@@ -44,13 +44,13 @@ while [ -L "$SCRIPT" ]; do
         echo "raptor-frida: symlink hop limit exceeded resolving $0" >&2
         exit 1
     fi
-    DIR="$(cd "$(dirname "$SCRIPT")" && pwd)"
+    DIR="$(CDPATH= cd -- "$(dirname "$SCRIPT")" && pwd)"
     SCRIPT="$(readlink "$SCRIPT")"
     [[ "$SCRIPT" != /* ]] && SCRIPT="$DIR/$SCRIPT"
 done
 unset _symhops
 unset DIR
-RAPTOR_DIR="$(cd "$(dirname "$SCRIPT")/.." && pwd)"
+RAPTOR_DIR="$(CDPATH= cd -- "$(dirname "$SCRIPT")/.." && pwd)"
 
 if [ ! -f "$RAPTOR_DIR/raptor.py" ]; then
     echo "raptor-frida: cannot find raptor.py under $RAPTOR_DIR" >&2
@@ -114,12 +114,24 @@ abs_target() {
 TARGET=""
 OUT=""
 PASS_ARGS=()
+TAIL_ARGS=()
 PROJECT_FLAG=""
 i=0
 ARGS=("$@")
 while [ $i -lt ${#ARGS[@]} ]; do
     a="${ARGS[$i]}"
     case "$a" in
+        --)
+            # Everything after -- is positional: stop extracting
+            # wrapper flags (a --target/--out/--project after -- must
+            # pass through verbatim, matching the short-circuit loop).
+            # Kept in a separate tail so wrapper-appended flags
+            # (--out below) land BEFORE the separator — appended
+            # after it they would parse as positionals and make the
+            # documented -- form unusable.
+            TAIL_ARGS=("${ARGS[@]:$i}")
+            break
+            ;;
         --target)
             i=$((i + 1))
             TARGET="$(abs_target "${ARGS[$i]:-}")"
@@ -228,23 +240,59 @@ else
     LIFECYCLE_OWNED=0
 fi
 
-PASS_ARGS+=("--out" "$OUT")
+# ─── nonce-framed run-dir sentinel (evidence-dir integrity) ─────────
+# The spawned target inherits this process's stdio, so a bare
+# OUTPUT_DIR= line in the captured streams is forgeable by target
+# bytes. When the programmatic caller (packages/frida/active.py)
+# supplies a per-launch nonce, echo the framed sentinel BEFORE any
+# target code can run, then unset the nonce so the instrumented
+# target never sees it. The bare OUTPUT_DIR= lifecycle line above
+# stays: operators and downstream lifecycle steps parse it.
+if [ -n "${RAPTOR_FRIDA_RUNDIR_NONCE:-}" ]; then
+    echo "RAPTOR_FRIDA_RUN_DIR:${RAPTOR_FRIDA_RUNDIR_NONCE}=${OUT}" >&2
+    unset RAPTOR_FRIDA_RUNDIR_NONCE
+fi
 
-# ─── signal trap: clean up lifecycle on interrupt/terminate ────────
-_cleanup() {
-    local sig="${1:-EXIT}"
-    if [ $LIFECYCLE_OWNED -eq 1 ] && [ -n "${OUT:-}" ]; then
-        "$RAPTOR_DIR/libexec/raptor-run-lifecycle" fail "$OUT" \
-            "frida interrupted by signal $sig" 2>/dev/null || true
-    fi
-    # Kill child process group if we started one
+PASS_ARGS+=("--out" "$OUT")
+# Re-attach the verbatim post--- tail AFTER every wrapper-owned flag.
+PASS_ARGS+=(${TAIL_ARGS[@]+"${TAIL_ARGS[@]}"})
+
+# ─── signal trap: forward to the child, decide disposition later ───
+# The trap must NOT write the lifecycle disposition: the child's exit
+# status after the signal decides it (a duration-bounded capture ends
+# gracefully on SIGINT/SIGTERM and must complete, not fail) — writing
+# fail here and complete after the wait made the final status a
+# last-write race. The child runs in its own session (setsid, when
+# available) so the WHOLE tree — sandbox wrapper, frida CLI, spawned
+# instrumented target — gets the signal, not just the direct child.
+INTERRUPTED=""
+CHILD_GROUP=0
+if command -v setsid >/dev/null 2>&1; then
+    CHILD_GROUP=1
+fi
+_on_signal() {
+    INTERRUPTED="$1"
     if [ -n "${CHILD_PID:-}" ]; then
-        kill "$CHILD_PID" 2>/dev/null || true
+        if [ "$CHILD_GROUP" -eq 1 ]; then
+            kill -- "-$CHILD_PID" 2>/dev/null \
+                || kill "$CHILD_PID" 2>/dev/null || true
+        else
+            kill "$CHILD_PID" 2>/dev/null || true
+        fi
     fi
 }
-trap '_cleanup INT'  INT
-trap '_cleanup TERM' TERM
-trap '_cleanup HUP'  HUP
+trap '_on_signal INT'  INT
+trap '_on_signal TERM' TERM
+trap '_on_signal HUP'  HUP
+
+_spawn() {
+    if [ "$CHILD_GROUP" -eq 1 ]; then
+        setsid "$@" &
+    else
+        "$@" &
+    fi
+    CHILD_PID=$!
+}
 
 # ─── run the Python CLI ─────────────────────────────────────────────
 set +e
@@ -255,17 +303,19 @@ if [ "$UNSAFE_ATTACH" -eq 1 ]; then
     for a in "${PASS_ARGS[@]}"; do
         [ "$a" = "--unsafe-attach" ] || FILTERED_ARGS+=("$a")
     done
-    python3 -m packages.frida.cli "${FILTERED_ARGS[@]}" &
-    CHILD_PID=$!
-    wait $CHILD_PID
-    RC=$?
+    _spawn python3 -m packages.frida.cli "${FILTERED_ARGS[@]}"
 else
     SANDBOX_ARGS=("--out" "$OUT")
     [ "$IS_SPAWN" -eq 1 ] && SANDBOX_ARGS+=("--spawn")
-    python3 -m packages.frida.sandboxed "${SANDBOX_ARGS[@]}" -- \
-        python3 -m packages.frida.cli "${PASS_ARGS[@]}" &
-    CHILD_PID=$!
-    wait $CHILD_PID
+    _spawn python3 -m packages.frida.sandboxed "${SANDBOX_ARGS[@]}" -- \
+        python3 -m packages.frida.cli "${PASS_ARGS[@]}"
+fi
+wait $CHILD_PID
+RC=$?
+if [ -n "$INTERRUPTED" ]; then
+    # A trapped signal interrupts the first wait before the child has
+    # exited; re-wait to collect the child's real disposition.
+    wait $CHILD_PID 2>/dev/null
     RC=$?
 fi
 set -e
@@ -277,6 +327,9 @@ trap - INT TERM HUP
 if [ $LIFECYCLE_OWNED -eq 1 ]; then
     if [ $RC -eq 0 ]; then
         "$RAPTOR_DIR/libexec/raptor-run-lifecycle" complete "$OUT" || true
+    elif [ -n "$INTERRUPTED" ]; then
+        "$RAPTOR_DIR/libexec/raptor-run-lifecycle" fail "$OUT" \
+            "frida interrupted by signal $INTERRUPTED (cli exited $RC)" || true
     else
         "$RAPTOR_DIR/libexec/raptor-run-lifecycle" fail "$OUT" \
             "frida cli exited $RC" || true

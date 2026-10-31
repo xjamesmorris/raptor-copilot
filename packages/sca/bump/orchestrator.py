@@ -39,6 +39,7 @@ from .evaluator import evaluate_bump_supply_chain
 from .upstream_map import UpstreamSource, lookup_upstream
 from .vuln_delta import VulnDeltaDegraded, evaluate_bump_vulns
 from typing import TYPE_CHECKING
+from ..file_shapes import is_dockerfile as _is_dockerfile
 
 if TYPE_CHECKING:
     from ..registries.pypi import PyPIClient
@@ -401,11 +402,8 @@ def _enumerate_candidates(
     # Dockerfiles may pin the same tool.
     latest_cache: dict = {}
     for dockerfile in dockerfiles:
-        try:
-            text = dockerfile.read_text(encoding="utf-8")
-        except OSError as e:
-            logger.warning("sca.bump: read failed for %s: %s",
-                            dockerfile, e)
+        text = _read_target_text(dockerfile, target)
+        if text is None:
             continue
         for line in text.splitlines():
             match = _ARG_RE.match(line)
@@ -442,8 +440,25 @@ def _enumerate_candidates(
                 continue
             upstream = lookup_upstream(arg_name)
             if upstream is None:
-                # No upstream source — silent skip (operator can
-                # add via the inline-comment override path).
+                # No upstream source, so no bump target can be
+                # proposed. When the ARG is a RECOGNISED version-pin
+                # family (a _BUILTIN_ARG_MAP key — which includes the
+                # runtime/base-image ARGs deliberately mapped to no
+                # ecosystem: PYTHON_VERSION, GO_VERSION,
+                # UBUNTU_VERSION, ...) the gap is operator-relevant
+                # and surfaces in ``skipped`` instead of vanishing.
+                # Unrecognised ARGs stay silent (arbitrary build args
+                # are noise); the inline-comment override remains the
+                # operator escape hatch either way.
+                if arg_name in _BUILTIN_ARG_MAP:
+                    skipped.append((
+                        arg_name, dockerfile,
+                        "recognised version-pin ARG with no "
+                        "upstream-latest source (runtime/base-image "
+                        "axis is deliberately unmapped) — bump "
+                        "target cannot be proposed; use an inline "
+                        "# raptor-sca: override to remap or skip",
+                    ))
                 continue
             cache_key = (upstream.kind, upstream.coordinate)
             if cache_key in latest_cache:
@@ -471,7 +486,25 @@ def _enumerate_candidates(
                     )
                     latest_cache[cache_key] = None
                     continue
-                target_version = (raw or "").lstrip("v")
+                # Gate on stable-semver shape like every other walker
+                # (_lookup_latest_release_or_tag documents why): a
+                # bundle/nightly/hostile "latest" tag must not become
+                # the proposed pin — under --apply it would be written
+                # into the ARG. And removeprefix, not lstrip: lstrip
+                # strips EVERY leading 'v' ("vault-1.2.3" → "ault-...").
+                from core.upstream_latest._version_filter import (
+                    parse_stable,
+                )
+                raw_value = raw or ""
+                if raw_value and parse_stable(raw_value) is None:
+                    skipped.append(
+                        (arg_name, dockerfile,
+                         f"upstream latest {raw_value!r} is not a "
+                         "stable semver version")
+                    )
+                    latest_cache[cache_key] = None
+                    continue
+                target_version = raw_value.removeprefix("v")
                 latest_cache[cache_key] = target_version
             if not target_version:
                 skipped.append(
@@ -496,9 +529,8 @@ def _enumerate_candidates(
     # bookworm`` — variants aren't bump candidates without a
     # variant-tag map we don't have).
     for dockerfile in dockerfiles:
-        try:
-            text = dockerfile.read_text(encoding="utf-8")
-        except OSError:
+        text = _read_target_text(dockerfile, target)
+        if text is None:
             continue
         from_candidates, from_skipped = _enumerate_from_image_candidates(
             text=text, dockerfile=dockerfile,
@@ -571,9 +603,8 @@ def _enumerate_candidates(
         )
         excluded_files.update((p, None) for p in dropped)
     for wf in workflow_files:
-        try:
-            text = wf.read_text(encoding="utf-8")
-        except OSError:
+        text = _read_target_text(wf, target)
+        if text is None:
             continue
         gha_candidates, gha_skipped = _enumerate_gha_uses_candidates(
             text=text, workflow=wf,
@@ -858,15 +889,21 @@ def _enumerate_from_image_candidates(
     for inst in instructions:
         if inst.directive != "FROM":
             continue
-        args = inst.args.strip()
-        # ``FROM image AS stage`` — record the stage name + bump
-        # the image portion.
-        as_split = args.split(" AS ", 1)
-        if len(as_split) == 1:
-            as_split = args.split(" as ", 1)
-        image_ref_str = as_split[0].strip()
-        if len(as_split) > 1:
-            stage_names.add(as_split[1].strip())
+        # ``FROM [--platform=...] image [AS stage]``. Flags precede
+        # the ref (BuildKit ``--platform``); Dockerfile keywords are
+        # case-insensitive, so ``As`` / ``aS`` name a stage too —
+        # a two-way case-sensitive split left the flag glued to the
+        # ref (per-line "unparseable FROM ref" noise) and mixed-case
+        # aliases unrecorded (a later ``FROM <stage>`` then looked
+        # up as an image).
+        tokens = inst.args.strip().split()
+        while tokens and tokens[0].startswith("--"):
+            tokens.pop(0)
+        if not tokens:
+            continue
+        image_ref_str = tokens[0]
+        if len(tokens) >= 3 and tokens[1].upper() == "AS":
+            stage_names.add(tokens[2])
         # Reusing a prior stage by name — not a bump target.
         if image_ref_str in stage_names:
             continue
@@ -905,8 +942,11 @@ def _enumerate_from_image_candidates(
             target_tag = from_cache[cache_key]
         else:
             try:
+                # Look up by bare locator (tag portions are ignored
+                # by the tag-listing anyway) so the FROM and yaml
+                # walkers share upstream caching for the same repo.
                 target_tag = oci_latest_tag(
-                    image_ref_str, http=http, cache=cache,
+                    locator, http=http, cache=cache,
                     variant=variant,
                 )
             except (UpstreamLookupError, NoStableVersionsFound) as e:
@@ -1112,32 +1152,41 @@ def _binary_capability_delta_for_candidate(
         current_ref = f"{cand.locator}:{cand.current_version}"
         target_ref = f"{cand.locator}:{cand.target_version}"
 
-    current_bin = fetch_image_binary(
-        current_ref, client=oci_client,
-    )
-    if current_bin is None:
-        logger.debug(
-            "sca.bump.binary_capability_delta: could not extract "
-            "current binary from %s", current_ref,
+    from .image_binary_extract import cleanup_extracted_binary
+    current_bin = None
+    target_bin = None
+    try:
+        current_bin = fetch_image_binary(
+            current_ref, client=oci_client,
         )
-        return None
-    target_bin = fetch_image_binary(
-        target_ref, client=oci_client,
-    )
-    if target_bin is None:
-        logger.debug(
-            "sca.bump.binary_capability_delta: could not extract "
-            "target binary from %s", target_ref,
+        if current_bin is None:
+            logger.debug(
+                "sca.bump.binary_capability_delta: could not extract "
+                "current binary from %s", current_ref,
+            )
+            return None
+        target_bin = fetch_image_binary(
+            target_ref, client=oci_client,
         )
-        return None
-    return binary_capability_delta_finding(
-        ecosystem=ecosystem,
-        name=cand.locator,
-        current_version=cand.current_version,
-        target_version=cand.target_version,
-        current_binary=current_bin,
-        target_binary=target_bin,
-    )
+        if target_bin is None:
+            logger.debug(
+                "sca.bump.binary_capability_delta: could not extract "
+                "target binary from %s", target_ref,
+            )
+            return None
+        return binary_capability_delta_finding(
+            ecosystem=ecosystem,
+            name=cand.locator,
+            current_version=cand.current_version,
+            target_version=cand.target_version,
+            current_binary=current_bin,
+            target_binary=target_bin,
+        )
+    finally:
+        # Extracted binaries previously accumulated in the system
+        # tempdir across runs, unbounded; the diff is done, drop them.
+        cleanup_extracted_binary(current_bin)
+        cleanup_extracted_binary(target_bin)
 
 
 def _resolve_gha_image_refs(
@@ -1250,7 +1299,12 @@ def _enumerate_yaml_image_candidates(
                              dep.name, current_tag, e)
                 continue
             locator = f"{ref.registry}/{ref.repository}"
-            cache_key = ("oci_tag", locator)
+            # Same 3-tuple key shape as the FROM walker (variant ""
+            # — this walker only handles bare-semver tags): the two
+            # walkers share ``latest_cache``, and a 2-tuple key
+            # never matched the FROM walker's 3-tuple, so the same
+            # repo was queried once per walker.
+            cache_key = ("oci_tag", locator, "")
             if cache_key in from_cache:
                 target_tag = from_cache[cache_key]
             else:
@@ -1387,10 +1441,7 @@ def _enumerate_git_submodule_candidates(
     <path>`` instruction.
     """
     from core.upstream_latest.github_releases import (
-        NoStableVersionsFound,
         UpstreamLookupError,
-        latest_release,
-        latest_tag,
         resolve_tag_to_sha,
     )
 
@@ -1421,29 +1472,25 @@ def _enumerate_git_submodule_candidates(
                 # without a current anchor.
                 continue
             repo = dep.name      # ``owner/repo`` for GitHub URLs
-            cache_key = ("git_submodule", repo)
-            if cache_key in sub_cache:
-                target_tag = sub_cache[cache_key]
-            else:
-                try:
-                    target_tag = latest_release(
-                        repo, http=http, cache=cache,
-                        github_token=github_token,
-                    )
-                except UpstreamLookupError:
-                    try:
-                        target_tag = latest_tag(
-                            repo, http=http, cache=cache,
-                            github_token=github_token,
-                        )
-                    except (UpstreamLookupError, NoStableVersionsFound) as e:
-                        skipped.append((
-                            repo, manifest.path,
-                            f"submodule upstream lookup failed: {e}",
-                        ))
-                        sub_cache[cache_key] = None
-                        continue
-                sub_cache[cache_key] = target_tag
+            # Gate on stable-semver shape like every other walker:
+            # ``/releases/latest`` returns whatever tag the
+            # publisher marked latest, unfiltered — e.g.
+            # ``github/codeql-action`` publishes
+            # ``codeql-bundle-vX.Y.Z``. Taken ungated, that becomes
+            # a wrong-axis bump proposal (target_version a bundle
+            # tag, new_sha for the bundle) that block_on_major /
+            # block_on_minor_skew can't even parse. The shared
+            # helper validates through parse_stable and falls back
+            # to the stable-filtered ``/tags`` path, recording a
+            # skip row when neither yields a stable tag.
+            target_tag = _lookup_latest_release_or_tag(
+                repo, http=http, cache=cache,
+                github_token=github_token,
+                uses_cache=sub_cache,
+                skipped=skipped,
+                workflow=manifest.path,
+                cache_kind="git_submodule",
+            )
             if not target_tag:
                 continue
             # Resolve target tag → SHA. Cache separately from the
@@ -1661,6 +1708,7 @@ def _lookup_latest_release_or_tag(
     uses_cache: dict,
     skipped: list[tuple[str, Path, str]],
     workflow: Path,
+    cache_kind: str = "gha_uses",
 ) -> str | None:
     """Look up the latest stable upstream version for a GitHub
     repo. Tries ``/releases/latest`` first (proper GitHub
@@ -1678,6 +1726,10 @@ def _lookup_latest_release_or_tag(
     ``releases/latest`` tag doesn't pass the filter. If neither
     path produces a stable-semver tag, the repo is recorded as
     skipped with reason — operator sees the gap explicitly.
+
+    ``cache_kind`` names the caller's per-repo cache-key kind so
+    walkers with their own cache dicts (gha_uses, git_submodule)
+    share this one gate implementation without colliding keys.
     """
     from core.upstream_latest._version_filter import parse_stable
     from core.upstream_latest.github_releases import (
@@ -1686,7 +1738,7 @@ def _lookup_latest_release_or_tag(
         latest_release,
         latest_tag,
     )
-    cache_key = ("gha_uses", repo)
+    cache_key = (cache_kind, repo)
     if cache_key in uses_cache:
         return uses_cache[cache_key]
     target_ref = None
@@ -1824,16 +1876,62 @@ def _same_major_pin(current: str, target: str) -> bool:
     return cur[0] == tgt[0]
 
 
+def _read_target_text(path: Path, target: Path) -> str | None:
+    """Read a discovered file through the bounded parser reader.
+
+    ``read_bounded(follow_symlinks=False)`` under a
+    ``scan_root_context`` accepts a symlinked file whose resolved
+    target still lies inside *target* (the monorepo shared-manifest
+    pattern) and refuses links that escape the tree, oversize files,
+    and non-regular entries — each with its own warning. A bare
+    ``read_text`` here follows any planted link, laundering host
+    files into candidate enumeration.
+    """
+    from ..parsers._safe_read import read_bounded, scan_root_context
+    with scan_root_context(target):
+        return read_bounded(path, follow_symlinks=False)
+
+
+def _harvestable_file(path: Path, root: Path) -> bool:
+    """True when a discovered entry may enter the bump file lists.
+
+    Regular files pass. A symlink passes only when its resolved
+    target is a regular file still inside *root* (pre-resolved) —
+    discovered files feed the REWRITER, so an escaping link would
+    redirect writes outside the tree. Everything else is skipped
+    with a sanitised warning.
+    """
+    if not path.is_symlink():
+        return path.is_file()
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    if resolved.is_file() and resolved.is_relative_to(root):
+        return True
+    from core.security.log_sanitisation import sanitise_for_terminal
+    logger.warning(
+        "sca.bump: refusing non-contained symlink %s",
+        sanitise_for_terminal(str(path)),
+    )
+    return False
+
+
 def _find_gha_workflows(target: Path) -> list[Path]:
     """Walk ``target`` for GitHub Actions workflow YAML files."""
     out: list[Path] = []
+    root = target.resolve()
     for gh_dir in target.rglob(".github"):
-        if not gh_dir.is_dir():
+        if gh_dir.is_symlink() or not gh_dir.is_dir():
             continue
         wf_dir = gh_dir / "workflows"
-        if not wf_dir.is_dir():
+        if wf_dir.is_symlink() or not wf_dir.is_dir():
             continue
-        out.extend(path for path in wf_dir.iterdir() if path.is_file() and path.suffix in (".yml", ".yaml"))
+        out.extend(
+            path for path in wf_dir.iterdir()
+            if _harvestable_file(path, root)
+            and path.suffix in (".yml", ".yaml")
+        )
     return sorted(out)
 
 
@@ -1850,8 +1948,9 @@ def _find_dockerfiles_and_workflows(
         return ([target] if _is_dockerfile(target) else []), []
     dockerfiles: list[Path] = []
     workflows: list[Path] = []
+    root = target.resolve()
     for path in target.rglob("*"):
-        if not path.is_file():
+        if not _harvestable_file(path, root):
             continue
         if _is_dockerfile(path):
             dockerfiles.append(path)
@@ -1887,17 +1986,23 @@ def _find_dockerfiles(target: Path) -> list[Path]:
     file that the rest of SCA does."""
     if target.is_file():
         return [target] if _is_dockerfile(target) else []
-    out: list[Path] = [path for path in target.rglob("*") if path.is_file() and _is_dockerfile(path)]
+    root = target.resolve()
+    out: list[Path] = [
+        path for path in target.rglob("*")
+        if _harvestable_file(path, root) and _is_dockerfile(path)
+    ]
     return sorted(out)
 
 
-def _is_dockerfile(path: Path) -> bool:
-    name = path.name
-    if name in ("Dockerfile", "Containerfile"):
-        return True
-    if name.startswith("Dockerfile.") or name.endswith(".Dockerfile"):
-        return True
-    return path.suffix == ".dockerfile"
+def _term(value: object, max_chars: int) -> str:
+    """Defang an untrusted value for terminal output: ANSI / BIDI /
+    control bytes neutralised, newlines collapsed, length-capped —
+    same treatment the report/review renderers give remote and
+    repo-sourced fields."""
+    from core.security.prompt_output_sanitise import sanitise_string
+    return " ".join(
+        sanitise_string(str(value), max_chars=max_chars).split(),
+    )
 
 
 def _title_severity(severity: str) -> str:
@@ -1995,12 +2100,17 @@ def render_report(report: BumpReport) -> str:
                 result_label = f"error: {head.error}"
             else:
                 result_label = "" if n_files == 1 else f"({n_files} files)"
+            # Locator / reasons / registry strings land on the
+            # operator's terminal — defang ANSI/BIDI/control bytes
+            # (same treatment the sibling renderers give remote and
+            # repo-sourced fields). Versions are semver-gated at the
+            # candidate walkers.
             lines.append(
                 f"  {head.candidate.kind:<11} "
-                f"{head.candidate.locator:<35} "
+                f"{_term(head.candidate.locator, 60):<35} "
                 f"{head.candidate.current_version:<14} "
                 f"{head.candidate.target_version:<22} "
-                f"{head.verdict_label:<8} {result_label}"
+                f"{head.verdict_label:<8} {_term(result_label, 200)}"
             )
             # Surface the supply-chain findings inline so operators
             # know WHY a verdict isn't Clean. (One copy per group;
@@ -2010,7 +2120,7 @@ def render_report(report: BumpReport) -> str:
             # the raw lowercase form stays in JSON.
             lines.extend(
                 f"      [{_title_severity(sf.severity)}] "
-                f"{sf.kind}: {sf.detail}"
+                f"{sf.kind}: {_term(sf.detail, 300)}"
                 for sf in head.bump_supply_chain_findings
             )
             # Surface newly-introduced CVEs (OSV vuln-delta) —
@@ -2021,14 +2131,15 @@ def render_report(report: BumpReport) -> str:
                 kev_marker = " KEV" if vf.in_kev else ""
                 lines.append(
                     f"      [{_title_severity(vf.severity)}{kev_marker}] "
-                    f"new-CVE {cve}: "
-                    f"{(adv.summary[:90] if adv and adv.summary else '')}"
+                    f"new-CVE {_term(cve, 60)}: "
+                    f"{_term(adv.summary[:90] if adv and adv.summary else '', 120)}"
                 )
     if report.skipped:
         lines.append("")
         lines.append("  Skipped:")
         for arg, path, reason in report.skipped:
             lines.append(
-                f"    {arg} ({path.name}): {reason}"
+                f"    {_term(arg, 80)} ({_term(path.name, 80)}): "
+                f"{_term(reason, 300)}"
             )
     return "\n".join(lines) + "\n"

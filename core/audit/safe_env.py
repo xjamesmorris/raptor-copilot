@@ -1,9 +1,11 @@
-"""Safe environment and resource limits for audit tool execution.
+"""Resource-limit and output-cap tables for audit tool execution.
 
-Enforces resource limits, output size caps, filesystem isolation,
-and network denial for every external tool invocation in the audit
-pipeline.  Complements sandbox_policy.py (which maps tools to profiles)
-with the runtime enforcement details.
+The resource-limit half is advisory reference data derived from
+sandbox_policy.py: isolation (namespaces, Landlock, network deny,
+rlimits) is enforced by core.sandbox at the spawn layer, and the
+lookup helpers here are not consulted on that path.  The output-size
+caps (truncate_output) are applied in production: they bound tool
+output before it is fed into prompts.
 """
 
 from __future__ import annotations
@@ -52,6 +54,7 @@ _TOOL_LIMITS: dict[str, ResourceLimits] | None = None
 
 
 def get_resource_limits(tool: str) -> ResourceLimits | None:
+    """Advisory limits lookup; enforcement happens in core.sandbox."""
     global _TOOL_LIMITS
     if _TOOL_LIMITS is None:
         _TOOL_LIMITS = _build_limits_from_policy()
@@ -94,13 +97,24 @@ def get_output_limit(tool: str) -> OutputSizeLimit | None:
 def truncate_output(
     items: list[Any],
     tool: str,
-) -> tuple:
+) -> tuple[list[Any], str | None]:
     """Truncate tool output to the configured limit.
 
     Returns (truncated_items, truncation_note_or_None).
+
+    An unregistered *tool* key returns the items uncapped — that is
+    always call-site drift (every caller intends a cap), so it is
+    logged loudly rather than silently no-opping.
     """
     limit = get_output_limit(tool)
-    if limit is None or len(items) <= limit.max_results:
+    if limit is None:
+        logger.warning(
+            "no output limit configured for tool key '%s' — "
+            "output passed through uncapped",
+            tool,
+        )
+        return items, None
+    if len(items) <= limit.max_results:
         return items, None
 
     truncated = items[:limit.max_results]

@@ -168,3 +168,47 @@ class RaptorScaRunWrapperTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OpLockContentionTests(unittest.TestCase):
+    """A contended project must give the operator the named-holder
+    refusal (one ERROR line, exit 1) — not a raw traceback (the
+    raptor-run-lifecycle sibling already handles this)."""
+
+    def test_contention_prints_error_line(self):
+        import importlib.machinery
+        import importlib.util
+        import io
+        import sys as _sys
+        from contextlib import redirect_stderr
+        from unittest.mock import patch
+
+        os.environ.setdefault("_RAPTOR_TRUSTED", "1")
+        loader = importlib.machinery.SourceFileLoader(
+            "raptor_sca_run_contention", str(WRAPPER))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+
+        from core.project.oplock import OpLockContention
+
+        with TemporaryDirectory() as d:
+            target = Path(d) / "src"
+            target.mkdir()
+            out = Path(d) / "out"
+
+            def raise_contention(*a, **kw):
+                raise OpLockContention(
+                    "project busy: run held by session X")
+
+            err = io.StringIO()
+            with patch.object(mod, "start_run", raise_contention), \
+                    patch.object(mod, "get_output_dir",
+                                 lambda **kw: out), \
+                    redirect_stderr(err):
+                with self.assertRaises(SystemExit) as ctx:
+                    mod.main([str(target)])
+            self.assertEqual(ctx.exception.code, 1)
+            self.assertIn("ERROR: project busy", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+        _sys.modules.pop("raptor_sca_run_contention", None)

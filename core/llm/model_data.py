@@ -364,12 +364,17 @@ _DATED_ALIAS_RE = _re.compile(r"-\d{8}$")
 
 def _resolve_model_entry(table: dict, model: str) -> dict | None:
     """Canonical table lookup: exact → dated alias → bedrock strip →
-    both. EVERY consumer of ``MODEL_COSTS`` / ``MODEL_LIMITS`` must
-    resolve through this chain (or the helpers below) — two independent
-    two-step lookups have now each caused a production failure for
-    Bedrock-form ids (``anthropic.claude-…``): $0 cost booking with
-    unenforced budget caps, and a 4096-token completion ceiling that
-    truncated every thinking-model structured response.
+    both. EVERY consumer of ``MODEL_COSTS`` / ``MODEL_LIMITS`` that
+    resolves an id from config or user input must route through this
+    chain (or the helpers below); a direct ``table.get`` is legal only
+    for a literal catalog key. Hand-rolled partial ladders have now
+    caused three production-grade failures for Bedrock-form ids
+    (``anthropic.claude-…``): $0 cost booking with unenforced budget
+    caps, a 4096-token completion ceiling that truncated every
+    thinking-model structured response, and a dated+prefixed id
+    (``us.anthropic.claude-x-<date>``) missing every single-strip
+    probe and running a 128K/1M catalog model at the 8K/32K fallback
+    limits.
     """
     return (
         table.get(model)
@@ -435,13 +440,7 @@ def context_window_for(model: str) -> int:
     looked up by their bare name — context windows are identical to
     the direct-API form.
     """
-    limits = MODEL_LIMITS.get(model)
-    if limits is None:
-        limits = MODEL_LIMITS.get(_strip_dated_alias(model))
-    if limits is None:
-        limits = MODEL_LIMITS.get(_strip_bedrock_prefixes(model))
-    if limits is None:
-        limits = MODEL_LIMITS.get(_strip_dated_alias(_strip_bedrock_prefixes(model)))
+    limits = resolve_model_limits(model)
     if limits is None:
         msg = f"context_window_for: unknown model {model!r}"
         raise KeyError(msg)
@@ -455,13 +454,7 @@ def max_output_for(model: str) -> int:
 
     Bedrock-prefixed identifiers map to the bare name; output limits
     are identical to the direct-API form."""
-    limits = MODEL_LIMITS.get(model)
-    if limits is None:
-        limits = MODEL_LIMITS.get(_strip_dated_alias(model))
-    if limits is None:
-        limits = MODEL_LIMITS.get(_strip_bedrock_prefixes(model))
-    if limits is None:
-        limits = MODEL_LIMITS.get(_strip_dated_alias(_strip_bedrock_prefixes(model)))
+    limits = resolve_model_limits(model)
     if limits is None:
         msg = f"max_output_for: unknown model {model!r}"
         raise KeyError(msg)
@@ -521,13 +514,7 @@ def rpm_for(model: str, *, default: int = 0) -> int:
     to the actual primary model before lookup.
     """
     model = resolve_model_name(model)
-    limits = MODEL_LIMITS.get(model)
-    if limits is None:
-        limits = MODEL_LIMITS.get(_strip_dated_alias(model))
-    if limits is None:
-        limits = MODEL_LIMITS.get(_strip_bedrock_prefixes(model))
-    if limits is None:
-        limits = MODEL_LIMITS.get(_strip_dated_alias(_strip_bedrock_prefixes(model)))
+    limits = resolve_model_limits(model)
     if limits is None:
         return default
     return limits.get("rpm", default)
@@ -544,9 +531,10 @@ def price_for(
     helper converts to per-million which is the unit consumers (loop
     cost tracking, ``max_cost_usd`` enforcement) actually want.
 
-    Bedrock-prefixed identifiers are looked up by their bare name and
-    then multiplied by :func:`_bedrock_cost_multiplier` to account for
-    the regional-CRIS ~10% surcharge over global / direct-API pricing.
+    Bedrock-prefixed identifiers are looked up by their bare name via
+    :func:`resolve_model_costs`, which applies the
+    :func:`_bedrock_cost_multiplier` regional-CRIS ~10% surcharge over
+    global / direct-API pricing.
 
     Unknown models return ``default`` rather than raising — the caller
     chooses between (a) soft warn + treat as $0 (cost tracking
@@ -555,23 +543,12 @@ def price_for(
     ``None`` isn't a valid tuple so callers wanting hard errors should
     test the return against ``(0.0, 0.0)`` and act accordingly.
     """
-    cost = MODEL_COSTS.get(model)
-    multiplier = 1.0
-    if cost is None:
-        undated = _strip_dated_alias(model)
-        cost = MODEL_COSTS.get(undated)
-    if cost is None:
-        bare = _strip_bedrock_prefixes(model)
-        if bare != model:
-            cost = MODEL_COSTS.get(bare)
-            if cost is None:
-                cost = MODEL_COSTS.get(_strip_dated_alias(bare))
-            multiplier = _bedrock_cost_multiplier(model)
+    cost = resolve_model_costs(model)
     if cost is None:
         return default
     return (
-        cost["input"] * 1000.0 * multiplier,
-        cost["output"] * 1000.0 * multiplier,
+        cost["input"] * 1000.0,
+        cost["output"] * 1000.0,
     )
 
 

@@ -53,6 +53,7 @@ from pathlib import Path
 from collections.abc import Sequence
 
 from core.json import dumps_artifact, load_json
+from core.llm.scorecard._render import scrub_cell
 from core.llm.multi_model.dawid_skene import (
     DawidSkeneResult,
     estimate_partitioned,
@@ -66,6 +67,7 @@ from core.llm.scorecard.priors import (
     BetaPrior,
     uniform_prior,
 )
+from core.run.finding_status import read_verdict
 
 
 # Flip = D–S posterior > 0.5 disagrees with recorded is_exploitable.
@@ -73,6 +75,10 @@ from core.llm.scorecard.priors import (
 FLIP_TO_EXPLOITABLE = "to_exploitable"
 FLIP_TO_NOT_EXPLOITABLE = "to_not_exploitable"
 NO_FLIP = "no_flip"
+# The recorded pipeline never concluded on this finding (verdict
+# missing / nulled) — there is nothing to flip FROM. Bucketed
+# separately: counting these as NO_FLIP silently deflated flip_rate.
+NO_RECORDED_VERDICT = "no_recorded_verdict"
 
 
 # ---------------------------------------------------------------------------
@@ -115,10 +121,17 @@ class ReplayReport:
     findings: list[FindingComparison]
     class_summaries: list[ClassSummary]
     # Aggregate metrics — the headline numbers an operator scans first.
+    # Flip rates are computed over findings WITH a recorded verdict
+    # (the comparable set) — abstained findings are counted separately
+    # below, never as silent NO_FLIPs deflating the headline number.
     flip_rate: float
     flip_to_exploitable_rate: float
     flip_to_not_exploitable_rate: float
     posterior_distribution: dict[str, float]  # bin -> count
+    # Findings whose recorded pipeline never concluded (verdict
+    # missing / nulled). Additive field — JSON consumers tolerate
+    # extra keys.
+    n_no_recorded_verdict: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -156,10 +169,16 @@ def _recorded_verdict_index(
             fid = finding.get("finding_id")
             if not isinstance(fid, str):
                 continue
-            is_exploitable = finding.get("is_exploitable")
-            if not isinstance(is_exploitable, bool):
-                is_exploitable = None
-            out[fid] = is_exploitable
+            if fid in out:
+                # Same finding in multiple reports: FIRST record in
+                # path order wins — the same rule the estimator
+                # applies to duplicate (finding, model) panels
+                # (dawid_skene.estimate). Pre-fix this index kept the
+                # LAST file's verdict while the EM kept the first
+                # file's panels, so flips were computed against a
+                # different run than the one that fed the posterior.
+                continue
+            out[fid] = read_verdict(finding, "is_exploitable")
     return out
 
 
@@ -170,7 +189,7 @@ def _recorded_verdict_index(
 
 def _flip_tag(recorded: bool | None, posterior: float) -> str:
     if recorded is None:
-        return NO_FLIP  # nothing to flip from
+        return NO_RECORDED_VERDICT  # nothing to flip from
     posterior_says_exploitable = posterior > 0.5
     if recorded == posterior_says_exploitable:
         return NO_FLIP
@@ -279,15 +298,20 @@ def replay(
             converged=ds_result.converged,
             iterations=ds_result.iterations,
             model_reliabilities=[
-                {"model": r.model, "alpha": r.alpha, "beta": r.beta}
+                {"model": r.model, "alpha": r.alpha, "beta": r.beta}  # type: ignore[dict-item]
                 for r in ds_result.model_reliabilities
             ],
         ))
 
     total_findings = len(findings)
-    n_flips = sum(1 for f in findings if f.flip != NO_FLIP)
+    n_no_recorded = sum(
+        1 for f in findings if f.flip == NO_RECORDED_VERDICT
+    )
+    # Comparable set: findings with a recorded verdict to flip from.
+    n_comparable = total_findings - n_no_recorded
     n_flips_pos = sum(1 for f in findings if f.flip == FLIP_TO_EXPLOITABLE)
     n_flips_neg = sum(1 for f in findings if f.flip == FLIP_TO_NOT_EXPLOITABLE)
+    n_flips = n_flips_pos + n_flips_neg
 
     distinct_models = sorted({r.model for r in panel_records})
     distinct_classes = sorted({r.decision_class for r in panel_records})
@@ -300,16 +324,28 @@ def replay(
         distinct_decision_classes=distinct_classes,
         findings=findings,
         class_summaries=class_summaries,
-        flip_rate=(n_flips / total_findings) if total_findings else 0.0,
-        flip_to_exploitable_rate=(n_flips_pos / total_findings) if total_findings else 0.0,
-        flip_to_not_exploitable_rate=(n_flips_neg / total_findings) if total_findings else 0.0,
+        flip_rate=(n_flips / n_comparable) if n_comparable else 0.0,
+        flip_to_exploitable_rate=(n_flips_pos / n_comparable) if n_comparable else 0.0,
+        flip_to_not_exploitable_rate=(n_flips_neg / n_comparable) if n_comparable else 0.0,
         posterior_distribution=_bin_posteriors([f.posterior_true_positive for f in findings]),
+        n_no_recorded_verdict=n_no_recorded,
     )
 
 
 # ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
+
+
+def _scrub_cell(value: object) -> str:
+    """Escape + bound an orchestrated_report-derived cell value
+    (decision_class, model) before terminal/markdown rendering — the
+    reports are foreign input to this renderer. Routes through the
+    shared ``scrub_cell`` (md_inline projection): control bytes
+    escaped AND in-slot markdown structure (pipes, backticks)
+    entity-escaped, so a forged cell cannot mint table columns in the
+    pasted report."""
+    return scrub_cell(value)
 
 
 def render_markdown(report: ReplayReport) -> str:
@@ -323,7 +359,7 @@ def render_markdown(report: ReplayReport) -> str:
     )
     lines.append(
         f"Distinct models: **{len(report.distinct_models)}** "
-        f"(`{', '.join(report.distinct_models)}`)."
+        f"(`{', '.join(_scrub_cell(m) for m in report.distinct_models)}`)."
     )
     lines.append(
         f"Distinct decision classes: **{len(report.distinct_decision_classes)}**."
@@ -335,6 +371,11 @@ def render_markdown(report: ReplayReport) -> str:
                  f"(D–S posterior > 0.5 disagrees with recorded `is_exploitable`)")
     lines.append(f"- **Flips to exploitable:** {report.flip_to_exploitable_rate:.1%}")
     lines.append(f"- **Flips to NOT exploitable:** {report.flip_to_not_exploitable_rate:.1%}")
+    if report.n_no_recorded_verdict:
+        lines.append(
+            f"- **Findings with no recorded verdict (excluded from "
+            f"flip rates):** {report.n_no_recorded_verdict}"
+        )
     lines.append("")
     if report.total_findings_with_panel:
         lines.append("## Posterior distribution")
@@ -356,7 +397,7 @@ def render_markdown(report: ReplayReport) -> str:
             "converged | iters |"
         )
         lines.append("|---|---:|---:|---:|:---:|---:|")
-        lines.extend(f"| `{s.decision_class}` | {s.n_findings} | "
+        lines.extend(f"| `{_scrub_cell(s.decision_class)}` | {s.n_findings} | "
                 f"{s.n_flips_to_exploitable} | {s.n_flips_to_not_exploitable} | "
                 f"{'✓' if s.converged else '×'} | {s.iterations} |" for s in sorted(report.class_summaries, key=lambda x: x.decision_class))
     lines.append("")
@@ -367,15 +408,15 @@ def render_markdown(report: ReplayReport) -> str:
         per_model_beta: dict[str, list[float]] = {}
         for s in report.class_summaries:
             for r in s.model_reliabilities:
-                per_model_alpha.setdefault(r["model"], []).append(r["alpha"])
-                per_model_beta.setdefault(r["model"], []).append(r["beta"])
+                per_model_alpha.setdefault(r["model"], []).append(r["alpha"])  # type: ignore[arg-type]
+                per_model_beta.setdefault(r["model"], []).append(r["beta"])  # type: ignore[arg-type]
         lines.append("| model | mean α | mean β | n classes |")
         lines.append("|---|---:|---:|---:|")
         for model in sorted(per_model_alpha):
             alphas = per_model_alpha[model]
             betas = per_model_beta[model]
             lines.append(
-                f"| `{model}` | {statistics.mean(alphas):.3f} | "
+                f"| `{_scrub_cell(model)}` | {statistics.mean(alphas):.3f} | "
                 f"{statistics.mean(betas):.3f} | {len(alphas)} |"
             )
     lines.append("")
@@ -383,10 +424,13 @@ def render_markdown(report: ReplayReport) -> str:
 
 
 def render_json(report: ReplayReport) -> str:
-    # Artifact, not display: the rendering is persisted to the replay
-    # output file as well as printed, and both forms are consumed as a
-    # JSON document (jq, downstream tooling) rather than read as prose.
-    return dumps_artifact(asdict(report), sort_keys=True)
+    # The rendering is persisted to the replay output file AND written
+    # to the operator terminal by main() — the terminal half makes
+    # ensure_ascii load-bearing: without it, C1 controls (single-byte
+    # CSI/OSC) in orchestrated_report-derived strings pass through
+    # raw. ASCII output stays a valid JSON document for the parsing
+    # consumers (jq, downstream tooling) either way.
+    return dumps_artifact(asdict(report), sort_keys=True, ensure_ascii=True)
 
 
 # ---------------------------------------------------------------------------

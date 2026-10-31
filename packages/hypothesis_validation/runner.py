@@ -489,7 +489,15 @@ def _evaluate_with_refinement(
                 None,
             )
         if not evidence.matches:
-            return "refuted", f"Tool ran cleanly with no matches: {evidence.summary}", None
+            # Route through the ladder rather than hard-coding
+            # "refuted": a conclusive empty result (SMT unsat) takes
+            # its direction from the hypothesis's declared polarity —
+            # hard-coded refuted would report the opposite of the
+            # proof on an infeasibility-phrased hypothesis.
+            verdict = verdict_from(
+                evidence, "refuted", polarity=hypothesis.polarity,
+            )
+            return verdict, f"Tool ran cleanly with no matches: {evidence.summary}", None
         return "inconclusive", f"LLM evaluation failed; matches present: {evidence.summary}", None
 
     data = _extract_data(response) or {}
@@ -501,7 +509,7 @@ def _evaluate_with_refinement(
             claim, hypothesis.claim[:80],
         )
         claim = "inconclusive"
-    verdict = verdict_from(evidence, claim)
+    verdict = verdict_from(evidence, claim, polarity=hypothesis.polarity)
     reasoning = (
         data.get("reasoning", "")
         or evidence.summary

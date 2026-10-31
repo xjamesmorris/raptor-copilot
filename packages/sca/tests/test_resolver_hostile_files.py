@@ -190,5 +190,135 @@ def test_scan_root_context_does_not_admit_escapes(tmp_path: Path) -> None:
     assert {d.name for d in deps} == set()
 
 
+# ---------------------------------------------------------------------------
+# Resolver temp-copy stage — every resolver must refuse symlinked /
+# special manifest files from the scanned directory
+# ---------------------------------------------------------------------------
+
+class _StopAfterCopy(Exception):
+    """Raised by the stubbed ``_run`` so each dry_run test stops right
+    after the temp-copy stage — the copy posture is what's under test,
+    not the (absent) package-manager tool."""
+
+
+def _stub_run_recording(record: dict):
+    """Return a ``_run`` stand-in that snapshots the temp dir the
+    resolver populated, then aborts the dry_run."""
+    def _fake_run(cmd, cwd, timeout, proxy_hosts, env=None,
+                  block_network=False):
+        record["files"] = {
+            p.name: p.read_bytes()
+            for p in Path(cwd).iterdir() if p.is_file()
+        }
+        raise _StopAfterCopy
+    return _fake_run
+
+
+# (module path, resolver class name, filenames the resolver copies)
+_COPYING_RESOLVERS = [
+    ("packages.sca.resolvers.bundler", "BundlerResolver",
+     ("Gemfile", "Gemfile.lock")),
+    ("packages.sca.resolvers.composer", "ComposerResolver",
+     ("composer.json", "composer.lock")),
+    ("packages.sca.resolvers.gomod", "GoResolver", ("go.mod", "go.sum")),
+    ("packages.sca.resolvers.npm", "NpmResolver",
+     ("package.json", "package-lock.json")),
+    ("packages.sca.resolvers.nuget", "NugetResolver",
+     ("app.csproj", "packages.lock.json")),
+    ("packages.sca.resolvers.pnpm", "PnpmResolver",
+     ("package.json", "pnpm-lock.yaml")),
+    ("packages.sca.resolvers.yarn", "YarnResolver",
+     ("package.json", "yarn.lock")),
+]
+
+
+@pytest.mark.parametrize(
+    ("mod_name", "cls_name", "fnames"), _COPYING_RESOLVERS,
+    ids=[m.rsplit(".", 1)[1] for m, _, _ in _COPYING_RESOLVERS],
+)
+def test_resolver_copy_refuses_symlink_and_fifo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    mod_name: str, cls_name: str, fnames: tuple,
+) -> None:
+    """A manifest that is a symlink to an operator file must not have
+    its target's content copied into the resolver's temp dir; a FIFO
+    lockfile must be refused without blocking."""
+    import importlib
+    mod = importlib.import_module(mod_name)
+
+    secret = tmp_path / "operator-secret"
+    secret.write_bytes(b"AWS_SECRET=hunter2\n")
+    hostile = tmp_path / "hostile"
+    hostile.mkdir()
+    manifest_name, lock_name = fnames
+    (hostile / manifest_name).symlink_to(secret)
+    os.mkfifo(hostile / lock_name)
+
+    record: dict = {}
+    monkeypatch.setattr(mod, "_run", _stub_run_recording(record))
+    monkeypatch.setattr(mod, "_check_tool", lambda *a, **k: True)
+    if hasattr(mod, "_detect_major_version"):
+        monkeypatch.setattr(mod, "_detect_major_version", lambda: 1)
+
+    resolver = getattr(mod, cls_name)()
+    with pytest.raises(_StopAfterCopy):
+        resolver.dry_run(hostile)
+
+    copied = record["files"]
+    assert lock_name not in copied, "FIFO lockfile must be refused"
+    for content in copied.values():
+        assert b"hunter2" not in content, (
+            "symlink target content leaked into the resolver copy"
+        )
+
+
+def test_bundler_copy_refuses_symlinked_gemspec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from packages.sca.resolvers import bundler
+
+    secret = tmp_path / "operator-secret"
+    secret.write_bytes(b"hunter2")
+    hostile = tmp_path / "hostile"
+    hostile.mkdir()
+    (hostile / "Gemfile").write_text("source 'https://rubygems.org'\n",
+                                     encoding="utf-8")
+    (hostile / "evil.gemspec").symlink_to(secret)
+
+    record: dict = {}
+    monkeypatch.setattr(bundler, "_run", _stub_run_recording(record))
+    monkeypatch.setattr(bundler, "_check_tool", lambda *a, **k: True)
+    with pytest.raises(_StopAfterCopy):
+        bundler.BundlerResolver().dry_run(hostile)
+
+    assert "evil.gemspec" not in record["files"]
+
+
+def test_gomod_go_file_copy_refuses_symlink_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ``*.go`` source-copy loop must not follow a symlink even
+    when it appears as a regular ``.go`` path at copy time."""
+    from packages.sca.resolvers import gomod
+
+    secret = tmp_path / "operator-secret"
+    secret.write_bytes(b"hunter2")
+    hostile = tmp_path / "hostile"
+    hostile.mkdir()
+    (hostile / "go.mod").write_text("module example.com/x\n",
+                                    encoding="utf-8")
+    (hostile / "main.go").write_text("package main\n", encoding="utf-8")
+    (hostile / "leak.go").symlink_to(secret)
+
+    record: dict = {}
+    monkeypatch.setattr(gomod, "_run", _stub_run_recording(record))
+    monkeypatch.setattr(gomod, "_check_tool", lambda *a, **k: True)
+    with pytest.raises(_StopAfterCopy):
+        gomod.GoResolver().dry_run(hostile)
+
+    assert "main.go" in record["files"]
+    assert "leak.go" not in record["files"]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

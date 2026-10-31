@@ -17,6 +17,7 @@ from core.llm.coerce import structured_result
 from core.security.prompt_framing import with_audit_framing
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -205,11 +206,17 @@ def classify_security_impact(
     llm_client: Any,
     *,
     model_name: str | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Classify findings/suspicious outcomes for security impact.
 
     Returns a dict mapping ``file:function`` to the classification result.
     Only processes outcomes with status in (finding, suspicious).
+
+    *should_stop* (the orchestrator's environment dispatch gate) is
+    consulted before each per-outcome LLM call; True stops the loop —
+    already-classified outcomes keep their results, the rest carry no
+    ``security_impact`` record (never a fabricated ruling).
     """
     candidates = [
         o for o in outcomes
@@ -233,6 +240,13 @@ def classify_security_impact(
 
     total_cost = 0.0
     for outcome in candidates:
+        if should_stop is not None and should_stop():
+            logger.info(
+                "security classification stopped — environment guard "
+                "concluded (%d/%d outcomes classified)",
+                len(results), len(candidates),
+            )
+            break
         key = f"{outcome.file}:{outcome.function}"
         # Injection preflight over the untrusted inputs BEFORE the
         # call: this class renders its payload plaintext (see

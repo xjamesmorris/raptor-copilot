@@ -21,10 +21,14 @@ The adapter feeds those into Z3 and reports satisfiability:
     unsat     — constraints are mutually exclusive, no input can satisfy
                 them. For "is this path reachable" hypotheses → REFUTED;
                 for "these constraints are mutually exclusive / the path
-                is infeasible" hypotheses → CONFIRMED (the evidence
-                carries empty_matches_conclusive so the verdict ladder
-                honours that reading). Sound even when some conditions
-                were dropped as unparseable.
+                is infeasible" hypotheses → CONFIRMED. The evidence
+                carries empty_matches_conclusive; the verdict DIRECTION
+                is derived mechanically from the hypothesis's declared
+                ``polarity`` (undeclared polarity fails closed to
+                inconclusive rather than letting the evaluating LLM's
+                phrasing-aware claim pick the label — see
+                ``verdict.verdict_from``). Sound even when some
+                conditions were dropped as unparseable.
     unknown   — Z3 unavailable, all constraints unparseable, or solver
                 timed out. The runner converts to inconclusive.
 
@@ -40,6 +44,7 @@ from core.smt_solver.path_feasibility import (
     PathCondition,
     PathSMTResult,
     check_path_feasibility,
+    check_path_feasibility_dual,
 )
 
 from .base import ToolAdapter, ToolCapability, ToolEvidence
@@ -139,7 +144,21 @@ class SMTAdapter(ToolAdapter):
 
         try:
             profile = self._profile()
-            result: PathSMTResult = check_path_feasibility(
+            # Signedness honesty: the default uint64 profile is a
+            # GUESS — under it the ubiquitous signed error check
+            # (``ret < 0``) encodes as ``ULT(ret, 0)``, unsat, so one
+            # signedness-mismatched guard would refute (and thereby
+            # confirm infeasibility for) a perfectly live path. When
+            # the operator did not pin a profile, an unsat verdict is
+            # honored only if BOTH signedness profiles agree
+            # (check_path_feasibility_dual); a caller-supplied
+            # bv_profile asserts known signedness and keeps the
+            # cheaper single-profile check.
+            check = (
+                check_path_feasibility if self._bv_profile is not None
+                else check_path_feasibility_dual
+            )
+            result: PathSMTResult = check(
                 conditions, profile=profile,
             )
         except Exception as e:  # noqa: BLE001 — solver failure becomes tool-evidence error, never a crash
@@ -223,10 +242,11 @@ class SMTAdapter(ToolAdapter):
             success=True,
             matches=matches,
             summary=summary,
-            # unsat is a definitive proof despite the empty match list —
-            # without this flag the verdict ladder would invert a
-            # correct "confirmed" on an infeasibility-phrased hypothesis
-            # into "refuted".
+            # unsat is a definitive proof despite the empty match list.
+            # The flag tells the verdict ladder this emptiness is a
+            # tool result; the ladder then derives the verdict
+            # direction from the hypothesis's declared polarity
+            # (never from the LLM's post-hoc reading).
             empty_matches_conclusive=not result.feasible,
         )
 

@@ -23,6 +23,30 @@ config-gated. False negatives are cheap (we miss a deferral
 opportunity); false positives are expensive (we silence a real
 finding on a file that's actually loadable).
 
+Recovery / early-exit constructs make an abort non-terminating even
+when the abort statement itself is unconditional, so each detector
+also abstains when the language offers a way for the file to survive
+(or never reach) the abort:
+
+  * Go: a ``defer`` registered before the panic may ``recover()`` it,
+    and a ``return`` before the panic ends init first — any ``defer``
+    or ``return`` token in the init body before the panic → no
+    witness.
+  * JavaScript / PHP: a module-/file-scope ``return`` (CommonJS
+    module wrapper, PHP include) ends top-level execution before the
+    abort line is reached. Any ``return`` token not provably inside a
+    ``function`` body (or arrow-function body for JS) before the
+    abort → no witness. Braces whose opener can't be proven to be a
+    function (class/method/object bodies, bare blocks) count as
+    module-level — the cheap under-detect direction.
+  * Ruby: a top-level ``return`` ends the file's execution; an
+    INDENTED block opener at nesting depth zero breaks the column-0
+    nesting model (the following column-0 lines may be inside it) —
+    either → no witness.
+
+Suppression is only ever earned when the abort provably terminates
+loading; every ambiguity above degrades to "no signal".
+
 Per-language detection currently handled:
 
   * Python: ``raise <AbortException>(...)`` at module scope, NOT
@@ -35,7 +59,16 @@ Per-language detection currently handled:
     init body's top scope (not inside a conditional / loop).
   * Rust: ``compile_error!(...)`` at module scope.
   * PHP: file-scope ``throw new <Class>`` / ``die`` / ``exit`` at
-    brace-depth zero, statement-initial (conditional forms skipped).
+    brace-depth zero, statement-initial (conditional forms skipped),
+    AND with no call-shaped top-level code before it. PHP hoists
+    top-level function declarations at compile time — they bind
+    before ANY statement runs — so a late file-scope abort proves
+    nothing about bindings, and any top-level call before the abort
+    may already have executed the file's functions (a live page whose
+    dispatch chain ends in ``exit()`` is the canonical shape). The
+    witness is therefore only earned when nothing call-shaped
+    (``name(...)``, ``new``, include/require, ``goto``) precedes the
+    abort outside function bodies.
   * Ruby: unconditional column-0 ``raise`` / ``abort`` / ``exit`` /
     ``fail`` at nesting depth zero (modifier forms skipped).
 
@@ -51,6 +84,7 @@ import ast
 import logging
 import re
 from dataclasses import dataclass
+from core.source.lines import split_lines
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +120,7 @@ def detect_module_load_abort(
         if language == "python":
             return _detect_python(content)
         if language in ("javascript", "typescript", "tsx"):
-            return _detect_javascript(content)
+            return _detect_javascript(language, content)
         if language == "go":
             return _detect_go(content)
         if language == "rust":
@@ -178,10 +212,11 @@ def _py_summarise_raise(node: ast.Raise) -> str:
 
 
 # ---------------------------------------------------------------------------
-# JavaScript / TypeScript — regex with brace-depth tracking. No AST
-# in stdlib; pulling tree-sitter just for this detector is overkill
-# (the call-graph extractor already does that work). False-negative
-# bias on ambiguous cases is acceptable.
+# JavaScript / TypeScript — regex with brace-depth tracking over the
+# tokenizer-grade blanked view (comments, strings, templates, regex
+# literals, JSX text all spaced out by the shared substrate). No
+# grammar / parse errors → bail on the whole file (no abort — toward
+# no suppression).
 # ---------------------------------------------------------------------------
 
 
@@ -195,38 +230,89 @@ _JS_THROW_NEW = re.compile(
 
 _JS_STMT_BOUNDARY = frozenset({";", "{", "}"})
 
+_JS_RETURN = re.compile(r"return\b")
+# A brace provably opening a FUNCTION body: an arrow (``=>``) or a
+# ``function`` keyword header (optionally generator / named) whose
+# parameter list carries no braces. ONLY these scopes may contain a
+# ``return`` without ending module-level execution. Anything the
+# pattern can't prove (class/object method shorthand, bare blocks,
+# parameter defaults containing braces) counts as module-level, so a
+# ``return`` inside it abstains — the cheap under-detect direction; a
+# wrongly "function"-classified brace would instead let a module-level
+# return keep a false whole-file abort witness.
+# The parameter-list body is bounded: an unbounded ``[^{}]*`` re-scans
+# the window from every planted ``(`` — quadratic on hostile source —
+# and the caller only ever searches a 400-char window before the
+# brace, so params past 400 chars could never complete a match anyway.
+_JS_FN_BRACE = re.compile(
+    r"(?:=>|\bfunction\b(?:\s*\*)?(?:\s+[A-Za-z_$][\w$]*)?\s*\([^{}]{0,400}\))\s*$"
+)
 
-def _detect_javascript(content: str) -> ModuleLoadAbort | None:
+
+def _detect_javascript(
+    language: str, content: str,
+) -> ModuleLoadAbort | None:
     # Blank ALL non-code text (comments, strings, template literals,
-    # regex literals) in one shared-lexer pass, preserving newlines so
-    # the line-number report stays valid. Comment-only or string-only
-    # stripping is not enough: braces inside a REGEX literal
-    # (``var r = /}}/;``) corrupted the depth counter, so a throw
-    # inside a never-called function read as depth-zero — a
-    # false-positive whole-file abort gate that silenced every finding
-    # below it. Same class for a string with an unbalanced brace
-    # (``const s = "}";``).
-    from core.inventory.js_lexer import blank_js_noncode
+    # regex literals, JSX text) via the tokenizer-grade substrate,
+    # preserving newlines so the line-number report stays valid.
+    # Comment-only or string-only stripping is not enough: braces
+    # inside a REGEX literal (``var r = /}}/;``) corrupted the depth
+    # counter, so a throw inside a never-called function read as
+    # depth-zero — a false-positive whole-file abort gate that
+    # silenced every finding below it. Same class for a string with
+    # an unbalanced brace (``const s = "}";``).
+    from core.inventory.lexical_view import LexicalRefusal, blank_noncode
 
-    stripped = blank_js_noncode(content)
+    try:
+        stripped = blank_noncode(language, content)
+    except LexicalRefusal:
+        # Parse errors: recovered token boundaries are guesses; a
+        # partial view could fabricate a whole-file abort over live
+        # code. Bail on the whole file — toward no suppression.
+        return None
+    if stripped is None:
+        # Grammar unavailable — cannot vouch a code view; no witness.
+        return None
     # Walk character-by-character tracking brace and paren depth.
     # An unconditional module-level throw is one at depth zero
-    # before any function body opens it.
+    # before any function body opens it. Braces are additionally
+    # classified function / non-function so a module-level ``return``
+    # (a CommonJS wrapper can return; conditional blocks that return
+    # end the module before a later throw runs) abstains, while a
+    # ``return`` inside a proven function body doesn't.
     depth = 0
     paren = 0
+    fn_depth = 0
+    brace_is_fn: list[bool] = []
     last_significant = None
     i = 0
     n = len(stripped)
     while i < n:
         c = stripped[i]
         if c == "{":
+            is_fn = bool(_JS_FN_BRACE.search(stripped, max(0, i - 400), i))
+            brace_is_fn.append(is_fn)
+            if is_fn:
+                fn_depth += 1
             depth += 1
         elif c == "}":
             depth = max(0, depth - 1)
+            if brace_is_fn and brace_is_fn.pop():
+                fn_depth -= 1
         elif c == "(":
             paren += 1
         elif c == ")":
             paren = max(0, paren - 1)
+        elif c == "r" and fn_depth == 0 and (
+                i == 0 or not (stripped[i - 1].isalnum()
+                               or stripped[i - 1] in "_$")):
+            if _JS_RETURN.match(stripped, i):
+                # A return not provably inside a function body may end
+                # module-level execution before any later abort line is
+                # reached (CJS top-level return, return inside an
+                # executed conditional block). Abstain — toward no
+                # suppression.
+                return None
         elif c == "t" and depth == 0 and paren == 0 and (
                 last_significant is None
                 or last_significant in _JS_STMT_BOUNDARY):
@@ -274,6 +360,12 @@ def _js_skip_string(source: str, start: int) -> int | None:
 
 _GO_INIT_HEADER = re.compile(r"\bfunc\s+init\s*\(\s*\)\s*\{")
 _GO_PANIC_CALL = re.compile(r"\bpanic\s*\(")
+# Recovery / early-exit tokens BEFORE the panic disqualify the abort:
+# a ``defer`` registered first may ``recover()`` the panic (the file
+# then loads normally), and a ``return`` ends init before the panic
+# runs. Textual check on the comment/string-stripped body — a token
+# inside a nested func literal also abstains (under-detect, cheap).
+_GO_RECOVERY_TOKEN = re.compile(r"\b(?:defer|return)\b")
 
 
 def _go_strip_comments_and_strings(content: str) -> str:
@@ -345,6 +437,11 @@ def _detect_go(content: str) -> ModuleLoadAbort | None:
     init_body = content[body_start:body_end]
     panic_match = _GO_PANIC_CALL.search(init_body)
     if not panic_match:
+        return None
+    # A defer registered before the panic may recover() it; a return
+    # before the panic ends init first. Either way the abort is not
+    # proven to terminate loading — no witness.
+    if _GO_RECOVERY_TOKEN.search(init_body, 0, panic_match.start()):
         return None
     # Panic must be at init body's top scope (not inside any
     # nested block — if / for / switch / select). If brace depth
@@ -458,7 +555,10 @@ def _go_panic_is_unconditional(body: str, panic_offset: int) -> bool:
 # may also appear inside ``#[cfg(...)]`` gates — those are
 # conditional on build features and we conservatively do NOT
 # flag them (build configuration is out of scope for static
-# analysis).
+# analysis). Matched over the tokenizer-grade blanked view so a
+# ``compile_error!`` inside a comment or string literal (both
+# idiomatic in macro documentation) can never fabricate the
+# whole-file abort gate. No grammar / parse errors → bail.
 # ---------------------------------------------------------------------------
 
 
@@ -468,6 +568,18 @@ _RUST_COMPILE_ERROR = re.compile(
 
 
 def _detect_rust(content: str) -> ModuleLoadAbort | None:
+    from core.inventory.lexical_view import LexicalRefusal, blank_noncode
+
+    try:
+        stripped = blank_noncode("rust", content)
+    except LexicalRefusal:
+        # Parse errors: recovered token boundaries are guesses; a
+        # partial view could fabricate a whole-file abort. Bail —
+        # toward no suppression.
+        return None
+    if stripped is None:
+        # Grammar unavailable — cannot vouch a code view; no witness.
+        return None
     # Naive but effective: examine only the FIRST compile_error! at
     # line start (after any leading whitespace). If that occurrence
     # is attribute-gated, report nothing — later occurrences are not
@@ -476,16 +588,36 @@ def _detect_rust(content: str) -> ModuleLoadAbort | None:
     # gates; treating those sites as out of scope is the module-wide
     # false-negative bias (miss a deferral, never suppress live
     # code).
-    m = _RUST_COMPILE_ERROR.search(content)
+    m = _RUST_COMPILE_ERROR.search(stripped)
     if not m:
+        return None
+    # Module scope only: a ``compile_error!`` nested inside braces is
+    # most commonly a ``macro_rules!`` arm (the ubiquitous "bad
+    # invocation" guard, e.g. a fallback match arm) or function-body
+    # code — sites that fire conditionally or never, where flagging
+    # would hard-suppress a live file. A ``mod``-nested unconditional
+    # compile_error is skipped too: a missed deferral, the module-wide
+    # cheap (false-negative) direction. All three delimiter pairs
+    # count: macro invocations take any token-tree delimiter, and a
+    # ``compile_error!`` inside ``ignore_it!( ... )`` / ``ignore_it![
+    # ... ]`` never expands (rustc-verified) but leaves the prefix
+    # brace-balanced — only the dangling ``(`` / ``[`` betrays it.
+    # Valid Rust code before a genuine module-scope statement nets
+    # zero on every pair; delimiters inside strings/comments are
+    # already blanked, so raw counts over the prefix are exact.
+    prefix = stripped[: m.start()]
+    if any(
+        prefix.count(op) - prefix.count(cl) != 0
+        for op, cl in (("{", "}"), ("(", ")"), ("[", "]"))
+    ):
         return None
     # Check that the preceding non-whitespace token isn't ``]`` (end
     # of an attribute). A bare attribute-attached compile_error like
     # ``#[cfg(...)] compile_error!(...)`` is conditional; skip it.
-    before = content[: m.start()].rstrip()
+    before = prefix.rstrip()
     if before.endswith("]"):
         return None
-    line_no = content.count("\n", 0, m.start()) + 1
+    line_no = stripped.count("\n", 0, m.start()) + 1
     return ModuleLoadAbort(
         line=line_no,
         summary="compile_error!(...)",
@@ -499,66 +631,19 @@ def _detect_rust(content: str) -> ModuleLoadAbort | None:
 # tracking (mirrors the JS detector) + a statement-initial gate so a
 # CONDITIONAL abort (``if (x) die();`` — the abort follows ``)``) is
 # never flagged (a false positive would wrongly hard-suppress live code).
+#
+# Scanned over the tokenizer-grade blanked view: comments, strings,
+# heredocs/nowdocs, backtick shell strings and the HTML text outside
+# the PHP tags are spaced out first, so ``die`` in prose or string
+# data can never fabricate the whole-file abort gate. Only the
+# ``<?php`` open tags remain for this detector to blank (so the first
+# statement after a tag is statement-initial). No grammar / parse
+# errors → bail, toward no suppression.
 # ---------------------------------------------------------------------------
 
 
-_PHP_LINE_COMMENT = re.compile(r"(//|#)[^\n]*")
-_PHP_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
 _PHP_TAG = re.compile(r"<\?php|<\?=|<\?|\?>")
 
-
-def _php_blank_outside_php(content: str) -> str:
-    """Blank everything OUTSIDE ``<?php … ?>`` regions to spaces,
-    preserving newlines. Text outside the tags is template OUTPUT the
-    interpreter echoes, not code — the word ``die`` in HTML prose used
-    to match _PHP_ABORT and fabricate a whole-file abort gate on a
-    fully live file.
-
-    In-region scanning is quote/comment-aware when looking for the
-    closing ``?>``: a ``?>`` inside a string or ``/* */`` block
-    comment does not leave PHP mode, while one inside a ``//`` / ``#``
-    line comment DOES (matching the real interpreter). Heredocs are
-    not modelled — a ``?>`` inside a heredoc mis-reads as region end
-    and blanks the remainder as HTML, which only under-detects (the
-    module-wide cheap failure direction)."""
-    out = list(content)
-    n = len(out)
-    i = 0
-    in_php = False
-    while i < n:
-        if not in_php:
-            if content.startswith("<?", i):
-                in_php = True
-                i += 2
-                continue
-            if out[i] != "\n":
-                out[i] = " "
-            i += 1
-            continue
-        c = content[i]
-        if content.startswith("?>", i):
-            in_php = False
-            i += 2
-            continue
-        if c == "/" and i + 1 < n and content[i + 1] == "*":
-            end = content.find("*/", i + 2)
-            i = n if end == -1 else end + 2
-            continue
-        if (c == "#" or (c == "/" and i + 1 < n and content[i + 1] == "/")):
-            # Line comment: ends at newline OR at a closing tag.
-            while i < n and content[i] != "\n":
-                if content.startswith("?>", i):
-                    break
-                i += 1
-            continue
-        if c in "\"'":
-            j = _js_skip_string(content, i)
-            if j is None:
-                break  # unterminated string — rest is string data
-            i = j
-            continue
-        i += 1
-    return "".join(out)
 _PHP_ABORT = re.compile(r"throw\s+new\s+([A-Za-z_\\][\w\\]*)|die\b|exit\b")
 # A statement-initial abort is preceded (ignoring whitespace) by one of
 # these — i.e. it begins a statement, so it is not a branch/modifier body.
@@ -566,22 +651,117 @@ _PHP_ABORT = re.compile(r"throw\s+new\s+([A-Za-z_\\][\w\\]*)|die\b|exit\b")
 # after ``<?php`` sees ``last_significant is None`` and counts as initial.)
 _PHP_STMT_BOUNDARY = frozenset({";", "{", "}"})
 
+# Case-insensitive: PHP keywords fold case, and this is a
+# DISQUALIFIER — a file-scope ``Return;`` ends the include exactly
+# like ``return;``, so a case-sensitive miss here keeps a wrong
+# witness (suppression-unsafe), unlike the abort trigger's own
+# lowercase calibration, which only misses a witness (fail-safe).
+_PHP_RETURN = re.compile(r"return\b", re.IGNORECASE)
+
+# Alternative (colon) syntax markers: ``if (...): ... endif;`` blocks
+# open NO brace, so the depth model reads their bodies as file scope —
+# an abort inside one looked unconditional. The end keywords are
+# mandatory for the colon form, so their presence anywhere in the code
+# view means the depth model cannot be trusted for this file; abstain
+# wholesale (a missed deferral, the module-wide cheap direction).
+# IGNORECASE for the same disqualifier-fails-unsafe reason as above.
+_PHP_ALT_SYNTAX_END = re.compile(
+    r"\b(?:endif|endforeach|endfor|endwhile|endswitch|enddeclare)\b",
+    re.IGNORECASE,
+)
+
+# Words whose trailing ``(`` is a language construct, not a call into
+# user code: control headers, inspection constructs, output
+# constructs, and the aborts themselves (an abort's own argument list
+# must not disqualify its witness; calls INSIDE the arguments still
+# match at their own position).
+_PHP_NONCALL_PAREN_WORDS = frozenset({
+    "if", "elseif", "for", "foreach", "while", "switch", "catch",
+    "match", "declare", "isset", "unset", "empty", "list", "array",
+    "echo", "print", "return", "exit", "die", "define", "use",
+    # Declaration headers: ``function name(`` / anonymous
+    # ``function (`` / arrow ``fn(`` open a parameter list, not a
+    # call site (the name case is handled by the preceding-word
+    # check in the walk).
+    "function", "fn",
+})
+
+# Whole words that execute code even without a paren-shaped call
+# site: ``new`` runs a constructor, the include family executes
+# another file (which can call back into this one — PHP hoisting
+# makes this file's functions callable the moment it is compiled),
+# and ``goto`` breaks the top-to-bottom execution model the whole
+# walk assumes (a jump can skip the abort entirely). IGNORECASE:
+# keywords fold case in PHP, and these are disqualifiers — a
+# case-sensitive miss on ``Goto skip;`` would keep a witness for a
+# file whose execution jumps past the abort (suppression-unsafe),
+# while the abort trigger's own lowercase calibration only misses a
+# witness (fail-safe).
+_PHP_EXEC_WORD = re.compile(
+    r"(?:new|include(?:_once)?|require(?:_once)?|goto)\b",
+    re.IGNORECASE,
+)
+
+# First characters (either case) that can start one of the
+# disqualifier words checked in the walk's word branch: return /
+# new / include(_once) / require(_once) / goto / namespace.
+_PHP_WORD_BRANCH_CHARS = frozenset("rnigRNIG")
+
+# ``namespace`` declaration head: inside a namespace, an unqualified
+# function name resolves namespace-first, so the one plain-function
+# exemption in _PHP_NONCALL_PAREN_WORDS (``define``) can bind to a
+# hoisted namespace-local shadow that executes user code. The other
+# entries are reserved constructs in MODERN PHP and cannot be
+# shadowed there; ``match`` (reserved only since 8.0) and ``fn``
+# (7.4) CAN be user functions in the legacy codebases this walk
+# targets — but a file carrying such a shadow parse-errors under the
+# tree-sitter PHP-8 grammar, so ``blank_noncode`` raises
+# LexicalRefusal and the detector abstains before this word list is
+# ever consulted. The no-shadow guarantee for those two lives in the
+# lexical gate, not in reservedness.
+_PHP_NAMESPACE = re.compile(r"namespace\b", re.IGNORECASE)
+# A brace provably opening a PHP function/method/closure body: a
+# ``function`` keyword with no brace/semicolon between it and the
+# ``{`` (covers names, parameter lists, ``use (...)`` closures and
+# return-type declarations). Same abstain doctrine as the JS matcher:
+# an unproven brace counts as file-scope, so a ``return`` inside it
+# withholds the witness (a file-scope return ends the include before
+# any later abort line runs). IGNORECASE so an upper-cased
+# ``FUNCTION`` header classifies its body identically.
+_PHP_FN_BRACE = re.compile(r"\bfunction\b[^{};]*$", re.IGNORECASE)
+
 
 def _detect_php(content: str) -> ModuleLoadAbort | None:
+    from core.inventory.lexical_view import LexicalRefusal, blank_noncode
+
+    try:
+        stripped = blank_noncode("php", content)
+    except LexicalRefusal:
+        # Parse errors: recovered token boundaries are guesses; a
+        # partial view could fabricate a whole-file abort. Bail —
+        # toward no suppression.
+        return None
+    if stripped is None:
+        # Grammar unavailable — cannot vouch a code view; no witness.
+        return None
+
     def _spaces(m: re.Match[str]) -> str:
         return re.sub(r"[^\n]", " ", m.group(0))
-    # HTML/text outside the PHP tags is output, not code — blank it
-    # before any matching so prose containing ``die`` / ``exit`` can
-    # never fabricate the whole-file abort gate.
-    stripped = _php_blank_outside_php(content)
-    stripped = _PHP_BLOCK_COMMENT.sub(_spaces, stripped)
-    stripped = _PHP_LINE_COMMENT.sub(_spaces, stripped)
-    # Blank the PHP open/close tags so the first statement after ``<?php``
-    # is statement-initial and ``->`` / ``?>`` ``>`` chars never read as a
-    # boundary.
+    # Blank the PHP open tags so the first statement after ``<?php``
+    # is statement-initial and the tag chars never read as a boundary
+    # (the close tags and surrounding HTML are already blanked).
     stripped = _PHP_TAG.sub(_spaces, stripped)
+    # Alternative (colon) syntax anywhere in the file breaks the
+    # brace-depth model — abstain wholesale (see _PHP_ALT_SYNTAX_END).
+    if _PHP_ALT_SYNTAX_END.search(stripped):
+        return None
     depth = 0
+    fn_depth = 0
+    brace_is_fn: list[bool] = []
     last_significant = None  # last non-whitespace char seen
+    # A namespace declaration makes unqualified function names resolve
+    # namespace-first (see _PHP_NAMESPACE / the define exemption).
+    namespace_seen = False
     i = 0
     n = len(stripped)
     while i < n:
@@ -594,17 +774,120 @@ def _detect_php(content: str) -> ModuleLoadAbort | None:
             i = j
             continue
         if c == "{":
+            is_fn = bool(_PHP_FN_BRACE.search(stripped, max(0, i - 400), i))
+            brace_is_fn.append(is_fn)
+            if is_fn:
+                fn_depth += 1
             depth += 1
         elif c == "}":
             depth = max(0, depth - 1)
+            if brace_is_fn and brace_is_fn.pop():
+                fn_depth -= 1
+        elif c == "(" and fn_depth == 0:
+            # Call-shaped top-level code disqualifies any later abort.
+            # PHP hoists top-level declarations at compile time: every
+            # function in the file is bound before the first statement
+            # runs, so top-level code before the abort can CALL them
+            # (the live-page shape: a dispatch chain that invokes the
+            # file's functions and only then ends in ``exit()``).
+            # Include/require before the abort likewise hands control
+            # to another file that can call back in. Only construct
+            # parens (control headers, isset/list/echo/... and
+            # declaration parameter lists) are exempt; calls inside
+            # their arguments still match at their own ``(``.
+            #
+            # Coverage boundary (mechanism note): the disqualifier
+            # models the EXPLICIT execution statements of the linear
+            # top-level flow — call shapes, ``new``, include/require,
+            # ``goto``, ``return``. Execution reached through other
+            # language surfaces follows those surfaces' own shapes;
+            # the documented shape pins live in the test suite.
+            j = i - 1
+            while j >= 0 and stripped[j].isspace():
+                j -= 1
+            prev = stripped[j] if j >= 0 else ""
+            if prev in ")]\"'":
+                # ``(expr)(...)`` / ``$a['k'](...)`` dynamic calls,
+                # and the string-callable form ``'name'();`` — the
+                # blanked view spaces string INTERIORS but keeps the
+                # quotes, so the surviving quote before ``(`` is the
+                # call witness.
+                return None
+            if prev and (prev.isalnum() or prev in "_$"):
+                k = j
+                while k >= 0 and (stripped[k].isalnum()
+                                  or stripped[k] in "_$\\"):
+                    k -= 1
+                raw_word = stripped[k + 1:j + 1]
+                word = raw_word.split("\\")[-1].lower()
+                if k >= 0 and stripped[k] in ">:":
+                    # ``->word(`` / ``::word(`` is a user method or
+                    # static call whatever the word says: construct
+                    # names are constructs only in plain-call
+                    # position (semi-reserved words are legal method
+                    # names since PHP 7), so ``$o->exit(...)`` is
+                    # user code executing before the abort.
+                    return None
+                if "\\" in raw_word.lstrip("\\"):
+                    # A QUALIFIED name (``a\b(...)``, leading
+                    # backslash or not) always names a user function:
+                    # language constructs cannot be namespace-
+                    # qualified, and only a single LEADING backslash
+                    # names a global builtin. The bare-word exemption
+                    # below must never see it.
+                    return None
+                if word == "define" and namespace_seen \
+                        and not raw_word.startswith("\\"):
+                    # ``define`` is the one plain FUNCTION in the
+                    # exemption list (everything else is a reserved
+                    # construct and cannot be shadowed). Inside a
+                    # namespace, the unqualified name resolves
+                    # namespace-first, so a hoisted local
+                    # ``function define(...)`` shadow executes user
+                    # code. Scoped drop rather than removing the
+                    # exemption entirely: genuine top-abort preludes
+                    # commonly ``define()`` constants, and only
+                    # namespaced files carry the shadow resolution —
+                    # a leading-backslash ``\define(`` names the
+                    # global builtin explicitly and stays exempt.
+                    return None
+                if word not in _PHP_NONCALL_PAREN_WORDS:
+                    # ``function name(`` is a declaration header, not
+                    # a call: exempt when the word before the name is
+                    # the function keyword.
+                    m = j - len(word)
+                    while m >= 0 and stripped[m].isspace():
+                        m -= 1
+                    p = m
+                    while p >= 0 and (stripped[p].isalnum()
+                                      or stripped[p] in "_"):
+                        p -= 1
+                    if stripped[p + 1:m + 1].lower() != "function":
+                        return None
+        elif c in _PHP_WORD_BRANCH_CHARS and fn_depth == 0 and (
+                i == 0 or not (stripped[i - 1].isalnum()
+                               or stripped[i - 1] in "_$")):
+            if c in "rR" and _PHP_RETURN.match(stripped, i):
+                # A file-scope return (directly, or inside an executed
+                # conditional block) ends the include before any later
+                # abort runs. Abstain — toward no suppression.
+                return None
+            if _PHP_EXEC_WORD.match(stripped, i):
+                # ``new`` runs a constructor, include/require executes
+                # another file (which can call this file's hoisted
+                # functions), ``goto`` may skip the abort entirely.
+                # Any of them before the abort → no witness.
+                return None
+            if c in "nN" and _PHP_NAMESPACE.match(stripped, i):
+                namespace_seen = True
         elif depth == 0 and (c in "tde") and (
                 last_significant is None or last_significant in _PHP_STMT_BOUNDARY):
             # Only attempt a match at a statement boundary at file scope.
-            m = _PHP_ABORT.match(stripped, i)
+            m = _PHP_ABORT.match(stripped, i)  # type: ignore[assignment]
             if m:
-                tok = m.group(0).split()[0]
-                summary = (f"throw new {m.group(1).split(chr(92))[-1]}"
-                           if m.group(1) else tok)
+                tok = m.group(0).split()[0]  # type: ignore[attr-defined]
+                summary = (f"throw new {m.group(1).split(chr(92))[-1]}"  # type: ignore[attr-defined]
+                           if m.group(1) else tok)  # type: ignore[attr-defined]
                 line_no = stripped.count("\n", 0, i) + 1
                 return ModuleLoadAbort(line=line_no, summary=summary)
         if not c.isspace():
@@ -642,18 +925,59 @@ _RB_ABORT = re.compile(r"^(raise\s+\S|abort\b|exit!|exit\b|fail\s+\S|Kernel\.(ab
 # continues, the file loads, and flagging it fabricates the whole-file
 # dead gate on a live file.
 _RB_MODIFIER = re.compile(r"\b(if|unless|while|until|rescue)\b")
+# An endless method definition (``def foo = 42``, ``def foo(a) = a``)
+# opens NO body and has NO ``end`` — counting it as an opener leaves
+# the depth stuck at 1 and silently disables detection for the rest
+# of the file. Setter defs (``def foo=(v)``) keep their ``end`` and
+# must NOT match: the ``=`` alternative with parens requires the
+# parameter list first, and the paren-less alternative requires
+# whitespace on both sides of the ``=``.
+_RB_ENDLESS_DEF = re.compile(
+    r"^def\s+(?:self\s*\.\s*)?[A-Za-z_]\w*[!?]?"
+    r"(?:\s*\([^()]*\)\s*=(?![=~>])|\s+=\s)"
+)
+# A top-level ``return`` (valid at Ruby file scope) ends the file's
+# execution — any later abort line never runs. Modifier-conditional
+# forms (``return if cond``) are ambiguous the same way; both abstain.
+_RB_RETURN = re.compile(r"^return\b")
 
 
 def _detect_ruby(content: str) -> ModuleLoadAbort | None:
+    # Scan the tokenizer-grade blanked view: comments, strings, heredoc
+    # bodies and the ``__END__`` section are spaced out, so a column-0
+    # ``raise`` / ``exit`` line inside a heredoc or multi-line string
+    # (idiomatic Ruby: SQL, usage banners) can never fabricate the
+    # whole-file abort gate. String DELIMITERS survive blanking, so a
+    # real ``raise "boom"`` still reads as raise-with-argument. No
+    # grammar / parse errors → bail, toward no suppression.
+    from core.inventory.lexical_view import LexicalRefusal, blank_noncode
+
+    try:
+        blanked = blank_noncode("ruby", content)
+    except LexicalRefusal:
+        return None
+    if blanked is None:
+        return None
     depth = 0
-    for idx, raw in enumerate(content.splitlines()):
-        # Strip trailing line comment (best-effort; a ``#`` inside a string
-        # is rare at module scope and only risks under-detection).
-        line = re.sub(r"#.*$", "", raw)
+    for idx, line in enumerate(split_lines(blanked)):
         stripped = line.strip()
         if not stripped:
             continue
         is_col0 = line[:1] not in (" ", "\t")
+        if depth == 0:
+            if _RB_RETURN.match(stripped):
+                # Top-level return — execution ends here; a later abort
+                # never runs. Abstain, toward no suppression.
+                return None
+            if (not is_col0 and _RB_OPENER.match(stripped)
+                    and not _RB_ONELINER.search(stripped)
+                    and not _RB_ENDLESS_DEF.match(stripped)):
+                # An INDENTED opener at depth zero breaks the column-0
+                # nesting model: following column-0 lines (including an
+                # abort) may sit inside its body, unconditionally-looking
+                # but conditional. Bail on the whole file — toward no
+                # suppression.
+                return None
         if is_col0 and depth == 0:
             abort = _RB_ABORT.match(stripped)
             if abort and not _RB_MODIFIER.search(stripped[len(abort.group(0)):]):
@@ -666,8 +990,11 @@ def _detect_ruby(content: str) -> ModuleLoadAbort | None:
         if is_col0:
             if _RB_END.match(stripped):
                 depth = max(0, depth - 1)
-            elif _RB_OPENER.match(stripped) and not _RB_ONELINER.search(stripped):
-                # one-liner (``def f; end``) is net-zero — don't increment.
+            elif (_RB_OPENER.match(stripped)
+                    and not _RB_ONELINER.search(stripped)
+                    and not _RB_ENDLESS_DEF.match(stripped)):
+                # one-liner (``def f; end``) and endless defs
+                # (``def f = 42``) are net-zero — don't increment.
                 depth += 1
     return None
 

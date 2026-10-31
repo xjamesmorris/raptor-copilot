@@ -9,6 +9,17 @@ from unittest.mock import patch
 from core.project.project import Project, ProjectManager
 
 
+import pytest
+
+@pytest.fixture(autouse=True)
+def _user_state_in_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """User registries stay out of the real home: the root-conftest
+    layer doing this is stripped from release extracts (conftest.py
+    is export-ignore), so the pin must travel in-file."""
+    from core.testing.state_isolation import pin_user_state_dirs
+    pin_user_state_dirs(monkeypatch, tmp_path)
+
+
 class TestProject(unittest.TestCase):
 
     def setUp(self):
@@ -347,6 +358,172 @@ class TestProjectManager(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.mgr.rename("a", "none")
 
+    def test_rename_moves_default_output_dir(self):
+        p = self.mgr.create("old", self.target_code)
+        old_output = Path(p.output_dir)
+        (old_output / "scan_1").mkdir(parents=True)
+        (old_output / "scan_1" / "findings.json").write_text("[]")
+        renamed = self.mgr.rename("old", "new")
+        new_output = Path(renamed.output_dir)
+        self.assertNotEqual(new_output, old_output)
+        self.assertEqual(new_output.name, "new")
+        self.assertFalse(old_output.exists())
+        self.assertTrue((new_output / "scan_1" / "findings.json").exists())
+        # Persisted, not just on the returned object
+        self.assertEqual(self.mgr.load("new").output_dir,
+                         str(new_output))
+
+    def test_rename_then_recreate_old_name_does_not_share(self):
+        # rename A→B once left output_dir at <base>/A; create(A) then
+        # minted a SECOND project on the same dir — B's runs showed in
+        # A's status and a purge of A destroyed B's runs.
+        p = self.mgr.create("appa", self.target_code)
+        old_output = Path(p.output_dir)
+        (old_output / "scan_1").mkdir(parents=True)
+        renamed = self.mgr.rename("appa", "appb")
+        recreated = self.mgr.create("appa", self.target_other)
+        self.assertNotEqual(recreated.output_dir, renamed.output_dir)
+        # The re-created project must not see the renamed project's runs
+        self.assertFalse(
+            (Path(recreated.output_dir) / "scan_1").exists())
+
+    def test_rename_keeps_custom_output_dir(self):
+        custom = Path(self.tmpdir.name) / "custom-out"
+        p = self.mgr.create("old", self.target_code,
+                            output_dir=str(custom))
+        self.mgr.rename("old", "new")
+        self.assertEqual(self.mgr.load("new").output_dir, p.output_dir)
+        self.assertTrue(custom.exists())
+
+    def test_rename_refuses_existing_destination_dir(self):
+        from core.project.project import DEFAULT_OUTPUT_BASE
+        p = self.mgr.create("old", self.target_code)
+        blocker = DEFAULT_OUTPUT_BASE / "new"
+        blocker.mkdir(parents=True)
+        with self.assertRaises(ValueError):
+            self.mgr.rename("old", "new")
+        # Nothing mutated: old project intact, its dir untouched
+        self.assertIsNotNone(self.mgr.load("old"))
+        self.assertIsNone(self.mgr.load("new"))
+        self.assertTrue(Path(p.output_dir).exists())
+
+    def test_rename_force_with_live_runs_keeps_dir(self):
+        # A live run's directory must never move under it: the forced
+        # rename keeps the old path (and create()'s shared-dir refusal
+        # protects a later re-create of the old name).
+        from unittest.mock import patch as _patch
+        p = self.mgr.create("old", self.target_code)
+        live_dir = Path(p.output_dir) / "scan_live"
+        live_dir.mkdir(parents=True)
+        with _patch("core.project.clean.split_live_runs",
+                    return_value=([], [live_dir])):
+            renamed = self.mgr.rename("old", "new", force=True)
+        self.assertEqual(renamed.output_dir, p.output_dir)
+        self.assertTrue(live_dir.exists())
+        with self.assertRaises(ValueError):
+            self.mgr.create("old", self.target_other)
+
+    def test_create_holds_registry_lock_across_exists_check(self):
+        """create() serialises on the registry file: a competing
+        create that wins the lock first must make ours fail the
+        exists check (no silent last-writer-wins)."""
+        import contextlib as _ctx
+        from unittest.mock import patch as _patch
+
+        from core.project import project as project_mod
+
+        real_lock = project_mod.project_file_lock
+
+        @_ctx.contextmanager
+        def racing_lock(project_file):
+            with real_lock(project_file):
+                # Simulate the competing create committing while we
+                # hold (i.e. before we re-check existence).
+                if not project_file.exists():
+                    project_file.write_text("{}")
+                yield
+
+        with _patch.object(project_mod, "project_file_lock",
+                           racing_lock), \
+                self.assertRaises(ValueError):
+            self.mgr.create("raced", self.target_code)
+
+    def test_create_refuses_claimed_output_dir(self):
+        shared = str(Path(self.tmpdir.name) / "shared-out")
+        self.mgr.create("a", self.target_a, output_dir=shared)
+        with self.assertRaises(ValueError):
+            self.mgr.create("b", self.target_b, output_dir=shared)
+
+    def test_create_owner_scan_runs_inside_the_dir_claim(self):
+        """The shared-dir owner scan must run INSIDE the output-dir
+        claim lock: the name lock is per-NAME, so a competing create of
+        a DIFFERENT name with the same dir that wins the claim first
+        must be visible to our re-scan."""
+        import contextlib as _ctx
+        from unittest.mock import patch as _patch
+
+        from core.json import save_json
+
+        shared = str(Path(self.tmpdir.name) / "shared-race")
+        real_claim = self.mgr._output_dir_claim_lock
+
+        @_ctx.contextmanager
+        def racing_claim(output_dir):
+            with real_claim(output_dir):
+                # Simulate the competing create (different name, same
+                # dir) having committed while holding the claim.
+                winner = self.mgr.projects_dir / "winner.json"
+                if not winner.exists():
+                    save_json(winner, {
+                        "name": "winner", "target": self.target_a,
+                        "output_dir": str(Path(shared).resolve()),
+                        "created": "2026-01-01T00:00:00+00:00",
+                    })
+                yield
+
+        with _patch.object(self.mgr, "_output_dir_claim_lock",
+                           racing_claim), \
+                self.assertRaises(ValueError):
+            self.mgr.create("loser", self.target_b, output_dir=shared)
+
+    def test_concurrent_creates_different_names_never_share_a_dir(self):
+        """Reviewer repro: two concurrent creates of DIFFERENT names
+        with the same --output-dir must never both succeed (the
+        per-name registry lock alone does not serialise them)."""
+        import threading
+
+        for round_no in range(10):
+            shared = str(Path(self.tmpdir.name) / f"race-{round_no}")
+            barrier = threading.Barrier(2)
+            results: dict[str, str] = {}
+
+            def worker(name: str, shared=shared, barrier=barrier,
+                       results=results) -> None:
+                barrier.wait()
+                try:
+                    self.mgr.create(name, self.target_a,
+                                    output_dir=shared)
+                    results[name] = "ok"
+                except ValueError:
+                    results[name] = "refused"
+
+            names = (f"racer-a-{round_no}", f"racer-b-{round_no}")
+            threads = [threading.Thread(target=worker, args=(n,))
+                       for n in names]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            oks = [n for n in names if results.get(n) == "ok"]
+            self.assertEqual(
+                len(oks), 1,
+                f"round {round_no}: exactly one create may win a "
+                f"shared dir, got {results}")
+            owners = [p.name for p in self.mgr.list_projects()
+                      if str(Path(p.output_dir).resolve())
+                      == str(Path(shared).resolve())]
+            self.assertEqual(owners, oks)
+
     def test_delete_clears_active_symlink(self):
         self.mgr.create("myapp", self.target_code)
         active = self.mgr.projects_dir / ".active"
@@ -442,6 +619,356 @@ class TestProjectManager(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.mgr.remove_run("myapp", "scan-20260406")
 
+    def test_t28_adopt_receipt_run_refuses_before_move_or_pin_rewrite(self):
+        from core.json import save_json
+        from core.run.metadata import RUN_RUNTIME_RECEIPT_KEY
+
+        project = self.mgr.create("myapp", self.target_code)
+        source = Path(self.tmpdir.name) / "scan-receipt"
+        source.mkdir()
+        save_json(
+            source / ".raptor-run.json",
+            {
+                "version": 2,
+                "command": "scan",
+                "status": "running",
+                "target_path": self.target_code,
+                "project": None,
+                "project_source": "session",
+                RUN_RUNTIME_RECEIPT_KEY: {},
+            },
+            mode=0o600,
+        )
+        before = (source / ".raptor-run.json").read_bytes()
+        with patch(
+            "core.run.metadata.write_run_pin",
+            side_effect=AssertionError(
+                "receipt adoption must refuse before pin rewrite"
+            ),
+        ):
+            self.assertEqual(
+                self.mgr.add_directory("myapp", str(source)),
+                0,
+            )
+        self.assertTrue(source.is_dir())
+        self.assertEqual((source / ".raptor-run.json").read_bytes(), before)
+        self.assertFalse((project.output_path / source.name).exists())
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestThreatModelStampRMW(unittest.TestCase):
+    def test_stamp_does_not_clobber_concurrent_trust_write(self):
+        # The threat-model actions load a project snapshot BEFORE
+        # potentially long work; persisting the whole snapshot at the
+        # end re-wrote the trust dict as of load time — a trust
+        # marker removed in the meantime silently resurrected (trust
+        # markers gate repo-trust witnesses). The RMW mutator reloads
+        # under the same lock every other registry mutator uses.
+        with TemporaryDirectory() as td:
+            mgr = ProjectManager(Path(td) / "projects")
+            mgr.create("p1", td, resolve_target=False)
+            mgr.set_trust_marker("p1", "config")
+            # Simulate the stale-snapshot writer: a concurrent
+            # operator removes the marker mid-flight...
+            mgr.clear_trust_marker("p1", "config")
+            # ...then the threat-model pass stamps its fields.
+            mgr.update_threat_model_stamp(
+                "p1", updated_at="2026-01-01T00:00:00+00:00",
+                path="/x/tm.json",
+            )
+            fresh = mgr.load("p1")
+            self.assertEqual(fresh.threat_model_path, "/x/tm.json")
+            self.assertEqual(
+                fresh.threat_model_updated, "2026-01-01T00:00:00+00:00")
+            self.assertFalse(fresh.trust)  # marker stays removed
+
+    def test_stamp_without_path_keeps_existing_path(self):
+        with TemporaryDirectory() as td:
+            mgr = ProjectManager(Path(td) / "projects")
+            mgr.create("p2", td, resolve_target=False)
+            mgr.update_threat_model_stamp(
+                "p2", updated_at="t1", path="/x/tm.json")
+            mgr.update_threat_model_stamp("p2", updated_at="t2")
+            fresh = mgr.load("p2")
+            self.assertEqual(fresh.threat_model_path, "/x/tm.json")
+            self.assertEqual(fresh.threat_model_updated, "t2")
+
+
+class TestRegistryMutationLockDiscipline(unittest.TestCase):
+    """rename() and delete() must participate in the registry-file RMW
+    lock discipline: a locked mutator that loaded before an UNLOCKED
+    rename/delete completed would _save() afterwards and resurrect the
+    old-name / deleted registry file (duplicate registration over one
+    output dir, zombie project). The recorder wraps the real lock so
+    the critical-section state is observed at lock release.
+    """
+
+    def setUp(self):
+        self.tmpdir = TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        out_base = Path(self.tmpdir.name) / "out" / "projects"
+        _ob = patch("core.project.project.DEFAULT_OUTPUT_BASE", out_base)
+        _ob.start()
+        self.addCleanup(_ob.stop)
+        self.projects_dir = Path(self.tmpdir.name) / "projects"
+        self.mgr = ProjectManager(projects_dir=self.projects_dir)
+        self.target = str(Path(self.tmpdir.name) / "code")
+
+    def _install_recorder(self):
+        import contextlib
+
+        from core.project import project as project_mod
+        records = []
+        real = project_mod.project_file_lock
+
+        @contextlib.contextmanager
+        def _recording(path):
+            p = Path(path)
+            records.append(("enter", p.name))
+            with real(path):
+                try:
+                    yield
+                finally:
+                    registry = sorted(
+                        f.name for f in self.projects_dir.glob("*.json"))
+                    records.append(("exit", p.name, registry))
+
+        patcher = patch.object(
+            project_mod, "project_file_lock", _recording)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return records
+
+    def test_delete_unlinks_inside_the_registry_lock(self):
+        self.mgr.create("myapp", self.target, resolve_target=False)
+        records = self._install_recorder()
+        self.mgr.delete("myapp")
+        self.assertIn(("enter", "myapp.json"), records)
+        exits = [r for r in records
+                 if r[0] == "exit" and r[1] == "myapp.json"]
+        self.assertTrue(exits, "delete released no registry lock")
+        # At lock release the file is already gone: a blocked mutator
+        # resuming after us loads nothing instead of resurrecting.
+        self.assertNotIn("myapp.json", exits[-1][2])
+
+    def test_rename_holds_both_locks_in_sorted_order(self):
+        self.mgr.create("beta", self.target, resolve_target=False)
+        records = self._install_recorder()
+        self.mgr.rename("beta", "alpha")
+        enters = [r[1] for r in records if r[0] == "enter"]
+        # Both names locked, sorted order (crossing renames can't
+        # deadlock), both held before the registry transition.
+        self.assertEqual(enters[:2], ["alpha.json", "beta.json"])
+        exits = [r for r in records if r[0] == "exit"]
+        # The transition is complete at every lock release: new file
+        # present, old file gone.
+        for _tag, _name, registry in exits[:2]:
+            self.assertIn("alpha.json", registry)
+            self.assertNotIn("beta.json", registry)
+
+    def test_rename_to_same_name_raises_without_deadlock(self):
+        self.mgr.create("same", self.target, resolve_target=False)
+        with self.assertRaises(ValueError):
+            self.mgr.rename("same", "same")
+        self.assertIsNotNone(self.mgr.load("same"))
+
+
+class TestRenamePinRewriteLocked(unittest.TestCase):
+    """The rename marker loop is a read-modify-write on
+    .raptor-run.json — it must serialise on the same per-marker
+    _metadata_lock every other marker writer takes (complete_run,
+    _update_status, write_run_pin). Unlocked, its stale snapshot
+    wrote back wholesale and resurrected a run a racing finaliser had
+    just completed (status back to running, terminal fields lost) —
+    the abandon sweep then fail-stamped the genuinely completed run."""
+
+    def setUp(self):
+        self.tmpdir = TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        base = Path(self.tmpdir.name)
+        self.projects_dir = base / "projects"
+        out_base = base / "out" / "projects"
+        _ob = patch("core.project.project.DEFAULT_OUTPUT_BASE", out_base)
+        _ob.start()
+        self.addCleanup(_ob.stop)
+        self.mgr = ProjectManager(projects_dir=self.projects_dir)
+        self.target = str(base / "code")
+        Path(self.target).mkdir()
+
+    def _project_with_pinned_run(self):
+        from core.json import save_json
+        p = self.mgr.create("old", self.target)
+        run = Path(p.output_dir) / "scan-20260101-000000"
+        run.mkdir(parents=True)
+        save_json(run / ".raptor-run.json", {
+            "version": 2, "command": "scan",
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "status": "running", "project": "old",
+        })
+        return run / ".raptor-run.json"
+
+    def test_rewrite_blocks_on_the_marker_lock(self):
+        import fcntl
+        import os
+        import threading
+        import time
+
+        marker = self._project_with_pinned_run()
+        lock_path = marker.with_suffix(marker.suffix + ".lock")
+        fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+
+        done = threading.Event()
+
+        def _rename():
+            # force: a status=running marker reads live and this is
+            # exactly the supported --force-past-live-runs path the
+            # unlocked rewrite raced on. Forced rename keeps the
+            # output dir, so the marker path is stable throughout.
+            self.mgr.rename("old", "new", force=True)
+            done.set()
+
+        moved = marker
+
+        t = threading.Thread(target=_rename, daemon=True)
+        t.start()
+        try:
+            # While a marker writer holds the lock, the rename loop
+            # must not have re-pointed the pin (an unlocked rewrite
+            # lands within milliseconds).
+            deadline = time.monotonic() + 1.0
+            from core.json import load_json
+            while time.monotonic() < deadline:
+                for candidate in (marker, moved):
+                    meta = load_json(candidate)
+                    if meta is not None:
+                        self.assertEqual(
+                            meta.get("project"), "old",
+                            "pin rewritten while another writer held "
+                            "the marker lock — the RMW is not "
+                            "serialised")
+                if done.is_set():
+                    self.fail("rename completed through a held marker lock")
+                time.sleep(0.05)
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        t.join(timeout=10)
+        self.assertTrue(done.is_set(), "rename never completed")
+        from core.json import load_json
+        self.assertEqual(load_json(moved).get("project"), "new")
+
+    def test_oversize_marker_left_untouched(self):
+        # The loop's read carries the metadata budget: an oversize
+        # plant is skipped (with the loud per-dir trail), never
+        # parsed wholesale and never rewritten.
+        marker = self._project_with_pinned_run()
+        payload = ('{"project": "old", "status": "running", "pad": "'
+                   + "A" * (2 * 1024 * 1024) + '"}')
+        marker.write_text(payload, encoding="utf-8")
+        self.mgr.rename("old", "new")
+        moved = (Path(str(marker)).parents[2] / "new"
+                 / "scan-20260101-000000" / ".raptor-run.json")
+        self.assertEqual(moved.read_text(encoding="utf-8"), payload,
+                         "oversize marker was parsed and rewritten")
+
+
+class TestSweepOversizeMarker(unittest.TestCase):
+    """An oversize .raptor-run.json plant (sandbox-writable) must not
+    crash the sweep consumers. Pre-fix the sweep's BARE read parsed
+    the plant, decided to fail the run, and the BUDGETED fail_run then
+    refused the same file — an uncaught error out of
+    get_run_dirs(sweep=True) took /project report, export, and the
+    startup sweep down with one file."""
+
+    def setUp(self):
+        self.tmpdir = TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        base = Path(self.tmpdir.name)
+        out_base = base / "out" / "projects"
+        _ob = patch("core.project.project.DEFAULT_OUTPUT_BASE", out_base)
+        _ob.start()
+        self.addCleanup(_ob.stop)
+        self.mgr = ProjectManager(projects_dir=base / "projects")
+        self.target = str(base / "code")
+        Path(self.target).mkdir()
+
+    def test_oversize_marker_is_skipped_not_a_crash(self):
+        import json as _json
+        p = self.mgr.create("proj", self.target)
+        run = Path(p.output_dir) / "scan_20260101_000000"
+        run.mkdir(parents=True)
+        marker = run / ".raptor-run.json"
+        payload = _json.dumps({
+            "version": 2, "command": "scan",
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "status": "running", "session_pid": 4194001,
+            "pad": "A" * (8 * 1024 * 1024),
+        })
+        marker.write_text(payload, encoding="utf-8")
+        # Must neither raise nor fail-stamp the unreadable marker.
+        dirs = p.get_run_dirs(sweep=True)
+        self.assertEqual([d.name for d in dirs],
+                         ["scan_20260101_000000"])
+        self.assertEqual(marker.read_text(encoding="utf-8"), payload)
+
+    def test_in_budget_dead_session_still_swept(self):
+        # Two-direction: the budget must not turn the sweep off.
+        import json as _json
+
+        from core.json import load_json
+        p = self.mgr.create("proj", self.target)
+        run = Path(p.output_dir) / "scan_20260101_000000"
+        run.mkdir(parents=True)
+        marker = run / ".raptor-run.json"
+        marker.write_text(_json.dumps({
+            "version": 2, "command": "scan",
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "status": "running", "session_pid": 4194001,
+        }), encoding="utf-8")
+        with patch("core.run.metadata._pid_alive", lambda pid: False):
+            p.get_run_dirs(sweep=True)
+        self.assertEqual(load_json(marker)["status"], "failed")
+
+
+class TestGetRunDirsVanishedDir(unittest.TestCase):
+    """A run dir removed between enumeration and the sort key (a
+    concurrent /project clean, manual rm) must sort oldest, not crash
+    every /project consumer out of the central enumerator —
+    safe_run_mtime exists for exactly this and the enumerator was the
+    one caller still running a bare stat."""
+
+    def setUp(self):
+        self.tmpdir = TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        base = Path(self.tmpdir.name)
+        out_base = base / "out" / "projects"
+        _ob = patch("core.project.project.DEFAULT_OUTPUT_BASE", out_base)
+        _ob.start()
+        self.addCleanup(_ob.stop)
+        self.mgr = ProjectManager(projects_dir=base / "projects")
+        self.target = str(base / "code")
+        Path(self.target).mkdir()
+
+    def test_vanishing_run_dir_sorts_oldest_instead_of_crashing(self):
+        import shutil
+
+        p = self.mgr.create("proj", self.target)
+        out = Path(p.output_dir)
+        # Non-timestamp names force the mtime fallback.
+        (out / "oddly-named-run").mkdir(parents=True)
+        (out / "another-odd-run").mkdir()
+
+        real_list = p._list_run_dirs
+
+        def listing_then_vanish():
+            dirs = real_list()
+            shutil.rmtree(out / "oddly-named-run")
+            return dirs
+
+        with patch.object(p, "_list_run_dirs", listing_then_vanish):
+            dirs = p.get_run_dirs()
+        self.assertEqual([d.name for d in dirs][-1], "oddly-named-run")

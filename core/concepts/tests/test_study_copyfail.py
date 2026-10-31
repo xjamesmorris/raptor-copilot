@@ -11,10 +11,18 @@ import pytest
 
 RAPTOR_DIR = Path(__file__).resolve().parents[3]
 STUDY_PREP = str(RAPTOR_DIR / "libexec" / "raptor-study-prep")
-TARGET = Path("/tmp/copyfail-audit/target")
+# Explicit opt-in only: point RAPTOR_COPYFAIL_TARGET at the prepared
+# CopyFail checkout to enable. A bare well-known /tmp path un-skipped
+# the test against whatever a shared host happened to have there —
+# unknown (potentially foreign) content driving assertions.
+_TARGET_ENV = os.environ.get("RAPTOR_COPYFAIL_TARGET", "")
+TARGET = Path(_TARGET_ENV) if _TARGET_ENV else None
 
 
-@pytest.mark.skipif(not TARGET.is_dir(), reason="CopyFail target not set up")
+@pytest.mark.skipif(
+    TARGET is None or not TARGET.is_dir(),
+    reason="CopyFail target not set up (set RAPTOR_COPYFAIL_TARGET)",
+)
 class TestStudyPrepCopyFail:
     def test_concept_seeded_items_cover_key_functions(self, tmp_path: Path) -> None:
         """With aliasing concepts seeded, prep extracts items for the bug-site functions."""

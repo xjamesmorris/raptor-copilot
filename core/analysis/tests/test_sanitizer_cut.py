@@ -112,6 +112,7 @@ class TestCanonicalSiblingBranch:
 
     def test_both_branches_sanitize_suppresses(self):
         src = (
+            "import html\n"
             "def handle(user):\n"
             "    if user.is_admin:\n"
             "        x = html.escape(user.name)\n"
@@ -132,6 +133,7 @@ class TestCanonicalSiblingBranch:
 
     def test_only_one_branch_sanitizes_does_not_suppress(self):
         src = (
+            "import html\n"
             "def handle(user):\n"
             "    if user.is_admin:\n"
             "        x = html.escape(user.name)\n"
@@ -158,6 +160,7 @@ class TestStraightLineSanitize:
 
     def test_linear_sanitize_then_sink_suppresses(self):
         src = (
+            "import html\n"
             "def handle(x):\n"
             "    y = html.escape(x)\n"
             "    render(y)\n"
@@ -174,6 +177,7 @@ class TestStraightLineSanitize:
         """Sanitizer AFTER the sink — bypass; current model treats
         this as 'not on every path to sink' which is correct."""
         src = (
+            "import html\n"
             "def handle(x):\n"
             "    render(x)\n"
             "    y = html.escape(x)\n"
@@ -188,12 +192,56 @@ class TestStraightLineSanitize:
         assert result.suppress is False
 
 
+class TestMatch:
+    def test_sanitizer_only_in_match_case_does_not_suppress(self):
+        """A ``match`` with no irrefutable case has a no-match
+        fall-through: at runtime no case may match and the post-match
+        sink is reached without crossing the case-body sanitizer."""
+        src = (
+            "import html\n"
+            "def handle(x):\n"
+            "    match x:\n"
+            "        case 'a':\n"
+            "            y = html.escape(x)\n"
+            "    render(x)\n"
+        )
+        cfg = _cfg(src)
+        sink = _node_with_call(cfg, "render")
+        result = evaluate_finding(
+            cfg, [cfg.entry_node], sink,
+            cwe="CWE-79", language="python",
+        )
+        assert result.suppress is False
+
+    def test_every_case_sanitizes_with_wildcard_suppresses(self):
+        """With ``case _:`` some case always runs — when every case
+        body sanitizes, the cut is genuinely complete."""
+        src = (
+            "import html\n"
+            "def handle(x):\n"
+            "    match x:\n"
+            "        case 'a':\n"
+            "            y = html.escape(x)\n"
+            "        case _:\n"
+            "            y = html.escape(x)\n"
+            "    render(y)\n"
+        )
+        cfg = _cfg(src)
+        sink = _node_with_call(cfg, "render")
+        result = evaluate_finding(
+            cfg, [cfg.entry_node], sink,
+            cwe="CWE-79", language="python",
+        )
+        assert result.suppress is True
+
+
 class TestLoops:
     def test_sanitizer_only_in_loop_body_does_not_suppress(self):
         """A ``for`` with a sanitizer inside doesn't help — the loop
         may execute zero iterations, leaving the post-loop sink
         reachable without crossing the sanitizer."""
         src = (
+            "import html\n"
             "def handle(items):\n"
             "    for x in items:\n"
             "        y = html.escape(x)\n"
@@ -216,6 +264,7 @@ class TestLoops:
 class TestNoSuppression:
     def test_wrong_cwe_does_not_suppress(self):
         src = (
+            "import html\n"
             "def handle(x):\n"
             "    y = html.escape(x)\n"
             "    render(y)\n"
@@ -233,6 +282,7 @@ class TestNoSuppression:
 
     def test_wrong_language_does_not_suppress(self):
         src = (
+            "import html\n"
             "def handle(x):\n"
             "    y = html.escape(x)\n"
             "    render(y)\n"
@@ -249,6 +299,7 @@ class TestNoSuppression:
 
     def test_unknown_cwe_does_not_suppress(self):
         src = (
+            "import html\n"
             "def handle(x):\n"
             "    y = html.escape(x)\n"
             "    render(y)\n"
@@ -277,6 +328,7 @@ class TestNoSuppression:
 
     def test_no_sources_does_not_suppress(self):
         src = (
+            "import html\n"
             "def handle(x):\n"
             "    y = html.escape(x)\n"
             "    render(y)\n"
@@ -291,6 +343,7 @@ class TestNoSuppression:
 
     def test_no_sink_does_not_suppress(self):
         src = (
+            "import html\n"
             "def handle(x):\n"
             "    y = html.escape(x)\n"
             "    return y\n"
@@ -312,6 +365,7 @@ class TestNoSuppression:
 class TestSuppressionRecord:
     def test_writes_jsonl_on_suppression(self, tmp_path: Path):
         src = (
+            "import html\n"
             "def handle(x):\n"
             "    y = html.escape(x)\n"
             "    render(y)\n"
@@ -361,6 +415,7 @@ class TestSuppressionRecord:
             encoding="utf-8",
         )
         src = (
+            "import html\n"
             "def handle(x):\n"
             "    y = html.escape(x)\n"
             "    render(y)\n"
@@ -388,6 +443,7 @@ class TestSuppressionRecord:
 
 def test_cut_set_contains_actual_cfg_nodes():
     src = (
+        "import html\n"
         "def handle(x):\n"
         "    y = html.escape(x)\n"
         "    render(y)\n"
@@ -402,3 +458,80 @@ def test_cut_set_contains_actual_cfg_nodes():
     for n in result.cut_set:
         assert isinstance(n, PyCFGNode)
         assert n in set(cfg.nodes())
+
+
+class TestLegacySinkInCutNotTrivial:
+    """Legacy (no value context) path: a sanitizer ON the sink node
+    used to count as a trivial cut — sink(escape(other), tainted)
+    read as fully sanitized one caller-invariant away from
+    enforcement. The cut is re-asked over the non-sink sanitizer
+    nodes; on-path sanitizers keep suppressing."""
+
+    def _cfg(self, src):
+        from core.analysis.cfg_builder import build_python_cfg
+        cfg = build_python_cfg(src, "handle")
+        assert cfg is not None
+        return cfg
+
+    def _sink(self, cfg, call_name):
+        from core.analysis.cfg_builder import PyCFGNode
+        return next(
+            n for n in cfg.nodes()
+            if isinstance(n, PyCFGNode) and call_name in n.calls
+        )
+
+    def test_sanitizer_on_sink_node_refuses_legacy(self):
+        from core.analysis.sanitizer_cut import (
+            VERDICT_NO_SUPPRESS,
+            evaluate_finding,
+        )
+        src = (
+            "import html\n"
+            "def handle(tainted, other):\n"
+            "    render(html.escape(other), tainted)\n"
+        )
+        cfg = self._cfg(src)
+        result = evaluate_finding(
+            cfg, [cfg.entry_node], self._sink(cfg, "render"),
+            cwe="CWE-79", language="python",
+        )
+        assert result.verdict == VERDICT_NO_SUPPRESS
+
+    def test_on_path_sanitizer_still_suppresses_legacy(self):
+        from core.analysis.sanitizer_cut import (
+            VERDICT_SUPPRESS,
+            evaluate_finding,
+        )
+        src = (
+            "import html\n"
+            "def handle(x):\n"
+            "    y = html.escape(x)\n"
+            "    render(y)\n"
+        )
+        cfg = self._cfg(src)
+        result = evaluate_finding(
+            cfg, [cfg.entry_node], self._sink(cfg, "render"),
+            cwe="CWE-79", language="python",
+        )
+        assert result.verdict == VERDICT_SUPPRESS
+
+    def test_value_bound_same_node_sanitize_at_sink_unchanged(self):
+        # The VALUE-BOUND path keeps its same-node semantics — this
+        # guard is scoped to the legacy branch only.
+        from core.analysis.sanitizer_cut import (
+            VERDICT_SUPPRESS,
+            evaluate_finding,
+        )
+        src = (
+            "import html\n"
+            "def handle(x):\n"
+            "    y = html.escape(x)\n"
+            "    render(y)\n"
+        )
+        cfg = self._cfg(src)
+        result = evaluate_finding(
+            cfg, [cfg.entry_node], self._sink(cfg, "render"),
+            cwe="CWE-79", language="python",
+            source_symbols={"x"}, sink_arg="y",
+        )
+        assert result.verdict == VERDICT_SUPPRESS

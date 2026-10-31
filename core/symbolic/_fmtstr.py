@@ -56,7 +56,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from core.function_taxonomy import FORMAT_STRING_FMT_ARG_INDEX
-from core.symbolic._project import _open_project
+from core.symbolic import _engine
 from core.symbolic._budget import z3_call_budget
 from core.symbolic._types import SymbolicResult
 
@@ -114,18 +114,12 @@ def discover_fmtstr_slots(
     """Isolated entry point — semantics in
     :func:`_discover_fmtstr_slots_impl`.
 
-    Hard-budget process isolation; see :mod:`core.symbolic._isolate`.
-    When angr is unavailable the availability guard answers directly.
+    Hard-budget process isolation via
+    :func:`core.symbolic._engine.dispatch_isolated`; when angr is
+    unavailable the availability guard answers directly.
     """
-    from core.symbolic._availability import angr_available
-    from core.symbolic._isolate import run_isolated
-    if not angr_available():
-        return _discover_fmtstr_slots_impl(
-            binary_path, sink_addr, fmt_arg_index=fmt_arg_index,
-            num_slots=num_slots, timeout=timeout,
-            max_input_bytes=max_input_bytes)
-    return run_isolated(
-        "core.symbolic._fmtstr", "_discover_fmtstr_slots_impl",
+    return _engine.dispatch_isolated(
+        _discover_fmtstr_slots_impl,
         {"binary_path": binary_path, "sink_addr": sink_addr,
          "fmt_arg_index": fmt_arg_index, "num_slots": num_slots,
          "timeout": timeout, "max_input_bytes": max_input_bytes},
@@ -180,19 +174,13 @@ def _discover_fmtstr_slots_impl(
         explains the failure (arch unsupported, path not reached,
         timeout, etc.).
     """
-    from core.symbolic._availability import (
-        angr_available, unavailable_result,
-    )
-    if not angr_available():
-        return unavailable_result("angr", "discover_fmtstr_slots")
+    gate = _engine.availability_gate("discover_fmtstr_slots")
+    if gate is not None:
+        return gate
 
-    binary_path = Path(binary_path)
-    if not binary_path.is_file():
-        return SymbolicResult(
-            succeeded=False,
-            reason=f"binary not found: {binary_path}",
-            wall_seconds=0.0,
-        )
+    binary_path, missing = _engine.check_binary(binary_path)
+    if missing is not None:
+        return missing
 
     if fmt_arg_index < 1 or fmt_arg_index > len(_SYSV_AMD64_ARG_REGS_ALL):
         return SymbolicResult(
@@ -206,14 +194,11 @@ def _discover_fmtstr_slots_impl(
         )
 
     t0 = time.monotonic()
-    try:
-        project = _open_project(binary_path)
-    except Exception as exc:  # noqa: BLE001
-        return SymbolicResult(
-            succeeded=False,
-            reason=f"angr load failed: {type(exc).__name__}: {exc}",
-            wall_seconds=time.monotonic() - t0,
-        )
+    # No hook installers: slot discovery only needs to REACH the sink
+    # with a small stdin; nothing here copies with symbolic lengths.
+    project, load_error = _engine.open_gated_project(binary_path, t0)
+    if load_error is not None:
+        return load_error
 
     if project.arch.name != "AMD64":
         return SymbolicResult(
@@ -226,67 +211,43 @@ def _discover_fmtstr_slots_impl(
             metadata={"arch": project.arch.name},
         )
 
-    if not _is_mapped(project, sink_addr):
-        return SymbolicResult(
-            succeeded=False,
-            reason=(
-                f"sink_addr 0x{sink_addr:x} not in a mapped segment"
-            ),
-            wall_seconds=time.monotonic() - t0,
-            metadata={"sink_addr": sink_addr},
-        )
-
-    import angr
-
-    state = project.factory.entry_state(
-        stdin=angr.SimFileStream,
-        add_options={angr.options.LAZY_SOLVES},
+    unmapped = _engine.check_mapped(
+        project, sink_addr, t0,
+        addr_key="sink_addr",
+        reason=f"sink_addr 0x{sink_addr:x} not in a mapped segment",
     )
+    if unmapped is not None:
+        return unmapped
+
+    state = _engine.make_entry_state(project)
     simgr = project.factory.simulation_manager(state)
 
     deadline = t0 + timeout
 
-    def _stop(_simgr) -> bool:
-        return time.monotonic() >= deadline
-
-    def _step(sg):
-        if _stop(sg):
-            return sg.move(from_stash="active", to_stash="deadended")
-        if len(sg.active) > 512:
-            # RAM bound (mirrors _overflow).
-            return sg.move(from_stash="active", to_stash="deadended")
-        return sg
-
+    step = _engine.budget_step(deadline)
     try:
         with z3_call_budget(deadline):
             simgr.explore(
                 find=sink_addr,
                 num_find=1,
-                step_func=_step,
+                step_func=step,
             )
     except Exception as exc:  # noqa: BLE001
-        return SymbolicResult(
-            succeeded=False,
-            reason=f"angr explore raised: {type(exc).__name__}: {exc}",
-            wall_seconds=time.monotonic() - t0,
-            states_explored=_count_states(simgr),
+        return _engine.raised_result(
+            exc, t0=t0, simgr=simgr,
             metadata={"sink_addr": sink_addr},
         )
 
     wall = time.monotonic() - t0
 
     if not simgr.found:
-        timed_out = time.monotonic() >= deadline
-        return SymbolicResult(
-            succeeded=False,
-            reason=(
-                f"timeout after {wall:.1f}s (never reached sink)"
-                if timed_out
-                else "no path from entry to sink_addr"
-            ),
-            wall_seconds=wall,
-            states_explored=_count_states(simgr),
+        return _engine.unfound_result(
+            deadline=deadline, wall=wall,
+            states=_engine.count_states(simgr),
+            timeout_reason=f"timeout after {wall:.1f}s (never reached sink)",
+            no_path_reason="no path from entry to sink_addr",
             metadata={"sink_addr": sink_addr},
+            step=step, simgr=simgr,
         )
 
     state = simgr.found[0]
@@ -296,7 +257,7 @@ def _discover_fmtstr_slots_impl(
         succeeded=True,
         reason=f"classified {len(slots)} vararg slots at sink call",
         wall_seconds=wall,
-        states_explored=_count_states(simgr),
+        states_explored=_engine.count_states(simgr),
         metadata={
             "sink_addr": sink_addr,
             "slots": [s.as_dict() for s in slots],
@@ -424,16 +385,3 @@ def _looks_like_stdin(var_name: str) -> bool:
     lower = var_name.lower()
     return "stdin" in lower
 
-
-def _is_mapped(project, addr: int) -> bool:
-    try:
-        return project.loader.find_object_containing(addr) is not None
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def _count_states(simgr) -> int:
-    try:
-        return sum(1 for _ in simgr.stashes.values() for __ in _)
-    except Exception:  # noqa: BLE001
-        return 0

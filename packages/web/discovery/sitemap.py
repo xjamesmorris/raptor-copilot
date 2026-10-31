@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
-import logging
 import xml.etree.ElementTree as ET
+from core.logging import get_logger
+
 from typing import TYPE_CHECKING, List, Set
 from urllib.parse import urlparse
+
+from packages.web.origin import origin_of
 
 if TYPE_CHECKING:
     from packages.web.client import WebClient
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 _MAX_SITEMAPS = 10
 _MAX_URLS = 500
@@ -51,6 +54,11 @@ def _process_sitemap(
         resp = client.get(path)
         if resp.status_code != 200:
             return
+        # stdlib ElementTree parses untrusted XML here: entity-expansion
+        # DoS protection rests on the host's expat (modern expat caps
+        # amplification) and the response body is already bounded by the
+        # client's response cap. defusedxml is deliberately not a hard
+        # dependency of the web scanner.
         root = ET.fromstring(resp.text)
     except Exception as e:
         logger.debug("sitemap fetch/parse failed for %s: %s", path, e)
@@ -82,7 +90,5 @@ def _process_sitemap(
                         return
 
 
-def _origin(url: str) -> tuple:
-    p = urlparse(url)
-    default_port = 443 if p.scheme == "https" else 80
-    return (p.scheme.lower(), (p.hostname or "").lower(), p.port or default_port)
+def _origin(url: str) -> tuple[str, str, int]:
+    return origin_of(url)

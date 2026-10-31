@@ -24,19 +24,43 @@ class HttpsRedirectCheck(Check):
                 # downgrade origin is outside its scope), so a transport
                 # failure must be counted here for the degraded-coverage
                 # accounting.
+                import ipaddress
+                from urllib.parse import urlparse as _urlparse
+
                 import requests
 
                 from packages.web.checks.base import note_transport_error
+                # Mirror WebClient's rule: loopback/private targets must
+                # not route through a corporate proxy (requests honours
+                # proxy env; NO_PROXY rarely covers loopback) — the
+                # deliberate off-client http-downgrade probe otherwise
+                # silently lost coverage on proxied hosts scanning local
+                # fixtures.
+                _host = (_urlparse(http_url).hostname or "").lower()
+                _local = _host == "localhost"
+                if not _local:
+                    try:
+                        _local = ipaddress.ip_address(_host).is_loopback \
+                            or ipaddress.ip_address(_host).is_private
+                    except ValueError:
+                        pass
+                _session = requests.Session()
+                _session.trust_env = not _local
                 try:
-                    resp = requests.get(
-                        http_url,
-                        allow_redirects=False,
-                        timeout=10,
-                        verify=False,
-                    )
-                except requests.RequestException:
-                    note_transport_error(client)
-                    return []
+                    try:
+                        resp = _session.get(
+                            http_url,
+                            allow_redirects=False,
+                            timeout=10,
+                            verify=False,
+                        )
+                    except requests.RequestException:
+                        note_transport_error(client)
+                        return []
+                finally:
+                    # One leaked connection pool per check run adds up
+                    # over a long scan.
+                    _session.close()
                 if resp.status_code not in (301, 302, 307, 308):
                     return [self._result(
                         passed=False, url=http_url,

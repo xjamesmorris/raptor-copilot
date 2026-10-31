@@ -1464,9 +1464,9 @@ def _idle_wait_for_sigchld(tick_s: float) -> None:
     used a plain ``time.sleep(0.05)`` when no event was ready. A
     tracee stopped by SCMP_ACT_TRACE stays FROZEN until the tracer
     wakes and PTRACE_CONTs it, so every traced syscall cost up to one
-    full tick — ~20 syscalls/sec. The Landlock-only spawn path wraps
-    commands in the Python pid1-shim whose interpreter startup alone
-    is ~200 traced syscalls: 10+ seconds of wall clock for
+    full tick — ~20 syscalls/sec. A Python interpreter startup alone
+    is ~200 traced syscalls (observed with the since-deleted Python
+    pid1-shim wrapper): 10+ seconds of wall clock for
     ``/usr/bin/true``, blowing every caller timeout and presenting as
     "drain never sees pipe EOF". sigtimedwait keeps the bounded-tick
     watchdog behaviour while making event wakeups immediate.
@@ -1684,8 +1684,13 @@ def trace(target_pid: int, run_dir: Path,
             except InterruptedError:
                 continue
             except ChildProcessError:
-                # All tracees gone — clean exit.
-                return 0
+                # All tracees gone — a near-normal exit shape (the
+                # ECHILD race vs the traced-set bookkeeping), not a
+                # crash: fall through to the post-loop audit_summary
+                # write like the set-empties path. Returning here
+                # used to skip the summary, so budget_truncated/drop
+                # counts silently read as "no drops" for such runs.
+                break
             except OSError as e:
                 logger.error("tracer: waitpid failed: %s", e)
                 return 4
@@ -2139,14 +2144,24 @@ def _handle_waitpid_event(
                 # only the global cap (which truncates audit
                 # entirely) gets the stderr ping.
                 if budget.pop_global_cap_notice():
-                    os.write(2, (
-                        f"RAPTOR tracer: audit-record global cap "
-                        f"({budget.global_cap}) reached; further "
-                        f"events dropped (sub-caps still apply; "
-                        f"sampling continues for high-volume "
-                        f"categories). End-of-run audit_summary "
-                        f"record has totals.\n"
-                    ).encode("ascii", errors="replace"))
+                    # Guarded like every other live stderr banner in
+                    # this module: fd 2 can be closed/broken (parent
+                    # died mid-run, daemonised invocation) and an
+                    # OSError here would crash the tracer out of its
+                    # event loop — PTRACE_O_EXITKILL then SIGKILLs
+                    # every tracee mid-workload. The notice is
+                    # best-effort; audit_summary carries the totals.
+                    try:
+                        os.write(2, (
+                            f"RAPTOR tracer: audit-record global cap "
+                            f"({budget.global_cap}) reached; further "
+                            f"events dropped (sub-caps still apply; "
+                            f"sampling continues for high-volume "
+                            f"categories). End-of-run audit_summary "
+                            f"record has totals.\n"
+                        ).encode("ascii", errors="replace"))
+                    except OSError:
+                        pass
         # Continue regardless — audit mode allows the syscall.
         ptrace_cont(wpid, 0)
         return

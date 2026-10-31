@@ -61,6 +61,8 @@ from pathlib import Path
 from core.json import load_json_bounded
 
 from ..models import Confidence, Reachability
+from ..parsers import _safe_read
+from ._shared import iter_matches_with_lines as _iter_matches_with_lines
 
 logger = logging.getLogger(__name__)
 
@@ -70,8 +72,19 @@ _DEFAULT_MAX_DEPTH = 12
 # Java imports: ``import x.y.Z;``, ``import static x.y.Z.method;``,
 # ``import x.*;``. Capture the dotted path before the optional
 # wildcard / method tail.
+# Leading indent is HORIZONTAL-only ([^\S\n]): under MULTILINE the
+# ``^\s*`` spelling re-scans a run of blank lines from every line
+# start inside it — quadratic on attacker-supplied source files
+# (the import sweep walks every file of the ecosystem).
+# The wildcard tail folds its trailing whitespace INTO the optional
+# group (``(?:\.\*\s*)?;``, equivalent match set): the naive
+# ``\s*(?:\.\*)?\s*;`` puts two unbounded whitespace spans around an
+# optional atom, and an ``import x`` followed by a long whitespace
+# run with no ``;`` makes the engine try every split of the run
+# between them — quadratic on a single import token.
 _IMPORT_RE = re.compile(
-    r"^\s*import\s+(?:static\s+)?([A-Za-z_][A-Za-z0-9_.]*)\s*(?:\.\*)?\s*;",
+    r"^[^\S\n]*import\s+(?:static\s+)?([A-Za-z_][A-Za-z0-9_.]*)"
+    r"\s*(?:\.\*\s*)?;",
     re.MULTILINE,
 )
 
@@ -127,12 +140,8 @@ def scan_imports(
     out: dict[str, list[tuple[Path, int, bool]]] = {}
     for java_file in _walk_java_sources(target, max_depth=max_depth):
         is_test = _is_test_file(java_file, target)
-        try:
-            text = java_file.read_text(encoding="utf-8", errors="replace")
-        except OSError as e:
-            logger.debug(
-                "sca.reachability.maven: skip %s (%s)", java_file, e,
-            )
+        text = _safe_read.read_bounded(java_file, follow_symlinks=False)
+        if text is None:
             continue
         for path, line in _imports_in(text):
             out.setdefault(path, []).append((java_file, line, is_test))
@@ -241,10 +250,10 @@ def _candidate_prefixes(dep_name: str) -> Iterable[str]:
 
 def _imports_in(text: str) -> Iterable[tuple[str, int]]:
     """Yield ``(import_path, line_number)`` for each ``import`` line."""
-    for m in _IMPORT_RE.finditer(text):
-        path = m.group(1)
-        line = text.count("\n", 0, m.start()) + 1
-        yield path, line
+    # Rolling-cursor line numbers — the naive full-prefix count is
+    # quadratic on dense-import files.
+    for m, line in _iter_matches_with_lines(text, _IMPORT_RE.finditer(text)):
+        yield m.group(1), line
 
 
 def _walk_java_sources(

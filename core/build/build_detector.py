@@ -20,13 +20,80 @@ from pathlib import Path
 from shlex import quote
 from typing import Any, ClassVar
 
-from core.json import dumps_display
 from core.logging import get_logger
 from core.sandbox import SandboxSetupError
 from core.sandbox import run as _sandbox_run
 from core.sandbox import run_trusted as _run_trusted
 
 logger = get_logger()
+
+# Cap on files collected by one recursive enumeration of the untrusted
+# repo. Too low silently drops real source files on big targets
+# (missing CodeQL coverage, missed -I dirs, missed build files); too
+# high lets a hostile file farm dominate the UNSANDBOXED detection
+# phase's wall time. 100k files is an order of magnitude above the
+# largest legitimate targets this pipeline scans while keeping the
+# worst-case walk bounded.
+_MAX_WALK_FILES = 100_000
+
+# Companion cap on DIRECTORIES traversed: the file cap alone does not
+# bound the walk — an empty-directory farm collects zero files while
+# stat()ing forever. Same trade-off shape as the file cap (too low
+# drops real deep trees; 200k dirs is far above legitimate targets).
+_MAX_WALK_DIRS = 200_000
+
+
+def _walk_files(
+    root: Path,
+    suffixes: tuple[str, ...] | None = None,
+    *,
+    max_files: int = _MAX_WALK_FILES,
+) -> list[Path]:
+    """Recursive file enumeration that never follows directory symlinks.
+
+    Detect/synthesise run in the UNSANDBOXED parent against scanned
+    repos, so a repo containing ``src -> /`` must never steer the walk
+    across the host filesystem (``detect_missing_config_headers``
+    would then read host files in the parent). ``Path.rglob``
+    recurses into directory symlinks only via 3.13's
+    ``recurse_symlinks=True`` opt-in (it's
+    ``glob.glob(recursive=True)`` that followed them by default);
+    ``os.walk(followlinks=False)`` bounds the walk to the real tree
+    explicitly on every supported interpreter. File symlinks are
+    still yielded (rglob parity); unreadable subtrees are skipped
+    (``os.walk`` default).
+
+    ``suffixes`` filters by case-sensitive ``str.endswith`` — the same
+    matches ``rglob(f"*{{suffix}}")`` produced for regular files. The
+    result is capped at ``max_files`` and the traversal itself at
+    ``_MAX_WALK_DIRS`` (the file cap bounds files COLLECTED, not
+    directories visited — an empty-dir farm walks free of it), each
+    with a warning, so a hostile file farm can't monopolise detection
+    either way.
+    """
+    out: list[Path] = []
+    dirs_seen = 0
+    for dirpath, _dirnames, filenames in os.walk(root, followlinks=False):
+        dirs_seen += 1
+        if dirs_seen > _MAX_WALK_DIRS:
+            logger.warning(
+                "Directory enumeration under %s hit the %d-dir cap — "
+                "remaining subtrees are not considered for build "
+                "detection", root, _MAX_WALK_DIRS,
+            )
+            return out
+        for name in filenames:
+            if suffixes is not None and not name.endswith(suffixes):
+                continue
+            out.append(Path(dirpath) / name)
+            if len(out) >= max_files:
+                logger.warning(
+                    "File enumeration under %s hit the %d-file cap — "
+                    "remaining files are not considered for build "
+                    "detection", root, max_files,
+                )
+                return out
+    return out
 
 
 @dataclass
@@ -35,7 +102,14 @@ class BuildSystem:
     type: str  # maven, gradle, npm, etc.
     command: str  # Build command to use
     working_dir: Path  # Directory to run command in
-    env_vars: dict[str, str]  # Env vars we inject as-is (RAPTOR-chosen constants)
+    # Env vars we inject as-is. RAPTOR-CHOSEN CONSTANTS by contract:
+    # the static BUILD_SYSTEMS table is the only producer of non-empty
+    # content (never repo metadata — repo-derived env must go through
+    # the hostile-input gates instead). Consumers admit these through
+    # the codeql build-env gate by exact declared (name, value) pair —
+    # see declared_env_constants() — so a future producer that copies
+    # repo content in here still meets the gate.
+    env_vars: dict[str, str]
     confidence: float  # 0.0 - 1.0
     detected_files: list[str]  # Files that indicated this build system
     cleanup_paths: list[Path] = field(default_factory=list)  # Temp files/dirs to remove after CodeQL
@@ -148,6 +222,14 @@ class BuildDetector:
                 "priority": 1,
             },
         },
+        "rust": {
+            "cargo": {
+                "files": ["Cargo.toml"],
+                "command": "cargo build",
+                "env_vars": {},
+                "priority": 1,
+            },
+        },
         "cpp": {
             # Priority ordering rationale (lower = picked first
             # via ``min()``): source-of-truth build descriptions
@@ -229,6 +311,14 @@ class BuildDetector:
             },
         },
     }
+    # C shares the cpp table by ALIAS (same dict object — one source
+    # of truth): cmake / autotools / meson / make describe C projects
+    # identically, and callers hint the real source language ("c").
+    # Without the key, detect_build_system warned "No build system
+    # detection for language: c" and bailed before any file scan —
+    # every pure-C target (e.g. GNU screen) fell through to the
+    # synthesised-compile fallback even when configure.ac was present.
+    BUILD_SYSTEMS["c"] = BUILD_SYSTEMS["cpp"]
 
     def __init__(self, repo_path: Path) -> None:
         """
@@ -269,6 +359,37 @@ class BuildDetector:
             if result:
                 detected.append(result)
 
+        # Depth-1 fallback: some checkouts keep the whole build under
+        # one subdirectory (GNU screen's autotools live in src/; the
+        # repo root holds only COPYING + mktar.pl). Root-only scanning
+        # reported "no build system" for them. Scanned only when the
+        # root found NOTHING, shallowest-then-alphabetical, first
+        # subdirectory with any detection wins (deterministic, same
+        # rationale as the .csproj rglob sort). Symlinked and hidden
+        # dirs are skipped — a symlink can point out of the tree, and
+        # .git/.github never hold the build root.
+        if not detected:
+            try:
+                subdirs = sorted(
+                    (d for d in self.repo_path.iterdir()
+                     if d.is_dir() and not d.is_symlink()
+                     and not d.name.startswith(".")),
+                    key=lambda p: p.name,
+                )
+            except OSError:
+                subdirs = []
+            for sub in subdirs:
+                for build_type, config in build_systems.items():
+                    result = self._check_build_system(
+                        language, build_type, config, base=sub)
+                    if result:
+                        detected.append(result)
+                if detected:
+                    logger.info(
+                        "  Build system found in subdirectory: %s",
+                        sub.name)
+                    break
+
         if not detected:
             logger.warning("No build system detected for %s", language)
             return None
@@ -279,7 +400,8 @@ class BuildDetector:
         logger.info("  Command: %s", best.command)
         return best
 
-    def _check_build_system(self, language: str, build_type: str, config: dict) -> BuildSystem | None:
+    def _check_build_system(self, language: str, build_type: str, config: dict,
+                            base: Path | None = None) -> BuildSystem | None:
         """
         Check if a specific build system is present.
 
@@ -287,17 +409,24 @@ class BuildDetector:
             language: Programming language
             build_type: Build system type
             config: Build system configuration
+            base: Directory whose top level is scanned for the exact-name
+                marker files (defaults to the repo root; the depth-1
+                fallback in detect_build_system passes a subdirectory).
+                Extension-pattern markers (".csproj") keep their
+                repo-rooted recursive scan either way.
 
         Returns:
             BuildSystem object or None
         """
         detected_files = []
-        working_dir = self.repo_path
+        if base is None:
+            base = self.repo_path
+        working_dir = base
 
         # Check for build files
         for build_file in config["files"]:
             # Check for exact match
-            if (self.repo_path / build_file).exists():
+            if (base / build_file).exists():
                 detected_files.append(build_file)
 
             # Check for extension match (e.g., *.csproj)
@@ -316,20 +445,21 @@ class BuildDetector:
                 # which matches operator intuition for "primary"
                 # build root.
                 matches = sorted(
-                    self.repo_path.rglob(f"*{build_file}"),
+                    _walk_files(self.repo_path, (build_file,)),
                     key=lambda p: (len(p.parts), str(p)),
                 )
                 if matches:
                     detected_files.append(build_file)
                     # Use the directory of the first match WITH
                     # containment + executability checks. Pre-fix
-                    # `working_dir = matches[0].parent` blindly
-                    # used the rglob result, which on Python <
-                    # 3.13 follows symlinks — a symlink in the
-                    # repo pointing OUT to e.g. /etc could land
-                    # us with `working_dir = /etc` which codeql
-                    # can't cd into and which leaks the
-                    # operator's filesystem layout into logs.
+                    # `working_dir = matches[0].parent` used the
+                    # match blindly; the working dir handed to
+                    # codeql must RESOLVE inside the repo — a
+                    # symlinked path segment would otherwise make
+                    # the cd effectively land elsewhere (e.g.
+                    # /etc), a dir codeql can't build from and
+                    # whose surfacing leaks the operator's
+                    # filesystem layout into logs.
                     # X_OK check refuses dirs we can't actually
                     # browse into.
                     candidate = matches[0].parent
@@ -391,6 +521,19 @@ class BuildDetector:
                 )
                 return None
 
+        # Special handling for autotools: a git checkout ships the
+        # hand-authored configure.ac / Makefile.am but usually NOT the
+        # generated ./configure (a release-tarball artifact), so
+        # "./configure && make" fails on the first command. autoreconf
+        # regenerates it with standard host tooling — preferred over
+        # running a repo-shipped autogen.sh by name.
+        if build_type == "autotools" and not (working_dir / "configure").is_file():
+            command = "autoreconf -fi && " + command
+            logger.debug(
+                "No generated ./configure in %s — prepending autoreconf",
+                working_dir,
+            )
+
         # Special handling for gradle wrapper
         if build_type == "gradle" and "./gradlew" in command:
             gradlew = self.repo_path / "gradlew"
@@ -418,6 +561,47 @@ class BuildDetector:
             env_detect=config.get("env_detect", []),
         )
 
+    @staticmethod
+    def _ancestor_include_refusal(
+        resolved: Path,
+        repo_resolved: Path,
+        bases: list,
+    ) -> str | None:
+        """Reason an ancestor-include candidate must be refused, or
+        ``None`` when it is grantable. ONE home for the predicate set,
+        applied at BOTH discovery and the pre-dry-run grant re-vet: the
+        re-vet exists because a symlink swapped between discovery and
+        grant must not widen the read sandbox, so a predicate the
+        re-vet lacks is a predicate the swap defeats (the shared-temp
+        block had drifted out of the re-vet — a discovery→grant swap
+        to ``/tmp/include``, creatable by ANY local user, passed for
+        targets extracted under /tmp).
+
+        ``bases`` is the containment set: the single walked ancestor
+        at discovery; the walked-ancestor parents at the grant site.
+        """
+        import tempfile
+        tmp_roots = {
+            "/tmp", "/var/tmp",
+            os.path.realpath(tempfile.gettempdir()),
+        }
+        s = str(resolved)
+        # System paths could never be the target's own include/ dir
+        # (path-boundary compare: /etcetera is not /etc).
+        for blocked in ("/etc", "/proc", "/sys", "/dev", "/boot"):
+            if s == blocked or s.startswith(blocked + os.sep):
+                return "system path"
+        # <shared-temp-root>/include is creatable by any local user.
+        if str(resolved.parent) in tmp_roots:
+            return "direct child of a shared temp root"
+        if resolved == Path(resolved.anchor):
+            return "filesystem root"
+        if repo_resolved.is_relative_to(resolved):
+            return "superset of the target"
+        if not any(resolved.is_relative_to(base) for base in bases):
+            return "outside the walked ancestor subtree"
+        return None
+
     def _discover_ancestor_includes(self, max_depth: int = 3) -> list[str]:
         """Find ``include/`` directories at ancestors of ``self.repo_path``.
 
@@ -442,6 +626,7 @@ class BuildDetector:
             current = self.repo_path.resolve(strict=False)
         except OSError:
             return found
+        repo_resolved = current
         # World-writable temp roots. <temp-root>/include is never a
         # legitimate ancestor include dir: ANY local user could
         # pre-create it and shadow system headers in every
@@ -467,41 +652,59 @@ class BuildDetector:
                 inc_resolved = include_dir.resolve(strict=False)
             except OSError:
                 continue
-            if (
-                include_dir.is_dir()
-                and os.access(include_dir, os.X_OK)
-                and self._has_c_header(inc_resolved)
-            ):
-                # Sanity-check the resolved path is somewhere
-                # plausible. Reject anything that resolves to a
-                # system path like /etc, /proc, /sys, /dev — these
-                # could not legitimately be the "include/" dir of
-                # the operator's source target. Also re-apply the
-                # temp-root block on the RESOLVED path so a symlink
-                # (include -> /tmp/include) can't smuggle a shared
-                # temp root's include dir back in.
-                blocked = ("/etc", "/proc", "/sys", "/dev", "/boot")
-                if (
-                    any(str(inc_resolved).startswith(b) for b in blocked)
-                    or str(inc_resolved.parent) in tmp_roots
-                ):
-                    logger.debug(
-                        "Skipping ancestor include candidate %s "
-                        "(resolves to a system path)",
-                        include_dir,
-                    )
-                    continue
+            if not (include_dir.is_dir() and os.access(include_dir, os.X_OK)):
+                continue
+            # Sanity-check the resolved path BEFORE the recursive
+            # header walk (a hostile resolution must not even be
+            # enumerated). The predicate set is shared with the
+            # pre-dry-run grant re-vet (`_ancestor_include_refusal`)
+            # so the two sites cannot drift: system paths, shared
+            # temp roots, filesystem root, repo supersets, and any
+            # resolution that leaves the ancestor subtree the
+            # candidate was found in — the rescue exists for IN-TREE
+            # sibling include dirs only; downstream a grant becomes
+            # both a compile `-I<dir>` and a dry-run sandbox readable
+            # grant on host content the operator never scoped in.
+            reason = self._ancestor_include_refusal(
+                inc_resolved, repo_resolved, [current])
+            if reason is not None:
+                logger.debug(
+                    "Skipping ancestor include candidate %s (%s)",
+                    include_dir, reason,
+                )
+                continue
+            if self._has_c_header(inc_resolved):
                 found.append(str(inc_resolved))
         return found
 
     @staticmethod
     def _has_c_header(path: Path) -> bool:
-        """True if ``path`` contains at least one .h/.hpp file
-        recursively. Quick existence check — does not enumerate."""
+        """True if ``path`` contains at least one .h/.hpp/.hh file.
+
+        Walks until the FIRST hit (early exit, so a real include tree
+        answers after one directory) but the walk itself is bounded by
+        ``_MAX_WALK_DIRS`` — the early exit is no bound at all on a
+        header-free empty-dir farm. Suffix match is case-sensitive,
+        the same rule ``_walk_files`` applies when the missing-header
+        scan collects existing header NAMES: a case-insensitive match
+        here fed dirs whose headers the case-sensitive collection then
+        missed. Never follows directory symlinks (a hostile
+        ``include`` tree must not walk the host filesystem)."""
+        dirs_seen = 0
         try:
-            for entry in path.rglob("*"):
-                if entry.is_file() and entry.suffix.lower() in (".h", ".hpp", ".hh"):
-                    return True
+            for _dirpath, _dirnames, filenames in os.walk(
+                path, followlinks=False,
+            ):
+                dirs_seen += 1
+                if dirs_seen > _MAX_WALK_DIRS:
+                    logger.warning(
+                        "Header probe under %s hit the %d-dir cap — "
+                        "treating as header-free", path, _MAX_WALK_DIRS,
+                    )
+                    return False
+                for name in filenames:
+                    if name.endswith((".h", ".hpp", ".hh")):
+                        return True
         except OSError:
             return False
         return False
@@ -529,21 +732,27 @@ class BuildDetector:
         # Build the set of header names that DO exist on disk —
         # repo_path + ancestor includes we'd consider.
         existing_header_names = set()
-        for ext in (".h", ".hpp", ".hh"):
-            for h in self.repo_path.rglob(f"*{ext}"):
-                existing_header_names.add(h.name)
+        for h in _walk_files(self.repo_path, (".h", ".hpp", ".hh")):
+            existing_header_names.add(h.name)
         for parent_inc in self._discover_ancestor_includes(max_depth=3):
             try:
-                for ext in (".h", ".hpp", ".hh"):
-                    for h in Path(parent_inc).rglob(f"*{ext}"):
-                        existing_header_names.add(h.name)
+                for h in _walk_files(Path(parent_inc), (".h", ".hpp", ".hh")):
+                    existing_header_names.add(h.name)
             except OSError:
                 continue
 
-        # Pattern: #include "something_config.h" OR #include "config.h"
+        # Pattern: #include "something_config.h" OR #include "config.h".
+        # Case-SENSITIVE end to end: the existing-header name set is
+        # collected case-sensitively, so an IGNORECASE grep here
+        # reported "missing" for spellings the collection deliberately
+        # does not track (C itself is case-sensitive; the lowercase
+        # `#include` keyword and `*config.h` convention are the real
+        # shapes).
         pattern = re.compile(
-            r'^\s*#\s*include\s*"([^"]*config(?:_[a-z0-9_]+)?\.h)"',
-            re.MULTILINE | re.IGNORECASE,
+            # Horizontal-only indent — the MULTILINE ^\s* idiom is
+            # quadratic on blank-line runs in scanned source.
+            r'^[^\S\n]*#\s*include\s*"([^"]*config(?:_[a-z0-9_]+)?\.h)"',
+            re.MULTILINE,
         )
         seen_missing = set()
         sources: list[Path] = []
@@ -551,15 +760,24 @@ class BuildDetector:
         # header (e.g. curl's ``curl_setup.h``) that does the
         # ``#include "curl_config.h"`` so the .c files never
         # reference the config header directly.
-        for ext in (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp"):
-            sources.extend(self.repo_path.rglob(f"*{ext}"))
+        sources.extend(
+            _walk_files(self.repo_path, (".c", ".cc", ".cpp", ".cxx",
+                                         ".h", ".hpp")),
+        )
         # Cap at 200 files to bound scan time on huge targets.
         for src in sorted(sources, key=lambda p: (len(p.parts), str(p)))[:200]:
-            try:
-                with src.open("rb") as f:
-                    text = f.read(65536).decode("utf-8", "replace")
-            except OSError:
+            # Hardened head read: this scan runs in the UNSANDBOXED
+            # parent over untrusted directory entries, and _walk_files
+            # yields every file type — a raw open() on a writer-less
+            # FIFO named `a.c` blocks forever with nothing to kill it
+            # but the operator. read_text_capped opens O_NOFOLLOW +
+            # O_NONBLOCK and refuses non-regular files, degrading to
+            # skip — the same answer an unreadable file already got.
+            from core.source import read_text_capped
+            got = read_text_capped(src, 65536)
+            if got is None:
                 continue
+            text = got[0]
             for m in pattern.finditer(text):
                 header = m.group(1)
                 if header in existing_header_names:
@@ -589,11 +807,14 @@ class BuildDetector:
         (first 64 KB) — real CMakeLists files rarely exceed this;
         the cap protects against pathological inputs.
         """
-        try:
-            with cmakelists.open("rb") as f:
-                head = f.read(65536).decode("utf-8", "replace")
-        except OSError:
+        # Hardened head read (unsandboxed parent, untrusted entry): a
+        # FIFO or device node planted at a CMakeLists.txt path must
+        # degrade to "not a project root", never block the open.
+        from core.source import read_text_capped
+        got = read_text_capped(cmakelists, 65536)
+        if got is None:
             return False
+        head = got[0]
         for raw in head.splitlines():
             line = raw.lstrip().lower()
             if line.startswith(("cmake_minimum_required", "project(")):
@@ -609,64 +830,27 @@ class BuildDetector:
 
         The manifest lives in the SCANNED (untrusted) repo and this
         method runs in the unsandboxed parent, so the bytes are gated
-        BEFORE any parse: open with ``O_NOFOLLOW`` (a package.json
-        symlinked at /dev/zero would otherwise be slurped until OOM)
-        and ``O_NONBLOCK`` (a FIFO would otherwise block ``open``
-        forever), then require ``fstat`` to report a regular file
-        under the size cap. Anything failing the gate degrades to
-        "no build script", same as a malformed manifest.
+        BEFORE any parse — via the shared hardened reader
+        (``macro_config._read_bounded``: O_NOFOLLOW so a package.json
+        symlinked at /dev/zero is refused, O_NONBLOCK so a FIFO can't
+        block ``open`` forever, fstat regular-file + size gate before
+        any read, grew-past-cap re-check). This method used to carry
+        its own inline copy of that whole gate. Anything failing it
+        degrades to "no build script", same as a malformed manifest.
         """
         import json
-        import stat as _stat
-        flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+
+        from core.build.macro_config import _read_bounded
         try:
-            fd = os.open(str(package_json), flags)
-        except OSError as e:
-            logger.debug("Cannot open package.json: %s", e)
+            raw = _read_bounded(package_json, self._PACKAGE_JSON_MAX_BYTES)
+        except (OSError, ValueError) as e:
+            logger.debug("Cannot read package.json: %s", e)
             return False
         try:
-            st = os.fstat(fd)
-            if not _stat.S_ISREG(st.st_mode):
-                logger.debug(
-                    "package.json at %s is not a regular file — ignoring",
-                    package_json,
-                )
-                return False
-            if st.st_size > self._PACKAGE_JSON_MAX_BYTES:
-                logger.debug(
-                    "package.json at %s is %d bytes (cap %d) — ignoring",
-                    package_json, st.st_size, self._PACKAGE_JSON_MAX_BYTES,
-                )
-                return False
-            chunks = []
-            remaining = self._PACKAGE_JSON_MAX_BYTES + 1
-            while remaining > 0:
-                buf = os.read(fd, min(remaining, 1 << 20))
-                if not buf:
-                    break
-                chunks.append(buf)
-                remaining -= len(buf)
-            if remaining <= 0:
-                # File grew past the cap between fstat and the reads.
-                logger.debug(
-                    "package.json at %s exceeded the size cap during "
-                    "read — ignoring", package_json,
-                )
-                return False
-            raw = b"".join(chunks)
-        except OSError as e:
-            logger.debug("Error reading package.json: %s", e)
-            return False
-        finally:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        try:
-            # utf-8-sig: transparently strip a UTF-8 BOM (same contract
-            # as core.json.load_json, which this replaced — load_json
-            # has no pre-parse size/file-type gate).
-            data = json.loads(raw.decode("utf-8-sig"))
+            # Leading U+FEFF: the utf-8 BOM under the reader's
+            # errors="replace" decode (same contract the previous
+            # utf-8-sig decode provided).
+            data = json.loads(raw.lstrip("\ufeff"))
             if not isinstance(data, dict):
                 return False
             scripts = data.get("scripts", {})
@@ -674,6 +858,7 @@ class BuildDetector:
         except Exception as e:  # noqa: BLE001 — malformed manifest degrades to no-build-script
             logger.debug("Error parsing package.json: %s", e)
             return False
+
     # Version probes run from the filesystem root — NEVER from inside
     # the scanned repo. Build tools auto-load configuration relative
     # to cwd (or an ancestor found by walking upward), even for bare
@@ -705,6 +890,12 @@ class BuildDetector:
     # cwd-never-inside-the-repo assertion. A probe added here cannot
     # silently reopen the class the maven `.mvn/jvm.config` incident
     # belonged to without failing that test.
+    # Every type BUILD_SYSTEMS can emit MUST have an entry here (a
+    # regression test enumerates both maps): validate_build_command
+    # returns False for unknown types, and the CodeQL caller downgrades
+    # an unvalidated detection to no-build mode — a missing entry
+    # silently discards a perfectly good detected command on EVERY run
+    # for that build system (autotools and meson shipped that way).
     _VALIDATION_COMMANDS: ClassVar[dict[str, list[str]]] = {
         "maven": ["mvn", "--version"],
         "gradle": ["gradle", "--version"],
@@ -714,11 +905,26 @@ class BuildDetector:
         "pnpm": ["pnpm", "--version"],
         "pip": ["pip", "--version"],
         "poetry": ["poetry", "--version"],
+        # `python setup.py build` — probe the interpreter the command
+        # names, not setuptools itself (import errors surface in the
+        # real build with a clear message).
+        "setuptools": ["python", "--version"],
         "gomod": ["go", "version"],
+        "cargo": ["cargo", "--version"],
         "cmake": ["cmake", "--version"],
+        # `./configure && make`: configure is repo-shipped and never
+        # executed at validation time (same doctrine as the gradle
+        # wrapper special-case above — repo code doesn't run in the
+        # probe), so the system tool the command actually needs is
+        # make. autoconf is deliberately NOT probed: it generates
+        # configure but the detected command never invokes it.
+        "autotools": ["make", "--version"],
+        "meson": ["meson", "--version"],
         "make": ["make", "--version"],
         "dotnet": ["dotnet", "--version"],
+        "msbuild": ["msbuild", "-version"],
         "bundler": ["bundle", "--version"],
+        "rake": ["rake", "--version"],
     }
 
     def validate_build_command(self, build_system: BuildSystem, timeout: int = 30) -> bool:
@@ -892,7 +1098,6 @@ class BuildDetector:
         r'-I.+|-D[A-Za-z_].*'           # include dirs / defines
         r'|-include|-std=.+'            # forced header / language std
         r'|-sourcepath|-cp|-classpath'  # javac shapes
-        r'|[^-].*'                      # positional value of a pair flag
         r')\Z'
     )
 
@@ -901,30 +1106,80 @@ class BuildDetector:
 
         Accepts single tokens ("-DFOO", "-Idir with spaces" — one
         argv element, space is data) and known pair flags
-        ("-include header.h" — split into their two argv tokens).
-        Two gates, both required: no shell/Make metacharacters
-        (character level) AND a known flag name (_SAFE_FLAG_NAME).
+        ("-include header.h", or ["-sourcepath", "<dir>"] as two list
+        elements — emitted as their two argv tokens). Two gates, both
+        required: no shell/Make metacharacters (character level) AND a
+        known flag name (_SAFE_FLAG_NAME).
+
+        Pair flags validate ATOMICALLY: a rejected value drops its
+        name too, and a name with no value is dropped. Emitting the
+        bare name would make the compiler consume the NEXT argv
+        element (-d, a source file …) as its value — one rejected
+        repo path used to strand "-sourcepath", which then ate the
+        javac "-d" and silently broke the whole traced build. A bare
+        non-dash token is accepted ONLY in pair-value position:
+        standalone positionals would splice arbitrary extra argv
+        (an attacker-chosen source file) into every compile.
         """
-        safe: list = []
+        # Flatten to candidate argv tokens (pair strings split once).
+        tokens: list[str] = []
         for flag in flags:
             if not isinstance(flag, str) or not flag.strip():
                 continue
             first, _sep, rest = flag.partition(" ")
             if first in self._PAIR_FLAG_NAMES and rest.strip():
-                tokens = [first, rest.strip()]
+                tokens.extend([first, rest.strip()])
             else:
-                tokens = [flag]
-            if not all(self._SAFE_FLAG_TOKEN.match(t) for t in tokens):
-                logger.warning("Rejected unsafe compiler flag: %s", flag)
+                tokens.append(flag)
+
+        safe: list = []
+        i = 0
+        n = len(tokens)
+        while i < n:
+            tok = tokens[i]
+            if tok in self._PAIR_FLAG_NAMES:
+                value = tokens[i + 1] if i + 1 < n else None
+                if value is None or value.startswith("-"):
+                    # No value present — drop the name alone and keep
+                    # lexing from the next token (it is a flag, not a
+                    # value).
+                    logger.warning(
+                        "Dropped pair flag without a value: %s", tok)
+                    i += 1
+                    continue
+                if self._SAFE_FLAG_TOKEN.match(value):
+                    safe.extend([tok, value])
+                else:
+                    # Fail-closed by design: the charset excludes
+                    # shell/Make metacharacters (parens, quotes,
+                    # non-ASCII), which also drops LEGITIMATE values —
+                    # e.g. a repo-root -sourcepath under a checkout
+                    # path containing parentheses. Widening the class
+                    # would let those characters reach generated build
+                    # scripts; the trusted escape hatch is the whole
+                    # point of the hint below.
+                    logger.warning(
+                        "Rejected unsafe compiler flag pair: %s %s "
+                        "(operators needing it: /project set "
+                        "build-command)", tok, value)
+                i += 2
                 continue
-            if not all(self._SAFE_FLAG_NAME.match(t) for t in tokens):
+            if not tok.startswith("-"):
+                logger.warning(
+                    "Dropped unpaired positional token: %s", tok)
+                i += 1
+                continue
+            if not self._SAFE_FLAG_TOKEN.match(tok):
+                logger.warning("Rejected unsafe compiler flag: %s", tok)
+            elif not self._SAFE_FLAG_NAME.match(tok):
                 logger.warning(
                     "Dropped compiler flag outside the synthesis "
                     "allowlist: %s (operators needing it: "
-                    "/project set build-command)", flag,
+                    "/project set build-command)", tok,
                 )
-                continue
-            safe.extend(tokens)
+            else:
+                safe.append(tok)
+            i += 1
         return safe
 
     def synthesise_build_command(self, language: str) -> BuildSystem | None:
@@ -972,6 +1227,57 @@ class BuildDetector:
         source_files, compiler, include_flags, define_flags = self._detect_build_params(language)
         if not source_files:
             return None
+
+        # Ancestor -I rescues point OUTSIDE repo_path by construction
+        # (in-repo include flags stay relative). The dry-run sandbox
+        # restricts reads to repo + system dirs, so the discovered
+        # ancestor include dirs must be carved out explicitly or the
+        # rescue self-defeats under the read sandbox. Absolute -I
+        # flags are exactly the _discover_ancestor_includes results —
+        # already ownership/system-path checked at discovery — but the
+        # grant is re-vetted here on the CURRENT resolution: a symlink
+        # swapped between discovery and grant must not widen the read
+        # sandbox. The grant only ever covers dirs inside the walked
+        # ancestor subtree (max_depth parents of the scan root) —
+        # roots, repo-supersets, and out-of-tree resolutions
+        # (`/usr`, a foreign `/home/...`) are all refused.
+        ancestor_read_dirs: list[str] = []
+        try:
+            repo_resolved = self.repo_path.resolve(strict=False)
+        except OSError:
+            repo_resolved = self.repo_path
+        # Filesystem roots never qualify as a base — for a shallow
+        # repo the third parent can be `/`, which would make the
+        # containment vacuous.
+        allowed_bases = [
+            p for p in list(repo_resolved.parents)[:3]
+            if p != Path(p.anchor)
+        ]
+        for flag in include_flags:
+            if not (isinstance(flag, str) and flag.startswith("-I")
+                    and os.path.isabs(flag[2:])):
+                continue
+            candidate = flag[2:]
+            try:
+                resolved = Path(candidate).resolve(strict=False)
+            except OSError:
+                continue
+            # Same predicate set as discovery (shared helper): a
+            # symlink swapped between discovery and grant must not
+            # smuggle in anything discovery would have refused —
+            # including a shared temp root's include dir, which for a
+            # /tmp-extracted target the parent-containment check
+            # alone admits (the walked-ancestor bases contain /tmp
+            # itself there).
+            reason = self._ancestor_include_refusal(
+                resolved, repo_resolved, allowed_bases)
+            if reason is not None:
+                logger.warning(
+                    "Refusing dry-run read grant for include dir %s — "
+                    "%s", candidate, reason,
+                )
+                continue
+            ancestor_read_dirs.append(candidate)
 
         # Diagnostic — does NOT auto-run anything. If the target's
         # .c files reference ``*_config.h``-shaped headers that
@@ -1046,7 +1352,10 @@ class BuildDetector:
             logger.info("Synthesised build script for %s: %s", language, script_path)
             logger.info("  Source files: %d", len(source_files))
 
-            failures = self._dry_run(script_path, language=language)
+            failures = self._dry_run(
+                script_path, language=language,
+                extra_readable=ancestor_read_dirs,
+            )
             build_type = "synthesised"
             confidence = 0.7
 
@@ -1070,7 +1379,10 @@ class BuildDetector:
                         include_flags + cc_flags.get("includes", []),
                         define_flags + cc_flags.get("defines", []),
                     )
-                    cc_failures = self._dry_run(script_path, language=language)
+                    cc_failures = self._dry_run(
+                        script_path, language=language,
+                        extra_readable=ancestor_read_dirs,
+                    )
                     if cc_failures is None:
                         logger.info("  CC retry didn't run — keeping heuristic")
                         # The script on disk currently contains the UNMEASURED
@@ -1116,19 +1428,19 @@ class BuildDetector:
         """Detect source files, compiler, and include/define flags."""
         source_files: list[Path] = []
         if language == "cpp":
-            for ext in (".c", ".cc", ".cpp", ".cxx"):
-                source_files.extend(self.repo_path.rglob(f"*{ext}"))
+            source_files.extend(
+                _walk_files(self.repo_path, (".c", ".cc", ".cpp", ".cxx")),
+            )
             has_cpp = any(f.suffix in (".cpp", ".cc", ".cxx") for f in source_files)
             compiler = "g++" if has_cpp else "gcc"
 
             # Auto-detect -I flags from header locations
             include_flags = set()
-            for ext in (".h", ".hpp", ".hh"):
-                for h in self.repo_path.rglob(f"*{ext}"):
-                    try:
-                        include_flags.add(f"-I{h.parent.relative_to(self.repo_path)}")
-                    except ValueError:
-                        pass
+            for h in _walk_files(self.repo_path, (".h", ".hpp", ".hh")):
+                try:
+                    include_flags.add(f"-I{h.parent.relative_to(self.repo_path)}")
+                except ValueError:
+                    pass
             # Subdir-target rescue: walk UP from repo_path looking for
             # sibling ``include/`` directories at ancestors. Real-world
             # case: repo_path points at ``curl-8.11.0/lib`` and the
@@ -1143,17 +1455,17 @@ class BuildDetector:
             # of operator-stated scan scope.
             for parent_inc in self._discover_ancestor_includes():
                 include_flags.add(f"-I{parent_inc}")
-            include_flags = sorted(include_flags)
+            flag_list = sorted(include_flags)
         elif language == "java":
-            source_files = list(self.repo_path.rglob("*.java"))
+            source_files = _walk_files(self.repo_path, (".java",))
             compiler = "javac"
-            include_flags = ["-sourcepath", str(self.repo_path)]
+            flag_list = ["-sourcepath", str(self.repo_path)]
         else:
             return [], "", [], []
 
         # Validate all auto-detected flags
-        include_flags = self._validate_flags(include_flags)
-        return source_files, compiler, include_flags, []
+        flag_list = self._validate_flags(flag_list)
+        return source_files, compiler, flag_list, []
 
     def _java_synthesised_classpath(self) -> list[str]:
         """When we fall through to raw javac (no pom.xml/build.gradle/
@@ -1285,8 +1597,10 @@ for i, src in enumerate(FILES):
 
     # SECURITY: resolve symlinks and reject paths that escape the repo root.
     # Prevents writing object files outside the build directory via symlinks.
+    # Path-boundary compare: an in-repo file NAMED `..weird.c` is not
+    # an escape (rel must be `..` itself or start with `../`).
     rel = os.path.relpath(os.path.realpath(src), REPO_ROOT)
-    if rel.startswith('..'):
+    if rel == '..' or rel.startswith('..' + os.sep):
         fail += 1
         continue
 
@@ -1405,7 +1719,8 @@ print(f"Compiled {{ok}}/{{total}} files ({{fail}} failed)")
         script_path.chmod(0o500)
         return script_path
 
-    def _dry_run(self, script_path, language: str | None = None) -> list | None:
+    def _dry_run(self, script_path, language: str | None = None,
+                 extra_readable: list[str] | None = None) -> list | None:
         """Run the build script and return compilation failures.
 
         Returns:
@@ -1430,6 +1745,16 @@ print(f"Compiled {{ok}}/{{total}} files ({{fail}} failed)")
         via PATH but the JDK layout (tools.jar, rt.jar on older JDKs)
         may not resolve. Scoped to this one subprocess — see
         ~/design/env-handling.md.
+
+        ``extra_readable`` names additional read-allowed roots under
+        ``restrict_reads`` — the caller passes the discovered ancestor
+        include dirs, which point outside ``repo_path`` by
+        construction. Without the carve-out the sandboxed compiler
+        gets EACCES on every ancestor header while the real CodeQL
+        build (which runs read-wide) would succeed: the dry-run then
+        reports failures the CC flag-suggest retry can never fix,
+        burning a paid dispatch and downgrading confidence for the
+        exact case the ancestor rescue exists for.
         """
         # Build env: sanitised base + toolchain auto-detection for the
         # language. For Java synthesised-build path, this is JAVA_HOME.
@@ -1439,7 +1764,7 @@ print(f"Compiled {{ok}}/{{total}} files ({{fail}} failed)")
         # Extra read-allowed roots under restrict_reads: user-local
         # toolchain installs (sdkman/asdf JDKs) live outside the
         # default system-dirs allowlist.
-        readable: list[str] = []
+        readable: list[str] = list(extra_readable or [])
         if language == "java":
             from core.build.toolchain import apply_toolchain_env
             apply_toolchain_env(env, ["JAVA_HOME"])
@@ -1820,7 +2145,12 @@ def main() -> None:
         if not valid:
             print("WARNING: Build command validation failed")
 
+    # command / working_dir / env_vars derive from the scanned
+    # (hostile) repo's build files — escape before the terminal, and
+    # keep the JSON lane ASCII (C1 controls pass raw otherwise).
+    from core.security.log_sanitisation import sanitise_for_terminal as _sft
     if args.json:
+        import json as _json
         output = {
             "type": build_system.type,
             "command": build_system.command,
@@ -1828,16 +2158,36 @@ def main() -> None:
             "env_vars": build_system.env_vars,
             "confidence": build_system.confidence,
         }
-        print(dumps_display(output))
+        print(_json.dumps(output, indent=2, ensure_ascii=True, default=str))
     else:
         print(f"\n{'=' * 70}")
         print(f"BUILD SYSTEM DETECTED: {build_system.type.upper()}")
         print(f"{'=' * 70}")
-        print(f"Command: {build_system.command}")
-        print(f"Working directory: {build_system.working_dir}")
+        print(f"Command: {_sft(str(build_system.command), max_len=300)}")
+        print(f"Working directory: {_sft(str(build_system.working_dir), max_len=300)}")
         print(f"Confidence: {build_system.confidence:.2f}")
         if build_system.env_vars:
-            print(f"Environment variables: {build_system.env_vars}")
+            print(f"Environment variables: {_sft(str(build_system.env_vars), max_len=300)}")
+
+
+def declared_env_constants() -> frozenset:
+    """Every (name, value) pair RAPTOR itself declares in a
+    BUILD_SYSTEMS ``env_vars`` row.
+
+    ``BuildSystem.env_vars`` carries RAPTOR-chosen constants (JVM heap
+    sizing and the like) — the static class table is the only
+    producer. The codeql build-env gate admits exactly these declared
+    pairs and refuses everything else as hostile input, so the
+    constants reach traced builds while a hypothetical future producer
+    that routes repo content into the field gains nothing: only the
+    literal benign pair RAPTOR would have set anyway can pass.
+    """
+    pairs = set()
+    for lang_configs in BuildDetector.BUILD_SYSTEMS.values():
+        for config in lang_configs.values():
+            for name, value in config.get("env_vars", {}).items():
+                pairs.add((name, value))
+    return frozenset(pairs)
 
 
 if __name__ == "__main__":

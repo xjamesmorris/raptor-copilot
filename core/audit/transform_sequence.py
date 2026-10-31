@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING
 
 from .prompt_defence import sanitise_for_prompt
+from core.source.lines import split_lines
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -132,18 +133,24 @@ def _pat(*patterns: str) -> list[re.Pattern[str]]:
     return [re.compile(p, re.IGNORECASE) for p in patterns]
 
 
+# Keyword-pair gaps in the ordering rules are bounded ({0,200}), same
+# convention as the double-encoding table below: an unbounded `.*` gap
+# makes every occurrence of the first keyword re-scan the rest of the
+# scanned name for the second — quadratic on hostile-shaped call names.
+# Real call names sit far inside the bound; a longer name stops
+# matching the rule instead of scanning without bound.
 ORDERING_RULES: list[_OrderingRule] = [
     _OrderingRule(
         name="unicode_before_regex",
         must_precede_patterns=_pat(
-            r"unicode.*norm", r"nfkc|nfkd|nfc|nfd",
-            r"strip.*(?:invisible|zero.?width|control)",
-            r"remove.*(?:invisible|zero.?width|bidi|control)",
+            r"unicode.{0,200}norm", r"nfkc|nfkd|nfc|nfd",
+            r"strip.{0,200}(?:invisible|zero.?width|control)",
+            r"remove.{0,200}(?:invisible|zero.?width|bidi|control)",
         ),
         must_follow_patterns=_pat(
             r"re\.sub", r"re\.match", r"re\.search", r"re\.findall",
             r"defang", r"neutrali[sz]e",
-            r"regex.*(?:replace|match|filter)",
+            r"regex.{0,200}(?:replace|match|filter)",
         ),
         reason="Unicode normalization/stripping must precede regex matching — "
                "invisible chars can defeat regex anchors and patterns",
@@ -152,12 +159,12 @@ ORDERING_RULES: list[_OrderingRule] = [
     _OrderingRule(
         name="decode_before_path_check",
         must_precede_patterns=_pat(
-            r"url.*decode", r"unquote", r"percent.*decode",
-            r"urllib.*unquote",
+            r"url.{0,200}decode", r"unquote", r"percent.{0,200}decode",
+            r"urllib.{0,200}unquote",
         ),
         must_follow_patterns=_pat(
-            r"path.*(?:check|valid|travers|saniti)",
-            r"(?:check|valid|saniti).*path",
+            r"path.{0,200}(?:check|valid|travers|saniti)",
+            r"(?:check|valid|saniti).{0,200}path",
             r"os\.path\.(?:basename|normpath|realpath)",
             r"is_safe_path", r"check_path",
         ),
@@ -168,13 +175,13 @@ ORDERING_RULES: list[_OrderingRule] = [
     _OrderingRule(
         name="entity_decode_before_xss_filter",
         must_precede_patterns=_pat(
-            r"html.*(?:unescape|decode|entity)",
-            r"unescape.*html",
-            r"(?:decode|parse).*entit",
+            r"html.{0,200}(?:unescape|decode|entity)",
+            r"unescape.{0,200}html",
+            r"(?:decode|parse).{0,200}entit",
         ),
         must_follow_patterns=_pat(
-            r"(?:xss|html).*(?:filter|sanitiz|clean|strip|escape)",
-            r"(?:filter|sanitiz|clean|strip).*(?:xss|html|tag)",
+            r"(?:xss|html).{0,200}(?:filter|sanitiz|clean|strip|escape)",
+            r"(?:filter|sanitiz|clean|strip).{0,200}(?:xss|html|tag)",
             r"bleach", r"html\.escape", r"markupsafe",
         ),
         reason="HTML-entity-encoded characters (&#60;) bypass XSS filters "
@@ -185,11 +192,11 @@ ORDERING_RULES: list[_OrderingRule] = [
         name="case_normalize_before_blocklist",
         must_precede_patterns=_pat(
             r"\.lower\b", r"\.upper\b", r"\.casefold\b",
-            r"case.*norm", r"to_?lower", r"to_?upper",
+            r"case.{0,200}norm", r"to_?lower", r"to_?upper",
         ),
         must_follow_patterns=_pat(
             r"block.?list", r"deny.?list", r"banned", r"forbidden",
-            r"disallow", r"reject.*(?:name|word|term)",
+            r"disallow", r"reject.{0,200}(?:name|word|term)",
         ),
         reason="Mixed-case input bypasses case-sensitive blocklist checks",
         fix_template="move {precede} before {follow}",
@@ -197,12 +204,12 @@ ORDERING_RULES: list[_OrderingRule] = [
     _OrderingRule(
         name="null_strip_before_extension_check",
         must_precede_patterns=_pat(
-            r"(?:strip|remove|replace).*(?:null|\\x00|\x00|\\0)",
-            r"\.replace\(.*(?:null|\\x00|\\0)",
+            r"(?:strip|remove|replace).{0,200}(?:null|\\x00|\x00|\\0)",
+            r"\.replace\(.{0,200}(?:null|\\x00|\\0)",
         ),
         must_follow_patterns=_pat(
-            r"(?:check|valid|allow).*(?:ext|suffix|file.?type)",
-            r"\.endswith\b", r"splitext\b", r"file.*extension",
+            r"(?:check|valid|allow).{0,200}(?:ext|suffix|file.?type)",
+            r"\.endswith\b", r"splitext\b", r"file.{0,200}extension",
         ),
         reason="Null bytes truncate filenames in some APIs, bypassing "
                "extension checks",
@@ -211,12 +218,12 @@ ORDERING_RULES: list[_OrderingRule] = [
     _OrderingRule(
         name="backslash_normalize_before_path_check",
         must_precede_patterns=_pat(
-            r"\.replace\(.*(?:\\\\|backslash).*(?:/|slash)",
-            r"backslash.*norm", r"normalize.*(?:sep|slash|path)",
+            r"\.replace\(.{0,200}(?:\\\\|backslash).{0,200}(?:/|slash)",
+            r"backslash.{0,200}norm", r"normalize.{0,200}(?:sep|slash|path)",
         ),
         must_follow_patterns=_pat(
-            r"path.*(?:check|valid|travers|saniti)",
-            r"\.startswith\(.*(?:/|\\\\)",
+            r"path.{0,200}(?:check|valid|travers|saniti)",
+            r"\.startswith\(.{0,200}(?:/|\\\\)",
         ),
         reason="Backslash path separators bypass forward-slash-only "
                "traversal checks",
@@ -226,12 +233,12 @@ ORDERING_RULES: list[_OrderingRule] = [
         name="whitespace_strip_before_header_parse",
         must_precede_patterns=_pat(
             r"\.strip\b", r"\.lstrip\b",
-            r"strip.*(?:whitespace|space|ws)",
+            r"strip.{0,200}(?:whitespace|space|ws)",
         ),
         must_follow_patterns=_pat(
-            r"(?:parse|split).*header",
-            r"header.*(?:parse|split|extract)",
-            r"content.?type.*parse",
+            r"(?:parse|split).{0,200}header",
+            r"header.{0,200}(?:parse|split|extract)",
+            r"content.?type.{0,200}parse",
         ),
         reason="Leading whitespace confuses header parsers and can cause "
                "request smuggling",
@@ -240,12 +247,12 @@ ORDERING_RULES: list[_OrderingRule] = [
     _OrderingRule(
         name="crlf_strip_before_header_inject",
         must_precede_patterns=_pat(
-            r"(?:strip|remove|replace).*(?:crlf|\\r\\n|\\n|newline|cr|lf)",
-            r"\.replace\(.*(?:\\r|\\n)",
+            r"(?:strip|remove|replace).{0,200}(?:crlf|\\r\\n|\\n|newline|cr|lf)",
+            r"\.replace\(.{0,200}(?:\\r|\\n)",
         ),
         must_follow_patterns=_pat(
-            r"(?:set|add|write).*header",
-            r"header.*(?:set|add|inject|write)",
+            r"(?:set|add|write).{0,200}header",
+            r"header.{0,200}(?:set|add|inject|write)",
             r"response\.header",
         ),
         reason="CRLF characters in header values enable header injection",
@@ -254,12 +261,12 @@ ORDERING_RULES: list[_OrderingRule] = [
     _OrderingRule(
         name="percent_decode_before_sql_filter",
         must_precede_patterns=_pat(
-            r"url.*decode", r"unquote", r"percent.*decode",
+            r"url.{0,200}decode", r"unquote", r"percent.{0,200}decode",
         ),
         must_follow_patterns=_pat(
-            r"sql.*(?:filter|sanitiz|escape|param)",
-            r"(?:filter|sanitiz|escape).*sql",
-            r"quote.*(?:literal|string|ident)",
+            r"sql.{0,200}(?:filter|sanitiz|escape|param)",
+            r"(?:filter|sanitiz|escape).{0,200}sql",
+            r"quote.{0,200}(?:literal|string|ident)",
         ),
         reason="Percent-encoded quotes (%27) bypass SQL sanitization",
         fix_template="move {precede} before {follow}",
@@ -274,25 +281,30 @@ ORDERING_RULES: list[_OrderingRule] = [
 # indicates potential double-encoding bypass: an intermediate security check
 # saw the still-encoded form while the final consumer sees the decoded form.
 
+# Keyword-pair gaps are bounded ({0,200}): an unbounded `.*` gap
+# makes every occurrence of the first keyword re-scan the rest of the
+# scanned text for the second — quadratic on hostile-shaped text.
+# Real decode/encode spellings keep the pair within one identifier or
+# short phrase; beyond the bound the class simply does not attach.
 _DOUBLE_ENCODE_CLASSES: list[tuple[str, re.Pattern[str]]] = [
     ("url_decode", re.compile(
-        r"url.*decode|unquote|percent.*decode|decodeURI|"
-        r"urllib.*unquote|url\.QueryUnescape|url\.PathUnescape",
+        r"url.{0,200}decode|unquote|percent.{0,200}decode|decodeURI|"
+        r"urllib.{0,200}unquote|url\.QueryUnescape|url\.PathUnescape",
         re.IGNORECASE,
     )),
     ("html_decode", re.compile(
-        r"html.*(?:unescape|decode|entity)|unescape.*html|"
-        r"(?:decode|parse).*entit|html_entity_decode|he\.decode",
+        r"html.{0,200}(?:unescape|decode|entity)|unescape.{0,200}html|"
+        r"(?:decode|parse).{0,200}entit|html_entity_decode|he\.decode",
         re.IGNORECASE,
     )),
     ("base64_decode", re.compile(
-        r"base64.*decode|b64decode|atob|Base64\.decode",
+        r"base64.{0,200}decode|b64decode|atob|Base64\.decode",
         re.IGNORECASE,
     )),
     ("url_encode", re.compile(
-        r"url.*encode|urllib.*quote|percent.*encode|encodeURI|"
-        r"url\.QueryEscape|url\.PathEscape|"
-        r"(?:percent|url|uri|path).*quote|quote_plus",
+        r"url.{0,200}encode|urllib.{0,200}quote|percent.{0,200}encode|"
+        r"encodeURI|url\.QueryEscape|url\.PathEscape|"
+        r"(?:percent|url|uri|path).{0,200}quote|quote_plus",
         re.IGNORECASE,
     )),
 ]
@@ -360,7 +372,6 @@ def _check_duplicate_transforms(
                 confidence="medium",
                 catalog_rule="duplicate_transform",
             ))
-            break
         seen[name] = i
 
     return violations
@@ -401,6 +412,11 @@ class _SequenceExtractor(ast.NodeVisitor):
         self.func_lineno = func_lineno
         self.sequences: list[TransformSequence] = []
         self._reassign_chains: dict[str, list[TransformStep]] = {}
+        # Call nodes that are interior links of an already-emitted
+        # method chain: their steps are a strict sub-chain of the
+        # enclosing call's and must not be emitted separately (the
+        # tree-sitter extractor guards this with _is_chain_object).
+        self._chain_interior: set[ast.Call] = set()
 
     def visit_Assign(self, node: ast.Assign) -> None:
         if len(node.targets) != 1:
@@ -447,11 +463,6 @@ class _SequenceExtractor(ast.NodeVisitor):
                 parts = self._dotted_name(node.func)
                 return parts, _first_arg_summary(node)
             return "", ""
-
-        # Method chain: x.strip().lower().replace(...)
-        # Walk leftward collecting the chain.
-        if isinstance(node, ast.Call):
-            pass  # handled above
         return "", ""
 
     @staticmethod
@@ -471,6 +482,7 @@ class _SequenceExtractor(ast.NodeVisitor):
         var_name = ""
         current = node
 
+        interior: list[ast.Call] = []
         while isinstance(current, ast.Call):
             if isinstance(current.func, ast.Attribute):
                 steps.append(TransformStep(
@@ -479,6 +491,8 @@ class _SequenceExtractor(ast.NodeVisitor):
                     args_summary=_first_arg_summary(current),
                 ))
                 current = current.func.value
+                if isinstance(current, ast.Call):
+                    interior.append(current)
             else:
                 break
 
@@ -487,6 +501,7 @@ class _SequenceExtractor(ast.NodeVisitor):
 
         if len(steps) < 2:
             return None
+        self._chain_interior.update(interior)
 
         steps.reverse()
         return TransformSequence(
@@ -497,10 +512,12 @@ class _SequenceExtractor(ast.NodeVisitor):
         )
 
     def visit_Call(self, node: ast.Call) -> None:
-        # Check for method chains
-        chain = self._extract_method_chain(node)
-        if chain:
-            self.sequences.append(chain)
+        # Check for method chains — but never re-emit the prefixes of a
+        # chain already extracted from an enclosing call node.
+        if node not in self._chain_interior:
+            chain = self._extract_method_chain(node)
+            if chain:
+                self.sequences.append(chain)
         self.generic_visit(node)
 
     def finalize(self) -> list[TransformSequence]:
@@ -541,19 +558,56 @@ def _extract_sequences_python(
 
 _C_EXTS = frozenset((".c", ".h", ".cc", ".cpp", ".cxx", ".go", ".js", ".ts"))
 
+# A function header needs a POSITIVE signal: at least one leading
+# type/keyword prefix, or a brace-terminated line (below). With every
+# prefix optional (the old shape) any bare call statement
+# (``log_msg(x);``) matched as a header and reset the accumulated
+# variable chains, leaving the fallback near-blind on real C. The
+# cost: headers with the return type on its own line (kernel style)
+# are no longer recognised, so a chain can be attributed to the
+# PREVIOUS function's name — sequence recall is preferred over label
+# precision in this tree-sitter-absent fallback.
+# Horizontal-only indent — the MULTILINE ^\s* idiom is quadratic
+# on blank-line runs (identical match set per line).
+# Bounded iteration counts on the keyword and type loops: the two
+# loops overlap on every word (keywords are \w+), so the unbounded
+# spelling let a qualifier-word line with no paren drive the engine
+# through every split of the run between them — worse than quadratic
+# on hostile lines. Bound trade-off, both directions: larger keeps
+# absurd headers matching but raises the per-line backtracking
+# ceiling; smaller is faster but a real header beyond the bound
+# stops matching. 16 words per loop sits far above real headers
+# while capping per-line work at a constant.
 _FUNC_HEADER_RE = re.compile(
-    r"^\s*(?:(?:static|inline|void|int|char|unsigned|const|auto|"
+    r"^[^\S\n]*(?:(?:static|inline|void|int|char|unsigned|const|auto|"
     r"func|function|export|async|public|private|protected|"
     r"internal|override|virtual|abstract|final|synchronized|"
-    r"fn|def)\s+)*"
+    r"fn|def)\s+){1,16}"
     r"(?:\([^)]*\)\s+)?"  # Go method receiver: func (s *Server) Handle(
-    r"(?:\w+\s+)*"         # return type(s): int, *Item, []byte
+    r"(?:\w+\s+){0,16}"    # return type(s): int, *Item, []byte
     r"(\w+)\s*\(",
     re.MULTILINE,
 )
 
+# Brace-terminated header (``size_t copy_data(char *p) {``) for
+# return types outside the keyword list; the name must not be a
+# control-flow keyword (``if (...) {`` is not a header).
+_FUNC_HEADER_BRACE_RE = re.compile(
+    r"^\s*(?:[\w*\[\]&:<>,]+\s+)*(\w+)\s*\([^;{]*\)\s*\{\s*$",
+)
+
+_CONTROL_FLOW_NAMES = frozenset(
+    {"if", "for", "while", "switch", "catch", "do", "else", "return"}
+)
+
+# \b keeps the unanchored scan from restarting inside an identifier
+# run (quadratic); earliest-start matches and captures unchanged.
+# The dotted chain is bounded: a ".a"-unit storm makes every
+# component start re-walk the run when no call paren follows —
+# quadratic in the line (beyond 32 links the match binds the
+# last 32 components; real call chains sit far inside that).
 _CALL_RE = re.compile(
-    r"(\w+(?:\.\w+)*)\s*\(",
+    r"\b(\w+(?:\.\w+){0,32})\s*\(",
 )
 
 
@@ -598,13 +652,17 @@ def _extract_sequences_c_regex(
 ) -> list[TransformSequence]:
     """Regex fallback for transform-sequence extraction."""
     all_seqs: list[TransformSequence] = []
-    lines = source.splitlines()
+    lines = split_lines(source)
     current_func = "<module>"
     var_chains: dict[str, list[TransformStep]] = {}
 
     for lineno_0, line in enumerate(lines):
         lineno = lineno_0 + 1
         fm = _FUNC_HEADER_RE.match(line)
+        if not fm:
+            bm = _FUNC_HEADER_BRACE_RE.match(line)
+            if bm and bm.group(1) not in _CONTROL_FLOW_NAMES:
+                fm = bm
         if fm:
             for var, steps in var_chains.items():
                 if len(steps) >= 2:
@@ -725,10 +783,14 @@ def extract_transform_sequences(
             continue
 
         for seq in seqs:
+            # Method-chain steps carry ".method"-shaped call names —
+            # match the extra (learned) names against the bare tail
+            # too, or the whole extra-names arm is dead for chains.
             security_count = sum(
                 1 for s in seq.steps
                 if (_SECURITY_TRANSFORM_RE.search(s.call_name)
-                    or s.call_name in extra)
+                    or s.call_name in extra
+                    or s.call_name.rpartition(".")[2] in extra)
             )
             if security_count >= 2:
                 all_seqs.append(seq)

@@ -13,11 +13,16 @@ from __future__ import annotations
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+if TYPE_CHECKING:
+    from packages.fuzzing.atheris_runner import AtherisResult
+    from packages.fuzzing.cargofuzz_runner import CargoFuzzResult
+    from packages.fuzzing.jazzer_runner import JazzerResult
+
+from core.binary.inspect import inspect_binary as _inspect_binary
 from core.json import save_json
 from core.logging import get_logger
-from core.sandbox import run_trusted as _run_trusted
 from packages.fuzzing.capability import CapabilityReport
 from packages.fuzzing.capability import probe as probe_capabilities
 from packages.fuzzing.target_detector import TargetInfo
@@ -27,7 +32,22 @@ _BINARY_UNDERSTAND_KINDS = frozenset({"elf-linux", "elf-kmod", "macho", "pe-exe"
 
 logger = get_logger()
 
-_EXECUTABLE_FUZZERS = {"afl", "libfuzzer"}
+_EXECUTABLE_FUZZERS = {"afl", "libfuzzer", "atheris", "cargo-fuzz",
+                       "jazzer"}
+
+# Which target kinds each explicitly requested engine can drive.
+# Engine override is a redirect within a kind's viable engines, never
+# a way to point an engine at a target it cannot execute.
+_ENGINE_KINDS = {
+    "afl": frozenset({"elf-linux", "macho"}),
+    "libfuzzer": frozenset({"elf-linux", "macho"}),
+    "atheris": frozenset({"python-pkg"}),
+    "cargo-fuzz": frozenset({"rust-crate"}),
+    "jazzer": frozenset({"java-project"}),
+}
+
+# Target kinds whose --fuzz-target flag selects an in-repo harness.
+_FUZZ_TARGET_KINDS = ("rust-crate", "java-project")
 
 
 @dataclass
@@ -48,6 +68,24 @@ class CampaignPlan:
     #: the caller's explicit consent flag (None = project marker),
     #: re-used by execute() so plan and build see the same decision.
     env_build_consent: bool | None = None
+    #: atheris (python-pkg) harness resolution — an operator-supplied
+    #: TestOneInput harness file, or a module:function entry point the
+    #: template scaffolder turns into one at execute() time.
+    atheris_harness: Path | None = None
+    atheris_entry: str | None = None
+    atheris_payload: str = "bytes"
+    #: cargo-fuzz (rust-crate) target resolution — the fuzz target
+    #: name under fuzz/fuzz_targets/ the campaign will build and run
+    #: (operator --fuzz-target, or auto-selected when the crate has
+    #: exactly one).
+    cargofuzz_target: str | None = None
+    #: jazzer (java-project) target resolution — the fully-qualified
+    #: class carrying fuzzerTestOneInput / @FuzzTest the campaign will
+    #: build and run (operator --fuzz-target, or auto-selected when
+    #: the project has exactly one), plus its declaring source file
+    #: (binds witnesses; locates the seed-corpus convention).
+    jazzer_target: str | None = None
+    jazzer_target_source: Path | None = None
 
     def summary(self) -> str:
         lines = [
@@ -83,8 +121,33 @@ class CampaignPlan:
             lines.append(
                 "Env build: AFL-instrumented build in the pinned AFL++ "
                 "image; campaign runs from its rootfs under the sandbox")
+        if self.atheris_harness:
+            lines.append(f"Atheris harness: {self.atheris_harness}")
+        elif self.atheris_entry:
+            lines.append(
+                f"Atheris harness: scaffold from {self.atheris_entry} "
+                f"({self.atheris_payload} payload)")
+        if self.cargofuzz_target:
+            lines.append(f"cargo-fuzz target: {self.cargofuzz_target}")
+        if self.jazzer_target:
+            lines.append(f"jazzer target class: {self.jazzer_target}")
         if self.needs_harness:
-            lines.append("Action required: generate libFuzzer harness")
+            if self.fuzzer == "atheris":
+                lines.append(
+                    "Action required: pass --py-harness <file> or "
+                    "--py-entry module:function")
+            elif self.fuzzer == "cargo-fuzz":
+                lines.append(
+                    "Action required: scaffold fuzz targets with "
+                    "'cargo fuzz init' / 'cargo fuzz add <name>' "
+                    "(fuzz/fuzz_targets/)")
+            elif self.fuzzer == "jazzer":
+                lines.append(
+                    "Action required: write a fuzz harness class with "
+                    "public static void fuzzerTestOneInput(byte[] "
+                    "data) (or a @FuzzTest JUnit method)")
+            else:
+                lines.append("Action required: generate libFuzzer harness")
         if self.blockers:
             lines.append("")
             lines.append("Blockers:")
@@ -112,6 +175,11 @@ class FuzzingOrchestrator:
         *,
         env_build: bool | None = None,
         run_dir: Path | None = None,
+        engine: str | None = None,
+        py_harness: Path | None = None,
+        py_entry: str | None = None,
+        py_payload: str = "bytes",
+        fuzz_target: str | None = None,
     ) -> CampaignPlan:
         """Inspect the target, pick a fuzzer, return a campaign plan.
 
@@ -121,6 +189,25 @@ class FuzzingOrchestrator:
         ``env_build``: explicit consent for building a source tree in
         the AFL++ image (None = defer to the project ``build`` trust
         marker). The build itself runs in execute().
+
+        ``engine``: explicit engine override (``afl`` / ``libfuzzer``
+        / ``atheris``). Honoured only when the detected target kind is
+        one that engine can drive; otherwise the plan blocks.
+
+        ``py_harness`` / ``py_entry`` / ``py_payload``: atheris harness
+        resolution for python-pkg targets — an operator-written
+        TestOneInput harness file, or a ``module:function`` entry the
+        template scaffolder wraps (``py_payload`` selects bytes or
+        text). Without either, a python-pkg plan blocks on the missing
+        harness.
+
+        ``fuzz_target``: in-repo harness selection for rust-crate and
+        java-project targets — the cargo-fuzz target name under
+        ``fuzz/fuzz_targets/``, or the jazzer target class (a
+        fuzzerTestOneInput / @FuzzTest class; fully-qualified, or the
+        simple name when unambiguous). Without it, a project with
+        exactly one target auto-selects; several targets block with
+        the list.
         """
         target = detect_target(Path(target_path))
         plan = CampaignPlan(target=target, capabilities=self.capabilities,
@@ -129,6 +216,12 @@ class FuzzingOrchestrator:
             plan.hints.append(
                 "--env-build applies to source-tree targets; ignored "
                 f"for this {target.kind} file")
+        if fuzz_target and target.kind not in _FUZZ_TARGET_KINDS:
+            # An explicit operator flag must never vanish silently —
+            # same visibility idiom as the --env-build hint above.
+            plan.hints.append(
+                "--fuzz-target applies to rust-crate and java-project "
+                f"targets; ignored for this {target.kind} target")
 
         # Carry blockers forward
         plan.blockers.extend(target.blockers)
@@ -201,22 +294,36 @@ class FuzzingOrchestrator:
         elif kind == "rust-crate":
             plan.fuzzer = "cargo-fuzz" if not target.blockers else None
             if plan.fuzzer:
-                plan.blockers.append(
-                    "cargo-fuzz target detection is available, but RAPTOR does "
-                    "not orchestrate cargo-fuzz campaigns yet."
-                )
+                self._plan_cargofuzz_target(plan, fuzz_target)
+        elif kind == "java-project":
+            plan.fuzzer = "jazzer" if not target.blockers else None
+            if plan.fuzzer:
+                self._plan_jazzer_target(plan, fuzz_target)
         elif kind == "python-pkg":
             plan.fuzzer = "atheris" if not target.blockers else None
             if plan.fuzzer:
-                plan.blockers.append(
-                    "Atheris target detection is available, but RAPTOR does "
-                    "not orchestrate Atheris campaigns yet."
+                self._plan_atheris_harness(
+                    plan, py_harness, py_entry, py_payload,
                 )
         else:
             plan.blockers.append(
                 "Could not identify target type. Pass an executable binary, a "
                 "C/C++ header, or a Cargo/Python project root."
             )
+
+        if engine:
+            supported = _ENGINE_KINDS.get(engine, frozenset())
+            if kind not in supported:
+                plan.fuzzer = None
+                plan.blockers.append(
+                    f"--engine {engine} cannot drive a {kind} target "
+                    f"(supported kinds: {', '.join(sorted(supported)) or 'none'})."
+                )
+            elif plan.fuzzer and plan.fuzzer != engine:
+                plan.hints.append(
+                    f"engine override: {engine} requested over the "
+                    f"auto-selected {plan.fuzzer}")
+                plan.fuzzer = engine
 
         if plan.fuzzer is None and not plan.blockers:
             if kind in ("elf-linux", "macho"):
@@ -252,6 +359,194 @@ class FuzzingOrchestrator:
             )
 
         return plan
+
+    @staticmethod
+    def _plan_atheris_harness(
+        plan: "CampaignPlan",
+        py_harness: Path | None,
+        py_entry: str | None,
+        py_payload: str,
+    ) -> None:
+        """Resolve the atheris harness question at plan time.
+
+        Operator harness file wins; a ``module:function`` entry point
+        gets the template scaffold (generated in execute(), validated
+        here so a bad entry fails before any work); neither means the
+        plan blocks on the missing harness.
+        """
+        if py_harness is not None:
+            harness = Path(py_harness).resolve()
+            if not harness.is_file() or harness.suffix != ".py":
+                plan.blockers.append(
+                    f"--py-harness must name an existing .py atheris "
+                    f"harness (got {harness})")
+                return
+            plan.atheris_harness = harness
+            return
+        if py_entry:
+            from packages.fuzzing.atheris_harness import AtherisHarnessSpec
+            try:
+                spec = AtherisHarnessSpec(entry=py_entry, payload=py_payload)
+            except ValueError as e:
+                plan.blockers.append(f"--py-entry rejected: {e}")
+                return
+            plan.atheris_entry = spec.entry
+            plan.atheris_payload = spec.payload
+            plan.hints.append(
+                "A template harness will be generated for "
+                f"{spec.module}.{spec.function} (simple bytes/str case "
+                "only; every uncaught exception counts as a crash — "
+                "review the generated file for expected-exception "
+                "filtering).")
+            return
+        plan.needs_harness = True
+        plan.blockers.append(
+            "Atheris needs a Python TestOneInput harness. Pass "
+            "--py-harness <file> for an operator-written harness, or "
+            "--py-entry module:function to scaffold the simple case "
+            "(target function taking bytes/str)."
+        )
+
+    @staticmethod
+    def _plan_cargofuzz_target(
+        plan: "CampaignPlan",
+        fuzz_target: str | None,
+    ) -> None:
+        """Resolve the cargo-fuzz target question at plan time.
+
+        An explicit operator ``--fuzz-target`` is validated against the
+        crate's enumerated targets; a crate with exactly one target
+        auto-selects it; several targets block with the list (never a
+        silent pick); no targets blocks with the scaffolding remedy.
+        Target names are charset-vetted by the enumeration, so they are
+        inert in plan output.
+        """
+        from packages.fuzzing.target_detector import (
+            find_cargo_fuzz_dir,
+            list_cargo_fuzz_targets,
+        )
+        fuzz_dir = find_cargo_fuzz_dir(plan.target.path)
+        targets = list_cargo_fuzz_targets(fuzz_dir) if fuzz_dir else []
+        if not targets:
+            plan.needs_harness = True
+            plan.blockers.append(
+                "No cargo-fuzz targets found (fuzz/fuzz_targets/*.rs). "
+                "Scaffold with 'cargo fuzz init' and "
+                "'cargo fuzz add <name>', then re-run."
+            )
+            return
+        shown = ", ".join(targets[:8]) + (", ..." if len(targets) > 8
+                                          else "")
+        if fuzz_target:
+            if fuzz_target not in targets:
+                plan.blockers.append(
+                    f"--fuzz-target {str(fuzz_target)[:80]!r} is not "
+                    f"among the crate's fuzz targets: {shown}"
+                )
+                return
+            plan.cargofuzz_target = fuzz_target
+        elif len(targets) == 1:
+            plan.cargofuzz_target = targets[0]
+            plan.hints.append(
+                "auto-selected the crate's only cargo-fuzz target: "
+                f"{targets[0]}")
+        else:
+            plan.blockers.append(
+                f"Crate has {len(targets)} cargo-fuzz targets "
+                f"({shown}) — pass --fuzz-target <name> to pick one."
+            )
+            return
+        # Sanitizer visibility at plan time — the runner probes again
+        # at construction and degrades the same way.
+        from packages.fuzzing.cargofuzz_runner import (
+            NIGHTLY_HINT,
+            nightly_toolchain_arg,
+        )
+        if nightly_toolchain_arg() is None:
+            plan.hints.append(NIGHTLY_HINT)
+
+    @staticmethod
+    def _plan_jazzer_target(
+        plan: "CampaignPlan",
+        fuzz_target: str | None,
+    ) -> None:
+        """Resolve the jazzer target question at plan time.
+
+        An explicit operator ``--fuzz-target`` is validated against
+        the project's enumerated target classes (fully-qualified name
+        wins; a simple class name is honoured when it names exactly
+        one target, ambiguity blocks with the candidates); a project
+        with exactly one target auto-selects it; several targets block
+        with the list (never a silent pick); no targets blocks with
+        the write-a-harness remedy. Class names are charset-vetted by
+        the enumeration, so they are inert in plan output. The
+        layout's build tool is probed here too — the runner refuses
+        again at construction — so a missing mvn/gradle/javac blocks
+        the plan instead of dying mid-execute.
+        """
+        from packages.fuzzing.target_detector import list_jazzer_targets
+        targets = list_jazzer_targets(plan.target.path)
+        if not targets:
+            plan.needs_harness = True
+            plan.blockers.append(
+                "No Jazzer fuzz targets found (a class with public "
+                "static void fuzzerTestOneInput(byte[] data), or a "
+                "@FuzzTest JUnit method). Write one, then re-run."
+            )
+            return
+        names = [t.class_name for t in targets]
+        by_name = {t.class_name: t for t in targets}
+        shown = ", ".join(names[:8]) + (", ..." if len(names) > 8
+                                        else "")
+        selected = None
+        if fuzz_target:
+            if fuzz_target in by_name:
+                selected = by_name[fuzz_target]
+            else:
+                simple = [t for t in targets
+                          if t.class_name.rsplit(".", 1)[-1]
+                          == fuzz_target]
+                if len(simple) == 1:
+                    selected = simple[0]
+                elif len(simple) > 1:
+                    candidates = ", ".join(
+                        t.class_name for t in simple[:8])
+                    plan.blockers.append(
+                        f"--fuzz-target {str(fuzz_target)[:80]!r} is "
+                        f"ambiguous — use the fully-qualified class "
+                        f"name ({candidates})."
+                    )
+                    return
+                else:
+                    plan.blockers.append(
+                        f"--fuzz-target {str(fuzz_target)[:80]!r} is "
+                        f"not among the project's Jazzer targets: "
+                        f"{shown}"
+                    )
+                    return
+        elif len(targets) == 1:
+            selected = targets[0]
+            plan.hints.append(
+                "auto-selected the project's only Jazzer target: "
+                f"{targets[0].class_name}")
+        else:
+            plan.blockers.append(
+                f"Project has {len(targets)} Jazzer targets ({shown}) "
+                "— pass --fuzz-target <class> to pick one."
+            )
+            return
+        plan.jazzer_target = selected.class_name
+        plan.jazzer_target_source = selected.source
+        # Build-lane visibility at plan time — the runner probes again
+        # at construction and refuses the same way.
+        from packages.fuzzing.jazzer_runner import (
+            build_tool_executable,
+            build_tool_for,
+            build_tool_install_hint,
+        )
+        tool = build_tool_for(plan.target.path)
+        if build_tool_executable(tool) is None:
+            plan.blockers.append(build_tool_install_hint(tool))
 
     def _pick_for_unix_binary(self, caps: CapabilityReport, target_path: Path | None = None) -> str | None:
         """Pick AFL++ or libFuzzer for a Unix binary target.
@@ -291,12 +586,11 @@ class FuzzingOrchestrator:
             return
         if not shutil.which("strings"):
             return
-        try:
-            result = _run_trusted(
-                ["strings", str(binary)],
-                capture_output=True, text=True, timeout=30,
-            )
-        except Exception:  # noqa: BLE001 — probe is best-effort
+        # Full sandbox via core.binary.inspect — strings parses the
+        # target's bytes. Never raises; failure is returncode None
+        # (probe is best-effort either way).
+        result = _inspect_binary("strings", (), binary, timeout=30)
+        if result.returncode is None:
             return
         out = result.stdout or ""
         if "__AFL" in out or "afl" in out.lower():
@@ -324,21 +618,20 @@ class FuzzingOrchestrator:
         if not shutil.which("nm") and not shutil.which("strings"):
             return False
 
-        for cmd in (
-            ["nm", str(target_path)],
-            ["strings", "-a", str(target_path)],
-            ["strings", str(target_path)],
+        # Full sandbox via core.binary.inspect — nm/strings parse the
+        # target's bytes. inspect_binary never raises; a failed
+        # invocation is returncode None with empty streams (probe is
+        # best-effort either way).
+        for tool, args in (
+            ("nm", ()),
+            ("strings", ("-a",)),
+            ("strings", ()),
         ):
-            if not shutil.which(cmd[0]):
+            if not shutil.which(tool):
                 continue
-            try:
-                result = _run_trusted(
-                    cmd, capture_output=True, text=True, timeout=15,
-                )
-                if (result.stdout or "") and "LLVMFuzzerTestOneInput" in result.stdout:
-                    return True
-            except Exception:  # noqa: BLE001, S112 — probe is best-effort
-                continue
+            result = _inspect_binary(tool, args, target_path, timeout=15)
+            if result.stdout and "LLVMFuzzerTestOneInput" in result.stdout:
+                return True
         return False
 
     def execute(
@@ -383,6 +676,25 @@ class FuzzingOrchestrator:
                 },
                 "fuzzer": plan.fuzzer,
                 "needs_harness": plan.needs_harness,
+                **(
+                    {
+                        "atheris_harness": (
+                            str(plan.atheris_harness)
+                            if plan.atheris_harness else None
+                        ),
+                        "atheris_entry": plan.atheris_entry,
+                        "atheris_payload": plan.atheris_payload,
+                    }
+                    if plan.fuzzer == "atheris" else {}
+                ),
+                **(
+                    {"cargofuzz_target": plan.cargofuzz_target}
+                    if plan.fuzzer == "cargo-fuzz" else {}
+                ),
+                **(
+                    {"jazzer_target": plan.jazzer_target}
+                    if plan.fuzzer == "jazzer" else {}
+                ),
             },
         )
         save_json(out_dir / "capability_report.json", plan.capabilities.to_dict())
@@ -420,15 +732,73 @@ class FuzzingOrchestrator:
                 return
             if not env_build.rootfs.exists():
                 return
-            import shutil as _shutil
-            _shutil.rmtree(env_build.rootfs, ignore_errors=True)
-            logger.info(
-                "env rootfs removed (%s); the campaign outputs and the "
-                "read-only extracted binaries remain — re-run the build "
-                "to reproduce crashes in-image, or pass "
-                "--keep-env-rootfs to retain it",
-                env_build.rootfs,
-            )
+            from core.atomic_fs import rmtree_hardened
+            if rmtree_hardened(env_build.rootfs):
+                logger.info(
+                    "env rootfs removed (%s); the campaign outputs and "
+                    "the read-only extracted binaries remain — re-run "
+                    "the build to reproduce crashes in-image, or pass "
+                    "--keep-env-rootfs to retain it",
+                    env_build.rootfs,
+                )
+            else:
+                # Only claim removal on success — leftover entries
+                # (a griefed mode-0 subtree, host I/O failure) leave
+                # gigabytes in the run dir, and the operator must hear
+                # that, not read "removed".
+                logger.warning(
+                    "env rootfs NOT fully removed (%s): entries "
+                    "survived cleanup — remove it manually to reclaim "
+                    "the space",
+                    env_build.rootfs,
+                )
+
+        # cargo-fuzz corpus convention: without an operator corpus,
+        # the crate's own fuzz/corpus/<target>/ seeds win over the
+        # generic generated corpus — they are the project's curated
+        # inputs for exactly this target. The runner stages them
+        # through the bounded, symlink-refusing corpus stager, so a
+        # hostile in-repo corpus gets the same treatment as any other.
+        crate_corpus_info = None
+        if (corpus_dir is None and plan.fuzzer == "cargo-fuzz"
+                and plan.cargofuzz_target):
+            from packages.fuzzing.cargofuzz_runner import crate_corpus_dir
+            crate_corpus = crate_corpus_dir(
+                plan.target.path, plan.cargofuzz_target)
+            if crate_corpus is not None:
+                corpus_dir = crate_corpus
+                crate_corpus_info = {
+                    "source": "cargo_fuzz_crate_corpus",
+                    "path": str(crate_corpus),
+                }
+                save_json(out_dir / "crate-corpus.json", crate_corpus_info)
+                logger.info(
+                    "Using the crate's own cargo-fuzz corpus: %s",
+                    crate_corpus)
+
+        # jazzer corpus convention: without an operator corpus, the
+        # project's own <SimpleName>Inputs resources directory (the
+        # jazzer JUnit seed convention) wins over the generic
+        # generated corpus — same posture and same bounded,
+        # symlink-refusing stager as the cargo-fuzz crate corpus.
+        jazzer_corpus_info = None
+        if (corpus_dir is None and plan.fuzzer == "jazzer"
+                and plan.jazzer_target):
+            from packages.fuzzing.jazzer_runner import project_corpus_dir
+            jazzer_corpus = project_corpus_dir(
+                plan.target.path, plan.jazzer_target,
+                target_source=plan.jazzer_target_source)
+            if jazzer_corpus is not None:
+                corpus_dir = jazzer_corpus
+                jazzer_corpus_info = {
+                    "source": "jazzer_inputs_convention",
+                    "path": str(jazzer_corpus),
+                }
+                save_json(out_dir / "jazzer-corpus.json",
+                          jazzer_corpus_info)
+                logger.info(
+                    "Using the project's own Jazzer seed corpus: %s",
+                    jazzer_corpus)
 
         try:
             corpus_dir, generated_corpus_info = self._prepare_corpus(
@@ -491,11 +861,21 @@ class FuzzingOrchestrator:
                 }
         elif plan.fuzzer == "libfuzzer":
             result = self._run_libfuzzer(plan, out_dir, duration_seconds, corpus_dir, dict_path)
+        elif plan.fuzzer == "atheris":
+            result = self._run_atheris(plan, out_dir, duration_seconds, corpus_dir, dict_path)
+        elif plan.fuzzer == "cargo-fuzz":
+            result = self._run_cargofuzz(plan, out_dir, duration_seconds, corpus_dir, dict_path)
+        elif plan.fuzzer == "jazzer":
+            result = self._run_jazzer(plan, out_dir, duration_seconds, corpus_dir, dict_path)
         else:
             msg = f"Fuzzer '{plan.fuzzer}' not yet wired into orchestrator."
             raise RuntimeError(msg)
         if generated_corpus_info:
             result["generated_corpus"] = generated_corpus_info
+        if crate_corpus_info:
+            result["crate_corpus"] = crate_corpus_info
+        if jazzer_corpus_info:
+            result["jazzer_corpus"] = jazzer_corpus_info
         if binary_understand and plan.target.kind in _BINARY_UNDERSTAND_KINDS:
             try:
                 from packages.binary_analysis import append_fuzz_evidence_to_run
@@ -516,6 +896,16 @@ class FuzzingOrchestrator:
         # instrumentation, replay the corpus and emit per-function
         # coverage-fuzz.json for /audit's priority scorer and review
         # context. Degrades silently on uninstrumented targets.
+        # atheris campaigns skip it: the bridge replays a native
+        # binary; a Python coverage lane is a later phase. cargo-fuzz
+        # campaigns skip it too: the built fuzz target carries sancov
+        # instrumentation, not gcov, and the plan target is the crate
+        # directory — a Rust coverage lane is a later phase. jazzer
+        # campaigns skip it the same way: JVM coverage is JaCoCo, not
+        # gcov, and the plan target is the project directory — a JVM
+        # coverage lane is a later phase.
+        if plan.fuzzer in ("atheris", "cargo-fuzz", "jazzer"):
+            return result
         try:
             from packages.fuzzing.coverage_bridge import emit_fuzz_coverage
 
@@ -620,9 +1010,23 @@ class FuzzingOrchestrator:
         seed_profile: str = "default",
     ) -> tuple[Path, dict[str, Any]]:
         """Materialise RAPTOR's checked-in baseline corpus for this campaign."""
+        from core.security.log_sanitisation import sanitise_for_terminal
         from packages.fuzzing.seed_corpus import prepare_builtin_seed_corpus
+        from packages.fuzzing.smt_seed import ensure_real_seed_dir
 
         seed_dir = out_dir / "seed-corpus"
+        # Name containment before any write: the run dir is reused and
+        # was writable by a previous campaign's sandboxed target; a
+        # symlink planted at this predictable name would receive the
+        # whole seed corpus and the manifest os.replace.
+        refusal = ensure_real_seed_dir(seed_dir)
+        if refusal is not None:
+            msg = (
+                f"refusing seed corpus dir "
+                f"{sanitise_for_terminal(str(seed_dir))}: "
+                f"{sanitise_for_terminal(refusal, max_len=200)}"
+            )
+            raise RuntimeError(msg)
         manifest = prepare_builtin_seed_corpus(seed_dir, profile=seed_profile)
         info = {
             "source": "raptor_builtin_seed_corpus",
@@ -685,16 +1089,16 @@ class FuzzingOrchestrator:
                 binary_only_mode=afl_binary_mode,
             )
             telemetry_target = str(plan.target.path)
-        runner.telemetry = FuzzingTelemetry(
+        runner.telemetry = FuzzingTelemetry(  # type: ignore[assignment]
             out_dir=out_dir,
             fuzzer="afl++",
             target=telemetry_target,
         )
-        runner.telemetry.start()
+        runner.telemetry.start()  # type: ignore[attr-defined]
         try:
             crashes, crashes_dir = runner.run_fuzzing(duration=duration_seconds)
         finally:
-            runner.telemetry.stop()
+            runner.telemetry.stop()  # type: ignore[attr-defined]
         return {
             "fuzzer": "afl",
             "campaign_failed": bool(getattr(runner, "campaign_failed",
@@ -787,3 +1191,361 @@ class FuzzingOrchestrator:
             "telemetry": str(out_dir / "fuzz-summary.json"),
             "events": str(out_dir / "fuzz-events.jsonl"),
         }
+
+    def _run_atheris(
+        self,
+        plan: CampaignPlan,
+        out_dir: Path,
+        duration_seconds: int,
+        corpus_dir: Path | None,
+        dict_path: Path | None,
+    ) -> dict[str, Any]:
+        from packages.fuzzing.atheris_runner import AtherisRunner
+        from packages.fuzzing.telemetry import FuzzingTelemetry
+
+        harness = plan.atheris_harness
+        if harness is None:
+            if not plan.atheris_entry:
+                msg = ("atheris plan carries neither a harness nor an "
+                       "entry point — plan() should have blocked")
+                raise RuntimeError(msg)
+            from packages.fuzzing.atheris_harness import (
+                AtherisHarnessSpec,
+                write_atheris_harness,
+            )
+            spec = AtherisHarnessSpec(
+                entry=plan.atheris_entry, payload=plan.atheris_payload,
+            )
+            harness = write_atheris_harness(spec, out_dir / "atheris-harness")
+
+        target_dir = (
+            plan.target.path if plan.target.path.is_dir()
+            else plan.target.path.parent
+        )
+        runner = AtherisRunner(
+            harness,
+            target_dir=target_dir,
+            corpus_dir=corpus_dir,
+            output_dir=out_dir / "atheris",
+            dict_path=dict_path,
+            max_total_time=duration_seconds,
+        )
+        telemetry = FuzzingTelemetry(
+            out_dir=out_dir,
+            fuzzer="atheris",
+            target=str(plan.target.path),
+        )
+        telemetry.start()
+        try:
+            result = runner.run(telemetry=telemetry)
+            telemetry.update_stats(
+                total_executions=result.stats.total_executions,
+                executions_per_second=result.stats.executions_per_second,
+                coverage_features=result.stats.coverage_features,
+                corpus_size=result.stats.corpus_size,
+            )
+        finally:
+            telemetry.stop()
+
+        recorded = self._record_atheris_witnesses(out_dir, harness, result)  # type: ignore[arg-type]
+
+        return {
+            "fuzzer": "atheris",
+            "campaign_failed": result.campaign_failed,
+            "crashes": len(result.crashes),
+            "timeouts": len(result.timeouts),
+            "oom_events": len(result.oom_inputs),
+            "leaks": len(result.leak_inputs),
+            "crashes_dir": str(runner.crashes_dir),
+            "harness": str(harness),
+            "python_exception": (
+                result.python_exception.to_dict()  # type: ignore[attr-defined]
+                if result.python_exception else None  # type: ignore[attr-defined]
+            ),
+            "crash_records": (
+                str(runner.output_dir / "atheris-crashes.json")
+                if result.crash_records else None  # type: ignore[attr-defined]
+            ),
+            "witnesses_recorded": recorded,
+            "stats": result.stats.__dict__,
+            "telemetry": str(out_dir / "fuzz-summary.json"),
+            "events": str(out_dir / "fuzz-events.jsonl"),
+        }
+
+    @staticmethod
+    def _record_atheris_witnesses(out_dir: Path, harness: Path,
+                                  result: AtherisResult) -> int:
+        """Record each atheris crash artifact as a canonical Witness.
+
+        Same store path (``<out>/witnesses``) and best-effort posture
+        as the AFL path in raptor_fuzzing: the crashes stay on disk in
+        their artifact form even when the canonical write fails, and
+        ``raptor-verified-outcomes`` picks the records up from here.
+        """
+        if not result.crashes:
+            return 0
+        try:
+            from core.witness import WitnessStore
+            from packages.fuzzing.witness_adapter import (
+                witness_from_atheris_artifact,
+            )
+            store = WitnessStore(out_dir / "witnesses")
+        except Exception as e:  # noqa: BLE001 — best-effort
+            logger.warning(
+                "Witness-store setup failed: %s: %s; continuing without "
+                "canonical Witness records", type(e).__name__, e,
+            )
+            return 0
+        recorded = 0
+        for artifact in result.crashes:
+            try:
+                witness, data = witness_from_atheris_artifact(
+                    artifact,
+                    exception=result.python_exception,
+                    harness_path=harness,
+                )
+                store.put(witness, data)
+                recorded += 1
+            except Exception as e:  # noqa: BLE001 — best-effort
+                logger.warning(
+                    "failed to record witness for crash %s: %s: %s",
+                    artifact.name, type(e).__name__, e,
+                )
+        if recorded:
+            logger.info(
+                "Recorded %d/%d atheris crashes as Witnesses → %s",
+                recorded, len(result.crashes), out_dir / "witnesses",
+            )
+        return recorded
+
+    def _run_cargofuzz(
+        self,
+        plan: CampaignPlan,
+        out_dir: Path,
+        duration_seconds: int,
+        corpus_dir: Path | None,
+        dict_path: Path | None,
+    ) -> dict[str, Any]:
+        from packages.fuzzing.cargofuzz_runner import CargoFuzzRunner
+        from packages.fuzzing.telemetry import FuzzingTelemetry
+
+        if not plan.cargofuzz_target:
+            msg = ("cargo-fuzz plan carries no fuzz target — plan() "
+                   "should have blocked")
+            raise RuntimeError(msg)
+        runner = CargoFuzzRunner(
+            plan.target.path,
+            plan.cargofuzz_target,
+            corpus_dir=corpus_dir,
+            output_dir=out_dir / "cargofuzz",
+            dict_path=dict_path,
+            max_total_time=duration_seconds,
+        )
+        telemetry = FuzzingTelemetry(
+            out_dir=out_dir,
+            fuzzer="cargo-fuzz",
+            target=str(plan.target.path),
+        )
+        telemetry.start()
+        try:
+            result = runner.run(telemetry=telemetry)
+            telemetry.update_stats(
+                total_executions=result.stats.total_executions,
+                executions_per_second=result.stats.executions_per_second,
+                coverage_features=result.stats.coverage_features,
+                corpus_size=result.stats.corpus_size,
+            )
+        finally:
+            telemetry.stop()
+
+        recorded = self._record_cargofuzz_witnesses(out_dir, result)
+
+        return {
+            "fuzzer": "cargo-fuzz",
+            "campaign_failed": result.campaign_failed,
+            "crashes": len(result.crashes),
+            "timeouts": len(result.timeouts),
+            "oom_events": len(result.oom_inputs),
+            "leaks": len(result.leak_inputs),
+            "crashes_dir": str(runner.crashes_dir),
+            "fuzz_target": plan.cargofuzz_target,
+            "binary": result.built_binary,
+            "sanitizer": runner.sanitizer,
+            "rust_panic": (
+                result.rust_panic.to_dict()
+                if result.rust_panic else None
+            ),
+            "crash_records": (
+                str(runner.output_dir / "cargofuzz-crashes.json")
+                if result.crash_records else None
+            ),
+            "witnesses_recorded": recorded,
+            "stats": result.stats.__dict__,
+            "telemetry": str(out_dir / "fuzz-summary.json"),
+            "events": str(out_dir / "fuzz-events.jsonl"),
+        }
+
+    @staticmethod
+    def _record_cargofuzz_witnesses(out_dir: Path,
+                                    result: CargoFuzzResult) -> int:
+        """Record each cargo-fuzz crash artifact as a canonical Witness.
+
+        Same store path (``<out>/witnesses``) and best-effort posture
+        as the AFL and atheris paths: the crashes stay on disk in
+        their artifact form even when the canonical write fails, and
+        ``raptor-verified-outcomes`` picks the records up from here.
+        """
+        if not result.crashes:
+            return 0
+        try:
+            from core.witness import WitnessStore
+            from packages.fuzzing.witness_adapter import (
+                witness_from_cargofuzz_artifact,
+            )
+            store = WitnessStore(out_dir / "witnesses")
+        except Exception as e:  # noqa: BLE001 — best-effort
+            logger.warning(
+                "Witness-store setup failed: %s: %s; continuing without "
+                "canonical Witness records", type(e).__name__, e,
+            )
+            return 0
+        binary = Path(result.built_binary) if result.built_binary else None
+        recorded = 0
+        for artifact in result.crashes:
+            try:
+                witness, data = witness_from_cargofuzz_artifact(
+                    artifact,
+                    panic=result.rust_panic,
+                    binary_path=binary,
+                )
+                store.put(witness, data)
+                recorded += 1
+            except Exception as e:  # noqa: BLE001 — best-effort
+                logger.warning(
+                    "failed to record witness for crash %s: %s: %s",
+                    artifact.name, type(e).__name__, e,
+                )
+        if recorded:
+            logger.info(
+                "Recorded %d/%d cargo-fuzz crashes as Witnesses → %s",
+                recorded, len(result.crashes), out_dir / "witnesses",
+            )
+        return recorded
+
+    def _run_jazzer(
+        self,
+        plan: CampaignPlan,
+        out_dir: Path,
+        duration_seconds: int,
+        corpus_dir: Path | None,
+        dict_path: Path | None,
+    ) -> dict[str, Any]:
+        from packages.fuzzing.jazzer_runner import JazzerRunner
+        from packages.fuzzing.telemetry import FuzzingTelemetry
+
+        if not plan.jazzer_target:
+            msg = ("jazzer plan carries no target class — plan() "
+                   "should have blocked")
+            raise RuntimeError(msg)
+        runner = JazzerRunner(
+            plan.target.path,
+            plan.jazzer_target,
+            target_source=plan.jazzer_target_source,
+            corpus_dir=corpus_dir,
+            output_dir=out_dir / "jazzer",
+            dict_path=dict_path,
+            max_total_time=duration_seconds,
+        )
+        telemetry = FuzzingTelemetry(
+            out_dir=out_dir,
+            fuzzer="jazzer",
+            target=str(plan.target.path),
+        )
+        telemetry.start()
+        try:
+            result = runner.run(telemetry=telemetry)
+            telemetry.update_stats(
+                total_executions=result.stats.total_executions,
+                executions_per_second=result.stats.executions_per_second,
+                coverage_features=result.stats.coverage_features,
+                corpus_size=result.stats.corpus_size,
+            )
+        finally:
+            telemetry.stop()
+
+        recorded = self._record_jazzer_witnesses(
+            out_dir, result, plan.jazzer_target_source)
+
+        return {
+            "fuzzer": "jazzer",
+            "campaign_failed": result.campaign_failed,
+            "crashes": len(result.crashes),
+            "timeouts": len(result.timeouts),
+            "oom_events": len(result.oom_inputs),
+            "leaks": len(result.leak_inputs),
+            "crashes_dir": str(runner.crashes_dir),
+            "fuzz_target": plan.jazzer_target,
+            "build_tool": runner.build_tool,
+            "java_exception": (
+                result.java_exception.to_dict()
+                if result.java_exception else None
+            ),
+            "crash_records": (
+                str(runner.output_dir / "jazzer-crashes.json")
+                if result.crash_records else None
+            ),
+            "witnesses_recorded": recorded,
+            "stats": result.stats.__dict__,
+            "telemetry": str(out_dir / "fuzz-summary.json"),
+            "events": str(out_dir / "fuzz-events.jsonl"),
+        }
+
+    @staticmethod
+    def _record_jazzer_witnesses(
+        out_dir: Path,
+        result: JazzerResult,
+        harness_source: Path | None,
+    ) -> int:
+        """Record each jazzer crash artifact as a canonical Witness.
+
+        Same store path (``<out>/witnesses``) and best-effort posture
+        as the AFL, atheris, and cargo-fuzz paths: the crashes stay on
+        disk in their artifact form even when the canonical write
+        fails, and ``raptor-verified-outcomes`` picks the records up
+        from here.
+        """
+        if not result.crashes:
+            return 0
+        try:
+            from core.witness import WitnessStore
+            from packages.fuzzing.witness_adapter import (
+                witness_from_jazzer_artifact,
+            )
+            store = WitnessStore(out_dir / "witnesses")
+        except Exception as e:  # noqa: BLE001 — best-effort
+            logger.warning(
+                "Witness-store setup failed: %s: %s; continuing without "
+                "canonical Witness records", type(e).__name__, e,
+            )
+            return 0
+        recorded = 0
+        for artifact in result.crashes:
+            try:
+                witness, data = witness_from_jazzer_artifact(
+                    artifact,
+                    exception=result.java_exception,
+                    harness_path=harness_source,
+                )
+                store.put(witness, data)
+                recorded += 1
+            except Exception as e:  # noqa: BLE001 — best-effort
+                logger.warning(
+                    "failed to record witness for crash %s: %s: %s",
+                    artifact.name, type(e).__name__, e,
+                )
+        if recorded:
+            logger.info(
+                "Recorded %d/%d jazzer crashes as Witnesses → %s",
+                recorded, len(result.crashes), out_dir / "witnesses",
+            )
+        return recorded

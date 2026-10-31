@@ -33,7 +33,13 @@ from packages.sca.update import _bump_npm_spec
     (">=1.0.0 || >=2.0.0", "2.8.0", None),   # OR range
     ("<3.0.0",             "2.8.0", None),    # upper-only, no floor
     ("git+https://x/y.git", "2.8.0", None),   # VCS
-    ("npm:lodash@^4",       "2.8.0", None),   # alias
+    # npm alias: the range after the target bumps, the alias spelling
+    # (``npm:<real>@``) is written back verbatim — declining these left
+    # aliased deps permanently unfixable even though the pinned range is
+    # an ordinary semver corridor.
+    ("npm:lodash@^4",       "2.8.0", "npm:lodash@^2.8.0"),
+    ("npm:@scope/real@~1.0", "1.2.3", "npm:@scope/real@~1.2.3"),
+    ("npm:^1.0",            "2.8.0", None),    # bare protocol form, no name
 ])
 def test_bump_npm_spec(current, target, expected):
     # installed arg is the planner's from_version; for a RANGE dep it is

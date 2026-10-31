@@ -58,6 +58,7 @@ from .field_census import (
     build_field_census,
 )
 from .peer_evidence import PeerEvidence, PeerExhibit
+from core.source.lines import split_lines
 
 logger = logging.getLogger(__name__)
 
@@ -141,10 +142,6 @@ _HYPOTHESIS_STOPWORDS = frozenset({
     "void", "char",
 })
 
-# Invalidation search bounds (leg B step 3).
-_INVALIDATION_CALLEE_DEPTH = 2
-_MAX_INVALIDATION_FUNCTIONS = 50
-
 # Standing pre-pass caps.
 PREPASS_BUDGET_S = 20.0
 MAX_PARITY_DEVIATIONS = 20
@@ -206,12 +203,25 @@ def _event_vocab_source(verb: str, vocab: Any = None) -> str | None:
 
 @lru_cache(maxsize=32)
 def _event_call_re(names: tuple[str, ...]) -> re.Pattern:
+    # Group 2 is the base identifier of the event argument; group 3
+    # captures a trailing member chain (``->scratch`` / ``.scratch``)
+    # so field-expression events bind to the FIELD actually released,
+    # not the whole base object.
     alts = "|".join(
         re.escape(n) for n in sorted(names, key=len, reverse=True)
     )
+    # The optional '&' gates its own trailing whitespace — the naive
+    # ``\s*&?\s*`` pair was quadratic on a release call followed by
+    # a whitespace run.
+    # The releaser-name head and the member chain are bounded: with
+    # unbounded spans, one long stem-repeating word (or a hostile
+    # ``a.a.a...`` chain) costs every split of the run — quadratic
+    # in hostile source length. Real identifiers sit far inside 256
+    # chars and real member chains far inside 32 links.
     return re.compile(
-        r"\b(" + alts + r"|\w+_(?:free|destroy|release|put|teardown)\w*"
-        r")\s*\(\s*&?\s*([A-Za-z_]\w*)"
+        r"\b(" + alts + r"|\w{1,256}?_(?:free|destroy|release|put|teardown)\w*"
+        r")\s*\(\s*(?:&\s*)?([A-Za-z_]\w*)"
+        r"((?:\s*(?:->|\.)\s*[A-Za-z_]\w*){0,32})"
     )
 
 
@@ -489,6 +499,27 @@ def _alias_edges_for_owner(
     return edges
 
 
+def _edges_for_event(
+    census: FieldCensus,
+    event: dict[str, Any],
+) -> list[_AliasEdge]:
+    """Alias edges staled by *event*, with field-precision binding.
+
+    ``free(conn->scratch)`` releases the referent of ONE field — an
+    alias taken from a DIFFERENT conn field (``p = conn->other``)
+    still points at a live object, and adjudicating it as staled
+    minted confirmed UAF claims on live pointers. When the event
+    argument is a member expression, only edges sourced from that
+    exact field qualify; a whole-object event (``free(conn)``) keeps
+    the every-field binding.
+    """
+    edges = _alias_edges_for_owner(census, event["target"])
+    target_field = event.get("target_field")
+    if target_field:
+        edges = [e for e in edges if e.owner_field == target_field]
+    return edges
+
+
 def _find_events(
     segment_lines: list[str],
     start_line: int,
@@ -509,9 +540,17 @@ def _find_events(
             source = _event_vocab_source(verb, vocab)
             if source is None:
                 continue
+            # A member-expression argument (``free(conn->scratch)``)
+            # releases the FIELD's referent, not the base object:
+            # record which field so edge matching can require it.
+            chain = re.findall(r"[A-Za-z_]\w*", m.group(3) or "")
             events.append({
                 "verb": verb,
                 "target": target,
+                "target_field": chain[-1] if chain else None,
+                "target_expr": re.sub(
+                    r"\s+", "", target + (m.group(3) or ""),
+                ),
                 "line": start_line + offset,
                 "code": text.strip()[:200],
                 "vocab_source": source,
@@ -528,9 +567,11 @@ def _invalidation_receipt(
     census: FieldCensus,
 ) -> dict[str, Any] | None:
     """Search for an invalidating write to the alias after the event:
-    in the event function's remainder, then in direct callees
-    (depth ≤ 2, capped). Returns the receipt when found (→ refuted),
-    else None (alias live)."""
+    in the event function's remainder, then census-wide NULL writes to
+    the alias field on the same holder (the invalidate-in-helper
+    shape — the census records carry cross-function writes, so no
+    callee-body walk runs). Returns the receipt when found
+    (→ refuted), else None (alias live)."""
     if edge.kind == "field":
         # The NULL write must hit the ALIAS-HOLDING base: an
         # unconstrained `\w+->field = NULL` match let a write to any
@@ -576,7 +617,8 @@ def _invalidation_receipt(
                     "line": w.line,
                     "code": w.code,
                 }
-    del source_texts  # depth-2 callee scan rides the census records
+    del source_texts  # unused: census records already carry the
+    # cross-function null-writes this search consumes
     return None
 
 
@@ -640,8 +682,12 @@ def _local_alias_escapes(
     """A local alias handed to an out-of-census callee between assign
     and event may transfer ownership — mirror of the consistency
     ``ownership-unresolved`` convention."""
+    # The argument span before the alias is bounded: unbounded, a
+    # line repeating the callee head inside the span re-scans the
+    # rest from every occurrence — quadratic. The alias sits within
+    # a real argument list, far inside 500 chars.
     call_re = re.compile(
-        rf"\b([A-Za-z_]\w*)\s*\([^)]*\b{re.escape(edge.name)}\b",
+        rf"\b([A-Za-z_]\w*)\s*\([^)]{{0,500}}\b{re.escape(edge.name)}\b",
     )
     # Clamp both ends: an alias edge recorded OUTSIDE this function's
     # span (the census matches edges to events by field name, so a
@@ -664,7 +710,7 @@ def _local_alias_escapes(
 
 
 def _grade(vocab_source: str, census: FieldCensus) -> str:
-    """Registry rule-id when the event verb is learned/pack/seed
+    """Registry rule-id when the event verb is learned/seed
     (registry vocabulary) AND the census is full-tier; naming-only
     verbs select the ``-naming`` detection variant."""
     if vocab_source in ("learned", "seed") and not census.degraded:
@@ -684,7 +730,7 @@ def _adjudicate_alias(
     context: Any = None,
 ) -> AliasEvidence:
     """Adjudicate one (event, alias-edge) pair."""
-    lines = source_texts.get(file_path, "").splitlines()
+    lines = split_lines(source_texts.get(file_path, ""))
     segment = lines[function_span.start - 1:function_span.end]
 
     # 6c parity: rcu-safe deferred free of an rcu-read alias refutes.
@@ -761,7 +807,8 @@ def _adjudicate_alias(
             f"`{edge.holder + '->' if edge.holder else ''}{edge.name}` "
             f"aliases {edge.owner}->{edge.owner_field} (assigned at "
             f"{edge.file}:{edge.line}); {event['verb']}() releases "
-            f"{event['target']} at {file_path}:{event['line']} with "
+            f"{event.get('target_expr') or event['target']} at "
+            f"{file_path}:{event['line']} with "
             f"the alias live (no invalidating write found), and the "
             f"alias is read at {reads[0].get('file', file_path)}:"
             f"{reads[0]['line']}"
@@ -773,9 +820,11 @@ def _adjudicate_alias(
         event={**event, "function": function_span.name,
                "file": file_path},
         post_event_reads=reads,
+        # The receipt must describe the search that actually ran:
+        # event-function remainder plus census-recorded NULL writes —
+        # not a callee-body walk this module does not perform.
         invalidation_search={
-            "scanned_functions": 1,
-            "depth": _INVALIDATION_CALLEE_DEPTH,
+            "scope": "event-function-remainder+census-null-writes",
             "found": None,
         },
     )
@@ -832,6 +881,15 @@ def run_ptr_lifecycle_check(
     cost discipline).
     """
     del budget_s  # phase-2 cross-file expansion parameter
+    # Binary checklist rows carry no repo source path; gate before the
+    # suffix-based language lookup can leak a meaningless ".0" reason.
+    from .fail_open_lang import is_binary_row
+    if is_binary_row(file_path):
+        return _inconclusive(
+            REASON_LANGUAGE_UNSUPPORTED,
+            "binary checklist row — ptr-lifecycle reads repo source, "
+            "not decompiled output",
+        )
     if not _language_supported(file_path):
         return _inconclusive(
             REASON_LANGUAGE_UNSUPPORTED,
@@ -839,17 +897,18 @@ def run_ptr_lifecycle_check(
         )
 
     if source_texts is None:
-        try:
-            p = Path(target_path) / file_path
-            source_texts = {
-                file_path: p.read_text(encoding="utf-8",
-                                       errors="replace"),
-            }
-        except OSError:
+        # Same join class as lock_region: ``file_path`` arrives from
+        # gap records (LLM-writable) — contained + capped +
+        # fd-checked regular instead of a bare join + raw read.
+        from core.source import read_contained
+
+        text = read_contained(Path(target_path), file_path)
+        if text is None:
             return _inconclusive(
                 REASON_HYPOTHESIS_UNBINDABLE,
                 f"could not read {file_path}",
             )
+        source_texts = {file_path: text}
     source = source_texts.get(file_path, "")
     if not source:
         return _inconclusive(
@@ -881,7 +940,7 @@ def run_ptr_lifecycle_check(
             census_tier=census.tier,
         )
 
-    lines = source.splitlines()
+    lines = split_lines(source)
     segment = lines[span.start - 1:span.end]
     events = _find_events(segment, span.start, domain_vocab)
     if not events:
@@ -900,7 +959,7 @@ def run_ptr_lifecycle_check(
     )
     fallbacks: list[AliasEvidence] = []
     for event in ranked:
-        edges = _alias_edges_for_owner(census, event["target"])
+        edges = _edges_for_event(census, event)
         for edge in edges:
             res = _adjudicate_alias(
                 census, source_texts, file_path, span, event, edge,
@@ -1021,7 +1080,7 @@ def run_ptr_lifecycle_prepass(
                     source_texts[file_path], file_path,
                 )
                 census.functions[file_path] = spans
-            lines = source_texts[file_path].splitlines()
+            lines = split_lines(source_texts[file_path])
             for span in spans:
                 if candidates >= MAX_ALIAS_CANDIDATES:
                     break
@@ -1031,9 +1090,7 @@ def run_ptr_lifecycle_prepass(
                     continue
                 candidates += 1
                 for event in events:
-                    for edge in _alias_edges_for_owner(
-                        census, event["target"],
-                    ):
+                    for edge in _edges_for_event(census, event):
                         res = _adjudicate_alias(
                             census, source_texts, file_path, span,
                             event, edge, inventory=inventory,

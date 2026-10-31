@@ -197,7 +197,7 @@ def _find_virtual_dispatch_sites(
        enclosing class has subtypes overriding the method.
     """
     results: list[tuple[str, str, int, str, str, list[str]]] = []
-    seen: set[tuple[str, str, int]] = set()
+    seen: set[tuple[str, str, int, str]] = set()
 
     for filepath, graph in call_graphs.items():
         calls = getattr(graph, "calls", None)
@@ -416,7 +416,7 @@ def detect_type_confusion(
 
     for dfunc, dlocations in deser_funcs.items():
         if dfunc in dispatch_by_func:
-            for dfile, dapi, _dline in dlocations:
+            for _dfile, dapi, _dline in dlocations:
                 for vfile, vline, vbase, vmethod, voverrides in dispatch_by_func[dfunc]:
                     key = (vfile, dfunc, vline, vbase)
                     if key in seen:
@@ -436,7 +436,7 @@ def detect_type_confusion(
         reachable = forward_reach.get(dfunc, set())
         for reached_func in reachable:
             if reached_func in dispatch_by_func:
-                for dfile, dapi, _dline in dlocations:
+                for _dfile, dapi, _dline in dlocations:
                     for vfile, vline, vbase, vmethod, voverrides in dispatch_by_func[reached_func]:
                         key = (vfile, reached_func, vline, vbase)
                         if key in seen:

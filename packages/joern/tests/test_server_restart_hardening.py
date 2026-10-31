@@ -413,3 +413,118 @@ class TestRetryWaitBounds:
             assert len(calls) == 1
         finally:
             srv._restarting.clear()
+
+
+class TestCpgLoadEpoch:
+    """Every successful CPG load bumps ``cpg_load_epoch`` — the memo
+    key consumers use to discard per-graph caches across the
+    ``restart()`` re-import (which never passes through lane start)."""
+
+    def test_import_cpg_bumps_epoch(self, tmp_path):
+        srv = JoernServer()
+        cpg = tmp_path / "c.bin"
+        cpg.write_bytes(b"x")
+        assert srv.cpg_load_epoch == 0
+        with patch.object(srv, "_post_sync",
+                          return_value={"success": True}), \
+             patch.object(srv, "_verify_cpg_binding", return_value=True), \
+             patch.object(srv, "_warmup_dataflow"):
+            assert srv.import_cpg(cpg, timeout=5)
+        assert srv.cpg_load_epoch == 1
+
+    def test_failed_import_does_not_bump(self, tmp_path):
+        srv = JoernServer()
+        cpg = tmp_path / "c.bin"
+        cpg.write_bytes(b"x")
+        with patch.object(srv, "_post_sync",
+                          return_value={"success": False, "stderr": "x"}):
+            assert not srv.import_cpg(cpg, timeout=5)
+        assert srv.cpg_load_epoch == 0
+
+    def test_import_code_bumps_epoch(self, tmp_path):
+        srv = JoernServer()
+        with patch.object(srv, "_post_sync",
+                          return_value={"success": True}), \
+             patch.object(srv, "_verify_cpg_binding", return_value=True):
+            assert srv.import_code(tmp_path, timeout=5)
+        assert srv.cpg_load_epoch == 1
+
+
+class TestNoRestartSeam:
+    """query(no_restart=True) opts a side-channel query out of the
+    timeout-triggered restart: only queries whose timeout evidences a
+    stuck REPL may wield the recovery ladder."""
+
+    @staticmethod
+    def _timeout_post(srv):
+        def fake_post(query_str, *, timeout=30):
+            srv._last_post_error = f"query timed out after {timeout}s"
+            return None
+        return fake_post
+
+    def test_timeout_with_no_restart_skips_restart(self):
+        srv = JoernServer()
+        srv._cpg_loaded = True
+        with patch.object(srv, "_post_sync",
+                          side_effect=self._timeout_post(srv)), \
+             patch.object(srv, "restart") as restart:
+            result = srv.query("cpg.method.name.l", timeout=1,
+                               no_restart=True)
+        assert restart.call_count == 0
+        assert any("timed out" in e for e in result.errors)
+
+    def test_timeout_without_no_restart_still_restarts(self):
+        srv = JoernServer()
+        srv._cpg_loaded = True
+        with patch.object(srv, "_post_sync",
+                          side_effect=self._timeout_post(srv)), \
+             patch.object(srv, "restart") as restart:
+            srv.query("cpg.method.name.l", timeout=1)
+        assert restart.call_count == 1
+
+
+class TestPostErrorClassificationRace:
+    """_last_post_error is read by query() AFTER _post_sync returns to
+    decide the stuck-REPL restart; sweep threads share the instance,
+    so the classification must be per-thread — a sibling's entry-reset
+    used to clobber a genuine timeout before its own query() read it,
+    skipping the restart and cross-attributing the error text."""
+
+    def test_sibling_entry_reset_cannot_clobber_timeout(self):
+        srv = JoernServer()
+        srv._cpg_loaded = True
+        srv._base_url = "http://joern-local"
+        srv._uds_path = "/nonexistent.sock"  # route _post_sync → uds
+
+        restarts: list[int] = []
+        a_set_error = threading.Event()
+        b_done = threading.Event()
+
+        def stub_uds(method, path, payload, timeout):
+            if "QUERY_A" in payload["query"]:
+                # A's transport timed out: classification written...
+                srv._last_post_error = f"query timed out after {timeout}s"
+                a_set_error.set()
+                # ...then B's whole round-trip (entry-reset included)
+                # lands before A's query() reads it.
+                b_done.wait(5)
+                return None
+            return {"stdout": 'val res0: String = "ok"', "stderr": ""}
+
+        results: dict = {}
+        with patch.object(srv, "_uds_request", side_effect=stub_uds), \
+             patch.object(srv, "restart",
+                          side_effect=lambda: restarts.append(1) or True):
+            ta = threading.Thread(target=lambda: results.update(
+                a=srv.query("QUERY_A", timeout=10, validate=False)))
+            ta.start()
+            assert a_set_error.wait(5)
+            results["b"] = srv.query("QUERY_B", timeout=10, validate=False)
+            b_done.set()
+            ta.join(10)
+
+        # A keeps ITS classification: restart fires for the genuine
+        # timeout and the error text is not cross-attributed.
+        assert results["a"].errors == ["query timed out after 10s"]
+        assert restarts == [1]
+        assert not results["b"].errors

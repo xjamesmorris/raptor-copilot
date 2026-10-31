@@ -243,9 +243,20 @@ TIER_B_FRAMEWORK_HOOKS: tuple[FrameworkHook, ...] = (
     # by chi and most router ecosystems) and gin's HandlerFunc type.
     # Plain `func(w, r)` request handlers deliberately do NOT match —
     # a handler is not a gate; the wrapper shape is.
+    # The optional function name is gated (``(?:\s*\w+)?``) so the
+    # whitespace runs on either side of it can never trade
+    # characters: the earlier ``\s*\w*\s*`` spelling backtracked
+    # every split of a whitespace run when the paren tail failed
+    # (quadratic over hostile function source).  Language unchanged:
+    # with a name present the run splits deterministically, without
+    # one a single ``\s*`` remains.  The keyword is \b-pinned and
+    # the name/receiver tokens bounded: planted keywords inside an
+    # unbounded \w+ span re-scan the rest of the line per keyword,
+    # and a mid-word start only fabricated a token (real Go/JS
+    # identifiers sit far inside 256 chars).
     FrameworkHook(
         "go-net/http", "middleware",
-        r"func\s*\w*\s*\(\s*\w+\s+http\.Handler\s*\)\s*http\.Handler",
+        r"\bfunc(?:\s*\w{1,256})?\s*\(\s*\w{1,256}\s+http\.Handler\s*\)\s*http\.Handler",
     ),
     FrameworkHook(
         "gin", "middleware",
@@ -260,9 +271,10 @@ TIER_B_FRAMEWORK_HOOKS: tuple[FrameworkHook, ...] = (
     # surfaces and naming stems only.
     FrameworkHook(
         "express", "middleware",
+        # Same gated-optional-name shape as the Go hook above.
         r"\(\s*(?:req|request)\s*,\s*(?:res|response)\s*,\s*next\s*\)"
         r"\s*(?:=>|\{)"
-        r"|function\s*\w*\s*\(\s*(?:req|request)\s*,\s*(?:res|response)"
+        r"|\bfunction(?:\s*\w{1,256})?\s*\(\s*(?:req|request)\s*,\s*(?:res|response)"
         r"\s*,\s*next\s*\)",
     ),
 )
@@ -288,10 +300,14 @@ _LIBRARY_PREFIX_RE = re.compile(
 
 # Tri-state contract mined from domain-model contract prose
 # ("returns 1 on success, 0 on failure, -1 on error").
+# Each optional verb gates its own trailing whitespace: the naive
+# ``\s*(?:VERB)?\s*`` put two unbounded whitespace spans around it
+# (three times over) — quadratic on tristate-shaped prose ending in
+# a whitespace run.
 _TRISTATE_PROSE_RE = re.compile(
-    r"1\s*(?:=|on|for|means)?\s*(?:ok|success|valid).{0,60}"
-    r"0\s*(?:=|on|for|means)?\s*(?:fail|invalid|bad).{0,60}"
-    r"(?:-1|negative)\s*(?:=|on|for|means)?\s*(?:error|fault)",
+    r"1\s*(?:(?:=|on|for|means)\s*)?(?:ok|success|valid).{0,60}"
+    r"0\s*(?:(?:=|on|for|means)\s*)?(?:fail|invalid|bad).{0,60}"
+    r"(?:-1|negative)\s*(?:(?:=|on|for|means)\s*)?(?:error|fault)",
     re.IGNORECASE | re.DOTALL,
 )
 _ZERO_OK_PROSE_RE = re.compile(
@@ -316,11 +332,20 @@ _ROLE_ANNOTATION_STATUSES = frozenset({
     "sink", "trust_boundary", "entry_point",
 })
 
-# IRIS/taint evidence tiers corroborated enough to be registry-grade.
-_CORROBORATED_SPEC_TIERS = frozenset({
-    "observed_runtime", "replayed_crash", "smt_proved",
-    "xref_backed", "header_backed",
-})
+# IRIS/taint evidence tiers corroborated enough to be registry-grade:
+# everything ranking at or above HEADER_BACKED. Derived from the
+# canonical ladder, not spelled as literals — a literal copy silently
+# excluded members added to the enum later, inverting the ordering
+# this policy means to express.
+def _corroborated_spec_tiers() -> frozenset[str]:
+    from core.evidence import TIER_RANK, EvidenceTier
+    floor = TIER_RANK[EvidenceTier.HEADER_BACKED]
+    return frozenset(
+        tier.value for tier, rank in TIER_RANK.items() if rank >= floor
+    )
+
+
+_CORROBORATED_SPEC_TIERS = _corroborated_spec_tiers()
 
 
 @dataclass
@@ -472,7 +497,17 @@ def registry_budget_violations() -> list[str]:
 def _annotation_role(
     names: Sequence[str], file_path: str, ctx: RoleContext,
 ) -> RoleEvidence | None:
-    """Operator annotations — the strongest learned source."""
+    """Operator annotations — the strongest learned source.
+
+    Registry grade requires human provenance: annotations are the one
+    learned source whose authority comes from an operator having
+    personally asserted the role, and the provenance contract
+    (``core.annotations.provenance``) grants that weight only to
+    ``source=human`` notes with an interactive-TTY stamp. Agent-written
+    notes still bind the role, but at detection grade — hint tier,
+    promote-capable only with independent corroboration (the same
+    split the sibling annotation consumers apply).
+    """
     base = ctx.annotations_dir
     if base is None and ctx.out_dir is not None:
         candidate = Path(ctx.out_dir) / "annotations"
@@ -480,8 +515,13 @@ def _annotation_role(
     if base is None:
         return None
     try:
-        from core.annotations.storage import read_file_annotations
+        from core.annotations.provenance import is_human_grade
+        from core.annotations.storage import (
+            annotation_file_mtime,
+            read_file_annotations,
+        )
         annotations = read_file_annotations(Path(base), file_path)
+        ann_mtime = annotation_file_mtime(Path(base), file_path)
     except Exception:
         logger.debug("fail_open role: annotation read failed", exc_info=True)
         return None
@@ -489,13 +529,14 @@ def _annotation_role(
     for ann in annotations:
         status = (ann.metadata or {}).get("status", "")
         if status in _ROLE_ANNOTATION_STATUSES and ann.function in wanted:
+            human = is_human_grade(ann.metadata, note_mtime=ann_mtime)
             return RoleEvidence(
                 kind=status,
                 source="annotation",
                 matched=ann.function,
-                confidence="high",
+                confidence="high" if human else "low",
                 provenance="annotation",
-                grade=GRADE_REGISTRY,
+                grade=GRADE_REGISTRY if human else GRADE_DETECTION,
             )
     return None
 
@@ -604,7 +645,7 @@ def _iris_spec_role(
         return None
     try:
         from core.audit.iris_specs import specs_from_json
-        specs = specs_from_json(spec_path.read_text(encoding="utf-8"))
+        specs = specs_from_json(spec_path.read_text(encoding="utf-8"))  # raw-open: RAPTOR-written IRIS spec artifact in the run out dir
     except Exception:
         logger.debug("fail_open role: iris spec load failed", exc_info=True)
         return None
@@ -668,6 +709,22 @@ def _sink_catalog_role(
     return None
 
 
+# Consumer-side caps for registry-sourced convention patterns. The
+# repo-wide regex census covers repo-authored pattern LITERALS; a
+# SecurityConvention's pattern string arrives at runtime through the
+# learned-vocabulary registry, so nothing else keeps a future producer
+# census-honest. Today's only producer emits escaped-literal call
+# shapes (census-linear), so both caps are defence in depth:
+# a learned name is identifier-sized (>512 chars is junk — refuse the
+# pattern), and the haystack is one function's source (64 KiB is far
+# above real function bodies — a longer decoy is searched only in its
+# first window; trade-off: a genuine convention match past the window
+# of a pathologically long function is missed, versus an unvetted
+# pattern scanning an unbounded attacker-authored body).
+_CONVENTION_PATTERN_MAX_LEN = 512
+_CONVENTION_SOURCE_WINDOW = 64 * 1024
+
+
 def _convention_role(
     names: Sequence[str], enclosing_source: str, ctx: RoleContext,
 ) -> RoleEvidence | None:
@@ -686,7 +743,7 @@ def _convention_role(
         if getattr(conv, "occurrences", 0) < MIN_CONVENTION_OCCURRENCES:
             continue
         pattern = getattr(conv, "pattern", "")
-        if not pattern:
+        if not pattern or len(pattern) > _CONVENTION_PATTERN_MAX_LEN:
             continue
         try:
             conv_re = re.compile(pattern)
@@ -702,7 +759,8 @@ def _convention_role(
                     provenance=f"convention:{pattern}",
                     grade=GRADE_REGISTRY,
                 )
-        if enclosing_source and conv_re.search(enclosing_source):
+        if enclosing_source and conv_re.search(
+                enclosing_source[:_CONVENTION_SOURCE_WINDOW]):
             return RoleEvidence(
                 kind=concern,
                 source="convention",

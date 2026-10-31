@@ -951,3 +951,33 @@ class TestSignalReadyHandshake:
                     real_close(fd)
                 except OSError:
                     pass
+
+
+class TestEchildWritesSummary:
+    """The ECHILD wait-loop exit is a near-normal end-of-run shape
+    (the race between the last tracee's reap and the traced-set
+    bookkeeping), not a crash — it must still append the audit_summary
+    record. Without it, budget_truncated/drop counts silently read as
+    "no drops" for such runs, and consumers can't tell the difference
+    from a mid-run tracer death."""
+
+    def test_summary_record_written_on_echild_exit(self, tmp_path):
+        from unittest import mock
+
+        if tracer._arch_info() is None:
+            pytest.skip("unsupported arch")
+        with mock.patch.object(tracer, "_ptrace_seize",
+                               return_value=True), \
+                mock.patch("os.waitpid",
+                           side_effect=ChildProcessError):
+            rc = tracer.trace(4194000, tmp_path)
+        assert rc == 0
+        from core.sandbox import evidence as evidence_mod
+        log = (evidence_mod.audit_dir_path(tmp_path)
+               / tracer._DENIALS_FILENAME)
+        assert log.exists(), "no JSONL written on the ECHILD exit"
+        records = [json.loads(x) for x in
+                   log.read_text().splitlines()]
+        assert any(r.get("type") == "audit_summary" for r in records), (
+            f"audit_summary missing from ECHILD-exit JSONL: {records}"
+        )

@@ -212,3 +212,47 @@ def test_markers_shared_between_fuzzer_and_oracle_tiers():
     assert marker_present("ssti", "result 49 here")
     assert not marker_present("ssti", "result 50 here")
     assert not marker_present("nosuchclass", body)
+
+
+def test_fuzzer_hit_records_base_data_for_replay():
+    """Form hits carry their sibling fields so Phase 6v replay legs can
+    reproduce the exact request shape that confirmed the hit."""
+    client = WebClient("https://example.test")
+    fuzzer = WebFuzzer(client)
+    responses = iter([
+        _response(200, "normal page"),
+        _response(500, "You have an error in your SQL syntax near q"),
+    ])
+    sent_bodies = []
+
+    def post(url, data=None, **kw):
+        sent_bodies.append(dict(data or {}))
+        return next(responses)
+
+    client.post = post
+    finding = fuzzer._test_payload(
+        "https://example.test/form", "q", "' OR 1=1--", "sqli",
+        method="POST", base_data={"csrf": "tok123", "email": "a@b.invalid"},
+    )
+
+    assert finding is not None
+    assert finding["base_data"] == {"csrf": "tok123", "email": "a@b.invalid"}
+    # The siblings actually rode both detection legs.
+    assert all(body["csrf"] == "tok123" for body in sent_bodies)
+
+
+def test_fuzzer_hit_base_data_defaults_to_empty():
+    client = WebClient("https://example.test")
+    fuzzer = WebFuzzer(client)
+    responses = iter([
+        _response(200, "normal search page"),
+        _response(500, "You have an error in your SQL syntax near q"),
+    ])
+    client.get = lambda url, params=None: next(responses)
+
+    finding = fuzzer._test_payload(
+        "https://example.test/search", "q", "' OR 1=1--", "sqli",
+    )
+
+    assert finding is not None
+    assert finding["base_data"] == {}

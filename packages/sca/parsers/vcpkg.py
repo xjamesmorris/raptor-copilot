@@ -37,6 +37,7 @@ import logging
 from typing import Any, TYPE_CHECKING
 
 from ..models import Confidence, Dependency, PinStyle
+from ._base import PARSE_ESCAPE_ERRORS, build_purl
 from . import _safe_read, register
 
 if TYPE_CHECKING:
@@ -64,7 +65,7 @@ def parse(path: Path) -> list[Dependency]:
 
     try:
         data = json.loads(text)
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, *PARSE_ESCAPE_ERRORS) as e:  # type: ignore[misc]  # hostile-input escape classes
         logger.warning(
             "sca.parsers.vcpkg: JSON parse failed for %s: %s", path, e,
         )
@@ -106,7 +107,7 @@ def _build_dep(
     entry: Any, *, scope: str, path: Path,
 ) -> Dependency | None:
     if isinstance(entry, str):
-        name = entry
+        name: Any = entry
         version = None
         pin_style = PinStyle.WILDCARD
     elif isinstance(entry, dict):
@@ -129,7 +130,7 @@ def _build_dep(
         is_lockfile=False,
         pin_style=pin_style,
         direct=True,
-        purl=_build_purl(name, version),
+        purl=build_purl(_PURL_TYPE, name, version),
         parser_confidence=_confidence(pin_style, version),
     )
 
@@ -163,6 +164,10 @@ def _classify(entry: dict[str, Any]) -> tuple[str | None, PinStyle]:
 
 
 def _confidence(pin_style: PinStyle, version: str | None) -> Confidence:
+    # Deliberately NOT the shared ``_base`` ladder: vcpkg keys on
+    # EXACT/RANGE structured fields (ports have no git/path pin
+    # shapes and a bare port name is still medium-trust registry
+    # metadata, not a low-trust unversioned lockfile row).
     if pin_style == PinStyle.EXACT and version:
         return Confidence("high", reason="vcpkg.json structured field")
     if pin_style == PinStyle.RANGE and version:
@@ -172,9 +177,3 @@ def _confidence(pin_style: PinStyle, version: str | None) -> Confidence:
         )
     return Confidence("medium", reason="vcpkg.json port name only")
 
-
-def _build_purl(name: str, version: str | None) -> str:
-    base = f"pkg:{_PURL_TYPE}/{name}"
-    if version:
-        return f"{base}@{version}"
-    return base

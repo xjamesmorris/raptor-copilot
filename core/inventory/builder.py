@@ -24,7 +24,7 @@ from core.build.macro_config import extract_build_tus, extract_macro_config
 from core.build.rust_modules import extract_rust_crate_modules
 from core.config import RaptorConfig
 from core.hash import sha256_bytes, sha256_string
-from core.json import load_json, save_json
+from core.json import save_json
 
 from .build_membership import (
     crate_module_excluded,
@@ -63,11 +63,17 @@ from .extractors import compute_interstitial_items, count_sloc, extract_items
 from .languages import (
     LANGUAGE_MAP,
     RECORD_ONLY_EXTENSIONS,
+    SCRIPT_PER_FILE_LANGUAGES,
     detect_language,
-    detect_language_from_shebang,
+    detect_language_from_content,
+    language_extensions,
     refine_language,
 )
 from .module_load_abort import detect_module_load_abort
+from .script_handler import (
+    reconcile_interstitial_items,
+    stamp_script_handler_items,
+)
 from .translation_view import detect_macro_call_targets, preprocess_view
 
 logger = logging.getLogger(__name__)
@@ -246,6 +252,154 @@ def _pool_probe() -> bool:
     return True
 
 
+def _shutdown_pool_nowait(
+    pool: "ProcessPoolExecutor | ThreadPoolExecutor",
+    *,
+    kill_grace_s: float = 5.0,
+) -> None:
+    """Tear down an extractor pool without blocking on its workers,
+    and make sure process-pool workers actually die.
+
+    Order matters: ``ProcessPoolExecutor.shutdown()`` drops the
+    executor's reference to its worker map (``self._processes =
+    None``) before returning, so the worker snapshot MUST be taken
+    first — a post-shutdown read sees ``None`` and terminates
+    nothing. A leaked wedged worker is not just leaked RAM: the
+    executor's manager thread joins its workers, interpreter exit
+    joins the manager thread, and the worker still holds the
+    process's inherited stdout/stderr — one surviving worker turns a
+    finished-and-summarised run into a process that never exits and
+    an output pipe that never closes (a CI runner waits on that pipe
+    even after the step's shell would have finished).
+
+    ``terminate()`` alone is not enough either: a worker forked from
+    a threaded parent inherits the parent's Python signal handlers,
+    and a handler that touches a fork-frozen lock never returns — the
+    worker survives SIGTERM indefinitely. Wait on the process
+    sentinels (death is visible there no matter which thread reaps)
+    and escalate to SIGKILL after ``kill_grace_s``. Grace trade-off
+    both ways: longer lets a slow-but-responsive worker exit on
+    SIGTERM cleanly; shorter recovers the build faster when the
+    worker is truly wedged. 5s is orders of magnitude above a healthy
+    worker's SIGTERM latency and well below the stall window that
+    triggers this teardown.
+
+    ThreadPoolExecutor has no ``_processes``: the snapshot is empty
+    and this degrades to the plain non-blocking shutdown — hung
+    threads cannot be killed, only abandoned.
+    """
+    procs = list((getattr(pool, "_processes", None) or {}).values())
+    pool.shutdown(wait=False, cancel_futures=True)
+    for proc in procs:
+        try:
+            proc.terminate()
+        except Exception:  # noqa: BLE001 — teardown must never raise
+            pass
+    for proc in _await_worker_exit(procs, kill_grace_s):
+        # kill() no-ops on an already-reaped process (returncode set),
+        # so racing the manager thread's own join here is safe.
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001 — teardown must never raise
+            pass
+
+
+def _await_worker_exit(procs: list, grace_s: float) -> list:
+    """Wait up to ``grace_s`` for the given worker processes to exit;
+    return the survivors (empty on a full clean exit).
+
+    Waits on the process SENTINELS, not ``join()``: death is visible
+    on the sentinel no matter which thread reaps the process, so this
+    never races the executor manager thread's own join. Event-driven
+    — returns as soon as the last worker exits, so a prompt exit
+    costs milliseconds regardless of the grace value.
+    """
+    import time as _time
+    from multiprocessing import connection as _mp_connection
+
+    if not procs:
+        return []
+    deadline = _time.monotonic() + grace_s
+    pending = {proc.sentinel: proc for proc in procs}
+    while pending:
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            ready = _mp_connection.wait(list(pending), timeout=remaining)
+        except OSError:
+            break
+        for sentinel in ready:
+            pending.pop(sentinel, None)
+    return list(pending.values())
+
+
+def _shutdown_pool_clean(
+    pool: "ProcessPoolExecutor | ThreadPoolExecutor",
+    *,
+    grace_s: float = 10.0,
+) -> None:
+    """Shut down a pool whose futures have ALL resolved, without an
+    unbounded join on its workers.
+
+    The clean-completion counterpart of :func:`_shutdown_pool_nowait`.
+    ``shutdown(wait=True)`` here joins workers that have already
+    delivered every result — but a fork-context worker can wedge on a
+    fork-frozen lock ON ITS EXIT PATH, after its last result, and the
+    blocking join then hangs the whole build before any summary
+    prints. Results integrity is unaffected by construction: callers
+    invoke this only after the drain loop consumed every future, so
+    no result can be lost to an escalated kill — the workers hold
+    nothing the build still needs.
+
+    Same snapshot-before-shutdown order as the wedged-path helper
+    (``shutdown()`` nulls ``_processes`` before returning). Workers
+    get ``grace_s`` to exit NORMALLY off the shutdown sentinel first
+    — the wait is sentinel-event-driven, so the healthy path costs
+    milliseconds, not the grace value. Grace trade-off both ways:
+    longer tolerates a slow-but-healthy worker teardown on a loaded
+    host (exit is normally instant — the worker loop just returns);
+    shorter bounds how long a wedged exit path can delay the build's
+    completion. 10s is generous for "instant" and small next to the
+    60s stall window the in-flight path uses. Escalation past the
+    grace is terminate → ``kill_grace_s`` → SIGKILL, identical to the
+    wedged path, with a WARNING naming the wedged pids — a clean
+    drain that needed signals is a real anomaly worth a log line,
+    but it never fails the build.
+
+    Thread pools (the extractor fallback) take the plain blocking
+    shutdown: threads share the parent's locks normally — the
+    fork-frozen-lock wedge class cannot occur — and cannot be killed
+    anyway.
+    """
+    procs = list((getattr(pool, "_processes", None) or {}).values())
+    if not procs:
+        pool.shutdown(wait=True)
+        return
+    pool.shutdown(wait=False)
+    survivors = _await_worker_exit(procs, grace_s)
+    if not survivors:
+        return
+    logger.warning(
+        "inventory: %d extractor worker(s) still alive %.1fs after a "
+        "clean drain (pids: %s) — escalating terminate→kill; all "
+        "results were already collected, the build is unaffected",
+        len(survivors), grace_s,
+        ", ".join(str(p.pid) for p in survivors),
+    )
+    for proc in survivors:
+        try:
+            proc.terminate()
+        except Exception:  # noqa: BLE001 — teardown must never raise
+            pass
+    for proc in _await_worker_exit(survivors, 5.0):
+        # Same reap-race safety note as _shutdown_pool_nowait.
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001 — teardown must never raise
+            pass
+
+
 def _make_extractor_pool(initargs, *, max_workers=None, contexts=None):
     """Create the extractor process pool, PROBING each candidate
     context with a real worker round-trip before committing to it.
@@ -286,13 +440,7 @@ def _make_extractor_pool(initargs, *, max_workers=None, contexts=None):
                 "inventory: %s pool context failed its worker probe; "
                 "trying the next candidate", method,
             )
-        pool.shutdown(wait=False, cancel_futures=True)
-        procs = getattr(pool, "_processes", None) or {}
-        for proc in list(procs.values()):
-            try:
-                proc.terminate()
-            except Exception:  # noqa: BLE001
-                pass
+        _shutdown_pool_nowait(pool)
     return None
 
 # Stall watchdog for the extractor pool. The previous loop used
@@ -331,14 +479,8 @@ def _retry_stalled_files(files, initargs, *, _on_retry_done, futures_map):
     ``with`` block: the context manager exit would block on wedged
     workers, which is exactly what the teardown here must never do.
     """
-    def _kill(p) -> None:
-        p.shutdown(wait=False, cancel_futures=True)
-        procs = getattr(p, "_processes", None) or {}
-        for proc in list(procs.values()):
-            try:
-                proc.terminate()
-            except Exception:  # noqa: BLE001
-                pass
+    def _kill(p: ProcessPoolExecutor) -> None:
+        _shutdown_pool_nowait(p)
 
     still_failed = []
     pool = None
@@ -379,7 +521,10 @@ def _retry_stalled_files(files, initargs, *, _on_retry_done, futures_map):
                 break
     finally:
         if pool is not None:
-            pool.shutdown(wait=True)
+            # Bounded, not shutdown(wait=True): the last retry future
+            # has resolved by here, but the retry worker can still
+            # wedge on its EXIT path — see _shutdown_pool_clean.
+            _shutdown_pool_clean(pool)
     return still_failed
 
 
@@ -415,9 +560,21 @@ MAX_FILE_BYTES = 8 * 1024 * 1024  # 8 MiB
 # keys distinct projects so two scans of unrelated trees don't
 # share state. Operator-purge: ``rm -rf ~/.raptor/cache/inventory/``
 # or ``raptor-sca clean-cache``.
-_DEFAULT_INVENTORY_CACHE_ROOT = (
-    Path.home() / ".raptor" / "cache" / "inventory"
-)
+# Test-override seam: when set (tests monkeypatch a tmp dir here) it
+# wins. Production leaves it None so the accessor re-reads $HOME on
+# every call — a HOME pin installed AFTER this module is imported
+# still redirects the cache instead of being silently ignored by an
+# import-time snapshot.
+_DEFAULT_INVENTORY_CACHE_ROOT: Path | None = None
+
+
+def _default_inventory_cache_root() -> Path:
+    """Inventory-checklist cache root, resolved at call time
+    (``~/.raptor/cache/inventory``; ``Path.home()`` reads ``$HOME``
+    per call)."""
+    if _DEFAULT_INVENTORY_CACHE_ROOT is not None:
+        return _DEFAULT_INVENTORY_CACHE_ROOT
+    return Path.home() / ".raptor" / "cache" / "inventory"
 
 
 def default_cache_dir(
@@ -454,7 +611,72 @@ def default_cache_dir(
     # paths come from the filesystem and can carry surrogate escapes
     # (non-UTF-8 filenames), which a strict encode crashes on.
     target_hash = sha256_string(key)[:16]
-    return _DEFAULT_INVENTORY_CACHE_ROOT / target_hash
+    return _default_inventory_cache_root() / target_hash
+
+
+#: Bounds for the case-collision note: at most this many collided
+#: groups are listed (with a "+N more" tail), at most 3 spellings per
+#: group — the note is awareness, not an exhaustive report.
+_CASE_COLLISION_EXAMPLE_CAP = 5
+
+
+def _note_case_collisions(
+    target_path: str, files_info: list[dict],
+) -> None:
+    """Informational note when inventory paths differ only by case and
+    the tree sits on a case-insensitive-suspect mount (WSL drvfs/9p).
+
+    Duplicate-identity awareness ONLY — inventory keying is
+    deliberately unchanged: on a case-insensitive checkout,
+    case-variant spellings of one on-disk file can enter the inventory
+    (and downstream SARIF / suppression keys) as distinct entries. The
+    fail direction is safe noise — duplicate analysis, split coverage
+    marks — never a masked finding, so this stays a note rather than a
+    dedup. Cost discipline: the cached ``is_wsl()`` boolean gates
+    everything (free off WSL), one ``statfs`` of the target root
+    answers the mount question, and the collision scan is a casefold
+    post-pass over the already-built path list — no per-file
+    filesystem probes. ``str.casefold`` APPROXIMATES the mount's own
+    folding table (NTFS ``$UpCase``): it can over-report pairs the
+    mount keeps distinct (``ß``/``ẞ`` casefold together) and miss
+    pairs the mount folds differently — acceptable for an
+    awareness-only note. Example paths come from the scanned tree, so
+    they are terminal-escaped and bounded. Best-effort: never raises.
+    """
+    try:
+        from core.startup.wsl import fs_is_drvfs_or_9p, is_wsl
+        if not is_wsl() or not fs_is_drvfs_or_9p(target_path):
+            return
+        buckets: dict[str, list[str]] = {}
+        for f in files_info:
+            p = f.get('path')
+            if isinstance(p, str):
+                buckets.setdefault(p.casefold(), []).append(p)
+        collided = sorted(
+            (group for group in buckets.values() if len(group) > 1),
+            key=lambda g: g[0],
+        )
+        if not collided:
+            return
+        from core.security.log_sanitisation import sanitise_for_terminal
+        examples = "; ".join(
+            " / ".join(
+                sanitise_for_terminal(p, max_len=120) for p in group[:3]
+            )
+            for group in collided[:_CASE_COLLISION_EXAMPLE_CAP]
+        )
+        more = len(collided) - _CASE_COLLISION_EXAMPLE_CAP
+        logger.info(
+            "inventory: %d path group(s) differ only by case and the "
+            "target is on a case-insensitive-suspect mount (drvfs/9p) "
+            "— case-variant spellings of one on-disk file appear as "
+            "distinct inventory entries (duplicate-identity noise; "
+            "keying unchanged): %s%s. See docs/wsl.md.",
+            len(collided), examples,
+            f" (+{more} more)" if more > 0 else "",
+        )
+    except Exception:  # noqa: BLE001 — awareness note must never break a build
+        logger.debug("case-collision note failed", exc_info=True)
 
 
 def build_inventory(
@@ -473,10 +695,12 @@ def build_inventory(
     Enumerates source files, detects languages, extracts functions via
     AST/regex, computes SHA-256 per file, and records exclusions.
 
-    Always rehashes files on disk.  Unchanged files (SHA-256 match with
-    a previous checklist) reuse their old parsed entries, including
-    coverage marks.  Changed files are re-parsed and their coverage
-    marks cleared.
+    Change detection against a previous checklist is two-tier: a
+    stat compare (mtime + size) first — an exact match reuses the old
+    parsed entry without reading the file — then a SHA-256 content
+    compare for files whose stat changed. Unchanged files keep their
+    old parsed entries, including coverage marks. Changed files are
+    re-parsed and their coverage marks cleared.
 
     Args:
         target_path: Directory or file to analyze.
@@ -518,16 +742,16 @@ def build_inventory(
     # Build macro config once (compile_commands.json / .config). Drives
     # config-aware #ifdef resolution in each file's TranslationView. Empty
     # (and inert) when no build artifacts are present or in isolation mode.
-    macro_config = extract_macro_config(target_path)
+    macro_config = extract_macro_config(target_path)  # type: ignore[arg-type]
     if allow_unreachable:
-        macro_config = None
+        macro_config = None  # type: ignore[assignment]
     # Translation-unit set (compile_commands membership), built once for the
     # C/C++ build-membership witness. A witness record (not a view transform),
     # so — like the Go //go:build detector — it is NOT disabled under
     # allow_unreachable; the surface-only consumers ignore it in that mode.
-    build_tus = extract_build_tus(target_path)
+    build_tus = extract_build_tus(target_path)  # type: ignore[arg-type]
     # Rust crate-module set (mod-tree membership), same role for .rs sources.
-    crate_modules = extract_rust_crate_modules(target_path)
+    crate_modules = extract_rust_crate_modules(target_path)  # type: ignore[arg-type]
     cfg_fp = macro_config.fingerprint() if macro_config else ""
     # Fold the membership sets into the cache key: a compile_commands / mod-tree
     # change (a file added to / removed from the build) must invalidate cached
@@ -558,12 +782,11 @@ def build_inventory(
         raise FileNotFoundError(msg)
 
     if (target.is_file() and detect_language(str(target)) is None
-            and (target.suffix
-                 or detect_language_from_shebang(str(target)) is None)):
-        # Directory mode admits extensionless shebang scripts; the
-        # single-file gate must accept the same files (the shebang
-        # probe only runs when there is no extension, mirroring the
-        # walk).
+            and detect_language_from_content(str(target)) is None):
+        # Directory mode admits content-probed files (extensionless
+        # shebang scripts, PHP under foreign extensions); the
+        # single-file gate must accept the same files, mirroring the
+        # walk.
         msg = f"Target file has no recognized source extension: {target_path}"
         raise ValueError(msg)
 
@@ -606,12 +829,33 @@ def build_inventory(
             "scope filter: %d → %d files (%d excluded)",
             before, len(file_list), before - len(file_list),
         )
+        # Target-relative scope stamp for the artifact: marks the
+        # inventory as PARTIAL so shared-slot machinery (project
+        # checklist promotion) never adopts it as the full-tree form.
+        # A scope that covers the target ROOT is a full-tree build in
+        # scope clothing — stamping it would permanently demote a
+        # genuinely complete inventory to run-local/never-promoted.
+        if any(p == str(target_resolved) for p in resolved_prefixes):
+            scope_stamp = None
+        else:
+            scope_stamp = sorted(
+                str(Path(p).relative_to(target_resolved))
+                for p in resolved_prefixes
+            )
+    else:
+        scope_stamp = None
     logger.info("Found %d source files to process", len(file_list))
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     checklist_file = output_path / 'checklist.json'
-    old_inventory = load_json(checklist_file)
+    # Accessor read (not a raw load_json): the prior inventory may be
+    # stored in the sharded checklist/ layout, and the stat/sha
+    # carry-forward below must keep working against it. read_checklist
+    # returns {} for absent — normalise to None so the "no previous
+    # inventory" arms below stay on their historical path.
+    from core.inventory import read_checklist
+    old_inventory = read_checklist(output_path) or None
 
     # Parse-affecting configuration fingerprint. The default cache dir
     # folds this into its KEY, but an explicit ``output_dir`` (project
@@ -655,6 +899,15 @@ def build_inventory(
 
     def _collect_result(result) -> None:
         nonlocal total_items, total_sloc, skipped
+        if isinstance(result, dict):
+            # Worker-buffered analysis-gap records: persist in the
+            # parent, where the active-run pointer resolves.
+            worker_gaps = result.pop("_analysis_gaps", None)
+            if worker_gaps:
+                from core.run.gaps import persist_gap_records
+                persist_gap_records(worker_gaps)
+            if result.pop("_gaps_only", False):
+                result = None
         if result is None:
             skipped += 1
         elif result.get("_excluded"):
@@ -689,14 +942,23 @@ def build_inventory(
         # drivers — the sweep's own shape) is lazy: the constructor
         # succeeds and the first submit dies.
         pool = _make_extractor_pool(initargs)
+        # Process-pool workers run with stdio detached (see
+        # _init_inventory_worker), so their own per-file WARNING (with
+        # traceback) never reaches the console and the future SUCCEEDS
+        # with an _excluded record — the parent must re-voice the
+        # failure or it is visible only in the artifact. Thread-pool
+        # fallback workers log in-process; re-voicing there would
+        # print every failure twice.
+        worker_stdio_detached = pool is not None
         if pool is None:
             pool = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
             def submit_fn(fp, pool=pool):
                 return pool.submit(
-                    _process_single_file, fp, target, exclude_patterns,
-                    skip_generated, old_files_by_path, allow_unreachable,
-                    macro_config, build_tus, crate_modules,
+                    _process_one_with_gap_context, fp, target,
+                    exclude_patterns, skip_generated, old_files_by_path,
+                    allow_unreachable, macro_config, build_tus,
+                    crate_modules,
                 )
         else:
             def submit_fn(fp, pool=pool):
@@ -714,7 +976,15 @@ def build_inventory(
             nonlocal skipped
             fp = futures[future]
             try:
-                _collect_result(future.result())
+                result = future.result()
+                if (worker_stdio_detached and isinstance(result, dict)
+                        and result.get("_reason") == "processing_error"):
+                    logger.warning(
+                        "inventory: per-file extractor failed on %s "
+                        "(%s) — recorded as processing_error",
+                        fp, result.get("_pattern"),
+                    )
+                _collect_result(result)
             except Exception as exc:  # noqa: BLE001 — one bad file must not sink the pool
                 logger.warning(
                     "inventory: per-file extractor raised on "
@@ -728,6 +998,13 @@ def build_inventory(
                     "reason": "processing_error",
                     "pattern_matched": exc.__class__.__name__,
                 })
+                from core.run.gaps import record_analysis_gap
+                record_analysis_gap(
+                    file_path=_rel_of(fp),
+                    reason="processing_error",
+                    tool="inventory",
+                    detail=exc.__class__.__name__,
+                )
                 skipped += 1
 
         stalled = set()
@@ -767,6 +1044,16 @@ def build_inventory(
                             f"no completion in {INVENTORY_STALL_TIMEOUT_S}s"
                             " + retry failed",
                     })
+                    from core.run.gaps import record_analysis_gap
+                    record_analysis_gap(
+                        file_path=_rel_of(fp),
+                        reason="worker_stalled",
+                        tool="inventory",
+                        detail=(
+                            f"no completion in {INVENTORY_STALL_TIMEOUT_S}s"
+                            " + retry failed"
+                        ),
+                    )
                     skipped += 1
         finally:
             if stalled:
@@ -775,17 +1062,16 @@ def build_inventory(
                 # nor interpreter exit waits on them. (Thread-pool
                 # fallback threads can't be killed — the build still
                 # proceeds; the hung thread is abandoned.)
-                pool.shutdown(wait=False, cancel_futures=True)
-                # ProcessPoolExecutor has no public kill API; _processes
-                # is the documented-in-source worker map.
-                procs = getattr(pool, "_processes", None) or {}
-                for proc in list(procs.values()):
-                    try:
-                        proc.terminate()
-                    except Exception:  # noqa: BLE001
-                        pass
+                _shutdown_pool_nowait(pool)
             else:
-                pool.shutdown(wait=True)
+                # Clean drain: every future resolved (the loop above
+                # exhausted them), so the workers hold nothing the
+                # build still needs — but their EXIT paths can wedge
+                # on fork-frozen locks just like their task paths,
+                # and shutdown(wait=True) would then hang the build
+                # before any summary prints. Bounded shutdown with
+                # escalation instead; see _shutdown_pool_clean.
+                _shutdown_pool_clean(pool)
     else:
         for filepath in file_list:
             _collect_result(
@@ -799,6 +1085,10 @@ def build_inventory(
     files_info.sort(key=lambda x: x['path'])
     excluded_files.sort(key=lambda x: x['path'])
 
+    # Case-collision awareness on case-insensitive-suspect mounts
+    # (WSL drvfs/9p) — informational note only, keying unchanged.
+    _note_case_collisions(target_path, files_info)
+
     # Count functions specifically for backwards-compatible field
     total_functions = sum(
         1 for f in files_info for item in f.get('items', [])
@@ -807,10 +1097,26 @@ def build_inventory(
 
     # Record limitations when extraction is incomplete
     limitations = []
-    from .extractors import _TS_AVAILABLE
+    from .extractors import _TS_AVAILABLE, _TS_PROBE_LANGUAGES, _ts_language
     if not _TS_AVAILABLE:
         limitations.append("globals not extracted (tree-sitter was not available)")
         limitations.append("SLOC counts used regex fallback (less accurate)")
+    # Per-language honesty: a language the tree-sitter loader knows but
+    # whose grammar isn't importable fell back to regex extraction for
+    # EVERY file of that language. The generic "globals not extracted"
+    # note above only fires when tree-sitter itself is missing, so a
+    # missing single grammar (e.g. tree_sitter_kotlin) previously left
+    # no signal at all — downstream coverage read as trivially complete
+    # over functions the build never saw. Python is exempt (its stdlib
+    # ast fallback is full-fidelity).
+    for lang in sorted({f.get('language') for f in files_info} - {None}):
+        if lang == 'python' or lang not in _TS_PROBE_LANGUAGES:
+            continue
+        if not _TS_AVAILABLE or _ts_language(lang) is None:
+            limitations.append(
+                f"{lang}: tree-sitter grammar not installed — regex "
+                "fallback (reduced function recall, no spans/globals, "
+                "call graph unavailable)")
 
     inventory = {
         'generated_at': datetime.now(timezone.utc).isoformat(),
@@ -825,6 +1131,8 @@ def build_inventory(
         'excluded_files': excluded_files,
         'files': files_info,
     }
+    if scope_stamp is not None:
+        inventory['scope'] = scope_stamp
     # Target classification (library | hybrid | application | unknown) — a
     # first-class, neutral signal for downstream consumers (reachability,
     # attack-surface mapping, taint sources, SCA pinning posture). Setting is
@@ -871,6 +1179,8 @@ def build_inventory(
             enrich_inventory_with_binary_oracle(
                 inventory, bin_paths,
                 no_suppression_paths=RaptorConfig.BINARY_ORACLE_NO_SUPPRESS,
+                declared_paths=RaptorConfig.BINARY_ORACLE_DECLARED,
+                identity_pins=RaptorConfig.BINARY_ORACLE_IDENTITY_PINS,
             )
             # Persist per-binary verdicts into the build-ID-keyed cache
             # so later runs (and external consumers of the shared cache
@@ -908,6 +1218,28 @@ def build_inventory(
                 logger.warning("binary_oracle_edges extraction failed: %s",
                                exc)
 
+    # Propagate binary verdicts into the graph store so downstream
+    # consumers (coverage_residual, fuzz_targets) reflect dead-code status.
+    if bin_paths and output_dir:
+        import sqlite3 as _graph_sqlite3
+        try:
+            from core.understand_graph import graph_path_for_run, propagate_binary_verdicts
+            _gp = graph_path_for_run(Path(output_dir), target_path)
+            if _gp.exists():
+                _bo_verdicts: dict[str, str] = {}
+                for _f in (inventory.get("files") or []):  # type: ignore[union-attr,attr-defined]
+                    _fp = _f.get("path", "")  # type: ignore[union-attr]
+                    for _item in (_f.get("items") or []):  # type: ignore[union-attr]
+                        _bo = ((_item.get("metadata") or {}).get("binary_oracle") or {})
+                        _cls = _bo.get("classification")
+                        _name = _item.get("name")
+                        if _cls and _name:
+                            _bo_verdicts[f"{_fp}::{_name}"] = _cls
+                if _bo_verdicts:
+                    propagate_binary_verdicts(_gp, _bo_verdicts)
+        except (ImportError, _graph_sqlite3.Error, KeyError, TypeError, ValueError):
+            logger.debug("graph propagate_binary_verdicts skipped", exc_info=True)
+
     # Perlasm generated-asm enrichment (asm option b): structurally
     # detect perlasm generators, run them under the strict sandbox
     # (fail-closed), and inventory the emitted assembly as
@@ -944,8 +1276,35 @@ def build_inventory(
         except (KeyError, TypeError):
             logger.debug("incompatible old inventory, skipping diff", exc_info=True)
 
-    from core.inventory import save_checklist
+    from core.inventory import ensure_runlocal_checklist, save_checklist
+    if scope_stamp is not None:
+        # Scope-collision rule: never write a PARTIAL inventory
+        # through the project-slot symlink — detach so the write
+        # below lands run-local and the project keeps the full-tree
+        # form (loud when the two now diverge).
+        ensure_runlocal_checklist(output_path)
     save_checklist(str(output_path), inventory)
+
+    # PHP include-graph derivation (Layer 1, hint-tier) — mechanical
+    # fold of the walker's include edges into include-graph.json
+    # beside the checklist. Inventory-time placement makes every
+    # pipeline (audit context, validate Stage C, map ride-alongs) a
+    # consumer with zero extra orchestration. Best-effort — graph
+    # trouble never blocks the inventory.
+    if any(f.get('language') == 'php' for f in files_info):
+        try:
+            from .include_graph import (
+                build_include_graph,
+                save_include_graph,
+            )
+            include_graph = build_include_graph(
+                inventory,
+                target_root=str(target) if target.is_dir() else None,
+            )
+            save_include_graph(str(output_path), include_graph)
+        except Exception:                                  # noqa: BLE001
+            logger.warning("include-graph derivation failed",
+                           exc_info=True)
 
     logger.info("Built inventory: %d files, %d items "
                 "(%d functions, %d SLOC, %d skipped, %d excluded)",
@@ -1031,7 +1390,16 @@ def _carry_forward_coverage(
             counts[base] = ordinal + 1
             yield (path, *base, ordinal), item
 
-    # Build lookup: keyed item -> checked_by from old inventory
+    from .checklist_mac import TOKEN_MAP_KEY
+
+    # Build lookup: keyed item -> (checked_by, claim tokens) from old
+    # inventory. Tokens are carried VERBATIM, never re-minted: copying
+    # cannot launder a planted row (a forged unstamped label stays
+    # unstamped through every carry), and a genuine token minted over
+    # the old item verifies on the new one exactly when the claim's
+    # covered content (file sha256, name/class/kind, line range) is
+    # unchanged — a since-moved claim demotes at import, the safe
+    # direction.
     old_coverage = {}
     for file_info in old.get('files', []):
         if file_info.get('path') in modified:
@@ -1039,16 +1407,36 @@ def _carry_forward_coverage(
         for key, item in _keyed_items(file_info):
             checked_by = item.get('checked_by', [])
             if checked_by:
-                old_coverage[key] = checked_by
+                mac_map = item.get(TOKEN_MAP_KEY)
+                old_coverage[key] = (
+                    checked_by,
+                    mac_map if isinstance(mac_map, dict) else {},
+                )
 
     # Apply to new inventory
     for file_info in new.get('files', []):
         for key, item in _keyed_items(file_info):
             if key in old_coverage:
+                old_checked, old_macs = old_coverage[key]
                 existing = item.get('checked_by') or []
                 item['checked_by'] = existing + [
-                    run for run in old_coverage[key] if run not in existing
+                    run for run in old_checked if run not in existing
                 ]
+                carried = {
+                    label: token
+                    for label, token in old_macs.items()
+                    if isinstance(label, str) and isinstance(token, str)
+                    and label in item['checked_by']
+                }
+                if carried:
+                    mac_map = item.get(TOKEN_MAP_KEY)
+                    if not isinstance(mac_map, dict):
+                        mac_map = {}
+                    # Existing (newer) tokens win: promotion folds
+                    # OLDER checklists into the newest base, and the
+                    # base's own token was minted against the base's
+                    # own row.
+                    item[TOKEN_MAP_KEY] = {**carried, **mac_map}
 
 
 def _count_source_files(dirpath: Path, extensions: set[str], cap: int = 1000) -> int:
@@ -1207,12 +1595,25 @@ def _collect_source_files(
             # instead of leaving them silently invisible.
             if ext in extensions or ext in RECORD_ONLY_EXTENSIONS:
                 file_list.append(filepath)
-            elif not ext and detect_language_from_shebang(str(filepath)):
-                # Extensionless interpreter scripts (launcher / dispatch
-                # surfaces) carry their language in the shebang line; the
-                # extension gate alone left them invisible to every
-                # downstream scanner.
-                file_list.append(filepath)
+            else:
+                # Files whose name says nothing carry their language in
+                # the content: extensionless interpreter scripts
+                # (launcher / dispatch surfaces) in the shebang line,
+                # PHP shipped under foreign extensions (plugin module
+                # files) in the open tag. The extension gate alone left
+                # both invisible to every downstream scanner. Two gates
+                # keep the probe inside its derivation: shebang routing
+                # applies to EXTENSIONLESS names only (probing shebangs
+                # on named documents minted review units from
+                # notes.txt-class non-source), and a probe-detected
+                # language is admitted only when the caller's
+                # ``extensions`` narrowing includes it (the documented
+                # parameter contract).
+                probe_lang = detect_language_from_content(
+                    str(filepath), allow_shebang=not ext)
+                if probe_lang and (
+                        language_extensions(probe_lang) & extensions):
+                    file_list.append(filepath)
 
     return file_list, pruned_dirs
 
@@ -1234,7 +1635,7 @@ def _is_github_workflow(rel_path: str, content: str) -> bool:
         return True
     from .extractors import GitHubWorkflowExtractor
     return any(GitHubWorkflowExtractor._JOBS_RE.match(line)
-               for line in content.split("\n"))
+               for line in content.split("\n"))  # line-model: byte-decoded content; the matcher's \s*/.* tail tolerates a trailing \r
 
 
 _worker_ctx: dict[str, Any] = {}
@@ -1250,6 +1651,52 @@ def _init_inventory_worker(
     build_tus,
     crate_modules,
 ) -> None:
+    # Signal hygiene first: fork-context workers inherit the parent's
+    # Python-level signal handlers, and embedding drivers install
+    # SIGTERM handlers whose post-mortem paths take locks that can be
+    # fork-frozen in this child — SIGTERM then never kills the worker
+    # (the handler blocks forever) and the pool teardown has to
+    # escalate to SIGKILL. Reset to the default disposition so
+    # terminate() means terminate and no parent post-mortem ever runs
+    # (and prints) inside an extractor worker. Never raise: a raising
+    # initializer breaks the whole pool.
+    import signal as _signal
+    try:
+        _signal.signal(_signal.SIGTERM, _signal.SIG_DFL)
+    except (ValueError, OSError):
+        # ValueError: not the main thread (thread-pool fallback path
+        # reuses none of this, but be safe); OSError: exotic platform.
+        pass
+    # The MASK is inherited separately from the disposition: a parent
+    # thread that had SIGTERM blocked at fork leaves it blocked here,
+    # where a pending SIGTERM then sits undelivered forever — the
+    # disposition reset above looks correct but terminate() still
+    # does nothing and teardown must SIGKILL. Unblock it explicitly.
+    try:
+        _signal.pthread_sigmask(_signal.SIG_UNBLOCK, {_signal.SIGTERM})
+    except (AttributeError, ValueError, OSError):
+        # pthread_sigmask absent (non-POSIX) or refused — the
+        # disposition reset above still holds; never break the pool.
+        pass
+    # Detach the worker from the parent's stdout/stderr. Workers
+    # inherit those descriptors, and when the parent's stdout is a
+    # pipe (CI step streams), any worker that outlives the parent —
+    # however it got there — keeps the pipe open and the pipe's
+    # reader waiting; the teardown escalation makes that window
+    # small, this makes the worker unable to hold it at all. Nothing
+    # owned is lost: per-file failures come back as processing_error
+    # records that the parent re-voices (see _on_done), and direct
+    # worker writes were unowned noise interleaving into the
+    # parent's stream. Never raise.
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull, 1)
+            os.dup2(devnull, 2)
+        finally:
+            os.close(devnull)
+    except OSError:
+        pass
     _worker_ctx["target"] = target
     _worker_ctx["exclude_patterns"] = exclude_patterns
     _worker_ctx["skip_generated"] = skip_generated
@@ -1260,8 +1707,37 @@ def _init_inventory_worker(
     _worker_ctx["crate_modules"] = crate_modules
 
 
+def _process_one_with_gap_context(
+    filepath: Path, *args: Any,
+) -> dict[str, Any] | None:
+    """Run :func:`_process_single_file` with analysis-gap plumbing.
+
+    parse_origin attributes any budget-abandoned parse under this
+    file to the file itself on the run's analysis-gap trail. Records
+    that could not be persisted in this process (pool workers do not
+    inherit the parent's active-run pointer) ride back to the parent
+    on the result dict, which persists them in _collect_result.
+    """
+    from core.run.gaps import drain_pending_gaps, parse_origin
+    target = args[0] if args else None
+    origin = str(filepath)
+    if isinstance(target, Path):
+        try:
+            origin = str(Path(filepath).relative_to(target))
+        except ValueError:
+            pass
+    with parse_origin(origin):
+        result = _process_single_file(filepath, *args)
+    pending = drain_pending_gaps()
+    if pending:
+        if result is None:
+            result = {"_gaps_only": True}
+        result["_analysis_gaps"] = pending
+    return result
+
+
 def _process_file_in_worker(filepath: Path) -> dict[str, Any] | None:
-    return _process_single_file(
+    return _process_one_with_gap_context(
         filepath,
         _worker_ctx["target"],
         _worker_ctx["exclude_patterns"],
@@ -1306,10 +1782,11 @@ def _process_single_file(
     if excluded:
         return {"path": rel_path, "_excluded": True, "_reason": reason, "_pattern": pattern}
 
-    # Detect language
+    # Detect language — extension first, then the content probe
+    # (shebang line, PHP open tag) for names that say nothing.
     language = detect_language(str(filepath))
-    if not language and not filepath.suffix:
-        language = detect_language_from_shebang(str(filepath))
+    if not language:
+        language = detect_language_from_content(str(filepath))
     if not language:
         # Source-like files we still don't parse (parser grammars,
         # inline-include fragments, Solidity) were previously dropped
@@ -1335,25 +1812,31 @@ def _process_single_file(
         except OSError:
             file_stat = None
 
-        # Fast path: if stat (mtime_ns + size) matches old entry, reuse
-        # without reading the file at all — skips I/O, hash, and parsing.
-        if old_files and rel_path in old_files:
-            old_entry = old_files[rel_path]
-            old_stat = old_entry.get('_stat')
-            if file_stat and old_stat and file_stat == old_stat:
-                return old_entry
+        # A stat (mtime_ns + size) match against the old entry is a
+        # HINT, never proof of identity: a same-size edit with a
+        # preserved mtime (rsync -a, cp -p, archive extraction,
+        # os.utime restore, sub-clock-granularity edits) is invisible
+        # to stat, and serving the old parse attaches coverage marks
+        # and span hashes to code that no longer exists. Reuse
+        # therefore always goes through the SHA-256 compare below —
+        # the module's documented contract. A content match still
+        # skips tree-sitter parsing (the dominant cost); the price is
+        # re-reading each unchanged file's bytes every incremental
+        # run. Trading that read back for a stat-only trust fast path
+        # re-opens the stale-entry hole in both the timestamp-
+        # preserving-sync and same-instant-edit shapes.
 
         # Bounded read. `read_bytes()` loads the whole file into
         # memory before any size check — a 10 GB binary, malformed
         # symlink-to-/dev/zero, or hostile sample in a vendored
         # archive OOM-killed the inventory builder. stat-then-bound
         # caps the in-flight memory at MAX_FILE_BYTES + 1 regardless
-        # of file size.
-        try:
-            file_size = filepath.stat().st_size
-        except OSError:
+        # of file size. Reuses the stat taken just above instead of a
+        # second back-to-back syscall.
+        if file_stat is None:
             return {"path": rel_path, "_excluded": True,
                     "_reason": "stat_failed", "_pattern": None}
+        file_size = file_stat[1]
         if file_size > MAX_FILE_BYTES:
             return {"path": rel_path, "_excluded": True,
                     "_reason": "too_large",
@@ -1378,11 +1861,28 @@ def _process_single_file(
             return {"path": rel_path, "_excluded": True,
                     "_reason": "too_large_during_read",
                     "_pattern": f"size>{MAX_FILE_BYTES}"}
-        content = raw_bytes.decode('utf-8', errors='ignore')
+        # errors='replace', never 'ignore': 'ignore' DELETES invalid
+        # bytes, so attacker-chosen bytes make this decoded view
+        # structurally differ from what an interpreter honouring a
+        # coding cookie executes (a latin-1 file whose guard name
+        # carries a high byte decoded to `if False:` — every text
+        # detector then ranged a LIVE, executing function as dead, a
+        # hard-suppress witness). U+FFFD keeps every byte represented:
+        # the forged view fails to parse and detectors bail toward no
+        # witness. Also the unit-wide convention — lexical_view and
+        # perlasm already decode with 'replace', so all views of one
+        # file agree by construction.
+        content = raw_bytes.decode('utf-8', errors='replace')
 
         _uncorroborated_generated = False
         if skip_generated and is_generated_file(content):
-            if generated_marker_corroborated(rel_path):
+            # target_root arms the first-party package probe so a
+            # walk-KEPT build/dist/target package never corroborates —
+            # mirroring the walk-time exemption (marker + kept-path
+            # hint must not compose into whole-file suppression).
+            if generated_marker_corroborated(
+                    rel_path,
+                    target_root=target if target.is_dir() else None):
                 return {"path": rel_path, "_excluded": True,
                         "_reason": "generated_file", "_pattern": None}
             # The in-file marker is target-controlled text; honouring
@@ -1415,11 +1915,136 @@ def _process_single_file(
         line_count = content.count('\n') + 1
         sha256 = sha256_bytes(raw_bytes)
 
-        # Fall back to SHA-256 comparison when stat changed but content didn't
+        # The one reuse gate: content identity by SHA-256 (see the
+        # stat-is-a-hint rationale above). Skips the parse, refreshes
+        # the recorded stat.
         if old_files and rel_path in old_files:
             old_entry = old_files[rel_path]
             if old_entry.get('sha256') == sha256:
                 old_entry['_stat'] = file_stat
+                # Reused records get their script_handler stamps
+                # RE-DERIVED, not trusted: content is byte-identical
+                # to what the old parse saw, so re-deriving equals the
+                # original stamping — and it self-heals. The checklist
+                # sits in a writable run/cache directory, and the SHA
+                # match would otherwise skip the parse indefinitely:
+                # a pre-stamp entry, a tampered stamp on an unchanged
+                # file, and a stale verdict from an older classifier
+                # would all persist forever. Interstitial GEOMETRY is
+                # reconciled first: the stamp re-derivation slices by
+                # the recorded span, so a shifted span would classify
+                # the wrong bytes — the geometry is line arithmetic
+                # over the record's other items (no parse), and a
+                # cached set that disagrees with the content-derived
+                # one is replaced loudly. Same for the span hashes
+                # of stamped handler spans (the pre-stamp hasher
+                # skipped every interstitial): the function-level diff
+                # needs them, and hashing the identical content now
+                # equals hashing it at the original parse. Best-effort
+                # like the fresh-parse hasher below.
+                items_list = old_entry.get('items')
+                if isinstance(items_list, list):
+                    healed = reconcile_interstitial_items(
+                        items_list, language, content, path=rel_path,  # type: ignore[arg-type]
+                    )
+                    if healed:
+                        # Replaced items lost builder-stamped sibling
+                        # fields; re-derive the lexical_dead tag the
+                        # fresh path would give them (same rule:
+                        # tagged only when the span STARTS inside a
+                        # dead range) so a healed record equals a
+                        # fresh build's interstitial state.
+                        dead_ranges = detect_dead_scopes(
+                            language, content)  # type: ignore[arg-type]
+                        if dead_ranges:
+                            for it in items_list:
+                                if (not isinstance(it, dict)
+                                        or it.get('kind')
+                                        != 'interstitial'):
+                                    continue
+                                ls = it.get('line_start') or 0
+                                if ls and any(lo <= ls <= hi
+                                              for lo, hi
+                                              in dead_ranges):
+                                    it['lexical_dead'] = True
+                    stamp_script_handler_items(
+                        items_list, language, content,  # type: ignore[arg-type]
+                    )
+                    # Gated on the DETECTED language (the stamp
+                    # producer's own scope), never the cached record:
+                    # on any other language a genuine True stamp
+                    # cannot exist, so a stamp planted on e.g. a C
+                    # record must not get a fresh span_hash minted
+                    # for it here.
+                    script_lang = ((language or '').lower()
+                                   in SCRIPT_PER_FILE_LANGUAGES)
+                    try:
+                        from core.staleness import hash_spans_text
+                        unhashed = [
+                            it for it in items_list
+                            if script_lang
+                            and isinstance(it, dict)
+                            and it.get('kind') == 'interstitial'
+                            and it.get('script_handler') is True
+                            and not it.get('span_hash')
+                            and isinstance(it.get('line_start'), int)
+                            and not isinstance(it.get('line_start'), bool)
+                            and isinstance(it.get('line_end'), int)
+                            and not isinstance(it.get('line_end'), bool)
+                            and 0 < it['line_start'] <= it['line_end']
+                        ]
+                        if unhashed:
+                            hashes = hash_spans_text(
+                                content,
+                                [(it['line_start'], it['line_end'])
+                                 for it in unhashed],
+                            )
+                            for it, h in zip(unhashed, hashes):
+                                if h:
+                                    it['span_hash'] = h
+                    except Exception:
+                        logger.debug(
+                            "handler span-hash backfill failed for %s",
+                            rel_path, exc_info=True,
+                        )
+                # Same carried-gap rule for the PHP include edges: a
+                # record written before the edge layer existed never
+                # re-parses on the SHA fast path, so backfill the
+                # include layer from the (byte-identical) content —
+                # exact, not a guess. Key presence marks extraction
+                # ran (empty ``includes`` is a real "no includes"),
+                # so this runs at most once per pre-edge record.
+                # Deliberately NOT the stamp rule above (re-derive
+                # every reuse): healing edges means a full
+                # tree-sitter parse per PHP file per build — the very
+                # cost the SHA gate exists to skip — while the stamp
+                # heals with one line-scan. The tamper exposure is
+                # also a tier lower: include edges feed hint-tier
+                # prompt context only (no verdict path reads the
+                # graph), so a tampered edge steers where a tampered
+                # stamp would suppress.
+                if language == 'php':
+                    cg = old_entry.get('call_graph')
+                    if isinstance(cg, dict) and 'includes' not in cg:
+                        try:
+                            fresh = extract_call_graph_php(content)
+                            if fresh.includes_extracted:
+                                fd = fresh.to_dict()  # type: ignore[assignment]
+                                for k in ('includes', 'defines',
+                                          'includes_truncated',
+                                          'direct_access_guard'):
+                                    if k in fd:  # type: ignore[operator]
+                                        cg[k] = fd[k]  # type: ignore[index]
+                                from .include_graph import (
+                                    anchor_literal_include_targets,
+                                )
+                                anchor_literal_include_targets(
+                                    cg, rel_path)
+                        except Exception:
+                            logger.debug(
+                                "include-edge backfill failed for %s",
+                                rel_path, exc_info=True,
+                            )
                 return old_entry
 
         # The parser reads a TranslationView (its parse_text), not raw
@@ -1430,18 +2055,22 @@ def _process_single_file(
         # (detect_dead_scopes / detect_module_load_abort) keep using the
         # real `content`; only the tree-sitter / AST parse uses parse_text.
         view = preprocess_view(
-            str(filepath), language, content,
+            str(filepath), language, content,  # type: ignore[arg-type]
             allow_unreachable=allow_unreachable,
             config=macro_config,
         )
         parse_text = view.parse_text
         tree_cache: dict[str, Any] = {}
-        items = extract_items(str(filepath), language, parse_text, _tree_cache=tree_cache)
+        items = extract_items(str(filepath), language, parse_text, _tree_cache=tree_cache)  # type: ignore[arg-type]
         # Safety net: every SLOC-bearing line outside an extracted item becomes
         # an interstitial item, so non-function code (top-level statements,
         # missed globals) is never invisible to coverage (coverage Decision #2).
         items = items + compute_interstitial_items(items, parse_text)
-        sloc = count_sloc(content, language, _tree=tree_cache.get("tree"))
+        # SLOC over the SAME view the tree was parsed from: counting
+        # blank lines from raw content while the tree (comment lines)
+        # came from parse_text made comment lines inside blanked
+        # preprocessor arms count as SLOC — the two inputs must agree.
+        sloc = count_sloc(parse_text, language, _tree=tree_cache.get("tree"))  # type: ignore[arg-type]
 
         record: dict[str, Any] = {
             'path': rel_path,
@@ -1454,11 +2083,23 @@ def _process_single_file(
         }
         if _uncorroborated_generated:
             record['generated_marker'] = 'uncorroborated'
+        # Script-per-file languages: classify each interstitial span
+        # (handler vs wiring) ONCE, here, and persist the verdict on
+        # the item — the single source of truth every consumer reads
+        # (gap selection, gap-for-site binding, coverage denominators,
+        # lookup enclosure, diff carry-forward, corpus credit) instead
+        # of each recomputing from source. Classified over the raw
+        # ``content`` — the same bytes gap-side hydration reads — not
+        # the translation view.
+        stamp_script_handler_items(record['items'], language, content)  # type: ignore[arg-type]
         # Per-item span hashes (core.staleness format: SHA-256[:12] of
         # the raw span lines). The function-level inventory diff
         # compares these across runs to find added/changed functions
         # without needing the previous run's source. Interstitial
-        # residue is skipped (synthetic, not a reviewable unit).
+        # residue is skipped (synthetic, not a reviewable unit) —
+        # EXCEPT spans stamped script_handler above: those are the
+        # reviewable units of script-per-file files, and without a
+        # hash the diff can only over-report them as changed forever.
         # Best-effort — a hash failure just leaves the field absent.
         try:
             from core.staleness import hash_spans_text
@@ -1470,7 +2111,8 @@ def _process_single_file(
                 if (isinstance(ls, int) and not isinstance(ls, bool)
                         and isinstance(le, int) and not isinstance(le, bool)
                         and 0 < ls <= le
-                        and item_dict.get('kind') != 'interstitial'):
+                        and (item_dict.get('kind') != 'interstitial'
+                             or item_dict.get('script_handler') is True)):
                     span_items.append(item_dict)
                     spans.append((ls, le))
             if spans:
@@ -1490,7 +2132,7 @@ def _process_single_file(
         # as mutually CALLED). Tagged here (not in each extractor) so
         # detection lives in one place per language; field is set only
         # when dead so inventory size stays flat.
-        dead_ranges = detect_dead_scopes(language, content)
+        dead_ranges = detect_dead_scopes(language, content)  # type: ignore[arg-type]
         if dead_ranges:
             for item_dict in record['items']:
                 ls = item_dict.get('line_start') or 0
@@ -1499,7 +2141,12 @@ def _process_single_file(
         # Call-graph extraction. The resolver in
         # core.analysis.reachability is language-agnostic; per-file
         # extractors emit the same FileCallGraph dataclass for
-        # whichever languages have a walker.
+        # whichever languages have a walker. The tree extract_items
+        # parsed (same grammar, same parse_text) is threaded through so
+        # the call-graph walkers don't tree-sitter-parse every file a
+        # second time; when the extractors' parse failed or the grammar
+        # is absent the walkers fall back to their own parse path.
+        _shared_tree = tree_cache.get("tree")
         if language == 'python':
             record['call_graph'] = extract_call_graph_python(parse_text).to_dict()
             # Module-level ``__all__`` is the explicit export contract.
@@ -1517,47 +2164,52 @@ def _process_single_file(
             # isn't installed. TS/TSX use the typescript grammar so typed
             # source (annotations, decorators, interfaces) parses.
             record['call_graph'] = extract_call_graph_javascript(
-                parse_text, language=language,
+                parse_text, language=language, _tree=_shared_tree,
             ).to_dict()
         elif language == 'go':
             record['call_graph'] = extract_call_graph_go(
-                parse_text,
+                parse_text, _tree=_shared_tree,
             ).to_dict()
         elif language == 'java':
             record['call_graph'] = extract_call_graph_java(
-                parse_text,
+                parse_text, _tree=_shared_tree,
             ).to_dict()
         elif language == 'rust':
             record['call_graph'] = extract_call_graph_rust(
-                parse_text,
+                parse_text, _tree=_shared_tree,
             ).to_dict()
         elif language == 'ruby':
             record['call_graph'] = extract_call_graph_ruby(
-                parse_text,
+                parse_text, _tree=_shared_tree,
             ).to_dict()
         elif language in ('csharp', 'c_sharp'):
             record['call_graph'] = extract_call_graph_csharp(
-                parse_text,
+                parse_text, _tree=_shared_tree,
             ).to_dict()
         elif language == 'php':
             record['call_graph'] = extract_call_graph_php(
-                parse_text,
+                parse_text, _tree=_shared_tree,
             ).to_dict()
+            # Layer-0 include edges ride the same parse; pure-literal
+            # edges anchor relative to this file (path arithmetic
+            # only — existence is the include-graph derivation's job).
+            from .include_graph import anchor_literal_include_targets
+            anchor_literal_include_targets(record['call_graph'], rel_path)
         elif language == 'lua':
             record['call_graph'] = extract_call_graph_lua(
-                parse_text,
+                parse_text, _tree=_shared_tree,
             ).to_dict()
         elif language == 'scala':
             record['call_graph'] = extract_call_graph_scala(
-                parse_text,
+                parse_text, _tree=_shared_tree,
             ).to_dict()
         elif language == 'kotlin':
             record['call_graph'] = extract_call_graph_kotlin(
-                parse_text,
+                parse_text, _tree=_shared_tree,
             ).to_dict()
         elif language == 'swift':
             record['call_graph'] = extract_call_graph_swift(
-                parse_text,
+                parse_text, _tree=_shared_tree,
             ).to_dict()
         elif language == 'c':
             # S5: wire the existing extract_call_graph_c into the
@@ -1569,7 +2221,7 @@ def _process_single_file(
             # was absent for every C scan. Closes RAPTOR's largest
             # whole-language reachability blind spot.
             record['call_graph'] = extract_call_graph_c(
-                parse_text,
+                parse_text, _tree=_shared_tree,
             ).to_dict()
         elif language == 'cpp':
             # S5: same wiring story for C++. _CppCallGraph inherits
@@ -1577,7 +2229,7 @@ def _process_single_file(
             # handling. Covers .cpp / .cc / .cxx / .hpp (per the
             # languages.py extension map).
             record['call_graph'] = extract_call_graph_cpp(
-                parse_text,
+                parse_text, _tree=_shared_tree,
             ).to_dict()
         # U4 (macro-masking): record the function names invoked inside
         # function-like macro bodies. tree-sitter sees a macro call as a
@@ -1599,7 +2251,7 @@ def _process_single_file(
         # NOT_REACHED gate. Stored only when detected so the field
         # is absent (not False) on the overwhelming majority of
         # files — keeps inventory size flat.
-        abort = detect_module_load_abort(language, content)
+        abort = detect_module_load_abort(language, content)  # type: ignore[arg-type]
         if abort is not None:
             record['module_aborts_on_load'] = {
                 'line': abort.line,
@@ -1609,7 +2261,7 @@ def _process_single_file(
         # is never compiled, so every function in it is dead regardless of
         # call edges or external linkage. Heuristic (config-dependent) — a
         # surface-only gate, never hard-suppress.
-        excluded = detect_build_excluded(language, content)
+        excluded = detect_build_excluded(language, content)  # type: ignore[arg-type]
         if excluded is not None:
             record['build_excluded'] = {
                 'line': excluded.line,

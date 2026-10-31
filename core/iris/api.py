@@ -22,7 +22,7 @@ from pathlib import Path
 
 from core.evidence import TIER_RANK, EvidenceTier
 
-from .store import load_specs, load_store_metadata, save_specs
+from .store import load_specs, load_store_metadata, save_specs, store_lock
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -246,59 +246,69 @@ def promote_spec_on_annotation(
     if resolved is None:
         return None
 
-    specs = load_specs(resolved)
-    if not specs:
+    # The promotion is a load → mutate → re-save of the shared
+    # project store; hold the store lock across the whole window
+    # so a concurrent run's persist cannot interleave and drop
+    # this promotion (or vice versa).
+    with store_lock(resolved):
+        specs = load_specs(resolved)
+        if not specs:
+            return None
+
+        promoted = False
+        if human_grade:
+            target_tier = EvidenceTier.XREF_BACKED
+            spec_source = "operator_confirmed"
+        else:
+            target_tier = EvidenceTier.HEADER_BACKED
+            spec_source = "annotation_asserted"
+        target_rank = TIER_RANK.get(target_tier, 0)
+
+        for spec in specs:
+            if spec.function != function:
+                continue
+            if not spec.file or not source_file:
+                continue
+            # Bidirectional, component-boundary suffix match (the
+            # recall matcher's path_matches discipline): a spec whose
+            # file is MORE qualified than the annotation path must
+            # promote too — one-direction endswith silently skipped it.
+            if not (source_file == spec.file
+                    or source_file.endswith("/" + spec.file)
+                    or spec.file.endswith("/" + source_file)):
+                continue
+            if spec.role != role:
+                continue
+            if TIER_RANK.get(spec.evidence_tier, 0) >= target_rank:
+                continue
+            spec.evidence_tier = target_tier
+            spec.source = spec_source
+            promoted = True
+
+        if promoted:
+            meta = load_store_metadata(resolved)
+            # Public reader, not raw meta rows: load_assumptions floors
+            # tiers when the envelope's provenance token does not verify,
+            # so this re-save (which re-stamps) can never launder forged
+            # assumption tiers under a fresh token.
+            from .store import load_assumptions
+            existing_assumptions = load_assumptions(resolved)
+            stored_target = meta.get("target_path")
+            save_specs(
+                resolved, specs,
+                cl_sha=meta.get("checklist_sha", ""),
+                round_num=meta.get("round", 0),
+                history=meta.get("history"),
+                assumptions=existing_assumptions or None,
+                target_path=Path(stored_target) if stored_target else None,
+            )
+            logger.info(
+                "IRIS: promoted %s:%s to %s via %s annotation",
+                source_file, function, target_tier.value,
+                "operator" if human_grade else "machine-attributed",
+            )
+            return target_tier
         return None
-
-    promoted = False
-    if human_grade:
-        target_tier = EvidenceTier.XREF_BACKED
-        spec_source = "operator_confirmed"
-    else:
-        target_tier = EvidenceTier.HEADER_BACKED
-        spec_source = "annotation_asserted"
-    target_rank = TIER_RANK.get(target_tier, 0)
-
-    for spec in specs:
-        if spec.function != function:
-            continue
-        if not spec.file or not source_file:
-            continue
-        if not (source_file == spec.file
-                or source_file.endswith("/" + spec.file)):
-            continue
-        if spec.role != role:
-            continue
-        if TIER_RANK.get(spec.evidence_tier, 0) >= target_rank:
-            continue
-        spec.evidence_tier = target_tier
-        spec.source = spec_source
-        promoted = True
-
-    if promoted:
-        meta = load_store_metadata(resolved)
-        # Public reader, not raw meta rows: load_assumptions floors
-        # tiers when the envelope's provenance token does not verify,
-        # so this re-save (which re-stamps) can never launder forged
-        # assumption tiers under a fresh token.
-        from .store import load_assumptions
-        existing_assumptions = load_assumptions(resolved)
-        stored_target = meta.get("target_path")
-        save_specs(
-            resolved, specs,
-            cl_sha=meta.get("checklist_sha", ""),
-            round_num=meta.get("round", 0),
-            history=meta.get("history"),
-            assumptions=existing_assumptions or None,
-            target_path=Path(stored_target) if stored_target else None,
-        )
-        logger.info(
-            "IRIS: promoted %s:%s to %s via %s annotation",
-            source_file, function, target_tier.value,
-            "operator" if human_grade else "machine-attributed",
-        )
-        return target_tier
-    return None
 
 
 def _resolve_out_dir(out_dir: Path | None) -> Path | None:

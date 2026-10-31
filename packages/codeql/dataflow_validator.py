@@ -25,15 +25,23 @@ sys.path.insert(0, os.environ["RAPTOR_DIR"])
 
 from core.dataflow.evidence_renderer import render_evidence_for_prompt
 from core.dataflow.sanitizer_evidence import SanitizerEvidence
+from core.llm.context_window import (
+    DATAFLOW_STEP_CONTEXT_LINES,
+    DATAFLOW_VALIDATION_CONTEXT_LINES,
+)
 from core.llm.methodology import load_methodology
 from core.smt_solver import BVProfile
 from core.smt_solver.path_feasibility import (
     PathCondition,
+    PathSMTResult,
     check_path_feasibility,
+    check_path_feasibility_dual,
 )
 from core.llm.scorecard import fast_tier_model_name, run_cheap_fp_check
 from core.llm.task_types import TaskType
 from core.logging import get_logger
+from core.paths import confine
+from core.source import read_text_capped, split_lines
 from core.security.prompt_defense_profiles import CONSERVATIVE
 from core.security.prompt_envelope import (
     TaintedString,
@@ -283,6 +291,17 @@ SMT_INFEASIBLE_CONFIDENCE = 0.7
 # unsat — the case where the extra LLM condition-extraction calls buy
 # soundness (declaring a finding infeasible on path 1 alone while
 # path 2 is live is a false suppression).
+#
+# Soundness contract at the cap: the cap bounds WORK (per-path LLM
+# condition extraction + solver calls), never EVIDENCE. Refutation
+# requires every one of the result's paths to be checked-unsat; when
+# the result carries more paths than the cap allows, all-checked-unsat
+# is indeterminate and the finding falls through to full LLM analysis.
+# Trade-off, both directions: raising the cap buys refutation coverage
+# on many-flow results at the price of extra LLM extraction calls per
+# stubbornly-unsat finding; lowering it saves those calls but sends
+# more many-flow findings to the (more expensive) full analysis — it
+# can never widen refutation, because truncated coverage never refutes.
 MAX_SMT_PATHS = 3
 
 
@@ -303,7 +322,10 @@ def _steering_target(conditions: list) -> str | None:
         return None
     for tok in _STEER_IDENT_RE.findall(conditions[-1].text):
         low = tok.lower()
-        if low in _STEER_NON_VARS or low.startswith("0x"):
+        # Hex literals need no guard here: _STEER_IDENT_RE requires a
+        # leading letter/underscore, so a token can never start "0x",
+        # and the digit lookbehind stops a mid-literal "x10" match.
+        if low in _STEER_NON_VARS:
             continue
         return low
     return None
@@ -470,7 +492,7 @@ class DataflowValidator:
             ),
             "sanitizers": TaintedString(value=sanitizer_text, trust="untrusted"),
         }
-        blocks = ()
+        blocks: tuple[UntrustedBlock, ...] = ()
         if dataflow.message:
             blocks = (UntrustedBlock(
                 content=dataflow.message,
@@ -598,7 +620,8 @@ class DataflowValidator:
             self.logger.warning("Failed to extract dataflow path: %s", e)
             return None
 
-    def read_source_context(self, file_path: str, line: int, context_lines: int = 10,
+    def read_source_context(self, file_path: str, line: int,
+                            context_lines: int = DATAFLOW_VALIDATION_CONTEXT_LINES,
                             repo_root: Path | None = None) -> str:
         """
         Read source code context around a location.
@@ -606,7 +629,9 @@ class DataflowValidator:
         Args:
             file_path: Path to source file
             line: Line number
-            context_lines: Lines before/after to include
+            context_lines: Lines before/after to include (default:
+                the shared dataflow-validation window — see
+                core.llm.context_window for the sizing rationale)
             repo_root: When provided, refuse to read files outside this root.
                 Callers passing SARIF-derived paths should always set this.
 
@@ -614,40 +639,34 @@ class DataflowValidator:
             Source code snippet with context
         """
         try:
-            resolved = Path(file_path).resolve()
             if repo_root is not None:
-                try:
-                    resolved.relative_to(repo_root.resolve())
-                except ValueError:
+                maybe = confine(repo_root, file_path)
+                if maybe is None:
                     return ""
-            # Cap the source-context read at 10 MB. Pre-fix
-            # `open(...).readlines()` had no upper bound — a
-            # source file > 10 MB (auto-generated lexer tables,
-            # vendored library bundles, single-file compiled JS
-            # blobs) was loaded entirely into memory just to
-            # extract a ~20-line window around `line`.
-            #
-            # 10 MB covers every legitimate human-authored
-            # source file by orders of magnitude (Linux kernel
-            # ~10 MB across ALL files; the largest single C
-            # file ever observed in a major OSS project is
-            # ~3 MB). For pathological files past the cap the
-            # function still produces a context window — just
-            # truncated to the first 10 MB worth of lines.
-            _MAX_SOURCE_BYTES = 10 * 1024 * 1024
-            with Path(resolved).open(encoding="utf-8", errors="replace") as f:
-                content = f.read(_MAX_SOURCE_BYTES + 1)
-            if len(content) > _MAX_SOURCE_BYTES:
-                # Drop the trailing partial line (avoids splitting
-                # in the middle of a token in the rendered context)
-                content = content[:_MAX_SOURCE_BYTES]
-                content = content.rsplit("\n", 1)[0] + "\n"
+                resolved = maybe
+            else:
+                resolved = Path(file_path).resolve()
+            # Capped read (shared core.source helper, 10 MB default):
+            # a source file past the cap (auto-generated lexer
+            # tables, vendored bundles, single-file compiled JS
+            # blobs) yields a context window over the truncated
+            # prefix instead of loading whole into memory.
+            got = read_text_capped(resolved, newline="")
+            if got is None:
                 self.logger.warning(
-                    "Source file %s exceeded %s-byte cap; context window reflects truncated read",
+                    "Failed to read source context at %s", resolved)
+                return ""
+            content, truncated = got
+            if truncated:
+                self.logger.warning(
+                    "Source file %s exceeded the capped read; context window reflects truncated read",
                     resolved,
-                    _MAX_SOURCE_BYTES
                 )
-            lines = content.splitlines(keepends=True)
+            # \n-model split (core.source.lines contract): *line*
+            # is CodeQL's, counting \n only — a splitlines() view
+            # put the >>> marker and the context window on the
+            # wrong lines after any in-literal form feed.
+            lines = split_lines(content)
 
             start = max(0, line - context_lines - 1)
             end = min(len(lines), line + context_lines)
@@ -715,7 +734,12 @@ class DataflowValidator:
         blocks = []
         all_steps = [dataflow.source] + dataflow.intermediate_steps + [dataflow.sink]
         for i, step in enumerate(all_steps):
-            ctx = self.read_source_context(str(repo_path / step.file_path), step.line, context_lines=5,
+            # Tight per-step window (shared with the analysis prompt's
+            # dataflow snippets): condition extraction wants the guards
+            # AT the step, not the whole neighbourhood — see
+            # core.llm.context_window.
+            ctx = self.read_source_context(str(repo_path / step.file_path), step.line,
+                                            context_lines=DATAFLOW_STEP_CONTEXT_LINES,
                                             repo_root=repo_path)
             blocks.append(UntrustedBlock(
                 content=f"({step.label})\n{ctx}",
@@ -868,10 +892,12 @@ class DataflowValidator:
         # total) before the expensive LLM call is skipped. The per-path
         # LLM condition extraction runs lazily: an alternative is only
         # extracted after all earlier paths came back unsat.
+        total_paths = 1 + len(dataflow.alternatives)
         candidate_paths = [dataflow, *dataflow.alternatives[:MAX_SMT_PATHS - 1]]
         refuted: list = []
         smt_result = None
         active_index = 0
+        smt_paths_checked = 1
         for path_index, candidate in enumerate(candidate_paths):
             conditions, profile_hint = self._extract_path_conditions(candidate, repo_path)
             profile = _infer_bv_profile(candidate.rule_id, profile_hint)
@@ -885,7 +911,22 @@ class DataflowValidator:
                 target = _steering_target(conditions)
                 if target is not None:
                     prefer = (target, "max")
-            smt_result = check_path_feasibility(
+            # Signedness honesty: ``_infer_bv_profile``'s ``signed`` is a
+            # heuristic default (unsigned) unless the LLM hint pinned it
+            # with an explicit boolean. Under a guessed-unsigned profile
+            # the ubiquitous C signed error check (``ret < 0``) encodes
+            # as ``ULT(ret, 0)`` — unsat — so one signedness-mismatched
+            # guard anywhere in the path would refute the whole finding
+            # pre-LLM. When signedness is a guess, a refutation is only
+            # honored if BOTH signedness profiles agree (the
+            # bounds_feasibility agreement rule); a pinned hint keeps the
+            # cheaper single-profile check.
+            signed_pinned = isinstance(profile_hint.get("signed"), bool)
+            check = (
+                check_path_feasibility if signed_pinned
+                else check_path_feasibility_dual
+            )
+            smt_result = check(
                 conditions, profile=profile, prefer_witness=prefer,
             )
             if smt_result.feasible is False:
@@ -897,44 +938,79 @@ class DataflowValidator:
                 continue
             # sat or indeterminate — this path carries the analysis.
             active_index = path_index
+            smt_paths_checked = path_index + 1
             dataflow = candidate
             break
         else:
             paths_checked = len(candidate_paths)
-            if paths_checked == 1:
-                reasoning = (
-                    f"SMT analysis: {smt_result.reasoning}. Path conditions are mutually exclusive. "
-                    f"Confidence is capped at {SMT_INFEASIBLE_CONFIDENCE} because this formal verdict depends on "
-                    "LLM-extracted predicates which may have parsing or coverage limitations."
+            if total_paths > paths_checked:
+                # Truncated coverage: every CHECKED path is unsat, but
+                # the result carries paths the cap kept unchecked — a
+                # live path may be among them, so refuting here would
+                # be a false suppression. Demote to indeterminate and
+                # fall through to full LLM analysis on the primary
+                # path (the pre-SMT behavior).
+                self.logger.info(
+                    "SMT: %d of %d dataflow paths checked (all unsat) — "
+                    "cap %d truncated coverage; refutation requires all "
+                    "paths, proceeding to full analysis",
+                    paths_checked, total_paths, MAX_SMT_PATHS,
                 )
-                barriers = smt_result.unsatisfied
+                smt_paths_checked = paths_checked
+                smt_result = PathSMTResult(
+                    feasible=None,
+                    satisfied=[],
+                    unsatisfied=[
+                        f"path {i + 1}: {cond}"
+                        for i, r in enumerate(refuted)
+                        for cond in r.unsatisfied
+                    ],
+                    unknown=[],
+                    model={},
+                    smt_available=True,
+                    reasoning=(
+                        f"checked {paths_checked} of {total_paths} "
+                        f"dataflow paths (all unsat); "
+                        f"{total_paths - paths_checked} path(s) were not "
+                        f"SMT-checked, so infeasibility is unproven"
+                    ),
+                )
             else:
-                per_path = "; ".join(
-                    f"path {i + 1}: {r.reasoning}" for i, r in enumerate(refuted)
+                if paths_checked == 1:
+                    assert smt_result is not None
+                    reasoning = (
+                        f"SMT analysis: {smt_result.reasoning}. Path conditions are mutually exclusive. "
+                        f"Confidence is capped at {SMT_INFEASIBLE_CONFIDENCE} because this formal verdict depends on "
+                        "LLM-extracted predicates which may have parsing or coverage limitations."
+                    )
+                    barriers = smt_result.unsatisfied
+                else:
+                    per_path = "; ".join(
+                        f"path {i + 1}: {r.reasoning}" for i, r in enumerate(refuted)
+                    )
+                    reasoning = (
+                        f"SMT analysis: all {paths_checked} dataflow paths refuted ({per_path}). "
+                        f"Confidence is capped at {SMT_INFEASIBLE_CONFIDENCE} because this formal verdict depends on "
+                        "LLM-extracted predicates which may have parsing or coverage limitations."
+                    )
+                    barriers = [
+                        f"path {i + 1}: {cond}"
+                        for i, r in enumerate(refuted)
+                        for cond in r.unsatisfied
+                    ]
+                return DataflowValidation(
+                    is_exploitable=False,
+                    confidence=SMT_INFEASIBLE_CONFIDENCE,
+                    sanitizers_effective=True,
+                    bypass_possible=False,
+                    bypass_strategy=None,
+                    attack_complexity="high",
+                    reasoning=reasoning,
+                    barriers=barriers,
+                    prerequisites=[],
+                    smt_path_index=paths_checked - 1,
+                    smt_paths_checked=paths_checked,
                 )
-                reasoning = (
-                    f"SMT analysis: all {paths_checked} dataflow paths refuted ({per_path}). "
-                    f"Confidence is capped at {SMT_INFEASIBLE_CONFIDENCE} because this formal verdict depends on "
-                    "LLM-extracted predicates which may have parsing or coverage limitations."
-                )
-                barriers = [
-                    f"path {i + 1}: {cond}"
-                    for i, r in enumerate(refuted)
-                    for cond in r.unsatisfied
-                ]
-            return DataflowValidation(
-                is_exploitable=False,
-                confidence=SMT_INFEASIBLE_CONFIDENCE,
-                sanitizers_effective=True,
-                bypass_possible=False,
-                bypass_strategy=None,
-                attack_complexity="high",
-                reasoning=reasoning,
-                barriers=barriers,
-                prerequisites=[],
-                smt_path_index=paths_checked - 1,
-                smt_paths_checked=paths_checked,
-            )
 
         # Fast-tier FP prefilter. Runs after SMT (a definitive
         # infeasibility verdict beats anything the cheap LLM can
@@ -958,6 +1034,7 @@ class DataflowValidator:
             decision_class=decision_class,
             model=fast_model_name,
             cheap_says_fp=cheap_says_fp,
+            repo=repo_path,   # diversity gate: the repo under analysis
         )
         if decision.short_circuit:
             self.logger.info(
@@ -967,7 +1044,7 @@ class DataflowValidator:
             self.llm.record_short_circuit()
             result = self._short_circuit_fp_dataflow_result(cheap_reasoning)
             result.smt_path_index = active_index
-            result.smt_paths_checked = active_index + 1
+            result.smt_paths_checked = smt_paths_checked
             return result
 
         # Path is sat or indeterminate — run full LLM analysis.
@@ -1104,7 +1181,7 @@ class DataflowValidator:
             # Path bookkeeping is ours, not the LLM's — overwrite
             # anything the response happened to carry.
             validation.smt_path_index = active_index
-            validation.smt_paths_checked = active_index + 1
+            validation.smt_paths_checked = smt_paths_checked
 
             self.logger.info(
                 "Dataflow validation: exploitable=%s, confidence=%.2f",
@@ -1115,17 +1192,28 @@ class DataflowValidator:
             # Record cheap-vs-full agreement for the scorecard.
             # ``full_says_fp`` for dataflow = full said NOT
             # exploitable. Same shape as autonomous_analyzer's
-            # is_true_positive negation.
-            full_says_fp = not validation.is_exploitable
-            record_prefilter_outcome(
-                self.llm.scorecard,
-                decision_class=decision_class,
-                model=fast_model_name,
-                cheap_says_fp=cheap_says_fp,
-                full_says_fp=full_says_fp,
-                cheap_reasoning=cheap_reasoning,
-                full_reasoning=validation.reasoning,
-            )
+            # is_true_positive negation — including the abstention
+            # guard: the dict-splat construction above lets a
+            # model-emitted literal null land as None despite the
+            # bool annotation, and there is no full verdict to
+            # compare the cheap claim against.
+            if validation.is_exploitable is None:
+                self.logger.debug(
+                    "dataflow validation abstained on is_exploitable "
+                    "— skipping prefilter outcome record",
+                )
+            else:
+                full_says_fp = not validation.is_exploitable
+                record_prefilter_outcome(
+                    self.llm.scorecard,
+                    decision_class=decision_class,
+                    model=fast_model_name,
+                    cheap_says_fp=cheap_says_fp,
+                    full_says_fp=full_says_fp,
+                    cheap_reasoning=cheap_reasoning,
+                    full_reasoning=validation.reasoning,
+                    repo=repo_path,
+                )
 
             return validation
 
@@ -1147,7 +1235,7 @@ class DataflowValidator:
                 prerequisites=[],
                 error=str(e) or type(e).__name__,
                 smt_path_index=active_index,
-                smt_paths_checked=active_index + 1,
+                smt_paths_checked=smt_paths_checked,
             )
 
     def validate_finding(

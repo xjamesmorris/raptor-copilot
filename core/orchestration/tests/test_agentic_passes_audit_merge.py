@@ -20,6 +20,7 @@ from core.orchestration.agentic_passes import (
     run_validate_postpass,
 )
 from core.orchestration.tests.test_agentic_passes import (
+    _VALIDATE_REPORT_WRITES,
     _make_lifecycle_dispatcher,
     _patch_passes,
 )
@@ -122,7 +123,9 @@ class MergedSelectionTests(unittest.TestCase):
             ])
             audit_dir = self._make_audit_dir(tmp, 2)
             validate_dir = tmp / "validate_run"
-            dispatcher = _make_lifecycle_dispatcher(start_dir=validate_dir)
+            dispatcher = _make_lifecycle_dispatcher(
+                start_dir=validate_dir,
+                claude_writes=dict(_VALIDATE_REPORT_WRITES))
             with _patch_passes(dispatcher):
                 result = run_validate_postpass(
                     target=tmp, agentic_out_dir=tmp, analysis_report=report,
@@ -144,7 +147,9 @@ class MergedSelectionTests(unittest.TestCase):
             tmp = Path(tmp)
             audit_dir = self._make_audit_dir(tmp, 1)
             validate_dir = tmp / "validate_run"
-            dispatcher = _make_lifecycle_dispatcher(start_dir=validate_dir)
+            dispatcher = _make_lifecycle_dispatcher(
+                start_dir=validate_dir,
+                claude_writes=dict(_VALIDATE_REPORT_WRITES))
             with _patch_passes(dispatcher):
                 result = run_validate_postpass(
                     target=tmp, agentic_out_dir=tmp,
@@ -175,7 +180,9 @@ class MergedSelectionTests(unittest.TestCase):
             ])
             audit_dir = self._make_audit_dir(tmp, 3)
             validate_dir = tmp / "validate_run"
-            dispatcher = _make_lifecycle_dispatcher(start_dir=validate_dir)
+            dispatcher = _make_lifecycle_dispatcher(
+                start_dir=validate_dir,
+                claude_writes=dict(_VALIDATE_REPORT_WRITES))
             old_cap = agentic_passes._MAX_VALIDATE_FINDINGS
             agentic_passes._MAX_VALIDATE_FINDINGS = 4
             try:
@@ -199,3 +206,41 @@ class MergedSelectionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GapAuditSelectionTruncationTests(unittest.TestCase):
+    """Over-cap audit selection is signal-sorted, never a head slice:
+    the highest-signal finding must survive even when it is last in
+    file order."""
+
+    def test_high_signal_tail_finding_survives_cap(self):
+        from core.orchestration.agentic_passes import (
+            _MAX_VALIDATE_FINDINGS,
+        )
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            findings = [_audit_finding(i)
+                        for i in range(1, _MAX_VALIDATE_FINDINGS + 5)]
+            findings.append(
+                _audit_finding(999, is_exploitable=True))
+            audit_dir = tmp / "audit_run"
+            audit_dir.mkdir()
+            (audit_dir / "findings.json").write_text(
+                json.dumps(findings))
+            validate_dir = tmp / "validate_run"
+            dispatcher = _make_lifecycle_dispatcher(
+                start_dir=validate_dir,
+                claude_writes=dict(_VALIDATE_REPORT_WRITES))
+            with _patch_passes(dispatcher):
+                result = run_validate_postpass(
+                    target=tmp, agentic_out_dir=tmp,
+                    analysis_report=tmp / "missing.json",
+                    claude_bin="/fake/claude", audit_dir=audit_dir,
+                )
+            self.assertTrue(result.ran, msg=result.skipped_reason)
+            self.assertEqual(result.selected_count,
+                             _MAX_VALIDATE_FINDINGS)
+            data = json.loads(
+                (validate_dir / "selected-findings.json").read_text())
+            ids = [f["id"] for f in data["findings"]]
+            self.assertIn("AUDIT-999", ids)

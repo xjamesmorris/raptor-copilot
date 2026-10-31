@@ -1,19 +1,31 @@
 """Tool-grounded sweep execution for /audit.
 
-Wraps existing tool packages (semgrep, coccinelle) and SMT verb shims
-to run a hypothesis test against a specific file/function, then logs
-the result to the audit trail.  The sweep log entry is the breadcrumb
-that G3 (NO-SELF-CRITIQUE) checks: re-recording a function requires a
-sweep since the last record.
+Runs a hypothesis test against a specific file/function through one
+of nine tool channels, then logs the result to the audit trail:
 
-Uses ``packages.semgrep.runner.run_rule``,
-``packages.coccinelle.runner.run_rule``, and the
-``libexec/raptor-smt-*`` CLI shims.
+- semgrep (``run_semgrep_sweep``, plus the expanded-TU pass and
+  negative-control fixtures) via ``packages.semgrep.runner``
+- coccinelle (``run_coccinelle_sweep``) via ``packages.coccinelle``
+- SMT verbs (``run_smt_sweep`` / ``run_smt_verb_direct``) via the
+  ``libexec/raptor-smt-*`` CLI shims
+- CodeQL (``run_codeql_sweep``) with the whole-DB result memo
+- Joern (``run_joern_sweep`` / ``run_joern_pre_sweep`` /
+  ``run_consistency_check``)
+- symbolic execution (``run_symbolic_sweep``, angr)
+- heap-copy / integer-truncation checkers (``run_heap_copy_sweep``,
+  ``run_integer_truncation_sweep``)
+- proto-length checker (``run_proto_length_sweep``)
+- struct-field layout checker (``run_struct_field_sweep``)
+
+The sweep log entry is the breadcrumb that G3 (NO-SELF-CRITIQUE)
+checks: re-recording a function requires a sweep since the last
+record.
 """
 
 from __future__ import annotations
 
 import contextlib
+import copy
 import json as _json
 import logging
 import os
@@ -27,18 +39,32 @@ from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from core.json import load_json
+from core.paths import strip_file_uri
 
 from ._util import is_valid_identifier, safe_join
+from .run_memo import BoundedMemo
+from .substrate import (
+    Coverage,
+    UNKNOWN_INCONCLUSIVE,
+    file_substrate_coverage,
+    license_refutation,
+    substrate_covers,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+# Static import: an ``except`` clause needs the class object at
+# handler-match time, so the lazy-import convention the sandbox call
+# sites use cannot apply here. ``core.sandbox.errors`` is a leaf
+# module (no spawn machinery behind it).
+try:
+    from core.sandbox.errors import SandboxSetupError as _SandboxSetupError
+except ImportError:  # pragma: no cover — core.sandbox ships in-repo
+    class _SandboxSetupError(BaseException):  # type: ignore[no-redef]
+        """Stand-in no code raises; keeps the except clauses valid."""
+
 logger = logging.getLogger(__name__)
-
-# Sibling-run checklist.json parses in a per-run loop; big targets
-# legitimately reach tens of MiB — the checklist budget class.
-_MAX_CHECKLIST_BYTES = 256 * 1024 * 1024
-
 
 _ROLE_RE = _re.compile(r"^//\s*@role:\s*(\w+)", _re.MULTILINE)
 
@@ -52,18 +78,167 @@ def get_rule_role(rule_path: str) -> str:
     Dynamic per-hypothesis rules (not on disk) bypass this check
     entirely — the orchestrator's ``_is_detection_only`` returns
     False for files not in the stock library.
+
+    The read is bounded by the header GRAMMAR, never a byte count:
+    role directives live in the rule's leading comment block, so the
+    scan consumes exactly that block (``//`` comment and blank lines
+    up to the first SmPL content).  A fixed byte prefix silently
+    demoted a verification rule whose documentation grew past the
+    prefix — verdict machinery went dark with zero diagnostics.  The
+    fixture-closure gate cross-checks this reader against a full-file
+    scan (engine/coccinelle/tests/test_rule_fixture_closure.py), so a
+    directive this reader cannot see fails CI instead of silently
+    defaulting.
     """
+    header_lines: list[str] = []
     try:
-        with Path(rule_path).open() as f:
-            head = f.read(2048)
-        m = _ROLE_RE.search(head)
-        if m:
-            role = m.group(1).lower()
-            if role in ("detection", "verification"):
-                return role
+        with Path(rule_path).open() as f:  # raw-open: RAPTOR-owned cocci rule file (shipped or run-dir synthesized)
+            for line in f:
+                stripped = line.strip()
+                if stripped and not stripped.startswith("//"):
+                    break
+                header_lines.append(line)
     except OSError:
-        pass
+        return "detection"
+    m = _ROLE_RE.search("".join(header_lines))
+    if m:
+        role = m.group(1).lower()
+        if role in ("detection", "verification"):
+            return role
     return "detection"
+
+
+# Per-rule confirm-only role marker: the exact comment line
+# `# raptor: confirm-only` in a CURATED rule file's leading comment
+# block. Curated rules that adjudicate a sub-shape narrower than the
+# class they dispatch for declare it so their silence maps to
+# inconclusive instead of refuted (see the scanned-witness branch in
+# run_semgrep_sweep). Distinct from get_rule_role's
+# detection/verification split, which governs whether a MATCH may
+# promote; this marker governs what a NON-match means.
+_CONFIRM_ONLY_MARKER = "# raptor: confirm-only"
+
+# Per-rule decomp-safe marker, same anchored-header convention: a
+# CURATED rule that also tolerates decompiler output (synthetic
+# variable names, flattened control flow, no macros) declares
+# `# raptor: decomp-safe` in its leading comment block and the
+# decomp-tree sweep (core.audit.decomp_sweep) then runs it over
+# binary pseudo-source alongside the dedicated decompiler corpus.
+# Opt-in on purpose: most source rules key on API names and idioms
+# stripped decompilation lacks, so running the whole library over a
+# decomp-tree would manufacture noise, not coverage.
+_DECOMP_SAFE_MARKER = "# raptor: decomp-safe"
+
+#: The curated rule library. The confirm-only role is scoped to it:
+#: dynamic per-hypothesis tempfile rules and synthesized checkers are
+#: authored by the LLM at run time, and letting a rule's AUTHOR opt
+#: its own rule out of refutation semantics would be refutation
+#: evasion. The decomp-safe marker is scoped the same way for the
+#: same reason — an LLM-authored rule must not opt itself onto the
+#: attacker-shaped decomp-tree surface.
+_CURATED_SEMGREP_RULES_DIR = (
+    Path(__file__).resolve().parents[2] / "engine" / "semgrep" / "rules"
+)
+
+# Per-(path, marker) memo — curated rule files are read once per
+# process per marker, not per sweep. Bounded: only curated paths are
+# ever cached and the marker vocabulary is the two module constants.
+_RULE_MARKER_CACHE: dict[tuple[str, str], bool] = {}
+
+
+def _parse_header_marker(text: str, marker: str) -> bool:
+    """Anchored marker parse: the exact marker line must appear in
+    the file's LEADING comment block (before the first line that is
+    neither blank nor a ``#`` comment). Marker-shaped text anywhere
+    else — inside a YAML ``message:`` block, a trailing comment, a
+    pattern string — never activates the role. A UTF-8 BOM on the
+    first line is tolerated; near-miss spellings (extra spaces,
+    missing colon) deliberately do not parse — the loud companion
+    test over the curated library catches them so a mis-spelled
+    marker fails CI instead of silently reverting a rule to
+    refutation semantics (confirm-only) or silently dropping it from
+    the decomp-tree sweep (decomp-safe).
+    """
+    for line in text.splitlines():
+        stripped = line.lstrip("\ufeff").strip()
+        if not stripped:
+            continue
+        if not stripped.startswith("#"):
+            return False
+        if stripped == marker:
+            return True
+    return False
+
+
+def _parse_confirm_only_header(text: str) -> bool:
+    """Confirm-only variant of :func:`_parse_header_marker`."""
+    return _parse_header_marker(text, _CONFIRM_ONLY_MARKER)
+
+
+def _curated_rule_has_marker(rule_path: str, marker: str) -> bool:
+    """True when a CURATED rule file declares *marker* in its header.
+
+    Curated paths only (under ``engine/semgrep/rules``): dynamic
+    per-hypothesis tempfile rules and on-demand synthesized checkers
+    return False regardless of content — their author is the LLM, and
+    an author-controlled role declaration is either refutation
+    evasion (confirm-only) or an opt onto the attacker-shaped
+    decomp-tree surface (decomp-safe). Unreadable files return False
+    — only an explicit, well-formed header declaration activates a
+    role.
+    """
+    if not rule_path:
+        return False
+    try:
+        resolved = Path(rule_path).resolve()
+        if not resolved.is_relative_to(_CURATED_SEMGREP_RULES_DIR):
+            return False
+    except OSError:
+        return False
+    key = (str(resolved), marker)
+    cached = _RULE_MARKER_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        result = _parse_header_marker(
+            resolved.read_text(encoding="utf-8"),  # raw-open: RAPTOR-owned curated rule file, resolved above
+            marker,
+        )
+    except (OSError, UnicodeDecodeError):
+        result = False
+    _RULE_MARKER_CACHE[key] = result
+    return result
+
+
+def is_confirm_only_rule(rule_path: str) -> bool:
+    """True when a CURATED rule file declares the confirm-only marker
+    (see :func:`_curated_rule_has_marker` for the scoping rules)."""
+    return _curated_rule_has_marker(rule_path, _CONFIRM_ONLY_MARKER)
+
+
+def is_decomp_safe_rule(rule_path: str) -> bool:
+    """True when a CURATED rule file declares the decomp-safe marker
+    (see :func:`_curated_rule_has_marker` for the scoping rules)."""
+    return _curated_rule_has_marker(rule_path, _DECOMP_SAFE_MARKER)
+
+
+def decomp_safe_curated_rules() -> "list[Path]":
+    """Curated rules opted onto decomp-trees, sorted for determinism.
+
+    Walks the curated library once per call (54 small YAML files at
+    the time of writing; the per-(path, marker) memo makes repeat
+    calls header-read-free). Consumed by the decomp-tree sweep
+    alongside :func:`core.audit.binary_verification
+    .decompiler_rules_for_tree` — the dedicated decompiler corpus is
+    the seed; these are the explicit opt-ins.
+    """
+    if not _CURATED_SEMGREP_RULES_DIR.is_dir():
+        return []
+    out = []
+    for path in sorted(_CURATED_SEMGREP_RULES_DIR.rglob("*.yaml")):
+        if path.is_file() and is_decomp_safe_rule(str(path)):
+            out.append(path)
+    return out
 
 
 _IDENTIFIER_QUALIFIED_RE = None  # lazy import
@@ -124,13 +299,32 @@ class SarifCache:
 
         with self._counter_lock:
             self.hit_count += 1
+        # Deep copies, never the cache's own lists/dicts: many
+        # hypotheses share one ingested result set, so a consumer
+        # mutating its matches must not corrupt every other
+        # hypothesis's view (run_codeql_sweep's memo does the same).
         if not line_start:
-            return results
+            return copy.deepcopy(results)
 
         return [
-            r for r in results
+            copy.deepcopy(r) for r in results
             if _sarif_result_in_range(r, line_start, line_end)
         ]
+
+    def ingest(self, uri: str, result: dict[str, Any]) -> str | None:
+        """Insert one SARIF result under the normalized form of *uri*.
+
+        The supported write path for producers outside this module
+        (the CodeQL pre-sweep) — ``_by_file`` stays private to the
+        cache. Returns the normalized path the result was filed
+        under, or None when *uri* normalizes to nothing (the result
+        is not ingested).
+        """
+        normalized = _normalize_sarif_path(uri)
+        if not normalized:
+            return None
+        self._by_file.setdefault(normalized, []).append(result)
+        return normalized
 
     @classmethod
     def from_directory(cls, out_dir: Path) -> SarifCache:
@@ -291,11 +485,9 @@ def _load_checklist_hashes(run_dir: Path) -> dict[str, str]:
     Same shape understand_bridge gates on; empty when the run carries
     no checklist (plain /scan runs).
     """
-    path = run_dir / "checklist.json"
-    if not path.is_file():
-        return {}
-    checklist = load_json(path, max_bytes=_MAX_CHECKLIST_BYTES)
-    if not isinstance(checklist, dict):
+    from core.inventory import read_checklist
+    checklist = read_checklist(run_dir)
+    if not checklist:
         return {}
     out: dict[str, str] = {}
     for f in checklist.get("files", []):
@@ -448,8 +640,10 @@ def _normalize_sarif_path(uri_or_path: str) -> str:
     forward-slash-separated relative path so that lookup keys match
     insertion keys regardless of how the caller spells the path.
     """
-    p = uri_or_path
-    p = p.removeprefix("file://")
+    # Leading-scheme strip delegates to the shared helper; the
+    # absolute->relative collapse (lstrip) stays local — it is this
+    # key normalisation's own contract, not part of URI stripping.
+    p = strip_file_uri(uri_or_path)
     p = p.lstrip("/")
     p = p.removeprefix("./")
     return p.replace("\\", "/")
@@ -506,7 +700,7 @@ class SweepResult:
     tool: str
     file_path: str
     function_name: str
-    outcome: str  # confirmed | refuted | error | inconclusive
+    outcome: str  # confirmed | refuted | error | inconclusive | skipped
     matches: list[dict[str, Any]] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     rule_id: str | None = None
@@ -541,13 +735,53 @@ def _target_in_failed_files(
     """Whether the sweep's single target file is in semgrep's
     ``files_failed`` list (parsed from --json-output).
 
+    Entries are ``{"path", "reason"}`` dicts from the runner's
+    --json-output parse (string entries tolerated for injected
+    runners) — the same shape :func:`_fixture_in_failed_files` reads.
+    A ``str(entry)`` here compared the dict's repr against path
+    strings, so the parse-failure gate never fired for the standard
+    runner: a partially-parsed target (semgrep's PartialParsing warn
+    covers exactly the region a syntax error hides) still appeared in
+    ``paths.scanned`` and a zero-finding scan of it read as a
+    licensed refutation — planting a syntax error next to a finding
+    suppressed it.
+
     Semgrep may report the path as passed on the command line
     (absolute), or relative — compare both shapes.  ``files_examined``
-    being empty is deliberately NOT treated as failure: the JSON
-    sidecar is best-effort and absent in many injected-runner setups.
+    being empty is deliberately NOT treated as a tool error here: the
+    JSON sidecar is best-effort and absent in many injected-runner
+    setups.  The refutation gate handles that case separately — a
+    zero-finding scan without a positive scanned witness degrades to
+    "inconclusive" (see :func:`_target_in_examined_files`), never to
+    "refuted".
     """
     full_str = str(full_path)
     for entry in files_failed or []:
+        s = entry.get("path", "") if isinstance(entry, dict) else str(entry)
+        if not s:
+            continue
+        if s in (full_str, file_path) or s.endswith("/" + file_path):
+            return True
+    return False
+
+
+def _target_in_examined_files(
+    files_examined: Any,
+    full_path: Path,
+    file_path: str,
+) -> bool:
+    """Whether the sweep's single target file is in semgrep's
+    ``files_examined`` list (``paths.scanned`` from --json-output).
+
+    This is the POSITIVE witness that the target was actually
+    analysed: semgrep can silently SKIP a target (``paths.skipped`` —
+    surfaced in neither ``errors`` nor ``files_failed``), so
+    absence-of-failure alone proves nothing.  Same absolute/relative
+    shape comparison as :func:`_target_in_failed_files`; an
+    absent/empty sidecar simply yields False.
+    """
+    full_str = str(full_path)
+    for entry in files_examined or []:
         s = str(entry)
         if not s:
             continue
@@ -566,6 +800,7 @@ def run_semgrep_sweep(
     line_end: int = 0,
     hypothesis: str = "",
     rule_keyword: str = "",
+    language: str | None = None,
 ) -> SweepResult:
     """Run a semgrep rule against a single file and classify matches.
 
@@ -585,6 +820,19 @@ def run_semgrep_sweep(
             Enables the negative-control check — a rule that also matches
             the keyword's guarded fixture is a presence detector and is
             capped at "inconclusive".
+        language: The file's canonical language when the caller already
+            knows it (inventory-stamped; content-probed for extensions
+            no table maps). When the probe licenses a semgrep language
+            key for an unmapped extension AND the rule's own
+            ``languages:`` key names that language, the scan runs with
+            ``--scan-unknown-extensions`` — without it semgrep's
+            extension-based target selection silently SKIPS the file
+            (``paths.scanned`` stays empty) and the scanned-witness
+            gate capped every such sweep at inconclusive, so a
+            content-probed file could never earn a tool outcome in
+            either direction. Both language gates stay in force: a rule
+            that does not name the probed language keeps today's
+            behaviour, and mapped extensions never consult the hint.
 
     Returns:
         SweepResult with outcome and matches.
@@ -604,7 +852,12 @@ def run_semgrep_sweep(
         )
 
     try:
-        from packages.semgrep.runner import is_available, run_rule
+        # Aliased import: this module also calls the coccinelle
+        # runner's run_rule (different keyword surface), and the
+        # bare shared name made the kwargs miswiring gate unable to
+        # tell the callees apart.
+        from packages.semgrep.runner import is_available
+        from packages.semgrep.runner import run_rule as run_semgrep_rule
 
         if not is_available():
             return SweepResult(
@@ -615,7 +868,97 @@ def run_semgrep_sweep(
                 errors=["semgrep not installed"],
             )
 
-        result = run_rule(full_path, rule_config, timeout=120)
+        # Content-probed unknown extensions (see the ``language``
+        # docstring): the flag is emitted ONLY when the inventory
+        # probe and the rule's own ``languages:`` key agree, so a
+        # probed-c file is never scanned as php and unmapped targets
+        # without a probe keep today's silent skip (which the
+        # scanned-witness gate below converts to inconclusive).
+        # Mapped extensions never reach here — semgrep_probed_language
+        # refuses them, so ordinary targets run the identical command.
+        # NOTE: --scan-unknown-extensions is per-INVOCATION — every
+        # unknown-extension target in the invocation gets scanned as
+        # the rule's language. Safe today because the target set is
+        # [target] or [target, mapped-extension control fixture] and
+        # flag + fixture cannot co-occur (batching needs a rule
+        # keyword, whose fixtures all carry mapped extensions); a
+        # future caller adding unknown-extension extra_targets must
+        # re-audit this.
+        extra_args: list[str] | None = None
+        # Receipt-policy honesty for foreign-extension targets: when
+        # the inventory language is known but semgrep CANNOT witness
+        # the file (no language key for the probed language, or the
+        # rule's own languages: key does not name it), the inevitable
+        # no-witness inconclusive below must SAY so — a silent cap
+        # reads as a rule failure and hides that no executed receipt
+        # was ever possible on this target/rule pair.
+        capability_note: str | None = None
+        if language:
+            from .hypothesis_mapping import (
+                semgrep_extension_mapped,
+                semgrep_probed_language,
+            )
+
+            _probed = semgrep_probed_language(file_path, language)
+            if _probed and _rule_languages_include(rule_config, _probed):
+                extra_args = ["--scan-unknown-extensions"]
+            elif _probed:
+                capability_note = (
+                    f"rule languages do not include the probed "
+                    f"language '{_probed}' for foreign-extension "
+                    f"target {file_path} — regenerate the rule with "
+                    f"languages: [{_probed}] to earn an executed "
+                    "receipt"
+                )
+            elif not semgrep_extension_mapped(file_path):
+                capability_note = (
+                    "engine capability absent: semgrep has no "
+                    f"language key for inventory language "
+                    f"'{language}' (content-probed foreign "
+                    "extension) — no executed receipt is possible "
+                    "in either direction"
+                )
+
+        # When a dynamic rule will need its negative control anyway,
+        # fold the control fixture into the SAME invocation as an
+        # extra target (one semgrep process instead of two) and split
+        # the findings back per file afterwards. Any wrinkle — batch
+        # failure, missing attribution, fixture parse failure — falls
+        # back to a target-only scan plus the separate-process control
+        # path, so the confirm/refute logic always sees exactly the
+        # unbatched inputs.
+        batch: tuple[Path, tuple, list[Any], list[Any]] | None = None
+        batched_fixture, batched_cache_key = _negative_control_batch_plan(
+            rule_keyword, file_path, full_path,
+        )
+        if batched_fixture is not None:
+            result = run_semgrep_rule(
+                full_path, rule_config, timeout=120,
+                extra_targets=[batched_fixture],
+                extra_args=extra_args,
+            )
+            split = None
+            if not result.errors and getattr(result, "returncode", 0) in (0, 1):
+                split = _split_batched_control_findings(
+                    result.findings, batched_fixture,
+                )
+            if split is not None and batched_cache_key is not None:
+                batch = (batched_fixture, batched_cache_key, *split)
+            else:
+                # A batch-level failure could be the fixture leg's
+                # fault, and a finding without file attribution could
+                # move between the target verdict and the control
+                # verdict — an unbatched target scan has neither
+                # problem. Retry target-only before classifying.
+                result = run_semgrep_rule(
+                    full_path, rule_config, timeout=120,
+                    extra_args=extra_args,
+                )
+        else:
+            result = run_semgrep_rule(
+                full_path, rule_config, timeout=120,
+                extra_args=extra_args,
+            )
 
         # Tool failure is never a refutation. The runner populates
         # ``errors`` for not-installed / sandbox-refusal / timeout /
@@ -655,8 +998,31 @@ def run_semgrep_sweep(
                 rule_id=rule_config,
             )
 
+        target_findings = result.findings
+        if batch is not None:
+            fixture, control_key, target_findings, control_findings = batch
+            if _fixture_in_examined_files(
+                getattr(result, "files_examined", None), fixture,
+            ) and not _fixture_in_failed_files(
+                getattr(result, "files_failed", None), fixture,
+            ):
+                # The fixture leg verifiably ran — bank its verdict so
+                # the negative-control check below (and the expanded
+                # second pass) reads it from the cache instead of
+                # spawning the separate control process. The positive
+                # scanned-witness gate matters: semgrep can silently
+                # SKIP a target (paths.skipped — surfaced in neither
+                # ``errors`` nor ``files_failed``), and banking False
+                # from a scan that never examined the fixture would
+                # permanently disarm the presence-detector cap for the
+                # keyword (the control cache is process-lifetime).
+                # Anything short of a scanned witness banks nothing:
+                # the separate-process control path stays
+                # authoritative, exactly as unbatched.
+                _negative_control_cache[control_key] = bool(control_findings)
+
         in_function = []
-        for finding in result.findings:
+        for finding in target_findings:
             if hasattr(finding, "line"):
                 finding_line = finding.line
             elif isinstance(finding, dict):
@@ -670,6 +1036,7 @@ def run_semgrep_sweep(
                 in_function.append(finding)
 
         capped_reason: str | None = None
+        witness_cov: Coverage | None = None
         if in_function and hypothesis:
             named = _hypothesis_identifiers(hypothesis)
             if named:
@@ -685,16 +1052,22 @@ def run_semgrep_sweep(
                         + ", ".join(sorted(named)[:5]) + ")"
                     )
 
-        if (
-            in_function and capped_reason is None and rule_keyword
-            and _rule_matches_negative_control(
+        control_error = False
+        if in_function and capped_reason is None and rule_keyword:
+            _ctl = _rule_matches_negative_control(
                 rule_config, rule_keyword, file_path,
             )
-        ):
-            capped_reason = (
-                f"presence detector: rule for {rule_keyword!r} also "
-                "matches the guarded negative-control fixture"
-            )
+            if _ctl is None:
+                # Control run failed — proceed uncapped for THIS
+                # dispatch, but stamp the result so the sweep memo
+                # never pins it (nothing was banked; a re-dispatch
+                # must re-run the control and get its chance to cap).
+                control_error = True
+            elif _ctl:
+                capped_reason = (
+                    f"presence detector: rule for {rule_keyword!r} also "
+                    "matches the guarded negative-control fixture"
+                )
 
         if capped_reason:
             logger.info(
@@ -706,10 +1079,62 @@ def run_semgrep_sweep(
             outcome = "confirmed"
         else:
             # Tool failures (errors / bad returncode / target file in
-            # files_failed) already returned "error" above — a
-            # no-match from a scan that actually analysed the file is
-            # a genuine refutation.
-            outcome = "refuted"
+            # files_failed) already returned "error" above — but a
+            # no-match only refutes when the scan verifiably analysed
+            # the target.  Semgrep can silently SKIP a target
+            # (paths.skipped — surfaced in neither ``errors`` nor
+            # ``files_failed``), so refutation requires the same
+            # positive scanned witness the batched control leg
+            # demands before banking its verdict: the target must
+            # appear in ``files_examined`` (paths.scanned).  Without
+            # that witness — target skipped, or the best-effort
+            # sidecar absent entirely (injected runners) — zero
+            # findings say nothing about the code: degrade to
+            # inconclusive, never refuted.
+            _examined = getattr(result, "files_examined", None)
+            if _target_in_examined_files(_examined, full_path, file_path):
+                outcome = "refuted"
+                # The pre-existing scanned witness, re-expressed as a
+                # substrate receipt (vocabulary only — the decision
+                # above is unchanged): licensed refutations carry the
+                # evidence that the tool verifiably analysed the file.
+                witness_cov = Coverage(
+                    covered=True,
+                    tier="scanned-witness",
+                    reason=(
+                        "semgrep: target present in files_examined "
+                        "(paths.scanned)"
+                    ),
+                )
+            else:
+                if capability_note:
+                    # The dispatch-time capability analysis names the
+                    # real cause of the missing witness — record it
+                    # instead of the generic skip message.
+                    capped_reason = capability_note
+                elif _examined:
+                    capped_reason = (
+                        f"no scanned-target witness: {file_path} missing "
+                        "from semgrep's files_examined (paths.scanned) — "
+                        "a silently skipped scan cannot refute"
+                    )
+                else:
+                    capped_reason = (
+                        "no scanned-target witness: semgrep's "
+                        "files_examined sidecar is absent/empty — an "
+                        "unwitnessed zero-finding scan cannot refute"
+                    )
+                logger.info(
+                    "semgrep sweep capped at inconclusive for %s:%s — %s",
+                    file_path, function_name, capped_reason,
+                )
+                outcome = "inconclusive"
+                witness_cov = Coverage(
+                    covered=None,
+                    tier="scanned-witness",
+                    reason=capped_reason,
+                    unknown_policy=UNKNOWN_INCONCLUSIVE,
+                )
 
         if outcome == "refuted":
             # Second pass over the fidelity-3 expanded view: pattern
@@ -731,6 +1156,43 @@ def run_semgrep_sweep(
             )
             if expanded is not None:
                 return expanded
+            if is_confirm_only_rule(rule_config):
+                # Confirm-only rules adjudicate a sub-shape NARROWER
+                # than the class they dispatch for, so a scanned
+                # zero-match answers "not this sub-shape", never "not
+                # this class" — booking refuted here would let every
+                # documented FN mode of such a rule discard real bugs
+                # through the tool-refutes-then-drop doctrine. Both
+                # directions weighed at this site: mapping silence to
+                # inconclusive forfeits mechanical refutations from
+                # these rules (more human review on the correct-code
+                # direction) in exchange for never converting a shape
+                # miss into a class refutation. Rules whose claim
+                # spans their whole dispatched class omit the marker
+                # and keep the scanned-witness refutation above.
+                # (Placed after the expanded second pass so the
+                # macro-view rescue still runs first — an
+                # inconclusive lead for marked rules, a CONFIRM
+                # rescue only for unmarked ones, which return before
+                # reaching this branch.)
+                capped_reason = (
+                    "confirm-only rule: a scanned zero-match answers "
+                    "only the rule's sub-shape, not the dispatched "
+                    "class — silence stays inconclusive (dark), "
+                    "never refuted"
+                )
+                logger.info(
+                    "semgrep sweep capped at inconclusive for %s:%s "
+                    "— %s",
+                    file_path, function_name, capped_reason,
+                )
+                outcome = "inconclusive"
+                witness_cov = Coverage(
+                    covered=None,
+                    tier="scanned-witness",
+                    reason=capped_reason,
+                    unknown_policy=UNKNOWN_INCONCLUSIVE,
+                )
         serialized = []
         for f in in_function:
             if hasattr(f, "to_dict"):
@@ -741,6 +1203,17 @@ def run_semgrep_sweep(
                 serialized.append({"line": getattr(f, "line", 0),
                                    "rule_id": getattr(f, "rule_id", ""),
                                    "message": getattr(f, "message", "")})
+        details: dict[str, Any] | None = None
+        if capped_reason:
+            details = {"reason": capped_reason}
+        if control_error:
+            details = details or {}
+            details["negative_control_error"] = True
+        if witness_cov is not None:
+            # Receipt only — the witness decision above is unchanged;
+            # consumers tolerate extra detail keys by contract.
+            details = details or {}
+            details["substrate"] = witness_cov.as_receipt()
         return SweepResult(
             tool="semgrep",
             file_path=file_path,
@@ -749,7 +1222,7 @@ def run_semgrep_sweep(
             matches=serialized,
             rule_id=rule_config,
             errors=result.errors,
-            details={"reason": capped_reason} if capped_reason else None,
+            details=details,
         )
     except Exception as exc:  # noqa: BLE001
         return SweepResult(
@@ -806,12 +1279,14 @@ def _expanded_second_pass(
 
         if not is_c_family(file_path):
             return None
-        try:
-            source = full_path.read_text(errors="replace")
-        except OSError:
+        from core.source import read_text_capped
+
+        got = read_text_capped(full_path)
+        if got is None:
             return None
+        source = got[0]
         if line_start and line_end:
-            lines = source.split("\n")
+            lines = source.split("\n")  # line-model: read_text_capped universal-newline read above
             segment = "\n".join(lines[max(0, line_start - 1):line_end])
         else:
             segment = source
@@ -852,27 +1327,61 @@ def _expanded_second_pass(
                         + ", ".join(sorted(named)[:5]) + ")"
                     )
 
-        if (
-            matches and capped_reason is None and rule_keyword
-            and _rule_matches_negative_control(
+        control_error = False
+        if matches and capped_reason is None and rule_keyword:
+            _ctl = _rule_matches_negative_control(
                 rule_config, rule_keyword, file_path,
             )
-        ):
-            capped_reason = (
-                f"presence detector: rule for {rule_keyword!r} also "
-                "matches the guarded negative-control fixture"
-            )
+            if _ctl is None:
+                # Same contract as the plain pass: uncapped for this
+                # dispatch, stamped so the sweep memo refuses to pin.
+                control_error = True
+            elif _ctl:
+                capped_reason = (
+                    f"presence detector: rule for {rule_keyword!r} also "
+                    "matches the guarded negative-control fixture"
+                )
 
         details: dict[str, Any] = {
             "expanded_view": True,
             "dropped_out_of_file": exp.dropped_out_of_file,
         }
+        if control_error:
+            details["negative_control_error"] = True
         if capped_reason:
             details["reason"] = capped_reason
             logger.info(
                 "expanded semgrep sweep capped at inconclusive for "
                 "%s:%s — %s",
                 file_path, function_name, capped_reason,
+            )
+            outcome = "inconclusive"
+        elif is_confirm_only_rule(rule_config):
+            # Confirm-only rules must not CONFIRM from the expanded
+            # view: fidelity-3 preprocessing rewrites the libc guard
+            # idioms their exclusions anchor on (glibc strpbrk/strchr
+            # become _Generic(...) selections), so pattern-not-inside
+            # clauses structurally stop binding while the positive
+            # sink pattern still matches — CORRECT code reads as a
+            # match here. Both directions weighed at this site:
+            # capping forfeits promotion-grade macro-hidden-sink
+            # confirms for marked rules (the match survives below as
+            # an inconclusive LEAD with its evidence attached), in
+            # exchange for never minting a promotion-grade
+            # ``:expanded`` receipt from a view where the rule's
+            # exclusions are unsound. Unmarked rules keep the
+            # expanded confirm exactly as before.
+            details["reason"] = (
+                "confirm-only rule: expanded-view match kept as a "
+                "lead, not a confirmation — preprocessing rewrites "
+                "the guard idioms this rule's exclusions anchor on, "
+                "so they cannot bind in this view"
+            )
+            logger.info(
+                "expanded semgrep sweep capped at inconclusive for "
+                "%s:%s — confirm-only rule (exclusions unsound in "
+                "the expanded view)",
+                file_path, function_name,
             )
             outcome = "inconclusive"
         else:
@@ -975,6 +1484,56 @@ def negative_control_fixture(keyword: str, file_path: str) -> Path | None:
     return None
 
 
+# Rule files are small YAML; a bounded read keeps a hostile/corrupt
+# path from ballooning the sweep.
+_RULE_LANGS_MAX_BYTES = 256 * 1024
+
+
+def _rule_languages_include(rule_config: str, lang: str) -> bool:
+    """Whether any rule in the file declares *lang* in ``languages:``.
+
+    The second half of the double language gate for content-probed
+    targets: ``--scan-unknown-extensions`` makes semgrep scan an
+    unmapped explicit target with the RULE's languages, so the flag
+    may only be emitted when the rule actually names the probed
+    language. Real YAML parse of the rule structure — a textual scan
+    for ``languages:`` also matched the phrase inside block-scalar
+    bodies (a ``message: |`` quoting it), wrongly licensing the flag.
+    Registry pack identifiers, unreadable files, and YAML that does
+    not parse all yield False — fail closed to today's behaviour (no
+    flag, target skipped, witness gate caps at inconclusive) rather
+    than scanning a file as a language nothing vouched for.
+    """
+    try:
+        path = Path(rule_config)
+        if not path.is_file():
+            return False
+        with path.open(encoding="utf-8", errors="replace") as fh:  # raw-open: RAPTOR-owned rule config (shipped pack or run-dir generated)
+            text = fh.read(_RULE_LANGS_MAX_BYTES)
+    except OSError:
+        return False
+    try:
+        import yaml
+        data = yaml.safe_load(text)
+    except Exception:  # noqa: BLE001 — unparseable rule: fail closed
+        return False
+    if not isinstance(data, dict):
+        return False
+    rules = data.get("rules")
+    if not isinstance(rules, list):
+        return False
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        langs = rule.get("languages")
+        if isinstance(langs, list) and any(
+            isinstance(entry, str) and entry.strip().lower() == lang
+            for entry in langs
+        ):
+            return True
+    return False
+
+
 def _relanguage_rule_config(
     rule_config: str, rule_lang: str, fixture_lang: str,
 ) -> str | None:
@@ -992,7 +1551,7 @@ def _relanguage_rule_config(
         path = Path(rule_config)
         if not path.is_file():
             return None
-        text = path.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8")  # raw-open: RAPTOR-owned generated rule in the run dir
     except OSError:
         return None
     needle = f"languages: [{rule_lang}]"
@@ -1008,14 +1567,123 @@ def _relanguage_rule_config(
         return fh.name
 
 
+def _negative_control_batch_plan(
+    rule_keyword: str, file_path: str, full_path: Path,
+) -> tuple[Path | None, tuple | None]:
+    """Whether the keyword's negative-control fixture can ride along
+    as an extra TARGET of the main semgrep invocation.
+
+    Batching folds the control scan into the target scan (one process
+    instead of two) with per-file attribution of the findings.
+    Returns ``(fixture, cache_key)`` when batchable, ``(None, None)``
+    otherwise. Batchable requires:
+
+    * a dynamic rule keyword with an on-disk fixture,
+    * no cached control verdict for the key yet,
+    * the emitted rule's language selects the fixture AS-IS — a
+      language mismatch needs the re-languaged rule copy and stays a
+      separate control process,
+    * distinct basenames — findings are attributed per file by
+      basename, so a collision would be ambiguous.
+    """
+    if not rule_keyword:
+        return None, None
+    fixture = negative_control_fixture(rule_keyword, file_path)
+    if fixture is None:
+        return None, None
+    from .hypothesis_mapping import semgrep_language_for
+
+    rule_lang = semgrep_language_for(file_path)
+    cache_key = (rule_keyword, rule_lang, fixture.suffix)
+    if cache_key in _negative_control_cache:
+        return None, None
+    fixture_lang = semgrep_language_for(str(fixture))
+    if rule_lang != "generic" and fixture_lang != rule_lang:
+        return None, None
+    if fixture.name == full_path.name:
+        return None, None
+    return fixture, cache_key
+
+
+def _split_batched_control_findings(
+    findings: list[Any], fixture: Path,
+) -> tuple[list[Any], list[Any]] | None:
+    """Split a batched scan's findings into (target, control) by file.
+
+    Basenames were pre-checked distinct, so basename equality with the
+    fixture is unambiguous. Returns None when any finding carries no
+    usable file attribution — the caller must then discard the batched
+    attempt (an unattributable finding could silently move between the
+    target verdict and the control verdict).
+    """
+    target_findings: list[Any] = []
+    control_findings: list[Any] = []
+    for finding in findings:
+        if hasattr(finding, "file"):
+            fpath = str(finding.file or "")
+        elif isinstance(finding, dict):
+            fpath = str(finding.get("file", "") or "")
+        else:
+            fpath = ""
+        if not fpath:
+            return None
+        if os.path.basename(fpath) == fixture.name:
+            control_findings.append(finding)
+        else:
+            target_findings.append(finding)
+    return target_findings, control_findings
+
+
+def _fixture_in_examined_files(files_examined: Any, fixture: Path) -> bool:
+    """Whether the control fixture is in semgrep's ``files_examined``.
+
+    Entries are path strings parsed from --json-output's
+    ``paths.scanned``. This is the POSITIVE witness that the batched
+    control leg actually ran: a target semgrep silently skipped lands
+    in ``paths.skipped`` — surfaced in neither ``errors`` nor
+    ``files_failed`` — so absence-of-failure alone proves nothing.
+    An absent/empty sidecar (injected runners) simply yields False and
+    the caller falls back to the separate-process control run.
+    """
+    target = str(fixture)
+    for entry in files_examined or []:
+        p = str(entry)
+        if p and (p == target or p.endswith("/" + fixture.name)):
+            return True
+    return False
+
+
+def _fixture_in_failed_files(files_failed: Any, fixture: Path) -> bool:
+    """Whether the control fixture is in semgrep's ``files_failed``.
+
+    Entries are ``{"path", "reason"}`` dicts from the runner's
+    --json-output parse (string entries tolerated for injected
+    runners). A failed fixture parse means the control leg scanned
+    nothing — its empty findings must not be banked as a verdict.
+    """
+    target = str(fixture)
+    for entry in files_failed or []:
+        p = entry.get("path", "") if isinstance(entry, dict) else str(entry)
+        if p and (p == target or p.endswith("/" + fixture.name)):
+            return True
+    return False
+
+
 def _rule_matches_negative_control(
     rule_config: str, keyword: str, file_path: str,
-) -> bool:
+) -> bool | None:
     """Run *rule_config* against the keyword's guarded fixture.
 
     True means the rule fires on safe code — it is a presence detector.
-    Errors return False: a broken control run must not fabricate
-    inconclusive outcomes for rules that behaved on the real target.
+    False means the control ran (or is deterministically inapplicable:
+    no fixture for the keyword, un-relanguageable rule) and did not
+    fire. None means the control RUN itself failed (semgrep missing,
+    timeout, crash): a broken control must not fabricate inconclusive
+    outcomes for rules that behaved on the real target, so the caller
+    proceeds uncapped — but it must also mark the result so the
+    per-run sweep memo refuses to pin the uncapped verdict (see
+    ``SweepMemo.put``): nothing was banked, and the next dispatch must
+    re-run the control and get its chance to cap.
     """
     fixture = negative_control_fixture(keyword, file_path)
     if fixture is None:
@@ -1059,7 +1727,7 @@ def _rule_matches_negative_control(
 
         result = run_rule(fixture, control_config, timeout=60)
     except Exception:  # noqa: BLE001
-        return False
+        return None
     finally:
         if relanged is not None:
             with contextlib.suppress(OSError):
@@ -1071,7 +1739,7 @@ def _rule_matches_negative_control(
         # rejected, timeout): its empty findings say nothing about
         # the rule. Do NOT cache matched=False — that permanently
         # disarmed the presence-detector cap for this keyword.
-        return False
+        return None
     matched = bool(result.findings)
     _negative_control_cache[cache_key] = matched
     return matched
@@ -1103,7 +1771,10 @@ def _hypothesis_identifiers(hypothesis: str) -> frozenset:
     ))
     idents.update(re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", hypothesis))
     idents.update(re.findall(r"(?:->|\.)([A-Za-z_][A-Za-z0-9_]*)", hypothesis))
-    idents.update(re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\s*->", hypothesis))
+    # \b pins the scan to word starts: unanchored, every position
+    # inside one hostile word re-scans the word's remainder —
+    # quadratic. A mid-word start was a false token anyway.
+    idents.update(re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*->", hypothesis))
     for tok in _IDENT_RE.findall(hypothesis):
         if "_" in tok or any(c.isdigit() for c in tok):
             idents.add(tok)
@@ -1125,10 +1796,12 @@ def _filter_identifier_consistent(
     """
     import re
 
-    try:
-        file_lines = full_path.read_text(errors="replace").splitlines()
-    except OSError:
+    from core.source import read_text_capped
+
+    got = read_text_capped(full_path)
+    if got is None:
         return []
+    file_lines = got[0].splitlines()
 
     patterns = [
         re.compile(r"\b" + re.escape(ident) + r"\b")
@@ -1145,38 +1818,56 @@ def _filter_identifier_consistent(
     return consistent
 
 
-def run_coccinelle_sweep(
+def run_coccinelle_file_sweep(
     *,
     target_path: Path,
     file_path: str,
-    function_name: str,
     cocci_rule: str,
     defines: dict[str, str] | None = None,
-    line_start: int | None = None,
-    line_end: int | None = None,
     domain_vocab: Any = None,
+    language: str | None = None,
+    rendered_rule: str | None = None,
 ) -> SweepResult:
-    """Run a Coccinelle rule against a single C file.
+    """Run a Coccinelle rule against a single C file — FILE scope.
+
+    spatch always scans the whole file, so this is the natural memo
+    unit: the result depends only on (rule content, file content,
+    defines), never on which function the caller is auditing. Per-function
+    range filtering and confirmed/refuted classification happen in
+    :func:`scope_coccinelle_result` AFTER any memo retrieval, so one
+    spatch invocation serves every function in the file.
 
     Args:
         target_path: Root of the target codebase.
         file_path: Relative path to the C source file.
-        function_name: Function being audited.
-        cocci_rule: Path to the .cocci rule file.
+        cocci_rule: Path to the .cocci rule file. Always recorded as
+            ``rule_id`` — never a rendered tempfile path, which would
+            poison a memoized result with a path that stops existing.
+        language: Canonical language of the file when the caller
+            already knows it (inventory-stamped); None detects it via
+            the canonical machinery. Non-C-family files yield
+            ``outcome="skipped"`` — spatch parses every input as C
+            and exits 0 with zero matches on foreign source, so its
+            silence there is not evidence.
         defines: Optional spatch -D defines (e.g. {"func": "parse_input"}).
-        line_start: Restricts matches to the audited function's span;
-            matches outside it are dropped. When ``line_end`` is
-            missing, a ``line_start + 50`` window applies (same
-            fallback as the semgrep leg). Falsy ``line_start``
-            disables the filter (whole-file rules).
-        line_end: Upper bound of the match-filter range; see
-            ``line_start``.
+            Defines steer what the rule matches, so they are part of
+            the sweep's result identity: a caller memoizing this sweep
+            must carry a defines dimension in its memo key before
+            passing any defines through the memoized path.
         domain_vocab: DomainVocabulary used to render vocabulary
             placeholders in the rule to a tempfile before running;
             when None the rule file is run as-is.
+        rendered_rule: Path to an ALREADY vocab-rendered rule file.
+            When set it is run instead of ``cocci_rule`` and
+            ``domain_vocab`` is not consulted; the caller owns the
+            tempfile's lifecycle (it is not unlinked here). Lets the
+            orchestrator render once, hash the rendered bytes for the
+            memo key, and skip a second render inside the sweep.
 
     Returns:
-        SweepResult with outcome and matches.
+        SweepResult with the FULL unfiltered match set;
+        ``outcome="confirmed"`` iff any match anywhere in the file.
+        ``function_name`` is ``""`` (file scope).
     """
     escape = _check_path_containment(target_path, file_path, "coccinelle")
     if escape:
@@ -1187,9 +1878,29 @@ def run_coccinelle_sweep(
         return SweepResult(
             tool="coccinelle",
             file_path=file_path,
-            function_name=function_name,
+            function_name="",
             outcome="error",
             errors=[f"file not found: {full_path}"],
+        )
+
+    # Substrate license (in-sweep, belt-and-braces behind the
+    # dispatcher's pre-dispatch gate so EVERY caller crosses one
+    # chokepoint): a provably non-C file is refused before spatch
+    # spawns — the channel did not look.
+    cov = file_substrate_coverage(
+        "coccinelle",
+        target_path=target_path,
+        file_path=file_path,
+        language=language,
+    )
+    if cov is not None and cov.covered is False:
+        return SweepResult(
+            tool="coccinelle",
+            file_path=file_path,
+            function_name="",
+            outcome="skipped",
+            rule_id=cocci_rule,
+            details={"reason": cov.reason, "substrate": cov.as_receipt()},
         )
 
     try:
@@ -1199,14 +1910,16 @@ def run_coccinelle_sweep(
             return SweepResult(
                 tool="coccinelle",
                 file_path=file_path,
-                function_name=function_name,
+                function_name="",
                 outcome="error",
                 errors=["coccinelle (spatch) not installed"],
             )
 
         effective_rule = cocci_rule
         _rendered_tmp = None
-        if domain_vocab is not None:
+        if rendered_rule is not None:
+            effective_rule = rendered_rule
+        elif domain_vocab is not None:
             # Rendering reads the rule file and writes a tempfile: IO
             # and text-decode errors are the legitimate failure set.
             with contextlib.suppress(OSError, ValueError):
@@ -1217,8 +1930,8 @@ def run_coccinelle_sweep(
 
         try:
             result = run_rule(
-                full_path,
-                effective_rule,
+                Path(full_path),
+                Path(effective_rule),
                 defines=defines or {},
                 timeout=120,
                 # In-repo engine/coccinelle rules via cwe_dispatch
@@ -1240,7 +1953,7 @@ def run_coccinelle_sweep(
             return SweepResult(
                 tool="coccinelle",
                 file_path=file_path,
-                function_name=function_name,
+                function_name="",
                 outcome="error",
                 errors=spatch_errors
                 or [f"spatch exited with code {returncode}"],
@@ -1254,26 +1967,11 @@ def run_coccinelle_sweep(
             else:
                 matches.append({"raw": str(f)})
 
-        if line_start:
-            # Apply the range filter whenever the caller placed the
-            # function at all — requiring BOTH bounds let a match
-            # anywhere in the file confirm a per-function hypothesis
-            # when production passed line_end=None (the exact
-            # wrong-function bug the semgrep leg fixed). Without a
-            # real end bound, fall back to the same +50 window the
-            # semgrep call sites use.
-            effective_end = line_end if line_end else line_start + 50
-            matches = [
-                m for m in matches
-                if _match_in_range(m, line_start, effective_end)
-            ]
-
-        outcome = "confirmed" if matches else "refuted"
         return SweepResult(
             tool="coccinelle",
             file_path=file_path,
-            function_name=function_name,
-            outcome=outcome,
+            function_name="",
+            outcome="confirmed" if matches else "refuted",
             matches=matches,
             rule_id=cocci_rule,
         )
@@ -1281,10 +1979,139 @@ def run_coccinelle_sweep(
         return SweepResult(
             tool="coccinelle",
             file_path=file_path,
-            function_name=function_name,
+            function_name="",
             outcome="error",
             errors=[str(exc)],
         )
+
+
+def scope_coccinelle_result(
+    file_result: SweepResult,
+    *,
+    target_path: Path,
+    function_name: str,
+    line_start: int | None = None,
+    line_end: int | None = None,
+    language: str | None = None,
+) -> SweepResult:
+    """Narrow a file-scoped Coccinelle result to one function.
+
+    Works on a deep copy so a memoized ``file_result`` can be scoped
+    to any number of functions without cross-contamination.
+
+    Args:
+        file_result: Output of :func:`run_coccinelle_file_sweep`
+            (possibly replayed from the sweep memo).
+        target_path: Root of the target codebase (substrate-receipt
+            recompute).
+        function_name: Function being audited — stamped on the
+            returned result.
+        line_start: Restricts matches to the audited function's span;
+            matches outside it are dropped. When ``line_end`` is
+            missing, a ``line_start + 50`` window applies (same
+            fallback as the semgrep leg). Falsy ``line_start``
+            disables the filter (whole-file rules).
+        line_end: Upper bound of the match-filter range; see
+            ``line_start``.
+        language: Canonical language hint for the substrate-receipt
+            recompute; None detects it via the canonical machinery.
+
+    Returns:
+        SweepResult with the function-scoped match set and
+        confirmed/refuted re-derived from it. Non-match outcomes
+        (error / skipped / inconclusive / novel) pass through with
+        only ``function_name`` stamped.
+    """
+    scoped = copy.deepcopy(file_result)
+    scoped.function_name = function_name
+    if scoped.outcome not in ("confirmed", "refuted"):
+        # error / skipped payloads (reasons, substrate receipts) are
+        # function-independent — nothing else to narrow.
+        return scoped
+
+    matches = scoped.matches
+    if line_start:
+        # Apply the range filter whenever the caller placed the
+        # function at all — requiring BOTH bounds let a match
+        # anywhere in the file confirm a per-function hypothesis
+        # when production passed line_end=None (the exact
+        # wrong-function bug the semgrep leg fixed). Without a
+        # real end bound, fall back to the same +50 window the
+        # semgrep call sites use.
+        effective_end = line_end if line_end else line_start + 50
+        matches = [
+            m for m in matches
+            if _match_in_range(m, line_start, effective_end)
+        ]
+    scoped.matches = matches
+    scoped.outcome = "confirmed" if matches else "refuted"
+
+    # Recompute the substrate license instead of carrying it in the
+    # file result: file_substrate_coverage is deterministic and
+    # process-cached, and the file runner already crossed the gate
+    # (covered=False never reaches this branch), so this is a cheap
+    # cache hit — not a second detection pass.
+    try:
+        cov = file_substrate_coverage(
+            "coccinelle",
+            target_path=target_path,
+            file_path=scoped.file_path,
+            language=language,
+        )
+    except Exception:  # noqa: BLE001 — receipt is best-effort here
+        cov = None
+    if cov is not None:
+        # Licensed refutations carry their substrate receipt;
+        # unknown-language coverage fails open by tier policy.
+        return license_refutation(scoped, cov)
+    return scoped
+
+
+def run_coccinelle_sweep(
+    *,
+    target_path: Path,
+    file_path: str,
+    function_name: str,
+    cocci_rule: str,
+    defines: dict[str, str] | None = None,
+    line_start: int | None = None,
+    line_end: int | None = None,
+    domain_vocab: Any = None,
+    language: str | None = None,
+) -> SweepResult:
+    """Run a Coccinelle rule against a single C file, function-scoped.
+
+    Composition of :func:`run_coccinelle_file_sweep` and
+    :func:`scope_coccinelle_result` — same signature and result
+    semantics as the historical single-function sweep. Callers that
+    audit many functions per file should memoize the file sweep and
+    scope per function instead (the orchestrator's coccinelle leg
+    does).
+
+    See the two component functions for argument semantics.
+    """
+    escape = _check_path_containment(target_path, file_path, "coccinelle")
+    if escape:
+        # Containment errors historically carry function_name="" —
+        # return before the scoper would stamp the function on them.
+        return escape
+
+    file_result = run_coccinelle_file_sweep(
+        target_path=target_path,
+        file_path=file_path,
+        cocci_rule=cocci_rule,
+        defines=defines,
+        domain_vocab=domain_vocab,
+        language=language,
+    )
+    return scope_coccinelle_result(
+        file_result,
+        target_path=target_path,
+        function_name=function_name,
+        line_start=line_start,
+        line_end=line_end,
+        language=language,
+    )
 
 
 # SMT verb names → libexec shim basenames. Only verbs with an actual
@@ -1299,6 +2126,7 @@ _SMT_VERBS = {
     "check-null-deref": "raptor-smt-check-null-deref",
     "check-overflow-to-oob": "raptor-smt-check-overflow-to-oob",
     "check-negative-bypass": "raptor-smt-check-negative-bypass",
+    "check-encoding-residual": "raptor-smt-check-encoding-residual",
     "validate-path": "raptor-smt-validate-path",
 }
 
@@ -1350,6 +2178,18 @@ _SMT_VERB_ROLES = {
     "check-early-release": "detection",
     "check-lock-domain": "detection",
     "check-toctou": "detection",
+    # Detection by construction: z3 models exactly the byte-survival
+    # predicate it is asked, but the premises (the emitter's transfer
+    # description) are an LLM/orchestrator extraction the verb never
+    # verifies against the source — a fired probe corroborates and
+    # seeds, it does not convict alone. NOT in VACUOUS_SMT_VERBS: the
+    # intrinsic is fully constrained by the supplied escaped/dropped/
+    # passed sets, so SAT is meaningful without guard premises. The
+    # ``:witness`` suffix must never be stamped for this verb — its
+    # model is a byte satisfying the SUPPLIED description, not a
+    # source-discriminating witness (is_detection_rule_id withholds
+    # the :witness escape accordingly).
+    "check-encoding-residual": "detection",
 }
 
 
@@ -1388,15 +2228,20 @@ def is_detection_rule_id(stamp: str) -> bool:
     A ``:witness`` suffix records a concrete solver model and keeps the
     stamp's receipt; verbs the table does not name keep their current
     grading (the firewall only demotes what the channel has explicitly
-    classified as detection-role).
+    classified as detection-role). Exception: check-encoding-residual
+    — its solver model ranges over premises (the transfer description)
+    the verb never verifies against the source, so a concrete model
+    does NOT discriminate and the ``:witness`` escape is withheld.
     """
     part = stamp.split(":", 1)[1] if ":" in stamp else stamp
     if part.startswith("symbolic-") or stamp.startswith("symbolic"):
         return part == "symbolic-reach"
 
-    if ":" not in stamp or stamp.endswith(":witness"):
+    if ":" not in stamp:
         return False
     verb = stamp.split(":", 2)[1]
+    if stamp.endswith(":witness"):
+        return verb == "check-encoding-residual"
     return _SMT_VERB_ROLES.get(verb) == "detection"
 
 
@@ -1421,6 +2266,15 @@ VACUOUS_SMT_VERBS = frozenset({
     "check-overflow", "check-oob", "check-overflow-to-oob",
 })
 
+# smt_args keys whose shim contract is ONE JSON-array argument rather
+# than a repeated flag (``check-encoding-residual --forbidden``).
+# Repeating such a flag would hand argparse only the last element —
+# silently narrowing the set toward refutation. Keys stay listed here
+# per-flag: defaulting ALL lists to JSON arrays would break the
+# repeated ``--guard`` / ``--operand`` contract every other shim
+# documents.
+_SMT_JSON_ARRAY_ARGS = frozenset({"forbidden"})
+
 
 def is_vacuous_smt_verb(verb: str) -> bool:
     """True when *verb* (bare or ``smt:``-prefixed) is in the vacuous set."""
@@ -1441,9 +2295,13 @@ def run_smt_sweep(
         file_path: Source file being audited (for logging).
         function_name: Function being audited.
         verb: SMT verb name (e.g. "check-overflow", "validate-path").
-        smt_args: Dict of CLI args for the verb (keys become --key flags,
-            values become their arguments). List values are serialised
-            as JSON.
+        smt_args: Dict of CLI args for the verb (keys become --key
+            flags, values become their arguments). List values repeat
+            the flag once per item (the ``--guard`` / ``--operand``
+            shim contract), EXCEPT keys in
+            :data:`_SMT_JSON_ARRAY_ARGS`, which pass one JSON-array
+            argument. Dict values pass as one JSON object;
+            ``conditions`` is positional (see below).
 
     Returns:
         SweepResult with outcome ``confirmed`` (sat — the condition is
@@ -1521,8 +2379,11 @@ def run_smt_sweep(
             if value:
                 cmd.append(flag)
         elif isinstance(value, list):
-            for item in value:
-                cmd.extend([flag, str(item)])
+            if key in _SMT_JSON_ARRAY_ARGS:
+                cmd.extend([flag, _json.dumps(value)])
+            else:
+                for item in value:
+                    cmd.extend([flag, str(item)])
         elif isinstance(value, dict):
             cmd.extend([flag, _json.dumps(value)])
         else:
@@ -1538,9 +2399,21 @@ def run_smt_sweep(
             from core.config import RaptorConfig
             safe_env = RaptorConfig.get_safe_env()
         except ImportError:
-            safe_env = dict(os.environ)
-            for var in ("TERMINAL", "EDITOR", "VISUAL", "BROWSER", "PAGER"):
-                safe_env.pop(var, None)
+            # Fail closed: without the allowlist sanitiser the only
+            # safe environment is none at all — a pass-through of
+            # os.environ minus a short blocklist contradicts the
+            # SAFE_ENV_ALLOWLIST doctrine. Unreachable in-repo
+            # (core.config always ships beside this module).
+            return SweepResult(
+                tool="smt",
+                file_path=file_path,
+                function_name=function_name,
+                outcome="error",
+                errors=[
+                    "core.config unavailable; refusing to spawn the "
+                    "SMT shim with an unsanitised environment",
+                ],
+            )
 
         proc = subprocess.run(
             cmd,
@@ -2145,7 +3018,10 @@ def _extract_negative_bypass_operands(
     value = m.group(1) if m else None
 
     m = re.search(
-        r"(?:bypass|exceed|circumvent)\w*\s+(?:the\s+)?[`'\"]?(\w+)[`'\"]?\s+(?:check|limit|bound)",
+        # Keyword \w run bounded: unbounded, every keyword planted
+        # inside one hostile word re-scans the word's remainder —
+        # quadratic on hypothesis text.
+        r"(?:bypass|exceed|circumvent)\w{0,64}\s+(?:the\s+)?[`'\"]?(\w+)[`'\"]?\s+(?:check|limit|bound)",
         hyp,
     )
     if m:
@@ -2175,14 +3051,89 @@ def _lang_has_overflow_safety(file_path: str) -> bool:
     return Path(file_path).suffix in _OVERFLOW_SAFE_EXTS
 
 
+_STRIP_TOKEN_RE = _re.compile(r"//|/\*|[\"']")
+
+
+def _string_close_index(source: str, body: int,
+                        cache: dict[int, int], quote: str) -> int:
+    """Index of the unescaped *quote* closing a literal whose body
+    starts at *body*, or -1.  The walk (escape pairs consume two
+    chars) is deterministic per position, so results are memoized:
+    without the cache a run of escaped quotes with no closer makes
+    every later opener re-walk the same tail — quadratic in the
+    source length."""
+    path: list[int] = []
+    i = body
+    n = len(source)
+    close = -1
+    while i < n:
+        hit = cache.get(i)
+        if hit is not None:
+            close = hit
+            break
+        path.append(i)
+        ch = source[i]
+        if ch == "\\":
+            i += 2
+        elif ch == quote:
+            close = i
+            break
+        else:
+            i += 1
+    for pos in path:
+        cache[pos] = close
+    return close
+
+
 def _strip_comments_and_strings(source: str) -> str:
     """Blank out comments and string literals so lexical scans don't
-    match prose that merely mentions code."""
-    import re
-    return re.sub(
-        r'//[^\n]*|/\*.*?\*/|"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'',
-        " ", source, flags=re.DOTALL,
-    )
+    match prose that merely mentions code.
+
+    Single left-to-right token scan with memoized literal walks —
+    match-identical to the alternation sub it replaces
+    (``//…`` to end of line, lazy ``/*…*/``, escape-aware quoted
+    literals; an unterminated opener is not a token and scanning
+    resumes right after it), without that sub's quadratic re-walks
+    on hostile escaped-quote or unclosed-comment storms."""
+    out: list[str] = []
+    pos = 0
+    no_block_closer = False
+    close_cache: dict[str, dict[int, int]] = {'"': {}, "'": {}}
+    while True:
+        m = _STRIP_TOKEN_RE.search(source, pos)
+        if m is None:
+            out.append(source[pos:])
+            return "".join(out)
+        out.append(source[pos:m.start()])
+        token = m.group()
+        if token == "//":
+            end = source.find("\n", m.end())
+            out.append(" ")
+            pos = end if end != -1 else len(source)
+        elif token == "/*":
+            end = -1 if no_block_closer else source.find("*/", m.end())
+            if end == -1:
+                # Never closes: not a comment token (and no later
+                # opener can close either).  Keep the chars, resume
+                # after them.
+                no_block_closer = True
+                out.append(token)
+                pos = m.end()
+            else:
+                out.append(" ")
+                pos = end + 2
+        else:  # '"' or "'"
+            close = _string_close_index(
+                source, m.end(), close_cache[token], token,
+            )
+            if close == -1:
+                # Unterminated: not a literal — the scan resumes at
+                # the next char (a later token may still match).
+                out.append(token)
+                pos = m.end()
+            else:
+                out.append(" ")
+                pos = close + 1
 
 
 def _operand_in_source_arithmetic(operand: str, source: str) -> bool:
@@ -2254,6 +3205,21 @@ def _premise_gate(premises: list[str], profile: str) -> str | None:
     inconclusive-reason string.  The premise-vacuity check matters
     because contradictory premises would drive the *full* query UNSAT
     and masquerade as an authoritative "refuted".
+
+    ``profile`` is deliberately the SAME single profile the verb's
+    main query uses, even though the extracted premises' true
+    signedness is a guess — the gate models the premises exactly as
+    the main query will consume them. Both directions of the
+    trade-off: relaxing the gate to the dual-signedness check
+    (``profile=None``) would pass premises that are contradictory
+    under the main query's profile, and the main query's resulting
+    UNSAT maps to an authoritative "refuted" — the exact masquerade
+    this gate exists to block. Keeping the pin means premises whose
+    real signedness differs from the verb's modeling frame degrade to
+    "vacuous premises" → inconclusive: lost coverage, never a wrong
+    verdict. Widening safely requires dual-profiling the verb layer
+    itself (gate + main query agreeing under both profiles), a design
+    change, not a gate tweak.
     """
     if not premises:
         return (
@@ -2317,7 +3283,9 @@ def _extract_arith_operator(hypothesis: str) -> str:
 def _extract_ptr_operand(hypothesis: str) -> str | None:
     """Extract pointer name from hypothesis like 'NULL pointer dereference of ptr'."""
     import re
-    m = re.search(r"[`'\"]?(\w+)[`'\"]?\s+(?:is\s+)?(?:null|NULL)", hypothesis)
+    # (?<!\w) pins the scan to word starts (mid-word starts were
+    # false tokens; unanchored they cost quadratic on hostile text).
+    m = re.search(r"(?<!\w)[`'\"]?(\w+)[`'\"]?\s+(?:is\s+)?(?:null|NULL)", hypothesis)
     if m and _IDENT_RE.fullmatch(m.group(1)):
         return m.group(1)
     m = re.search(r"(?:null|NULL)\s+(?:pointer\s+)?(?:dereference\s+)?(?:of\s+)?[`'\"]?(\w+)[`'\"]?", hypothesis)
@@ -2360,7 +3328,8 @@ def _extract_oob_operands(
 ) -> tuple:
     """Extract (index, size) from hypothesis about out-of-bounds access."""
     import re
-    m = re.search(r"[`'\"]?(\w+)[`'\"]?\s+(?:is\s+)?(?:used\s+)?(?:as\s+)?(?:an?\s+)?(?:array\s+)?index", hypothesis.lower())
+    # (?<!\w) pin — same rationale as _extract_ptr_operand.
+    m = re.search(r"(?<!\w)[`'\"]?(\w+)[`'\"]?\s+(?:is\s+)?(?:used\s+)?(?:as\s+)?(?:an?\s+)?(?:array\s+)?index", hypothesis.lower())
     index = m.group(1) if m and _IDENT_RE.fullmatch(m.group(1)) else None
 
     m = re.search(r"(?:array|buffer)\s+(?:of\s+)?(?:size\s+)?[`'\"]?(\w+)[`'\"]?", hypothesis.lower())
@@ -2439,18 +3408,227 @@ def _extract_path_conditions(
     quoted conditions or simple relational expressions.
     """
     import re
-    backtick_conds = re.findall(r"`([^`]*[<>=!]+[^`]*)`", hypothesis)
+    # The condition body is spelled prefix-without-operators, ONE
+    # operator char, then the greedy rest ([^`<>=!]*[<>=!][^`]*): the
+    # naive [^`]*[<>=!]+[^`]* overlaps all three repeats on the
+    # operator chars, and an unterminated quote followed by an
+    # operator run makes the engine try every split of the run
+    # between them — cubic in the hypothesis length. Match set
+    # unchanged: any between-quote span with at least one operator
+    # char, captured whole, in both spellings.
+    backtick_conds = re.findall(r"`([^`<>=!]*[<>=!][^`]*)`", hypothesis)
     if backtick_conds:
         return backtick_conds
 
-    quoted_conds = re.findall(r'"([^"]*[<>=!]+[^"]*)"', hypothesis)
+    quoted_conds = re.findall(r'"([^"<>=!]*[<>=!][^"]*)"', hypothesis)
     if quoted_conds:
         return quoted_conds
 
+    # \b pin — same rationale as the identifier scans above.
     relational = re.findall(
-        r"(\w+\s*(?:[<>=!]=?|!=)\s*\w+)", hypothesis,
+        r"\b(\w+\s*(?:[<>=!]=?|!=)\s*\w+)", hypothesis,
     )
     return relational or []
+
+
+# Whole-database CodeQL results are identical for every hypothesis
+# sharing the same (database, query) pair — the analyze invocation has
+# no notion of the audited function; per-hypothesis filtering happens
+# on the parsed SARIF. Memoize the parsed whole-DB result set so N
+# hypotheses on one DB pay for one CLI/JVM boot per query, not N.
+#
+# Size trade-off: smaller → repeated multi-minute ``database analyze``
+# runs come back as soon as an audit rotates through more (db, query)
+# pairs than fit; larger → more whole-DB result lists (potentially
+# many MB each on alert-dense targets) held for the memo's lifetime.
+# The floor is set by the warm-up (:func:`warm_codeql_memo`): a
+# multi-database run pre-fills one entry per (db, dispatchable query),
+# and the CWE dispatch menu spans ~27 query IDs across three language
+# packs — a 16-entry cap evicted warm-up entries before their
+# per-hypothesis lookups arrived, re-buying the analyze the warm-up
+# already paid for. 40 = the full menu plus ad-hoc per-run headroom.
+# Memory shape under warm-up: each database's pass parks its ENTIRE
+# per-rule slice set in the memo at once, so a multi-DB run holds
+# every database's slices simultaneously (bounded by this cap times
+# the largest whole-DB result list).
+#
+# Lifetime: the orchestrator passes a per-RUN memo owned by its
+# OrchestratorConfig (``codeql_memo``, default_factory — exactly like
+# ``sweep_memo``), because the key's correctness argument is
+# run-scoped: the manifest stamp pins the database build, but nothing
+# hashes the DB's row data, and only the run's read-only-target-tree
+# contract bounds it. The module-level instance below serves direct
+# callers and tests only; a process outliving one run must not reuse
+# it across runs, which the orchestrator wiring guarantees for the
+# audit path.
+_CODEQL_MEMO_MAX_ENTRIES = 40
+_codeql_memo: BoundedMemo[list[dict[str, Any]]] = BoundedMemo(
+    _CODEQL_MEMO_MAX_ENTRIES,
+)
+
+
+def _reset_codeql_memo() -> None:
+    """Test hook: forget memoized whole-database CodeQL results."""
+    _codeql_memo.clear()
+
+
+# Loud-failure channel state. Per-dispatch CodeQL errors are recorded
+# on the SweepResult and surfaced by the orchestrator at DEBUG — the
+# right level for a one-off query fault, but a host-posture problem
+# (sandbox refusal, broken CLI install) errors EVERY dispatch and a
+# debug-only trail loses the whole CodeQL tier with nothing an
+# operator would ever see. These emit one WARNING per process: the
+# warm-up's on its first failure, the dispatch path's on a sandbox
+# setup refusal (host posture — systematic by nature) or once the
+# consecutive-error streak reaches the threshold below. Not
+# per-hypothesis noise in either direction: streaks reset on any
+# successful dispatch, and both flags fire at most once.
+_CODEQL_ERROR_STREAK_WARN = 3
+_codeql_channel_guard = threading.Lock()
+_codeql_channel_warned = False
+_codeql_warmup_warned = False
+_codeql_error_streak = 0
+
+
+def _reset_codeql_channel_state() -> None:
+    """Test hook: re-arm the once-per-process channel warnings."""
+    global _codeql_channel_warned, _codeql_warmup_warned
+    global _codeql_error_streak
+    with _codeql_channel_guard:
+        _codeql_channel_warned = False
+        _codeql_warmup_warned = False
+        _codeql_error_streak = 0
+
+
+def _warn_codeql_channel_down(context: str, cause: str) -> None:
+    """One WARNING per process when the dispatch path fails systemically."""
+    global _codeql_channel_warned
+    with _codeql_channel_guard:
+        if _codeql_channel_warned:
+            return
+        _codeql_channel_warned = True
+    logger.warning(
+        "codeql dispatch failing systematically (%s): %s — every "
+        "hypothesis routed at CodeQL records a tool error until the "
+        "cause is fixed (per-dispatch detail stays at DEBUG)",
+        context, cause,
+    )
+
+
+def _warn_codeql_warmup_failed(cause: str) -> None:
+    """One WARNING per process when the whole-run warm-up fails."""
+    global _codeql_warmup_warned
+    with _codeql_channel_guard:
+        if _codeql_warmup_warned:
+            return
+        _codeql_warmup_warned = True
+    logger.warning(
+        "codeql warm-up analyze failed (%s) — memo stays cold, "
+        "per-hypothesis dispatches each pay a full analyze; if the "
+        "cause is host posture (sandbox refusal, CLI fault) they "
+        "will error the same way",
+        cause,
+    )
+
+
+def _note_codeql_dispatch_error(cause: str) -> None:
+    """Count a dispatch error toward the systematic-failure warning."""
+    global _codeql_error_streak
+    with _codeql_channel_guard:
+        _codeql_error_streak += 1
+        streak = _codeql_error_streak
+    if streak >= _CODEQL_ERROR_STREAK_WARN:
+        _warn_codeql_channel_down(
+            f"{streak} consecutive dispatch errors", cause,
+        )
+
+
+def _note_codeql_dispatch_ok() -> None:
+    """A served result (fresh or memoized) proves the channel works."""
+    global _codeql_error_streak
+    with _codeql_channel_guard:
+        _codeql_error_streak = 0
+
+
+class _UnreadableSarifError(Exception):
+    """Analyze produced SARIF the bounded loader refused (oversize /
+    unparseable). Carried out of the memoized compute so the caller
+    can keep the historical error SweepResult shape."""
+
+
+def _codeql_db_stamp(db_path: Path) -> tuple | None:
+    """Cheap content stamp for a CodeQL database directory.
+
+    ``codeql-database.yml`` at the DB root carries the creation
+    metadata (source root, baseline, creation time) and is rewritten
+    when the database is re-created — its content hash plus stat is a
+    reliable, cheap change witness. Databases without a readable
+    manifest return None and the caller skips memoization entirely:
+    the directory's own mtime is NOT an acceptable fallback (it only
+    changes on direct-child churn, so an in-place re-extraction that
+    rewrites nested files would serve stale cached results).
+    """
+    import hashlib
+
+    manifest = db_path / "codeql-database.yml"
+    try:
+        st = manifest.stat()
+        digest = hashlib.sha256(manifest.read_bytes()).hexdigest()  # raw-open: CodeQL pack manifest (RAPTOR-owned), hashed for the memo key
+    except OSError:
+        return None
+    return ("manifest", st.st_size, st.st_mtime_ns, digest)
+
+
+def _codeql_query_stamp(query_path: Path) -> tuple | None:
+    """Content hash of the query file, or None when unreadable."""
+    import hashlib
+
+    try:
+        return ("sha256", hashlib.sha256(query_path.read_bytes()).hexdigest())  # raw-open: CodeQL query file (RAPTOR-owned), hashed for the memo key
+    except OSError:
+        return None
+
+
+# codeql's IMB disk cache takes an EXCLUSIVE lock on the database:
+# two concurrent ``database analyze`` invocations against one DB fail
+# hard (OverlappingFileLockException, exit 2). Every in-process
+# analyze — the sweep's per-query path and the warm-up's whole-run
+# pass — must serialize per database, or a mid-loop dispatch that
+# misses the memo while the warm-up holds the DB turns into a tool
+# ERROR (losing the CodeQL channel exactly when the warm-up runs).
+# Per-process only: cross-process collisions are outside this run's
+# control, as before.
+_codeql_db_locks: dict[str, threading.Lock] = {}
+_codeql_db_locks_guard = threading.Lock()
+
+
+def _codeql_db_lock_for(db_path: str | Path) -> threading.Lock:
+    """The per-database analyze mutex (process-wide, keyed by resolved
+    path so every spelling of one DB shares a lock)."""
+    key = str(Path(db_path).resolve())
+    with _codeql_db_locks_guard:
+        return _codeql_db_locks.setdefault(key, threading.Lock())
+
+
+def _codeql_memo_key(db: Path, qpath: Path) -> tuple | None:
+    """Whole-DB memo key for one (database, query) pair, or None.
+
+    Single constructor shared by :func:`run_codeql_sweep` (lookup) and
+    :func:`warm_codeql_memo` (pre-fill) — the warm-up only pays off if
+    both sides build byte-identical keys. Either side unreadable →
+    None → the caller runs uncached.
+    """
+    db_stamp = _codeql_db_stamp(db)
+    query_stamp = _codeql_query_stamp(qpath)
+    if db_stamp is None or query_stamp is None:
+        return None
+    return (
+        "codeql",
+        str(db.resolve()),
+        db_stamp,
+        str(qpath.resolve()),
+        query_stamp,
+    )
 
 
 def run_codeql_sweep(
@@ -2462,6 +3640,7 @@ def run_codeql_sweep(
     database_path: str | None = None,
     line_start: int = 0,
     line_end: int = 0,
+    memo: BoundedMemo[list[dict[str, Any]]] | None = None,
 ) -> SweepResult:
     """Run a CodeQL query against a database and classify matches.
 
@@ -2470,10 +3649,16 @@ def run_codeql_sweep(
         file_path: Relative path to the source file being audited.
         function_name: Function being audited.
         query_path: Path to the .ql query file.
-        database_path: Path to the CodeQL database. If None, attempts
-            to find one under ``target_path``.
+        database_path: Path to the CodeQL database. Required in
+            practice: None returns an error outcome (in-target DB
+            auto-discovery was removed — a database committed inside
+            the scanned repo is untrusted).
         line_start: Function start line (for match filtering).
         line_end: Function end line.
+        memo: Whole-DB result memo. The orchestrator passes its run's
+            ``config.codeql_memo`` so cached results live exactly one
+            run; None falls back to the module-level instance (direct
+            callers, tests via ``_reset_codeql_memo``).
 
     Returns:
         SweepResult with outcome based on whether any matches fall
@@ -2494,55 +3679,190 @@ def run_codeql_sweep(
 
         db = database_path
         if not db:
-            for candidate in (
-                target_path / "codeql-db",
-                target_path / ".codeql" / "db",
-                target_path / "codeql-database",
-            ):
-                if candidate.is_dir():
-                    db = str(candidate)
-                    break
-
-        if not db:
-            return SweepResult(
-                tool="codeql",
-                file_path=file_path,
-                function_name=function_name,
-                outcome="error",
-                errors=["no CodeQL database found; build one first"],
+            # No in-target auto-discovery: a database committed inside
+            # the scanned repo (target/codeql-db etc.) has untrusted
+            # provenance — a hostile tree can plant a crafted or empty
+            # DB that steers every sweep verdict toward refuted or
+            # confirmed. Callers must pass a database they provisioned
+            # themselves (the orchestrator always does).
+            logger.warning(
+                "codeql sweep: no database_path given — in-target DB "
+                "auto-discovery (codeql-db/.codeql/db/codeql-database "
+                "under the target) is disabled because a repo-committed "
+                "database is untrusted; provision a database and pass "
+                "it explicitly",
             )
-
-        import tempfile
-
-        with tempfile.TemporaryDirectory(prefix="codeql-sweep-") as tmp:
-            sarif_out = Path(tmp) / "sweep.sarif"
-            result = analyze(
-                Path(db),
-                [str(qpath)],
-                sarif_out,
-                timeout_seconds=300,
-            )
-            # Canonical bounded SARIF loader (100 MiB cap): the query
-            # runs over an untrusted target, so a hostile source tree
-            # can inflate the result set — a raw read_text()+loads
-            # here buffered the whole artifact before any size check.
-            from core.sarif.parser import load_sarif
-            sarif = load_sarif(result.sarif_path)
-
-        if sarif is None:
             return SweepResult(
                 tool="codeql",
                 file_path=file_path,
                 function_name=function_name,
                 outcome="error",
                 errors=[
-                    f"unreadable or oversize SARIF output: {sarif_out}",
+                    "no CodeQL database provided; in-target "
+                    "auto-discovery is disabled (untrusted provenance) "
+                    "— build one and pass database_path",
+                ],
+            )
+
+        # Source-archive membership gate: a file the extractor never
+        # ingested (a computed include the buildless extraction could
+        # not follow, an orphan fragment no extracted TU pulls in)
+        # cannot appear in ANY result row, so zero rows from this
+        # database say nothing about the hypothesis — classifying
+        # them as refuted turned "the channel could not look" into
+        # refutation-grade silence, and the vacuous whole-DB analyze
+        # still burned its full run first. The gate sits HERE at the
+        # sweep layer, not in the orchestrator leg, so every dispatch
+        # path (chain legs, replay, direct callers) crosses one
+        # chokepoint. Unknown membership (no src.zip, unreadable or
+        # bomb-shaped archive) fails OPEN to the historic behaviour
+        # with a debug line — an unreadable archive must not kill the
+        # channel for every file; the price is that vacuous
+        # refutations survive in that degraded case. Side benefit:
+        # SweepMemo.put refuses to store error outcomes, so a
+        # mismatched (db, query) pair re-runs a full analyze on every
+        # dispatch — skipping before analyze removes most of those
+        # dispatches.
+        from .codeql_dbs import db_contains_source
+        _membership = db_contains_source(db, file_path)
+        # The membership decision, re-expressed as a substrate receipt
+        # (vocabulary only — every branch's outcome is unchanged):
+        # skipped and refuted results carry the evidence the verdict
+        # rests on into details/journal/memo.
+        if _membership is None:
+            logger.debug(
+                "codeql sweep: source membership unknown for %s in %s "
+                "— proceeding (fail-open)", file_path, db,
+            )
+            _member_cov = Coverage(
+                covered=None,
+                tier="db-membership",
+                reason=(
+                    "codeql: source-archive membership unknown (no "
+                    "readable src.zip) — refutation weight kept "
+                    "(fail-open)"
+                ),
+            )
+        elif _membership is False:
+            _member_cov = Coverage(
+                covered=False,
+                tier="db-membership",
+                reason="file not in this database",
+            )
+            return SweepResult(
+                tool="codeql",
+                file_path=file_path,
+                function_name=function_name,
+                outcome="skipped",
+                rule_id=query_path,
+                details={
+                    "reason": "file not in this database",
+                    "substrate": _member_cov.as_receipt(),
+                },
+            )
+        else:
+            _member_cov = Coverage(
+                covered=True,
+                tier="db-membership",
+                reason=(
+                    "codeql: file present in the database's source "
+                    "archive"
+                ),
+            )
+
+        def _analyze_whole_db() -> list[dict[str, Any]]:
+            import tempfile
+
+            with _codeql_db_lock_for(db):
+                # The warm-up may have pre-filled this key while we
+                # waited for the DB (its analyze holds the exclusive
+                # IMB lock). touch=False: get_or_compute re-stores
+                # this return as its own (identical) value and books
+                # the miss — a touching peek would double-count the
+                # same serve as hit AND miss.
+                _waited_value, _found = _memo.peek(memo_key, touch=False)
+                if _found:
+                    return _waited_value  # type: ignore[return-value]
+                # Absolute CLI path resolved in the CALLER environment
+                # (the sandbox's env scrub drops home-rooted PATH
+                # entries, so a bare "codeql" from a home install is
+                # unresolvable inside it). When the CLI is missing,
+                # nothing can execute on either path — the bare
+                # analyze() below raises FileNotFoundError exactly as
+                # the sandboxed lane would, so no enforcement is lost.
+                import shutil
+
+                _cli = shutil.which("codeql")
+                with tempfile.TemporaryDirectory(
+                    prefix="codeql-sweep-",
+                ) as tmp:
+                    sarif_out = Path(tmp) / "sweep.sarif"
+                    if _cli:
+                        codeql_cli = os.path.realpath(_cli)
+                        result = analyze(
+                            Path(db),
+                            [str(qpath)],
+                            sarif_out,
+                            codeql_bin=codeql_cli,
+                            timeout_seconds=300,
+                            runner=_sandboxed_codeql_runner(
+                                [str(Path(codeql_cli).parent)],
+                                database_dir=Path(db),
+                                query_paths=[str(qpath)],
+                                scratch_dir=Path(tmp),
+                                caller_label="audit-codeql-sweep",
+                            ),
+                            extra_args=_codeql_cache_args(Path(db)),
+                        )
+                    else:
+                        result = analyze(
+                            Path(db),
+                            [str(qpath)],
+                            sarif_out,
+                            timeout_seconds=300,
+                        )
+                    return _load_whole_db_results(result, sarif_out)
+
+        def _load_whole_db_results(
+            result, sarif_out: Path,
+        ) -> list[dict[str, Any]]:
+            # Canonical bounded SARIF loader (100 MiB cap): the
+            # query runs over an untrusted target, so a hostile
+            # source tree can inflate the result set — a raw
+            # read_text()+loads here buffered the whole artifact
+            # before any size check.
+            from core.sarif.parser import load_sarif
+            sarif = load_sarif(result.sarif_path)
+            if sarif is None:
+                raise _UnreadableSarifError(str(sarif_out))
+            runs = sarif.get("runs") or [{}]
+            return runs[0].get("results") or []
+
+        # Memo key embeds content stamps for BOTH sides; either side
+        # unreadable → key None → analyze runs uncached. The forced
+        # ``--rerun`` / ``--model-packs`` measurement legs
+        # (run_baseline_and_augmented) call analyze() directly and
+        # never pass through this sweep-layer memo.
+        memo_key = _codeql_memo_key(Path(db), qpath)
+
+        _memo = memo if memo is not None else _codeql_memo
+        try:
+            sarif_results, _memo_hit = _memo.get_or_compute(
+                memo_key, _analyze_whole_db,
+            )
+        except _UnreadableSarifError as exc:
+            return SweepResult(
+                tool="codeql",
+                file_path=file_path,
+                function_name=function_name,
+                outcome="error",
+                errors=[
+                    f"unreadable or oversize SARIF output: {exc}",
                 ],
                 rule_id=query_path,
             )
+        _note_codeql_dispatch_ok()
 
-        runs = sarif.get("runs") or [{}]
-        sarif_results = runs[0].get("results") or []
         in_function = []
         for r in sarif_results:
             locs = r.get("locations") or [{}]
@@ -2559,6 +3879,67 @@ def run_codeql_sweep(
                 else:
                     in_function.append(r)
 
+        # The memo shares one whole-DB result list across callers —
+        # hand out copies so a consumer mutating its matches cannot
+        # corrupt another hypothesis's view.
+        in_function = [copy.deepcopy(r) for r in in_function]
+
+        if not in_function:
+            # Refutation needs a POSITIVE extraction witness, the
+            # same rule the semgrep leg's files_examined check
+            # enforces: a file that never entered the database
+            # (buildless C/C++ extraction is partial by design; a
+            # traced build only covers what the build command
+            # compiled) yields zero rows for EVERY query —
+            # indistinguishable from clean. The membership pre-gate
+            # above already SKIPS provably-absent files before the
+            # analyze; this arm closes the pre-gate's declared
+            # fail-open price: with NO readable source archive the
+            # dispatch rightly proceeds (confirmations must still
+            # land), but the unwitnessed zero-row result may not
+            # claim refutation-grade silence — degrade to
+            # inconclusive, mirroring the semgrep leg's
+            # absent-sidecar arm. Same membership primitive as the
+            # pre-gate (one src.zip reader, one cache, one URI-match
+            # rule), so the two gates can never disagree on what
+            # "present" means.
+            extracted = db_contains_source(db, file_path)
+            if extracted is not True:
+                if extracted is False:
+                    # Only reachable when the archive changed between
+                    # the pre-gate and here — kept for direct-caller
+                    # robustness.
+                    capped_reason = (
+                        f"no extraction witness: {file_path} absent "
+                        "from the CodeQL database source archive — an "
+                        "unextracted file yields zero rows for every "
+                        "query; a silently skipped extraction cannot "
+                        "refute"
+                    )
+                else:
+                    capped_reason = (
+                        "no extraction witness: the CodeQL database "
+                        "has no readable source archive — an "
+                        "unwitnessed zero-row result cannot refute"
+                    )
+                logger.info(
+                    "codeql sweep capped at inconclusive for %s:%s — %s",
+                    file_path, function_name, capped_reason,
+                )
+                return SweepResult(
+                    tool="codeql",
+                    file_path=file_path,
+                    function_name=function_name,
+                    outcome="inconclusive",
+                    errors=[capped_reason],
+                    rule_id=query_path,
+                    # The capped verdict keeps the membership receipt:
+                    # the degraded evidence stays auditable in
+                    # details/journal/memo exactly like the refuted
+                    # lane it replaced.
+                    details={"substrate": _member_cov.as_receipt()},
+                )
+
         outcome = "confirmed" if in_function else "refuted"
         return SweepResult(
             tool="codeql",
@@ -2567,6 +3948,12 @@ def run_codeql_sweep(
             outcome=outcome,
             matches=in_function,
             rule_id=query_path,
+            # Refutations carry the membership receipt; a match is
+            # its own substrate proof and stays receipt-free.
+            details=(
+                {"substrate": _member_cov.as_receipt()}
+                if outcome == "refuted" else None
+            ),
         )
     except ImportError:
         return SweepResult(
@@ -2576,7 +3963,14 @@ def run_codeql_sweep(
             outcome="error",
             errors=["core.dataflow.codeql_augmented_run not available"],
         )
+    except _SandboxSetupError as exc:
+        # BaseException by design — never converted to a quiet error
+        # verdict. Host posture is systematic: warn once, keep the
+        # fail-closed propagation.
+        _warn_codeql_channel_down("sandbox setup refusal", str(exc))
+        raise
     except Exception as exc:  # noqa: BLE001
+        _note_codeql_dispatch_error(str(exc))
         return SweepResult(
             tool="codeql",
             file_path=file_path,
@@ -2586,12 +3980,377 @@ def run_codeql_sweep(
         )
 
 
+_CODEQL_QUERY_ID_RE = _re.compile(r"@id\s+(\S+)")
+
+
+def _codeql_query_id(qpath: Path) -> str | None:
+    """The query's declared ``@id`` (header metadata), or None.
+
+    SARIF results reference their producing query by rule ID, so a
+    query file without a parseable ``@id`` cannot have its slice of a
+    multi-query SARIF attributed back to it.
+    """
+    try:
+        text = qpath.read_text(encoding="utf-8", errors="replace")  # raw-open: CodeQL query file (RAPTOR-owned)
+    except OSError:
+        return None
+    m = _CODEQL_QUERY_ID_RE.search(text)
+    return m.group(1) if m else None
+
+
+# How many directory levels above the query's own directory the pack-
+# manifest search may climb. Real pack layouts keep the manifest close:
+# the deepest standard-library nesting (<pack>/Security/CWE/CWE-NNN/
+# query.ql) puts it 3 levels up, and repo-resident packs sit at 1-2.
+# Too low and a legitimately deep pack loses its manifest (the read
+# grant shrinks to the query dir and the analyze fails loudly under
+# confinement — see the out-of-bound warning below); too high and a
+# stray manifest far up the tree silently WIDENS the read grant to
+# that whole ancestor. 6 covers every observed layout with headroom.
+_PACK_MANIFEST_ASCENT_MAX = 6
+
+
+def _codeql_pack_root(query_path: Path) -> Path:
+    """Enclosing qlpack root for a resolved on-disk query file.
+
+    ``database analyze`` resolves a query THROUGH its pack: it reads
+    the enclosing ``qlpack.yml`` / ``codeql-pack.yml`` and the pack's
+    sibling files (compiled ``.qlx``, suite metadata), not just the
+    ``.ql`` itself, so the sandbox read grant must cover the pack
+    directory. Falls back to the query's own directory when no pack
+    manifest exists (a bare ``.ql`` compiles standalone).
+
+    The return value becomes a read grant, so the ascent is bounded
+    (``_PACK_MANIFEST_ASCENT_MAX``) and never accepts the user's home
+    directory or the filesystem root as a pack root — a manifest
+    planted there would otherwise convert this lookup into a
+    whole-tree read grant. A manifest that exists only beyond the
+    bound cannot be honoured; the analyze will fail under confinement,
+    so that shape is diagnosed with a loud warning rather than a
+    silent per-hypothesis error."""
+    parent = query_path.resolve().parent
+    home = Path.home()
+    candidates = (parent, *parent.parents)
+    for candidate in candidates[:_PACK_MANIFEST_ASCENT_MAX + 1]:
+        if candidate == home or candidate == candidate.parent:
+            break
+        if ((candidate / "qlpack.yml").is_file()
+                or (candidate / "codeql-pack.yml").is_file()):
+            return candidate
+    for candidate in candidates[_PACK_MANIFEST_ASCENT_MAX + 1:]:
+        if ((candidate / "qlpack.yml").is_file()
+                or (candidate / "codeql-pack.yml").is_file()):
+            logger.warning(
+                "codeql: pack manifest for %s sits at %s — outside "
+                "the bounded read grant this sweep confines the "
+                "analyze to. The query cannot resolve through its "
+                "pack under confinement; re-root the pack closer to "
+                "the query.",
+                query_path, candidate,
+            )
+            break
+    return parent
+
+
+def _codeql_cache_args(database_dir: Path) -> tuple[str, ...]:
+    """Extra ``database analyze`` args redirecting the compilation cache.
+
+    The durable pack trees (installed packs under the CLI's package
+    home, the repo's own packs) are READ-ONLY inside the sandbox — a
+    JVM compromised by hostile database bytes must not be able to
+    rewrite compiled-query caches that every future sweep would
+    execute. The CLI's default cache locations live in exactly those
+    trees, so they are disabled and the cache is redirected into the
+    database directory: already writable (the analyze holds its disk
+    cache and evaluation cache there), scoped to this database's
+    lifetime, and shared across the run's per-hypothesis dispatches
+    so each query compiles at most once per database."""
+    cache_dir = database_dir / "raptor-compile-cache"
+    try:
+        cache_dir.mkdir(exist_ok=True)
+    except OSError:
+        # The analyze itself needs a writable database dir (disk
+        # cache lock); if that premise fails the CLI will surface it.
+        pass
+    return (
+        f"--compilation-cache={cache_dir}",
+        "--no-default-compilation-cache",
+    )
+
+
+def _sandboxed_codeql_runner(
+    tool_paths: list[str],
+    *,
+    database_dir: Path,
+    query_paths: list[str],
+    scratch_dir: Path,
+    caller_label: str = "codeql-warmup",
+    sandbox_run: Callable[..., Any] | None = None,
+) -> Callable[..., Any]:
+    """Build a subprocess.run-shaped adapter routing a codeql
+    invocation through ``core.sandbox`` — network deny, safe env,
+    resource limits, namespace-supervised reaping, and filesystem
+    confinement. A bare ``subprocess.run`` would leave an
+    unsupervised JVM outside every deny/reap layer (orphaned for up
+    to its timeout at interpreter exit), and a sandbox run WITHOUT
+    ``target=``/``output=`` applies no filesystem confinement at all
+    — the JVM parses attacker-shaped bytes (the database is extracted
+    from the scanned repo) with the whole filesystem reachable.
+
+    Filesystem surface, enumerated to what ``database analyze``
+    genuinely touches. ``restrict_reads=True`` is what makes the read
+    side REAL on every lane: without it the Landlock tier leaves
+    reads host-wide and the substrate discards ``readable_paths``
+    outright — the grants below would be decorative.
+
+    * ``output=`` — ``scratch_dir``, the invocation's writable
+      scratch where the SARIF lands.
+    * ``writable_paths`` — the database dir only (analyze holds the
+      exclusive IMB disk-cache lock and writes evaluation cache
+      inside the db tree; the compilation cache is redirected there
+      too — see :func:`_codeql_cache_args`). The durable pack trees
+      are deliberately NOT writable: a JVM compromised by hostile
+      database bytes could otherwise poison compiled-query caches
+      that later sweeps execute.
+    * ``readable_paths`` — each query's enclosing pack root (pack
+      manifest, compiled-query siblings) plus the CLI's package home
+      (``~/.codeql``, read-only) when present, where installed
+      dependency packs (``codeql/cpp-all`` etc.) resolve from.
+    * ``tool_paths`` — the resolved codeql install dir (the bundled
+      standard packs under the distribution resolve through this
+      grant). ALSO load-bearing for name resolution: the sandbox's
+      child-env scrub drops home-rooted PATH entries, so a bare
+      ``codeql`` argv[0] from a home install resolves in the caller
+      environment but NOT inside the sandbox — setup refuses and the
+      caller degrades (the query_runner's ``_sandbox_tool_paths``
+      precedent).
+
+    ``sandbox_run`` pins the spawn callable: a caller whose adapter
+    will fire on a thread that outlives it (the whole-run warm-up)
+    resolves ``core.sandbox.run`` in its own context and passes it
+    here, so a process-wide patch of that seam installed later
+    cannot steer the spawn. Omitted, the adapter keeps call-time
+    resolution — right for same-thread callers, where the live
+    surface IS the caller's context."""
+    readable = {
+        str(_codeql_pack_root(Path(q))) for q in query_paths
+    }
+    codeql_home = Path.home() / ".codeql"
+    if codeql_home.is_dir():
+        readable.add(str(codeql_home))
+    readable_list = sorted(readable)
+    writable = [str(database_dir)]
+
+    def _runner(cmd: list[str], **kwargs: Any):
+        run_fn = sandbox_run
+        if run_fn is None:
+            from core.sandbox import run as run_fn
+
+        # The sandbox applies get_safe_env() itself; forwarding
+        # analyze()'s env would fight its sanitisation.
+        kwargs.pop("env", None)
+        assert run_fn is not None
+        return run_fn(
+            cmd, block_network=True, caller_label=caller_label,
+            tool_paths=tool_paths,
+            output=str(scratch_dir),
+            restrict_reads=True,
+            readable_paths=readable_list,
+            writable_paths=writable,
+            **kwargs,
+        )
+
+    return _runner
+
+
+def warm_codeql_memo(
+    database_path: str,
+    query_paths: list[str],
+    memo: BoundedMemo[list[dict[str, Any]]] | None = None,
+    *,
+    timeout_seconds: int = 600,
+    sandbox_run: Callable[..., Any] | None = None,
+) -> dict[str, int] | None:
+    """One whole-run ``database analyze`` pre-filling the per-query memo.
+
+    ``analyze()`` accepts a query list but the sweep path only ever
+    passes one — N dispatchable queries therefore pay N CLI/JVM boots
+    over the run. This runs them all in ONE invocation up front and
+    splits the combined SARIF per rule into the exact per-(db, query)
+    memo entries :func:`run_codeql_sweep` looks up, so mid-loop
+    dispatches hit instead of re-analyzing.
+
+    Safety rules (a wrong pre-filled entry would serve a wrong verdict):
+
+    * Keys are built by the same :func:`_codeql_memo_key` constructor
+      the lookup side uses; stamps are taken BEFORE the analyze so a
+      database rewritten mid-warm-up produces a dead key (lookup miss →
+      fresh compute), never a stale serve.
+    * Queries whose ``@id`` cannot be parsed (or that share an ``@id``
+      with another query — ambiguous attribution) are dropped from the
+      warm-up entirely.
+    * Results whose rule ID matches no included query ("orphans") make
+      every EMPTY slice untrustworthy — the orphan could belong to the
+      query whose slice would read as a clean refutation — so orphans
+      suppress empty-slice pre-fill; matched slices stay safe to store.
+    * Pre-fill goes through ``memo.get_or_compute``, so a mid-loop
+      dispatch that already computed (or is computing) a key wins and
+      the warm-up's slice is discarded — never a double-store.
+
+    Returns ``{"queries": n, "prefilled": k, "orphan_rules": m}`` or
+    None when nothing could be warmed. Best-effort by contract: the
+    caller runs this on a background thread and every failure must
+    degrade to the pre-existing per-query path.
+
+    ``sandbox_run`` is the launcher's submit-time pin of
+    ``core.sandbox.run``, threaded to the sandboxed runner so the
+    background thread's spawns cannot be steered by a later
+    process-wide patch of that seam (see
+    :func:`_sandboxed_codeql_runner`); omitted, the runner keeps
+    call-time resolution.
+    """
+    from core.dataflow.codeql_augmented_run import analyze
+
+    db = Path(database_path)
+    entries: list[tuple[Path, tuple, str]] = []  # (qpath, key, rule_id)
+    ids_seen: dict[str, int] = {}
+    for raw in query_paths:
+        qpath = Path(raw)
+        if not qpath.is_file():
+            continue
+        key = _codeql_memo_key(db, qpath)
+        rule_id = _codeql_query_id(qpath)
+        if key is None or rule_id is None:
+            continue
+        ids_seen[rule_id] = ids_seen.get(rule_id, 0) + 1
+        entries.append((qpath, key, rule_id))
+    entries = [e for e in entries if ids_seen[e[2]] == 1]
+    if not entries:
+        return None
+
+    _memo = memo if memo is not None else _codeql_memo
+    if all(
+        _memo.peek(key, touch=False)[1] for _q, key, _rid in entries
+    ):
+        # Every menu slice is already memoized (resumed segment,
+        # second warm-up call) — a whole-DB analyze would buy nothing.
+        return {
+            "queries": len(entries), "prefilled": 0, "orphan_rules": 0,
+            "skipped_memoized": True,
+        }
+
+    # Absolute CLI path, resolved in the CALLER environment: inside
+    # the sandbox the scrubbed child env has no home-rooted PATH
+    # entries, so a bare "codeql" from the standard home install is
+    # unresolvable there and sandbox setup refuses. Loud degrade — a
+    # debug-level no-op left the warm-up permanently vacuous on such
+    # hosts with nothing an operator would ever see.
+    import shutil
+
+    _cli = shutil.which("codeql")
+    if not _cli:
+        logger.warning(
+            "codeql warm-up: codeql CLI not found on PATH — warm-up "
+            "skipped (per-query dispatches degrade the same way)",
+        )
+        return None
+    codeql_cli = os.path.realpath(_cli)
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="codeql-warmup-") as tmp:
+        sarif_out = Path(tmp) / "warmup.sarif"
+        # Per-DB analyze mutex: codeql's IMB disk cache lock is
+        # exclusive — see _codeql_db_lock_for. A sweep miss arriving
+        # while this holds the DB waits there instead of dying on the
+        # lock, then re-peeks the memo this call is about to fill.
+        with _codeql_db_lock_for(db):
+            try:
+                result = analyze(
+                    db,
+                    [str(q) for q, _key, _rid in entries],
+                    sarif_out,
+                    codeql_bin=codeql_cli,
+                    timeout_seconds=timeout_seconds,
+                    runner=_sandboxed_codeql_runner(
+                        [str(Path(codeql_cli).parent)],
+                        database_dir=db,
+                        query_paths=[str(q) for q, _key, _rid in entries],
+                        scratch_dir=Path(tmp),
+                        sandbox_run=sandbox_run,
+                    ),
+                    extra_args=_codeql_cache_args(db),
+                )
+            except (Exception, _SandboxSetupError) as exc:  # noqa: BLE001
+                # Best-effort by contract (the caller runs this on a
+                # background thread and debug-swallows), so a sandbox
+                # setup refusal MAY be absorbed here — the warm-up
+                # produces no verdict, and the per-hypothesis
+                # dispatches hit the same refusal fail-closed. What
+                # it must not be is silent: warn once with the cause.
+                _warn_codeql_warmup_failed(
+                    f"{type(exc).__name__}: {exc}",
+                )
+                return None
+        from core.sarif.parser import load_sarif
+        sarif = load_sarif(result.sarif_path)
+    if sarif is None:
+        return None
+    runs = sarif.get("runs") or [{}]
+    if len(runs) > 1:
+        # A multi-run SARIF has results outside runs[0]; slicing only
+        # the first run would pre-fill missing-result slices as clean
+        # refutations. Never observed from `database analyze`; refuse
+        # rather than guess.
+        logger.debug(
+            "codeql warm-up: SARIF carries %d runs — refusing to "
+            "pre-fill from a shape the splitter cannot attribute",
+            len(runs),
+        )
+        return None
+    all_results = runs[0].get("results") or []
+
+    known_ids = {rid for _q, _key, rid in entries}
+    by_rule: dict[str, list[dict[str, Any]]] = {}
+    orphan_rules: set[str] = set()
+    for r in all_results:
+        rid = r.get("ruleId") or ""
+        if rid in known_ids:
+            by_rule.setdefault(rid, []).append(r)
+        else:
+            orphan_rules.add(rid or "<missing ruleId>")
+
+    prefilled = 0
+    for _qpath, key, rule_id in entries:
+        slice_ = by_rule.get(rule_id)
+        if slice_ is None:
+            if orphan_rules:
+                continue
+            slice_ = []
+        _value, was_cached = _memo.get_or_compute(key, lambda s=slice_: s)  # type: ignore[misc]
+        if not was_cached:
+            prefilled += 1
+
+    if orphan_rules:
+        logger.debug(
+            "codeql warm-up: %d unattributable rule id(s) — empty "
+            "slices not pre-filled: %s",
+            len(orphan_rules), sorted(orphan_rules),
+        )
+    return {
+        "queries": len(entries),
+        "prefilled": prefilled,
+        "orphan_rules": len(orphan_rules),
+    }
+
+
 def run_consistency_check(
     *,
     target_path: Path,
     function_name: str,
     cocci_rule: str,
     domain_vocab: Any = None,
+    tree_languages: frozenset[str] | None = None,
 ) -> SweepResult:
     """Run a Coccinelle consistency check across the entire target.
 
@@ -2612,6 +4371,13 @@ def run_consistency_check(
         domain_vocab: DomainVocabulary used to render vocabulary
             placeholders in the rule to a tempfile before running;
             when None the rule file is run as-is.
+        tree_languages: Canonical languages present in the target
+            tree (the inventory's language mix). The result is
+            tree-scoped — its file_path is the "<codebase>" sentinel
+            — so its refutation license is "the corpus contains
+            something spatch can parse": zero C-family languages
+            yields ``outcome="skipped"``; None (no inventory to
+            answer from) keeps historic behavior by tier policy.
 
     Returns:
         SweepResult with matches being the inconsistent call sites.
@@ -2623,6 +4389,24 @@ def run_consistency_check(
             function_name=function_name,
             outcome="error",
             errors=[f"invalid function name for -D define: {function_name!r}"],
+        )
+
+    # Tree-scoped substrate license: this licenses only THIS
+    # "<codebase>" result — the dispatching chain leg's pre-dispatch
+    # gate keeps the file-scoped predicate on the subject file, so a
+    # stray C file elsewhere never licenses a whole-tree refutation
+    # against a non-C hypothesis (conjunct, not replacement).
+    cov = substrate_covers(
+        "coccinelle_consistency", tree_languages=tree_languages,
+    )
+    if cov.covered is False:
+        return SweepResult(
+            tool="coccinelle_consistency",
+            file_path="<codebase>",
+            function_name=function_name,
+            outcome="skipped",
+            rule_id=cocci_rule,
+            details={"reason": cov.reason, "substrate": cov.as_receipt()},
         )
 
     try:
@@ -2650,8 +4434,8 @@ def run_consistency_check(
 
         try:
             result = run_rule(
-                target_path,
-                effective_rule,
+                Path(target_path),
+                Path(effective_rule),
                 defines={"func": function_name},
                 timeout=300,
                 # In-repo engine/coccinelle rules via cwe_dispatch
@@ -2686,13 +4470,16 @@ def run_consistency_check(
                 matches.append({"raw": str(match)})
 
         outcome = "confirmed" if matches else "refuted"
-        return SweepResult(
-            tool="coccinelle_consistency",
-            file_path="<codebase>",
-            function_name=function_name,
-            outcome=outcome,
-            matches=matches,
-            rule_id=cocci_rule,
+        return license_refutation(
+            SweepResult(
+                tool="coccinelle_consistency",
+                file_path="<codebase>",
+                function_name=function_name,
+                outcome=outcome,
+                matches=matches,
+                rule_id=cocci_rule,
+            ),
+            cov,
         )
     except ImportError:
         return SweepResult(
@@ -2852,6 +4639,56 @@ _PRE_SWEEP_INTERRUPTION_MARKERS = (
 
 #: Bounded re-queue attempts for an interrupted pre-sweep window.
 _PRE_SWEEP_MAX_REQUEUES = 2
+
+# The bulk pre-sweep window runs the full standard-sink catalog's
+# whole-CPG dataflow solves in ONE submission, so its runtime scales
+# with graph size while the configured query timeout is sized for a
+# single query. Scale the window's budget by the serialized CPG size
+# (the only mechanical size signal available client-side) through the
+# central tuning derivation. Too small a budget and the window
+# straddles the boundary on big CPGs — each straddle fires a server
+# restart plus a multi-minute CPG re-import that the re-queue
+# machinery then has to wait out, and the run's taint evidence is
+# lost outright when the re-queues run out (a fixed 4x multiple of
+# the per-query timeout still starved a kernel-scale graph). Too
+# large (hence the derivation's hard cap) and one genuinely wedged
+# window holds the single-threaded REPL — and every review worker's
+# query behind it — for a large slice of the run.
+
+# Below this remaining-wall-budget floor a pre-sweep window (or a
+# re-queue of one) is not worth starting: the window would be clamped
+# so hard it can only time out, and the timeout then fires a server
+# restart the rest of the run pays for.
+_PRE_SWEEP_MIN_WINDOW_S = 30
+
+
+def _presweep_bulk_timeout_s(
+    query_timeout: int, cpg_bytes: int | None,
+) -> int:
+    """Budget for the bulk pre-sweep window, scaled by CPG size.
+
+    Delegates to :func:`core.tuning.derive_joern_presweep_timeout_s`:
+    floor = the configured per-query timeout (small/unknown CPGs and
+    an operator-raised budget keep the configured value), linear in
+    the serialized CPG size, hard absolute cap. Non-positive timeouts
+    pass through unchanged (degenerate/test paths).
+    """
+    from core.tuning import derive_joern_presweep_timeout_s
+    return derive_joern_presweep_timeout_s(query_timeout, cpg_bytes)
+
+
+def _presweep_error_reason(errors: list | None) -> str:
+    """Machine-readable WHY for an errored, non-interrupted sweep.
+
+    A fatal-with-zero-flows status must name what died: a window
+    killed by the query budget reads ``query_timeout`` (remedy:
+    joern_query_timeout_s / the CPG-size derivation), anything else
+    reads ``query_error``.
+    """
+    for err in errors or []:
+        if "timed out" in str(err).lower():
+            return "query_timeout"
+    return "query_error"
 #: How long to wait for the restarted server before each re-queue.
 #: Covers a JVM boot + CPG reload (~1-2 min on big targets).
 _PRE_SWEEP_RECOVERY_WAIT_S = 300
@@ -2911,9 +4748,13 @@ def run_joern_pre_sweep(
     stall_timeout: int = 600,
     query_timeout: int = 300,
     heap_mb: int | None = None,
+    heap_is_derived: bool = False,
     server=None,
     status_out: dict | None = None,
     exclude_dirs: tuple[str, ...] = (),
+    scope_exclude_dirs: tuple[str, ...] = (),
+    abort_check: Callable[[], bool] | None = None,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, list]:
     """Run standard taint queries before the LLM loop.
 
@@ -2924,6 +4765,14 @@ def run_joern_pre_sweep(
     ``exclude_dirs`` are caller-declared exclusion roots (a run's
     output dir inside the target) forwarded to the CPG build so run
     artifacts stay out of both the content key and the graph.
+    ``scope_exclude_dirs`` (the run's scope complement) additionally
+    keys the CPG cache slot — see
+    :func:`packages.joern.runner.build_cpg_cached`. Server mode
+    ignores both: the server's already-imported CPG carries its own
+    exclusion contract.
+    ``abort_check`` is polled at step boundaries (before the CPG
+    build, before each query, on re-queue): True aborts with ``{}`` —
+    the consumer has discarded the result.
 
     Server mode shares the single-threaded REPL with the review loop's
     verification queries: a stuck query ANYWHERE restarts the server,
@@ -2951,6 +4800,18 @@ def run_joern_pre_sweep(
         logger.debug("joern not available on PATH; skipping pre-sweep")
         return {}
 
+    def _aborted(step: str) -> bool:
+        # Consumer-discard signal (empty-gaps run): stop at the next
+        # step boundary instead of paying the CPG build / query for a
+        # result nobody will read.
+        if abort_check is not None and abort_check():
+            logger.debug("joern pre-sweep aborted before %s", step)
+            return True
+        return False
+
+    if _aborted("script checks"):
+        return {}
+
     target_path = Path(target_path)
     if not target_path.is_dir():
         return {}
@@ -2970,14 +4831,72 @@ def run_joern_pre_sweep(
     sink_subst = {"__SINK_NAMES__": scala_string_list(STANDARD_SWEEP_SINKS)}
 
     if server is not None:
+        if _aborted("server taint query"):
+            return {}
+        cpg_bytes: int | None = None
+        _size_fn = getattr(server, "cpg_size_bytes", None)
+        if callable(_size_fn):
+            try:
+                cpg_bytes = _size_fn()
+            except Exception:  # noqa: BLE001 — size is advisory only
+                cpg_bytes = None
+        bulk_timeout = _presweep_bulk_timeout_s(query_timeout, cpg_bytes)
+        if bulk_timeout != query_timeout:
+            logger.info(
+                "joern pre-sweep window budget scaled to %ds "
+                "(CPG %.0f MB; per-query default %ds)",
+                bulk_timeout, (cpg_bytes or 0) / (1024 * 1024),
+                query_timeout,
+            )
+
+        # Composed worst case (initial window + bounded re-queues +
+        # recovery waits) must never overrun the run's wall budget:
+        # clamp every wait leg to the remaining time, and refuse to
+        # start a window the clamp would doom to a timeout (a timed-
+        # out window fires a server restart the rest of the run pays
+        # for).
+        def _remaining_s() -> float | None:
+            if deadline_monotonic is None:
+                return None
+            return deadline_monotonic - time.monotonic()
+
+        _rem = _remaining_s()
+        if _rem is not None:
+            if _rem < _PRE_SWEEP_MIN_WINDOW_S:
+                logger.warning(
+                    "joern pre-sweep skipped — remaining run budget "
+                    "(%.0fs) below the minimum window (%ds)",
+                    max(_rem, 0.0), _PRE_SWEEP_MIN_WINDOW_S,
+                )
+                return {}
+            bulk_timeout = min(bulk_timeout, int(_rem))
         result = server.query_script(
-            sinks_script, timeout=query_timeout, substitutions=sink_subst,
+            sinks_script, timeout=bulk_timeout, substitutions=sink_subst,
         )
         requeued = 0
         interrupted = 1 if _presweep_interrupted(result.errors) else 0
+        # Scale-aware re-queue budget: a timeout-class interruption
+        # proved the window's wall insufficient, so its re-queue must
+        # never re-buy the identical wall (doubled, capped at the
+        # derivation ceiling — beyond it the re-queue is abandoned
+        # with an honest status instead of parking the REPL for
+        # another ceiling-length window). Externally interrupted
+        # windows (server restarted under someone else's query) keep
+        # their budget: the wall said nothing about THIS window.
+        window_budget = bulk_timeout
+        try:
+            from core.tuning import derived_max_joern_presweep_timeout_s
+            window_cap: int | None = (
+                derived_max_joern_presweep_timeout_s(query_timeout)
+            )
+        except Exception:  # noqa: BLE001 — sizing must not cost the sweep
+            logger.debug("pre-sweep re-queue cap unavailable",
+                         exc_info=True)
+            window_cap = None
         while (
             _presweep_interrupted(result.errors)
             and requeued < _PRE_SWEEP_MAX_REQUEUES
+            and not _aborted("pre-sweep re-queue")
         ):
             logger.warning(
                 "joern pre-sweep window interrupted (%s) — re-queueing "
@@ -2985,20 +4904,60 @@ def run_joern_pre_sweep(
                 "; ".join(str(e) for e in result.errors)[:300],
                 requeued + 1, _PRE_SWEEP_MAX_REQUEUES,
             )
+            if _presweep_error_reason(result.errors) == "query_timeout":
+                if window_cap is not None and window_budget >= window_cap:
+                    logger.warning(
+                        "joern pre-sweep window timed out at the "
+                        "derived ceiling (%ds) — no larger re-queue "
+                        "budget exists, abandoning; raise "
+                        "joern_query_timeout_s to exceed the ceiling",
+                        window_budget,
+                    )
+                    break
+                window_budget = window_budget * 2
+                if window_cap is not None:
+                    window_budget = min(window_budget, window_cap)
+                logger.info(
+                    "joern pre-sweep re-queue window raised to %ds "
+                    "(the timed-out wall is proven insufficient)",
+                    window_budget,
+                )
+            _rem = _remaining_s()
+            _recovery_wait: float = _PRE_SWEEP_RECOVERY_WAIT_S
+            if _rem is not None:
+                if _rem < _PRE_SWEEP_MIN_WINDOW_S:
+                    logger.warning(
+                        "joern pre-sweep re-queue abandoned — "
+                        "remaining run budget (%.0fs) below the "
+                        "minimum window", max(_rem, 0.0),
+                    )
+                    break
+                _recovery_wait = min(_recovery_wait, _rem)
             if not _wait_for_presweep_server(
                 server,
-                deadline_s=_PRE_SWEEP_RECOVERY_WAIT_S,
+                deadline_s=_recovery_wait,
                 poll_s=_PRE_SWEEP_RECOVERY_POLL_S,
                 on_progress=on_progress,
             ):
                 logger.warning(
                     "joern pre-sweep re-queue abandoned — server did "
-                    "not recover within %ds", _PRE_SWEEP_RECOVERY_WAIT_S,
+                    "not recover within %.0fs", _recovery_wait,
                 )
                 break
             requeued += 1
+            _rem = _remaining_s()
+            _window = window_budget
+            if _rem is not None:
+                if _rem < _PRE_SWEEP_MIN_WINDOW_S:
+                    logger.warning(
+                        "joern pre-sweep re-queue abandoned — "
+                        "remaining run budget (%.0fs) below the "
+                        "minimum window", max(_rem, 0.0),
+                    )
+                    break
+                _window = min(_window, int(_rem))
             result = server.query_script(
-                sinks_script, timeout=query_timeout,
+                sinks_script, timeout=_window,
                 substitutions=sink_subst,
             )
             if _presweep_interrupted(result.errors):
@@ -3012,6 +4971,22 @@ def run_joern_pre_sweep(
             status_out["requeued"] = requeued
             status_out["recovered"] = recovered
             status_out["errors"] = [str(e) for e in (result.errors or [])]
+            # Failure honesty (ADDITIVE fields — readers tolerate
+            # absence and presence): the window budget the LAST
+            # attempt ran with and the size it was derived from, plus
+            # a machine-readable WHY when the sweep ends degraded.
+            status_out["query_timeout_s"] = window_budget
+            status_out["cpg_bytes"] = cpg_bytes
+            if result.errors:
+                # Timeout outranks the generic interruption class: it
+                # names the binding ceiling (the window's own wall),
+                # where window_interrupted means the server restarted
+                # underneath the window for someone else's reasons.
+                reason_val = _presweep_error_reason(result.errors)
+                if (reason_val != "query_timeout"
+                        and _presweep_interrupted(result.errors)):
+                    reason_val = "window_interrupted"
+                status_out["reason"] = reason_val
         if result.errors:
             if _presweep_interrupted(result.errors):
                 logger.warning(
@@ -3027,7 +5002,7 @@ def run_joern_pre_sweep(
                 requeued,
             )
 
-        flows_by_key: dict[str, list] = {}
+        flows_by_key: dict[str, list] = {}  # type: ignore[no-redef]
         for flow in result.flows:
             if flow.steps:
                 step_file = flow.steps[0].file
@@ -3040,8 +5015,11 @@ def run_joern_pre_sweep(
             # The taint query ran through to a flow set — distinguishes
             # a genuinely empty sweep (cacheable) from the early-return
             # skip cases above (joern missing, no script), which leave
-            # status_out untouched.
-            status_out["completed"] = True
+            # status_out untouched. Residual errors (a lost window, a
+            # query failure) block the marker: an errored sweep's
+            # zero/partial flows must never read as a genuinely empty
+            # ("not tainted") result.
+            status_out["completed"] = not result.errors
         return flows_by_key
 
     build_kwargs: dict[str, Any] = {
@@ -3049,6 +5027,7 @@ def run_joern_pre_sweep(
     }
     if heap_mb is not None:
         build_kwargs["heap_mb"] = heap_mb
+        build_kwargs["heap_is_derived"] = heap_is_derived
     if exclude_dirs:
         build_kwargs["exclude_dirs"] = exclude_dirs
     # Pin the joern-parse frontend to the detected dominant language
@@ -3059,25 +5038,78 @@ def run_joern_pre_sweep(
     if parse_langs:
         build_kwargs["languages"] = parse_langs
 
+    if _aborted("CPG build"):
+        return {}
     if cache_dir is not None:
+        if scope_exclude_dirs:
+            build_kwargs["scope_exclude_dirs"] = scope_exclude_dirs
         cpg = build_cpg_cached(target_path, cache_dir, **build_kwargs)
     else:
+        if scope_exclude_dirs:
+            # No cache slot to key on the uncached path — the scope
+            # complement still shapes the graph (analysis parity).
+            build_kwargs["exclude_dirs"] = tuple(
+                build_kwargs.get("exclude_dirs", ())
+            ) + tuple(scope_exclude_dirs)
         cpg = build_cpg(target_path, **build_kwargs)
     if not cpg.exists():
         logger.warning("CPG build produced no output")
         return {}
 
     try:
+        if _aborted("taint query"):
+            return {}
+        cpg_bytes: int | None = None  # type: ignore[no-redef]
+        try:
+            cpg_bytes = cpg.path.stat().st_size
+        except OSError:
+            cpg_bytes = None
+        # This subprocess path's single wall covers importCpg PLUS the
+        # taint solve (the query wrapper script loads the CPG itself),
+        # so the derivation includes the import slope and widens its
+        # cap accordingly — a static per-query budget starved a
+        # kernel-scale graph before the solve even started. Floor: the
+        # configured per-query timeout; unknown size keeps the floor.
+        local_timeout = query_timeout
+        try:
+            from core.tuning import derive_joern_presweep_timeout_s
+            local_timeout = derive_joern_presweep_timeout_s(
+                query_timeout, cpg_bytes, include_import=True,
+            )
+        except Exception:  # noqa: BLE001 — sizing must not cost the sweep
+            logger.debug("pre-sweep budget derivation failed",
+                         exc_info=True)
+        if local_timeout != query_timeout:
+            logger.info(
+                "joern pre-sweep window budget scaled to %ds "
+                "(CPG %.0f MB incl. import; per-query default %ds)",
+                local_timeout, (cpg_bytes or 0) / (1024 * 1024),
+                query_timeout,
+            )
         result = run_query(
-            cpg, str(sinks_script), timeout=query_timeout,
+            cpg, str(sinks_script), timeout=local_timeout,
             substitutions=sink_subst,
         )
         if result.errors:
-            logger.warning("joern pre-sweep errors: %s", result.errors)
+            logger.warning(
+                "joern pre-sweep errors: %s — flow set is incomplete; "
+                "this sweep will not read as completed (missing flows "
+                "mean 'not swept', not 'no flows')", result.errors,
+            )
         if status_out is not None:
             status_out["errors"] = [str(e) for e in (result.errors or [])]
+            # Failure honesty (ADDITIVE fields): the window that
+            # actually ran and the size it was derived from, plus a
+            # machine-readable WHY on a degraded end — errors_fatal
+            # beside zero flows previously recorded no reason at all.
+            status_out["query_timeout_s"] = local_timeout
+            status_out["cpg_bytes"] = cpg_bytes
+            if result.errors:
+                status_out["errors_fatal"] = True
+                status_out["reason"] = _presweep_error_reason(
+                    result.errors)
 
-        flows_by_key: dict[str, list] = {}
+        flows_by_key: dict[str, list] = {}  # type: ignore[no-redef]
         for flow in result.flows:
             if flow.steps:
                 step_file = flow.steps[0].file
@@ -3088,7 +5120,14 @@ def run_joern_pre_sweep(
                 flows_by_key.setdefault(key, []).append(flow)
 
         if status_out is not None:
-            status_out["completed"] = True
+            # completed marks a query that ran through cleanly. An
+            # errored query's zero/partial flows must stay
+            # distinguishable from a genuinely empty sweep — "no
+            # flows" from a degraded run means "not swept", never
+            # "not tainted" — so errors block the completed marker
+            # (the flow-cache gate treats not-completed as
+            # uncacheable).
+            status_out["completed"] = not result.errors
         return flows_by_key
     finally:
         cleanup_cpg(cpg)
@@ -3385,8 +5424,8 @@ def _store_sweep_witness(
     """Store the solved bytes; optionally replay (dynamic-gated)."""
     try:
         from packages.exploitability_validation.symbolic_witness import (
-            _replay,
-            _store_witness,
+            replay_witness,
+            store_witness,
         )
         record = {
             "mode": "sweep",
@@ -3395,11 +5434,11 @@ def _store_sweep_witness(
             "_input_bytes": witness_bytes,
         }
         if replay:
-            record.update(_replay(Path(binary), witness_bytes))
+            record.update(replay_witness(Path(binary), witness_bytes))
         else:
             record["replay_outcome"] = "not_run"
         finding = {"function": function_name, "cwe": cwe, "file": file_path}
-        digest = _store_witness(finding, record, Path(binary), Path(out_dir))
+        digest = store_witness(finding, record, Path(binary), Path(out_dir))
         out = {
             "replay_outcome": record.get("replay_outcome"),
             "witness_hash": digest,
@@ -3433,7 +5472,10 @@ def run_heap_copy_sweep(
             rule_id="heap-copy",
         )
     try:
-        from core.audit.heap_copy_checker import check_decompiled_function
+        from core.audit.heap_copy_checker import (
+            check_decompiled_function,
+            copy_sites_present,
+        )
         findings = check_decompiled_function(
             function_name, source, file=file_path,
         )
@@ -3449,6 +5491,20 @@ def run_heap_copy_sweep(
             tool="heap-copy", file_path=file_path,
             function_name=function_name, outcome="confirmed",
             matches=[f.to_dict() for f in findings],
+            rule_id="heap-copy",
+        )
+    if not copy_sites_present(source):
+        # The _negative_outcome doctrine, applied at the wrapper: no
+        # copy site means the model never matched — an analysis that
+        # did not run cannot refute.
+        return SweepResult(
+            tool="heap-copy", file_path=file_path,
+            function_name=function_name, outcome="inconclusive",
+            errors=[
+                "no copy sites in the analysed source — the checker's "
+                "prerequisites never matched; a model miss cannot "
+                "refute",
+            ],
             rule_id="heap-copy",
         )
     return SweepResult(
@@ -3490,6 +5546,7 @@ def run_integer_truncation_sweep(
     try:
         from core.audit.integer_truncation_checker import (
             check_integer_truncation,
+            narrowing_sites_present,
         )
         findings = check_integer_truncation(
             function_name, source, file=file_path,
@@ -3507,6 +5564,17 @@ def run_integer_truncation_sweep(
             tool="integer-truncation", file_path=file_path,
             function_name=function_name, outcome="confirmed",
             matches=[f.to_dict() for f in findings],
+            rule_id="integer-truncation",
+        )
+    if not narrowing_sites_present(source, xref_source):
+        return SweepResult(
+            tool="integer-truncation", file_path=file_path,
+            function_name=function_name, outcome="inconclusive",
+            errors=[
+                "no narrowing sites in the analysed source — the "
+                "checker's prerequisites never matched; a model miss "
+                "cannot refute",
+            ],
             rule_id="integer-truncation",
         )
     return SweepResult(
@@ -3533,7 +5601,10 @@ def run_proto_length_sweep(
             rule_id="proto-length",
         )
     try:
-        from core.audit.proto_length_checker import check_proto_length
+        from core.audit.proto_length_checker import (
+            check_proto_length,
+            length_sites_present,
+        )
         findings = check_proto_length(
             function_name, source, file=file_path,
             xref_source=xref_source,
@@ -3550,6 +5621,17 @@ def run_proto_length_sweep(
             tool="proto-length", file_path=file_path,
             function_name=function_name, outcome="confirmed",
             matches=[f.to_dict() for f in findings],
+            rule_id="proto-length",
+        )
+    if not length_sites_present(source, xref_source):
+        return SweepResult(
+            tool="proto-length", file_path=file_path,
+            function_name=function_name, outcome="inconclusive",
+            errors=[
+                "no protocol length-candidate sites in the analysed "
+                "source — the checker's prerequisites never matched; "
+                "a model miss cannot refute",
+            ],
             rule_id="proto-length",
         )
     return SweepResult(
@@ -3577,7 +5659,10 @@ def run_struct_field_sweep(
             rule_id="struct-field",
         )
     try:
-        from core.audit.struct_field_checker import check_struct_field_copy
+        from core.audit.struct_field_checker import (
+            check_struct_field_copy,
+            struct_sites_present,
+        )
         findings = check_struct_field_copy(
             function_name, source, file=file_path,
             re_types=re_types, xref_source=xref_source,
@@ -3594,6 +5679,18 @@ def run_struct_field_sweep(
             tool="struct-field", file_path=file_path,
             function_name=function_name, outcome="confirmed",
             matches=[f.to_dict() for f in findings],
+            rule_id="struct-field",
+        )
+    if not struct_sites_present(source, re_types, xref_source):
+        return SweepResult(
+            tool="struct-field", file_path=file_path,
+            function_name=function_name, outcome="inconclusive",
+            errors=[
+                "no struct layouts, offset accesses, or bound RE-typed "
+                "fields in the analysed source — the checker's "
+                "prerequisites never matched; a model miss cannot "
+                "refute",
+            ],
             rule_id="struct-field",
         )
     return SweepResult(

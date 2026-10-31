@@ -1,15 +1,18 @@
 """
-RAPTOR Autonomous Fuzzing System
+RAPTOR Autonomous Fuzzing Support
 
-Transforms RAPTOR from automation to true autonomy through:
-- Intelligent decision-making and planning
-- Learning from past successes and failures
-- Multi-turn reasoning with LLMs
-- Goal-directed behaviour
-- Adaptive strategies based on feedback
+Building blocks the fuzzing pipeline composes:
+- Crash prioritisation against operator goals (planner, goal_planner)
+- Cross-campaign memory of strategies and crashes (memory)
+- Multi-turn crash reasoning with LLMs (dialogue)
+- Intelligent corpus generation (corpus_generator)
+- Exploit validation (exploit_validator)
+
+The fuzz loop itself runs on the operator's duration timer in
+raptor_fuzzing.py — there is no autonomous stop-condition surface.
 """
 
-from .planner import FuzzingPlanner, FuzzingState, Action
+from .planner import FuzzingPlanner, FuzzingState
 from .memory import FuzzingMemory, FuzzingKnowledge
 from .dialogue import MultiTurnAnalyser
 from .exploit_validator import ExploitValidator, ValidationResult
@@ -17,7 +20,6 @@ from .goal_planner import GoalPlanner, Goal, GoalType
 from .corpus_generator import CorpusGenerator
 
 __all__ = [
-    "Action",
     "CorpusGenerator",
     "ExploitValidator",
     "FuzzingKnowledge",

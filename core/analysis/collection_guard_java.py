@@ -69,6 +69,16 @@ logger = logging.getLogger(__name__)
 
 _MAX_DECLARING_CANDIDATES = 8
 _MAX_TREE_FILES = 5000
+
+def _loop_statement_types() -> frozenset[str]:
+    """Loop statements carry a back edge — inside one, textual order
+    stops implying execution order (the writer-interval extension in
+    collection_guard_reason). Grammar-validated single home."""
+    from core.analysis.cfg_node_tables import JAVA_TABLES
+    return JAVA_TABLES.loops
+
+
+_LOOP_STATEMENT_TYPES = _loop_statement_types()
 _MAX_REFERENCING_FILES = 64
 _MAX_ELEMENTS = 64
 
@@ -107,6 +117,15 @@ class _Refused(Exception):
         self.reason = reason
 
 
+class _NoLocalDeclaration(_Refused):
+    """The method declares NO local by this name — the only local
+    refusal that may fall back to a class field. Any other refusal
+    means a local declarator EXISTS; Java scoping makes that local
+    the guard's runtime receiver, and resolving a same-named
+    ``static final`` field instead would bound the guard to the
+    wrong (possibly attacker-influenced) collection."""
+
+
 # ---------------------------------------------------------------------------
 # AST helpers
 # ---------------------------------------------------------------------------
@@ -137,9 +156,17 @@ def _line_byte_range(source_text: str, line: int) -> tuple[int, int]:
     """(first_byte, end_byte) of ``line`` — used for writer-interval
     bounds. Statement covering is decided by LINE, not byte: the
     line's first byte is indentation, which no statement node spans."""
+    # Split on \n ONLY: *line* is a tree-sitter row (\n-counted), so
+    # a splitlines() view desynced after any in-literal exotic
+    # terminator. Manual split keeps the ORIGINAL bytes (no \r
+    # normalisation) so the returned offsets stay true to the text
+    # tree-sitter parsed; the separator byte is counted explicitly.
     offset = 0
-    for i, chunk in enumerate(source_text.splitlines(keepends=True), 1):
+    chunks = source_text.split("\n")  # line-model: callers read universal-newline; offsets stay self-consistent with the parsed text
+    for i, chunk in enumerate(chunks, 1):
         blen = len(chunk.encode("utf-8", errors="replace"))
+        if i < len(chunks):
+            blen += 1  # the terminating \n
         if i == line:
             return offset, offset + blen
         offset += blen
@@ -214,7 +241,16 @@ def _guard_dominates_sink(guard_if: Node, sink_line: int) -> bool:
 
 
 def _writers_of(method, name: str) -> list[int]:
-    """Byte offsets of every construct that (re)defines ``name``."""
+    """Byte offsets of every construct that (re)defines ``name``.
+
+    Enumeration must cover every BINDING form, not just assignment
+    shapes: a try-with-resources ``resource`` and the pattern
+    variables of ``instanceof`` / ``type_pattern`` / record patterns
+    all bind invisibly to an assignment-only walk — legal even when
+    they shadow a same-named field — and a missed writer between
+    guard and sink lets the guard vouch for a DIFFERENT value than
+    the one the sink consumes (the false-suppression direction).
+    """
     out: list[int] = []
     for n in _iter_named(method):
         t = n.type
@@ -226,11 +262,13 @@ def _writers_of(method, name: str) -> list[int]:
         elif t == "update_expression":
             out.extend(n.start_byte for c in n.children if c.is_named and c.type == "identifier" \
                         and _text(c) == name)
-        elif t in {"variable_declarator", "enhanced_for_statement"}:
+        elif t in {"variable_declarator", "enhanced_for_statement",
+                   "resource", "instanceof_expression"}:
             nm = n.child_by_field_name("name")
             if nm is not None and _text(nm) == name:
                 out.append(n.start_byte)
-        elif t == "catch_formal_parameter":
+        elif t in {"catch_formal_parameter", "type_pattern",
+                   "record_pattern_component"}:
             out.extend(n.start_byte for c in n.children if c.is_named and c.type == "identifier" \
                         and _text(c) == name)
     return out
@@ -307,10 +345,25 @@ def _occurrences_contains_only(scope, name: str, *,
                 and p.child_by_field_name("object") == n \
                 and _text(p.child_by_field_name("name")) == "contains":
             continue
-        # the name inside a field_access chain (Utils.NAME) is handled
-        # by the chain resolver, not here
+        # A qualified spelling (``Vuln.NAME`` / ``this.NAME``) reaches
+        # the SAME collection as the bare name — exempting it
+        # wholesale let ``Vuln.allowed.set(0, evil)`` pass while the
+        # bare ``allowed.set(0, evil)`` refused. Accept exactly the
+        # shape the cross-file immutability scan accepts: the
+        # identifier is the accessed FIELD and the access is the
+        # receiver of a contains() invocation. Every other qualified
+        # occurrence — a mutator/alias/argument through the chain, or
+        # the name in OBJECT position (a field read off the
+        # collection) — refuses, matching the bare-spelling rule.
         if p is not None and p.type == "field_access":
-            continue
+            if p.child_by_field_name("field") == n:
+                gp = p.parent
+                if gp is not None and gp.type == "method_invocation" \
+                        and gp.child_by_field_name("object") == p \
+                        and _text(gp.child_by_field_name("name")) \
+                        == "contains":
+                    continue
+            return False
         return False
     return True
 
@@ -339,7 +392,7 @@ def _resolve_local_collection(method, name: str, resolver) -> list[str]:
             raise _Refused(msg)
     if decl_elems is None:
         msg = "no local declaration for the collection"
-        raise _Refused(msg)
+        raise _NoLocalDeclaration(msg)
     if not _occurrences_contains_only(method, name):
         msg = (
             "collection name used beyond contains() — "
@@ -349,11 +402,34 @@ def _resolve_local_collection(method, name: str, resolver) -> list[str]:
     return decl_elems
 
 
-def _resolve_static_field(root, name: str, resolver) -> list[str]:
-    """``static final`` field with a constant initializer, occurrence
-    discipline over the whole file."""
+def _enclosing_class(node) -> "Node | None":
+    """Nearest enclosing class-like declaration of ``node``."""
+    cur = node.parent
+    while cur is not None:
+        if cur.type in ("class_declaration", "enum_declaration",
+                        "record_declaration", "interface_declaration"):
+            return cur
+        cur = cur.parent
+    return None
+
+
+def _resolve_static_field(root, enclosing_class, name: str,
+                          resolver) -> tuple[list[str], bool]:
+    """``static final`` field with a constant initializer, declared
+    DIRECTLY by the sink's enclosing class — an unqualified field read
+    resolves through the class hierarchy, so binding any same-file
+    declaration could vouch a DIFFERENT collection than the runtime
+    receiver (an inherited, possibly mutable field). Occurrence
+    discipline over the whole file. Returns ``(elems, is_private)``:
+    a non-private field is writable from other files and needs the
+    caller's tree-wide mutation scan on top."""
+    body = enclosing_class.child_by_field_name("body")
+    if body is None:
+        msg = "enclosing class has no body"
+        raise _Refused(msg)
     found: list[str] | None = None
-    for n in _iter_named(root):
+    private = False
+    for n in body.children:
         if n.type != "field_declaration":
             continue
         decls = [c for c in n.children if c.type == "variable_declarator"]
@@ -380,13 +456,17 @@ def _resolve_static_field(root, name: str, resolver) -> list[str]:
                 )
                 raise _Refused(msg)
             found = elems
+            private = "private" in mod_texts
     if found is None:
-        msg = "no static final field of that name"
+        # Includes the inherited-field case: the enclosing class
+        # extends/implements something and declares no such field —
+        # the binding is unprovable through the hierarchy.
+        msg = "no static final field of that name on the sink's class"
         raise _Refused(msg)
     if not _occurrences_contains_only(root, name):
         msg = "field name used beyond contains() in its file"
         raise _Refused(msg)
-    return found
+    return found, private
 
 
 def _package_of(root) -> str:
@@ -438,11 +518,41 @@ def _resolve_cross_file(chain: str, field: str, source_root: Path,
     from core.analysis.cfg_builder_java import _NameResolver, build_import_map
     types, statics = build_import_map(declaring_root)
     resolver = _NameResolver(types, statics)
-    elems = _resolve_static_field(declaring_root, field, resolver)
+    declaring_class = _single_top_level_class(declaring_root, simple)
+    if declaring_class is None:
+        msg = "declaring class not found in its file"
+        raise _Refused(msg)
+    elems, _private = _resolve_static_field(
+        declaring_root, declaring_class, field, resolver)
 
     # Mutation-anywhere scan: a static collection is writable from any
     # file that can see it. Occurrences elsewhere must be contains
     # receivers only.
+    _scan_tree_contains_only(field, source_root, parser,
+                             skip_file=declaring)
+    return elems
+
+
+def _single_top_level_class(root, simple: str) -> "Node | None":
+    """The class-like declaration named ``simple`` in ``root``."""
+    for n in _iter_named(root):
+        if n.type in ("class_declaration", "enum_declaration",
+                      "record_declaration", "interface_declaration"):
+            nm = n.child_by_field_name("name")
+            if nm is not None and _text(nm) == simple:
+                return n
+    return None
+
+
+def _scan_tree_contains_only(field: str, source_root: Path, parser, *,
+                             skip_file: Path | None = None,
+                             skip_text: str | None = None) -> None:
+    """Refuse (raise) unless every occurrence of ``field`` outside the
+    declaring file is a ``contains()`` receiver. ``skip_file`` names
+    the declaring file by path (cross-file resolution); ``skip_text``
+    identifies it by CONTENT when the caller has only the analysed
+    source text (same-class resolution) — a byte-different copy is
+    scanned as foreign and refuses, the conservative direction."""
     n_files = 0
     n_refs = 0
     for f in source_root.rglob("*.java"):
@@ -461,7 +571,9 @@ def _resolve_cross_file(chain: str, field: str, source_root: Path,
         if n_refs > _MAX_REFERENCING_FILES:
             msg = "too many files reference the collection"
             raise _Refused(msg)
-        if f == declaring:
+        if skip_file is not None and f == skip_file:
+            continue
+        if skip_text is not None and text == skip_text:
             continue
         try:
             tree = parser.parse(text.encode("utf-8", errors="replace"))
@@ -490,7 +602,6 @@ def _resolve_cross_file(chain: str, field: str, source_root: Path,
                 continue
             msg = f"{f.name} uses the collection beyond contains()"
             raise _Refused(msg)
-    return elems
 
 
 # ---------------------------------------------------------------------------
@@ -553,9 +664,23 @@ def collection_guard_reason(
     _sink_line_start, sink_line_end = _line_byte_range(
         source_text, sink_line)
 
-    from core.analysis.cfg_builder_java import _NameResolver, build_import_map
+    from core.analysis.cfg_builder_java import (
+        _declared_local_scopes,
+        _file_type_shadow_names,
+        _NameResolver,
+        build_import_map,
+    )
     types, statics = build_import_map(root)
-    resolver = _NameResolver(types, statics)
+    type_shadows = _file_type_shadow_names(root)
+    resolver = _NameResolver(types, statics, type_shadows=type_shadows)
+    # Scope oracle for the TESTED identifier. The guard's soundness
+    # premise — "no syntactic writer between guard and sink means the
+    # tested value is unchanged" — only holds for unaliasable names
+    # (declared locals and parameters). A FIELD passes the writer
+    # interval trivially while any interleaved call can rewrite it, so
+    # a non-vouched tested name must refuse (the same positional-scope
+    # rule every other name-scope consumer enforces).
+    scopes = _declared_local_scopes(method)
 
     for n in _iter_named(method):
         if n.type != "if_statement":
@@ -568,6 +693,12 @@ def collection_guard_reason(
             decisions.append(
                 f"guard at line {n.start_point[0] + 1} tests {tested!r}, "
                 f"not the sink argument")
+            continue
+        if not scopes.vouches(tested, n.start_byte):
+            decisions.append(
+                f"tested name {tested!r} is not a declared local/param "
+                f"in scope at the guard (field or outer binding an "
+                f"interleaved call can rewrite) — refused")
             continue
         consequence = n.child_by_field_name("consequence")
         guard_end_line = n.end_point[0] + 1
@@ -618,8 +749,26 @@ def collection_guard_reason(
                 continue
         # Writer interval: from the guard's start to the END of the
         # sink line — a same-line writer after the sink call refuses
-        # too (conservative direction).
-        interval = (n.start_byte, sink_line_end)
+        # too (conservative direction). Byte order is NOT execution
+        # order under a back edge: a writer textually after the sink
+        # but inside a loop enclosing it executes BEFORE the sink on
+        # iteration >= 2, so the interval extends to the end of every
+        # loop that encloses the sink but not the guard. A loop
+        # enclosing BOTH re-tests the guard each iteration before the
+        # sink reruns, so the loop-carried write is re-vouched there
+        # and needs no extension.
+        interval_end = sink_line_end
+        for loop in _iter_named(method):
+            if loop.type not in _LOOP_STATEMENT_TYPES:
+                continue
+            if not (loop.start_point[0] + 1 <= sink_line
+                    <= loop.end_point[0] + 1):
+                continue
+            if loop.start_byte <= n.start_byte \
+                    and n.end_byte <= loop.end_byte:
+                continue
+            interval_end = max(interval_end, loop.end_byte)
+        interval = (n.start_byte, interval_end)
         writers = _writers_of(method, sink_arg)
         if any(interval[0] < w < interval[1] for w in writers):
             decisions.append(
@@ -632,14 +781,61 @@ def collection_guard_reason(
                 name = _text(recv_u)
                 try:
                     elems = _resolve_local_collection(method, name, resolver)
-                except _Refused:
-                    elems = _resolve_static_field(root, name, resolver)
+                except _NoLocalDeclaration:
+                    # Only the no-local-at-all refusal may consult the
+                    # class field — a declared local SHADOWS the field
+                    # (see _NoLocalDeclaration); its refusal reasons
+                    # must refuse the guard outright. The lookup is
+                    # restricted to the sink's ENCLOSING class (an
+                    # unqualified read resolves through the hierarchy,
+                    # never to an unrelated same-file class), and a
+                    # non-private field needs the same tree-wide
+                    # mutation proof the cross-file path demands — a
+                    # package-visible static collection is writable
+                    # from any file.
+                    encl = _enclosing_class(method)
+                    if encl is None:
+                        msg = "no enclosing class for the field lookup"
+                        raise _Refused(msg)  # noqa: B904
+                    elems, private = _resolve_static_field(
+                        root, encl, name, resolver)
+                    if not private:
+                        if source_root is None:
+                            msg = (
+                                "package-visible field needs a source "
+                                "root for the mutation scan"
+                            )
+                            raise _Refused(msg)  # noqa: B904
+                        _scan_tree_contains_only(
+                            name, Path(source_root), parser,
+                            skip_text=source_text)
             elif recv_u is not None and recv_u.type in (
                     "field_access", "scoped_identifier"):
                 chain_text = _text(recv_u)
                 head, _, field = chain_text.rpartition(".")
                 if not head or not field:
                     msg = "unresolvable collection chain"
+                    raise _Refused(msg)
+                # JLS 6.4.2 obscuring: a local/param named like the
+                # chain head makes the runtime read the LOCAL's
+                # field, not the class's — binding the class's
+                # literal set would vouch for a different collection.
+                head_ident = head.split(".", 1)[0]
+                if scopes.vouches(head_ident, recv_u.start_byte):
+                    msg = (
+                        "collection chain head is a local variable "
+                        "(obscures the type name)"
+                    )
+                    raise _Refused(msg)
+                if head_ident in type_shadows:
+                    # JLS 6.4.1: a same-file member type / type
+                    # parameter shadows the import — resolving the
+                    # simple name cross-file would bind a DIFFERENT
+                    # class than the runtime receiver.
+                    msg = (
+                        "collection chain head is shadowed by a "
+                        "same-file type declaration"
+                    )
                     raise _Refused(msg)
                 resolved_head = resolver._resolve_chain(head)
                 if source_root is None:

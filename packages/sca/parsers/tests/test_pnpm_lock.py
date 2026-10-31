@@ -200,3 +200,126 @@ def test_malformed_yaml_returns_empty(tmp_path: Path) -> None:
     p = tmp_path / "pnpm-lock.yaml"
     p.write_text("[: not yaml :", encoding="utf-8")
     assert parse(p) == []
+
+
+# ---------------------------------------------------------------------------
+# npm aliases: the packages/snapshots maps already carry the REAL
+# package — the importer's alias entry must keep it direct and
+# preserve the alias spelling
+# ---------------------------------------------------------------------------
+
+def test_v6_alias_importer_keeps_real_package_direct(tmp_path: Path) -> None:
+    body = """\
+lockfileVersion: '6.0'
+
+importers:
+  .:
+    dependencies:
+      my-lodash:
+        specifier: npm:lodash@^4.17.0
+        version: /lodash@4.17.4
+
+packages:
+  /lodash@4.17.4:
+    resolution: {integrity: sha512-x}
+"""
+    [d] = parse(_write(tmp_path, body))
+    assert d.name == "lodash"
+    assert d.alias_name == "my-lodash"
+    assert d.version == "4.17.4"
+    assert d.direct is True
+
+
+def test_v9_alias_importer_keeps_real_package_direct(tmp_path: Path) -> None:
+    body = """\
+lockfileVersion: '9.0'
+
+importers:
+  .:
+    dependencies:
+      legacy-form:
+        specifier: npm:@scope/real@^1.2.0
+        version: '@scope/real@1.2.3'
+
+packages:
+  '@scope/real@1.2.3':
+    resolution: {integrity: sha512-x}
+
+snapshots:
+  '@scope/real@1.2.3': {}
+"""
+    [d] = parse(_write(tmp_path, body))
+    assert d.name == "@scope/real"
+    assert d.alias_name == "legacy-form"
+    assert d.version == "1.2.3"
+    assert d.direct is True
+
+
+def test_v5_alias_value_keeps_real_package_direct(tmp_path: Path) -> None:
+    body = """\
+lockfileVersion: 5.4
+
+dependencies:
+  my-lodash: /lodash/4.17.4
+
+packages:
+  /lodash/4.17.4:
+    resolution: {integrity: sha512-x}
+"""
+    [d] = parse(_write(tmp_path, body))
+    assert d.name == "lodash"
+    assert d.alias_name == "my-lodash"
+    assert d.version == "4.17.4"
+    assert d.direct is True
+
+
+def test_alias_handling_leaves_non_aliased_rows_unchanged(tmp_path: Path) -> None:
+    body = """\
+lockfileVersion: '6.0'
+
+importers:
+  .:
+    dependencies:
+      lodash:
+        specifier: ^4.17.21
+        version: 4.17.21
+
+packages:
+  /lodash@4.17.21:
+    resolution: {integrity: sha512-x}
+"""
+    [d] = parse(_write(tmp_path, body))
+    assert d.name == "lodash"
+    assert d.alias_name is None
+    assert d.direct is True
+
+
+def test_v9_two_aliases_of_same_package_attributed_by_version(
+    tmp_path: Path,
+) -> None:
+    # The canonical alias use case: two versions of one package side
+    # by side. Each row must carry ITS OWN alias spelling — name-only
+    # attribution stamped the first alias on both.
+    body = """\
+lockfileVersion: '9.0'
+
+importers:
+  .:
+    dependencies:
+      lodash-new:
+        specifier: npm:lodash@^4.17.21
+        version: lodash@4.17.21
+      lodash-old:
+        specifier: npm:lodash@^3.10.0
+        version: lodash@3.10.1
+
+packages:
+  lodash@4.17.21:
+    resolution: {integrity: sha512-x}
+  lodash@3.10.1:
+    resolution: {integrity: sha512-y}
+"""
+    deps = {d.version: d for d in parse(_write(tmp_path, body))}
+    assert deps["4.17.21"].alias_name == "lodash-new"
+    assert deps["3.10.1"].alias_name == "lodash-old"
+    assert deps["4.17.21"].direct is True and deps["3.10.1"].direct is True

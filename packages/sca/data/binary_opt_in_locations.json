@@ -116,7 +116,13 @@
     {"pattern": "**/tests/golden/**/*",
      "reason": "nested golden test data"},
     {"pattern": ".git/**/*",
-     "reason": "git internal — typically excluded from publish but harmless if shipped"}
+     "reason": "git internal — typically excluded from publish but harmless if shipped"},
+    {"pattern": "helpers/*",
+     "reason": "compiled helper binaries (container runtimes, sandbox setuid helpers, newuidmap wrappers)",
+     "magic_required": ["elf", "macho", "pe"]},
+    {"pattern": "libexec/*",
+     "reason": "project-internal executables (FHS convention for programs not meant for direct user invocation)",
+     "magic_required": ["elf", "macho", "pe"]}
   ],
   "manifest_opt_in_fields": {
     "_comment": "Manifest fields that, when present, declare the package opts in to shipping platform-specific binaries. Annotation only: these fields live in the scanned repo's own manifest (attacker-controlled), so a declaration never suppresses findings — the binary walk always runs, and hits under a declaring manifest carry manifest_declares_native so reviewers see the package claims a documented native-binary surface.",

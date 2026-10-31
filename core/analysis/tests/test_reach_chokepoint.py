@@ -233,3 +233,42 @@ def test_sage_fp_skip_honours_manual_override() -> None:
     assert gate_at < recall_at, (
         "the manual_override gate must run before the SAGE recall"
     )
+
+
+def test_record_suppression_swallows_unserialisable_extra(tmp_path):
+    # The best-effort contract must be structural: a producer
+    # smuggling a non-serialisable value through ``extra`` raises
+    # TypeError/ValueError inside the JSON writer — that must be
+    # logged and swallowed, never propagate into the caller's
+    # pipeline.
+    from core.analysis.reach_chokepoint import record_suppression
+    record_suppression(
+        tmp_path, finding={"finding_id": "f1"},
+        verdict="binary_oracle_absent", reason="r",
+        extra={"bad": object()},
+    )
+    # No record written, no exception raised.
+    p = tmp_path / "suppressions.jsonl"
+    assert not p.exists() or "f1" not in p.read_text()
+
+
+def test_non_numeric_line_does_not_raise(tmp_path):
+    """check_suppress(line="N/A") raised ValueError out of the
+    chokepoint into the /agentic + /codeql consumer loops — the one
+    raw coercion on an otherwise shape-tolerated path. A non-numeric
+    line reads as line 0 ("no line")."""
+    from core.analysis.reach_chokepoint import check_suppress
+    checklist = {"files": [{"path": "pkg/mod.py", "items": [
+        {"name": "f", "line_start": 1, "kind": "function"},
+    ], "call_graph": {"calls": [], "imports": {}}}]}
+    for odd_line in ("N/A", "", None, [], {}):
+        result = check_suppress(
+            checklist=checklist,
+            file_path="pkg/mod.py",
+            function_name="f",
+            line=odd_line,
+            repo_root=str(tmp_path),
+        )
+        # Verdict content is classifier-dependent; the contract under
+        # test is only "never raises on a hostile/odd line shape".
+        assert result is None or isinstance(result, tuple)

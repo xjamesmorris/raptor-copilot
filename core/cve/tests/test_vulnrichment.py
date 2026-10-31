@@ -286,7 +286,7 @@ class TestVulnrichmentClient:
             "HEAD/2024/12xxx/CVE-2024-12345.json"
         )
         http = FakeHttp(errors={
-            url: HttpError("404 Not Found"),
+            url: HttpError("404 Not Found", status=404),
         })
         cache = JsonCache(root=tmp_path)
         client = VulnrichmentClient(http, cache)
@@ -296,7 +296,7 @@ class TestVulnrichmentClient:
         # Second client (fresh process) — must read the negative
         # marker from disk, not re-probe.
         http2 = FakeHttp(errors={
-            url: HttpError("404 Not Found"),
+            url: HttpError("404 Not Found", status=404),
         })
         client2 = VulnrichmentClient(http2, cache)
         assert client2.lookup("CVE-2024-12345") is None
@@ -329,6 +329,73 @@ class TestVulnrichmentClient:
         d = c2.lookup("CVE-2024-12345")
         assert d is not None
         assert d.exploitation == "active"
+
+    def test_gone_410_caches_negative(self, tmp_path: Path):
+        """410 is equally authoritative not-found — negative-cached
+        like 404 (same statuses the SCA registry clients accept)."""
+        url = (
+            "https://raw.githubusercontent.com/cisagov/vulnrichment/"
+            "HEAD/2024/12xxx/CVE-2024-12345.json"
+        )
+        cache = JsonCache(root=tmp_path)
+        http = FakeHttp(errors={url: HttpError("gone", status=410)})
+        assert VulnrichmentClient(http, cache).lookup(
+            "CVE-2024-12345",
+        ) is None
+        http2 = FakeHttp(errors={url: HttpError("gone", status=410)})
+        assert VulnrichmentClient(http2, cache).lookup(
+            "CVE-2024-12345",
+        ) is None
+        assert http2.gets == []
+
+    def test_503_with_404_in_url_not_negative_cached(
+        self, tmp_path: Path,
+    ):
+        """The transport error message embeds the request URL, and the
+        URL embeds the CVE id — an id containing \"404\" must not turn
+        a transient 503 into a cached \"CISA hasn't enriched this CVE\"
+        for a day. Only the structured status decides."""
+        url = _url("CVE-2021-40444")
+        cache = JsonCache(root=tmp_path)
+        http = FakeHttp(errors={
+            url: HttpError(f"HTTP 503 from {url}", status=503),
+        })
+        assert VulnrichmentClient(http, cache).lookup(
+            "CVE-2021-40444",
+        ) is None
+
+        # The blip is over: the next client must re-probe and win.
+        http_ok = FakeHttp(responses={
+            url: _vulnrichment_record(exploitation="active"),
+        })
+        d = VulnrichmentClient(http_ok, cache).lookup("CVE-2021-40444")
+        assert d is not None
+        assert http_ok.gets == [url]
+
+    def test_statusless_not_found_message_not_negative_cached(
+        self, tmp_path: Path,
+    ):
+        """A status-less transport error whose message happens to say
+        \"not found\" (DNS: \"name or service not found\") is transient
+        for EVERY id — it must never mint a negative entry."""
+        url = _url("CVE-2021-34527")
+        cache = JsonCache(root=tmp_path)
+        http = FakeHttp(errors={
+            url: HttpError(
+                f"urlopen error [Errno -2] name or service not "
+                f"found for {url}",
+            ),
+        })
+        assert VulnrichmentClient(http, cache).lookup(
+            "CVE-2021-34527",
+        ) is None
+
+        http_ok = FakeHttp(responses={
+            url: _vulnrichment_record(exploitation="poc"),
+        })
+        d = VulnrichmentClient(http_ok, cache).lookup("CVE-2021-34527")
+        assert d is not None
+        assert http_ok.gets == [url]
 
     def test_offline_with_cold_cache_returns_none(
         self, tmp_path: Path,
@@ -372,6 +439,161 @@ class TestVulnrichmentClient:
 
 
 # ---------------------------------------------------------------------------
+# Hostile / undecodable records — per-id decode boundary
+# ---------------------------------------------------------------------------
+
+def _hostile_record() -> dict:
+    """CVE-JSON-5 shaped record whose ADP entry carries a truthy
+    non-dict where a dict is expected — the class of shape drift a
+    hostile upstream (or a CDN error page mimicking the schema) can
+    ship inside an otherwise well-formed 200 body."""
+    return {"containers": {"adp": [
+        {"providerMetadata": "CISA-ADP", "metrics": []},
+    ]}}
+
+
+class TestDecodeBoundary:
+    URL = (
+        "https://raw.githubusercontent.com/cisagov/vulnrichment/"
+        "HEAD/2024/12xxx/CVE-2024-12345.json"
+    )
+
+    def test_hostile_subshapes_return_none(self):
+        """A truthy non-dict one level down must not escape the
+        "any unexpected shape returns None" contract."""
+        shapes = [
+            _hostile_record(),
+            {"containers": {"adp": [
+                {"providerMetadata": {"shortName": "CISA-ADP"},
+                 "metrics": [{"other": "junk"}]}]}},
+            {"containers": {"adp": [
+                {"providerMetadata": {"shortName": "CISA-ADP"},
+                 "metrics": [{"other": {"content": [1, 2]}}]}]}},
+            {"containers": {"adp": [
+                {"providerMetadata": {"shortName": 42},
+                 "metrics": "junk"}]}},
+        ]
+        for record in shapes:
+            assert _decode_ssvc(record) is None
+
+    def test_hostile_record_degrades_and_never_enters_cache(
+        self, tmp_path: Path,
+    ):
+        """One hostile 200 body degrades that id to no-signal AND
+        never becomes a disk-cache entry — a record that can't
+        decode must not stick for the positive TTL."""
+        http = FakeHttp(responses={self.URL: _hostile_record()})
+        cache = JsonCache(root=tmp_path)
+        assert VulnrichmentClient(http, cache).lookup(
+            "CVE-2024-12345",
+        ) is None
+        # An offline second client must see a cold cache, not a
+        # poisoned entry replaying for 7 days.
+        offline = VulnrichmentClient(FakeHttp(), cache, offline=True)
+        assert offline.lookup("CVE-2024-12345") is None
+
+    def test_poisoned_cache_entry_is_evicted_not_served(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """A pre-existing poisoned entry (written before the
+        validate-before-cache gate existed, or by a future decoder
+        drift) is evicted on decode failure — never replayed for the
+        rest of its TTL."""
+        import core.cve.vulnrichment as vr
+
+        cache = JsonCache(root=tmp_path)
+        cache.put(
+            "vulnrichment/CVE-2024-12345",
+            _vulnrichment_record(),
+            ttl_seconds=7 * 24 * 3600,
+        )
+
+        def _boom(record):
+            raise AttributeError("decoder drift")
+
+        with monkeypatch.context() as m:
+            m.setattr(vr, "_decode_ssvc", _boom)
+            http = FakeHttp(
+                responses={self.URL: _vulnrichment_record()},
+            )
+            # Must degrade, not raise — and evict the poison.
+            assert VulnrichmentClient(http, cache).lookup(
+                "CVE-2024-12345",
+            ) is None
+        assert cache.get(
+            "vulnrichment/CVE-2024-12345", ttl_seconds=7 * 24 * 3600,
+        ) is None, "poisoned entry must be evicted, not served"
+
+        # With the decoder healthy again, a fresh client recovers.
+        http2 = FakeHttp(responses={self.URL: _vulnrichment_record()})
+        d = VulnrichmentClient(http2, cache).lookup("CVE-2024-12345")
+        assert d is not None
+        assert http2.gets == [self.URL]
+
+    def test_lookup_many_one_undecodable_id_degrades_only_that_id(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """The decode sits inside the per-id boundary: one hostile
+        record must not sink the whole batch (pool path, >4 ids)."""
+        import core.cve.vulnrichment as vr
+
+        cves = [f"CVE-2024-{90101 + i}" for i in range(6)]
+        bad = cves[3]
+        responses = {_url(c): _vulnrichment_record() for c in cves}
+        responses[_url(bad)] = {"_marker": bad, **_vulnrichment_record()}
+
+        real_decode = _decode_ssvc
+
+        def _selective(record):
+            if isinstance(record, dict) and record.get("_marker") == bad:
+                raise AttributeError("hostile record")
+            return real_decode(record)
+
+        monkeypatch.setattr(vr, "_decode_ssvc", _selective)
+        client = VulnrichmentClient(
+            FakeHttp(responses=responses), JsonCache(root=tmp_path),
+        )
+        out = client.lookup_many(cves, max_workers=2)
+        assert set(out) == set(cves) - {bad}
+
+    def test_lookup_many_cached_hit_decode_is_guarded(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """The cached-hit decode lane in ``lookup_many`` is equally
+        per-id guarded: a poisoned disk entry degrades that id (and
+        is evicted), the rest of the batch resolves."""
+        import core.cve.vulnrichment as vr
+
+        cves = ["CVE-2024-91201", "CVE-2024-91202"]
+        bad = cves[0]
+        cache = JsonCache(root=tmp_path)
+        cache.put(
+            f"vulnrichment/{bad}",
+            {"_marker": bad, **_vulnrichment_record()},
+            ttl_seconds=7 * 24 * 3600,
+        )
+
+        real_decode = _decode_ssvc
+
+        def _selective(record):
+            if isinstance(record, dict) and record.get("_marker") == bad:
+                raise AttributeError("hostile record")
+            return real_decode(record)
+
+        monkeypatch.setattr(vr, "_decode_ssvc", _selective)
+        responses = {_url(c): _vulnrichment_record() for c in cves}
+        responses[_url(bad)] = {"_marker": bad, **_vulnrichment_record()}
+        client = VulnrichmentClient(
+            FakeHttp(responses=responses), cache,
+        )
+        out = client.lookup_many(cves)
+        assert set(out) == {cves[1]}
+        assert cache.get(
+            f"vulnrichment/{bad}", ttl_seconds=7 * 24 * 3600,
+        ) is None, "poisoned entry must be evicted"
+
+
+# ---------------------------------------------------------------------------
 # SSVCDecision properties
 # ---------------------------------------------------------------------------
 
@@ -389,3 +611,177 @@ class TestSSVCDecisionProperties:
         )
         assert d.is_active is active
         assert d.has_exploit is has_exp
+
+
+# ---------------------------------------------------------------------------
+# lookup_many — scan-wide batched lookup
+# ---------------------------------------------------------------------------
+
+def _url(cve: str) -> str:
+    u = _url_for_cve(cve)
+    assert u is not None
+    return u
+
+
+class TestLookupMany:
+    """``lookup_many`` is the scan-scale entry point: cache hits are
+    free, uncached fetches run on a bounded pool under an optional
+    network budget spent in input order."""
+
+    def test_resolves_all_and_counts_requests(self, tmp_path: Path):
+        cves = [f"CVE-2024-{10000 + i}" for i in range(6)]
+        http = FakeHttp(responses={
+            _url(c): _vulnrichment_record(exploitation="active")
+            for c in cves
+        })
+        client = VulnrichmentClient(http, JsonCache(root=tmp_path))
+        out = client.lookup_many(cves)
+        assert set(out) == set(cves)
+        assert all(d.exploitation == "active" for d in out.values())
+        # One GET per CVE (6 ids exercises the thread-pool path;
+        # order across workers is unspecified).
+        assert sorted(http.gets) == sorted(_url(c) for c in cves)
+
+    def test_budget_spent_in_input_order(self, tmp_path: Path):
+        cves = ["CVE-2024-30001", "CVE-2024-30002", "CVE-2024-30003"]
+        http = FakeHttp(responses={
+            _url(c): _vulnrichment_record() for c in cves
+        })
+        client = VulnrichmentClient(http, JsonCache(root=tmp_path))
+        out = client.lookup_many(cves, fetch_budget=2)
+        assert set(out) == set(cves[:2])
+        assert http.gets == [_url(c) for c in cves[:2]]
+
+    def test_cached_ids_do_not_consume_budget(self, tmp_path: Path):
+        """Disk-cache hits resolve for free: with CVE-1 already
+        cached, a budget of 1 still fetches CVE-2."""
+        cves = ["CVE-2024-40001", "CVE-2024-40002"]
+        cache = JsonCache(root=tmp_path)
+        warm = FakeHttp(responses={_url(cves[0]): _vulnrichment_record()})
+        VulnrichmentClient(warm, cache).lookup(cves[0])
+
+        http = FakeHttp(responses={_url(cves[1]): _vulnrichment_record()})
+        client = VulnrichmentClient(http, cache)
+        out = client.lookup_many(cves, fetch_budget=1)
+        assert set(out) == set(cves)
+        assert http.gets == [_url(cves[1])]
+
+    def test_second_call_uses_memo(self, tmp_path: Path):
+        cves = ["CVE-2024-50001", "CVE-2024-50002"]
+        http = FakeHttp(responses={
+            _url(c): _vulnrichment_record() for c in cves
+        })
+        client = VulnrichmentClient(http, JsonCache(root=tmp_path))
+        client.lookup_many(cves)
+        n = len(http.gets)
+        out = client.lookup_many(cves)
+        assert len(http.gets) == n
+        assert set(out) == set(cves)
+        # ...and the single-CVE path shares the memo too.
+        assert client.lookup(cves[0]) is not None
+        assert len(http.gets) == n
+
+    def test_skipped_ids_are_not_memoised(self, tmp_path: Path):
+        """An over-budget skip must stay retryable: a later direct
+        ``lookup`` (or the next run) still fetches it."""
+        cves = ["CVE-2024-60001", "CVE-2024-60002"]
+        http = FakeHttp(responses={
+            _url(c): _vulnrichment_record() for c in cves
+        })
+        client = VulnrichmentClient(http, JsonCache(root=tmp_path))
+        out = client.lookup_many(cves, fetch_budget=1)
+        assert set(out) == {cves[0]}
+        d = client.lookup(cves[1])
+        assert d is not None
+        assert http.gets == [_url(c) for c in cves]
+
+    def test_offline_serves_cache_only(self, tmp_path: Path):
+        cves = ["CVE-2024-70001", "CVE-2024-70002"]
+        cache = JsonCache(root=tmp_path)
+        warm = FakeHttp(responses={_url(cves[0]): _vulnrichment_record()})
+        VulnrichmentClient(warm, cache).lookup(cves[0])
+
+        http = FakeHttp()
+        client = VulnrichmentClient(http, cache, offline=True)
+        out = client.lookup_many(cves)
+        assert set(out) == {cves[0]}
+        assert http.gets == []
+
+    def test_malformed_ids_skipped(self, tmp_path: Path):
+        http = FakeHttp(responses={
+            _url("CVE-2024-80001"): _vulnrichment_record(),
+        })
+        client = VulnrichmentClient(http, JsonCache(root=tmp_path))
+        out = client.lookup_many(
+            ["CVE-2024-80001", "..", "a//b", "", None, 42],  # type: ignore[list-item]
+        )
+        assert set(out) == {"CVE-2024-80001"}
+        assert http.gets == [_url("CVE-2024-80001")]
+
+    def test_one_failure_degrades_only_that_id(self, tmp_path: Path):
+        """A raising fetch (transport surprise, hostile response)
+        must not sink its batchmates — that id is simply absent."""
+        cves = [f"CVE-2024-{90001 + i}" for i in range(6)]
+        responses = {_url(c): _vulnrichment_record() for c in cves[1:]}
+        http = FakeHttp(
+            responses=responses,
+            errors={_url(cves[0]): RuntimeError("connection reset")},
+        )
+        client = VulnrichmentClient(http, JsonCache(root=tmp_path))
+        out = client.lookup_many(cves)
+        assert set(out) == set(cves[1:])
+
+    def test_failed_fetches_are_not_memoised(self, tmp_path: Path):
+        """Docstring contract: \"Skipped and FAILED ids are NOT
+        memoised\". A transient failure during the batched prefetch
+        must leave the id retryable by a later direct lookup in the
+        same process."""
+
+        class FlakyHttp:
+            def __init__(self, url: str, payload: dict) -> None:
+                self.url, self.payload = url, payload
+                self.calls = 0
+
+            def get_json(self, url: str, timeout: int = 30) -> dict:
+                self.calls += 1
+                if self.calls == 1:
+                    raise HttpError(f"HTTP 500 from {url}", status=500)
+                assert url == self.url
+                return self.payload
+
+        cve = "CVE-2024-95001"
+        http = FlakyHttp(_url(cve), _vulnrichment_record())
+        client = VulnrichmentClient(http, JsonCache(root=tmp_path))
+        assert client.lookup_many([cve]) == {}
+        d = client.lookup(cve)
+        assert d is not None, "failed fetch was memoised — retry lost"
+        assert http.calls == 2
+
+    def test_definitive_no_signal_is_memoised(self, tmp_path: Path):
+        """The flip side: a successfully fetched record WITHOUT an
+        SSVC scorecard is a definitive no-signal answer — memoised so
+        repeat lookups in the run stay free."""
+        cve = "CVE-2024-95002"
+        http = FakeHttp(responses={
+            _url(cve): {"containers": {"adp": []}},
+        })
+        client = VulnrichmentClient(http, JsonCache(root=tmp_path))
+        assert client.lookup_many([cve]) == {}
+        assert client.lookup(cve) is None
+        assert http.gets == [_url(cve)]
+
+    def test_budget_truncation_logs_one_summary_line(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        cves = [f"CVE-2024-{20001 + i}" for i in range(10)]
+        http = FakeHttp(responses={
+            _url(c): _vulnrichment_record() for c in cves
+        })
+        client = VulnrichmentClient(http, JsonCache(root=tmp_path))
+        with caplog.at_level("INFO", logger="core.cve.vulnrichment"):
+            client.lookup_many(cves, fetch_budget=3)
+        budget_lines = [
+            r for r in caplog.records if "budget" in r.getMessage()
+        ]
+        assert len(budget_lines) == 1
+        assert "skipped 7" in budget_lines[0].getMessage()

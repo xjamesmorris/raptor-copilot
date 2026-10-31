@@ -66,6 +66,7 @@ overview:
 | [Crash Analysis](crash-analysis.md) | Autonomous crash root-cause analysis |
 | [Audit](audit.md) | Systematic code review: hypotheses, tools, strategies, gates, long runs and resume |
 | [Validation](validation.md) | Exploitability validation pipeline (stages 0, A--F, 1) |
+| [Understand Graph](understand-graph.md) | SQLite graph memory behind `/understand`: what goes in, consumers, operator queries, snapshot diff |
 | [Binary Analysis](binary-analysis.md) | Binary oracle, `/binary`, exploit feasibility |
 | [SCA](sca.md) | Software composition analysis |
 | [CVE Patch Discovery](cve-diff.md) | Find, acquire, and diff the fix commit for a CVE |
@@ -73,6 +74,8 @@ overview:
 | [Frida](frida.md) | Dynamic instrumentation |
 | [ZKPoX](zkpox.md) | Proof of exploit: witness eligibility, bundles, sandboxed reproduction |
 | [Sandbox](sandbox.md) | Process isolation and sandboxing |
+| [WSL](wsl.md) | Running under WSL2: Landlock routes, Windows-interop mounts, tool notes |
+| [Agent Security](agent-security.md) | Agent capabilities, tool boundaries, network controls and human approval |
 | [LLM Providers](llm.md) | Provider configuration, Bedrock, multi-model workflows, cost management |
 | [SAGE](sage.md) | Persistent memory: setup, HMAC key, CPU/GPU, use cases, upgrades |
 | [Security](security.md) | RAPTOR's own security model |

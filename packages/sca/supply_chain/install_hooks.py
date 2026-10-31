@@ -30,9 +30,10 @@ import json as _json
 import logging
 from dataclasses import dataclass
 
-from ..models import Confidence, Dependency, Manifest, PinStyle
+from ..models import Confidence, Dependency, Manifest
 from ..parsers import _safe_read
-from . import _hook_patterns, _intree_resolve
+from . import _hook_patterns, _intree_resolve, _own_host
+from ..parsers._base import PARSE_ESCAPE_ERRORS
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -110,49 +111,20 @@ def scan_manifests(
 def _resolve_host(
     manifest: Manifest, deps: list[Dependency],
 ) -> Dependency:
-    """Return a Dependency whose ``name`` is the package's OWN name.
+    """Return a Dependency whose ``name`` is the package's OWN name
+    (``data.name``), or the placeholder when the manifest lacks one.
 
-    Strategy:
-      1. Read ``data.name`` from the manifest.
-      2. If a dep in ``deps`` matches that name AND is declared at
-         this manifest path, return it (preserves the parser's
-         confidence / pin metadata).
-      3. Otherwise synthesise a placeholder with the package's
-         own name.
-      4. Fallback to the generic placeholder when reading the name
-         fails.
+    Delegates to the shared resolver so every package-own detector
+    anchoring at this manifest produces an identical host key — the
+    composite chokepoint's HOOK-involving pairs depend on that.
+    ``deps`` is no longer consulted: the host is a pure function of
+    the manifest file.
     """
-    text = _safe_read.read_bounded(manifest.path, follow_symlinks=False)
-    if text is None:
-        return _placeholder_for_manifest(manifest)
-    try:
-        data = _json.loads(text)
-    except _json.JSONDecodeError:
-        return _placeholder_for_manifest(manifest)
-    if not isinstance(data, dict):
-        return _placeholder_for_manifest(manifest)
-    pkg_name = data.get("name")
-    if not isinstance(pkg_name, str) or not pkg_name:
-        return _placeholder_for_manifest(manifest)
-    for d in deps:
-        if (d.declared_in == manifest.path
-                and d.name == pkg_name):
-            return d
-    return Dependency(
-        ecosystem=manifest.ecosystem,
-        name=pkg_name,
-        version=(data.get("version")
-                 if isinstance(data.get("version"), str) else None),
-        declared_in=manifest.path,
-        scope="main",
-        is_lockfile=False,
-        pin_style=PinStyle.UNKNOWN,
-        direct=True,
-        purl=f"pkg:{manifest.ecosystem.lower()}/{pkg_name}",
-        parser_confidence=Confidence(
-            "high",
-            reason="package's own name from manifest data.name",
-        ),
+    del deps
+    return _own_host.resolve_own_host(
+        manifest,
+        reason="placeholder for install-hook finding host",
+        placeholder_name="<package.json>",
     )
 
 
@@ -179,7 +151,7 @@ def _scan_one(path: Path, host: Dependency) -> list[InstallHookFinding]:
         return []
     try:
         data = _json.loads(text)
-    except _json.JSONDecodeError:
+    except (_json.JSONDecodeError, *PARSE_ESCAPE_ERRORS):  # type: ignore[misc]  # hostile-input escape classes
         return []
     if not isinstance(data, dict):
         return []
@@ -219,14 +191,15 @@ def _scan_one(path: Path, host: Dependency) -> list[InstallHookFinding]:
             has_publish_action=analysis.has_publish_action,
         )
         # Phase 5 worm-shape: install hook reads credentials AND
-        # invokes a publish action.  Suppress when the host package
-        # is in the publish-helpers allowlist (semantic-release et
-        # al. legitimately do both at runtime; the malicious shape
-        # is doing it from an INSTALL hook on an unrelated package).
+        # invokes a publish action.  Suppress only for an ATTESTED
+        # publish helper — allowlisted name corroborated by a vendored
+        # path (node_modules/<name>/...): semantic-release et al.
+        # legitimately do both at runtime, but the name alone is
+        # self-declared manifest content an attacker can copy.
         worm_shape = (
             analysis.reads_credentials
             and analysis.has_publish_action
-            and not _hook_patterns.is_publish_helper(host)
+            and not _hook_patterns.is_attested_publish_helper(host)
         )
         if analysis.reasons:
             out.append(InstallHookFinding(
@@ -286,23 +259,6 @@ def _scan_one(path: Path, host: Dependency) -> list[InstallHookFinding]:
                 ),
             ))
     return out
-
-
-def _placeholder_for_manifest(manifest: Manifest) -> Dependency:
-    return Dependency(
-        ecosystem=manifest.ecosystem,
-        name="<package.json>",
-        version=None,
-        declared_in=manifest.path,
-        scope="main",
-        is_lockfile=False,
-        pin_style=PinStyle.UNKNOWN,
-        direct=True,
-        purl="",
-        parser_confidence=Confidence(
-            "low", reason="placeholder for install-hook finding host",
-        ),
-    )
 
 
 __all__ = ["InstallHookFinding", "InstallHookHit", "scan_manifests"]

@@ -22,6 +22,7 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
+from core.source.lines import split_lines
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -64,7 +65,7 @@ def _pack_cleanup_names(target_path: Path | None) -> frozenset[str]:
         if not is_kernel_tree(target_path):
             return frozenset()
         raw = json.loads(
-            (_PACK_DIR / "linux_kernel.json").read_text(encoding="utf-8"),
+            (_PACK_DIR / "linux_kernel.json").read_text(encoding="utf-8"),  # raw-open: shipped vocab pack under _PACK_DIR (RAPTOR-owned)
         )
     except Exception:
         return frozenset()
@@ -124,12 +125,19 @@ _ERROR_RETURN_RE = re.compile(
     r"-1|0(?!\s*[;,)]))",
 )
 
+# \b pins the left operand to a word start: unanchored, every
+# position inside a long identifier run starts a fresh scan of the
+# rest of the run — quadratic on hostile source. A mid-word start is
+# a false token (the tail of a longer identifier) either way.
 _COMPARISON_RE = re.compile(
-    r"(\w+)\s*(==|!=|<=|>=|<(?!=)|>(?!=))\s*(\w+|\d+)",
+    r"\b(\w+)\s*(==|!=|<=|>=|<(?!=)|>(?!=))\s*(\w+|\d+)",
 )
 
+# The optional bang gates its own trailing whitespace: the naive
+# ``\s*!?\s*`` put two whitespace spans around it — quadratic on an
+# if-line ending in a whitespace run.
 _GUARD_CHECK_RE = re.compile(
-    r"\b(if\s*\(\s*!?\s*\w+|IS_ERR\s*\(|unlikely\s*\(|WARN_ON\s*\(|BUG_ON\s*\()",
+    r"\b(if\s*\(\s*(?:!\s*)?\w+|IS_ERR\s*\(|unlikely\s*\(|WARN_ON\s*\(|BUG_ON\s*\()",
 )
 
 
@@ -187,7 +195,7 @@ def check_cleanup_consistency(
     segment, and flags paths that omit a cleanup present in the
     majority.
     """
-    lines = source.splitlines()
+    lines = split_lines(source)
     if len(lines) < 4:
         return []
 
@@ -196,7 +204,12 @@ def check_cleanup_consistency(
         if (domain_model or target_path) else _CLEANUP_CALLS
     )
 
-    segments: list[tuple[int, set[str]]] = []
+    # (segment start line, RETURN line, cleanups seen in between).
+    # The return line is what reports: it is the flagged path's exit
+    # site, while the segment start is merely the line after the
+    # PREVIOUS return — a hint anchored there can point a whole
+    # segment away from the return it describes.
+    segments: list[tuple[int, int, frozenset[str]]] = []
     current_cleanups: set[str] = set()
     segment_start = 1
 
@@ -204,7 +217,7 @@ def check_cleanup_consistency(
         for m in cleanup_re.finditer(line):
             current_cleanups.add(m.group(1).lower())
         if _RETURN_RE.search(line):
-            segments.append((segment_start, frozenset(current_cleanups)))
+            segments.append((segment_start, i, frozenset(current_cleanups)))
             current_cleanups = set()
             segment_start = i + 1
 
@@ -212,7 +225,7 @@ def check_cleanup_consistency(
         return []
 
     all_cleanups: Counter[str] = Counter()
-    for _, cleanups in segments:
+    for _, _, cleanups in segments:
         for c in cleanups:
             all_cleanups[c] += 1
 
@@ -222,16 +235,16 @@ def check_cleanup_consistency(
     for cleanup_fn, count in all_cleanups.items():
         if count < majority_threshold:
             continue
-        for line_no, cleanups in segments:
+        for _start, return_line, cleanups in segments:
             if cleanup_fn not in cleanups:
                 results.append(IntraFunctionAsymmetry(
                     kind="cleanup",
                     description=(
                         f"{count}/{len(segments)} return paths call "
-                        f"{cleanup_fn}(), but the path at line {line_no} "
-                        f"does not"
+                        f"{cleanup_fn}(), but the path returning at "
+                        f"line {return_line} does not"
                     ),
-                    line=line_no,
+                    line=return_line,
                 ))
 
     return results
@@ -246,7 +259,7 @@ def check_operator_consistency(
     when the operator is inconsistent (e.g. 5 comparisons of ``idx``
     use ``<`` but one uses ``<=``).
     """
-    lines = source.splitlines()
+    lines = split_lines(source)
     if len(lines) < 3:
         return []
 

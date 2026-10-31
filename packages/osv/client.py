@@ -46,6 +46,20 @@ DEFAULT_TTL_SECONDS = 24 * 3600
 _MAX_QUERY_PAGES = 20
 
 
+class OsvLookupError(Exception):
+    """A per-vuln lookup failed for a NON-definitive reason.
+
+    Raised (opt-in, see :meth:`OsvClient.get_vuln`) for network
+    failures, non-404 HTTP errors, malformed response bodies, and
+    offline cache misses — everything where "OSV has no record" would
+    be the wrong conclusion. A definitive 404 stays ``None``: that IS
+    OSV's authoritative "no such record".
+
+    Never cached: only successful record fetches enter the cache, so a
+    transient outage can't be replayed as an authoritative answer.
+    """
+
+
 class OsvClient:
     """Thin client over the OSV.dev v1 API. Construct one per run."""
 
@@ -62,14 +76,33 @@ class OsvClient:
         self._offline = offline
         self._ttl = ttl_seconds
 
-    def get_vuln(self, vuln_id: str) -> OsvRecord | None:
-        """Return a parsed :class:`OsvRecord` or ``None`` on 404 / error / parse failure."""
-        record = self._cached_get_vuln(vuln_id)
+    def get_vuln(
+        self, vuln_id: str, *, raise_on_transient: bool = False,
+    ) -> OsvRecord | None:
+        """Return a parsed :class:`OsvRecord` or ``None`` on 404 / error / parse failure.
+
+        With ``raise_on_transient=True``, non-definitive failures
+        (network error, non-404 HTTP status, malformed body, offline
+        cache miss) raise :class:`OsvLookupError` instead of degrading
+        to ``None`` — callers minting verdicts must not read a
+        transient outage as "OSV has no record". The default keeps the
+        historical swallow-to-``None`` shape for aggregating callers.
+        """
+        try:
+            record = self._cached_get_vuln(vuln_id)
+        except OsvLookupError:
+            if raise_on_transient:
+                raise
+            return None
         if record is None:
             return None
         try:
             return parse_record(record)
-        except ValueError as exc:
+        except (TypeError, ValueError) as exc:
+            # TypeError belts future parser drift: the record may
+            # already be disk-cached (write precedes parse), so a
+            # parse crash class outside the catch would replay on
+            # every cached read for the TTL instead of degrading.
             log.debug("osv: skipping malformed record %s: %s", vuln_id, exc)
             return None
 
@@ -153,13 +186,13 @@ class OsvClient:
                 for i, token in pending
             ]
             try:
-                data = self._http.post_json(
+                cont_data = self._http.post_json(
                     f"{OSV_BASE_URL}/querybatch", {"queries": cont_queries},
                 )
             except HttpError as exc:
                 log.warning("osv: querybatch continuation failed: %s", exc)
-                data = None
-            cont_results = data.get("results") if isinstance(data, dict) else None
+                cont_data = None
+            cont_results = cont_data.get("results") if isinstance(cont_data, dict) else None
             if not isinstance(cont_results, list) or len(cont_results) != len(pending):
                 for i, _token in pending:
                     out[i] = None
@@ -180,11 +213,21 @@ class OsvClient:
 
     @staticmethod
     def _slot_ids(slot: dict[str, Any]) -> list[str]:
-        """Extract string vuln IDs from one querybatch result slot."""
+        """Extract string vuln IDs from one querybatch result slot.
+
+        Empty ids are dropped: they are server-minted junk, and the
+        hydration loop would only feed them back to the per-vuln
+        endpoint (where the degenerate-id gate refuses them). A truthy
+        non-list ``vulns`` is equally junk — never iterated.
+        """
+        vulns = slot.get("vulns")
+        if not isinstance(vulns, list):
+            return []
         return [
             v["id"]
-            for v in slot.get("vulns") or []
+            for v in vulns
             if isinstance(v, dict) and isinstance(v.get("id"), str)
+            and v["id"]
         ]
 
     # ------------------------------------------------------------------
@@ -192,13 +235,26 @@ class OsvClient:
     # ------------------------------------------------------------------
 
     def _cached_get_vuln(self, vuln_id: str) -> dict[str, Any] | None:
-        cache_key = f"osv/vulns/{_safe_id(vuln_id)}"
+        """Raw record dict, ``None`` for a definitive 404, or
+        :class:`OsvLookupError` for any non-definitive failure."""
+        # Shape-gate the id BEFORE it joins a cache key or URL. Ids
+        # arrive from server-controlled querybatch output, not just
+        # operator input (the epss/vulnrichment clients carry the same
+        # validate-first discipline for the same reason); '' / '.' /
+        # '..' would raise ValueError out of the cache-key layer —
+        # escaping the OsvLookupError-only catches upstream and
+        # killing the scan on one hostile slot.
+        if not vuln_id or vuln_id in (".", ".."):
+            msg = f"osv: refusing degenerate vuln id {vuln_id!r}"
+            raise OsvLookupError(msg)
+        cache_key = f"osv/vulns/{_encode_id(vuln_id)}"
         if self._cache is not None:
             cached = self._cache.get(cache_key, ttl_seconds=self._ttl)
             if isinstance(cached, dict):
                 return cached
         if self._offline:
-            return None
+            msg = f"osv: offline and no cached record for {vuln_id}"
+            raise OsvLookupError(msg)
         # Percent-encode `vuln_id` before interpolating into the
         # URL. Pre-fix the raw `vuln_id` flowed straight into the
         # path segment — for IDs containing `/` (rare but real
@@ -206,26 +262,41 @@ class OsvClient:
         # query string), `#` (fragment), spaces, or control
         # bytes (worst case), the resulting URL was either
         # malformed (server returned 400) or resolved to the
-        # wrong endpoint silently. `_safe_id` already sanitises
-        # for the CACHE KEY but the URL path needed proper
-        # percent-encoding via `urllib.parse.quote(..., safe="")`
-        # so even `/` gets encoded as %2F.
-        from urllib.parse import quote
-        encoded_id = quote(vuln_id, safe="")
+        # wrong endpoint silently. The same injective encoding
+        # keys the cache above, so URL identity and cache identity
+        # cannot diverge.
+        encoded_id = _encode_id(vuln_id)
         try:
             data = self._http.get_json(f"{OSV_BASE_URL}/vulns/{encoded_id}")
         except HttpError as exc:
             if exc.status == 404:
+                # Definitive: OSV authoritatively has no such record.
                 return None
             log.warning("osv: get_vuln(%s) failed: %s", vuln_id, exc)
-            return None
+            msg = f"osv: get_vuln({vuln_id}) failed: {exc}"
+            raise OsvLookupError(msg) from exc
         if not isinstance(data, dict):
-            return None
+            # A 200 whose body isn't a record object (proxy/CDN error
+            # page shaped as JSON) — not OSV saying "no record".
+            msg = f"osv: get_vuln({vuln_id}) returned a non-object body"
+            raise OsvLookupError(msg)
         if self._cache is not None:
             self._cache.put(cache_key, data, ttl_seconds=self._ttl)
         return data
 
 
-def _safe_id(s: str) -> str:
-    """Make a vuln ID safe for path-segment caching."""
-    return s.replace("/", "_").replace("\\", "_")
+def _encode_id(s: str) -> str:
+    """Injective, path-safe encoding of a vuln ID for the cache key.
+
+    The previous ``/`` / ``\\`` → ``_`` replacement was lossy:
+    ``GHSA-a/b`` and ``GHSA-a_b`` shared one cache file, letting a
+    crafted id shadow another id's cached record for the TTL.
+    Percent-encoding every reserved byte (``safe=""``) is injective —
+    JsonCache documents exactly this responsibility for callers that
+    interpolate externally-sourced names into key segments. Keys for
+    ids containing ``/`` change spelling once; the old entries simply
+    expire unread.
+    """
+    from urllib.parse import quote
+
+    return quote(s, safe="")

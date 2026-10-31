@@ -86,7 +86,9 @@ from core.oci.sbom import (
     packages_from_layer_files,
 )
 
+from .file_shapes import is_dockerfile as _is_dockerfile
 from .models import Confidence, Dependency, PinStyle
+from .parsers._base import PARSE_ESCAPE_ERRORS
 
 logger = logging.getLogger(__name__)
 
@@ -94,9 +96,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Discovery
 # ---------------------------------------------------------------------------
-
-
-_DOCKERFILE_NAMES = {"Dockerfile", "Containerfile"}
 
 
 def _read_source_bounded(p: Path) -> str | None:
@@ -110,22 +109,6 @@ def _read_source_bounded(p: Path) -> str | None:
     """
     from .parsers._safe_read import read_bounded
     return read_bounded(p, follow_symlinks=False)
-
-
-def _is_dockerfile(path: Path) -> bool:
-    """Match Dockerfile / Containerfile / Dockerfile.<variant> /
-    <variant>.Dockerfile / *.dockerfile.
-
-    Same shape as ``discovery._is_inline_install_source`` but
-    Dockerfile-only — devcontainer.json, shell scripts, and GHA
-    workflows don't carry a base image.
-    """
-    name = path.name
-    if name in _DOCKERFILE_NAMES:
-        return True
-    if name.startswith("Dockerfile.") or name.endswith(".Dockerfile"):
-        return True
-    return path.suffix == ".dockerfile"
 
 
 # Directory names that almost certainly carry test fixtures or CI
@@ -146,6 +129,23 @@ _IMAGE_DISCOVERY_EXCLUDE_PARENT_DIRS = frozenset({
     "ci",            # CI infrastructure dockerfiles, not the app
     "fixtures", "fixture",
     "examples", "example", "sample", "samples",
+    # "testdata" is the Go-idiomatic fixture directory (the Go
+    # toolchain ignores it entirely — it can never hold production
+    # build inputs). Trade-off, both directions:
+    # - Excluding: a production image ref under a dir literally
+    #   named testdata would be missed. Effectively nil — Go
+    #   tooling reserves the name for compiler-ignored fixtures,
+    #   and non-Go projects follow the same convention.
+    # - NOT excluding: K8s YAML fixtures under testdata/ dominate
+    #   image discovery on Go projects. Measured on istio
+    #   release-1.4: 113 of 155 discovered image refs and 17 of 25
+    #   unique resolvable images (floating alpine/busybox/nginx/perl
+    #   tags plus the literal placeholder ``image``) were reachable
+    #   only via testdata paths, and 78% of 41,633 vuln findings
+    #   (32,664) were declared in testdata files — fixture-image
+    #   SBOMs swamping the real base-image signal and the scan
+    #   budget.
+    "testdata",
 })
 
 
@@ -625,7 +625,7 @@ def fetch_image_sbom(
             target_digest, image,
         )
     sbom_key = (
-        _sbom_cache_key(ref.registry, target_digest)
+        _sbom_cache_key(ref.registry, target_digest)  # type: ignore[arg-type]
         if digest_cacheable else None
     )
 
@@ -961,7 +961,7 @@ def find_compose_image_refs(target: Path) -> list[ImageRefSource]:
                 continue
             try:
                 data = safe_load(text)
-            except yaml.YAMLError:
+            except (yaml.YAMLError, *PARSE_ESCAPE_ERRORS):  # hostile-input escape classes
                 continue
             if not isinstance(data, dict):
                 continue
@@ -1009,7 +1009,7 @@ def find_gitlab_ci_image_refs(target: Path) -> list[ImageRefSource]:
                 continue
             try:
                 data = safe_load(text)
-            except yaml.YAMLError:
+            except (yaml.YAMLError, *PARSE_ESCAPE_ERRORS):  # hostile-input escape classes
                 continue
             if not isinstance(data, dict):
                 continue
@@ -1072,7 +1072,11 @@ def find_kubernetes_image_refs(target: Path) -> list[ImageRefSource]:
     except ImportError:
         return out
     from .discovery import EXCLUDED_DIR_NAMES
-    from .parsers.kubernetes import _WORKLOAD_KINDS, _is_k8s_manifest
+    from .parsers.kubernetes import (
+        _WORKLOAD_KINDS,
+        _is_k8s_manifest,
+        resolve_workload_pod_spec,
+    )
     for root, dirs, files in os.walk(target):
         dirs[:] = [
             d for d in dirs
@@ -1091,7 +1095,7 @@ def find_kubernetes_image_refs(target: Path) -> list[ImageRefSource]:
                 continue
             try:
                 docs = list(safe_load_all(text))
-            except yaml.YAMLError:
+            except (yaml.YAMLError, *PARSE_ESCAPE_ERRORS):  # hostile-input escape classes
                 continue
             for doc in docs:
                 if not isinstance(doc, dict):
@@ -1102,12 +1106,10 @@ def find_kubernetes_image_refs(target: Path) -> list[ImageRefSource]:
                 spec = doc.get("spec")
                 if not isinstance(spec, dict):
                     continue
-                template_spec = spec
-                template = spec.get("template")
-                if isinstance(template, dict):
-                    ts = template.get("spec")
-                    if isinstance(ts, dict):
-                        template_spec = ts
+                # Shared kind-nesting rule (CronJob's jobTemplate
+                # depth included) — a re-implemented walk here drifted
+                # from the parser and dropped every CronJob image.
+                template_spec = resolve_workload_pod_spec(spec, kind)
                 for cf in (
                     "containers", "initContainers", "ephemeralContainers",
                 ):
@@ -1219,7 +1221,7 @@ def scan_image_sources(
                     digest_cache=None,
                     disk_cache=cache,
                 )
-            except ValueError as e:
+            except Exception as e:  # noqa: BLE001 — per-image containment: any raise aborts pool.map and loses every other image's SBOM
                 logger.warning(
                     "sca.dockerfile_from: SBOM fetch failed for %s: %s",
                     image, e,

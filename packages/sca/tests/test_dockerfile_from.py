@@ -12,6 +12,8 @@ from __future__ import annotations
 import gzip
 import io
 import tarfile
+
+import pytest
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -318,6 +320,70 @@ def test_find_dockerfiles_excludes_test_ci_parents(tmp_path: Path):
     found_names = {p.parent.name + "/" + p.name for p in found}
     assert found_names == {tmp_path.name + "/Dockerfile"}, (
         f"expected only the root Dockerfile, got: {found_names}"
+    )
+
+
+def test_find_dockerfiles_excludes_testdata_parent(tmp_path: Path):
+    """``testdata/`` is the Go-idiomatic fixture directory —
+    Dockerfiles under it are test fixtures, never the project's
+    runtime image. A Dockerfile in a sibling non-testdata dir is
+    still found (the exclusion is name-exact, not prefix)."""
+    from packages.sca.dockerfile_from import find_dockerfiles
+    # Production Dockerfiles (kept)
+    (tmp_path / "Dockerfile").write_text("FROM debian:12\n")
+    docker_dir = tmp_path / "pilot" / "docker"
+    docker_dir.mkdir(parents=True)
+    (docker_dir / "Dockerfile.app").write_text("FROM ubuntu:22.04\n")
+    # Go test fixture (skipped)
+    td_dir = tmp_path / "pilot" / "testdata" / "gateway"
+    td_dir.mkdir(parents=True)
+    (td_dir / "Dockerfile").write_text("FROM alpine\n")
+
+    found = {
+        p.relative_to(tmp_path).as_posix() for p in find_dockerfiles(tmp_path)
+    }
+    assert found == {"Dockerfile", "pilot/docker/Dockerfile.app"}, (
+        f"testdata Dockerfile must be skipped, siblings kept; got: {found}"
+    )
+
+
+def test_find_kubernetes_image_refs_excludes_testdata_parent(
+    tmp_path: Path,
+):
+    """K8s manifest fixtures under ``testdata/`` are the dominant
+    image-ref source on Go projects (istio-shaped trees carry
+    hundreds, with floating tags) — they must not feed base-image
+    SBOM scanning. The same manifest in a non-testdata dir is
+    still discovered."""
+    pytest.importorskip("yaml")
+    from packages.sca.dockerfile_from import find_kubernetes_image_refs
+
+    manifest = (
+        "apiVersion: apps/v1\n"
+        "kind: Deployment\n"
+        "spec:\n"
+        "  template:\n"
+        "    spec:\n"
+        "      containers:\n"
+        "        - name: web\n"
+        "          image: {image}\n"
+    )
+    # Fixture manifest (skipped)
+    td_dir = tmp_path / "cmd" / "testdata" / "uninject"
+    td_dir.mkdir(parents=True)
+    (td_dir / "job.yaml").write_text(manifest.format(image="perl"))
+    # Deploy manifest (kept)
+    deploy_dir = tmp_path / "deploy"
+    deploy_dir.mkdir()
+    (deploy_dir / "app.yaml").write_text(
+        manifest.format(image="nginx:1.25")
+    )
+
+    refs = find_kubernetes_image_refs(tmp_path)
+    images = {r.image for r in refs}
+    assert images == {"nginx:1.25"}, (
+        f"testdata manifest must be skipped, deploy manifest kept; "
+        f"got: {images}"
     )
 
 
@@ -828,6 +894,85 @@ def test_find_kubernetes_image_refs_skips_symlinked_file(tmp_path: Path):
     (target / "deployment.yaml").symlink_to(real)
 
     assert find_kubernetes_image_refs(target) == []
+
+
+def test_find_kubernetes_image_refs_reaches_cronjob_containers(
+    tmp_path: Path,
+):
+    """CronJob nests its pod spec one level deeper
+    (``spec.jobTemplate.spec.template.spec``) — the walker must use
+    the parser's shared kind-nesting rule; a ``spec.template.spec``-
+    only walk silently dropped every CronJob image from base-image
+    SBOM/OSV scanning and the egress allowlist derivation."""
+    from packages.sca.dockerfile_from import find_kubernetes_image_refs
+
+    manifest = (
+        "apiVersion: batch/v1\n"
+        "kind: CronJob\n"
+        "metadata:\n"
+        "  name: backup\n"
+        "spec:\n"
+        "  schedule: '0 0 * * *'\n"
+        "  jobTemplate:\n"
+        "    spec:\n"
+        "      template:\n"
+        "        spec:\n"
+        "          containers:\n"
+        "            - name: backup\n"
+        "              image: alpine:3.19\n"
+        "          initContainers:\n"
+        "            - name: prep\n"
+        "              image: busybox:1.36\n"
+    )
+    target = tmp_path / "repo"
+    target.mkdir()
+    (target / "cronjob.yaml").write_text(manifest)
+
+    refs = find_kubernetes_image_refs(target)
+    assert sorted(r.image for r in refs) == ["alpine:3.19", "busybox:1.36"]
+    assert all(r.source_kind == "k8s" for r in refs)
+
+
+def test_walker_and_parser_agree_on_every_workload_kind(tmp_path: Path):
+    """Closure across the twin walkers: for EVERY kind in
+    ``_WORKLOAD_KINDS`` the image-source walker must find exactly the
+    images the parser extracts — the walker importing the kind list
+    but re-implementing the nesting is how CronJob got dropped."""
+    from packages.sca.dockerfile_from import find_kubernetes_image_refs
+    from packages.sca.parsers.kubernetes import (
+        _WORKLOAD_KINDS,
+        _extract_images,
+    )
+
+    api = {"CronJob": "batch/v1", "Job": "batch/v1", "Pod": "v1"}
+    for kind in sorted(_WORKLOAD_KINDS):
+        pod_spec = {
+            "containers": [{"name": "c", "image": f"img-{kind.lower()}:1"}],
+        }
+        if kind == "Pod":
+            spec = pod_spec
+        elif kind == "CronJob":
+            spec = {"jobTemplate": {"spec": {"template": {"spec": pod_spec}}}}
+        else:
+            spec = {"template": {"spec": pod_spec}}
+        doc = {
+            "apiVersion": api.get(kind, "apps/v1"),
+            "kind": kind,
+            "metadata": {"name": "w"},
+            "spec": spec,
+        }
+        parser_images = {img for img, _ctx, _name in
+                         _extract_images(doc, kind=kind)}
+
+        import yaml as _yaml
+
+        target = tmp_path / f"repo-{kind.lower()}"
+        target.mkdir()
+        (target / "workload.yaml").write_text(_yaml.safe_dump(doc))
+        walker_images = {r.image for r in find_kubernetes_image_refs(target)}
+        assert walker_images == parser_images == {f"img-{kind.lower()}:1"}, (
+            f"walker/parser drift for kind {kind}"
+        )
 
 
 def test_find_gitlab_ci_image_refs_skips_symlinked_file(tmp_path: Path):

@@ -31,7 +31,7 @@
 - Alternative: Use Semgrep-only (`--no-codeql`)
 
 **Timeout:**
-- Use: `--extended` flag for security-extended suite (faster)
+- Note: `--extended` runs MORE rules and is slower — dropping it (the default suite) is the timeout-friendly direction
 - Alternative: Skip CodeQL, use Semgrep only
 
 **Not installed:**
@@ -43,23 +43,30 @@
 ### LLM Issues
 
 **Rate limit:**
-- Python handles: Automatic fallback (Claude → GPT-4 → Ollama)
+- Python handles: retries with backoff and reduced concurrency
+- Provider failover: configure a `role: fallback` model in
+  `models.json` (see docs/llm.md) — there is no built-in
+  provider chain without one
 - If all fail: Analyze SARIF files manually
 
 **Placeholder exploits (TODO comments):**
-- Preferred: `/exploit <finding-id>` — wraps the
-  exploit-developer workflow with sandbox + budget tracking
-  and produces a working PoC in `out/exploit_<id>/`.
+- Preferred: `/exploit <target>` — dispatches
+  `python3 raptor.py agentic --repo <target> --no-patches`
+  with sandbox + budget tracking; working PoCs land in the
+  run's `autonomous/exploits/` directory. Add `--sarif <file>`
+  to reuse findings from a previous `/scan` instead of
+  re-scanning.
 - Manual fallback: load `tiers/personas/exploit_developer.md`
   explicitly only if `/exploit` is unavailable / disabled.
   Command: "Load tiers/personas/exploit_developer.md and fix
   finding #X".
 
 **Template patches (recommendations not code):**
-- Preferred: `/patch <finding-id>` — wraps the patch-engineer
-  workflow and produces an applyable diff in
-  `out/patch_<id>/`. For exploit PoC patches, run `/exploit`
-  first to confirm the finding is exploitable.
+- Preferred: `/patch <target>` — dispatches
+  `python3 raptor.py agentic --repo <target> --no-exploits`;
+  patches land in the run's `autonomous/patches/` directory.
+  For exploit PoC patches, run `/exploit` first to confirm the
+  finding is exploitable.
 - Manual fallback: load `tiers/personas/patch_engineer.md`
   (or `tiers/personas/exploit_developer.md` for exploit PoC
   patches) only if `/patch` is unavailable.
@@ -69,7 +76,7 @@
 **Model not found (Ollama):**
 - Check: `ollama list` for available models
 - Install: `ollama pull <model>`
-- Alternative: Use cloud models (Claude/GPT-4)
+- Alternative: Use a configured cloud model (see docs/llm.md)
 
 ---
 
@@ -99,6 +106,92 @@
 **GDB analysis fails:**
 - Use: ASan build (`clang -fsanitize=address`)
 - Alternative: Manual crash analysis with crash analyst persona
+
+---
+
+### Interrupted runs (resume)
+
+An externally-killed run leaves coherent artifacts — do not restart
+from zero when a resume surface exists:
+
+**/understand (multi-model `--hunt`/`--trace`):**
+- Each model's finished result is checkpointed as produced
+  (`understand-checkpoints/` in the run dir); the run's options are
+  pinned in `understand-run-config.json`
+- Re-enter: `libexec/raptor-understand --resume <run-dir>` —
+  checkpointed models carry over at no new cost, only the remainder
+  dispatches; cost accounting stays continuous across segments
+- Drift refusal ("target tree drifted since this run's checkpoints"):
+  re-run fresh, or pass `--allow-drift` to carry the older-tree
+  results loudly
+- Status `completed` but no `*-result.json`: a step that did not own
+  the run stamped it — pass `--reopen`
+
+**/audit:**
+- Re-enter: `libexec/raptor-audit resume <run-dir>` (journal verdicts
+  re-import at $0; see docs/audit.md for the gates)
+
+A SIGTERM/Ctrl-C exit marks the run `interrupted`; a hard kill
+(SIGKILL/OOM) leaves it `running` with a dead worker — both resume.
+A run still in flight (live worker) refuses to resume.
+
+---
+
+### Sandbox containment-floor refusal (`SandboxFloorError`)
+
+A run that stops with "sandbox containment floor violated" or "the
+fresh-procfs contract cannot be met" refused to execute
+attacker-derived/untrusted code below the required containment tier.
+The refusal text names the required floor, the achievable tier, and
+the exact remedies. This is a run-boundary decision point (nothing
+executed).
+
+In an interactive session, offer the remedies as a structured choice
+(see CLAUDE.md § INTERACTIVE PROMPTS; gate with
+`libexec/raptor-may-ask` first — only if it prints `interactive` AND
+the AskUserQuestion tool is available). Quote the actual refusal text
+for the host condition and the exact tier labels from the error;
+never invent values:
+
+1. **Fix the environment (Recommended)** — apply the named host
+   remedy from the refusal (e.g. install the uidmap package, relax
+   the AppArmor userns sysctl, upgrade to a Landlock kernel) and
+   re-run at full containment.
+2. **Lower the floor for this run** — re-run with the exact flag the
+   refusal names (e.g. `--sandbox-floor landlock`). State exactly
+   what is being accepted (the refusal says: e.g. host process table
+   visible to attacker-derived code; /proc read grant withdrawn).
+3. **Persist for this project** — `/project set sandbox-floor
+   <tier>`; the same grant, standing for every subsequent run on the
+   project (per-run `--sandbox-floor` still overrides).
+
+**Non-interactive fallback: refuse** — report the refusal text
+(which already names all the remedies) and stop. Never select a
+floor on the operator's behalf, and never re-run with a lowered
+floor without the operator choosing it. Note: `--sandbox-floor none`
+is not a consentable untrusted floor — if the operator truly wants
+no sandbox, that is the authoritative `--sandbox none` /
+`--no-sandbox` surface.
+
+---
+
+### Diagnosing a stuck, slow, or opaque run
+
+`libexec/raptor-run-status <run-dir>` (or `--project [name]` for every
+run of a project) is the read-only live view of a run's state:
+status, heartbeat age (mtime freshness — a stale heartbeat on a
+`running` run means it stopped making progress), booked spend vs the
+run's cap, LLM call / failed-attempt / timeout counts, breaker trips,
+and the newest call class as a phase hint. It never modifies run
+state — safe to point at an in-flight run.
+
+Use it BEFORE restarting or killing anything:
+- Heartbeat fresh + spend advancing → the run is working; leave it.
+- Heartbeat stale + breaker trips or climbing failed attempts → check
+  provider health (docs/llm.md), then the run's `llm-telemetry.jsonl`.
+- Terminal `failed` status → the error line quotes the recorded
+  failure; `raptor-review digest <run-dir>` summarises what the run
+  produced anyway.
 
 ---
 

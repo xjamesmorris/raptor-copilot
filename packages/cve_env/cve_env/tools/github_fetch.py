@@ -194,7 +194,7 @@ class GhFetchResult:
     )  # [{name,type,path,size}]
     status: int = 0
     reason: str = ""
-    reason_class: str = "ok"  # ok / rate_limited / transport / auth / not_found
+    reason_class: str = "ok"  # ok / rate_limited / transport / auth / not_found / poc_repo_blocked
 
 
 # Per-process cache so ``resolve_github_token`` doesn't fork ``gh`` repeatedly.
@@ -203,6 +203,11 @@ _TOKEN_CACHE: dict[str, str | bool] = {"resolved": False, "value": ""}
 
 def resolve_github_token() -> str:
     """Pick the GitHub token from env or `gh` CLI.
+
+    SIBLINGS (a fix here usually applies there):
+    ``cve_env/infra/service_health.py::_resolve_github_token_for_probe``
+    and ``cve_diff/infra/service_health.py::probe_github`` — all three
+    fork ``gh auth token`` with a sanitised env.
 
     Order of precedence:
       1. ``GITHUB_TOKEN`` env var (explicit, highest priority)
@@ -335,6 +340,20 @@ def github_fetch(
             reason_class="poc_repo_blocked",
         )
     clean_path = path.strip("/")
+    # '.'/'..' segments survive quote() (safe="/" keeps the
+    # separators) and are resolved by the HTTP stack / server —
+    # "../{other}/contents/x" would re-point the request at a
+    # different API route than the one audited above. Refuse them.
+    if any(seg in (".", "..") for seg in clean_path.split("/")):
+        return GhFetchResult(
+            ok=False,
+            reason=(
+                f"path {path!r} contains a '.' or '..' segment — "
+                "give the repo-relative file path without traversal "
+                "segments"
+            ),
+            reason_class="not_found",
+        )
     encoded_path = urllib.parse.quote(clean_path, safe="/")
     url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/contents/{encoded_path}"
     if ref:

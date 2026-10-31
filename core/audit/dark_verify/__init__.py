@@ -15,11 +15,29 @@ Anti-hallucination design:
     against a typed allowlist grammar before generation:
     arg_expressions and native setup_lines (declaration-only),
     param_types / return_type (type spellings), Java imports
-    (dotted names). Free-form code never reaches the harness.
+    (dotted names), the Go import_alias (single identifier).
+    Free-form code never reaches the harness.
   - The harness generates the test from a fixed template.
-  - The import/source path is validated against the finding's file,
-    and the witness is bound to the finding's FUNCTION — a response
-    naming any other function is rejected, never executed.
+  - Module binding holds in the RESOLUTION direction: every language
+    lane asks whether the reference the harness hands the loader
+    resolves to the finding's file under the loader's real rules,
+    through one engine (_resolve.py) with per-language adapters —
+    C/C++/Rust register as structural lanes (compiled directly
+    against spec.file). The STATIC engine is the refusal authority:
+    an unresolvable reference, or one whose earlier loader slots are
+    occupied or unverifiable at validation time, is refused, never
+    executed — for the slot models the adapters encode, as probed
+    per lane with plantable lookalikes by TestLaneBindingClosure.
+    The Python/Ruby/Perl harnesses add a BEST-EFFORT post-load belt
+    (module __file__ / %INC / $LOADED_FEATURES): it reports
+    binding_error instead of a verdict for mis-binds where no plant
+    code runs, but it reads interpreter state after target code has
+    executed, so it is not a defense against executing plants — those
+    are the static engine's to refuse. Lua's package.searchpath
+    re-check runs BEFORE require and is the one belt target code
+    cannot have forged. The witness is likewise bound to the
+    finding's FUNCTION — a response naming any other function or
+    module is rejected, never executed.
   - The return value / crash signal is captured independently and
     authenticated: the harness embeds a per-execution token
     (generated in-process after the LLM response is parsed) in its
@@ -57,6 +75,7 @@ from ._harness import (
 from ._execute import (
     _classify_output,
     execute_witness,
+    floor_refusal_result,
     validate_spec,
 )
 from ._prompts import (
@@ -71,6 +90,7 @@ __all__ = [
     "build_witness_prompt",
     "execute_witness",
     "file_to_import_path",
+    "floor_refusal_result",
     "generate_c_harness",
     "generate_go_harness",
     "generate_java_harness",

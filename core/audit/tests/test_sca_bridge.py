@@ -169,6 +169,25 @@ class TestApplySCAAdvisories:
         assert apply_sca_advisories([], tmp_path) == 0
         assert apply_sca_advisories([_gap()], None) == 0
 
+    def test_malformed_injected_hypotheses_never_raises(self, tmp_path):
+        # Docstring contract: "Never raises." A non-dict hypothesis
+        # entry (or a non-list value) written by another producer
+        # used to AttributeError outside the guard try.
+        out = self._priors_env(tmp_path)
+        stringy = _gap(file="src/http_util.py")
+        stringy["injected_hypotheses"] = ["free-form prose note"]
+        boosted = apply_sca_advisories([stringy], out)
+        assert boosted == 1
+        assert any(
+            isinstance(h, dict) and h.get("source") == "sca_advisory"
+            for h in stringy["injected_hypotheses"]
+        )
+
+        nonlist = _gap(file="src/http_util.py")
+        nonlist["injected_hypotheses"] = "not a list"
+        assert apply_sca_advisories([nonlist], out) == 1
+        assert isinstance(nonlist["injected_hypotheses"], list)
+
     def test_orchestrator_wires_bridge_before_budget_cap(self):
         import inspect
 

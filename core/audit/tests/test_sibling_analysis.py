@@ -502,3 +502,110 @@ class TestSemanticFindingsToMechanical:
             {"file": "a.py", "inconsistency": "no function key"},
         ])
         assert out == []
+
+
+class TestSemanticConsistencySanitizedView:
+    """Practice regexes must scan a comment/string-blanked view.
+
+    A comment that merely mentions an auth call would otherwise count
+    as the practice being present and suppress the outlier finding.
+    """
+
+    @staticmethod
+    def _group() -> SiblingGroup:
+        return SiblingGroup(
+            group_id="handlers",
+            sibling_type=SiblingType.PEER_FUNCTIONS,
+            description="peer request handlers",
+            siblings=[
+                SiblingPath("a", "handlers.c", "handle_alpha"),
+                SiblingPath("b", "handlers.c", "handle_beta"),
+                SiblingPath("c", "handlers.c", "handle_gamma"),
+            ],
+        )
+
+    @staticmethod
+    def _checklist(gamma_src: str) -> dict:
+        alpha = (
+            "int handle_alpha(req_t *r) {\n"
+            "    if (!check_permission(r->user))\n"
+            "        return -1;\n"
+            "    return do_alpha(r);\n"
+            "}\n"
+        )
+        beta = (
+            "int handle_beta(req_t *r) {\n"
+            "    if (!check_permission(r->user))\n"
+            "        return -1;\n"
+            "    return do_beta(r);\n"
+            "}\n"
+        )
+        return {
+            "handlers.c:handle_alpha": {"source": alpha},
+            "handlers.c:handle_beta": {"source": beta},
+            "handlers.c:handle_gamma": {"source": gamma_src},
+        }
+
+    def test_comment_only_auth_mention_does_not_earn_receipt(self):
+        from core.audit.sibling_analysis import check_semantic_consistency
+
+        gamma = (
+            "int handle_gamma(req_t *r) {\n"
+            "    /* check_permission is handled upstream */\n"
+            "    return do_gamma(r);\n"
+            "}\n"
+        )
+        findings = check_semantic_consistency(
+            [self._group()], self._checklist(gamma),
+        )
+        auth = [f for f in findings if f.get("cwe") == "CWE-862"]
+        assert len(auth) == 1
+        assert auth[0]["function"] == "handle_gamma"
+
+    def test_real_auth_check_still_earns_receipt(self):
+        from core.audit.sibling_analysis import check_semantic_consistency
+
+        gamma = (
+            "int handle_gamma(req_t *r) {\n"
+            "    if (!check_permission(r->user))\n"
+            "        return -1;\n"
+            "    return do_gamma(r);\n"
+            "}\n"
+        )
+        findings = check_semantic_consistency(
+            [self._group()], self._checklist(gamma),
+        )
+        assert [f for f in findings if f.get("cwe") == "CWE-862"] == []
+
+    def test_missing_auth_check_still_flagged(self):
+        from core.audit.sibling_analysis import check_semantic_consistency
+
+        gamma = (
+            "int handle_gamma(req_t *r) {\n"
+            "    return do_gamma(r);\n"
+            "}\n"
+        )
+        findings = check_semantic_consistency(
+            [self._group()], self._checklist(gamma),
+        )
+        auth = [f for f in findings if f.get("cwe") == "CWE-862"]
+        assert len(auth) == 1
+        assert auth[0]["function"] == "handle_gamma"
+
+
+class TestNormalizeValue:
+    def test_mixed_type_list_does_not_raise(self):
+        # An extractor emitting [0, "err"] aborted find_asymmetries
+        # with TypeError under bare sorted().
+        from core.audit.sibling_analysis import _normalize_value
+
+        out = _normalize_value([0, "err", None])
+        assert isinstance(out, str)
+        # Same content, any order -> same normalisation.
+        assert out == _normalize_value(["err", None, 0])
+
+    def test_homogeneous_list_order_unchanged(self):
+        from core.audit.sibling_analysis import _normalize_value
+
+        assert _normalize_value([10, 2]) == "2,10"
+        assert _normalize_value(["b", "a"]) == "a,b"

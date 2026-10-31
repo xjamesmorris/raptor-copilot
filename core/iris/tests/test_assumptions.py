@@ -176,6 +176,28 @@ class TestMergeAssumptions:
         assert len(merged) == 1
         assert merged[0].confidence == 0.9
 
+    def test_equal_tier_operator_confirmed_sticky(self):
+        """Same tie-break as merge_specs: a fresh same-tier LLM row
+        must not replace an operator-era assumption and launder away
+        its source provenance."""
+        old = _make_assumption(confidence=0.3)
+        old.source = "operator_confirmed"
+        new = _make_assumption(confidence=0.9)
+        merged = merge_assumptions([old], [new])
+        assert len(merged) == 1
+        assert merged[0].source == "operator_confirmed"
+        assert merged[0].confidence == 0.3
+
+    def test_stronger_tier_replaces_operator_confirmed(self):
+        """Stickiness is a tie-break only — a strictly stronger tier
+        still wins (mirrors merge_specs)."""
+        old = _make_assumption(evidence_tier=EvidenceTier.HEURISTIC)
+        old.source = "operator_confirmed"
+        new = _make_assumption(evidence_tier=EvidenceTier.XREF_BACKED)
+        merged = merge_assumptions([old], [new])
+        assert len(merged) == 1
+        assert merged[0].evidence_tier == EvidenceTier.XREF_BACKED
+
 
 class TestEvictStale:
     def test_keeps_current_files(self):
@@ -192,3 +214,66 @@ class TestEvictStale:
         a = _make_assumption(file="src/old.c", evidence_tier=EvidenceTier.XREF_BACKED)
         result = evict_stale_assumptions([a], {"src/auth.c"})
         assert len(result) == 1
+
+
+class TestEvictStaleAssumptions:
+    """Twin-aligned with the spec evictor: empty-file rows are exempt,
+    high tiers survive a vanished file, low-tier vanished files go."""
+
+    @staticmethod
+    def _assumption(file, tier=None):
+        from core.evidence import EvidenceTier
+        a = SafetyAssumption(
+            target="t", file=file, assumption="x",
+            category=AssumptionCategory.ORDERING,
+            enforced_by=["check"],
+        )
+        a.evidence_tier = tier or EvidenceTier.HEURISTIC
+        return a
+
+    def test_empty_file_rows_exempt(self):
+        from core.iris.assumptions import evict_stale_assumptions
+        rows = [self._assumption(""), self._assumption("gone.c")]
+        kept = evict_stale_assumptions(rows, {"live.c"})
+        assert [a.file for a in kept] == [""], (
+            "empty-file assumptions carry nothing to be stale against"
+        )
+
+    def test_vanished_file_evicted_live_kept(self):
+        from core.iris.assumptions import evict_stale_assumptions
+        rows = [self._assumption("live.c"), self._assumption("gone.c")]
+        kept = evict_stale_assumptions(rows, {"live.c"})
+        assert [a.file for a in kept] == ["live.c"]
+
+    def test_high_tier_survives_vanished_file(self):
+        from core.evidence import EvidenceTier
+        from core.iris.assumptions import evict_stale_assumptions
+        rows = [self._assumption("gone.c",
+                                 tier=EvidenceTier.XREF_BACKED)]
+        assert evict_stale_assumptions(rows, {"live.c"}) == rows
+
+
+class TestConfidenceClamp:
+    """assumption_from_dict routes confidence through the spec twin's
+    clamp: LLM strings/None/out-of-range never round-trip the store."""
+
+    def _from_dict(self, confidence):
+        from core.iris.assumptions import assumption_from_dict
+        return assumption_from_dict({
+            "target": "t", "file": "a.c", "assumption": "x",
+            "category": "ordering", "enforced_by": ["check"],
+            "confidence": confidence,
+        })
+
+    def test_string_coerces(self):
+        assert self._from_dict("0.8").confidence == 0.8
+
+    def test_garbage_string_defaults(self):
+        assert self._from_dict("high").confidence == 0.5
+
+    def test_none_defaults(self):
+        assert self._from_dict(None).confidence == 0.5
+
+    def test_out_of_range_clamped(self):
+        assert self._from_dict(7).confidence == 1.0
+        assert self._from_dict(-3).confidence == 0.0

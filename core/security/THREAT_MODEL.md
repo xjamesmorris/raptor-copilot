@@ -49,6 +49,31 @@ The `core.sandbox` stack composes three filesystem-isolation layers:
    With `restrict_reads=False` (the historic default), only writes
    are restricted; reads are allowed everywhere visible.
 
+If the bind tree fails after namespaces are available, the sandbox retries
+without bind mounts. This `landlock-pidns` backend keeps the user, PID, IPC,
+and network namespaces, mounts a fresh `/proc`, and applies Landlock and
+seccomp. Reads can be limited, but Landlock cannot control metadata-only
+operations such as `chmod`, `chown`, and `utimensat`. Host paths remain
+visible by name, so a child can distinguish a missing path (`ENOENT`) from a
+denied path (`EACCES`), which exposes a filesystem-existence oracle. The
+fallback preserves the caller's read policy: `restrict_reads=False` keeps the
+historic read-everywhere behaviour, while `restrict_reads=True` limits reads
+to the declared allowlist. Read-restricted mountless calls also replace
+host-shared `/tmp` and `/dev/shm` write grants with a private mode-`0700`
+scratch directory. Explicit non-shared writable paths are retained. Calls with
+`restrict_reads=False` retain the historical writable baseline, including
+host-shared temporary paths when the bind tree is absent. Untrusted execution
+refuses this lesser filesystem tier unless the operator sets
+`RAPTOR_ALLOW_DEGRADED_UNTRUSTED=1` — enforced by the containment-floor
+contract (`core/sandbox/tiers.py`): every execution lane carries a declared
+containment tier, every dispatch site asserts `delivered >= floor` before the
+command runs, and a violation raises a typed `SandboxFloorError` chained to
+the demoting backend failure. On Landlock ABI below 3 the mountless backend
+is not achievable for untrusted or read-restricted work (those kernels cannot
+block `truncate()` outside the write allowlist); an unwaived untrusted run is
+then refused at its floor, and a waived or trusted read-restricted run
+continues down the demotion ladder to a lane its floor admits.
+
 **Critical fallback property** — `mount namespace` engagement requires
 unprivileged user namespaces (`kernel.apparmor_restrict_unprivileged_userns=0`).
 On Ubuntu 24.04+, hardened containers, and similar host configurations

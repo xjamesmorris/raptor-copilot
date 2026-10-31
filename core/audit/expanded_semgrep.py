@@ -45,6 +45,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from core.atomic_fs import write_bytes_atomically
+from core.sarif import emit
+from core.source import read_text_capped
+
 from ._util import safe_join
 from .preprocessor_view import (
     _AUGMENT_FILE_CAP,
@@ -376,6 +380,20 @@ def build_expanded_corpus(
     target_path = Path(target_path)
     scratch_root = Path(scratch_root)
     scratch_root.mkdir(parents=True, exist_ok=True)
+    # Process-private scratch contract: the expanded copies land at
+    # target-derived relative paths, so a pre-populated or symlinked
+    # scratch root could alias those writes onto foreign files. The
+    # caller owns creating a FRESH dir (mkdtemp under the run dir);
+    # refuse anything else loudly instead of writing into it.
+    if scratch_root.is_symlink():
+        msg = f"expanded-corpus scratch root is a symlink: {scratch_root}"
+        raise ValueError(msg)
+    if any(scratch_root.iterdir()):
+        msg = (
+            f"expanded-corpus scratch root {scratch_root} is not empty "
+            "— pass a fresh process-private directory"
+        )
+        raise ValueError(msg)
     corpus = ExpandedCorpus(root=scratch_root)
 
     budget = max_tus
@@ -383,11 +401,16 @@ def build_expanded_corpus(
         resolved = safe_join(target_path, rel)
         if resolved is None or not resolved.is_file():
             continue
-        try:
-            raw = resolved.read_text(errors="replace")
-        except OSError:
+        # Capped like every migrated core/audit sibling: the
+        # candidate gate buffered whole files, so a planted
+        # multi-hundred-MB "source" cost its full size in peak
+        # memory before being screened. An oversized file is not a
+        # sensible expansion candidate — skip it.
+        got = read_text_capped(resolved, errors="replace")
+        if got is None:
             continue
-        if not has_macro_invocation(raw):
+        raw, truncated = got
+        if truncated or not has_macro_invocation(raw):
             continue
         corpus.candidates_total += 1
         if budget <= 0:
@@ -410,7 +433,13 @@ def build_expanded_corpus(
         dest = scratch_root / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         try:
-            dest.write_text(view.text, encoding="utf-8", errors="replace")
+            # Atomic write: belt-and-braces under the fresh-scratch
+            # contract above — os.replace never follows a symlink
+            # planted mid-loop by a concurrent writer. Bytes variant
+            # keeps the old write_text errors="replace" behaviour.
+            write_bytes_atomically(
+                dest, view.text.encode("utf-8", errors="replace"),
+            )
         except OSError as exc:
             corpus.failed += 1
             logger.debug("expanded corpus: could not write %s: %s", dest, exc)
@@ -511,10 +540,7 @@ def translate_corpus_findings(
 # SARIF for the /scan stage
 # ---------------------------------------------------------------------------
 
-_SARIF_SCHEMA_URI = (
-    "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master"
-    "/Documents/CommitteeSpecifications/2.1.0/sarif-schema-2.1.0.json"
-)
+_SARIF_SCHEMA_URI = emit.SCHEMA_URI_COMMITTEE
 _TOOL_NAME = "semgrep-expanded"
 
 
@@ -527,49 +553,27 @@ def findings_to_sarif(findings: list[dict[str, Any]]) -> dict[str, Any]:
     plain semgrep run.  Every result carries
     ``properties.expanded_view: true`` and original coordinates.
     """
-    rule_defs: list[dict[str, Any]] = []
-    seen_rules: set[str] = set()
+    rule_index = emit.RuleIndex()
     results: list[dict[str, Any]] = []
     for f in findings:
         rule_id = f.get("rule_id") or "(unnamed)"
-        if rule_id not in seen_rules:
-            rule_defs.append({
-                "id": rule_id,
-                "name": rule_id,
-                "shortDescription": {"text": rule_id},
-                "defaultConfiguration": {"level": "warning"},
-            })
-            seen_rules.add(rule_id)
-        results.append({
-            "ruleId": rule_id,
-            "level": "warning",
-            "message": {
-                "text": f.get("message") or f"{rule_id} matched "
-                        "(fidelity-3 expanded view)",
-            },
-            "locations": [{
-                "physicalLocation": {
-                    "artifactLocation": {"uri": f.get("file", "")},
-                    "region": {"startLine": f.get("line", 0)},
-                },
-            }],
-            "properties": {
+        rule_index.add(emit.minimal_rule(rule_id))
+        results.append(emit.result(
+            rule_id,
+            f.get("message") or f"{rule_id} matched "
+            "(fidelity-3 expanded view)",
+            [emit.location(f.get("file", ""),
+                           {"startLine": f.get("line", 0)})],
+            properties={
                 "expanded_view": True,
                 "expanded_line": f.get("expanded_line", 0),
             },
-        })
-    return {
-        "$schema": _SARIF_SCHEMA_URI,
-        "version": "2.1.0",
-        "runs": [{
-            "tool": {
-                "driver": {
-                    "name": _TOOL_NAME,
-                    "fullName": "Semgrep over fidelity-3 preprocessor-"
-                                "expanded views (macro-hidden sinks)",
-                    "rules": rule_defs,
-                },
-            },
-            "results": results,
-        }],
-    }
+        ))
+    return emit.document(
+        [emit.run(
+            _TOOL_NAME, rule_index.rules(), results,
+            full_name="Semgrep over fidelity-3 preprocessor-"
+                      "expanded views (macro-hidden sinks)",
+        )],
+        schema_uri=_SARIF_SCHEMA_URI,
+    )

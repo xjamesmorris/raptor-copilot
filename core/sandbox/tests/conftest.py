@@ -6,6 +6,7 @@ snapshot them before every test and restore afterwards as a safety net
 — individual tests are still free to mutate them deliberately.
 """
 
+import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -32,6 +33,195 @@ def short_sock_dir():
         yield Path(d)
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+@pytest.fixture
+def hermetic_invalid_dns(monkeypatch):
+    """Deterministic NXDOMAIN for RFC 2606 ``.invalid`` CONNECT targets.
+
+    Several proxy tests use ``.invalid`` hostnames as guaranteed-failing
+    resolve targets. The GUARANTEE is only about the outcome — the
+    latency and exception detail come from the host's live resolver,
+    and platform resolvers differ wildly: glibc fails an NXDOMAIN
+    immediately, while macOS (search-domain retries through
+    mDNSResponder) has been observed taking longer than a test client's
+    5s read budget, so the proxy's 502 arrived after the client gave
+    up. Stub the proxy's resolve seam for ``.invalid`` names — instant
+    gaierror, no resolver in the loop — and delegate every other name
+    (e.g. ``localhost``, literal IPs) to the real lookup.
+
+    The patch MUST go through the shared ``monkeypatch`` fixture, not a
+    manual save/restore: tests layer their own ``monkeypatch.setattr``
+    on the same class attribute, and a manual ``finally`` restore runs
+    BEFORE that monkeypatch's undo — which then re-installs the value
+    it saved at setattr time (this fixture's stub), leaking the stub
+    onto the class for the rest of the process. One shared undo stack
+    unwinds LIFO and always lands back on the pristine method (the
+    session-end seam guard below trips if that ever regresses).
+    """
+    import socket as _socket
+
+    from core.sandbox import proxy as _proxy_mod
+
+    real = _proxy_mod.EgressProxy._cached_getaddrinfo
+
+    async def _stubbed(self, host, port):
+        if host.endswith(".invalid"):
+            raise _socket.gaierror(
+                _socket.EAI_NONAME, "Name or service not known")
+        return await real(self, host, port)
+
+    monkeypatch.setattr(_proxy_mod.EgressProxy, "_cached_getaddrinfo",
+                        _stubbed)
+    yield
+
+
+@pytest.fixture
+def confined_parser_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the parser-jail floor to confined (``landlocked`` -> True).
+
+    Buffer-semantics tests (lane fan-out, caps, record/unregister
+    serialisation) pin the EXACT contents of registration event
+    buffers. On a host without Landlock (macOS; Linux < 5.13) the
+    parser-jail worker comes up on the degraded floor, and
+    ``register_sandbox`` then injects the documented per-registration
+    ``parser_jail_degraded`` control-plane marker into every buffer —
+    shifting every count, segregation set, and index-0 assumption by
+    one. That marker contract is pinned hermetically BOTH ways in
+    test_parser_jail.py (TestDegradedFloor); pinning the floor here
+    keeps the buffer pins running identically on every host instead
+    of skipping them off-platform. Patches the class property so
+    proxies constructed later inside the test observe it, and only
+    the floor REPORT is pinned — the real worker still parses.
+    """
+    from core.sandbox import parser_jail as _parser_jail_mod
+
+    def _confined(self: "_parser_jail_mod.ParserJail") -> bool:
+        return True
+
+    monkeypatch.setattr(_parser_jail_mod.ParserJail, "landlocked",
+                        property(_confined))
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _resolver_seam_leak_guard():
+    """Leak tripwire for the proxy resolve seam.
+
+    Session-scoped so its teardown runs after every function-scoped
+    fixture (including ``monkeypatch``, which instantiates early — it
+    is requested by root-conftest autouse fixtures — and therefore
+    finalizes after any function-scoped guard could). If any test or
+    fixture leaves a stub on ``EgressProxy._cached_getaddrinfo``, the
+    whole session fails loudly here instead of silently running every
+    later module against the stub.
+    """
+    from core.sandbox import proxy as _proxy_mod
+
+    pristine = _proxy_mod.EgressProxy._cached_getaddrinfo
+    yield
+    current = _proxy_mod.EgressProxy._cached_getaddrinfo
+    assert current is pristine, (
+        f"EgressProxy._cached_getaddrinfo leaked a test stub past its "
+        f"test: {current!r} (pristine: {pristine!r})"
+    )
+
+
+@pytest.fixture(autouse=True)
+def _consent_env_guard():
+    """Strip the consent variables around every test.
+
+    RAPTOR_ALLOW_DEGRADED_UNTRUSTED steers untrusted-run refusal
+    behaviour, so a shell or CI job exporting it flips fail-closed
+    expectations across this directory (four refusal tests turn red
+    under an exported consent). RAPTOR_NO_SANDBOX_NONCE gets the same
+    treatment: an ambient nonce exported by an operator's shell would
+    let in-process disable-gate tests resolve a consent the test never
+    granted. Tests that exercise the opt-ins set them explicitly via
+    monkeypatch.setenv (or the ``no_sandbox_consent`` fixture), which
+    composes with this guard: the guard strips first, the test sets,
+    both restore in LIFO order.
+    """
+    _vars = ("RAPTOR_ALLOW_DEGRADED_UNTRUSTED", "RAPTOR_NO_SANDBOX_NONCE")
+    saved = {v: os.environ.pop(v, None) for v in _vars}
+    try:
+        yield
+    finally:
+        for v, val in saved.items():
+            if val is not None:
+                os.environ[v] = val
+            else:
+                os.environ.pop(v, None)
+
+
+@pytest.fixture
+def no_sandbox_consent(monkeypatch, tmp_path):
+    """Mint a real, test-scoped consent for the CLI sandbox disable.
+
+    THE migration path for tests that legitimately drive
+    ``set_cli_profile("none")`` / ``disable_from_cli()`` /
+    ``--no-sandbox`` in-process: the gate's only consent source is a
+    minted nonce backed by a uid-owned consent file — terminal
+    presence grants nothing — so without one the disable refuses
+    regardless of the test process's fd shape. This fixture goes through
+    the REAL validation path — a digest-content consent file, mode
+    0600, in a consents directory redirected to tmp_path — rather
+    than stubbing the gate, so migrated tests still exercise the
+    production consent logic. This conftest is also the designated
+    OUT-OF-RUNTIME mint surface for the test suite (the runtime
+    module only ever re-exports an already-accepted consent).
+
+    Returns the nonce string (already exported via monkeypatch.setenv).
+    """
+    import secrets
+
+    from core.sandbox import disable_consent as dc
+
+    d = tmp_path / "consents.d"
+    d.mkdir(mode=0o700)
+    monkeypatch.setattr(dc, "_consents_dir", lambda: d)
+    nonce = secrets.token_hex(dc.NONCE_HEX_LEN // 2)
+    path = d / dc._nonce_filename(nonce)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(fd, (dc._nonce_digest(nonce) + "\n").encode("ascii"))
+    finally:
+        os.close(fd)
+    monkeypatch.setenv(dc.NONCE_ENV_VAR, nonce)
+    return nonce
+
+
+@pytest.fixture
+def no_sandbox_consent_subprocess():
+    """Mint a disable consent a SUBPROCESS can validate.
+
+    The ``no_sandbox_consent`` fixture redirects the consents
+    directory via monkeypatch, which a child process never sees —
+    subprocess-based gate tests (the invocation-shape battery) need
+    the consent file in the REAL per-uid consents directory the child
+    will resolve. Yields the nonce (the test passes it via the child
+    env explicitly); removes the file afterwards. Same conftest-only
+    mint-path rule as above.
+    """
+    import secrets
+
+    from core.sandbox import disable_consent as dc
+
+    d = dc._consents_dir()
+    d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    nonce = secrets.token_hex(dc.NONCE_HEX_LEN // 2)
+    path = d / dc._nonce_filename(nonce)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(fd, (dc._nonce_digest(nonce) + "\n").encode("ascii"))
+    finally:
+        os.close(fd)
+    try:
+        yield nonce
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
 
 @pytest.fixture(autouse=True)
@@ -61,17 +251,33 @@ def _sandbox_state_guard():
     state_names = [
         # CLI overrides
         "_cli_sandbox_disabled", "_cli_sandbox_profile",
+        "_cli_sandbox_disable_consent",
         "_cli_sandbox_audit", "_cli_sandbox_audit_verbose",
         "_cli_sandbox_audit_budget",
         "_cli_sandbox_readable_paths", "_cli_sandbox_tool_paths",
+        "_cli_sandbox_floor", "_project_sandbox_floor",
         # Once-per-process warnings
         "_landlock_warned_unavailable", "_landlock_warned_abi_v4",
         "_landlock_warned_abi_v3", "_landlock_warned_abi_v2",
         "_sandbox_unavailable_warned", "_sandbox_landlock_only_warned",
+        "_mountless_backend_warned",
+        "_nproc_pressure_degrade_warned",
+        "_floor_lowered_banner_warned",
+        "_floor_flag_banner_warned",
+        "_floor_project_banner_warned",
+        "_floor_host_banner_warned",
+        "_floor_host_degrade_notice_warned",
+        "_floor_surface_disagreement_warned",
+        "_inherit_netns_block_warned",
+        "_mountless_unachievable_warned",
         "_bare_run_posture_warned",
         "_net_and_tcp_allowlist_warned",
         "_degraded_tcp_deny_warned",
         "_degraded_net_open_override_warned",
+        "_degraded_landlock_override_warned",
+        "_demoted_tcp_deny_warned",
+        "_demoted_net_open_override_warned",
+        "_tolerated_policy_unenforced_warned",
         "_proxy_tier2_port_pin_warned",
         "_seccomp_filter_lost_warned",
         "_seccomp_arch_missing_warned", "_mount_unavailable_warned",
@@ -114,7 +320,7 @@ def _sandbox_state_guard():
         # to exercise the probe; without snapshot the poisoned value
         # leaks into subsequent tests.
         "_gidmap_allow_cache", "_gidmap_allow_warned_missing",
-        "_unshare_path_cache", "_prlimit_path_cache",
+        "_unshare_path_cache",
         "_mount_path_cache", "_mkdir_path_cache",
         "_newuidmap_path_cache", "_newgidmap_path_cache",
         "_getcap_path_cache", "_sandbox_exec_path_cache",
@@ -126,6 +332,11 @@ def _sandbox_state_guard():
         # test_pidns_proc_mount.py seeds the cache to exercise the
         # once-per-process WARNING and the per-run posture stamp.
         "_pidns_fresh_proc_cache", "_pidns_proc_mount_unavailable_warned",
+        # Supervised pid-ns tier probe cache — test_supervised.py seeds
+        # and flips it (probe-count assertions, runtime-refusal flip);
+        # a leaked False would silently reroute every later
+        # spawn_supervised test onto the group tier.
+        "_pidns_supervision_cache",
     ]
     saved = {name: getattr(mod, name) for name in state_names}
     # Snapshot+restore the speculative-failure cache as a deep copy

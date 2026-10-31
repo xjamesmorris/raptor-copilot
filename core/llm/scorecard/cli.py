@@ -2,12 +2,19 @@
 sidecar maintenance over the model scorecard.
 
 Subcommands:
-    list      — markdown table of all cells with derived columns
-    compare   — side-by-side two models on shared decision_classes
-    samples   — show disagreement-sample reasoning for a cell
-    pin       — set policy_override on a cell
-    unpin     — release a pin (set policy_override back to "auto")
-    reset     — delete cells (single, --model, --older-than, --all)
+    list          — markdown table of all cells with derived columns
+    summary       — one-shot dashboard (totals, policy, spend)
+    recommend     — cheapest trusted model for a decision_class
+    chain-closure — rank models by exploit chain-closure success
+    compare       — side-by-side two models on shared decision_classes
+    samples       — show disagreement-sample reasoning for a cell
+    pin           — set policy_override on a cell
+    unpin         — release a pin (set policy_override back to "auto")
+    reset         — delete cells (single, --model, --older-than, --all)
+    mark          — record an operator-feedback event on a cell
+    tool-evidence — back-propagate /validate outcomes onto the scorecard
+    adopt         — re-bless an unverified sidecar (stamp with this
+                    install's integrity token)
 
 Run ``raptor-llm-scorecard <subcommand> -h`` for per-subcommand
 flags.  All output is markdown so operators can paste it straight
@@ -18,15 +25,19 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import json
 import re
 import sys
 from pathlib import Path
 from typing import Any
 
-from core.json import dumps_display
+from core.llm.scorecard._render import scrub_cell
 
+from .paths import default_scorecard_path
 from .scorecard import (
     ALL_EVENT_TYPES,
+    DEFAULT_MISS_RATE_CEILING,
+    DEFAULT_SAMPLE_SIZE_FLOOR,
     EventType,
     ModelScorecard,
     Policy,
@@ -36,7 +47,13 @@ from .scorecard import (
 )
 
 
-DEFAULT_PATH = Path("out/llm_scorecard.json")
+# Shared resolver (RAPTOR_SCORECARD_PATH override → RAPTOR_DIR-anchored
+# → relative fallback): the CLI must read the SAME ledger analysis runs
+# write, regardless of the invoking cwd. Resolved lazily at
+# parser-build time, NOT frozen at import — an env override set after
+# import (in-process callers, some test orders) must still win, like
+# every other call site of the resolver.
+LEGACY_COST_LABEL = "Estimated USD (legacy; authority unknown)"
 
 
 # ---------------------------------------------------------------------------
@@ -47,13 +64,20 @@ DEFAULT_PATH = Path("out/llm_scorecard.json")
 def _policy_for_stats(
     stats: DecisionClassStats,
     *,
-    sample_size_floor: int = 10,
-    miss_rate_ceiling: float = 0.05,
+    sample_size_floor: int = DEFAULT_SAMPLE_SIZE_FLOOR,
+    miss_rate_ceiling: float = DEFAULT_MISS_RATE_CEILING,
 ) -> str:
     """Re-derive the policy decision from a ``DecisionClassStats``
     snapshot. We don't read the live ``ModelScorecard.should_short_circuit``
     here because that's per-call and we want a self-contained
-    interpretation of the on-disk data."""
+    interpretation of the on-disk data.
+
+    The gate parameters default to the SUBSTRATE constants (never
+    re-hardcoded literals) so this column diverges from the live gate
+    only where the operator tuned a per-run knob the CLI cannot see —
+    a run configured with ``scorecard_freshness_half_life_days`` or a
+    custom ceiling. The default-view note in ``cmd_list`` names that
+    residual; ``--freshness`` mirrors the freshness half."""
     if stats.policy_override == "force_short_circuit":
         return Policy.SHORT_CIRCUIT
     if stats.policy_override == "force_fall_through":
@@ -154,13 +178,21 @@ def _humanise_age(iso_ts: str, *, now: _dt.datetime | None = None) -> str:
     try:
         ts = _dt.datetime.fromisoformat(iso_ts)
     except ValueError:
-        return iso_ts                              # pass through if unparseable
+        # An unparseable timestamp only comes from a forged/corrupt
+        # sidecar row (the writer always emits ISO) — escape + bound
+        # before it can reach a terminal render verbatim.
+        return _scrub_cell(iso_ts)
     if now is None:
         now = _dt.datetime.now(_dt.timezone.utc)
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=_dt.timezone.utc)
     delta = now - ts
     secs = delta.total_seconds()
+    if secs < 0:
+        # A future last_seen_at only comes from clock skew or a
+        # forged sidecar row — flag it instead of rendering a
+        # nonsensical negative age ("-42s ago").
+        return "in the future"
     if secs < 60:
         return f"{int(secs)}s ago"
     if secs < 3600:
@@ -196,7 +228,7 @@ def _filter_stats(
     since: _dt.timedelta | None = None,
     only_untrusted: bool = False,
     only_learning: bool = False,
-    sample_size_floor: int = 10,
+    sample_size_floor: int = DEFAULT_SAMPLE_SIZE_FLOOR,
 ) -> list[DecisionClassStats]:
     """Apply CLI filter flags. Filters compose (AND)."""
     out = list(stats)
@@ -245,8 +277,8 @@ def _sort_stats(
     if sort_key == "miss-rate":
         return sorted(
             stats,
-            key=lambda s: (
-                _wilson_ub_pct(s, event_type)
+            key=lambda s: (  # type: ignore[arg-type]
+                _wilson_ub_pct(s, event_type)  # type: ignore[return-value]
                 if _wilson_ub_pct(s, event_type) is not None
                 else -1
             ),
@@ -279,6 +311,8 @@ def _stats_to_json(s: DecisionClassStats) -> dict[str, Any]:
         "cheap_incorrect": ev.incorrect,
         "calls": s.calls,
         "cost_usd": s.cost_usd,
+        "cost_basis": "scorecard_legacy",
+        "usd_authority": "unknown",
         "tokens": s.tokens,
         "input_tokens": s.input_tokens,
         "output_tokens": s.output_tokens,
@@ -287,6 +321,39 @@ def _stats_to_json(s: DecisionClassStats) -> dict[str, Any]:
         "first_seen_at": s.first_seen_at,
         "last_seen_at": s.last_seen_at,
     }
+
+
+def _scrub_cell(value: object) -> str:
+    """Escape + bound a sidecar-derived cell value (decision_class,
+    model, event_type) before terminal rendering — the sidecar is
+    same-user writable and readable without HMAC verification under
+    the key-unusable clamp, so these strings are attacker-choosable.
+    Routes through the shared ``scrub_cell`` (md_inline projection):
+    control bytes escaped AND in-slot markdown structure (pipes,
+    backticks) entity-escaped, so a forged cell cannot mint table
+    columns in the pasted report."""
+    return scrub_cell(value)
+
+
+def _dumps_json_lane(data: Any) -> str:
+    """Serialise a ``--json`` lane payload for the terminal.
+
+    ensure_ascii: JSON escapes C0 but passes C1 controls
+    (U+0080-U+009F, incl. single-byte CSI/OSC) through raw when
+    ensure_ascii is off — ``dumps_display`` is exactly that, and these
+    dicts carry the same sidecar-derived strings the table lanes scrub
+    (decision_class, model, model_version, timestamps). ASCII-encode
+    so the structured lane cannot carry live terminal controls either;
+    output stays valid JSON for consumers that parse it."""
+    return json.dumps(data, indent=2, ensure_ascii=True, default=str)
+
+
+def _legacy_cost_display(stats: DecisionClassStats) -> str:
+    if stats.calls <= 0:
+        return "—"
+    if stats.cost_usd <= 0:
+        return "unavailable"
+    return f"${stats.cost_usd:.4f} est."
 
 
 def _render_table(
@@ -321,8 +388,8 @@ def _render_table(
             baseline = drift_map.get((s.decision_class, s.model), policy)
             marker = _drift_marker(baseline, policy)
         rows.append((
-            s.decision_class,
-            s.model,
+            _scrub_cell(s.decision_class),
+            _scrub_cell(s.model),
             n,
             _format_wilson(s, event_type),
             marker + _format_policy(policy, s.events[
@@ -331,11 +398,11 @@ def _render_table(
             _event_correct_count(s, event_type),
             _humanise_age(s.last_seen_at),
             s.calls,
-            f"${s.cost_usd:.4f}" if s.cost_usd else "$0",
+            _legacy_cost_display(s),
         ))
     headers = (
         "decision_class", "model", "n", "max_miss%",
-        "policy", correct_col, "last_seen", "calls", "$$",
+        "policy", correct_col, "last_seen", "calls", LEGACY_COST_LABEL,
     )
     widths = [
         max(len(headers[i]), max((len(str(r[i])) for r in rows), default=0))
@@ -366,7 +433,7 @@ def _render_compare(
             f"{model_b})_"
         )
     def _cost(s: DecisionClassStats) -> str:
-        return f"${s.cost_usd:.4f}" if s.cost_usd else "$0"
+        return _legacy_cost_display(s)
 
     rows = []
     for dc in shared:
@@ -374,7 +441,7 @@ def _render_compare(
         a_ev = a.events[EventType.CHEAP_SHORT_CIRCUIT]
         b_ev = b.events[EventType.CHEAP_SHORT_CIRCUIT]
         rows.append((
-            dc,
+            _scrub_cell(dc),
             f"{a_ev.correct + a_ev.incorrect}",
             _format_wilson(a),
             _format_policy(_policy_for_stats(a),
@@ -389,9 +456,9 @@ def _render_compare(
     headers = (
         "decision_class",
         f"{model_a} n", f"{model_a} max_miss%", f"{model_a} policy",
-        f"{model_a} calls", f"{model_a} $$",
+        f"{model_a} calls", f"{model_a} legacy estimate",
         f"{model_b} n", f"{model_b} max_miss%", f"{model_b} policy",
-        f"{model_b} calls", f"{model_b} $$",
+        f"{model_b} calls", f"{model_b} legacy estimate",
     )
     widths = [
         max(len(headers[i]), max((len(str(r[i])) for r in rows), default=0))
@@ -411,20 +478,28 @@ def _render_samples(stat: DecisionClassStats) -> str:
     cheap and full disagreed."""
     if not stat.disagreement_samples:
         return (
-            f"_(no disagreement samples for {stat.decision_class} on "
-            f"{stat.model})_"
+            f"_(no disagreement samples for {_scrub_cell(stat.decision_class)} on "
+            f"{_scrub_cell(stat.model)})_"
         )
     lines = [
-        f"# {stat.decision_class} on {stat.model}",
+        f"# {_scrub_cell(stat.decision_class)} on {_scrub_cell(stat.model)}",
         f"_{len(stat.disagreement_samples)} sample(s); "
         f"trust math: cheap claimed FP and was actually wrong_",
         "",
     ]
+    # Persisted reasoning text originates from LLM output that can
+    # quote analysed-repo tool output — escape control/ANSI bytes so a
+    # planted escape sequence can't rewrite the operator's terminal.
+    from core.security.log_sanitisation import escape_nonprintable
+
+    def _esc(s: str) -> str:
+        return escape_nonprintable(s, preserve_newlines=True)
+
     for i, sample in enumerate(stat.disagreement_samples, 1):
-        lines.append(f"## Sample {i} — {sample.get('ts', '?')} ({sample.get('event_type', '?')})")
-        cheap_r = sample.get("this_reasoning", "")
-        full_r = sample.get("other_reasoning", "")
-        note = sample.get("note", "")
+        lines.append(f"## Sample {i} — {_esc(str(sample.get('ts', '?')))} ({_esc(str(sample.get('event_type', '?')))})")
+        cheap_r = _esc(sample.get("this_reasoning", ""))
+        full_r = _esc(sample.get("other_reasoning", ""))
+        note = _esc(sample.get("note", ""))
         if cheap_r:
             lines.append("**Cheap (clear_fp):**")
             lines.append(cheap_r)
@@ -450,8 +525,8 @@ def _render_samples(stat: DecisionClassStats) -> str:
                 continue
             value = sample.get(key)
             if isinstance(value, str) and value:
-                lines.append(f"**{key}:**")
-                lines.append(value)
+                lines.append(f"**{_esc(key)}:**")
+                lines.append(_esc(value))
                 lines.append("")
     return "\n".join(lines)
 
@@ -475,7 +550,14 @@ def cmd_list(args: argparse.Namespace) -> int:
             (s.decision_class, s.model): _policy_for_stats(s)
             for s in baseline
         }
-    since = _parse_since(args.since) if args.since else None
+    # ``--since`` is declared ``type=str`` (handlers are also driven
+    # programmatically with pre-parsed namespaces), so argparse never
+    # converts it — surface a typo as a usage error, not a traceback.
+    try:
+        since = _parse_since(args.since) if args.since else None
+    except argparse.ArgumentTypeError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 2
     stats = _filter_stats(
         stats,
         consumer=args.consumer,
@@ -497,7 +579,7 @@ def cmd_list(args: argparse.Namespace) -> int:
         for s in stats:
             d = _stats_to_json(s)
             if drift_map:
-                baseline = drift_map.get((s.decision_class, s.model))
+                baseline = drift_map.get((s.decision_class, s.model))  # type: ignore[assignment]
                 if baseline and baseline != d["policy"]:
                     d["freshness_drift"] = {"baseline_policy": baseline}
             cells.append(d)
@@ -505,9 +587,20 @@ def cmd_list(args: argparse.Namespace) -> int:
         if hl:
             out["freshness_half_life_days"] = hl
             out["freshness_impact"] = sc.measure_freshness_impact(hl)
-        print(dumps_display(out))
+        print(_dumps_json_lane(out))
         return 0
     print(_render_table(stats, event_type=event_type, drift_map=drift_map))
+    if not hl:
+        # Divergence breadcrumb: the live gate applies the run
+        # config's scorecard_freshness_half_life_days, which this
+        # process cannot see — an operator auditing the routing
+        # decision must know the default view is the unweighted lens.
+        print(
+            "\nnote: policy column is unweighted with default gate "
+            "parameters; a run configured with freshness weighting "
+            "applies a different lens — mirror it with --freshness "
+            "DAYS."
+        )
     if hl:
         # When the freshness view is on, summarise its impact inline: how many
         # currently-trusted cells would change verdict under this half-life —
@@ -526,7 +619,8 @@ def cmd_summary(args: argparse.Namespace) -> int:
     """One-shot dashboard: totals, policy breakdown, spend, most-used model,
     cheapest-reliable, recent activity. The "open this every morning" view."""
     sc = ModelScorecard(args.path)
-    stats = sc.get_stats()
+    hl = getattr(args, "freshness_half_life_days", None)
+    stats = sc.get_stats(freshness_half_life_days=hl)
     if not stats:
         print("scorecard is empty — no LLM calls recorded yet.")
         return 0
@@ -535,22 +629,29 @@ def cmd_summary(args: argparse.Namespace) -> int:
     short_circuit = learning = fall_through = 0
     total_cost = 0.0
     cost_per_model: dict[str, float] = {}
-    calls_per_model: dict[str, int] = {}
+    usage_calls_by_model: dict[str, int] = {}
+    real_calls_by_model: dict[str, int] = {}
     usage_cell_by_model: dict[str, DecisionClassStats] = {}
-    sc_models_by_dc: dict[str, str] = {}   # for cheapest-trusted picking
+    # Keyed by (decision_class, model) — for cheapest-trusted picking.
+    sc_models_by_dc: dict[tuple[str, str], str] = {}
 
     for s in stats:
         models.add(s.model)
-        p = _policy_for_stats(s)
         if s.decision_class == "_usage":
             usage_cell_by_model[s.model] = s
-        if p == Policy.SHORT_CIRCUIT:
-            short_circuit += 1
-            sc_models_by_dc[(s.decision_class, s.model)] = s.model
-        elif p == Policy.LEARNING:
-            learning += 1
-        elif p == Policy.FALL_THROUGH:
-            fall_through += 1
+        # Underscore-prefixed cells (_usage roll-ups, _structured
+        # schema tallies) are bookkeeping, not policy cells — counting
+        # them in the breakdown inflated "learning" by one per model
+        # per bookkeeping axis.
+        if not s.decision_class.startswith("_"):
+            p = _policy_for_stats(s)
+            if p == Policy.SHORT_CIRCUIT:
+                short_circuit += 1
+                sc_models_by_dc[(s.decision_class, s.model)] = s.model
+            elif p == Policy.LEARNING:
+                learning += 1
+            elif p == Policy.FALL_THROUGH:
+                fall_through += 1
         # ``_usage`` is the per-model roll-up of every real call and its
         # spend. Other underscore-prefixed cells (e.g. ``_structured``)
         # re-count a per-call subset of those same calls on a separate
@@ -563,14 +664,28 @@ def cmd_summary(args: argparse.Namespace) -> int:
         if not is_subset_cell:
             total_cost += s.cost_usd
             cost_per_model[s.model] = cost_per_model.get(s.model, 0.0) + s.cost_usd
-            calls_per_model[s.model] = calls_per_model.get(s.model, 0) + s.calls
+            # Calls axis, per model: REAL decision classes carry
+            # ``calls`` too (register_uses on e.g. study_question) —
+            # those re-count calls the ``_usage`` roll-up already
+            # covers, so they are tallied separately and only used
+            # when the model has no roll-up (a sidecar written
+            # without a lifecycle flush). No real-dc COST writers
+            # exist, so the spend axis above needs no split.
+            if s.decision_class == "_usage":
+                usage_calls_by_model[s.model] = (
+                    usage_calls_by_model.get(s.model, 0) + s.calls
+                )
+            else:
+                real_calls_by_model[s.model] = (
+                    real_calls_by_model.get(s.model, 0) + s.calls
+                )
 
     # Cheapest short-circuit (lowest $/call from each cell's _usage row).
     cheapest: tuple | None = None
     sc_aliases = {m for (_, m) in sc_models_by_dc}
     for m in sc_aliases:
         u = usage_cell_by_model.get(m)
-        if u and u.calls > 0:
+        if u and u.calls > 0 and u.cost_usd > 0:
             cpc = u.cost_usd / u.calls
             if cheapest is None or cpc < cheapest[1]:
                 cheapest = (m, cpc)
@@ -588,6 +703,10 @@ def cmd_summary(args: argparse.Namespace) -> int:
         except (ValueError, TypeError):
             pass
 
+    calls_per_model: dict[str, int] = {
+        m: usage_calls_by_model.get(m, real_calls_by_model.get(m, 0))
+        for m in (set(usage_calls_by_model) | set(real_calls_by_model))
+    }
     most_used = max(calls_per_model.items(), key=lambda x: x[1], default=(None, 0))
 
     if getattr(args, "json", False):
@@ -598,6 +717,8 @@ def cmd_summary(args: argparse.Namespace) -> int:
                 "short_circuit": short_circuit, "learning": learning, "fall_through": fall_through,
             },
             "total_spend_usd": total_cost,
+            "cost_basis": "scorecard_legacy",
+            "usd_authority": "unknown",
             "spend_by_model": dict(cost_per_model),
             "calls_by_model": dict(calls_per_model),
             "most_used": (
@@ -610,20 +731,25 @@ def cmd_summary(args: argparse.Namespace) -> int:
             ),
             "recent_cells_7d": recent,
         }
-        print(dumps_display(out))
+        print(_dumps_json_lane(out))
         return 0
 
     print(f"scorecard summary ({args.path}):")
     print(f"  cells: {len(stats)} across {len(models)} model(s)")
     print(f"  policy: {short_circuit} trusted · {learning} learning · {fall_through} fall-through")
-    cost_lines = [f"{m} ${c:.4f}" for m, c in sorted(
+    # Model names are sidecar-derived (same forgeable provenance as the
+    # table cells) — scrub before the terminal, like every other lane.
+    cost_lines = [f"{_scrub_cell(m)} ${c:.4f}" for m, c in sorted(
         cost_per_model.items(), key=lambda x: -x[1]) if c > 0]
     cost_break = " (" + ", ".join(cost_lines) + ")" if cost_lines else ""
-    print(f"  total spend: ${total_cost:.4f}{cost_break}")
+    print(f"  {LEGACY_COST_LABEL}: ${total_cost:.4f}{cost_break}")
     if most_used[0] and most_used[1] > 0:
-        print(f"  most-used: {most_used[0]} ({most_used[1]} calls)")
+        print(f"  most-used: {_scrub_cell(most_used[0])} ({most_used[1]} calls)")
     if cheapest:
-        print(f"  cheapest trusted: {cheapest[0]} @ ${cheapest[1]:.4f}/call")
+        print(
+            "  lowest legacy estimate among trusted: "
+            f"{_scrub_cell(cheapest[0])} @ ${cheapest[1]:.4f}/call",
+        )
     print(f"  recent activity: {recent} cells last seen in last 7d")
     return 0
 
@@ -659,7 +785,11 @@ def cmd_recommend(args: argparse.Namespace) -> int:
     for c in candidates:
         ub = _wilson_ub_pct(c, EventType.CHEAP_SHORT_CIRCUIT)
         u = usage_by_model.get(c.model)
-        cpc = (u.cost_usd / u.calls) if u and u.calls else None
+        cpc = (
+            u.cost_usd / u.calls
+            if u and u.calls and u.cost_usd > 0
+            else None
+        )
         ev = c.events[EventType.CHEAP_SHORT_CIRCUIT]
         rows.append((c.model, ub, cpc, _policy_for_stats(c), ev.correct + ev.incorrect))
 
@@ -682,6 +812,8 @@ def cmd_recommend(args: argparse.Namespace) -> int:
         out = {
             "decision_class": target_dc,
             "freshness_half_life_days": hl,
+            "cost_basis": "scorecard_legacy",
+            "usd_authority": "unknown",
             "short_circuit": [_r(r) for r in sc_rows],
             "learning": [r[0] for r in learning],
             "fall_through": [_r(r) for r in fall_through],
@@ -692,7 +824,7 @@ def cmd_recommend(args: argparse.Namespace) -> int:
         }
         if not sc_rows and fall_through:
             out["least_bad"] = {"model": fall_through[0][0]}
-        print(dumps_display(out))
+        print(_dumps_json_lane(out))
         return 0
 
     # Freshness banner — when an operator passes --freshness, surface that the
@@ -705,21 +837,27 @@ def cmd_recommend(args: argparse.Namespace) -> int:
         return f"{x:.1f}% max_miss" if x is not None else "max_miss=n/a"
 
     def _fmt_cpc(x) -> str:
-        return f"${x:.4f}/call" if x is not None else "no cost data"
+        return (
+            f"${x:.4f}/call legacy estimate"
+            if x is not None
+            else "no usable cost estimate"
+        )
 
+    # Model names are sidecar-derived (same forgeable provenance as the
+    # table cells) — scrub before the terminal, like every other lane.
     if sc_rows:
         m, ub, cpc, _, n = sc_rows[0]
         cpc_note = " — cheapest trusted" if cpc is not None else " — trusted (no cost data to rank by)"
-        print(f"  use: {m}  ({_fmt_ub(ub)} · n={n} · {_fmt_cpc(cpc)}){cpc_note}")
+        print(f"  use: {_scrub_cell(m)}  ({_fmt_ub(ub)} · n={n} · {_fmt_cpc(cpc)}){cpc_note}")
         for m2, ub2, cpc2, _, _n2 in sc_rows[1:]:
-            print(f"  also trusted: {m2} ({_fmt_ub(ub2)} · {_fmt_cpc(cpc2)})")
+            print(f"  also trusted: {_scrub_cell(m2)} ({_fmt_ub(ub2)} · {_fmt_cpc(cpc2)})")
     else:
         print("  no trusted model — none meet the miss-rate ceiling")
         if fall_through:
             m, ub, cpc, _, n = fall_through[0]
-            print(f"  least-bad option: {m} ({_fmt_ub(ub)} · n={n} · {_fmt_cpc(cpc)})")
+            print(f"  least-bad option: {_scrub_cell(m)} ({_fmt_ub(ub)} · n={n} · {_fmt_cpc(cpc)})")
     if learning:
-        names = ", ".join(r[0] for r in learning)
+        names = ", ".join(_scrub_cell(r[0]) for r in learning)
         print(f"  still learning (insufficient data): {names}")
     return 0
 
@@ -759,12 +897,17 @@ def cmd_chain_closure(args: argparse.Namespace) -> int:
             candidates.append(s)
 
     if not candidates:
+        # Honest remedy: the exploit-engine producer for this event
+        # type has not landed, so there is no flag or run that
+        # populates it yet — sending the operator to one is a wall.
         msg = (
             f"no chain-closure data for {target_dc!r} — nothing to rank. "
-            f"Fire /exploit with --scorecard <path> to populate."
+            f"The exploit-engine producer for exploit_chain_closure "
+            f"events is not wired in this tree yet; this view populates "
+            f"once it lands."
         )
         if getattr(args, "json", False):
-            print(dumps_display({
+            print(_dumps_json_lane({
                 "decision_class": target_dc,
                 "candidates": [],
                 "message": msg,
@@ -775,13 +918,17 @@ def cmd_chain_closure(args: argparse.Namespace) -> int:
 
     # For each candidate: n = successes + failures on this cell;
     # success_rate = success / n; cost_per_fire from _usage.
-    rows = []
+    rows: list[dict[str, Any]] = []
     for c in candidates:
         ev = c.events[EventType.EXPLOIT_CHAIN_CLOSURE]
         n = ev.correct + ev.incorrect
         rate = (ev.correct / n) if n else None
         u = usage_by_model.get(c.model)
-        cpc = (u.cost_usd / u.calls) if u and u.calls else None
+        cpc = (
+            u.cost_usd / u.calls
+            if u and u.calls and u.cost_usd > 0
+            else None
+        )
         rows.append({
             "model": c.model,
             "n": n,
@@ -819,29 +966,33 @@ def cmd_chain_closure(args: argparse.Namespace) -> int:
         if not rows:
             return None
         top = rows[0]
-        if top["n"] and (top["success_rate"] or 0.0) > 0.0:
-            return top["model"]
+        if top["n"] and (top["success_rate"] or 0.0) > 0.0:  # type: ignore[operator]
+            return top["model"]  # type: ignore[return-value]
         return None
 
     if getattr(args, "json", False):
-        print(dumps_display({
+        print(_dumps_json_lane({
             "decision_class": target_dc,
             "candidates": rows,
             "recommendation": _recommendation(),
+            "cost_basis": "scorecard_legacy",
+            "usd_authority": "unknown",
         }))
         return 0
 
     print(f"chain-closure ranking for {target_dc}:")
     print(
         f"  {'model':<28} {'n':>4} {'succ':>4} "
-        f"{'rate':>7} {'cost/fire':>10}",
+        f"{'rate':>7} {'legacy est./fire':>16}",
     )
     for r in rows:
-        rate_s = f"{r['success_rate']*100:5.1f}%" if r['success_rate'] is not None else "  n/a"
+        rate_s = f"{r['success_rate']*100:5.1f}%" if r['success_rate'] is not None else "  n/a"  # type: ignore[operator]
         cpc_s = f"${r['cost_per_call']:.3f}" if r['cost_per_call'] is not None else "  n/a"
+        # Model names are sidecar-derived (forgeable) — scrub for the
+        # terminal, like the list/compare table cells.
         print(
-            f"  {r['model']:<28} {r['n']:>4} {r['successes']:>4} "
-            f"{rate_s:>7} {cpc_s:>10}",
+            f"  {_scrub_cell(r['model']):<28} {r['n']:>4} {r['successes']:>4} "
+            f"{rate_s:>7} {cpc_s:>16}",
         )
     return 0
 
@@ -863,7 +1014,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
                 for dc in sorted(set(by_dc_a) & set(by_dc_b))
             ],
         }
-        print(dumps_display(out))
+        print(_dumps_json_lane(out))
         return 0
     print(_render_compare(
         all_stats, all_stats,
@@ -1005,14 +1156,20 @@ def cmd_tool_evidence(args: argparse.Namespace) -> int:
         or []
     )
     for vf in val_findings:
+        if not isinstance(vf, dict):
+            # A hand-edited or corrupted report can carry non-dict
+            # list entries; same guard as the auto-back-prop walk.
+            continue
         fid = vf.get("finding_id")
         if not fid:
             continue
         verdict = vf.get("is_exploitable")
-        if verdict is None:
-            # inconclusive — skip
+        if not isinstance(verdict, bool):
+            # Inconclusive (None) or malformed (stringy "true"/"yes")
+            # — skip; same typed rule as the auto-back-prop join in
+            # tool_evidence.py.
             continue
-        val_by_id[fid] = bool(verdict)
+        val_by_id[fid] = verdict
 
     # Walk analysis records; emit one evidence record per finding the
     # validator concluded on. Skip records missing the model — without
@@ -1023,6 +1180,8 @@ def cmd_tool_evidence(args: argparse.Namespace) -> int:
     skipped_no_model = 0
     analysis_records = analysis.get("results") or []
     for r in analysis_records:
+        if not isinstance(r, dict):
+            continue
         fid = r.get("finding_id")
         if not fid or fid not in val_by_id:
             continue
@@ -1030,10 +1189,20 @@ def cmd_tool_evidence(args: argparse.Namespace) -> int:
         if not model:
             skipped_no_model += 1
             continue
+        analysis_verdict = r.get("is_exploitable")
+        if not isinstance(analysis_verdict, bool):
+            # The analysis model abstained (errored / refused /
+            # schema-failed response nulls the field): it cast no
+            # verdict, so grading it against the validator would mint
+            # a reliability event for a vote never cast. bool()
+            # coercion here previously turned that abstention into a
+            # "not exploitable" vote — same typed rule as the
+            # auto-back-prop join in tool_evidence.py.
+            continue
         records.append({
             "model": model,
             "rule_id": r.get("rule_id") or "unknown",
-            "analysis_verdict": bool(r.get("is_exploitable", False)),
+            "analysis_verdict": analysis_verdict,
             "validation_verdict": val_by_id[fid],
             "finding_id": fid,
             "analysis_reasoning": r.get("reasoning") or "",
@@ -1049,6 +1218,24 @@ def cmd_tool_evidence(args: argparse.Namespace) -> int:
         f"from {len(records)} joined finding(s).",
         file=sys.stderr,
     )
+    # Run-context annotation: when the validation run whose verdicts
+    # were just graded against executed with the sandbox disabled, the
+    # operator should see that the truth signal came from an
+    # unsandboxed run. Notice only — the recorded events are
+    # unchanged. Display-tier read (escaped + bounded label; see
+    # read_cli_disable_annotation's trust note).
+    try:
+        from core.sandbox.summary import read_cli_disable_annotation
+        _consent = read_cli_disable_annotation(Path(args.validation).parent)
+    except Exception:  # noqa: BLE001 — annotation must never block recording
+        _consent = None
+    if _consent is not None:
+        print(
+            "  run context: the validation run executed with the "
+            f"sandbox DISABLED (consent: {_consent}) — its verdicts "
+            "were produced unsandboxed.",
+            file=sys.stderr,
+        )
     if skipped_no_model:
         print(
             f"  notice: {skipped_no_model} analysis record(s) skipped "
@@ -1056,9 +1243,12 @@ def cmd_tool_evidence(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     print(
-        "  reminder: re-running this command on the same reports "
-        "double-records. Track external state (commit hash, run id) "
-        "if invoking from automation.",
+        "  note: re-running on the same reports is idempotent per "
+        "finding_id (atomic claim-and-record). Residual: a cell that "
+        "accumulates more findings than the seen-id cap between "
+        "imports evicts oldest ids, so a re-import that far apart "
+        "can double-count those findings — a bounded counting "
+        "error, not a trust flip.",
         file=sys.stderr,
     )
     return 0
@@ -1080,7 +1270,8 @@ def cmd_adopt(args: argparse.Namespace) -> int:
     if not adopted:
         print(
             "nothing to adopt — no quarantine file "
-            f"({args.path}.unverified) and no sidecar content",
+            f"({args.path}.<timestamp>.unverified) and no sidecar "
+            "content",
         )
         return 1
     print(f"adopted scorecard content into {args.path} (stamped).")
@@ -1110,8 +1301,9 @@ def cmd_mark(args: argparse.Namespace) -> int:
     sample = None
     if args.note:
         # Single-line operator note attached to the disagreement-
-        # samples log on incorrect outcomes. Bounded by
-        # ``record_event``'s caps + retain_samples gate.
+        # samples log on incorrect outcomes. Length-bounded at the
+        # sink (``_append_sample`` slices every string leaf to
+        # ``_MAX_REASONING_CHARS``) and gated by retain_samples.
         sample = {"note": args.note}
     sc.record_event(
         decision_class=args.decision_class,
@@ -1150,8 +1342,9 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
-        "--path", type=Path, default=DEFAULT_PATH,
-        help=f"sidecar path (default: {DEFAULT_PATH})",
+        "--path", type=Path, default=default_scorecard_path(),
+        help=f"sidecar path (default: {default_scorecard_path()}),"
+             " resolved at invocation",
     )
     p.add_argument(
         "--json", action="store_true",
@@ -1190,7 +1383,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_list.add_argument(
         "--by-cost", action="store_true",
-        help="sort by total spend on this cell (descending) — the $$ column.",
+        help=(
+            "sort by legacy estimated USD on this cell "
+            "(descending)"
+        ),
     )
     p_list.add_argument(
         "--untrusted", action="store_true",
@@ -1242,8 +1438,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p_sum = sub.add_parser(
         "summary",
         help=(
-            "one-shot dashboard: cell totals, policy breakdown, total spend, "
-            "most-used model, cheapest trusted, recent activity"
+            "one-shot dashboard: cell totals, policy breakdown, legacy "
+            "estimated USD, most-used model, recent activity"
+        ),
+    )
+    p_sum.add_argument(
+        "--freshness", dest="freshness_half_life_days",
+        type=float, default=None, metavar="DAYS",
+        help=(
+            "weight recent behaviour (half-life in days) so the policy "
+            "breakdown mirrors a freshness-configured live gate; same "
+            "as `list --freshness`. Default: unweighted (all-time)."
         ),
     )
     p_sum.set_defaults(handler=cmd_summary)
@@ -1436,9 +1641,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_adopt.add_argument(
         "--file", type=Path, default=None,
         help=(
-            "explicit source JSON to adopt (default: the "
-            "quarantine file <sidecar>.unverified when present, "
-            "else the sidecar itself)"
+            "explicit source JSON to adopt (default: the newest "
+            "quarantine file <sidecar>.<timestamp>.unverified when "
+            "present, else the sidecar itself)"
         ),
     )
     p_adopt.set_defaults(handler=cmd_adopt)

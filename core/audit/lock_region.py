@@ -55,6 +55,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+from core.source.lines import split_lines
 
 logger = logging.getLogger(__name__)
 
@@ -97,16 +98,26 @@ _SEED_LOCK_PAIRS = (
 )
 
 # Naming-stem pairing for project locks (foo_lock → foo_unlock):
-# detection grade only.
-_STEM_LOCK_RE = re.compile(r"\A(\w*?)_?(?<!un)lock\Z")
+# detection grade only. The stem separator is MANDATORY — an optional
+# `_?` let common words (clock, block, flock) register as stem
+# acquires whose pair never resolves, misattributing pair-unresolved
+# inconclusives after a cross-file rescan.
+_STEM_LOCK_RE = re.compile(r"\A(\w+)_lock\Z")
 
 # Hypothesis shapes asserting callback-invocation-under-lock (§5.5).
+# ``stem\w*.{0,N}`` gaps are respelled in canonical-split form
+# ``stem(?:.{0,N}|\w{1,64}.{N})``: the suffix run and the gap both
+# consume word characters, so the unbounded ambiguous spelling
+# re-splits against every stem repeat inside one long word —
+# quadratic on hostile text. Same language (gap alone, or word run
+# plus exactly-N gap); only a stem buried more than 64
+# word-characters before the gap stops matching.
 _LOCK_REGION_HYPOTHESIS_RE = re.compile(
-    r"(?:(?:callback|handler|hook|function\s+pointer|\bcb\b)\w*"
-    r".{0,60}(?:under|while|with|holding|inside)"
+    r"(?:(?:callback|handler|hook|function\s+pointer|\bcb\b)"
+    r"(?:.{0,60}|\w{1,64}.{60})(?:under|while|with|holding|inside)"
     r".{0,20}(?:the\s+|a\s+)?lock"
     r"|lock\s+held.{0,40}(?:callback|reentran)"
-    r"|reentran\w+.{0,40}lock"
+    r"|reentran(?:\w.{0,40}|\w{1,64}.{40})lock"
     r"|deadlock.{0,40}callback"
     r"|callback.{0,40}deadlock)",
     re.IGNORECASE | re.DOTALL,
@@ -333,7 +344,7 @@ def _find_regions(
         release_off = 0
         release_name = ""
         for off2 in range(offset + 1, len(segment)):
-            m = rel_re.search(segment[off2])
+            m = rel_re.search(segment[off2])  # type: ignore[assignment]
             if m:
                 release_off = off2
                 release_name = m.group(0).rstrip("( \t")
@@ -448,15 +459,33 @@ def _in_region_invocations(
     invocations: list[dict[str, Any]] = []
     cancels: list[dict[str, Any]] = []
     cancel_set = set(_cancel_names(vocab))
-    lo = region.acquire_line - start_line + 1
+    lo = region.acquire_line - start_line
     hi = region.release_line - start_line
 
     def _code(offset: int) -> str:
         show = raw_segment if raw_segment is not None else segment
         return show[offset].strip()[:200]
 
-    for offset in range(max(lo, 0), min(hi, len(segment))):
+    def _clipped(offset: int) -> str:
+        """Region-clipped view of one line: the acquire line counts
+        only AFTER the acquire call, the release line only BEFORE the
+        release call. Excluding both LINES wholesale produced false
+        affirmative refutations ("release precedes every
+        callback-shaped invocation") whenever an invocation shared
+        the acquire or release line."""
         text = segment[offset]
+        if offset == hi:
+            m = re.search(rf"\b{re.escape(region.release)}\s*\(", text)
+            if m:
+                text = text[:m.start()]
+        if offset == lo:
+            m = re.search(rf"\b{re.escape(region.acquire)}\s*\(", text)
+            if m:
+                text = text[m.end():]
+        return text
+
+    for offset in range(max(lo, 0), min(hi + 1, len(segment))):
+        text = _clipped(offset)
         for m in _INDIRECT_CALL_RE.finditer(text):
             base = m.group(1) or m.group(3)
             member = m.group(2) or m.group(4)
@@ -588,7 +617,7 @@ def _adjudicate_function(
     """Adjudicate one function. Returns None when the function has no
     lock shape at all (prepass skip)."""
     source = source_texts.get(file_path, "")
-    lines = source.splitlines()
+    lines = split_lines(source)
     raw_segment = lines[span.start - 1:span.end]
     # Matching runs on the sanitized view only (comments/strings
     # blanked); raw lines feed the human-facing receipt fields.
@@ -757,17 +786,20 @@ def run_lock_region_check(
             f"{Path(file_path).suffix or 'unknown'}",
         )
     if source_texts is None:
-        try:
-            p = Path(target_path) / file_path
-            source_texts = {
-                file_path: p.read_text(encoding="utf-8",
-                                       errors="replace"),
-            }
-        except OSError:
+        # ``file_path`` arrives from gap records (LLM-writable): a
+        # bare join lets an absolute path replace the base and a
+        # ``../`` escape it; a FIFO plant would block the raw read
+        # forever. Contained + capped + fd-checked regular — every
+        # refusal degrades to the existing unbindable outcome.
+        from core.source import read_contained
+
+        text = read_contained(Path(target_path), file_path)
+        if text is None:
             return _inconclusive(
                 REASON_HYPOTHESIS_UNBINDABLE,
                 f"could not read {file_path}",
             )
+        source_texts = {file_path: text}
     source = source_texts.get(file_path, "")
     if not source:
         return _inconclusive(
@@ -827,7 +859,7 @@ def cocci_corroboration(
             return None
         res = run_rule(
             Path(target_path),
-            str(rule_path),
+            Path(rule_path),
             defines={"lock": lock, "unlock": unlock},
             timeout=120,
             allow_scripting=True,
@@ -887,7 +919,7 @@ def run_lock_region_prepass(
             or re.search(r"\b\w+_lock\s*\(", source)
         ):
             continue
-        lines = source.splitlines()
+        lines = split_lines(source)
         for span in _spans_cached(source, file_path):
             if telemetry["candidates"] >= max_candidates:
                 break

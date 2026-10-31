@@ -83,9 +83,10 @@ class TestAdditions:
         assert drift.new_buckets == {"exec": ["popen"]}
         assert drift.high_severity()
 
-    def test_high_severity_only_for_exec_or_network(self):
+    def test_high_severity_only_for_high_severity_buckets(self):
         """Adding string_overflow alone isn't high severity —
-        the ladder reserves high for exec/network adds."""
+        the ladder reserves high for HIGH_SEVERITY_BUCKETS adds
+        (exec / network / runtime_privilege / kernel_trace)."""
         prev = _fp(sha="A", buckets={})
         cur = _fp(sha="B", buckets={"string_overflow": ["strcpy"]})
         drift = detect_drift(prev, cur)

@@ -14,6 +14,7 @@ one doesn't") produces much higher precision than hardcoded checklists.
 
 from __future__ import annotations
 
+import bisect
 import logging
 import re
 from collections.abc import Collection, Sequence
@@ -22,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from .gaps import read_gap_source
+from core.source.lines import split_lines
 
 logger = logging.getLogger(__name__)
 
@@ -196,7 +198,10 @@ _GENERIC_PATTERNS: dict[str, list[str]] = {
     ],
     CONCERN_BOUNDS: [
         r"if\s*\(\s*\w+\s*[<>]=?\s*\w+\s*\)",
-        r"assert.*len",
+        # Bounded gap: same trade-off as the walk-based members above —
+        # real assert/len co-occurrence is one expression, and an
+        # unbounded gap re-scans hostile source per planted keyword.
+        r"assert.{0,1000}len",
         r"check_bounds",
     ],
     CONCERN_NULL_CHECK: [
@@ -319,6 +324,10 @@ def discover_conventions(
                 continue
             key = f"{gap.get('file', '')}:{gap.get('name', '')}"
 
+            # Count the gap under EVERY matching pattern: with a
+            # first-match break, an early pattern absorbed each gap and
+            # skewed the best_pat majority vote toward list order
+            # rather than actual adoption.
             for pat in patterns_to_check:
                 try:
                     if re.search(pat, source):
@@ -326,7 +335,6 @@ def discover_conventions(
                         locs = bucket.setdefault(pat, [])
                         if key not in locs:
                             locs.append(key)
-                        break
                 except re.error:
                     continue
 
@@ -533,9 +541,18 @@ def check_sibling_negative_space(
 
     findings: list[NegativeSpaceFinding] = []
 
+    from core.audit.consistency_dimensions import intake_capped
+
     for pg in peer_groups:
+        # Family-size ceiling at comparator intake (the
+        # consistency_dimensions.MAX_FAMILY_MEMBERS backstop): an
+        # uncapped producer must not turn one hub group into a
+        # whole-tree vote blob here either.
+        capped_siblings, was_capped = intake_capped(
+            list(pg.siblings),
+        )
         enriched_siblings = []
-        for sibling in pg.siblings:
+        for sibling in capped_siblings:
             sib_copy = SiblingPath(
                 label=sibling.label,
                 file=sibling.file,
@@ -595,6 +612,16 @@ def check_sibling_negative_space(
                     expected=(
                         f"{asym.majority_count}/{asym.majority_count + asym.minority_count} "
                         f"peer functions follow this convention"
+                        + (
+                            # In-band sampling marker (the intake
+                            # ceiling): the vote ran over a seeded
+                            # sample, and the receipt must never
+                            # read as the whole family.
+                            f" [vote over a seeded sample of "
+                            f"{len(capped_siblings)} of the "
+                            f"group's {len(pg.siblings)} siblings]"
+                            if was_capped else ""
+                        )
                     ),
                     evidence=(
                         f"{sib_label} lacks {concern} check that "
@@ -638,9 +665,74 @@ def format_negative_space_prose(
 # ── Post-loop pattern checks ────────────────────────────────────────
 # Pattern-based checks that detect known-dangerous constructs, missing
 # security features, and protocol ambiguities across the whole codebase.
+#
+# Scan-cost discipline for this section: the checks run unanchored
+# over scanned-repo source, so an unbounded gap (``.*`` / ``[^X]*``)
+# between required tokens is re-scanned from every candidate start —
+# quadratic (and multiplicative per extra gap) on hostile text. Gaps
+# carry generous bounds instead (far above real code spans; a longer
+# span stops matching, which only drops pathological inputs), and
+# checks with two or more gaps walk their tokens in order via
+# ``_ordered_tokens`` — one linear pass per token, same accept set.
 
+
+def _ordered_tokens(
+    source: str,
+    steps: Sequence[re.Pattern[str]],
+    forbid: str = "\n",
+) -> bool:
+    """True when ``steps`` match ``source`` in order with every
+    inter-step gap free of ``forbid`` (the gap alphabet of the
+    single-regex spelling this replaces: a ``.*`` gap forbids a
+    newline, a ``[^}]*`` gap forbids ``}``).
+
+    A chained regex explores every pairing of the tokens' candidate
+    positions — multiplicative backtracking on token-dense hostile
+    source. This walk enumerates each token's occurrences once and
+    carries the reachable chain ends, so cost is one linear pass per
+    token while accepting exactly the same sources.
+    """
+    # One pass for the forbidden-char positions: a per-occurrence
+    # rfind would itself re-scan the prefix from every token.
+    forbid_at = [i for i, ch in enumerate(source) if ch == forbid]
+    ends = [m.end() for m in steps[0].finditer(source)]
+    for step in steps[1:]:
+        if not ends:
+            return False
+        new_ends: list[int] = []
+        for m in step.finditer(source):
+            start = m.start()
+            # Some prior chain end e must satisfy floor < e <= start,
+            # where floor is the last forbidden char before the token
+            # (the connecting gap may not cross it). ``ends`` is
+            # ascending, so the largest end <= start decides.
+            fi = bisect.bisect_left(forbid_at, start) - 1
+            floor = forbid_at[fi] if fi >= 0 else -1
+            index = bisect.bisect_right(ends, start) - 1
+            if index >= 0 and ends[index] > floor:
+                new_ends.append(m.end())
+        ends = new_ends
+    return bool(ends)
+
+
+class _OrderedTokenCheck:
+    """``search()``-shaped adapter over ``_ordered_tokens`` so a
+    multi-gap co-occurrence check can sit in a pattern table whose
+    consumers only branch on truthiness."""
+
+    def __init__(self, steps: tuple[re.Pattern[str], ...],
+                 forbid: str = "\n") -> None:
+        self._steps = steps
+        self._forbid = forbid
+
+    def search(self, source: str) -> bool:
+        return _ordered_tokens(source, self._steps, self._forbid)
+
+
+# Bounded head-to-tail gap: it never spans more than one regex
+# literal in real code.
 _REDOS_SUSPICIOUS = re.compile(
-    r"""re\.compile\(\s*[rfbu]*["'].*(?:\+\)\+|\*\)\*|\+\)\*|\*\)\+)""",
+    r"""re\.compile\(\s*[rfbu]*["'].{0,1000}(?:\+\)\+|\*\)\*|\+\)\*|\*\)\+)""",
     re.IGNORECASE,
 )
 
@@ -649,13 +741,22 @@ _UNBOUNDED_ALLOC = re.compile(
     re.IGNORECASE,
 )
 
+# ``if (`` … size-word … comparator, in order on one line (the
+# ordered-walk spelling of ``if\s*\(.*(?:size|len|count|num).*[<>]``).
+_ALLOC_BOUNDS_CHECK_STEPS = (
+    re.compile(r"if\s*\(", re.IGNORECASE),
+    re.compile(r"size|len|count|num", re.IGNORECASE),
+    re.compile(r"[<>]"),
+)
+
 _XML_ENTITY_EXPANSION = re.compile(
     r"(?:XMLParser|xml\.(?:sax|dom|etree|parsers)|parseString|parse\(|fromstring)\s*\(",
     re.IGNORECASE,
 )
 
 _XML_SAFE_GUARD = re.compile(
-    r"(?:defusedxml|resolve_entities\s*=\s*False|XMLParser\s*\([^)]*resolve_entities|"
+    r"(?:defusedxml|resolve_entities\s*=\s*False|"
+    r"XMLParser\s*\([^)]{0,4000}resolve_entities|"
     r"set_feature\s*\(\s*feature_external_ges)",
     re.IGNORECASE,
 )
@@ -670,10 +771,32 @@ _HASH_COLLISION_GUARD = re.compile(
     re.IGNORECASE,
 )
 
-_RECURSIVE_CALL = re.compile(
-    r"def\s+(\w+)\s*\([^)]*\).*?\b\1\s*\(",
-    re.DOTALL,
-)
+# Recursion = a ``def NAME(`` whose NAME reappears before a ``(``
+# after the parameter list closes. The single-regex spelling
+# (``def\s+(\w+)\s*\([^)]*\).*?\b\1\s*\(`` with DOTALL) re-scanned
+# the whole remaining source from every def on hostile input; this
+# walk indexes every ``name(`` call shape in one pass instead.
+_DEF_SITE_RE = re.compile(r"def\s+(\w+)\s*\(")
+_CALL_SITE_RE = re.compile(r"\b(\w+)\s*\(")
+
+
+def _has_recursive_call(source: str) -> bool:
+    calls: dict[str, int] = {}
+    for m in _CALL_SITE_RE.finditer(source):
+        # keep the LAST occurrence position per name — recursion only
+        # needs one occurrence after the def's parameter list.
+        calls[m.group(1)] = m.start(1)
+    # One pass for the closing parens: a per-def str.find would
+    # re-scan the tail from every def on paren-free hostile source.
+    closes = [i for i, ch in enumerate(source) if ch == ")"]
+    for m in _DEF_SITE_RE.finditer(source):
+        ci = bisect.bisect_left(closes, m.end())
+        if ci >= len(closes):
+            continue
+        last = calls.get(m.group(1))
+        if last is not None and last > closes[ci]:
+            return True
+    return False
 
 _RECURSION_GUARD = re.compile(
     r"(?:depth|level|max_depth|MAX_DEPTH|recursion_limit|sys\.setrecursionlimit)",
@@ -727,9 +850,9 @@ def check_resource_exhaustion(
                     re.IGNORECASE,
                 )
         if unbounded_re.search(source):
-            is_checked = bool(re.search(
-                r"if\s*\(.*(?:size|len|count|num).*[<>]", source, re.IGNORECASE,
-            ))
+            is_checked = _ordered_tokens(
+                source, _ALLOC_BOUNDS_CHECK_STEPS,
+            )
             if not is_checked:
                 findings.append(NegativeSpaceFinding(
                     check_type="resource_exhaustion",
@@ -787,7 +910,7 @@ def check_resource_exhaustion(
                     title="Hash container without size limit",
                 ))
 
-        if (_RECURSIVE_CALL.search(source)
+        if (_has_recursive_call(source)
                 and not _RECURSION_GUARD.search(source)):
             findings.append(NegativeSpaceFinding(
                     check_type="resource_exhaustion",
@@ -1101,7 +1224,9 @@ def check_missing_app_features(
     return findings
 
 
-_UB_PATTERNS = [
+# Rows mix compiled patterns and ordered-token adapters — both
+# expose the boolean ``search()`` the consumer branches on.
+_UB_PATTERNS: list[tuple[re.Pattern[str] | _OrderedTokenCheck, str, str]] = [
     (
         re.compile(r"if\s*\(\s*\w+\s*\+\s*\w+\s*<\s*\w+\s*\)"),
         "Signed overflow check may be optimized away",
@@ -1118,20 +1243,51 @@ _UB_PATTERNS = [
         "CWE-682",
     ),
     (
-        re.compile(r"memcpy\s*\([^,]+,\s*[^,]+\s*(?:\+|-)\s*\w+\s*,"),
+        # The second argument is \S-delimited: the naive
+        # ``,\s*[^,]+\s*(?:\+|-)`` overlapped three unbounded repeats
+        # on whitespace, so a ``memcpy(``-opening line with a long
+        # whitespace run and no operator cost every split of the run
+        # — cubic in the line length. The dropped corner is a
+        # whitespace-only second argument, not real C. Both argument
+        # spans are bounded (real memcpy arguments sit far below the
+        # bound; an unbounded span is re-scanned from every planted
+        # ``memcpy(`` on hostile source).
+        re.compile(
+            r"memcpy\s*\([^,]{1,1000},\s*[^,\s](?:[^,]{0,1000}?[^,\s])?"
+            r"\s*(?:\+|-)\s*\w+\s*,",
+        ),
         "memcpy with overlapping regions risk (should use memmove)",
         "CWE-120",
     ),
     (
+        # \b pins the pointer name to its full word — the name and
+        # the dot-star overlapped on word chars (quadratic on an
+        # identifier run with no sizeof). The one dropped corner is
+        # a mid-word 'sizeof' suffix ('mysizeof' counted as the
+        # operator), which was a false-positive row, not C. The
+        # declaration-to-sizeof gaps are bounded: on one line they
+        # never span more than a statement in real C.
         re.compile(
-            r"(?:void|char)\s*\*\s*\w+.*(?:sizeof\s*\(|sizeof\b)|"
-            r"sizeof\s*\(.*(?:void|char)\s*\*\s*\w+",
+            r"(?:void|char)\s*\*\s*\w+\b.{0,1000}(?:sizeof\s*\(|sizeof\b)|"
+            r"sizeof\s*\(.{0,1000}(?:void|char)\s*\*\s*\w+",
         ),
         "Pointer arithmetic on void*/char* near sizeof (potential type confusion)",
         "CWE-843",
     ),
     (
-        re.compile(r"union\s+\w+\s*\{[^}]*\b(?:int|float|double|long|short|char)\b[^}]*\}"),
+        # Ordered-walk spelling of ``union\s+\w+\s*\{[^}]*\b(?:int|
+        # float|double|long|short|char)\b[^}]*\}`` — two unbounded
+        # body gaps made the single regex multiplicative on hostile
+        # type-dense source; the walk is linear and gap-exact
+        # (``[^}]`` gaps, so the forbidden char is ``}``).
+        _OrderedTokenCheck(
+            (
+                re.compile(r"union\s+\w+\s*\{"),
+                re.compile(r"\b(?:int|float|double|long|short|char)\b"),
+                re.compile(r"\}"),
+            ),
+            forbid="}",
+        ),
         "Union used for type punning (strict aliasing violation candidate)",
         "CWE-843",
     ),
@@ -1253,13 +1409,22 @@ def check_signal_safety(
 
 # ── Side-channel patterns ─────────────────────────────────────────────
 
-_EARLY_RETURN_AUTH = re.compile(
-    r"(?:password|passwd|secret|token|key|hmac|digest)\s*\[.*\]\s*!=.*:\s*return\s+False",
-    re.IGNORECASE,
+# Ordered-walk spelling of ``(?:password|…)\s*\[.*\]\s*!=.*:\s*
+# return\s+False`` — the two subscript/comparison gaps made the
+# single regex multiplicative on hostile secret-word-dense source.
+_EARLY_RETURN_AUTH_STEPS = (
+    re.compile(
+        r"(?:password|passwd|secret|token|key|hmac|digest)\s*\[",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\]\s*!="),
+    re.compile(r":\s*return\s+False", re.IGNORECASE),
 )
 
+# Gated optional paren — the naive ``\(?\s*`` pair was quadratic on
+# a comparator followed by a whitespace run.
 _NON_CONSTANT_TIME_CMP = re.compile(
-    r"(?:strcmp|memcmp|==)\s*\(?\s*(?:password|passwd|token|secret|key|hmac|api_key|auth)",
+    r"(?:strcmp|memcmp|==)\s*(?:\(\s*)?(?:password|passwd|token|secret|key|hmac|api_key|auth)",
     re.IGNORECASE,
 )
 
@@ -1286,7 +1451,7 @@ def check_side_channels(
         file = gap.get("file", "")
         function = gap.get("name", "")
 
-        if _EARLY_RETURN_AUTH.search(source):
+        if _ordered_tokens(source, _EARLY_RETURN_AUTH_STEPS):
             findings.append(NegativeSpaceFinding(
                 check_type="side_channel",
                 expected="constant-time comparison for secret data",
@@ -1373,13 +1538,23 @@ _CROSS_PROC_PRIV = re.compile(
     re.IGNORECASE,
 )
 
-_CROSS_PROC_PRIV_CONTEXT = re.compile(
-    r"if\s+.*(?:os\.getuid|os\.geteuid|getuid|geteuid)\s*\(",
-    re.IGNORECASE,
+# Ordered-walk spelling of ``if\s+(?=\S).*(?:os\.getuid|…)\s*\(`` —
+# an unbounded same-line condition gap is re-scanned from every
+# planted ``if`` on hostile source.
+_CROSS_PROC_HEAD_RE = re.compile(r"if\s+(?=\S)", re.IGNORECASE)
+_CROSS_PROC_UID_RE = re.compile(
+    r"(?:os\.getuid|os\.geteuid|getuid|geteuid)\s*\(", re.IGNORECASE,
 )
 
+
+def _cross_proc_priv_context(source: str) -> bool:
+    return _ordered_tokens(source, (_CROSS_PROC_HEAD_RE, _CROSS_PROC_UID_RE))
+
+# Bounded argument span — real call arguments sit far below the
+# bound; unbounded, the span is re-scanned from every planted head.
 _SUBPROCESS_SHELL_UNTRUSTED = re.compile(
-    r"subprocess\.(?:Popen|call|run|check_output|check_call)\s*\([^)]*shell\s*=\s*True",
+    r"subprocess\.(?:Popen|call|run|check_output|check_call)"
+    r"\s*\([^)]{0,4000}shell\s*=\s*True",
     re.IGNORECASE,
 )
 
@@ -1437,7 +1612,7 @@ def check_multi_process(
                 title="Shared memory access without synchronization",
             ))
 
-        if _CROSS_PROC_PRIV_CONTEXT.search(source):
+        if _cross_proc_priv_context(source):
             findings.append(NegativeSpaceFinding(
                 check_type="multi_process",
                 expected="privilege decisions based on verified credentials, not PID/UID",
@@ -1480,15 +1655,26 @@ def check_multi_process(
 # the legacy whitelist token stays (older codebases use it) and the
 # allowlist/blocklist spellings are listed alongside; this is exempt
 # from the house allowlist/blocklist terminology rule.
-_HARDCODED_LOCALHOST = re.compile(
-    r"""(?:127\.0\.0\.1|localhost|0\.0\.0\.0).*"""
-    r"""(?:auth|secur|allow|trust|permit|acl|whitelist|allowlist"""
-    r"""|allow_list|blocklist|denylist)"""
-    r"""|(?:auth|secur|allow|trust|permit|acl|whitelist|allowlist"""
-    r"""|allow_list|blocklist|denylist).*"""
-    r"""(?:127\.0\.0\.1|localhost|0\.0\.0\.0)""",
+# Ordered-walk spelling of ``(?:127\.0\.0\.1|…).*(?:auth|…)`` and
+# its mirrored branch — an unbounded same-line gap is re-scanned
+# from every planted keyword on hostile source.
+_LOCALHOST_ADDR_RE = re.compile(
+    r"127\.0\.0\.1|localhost|0\.0\.0\.0", re.IGNORECASE,
+)
+_LOCALHOST_KEYWORD_RE = re.compile(
+    r"auth|secur|allow|trust|permit|acl|whitelist|allowlist"
+    r"|allow_list|blocklist|denylist",
     re.IGNORECASE,
 )
+
+
+def _hardcoded_localhost(source: str) -> bool:
+    return (
+        _ordered_tokens(source, (_LOCALHOST_ADDR_RE, _LOCALHOST_KEYWORD_RE))
+        or _ordered_tokens(
+            source, (_LOCALHOST_KEYWORD_RE, _LOCALHOST_ADDR_RE),
+        )
+    )
 
 _GLOBAL_STATE_NO_LOCK = re.compile(
     r"(?:global\s+\w+|_(?:cache|state|registry|store|sessions|connections)\s*(?:=|\[))",
@@ -1509,11 +1695,36 @@ _HARDCODED_PATH_SECURITY_CONTEXT = re.compile(
     re.IGNORECASE,
 )
 
-_DEBUG_SKIP_SECURITY = re.compile(
-    r"if\s+.*(?:DEBUG|TESTING|DEV_MODE|DEVELOPMENT|TEST_MODE)\s*"
-    r"(?::|.*(?:skip|disable|bypass|no).*(?:auth|secur|valid|check|verif))",
+# Ordered-walk spelling of ``if\s+(?=\S).*(?:DEBUG|…)(?:\s*:|\s*
+# (?=\S).*(?:skip|…).*(?:auth|…))`` — three chained gaps made the
+# single regex multiplicative on hostile keyword-dense source. The
+# mode token absorbs its trailing whitespace run ((?=\S)-pinned, as
+# before) so a whitespace-only line break between the mode word and
+# the skip word still connects, exactly like the old spelling.
+_DEBUG_SKIP_HEAD = re.compile(r"if\s+(?=\S)", re.IGNORECASE)
+_DEBUG_SKIP_MODE_COLON = re.compile(
+    r"(?:DEBUG|TESTING|DEV_MODE|DEVELOPMENT|TEST_MODE)\s*:",
     re.IGNORECASE,
 )
+_DEBUG_SKIP_MODE = re.compile(
+    r"(?:DEBUG|TESTING|DEV_MODE|DEVELOPMENT|TEST_MODE)\s*(?=\S)",
+    re.IGNORECASE,
+)
+_DEBUG_SKIP_VERB = re.compile(r"skip|disable|bypass|no", re.IGNORECASE)
+_DEBUG_SKIP_NOUN = re.compile(
+    r"auth|secur|valid|check|verif", re.IGNORECASE,
+)
+
+
+def _debug_skip_security(source: str) -> bool:
+    return (
+        _ordered_tokens(source, (_DEBUG_SKIP_HEAD, _DEBUG_SKIP_MODE_COLON))
+        or _ordered_tokens(
+            source,
+            (_DEBUG_SKIP_HEAD, _DEBUG_SKIP_MODE,
+             _DEBUG_SKIP_VERB, _DEBUG_SKIP_NOUN),
+        )
+    )
 
 
 def check_deployment_assumptions(
@@ -1533,7 +1744,7 @@ def check_deployment_assumptions(
         file = gap.get("file", "")
         function = gap.get("name", "")
 
-        if _HARDCODED_LOCALHOST.search(source):
+        if _hardcoded_localhost(source):
             findings.append(NegativeSpaceFinding(
                 check_type="deployment_assumption",
                 expected="security checks not conditional on localhost/127.0.0.1",
@@ -1585,7 +1796,7 @@ def check_deployment_assumptions(
                 title="Hardcoded temp/var path in security context",
             ))
 
-        if _DEBUG_SKIP_SECURITY.search(source):
+        if _debug_skip_security(source):
             findings.append(NegativeSpaceFinding(
                 check_type="deployment_assumption",
                 expected="no security bypass gated on DEBUG/development flags",
@@ -1607,8 +1818,15 @@ def check_deployment_assumptions(
 
 # ── Lock ordering patterns ────────────────────────────────────────────
 
+# The optional '&' gates its own trailing whitespace — the naive
+# ``\s*&?\s*`` pair was quadratic on a lock call followed by a
+# whitespace run.
+# \b pins each alternative to a word start — every branch opens on a
+# word char, and an unpinned leading \w+ is re-scanned from every
+# position of a hostile identifier run. Dropped corner: a mid-word
+# start ('0foo.acquire' matching 'foo'), a false token, not code.
 _LOCK_ACQUIRE = re.compile(
-    r"(?:(\w+)\.acquire\s*\(|pthread_mutex_lock\s*\(\s*&?\s*(\w+)|"
+    r"\b(?:(\w+)\.acquire\s*\(|pthread_mutex_lock\s*\(\s*(?:&\s*)?(\w+)|"
     r"(\w+)\.lock\s*\(|with\s+(\w+)\s*:)",
 )
 
@@ -1627,9 +1845,28 @@ _UNLOCK_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-_CONTEXT_MANAGER_LOCK = re.compile(
-    r"with\s+\w+",
+# Suppresses the missing-unlock check only when the managed object
+# looks lock-ish. Trade-off in both directions: the previous
+# any-with form (r"with\s+\w+") let `with open(path)` hide a bare
+# .acquire() with no release (missed leaks); an over-narrow name list
+# would re-flag RAII-managed locks whose release IS the context
+# manager (false rows). Lock-ish name tokens keep both directions
+# covered.
+# (?=\S) pins the whitespace run to end where the line body begins
+# (same language — the line class absorbed any remainder).
+# Ordered-walk spelling of ``with\s+(?=\S)[^\n]*(?:lock|…)`` — an
+# unbounded with-expression span is re-scanned from every planted
+# ``with`` on hostile source.
+_CONTEXT_LOCK_HEAD_RE = re.compile(r"with\s+(?=\S)", re.IGNORECASE)
+_CONTEXT_LOCK_WORD_RE = re.compile(
+    r"lock|mutex|guard|sema|cond|critical|monitor", re.IGNORECASE,
 )
+
+
+def _context_manager_lock(source: str) -> bool:
+    return _ordered_tokens(
+        source, (_CONTEXT_LOCK_HEAD_RE, _CONTEXT_LOCK_WORD_RE),
+    )
 
 _NON_REENTRANT_CALLS = frozenset({
     "strtok", "localtime", "gmtime", "asctime", "ctime",
@@ -1723,7 +1960,7 @@ def check_lock_ordering(
                     title="Lock acquisition in signal handler context",
                 ))
 
-        if lock_missing_re.search(source) and not _CONTEXT_MANAGER_LOCK.search(source):
+        if lock_missing_re.search(source) and not _context_manager_lock(source):
             has_acquire = lock_missing_re.search(source)
             has_release = unlock_re.search(source)
             has_error_path = re.search(
@@ -1779,7 +2016,9 @@ def check_lock_ordering(
 # (auth_predicates / security_fields), never hardcoded per framework.
 _AUTH_TERM_SEED = frozenset({"auth", "login", "authentication"})
 
-_AMR_CALL_RE = re.compile(r"\b([A-Za-z_][\w.]*)\s*\(")
+# Name run bounded — separator fills keep the \b live at every
+# planted head, so an unbounded run is re-scanned per head.
+_AMR_CALL_RE = re.compile(r"\b([A-Za-z_][\w.]{0,128})\s*\(")
 _AMR_KEYWORDS = frozenset({
     "if", "elif", "while", "for", "return", "switch", "sizeof",
     "assert", "print", "len", "isinstance", "super", "str", "int",
@@ -1843,7 +2082,7 @@ def check_auth_mode_registration(
         return []
     terms = _auth_terms_from_domain_model(domain_model)
 
-    lines = source.splitlines()
+    lines = split_lines(source)
     gated_spans: list[tuple[int, int]] = []  # [start, end) line idx
     cond_snippets: list[str] = []
 
@@ -1950,7 +2189,6 @@ def _go_method_bodies(source: str) -> list[tuple[str, str, str, str]]:
     Go method. Body extent = brace balance from the signature line."""
     out = []
     for m in _GO_METHOD_RE.finditer(source):
-        start = source.find("{", m.end() - 1)
         sig_end = source.find("\n", m.end())
         brace = source.find("{", sig_end - 1 if sig_end > 0 else m.end())
         if brace < 0:
@@ -1968,7 +2206,6 @@ def _go_method_bodies(source: str) -> list[tuple[str, str, str, str]]:
                     break
         out.append((m.group(1), m.group(2), m.group(3),
                     source[brace:end + 1]))
-        del start
     return out
 
 
@@ -2050,7 +2287,9 @@ def check_shared_writer_race(
 # f-string (or .format/concat) composing a URL: a placeholder sits
 # immediately after "://" — the authority segment is interpolated.
 _URL_FSTRING_BODY_RE = re.compile(r"""f["']([^"']+)["']""")
-_URL_PLACEHOLDER_RE = re.compile(r"\{([^}]+)\}")
+# Bounded placeholder name — real template placeholders are short,
+# and an unbounded body is re-scanned from every planted brace.
+_URL_PLACEHOLDER_RE = re.compile(r"\{([^}]{1,256})\}")
 _URL_CONCAT_RE = re.compile(
     r"""["'][^"']*://["']\s*\+\s*([A-Za-z_]\w*)""",
 )
@@ -2088,7 +2327,7 @@ def check_url_boundary_composition(
 
     findings: list[NegativeSpaceFinding] = []
     seen: set[str] = set()
-    lines = source.splitlines()
+    lines = split_lines(source)
     lower_src = source.lower()
 
     def _header_derived(var: str) -> bool:

@@ -8,22 +8,27 @@ from __future__ import annotations
 
 import logging
 import re
+from core.source.lines import split_lines
 
+from .cfg_conditions import _CONDITION_LABEL_RE
 from .lifecycle_model import Guard, ReadSite, WriteSite
 
 logger = logging.getLogger(__name__)
 
-_IF_CONDITION_RE = re.compile(
-    r"^(?:If|While|ElIf)\s*\((.+)\)$",
-    re.IGNORECASE,
-)
-
 
 def _extract_condition_from_label(label: str) -> str | None:
-    """Extract the condition text from a CFG node label like 'If (x != NULL)'."""
-    m = _IF_CONDITION_RE.match(label.strip())
+    """Extract the condition text from a CFG node label like
+    'If (x != NULL)' or the C builder's bare 'For x < n'.
+
+    One authority: :data:`core.analysis.cfg_conditions._CONDITION_LABEL_RE`
+    owns the label grammar — a private copy here drifted when the
+    ``For`` / bare-condition forms were added there, silently dropping
+    every C for-loop guard from the collected sets (false-negative
+    direction).
+    """
+    m = _CONDITION_LABEL_RE.match(label.strip())
     if m:
-        return m.group(1).strip()
+        return (m.group(1) or m.group(2) or "").strip()
     return None
 
 
@@ -124,7 +129,7 @@ def collect_field_sites_from_source(
         re.compile(rf"\.({re.escape(field_name)})\s*=(?!=)"),
     ]
 
-    for lineno, line_text in enumerate(source.splitlines(), 1):
+    for lineno, line_text in enumerate(split_lines(source), 1):
         is_write = any(p.search(line_text) for p in assign_patterns)
         is_access = any(p.search(line_text) for p in access_patterns)
 

@@ -303,9 +303,11 @@ def main(argv=None) -> None:
 
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument(
-        "--synth-db", type=Path, default=Path("/data/corpus/synth-results-tier0.db"),
-        help="trust-witness bridge's synth_results SQLite (default: "
-             "/data/corpus/synth-results-tier0.db)",
+        # Required: the old default named one specific corpus host's
+        # /data/corpus layout — a machine detail that doesn't belong
+        # in the repo.
+        "--synth-db", type=Path, required=True,
+        help="trust-witness bridge's synth_results SQLite",
     )
     args = ap.parse_args(argv)
     rep = analyze(args.synth_db)

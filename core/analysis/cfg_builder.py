@@ -32,7 +32,7 @@ vertex-cut check works at function granularity for C/C++.
 from __future__ import annotations
 
 import ast
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -136,6 +136,16 @@ class PyCFGNode:
     The legacy ``calls`` field is preserved for back-compat with
     phase 5–7 callers; ``{cs.name for cs in call_sites}`` will agree
     with it.
+
+    ``may_escape`` is the aliasing-conservatism bit shared with the
+    C/C++ and Java node contracts. A Python statement that stores to
+    a name the function declared ``global`` or ``nonlocal`` is NOT a
+    clean local rebinding: any callee (or, for ``nonlocal``, any
+    sibling closure) can rewrite the same binding between this
+    statement and a later read, so the value gate must not treat the
+    stored value's identity as proven at the sink.
+    ``evaluate_finding`` downgrades ``SUPPRESS → CANDIDATE_ONLY``
+    when a ``may_escape`` node sits on a source→sink path.
     """
     kind: str          # "entry" | "exit" | "stmt"
     lineno: int
@@ -144,6 +154,7 @@ class PyCFGNode:
     defs: frozenset[str] = frozenset()
     uses: frozenset[str] = frozenset()
     call_sites: tuple[CallSite, ...] = ()
+    may_escape: bool = False
 
     def __repr__(self) -> str:                              # pragma: no cover
         return (
@@ -197,6 +208,31 @@ class PythonCFG:
     _nodes: tuple[PyCFGNode, ...]
     _adjacency: dict[PyCFGNode, tuple[PyCFGNode, ...]]
     params: tuple[str, ...] = ()
+    # Names whose WRITTEN identity a consumer must not trust: the
+    # function's own bound names (params, assignments, local imports,
+    # nested defs, …) plus the module's repo-controlled roots
+    # (module-scope defs/assignments/globals and import aliases that
+    # bind a different source — ``import fakelib as html``). The
+    # sanitizer-cut catalog matcher degrades any binding whose
+    # callable root is in this set: the runtime callee is the repo's
+    # object, not the catalog identity the spelling suggests. Empty
+    # for hand-built CFGs (consumers treat absence as no distrust).
+    shadowed_roots: frozenset[str] = frozenset()
+    # True when a dynamic route (star-import, exec/eval, sys.modules,
+    # escaping globals()/vars()) makes the WHOLE module's name
+    # resolution unprovable — the catalog guard refuses every written
+    # identity in the function (suppression can only be lost).
+    namespace_unprovable: bool = False
+    # Roots the module PROVABLY binds to their same-named module via
+    # a plain self-import (``import html`` / ``import html.parser``).
+    # A dotted catalog identity is trusted ONLY through these: an
+    # UNBOUND root resolves through builtins at runtime, and builtins
+    # are writable by any other module in the repo (a package
+    # __init__ doing ``builtins.html = FakeNs`` forged an enforced
+    # suppression with no binding for the walkers to see) —
+    # legitimate code always imports its sanitizer. ``None`` =
+    # not computed (hand-built CFGs): consumers skip the check.
+    trusted_import_roots: frozenset[str] | None = None
 
     @property
     def entry(self) -> PyCFGNode:
@@ -214,6 +250,16 @@ _COMPREHENSION_TYPES = (
 )
 
 
+# ``ast.TryStar`` (``except*``) is 3.11+; same guard shape as the
+# smt_barrier dominance walk so the two legs stay coherent — an
+# ``except*`` handler group models exactly like ``except`` for
+# reachability-under-deletion purposes (re-raising handlers still
+# converge on the same merge points).
+_TRY_STMTS: tuple[type, ...] = (
+    (ast.Try, ast.TryStar) if hasattr(ast, "TryStar") else (ast.Try,)
+)
+
+
 def _statement_expr_roots(stmt: ast.stmt) -> list[ast.AST]:
     """Per-stmt-kind list of expressions that belong to *this* CFG
     node, excluding nested compound bodies (which become their own
@@ -227,12 +273,38 @@ def _statement_expr_roots(stmt: ast.stmt) -> list[ast.AST]:
         return [stmt.test]
     if isinstance(stmt, ast.While):
         return [stmt.test]
-    if isinstance(stmt, ast.For):
+    if isinstance(stmt, (ast.For, ast.AsyncFor)):
         return [stmt.target, stmt.iter]
-    if isinstance(stmt, ast.Try):
+    if isinstance(stmt, _TRY_STMTS):
         return []  # try has no statement-level expressions
-    if isinstance(stmt, ast.With):
-        roots: list[ast.AST] = []
+    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef,
+                         ast.ClassDef)):
+        # Nested def/class: the BODY is not statement-level code of
+        # the enclosing function — flattening it attributed a
+        # sanitizer inside a never-called nested def to a node that
+        # sits unconditionally on the path, and leaked nested locals
+        # / class-body names into defs. Only the parts evaluated AT
+        # the definition site in the enclosing scope are roots:
+        # decorators, parameter defaults, class bases / keywords.
+        roots: list[ast.AST] = list(stmt.decorator_list)
+        if isinstance(stmt, ast.ClassDef):
+            roots.extend(stmt.bases)
+            roots.extend(kw.value for kw in stmt.keywords)
+        else:
+            roots.extend(stmt.args.defaults)
+            roots.extend(
+                d for d in stmt.args.kw_defaults if d is not None
+            )
+        return roots
+    if hasattr(ast, "Match") and isinstance(stmt, ast.Match):
+        # Only the subject is statement-level; case bodies become
+        # their own nodes. Without this the subject node inherits the
+        # case bodies' calls — a sanitizer call inside a case would be
+        # attributed to the subject, so the vertex cut removes the
+        # subject and severs the no-match fall-through with it.
+        return [stmt.subject]
+    if isinstance(stmt, (ast.With, ast.AsyncWith)):
+        roots = []
         for item in stmt.items:
             roots.append(item.context_expr)
             if item.optional_vars is not None:
@@ -424,6 +496,38 @@ def _walk_symbols(
     return frozenset(defs), frozenset(uses)
 
 
+def _iter_eager_calls(root: ast.AST):
+    """Every ``ast.Call`` in ``root`` whose execution is NOT deferred.
+
+    Lambda bodies and generator-expression payloads run when the
+    lambda is CALLED / the generator is CONSUMED — not at this
+    statement. Attributing their calls to the statement node puts a
+    possibly-never-executed sanitizer unconditionally on the path
+    (the same false-suppression hazard as flattening nested ``def``
+    bodies, which :func:`_statement_expr_roots` already excludes).
+    Only the parts evaluated eagerly at the statement descend: a
+    lambda's parameter defaults, and a genexp's FIRST iterable (the
+    standard Python semantic). List/set/dict comprehensions evaluate
+    eagerly and descend in full.
+    """
+    stack: list[ast.AST] = [root]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, ast.Lambda):
+            stack.extend(node.args.defaults)
+            stack.extend(
+                d for d in node.args.kw_defaults if d is not None
+            )
+            continue
+        if isinstance(node, ast.GeneratorExp):
+            if node.generators:
+                stack.append(node.generators[0].iter)
+            continue
+        if isinstance(node, ast.Call):
+            yield node
+        stack.extend(ast.iter_child_nodes(node))
+
+
 def _extract_statement_payload(
     stmt: ast.stmt,
 ) -> tuple[
@@ -436,7 +540,9 @@ def _extract_statement_payload(
 
     Statement-level expression discipline (compound stmts walk only
     their controlling expressions, not bodies) is shared with
-    :func:`_statement_expr_roots`. The legacy ``calls`` frozenset is
+    :func:`_statement_expr_roots`; deferred-execution bodies (lambda,
+    genexp) are excluded from call extraction by
+    :func:`_iter_eager_calls`. The legacy ``calls`` frozenset is
     derived from ``call_sites`` so the two views never disagree.
     """
     expr_roots = _statement_expr_roots(stmt)
@@ -445,9 +551,7 @@ def _extract_statement_payload(
     # call_sites in source order
     site_records: list[tuple[int, int, CallSite]] = []
     for root in expr_roots:
-        for child in ast.walk(root):
-            if not isinstance(child, ast.Call):
-                continue
+        for child in _iter_eager_calls(root):
             name = _resolve_callable_name(child.func)
             if name is None:
                 continue
@@ -484,20 +588,96 @@ def _extract_statement_payload(
     return calls, frozenset(defs), frozenset(uses), call_sites
 
 
+# Label paren-content length cap: long conditions truncate rather than
+# bloat every node repr; downstream reference extraction only loses
+# names past the cut (a condition-text consumer degrades to fewer
+# matched guards — the not-covered direction).
+_LABEL_EXPR_MAX = 120
+
+
+def _expr_text(expr: ast.AST) -> str | None:
+    """Unparsed source of ``expr``, truncated; None when unparsing
+    fails (synthetic/malformed nodes)."""
+    try:
+        text = ast.unparse(expr)
+    except Exception:  # noqa: BLE001 — label rendering must never abort a build
+        return None
+    text = " ".join(text.split())
+    return text[:_LABEL_EXPR_MAX]
+
+
 def _short_label(stmt: ast.stmt) -> str:
-    """Brief human-facing rendering of a statement for diagnostics."""
+    """Brief human-facing rendering of a statement for diagnostics.
+
+    Conditional headers embed their CONDITION text — ``If (x > 0)`` —
+    not just the line number: cfg_conditions/lifecycle_collector parse
+    the paren content of ``If``/``While``/``For`` labels as the guard
+    expression (same contract as the C/C++ and Java builders), and
+    :class:`PyCFGNode` documents that shape. A positional-only label
+    would hand those consumers ``line N`` as the guard text.
+    """
     kind = type(stmt).__name__
-    if isinstance(stmt, ast.If):
-        return f"If (line {stmt.lineno})"
-    if isinstance(stmt, ast.While):
-        return f"While (line {stmt.lineno})"
+    if isinstance(stmt, (ast.If, ast.While)):
+        cond = _expr_text(stmt.test)
+        if cond is not None:
+            return f"{kind} ({cond})"
+        return f"{kind} (line {stmt.lineno})"
     if isinstance(stmt, ast.For):
+        target = _expr_text(stmt.target)
+        it = _expr_text(stmt.iter)
+        if target is not None and it is not None:
+            return f"For ({target} in {it})"
         return f"For (line {stmt.lineno})"
     if isinstance(stmt, ast.Try):
         return f"Try (line {stmt.lineno})"
-    if isinstance(stmt, (ast.Return, ast.Raise)):
-        return f"{kind} (line {stmt.lineno})"
     return f"{kind} (line {stmt.lineno})"
+
+
+def _pattern_irrefutable(pattern: ast.pattern) -> bool:
+    """True when ``pattern`` matches ANY subject value.
+
+    ``case _:`` and bare captures (``case x:``) are ``MatchAs`` with
+    ``pattern=None``; ``case <p> as x`` is irrefutable iff ``<p>`` is;
+    a ``MatchOr`` is irrefutable when any alternative is. Everything
+    else (literals, classes, sequences, mappings) can fail to match.
+    """
+    if isinstance(pattern, ast.MatchAs):
+        return pattern.pattern is None or _pattern_irrefutable(pattern.pattern)
+    if isinstance(pattern, ast.MatchOr):
+        return any(_pattern_irrefutable(p) for p in pattern.patterns)
+    return False
+
+
+def _pattern_capture_names(pattern: ast.AST) -> frozenset[str]:
+    """Names a match-case pattern BINDS on success.
+
+    Capture names are identifier STRINGS (``MatchAs.name`` /
+    ``MatchStar.name`` / ``MatchMapping.rest``), not Store-ctx
+    ``ast.Name`` nodes, so no ``_walk_symbols`` layer can ever see
+    them. Leaving them out of ``defs`` makes a capture rebind of a
+    sanitized name (``case [*y]:``) invisible to reaching-defs — the
+    value-bound gate's condition-3 exclusivity then holds falsely and
+    a runtime-tainted sink suppresses.
+    """
+    out: set[str] = set()
+    for node in ast.walk(pattern):
+        if isinstance(node, (ast.MatchAs, ast.MatchStar)):
+            if node.name is not None:
+                out.add(node.name)
+        elif isinstance(node, ast.MatchMapping):
+            if node.rest is not None:
+                out.add(node.rest)
+    return frozenset(out)
+
+
+def _match_has_irrefutable_case(stmt: ast.Match) -> bool:
+    """True when some case of ``stmt`` is guaranteed to execute — an
+    irrefutable pattern with no ``if`` guard. Only then does the match
+    have no fall-through path."""
+    return any(
+        case.guard is None and _pattern_irrefutable(case.pattern)
+        for case in stmt.cases
+    )
 
 
 class _PythonCFGBuilder:
@@ -510,9 +690,14 @@ class _PythonCFGBuilder:
     structured-block CFG idiom.
     """
 
-    def __init__(self, function_name: str, file_path: str) -> None:
+    def __init__(self, function_name: str, file_path: str,
+                 escape_names: frozenset[str] = frozenset()) -> None:
         self.function_name = function_name
         self.file_path = file_path
+        # Names this function declared ``global`` / ``nonlocal``.
+        # Stores to them are not clean local rebindings — see
+        # :meth:`_apply_scope_escape`.
+        self._escape_names = escape_names
         self.entry = PyCFGNode(
             kind="entry", lineno=ENTRY_LINENO,
             label=f"ENTRY:{function_name}",
@@ -539,9 +724,35 @@ class _PythonCFGBuilder:
         for s in srcs:
             self._link(s, dst)
 
+    def _apply_scope_escape(
+        self, defs: frozenset[str], call_sites: tuple[CallSite, ...],
+    ) -> tuple[bool, tuple[CallSite, ...]]:
+        """Demote stores to ``global`` / ``nonlocal`` names.
+
+        A bare-name store to such a name binds OUTSIDE the local
+        frame: a callee (or sibling closure) can rewrite it between
+        this statement and a later read, so granting it the clean
+        local-rebinding semantics (``assigned_names`` — sanitizer-
+        output identity) would let the value gate prove exclusivity
+        over a binding it does not own. The def itself stays — an
+        extra definer can only break an exclusivity proof, never
+        grant identity (refusal direction) — but the node is stamped
+        ``may_escape`` and its call sites lose the escaping names
+        from ``assigned_names``.
+        """
+        if not (defs & self._escape_names):
+            return False, call_sites
+        call_sites = tuple(
+            replace(cs, assigned_names=cs.assigned_names - self._escape_names)
+            if cs.assigned_names & self._escape_names else cs
+            for cs in call_sites
+        )
+        return True, call_sites
+
     def _new_node(self, kind: str, stmt: ast.stmt,
                   *, label: str | None = None) -> PyCFGNode:
         calls, defs, uses, call_sites = _extract_statement_payload(stmt)
+        escapes, call_sites = self._apply_scope_escape(defs, call_sites)
         node = PyCFGNode(
             kind=kind, lineno=stmt.lineno,
             label=label or _short_label(stmt),
@@ -549,7 +760,25 @@ class _PythonCFGBuilder:
             defs=defs,
             uses=uses,
             call_sites=call_sites,
+            may_escape=escapes,
         )
+        self._all_nodes.append(node)
+        return node
+
+    def _join_node(self, stmt: ast.stmt, label: str) -> PyCFGNode:
+        """Payload-free join sentinel for a loop's exit edge.
+
+        Re-running the header's payload extraction here duplicated
+        the header's calls/defs/uses on a SECOND node at the same
+        line: a walrus in the condition (``while (y := f(x)):``)
+        yielded a duplicate definer of ``y`` on the join, and a
+        sanitizer call in the condition appeared on two nodes. The
+        duplicate definer carries empty ``assigned_names`` so it can
+        only break exclusivity (over-refusal, never suppression),
+        but it pollutes reaching-defs and per-line call-site queries
+        — the sentinel carries no payload at all.
+        """
+        node = PyCFGNode(kind="join", lineno=stmt.lineno, label=label)
         self._all_nodes.append(node)
         return node
 
@@ -576,11 +805,17 @@ class _PythonCFGBuilder:
             return self._build_if(stmt, incoming)
         if isinstance(stmt, ast.While):
             return self._build_while(stmt, incoming)
-        if isinstance(stmt, ast.For):
+        if isinstance(stmt, (ast.For, ast.AsyncFor)):
+            # AsyncFor shares For's field shape (target/iter/body/
+            # orelse) and its zero-iteration semantics — collapsing
+            # it to one straight-line node put a sanitizer inside the
+            # body unconditionally on the path.
             return self._build_for(stmt, incoming)
-        if isinstance(stmt, ast.Try):
-            return self._build_try(stmt, incoming)
-        if isinstance(stmt, ast.With):
+        if isinstance(stmt, _TRY_STMTS):
+            # ``except*`` groups converge like ``except`` for
+            # reachability-under-deletion (see _TRY_STMTS).
+            return self._build_try(stmt, incoming)  # type: ignore[arg-type]
+        if isinstance(stmt, (ast.With, ast.AsyncWith)):
             return self._build_with(stmt, incoming)
         if isinstance(stmt, ast.Return):
             node = self._new_node("stmt", stmt)
@@ -637,7 +872,7 @@ class _PythonCFGBuilder:
     ) -> list[PyCFGNode]:
         header = self._new_node("stmt", stmt)
         self._link_many(incoming, header)
-        exit_node = self._new_node("join", stmt, label=f"while-exit (line {stmt.lineno})")
+        exit_node = self._join_node(stmt, f"while-exit (line {stmt.lineno})")
         self._loop_stack.append((exit_node, header))
         body_out = self._build_stmts(stmt.body, [header])
         for tail in body_out:
@@ -652,11 +887,11 @@ class _PythonCFGBuilder:
         return [exit_node]
 
     def _build_for(
-        self, stmt: ast.For, incoming: list[PyCFGNode],
+        self, stmt: ast.For | ast.AsyncFor, incoming: list[PyCFGNode],
     ) -> list[PyCFGNode]:
         header = self._new_node("stmt", stmt)
         self._link_many(incoming, header)
-        exit_node = self._new_node("join", stmt, label=f"for-exit (line {stmt.lineno})")
+        exit_node = self._join_node(stmt, f"for-exit (line {stmt.lineno})")
         self._loop_stack.append((exit_node, header))
         body_out = self._build_stmts(stmt.body, [header])
         for tail in body_out:
@@ -677,12 +912,73 @@ class _PythonCFGBuilder:
         self._link_many(incoming, subject)
         exits: list[PyCFGNode] = []
         for case in stmt.cases:
-            case_out = self._build_stmts(case.body, [subject])
+            # Per-case binding node between subject and body: carries
+            # the pattern's capture names as defs (see
+            # _pattern_capture_names — invisible to any Name walk) and
+            # the guard's reads/calls. Without it a capture rebind of
+            # a sanitized name never reaches reaching-defs — the
+            # false-suppression direction for the value-bound gate.
+            case_node = self._match_case_node(case)
+            self._link(subject, case_node)
+            case_out = self._build_stmts(case.body, [case_node])
             exits.extend(case_out)
+        # When no case is irrefutable, execution can match NOTHING and
+        # fall straight through to the post-match code — the subject
+        # itself is an exit, mirroring _build_if's no-else handling.
+        # Omitting this edge makes a sanitizer inside a case body look
+        # like it lies on every path to a post-match sink, which is
+        # the false-suppression direction for the vertex-cut consumer.
+        if not _match_has_irrefutable_case(stmt):
+            exits.append(subject)
         return exits
 
+    def _match_case_node(self, case: ast.match_case) -> PyCFGNode:
+        """Synthetic node for one match case: pattern capture names as
+        ``defs``; pattern value reads plus the guard's reads as
+        ``uses``; the guard's calls as ``calls``/``call_sites``.
+        Guard call sites carry empty ``assigned_names`` — a guard
+        expression binds nothing the gate may treat as a sanitizer
+        output (refusal direction)."""
+        defs = set(_pattern_capture_names(case.pattern))
+        uses: set[str] = set()
+        for sub in ast.walk(case.pattern):
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
+                uses.add(sub.id)
+        site_records: list[CallSite] = []
+        if case.guard is not None:
+            guard_defs, guard_uses = _walk_symbols(case.guard)
+            defs |= guard_defs  # a walrus in a guard binds too
+            uses |= guard_uses
+            for child in _iter_eager_calls(case.guard):
+                name = _resolve_callable_name(child.func)
+                if name is None:
+                    continue
+                site_records.append(CallSite(
+                    name=name,
+                    arg_names=_arg_surface_names(child),
+                    assigned_names=frozenset(),
+                    lineno=child.lineno,
+                    col_offset=getattr(child, "col_offset", 0),
+                ))
+        frozen_defs = frozenset(defs)
+        escapes, sites = self._apply_scope_escape(
+            frozen_defs, tuple(site_records),
+        )
+        node = PyCFGNode(
+            kind="stmt",
+            lineno=case.pattern.lineno,
+            label=f"case (line {case.pattern.lineno})",
+            calls=frozenset(cs.name for cs in sites),
+            defs=frozen_defs,
+            uses=frozenset(uses),
+            call_sites=sites,
+            may_escape=escapes,
+        )
+        self._all_nodes.append(node)
+        return node
+
     def _build_try(
-        self, stmt: ast.Try, incoming: list[PyCFGNode],
+        self, stmt: ast.Try | ast.TryStar, incoming: list[PyCFGNode],
     ) -> list[PyCFGNode]:
         # try-block: incoming flows into body. Any node in body may
         # raise and route to ANY of the except handlers, so the
@@ -695,10 +991,32 @@ class _PythonCFGBuilder:
         body_out = self._build_stmts(stmt.body, incoming)
         handler_outs: list[PyCFGNode] = []
         for handler in stmt.handlers:
-            # Each handler's first node is reachable from every
-            # statement of body (any of them could raise).
+            # Handler ENTRY node: carries the ``except E as name``
+            # binding as a def. ``ExceptHandler.name`` is an
+            # identifier STRING (no Store-ctx Name node), so no
+            # ``_walk_symbols`` walk can ever see it — leaving it out
+            # of ``defs`` makes a handler rebind of a sanitized name
+            # invisible to reaching-defs, the same hole the match-case
+            # capture nodes and the Java leg's catch entry close.
+            # Def-only (never ``assigned_names``): refusal direction.
+            handler_defs = (
+                frozenset({handler.name}) if handler.name else frozenset()
+            )
+            entry_node = PyCFGNode(
+                kind="stmt",
+                lineno=handler.lineno,
+                label=f"except (line {handler.lineno})",
+                defs=handler_defs,
+                may_escape=bool(handler_defs & self._escape_names),
+            )
+            self._all_nodes.append(entry_node)
+            # Each handler's entry is reachable from every statement
+            # of body (any of them could raise).
+            self._link_many(
+                list(self._adjacency.keys() - {self.exit}), entry_node,
+            )
             handler_node_start = self._build_stmts(
-                handler.body, list(self._adjacency.keys() - {self.exit}),
+                handler.body, [entry_node],
             )
             # Simplification: the conservative attachment above adds
             # spurious predecessors. The right thing for the
@@ -718,7 +1036,7 @@ class _PythonCFGBuilder:
         return merge_in
 
     def _build_with(
-        self, stmt: ast.With, incoming: list[PyCFGNode],
+        self, stmt: ast.With | ast.AsyncWith, incoming: list[PyCFGNode],
     ) -> list[PyCFGNode]:
         # Model as a sentinel statement for the `with` line + the body.
         header = self._new_node("stmt", stmt)
@@ -775,8 +1093,55 @@ def _function_params(
     return tuple(names)
 
 
+def _scope_escape_names(
+    func: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> frozenset[str]:
+    """Names whose local bindings in ``func`` are rewritable from
+    outside straight-line reaching-defs.
+
+    Two channels:
+
+    * ``func``'s own ``global`` / ``nonlocal`` declarations —
+      compile-time properties of the WHOLE scope (a ``global x``
+      inside an ``if`` branch still binds every ``x`` store in the
+      function). The walk covers the body but stops at nested scopes
+      for THIS channel: a nested def's ``global`` binds the module
+      frame, not this one.
+    * ``nonlocal`` declarations in defs NESTED under ``func`` (any
+      depth): ``nonlocal t`` targets an ENCLOSING function frame, so
+      calling the closure rewrites ``func``'s ``t`` behind
+      reaching-defs' back — ``t = escape(x); def f(): nonlocal t;
+      t = x; f(); sink(t)`` kills the sanitized def invisibly.
+      Over-approximate (the nonlocal may target an intermediate
+      nested frame): an extra escape name only ever breaks an
+      exclusivity proof, never grants one.
+
+    Lambdas and comprehensions cannot contain statements.
+    """
+    out: set[str] = set()
+    stack: list[ast.AST] = list(func.body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef)):
+            continue
+        if isinstance(node, (ast.Global, ast.Nonlocal)):
+            out.update(node.names)
+            continue
+        stack.extend(ast.iter_child_nodes(node))
+    # Nested-scope channel: every Nonlocal anywhere under func (the
+    # boundary walk above already covered func's own statements; this
+    # full walk adds the nested defs').
+    for node in ast.walk(func):
+        if isinstance(node, ast.Nonlocal):
+            out.update(node.names)
+    return frozenset(out)
+
+
 def build_python_cfg(
     source: str | Path, function_name: str,
+    *,
+    _module_tree: ast.Module | None = None,
 ) -> PythonCFG | None:
     """Build the CFG for one named function in a Python source file or
     in-memory source string.
@@ -784,14 +1149,27 @@ def build_python_cfg(
     ``source`` can be a :class:`Path` (read from disk) or a ``str``
     containing source code (parsed directly — useful for tests).
     Returns ``None`` if the named function isn't found.
+
+    ``_module_tree`` — when the caller already holds a parsed
+    :class:`ast.Module` for the same ``source`` text, pass it here
+    to skip the redundant ``ast.parse()``.  Internal optimisation
+    for the finding resolver's hot loop (one parse per finding
+    instead of two).
     """
     if isinstance(source, Path):
         file_path = str(source)
-        source_text = source.read_text(encoding="utf-8")
+        try:
+            source_text = source.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            # Hostile / binary bytes on the direct-Path API: refuse
+            # (None) like the not-found path — decoding with
+            # replacement could mangle literals downstream consumers
+            # read as values.
+            return None
     else:
         file_path = "<string>"
         source_text = source
-    tree = ast.parse(source_text)
+    tree = _module_tree if _module_tree is not None else ast.parse(source_text)
     func: ast.AST | None = None
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
@@ -800,8 +1178,38 @@ def build_python_cfg(
             break
     if func is None:
         return None
-    builder = _PythonCFGBuilder(function_name, file_path)
-    return builder.build(func)  # type: ignore[arg-type]
+    builder = _PythonCFGBuilder(
+        function_name, file_path,
+        escape_names=_scope_escape_names(func),  # type: ignore[arg-type]
+    )
+    cfg = builder.build(func)  # type: ignore[arg-type]
+    if cfg is None:
+        return None
+    # Stamp the untrusted-identity roots (see PythonCFG.shadowed_roots)
+    # — computed here because only this entry point sees the whole
+    # module tree. Local import so the callgraph substrate module
+    # never becomes an import-time dependency of CFG construction for
+    # non-Python callers.
+    from core.analysis.python_module_callgraph import (
+        local_binding_names,
+        module_dynamic_namespace,
+        module_shadowed_identity_roots,
+    )
+    from core.analysis.python_module_callgraph import module_import_map
+    dyn_whole, dyn_names = module_dynamic_namespace(tree)
+    return replace(
+        cfg,
+        shadowed_roots=(
+            local_binding_names(func)
+            | module_shadowed_identity_roots(tree)
+            | dyn_names
+        ),
+        namespace_unprovable=dyn_whole,
+        trusted_import_roots=frozenset(
+            root for root, src in module_import_map(tree).items()
+            if src == root
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

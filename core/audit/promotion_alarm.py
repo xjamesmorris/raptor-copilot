@@ -119,10 +119,10 @@ def build_alarm_record(
         # them) go on the record so the operator can audit what the
         # unverified claim named.
         record["bypass_claimed"] = [str(b)[:100] for b in bypass][:16] \
-            if isinstance(bypass, (list, tuple)) else str(bypass)[:200]
+            if isinstance(bypass, (list, tuple)) else str(bypass)[:200]  # type: ignore[assignment]
         tiers = (review_result or {}).get("g2_invariant_bypass_tiers")
         if isinstance(tiers, dict):
-            record["bypass_claimed_tiers"] = {
+            record["bypass_claimed_tiers"] = {  # type: ignore[assignment]
                 str(k)[:100]: str(v)[:40]
                 for k, v in list(tiers.items())[:16]
             }
@@ -167,24 +167,49 @@ def _enforce_demotion(outcome: Any, record: dict[str, Any]) -> None:
     ``review_result["promotion_gate_demoted"]``) and on the alarm
     record (``"blocked": True``) so the JSONL trail says whether the
     gate observed or acted.  Never raises — a gate that loses the
-    outcome is worse than a gate that ships it.
+    outcome is worse than a gate that ships it.  The status + record
+    stamps come first, each fallible outcome mutation is isolated, and
+    a status assignment that itself raises is recorded truthfully
+    (``"blocked": False`` + ``"demotion_failed": True``) instead of
+    letting the record claim a demotion that never landed.
     """
-    outcome.status = "suspicious"
-    record["blocked"] = True
+    try:
+        outcome.status = "suspicious"
+        record["blocked"] = True
+    except Exception:
+        # The one mutation that IS the gate failed (e.g. a raising
+        # property setter): the finding ships un-demoted.  Say so at
+        # the same severity as the violation itself, and keep the
+        # trail honest about the gate having only observed.
+        record["blocked"] = False
+        record["demotion_failed"] = True
+        logger.critical(
+            "promotion gate: failed to demote %s:%s at %s — status "
+            "assignment raised, the evidence-less finding ships "
+            "un-demoted",
+            record.get("file"), record.get("function"),
+            record.get("stage"), exc_info=True,
+        )
     try:
         body = getattr(outcome, "body", "") or ""
         outcome.body = f"{DEMOTION_MARKER}\n{body}" if body else DEMOTION_MARKER
     except Exception:
         logger.debug("promotion gate body marker failed", exc_info=True)
-    rr = getattr(outcome, "review_result", None)
-    if isinstance(rr, dict):
-        rr["promotion_gate_demoted"] = True
-    logger.warning(
-        "promotion gate: %s:%s demoted finding -> suspicious at %s — "
-        "no qualifying tool evidence (evidence_tool=%r)",
-        record.get("file"), record.get("function"),
-        record.get("stage"), record.get("evidence_tool"),
-    )
+    try:
+        rr = getattr(outcome, "review_result", None)
+        if isinstance(rr, dict):
+            rr["promotion_gate_demoted"] = True
+    except Exception:
+        logger.debug(
+            "promotion gate review-result stamp failed", exc_info=True,
+        )
+    if record.get("blocked"):
+        logger.warning(
+            "promotion gate: %s:%s demoted finding -> suspicious at %s — "
+            "no qualifying tool evidence (evidence_tool=%r)",
+            record.get("file"), record.get("function"),
+            record.get("stage"), record.get("evidence_tool"),
+        )
 
 
 def check_and_emit(
@@ -202,45 +227,127 @@ def check_and_emit(
     before the caller writes it — see the module docstring.  Returns
     the emitted record (for tests / callers that aggregate), or None
     when the outcome is legitimate.
+
+    Fail closed: once the outcome classifies as a ``finding``, an
+    exception in any gate step (evidence grading, G2 re-verification,
+    record construction, alarm emission) degrades toward demotion —
+    logged at WARNING or above, never a silent debug line.  A gate
+    that throws mid-check and then ships the un-demoted promotion is
+    exactly the bypass this alarm exists to catch.
     """
+    # Classification.  An outcome whose status is unreadable cannot be
+    # classified — and cannot be demoted either — so this is the one
+    # step that degrades to pass-through, loudly.
     try:
         verdict = getattr(outcome, "status", "") or ""
-        evidence_tool = getattr(outcome, "evidence_tool", "") or ""
-        review_result = getattr(outcome, "review_result", None)
+    except Exception:
+        logger.warning(
+            "promotion alarm: outcome status unreadable at stage %s — "
+            "gate skipped for this write", stage, exc_info=True,
+        )
+        return None
+    if verdict not in ALARMED_VERDICTS:
+        return None
 
-        # Re-derive the G2 exception only when it would matter (an
-        # evidence-less finding carrying the bypass key) — the
-        # re-verification loads the run's domain model.
-        bypass_verified: bool | None = None
-        if (
-            verdict in ALARMED_VERDICTS
-            and not _has_tool_evidence(evidence_tool)
-            and isinstance(review_result, dict)
-            and review_result.get(G2_BYPASS_KEY)
-        ):
+    # The outcome is a ``finding`` — every step from here fails closed.
+    evidence_tool = ""
+    try:
+        evidence_tool = getattr(outcome, "evidence_tool", "") or ""
+        if _has_tool_evidence(evidence_tool):
+            # Legitimate tool-gated promotion: passes through untouched.
+            return None
+    except Exception:
+        logger.warning(
+            "promotion alarm: evidence check errored at stage %s — "
+            "treating the finding as evidence-less", stage, exc_info=True,
+        )
+
+    review_result: Any = None
+    file = function = hypothesis = ""
+    try:
+        review_result = getattr(outcome, "review_result", None)
+        file = getattr(outcome, "file", "") or ""
+        function = getattr(outcome, "function", "") or ""
+        hypothesis = getattr(outcome, "hypothesis", "") or ""
+    except Exception:
+        logger.warning(
+            "promotion alarm: outcome fields unreadable at stage %s — "
+            "recording the violation with partial context", stage,
+            exc_info=True,
+        )
+
+    # Re-derive the G2 exception only when it would matter (an
+    # evidence-less finding carrying the bypass key) — the
+    # re-verification loads the run's domain model.  An exception here
+    # means the claim is UNVERIFIED, never exempt.
+    bypass_claimed = isinstance(review_result, dict) and bool(
+        review_result.get(G2_BYPASS_KEY),
+    )
+    bypass_verified = False
+    if bypass_claimed:
+        try:
             from .invariant_gate import reverify_bypass
 
-            bypass_verified = reverify_bypass(out_dir, outcome)
+            bypass_verified = bool(reverify_bypass(out_dir, outcome))
+        except Exception:
+            logger.warning(
+                "promotion alarm: G2 bypass re-verification errored at "
+                "stage %s — treating the claim as unverified", stage,
+                exc_info=True,
+            )
+    if bypass_claimed and bypass_verified:
+        # Re-verified designed exception: promotes untouched.
+        return None
 
+    record: dict[str, Any] | None = None
+    try:
         record = build_alarm_record(
             stage=stage,
-            file=getattr(outcome, "file", "") or "",
-            function=getattr(outcome, "function", "") or "",
+            file=file,
+            function=function,
             verdict=verdict,
             evidence_tool=evidence_tool,
             review_result=review_result,
-            hypothesis=getattr(outcome, "hypothesis", "") or "",
+            hypothesis=hypothesis,
             run_id=run_id,
             bypass_verified=bypass_verified,
         )
-        if record is not None:
-            if enforce:
-                _enforce_demotion(outcome, record)
-            emit_alarm(Path(out_dir), record)
-        return record
-    except Exception:  # alarm must never break the write path
-        logger.debug("promotion alarm check failed", exc_info=True)
-        return None
+    except Exception:
+        logger.warning(
+            "promotion alarm: record construction failed at stage %s — "
+            "recording a degraded violation record", stage, exc_info=True,
+        )
+    if record is None:
+        # Construction failed (a violation is already established, so
+        # build_alarm_record cannot legitimately return None here) —
+        # a degraded record still carries the demotion and the trail.
+        record = {
+            "event": ALARM_EVENT,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "stage": stage,
+            "run_id": run_id,
+            "file": file,
+            "function": function,
+            "verdict": verdict,
+            "evidence_tool": evidence_tool,
+            "hypothesis": (hypothesis or "")[:500],
+            "record_degraded": True,
+        }
+
+    if enforce:
+        # Demote BEFORE the fallible emission step: an emit failure
+        # must never ship the promotion.  _enforce_demotion never
+        # raises.
+        _enforce_demotion(outcome, record)
+    try:
+        emit_alarm(Path(out_dir), record)
+    except Exception:
+        logger.warning(
+            "promotion alarm: emission failed at stage %s — the "
+            "violation was already %s", stage,
+            "demoted" if enforce else "detected", exc_info=True,
+        )
+    return record
 
 
 def load_alarms(out_dir: Path) -> list[dict[str, Any]]:

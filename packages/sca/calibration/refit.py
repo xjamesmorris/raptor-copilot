@@ -170,6 +170,26 @@ class RefitReport:
         }
 
 
+
+def _fails_accept_gate(p20_improvement: float, rho_improvement: float,
+                       threshold: float) -> bool:
+    """True when the refit accept gate REJECTS.
+
+    Accept requires P20 improvement ≥ threshold, OR ρ improvement ≥
+    threshold WITH P20 not regressing. The non-regression clamp on the
+    ρ arm is a deliberate trade-off, both directions: without it, a
+    corpus-wide rank-correlation jump could ship an auto-applied refit
+    that LOWERS operator-facing top-20 precision (the headline verdict
+    metric); with it, a refit trading a hair of P20 for a large ρ gain
+    needs a manual apply. P20 is what operators see first, so
+    regressions there must never ship silently.
+    """
+    if p20_improvement >= threshold:
+        return False
+    if rho_improvement >= threshold and p20_improvement >= 0:
+        return False
+    return True
+
 def grid_search_refit(
     corpus_dir: Path,
     *,
@@ -177,6 +197,7 @@ def grid_search_refit(
     improvement_threshold: float = DEFAULT_IMPROVEMENT_THRESHOLD,
     min_samples: int = MIN_SAMPLES_FOR_REFIT,
     out_path: Path | None = None,
+    update_snapshot: bool = False,
     ecosystem_filter: str | None = None,
 ) -> RefitReport:
     """Run the per-constant grid search and emit a refit report.
@@ -184,8 +205,15 @@ def grid_search_refit(
     ``corpus_dir`` is the calibration data root containing
     ``kev_signals.json`` etc. + ``project_samples/<eco>/<name>.json``.
 
-    Writes the report to ``corpus_dir/refit/<date>.json`` (or
-    ``out_path`` when explicitly supplied).
+    Report emission is caller-directed (mirrors
+    ``validate.validate_corpus``): ``out_path`` writes to an
+    explicit file; ``update_snapshot=True`` writes the dated
+    snapshot under ``corpus_dir/refit/`` AND prunes that
+    repo-committed directory to its retention window — only the
+    refit workflow (which commits the report) passes it. With
+    neither, the report is returned without touching disk, so a
+    local verification run can't clobber or prune committed
+    snapshots.
 
     ``ecosystem_filter``: when set, drops findings outside the
     named ecosystem before fitting. Useful for "what would
@@ -219,11 +247,12 @@ def grid_search_refit(
                 improvement_threshold=improvement_threshold,
                 max_delta=max_delta,
                 notes=[
+                    *notes,
                     "no project samples found under "
                     f"{corpus_dir}/project_samples/",
                 ],
             ),
-            corpus_dir, out_path,
+            corpus_dir, out_path, update_snapshot=update_snapshot,
         )
 
     if len(samples) < min_samples:
@@ -238,11 +267,12 @@ def grid_search_refit(
                 improvement_threshold=improvement_threshold,
                 max_delta=max_delta,
                 notes=[
+                    *notes,
                     f"only {len(samples)} labelled findings in corpus; "
                     f"need ≥ {min_samples} for refit",
                 ],
             ),
-            corpus_dir, out_path,
+            corpus_dir, out_path, update_snapshot=update_snapshot,
         )
 
     from packages.sca.risk import (
@@ -266,13 +296,14 @@ def grid_search_refit(
     # crossing KEV_MULT, NOT_EVALUATED becoming a bonus instead of
     # penalty). Inadmissible candidates produce a precision of -inf
     # so they're never picked even when they'd numerically maximise.
-    # `_search_metric` returns (top_20, top_50). max() over tuples
-    # compares lexicographically — top-20 dominates, top-50 breaks
-    # ties. The legacy scalar `_top_20_precision` is preserved for
-    # the verdict + report fields; the search itself runs on the
-    # tuple so once the corpus saturates top-20 at 1.000 the search
-    # keeps moving on top-50 instead of silently sticking to the
-    # first-seen candidate.
+    # `_search_metric` returns (top_20_precision, ndcg_20,
+    # spearman_rho). max() over tuples compares lexicographically —
+    # top-20 dominates, NDCG@20 breaks P20 ties, corpus-wide ρ
+    # breaks NDCG ties. The legacy scalar `_top_20_precision` is
+    # preserved for the verdict + report fields; the search itself
+    # runs on the tuple so once the corpus saturates top-20 at
+    # 1.000 the search keeps moving on the finer-grained metrics
+    # instead of silently sticking to the first-seen candidate.
     SENTINEL_INADMISSIBLE = (float("-inf"), float("-inf"), float("-inf"))
 
     per_constant: list[ConstantRefit] = []
@@ -333,6 +364,7 @@ def grid_search_refit(
     joint_overrides = {
         c.name: c.proposed for c in per_constant if c.changed
     }
+    composition_rejected = False
     if joint_overrides:
         joint_full = {**current, **joint_overrides}
         ok_joint, joint_reason = is_admissible(joint_full)
@@ -342,6 +374,7 @@ def grid_search_refit(
                 f"falling back to baseline"
             )
             joint_overrides = {}
+            composition_rejected = True
     joint_precision = (
         _top_20_precision(samples, overrides=joint_overrides)
         if joint_overrides else baseline
@@ -368,15 +401,30 @@ def grid_search_refit(
 
     if not joint_overrides:
         status = "rejected"
-        notes.append("no per-constant variant beat the baseline")
-    elif (improvement < improvement_threshold
-            and rho_improvement < improvement_threshold):
+        # Only claim "nothing beat the baseline" when that is what
+        # happened — when per-constant variants DID beat it but
+        # their composition was inadmissible, the composition-
+        # rejected note above is the (whole) truth, and this note
+        # would falsely steer the next tuner away from the real
+        # cause.
+        if not composition_rejected:
+            notes.append("no per-constant variant beat the baseline")
+    elif _fails_accept_gate(improvement, rho_improvement,
+                            improvement_threshold):
         status = "rejected"
-        notes.append(
-            f"joint P20 improvement {improvement:+.3f} AND ρ "
-            f"improvement {rho_improvement:+.3f} both below "
-            f"threshold {improvement_threshold:.3f}; refit not shipped"
-        )
+        if rho_improvement >= improvement_threshold:
+            notes.append(
+                f"rejected by non-regression clamp: ρ improvement "
+                f"{rho_improvement:+.3f} clears the threshold but P20 "
+                f"regressed {improvement:+.3f}; a rank-correlation gain "
+                f"must not ship a top-20 precision regression"
+            )
+        else:
+            notes.append(
+                f"joint P20 improvement {improvement:+.3f} AND ρ "
+                f"improvement {rho_improvement:+.3f} both below "
+                f"threshold {improvement_threshold:.3f}; refit not shipped"
+            )
     else:
         status = "proposed"
         if rho_improvement >= improvement_threshold:
@@ -401,7 +449,7 @@ def grid_search_refit(
             per_constant=per_constant,
             notes=notes,
         ),
-        corpus_dir, out_path,
+        corpus_dir, out_path, update_snapshot=update_snapshot,
     )
 
 
@@ -548,12 +596,16 @@ def joint_grid_search_refit(
     max_passes: int = _MAX_JOINT_PASSES,
     seed: int | None = None,
     out_path: Path | None = None,
+    update_snapshot: bool = False,
     ecosystem_filter: str | None = None,
 ) -> JointRefitReport:
     """Multi-pass coordinate descent with random restarts.
 
     Find inter-constant interactions the per-constant search misses.
     See the section header above for the algorithm + safety bounds.
+    ``out_path`` / ``update_snapshot`` direct report emission exactly
+    as in :func:`grid_search_refit` (the joint snapshot name is
+    ``<date>.joint.json``); with neither, nothing is written.
 
     ``seed`` makes the random-restart sampling deterministic — same
     seed produces the same restart trajectories, so refits run from
@@ -592,9 +644,9 @@ def joint_grid_search_refit(
                 improvement=0.0,
                 improvement_threshold=improvement_threshold,
                 max_delta=max_delta,
-                notes=[why],
+                notes=[*notes, why],
             ),
-            corpus_dir, out_path,
+            corpus_dir, out_path, update_snapshot=update_snapshot,
         )
 
     from packages.sca.risk import (
@@ -618,24 +670,18 @@ def joint_grid_search_refit(
 
     # Always run the single-pass per-constant search first so we
     # can compare joint to single. Cheap (~50 evals); gives a
-    # fallback when joint doesn't improve.
-    single_tmp = corpus_dir / "refit" / f".{snapshot}.single.tmp"
-    try:
-        single_pass = grid_search_refit(
-            corpus_dir, max_delta=max_delta,
-            improvement_threshold=improvement_threshold,
-            min_samples=min_samples,
-            # Suppress the default disk write — we'll emit our own
-            # joint report. ``out_path=`` to /dev/null isn't
-            # supported on Windows, so the in-line call writes to a
-            # throwaway path that the ``finally`` removes on every
-            # exit — including a raise inside the search, which
-            # previously leaked the tmp file.
-            out_path=single_tmp,
-            ecosystem_filter=ecosystem_filter,
-        )
-    finally:
-        single_tmp.unlink(missing_ok=True)
+    # fallback when joint doesn't improve. Metrics-only: the joint
+    # run emits its own report, so the in-line single pass writes
+    # nothing — pre-fix it wrote a fixed-name throwaway file under
+    # the (repo-committed, possibly read-only) corpus dir, where a
+    # read-only checkout failed the whole joint run and two
+    # same-day joint runs could unlink each other's in-flight file.
+    single_pass = grid_search_refit(
+        corpus_dir, max_delta=max_delta,
+        improvement_threshold=improvement_threshold,
+        min_samples=min_samples,
+        ecosystem_filter=ecosystem_filter,
+    )
     single_pass_overrides = {
         c.name: c.proposed for c in single_pass.per_constant if c.changed
     }
@@ -776,8 +822,12 @@ def joint_grid_search_refit(
 
     report_proposed_p20 = joint_metric[0]
     report_improvement = p20_improvement
-    if (p20_improvement < improvement_threshold
-            and rho_improvement < improvement_threshold):
+    # Shared accept gate (incl. the P20 non-regression clamp). The
+    # single-pass fallback below still propagates when it passed its
+    # own gate, so a clamped joint result degrades to the cheap
+    # search's optimum, never to silence.
+    if _fails_accept_gate(p20_improvement, rho_improvement,
+                          improvement_threshold):
         # Surface whichever metric came closest to the gate so
         # operators reading the report know what's driving the
         # verdict.
@@ -837,23 +887,33 @@ def joint_grid_search_refit(
             single_pass_metric=single_pass_metric,
             joint_winning_metric=joint_metric,
         ),
-        corpus_dir, out_path,
+        corpus_dir, out_path, update_snapshot=update_snapshot,
     )
 
 
 def _emit_joint_report(
     report: JointRefitReport, corpus_dir: Path,
-    out_path: Path | None,
+    out_path: Path | None, *, update_snapshot: bool = False,
 ) -> JointRefitReport:
-    """Mirror of ``_emit_report`` for the joint variant. Writes to
-    ``<corpus_dir>/refit/<date>.joint.json`` by default so a joint
-    refit doesn't overwrite a same-day single-pass refit."""
+    """Mirror of ``_emit_report`` for the joint variant. The
+    snapshot path is ``<corpus_dir>/refit/<date>.joint.json`` so a
+    joint refit doesn't overwrite a same-day single-pass refit."""
+    if out_path is not None and update_snapshot:
+        msg = "out_path and update_snapshot are mutually exclusive"
+        raise ValueError(msg)
     prune_dir: Path | None = None
-    if out_path is None:
+    if update_snapshot:
         refit_dir = corpus_dir / "refit"
         refit_dir.mkdir(parents=True, exist_ok=True)
         out_path = refit_dir / f"{report.snapshot_date}.joint.json"
         prune_dir = refit_dir
+    elif out_path is None:
+        logger.info(
+            "sca.calibration.refit: metrics-only run (no out_path; "
+            "pass update_snapshot=True to write the committed dated "
+            "snapshot)",
+        )
+        return report
     else:
         out_path.parent.mkdir(parents=True, exist_ok=True)
     save_json(out_path, report.to_dict(), sort_keys=True)
@@ -865,22 +925,35 @@ def _emit_joint_report(
 
 def _emit_report(
     report: RefitReport, corpus_dir: Path, out_path: Path | None,
+    *, update_snapshot: bool = False,
 ) -> RefitReport:
-    """Write the report to disk + return it. The CLI gates on
-    return-value status; tests bypass the write by stubbing
-    out_path to a tmp file."""
+    """Emit the report per the caller's direction + return it. The
+    CLI gates on return-value status. With neither ``out_path`` nor
+    ``update_snapshot`` the report is returned without a write —
+    the default must not mutate the repo-committed ``refit/`` dir."""
+    if out_path is not None and update_snapshot:
+        msg = "out_path and update_snapshot are mutually exclusive"
+        raise ValueError(msg)
     prune_dir: Path | None = None
-    if out_path is None:
+    if update_snapshot:
         refit_dir = corpus_dir / "refit"
         refit_dir.mkdir(parents=True, exist_ok=True)
         out_path = refit_dir / f"{report.snapshot_date}.json"
         prune_dir = refit_dir
+    elif out_path is None:
+        logger.info(
+            "sca.calibration.refit: metrics-only run (no out_path; "
+            "pass update_snapshot=True to write the committed dated "
+            "snapshot)",
+        )
+        return report
     else:
         out_path.parent.mkdir(parents=True, exist_ok=True)
     save_json(out_path, report.to_dict(), sort_keys=True)
     if prune_dir is not None:
         # Retention: dated refit reports accumulate one per run with
-        # no other pruning mechanism.
+        # no other pruning mechanism. Prune only on the explicit
+        # snapshot-update path — it deletes committed history.
         from ._snapshots import REFIT_KEEP, prune_dated_snapshots
         prune_dated_snapshots(prune_dir, keep=REFIT_KEEP)
     return report
@@ -895,8 +968,10 @@ def _load_findings_with_labels(
     corpus_dir: Path,
 ) -> list[tuple[dict[str, Any], int]]:
     """Walk project samples; pair each finding with its exploited
-    label (1 if any of the finding's CVE aliases appears in the
-    KEV / EDB / MSF / GitHub-PoC ground-truth signals).
+    label (1 if any of the finding's CVE ids appears in the
+    ground-truth signal union — the six sources listed by
+    ``validate._ground_truth_files()``: KEV, Exploit-DB,
+    Metasploit, GitHub-PoC, OSV exploit-evidence, Vulnrichment).
 
     Returns a list of ``(finding_dict, label)`` pairs. Findings
     without a usable score (no risk_components or non-float
@@ -951,11 +1026,11 @@ def _top_20_precision(
 
     Backwards-compatible scalar metric — kept for the existing
     refit verdict + report fields. The grid search itself uses
-    `_search_metric` (a tuple of (top_20, top_50) precisions) so
-    when top-20 saturates at 1.0 across multiple candidates,
-    top-50 is the tiebreaker — without this, the search picks
-    the first-seen candidate even when a strictly-better-packed
-    top-50 exists.
+    `_search_metric` (the (top_20_precision, ndcg_20, spearman_rho)
+    tuple) so when top-20 saturates at 1.0 across multiple
+    candidates, NDCG@20 and then corpus-wide ρ break the tie —
+    without this, the search picks the first-seen candidate even
+    when a strictly-better ordering exists.
     """
     return _search_metric(samples, overrides=overrides)[0]
 

@@ -344,3 +344,83 @@ def test_cli_root_discovery_finds_nested_reports(tmp_path, capsys):
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
     assert payload["total_findings_with_panel"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Cross-run duplicates: recorded verdict and panels come from the SAME run
+# ---------------------------------------------------------------------------
+
+
+def test_duplicate_finding_across_reports_flips_against_first_run(tmp_path):
+    """When two reports carry the same finding, exactly one run's data
+    is used END TO END: the estimator keeps the FIRST (finding, model)
+    panels in path order, so the recorded-verdict index must keep the
+    first run's verdict too. Pre-fix the index kept the LAST file's
+    verdict while the EM used the first file's panels — a clean run
+    pair (each internally consistent) produced a spurious flip."""
+    run1 = _write_report(tmp_path / "run1.json", [
+        _finding("F1", "rule-a", is_exploitable=True, analyses=[
+            _entry("m1", True), _entry("m2", True), _entry("m3", True),
+        ]),
+    ])
+    run2 = _write_report(tmp_path / "run2.json", [
+        _finding("F1", "rule-a", is_exploitable=False, analyses=[
+            _entry("m1", False), _entry("m2", False), _entry("m3", False),
+        ]),
+    ])
+    report = replay([run1, run2])
+    (f,) = report.findings
+    # First run's panels (unanimous True) → posterior above 0.5;
+    # first run's recorded verdict (True) → no flip. The pre-fix skew
+    # reported FLIP_TO_EXPLOITABLE here despite both runs agreeing
+    # with their own panels.
+    assert f.recorded_is_exploitable is True
+    assert f.flip == NO_FLIP
+    assert report.flip_rate == 0.0
+
+
+def test_recorded_none_findings_bucketed_not_no_flip(tmp_path):
+    """A finding with NO recorded verdict cannot flip — but counting
+    it as NO_FLIP in the denominator deflated flip_rate. Abstained
+    findings get their own bucket and leave the flip rates."""
+    from core.llm.multi_model.replay import NO_RECORDED_VERDICT
+
+    findings = []
+    for i in range(8):
+        findings.append(_finding(
+            f"F{i}", "rule-a", is_exploitable=False,
+            analyses=[_entry("m1", True), _entry("m2", True),
+                      _entry("m3", True)],
+        ))
+    for i in range(4):
+        findings.append({
+            "finding_id": f"X{i}", "rule_id": "rule-a",
+            # no recorded is_exploitable
+            "multi_model_analyses": [
+                _entry("m1", True), _entry("m2", True),
+                _entry("m3", True),
+            ],
+        })
+    path = _write_report(tmp_path / "rep.json", findings)
+    report = replay([path])
+    assert report.total_findings_with_panel == 12
+    abstained = [f for f in report.findings
+                 if f.flip == NO_RECORDED_VERDICT]
+    assert len(abstained) == 4
+    assert report.n_no_recorded_verdict == 4
+    # Rates over findings WITH a recorded verdict: 8 flips / 8.
+    assert report.flip_rate == pytest.approx(1.0, abs=1e-9)
+    assert report.flip_to_exploitable_rate == pytest.approx(1.0, abs=1e-9)
+
+
+def test_markdown_names_the_abstained_bucket(tmp_path):
+    path = _write_report(tmp_path / "rep.json", [
+        {
+            "finding_id": "X1", "rule_id": "rule-a",
+            "multi_model_analyses": [
+                _entry("m1", True), _entry("m2", True),
+            ],
+        },
+    ])
+    md = render_markdown(replay([path]))
+    assert "no recorded verdict" in md

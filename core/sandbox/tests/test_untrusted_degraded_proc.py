@@ -17,7 +17,6 @@ allowlist via omit_proc_reads.
 from __future__ import annotations
 
 import logging
-import sys
 from unittest import mock
 
 import pytest
@@ -25,10 +24,9 @@ import pytest
 from core.sandbox import context as context_mod
 from core.sandbox.tests.capability import requires_landlock
 
-pytestmark = pytest.mark.skipif(
-    sys.platform == "darwin",
-    reason="degradation path is Linux-only (seatbelt covers macOS)",
-)
+# Degradation path is Linux-only (seatbelt covers macOS) and spawns
+# real degraded children — a real-Linux-kernel binding.
+pytestmark = pytest.mark.linux_native
 
 
 @pytest.fixture
@@ -98,6 +96,10 @@ class TestDegradedRunUntrusted:
         assert len(warnings) == 2, (
             "degraded run_untrusted must warn on EVERY call, "
             f"got {len(warnings)}")
+        # Two run_untrusted calls, ONE preexec build each: only the
+        # ns-creation-blocking plain-lane preexec exists since the
+        # unshare-CLI lane (whose bootstrap needed the permissive
+        # variant) was deleted.
         assert len(preexec_recorder) == 2
         for kwargs in preexec_recorder:
             readable = kwargs.get("readable_paths") or []

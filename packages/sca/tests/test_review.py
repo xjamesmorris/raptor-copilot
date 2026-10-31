@@ -372,7 +372,7 @@ def test_advisory_with_fix_returns_review(tmp_path: Path, capsys) -> None:
     assert rc == 1
     out = capsys.readouterr().out
     assert "**Verdict:** Review" in out
-    assert "Fix available: **4.17.12**" in out
+    assert "Fix available: **`4.17.12`**" in out
 
 
 # ---------------------------------------------------------------------------
@@ -810,3 +810,143 @@ def test_review_markdown_sanitises_osv_fields() -> None:
     assert "\x07" not in md
     assert "\\x1b" in md
     assert "![exfil](https://evil.example/p.png)" not in md
+
+
+def test_review_markdown_sanitises_fixed_version_and_transitives() -> None:
+    """``fixed_version`` (OSV ranges.events.fixed) and transitive
+    names/versions (live registry metadata) render into the same
+    operator-facing markdown as the escaped osv_id beside them —
+    hostile bytes must be defanged, and a backtick in a transitive
+    name must not escape its code span."""
+    from packages.sca.models import Advisory
+    from packages.sca.review import (
+        _VERDICT_REVIEW,
+        _render_review_markdown,
+        _synthesise_dep,
+    )
+
+    adv = Advisory(
+        osv_id="GHSA-ok",
+        aliases=[],
+        summary="s",
+        details="",
+        affected=[],
+        severity=None,
+        fixed_versions=["1.2.3\x1b[2Jwiped"],
+        references=[],
+    )
+    f = _vuln(severity="high", fixed="1.2.3\x1b[2Jwiped")
+    f.advisories = [adv]
+    hostile_transitive = Dependency(
+        ecosystem="PyPI", name="evil`](https://evil.example)`",
+        version="1.0\x1b[31m",
+        declared_in=Path("/r/req.txt"), scope="main",
+        is_lockfile=False, pin_style=PinStyle.EXACT, direct=False,
+        purl="pkg:pypi/evil@1.0",
+        parser_confidence=Confidence("low", reason="t"),
+    )
+    t_finding = _vuln(severity="high", fixed="2.0\x1b[31m")
+    t_finding.advisories = [adv]
+    dep = _synthesise_dep("PyPI", "x", "1.0")
+    md = _render_review_markdown(
+        dep, [f], [], _VERDICT_REVIEW,
+        transitive_deps=[hostile_transitive],
+        transitive_findings=[t_finding],
+        transitive_walk_attempted=True,
+        transitive_walk_supported=True,
+    )
+    assert "\x1b" not in md
+    assert "evil`" not in md
+    assert "evil'](https://evil.example)'" in md
+
+
+def test_review_markdown_keeps_link_and_image_syntax_inert() -> None:
+    """``escape_nonprintable`` passes printable markdown metachars —
+    a hostile fixed_version shaped like ``![beacon](url)`` must not
+    render as an active inline image in the operator report. The fix
+    line renders the value inside a code span (backticks
+    neutralised), so the syntax is inert."""
+    from packages.sca.models import Advisory
+    from packages.sca.review import (
+        _VERDICT_REVIEW,
+        _render_review_markdown,
+        _synthesise_dep,
+    )
+
+    beacon = "![beacon](https://evil.example/p?q=x)"
+    adv = Advisory(
+        osv_id="GHSA-ok", aliases=[], summary="s", details="",
+        affected=[], severity=None,
+        fixed_versions=[beacon], references=[],
+    )
+    f = _vuln(severity="high", fixed=beacon)
+    f.advisories = [adv]
+    dep = _synthesise_dep("PyPI", "x", "1.0")
+    md = _render_review_markdown(dep, [f], [], _VERDICT_REVIEW)
+    # The beacon text appears only INSIDE a code span; a code span
+    # cannot be broken out of because backticks in the value are
+    # replaced.
+    assert f"`{beacon}`" in md
+    for line in md.splitlines():
+        if beacon in line:
+            before = line.split(beacon, 1)[0]
+            assert before.endswith("`"), line
+
+
+# ---------------------------------------------------------------------------
+# OSV degradation — verdict availability
+# ---------------------------------------------------------------------------
+
+def test_osv_outage_never_mints_clean(tmp_path: Path, capsys) -> None:
+    """A transient OSV outage must not read as "no known advisories"
+    with exit 0 — a network blip would wave a vulnerable package
+    through any pre-install gate built on this command. Mirrors the
+    whatif degraded refusal: explicit degraded section + exit 2."""
+    from core.http import HttpError
+
+    class OutageHttp(StubHttp):
+        def post_json(self, url, body, timeout=30, **kwargs):
+            raise HttpError(f"simulated OSV outage: {url}")
+
+    http = OutageHttp(gets={
+        "https://registry.npmjs.org/lodash/4.17.4": {"name": "lodash"},
+    })
+    rc = review.main(
+        ["npm", "lodash", "4.17.4", "--no-kev", "--no-epss",
+         "--no-transitive"],
+        http=http, cache=JsonCache(root=tmp_path),
+    )
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "OSV lookups degraded" in out
+    assert "verdict unavailable" in out
+    # The human-readable verdict reflects the degradation too — a
+    # "Clean" label above the exit-2 refusal would contradict it.
+    assert "**Verdict:** Degraded" in out
+    assert "**Verdict:** Clean" not in out
+
+
+def test_osv_degraded_block_verdict_keeps_exit_2(tmp_path: Path, capsys) -> None:
+    """Degradation never DOWNGRADES a verdict: a block-tier signal that
+    survived the outage still exits 2, with the degraded section
+    appended for visibility."""
+    from core.http import HttpError
+
+    class OutageHttp(StubHttp):
+        def post_json(self, url, body, timeout=30, **kwargs):
+            raise HttpError(f"simulated OSV outage: {url}")
+
+    # distance-1 typosquat of "lodash" — block-tier without OSV.
+    http = OutageHttp(gets={
+        "https://registry.npmjs.org/lodahs/4.17.4": {"name": "lodahs"},
+    })
+    rc = review.main(
+        ["npm", "lodahs", "4.17.4", "--no-kev", "--no-epss",
+         "--no-transitive"],
+        http=http, cache=JsonCache(root=tmp_path),
+    )
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "OSV lookups degraded" in out
+    # Degradation never DOWNGRADES: the block verdict label survives.
+    assert "**Verdict:** Block" in out

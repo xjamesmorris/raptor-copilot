@@ -31,13 +31,13 @@ This mode teaches RAPTOR what the code's vocabulary means, then compiles that un
 
 ### Automated pipeline (LLM available)
 
-When an LLM is available, the full pipeline runs mechanically. Prefer the multi-pass orchestrator, which drains the reading list (items the LLM flags for follow-up) automatically:
+When an LLM is available, the full pipeline runs mechanically. Prefer the orchestrator, which seeds the prep scope from the reading list (items the LLM flags for follow-up) when one is present:
 
 ```bash
 libexec/raptor-study-loop <target> "$OUTPUT_DIR" [--root <source_root>] [--identifier <names>] [--concept <names>] [--model MODEL]
 ```
 
-This loops prep → study-run → reading-list drain until convergence (no pending items, or no progress between passes). Each pass overwrites `study-list.json` and `domain-model.json`, feeding reading-list items back as identifiers/concepts for the next prep run.
+This runs a SINGLE pass — prep → study-run → invariant compilation — and reports whatever reading-list items remain pending at the end. To drain a reading list, run the loop again (each run picks up the pending items; the study-list cache is scope-keyed, so newly queued items regenerate it automatically). Resolution bookkeeping lives with the study pipeline and its callers.
 
 For single-pass or manual control, the two steps individually:
 
@@ -51,7 +51,7 @@ For multi-identifier mode, pass `--correlate` with comma- or `+`-separated ident
 
 **Step 2: Phase 2 + 3 — LLM extraction and synthesis**
 ```bash
-libexec/raptor-study-run "$OUTPUT_DIR" [--max-batches N] [--model MODEL]
+libexec/raptor-study-run "$OUTPUT_DIR" [--batch-target N] [--model MODEL]
 ```
 Reads `study-list.json`, dispatches batches to an LLM, synthesises results, writes `domain-model.json`.
 

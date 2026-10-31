@@ -118,16 +118,19 @@ class TestDeadBranches:
     """Consumer handles values nobody produces."""
 
     def test_consumer_has_unreachable_branch(self):
+        # Fixture field is "severity", not "status": the field-link
+        # heuristic excludes the most generic field names by design
+        # (_GENERIC_FIELD_NAMES).
         source = {
             "pkg/producer.py": (
                 'def produce():\n'
-                '    status = "ok"\n'
+                '    severity = "ok"\n'
             ),
             "pkg/consumer.py": (
-                'def consume(status):\n'
-                '    if status == "ok":\n'
+                'def consume(severity):\n'
+                '    if severity == "ok":\n'
                 '        pass\n'
-                '    elif status == "never_produced":\n'
+                '    elif severity == "never_produced":\n'
                 '        pass\n'
             ),
         }
@@ -574,7 +577,16 @@ function getLabels() {
         assert funcs == []
 
     def test_cross_language_mismatch(self):
-        """Go producer + Python consumer should detect gap."""
+        """Go producer + Python consumer should detect gap.
+
+        The producer and consumer live in different files, so the pair
+        needs an explicit call-graph edge (the intra-module heuristic
+        links only within one file, and there is no shared field name
+        for the field heuristic). Availability is probed explicitly so
+        the assertion stays load-bearing when tree-sitter is present —
+        a skip on ``match is None`` would also mask a real regression
+        in cross-language linking or gap computation.
+        """
         go_src = '''\
 package main
 
@@ -589,13 +601,24 @@ def apply_mode(m):
     elif m == "slow":
         pass
 '''
-        results = detect_value_space_mismatches({
-            "mode.go": go_src,
-            "handler.py": py_src,
-        })
+        from core.audit.ts_extract import extract_string_literals
+        if extract_string_literals("mode.go", go_src) is None:
+            pytest.skip("tree-sitter (go grammar) not available")
+        results = detect_value_space_mismatches(
+            {
+                "mode.go": go_src,
+                "handler.py": py_src,
+            },
+            call_graphs={
+                "handler.py": FakeCallGraph(calls=[
+                    FakeCall(caller="apply_mode", chain=["getMode"]),
+                ]),
+            },
+        )
         match = _find_mismatch(results, "getMode", "apply_mode")
-        if match is None:
-            pytest.skip("tree-sitter not available or no intra-module link")
+        assert match is not None, (
+            f"Expected getMode→apply_mode mismatch, got {results}"
+        )
         assert "slow" in match.dead_branches
 
 
@@ -757,3 +780,76 @@ class TestDeadVisitorFlagsRemoved:
         extractor = _LiteralExtractor("a.py", "f")
         assert not hasattr(extractor, "_in_compare")
         assert not hasattr(extractor, "_in_membership")
+
+
+class TestNestedFunctionAttribution:
+    def test_nested_def_literals_not_double_attributed(self):
+        funcs = _extract_function_literals(
+            'def outer():\n'
+            '    def inner():\n'
+            '        return "inner_value"\n'
+            '    return "outer_value"\n',
+            "a.py",
+        )
+        by_name = {fl.function: fl for fl in funcs}
+        assert by_name["inner"].produced == {"inner_value"}
+        assert by_name["outer"].produced == {"outer_value"}
+
+    def test_posonly_and_kwonly_params_are_field_params(self):
+        funcs = _extract_function_literals(
+            'def f(ecosystem, /, *, severity):\n'
+            '    labels = {"PyPI": 1, "npm": 2}\n'
+            '    return labels\n',
+            "a.py",
+        )
+        assert len(funcs) == 1
+        assert funcs[0].field_produced == {"ecosystem", "severity"}
+
+
+class TestFieldHeuristicNoise:
+    """Generic field names must not cross-product unrelated functions;
+    pairs per field are capped."""
+
+    @staticmethod
+    def _fl(fn, *, prod_field=None, cons_field=None):
+        from core.audit.value_space_checker import _FunctionLiterals
+        fl = _FunctionLiterals(file="pkg/a.py", function=fn)
+        if prod_field:
+            fl.produced.add("x")
+            fl.field_produced.add(prod_field)
+        if cons_field:
+            fl.consumed.add("y")
+            fl.field_consumed.add(cons_field)
+        return fl
+
+    def test_generic_field_names_do_not_link(self):
+        from core.audit.value_space_checker import _link_by_field_heuristic
+        funcs = [
+            self._fl("p", prod_field="type"),
+            self._fl("c", cons_field="type"),
+        ]
+        assert _link_by_field_heuristic({"pkg/a.py": funcs}) == []
+
+    def test_specific_field_names_still_link(self):
+        from core.audit.value_space_checker import _link_by_field_heuristic
+        funcs = [
+            self._fl("p", prod_field="ecosystem"),
+            self._fl("c", cons_field="ecosystem"),
+        ]
+        links = _link_by_field_heuristic({"pkg/a.py": funcs})
+        assert len(links) == 1
+
+    def test_pairs_capped_per_field(self):
+        from core.audit import value_space_checker as vsc
+        producers = [
+            self._fl(f"p{i}", prod_field="ecosystem") for i in range(10)
+        ]
+        consumers = [
+            self._fl(f"c{i}", cons_field="ecosystem") for i in range(10)
+        ]
+        links = vsc._link_by_field_heuristic(
+            {"pkg/a.py": producers + consumers},
+        )
+        # 10x10 raw pairs collapse to the cap; under-cap fields are
+        # unaffected (previous test emits exactly its 1 raw pair).
+        assert len(links) == vsc._MAX_PAIRS_PER_FIELD

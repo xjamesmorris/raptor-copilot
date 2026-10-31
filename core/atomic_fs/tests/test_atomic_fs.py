@@ -393,3 +393,372 @@ class TestShortWriteCompletion:
         monkeypatch.undo()
         assert not target.exists()
         assert list(tmp_path.iterdir()) == []
+
+
+class TestOpenExclusiveArtifact:
+    """The exclusive-create family: anything occupying the
+    destination name refuses the open instead of being followed,
+    truncated, or blocked on."""
+
+    def test_creates_new_file(self, tmp_path):
+        import os
+
+        from core.atomic_fs import open_exclusive_artifact
+
+        target = tmp_path / "artifact.bin"
+        fd = open_exclusive_artifact(target)
+        try:
+            os.write(fd, b"payload")
+        finally:
+            os.close(fd)
+        assert target.read_bytes() == b"payload"
+
+    def test_refuses_existing_file(self, tmp_path):
+        from core.atomic_fs import open_exclusive_artifact
+
+        target = tmp_path / "artifact.bin"
+        target.write_bytes(b"old")
+        with pytest.raises(OSError):
+            open_exclusive_artifact(target)
+        assert target.read_bytes() == b"old"
+
+    def test_refuses_dangling_symlink(self, tmp_path):
+        """A dangling symlink passes ``exists() == False`` — the
+        exact blind spot O_EXCL closes: creating through it would
+        materialise the attacker-chosen target."""
+        from core.atomic_fs import open_exclusive_artifact
+
+        victim = tmp_path / "victim"
+        link = tmp_path / "artifact.bin"
+        link.symlink_to(victim)
+        with pytest.raises(OSError):
+            open_exclusive_artifact(link)
+        assert not victim.exists()
+
+    def test_refuses_symlink_to_existing_victim(self, tmp_path):
+        from core.atomic_fs import open_exclusive_artifact
+
+        victim = tmp_path / "victim"
+        victim.write_text("do not touch")
+        link = tmp_path / "artifact.bin"
+        link.symlink_to(victim)
+        with pytest.raises(OSError):
+            open_exclusive_artifact(link)
+        assert victim.read_text() == "do not touch"
+
+    def test_replace_removes_planted_symlink_not_its_target(
+        self, tmp_path,
+    ):
+        from core.atomic_fs import write_new_bytes
+
+        victim = tmp_path / "victim"
+        victim.write_text("do not touch")
+        link = tmp_path / "artifact.bin"
+        link.symlink_to(victim)
+        write_new_bytes(link, b"fresh", replace=True)
+        assert victim.read_text() == "do not touch"
+        assert not link.is_symlink()
+        assert link.read_bytes() == b"fresh"
+
+    def test_replace_overwrites_own_previous_emission(self, tmp_path):
+        from core.atomic_fs import write_new_bytes
+
+        target = tmp_path / "artifact.bin"
+        write_new_bytes(target, b"run one", replace=True)
+        write_new_bytes(target, b"run two", replace=True)
+        assert target.read_bytes() == b"run two"
+
+    def test_replace_refuses_directory(self, tmp_path):
+        from core.atomic_fs import open_exclusive_artifact
+
+        target = tmp_path / "artifact.bin"
+        target.mkdir()
+        with pytest.raises(OSError):
+            open_exclusive_artifact(target, replace=True)
+        assert target.is_dir()
+
+    @pytest.mark.skipif(
+        not hasattr(__import__("os"), "mkfifo"),
+        reason="mkfifo unavailable (non-POSIX)")
+    def test_replace_removes_planted_fifo(self, tmp_path):
+        import os
+
+        from core.atomic_fs import write_new_bytes
+
+        target = tmp_path / "artifact.bin"
+        os.mkfifo(target)
+        write_new_bytes(target, b"fresh", replace=True)
+        assert target.read_bytes() == b"fresh"
+
+    def test_mode_wins_over_umask(self, tmp_path):
+        import os
+        import stat
+
+        from core.atomic_fs import open_exclusive_artifact
+
+        target = tmp_path / "script.sh"
+        old_umask = os.umask(0o077)
+        try:
+            fd = open_exclusive_artifact(target, mode=0o755)
+            os.close(fd)
+        finally:
+            os.umask(old_umask)
+        assert stat.S_IMODE(target.stat().st_mode) == 0o755
+
+    def test_mode_rejects_setuid(self, tmp_path):
+        from core.atomic_fs import open_exclusive_artifact
+
+        with pytest.raises(ValueError):
+            open_exclusive_artifact(tmp_path / "f", mode=0o4755)
+
+    def test_default_mode_honours_umask(self, tmp_path):
+        # Two-direction pair with test_mode_wins_over_umask: an
+        # EXPLICIT mode beats the umask (0o755 scripts stay
+        # executable), but the unrequested DEFAULT must be masked by
+        # it — fchmod-forcing the default widened 0o600 (umask 077)
+        # artifacts to a world-readable 0o644 on restrictive-umask
+        # multi-user hosts, where the plain open("w") these writers
+        # replaced and the append family in this module both honour
+        # the umask.
+        import os
+        import stat
+
+        from core.atomic_fs import write_new_text
+
+        target = tmp_path / "artifact.txt"
+        old_umask = os.umask(0o077)
+        try:
+            write_new_text(target, "crash bytes\n")
+        finally:
+            os.umask(old_umask)
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+    def test_explicit_mode_wins_over_umask_through_write_new(self, tmp_path):
+        import os
+        import stat
+
+        from core.atomic_fs import write_new_bytes
+
+        target = tmp_path / "script.sh"
+        old_umask = os.umask(0o077)
+        try:
+            write_new_bytes(target, b"#!/bin/sh\n", mode=0o755)
+        finally:
+            os.umask(old_umask)
+        assert stat.S_IMODE(target.stat().st_mode) == 0o755
+
+    def test_write_new_text_round_trip(self, tmp_path):
+        from core.atomic_fs import write_new_text
+
+        target = tmp_path / "artifact.txt"
+        write_new_text(target, "héllo\n")
+        assert target.read_text(encoding="utf-8") == "héllo\n"
+
+
+class TestOpenHardenedAppend:
+
+    def test_appends_not_truncates(self, tmp_path):
+        import os
+
+        from core.atomic_fs import open_hardened_append
+
+        target = tmp_path / "trail.log"
+        for chunk in (b"one\n", b"two\n"):
+            fd = open_hardened_append(target)
+            try:
+                os.write(fd, chunk)
+            finally:
+                os.close(fd)
+        assert target.read_bytes() == b"one\ntwo\n"
+
+    def test_refuses_symlink(self, tmp_path):
+        from core.atomic_fs import open_hardened_append
+
+        victim = tmp_path / "victim"
+        victim.write_text("do not touch")
+        link = tmp_path / "trail.log"
+        link.symlink_to(victim)
+        with pytest.raises(OSError):
+            open_hardened_append(link)
+        assert victim.read_text() == "do not touch"
+
+    @pytest.mark.skipif(
+        not hasattr(__import__("os"), "mkfifo"),
+        reason="mkfifo unavailable (non-POSIX)")
+    def test_refuses_readerless_fifo_without_blocking(self, tmp_path):
+        import os
+
+        from core.atomic_fs import open_hardened_append
+
+        target = tmp_path / "trail.log"
+        os.mkfifo(target)
+        with pytest.raises(OSError):
+            open_hardened_append(target)
+
+    @pytest.mark.skipif(
+        not hasattr(__import__("os"), "mkfifo"),
+        reason="mkfifo unavailable (non-POSIX)")
+    def test_refuses_fifo_with_reader(self, tmp_path):
+        import os
+
+        from core.atomic_fs import open_hardened_append
+
+        target = tmp_path / "trail.log"
+        os.mkfifo(target)
+        reader = os.open(str(target), os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            with pytest.raises(OSError):
+                open_hardened_append(target)
+        finally:
+            os.close(reader)
+
+
+class TestRmtreeHardened:
+    """Griefing-resistant tree removal (the chmod-walk-then-rmtree
+    shape shared by symex private tmps, fuzzing env rootfs, and sca
+    venv scratch)."""
+
+    def test_removes_griefed_mode0_subtree(self, tmp_path):
+        from core.atomic_fs import rmtree_hardened
+
+        victim = tmp_path / "scratch"
+        nested = victim / "a" / "b"
+        nested.mkdir(parents=True)
+        (nested / "f").write_text("x")
+        (victim / "a").chmod(0o000)
+        try:
+            assert rmtree_hardened(victim) is True
+            assert not victim.exists()
+        finally:
+            if victim.exists():  # restore so pytest tmp cleanup works
+                (victim / "a").chmod(0o700)
+
+    def test_removes_mode0_root(self, tmp_path):
+        from core.atomic_fs import rmtree_hardened
+
+        victim = tmp_path / "scratch"
+        victim.mkdir()
+        (victim / "f").write_text("x")
+        victim.chmod(0o000)
+        try:
+            assert rmtree_hardened(victim) is True
+            assert not victim.exists()
+        finally:
+            if victim.exists():
+                victim.chmod(0o700)
+
+    def test_never_chmods_through_symlink(self, tmp_path):
+        from core.atomic_fs import rmtree_hardened
+
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        outside.chmod(0o755)
+        victim = tmp_path / "scratch"
+        victim.mkdir()
+        (victim / "evil").symlink_to(outside)
+        assert rmtree_hardened(victim) is True
+        assert not victim.exists()
+        assert outside.exists()
+        assert (outside.stat().st_mode & 0o777) == 0o755
+
+    def test_symlink_root_not_followed(self, tmp_path):
+        from core.atomic_fs import rmtree_hardened
+
+        # The target carries a restrictive-mode SUBDIRECTORY: os.walk
+        # always follows its `top` argument (followlinks only governs
+        # the descent), so an unrefused link root would restore 0o700
+        # onto the target's subtree through the link before rmtree
+        # ever refused it. The refusal must come first — no chmod, no
+        # walk, no side effects.
+        target = tmp_path / "real"
+        sub = target / "locked"
+        sub.mkdir(parents=True)
+        (sub / "keep").write_text("x")
+        sub.chmod(0o555)
+        target.chmod(0o755)
+        link = tmp_path / "scratch"
+        link.symlink_to(target)
+        try:
+            result = rmtree_hardened(link)
+            assert result is False
+            assert link.is_symlink()
+            assert (sub / "keep").read_text() == "x"
+            assert (target.stat().st_mode & 0o777) == 0o755
+            assert (sub.stat().st_mode & 0o777) == 0o555
+        finally:
+            sub.chmod(0o700)  # so pytest tmp cleanup works
+
+    def test_missing_path_reports_gone(self, tmp_path):
+        from core.atomic_fs import rmtree_hardened
+
+        assert rmtree_hardened(tmp_path / "never-there") is True
+
+    def test_reports_false_when_removal_blocked(self, tmp_path):
+        import os
+
+        from core.atomic_fs import rmtree_hardened
+
+        if os.geteuid() == 0:
+            pytest.skip("root bypasses permission checks")
+        parent = tmp_path / "jail"
+        victim = parent / "scratch"
+        victim.mkdir(parents=True)
+        (victim / "f").write_text("x")
+        parent.chmod(0o500)  # no write: victim cannot be unlinked
+        try:
+            assert rmtree_hardened(victim) is False
+            assert victim.exists()
+        finally:
+            parent.chmod(0o700)
+
+
+class TestOpenHardenedRead:
+
+    def test_reads_regular_file(self, tmp_path):
+        import os
+
+        from core.atomic_fs import open_hardened_read
+
+        target = tmp_path / "artifact.log"
+        target.write_bytes(b"one\ntwo\n")
+        fd = open_hardened_read(target)
+        try:
+            assert os.read(fd, 1 << 16) == b"one\ntwo\n"
+        finally:
+            os.close(fd)
+
+    def test_refuses_symlink(self, tmp_path):
+        from core.atomic_fs import open_hardened_read
+
+        victim = tmp_path / "victim"
+        victim.write_text("attacker-chosen content")
+        link = tmp_path / "artifact.log"
+        link.symlink_to(victim)
+        with pytest.raises(OSError):
+            open_hardened_read(link)
+
+    @pytest.mark.skipif(
+        not hasattr(__import__("os"), "mkfifo"),
+        reason="mkfifo unavailable (non-POSIX)")
+    def test_refuses_writerless_fifo_without_blocking(self, tmp_path):
+        import os
+
+        from core.atomic_fs import open_hardened_read
+
+        target = tmp_path / "artifact.log"
+        os.mkfifo(target)
+        # O_NONBLOCK makes the read-side open of a writerless FIFO
+        # return immediately; the fstat gate must then refuse it —
+        # a plain open() here blocks forever.
+        with pytest.raises(OSError):
+            open_hardened_read(target)
+
+    def test_refuses_character_device(self):
+        from pathlib import Path
+
+        from core.atomic_fs import open_hardened_read
+
+        if not Path("/dev/null").exists():
+            pytest.skip("/dev/null unavailable")
+        with pytest.raises(OSError):
+            open_hardened_read("/dev/null")

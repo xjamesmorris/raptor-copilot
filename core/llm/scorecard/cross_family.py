@@ -25,6 +25,7 @@ import logging
 from typing import Any
 
 from . import _MAX_REASONING_CHARS
+from ._batch import record_event_batch
 from .scorecard import EventType, ModelScorecard
 
 logger = logging.getLogger(__name__)
@@ -43,13 +44,17 @@ def record_cross_family_outcomes(
     if scorecard is None:
         return 0
 
-    n_recorded = 0
+    pending: list[dict] = []
     for fid, result in results_by_id.items():
         cf = result.get("cross_family_check")
         if not isinstance(cf, dict):
             continue
 
-        verdict = cf.get("verdict", "")
+        # `or ""` (not a .get default): a present-but-None verdict —
+        # e.g. a checker that errored out upstream — must degrade to
+        # a skip, not AttributeError the walk and drop every
+        # remaining finding's event.
+        verdict = str(cf.get("verdict") or "")
         if verdict.startswith("skipped"):
             continue
 
@@ -57,47 +62,63 @@ def record_cross_family_outcomes(
         if not checker_model:
             continue
 
-        # Derive agreed/disputed from the verdict string rather than
-        # relying on the separate top-level boolean flags — those are
-        # set by a different code path and could fall out of sync.
-        # Either way the event is a consistency observation: with one
-        # primary and one checker a dispute is an even split with no
-        # ground truth, so neither side earns a correctness
-        # attribution from it.
-        if "disputed" in verdict:
+        # Derive agreed/disputed from the verdict string; the
+        # separate top-level boolean flags are set by a different
+        # code path and can fall out of sync — an out-of-sync True
+        # flag must never mint ``correct`` past a present-but-unknown
+        # verdict (the flag pre-empted the grammar here once). The
+        # flag remains only as the backstop for legacy records that
+        # carry no verdict string at all. Either way the event is a
+        # consistency observation: with one primary and one checker a
+        # dispute is an even split with no ground truth, so neither
+        # side earns a correctness attribution from it.
+        #
+        # Prefix-anchored matching against the producer's exact
+        # grammar ({"skipped — …", "disputed — conservative override",
+        # "agreed"}): a bare substring test read any future
+        # "disagreed" verdict as agreement.
+        if verdict.startswith("disputed"):
             outcome = "incorrect"
-        elif result.get("cross_family_agreed") or "agreed" in verdict:
+        elif verdict.startswith("agreed"):
+            outcome = "correct"
+        elif not verdict and result.get("cross_family_agreed"):
             outcome = "correct"
         else:
             continue
 
         rule_id = str(result.get("rule_id") or "unknown")
         decision_class = f"{decision_class_prefix}:{rule_id}"
-        model_version = cf.get("checker_model")
+        # model_version is the CONCRETE served snapshot per the family
+        # convention (consensus.py) — "None when unavailable so the
+        # cell stays alias-keyed, never guessed". The check record
+        # carries no resolved_model, and stamping the checker ALIAS
+        # here made the cell lie about its snapshot and polluted
+        # cross-event model_version drift comparisons.
+        model_version = None
 
         sample = None
         if outcome == "incorrect":
             sample = {
-                "trigger": cf.get("trigger", ""),
+                # str-coerced like every sibling field: an upstream
+                # list/dict in this slot must persist as one flat
+                # string, not smuggle nested values into the sample.
+                "trigger": str(cf.get("trigger") or ""),
                 "checker_ruling": str(
                     cf.get("checker_ruling", "")
                 )[:_MAX_REASONING_CHARS],
             }
 
-        try:
-            scorecard.record_event(
-                decision_class,
-                str(checker_model),
-                EventType.CROSS_FAMILY_CONSISTENCY,
-                outcome,
-                model_version=model_version,
-                sample=sample,
-            )
-            n_recorded += 1
-        except Exception:
-            logger.warning(
-                "cross-family check: record_event failed for %s",
-                fid, exc_info=True,
-            )
+        pending.append({
+            "decision_class": decision_class,
+            "model": str(checker_model),
+            "event_type": EventType.CROSS_FAMILY_CONSISTENCY,
+            "outcome": outcome,
+            "model_version": model_version,
+            "sample": sample,
+        })
 
-    return n_recorded
+    # One lock/load/verify/rewrite cycle for the whole walk instead of
+    # one per event (see _batch's rationale).
+    return record_event_batch(
+        scorecard, pending, log=logger, producer="cross-family check",
+    )

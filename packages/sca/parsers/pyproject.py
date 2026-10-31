@@ -1,4 +1,4 @@
-"""pyproject.toml parser — PEP 621, Poetry, PDM, and build-system requires.
+"""pyproject.toml parser — PEP 621/735, Poetry, PDM, and build-system requires.
 
 Reads (in this order, since a single file may declare deps under several
 schemes — Poetry projects often add ``[build-system].requires``, and a
@@ -6,6 +6,7 @@ PEP 621 project may also list a few PDM dev groups):
 
 - ``[project.dependencies]``                    → PEP 621, main scope
 - ``[project.optional-dependencies][<extra>]``  → PEP 621, "optional" scope
+- ``[dependency-groups][<group>]``              → PEP 735, dev scope
 - ``[tool.poetry.dependencies]``                → main
 - ``[tool.poetry.dev-dependencies]``            → dev   (legacy Poetry)
 - ``[tool.poetry.group.<name>.dependencies]``   → dev   (modern Poetry)
@@ -23,11 +24,12 @@ or ``path`` keys override pin style without a string spec.
 from __future__ import annotations
 
 import logging
-import re
 import sys
 from typing import Any, TYPE_CHECKING
 
 from ..models import Confidence, Dependency, PinStyle
+from ..naming import pep503_name
+from ._base import PARSE_ESCAPE_ERRORS, build_purl, manifest_confidence
 from . import _safe_read, register
 from .requirements import _spec_bounds
 
@@ -39,7 +41,7 @@ logger = logging.getLogger(__name__)
 # tomllib is stdlib on 3.11+; older interpreters need the `tomli` backport.
 _tomllib = None
 if sys.version_info >= (3, 11):
-    import tomllib as _tomllib            # type: ignore[no-redef]
+    import tomllib as _tomllib            # type: ignore[no-redef,assignment]
 else:                                     # pragma: no cover — env-dependent
     try:
         import tomli as _tomllib          # type: ignore[no-redef]
@@ -55,7 +57,7 @@ try:
     _HAS_PACKAGING = True
 except ImportError:                       # pragma: no cover — env-dependent
     InvalidRequirement = Exception        # type: ignore[assignment,misc]
-    Requirement = None                    # type: ignore[assignment]
+    Requirement = None                    # type: ignore[assignment,misc]
     _HAS_PACKAGING = False
     logger.warning(
         "sca.parsers.pyproject: 'packaging' not installed — PEP 621/PDM "
@@ -64,6 +66,11 @@ except ImportError:                       # pragma: no cover — env-dependent
     )
 
 ECOSYSTEM = "PyPI"
+
+# No legitimate PEP 508 spec exceeds a few hundred bytes; a 100k-byte
+# version string is hostile input regardless of whether packaging
+# chokes on it.
+_MAX_SPEC_LEN = 4096
 
 # Poetry caret/tilde grammar that PEP 508 doesn't accept directly.
 _POETRY_PREFIX_OPS = ("^", "~")
@@ -95,6 +102,15 @@ def parse(path: Path) -> list[Dependency]:
                     d = _from_pep508(spec, path, scope="optional")
                     if d is not None:
                         deps.append(d)
+
+    # --- PEP 735 dependency groups -------------------------------------
+    dependency_groups = data.get("dependency-groups") or {}
+    if isinstance(dependency_groups, dict):
+        for items in dependency_groups.values():
+            for spec in _str_items(items):
+                d = _from_pep508(spec, path, scope="dev")
+                if d is not None:
+                    deps.append(d)
 
     # --- Poetry ----------------------------------------------------------
     tool = data.get("tool") or {}
@@ -187,7 +203,7 @@ def _load(path: Path) -> dict[str, Any] | None:
 
     try:
         return _tomllib.loads(text)
-    except _tomllib.TOMLDecodeError as e:
+    except (_tomllib.TOMLDecodeError, *PARSE_ESCAPE_ERRORS) as e:  # hostile-input escape classes
         logger.warning("sca.parsers.pyproject: TOML parse failed for %s: %s", path, e)
         return None
 
@@ -223,14 +239,17 @@ def _from_pep508(
 ) -> Dependency | None:
     if not isinstance(spec, str) or not spec.strip():
         return None
+    if len(spec) > _MAX_SPEC_LEN:
+        logger.debug(
+            "sca.parsers.pyproject: spec too long (%d bytes) in %s, skipping",
+            len(spec), path,
+        )
+        return None
     if not _HAS_PACKAGING:
-        # Without `packaging`, PEP 508 lines are skipped — the operator
-        # was warned at import time. Poetry tool-table dict rows are
-        # still parsed.
         return None
     try:
         req = Requirement(spec)
-    except InvalidRequirement as e:
+    except (InvalidRequirement, ValueError) as e:
         logger.debug(
             "sca.parsers.pyproject: invalid PEP 508 %r in %s: %s",
             spec, path, e,
@@ -249,14 +268,14 @@ def _from_pep508(
 
     return Dependency(
         ecosystem=ECOSYSTEM,
-        name=_normalise_name(req.name),
+        name=pep503_name(req.name),
         version=version,
         declared_in=path,
         scope=scope,
         is_lockfile=False,
         pin_style=pin_style,
         direct=True,
-        purl=_build_purl(req.name, version),
+        purl=build_purl("pypi", pep503_name(req.name), version),
         parser_confidence=_confidence_for_pep508(pin_style, version),
         version_floor=version_floor,
         version_ceiling=version_ceiling,
@@ -295,14 +314,14 @@ def _from_poetry(
         version_floor, version_ceiling = _poetry_bounds(pin_style, version)
         return Dependency(
             ecosystem=ECOSYSTEM,
-            name=_normalise_name(name),
+            name=pep503_name(name),
             version=version,
             declared_in=path,
             scope=scope,
             is_lockfile=False,
             pin_style=pin_style,
             direct=True,
-            purl=_build_purl(name, version),
+            purl=build_purl("pypi", pep503_name(name), version),
             parser_confidence=Confidence(
                 "medium",
                 reason="Poetry multi-constraint entry; first match recorded",
@@ -316,14 +335,14 @@ def _from_poetry(
     version_floor, version_ceiling = _poetry_bounds(pin_style, version)
     return Dependency(
         ecosystem=ECOSYSTEM,
-        name=_normalise_name(name),
+        name=pep503_name(name),
         version=version,
         declared_in=path,
         scope=scope,
         is_lockfile=False,
         pin_style=pin_style,
         direct=True,
-        purl=_build_purl(name, version),
+        purl=build_purl("pypi", pep503_name(name), version),
         parser_confidence=_confidence_for_poetry(pin_style, version),
         version_floor=version_floor,
         version_ceiling=version_ceiling,
@@ -399,42 +418,26 @@ def _poetry_bounds(
 def _confidence_for_pep508(
     pin_style: PinStyle, version: str | None
 ) -> Confidence:
-    if pin_style in (PinStyle.GIT, PinStyle.PATH):
-        return Confidence(
-            "medium",
-            reason="pyproject.toml git/path dep; version best-effort",
-        )
-    if pin_style is PinStyle.UNKNOWN:
-        return Confidence("low", reason="pyproject.toml spec unrecognised")
-    if version is None:
-        return Confidence("medium", reason="pyproject.toml wildcard version")
-    return Confidence("high", reason="pyproject.toml PEP 621 entry")
+    return manifest_confidence(
+        pin_style, version,
+        unrecognised_reason="pyproject.toml spec unrecognised",
+        git_path_reason="pyproject.toml git/path dep; version best-effort",
+        unpinned_reason="pyproject.toml wildcard version",
+        pinned_reason="pyproject.toml PEP 621 entry",
+    )
 
 
 def _confidence_for_poetry(
     pin_style: PinStyle, version: str | None
 ) -> Confidence:
-    if pin_style is PinStyle.UNKNOWN:
-        return Confidence("low", reason="Poetry dep table without version")
-    if pin_style in (PinStyle.GIT, PinStyle.PATH):
-        return Confidence(
-            "medium",
-            reason="Poetry git/path source; version best-effort",
-        )
-    if version is None:
-        return Confidence("medium", reason="Poetry wildcard version")
-    return Confidence("high", reason="Poetry tool table")
+    return manifest_confidence(
+        pin_style, version,
+        unrecognised_reason="Poetry dep table without version",
+        git_path_reason="Poetry git/path source; version best-effort",
+        unpinned_reason="Poetry wildcard version",
+        pinned_reason="Poetry tool table",
+    )
 
-
-def _normalise_name(name: str) -> str:
-    return re.sub(r"[-_.]+", "-", name).lower()
-
-
-def _build_purl(name: str, version: str | None) -> str:
-    base = f"pkg:pypi/{_normalise_name(name)}"
-    if version:
-        return f"{base}@{version}"
-    return base
 
 
 register(filenames=["pyproject.toml"])(parse)

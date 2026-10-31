@@ -63,7 +63,13 @@ _TEARDOWN_NAME_RE = re.compile(
 # this from firing on every function that frees a local on an error
 # path: only frees of a *parameter* (or a field of one) mark the
 # function as a teardown wrapper.
-_DEALLOC_NAME = r"(?:\w*free\w*|\w+_(?:destroy|release|put|teardown))"
+# The prefix run before ``free`` is bounded: unbounded, a long
+# identifier stuffed with ``free`` repeats makes every occurrence
+# re-scan the rest of the word for the call parenthesis — quadratic
+# on hostile source. Real dealloc-wrapper names sit far inside 256
+# chars (trade-off: a longer name stops matching, versus an
+# unbounded scan).
+_DEALLOC_NAME = r"(?:\w{0,256}free\w*|\w+_(?:destroy|release|put|teardown))"
 
 
 def _param_names(metadata: dict[str, Any]) -> list[str]:
@@ -102,8 +108,11 @@ def is_contract_risk_function(
     if not params:
         return False
     param_alt = "|".join(re.escape(p) for p in params)
+    # The optional '&' gates its own trailing whitespace: the naive
+    # ``\s*&?\s*`` put two unbounded whitespace spans around it —
+    # quadratic on a call-opening line ending in a whitespace run.
     dealloc_on_param = re.compile(
-        rf"\b{_DEALLOC_NAME}\s*\(\s*&?\s*(?:{param_alt})\b",
+        rf"\b{_DEALLOC_NAME}\s*\(\s*(?:&\s*)?(?:{param_alt})\b",
         re.IGNORECASE,
     )
     return bool(dealloc_on_param.search(source))
@@ -172,9 +181,16 @@ def _infer_def_end(
         resolved = (target_path / rel_file).resolve()
         if not resolved.is_relative_to(target_path.resolve()):
             return line_start
-        lines = resolved.read_text(errors="replace").splitlines()
     except OSError:
         return line_start
+    # House-capped read (64 MiB budget): a planted blob must be
+    # refused, not buffered — this runs on the default review path.
+    from .context import _read_target_text
+
+    text = _read_target_text(resolved)
+    if text is None:
+        return line_start
+    lines = text.splitlines()
     depth = 0
     opened = False
     end = min(len(lines), line_start - 1 + _MAX_DEF_SCAN_LINES)
@@ -204,9 +220,17 @@ def _site_excerpt(
             if not resolved.is_relative_to(target_path.resolve()):
                 file_cache[rel_file] = None
             else:
-                file_cache[rel_file] = resolved.read_text(
-                    errors="replace",
-                ).splitlines()
+                # House-capped read (64 MiB budget): the FULL text of
+                # every call-site file is cached here on the default
+                # review path for contract-risk functions, amplified
+                # per function — a planted blob must be refused, not
+                # buffered (+200 MiB RSS for one 100 MiB file).
+                from .context import _read_target_text
+
+                text = _read_target_text(resolved)
+                file_cache[rel_file] = (
+                    text.splitlines() if text is not None else None
+                )
         except OSError:
             file_cache[rel_file] = None
     lines = file_cache[rel_file]
@@ -287,12 +311,15 @@ def build_caller_contract_digest(
         "sites": [],
         "declined": False,
         "enumeration": method,
-        # The enumerator caps total sites and skips oversized files;
-        # both mean the site list may be partial — folded into the
-        # same incompleteness flag the render already narrates.
+        # The enumerator caps total sites, skips oversized files and
+        # drops call-shaped matches whose argument list overflows the
+        # span bound; each means the site list may be partial —
+        # folded into the same incompleteness flag the render
+        # already narrates.
         "scan_capped": bool(
             report.get("scan_capped")
             or report.get("site_capped")
+            or report.get("span_capped")
             or report.get("size_skipped")
         ),
         "scanned_files": int(report.get("scanned_files", 0)),

@@ -87,6 +87,21 @@ PEELOFF_TWIN = PEELOFF.replace(
     "    obj->tls = tmp->tls;\n    obj->port = tmp->port;\n",
 )
 
+# Field-precision binding: the event argument is a member expression,
+# so only aliases of THAT field are staled by it.
+FIELD_EVENT_SHAPE = """
+int detach(struct ctx *d, struct conn *c) {
+    d->cached = c->other;
+    free(c->scratch);
+    return 0;
+}
+struct buf *get_cached(struct ctx *d) {
+    return d->cached;
+}
+"""
+
+FIELD_EVENT_TWIN = FIELD_EVENT_SHAPE.replace("c->other", "c->scratch")
+
 RCU_SHAPE = """
 void reclaim(struct s *o) {
     struct n *p = rcu_dereference(o->node);
@@ -152,6 +167,12 @@ class TestLegBStaleAlias:
         assert d["event"]["verb"] == "BIO_free"
         assert d["event"]["vocab_source"] == "learned"
         assert d["invalidation_search"]["found"] is None
+        # The receipt must describe the search that actually ran —
+        # a claimed callee-depth scan that never executes would
+        # overstate confidence in "alias live".
+        assert "depth" not in d["invalidation_search"]
+        assert d["invalidation_search"]["scope"] == \
+            "event-function-remainder+census-null-writes"
         assert d["post_event_reads"][0]["function"] == "ctx_pool"
         assert d["owner"] == {"name": "b", "field": "pool"}
 
@@ -165,6 +186,25 @@ class TestLegBStaleAlias:
         assert "invalidated" in res.reason
         assert res.to_dict()["invalidation_search"]["kind"] == \
             "null-write"
+
+    def test_field_event_does_not_stale_other_field_aliases(self):
+        # free(c->scratch) releases ONE field's referent; the alias
+        # taken from c->other still points at a live object — a
+        # confirmed verdict here is a false UAF on a live pointer.
+        res = run_ptr_lifecycle_check(
+            Path("/nonexistent"), "src/conn.c", "detach", HYP,
+            source_texts={"src/conn.c": FIELD_EVENT_SHAPE},
+        )
+        assert res.outcome != "confirmed"
+
+    def test_field_event_on_the_aliased_field_still_confirms(self):
+        res = run_ptr_lifecycle_check(
+            Path("/nonexistent"), "src/conn.c", "detach", HYP,
+            source_texts={"src/conn.c": FIELD_EVENT_TWIN},
+        )
+        assert res.outcome == "confirmed"
+        assert "c->scratch" in res.reason
+        assert res.to_dict()["owner"] == {"name": "c", "field": "scratch"}
 
     def test_naming_only_event_verb_is_detection_variant(self):
         # Vocab-policy: with no learned inputs, the target-specific
@@ -446,7 +486,11 @@ class TestOutOfSpanOffsetsClamped:
         result = _local_alias_escapes(
             self._edge(10), segment, self._span(), 820, set(),
         )
-        assert result is None or "line 80" in result
+        # Deterministic: the clamped walk starts at offset 0 and finds
+        # `use(alias)` at segment offset 2 → span line 802. The old
+        # `result is None or ...` form passed vacuously on None.
+        assert result is not None
+        assert "line 802" in result
 
     def test_event_before_span_reads_nothing(self):
         from core.audit.ptr_lifecycle import _local_post_event_reads
@@ -489,13 +533,17 @@ class TestCensusBlockIsolationWiring:
 
         import core.audit.orchestrator as orch_mod
 
+        import re
+
         src = Path(orch_mod.__file__).read_text()
         idx = src.find("def _census_prepass")
         assert idx != -1, "per-channel isolation wrapper missing"
         window = src[idx:idx + 2500]
         assert "logger.warning" in window[:800]
-        assert '_census_prepass(\n                "ptr_lifecycle"' in src
-        assert '_census_prepass(\n                "lock_region"' in src
+        # Whitespace-insensitive: reformatting the call must not fail
+        # the wiring check.
+        assert re.search(r'_census_prepass\(\s*"ptr_lifecycle"', src)
+        assert re.search(r'_census_prepass\(\s*"lock_region"', src)
         # The block-level swallow is loud too.
         assert (
             "lifecycle channel prepass block failed" in src
@@ -559,3 +607,36 @@ class TestInvalidationHolderConstraint:
         )
         assert res.outcome == "refuted"
         assert res.to_dict()["invalidation_search"]["kind"] == "null-write"
+
+
+class TestSourceReadContainment:
+    """run_ptr_lifecycle_check's own source read (source_texts=None)
+    is contained + capped — same gap-record join class as
+    lock_region."""
+
+    def test_escaping_file_path_holds_unbindable(self, tmp_path):
+        import sys
+
+        target = tmp_path / "target"
+        target.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        secret = outside / "evil.c"
+        secret.write_text("void freed_alias(void) { }\n")
+        opened: list = []
+
+        def hook(event, args):
+            if event == "open" and args and str(secret) in str(args[0]):
+                opened.append(args)
+
+        sys.addaudithook(hook)
+        for fp in (str(secret), "../outside/evil.c"):
+            res = pl.run_ptr_lifecycle_check(
+                target, fp, "freed_alias",
+                "stale alias dereferenced after free",
+            )
+            assert res.outcome == "inconclusive"
+            assert res.reason.startswith(pl.REASON_HYPOTHESIS_UNBINDABLE)
+        assert opened == [], (
+            "out-of-root file was opened by the ptr_lifecycle source read"
+        )

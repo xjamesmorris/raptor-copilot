@@ -5,6 +5,7 @@ architecture (OpenAI SDK + Anthropic SDK) without any LiteLLM dependency.
 """
 
 import pytest
+import re
 import sys
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -135,6 +136,26 @@ class TestIsAuthError:
         assert _is_auth_error(Exception("Connection timeout")) is False
         assert _is_auth_error(ValueError("bad value")) is False
 
+    def test_bare_401_digits_do_not_false_positive(self):
+        """"401"/"403" need status context — stack-trace line numbers
+        and ids containing the digits must not classify as auth (which
+        feeds phase-abort style consumers and telemetry labels)."""
+        assert _is_auth_error(
+            Exception('File "worker.py", line 401, in call'),
+        ) is False
+        assert _is_auth_error(
+            Exception("request id req-401-abc failed to parse"),
+        ) is False
+        assert _is_auth_error(Exception("read 403 bytes from pipe")) is False
+
+    def test_context_anchored_401_still_detected(self):
+        """Genuine auth shapes keep classifying after the anchoring."""
+        assert _is_auth_error(Exception("Error code: 401 - bad key")) is True
+        assert _is_auth_error(Exception("403 Forbidden")) is True
+        assert _is_auth_error(
+            Exception("api key not valid. Pass a valid key."),
+        ) is True
+
 
 class TestIsQuotaError:
     """Verify _is_quota_error detects rate limit errors from both SDKs."""
@@ -171,21 +192,31 @@ class TestIsQuotaError:
         except (ImportError, TypeError):
             pytest.skip("anthropic SDK not installed or constructor incompatible")
 
+    # The string-based arms require transport corroboration (see
+    # test_transport_gated_classifiers.py), so message fixtures carry
+    # a transport module root like a real SDK/httpx exception.
+    class _TransportError(Exception):
+        __module__ = "httpx"
+
     def test_detects_string_based_429(self):
         """Detect 429 status code in error message."""
-        assert _is_quota_error(Exception("Error 429: Too Many Requests")) is True
+        assert _is_quota_error(
+            self._TransportError("Error 429: Too Many Requests")) is True
 
     def test_detects_string_based_quota_exceeded(self):
         """Detect 'quota exceeded' in error message."""
-        assert _is_quota_error(Exception("quota exceeded for this billing period")) is True
+        assert _is_quota_error(self._TransportError(
+            "quota exceeded for this billing period")) is True
 
     def test_detects_string_based_rate_limit(self):
         """Detect 'rate limit' in error message."""
-        assert _is_quota_error(Exception("rate limit reached, try again later")) is True
+        assert _is_quota_error(self._TransportError(
+            "rate limit reached, try again later")) is True
 
     def test_detects_gemini_free_tier(self):
         """Detect Gemini-specific free tier quota error."""
-        assert _is_quota_error(Exception("generate_content_free_tier limit hit")) is True
+        assert _is_quota_error(self._TransportError(
+            "generate_content_free_tier limit hit")) is True
 
     def test_non_quota_error_returns_false(self):
         """Non-quota errors should return False."""
@@ -269,11 +300,21 @@ class TestSanitizeLogMessage:
         assert "[REDACTED-API-KEY]" in result
 
     def test_preserves_boundary_length_non_tokens(self):
-        """Values below secret length thresholds should not be redacted."""
+        """Values below secret length thresholds and outside secret-named
+        assignments should not be redacted."""
         bearer = "Bearer " + "d" * 19
-        github_token = "ghp_" + "e" * 35
-        message = f"Authorization failed for {bearer}; token={github_token}"
+        message = f"Authorization failed for {bearer}"
         assert _sanitize_log_message(message) == message
+        # A sub-threshold ghp_ value no longer sails through when it sits
+        # in a `token=` assignment: the shared redact_secrets final pass
+        # redacts BY FIELD NAME regardless of value shape. Redaction only
+        # tightens here — pinned so a future reorder reconsiders it.
+        github_token = "ghp_" + "e" * 35
+        result = _sanitize_log_message(f"token={github_token}")
+        assert github_token not in result
+        # The same sub-threshold value WITHOUT assignment context stays.
+        bare = _sanitize_log_message(f"saw {github_token} in trace")
+        assert github_token in bare
 
     def test_preserves_non_key_content(self):
         """Non-key content should be preserved."""
@@ -306,7 +347,11 @@ class TestSanitizeLogMessage:
         result = _sanitize_log_message(message)
         for name, value in values:
             assert value not in result
-            assert f"{name}=[REDACTED-API-KEY]" in result
+            # The local pass tags [REDACTED-API-KEY]; the shared
+            # redact_secrets final pass may collapse assignment-shaped
+            # markers to its own [REDACTED]. Either way the field name
+            # stays and the value is gone.
+            assert f"{name}=[REDACTED" in result
 
     def test_redacts_quoted_json_secret_fields(self):
         """JSON-ish secret fields from SDK errors redact quoted values."""
@@ -317,8 +362,10 @@ class TestSanitizeLogMessage:
         )
         assert api_value not in result
         assert session_value not in result
-        assert '"api_key": "[REDACTED-API-KEY]"' in result
-        assert '"session_token": "[REDACTED-API-KEY]"' in result
+        # Marker may be the local [REDACTED-API-KEY] or collapsed to
+        # the shared final pass's [REDACTED]; the field names survive.
+        assert re.search(r'"api_key": "?\[REDACTED', result)
+        assert re.search(r'"session_token": "?\[REDACTED', result)
 
     def test_redacts_basic_authorization_header(self):
         """Basic auth credentials in headers are redacted like bearer tokens."""
@@ -350,21 +397,38 @@ class TestSanitizeLogMessage:
         )
         assert short_password not in result
         assert punctuated_secret not in result
-        assert 'DATABASE_PASSWORD="[REDACTED-API-KEY]"' in result
-        assert 'CLIENT_SECRET="[REDACTED-API-KEY]"' in result
+        assert re.search(r'DATABASE_PASSWORD="?\[REDACTED', result)
+        assert re.search(r'CLIENT_SECRET="?\[REDACTED', result)
 
     def test_preserves_llm_token_usage_metrics(self):
         """Usage counters named *_tokens are telemetry, not credentials."""
         message = "prompt_tokens=123456789012 completion_tokens=987654321098"
         assert _sanitize_log_message(message) == message
 
-    def test_preserves_secret_metadata_and_pagination_fields(self):
-        """Secret-related metadata and pagination cursors are not credential values."""
+    def test_preserves_secret_metadata_fields(self):
+        """Names merely CONTAINING secret vocabulary (no secret suffix)
+        are metadata, not credentials — long realistic values included
+        so the assertion doesn't ride the assignment RE's 8-char value
+        floor."""
         message = (
-            "SECRET_ROTATION_DAYS=90 PASSWORD_POLICY=strong IS_SECRET=false "
-            "MAX_API_KEY_LENGTH=128 page_token=abc123 next_token=def456"
+            "SECRET_ROTATION_DAYS=90 PASSWORD_POLICY=strong-rotate-quarterly "
+            "MAX_API_KEY_LENGTH=128128128"
         )
         assert _sanitize_log_message(message) == message
+
+    def test_pagination_cursor_boundary(self):
+        """Pagination cursors carry secret-SUFFIXED names (page_token,
+        next_token), so the shared redactor's final pass redacts their
+        values by NAME once they clear the 8-char floor. Pin both sides
+        of that boundary: sub-floor values survive; a real-length
+        cursor is redacted (the safe direction — the local pattern
+        set's old cursor-preservation intent no longer holds above the
+        floor, see the field-vocabulary comment in the source)."""
+        short = "page_token=abc123 next_token=def456 IS_SECRET=false"
+        assert _sanitize_log_message(short) == short
+        out = _sanitize_log_message("page_token=CAESJDU1MGU4NDAw")
+        assert "CAESJDU1MGU4NDAw" not in out
+        assert out == "page_token=[REDACTED]"
 
     def test_redacts_private_key_blocks(self):
         """PEM private keys in multiline errors should never reach logs."""
@@ -576,8 +640,11 @@ class TestBudgetReservationConcurrency:
         # short-circuit — but cache hits don't even reach the loop
         # body's acquire, so we patch _check_budget too to isolate
         # the cache-path behaviour we're asserting.
-        with patch.object(client, "_get_cached_response",
-                          return_value="cached content"), \
+        with patch.object(
+            client,
+            "_get_cached_response",
+            return_value=("cached content", "gpt-5.2", "openai", None),
+        ), \
              patch.object(client, "_check_budget", return_value=True):
             response = client.generate(prompt="anything")
         # Cache hit returned the cached content with cost=0.
@@ -587,3 +654,23 @@ class TestBudgetReservationConcurrency:
         # moved the acquire above the cache check, this would
         # increase by _BUDGET_RESERVATION ($0.10).
         assert client.total_cost == 0.95
+
+
+class TestSanitizeUsesSharedRedactor:
+    """_sanitize_log_message guards the terminal give-up messages; it
+    must also apply the shared redact_secrets pattern set so pattern
+    additions there reach the highest-visibility message (the raised
+    RuntimeError text that propagates into reports)."""
+
+    def test_slack_token_redacted_via_shared_patterns(self):
+        # A Slack token shape only the shared redactor knows.
+        tok = "xoxb-123456789012-" + "a" * 24
+        result = _sanitize_log_message(f"upstream said: {tok}")
+        assert tok not in result
+        assert "[REDACTED" in result
+
+    def test_local_marker_preserved_for_api_keys(self):
+        key = "sk-proj-" + "a" * 48
+        result = _sanitize_log_message(f"Error with key {key}")
+        assert key not in result
+        assert "[REDACTED-API-KEY]" in result

@@ -10,7 +10,6 @@ from cve_diff.agent.source_classes import (
     has_verified,
     should_surrender_no_evidence,
     tried_classes,
-    untried_classes,
 )
 
 
@@ -84,20 +83,6 @@ def test_no_surrender_when_verification_called() -> None:
     """Verified candidate present → never surrender via this rule."""
     log = ["osv_raw", "gh_commit_detail", "http_fetch", "http_fetch"]
     assert should_surrender_no_evidence(log, 2.00) is False
-
-
-# ---------- untried_classes ----------
-
-def test_untried_classes_lists_remaining() -> None:
-    log = ["osv_raw", "nvd_raw"]
-    untried = untried_classes(log)
-    assert "github_search" in untried
-    assert "distro_trackers" in untried
-    assert "non_github_forge" in untried
-    assert "generic_http" in untried
-    assert "deterministic_hints" in untried
-    assert "osv" not in untried
-    assert "nvd" not in untried
 
 
 # ---------- catalog hygiene ----------

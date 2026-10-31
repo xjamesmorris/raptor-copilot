@@ -278,7 +278,14 @@ def _merged_signal_map(
 
 
 @lru_cache(maxsize=8)
-def _learned_vocab_cached(out_dir_str: str, target_str: str) -> Any:
+def _learned_vocab_cached(
+    out_dir_str: str, target_str: str, model_stamp: str | None,
+) -> Any:
+    # ``model_stamp`` is cache-key-only: the domain model grows
+    # mid-run via concept discovery, and a (dir, target)-only key
+    # served stale vocabulary to late-reviewed functions after the
+    # model changed on disk.
+    del model_stamp
     try:
         from core.coverage.journal import load_domain_model
 
@@ -292,18 +299,33 @@ def _learned_vocab_cached(out_dir_str: str, target_str: str) -> Any:
         return None
 
 
+def _domain_model_stamp(out_dir: Any) -> str | None:
+    """Content stamp of the run's domain-model.json (or None).
+
+    The same hash the AR-7 staleness gate uses — a changed model must
+    invalidate the vocab cache, not be served stale for the rest of
+    the run."""
+    try:
+        from core.coverage.journal import compute_domain_model_hash
+        return compute_domain_model_hash(Path(str(out_dir)))
+    except Exception:
+        logger.debug("domain model stamp failed", exc_info=True)
+        return None
+
+
 def learned_vocab(out_dir: Any, target_path: Any = None) -> Any:
     """Cached study-learned DomainVocabulary for a run (or None).
 
     Convenience for strategy-inference callers: loads the run's
-    domain model once per (out_dir, target) and merges the target-kind
-    checker pack. Best-effort — returns None when there is nothing to
-    load.
+    domain model once per (out_dir, target, model content stamp) and
+    merges the target-kind checker pack. Best-effort — returns None
+    when there is nothing to load.
     """
     if out_dir is None:
         return None
     vocab = _learned_vocab_cached(
         str(out_dir), str(target_path) if target_path else "",
+        _domain_model_stamp(out_dir),
     )
     if vocab is not None and not vocab.has_content:
         return None

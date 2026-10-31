@@ -457,10 +457,19 @@ class TestWrapperLiveE2E:
     # Documented host friction: some sandboxes block frida's
     # agent-injection channel. That is a host property, not a wrapper
     # regression — skip on its signature, fail on anything else.
+    # frida_memory_file_descriptor_from_bytes: the restricted-reads
+    # sandbox posture hard-denies memfd_create (fileless-exec
+    # hardening), and frida-core stages its agent through a memfd —
+    # the CLI aborts on the EPERM (GLib assertion n == data.length)
+    # before it can do anything. The sandboxed frida lane needs its
+    # own accommodation in the sandbox policy before this can run
+    # under that posture; until then it is the same blocked-injection
+    # class as the signatures above.
     _INJECTION_BLOCKED = (
         "Error sending credentials",
         "ProcessNotRespondingError",
         "unexpected early end-of-stream",
+        "frida_memory_file_descriptor_from_bytes",
     )
 
     def test_wrapper_spawn_relative_target(self, victim_binary, tmp_path):
@@ -482,18 +491,27 @@ class TestWrapperLiveE2E:
             capture_output=True, text=True, timeout=90, env=env,
         )
         combined = result.stdout + result.stderr
+        blocked = result.returncode != 0 and any(
+            sig in combined for sig in self._INJECTION_BLOCKED
+        )
 
         # Wrapper-side handling must have worked regardless of the
         # sandbox outcome: the target was absolutized and classified
-        # as a binary (metadata is written even for failed runs).
+        # as a binary (metadata is written even for failed runs) —
+        # EXCEPT when a blocked injection channel aborts the CLI
+        # process itself (the memfd signature) before it writes
+        # anything; a blocked host proves nothing about the wrapper.
         meta_path = run_dir / "metadata.json"
+        if blocked and not meta_path.is_file():
+            pytest.skip("sandbox blocks frida agent injection on "
+                        "this host (documented friction)")
         assert meta_path.is_file(), combined[-2000:]
         meta = json.loads(meta_path.read_text())
         assert meta["target"]["kind"] == "binary"
         assert meta["target"]["binary"] == str(victim_binary)
 
         if result.returncode != 0:
-            if any(sig in combined for sig in self._INJECTION_BLOCKED):
+            if blocked:
                 pytest.skip("sandbox blocks frida agent injection on "
                             "this host (documented friction)")
             raise AssertionError(

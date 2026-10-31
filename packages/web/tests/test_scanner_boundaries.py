@@ -396,6 +396,187 @@ class TestCrawlerWorkQueue(unittest.TestCase):
         self.assertEqual(fetches.count("http://t.example/page"), 1)
 
 
+class TestCrawlerFormDedup(unittest.TestCase):
+    """A site-wide repeated form is ONE fuzz target; distinct forms
+    (different action, method, or field set) all survive."""
+
+    NAV_FORM = (
+        '<form action="/search" method="get">'
+        '<input name="q" type="text"/></form>'
+    )
+
+    def _crawler(self):
+        from packages.web.crawler import WebCrawler
+
+        client = MagicMock()
+        client.reveal_secrets = False
+        client.base_url = "http://t.example"
+        client._is_in_scope.return_value = True
+        return WebCrawler(client, max_depth=2, max_pages=10), client
+
+    def _serve(self, client, pages):
+        def get(url, **kw):
+            body = pages.get(url, "<html></html>")
+            return SimpleNamespace(
+                status_code=200, headers={"Content-Type": "text/html"},
+                content=body.encode(), text=body,
+            )
+
+        client.get.side_effect = get
+
+    def test_repeated_nav_form_is_recorded_once(self):
+        crawler, client = self._crawler()
+        login = (
+            '<form action="/login" method="post">'
+            '<input name="user"/><input name="pass" type="password"/></form>'
+        )
+        self._serve(client, {
+            "http://t.example/": (
+                f'<html><a href="/a">a</a><a href="/b">b</a>'
+                f"{self.NAV_FORM}</html>"
+            ),
+            "http://t.example/a": f"<html>{self.NAV_FORM}</html>",
+            "http://t.example/b": f"<html>{self.NAV_FORM}{login}</html>",
+        })
+        crawler.crawl("http://t.example/")
+        actions = [f["action"] for f in crawler.discovered_forms]
+        self.assertEqual(actions.count("http://t.example/search"), 1)
+        self.assertIn("http://t.example/login", actions)
+        self.assertEqual(len(crawler.discovered_forms), 2)
+        # Duplicate copies still contribute their parameter names.
+        self.assertIn("q", crawler.discovered_parameters)
+
+    def test_hidden_value_discriminants_survive_as_distinct_forms(self):
+        """Two forms whose ONLY difference is a hidden routing value
+        (mode=delete vs mode=upload) reach different handlers — both
+        must be fuzzed."""
+        crawler, client = self._crawler()
+
+        def op_form(mode):
+            return (
+                '<form action="/op" method="post">'
+                f'<input type="hidden" name="mode" value="{mode}"/>'
+                '<input name="target"/></form>'
+            )
+
+        self._serve(client, {
+            "http://t.example/": (
+                f'<html><a href="/a">a</a>{op_form("delete")}</html>'
+            ),
+            "http://t.example/a": f"<html>{op_form('upload')}</html>",
+        })
+        crawler.crawl("http://t.example/")
+        modes = sorted(
+            f["inputs"]["mode"]["value"] for f in crawler.discovered_forms
+        )
+        self.assertEqual(modes, ["delete", "upload"])
+
+    def test_twenty_identical_nav_forms_still_collapse_to_one(self):
+        from packages.web.crawler import WebCrawler
+
+        client = MagicMock()
+        client.reveal_secrets = False
+        client.base_url = "http://t.example"
+        client._is_in_scope.return_value = True
+        crawler = WebCrawler(client, max_depth=2, max_pages=30)
+        links = "".join(f'<a href="/p{i}">p</a>' for i in range(20))
+        pages = {
+            f"http://t.example/p{i}": f"<html>{self.NAV_FORM}</html>"
+            for i in range(20)
+        }
+        pages["http://t.example/"] = f"<html>{links}{self.NAV_FORM}</html>"
+        self._serve(client, pages)
+        crawler.crawl("http://t.example/")
+        self.assertEqual(len(crawler.discovered_forms), 1)
+
+    def test_rotating_csrf_hidden_value_does_not_defeat_dedup(self):
+        """Anti-forgery hidden values rotate per page; keying on them
+        would reopen the budget exhaustion on the exact site-wide
+        CSRF-protected form the dedup exists for."""
+        crawler, client = self._crawler()
+
+        def csrf_form(token):
+            return (
+                '<form action="/search" method="post">'
+                f'<input type="hidden" name="csrf" value="{token}"/>'
+                '<input name="q"/></form>'
+            )
+
+        self._serve(client, {
+            "http://t.example/": (
+                f'<html><a href="/a">a</a>{csrf_form("tok-page-1")}</html>'
+            ),
+            "http://t.example/a": f"<html>{csrf_form('tok-page-2')}</html>",
+        })
+        crawler.crawl("http://t.example/")
+        self.assertEqual(len(crawler.discovered_forms), 1)
+
+    def test_same_action_different_shape_is_not_collapsed(self):
+        crawler, client = self._crawler()
+        self._serve(client, {
+            "http://t.example/": (
+                '<html><a href="/a">a</a>'
+                '<form action="/api" method="get">'
+                '<input name="q"/></form></html>'
+            ),
+            "http://t.example/a": (
+                '<html><form action="/api" method="post">'
+                '<input name="q"/></form>'
+                '<form action="/api" method="get">'
+                '<input name="filter"/></form></html>'
+            ),
+        })
+        crawler.crawl("http://t.example/")
+        self.assertEqual(len(crawler.discovered_forms), 3)
+
+
+class TestFormBudgetAppliesToDistinctForms(unittest.TestCase):
+    """Both directions of the Phase 6 form budget: it still caps the
+    number of DISTINCT forms fuzzed, and (with crawler dedup) a distinct
+    form is never displaced by duplicates of another."""
+
+    @staticmethod
+    def _form(i):
+        return {
+            "action": f"http://example.com/f{i}", "method": "POST",
+            "inputs": {"q": {"type": "text", "value": "x"}},
+            "page_url": "http://example.com/",
+        }
+
+    def _fuzzed_form_endpoints(self, forms):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scanner = _make_scanner(tmpdir)
+            scanner.execution_policy = MagicMock()
+            scanner.fuzzer = MagicMock()
+            scanner.fuzzer.fuzz_parameter.return_value = []
+            scanner.fuzzer.payload_cache_stats = (0, 0)
+            crawl_data = {
+                "discovered_urls": [], "visited_urls": [],
+                "discovered_parameters": [], "discovered_forms": forms,
+            }
+            scanner._phase_injection(crawl_data)
+            return {
+                c.args[0]
+                for c in scanner.fuzzer.fuzz_parameter.call_args_list
+                if c.args[0].startswith("http://example.com/f")
+            }
+
+    def test_budget_caps_distinct_forms(self):
+        endpoints = self._fuzzed_form_endpoints(
+            [self._form(i) for i in range(7)],
+        )
+        self.assertEqual(len(endpoints), 5)
+
+    def test_all_distinct_forms_within_budget_are_fuzzed(self):
+        endpoints = self._fuzzed_form_endpoints(
+            [self._form(i) for i in range(3)],
+        )
+        self.assertEqual(
+            endpoints,
+            {f"http://example.com/f{i}" for i in range(3)},
+        )
+
+
 class TestFuzzerRequestShapes(unittest.TestCase):
     def test_post_fuzz_carries_sibling_form_fields(self):
         from packages.web.client import WebClient
@@ -490,6 +671,254 @@ class TestThreeGateVetoes(unittest.TestCase):
         )
         self.assertIsNotNone(finding)
         self.assertEqual(finding["oracle_signal"], "xss_reflected_unescaped")
+
+
+class _RecordingCheck:
+    """Records which client each run() call received."""
+
+    check_id = "V0.0.9"
+    risk = "passive"
+    __name__ = "RecordingCheck"
+    seen_clients: list = []
+
+    def __init__(self, llm=None):
+        pass
+
+    def run(self, client, *args, **kwargs):
+        type(self).seen_clients.append(client)
+        return []
+
+
+class TestPhase4AuthContextIsolation(unittest.TestCase):
+    """Unauthenticated checks must not probe through (or clobber) the
+    authenticated scan session."""
+
+    def _run_passive(self, scanner):
+        _RecordingCheck.seen_clients = []
+        discovery = _discovery_mock()
+        with patch(
+            "packages.web.checks.registry.unauthenticated",
+            return_value=[_RecordingCheck],
+        ):
+            scanner.execution_policy = MagicMock()
+            scanner._phase_passive_checks(discovery, {})
+        return _RecordingCheck.seen_clients
+
+    def test_authenticated_scan_probes_through_fresh_client(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scanner = _make_scanner(tmpdir)
+            scanner.session = SimpleNamespace(authenticated=True, mode="form")
+            fresh = MagicMock()
+            fresh.transport_errors = 0
+            with patch.object(
+                scanner, "_make_principal_client", return_value=fresh,
+            ) as make_client:
+                seen = self._run_passive(scanner)
+            make_client.assert_called_once_with()
+            self.assertEqual(seen, [fresh])
+            self.assertNotIn(scanner.client, seen)
+            fresh.close.assert_called_once_with()
+
+    def test_unauthenticated_scan_also_probes_through_fresh_client(self):
+        """The isolation is unconditional: on unauthenticated scans the
+        login-probing checks can GRANT a session (a default-credential
+        success drops the admin cookie into whatever jar they probe
+        through), and nothing removes it — the rest of the scan would
+        silently run as the discovered admin while findings stay
+        stamped unauthenticated."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scanner = _make_scanner(tmpdir)
+            self.assertIsNone(scanner.session)
+            fresh = MagicMock()
+            fresh.transport_errors = 0
+            with patch.object(
+                scanner, "_make_principal_client", return_value=fresh,
+            ) as make_client:
+                seen = self._run_passive(scanner)
+            make_client.assert_called_once_with()
+            self.assertEqual(seen, [fresh])
+            self.assertNotIn(scanner.client, seen)
+            fresh.close.assert_called_once_with()
+
+    def test_granted_login_cookie_never_reaches_the_shared_jar(self):
+        """A check that wins a login stamps its cookie only on the
+        phase-scoped client; the shared scan client's jar (what phases
+        6/6v/6o ride) stays principal-free."""
+
+        class _LoginWinningCheck(_RecordingCheck):
+            __name__ = "LoginWinningCheck"
+
+            def run(self, client, *args, **kwargs):
+                type(self).seen_clients.append(client)
+                client.cookies["session"] = "admintok"
+                return []
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scanner = _make_scanner(tmpdir)
+            self.assertIsNone(scanner.session)
+            scanner.client.cookies = {}
+            fresh = MagicMock()
+            fresh.transport_errors = 0
+            fresh.cookies = {}
+            _LoginWinningCheck.seen_clients = []
+            discovery = _discovery_mock()
+            with patch(
+                "packages.web.checks.registry.unauthenticated",
+                return_value=[_LoginWinningCheck],
+            ), patch.object(
+                scanner, "_make_principal_client", return_value=fresh,
+            ):
+                scanner.execution_policy = MagicMock()
+                scanner._phase_passive_checks(discovery, {})
+            self.assertEqual(fresh.cookies, {"session": "admintok"})
+            self.assertEqual(scanner.client.cookies, {})
+
+
+class TestPhase5SessionIntegrity(unittest.TestCase):
+    """A dead session before Phase 5 gets one loud re-auth attempt; a
+    failed re-auth skips the tier loudly instead of silently."""
+
+    def _run_auth_checks(self, scanner):
+        _RecordingCheck.seen_clients = []
+        discovery = _discovery_mock()
+        with patch(
+            "packages.web.checks.registry.authenticated",
+            return_value=[_RecordingCheck],
+        ):
+            scanner.execution_policy = MagicMock()
+            return scanner._phase_auth_checks(discovery, {})
+
+    def test_expired_session_reauths_and_proceeds(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scanner = _make_scanner(tmpdir)
+            scanner.client.transport_errors = 0
+            old = SimpleNamespace(authenticated=True, mode="form")
+            renewed = SimpleNamespace(authenticated=True, mode="form")
+            scanner.session = old
+            scanner.auth_manager = MagicMock()
+            scanner.auth_manager.verify.return_value = False
+            scanner.auth_manager.authenticate.return_value = renewed
+            with self.assertLogs("raptor", level="WARNING") as captured:
+                self._run_auth_checks(scanner)
+            scanner.auth_manager.authenticate.assert_called_once_with(
+                scanner.client,
+            )
+            self.assertIs(scanner.session, renewed)
+            self.assertEqual(_RecordingCheck.seen_clients, [scanner.client])
+            self.assertIn("re-authenticating", "\n".join(captured.output))
+
+    def test_failed_reauth_skips_tier_loudly(self):
+        from packages.web.auth import AuthenticationError
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scanner = _make_scanner(tmpdir)
+            scanner.session = SimpleNamespace(authenticated=True, mode="form")
+            scanner.auth_manager = MagicMock()
+            scanner.auth_manager.verify.return_value = False
+            scanner.auth_manager.authenticate.side_effect = (
+                AuthenticationError("still dead")
+            )
+            with self.assertLogs("raptor", level="WARNING") as captured:
+                findings = self._run_auth_checks(scanner)
+            self.assertEqual(findings, [])
+            self.assertIsNone(scanner.session)
+            self.assertEqual(_RecordingCheck.seen_clients, [])
+            joined = "\n".join(captured.output)
+            self.assertIn("skipping ALL authenticated checks", joined)
+
+
+class TestValidatePostpassFailureSurfacing(unittest.TestCase):
+    def test_validate_crash_is_loud_and_recorded(self):
+        """The operator opted into --validate; its crash must show at
+        default log level and in the report's phase list, not DEBUG."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scanner = _make_scanner(tmpdir)
+            finding = _oracle_finding(status="needs_review")
+            with patch(
+                "core.security.rule_of_two.is_interactive",
+                return_value=True,
+            ), patch(
+                "shutil.which", return_value="/usr/bin/claude",
+            ), patch(
+                "core.orchestration.agentic_passes.run_validate_postpass",
+                side_effect=RuntimeError("stage runner crashed"),
+            ), self.assertLogs("raptor", level="WARNING") as captured:
+                result = scanner._phase_validate([finding])
+            self.assertEqual(result, [finding])
+            self.assertIn("validate_failed", scanner._phases_completed)
+            self.assertNotIn("validate", set(scanner._phases_completed) - {"validate_failed"})
+            self.assertIn("/validate failed", "\n".join(captured.output))
+
+
+class TestPreflightSchemeUpgradeGuidance(unittest.TestCase):
+    """An http target that 301s to its own https origin must produce an
+    actionable error naming that origin, not a generic unreachable."""
+
+    def _scan_with_blocked_redirect(self, next_url):
+        from packages.web.client import ScopeRedirectBlockedError
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scanner = _make_scanner(tmpdir)
+            scanner.client.get.side_effect = ScopeRedirectBlockedError(
+                f"Blocked redirect outside configured target scope: {next_url}",
+                next_url,
+            )
+            return scanner.scan()
+
+    def test_same_host_https_upgrade_names_the_https_origin(self):
+        result = self._scan_with_blocked_redirect("https://example.com/")
+        self.assertIn("https://example.com/", result["error"])
+        self.assertIn("re-run the scan", result["error"])
+        self.assertEqual(result["findings"], [])
+
+    def test_off_host_redirect_keeps_generic_unreachable(self):
+        result = self._scan_with_blocked_redirect("https://other.example/")
+        self.assertEqual(
+            result["error"], "Preflight failed -- target unreachable",
+        )
+
+
+class TestVerificationCarriesSiblingFields(unittest.TestCase):
+    def test_verify_findings_passes_hit_base_data_to_oracle(self):
+        """Phase 6v must replay the full detection-time field set —
+        a bare {param: payload} replay fails multi-field/CSRF form
+        validation and demotes every such hit to inconclusive."""
+        from packages.web.oracle import VerificationResult
+
+        seen: dict[str, object] = {}
+
+        class _RecordingOracle:
+            def __init__(self, client):
+                self.requests_used = 0
+                self.errors = 0
+
+            def verify(self, url, param, payload, vuln_type,
+                       method="GET", base_data=None):
+                seen["base_data"] = base_data
+                return VerificationResult(
+                    status="inconclusive", evidence_type="sqli_error",
+                )
+
+        hit = {
+            "endpoint": "http://example.com/form",
+            "parameter": "q",
+            "payload": "' OR 1=1--",
+            "vulnerability_type": "sqli",
+            "method": "POST",
+            "attack_vector": "request_body",
+            "base_data": {"csrf": "tok123", "email": "a@b.invalid"},
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scanner = _make_scanner(tmpdir)
+            with patch(
+                "packages.web.oracle.VerificationOracle", _RecordingOracle,
+            ):
+                scanner._verify_findings(
+                    [(hit, hit["endpoint"], "q", "POST")],
+                )
+        self.assertEqual(
+            seen["base_data"], {"csrf": "tok123", "email": "a@b.invalid"},
+        )
 
 
 if __name__ == "__main__":

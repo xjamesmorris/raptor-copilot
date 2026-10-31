@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 
 import pytest
 
@@ -40,10 +39,10 @@ from core.sandbox.context import run_trusted, run_untrusted, sandbox
 from core.sandbox.errors import SandboxSetupError
 from core.sandbox.tests.capability import requires_landlock, requires_userns
 
-linux_only = pytest.mark.skipif(
-    sys.platform != "linux",
-    reason="degradation-ladder paths are Linux-backend specific",
-)
+# degradation-ladder paths are Linux-backend specific
+# Real-Linux-kernel binding: these tests carry the linux_native
+# marker (pytest.ini) instead of an ad hoc skipif — honest skip on
+# other native platforms, deselected under the darwin-emulation gate.
 
 MARKER = "sandbox-audit-degraded.json"
 
@@ -138,7 +137,7 @@ class TestEntryValidation:
         assert res.returncode == 0
 
 
-@linux_only
+@pytest.mark.linux_native
 class TestVanishedMidRun:
     """Layer 2: audit dir vanishing after entry validation fails loud."""
 
@@ -202,7 +201,7 @@ class TestVanishedMidRun:
 
 
 @requires_landlock
-@linux_only
+@pytest.mark.linux_native
 class TestEvidenceBottleneck:
     """Layer 3: audit requested but no tier engaged."""
 
@@ -311,12 +310,17 @@ class TestKwargSurface:
         # degraded-host guard (whatever its current shape) is a no-op
         # and the call reaches the forwarding under test.
         monkeypatch.setattr(ctx, "check_net_available", lambda: True)
+        # The darwin arm of run_untrusted's entry gate smoke-tests the
+        # REAL host's sandbox-exec; pretend it holds so the plumbing
+        # under test is reached on every platform (including
+        # emulated-darwin runs — the gate itself has its own tests).
+        monkeypatch.setattr(ctx, "check_seatbelt_available", lambda: True)
         run_untrusted(["true"], output="/tmp", audit=True,
                       audit_required=True)
         assert captured.get("audit_required") is True
 
 
-@linux_only
+@pytest.mark.linux_native
 class TestSpawnTierFailClosed:
     """audit_required threads into _spawn's in-spawn degrade sites
     (F063a/b/c) — the raise happens before the fork."""

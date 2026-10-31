@@ -5,8 +5,33 @@ Single source of truth, consumed two ways:
   * run-matrix.sh:   python3 profiles/lanes.py args <lane> --profiles DIR
                      -> newline-separated docker run arguments
   * bin/report.py:   imports LANES and compares each lane's probed
-                     shape against `expect` (None = record-only lane,
-                     no divergence check — "probe, don't assume").
+                     shape against the two expectation tiers:
+                       expect      — features the lane's own
+                                     configuration FORCES (seccomp
+                                     fakes, denials) plus the harness's
+                                     host floor. A mismatch means the
+                                     lane didn't apply -> the cell is
+                                     SHAPE-DIVERGED and the run fails.
+                       expect_env  — environment-conditioned features
+                                     with their NOMINAL values. A
+                                     mismatch is a real host shape, not
+                                     a harness bug: the cell
+                                     self-classifies as
+                                     degraded(<features>) and the run
+                                     does NOT fail on shape (test
+                                     failures still gate). GitHub
+                                     runners land here: Ubuntu's
+                                     apparmor_restrict_unprivileged_userns
+                                     leaves userns creation working but
+                                     denies mount capability inside, so
+                                     the full lane probes
+                                     UNS=ok MNT=fail — previously
+                                     stamped "as-intended" by a
+                                     host-conditioned expectation,
+                                     burying the divergence the table
+                                     itself printed.
+                     expect=None with no expect_env = record-only lane
+                     ("probe, don't assume").
 
 Design notes
 ------------
@@ -39,21 +64,9 @@ the probe records what it actually blocks.
 import argparse
 import sys
 
-LANE_ORDER = ["full", "default", "no-landlock", "no-userns", "no-both"]
-
-
-def _host_blocks_mount_in_userns() -> bool:
-    """The host kernel's apparmor_restrict_unprivileged_userns sysctl is
-    kernel-wide — Docker --privileged cannot override it. When set,
-    mount/proc/pivot inside a user namespace fail even with full caps."""
-    try:
-        with open("/proc/sys/kernel/apparmor_restrict_unprivileged_userns") as f:
-            return f.read().strip() == "1"
-    except OSError:
-        return False
-
-
-_MNT = "fail" if _host_blocks_mount_in_userns() else "ok"
+LANE_ORDER = ["full", "default", "no-landlock", "no-mount",
+              "restricted-userns", "no-mount-nonet", "no-userns",
+              "no-both"]
 
 _COMMON = [
     "--security-opt", "apparmor=unconfined",
@@ -62,12 +75,33 @@ _COMMON = [
     "-e", "SXV_UNMASK=1",
 ]
 
+# Mount-capability features are environment-conditioned on lanes that
+# don't force them: the host's apparmor_restrict_unprivileged_userns
+# sysctl is kernel-wide (docker --privileged cannot override it), so a
+# feature-complete lane on a restricted host probes MNT=fail without
+# any harness bug. Nominal (feature-complete) values:
+_ENV_MOUNT_NOMINAL = {"mount_in_userns": "ok",
+                      "proc_mount_in_userns": "ok",
+                      "pivot_root_in_userns": "ok"}
+
+# Tests that must appear PASSED — not skipped, not absent — in a
+# lane's junit (report.py gates on it like a divergence). These are
+# the binding guards of inverse-gated live coverage: a test module
+# that runs ONLY where a kernel feature is genuinely denied cannot
+# defend itself against being skipped wholesale (a module-level gate
+# skips its own in-file guard too), so the lane that exists to bind
+# it asserts the guard ran and passed. Applied to every lane whose
+# seccomp profile forces the namespace backend away; the `default`
+# lane stays record-only by design ("probe, don't assume").
+_EXPECT_BOUND_DENIED_NS = [
+    "test_denied_matrix_lanes_bind_this_module",
+]
+
 LANES: dict[str, dict[str, object]] = {
     "full": {
         "docker_args": ["--privileged"],
-        "expect": {"landlock": "present", "userns": "ok",
-                   "mount_in_userns": _MNT, "proc_mount_in_userns": _MNT,
-                   "pivot_root_in_userns": _MNT, "seccomp": "ok"},
+        "expect": {"landlock": "present", "userns": "ok", "seccomp": "ok"},
+        "expect_env": dict(_ENV_MOUNT_NOMINAL),
         "intent": "namespaces AND Landlock available",
     },
     "default": {
@@ -83,10 +117,63 @@ LANES: dict[str, dict[str, object]] = {
                         "--security-opt", "apparmor=unconfined",
                         "--cap-add", "ALL",
                         "--user", "root", "-e", "SXV_UNMASK=1"],
-        "expect": {"landlock": "enosys", "userns": "ok",
-                   "mount_in_userns": _MNT, "proc_mount_in_userns": _MNT,
-                   "pivot_root_in_userns": _MNT, "seccomp": "ok"},
+        "expect": {"landlock": "enosys", "userns": "ok", "seccomp": "ok"},
+        "expect_env": dict(_ENV_MOUNT_NOMINAL),
         "intent": "pre-5.13-kernel fake: namespaces yes, Landlock ENOSYS",
+    },
+    # Mount-capability-denied lanes, made permanent the day a GitHub
+    # runner proved the population exists (userns creation worked, every
+    # mount inside was denied — Ubuntu's restricted-userns AppArmor
+    # transition). Three variants because the real populations diverge
+    # in what the capability guards see:
+    #   no-mount           mount OPERATIONS denied, all namespace
+    #                      creation works — outer-container-seccomp
+    #                      shape; userns probe True, engagement probe
+    #                      True; tests gate on the MOUNT probe.
+    #   restricted-userns  no-mount plus the STAGED pid-ns creation
+    #                      denial — the shape live-confirmed on the
+    #                      GitHub runner (see make_profiles.py):
+    #                      userns/net probes True but the spawn
+    #                      backend's engagement probe goes False, so
+    #                      namespace-backed runs refuse loudly and
+    #                      backend-premised tests skip via
+    #                      requires_ns_backend.
+    #   no-mount-nonet     additionally denies netns creation — kept
+    #                      for lattice coverage of the
+    #                      userns-probe-False path (first modelled as
+    #                      the runner shape; superseded by
+    #                      restricted-userns when live artifacts
+    #                      arrived).
+    # All features forced by the seccomp profile — static expectations,
+    # no env tier.
+    "no-mount": {
+        "docker_args": ["--security-opt", "seccomp=@PROFILES@/no-mount.json",
+                        *_COMMON],
+        "expect": {"landlock": "present", "userns": "ok",
+                   "mount_in_userns": "fail", "proc_mount_in_userns": "fail",
+                   "pivot_root_in_userns": "fail", "seccomp": "ok"},
+        "intent": "namespaces ok, mount operations denied (outer seccomp)",
+    },
+    "restricted-userns": {
+        "docker_args": ["--security-opt",
+                        "seccomp=@PROFILES@/restricted-userns.json",
+                        *_COMMON],
+        "expect": {"landlock": "present", "userns": "ok",
+                   "mount_in_userns": "fail", "proc_mount_in_userns": "fail",
+                   "pivot_root_in_userns": "fail", "seccomp": "ok"},
+        "expect_bound": _EXPECT_BOUND_DENIED_NS,
+        "intent": ("mount ops + staged pid-ns creation denied "
+                   "(GitHub-runner shape, live-confirmed)"),
+    },
+    "no-mount-nonet": {
+        "docker_args": ["--security-opt",
+                        "seccomp=@PROFILES@/no-mount-nonet.json",
+                        *_COMMON],
+        "expect": {"landlock": "present", "userns": "ok",
+                   "mount_in_userns": "fail", "proc_mount_in_userns": "fail",
+                   "pivot_root_in_userns": "fail", "seccomp": "ok"},
+        "expect_bound": _EXPECT_BOUND_DENIED_NS,
+        "intent": "mount ops + netns creation denied (userns-probe-False)",
     },
     "no-userns": {
         "docker_args": ["--security-opt", "seccomp=@PROFILES@/no-userns.json",
@@ -94,6 +181,7 @@ LANES: dict[str, dict[str, object]] = {
         "expect": {"landlock": "present", "userns": "denied",
                    "mount_in_userns": "fail", "proc_mount_in_userns": "fail",
                    "pivot_root_in_userns": "fail", "seccomp": "ok"},
+        "expect_bound": _EXPECT_BOUND_DENIED_NS,
         "intent": "userns denied (EPERM), Landlock present",
     },
     "no-both": {
@@ -102,6 +190,7 @@ LANES: dict[str, dict[str, object]] = {
         "expect": {"landlock": "enosys", "userns": "denied",
                    "mount_in_userns": "fail", "proc_mount_in_userns": "fail",
                    "pivot_root_in_userns": "fail", "seccomp": "ok"},
+        "expect_bound": _EXPECT_BOUND_DENIED_NS,
         "intent": "no namespaces, no Landlock",
     },
 }

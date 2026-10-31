@@ -16,6 +16,19 @@ DB build.
 
 Constraints persist across runs with freshness checks (same staleness
 model as annotations).
+
+Consumption contract: the orchestrator consumes ``resolution ==
+"refuted"`` (closes the constraint) and ``resolution ==
+"depth_limited"`` (marks the constraint and records the depth
+reached).  ``resolution == "confirmed"`` is counted in tier telemetry
+and carried on the result (including any ``finding`` payload) but
+deliberately does NOT change any constraint or review-outcome status:
+minting or promoting a finding from a propagation confirmation would
+be a new verdict-flip path outside the existing tool-verdict
+chokepoints, so the confirmed signal stays evidence-only until such a
+chokepoint consumes it.  ``callers_scheduled`` (heuristic tier) is
+likewise advisory: no resolver derives child constraints, so an
+unresolved hop ends propagation for that constraint.
 """
 
 from __future__ import annotations
@@ -32,6 +45,11 @@ from ._util import (
     find_function_lines,
     safe_join,
 )
+from core.source import read_text_capped
+
+from .diagnostics import warn_unknown_tier
+from .run_memo import BoundedMemo
+from core.source.lines import split_lines
 
 if TYPE_CHECKING:
     from .constraints import Constraint
@@ -42,20 +60,36 @@ DEFAULT_MAX_DEPTH = 5
 DEFAULT_MAX_CALLERS_PER_HOP = 10
 _MAX_SOURCE_BYTES = 2 * 1024 * 1024  # 2 MB cap for heuristic source reads
 
+# Caller-source memo size.  Each entry holds one source file's text
+# (<= _MAX_SOURCE_BYTES), so 32 bounds worst-case memory at ~64 MB.
+# Larger would help constraint sets whose callers span more than 32
+# files per round at the cost of proportionally more resident text;
+# smaller re-pays file reads on wide caller fan-outs (the repeated
+# per-caller-per-constraint read this memo exists to collapse).
+_SOURCE_MEMO_MAX_ENTRIES = 32
+
+# The condition spans are bounded: unbounded, every "if(" planted
+# inside a span makes each occurrence re-scan the rest of the hostile
+# caller source — worse than quadratic with two spans. Real
+# conditions sit far inside 160 chars per span; beyond the bound the
+# check simply does not count as a bounds check.
 _BOUNDS_CHECK_RE = re.compile(
     r"""
     (?:if|while|assert|CHECK|DCHECK|BUG_ON|WARN_ON)
     \s*\(
-    [^)]*
+    [^)]{0,160}
     (?:<=?|>=?|==|!=|<|>)
-    [^)]*
+    [^)]{0,160}
     \)
     """,
     re.VERBOSE,
 )
 
+# The test-stem run is bounded: unbounded, every "test_" planted
+# inside one hostile path component re-scans the component's
+# remainder — quadratic. Path components sit far inside 250 chars.
 _TEST_PATH_RE = re.compile(
-    r"(?:^|/)(?:test|tests|testing|__tests__|spec|specs)/|_test\.\w+$|test_\w+\.\w+$",
+    r"(?:^|/)(?:test|tests|testing|__tests__|spec|specs)/|_test\.\w+$|test_\w{1,250}\.\w{1,64}$",
 )
 
 
@@ -77,8 +111,11 @@ class PropagationResult:
     """Result of propagating one constraint one hop."""
 
     constraint: Constraint
+    # resolved=True marks a terminal disposition for this hop
+    # ("confirmed" | "refuted" | "depth_limited"); resolved=False is a
+    # passthrough ("inconclusive" or heuristic caller scheduling).
     resolved: bool = False
-    resolution: str = ""          # "confirmed" | "refuted" | "depth_limited"
+    resolution: str = ""          # "confirmed" | "refuted" | "depth_limited" | "inconclusive"
     resolver_used: str = ""       # "codeql" | "coccinelle" | "semgrep" | "heuristic" | "llm"
     callers_scheduled: list[CallerCandidate] = field(default_factory=list)
     finding: dict[str, Any] | None = None
@@ -117,6 +154,12 @@ class PropagationConfig:
     # (P23). None = tier disabled; the orchestrator threads its
     # already-running server in, this module never starts one.
     joern_server: Any | None = None
+    # Caller-source text memo shared across every hop this config
+    # serves: score_caller reads each caller's file once per
+    # (mtime, size) stamp instead of once per caller-per-constraint.
+    source_memo: BoundedMemo[str] = field(
+        default_factory=lambda: BoundedMemo(_SOURCE_MEMO_MAX_ENTRIES),
+    )
 
 
 def score_caller(
@@ -129,6 +172,7 @@ def score_caller(
     checklist: dict[str, Any] | None = None,
     target_path: Path | None = None,
     inventory: dict[str, Any] | None = None,
+    source_memo: BoundedMemo[str] | None = None,
 ) -> CallerCandidate:
     """Score a caller by likelihood of violating a constraint.
 
@@ -162,9 +206,38 @@ def score_caller(
         source_file = safe_join(target_path, caller_file)
         if source_file and source_file.exists():
             try:
-                size = source_file.stat().st_size
-                if size <= _MAX_SOURCE_BYTES:
-                    source = source_file.read_text(errors="replace")
+                st = source_file.stat()
+                if st.st_size <= _MAX_SOURCE_BYTES:
+                    # The stat feeds only the memo key; the read is
+                    # capped on the fd, so a file that grows past
+                    # the by-name gate cannot be buffered unbounded
+                    # and a FIFO plant refuses instead of blocking.
+                    # A refused read RAISES (caught by the enclosing
+                    # OSError handler, like the raw read it replaced)
+                    # so a transient failure is never memoised as ""
+                    # for the file's whole (mtime, size) lifetime.
+                    def _read_capped() -> str:
+                        got = read_text_capped(
+                            source_file, _MAX_SOURCE_BYTES,
+                        )
+                        if got is None:
+                            msg = (
+                                "unreadable or non-regular: "
+                                f"{source_file}"
+                            )
+                            raise OSError(msg)
+                        return got[0]
+
+                    if source_memo is not None:
+                        # (mtime, size)-stamped key: a file edited
+                        # mid-run re-reads rather than serving stale
+                        # text.
+                        source, _ = source_memo.get_or_compute(
+                            (str(source_file), st.st_mtime_ns, st.st_size),
+                            _read_capped,
+                        )
+                    else:
+                        source = _read_capped()
                     # Scope to the caller function body so we don't
                     # attribute evidence from unrelated functions in the
                     # same file.
@@ -199,7 +272,9 @@ def _scope_to_function(
     caller_line with a heuristic end boundary.  Returns the full source
     unchanged if scoping fails entirely.
     """
-    lines = source.splitlines(keepends=True)
+    # \n-model split (core.source.lines contract): the scoping line
+    # numbers come from the checklist/inventory, which count \n.
+    lines = split_lines(source)
     start = 0
     end = len(lines)
 
@@ -217,7 +292,7 @@ def _scope_to_function(
     if start == 0 and end == len(lines):
         return source
 
-    return "".join(lines[start:end])
+    return "\n".join(lines[start:end])
 
 
 def _score_from_source(
@@ -233,8 +308,9 @@ def _score_from_source(
     if not call_pattern.search(source):
         return
 
+    # Bounded argument span (same rationale as _BOUNDS_CHECK_RE).
     has_literal = re.search(
-        rf"{re.escape(constraint.function)}\s*\([^)]*\b\d+\b",
+        rf"{re.escape(constraint.function)}\s*\([^)]{{0,400}}\b\d+\b",
         source,
     )
     if has_literal:
@@ -505,10 +581,10 @@ def try_coccinelle_resolve(
     parametric: list[Path] = []
     batchable: list[Path] = []
     for rp in rule_paths:
-        try:
-            head = rp.read_text()[:4096]
-        except OSError:
+        got = read_text_capped(rp, 4096)
+        if got is None:
             continue
+        head = got[0]
         if _PARAMETRIC_RE.search(head):
             parametric.append(rp)
         else:
@@ -529,7 +605,7 @@ def try_coccinelle_resolve(
         defines = {"func": constraint.function} if constraint.function else {}
         sr = run_rule(
             config.target_path,
-            str(rp),
+            rp,
             defines=defines,
             timeout=300,
             # In-repo engine/coccinelle rules (code trust).
@@ -550,11 +626,17 @@ def try_coccinelle_resolve(
                 ) for m in result.matches if m.file)
 
     if all_callers:
+        # Same per-hop discipline as the heuristic tier: spatch can
+        # match every call site in the tree, and an uncapped schedule
+        # would bypass the max_callers_per_hop budget every other
+        # resolver honours.
         return PropagationResult(
             constraint=constraint,
             resolved=False,
             resolver_used="coccinelle",
-            callers_scheduled=all_callers,
+            callers_scheduled=rank_callers(
+                all_callers, max_callers=config.max_callers_per_hop,
+            ),
         )
 
     return None
@@ -860,14 +942,22 @@ def _tick_tier(
     result: PropagationResult,
 ) -> None:
     """Increment a tier counter based on propagation result."""
-    if tier_counters is None or tier not in tier_counters:
+    if tier_counters is None:
+        # Telemetry is off for this call — nothing to book, nothing
+        # to warn about.
+        return
+    if tier not in tier_counters:
+        warn_unknown_tier(tier)
         return
     tc = tier_counters[tier]
     if result.resolved and result.resolution == "confirmed":
         tc.confirmed += 1
-    elif result.resolved:
+    elif result.resolved and result.resolution == "refuted":
         tc.refuted += 1
     else:
+        # Passthroughs and depth-limited results are inconclusive for
+        # tier telemetry — depth limiting is terminal but proves
+        # nothing about the constraint either way.
         tc.inconclusive += 1
 
 
@@ -911,9 +1001,15 @@ def propagate_one_hop(
         probe = probe_beyond_ceiling(
             constraint, ceiling_callers, config.inventory, entry_points,
         )
+        # resolved=True: depth limiting is a terminal disposition for
+        # this hop.  The consumer keys the constraint's depth_limited
+        # status transition off ``resolved and resolution ==
+        # "depth_limited"`` — an unresolved-shaped result is
+        # indistinguishable from a heuristic passthrough and the
+        # depth signal would never land.
         return PropagationResult(
             constraint=constraint,
-            resolved=False,
+            resolved=True,
             resolution="depth_limited",
             depth_probe=probe,
         )
@@ -983,6 +1079,7 @@ def propagate_one_hop(
             checklist=checklist,
             target_path=config.target_path,
             inventory=config.inventory,
+            source_memo=config.source_memo,
         )
         for f, fn, ln in raw_callers
     ]
@@ -1085,8 +1182,11 @@ _CALLER_VIOLATION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# \b pins the callee-name scan to word starts: unanchored, every
+# position inside one hostile word re-scans the word's remainder —
+# quadratic. A mid-word start was a false token anyway.
 _CALLEE_VIOLATION_RE = re.compile(
-    r"(\w+)\(\)\s+(?:returns|produces|yields|could\s+(?:return|produce|fail))|"
+    r"\b(\w+)\(\)\s+(?:returns|produces|yields|could\s+(?:return|produce|fail))|"
     r"assumes\s+(\w+)\(\)\s+(?:will|always)|"
     r"(?:if|when)\s+(\w+)\(\)\s+(?:fails|errors|returns\s+(?:null|NULL|-1|error))",
     re.IGNORECASE,
@@ -1240,6 +1340,13 @@ def _get_callers_from_index(
     Production edges have keys caller_file, caller, callee_file, callee.
     Test edges may use the 'target' key as a file:function composite.
 
+    A file-qualified callee must match the full file:function key;
+    bare-name matching applies only to edges that carry no callee_file.
+    Duplicate function names are routine (C statics), and a bare-name
+    match on a file-qualified edge collects a DIFFERENT function's
+    callers — an all-clean wrong-caller set would then demote a
+    suspicious outcome on unrelated evidence.
+
     Returns deduplicated callers — edges are indexed under both caller
     and callee keys so the same edge appears twice in a full scan.
     """
@@ -1256,7 +1363,7 @@ def _get_callers_from_index(
             callee_name = edge.get("callee") or ""
             if callee_file and callee_name:
                 callee_key = f"{callee_file}:{callee_name}"
-                if callee_key == key or callee_name == key_func:
+                if callee_key == key:
                     caller_file = edge.get("caller_file", "")
                     caller_name = edge.get("caller", "")
                     if caller_file and caller_name:
@@ -1265,8 +1372,11 @@ def _get_callers_from_index(
                             seen.add(pair)
                             callers.append(pair)
                         continue
-            target = edge.get("target") or callee_name
-            if target == key or (key_func and target == key_func):
+            # The bare-name fallback is reserved for file-less edges: a
+            # file-qualified callee that failed the full-key check above
+            # must not re-enter through its bare name.
+            target = edge.get("target") or ("" if callee_file else callee_name)
+            if target and (target == key or (key_func and target == key_func)):
                 parts = edge_key.split(":", 1)
                 if len(parts) == 2:
                     pair = (parts[0], parts[1])

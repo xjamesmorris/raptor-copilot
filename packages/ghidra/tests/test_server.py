@@ -1,11 +1,29 @@
 """Tests for the persistent sandboxed Ghidra server."""
 
+import shutil
 import sys
+import tempfile
 import time
+from pathlib import Path
 
 import pytest
 
 from packages.ghidra.detect import pyghidra_available
+
+
+@pytest.fixture
+def short_sock_dir():
+    """AF_UNIX-safe socket dir (same pattern as core/sandbox tests).
+
+    ``tmp_path`` under xdist / deep TMPDIRs exceeds sun_path (~108
+    bytes on Linux) once a socket name is appended — bind() then
+    fails with "AF_UNIX path too long".
+    """
+    d = tempfile.mkdtemp(prefix="raptor-sk-", dir="/tmp")
+    try:
+        yield Path(d)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 class TestServerGating:
@@ -101,19 +119,29 @@ class TestWorkerWatchdog:
     """Per-op hard deadline on the persistent handler — no JVM."""
 
     def test_hung_op_raises(self, monkeypatch):
+        import threading
+
         from packages.ghidra import server_worker
 
+        # Event-parked, not sleep-parked: a plain sleep(30) left the
+        # daemon handler thread wedged for 30s AFTER the test passed,
+        # bleeding scheduler pressure into the rest of the worker's
+        # test batch. The release below unparks it immediately.
+        release = threading.Event()
+
         def _stuck(session, req):
-            import time
-            time.sleep(30)
+            release.wait(timeout=120)
 
         monkeypatch.setattr(server_worker, "_handle", _stuck)
         monkeypatch.setattr(
             server_worker, "_OP_DEADLINE_S", {"ping": 0.2},
         )
         handler = server_worker._HandlerThread(server_worker._Session())
-        with pytest.raises(server_worker._OpHung, match="ping"):
-            handler.run({"op": "ping"})
+        try:
+            with pytest.raises(server_worker._OpHung, match="ping"):
+                handler.run({"op": "ping"})
+        finally:
+            release.set()
 
     def test_fast_op_passes_through(self):
         from packages.ghidra import server_worker
@@ -438,15 +466,16 @@ class TestWorkerConnectionIdleTimeout:
     idle-but-connected (or wedged) parent must not hold the JVM
     worker process alive forever."""
 
-    def _run_worker(self, tmp_path, monkeypatch):
+    def _run_worker(self, sock_dir, monkeypatch, idle_timeout=1):
         import threading
 
         from packages.ghidra import server_worker
 
-        sock_path = str(tmp_path / "w.sock")
+        sock_path = str(sock_dir / "w.sock")
         monkeypatch.setattr(
             sys, "argv",
-            ["server_worker", sock_path, "--idle-timeout", "1"],
+            ["server_worker", sock_path,
+             "--idle-timeout", str(idle_timeout)],
         )
         box: dict = {}
 
@@ -490,11 +519,22 @@ class TestWorkerConnectionIdleTimeout:
                 time.sleep(0.02)
 
     def test_idle_connected_client_does_not_pin_worker(
-            self, tmp_path, monkeypatch):
-        sock_path, thread, box = self._run_worker(tmp_path, monkeypatch)
+            self, short_sock_dir, monkeypatch):
+        sock_path, thread, box = self._run_worker(
+            short_sock_dir, monkeypatch)
         client = self._connect_client(sock_path, thread=thread)
         try:
-            thread.join(timeout=8)
+            # Generous join budget with a structural completion
+            # signal: the worker runs in-process with a REAL 1s
+            # socket timeout, so under xdist scheduler starvation the
+            # timeout wakeup plus the surrounding Python can land
+            # seconds late — a tight join deadline measured the
+            # scheduler, not the idle enforcement. A worker that
+            # MISSES the per-connection timeout never exits at all,
+            # so the wide budget loses no detection power; rc == 0 is
+            # the idle-exit path's return value (a crashed run() body
+            # leaves box empty).
+            thread.join(timeout=60)
             assert not thread.is_alive(), (
                 "worker still alive with an idle connected client")
             assert box.get("rc") == 0
@@ -502,11 +542,21 @@ class TestWorkerConnectionIdleTimeout:
             client.close()
 
     def test_requests_still_served_under_connection_timeout(
-            self, tmp_path, monkeypatch):
+            self, short_sock_dir, monkeypatch):
         import json as json_mod
 
-        sock_path, thread, box = self._run_worker(tmp_path, monkeypatch)
-        client = self._connect_client(sock_path, thread=thread, timeout=5)
+        # The property here is "requests are served WITH a
+        # per-connection timeout armed", not the timeout's length —
+        # a 1s timeout raced this test's own client scheduling (the
+        # worker idle-exited before a descheduled client sent its
+        # ping). 60s keeps the settimeout code path armed while
+        # sitting far outside any load stall.
+        sock_path, thread, box = self._run_worker(
+            short_sock_dir, monkeypatch, idle_timeout=60)
+        # Client timeout and join budget both generous: the in-process
+        # worker's replies can be scheduled seconds late under load
+        # (same rationale as the idle test above).
+        client = self._connect_client(sock_path, thread=thread, timeout=60)
         try:
             stream = client.makefile("rwb")
             stream.write(b'{"id": 1, "op": "ping"}\n')
@@ -517,8 +567,422 @@ class TestWorkerConnectionIdleTimeout:
             stream.flush()
             resp = json_mod.loads(stream.readline())
             assert resp["ok"] is True and resp["bye"] is True
-            thread.join(timeout=5)
+            thread.join(timeout=60)
             assert not thread.is_alive()
             assert box.get("rc") == 0
         finally:
             client.close()
+
+
+class TestWorkerSocketFdTransport:
+    """--socket-fd mode: serve an inherited socketpair half without
+    ever calling socket(2)/bind(2) — the transport for sandbox lanes
+    whose seccomp policy denies AF_UNIX socket creation to the child.
+    No JVM required (ping/shutdown never touch pyghidra)."""
+
+    def _run_worker_fd(self, monkeypatch, fd, idle_timeout=60):
+        import threading
+
+        from packages.ghidra import server_worker
+
+        monkeypatch.setattr(
+            sys, "argv",
+            ["server_worker", "--socket-fd", str(fd),
+             "--idle-timeout", str(idle_timeout)],
+        )
+        box: dict = {}
+
+        def run():
+            box["rc"] = server_worker.main()
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        return thread, box
+
+    def test_ping_and_shutdown_over_socketpair(self, monkeypatch):
+        import json as json_mod
+        import socket as socket_mod
+
+        parent, child = socket_mod.socketpair()
+        # detach(): the worker's socket.socket(fileno=...) takes
+        # ownership of the fd — a second owner in this (in-process)
+        # test would double-close it.
+        child_fd = child.detach()
+        thread, box = self._run_worker_fd(monkeypatch, child_fd)
+        try:
+            parent.settimeout(60)
+            stream = parent.makefile("rwb")
+            stream.write(b'{"id": 1, "op": "ping"}\n')
+            stream.flush()
+            resp = json_mod.loads(stream.readline())
+            assert resp == {"id": 1, "ok": True, "pong": True}
+            stream.write(b'{"id": 2, "op": "shutdown"}\n')
+            stream.flush()
+            resp = json_mod.loads(stream.readline())
+            assert resp["ok"] is True and resp["bye"] is True
+            thread.join(timeout=60)
+            assert not thread.is_alive()
+            assert box.get("rc") == 0
+        finally:
+            parent.close()
+
+    def test_peer_eof_exits_zero(self, monkeypatch):
+        import socket as socket_mod
+
+        parent, child = socket_mod.socketpair()
+        child_fd = child.detach()
+        thread, box = self._run_worker_fd(monkeypatch, child_fd)
+        parent.close()  # EOF: the parent (only peer) went away
+        thread.join(timeout=60)
+        assert not thread.is_alive(), "worker did not exit on peer EOF"
+        assert box.get("rc") == 0
+
+    def test_exactly_one_transport_required(self, monkeypatch, capsys):
+        # Assert the SPECIFIC exclusive-transport refusal (message +
+        # argparse exit code), not just any SystemExit — a missing
+        # required positional would also exit and make the assertion
+        # vacuous.
+        from packages.ghidra import server_worker
+
+        monkeypatch.setattr(sys, "argv", ["server_worker"])
+        with pytest.raises(SystemExit) as ei:
+            server_worker.main()
+        assert ei.value.code == 2
+        assert ("exactly one of socket_path or --socket-fd"
+                in capsys.readouterr().err)
+        monkeypatch.setattr(
+            sys, "argv",
+            ["server_worker", "/tmp/x.sock", "--socket-fd", "7"],
+        )
+        with pytest.raises(SystemExit) as ei:
+            server_worker.main()
+        assert ei.value.code == 2
+        assert ("exactly one of socket_path or --socket-fd"
+                in capsys.readouterr().err)
+
+
+class TestServerTransportSelection:
+    """Boot-time transport pre-flight: pathname primary, inherited
+    socketpair on hosts whose sandboxed child cannot create AF_UNIX
+    sockets. Uses the REAL worker in a plain subprocess (the sandbox
+    call is replaced by a pass_fds-honouring spawn) — no JVM."""
+
+    @staticmethod
+    def _fake_sandbox_run(cmd, **kwargs):
+        import subprocess
+        return subprocess.run(
+            cmd,
+            pass_fds=kwargs.get("pass_fds") or (),
+            capture_output=True, text=True,
+            timeout=kwargs.get("timeout"),
+        )
+
+    def _server(self, tmp_path, monkeypatch, *, capable):
+        import core.sandbox as sandbox_pkg
+        import packages.ghidra.server as server_mod
+        monkeypatch.setattr(
+            server_mod, "pyghidra_available", lambda: True,
+        )
+        monkeypatch.setattr(
+            server_mod, "check_child_unix_sockets_available",
+            lambda: capable,
+        )
+        monkeypatch.setattr(
+            server_mod, "prepare_working_copy",
+            lambda gpr, wd: wd / "copy.gpr",
+        )
+        # The denial memo is process-level state: an earlier test (or
+        # any earlier boot in this worker process) that observed the
+        # EPERM signature would otherwise steer THIS test's transport
+        # selection.
+        monkeypatch.setattr(
+            server_mod, "_PATHNAME_TRANSPORT_DENIED", False,
+        )
+        monkeypatch.setattr(sandbox_pkg, "run", self._fake_sandbox_run)
+        gpr = tmp_path / "p.gpr"
+        gpr.write_text("")
+        return server_mod.GhidraServer(gpr, lifetime_s=60)
+
+    def test_pathname_transport_when_capable(self, tmp_path, monkeypatch):
+        srv = self._server(tmp_path, monkeypatch, capable=True)
+        srv.start()
+        try:
+            assert srv._child_sock is None  # never created
+            assert list(srv._work_dir.glob("worker-*.sock"))
+            assert srv._request({"op": "ping"}).get("pong") is True
+        finally:
+            srv.stop()
+
+    def test_socketpair_transport_when_incapable(
+        self, tmp_path, monkeypatch,
+    ):
+        srv = self._server(tmp_path, monkeypatch, capable=False)
+        srv.start()
+        try:
+            # No pathname socket anywhere; the adopted socketpair
+            # serves requests. The child half stays with its owning
+            # _serve thread for the worker's whole life (an early
+            # close would free the fd number while a spawn could
+            # still be in flight).
+            assert not list(srv._work_dir.glob("worker-*.sock"))
+            assert srv._child_sock is not None
+            assert srv._sock is not None
+            assert srv._request({"op": "ping"}).get("pong") is True
+        finally:
+            srv.stop()
+        # stop() joins the _serve thread, whose finally releases the
+        # child half — worker death surfaces as EOF, no fd leak.
+        assert srv._child_sock is None
+
+    def test_boot_failure_releases_child_sock(
+        self, tmp_path, monkeypatch,
+    ):
+        # The owning _serve thread's finally releases the child half
+        # once its sandbox call has returned; start()'s failure path
+        # joins the thread via stop(), so the release is observable
+        # here.
+        import core.sandbox as sandbox_pkg
+        import packages.ghidra.server as server_mod
+        srv = self._server(tmp_path, monkeypatch, capable=False)
+
+        def _dead_run(cmd, **kwargs):
+            from types import SimpleNamespace
+            return SimpleNamespace(returncode=1, stderr="boom: bad worker")
+
+        monkeypatch.setattr(sandbox_pkg, "run", _dead_run)
+        with pytest.raises(
+            server_mod.GhidraServerError, match="died during boot",
+        ):
+            srv.start()
+        assert srv._child_sock is None
+
+    def test_boot_timeout_keeps_child_fd_valid_for_inflight_spawn(
+        self, tmp_path, monkeypatch,
+    ):
+        # Boot-deadline expiry while the _serve thread is still
+        # PRE-spawn: any cleanup-path close of the child half would
+        # free the fd number, and a reused descriptor would ride into
+        # pass_fds in its place. The fd observed at spawn time must
+        # still be the socketpair half.
+        import os
+        import stat as stat_mod
+        import threading as threading_mod
+
+        import core.sandbox as sandbox_pkg
+        import packages.ghidra.server as server_mod
+
+        srv = self._server(tmp_path, monkeypatch, capable=False)
+        monkeypatch.setattr(server_mod, "_BOOT_TIMEOUT_S", 0.3)
+        monkeypatch.setattr(server_mod, "_SHUTDOWN_GRACE_S", 1)
+        release = threading_mod.Event()
+        seen: dict = {}
+
+        def _slow_spawn_run(cmd, **kwargs):
+            release.wait(timeout=30)
+            fd = (kwargs.get("pass_fds") or (None,))[0]
+            try:
+                seen["is_sock"] = stat_mod.S_ISSOCK(
+                    os.fstat(fd).st_mode,
+                )
+            except OSError as e:
+                seen["error"] = str(e)
+            from types import SimpleNamespace
+            return SimpleNamespace(returncode=0, stderr="")
+
+        monkeypatch.setattr(sandbox_pkg, "run", _slow_spawn_run)
+        with pytest.raises(
+            server_mod.GhidraServerError, match="did not come up",
+        ):
+            srv.start()
+        release.set()
+        thread = srv._thread
+        assert thread is not None
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+        assert "error" not in seen, seen
+        assert seen.get("is_sock") is True
+        # ... and the owner released the half once its call returned.
+        assert srv._child_sock is None
+
+    def test_boot_response_flood_fails_closed(
+        self, tmp_path, monkeypatch,
+    ):
+        # A hostile worker that floods the pair without a newline
+        # must fail the boot at the response cap, not grow the boot
+        # buffer without bound.
+        import socket as socket_mod
+        import threading as threading_mod
+        import time as time_mod
+
+        import packages.ghidra.server as server_mod
+
+        srv = self._server(tmp_path, monkeypatch, capable=False)
+        monkeypatch.setattr(server_mod, "_MAX_RESPONSE_BYTES", 4096)
+        parent, peer = socket_mod.socketpair()
+        stop_flood = threading_mod.Event()
+
+        def flood():
+            junk = b"x" * 4096
+            try:
+                while not stop_flood.is_set():
+                    peer.sendall(junk)
+            except OSError:
+                pass
+
+        flooder = threading_mod.Thread(target=flood, daemon=True)
+        flooder.start()
+        try:
+            with pytest.raises(
+                server_mod.GhidraServerError,
+                match="boot response exceeded",
+            ):
+                srv._boot_wait_socketpair(
+                    parent, time_mod.monotonic() + 15,
+                )
+        finally:
+            stop_flood.set()
+            parent.close()
+            peer.close()
+            flooder.join(timeout=10)
+            assert not flooder.is_alive()
+
+    def test_pathname_eperm_boot_falls_back_to_socketpair(
+        self, tmp_path, monkeypatch,
+    ):
+        """The live defect: the host pre-flight predicts the pathname
+        transport, but the per-call sandbox lane denies socket(AF_UNIX)
+        and the worker dies at socket setup with EPERM. The boot must
+        recover on the inherited-socketpair transport instead of
+        failing the server (and losing server-resolved reading)."""
+        import core.sandbox as sandbox_pkg
+        import packages.ghidra.server as server_mod
+        srv = self._server(tmp_path, monkeypatch, capable=True)
+        calls: list = []
+
+        def _lane_denied_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            if "--socket-fd" in cmd:
+                # The inherited descriptor works on the denying lane.
+                return self._fake_sandbox_run(cmd, **kwargs)
+            from types import SimpleNamespace
+            return SimpleNamespace(
+                returncode=1,
+                stderr=("PermissionError: [Errno 1] "
+                        "Operation not permitted"),
+            )
+
+        monkeypatch.setattr(sandbox_pkg, "run", _lane_denied_run)
+        srv.start()
+        try:
+            assert len(calls) == 2
+            assert "--socket-fd" not in calls[0]
+            assert "--socket-fd" in calls[1]
+            assert srv._request({"op": "ping"}).get("pong") is True
+            # ... and the denial is memoised for the process so the
+            # next server boot skips the doomed pathname attempt.
+            assert server_mod._PATHNAME_TRANSPORT_DENIED is True
+        finally:
+            srv.stop()
+
+    def test_denial_memo_boots_socketpair_directly(
+        self, tmp_path, monkeypatch,
+    ):
+        import core.sandbox as sandbox_pkg
+        import packages.ghidra.server as server_mod
+        srv = self._server(tmp_path, monkeypatch, capable=True)
+        monkeypatch.setattr(
+            server_mod, "_PATHNAME_TRANSPORT_DENIED", True,
+        )
+        calls: list = []
+
+        def _recording_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            return self._fake_sandbox_run(cmd, **kwargs)
+
+        monkeypatch.setattr(sandbox_pkg, "run", _recording_run)
+        srv.start()
+        try:
+            assert len(calls) == 1
+            assert "--socket-fd" in calls[0]
+            assert srv._request({"op": "ping"}).get("pong") is True
+        finally:
+            srv.stop()
+
+    def test_pathname_eperm_death_names_seccomp_policy(
+        self, tmp_path, monkeypatch,
+    ):
+        """The denial signature raises the typed socket-denial error
+        with policy attribution (pathname transport only), and a boot
+        whose socketpair retry ALSO dies still surfaces a boot death
+        after exactly one retry."""
+        import core.sandbox as sandbox_pkg
+        import packages.ghidra.server as server_mod
+        srv = self._server(tmp_path, monkeypatch, capable=True)
+
+        srv._result = {"stderr": ("PermissionError: [Errno 1] "
+                                  "Operation not permitted")}
+        err = srv._boot_death_error(pathname=True)
+        assert isinstance(err, server_mod.GhidraWorkerSocketDenied)
+        assert "denies AF_UNIX socket creation" in str(err)
+        # The socketpair transport never creates a socket — an EPERM
+        # there is NOT the socket-policy signature.
+        err = srv._boot_death_error(pathname=False)
+        assert not isinstance(err, server_mod.GhidraWorkerSocketDenied)
+        srv._result = {}
+
+        calls: list = []
+
+        def _eperm_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            from types import SimpleNamespace
+            return SimpleNamespace(
+                returncode=1,
+                stderr=("PermissionError: [Errno 1] "
+                        "Operation not permitted"),
+            )
+
+        monkeypatch.setattr(sandbox_pkg, "run", _eperm_run)
+        with pytest.raises(
+            server_mod.GhidraServerError, match="died during boot",
+        ):
+            srv.start()
+        assert len(calls) == 2  # pathname attempt + socketpair retry
+        assert "--socket-fd" in calls[1]
+        assert server_mod._PATHNAME_TRANSPORT_DENIED is True
+
+    def test_non_eperm_boot_death_does_not_retry(
+        self, tmp_path, monkeypatch,
+    ):
+        """Denial-signature selectivity: a pathname boot that dies
+        WITHOUT the EPERM signature (e.g. a JVM crash) is a plain
+        boot death — no typed denial, no socketpair retry, and the
+        process-level denial memo stays untouched."""
+        import core.sandbox as sandbox_pkg
+        import packages.ghidra.server as server_mod
+        srv = self._server(tmp_path, monkeypatch, capable=True)
+
+        jvm_crash = ('Exception in thread "main" '
+                     "java.lang.OutOfMemoryError: Java heap space")
+        srv._result = {"stderr": jvm_crash}
+        err = srv._boot_death_error(pathname=True)
+        assert not isinstance(err, server_mod.GhidraWorkerSocketDenied)
+        srv._result = {}
+
+        calls: list = []
+
+        def _jvm_crash_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            from types import SimpleNamespace
+            return SimpleNamespace(returncode=1, stderr=jvm_crash)
+
+        monkeypatch.setattr(sandbox_pkg, "run", _jvm_crash_run)
+        with pytest.raises(
+            server_mod.GhidraServerError, match="died during boot",
+        ) as excinfo:
+            srv.start()
+        assert not isinstance(
+            excinfo.value, server_mod.GhidraWorkerSocketDenied,
+        )
+        assert len(calls) == 1  # exactly one attempt — no retry
+        assert "--socket-fd" not in calls[0]
+        assert server_mod._PATHNAME_TRANSPORT_DENIED is False

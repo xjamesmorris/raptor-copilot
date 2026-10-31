@@ -133,15 +133,59 @@ def _int_literal(n) -> int | None:
         return None
 
 
-def _block_id(n) -> int | None:
-    """Start byte of the nearest enclosing block statement — the
-    linearity token: positional simulation demands every op share
-    one block, so recorded order IS execution order."""
-    cur = n.parent
-    while cur is not None:
-        if cur.type == "block":
-            return cur.start_byte
-        cur = cur.parent
+# Statement kinds that execute exactly once when their enclosing block
+# runs — the only shapes _linear_block_id accepts as the op's direct
+# statement under the block. ``return_statement`` qualifies: a return
+# directly under the block runs exactly once per block entry (it ENDS
+# the entry, and no later op of the same receiver can execute after
+# it), while a return hanging off a braceless if/loop never reaches
+# this check — its parent is the *_statement, not the block. Omitting
+# it demoted the WHOLE receiver to ALL_ELEMENTS the moment any op sat
+# under a return (precision-only loss, but a broader cut than the
+# braceless-body hazard this allowlist exists for).
+_LINEAR_STATEMENTS = frozenset({
+    "expression_statement", "local_variable_declaration",
+    "return_statement",
+})
+
+# Expression-level wrappers an op may sit under between its own node
+# and the enclosing statement without breaking exactly-once execution.
+# Anything else — braceless loop/if bodies (the op's statement hangs
+# off a *_statement, not the block), ternary arms, short-circuit
+# operands, lambdas, anonymous classes, switch expressions — refuses.
+# Fold-or-refuse polarity: an unknown wrapper is a linearity hazard,
+# not a pass-through.
+_LINEAR_WRAPPERS = frozenset({
+    "argument_list", "method_invocation", "cast_expression",
+    "parenthesized_expression", "assignment_expression",
+    "variable_declarator", "local_variable_declaration",
+    "expression_statement",
+})
+
+
+def _linear_block_id(n) -> int | None:
+    """Start byte of the enclosing block IFF ``n`` provably executes
+    exactly once each time that block runs — the linearity token:
+    positional simulation demands every op share one block AND run
+    once per block entry, so recorded order IS execution order.
+
+    Nearest-block-ancestor alone is NOT sufficient: a braceless body
+    (``for (int i = 0; i < 2; i++) l.remove(0);`` or
+    ``if (c) l.remove(0);``) shares the declaration's nearest block
+    while executing repeatedly / conditionally, which resolves a
+    positional ``get`` to the wrong element. Require the op's own
+    statement to be a DIRECT child of the block, reached only through
+    allowlisted expression wrappers."""
+    cur = n
+    while cur.parent is not None:
+        parent = cur.parent
+        if parent.type == "block":
+            if cur.type in _LINEAR_STATEMENTS:
+                return parent.start_byte
+            return None
+        if cur is not n and cur.type not in _LINEAR_WRAPPERS:
+            return None
+        cur = parent
     return None
 
 
@@ -166,6 +210,14 @@ class LocalCollectionIndex:
     # (lineno, col) of qualifying get-invocations -> (name, key)
     _get_sites: dict[tuple[int, int], tuple[str, str]] = field(
         default_factory=dict)
+    # name -> [fresh_declarator_start_byte, enclosing_block_end_byte):
+    # positional vouch window; an op outside it targets a same-named
+    # FIELD / outer binding (the a1b positional-scope discipline).
+    _windows: dict[str, tuple[int, int]] = field(default_factory=dict)
+    # list-op log per receiver, consumed by the positional post-pass.
+    _list_ops: dict[str, list] = field(default_factory=dict)
+    # list receiver -> declaring linear-block id (see _linear_block_id).
+    _decl_block: dict[str, int | None] = field(default_factory=dict)
     _resolver: Any = None
 
     # ----- queries ---------------------------------------------------
@@ -218,6 +270,18 @@ class LocalCollectionIndex:
         return name is not None and name in catalog_callables
 
 
+def _enclosing_block_end(n) -> int:
+    """End byte of the nearest enclosing block-like scope — a fresh
+    declarator's vouch-window upper bound. No block ancestor (e.g. a
+    field declarator) ⇒ -1: an empty window, everything refuses."""
+    cur = n.parent
+    while cur is not None:
+        if cur.type in ("block", "constructor_body"):
+            return cur.end_byte
+        cur = cur.parent
+    return -1
+
+
 def _fresh_collection_kind(value) -> str | None:
     """``"map"`` / ``"list"`` when ``value`` is an argument-free fresh
     ``new`` of an allowlisted concrete type; None otherwise."""
@@ -258,10 +322,14 @@ def build_local_collection_index(
         return None
 
     idx = LocalCollectionIndex(ok=True)
-    idx._list_ops = {}
-    idx._decl_block = {}
     types, statics = build_import_map(tree.root_node)
-    idx._resolver = _NameResolver(types, statics)
+    from core.analysis.cfg_builder_java import (
+        _file_type_shadow_names,
+        _FileLocalScopes,
+    )
+    idx._resolver = _NameResolver(
+        types, statics, local_scopes=_FileLocalScopes(tree.root_node),
+        type_shadows=_file_type_shadow_names(tree.root_node))
     lo, hi = line_span
     consumed: set[tuple[int, int]] = set()
 
@@ -288,6 +356,13 @@ def build_local_collection_index(
         kind = idx._kind.get(recv)
         if kind is None:
             return False
+        # Positional vouch: an op outside the fresh declarator's
+        # window targets a same-named FIELD / outer binding — a
+        # different (rewritable) storage location. Record + consume
+        # as usual; the violation makes every query refuse.
+        w_lo, w_hi = idx._windows.get(recv, (0, -1))
+        if not (w_lo <= obj.start_byte < w_hi):
+            idx._violated.add(recv)
         method = _text(name_node)
         args = named_args(call)
         ln = line_of(call)
@@ -321,11 +396,11 @@ def build_local_collection_index(
             if method == "add" and len(args) == 1:
                 op = ("add", None, args[0])
             elif method == "add":
-                op = ("add_at", _int_literal(args[0]), args[1])
+                op = ("add_at", _int_literal(args[0]), args[1])  # type: ignore[assignment]
             else:
-                op = ("set", _int_literal(args[0]), args[1])
+                op = ("set", _int_literal(args[0]), args[1])  # type: ignore[assignment]
             idx._list_ops.setdefault(recv, []).append(
-                (ln, col, _block_id(call)) + op)
+                (ln, col, _linear_block_id(call)) + op)
             consumed.add((obj.start_byte, obj.end_byte))
             return True
         if kind == "list" and method in _LIST_REMOVE and len(args) == 1:
@@ -337,14 +412,14 @@ def build_local_collection_index(
             if i is None:
                 return False
             idx._list_ops.setdefault(recv, []).append(
-                (ln, col, _block_id(call), "remove", i, None))
+                (ln, col, _linear_block_id(call), "remove", i, None))
             consumed.add((obj.start_byte, obj.end_byte))
             return True
         if kind == "list" and method in _LIST_READ and len(args) == 1:
             idx._reads_at.setdefault((ln, recv), set()).add(ALL_ELEMENTS)
             idx._get_sites[(ln, col)] = (recv, ALL_ELEMENTS)
             idx._list_ops.setdefault(recv, []).append(
-                (ln, col, _block_id(call), "get", _int_literal(args[0]),
+                (ln, col, _linear_block_id(call), "get", _int_literal(args[0]),
                  None))
             consumed.add((obj.start_byte, obj.end_byte))
             return True
@@ -395,8 +470,10 @@ def build_local_collection_index(
                     if lhs in idx._kind:
                         idx._violated.add(lhs)
                     idx._kind[lhs] = kind
+                    idx._windows[lhs] = (
+                        n.start_byte, _enclosing_block_end(n))
                     if kind == "list":
-                        idx._decl_block[lhs] = _block_id(n)
+                        idx._decl_block[lhs] = _linear_block_id(n)
                     consumed.add((name_node.start_byte, name_node.end_byte))
                     return           # fresh init consumed whole
                 if value is not None:

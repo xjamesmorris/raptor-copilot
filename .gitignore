@@ -14,11 +14,15 @@ __pycache__/
 # RAPTOR outputs
 out/
 .out/
+.mvp10-state/
 
 # Local
 .env*
+local-issues.txt
 .claude/*.local.json
 .claude/raptor.env
+# Copilot's runtime settings locks are not configuration.
+.github/copilot/settings*.json.lock
 # Per-dispatch runtime state (webfetch anchor files + fetch logs)
 .claude/run/
 
@@ -27,8 +31,11 @@ core/analysis/tests/fixtures/*.o
 core/analysis/tests/fixtures/demo
 
 # Runtime artifacts
+# Joern's importCpg materialises a workspace/ under the JVM's cwd; a
+# query launched with cwd at the repo root drops one here. Root-anchored
+# so a legitimate nested workspace/ source dir (none today) stays visible.
+/workspace/
 codeql_dbs/
-.github/codeql/codeql-scoped-config.yml
 engine/semgrep/rules/registry-cache/c.p.*.json
 # Build-ID binary cache (core/audit/build_id_cache.py; default lives at
 # the install root — override with RAPTOR_BINARY_CACHE_DIR)
@@ -46,3 +53,8 @@ tuning.json
 # Rendered per-checkout AppArmor profile (make apparmor-profile output;
 # the tracked source is the .template)
 core/sandbox/helpers/raptor-coord-launcher.apparmor
+
+# Local-only replay-eval case corpus (transcripts + verdict
+# expectations supplied per-machine; machinery ships in-tree, case
+# content never does — same convention as the corpus labels)
+core/audit/corpus/replay-cases/

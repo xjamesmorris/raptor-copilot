@@ -23,7 +23,14 @@ from __future__ import annotations
 import logging
 import re
 
-from . import RewriteEdit, RewriteResult, apply_version_edit, register, rewrite_file_with
+from . import (
+    RewriteEdit,
+    RewriteResult,
+    apply_version_edit,
+    build_element_attr_version_pattern,
+    register,
+    rewrite_file_with,
+)
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -38,45 +45,36 @@ def _build_targets_predicate(path: Path) -> bool:
 
 def _build_inline_version_pattern(update_name: str) -> re.Pattern:
     """``<PackageReference Update="X" Version="OLD" />`` — central-version
-    override shape."""
-    upd = re.escape(update_name)
-    return re.compile(
-        r"""(?P<open><PackageReference\b)"""
-        r"""(?P<prefix>[^>]*?Update\s*=\s*['"])"""
-        rf"""(?P<upd>{upd})"""
-        r"""(?P<upd_close>['"])"""
-        r"""(?P<mid>[^>]*?Version\s*=\s*['"])"""
-        r"""(?P<version>[^'"]*)"""
-        r"""(?P<ver_close>['"])""",
-        re.IGNORECASE,
+    override shape, either attribute order (MSBuild is order-agnostic)."""
+    return build_element_attr_version_pattern(
+        ("PackageReference",), "Update", update_name, "Version",
     )
 
 
 def _build_version_override_pattern(update_name: str) -> re.Pattern:
-    """``<PackageReference Update="X" VersionOverride="OLD" />``."""
-    upd = re.escape(update_name)
-    return re.compile(
-        r"""(?P<open><PackageReference\b)"""
-        r"""(?P<prefix>[^>]*?Update\s*=\s*['"])"""
-        rf"""(?P<upd>{upd})"""
-        r"""(?P<upd_close>['"])"""
-        r"""(?P<mid>[^>]*?VersionOverride\s*=\s*['"])"""
-        r"""(?P<version>[^'"]*)"""
-        r"""(?P<ver_close>['"])""",
-        re.IGNORECASE,
+    """``<PackageReference Update="X" VersionOverride="OLD" />``,
+    either attribute order."""
+    return build_element_attr_version_pattern(
+        ("PackageReference",), "Update", update_name, "VersionOverride",
     )
 
 
 def _build_child_version_pattern(update_name: str) -> re.Pattern:
     """``<PackageReference Update="X"><Version>OLD</Version></PackageReference>``
-    — older child-element shape."""
+    — older child-element shape.
+
+    Attribute spans are ``[^<>]`` (not ``[^>]``): a raw ``<`` is
+    illegal inside an XML open tag, so real tags match identically,
+    while with ``[^>]`` every planted ``<PackageReference`` inside
+    an unclosed tag re-scanned the rest of it — quadratic on
+    hostile project files."""
     upd = re.escape(update_name)
     return re.compile(
         r"""(?P<open><PackageReference\b)"""
-        r"""(?P<prefix>[^>]*?Update\s*=\s*['"])"""
+        r"""(?P<prefix>[^<>]*?Update\s*=\s*['"])"""
         rf"""(?P<upd>{upd})"""
         r"""(?P<upd_close>['"])"""
-        r"""(?P<gap>[^>]*>\s*<Version>\s*)"""
+        r"""(?P<gap>[^<>]*>\s*<Version>\s*)"""
         r"""(?P<version>[^<]*?)"""
         r"""(?P<post>\s*</Version>\s*</PackageReference>)""",
         re.IGNORECASE,

@@ -42,7 +42,9 @@ class TestProcessFindingsCallsTheMethod:
 
     def test_call_is_inside_analyze_vulnerability_branch(self):
         text = AGENT_PY.read_text(encoding="utf-8")
-        ana_idx = text.index("if self.analyze_vulnerability(vuln):")
+        ana_idx = text.index(
+            "if self.analyze_vulnerability(vuln, checklist=checklist):"
+        )
         post_text = text[ana_idx:]
         emit_offset = post_text.index(
             "self._emit_journal_entry(vuln, checklist)"
@@ -257,6 +259,27 @@ class TestDeriveVerdict:
     def test_string_is_true_positive_is_error(self):
         assert AutonomousSecurityAgentV2._derive_verdict(
             {"is_true_positive": "yes"},
+        ) == "error"
+
+    def test_tp_with_abstained_exploitability_is_error(self):
+        # Response validation nulls a missing/malformed
+        # is_exploitable. "suspicious" would assert "real bug, NOT
+        # exploitable" — a definitive journal verdict minted from an
+        # abstention (pre-fix behaviour). Same rule as
+        # _panel_verdict: a non-bool exploitability bears no verdict.
+        assert AutonomousSecurityAgentV2._derive_verdict(
+            {"is_true_positive": True, "is_exploitable": None},
+        ) == "error"
+
+    def test_tp_with_absent_exploitability_is_error(self):
+        assert AutonomousSecurityAgentV2._derive_verdict(
+            {"is_true_positive": True},
+        ) == "error"
+
+    def test_tp_with_string_exploitability_is_error(self):
+        # A truthy non-bool must not be laundered into "finding".
+        assert AutonomousSecurityAgentV2._derive_verdict(
+            {"is_true_positive": True, "is_exploitable": "yes"},
         ) == "error"
 
 

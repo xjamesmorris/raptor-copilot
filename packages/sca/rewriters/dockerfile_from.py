@@ -29,28 +29,14 @@ from __future__ import annotations
 import logging
 import re
 
-from core.atomic_fs import write_text_atomically as _atomic_write
-
-from . import RewriteEdit, RewriteResult, register
+from . import RewriteEdit, RewriteResult, register, rewrite_file_with
 from typing import TYPE_CHECKING
+from ..file_shapes import is_dockerfile as _is_dockerfile
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 logger = logging.getLogger(__name__)
-
-
-def _is_dockerfile(path: Path) -> bool:
-    """Match the same predicate as ``dockerfile_arg`` — both
-    rewriters register against Dockerfiles. The dispatcher routes
-    by content (we look at every ``RewriteEdit`` and pick the
-    line shape that matches)."""
-    name = path.name
-    if name in ("Dockerfile", "Containerfile"):
-        return True
-    if name.startswith("Dockerfile.") or name.endswith(".Dockerfile"):
-        return True
-    return path.suffix == ".dockerfile"
 
 
 @register(predicate=_is_dockerfile, filenames=None)
@@ -119,28 +105,7 @@ def _apply_from_edits(
     and short forms in the file (Docker accepts ``python:3.12``
     as shorthand for ``docker.io/library/python:3.12``).
     """
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as e:
-        return [RewriteResult(edit=e2, applied=False,
-                              reason=f"error: read failed: {e}")
-                for e2 in edits]
-
-    new_text = text
-    results: list[RewriteResult] = []
-    for edit in edits:
-        new_text, result = _apply_one_from(new_text, edit)
-        results.append(result)
-
-    if any(r.applied for r in results):
-        try:
-            _atomic_write(path, new_text)
-        except OSError as e:
-            return [RewriteResult(edit=r.edit, applied=False,
-                                  reason=f"error: write failed: {e}")
-                    if r.applied else r
-                    for r in results]
-    return results
+    return rewrite_file_with(path, edits, _apply_one_from)
 
 
 def _apply_one_from(
@@ -171,8 +136,11 @@ def _apply_one_from(
     # Match: optional ``FROM`` + whitespace + image + ``:`` +
     # captured tag + (optional ``@digest`` + optional ``AS
     # <stage>`` + optional comment / EOL).
+    # Leading indent is HORIZONTAL-only ([^\S\n]) — the MULTILINE
+    # ``^\s*`` idiom is quadratic on blank-line runs (see the helm
+    # rewriter's fixed anchor; same sibling idiom).
     pattern = re.compile(
-        rf"^(\s*FROM\s+(?:--platform=\S+\s+)?(?:{image_alternates}):)"
+        rf"^([^\S\n]*FROM\s+(?:--platform=\S+\s+)?(?:{image_alternates}):)"
         rf"(\S+?)"                  # tag (non-greedy)
         rf"(\s|$|@|#)",              # boundary
         re.MULTILINE,
@@ -204,8 +172,22 @@ def _apply_one_from(
             + edit.new_value
             + new_text[m.end(2):]
         )
+    # Verdict parity with the shared driver and the sibling
+    # rewriters: when OTHER-valued occurrences of the same image
+    # remain, the apply is explicitly ``partial`` — a bare
+    # ``applied`` reported a clean rewrite over a mixed file.
+    stray_values = sorted(
+        {m.group(2) for m in matches}
+        - {edit.old_value, edit.new_value},
+    )
+    reason = "applied"
+    if stray_values:
+        reason = (
+            f"partial: {len(target_matches)} occurrence(s) bumped; "
+            f"other value(s) left in place: {stray_values!r}"
+        )
     return new_text, RewriteResult(
-        edit=edit, applied=True, reason="applied",
+        edit=edit, applied=True, reason=reason,
     )
 
 

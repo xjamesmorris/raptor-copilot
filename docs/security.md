@@ -85,6 +85,34 @@ strips `PYTHONPATH`/`PYTHONHOME`, no user site, no cwd prepended to
 `PYTHONHOME`, `PYTHONSTARTUP`, and `PYTHONINSPECT` from all subprocess
 environments.
 
+**Interpreter-startup-hook forgery (authority/consent surfaces):** a
+sharper variant of the same class — a `sitecustomize.py` reached via
+`PYTHONPATH`, or a `.pth`/`usercustomize.py` planted in the default
+user site (the latter needs ZERO environment variables, so no env
+check can see it), executes before the first line of any launcher and
+can monkeypatch the checks that operator authority rests on
+(invocation-context provenance, consent ceremonies, the
+boot-payload-stamp enforcement). The launchers that mint or enforce
+operator authority — `raptor-review`, `raptor-annotate`,
+`raptor-coverage-summary`, `raptor-wsl-consent`, `raptor-may-ask`,
+`raptor-sage-mcp-guard`, and the `python3` children of the SAGE
+consent lane — therefore run under interpreter isolated mode: a
+`-S python3 -I` shebang closes the dispatch route at the first
+instruction, and a byte-pinned re-exec guard (first statement in each
+script) extends the closure to `python3 <script>` invocations,
+preserving argv, stdin, and the TTY-ness of all std fds so the
+ceremony gates see the unchanged context. Honest bound: on the
+`python3 <script>` route the hook has already run when the guard
+fires — the stock neuter of the guard fails closed (exit 97), but a
+hook crafted against the guard can win there, and same-user writes to
+RAPTOR's own files or the interpreter's startup surface — the system
+site-packages, or interpreter resolution itself (a `python3` shim in
+a user-writable `PATH` directory, or a `PATH=…` prefix, that strips
+`-I` before the real interpreter runs) — remain outside the trust
+edge, as ever. Identity, coverage, and behaviour
+are gate-pinned (`test_libexec_marker_coverage.py`,
+`test_interpreter_isolation.py`).
+
 ### 5. Exfiltration via LLM Output Rendering
 
 Attacker-controlled content can exfiltrate data if the researcher views
@@ -169,6 +197,19 @@ Operators should know the honest residuals and compensate accordingly:
   and CPU time, but a crafted input maximising LLM token consumption is
   a slow denial-of-service against API budget, not a security bypass.
   Budget caps are the mitigation.
+- **Same-UID receipt-state tampering.** Receipt-backed session entries and
+  immutable content-addressed sidecars are owner-only and validated with
+  no-follow, single-link, exact-byte checks, but they do not defend against
+  a process already running as the same OS user. They are deny-only evidence:
+  pending, rejected, malformed, and statically verified records remain
+  projectless and never create a session owner. A run marker carrying either
+  reserved receipt key is an authoritative negative pin only: injected
+  `project`/`project_source` values are ignored, project writes are disabled,
+  containment fallback is blocked, and child bootstrap installs projectless
+  state without treating the marker as a ledger witness. Credential-less
+  coverage skips these markers during discovery and checks again through the
+  already-open run-directory fd before append. A matching or even exact
+  receipt is never a substitute for `SessionOwner`.
 
 ---
 
@@ -187,40 +228,45 @@ targets as able to assert their own trust.
 
 ## Agent Capabilities and the Rule of Two
 
-Every RAPTOR agent is audited against three axes: **(A)** reads
-untrusted input, **(B)** has state-changing tools (Write, Edit, Bash,
-WebFetch), **(C)** communicates with external services. Following
-Meta's agent security framework, an agent session may combine at most
-two of the three; an agent needing all three requires human approval
-before execution.
+Agent boundaries, tool inventories, dispatch gates and the Rule of Two
+capability constraint are documented in [Agent Security](agent-security.md).
+This section covers the repository-facing threat model and process-level
+controls; the agent guide covers per-agent capability declarations, network
+hooks, credential isolation, and SAGE trust boundaries.
 
-In practice:
+### Copilot session service isolation
 
-- Pipeline agents declare explicit tool lists scoped to their job;
-  network-reaching agents (forensics investigators, the crash-report
-  fetcher) have their WebFetch pinned to specific domains by
-  per-agent hooks, and the BigQuery agent's Bash is restricted to a
-  typed read-only query wrapper.
-- The crash-analysis pipeline isolates all bug-tracker fetching in a
-  dedicated fetch-only agent whose single output is schema-gated
-  before anything downstream consumes it (see
-  [crash-analysis](crash-analysis.md)).
-- `offsec-specialist` inherently spans all three axes and is
-  classified **needs-HITL**: the requirement is mechanically enforced
-  (headless dispatch is refused; an effective sandbox does not
-  substitute for the human), and an inventory test fails on any
-  programmatic dispatch reference.
+`core/security/session_services.py` treats Copilot identity as a restriction,
+never as authorization for a standalone SDK, another harness, a saved
+account, or a local sidecar. It suppresses automatic probes and refuses
+provider, dispatcher, HTTP, network-enabled subprocess, and SAGE paths.
+No persistent grant, trust flag, model choice, or environment opt-out can
+authorize them. The active Copilot account is opaque to RAPTOR; an unknown
+account is refused rather than inferred from a hostname or model name.
 
-Prompt-side injection exposure is lint-enforced: every prompt-
-construction file is registered, and every interpolation must either
-be envelope-constructed or carry an audited allowlist entry with a
-written justification — the audit cannot silently regress.
+At repository Python bootstrap, `offline_network.py` installs an inherited
+Linux seccomp ceiling: socket creation/connections, io_uring, and
+cross-process fd acquisition cannot supply a network route. Addressable
+datagram socketpairs are denied; anonymous stream/seqpacket pairs remain
+available. Bootstrap refuses already-open socket/io_uring descriptors,
+already-started threads, and unavailable containment. A Python audit hook
+also supplies explicit errors before DNS or direct SDK connections.
+
+This is a process-tree network ceiling, not a replacement for the target
+sandbox or an OS-wide firewall. Copilot's own authentication/routing, native
+host tools and MCP/extensions, processes started earlier, and malicious
+same-UID changes to the framework are outside it. Shell commands that never
+enter repository Python are not generally contained; the SAGE wrappers and
+nested frontend launcher have explicit early refusals. Project instructions
+require fresh, operation/account-specific approval on host-owned surfaces.
+No verified in-repository scoped authorization bridge currently exists, so
+network-dependent repository commands remain blocked under Copilot.
 
 ---
 
 ## Security Invariants
 
-Three invariants govern any code path where RAPTOR reads target source
+Four invariants govern any code path where RAPTOR reads target source
 via an LLM, dispatches a sub-agent, or feeds LLM-derived artefacts to
 downstream consumers (engineering detail: `core/security/THREAT_MODEL.md`):
 
@@ -239,6 +285,32 @@ downstream consumers (engineering detail: `core/security/THREAT_MODEL.md`):
 - **I3 — Config trust is narrow.** The config-file poisoning gate
   (scenario 3 above) is a different threat from source-level prompt
   injection; `--trust-repo` relaxes only the config checks, never I2.
+- **I4 — Runtime receipts remain non-authorizing.** Receipt-backed
+  session records and runs are projectless, ownerless, and ledgerless.
+  Generic lifecycle paths refuse them. A narrow test-only exception
+  exists for RAPTOR's fixed owned runtime fake: a non-exported,
+  process-local, exact-object, single-use capability binds one verified
+  launch, direct child, receipt snapshot, private terminal socket, and
+  fresh projectless run. An authenticated terminal event creates a
+  thread-bound permit only around an existing lifecycle wrapper.
+
+  The outer receipt veto and the under-lock status update independently
+  verify the exact run path, raw metadata generation, parsed receipt
+  snapshot, terminal event, target status, and null project pin.
+  Wrapper signatures and effect order do not change. The permit is
+  spent even when verification fails; fork descendants wipe all
+  process-local authority. Exact cleanup, replay resistance, and
+  launch/run/socket binding prevent tampering, concurrent reuse,
+  cross-thread use, or cross-launch reuse.
+
+  This exception has no environment, CLI, hook-event, receipt-field,
+  provider, model, public export, launcher, or live frontend surface.
+  It calls no ledger start, resume, or finish API. Project journal and
+  coverage projections remain no-ops because the run stays
+  authoritatively projectless. Same-launch resume requires a fresh
+  capability bound to the new metadata generation; cross-launch
+  receipt continuity remains audit evidence and grants no terminal
+  authority.
 
 ---
 

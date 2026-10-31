@@ -18,7 +18,11 @@ anchors, ``.env`` are applied by compose itself; the sanitizer must
 see what the daemon would run, not the raw text), then rebuilds each
 service from a KEY ALLOWLIST: every published port becomes
 ``127.0.0.1:0:<target>``, bind-mount sources must resolve inside the
-staging dir, ``build`` contexts are confined to the staging dir,
+staging dir (and may not nest under another container-writable bind —
+the daemon re-resolves sources at container start, so a writable
+parent is a symlink-swap TOCTOU; see
+``_refuse_writable_bind_overlaps``), ``build`` contexts are confined
+to the staging dir,
 ``cap_add`` is filtered to a safe-capability allowlist, devices are
 filtered to safe pseudo-devices unless the caller opts out,
 single-container-parity resource limits are injected per service, and
@@ -244,17 +248,35 @@ def rewrite_for_localhost(
 #: copytree. The gate runs BEFORE any byte is copied.
 _STAGING_MAX_BYTES = 2 << 30
 
+#: Entry-count twin of the byte budget (files + dirs). Mirrors the
+#: export path's DEFAULT_MAX_ROOTFS_ENTRIES: a compose build context
+#: is the same order of artifact, and 400k entries is far above any
+#: legitimate context while well under tmpfs inode defaults.
+_STAGING_MAX_ENTRIES = 400_000
+
 
 def _require_stageable_size(source_dir: Path) -> None:
     """Refuse staging when ``source_dir`` exceeds the copy budget.
 
-    Sums ``lstat`` sizes (symlinks never followed — the copy itself is
-    ``symlinks=True``) and stops walking as soon as the budget is
-    exceeded, so a huge hostile tree costs a bounded scan, not a full
-    disk accounting.
+    Two budgets, because bytes alone miss the inode axis: a hostile
+    tree of millions of zero-byte files passes any byte cap while
+    ``copytree`` exhausts the staging tmpfs's inodes (the export path
+    already carries an entry bound for the same reason). Sums
+    ``lstat`` sizes (symlinks never followed — the copy itself is
+    ``symlinks=True``) and counts entries (files + dirs) in the same
+    walk, stopping as soon as either budget is exceeded, so a huge
+    hostile tree costs a bounded scan, not a full disk accounting.
     """
     total = 0
-    for dirpath, _dirnames, filenames in os.walk(source_dir, followlinks=False):
+    entries = 0
+    for dirpath, dirnames, filenames in os.walk(source_dir, followlinks=False):
+        entries += len(dirnames) + len(filenames)
+        if entries > _STAGING_MAX_ENTRIES:
+            raise ComposeError(
+                f"compose source dir {source_dir} exceeds the "
+                f"{_STAGING_MAX_ENTRIES}-entry staging budget — refusing "
+                "to copy it to the staging tmpdir (inode exhaustion)"
+            )
         for name in filenames:
             try:
                 total += os.lstat(os.path.join(dirpath, name)).st_size
@@ -421,7 +443,7 @@ def _filter_devices(spec: dict, *, allow_all: bool = False) -> None:
             # ``{source, target, permissions}``.
             norm = _safe_device_source(str(dev.get("source") or ""))
             if norm is not None:
-                kept.append({**dev, "source": norm})
+                kept.append({**dev, "source": norm})  # type: ignore[arg-type]
                 continue
         logger.warning("compose sanitize: dropping device %r", dev)
     if kept:
@@ -640,37 +662,74 @@ _RESOLVER_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 _RESOLVER_TIMEOUT_S = 60.0
 
 
-def _resolver_env(staging: Path) -> dict[str, str]:
+def _resolver_scratch_home() -> Path:
+    """Create the resolver's throwaway HOME — always OUTSIDE staging.
+
+    The staging dir is a verbatim ``copytree`` of the (hostile) repo's
+    compose dir, so ANY fixed path under it is attacker-preseedable: a
+    repo shipping ``.raptor-resolver-home/.docker/config.json`` would
+    hand the ``docker compose config`` invocation an attacker-authored
+    CLI config — and docker's ``cliPluginsExtraDirs`` discovery would
+    then EXECUTE a repo-shipped plugin binary at sanitize time (before
+    any allowlist sanitisation, unconfined on hosts where the resolver
+    sandbox cannot engage). ``mkdtemp`` in the system temp dir yields a
+    fresh, empty, mode-0700, RAPTOR-owned dir that no repo content can
+    pre-populate or alias (same construction as core.sandbox's
+    fake_home; freshness per call is what makes the symlink-refusal
+    guard unnecessary here). ``.docker`` is pre-created so config
+    discovery lands on an existing empty RAPTOR-owned dir. Callers own
+    cleanup (``shutil.rmtree`` after resolution).
+    """
+    scratch = Path(tempfile.mkdtemp(prefix="raptor-resolver-home-"))
+    (scratch / ".docker").mkdir(mode=0o700)
+    return scratch
+
+
+def _resolver_env(scratch_home: Path) -> dict[str, str]:
     """Minimal environment for the ``compose config`` resolution step.
 
     Interpolation reads THIS environment — a hostile compose file's
     ``${HOME}``/``${PATH}``/``${DOCKER_HOST}`` would otherwise inline the
     launcher's allowlisted process env into the resolved model and ship
-    it into the container. Only a static generic PATH plus a throwaway
-    HOME/DOCKER_CONFIG inside staging are provided: unset variables
+    it into the container. Only a static generic PATH plus the throwaway
+    RAPTOR-owned HOME/DOCKER_CONFIG (:func:`_resolver_scratch_home` —
+    never inside staging) are provided: unset variables
     interpolate to empty (compose semantics, with a compose-side
     warning); ``${VAR:?}`` forms make resolution fail, which refuses the
     stack (fail closed). ``build``/``up``/``ps``/``down`` keep the normal
     allowlisted docker env — the sanitized file they consume contains no
     live interpolation (``$`` survives only ``$$``-escaped).
+
+    Note: a hostile ``${HOME}`` interpolation DOES inline the scratch
+    path string into the resolved model. That is a dead path by the time
+    anything runs (the dir is rmtree'd right after resolution) and leaks
+    only system tmpdir naming layout — the same info class as the
+    staging path itself. Revisit if tmp naming ever becomes sensitive.
     """
-    scratch = staging / ".raptor-resolver-home"
-    scratch.mkdir(exist_ok=True)
     return {
         "PATH": _RESOLVER_PATH,
-        "HOME": str(scratch),
-        "DOCKER_CONFIG": str(scratch / ".docker"),
+        "HOME": str(scratch_home),
+        "DOCKER_CONFIG": str(scratch_home / ".docker"),
     }
 
 
-def _run_resolver(argv: list[str], staging: Path, env: dict[str, str]) -> str:
+def _run_resolver(
+    argv: list[str],
+    staging: Path,
+    env: dict[str, str],
+    *,
+    scratch_home: Path | None = None,
+) -> str:
     """Run the resolver, sandboxed with reads confined to staging.
 
     The resolver invocation is itself attack surface — it follows file
     references in hostile YAML — so it runs under ``core.sandbox`` with
     ``restrict_reads`` scoped to the staging dir: an out-of-staging read
-    the parser-level gate missed fails at the kernel. When the sandbox
-    cannot ENGAGE (unsupported host), resolution proceeds unconfined
+    the parser-level gate missed fails at the kernel. ``scratch_home``
+    (the RAPTOR-owned resolver HOME, which lives outside staging) is
+    granted to the read + write sets so docker's config discovery works
+    under the confinement. When the sandbox cannot ENGAGE (unsupported
+    host), resolution proceeds unconfined
     with the recursive pre-gate as the remaining defense (logged loudly).
     A non-zero exit INSIDE the sandbox is a resolution failure and
     refuses the stack — it is never retried unconfined.
@@ -679,8 +738,8 @@ def _run_resolver(argv: list[str], staging: Path, env: dict[str, str]) -> str:
         from core.sandbox import SandboxSetupError
         from core.sandbox import run as sandbox_run
     except ImportError:  # pragma: no cover — core.sandbox always ships
-        sandbox_run = None
-        SandboxSetupError = Exception  # noqa: N806
+        sandbox_run = None  # type: ignore[assignment]
+        SandboxSetupError = Exception  # type: ignore[misc,assignment]  # noqa: N806
     if sandbox_run is not None:
         try:
             proc = sandbox_run(
@@ -693,6 +752,10 @@ def _run_resolver(argv: list[str], staging: Path, env: dict[str, str]) -> str:
                 # loader/TLS minimum. This holds on the Landlock-only
                 # tier too, where no private mount view narrows /etc.
                 omit_etc_reads=True,
+                readable_paths=(
+                    [str(scratch_home)] if scratch_home else None),
+                writable_paths=(
+                    [str(scratch_home)] if scratch_home else None),
                 cwd=str(staging),
                 env=env,
                 # The env is CONSTRUCTED minimal (static PATH + throwaway
@@ -750,6 +813,14 @@ def _run_resolver(argv: list[str], staging: Path, env: dict[str, str]) -> str:
             f"compose config failed (rc={outcome.returncode}): {stderr}",
             stderr=stderr,
         )
+    if outcome.truncated:
+        # The resolved model is PARSED, not sliced for diagnostics — a
+        # head-dropped tail could still be a valid YAML document
+        # describing a SUBSET stack, which would then be sanitized and
+        # launched as if complete. Refuse (fail closed).
+        msg = ("compose config output exceeded the capture bound and was "
+               "truncated — refusing to parse a partial resolved model")
+        raise ComposeError(msg)
     return outcome.stdout or ""
 
 
@@ -767,11 +838,16 @@ def _resolve_effective_model(compose_file: Path) -> dict[str, Any]:
     """
     staging = compose_file.parent
     prefix = _compose_invocation()
-    raw = _run_resolver(
-        [*prefix, "-f", str(compose_file), "config"],
-        staging,
-        _resolver_env(staging),
-    )
+    scratch_home = _resolver_scratch_home()
+    try:
+        raw = _run_resolver(
+            [*prefix, "-f", str(compose_file), "config"],
+            staging,
+            _resolver_env(scratch_home),
+            scratch_home=scratch_home,
+        )
+    finally:
+        shutil.rmtree(scratch_home, ignore_errors=True)
     try:
         data = yaml.safe_load(raw)
     except yaml.YAMLError as exc:
@@ -819,14 +895,20 @@ def _filter_volumes(volumes: list[Any], staging: Path) -> list[Any]:
                 kept.append(vol)  # anonymous volume, container path only
                 continue
             source = parts[0].strip()
-            if source.startswith(("/", ".", "~")):
+            # Any '/'-bearing source is a PATH, never a named volume
+            # (compose volume names are [a-zA-Z0-9._-]). The old
+            # leading-char test classified `foo/../x:/x` as a named
+            # volume — safe only because the sanitizer happens to run
+            # on the RESOLVED model today; align the discriminator
+            # with the grammar so that ordering is not load-bearing.
+            if source.startswith(("/", ".", "~")) or "/" in source:
                 if _bind_source_ok(source):
                     kept.append(vol)
                 else:
                     logger.warning(
                         "compose sanitize: dropping host bind %r", vol)
             else:
-                kept.append(vol)  # named volume
+                kept.append(vol)  # named volume (no path separator)
         elif isinstance(vol, dict):
             vtype = str(vol.get("type") or "volume")
             if vtype in ("volume", "tmpfs"):
@@ -846,6 +928,132 @@ def _filter_volumes(volumes: list[Any], staging: Path) -> list[Any]:
                     "compose sanitize: dropping %s mount %r", vtype, vol)
         # non-str/dict entries dropped
     return kept
+
+
+def _bind_mounts(
+    volumes: Any, staging_real: str,
+) -> list[tuple[str, str, bool]]:
+    """``(source_text, resolved_source, writable)`` for each bind mount
+    in a sanitized ``volumes:`` list. Named/anonymous volumes and tmpfs
+    entries carry no host path and are skipped. Resolution mirrors
+    :func:`_filter_volumes._bind_source_ok` so both layers judge the
+    same path."""
+    out: list[tuple[str, str, bool]] = []
+    if not isinstance(volumes, list):
+        return out
+    for vol in volumes:
+        if isinstance(vol, str):
+            parts = vol.split(":")
+            if len(parts) < 2:
+                continue
+            source = parts[0].strip()
+            if not source.startswith(("/", ".")):
+                continue  # named volume
+            writable = True
+            if len(parts) >= 3:
+                writable = "ro" not in parts[-1].split(",")
+        elif isinstance(vol, dict):
+            if str(vol.get("type") or "volume") != "bind":
+                continue
+            source = str(vol.get("source") or "").strip()
+            writable = not vol.get("read_only")
+        else:
+            continue
+        if source.startswith("/"):
+            resolved = os.path.realpath(source)
+        else:
+            resolved = os.path.realpath(os.path.join(staging_real, source))
+        out.append((source, resolved, writable))
+    return out
+
+
+def _refuse_writable_bind_overlaps(
+    services: dict[str, Any], staging: Path,
+    file_source_defs: dict[str, dict[str, Any]] | None = None,
+) -> None:
+    """Refuse bind layouts a container can re-point between sanitize
+    time and daemon mount time (bind-source TOCTOU).
+
+    Bind sources are approved at sanitize time via ``realpath`` — but
+    dockerd re-resolves the source path at every container START
+    (verified against a live daemon: a symlink swapped in after
+    approval is followed, including across ``docker restart``). A
+    service holding a WRITABLE bind of a staging directory can replace
+    any path component beneath it with a symlink to a host path; a
+    bind source nesting under that directory is then steered at the
+    host when its container starts later (``depends_on`` /
+    healthchecks make "later" attacker-schedulable) or restarts.
+    ``_prune_escaping_symlinks`` only removes links present at staging
+    time; this check closes the write channel that plants them
+    afterwards.
+
+    Trade-off, both directions: refusing only CROSS-service overlaps
+    would leave the same-service replay open (tamper, exit, restart
+    policy re-resolves the sibling mount); refusing ALL same-service
+    overlaps would reject common legitimate stacks (one service
+    binding ``./www`` rw plus ``./www/conf`` has no TOCTOU without a
+    restart — its mounts are resolved before its own code runs). So:
+    overlaps across services always refuse; overlaps within one
+    service refuse only when that service carries a restart policy
+    other than ``no``.
+    """
+    staging_real = str(staging.resolve())
+    binds: list[tuple[str, str, str, bool]] = []
+    restartable: dict[str, bool] = {}
+    for svc, spec in services.items():
+        if not isinstance(spec, dict):
+            continue
+        restart = str(spec.get("restart") or "no")
+        restartable[svc] = restart not in ("no", "none")
+        for source, resolved, writable in _bind_mounts(
+            spec.get("volumes"), staging_real,
+        ):
+            binds.append((svc, source, resolved, writable))
+        # Non-swarm ``docker compose`` implements file-based
+        # configs/secrets as BIND MOUNTS of the source file,
+        # re-resolved by the daemon at container start — the same
+        # swap channel as volumes. Feed each service's attached file
+        # sources in as read-only binds so a source nesting under
+        # another service's writable bind refuses like any other
+        # bind (service A binds ./dir rw, secret file ./dir/tok
+        # attached to a later-starting service B: A swaps tok for a
+        # symlink before B starts).
+        for section in ("configs", "secrets"):
+            defs = (file_source_defs or {}).get(section) or {}
+            for att in spec.get(section) or []:
+                if isinstance(att, str):
+                    ref_name = att
+                elif isinstance(att, dict):
+                    ref_name = str(att.get("source") or "")
+                else:
+                    continue
+                file_ref = (defs.get(ref_name) or {}).get("file")
+                if not file_ref:
+                    continue
+                file_ref = str(file_ref)
+                if file_ref.startswith("/"):
+                    resolved = os.path.realpath(file_ref)
+                else:
+                    resolved = os.path.realpath(
+                        os.path.join(staging_real, file_ref))
+                binds.append((svc, file_ref, resolved, False))
+    for svc_w, src_w, res_w, writable in binds:
+        if not writable:
+            continue
+        prefix = res_w + os.sep
+        for svc_o, src_o, res_o, _writable_o in binds:
+            if not res_o.startswith(prefix):
+                continue
+            if svc_o == svc_w and not restartable[svc_o]:
+                continue
+            raise ComposeError(
+                f"compose service {svc_o!r} bind source {src_o!r} lies "
+                f"under service {svc_w!r}'s writable bind {src_w!r} — "
+                "refusing (the writable container can swap a path "
+                "component for a symlink after sanitize-time approval; "
+                "the daemon re-resolves bind sources at container "
+                "start, steering the mount at a host path)"
+            )
 
 
 def _sanitize_build(build: Any, staging: Path, *, service: str) -> dict[str, Any]:
@@ -1027,11 +1235,11 @@ def _sanitize_service(
             if "host-gateway" not in str(v)
         }
     if kept_hosts is not None:
-        if len(kept_hosts) != len(extra_hosts):
+        if len(kept_hosts) != len(extra_hosts):  # type: ignore[arg-type]
             logger.warning(
                 "compose sanitize: dropping host-gateway extra_hosts "
                 "entr%s from service %r",
-                "y" if len(extra_hosts) - len(kept_hosts) == 1 else "ies",
+                "y" if len(extra_hosts) - len(kept_hosts) == 1 else "ies",  # type: ignore[arg-type]
                 name,
             )
         if kept_hosts:
@@ -1192,6 +1400,22 @@ def _sanitize_model(
             str(name), spec, staging,
             labels=labels, allow_devices=allow_devices,
         )
+    # Sanitize configs/secrets BEFORE the stack-wide bind pass: their
+    # file sources are daemon-re-resolved binds and must join the
+    # writable-overlap refusal below.
+    for section in ("configs", "secrets"):
+        if section in data:
+            out[section] = _sanitize_file_source_defs(
+                data[section], staging, what=section)
+    # Stack-wide pass: per-service volume filtering cannot see the
+    # bind-source TOCTOU one service sets up against another.
+    _refuse_writable_bind_overlaps(
+        out["services"], staging,
+        file_source_defs={
+            "configs": out.get("configs") or {},
+            "secrets": out.get("secrets") or {},
+        },
+    )
     if "volumes" in data:
         out["volumes"] = _sanitize_volume_defs(data["volumes"])
     # Egress isolation: every stack network — including the implicit
@@ -1206,10 +1430,6 @@ def _sanitize_model(
     # authority (a DOCKER-USER rule) RAPTOR does not own.
     out["networks"] = _sanitize_network_defs(data.get("networks") or {})
     out["networks"].setdefault("default", {"internal": True})
-    for section in ("configs", "secrets"):
-        if section in data:
-            out[section] = _sanitize_file_source_defs(
-                data[section], staging, what=section)
     dropped = sorted(
         set(data) - set(out) - {"version"}
     )
@@ -1355,12 +1575,6 @@ def up_stack(
     """``docker compose up -d`` + parse ``ps --format json``. Returns
     ``(all_containers, primary)``.
     """
-    # Force fresh pull of every service's image. Bypasses the local Docker
-    # layer cache, which can silently re-use cached vulhub/X images even when
-    # the registry is rate-limited. Compose stacks reference registry images;
-    # locally-built compose stacks are extremely rare (vulhub-compose method's
-    # images are all vulhub/X). If a service does FROM a local-only image,
-    # --pull always fails loudly + the agent sees the error and pivots.
     # --pull missing: pull images only when not locally available. Using
     # "always" breaks locally-built services (compose stacks that `build:`
     # their own images have no upstream to pull from). Trade-off: a stale

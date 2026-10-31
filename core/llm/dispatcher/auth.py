@@ -75,7 +75,6 @@ import binascii
 import json
 import logging
 import os
-import sys
 import threading
 import time
 import urllib.parse
@@ -118,6 +117,18 @@ class BedrockTransformError(Exception):
         super().__init__(message)
         self.status = status
         self.message = message
+
+
+# The permission gate is shared with the DIRECT model-config loader
+# (core.llm.detection._read_config_models) — one implementation in
+# core.llm.models_config_perm so the two loaders of the identical file
+# can never drift. Re-exported here because this is where the seeder's
+# consumers (and its tests) import the exception from.
+from core.llm.models_config_perm import (  # noqa: E402
+    WorldReadableModelsConfigError as WorldReadableModelsConfigError,
+    loose_mode_bits,
+    refuse_exposed_inline_keys,
+)
 
 
 @dataclass(frozen=True)
@@ -246,6 +257,8 @@ class CredentialStore:
     """
 
     def __init__(self) -> None:
+        from core.security.session_services import require_service_authorization
+        require_service_authorization("loading standalone provider credentials")
         # Read each provider's key into private state. Store is
         # mutable so tests can inject fakes without touching env.
         # Pre-read GOOGLE_API_KEY so it's always erased even when
@@ -264,46 +277,36 @@ class CredentialStore:
             return val
 
         self._keys: dict[str, str | None] = {
+            # --- direct providers (read-and-erase) ---
             "anthropic":  _read_env("ANTHROPIC_API_KEY"),
-            "openai":     _read_env("OPENAI_API_KEY"),
             "gemini":     _read_env("GEMINI_API_KEY") or _google_api_key,
-            # OpenAI-compatible aggregators + ecosystem providers.
-            # Same Bearer-auth shape; different upstream URLs. Read
-            # WITHOUT erasure — workers reach these env-direct (no
-            # worker-side dispatcher factory routes them), see the
-            # comment above the class.
-            "mistral":    _read_env_keep("MISTRAL_API_KEY"),
+            "openai":     _read_env("OPENAI_API_KEY"),
+            # --- aggregator / routing providers (read-and-keep) ---
+            # Workers reach these env-direct (no worker-side dispatcher
+            # factory routes them); see the comment above the class.
+            "apiroute": _read_env_keep("API_ROUTE_API_KEY"),
+            "cheaperinference": _read_env_keep("CHEAPER_INFERENCE_API_KEY"),
+            "cohere":     _read_env_keep("COHERE_API_KEY"),
+            "deepinfra":  _read_env_keep("DEEPINFRA_API_KEY"),
+            "fireworks":  _read_env_keep("FIREWORKS_API_KEY"),
             "groq":       _read_env_keep("GROQ_API_KEY"),
-            "together":   _read_env_keep("TOGETHER_API_KEY"),
+            "mistral":    _read_env_keep("MISTRAL_API_KEY"),
             "openrouter": _read_env_keep("OPENROUTER_API_KEY"),
             "orcarouter": _read_env_keep("ORCAROUTER_API_KEY"),
-            "fireworks":  _read_env_keep("FIREWORKS_API_KEY"),
-            "deepinfra":  _read_env_keep("DEEPINFRA_API_KEY"),
             "perplexity": _read_env_keep("PERPLEXITY_API_KEY"),
-            "cohere":     _read_env_keep("COHERE_API_KEY"),
             # Replicate — uses ``Token <key>`` prefix, not ``Bearer``.
             "replicate":  _read_env_keep("REPLICATE_API_TOKEN"),
-            # Azure OpenAI — operator-configured endpoint URL +
-            # api-key header, both env-direct like the aggregators
-            # (workers need endpoint AND key). If the endpoint is
-            # absent the rule's upstream is a sentinel that produces
-            # 503 at request time (consistent with other unconfigured
-            # providers).
+            "together":   _read_env_keep("TOGETHER_API_KEY"),
+            # --- cloud gateways ---
+            # Azure OpenAI — endpoint absent → sentinel producing 503.
             "azure_openai":           _read_env_keep("AZURE_OPENAI_API_KEY"),
             "azure_openai_endpoint":  _read_env_keep("AZURE_OPENAI_ENDPOINT"),
-            # AWS Bedrock — the *secret* parts are read-and-erased like
-            # every other provider key so they never reach a spawned
-            # worker's env. Static creds set this way; SSO/IMDS/profile
-            # creds (no env keys) are resolved by botocore at signing
-            # time. Region + endpoint are NOT secrets, so they're read
-            # without popping (workers may legitimately need the region).
+            # AWS Bedrock — secret parts read-and-erased; SSO/IMDS/
+            # profile creds resolved by botocore at signing time.
             "aws_access_key_id":      _read_env("AWS_ACCESS_KEY_ID"),
             "aws_secret_access_key":  _read_env("AWS_SECRET_ACCESS_KEY"),
             "aws_session_token":      _read_env("AWS_SESSION_TOKEN"),
-            # Bedrock API key (newer bearer-token auth). When present it
-            # takes precedence over SigV4 (matching the AWS SDKs) and the
-            # request is authed with a static ``Authorization: Bearer``
-            # header — no botocore, no signing. Secret → read-and-erased.
+            # Bedrock bearer — takes precedence over SigV4. Secret.
             "aws_bearer_token":       _read_env("AWS_BEARER_TOKEN_BEDROCK"),
         }
         self._aws_region: str | None = (
@@ -632,14 +635,14 @@ class CredentialStore:
         resolved = self._aws_signer_cache[cache_key]
         if resolved is None:
             return None
-        credentials, resolved_region = resolved
-        effective_region = region or resolved_region
+        credentials, resolved_region = resolved  # type: ignore[misc]
+        effective_region = region or resolved_region  # type: ignore[has-type]
         if not effective_region:
             return None
         endpoint = self.aws_bedrock_endpoint(api, region=effective_region)
         if endpoint is None:
             return None
-        return (credentials, effective_region, endpoint)
+        return (credentials, effective_region, endpoint)  # type: ignore[has-type]
 
     def _resolve_aws_credentials(self, profile: str | None = None):
         """Resolve ``(credentials, region)`` from botocore.
@@ -1249,87 +1252,96 @@ def build_rules(creds: CredentialStore) -> dict[str, ProviderRule]:
             upstream_base_url="https://api.anthropic.com",
             inject_headers=_anthropic_headers,
         ),
-        "openai": ProviderRule(
-            name="openai",
-            upstream_base_url="https://api.openai.com",
-            inject_headers=_openai_headers,
-        ),
+        # --- direct providers ---
         "gemini": ProviderRule(
             name="gemini",
             upstream_base_url="https://generativelanguage.googleapis.com",
             inject_headers=_gemini_headers,
         ),
-        "mistral": ProviderRule(
-            name="mistral",
-            upstream_base_url="https://api.mistral.ai",
-            inject_headers=_bearer_headers("mistral"),
+        "openai": ProviderRule(
+            name="openai",
+            upstream_base_url="https://api.openai.com",
+            inject_headers=_openai_headers,
         ),
-        "groq": ProviderRule(
-            name="groq",
-            upstream_base_url="https://api.groq.com",
-            inject_headers=_bearer_headers("groq"),
+        # --- aggregator / routing providers ---
+        "apiroute": ProviderRule(
+            name="apiroute",
+            # Preserve the SDK's /v1 path, as with other compatible gateways.
+            upstream_base_url="https://global.api-route.com",
+            inject_headers=_bearer_headers("apiroute"),
         ),
-        "together": ProviderRule(
-            name="together",
-            upstream_base_url="https://api.together.xyz",
-            inject_headers=_bearer_headers("together"),
-        ),
-        "openrouter": ProviderRule(
-            name="openrouter",
-            # OpenRouter's API is rooted at ``/api/v1`` rather than the
-            # bare host; SDKs typically configure ``base_url=https://
-            # openrouter.ai/api/v1``. Forward to the bare host — the
-            # SDK's path component (``/api/v1/chat/completions`` etc.)
-            # is preserved end-to-end through the dispatcher.
-            upstream_base_url="https://openrouter.ai",
-            inject_headers=_bearer_headers("openrouter"),
-        ),
-        "orcarouter": ProviderRule(
-            name="orcarouter",
-            # OrcaRouter's API is rooted at ``/v1`` (OpenAI-compatible
-            # gateway). The SDK's path component (``/v1/chat/completions``
-            # etc.) is preserved end-to-end through the dispatcher, so the
-            # bare host is the correct upstream — same shape as OpenRouter.
-            upstream_base_url="https://api.orcarouter.ai",
-            inject_headers=_bearer_headers("orcarouter"),
-        ),
-        "fireworks": ProviderRule(
-            name="fireworks",
-            upstream_base_url="https://api.fireworks.ai",
-            inject_headers=_bearer_headers("fireworks"),
-        ),
-        "deepinfra": ProviderRule(
-            name="deepinfra",
-            upstream_base_url="https://api.deepinfra.com",
-            inject_headers=_bearer_headers("deepinfra"),
-        ),
-        "perplexity": ProviderRule(
-            name="perplexity",
-            upstream_base_url="https://api.perplexity.ai",
-            inject_headers=_bearer_headers("perplexity"),
+        "cheaperinference": ProviderRule(
+            name="cheaperinference",
+            # /v1 root (OpenAI-compatible); bare host is the correct
+            # upstream — SDK path preserved end-to-end.
+            upstream_base_url="https://api.cheaperinference.com",
+            inject_headers=_bearer_headers("cheaperinference"),
         ),
         "cohere": ProviderRule(
             name="cohere",
             upstream_base_url="https://api.cohere.ai",
             inject_headers=_bearer_headers("cohere"),
         ),
+        "deepinfra": ProviderRule(
+            name="deepinfra",
+            upstream_base_url="https://api.deepinfra.com",
+            inject_headers=_bearer_headers("deepinfra"),
+        ),
+        "fireworks": ProviderRule(
+            name="fireworks",
+            upstream_base_url="https://api.fireworks.ai",
+            inject_headers=_bearer_headers("fireworks"),
+        ),
+        "groq": ProviderRule(
+            name="groq",
+            upstream_base_url="https://api.groq.com",
+            inject_headers=_bearer_headers("groq"),
+        ),
+        "mistral": ProviderRule(
+            name="mistral",
+            upstream_base_url="https://api.mistral.ai",
+            inject_headers=_bearer_headers("mistral"),
+        ),
+        "openrouter": ProviderRule(
+            name="openrouter",
+            # API rooted at /api/v1; bare host is the correct upstream.
+            upstream_base_url="https://openrouter.ai",
+            inject_headers=_bearer_headers("openrouter"),
+        ),
+        "orcarouter": ProviderRule(
+            name="orcarouter",
+            # /v1 root (OpenAI-compatible); bare host — same shape as
+            # OpenRouter.
+            upstream_base_url="https://api.orcarouter.ai",
+            inject_headers=_bearer_headers("orcarouter"),
+        ),
+        "perplexity": ProviderRule(
+            name="perplexity",
+            upstream_base_url="https://api.perplexity.ai",
+            inject_headers=_bearer_headers("perplexity"),
+        ),
         "replicate": ProviderRule(
             name="replicate",
             upstream_base_url="https://api.replicate.com",
             inject_headers=_replicate_headers,
         ),
+        "together": ProviderRule(
+            name="together",
+            upstream_base_url="https://api.together.xyz",
+            inject_headers=_bearer_headers("together"),
+        ),
+        # --- cloud gateways ---
         "azure_openai": ProviderRule(
             name="azure_openai",
             upstream_base_url=azure_endpoint,
             inject_headers=_azure_openai_headers,
-            # Azure echoes the api-key in some error responses;
-            # strip ``api-key`` from worker requests on top of the
-            # default Bearer/x-api-key set so the dispatcher's
-            # injected value isn't shadowed.
-            strip_request_headers=(
-                "authorization", "x-api-key", "x-goog-api-key",
-                "api-key", "openai-organization",
-            ),
+            # Azure authenticates via ``api-key``, which the
+            # ProviderRule DEFAULT strip set already covers (along
+            # with the Bearer/x-api-key family) — the dispatcher's
+            # injected value cannot be shadowed by a worker header.
+            # No override needed; a previous explicit tuple here was
+            # byte-identical to the default while its comment claimed
+            # an extension.
         ),
         "bedrock": ProviderRule(
             name="bedrock",
@@ -1367,12 +1379,25 @@ def seed_from_config(store: CredentialStore) -> None:
     Silent on file-missing, parse-error, or schema-error — same posture
     as the rest of the config-reading path. A misconfigured file looks
     the same as no file at all and surfaces later as the dispatcher's
-    own ``503 provider not configured``. One deliberate exception: a
-    file shaped like ``packages/exploit_feasibility``'s AnalysisConfig
-    JSON (which historically shared ``RAPTOR_CONFIG`` before moving to
-    ``RAPTOR_EF_CONFIG``) warns actionably — that mismatch has a
-    specific cause worth naming.
+    own ``503 provider not configured``. Two deliberate exceptions:
+
+    * A file shaped like ``packages/exploit_feasibility``'s
+      AnalysisConfig JSON (which historically shared ``RAPTOR_CONFIG``
+      before moving to ``RAPTOR_EF_CONFIG``) warns actionably — that
+      mismatch has a specific cause worth naming.
+    * A group/other-readable file that CARRIES inline ``api_key``
+      entries raises :class:`WorldReadableModelsConfigError` instead
+      of loading the exposed credentials (fail-closed; the message
+      names the ``chmod 600`` fix and the
+      ``RAPTOR_ALLOW_WORLD_READABLE_MODELS_JSON=1`` override). A loose
+      file with NO inline keys only warns — there is nothing sensitive
+      in it to protect.
+
+    Raises:
+        WorldReadableModelsConfigError: see above.
     """
+    from core.security.session_services import require_service_authorization
+    require_service_authorization("loading saved provider credentials")
     try:
         from core.json import load_json_with_comments
     except ImportError:
@@ -1384,29 +1409,16 @@ def seed_from_config(store: CredentialStore) -> None:
     else:
         config_path = Path.home() / ".config" / "raptor" / "models.json"
 
-    # Permission posture warning: models.json carries API keys when the
-    # operator uses the inline ``api_key`` field. World-readable mode
-    # (any of ``0o004`` / ``0o040`` / group-readable on a multi-user
-    # box) means another local UID can grep the file. We don't *refuse*
-    # to load — that would be a footgun on systems where umask sets
-    # 0o644 and the operator didn't notice — but log once at WARNING so
-    # the operator can ``chmod 600`` it. Skip on Windows where POSIX
-    # bits don't have the same meaning.
-    if sys.platform != "win32":
-        try:
-            st = config_path.stat()
-            if st.st_mode & 0o077:
-                import logging as _logging
-                _logging.getLogger(__name__).warning(
-                    "models.json at %s is mode %04o — contains API keys "
-                    "when populated inline. Consider `chmod 600 %s`.",
-                    config_path, st.st_mode & 0o777, config_path,
-                )
-        except OSError:
-            # Missing file / unreadable: load_json_with_comments below
-            # will handle the "missing" case (returns None) and the
-            # operator hits the "no key configured" path naturally.
-            pass
+    # Permission posture: models.json carries API keys when the
+    # operator uses the inline ``api_key`` field. Group/other-readable
+    # mode (any ``0o077`` bit) means another local UID can grep the
+    # file. Record the loose mode here; whether it REFUSES or merely
+    # warns is decided after parsing, once we know if the file
+    # actually carries inline keys (a keyless routing-only file has
+    # nothing to protect). The shared helper skips Windows (POSIX bits
+    # don't have the same meaning) and stat failure (the "missing"
+    # case is handled by load_json_with_comments below).
+    loose_mode = loose_mode_bits(config_path)
 
     data = load_json_with_comments(config_path)
     if data is None:
@@ -1439,6 +1451,9 @@ def seed_from_config(store: CredentialStore) -> None:
     if not isinstance(entries, list):
         return
 
+    if loose_mode is not None:
+        refuse_exposed_inline_keys(config_path, loose_mode, entries)
+
     for entry in entries:
         if not isinstance(entry, dict):
             continue
@@ -1452,6 +1467,8 @@ def seed_from_config(store: CredentialStore) -> None:
         # roles, same key) — first match seeds, rest are no-ops.
         if store.get(provider) is None:
             store.set(provider, api_key)
+
+
 
 
 def _seed_bedrock_override(

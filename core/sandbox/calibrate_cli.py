@@ -114,22 +114,28 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _format_human(profile, *, cached: bool) -> str:
-    """Pretty multi-line summary."""
+    """Pretty multi-line summary.
+
+    Observed paths/hosts are chosen by the PROBED binary (it decides
+    what to open/connect to) — escape them before the operator's
+    terminal like every other foreign-derived print surface.
+    """
+    from core.security.log_sanitisation import sanitise_for_terminal as _sft
     SAMPLE = 15
     lines = []
-    lines.append(f"binary: {profile.binary_path}")
+    lines.append(f"binary: {_sft(str(profile.binary_path), max_len=200)}")
     lines.append(f"  sha256:        {profile.binary_sha256[:16]}…")
     lines.append(f"  env signature: {profile.env_signature[:16]}…")
     lines.append(f"  captured at:   {profile.captured_at}")
     lines.append(f"  source:        {'cache' if cached else 'fresh probe'}")
-    lines.append(f"  probe argv:    {profile.probe_args}")
+    lines.append(f"  probe argv:    {_sft(str(profile.probe_args), max_len=200)}")
 
     def _section(label, items, sample=SAMPLE) -> None:
         lines.append(f"\n{label} ({len(items)}):")
         if not items:
             lines.append("  (empty)")
             return
-        lines.extend(f"  {x}" for x in items[:sample])
+        lines.extend(f"  {_sft(str(x), max_len=300)}" for x in items[:sample])
         if len(items) > sample:
             lines.append(f"  ... (+{len(items) - sample} more)")
 
@@ -139,7 +145,10 @@ def _format_human(profile, *, cached: bool) -> str:
     _section("proxy hosts", profile.proxy_hosts)
     if profile.connect_targets:
         lines.append(f"\nconnect targets ({len(profile.connect_targets)}):")
-        lines.extend(f"  {t.ip}:{t.port} ({t.family})" for t in profile.connect_targets[:SAMPLE])
+        lines.extend(
+            f"  {_sft(str(t.ip), max_len=64)}:{t.port} ({_sft(str(t.family), max_len=32)})"
+            for t in profile.connect_targets[:SAMPLE]
+        )
         if len(profile.connect_targets) > SAMPLE:
             lines.append(
                 f"  ... (+{len(profile.connect_targets) - SAMPLE} more)"
@@ -198,8 +207,8 @@ def _cli_main(argv: Sequence[str] | None = None) -> int:
             return _SOFTWARE_EX
         env_sig = cal._env_signature(env_keys)
         fp = cal._fingerprint(bin_sha, env_sig)
-        cached = cal._load_from_cache(fp)
-        if cached is None:
+        cached_profile = cal._load_from_cache(fp)
+        if cached_profile is None:
             sys.stderr.write(
                 f"raptor-sandbox-calibrate: no cached profile for "
                 f"{bin_path} (env keys: "
@@ -208,9 +217,9 @@ def _cli_main(argv: Sequence[str] | None = None) -> int:
             )
             return _SOFTWARE_EX
         if args.json_output:
-            sys.stdout.write(_profile_to_json(cached) + "\n")
+            sys.stdout.write(_profile_to_json(cached_profile) + "\n")
         else:
-            sys.stdout.write(_format_human(cached, cached=True) + "\n")
+            sys.stdout.write(_format_human(cached_profile, cached=True) + "\n")
         return 0
 
     # Spawn path: load_or_calibrate handles cache hit / miss /
@@ -223,7 +232,7 @@ def _cli_main(argv: Sequence[str] | None = None) -> int:
         try:
             bin_sha = cal._sha256_file(bin_path.resolve())
         except OSError:
-            bin_sha = None
+            bin_sha = None  # type: ignore[assignment]
         env_sig = cal._env_signature(env_keys)
         fp = (cal._fingerprint(bin_sha, env_sig)
               if bin_sha is not None else None)
@@ -235,7 +244,7 @@ def _cli_main(argv: Sequence[str] | None = None) -> int:
             env_keys=env_keys, force=args.force,
             timeout=args.timeout,
         )
-        cached = (
+        cached: bool = (
             before is not None
             and before.captured_at == profile.captured_at
         )

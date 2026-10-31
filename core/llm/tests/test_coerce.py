@@ -9,6 +9,7 @@ from core.llm.coerce import (
     structured_result,
     to_float_safe,
     to_int_safe,
+    to_lower_token_safe,
 )
 
 
@@ -60,6 +61,23 @@ class TestToIntSafe:
 
     def test_list_falls_to_default(self):
         assert to_int_safe([1, 2, 3]) == 0
+
+
+class TestToLowerTokenSafe:
+    def test_string_normalised(self):
+        assert to_lower_token_safe("  UInt32 ", "uint64") == "uint32"
+
+    def test_non_string_falls_to_default(self):
+        # LLM structured-output drift: list/int/dict where the schema
+        # promised a string.
+        assert to_lower_token_safe(["uint32"], "uint64") == "uint64"
+        assert to_lower_token_safe(64, "uint64") == "uint64"
+        assert to_lower_token_safe({"p": "x"}, "uint64") == "uint64"
+        assert to_lower_token_safe(None, "uint64") == "uint64"
+
+    def test_blank_string_falls_to_default(self):
+        assert to_lower_token_safe("   ", "uint64") == "uint64"
+        assert to_lower_token_safe("", "uint64") == "uint64"
 
 
 class TestToFloatSafe:
@@ -187,3 +205,17 @@ class TestAsPair:
         resp = StructuredResponse(result={"a": 1}, raw="text")
         r1, raw1 = resp  # legacy 2-tuple unpack
         assert resp.as_pair() == (r1, raw1) == ({"a": 1}, "text")
+
+
+def test_public_api_star_export_complete():
+    """``__all__`` carries every public coercer — to_lower_token_safe
+    landed without joining it, so star-imports silently dropped it."""
+    import core.llm.coerce as coerce_mod
+
+    public = {
+        n for n in dir(coerce_mod)
+        if not n.startswith("_") and callable(getattr(coerce_mod, n))
+        and getattr(getattr(coerce_mod, n), "__module__", "")
+        == "core.llm.coerce"
+    }
+    assert public == set(coerce_mod.__all__)

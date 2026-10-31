@@ -1,6 +1,7 @@
 """Tests for the generic dispatch framework (dispatch.py + tasks.py)."""
 
 import sys
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -10,9 +11,14 @@ import pytest
 # packages/llm_analysis/tests/test_dispatch.py -> repo root
 sys.path.insert(0, str(Path(__file__).parents[3]))
 
+from core.llm.accounting import (  # noqa: E402
+    CostObservation,
+    RouteIdentity,
+    attach_cost_observation,
+)
 from packages.llm_analysis.dispatch import (
     DispatchTask, DispatchResult, dispatch_task, _format_elapsed,
-    _classify_error,
+    _classify_error, _breaker_should_open, _BREAKER_PROVEN_THRESHOLD,
 )
 from packages.llm_analysis.tasks import (
     AggregationTask, AnalysisTask, ExploitTask, PatchTask, ConsensusTask,
@@ -477,6 +483,90 @@ class TestDispatchTaskIntegration:
         summary = ct.get_summary()
         assert "test-model" in summary["cost_by_model"]
 
+    def test_progress_line_escapes_hostile_display(self, capsys):
+        # The progress line's display derives from the scanned
+        # (hostile) repo's file names and prints straight to the
+        # operator TTY — a raw ESC would allow ANSI/OSC injection
+        # (title changes, log-line forgery) mid-run.
+        hostile = _make_finding(
+            "f-001", file_path="src/\x1b]0;pwned\x07evil.py",
+        )
+
+        def mock_fn(prompt, schema, system_prompt, temperature, model):
+            return _make_dispatch_result(exploitable=True, score=0.9)
+
+        dispatch_task(
+            task=AnalysisTask(),
+            items=[hostile],
+            dispatch_fn=mock_fn,
+            role_resolution={},
+            prior_results={},
+            cost_tracker=CostTracker(0),
+            max_parallel=1,
+        )
+        out = capsys.readouterr().out
+        assert "\x1b" not in out
+        assert "evil.py" in out  # content survives, escaped
+
+    def test_progress_line_reports_abstention_not_verdict(self, capsys):
+        # A schema-nulled is_exploitable is an abstention. The
+        # progress line must say so — "not exploitable" would show
+        # the operator a definitive ruling nobody made.
+        def mock_fn(prompt, schema, system_prompt, temperature, model):
+            return _make_dispatch_result(exploitable=None, score=None)
+
+        dispatch_task(
+            task=AnalysisTask(),
+            items=[_make_finding("f-001")],
+            dispatch_fn=mock_fn,
+            role_resolution={},
+            prior_results={},
+            cost_tracker=CostTracker(0),
+            max_parallel=1,
+        )
+        out = capsys.readouterr().out
+        assert "no verdict" in out
+        assert "not exploitable" not in out
+
+    def test_progress_line_explicit_false_still_definitive(self, capsys):
+        # Two-direction: an explicit False keeps its ruling.
+        def mock_fn(prompt, schema, system_prompt, temperature, model):
+            return _make_dispatch_result(exploitable=False, score=0.0)
+
+        dispatch_task(
+            task=AnalysisTask(),
+            items=[_make_finding("f-001")],
+            dispatch_fn=mock_fn,
+            role_resolution={},
+            prior_results={},
+            cost_tracker=CostTracker(0),
+            max_parallel=1,
+        )
+        out = capsys.readouterr().out
+        assert "not exploitable" in out
+
+    def test_failure_line_escapes_llm_derived_error(self, capsys):
+        # External-LLM errors can embed response excerpts — the
+        # FAILED progress line must escape them (the CC path
+        # pre-escapes; this is the chokepoint for everything else).
+        findings = [_make_finding("f-001")]
+
+        def failing_fn(prompt, schema, system_prompt, temperature, model):
+            raise RuntimeError("response said \x1b[2J\x1b[H wipe")
+
+        dispatch_task(
+            task=AnalysisTask(),
+            items=findings,
+            dispatch_fn=failing_fn,
+            role_resolution={},
+            prior_results={},
+            cost_tracker=CostTracker(0),
+            max_parallel=1,
+        )
+        out = capsys.readouterr().out
+        assert "FAILED" in out
+        assert "\x1b" not in out
+
     def test_dispatch_handles_errors(self):
         """dispatch_task handles exceptions gracefully."""
         findings = [_make_finding("f-001")]
@@ -649,22 +739,169 @@ class TestDispatchTaskIntegration:
         assert len(dispatch_calls) == 2
 
 
+class TestMixedDispatchOrdering:
+    """Completion order must not change result order or hide cancellation."""
+
+    class _DwellStderr:
+        def __init__(self, inner, calls):
+            self._inner = inner
+            self._calls = calls
+
+        def write(self, text):
+            if "All models hit auth" in text:
+                deadline = time.monotonic() + 10.0
+                while len(self._calls) < 5 and time.monotonic() < deadline:
+                    time.sleep(0.002)
+            return self._inner.write(text)
+
+        def flush(self):
+            return self._inner.flush()
+
+    def test_success_failure_timeout_straggler_and_cancel_keep_input_order(
+        self,
+    ):
+        findings = [_make_finding(f"f-{index}") for index in range(7)]
+        route = RouteIdentity("claudecode", "only-model")
+        calls: list[int] = []
+        caller_ident = threading.get_ident()
+        tracker = CostTracker(0)
+
+        def _success() -> DispatchResult:
+            observation = CostObservation.cli_reported(0.10, route=route)
+            return DispatchResult(
+                result={
+                    "is_true_positive": True,
+                    "is_exploitable": False,
+                    "exploitability_score": 0.1,
+                    "reasoning": "ok",
+                },
+                cost=0.10,
+                tokens=2,
+                model=route.model,
+                provider=route.provider,
+                cost_observation=observation,
+            )
+
+        def _paid_failure(
+            error: BaseException,
+            cost: float,
+            tokens_in: int,
+            tokens_out: int,
+        ) -> BaseException:
+            observation = CostObservation.cli_reported(cost, route=route)
+            attach_cost_observation(error, observation)
+            error.billed_cost_usd = cost  # type: ignore[attr-defined]
+            error.billed_tokens_in = tokens_in  # type: ignore[attr-defined]
+            error.billed_tokens_out = tokens_out  # type: ignore[attr-defined]
+            return error
+
+        def _caller_parked_in_executor_join() -> bool:
+            frame = sys._current_frames().get(caller_ident)
+            while frame is not None:
+                if frame.f_code.co_name == "join":
+                    return True
+                frame = frame.f_back
+            return False
+
+        def mixed(prompt, schema, system_prompt, temperature, model):
+            calls.append(len(calls) + 1)
+            call = calls[-1]
+            if call == 1:
+                return _success()
+            if call == 2:
+                raise _paid_failure(
+                    RuntimeError("ordinary failure"),
+                    0.25,
+                    10,
+                    5,
+                )
+            if call == 3:
+                raise _paid_failure(
+                    TimeoutError("timed out after partial response"),
+                    0.50,
+                    20,
+                    10,
+                )
+            if call == 4:
+                raise RuntimeError("Error 401 Unauthorized")
+            if call == 5:
+                deadline = time.monotonic() + 10.0
+                while (
+                    not _caller_parked_in_executor_join()
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.002)
+                return _success()
+            raise AssertionError("cancelled work unexpectedly dispatched")
+
+        old_stderr = sys.stderr
+        sys.stderr = self._DwellStderr(old_stderr, calls)
+        try:
+            results = dispatch_task(
+                task=AnalysisTask(),
+                items=findings,
+                dispatch_fn=mixed,
+                role_resolution={},
+                prior_results={},
+                cost_tracker=tracker,
+                max_parallel=1,
+            )
+        finally:
+            sys.stderr = old_stderr
+
+        assert calls == [1, 2, 3, 4, 5]
+        assert [result["finding_id"] for result in results] == [
+            finding["finding_id"] for finding in findings
+        ]
+        assert "error" not in results[0]
+        assert results[1]["error_type"] == "error"
+        assert results[2]["error_type"] == "timeout"
+        assert results[3]["error_type"] == "auth"
+        assert "error" not in results[4]
+        assert [result["error_type"] for result in results[5:]] == [
+            "cancelled",
+            "cancelled",
+        ]
+
+        summary = tracker.get_summary()
+        assert summary["failed_dispatches"] == 3
+        assert summary["total_cost"] == pytest.approx(0.95)
+        assert summary["total_tokens"] == 49
+        assert summary["cli_reported_calls"] == 4
+
+
 class TestCircuitBreakerEnforcement:
     """A dead model's pre-submitted futures must not keep dispatching."""
 
     def test_dead_model_futures_short_circuit(self):
+        from core.security.prompt_telemetry import defense_telemetry
+        defense_telemetry.reset()
+
         model_a = MagicMock(model_name="model-a")
         model_b = MagicMock(model_name="model-b")
         findings = [_make_finding(f"f-{i:03d}") for i in range(12)]
         a_calls = []
 
+        def _drained_a_failures() -> int:
+            models = defense_telemetry.summary()[
+                "defense_telemetry"]["models"]
+            return models.get("model-a", {}).get("schema_failed", 0)
+
         def mock_fn(prompt, schema, system_prompt, temperature, model):
             if model is model_a:
+                n_prior = len(a_calls)
                 a_calls.append(1)
-                # Slow failure: keeps the worker busy long enough for
-                # the drain loop to process the previous failure and
-                # mark the model dead before the NEXT dead-check runs.
-                time.sleep(0.15)
+                # Deterministic drain sync (replaces a sleep-won race
+                # with a fixed tolerance band, which a starved CI host
+                # could lose): block until the drain loop has recorded
+                # every PRIOR model-a failure into telemetry, so the
+                # dead-set is current before the next worker's
+                # dead-check can run. Bounded so a regression fails
+                # loudly instead of hanging the suite.
+                deadline = time.monotonic() + 10.0
+                while (_drained_a_failures() < n_prior
+                        and time.monotonic() < deadline):
+                    time.sleep(0.002)
                 raise RuntimeError("model-a keeps exploding")
             return _make_dispatch_result(
                 exploitable=False, score=0.1, model="model-b",
@@ -679,18 +916,52 @@ class TestCircuitBreakerEnforcement:
             cost_tracker=CostTracker(0),
             max_parallel=1,  # sequential: model-a items drain first
         )
+        # Read BEFORE the reset: every real model-a dispatch failed
+        # and must have been recorded exactly once, and the
+        # short-circuited futures must have recorded nothing — a
+        # mismatch means the drain lost or misattributed a failure
+        # event.
+        drained_a = _drained_a_failures()
+        defense_telemetry.reset()
 
-        # Without enforcement every one of the 12 model-a futures called
-        # dispatch_fn (12 wasted API calls). With it the circuit opens
-        # after 3 consecutive failures; at most one extra call can race
-        # in before the dead-set write lands.
+        # Without enforcement every one of the 12 model-a futures
+        # called dispatch_fn (12 wasted API calls). With it, the
+        # breaker's contract is best-effort fast-stop
+        # (_ModelCircuitOpen: a future whose model "has since been
+        # declared dead" is short-circuited at execution time), so
+        # the real-dispatch count is scheduling-dependent, not exact.
+        # The worker thread pulls the next pre-submitted future the
+        # moment the previous one raises, while the DRAIN loop (main
+        # thread) is still recording that failure — with the mock's
+        # drain sync holding, the reachable outcomes are:
+        #   3 — the third failure's dead-add landed before item 4's
+        #       dead-check (worker descheduled between futures);
+        #   4 — the common interleaving: exactly one straggler whose
+        #       dead-check preceded the third failure's drain;
+        #   5 — item 5's dead-check slipped into the gap between the
+        #       third failure's telemetry record and its dead-add.
+        # Item 6 can never dispatch: its dead-check runs only after
+        # item 5's mock observed the FOURTH drained failure, which
+        # the drain records strictly after the third failure's
+        # dead-add. Asserting the common count exactly (== 4) was a
+        # load flake; the open-after-3 threshold itself is pinned
+        # deterministically by TestBreakerShouldOpen.
         assert 3 <= len(a_calls) <= 5
+        assert drained_a == len(a_calls)
 
         skipped = [r for r in results
                    if r.get("error_type") == "circuit_breaker"]
-        assert len(skipped) >= 7
+        assert len(skipped) == 12 - len(a_calls)
         assert all(r["analysed_by"] == "model-a" for r in skipped)
         assert all("circuit-broken" in r["error"] for r in skipped)
+
+        # Every model-a future is accounted for exactly once: the
+        # dispatched ones failed for real, the rest were skipped.
+        a_failed = [r for r in results
+                    if r.get("analysed_by") == "model-a"
+                    and r.get("error_type") != "circuit_breaker"
+                    and "error" in r]
+        assert len(a_failed) == len(a_calls)
 
         # The healthy model still analysed every item.
         b_ok = [r for r in results
@@ -734,27 +1005,76 @@ class TestCircuitBreakerEnforcement:
 
     def test_all_dead_abort_reason_not_mislabelled_as_auth(self):
         """Abort-fill records from the all-models-circuit-broken branch
-        used to say "aborted (auth failure)"."""
+        used to say "aborted (auth failure)". Since the straggler sweep
+        resolves every future that actually RAN, abort-fill rows exist
+        only for futures cancelled before dispatch — so the straggler
+        holds the worker until the dispatching thread is provably
+        parked in the executor join, which is strictly AFTER
+        cancel_futures cancelled the queued remainder: exactly two
+        cancelled futures, every run."""
+        from core.security.prompt_telemetry import defense_telemetry
+        defense_telemetry.reset()
+
         model = MagicMock(model_name="only-model")
         findings = [_make_finding(f"f-{i:03d}") for i in range(6)]
+        calls = []
+        caller_ident = threading.get_ident()
+
+        def _drained() -> int:
+            models = defense_telemetry.summary()[
+                "defense_telemetry"]["models"]
+            return sum(s["schema_failed"] for s in models.values())
+
+        def _caller_parked_in_executor_join() -> bool:
+            # ThreadPoolExecutor.__exit__ -> shutdown(wait=True) ->
+            # Thread.join: only that path puts a "join" frame on the
+            # dispatching thread's stack (the in-loop abort shutdown
+            # passes wait=False and never joins), so this cannot
+            # trigger mid-cancellation.
+            frame = sys._current_frames().get(caller_ident)
+            while frame is not None:
+                if frame.f_code.co_name == "join":
+                    return True
+                frame = frame.f_back
+            return False
 
         def failing_fn(prompt, schema, system_prompt, temperature, m):
+            calls.append(1)
+            n = len(calls)
+            # Deterministic drain sync (cf. the dead-futures test).
+            deadline = time.monotonic() + 10.0
+            while (_drained() < min(n - 1, 3)
+                    and time.monotonic() < deadline):
+                time.sleep(0.002)
+            if n == 4:
+                deadline = time.monotonic() + 10.0
+                while (not _caller_parked_in_executor_join()
+                        and time.monotonic() < deadline):
+                    time.sleep(0.002)
             raise RuntimeError("structured generation failed")
 
-        results = dispatch_task(
-            task=AnalysisTask(),
-            items=findings,
-            dispatch_fn=failing_fn,
-            role_resolution={"analysis_models": [model]},
-            prior_results={},
-            cost_tracker=CostTracker(0),
-            max_parallel=1,
-        )
+        old_stderr = sys.stderr
+        sys.stderr = TestAbortStragglerSweep._DwellStderr(
+            old_stderr, calls)
+        try:
+            results = dispatch_task(
+                task=AnalysisTask(),
+                items=findings,
+                dispatch_fn=failing_fn,
+                role_resolution={"analysis_models": [model]},
+                prior_results={},
+                cost_tracker=CostTracker(0),
+                max_parallel=1,
+            )
+        finally:
+            sys.stderr = old_stderr
+        defense_telemetry.reset()
 
+        assert len(calls) == 4
         assert len(results) == 6
         assert all("error" in r for r in results)
         aborted = [r for r in results if r["error"].startswith("aborted")]
-        assert aborted, "abort-fill records expected after all-dead"
+        assert len(aborted) == 2
         for r in aborted:
             assert "circuit-broken" in r["error"]
             assert "auth" not in r["error"]
@@ -779,6 +1099,44 @@ class TestCircuitBreakerEnforcement:
         aborted = [r for r in results if r.get("error", "").startswith("aborted")]
         for r in aborted:
             assert "auth failure" in r["error"]
+
+
+class TestBreakerShouldOpen:
+    """Deterministic pins for the breaker's open/stay-closed decision.
+
+    The integration tests above exercise the breaker through the
+    threaded dispatch path, where the number of real dispatches is
+    scheduling-dependent — these pin the threshold semantics exactly,
+    with no scheduler in the loop.
+    """
+
+    def test_never_succeeded_opens_at_three(self):
+        assert _breaker_should_open(consec=3, completed=3)
+
+    def test_two_consecutive_failures_stay_closed(self):
+        assert not _breaker_should_open(consec=2, completed=2)
+
+    def test_fast_path_requires_every_completion_to_be_a_failure(self):
+        assert not _breaker_should_open(consec=3, completed=4)
+
+    def test_proven_model_rides_out_short_burst(self):
+        # Prior successes (completed > consec) suspend the fast path.
+        assert not _breaker_should_open(consec=3, completed=10)
+        assert not _breaker_should_open(
+            consec=_BREAKER_PROVEN_THRESHOLD - 1, completed=50,
+        )
+
+    def test_proven_model_opens_at_proven_threshold(self):
+        assert _breaker_should_open(
+            consec=_BREAKER_PROVEN_THRESHOLD, completed=50,
+        )
+
+    def test_proven_threshold_value_pinned(self):
+        # Regression pin for the constant itself — see its
+        # both-directions rationale before moving it in either
+        # direction.
+        assert not _breaker_should_open(consec=9, completed=50)
+        assert _breaker_should_open(consec=10, completed=50)
 
 
 class TestRetryTask:
@@ -1002,6 +1360,42 @@ class TestJudgeTask:
         prompt = task.build_prompt(finding)
         assert "SQL injection via user input" in prompt
         assert "is_exploitable=True" in prompt
+
+    def test_prompt_shows_earliest_snapshot_as_primary_verdict(self):
+        # A cross-family conservative override ran before the judge:
+        # the critique premise must be the analyst's OWN conclusion
+        # (the earliest snapshot), never the override — otherwise the
+        # judge critiques "is_exploitable=True" above reasoning that
+        # argues not-exploitable, and its "agreed" stamp mints
+        # corroboration for a verdict no analyst produced.
+        results_by_id = {
+            "f-001": {
+                "is_exploitable": True,  # cross-family override
+                "pre_crossfamily_is_exploitable": False,
+                "cross_family_disputed": True,
+                "ruling": "false_positive",
+                "reasoning": "sink is unreachable behind constant guard",
+            }
+        }
+        task = JudgeTask(results_by_id=results_by_id)
+        prompt = task.build_prompt(_make_finding("f-001"))
+        assert "is_exploitable=False" in prompt
+
+    def test_prompt_prefers_crossfamily_over_consensus_snapshot(self):
+        # Both stages snapshotted: the cross-family one is earlier in
+        # the pipeline and is the analyst's own verdict.
+        results_by_id = {
+            "f-001": {
+                "is_exploitable": True,
+                "pre_crossfamily_is_exploitable": False,
+                "pre_consensus_is_exploitable": True,
+                "ruling": "false_positive",
+                "reasoning": "r",
+            }
+        }
+        task = JudgeTask(results_by_id=results_by_id)
+        prompt = task.build_prompt(_make_finding("f-001"))
+        assert "is_exploitable=False" in prompt
 
 
 class TestAggregationTask:
@@ -1568,3 +1962,288 @@ class TestScaPatchPrompt:
         bundle = build_patch_prompt_bundle_from_finding(finding)
         user_msg = next(m.content for m in bundle.messages if m.role == "user")
         assert "sqli" in user_msg or "db.py" in user_msg
+
+
+class TestProvenModelBreakerThreshold:
+    """Both directions of _BREAKER_PROVEN_THRESHOLD: a proven model
+    riding out a sub-threshold burst keeps dispatching, while a proven
+    model failing permanently (mid-run credential expiry, provider
+    outage) still opens the breaker instead of burning one timeout per
+    remaining work item — pre-fix the never-succeeded requirement
+    (completed == consec) meant one early success disabled the breaker
+    for the whole run."""
+
+    def test_proven_model_sub_threshold_burst_survives(self):
+        findings = [_make_finding(f"f-{i:03d}") for i in range(15)]
+        call_count = [0]
+
+        def burst_fn(prompt, schema, system_prompt, temperature, model):
+            call_count[0] += 1
+            # 1 success, a 9-failure burst (threshold - 1), recover.
+            if 2 <= call_count[0] <= 10:
+                raise RuntimeError("upstream blip")
+            return _make_dispatch_result()
+
+        results = dispatch_task(
+            task=AnalysisTask(),
+            items=findings,
+            dispatch_fn=burst_fn,
+            role_resolution={},
+            prior_results={},
+            cost_tracker=CostTracker(0),
+            max_parallel=1,
+        )
+        assert call_count[0] == 15          # every item dispatched
+        assert not [r for r in results
+                    if r.get("error_type") == "circuit_breaker"
+                    or str(r.get("error", "")).startswith("aborted")]
+
+    def test_proven_model_permanent_failure_opens_breaker(self):
+        from core.security.prompt_telemetry import defense_telemetry
+        defense_telemetry.reset()
+
+        findings = [_make_finding(f"f-{i:03d}") for i in range(30)]
+        calls = []
+
+        def _drained_failures() -> int:
+            models = defense_telemetry.summary()[
+                "defense_telemetry"]["models"]
+            return sum(s["schema_failed"] for s in models.values())
+
+        def dead_after_one(prompt, schema, system_prompt, temperature,
+                           model):
+            n_prior_failures = max(0, len(calls) - 1)
+            calls.append(1)
+            if len(calls) == 1:
+                return _make_dispatch_result()
+            # Deterministic drain sync up to the threshold (see the
+            # dead-futures test); post-abort stragglers get a short
+            # stall that lets cancel_futures land.
+            deadline = time.monotonic() + (
+                10.0 if n_prior_failures < 10 else 0.5)
+            while (_drained_failures() < min(n_prior_failures, 10)
+                    and time.monotonic() < deadline):
+                time.sleep(0.002)
+            raise RuntimeError("credential expired mid-run")
+
+        results = dispatch_task(
+            task=AnalysisTask(),
+            items=findings,
+            dispatch_fn=dead_after_one,
+            role_resolution={},
+            prior_results={},
+            cost_tracker=CostTracker(0),
+            max_parallel=1,
+        )
+        defense_telemetry.reset()
+
+        # 1 success + 10 failures + one racing extra (+ possible
+        # cancel-window stragglers) — never one call per item.
+        assert 11 <= len(calls) <= 14
+        assert len(results) == 30
+        broken = [r for r in results
+                  if r.get("error_type") == "circuit_breaker"
+                  or str(r.get("error", "")).startswith("aborted")]
+        assert len(broken) >= 16
+
+    def test_success_resets_consecutive_failure_counter(self):
+        """The success branch's ``pm["consec"] = 0`` is what makes the
+        streak CONSECUTIVE rather than cumulative: a model alternating
+        failure/success accumulates 15 failures over 30 calls but never
+        two in a row, so the breaker must never open. Dropping the
+        reset would open the circuit at the proven threshold and
+        short-circuit the rest of the run for a mostly-healthy model.
+        The success direction is schedule-independent (a breaker that
+        never opens has no dead-check to race); the drain-sync below
+        exists so the mutated code reliably reaches the threshold
+        before the run completes."""
+        from core.security.prompt_telemetry import defense_telemetry
+        defense_telemetry.reset()
+
+        findings = [_make_finding(f"f-{i:03d}") for i in range(30)]
+        calls = []
+
+        def _drained_failures() -> int:
+            models = defense_telemetry.summary()[
+                "defense_telemetry"]["models"]
+            return sum(s["schema_failed"] for s in models.values())
+
+        def alternating(prompt, schema, system_prompt, temperature,
+                        model):
+            calls.append(1)
+            n = len(calls)
+            # Even-numbered calls fail; call 1 succeeds first so the
+            # model is proven (completed > consec forever after).
+            n_prior_failures = (n - 1) // 2
+            deadline = time.monotonic() + 10.0
+            while (_drained_failures() < n_prior_failures
+                    and time.monotonic() < deadline):
+                time.sleep(0.002)
+            if n % 2 == 0:
+                raise RuntimeError("intermittent blip")
+            return _make_dispatch_result()
+
+        results = dispatch_task(
+            task=AnalysisTask(),
+            items=findings,
+            dispatch_fn=alternating,
+            role_resolution={},
+            prior_results={},
+            cost_tracker=CostTracker(0),
+            max_parallel=1,
+        )
+        defense_telemetry.reset()
+
+        assert len(calls) == 30             # every item dispatched
+        assert not [r for r in results
+                    if r.get("error_type") == "circuit_breaker"
+                    or str(r.get("error", "")).startswith("aborted")]
+
+
+class TestAbortStragglerSweep:
+    """All-models-dead abort with a real straggler in flight: the
+    worker's dead-check beat the dead-add, so a REAL API call was made
+    — and the executor context-exit (shutdown(wait=True)) joins the
+    worker, so by backfill time that future is done-but-undrained. Its
+    outcome must be swept: the failure's telemetry event recorded and
+    its row carrying the real error (a success carrying its real
+    result), never the backfill's "aborted (...)" mislabel."""
+
+    @staticmethod
+    def _drained_failures() -> int:
+        from core.security.prompt_telemetry import defense_telemetry
+        models = defense_telemetry.summary()[
+            "defense_telemetry"]["models"]
+        return sum(s["schema_failed"] for s in models.values())
+
+    class _DwellStderr:
+        """File-like stderr shim that pins the race deterministically:
+        the drain thread's breaker-open print runs AFTER the third
+        failure's telemetry record and BEFORE the dead-add, so dwelling
+        inside that write until the straggler (call 4) has entered
+        dispatch_fn guarantees exactly one real straggler. Bounded so a
+        regression fails loudly instead of hanging the suite."""
+
+        def __init__(self, inner, calls):
+            self._inner = inner
+            self._calls = calls
+
+        def write(self, text):
+            if "stopping dispatch" in text:
+                deadline = time.monotonic() + 10.0
+                while (len(self._calls) < 4
+                        and time.monotonic() < deadline):
+                    time.sleep(0.002)
+            return self._inner.write(text)
+
+        def flush(self):
+            return self._inner.flush()
+
+    def _run_abort_scenario(self, straggler_outcome):
+        """Drive the only model dead in 3 failures with a 4th call in
+        flight; ``straggler_outcome(prompt)`` decides how call 4
+        completes. Returns (results, calls, drained_failure_count,
+        per-model telemetry summary captured before the reset)."""
+        from core.security.prompt_telemetry import defense_telemetry
+        defense_telemetry.reset()
+
+        model = MagicMock(model_name="only-model")
+        findings = [_make_finding(f"f-{i:03d}") for i in range(4)]
+        calls = []
+
+        def mock_fn(prompt, schema, system_prompt, temperature, m):
+            calls.append(1)
+            n = len(calls)
+            # Deterministic drain sync (cf. the dead-futures test):
+            # block until every PRIOR failure has been drained.
+            deadline = time.monotonic() + 10.0
+            while (self._drained_failures() < min(n - 1, 3)
+                    and time.monotonic() < deadline):
+                time.sleep(0.002)
+            if n == 4:
+                return straggler_outcome(prompt)
+            raise RuntimeError("model keeps exploding")
+
+        old_stderr = sys.stderr
+        sys.stderr = self._DwellStderr(old_stderr, calls)
+        try:
+            results = dispatch_task(
+                task=AnalysisTask(),
+                items=findings,
+                dispatch_fn=mock_fn,
+                role_resolution={"analysis_models": [model]},
+                prior_results={},
+                cost_tracker=CostTracker(0),
+                max_parallel=1,
+            )
+        finally:
+            sys.stderr = old_stderr
+
+        drained = self._drained_failures()
+        telemetry = defense_telemetry.summary()[
+            "defense_telemetry"]["models"].get("only-model", {})
+        defense_telemetry.reset()
+        # The dwell held the dead-add until call 4 had entered, and
+        # with 4 items there is no 5th future to race: exactly one
+        # real straggler, every run.
+        assert len(calls) == 4
+        assert len(results) == 4
+        return results, calls, drained, telemetry
+
+    def test_abort_straggler_failure_keeps_telemetry_and_real_row(self):
+        def _fail(prompt):
+            raise RuntimeError("straggler exploded for real")
+
+        results, calls, drained, _ = self._run_abort_scenario(_fail)
+
+        # Every REAL failure recorded exactly once — including the
+        # straggler's, which the drain loop's abort break never saw.
+        assert drained == 4
+        by_id = {r["finding_id"]: r for r in results}
+        straggler = by_id["f-003"]
+        assert straggler["error"] == "straggler exploded for real"
+        assert straggler["error_type"] == "error"
+        assert straggler["analysed_by"] == "only-model"
+
+    def test_abort_straggler_success_keeps_real_result(self):
+        results, calls, drained, _ = self._run_abort_scenario(
+            lambda prompt: _make_dispatch_result())
+
+        assert drained == 3                 # the three real failures
+        by_id = {r["finding_id"]: r for r in results}
+        straggler = by_id["f-003"]
+        # A completed success is a paid-for result: it must ride the
+        # results list, not be rewritten as an abort casualty.
+        assert "error" not in straggler
+        assert straggler["_quality"] == 1.0
+
+    def test_abort_straggler_success_runs_nonce_leak_check(self):
+        """A swept success must pass the same nonce-leak check as a
+        drained one: the leak flag feeds the defense summary and the
+        cross-family recheck's item selection, both of which still
+        consume it after an abort — and the recheck skips rows with an
+        ``error`` key, so BASE's "aborted" mislabel accidentally
+        quarantined a leaking straggler while an unchecked sweep would
+        promote it as a valid, unflagged analysis row."""
+        def _echo(prompt):
+            # Echoing the prompt reflects the envelope — and its nonce.
+            return DispatchResult(
+                result={
+                    "is_true_positive": True,
+                    "is_exploitable": True,
+                    "exploitability_score": 0.9,
+                    "reasoning": "r",
+                    "content": prompt,
+                },
+                cost=0.10, tokens=500, model="only-model", duration=5.0,
+            )
+
+        results, calls, drained, telemetry = self._run_abort_scenario(
+            _echo)
+
+        by_id = {r["finding_id"]: r for r in results}
+        straggler = by_id["f-003"]
+        assert "error" not in straggler
+        assert straggler.get("_nonce_leaked") is True
+        assert telemetry.get("nonce_leaks", 0) == 1
+        assert telemetry.get("schema_accepted", 0) == 1

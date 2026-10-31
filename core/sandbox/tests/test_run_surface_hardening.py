@@ -26,7 +26,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-from core.sandbox.tests.capability import requires_landlock, requires_userns
+from core.sandbox.tests.capability import (
+    requires_landlock,
+    requires_mount,
+    requires_userns,
+)
 
 pytestmark = pytest.mark.skipif(
     sys.platform != "linux", reason="Linux spawn backend",
@@ -50,6 +54,8 @@ class TestCaptureCeiling(unittest.TestCase):
         if not mount_ns_available():
             self.skipTest("mount-ns not available on this host")
 
+    # Exercises mount-delivered capability; hosts with userns but no mount capability degrade by design -> named SKIP, not a mid-flight mount failure.
+    @requires_mount
     def test_stdout_flood_is_bounded_and_marked(self):
         from unittest import mock
 
@@ -95,6 +101,41 @@ class TestCaptureCeiling(unittest.TestCase):
             "parent-side capture exceeded the 64 MiB ceiling")
         self.assertIn(b"capture truncated", r.stdout,
                       "expected the truncation marker")
+
+    # Same gating rationale as the flood test above.
+    @requires_mount
+    def test_per_call_cap_bounds_the_drain(self):
+        from core.sandbox._spawn import run_sandboxed
+
+        # Per-call ceiling BELOW the module constant: the drain must
+        # honour the caller's tighter bound (SandboxHandle-style
+        # tail-only consumers), no module patching involved.
+        out = tempfile.mkdtemp(prefix="raptor-cap-")
+        prog = textwrap.dedent("""
+            import os
+            chunk = b"x" * (256 * 1024)
+            for _ in range(8):  # 2 MiB > the 256 KiB per-call cap
+                os.write(1, chunk)
+        """)
+        r = run_sandboxed(
+            ["/usr/bin/python3", "-c", prog],
+            target=out, output=out,
+            block_network=True,
+            writable_paths=[out, "/tmp"],
+            nproc_limit=1024,
+            limits={"memory_mb": 0, "max_file_mb": 10240,
+                    "cpu_seconds": 300},
+            readable_paths=None, allowed_tcp_ports=None,
+            seccomp_profile="full", seccomp_block_udp=False,
+            env=None, cwd=None, timeout=120,
+            capture_output=True, text=False,
+            max_capture_bytes=256 * 1024,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr[-300:])
+        self.assertLessEqual(
+            len(r.stdout), 256 * 1024 + 65536 + 4096,
+            "per-call capture cap not honoured by the drain")
+        self.assertIn(b"capture truncated", r.stdout)
 
 
 @requires_landlock

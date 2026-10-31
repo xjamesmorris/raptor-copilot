@@ -167,6 +167,10 @@ def _format_heuristic(
     return "\n".join(lines)
 
 
+# Per-field cap for registry-sourced strings (mirrors maintainer_trust).
+_FIELD_CAP = 200
+
+
 def _format_metadata(
     dep: Dependency, meta: dict[str, Any],
 ) -> str:
@@ -186,17 +190,22 @@ def _format_metadata(
     if latest_pub:
         lines.append(f"Latest version published: {latest_pub}")
     maintainers = meta.get("maintainers", [])
-    if maintainers:
+    if isinstance(maintainers, list) and maintainers:
+        from .registry_view import iter_maintainers
+
         lines.append(f"Maintainers ({len(maintainers)}):")
-        for m in maintainers[:10]:
-            name = m.get("name", m.get("username", "?"))
-            email = m.get("email", "")
+        # iter_maintainers skips hostile entry shapes — mirrors
+        # maintainer_trust; one poisoned row must not abort the stage.
+        for name, email, _added in iter_maintainers(meta, 10):
+            # Per-field caps mirror maintainer_trust (attacker-
+            # publishable strings must not dominate the prompt budget).
             lines.append(
-                f"  - {name}" + (f" <{email}>" if email else "")
+                f"  - {name[:_FIELD_CAP]}"
+                + (f" <{email[:_FIELD_CAP]}>" if email else "")
             )
     repo = meta.get("repository_url")
     if repo:
-        lines.append(f"Repository URL (claimed): {repo}")
+        lines.append(f"Repository URL (claimed): {str(repo)[:_FIELD_CAP]}")
     elif "repository_url" in meta:
         lines.append("Repository URL: (none declared)")
     downloads = meta.get("download_count")

@@ -68,3 +68,28 @@ class TestFlagValue:
         args = ["0", "--sanitizer-cut-parity-log", "/log"]
         assert mod._flag_value(args, "--sanitizer-cut") is None
         assert mod._flag_value(args, "--sanitizer-cut-parity-log") == "/log"
+
+    def test_project_name_space_form(self):
+        mod = _load_helper()
+        assert mod._flag_value(["0", "--project", "myapp"],
+                               "--project") == "myapp"
+
+    def test_project_bare_dash_space_form(self):
+        # `--project -` = explicitly projectless (core/run/pin.py);
+        # the usage string advertises `--project <name|->`.
+        mod = _load_helper()
+        assert mod._flag_value(["0", "--project", "-"],
+                               "--project") == "-"
+
+    def test_project_bare_dash_equals_form(self):
+        mod = _load_helper()
+        assert mod._flag_value(["0", "--project=-"], "--project") == "-"
+
+    def test_flag_shaped_value_still_errors(self):
+        # Bare `-` is legal; flag-shaped tokens are still a missing
+        # value in both forms.
+        mod = _load_helper()
+        with pytest.raises(SystemExit):
+            mod._flag_value(["0", "--project", "--out"], "--project")
+        with pytest.raises(SystemExit):
+            mod._flag_value(["0", "--project=--out"], "--project")

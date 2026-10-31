@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import logging
 import math
-import re
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -44,6 +43,8 @@ from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+
+from core.llm.scorecard.cwe import extract_cwe
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +82,9 @@ MIN_RELIABILITY_EVENTS = 5
 # prefer-positive rule, never by floating-point noise.
 _TIE_EPSILON = 1e-9
 
-_CWE_RE = re.compile(r"CWE-\d+", re.IGNORECASE)
+# CWE extraction shares one grammar with the audit:<CWE> writers
+# (core.llm.scorecard.cwe) — suffix spellings are routine in journal
+# rows, and a writer/reader grammar split silently un-joins the cells.
 
 # Statuses that cast a vote. dormant/error/unknown variants are kept in
 # the panel annotations but do not move the posterior.
@@ -104,10 +107,9 @@ def decision_class_for(variants: list[dict[str, Any]]) -> str:
     falls back to the catch-all audit review class.
     """
     for v in variants:
-        cwe = str(v.get("cwe") or v.get("cwe_class") or "")
-        m = _CWE_RE.search(cwe)
-        if m:
-            return f"{DECISION_CLASS_PREFIX}:{m.group(0).upper()}"
+        tag = extract_cwe(v.get("cwe") or v.get("cwe_class") or "")
+        if tag:
+            return f"{DECISION_CLASS_PREFIX}:{tag}"
     return DEFAULT_DECISION_CLASS
 
 
@@ -127,6 +129,14 @@ def model_reliability(
         return None
     try:
         stats = scorecard.get_stat(decision_class, model)
+        # This weight is AUTHORITY (it steers which model's verdict
+        # wins the merge), not introspection: a row materialised from
+        # an unverifiable read (the key-unusable clamp keeps forged
+        # content readable) must stay uninformative — a forged
+        # all-correct cell otherwise buys a near-1.0 weight through
+        # the stats surface the trust clamp doesn't cover.
+        if stats is not None and not getattr(stats, "trusted", True):
+            return None
     except Exception:  # never let a store read break a merge
         logger.debug("scorecard read failed for %s/%s",
                      decision_class, model, exc_info=True)
@@ -204,11 +214,10 @@ def _priors_from_journal_uncached(out_dir: Path) -> Mapping[str, Any]:
 
     counts: dict[str, list[int]] = {}
     for e in latest.values():
-        cwe = str(getattr(e, "cwe", "") or "")
-        m = _CWE_RE.search(cwe)
-        if not m:
+        tag = extract_cwe(getattr(e, "cwe", "") or "")
+        if not tag:
             continue
-        dc = f"{DECISION_CLASS_PREFIX}:{m.group(0).upper()}"
+        dc = f"{DECISION_CLASS_PREFIX}:{tag}"
         bucket = counts.setdefault(dc, [0, 0])
         verdict = (e.validate_verdict or "").strip().lower()
         if verdict in ("confirmed", "exploitable"):
@@ -321,7 +330,7 @@ def calibrated_decision(
     try:
         from .evidence_grade import is_tool_evidence
     except ImportError:  # pragma: no cover
-        is_tool_evidence = lambda _ev: False
+        is_tool_evidence = lambda _ev: False  # type: ignore[assignment]
     tool_backed = [
         e for e in losing_positive
         if is_tool_evidence(e[0].get("evidence_tool", "") or "")

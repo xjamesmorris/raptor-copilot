@@ -15,13 +15,21 @@ network tool of their own. Constraints, all fail-closed:
   - https only;
   - the transfer goes through ``core.http.EgressClient`` (in-process
     egress proxy: hostname allowlist pinned to the attachment's own
-    host, private-IP / loopback resolution refused, size-capped body).
+    host, private-IP / loopback resolution refused, size-capped body);
+  - the destination is confined to the ``attachments/`` directory
+    beside the bug report: only the final file name of ``<dest-file>``
+    is honoured (sanitised to a conservative charset), and any parent
+    (``..``) component refuses — the file name originates in the
+    untrusted tracker, so it must never steer the write location.
 
 The downloaded file is an untrusted crash input: callers feed it to
 the instrumented target program, nothing else.
 
 Exit codes: 0 success, 1 download/validation failure, 2 usage error.
 """
+import errno
+import re
+import stat
 import sys
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -43,11 +51,95 @@ if not (os.environ.get("CLAUDECODE")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import core.startup.process_init  # noqa: E402,F401
 from core.json import load_json  # noqa: E402
+from core.security.log_sanitisation import sanitise_for_terminal as _sft  # noqa: E402
 
 # Byte budget for bug-report.json: it is distilled from an untrusted
 # bug tracker, so cap the read like every other libexec artifact
 # reader rather than buffering a pathological file unbounded.
 _MAX_REPORT_BYTES = 8 * 1024 * 1024
+
+
+# Attachment file names come from the untrusted tracker (the agent
+# composes <workdir>/attachments/<filename> from the report), so the
+# kept name is reduced to a conservative charset.
+_SAFE_NAME_CHARS = re.compile(r"[^A-Za-z0-9._-]")
+_MAX_NAME_LEN = 128
+
+
+def _confine_dest(dest_arg: str, report_path: Path) -> Path | None:
+    """Confine the requested destination under the run's attachment
+    directory (``attachments/`` beside the bug report).
+
+    Only the final file name of *dest_arg* is honoured; a ``..``
+    component anywhere refuses outright (None) rather than being
+    silently repaired — a traversal-shaped name is a signal worth
+    surfacing, not normalising. The name is then reduced to a
+    conservative charset and stripped of leading dots/dashes so it can
+    be neither an option shape nor a dotfile.
+    """
+    raw = Path(dest_arg)
+    if ".." in raw.parts:
+        return None
+    name = raw.name
+    if not name or name == ".":
+        return None
+    name = _SAFE_NAME_CHARS.sub("_", name)
+    name = name.lstrip(".-")[:_MAX_NAME_LEN] or "attachment.bin"
+    return report_path.resolve().parent / "attachments" / name
+
+
+# Flags for the anchored directory opens below. getattr fallbacks keep
+# the script importable where a flag is missing; the fstat(S_ISDIR)
+# check on the OPENED fd carries the directory guarantee either way.
+_O_DIR_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+
+
+def _open_attachments_dir(attachments_dir: Path) -> int:
+    """Open ``attachments_dir`` as an fd via an anchored component walk.
+
+    The base (the resolved bug-report directory — canonical, so a
+    symlink at its final component can only be a post-resolve swap) is
+    opened with O_DIRECTORY|O_NOFOLLOW, then the ``attachments``
+    component is created and opened relative to that fd (``dir_fd``),
+    each fd verified S_ISDIR by fstat — never by name. A symlink at
+    either component refuses (ELOOP) instead of being followed: a
+    by-name probe (``is_symlink()``) races a concurrent swap, an
+    already-opened fd cannot be redirected.
+
+    Returns the directory fd (caller closes). Raises OSError on any
+    refusal.
+
+    Sibling: :mod:`core.source.beneath` is the shared home for the
+    READER-side anchored open (``open_regular_beneath``). This walk
+    stays script-local because it is write-side — it mkdirs the
+    final component mid-walk — and adopts a shared
+    ``open_dir_beneath`` when that flavor earns a second consumer.
+    """
+    base_fd = os.open(str(attachments_dir.parent), _O_DIR_FLAGS)
+    try:
+        if not stat.S_ISDIR(os.fstat(base_fd).st_mode):
+            raise OSError(errno.ENOTDIR, "not a directory",
+                          str(attachments_dir.parent))
+        try:
+            os.mkdir(attachments_dir.name, 0o755, dir_fd=base_fd)
+        except FileExistsError:
+            pass  # whatever exists is vetted by the anchored open below
+        fd = os.open(attachments_dir.name, _O_DIR_FLAGS, dir_fd=base_fd)
+    finally:
+        os.close(base_fd)
+    try:
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(errno.ENOTDIR, "not a directory",
+                          str(attachments_dir))
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 def _attachment_urls(report: object) -> set:
@@ -68,7 +160,7 @@ def main() -> int:
               file=sys.stderr)
         return 2
 
-    report_path, url, dest = Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3])
+    report_path, url = Path(sys.argv[1]), sys.argv[2]
 
     report = load_json(report_path, max_bytes=_MAX_REPORT_BYTES)
     if report is None:
@@ -76,8 +168,11 @@ def main() -> int:
         return 1
 
     if url not in _attachment_urls(report):
+        # The URL comes verbatim from the untrusted bug report — the
+        # scheme/host checks below never run on this refusal path, and
+        # path bytes are unconstrained in any case.
         print(
-            f"refusing download: {url} is not recorded in "
+            f"refusing download: {_sft(url, max_len=300)} is not recorded in "
             f"{report_path.name}'s attachments list",
             file=sys.stderr,
         )
@@ -86,7 +181,7 @@ def main() -> int:
     try:
         parts = urlsplit(url)
     except ValueError as e:
-        print(f"malformed url: {e}", file=sys.stderr)
+        print(f"malformed url: {_sft(str(e), max_len=300)}", file=sys.stderr)
         return 1
     if parts.scheme.lower() != "https" or not parts.hostname:
         print("refusing download: attachment URLs must be https with a "
@@ -97,18 +192,77 @@ def main() -> int:
               file=sys.stderr)
         return 1
 
+    dest = _confine_dest(sys.argv[3], report_path)
+    if dest is None:
+        print(
+            "refusing download: destination must not contain parent "
+            "('..') components and must end in a file name; the file "
+            "is stored under the bug report's attachments/ directory",
+            file=sys.stderr,
+        )
+        return 1
+    # Anchor the attachments directory to an fd BEFORE the fetch and
+    # hold it across the download: a by-name probe here followed by a
+    # path-resolved mkdir/write AFTER the network round-trip leaves a
+    # window spanning the whole fetch in which a racer with the
+    # run-dir write grant (exactly the grant sandboxed target code
+    # holds) swaps attachments/ for a symlink and redirects the write.
+    # Every write below goes through this fd; the path is never
+    # re-resolved once the fetch has started.
+    try:
+        dir_fd = _open_attachments_dir(dest.parent)
+    except OSError as e:
+        if e.errno in (errno.ELOOP, errno.ENOTDIR):
+            print(
+                f"refusing download: {dest.parent} is not a real "
+                "directory — the attachments directory must be a "
+                "directory, not a symlink or other file",
+                file=sys.stderr,
+            )
+        else:
+            print(f"download failed: cannot prepare {dest.parent}: {e}",
+                  file=sys.stderr)
+        return 1
+
     from core.http import HttpError
     from core.http.egress_backend import EgressClient
     client = EgressClient(allowed_hosts=[parts.hostname])
     try:
-        body = client.get_bytes(url)
-    except HttpError as e:
-        print(f"download failed: {e}", file=sys.stderr)
-        return 1
+        try:
+            body = client.get_bytes(url)
+        except HttpError as e:
+            print(f"download failed: {_sft(str(e), max_len=300)}",
+                  file=sys.stderr)
+            return 1
 
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_bytes(body)
-    print(f"OK: {url} -> {dest} ({len(body)} bytes)")
+        # O_NOFOLLOW closes the same check-then-write window on the
+        # FINAL component: an is_symlink() probe followed by
+        # write_bytes let a symlink swapped in between redirect the
+        # write. The open refuses with ELOOP, and dir_fd anchors it
+        # to the directory opened before the fetch.
+        try:
+            fd = os.open(
+                dest.name,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o644,
+                dir_fd=dir_fd,
+            )
+        except OSError as e:
+            if e.errno == errno.ELOOP:
+                print(f"refusing download: {dest} is a symlink",
+                      file=sys.stderr)
+                return 1
+            print(f"download failed: cannot write {dest}: {e}",
+                  file=sys.stderr)
+            return 1
+    finally:
+        os.close(dir_fd)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(body)
+    if str(dest) != sys.argv[3]:
+        print(f"note: destination confined to {dest}", file=sys.stderr)
+    print(f"OK: {_sft(url, max_len=300)} -> {dest} ({len(body)} bytes)")
     return 0
 
 

@@ -285,3 +285,107 @@ class HostileStampTest(unittest.TestCase):
                             "unbounded stamp flooded the message")
             # Non-int pid is coerced, not echoed.
             self.assertIn("pid unknown", msg)
+
+
+class ReadHolderBoundedTest(unittest.TestCase):
+    """The holder stamp is writable by any principal with project-dir
+    access — the diagnostic read is byte-bounded, degrading an
+    over-cap plant to the holder-unknown shape."""
+
+    def test_oversize_stamp_reads_as_unknown(self):
+        from tempfile import TemporaryDirectory
+
+        from core.project.oplock import read_holder
+        with TemporaryDirectory() as td:
+            lock = Path(td) / ".op.lock"
+            lock.write_text('{"pad": "' + "A" * (2 * 1024 * 1024) + '"}',
+                            encoding="utf-8")
+            self.assertEqual(read_holder(lock), {})
+
+    def test_normal_stamp_still_parses(self):
+        from tempfile import TemporaryDirectory
+
+        from core.project.oplock import read_holder
+        with TemporaryDirectory() as td:
+            lock = Path(td) / ".op.lock"
+            lock.write_text('{"pid": 123, "op": "merge"}',
+                            encoding="utf-8")
+            self.assertEqual(read_holder(lock)["op"], "merge")
+
+
+class VerifyAfterLockTest(unittest.TestCase):
+    """delete --purge rmtrees a possibly-held .op.lock; a re-created
+    same-path project mints a fresh inode — without verify-after-lock
+    the old holder and every new locker sat on DIFFERENT inodes,
+    silently splitting the mutual exclusion."""
+
+    def test_lock_re_acquires_on_replaced_inode(self):
+        import os
+        from tempfile import TemporaryDirectory
+
+        from core.project.oplock import op_lock_path, project_op_lock
+        with TemporaryDirectory() as td:
+            pdir = Path(td) / "proj"
+            pdir.mkdir()
+            lock = op_lock_path(pdir)
+            # Simulate the purge+recreate race: swap the inode as the
+            # locker acquires (a pre-created stale file the purge
+            # removed mid-acquire). Hold an fd on the stale file
+            # across the unlink: ext4 hands the freed inode NUMBER to
+            # the very next create (tmpfs allocates monotonically), and
+            # a recycled number makes the swap invisible to any inode
+            # comparison — the open fd keeps the stale inode allocated
+            # so the replacement provably differs on every filesystem.
+            lock.write_text("")
+            stale_fd = os.open(str(lock), os.O_RDONLY)
+            try:
+                stale_ino = os.stat(lock).st_ino
+                os.unlink(lock)
+                lock.write_text("")
+                with project_op_lock(pdir, "merge"):
+                    held = os.stat(lock)
+                    self.assertNotEqual(held.st_ino, stale_ino)
+                    # The holder's fd is on the CURRENT path inode.
+                    import fcntl
+                    fd = os.open(str(lock), os.O_RDWR)
+                    try:
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    finally:
+                        os.close(fd)
+            finally:
+                os.close(stale_fd)
+
+    def test_purged_lock_mid_hold_reminted(self):
+        import os
+        from tempfile import TemporaryDirectory
+
+        from core.project.oplock import op_lock_path, project_op_lock
+        with TemporaryDirectory() as td:
+            pdir = Path(td) / "proj"
+            pdir.mkdir()
+            lock = op_lock_path(pdir)
+
+            # Direct check of the verify loop: report a swapped inode
+            # once (a purge landing between open and verify) and pin
+            # that the lock re-mints instead of holding a dead inode.
+            first = {"done": False}
+            real_stat = os.stat
+
+            def swapping_stat(path, *a, **k):
+                st = real_stat(path, *a, **k)
+                if (not first["done"]
+                        and str(path) == str(lock)):
+                    first["done"] = True
+                    # lie once: report a different inode so the
+                    # verify loop re-mints
+                    class _St:
+                        st_ino = st.st_ino + 1
+                        st_dev = st.st_dev
+                    return _St()
+                return st
+
+            with patch("core.project.oplock.os.stat", swapping_stat):
+                with project_op_lock(pdir, "merge"):
+                    pass
+            self.assertTrue(first["done"])

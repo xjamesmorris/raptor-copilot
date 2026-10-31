@@ -108,8 +108,13 @@ _ERROR_RE = re.compile(
     r"|(?-i:\b(?:E[A-Z]{2,}|STATUS_[A-Z_]+|ERROR_[A-Z_]+|ERR_[A-Z_]+)\b)"
     # Success/failure checks
     r"|\b(?:succeeded|failed|is_?(?:err(?:or)?|ok|success))\b"
-    # Go error pattern
-    r"|\berr\s*!=\s*nil\b"
+    # NOTE: Go's ``err != nil`` deliberately has no alternation here.
+    # _NULL_RE precedes _ERROR_RE in _CLASSIFIERS and its generic
+    # ``\w+ != nil`` comparison already matches it, so a copy here
+    # was dead — Go error checks classify as "null". Reclassifying
+    # them as "error" would change sink priority scoring (error
+    # guards deduct more than null guards) and the adequacy specs'
+    # category sets, so it is a behavior decision, not a cleanup.
     # HTTP status
     r"|\b(?:status_?code|http_?status)\s*(?:==|!=|<|>)"
     # Exception-related

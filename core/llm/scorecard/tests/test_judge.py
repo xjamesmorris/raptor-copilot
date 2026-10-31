@@ -338,6 +338,242 @@ class TestPanelTie:
                 EventType.JUDGE_REVIEW,
             ) == (0, 0)
 
+class TestAbstentions:
+    """A judge with ``is_exploitable: None`` (errored / refused /
+    schema-failed response) cast no vote — same abstention rule as
+    ``tally_verdict_votes`` (the contract ``JudgeTask.finalize``
+    applies). Abstainers never join the tie computation and never
+    receive a JUDGE_REVIEW event."""
+
+    def test_abstainer_gets_no_event_on_real_majority(self, scorecard):
+        """Judges [True, True, None] vs primary False: JudgeTask's
+        abstention-aware tally finalises exploitable on a real 2-1
+        majority. Pre-fix the producer bool()-coerced the abstainer
+        into a False vote, saw a 2-2 'tie' and dropped the whole
+        finding's signal. Post-fix: primary incorrect, both voting
+        judges correct, abstainer untouched."""
+        results = {"f1": {
+            "rule_id": "py/sql-injection",
+            "judge": "disputed",
+            "is_exploitable": True,           # real 2-1 majority
+            "analysed_by": "claude-opus",
+            "reasoning": "primary reasoning",
+            "judge_analyses": [
+                {"model": "gpt-5", "is_exploitable": True},
+                {"model": "gemini", "is_exploitable": True},
+                {"model": "mistral", "is_exploitable": None,
+                 "reasoning": ""},
+            ],
+        }}
+        n = record_judge_outcomes(
+            scorecard,
+            results_by_id=results,
+            primary_verdicts_before_judge={"f1": False},
+        )
+        assert n == 3
+        dc = "agentic:py/sql-injection"
+        assert _stat(scorecard, dc, "claude-opus", EventType.JUDGE_REVIEW) == (0, 1)
+        assert _stat(scorecard, dc, "gpt-5",       EventType.JUDGE_REVIEW) == (1, 0)
+        assert _stat(scorecard, dc, "gemini",      EventType.JUDGE_REVIEW) == (1, 0)
+        # The abstaining judge cast no vote — no cell, no event.
+        assert scorecard.get_stat(dc, "mistral") is None
+
+    def test_junk_judge_vote_is_an_abstention(self, scorecard):
+        """A judge whose is_exploitable is a non-bool shape ("yes")
+        cast no readable vote. Pre-fix the `is not None` filter kept
+        it as a voter and bool()-coerced the junk into a True vote —
+        minting a JUDGE_REVIEW reliability event for a vote never
+        cast (the tri-state accessor reads junk as abstention)."""
+        results = {"f1": {
+            "rule_id": "py/sql-injection",
+            "judge": "disputed",
+            "is_exploitable": True,           # real 2-1 majority
+            "analysed_by": "claude-opus",
+            "reasoning": "primary reasoning",
+            "judge_analyses": [
+                {"model": "gpt-5", "is_exploitable": True},
+                {"model": "gemini", "is_exploitable": True},
+                {"model": "mistral", "is_exploitable": "yes",
+                 "reasoning": ""},
+            ],
+        }}
+        n = record_judge_outcomes(
+            scorecard,
+            results_by_id=results,
+            primary_verdicts_before_judge={"f1": False},
+        )
+        assert n == 3
+        dc = "agentic:py/sql-injection"
+        # The junk-vote judge gets no cell, exactly like a None vote.
+        assert scorecard.get_stat(dc, "mistral") is None
+        assert _stat(scorecard, dc, "gpt-5", EventType.JUDGE_REVIEW) == (1, 0)
+
+    def test_junk_primary_snapshot_value_is_an_abstention(self, scorecard):
+        """A junk value in the pre-judge snapshot is not a primary
+        vote. Pre-fix bool()-coercion minted a phantom True vote that
+        broke this genuine 1-1 judge tie into a 2-1 "majority" —
+        scoring a real judge "incorrect" and fabricating a "correct"
+        primary event for a vote never cast. Junk = abstention: the
+        real votes are a tie, nothing is recorded."""
+        results = {"f1": {
+            "rule_id": "py/sql-injection",
+            "judge": "disputed",
+            "is_exploitable": True,
+            "analysed_by": "claude-opus",
+            "reasoning": "primary reasoning",
+            "judge_analyses": [
+                {"model": "gpt-5", "is_exploitable": True},
+                {"model": "gemini", "is_exploitable": False,
+                 "reasoning": "dissent"},
+            ],
+        }}
+        n = record_judge_outcomes(
+            scorecard,
+            results_by_id=results,
+            primary_verdicts_before_judge={"f1": "yes"},
+        )
+        assert n == 0
+        for model in ("claude-opus", "gpt-5", "gemini"):
+            assert scorecard.get_stat("agentic:py/sql-injection", model) is None
+
+    def test_junk_final_verdict_records_nothing(self, scorecard):
+        """A junk finalised is_exploitable is not a majority outcome
+        to score anyone against — pre-fix bool() read it as True and
+        scored the panel against a fabricated verdict."""
+        results = {"f1": {
+            "rule_id": "py/sql-injection",
+            "judge": "disputed",
+            "is_exploitable": "yes",
+            "analysed_by": "claude-opus",
+            "reasoning": "primary reasoning",
+            "judge_analyses": [
+                {"model": "gpt-5", "is_exploitable": True},
+                {"model": "gemini", "is_exploitable": True},
+            ],
+        }}
+        n = record_judge_outcomes(
+            scorecard,
+            results_by_id=results,
+            primary_verdicts_before_judge={"f1": False},
+        )
+        assert n == 0
+
+    def test_abstention_tie_skips_and_mints_nothing(self, scorecard):
+        """Judges [True, None] vs primary False: the real vote is a
+        1-1 tie, so JudgeTask preserves the primary verdict as a
+        mechanical tie-break. Pre-fix the producer counted the
+        abstainer as a False vote, saw a 1-vs-2 'majority', scored
+        the True judge incorrect AND minted a correct JUDGE_REVIEW
+        event for the abstainer — a reliability event for a vote
+        never cast. Post-fix: tie over actual voters, nothing
+        recorded."""
+        results = {"f1": {
+            "rule_id": "py/sql-injection",
+            "judge": "disputed",
+            "is_exploitable": False,          # preserved primary
+            "analysed_by": "claude-opus",
+            "reasoning": "primary reasoning",
+            "judge_analyses": [
+                {"model": "gpt-5", "is_exploitable": True,
+                 "reasoning": "judge dissent"},
+                {"model": "gemini", "is_exploitable": None,
+                 "reasoning": ""},
+            ],
+        }}
+        n = record_judge_outcomes(
+            scorecard,
+            results_by_id=results,
+            primary_verdicts_before_judge={"f1": False},
+        )
+        assert n == 0
+        for model in ("claude-opus", "gpt-5", "gemini"):
+            assert scorecard.get_stat("agentic:py/sql-injection", model) is None
+
+    def test_abstention_negative_majority_direction(self, scorecard):
+        """Mirror direction: judges [False, False, None] vs primary
+        True — a real 2-1 not-exploitable majority. Primary
+        incorrect, voting judges correct, abstainer untouched."""
+        results = {"f1": {
+            "rule_id": "py/sql-injection",
+            "judge": "disputed",
+            "is_exploitable": False,          # real 2-1 majority
+            "analysed_by": "claude-opus",
+            "reasoning": "primary reasoning",
+            "judge_analyses": [
+                {"model": "gpt-5", "is_exploitable": False},
+                {"model": "gemini", "is_exploitable": False},
+                {"model": "mistral", "is_exploitable": None},
+            ],
+        }}
+        n = record_judge_outcomes(
+            scorecard,
+            results_by_id=results,
+            primary_verdicts_before_judge={"f1": True},
+        )
+        assert n == 3
+        dc = "agentic:py/sql-injection"
+        assert _stat(scorecard, dc, "claude-opus", EventType.JUDGE_REVIEW) == (0, 1)
+        assert _stat(scorecard, dc, "gpt-5",       EventType.JUDGE_REVIEW) == (1, 0)
+        assert _stat(scorecard, dc, "gemini",      EventType.JUDGE_REVIEW) == (1, 0)
+        assert scorecard.get_stat(dc, "mistral") is None
+
+    def test_all_judges_abstained_records_nothing(self, scorecard):
+        """Defensive: JudgeTask marks a fully-abstained panel
+        ``judge == "no-verdict"``, but a dirty record tagged
+        disputed must not score the primary against its own
+        preserved verdict (self-corroboration)."""
+        results = {"f1": {
+            "rule_id": "py/sql-injection",
+            "judge": "disputed",
+            "is_exploitable": True,
+            "analysed_by": "claude-opus",
+            "judge_analyses": [
+                {"model": "gpt-5", "is_exploitable": None},
+                {"model": "gemini", "is_exploitable": None},
+            ],
+        }}
+        n = record_judge_outcomes(
+            scorecard,
+            results_by_id=results,
+            primary_verdicts_before_judge={"f1": True},
+        )
+        assert n == 0
+        assert scorecard.get_stat("agentic:py/sql-injection", "claude-opus") is None
+
+    def test_abstention_unmasks_tie_into_majority_both_ways(self, scorecard):
+        """Judges [False, None, True, True] vs primary True: voting
+        panel is 3-1 exploitable (abstainer coerced to False would
+        have faked a 3-2 — still majority — but with primary False
+        and judges [True, None] the coercion direction flips; this
+        case pins the abstainer excluded from the denominator)."""
+        results = {"f1": {
+            "rule_id": "py/sql-injection",
+            "judge": "disputed",
+            "is_exploitable": True,
+            "analysed_by": "claude-opus",
+            "judge_analyses": [
+                {"model": "gpt-5", "is_exploitable": False,
+                 "reasoning": "dissent"},
+                {"model": "gemini", "is_exploitable": None},
+                {"model": "mistral", "is_exploitable": True},
+                {"model": "llama", "is_exploitable": True},
+            ],
+        }}
+        n = record_judge_outcomes(
+            scorecard,
+            results_by_id=results,
+            primary_verdicts_before_judge={"f1": True},
+        )
+        assert n == 4
+        dc = "agentic:py/sql-injection"
+        assert _stat(scorecard, dc, "claude-opus", EventType.JUDGE_REVIEW) == (1, 0)
+        assert _stat(scorecard, dc, "gpt-5",       EventType.JUDGE_REVIEW) == (0, 1)
+        assert _stat(scorecard, dc, "mistral",     EventType.JUDGE_REVIEW) == (1, 0)
+        assert _stat(scorecard, dc, "llama",       EventType.JUDGE_REVIEW) == (1, 0)
+        assert scorecard.get_stat(dc, "gemini") is None
+
+
+class TestPanelTieMajority:
     def test_clear_majority_still_records(self, scorecard):
         """3-vs-1 panel: every voter is scored against the majority."""
         results = {"f1": {
@@ -366,3 +602,114 @@ class TestPanelTie:
             scorecard, "agentic:py/sql-injection", "gpt-5",
             EventType.JUDGE_REVIEW,
         ) == (1, 0)
+
+
+class TestAbstainedPrimarySnapshot:
+    """A ``None`` snapshot entry means the primary ABSTAINED — it cast
+    no vote. Pre-fix ``bool(None)`` minted a "not exploitable" primary
+    vote, skewing the tie computation and writing a fabricated primary
+    outcome into the ledger against exploitable-voting judges."""
+
+    def _record(self, scorecard, judges, final, primary_snap):
+        results = {"f1": {
+            "rule_id": "py/sql-injection",
+            "judge": "disputed",
+            "is_exploitable": final,
+            "analysed_by": "claude-opus",
+            "reasoning": "primary reasoning",
+            "judge_analyses": [
+                {"model": m, "is_exploitable": v} for m, v in judges
+            ],
+        }}
+        return record_judge_outcomes(
+            scorecard,
+            results_by_id=results,
+            primary_verdicts_before_judge={"f1": primary_snap},
+        )
+
+    def test_abstained_primary_gets_no_event_judges_still_score(self, scorecard):
+        n = self._record(
+            scorecard,
+            judges=[("gpt-5", True), ("gemini", True)],
+            final=True,
+            primary_snap=None,
+        )
+        assert n == 2
+        dc = "agentic:py/sql-injection"
+        assert scorecard.get_stat(dc, "claude-opus") is None
+        assert _stat(scorecard, dc, "gpt-5",  EventType.JUDGE_REVIEW) == (1, 0)
+        assert _stat(scorecard, dc, "gemini", EventType.JUDGE_REVIEW) == (1, 0)
+
+    def test_abstained_primary_split_judges_is_a_tie_skip(self, scorecard):
+        """Primary None + judges [True, False]: the real vote is 1-1 —
+        JudgeTask's finalised value is a mechanical tie-break, so
+        nothing scores. Pre-fix the coerced primary made it 1-vs-2
+        and the exploitable-voting judge was minted incorrect against
+        a majority the primary never joined."""
+        n = self._record(
+            scorecard,
+            judges=[("gpt-5", True), ("gemini", False)],
+            final=False,          # mechanical (preserved abstention)
+            primary_snap=None,
+        )
+        assert n == 0
+        for model in ("claude-opus", "gpt-5", "gemini"):
+            assert scorecard.get_stat("agentic:py/sql-injection", model) is None
+
+    def test_abstained_primary_single_voting_judge_skips(self, scorecard):
+        """Primary None + judges [True, None]: one real vote cannot
+        define a majority — recording the lone voter correct against
+        a verdict only it produced would mint self-corroboration."""
+        n = self._record(
+            scorecard,
+            judges=[("gpt-5", True), ("gemini", None)],
+            final=True,
+            primary_snap=None,
+        )
+        assert n == 0
+
+    def test_voting_primary_unchanged(self, scorecard):
+        """Control: a primary that actually voted keeps scoring
+        exactly as before."""
+        n = self._record(
+            scorecard,
+            judges=[("gpt-5", True), ("gemini", True)],
+            final=True,
+            primary_snap=False,
+        )
+        assert n == 3
+        dc = "agentic:py/sql-injection"
+        assert _stat(scorecard, dc, "claude-opus", EventType.JUDGE_REVIEW) == (0, 1)
+
+
+class TestUnattributablePrimarySkipped:
+    """A result without ``analysed_by`` cannot attribute the primary's
+    outcome — minting it on a literal "?" cell accumulates noise no
+    producer ever revisits (cmd_tool_evidence skips no-model records
+    for exactly this reason; this was sibling drift). The primary's
+    VOTE still counts toward the tie computation; only the event is
+    skipped, and the judges still grade."""
+
+    def test_no_analysed_by_skips_primary_event_keeps_judges(
+        self, tmp_path,
+    ):
+        sc = ModelScorecard(tmp_path / "sc.json")
+        results = {"f1": {
+            "rule_id": "r",
+            "judge": "disputed",
+            "is_exploitable": True,
+            "judge_analyses": [
+                {"model": "j1", "is_exploitable": True},
+                {"model": "j2", "is_exploitable": True},
+            ],
+            # no analysed_by
+        }}
+        n = record_judge_outcomes(
+            sc,
+            results_by_id=results,
+            primary_verdicts_before_judge={"f1": False},
+        )
+        # Judges grade (2 events); no "?"-keyed primary cell.
+        assert n == 2
+        assert sc.get_stat("agentic:r", "?") is None
+        assert sc.get_stat("agentic:r", "j1") is not None

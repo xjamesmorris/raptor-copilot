@@ -13,8 +13,7 @@ package map, rule authoring, the sandbox model — see
 ```bash
 git clone https://github.com/gadievron/raptor.git
 cd raptor
-pip install -r requirements.txt
-pip install -r requirements-dev.txt   # ruff, mypy
+uv sync --locked                      # installs all deps from uv.lock
 pip install semgrep                    # required for /scan
 ```
 
@@ -65,9 +64,8 @@ in new dependencies when an existing module covers it.
   vars or hardcode values.
 - **Findings** follow the standard schema in `core/models/` — don't invent
   new finding shapes.
-- **New pip dependencies** need justification. Check `requirements.txt`
-  first; if something similar is already available in core, use that
-  instead.
+- **New dependencies** need justification. Check `pyproject.toml` first;
+  if something similar is already available in core, use that instead.
 
 
 ## Adding commands
@@ -89,8 +87,10 @@ frontmatter field pointing at the CLI entry point. The entry point goes in
 - Use `pytest`. No `jsonschema` validation — assert on actual data shapes.
 - Test against production-class object shapes, not toy stubs.
 - When testing sandbox behaviour, use the sandbox itself (don't mock it).
-- Gate slow tests (network, LLM, subprocess) with
-  `@pytest.mark.skipif` or the `RAPTOR_SLOW_TESTS` env var so the fast
+- Gate slow tests (network, LLM, subprocess) with the marker
+  doctrine: `@pytest.mark.slow` / `integration` / `corpus` (deselected
+  by default via pytest.ini, run by the nightly lanes), or
+  `@pytest.mark.skipif` for environment-dependent cases — the fast
   suite stays under a few seconds.
 
 
@@ -104,11 +104,15 @@ frontmatter field pointing at the CLI entry point. The entry point goes in
 
 Beyond the test suite and lint (which run on every PR — including
 `check_command_metadata.py`, which requires every `.claude/commands/*.md`
-to carry a parseable `dispatch:` field whose target exists on disk), two
-scheduled scans run daily from
-`.github/workflows/miswiring-scan.yml`. They are not PR gates — the
-full-repo index takes a while and the findings need human judgement —
-but a failure is actionable:
+to carry a parseable `dispatch:` field whose target exists on disk, and
+`project_agent_projection.py`, which rejects Claude/Copilot agent drift), the
+repo-invariant detectors are PR gates too: the `repo-invariants` job in
+`.github/workflows/lint.yml` runs them on every pull request, push to
+`main`, and merge-queue entry, and
+`.github/workflows/miswiring-scan.yml` re-runs the same set daily as a
+belt-and-braces sweep. A new finding fails the job; deliberate
+exceptions go in the detector's baseline JSON with a note. The two you
+are most likely to hit:
 
 - **Miswiring scan** (`.github/scripts/check_miswiring.py`) — detects
   kwarg/signature mismatches, broken in-repo imports, dead definitions,

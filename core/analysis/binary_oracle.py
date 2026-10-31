@@ -20,9 +20,10 @@ Used asymmetrically by the reachability classifier (Inc 2):
   * Binary call edges the source graph missed ⇒ promote callee to reachable
     (Inc 2; not built here).
 
-v1 scope (per design): Linux ELF, DWARF required, native targets (C/C++/
-Rust/Go). Stripped binary → ``skipped`` with reason; macOS Mach-O / PE
-deferred.
+v1 scope (per design): Linux ELF, native targets (C/C++/Rust/Go). A
+stripped binary (no DWARF) falls back to the nm-only ``symbol_only``
+tier — verdicts still enrich, but never earn ``absent``-suppression;
+macOS Mach-O / PE deferred.
 
 Implementation: shells out to system tools (``readelf``, ``nm``,
 ``objdump --dwarf=info``) — no Python DWARF library dependency. The text
@@ -38,6 +39,8 @@ import re
 import shutil
 import subprocess
 import tempfile
+
+from core.security.log_sanitisation import escape_nonprintable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (
@@ -46,7 +49,8 @@ TYPE_CHECKING,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator
+    from collections.abc import Iterable, Iterator, Mapping
+    from typing import IO
 
 logger = logging.getLogger(__name__)
 
@@ -148,11 +152,17 @@ def _run_status(argv: list[str], timeout: int = 60,
         # dump — a function past the cut-off point looks ``absent``.
         # Treat as no evidence for this tool, matching the
         # TimeoutExpired path above.
+        # The stderr slice and the trailing argv element are hostile-
+        # ELF-derived (tool output over attacker bytes; a scanned-repo
+        # file path) — escape before they reach the operator's
+        # terminal/log (core.security.log_sanitisation names both as
+        # canonical untrusted inputs).
         logger.warning(
             "binary_oracle: %s rc=%s on %s — discarding partial output "
             "(stderr=%s)",
-            argv[0], proc.returncode, argv[-1],
-            (proc.stderr or "")[:200])
+            argv[0], proc.returncode,
+            escape_nonprintable(str(argv[-1])),
+            escape_nonprintable((proc.stderr or "")[:200]))
         return "", False
     return proc.stdout or "", True
 
@@ -196,8 +206,9 @@ def _stream(argv: list[str], timeout: int,
                                 encoding="utf-8", errors="replace",
                                 timeout=timeout)
         except (OSError, subprocess.TimeoutExpired) as e:
+            # Exception text quotes target-derived paths — escape.
             logger.warning("binary_oracle: %s failed/timed out: %s",
-                           argv[0], e)
+                           argv[0], escape_nonprintable(str(e)))
             return
         if proc.returncode != 0:
             # Same contract as ``_run_status``: a non-zero exit means
@@ -205,11 +216,13 @@ def _stream(argv: list[str], timeout: int,
             # a DWARF dump cut off halfway would silently classify
             # every function past the cut as ``absent``. Yield nothing
             # so the caller degrades to the no-DWARF tier instead.
+            # Same escape rationale as ``_run_status``.
             logger.warning(
                 "binary_oracle: %s rc=%s on %s — discarding partial "
                 "output (stderr=%s)",
-                argv[0], proc.returncode, argv[-1],
-                (proc.stderr or "")[:200])
+                argv[0], proc.returncode,
+                escape_nonprintable(str(argv[-1])),
+                escape_nonprintable((proc.stderr or "")[:200]))
             return
         if not Path(out_path).exists():
             return
@@ -417,7 +430,11 @@ def _find_arglist_open(name: str) -> int:
 # argument types inside ``{lambda(...)#N}`` but ``gcov -m`` emits the
 # bare placeholder ``{lambda()#N}``. Normalise to the gcov form so the
 # two name sources can match.
-_LAMBDA_ARGS_RE = re.compile(r"\{lambda\([^)]*\)(#\d+)\}")
+# The argument span is bounded: unbounded, every "{lambda(" planted
+# in a hostile name re-scans the rest of it — quadratic. Demangled
+# lambda argument lists sit far below 4000 chars (beyond it the
+# name is left unnormalised, versus an unbounded scan).
+_LAMBDA_ARGS_RE = re.compile(r"\{lambda\([^)]{0,4000}\)(#\d+)\}")
 
 
 def _normalise_lambda_args(name: str) -> str:
@@ -500,9 +517,6 @@ def _strip_impl_block_brackets(name: str) -> str:
     return f"{inner}::{rest}"
 
 
-# Legacy back-compat — some callers may import the constant directly.
-_IMPL_BLOCK_RE = re.compile(r"^<([\w:]+)>::(.+)$")
-
 
 def _qualified_from_demangled(name: str) -> str:
     """Strip argument list + trailing method qualifiers + any leading
@@ -555,16 +569,28 @@ def _demangle_linkage_names(linkage_names: Iterable[str]) -> dict[str, str]:
     # Full sandbox, same rationale as _run: the mangled names being
     # demangled are attacker-derived strings from the binary's DWARF.
     # input= routes through the subprocess+preexec sandbox path.
+    # c++filt reads nothing and writes nothing beyond stdin/stdout, so
+    # a throwaway scratch dir as output= plus restrict_reads=True is
+    # the whole filesystem surface: writes confined to the scratch
+    # dir, reads confined to the system allowlist (toolchain + libc —
+    # all c++filt needs). Without them the sandbox applies no
+    # filesystem confinement (bare-run posture) and a c++filt parser
+    # bug over hostile mangled bytes would execute with the
+    # filesystem reachable.
     from core.sandbox import run as _sandbox_run
     try:
         # errors="replace": mangled names are attacker-derived bytes; a
         # non-UTF-8 c++filt echo must degrade, not raise mid-classify.
-        proc = _sandbox_run(
-            ["c++filt"], block_network=True,
-            input="\n".join(seen),
-            capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=30,
-        )
+        with tempfile.TemporaryDirectory(
+                prefix="raptor-bo-demangle-") as scratch:
+            proc = _sandbox_run(
+                ["c++filt"], block_network=True,
+                restrict_reads=True,
+                output=scratch,
+                input="\n".join(seen),
+                capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=30,
+            )
     except (OSError, subprocess.TimeoutExpired):
         return {}
     lines = proc.stdout.splitlines()
@@ -625,8 +651,9 @@ def _parse_dwarf(binary_path: Path) -> tuple[dict[int, _SubprogramDIE], list[int
     # ``DecompressBranchless<long``), which then mis-classified as absent
     # because the qualified-name lookup couldn't find them (snappy Inc 3c
     # followup).
+    # (qualifier span bounded, same trade-off as _LAMBDA_ARGS_RE)
     name_indirect_re = re.compile(
-        r"\(in(?:direct|dexed) string[^)]*\):\s*(.+?)\s*$")
+        r"\(in(?:direct|dexed) string[^)]{0,4000}\):\s*(.+?)\s*$")
     # DW_AT_abstract_origin emits an offset that may be ``<0xNN>`` or bare hex.
     aorig_re = re.compile(r"<0x([0-9a-fA-F]+)>")
     # DW_AT_low_pc is an address.
@@ -874,10 +901,10 @@ def classify_binary_evidence(
     Returns a name → ``BinaryOracleWitness`` mapping for every input name.
     Names not resolvable either way get ``absent`` (the DCE case).
 
-    The binary MUST have DWARF. A stripped binary (no DWARF subprograms
-    found) returns an empty mapping; the operator-visible skip is the
-    caller's responsibility (the witness is consumed at the reachability
-    layer in Inc 2, which logs the skip).
+    A stripped binary (no DWARF subprograms found) falls back to the
+    nm-only ``symbol_only`` tier: a full mapping is still returned, but
+    every witness carries ``tier="symbol_only"`` and the suppression
+    chokepoint refuses to hard-suppress on it.
     """
     binary_path = Path(binary_path)
     if not binary_path.is_file():
@@ -986,9 +1013,9 @@ def classify_binary_evidence(
                         inlined_names.add(bare)
 
     for off in inline_origins:
-        die = subs.get(off)
-        if die:
-            _note_inlined(die)
+        sub = subs.get(off)
+        if sub:
+            _note_inlined(sub)
     for die in subs.values():
         if die.has_inline_marker:
             _note_inlined(die)
@@ -1130,13 +1157,71 @@ def _combine_verdicts(
             )
     full = [c for c, t in pairs if t == "full"]
     pool = full or [c for c, _ in pairs]
-    return max(pool, key=lambda v: _CLASS_PRIORITY.get(v, 0))
+    return max(pool, key=lambda v: _CLASS_PRIORITY.get(v, 0))  # type: ignore[arg-type]
+
+
+def _pin_open_verified(
+    bp: Path, pin: tuple[int, int, int, str],
+) -> IO | None:
+    """Fd-honest open of *bp* verified against its identity pin.
+
+    O_NOFOLLOW open (``core.source.open_regular``), fstat of the
+    OPENED fd against the pinned ``(st_dev, st_ino, st_size)``, then
+    a full hash of that same fd against the pinned sha256. Returns
+    the held stream (positioned at EOF) on success — the caller keeps
+    it open across the classify pass — or ``None`` on any mismatch
+    or open failure.
+    """
+    from core.hash import sha256_fileobj
+    from core.source import open_regular
+    fh = open_regular(bp, "rb")
+    if fh is None:
+        return None
+    try:
+        st = os.fstat(fh.fileno())
+        if ((st.st_dev, st.st_ino, st.st_size)
+                == (pin[0], pin[1], pin[2])
+                and sha256_fileobj(fh) == pin[3]):  # type: ignore[arg-type]
+            return fh
+    except OSError:
+        pass
+    try:
+        fh.close()
+    except OSError:
+        pass
+    return None
+
+
+def _pin_still_holds(
+    fh: IO, bp: Path, pin: tuple[int, int, int, str],
+) -> bool:
+    """Post-classify half of the identity bracket.
+
+    Two checks: the HELD fd's content still hashes to the pin (an
+    in-place rewrite of the pinned inode would have fed the classify
+    tools different bytes through the same name), and the by-name
+    slot still resolves to the pinned inode (the classify tools
+    re-open by name, so a lingering swap means they read a different
+    file than the one the witness verified).
+    """
+    from core.hash import sha256_fileobj
+    try:
+        fh.seek(0)
+        if sha256_fileobj(fh) != pin[3]:  # type: ignore[arg-type]
+            return False
+        st = os.stat(bp)
+    except OSError:
+        return False
+    return (st.st_dev, st.st_ino) == (pin[0], pin[1])
 
 
 def enrich_inventory_with_binary_oracle(
     inventory: dict,
     binaries,
     no_suppression_paths=(),
+    declared_paths=(),
+    identity_pins: Mapping[
+        str, tuple[int, int, int, str] | None] | None = None,
 ) -> dict[str, int]:
     """Annotate each native-language inventory item with its binary-oracle
     classification, plus a top-level summary on the inventory itself.
@@ -1152,6 +1237,32 @@ def enrich_inventory_with_binary_oracle(
       - **absent from every binary** ⇒ combined verdict is ``absent``
         — and ONLY then can the downstream chokepoint hard-suppress
 
+    ``declared_paths`` names the binaries the OPERATOR declared
+    (explicit ``--binary`` flags and the project binary store). They
+    are exempt from the source-coverage floor below — the operator
+    asserted trust, and the floor's drop warning names exactly that
+    remedy. When the floor drops a NON-declared binary that produced
+    evidence, every surviving binary's records downgrade to
+    ``suppression_grade: false``: the "absent from every binary"
+    quantifier was silently narrowed, so ``absent`` may still enrich
+    but must not license suppression.
+
+    ``identity_pins`` maps a binary path (as it appears in
+    ``binaries``) to the fstat identity + sha256 recorded from the
+    very fd its project-store content witness was verified on
+    (``RaptorConfig.BINARY_ORACLE_IDENTITY_PINS``), or to ``None``
+    for an entry already demoted at load time. Tuple pins are
+    re-verified BRACKETING this function's classify pass — fd-honest
+    open + fstat + hash before the tools run (fd held across the
+    pass), held-fd re-hash + by-name inode check after — so a swap
+    landing between the witness read and the oracle's own by-name
+    opens DEMOTES the binary (its records lose ``suppression_grade``;
+    enrichment continues at hint tier) instead of silently steering
+    ``absent``-verdict suppression. Residual stated honestly: the
+    classify tools open by name, so a swap-in/swap-back pair that
+    completes entirely within the classify pass evades both bracket
+    checks.
+
     Storage shape on each item::
 
       metadata.binary_oracle = {
@@ -1166,7 +1277,8 @@ def enrich_inventory_with_binary_oracle(
     Top-level inventory summary::
 
       inventory.binary_oracle = {
-        "binaries": [{"path": "...", "build_id": "..."}, ...],
+        "binaries": [{"path": "...", "build_id": "...", "tier": "full",
+                      "suppression_grade": true}, ...],
         "counts": {"classified": N, "symbol_present": N, "inlined": N,
                    "absent": N, "folded": N},
         "skipped_non_native": M,
@@ -1218,9 +1330,70 @@ def enrich_inventory_with_binary_oracle(
     # Classify once per binary. Each classify_binary_evidence call shells
     # to nm + objdump (~1-15s per binary depending on size); for the
     # typical 1-3 binary hybrid case the cost is bounded.
+    #
+    # Identity-pin bracket: a pinned (project-store-witnessed) binary
+    # is re-verified fd-honestly BEFORE the tools run and the fd is
+    # held across the pass; afterwards the held fd is re-hashed and
+    # the by-name slot re-checked against the pinned inode. Any
+    # failure — including a load-time ``None`` pin — DEMOTES the
+    # binary: it keeps enriching (promotions are fail-safe; they keep
+    # findings alive) but every record it contributes drops
+    # ``suppression_grade``, so ``absent`` never hard-suppresses off
+    # bytes the witness did not verify.
+    _pins: dict[str, tuple[int, int, int, str] | None] = dict(
+        identity_pins or {})
+    identity_demoted: set[str] = set()
+    # A pinned path that is not among the analysed binaries is a
+    # witnessed project-store binary that went MISSING (deleted from
+    # its slot — a no-race move for the same run-dir-write attacker
+    # the witness exists to stop). Two flavors reach here:
+    #   - missing AT LOAD: the load seam recorded a ``None`` pin;
+    #   - deleted AFTER a verified load (tuple pin) — the
+    #     ``is_file()`` usability filter above silently dropped the
+    #     path before classification.
+    # Both are pinned-but-not-analysed, and that is the whole test: a
+    # pin exists only because the path was DECLARED for analysis, so
+    # not-analysed can only mean the member vanished. The entry is
+    # skipped, not classified, but the skip narrows the "absent from
+    # EVERY declared binary" quantifier: a function alive only in the
+    # deleted binary would combine to ``absent`` over the survivors.
+    # Account for it like a floor drop of a sibling — the missing
+    # path joins the demotion set (summary accounting) and every
+    # SURVIVING record drops ``suppression_grade`` below.
+    # Demote-not-refuse: enrichment continues at hint tier.
+    _analysed = {str(bp) for bp in binary_paths}
+    witness_missing = {k for k in _pins if k not in _analysed}
+    identity_demoted |= witness_missing
     per_binary: list[tuple[Path, str, dict[str, BinaryOracleWitness]]] = []
     for bp in binary_paths:
-        verdicts = classify_binary_evidence(names, bp)
+        key = str(bp)
+        pin = _pins.get(key)
+        held: IO | None = None
+        if key in _pins and pin is not None:
+            held = _pin_open_verified(bp, pin)
+        try:
+            verdicts = classify_binary_evidence(names, bp)
+        finally:
+            if held is not None and pin is not None:
+                post_ok = _pin_still_holds(held, bp, pin)
+                try:
+                    held.close()
+                except OSError:
+                    pass
+                if not post_ok:
+                    held = None  # demoted below
+        if key in _pins and held is None:
+            identity_demoted.add(key)
+            if pin is not None:
+                # ``None`` pins were already warned at load time.
+                logger.warning(
+                    "binary_oracle: identity pin for %s did not hold "
+                    "across classification (fd-honest open failed, or "
+                    "content/inode changed between the witness read "
+                    "and the classify pass) — DEMOTED to enrichment-"
+                    "only for this run: verdicts still enrich, "
+                    "'absent' loses suppression authority.",
+                    escape_nonprintable(str(bp)))
         # Every witness already carries the build_id the classifier
         # read — reuse it instead of re-running readelf on the binary.
         if verdicts:
@@ -1272,6 +1445,15 @@ def enrich_inventory_with_binary_oracle(
     })
     project_names = [n for n in names if n not in _BOILERPLATE_NAMES]
     n_project = len(project_names)
+    _declared = {str(Path(x).resolve()) for x in (declared_paths or ())}
+
+    def _is_declared(p: Path) -> bool:
+        try:
+            return str(p.resolve()) in _declared
+        except OSError:
+            return str(p) in _declared
+
+    floor_dropped: list[str] = []
     kept: list[tuple[Path, str, dict[str, BinaryOracleWitness]]] = []
     for bp, build_id, verdicts in per_binary:
         if not verdicts:
@@ -1296,6 +1478,23 @@ def enrich_inventory_with_binary_oracle(
                 and n_project >= SRC_FLOOR_MIN_PROJECT_NAMES
                 and (matched < SRC_COVERAGE_MIN_MATCHED
                      or ratio < SRC_COVERAGE_FLOOR)):
+            if _is_declared(bp):
+                # Operator-declared (--binary / project binary store):
+                # the declaration IS the trust assertion the floor's
+                # remedy names, so warn-and-keep. Dropping here would
+                # make the "absent only when EVERY declared binary
+                # lacks it" contract quantify over a set the operator
+                # never saw shrink.
+                logger.warning(
+                    "binary_oracle: declared binary %s matched only %d of "
+                    "%d project source names (%.1f%%, floor %.0f%% / min "
+                    "%d) — kept because the operator declared it, but "
+                    "verify it was built from THIS source tree.",
+                    bp.name, matched, n_project, ratio * 100,
+                    SRC_COVERAGE_FLOOR * 100, SRC_COVERAGE_MIN_MATCHED,
+                )
+                kept.append((bp, build_id, verdicts))
+                continue
             logger.warning(
                 "binary_oracle: dropping %s — only %d of %d project source "
                 "names matched (%.1f%%, floor %.0f%% / min %d). Likely the "
@@ -1305,6 +1504,7 @@ def enrich_inventory_with_binary_oracle(
                 bp.name, matched, n_project, ratio * 100,
                 SRC_COVERAGE_FLOOR * 100, SRC_COVERAGE_MIN_MATCHED,
             )
+            floor_dropped.append(str(bp))
             continue
         kept.append((bp, build_id, verdicts))
     per_binary = kept
@@ -1313,6 +1513,16 @@ def enrich_inventory_with_binary_oracle(
             "binary_oracle: all binaries dropped by source-coverage floor; "
             "skipping enrichment")
         return counts
+    if floor_dropped:
+        logger.warning(
+            "binary_oracle: %d binary(s) floor-dropped while %d survived — "
+            "'absent' verdicts from the survivors lose suppression "
+            "authority for this run (a function unique to a dropped "
+            "binary would otherwise hard-suppress). Pass --binary for "
+            "the dropped path(s) to restore it, or --no-binary-oracle "
+            "to disable oracle filtering.",
+            len(floor_dropped), len(per_binary),
+        )
 
     # Combine + annotate. The combined classification is what downstream
     # consumers (reach_witness, /codeql autonomous_analyzer, /validate
@@ -1334,6 +1544,33 @@ def enrich_inventory_with_binary_oracle(
     any_guessed_build = any(
         str(bp) in _no_suppress for bp, _, _ in per_binary
     )
+    any_floor_dropped = bool(floor_dropped)
+    # Identity-demoted binaries (pin failed to verify or to hold
+    # across the classify pass) get the same per-record treatment as
+    # guessed-build entries, but stay a SEPARATE accounting channel —
+    # the summary keys must say what actually happened. Derived from
+    # the demotion SET, not from ``per_binary``: a demoted binary that
+    # also fell to the source-coverage floor (or produced zero
+    # verdicts) still demoted, and the flag must agree with the
+    # ``identity_demoted`` list it summarises.
+    any_identity_demoted = bool(identity_demoted)
+
+    def _binary_suppression_grade(bp: Path) -> bool:
+        """Per-binary authority marker, shared by the per-item records
+        and the summary ``binaries`` entries so the cross-run cache
+        writer (``core.audit.build_id_cache.store_oracle_verdicts``
+        reads the SUMMARY entries) can never resurrect authority the
+        demotion channels stripped."""
+        return (str(bp) not in _no_suppress
+                and str(bp) not in identity_demoted
+                and not any_floor_dropped
+                # A witnessed sibling MISSING (at load, or deleted
+                # after a verified load and dropped by the usability
+                # filter) narrows the every-binary quantifier for
+                # every survivor, exactly like a floor drop (a
+                # PRESENT demoted sibling does not: its hint-tier
+                # evidence still defeats absence via alive-in-any).
+                and not witness_missing)
     for fi, ii, name in targets:
         per_binary_entries: list[dict[str, object]] = []
         for bp, build_id, verdicts in per_binary:
@@ -1347,8 +1584,11 @@ def enrich_inventory_with_binary_oracle(
                 # F1): the summary-level earns_suppression is not what
                 # the live gates read — the chokepoint, demoter, and
                 # audit verdict extraction all gate per item, so the
-                # guessed-build downgrade must live here too.
-                "suppression_grade": str(bp) not in _no_suppress,
+                # guessed-build downgrade must live here too. A
+                # floor-drop of any sibling binary downgrades EVERY
+                # surviving record the same way: the combined verdict
+                # no longer quantifies over every declared binary.
+                "suppression_grade": _binary_suppression_grade(bp),
                 "classification": w.classification,
                 "address":        w.address,
                 "tier":           w.tier,
@@ -1356,7 +1596,7 @@ def enrich_inventory_with_binary_oracle(
         if not per_binary_entries:
             continue
         combined = _combine_verdicts(
-            (entry["classification"], entry["tier"])
+            (str(entry["classification"]), str(entry["tier"]))
             for entry in per_binary_entries)
         # NB: ``setdefault('metadata', {})`` returns the *existing* value
         # if the key is present — even when that value is ``None``. A
@@ -1390,6 +1630,12 @@ def enrich_inventory_with_binary_oracle(
             "path":     str(bp),
             "build_id": bid,
             "tier":     first.tier if first else "unknown",
+            # The cross-run oracle-verdicts cache writer derives its
+            # payload grade from THESE entries (defaulting a missing
+            # key to full grade) — omitting the marker here would
+            # launder a demoted binary's verdicts into the cache with
+            # suppression authority restored at rest.
+            "suppression_grade": _binary_suppression_grade(bp),
         })
 
     inventory["binary_oracle"] = {
@@ -1418,10 +1664,22 @@ def enrich_inventory_with_binary_oracle(
         # could license a false negative. Downgrade conservatively
         # when ANY contributing binary is symbol-only (E1 stripped-
         # binary fallback).
-        "earns_suppression": not any_symbol_only and not any_guessed_build,
+        "earns_suppression": (not any_symbol_only and not any_guessed_build
+                              and not any_floor_dropped
+                              and not any_identity_demoted),
         # Surfaced for operator-visible evidence-tier reporting.
         "any_symbol_only": any_symbol_only,
         "any_env_built_guessed": any_guessed_build,
+        # True when a project-store binary's identity pin failed to
+        # verify (or to hold across the classify pass) — its records
+        # enrich at hint tier but never license suppression.
+        "any_identity_demoted": any_identity_demoted,
+        "identity_demoted": sorted(identity_demoted),
+        # True when the source-coverage floor dropped a non-declared
+        # binary that had produced evidence — the surviving verdicts
+        # then enrich but never suppress (see suppression_grade above).
+        "any_floor_dropped": any_floor_dropped,
+        "floor_dropped": list(floor_dropped),
     }
     return counts
 
@@ -1444,9 +1702,11 @@ def absent_earns_suppression(per_binary) -> bool:
       * EVERY contributing binary is full-tier (a symbol-only binary
         can't distinguish ``inlined`` from ``absent``), AND
       * no contributing binary is marked ``suppression_grade: false``
-        (env-built with a GUESSED build command — its absence says
-        nothing suppression-grade about the operator's tree; a
-        missing key = legacy record = full grade).
+        (env-built with a GUESSED build command, identity-demoted —
+        its content-witness pin failed to verify or to hold across
+        the classify pass — or a sibling binary was floor-dropped so
+        the every-binary quantifier no longer holds; a missing key =
+        legacy record = full grade).
     """
     entries = [b for b in (per_binary or []) if isinstance(b, dict)]
     if not entries:
@@ -1503,7 +1763,12 @@ def extract_verdicts(inventory: dict) -> dict[str, str]:
             bo = (item.get("metadata") or {}).get("binary_oracle")
             if not (bo and isinstance(bo, dict)):
                 continue
-            classification = bo["classification"]
+            # .get: a hand-edited inventory record without the key
+            # must skip, not KeyError — every other field access in
+            # this loop is already guarded.
+            classification = bo.get("classification")
+            if not classification:
+                continue
             if (classification == "absent"
                     and not absent_earns_suppression(bo.get("binaries"))):
                 absent_blocked.add(name)

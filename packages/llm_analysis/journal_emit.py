@@ -22,8 +22,27 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from typing import Any
+from core.run.finding_status import read_verdict
 
 logger = logging.getLogger(__name__)
+
+
+def _entry_identity(entry: Any) -> tuple[Any, ...]:
+    """Stable identity for one emitted agentic journal assertion."""
+    return (
+        entry.run_id,
+        entry.file,
+        entry.function,
+        entry.line_start,
+        entry.line_end,
+        entry.verdict,
+        entry.source_hash,
+        entry.cwe,
+        entry.body,
+        entry.model,
+        tuple(entry.evidence_tools or []),
+        entry.producer,
+    )
 
 
 def derive_verdict(analysis: dict[str, Any] | None) -> str:
@@ -34,7 +53,17 @@ def derive_verdict(analysis: dict[str, Any] | None) -> str:
     if is_tp is False:
         return "clean"
     if is_tp is True:
-        return "finding" if analysis.get("is_exploitable") else "suspicious"
+        is_exploitable = analysis.get("is_exploitable")
+        if is_exploitable is True:
+            return "finding"
+        if is_exploitable is False:
+            return "suspicious"
+        # Response validation nulls a missing/malformed
+        # is_exploitable — an abstention. "suspicious" asserts
+        # "real bug, NOT exploitable", a definitive ruling the
+        # model never made. Same rule as _panel_verdict below:
+        # a non-bool exploitability bears no journal verdict.
+        return "error"
     return "error"
 
 
@@ -83,6 +112,7 @@ def emit_finding_journal_entry(
     model: str | None = None,
     has_dataflow: bool = False,
     verdict: str | None = None,
+    existing_identities: set[tuple[Any, ...]] | None = None,
 ) -> str | None:
     """Emit one finding-grade ``ReviewJournalEntry`` into ``out_dir``.
 
@@ -100,6 +130,7 @@ def emit_finding_journal_entry(
             ReviewJournalEntry,
             append_entry,
             now_iso,
+            resolved_run_id,
         )
         from core.inventory.lookup import lookup_function
 
@@ -134,7 +165,11 @@ def emit_finding_journal_entry(
 
         entry = ReviewJournalEntry(
             ts=now_iso(),
-            run_id=Path(out_dir).name,
+            # Resolved basename, never the raw spelling: a relative
+            # out_dir ("." from inside the run dir) has name == "",
+            # and run_id rides under the row MAC — the row would be
+            # sealed with no attribution (see resolved_run_id).
+            run_id=resolved_run_id(Path(out_dir)),
             file=file_path,
             function=name,
             verdict=verdict,
@@ -151,7 +186,15 @@ def emit_finding_journal_entry(
             # is_function_grade.
             producer="agentic",
         )
+        identity = _entry_identity(entry)
+        if (
+            existing_identities is not None
+            and identity in existing_identities
+        ):
+            return name
         append_entry(Path(out_dir), entry)
+        if existing_identities is not None:
+            existing_identities.add(identity)
         return name
     except Exception:
         logger.debug("journal entry emit error", exc_info=True)
@@ -220,11 +263,29 @@ def journal_orchestrated_results(
     Returns the number of entries written. Best-effort.
     """
     if checklist is None:
-        from core.json import load_json
-        checklist = load_json(Path(out_dir) / "checklist.json")
+        from core.inventory import read_checklist
+        checklist = read_checklist(Path(out_dir)) or None
     if not isinstance(checklist, dict):
         logger.debug(
             "orchestrated journal: no usable checklist — skipping",
+        )
+        return 0
+
+    from core.coverage.journal import (
+        JournalIncomplete,
+        require_complete_entries,
+    )
+    try:
+        existing_identities = {
+            _entry_identity(entry)
+            for entry in require_complete_entries(Path(out_dir))
+            if entry.producer == "agentic"
+        }
+    except (JournalIncomplete, OSError) as exc:
+        logger.warning(
+            "orchestrated journal: existing entries unavailable — "
+            "refusing duplicate-prone append: %s",
+            exc,
         )
         return 0
 
@@ -236,11 +297,12 @@ def journal_orchestrated_results(
         if status is not None:
             if status not in _JOURNALABLE_STATUSES:
                 continue
-        elif not isinstance(result.get("is_true_positive"), bool):
+        elif read_verdict(result, "is_true_positive") is None:
             continue
         analysis = {
             k: result[k] for k in _ANALYSIS_KEYS if result.get(k) is not None
         }
+        before = len(existing_identities)
         name = emit_finding_journal_entry(
             out_dir=Path(out_dir),
             repo_path=Path(repo_path),
@@ -253,10 +315,11 @@ def journal_orchestrated_results(
             message=result.get("message"),
             model=result.get("analysed_by") or result.get("model"),
             has_dataflow=bool(result.get("dataflow_validation")),
+            existing_identities=existing_identities,
         )
         if name is None:
             continue
-        emitted += 1
+        emitted += len(existing_identities) - before
 
         # Multi-model runs: journal each panel member's own verdict
         # too. The index key includes the model, so per-model history
@@ -278,6 +341,7 @@ def journal_orchestrated_results(
             member_verdict = _panel_verdict(member)
             if member_verdict is None:
                 continue
+            before = len(existing_identities)
             if emit_finding_journal_entry(
                 out_dir=Path(out_dir),
                 repo_path=Path(repo_path),
@@ -290,8 +354,9 @@ def journal_orchestrated_results(
                 message=result.get("message"),
                 model=member_model,
                 verdict=member_verdict,
+                existing_identities=existing_identities,
             ) is not None:
-                emitted += 1
+                emitted += len(existing_identities) - before
     if emitted:
         logger.info(
             "journaled %d orchestrated per-finding analyses into %s",

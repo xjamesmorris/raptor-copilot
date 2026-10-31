@@ -7,13 +7,13 @@ from __future__ import annotations
 
 import ipaddress
 import socket
-import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
+from core.testing.wallclock import cpu_budget
 from packages.web.execution_policy import WebExecutionPolicy, WebPolicyError
 
 
@@ -86,10 +86,9 @@ def test_inline_script_scan_is_linear_on_hostile_unclosed_tags():
     from packages.web.discovery.js_routes import _inline_scripts
 
     hostile = ("<script>" * 3000) + ("x" * 1024 * 1024)
-    started = time.monotonic()
-    scripts = _inline_scripts(hostile)
-    elapsed = time.monotonic() - started
-    assert elapsed < 2.0, f"hostile page took {elapsed:.1f}s to scan"
+    # CPU budget, not wall clock: the superlinear scan burns CPU.
+    with cpu_budget(2.0, what="hostile unclosed-tag page scan"):
+        scripts = _inline_scripts(hostile)
     assert scripts == []  # no closing tag: nothing extractable
 
     normal = (
@@ -101,6 +100,32 @@ def test_inline_script_scan_is_linear_on_hostile_unclosed_tags():
     assert any("/api/a" in body for body in bodies)
     assert any("/api/b" in body for body in bodies)
     assert not any("bundle" in body for body in bodies)
+
+
+def test_route_extraction_is_bounded_on_hostile_ajax_fragments():
+    from packages.web.discovery.js_routes import _extract_routes
+
+    # Many `.ajax({` openers, none closed: an unbounded lazy-DOTALL
+    # `[^}]*?url` scan re-walks to end-of-body per opener —
+    # O(openers x body) on hostile input.
+    hostile = (".ajax({ " * 5000) + ("y" * 512 * 1024)
+    # CPU budget — same rationale as the inline-script scan above.
+    with cpu_budget(2.0, what="hostile ajax-fragment scan"):
+        routes = _extract_routes(hostile)
+    assert routes == []
+
+    # Oversized bodies are truncated, not scanned in full.
+    big = ("z" * (4 * 1024 * 1024)) + "fetch('/api/tail')"
+    assert "/api/tail" not in _extract_routes(big)
+
+    # Real routes inside the caps still extract.
+    normal = "fetch('/api/a'); $.ajax({ url: '/api/b' }); path: '/route'"
+    routes = _extract_routes(normal)
+    assert {"/api/a", "/api/b", "/route"} <= set(routes)
+
+    # A >4 KB "URL" is a misclassified blob, not a route.
+    blob = "fetch('" + "/a" * 3000 + "')"
+    assert _extract_routes(blob) == []
 
 
 # -- execution policy URL edge cases ----------------------------------------------
@@ -185,6 +210,25 @@ def test_private_host_recognizes_hostnames_by_resolution(monkeypatch):
     assert is_private("http://box.internal/") is True
 
 
+def test_hostname_colliding_with_block_wording_is_resolved_not_blocked(monkeypatch):
+    """The IP-literal / hostname split must be structural, not a
+    substring match on our own error text: a hostname containing
+    'non-global' used to be re-raised as a blocked IP instead of being
+    DNS-resolved and validated."""
+    from packages.web.client import WebClient
+
+    def fake_getaddrinfo(host, port, **kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 80))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    client = WebClient("http://non-global-widgets.example")
+    pinned = client._resolve_and_validate("http://non-global-widgets.example/")
+    assert pinned is not None
+    hostname, _port, addrs = pinned
+    assert hostname == "non-global-widgets.example"
+    assert addrs[0][4][0] == "93.184.216.34"
+
+
 def test_lna_is_decided_per_batch_not_across_mixed_targets(tmp_path, monkeypatch):
     import shutil as shutil_module
 
@@ -251,6 +295,17 @@ def test_wildcard_bind_without_callback_host_warns(caplog):
     assert any("bind interface" in record.message for record in caplog.records)
 
 
+def test_wildcard_bind_warning_fires_once_not_per_mint(caplog):
+    from packages.web.oob import OobContext, OobListener
+
+    listener = OobListener(bind_host="0.0.0.0")
+    with caplog.at_level("WARNING", logger="raptor"):
+        for i in range(5):
+            listener.mint(OobContext(url=f"http://t/{i}", param="u", kind="ssrf"))
+    warnings = [r for r in caplog.records if "bind interface" in r.message]
+    assert len(warnings) == 1, "per-listener advice must not repeat per canary"
+
+
 # -- ffuf summary raw channel -------------------------------------------------------
 
 
@@ -279,3 +334,39 @@ def test_ffuf_summary_carries_raw_values_when_display_form_mutates(tmp_path):
     })
     assert "input_raw" not in clean
     assert "url_raw" not in clean
+
+
+def test_redirect_hop_abort_records_the_blocked_host():
+    """The origin gate's hop-abort path incremented _blocked_requests
+    but never recorded the host — the blocked_hosts diff (the poisoned-
+    markup evidence channel) was blind to payloads delivered via a
+    same-origin request whose redirect chain pivoted off-origin."""
+    from packages.web.browser import BrowserEngine
+
+    engine = BrowserEngine("https://target.example")
+
+    class _HopResponse:
+        status = 302
+        headers = {"location": "https://attacker-sink.example/pivot"}
+
+    class _Route:
+        aborted = False
+
+        class request:  # noqa: N801 - playwright shape
+            url = "https://target.example/start"
+            method = "GET"
+            post_data = None
+            headers: dict = {}
+
+        def fetch(self, max_redirects=0):
+            return _HopResponse()
+
+        def abort(self):
+            type(self).aborted = True
+
+    route = _Route()
+    engine._route_gate(route)
+
+    assert _Route.aborted is True
+    assert engine.blocked_requests == 1
+    assert "attacker-sink.example" in engine.blocked_hosts

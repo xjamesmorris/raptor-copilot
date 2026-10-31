@@ -186,6 +186,215 @@ def test_phase1_local_parent_properties_inherited(tmp_path: Path):
     assert db.version == "2.16.1"
 
 
+_CORPORATE_PARENT_XML = '''\
+<project>
+  <groupId>com.example</groupId>
+  <artifactId>corp-parent</artifactId>
+  <version>1.0</version>
+  <properties>
+    <jackson.version>2.9.0</jackson.version>
+  </properties>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>com.fasterxml.jackson.core</groupId>
+        <artifactId>jackson-databind</artifactId>
+        <version>${jackson.version}</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+</project>
+'''
+
+_CHILD_WITH_OVERRIDE_XML = '''\
+<project>
+  <parent>
+    <groupId>com.example</groupId>
+    <artifactId>corp-parent</artifactId>
+    <version>1.0</version>
+  </parent>
+  <artifactId>service</artifactId>
+  <properties>
+    <jackson.version>2.17.1</jackson.version>
+  </properties>
+  <dependencies>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+'''
+
+_CHILD_NO_OVERRIDE_XML = '''\
+<project>
+  <parent>
+    <groupId>com.example</groupId>
+    <artifactId>corp-parent</artifactId>
+    <version>1.0</version>
+  </parent>
+  <artifactId>plain</artifactId>
+  <dependencies>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+'''
+
+
+def _jackson(deps):
+    return next(
+        (d for d in deps
+         if d.name == "com.fasterxml.jackson.core:jackson-databind"),
+        None,
+    )
+
+
+def test_child_property_override_wins_over_parent_scope(tmp_path: Path):
+    """The canonical corporate pattern: parent pins
+    ``<jackson.version>2.9.0</jackson.version>`` and manages
+    ``jackson-databind ${jackson.version}``; the child OVERRIDES the
+    property. Maven's effective POM resolves managed ``${...}``
+    versions with child-wins property precedence — reporting the
+    parent's stale 2.9.0 mints false CVE findings against a version
+    the build never uses (and hides real ones when a child
+    DOWNGRADES)."""
+    _write(tmp_path, "pom.xml", _CORPORATE_PARENT_XML)
+    child = _write(tmp_path, "service/pom.xml", _CHILD_WITH_OVERRIDE_XML)
+    deps = _parse_with_resolver(child, client=None)
+    db = _jackson(deps)
+    assert db is not None
+    assert db.version == "2.17.1"
+    assert db.purl is not None and db.purl.endswith("@2.17.1")
+
+
+def test_parent_scope_resolution_without_override_unchanged(
+    tmp_path: Path,
+) -> None:
+    """Counter-direction pin: a child with NO override still gets the
+    parent-resolved value (deferring resolution must not lose the
+    ancestor-only case)."""
+    _write(tmp_path, "pom.xml", _CORPORATE_PARENT_XML)
+    child = _write(tmp_path, "plain/pom.xml", _CHILD_NO_OVERRIDE_XML)
+    deps = _parse_with_resolver(child, client=None)
+    db = _jackson(deps)
+    assert db is not None
+    assert db.version == "2.9.0"
+
+
+def test_shared_parent_cache_serves_each_child_its_own_view(
+    tmp_path: Path,
+) -> None:
+    """The per-coordinate view cache used to bake the FIRST child's
+    resolution into the shared entry — sibling modules of one
+    corporate parent then all inherited whichever property scope was
+    walked first. Each child must resolve against its own merged
+    property set."""
+    _write(tmp_path, "pom.xml", _CORPORATE_PARENT_XML)
+    plain = _write(tmp_path, "plain/pom.xml", _CHILD_NO_OVERRIDE_XML)
+    service = _write(tmp_path, "service/pom.xml", _CHILD_WITH_OVERRIDE_XML)
+    resolver = pom_inheritance.PomInheritanceResolver(None)
+    pom_inheritance.set_inheritance_resolver(resolver)
+    try:
+        deps_plain = pom_parser.parse(plain)      # caches the parent
+        deps_service = pom_parser.parse(service)  # cache hit
+    finally:
+        pom_inheritance.set_inheritance_resolver(None)
+    assert _jackson(deps_plain).version == "2.9.0"
+    assert _jackson(deps_service).version == "2.17.1"
+
+
+def test_child_override_does_not_rewrite_imported_bom(tmp_path: Path):
+    """The other direction of the resolution-scope split: an imported
+    BOM resolves ``${...}`` at its OWN scope (Maven semantics — the
+    importing POM's properties never rewrite an imported BOM's
+    managed versions). The child's override must NOT leak into the
+    BOM-pinned version."""
+    bom_xml = '''\
+<project>
+  <groupId>com.fasterxml.jackson</groupId>
+  <artifactId>jackson-bom</artifactId>
+  <version>2.16.0</version>
+  <properties>
+    <jackson.version>2.16.0</jackson.version>
+  </properties>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>com.fasterxml.jackson.core</groupId>
+        <artifactId>jackson-databind</artifactId>
+        <version>${jackson.version}</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+</project>
+'''
+    child = _write(tmp_path, "pom.xml", '''\
+<project>
+  <groupId>com.example</groupId>
+  <artifactId>bom-consumer</artifactId>
+  <version>1.0</version>
+  <properties>
+    <jackson.version>9.9.9</jackson.version>
+  </properties>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>com.fasterxml.jackson</groupId>
+        <artifactId>jackson-bom</artifactId>
+        <version>2.16.0</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+  <dependencies>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+''')
+    client = _StubMavenClient({
+        "com.fasterxml.jackson:jackson-bom:2.16.0": bom_xml,
+    })
+    deps = _parse_with_resolver(child, client=client)
+    db = _jackson(deps)
+    assert db is not None
+    assert db.version == "2.16.0"
+
+
+def test_unresolvable_inherited_property_refused(tmp_path: Path):
+    """An inherited managed version whose ``${prop}`` no scope
+    defines must NOT flow verbatim into ``dep.version`` / purl —
+    ``${jackson.version}`` is not a version and poisons CVE
+    matching downstream. The dep stays unpinned."""
+    _write(tmp_path, "pom.xml", '''\
+<project>
+  <groupId>com.example</groupId>
+  <artifactId>corp-parent</artifactId>
+  <version>1.0</version>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>com.fasterxml.jackson.core</groupId>
+        <artifactId>jackson-databind</artifactId>
+        <version>${undefined.version}</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+</project>
+''')
+    child = _write(tmp_path, "plain/pom.xml", _CHILD_NO_OVERRIDE_XML)
+    deps = _parse_with_resolver(child, client=None)
+    db = _jackson(deps)
+    assert db is not None
+    assert db.version is None
+
+
 def test_phase1_explicit_relativepath(tmp_path: Path):
     """``<parent><relativePath>../../shared/pom.xml</relativePath>``
     is honoured."""
@@ -945,7 +1154,7 @@ def test_cache_hit_merges_even_when_coord_already_visited() -> None:
     cached = InheritanceView()
     cached.managed[("g", "dep")] = "9.9"
     cached.properties["k"] = "v"
-    resolver._cache[("g", "parent", "1.0")] = cached
+    resolver._cache[("parent", "g", "parent", "1.0")] = cached
 
     view = InheritanceView()
     visited = {("g", "parent", "1.0")}   # already seen in this walk
@@ -959,7 +1168,7 @@ def test_cache_hit_merges_on_fresh_walk() -> None:
     resolver = PomInheritanceResolver(None, offline=True)
     cached = InheritanceView()
     cached.managed[("g", "dep")] = "1.2"
-    resolver._cache[("g", "parent", "1.0")] = cached
+    resolver._cache[("parent", "g", "parent", "1.0")] = cached
 
     view = InheritanceView()
     resolver._walk_parents(None, _root(_CHILD_XML), view, set(), depth=0)
@@ -1103,3 +1312,533 @@ def test_bom_missing_raw_xml_logs_debug(caplog) -> None:
         "raw_xml" in rec.getMessage() and "g:a" in rec.getMessage()
         for rec in caplog.records
     ), f"no raw_xml debug record: {[r.getMessage() for r in caplog.records]}"
+
+
+def test_phase3_child_direct_bom_import_without_parent(tmp_path: Path):
+    """Spring's documented alternative to inheriting starter-parent:
+    a pom with NO <parent> that BOM-imports spring-boot-dependencies
+    directly (mandatory whenever the project needs its own corporate
+    parent). The child's own dependencyManagement imports must be
+    absorbed — the caller only holds the import DECLARATION, not the
+    BOM's contents."""
+    boot_deps_xml = '''\
+<project>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-dependencies</artifactId>
+  <version>3.2.0</version>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>com.fasterxml.jackson.core</groupId>
+        <artifactId>jackson-databind</artifactId>
+        <version>2.16.0</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+</project>
+'''
+    client = _StubMavenClient({
+        "org.springframework.boot:spring-boot-dependencies:3.2.0":
+            boot_deps_xml,
+    })
+    app = _write(tmp_path, "pom.xml", '''\
+<project>
+  <artifactId>myapp</artifactId>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-dependencies</artifactId>
+        <version>3.2.0</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+  <dependencies>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+''')
+    deps = _parse_with_resolver(app, client=client)
+    jdb = next(
+        (d for d in deps
+         if d.name == "com.fasterxml.jackson.core:jackson-databind"),
+        None,
+    )
+    assert jdb is not None
+    assert jdb.version == "2.16.0"
+
+
+def test_phase3_child_own_bom_version_from_same_pom_property(
+    tmp_path: Path,
+):
+    """The routine corporate/Spring spelling of the parent-less BOM
+    import: the version centralised in the SAME pom's <properties>
+    (``<version>${boot.version}</version>``). The ancestor view is
+    empty on a parent-less child, so resolution must overlay the
+    child's own properties — pre-fix the coord failed _valid_coord
+    with the unresolved ``${...}`` and the whole managed set was lost
+    silently (managed == {} with zero fetches)."""
+    boot_deps_xml = '''\
+<project>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-dependencies</artifactId>
+  <version>3.2.0</version>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>com.fasterxml.jackson.core</groupId>
+        <artifactId>jackson-databind</artifactId>
+        <version>2.16.0</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+</project>
+'''
+    client = _StubMavenClient({
+        "org.springframework.boot:spring-boot-dependencies:3.2.0":
+            boot_deps_xml,
+    })
+    app = _write(tmp_path, "pom.xml", '''\
+<project>
+  <artifactId>myapp</artifactId>
+  <properties>
+    <boot.version>3.2.0</boot.version>
+  </properties>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-dependencies</artifactId>
+        <version>${boot.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+  <dependencies>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+''')
+    deps = _parse_with_resolver(app, client=client)
+    jdb = next(
+        (d for d in deps
+         if d.name == "com.fasterxml.jackson.core:jackson-databind"),
+        None,
+    )
+    assert jdb is not None
+    assert jdb.version == "2.16.0"
+    assert client.fetch_calls == [
+        "org.springframework.boot:spring-boot-dependencies:3.2.0",
+    ]
+
+
+def test_phase3_child_own_property_beats_inherited(tmp_path: Path):
+    """Precedence on the overlay: when the child and its parent both
+    define the property, the child's value wins (Maven precedence) —
+    the BOM fetched is the child-pinned version."""
+    boot_new = '''\
+<project>
+  <groupId>org.example</groupId>
+  <artifactId>corp-bom</artifactId>
+  <version>2.0</version>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>com.fasterxml.jackson.core</groupId>
+        <artifactId>jackson-databind</artifactId>
+        <version>2.17.0</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+</project>
+'''
+    client = _StubMavenClient({"org.example:corp-bom:2.0": boot_new})
+    _write(tmp_path, "parent/pom.xml", '''\
+<project>
+  <groupId>org.example</groupId>
+  <artifactId>parent</artifactId>
+  <version>1</version>
+  <properties>
+    <bom.version>1.0</bom.version>
+  </properties>
+</project>
+''')
+    app = _write(tmp_path, "app/pom.xml", '''\
+<project>
+  <artifactId>myapp</artifactId>
+  <parent>
+    <groupId>org.example</groupId>
+    <artifactId>parent</artifactId>
+    <version>1</version>
+    <relativePath>../parent/pom.xml</relativePath>
+  </parent>
+  <properties>
+    <bom.version>2.0</bom.version>
+  </properties>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.example</groupId>
+        <artifactId>corp-bom</artifactId>
+        <version>${bom.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+  <dependencies>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+''')
+    deps = _parse_with_resolver(app, client=client)
+    jdb = next(
+        (d for d in deps
+         if d.name == "com.fasterxml.jackson.core:jackson-databind"),
+        None,
+    )
+    assert jdb is not None
+    assert jdb.version == "2.17.0"
+
+
+def _find(deps, suffix: str):
+    return next(d for d in deps if d.name.endswith(suffix))
+
+
+def test_bom_undefined_property_never_resolves_at_importer_scope(
+    tmp_path: Path,
+):
+    """A BOM's own managed entry referencing a property the BOM does
+    NOT define is scope-final at absorption: Maven leaves the
+    reference literal, and a literal ``${...}`` is not a version.
+    Left raw in the view, the apply pass resolved it against the
+    IMPORTING pom's properties — a name collision reported a version
+    the build never uses."""
+    bom_xml = '''\
+<project>
+  <groupId>corp</groupId><artifactId>bom2</artifactId><version>1.0</version>
+  <dependencyManagement><dependencies>
+    <dependency><groupId>io.vendor</groupId><artifactId>vendor-core</artifactId>
+      <version>${vendor.core.version}</version></dependency>
+  </dependencies></dependencyManagement>
+</project>
+'''
+    child = _write(tmp_path, "pom.xml", '''\
+<project>
+  <groupId>corp</groupId><artifactId>app</artifactId><version>1</version>
+  <properties><vendor.core.version>99.99</vendor.core.version></properties>
+  <dependencyManagement><dependencies>
+    <dependency><groupId>corp</groupId><artifactId>bom2</artifactId>
+      <version>1.0</version><type>pom</type><scope>import</scope></dependency>
+  </dependencies></dependencyManagement>
+  <dependencies>
+    <dependency><groupId>io.vendor</groupId><artifactId>vendor-core</artifactId></dependency>
+  </dependencies>
+</project>
+''')
+    client = _StubMavenClient({"corp:bom2:1.0": bom_xml})
+    deps = _parse_with_resolver(child, client)
+    # The importer defines the property, but the BOM's scope doesn't:
+    # the entry is dropped at BOM finalisation and the dep stays
+    # unpinned — never 99.99.
+    assert _find(deps, ":vendor-core").version is None
+
+
+def test_bom_undefined_property_refused_without_importer_collision(
+    tmp_path: Path,
+):
+    """Control for the scope-final rule: with NO importer property of
+    the same name, the entry is equally refused (the two shapes must
+    agree — refusal fired only in this one before)."""
+    bom_xml = '''\
+<project>
+  <groupId>corp</groupId><artifactId>bom2</artifactId><version>1.0</version>
+  <dependencyManagement><dependencies>
+    <dependency><groupId>io.vendor</groupId><artifactId>vendor-core</artifactId>
+      <version>${vendor.core.version}</version></dependency>
+  </dependencies></dependencyManagement>
+</project>
+'''
+    child = _write(tmp_path, "pom.xml", '''\
+<project>
+  <groupId>corp</groupId><artifactId>app</artifactId><version>1</version>
+  <dependencyManagement><dependencies>
+    <dependency><groupId>corp</groupId><artifactId>bom2</artifactId>
+      <version>1.0</version><type>pom</type><scope>import</scope></dependency>
+  </dependencies></dependencyManagement>
+  <dependencies>
+    <dependency><groupId>io.vendor</groupId><artifactId>vendor-core</artifactId></dependency>
+  </dependencies>
+</project>
+''')
+    client = _StubMavenClient({"corp:bom2:1.0": bom_xml})
+    deps = _parse_with_resolver(child, client)
+    assert _find(deps, ":vendor-core").version is None
+
+
+def test_bom_parent_chain_property_resolves_at_bom_scope(tmp_path: Path):
+    """Arrival path two for the same mechanism: the BOM's PARENT
+    chain contributes raw-by-design managed values; they must settle
+    at the BOM's merged scope (2.9.0 here), not at the importer's
+    (9.9.9-IMPORTER)."""
+    bom_xml = '''\
+<project>
+  <parent><groupId>corp</groupId><artifactId>bom-parent</artifactId>
+    <version>1.0</version></parent>
+  <groupId>corp</groupId><artifactId>bom</artifactId><version>1.0</version>
+</project>
+'''
+    bom_parent_xml = '''\
+<project>
+  <groupId>corp</groupId><artifactId>bom-parent</artifactId><version>1.0</version>
+  <properties><jackson.version>2.9.0</jackson.version></properties>
+  <dependencyManagement><dependencies>
+    <dependency><groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>${jackson.version}</version></dependency>
+  </dependencies></dependencyManagement>
+</project>
+'''
+    child = _write(tmp_path, "pom.xml", '''\
+<project>
+  <groupId>corp</groupId><artifactId>app</artifactId><version>1</version>
+  <properties><jackson.version>9.9.9-IMPORTER</jackson.version></properties>
+  <dependencyManagement><dependencies>
+    <dependency><groupId>corp</groupId><artifactId>bom</artifactId>
+      <version>1.0</version><type>pom</type><scope>import</scope></dependency>
+  </dependencies></dependencyManagement>
+  <dependencies>
+    <dependency><groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId></dependency>
+  </dependencies>
+</project>
+''')
+    client = _StubMavenClient({
+        "corp:bom:1.0": bom_xml,
+        "corp:bom-parent:1.0": bom_parent_xml,
+    })
+    deps = _parse_with_resolver(child, client)
+    assert _find(deps, ":jackson-databind").version == "2.9.0"
+
+
+_D1_BOM_V1 = '''\
+<project>
+  <groupId>corp</groupId><artifactId>platform-bom</artifactId><version>1.0</version>
+  <dependencyManagement><dependencies>
+    <dependency><groupId>corp</groupId><artifactId>lib</artifactId>
+      <version>9.9.9</version></dependency>
+  </dependencies></dependencyManagement>
+</project>
+'''
+_D1_BOM_V2 = (
+    _D1_BOM_V1
+    .replace("<version>1.0</version>", "<version>2.0</version>")
+    .replace("9.9.9", "5.5.5")
+)
+_D1_PARENT = '''\
+<project>
+  <groupId>corp</groupId><artifactId>par</artifactId><version>1</version>
+  <properties><bom.version>1.0</bom.version></properties>
+  <dependencyManagement><dependencies>
+    <dependency><groupId>corp</groupId><artifactId>platform-bom</artifactId>
+      <version>${bom.version}</version><type>pom</type><scope>import</scope></dependency>
+  </dependencies></dependencyManagement>
+</project>
+'''
+
+
+def test_parent_declared_bom_selector_resolves_child_wins(tmp_path: Path):
+    """A BOM import declared in the PARENT with
+    ``<version>${bom.version}</version>``: Maven resolves the selector
+    child-wins (the documented pattern for picking a platform-BOM
+    revision). Resolving it at ancestor scope fetched BOM 1.0 and
+    pinned versions the build never imports."""
+    _write(tmp_path, "pom.xml", _D1_PARENT)
+    child = _write(tmp_path, "app/pom.xml", '''\
+<project>
+  <parent><groupId>corp</groupId><artifactId>par</artifactId>
+    <version>1</version></parent>
+  <groupId>corp</groupId><artifactId>app</artifactId><version>1</version>
+  <properties><bom.version>2.0</bom.version></properties>
+  <dependencies>
+    <dependency><groupId>corp</groupId><artifactId>lib</artifactId></dependency>
+  </dependencies>
+</project>
+''')
+    client = _StubMavenClient({
+        "corp:platform-bom:1.0": _D1_BOM_V1,
+        "corp:platform-bom:2.0": _D1_BOM_V2,
+    })
+    deps = _parse_with_resolver(child, client)
+    assert _find(deps, ":lib").version == "5.5.5"
+    assert "corp:platform-bom:2.0" in client.fetch_calls
+
+
+def test_parent_declared_bom_not_baked_into_cached_parent_view(
+    tmp_path: Path,
+):
+    """Two children of ONE parent (cached after the first) with
+    different ``bom.version`` overrides must each get their own BOM
+    revision — the parent's cached view carries the declaration, not
+    a baked selection."""
+    _write(tmp_path, "pom.xml", _D1_PARENT)
+    child_a = _write(tmp_path, "a/pom.xml", '''\
+<project>
+  <parent><groupId>corp</groupId><artifactId>par</artifactId>
+    <version>1</version></parent>
+  <groupId>corp</groupId><artifactId>a</artifactId><version>1</version>
+  <dependencies>
+    <dependency><groupId>corp</groupId><artifactId>lib</artifactId></dependency>
+  </dependencies>
+</project>
+''')
+    child_b = _write(tmp_path, "b/pom.xml", '''\
+<project>
+  <parent><groupId>corp</groupId><artifactId>par</artifactId>
+    <version>1</version></parent>
+  <groupId>corp</groupId><artifactId>b</artifactId><version>1</version>
+  <properties><bom.version>2.0</bom.version></properties>
+  <dependencies>
+    <dependency><groupId>corp</groupId><artifactId>lib</artifactId></dependency>
+  </dependencies>
+</project>
+''')
+    client = _StubMavenClient({
+        "corp:platform-bom:1.0": _D1_BOM_V1,
+        "corp:platform-bom:2.0": _D1_BOM_V2,
+    })
+    resolver = pom_inheritance.PomInheritanceResolver(client)
+    pom_inheritance.set_inheritance_resolver(resolver)
+    try:
+        deps_a = pom_parser.parse(child_a)   # no override → parent's 1.0
+        deps_b = pom_parser.parse(child_b)   # override → 2.0
+    finally:
+        pom_inheritance.set_inheritance_resolver(None)
+    assert _find(deps_a, ":lib").version == "9.9.9"
+    assert _find(deps_b, ":lib").version == "5.5.5"
+
+
+def test_inherited_embedded_property_ref_resolves_child_wins(
+    tmp_path: Path,
+):
+    """A parent-managed ``<version>2.${jackson.minor}.0</version>``
+    with the property defined in parent AND child resolves child-wins
+    at apply (2.17.0). The whole-string-only pass left it unresolved
+    — OSV can't match ``2.${jackson.minor}.0`` — AND let it through
+    the whole-string-only refusal gate into dep.version and purl."""
+    _write(tmp_path, "pom.xml", '''\
+<project>
+  <groupId>corp</groupId><artifactId>par</artifactId><version>1</version>
+  <properties><jackson.minor>9</jackson.minor></properties>
+  <dependencyManagement><dependencies>
+    <dependency><groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>2.${jackson.minor}.0</version></dependency>
+  </dependencies></dependencyManagement>
+</project>
+''')
+    child = _write(tmp_path, "app/pom.xml", '''\
+<project>
+  <parent><groupId>corp</groupId><artifactId>par</artifactId>
+    <version>1</version></parent>
+  <groupId>corp</groupId><artifactId>app</artifactId><version>1</version>
+  <properties><jackson.minor>17</jackson.minor></properties>
+  <dependencies>
+    <dependency><groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId></dependency>
+  </dependencies>
+</project>
+''')
+    deps = _parse_with_resolver(child, None)
+    dep = _find(deps, ":jackson-databind")
+    assert dep.version == "2.17.0"
+    assert dep.purl.endswith("@2.17.0")
+
+
+def test_inherited_embedded_unresolvable_ref_is_refused(tmp_path: Path):
+    """An embedded reference NO scope defines is refused at apply —
+    the dep stays unpinned; the raw ``${...}`` never reaches
+    dep.version or the purl."""
+    _write(tmp_path, "pom.xml", '''\
+<project>
+  <groupId>corp</groupId><artifactId>par</artifactId><version>1</version>
+  <dependencyManagement><dependencies>
+    <dependency><groupId>corp</groupId><artifactId>ctrl</artifactId>
+      <version>2.${undefined.minor}.0</version></dependency>
+  </dependencies></dependencyManagement>
+</project>
+''')
+    child = _write(tmp_path, "app/pom.xml", '''\
+<project>
+  <parent><groupId>corp</groupId><artifactId>par</artifactId>
+    <version>1</version></parent>
+  <groupId>corp</groupId><artifactId>app</artifactId><version>1</version>
+  <dependencies>
+    <dependency><groupId>corp</groupId><artifactId>ctrl</artifactId></dependency>
+  </dependencies>
+</project>
+''')
+    deps = _parse_with_resolver(child, None)
+    dep = _find(deps, ":ctrl")
+    assert dep.version is None
+    assert "${" not in (dep.purl or "")
+
+
+def test_failed_parent_load_is_retried_as_bom_import(tmp_path: Path):
+    """A coordinate whose PARENT-chain load failed (404) must stay
+    retryable: marking it visited before the load left a later BOM
+    import of the same coordinate silently skipped."""
+    child = _write(tmp_path, "pom.xml", '''\
+<project>
+  <parent><groupId>corp</groupId><artifactId>platform</artifactId>
+    <version>1.0</version><relativePath/></parent>
+  <groupId>corp</groupId><artifactId>app</artifactId><version>1</version>
+  <dependencyManagement><dependencies>
+    <dependency><groupId>corp</groupId><artifactId>platform</artifactId>
+      <version>1.0</version><type>pom</type><scope>import</scope></dependency>
+  </dependencies></dependencyManagement>
+  <dependencies>
+    <dependency><groupId>corp</groupId><artifactId>lib</artifactId></dependency>
+  </dependencies>
+</project>
+''')
+    platform_xml = '''\
+<project>
+  <groupId>corp</groupId><artifactId>platform</artifactId><version>1.0</version>
+  <dependencyManagement><dependencies>
+    <dependency><groupId>corp</groupId><artifactId>lib</artifactId>
+      <version>4.4.4</version></dependency>
+  </dependencies></dependencyManagement>
+</project>
+'''
+
+    class _FlakyClient(_StubMavenClient):
+        """404s the FIRST fetch of the coordinate (the parent walk),
+        serves it afterwards (the BOM import)."""
+
+        def __init__(self, poms):
+            super().__init__(poms)
+            self._failed_once = False
+
+        def get_pom(self, coord, version):
+            if not self._failed_once and coord == "corp:platform":
+                self._failed_once = True
+                self.fetch_calls.append(f"{coord}:{version}")
+                return None
+            return super().get_pom(coord, version)
+
+    client = _FlakyClient({"corp:platform:1.0": platform_xml})
+    deps = _parse_with_resolver(child, client)
+    assert _find(deps, ":lib").version == "4.4.4"

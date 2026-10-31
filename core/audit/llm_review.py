@@ -103,7 +103,11 @@ _STATUS_FULL = {
         "exploitable in the current calling context. You must name "
         "the bug — if you cannot, use clean. "
         "finding = real vulnerability worth investigating. "
-        "dormant = latent issue that needs specific conditions to trigger."
+        "dormant = real bug in code that is currently unreachable "
+        "(dead code, no callers); it becomes a finding when "
+        "reachability changes. A reachable bug that only triggers "
+        "under specific conditions is suspicious or finding, never "
+        "dormant."
     ),
 }
 
@@ -133,7 +137,11 @@ _STATUS_QUALITY = {
         "suspicious = possible defect, unconfirmed. You must name "
         "the specific concern — if you cannot, use clean. "
         "finding = confirmed defect worth investigating. "
-        "dormant = latent issue that needs specific conditions to trigger."
+        "dormant = real defect in code that is currently unreachable "
+        "(dead code, no callers); it becomes a finding when "
+        "reachability changes. A reachable defect that only triggers "
+        "under specific conditions is suspicious or finding, never "
+        "dormant."
     ),
 }
 
@@ -156,12 +164,36 @@ _BUG_CLASS_FIELD = {
 # lifting the gate for another language.
 STUDY_SUPPORTED_LANGUAGES = (
     "C", "C++", "Python", "Go", "Java", "JavaScript", "TypeScript",
-    "Rust",
+    "Rust", "PHP", "Kotlin", "C#", "Swift",
 )
 
 _STUDY_LANGS_TEXT = (
-    "C/C++, Python, Go, Java, JavaScript/TypeScript, and Rust"
+    "C/C++, Python, Go, Java, JavaScript/TypeScript, Rust, PHP, "
+    "Kotlin, C#, and Swift"
 )
+
+# Claim shape for the folded spec-inference response field — mirrors
+# the standalone spec class's prompt contract (spec_inference):
+# anchors are verified verbatim against the function source, and
+# unanchored claims are demoted to the hint tier.
+_SPEC_CLAIM_ITEM = {
+    "type": "object",
+    "properties": {
+        "claim": {
+            "type": "string",
+            "description": "The contract condition, one sentence.",
+        },
+        "anchor": {
+            "type": "string",
+            "description": (
+                "Short snippet copied VERBATIM from the function "
+                "source that grounds the claim (code only, no "
+                "line-number gutter)."
+            ),
+        },
+    },
+    "required": ["claim"],
+}
 
 REVIEW_SCHEMA = {
     "type": "object",
@@ -232,6 +264,37 @@ REVIEW_SCHEMA = {
                             "'writers are serialised by the lock' "
                             "(cross_function)? Omit when there is no "
                             "counter."
+                        ),
+                    },
+                    "guard_type": {
+                        "type": "string",
+                        "enum": [
+                            "bounds",
+                            "null_safety",
+                            "validation",
+                            "sanitisation",
+                            "lifetime",
+                            "ordering",
+                            "concurrency",
+                            "other",
+                        ],
+                        "description": (
+                            "When counter_scope is cross_function: "
+                            "what category of guarantee does the "
+                            "external entity provide? Omit when "
+                            "counter_scope is local or absent."
+                        ),
+                    },
+                    "assumed_property": {
+                        "type": "string",
+                        "description": (
+                            "When counter_scope is cross_function: "
+                            "one-phrase description of what this "
+                            "function assumes but does not check, "
+                            "e.g. 'input length <= 256', 'pointer "
+                            "is non-NULL', 'buffer is null-"
+                            "terminated'. Omit when counter_scope "
+                            "is local or absent."
                         ),
                     },
                 },
@@ -345,8 +408,20 @@ REVIEW_SCHEMA = {
                         "type": "string",
                         "enum": [
                             "parameter", "precondition", "postcondition",
-                            "state", "ordering",
+                            "state", "ordering", "invariant",
                         ],
+                        "description": (
+                            "parameter: bound on a parameter value. "
+                            "precondition: must hold before the call. "
+                            "postcondition: holds after the call / the "
+                            "return must be checked. state: a program-"
+                            "state condition (lock held, initialised) "
+                            "that must hold while the function runs. "
+                            "ordering: calls must happen in a given "
+                            "order. invariant is accepted as an alias "
+                            "of state — a state condition that must "
+                            "always hold — and is stored as state."
+                        ),
                     },
                     "target": {"type": "string"},
                     "rule": {"type": "string"},
@@ -483,6 +558,41 @@ REVIEW_SCHEMA = {
                         "docstring, test_assertions, annotation, "
                         "caller_usage, parameter_type."
                     ),
+                },
+            },
+        },
+        "inferred_spec": {
+            "type": "object",
+            "description": (
+                "ONLY when the prompt contains a 'Specification "
+                "inference' section: the behavioural contract you "
+                "inferred for this function while reviewing. Omit "
+                "entirely otherwise. Every claim carries an anchor "
+                "copied verbatim from the source — unanchored claims "
+                "are demoted to unverified hints."
+            ),
+            "properties": {
+                "intent": {
+                    "type": "string",
+                    "description": (
+                        "One sentence: what this function should do."
+                    ),
+                },
+                "preconditions": {
+                    "type": "array",
+                    "items": _SPEC_CLAIM_ITEM,
+                },
+                "postconditions": {
+                    "type": "array",
+                    "items": _SPEC_CLAIM_ITEM,
+                },
+                "invariants": {
+                    "type": "array",
+                    "items": _SPEC_CLAIM_ITEM,
+                },
+                "negative_specs": {
+                    "type": "array",
+                    "items": _SPEC_CLAIM_ITEM,
                 },
             },
         },
@@ -720,17 +830,17 @@ REVIEW_SCHEMA = {
 REVIEW_SCHEMA_BLIND = {
     "type": "object",
     "properties": {
-        "hypothesis": REVIEW_SCHEMA["properties"]["hypothesis"],
-        "hypotheses": REVIEW_SCHEMA["properties"]["hypotheses"],
+        "hypothesis": REVIEW_SCHEMA["properties"]["hypothesis"],  # type: ignore[index]
+        "hypotheses": REVIEW_SCHEMA["properties"]["hypotheses"],  # type: ignore[index]
         "body": {"type": "string"},
-        "cwe": REVIEW_SCHEMA["properties"]["cwe"],
-        "counter_hypothesis": REVIEW_SCHEMA["properties"]["counter_hypothesis"],
-        "counter_direction": REVIEW_SCHEMA["properties"]["counter_direction"],
-        "observations": REVIEW_SCHEMA["properties"]["observations"],
-        "constraints": REVIEW_SCHEMA["properties"]["constraints"],
-        "reading_list": REVIEW_SCHEMA["properties"]["reading_list"],
-        "intent_trace": REVIEW_SCHEMA["properties"]["intent_trace"],
-        "verdict_rationale": REVIEW_SCHEMA["properties"]["verdict_rationale"],
+        "cwe": REVIEW_SCHEMA["properties"]["cwe"],  # type: ignore[index]
+        "counter_hypothesis": REVIEW_SCHEMA["properties"]["counter_hypothesis"],  # type: ignore[index]
+        "counter_direction": REVIEW_SCHEMA["properties"]["counter_direction"],  # type: ignore[index]
+        "observations": REVIEW_SCHEMA["properties"]["observations"],  # type: ignore[index]
+        "constraints": REVIEW_SCHEMA["properties"]["constraints"],  # type: ignore[index]
+        "reading_list": REVIEW_SCHEMA["properties"]["reading_list"],  # type: ignore[index]
+        "intent_trace": REVIEW_SCHEMA["properties"]["intent_trace"],  # type: ignore[index]
+        "verdict_rationale": REVIEW_SCHEMA["properties"]["verdict_rationale"],  # type: ignore[index]
         "status": _STATUS_NO_DORMANT,
     },
     "required": [
@@ -938,18 +1048,18 @@ def _schema_for_mode(mode: ReviewMode) -> dict:
     import copy
     base = copy.deepcopy(REVIEW_SCHEMA)
     if mode.is_defect_oriented:
-        base["properties"]["status"] = copy.deepcopy(_status_for_mode(mode))
-        base["properties"]["hypothesis"]["description"] = (
+        base["properties"]["status"] = copy.deepcopy(_status_for_mode(mode))  # type: ignore[index]
+        base["properties"]["hypothesis"]["description"] = (  # type: ignore[index]
             "Your single strongest hypothesis for HOW this function "
             "is defective. Name the specific mechanism: off-by-one, "
             "resource leak, missing error check, use-after-free, "
             "integer overflow, TOCTOU race, etc. One sentence, "
             "mechanism first."
         )
-        base["properties"]["bug_class"] = copy.deepcopy(_BUG_CLASS_FIELD)
+        base["properties"]["bug_class"] = copy.deepcopy(_BUG_CLASS_FIELD)  # type: ignore[index]
         if mode == ReviewMode.QUALITY:
-            base["properties"].pop("impact", None)
-            base["properties"].pop("preconditions", None)
+            base["properties"].pop("impact", None)  # type: ignore[attr-defined]
+            base["properties"].pop("preconditions", None)  # type: ignore[attr-defined]
     return base
 
 
@@ -1022,6 +1132,27 @@ def _is_contract_delegation(lower: str) -> bool:
         if any(w in lower for w in _CALLER_REFERENCE_WORDS):
             return True
     return False
+
+
+def _refutation_grounded(h: dict) -> bool:
+    """True when a refuted hypothesis's refutation is GROUNDED.
+
+    Grounded means the model backed the refutation with a counter it
+    verified against the reviewed function itself: ``counter`` text is
+    present, scoped ``counter_scope == "local"``, and not mere
+    contract delegation ("the caller must ensure..." defeats nothing
+    locally). A missing counter, a ``cross_function`` scope (the
+    refuting claim lives in code the review never examined), or a
+    delegated contract is an UNGROUNDED refutation — it may not erase
+    the suspicion by itself; the claim routes to verification instead
+    (verify the refuting claim, don't distrust the clean).
+    """
+    counter = str(h.get("counter") or "").strip()
+    if not counter:
+        return False
+    if str(h.get("counter_scope") or "").strip().lower() != "local":
+        return False
+    return not _is_contract_delegation(counter.lower())
 
 
 def _clean_counter_escalates(result: dict) -> bool:
@@ -1271,6 +1402,16 @@ def make_review_fn(
 
         duration = time.monotonic() - t0
 
+        # Prompt-budget disclosure: format_context_for_prompt stamps
+        # ``ctx["prompt_budget_event"]`` when the assembled prompt had
+        # priority-0 content elided (or was still over budget after
+        # elision). Ride it on the result dict so the audit-log
+        # writers (Collector.submit / _commit_outcome) persist it on
+        # this row's durable record.
+        budget_event = ctx.get("prompt_budget_event")
+        if budget_event and isinstance(result, dict):
+            result["prompt_budget_event"] = budget_event
+
         status = result.get("status", "suspicious")
         if status not in ("clean", "suspicious", "finding", "dormant"):
             logger.warning(
@@ -1326,21 +1467,103 @@ def make_review_fn(
                 for h in hypotheses
             )
             if all_refuted:
-                status = "clean"
-                result["status"] = status
-                result["all_refuted_demotion"] = True
-                # Keep the journal body consistent with the stored
-                # verdict (the prose may still argue suspicion).
-                result["body"] = (
-                    "[all-refuted demotion: every hypothesis below was "
-                    "refuted by the review itself — verdict recorded "
-                    "as clean]\n\n" + (result.get("body") or "")
-                )
-                logger.info(
-                    "all-refuted demotion %s:%s: %d hypotheses refuted%s",
-                    ctx["file"], ctx["function"], len(hypotheses),
-                    " (overrode counter-escalation)" if counter_escalated else "",
-                )
+                # Grounding gate: self-refutation demotes only when
+                # every refutation is grounded (local, non-delegated
+                # counter — _refutation_grounded). An ungrounded
+                # refutation is an unverified claim; withholding keeps
+                # the verdict suspicious so the existing verification
+                # lane (deepen re-review / end-of-run resolution)
+                # adjudicates it instead of the model erasing its own
+                # suspicion by assertion. The deepen pass IS that
+                # lane: a full-context re-review that still refutes
+                # everything closes the loop and demotes with its own
+                # provenance stamp.
+                ungrounded = [
+                    h for h in hypotheses if not _refutation_grounded(h)
+                ]
+                withhold_reason = ""
+                if ctx.get("deepen"):
+                    # Deepen exempts ONLY the ungrounded-refutation
+                    # leg: the full-context re-review is itself the
+                    # verification lane for grounding. The
+                    # counter-escalation floor below still applies —
+                    # a deepen response whose own compelling counter
+                    # machine-raised the verdict may not un-raise it
+                    # with the same response's refutation record.
+                    ungrounded = []
+                if ungrounded:
+                    withhold_reason = (
+                        f"{len(ungrounded)} of {len(hypotheses)} "
+                        "refutation(s) carry no grounded local counter"
+                    )
+                    result["all_refuted_demotion_withheld"] = "ungrounded"
+                elif counter_escalated:
+                    # Counter-escalation evidence floor: this
+                    # suspicious is machine-raised off the review's
+                    # own counter-hypothesis (the model concluded
+                    # clean). The same response's refutation record
+                    # may not un-raise it — only a verification-grade
+                    # receipt may. Sanitized per "+"-part so a raw
+                    # model claim can never satisfy the floor.
+                    from .evidence_grade import is_verification_evidence
+                    sanitized_ev = "+".join(
+                        p for p in (
+                            _normalize_evidence_tool(part.strip())
+                            for part in str(
+                                result.get("evidence_tool") or "",
+                            ).split("+")
+                        ) if p
+                    )
+                    if not is_verification_evidence(sanitized_ev):
+                        withhold_reason = (
+                            "the verdict is a counter-escalation with "
+                            "no verification-grade receipt"
+                        )
+                        result["all_refuted_demotion_withheld"] = (
+                            "counter-escalation-floor"
+                        )
+                if withhold_reason:
+                    marker = (
+                        "[withheld all-refuted demotion: every "
+                        "hypothesis below is marked refuted, but "
+                        f"{withhold_reason} — verdict stays suspicious "
+                        "pending verification]\n\n"
+                    )
+                    body = result.get("body") or ""
+                    if body.startswith("[counter-hypothesis escalation:"):
+                        # The escalation marker must stay FIRST (the
+                        # machine-raised provenance check reads the
+                        # body prefix on journal-rebuilt outcomes) —
+                        # splice the withhold marker after it.
+                        head, sep, tail = body.partition("\n\n")
+                        result["body"] = head + sep + marker + tail
+                    else:
+                        result["body"] = marker + body
+                    logger.info(
+                        "all-refuted demotion withheld %s:%s: %s",
+                        ctx["file"], ctx["function"], withhold_reason,
+                    )
+                else:
+                    status = "clean"
+                    result["status"] = status
+                    result["all_refuted_demotion"] = True
+                    result["all_refuted_grounding"] = (
+                        "deepen-verified" if ctx.get("deepen") else "local"
+                    )
+                    # Keep the journal body consistent with the stored
+                    # verdict (the prose may still argue suspicion).
+                    result["body"] = (
+                        "[all-refuted demotion: every hypothesis below "
+                        "was refuted by the review itself — verdict "
+                        "recorded as clean]\n\n" + (result.get("body") or "")
+                    )
+                    logger.info(
+                        "all-refuted demotion %s:%s: %d hypotheses "
+                        "refuted%s",
+                        ctx["file"], ctx["function"], len(hypotheses),
+                        " (overrode counter-escalation)"
+                        if counter_escalated else "",
+                    )
 
         if _rationale_consistency_should_demote(
             status,
@@ -1405,8 +1628,10 @@ def call_llm_for_rule_refinement(
             # spend enters the run ledger and the reservation gate.
             client = getattr(config, "llm_budget_client", None)
         if client is None:
-            from core.llm.client import LLMClient
-            client = LLMClient()
+            # Transcript seam: identical to LLMClient() with no
+            # session active.
+            from core.llm.transcript import build_llm_client
+            client = build_llm_client()
         from core.security.prompt_framing import with_audit_framing
         response = client.generate(
             prompt,

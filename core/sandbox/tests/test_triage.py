@@ -10,6 +10,17 @@ from core.sandbox import summary as summary_mod
 from core.sandbox import triage as triage_mod
 
 
+from pathlib import Path
+
+@pytest.fixture(autouse=True)
+def _user_state_in_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """User registries stay out of the real home: the root-conftest
+    layer doing this is stripped from release extracts (conftest.py
+    is export-ignore), so the pin must travel in-file."""
+    from core.testing.state_isolation import pin_user_state_dirs
+    pin_user_state_dirs(monkeypatch, tmp_path)
+
+
 def _write_summary(tmp_path, denials, total_denials=None):
     """Hand-write a sandbox-summary.json for cases the real writer API
     can't easily produce (specific syscall/marker permutations)."""
@@ -1047,7 +1058,14 @@ class TestProvenanceUnavailable:
         xdg = tmp_path / "xdg"
         keydir = xdg / "raptor"
         keydir.mkdir(parents=True)
-        (keydir / "telemetry-mac.key").write_bytes(b"short")  # wrong length
+        # Stable SHORT content at healthy 0600 perms: the one
+        # operator-side unusable shape that is NOT auto-recovered
+        # (tamper shapes — mode flips, symlinks, over-length — are
+        # quarantined and re-keyed, and land in telemetry_tampering
+        # via failed verification instead).
+        key = keydir / "telemetry-mac.key"
+        key.write_bytes(b"short")  # wrong length
+        key.chmod(0o600)
         monkeypatch.setenv("XDG_DATA_HOME", str(xdg))
 
     def test_unusable_key_is_notable_not_tampering(
@@ -1159,3 +1177,358 @@ class TestHostileArtifactReads:
         ])
         result = triage_mod.triage_run(tmp_path)
         assert result["inputs"]["sandbox_summary_present"] is False
+
+
+class TestCapEvidenceEscapesStructurally:
+    """_cap_evidence is the one chokepoint every signal's evidence
+    list passes through — target-derived bytes (the Landlock-lane
+    child-append residual lets a hostile child forge whole denial
+    records) must never reach sandbox-triage.json with raw control
+    bytes, whatever today's consumers happen to print."""
+
+    def test_control_bytes_escaped(self):
+        out = triage_mod._cap_evidence(["evil\x1b]0;pwned\x07name"])
+        assert len(out) == 1
+        assert "\x1b" not in out[0]
+        assert "\x07" not in out[0]
+        assert "\\x1b" in out[0]
+
+    def test_length_bound_holds_on_escaped_output(self):
+        # Escaping expands (1 control byte -> 4 chars); the cap must
+        # bound what is EMITTED, not the pre-escape input.
+        raw = "\x1b" * (triage_mod._MAX_EVIDENCE_ITEM_LEN)
+        out = triage_mod._cap_evidence([raw])
+        assert len(out[0]) <= triage_mod._MAX_EVIDENCE_ITEM_LEN + 32
+
+    def test_plain_items_untouched(self):
+        items = ["socket", "connect"]
+        assert triage_mod._cap_evidence(items) == items
+
+
+class TestReadBoundedGrewDuringRead:
+    """A triage input that grows past the cap between the fstat size
+    gate and the read must be REFUSED (None), never returned as a
+    silently-truncated prefix — a racing target-side writer could
+    shape the prefix into a different (cleaner-grading) artifact.
+    Pins the contract _read_bounded inherits from
+    core.security.capped_read; the pre-migration private copy
+    truncated instead."""
+
+    def test_grown_input_refused_not_truncated(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(triage_mod, "_MAX_INPUT_BYTES", 10)
+        f = tmp_path / "input.json"
+        f.write_bytes(b"x" * 20)
+        real_fstat = os.fstat
+
+        def lying_fstat(fd: int) -> os.stat_result:
+            # Simulate the race: fstat sees an in-cap size while the
+            # file already holds more than the cap.
+            st = real_fstat(fd)
+            return os.stat_result(
+                (st.st_mode, st.st_ino, st.st_dev, st.st_nlink,
+                 st.st_uid, st.st_gid, 5, st.st_atime, st.st_mtime,
+                 st.st_ctime))
+
+        monkeypatch.setattr(os, "fstat", lying_fstat)
+        assert triage_mod._read_bounded(f) is None
+
+
+class TestEscapeBurst:
+    def test_fires_on_rapid_ptrace_burst_iso_timestamps(self, tmp_path):
+        from datetime import datetime, timezone, timedelta
+        base = datetime(2026, 10, 4, 12, 0, 0, tzinfo=timezone.utc)
+        denials = [
+            {"type": "seccomp", "syscall": "ptrace",
+             "ts": (base + timedelta(milliseconds=100 * i)).isoformat()}
+            for i in range(6)
+        ]
+        _write_summary(tmp_path, denials)
+        result = triage_mod.triage_run(tmp_path)
+        types = {s["type"] for s in result["signals"]}
+        assert "escape_burst" in types
+
+    def test_fires_on_rapid_ptrace_burst_numeric_ts(self, tmp_path):
+        denials = [
+            {"type": "seccomp", "syscall": "ptrace", "ts": 1.0 + i * 0.1}
+            for i in range(6)
+        ]
+        _write_summary(tmp_path, denials)
+        result = triage_mod.triage_run(tmp_path)
+        types = {s["type"] for s in result["signals"]}
+        assert "escape_burst" in types
+
+    def test_no_burst_when_spread_over_minutes(self, tmp_path):
+        from datetime import datetime, timezone, timedelta
+        base = datetime(2026, 10, 4, 12, 0, 0, tzinfo=timezone.utc)
+        denials = [
+            {"type": "seccomp", "syscall": "ptrace",
+             "ts": (base + timedelta(minutes=i)).isoformat()}
+            for i in range(6)
+        ]
+        _write_summary(tmp_path, denials)
+        result = triage_mod.triage_run(tmp_path)
+        types = {s["type"] for s in result["signals"]}
+        assert "escape_burst" not in types
+
+    def test_no_burst_below_count_threshold(self, tmp_path):
+        denials = [
+            {"type": "seccomp", "syscall": "bpf", "ts": 1.0 + i * 0.1}
+            for i in range(3)
+        ]
+        _write_summary(tmp_path, denials)
+        result = triage_mod.triage_run(tmp_path)
+        types = {s["type"] for s in result["signals"]}
+        assert "escape_burst" not in types
+
+    def test_tolerates_missing_timestamps(self, tmp_path):
+        denials = [
+            {"type": "seccomp", "syscall": "ptrace"}
+            for _ in range(10)
+        ]
+        _write_summary(tmp_path, denials)
+        result = triage_mod.triage_run(tmp_path)
+        types = {s["type"] for s in result["signals"]}
+        assert "escape_burst" not in types
+
+
+class TestHostRetryPattern:
+    def test_fires_on_repeated_same_host(self, tmp_path):
+        events = [
+            {"t": i, "host": "c2.evil.com", "port": 443,
+             "result": "denied_host"}
+            for i in range(12)
+        ]
+        _write_proxy_events(tmp_path, events)
+        result = triage_mod.triage_run(tmp_path)
+        types = {s["type"] for s in result["signals"]}
+        assert "host_retry_pattern" in types
+
+    def test_no_signal_below_threshold(self, tmp_path):
+        events = [
+            {"t": i, "host": "c2.evil.com", "port": 443,
+             "result": "denied_host"}
+            for i in range(5)
+        ]
+        _write_proxy_events(tmp_path, events)
+        result = triage_mod.triage_run(tmp_path)
+        types = {s["type"] for s in result["signals"]}
+        assert "host_retry_pattern" not in types
+
+    def test_distinct_from_breadth_recon(self, tmp_path):
+        events = [
+            {"t": i, "host": f"host-{i}.evil.com", "port": 443,
+             "result": "denied_host"}
+            for i in range(12)
+        ]
+        _write_proxy_events(tmp_path, events)
+        result = triage_mod.triage_run(tmp_path)
+        types = {s["type"] for s in result["signals"]}
+        assert "host_retry_pattern" not in types
+        assert "host_recon_pattern" in types
+
+
+class TestDnsExfilIndicator:
+    def test_fires_on_many_subdomains_of_one_parent(self, tmp_path):
+        events = [
+            {"t": i, "host": f"chunk{i}.exfil.evil.com", "port": 443,
+             "result": "allowed"}
+            for i in range(25)
+        ]
+        _write_proxy_events(tmp_path, events)
+        result = triage_mod.triage_run(tmp_path)
+        types = {s["type"] for s in result["signals"]}
+        assert "dns_exfil_indicator" in types
+
+    def test_no_signal_with_few_subdomains(self, tmp_path):
+        events = [
+            {"t": i, "host": f"chunk{i}.exfil.evil.com", "port": 443,
+             "result": "allowed"}
+            for i in range(5)
+        ]
+        _write_proxy_events(tmp_path, events)
+        result = triage_mod.triage_run(tmp_path)
+        types = {s["type"] for s in result["signals"]}
+        assert "dns_exfil_indicator" not in types
+
+    def test_ignored_for_denied_events(self, tmp_path):
+        events = [
+            {"t": i, "host": f"chunk{i}.exfil.evil.com", "port": 443,
+             "result": "denied_host"}
+            for i in range(25)
+        ]
+        _write_proxy_events(tmp_path, events)
+        result = triage_mod.triage_run(tmp_path)
+        types = {s["type"] for s in result["signals"]}
+        assert "dns_exfil_indicator" not in types
+
+    def test_2ld_tld_grouped_correctly(self, tmp_path):
+        events = [
+            {"t": i, "host": f"chunk{i}.exfil.co.uk", "port": 443,
+             "result": "allowed"}
+            for i in range(25)
+        ]
+        _write_proxy_events(tmp_path, events)
+        result = triage_mod.triage_run(tmp_path)
+        types = {s["type"] for s in result["signals"]}
+        assert "dns_exfil_indicator" in types
+        sig = [s for s in result["signals"]
+               if s["type"] == "dns_exfil_indicator"][0]
+        assert "exfil.co.uk" in sig["evidence"][0]
+
+
+class TestUdpPostureGap:
+    def test_fires_when_network_blocked_but_udp_open(
+            self, tmp_path, monkeypatch):
+        _write_summary(tmp_path, [
+            {"type": "write", "cmd": "test", "returncode": 1,
+             "path": "/tmp/x"},
+        ])
+        from core.sandbox import summary as summary_mod_local
+        monkeypatch.setattr(
+            summary_mod_local, "_run_postures",
+            {str(tmp_path.resolve()): {
+                "mount_ns_active": True,
+                "restrict_reads": False,
+                "mac_key_hidden": True,
+                "block_network": True,
+                "udp_block_engaged": False,
+            }},
+        )
+        result = triage_mod.triage_run(tmp_path)
+        types = {s["type"] for s in result["signals"]}
+        assert "udp_posture_gap" in types
+
+    def test_clean_when_udp_engaged(self, tmp_path, monkeypatch):
+        _write_summary(tmp_path, [
+            {"type": "write", "cmd": "test", "returncode": 1,
+             "path": "/tmp/x"},
+        ])
+        from core.sandbox import summary as summary_mod_local
+        monkeypatch.setattr(
+            summary_mod_local, "_run_postures",
+            {str(tmp_path.resolve()): {
+                "mount_ns_active": True,
+                "restrict_reads": False,
+                "mac_key_hidden": True,
+                "block_network": True,
+                "udp_block_engaged": True,
+            }},
+        )
+        result = triage_mod.triage_run(tmp_path)
+        types = {s["type"] for s in result["signals"]}
+        assert "udp_posture_gap" not in types
+
+    def test_no_signal_when_network_not_blocked(self, tmp_path, monkeypatch):
+        _write_summary(tmp_path, [
+            {"type": "write", "cmd": "test", "returncode": 1,
+             "path": "/tmp/x"},
+        ])
+        from core.sandbox import summary as summary_mod_local
+        monkeypatch.setattr(
+            summary_mod_local, "_run_postures",
+            {str(tmp_path.resolve()): {
+                "mount_ns_active": True,
+                "restrict_reads": False,
+                "mac_key_hidden": True,
+                "block_network": False,
+                "udp_block_engaged": False,
+            }},
+        )
+        result = triage_mod.triage_run(tmp_path)
+        types = {s["type"] for s in result["signals"]}
+        assert "udp_posture_gap" not in types
+
+
+class TestHostCaseNormalisation:
+    def test_retry_counts_mixed_case_as_one_host(self, tmp_path):
+        events = [
+            {"t": i, "host": h, "port": 443, "result": "denied_host"}
+            for i, h in enumerate([
+                "C2.Evil.COM", "c2.evil.com", "c2.EVIL.com",
+                "C2.EVIL.COM", "c2.Evil.Com", "C2.evil.com",
+                "c2.evil.COM", "C2.Evil.com", "c2.Evil.COM",
+                "C2.evil.COM", "c2.evil.com", "C2.Evil.COM",
+            ])
+        ]
+        _write_proxy_events(tmp_path, events)
+        result = triage_mod.triage_run(tmp_path)
+        types = {s["type"] for s in result["signals"]}
+        assert "host_retry_pattern" in types
+
+    def test_recon_deduplicates_mixed_case(self, tmp_path):
+        events = [
+            {"t": i, "host": h, "port": 443, "result": "denied_host"}
+            for i, h in enumerate([
+                "A.com", "a.com", "a.COM",
+                "B.com", "b.com", "b.COM",
+            ])
+        ]
+        _write_proxy_events(tmp_path, events)
+        result = triage_mod.triage_run(tmp_path)
+        assert not any(s["type"] == "host_recon_pattern"
+                       for s in result["signals"])
+
+
+class TestDomainFrontingAttempt:
+    def test_single_sni_mismatch_fires_suspicious(self, tmp_path):
+        _write_proxy_events(tmp_path, [
+            {"t": 1.0, "host": "cdn.allowed.com", "port": 443,
+             "result": "denied_sni",
+             "reason": "TLS SNI 'evil.com' != CONNECT host"},
+        ])
+        result = triage_mod.triage_run(tmp_path)
+        assert result["verdict"] == triage_mod.VERDICT_SUSPICIOUS
+        signal = next(s for s in result["signals"]
+                      if s["type"] == "domain_fronting_attempt")
+        assert signal["severity"] == "high"
+        assert signal["count"] == 1
+
+    def test_multiple_fronting_attempts_counted(self, tmp_path):
+        _write_proxy_events(tmp_path, [
+            {"t": 1.0, "host": "cdn.allowed.com", "port": 443,
+             "result": "denied_sni",
+             "reason": "TLS SNI 'evil.com' != CONNECT host"},
+            {"t": 2.0, "host": "cdn.allowed.com", "port": 443,
+             "result": "denied_sni",
+             "reason": "TLS SNI 'c2.bad.org' != CONNECT host"},
+        ])
+        result = triage_mod.triage_run(tmp_path)
+        signal = next(s for s in result["signals"]
+                      if s["type"] == "domain_fronting_attempt")
+        assert signal["count"] == 2
+
+    def test_no_signal_without_denied_sni(self, tmp_path):
+        _write_proxy_events(tmp_path, [
+            {"t": 1.0, "host": "allowed.com", "port": 443,
+             "result": "allowed"},
+        ])
+        result = triage_mod.triage_run(tmp_path)
+        types = {s["type"] for s in result["signals"]}
+        assert "domain_fronting_attempt" not in types
+
+
+class TestPortProbe:
+    def test_single_denied_port_fires_notable(self, tmp_path):
+        _write_proxy_events(tmp_path, [
+            {"t": 1.0, "host": "allowed.com", "port": 22,
+             "result": "denied_port",
+             "reason": "port 22 not in allowed set {443}"},
+        ])
+        result = triage_mod.triage_run(tmp_path)
+        assert result["verdict"] == triage_mod.VERDICT_NOTABLE
+        signal = next(s for s in result["signals"]
+                      if s["type"] == "port_probe")
+        assert signal["severity"] == "medium"
+        assert signal["count"] == 1
+
+    def test_multiple_ports_counted(self, tmp_path):
+        events = [
+            {"t": float(i), "host": "allowed.com", "port": p,
+             "result": "denied_port", "reason": f"port {p} denied"}
+            for i, p in enumerate([22, 80, 3306, 5432])
+        ]
+        _write_proxy_events(tmp_path, events)
+        result = triage_mod.triage_run(tmp_path)
+        signal = next(s for s in result["signals"]
+                      if s["type"] == "port_probe")
+        assert signal["count"] == 4

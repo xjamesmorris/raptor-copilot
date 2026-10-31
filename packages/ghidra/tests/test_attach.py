@@ -842,8 +842,12 @@ class TestCacheLayoutAndCollectorHardening:
         with patch("core.project.project.ProjectManager", FakeMgr):
             cands = redb_cache_candidates(gpr)
         assert cands[0] == attach_dir(proj, gpr) / "re-database.json"
+        # Legacy global candidate stays LAST — resolved against the
+        # configured out base, not the process CWD.
+        from core.config import RaptorConfig
         assert cands[-1] == (
-            Path("out/ghidra-import-fw") / "re-database.json")
+            RaptorConfig.get_out_dir() / "ghidra-import-fw"
+            / "re-database.json")
 
     def test_sequential_shape_records_export(self):
         """Sequential runs (vuln.to_dict() in the autonomous report)
@@ -1103,18 +1107,53 @@ class TestGhidraCliStatusAndWarnings:
             def __exit__(self, *exc):
                 pass
 
-            def import_project(self, out_dir, decompile=False):
+            def import_project(self, out_dir, decompile=False,
+                               timeout=None):
                 return _test_db()
 
         args = _ap.Namespace(gpr=gpr_project, enrich=False,
                              decompile_all=False, program=None,
-                             binary=None, wait=False)
+                             binary=None, wait=False, timeout=None)
         with patch("packages.ghidra.bridge.GhidraBridge", FakeBridge):
             rc = mod._cmd_attach(args)
         err = capsys.readouterr().err
         assert rc == 0
         assert "decompilation for 1 function(s)" in err
         assert "--decompile-all" in err
+
+    def test_enrich_import_forwards_decompile_all(
+        self, gpr_project, monkeypatch, tmp_path,
+    ):
+        """The enrich branch of _do_import routes through
+        import_and_enrich — dropping args.decompile_all there turns an
+        --enrich --decompile-all import into metadata-only."""
+        import argparse as _ap
+
+        mod = _load_ghidra_cli(monkeypatch)
+        seen: dict = {}
+
+        class FakeBridge:
+            def __init__(self, gpr, **kw):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                pass
+
+            def import_and_enrich(self, out_dir, *, binary_path=None,
+                                  decompile=False, timeout=None):
+                seen["decompile"] = decompile
+                return _test_db()
+
+        args = _ap.Namespace(gpr=gpr_project, enrich=True,
+                             decompile_all=True, program=None,
+                             binary=None, wait=False, timeout=None)
+        with patch("packages.ghidra.bridge.GhidraBridge", FakeBridge):
+            db = mod._do_import(gpr_project, args, tmp_path / "out")
+        assert seen["decompile"] is True
+        assert db is not None
 
     def test_oversize_cache_warns_at_attach(self, tmp_path,
                                             monkeypatch, capsys):
@@ -1269,7 +1308,7 @@ class TestGhidraCliScrubbedOutput:
         monkeypatch.setattr(attach_mod, "detach", fake_detach)
         args = _ap.Namespace(gpr=Path("/tmp/x.gpr"), enrich=False,
                              decompile_all=False, program=None,
-                             binary=None, wait=True)
+                             binary=None, wait=True, timeout=None)
         mod._cmd_attach(args)
         mod._cmd_detach(_ap.Namespace(gpr=None, wait=True))
         assert seen == {"attach_wait": True, "detach_wait": True}
@@ -1589,11 +1628,17 @@ class TestAddressIndex:
                  for i in range(10_000)]
         db = REDatabase(source_tool="ghidra", binary_path="/fw/b",
                         functions=funcs)
-        t0 = time.monotonic()
+        # CPU time, not wall clock: lookups are pure computation, so
+        # the quadratic regression burns CPU while an oversubscribed
+        # runner only adds scheduling delay — process_time keeps the
+        # signal without load-induced flakes. Bound trade-off: high
+        # enough for slow CI CPUs (~10x over the indexed path), low
+        # enough that the ~1.8s-CPU linear rescan still trips it.
+        t0 = time.process_time()
         for addr in range(0x1000, 0x1000 + 32 * 10_000, 32):
             db.function_containing_address(addr + 3)
-        elapsed = time.monotonic() - t0
-        assert elapsed < 1.0, f"indexed lookups took {elapsed:.2f}s"
+        elapsed = time.process_time() - t0
+        assert elapsed < 1.0, f"indexed lookups took {elapsed:.2f}s CPU"
 
     def test_zero_size_symbols_do_not_break_containment(self):
         """nm-fallback databases carry size-0 symbols (asm without
@@ -1646,3 +1691,183 @@ class TestRelativeOutputDirAbsolutized:
         assert cache.is_absolute()
         assert str(cache).startswith(
             os.path.abspath("out/projects/rel"))
+
+
+class TestRawBinaryImportOnramp:
+    """`import <raw-binary>` with a headless install present must
+    create a Ghidra project and take the normal .gpr path — pre-fix
+    it degraded straight to r2 with a message claiming Ghidra was
+    unavailable."""
+
+    def _args(self, binary, out, **over):
+        import argparse as _ap
+        base = dict(gpr=binary, out=out, enrich=False,
+                    decompile_all=False, program=None, binary=None,
+                    timeout=None)
+        base.update(over)
+        return _ap.Namespace(**base)
+
+    def _fake_create(self, seen):
+        def fake(binary, project_dir, *, timeout=3600):
+            seen["create"] = (Path(binary), Path(project_dir), timeout)
+            project_dir.mkdir(parents=True, exist_ok=True)
+            gpr = project_dir / "raptor.gpr"
+            gpr.write_text("")
+            return gpr
+        return fake
+
+    def test_create_then_normal_import_path(
+            self, tmp_path, monkeypatch, capsys):
+        import packages.ghidra.detect as detect
+        import packages.ghidra.headless as headless_mod
+        mod = _load_ghidra_cli(monkeypatch)
+        binary = tmp_path / "firmware.bin"
+        binary.write_bytes(b"\x7fELF")
+        out_dir = tmp_path / "out"
+        seen: dict = {}
+        monkeypatch.setattr(detect, "ghidra_available", lambda: True)
+        monkeypatch.setattr(headless_mod, "create_project_from_binary",
+                            self._fake_create(seen))
+
+        def fake_do_import(gpr, args, od):
+            seen["import"] = Path(gpr)
+            return _test_db()
+
+        monkeypatch.setattr(mod, "_do_import", fake_do_import)
+        rc = mod._cmd_import(self._args(binary, out_dir))
+        err = capsys.readouterr().err
+        assert rc == 0
+        created_binary, project_dir, timeout = seen["create"]
+        assert created_binary == binary
+        assert project_dir == out_dir / "ghidra-project" / "firmware"
+        # Create + auto-analysis is decompile-scale work: an unset
+        # --timeout must not inherit the 300s metadata cap.
+        assert timeout == 3600
+        # The created project continues through the NORMAL import.
+        assert seen["import"] == project_dir / "raptor.gpr"
+        assert "created:" in err
+
+    def test_enrich_gets_the_binary_for_r2(
+            self, tmp_path, monkeypatch):
+        import packages.ghidra.detect as detect
+        import packages.ghidra.headless as headless_mod
+        mod = _load_ghidra_cli(monkeypatch)
+        binary = tmp_path / "firmware.bin"
+        binary.write_bytes(b"\x7fELF")
+        seen: dict = {}
+        monkeypatch.setattr(detect, "ghidra_available", lambda: True)
+        monkeypatch.setattr(headless_mod, "create_project_from_binary",
+                            self._fake_create(seen))
+
+        def fake_do_import(gpr, args, od):
+            seen["r2_binary"] = args.binary
+            return _test_db()
+
+        monkeypatch.setattr(mod, "_do_import", fake_do_import)
+        rc = mod._cmd_import(
+            self._args(binary, tmp_path / "out", enrich=True))
+        assert rc == 0
+        assert seen["r2_binary"] == binary
+
+    def test_absent_ghidra_prints_real_reason(
+            self, tmp_path, monkeypatch, capsys):
+        import packages.ghidra.detect as detect
+        mod = _load_ghidra_cli(monkeypatch)
+        binary = tmp_path / "firmware.bin"
+        binary.write_bytes(b"\x7fELF")
+        seen: dict = {}
+        monkeypatch.setattr(detect, "ghidra_available", lambda: False)
+
+        def fake_fallback(b, od):
+            seen["fallback"] = Path(b)
+            return 0
+
+        monkeypatch.setattr(mod, "_import_binary_fallback",
+                            fake_fallback)
+        rc = mod._cmd_import(self._args(binary, tmp_path / "out"))
+        err = capsys.readouterr().err
+        assert rc == 0
+        assert seen["fallback"] == binary
+        assert "no Ghidra install found" in err
+
+    def test_occupied_destination_is_terminal_not_degrading(
+            self, tmp_path, monkeypatch, capsys):
+        """Re-running `import <binary>` with the deterministic out dir
+        already populated must be a hard error: falling through to the
+        r2/objdump fallback would OVERWRITE the first run's
+        full-fidelity re-database.json with a degraded one, and silent
+        reuse would trust a possibly stale project."""
+        from types import SimpleNamespace
+
+        import packages.ghidra.detect as detect
+        import packages.ghidra.headless as headless_mod
+        mod = _load_ghidra_cli(monkeypatch)
+        binary = tmp_path / "firmware.bin"
+        binary.write_bytes(b"\x7fELF")
+        out_dir = tmp_path / "out"
+        monkeypatch.setattr(detect, "ghidra_available", lambda: True)
+        monkeypatch.setattr(
+            headless_mod, "_find_headless",
+            lambda: "/opt/ghidra/support/analyzeHeadless")
+
+        def fake_run(cmd, **kwargs):
+            project_dir = Path(cmd[1])
+            (project_dir / "raptor.gpr").write_text("")
+            (project_dir / "raptor.rep").mkdir()
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr("core.sandbox.run", fake_run)
+
+        def fake_do_import(gpr, args, od):
+            Path(od).mkdir(parents=True, exist_ok=True)
+            (Path(od) / "re-database.json").write_text("full-fidelity")
+            return _test_db()
+
+        monkeypatch.setattr(mod, "_do_import", fake_do_import)
+
+        def fail_fallback(b, od):  # pragma: no cover - must not run
+            raise AssertionError("degrading fallback must not run")
+
+        monkeypatch.setattr(mod, "_import_binary_fallback",
+                            fail_fallback)
+
+        # Run 1: creates the project and imports normally.
+        assert mod._cmd_import(self._args(binary, out_dir)) == 0
+        capsys.readouterr()
+
+        # Run 2: occupied destination — terminal, artifact untouched.
+        rc = mod._cmd_import(self._args(binary, out_dir))
+        err = capsys.readouterr().err
+        assert rc == 1
+        assert "already exists" in err
+        assert (out_dir / "re-database.json").read_text() == \
+            "full-fidelity"
+
+    def test_create_failure_prints_reason_and_falls_back(
+            self, tmp_path, monkeypatch, capsys):
+        import packages.ghidra.detect as detect
+        import packages.ghidra.headless as headless_mod
+        mod = _load_ghidra_cli(monkeypatch)
+        binary = tmp_path / "firmware.bin"
+        binary.write_bytes(b"\x7fELF")
+        seen: dict = {}
+        monkeypatch.setattr(detect, "ghidra_available", lambda: True)
+
+        def boom(*a, **kw):
+            raise headless_mod.GhidraError("jvm exploded")
+
+        monkeypatch.setattr(headless_mod, "create_project_from_binary",
+                            boom)
+
+        def fake_fallback(b, od):
+            seen["fallback"] = Path(b)
+            return 0
+
+        monkeypatch.setattr(mod, "_import_binary_fallback",
+                            fake_fallback)
+        rc = mod._cmd_import(self._args(binary, tmp_path / "out"))
+        err = capsys.readouterr().err
+        assert rc == 0
+        assert seen["fallback"] == binary
+        assert "ghidra project create failed" in err
+        assert "jvm exploded" in err

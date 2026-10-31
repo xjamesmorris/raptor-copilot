@@ -4,7 +4,8 @@ The reading-list study loop verifies external-contract assumptions a
 review relied on ("Does ``json.loads`` reject NaN?") against the actual
 source.  The C/C++ path lives in ``libexec/raptor-study-prep``; this
 module is the equivalent resolution machinery for the other first-class
-languages: Python, Go, Java, JavaScript/TypeScript, and Rust.
+languages: Python, Go, Java, JavaScript/TypeScript, Rust, PHP, Kotlin,
+C#, and Swift.
 
 Two resolution modes, mirroring the C/C++ study-prep shapes:
 
@@ -42,8 +43,31 @@ from core.inventory.extractors import (
 from core.inventory.languages import LANGUAGE_MAP
 
 from .model import StudyItem
+from core.source.lines import split_lines
 
 logger = logging.getLogger(__name__)
+
+# rglob scan budget for header-stem sibling directories (entries
+# VISITED, not matched) — bounds directory materialisation on scanned
+# targets. Wide enough for real include trees; a subtree wider than
+# this is scanned partially rather than slurped.
+_STEM_DIR_SCAN_BOUND = 10_000
+
+
+def _read_capped(path: Path, max_chars: int | None = None) -> str | None:
+    """Capped text read of scanned-target content (degrades to None).
+
+    Routes through ``core.source.read_text_capped`` so every read this
+    module performs over the (untrusted) target tree pays a byte
+    budget; truncation degrades to the capped prefix.
+    """
+    from core.source import read_text_capped
+
+    if max_chars is None:
+        got = read_text_capped(path)
+    else:
+        got = read_text_capped(path, max_chars)
+    return None if got is None else got[0]
 
 
 # ------------------------------------------------------------------
@@ -55,6 +79,7 @@ logger = logging.getLogger(__name__)
 #: tree-sitter grammar branch plus an AST/regex fallback.
 STUDY_LANGUAGES: frozenset[str] = frozenset({
     "python", "go", "java", "javascript", "typescript", "tsx", "rust",
+    "php", "kotlin", "csharp", "swift",
 })
 
 #: File suffixes covered by :data:`STUDY_LANGUAGES`.
@@ -68,20 +93,28 @@ _C_SUFFIXES = frozenset(
 )
 
 
-def language_for_path(path: str | Path) -> str | None:
+def language_for_path(path: str | Path | None) -> str | None:
     """Study-resolvable language for *path*, or None.
 
     C/C++ returns None here — that path is handled by the dedicated
-    study-prep machinery, not this module.
+    study-prep machinery, not this module. None and other
+    non-path-like values answer None: callers feed this straight
+    from LLM-authored artifacts where a path field can arrive null.
     """
+    if not isinstance(path, (str, Path)):
+        return None
     suffix = Path(path).suffix.lower()
     lang = LANGUAGE_MAP.get(suffix)
     return lang if lang in STUDY_LANGUAGES else None
 
 
-def is_study_supported_path(path: str | Path) -> bool:
+def is_study_supported_path(path: str | Path | None) -> bool:
     """True when the study loop has ANY resolver for *path* (C/C++ or
-    one of :data:`STUDY_LANGUAGES`)."""
+    one of :data:`STUDY_LANGUAGES`). None and other non-path-like
+    values are unsupported, same contract as
+    :func:`language_for_path`."""
+    if not isinstance(path, (str, Path)):
+        return False
     suffix = Path(path).suffix.lower()
     return suffix in _C_SUFFIXES or suffix in STUDY_SUFFIXES
 
@@ -115,6 +148,11 @@ _DOTTED_RE = re.compile(
 _BARE_RE = re.compile(
     r"\b([A-Za-z_]\w*_\w+|[A-Z][a-z]+[A-Z]\w*|[a-z]+[A-Z]\w*)\b",
 )
+# PHP instance access: the receiver of ``$obj->method`` is a runtime
+# value, so only the member name is statically resolvable — extract
+# the tail alone (static ``Class::method`` keeps its qualifier via
+# the dotted pattern above).
+_PHP_ARROW_RE = re.compile(r"\$[A-Za-z_]\w*\s*->\s*([A-Za-z_]\w*)")
 
 _QUESTION_STOPWORDS = frozenset({
     # question scaffolding that survives the shape filters
@@ -150,6 +188,8 @@ def extract_question_identifiers(
             _add(m.group(1))
         for m in _DOTTED_RE.finditer(text):
             _add(m.group(1))
+        for m in _PHP_ARROW_RE.finditer(text):
+            _add(m.group(1))
         for m in _BARE_RE.finditer(text):
             _add(m.group(1))
     return out
@@ -157,8 +197,9 @@ def extract_question_identifiers(
 
 def identifier_tail(name: str) -> str:
     """Last path segment of a qualified identifier
-    (``json.loads`` → ``loads``, ``Vec::new`` → ``new``)."""
-    return re.split(r"\.|::", name)[-1]
+    (``json.loads`` → ``loads``, ``Vec::new`` → ``new``,
+    ``$obj->method`` → ``method``)."""
+    return re.split(r"\.|::|->", name)[-1]
 
 
 # ------------------------------------------------------------------
@@ -263,6 +304,15 @@ def include_scope_files(
         root_res = root.resolve()
     except OSError:
         return []
+    # The chase START file must satisfy the same containment the
+    # candidates do — source_file is a reading-list item field
+    # (LLM/audit-derived), and an absolute or ``..``-carrying value
+    # otherwise escapes the pinned tree before the first candidate is
+    # ever checked (the escaped file's text would be read and scanned
+    # for #include lines).
+    from core.paths import confine
+    if confine(root, source_file) is None:
+        return []
     if not start.is_file():
         return []
 
@@ -287,18 +337,31 @@ def include_scope_files(
         sib = header.parent / header.stem
         if not sib.is_dir() or sib.is_symlink():
             return
+        # Iterate lazily with a scan bound, then sort the matches:
+        # sorted(rglob("*")) materialised the WHOLE subtree before the
+        # cap ran, so a huge scanned-target directory ballooned memory
+        # for a handful of wanted files. The bound trades exhaustive
+        # coverage of pathologically wide subtrees for a fixed scan
+        # budget; matches within the budget stay deterministic via the
+        # post-scan sort.
+        matches: list[Path] = []
+        scanned = 0
         try:
-            entries = sorted(sib.rglob("*"))
+            for e in sib.rglob("*"):
+                scanned += 1
+                if scanned > _STEM_DIR_SCAN_BOUND:
+                    break
+                try:
+                    if e.is_file() and e.suffix.lower() in _C_SUFFIXES:
+                        matches.append(e)
+                except OSError:
+                    continue
         except OSError:
             return
-        for e in entries:
+        for e in sorted(matches):
             if len(out) >= max_files:
                 return
-            try:
-                if e.is_file() and e.suffix.lower() in _C_SUFFIXES:
-                    _add(e)
-            except OSError:
-                continue
+            _add(e)
 
     frontier = [start]
     for _depth in range(max_depth):
@@ -306,10 +369,12 @@ def include_scope_files(
             break
         next_frontier: list[Path] = []
         for f in frontier:
-            try:
-                text = f.read_text(encoding="utf-8", errors="replace")
-            except OSError:
+            # Capped: include lines live near the top; a pathological
+            # header must not be slurped whole to find them.
+            got = _read_capped(f)
+            if got is None:
                 continue
+            text = got
             for ref in _INCLUDE_RE.findall(text):
                 if len(out) >= max_files:
                     break
@@ -342,6 +407,10 @@ _LINE_COMMENT = {
     "tsx": ("//",),
     "rust": ("///", "//!", "//"),
     "python": ("#",),
+    "php": ("//", "#"),
+    "kotlin": ("//",),
+    "csharp": ("///", "//"),
+    "swift": ("///", "//"),
 }
 
 # Lines that sit between a doc comment and the definition and should be
@@ -409,27 +478,97 @@ def _const_pattern(language: str, name: str) -> re.Pattern | None:
     if language == "python":
         return re.compile(rf"^{esc}[ \t]*(?::[^=\n]+)?=[ \t]*\S", re.MULTILINE)
     if language == "go":
+        # The assignment branch's separator is subsumed by the value
+        # class ([^=\n] includes horizontal whitespace) — the naive
+        # ``[ \t]+[^=\n]*`` overlapped two spans, quadratic on a
+        # name followed by a whitespace run with no '='. Same
+        # language.
         return re.compile(
             rf"^[ \t]*(?:const|var)\s+(?:\([ \t]*)?{esc}\b|"
-            rf"^[ \t]*{esc}[ \t]+[^=\n]*=",
+            rf"^[ \t]*{esc}[ \t][^=\n]*=",
             re.MULTILINE,
         )
     if language == "rust":
+        # The visibility spec's class excludes newlines: an
+        # unterminated ``pub(`` otherwise re-scans to EOF from every
+        # line's anchor (quadratic on ``pub(`` floods). Trade-off: a
+        # visibility spec split across lines won't match — acceptable
+        # for this regex fallback tier.
         return re.compile(
-            rf"^[ \t]*(?:pub(?:\([^)]*\))?\s+)?(?:const|static)\s+{esc}\b",
+            rf"^[ \t]*(?:pub(?:\([^)\n]*\))?\s+)?(?:const|static)\s+{esc}\b",
             re.MULTILINE,
         )
     if language == "java":
+        # ``final``/``static`` field declarations. Horizontal-only
+        # ``[ \t]+`` after each modifier: interior ``\s+`` under the
+        # MULTILINE ^-anchors let the modifier loop swallow
+        # newline-separated keyword floods from every line's anchor
+        # (quadratic on keyword floods). Each branch's required
+        # keyword stays out of its own modifier loop, and the
+        # type/name separator is a single ``[ \t]`` after a type
+        # class that itself absorbs blanks — a variable-length
+        # separator overlapping the type class was quadratic on
+        # space floods. Trade-off: a declaration split across lines
+        # won't match — acceptable for this regex fallback tier.
         return re.compile(
-            rf"^[ \t]*(?:(?:public|private|protected|static|final)\s+)*"
-            rf"final\s+\w[\w<>\[\], ]*\s+{esc}\s*=|"
-            rf"^[ \t]*(?:(?:public|private|protected|final)\s+)*"
-            rf"static\s+\w[\w<>\[\], ]*\s+{esc}\s*=",
+            rf"^[ \t]*(?:(?:public|private|protected|static)[ \t]+)*"
+            rf"final[ \t]+\w[\w<>\[\], \t]*[ \t]{esc}\s*=|"
+            rf"^[ \t]*(?:(?:public|private|protected|final)[ \t]+)*"
+            rf"static[ \t]+\w[\w<>\[\], \t]*[ \t]{esc}\s*=",
             re.MULTILINE,
         )
     if language in ("javascript", "typescript", "tsx"):
         return re.compile(
             rf"^[ \t]*(?:export\s+)?(?:const|let|var)\s+{esc}\b",
+            re.MULTILINE,
+        )
+    if language == "php":
+        # ``const`` (module or class scope, optionally typed) and the
+        # runtime ``define('NAME', ...)`` form. Horizontal-only
+        # ``[ \t]+`` between the keywords: interior ``\s+`` under a
+        # MULTILINE ^-anchor is quadratic on keyword/blank floods.
+        # Trade-off: a declaration split across lines won't match —
+        # acceptable for this regex fallback tier.
+        return re.compile(
+            rf"^[ \t]*(?:(?:public|private|protected|final)[ \t]+)*"
+            rf"const[ \t]+(?:\w+[ \t]+)?{esc}\s*=|"
+            rf"\bdefine\s*\(\s*['\"]{esc}['\"]",
+            re.MULTILINE,
+        )
+    if language == "kotlin":
+        # ``const val`` compile-time constants and top-level/object
+        # ``val`` bindings. Horizontal-only ``[ \t]+`` between the
+        # keywords — same flood-safety/split-across-lines trade-off
+        # as the php arm above.
+        return re.compile(
+            rf"^[ \t]*(?:(?:public|private|protected|internal)[ \t]+)?"
+            rf"(?:const[ \t]+)?val[ \t]+{esc}\b",
+            re.MULTILINE,
+        )
+    if language == "csharp":
+        # ``const`` fields and ``static readonly`` fields — the two
+        # C# constant spellings. Like the Java arm, each branch's
+        # required keyword stays out of its own modifier loop, the
+        # type/name separator is a single ``[ \t]`` after a type
+        # class that itself absorbs blanks, and inter-keyword
+        # whitespace is horizontal-only (interior ``\s+`` under a
+        # MULTILINE ^-anchor is quadratic on keyword floods).
+        # Trade-off: a declaration split across lines won't match —
+        # acceptable for this regex fallback tier.
+        return re.compile(
+            rf"^[ \t]*(?:(?:public|private|protected|internal)[ \t]+)*"
+            rf"const[ \t]+\w[\w<>\[\],. \t]*[ \t]{esc}\s*=|"
+            rf"^[ \t]*(?:(?:public|private|protected|internal|static)[ \t]+)*"
+            rf"readonly[ \t]+\w[\w<>\[\],. \t]*[ \t]{esc}\s*=",
+            re.MULTILINE,
+        )
+    if language == "swift":
+        # ``let`` constants (optionally typed, optionally scoped
+        # ``static``/``class``). Horizontal-only ``[ \t]+`` — same
+        # flood-safety/split-across-lines trade-off as the arms above.
+        return re.compile(
+            rf"^[ \t]*(?:(?:public|private|internal|fileprivate|open"
+            rf"|static|class|final)[ \t]+)*let[ \t]+{esc}\b",
             re.MULTILINE,
         )
     return None
@@ -447,21 +586,71 @@ def _type_pattern(language: str, name: str) -> re.Pattern | None:
             rf"^type\s+{esc}\s+(?:struct|interface)\b", re.MULTILINE,
         )
     if language == "rust":
+        # Newline-free visibility class — same flood-safety and
+        # split-across-lines trade-off as the const pattern above.
         return re.compile(
-            rf"^[ \t]*(?:pub(?:\([^)]*\))?\s+)?"
+            rf"^[ \t]*(?:pub(?:\([^)\n]*\))?\s+)?"
             rf"(?:struct|enum|trait|union|type)\s+{esc}\b",
             re.MULTILINE,
         )
     if language == "java":
+        # Horizontal-only ``[ \t]+`` after each modifier — same
+        # flood-safety and split-across-lines trade-off as the const
+        # pattern above.
         return re.compile(
-            rf"^[ \t]*(?:(?:public|private|protected|abstract|final|static)\s+)*"
-            rf"(?:class|interface|enum|record)\s+{esc}\b",
+            rf"^[ \t]*(?:(?:public|private|protected|abstract|final|static)[ \t]+)*"
+            rf"(?:class|interface|enum|record)[ \t]+{esc}\b",
             re.MULTILINE,
         )
     if language in ("javascript", "typescript", "tsx"):
+        # Bounded keyword gaps (\s{1,64}): unbounded ``\s+`` let
+        # every line anchor re-scan a shared whitespace run before
+        # failing at the name — quadratic over planted keyword lines.
+        # 64 whitespace chars per gap sits far above real code.
         return re.compile(
-            rf"^[ \t]*(?:export\s+)?(?:abstract\s+)?"
-            rf"(?:class|interface|enum|type)\s+{esc}\b",
+            rf"^[ \t]*(?:export\s{{1,64}})?(?:abstract\s{{1,64}})?"
+            rf"(?:class|interface|enum|type)\s{{1,64}}{esc}\b",
+            re.MULTILINE,
+        )
+    if language == "php":
+        # Horizontal-only ``[ \t]+`` between keywords — same
+        # flood-safety/split-across-lines trade-off as the const
+        # pattern above.
+        return re.compile(
+            rf"^[ \t]*(?:(?:abstract|final|readonly)[ \t]+)*"
+            rf"(?:class|interface|trait|enum)[ \t]+{esc}\b",
+            re.MULTILINE,
+        )
+    if language == "kotlin":
+        # ``enum class`` / ``data class`` etc. fall out of the
+        # modifier loop naturally (``enum``/``data`` are modifiers
+        # here). Horizontal-only ``[ \t]+`` — same flood-safety/
+        # split-across-lines trade-off as the const pattern above.
+        return re.compile(
+            rf"^[ \t]*(?:(?:public|private|internal|abstract|final|open"
+            rf"|sealed|data|enum|annotation|inner)[ \t]+)*"
+            rf"(?:class|interface|object)[ \t]+{esc}\b",
+            re.MULTILINE,
+        )
+    if language == "csharp":
+        # Horizontal-only ``[ \t]+`` between keywords — same
+        # flood-safety/split-across-lines trade-off as the const
+        # pattern above.
+        return re.compile(
+            rf"^[ \t]*(?:(?:public|private|protected|internal|abstract"
+            rf"|sealed|static|partial|readonly)[ \t]+)*"
+            rf"(?:class|interface|struct|enum|record)[ \t]+{esc}\b",
+            re.MULTILINE,
+        )
+    if language == "swift":
+        # Horizontal-only ``[ \t]+`` between keywords — same
+        # flood-safety/split-across-lines trade-off as the const
+        # pattern above.
+        return re.compile(
+            rf"^[ \t]*(?:(?:public|private|internal|fileprivate|open"
+            rf"|final|indirect)[ \t]+)*"
+            rf"(?:class|struct|enum|protocol|actor|typealias)"
+            rf"[ \t]+{esc}\b",
             re.MULTILINE,
         )
     return None
@@ -505,12 +694,28 @@ def _dynamic_assignment_found(
 ) -> bool:
     tail = identifier_tail(name)
     pattern = re.compile(rf"[\w\)\]]\.{re.escape(tail)}\s*=[^=]")
+    # PHP's analog is a closure assigned to a property — dynamic
+    # method injection. The RHS keyword requirement is what keeps
+    # ordinary property initialisation (``$this->total = 0``) from
+    # mislabelling an unresolved identifier as monkey-patching.
+    php_pattern = re.compile(
+        rf"->\s*{re.escape(tail)}\s*=\s*(?:static[ \t]+)?(?:function|fn)\b",
+    )
     for lang, content in contents.values():
         if tail not in content:
             continue
         if lang == "python" and re.search(
-            rf"\bsetattr\s*\([^,]+,\s*['\"]{re.escape(tail)}['\"]", content,
+            # Bounded first-argument span: unbounded, every "setattr("
+            # planted in hostile source re-scans the rest of it —
+            # quadratic. Real receiver expressions sit far below the
+            # bound.
+            rf"\bsetattr\s*\([^,]{{1,500}},\s*['\"]{re.escape(tail)}['\"]",
+            content,
         ):
+            return True
+        # Scoped to PHP contents so C's ``ps->field = v`` never trips
+        # the reason.
+        if lang == "php" and php_pattern.search(content):
             return True
         if pattern.search(content):
             return True
@@ -640,16 +845,22 @@ def resolve_identifiers(
         return lang
 
     # Read + language-tag every candidate file once; grep-scope to
-    # files that mention at least one identifier tail.
+    # files that mention at least one identifier tail. Reads are
+    # per-file capped (core.source.read_text_capped): this loop runs
+    # over SCANNED-target content on the default study path and
+    # retains matching texts — one planted multi-hundred-MB file must
+    # not balloon resident memory.
+    from core.source import read_text_capped
+
     contents: dict[Path, tuple[str, str]] = {}
     for f in files:
         lang = _lang_for(f)
         if lang is None:
             continue
-        try:
-            text = f.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        got = read_text_capped(f)
+        if got is None:
             continue
+        text = got[0]
         if any(tail in text for tail in tails_ordered):
             contents[f] = (lang, text)
 
@@ -665,7 +876,7 @@ def resolve_identifiers(
         wanted_tails = [t for t in tails_ordered if t in content]
         if not wanted_tails:
             continue
-        lines = content.splitlines()
+        lines = split_lines(content)
         py_docs = _python_docstrings(content) if lang == "python" else {}
 
         try:
@@ -766,7 +977,7 @@ def resolve_identifiers(
                 if not m:
                     continue
                 lang_seen.setdefault(orig, lang)
-                lines = content.splitlines()
+                lines = split_lines(content)
                 line_no = content.count("\n", 0, m.start()) + 1
                 # ^[ \t]* anchors keep the match on one line, but a
                 # match can still start at the newline of line N-1
@@ -810,7 +1021,7 @@ def resolve_identifiers(
                 ci for ci in file_items.get(_path, [])
                 if ci.kind == KIND_FUNCTION
             ]
-            lines = content.splitlines()
+            lines = split_lines(content)
             for ci in fn_items:
                 start = max(1, ci.line_start or 1)
                 end = ci.line_end or start
@@ -829,7 +1040,12 @@ def resolve_identifiers(
     for bucket in matched.values():
         result.items.extend(bucket)
 
-    # Unresolved: honest reasons, never guesses
+    # Unresolved: honest reasons, never guesses. What lands here is
+    # extractor-shape-dependent, not language-binary: e.g. a C# method
+    # without its grammar resolves in K&R brace style (GenericExtractor
+    # recognises `type name(...) {` on one line) but not in Allman
+    # style (brace on the next line), where it arrives here with the
+    # referenced-but-undefined reason below.
     for orig, tail in candidates:
         if orig in matched:
             continue
@@ -878,11 +1094,32 @@ def merge_into_study_list(
     items actually added.  Creates a minimal skeleton when the file
     does not exist yet.
     """
+    from core.atomic_fs.fs_lock import artifact_lock
+
+    path = Path(study_list_path)
+    # Cross-process lock over the whole load → merge → save window:
+    # the shared-out_dir pattern (study loop beside /audit's consumer)
+    # makes this the same lost-update shape as canonical promotion —
+    # two unserialised writers silently drop each other's items.
+    with artifact_lock(path, subject="study list"):
+        return _merge_into_study_list_locked(
+            path, items, related_docs=related_docs,
+            unresolved=unresolved,
+        )
+
+
+def _merge_into_study_list_locked(
+    path: Path,
+    items: list[StudyItem],
+    *,
+    related_docs: list[dict] | None,
+    unresolved: list[dict] | None,
+) -> int:
+    """Body of :func:`merge_into_study_list`; caller holds the lock."""
     from dataclasses import asdict
 
     from core.json import load_json, save_json
 
-    path = Path(study_list_path)
     data: dict = {"target": "", "source_root": "", "items": []}
     if path.is_file():
         loaded = load_json(path, max_bytes=64 * 1024 * 1024)
@@ -985,10 +1222,10 @@ def resolve_concept_docs(
     for doc in candidates:
         if len(results) >= max_docs:
             break
-        try:
-            snippet = doc.read_text(encoding="utf-8", errors="ignore")[:8192]
-        except OSError:
+        got = _read_capped(doc, 8192)
+        if got is None:
             continue
+        snippet = got
         snippet_lower = snippet.lower()
         hits = [k for k in keywords if k in snippet_lower]
         if len(hits) >= 2 or (hits and doc.name.lower().startswith("readme")):

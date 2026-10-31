@@ -25,7 +25,7 @@ __all__ = ["get_client"]
 
 
 def get_client(
-    config: LLMConfig = None,
+    config: LLMConfig | None = None,
     *,
     prefer: str | list[str] | None = None,
 ) -> LLMClient | None:
@@ -46,18 +46,38 @@ def get_client(
         get_client(prefer="anthropic")            # cve-diff
         get_client(prefer=["openai", "gemini"])   # ordered fallthrough
     """
+    # Transcript record/replay (core.llm.transcript): when a session
+    # is active, construction diverts to build_llm_client. Replay
+    # serves recorded responses and needs no provider — "no primary
+    # model" is then not a reason to return None (hermetic CI eval
+    # runs have no credentials); build_llm_client substitutes an
+    # inert placeholder primary. Resolved OUTSIDE the soft-fail net:
+    # a garbled RAPTOR_LLM_TRANSCRIPT raises TranscriptError, and
+    # swallowing it into a None return would silently drop replay
+    # mode — the one failure the transcript seam must never allow.
+    from core.llm.transcript import active_transcript, build_llm_client
+    session = active_transcript()
+    replay = session is not None and session.mode == "replay"
     try:
         if config is None:
             from core.llm.config import _get_default_primary_model
-            primary = _get_default_primary_model(prefer=prefer)
-            if primary is None:
+            primary = _get_default_primary_model(
+                prefer=([prefer] if isinstance(prefer, str) else prefer),
+            )
+            if primary is None and not replay:
                 return None
             cfg = LLMConfig(primary_model=primary)
         else:
             cfg = config
-        if not cfg.primary_model:
+        if not cfg.primary_model and not replay:
             return None
+        if session is not None:
+            return build_llm_client(cfg)
         return LLMClient(cfg)
-    except Exception as e:  # noqa: BLE001 — soft-fail factory by contract
+    except Exception as e:  # noqa: BLE001
+        from core.llm.accounting import LLMPolicyError
+        from core.security.session_services import ServiceAuthorizationError
+        if isinstance(e, (LLMPolicyError, ServiceAuthorizationError)):
+            raise
         logger.warning("LLM client not available: %s", e)
         return None

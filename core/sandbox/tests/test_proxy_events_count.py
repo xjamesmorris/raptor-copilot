@@ -330,18 +330,34 @@ class TestAnchoredOverflow:
         stream-verify every event instead of refusing the file and
         misreading the refusal as truncation.
 
-        slow: writing + stream-verifying >64 MiB of real events takes
-        tens of seconds by construction (the whole point is that no
-        cap is mocked down) — nightly tier, per the default-tier
-        slow-test guard's doctrine."""
+        slow: writing + stream-verifying >64 MiB of real events costs
+        seconds by construction (the whole point is that no cap is
+        mocked down) — slow tier, per the default-tier slow-test
+        guard's doctrine.
+
+        The thresholds are BYTE bounds, so the synthesis crosses them
+        with fat events rather than many: ~16 KiB hosts keep every
+        line inside the triage per-line cap (64 KiB) while needing
+        ~100x fewer per-event writer mints and verifier parses than
+        the short-host shape, which burned ~40s of pure per-event
+        overhead in CI for the same byte crossing."""
         run = _run_dir(tmp_path)
-        n_batches, per_batch = 4, 100_000
+        n_batches, per_batch = 4, 1_400
+        pad = "pad" * 5_330  # ~16 KiB of host, line well under 64 KiB
         batch_hosts = [
-            f"host-{i:06d}.padpadpadpadpadpadpadpadpadpadpadpadpad"
-            f"padpadpadpadpadpadpadpadpadpadpadpad.example"
-            for i in range(per_batch)
+            f"{pad}.host-{i:06d}.example" for i in range(per_batch)
         ]
         for b in range(n_batches):
+            if b == n_batches - 1:
+                # The final batch must find the file already past the
+                # writer's bounded-recount cap: that is the anchored
+                # recount OVERFLOW this test exists to grade clean
+                # (empty flag set), not merely an oversize final file.
+                pre_final = (run / PROXY_EVENTS_FILENAME).stat().st_size
+                assert pre_final > ctx._RECOUNT_MAX_BYTES, (
+                    f"synthesis must cross the writer recount bound "
+                    f"before the final batch (got {pre_final} bytes)"
+                )
             ctx._persist_proxy_events(
                 [{"host": h, "result": "allowed",
                   "resolved_ip": "10.0.0.1"} for h in batch_hosts],

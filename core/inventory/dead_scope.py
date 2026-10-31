@@ -48,9 +48,25 @@ from __future__ import annotations
 import ast
 import logging
 import re
+from bisect import bisect_right
 from collections import Counter
 
 logger = logging.getLogger(__name__)
+
+
+def _newline_offsets(source: str) -> list[int]:
+    """Offsets of every ``\\n`` in ``source``, computed once so
+    per-match line numbers are a bisect instead of an O(offset)
+    ``str.count`` — the count-per-match spelling made a crafted file
+    of thousands of tiny matches O(matches x file-size), hours of CPU
+    within the builder's 8 MiB per-file cap (and one stalled worker
+    evicts exactly that file from the inventory)."""
+    return [m.start() for m in re.finditer("\n", source)]
+
+
+def _line_at(offsets: list[int], pos: int) -> int:
+    """1-indexed line number of character ``pos``."""
+    return bisect_right(offsets, pos - 1) + 1
 
 # A dead scope is reported as an inclusive ``(start_line, end_line)``
 # 1-indexed range. A function whose ``line_start`` falls within any
@@ -72,7 +88,7 @@ def detect_dead_scopes(language: str, content: str) -> list[DeadRange]:
         if language == "python":
             return _detect_python(content)
         if language in ("javascript", "typescript", "tsx"):
-            return _detect_javascript(content)
+            return _detect_javascript(language, content)
         if language in ("c", "cpp"):
             return _detect_c(content)
         if language == "rust":
@@ -133,39 +149,53 @@ def _py_end_line(stmt: ast.stmt) -> int:
 # ---------------------------------------------------------------------------
 # JavaScript / TypeScript — brace-tracked ``if (false) {…}`` blocks.
 # Regex finds the guard header; manual brace matching finds the block
-# extent (no stdlib JS AST; tree-sitter would be heavier than needed).
-# Non-code text is blanked by the shared single-pass lexer
-# (:func:`core.inventory.js_lexer.blank_js_noncode`) — the previous
-# two-phase comments-then-strings regex strip diverged from a real JS
-# lexer (a ``//`` inside a string ate the dead-if's closing brace; a
-# regex literal containing a quote resynced string state), letting a
-# hostile repo range live code as lexical_dead, a hard-suppress
-# witness.
+# extent. Non-code text (comments, strings, templates, regex literals,
+# JSX text) is blanked by the tokenizer-grade shared substrate
+# (:func:`core.inventory.lexical_view.blank_noncode`) — hand-rolled
+# lexing repeatedly diverged from a real JS lexer on hostile shapes
+# (regex-vs-division guesses, comment openers consumed by fake regex
+# terminators), letting a hostile repo range live code as
+# lexical_dead, a hard-suppress witness. No grammar / parse errors →
+# bail on the whole file (no ranges — toward no suppression).
 # ---------------------------------------------------------------------------
 
 
 _JS_DEAD_IF = re.compile(r"\bif\s*\(\s*(?:false|0)\s*\)\s*\{")
 
 
-def _detect_javascript(content: str) -> list[DeadRange]:
-    from core.inventory.js_lexer import blank_js_noncode
+def _detect_javascript(language: str, content: str) -> list[DeadRange]:
+    from core.inventory.lexical_view import LexicalRefusal, blank_noncode
 
-    stripped = blank_js_noncode(content)
+    try:
+        stripped = blank_noncode(language, content)
+    except LexicalRefusal:
+        # Parse errors: recovered token boundaries are guesses; a
+        # partial view could range live code as dead (a hard-suppress
+        # witness). Bail on the whole file — toward no suppression.
+        return []
+    if stripped is None:
+        # Grammar unavailable — cannot vouch a code view; no witness.
+        return []
     ranges: list[DeadRange] = []
+    offsets = _newline_offsets(stripped)
     for m in _JS_DEAD_IF.finditer(stripped):
         brace_pos = m.end() - 1
         close = _match_brace(stripped, brace_pos)
         if close is None:
             continue
-        start_line = stripped.count("\n", 0, m.start()) + 1
-        end_line = stripped.count("\n", 0, close) + 1
-        ranges.append((start_line, end_line))
+        ranges.append((_line_at(offsets, m.start()),
+                       _line_at(offsets, close)))
     return ranges
 
 
 # ---------------------------------------------------------------------------
 # Rust — ``if false {…}`` blocks plus ``#[cfg(any())]`` attributes
 # (empty ``any()`` is the canonical always-false cfg) gating a fn.
+# Matched over the tokenizer-grade blanked view: comments (line, block
+# — nested included, doc), string literals (raw forms included) and
+# char literals are spaced out first, so ``if false {`` /
+# ``#[cfg(any())]`` in a comment or string can never range live code
+# dead. No grammar / parse errors → bail (no ranges).
 # ---------------------------------------------------------------------------
 
 
@@ -191,19 +221,30 @@ _RUST_ITEM_AFTER_CFG = re.compile(
 
 
 def _detect_rust(content: str) -> list[DeadRange]:
+    from core.inventory.lexical_view import LexicalRefusal, blank_noncode
+
+    try:
+        stripped = blank_noncode("rust", content)
+    except LexicalRefusal:
+        # Parse errors: recovered token boundaries are guesses; bail
+        # on the whole file — toward no suppression.
+        return []
+    if stripped is None:
+        # Grammar unavailable — cannot vouch a code view; no witness.
+        return []
     ranges: list[DeadRange] = []
+    offsets = _newline_offsets(stripped)
     # ``if false { … }`` blocks.
-    for m in _RUST_DEAD_IF.finditer(content):
+    for m in _RUST_DEAD_IF.finditer(stripped):
         brace_pos = m.end() - 1
-        close = _match_brace(content, brace_pos)
+        close = _match_brace(stripped, brace_pos)
         if close is None:
             continue
-        start_line = content.count("\n", 0, m.start()) + 1
-        end_line = content.count("\n", 0, close) + 1
-        ranges.append((start_line, end_line))
+        ranges.append((_line_at(offsets, m.start()),
+                       _line_at(offsets, close)))
     # ``#[cfg(any())]`` gating the immediately-following fn / mod.
-    for m in _RUST_DEAD_CFG.finditer(content):
-        after = content[m.end():]
+    for m in _RUST_DEAD_CFG.finditer(stripped):
+        after = stripped[m.end():]
         if not _RUST_ITEM_AFTER_CFG.match(after):
             # cfg gates a non-fn/mod item — do not range (avoids the
             # false positive of grabbing an unrelated later fn).
@@ -219,15 +260,14 @@ def _detect_rust(content: str) -> list[DeadRange]:
             continue
         if semi_rel != -1 and semi_rel < brace_rel:
             continue
-        close = _match_brace(content, m.end() + brace_rel)
+        close = _match_brace(stripped, m.end() + brace_rel)
         if close is None:
             continue
         # Range spans from the attribute to the item's closing brace,
         # so the fn/mod ``line_start`` is captured (and, for mod, every
         # nested fn inside the dead module).
-        start_line = content.count("\n", 0, m.start()) + 1
-        end_line = content.count("\n", 0, close) + 1
-        ranges.append((start_line, end_line))
+        ranges.append((_line_at(offsets, m.start()),
+                       _line_at(offsets, close)))
     return ranges
 
 
@@ -328,6 +368,7 @@ _C_MAX_PARAM_SCAN = 16 * 1024
 def _detect_c(content: str) -> list[DeadRange]:
     stripped = _c_strip_comments_and_strings(content)
     ranges: list[DeadRange] = []
+    offsets: list[int] | None = None
     budget = _C_SCAN_BUDGET_FACTOR * len(stripped)
     # Whole-word occurrence count for every identifier, computed once —
     # a per-candidate re.findall over the full file is the other half of
@@ -397,9 +438,15 @@ def _detect_c(content: str) -> list[DeadRange]:
         if counts is None:
             counts = Counter(re.findall(r"\w+", stripped))
         if counts[name] <= 1:
-            start_line = stripped.count("\n", 0, m.start()) + 1
-            end_line = stripped.count("\n", 0, close) + 1
-            ranges.append((start_line, end_line))
+            # Line numbers via the shared one-pass offsets — the
+            # per-range str.count spelling was the half of the
+            # O(candidates x file-size) class the _C_SCAN_BUDGET
+            # comment didn't cover (built lazily: most files never
+            # append a range).
+            if offsets is None:
+                offsets = _newline_offsets(stripped)
+            ranges.append((_line_at(offsets, m.start()),
+                           _line_at(offsets, close)))
 
     return ranges
 
@@ -422,7 +469,18 @@ def _match_brace(source: str, open_pos: int) -> int | None:
     while i < n:
         c = source[i]
         if c in "\"'`":
-            if c == "'" and i + 1 < n and source[i + 1].isalpha():
+            # Rust lifetime / loop-label tokens (``'a``, ``'static``,
+            # ``'_``, ``'label:``) never close with a quote — treating
+            # one as a string opener swallows everything to the next
+            # ``'`` byte and desyncs the depth count over live code.
+            # The token grammar is ``'`` + XID_Start-or-``_``; only a
+            # single-char form closing immediately (``'x'`` — a char
+            # literal, its interior blanked by the substrate but the
+            # quotes kept) is a literal. isalpha() is Unicode-aware,
+            # matching rustc's XID_Start acceptance of non-ASCII
+            # lifetimes.
+            if c == "'" and i + 1 < n and (
+                    source[i + 1].isalpha() or source[i + 1] == "_"):
                 if i + 2 >= n or source[i + 2] != "'":
                     i += 1
                     continue
@@ -479,146 +537,31 @@ def _skip_string(source: str, start: int) -> int | None:
 
 # ---------------------------------------------------------------------------
 # PHP — ``if (false) {…}`` / ``if (0)`` / ``if (null)`` blocks. Same brace
-# shape as JS, so the JS block-matching is reused; PHP adds ``#`` line
-# comments. Conservative: only literal always-false constants (NOT
-# ``if ($flag)`` — a runtime name). Mutually-recursive functions inside the
-# block otherwise read CALLED, masking that the whole block is dead.
+# shape as JS, so the JS block-matching is reused. Conservative: only
+# literal always-false constants (NOT ``if ($flag)`` — a runtime name).
+# Mutually-recursive functions inside the block otherwise read CALLED,
+# masking that the whole block is dead. Matched over the tokenizer-grade
+# blanked view: comments, strings, heredocs/nowdocs and the HTML text
+# outside the PHP tags are spaced out first, so string data can never
+# open a dead range over live code. No grammar / parse errors → bail.
 # ---------------------------------------------------------------------------
 
 
 _PHP_DEAD_IF = re.compile(r"\bif\s*\(\s*(?:false|0|null)\s*\)\s*\{")
 
 
-def _php_strip_comments_and_strings(content: str) -> str:
-    """Strip PHP comments (``/* */``, ``//``, ``#``) AND string literals
-    (``'…'`` / ``"…"`` / heredoc / nowdoc) in one pass, preserving
-    newlines so line numbers stay valid.
-
-    Single-pass matters twice over: a ``#`` or ``//`` inside a string
-    (``"color: #fff"``) must not truncate the line, and an
-    ``if (false) {`` inside a string literal must never reach the
-    matcher — string content is untrusted target-repo text, and a match
-    starting mid-string yields garbage dead ranges that hard-suppress
-    real findings in live code (the expensive failure mode, per the
-    module header).
-    """
-    out = list(content)
-    i = 0
-    n = len(out)
-    while i < n:
-        c = out[i]
-        if c == "/" and i + 1 < n and out[i + 1] == "/":
-            while i < n and out[i] != "\n":
-                out[i] = " "
-                i += 1
-            continue
-        if c == "#":
-            while i < n and out[i] != "\n":
-                out[i] = " "
-                i += 1
-            continue
-        if c == "/" and i + 1 < n and out[i + 1] == "*":
-            out[i] = " "
-            out[i + 1] = " "
-            i += 2
-            while i < n:
-                if out[i] == "*" and i + 1 < n and out[i + 1] == "/":
-                    out[i] = " "
-                    out[i + 1] = " "
-                    i += 2
-                    break
-                if out[i] != "\n":
-                    out[i] = " "
-                i += 1
-            continue
-        if c == "<" and content.startswith("<<<", i):
-            j = _php_blank_heredoc(out, content, i)
-            if j is not None:
-                i = j
-            else:
-                i += 3
-            continue
-        if c in "\"'":
-            quote = c
-            out[i] = " "
-            i += 1
-            while i < n:
-                if out[i] == "\\" and i + 1 < n:
-                    out[i] = " "
-                    if out[i + 1] != "\n":
-                        out[i + 1] = " "
-                    i += 2
-                    continue
-                if out[i] == quote:
-                    out[i] = " "
-                    i += 1
-                    break
-                if out[i] != "\n":
-                    out[i] = " "
-                i += 1
-            continue
-        i += 1
-    return "".join(out)
-
-
-def _php_blank_heredoc(
-    out: list[str], content: str, start: int,
-) -> int | None:
-    """Blank a heredoc/nowdoc starting at ``start`` (the ``<<<``).
-    Returns the index just past the closing identifier, or ``None``
-    when ``<<<`` isn't followed by a valid opener (caller skips it).
-    Positions >= ``start`` in ``out`` are still pristine, so
-    ``content`` can be used for lookahead. Unterminated heredocs blank
-    to EOF — the remainder is string data, not code."""
-    n = len(content)
-    j = start + 3
-    quote = None
-    if j < n and content[j] in "\"'":
-        quote = content[j]
-        j += 1
-    ident_start = j
-    while j < n and (content[j].isalnum() or content[j] == "_"):
-        j += 1
-    ident = content[ident_start:j]
-    if not ident or ident[0].isdigit():
-        return None
-    if quote is not None:
-        if j >= n or content[j] != quote:
-            return None
-        j += 1
-    eol = content.find("\n", j)
-    if eol == -1 or content[j:eol].strip():
-        return None
-    # Body runs until a line whose first token (PHP 7.3 allows indented
-    # closers) is the identifier followed by a non-identifier char.
-    k = eol
-    end = n
-    while k < n:
-        line_start = k + 1
-        line_end = content.find("\n", line_start)
-        if line_end == -1:
-            line_end = n
-        line = content[line_start:line_end]
-        candidate = line.lstrip(" \t")
-        if candidate.startswith(ident):
-            rest = candidate[len(ident):]
-            if not rest or not (rest[0].isalnum() or rest[0] == "_"):
-                indent = len(line) - len(candidate)
-                end = line_start + indent + len(ident)
-                break
-        k = line_end
-    for p in range(start, end):
-        if out[p] != "\n":
-            out[p] = " "
-    return end
-
-
 def _detect_php(content: str) -> list[DeadRange]:
-    # Strip comments AND string literals in a single pass (the JS
-    # detector's two-phase regex approach would let a comment marker
-    # inside a string eat the closing quote) so neither a keyword in a
-    # comment nor an ``if (false) {`` in a string misleads the matcher.
-    stripped = _php_strip_comments_and_strings(content)
+    from core.inventory.lexical_view import LexicalRefusal, blank_noncode
+
+    try:
+        stripped = blank_noncode("php", content)
+    except LexicalRefusal:
+        # Parse errors: recovered token boundaries are guesses; bail
+        # on the whole file — toward no suppression.
+        return []
+    if stripped is None:
+        # Grammar unavailable — cannot vouch a code view; no witness.
+        return []
     ranges: list[DeadRange] = []
     for m in _PHP_DEAD_IF.finditer(stripped):
         close = _match_brace(stripped, m.end() - 1)
@@ -638,6 +581,12 @@ def _detect_php(content: str) -> list[DeadRange]:
 # at that column; if the scan dedents past the opener first (malformed /
 # unconventional), we BAIL and report nothing — a false positive here would
 # hard-suppress live code, so ambiguity must under-detect.
+#
+# Scanned over the tokenizer-grade blanked view: comments, strings,
+# heredoc bodies and the ``__END__`` section are spaced out first, so
+# an ``if false`` line inside a heredoc (idiomatic Ruby: SQL, usage
+# banners) can never open a dead range over live code. No grammar /
+# parse errors → bail (no ranges).
 # ---------------------------------------------------------------------------
 
 
@@ -648,31 +597,58 @@ _RB_BRANCH_AT = re.compile(r"^(\s*)(?:else|elsif)\b")
 _RB_END_AT = re.compile(r"^(\s*)end\b")
 
 
-def _strip_ruby_comment(line: str) -> str:
-    """Strip ``#`` comments while respecting string literals."""
-    in_str: str | None = None
-    i = 0
-    while i < len(line):
-        c = line[i]
-        if c == "\\" and in_str:
-            i += 2
-            continue
-        if in_str:
-            if c == in_str:
-                in_str = None
-        elif c in ('"', "'"):
-            in_str = c
-        elif c == "#":
-            return line[:i]
-        i += 1
-    return line
-
-
 def _detect_ruby(content: str) -> list[DeadRange]:
-    lines = [_strip_ruby_comment(ln) for ln in content.split("\n")]
+    from core.inventory.lexical_view import LexicalRefusal, blank_noncode
+
+    try:
+        stripped = blank_noncode("ruby", content)
+    except LexicalRefusal:
+        # Parse errors: recovered token boundaries are guesses; bail
+        # on the whole file — toward no suppression.
+        return []
+    if stripped is None:
+        # Grammar unavailable — cannot vouch a code view; no witness.
+        return []
+    lines = stripped.split("\n")  # line-model: byte-decoded view; pattern tails (\s*/.*) tolerate \r and captures are leading indent
     ranges: list[DeadRange] = []
-    for i, line in enumerate(lines):
-        m = _RB_DEAD_IF.match(line)
+    # Single pass with a stack of pending dead-if openers. Per-opener
+    # forward rescans made a balanced nested ladder O(openers x file)
+    # — minutes of CPU inside the builder's per-file cap, and one
+    # stalled worker evicts exactly that file from the inventory. The
+    # close / bail decisions depend only on (line, opener indent), so
+    # evaluating each line against the stack innermost-first takes the
+    # same decisions the independent scans took.
+    stack: list[tuple[int, str]] = []   # (opener line idx, opener indent)
+    for j, lj in enumerate(lines):
+        if lj.strip():
+            cur = lj[:len(lj) - len(lj.lstrip())]
+            be = _RB_BRANCH_AT.match(lj)
+            en = _RB_END_AT.match(lj)
+            while stack:
+                i, ind = stack[-1]
+                if (be and be.group(1) == ind) or (en and en.group(1) == ind):
+                    # dead branch body is lines i+1..j-1 (0-indexed) →
+                    # (i+2 .. j) 1-indexed.
+                    stack.pop()
+                    if i + 2 <= j:
+                        ranges.append((i + 2, j))
+                    # The same line may close / bail enclosing openers
+                    # too (their checks see the same (line, indent)).
+                    continue
+                if len(cur) <= len(ind) and cur != ind:
+                    # Dedented past the opener — or at/inside the
+                    # opener's column with a DIFFERENT whitespace mix
+                    # (space vs tab: same length, different bytes
+                    # evades both the byte-equal closer match above
+                    # and a length-only dedent check, letting the scan
+                    # latch onto a later end and range live defs
+                    # dead). Either way the indentation anchor is
+                    # broken — bail this opener (sound, under-detect)
+                    # and let enclosing openers judge the line.
+                    stack.pop()
+                    continue
+                break
+        m = _RB_DEAD_IF.match(lj)
         if not m:
             continue
         # Self-contained one-liner (``if false then nil end``): the
@@ -683,24 +659,14 @@ def _detect_ruby(content: str) -> list[DeadRange]:
         # on one line — nothing below it is dead; skip (under-detect,
         # sound). Checked on the comment-stripped line; an ``end``
         # inside a string also skips — same cheap FN direction.
-        if re.search(r"\bend\b", line[m.end(1):]):
+        if re.search(r"\bend\b", lj[m.end(1):]):
             continue
-        ind = m.group(1)
-        for j in range(i + 1, len(lines)):
-            lj = lines[j]
-            if not lj.strip():
-                continue
-            cur = lj[:len(lj) - len(lj.lstrip())]
-            be = _RB_BRANCH_AT.match(lj)
-            en = _RB_END_AT.match(lj)
-            if (be and be.group(1) == ind) or (en and en.group(1) == ind):
-                # dead branch body is lines i+1..j-1 (0-indexed) →
-                # (i+2 .. j) 1-indexed.
-                if i + 2 <= j:
-                    ranges.append((i + 2, j))
-                break
-            if len(cur) < len(ind):
-                break  # dedented past the opener without a match — bail (sound)
+        stack.append((j, m.group(1)))
+    # Openers still pending at EOF never found a closer — no range
+    # (exactly the independent scans' run-to-EOF outcome). Emission
+    # order above is innermost-first; the independent scans emitted
+    # opener-order (ascending start line) — restore it.
+    ranges.sort()
     return ranges
 
 

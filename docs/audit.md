@@ -48,11 +48,13 @@ full flag table.
 | `--pre-scan` | Bounded Semgrep baseline when the run has no scan SARIF (feeds the SARIF-corroboration channels) |
 | `--out <dir>` | Output directory |
 | `--codeql-db <path>` | CodeQL database for query dispatch and pre-sweep (repeatable — one per language; dispatch routes by file language) |
-| `--max-cost <USD>` | Stop after spending this many dollars on LLM calls |
+| `--max-cost <USD>` | Stop after spending this many dollars on LLM calls. Also accepted by `resume` for a single segment (overrides the original cap; booked spend from prior segments still counts against it; `0` removes the cap) |
+| `--forecast` | Print the deepen-aware pre-spend cost forecast band and exit at $0 LLM spend — see [Cost forecasting](#cost-forecasting) |
 | `--deepen-reserve <fraction>` | Slice of `--max-cost` held back for the deepen phase so announced re-reviews can execute (default 0.15; 0 disables) |
 | `--max-time <seconds>` | Wall-clock time limit |
 | `--no-supervisor-bound` | Do not default a wall budget under a capped Claude subagent shell (see [Running long audits](#running-long-audits)) |
 | `--review-passes <N>` | Independent review passes per function for self-consistency (default: 1) |
+| `--max-workers <N>` | Concurrent review workers (1-32; values above the cap are clamped). Overrides the transport-derived default — the operator owns the rate-limit consequences (the adaptive throttle still backs off on 429s). Also accepted by `resume` for a single segment. Without the flag, the auto default is account-posture-aware: `tuning.json`'s `llm_account_posture` selects the fair-share (`shared`, default) or solo ceiling, and startup prints the posture plus a sibling-run observation (live LLM-consuming runs seen in the session run ledger) — a banner heuristic, never a gate |
 | `--subsystem-depth <N>` | Directory grouping depth for subsystem-ordered review (default: 0) |
 | `--max-propagation-depth <N>` | Override adaptive constraint propagation depth (default: auto-calibrated p90+2, floor 5, cap 15) |
 | `--model <name>` | Model ID (repeatable for multi-model consensus) |
@@ -66,9 +68,12 @@ full flag table.
 | `--schedule {cost,priority}` | Parallel review ordering: `cost` packs predicted-longest reviews first, `priority` reviews most promising first |
 | `--prior-journal <run-dir>` | Run dir whose review journal feeds prior finding-grade claims into review context (repeatable; used by `/agentic --gap-audit`) |
 | `--prior-claims <N>` | Max prior finding-grade claims injected per function (default 3; 0 disables) |
+| `--hypothesis-seeds <file>` | `sibling-hypotheses.json` seed file (repeatable); a co-located file in the output dir is picked up automatically — see [Hypothesis seeds](#hypothesis-seeds) |
+| `--seed-rereview` | Schedule a fresh review for seeds resolving to already-covered checklist functions (default off: such seeds record as `no_matching_gap` misses) — see [Hypothesis seeds](#hypothesis-seeds) |
 | `--dynamic` / `--no-dynamic` | Enable/disable dynamic validation (Frida observation / target execution) for confirmed findings |
 | `--binary <path>` / `--binary-auto` / `--no-binary-oracle` | Binary-oracle reachability enrichment of the inventory |
 | `--no-vendored-triage` | Disable the vendored/generated-code triage tier (corroborated generated files → skip tier, uncorroborated banners / vendored paths / generated-shape structure → glance tier; every decision leaves a `suppressions.jsonl` record and the run summary counts them) |
+| `--no-auto-siblings` | Binary targets only: skip the automatic sibling-consistency pass (default: on for binary targets; source targets never run it) — see [Hypothesis seeds](#hypothesis-seeds). Also accepted by `resume` for a single segment |
 | `--annotations-dir <dir>` | Annotations directory (default: project-level `annotations/`, falling back to `<out>/annotations`) |
 
 
@@ -142,6 +147,68 @@ Binary checklist items additionally journal which refutation gates
 could not run on them, so "no refutation" is distinguishable from
 "gate never ran".
 
+Binary items get one refutation gate of their own: the disassembly
+cross-check (`disasm_xcheck`).  Decompilation can silently drop a
+call argument or misrender register liveness, and a review grounded
+in that pseudo-C then asserts a mechanism the machine code
+contradicts.  When a binary item's suspicious/finding-tier claim
+cites an argument-count, register-liveness, sibling-differential
+("no count argument, unlike sibling calls that pass one"), or
+operand-width fact (a bounded keyword+structure match, never free
+LLM classification — the claim is read from the hypothesis, the
+hypothesis list, or the verdict body), the gate disassembles a
+bounded window around the relevant call site(s) — sandboxed, like
+every other parser of target-derived bytes — and runs mechanical
+predicates against the decoded instructions.  Checklist and
+re-database addresses are corrected for the RE tool's load bias
+(Ghidra rebases position-independent ELFs), so the decoded window is
+the claimed function, never a lookalike at the wrong address.
+
+Demotion requires refute-grade evidence at every examined call site:
+an unconditional 32/64-bit register write that provably reaches the
+call within the window (branch-free, or dominating from the
+function's straight-line entry region — and only when the call is
+itself reachable from the entry; an entry region that returns or
+jumps past the call dominates nothing).  Conditional moves, 8/16-bit
+alias writes, and writes a jump can bypass never demote — they only
+withhold corroboration.  Sibling-differential demotion additionally
+requires the callee's FULL attributable caller population sampled
+cleanly (a partial sample is decoy-steerable) and a shared register
+set with signal beyond the near-universal first two argument
+registers.  A load bias guessed from the tool's naming convention
+(rather than measured from the re-database's segment table) can
+corroborate but never demote.  Operand-width claims never demote at all: a
+wide compare beside a narrow one is the classic
+truncated-length-check TRUE-finding shape, so width evidence only
+corroborates or stays inconclusive.  Consistent evidence attaches a
+corroboration receipt without changing anything; an unresolvable
+window, an unmatched claimed callee, or a below-grade write records
+an honest inconclusive with its reason.  The gate never promotes,
+and its per-outcome tallies appear in the run's mechanical tier
+effectiveness table under `disasm_xcheck`.  Receipts land in the
+audit log (`action: disasm_xcheck`) with the excerpt escaped and
+bounded.  Only x86-64 ELF binaries are decoded today; other
+architectures record `arch-unsupported`.
+
+Binary targets get two decompiler Semgrep passes.  Per hypothesis,
+the tool chain runs curated decompiler-tolerant rules
+(`core/audit/rules/decompiler/`) over the reviewed function's
+decompilation.  Post-loop, the same corpus -- plus any curated rule
+opted in with a `# raptor: decomp-safe` header marker -- runs over
+the WHOLE decomp-tree (built from the run's RE database when absent;
+a binary run that cannot sweep records a loud skip in
+`decomp-sweep.json`, never a silent no-sweep).  Decomp-trees are
+attacker-shaped pseudo-C regardless of living in the run directory,
+so these scans run sandboxed like every other parser of
+target-derived bytes.  Matches map back through the tree's
+`decomp-map.json` sidecar to `function @ address` (+ normalized fid)
+and land in the journal as `[mechanical]` rows at `suspicious` --
+detection-tier leads capped at the decompiled-evidence confidence
+ceiling (`traced`), never promotions.  The report's sweep-coverage
+line cites the tree's parse-conformance metric
+(`decomp-tree-conformance.json`) as its denominator; unmapped
+matches are counted and recorded.
+
 
 ## Strategies
 
@@ -196,6 +263,7 @@ channels.
 | **Resource-bounds channel** | Unbounded-accumulation hypotheses (CWE-770/400/772): insert/alloc in a loop with no bound check locally or in nearby callers (`resource_bounds:unbounded-accumulation`; seed-only vocabulary = `-naming` detection variant) | "Each accepted connection is appended to `incoming_channel_list`; no cap in the function or its callers" |
 | **Release-order channel** | Release-before-verify hypotheses (CWE-354/347, the EFAIL class): data handed to an escaping destination before the integrity finalizer's status is consulted (`release_order:*`) | "The loop `BIO_write`s each decrypted chunk to `out`; `BIO_get_cipher_status` is consulted only at end-of-stream" |
 | **Protocol-state channel** | Protocol-invariant hypotheses (CWE-372): promote-capable (`protocol_state:invariant-violated`) only when the invariant premise is study-receipted and SMT finds a violating write site; LLM-stated premises stay detection-grade | "`largest_acked_pkt` is set from the decoded ACK with no guard referencing `highest_sent`" |
+| **Sanitizer witness (sanwit, PHP)** | Sanitizer-sufficiency hypotheses (CWE-78/77/88/79/116 with a named sanitizer): the EXACT sanitizer chain is extracted from the function (refusing whenever a pure straight-line chain cannot be isolated), executed in a sandboxed PHP interpreter against the sink context's breakout-payload corpus, and adjudicated by the context's mechanical predicate.  `sanwit:insufficient:<context>` carries the payload + observed output and is detection-grade (aggregates, never convicts alone); `sanwit:sufficient:<context>` is corpus-bounded and context-scoped — it steers, never resolves clean | "`escapeshellcmd` does not quote argument boundaries — the executed chain passes `x --flag` through as two argv words" |
 
 ### SMT verbs
 
@@ -206,6 +274,7 @@ channels.
 | `check-null-deref` | CWE-476 | Null dereference reachability |
 | `check-overflow-to-oob` | CWE-680 | Overflow feeding a buffer index |
 | `check-negative-bypass` | CWE-839 | Signed comparison bypass with negative values |
+| `check-encoding-residual` | CWE-116 | Encoder completeness: can a target-grammar forbidden byte survive the emitter's supplied transfer semantics unescaped |
 | `validate-path` | Various | Branch condition satisfiability along a dataflow path |
 
 
@@ -257,6 +326,10 @@ This is the KNighter pattern: one hypothesis → sweep the whole codebase.
 Rules are stored in the project's rule library and can be replayed across
 runs.
 
+The same synthesis channel also runs on demand for chain-less suspicious
+hypotheses during a run, and post-run against the witness backlog's dark
+rows (see "Witness-backlog drain" under Post-run Workflows).
+
 
 ## Vocabulary Packs
 
@@ -280,6 +353,47 @@ directory.  Each pack directory carries (or points at) its schema
 documentation.  Malformed packs are skipped with a warning -- checkers
 then run on seeds + learned vocabulary alone.
 
+
+## Cost forecasting
+
+`--forecast` prints a deepen-aware pre-spend cost band and exits at
+$0 LLM spend — no review, no model calls, not a run.  The same band
+prints informationally at the start of every uncapped run (no
+`--max-cost`) before the review loop commits.  Informational only:
+nothing about the forecast gates or caps anything — `--max-cost` is
+the enforcement surface.
+
+```bash
+libexec/raptor-audit run /path/to/code --out out/myrun --forecast
+```
+
+The forecast is a **band** (low/central/high), never a point, built
+from three phases:
+
+- **review** — first-pass reviews, per-item from the gap queue's SLOC
+  census (narrow band);
+- **deepen** — the follow-up machinery (`re_review` + `refinement`
+  ledger phases): a first-pass `suspicious` verdict spawns refinement
+  rounds, the deepen pass, and iterative caller re-review, so this
+  phase rides the queue's **predicted suspicious density**.  With
+  journal priors (a prior run on the project), the density comes from
+  per-function and per-file prior verdict rates; cold runs use a
+  measured corpus default with a wide band.  Prior suspicious/finding
+  functions outside the queue count as seeded re-review mass.  This
+  phase can be several times the first-pass cost on a
+  suspicious-dense queue — pricing first-pass economics only is the
+  miss the forecast exists to close;
+- **support** — triage, study, IRIS, checker synthesis, glances,
+  summaries, as a stable fraction of the subtotal.
+
+Each printed band names its drivers (density source and coverage,
+deepen-depth spread, seeded mass, model overrides).  At run
+completion the forecast is paired with the actual `cost-breakdown.json`
+ledger: the comparison lands in `audit-report.json`
+(`forecast_vs_actual`), on the console, and as an appended record in
+`forecast-calibration.jsonl` (run dir, plus the project dir for
+project runs) — the re-fit food for the seeded coefficients in
+`core/audit/forecast.py`.
 
 ## Running long audits
 
@@ -312,6 +426,13 @@ the run in bounded time (in-flight completions harvested, everything
 flushed, report written, lifecycle `interrupted` with a resume hint,
 exit 130); a second TERM exits immediately after a best-effort flush.
 
+**Watching a run:** `libexec/raptor-run-status <run-dir>` is the
+read-only live view — status, heartbeat age, booked spend vs the
+run's cap, LLM call / failed-attempt / breaker counts, and the newest
+call class as a phase hint.  `--project [name]` shows every run of a
+project at once.  It only reads existing artifacts, so it is safe
+against an in-flight run.
+
 ### Resuming an interrupted run
 
 An audit stopped by an external supervisor (harness shell cap, SIGTERM,
@@ -319,12 +440,14 @@ SIGKILL, OOM) leaves coherent artifacts and can be re-entered **as the
 same run**:
 
 ```bash
-libexec/raptor-audit resume "$OUTPUT_DIR" [--allow-drift] [--max-time <s>] [--no-supervisor-bound]
+libexec/raptor-audit resume "$OUTPUT_DIR" [--allow-drift] [--max-time <s>] [--max-cost <usd>] [--no-supervisor-bound]
 ```
 
 Prior verdicts are re-imported at $0 (hash-verified), the remaining
 gaps are recomputed against the original checklist/scope/pins, the
-remaining budget is the original cap minus booked spend, and one final
+remaining budget is the original cap minus booked spend (or a
+per-segment `--max-cost` override minus booked spend; `0` removes
+the cap for that segment), and one final
 report covers all segments (segment provenance noted in the report and
 run metadata).
 
@@ -335,6 +458,24 @@ and the **staleness gate** re-verifies every hashed journal verdict
 against the target tree — any drift refuses the resume with the drifted
 functions named, or `--allow-drift` proceeds and re-reviews those
 functions instead of reusing them.
+
+Mutual exclusion: `run` and `resume` take an exclusive,
+orchestrator-lifetime lock on the run directory (`.audit-run.lock`) at
+startup. A second `run`/`resume` against a directory whose orchestrator
+is still alive — including one draining after SIGTERM, which keeps the
+lock through salvage until the process actually exits — refuses with a
+non-zero exit, naming the holder pid and start time. If verification
+shows the named pid is not an audit orchestrator working that directory
+(a forged or wrong stamp), delete the lock file and retry — but only
+after verifying: removing the file under a genuinely live holder splits
+lockers across two inodes. A crashed holder's
+stale lock is reclaimed automatically when its stamped identity is
+provably dead (pid gone, recycled pid, or a prior boot of this
+machine); a holder whose liveness cannot be verified fails closed with
+the manual remedy named; a lock path occupied by a symlink, directory,
+or other non-regular artifact refuses outright until the planted
+artifact is removed. Read-only consumers (`report`, `/review`,
+coverage readers) and the lifecycle stubs never take the lock.
 
 ## Post-run Workflows
 
@@ -351,10 +492,13 @@ Corrections are appended as fresh review-journal entries (with the prior
 verdict and lesson recorded): disproven findings are downgraded to `clean`,
 missed vulnerabilities are upgraded to `finding`, corroborated findings get
 a confirmation entry.  Nothing is rewritten in place, and human-grade
-annotations (`source=human` with an interactive-TTY provenance stamp, or
-legacy pre-stamp notes) veto feedback for their function entirely; agent
-notes and human claims stamped non-interactive only serve as the prior
-claim when no journal entry exists.
+annotations (`source=human` with a corroborated interactive-TTY provenance
+stamp, or legacy pre-stamp notes) veto feedback for their function
+entirely; agent notes and human claims stamped non-interactive — or
+interactive but uncorroborated (a pty wrapper makes `isatty` true by
+design, so readers also check the recorded session-leader shape,
+environment markers, and parent chain) — only serve as the prior claim
+when no journal entry exists.
 
 Downgrades are refereed: a `ruled_out` may take a **tool-evidenced**
 finding to `clean` only when the ruling carries a mechanical
@@ -371,6 +515,60 @@ or `referee: llm_only_ruling`), and referee-blocked disprovals are
 excluded from the model scorecard (an LLM-vs-LLM disagreement is not
 ground truth).  This mirrors G2 in the demotion direction: tool output
 is the verdict; LLM-only signals neither promote nor fully demote.
+
+### Witness-backlog drain
+
+`/validate`'s findings import routes dark rows (hypotheses no tool could
+adjudicate either way) into `witness-backlog.json` instead of spending
+validation budget on them.  The backlog consumer works that queue with
+non-executing witnesses: the Mode 2 on-demand checker synthesis is
+retargeted at each dark row's stated hypothesis.
+
+```bash
+libexec/raptor-audit backlog list --out "$OUTPUT_DIR"
+libexec/raptor-audit backlog drain --out "$OUTPUT_DIR" \
+    --target "$TARGET_PATH" --budget 5.00
+```
+
+`list` ranks the queue by cheapest-available-witness without spending
+anything: rows whose hypothesis names a pattern synthesis can target (a
+concrete cluster CWE, or a mechanism the keyword dispatch recognises)
+rank first, and rows with PENDING study questions on the same
+function/file rank behind their questions (study-first ordering — a row
+that is dark because a domain contract is unknown is cheaper to drain
+after the study loop answers the question).  Rows the on-demand policy
+refuses (not-tool-verifiable classes, no stated harm) are recorded and
+never attempted.
+
+`drain` works the ranked queue under the mandatory `--budget` USD cap
+(a positive, finite amount — synthesis calls cost; mechanical engine
+runs are free).  It is a post-run pass: a run directory whose recorded
+worker is still alive is refused — wait for the run to finish (or kill
+it) first.  The consumer never mints verdicts:
+
+- A row leaves the backlog only on a landed tool verdict — a
+  synthesized rule that passed both mechanical controls (positive
+  control at the row's site, dual control on fixtures) AND whose
+  journal entry actually landed.  Witnessed rows are journaled
+  `suspicious` through the orchestrator's own write path with the
+  `<engine>:synth-<rule_id>` receipt recorded; the receipt is
+  self-matched (distilled from the row's own site), so it corroborates
+  without promoting — promotion stays with the review lanes.
+- Failed or refused synthesis leaves the row dark, with a per-row
+  attempt record in `drain-report.json` and a persisted attempt counter
+  on the backlog row (sites past 3 attempts stay parked).  The counter
+  is keyed on the site, not the listing: exact duplicates collapse at
+  load and share one counter, and one drain dispatches at most one
+  synthesis per `file:function` site — duplicate listings never buy
+  extra attempts or extra journal rows.
+
+Drain entries carry the finding-grade `backlog-drain` journal producer:
+they never suppress audit gaps, fold into coverage, or serve as reused
+verdicts.  `--sample N` (with `--sample-seed`) drains a seeded random
+calibration sample of the attemptable rows instead of the whole ranked
+queue.  `--study-answers <path>` points at an explicit
+`study-answers.json` ledger when the run dir (or its newest project
+sibling) does not carry one.
 
 ### Staleness check
 
@@ -412,16 +610,20 @@ Query audit state across all four layers:
 | `annotations/<source_path>.md` | Human-written per-function notes (read as review context; never written by the LLM) |
 | `findings.json` | Findings in standard format (fed to `/validate`) |
 | `gaps.json` | Gap list used for this run |
-| `.audit-log.jsonl` | Full audit trail |
+| `.audit-log.jsonl` | Full audit trail (event log; rolls to numbered sibling shards — `.audit-log.002.jsonl`, … — below the per-shard read budget; readers load the contiguous set. `raptor-audit audit-log rotate <out-dir>` re-splits a pre-rotation oversized trail verbatim, backing up originals as `<name>.pre-rotate`; live runs are refused) |
 | `review-journal.jsonl` | Per-function review decisions (strategies, hypotheses, tools, cost) |
 | `return-census.json` | Return-usage census from the consistency pre-pass (six-value usage enum per call site) |
 | `field-census.json` | Field-access census from the lifecycle channel pre-pass (per-field write sites with rhs provenance, read sites with use context) |
 | `prefilter-kills.jsonl` | One record per prefilter/triage kill (summary row first, then `file`, `function`, `gate`, `reason`, plus spot-audit corroboration fields on sampled rows) |
-| `suppressions.jsonl` | Decision audit trail: oracle-earned skips, vendored/generated skip/glance routings, plus the refutation lattice's record-or-refuse rows — witness discharges, proof-grade receipt-floor overrides, and merge-fence holds, all `dropped: false` (same record shape as `/agentic`/`/codeql`) |
+| `suppressions.jsonl` | Decision audit trail: oracle-earned skips, vendored/generated skip/glance routings, binary toolchain glance screens (`audit:toolchain-screen` — glance verdict kept, full-review escalation withheld by design), plus the refutation lattice's record-or-refuse rows — witness discharges, proof-grade receipt-floor overrides, and merge-fence holds, all `dropped: false` (same record shape as `/agentic`/`/codeql`) |
 | `tier-diagnostics.json` | Per-channel outcome counters (prefilter, semgrep, smt, fail_open, consistency, ...) |
+| `decomp-sweep.json` | Binary targets: tree-wide decompiler Semgrep sweep record — rules run/errored, per-finding records (fid + address join, `traced`-capped, `decompiled-evidence`-tagged), unmapped matches, or the loud-skip reason |
+| `decomp-tree/decomp-tree-conformance.json` | Binary targets: per-tool parse conformance of the decomp-tree (sandboxed tree-sitter + semgrep probe legs, conservative `parsed_rate`, quarantine list) — the sweep-coverage denominator |
 | `fuzz-dict.json` / `fuzz.dict` | Fuzz handoff: dictionary tokens mined from constants, parse-shape literals, and dispatch keys; `fuzz.dict` is AFL format and is auto-discovered by [/fuzz](fuzzing.md#dictionary-auto-discovery) |
 | `cost-breakdown.json` | Per-phase cost ledger reconciliation (completed + failed-attempt + unattributed spend always sum to the authoritative total; the pre-loop summary pass books as the `summary` phase) |
 | `llm-telemetry.jsonl` | Per-call LLM telemetry |
+| `forecast.json` | Pre-spend cost forecast band (`pre_run` for uncapped runs, `forecast_only` for `--forecast` exits) — see [Cost forecasting](#cost-forecasting) |
+| `forecast-calibration.jsonl` | Forecast-vs-actual record appended at run completion (also appended at the project level for project runs) |
 | `promotion-alarms.jsonl` | Promotion-without-tool-evidence alarms — a `finding` that reached the journal or export without qualifying tool evidence. Empty on every legitimate run; any record means the mechanical-verdict gate was bypassed (possible injection or policy bug). The gate also enforces: a violating `finding` is demoted to `suspicious` before it ships, and the record is the alarm trail |
 | `audit-report.json` | Summary report |
 
@@ -433,6 +635,157 @@ Query audit state across all four layers:
 `/audit` requires `context-map.json` from `/understand --map`.  If
 missing, it runs the map automatically.  The context map provides
 entry points, sinks, and trust boundaries that drive priority ordering.
+
+### Hypothesis seeds
+
+External producers (sibling-consistency analysis, contract checkers)
+can hand the audit hypothesis seeds: a `sibling-hypotheses.json` file
+of per-function records — `file` (source path, or the `binary:<stem>`
+sentinel plus `address` for binary functions), optional `fid`, a
+`claim`, evidence references (`{artifact, pointer}`), an
+`evidence_tier` (a `core.evidence` value spelling), a `disproof`
+recipe, and `derived_from_target` flags on the text fields.  A
+co-located file in the run's output directory is discovered
+automatically; `--hypothesis-seeds <file>` (repeatable) names others,
+and the flag is persisted so `resume` segments see the same seeds.
+
+**Auto-siblings (binary targets).** For a binary target the pipeline
+runs the sibling-consistency pass itself — no hand-ferrying: when a
+mapped sibling run for the same binary exists (discovered through
+the shared sibling-run search with a recorded-target gate and a
+FAIL-CLOSED build-identity gate — the map manifest's `binary_sha256`
+must be present and match the audit target's content hash, so
+another binary's, another build's, or an identity-unverifiable map
+never seeds the audit), its `sibling-hypotheses.json` is captured
+co-located into the audit run dir, where the normal intake ingests
+it.  A map run that already holds the artifact (a prior hand-run,
+possibly operator-adjudicated) is captured verbatim — the engine is
+not re-run over it (receipt provenance `captured_existing`); only a
+map with no artifact runs the landed `raptor-binary siblings --auto`
+engine (provenance `computed`), inside a bounded worker that
+degrades to `engine_timeout` instead of stalling audit start.
+Operator `--hypothesis-seeds` files merge through the intake's usual
+multi-source path (shared record cap, per-seed source provenance in
+the receipt).  A co-located seed file that already exists in the
+audit run dir (operator-ferried, or captured by an earlier segment)
+is reused — nothing runs.  Every other non-captured outcome degrades
+loudly to today's unseeded audit: one warning names the reason, the
+`auto-siblings.json` receipt persists it, and the run report carries
+an "Auto-siblings pass skipped" section with the manual escape
+hatch.  `--no-auto-siblings` (on `run` and `resume`) opts out;
+source targets never enter the pass.
+
+Seeds are an attention channel riding two existing seams: matched
+gap-queue entries get one bounded priority boost — applied after the
+sort that fixes the `--budget` cut, so it moves a matched function
+earlier in the review order (and across the folded spec-inference
+gate) without displacing any other function out of the run — and the
+matched function's review context gains a hint-tier block with the
+claim and its disproof recipe, enveloped as untrusted content.
+Binary seeds join on the checklist's own address space (the
+`binary:<stem>` sentinel plus the address the audit's RE database
+recorded) — a producer emitting another tool's base gets loud misses,
+not silent wrong-function joins.  The journal entry records which
+seeds the reviewer saw (`seed_provenance`), and the intake receipt
+(`hypothesis-seed-intake.json`) carries per-source resolved paths and
+file hashes plus loaded/matched/missed/conflict/skip counts; seeds
+naming unknown functions are recorded misses in `fid-misses.json`
+(reason-differentiated: placeholder names and address/name conflicts
+are called out as producer errors), never run errors.  Resumed runs
+re-run the intake each segment against that segment's residual
+queue: a seed whose target this run already reviewed counts in the
+receipt's `already_covered` bucket (no new miss rows accumulate per
+resume), and a seed the checklist recognises but the segment's queue
+does not carry records the precise reason `not_in_gap_queue` instead
+of a guess derived from the seed's name shape.
+
+Against a fully-covered target the boost has nothing to land on: a
+seed naming a function every prior run already reviewed records as a
+`no_matching_gap` miss and the audit reviews nothing.  `--seed-rereview`
+(on `run` and `resume`; default off — the flag is the operator's
+consent to re-open spend on covered code) changes exactly that case:
+a seed that resolves to a checklist function which is covered rather
+than absent is scheduled for a fresh review — hoisted through the
+same mechanism `--pin` uses, ahead of the `--budget` cut, with the
+seed's claim and disproof recipe injected at the same review-context
+seam as matched-gap seeds.  Note the consented displacement this
+implies on a partially-covered target: scheduled re-reviews claim
+budget slots first, so never-reviewed gaps can be displaced from a
+bounded run (recorded in `not-attempted.json`, like any `--pin`);
+the displacement is flag-gated and bounded by the intake's 200-seed
+record cap, and excess scheduled items beyond the budget are
+themselves cut and recorded.  Verdict reuse never satisfies a
+scheduled function (the prior verdicts stay in the journal history;
+the fresh verdict appends, its row marked `seed_rereview`), and the
+marker also bounds the consent: each seed forces at most ONE fresh
+review per run — resume segments count an already-reviewed seed as
+`rereview_already_satisfied` instead of re-scheduling it.  The
+ledger rows for scheduled seeds carry reason `rereview_scheduled`
+with the resolved address, and the intake line reports the extra
+buckets.  A seed for a function absent from the checklist entirely
+remains a miss, flag or no flag.
+
+What seeds NEVER do: they mint no findings (the Ghidra bookmarks
+bridge remains the only pre-identified-finding lane), carry no
+verdict weight, and suppress nothing — the LLM still forms and
+validates every hypothesis, and tool output is still the verdict.
+A junk or hostile seed file degrades to counted skips, never a
+failed run.  `--seed-rereview` does not change any of this: seeds
+still never mint findings or change verdicts, and scheduled
+re-reviews spend inside `--max-cost`/`--budget` like every other
+review.
+
+### Token-enforcement map
+
+`/understand --study` can learn WHICH function(s) implement the
+target's anti-request-forgery (CSRF/nonce) check idiom — the
+`token_checks` vocabulary channel, name-verified against the study
+items like every other channel (generic name shapes like
+*token*/*csrf*/*nonce* are candidate discovery hints only; the
+classification comes from the enforcement behaviour in the studied
+code, so a validator without those words in its name still
+qualifies).  At save time a mechanical projection maps every entry
+point (context-map entry points plus checklist script-handler files;
+PHP targets) to a per-entry status via static call reachability
+inside the entry's pre-output prefix, written as `token-map.json`
+beside `domain-model.json`:
+
+- `enforced` — a learned check is called directly before any output
+- `indirect` — the check is reached through resolved intermediate
+  calls (branch conditions inside intermediates are NOT analysed)
+- `not_enforced` — no path, with every reachability search run to
+  natural exhaustion; the record carries the absence census
+- `unknown` — parse failure, dynamic dispatch, a truncated search
+  (call-depth cap, include depth cap, or include-splice budget), or a
+  config-dependent short open tag; never downgraded to a claim in
+  either direction
+
+Every status is hint-tier.  `enforced` is a call-presence witness,
+not bypass-freedom — a check behind a conditional projects as
+enforced with a `conditional` flag, and NO consumer may suppress or
+down-rank a finding because an entry maps as enforced.  Consumers:
+entry-point audit reviews get a verify-against-source hint line; the
+validate bridge attaches the fact to `attack-surface.json` entry
+points (advisory, never a status write); `/project correlate`
+reports per-entry drift between runs (`lost_enforcement` rows are
+re-review food for token-guard disproofs, never an auto-overturn).
+
+Operator surface:
+
+```bash
+libexec/raptor-audit token-map project --out <run-dir> --target <src>
+libexec/raptor-audit token-map drift --prior <run-A> --current <run-B>
+libexec/raptor-audit token-map sweep --out <run-dir> [--finding-id F-7]
+```
+
+`sweep` is the class-sweep generator: when a finding confirmed on a
+token-related premise (the finding names a learned check, or carries
+CWE-352), every `not_enforced` entry becomes a hypothesis seed in the
+`sibling-hypotheses.json` contract above — same caps, same
+guarantees, seeds never mint findings.  If another producer already
+owns the co-located file, the sweep writes
+`token-sweep-hypotheses.json` for an explicit `--hypothesis-seeds`
+pass instead (it never overwrites).
 
 ### /agentic → /audit
 

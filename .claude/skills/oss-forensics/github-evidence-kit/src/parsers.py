@@ -8,6 +8,7 @@ Each parser extracts structured data from raw GH Archive JSON payloads.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import Any
 
 from .helpers import (
@@ -98,10 +99,15 @@ class _RowContext:
 
         self.repository = make_repo_from_full_name(repo_name)
 
-        # Determine table from timestamp if not provided
+        # Determine table from timestamp if not provided. Completed
+        # years use the year table; the CURRENT year's year-table is
+        # still being filled, so recent events use the month table.
+        # Derived from today's date — a hardcoded boundary year froze
+        # this decision in time and sent post-boundary events to
+        # month tables forever.
         if not table and self.when:
             year = self.when.year
-            if year < 2025:
+            if year < datetime.now(timezone.utc).year:
                 table = f"githubarchive.year.{year}"
             else:
                 month = self.when.strftime("%Y%m")
@@ -146,6 +152,17 @@ def _as_int(v: Any) -> int:
     return 0
 
 
+# Evidence-id keying contract: EvidenceStore.add replaces on id match,
+# so every parser's id embeds the row timestamp (and the lifecycle
+# action where the event has one) — the WorkflowRunEvent pattern.
+# Recurring shapes (issue closed→reopened→closed, branch
+# recreate-after-delete, re-push of the same head sha) are distinct
+# forensic events and must never evict one another; re-ingesting the
+# SAME archive row still dedupes (ids stay deterministic per row).
+# Pinned for all parsers by
+# tests/test_parsers.py::TestEvidenceIdKeying.
+
+
 def parse_push_event(row: dict[str, Any], table: str | None = None) -> PushEvent:
     """Parse GH Archive PushEvent into PushEvent evidence."""
     ctx = _RowContext(row, table)
@@ -170,7 +187,7 @@ def parse_push_event(row: dict[str, Any], table: str | None = None) -> PushEvent
     ref = payload.get("ref", "")
 
     return PushEvent(
-        evidence_id=generate_evidence_id("push", ctx.repository.full_name, after_sha),
+        evidence_id=generate_evidence_id("push", ctx.repository.full_name, after_sha, ctx.when.isoformat()),
         when=ctx.when,
         who=ctx.who,
         what=f"Pushed {size} commit(s) to {ref}",
@@ -201,7 +218,7 @@ def parse_issue_event(row: dict[str, Any], table: str | None = None) -> IssueEve
     issue_number = _as_int(issue.get("number", 0))
 
     return IssueEvent(
-        evidence_id=generate_evidence_id("issue", ctx.repository.full_name, str(issue_number), action_str),
+        evidence_id=generate_evidence_id("issue", ctx.repository.full_name, str(issue_number), action_str, ctx.when.isoformat()),
         when=ctx.when,
         who=ctx.who,
         what=f"Issue #{issue_number} {action_str}",
@@ -224,7 +241,7 @@ def parse_create_event(row: dict[str, Any], table: str | None = None) -> CreateE
     ref_name = ctx.payload.get("ref", "")
 
     return CreateEvent(
-        evidence_id=generate_evidence_id("create", ctx.repository.full_name, ref_type_str, ref_name),
+        evidence_id=generate_evidence_id("create", ctx.repository.full_name, ref_type_str, ref_name, ctx.when.isoformat()),
         when=ctx.when,
         who=ctx.who,
         what=f"Created {ref_type_str} '{ref_name}'",
@@ -249,7 +266,7 @@ def parse_pull_request_event(row: dict[str, Any], table: str | None = None) -> P
     pr_number = _as_int(pr.get("number", 0))
 
     return PullRequestEvent(
-        evidence_id=generate_evidence_id("pr", ctx.repository.full_name, str(pr_number), action_str),
+        evidence_id=generate_evidence_id("pr", ctx.repository.full_name, str(pr_number), action_str, ctx.when.isoformat()),
         when=ctx.when,
         who=ctx.who,
         what=f"PR #{pr_number} {action_str}",
@@ -273,7 +290,7 @@ def parse_issue_comment_event(row: dict[str, Any], table: str | None = None) -> 
     issue_number = _as_int(issue.get("number", 0))
 
     return IssueCommentEvent(
-        evidence_id=generate_evidence_id("comment", ctx.repository.full_name, str(comment_id)),
+        evidence_id=generate_evidence_id("comment", ctx.repository.full_name, str(comment_id), ctx.when.isoformat()),
         when=ctx.when,
         who=ctx.who,
         what=f"Comment on issue #{issue_number}",
@@ -291,7 +308,7 @@ def parse_watch_event(row: dict[str, Any], table: str | None = None) -> WatchEve
     ctx = _RowContext(row, table)
 
     return WatchEvent(
-        evidence_id=generate_evidence_id("watch", ctx.repository.full_name, ctx.who.login),
+        evidence_id=generate_evidence_id("watch", ctx.repository.full_name, ctx.who.login, ctx.when.isoformat()),
         when=ctx.when,
         who=ctx.who,
         what=f"User {ctx.who.login} starred repository",
@@ -307,7 +324,7 @@ def parse_fork_event(row: dict[str, Any], table: str | None = None) -> ForkEvent
     fork_full_name = forkee.get("full_name", f"{ctx.who.login}/{ctx.repository.name}")
 
     return ForkEvent(
-        evidence_id=generate_evidence_id("fork", ctx.repository.full_name, fork_full_name),
+        evidence_id=generate_evidence_id("fork", ctx.repository.full_name, fork_full_name, ctx.when.isoformat()),
         when=ctx.when,
         who=ctx.who,
         what=f"Forked to {fork_full_name}",
@@ -327,7 +344,7 @@ def parse_delete_event(row: dict[str, Any], table: str | None = None) -> DeleteE
     ref_name = ctx.payload.get("ref", "")
 
     return DeleteEvent(
-        evidence_id=generate_evidence_id("delete", ctx.repository.full_name, ref_type_str, ref_name),
+        evidence_id=generate_evidence_id("delete", ctx.repository.full_name, ref_type_str, ref_name, ctx.when.isoformat()),
         when=ctx.when,
         who=ctx.who,
         what=f"Deleted {ref_type_str} '{ref_name}'",
@@ -352,7 +369,7 @@ def parse_member_event(row: dict[str, Any], table: str | None = None) -> MemberE
         # Keyed on the NORMALIZED action so the id and the record's
         # action field can never disagree (an unknown raw action used
         # to produce an id citing it while the record said "added").
-        evidence_id=generate_evidence_id("member", ctx.repository.full_name, member.get("login", ""), normalized_action),
+        evidence_id=generate_evidence_id("member", ctx.repository.full_name, member.get("login", ""), normalized_action, ctx.when.isoformat()),
         when=ctx.when,
         who=ctx.who,
         what=f"Collaborator {member.get('login', 'unknown')} {normalized_action}",
@@ -368,7 +385,7 @@ def parse_public_event(row: dict[str, Any], table: str | None = None) -> PublicE
     ctx = _RowContext(row, table)
 
     return PublicEvent(
-        evidence_id=generate_evidence_id("public", ctx.repository.full_name, str(ctx.when.timestamp())),
+        evidence_id=generate_evidence_id("public", ctx.repository.full_name, ctx.when.isoformat()),
         when=ctx.when,
         who=ctx.who,
         what=f"Repository {ctx.repository.full_name} made public",
@@ -389,7 +406,7 @@ def parse_release_event(row: dict[str, Any], table: str | None = None) -> Releas
     normalized_action = action_map.get(action, "published")
 
     return ReleaseEvent(
-        evidence_id=generate_evidence_id("release", ctx.repository.full_name, tag_name, action),
+        evidence_id=generate_evidence_id("release", ctx.repository.full_name, tag_name, action, ctx.when.isoformat()),
         when=ctx.when,
         who=ctx.who,
         what=f"Release {tag_name} {normalized_action}",
@@ -423,7 +440,19 @@ def parse_workflow_run_event(row: dict[str, Any], table: str | None = None) -> W
     head_sha = workflow_run.get("head_sha", "0" * 40)
 
     return WorkflowRunEvent(
-        evidence_id=generate_evidence_id("workflow", ctx.repository.full_name, workflow_name, head_sha[:8]),
+        # The id must carry the lifecycle action and the row timestamp:
+        # a run's `requested` and `completed` events used to share one
+        # id, and EvidenceStore.add replaces on id match — ingesting
+        # both silently discarded one, corrupting the workflow-timing
+        # attribution pattern this event type exists for.
+        evidence_id=generate_evidence_id(
+            "workflow",
+            ctx.repository.full_name,
+            workflow_name,
+            head_sha[:8],
+            normalized_action,
+            ctx.when.isoformat(),
+        ),
         when=ctx.when,
         who=ctx.who,
         what=f"Workflow '{workflow_name}' {normalized_action}",
@@ -454,6 +483,16 @@ _PARSERS = {
     "ReleaseEvent": parse_release_event,
     "WorkflowRunEvent": parse_workflow_run_event,
 }
+
+
+def is_supported_event_type(event_type: str) -> bool:
+    """True when a dedicated parser exists for *event_type*.
+
+    Collectors use this to skip-and-log routine-but-unmodeled GH
+    Archive types (GollumEvent, the PR-review events, ...) instead of
+    letting :func:`parse_gharchive_event`'s unsupported-type
+    ValueError abort a whole ingest."""
+    return event_type in _PARSERS
 
 
 def parse_gharchive_event(row: dict[str, Any], table: str | None = None) -> Any:

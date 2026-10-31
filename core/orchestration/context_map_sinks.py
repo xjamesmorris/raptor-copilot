@@ -46,6 +46,7 @@ from core.inventory.sink_discovery import (
     discover_sinks_for_target,
 )
 from core.json import load_json
+from core.orchestration.llm_json import dict_rows
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -166,7 +167,9 @@ def _merge_discovered_sinks(
     Only adds sinks not already present (by file+line match).
     """
     sink_details = context_map.get("sink_details")
-    if sink_details is None:
+    if not isinstance(sink_details, list):
+        # None, or an LLM-shape-drifted scalar/string: the merge below
+        # appends, so normalise to a list rather than crash the stage.
         sink_details = []
         context_map["sink_details"] = sink_details
 
@@ -209,7 +212,11 @@ def _annotate_entry_points(
     result: SinkDiscoveryResult,
 ) -> int:
     """Add reachable_sinks to entry points that can reach dangerous sinks."""
-    entry_points = context_map.get("entry_points", [])
+    # dict_rows: LLM output routinely renders entry_points as a list
+    # of strings (or a scalar) — a bare .get() iteration crashed on
+    # the first ep.get(), silently dropping the whole stage under the
+    # shim's except-Exception wrapper.
+    entry_points = dict_rows(context_map, "entry_points")
     if not entry_points:
         return 0
 
@@ -308,7 +315,7 @@ def _populate_sinks_array(
     Deduplicates by (file, function, target).
     """
     sinks = context_map.get("sinks")
-    if sinks is None:
+    if not isinstance(sinks, list):
         sinks = []
         context_map["sinks"] = sinks
 
@@ -357,7 +364,9 @@ def _sink_detail_index(
 ) -> tuple:
     """(sink_details list, {(file, name)} and {(file, line)} dedup sets)."""
     sink_details = context_map.get("sink_details")
-    if sink_details is None:
+    if not isinstance(sink_details, list):
+        # None, or an LLM-shape-drifted scalar/string: the merge below
+        # appends, so normalise to a list rather than crash the stage.
         sink_details = []
         context_map["sink_details"] = sink_details
     by_name: set[tuple] = set()
@@ -380,6 +389,9 @@ def _append_flat_sink(
 ) -> None:
     """Append to the flat ``sinks`` array with dedup."""
     sinks = context_map.setdefault("sinks", [])
+    if not isinstance(sinks, list):
+        sinks = []
+        context_map["sinks"] = sinks
     for s in sinks:
         if isinstance(s, dict) and (
             s.get("file", ""), s.get("function", ""), s.get("target", ""),
@@ -484,20 +496,27 @@ def _merge_expanded_view_sinks(
         r"\b(" + "|".join(re.escape(t) for t in c_targets) + r")\s*\("
     )
 
+    # The walk runs over the SCANNED (untrusted) target in the
+    # unsandboxed parent: use the symlink-safe capped enumerator (a
+    # hostile ``dir -> /`` symlink must not steer the walk across the
+    # host fs) and cap each read (a planted multi-GB .c file must not
+    # be loaded whole). Sorted for deterministic candidate selection
+    # under the file cap, as the rglob-sorted predecessor was.
+    from core.inventory._walk import iter_regular_files
+    from core.source import read_text_capped
+
     candidates: list[tuple] = []
     try:
-        source_files = sorted(target_path.rglob("*"))
+        source_files = sorted(iter_regular_files(target_path, _C_SUFFIXES))
     except OSError:
         return 0
     for f in source_files:
         if len(candidates) >= EXPANDED_SINK_FILE_CAP:
             break
-        if f.suffix not in _C_SUFFIXES or not f.is_file():
+        got = read_text_capped(f)
+        if got is None:
             continue
-        try:
-            raw = f.read_text(errors="replace")
-        except OSError:
-            continue
+        raw = got[0]
         if _MACRO_CALL_RE.search(raw):
             candidates.append((str(f.relative_to(target_path)), raw))
 
@@ -581,13 +600,23 @@ def _raw_lines_for(
 ) -> list[str] | None:
     if rel in cache:
         return cache[rel]
+    # ``rel`` comes from preprocessor ``#line`` markers in the
+    # target's own TUs — attacker-shaped. String-prefix containment
+    # let a crafted marker escape to a SIBLING of the target
+    # (``/tmp/target-evil`` passes ``startswith("/tmp/target")``);
+    # the shared confine() does real containment. The capped read
+    # keeps a marker pointed at a multi-GB file from being loaded
+    # whole in the unsandboxed parent — the same hardening the
+    # candidate walk above already has.
+    from core.paths import confine
+    from core.source import read_text_capped
+
     lines: list[str] | None = None
-    try:
-        candidate = (target_path / rel).resolve()
-        if str(candidate).startswith(str(target_path.resolve())) and candidate.is_file():
-            lines = candidate.read_text(errors="replace").splitlines()
-    except (OSError, ValueError):
-        lines = None
+    candidate = confine(target_path, rel)
+    if candidate is not None:
+        got = read_text_capped(candidate)
+        if got is not None:
+            lines = got[0].splitlines()
     cache[rel] = lines
     return lines
 
@@ -717,7 +746,18 @@ def _find_discovered_sinks(run_dir: Path) -> dict[str, Any] | None:
             from core.orchestration.run_discovery import (
                 recorded_target_matches,
             )
-            for sibling in sorted(parent.iterdir(), reverse=True):
+
+            def _mtime_ns(p: Path) -> int:
+                try:
+                    return p.stat().st_mtime_ns
+                except OSError:
+                    return -1
+
+            # Newest first by mtime — a lexicographic-descending NAME
+            # sort only matches recency for timestamp-named dirs, and
+            # project-mode run dirs carry arbitrary names.
+            for sibling in sorted(parent.iterdir(), key=_mtime_ns,
+                                  reverse=True):
                 if sibling == run_dir or not sibling.is_dir():
                     continue
                 if own_target and not recorded_target_matches(

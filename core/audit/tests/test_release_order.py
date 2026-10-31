@@ -90,6 +90,36 @@ int cms_text_alias(BIO *out, BIO *cms, unsigned char *buf, int n,
 }
 """
 
+# One dominated escaping write PLUS one undecidable alias write: the
+# dominance receipt on `out` must not let the tmpout question vanish
+# into a refutation.
+TMPOUT_ALIAS_WITH_DOMINATED = """\
+int cms_text_mixed(BIO *out, BIO *cms, unsigned char *buf, int n,
+                   int clear)
+{
+    BIO *tmpout = clear ? out : BIO_new(BIO_s_mem());
+    BIO_write(tmpout, buf, n);
+    if (BIO_get_cipher_status(cms) <= 0)
+        return -1;
+    BIO_write(out, buf, n);
+    return 1;
+}
+"""
+
+TMPOUT_TWO_ALIASES = """\
+int cms_text_two_aliases(BIO *out, BIO *cms, unsigned char *buf, int n,
+                         int clear)
+{
+    BIO *tmpa = clear ? out : BIO_new(BIO_s_mem());
+    BIO *tmpb = clear ? out : BIO_new(BIO_s_mem());
+    BIO_write(tmpa, buf, n);
+    BIO_write(tmpb, buf, n);
+    if (BIO_get_cipher_status(cms) <= 0)
+        return -1;
+    return 1;
+}
+"""
+
 # Plain-CBC pipeline without a MAC — not this channel's claim.
 PLAIN_CBC = """\
 int cbc_stream(BIO *out, BIO *cms, unsigned char *buf)
@@ -264,6 +294,38 @@ class TestAnchorPairs:
         assert res.outcome == "inconclusive"
         assert REASON_SINK_ALIAS_UNRESOLVED in res.reason
 
+    def test_dominated_site_does_not_suppress_unresolved_alias(
+        self, tmp_path,
+    ):
+        # The unresolved-alias write is excluded from the dominance
+        # test, so a dominated escaping sibling must not earn "every
+        # release site is dominated" — the undecidable write stays on
+        # the table as sink-alias-unresolved. The zero-unresolved
+        # all-dominated twin still refutes
+        # (test_buffered_twin_refuted_with_dominator).
+        _write(tmp_path, "src/cms_smime.c", TMPOUT_ALIAS_WITH_DOMINATED)
+        res = run_release_order_check(
+            tmp_path, "src/cms_smime.c", "cms_text_mixed", HYP,
+        )
+        assert res.outcome == "inconclusive"
+        assert REASON_SINK_ALIAS_UNRESOLVED in res.reason
+        dests = {r["destination"] for r in res.releases}
+        assert "tmpout" in dests  # the undecidable write is named
+        assert "out" in dests     # the dominated receipt stays attached
+
+    def test_all_unresolved_sites_in_receipt(self, tmp_path):
+        _write(tmp_path, "src/cms_smime.c", TMPOUT_TWO_ALIASES)
+        res = run_release_order_check(
+            tmp_path, "src/cms_smime.c", "cms_text_two_aliases", HYP,
+        )
+        assert res.outcome == "inconclusive"
+        assert REASON_SINK_ALIAS_UNRESOLVED in res.reason
+        unresolved = [
+            r for r in res.releases
+            if r["destination_class"] == "unresolved"
+        ]
+        assert {r["destination"] for r in unresolved} == {"tmpa", "tmpb"}
+
     def test_plain_cbc_is_finalizer_unresolved(self, tmp_path):
         # Proves the channel does not claim unauthenticated pipelines.
         _write(tmp_path, "src/cbc.c", PLAIN_CBC)
@@ -378,6 +440,32 @@ int f(BIO *cms)
     def test_all_reasons_enumerated(self):
         assert len(INCONCLUSIVE_REASONS) == 7
 
+    def test_traversal_path_reads_as_unbindable(self, tmp_path):
+        # file_path is LLM-writable: a ../ segment must not escape the
+        # analysed root and pull host files into adjudication.
+        target = tmp_path / "target"
+        target.mkdir()
+        outside = tmp_path / "outside.c"
+        outside.write_text(EFAIL, encoding="utf-8")
+        res = run_release_order_check(
+            target, "../outside.c", "cms_copy_content", HYP,
+        )
+        assert res.outcome == "inconclusive"
+        assert res.reason.startswith(REASON_HYPOTHESIS_UNBINDABLE)
+
+    def test_absolute_path_reads_as_unbindable(self, tmp_path):
+        # An absolute file_path discards target_path entirely under
+        # Path "/" join semantics — must refuse, never read.
+        target = tmp_path / "target"
+        target.mkdir()
+        outside = tmp_path / "outside.c"
+        outside.write_text(EFAIL, encoding="utf-8")
+        res = run_release_order_check(
+            target, str(outside), "cms_copy_content", HYP,
+        )
+        assert res.outcome == "inconclusive"
+        assert res.reason.startswith(REASON_HYPOTHESIS_UNBINDABLE)
+
 
 class TestPrepass:
     def test_prepass_pairs(self, tmp_path):
@@ -433,3 +521,108 @@ class TestPrepass:
         )
         assert res.outcome == "confirmed"
         assert res.reachability["status"] == "entry_reachable"
+
+
+# fwrite's destination is its 4th argument (the stream); the 1st is
+# the data buffer. First-arg extraction classified `buf = malloc(len)`
+# as fresh-call provenance -> "internal" -> a false buffered-then-flush
+# refutation on a genuine pre-verify stdio release.
+FWRITE_TO_PARAM_STREAM = """\
+int cms_copy_fwrite(FILE *out, BIO *cms, unsigned char *src, int len)
+{
+    unsigned char *buf = malloc(len);
+    memcpy(buf, src, len);
+    fwrite(buf, 1, len, out);
+    if (BIO_get_cipher_status(cms) <= 0)
+        return -1;
+    return 1;
+}
+"""
+
+FWRITE_TO_INTERNAL_STREAM = """\
+int cms_copy_fwrite_spool(BIO *cms, unsigned char *src, int len)
+{
+    FILE *spool = get_spool_stream();
+    fwrite(src, 1, len, spool);
+    if (BIO_get_cipher_status(cms) <= 0)
+        return -1;
+    return 1;
+}
+"""
+
+WRITE_TO_FRESH_FD = """\
+int relay_plain(BIO *cms, unsigned char *buf, int n)
+{
+    int fd = open("/run/tap0", 1);
+    write(fd, buf, n);
+    if (BIO_get_cipher_status(cms) <= 0)
+        return -1;
+    return 1;
+}
+"""
+
+FWRITE_HYP = ("plaintext is written to the output stream before the "
+              "cipher status is verified")
+
+
+class TestDestinationArgument:
+    def test_fwrite_to_param_stream_confirms(self, tmp_path):
+        _write(tmp_path, "src/cms_fw.c", FWRITE_TO_PARAM_STREAM)
+        res = run_release_order_check(
+            tmp_path, "src/cms_fw.c", "cms_copy_fwrite", FWRITE_HYP,
+        )
+        assert res.outcome == "confirmed"
+        undominated = [r for r in res.releases if not r["dominated"]]
+        assert undominated[0]["callee"] == "fwrite"
+        assert undominated[0]["destination"] == "out"
+
+    def test_fwrite_to_internal_stream_still_refutes(self, tmp_path):
+        _write(tmp_path, "src/cms_fw.c", FWRITE_TO_INTERNAL_STREAM)
+        res = run_release_order_check(
+            tmp_path, "src/cms_fw.c", "cms_copy_fwrite_spool", FWRITE_HYP,
+        )
+        assert res.outcome == "refuted"
+
+    def test_write_to_fresh_descriptor_escapes(self, tmp_path):
+        # A freshly-opened descriptor is not an internal buffer: data
+        # leaves the process the moment write() runs.
+        _write(tmp_path, "src/relay.c", WRITE_TO_FRESH_FD)
+        res = run_release_order_check(
+            tmp_path, "src/relay.c", "relay_plain", FWRITE_HYP,
+        )
+        assert res.outcome == "confirmed"
+        undominated = [r for r in res.releases if not r["dominated"]]
+        assert undominated[0]["destination"] == "fd"
+
+
+class TestTernarySplitWhitespaceRun:
+    def test_ternary_whitespace_run_is_fast(self):
+        """Hostile assignment RHS with a ``?`` followed by a long
+        whitespace run and no ``:``: the previous trim spelling
+        ``\\s*(.+?)\\s*:`` overlapped three unbounded repeats on
+        whitespace and tried every split of the run between them —
+        cubic in the line length. The \\S-delimited arm spelling is
+        linear. Both-direction bound: fast AND real ternary
+        assignments still classify."""
+        from core.audit.release_order import _classify_destination
+        from core.testing.wallclock import cpu_budget
+
+        hostile = "out = cond ?" + " " * (1 << 16) + "x"
+        with cpu_budget(1.0, what="ternary whitespace-run classify"):
+            assert _classify_destination("out", [hostile], ("p",)) \
+                == "unresolved"
+
+    def test_ternary_arm_classification_unchanged(self):
+        from core.audit.release_order import _classify_destination
+
+        # True-arm aliases a param -> escaping vote; both arms fresh
+        # calls -> internal.
+        assert _classify_destination(
+            "out", ["out = ok ? dst : make_buf();"], ("dst",),
+        ) == "unresolved"  # mixed escaping+internal
+        assert _classify_destination(
+            "out", ["out = ok ? make_a() : make_b();"], ("p",),
+        ) == "internal"
+        assert _classify_destination(
+            "out", ["out = ok ? dst : src;"], ("dst", "src"),
+        ) == "escaping"

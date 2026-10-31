@@ -16,7 +16,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from core.atomic_fs import write_new_bytes
 from core.json import load_json, load_json_bounded, save_json
+from core.paths import confine
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -372,15 +374,46 @@ def prepare_seed_corpus(options: SeedCorpusOptions) -> dict:
                 Path(kind) / f"seed-{counters[kind]:04d}{path.suffix.lower()}"
             )
             destination = out_dir / destination_relative
+            # Vet the kind-dir chain before mkdir/write: the reset
+            # above owns the known kind names, but the exclusive
+            # create below hardens only the FINAL component and
+            # mkdir(parents=True) follows a planted intermediate
+            # symlink — belt-and-braces containment so a link
+            # surviving into the reset→write window can never carry
+            # the seed outside out_dir.
+            if confine(out_dir, destination_relative.parent) is None:
+                counters[kind] -= 1
+                skipped.append({
+                    "path": relative_posix,
+                    "reason": "kind directory resolves outside the "
+                              "output directory (planted symlink?)",
+                })
+                continue
             destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(path, destination)
+            # Bounded copy, not copyfile: the source tree is the
+            # SCANNED repo, and a file can grow between the stat
+            # check above and the copy (corpus_manager's idiom).
+            with path.open("rb") as fh:
+                data = fh.read(options.max_file_size + 1)
+            if len(data) > options.max_file_size:
+                counters[kind] -= 1
+                skipped.append(
+                    {"path": relative_posix, "reason": "too large",
+                     "size": len(data)}
+                )
+                continue
+            # Exclusive create (replace=True unlinks a planted
+            # symlink itself): out_dir is reused run output — a
+            # dangling symlink at a deterministic seed-NNNN name
+            # would route a plain write_bytes anywhere on disk.
+            write_new_bytes(destination, data, replace=True)
             sha256 = _sha256_file(destination)
             seeds.append(
                 {
                     "source": relative_posix,
                     "destination": destination_relative.as_posix(),
                     "kind": kind,
-                    "size": size,
+                    "size": len(data),
                     "sha256": sha256,
                 }
             )
@@ -417,8 +450,24 @@ def prepare_builtin_seed_corpus(out_dir: Path, profile: str = "default") -> dict
     manifest with sizes and hashes for the exact seeds used by this run.
     """
 
-    out_dir = Path(out_dir).resolve()
-    _validate_builtin_output_directory(out_dir)
+    out_dir = Path(out_dir)
+    # Dangerous-path check first (a read of the resolved path only —
+    # its specific diagnostics must keep priority), then vet the NAME
+    # before adopting resolve()'s answer: resolve follows a planted
+    # symlink, pointing every write below (seeds, manifest.json via
+    # os.replace) at an attacker-chosen directory.
+    _validate_builtin_output_directory(out_dir.resolve())
+    from packages.fuzzing.smt_seed import ensure_real_seed_dir
+    refusal = ensure_real_seed_dir(out_dir)
+    if refusal is not None:
+        from core.security.log_sanitisation import sanitise_for_terminal
+        msg = (
+            f"refusing built-in seed corpus output at "
+            f"{sanitise_for_terminal(str(out_dir))}: "
+            f"{sanitise_for_terminal(refusal, max_len=200)}"
+        )
+        raise ValueError(msg)
+    out_dir = out_dir.resolve()
     manifest_path = BUILTIN_SEED_CORPUS_DIR / "manifest.json"
     if not manifest_path.is_file():
         msg = f"built-in seed corpus manifest missing: {manifest_path}"
@@ -475,7 +524,10 @@ def prepare_builtin_seed_corpus(out_dir: Path, profile: str = "default") -> dict
     for item, name, source_rel in selected:
         source = BUILTIN_SEED_CORPUS_DIR / source_rel
         destination = out_dir / name
-        shutil.copyfile(source, destination)
+        # Exclusive-create copy: copyfile opens the destination with
+        # O_TRUNC and follows a symlink surviving the reset (built-in
+        # seeds are small repo-shipped files — whole-read is fine).
+        write_new_bytes(destination, source.read_bytes(), replace=True)
         copied.append({
             "name": name,
             "source": source_rel.as_posix(),
@@ -511,29 +563,73 @@ def _validate_builtin_output_directory(out_dir: Path) -> None:
 
 
 def _reset_builtin_output(out_dir: Path, seed_names: set[str]) -> None:
+    """Provenance-gated reset, mirroring ``_reset_generated_output``:
+    only content a generator-written ``manifest.json`` proves is ours
+    may be deleted. Seed names are ordinary-looking filenames, so an
+    operator-chosen out_dir can legitimately contain same-named
+    entries this generator never wrote — on first contact (no
+    manifest) or under a foreign/corrupt manifest, refuse loudly
+    rather than destroy foreign data. Directories are NEVER removed
+    recursively: this generator only ever writes flat seed FILES, so
+    a colliding directory is foreign by construction.
+    """
     generated_names = set(seed_names)
     existing_manifest = out_dir / "manifest.json"
+    ours = False
     if existing_manifest.is_file():
-        # Manifest from a previous run of this generator; missing /
-        # corrupt / oversize degrade to "no previous manifest".
+        # Corrupt / oversize / non-object manifests are treated as
+        # foreign — the safe direction.
         previous = load_json(existing_manifest, max_bytes=64 * 1024 * 1024)
-        if previous is None:
+        if not isinstance(previous, dict):
             previous = {}
-        if previous.get("source") == "raptor_builtin_seed_corpus":
-            for seed in previous.get("seeds") or []:
-                destination = str(seed.get("destination") or "")
-                if destination and "/" not in destination and "\\" not in destination and ".." not in destination:
-                    generated_names.add(destination)
-        existing_manifest.unlink()
+        ours = previous.get("source") == "raptor_builtin_seed_corpus"
+        if not ours:
+            msg = (
+                f"refusing to reset {out_dir}: manifest.json was not "
+                "written by the built-in seed corpus generator — pick "
+                "an empty or generator-owned output directory"
+            )
+            raise ValueError(msg)
+        seeds = previous.get("seeds")
+        for seed in seeds if isinstance(seeds, list) else []:
+            if not isinstance(seed, dict):
+                continue
+            destination = str(seed.get("destination") or "")
+            if destination and "/" not in destination and "\\" not in destination and ".." not in destination:
+                generated_names.add(destination)
 
-    for name in generated_names:
-        path = out_dir / name
+    colliding = [
+        out_dir / name for name in sorted(generated_names)
+        if (out_dir / name).exists() or (out_dir / name).is_symlink()
+    ]
+    if colliding and not ours:
+        names = ", ".join(p.name for p in colliding)
+        msg = (
+            f"refusing to reset {out_dir}: {names} exist but no "
+            "generator-written manifest.json proves they came from a "
+            "previous corpus run — pick an empty or generator-owned "
+            "output directory"
+        )
+        raise ValueError(msg)
+    foreign_dirs = [
+        p for p in colliding if p.is_dir() and not p.is_symlink()
+    ]
+    if foreign_dirs:
+        names = ", ".join(p.name for p in foreign_dirs)
+        msg = (
+            f"refusing to reset {out_dir}: {names} are directories — "
+            "the generator only writes flat seed files, so these were "
+            "not written by a previous corpus run"
+        )
+        raise ValueError(msg)
+
+    if ours:
+        existing_manifest.unlink()
+    for path in colliding:
         try:
-            if path.is_file() or path.is_symlink():
-                path.unlink()
-            elif path.is_dir():
-                shutil.rmtree(path)
-        except (FileNotFoundError, OSError):
+            path.unlink()
+        except OSError:
+            # Best-effort: the copy that follows overwrites in place.
             pass
 
 

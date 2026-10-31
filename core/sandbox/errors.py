@@ -7,6 +7,12 @@ without pulling in the sandbox machinery or risking a circular import.
 
 from __future__ import annotations
 
+import subprocess
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # annotation-only; no runtime import (tiers imports us)
+    from .tiers import ContainmentTier
+
 # Process exit code a RAPTOR CLI uses to signal "sandbox isolation could
 # not engage" across a process boundary. BaseException propagation only
 # works in-process; when a parent (e.g. /agentic, /scan) spawns scanner.py
@@ -67,16 +73,19 @@ class SandboxSetupError(BaseException):
     diagnostic.
 
     ``setup_category`` carries the exec-status-pipe category letter
-    (M/L/S/U/X/P/F — see ``core/sandbox/_spawn._write_setup_status``)
-    when the raise site holds one, else ``None``. The distinction a
-    consumer can act on: ``"X"`` means every isolation layer engaged
-    and the failure was the target's own exec inside the sandbox — a
-    per-invocation condition (binary transiently unexecutable, e.g.
-    ETXTBSY from a lingering writer; a path outside the bind set) that
-    a caller with retry semantics may legitimately re-attempt at FULL
-    isolation. Every other category (and ``None``) means isolation
-    itself could not engage, where a retry cannot help and the
-    fail-loud contract stands.
+    (M/L/S/U/X/P/F/C, or the synthetic '!' for a spawn child that died
+    mid-setup without reaching any reporting site — see
+    ``core/sandbox/_spawn._write_setup_status``) when the raise site
+    holds one, else ``None``. The distinction a consumer can act on:
+    ``"X"`` means every isolation layer engaged and the failure was
+    the target's own exec inside the sandbox — a per-invocation
+    condition (binary transiently unexecutable, e.g. ETXTBSY from a
+    lingering writer; a path outside the bind set) that a caller with
+    retry semantics may legitimately re-attempt at FULL isolation.
+    ``"!"`` is also per-invocation (external SIGKILL / OOM landed on
+    the setup child) but says nothing about isolation. Every other
+    category (and ``None``) means isolation itself could not engage,
+    where a retry cannot help and the fail-loud contract stands.
     """
 
     def __init__(self, reason: str, instructions: str = "",
@@ -88,3 +97,81 @@ class SandboxSetupError(BaseException):
         if instructions:
             msg = f"{reason}\n  → {instructions}"
         super().__init__(msg)
+
+
+class SandboxDisableRefusedError(SandboxSetupError):
+    """A CLI sandbox disable (``--no-sandbox`` / ``--sandbox none``)
+    was requested without a matching-authority consent — refused.
+
+    The disable is a request for tier NONE, honoured only when
+    ``core.sandbox.disable_consent.resolve_disable_consent`` finds a
+    consent source (interactive TTY on stdin+stderr, or a validated
+    launcher/CI-minted nonce). Refusal means the run STOPS — the
+    request is never silently downgraded to "run sandboxed anyway"
+    (which would quietly invert the operator's stated intent) and
+    never granted with a warning.
+
+    BaseException semantics are inherited deliberately: a broad
+    ``except Exception`` between the argparse boundary and the run
+    proper must not be able to swallow the refusal and proceed —
+    in either direction (bare OR sandboxed) proceeding would decide
+    a posture question the gate just refused to decide. CLI entry
+    points route this through ``parser.error`` (clean exit-2 UX);
+    library callers see the exception itself.
+    """
+
+
+class SandboxFloorError(SandboxSetupError):
+    """Containment floor could not be met — the target never executed.
+
+    Raised by the floor contract (``core/sandbox/tiers.py``) when the
+    tier a call requires (its *floor*) exceeds the tier the selected
+    lane delivers: at the entry-time check for statically-knowable
+    shapes, and at the hard pre-exec dispatch assertion for every
+    demotion route. Chained (``raise ... from``) to the original
+    backend failure when a demotion carried one, so the environmental
+    cause stays diagnosable.
+
+    Subclass, not fields-on-parent: existing ``except``/``isinstance``
+    sites and the ``SANDBOX_ENGAGE_EXIT_CODE`` cross-process convention
+    keep working unchanged; only code that NAMES the subtype gets the
+    structured fields. BaseException semantics are inherited — the
+    "never masquerade as 0 findings" guarantee is untouched.
+
+    ``achievable`` carries the tier the refused lane would have
+    delivered; ``floor`` carries the required tier. Both are
+    :class:`~core.sandbox.tiers.ContainmentTier` values (annotation
+    only — this module stays dependency-free; ``tiers.py`` imports us,
+    never the reverse at runtime).
+    """
+
+    def __init__(self, reason: str, instructions: str = "", *,
+                 achievable: "ContainmentTier",
+                 floor: "ContainmentTier",
+                 setup_category: str | None = None) -> None:
+        super().__init__(reason, instructions,
+                         setup_category=setup_category)
+        self.achievable = achievable
+        self.floor = floor
+
+
+class SandboxCancelled(subprocess.SubprocessError):
+    """Raised when a caller-owned cancellation fd becomes readable.
+
+    Mirrors ``subprocess.TimeoutExpired``'s partial-output attributes while
+    keeping cancellation semantically distinct from a deadline.
+    """
+
+    def __init__(
+        self,
+        cmd,
+        *,
+        output=None,
+        stderr=None,
+    ) -> None:
+        self.cmd = cmd
+        self.output = output
+        self.stdout = output
+        self.stderr = stderr
+        self.cancelled = True
+        super().__init__(f"Command {cmd!r} cancelled")

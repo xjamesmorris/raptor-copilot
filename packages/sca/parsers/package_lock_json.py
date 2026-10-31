@@ -31,7 +31,9 @@ import logging
 from typing import Any, TYPE_CHECKING
 
 from ..models import Confidence, Dependency, PinStyle
+from ._base import PARSE_ESCAPE_ERRORS, build_purl, lockfile_confidence
 from . import _safe_read, register
+from ._npm_alias import split_npm_alias
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -57,7 +59,7 @@ def parse(path: Path) -> list[Dependency]:
         return []
     try:
         data = _json.loads(text)
-    except _json.JSONDecodeError as e:
+    except (_json.JSONDecodeError, *PARSE_ESCAPE_ERRORS) as e:  # type: ignore[misc]  # hostile-input escape classes
         logger.warning(
             "sca.parsers.package_lock: JSON parse failed for %s: %s", path, e
         )
@@ -78,7 +80,9 @@ def parse(path: Path) -> list[Dependency]:
 
 def _parse_v2_or_v3(data: dict[str, Any], path: Path) -> list[Dependency]:
     packages = data["packages"]
-    direct_names = _direct_names_from_root(packages.get("", {}))
+    root_entry = packages.get("", {})
+    direct_names = _direct_names_from_root(root_entry)
+    alias_targets = _alias_targets_from_root(root_entry)
 
     deps: list[Dependency] = []
     for key, entry in packages.items():
@@ -92,15 +96,36 @@ def _parse_v2_or_v3(data: dict[str, Any], path: Path) -> list[Dependency]:
         # elsewhere — skip.
         if entry.get("link") is True:
             continue
-        name = _name_from_packages_key(key, entry)
-        if name is None:
+        # ``path_name`` is the install-folder name — for an aliased
+        # install (``"my-lodash": "npm:lodash@^4"``) that's the ALIAS;
+        # the installed package comes from the entry's explicit
+        # ``name`` field (npm writes it whenever it differs from the
+        # folder), with the root manifest's alias-target map as the
+        # fallback for lockfiles that omit it. The fallback applies to
+        # TOP-LEVEL installs only: the root echo describes depth-1
+        # folders, and a nested ``node_modules/a/node_modules/ms`` is
+        # the REAL ms even when the root aliases the name ``ms`` to
+        # something else — renaming it would both invent findings for
+        # a package that isn't installed and hide the real one's
+        # advisories.
+        path_name = _name_from_packages_key(key)
+        if path_name is None:
             continue
+        depth1 = key.count("node_modules/") == 1
+        explicit = entry.get("name")
+        name = (explicit if isinstance(explicit, str) and explicit
+                else (alias_targets.get(path_name) if depth1 else None)
+                or path_name)
+        alias = path_name if path_name != name else None
         version = entry.get("version") if isinstance(entry.get("version"), str) else None
         scope = _scope_from_packages_entry(entry)
 
         pin_style, version_for_record = _classify_packages_entry(entry, version)
+        # The root's dependency buckets list DECLARED names — the
+        # alias spelling for aliased deps — so directness matches on
+        # the install-folder name, not the installed package.
         is_direct = (key.count("node_modules/") == 1
-                     and name in direct_names)
+                     and path_name in direct_names)
 
         deps.append(Dependency(
             ecosystem=ECOSYSTEM,
@@ -111,8 +136,9 @@ def _parse_v2_or_v3(data: dict[str, Any], path: Path) -> list[Dependency]:
             is_lockfile=True,
             pin_style=pin_style,
             direct=is_direct,
-            purl=_build_purl(name, version_for_record),
+            purl=build_purl("npm", name, version_for_record),
             parser_confidence=_confidence(pin_style, version_for_record),
+            alias_name=alias,
         ))
     return deps
 
@@ -128,22 +154,41 @@ def _direct_names_from_root(root_entry: dict[str, Any]) -> set[str]:
     return names
 
 
-def _name_from_packages_key(key: str, entry: dict[str, Any]) -> str | None:
-    """Extract the package name from a packages-map key.
+def _name_from_packages_key(key: str) -> str | None:
+    """Extract the install-folder name from a packages-map key.
 
     npm uses install-path keys like ``"node_modules/foo"`` or
     ``"node_modules/@scope/bar"``. Nested ``node_modules`` (a deep
     transitive copy) yields keys like ``"node_modules/a/node_modules/b"``;
     the relevant name is the rightmost ``node_modules/...`` segment.
+    For an aliased install this is the ALIAS spelling — callers
+    resolve the installed package separately.
     """
-    explicit = entry.get("name")
-    if isinstance(explicit, str) and explicit:
-        return explicit
     marker = "node_modules/"
     idx = key.rfind(marker)
     if idx == -1:
         return None
     return key[idx + len(marker):]
+
+
+def _alias_targets_from_root(root_entry: dict[str, Any]) -> dict[str, str]:
+    """Map declared alias → installed package from the root manifest
+    echo (``"my-lodash": "npm:lodash@^4.17.21"``). Fallback for
+    lockfile rows that omit the explicit ``name`` field."""
+    if not isinstance(root_entry, dict):
+        return {}
+    targets: dict[str, str] = {}
+    for key, _scope in _ROOT_KEY_SCOPE:
+        block = root_entry.get(key)
+        if not isinstance(block, dict):
+            continue
+        for declared, spec in block.items():
+            if not (isinstance(declared, str) and isinstance(spec, str)):
+                continue
+            split = split_npm_alias(spec)
+            if split is not None and split[0] != declared:
+                targets[declared] = split[0]
+    return targets
 
 
 def _scope_from_packages_entry(entry: dict[str, Any]) -> str:
@@ -209,10 +254,26 @@ def _walk_v1(
         # Pathological depth; npm-real trees rarely exceed 30. Stop
         # recursion to bound work.
         return
-    for name, entry in deps_block.items():
-        if not isinstance(name, str) or not isinstance(entry, dict):
+    for declared, entry in deps_block.items():
+        if not isinstance(declared, str) or not isinstance(entry, dict):
             continue
         version = entry.get("version") if isinstance(entry.get("version"), str) else None
+        # v1 records an aliased install as
+        # ``"my-lodash": {"version": "npm:lodash@4.17.21"}`` — the
+        # installed package and its real version live INSIDE the
+        # version string. Record the real package (advisory lookups
+        # key on ``name``; the alias spelling previously became the
+        # name and the ``npm:…`` string the version, hiding the
+        # installed package's advisories) and keep the alias for
+        # display / fix-materialisation.
+        name = declared
+        alias: str | None = None
+        if version is not None:
+            split = split_npm_alias(version)
+            if split is not None:
+                name = split[0]
+                version = split[1] or None
+                alias = declared if name != declared else None
         scope = "main"
         if entry.get("dev") is True:
             scope = "dev"
@@ -239,9 +300,12 @@ def _walk_v1(
             scope=scope,
             is_lockfile=True,
             pin_style=pin_style,
-            direct=(depth == 0 and name in direct_names),
-            purl=_build_purl(name, version),
+            # The v1 tree is keyed by DECLARED names, so directness
+            # matches on the declared spelling (the alias, if any).
+            direct=(depth == 0 and declared in direct_names),
+            purl=build_purl("npm", name, version),
             parser_confidence=_confidence(pin_style, version),
+            alias_name=alias,
         ))
 
         nested = entry.get("dependencies")
@@ -258,21 +322,15 @@ def _walk_v1(
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-def _build_purl(name: str, version: str | None) -> str:
-    base = f"pkg:npm/{name}"
-    if version:
-        return f"{base}@{version}"
-    return base
-
 
 def _confidence(pin_style: PinStyle, version: str | None) -> Confidence:
-    if pin_style is PinStyle.GIT:
-        return Confidence("medium", reason="package-lock.json git source")
-    if pin_style is PinStyle.PATH:
-        return Confidence("medium", reason="package-lock.json file/url source")
-    if version is None:
-        return Confidence("low", reason="package-lock.json entry without version")
-    return Confidence("high", reason="package-lock.json resolved entry")
+    return lockfile_confidence(
+        pin_style, version,
+        git_reason="package-lock.json git source",
+        path_reason="package-lock.json file/url source",
+        unversioned_reason="package-lock.json entry without version",
+        resolved_reason="package-lock.json resolved entry",
+    )
 
 
 # ``npm-shrinkwrap.json`` is byte-identical to package-lock.json in

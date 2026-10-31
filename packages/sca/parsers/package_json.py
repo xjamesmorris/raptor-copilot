@@ -17,6 +17,13 @@ Scope mapping:
 Pin-style classification covers npm's range grammar; anything we can't
 classify drops to ``unknown`` rather than guessing.
 
+npm aliases (``"my-lodash": "npm:lodash@^4.17.21"``): the dep row
+records the REAL (installed) package as ``name`` — advisory lookups,
+purls, and cross-run identity key on what actually ships — with the
+manifest's alias spelling preserved in ``alias_name``. All npm-family
+parsers (package.json, package-lock.json, yarn.lock, pnpm-lock.yaml)
+follow the same rule.
+
 Modern monorepo / workspace specs:
 
 - ``workspace:^1.0.0``, ``workspace:*``, ``workspace:~`` (pnpm /
@@ -67,8 +74,10 @@ import re
 from pathlib import Path
 
 from ..models import Confidence, Dependency, PinStyle
+from ._base import PARSE_ESCAPE_ERRORS, build_purl, manifest_confidence
 from ..versions import semver
 from . import _safe_read, register
+from ._npm_alias import split_npm_alias as _split_npm_alias
 
 logger = logging.getLogger(__name__)
 
@@ -84,8 +93,16 @@ _DEP_BUCKETS = (
 
 # Comparator characters that indicate a multi-bound range, e.g.
 # ">=1.0.0 <2.0.0" or "1.0.0 - 2.0.0". Used after ruling out caret/tilde.
-_RANGE_CHARS = set("<>=|") | {" - "}
-_HEX_SHA = re.compile(r"^[0-9a-f]{7,40}$", re.IGNORECASE)
+# Range markers: single comparator/union chars plus the spaced-hyphen
+# range form — all substring-tested uniformly (a tuple, not a set
+# union of chars and a string, which only worked by the accident of
+# set iteration feeding a substring check).
+_RANGE_MARKERS = ("<", ">", "=", "|", " - ")
+# A git object name is hex, 7-40 chars — but an ALL-DIGIT string of
+# that length is far likelier a bare version ("1234567" as a datelike
+# or build number) than a commit that happens to spell only digits;
+# require at least one hex LETTER before classifying as a git pin.
+_HEX_SHA = re.compile(r"^(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}$", re.IGNORECASE)
 _BARE_VERSION = re.compile(r"^v?\d+(?:\.\d+){0,2}(?:[-+].+)?$")
 
 
@@ -203,14 +220,19 @@ def _load(path: Path) -> dict[str, object] | None:
 
     try:
         data = _json.loads(text)
-    except _json.JSONDecodeError as e:
+    except (_json.JSONDecodeError, *PARSE_ESCAPE_ERRORS) as e:  # type: ignore[misc]  # hostile-input escape classes
         logger.warning(
             "sca.parsers.package_json: JSON parse failed for %s: %s", path, e
         )
         return None
     if not isinstance(data, dict):
+        # Canonical parse-failed shape so the whole-file failure lands
+        # in the run report's structured parse_failures (a repo of
+        # array-rooted package.json files must not read as a clean
+        # "0 deps analysed").
         logger.warning(
-            "sca.parsers.package_json: top-level not an object in %s", path
+            "sca.parsers.package_json: JSON parse failed for %s: "
+            "top-level is not an object", path,
         )
         return None
     return data
@@ -391,7 +413,7 @@ def _build_dep(
                 name=name, version=None, declared_in=path, scope=scope,
                 is_lockfile=False, pin_style=PinStyle.UNKNOWN,
                 direct=True,
-                purl=_build_purl(name, None),
+                purl=build_purl("npm", name, None),
                 parser_confidence=Confidence(
                     "low",
                     reason=(
@@ -403,23 +425,41 @@ def _build_dep(
             )
 
     pin_style, version, npm_alias_target = _classify(spec)
-    purl_name = npm_alias_target or name
+    # npm alias (``"my-lodash": "npm:lodash@^4.17.21"``): the REAL
+    # (installed) package is the canonical name — OSV queries key on
+    # ``Dependency.name``, so recording the alias spelling hid the
+    # installed package's advisories (a lockfile-less project with an
+    # aliased manifest entry queried the alias name and missed every
+    # advisory). The manifest's literal spelling is preserved in
+    # ``alias_name`` for display and fix-materialisation.
+    real_name = npm_alias_target or name
+    alias_name = name if npm_alias_target and npm_alias_target != name else None
     # Record the semver corridor (caret/tilde/range -> floor & ceiling) so
     # harden can place a ranged dep relative to its floor and keep a bump
-    # inside the ceiling. Exact / git / alias specs yield (None, None).
-    version_floor, version_ceiling = semver.bounds(spec)
+    # inside the ceiling. For an alias the corridor comes from the range
+    # AFTER the alias target. Exact / git specs yield (None, None).
+    corridor_spec = spec
+    if npm_alias_target:
+        alias_split = _split_npm_alias(spec)
+        corridor_spec = alias_split[1] if alias_split else ""
+    elif spec.startswith("npm:"):
+        # Bare protocol form (``npm:^2.1.3``) — the range follows the
+        # prefix directly.
+        corridor_spec = spec[len("npm:"):]
+    version_floor, version_ceiling = semver.bounds(corridor_spec)
 
     return Dependency(
         ecosystem=ECOSYSTEM,
-        name=name,
+        name=real_name,
         version=version,
         declared_in=path,
         scope=scope,
         is_lockfile=False,
         pin_style=pin_style,
         direct=True,
-        purl=_build_purl(purl_name, version),
+        purl=build_purl("npm", real_name, version),
         parser_confidence=_confidence(pin_style, version),
+        alias_name=alias_name,
         version_floor=version_floor,
         version_ceiling=version_ceiling,
     )
@@ -429,7 +469,7 @@ def _classify(spec: str) -> tuple[PinStyle, str | None, str | None]:
     """Return (pin_style, version_for_record, npm_alias_target_or_None).
 
     For an alias like ``"npm:lodash@^4.17.0"``, the alias target is
-    returned so the purl reflects the actual installed package; the spec
+    returned so the dep records the actual installed package; the spec
     governing the pin style is the right-hand side.
     """
     if not spec:
@@ -437,16 +477,21 @@ def _classify(spec: str) -> tuple[PinStyle, str | None, str | None]:
 
     # npm: alias → recurse on the right-hand side.
     if spec.startswith("npm:"):
-        rest = spec[len("npm:"):]
-        if "@" in rest[1:]:
-            sep = rest.rindex("@")
-            target = rest[:sep] if sep > 0 else rest
-            inner_spec = rest[sep + 1:] if sep > 0 else ""
-        else:
-            target = rest
-            inner_spec = ""
+        split = _split_npm_alias(spec)
+        if split is None:
+            rest = spec[len("npm:"):]
+            if rest.startswith("@"):
+                # Malformed scope-shaped target (``npm:@scope`` with
+                # no name) — not a range either; don't let the scope
+                # marker leak into the version/purl.
+                return PinStyle.UNKNOWN, None, None
+            # ``npm:<range>`` protocol form — classify the range for
+            # the declared name itself.
+            pin, ver, _ = _classify(rest)
+            return pin, ver, None
+        target, inner_spec = split
         pin, ver, _ = _classify(inner_spec)
-        return pin, ver, target or None
+        return pin, ver, target
 
     # ``workspace:`` references (pnpm + Yarn Berry) — internal
     # workspace package, not a registry entry. Marked as PATH so OSV
@@ -488,7 +533,7 @@ def _classify(spec: str) -> tuple[PinStyle, str | None, str | None]:
         return PinStyle.TILDE, spec[1:].strip() or None, None
 
     # Multi-bound or comparator-based range.
-    if any(ch in spec for ch in _RANGE_CHARS) or " - " in spec:
+    if any(marker in spec for marker in _RANGE_MARKERS):
         return PinStyle.RANGE, spec, None
 
     # Bare version: treat as exact unless it's a SHA (which npm allows
@@ -503,24 +548,16 @@ def _classify(spec: str) -> tuple[PinStyle, str | None, str | None]:
 
 
 def _confidence(pin_style: PinStyle, version: str | None) -> Confidence:
-    if pin_style is PinStyle.UNKNOWN:
-        return Confidence("low", reason="package.json spec unrecognised")
-    if pin_style in (PinStyle.GIT, PinStyle.PATH):
-        return Confidence(
-            "medium",
-            reason="package.json points to git/path source; version best-effort",
-        )
-    if version is None:
-        return Confidence("medium", reason="package.json wildcard version")
-    return Confidence("high", reason="package.json structured field")
+    return manifest_confidence(
+        pin_style, version,
+        unrecognised_reason="package.json spec unrecognised",
+        git_path_reason=(
+            "package.json points to git/path source; version best-effort"
+        ),
+        unpinned_reason="package.json wildcard version",
+        pinned_reason="package.json structured field",
+    )
 
-
-def _build_purl(name: str, version: str | None) -> str:
-    """Build an npm purl. Scoped packages keep the leading ``@``."""
-    base = f"pkg:npm/{name}"
-    if version:
-        return f"{base}@{version}"
-    return base
 
 
 register(filenames=["package.json"])(parse)

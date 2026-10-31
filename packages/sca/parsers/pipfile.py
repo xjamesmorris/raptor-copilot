@@ -34,6 +34,8 @@ import sys
 from typing import Any, TYPE_CHECKING
 
 from ..models import Confidence, Dependency, PinStyle
+from ..naming import pep503_name
+from ._base import PARSE_ESCAPE_ERRORS, build_purl, manifest_confidence
 from . import _safe_read, register
 
 if TYPE_CHECKING:
@@ -46,7 +48,7 @@ ECOSYSTEM = "PyPI"
 # tomllib is stdlib on 3.11+; older interpreters need the `tomli` backport.
 _tomllib = None
 if sys.version_info >= (3, 11):
-    import tomllib as _tomllib            # type: ignore[no-redef]
+    import tomllib as _tomllib            # type: ignore[no-redef,assignment]
 else:                                     # pragma: no cover — env-dependent
     try:
         import tomli as _tomllib          # type: ignore[no-redef]
@@ -78,7 +80,7 @@ def parse(path: Path) -> list[Dependency]:
         return []
     try:
         data = _tomllib.loads(text)
-    except _tomllib.TOMLDecodeError as e:
+    except (_tomllib.TOMLDecodeError, *PARSE_ESCAPE_ERRORS) as e:  # hostile-input escape classes
         logger.warning(
             "sca.parsers.pipfile: TOML parse failed for %s: %s", path, e,
         )
@@ -137,14 +139,14 @@ def _build_dep(
 
     return Dependency(
         ecosystem=ECOSYSTEM,
-        name=_normalise_name(name),
+        name=pep503_name(name),
         version=version,
         declared_in=path,
         scope=scope,
         is_lockfile=False,
         pin_style=pin_style,
         direct=True,
-        purl=_build_purl(name, version),
+        purl=build_purl("pypi", pep503_name(name), version),
         parser_confidence=_confidence(pin_style, version),
         version_floor=floor,
         version_ceiling=ceiling,
@@ -190,28 +192,15 @@ def _classify_fallback(
     return PinStyle.UNKNOWN, None, None, None
 
 
-def _normalise_name(name: str) -> str:
-    """PEP 503 normalisation, same as the requirements parser."""
-    return re.sub(r"[-_.]+", "-", name).lower()
-
-
-def _build_purl(name: str, version: str | None) -> str:
-    base = f"pkg:pypi/{_normalise_name(name)}"
-    if version:
-        return f"{base}@{version}"
-    return base
-
 
 def _confidence(pin_style: PinStyle, version: str | None) -> Confidence:
-    if pin_style is PinStyle.UNKNOWN:
-        return Confidence("low", reason="Pipfile spec unrecognised")
-    if pin_style in (PinStyle.GIT, PinStyle.PATH):
-        return Confidence(
-            "medium", reason="Pipfile git/path source; version best-effort",
-        )
-    if version is None:
-        return Confidence("medium", reason="Pipfile unpinned entry")
-    return Confidence("high", reason="Pipfile structured spec")
+    return manifest_confidence(
+        pin_style, version,
+        unrecognised_reason="Pipfile spec unrecognised",
+        git_path_reason="Pipfile git/path source; version best-effort",
+        unpinned_reason="Pipfile unpinned entry",
+        pinned_reason="Pipfile structured spec",
+    )
 
 
 __all__ = ["parse"]

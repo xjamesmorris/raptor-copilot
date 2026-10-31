@@ -1,6 +1,7 @@
 """Tests for Ghidra diff priority filter."""
 
 import json
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -203,3 +204,143 @@ class TestApplyDiffPriority:
         reason = result["files"][0]["items"][0]["priority_reason"]
         assert "binary-oracle" in reason
         assert "ghidra-diff" in reason
+
+
+class TestChecklistWriteChokepoint:
+    def test_boost_write_routes_through_update_checklist(
+        self, tmp_path, version_diff, checklist,
+    ):
+        """checklist.json has concurrent lock-free readers and an
+        integrity token minted only at the core.inventory write
+        chokepoint — the boost write must route through the
+        ``update_checklist`` RMW (flock + atomic replace + re-stamp),
+        never a raw load + save that preserves a stale frame token
+        (which would read back tampered and brick the checklist)."""
+        import core.inventory as inv
+
+        real_update = inv.update_checklist
+        calls = []
+
+        def spy(output_dir, transform_fn):
+            calls.append(Path(output_dir))
+            return real_update(output_dir, transform_fn)
+
+        with patch(
+            "packages.ghidra.diff_priority._find_version_diff",
+            return_value=version_diff,
+        ), patch.object(inv, "update_checklist", spy):
+            n = apply_diff_priority(tmp_path, checklist)
+
+        assert n == 2
+        assert tmp_path in calls
+        # And the content survived the accessor path.
+        data = json.loads(checklist.read_text())
+        parse = next(
+            i for i in data["files"][0]["items"]
+            if i["function"] == "parse_input"
+        )
+        assert parse["priority"] == "high"
+
+    def test_stamped_checklist_stays_verified_after_boost(
+        self, tmp_path, version_diff,
+    ):
+        """A frame-stamped checklist run through apply_diff_priority
+        must still read VERIFIED afterward — the boost write re-mints
+        the token instead of preserving the stale one."""
+        from core.inventory import checklist_frame_mac, read_checklist, save_checklist
+
+        save_checklist(tmp_path, {
+            "files": [{
+                "path": "src/main.c",
+                "items": [
+                    {"function": "parse_input", "name": "parse_input",
+                     "priority": "medium"},
+                ],
+            }],
+        })
+        cl = tmp_path / "checklist.json"
+        assert checklist_frame_mac.FRAME_TOKEN_KEY in json.loads(cl.read_text())
+
+        with patch(
+            "packages.ghidra.diff_priority._find_version_diff",
+            return_value=version_diff,
+        ):
+            n = apply_diff_priority(tmp_path, cl)
+
+        assert n == 1
+        on_disk = json.loads(cl.read_text())
+        assert checklist_frame_mac.frame_provenance(
+            on_disk, checklist_frame_mac.frame_binding(tmp_path),
+            checklist_frame_mac.FORM_SINGLE,
+        ) == checklist_frame_mac.FRAME_VERIFIED
+        data = read_checklist(tmp_path)
+        assert data["files"][0]["items"][0]["priority"] == "high"
+
+    def test_tampered_checklist_never_boosted_or_laundered(
+        self, tmp_path, version_diff,
+    ):
+        """A tampered frame is refused by the gated read: no boost,
+        and the artifact is left byte-identical (never rewritten
+        under a fresh stamp)."""
+        from core.inventory import save_checklist
+
+        save_checklist(tmp_path, {
+            "files": [{
+                "path": "src/main.c",
+                "items": [
+                    {"function": "parse_input", "name": "parse_input",
+                     "priority": "medium"},
+                ],
+            }],
+        })
+        cl = tmp_path / "checklist.json"
+        on_disk = json.loads(cl.read_text())
+        on_disk["files"][0]["items"][0]["priority"] = "low"  # in-place edit
+        cl.write_text(json.dumps(on_disk))
+        before = cl.read_text()
+
+        with patch(
+            "packages.ghidra.diff_priority._find_version_diff",
+            return_value=version_diff,
+        ):
+            n = apply_diff_priority(tmp_path, cl)
+
+        assert n == 0
+        assert cl.read_text() == before
+
+
+class TestFindVersionDiffOutBase:
+    def test_fallback_glob_uses_configured_out_base(
+            self, tmp_path, monkeypatch):
+        # A bare Path("out") resolved against the process CWD — any
+        # caller not launched from the repo root silently got "no
+        # version diff" (diff priority skipped, no error).
+        from packages.ghidra.diff_priority import _find_version_diff
+
+        out_base = tmp_path / "custom-out"
+        diff_dir = out_base / "ghidra-diff-20260914"
+        diff_dir.mkdir(parents=True)
+        (diff_dir / "version-diff.json").write_text('{"added": []}')
+
+        from core.config import RaptorConfig
+        monkeypatch.setattr(
+            RaptorConfig, "get_out_dir", staticmethod(lambda: out_base))
+
+        # A project resolves but carries no diff in its run dirs —
+        # the glob fallback lane. It must search the CONFIGURED base
+        # even from a foreign CWD.
+        class _Project:
+            def get_run_dirs(self):
+                return []
+
+        class _Mgr:
+            def find_project_for_target(self, target):
+                return _Project()
+
+        import core.project.project as project_mod
+        monkeypatch.setattr(project_mod, "ProjectManager", _Mgr)
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+        found = _find_version_diff(tmp_path / "no-such-target")
+        assert found == diff_dir / "version-diff.json"

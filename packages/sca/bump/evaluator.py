@@ -39,6 +39,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from ..kinds import BUMP_ID_PREFIX
 from ..models import Confidence, Dependency, PinStyle, SupplyChainFinding
 
 logger = logging.getLogger(__name__)
@@ -243,7 +244,7 @@ def _platform_compat_regression_finding(
 ) -> SupplyChainFinding:
     return SupplyChainFinding(
         finding_id=(
-            f"sca:supply_chain:platform_compat_regression:PyPI:{name}:"
+            f"{BUMP_ID_PREFIX}platform_compat_regression:PyPI:{name}:"
             f"{target_version}:{pair.arch}"
         ),
         kind="platform_compat_regression",
@@ -273,7 +274,7 @@ def _platform_compat_improvement_finding(
 ) -> SupplyChainFinding:
     return SupplyChainFinding(
         finding_id=(
-            f"sca:supply_chain:platform_compat_improvement:PyPI:{name}:"
+            f"{BUMP_ID_PREFIX}platform_compat_improvement:PyPI:{name}:"
             f"{target_version}:{pair.arch}"
         ),
         kind="platform_compat_improvement",
@@ -366,12 +367,24 @@ def _npm_version_publish(
 
 def _parse_iso(ts: str) -> datetime | None:
     """ISO-8601 parser that tolerates trailing ``Z`` and missing
-    fractional seconds (covers both PyPI and npm shapes)."""
+    fractional seconds (covers both PyPI and npm shapes).
+
+    Always returns an AWARE datetime: PyPI's legacy ``upload_time``
+    field is naive-UTC (``2026-09-20T12:00:00``, no offset — the
+    only shape the ``upload_time_iso_8601``-missing fallback ever
+    sees in the wild), and a naive result poisons every downstream
+    comparison against aware ``now`` / sibling timestamps with
+    TypeError — killing the whole supply-chain evaluation for the
+    candidate.
+    """
     cleaned = ts.replace("Z", "+00:00")
     try:
-        return datetime.fromisoformat(cleaned)
+        parsed = datetime.fromisoformat(cleaned)
     except ValueError:
         return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -594,7 +607,7 @@ def _install_hook_added_finding(
     )
     return SupplyChainFinding(
         finding_id=(
-            f"sca:bump:install_hook:{ecosystem}:{name}"
+            f"{BUMP_ID_PREFIX}install_hook:{ecosystem}:{name}"
             f"@{current_version}->{target_version}"
         ),
         kind="install_hook_suspicious",
@@ -662,7 +675,7 @@ def _install_hook_body_change_finding(
     }
     return SupplyChainFinding(
         finding_id=(
-            f"sca:bump:install_hook_body_change:{ecosystem}:{name}"
+            f"{BUMP_ID_PREFIX}install_hook_body_change:{ecosystem}:{name}"
             f"@{current_version}->{target_version}"
         ),
         kind="install_hook_suspicious",
@@ -750,7 +763,7 @@ def _recent_publish_finding(
     days = max(0, age.days)
     return SupplyChainFinding(
         finding_id=(
-            f"sca:bump:recent_publish:{ecosystem}:{name}@{target_version}"
+            f"{BUMP_ID_PREFIX}recent_publish:{ecosystem}:{name}@{target_version}"
         ),
         kind="recent_publish",
         dependency=placeholder_dep,
@@ -821,7 +834,7 @@ def _maintainer_change_finding(
     )
     return SupplyChainFinding(
         finding_id=(
-            f"sca:bump:maintainer_change:{ecosystem}:{name}"
+            f"{BUMP_ID_PREFIX}maintainer_change:{ecosystem}:{name}"
             f"@{current_version}->{target_version}"
         ),
         kind="maintainer_change",

@@ -616,3 +616,45 @@ class TestCli:
             tmp_path / "b.label.json", function_id="src/a.c:other",
         )
         assert collect_label_files([tmp_path / "d", b]) == [a, b]
+
+
+class TestProvenanceCheck:
+    """Vulnerable-class labels need public provenance (cve or
+    fix_commit); the lint surfaces the gap as a WARNING, never a
+    failure."""
+
+    def test_vulnerable_label_without_provenance_warns(self, tmp_path):
+        p = _write_label(
+            tmp_path / "a.label.json", expected_status="finding",
+        )
+        warnings = lint.provenance_check([(p, load_label(p))])
+        assert len(warnings) == 1
+        assert "public provenance" in warnings[0]
+
+    def test_fix_commit_satisfies_provenance(self, tmp_path):
+        p = _write_label(
+            tmp_path / "a.label.json",
+            expected_status="finding",
+            fix_commit="https://github.com/x/y/commit/abc123",
+        )
+        label = load_label(p)
+        assert label.fix_commit.endswith("abc123")
+        assert lint.provenance_check([(p, label)]) == []
+
+    def test_cve_satisfies_provenance(self, tmp_path):
+        p = _write_label(
+            tmp_path / "a.label.json",
+            expected_status="suspicious", cve="CVE-2024-0001",
+        )
+        assert lint.provenance_check([(p, load_label(p))]) == []
+
+    def test_clean_label_needs_no_provenance(self, tmp_path):
+        p = _write_label(tmp_path / "a.label.json")
+        assert lint.provenance_check([(p, load_label(p))]) == []
+
+    def test_warning_does_not_fail_schema_mode(self, tmp_path):
+        _write_label(
+            tmp_path / "a.label.json", expected_status="finding",
+        )
+        rc = lint.main([str(tmp_path), "--mode", "schema"])
+        assert rc == 0

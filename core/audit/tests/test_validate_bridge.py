@@ -291,6 +291,77 @@ class TestImportAuditEvidence:
         )
         assert not result.has_content
 
+    def test_in_flight_audit_sibling_skipped(self, tmp_path):
+        # A neighbour session's still-running audit sibling has a
+        # PARTIAL findings.json / layer0-findings.json — it must never
+        # be imported as Stage A evidence.
+        target = tmp_path / "src"
+        target.mkdir()
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+
+        running = project_dir / "audit_20260712"
+        running.mkdir()
+        _write_audit_findings(running, target)
+        (running / ".raptor-run.json").write_text(json.dumps(
+            {"target": str(target), "status": "running"},
+        ))
+
+        validate_dir = project_dir / "validate_20260713"
+        validate_dir.mkdir()
+
+        result = import_audit_evidence(
+            validate_dir, target, project_dir=project_dir,
+        )
+        assert not result.has_content
+
+    def test_in_flight_sibling_does_not_shadow_completed_one(self, tmp_path):
+        # A newer in-flight sibling sorts first; the completed older
+        # run must still import.
+        target = tmp_path / "src"
+        target.mkdir()
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+
+        completed = project_dir / "audit_20260710"
+        completed.mkdir()
+        _write_audit_findings(completed, target)
+
+        running = project_dir / "audit_20260712"
+        running.mkdir()
+        _write_audit_findings(running, target)
+        (running / ".raptor-run.json").write_text(json.dumps(
+            {"target": str(target), "status": "running"},
+        ))
+
+        validate_dir = project_dir / "validate_20260713"
+        validate_dir.mkdir()
+
+        result = import_audit_evidence(
+            validate_dir, target, project_dir=project_dir,
+        )
+        assert result.has_content
+        assert result.source_dir == str(completed)
+
+    def test_colocated_dir_exempt_from_in_flight_guard(self, tmp_path):
+        # Shared --out handoff: the co-located dir carries THIS run's
+        # own status=running manifest — the guard must not veto it.
+        target = tmp_path / "src"
+        target.mkdir()
+
+        validate_dir = tmp_path / "shared_out"
+        validate_dir.mkdir()
+        _write_audit_findings(validate_dir, target)
+        (validate_dir / ".raptor-run.json").write_text(json.dumps(
+            {"target": str(target), "status": "running"},
+        ))
+
+        result = import_audit_evidence(validate_dir, target)
+        assert result.has_content
+        assert result.source_dir == str(validate_dir)
+
 
 def _write_history_findings(d):
     """A /validate findings.json with mixed rulings."""
@@ -843,3 +914,57 @@ class TestTargetlessChecklist:
             audit_dir, target, project_dir=project_dir,
         )
         assert result.source_command == "validate (project sibling)"
+
+
+class TestTargetMatchResolution:
+    """The checklist branch of _check_target_match must resolve both
+    sides like the manifest branch — a symlinked spelling of the same
+    target is the same target."""
+
+    def test_symlinked_checklist_target_matches(self, tmp_path):
+        real = tmp_path / "real-src"
+        real.mkdir()
+        link = tmp_path / "link-src"
+        link.symlink_to(real)
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        sibling = project_dir / "validate-20260913-1"
+        sibling.mkdir()
+        (sibling / "checklist.json").write_text(json.dumps({
+            "target": str(link), "items": [],
+        }))
+        _write_validate_findings(sibling)
+        audit_dir = project_dir / "audit_x"
+        audit_dir.mkdir()
+
+        result = import_validate_evidence(
+            audit_dir, real, project_dir=project_dir,
+        )
+        assert result.source_command == "validate (project sibling)"
+
+
+class TestColocatedGatePrefix:
+    """The co-located gate must probe a prefix of the findings list,
+    not only findings[0]: a genuine /validate dir whose first finding
+    lacks both feasibility and ruling is still validate output."""
+
+    def test_gate_scans_beyond_first_finding(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("RAPTOR_DIR", str(tmp_path))
+        audit_dir = tmp_path / "out-dir"
+        audit_dir.mkdir()
+        findings = [
+            {"id": "F0", "function": "helper", "file": "src/util.c"},
+            {
+                "id": "F1", "function": "parse_header", "file": "src/http.c",
+                "feasibility": {
+                    "verdict": "likely_exploitable", "chain_breaks": [],
+                },
+                "final_status": "exploitable",
+            },
+        ]
+        (audit_dir / "findings.json").write_text(
+            json.dumps({"findings": findings}),
+        )
+        result = import_validate_evidence(audit_dir, tmp_path / "src")
+        assert result.source_command == "validate (co-located)"
+        assert result.feasibility_verdicts

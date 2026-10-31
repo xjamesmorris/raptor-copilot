@@ -13,6 +13,7 @@ from packages.fuzzing.crash_attribution import (
     _parse_srcs,
     _root_orig_seeds,
     attribute_crashes,
+    attribute_crashes_from_seeds,
     load_seed_provenance,
     manifest_path_for_run,
 )
@@ -259,11 +260,102 @@ class TestAttributeCrashes:
         assert summary.unattributed == 1
 
 
+class TestAttributeFromSeeds:
+    """The in-memory entry point the /fuzz CLI uses — provenance from
+    the seeds list this run's own synthesis returned, no disk read."""
+
+    _SEED_ENTRY = TestAttributeCrashes._SEED_ENTRY
+
+    def test_end_to_end_attribution_no_manifest_file(self, tmp_path):
+        # No manifest file exists anywhere on disk: the in-memory list
+        # alone drives the attribution.
+        afl, files = _mk_afl_tree(
+            tmp_path,
+            [_ORIG_A, "id:000002,src:000000,op:havoc,rep:2"],
+            ["id:000000,sig:06,src:000002,op:havoc,rep:1"],
+        )
+        summary = attribute_crashes_from_seeds(
+            [_crash(files[0])], [self._SEED_ENTRY])
+        assert summary.attributed["000000"].origin_id == "F-001"
+        assert summary.unattributed == 0
+
+    def test_in_memory_wins_over_planted_disk_manifest(self, tmp_path):
+        # A regular-file manifest on disk naming the same seed with a
+        # different origin must not leak into the result.
+        afl, files = _mk_afl_tree(
+            tmp_path, [_ORIG_A], ["id:000000,sig:06,src:000000,op:havoc"],
+        )
+        _mk_manifest(tmp_path, [{**self._SEED_ENTRY,
+                                 "origin_id": "ATTACKER"}])
+        summary = attribute_crashes_from_seeds(
+            [_crash(files[0])], [self._SEED_ENTRY])
+        assert summary.attributed["000000"].origin_id == "F-001"
+
+    def test_malformed_seed_entries_degrade_soft(self, tmp_path):
+        afl, files = _mk_afl_tree(
+            tmp_path, [_ORIG_A], ["id:000000,sig:06,src:000000,op:havoc"],
+        )
+        crash = _crash(files[0])
+        for seeds in (None, "not-a-list", {}, [None, "x", {"no": "seed"}]):
+            summary = attribute_crashes_from_seeds([crash], seeds)
+            assert not summary.attributed
+            assert summary.unattributed == 1
+
+
 class TestProvenanceLoading:
     def test_manifest_path_for_run(self, tmp_path):
         assert manifest_path_for_run(tmp_path) == (
             tmp_path / SEED_DIR_NAME / MANIFEST_NAME
         )
+
+    def test_manifest_path_refuses_planted_seed_dir_name(self, tmp_path):
+        """The seed synthesis refuses a plant at the smt-seeds name
+        and leaves it in place — this post-campaign read-back must not
+        traverse it: a symlink-to-directory would route the manifest
+        read through an attacker-chosen directory whose content then
+        labels crash provenance."""
+        attacker = tmp_path / "attacker"
+        attacker.mkdir()
+        run_out = tmp_path / "run"
+        run_out.mkdir()
+        (run_out / SEED_DIR_NAME).symlink_to(attacker)
+        assert manifest_path_for_run(run_out) is None
+
+        run_out2 = tmp_path / "run2"
+        run_out2.mkdir()
+        (run_out2 / SEED_DIR_NAME).write_text("occupied")
+        assert manifest_path_for_run(run_out2) is None
+
+        # Direction two: a REAL seed dir keeps the path.
+        run_out3 = tmp_path / "run3"
+        (run_out3 / SEED_DIR_NAME).mkdir(parents=True)
+        assert manifest_path_for_run(run_out3) == (
+            run_out3 / SEED_DIR_NAME / MANIFEST_NAME
+        )
+
+    def test_provenance_never_read_through_symlinked_manifest(
+        self, tmp_path, caplog,
+    ):
+        """A symlink planted at the predictable manifest name must be
+        refused without being followed — following it reads an
+        operator-readable file and republishes excerpts of it as crash
+        provenance."""
+        target = tmp_path / "operator-file.json"
+        target.write_text(json.dumps(
+            {"seeds": [{"seed": "s1", "origin_id": "OPERATOR-SECRET"}]},
+        ))
+        link = tmp_path / MANIFEST_NAME
+        link.symlink_to(target)
+
+        with caplog.at_level(
+            "WARNING", logger="packages.fuzzing.crash_attribution",
+        ):
+            prov = load_seed_provenance(link)
+
+        assert prov == {}
+        assert link.is_symlink()  # left in place
+        assert any("not a regular file" in r.getMessage()
+                   for r in caplog.records)
 
     def test_load_ignores_entries_without_seed(self, tmp_path):
         manifest = _mk_manifest(
@@ -386,3 +478,70 @@ class TestDuplicateCrashIds:
         summary = attribute_crashes([_crash(f) for f in files], manifest)
         assert sorted(summary.attributed) == ["000000", "000001"]
         assert summary.unattributed == 0
+
+
+class TestInstanceNameValidation:
+    def test_dotdot_instance_name_rejected(self, tmp_path):
+        """A crash filename can smuggle exactly one path hop
+        (`,instance:..` — a filename cannot contain '/'), which joins
+        the queue walk one level ABOVE the AFL out dir. Instance
+        names are RAPTOR-chosen (main / secondaryN) — validate the
+        parsed token so no join can ever leave the out dir."""
+        from packages.fuzzing.crash_attribution import _instance_for_crash
+
+        merged = tmp_path / "afl_out" / "merged_crashes"
+        merged.mkdir(parents=True)
+        crash = merged / "id:000000,sig:11,src:000000,instance:.."
+        crash.write_bytes(b"x")
+        assert _instance_for_crash(crash) is None
+
+    def test_normal_instance_names_still_parse(self, tmp_path):
+        from packages.fuzzing.crash_attribution import _instance_for_crash
+
+        merged = tmp_path / "afl_out" / "merged_crashes"
+        merged.mkdir(parents=True)
+        for inst in ("main", "secondary1", "sec-2"):
+            crash = merged / f"id:000000,sig:11,instance:{inst}"
+            crash.write_bytes(b"x")
+            located = _instance_for_crash(crash)
+            assert located is not None and located[0] == inst
+
+
+class TestSeedProvenanceShapes:
+    def test_list_shaped_manifest_returns_empty(self, tmp_path):
+        from packages.fuzzing.crash_attribution import load_seed_provenance
+
+        manifest = tmp_path / "smt-seeds-manifest.json"
+        manifest.write_text('["junk"]', encoding="utf-8")
+        assert load_seed_provenance(manifest) == {}
+
+
+def test_hostile_sync_token_breaks_chain_never_misroots():
+    """A queue entry's sync token rides the same target-writable
+    filename channel — an out-of-alphabet source instance must break
+    the chain (unattributed), never resolve against a guessed queue."""
+    from packages.fuzzing.crash_attribution import _root_orig_seeds
+
+    indexes = {
+        "main": {
+            "000001": "id:000001,sync:..,src:000002",
+        },
+        "..": {
+            "000002": "id:000002,orig:planted-root",
+        },
+    }
+    requested: list[str] = []
+
+    def index_for(inst: str) -> dict:
+        requested.append(inst)
+        return indexes.get(inst, {})
+
+    roots = _root_orig_seeds(
+        "id:000000,sig:11,src:000001",
+        "main",
+        index_for,
+    )
+    assert roots is None
+    assert ".." not in requested, (
+        "hostile sync token was path-joined into a queue lookup"
+    )

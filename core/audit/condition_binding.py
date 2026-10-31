@@ -67,11 +67,14 @@ _KEYWORDS: frozenset[str] = frozenset({
     "sizeof", "strlen", "wcslen",
 })
 
-# Struct/field access patterns
-_FIELD_RE = re.compile(r"([a-zA-Z_]\w*)(?:->|\.)([a-zA-Z_]\w*)")
+# Struct/field access patterns. \b pins each attempt to an
+# identifier start: unanchored, a hostile word run retries every
+# suffix — quadratic. A mid-word start ('x1f' inside '0x1f') was a
+# false token, not an identifier.
+_FIELD_RE = re.compile(r"\b([a-zA-Z_]\w*)(?:->|\.)([a-zA-Z_]\w*)")
 
 # Array subscript: arr[idx]
-_SUBSCRIPT_RE = re.compile(r"([a-zA-Z_]\w*)\s*\[")
+_SUBSCRIPT_RE = re.compile(r"\b([a-zA-Z_]\w*)\s*\[")
 
 
 def extract_identifiers(text: str) -> frozenset[str]:
@@ -108,7 +111,7 @@ def extract_sink_arg_identifiers(
     used as arguments. This is a best-effort text extraction — for
     precise analysis, use the AST/CST layer.
     """
-    lines = source.split("\n")
+    lines = source.split("\n")  # line-model: callers deliver \n-model text (universal-newline reads / split_lines span joins)
     if sink_line < 1 or sink_line > len(lines):
         return frozenset()
 
@@ -258,7 +261,7 @@ def check_guard_binding(
         # - Direct variable match: 0.9
         # - Auth/config always-relevant: 0.7
         # - No overlap but guard has few identifiers (might be aliased): 0.4
-        # - Clear no-overlap: 0.9 confidence it's decorative
+        # - Clear no-overlap: 0.85 confidence it's decorative
         if bound:
             conf = 0.9
         elif always_relevant:

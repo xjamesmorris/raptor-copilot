@@ -14,6 +14,7 @@ import contextlib
 
 import pytest
 
+from core.llm.accounting import CostBasis
 from core.llm.cc_adapter import StreamJsonResult
 from core.llm.config import ModelConfig
 from core.llm.providers import ClaudeCodeLLMProvider
@@ -39,6 +40,7 @@ def _tool_call_result(session_id: str, x_value: str) -> StreamJsonResult:
         },
         session_id=session_id,
         cost_usd=0.01,
+        cost_reported=True,
         input_tokens=10,
         output_tokens=5,
     )
@@ -96,6 +98,8 @@ def test_resumed_turn_skips_echo_of_own_prior_turn(resumable_provider) -> None:
     ]
     resp1 = provider.turn(messages, tools)
     call1 = resp1.content[0]
+    assert resp1.cost_observation.basis is CostBasis.CLI_REPORTED
+    assert resp1.cost_observation.estimated_usd == 0.01
 
     # The loop echoes the provider's own turn back, then appends the
     # tool result.

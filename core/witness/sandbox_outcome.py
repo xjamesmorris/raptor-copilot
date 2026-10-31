@@ -25,6 +25,101 @@ from typing import Any
 
 from core.witness.types import WitnessOutcome
 
+# Canonical status string for "the environment refused to execute the
+# payload at the required containment tier" — the sandbox floor
+# contract's verdict at the verification seam. Deliberately NOT a new
+# ``WitnessOutcome`` / verdict enum member: producers keep their
+# existing error-shaped vocabulary (``verdict="error"``,
+# ``WitnessOutcome.UNKNOWN``, a refused ``ProfileVerdict``) and carry
+# this status inside their structured detail payload instead, so no
+# schema consumer needs to learn a new terminal value. Explicitly
+# neither confirmed nor refuted — an unverifiable environment is not
+# a negative result.
+UNVERIFIABLE_ENVIRONMENT = "unverifiable_environment"
+
+
+def _tier_str(value: Any) -> str:
+    """Posture label for a ContainmentTier (``"mount-ns"``), falling
+    back to ``str(value)`` for anything the lattice doesn't know."""
+    try:
+        from core.sandbox.tiers import tier_label
+
+        return tier_label(value)
+    except (ImportError, KeyError, ValueError):
+        return str(value)
+
+
+def refusal_detail(exc: BaseException) -> dict[str, str] | None:
+    """Canonical unverifiable-environment payload for a containment-
+    floor refusal, or ``None`` when ``exc`` is not one.
+
+    The shared chokepoint of the sandbox floor contract's
+    verification-seam mapping: the attacker-payload executors
+    (dark_verify, exploit_verify, under_mitigations) each catch
+    :class:`~core.sandbox.errors.SandboxFloorError` at their own seam
+    — they do not share an exception-handling site — and every arm
+    derives its structured "unverifiable environment" outcome from
+    this one function, so the payload shape cannot drift per caller.
+
+    Semantics are record-then-raise: the catching arm records this
+    payload on the finding it was verifying, then RE-RAISES the
+    error. A floor refusal is host-deterministic — every subsequent
+    payload run on the host refuses identically — so the stage fails
+    loudly at the first refusal with exactly one surfaced record,
+    and a misconfigured CI host cannot masquerade as N benign
+    "error" verdicts. ``None`` means the arm must not map: re-raise
+    (or fall through to) the caller's existing handling unchanged.
+
+    ``core.witness`` still does not import ``core.sandbox`` at module
+    level — the isinstance check imports lazily, and a
+    ``SandboxFloorError`` instance can only exist in a process where
+    that import succeeds.
+
+    Payload keys (all strings, flat, JSON-safe):
+
+    * ``status`` — :data:`UNVERIFIABLE_ENVIRONMENT`.
+    * ``floor`` / ``achievable`` — posture labels of the required
+      and deliverable containment tiers (``"mount-ns"``,
+      ``"landlock"``, ...).
+    * ``remedies`` — the refusal's operator-facing remedy text
+      (``exc.instructions``; may be empty).
+    * ``failure_mode`` — ``"constrained_by_env"``, matching
+      ``core.labeled_attempts.types.FailureMode.CONSTRAINED_BY_ENV``
+      so attempt-record writers classify the non-success as
+      environmental without re-deriving it.
+    """
+    try:
+        from core.sandbox.errors import SandboxFloorError
+    except ImportError:
+        return None
+    if not isinstance(exc, SandboxFloorError):
+        return None
+    return {
+        "status": UNVERIFIABLE_ENVIRONMENT,
+        "floor": _tier_str(exc.floor),
+        "achievable": _tier_str(exc.achievable),
+        "remedies": exc.instructions or "",
+        "failure_mode": "constrained_by_env",
+    }
+
+
+def refusal_summary_line(detail: dict[str, str], count: int = 1) -> str:
+    """The one-line run-summary rendering of a floor refusal.
+
+    One canonical shape shared by every recording arm so operator
+    output cannot drift: sourced from the structured payload, never
+    from log scraping. Under record-then-raise ``count`` is 1 by
+    construction (the first refusal fails the stage); the parameter
+    exists so a future cross-run aggregator can reuse the wording.
+    """
+    remedies = detail.get("remedies") or "(none recorded)"
+    return (
+        f"{count} execution(s) refused: environment cannot meet the "
+        f"containment floor ({detail.get('floor', '?')} required, "
+        f"{detail.get('achievable', '?')} achievable) — remedies: "
+        f"{remedies}"
+    )
+
 
 def outcome_from_sandbox_info(
     sandbox_info: dict[str, Any] | None,

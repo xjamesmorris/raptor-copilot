@@ -36,7 +36,11 @@ and whether the enumeration was verified complete
 (``enumeration_complete``). Completeness is earned only by an
 uncapped textual tree scan whose address-taken sweep finds no
 indirect-call escape of the callee — call-graph-driven enumerations
-are never marked complete. Consumers that ACT on a ``refuted``
+are never marked complete. The documented soundness bounds — the
+file/site/match budgets, the byte cap, AND the argument-span bound
+(a call-shaped match whose argument list stays unbalanced within
+``_balanced_span``'s window cannot be parsed into a site) — each
+set an honesty flag when hit; any of them vetoes completeness. Consumers that ACT on a ``refuted``
 verdict (the caller-contract confidence-demotion gate) must require
 completeness; a refutation over a possibly-partial caller list is a
 hint, not a receipt.
@@ -46,14 +50,24 @@ from __future__ import annotations
 
 import bisect
 import logging
+import os
 import re
 from dataclasses import dataclass, field
+from core.source.lines import split_lines
 from pathlib import Path
+
+from core.paths import confine
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 RULE_ID = "api_boundary:caller-contract"
+
+#: Evidence marker for a bounded-contract site whose argument is a
+#: pinned integer literal — decidable in neither direction without
+#: the numeric bound.  Consumers key aggregate prose off this string;
+#: keep it in sync with the ``bounded`` branch of ``_check_site``.
+BOUNDED_CONST_EVIDENCE_MARKER = "pinned to compile-time constant"
 
 _IDENT = r"[A-Za-z_]\w*"
 
@@ -84,11 +98,15 @@ _EXTERNAL_ENV_RE = re.compile(
 )
 
 # Common C casts stripped when reducing an argument to its base
-# identifier.
+# identifier. The optional pointer star gates its own trailing
+# whitespace (``(?:\*\s*)?``): the naive ``\s*\*?\s*\)`` put two
+# unbounded whitespace spans around the optional star, quadratic on
+# a cast-shaped token followed by a whitespace run with no ``)``.
+# Match set unchanged.
 _CAST_RE = re.compile(
     r"\(\s*(?:const\s+)?(?:unsigned\s+|signed\s+)?"
     r"(?:size_t|ssize_t|u?int(?:8|16|32|64)?_t|int|long(?:\s+long)?"
-    r"|short|char|void|off_t|ptrdiff_t)\s*\*?\s*\)",
+    r"|short|char|void|off_t|ptrdiff_t)\s*(?:\*\s*)?\)",
 )
 
 _UNSIGNED_VALUED_RE = re.compile(
@@ -120,10 +138,14 @@ _SINGLE_CALL_RE = re.compile(
 
 # The explicitly named target of an invoked-twice claim ("if a caller
 # invokes bitmap_free twice").  Pronouns and generic nouns are not
-# names.
+# names. The optional ``()`` carries its own leading whitespace
+# ((?:\s*\(\s*\))?\s+): the naive ``\s*(?:\(\s*\))?\s+`` put two
+# unbounded whitespace spans around the optional atom, quadratic on
+# a call-verb + name followed by a whitespace run with no keyword.
+# Match set unchanged.
 _INVOKE_TARGET_RE = re.compile(
     r"(?:call(?:s|ed|ing)?|invoke[sd]?|invoking|re-?invoke[sd]?)\s+"
-    r"([A-Za-z_]\w*)\s*(?:\(\s*\))?\s+"
+    r"([A-Za-z_]\w*)(?:\s*\(\s*\))?\s+"
     r"(?:twice|again|more\s+than\s+once|a\s+second\s+time|"
     r"multiple\s+times|repeatedly)",
     re.IGNORECASE,
@@ -167,7 +189,8 @@ _CALLER_CONDITIONAL_RE = re.compile(
 class Contract:
     """One asserted caller obligation, bound to a callee parameter."""
 
-    kind: str          # "null" | "negative" | "single_call" | "external"
+    # "null" | "negative" | "single_call" | "bounded" | "external"
+    kind: str
     param: str = ""    # callee parameter name ("" for external)
     param_index: int = -1
 
@@ -180,6 +203,11 @@ class Contract:
             return (
                 f"callers must not invoke again on the same "
                 f"{self.param} (single-call contract)"
+            )
+        if self.kind == "bounded":
+            return (
+                f"callers must keep {self.param} within the bound "
+                "the flagged arithmetic assumes"
             )
         return f"callers must not pass negative {self.param}"
 
@@ -283,7 +311,10 @@ def is_caller_conditional_hypothesis(text: str) -> bool:
 # caller-obligation shaped: "the consumer must verify origin /
 # signature / integrity before passing the data in" is exactly the
 # asserted-obligation-at-call-sites question this channel answers.
-API_BOUNDARY_CWES = frozenset({"CWE-345"})
+# CWE-573 (improper following of specification by caller) IS the
+# caller-contract violation in class form — dispatched
+# unconditionally like CWE-345.
+API_BOUNDARY_CWES = frozenset({"CWE-345", "CWE-573"})
 
 # CWE families dispatched only when the hypothesis is itself
 # caller-conditional: double free / use-after-free / NULL dereference
@@ -325,7 +356,14 @@ def parse_param_names(defining_source: str, function_name: str) -> list[str]:
             return []
         params_text, end = _balanced_span(defining_source, m.end() - 1)
         if params_text is None:
-            return []
+            # Unbalanced within the span bound (e.g. a planted
+            # over-long argument list at a CALL of the name before
+            # the definition) — skip this match and keep looking for
+            # the real definition instead of going blind.  A
+            # definition whose own parameter list overflows the span
+            # binds nothing and the check abstains downstream.
+            pos = m.end()
+            continue
         # A definition is followed by `{` (possibly after a newline);
         # declarations end in `;`, call sites in anything else.
         if defining_source[end:end + 200].lstrip().startswith("{"):
@@ -375,8 +413,10 @@ def _param_names_from_list(params_text: str) -> list[str]:
         if not param or param in ("void", "..."):
             continue
         # Drop array suffixes / function-pointer noise, keep the last
-        # identifier as the name.
-        param = re.sub(r"\[[^\]]*\]", "", param)
+        # identifier as the name. The suffix window is bounded: an
+        # unbounded `[^\]]*` re-scans a hostile bracket run from
+        # every '[' — quadratic; a real array suffix is tiny.
+        param = re.sub(r"\[[^\]]{0,256}\]", "", param)
         idents = re.findall(_IDENT, param)
         if idents:
             names.append(idents[-1])
@@ -658,12 +698,59 @@ _STMT_KEYWORDS = (
 
 def _looks_like_decl_or_def(line: str, function_name: str) -> bool:
     """Filter out prototypes/definitions when scanning for call sites."""
+    # Linear respelling of the type-prefix span, same language:
+    # ``[A-Za-z_][\w\s\*]*[\s\*]`` folds the old leading identifier
+    # into the wide class (its word-run overlapped the class — every
+    # split of a hostile run was explored) and drops the trailing
+    # ``\s*`` (whitespace is inside both neighbouring classes, so the
+    # extra span matched nothing new).  The qualifier loop is
+    # bounded: each loop-exit point re-scans the type span, so a
+    # planted keyword run made one anchored attempt quadratic in the
+    # line; real declarations carry a handful of qualifiers (a
+    # longer run stops matching).
     return bool(re.match(
-        rf"\s*(?:static\s+|extern\s+|inline\s+|const\s+)*"
+        rf"\s*(?:static\s+|extern\s+|inline\s+|const\s+){{0,8}}"
         rf"(?!(?:{_STMT_KEYWORDS})\b)"
-        rf"(?:{_IDENT}[\w\s\*]*[\s\*])\s*{re.escape(function_name)}\s*\(",
+        rf"(?:[A-Za-z_][\w\s\*]*[\s\*]){re.escape(function_name)}\s*\(",
         line,
     )) or bool(re.match(rf"\s*#\s*define\s+{re.escape(function_name)}\b", line))
+
+
+def _walk_tree_entries(root):
+    """Streaming, name-sorted DFS over the tree.
+
+    Yields every entry (files, dirs, symlinks); symlinked directories
+    are yielded but never descended — exactly ``rglob("*")``'s
+    visitation set. Replaces ``sorted(root.rglob("*"))``, which
+    materialised the WHOLE tree before any scan cap could apply: the
+    caps bound scanning, not the walk, so a huge hostile tree cost
+    the full listing (memory + time) on every call. Explicit stack —
+    repo-shaped nesting must not recurse. Ordering is deterministic
+    name-sorted DFS; it differs from the old full-path lexicographic
+    sort only in dir-vs-file interleaving, observable only past a
+    scan cap.
+    """
+    work: list[tuple[bool, str]] = []
+
+    def _push_children(d: str) -> None:
+        try:
+            with os.scandir(d) as it:
+                entries = sorted(it, key=lambda e: e.name, reverse=True)
+        except OSError:
+            return
+        for e in entries:
+            try:
+                descend = e.is_dir(follow_symlinks=False)
+            except OSError:
+                descend = False
+            work.append((descend, e.path))
+
+    _push_children(str(root))
+    while work:
+        descend, path = work.pop()
+        yield Path(path)
+        if descend:
+            _push_children(path)
 
 
 def _scan_file_for_calls(
@@ -683,6 +770,9 @@ def _scan_file_for_calls(
     report carries the honesty facts consumers must not lose:
     ``size_skipped`` (file over the byte cap — a caller may hide in
     it), ``site_capped`` (site or match budget exhausted),
+    ``span_capped`` (a call-shaped match whose argument list stayed
+    unbalanced within the span bound was dropped — a real call site
+    may be hidden behind an over-long argument list),
     ``definitions`` (lines holding a DEFINITION of the name — used
     for cross-TU ambiguity detection), and ``alias_attr`` (an
     ``alias("name")`` attribute in the raw text — an indirect entry
@@ -690,15 +780,22 @@ def _scan_file_for_calls(
     freport: dict[str, Any] = {
         "size_skipped": False,
         "site_capped": False,
+        "span_capped": False,
         "definitions": [],
         "alias_attr": False,
     }
-    try:
-        if path.stat().st_size > _MAX_FILE_BYTES:
-            freport["size_skipped"] = True
-            return [], freport
-        text = path.read_text(errors="replace")
-    except OSError:
+    # Capped read on the fd, not stat-then-read: the file is
+    # target-writable, so a size check by name followed by an
+    # unbounded read races a growing plant; a FIFO plant would block
+    # a raw read forever. Over-cap keeps the honest size_skipped fact.
+    from core.source import read_text_capped
+
+    got = read_text_capped(path, _MAX_FILE_BYTES)
+    if got is None:
+        return [], freport
+    text, truncated = got
+    if truncated:
+        freport["size_skipped"] = True
         return [], freport
     if function_name not in text:
         return [], freport
@@ -716,8 +813,8 @@ def _scan_file_for_calls(
     from .source_view import sanitized_view
     view = sanitized_view(text, str(path))
     sites: list[dict[str, Any]] = []
-    lines = text.splitlines()
-    view_lines = view.splitlines()
+    lines = split_lines(text)
+    view_lines = split_lines(view)
     call_re = re.compile(rf"(?<![\w.>]){re.escape(function_name)}\s*\(")
     offset = 0
     line_starts: list[int] = []
@@ -760,6 +857,14 @@ def _scan_file_for_calls(
         if in_skip or _looks_like_decl_or_def(line_text, function_name):
             continue
         if args_text is None:
+            # A call-shaped match whose argument list stays
+            # unbalanced within the span bound cannot be parsed into
+            # a site — but it may BE a real call site (one over-long
+            # argument list is trivially plantable).  Dropping it
+            # silently would let a partial site list pass for the
+            # whole caller set; record the honesty event so
+            # completeness claims and the caller-lock witness refuse.
+            freport["span_capped"] = True
             continue
         window_start = max(0, line_no - 1 - _GUARD_WINDOW_LINES)
         window = "\n".join(
@@ -820,8 +925,10 @@ def enumerate_call_sites_with_report(
     present-but-unresolving inventory) — plus the honesty facts a
     consumer needs before treating the list as exhaustive:
     ``scan_capped`` / ``scanned_files`` (bounded file walk),
-    ``site_capped`` (per-run site/match budget hit), ``size_skipped``
-    (files over the byte cap that may hide callers),
+    ``site_capped`` (per-run site/match budget hit), ``span_capped``
+    (a call-shaped match dropped because its argument list stayed
+    unbalanced within the span bound — a call site may be hidden),
+    ``size_skipped`` (files over the byte cap that may hide callers),
     ``extra_definitions`` (same-name definitions OUTSIDE the reviewed
     definition's file — textual sites cannot be attributed to the
     reviewed function), and ``alias_attrs`` (``alias("name")``
@@ -833,6 +940,7 @@ def enumerate_call_sites_with_report(
         "scan_capped": False,
         "scanned_files": 0,
         "site_capped": False,
+        "span_capped": False,
         "size_skipped": 0,
         "extra_definitions": [],
         "alias_attrs": [],
@@ -843,6 +951,8 @@ def enumerate_call_sites_with_report(
             report["size_skipped"] += 1
         if freport.get("site_capped"):
             report["site_capped"] = True
+        if freport.get("span_capped"):
+            report["span_capped"] = True
         if freport.get("alias_attr"):
             report["alias_attrs"].append(rel)
         if rel != def_file:
@@ -860,7 +970,12 @@ def enumerate_call_sites_with_report(
             if not rel or rel in seen_files:
                 continue
             seen_files.add(rel)
-            path = target_path / rel
+            # rel comes from inventory caller records: confine the
+            # join (absolute/../ escapes refuse) and resolve benign
+            # in-root symlinks so the capped reader accepts them.
+            path = confine(target_path, rel)
+            if path is None:
+                continue
             skip = def_span if rel == def_file else None
             budget = _MAX_SITES_ENUMERATED - len(sites)
             if budget <= 0:
@@ -878,9 +993,10 @@ def enumerate_call_sites_with_report(
             report["method"] = "call-graph"
             return sites, report
 
-    # Fallback: bounded tree scan.
+    # Fallback: bounded tree scan (streaming walk — see
+    # _walk_tree_entries).
     scanned = 0
-    for path in sorted(target_path.rglob("*")):
+    for path in _walk_tree_entries(target_path):
         if scanned >= _MAX_SCAN_FILES:
             report["scan_capped"] = True
             break
@@ -891,13 +1007,19 @@ def enumerate_call_sites_with_report(
             rel = str(path.relative_to(target_path))
         except ValueError:
             continue
+        # Resolve through confine: in-tree symlinked sources (bazel-
+        # style link forests) keep contributing sites, while a link
+        # escaping the root refuses instead of being read.
+        resolved = confine(target_path, path)
+        if resolved is None:
+            continue
         skip = def_span if rel == def_file else None
         budget = _MAX_SITES_ENUMERATED - len(sites)
         if budget <= 0:
             report["site_capped"] = True
             break
         found, freport = _scan_file_for_calls(
-            path, rel, function_name, skip_span=skip, max_sites=budget,
+            resolved, rel, function_name, skip_span=skip, max_sites=budget,
         )
         _fold(rel, freport)
         sites.extend(found)
@@ -955,8 +1077,13 @@ def _check_site(
             )
             return check
         if base:
+            # Condition window bounded: an unbounded `[^)]*` costs
+            # every split of a paren-free hostile run from every
+            # `if (` — quadratic. Real conditions sit far under 400
+            # chars; past the bound the guard is not seen, which
+            # only widens the finding.
             guard = re.search(
-                rf"(?:if|while)\s*\([^)]*(?:!\s*{re.escape(base)}\b"
+                rf"(?:if|while)\s*\([^)]{{0,400}}(?:!\s*{re.escape(base)}\b"
                 rf"|{re.escape(base)}\s*[!=]=\s*NULL"
                 rf"|NULL\s*[!=]=\s*{re.escape(base)}\b"
                 rf"|\b{re.escape(base)}\b\s*(?:&&|\)))",
@@ -991,8 +1118,9 @@ def _check_site(
             check.evidence = "unsigned-valued argument"
             return check
         if base:
+            # Bounded condition window (see the NULL-guard scan).
             guard = re.search(
-                rf"(?:if|while)\s*\([^)]*{re.escape(base)}\s*"
+                rf"(?:if|while)\s*\([^)]{{0,400}}{re.escape(base)}\s*"
                 rf"(?:<\s*0|<=\s*0|>=\s*0|>\s*0)",
                 window,
             )
@@ -1009,6 +1137,53 @@ def _check_site(
 
     if contract.kind == "single_call":
         return _check_single_call_site(site, check, base, callee, arg)
+
+    if contract.kind == "bounded":
+        # A bounded contract carries no concrete numeric bound (the
+        # receipt that asserted it does not carry one across the
+        # promotion boundary), so a pinned integer literal is
+        # decidable in NEITHER direction: it cannot be judged
+        # violating (no bound to exceed) and it must not be graded
+        # upholding (the pinned value may itself exceed the bound the
+        # flagged arithmetic assumes).  Literals stay "undecided"
+        # with a constant-specific receipt, and the kind never
+        # returns "unguarded" — the aggregate can refute
+        # (sizeof-bounded sites) or decline, never confirm.
+        if re.fullmatch(r"(?:0[xX][0-9a-fA-F]+|\d+)[uUlL]*", stripped):
+            check.evidence = (
+                f"operand {BOUNDED_CONST_EVIDENCE_MARKER} {stripped} "
+                "— no numeric bound available to adjudicate"
+            )
+            return check
+        # Tested on the raw argument: the cast-stripper reads a
+        # parenthesised type operand ("sizeof(int)") as a cast.
+        if re.match(r"sizeof\s*\(", arg):
+            check.verdict = "guarded"
+            check.evidence = (
+                "sizeof-valued argument — bounded by an in-repo "
+                "object/type size"
+            )
+            return check
+        if base:
+            # Bounded condition window (see the NULL-guard scan).
+            guard = re.search(
+                rf"\b(?:if|while|assert\w{{0,64}}|BUG_ON|ASSERT|CHECK)\s*\("
+                rf"[^;)]{{0,400}}\b{re.escape(base)}\b\s*(?:<=?|>=?|==)",
+                window,
+            )
+            if guard:
+                check.verdict = "guarded"
+                check.grade = "lexical"
+                check.evidence = (
+                    f"range check in the window (lexical — no "
+                    f"dominance proof): {guard.group(0).strip()}"
+                )
+                return check
+        check.evidence = (
+            "argument not provably bounded (no sizeof, no range "
+            "check in the window)"
+        )
+        return check
 
     check.evidence = f"unsupported contract kind {contract.kind!r}"
     return check
@@ -1028,7 +1203,10 @@ _BRANCH_TOKEN_RE = re.compile(
 # callee may not return (exit/abort/longjmp) or may change the
 # argument's state — a "literal double invocation" separated by
 # another call is not literal.
-_INTERVENING_CALL_RE = re.compile(r"[A-Za-z_]\w*\s*\(")
+# \b-pinned to a word start: unanchored, the identifier scan
+# re-reads a hostile word run from every offset (quadratic);
+# dropped matches are mid-word suffix false tokens only.
+_INTERVENING_CALL_RE = re.compile(r"\b[A-Za-z_]\w*\s*\(")
 
 # A type-shaped token directly preceding an identifier: parameter or
 # local declaration.  Deliberately keyword/`_t`/pointer-star based —
@@ -1048,8 +1226,18 @@ def _declared_locally(before_body: str, base: str) -> bool:
     multiple callers in sequence, which no per-caller analysis can
     order — so refutation must decline."""
     b = re.escape(base)
+    # A type token must precede the identifier: a bare-star
+    # alternative made the deref-store `*g = x;` (assignment THROUGH
+    # g, not a declaration OF g) read as a local declaration and
+    # weakened this decline-to-refute rule. Pointer declarators are
+    # already covered by the type branch (`char *p`, `int a, *p` —
+    # the `[\s*]` tail matches the star).
     return bool(re.search(
-        rf"(?:\b(?:{_DECL_TYPE_TOKENS})\b[^;(){{}}=]*[\s*]|\*\s*)"
+        # Type-to-name window bounded: a separator fill keeps the \b
+        # live at every planted type keyword, so an unbounded window
+        # is re-scanned per keyword — quadratic on hostile source
+        # (400 is far above real declaration spans).
+        rf"\b(?:{_DECL_TYPE_TOKENS})\b[^;(){{}}=]{{0,400}}[\s*]"
         rf"{b}\s*[=;,)\[]",
         before_body,
     ))
@@ -1094,7 +1282,12 @@ def _single_call_precall_risk(
             f"address of {base} taken before the call — aliases may "
             "exist"
         )
-    if re.search(rf"(?<![=!<>])=(?!=)[^;\n]*?(?<![\w.>&]){b}\b", before):
+    # RHS window bounded: unbounded, every '=' in a hostile
+    # separator-free run re-scans the rest of the run — quadratic.
+    # A real assignment RHS up to the alias mention sits far under
+    # 160 chars; past the bound the alias is not seen, which only
+    # widens the finding.
+    if re.search(rf"(?<![=!<>])=(?!=)[^;\n]{{0,160}}?(?<![\w.>&]){b}\b", before):
         return (
             f"{base} assigned to another lvalue before the call — "
             "aliases may exist"
@@ -1298,20 +1491,28 @@ def address_taken_occurrences(
     scanned = 0
     capped = False
     size_skipped = 0
+    from core.source import read_text_capped
+
     from .source_view import sanitized_view
-    for path in sorted(target_path.rglob("*")):
+    for path in _walk_tree_entries(target_path):
         if scanned >= _MAX_SCAN_FILES:
             capped = True
             break
         if not path.is_file() or path.suffix.lower() not in _SOURCE_SUFFIXES:
             continue
         scanned += 1
-        try:
-            if path.stat().st_size > _MAX_FILE_BYTES:
-                size_skipped += 1
-                continue
-            text = path.read_text(errors="replace")
-        except OSError:
+        # Capped fd read (not stat-then-read) — same discipline as
+        # the call-site scan above; confine-resolve first so in-tree
+        # symlinked sources keep counting and escaping links refuse.
+        resolved = confine(target_path, path)
+        if resolved is None:
+            continue
+        got = read_text_capped(resolved, _MAX_FILE_BYTES)
+        if got is None:
+            continue
+        text, truncated = got
+        if truncated:
+            size_skipped += 1
             continue
         if function_name not in text:
             continue
@@ -1320,7 +1521,7 @@ def address_taken_occurrences(
         except ValueError:
             continue
         view = sanitized_view(text, str(path))
-        for line_no, line in enumerate(view.splitlines(), start=1):
+        for line_no, line in enumerate(split_lines(view), start=1):
             if (
                 def_span
                 and rel == def_file
@@ -1349,13 +1550,12 @@ def run_api_boundary_check(
     """Adjudicate one caller-contract hypothesis at the API boundary.
     See module docstring for verdict semantics."""
     target_path = Path(target_path)
-    defining_source = ""
-    try:
-        p = target_path / file_path
-        if p.is_file():
-            defining_source = p.read_text(errors="replace")
-    except OSError:
-        pass
+    # ``file_path`` arrives from finding/gap records (LLM-writable):
+    # contained + capped + fd-checked regular, never a bare join —
+    # same class as the smt_promotion_gate caller-gate read.
+    from core.source import read_contained
+
+    defining_source = read_contained(target_path, file_path) or ""
 
     # Wrong-target defence: a hypothesis that names its
     # invoked-twice/called-again target explicitly must name the
@@ -1398,6 +1598,33 @@ def run_api_boundary_check(
             contract=contract.describe(),
         )
 
+    return adjudicate_contract(
+        target_path,
+        file_path,
+        function_name,
+        contract,
+        inventory=inventory,
+        def_span=def_span,
+    )
+
+
+def adjudicate_contract(
+    target_path: Path,
+    file_path: str,
+    function_name: str,
+    contract: Contract,
+    *,
+    inventory: dict[str, Any] | None = None,
+    def_span: tuple[int, int] | None = None,
+) -> ApiBoundaryResult:
+    """Adjudicate one already-bound caller obligation at the API
+    boundary: enumerate in-repo call sites and grade each against the
+    contract.  Shared tail of :func:`run_api_boundary_check` for
+    callers that carry a :class:`Contract` directly (e.g. a
+    precondition re-derived from a tool receipt) instead of a prose
+    hypothesis; verdict and honesty semantics are identical (see
+    module docstring)."""
+    target_path = Path(target_path)
     sites, report = enumerate_call_sites_with_report(
         target_path,
         function_name,
@@ -1437,6 +1664,13 @@ def run_api_boundary_check(
         notes.append(
             "call-site budget exhausted before covering the tree — "
             "enumeration incomplete"
+        )
+    if report.get("span_capped"):
+        notes.append(
+            f"call-shaped match of {function_name} dropped because "
+            "its argument list stayed unbalanced within the span "
+            "bound — a call site may be hidden; enumeration "
+            "incomplete"
         )
     if report.get("size_skipped"):
         notes.append(
@@ -1527,6 +1761,7 @@ def run_api_boundary_check(
         elif not (
             report.get("scan_capped")
             or report.get("site_capped")
+            or report.get("span_capped")
             or report.get("size_skipped")
             or report.get("alias_attrs")
         ):

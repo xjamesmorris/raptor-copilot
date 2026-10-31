@@ -1,0 +1,4841 @@
+"""Repo-wide census of the blank-run-quadratic regex idiom.
+
+The idiom: a pattern compiled with ``re.MULTILINE`` whose ``^`` anchor
+is immediately followed by an UNBOUNDED quantifier over an atom that
+can match a newline (``^\\s*``, ``^\\s+``, ``^[\\s#]*`` ...).  Applied
+to whole file content (``finditer``/``findall``/``search``), the ``^``
+matches at every line start inside a run of blank lines and the
+quantifier re-scans the remainder of the run from each of them —
+O(n^2) on n blank lines.  Scanned-repo files are attacker-supplied, so
+a planted megabyte of whitespace turns a scan pass into tens of
+minutes per pattern, with no timeout on these paths.
+
+The fix discipline is horizontal-only whitespace at the anchor
+(``[^\\S\\n]``): line-leading indent never spans lines, the match set
+on real inputs is unchanged, and the scan is linear.
+
+This census exists because the idiom kept being fixed one FILE FAMILY
+at a time while identical siblings shipped elsewhere.  It derives the
+member set mechanically — every regex in runtime source, parsed
+structurally — and asserts the set is exactly the allowlist below, so
+the next member fails CI instead of waiting for the next audit.
+
+Scope: runtime source — the shared ``runtime_file_universe()``
+derivation (runtime roots incl. plugins/ hooks and the repo-root
+entry modules) — plus the pattern DATA files the runtime loads and
+compiles with MULTILINE-class flags (derived from the loader, not a
+hardcoded file list).  Tests and dev scripts are out of scope — they
+never receive attacker-controlled file content.
+
+Detection is structural, not textual: patterns are resolved from the
+AST (constants, module-level constant names, f-string/concat parts)
+and parsed with ``re``'s own parser, so spellings like ``^[\\s#]*``,
+``(?m)`` inline flags, and branch-embedded anchors like
+``(?:^|;)\\s*`` are members too, and per-line ``^\\s*`` WITHOUT
+``re.MULTILINE`` (bounded by one line) is not.
+
+Allowlisting a member requires a justification string; the only
+acceptable justifications are structural (the pattern is applied
+per-line via ``.match(line)``, or the input is length-bounded by
+construction).  Prefer fixing the anchor over allowlisting.
+
+TWO-STAGE ARMS (trailing-span and anchor-restart)
+-------------------------------------------------
+
+Two further superlinear mechanisms are censused with a two-stage
+design — a static rule PROPOSES members, an empirical pump oracle
+DISPOSES them:
+
+* **Trailing-span pairs** (Rule C): two adjacent unbounded quantified
+  subpatterns whose consumable character sets intersect, reachable
+  through optional/zero-width atoms, with a FAILABLE continuation
+  after the pair (a required consuming atom OR a failable zero-width
+  ``$`` / backslash-Z / backslash-b / lookaround).  A run of characters from the
+  intersection can be split between the two repeats in O(n) ways and
+  the failing continuation makes the engine try them all — O(n^2)
+  (three overlapping spans: O(n^3)).  Recall against the empirical
+  oracle is 1.00 on the corpus that derived the rule; precision is
+  ~0.56, which is why the oracle stage exists.
+* **Anchor-restart** (Rule R): under ``re.MULTILINE``, a ``^`` anchor
+  followed (not necessarily adjacently) by an unbounded repeat that
+  can cross newlines, with a failable continuation.  Every line start
+  anchors a match attempt whose repeat re-scans the remaining text —
+  O(lines x tail) on planted prefix-shaped lines.  This is the
+  mechanism that survived the anchor-adjacent census above with the
+  newline-crossing repeat one token past the anchor.
+
+The pump oracle synthesizes an attack from the parse tree (prefix
+min-model + pump run + poison for pairs; repeated prefix-shaped lines
+for restarts), times the pattern's OWN call mode (anchored
+``match``/``fullmatch`` call sites are measured anchored) at doubling
+sizes in a hard-killed subprocess, and classifies superlinear at
+growth exponent >= 1.6 with an absolute-time floor that defeats
+timer noise.  The oracle is deterministic and mechanical — no LLM.
+
+The default CI tier never runs the oracle: accepted members (static
+proposals the oracle measured linear) are PINNED in
+``data/redos_trailing_span_expected.json`` with a hash of their
+pattern text, and the default-tier test asserts the live member set
+equals the pinned set.  A new member, a drifted pattern, or a stale
+pin fails CI with regeneration instructions; the regeneration tool
+re-runs the oracle and REFUSES to pin a superlinear member — the fix
+is the only way through.  The nightly tier re-runs the full oracle
+against every pinned verdict.  Members whose attack the synthesizer
+cannot build land in the NOATTACK manual-review lane: a documented
+list this file pins exactly, so the lane cannot grow silently.
+
+PATTERN TABLES: the two-stage arms' universe also covers patterns
+stored in literal TABLES (list/tuple/set/dict constants, including
+constructor-call entries like registry rows) and compiled through a
+loop variable — ``for p in PATTERNS: re.search(p, line)`` never shows
+the resolver a constant operand at the call site, and a table-shaped
+member once shipped a wall-kill pattern that every call-site-only
+sweep missed.  The same family's class-constant spelling
+(``re.match(self.ANSI_PATTERN, line)``) resolves through a per-class
+attribute map, at the call's real flags and mode.  Table entries
+cannot carry call-site flags or an anchored call mode statically, so
+they are judged at WORST CASE (inline flags only, unanchored
+``search``).  A table member that is
+superlinear at worst case but bounded or mode-corrected at every real
+call site lives in the ADJUDICATED lane: pinned by identity in
+``_TABLE_ADJUDICATED`` with its written-down disposition, so the lane
+cannot grow silently and a NEW superlinear table entry still refuses
+to pin.
+
+SCAN-RESTART ARM (Rule S): the unanchored scan-restart family — the
+follow-up arm the boundary below called for.  At a SCANNING call
+site (search/finditer/findall/sub/split), ``re``'s position loop
+attempts a match at every input position; when an unbounded repeat R
+re-scans the remaining hostile run per attempt, cost is O(n^2)+
+WITHOUT nested quantifiers and WITHOUT an adjacent overlapping pair.
+Rule S proposes an unbounded repeat on the concatenation spine with
+a REQUIRED consuming failable continuation whose required prefix
+min-model (the "entry") is drawn from charset(R): entry == "" is the
+leading-density shape (``backslash-s*X``, ``[^.]*X``), entry != "" the
+planted-entry shape (multi-term ``A.*B.*C`` chains, their lazy/DOTALL
+two-term degenerate case ``A.*?B``, head-dense ``,[^;]*x``).  The
+position-density pump — (entry + fill)^k + poison — disposes;
+delimited-literal shapes get the UNTERMINATED-DELIMITER pump — the
+opener once, then repeats of a body unit that embeds the delimiter
+(``"`` + ``\\"``*k, never closing) — because a bare planted entry
+either satisfies the continuation (the plant doubles as the close)
+or halts the repeat, so the density shape prices each attempt at
+O(gap) instead of O(run) on string-literal matchers like
+``"(?:\\.|[^"\\])*"``.
+
+Three further synthesis mechanisms keep the pumps honest:
+
+* BRANCH-VARIANT ENTRIES: entry min-models enumerate every branch
+  alternative on the spine (capped), not just the first generable
+  one — a separator alternation whose first branch is zero-width
+  (``(?:\\A|[;&|(]|\\n)…``) or self-closing (``(?:\"\"\"|/\\*\\*)…``)
+  otherwise hides the dangerous entry from every lane.
+* MULTI-CHAR OPENER: for a non-empty entry, the entry ONCE followed
+  by body-unit repeats — a single attempt whose repeat/continuation
+  split ambiguity is quadratic in the run (bounded-chain shapes like
+  ``head\\(\\s*(?:\\w+\\s*(?:->|\\.)\\s*)+field[,)]``).  Not gated on
+  entry⊆charset: the entry never has to sit inside the repeat's
+  span, which is exactly why the density lanes could not price it.
+* ATTACK-DEGENERACY GUARD: an attack the pattern MATCHES returns
+  from the position loop early and prices nothing, so a matching
+  lane never contributes a linear verdict — the worker retries
+  poison-free (the poison chooser is first-set bounded and a later
+  continuation atom can complete a match it cannot see), then
+  reports the lane unsynthesizable; a member with no non-degenerate
+  lane routes LOUDLY to the manual-review lane.
+
+Per-member lane count is budgeted by ``_SCAN_LANE_CAP``;
+regeneration refuses and the nightly re-check flags any member over
+the cap instead of part-measuring it silently.  Pins live in
+``data/redos_scan_restart_expected.json`` under the same
+propose/refuse/nightly regime as the trailing-span arm, over the
+same universe (call sites and pattern-table entries both).
+
+NESTED-QUANTIFIER ARM (Rule N): the exponential-composition family —
+an EFFECTIVELY-UNBOUNDED repeat (unbounded, or bounded at or above
+``_EFFECTIVELY_UNBOUNDED`` — a large bound only caps the split
+search below the bound, so ``(?:a+){1,5000}`` measures the same
+~2^n as its unbounded twin) whose body can match the same run in
+more than one way, the classic ``(a*)*`` / ``(?:a+)+`` shape.  On a
+failing continuation the engine tries every split of the run between
+the inner and outer repeats — O(2^n) on n pumped characters, so ~100
+bytes of hostile input pin a CPU indefinitely (a difference in kind
+from the polynomial arms above; this arm closes the boundary the
+two-stage arms declared).  Two body-ambiguity conditions, judged on
+the OPTIMIZED parse tree so the rule agrees with the engine
+(``sre_parse`` collapses single-char alternations like
+``(?:\\s|\\n)`` into one character class — no branch survives to the
+engine, so no member):
+
+* **nested variable run**: some path through the body — descending
+  groups, choosing branch arms — carries a repeat able to consume
+  >= 2 distinct nonzero widths of a run (unbounded, or bounded with
+  ``max(lo,1) < hi``) while every sibling on the path can match
+  empty.  A run of the inner repeat's characters then splits between
+  outer iterations in exponentially many ways (``(?:A*|B)*``,
+  ``(?:\\s+|X)+``, ``(?:a{1,2})+``).
+* **branch ambiguity**: a branch (anywhere in the body) two of whose
+  arms can completely match the same single character, or two of
+  whose arms can both match empty (the shape prefix-hoisting leaves
+  behind for same-word arms, ``(a|a)`` -> ``a(?:|)``) — each
+  iteration then carries >= 2 interchangeable derivations, doubling
+  the path count per pumped unit.
+
+Membership additionally requires a FAILABLE continuation after the
+outer repeat (a required consuming atom or a failable zero-width
+assertion): with nothing to fail past the repeat, the greedy first
+parse succeeds and no split is ever retried.  Lookaround and
+atomic-group BODIES are searched too, with the continuation scoped
+to the body: both constructs are atomic (a succeeded one is never
+re-entered), but an ambiguous repeat with an in-body failable
+continuation does its exponential work internally before the
+construct resolves (``(?=(?:v+)+w)`` explodes while the lookahead
+is still being evaluated); a possessive/atomic repeat is never
+itself an outer candidate — its first greedy parse commits, so the
+outer split is never retried.  The FIX for a member is removing
+the ambiguity (single-character base, unambiguous alternation) —
+never merely bounding the outer repeat, which the threshold above
+exists to catch.  Single-stage by design — no pump-oracle pin
+file: a genuine member is exponential, never "linear at the real
+call site", so there is nothing for an empirical stage to dispose;
+the arm reuses the MULTILINE arm's allowlist grammar over the same
+shared universe (call sites, table entries, and the pattern data
+files), and ``_exponential_growth`` (a bounded CPU-time doubling
+probe) is the adjudication tool for any future hit.  Named
+constructed-only boundaries: same-STRING arm overlap longer than
+one character after prefix-hoisting (``(?:foo|f[o0]o)*``) is
+outside the one-char completion check, and an ambiguous-body outer
+bounded BELOW the threshold is deliberate non-membership (the
+bounded-nuisance band — capped-exponential under ~bound-size
+inputs, degree-(bound-1) polynomial beyond; unanchored spellings
+stay Rule S's to measure, ^-anchored ones are accepted residual) —
+the tree sweep at introduction found no live shape of either.
+
+HONEST BOUNDARY — mechanisms NO arm covers with a dedicated rule:
+(1) a trailing ambiguous repeat with NO failable continuation inside
+the pattern, called under ``fullmatch`` — the implicit end-of-string
+requirement is the failable continuation Rule N demands, but it
+lives at the call site, not in the parse tree the rule judges (the
+resolver folds ``fullmatch`` into the anchored ``match`` mode, so
+the spelling is statically invisible; the tree sweep at introduction
+found no anchored-mode site with a trailing ambiguous repeat).  Also
+outside the static universe, by construction: (2)
+patterns assembled or learned at RUNTIME (e.g. discovered-convention
+registries) — no static census can see them; their consumers own
+input bounds; and (3) a pattern table in a module that never binds
+``re`` itself and is compiled by ANOTHER module — cross-module
+constant resolution stays out of the resolver by design, so such a
+table sits with the chained-constant boundary.
+"""
+
+from __future__ import annotations
+
+import ast
+import re
+import sys
+import unicodedata
+import unittest
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+try:  # Python 3.11+
+    from re import _parser as sre_parse  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover - older interpreters
+    import sre_parse  # type: ignore[no-redef]
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+
+from runtime_universe import repo_root, runtime_file_universe  # noqa: E402
+
+# The census sre-parses every EXTRACTED candidate string, including
+# literal alias spellings that runtime code re.escape()s before
+# compiling (e.g. the C++ attribute forms ``[[nodiscard]]``). Parsing
+# those raw trips Python 3.14's nested-set forward-compat
+# FutureWarning; the census only inspects parse structure, so the
+# warning is noise here (and would break the sweep under a -W error
+# policy) while the runtime compile sites stay warning-clean.
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:Possible nested set:FutureWarning")
+
+_REPO = repo_root()
+
+# (posix-relative path, pattern variable/first-40-chars key) -> justification.
+# Empty on purpose: every historic member was fixed, not allowlisted.
+_ALLOWLIST: dict[tuple[str, str], str] = {}
+
+_RE_FUNCS = {
+    "compile", "search", "match", "fullmatch", "findall",
+    "finditer", "split", "sub", "subn",
+}
+
+# Raw-text gate applied before the AST pass: EVERY census arm needs a
+# ``re`` binding in the file, which the parser can only produce from
+# ``import re [as name]`` or ``from re import ...`` — a file whose
+# NFKC-normalized text spells neither cannot produce a member, so the
+# census skips its parse+walk.  (NFKC because Python normalizes
+# identifiers at parse time, so a fullwidth spelling is the same
+# binding to the AST and must be to the gate.)  This gate replaced
+# the earlier MULTILINE-token gate when the trailing-span arms joined
+# the census: those arms census EVERY pattern, not only MULTILINE
+# ones, so the necessary condition is the import itself — and the
+# broader gate also closes the two resolver blind spots the previous
+# gate design carried (a ``from re import compile, MULTILINE`` file
+# spells no ``re.``-attribute token; a numeric-literal flags operand
+# — ``re.compile(p, 8)`` — spells no flag token at all).  Declared
+# blind spot, same doctrine as ``_const_str_parts``'s
+# spell-anchors-literally rule: an ``importlib``/``getattr``-smuggled
+# ``re`` binding is invisible — bind ``re`` with a plain import.
+# ``test_scan_catches_every_multiline_spelling`` plants every
+# supported spelling through ``_scan_file`` so a gate regression
+# fails the census's own tests, not the closure.
+_RE_BINDING_GATE = re.compile(
+    r"\bimport\s+re\b"        # import re [as name]
+    r"|\bfrom\s+re\s+import\b",  # from re import compile, M, ...
+)
+
+# Flag names a ``from re import ...`` statement can bind bare, and
+# the bit each contributes when it appears in a flags operand.
+_FLAG_NAME_BITS: dict[str, int] = {
+    "MULTILINE": re.MULTILINE, "M": re.MULTILINE,
+    "DOTALL": re.DOTALL, "S": re.DOTALL,
+    "IGNORECASE": re.IGNORECASE, "I": re.IGNORECASE,
+    "VERBOSE": re.VERBOSE, "X": re.VERBOSE,
+    "ASCII": re.ASCII, "A": re.ASCII,
+}
+
+
+def _iter_python_files() -> list[Path]:
+    # The shared runtime-source derivation (runtime_universe module
+    # docstring documents roots and exclusions). Versus this census's
+    # previous private walk it adds plugins/ hook scripts and the
+    # repo-root entry modules — both receive scanned-repo content and
+    # belong to the invariant — and drops the bash launchers the old
+    # candidate list carried only for the AST parse to reject.
+    return runtime_file_universe(_REPO)
+
+
+def _const_str_parts(node: ast.AST, consts: dict[str, str]) -> str | None:
+    """Best-effort resolution of a pattern expression to a string.
+
+    f-string interpolations and unresolvable concat operands (calls
+    like ``re.escape(x)``, unknown names) become a harmless
+    placeholder atom ``X`` — the anchor+quantifier prefix under test
+    is always spelled literally, and dropping the whole pattern for
+    one dynamic operand hid real members. A dynamic operand that
+    EXPANDS to the idiom stays invisible — spell anchors literally.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Constant) and isinstance(node.value, bytes):
+        # Bytes patterns decode latin-1 (lossless byte-to-codepoint
+        # map): a bytes pattern compiled with MULTILINE re-scans a
+        # blank run exactly like its str twin, and the structural
+        # prefix under test is ASCII either way.
+        return node.value.decode("latin-1")
+    if isinstance(node, ast.JoinedStr):
+        parts: list[str] = []
+        for value in node.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                parts.append(value.value)
+            elif (isinstance(value, ast.FormattedValue)
+                    and isinstance(value.value, ast.Name)
+                    and value.format_spec is None
+                    and value.conversion == -1
+                    and value.value.id in consts):
+                # A plain module-constant interpolation resolves like
+                # the BinOp-concat spelling below — an rf-string built
+                # from pattern-fragment constants is the same pattern
+                # to the runtime, and the placeholder used to hide the
+                # fragment's repeats from every arm.
+                parts.append(consts[value.value.id])
+            else:
+                parts.append("X")
+        return "".join(parts)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _const_str_parts(node.left, consts)
+        right = _const_str_parts(node.right, consts)
+        return (left if left is not None else "X") \
+            + (right if right is not None else "X")
+    if isinstance(node, ast.Name):
+        return consts.get(node.id)
+    if isinstance(node, (ast.Call, ast.Attribute)):
+        return "X"
+    return None
+
+
+def _expr_flag_bits(node: ast.AST, flag_bits: dict[str, int]) -> int:
+    """Flag bits an assignment VALUE carries (attributes and known
+    flag names) — the module-flag-constant closure's judge."""
+    value = 0
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Attribute):
+            value |= _FLAG_NAME_BITS.get(sub.attr, 0)
+        elif isinstance(sub, ast.Name):
+            value |= flag_bits.get(sub.id, 0)
+    return value
+
+
+# Positional index of the ``flags`` parameter per ``re`` function
+# (an int literal is only a flags value at that exact position — the
+# same walk that resolves flag names must not read ``re.sub``'s
+# ``count`` or ``re.split``'s ``maxsplit`` as a bitmask).
+_FLAGS_ARG_INDEX: dict[str, int] = {
+    "compile": 1,
+    "search": 2, "match": 2, "fullmatch": 2,
+    "findall": 2, "finditer": 2,
+    "split": 3,
+    "sub": 4, "subn": 4,
+}
+
+
+def _flags_value(node: ast.Call, fn_name: str,
+                 flag_bits: dict[str, int]) -> int:
+    """Resolve a call's flags to a bitmask.
+
+    Handles flag ATTRIBUTES under any receiver (``re.MULTILINE``,
+    ``_rx.M``) anywhere in the argument list (legacy behaviour —
+    attribute names are unambiguous), bare NAMES carrying flag bits
+    (``from re import`` bindings and module flag constants like
+    ``_FLAGS = re.MULTILINE``, both alias-aware via ``flag_bits``),
+    and INT LITERALS at the function's flags position
+    (``re.compile(p, 8)``) — the numeric, from-import and
+    flag-constant spellings were all resolver blind spots that could
+    hide a member."""
+    value = 0
+    named_nodes: list[ast.AST] = list(node.args[1:]) + [
+        kw.value for kw in node.keywords if kw.arg == "flags"
+    ]
+    for operand in named_nodes:
+        for sub in ast.walk(operand):
+            if isinstance(sub, ast.Attribute):
+                value |= _FLAG_NAME_BITS.get(sub.attr, 0)
+            elif isinstance(sub, ast.Name):
+                value |= flag_bits.get(sub.id, 0)
+    int_nodes: list[ast.AST] = [
+        kw.value for kw in node.keywords if kw.arg == "flags"
+    ]
+    flags_idx = _FLAGS_ARG_INDEX.get(fn_name)
+    if flags_idx is not None and len(node.args) > flags_idx:
+        int_nodes.append(node.args[flags_idx])
+    for operand in int_nodes:
+        for sub in ast.walk(operand):
+            if isinstance(sub, ast.Constant) \
+                    and isinstance(sub.value, int) \
+                    and not isinstance(sub.value, bool):
+                value |= sub.value
+    return value
+
+
+def _in_matches_newline(items: list) -> bool:
+    """Does a character class (IN node body) match ``\\n``?"""
+    negated = bool(items) and items[0][0] is sre_parse.NEGATE
+    matched = False
+    for op, arg in items:
+        if op is sre_parse.NEGATE:
+            continue
+        if op is sre_parse.LITERAL and arg == 10:
+            matched = True
+        elif op is sre_parse.RANGE and arg[0] <= 10 <= arg[1]:
+            matched = True
+        elif op is sre_parse.CATEGORY:
+            name = str(arg)
+            if name.endswith("CATEGORY_SPACE"):
+                matched = True
+            elif name.endswith(("CATEGORY_NOT_WORD", "CATEGORY_NOT_DIGIT")):
+                matched = True
+    return not matched if negated else matched
+
+
+def _node_matches_newline(node: tuple, flags: int) -> bool:
+    op, arg = node
+    if op is sre_parse.LITERAL:
+        return arg == 10
+    if op is sre_parse.IN:
+        return _in_matches_newline(arg)
+    if op is sre_parse.ANY:
+        return bool(flags & re.DOTALL)
+    if op is sre_parse.CATEGORY:  # pragma: no cover - wrapped in IN
+        return str(arg).endswith("CATEGORY_SPACE")
+    if op is sre_parse.SUBPATTERN:
+        return any(_node_matches_newline(n, flags) for n in arg[3])
+    if op is sre_parse.BRANCH:
+        return any(
+            _node_matches_newline(n, flags)
+            for branch in arg[1] for n in branch
+        )
+    if op in (sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT):
+        return any(_node_matches_newline(n, flags) for n in arg[2])
+    return False
+
+
+def _can_start_with_newline(seq, flags: int) -> bool:
+    """Can ``seq`` begin matching by consuming a newline?  Walks
+    through empty-matching (optional) prefixes."""
+    for node in seq:
+        op, arg = node
+        if op is sre_parse.AT:
+            continue  # zero-width
+        if op in (sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT):
+            lo, _hi, body = arg
+            if _can_start_with_newline(body, flags):
+                return True
+            if lo == 0:
+                continue  # optional — look past it
+            return False
+        if op is sre_parse.SUBPATTERN:
+            return _can_start_with_newline(arg[3], flags)
+        if op is sre_parse.BRANCH:
+            return any(_can_start_with_newline(b, flags) for b in arg[1])
+        return _node_matches_newline(node, flags)
+    return False
+
+
+def _leads_with_unbounded_newline_repeat(node: tuple, flags: int) -> bool:
+    """Is ``node`` (the atom adjacent to a ``^`` anchor) an unbounded
+    repeat that can start consuming at a newline — possibly wrapped in
+    a group or an alternation branch (``^(?P<indent>\\s+)...``)?
+
+    The first-set test keeps this honest: ``^(?:KEYWORD\\s*)*`` fails a
+    blank-line attempt at its first literal in O(1) and is NOT a
+    member, while ``^\\s*`` / ``^[\\s#]*`` re-scan the whole blank run
+    from every line start inside it."""
+    op, arg = node
+    if op in (sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT):
+        _lo, hi, body = arg
+        return hi == sre_parse.MAXREPEAT and _can_start_with_newline(
+            body, flags,
+        )
+    if op is sre_parse.SUBPATTERN:
+        seq = list(arg[3])
+        return bool(seq) and _leads_with_unbounded_newline_repeat(
+            seq[0], flags,
+        )
+    if op is sre_parse.BRANCH:
+        return any(
+            branch and _leads_with_unbounded_newline_repeat(branch[0], flags)
+            for branch in arg[1]
+        )
+    return False
+
+
+def _ends_at_line_start(node: tuple) -> bool:
+    """Does ``node`` finish having just asserted a line start?  True
+    for a bare ``^`` (AT_BEGINNING) and for a group or alternation any
+    of whose branches ends that way — ``(?:^|;)`` makes the FOLLOWING
+    atom anchor-adjacent through its ``^`` branch, the exact idiom
+    with the anchor one level down (``(?:^|;|\\})\\s*`` survived the
+    top-level-only check while quadratic in production)."""
+    op, arg = node
+    if op is sre_parse.AT:
+        return str(arg).endswith("AT_BEGINNING")
+    if op is sre_parse.SUBPATTERN:
+        seq = list(arg[3])
+        return bool(seq) and _ends_at_line_start(seq[-1])
+    if op is sre_parse.BRANCH:
+        return any(
+            branch and _ends_at_line_start(branch[-1])
+            for branch in arg[1]
+        )
+    return False
+
+
+def _seq_has_idiom(seq, flags: int) -> bool:
+    """Anywhere in ``seq``: line-start ``^`` — bare or as a branch of
+    the preceding group — immediately followed by an unbounded repeat
+    whose atom can match a newline."""
+    nodes = list(seq)
+    for i, (op, arg) in enumerate(nodes):
+        if (flags & re.MULTILINE) and _ends_at_line_start((op, arg)) \
+                and i + 1 < len(nodes) \
+                and _leads_with_unbounded_newline_repeat(nodes[i + 1], flags):
+            return True
+        # Recurse into structure.
+        if op is sre_parse.SUBPATTERN:
+            if _seq_has_idiom(arg[3], flags):
+                return True
+        elif op in (sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT):
+            if _seq_has_idiom(arg[2], flags):
+                return True
+        elif op is sre_parse.BRANCH:
+            if any(_seq_has_idiom(b, flags) for b in arg[1]):
+                return True
+    return False
+
+
+def _pattern_is_member(pattern: str,
+                       call_flags: bool | int) -> bool:
+    """``call_flags`` accepts the legacy bool (MULTILINE yes/no — the
+    self-check pins use it) or the resolved flags bitmask."""
+    if isinstance(call_flags, bool):
+        call_flags = re.MULTILINE if call_flags else 0
+    try:
+        parsed = sre_parse.parse(pattern, call_flags)
+    except re.error:
+        return False
+    flags = parsed.state.flags  # includes inline (?m) / (?s)
+    if not flags & re.MULTILINE:
+        return False
+    return _seq_has_idiom(parsed, flags)
+
+
+def _compiled_is_member(pattern: re.Pattern[str]) -> bool:
+    """Membership for an already-compiled pattern (data-file corpora):
+    same structural test, flags taken from the compile call."""
+    if not pattern.flags & re.MULTILINE:
+        return False
+    try:
+        parsed = sre_parse.parse(pattern.pattern, pattern.flags)
+    except (re.error, ValueError):  # pragma: no cover - loader compiled it
+        return False
+    return _seq_has_idiom(parsed, parsed.state.flags)
+
+
+def _data_file_loaders() -> tuple[Any, Any]:
+    """Import the two data-file loader surfaces the census consumes.
+
+    Returns ``(prompt-preflight _load_patterns, exfil_destinations
+    module)``. The lint-tier CI env installs no runtime deps, but the
+    loaders' import chain (``packages.sca`` __init__ →
+    core.http.egress_backend → urllib_backend) imports urllib3 at
+    module top even though the DATA loaders never touch it. When
+    urllib3 is absent, stub exactly the names that import chain binds
+    at import time, scoped to this import (removed again below), so
+    the census arm stays live in the env it was built for instead of
+    erroring — and a later test that genuinely needs urllib3 still
+    sees the honest ModuleNotFoundError. Known residue: the
+    transitively imported runtime modules stay cached in sys.modules
+    with the stub exception classes bound into their namespaces after
+    the helper returns — inert here because the stubs only install
+    where urllib3 is genuinely absent, and no other test in this
+    suite exercises that import chain at runtime.
+    """
+    sys.path.insert(0, str(_REPO))
+    stubbed: list[str] = []
+    if "urllib3" not in sys.modules:
+        try:
+            import urllib3  # noqa: F401
+        except ModuleNotFoundError:
+            import types
+
+            _u3 = types.ModuleType("urllib3")
+            _u3_exc = types.ModuleType("urllib3.exceptions")
+            for _name in ("HTTPError", "LocationValueError",
+                          "MaxRetryError", "ReadTimeoutError",
+                          "SSLError", "ProxyError"):
+                setattr(_u3_exc, _name, type(_name, (Exception,), {}))
+            _u3.exceptions = _u3_exc
+            sys.modules["urllib3"] = _u3
+            sys.modules["urllib3.exceptions"] = _u3_exc
+            stubbed = ["urllib3", "urllib3.exceptions"]
+    try:
+        from core.security.prompt_input_preflight import _load_patterns
+        from packages.sca.supply_chain import (
+            exfil_destinations as _exfil,
+        )
+    finally:
+        sys.path.remove(str(_REPO))
+        for _mod in stubbed:
+            sys.modules.pop(_mod, None)
+    return _load_patterns, _exfil
+
+
+def _data_file_members() -> list[tuple[str, str]]:
+    """Census over pattern DATA FILES: every pattern the repo compiles
+    from a data file with MULTILINE-class flags, taken from each loader
+    itself, so a new corpus file, a new pattern line, or a flag change
+    is picked up here automatically (never a hardcoded file list).
+    AST resolution cannot see these patterns (each compile call's
+    operand is a loop variable), which is exactly how a data-file
+    member outlived the source census.
+
+    Universe: every data-file regex loader in the runtime tree —
+
+      * the preflight injection-pattern corpora (the loader globs its
+        corpus directory and decides per-file which flags apply);
+      * the SCA exfil-destination rules (operator-extensible JSON;
+        entries compile flag-less at load, so only an inline ``(?m)``
+        group makes one a member — which is precisely the spelling an
+        operator extension would smuggle past the source census).
+    """
+    _load_patterns, _exfil = _data_file_loaders()
+    members = [
+        (stem, compiled.pattern)
+        for stem, patterns in sorted(_load_patterns().items())
+        for compiled in patterns
+        if _compiled_is_member(compiled)
+    ]
+    members.extend(
+        ("exfil_destinations", rule.pattern.pattern)
+        for rule in _exfil._load_rules()
+        if rule.pattern is not None and _compiled_is_member(rule.pattern)
+    )
+    return members
+
+
+def _census_key(path: Path, pattern: str,
+                assign_name: str | None) -> tuple[str, str]:
+    # Keyed on (file, assigned name | pattern prefix) — line numbers
+    # churn; names and patterns are stable. Out-of-repo paths (the
+    # self-check's temp module) key on the bare name.
+    try:
+        rel = path.relative_to(_REPO).as_posix()
+    except ValueError:
+        rel = path.name
+    return (rel, assign_name or pattern[:40])
+
+
+class _Site:
+    """One resolvable regex site (shared by every census arm).
+
+    ``origin`` is ``"call"`` for a resolvable ``re.*`` call site and
+    ``"table"`` for a literal-table entry judged at worst case (the
+    MULTILINE arm consumes call sites only; the two-stage arms
+    consume both)."""
+
+    __slots__ = ("key", "lineno", "pattern", "flags", "mode", "name",
+                 "origin")
+
+    def __init__(self, key: tuple[str, str], lineno: int, pattern: str,
+                 flags: int, mode: str, name: str | None,
+                 origin: str = "call") -> None:
+        self.key = key
+        self.lineno = lineno
+        self.pattern = pattern
+        self.flags = flags
+        self.mode = mode
+        self.name = name
+        self.origin = origin
+
+
+def _table_pattern_entries(
+    container: ast.expr, re_funcs: set[str],
+) -> list[tuple[int, str]]:
+    """String entries of one literal table (the pattern-table arm's
+    per-assignment view): direct string/bytes elements, constructor-
+    call arguments (registry rows like ``Hook("name", r"...")``),
+    and ONE further nesting level of list/tuple/set/dict — enough for
+    every table shape in the tree; deeper literals are exotic enough
+    to earn resolver work when one appears.  ``re.*`` calls inside a
+    table are excluded here: their constant operands are ordinary
+    call sites the resolver already judges with real flags/mode."""
+    def _strs(node: ast.AST, depth: int):
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, str):
+                yield (node.lineno, node.value)
+            elif isinstance(node.value, bytes):
+                yield (node.lineno, node.value.decode("latin-1"))
+        elif isinstance(node, (ast.JoinedStr, ast.BinOp)):
+            value = _const_str_parts(node, {})
+            if value is not None:
+                yield (node.lineno, value)
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr in _RE_FUNCS:
+                return
+            if isinstance(func, ast.Name) and func.id in re_funcs:
+                return
+            for arg in list(node.args) + [k.value for k in node.keywords]:
+                yield from _strs(arg, depth)
+        elif isinstance(node, (ast.List, ast.Tuple, ast.Set)) and depth:
+            for elt in node.elts:
+                yield from _strs(elt, depth - 1)
+        elif isinstance(node, ast.Dict) and depth:
+            for part in list(node.keys) + list(node.values):
+                if part is not None:
+                    yield from _strs(part, depth - 1)
+
+    if isinstance(container, (ast.List, ast.Tuple, ast.Set)):
+        parts = list(container.elts)
+    else:
+        parts = [part
+                 for part in list(container.keys) + list(container.values)
+                 if part is not None]
+    entries: list[tuple[int, str]] = []
+    for part in parts:
+        entries.extend(_strs(part, 1))
+    return entries
+
+
+_METHOD_USE_RE = re.compile(
+    r"\b(\w+)\s*\.\s*(match|fullmatch|search|findall|finditer"
+    r"|split|sub|subn)\b"
+)
+
+
+def _method_uses(text: str) -> dict[str, set[str]]:
+    """One pass per file: every ``NAME.<re-method>(``-shaped use,
+    keyed by name — the per-site mode lookup below reads this map
+    instead of re-scanning the file text per compiled pattern."""
+    uses: dict[str, set[str]] = {}
+    for name, method in _METHOD_USE_RE.findall(text):
+        uses.setdefault(name, set()).add(method)
+    return uses
+
+
+def _compiled_mode(uses: dict[str, set[str]],
+                   name: str | None) -> str:
+    """Worst-of-uses call mode for a compiled pattern bound to
+    ``name``: 'search' when any unanchored use is visible (or the
+    binding is unnamed / unused / passed around), 'match' only when
+    every visible use is ``match``/``fullmatch``.  The mode picks the
+    engine entry point the oracle measures — an anchored call site
+    has one start position, and measuring it unanchored would flag
+    patterns that can never restart in production."""
+    if not name or name not in uses:
+        return "search"
+    if uses[name] <= {"match", "fullmatch"}:
+        return "match"
+    return "search"
+
+
+def _extract_sites(path: Path) -> list[_Site]:
+    """Shared single-pass extraction feeding every census arm.
+
+    ONE pass over the tree collects everything the membership tests
+    need (the census's cost is walk-bound, and separate walks per
+    collection quadrupled it):
+     * re_names — names the ``re`` module is bound to in this file,
+       module-level or function-local ``import re`` / ``import re
+       as _re``;
+     * from_funcs / from_flags — ``from re import compile as _c,
+       MULTILINE`` bindings (bare-name call receivers and bare-name
+       flag operands both hid members before the resolver knew the
+       spelling);
+     * consts — single-target constant-ish assignments, resolved
+       with an empty namespace exactly as before (chained constant
+       references stay unresolved by design);
+     * assign_of — the name each call is assigned to (stable keys,
+       and the compiled-pattern mode scan);
+     * calls — candidate ``re``-function call sites, judged against
+       the COMPLETE binding sets after the walk (an ``import re``
+       later in walk order than a call site must still count).
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, ValueError):
+        return []  # binary libexec helper or undecodable
+    if _RE_BINDING_GATE.search(
+            unicodedata.normalize("NFKC", text)) is None:
+        return []  # no ``re`` binding spelling — cannot be a member
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return []  # non-Python libexec helper (shell) or unparseable
+
+    re_names: set[str] = set()
+    from_funcs: dict[str, str] = {}
+    flag_bits: dict[str, int] = {}
+    flag_assigns: list[tuple[list[str], ast.expr]] = []
+    consts: dict[str, str] = {}
+    assign_of: dict[ast.Call, str] = {}
+    calls: list[tuple[ast.Call, str | None, str | None]] = []
+    tables: list[tuple[str, ast.expr]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "re":
+                    re_names.add(alias.asname or "re")
+        elif isinstance(node, ast.ImportFrom):
+            if node.module == "re" and not node.level:
+                for alias in node.names:
+                    bound = alias.asname or alias.name
+                    if alias.name in _RE_FUNCS:
+                        from_funcs[bound] = alias.name
+                    if alias.name in _FLAG_NAME_BITS:
+                        flag_bits[bound] = _FLAG_NAME_BITS[alias.name]
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            # Plain single- AND multi-target (``_A = _B = ...``) AND
+            # annotated (``_P: str = ...``) assignments: each spelling
+            # smuggled a planted member past the single-target-only
+            # resolver.
+            if isinstance(node, ast.Assign):
+                targets = [t.id for t in node.targets
+                           if isinstance(t, ast.Name)]
+            else:
+                targets = ([node.target.id]
+                           if isinstance(node.target, ast.Name) else [])
+            if not targets or node.value is None:
+                continue
+            if isinstance(node.value, ast.Call):
+                assign_of[node.value] = targets[0]
+                continue
+            if isinstance(node.value,
+                          (ast.Constant, ast.JoinedStr, ast.BinOp)):
+                value = _const_str_parts(node.value, {})
+                if value is not None:
+                    for name in targets:
+                        consts[name] = value
+            elif isinstance(node.value,
+                            (ast.List, ast.Tuple, ast.Set, ast.Dict)):
+                # Literal pattern-table candidate: judged after the
+                # walk (the ``re``-function name set must be complete
+                # so nested ``re.*`` calls can be excluded).
+                tables.append((targets[0], node.value))
+            # Every non-call assignment is a flag-constant candidate
+            # (``_FLAGS = re.MULTILINE`` is an Attribute value,
+            # ``re.M | re.S`` a BinOp) — judged after the walk.
+            flag_assigns.append((targets, node.value))
+        elif isinstance(node, ast.Call) and node.args:
+            if isinstance(node.func, ast.Attribute) \
+                    and node.func.attr in _RE_FUNCS \
+                    and isinstance(node.func.value, ast.Name):
+                calls.append((node, node.func.value.id, node.func.attr))
+            elif isinstance(node.func, ast.Name):
+                calls.append((node, None, node.func.id))
+
+    # Class-attribute pattern constants: ``re.match(self.ANSI_PATTERN,
+    # line)`` shows the resolver an Attribute operand a bare-name
+    # constant map cannot see (the same in-class-body family as the
+    # pattern tables above).  Resolved PER CLASS so two classes'
+    # same-named constants never cross: each ClassDef's direct-body
+    # string assignments feed only the calls inside that class (walk
+    # order is outer-to-inner, so the innermost class wins for nested
+    # classes).
+    class_attr_consts: dict[ast.Call, dict[str, str]] = {}
+    for cls_node in ast.walk(tree):
+        if not isinstance(cls_node, ast.ClassDef):
+            continue
+        attrs: dict[str, str] = {}
+        for stmt in cls_node.body:
+            if not isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+                continue
+            if isinstance(stmt, ast.Assign):
+                attr_names = [t.id for t in stmt.targets
+                              if isinstance(t, ast.Name)]
+            else:
+                attr_names = ([stmt.target.id]
+                              if isinstance(stmt.target, ast.Name) else [])
+            if not attr_names or stmt.value is None:
+                continue
+            value = _const_str_parts(stmt.value, {})
+            if value is not None:
+                for attr_name in attr_names:
+                    attrs[attr_name] = value
+        if not attrs:
+            continue
+        for sub in ast.walk(cls_node):
+            if isinstance(sub, ast.Call) and sub.args:
+                class_attr_consts[sub] = attrs
+
+    # Close flag_bits over module flag constants — iterated so a flag
+    # constant bound to ANOTHER flag constant still resolves (each
+    # pass adds bits to at least one name or stops, so it terminates).
+    changed = True
+    while changed:
+        changed = False
+        for targets, value in flag_assigns:
+            bits = _expr_flag_bits(value, flag_bits)
+            if not bits:
+                continue
+            for name in targets:
+                if flag_bits.get(name, 0) | bits != flag_bits.get(name, 0):
+                    flag_bits[name] = flag_bits.get(name, 0) | bits
+                    changed = True
+
+    sites: list[_Site] = []
+    uses: dict[str, set[str]] | None = None
+    for node, receiver, fn in calls:
+        if receiver is not None:
+            if receiver not in re_names:
+                continue
+            fn_name = fn
+        else:
+            fn_name = from_funcs.get(fn or "")
+            if fn_name is None:
+                continue
+        arg = node.args[0]
+        pattern = None
+        if (isinstance(arg, ast.Attribute)
+                and isinstance(arg.value, ast.Name)
+                and arg.value.id in ("self", "cls")):
+            # Resolve BEFORE the generic fallback: an unresolved
+            # Attribute otherwise degrades to the placeholder atom
+            # and the real pattern text is never judged.
+            pattern = class_attr_consts.get(node, {}).get(arg.attr)
+        if pattern is None:
+            pattern = _const_str_parts(arg, consts)
+        if pattern is None:
+            continue
+        flags = _flags_value(node, fn_name, flag_bits)
+        name = assign_of.get(node)
+        if fn_name == "compile":
+            if uses is None:
+                uses = _method_uses(text)
+            mode = _compiled_mode(uses, name)
+        elif fn_name in ("match", "fullmatch"):
+            mode = "match"
+        else:
+            mode = "search"
+        sites.append(_Site(_census_key(path, pattern, name),
+                           node.lineno, pattern, flags, mode, name))
+    # Literal pattern tables (compiled through a loop variable, so no
+    # call site ever shows the resolver a constant operand).  Flags
+    # and call mode are statically unknowable per entry — judged at
+    # WORST CASE: inline flags only, unanchored search.  Members that
+    # are superlinear at worst case but bounded/mode-corrected at
+    # their real call sites live in the identity-pinned
+    # ``_TABLE_ADJUDICATED`` lane.
+    re_like = set(from_funcs)
+    for table_name, container in tables:
+        for index, (lineno, pattern) in enumerate(
+                _table_pattern_entries(container, re_like)):
+            entry_name = f"{table_name}[{index}]"
+            sites.append(_Site(
+                _census_key(path, pattern, entry_name),
+                lineno, pattern, 0, "search", entry_name,
+                origin="table",
+            ))
+    return sites
+
+
+def _scan_file(path: Path) -> list[tuple[tuple[str, str], int]]:
+    """MULTILINE-idiom arm view of the shared extraction (kept as the
+    self-checks' planting surface).  Call-site origin only: a table
+    entry carries no call-site flags, so the MULTILINE arm — whose
+    membership is flag-driven — keeps its original universe; the
+    two-stage arms consume both origins."""
+    return [
+        (site.key, site.lineno)
+        for site in _extract_sites(path)
+        if site.origin == "call"
+        and _pattern_is_member(site.pattern, site.flags)
+    ]
+
+
+_ALL_SITES_CACHE: list[_Site] | None = None
+
+
+def _extract_worker(paths: list[str]) -> list[list[Any]]:
+    """Worker body for ``--extract-worker``: one contiguous chunk of
+    the file universe, extracted and JSON-flattened (same subprocess
+    protocol as ``--oracle-worker``).
+
+    ``flags`` travels as ``(int, is_RegexFlag)``: the pin digests
+    hash ``f"{site.flags}"``, and a ``re.RegexFlag`` formats as its
+    member names ("re.MULTILINE") while the same value as a plain
+    int formats as "8" — collapsing the type over the JSON hop
+    silently re-keyed every pinned digest."""
+    return [
+        [list(site.key), site.lineno, site.pattern,
+         int(site.flags), isinstance(site.flags, re.RegexFlag),
+         site.mode, site.name, site.origin]
+        for path in paths
+        for site in _extract_sites(Path(path))
+    ]
+
+
+def _extract_parallel(files: list[Path]) -> list[_Site] | None:
+    """Fan the whole-tree extraction out over worker subprocesses.
+
+    The extraction is walk-bound (millions of AST nodes across the
+    ~550 files the ``re``-binding gate lets through), and its serial
+    cost sat one loaded-runner spike from the default tier's per-test
+    budget.  Contiguous chunks reassembled by index reproduce the
+    serial order and site set EXACTLY — per-file extraction is
+    deterministic and shares no cross-file state.  Returns ``None``
+    on any worker failure so the caller falls back to the serial
+    path (correctness never depends on the fan-out).
+    """
+    import json
+    import os
+    import subprocess
+    from concurrent.futures import ThreadPoolExecutor
+
+    workers = min(8, os.cpu_count() or 1)
+    if workers < 2 or len(files) < 64:
+        return None
+    n_chunks = workers * 2  # finer chunks even out per-dir imbalance
+    step = (len(files) + n_chunks - 1) // n_chunks
+    chunks = [files[i:i + step] for i in range(0, len(files), step)]
+
+    def run_chunk(chunk: list[Path]) -> list[list[Any]] | None:
+        request = json.dumps({"paths": [str(p) for p in chunk]})
+        try:
+            proc = subprocess.run(
+                [sys.executable, __file__, "--extract-worker"],
+                input=request, capture_output=True, text=True,
+                timeout=300,
+            )
+            if proc.returncode != 0:
+                return None
+            rows = json.loads(proc.stdout)
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            return None
+        return rows if isinstance(rows, list) else None
+
+    sites: list[_Site] = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for rows in pool.map(run_chunk, chunks):
+            if rows is None:
+                return None
+            sites.extend(_sites_from_rows(rows))
+    return sites
+
+
+def _sites_from_rows(rows: list[list[Any]]) -> list[_Site]:
+    """Inverse of ``_extract_worker``'s flattening (type-exact: see
+    the flags note there)."""
+    return [
+        _Site(
+            (key[0], key[1]), lineno, pattern,
+            re.RegexFlag(flags) if is_rf else flags, mode, name,
+            origin,
+        )
+        for key, lineno, pattern, flags, is_rf, mode, name, origin
+        in rows
+    ]
+
+
+def _all_runtime_sites() -> list[_Site]:
+    """Whole-tree extraction, computed once per process — every arm's
+    tests share it, so the parse cost is paid a single time (fanned
+    out over worker subprocesses where the host has the cores)."""
+    global _ALL_SITES_CACHE
+    if _ALL_SITES_CACHE is None:
+        files = _iter_python_files()
+        sites = _extract_parallel(files)
+        if sites is None:
+            sites = []
+            for path in files:
+                sites.extend(_extract_sites(path))
+        _ALL_SITES_CACHE = sites
+    return _ALL_SITES_CACHE
+
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Trailing-span / anchor-restart arms (two-stage: static rule proposes,
+# empirical pump oracle disposes — see the module docstring).
+# ═════════════════════════════════════════════════════════════════════
+
+_MAXREP = sre_parse.MAXREPEAT
+# Probe alphabet for char-set reasoning: ASCII plus a NUL, NBSP and a
+# line separator so negated classes keep non-trivial members.
+_PROBE: list[int] = [*range(1, 128), 0, 160, 0x2028]
+
+_EXPECTED_FILE = Path(__file__).resolve().parent / "data" / \
+    "redos_trailing_span_expected.json"
+
+# Growth exponent at or above which the oracle calls a member
+# superlinear (quadratic measures ~2.0), and the absolute-time floor
+# below which a top-probe measurement is linear-with-noise rather
+# than evidence (a genuinely quadratic member clears 20ms by
+# n=32000; log-ratios over sub-5ms probes flap with scheduler
+# noise). The nightly re-check adds head-room on top (see
+# test_nightly_oracle_agrees_with_pins) so a pinned-linear member
+# only fails on a real regression, not on a loaded runner.
+_SUPERLINEAR_EXP = 1.6
+_TRUST_FLOOR_S = 5e-3
+
+# Per-size sampling count for the oracle workers: each ladder size is
+# measured as the MIN of this many CPU-time samples.  Contention,
+# cache eviction and CPU migration only ADD to a process-time sample,
+# so the min converges on the true cost.  Lowered to 1, a single
+# inflated sub-ms sample re-enters the ladder (the noise class the
+# full-ladder fit exists to survive — see LadderExponentPins);
+# raised, every in-budget probe costs proportionally more CPU inside
+# the lane's fixed wall deadline, so genuinely expensive lanes get
+# wall-killed with less of their ladder printed and the nightly
+# oracle tests pay more for no extra de-noising.
+_PROBE_SAMPLES = 3
+
+# Probes below this are timer-resolution noise and are excluded from
+# the ladder fit: process-time deltas at the 1-100us scale quantize
+# and jitter, and any ladder that clears the 5e-3 trust floor at its
+# top keeps the probes that carry its trend well above this (a
+# genuine quadratic's second-to-last probe is ~1/4 of its final).
+# Raised toward the trust floor, the fit degenerates back to the
+# last one or two probes and a single spiked sample decides the
+# verdict again (the spiked-linear pin reds); lowered below timer
+# resolution, near-zero quantized readings join the fit and drag a
+# linear ladder's slope superlinear (the quantized-bottom pin reds).
+_LADDER_NOISE_FLOOR_S = 1e-4
+
+# ── Adjudicated table members ────────────────────────────────────────
+# Table entries are judged at WORST CASE (inline flags, unanchored
+# search) because their real flags/mode are statically unknowable.  A
+# member that measures superlinear at worst case may still be sound in
+# production when EVERY call site bounds the subject or anchors the
+# call; such members are pinned HERE by pattern digest with their
+# written-down disposition.  The bar for an entry: (1) every call site
+# verified by hand, (2) the bound/mode stated, (3) the worst bounded
+# cost measured and acceptable.  Regeneration turns these digests into
+# ``adjudicated`` pins instead of refusing; anything not listed still
+# refuses, so the lane cannot grow silently.  Currently EMPTY: every
+# table member that measured superlinear at introduction was fixed
+# outright (a 16 KB-capped quadratic still cost ~1.6 s per line —
+# bounded was not acceptable).
+_TABLE_ADJUDICATED: dict[str, str] = {}
+
+
+def _cat_set(name: str) -> set[int]:
+    name = str(name)
+    if name.endswith("CATEGORY_SPACE"):
+        return {c for c in _PROBE if chr(c).isspace()}
+    if name.endswith("CATEGORY_NOT_SPACE"):
+        return {c for c in _PROBE if not chr(c).isspace()}
+    if name.endswith("CATEGORY_WORD"):
+        return {c for c in _PROBE if chr(c).isalnum() or c == 95}
+    if name.endswith("CATEGORY_NOT_WORD"):
+        return {c for c in _PROBE if not (chr(c).isalnum() or c == 95)}
+    if name.endswith("CATEGORY_DIGIT"):
+        return {c for c in _PROBE if chr(c).isdigit()}
+    if name.endswith("CATEGORY_NOT_DIGIT"):
+        return {c for c in _PROBE if not chr(c).isdigit()}
+    return set(_PROBE)  # unknown category: be permissive
+
+
+def _in_set(items: list) -> set[int]:
+    negated = bool(items) and items[0][0] is sre_parse.NEGATE
+    got: set[int] = set()
+    for op, arg in items:
+        if op is sre_parse.NEGATE:
+            continue
+        if op is sre_parse.LITERAL:
+            got.add(arg)
+        elif op is sre_parse.RANGE:
+            got |= {c for c in _PROBE if arg[0] <= c <= arg[1]}
+        elif op is sre_parse.CATEGORY:
+            got |= _cat_set(arg)
+    return (set(_PROBE) - got) if negated else got
+
+
+def _charset(node: tuple, flags: int) -> set[int]:
+    """Every probe char the node can consume (union over structure)."""
+    op, arg = node
+    if op is sre_parse.LITERAL:
+        return {arg}
+    if op is sre_parse.NOT_LITERAL:
+        return set(_PROBE) - {arg}
+    if op is sre_parse.IN:
+        return _in_set(arg)
+    if op is sre_parse.ANY:
+        return set(_PROBE) if flags & re.DOTALL else set(_PROBE) - {10}
+    if op is sre_parse.SUBPATTERN:
+        return _seq_charset(arg[3], flags)
+    if op is sre_parse.BRANCH:
+        out: set[int] = set()
+        for branch in arg[1]:
+            out |= _seq_charset(branch, flags)
+        return out
+    if op in (sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT):
+        return _seq_charset(arg[2], flags)
+    return set()  # AT / ASSERT / GROUPREF: zero-width or unknown
+
+
+def _seq_charset(seq, flags: int) -> set[int]:
+    out: set[int] = set()
+    for node in seq:
+        out |= _charset(node, flags)
+    return out
+
+
+def _is_unbounded_repeat(node: tuple) -> bool:
+    op, arg = node
+    return op in (sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT) \
+        and arg[1] == _MAXREP
+
+
+def _is_zero_width(node: tuple) -> bool:
+    return node[0] in (sre_parse.AT, sre_parse.ASSERT,
+                       sre_parse.ASSERT_NOT)
+
+
+def _is_transparent(node: tuple) -> bool:
+    """Can the engine pass this node consuming nothing?"""
+    op, arg = node
+    if _is_zero_width(node):
+        return True
+    if op in (sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT) \
+            and arg[0] == 0:
+        return True
+    if op is sre_parse.SUBPATTERN:
+        return all(_is_transparent(n) for n in arg[3])
+    if op is sre_parse.BRANCH:
+        return any(all(_is_transparent(n) for n in b) for b in arg[1])
+    return False
+
+
+def _tail_verdict(tail_nodes: list, flags: int) -> dict:
+    """Classify the continuation after a pair: does a required
+    consuming atom or a failable zero-width assertion follow?  (Rule
+    C's failable-continuation test — B's consuming-only variant was
+    recall-blind on ``$``-terminated pairs.)"""
+    consuming = False
+    failable = False
+    first_consumable: set[int] = set()
+    for i, node in enumerate(tail_nodes):
+        op, arg = node
+        if _is_zero_width(node):
+            failable = True  # $, \b, ^ mid-input, lookarounds
+            continue
+        if op in (sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT):
+            if arg[0] > 0:
+                consuming = True
+                first_consumable |= _seq_charset(arg[2], flags)
+                break
+            continue  # optional: transparent, keep walking
+        if op is sre_parse.SUBPATTERN:
+            inner = _tail_verdict(list(arg[3]) + tail_nodes[i + 1:],
+                                  flags)
+            consuming = consuming or inner["consuming"]
+            failable = failable or inner["failable_zw"]
+            first_consumable |= set(inner["first_consumable"])
+            break
+        if op is sre_parse.BRANCH:
+            for branch in arg[1]:
+                inner = _tail_verdict(list(branch), flags)
+                consuming = consuming or inner["consuming"]
+                failable = failable or inner["failable_zw"]
+                first_consumable |= set(inner["first_consumable"])
+            break
+        consuming = True  # plain consuming atom
+        first_consumable |= _charset(node, flags)
+        break
+    return {"consuming": consuming, "failable_zw": failable,
+            "first_consumable": sorted(first_consumable)}
+
+
+def _find_pairs(seq, flags: int, tail_after=()) -> list[dict]:
+    """Adjacent overlapping unbounded-repeat pairs (Rule A universe),
+    each with its Rule C continuation verdict."""
+    pairs: list[dict] = []
+    nodes = list(seq)
+    for i, node in enumerate(nodes):
+        op, arg = node
+        rest = nodes[i + 1:] + list(tail_after)
+        if op is sre_parse.SUBPATTERN:
+            pairs.extend(_find_pairs(arg[3], flags, rest))
+        elif op in (sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT):
+            pairs.extend(_find_pairs(arg[2], flags, rest))
+        elif op is sre_parse.BRANCH:
+            for branch in arg[1]:
+                pairs.extend(_find_pairs(branch, flags, rest))
+        if not _is_unbounded_repeat(node):
+            continue
+        cs1 = _charset(node, flags)
+        for k, nxt in enumerate(rest):
+            repeat2 = None
+            if _is_unbounded_repeat(nxt):
+                repeat2 = nxt
+            elif nxt[0] is sre_parse.SUBPATTERN:
+                lead = next(
+                    (n for n in nxt[1][3] if not _is_zero_width(n)),
+                    None,
+                )
+                if lead is not None and _is_unbounded_repeat(lead):
+                    repeat2 = lead
+            if repeat2 is not None:
+                overlap = cs1 & _charset(repeat2, flags)
+                if overlap:
+                    pairs.append({
+                        "pump": sorted(overlap),
+                        "tail": _tail_verdict(rest[k + 1:], flags),
+                        "r1_node": node,
+                    })
+                if not _is_transparent(nxt):
+                    break
+                continue
+            if _is_transparent(nxt):
+                continue
+            break
+    return pairs
+
+
+def _find_restart_entries(parsed, flags: int) -> list[tuple]:
+    """Rule R proposer: under MULTILINE, a ``^`` anchor followed (not
+    necessarily adjacently) by an unbounded repeat whose charset can
+    include a newline, with a failable continuation.  Returns
+    (prefix_nodes, repeat_node) entries for attack synthesis."""
+    if not flags & re.MULTILINE:
+        return []
+    entries: list[tuple] = []
+
+    def walk(seq, tail_after=()):
+        nodes = list(seq)
+        anchored_from = None
+        for i, node in enumerate(nodes):
+            op, arg = node
+            if op is sre_parse.AT and str(arg).endswith("AT_BEGINNING"):
+                anchored_from = i
+                continue
+            rest = nodes[i + 1:] + list(tail_after)
+            if op is sre_parse.SUBPATTERN:
+                walk(arg[3], rest)
+            elif op is sre_parse.BRANCH:
+                for branch in arg[1]:
+                    walk(branch, rest)
+            elif op in (sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT):
+                walk(arg[2], rest)
+            if anchored_from is None:
+                continue
+            newline_capable = (
+                (_is_unbounded_repeat(node)
+                 and 10 in _charset(node, flags))
+                or (op in (sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT)
+                    and arg[1] == _MAXREP
+                    and 10 in _seq_charset(arg[2], flags))
+            )
+            if newline_capable:
+                verdict = _tail_verdict(rest, flags)
+                if verdict["consuming"] or verdict["failable_zw"]:
+                    entries.append(
+                        (nodes[anchored_from + 1:i], node),
+                    )
+
+    walk(parsed)
+    return entries
+
+
+class _Unsupported(Exception):
+    """Attack synthesis cannot model this node (NOATTACK lane)."""
+
+
+def _gen_min(node: tuple, flags: int) -> str:
+    """Minimal model of a node — the synthesis prefix generator."""
+    op, arg = node
+    if op is sre_parse.LITERAL:
+        return chr(arg)
+    if op is sre_parse.NOT_LITERAL:
+        return "a" if arg != 97 else "b"
+    if op is sre_parse.IN:
+        chars = _in_set(arg)
+        if not chars:
+            raise _Unsupported("empty class")
+        for preferred in (97, 48, 32, 46):
+            if preferred in chars:
+                return chr(preferred)
+        return chr(sorted(chars)[0])
+    if op is sre_parse.ANY:
+        return "a"
+    if op in (sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT):
+        low = arg[0]
+        return "".join(
+            _gen_min_seq(arg[2], flags) for _ in range(min(low, 5))
+        )
+    if op is sre_parse.SUBPATTERN:
+        return _gen_min_seq(arg[3], flags)
+    if op is sre_parse.BRANCH:
+        for branch in arg[1]:
+            try:
+                return _gen_min_seq(branch, flags)
+            except _Unsupported:
+                continue
+        raise _Unsupported("no generable branch")
+    if op is sre_parse.AT:
+        return ""
+    if op in (sre_parse.ASSERT, sre_parse.ASSERT_NOT):
+        return ""  # hope the assertion holds on the synthesized text
+    if op is sre_parse.CATEGORY:  # pragma: no cover - wrapped in IN
+        chars = _cat_set(arg)
+        return chr(sorted(chars)[0]) if chars else ""
+    raise _Unsupported(f"cannot generate {op}")
+
+
+def _gen_min_seq(seq, flags: int) -> str:
+    return "".join(_gen_min(node, flags) for node in seq)
+
+
+def _gen_min_embed(node: tuple, flags: int, target: int) -> str:
+    """Min-model of a node that EMBEDS ``target`` wherever the node
+    can consume it — the unterminated-delimiter lane's unit
+    generator.  ``_gen_min`` picks a fixed preferred char per class,
+    so an escape branch like ``\\\\.`` models as ``\\a`` and never
+    carries the delimiter; this variant instantiates each atom to
+    the target char when the atom's set allows it, so the same
+    branch models as ``\\"`` for a double-quote target."""
+    op, arg = node
+    if op is sre_parse.NOT_LITERAL:
+        return chr(target) if arg != target else _gen_min(node, flags)
+    if op is sre_parse.IN:
+        return chr(target) if target in _in_set(arg) \
+            else _gen_min(node, flags)
+    if op is sre_parse.ANY:
+        return chr(target) if (target != 10 or flags & re.DOTALL) \
+            else _gen_min(node, flags)
+    if op in (sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT):
+        low = arg[0]
+        return "".join(
+            _gen_min_seq_embed(arg[2], flags, target)
+            for _ in range(min(low, 5))
+        )
+    if op is sre_parse.SUBPATTERN:
+        return _gen_min_seq_embed(arg[3], flags, target)
+    if op is sre_parse.BRANCH:
+        fallback: str | None = None
+        for branch in arg[1]:
+            try:
+                model = _gen_min_seq_embed(branch, flags, target)
+            except _Unsupported:
+                continue
+            if chr(target) in model:
+                return model
+            if fallback is None:
+                fallback = model
+        if fallback is None:
+            raise _Unsupported("no generable branch")
+        return fallback
+    return _gen_min(node, flags)
+
+
+def _gen_min_seq_embed(seq, flags: int, target: int) -> str:
+    return "".join(_gen_min_embed(node, flags, target) for node in seq)
+
+
+# Variant caps: per-node branch alternatives and accumulated entry
+# variants are both bounded so the lane walk stays linear-ish in
+# pattern size.  Both directions: raising them multiplies lanes (and
+# oracle lanes are subprocess-measured, so nightly cost follows);
+# lowering them re-opens the first-branch-only blindness for
+# patterns whose dangerous alternative sits past the cap.
+_VARIANT_CAP = 4
+_ENTRY_VARIANT_CAP = 6
+
+
+def _gen_min_variants(node: tuple, flags: int,
+                      cap: int = _VARIANT_CAP) -> list[str]:
+    """ALL branch-alternative min-models of a node (capped) — the
+    scalar ``_gen_min`` keeps only the FIRST generable alternative,
+    so a pattern whose dangerous entry or body unit sits in a later
+    branch was modeled by a harmless sibling (``(?:\\A|[;&|(]|\\n)``
+    modeled as the zero-width ``\\A``; a doc-comment alternation
+    modeled as its first delimiter only)."""
+    op, arg = node
+    if op is sre_parse.BRANCH:
+        outs: list[str] = []
+        for branch in arg[1]:
+            try:
+                outs.extend(_gen_min_seq_variants(branch, flags, cap))
+            except _Unsupported:
+                continue
+            if len(outs) >= cap:
+                break
+        if not outs:
+            raise _Unsupported("no generable branch")
+        return outs[:cap]
+    if op is sre_parse.SUBPATTERN:
+        return _gen_min_seq_variants(arg[3], flags, cap)
+    if op in (sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT):
+        low = arg[0]
+        if low == 0:
+            return [""]
+        subs = _gen_min_seq_variants(arg[2], flags, cap)
+        return [sub * min(low, 5) for sub in subs][:cap]
+    return [_gen_min(node, flags)]
+
+
+def _gen_min_seq_variants(seq, flags: int,
+                          cap: int = _VARIANT_CAP) -> list[str]:
+    outs = [""]
+    for node in seq:
+        variants = _gen_min_variants(node, flags, cap)
+        outs = [a + b for a in outs for b in variants][:cap]
+    return outs
+
+
+def _pump_units(pair: dict, flags: int) -> list[str]:
+    """Pump units for a pair: the single overlap char, plus the
+    min-model STRING of the first repeat's body — word-granularity
+    loops (whole-keyword repeats) only expose their split ambiguity to
+    whole-word pumps, a synthesis blind spot the review campaign
+    demonstrated on the C-declaration matchers."""
+    units = [chr(32 if 32 in pair["pump"] else pair["pump"][0])]
+    op, arg = pair["r1_node"]
+    if op in (sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT):
+        try:
+            body = _gen_min_seq(arg[2], flags)
+        except _Unsupported:
+            body = ""
+        if len(body) > 1:
+            units.append(body)
+    return units
+
+
+def _build_pair_attack(parsed, flags: int, pair: dict, n: int,
+                       unit: str) -> str | None:
+    """prefix (min-model of everything before the pair) + pump run +
+    poison (outside the pump set and the continuation's first set)."""
+    pump_char = chr(32 if 32 in pair["pump"] else pair["pump"][0])
+    bad = set(pair["pump"]) | set(pair["tail"]["first_consumable"])
+    poison = next(
+        (chr(c) for c in (1, 46, 59, 88, 10, 33) if c not in bad),
+        "\x01",
+    )
+
+    def walk(seq, acc: list[str]):
+        for node in seq:
+            op, arg = node
+            if node is pair["r1_node"]:
+                return "".join(acc)
+            if op is sre_parse.SUBPATTERN:
+                found = walk(arg[3], acc[:])
+                if found is not None:
+                    return found
+            elif op in (sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT):
+                found = walk(arg[2], acc[:])
+                if found is not None:
+                    return found
+            elif op is sre_parse.BRANCH:
+                for branch in arg[1]:
+                    found = walk(branch, acc[:])
+                    if found is not None:
+                        return found
+            try:
+                acc.append(_gen_min(node, flags))
+            except _Unsupported:
+                acc.append("")
+        return None
+
+    prefix = walk(parsed, []) or ""
+    if len(unit) == 1:
+        return prefix + pump_char * n + poison
+    repeats = max(2, n // max(1, len(unit)))
+    return prefix + unit * repeats + poison
+
+
+def _build_restart_attack(parsed, flags: int, entry: tuple,
+                          k: int) -> str | None:
+    """k lines each matching the pattern's anchored prefix followed
+    by a partial repeat fill: every line start anchors an attempt
+    whose newline-crossing repeat re-scans the tail."""
+    prefix_nodes, repeat = entry
+    try:
+        prefix = "".join(_gen_min(n, flags) for n in prefix_nodes)
+    except _Unsupported:
+        return None
+    op, arg = repeat
+    try:
+        body = _gen_min_seq(arg[2], flags) if op in (
+            sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT) else ""
+    except _Unsupported:
+        body = ""
+    if body.strip() == "" or "\n" in body:
+        wordish = [c for c in sorted(_charset(repeat, flags))
+                   if chr(c).isalnum()]
+        filler = (chr(wordish[0]) * 2 + " ") * 4 if wordish else "  "
+    else:
+        filler = (body + " ") * 4
+    line = (prefix + filler).rstrip("\n")
+    if not line.strip():
+        line = prefix + "x"
+    return (line + "\n") * k
+
+
+
+def _site_rules(site: _Site) -> tuple[bool, bool, list, list]:
+    """(rule_c, rule_r, pairs, restart_entries) for one site."""
+    try:
+        parsed = sre_parse.parse(site.pattern, site.flags)
+    except (re.error, ValueError, OverflowError):
+        return (False, False, [], [])
+    flags = parsed.state.flags  # includes inline (?m)/(?s)
+    pairs = _find_pairs(parsed, flags)
+    rule_c = any(
+        pair["tail"]["consuming"] or pair["tail"]["failable_zw"]
+        for pair in pairs
+    )
+    entries = _find_restart_entries(parsed, flags)
+    return (rule_c, bool(entries), pairs, entries)
+
+
+def _trailing_span_members() -> dict[tuple[str, str], dict]:
+    """The two-stage arms' PROPOSED member set over runtime source:
+    every site Rule C or Rule R flags, keyed like the MULTILINE arm,
+    with the pattern digest the pin file validates against."""
+    import hashlib
+
+    members: dict[tuple[str, str], dict] = {}
+    for site in _all_runtime_sites():
+        rule_c, rule_r, _pairs, _entries = _site_rules(site)
+        if not (rule_c or rule_r):
+            continue
+        digest = hashlib.sha256(
+            f"{site.flags}:{site.mode}:{site.pattern}".encode(),
+        ).hexdigest()[:12]
+        record = members.setdefault(site.key, {
+            "digests": set(), "rules": set(), "sites": [],
+        })
+        record["digests"].add(digest)
+        record["rules"].add("C" if rule_c else "R")
+        if rule_r:
+            record["rules"].add("R")
+        record["sites"].append(
+            (site.lineno, site.pattern, site.flags, site.mode),
+        )
+    return members
+
+
+def _load_expected() -> dict:
+    import json
+
+    with _EXPECTED_FILE.open(encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _min_probe_seconds(run: Callable[[], None],
+                       budget_s: float) -> float:
+    """CPU seconds for one ladder size: the min of
+    ``_PROBE_SAMPLES`` process-time samples of ``run``.  Contention
+    only inflates a CPU-time sample, so the min estimates the
+    uncontended cost.  Sampling stops early while the running min
+    exceeds ``budget_s``: an over-budget probe ends the ladder
+    anyway, so re-sampling it would only multiply a multi-second
+    cost inside the lane's wall deadline."""
+    import time
+
+    best = float("inf")
+    for _ in range(_PROBE_SAMPLES):
+        start = time.process_time()
+        run()
+        best = min(best, time.process_time() - start)
+        if best > budget_s:
+            break
+    return best
+
+
+def _ladder_exponent(
+        probes: list[tuple[int, float]]) -> tuple[float, str]:
+    """Growth exponent for a ``(size, seconds)`` probe ladder of at
+    least two strictly increasing sizes.
+
+    The FINAL probe gates trust: below ``_TRUST_FLOOR_S`` the whole
+    ladder is linear-with-noise, not evidence — a genuinely
+    quadratic member clears 20ms by n=32000.  Above it, the exponent
+    is the least-squares slope of log(t) against log(n) over every
+    probe above ``_LADDER_NOISE_FLOOR_S``: a genuinely superlinear
+    ladder shows its trend at every doubling, while one inflated
+    sample cannot carry the slope the way it carried the old
+    last-two log-ratio."""
+    import math
+
+    if probes[-1][1] < _TRUST_FLOOR_S:
+        return (1.0, "fast")
+    fit = [(n, t) for n, t in probes if t >= _LADDER_NOISE_FLOOR_S]
+    if len(fit) < 2:
+        # Fail-open guard: a final probe over the 5e-3 trust floor
+        # with every earlier probe in timer noise is a >=50x jump in
+        # one doubling — no linear member does that.  Price it from
+        # the last two probes rather than refusing to answer.
+        fit = probes[-2:]
+    xs = [math.log(n) for n, _ in fit]
+    ys = [math.log(max(t, 1e-7)) for _, t in fit]
+    x_mean = sum(xs) / len(xs)
+    y_mean = sum(ys) / len(ys)
+    sxx = sum((x - x_mean) ** 2 for x in xs)
+    sxy = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys))
+    return (sxy / sxx, "ok")
+
+
+def _oracle_probe_lines(pattern: str, flags: int, mode: str,
+                        kind: str, index: int, unit: str) -> None:
+    """Worker body (runs in a hard-killed subprocess): print
+    ``n dt`` probe lines for one attack lane at doubling sizes."""
+    if kind == "scan":
+        _scan_oracle_probe_lines(pattern, flags, index)
+        return
+    try:
+        parsed = sre_parse.parse(pattern, flags)
+    except (re.error, ValueError):
+        print("NOPARSE")
+        return
+    eff_flags = parsed.state.flags
+    if kind == "pair":
+        pairs = _find_pairs(parsed, eff_flags)
+        if index >= len(pairs):
+            print("NOLANE")
+            return
+        pair = pairs[index]
+
+        def attack(n: int) -> str | None:
+            return _build_pair_attack(parsed, eff_flags, pair, n, unit)
+    else:
+        entries = _find_restart_entries(parsed, eff_flags)
+        if index >= len(entries):
+            print("NOLANE")
+            return
+        entry = entries[index]
+
+        def attack(n: int) -> str | None:
+            return _build_restart_attack(parsed, eff_flags, entry, n)
+
+    rx = re.compile(pattern, flags)
+    if kind == "restart":
+        def run(text: str) -> None:
+            for _ in rx.finditer(text):
+                pass
+    elif mode == "match":
+        def run(text: str) -> None:
+            rx.match(text)
+    else:
+        def run(text: str) -> None:
+            rx.search(text)
+    n = 500
+    while n <= 32000:
+        try:
+            text = attack(n)
+        except _Unsupported:
+            text = None
+        if text is None:
+            print("NOATTACK")
+            return
+        # Min-of-N CPU time, not one wall sample: regex matching is
+        # pure CPU, and on a contended runner (this oracle fans out 8
+        # subprocess lanes, nightly runners have fewer cores)
+        # wall-clock scheduling noise routinely pushes a linear
+        # member's last probe over the trust floor and synthesizes
+        # exp~2-3, mass-failing the agrees-with-pins re-checks.  The
+        # process CPU clock counts only this child's own execution,
+        # and the min discards the residual sub-ms inflation (cache
+        # eviction, migration) that even CPU time picks up under
+        # load; the lane's hard-kill deadline stays wall-based in
+        # the parent.
+        elapsed = _min_probe_seconds(lambda: run(text), 1.0)
+        print(n, f"{elapsed:.6f}", flush=True)
+        if elapsed > 1.0:
+            break
+        n *= 2
+
+
+def _oracle_lane(pattern: str, flags: int, mode: str, kind: str,
+                 index: int, unit: str,
+                 timeout_s: float = 14.0) -> tuple[float | None, str]:
+    """One hard-killed oracle lane: (exponent | None, status)."""
+    import json
+    import subprocess
+    import sys
+
+    request = json.dumps({
+        "pattern": pattern, "flags": flags, "mode": mode,
+        "kind": kind, "index": index, "unit": unit,
+    })
+    try:
+        proc = subprocess.run(
+            [sys.executable, __file__, "--oracle-worker"],
+            input=request, capture_output=True, text=True,
+            timeout=timeout_s,
+        )
+        lines = proc.stdout.strip().splitlines()
+        killed = False
+    except subprocess.TimeoutExpired as exc:
+        lines = (exc.stdout or "").strip().splitlines()
+        killed = True
+    probes: list[tuple[int, float]] = []
+    status = "ok"
+    for line in lines:
+        parts = line.split()
+        if len(parts) == 2 and parts[0].isdigit():
+            probes.append((int(parts[0]), float(parts[1])))
+        elif parts:
+            status = parts[0]
+    if killed:
+        return (99.0, "wall")
+    if status in ("NOATTACK", "NOPARSE", "NOLANE", "DEGEN"):
+        return (None, status)
+    if len(probes) == 1 and probes[0][1] > 1.0:
+        return (99.0, "wall")  # first probe already over the CPU budget
+    if len(probes) < 2:
+        return (None, "short")
+    return _ladder_exponent(probes)
+
+
+def _oracle_classify(pattern: str, flags: int,
+                     mode: str) -> tuple[float | None, bool]:
+    """(worst exponent | None, any-lane-synthesized) across pair
+    lanes (both pump units) and restart lanes."""
+    try:
+        parsed = sre_parse.parse(pattern, flags)
+    except (re.error, ValueError):
+        return (None, False)
+    eff_flags = parsed.state.flags
+    worst: float | None = None
+    synthesized = False
+    pairs = _find_pairs(parsed, eff_flags)
+    for index, pair in enumerate(pairs[:3]):
+        for unit in _pump_units(pair, eff_flags)[:2]:
+            exponent, status = _oracle_lane(
+                pattern, flags, mode, "pair", index, unit,
+            )
+            if status not in ("NOATTACK", "NOPARSE", "NOLANE"):
+                synthesized = True
+            if exponent is not None and (worst is None
+                                         or exponent > worst):
+                worst = exponent
+    entries = _find_restart_entries(parsed, eff_flags)
+    for index in range(min(len(entries), 3)):
+        exponent, status = _oracle_lane(
+            pattern, flags, mode, "restart", index, "",
+        )
+        if status not in ("NOATTACK", "NOPARSE", "NOLANE"):
+            synthesized = True
+        if exponent is not None and (worst is None or exponent > worst):
+            worst = exponent
+    return (worst, synthesized)
+
+
+def _regen_expected(workers: int = 8) -> int:
+    """Re-run the pump oracle over every proposed member and rewrite
+    the pin file.  REFUSES to pin a superlinear member — fixing the
+    pattern is the only way through; refusal is the design."""
+    import json
+    from concurrent.futures import ThreadPoolExecutor
+
+    members = _trailing_span_members()
+    rows: dict[str, dict] = {}
+    failures: list[str] = []
+
+    def classify(item):
+        key, record = item
+        lineno, pattern, flags, mode = record["sites"][0]
+        exponent, synthesized = _oracle_classify(pattern, flags, mode)
+        return key, record, exponent, synthesized
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for key, record, exponent, synthesized in pool.map(
+                classify, sorted(members.items())):
+            if not synthesized:
+                verdict = "noattack"
+            elif exponent is not None and exponent >= 1.5:
+                if record["digests"] <= set(_TABLE_ADJUDICATED):
+                    # Worst-case-superlinear table member with a
+                    # written-down call-site disposition (see
+                    # _TABLE_ADJUDICATED) — pinned, not refused.
+                    verdict = "adjudicated"
+                else:
+                    # Regeneration margin sits BELOW the census
+                    # threshold: a member measuring in the 1.5-1.6
+                    # noise band must be fixed, not pinned at the
+                    # edge of flapping.
+                    failures.append(
+                        f"{key[0]} :: {key[1]} measures superlinear "
+                        f"(exp={exponent:.2f}) — fix the pattern; the "
+                        f"pin file only accepts oracle-linear members "
+                        f"(or an adjudicated table entry, see "
+                        f"_TABLE_ADJUDICATED)",
+                    )
+                    continue
+            else:
+                verdict = "linear"
+            rows["\x1f".join(key)] = {
+                "digests": sorted(record["digests"]),
+                "rules": sorted(record["rules"]),
+                "verdict": verdict,
+                "exp": None if exponent is None else round(exponent, 2),
+            }
+    if failures:
+        print("REFUSED to regenerate:")
+        for failure in failures:
+            print(" ", failure)
+        return 1
+    _EXPECTED_FILE.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "_comment": (
+            "Pinned trailing-span/anchor-restart census members: "
+            "static proposals (Rule C / Rule R) the pump oracle "
+            "measured linear, keyed file\x1fname with pattern "
+            "digests. Regenerate with: python3 "
+            ".github/tests/test_redos_idiom_census.py "
+            "--regen-trailing-span  (the tool refuses superlinear "
+            "members; hand-editing a verdict is caught by the "
+            "nightly oracle re-check)."
+        ),
+        "members": dict(sorted(rows.items())),
+    }
+    with _EXPECTED_FILE.open("w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=1, sort_keys=True)
+        fh.write("\n")
+    noatt = [k for k, v in rows.items() if v["verdict"] == "noattack"]
+    print(f"pinned {len(rows)} members "
+          f"({len(noatt)} noattack) -> {_EXPECTED_FILE}")
+    return 0
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Scan-restart arm (Rule S): unanchored position-loop superlinearity.
+# Static rule proposes, position-density pump oracle disposes.
+# ═════════════════════════════════════════════════════════════════════
+
+_SCAN_EXPECTED_FILE = Path(__file__).resolve().parent / "data" / \
+    "redos_scan_restart_expected.json"
+
+# Per-member lane budget for the scan oracle.  The classifier
+# measures at most this many lanes; a member whose lane count
+# EXCEEDS it is refused at regeneration and flagged by the nightly
+# re-check instead of being silently part-measured (a silent cap
+# once left a member's excess lanes unpriced with zero headroom).
+# Both directions: raising it buys more measurement per member at
+# subprocess cost (nightly re-measures every lane of every pin);
+# lowering it below the universe's max lane count (40 at this cut)
+# turns real members into refusals.
+_SCAN_LANE_CAP = 64
+
+# Rule S's identity-pinned manual-review lane, digest-keyed like
+# ``_TABLE_ADJUDICATED``: string-table entries the worst-case table
+# extraction admits but that are NEVER COMPILED as regexes — output
+# text a module emits verbatim (a generated C comment line, a QL
+# header line) or markers consumed by substring containment.  Read
+# as regexes they carry a quantified ``/`` and measure superlinear,
+# but rewriting the strings would corrupt real output.  Growth
+# requires editing this documented dict (the regeneration tool pins
+# these with the ``adjudicated`` verdict and refuses any other
+# superlinear member), so the lane cannot grow silently.
+_SCAN_ADJUDICATED: dict[str, str] = {
+    "0f64f014c82d": (
+        "core/audit/compile_probe.py lines[0]: the generated probe "
+        "TU's own header comment — emitted as C source text, never "
+        "compiled as a pattern"
+    ),
+    "8eba6201f599": (
+        "core/iris/specs.py lines[7]: the QL query header's "
+        "comment-closer line — emitted as query text, never "
+        "compiled as a pattern"
+    ),
+    "37de29a408f1": (
+        "core/inventory/exclusions.py GENERATED_MARKERS[10]: a "
+        "generated-file marker consumed via substring containment "
+        "(`marker in lowered`), never compiled as a pattern"
+    ),
+    # The rest of core/iris/specs.py's QL header block (each line is
+    # emitted query text; the ` * ` prefix reads as a quantified
+    # space to the worst-case table lens).
+    "5f33a892b9ad": "core/iris/specs.py lines[1]: QL @name line",
+    "74f670123f14": "core/iris/specs.py lines[2]: QL @description line",
+    "0fb08c380bf3": "core/iris/specs.py lines[3]: QL @kind line",
+    "70e776e25c31": (
+        "core/iris/specs.py lines[4]: QL @problem.severity line"
+    ),
+    "88e933d23e53": "core/iris/specs.py lines[5]: QL @id line",
+    "29eb48db7b62": "core/iris/specs.py lines[6]: QL @tags line",
+    "db21eb0cc688": (
+        "packages/ghidra/decomp_tree.py lines[1]: the decompilation "
+        "report's function header line — emitted report text, never "
+        "compiled as a pattern"
+    ),
+    "c7576fa032bf": (
+        "core/audit/dark_verify/_resolve.py _PY_EXT_SUFFIX_GLOBS[1] "
+        "('.*.so'): a FILENAME GLOB consumed by suffix probing, "
+        "never compiled as a regex"
+    ),
+    "9337696cf86c": (
+        "core/audit/dark_verify/_resolve.py _PY_EXT_SUFFIX_GLOBS[3] "
+        "('.*.pyd'): a filename glob, never compiled as a regex"
+    ),
+}
+
+
+# All-lanes-degenerate members: every pump the synthesizer can build
+# MATCHES the pattern (their continuations are total or near-total —
+# a ``\\Z`` / ``$`` / to-end-of-line alternative accepts wherever
+# the interior stops), so no failing attempt THE SYNTHESIZER'S
+# POISON CHOOSER CAN BUILD exists for the oracle to price, and the
+# members route to the manual noattack lane.  Degeneracy is relative
+# to the chooser, not always intrinsic: for some members a poison
+# outside its candidate set does build a failing attack (measured
+# linear where checked).  Adjudicated LINEAR as a class: an
+# entry-anchored attempt either matches (the scan consumes and
+# advances) or fails cheaply, and the nightly ladder re-times each
+# member's still-matching lanes, so a pathological match cost cannot
+# hide behind the DEGEN routing.  Identity-pinned like the other
+# manual lanes: a NEW degenerate member fails the lane test until it
+# is analysed and listed here.
+_SCAN_DEGENERATE_MEMBERS: frozenset[str] = frozenset({
+    "core/analysis/binary_oracle.py :: name_indirect_re",
+    "core/analysis/reachability_gates.py :: _FENCED_CODE_RE",
+    "core/analysis/taint_multi_lang.py :: assert_re",
+    "core/analysis/taint_multi_lang.py :: named_re",
+    "core/audit/corpus/rule_eval.py :: _CWE_RE",
+    "core/audit/discovery.py :: ```(?:json)?[ \\t]*\\n(.+?)```",
+    "core/audit/negative_space.py :: assign_re",
+    "core/audit/prefilter.py :: `[^`]*\\$",
+    "core/audit/release_order.py :: assign_re",
+    "core/audit/sentinel_collapse.py :: _GO_NIL_COERCE",
+    "core/audit/sibling_analysis.py :: _NULL_GUARD_RE",
+    "core/sage/hooks.py :: m",
+    "core/sandbox/observe.py :: m",
+    "core/symbolic/_detect.py :: _READ_SIZED_RE",
+    "packages/autonomous/dialogue.py :: code_block_match",
+    "packages/cve_env/cve_env/tools/dockerfile_gen.py :: "
+    "_APT_INSTALL_RE",
+    "packages/cve_env/cve_env/utils/exploit_text_sanitizer.py :: "
+    ",?\\s{0,16}leading to (?:a |an )?(?:[a-zA",
+    "packages/cve_env/cve_env/utils/exploit_text_sanitizer.py :: "
+    "An attacker (can|could|may|with)(?:[^.\\n",
+    "packages/cve_env/cve_env/utils/exploit_text_sanitizer.py :: "
+    "It (is|may be) possible to (launch|initi",
+    "packages/cve_env/cve_env/utils/exploit_text_sanitizer.py :: "
+    "Successful exploitation(?:[^.\\n]|\\.(?=\\d",
+    "packages/cve_env/cve_env/utils/exploit_text_sanitizer.py :: "
+    "The exploit has been (publicly )?disclos",
+    "packages/cve_env/cve_env/utils/exploit_text_sanitizer.py :: "
+    "The manipulation of (the )?(argument|par",
+    "packages/cve_env/cve_env/utils/exploit_text_sanitizer.py :: "
+    "This (allows|enables) (attackers?|advers",
+    "packages/cve_env/cve_env/utils/exploit_text_sanitizer.py :: "
+    "This (issue|vulnerability) (affects|allo",
+    "packages/cve_env/cve_env/utils/exploit_text_sanitizer.py :: "
+    "VDB-\\d+(?:[^.\\n]|\\.(?=\\d))*(?:\\.(?!\\d)|\\",
+    "packages/cve_env/cve_env/utils/exploit_text_sanitizer.py :: "
+    "\\b(allows?|enables?|permits?)\\s+(a\\s+|an",
+    "packages/cve_env/cve_env/utils/exploit_text_sanitizer.py :: "
+    "\\b(the\\s+)?attacks?\\s+(may|can|could|wil",
+    "packages/cve_env/cve_env/utils/exploit_text_sanitizer.py :: "
+    "\\bexploitable by(?:[^.\\n]|\\.(?=\\d))*(?:\\",
+    "packages/sca/refresh_typosquat_lists.py :: "
+    "[a-z0-9]([a-z0-9._-]*[a-z0-9])?",
+    "packages/sca/registries/packagist.py :: _PRERELEASE_RE",
+    "packages/sca/rewriters/gradle_version_catalog.py :: "
+    "_TOML_MULTILINE_STRING_RE",
+    "packages/semgrep/nosemgrep.py :: _NOSEMGREP_RE",
+})
+
+
+def _seq_leading_anchor(seq) -> bool:
+    """True when the pattern is start-anchored (``\\A`` or ``^``):
+    the search loop cannot restart densely without MULTILINE, and
+    with MULTILINE the anchor-restart arm (Rule R) owns the
+    mechanism."""
+    for node in seq:
+        op, arg = node
+        if op is sre_parse.AT:
+            if str(arg).endswith(("AT_BEGINNING", "AT_BEGINNING_STRING")):
+                return True
+            continue
+        if op is sre_parse.SUBPATTERN:
+            return _seq_leading_anchor(arg[3])
+        return False
+    return False
+
+
+def _first_set(nodes, flags: int) -> set[int]:
+    """TRUE first-set of a node sequence: the chars able to start a
+    match of it.  ``_tail_verdict``'s ``first_consumable`` unions the
+    whole continuation's charset instead — good enough for poison
+    choice, but as a FILL exclusion it starves the density lane
+    (``charset − union`` came out empty for an identifier-chain
+    tail whose union contains every word char), silently minting a
+    linear pin for a quadratic member."""
+    first: set[int] = set()
+    for node in nodes:
+        op, arg = node
+        if _is_zero_width(node):
+            continue
+        if op in (sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT):
+            first |= _first_set(arg[2], flags)
+            if arg[0] > 0 and not _is_transparent(node):
+                return first
+            continue
+        if op is sre_parse.SUBPATTERN:
+            first |= _first_set(arg[3], flags)
+            if not _is_transparent(node):
+                return first
+            continue
+        if op is sre_parse.BRANCH:
+            for branch in arg[1]:
+                first |= _first_set(branch, flags)
+            if not _is_transparent(node):
+                return first
+            continue
+        first |= _charset(node, flags)
+        return first
+    return first
+
+
+def _is_word_ord(char: int) -> bool:
+    return chr(char).isalnum() or char == 95
+
+
+def _leading_guards(seq, flags: int) -> tuple[bool, set[int], set[int]]:
+    """The pattern's leading zero-width guards: (has a word-boundary
+    assertion, chars a negative lookbehind rejects as the PRECEDING
+    char, charset of the first consuming atom)."""
+    boundary = False
+    rejected: set[int] = set()
+    nodes = list(seq)
+    while nodes:
+        node = nodes.pop(0)
+        op, arg = node
+        if op is sre_parse.AT:
+            if str(arg).endswith("AT_BOUNDARY"):
+                boundary = True
+            continue
+        if op is sre_parse.ASSERT_NOT:
+            if arg[0] < 0:
+                rejected |= _seq_charset(arg[1], flags)
+            continue
+        if op is sre_parse.ASSERT:
+            continue
+        if op is sre_parse.SUBPATTERN:
+            nodes = list(arg[3]) + nodes
+            continue
+        if op in (sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT) \
+                and arg[0] == 0:
+            continue
+        return boundary, rejected, _charset(node, flags)
+    return boundary, rejected, set()
+
+
+def _guard_breaking_fill(parsed, flags: int, entry: str,
+                         fills: list[int],
+                         primary: str) -> str | None:
+    """A fill that keeps the pattern's leading word-boundary or
+    negative-lookbehind guard LIVE at every pumped entry.  The
+    primary fill prefers alphanumerics, which FUSE a `\b`- or
+    lookbehind-pinned pump into one long word — the pin then leaves
+    a single attempt position and measures itself as if it held.
+    Derived from the guard itself: outside any lookbehind class,
+    and of opposite wordness to the entry head when a boundary
+    assertion guards it — never a hardcoded separator."""
+    boundary, rejected, head = _leading_guards(parsed, flags)
+    reference = entry[0] if entry else (
+        chr(min(head)) if head else primary)
+    candidates = [c for c in fills if c not in rejected]
+    if boundary:
+        want_word = not _is_word_ord(ord(reference))
+        candidates = [c for c in candidates
+                      if _is_word_ord(c) == want_word]
+    choice = next(
+        (c for c in (46, 45, 32) if c in candidates),
+        min(candidates) if candidates else None,
+    )
+    if choice is None or chr(choice) == primary:
+        return None
+    return chr(choice)
+
+
+def _find_scan_restart_lanes(parsed, flags: int) -> list[dict]:
+    """Rule S lanes: for an unbounded repeat R on the concatenation
+    spine with a REQUIRED consuming continuation after it, the site
+    is start-dense when the min-model of everything required before
+    R (the "entry", possibly empty) is drawn from charset(R):
+
+    * entry == "": leading ``\\s*`` / ``.*`` / ``[^X]*`` — every
+      position of a hostile fill run is a match attempt and each
+      attempt re-scans the rest of the run;
+    * entry != "" and chars(entry) <= charset(R): the attacker
+      plants entry occurrences INSIDE R's own span (multi-term
+      ``A.*B.*C`` chains, head-dense ``,[^;]*x`` shapes) — attempts
+      multiply with density and each backtrack re-scans the tail.
+
+    Walks into subpatterns, branches, and repeat BODIES (an unbounded
+    repeat nested inside an optional group scan-restarts all the
+    same), with the enclosing tail visible, accumulating min-model
+    ENTRY VARIANTS: every branch alternative on the spine becomes an
+    entry candidate (capped), because the scalar min-model kept only
+    the FIRST alternative and a separator alternation whose first
+    branch is zero-width (``(?:\\A|[;&|(]|\\n)``) or self-closing
+    (``(?:\"\"\"|/\\*\\*)``) hid the dangerous entry from every
+    lane."""
+    lanes: list[dict] = []
+    seen: set[int] = set()
+
+    def walk(seq, entries: tuple, tail_after: tuple) -> None:
+        for i, node in enumerate(list(seq)):
+            op, arg = node
+            rest = tuple(list(seq)[i + 1:]) + tail_after
+            if op is sre_parse.SUBPATTERN:
+                walk(arg[3], entries, rest)
+            elif op is sre_parse.BRANCH:
+                for branch in arg[1]:
+                    walk(branch, entries, rest)
+            elif op in (sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT) \
+                    and not _is_unbounded_repeat(node):
+                walk(arg[2], entries, rest)
+            elif _is_unbounded_repeat(node) and id(node) not in seen:
+                seen.add(id(node))
+                charset = _charset(node, flags)
+                if charset:
+                    tail = _tail_verdict(list(rest), flags)
+                    first = set(tail["first_consumable"])
+                    # Fills exclude the continuation's TRUE first-set
+                    # only (the union first_consumable stays for the
+                    # poison, where over-approximation is safe).
+                    true_first = _first_set(list(rest), flags)
+                    fills = [c for c in sorted(charset - true_first)
+                             if c not in (10, 13)]
+                    poison = next(
+                        (chr(c) for c in (1, 46, 59, 88, 10, 33, 2)
+                         if c not in charset and c not in first),
+                        None,
+                    )
+                    try:
+                        bodies = _gen_min_seq_variants(arg[2], flags)
+                    except _Unsupported:
+                        bodies = []
+                    for entry in entries:
+                        _emit_lanes_for_entry(
+                            lanes, parsed, flags, arg, entry, charset,
+                            tail, first, fills, poison, bodies,
+                        )
+                walk(arg[2], entries, rest)
+            new_entries = []
+            for entry in entries:
+                try:
+                    for variant in _gen_min_variants(node, flags):
+                        new_entries.append(entry + variant)
+                except _Unsupported:
+                    new_entries.append(entry)
+            entries = tuple(
+                dict.fromkeys(new_entries))[:_ENTRY_VARIANT_CAP]
+
+    if not _seq_leading_anchor(parsed):
+        walk(parsed, ("",), ())
+    # Entry variants can rediscover the same lane through different
+    # spine paths — deduplicate on full lane identity (order kept).
+    uniq: dict[tuple, dict] = {}
+    for lane in lanes:
+        key = (lane.get("entry"), lane.get("fill"), lane.get("poison"),
+               lane.get("opener"), lane.get("once"), lane.get("starved"))
+        uniq.setdefault(key, lane)
+    return list(uniq.values())
+
+
+def _emit_lanes_for_entry(lanes: list, parsed, flags: int, arg,
+                          entry: str, charset: set, tail: dict,
+                          first: set, fills: list,
+                          poison: str | None, bodies: list) -> None:
+    """All lane shapes for ONE (repeat, entry-variant) pair."""
+    if tail["consuming"] and not fills \
+            and all(ord(ch) in charset for ch in entry):
+        # STARVED density lane: no fill avoids the continuation's
+        # first-set, so this repeat's restart cost cannot be pumped —
+        # the member must not silently pin linear on the other lanes
+        # alone.  Regeneration routes starved members to the
+        # identity-pinned manual lane.
+        lanes.append({
+            "entry": entry, "fill": "",
+            "poison": "", "starved": True,
+        })
+    if tail["consuming"] and fills \
+            and all(ord(ch) in charset for ch in entry):
+        fill = chr(32 if 32 in fills else next(
+            (c for c in fills if chr(c).isalnum()),
+            fills[0]))
+        lanes.append({
+            "entry": entry, "fill": fill,
+            "poison": poison or "",
+        })
+        boundary_fill = _guard_breaking_fill(
+            parsed, flags, entry, fills, fill,
+        )
+        if boundary_fill is not None:
+            lanes.append({
+                "entry": entry, "fill": boundary_fill,
+                "poison": poison or "",
+            })
+        # Body-unit lane: a repeat whose BODY spans several chars
+        # (member-access links, dotted segments) only exposes its
+        # per-position re-walk to a pump built from whole body units
+        # — a single-char fill never iterates it.  All branch
+        # variants of the body pump (the first-variant-only unit
+        # missed chains whose ambiguous separator sits in a later
+        # branch).
+        for body in bodies:
+            if len(body) > 1 and body != fill:
+                lanes.append({
+                    "entry": entry, "fill": body,
+                    "poison": poison or "",
+                })
+        # Unterminated-delimiter lane: when the entry char is
+        # consumable by R only INSIDE a multi-char body unit (an
+        # escape pair like \" for a string-literal matcher), the
+        # density pump's bare planted entries either satisfy the
+        # continuation (the plant doubles as the close — the match
+        # succeeds early) or halt the repeat at the next plant —
+        # either way each attempt costs O(gap), not O(run).  The
+        # pump for this shape is the opener ONCE, then repeats of
+        # the embedding unit with no close: every embedded entry is
+        # a live attempt position, and the repeat consumes ACROSS
+        # the remaining plants (each sits inside a unit), so every
+        # attempt re-scans the whole tail.
+        if len(entry) == 1:
+            try:
+                embed = _gen_min_seq_embed(
+                    arg[2], flags, ord(entry),
+                )
+            except _Unsupported:
+                embed = ""
+            if len(embed) > 1 and entry in embed \
+                    and embed not in bodies:
+                lanes.append({
+                    "entry": entry, "fill": embed,
+                    "poison": poison or "",
+                    "opener": True,
+                })
+    if tail["consuming"] and entry:
+        # Multi-char opener lane: the entry ONCE, then body-unit
+        # repeats — a single attempt whose repeat/continuation
+        # ambiguity is quadratic in the run (bounded-chain shapes
+        # like ``head\(\s*(?:\w+\s*(?:->|\.)\s*)+field[,)]``).  Not
+        # gated on entry⊆charset: the entry never has to sit inside
+        # R's span (it appears once), which is exactly why the
+        # density lanes — all so gated — could not price these
+        # shapes.
+        for unit in bodies:
+            if len(unit) > 1:
+                lanes.append({
+                    "entry": entry, "fill": unit,
+                    "poison": poison or "", "opener": True,
+                })
+    if tail["consuming"] and (charset & first):
+        # Overlap lane: when the continuation's first char is ALSO
+        # in charset(R), the split of a hostile run between R and
+        # its continuation is the attack — one attempt at a single
+        # entry, quadratic in the run.  Neither the pure fill nor
+        # the body unit measures it (both avoid the tail's
+        # first-set).
+        overlap = sorted(charset & first)
+        ofill = chr(next(
+            (c for c in overlap if chr(c).isprintable()),
+            overlap[0]))
+        lanes.append({
+            "entry": entry, "fill": ofill,
+            "poison": poison or "", "once": True,
+        })
+
+
+def _build_scan_restart_attack(lane: dict, n: int) -> str | None:
+    """Position-density pump: (entry + fill)^k + poison.  Every entry
+    occurrence is a live attempt position inside the fill run; the
+    poison keeps the continuation failing so each attempt pays its
+    full re-scan.  The trailing-span pair pump does NOT fire on
+    these shapes (no adjacent overlapping pair) — this family needs
+    its own synthesis."""
+    if lane.get("starved"):
+        return None
+    if lane.get("opener"):
+        # Unterminated-delimiter pump: the opener once, then units
+        # that embed the entry char, never a close — every embedded
+        # entry restarts the scan and the repeat carries each
+        # attempt across the whole remaining run.  Repeating the
+        # ENTRY with the units (the density shape below) would plant
+        # bare entries, which close the very shapes this lane
+        # exists for.
+        unit = lane["fill"]
+        return lane["entry"] + unit * max(2, n // len(unit)) \
+            + lane["poison"]
+    if lane.get("once"):
+        # Single-attempt ambiguity pump: one entry, then a run the
+        # repeat and its continuation must SPLIT.
+        run = lane["fill"] * max(2, n // max(1, len(lane["fill"])))
+        return lane["entry"] + run + lane["poison"]
+    unit = lane["entry"] + lane["fill"]
+    if not unit:
+        return None
+    return unit * max(2, n // len(unit)) + lane["poison"]
+
+
+def _site_scan_lanes(site: _Site) -> list[dict]:
+    """Rule S applies to scanning call modes only: an anchored
+    match/fullmatch site has a single start position, so the
+    position loop never restarts."""
+    if site.mode != "search":
+        return []
+    try:
+        parsed = sre_parse.parse(site.pattern, site.flags)
+    except (re.error, ValueError, OverflowError):
+        return []
+    return _find_scan_restart_lanes(parsed, parsed.state.flags)
+
+
+def _scan_restart_members() -> dict[tuple[str, str], dict]:
+    """Rule S's PROPOSED member set over runtime source, keyed and
+    digest-stamped like the trailing-span arm."""
+    import hashlib
+
+    members: dict[tuple[str, str], dict] = {}
+    for site in _all_runtime_sites():
+        lanes = _site_scan_lanes(site)
+        if not lanes:
+            continue
+        digest = hashlib.sha256(
+            f"{site.flags}:{site.mode}:{site.pattern}".encode(),
+        ).hexdigest()[:12]
+        record = members.setdefault(site.key, {
+            "digests": set(), "sites": [],
+        })
+        record["digests"].add(digest)
+        record["sites"].append(
+            (site.lineno, site.pattern, site.flags, site.mode),
+        )
+    return members
+
+
+def _load_scan_expected() -> dict:
+    import json
+
+    with _SCAN_EXPECTED_FILE.open(encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _scan_oracle_probe_lines(pattern: str, flags: int,
+                             index: int) -> None:
+    """Worker body (hard-killed subprocess): ``n dt`` probe lines
+    for one scan-restart lane at doubling sizes."""
+    try:
+        parsed = sre_parse.parse(pattern, flags)
+    except (re.error, ValueError):
+        print("NOPARSE")
+        return
+    lanes = _find_scan_restart_lanes(parsed, parsed.state.flags)
+    if index >= len(lanes):
+        print("NOLANE")
+        return
+    lane = lanes[index]
+    rx = re.compile(pattern, flags)
+    # Attack-degeneracy guard: an attack the pattern MATCHES returns
+    # from the position loop early and prices no restart cost — a
+    # matching lane must never contribute a LINEAR verdict.  The
+    # poison chooser is first-set bounded, and a LATER continuation
+    # atom can complete a match the first-set test cannot see (a
+    # poison ``;`` completed ``return …;`` and minted a linear pin),
+    # so retry poison-free first.  When every spelling still
+    # matches, the lane is still TIMED — a pathological match cost
+    # must not hide behind the guard — but its probes are only
+    # reported if they blow the budget; a fast matching lane
+    # reports DEGEN, which the parent treats as unsynthesizable.
+    degenerate = False
+    probe = _build_scan_restart_attack(lane, 1000)
+    if probe is not None and rx.search(probe) is not None:
+        stripped = dict(lane, poison="")
+        probe = _build_scan_restart_attack(stripped, 1000)
+        if probe is not None and rx.search(probe) is None:
+            lane = stripped
+        else:
+            degenerate = True
+    buffered: list[str] = []
+    n = 500
+    while n <= 32000:
+        text = _build_scan_restart_attack(lane, n)
+        if text is None:
+            print("NOATTACK")
+            return
+        # Min-of-N CPU time, not one wall sample — same contention
+        # rationale as _oracle_probe_lines: single samples on a
+        # loaded runner synthesize false superlinear exponents.
+        elapsed = _min_probe_seconds(lambda: rx.search(text), 1.0)
+        if degenerate:
+            buffered.append(f"{n} {elapsed:.6f}")
+        else:
+            print(n, f"{elapsed:.6f}", flush=True)
+        if elapsed > 1.0:
+            break
+        n *= 2
+    if degenerate:
+        if buffered and float(buffered[-1].split()[1]) > 1.0:
+            print("\n".join(buffered), flush=True)
+        else:
+            print("DEGEN")
+
+
+def _scan_oracle_classify(pattern: str,
+                          flags: int) -> tuple[float | None, bool]:
+    """(worst exponent | None, any-lane-synthesized) across the
+    site's scan-restart lanes (subprocess-hard-killed, same probe
+    protocol and trust floor as the pair/restart oracle)."""
+    try:
+        parsed = sre_parse.parse(pattern, flags)
+    except (re.error, ValueError):
+        return (None, False)
+    lanes = _find_scan_restart_lanes(parsed, parsed.state.flags)
+    worst: float | None = None
+    synthesized = False
+    for index in range(min(len(lanes), _SCAN_LANE_CAP)):
+        exponent, status = _oracle_lane(
+            pattern, flags, "search", "scan", index, "",
+        )
+        if status not in ("NOATTACK", "NOPARSE", "NOLANE", "DEGEN"):
+            synthesized = True
+        if exponent is not None and (worst is None or exponent > worst):
+            worst = exponent
+    return (worst, synthesized)
+
+
+def _regen_scan_expected(workers: int = 8) -> int:
+    """Re-run the position-density oracle over every Rule S proposal
+    and rewrite the pin file.  REFUSES to pin a superlinear member —
+    fixing the pattern is the only way through."""
+    import json
+    from concurrent.futures import ThreadPoolExecutor
+
+    members = _scan_restart_members()
+    rows: dict[str, dict] = {}
+    failures: list[str] = []
+
+    def classify(item):
+        key, record = item
+        lineno, pattern, flags, _mode = record["sites"][0]
+        exponent, synthesized = _scan_oracle_classify(pattern, flags)
+        lanes = _site_scan_lanes(_Site(
+            key, lineno, pattern, flags, "search", None,
+        ))
+        starved = any(lane.get("starved") for lane in lanes)
+        return key, record, exponent, synthesized, starved, len(lanes)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for key, record, exponent, synthesized, starved, n_lanes \
+                in pool.map(classify, sorted(members.items())):
+            if n_lanes > _SCAN_LANE_CAP:
+                # Loud, never silent: a part-measured member must not
+                # pin — its unmeasured lanes could carry the verdict.
+                failures.append(
+                    f"{key[0]} :: {key[1]} has {n_lanes} lanes, over "
+                    f"the classify cap ({_SCAN_LANE_CAP}) — raise "
+                    f"_SCAN_LANE_CAP or simplify the pattern",
+                )
+                continue
+            if record["digests"] <= set(_SCAN_ADJUDICATED):
+                # Never-compiled table string with a documented
+                # disposition (see _SCAN_ADJUDICATED) — pinned, not
+                # refused.
+                verdict = "adjudicated"
+            elif not synthesized or (
+                    starved
+                    and (exponent is None or exponent < 1.5)):
+                # No lane synthesized, or a density lane was STARVED
+                # (no fill avoids the continuation's true first-set):
+                # the remaining lanes alone must not mint a linear
+                # pin — the manual-review lane is identity-pinned, so
+                # the member surfaces loudly until adjudicated.
+                verdict = "noattack"
+            elif exponent is not None and exponent >= 1.5:
+                failures.append(
+                    f"{key[0]} :: {key[1]} measures superlinear "
+                    f"(exp={exponent:.2f}) — fix the pattern (pin the "
+                    f"run start, bound the window, break the chain); "
+                    f"the pin file only accepts oracle-linear members",
+                )
+                continue
+            else:
+                verdict = "linear"
+            rows["\x1f".join(key)] = {
+                "digests": sorted(record["digests"]),
+                "verdict": verdict,
+                "exp": None if exponent is None else round(exponent, 2),
+            }
+    if failures:
+        print("REFUSED to regenerate:")
+        for failure in failures:
+            print(" ", failure)
+        return 1
+    _SCAN_EXPECTED_FILE.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "_comment": (
+            "Pinned scan-restart census members: Rule S proposals "
+            "the position-density pump oracle measured linear, keyed "
+            "file\x1fname with pattern digests. Regenerate with: "
+            "python3 .github/tests/test_redos_idiom_census.py "
+            "--regen-scan-restart  (the tool refuses superlinear "
+            "members; hand-editing a verdict is caught by the "
+            "nightly oracle re-check)."
+        ),
+        "members": dict(sorted(rows.items())),
+    }
+    with _SCAN_EXPECTED_FILE.open("w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=1, sort_keys=True)
+        fh.write("\n")
+    noattack = [k for k, v in rows.items() if v["verdict"] == "noattack"]
+    print(f"pinned {len(rows)} members "
+          f"({len(noattack)} noattack) -> {_SCAN_EXPECTED_FILE}")
+    return 0
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Nested-quantifier arm (Rule N): exponential-composition ambiguity —
+# an unbounded repeat over a body that can match the same run in more
+# than one way (see the module docstring).  Single-stage: the static
+# rule IS the verdict (a genuine member is exponential — there is no
+# "linear at the real call site" case for an oracle stage to dispose),
+# with the MULTILINE arm's allowlist grammar and a bounded CPU-time
+# growth probe (``_exponential_growth``) for adjudication.
+# ═════════════════════════════════════════════════════════════════════
+
+# (posix-relative path, pattern variable/first-40-chars key) ->
+# justification.  Empty on purpose: the exponential class has no
+# acceptable input-bound story short of a proof the pattern never
+# meets attacker-shaped text — fix a member by REMOVING THE
+# AMBIGUITY (a single-character base inside the repeated group, an
+# unambiguous alternation), never by merely bounding the outer
+# repeat: ``(?:a+){1,5000}`` keeps the whole split search below the
+# bound and measures the same ~2^n as its unbounded twin.  (Both
+# historical fixes removed the ambiguity; the one that also bounded
+# its outer repeat is safe because of its single-unit arms, not
+# because of the bound.)
+_NESTED_ALLOWLIST: dict[tuple[str, str], str] = {}
+
+# Outer-repeat bound at or above which Rule N treats a bounded
+# repeat as unbounded.  Mechanism: an outer bound hi caps the
+# ambiguous split search at ~2^(hi-1) engine states, fully reachable
+# from a ~hi-byte input (measured ~65 ns/state on this class, so the
+# cap in wall terms doubles per +1 on the bound: hi=16 ~2 ms, hi=24
+# ~0.5 s, hi=28 ~10 s, hi=32 ~2.5 min — a {1,5000} spelling measures
+# the same ~1.0 doublings/char as its unbounded twin).  Why not
+# lower: below 24 the pattern is a POLYNOMIAL split search (degree
+# hi-1 in input length — the bound caps the split count, not the
+# states per split, so long inputs still cost real CPU: {1,12}
+# measures tens of seconds at a few dozen bytes), excluded on CLASS
+# grounds — this arm's verdict is "exponential", and diluting it
+# with polynomial members would blunt both; the sub-threshold band
+# stays deliberately non-member (its unanchored spellings are Rule
+# S's to measure empirically; the ^-anchored ones are a NAMED
+# residual, see the module docstring).  Why not higher: at 24 the cap already
+# reads as a stall and every +1 doubles it — waiting for a "clearly
+# unbounded-equivalent" bound only excuses members whose worst case
+# is a hang.  Two-direction regression tests pin both sides of the
+# knob.
+_EFFECTIVELY_UNBOUNDED = 24
+
+
+def _fold_case(chars: set[int], flags: int) -> set[int]:
+    """Close a char set over ASCII/simple case folding when the
+    pattern is compiled IGNORECASE — ``(a|A)*`` is the same
+    two-derivations-per-char ambiguity as ``(a|a)*`` under it."""
+    if not flags & re.IGNORECASE:
+        return chars
+    folded = set(chars)
+    for char in chars:
+        folded.add(ord(chr(char).lower()[0]))
+        folded.add(ord(chr(char).upper()[0]))
+    return folded
+
+
+def _one_char_node(node: tuple, flags: int) -> set[int]:
+    """Chars c such that ``node`` alone can match exactly the
+    one-character string c."""
+    op, arg = node
+    if op is sre_parse.LITERAL:
+        return _fold_case({arg}, flags)
+    if op is sre_parse.NOT_LITERAL:
+        return set(_PROBE) - {arg}
+    if op is sre_parse.IN:
+        return _fold_case(_in_set(arg), flags)
+    if op is sre_parse.ANY:
+        return set(_PROBE) if flags & re.DOTALL else set(_PROBE) - {10}
+    if op is sre_parse.SUBPATTERN:
+        return _one_char_seq(arg[3], flags)
+    if op is sre_parse.BRANCH:
+        chars: set[int] = set()
+        for branch in arg[1]:
+            chars |= _one_char_seq(branch, flags)
+        return chars
+    if op in (sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT):
+        lo, hi, body = arg
+        if lo <= 1 <= hi:
+            return _one_char_seq(body, flags)
+        return set()
+    return set()  # AT / ASSERT / GROUPREF: zero-width or unknown
+
+
+def _one_char_seq(seq, flags: int) -> set[int]:
+    """Chars c such that the WHOLE sequence can match exactly c:
+    one node consumes exactly c, every other node matches empty."""
+    can_empty = True
+    chars: set[int] = set()
+    for node in seq:
+        node_empty = _is_transparent(node)
+        node_chars = _one_char_node(node, flags)
+        new_chars = chars if node_empty else set()
+        if can_empty:
+            new_chars = new_chars | node_chars
+        can_empty = can_empty and node_empty
+        chars = new_chars
+        if not can_empty and not chars:
+            return set()
+    return chars
+
+
+def _variable_run_node(node: tuple, flags: int) -> bool:
+    """Can ``node`` consume a run with >= 2 distinct NONZERO widths?
+    (Zero-width iterations are pruned by the engine's empty-match
+    guard, so ``a?`` — widths {0,1} — offers exactly one usable
+    width and is unambiguous under an outer repeat.)"""
+    op, arg = node
+    if op in (sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT):
+        lo, hi, body = arg
+        if not _seq_charset(body, flags):
+            return False  # zero-width body: nothing to split
+        if hi == _MAXREP or max(lo, 1) < hi:
+            return True
+        return _variable_run_seq(body, flags)  # fixed count: descend
+    if op is sre_parse.SUBPATTERN:
+        return _variable_run_seq(arg[3], flags)
+    if op is sre_parse.BRANCH:
+        return any(_variable_run_seq(b, flags) for b in arg[1])
+    return False
+
+
+def _variable_run_seq(seq, flags: int) -> bool:
+    """Nested-variable-run condition: some node in the sequence is a
+    variable-width run consumer while EVERY sibling can match empty —
+    an outer iteration can then begin and end anywhere inside the
+    run, so outer iterations split it ambiguously.  The transparent-
+    siblings requirement is what keeps ``(?:"[^"]*")*`` (iterations
+    pinned by required delimiters) and ``(?:a\\s*)+`` (the linear /
+    polynomial adjacent-span family, Rule C/S territory) out."""
+    nodes = list(seq)
+    for i, node in enumerate(nodes):
+        if not all(_is_transparent(other)
+                   for j, other in enumerate(nodes) if j != i):
+            continue
+        if _variable_run_node(node, flags):
+            return True
+    return False
+
+
+def _branch_ambiguity(seq, flags: int,
+                      path_consumes: bool = False) -> bool:
+    """Branch-ambiguity condition, anywhere in the sequence: a BRANCH
+    two of whose arms can completely match the same single character,
+    or two of whose arms can both match empty (what prefix-hoisting
+    leaves of same-word arms) PROVIDED something else on the branch's
+    derivation path can consume — an empty-empty branch that IS the
+    whole iteration only yields zero-width iterations, which the
+    engine's empty-match guard prunes (``(?:x|(?:|))*`` is linear;
+    ``(a|a)*`` — hoisted to ``a(?:|)`` — doubles per consumed char).
+    Judged on the optimized tree — single-char alternations the
+    parser collapsed into one character class carry no branch and no
+    ambiguity."""
+    nodes = list(seq)
+    for i, node in enumerate(nodes):
+        op, arg = node
+        siblings_consume = path_consumes or any(
+            _charset(other, flags)
+            for j, other in enumerate(nodes) if j != i
+        )
+        if op is sre_parse.SUBPATTERN:
+            if _branch_ambiguity(arg[3], flags, siblings_consume):
+                return True
+        elif op in (sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT):
+            if _branch_ambiguity(arg[2], flags, siblings_consume):
+                return True
+        elif op is sre_parse.BRANCH:
+            arms = [_one_char_seq(branch, flags) for branch in arg[1]]
+            for k, chars in enumerate(arms):
+                if any(chars & other for other in arms[k + 1:]):
+                    return True
+            empty_arms = sum(
+                1 for branch in arg[1]
+                if all(_is_transparent(n) for n in branch)
+            )
+            if empty_arms >= 2 and siblings_consume:
+                return True
+            # Arms recurse with the BRANCH node's own context only:
+            # a sibling ARM's consumption is never on this arm's
+            # derivation path.
+            if any(_branch_ambiguity(branch, flags, siblings_consume)
+                   for branch in arg[1]):
+                return True
+    return False
+
+
+def _nested_body_ambiguity(body, flags: int) -> str | None:
+    """Which ambiguity class (if any) an unbounded repeat's body
+    carries.  The branch condition additionally requires the body to
+    consume at all — a purely zero-width body has no run to pump and
+    the engine prunes its empty iterations."""
+    if _variable_run_seq(body, flags):
+        return "nested-variable-run"
+    if _seq_charset(body, flags) and _branch_ambiguity(body, flags):
+        return "branch-ambiguity"
+    return None
+
+
+# Interpreter-conditional ops (Python 3.11+): the older-interpreter
+# ``sre_parse`` fallback lacks them, so the finder compares against
+# None there (matching no node) instead of raising at import.
+_ATOMIC_GROUP = getattr(sre_parse, "ATOMIC_GROUP", None)
+_POSSESSIVE_REPEAT = getattr(sre_parse, "POSSESSIVE_REPEAT", None)
+
+
+def _find_nested_lanes(seq, flags: int, tail_after=()) -> list[str]:
+    """Rule N proposer: every effectively-unbounded repeat with an
+    ambiguous body AND a failable continuation (walked with the
+    enclosing tail visible, like the other arms' finders).  Returns
+    the ambiguity kinds, one entry per member repeat.
+
+    Lookaround and atomic-group bodies are searched with an EMPTY
+    outer tail: both constructs are atomic — the engine never
+    re-enters one that succeeded, so only an in-body continuation can
+    drive the split retries — but an ambiguous repeat WITH an in-body
+    failable continuation does its exponential work internally before
+    the construct resolves (``(?=(?:v+)+w)`` explodes while the
+    lookahead is still being evaluated).  A possessive/atomic repeat
+    is never itself an outer candidate for the same reason: its first
+    greedy parse commits, so the outer split is never retried."""
+    lanes: list[str] = []
+    nodes = list(seq)
+    for i, node in enumerate(nodes):
+        op, arg = node
+        rest = nodes[i + 1:] + list(tail_after)
+        if op is sre_parse.SUBPATTERN:
+            lanes.extend(_find_nested_lanes(arg[3], flags, rest))
+        elif op is sre_parse.BRANCH:
+            for branch in arg[1]:
+                lanes.extend(_find_nested_lanes(branch, flags, rest))
+        elif op in (sre_parse.ASSERT, sre_parse.ASSERT_NOT):
+            lanes.extend(_find_nested_lanes(arg[1], flags))
+        elif op is _ATOMIC_GROUP:
+            lanes.extend(_find_nested_lanes(arg, flags))
+        elif op is _POSSESSIVE_REPEAT:
+            lanes.extend(_find_nested_lanes(arg[2], flags))
+        elif op in (sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT):
+            lanes.extend(_find_nested_lanes(arg[2], flags, rest))
+            if arg[1] != _MAXREP and arg[1] < _EFFECTIVELY_UNBOUNDED:
+                # A small outer bound caps the split search (see
+                # _EFFECTIVELY_UNBOUNDED); at or above the threshold
+                # the bound is cosmetic and the repeat is judged as
+                # unbounded.
+                continue
+            kind = _nested_body_ambiguity(arg[2], flags)
+            if kind is None:
+                continue
+            tail = _tail_verdict(rest, flags)
+            if tail["consuming"] or tail["failable_zw"]:
+                lanes.append(kind)
+    return lanes
+
+
+def _nested_is_member(pattern: str, flags: int = 0) -> bool:
+    """Rule N membership for one pattern (bool-only: the rule is the
+    verdict; there is no oracle stage)."""
+    try:
+        parsed = sre_parse.parse(pattern, flags)
+    except (re.error, ValueError, OverflowError):
+        return False
+    return bool(_find_nested_lanes(parsed, parsed.state.flags))
+
+
+def _nested_members() -> dict[tuple[str, str], list[str]]:
+    """Rule N's member set over the shared runtime-source extraction
+    (call sites and table entries both; table entries judged at their
+    worst case exactly like the two-stage arms — Rule N ignores call
+    mode anyway, since one anchored attempt already explodes)."""
+    members: dict[tuple[str, str], list[str]] = {}
+    for site in _all_runtime_sites():
+        if _nested_is_member(site.pattern, site.flags):
+            members.setdefault(site.key, []).append(
+                f"{site.key[0]}:{site.lineno}: {site.key[1]}",
+            )
+    return members
+
+
+def _exponential_growth(pattern: str, flags: int,
+                        attack: Callable[[int], str]) -> float:
+    """Adjudication probe: CPU-time doubling rate per pumped
+    character of ``re.search(pattern, attack(n))`` over small
+    doubling-family sizes.  A genuinely exponential member measures
+    ~1.0 doublings/char (x16 per +4 chars); a linear pattern never
+    clears the trust floor and measures 0.0.  CPU time
+    (``process_time``) like the oracle probe workers — co-runner
+    load cannot inflate it — and the step budget (break past 20 ms,
+    n capped at 26) bounds the worst probe at a fraction of a
+    second, so the probe is deterministic and default-tier safe."""
+    import math
+    import time
+
+    rx = re.compile(pattern, flags)
+    probes: list[tuple[int, float]] = []
+    n = 10
+    while n <= 26:
+        text = attack(n)
+        start = time.process_time()
+        rx.search(text)
+        elapsed = time.process_time() - start
+        probes.append((n, elapsed))
+        if elapsed > 0.02:
+            break
+        n += 4
+    trusted = [(size, t) for size, t in probes if t >= 1e-3]
+    if len(trusted) < 2:
+        return 0.0
+    (n1, t1), (n2, t2) = trusted[-2], trusted[-1]
+    return math.log2(t2 / max(t1, 1e-7)) / (n2 - n1)
+
+
+# Growth rate (doublings per pumped char) at or above which the probe
+# calls a shape exponential.  Genuine members measure ~1.0; the floor
+# sits far below (x3 per +4 chars) so scheduler noise cannot flap the
+# verdict in either direction, and far above any polynomial (a
+# quadratic member's ratio per +4 chars at these sizes is ~1.5x,
+# ~0.15 doublings/char).
+_EXPONENTIAL_RATE = 0.4
+
+_PROBE_FIXTURE_FILE = Path(__file__).resolve().parent / "data" / \
+    "redos_probe_fixtures.json"
+
+
+def _probe_fixture(shape: str, spelling: str) -> str:
+    """Member/fixed probe spellings for the adjudication self-check,
+    loaded from a data file rather than written as source literals:
+    the probe test proves at runtime which spelling is the hostile
+    one, and a static regex adjudicator scanning test source would
+    otherwise re-flag the census's own positive controls as
+    findings.  ``spelling`` is ``"member"`` or ``"fixed"``."""
+    import json
+
+    with _PROBE_FIXTURE_FILE.open(encoding="utf-8") as fh:
+        return json.load(fh)[shape][spelling]
+
+
+class RedosIdiomCensus(unittest.TestCase):
+
+    def test_detector_catches_the_idiom(self) -> None:
+        """Self-check: the detector recognises the known spellings
+        (guards against the census silently going vacuous)."""
+        self.assertTrue(_pattern_is_member(r"^\s*FROM\s+(\S+)", True))
+        self.assertTrue(_pattern_is_member(r"^\s+import", True))
+        self.assertTrue(_pattern_is_member(r"(?m)^\s*x", False))
+        self.assertTrue(_pattern_is_member(r"^[\s#]*x", True))
+        self.assertTrue(_pattern_is_member(r"^(?P<indent>\s+)- name:", True))
+        # Branch-embedded anchor: a MULTILINE ``^`` as one alternative
+        # of a statement-boundary group is the same idiom — every
+        # blank line satisfies the ``^`` branch.
+        self.assertTrue(_pattern_is_member(r"(?:^|;|\})\s*static\b", True))
+        self.assertFalse(
+            _pattern_is_member(r"(?:^|;|\})[^\S\n]*static\b", True),
+        )
+        self.assertFalse(_pattern_is_member(r"(?:;|\})\s*static\b", True))
+        # Non-members: no MULTILINE, horizontal-only, bounded repeat.
+        self.assertFalse(_pattern_is_member(r"^\s*import", False))
+        self.assertFalse(_pattern_is_member(r"^[^\S\n]*import", True))
+        self.assertFalse(_pattern_is_member(r"^\s{0,8}import", True))
+        self.assertFalse(_pattern_is_member(r"^import\s+x", True))
+        # Repeats that cannot BEGIN at a newline fail a blank-line
+        # attempt in O(1): not members.
+        self.assertFalse(_pattern_is_member(
+            r"^(?:__attribute__\s*\(\([^()]*\)\)\s*)*(\w+)\s*\(", True,
+        ))
+        self.assertFalse(_pattern_is_member(r"^([0-9a-f]+)\s+\w+", True))
+
+    def test_scan_sees_aliased_and_composed_patterns(self) -> None:
+        """Scan-level self-check: an aliased ``import re as _rx``
+        receiver and a concat pattern with a dynamic operand
+        (``"^\\s*" + re.escape(x)``) are still members — both
+        spellings hid real members before the resolver handled
+        them."""
+        import tempfile
+
+        source = (
+            "import re as _rx\n"
+            "def probe(name, text):\n"
+            "    pat = _rx.compile(\n"
+            "        r'^\\s*static\\s+' + _rx.escape(name) + r'\\s*\\(',\n"
+            "        _rx.MULTILINE,\n"
+            "    )\n"
+            "    return pat.search(text)\n"
+        )
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".py", delete=False,
+        ) as fh:
+            fh.write(source)
+            probe = Path(fh.name)
+        try:
+            members = _scan_file(probe)
+        finally:
+            probe.unlink()
+        self.assertEqual([key for key, _ in members],
+                         [(probe.name, "pat")])
+
+    def test_scan_catches_every_multiline_spelling(self) -> None:
+        """Scan-level self-check for the raw-text gate: a planted
+        member must be caught through ``_scan_file`` under EVERY
+        supported MULTILINE spelling — the flag attribute, its ``M``
+        alias (on an aliased import), inline flag groups (bare and
+        combined), and the NFKC fullwidth ``Ｍ`` — plus the
+        branch-embedded anchor, so a gate regression fails here
+        instead of silently shrinking the census."""
+        import tempfile
+
+        plants: list[tuple[str, str]] = [
+            ("import re\n"
+             "p = re.compile(r'^\\s*planted', re.MULTILINE)\n", "p"),
+            ("import re as _rx\n"
+             "p = _rx.compile(r'^\\s*planted', _rx.M)\n", "p"),
+            ("import re\n"
+             "p = re.compile(r'(?m)^\\s*planted')\n", "p"),
+            ("import re\n"
+             "p = re.compile(r'(?im)^[\\s#]*planted')\n", "p"),
+            # Branch-embedded anchor member through the scan layer.
+            ("import re\n"
+             "p = re.compile(r'(?:^|;)\\s*planted', re.M)\n", "p"),
+            # Fullwidth Ｍ: Python NFKC-normalizes identifiers at
+            # parse time, so this IS the ``M`` attribute to the AST
+            # detector — the gate normalizes before matching so it
+            # agrees.
+            ("import re\n"
+             "p = re.compile(r'^\\s*planted', re.Ｍ)\n", "p"),
+            # Numeric flag literals: positional, |-combined value,
+            # and keyword — no MULTILINE/M/(?m token anywhere, so
+            # both the gate and the AST flag check must handle the
+            # decimal spelling.
+            ("import re\n"
+             "p = re.compile(r'^\\s*planted', 8)\n", "p"),
+            ("import re\n"
+             "p = re.compile(r'^\\s*planted', 10)\n", "p"),
+            ("import re\n"
+             "p = re.compile(r'^\\s*planted', flags=8)\n", "p"),
+            # Annotated constant: the repo's type-annotation practice
+            # steers new pattern constants into exactly this spelling.
+            ("import re\n"
+             "_P: str = r'^\\s*planted'\n"
+             "p = re.compile(_P, re.MULTILINE)\n", "p"),
+            # Multi-target constant assignment.
+            ("import re\n"
+             "_A = _B = r'^\\s*planted'\n"
+             "p = re.compile(_B, re.MULTILINE)\n", "p"),
+            # Name-bound flag constant ("extract shared flags" is a
+            # natural refactor; the raw-text gate passes on the
+            # MULTILINE token, so this miss was silent).
+            ("import re\n"
+             "_FLAGS = re.MULTILINE\n"
+             "p = re.compile(r'^\\s*planted', _FLAGS)\n", "p"),
+            # Bytes pattern (decoded latin-1 for the structural test).
+            ("import re\n"
+             "p = re.compile(rb'^\\s*planted', re.MULTILINE)\n", "p"),
+            # from-import bindings: Name-shaped call site AND a bare
+            # flag name — neither Attribute-shaped spelling appears.
+            ("from re import compile as _rc, MULTILINE as _ML\n"
+             "p = _rc(r'^\\s*planted', _ML)\n", "p"),
+        ]
+        for source, name in plants:
+            with tempfile.NamedTemporaryFile(
+                "w", suffix=".py", delete=False,
+            ) as fh:
+                fh.write(source)
+                probe = Path(fh.name)
+            try:
+                members = _scan_file(probe)
+            finally:
+                probe.unlink()
+            self.assertEqual([key for key, _ in members],
+                             [(probe.name, name)], source)
+
+    def test_extract_worker_roundtrip_matches_serial(self) -> None:
+        """Self-check for the extraction fan-out's wire format: one
+        real ``--extract-worker`` subprocess over a planted module
+        whose sites cover the digest-visible flag spellings
+        (attribute, |-combined, numeric literal, none) must
+        reproduce the serial extraction EXACTLY — including the
+        ``f"{flags}"`` rendering the pin digests hash, which the
+        JSON hop once collapsed from ``re.MULTILINE`` to ``8``,
+        silently re-keying every pinned digest."""
+        import json
+        import subprocess
+        import tempfile
+
+        source = (
+            "import re\n"
+            "A = re.compile(r'^\\s*alpha', re.MULTILINE)\n"
+            "B = re.compile(r'beta', 8)\n"
+            "C = re.compile(r'gamma')\n"
+            "D = re.compile(r'delta', re.IGNORECASE | re.DOTALL)\n"
+        )
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".py", delete=False,
+        ) as fh:
+            fh.write(source)
+            probe = Path(fh.name)
+        try:
+            serial = _extract_sites(probe)
+            proc = subprocess.run(
+                [sys.executable, __file__, "--extract-worker"],
+                input=json.dumps({"paths": [str(probe)]}),
+                capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            roundtripped = _sites_from_rows(json.loads(proc.stdout))
+        finally:
+            probe.unlink()
+
+        def flat(site: _Site) -> tuple:
+            return (site.key, site.lineno, site.pattern,
+                    f"{site.flags}", type(site.flags).__name__,
+                    site.mode, site.name, site.origin)
+
+        self.assertEqual(len(serial), 4, "planting surface changed?")
+        self.assertEqual([flat(s) for s in roundtripped],
+                         [flat(s) for s in serial])
+
+    @pytest.mark.slow
+    def test_runtime_source_has_no_members(self) -> None:
+        files = _iter_python_files()
+        self.assertGreater(len(files), 100, "scan roots missing?")
+        # Sites and keys are reported DISTINCTLY: several call sites
+        # can share one key (same file + same assigned name or
+        # 40-char pattern prefix — e.g. one module-level pattern
+        # searched from two call sites, or two same-named builder
+        # locals), so the site count and the key count differ and
+        # both must be visible for the numbers to reconcile.
+        offenders: dict[tuple[str, str], list[str]] = {}
+        n_sites = 0
+        # Consumes the shared whole-tree extraction (cached once per
+        # process) — the trailing-span arm pays for the parse, this
+        # arm reuses it.
+        for site in _all_runtime_sites():
+            if not _pattern_is_member(site.pattern, site.flags):
+                continue
+            n_sites += 1
+            offenders.setdefault(site.key, []).append(
+                f"{site.key[0]}:{site.lineno}: {site.key[1]}",
+            )
+        unexpected = sorted(set(offenders) - set(_ALLOWLIST))
+        stale = sorted(set(_ALLOWLIST) - set(offenders))
+        sites = [s for k in unexpected for s in offenders[k]]
+        self.assertFalse(unexpected, (
+            f"blank-run-quadratic regex idiom (MULTILINE ^ + unbounded "
+            f"newline-capable quantifier) in runtime source — "
+            f"{n_sites} member call site(s) across {len(unexpected)} "
+            f"key(s). Spell the anchor whitespace horizontally "
+            f"([^\\S\\n]) or, if the pattern is provably applied "
+            f"per-line, allowlist it WITH justification:\n  "
+            + "\n  ".join(sites)
+        ))
+        self.assertFalse(stale, f"stale allowlist entries: {stale}")
+
+    def test_pattern_data_files_have_no_members(self) -> None:
+        """The same class closure for patterns that live in DATA
+        files: the preflight corpus loader compiles ``_multiline``
+        corpora with re.MULTILINE | re.DOTALL and searches them over
+        explicitly untrusted content.  Membership runs over the
+        patterns the loader actually loads, with the flags it
+        actually compiles."""
+        members = _data_file_members()
+        self.assertFalse(members, (
+            "blank-run-quadratic regex idiom in a pattern data file — "
+            "spell the anchor whitespace horizontally ([^\\S\\n]):\n  "
+            + "\n  ".join(f"{stem}: {pat}" for stem, pat in members)
+        ))
+
+    def test_data_file_arm_detects_a_planted_member(self) -> None:
+        """Self-check for the data-file arm: plant a member in a
+        scratch copy of the corpus directory and point the loader at
+        it — the arm must flag the plant (and ONLY the plant, on the
+        fixed corpus)."""
+        import shutil
+        import sys
+        import tempfile
+
+        sys.path.insert(0, str(_REPO))
+        try:
+            from core.security import prompt_input_preflight as pf
+        finally:
+            sys.path.remove(str(_REPO))
+
+        with tempfile.TemporaryDirectory() as td:
+            scratch = Path(td) / "injection_patterns"
+            shutil.copytree(pf._PATTERNS_DIR, scratch)
+            with (scratch / "english_multiline.txt").open(
+                "a", encoding="utf-8",
+            ) as fh:
+                fh.write("\n^\\s*planted_member\\b\n")
+            original = pf._PATTERNS_DIR
+            pf._PATTERNS_DIR = scratch
+            try:
+                members = _data_file_members()
+            finally:
+                pf._PATTERNS_DIR = original
+        self.assertEqual(
+            members,
+            [("english_multiline", "^\\s*planted_member\\b")],
+        )
+
+    def test_data_file_arm_detects_a_planted_exfil_member(self) -> None:
+        """Self-check for the exfil-rules arm: plant an inline-(?m)
+        member in a scratch copy of the JSON and point the loader at
+        it — the arm must flag the plant. Today's shipped entries
+        compile flag-less (not census-class), so an operator-extended
+        entry with an inline ``(?m)`` was invisible to BOTH census
+        arms before this arm existed."""
+        import json as _json
+        import tempfile
+
+        _, _exfil = _data_file_loaders()
+
+        planted = r"(?m)^\s*evil\.example\b"
+        with tempfile.TemporaryDirectory() as td:
+            scratch = Path(td) / "exfil_destinations.json"
+            data = _json.loads(
+                _exfil._DATA_FILE.read_text(encoding="utf-8"))
+            data["entries"].append({
+                "category": "test", "severity": "high",
+                "reason": "planted census member", "pattern": planted,
+            })
+            scratch.write_text(_json.dumps(data), encoding="utf-8")
+            original_file = _exfil._DATA_FILE
+            original_cache = _exfil._RULES_CACHE
+            _exfil._DATA_FILE = scratch
+            _exfil._RULES_CACHE = None
+            try:
+                members = _data_file_members()
+            finally:
+                _exfil._DATA_FILE = original_file
+                _exfil._RULES_CACHE = original_cache
+        # The plant — and ONLY the plant — on the shipped rule set.
+        self.assertEqual(
+            [m for m in members if m[0] == "exfil_destinations"],
+            [("exfil_destinations", planted)],
+        )
+
+
+class TrailingSpanCensus(unittest.TestCase):
+    """Two-stage arms: Rule C / Rule R propose, the pinned oracle
+    verdicts dispose.  The default tier never runs the oracle."""
+
+    def test_rule_c_catches_known_spellings(self) -> None:
+        """Detector self-check on the arm's founding members and
+        non-members (guards against the proposer going vacuous)."""
+
+        def rule_c(pattern: str, flags: int = 0) -> bool:
+            parsed = sre_parse.parse(pattern, flags)
+            return any(
+                pair["tail"]["consuming"] or pair["tail"]["failable_zw"]
+                for pair in _find_pairs(parsed, parsed.state.flags)
+            )
+
+        # The two founding members: consuming and ZERO-WIDTH failable
+        # continuations (the consuming-only variant of this rule was
+        # recall-blind on the second).
+        self.assertTrue(rule_c(
+            r"^[^\S\n]*import\s+(?:static\s+)?"
+            r"([A-Za-z_][A-Za-z0-9_.]*)\s*(?:\.\*)?\s*;",
+            re.MULTILINE,
+        ))
+        self.assertTrue(rule_c(
+            r"^[^\S\n]*return\s+(0|nil|None|True|true|EXIT_SUCCESS)"
+            r"\s*;?\s*$",
+            re.MULTILINE,
+        ))
+        # Fixed spellings: folding the tail into the gated group
+        # removes the adjacent pair entirely.
+        self.assertFalse(rule_c(
+            r"^[^\S\n]*import\s+(?:static\s+)?"
+            r"([A-Za-z_][A-Za-z0-9_.]*)\s*(?:\.\*\s*)?;",
+            re.MULTILINE,
+        ))
+        self.assertFalse(rule_c(
+            r"^[^\S\n]*return\s+(0|nil|None|True|true|EXIT_SUCCESS)"
+            r"\s*(?:;\s*)?$",
+            re.MULTILINE,
+        ))
+        # Linear lookalike that must NOT flood the arm: adjacent
+        # overlapping spans with NO failable continuation (the
+        # pattern can end the match inside the run).
+        self.assertFalse(rule_c(r"=\s*(.+)"))
+
+    def test_rule_r_catches_the_restart_shape(self) -> None:
+        """The anchor-restart proposer sees the newline-crossing
+        repeat one token PAST the anchor (the spelling that survived
+        the anchor-adjacent arm above), and lets bounded spellings
+        through."""
+
+        def rule_r(pattern: str, flags: int = 0) -> bool:
+            parsed = sre_parse.parse(pattern, flags)
+            return bool(
+                _find_restart_entries(parsed, parsed.state.flags),
+            )
+
+        self.assertTrue(rule_r(
+            r"^(?P<head>[A-Za-z_][\w\s\*]*?)\b(?P<name>[A-Za-z_]\w*)"
+            r"\s*\((?P<params>[^;{)]*)\)\s*\{",
+            re.MULTILINE,
+        ))
+        self.assertTrue(rule_r(
+            r"^[ \t]*(?:\w+\s+)*(\w+)\s*\(", re.MULTILINE,
+        ))
+        # No MULTILINE -> a single anchor, no restart.
+        self.assertFalse(rule_r(r"^(?:\w+\s+)*(\w+)\s*\("))
+
+    def test_oracle_synthesizes_both_attack_families(self) -> None:
+        """Synthesis self-check (in-process, no timing): the pair
+        attack carries prefix + pump + poison, the word-unit pump
+        repeats whole loop bodies, and the restart attack repeats
+        prefix-shaped lines."""
+        pattern = (r"^[^\S\n]*import\s+(?:static\s+)?"
+                   r"([A-Za-z_][A-Za-z0-9_.]*)\s*(?:\.\*)?\s*;")
+        parsed = sre_parse.parse(pattern, re.MULTILINE)
+        flags = parsed.state.flags
+        pairs = _find_pairs(parsed, flags)
+        self.assertTrue(pairs)
+        attack = _build_pair_attack(parsed, flags, pairs[0], 64, " ")
+        self.assertIsNotNone(attack)
+        self.assertIn("import", attack)
+        loop_pattern = r"(?:(?:static|inline)\s+)+(\w+)\s*\("
+        loop_parsed = sre_parse.parse(loop_pattern, 0)
+        loop_pairs = _find_pairs(loop_parsed, 0)
+        units = _pump_units(loop_pairs[0], 0)
+        self.assertTrue(any(len(unit) > 1 for unit in units))
+        restart_pattern = r"^(?:\w+\s+)*(\w+)\s*\("
+        restart_parsed = sre_parse.parse(restart_pattern, re.MULTILINE)
+        entries = _find_restart_entries(restart_parsed, re.MULTILINE)
+        self.assertTrue(entries)
+        text = _build_restart_attack(restart_parsed, re.MULTILINE,
+                                     entries[0], 8)
+        self.assertIsNotNone(text)
+        self.assertEqual(text.count("\n"), 8)
+
+    def test_members_match_the_pinned_verdicts(self) -> None:
+        """Default-tier closure: the live proposed-member set equals
+        the pinned set, every pinned digest still matches its live
+        pattern, and every pin is ``linear`` or ``noattack`` — a new
+        member, a drifted pattern, or a stale pin fails here with
+        regeneration instructions (and regeneration refuses
+        superlinear members, so the fix is the only way through)."""
+        live = _trailing_span_members()
+        pinned = _load_expected()["members"]
+        live_keys = {"\x1f".join(key) for key in live}
+        pinned_keys = set(pinned)
+        regen = ("python3 .github/tests/test_redos_idiom_census.py "
+                 "--regen-trailing-span")
+        new_members = sorted(live_keys - pinned_keys)
+        self.assertFalse(new_members, (
+            f"unpinned trailing-span/anchor-restart census member(s) "
+            f"— an adjacent overlapping repeat pair with a failable "
+            f"continuation, or a MULTILINE anchor-restart shape. Fix "
+            f"the pattern (fold the optional atom's whitespace into "
+            f"its gated group / \\S-delimit trims / bound windows) "
+            f"or, if the pump oracle measures it linear, pin it with "
+            f"`{regen}`:\n  " + "\n  ".join(
+                member.replace("\x1f", " :: ")
+                for member in new_members)
+        ))
+        stale = sorted(pinned_keys - live_keys)
+        self.assertFalse(stale, (
+            f"stale trailing-span pins (member no longer proposed) — "
+            f"re-run `{regen}`:\n  " + "\n  ".join(
+                member.replace("\x1f", " :: ") for member in stale)
+        ))
+        drifted = []
+        bad_verdicts = []
+        for key, record in live.items():
+            row = pinned["\x1f".join(key)]
+            if set(row["digests"]) != record["digests"]:
+                drifted.append(" :: ".join(key))
+            if row["verdict"] == "adjudicated":
+                # Only digests carried by the documented lane may
+                # hold this verdict (see _TABLE_ADJUDICATED).
+                if not set(row["digests"]) <= set(_TABLE_ADJUDICATED):
+                    bad_verdicts.append(" :: ".join(key))
+            elif row["verdict"] not in ("linear", "noattack"):
+                bad_verdicts.append(" :: ".join(key))
+        self.assertFalse(sorted(drifted), (
+            f"pattern text drifted under existing pins — the pinned "
+            f"verdict no longer describes the live pattern; re-run "
+            f"`{regen}`:\n  " + "\n  ".join(sorted(drifted))
+        ))
+        self.assertFalse(bad_verdicts, (
+            "pin file carries a verdict outside linear/noattack (or "
+            "an 'adjudicated' pin whose digest the documented "
+            "_TABLE_ADJUDICATED lane does not carry) — hand-edited? "
+            "The nightly oracle re-check owns verdict truth; "
+            "regenerate instead."
+        ))
+
+    def test_noattack_lane_is_exactly_the_documented_list(self) -> None:
+        """The manual-review lane (members whose attack the
+        synthesizer cannot build) is pinned by IDENTITY, so it cannot
+        grow silently: a new unsynthesizable member fails here and
+        must be manually adjudicated (analysed and documented below)
+        before it can be pinned.
+
+        Current lane, one member, manually adjudicated LINEAR:
+        packages/sca/update.py ``poetry_re`` — its backreference
+        defeats the generator, and by inspection its adjacent
+        unbounded repeats have pairwise-disjoint character sets
+        (horizontal-only ``[ \t]*`` against a quote/word class), so
+        no run can be split between them."""
+        pinned = _load_expected()["members"]
+        noattack = sorted(
+            key.replace("\x1f", " :: ")
+            for key, row in pinned.items()
+            if row["verdict"] == "noattack"
+        )
+        self.assertEqual(noattack, [
+            "packages/sca/update.py :: poetry_re",
+        ])
+
+    def test_adjudicated_lane_is_exactly_the_documented_dict(self) -> None:
+        """The adjudicated-table lane (worst-case-superlinear table
+        members with hand-verified call-site bounds) is pinned by
+        IDENTITY: every ``adjudicated`` pin's digests must be carried
+        by ``_TABLE_ADJUDICATED``, and every documented digest must
+        back a live pin — a stale entry would silently pre-authorise
+        a future superlinear member."""
+        pinned = _load_expected()["members"]
+        pinned_digests: set[str] = set()
+        for row in pinned.values():
+            if row["verdict"] == "adjudicated":
+                pinned_digests.update(row["digests"])
+        self.assertEqual(pinned_digests, set(_TABLE_ADJUDICATED), (
+            "adjudicated pins and _TABLE_ADJUDICATED disagree — "
+            "adjudications live in the documented dict, nowhere else"
+        ))
+
+    def test_planted_table_member_is_caught(self) -> None:
+        """Self-check for the pattern-table arm: a KNOWN-superlinear
+        spelling planted in a literal table (and one behind a
+        ``self.`` class constant) is proposed by Rule C even though
+        no call site carries a constant operand; the fixed table
+        spelling is not (no flood)."""
+        import tempfile
+
+        source = (
+            "import re\n"
+            "PATTERNS = [\n"
+            "    r'(?:public|private|protected)?\\s*(?:static)?"
+            "\\s*\\w+\\s+(\\w+)\\s*\\(',\n"
+            "    r'(?:(?:public|private|protected)\\s+)?"
+            "(?:static\\s+)?\\w+\\s+(\\w+)\\s*\\(',\n"
+            "]\n"
+            "class Probe:\n"
+            "    BAD_ATTR = r'func\\s*\\w*\\s*\\(\\s*x\\s*\\)\\s*y'\n"
+            "    def scan(self, line: str):\n"
+            "        for pattern in PATTERNS:\n"
+            "            if re.search(pattern, line):\n"
+            "                return True\n"
+            "        return re.search(self.BAD_ATTR, line)\n"
+        )
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".py", delete=False,
+        ) as fh:
+            fh.write(source)
+            probe = Path(fh.name)
+        try:
+            sites = _extract_sites(probe)
+            rule_c_names = {
+                site.name for site in sites if _site_rules(site)[0]
+            }
+            rule_c_patterns = {
+                site.pattern for site in sites if _site_rules(site)[0]
+            }
+        finally:
+            probe.unlink()
+        self.assertIn("PATTERNS[0]", rule_c_names)
+        self.assertNotIn("PATTERNS[1]", rule_c_names)
+        # The class-constant spelling resolves through the per-class
+        # attribute map (the call site's operand is ``self.BAD_ATTR``).
+        self.assertIn(r"func\s*\w*\s*\(\s*x\s*\)\s*y", rule_c_patterns)
+
+    def test_planted_superlinear_member_is_caught(self) -> None:
+        """Self-check: a module planted with a KNOWN-superlinear
+        trailing-span spelling (a founding member's pre-fix pattern)
+        is proposed by the arm and — being unpinned — would fail the
+        closure. A linear lookalike in the same module must NOT be
+        proposed (no flood)."""
+        import tempfile
+
+        source = (
+            "import re\n"
+            "BAD = re.compile(\n"
+            "    r'^[^\\S\\n]*return\\s+(0|nil|None)\\s*;?\\s*$',\n"
+            "    re.MULTILINE,\n"
+            ")\n"
+            "OK = re.compile(\n"
+            "    r'^[^\\S\\n]*return\\s+(0|nil|None)\\s*(?:;\\s*)?$',\n"
+            "    re.MULTILINE,\n"
+            ")\n"
+        )
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".py", delete=False,
+        ) as fh:
+            fh.write(source)
+            probe = Path(fh.name)
+        try:
+            rule_c_proposed = {
+                site.name
+                for site in _extract_sites(probe)
+                if _site_rules(site)[0]
+            }
+            all_proposed = {
+                site.name
+                for site in _extract_sites(probe)
+                if any(_site_rules(site)[:2])
+            }
+        finally:
+            probe.unlink()
+        self.assertIn("BAD", rule_c_proposed)
+        # The fixed spelling has no adjacent pair (Rule C clean); its
+        # MULTILINE whitespace spans still propose it under Rule R,
+        # where the oracle-pinned linear verdict accepts it — being
+        # PROPOSED is not flooding, being unpinnable is.
+        self.assertNotIn("OK", rule_c_proposed)
+        self.assertIn("OK", all_proposed)
+
+    def test_dispatch_triggers_cover_the_universe(self) -> None:
+        """The census can only stop the NEXT member if a change in its
+        universe DISPATCHES it — assert the ``redos_census`` dispatch
+        tier's trigger set covers every file the universe walk yields
+        (derived from the walk itself, so widening the universe fails
+        here until the trigger set follows), names exactly this test
+        file, and carries no dead trigger claiming nothing (a stale
+        trigger row would dispatch the census for trees that no
+        longer exist while reading as coverage)."""
+        import sys
+
+        scripts_dir = _REPO / ".github" / "scripts"
+        sys.path.insert(0, str(scripts_dir))
+        try:
+            from test_scope import TIERS
+        finally:
+            sys.path.remove(str(scripts_dir))
+        tier = TIERS["redos_census"]
+        rel_self = Path(__file__).resolve().relative_to(_REPO).as_posix()
+        self.assertEqual(tier["test_files"], [rel_self])
+        triggers = tier["extra_triggers"]
+        universe = [
+            p.relative_to(_REPO).as_posix() for p in _iter_python_files()
+        ]
+        self.assertTrue(universe, "universe walk went vacuous")
+        uncovered = sorted(
+            rel for rel in universe
+            if not any(rel == t or rel.startswith(t + "/")
+                       for t in triggers)
+        )
+        self.assertFalse(uncovered, (
+            f"census universe file(s) outside the dispatch triggers "
+            f"(first: {uncovered[:5]}) — a member added there merges "
+            "green; extend TIERS['redos_census']['extra_triggers'] in "
+            ".github/scripts/test_scope.py"
+        ))
+        dead = sorted(
+            t for t in triggers
+            if not any(rel == t or rel.startswith(t + "/")
+                       for rel in universe)
+        )
+        self.assertFalse(dead, (
+            f"dispatch trigger(s) {dead} claim no census universe "
+            "file — drop the stale row(s) from "
+            "TIERS['redos_census']['extra_triggers']"
+        ))
+
+    def test_from_import_and_numeric_flag_members_are_seen(self) -> None:
+        """U-resolver self-check: the ``from re import`` spelling
+        (bare callable, bare flag name) and the numeric-literal flags
+        operand are members of the MULTILINE arm — both hid members
+        from the previous resolver — and the raw-text gate admits
+        both files."""
+        import tempfile
+
+        for source, description in (
+            (
+                "from re import compile as _c, MULTILINE\n"
+                "PAT = _c(r'^\\s*needle', MULTILINE)\n",
+                "from-import spelling",
+            ),
+            (
+                "import re\n"
+                "PAT = re.compile(r'^\\s*needle', 8)\n",
+                "numeric flags literal",
+            ),
+        ):
+            self.assertIsNotNone(
+                _RE_BINDING_GATE.search(
+                    unicodedata.normalize("NFKC", source)),
+                f"gate must admit the {description}",
+            )
+            with tempfile.NamedTemporaryFile(
+                "w", suffix=".py", delete=False,
+            ) as fh:
+                fh.write(source)
+                probe = Path(fh.name)
+            try:
+                members = _scan_file(probe)
+            finally:
+                probe.unlink()
+            self.assertEqual(
+                [key for key, _ in members], [(probe.name, "PAT")],
+                f"{description} must be a member",
+            )
+        # Position-awareness: an int literal in a NON-flags position
+        # (re.sub's count) must not read as a flags bitmask.
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".py", delete=False,
+        ) as fh:
+            fh.write("import re\n"
+                     "def clean(t):\n"
+                     "    return re.sub(r'^\\s*needle', '', t, 8)\n")
+            probe = Path(fh.name)
+        try:
+            members = _scan_file(probe)
+        finally:
+            probe.unlink()
+        self.assertEqual(members, [])
+
+    def test_boundary_shapes_are_not_members_of_these_arms(self) -> None:
+        """HONEST BOUNDARY pins (see the module docstring): the
+        unanchored scan-restart family is NOT covered by Rule C or
+        Rule R — the exemplar shapes (a multi-term dot-star chain,
+        its lazy/DOTALL two-term case, a sentence-body family
+        pattern, and a whitespace-prefixed search) are pinned as
+        non-members of THESE arms.  Rule S now owns that family: the
+        same shapes must be PROPOSED by it (the coverage handshake
+        below), so the boundary is a routing statement, not a gap.
+
+        Named constructed-only oracle blind spots (universe-swept,
+        no live superlinear member — named so a future member is a
+        known gap, not a surprise):
+
+        * Positive-lookbehind guard derivation: the guard-breaking
+          fill lane derives fills only from NEGATIVE-lookbehind
+          classes; a positive-lookbehind-headed member (``(?<=x)…``)
+          is pumped without its required predecessor and may
+          under-measure density (universe at this cut: 4
+          pos-lb-headed members, each oracle-pinned linear).
+        * Zero-width-bodied required repeat: ``_first_set`` treats
+          ``(?:\b)+q`` as consuming and returns the empty set,
+          missing the continuation's true first char (universe at
+          this cut: zero members; empty fills route LOUD to the
+          manual lane rather than minting a pin).
+        * Cross-unit entry recreation: the multi-char opener lane
+          pumps the entry ONCE (single-attempt split ambiguity); a
+          member that is dense only when full multi-char entries are
+          RECREATED inside the repeat's span across body-unit
+          boundaries has no dedicated pump — the density lane plants
+          entries bare, and a bare multi-char plant needs every
+          entry char consumable, which the entry⊆charset gate
+          already covers where it holds.  A restart at such an entry
+          re-matches every entry char, so the uncovered subclass
+          needs the units to concatenate into the exact entry —
+          constructed-only at this cut.
+
+        Accepted over-census: a member mixing closer-anchored dot
+        companions with arrow chains can census one row twice —
+        benign direction (a duplicate row can only ADD a census
+        member, never hide one)."""
+        for pattern, flags in (
+            # nested-quantifier ambiguity: the classic exponential
+            # ((?:a+)+ tail) has NO adjacent pair — Rule C is blind
+            # to it by construction, and the shape stays pinned as a
+            # non-member of these arms.  Rule N owns the family now
+            # (see the handshake below and NestedQuantifierCensus).
+            (r"(?:\w+)+\)", 0),
+            # multi-term chain (prompt_defence's pre-fix class)
+            (r"ignore\b.*\ball\b.*\binstructions", re.IGNORECASE),
+            # lazy/DOTALL two-term degenerate case of the same
+            # scan-restart family (an unclosed-opener storm makes the
+            # position loop re-scan to end-of-text per opener) — the
+            # follow-up arm's membership rule must cover it.
+            (r"/\*.*?\*/", re.DOTALL),
+            # sentence-body family (exploit-text sanitizer class)
+            (r"\bthe\s+attacks?\s+(may|can)\s+be\s+launched"
+             r"[^.!?\n]*[.!?\n]", re.IGNORECASE),
+            # whitespace-prefixed unanchored search
+            (r",?\s*leading to (?:a |an )?compromise", 0),
+        ):
+            site = _Site(
+                ("<boundary>", pattern[:40]), 0, pattern, flags,
+                "search", None,
+            )
+            rule_c, rule_r, _pairs, _entries = _site_rules(site)
+            self.assertFalse(rule_c or rule_r, pattern)
+            # Coverage handshake: the nested-quantifier exemplar is
+            # Rule N's to own; every other boundary shape is Rule
+            # S's.  Each routing is a positive claim, so a shrunk
+            # rule fails here instead of silently reopening the gap.
+            if pattern == r"(?:\w+)+\)":
+                self.assertTrue(_nested_is_member(pattern, flags))
+            else:
+                self.assertTrue(_site_scan_lanes(site), pattern)
+
+
+class TrailingSpanNightly(unittest.TestCase):
+    """Nightly re-verification: the pump oracle re-measures every
+    pinned member, so a hand-edited verdict or an environment-
+    dependent regression cannot hide behind the default tier's
+    static-only check."""
+
+    @pytest.mark.slow
+    def test_nightly_oracle_agrees_with_pins(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        live = _trailing_span_members()
+        pinned = _load_expected()["members"]
+        violations: list[str] = []
+
+        def measure(item):
+            key, record = item
+            lineno, pattern, flags, mode = record["sites"][0]
+            return key, _oracle_classify(pattern, flags, mode)
+
+        items = [
+            (key, record) for key, record in sorted(live.items())
+            if pinned.get("\x1f".join(key)) is not None
+        ]
+        # The lanes are hard-killed subprocesses; eight in flight
+        # keeps the nightly run in minutes without starving the
+        # runner (each worker is one child at a time).
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(measure, items))
+        for key, (exponent, synthesized) in results:
+            row = pinned["\x1f".join(key)]
+            if row["verdict"] == "adjudicated":
+                # Deliberately pinned worst-case-superlinear (bounded
+                # at every call site — see _TABLE_ADJUDICATED); the
+                # default tier already enforces lane identity.
+                continue
+            if row["verdict"] == "noattack":
+                if synthesized:
+                    violations.append(
+                        f"{key}: pinned noattack but the synthesizer "
+                        f"now builds an attack — re-adjudicate "
+                        f"(exp={exponent})",
+                    )
+                continue
+            # Pinned linear: re-measure with head-room above the
+            # census threshold so a loaded runner cannot flap a
+            # borderline member (regeneration refuses >= 1.5, the
+            # census threshold is 1.6, the nightly alarm is 1.9).
+            if exponent is not None and exponent >= 1.9:
+                violations.append(
+                    f"{key}: pinned linear but measures "
+                    f"exp={exponent:.2f}",
+                )
+        self.assertFalse(violations,
+                         "nightly oracle disagrees with pins:\n  "
+                         + "\n  ".join(violations))
+
+    @pytest.mark.slow
+    def test_nightly_oracle_detects_a_known_superlinear(self) -> None:
+        """Oracle self-check: the founding member's pre-fix spelling
+        measures superlinear and its fixed spelling measures linear —
+        so a broken oracle cannot silently bless the tree."""
+        bad = (r"^[^\S\n]*return\s+(0|nil|None|True|true|EXIT_SUCCESS)"
+               r"\s*;?\s*$")
+        good = (r"^[^\S\n]*return\s+"
+                r"(0|nil|None|True|true|EXIT_SUCCESS)\s*(?:;\s*)?$")
+        exponent, synthesized = _oracle_classify(
+            bad, re.MULTILINE, "search",
+        )
+        self.assertTrue(synthesized)
+        self.assertIsNotNone(exponent)
+        self.assertGreaterEqual(exponent, _SUPERLINEAR_EXP)
+        exponent, _ = _oracle_classify(good, re.MULTILINE, "search")
+        self.assertLess(exponent if exponent is not None else 1.0,
+                        _SUPERLINEAR_EXP)
+
+
+class ScanRestartCensus(unittest.TestCase):
+    """Rule S arm: static scan-restart rule proposes, the pinned
+    position-density oracle verdicts dispose.  The default tier never
+    runs the oracle."""
+
+    def test_rule_s_catches_known_spellings(self) -> None:
+        """Detector self-check on the arm's founding shapes and
+        non-members (guards against the proposer going vacuous or
+        flooding)."""
+
+        def rule_s(pattern: str, flags: int = 0,
+                   mode: str = "search") -> bool:
+            return bool(_site_scan_lanes(_Site(
+                ("<probe>", pattern[:40]), 0, pattern, flags, mode,
+                None,
+            )))
+
+        # Founding shapes: the three exemplars the trailing-span arms
+        # pinned as out-of-coverage, plus the head-dense variant.
+        self.assertTrue(rule_s(
+            r",?\s*leading to (?:a |an )?compromise", re.IGNORECASE,
+        ))
+        self.assertTrue(rule_s(
+            r"ignore\b.*\ball\b.*\binstructions", re.IGNORECASE,
+        ))
+        self.assertTrue(rule_s(
+            r"\bthe\s+attacks?\s+(may|can)\s+be\s+launched"
+            r"[^.!?\n]*[.!?\n]", re.IGNORECASE,
+        ))
+        self.assertTrue(rule_s(r",[^;]*x"))
+        # Lazy-quantifier + DOTALL delimited-span shapes are
+        # first-class members: the lazy repeat expands from every
+        # planted opener and re-scans to the missing closer — the
+        # 2-term case of the planted-entry mechanism. (These shapes
+        # are INVISIBLE to Rule C — no adjacent pair — and to Rule R
+        # — no MULTILINE anchor; this arm owns them.)
+        self.assertTrue(rule_s(r"/\*.*?\*/", re.DOTALL))
+        self.assertTrue(rule_s(r"<!--.*?-->", re.DOTALL))
+        self.assertTrue(rule_s(r"/\*.*?\*/"))
+        # An unbounded repeat hidden inside an OPTIONAL group is
+        # still a scan-restart member (the walker descends into
+        # repeat bodies); the entry ("a ") is drawn from the inner
+        # repeat's own class, so occurrences can be planted in its
+        # span.
+        self.assertTrue(rule_s(r"a\s+(?:[\w\-][\w\- ]*?)?flag\b"))
+        # When the entry carries a char outside the repeat's class
+        # ('='), the planted-entry lanes go away and only the
+        # overlap lane (continuation first-set inside the class)
+        # still proposes — being PROPOSED is not flooding, being
+        # unpinnable is: the oracle disposes this shape as linear
+        # (the lazy group expands one forced step per offset).
+        self.assertTrue(rule_s(r"=\s+(?:[\w\-][\w\- ]*?)?flag\b"))
+        # Non-members: a literal head whose chars fall outside the
+        # repeat's set (position skip prunes attempts), a bounded
+        # window, an anchored pattern, an anchored CALL MODE, and a
+        # tail that cannot fail.
+        self.assertFalse(rule_s(r"leading to [a-z]+", re.IGNORECASE))
+        self.assertFalse(rule_s(r",?\s{0,16}leading to"))
+        self.assertFalse(rule_s(r"^\s*foo"))
+        self.assertFalse(rule_s(r"\s*==\s*0\b", 0, "match"))
+        self.assertFalse(rule_s(r"\s*(.*)"))
+
+    def test_unterminated_delimiter_pump_is_synthesized(self) -> None:
+        """Generator self-check for the unterminated-delimiter lane
+        (in-process, no timing): a string-literal matcher gets an
+        opener lane whose unit embeds the delimiter through the
+        escape branch, and the built attack is the opener plus
+        escaped-delimiter repeats with NO bare close — the density
+        shape's bare plants satisfy the continuation (each plant
+        doubles as the close), which is exactly how this shape once
+        measured linear.  The run-start-pinned spelling keeps the
+        lane (the oracle disposes it — the pin defeats the pump,
+        not the proposer), and the bounded spelling leaves the
+        universe entirely (no unbounded repeat).  The timing half
+        of this self-check is the nightly
+        ``test_oracle_flags_superlinear_and_passes_fixed``."""
+
+        def lanes_for(pattern: str, flags: int = 0) -> list[dict]:
+            return _site_scan_lanes(_Site(
+                ("<probe>", pattern[:40]), 0, pattern, flags,
+                "search", None,
+            ))
+
+        # The embed generator instantiates the escape branch's ANY
+        # to the delimiter; the plain min-model never carries it.
+        parsed = sre_parse.parse(r'"(?:\\.|[^"\\])*"', 0)
+        repeat_body = next(
+            node for node in parsed if _is_unbounded_repeat(node)
+        )[1][2]
+        self.assertEqual(_gen_min_seq_embed(repeat_body, 0, ord('"')),
+                         '\\"')
+        self.assertNotIn('"', _gen_min_seq(repeat_body, 0))
+
+        openers = [lane for lane in lanes_for(r'"(?:\\.|[^"\\])*"')
+                   if lane.get("opener")]
+        # The embed unit rides among the opener lanes (the multi-char
+        # opener mechanism adds plain body-unit lanes beside it).
+        self.assertIn(
+            ('"', '\\"'),
+            [(lane["entry"], lane["fill"]) for lane in openers],
+        )
+        embed_lane = next(lane for lane in openers
+                          if lane["fill"] == '\\"')
+        attack = _build_scan_restart_attack(embed_lane, 64)
+        self.assertIsNotNone(attack)
+        self.assertTrue(attack.startswith('"\\"'))
+        # No bare close anywhere: every delimiter after the opener
+        # rides inside an escape pair.
+        for i, ch in enumerate(attack):
+            if ch == '"' and i > 0:
+                self.assertEqual(attack[i - 1], "\\", attack)
+        # Both branches of a two-quote alternation get their own
+        # opener lane; the escape-pair sibling with a DIFFERENT
+        # close delimiter (paren matcher) is the same family.
+        two_quote = (r'"(?:\\.|[^"\\])*"' + r"|'(?:\\.|[^'\\])*'")
+        self.assertLessEqual(
+            {'"', "'"},
+            {lane["entry"] for lane in lanes_for(two_quote)
+             if lane.get("opener")},
+        )
+        self.assertIn(
+            "\\(",
+            [lane["fill"] for lane in lanes_for(r"\((?:\\.|[^()\\])*\)")
+             if lane.get("opener")],
+        )
+        # Run-start-pinned spelling: still proposed (lane present) —
+        # linear disposition belongs to the oracle, not the proposer.
+        self.assertTrue([
+            lane for lane in lanes_for(r'(?<!\\)"(?:\\.|[^"\\])*"')
+            if lane.get("opener")
+        ])
+        # Bounded spelling: no unbounded repeat, no lanes at all.
+        self.assertEqual(
+            lanes_for(r'"(?:\\.|[^"\\]){0,200}"'
+                      r"|'(?:\\.|[^'\\]){0,200}'"), [],
+        )
+
+    def test_variant_opener_and_degeneracy_mechanisms(self) -> None:
+        """Generator self-checks for the three synthesis mechanisms
+        (in-process, no timing — each mechanism's timing half lives
+        in the nightly oracle self-check):
+
+        * branch-variant entries — a doc-comment alternation's
+          NON-first opener and a separator alternation's non-first
+          branches become entries (the first-variant-only model hid
+          them: one is preceded by a self-closing sibling, the
+          other by a zero-width ``\\A``);
+        * multi-char opener — a bounded-chain shape gets an
+          entry-once lane whose unit is a whole chain link, and the
+          built attack is the head followed by link repeats;
+        * attack-degeneracy guard — a lane whose every attack
+          spelling MATCHES the pattern reports DEGEN instead of
+          printing fast probe lines that would read as linear."""
+        import contextlib
+        import io
+
+        def lanes_for(pattern: str, flags: int = 0) -> list[dict]:
+            return _site_scan_lanes(_Site(
+                ("<probe>", pattern[:40]), 0, pattern, flags,
+                "search", None,
+            ))
+
+        # Branch-variant entries: the doc-comment exemplar's third
+        # opener (first two self-close: the plant doubles as the
+        # close) and the separator exemplar's non-first branches.
+        doc = r'(?:"""|\'\'\'|/\*\*)(.*?)(?:"""|\'\'\'|\*/)'
+        entries = {lane["entry"] for lane in lanes_for(doc, re.DOTALL)}
+        self.assertIn("/**", entries)
+        sep = r'(?:\A|[;&|(]|\n)\s*(?:\S*/)?libexec/x-[a-z]+'
+        entries = {lane["entry"] for lane in lanes_for(sep)}
+        self.assertIn("&", entries)
+        self.assertIn("\n", entries)
+        # Multi-char opener: the bounded-chain shape's head is an
+        # entry-once lane with a whole chain link as the unit.
+        chain = (r"\bcmp\s*\(\s*(?:\w+\s*(?:->|\.)\s*)+"
+                 r"([\w.]+?)\s*[,)]")
+        openers = [lane for lane in lanes_for(chain)
+                   if lane.get("opener") and lane["entry"] == "cmp("]
+        self.assertTrue(any("." in lane["fill"] and len(lane["fill"]) > 1
+                            for lane in openers), openers)
+        lane = next(lane for lane in openers if "." in lane["fill"])
+        attack = _build_scan_restart_attack(lane, 64)
+        self.assertTrue(attack.startswith("cmp(" + lane["fill"]))
+        self.assertEqual(attack.count("cmp("), 1)
+        # Degeneracy guard: every attack spelling for this shape
+        # matches the pattern (the planted entry doubles as the
+        # continuation), so the worker must report DEGEN — without
+        # the guard it prints fast probe lines that read linear.
+        degen = r"a[^;]*a"
+        lanes = _find_scan_restart_lanes(
+            sre_parse.parse(degen, 0), 0)
+        index = next(i for i, ln in enumerate(lanes)
+                     if not ln.get("once") and not ln.get("starved"))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            _scan_oracle_probe_lines(degen, 0, index)
+        self.assertEqual(out.getvalue().strip(), "DEGEN")
+        # The retry half: the poisoned attack for the return-value
+        # shape MATCHES (the first-set-safe poison ';' completes the
+        # match downstream), the poison-free respelling does not —
+        # the worker's retry has a live pump to fall back to.
+        ret = r"\breturn\s+([^;\s](?:[^;]*[^;\s])?)\s*;"
+        rlanes = _find_scan_restart_lanes(sre_parse.parse(ret, 0), 0)
+        rlane = next(ln for ln in rlanes
+                     if not ln.get("once") and not ln.get("starved"))
+        rx = re.compile(ret)
+        poisoned = _build_scan_restart_attack(rlane, 1000)
+        self.assertIsNotNone(rx.search(poisoned))
+        stripped = dict(rlane, poison="")
+        self.assertIsNone(
+            rx.search(_build_scan_restart_attack(stripped, 1000)))
+
+    @pytest.mark.slow  
+    def test_members_match_the_pinned_verdicts(self) -> None:
+        """Default-tier closure: the live Rule S proposal set equals
+        the pinned set, digests match, and every pin is linear or
+        noattack — a new member, a drifted pattern, or a stale pin
+        fails here (and regeneration refuses superlinear members, so
+        the fix is the only way through)."""
+        live = _scan_restart_members()
+        pinned = _load_scan_expected()["members"]
+        live_keys = {"\x1f".join(key) for key in live}
+        pinned_keys = set(pinned)
+        regen = ("python3 .github/tests/test_redos_idiom_census.py "
+                 "--regen-scan-restart")
+        new_members = sorted(live_keys - pinned_keys)
+        self.assertFalse(new_members, (
+            f"unpinned scan-restart census member(s) — an unanchored "
+            f"scanning call site whose unbounded repeat re-scans a "
+            f"hostile run from every attempt position. Fix the "
+            f"pattern (pin the run start with \\b/(?<!...), bound "
+            f"the window, break the ``A.*B.*C`` chain) or, if the "
+            f"position-density oracle measures it linear, pin it "
+            f"with `{regen}`:\n  " + "\n  ".join(
+                member.replace("\x1f", " :: ")
+                for member in new_members)
+        ))
+        stale = sorted(pinned_keys - live_keys)
+        self.assertFalse(stale, (
+            f"stale scan-restart pins (member no longer proposed) — "
+            f"re-run `{regen}`:\n  " + "\n  ".join(
+                member.replace("\x1f", " :: ") for member in stale)
+        ))
+        drifted = []
+        bad_verdicts = []
+        for key, record in live.items():
+            row = pinned["\x1f".join(key)]
+            if set(row["digests"]) != record["digests"]:
+                drifted.append(" :: ".join(key))
+            if row["verdict"] == "adjudicated":
+                if not set(row["digests"]) <= set(_SCAN_ADJUDICATED):
+                    bad_verdicts.append(" :: ".join(key))
+            elif row["verdict"] not in ("linear", "noattack"):
+                bad_verdicts.append(" :: ".join(key))
+        self.assertFalse(sorted(drifted), (
+            f"pattern text drifted under existing scan-restart pins "
+            f"— re-run `{regen}`:\n  " + "\n  ".join(sorted(drifted))
+        ))
+        self.assertFalse(bad_verdicts, (
+            "scan-restart pin carries a verdict outside "
+            "linear/noattack (or an adjudicated pin whose digest the "
+            "_SCAN_ADJUDICATED lane does not carry) — hand-edited? "
+            "The nightly oracle re-check owns verdict truth; "
+            "regenerate instead."
+        ))
+
+    def test_planted_superlinear_member_is_caught(self) -> None:
+        """Self-check: a module planted with a KNOWN-superlinear
+        scan-restart spelling is proposed by Rule S — being unpinned
+        it would fail the closure — and the fixed spelling in the
+        same module is NOT proposed (bounded glue has no unbounded
+        repeat left)."""
+        import tempfile
+
+        source = (
+            "import re\n"
+            "BAD = re.compile(r',?\\s*leading to compromise')\n"
+            "OK = re.compile(r',?\\s{0,16}leading to compromise')\n"
+            "def strip(t):\n"
+            "    return BAD.sub('', OK.sub('', t))\n"
+        )
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".py", delete=False,
+        ) as fh:
+            fh.write(source)
+            probe = Path(fh.name)
+        try:
+            proposed = {
+                site.name
+                for site in _extract_sites(probe)
+                if _site_scan_lanes(site)
+            }
+        finally:
+            probe.unlink()
+        self.assertIn("BAD", proposed)
+        self.assertNotIn("OK", proposed)
+
+    def test_fstring_constant_members_are_seen(self) -> None:
+        """Resolver self-check: a pattern assembled from module
+        pattern-fragment constants through an rf-string resolves to
+        its real spelling — the placeholder used to hide the
+        fragment's unbounded repeats from every arm."""
+        import tempfile
+
+        source = (
+            "import re\n"
+            "_BODY = r'[^.\\n]*'\n"
+            "PAT = re.compile(rf'{_BODY}leads to{_BODY}\\.')\n"
+            "def strip(t):\n"
+            "    return PAT.sub('', t)\n"
+        )
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".py", delete=False,
+        ) as fh:
+            fh.write(source)
+            probe = Path(fh.name)
+        try:
+            sites = {s.name: s.pattern for s in _extract_sites(probe)}
+        finally:
+            probe.unlink()
+        self.assertEqual(sites.get("PAT"),
+                         r"[^.\n]*leads to[^.\n]*\.")
+
+    def test_noattack_lane_is_exactly_the_documented_list(self) -> None:
+        """The scan-restart manual-review lanes are pinned by
+        IDENTITY so they cannot grow silently.  The adjudicated lane
+        is exactly the documented never-compiled table strings, and
+        every documented digest must still be pinned (a stale
+        disposition is drift too).
+
+        The lane is the starved member plus the documented
+        all-lanes-degenerate CLASS (see ``_SCAN_DEGENERATE_MEMBERS``
+        for the class adjudication):
+
+        * struct_field_checker ``_STRUCT_FIELD_RE`` — starved-density
+          routing from a FIRST-SET over-approximation (the
+          ``(?:backslash-s|(?=*))`` gate's lookahead constrains the
+          following atoms to '*', which the assert-blind first-set
+          cannot see), and by inspection no fill can pass the
+          ws-or-star gate: a word-char run costs one O(1)-per-split
+          rejection per word start, so the scan is linear.  Same
+          manual-friction class as the trailing-span lane's
+          backreference member.
+        * the ``_SCAN_DEGENERATE_MEMBERS`` class — total-continuation
+          patterns whose every synthesizable pump MATCHES, so no
+          failing attempt exists to price (the degeneracy guard
+          keeps their matching pumps from reading as linear
+          evidence, and a pathological match cost would still
+          surface: degenerate lanes are timed, DEGEN only reports
+          when the budget holds)."""
+        pinned = _load_scan_expected()["members"]
+        noattack = sorted(
+            key.replace("\x1f", " :: ")
+            for key, row in pinned.items()
+            if row["verdict"] == "noattack"
+        )
+        self.assertEqual(noattack, sorted(
+            {"core/audit/struct_field_checker.py :: _STRUCT_FIELD_RE"}
+            | _SCAN_DEGENERATE_MEMBERS
+        ))
+        adjudicated_digests: set[str] = set()
+        for row in pinned.values():
+            if row["verdict"] == "adjudicated":
+                adjudicated_digests |= set(row["digests"])
+        self.assertEqual(adjudicated_digests, set(_SCAN_ADJUDICATED))
+
+
+class ScanRestartNightly(unittest.TestCase):
+    """Nightly re-verification: the position-density oracle
+    re-measures every scan-restart pin, so a hand-edited verdict or
+    an environment-dependent regression cannot hide behind the
+    default tier's static-only check."""
+
+    @pytest.mark.slow
+    def test_oracle_flags_superlinear_and_passes_fixed(self) -> None:
+        """Oracle self-check with real timing: a known scan-restart
+        member measures superlinear and its run-start-pinned fix
+        measures linear — so a broken oracle cannot silently bless
+        the tree.  Nightly like its trailing-span twin
+        (``test_nightly_oracle_detects_a_known_superlinear``): six
+        exemplar classifications of hard-killed doubling-size probe
+        workers are genuine multi-second cost, and the default tier
+        never runs the oracle — its protections are the static rule
+        self-check and the pinned-verdict closure."""
+        bad = r"\s*==\s*0\b"
+        exponent, synthesized = _scan_oracle_classify(bad, 0)
+        self.assertTrue(synthesized)
+        assert exponent is not None
+        self.assertGreaterEqual(exponent, _SUPERLINEAR_EXP)
+        good = r"(?<!\s)\s*==\s*0\b"
+        exponent, _ = _scan_oracle_classify(good, 0)
+        self.assertLess(exponent if exponent is not None else 1.0,
+                        _SUPERLINEAR_EXP)
+        # The lazy-DOTALL delimited-span exemplar: planted openers
+        # with the closer withheld make every opener re-scan to the
+        # end — the position-density pump must expose it.
+        exponent, synthesized = _scan_oracle_classify(
+            r"/\*.*?\*/", re.DOTALL,
+        )
+        self.assertTrue(synthesized)
+        assert exponent is not None
+        self.assertGreaterEqual(exponent, _SUPERLINEAR_EXP)
+        # The body-unit exemplar: a multi-char repeat body only
+        # iterates under a whole-unit pump (a single-char fill
+        # measured this shape "linear"), and the bounded fix passes.
+        exponent, synthesized = _scan_oracle_classify(r"(?:ab)*c!", 0)
+        self.assertTrue(synthesized)
+        assert exponent is not None
+        self.assertGreaterEqual(exponent, _SUPERLINEAR_EXP)
+        exponent, _ = _scan_oracle_classify(r"(?:ab){0,32}c!", 0)
+        self.assertLess(exponent if exponent is not None else 1.0,
+                        _SUPERLINEAR_EXP)
+        # The identifier-chain exemplar: the continuation's UNION
+        # charset covers every word char, so a fill drawn against it
+        # starved the density lane and minted a linear pin for this
+        # quadratic shape — the TRUE first-set ({ws, -, .}) restores
+        # the lane, and the run-start-pinned fix passes.
+        chain = r"([A-Za-z_]\w*)((?:\s*(?:->|\.)\s*[A-Za-z_]\w*)+)"
+        exponent, synthesized = _scan_oracle_classify(chain, 0)
+        self.assertTrue(synthesized)
+        assert exponent is not None
+        self.assertGreaterEqual(exponent, _SUPERLINEAR_EXP)
+        exponent, _ = _scan_oracle_classify(r"(?<![\w.])" + chain, 0)
+        self.assertLess(exponent if exponent is not None else 1.0,
+                        _SUPERLINEAR_EXP)
+        # The boundary-maker exemplar: an alphanumeric fill FUSES a
+        # \b-pinned pump into one word and measures the pin as if it
+        # held — the guard-breaking fill (derived from the pin's own
+        # negated class) keeps every planted head a live attempt.
+        exponent, synthesized = _scan_oracle_classify(
+            r"\b\w[\w.]*\(", 0,
+        )
+        self.assertTrue(synthesized)
+        assert exponent is not None
+        self.assertGreaterEqual(exponent, _SUPERLINEAR_EXP)
+        exponent, _ = _scan_oracle_classify(r"\b\w[\w.]{0,32}\(", 0)
+        self.assertLess(exponent if exponent is not None else 1.0,
+                        _SUPERLINEAR_EXP)
+        # The unterminated-delimiter exemplar: a string-literal
+        # matcher on an opener plus escaped-delimiter repeats with
+        # no close — every embedded delimiter restarts the scan and
+        # the escape branch carries each attempt across the whole
+        # remaining run.  The density pump's bare plants CLOSE the
+        # literal instead (each plant satisfies the continuation),
+        # which is how this shape once measured linear; the opener
+        # pump must expose it.  The run-start-pinned fix rejects
+        # escaped-delimiter attempts in O(1) and measures linear.
+        exponent, synthesized = _scan_oracle_classify(
+            r'"(?:\\.|[^"\\])*"' + r"|'(?:\\.|[^'\\])*'", 0,
+        )
+        self.assertTrue(synthesized)
+        assert exponent is not None
+        self.assertGreaterEqual(exponent, _SUPERLINEAR_EXP)
+        exponent, _ = _scan_oracle_classify(
+            r'(?<!\\)"(?:\\.|[^"\\])*"'
+            + r"|(?<!\\)'(?:\\.|[^'\\])*'", 0,
+        )
+        self.assertLess(exponent if exponent is not None else 1.0,
+                        _SUPERLINEAR_EXP)
+        # The branch-variant-entry exemplar: the dangerous opener is
+        # the alternation's THIRD branch (the first two self-close),
+        # so a first-variant-only entry model measured this shape
+        # linear; enumerated entries expose the unclosed-opener
+        # storm.  The token-scan rewrite that fixed the live member
+        # compiles no unbounded repeat, so the pass-side here is the
+        # bounded-window spelling of the same family.
+        exponent, synthesized = _scan_oracle_classify(
+            r'(?:"""|\'\'\'|/\*\*)(.*?)(?:"""|\'\'\'|\*/)', re.DOTALL,
+        )
+        self.assertTrue(synthesized)
+        assert exponent is not None
+        self.assertGreaterEqual(exponent, _SUPERLINEAR_EXP)
+        self.assertEqual(_site_scan_lanes(_Site(
+            ("<probe>", "docs"), 0,
+            r'(?:"""|\'\'\'|/\*\*)(.{0,200}?)(?:"""|\'\'\'|\*/)',
+            re.DOTALL, "search", None,
+        )), [])
+        # The multi-char-opener exemplar: head once, then chain-link
+        # repeats with the closer withheld — single-attempt split
+        # ambiguity the density lanes cannot price (the head is
+        # never inside the repeat's span); the {1,32}-bounded chain
+        # measures linear.
+        chain_bad = (r"\bcmp\s*\(\s*(?:\w+\s*(?:->|\.)\s*)+"
+                     r"([\w.]+?)\s*[,)]")
+        exponent, synthesized = _scan_oracle_classify(chain_bad, 0)
+        self.assertTrue(synthesized)
+        assert exponent is not None
+        self.assertGreaterEqual(exponent, _SUPERLINEAR_EXP)
+        chain_good = (r"\bcmp\s*\(\s*(?:\w+\s*(?:->|\.)\s*){1,32}"
+                      r"([\w.]+?)\s*[,)]")
+        exponent, _ = _scan_oracle_classify(chain_good, 0)
+        self.assertLess(exponent if exponent is not None else 1.0,
+                        _SUPERLINEAR_EXP)
+        # The degeneracy exemplar: the first-set-safe poison ';'
+        # COMPLETES this pattern's match, so the poisoned pump
+        # returned early and read linear — the guard's poison-free
+        # retry is the only path that prices the quadratic (remove
+        # the retry and the lane goes DEGEN, exponent None, and this
+        # assertion fails).
+        exponent, synthesized = _scan_oracle_classify(
+            r"\breturn\s+([^;\s](?:[^;]*[^;\s])?)\s*;", 0,
+        )
+        self.assertTrue(synthesized)
+        assert exponent is not None
+        self.assertGreaterEqual(exponent, _SUPERLINEAR_EXP)
+        self.assertEqual(_site_scan_lanes(_Site(
+            ("<probe>", "ret"), 0,
+            r"\breturn\s+([^;\s](?:[^;]{0,400}[^;\s])?)\s*;",
+            0, "search", None,
+        )), [])
+
+    @pytest.mark.slow
+    def test_nightly_oracle_agrees_with_pins(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        live = _scan_restart_members()
+        pinned = _load_scan_expected()["members"]
+        violations: list[str] = []
+
+        def measure(item):
+            key, record = item
+            lineno, pattern, flags, _mode = record["sites"][0]
+            lanes = _site_scan_lanes(_Site(
+                key, lineno, pattern, flags, "search", None,
+            ))
+            starved = any(lane.get("starved") for lane in lanes)
+            return (key, starved, len(lanes),
+                    _scan_oracle_classify(pattern, flags))
+
+        items = [
+            (key, record) for key, record in sorted(live.items())
+            if pinned.get("\x1f".join(key)) is not None
+        ]
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for key, starved, n_lanes, (exponent, synthesized) \
+                    in pool.map(measure, items):
+                if n_lanes > _SCAN_LANE_CAP:
+                    violations.append(
+                        f"{key[0]} :: {key[1]}: {n_lanes} lanes over "
+                        f"the classify cap ({_SCAN_LANE_CAP}) — the "
+                        f"pin is part-measured; raise _SCAN_LANE_CAP")
+                row = pinned["\x1f".join(key)]
+                if row["verdict"] == "adjudicated":
+                    # Never-compiled table strings (documented in
+                    # _SCAN_ADJUDICATED) hold their verdict by
+                    # identity, not by measurement.
+                    continue
+                if row["verdict"] == "noattack":
+                    if synthesized and not starved:
+                        violations.append(
+                            f"{key[0]} :: {key[1]}: noattack pin but "
+                            f"the synthesizer now builds an attack — "
+                            f"regenerate")
+                    elif exponent is not None and exponent >= 1.9:
+                        violations.append(
+                            f"{key[0]} :: {key[1]}: manual-lane pin "
+                            f"but a lane measures exp={exponent:.2f}")
+                    continue
+                # Alarm threshold sits ABOVE the census threshold
+                # (1.6) so a pinned-linear member only fails on a
+                # real regression, not on a loaded runner.
+                if exponent is not None and exponent >= 1.9:
+                    violations.append(
+                        f"{key[0]} :: {key[1]}: pinned linear but "
+                        f"measures exp={exponent:.2f}")
+        self.assertFalse(violations,
+                         "scan-restart nightly oracle disagrees with "
+                         "pins:\n  " + "\n  ".join(violations))
+
+
+class LadderExponentPins(unittest.TestCase):
+    """Deterministic pins on the oracle's exponent fit and probe
+    sampler: synthetic ladders and a scripted clock, no real timing,
+    so they run in the default tier.  Each pin names the property
+    that regresses without it."""
+
+    @staticmethod
+    def _ladder(coeff: float, power: float) -> list[tuple[int, float]]:
+        """``t = coeff * n**power`` at the worker's doubling sizes."""
+        return [(n, coeff * n ** power)
+                for n in (500, 1000, 2000, 4000, 8000, 16000, 32000)]
+
+    def test_clean_linear_ladder_measures_linear(self) -> None:
+        exponent, status = _ladder_exponent(self._ladder(2e-7, 1.0))
+        self.assertEqual(status, "ok")
+        self.assertLess(exponent, _SUPERLINEAR_EXP)
+
+    def test_one_spiked_final_sample_cannot_mint_superlinear(
+            self) -> None:
+        """THE noise-shape pin: a linear ladder whose FINAL sample
+        alone is inflated 4x (a contention burst on the largest
+        probe) crosses the trust floor, and a last-two log-ratio
+        prices it at exactly 3.0 — the full-ladder fit keeps it
+        linear (1.4).  This pin also holds the RAISE direction of
+        ``_LADDER_NOISE_FLOOR_S``: push the noise floor toward the
+        trust floor and the fit collapses to the top one or two
+        probes, which is the last-two ratio again — this test reds
+        at any floor >= 1.25e-4."""
+        probes = self._ladder(6e-8, 1.0)
+        n_final, t_final = probes[-1]
+        probes[-1] = (n_final, t_final * 4)
+        self.assertGreaterEqual(probes[-1][1], _TRUST_FLOOR_S)
+        exponent, status = _ladder_exponent(probes)
+        self.assertEqual(status, "ok")
+        self.assertLess(exponent, _SUPERLINEAR_EXP)
+
+    def test_clean_quadratic_ladder_measures_superlinear(self) -> None:
+        exponent, status = _ladder_exponent(self._ladder(2e-10, 2.0))
+        self.assertEqual(status, "ok")
+        self.assertGreaterEqual(exponent, _SUPERLINEAR_EXP)
+
+    def test_one_dipped_sample_cannot_hide_superlinear(self) -> None:
+        """Fail-open direction guard: a quadratic ladder with one 4x
+        DOWNWARD-spiked mid-ladder sample still measures superlinear
+        — de-noising must never damp genuine growth below the
+        census threshold."""
+        probes = self._ladder(2e-10, 2.0)
+        n_mid, t_mid = probes[4]
+        probes[4] = (n_mid, t_mid / 4)
+        exponent, status = _ladder_exponent(probes)
+        self.assertEqual(status, "ok")
+        self.assertGreaterEqual(exponent, _SUPERLINEAR_EXP)
+
+    def test_sub_floor_ladder_stays_fast(self) -> None:
+        """The trust floor is judged on the FINAL probe: a ladder
+        that never clears 5ms is linear-with-noise, not evidence.
+        The values are a measured worst-case fixed-arm shape (the
+        string-literal alternation lane: 3.5ms at n=32000 with a
+        natural last-two ratio of 2.64 — only 0.2 of exponent under
+        the census threshold)."""
+        measured = [(500, 3.5e-5), (1000, 7.7e-5), (2000, 1.51e-4),
+                    (4000, 3.38e-4), (8000, 9.59e-4),
+                    (16000, 1.326e-3), (32000, 3.505e-3)]
+        self.assertEqual(_ladder_exponent(measured), (1.0, "fast"))
+
+    def test_noise_floor_excludes_quantized_bottom(self) -> None:
+        """Direction pin for LOWERING ``_LADDER_NOISE_FLOOR_S``:
+        probe deltas at sub-timer-resolution sizes quantize to near
+        zero, and included in the fit they drag this linear ladder's
+        slope to ~3.3 — excluded, it prices linear."""
+        probes = self._ladder(2e-7, 1.0)
+        for i in range(3):
+            probes[i] = (probes[i][0], 1e-7)
+        exponent, status = _ladder_exponent(probes)
+        self.assertEqual(status, "ok")
+        self.assertLess(exponent, _SUPERLINEAR_EXP)
+
+    def test_probe_sampler_takes_the_min_of_three(self) -> None:
+        """Direction pin for LOWERING ``_PROBE_SAMPLES``: the
+        scripted clock hands the three samples 10ms, 5ms and 2ms —
+        the reported probe is the 2ms min, which only the THIRD
+        sample supplies (one sample would report the 10ms inflated
+        reading, two would report 5ms)."""
+        from unittest import mock
+
+        with mock.patch("time.process_time",
+                        side_effect=[0.000, 0.010,
+                                     0.010, 0.015,
+                                     0.015, 0.017]):
+            got = _min_probe_seconds(lambda: None, 1.0)
+        self.assertAlmostEqual(got, 0.002)
+
+    def test_probe_sampler_never_resamples_over_budget(self) -> None:
+        """Direction pin for RAISING ``_PROBE_SAMPLES`` — the cost
+        bound that makes min-sampling safe inside the lane's wall
+        deadline: once every sample so far exceeds the budget the
+        sampler stops, so an over-budget probe (which ends the
+        ladder anyway) is paid for exactly once no matter the
+        sample count."""
+        from unittest import mock
+
+        clock = mock.Mock(side_effect=[0.0, 1.5])
+        with mock.patch("time.process_time", clock):
+            got = _min_probe_seconds(lambda: None, 1.0)
+        self.assertAlmostEqual(got, 1.5)
+        self.assertEqual(clock.call_count, 2)
+
+    def test_fallback_prices_a_50x_jump_superlinear(self) -> None:
+        """The fail-open corner: a final probe over the trust floor
+        with every earlier probe stuck in timer noise leaves fewer
+        than two fittable samples, so the fit falls back to the
+        last-two log-ratio — a >=50x one-doubling jump must price
+        wildly superlinear, never crash on an empty fit and never
+        be diluted toward linear by the sub-noise probes."""
+        probes = [(n, 1e-7) for n in (500, 1000, 2000, 4000, 8000,
+                                      16000)]
+        probes.append((32000, 6e-3))
+        exponent, status = _ladder_exponent(probes)
+        self.assertEqual(status, "ok")
+        self.assertGreater(exponent, 10.0)
+
+    def test_quantized_bottom_cannot_hide_genuine_superlinear(
+            self) -> None:
+        """Inversion guard on the noise-floor filter, suppression
+        direction: a genuine quadratic whose bottom probes quantize
+        to near zero must fit on the ABOVE-floor probes (slope ~2),
+        never on the quantized ones (slope 0) — a filter that keeps
+        the wrong side silences a real finding while every other
+        pin stays green."""
+        probes = ([(500, 1e-7), (1000, 1e-7)]
+                  + [(n, 2e-10 * n ** 2)
+                     for n in (2000, 4000, 8000, 16000, 32000)])
+        exponent, status = _ladder_exponent(probes)
+        self.assertEqual(status, "ok")
+        self.assertGreaterEqual(exponent, _SUPERLINEAR_EXP)
+
+    def test_sub_noise_slope_cannot_mint_superlinear(self) -> None:
+        """Inversion guard, false-positive direction: the same
+        wrong-side filter fits ONLY the quantization junk, and two
+        sub-noise samples carrying a wild fake slope then mint a
+        superlinear verdict from a clean linear ladder."""
+        probes = ([(500, 1e-7), (1000, 9e-5)]
+                  + [(n, 2e-7 * n)
+                     for n in (2000, 4000, 8000, 16000, 32000)])
+        exponent, status = _ladder_exponent(probes)
+        self.assertEqual(status, "ok")
+        self.assertLess(exponent, _SUPERLINEAR_EXP)
+
+
+class NestedQuantifierCensus(unittest.TestCase):
+    """Rule N arm: exponential-composition membership is static and
+    single-stage (the rule is the verdict); the CPU-time growth probe
+    backs adjudication and the self-checks below."""
+
+    def test_rule_n_catches_known_spellings(self) -> None:
+        """Detector self-check on the class's two in-tree member
+        spellings (both fixed before this arm existed — the arm
+        exists to catch the NEXT one the day it lands) and the
+        classic shapes; the fixed spellings and the safe common
+        idioms must NOT be members (flood guard)."""
+        # Member 1: a starred base inside a repeated attribute-body
+        # group — the (a*)* shape.  An unterminated "__attribute__(("
+        # line makes the engine try every split of the body between
+        # the two stars.
+        self.assertTrue(_nested_is_member(
+            r"(?:__attribute__\s*\(\((?:[^()]*|\([^()]*\))*\)\)\s*)*"
+            r"(?:__declspec\s*\([^()]*\)\s*)?(?:extern\s+)?"))
+        self.assertTrue(_nested_is_member(r"(?:[^()]*|\([^()]*\))*\)\)"))
+        # Its fixed spelling: single-character base — same language,
+        # one parse per input.
+        self.assertFalse(_nested_is_member(
+            r"(?:__attribute__\s*\(\((?:[^()]|\([^()]*\))*\)\)\s*)*"
+            r"(?:__declspec\s*\([^()]*\)\s*)?(?:extern\s+)?"))
+        self.assertFalse(_nested_is_member(r"(?:[^()]|\([^()]*\))*\)\)"))
+        # Member 2: an unbounded repeat over a branch whose \s+ arm
+        # is itself an unbounded repeat — a hostile whitespace run
+        # between the keywords splits between the \s+ iterations in
+        # O(2^k) ways.
+        self.assertTrue(_nested_is_member(
+            r"\b(?:drop|truncate)\b"
+            r"|\binto(?:\s+|/\*.*?\*/)+(?:out|dump)file\b",
+            re.IGNORECASE))
+        # Its fixed spelling: single-char / bounded-comment glue
+        # under a BOUNDED outer repeat.
+        self.assertFalse(_nested_is_member(
+            r"\binto(?:\s|/\*.{0,512}?\*/){1,64}(?:out|dump)file\b",
+            re.IGNORECASE))
+        # Classic shapes of both ambiguity conditions.
+        self.assertTrue(_nested_is_member(r"(?:a+)+$"))
+        self.assertTrue(_nested_is_member(r"(a*)*x"))
+        self.assertTrue(_nested_is_member(r"(?:\w+)+\)"))
+        self.assertTrue(_nested_is_member(r"(?:\w+\s*)*x"))
+        self.assertTrue(_nested_is_member(r"(?:a{1,2})+!"))
+        self.assertTrue(_nested_is_member(r"(a|a)*b"))
+        # Post-hoist same-char arm overlap: (?:ab|a.) leaves
+        # a(?:b|.) — arms overlap on 'b'.
+        self.assertTrue(_nested_is_member(r"(?:ab|a.)*!"))
+        # Case-folded arm overlap: multi-node arms survive the
+        # parser's single-char collapse, and IGNORECASE makes 'A'
+        # and 'a' the same derivation choice on the same character.
+        # The identical spelling WITHOUT the flag is unambiguous
+        # (disjoint arms) — the fold must be flag-conditional.
+        self.assertTrue(_nested_is_member(r"(?:Ax?|a)*!",
+                                          re.IGNORECASE))
+        self.assertFalse(_nested_is_member(r"(?:Ax?|a)*!"))
+        # Parser-collapsed alternations: sre_parse folds single-char
+        # arms into ONE character class, so the engine never sees a
+        # branch — runtime-linear, not members (the rule judges the
+        # optimized tree precisely so it agrees with the engine).
+        self.assertFalse(_nested_is_member(r"(?:\s|\n)*x"))
+        self.assertFalse(_nested_is_member(r"(?:\w|\d)*!"))
+        self.assertFalse(_nested_is_member(r"(a|A)*b", re.IGNORECASE))
+        # Empty-empty arms count only when something else on their
+        # derivation path consumes: an empty-empty branch that IS the
+        # whole iteration is pruned by the engine's empty-match guard
+        # (linear), while one sharing its iteration with a consuming
+        # sibling doubles per consumed character (exponential).
+        self.assertFalse(_nested_is_member(r"(?:x|(?:|))*y"))
+        self.assertTrue(_nested_is_member(r"(?:a?(?:|))*y"))
+        # Safe common idioms: the escaped-string scanner (single-char
+        # arms, disjoint — a backslash always routes to the escape
+        # arm), delimiter-pinned iterations, single-usable-width
+        # optional, prefix-code alternation, and an ambiguous repeat
+        # with NOTHING failable after it (greedy first parse
+        # succeeds; no split is retried).
+        self.assertFalse(_nested_is_member(r'(?:[^"\\]|\\.)*"'))
+        self.assertFalse(_nested_is_member(r'(?:"[^"]*")*x'))
+        self.assertFalse(_nested_is_member(r"(?:a?)*x"))
+        self.assertFalse(_nested_is_member(r"(?:ab|a)*c"))
+        self.assertFalse(_nested_is_member(r"(?:a+)+"))
+        # Sibling arms' territory stays theirs: adjacent overlapping
+        # spans (Rule C/S) and the MULTILINE anchor idiom carry no
+        # ambiguous UNBOUNDED-over-variable composition.
+        self.assertFalse(_nested_is_member(r"\s*==\s*0\b"))
+        self.assertFalse(_nested_is_member(r"^\s*import", re.MULTILINE))
+
+    def test_bounded_huge_outer_is_effectively_unbounded(self) -> None:
+        """A large outer bound is cosmetic: the split search survives
+        below the bound, so ``(?:w+){1,5000}z`` measures the same
+        ~1.0 doublings/char as its unbounded twin — including the
+        ^-anchored spelling, whose single anchored attempt already
+        explodes (no other arm can see it: Rule S keys on the
+        position loop).  Both sides of the knob are pinned: at the
+        threshold the bound is unbounded to the rule; just below it
+        the shape enters the bounded-nuisance band (capped split
+        search — deliberately non-member, see _EFFECTIVELY_UNBOUNDED
+        for both directions of that trade)."""
+        self.assertTrue(_nested_is_member(r"(?:w+){1,5000}z"))
+        self.assertTrue(_nested_is_member(r"^(?:w+){1,5000}z"))
+        self.assertTrue(_nested_is_member(r"(?:w{1,5000}){1,5000}z"))
+        self.assertTrue(_nested_is_member(r"(?:w+){1,32}z"))
+        # The knob itself, both directions.
+        threshold = _EFFECTIVELY_UNBOUNDED
+        self.assertTrue(_nested_is_member(
+            r"(?:w+){1,%d}z" % threshold))
+        self.assertFalse(_nested_is_member(
+            r"(?:w+){1,%d}z" % (threshold - 1)))
+        # Small-bounded nesting (empirically flat at probe sizes —
+        # the growth-probe leg below) stays non-member.
+        self.assertFalse(_nested_is_member(r"(?:w+){1,4}z"))
+        # A LOWER bound at/above the threshold with a small upper
+        # bound cannot exist ({32,4} is a parse error); a huge lower
+        # bound implies a huge upper bound and is judged by hi.
+        self.assertTrue(_nested_is_member(r"(?:w+){32,}z"))
+
+    def test_lookaround_and_atomic_bodies_are_searched(self) -> None:
+        """An exponential composition inside a lookaround or atomic
+        group does its work internally before the construct resolves
+        — members even though the construct itself is atomic.  The
+        continuation is scoped to the body: with no in-body failable
+        continuation the body's greedy first parse succeeds and the
+        atomicity prevents any retry (non-members), and a
+        possessive/atomic OUTER repeat is likewise never a candidate
+        (its first parse commits)."""
+        self.assertTrue(_nested_is_member(r"(?=(?:v+)+w)v"))
+        self.assertTrue(_nested_is_member(r"^(?=(?:v+)+w)v"))
+        self.assertTrue(_nested_is_member(r"(?!(?:v+)+w)v"))
+        self.assertTrue(_nested_is_member(r"(?>(?:p+)+q)r"))
+        # Unambiguous lookahead body: safe.
+        self.assertFalse(_nested_is_member(r"(?=(?:v+)w)v"))
+        # Ambiguous body but no in-body failable continuation: the
+        # greedy parse succeeds inside the atomic construct.
+        self.assertFalse(_nested_is_member(r"(?=(?:v+)+)x"))
+        # Possessive outer over an ambiguous body: first parse
+        # commits, never retried.
+        self.assertFalse(_nested_is_member(r"(?:a+)++x"))
+        self.assertFalse(_nested_is_member(r"(?:a+)*+x"))
+
+    def test_runtime_source_has_no_members(self) -> None:
+        """Default-tier closure: no runtime regex — call site or
+        table entry — is a Rule N member beyond the (empty)
+        allowlist.  A genuine member is exponential on ~100 bytes of
+        hostile input: fix it by REMOVING the ambiguity
+        (single-character base inside the repeated group, unambiguous
+        alternation) rather than allowlisting — and never by merely
+        bounding the outer repeat, which keeps the split search
+        below the bound."""
+        members = _nested_members()
+        unexpected = sorted(set(members) - set(_NESTED_ALLOWLIST))
+        stale = sorted(set(_NESTED_ALLOWLIST) - set(members))
+        sites = [s for key in unexpected for s in members[key]]
+        self.assertFalse(unexpected, (
+            f"nested-quantifier (exponential-composition) regex in "
+            f"runtime source — an unbounded repeat whose body can "
+            f"match the same run in multiple ways, O(2^n) on a "
+            f"failing continuation. Remove the AMBIGUITY "
+            f"(single-character base, unambiguous alternation); "
+            f"bounding the outer repeat alone is NOT a fix — the "
+            f"split search survives below the bound. Adjudicate "
+            f"with _exponential_growth. "
+            f"{len(sites)} member call site(s):\n  "
+            + "\n  ".join(sites)
+        ))
+        self.assertFalse(stale,
+                         f"stale nested allowlist entries: {stale}")
+
+    def test_pattern_data_files_have_no_members(self) -> None:
+        """The same closure for the pattern DATA files the runtime
+        loads (preflight injection corpora, SCA exfil rules) — a
+        corpus line is compiled and searched over untrusted content
+        exactly like a source-constant pattern."""
+        _load_patterns, _exfil = _data_file_loaders()
+        members = [
+            (stem, compiled.pattern)
+            for stem, patterns in sorted(_load_patterns().items())
+            for compiled in patterns
+            if _nested_is_member(compiled.pattern, compiled.flags)
+        ]
+        members.extend(
+            ("exfil_destinations", rule.pattern.pattern)
+            for rule in _exfil._load_rules()
+            if rule.pattern is not None
+            and _nested_is_member(rule.pattern.pattern,
+                                  rule.pattern.flags)
+        )
+        self.assertFalse(members, (
+            "nested-quantifier (exponential-composition) regex in a "
+            "pattern data file:\n  "
+            + "\n  ".join(f"{stem}: {pat}" for stem, pat in members)
+        ))
+
+    def test_planted_member_is_caught(self) -> None:
+        """Self-check through the shared extraction: a module planted
+        with a KNOWN-exponential member spelling is flagged from its
+        real call site, and the fixed spelling in the same module is
+        not (no flood)."""
+        import tempfile
+
+        source = (
+            "import re\n"
+            "BAD = re.compile(\n"
+            "    r'\\binto(?:\\s+|/\\*.*?\\*/)+(?:out|dump)file\\b',\n"
+            "    re.IGNORECASE,\n"
+            ")\n"
+            "OK = re.compile(\n"
+            "    r'\\binto(?:\\s|/\\*.{0,512}?\\*/){1,64}"
+            "(?:out|dump)file\\b',\n"
+            "    re.IGNORECASE,\n"
+            ")\n"
+            "def check(t):\n"
+            "    return BAD.search(t) or OK.search(t)\n"
+        )
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".py", delete=False,
+        ) as fh:
+            fh.write(source)
+            probe = Path(fh.name)
+        try:
+            flagged = {
+                site.name
+                for site in _extract_sites(probe)
+                if _nested_is_member(site.pattern, site.flags)
+            }
+        finally:
+            probe.unlink()
+        self.assertIn("BAD", flagged)
+        self.assertNotIn("OK", flagged)
+
+    def test_probe_confirms_exponential_class(self) -> None:
+        """Empirical self-check (CPU-time, tiny n): a flagged member
+        spelling measures exponential growth on its pump family and
+        its fixed spelling does not — so the adjudication probe can
+        FAIL, and the flagged class is demonstrably the exponential
+        one, not a static-only claim."""
+        rate = _exponential_growth(
+            _probe_fixture("attribute_body_alternation", "member"),
+            0, lambda n: "a" * n,
+        )
+        self.assertGreaterEqual(rate, _EXPONENTIAL_RATE)
+        rate = _exponential_growth(
+            _probe_fixture("attribute_body_alternation", "fixed"),
+            0, lambda n: "a" * n,
+        )
+        self.assertLess(rate, _EXPONENTIAL_RATE)
+        rate = _exponential_growth(
+            _probe_fixture("into_outfile_comment_glue", "member"),
+            re.IGNORECASE, lambda n: "into" + " " * n + "x",
+        )
+        self.assertGreaterEqual(rate, _EXPONENTIAL_RATE)
+        rate = _exponential_growth(
+            _probe_fixture("into_outfile_comment_glue", "fixed"),
+            re.IGNORECASE, lambda n: "into" + " " * n + "x",
+        )
+        self.assertLess(rate, _EXPONENTIAL_RATE)
+        # The bounded-huge outer is the unbounded blowup below its
+        # bound (the ^-anchored spelling: a single anchored attempt
+        # already carries the whole split search); small-bounded
+        # nesting caps the search and stays flat at probe sizes.
+        rate = _exponential_growth(
+            _probe_fixture("bounded_huge_outer", "member"),
+            0, lambda n: "w" * n,
+        )
+        self.assertGreaterEqual(rate, _EXPONENTIAL_RATE)
+        rate = _exponential_growth(
+            _probe_fixture("bounded_huge_outer", "fixed"),
+            0, lambda n: "w" * n,
+        )
+        self.assertLess(rate, _EXPONENTIAL_RATE)
+        # An exponential composition inside a lookahead does its work
+        # while the (atomic) construct is still being evaluated.
+        rate = _exponential_growth(
+            _probe_fixture("lookahead_composition", "member"),
+            0, lambda n: "v" * n,
+        )
+        self.assertGreaterEqual(rate, _EXPONENTIAL_RATE)
+        rate = _exponential_growth(
+            _probe_fixture("lookahead_composition", "fixed"),
+            0, lambda n: "v" * n,
+        )
+        self.assertLess(rate, _EXPONENTIAL_RATE)
+
+
+if __name__ == "__main__":
+    import sys
+
+    if "--oracle-worker" in sys.argv:
+        import json
+
+        request = json.load(sys.stdin)
+        _oracle_probe_lines(
+            request["pattern"], request["flags"], request["mode"],
+            request["kind"], request["index"], request["unit"],
+        )
+        sys.exit(0)
+    if "--extract-worker" in sys.argv:
+        import json
+
+        request = json.load(sys.stdin)
+        json.dump(_extract_worker(request["paths"]), sys.stdout)
+        sys.exit(0)
+    if "--regen-trailing-span" in sys.argv:
+        sys.exit(_regen_expected())
+    if "--regen-scan-restart" in sys.argv:
+        sys.exit(_regen_scan_expected())
+    unittest.main()

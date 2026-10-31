@@ -26,13 +26,20 @@ class Annotation:
 
     ``body``: free-form markdown prose. May be empty (a clean-status
     annotation can carry just metadata). The body is preserved
-    verbatim across read-write round-trips.
+    verbatim across read-write round-trips, modulo newline
+    normalisation (``\r\n``/``\r`` become ``\n``) and edge-blank
+    trimming (leading/trailing newlines are dropped by the on-disk
+    section framing); interior lines — including whitespace-only
+    ones — round-trip exactly.
 
     ``metadata``: structured key=value pairs from the HTML-comment
     frontmatter (``<!-- meta: status=clean cwe=CWE-78 -->``).
     Conventional keys:
       * ``status``: ``clean`` / ``suspicious`` / ``finding`` /
-        ``error`` (matches the audit coverage status enum)
+        ``dormant`` / ``error``, plus the ``sink`` / ``entry_point``
+        / ``trust_boundary`` role markers consumed by IRIS spec
+        promotion and audit role binding (enum-validated at write
+        time; matches the CLI's --status choices)
       * ``cwe``: e.g. ``CWE-78``
       * ``source``: ``human`` / ``agent`` / ``llm`` — who claims to
         have written the annotation (caller-asserted; readers grade
@@ -43,9 +50,13 @@ class Annotation:
         ``write_annotation(..., overwrite="respect-manual")`` skips
         writes whose existing record has ``source=human`` so
         scripted passes never clobber operator notes.
-      * ``tty`` / ``provenance``: the invocation-context stamp the
-        CLI records on every add/edit — which std fds were TTYs,
-        and the derived ``interactive-tty`` / ``non-tty`` tag (see
+      * ``tty`` / ``provenance`` / ``sid`` / ``envm`` / ``parents``
+        / ``corroboration``: the invocation-context stamp the CLI
+        records on every add/edit — which std fds were TTYs, the
+        derived ``interactive-tty`` / ``non-tty`` tag, and the
+        corroborating context (session-leader shape, environment
+        markers, parent-chain summary) that lets readers demote
+        pty-wrapper laundering (see
         :mod:`core.annotations.provenance`). Annotations without
         the stamp are legacy only when their file predates the
         stamp era (date-fenced — see ``STAMP_ERA_START``); readers

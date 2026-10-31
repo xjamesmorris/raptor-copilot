@@ -48,11 +48,13 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from core.atomic_fs import write_text_atomically
 from core.http import (
     DEFAULT_MAX_BYTES,
     HttpClient,
@@ -61,6 +63,9 @@ from core.http import (
 )
 from core.http.urllib_backend import UrllibClient
 from core.run.retry import RetryPolicy, retry_call
+from core.logging import configure_cli_logging
+
+from .supply_chain._name_grammar import valid_feed_name
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +141,23 @@ def _get_json(
     )
 
 
+def _grammar_filtered(names: list[str], ecosystem: str) -> list[str]:
+    """Drop feed rows failing the ecosystem's package-name grammar.
+
+    Feed content is unvalidated remote input and every kept name
+    becomes a trusted exact-match in the typosquat detector — the
+    npm bundle has already shipped scraped markup
+    (``"equire('express'"``).  Rank order is preserved."""
+    kept = [n for n in names if valid_feed_name(ecosystem, n)]
+    dropped = len(names) - len(kept)
+    if dropped:
+        logger.warning(
+            "%s feed: dropped %d row(s) failing the package-name "
+            "grammar", ecosystem, dropped,
+        )
+    return kept
+
+
 def _fetch_pypi_ranked(http: HttpClient, top_n: int) -> list[str]:
     """Rank-ordered (most-popular-first) PyPI names — the order the typosquat
     curation audit needs (rank is the signal it reasons about). May contain
@@ -149,7 +171,7 @@ def _fetch_pypi_ranked(http: HttpClient, top_n: int) -> list[str]:
         n = r.get("project") or r.get("name")
         if isinstance(n, str) and n:
             names.append(n.lower())
-    return names
+    return _grammar_filtered(names, "PyPI")
 
 
 def fetch_pypi(http: HttpClient, top_n: int) -> list[str]:
@@ -176,7 +198,7 @@ def _fetch_npm_ranked(http: HttpClient, top_n: int) -> list[str]:
         except (TypeError, ValueError):
             continue
     scored.sort(key=lambda ns: ns[1], reverse=True)
-    return [n for n, _ in scored[:top_n]]
+    return _grammar_filtered([n for n, _ in scored[:top_n]], "npm")
 
 
 def fetch_npm(http: HttpClient, top_n: int) -> list[str]:
@@ -211,7 +233,7 @@ def _fetch_crates_ranked(
                 names.append(n.lower())
         if len(crates) < per_page:
             break
-    return names
+    return _grammar_filtered(names, "Cargo")
 
 
 def fetch_crates(
@@ -245,11 +267,83 @@ def _fetch_packagist_ranked(http: HttpClient, top_n: int) -> list[str]:
         page += 1
         if page > 200:               # safety: 200 pages × 12/pg ≈ 2400
             break
-    return names
+    return _grammar_filtered(names, "Packagist")
 
 
 def fetch_packagist(http: HttpClient, top_n: int) -> list[str]:
     return sorted(set(_fetch_packagist_ranked(http, top_n)))
+
+
+# ---------------------------------------------------------------------------
+# Feed validation
+# ---------------------------------------------------------------------------
+
+# The feeds are REMOTE and they seed the typosquat detector's
+# reference sets — a compromised feed that injects attacker names as
+# "popular" (or wholesale-replaces the list) steers squat verdicts.
+# Every ingested name must match its ecosystem's registry grammar.
+# Longest documented registry name cap is npm's 214.
+_MAX_NAME_LEN = 214
+_NAME_GRAMMARS: dict[str, re.Pattern[str]] = {
+    # Names arrive lowercased by the fetchers.
+    "PyPI": re.compile(r"[a-z0-9]([a-z0-9._-]*[a-z0-9])?"),
+    "npm": re.compile(
+        r"(@[a-z0-9~][a-z0-9._~-]*/)?[a-z0-9~._-][a-z0-9._~-]*"),
+    "Cargo": re.compile(r"[a-z0-9][a-z0-9_-]*"),
+    # Mandatory separator per repetition (not Composer's published
+    # optional-separator form, which is ambiguous and backtracks
+    # exponentially on hostile feed rows): same language, linear
+    # time.  Must stay in lock-step with the Packagist grammar in
+    # supply_chain/_name_grammar.py (tested).
+    # \b keeps the unanchored scan from restarting inside a name
+    # run (quadratic); earliest-start matches unchanged.
+    "Packagist": re.compile(
+        # Segment chains bounded by the 214-char name cap (<=107
+        # separators): unbounded, a dotted-run feed row makes every
+        # segment start re-walk the run — quadratic per row.
+        r"\b[a-z0-9]+([_.-][a-z0-9]+){0,107}"
+        r"/[a-z0-9]+(([_.]|-{1,2})[a-z0-9]+){0,107}"),
+}
+
+# Churn guard: refuse an update that would replace more than this
+# fraction of an existing reference set in one refresh. Trade-off,
+# both directions: too LOW and a legitimately re-ranked feed
+# (methodology change upstream) wedges until an operator passes
+# --allow-churn; too HIGH and a hijacked feed can rotate attacker
+# names in wholesale without tripping it. Popular-package lists are
+# empirically stable week to week (a few percent), so 0.5 leaves an
+# order of magnitude of headroom while still catching replacement-
+# class tampering.
+_MAX_CHURN_FRACTION = 0.5
+
+
+def _validate_names(display: str, names: list[str]) -> list[str]:
+    """Keep only names matching the ecosystem grammar and length cap;
+    log what was dropped."""
+    pat = _NAME_GRAMMARS.get(display)
+    kept: list[str] = []
+    for n in names:
+        if len(n) > _MAX_NAME_LEN:
+            continue
+        if pat is not None and pat.fullmatch(n) is None:
+            continue
+        kept.append(n)
+    dropped = len(names) - len(kept)
+    if dropped:
+        logger.warning(
+            "%s feed: dropped %d/%d entr%s failing the name grammar",
+            display, dropped, len(names),
+            "y" if dropped == 1 else "ies",
+        )
+    return kept
+
+
+def _churn_fraction(old_names: list[str], new_names: list[str]) -> float:
+    """Fraction of the OLD reference set absent from the new one."""
+    old_set = set(old_names)
+    if not old_set:
+        return 0.0
+    return len(old_set - set(new_names)) / len(old_set)
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +369,7 @@ def refresh_all(
     top_n: int = _DEFAULT_TOP_N,
     only: list[str] | None = None,
     data_dir: Path = _DATA_DIR,
+    allow_churn: bool = False,
 ) -> dict[str, str]:
     """Fetch every supported ecosystem and write the result to
     ``data_dir/popular/<file>``. Returns ``{file: status}`` per
@@ -298,6 +393,7 @@ def refresh_all(
             logger.warning("%s fetch failed: %s", display, e)
             out[fname] = f"failed: {type(e).__name__}: {e}"
             continue
+        names = _validate_names(display, names)
         if not names:
             out[fname] = "failed: empty result"
             continue
@@ -308,7 +404,35 @@ def refresh_all(
                     and target.read_text(encoding="utf-8") == new_blob):
                 out[fname] = "unchanged"
                 continue
-            target.write_text(new_blob, encoding="utf-8")
+            if target.exists() and not allow_churn:
+                try:
+                    old_names = json.loads(
+                        target.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    old_names = []
+                if isinstance(old_names, list):
+                    churn = _churn_fraction(
+                        [n for n in old_names if isinstance(n, str)],
+                        names,
+                    )
+                    if churn > _MAX_CHURN_FRACTION:
+                        logger.error(
+                            "%s feed: refusing update — %.0f%% of the "
+                            "existing reference set would be replaced "
+                            "in one refresh (hijacked/rotated feed "
+                            "shape). Re-run with --allow-churn after "
+                            "reviewing the diff.",
+                            display, churn * 100,
+                        )
+                        out[fname] = (
+                            f"failed: churn guard "
+                            f"({churn:.0%} replaced)"
+                        )
+                        continue
+            # Atomic: these files seed the typosquat detector's
+            # reference sets — a torn write must not ship a truncated
+            # popular-package list.
+            write_text_atomically(target, new_blob)
         except OSError as e:
             # Output target unwritable: a hard failure (see ``main``), kept
             # distinct from a soft per-source fetch failure above.
@@ -346,13 +470,18 @@ def main(argv: list[str] | None = None) -> int:
         "--data-dir", type=Path, default=_DATA_DIR,
         help=f"data directory root (default {_DATA_DIR})",
     )
+    p.add_argument(
+        "--allow-churn", action="store_true",
+        help="permit an update that replaces more than "
+             f"{_MAX_CHURN_FRACTION:.0%}".replace("%", "%%")
+             + " of an existing reference set (review the diff first "
+             "— replacement-class churn is the hijacked-feed shape)",
+    )
     p.add_argument("-v", "--verbose", action="count", default=0)
     args = p.parse_args(argv if argv is not None else sys.argv[1:])
 
-    logging.basicConfig(
-        level=logging.WARNING - 10 * min(args.verbose, 2),
-        format="%(levelname)s %(name)s: %(message)s",
-    )
+    # Escaping console formatter — see core.logging.configure_cli_logging.
+    configure_cli_logging(logging.WARNING - 10 * min(args.verbose, 2))
 
     # The refresh script doesn't go through the SCA egress-allowlisted
     # client because the popularity feeds aren't on the SCA allowlist
@@ -360,7 +489,8 @@ def main(argv: list[str] | None = None) -> int:
     # the right tool — uncontended outbound HTTPS.
     http = UrllibClient()
     results = refresh_all(http, top_n=args.top_n, only=args.only,
-                           data_dir=args.data_dir)
+                           data_dir=args.data_dir,
+                           allow_churn=args.allow_churn)
     for fname, status in sorted(results.items()):
         print(f"  {fname:20s}  {status}")
 

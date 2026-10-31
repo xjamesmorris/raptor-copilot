@@ -22,6 +22,33 @@ Python's `str.isprintable()` is the classifier — True for all ASCII
 0x20-0x7E plus every Unicode codepoint whose general category is not
 Cc/Cf/Cn/Co/Cs/Zl/Zp. ESC (0x1b), NUL, CR, LF, BEL, C1 controls
 (0x80-0x9F), and Unicode line/paragraph separators are all rejected.
+
+The label-preserving excerpting contract
+----------------------------------------
+For MIXED-AUTHORITY text artifacts — a trusted writer's label/marker
+lines interleaved with untrusted quoted content (the dispatch
+child-tail log is the canonical member) — escaping is necessary but
+not sufficient. `escape_nonprintable(preserve_newlines=True)` passes
+printable newlines through, so untrusted content can contain lines
+SHAPED like the writer's own labels, and a windowed excerpt can drop
+the genuine label while keeping the forged one. Three rules:
+
+  1. Authority travels out-of-band. Facts the trusted side knows
+     (exit status, ran/failed, timeout) are structured record fields;
+     consumers re-emit them from parsed state, never recover them
+     from artifact bytes.
+  2. Tail windows re-attach the head. An excerpt of a mixed-authority
+     artifact keeps the writer-authored line 1 plus an explicit
+     elision marker — never a bare ``[-N:]`` over the whole document.
+  3. In-band markers must be forgery-evident: either nonce-stamped
+     (the dark_verify harness sentinel / merge_fence record-nonce
+     precedents) or with untrusted body lines quoted/indented so
+     marker-shaped lines cannot sit at column 0.
+
+Single-field tail slices into structured records (a wholly-untrusted
+``stderr_tail`` value) are NOT the class: there is no co-resident
+authority to drop. Per-record log-line escaping keeps its documented,
+weaker guarantee — only that no control byte reaches the TTY.
 """
 
 
@@ -69,6 +96,46 @@ def sanitise_for_terminal(s: str, *, max_len: int = 256) -> str:
     if len(out) > max_len:
         out = out[:max_len] + f"...[+{len(out) - max_len} chars]"
     return out
+
+
+#: Default bound for one untrusted value EMBEDDED inside a trusted
+#: message skeleton (:func:`sanitise_excerpt`). Churn-prone limit —
+#: rationale in both directions:
+#:
+#: * Not smaller: the longest values these messages legitimately embed
+#:   — dotted schema paths, enum spellings, part filenames — run to
+#:   ~100 characters, and existing per-filename terminal bounds already
+#:   use 120; a tighter cap would elide legitimate values the reader
+#:   needs whole to act on the message.
+#: * Not larger: a message skeleton embeds up to two excerpts and the
+#:   composed string may itself be bounded downstream (a quarantine
+#:   reason record, a terminal line) — wider per-value slack lets two
+#:   excerpts overflow that outer bound and elide the TRUSTED skeleton
+#:   tail (e.g. an "(already contributed by ...)" attribution) instead
+#:   of the untrusted excerpt.
+EXCERPT_MAX_LEN = 120
+
+
+def sanitise_excerpt(value: object, *, max_len: int = EXCERPT_MAX_LEN) -> str:
+    """Escape + bound one attacker-influenced value for embedding inside
+    a trusted message skeleton.
+
+    The excerpt form of the :func:`sanitise_for_terminal` contract —
+    same operation (escape non-printables, then truncate the escaped
+    string with an explicit elision marker), different default bound
+    and placement: :func:`sanitise_for_terminal` bounds a whole line at
+    the moment it reaches a terminal, while this bounds a single
+    untrusted VALUE at the moment it is interpolated into a message
+    (lint errors, quarantine reasons, receipt fields). Messages built
+    this way are safe on every downstream channel — terminal output,
+    durable JSON records, and agent briefs that quote those records —
+    because the untrusted content inside them is already inert and
+    bounded at composition.
+
+    Accepts any value (``str()`` applied first) so composition sites
+    can pass producer-supplied JSON scalars directly.
+    """
+    return sanitise_for_terminal(str(value), max_len=max_len)
 
 
 def _escape_char(c: str) -> str:

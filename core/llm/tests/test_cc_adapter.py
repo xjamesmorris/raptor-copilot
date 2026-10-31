@@ -1,10 +1,13 @@
 """Tests for core.llm.cc_adapter — CC subprocess transport utilities."""
 
+import contextlib
 import json
 import os
 import stat
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -137,36 +140,241 @@ class TestSystemPromptArgvHygiene:
 
 
 class TestSystemPromptFileFor:
+    @pytest.fixture(autouse=True)
+    def _fresh_cache(self):
+        # The cache is process-global; isolate each test and remove
+        # any files this test created.
+        from core.llm import cc_adapter
+        cc_adapter._cleanup_sysprompt_cache()
+        yield
+        cc_adapter._cleanup_sysprompt_cache()
+
     def test_yields_none_when_no_prompt(self):
         for sp in (None, "", "   \n"):
             config = CCDispatchConfig(claude_bin="claude", system_prompt=sp)
             with system_prompt_file_for(config) as spf:
                 assert spf is None
 
-    def test_writes_0600_exact_content_and_unlinks(self):
+    def test_writes_0600_exact_content(self):
         prompt = "line one\nnon-ascii: café → sink\n"
         config = CCDispatchConfig(claude_bin="claude", system_prompt=prompt)
         with system_prompt_file_for(config) as spf:
             assert isinstance(spf, Path)
-            assert spf.name.startswith("cc-sysprompt-")
+            assert spf.parent.name.startswith("cc-sysprompt-")
             assert spf.name.endswith(".txt")
             assert stat.S_IMODE(spf.stat().st_mode) == 0o600
             assert spf.read_text(encoding="utf-8") == prompt
-        assert not spf.exists()
 
-    def test_unlinked_on_exception(self):
+    def test_same_content_reuses_one_file(self):
+        config = CCDispatchConfig(claude_bin="claude", system_prompt="sp")
+        with system_prompt_file_for(config) as first:
+            pass
+        # The file survives the block: it is a per-process cache
+        # entry, reused by the next dispatch with the same prompt.
+        assert first.exists()
+        with system_prompt_file_for(config) as second:
+            assert second == first
+        other = CCDispatchConfig(claude_bin="claude", system_prompt="sp2")
+        with system_prompt_file_for(other) as third:
+            assert third != first
+            assert third.exists()
+        assert first.exists()
+
+    def test_survives_exception_for_reuse(self):
         config = CCDispatchConfig(claude_bin="claude", system_prompt="sp")
         with pytest.raises(RuntimeError, match="boom"):
             with system_prompt_file_for(config) as spf:
                 raise RuntimeError("boom")
-        assert not spf.exists()
+        # A failed dispatch does not evict the cache entry — the
+        # prompt content is still valid for the next call.
+        assert spf.exists()
 
-    def test_tolerates_early_unlink(self):
+    def test_recreated_after_external_removal(self):
         # A cleanup race (session-scratch sweeper, operator tmpwatch)
-        # must not turn CM exit into an exception.
+        # must neither raise nor hand the next child a dangling path.
         config = CCDispatchConfig(claude_bin="claude", system_prompt="sp")
         with system_prompt_file_for(config) as spf:
             os.unlink(spf)
+        with system_prompt_file_for(config) as again:
+            assert again.exists()
+            assert again.read_text(encoding="utf-8") == "sp"
+
+    def test_concurrent_writers_one_file(self):
+        import threading
+
+        config = CCDispatchConfig(claude_bin="claude", system_prompt="race")
+        paths: list[Path] = []
+        errors: list[BaseException] = []
+
+        def _use() -> None:
+            try:
+                with system_prompt_file_for(config) as spf:
+                    paths.append(spf)
+                    assert spf.read_text(encoding="utf-8") == "race"
+            except BaseException as exc:  # noqa: BLE001 — collected for the assert
+                errors.append(exc)
+
+        threads = [threading.Thread(target=_use) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not errors
+        assert len(set(paths)) == 1
+        assert paths[0].exists()
+
+    def test_cleanup_removes_cached_files(self):
+        from core.llm import cc_adapter
+
+        config = CCDispatchConfig(claude_bin="claude", system_prompt="sp")
+        with system_prompt_file_for(config) as spf:
+            pass
+        assert spf.exists()
+        cc_adapter._cleanup_sysprompt_cache()
+        assert not spf.exists()
+        assert not cc_adapter._sysprompt_cache
+
+    def test_files_live_in_private_0700_dir(self):
+        # One unpredictably-named 0700 mkdtemp dir per process: a
+        # sibling user sharing TMPDIR can neither pre-create (squat)
+        # the final path — which would fail every dispatch's
+        # os.replace with EISDIR — nor read or unlink the files.
+        config = CCDispatchConfig(claude_bin="claude", system_prompt="sp")
+        with system_prompt_file_for(config) as spf:
+            parent = spf.parent
+            assert parent != Path(tempfile.gettempdir())
+            assert parent.name.startswith("cc-sysprompt-")
+            assert stat.S_IMODE(parent.stat().st_mode) == 0o700
+
+    def test_forked_child_exit_never_unlinks_parent_files(self):
+        # A forked child inherits the cache state; its (atexit)
+        # cleanup must no-op — the files belong to the parent, whose
+        # in-flight dispatches still read them.
+        from core.llm import cc_adapter
+
+        config = CCDispatchConfig(claude_bin="claude", system_prompt="sp")
+        with system_prompt_file_for(config) as spf:
+            pass
+        assert spf.exists()
+        real_owner = cc_adapter._sysprompt_owner_pid
+        try:
+            cc_adapter._sysprompt_owner_pid = real_owner + 1  # "child"
+            cc_adapter._cleanup_sysprompt_cache()
+            assert spf.exists()
+            assert cc_adapter._sysprompt_cache  # state untouched
+        finally:
+            cc_adapter._sysprompt_owner_pid = real_owner
+
+    def test_forked_child_gets_fresh_dir_never_parents(self):
+        # A child CREATING a file must get its own directory — writing
+        # into the parent's would couple their lifetimes.
+        from core.llm import cc_adapter
+
+        config = CCDispatchConfig(claude_bin="claude", system_prompt="sp")
+        with system_prompt_file_for(config) as parent_file:
+            pass
+        parent_dir = parent_file.parent
+        real_owner = cc_adapter._sysprompt_owner_pid
+        try:
+            cc_adapter._sysprompt_owner_pid = real_owner + 1  # "child"
+            other = CCDispatchConfig(claude_bin="claude", system_prompt="sp2")
+            with system_prompt_file_for(other) as child_file:
+                assert child_file.parent != parent_dir
+            # The parent's file was not disturbed.
+            assert parent_file.exists()
+        finally:
+            # Adopt the child's dir for the fixture's cleanup, then
+            # remove the parent's leftover explicitly.
+            cc_adapter._sysprompt_owner_pid = os.getpid()
+            with contextlib.suppress(OSError):
+                os.unlink(parent_file)
+                os.rmdir(parent_dir)
+
+    def test_forked_child_cache_hit_is_refused(self):
+        # Even a WARM inherited cache entry (same prompt content) must
+        # not be handed to a forked child: the file belongs to the
+        # parent, whose exit unlinks it — possibly mid-dispatch in a
+        # fork-without-exec child.
+        from core.llm import cc_adapter
+
+        config = CCDispatchConfig(claude_bin="claude", system_prompt="sp")
+        with system_prompt_file_for(config) as parent_file:
+            pass
+        parent_dir = parent_file.parent
+        real_owner = cc_adapter._sysprompt_owner_pid
+        try:
+            cc_adapter._sysprompt_owner_pid = real_owner + 1  # "child"
+            with system_prompt_file_for(config) as child_file:
+                assert child_file != parent_file
+                assert child_file.parent != parent_dir
+                assert child_file.read_text(encoding="utf-8") == "sp"
+            assert parent_file.exists()  # parent's file untouched
+        finally:
+            cc_adapter._sysprompt_owner_pid = os.getpid()
+            with contextlib.suppress(OSError):
+                os.unlink(parent_file)
+                os.rmdir(parent_dir)
+
+    def test_dir_keepalive_paired_with_cleanup(self):
+        # The cc-sysprompt- prefix is reaper-registered by the scratch
+        # substrate, so the live directory must be keepalive-protected
+        # (a long-run process's cache must never age past the sweep
+        # floor) and the pid-guarded cleanup must unregister it — the
+        # substrate's contract for non-context-manager owners.
+        from core.llm import cc_adapter
+        from core.run import scratch
+
+        config = CCDispatchConfig(claude_bin="claude", system_prompt="sp")
+        with system_prompt_file_for(config) as spf:
+            pass
+        cache_dir = spf.parent
+        assert str(cache_dir) in scratch._keepalive_paths
+        cc_adapter._cleanup_sysprompt_cache()
+        assert str(cache_dir) not in scratch._keepalive_paths
+        assert not cache_dir.exists()
+
+    def test_swept_dir_recreated_with_fresh_keepalive(self):
+        # An externally-swept dir (tmpwatch, stale-tmp sweep) is
+        # replaced on next use; the dead path's keepalive registration
+        # must not be left behind pinning a name nobody owns.
+        import shutil
+
+        from core.run import scratch
+
+        config = CCDispatchConfig(claude_bin="claude", system_prompt="sp")
+        with system_prompt_file_for(config) as spf:
+            pass
+        old_dir = spf.parent
+        shutil.rmtree(old_dir)
+        with system_prompt_file_for(config) as again:
+            assert again.parent != old_dir
+            assert again.read_text(encoding="utf-8") == "sp"
+        assert str(old_dir) not in scratch._keepalive_paths
+        assert str(again.parent) in scratch._keepalive_paths
+
+    def test_cache_hit_refreshes_mtime(self):
+        # Age-based TMPDIR sweepers (tmpwatch) must see a file in
+        # active use — an hours-old mtime on a hot cache entry got the
+        # file deleted mid-run.
+        config = CCDispatchConfig(claude_bin="claude", system_prompt="sp")
+        with system_prompt_file_for(config) as spf:
+            pass
+        old = time.time() - 7200
+        os.utime(spf, (old, old))
+        with system_prompt_file_for(config) as again:
+            assert again == spf
+            assert again.stat().st_mtime > old + 3600
+
+    def test_cleanup_removes_the_private_dir(self):
+        from core.llm import cc_adapter
+
+        config = CCDispatchConfig(claude_bin="claude", system_prompt="sp")
+        with system_prompt_file_for(config) as spf:
+            pass
+        cache_dir = spf.parent
+        cc_adapter._cleanup_sysprompt_cache()
+        assert not spf.exists()
+        assert not cache_dir.exists()
 
 
 class TestStripJsonFences:
@@ -408,6 +616,28 @@ class TestParseCCFreeform:
         assert "error" not in parsed
         assert parsed["content"] == "hi"
 
+    def test_envelope_error_text_is_defanged_and_redacted(self):
+        # Same envelope-error treatment as parse_cc_structured — the
+        # freeform parser once shipped the CLI/model-authored bytes
+        # verbatim while claiming symmetry.
+        secret = "sk-" + "a" * 48
+        envelope_error = f"boom \x1b[31m {secret}"
+        envelope = json.dumps(
+            {"result": "", "is_error": True, "error": envelope_error},
+        )
+        parsed = parse_cc_freeform(envelope, "")
+        assert secret not in parsed["error"]
+        assert "\x1b" not in parsed["error"]
+        assert "[REDACTED]" in parsed["error"]
+
+    def test_envelope_error_text_truncated(self):
+        # Cap matches the structured parser's 500-char envelope-error
+        # budget (sanitisation may expand escapes, never the input).
+        parsed = parse_cc_freeform(
+            json.dumps({"result": "", "error": "x" * 2000}),
+        )
+        assert len(parsed["error"]) <= 500 * 4
+
 
 class TestExtractEnvelopeMetadata:
     def test_full_envelope(self):
@@ -420,6 +650,7 @@ class TestExtractEnvelopeMetadata:
         into: dict = {}
         extract_envelope_metadata(envelope, into)
         assert into["cost_usd"] == 0.25
+        assert into["cost_reported"] is True
         assert into["duration_seconds"] == 5.0
         assert into["analysed_by"] == "claude-opus-4-20250514"
         assert into["_tokens"] == 300
@@ -428,6 +659,7 @@ class TestExtractEnvelopeMetadata:
         into: dict = {}
         extract_envelope_metadata({}, into)
         assert "cost_usd" not in into
+        assert "cost_reported" not in into
         assert into["analysed_by"] == "claude-code"
 
     def test_string_usage_does_not_crash(self):
@@ -542,6 +774,7 @@ class TestParseStreamJsonLines:
         assert r.content == "hello"
         assert r.session_id == "sess-abc"
         assert r.cost_usd == 0.005
+        assert r.cost_reported is True
         assert r.input_tokens == 100
         assert r.output_tokens == 50
         assert r.cache_read_tokens == 80
@@ -631,6 +864,43 @@ class TestParseStreamJsonLines:
         ]
         r = parse_stream_json_lines(lines)
         assert r.error == "something broke"
+
+    def test_cost_presence_distinguishes_absent_from_explicit_zero(self):
+        from core.llm.cc_adapter import parse_stream_json_lines
+
+        absent = parse_stream_json_lines([
+            json.dumps({"type": "result", "is_error": False}),
+        ])
+        explicit_zero = parse_stream_json_lines([
+            json.dumps({
+                "type": "result",
+                "is_error": False,
+                "total_cost_usd": 0.0,
+            }),
+        ])
+
+        assert absent.cost_usd == 0.0
+        assert absent.cost_reported is False
+        assert explicit_zero.cost_usd == 0.0
+        assert explicit_zero.cost_reported is True
+
+    @pytest.mark.parametrize(
+        "bad_cost",
+        [-1.0, float("nan"), float("inf"), True, "0.1"],
+    )
+    def test_malformed_cost_is_not_reported(self, bad_cost):
+        from core.llm.cc_adapter import parse_stream_json_lines
+
+        parsed = parse_stream_json_lines([
+            json.dumps({
+                "type": "result",
+                "is_error": False,
+                "total_cost_usd": bad_cost,
+            }),
+        ])
+
+        assert parsed.cost_usd == 0.0
+        assert parsed.cost_reported is False
 
     def test_error_result_empty_text_falls_back_to_subtype(self):
         # Budget-cap aborts emit is_error with result "" and the cause
@@ -909,10 +1179,19 @@ class TestCcSubprocessEnvProxyMode:
 
     def test_zero_credential_material(self, monkeypatch):
         """Grep the whole env dict for credential-family names — only
-        the minted token may be present."""
-        import re
+        the minted token may be present. The offender check consumes
+        the canonical vocabulary (family membership + name shape)
+        rather than a private regex, so the test's vocabulary cannot
+        drift behind the strip's."""
+        from core.config import RaptorConfig
+        from core.security.credential_env import (
+            CREDENTIAL_ENV_FAMILY,
+            is_credential_shaped,
+        )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-SECRET")
         monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "operator-gateway-token")
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-LIVE")
+        monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", "X-Auth: hunter2")
         monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "1")
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE")
         monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "SECRETKEY")
@@ -920,14 +1199,30 @@ class TestCcSubprocessEnvProxyMode:
         monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "BRTOKEN")
         monkeypatch.setenv("AWS_PROFILE", "prod")
         monkeypatch.setenv("AWS_REGION", "us-east-1")
+        # Future-shaped first-party credential knob nothing enumerates.
+        monkeypatch.setenv("CLAUDE_CODE_FUTURE_TOKEN", "future-secret")
         env = self._proxy_env()
-        cred_shaped = re.compile(r"AWS_|API_KEY|SECRET|BEARER")
-        offenders = [k for k in env if cred_shaped.search(k)]
+        # Documented survivors: the minted gateway token and RAPTOR's
+        # own session-registry credential; GIT_ENV_VARS names only at
+        # their inert pinned values.
+        allowed = {"ANTHROPIC_AUTH_TOKEN", "RAPTOR_SESSION_TOKEN"}
+        offenders = [
+            k for k, v in env.items()
+            if k not in allowed
+            and RaptorConfig.GIT_ENV_VARS.get(k) != v
+            and (k.startswith("AWS_")
+                 or k in CREDENTIAL_ENV_FAMILY
+                 or is_credential_shaped(k))
+        ]
         assert offenders == []
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+        assert "CLAUDE_CODE_FUTURE_TOKEN" not in env
+        assert "ANTHROPIC_CUSTOM_HEADERS" not in env
         # And no credential VALUE leaked under another name.
         joined = json.dumps(env)
         for secret in ("sk-ant-SECRET", "AKIAEXAMPLE", "SECRETKEY",
-                       "SESSTOKEN", "BRTOKEN", "operator-gateway-token"):
+                       "SESSTOKEN", "BRTOKEN", "operator-gateway-token",
+                       "sk-ant-oat01-LIVE", "future-secret", "hunter2"):
             assert secret not in joined
         # The one credential present is the minted scoped token,
         # riding the Bedrock gateway route family (USE_BEDROCK install).
@@ -964,6 +1259,45 @@ class TestCcSubprocessEnvProxyMode:
         # Non-credential knobs still ride the overlay.
         assert env["RAPTOR_CC_EFFORT"] == "high"
         assert env["RAPTOR_BEDROCK_MODEL"] == "anthropic.claude-x"
+
+    def test_operator_limit_knobs_ride_the_overlay(self, monkeypatch):
+        """FP direction for the strip's name-shape belt: the documented
+        CC limit/tuning knobs (plural TOKENS counts things; the KEY
+        segment in the apiKeyHelper TTL knob is not credential
+        material) must reach the child — a proxy-mode child that
+        silently loses the operator's output-cap tuning is a
+        regression, not hygiene."""
+        from core.llm.cc_adapter import _cc_proxy_strip
+        monkeypatch.setenv("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "32000")
+        monkeypatch.setenv("CLAUDE_CODE_API_KEY_HELPER_TTL_MS", "3600000")
+        assert not _cc_proxy_strip("CLAUDE_CODE_MAX_OUTPUT_TOKENS")
+        assert not _cc_proxy_strip("CLAUDE_CODE_API_KEY_HELPER_TTL_MS")
+        env = self._proxy_env()
+        assert env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "32000"
+        assert env["CLAUDE_CODE_API_KEY_HELPER_TTL_MS"] == "3600000"
+        # Two-direction: the credential-shaped neighbours stay dead.
+        assert _cc_proxy_strip("CLAUDE_CODE_OAUTH_TOKEN")
+        assert _cc_proxy_strip("CLAUDE_CODE_FUTURE_TOKEN")
+
+    def test_proxy_strip_matches_cc_trust_redirect_shape(self):
+        """Symmetry lock: the proxy strip and cc_trust's settings scan
+        consume the SAME vocabulary shape rule for model-traffic
+        redirect names — every endpoint variant the scan blocks is
+        also stripped from the backend overlay."""
+        from core.llm.cc_adapter import _cc_proxy_strip
+        from core.security.credential_env import (
+            is_model_traffic_redirect_shaped,
+        )
+        for name in (
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_BEDROCK_BASE_URL",
+            "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+            "ANTHROPIC_VERTEX_BASE_URL",
+            "CLAUDE_CODE_SKIP_MANTLE_AUTH",
+            "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
+        ):
+            assert is_model_traffic_redirect_shaped(name), name
+            assert _cc_proxy_strip(name), name
 
     def test_api_install_routes_via_anthropic(self, monkeypatch):
         monkeypatch.delenv("CLAUDE_CODE_USE_BEDROCK", raising=False)
@@ -1067,6 +1401,41 @@ class TestNeutralCwd:
         # .claude hooks the CLI child would execute.
         assert (os.stat(d1).st_mode & 0o777) == 0o700
         assert os.listdir(d1) == []
+
+    def test_concurrent_first_calls_create_one_dir(self, monkeypatch):
+        """Lock-guarded lazy init: two threads racing the first CC
+        dispatch must converge on ONE scratch dir — the un-guarded
+        check-then-create let the loser's dir leak (registered,
+        keepalive-refreshed, unused) until process exit."""
+        import threading
+
+        import core.run.scratch as scratch_mod
+        from core.llm import cc_adapter
+
+        monkeypatch.setattr(cc_adapter, "_neutral_cwd", None)
+        created: list[str] = []
+        real_scratch_dir = scratch_mod.scratch_dir
+        entered = threading.Barrier(8, timeout=5)
+
+        def _counting(prefix, **kw):
+            created.append(prefix)
+            return real_scratch_dir(prefix, **kw)
+
+        monkeypatch.setattr(scratch_mod, "scratch_dir", _counting)
+
+        results: list[str] = []
+
+        def _call():
+            entered.wait()
+            results.append(cc_adapter.neutral_cwd())
+
+        threads = [threading.Thread(target=_call) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        assert len(set(results)) == 1
+        assert len(created) == 1
 
 
 class TestResolveClaudeCli:
@@ -1338,6 +1707,18 @@ class TestCcEnvCredentialScoping:
         env = cc_subprocess_env()
         assert "ANTHROPIC_API_KEY" not in env
 
+    def test_alternate_cloud_drops_setup_token_credential(self, monkeypatch):
+        """The `claude setup-token` OAuth credential rides the
+        CLAUDE_CODE_ overlay prefix; on Bedrock/Vertex installs it is
+        dead weight with the same tools-against-hostile-repos exposure
+        as the API key — the pop must cover the whole first-party
+        auth trio, not just the ANTHROPIC_ pair."""
+        from core.llm.cc_adapter import cc_subprocess_env
+        monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "1")
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-LIVE")
+        env = cc_subprocess_env()
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+
     def test_first_party_keeps_anthropic_key(self, monkeypatch):
         """On first-party API installs the key IS the child's auth."""
         from core.llm.cc_adapter import cc_subprocess_env
@@ -1346,6 +1727,17 @@ class TestCcEnvCredentialScoping:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-xxx")
         env = cc_subprocess_env()
         assert env["ANTHROPIC_API_KEY"] == "sk-ant-xxx"
+
+    def test_first_party_keeps_setup_token_credential(self, monkeypatch):
+        """Both-direction pin: on first-party installs the setup-token
+        OAuth credential IS the child's auth (the documented CI auth
+        path) — env mode must keep it."""
+        from core.llm.cc_adapter import cc_subprocess_env
+        monkeypatch.delenv("CLAUDE_CODE_USE_BEDROCK", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_USE_VERTEX", raising=False)
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-LIVE")
+        env = cc_subprocess_env()
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-LIVE"
 
     def test_unsandboxed_substrate_static_trio_passthrough(self, monkeypatch):
         """mint=False (pure-LLM substrate) children cannot re-resolve
@@ -1376,3 +1768,22 @@ class TestCcEnvCredentialScoping:
         env = cc_subprocess_env()
         assert "AWS_BEARER_TOKEN_BEDROCK" not in env
         assert "AWS_REGION" not in env
+
+
+class TestStreamErrorTextSanitised:
+    """Stream-json envelope error text is CLI/model-authored: the
+    producer must redact secrets and escape control bytes before the
+    string reaches TurnResponse.error_message / provider logs."""
+
+    HOSTILE = "\x1b]0;pwned\x07\x9b2J boom sk-ant-api03-" + "a" * 32
+
+    def test_stream_json_error_sanitised(self):
+        from core.llm.cc_adapter import parse_stream_json_lines
+        lines = [json.dumps({
+            "type": "result", "is_error": True, "result": self.HOSTILE,
+        })]
+        r = parse_stream_json_lines(lines)
+        assert r.error is not None
+        assert "\x1b" not in r.error and "\x9b" not in r.error
+        assert "sk-ant-api03-" not in r.error
+        assert len(r.error) < 700

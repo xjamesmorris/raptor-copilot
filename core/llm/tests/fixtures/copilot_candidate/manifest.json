@@ -1,0 +1,48 @@
+{
+  "manifest_version": 1,
+  "contract": {
+    "name": "github-copilot-cli-session-events",
+    "version": 1,
+    "evidence_level": "schema-derived-candidate-unverified"
+  },
+  "source": {
+    "package": "@github/copilot",
+    "cli_version": "1.0.84-4",
+    "schema_path": "dist/schemas/session-events.schema.json",
+    "schema_sha256": "ce6ea924e8bd3cb825046d7328a4b0922d787efa9868f9e7816df95e1ab2b545",
+    "json_output_equivalence": "unverified"
+  },
+  "candidate_profile_assumptions": [
+    "canonical UUID v4 event identifiers",
+    "parentId names the immediately preceding event",
+    "one root user/assistant turn",
+    "one assistant.usage event per model call",
+    "completion receipt, idle, then shutdown terminal order"
+  ],
+  "fixtures": [
+    {
+      "path": "complete.jsonl",
+      "sha256": "9d4f42a4c546fb84f76c8c7e469d40355d0b0ce74dd0596df929f864ad972842",
+      "origin": "independently-authored-synthetic",
+      "purpose": "minimal candidate pure-completion path",
+      "expected": {
+        "outcome": "candidate_complete",
+        "identity_evidence": "runtime_and_billing",
+        "usage_evidence": "per_call_and_shutdown",
+        "chunk_message_id_mode": "n/a"
+      }
+    },
+    {
+      "path": "error-after-receipt.jsonl",
+      "sha256": "d3bad8db910e2cb30915404edc2867cccdcde0fcc3f1d4b4d5b1ddfbeef9a9a1",
+      "origin": "independently-authored-synthetic",
+      "purpose": "late terminal error overrides apparent completion",
+      "expected": {
+        "outcome": "error",
+        "identity_evidence": "none",
+        "usage_evidence": "none",
+        "chunk_message_id_mode": "n/a"
+      }
+    }
+  ]
+}

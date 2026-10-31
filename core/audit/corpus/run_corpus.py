@@ -24,11 +24,12 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from core.security.log_sanitisation import sanitise_for_terminal
 from core.json import load_json, loads, save_json
 
 # Ensemble constants and algorithms imported from pipeline.py (single source
@@ -50,6 +51,7 @@ from core.llm.coerce import structured_result
 from core.run.scratch import keepalive_register, keepalive_unregister
 
 from .sources import FIXTURES_DIR
+from core.source.lines import split_lines
 
 logger = logging.getLogger(__name__)
 
@@ -61,10 +63,9 @@ EXIT_GATE_FAIL = 2
 CORPUS_DIR = Path(__file__).parent
 LABELS_DIR = CORPUS_DIR / "labels"
 
-# Byte budgets for the runner's artifact reads: checklists and
-# results files track corpus size (256 MiB, the checklist budget
-# class); cost-breakdown sidecars are small summaries.
-_MAX_CHECKLIST_BYTES = 256 * 1024 * 1024
+# Byte budgets for the runner's artifact reads: results files track
+# corpus size (256 MiB); cost-breakdown sidecars are small summaries.
+# (Checklist reads route through core.inventory.read_checklist.)
 _MAX_RESULTS_BYTES = 256 * 1024 * 1024
 _MAX_SIDECAR_BYTES = 8 * 1024 * 1024
 
@@ -101,9 +102,9 @@ def _group_max_cost(n_labels: int) -> float:
 def _ts() -> str:
     """Local ISO timestamp for phase banners.
 
-    An 8.8-hour v5 log had no timestamps anywhere — intra-group stalls
-    (study timeouts, 429 storms) were invisible without external
-    clocks. Second precision is enough for phase forensics.
+    A multi-hour run log used to have no timestamps anywhere —
+    intra-group stalls (study timeouts, 429 storms) were invisible
+    without external clocks. Second precision is enough for phase forensics.
     """
     return time.strftime("%Y-%m-%dT%H:%M:%S")
 
@@ -116,9 +117,10 @@ def _print_run_header(
 ) -> None:
     """One header stating the run's configuration up front.
 
-    The v5 log never printed the profile, tree, or model — an operator
-    reading only the log could not state the config without forensics
-    (the profile was only inferable from 120 per-group gate lines).
+    The run log used to print no profile, tree, or model — an
+    operator reading only the log could not state the config without
+    forensics (the profile was only inferable from per-group gate
+    lines).
     """
     from .history import pipeline_tree_sha
 
@@ -198,7 +200,7 @@ def _label_files_sha256(labels_dir: Path | None = None) -> str:
     h = hashlib.sha256()
     for path in files:
         try:
-            raw = path.read_bytes()
+            raw = path.read_bytes()  # raw-open: operator-curated corpus config (eval lane)
         except OSError:
             continue
         try:
@@ -780,7 +782,7 @@ def _verify_label_functions(
         if not name:
             continue
         try:
-            text = src_file.read_text(encoding="utf-8", errors="replace")
+            text = src_file.read_text(encoding="utf-8", errors="replace")  # raw-open: operator-curated corpus tree (eval lane)
         except OSError:
             continue
         if name not in text:
@@ -798,8 +800,8 @@ def _build_checklist(
     out_dir: Path,
 ) -> bool:
     """Build checklist for a target (mechanical, no LLM)."""
-    checklist_path = out_dir / "checklist.json"
-    if checklist_path.exists():
+    from core.inventory import checklist_exists
+    if checklist_exists(out_dir):
         return True
 
     print(f"  Building checklist for {target_dir.name}...", flush=True)
@@ -871,7 +873,7 @@ def _label_preprocessor_dead(src_dir: Path | None, label: Any) -> bool:
         from core.inventory.translation_view import (
             detect_preprocessor_dead_ranges,
         )
-        text = src_file.read_text(encoding="utf-8", errors="replace")
+        text = src_file.read_text(encoding="utf-8", errors="replace")  # raw-open: operator-curated corpus tree (eval lane)
         ranges = detect_preprocessor_dead_ranges(text)
     except Exception:  # noqa: BLE001 — enrichment only, never fatal
         logger.debug(
@@ -884,19 +886,30 @@ def _label_preprocessor_dead(src_dir: Path | None, label: Any) -> bool:
 
 
 def _load_inventoried_functions(audit_dir: Path | None) -> set:
-    """Return {(file, function_name)} for every function in the checklist."""
+    """Return {(file, function_name)} for every function in the checklist.
+
+    Interstitial spans are excluded (synthetic residue, not reviewable
+    units) — EXCEPT spans stamped ``script_handler: true``, which gap
+    selection schedules like functions: a label anchored in one must
+    score as inventoried (triage-skip presumption / pin-matched-no-gap)
+    rather than the label-drift ``function_not_in_checklist`` error. A
+    missing stamp keeps the exclusion — attributing corpus credit on an
+    unclassified span would fabricate a verdict.
+    """
     if audit_dir is None:
         return set()
-    ck_path = audit_dir / "checklist.json"
-    ck = load_json(ck_path, max_bytes=_MAX_CHECKLIST_BYTES)
-    if not isinstance(ck, dict):
+    from core.inventory import read_checklist
+    ck = read_checklist(audit_dir)
+    if not ck:
         return set()
+    from core.inventory.script_handler import script_handler_stamp
     result = set()
     for f in ck.get("files", []):
         fpath = f.get("path", "")
         for item in f.get("items", []):
             name = item.get("name", "")
-            if name and not name.startswith("interstitial:"):
+            if name and (not name.startswith("interstitial:")
+                         or script_handler_stamp(item) is True):
                 result.add((fpath, name))
     return result
 
@@ -1143,7 +1156,14 @@ def _run_audit(
                 error_reason = ""
                 if outcome is None:
                     fn_name = label.function_id.rsplit(":", 1)[-1]
-                    if fn_name.count(".") > 0:
+                    if ":interstitial:" in label.function_id:
+                        # Interstitial names carry a colon
+                        # (``interstitial:<start>-<end>``), so the
+                        # file:name rsplit above keeps only the range —
+                        # restore the full span name for the inventory
+                        # join (stamped handler spans are inventoried).
+                        fn_name = "interstitial:" + fn_name
+                    elif fn_name.count(".") > 0:
                         fn_name = fn_name.rsplit(".", 1)[-1]
                     in_inventory = (label.source.file, fn_name) in inventoried
                     hypothesis = ""
@@ -1537,7 +1557,7 @@ def _run_audit_on_target(
             # would get. Recorded in results.json meta and the run-
             # history header. Deployed = all channels on.
             profile=profile,
-            **(COLD_PROFILE_GATES if profile == "cold" else {}),
+            **(COLD_PROFILE_GATES if profile == "cold" else {}),  # type: ignore[arg-type]
             models=[model] if model else None,
             # Group budget scales with label weight (see the
             # GROUP_BUDGET_* constants); a slice is reserved for the
@@ -1572,10 +1592,38 @@ def _run_audit_on_target(
     return outcomes_by_id, bare_key_entries, out_dir
 
 
+def _iter_audit_log_rows(log_path: Path) -> Iterator[dict[str, Any]]:
+    """Rows of *log_path* in append order, expanded to the contiguous
+    shard set when it names the audit log's first shard — a rolled
+    trail's later rows live in numbered siblings, and scoring shard 1
+    alone would silently drop every outcome after the roll point."""
+    from core.audit.record import AUDIT_LOG_FILENAME, audit_log_paths
+
+    if log_path.name == AUDIT_LOG_FILENAME:
+        paths = audit_log_paths(log_path.parent)
+    else:
+        paths = [log_path]
+    for p in paths:
+        if not p.exists():
+            continue
+        with Path(p).open() as f:  # raw-open: run log written by this harness (eval lane)
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    entry = loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(entry, dict):
+                    yield entry
+
+
 def _parse_audit_log_outcomes(
     log_path: Path,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
-    """Index review/promotion rows of one ``.audit-log.jsonl``.
+    """Index review/promotion rows of one ``.audit-log.jsonl``
+    (expanded to its shard set — see :func:`_iter_audit_log_rows`).
 
     Returns ``(outcomes_by_id, bare_key_entries)``. Keys indexed per
     row: the raw log key (``file:function[:line]``), the derived bare
@@ -1603,57 +1651,39 @@ def _parse_audit_log_outcomes(
     # let unqualified rows update the qualified aliases too.
     qualified_by_bare: dict[str, str] = {}
     raw_entries: list[dict[str, Any]] = []
-    if log_path.exists():
-        with Path(log_path).open() as f:
-            for raw in f:
-                raw = raw.strip()
-                if not raw:
-                    continue
-                try:
-                    entry = loads(raw)
-                except ValueError:
-                    continue
-                if entry.get("action") not in ("orchestrator_review", "sweep_promotion"):
-                    continue
-                key = entry.get("key", "")
-                if not key:
-                    continue
-                raw_entries.append(entry)
-                qualified = entry.get("function_qualified") or ""
-                if qualified:
-                    head, _, tail = key.rpartition(":")
-                    base = head if (head and tail.isdigit()) else key
-                    file_part = base.rsplit(":", 1)[0]
-                    if file_part:
-                        qualified_by_bare[base] = (
-                            f"{file_part}:{qualified}"
-                        )
+    for entry in _iter_audit_log_rows(log_path):
+        if entry.get("action") not in ("orchestrator_review", "sweep_promotion"):
+            continue
+        key = entry.get("key", "")
+        if not key:
+            continue
+        raw_entries.append(entry)
+        qualified = entry.get("function_qualified") or ""
+        if qualified:
+            head, _, tail = key.rpartition(":")
+            base = head if (head and tail.isdigit()) else key
+            file_part = base.rsplit(":", 1)[0]
+            if file_part:
+                qualified_by_bare[base] = (
+                    f"{file_part}:{qualified}"
+                )
 
     # Receipt-floor pre-pass: a refutation_gate row that floored the
     # function to suspicious is deterministic mechanical evidence; the
     # rows it produced must be recognizable downstream (the phase-2
     # quality suppression exempts them, like any tool confirmation).
     floored_bases: set[str] = set()
-    if log_path.exists():
-        with Path(log_path).open() as f:
-            for raw in f:
-                raw = raw.strip()
-                if not raw:
-                    continue
-                try:
-                    entry = loads(raw)
-                except ValueError:
-                    continue
-                if (
-                    entry.get("action") == "refutation_gate"
-                    and entry.get("applied")
-                    and entry.get("demote_to") == "suspicious"
-                ):
-                    key = entry.get("key", "")
-                    head, _, tail = key.rpartition(":")
-                    floored_bases.add(
-                        head if (head and tail.isdigit()) else key,
-                    )
+    for entry in _iter_audit_log_rows(log_path):
+        if (
+            entry.get("action") == "refutation_gate"
+            and entry.get("applied")
+            and entry.get("demote_to") == "suspicious"
+        ):
+            key = entry.get("key", "")
+            head, _, tail = key.rpartition(":")
+            floored_bases.add(
+                head if (head and tail.isdigit()) else key,
+            )
 
     for entry in raw_entries:
         key = entry.get("key", "")
@@ -1703,7 +1733,7 @@ def _extract_source(
     src_file = source_dir / label.source.file
     if not src_file.is_file():
         return None
-    lines = src_file.read_text(encoding="utf-8", errors="replace").splitlines()
+    lines = split_lines(src_file.read_text(encoding="utf-8", errors="replace"))  # raw-open: operator-curated corpus tree (eval lane)
     start = max(0, label.source.line_start - 1)
     end = label.source.line_end
     return "\n".join(lines[start:end])
@@ -1769,7 +1799,7 @@ def _build_probe_context(
             rpr = check_race_protection(source)
             if rpr.protected:
                 ctx["race_protected"] = rpr.reasoning
-        except (ValueError, IndexError, RecursionError, OSError, *Z3_ERRORS):
+        except (ValueError, IndexError, RecursionError, OSError, *Z3_ERRORS):  # type: ignore[misc]
             # Optional enrichment over hostile C source: extraction
             # quirks and Z3 errors degrade to "no race annotation".
             pass
@@ -1805,13 +1835,16 @@ def _run_probe(
     from core.audit.context import format_context_for_prompt
     from core.audit.llm_review import _DEFAULT_SYSTEM_PROMPT, REVIEW_SCHEMA
     from core.audit.strategy import infer_strategies, primers_for_strategies
-    from core.llm.client import LLMClient
     from core.llm.concurrency import derive_max_workers, run_parallel
     from core.llm.log_quiet import quiet_noisy_loggers
+    from core.llm.transcript import build_llm_client, transcript_subject
 
     quiet_noisy_loggers()
 
-    client = LLMClient()
+    # Constructed through the transcript seam so RAPTOR_LLM_TRANSCRIPT
+    # record/replay covers the probe's calls; identical to LLMClient()
+    # when no transcript session is active.
+    client = build_llm_client()
     client.config.max_cost_per_scan = 100.0
     model_config = None
     if model:
@@ -1824,12 +1857,12 @@ def _run_probe(
     probe_schema = {
         "type": "object",
         "properties": {
-            "hypothesis": REVIEW_SCHEMA["properties"]["hypothesis"],
-            "hypotheses": REVIEW_SCHEMA["properties"]["hypotheses"],
-            "counter_hypothesis": REVIEW_SCHEMA["properties"]["counter_hypothesis"],
-            "cwe": REVIEW_SCHEMA["properties"].get("cwe", {"type": "string"}),
-            "body": REVIEW_SCHEMA["properties"].get("body", {"type": "string"}),
-            "status": REVIEW_SCHEMA["properties"]["status"],
+            "hypothesis": REVIEW_SCHEMA["properties"]["hypothesis"],  # type: ignore[index]
+            "hypotheses": REVIEW_SCHEMA["properties"]["hypotheses"],  # type: ignore[index]
+            "counter_hypothesis": REVIEW_SCHEMA["properties"]["counter_hypothesis"],  # type: ignore[index]
+            "cwe": REVIEW_SCHEMA["properties"].get("cwe", {"type": "string"}),  # type: ignore[attr-defined]
+            "body": REVIEW_SCHEMA["properties"].get("body", {"type": "string"}),  # type: ignore[attr-defined]
+            "status": REVIEW_SCHEMA["properties"]["status"],  # type: ignore[index]
         },
         "required": ["status"],
     }
@@ -1959,12 +1992,17 @@ def _run_probe(
         t0 = time.monotonic()
         error_reason = ""
         try:
-            response = client.generate_structured(
-                item["prompt"],
-                probe_schema,
-                system_prompt=item["system_prompt"],
-                **kwargs,
-            )
+            # transcript_subject keys the transcript record/replay
+            # entry to this label so replay matching survives the
+            # parallel workers' nondeterministic dispatch order.
+            # No-op-cheap when no transcript is active.
+            with transcript_subject(label.function_id):
+                response = client.generate_structured(
+                    item["prompt"],
+                    probe_schema,
+                    system_prompt=item["system_prompt"],
+                    **kwargs,
+                )
             result = structured_result(response, default={})
             cost = response.cost if hasattr(response, "cost") else 0.0
             cached = getattr(response, "cached", False)
@@ -2057,11 +2095,11 @@ def _aggregate_spend(run_dirs: list[Path]) -> dict[str, Any] | None:
     and ``cost-breakdown.json`` (the phase/summary ledger — used only
     to surface divergence). Returns None when no telemetry exists.
 
-    A v5 corpus run printed FOUR mutually inconsistent totals ($300 /
-    $301 / $142 / $95) and the prominent final banner under-stated
-    spend by 3.2x (it summed only label-attributed review cost). This
-    aggregate is the single end-of-run number, with the per-class and
-    per-group breakdown and the reconciliation deltas in one block.
+    The run summary used to print FOUR mutually inconsistent totals
+    and the prominent final banner under-stated spend by roughly 3x
+    (it summed only label-attributed review cost). This aggregate is
+    the single end-of-run number, with the per-class and per-group
+    breakdown and the reconciliation deltas in one block.
     """
     groups: list[dict[str, Any]] = []
     per_class: dict[str, list[float]] = {}
@@ -2078,7 +2116,7 @@ def _aggregate_spend(run_dirs: list[Path]) -> dict[str, Any] | None:
             calls = 0
             cost = 0.0
             try:
-                with Path(tel_path).open(encoding="utf-8") as f:
+                with Path(tel_path).open(encoding="utf-8") as f:  # raw-open: telemetry written by this harness (eval lane)
                     for raw in f:
                         raw = raw.strip()
                         if not raw:
@@ -2205,15 +2243,19 @@ def _record_scorecard(
     if not model or not results:
         return
     try:
+        from core.llm.scorecard.cwe import extract_cwe
+        from core.llm.scorecard.paths import default_scorecard_path
         from core.llm.scorecard.scorecard import EventType, ModelScorecard
-        scorecard_path = Path(
-            os.environ.get("RAPTOR_DIR", "."),
-        ) / "out" / "llm_scorecard.json"
-        scorecard = ModelScorecard(scorecard_path)
+        scorecard = ModelScorecard(default_scorecard_path())
         for r in results:
             if r.get("actual") == "error":
                 continue
-            decision_class = f"audit:{r['bug_class']}"
+            # CWE-shaped bug classes normalise through the shared
+            # grammar so the calibrated-merge reader joins them
+            # (case/suffix spellings otherwise mint orphan cells);
+            # non-CWE bug classes keep their raw offline-research key.
+            cwe_tag = extract_cwe(r["bug_class"])
+            decision_class = f"audit:{cwe_tag or r['bug_class']}"
             outcome = "correct" if r.get("match") else "incorrect"
             sample = None
             if outcome == "incorrect":
@@ -2228,7 +2270,7 @@ def _record_scorecard(
                 decision_class=decision_class,
                 model=model,
                 event_type=EventType.CORPUS_GROUND_TRUTH,
-                outcome=outcome,
+                outcome=outcome,  # type: ignore[arg-type]
                 sample=sample,
             )
     except Exception:
@@ -2270,7 +2312,7 @@ def _print_cross_model_summary(
 
         statuses = []
         for ml in model_labels:
-            r = verdicts.get(ml)
+            r = verdicts.get(ml)  # type: ignore[assignment]
             if r is None:
                 line += f" {'—':<13}"
             else:
@@ -2404,8 +2446,8 @@ def _format_summary(
     else:
         # No telemetry ledgers (probe mode / legacy dirs): say what
         # this number is — per-label review spend only, NOT the run
-        # total (a v5 run's bare "Cost:" banner under-stated total
-        # spend by 3.2x).
+        # total (a bare "Cost:" banner once under-stated total spend
+        # roughly 3x).
         lines.append(
             f"  Label-attributed cost: ${total_cost:.4f} "
             f"(per-label review spend only)",
@@ -2445,9 +2487,10 @@ def _format_summary(
                          f"expected={r['expected']} got={r['actual']} "
                          f"evidence={r.get('evidence_tool', '')}")
             if r.get("error_reason"):
-                lines.append(f"    reason: {r['error_reason']}")
+                lines.append("    reason: "
+                             f"{sanitise_for_terminal(str(r['error_reason']))}")
             if hyp:
-                lines.append(f"    hypothesis: {hyp}")
+                lines.append(f"    hypothesis: {sanitise_for_terminal(str(hyp))}")
 
     gates = check_gate(aggregate, per_class, results)
     if gates:
@@ -2515,7 +2558,7 @@ def _save_debug(
         jpath = d / "review-journal.jsonl"
         if not jpath.exists():
             continue
-        with open(jpath) as f:
+        with open(jpath) as f:  # raw-open: journal written by this harness run (eval lane)
             for raw in f:
                 raw = raw.strip()
                 if not raw:
@@ -2524,7 +2567,14 @@ def _save_debug(
                     entry = loads(raw)
                 except ValueError:
                     continue
-                fid = entry.get("file", "") + ":" + entry.get("function", "")
+                if not isinstance(entry, dict):
+                    # Valid JSON is not necessarily a dict — a planted
+                    # scalar line has no .get. Same quarantine as the
+                    # journal reader's non-dict line gate.
+                    continue
+                # f-string, not +: a planted non-str file/function
+                # must yield a non-matching key, not a TypeError.
+                fid = f"{entry.get('file', '')}:{entry.get('function', '')}"
                 if fid != ":":
                     journal_entries[fid] = entry
 
@@ -2888,7 +2938,7 @@ def _run_ensemble_audit(
         bf_by_id = {r["function_id"]: r for r in bf_results}
         all_ids = set(sec_by_id) | set(bf_by_id)
 
-        merged_results: list[dict[str, Any]] = []
+        merged_results: list[dict[str, Any]] = []  # type: ignore[no-redef]
         sec_only_wins = 0
         bf_only_wins = 0
         agree_count = 0
@@ -2993,7 +3043,7 @@ def _run_ensemble_audit(
             elif sec_r:
                 merged_results.append(dict(sec_r))
             else:
-                merged_results.append(dict(bf_r))
+                merged_results.append(dict(bf_r))  # type: ignore[arg-type]
 
         sec_cost = sum(r.get("cost_usd", 0) for r in sec_results)
         bf_cost = sum(r.get("cost_usd", 0) for r in bf_results)
@@ -3206,9 +3256,10 @@ def _run_phase2_classify(
         CALIBRATION_RULES,
         CLASSIFICATION_SCHEMA,
     )
-    from core.llm.client import LLMClient
+    from core.llm.transcript import build_llm_client, transcript_subject
 
-    client = LLMClient()
+    # Transcript seam: identical to LLMClient() with no session active.
+    client = build_llm_client()
     kwargs: dict[str, Any] = {"task_type": "audit"}
     if model:
         try:
@@ -3251,21 +3302,25 @@ def _run_phase2_classify(
             r["phase2_error"] = True
             continue
         try:
-            response = client.generate_structured(
-                prompt,
-                CLASSIFICATION_SCHEMA,
-                # Same calibrated ruleset as the in-run classifier
-                # (security_classifier._CLASSIFICATION_SYSTEM): the
-                # suppression decision this pass feeds must not be
-                # made by an uncalibrated twin of that prompt.
-                system_prompt=(
-                    "You are a security impact classifier. Given a "
-                    "verified code defect, decide whether it has security "
-                    "implications or is purely a quality issue.\n\n"
-                    + CALIBRATION_RULES
-                ),
-                **kwargs,
-            )
+            # transcript_subject keys the record/replay entry to this
+            # finding; no-op-cheap when no transcript is active.
+            with transcript_subject(fid):
+                response = client.generate_structured(
+                    prompt,
+                    CLASSIFICATION_SCHEMA,
+                    # Same calibrated ruleset as the in-run classifier
+                    # (security_classifier._CLASSIFICATION_SYSTEM): the
+                    # suppression decision this pass feeds must not be
+                    # made by an uncalibrated twin of that prompt.
+                    system_prompt=(
+                        "You are a security impact classifier. Given a "
+                        "verified code defect, decide whether it has "
+                        "security implications or is purely a quality "
+                        "issue.\n\n"
+                        + CALIBRATION_RULES
+                    ),
+                    **kwargs,
+                )
             result = structured_result(response, default={})
             cost = response.cost if hasattr(response, "cost") else 0.0
             total_cost += cost
@@ -3287,7 +3342,8 @@ def _run_phase2_classify(
         r["phase2_classification"] = result.get("classification", "quality_finding")
         r["phase2_is_security"] = result.get("is_security", False)
         r["phase2_primitive"] = result.get("primitive") or "none"
-        cls_tag = result.get("classification", "?")
+        cls_tag = sanitise_for_terminal(
+            str(result.get("classification", "?")), max_len=64)
         print(f"  {fid} -> {cls_tag}", flush=True)
 
     errored = sum(1 for r in findings if r.get("phase2_error"))
@@ -3310,9 +3366,10 @@ def _run_phase2b_chains(
     connected quality-bug pairs.
     """
     from core.audit.chain_detector import CHAIN_SCHEMA
-    from core.llm.client import LLMClient
+    from core.llm.transcript import build_llm_client, transcript_subject
 
-    client = LLMClient()
+    # Transcript seam: identical to LLMClient() with no session active.
+    client = build_llm_client()
     kwargs: dict[str, Any] = {"task_type": "audit"}
     if model:
         try:
@@ -3367,16 +3424,21 @@ def _run_phase2b_chains(
             f"neither bug represents alone?"
         )
         try:
-            response = client.generate_structured(
-                prompt,
-                CHAIN_SCHEMA,
-                system_prompt=(
-                    "You are a security analyst. Given two verified code "
-                    "defects on the same call path, decide whether they "
-                    "compose into a security vulnerability."
-                ),
-                **kwargs,
-            )
+            # transcript_subject keys the record/replay entry to this
+            # candidate pair; no-op-cheap when no transcript is active.
+            pair_id = "+".join(sorted([a["function_id"], b["function_id"]]))
+            with transcript_subject(pair_id):
+                response = client.generate_structured(
+                    prompt,
+                    CHAIN_SCHEMA,
+                    system_prompt=(
+                        "You are a security analyst. Given two verified "
+                        "code defects on the same call path, decide "
+                        "whether they compose into a security "
+                        "vulnerability."
+                    ),
+                    **kwargs,
+                )
             result = structured_result(response, default={})
         except Exception:
             logger.warning("Chain eval failed for %s + %s",
@@ -3436,6 +3498,15 @@ def main(argv: list[str] | None = None) -> int:
         "--splice", type=Path, default=None,
         help="Splice partial results back into this full results file "
              "(overwrites matching function_ids, keeps the rest)",
+    )
+    parser.add_argument(
+        "--labels-dir", type=Path, default=None,
+        help="Alternate label overlay directory (default: the "
+             "packaged labels/ dir). Synthetic-mutant overlays (see "
+             "core.audit.corpus.mutate) live in their own directory "
+             "so a default full run never loads them; a run refuses "
+             "a label set that mixes synthetic_mutant with real "
+             "labels either way",
     )
     parser.add_argument(
         "--model", action="append", default=[],
@@ -3587,7 +3658,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"--splice: file not found: {args.splice}", file=sys.stderr)
         return 1
 
-    labels = load_all_labels(bug_class=args.bug_class)
+    if args.labels_dir is not None:
+        labels = load_all_labels(
+            corpus_dir=args.labels_dir, bug_class=args.bug_class,
+        )
+    else:
+        labels = load_all_labels(bug_class=args.bug_class)
 
     if args.label_ids:
         id_set = set(args.label_ids)
@@ -3604,10 +3680,74 @@ def main(argv: list[str] | None = None) -> int:
         print(f" (ids: {len(args.label_ids)})", end="")
     print()
 
+    # --- label-kind partition ---
+    # A run is single-kind by construction: synthetic-mutant floors
+    # are mutation-operator regression numbers, real labels measure
+    # detection on real defects, and one results file mixing the two
+    # would launder the former into the latter everywhere downstream
+    # (metrics, gates, history).  Refuse, never filter silently.
+    from .mutation import (
+        PROVENANCE_SYNTHETIC_MUTANT,
+        apply_labels_to_tree,
+        label_kind,
+    )
+
+    kinds = {label_kind(lb) for lb in labels}
+    if len(kinds) > 1:
+        print(
+            "Label set mixes synthetic_mutant and real labels — a "
+            "corpus run is single-kind by design (mutant floors must "
+            "never read as real-bug results). Keep mutant overlays "
+            "in their own --labels-dir, or select one kind via "
+            "--class/--label.",
+            file=sys.stderr,
+        )
+        return 1
+    run_kind = kinds.pop()
+    if run_kind == PROVENANCE_SYNTHETIC_MUTANT:
+        if args.probe:
+            print(
+                "--probe reads the pinned (unmutated) sources and "
+                "never applies mutation specs — synthetic_mutant "
+                "labels would probe the clean code. Run mutants "
+                "through the audit path (no --probe).",
+                file=sys.stderr,
+            )
+            return 1
+        if args.scope != "excerpt":
+            print(
+                f"--scope {args.scope} audits the shared fixture "
+                f"tree; mutations are only ever applied to the "
+                f"run-private excerpt copy. Synthetic_mutant labels "
+                f"require --scope excerpt (the default).",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"Label kind: {run_kind} (mutation-operator regression "
+              f"run — floors, not real-bug recall)")
+    if args.splice:
+        # Both directions: a mutant refire must not merge into a real
+        # results file and vice versa — the merged rows would grade
+        # under one kind's gates while measuring the other's labels.
+        splice_raw = load_json(args.splice, max_bytes=_MAX_RESULTS_BYTES)
+        splice_kind = "real"
+        if isinstance(splice_raw, dict):
+            splice_kind = (splice_raw.get("meta") or {}).get(
+                "label_kind", "real",
+            )
+        if splice_kind != run_kind:
+            print(
+                f"--splice target records label_kind={splice_kind!r}; "
+                f"this run is {run_kind!r} — refusing to merge across "
+                f"kinds.",
+                file=sys.stderr,
+            )
+            return 1
+
     # Overlay identity: which label files (by canonical content) this
     # run loaded.  Stamped into meta + history so archives are always
     # attributable to their exact label set.
-    labels_content_hash = _label_files_sha256()
+    labels_content_hash = _label_files_sha256(args.labels_dir)
 
     # Resolve and state the transport BEFORE any prep or spend: the
     # first provider line used to appear only once group 1 started
@@ -3771,6 +3911,10 @@ def main(argv: list[str] | None = None) -> int:
         "triage": args.triage,
         "prefilter": args.prefilter,
         "scope": args.scope,
+        # A mutant run and a real run can share every other knob AND
+        # the function_id set (a mutant label reuses the clean
+        # function's id) — the kind must fence wall segments too.
+        "label_kind": run_kind,
     }
     wall_path, wall_segments = _wall_segment_open(
         None if args.probe else args.out, run_stamp,
@@ -3810,12 +3954,46 @@ def main(argv: list[str] | None = None) -> int:
                 excerpt_dirs = _build_excerpt_tree(labels, source_dirs)
                 audit_dirs = excerpt_dirs
 
+            if run_kind == PROVENANCE_SYNTHETIC_MUTANT:
+                # Mutation application, post-fetch: the SourcePin is
+                # the UNMUTATED parent ref, so the shared fixture
+                # clone stays clean and the spec is applied to this
+                # run's private excerpt copy only (the scope gate
+                # above guarantees one exists).  Fail-closed before
+                # any review cost: a spec that no longer applies (or
+                # whose applied result fails its content hash) means
+                # the run would measure the wrong code.
+                mutation_errors = apply_labels_to_tree(
+                    labels, excerpt_dirs or {},
+                )
+                if mutation_errors:
+                    print(
+                        f"{len(mutation_errors)} mutation application "
+                        f"error(s) — refusing before any review cost:",
+                        file=sys.stderr,
+                    )
+                    for e in mutation_errors:
+                        print(f"  {e}", file=sys.stderr)
+                    if excerpt_dirs:
+                        _release_excerpt_trees(excerpt_dirs)
+                    return 1
+                n_mutants = sum(
+                    1 for lb in labels
+                    if label_kind(lb) == PROVENANCE_SYNTHETIC_MUTANT
+                )
+                print(f"  Mutations applied and content-verified: "
+                      f"{n_mutants} label(s)", flush=True)
+
             # Resume-stamp axes only this layer knows: scope changes
-            # the audited tree, and a drifted default-model
-            # resolution is invisible in the requested name.
+            # the audited tree, a drifted default-model resolution is
+            # invisible in the requested name, and the label KIND
+            # fences a mutant run out of a real run's checkpoint (the
+            # function_id sets can be identical — a mutant label
+            # reuses the clean function's id).
             ckpt_stamp_extra = {
                 "scope": args.scope,
                 "model_resolved": model_labels[0],
+                "label_kind": run_kind,
             }
 
             t0 = time.monotonic()
@@ -3864,6 +4042,13 @@ def main(argv: list[str] | None = None) -> int:
                     "row-level signals only (partial)",
                     flush=True,
                 )
+
+    # Kind-stamp the FRESH rows (before splice): trend/stability/
+    # compare partition on this, and a run is single-kind, so every
+    # row of this run carries the run's kind.  Spliced-in prior rows
+    # keep their own stamps (kind agreement was enforced up front).
+    for row in results:
+        row.setdefault("label_kind", run_kind)
 
     # Conservation invariant over the FRESH rows, before any splice
     # merges in prior results: every selected label must sit in exactly
@@ -3960,6 +4145,11 @@ def main(argv: list[str] | None = None) -> int:
         # The knowledge profile the run was invoked with (probe mode
         # skips the orchestrator, so there it only labels the rows).
         "profile": args.profile,
+        # Label kind of the (single-kind) run: "real" or
+        # "synthetic_mutant".  Mutant results are mutation-operator
+        # regression floors, never real-bug recall — splice and the
+        # history store refuse to mix kinds on this field.
+        "label_kind": run_kind,
         # Whether LLM response-cache replay was possible for this run
         # ("off" = every completion was generated fresh — see
         # --no-llm-cache). Rows may still carry cached=True markers
@@ -4026,6 +4216,7 @@ def main(argv: list[str] | None = None) -> int:
             },
             profile=args.profile,
             selection=selection,
+            label_kind=run_kind,
         )
 
     # History delta report. Read-only history use — results.json and

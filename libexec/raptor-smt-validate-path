@@ -31,7 +31,7 @@ or the file/id can't be resolved.
 
 ``--profile`` selects bitvector width and signedness:
 
-  uint64  64-bit unsigned (default — size_t / pointer arithmetic)
+  uint64  64-bit unsigned (size_t / pointer arithmetic)
   int64   64-bit signed
   uint32  32-bit unsigned (CWE-190 32-bit wraparound paths)
   int32   32-bit signed (signed-overflow UB reasoning)
@@ -84,16 +84,24 @@ if not (os.environ.get("CLAUDECODE")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import core.startup.process_init  # noqa: E402,F401
-from core.json import dumps_display, load_json  # noqa: E402
+from core.json import load_json  # noqa: E402
 
 from packages.exploit_feasibility.smt_path import validate_path  # noqa: E402
 
 # attack-paths.json is a RAPTOR-written run artifact.
 _MAX_ATTACK_PATHS_BYTES = 64 * 1024 * 1024
+#: --stdin payloads share the file-read ceiling: every other
+#: read in this script is budgeted, and an unbounded
+#: json.load(sys.stdin) buffers whatever the pipe supplies.
+_MAX_STDIN_BYTES = 64 * 1024 * 1024
 
 
 def _err(msg: str) -> int:
-    print(f"raptor-smt-validate-path: {msg}", file=sys.stderr)
+    # Messages interpolate finding/trace fields — escape control
+    # bytes so the helper earns its recognised-sanitiser name.
+    from core.security.log_sanitisation import sanitise_for_terminal
+    print(f"raptor-smt-validate-path: {sanitise_for_terminal(msg, max_len=400)}",
+          file=sys.stderr)
     return 2
 
 
@@ -153,7 +161,9 @@ def main() -> int:
         "--profile",
         default=None,
         help="Bitvector profile name.  Defaults to the trace's path_profile "
-             "when --from-trace is used, otherwise to 'uint64'.",
+             "when --from-trace is used, otherwise to guessed-signedness "
+             "uint64 reasoning (an infeasible verdict then requires both "
+             "signedness profiles to agree).",
     )
     p.add_argument(
         "--stdin",
@@ -223,8 +233,12 @@ def main() -> int:
             return result_or_code
         conditions, trace_profile = result_or_code
     elif args.stdin:
+        raw = sys.stdin.read(_MAX_STDIN_BYTES + 1)
+        if len(raw) > _MAX_STDIN_BYTES:
+            return _err(
+                f"--stdin payload exceeds {_MAX_STDIN_BYTES} bytes")
         try:
-            payload = json.load(sys.stdin)
+            payload = json.loads(raw)
         except json.JSONDecodeError as e:
             return _err(f"invalid JSON on stdin: {e}")
         if not isinstance(payload, list):
@@ -233,8 +247,10 @@ def main() -> int:
     else:
         conditions = list(args.conditions)
 
-    # Profile precedence: explicit --profile > trace's path_profile > "uint64"
-    profile = args.profile or trace_profile or "uint64"
+    # Profile precedence: explicit --profile > trace's path_profile >
+    # None (guessed uint64 — validate_path then honors an infeasible
+    # verdict only when both signedness profiles agree).
+    profile = args.profile or trace_profile
 
     try:
         result = validate_path(
@@ -244,7 +260,12 @@ def main() -> int:
     except (TypeError, ValueError) as e:
         return _err(str(e))
 
-    sys.stdout.write(dumps_display(result))
+    # ensure_ascii: this JSON goes to the operator terminal; JSON
+    # escapes C0 but passes C1 controls (single-byte CSI/OSC) raw
+    # when ensure_ascii is off (dumps_display is exactly that).
+    # ASCII output stays valid JSON for parsing consumers.
+    sys.stdout.write(json.dumps(result, indent=2, ensure_ascii=True,
+                                default=str))
     sys.stdout.write("\n")
     return 0
 

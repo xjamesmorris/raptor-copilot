@@ -16,15 +16,29 @@ If external LLM fails entirely, falls back to CC dispatch automatically.
 import contextlib
 import copy
 import logging
+import math
 import os
 import sys
 import threading
 import time
 from collections import Counter
+from dataclasses import fields, replace
 from pathlib import Path
 from typing import Any
 
+from core.llm.accounting import (
+    AccountingSummary,
+    CostBasis,
+    CostObservation,
+    ModelKeyAggregation,
+    RouteIdentity,
+    UsdBudgetContract,
+    format_accounting_summary,
+    model_key_aggregation_for_config,
+)
 from core.reporting.formatting import format_elapsed as _format_elapsed
+from core.run.finding_status import read_verdict
+from core.security.log_sanitisation import sanitise_for_terminal
 from packages.llm_analysis.cc_dispatch import invoke_cc_simple
 from packages.llm_analysis.finding_adapter import FindingAdapter
 
@@ -44,22 +58,173 @@ class CostTracker:
     cutoff signals.
     """
 
-    def __init__(self, max_cost: float = 0.0) -> None:
+    def __init__(
+        self,
+        max_cost: float = 0.0,
+        *,
+        diagnostic_dir: Path | str | None = None,
+    ) -> None:
         self._lock = threading.RLock()  # Reentrant — get_summary calls _budget_ratio
         self._total_cost = 0.0
         self._total_tokens = 0
         self._thinking_tokens = 0
         self._max_cost = max_cost  # 0 = no limit
         self._per_model: dict[str, float] = {}
+        self._core_result_per_model: dict[str, float] = {}
+        self._accounting_summary = AccountingSummary()
+        self._core_result_accounting = AccountingSummary()
+        self._route_accounting: dict[RouteIdentity, AccountingSummary] = {}
+        self._core_route_accounting: dict[
+            RouteIdentity, AccountingSummary
+        ] = {}
+        self._core_result_cost = 0.0
+        self._core_result_tokens = 0
+        self._cache_hits = 0
+        self._core_cache_hits = 0
+        self._failed_attempts = 0
+        self._unclassified_legacy_events = 0
+        self.diagnostic_dir = (
+            Path(diagnostic_dir) if diagnostic_dir is not None else None
+        )
 
     def add_cost(self, model_name: str, cost: float, tokens: int = 0,
                  thinking_tokens: int = 0) -> None:
-        """Record cost and tokens from any source (thread-safe)."""
+        """Record a legacy aggregate with no per-attempt accounting basis."""
+        self.record_attempt(
+            model_name,
+            cost=cost,
+            tokens=tokens,
+            thinking_tokens=thinking_tokens,
+            legacy_unclassified=True,
+        )
+
+    def record_attempt(
+        self,
+        model_name: str,
+        *,
+        cost: float,
+        tokens: int = 0,
+        thinking_tokens: int = 0,
+        observation: CostObservation | None = None,
+        route: RouteIdentity | None = None,
+        failed: bool = False,
+        no_spend: bool = False,
+        cache_hit: bool = False,
+        core_accounted: bool = False,
+        retained_reservation_estimate_usd: float = 0.0,
+        legacy_unclassified: bool = False,
+    ) -> None:
+        """Record one completed dispatch attempt exactly once.
+
+        ``core_accounted`` marks observations also present in the owning
+        ``LLMClient`` cumulative snapshot. They remain available provisionally
+        for callers that do not supply that snapshot, but are replaced rather
+        than merged when :meth:`get_summary` receives ``core_stats``.
+        """
+        if observation is not None and not isinstance(
+            observation, CostObservation,
+        ):
+            raise TypeError("observation must be CostObservation or None")
+        if route is not None and not isinstance(route, RouteIdentity):
+            raise TypeError("route must be RouteIdentity or None")
+        if observation is not None and observation.route is not None:
+            route = observation.route
+        if (
+            isinstance(cost, bool)
+            or not isinstance(cost, (int, float))
+            or not math.isfinite(float(cost))
+            or float(cost) < 0.0
+        ):
+            raise ValueError("cost must be a finite non-negative number")
+        if (
+            isinstance(tokens, bool)
+            or not isinstance(tokens, int)
+            or tokens < 0
+        ):
+            raise ValueError("tokens must be a non-negative integer")
+        if (
+            isinstance(thinking_tokens, bool)
+            or not isinstance(thinking_tokens, int)
+            or thinking_tokens < 0
+        ):
+            raise ValueError(
+                "thinking_tokens must be a non-negative integer",
+            )
+        if (
+            observation is not None
+            and observation.has_numeric_usd
+            and not math.isclose(
+                float(cost),
+                observation.legacy_cost_usd,
+                rel_tol=1e-9,
+                abs_tol=1e-12,
+            )
+        ):
+            raise ValueError(
+                "legacy cost does not match the typed observation",
+            )
+        if no_spend and float(cost) != 0.0:
+            raise ValueError("no-spend dispatch cannot carry a non-zero cost")
+
         with self._lock:
-            self._total_cost += cost
-            self._total_tokens += tokens
-            self._thinking_tokens += thinking_tokens
-            self._per_model[model_name] = self._per_model.get(model_name, 0.0) + cost
+            if cache_hit:
+                self._cache_hits += 1
+                if core_accounted:
+                    self._core_cache_hits += 1
+            if no_spend:
+                return
+
+            amount = float(cost)
+            self._total_cost += amount
+            self._total_tokens += int(tokens)
+            self._thinking_tokens += int(thinking_tokens)
+            self._per_model[model_name] = (
+                self._per_model.get(model_name, 0.0) + amount
+            )
+            if core_accounted:
+                self._core_result_cost += amount
+                self._core_result_tokens += int(tokens)
+                self._core_result_per_model[model_name] = (
+                    self._core_result_per_model.get(model_name, 0.0)
+                    + amount
+                )
+            if failed:
+                self._failed_attempts += 1
+            if legacy_unclassified:
+                self._unclassified_legacy_events += 1
+            if observation is None:
+                return
+
+            target_attr = (
+                "_core_result_accounting"
+                if core_accounted else "_accounting_summary"
+            )
+            summary = getattr(self, target_attr)
+            if failed and observation.basis is CostBasis.UNKNOWN:
+                summary = summary.add_unknown_failure(
+                    retained_reservation_estimate_usd=(
+                        retained_reservation_estimate_usd
+                    ),
+                )
+            else:
+                summary = summary.add(observation)
+            setattr(self, target_attr, summary)
+
+            if route is not None:
+                route_map = (
+                    self._core_route_accounting
+                    if core_accounted else self._route_accounting
+                )
+                route_summary = route_map.get(route, AccountingSummary())
+                if failed and observation.basis is CostBasis.UNKNOWN:
+                    route_summary = route_summary.add_unknown_failure(
+                        retained_reservation_estimate_usd=(
+                            retained_reservation_estimate_usd
+                        ),
+                    )
+                else:
+                    route_summary = route_summary.add(observation)
+                route_map[route] = route_summary
 
     @property
     def total_cost(self) -> float:
@@ -186,18 +351,352 @@ class CostTracker:
         consensus_calls = n_findings * n_consensus_models
         return (analysis_calls + consensus_calls) * avg_cost
 
-    def get_summary(self) -> dict[str, Any]:
+    def get_summary(
+        self,
+        *,
+        core_stats: dict[str, Any] | None = None,
+        core_precharged_cost: float = 0.0,
+    ) -> dict[str, Any]:
         with self._lock:
+            total_cost = self._total_cost
+            total_tokens = self._total_tokens
+            cache_hits = self._cache_hits
+            per_model = dict(self._per_model)
+            accounting = _merge_accounting_summaries(
+                self._accounting_summary,
+                self._core_result_accounting,
+            )
+            route_accounting = dict(self._route_accounting)
+            for route, route_summary in self._core_route_accounting.items():
+                route_accounting[route] = _merge_accounting_summaries(
+                    route_accounting.get(route, AccountingSummary()),
+                    route_summary,
+                )
+
+            if core_stats is not None:
+                raw_core_accounting = core_stats.get("accounting")
+                if isinstance(raw_core_accounting, dict):
+                    core_accounting = _accounting_summary_from_mapping(
+                        raw_core_accounting,
+                    )
+                    accounting = _merge_accounting_summaries(
+                        self._accounting_summary,
+                        core_accounting,
+                    )
+                    route_accounting = dict(self._route_accounting)
+
+                core_total = core_stats.get("total_cost")
+                if (
+                    isinstance(core_total, (int, float))
+                    and not isinstance(core_total, bool)
+                    and math.isfinite(float(core_total))
+                    and float(core_total) >= 0.0
+                ):
+                    total_cost = (
+                        self._total_cost
+                        - self._core_result_cost
+                        + float(core_total)
+                        - float(core_precharged_cost)
+                    )
+
+                providers = core_stats.get("providers")
+                core_cache_hits = core_stats.get("cache_hits")
+                if (
+                    isinstance(core_cache_hits, int)
+                    and not isinstance(core_cache_hits, bool)
+                    and core_cache_hits >= 0
+                ):
+                    cache_hits = (
+                        self._cache_hits
+                        - self._core_cache_hits
+                        + core_cache_hits
+                    )
+                if isinstance(providers, dict):
+                    route_accounting = dict(self._route_accounting)
+                    provider_accounting_total = AccountingSummary()
+                    core_tokens = sum(
+                        int(provider_stats.get("total_tokens", 0) or 0)
+                        for provider_stats in providers.values()
+                        if isinstance(provider_stats, dict)
+                        and isinstance(
+                            provider_stats.get("total_tokens", 0),
+                            int,
+                        )
+                    )
+                    total_tokens = (
+                        self._total_tokens
+                        - self._core_result_tokens
+                        + core_tokens
+                    )
+                    per_model = {
+                        model: amount
+                        - self._core_result_per_model.get(model, 0.0)
+                        for model, amount in self._per_model.items()
+                    }
+                    for key, provider_stats in providers.items():
+                        if not isinstance(provider_stats, dict):
+                            continue
+                        provider_summary = _accounting_summary_from_mapping(
+                            provider_stats.get("accounting"),
+                        )
+                        if not _accounting_has_activity(provider_summary):
+                            continue
+                        provider, separator, model = str(key).partition(":")
+                        if not separator or not provider or not model:
+                            continue
+                        provider_cost = provider_stats.get("total_cost", 0.0)
+                        if (
+                            isinstance(provider_cost, (int, float))
+                            and not isinstance(provider_cost, bool)
+                        ):
+                            per_model[model] = (
+                                per_model.get(model, 0.0)
+                                + float(provider_cost)
+                            )
+                        route = RouteIdentity(provider, model)
+                        route_accounting[route] = (
+                            _merge_accounting_summaries(
+                                route_accounting.get(
+                                    route, AccountingSummary(),
+                                ),
+                                provider_summary,
+                            )
+                        )
+                        provider_accounting_total = (
+                            _merge_accounting_summaries(
+                                provider_accounting_total,
+                                provider_summary,
+                            )
+                        )
+                    if not isinstance(raw_core_accounting, dict):
+                        accounting = _merge_accounting_summaries(
+                            self._accounting_summary,
+                            provider_accounting_total,
+                        )
+                for route, markers in self._core_route_accounting.items():
+                    route_accounting[route] = _overlay_failure_accounting(
+                        route_accounting.get(route, AccountingSummary()),
+                        markers,
+                    )
+
+            if self._unclassified_legacy_events:
+                accounting = replace(
+                    accounting,
+                    usd_total_complete=False,
+                    authoritative_remaining_usd=None,
+                )
+            accounting_dict = accounting.as_dict()
             summary = {
-                "total_cost": round(self._total_cost, 4),
-                "total_tokens": self._total_tokens,
-                "max_cost": self._max_cost,
-                "budget_used_percent": round(self._budget_ratio() * 100, 1) if self._max_cost > 0 else 0,
-                "cost_by_model": {k: round(v, 4) for k, v in self._per_model.items()},
+                "total_cost": round(total_cost, 4),
+                "total_tokens": total_tokens,
+                # An uncapped run uses +inf internally; JSON represents
+                # its absent ceiling as null while enforcement stays unchanged.
+                "max_cost": None if self._max_cost == float("inf") else self._max_cost,
+                "budget_used_percent": (
+                    round((total_cost / self._max_cost) * 100, 1)
+                    if self._max_cost > 0
+                    and math.isfinite(self._max_cost)
+                    else 0
+                ),
+                "cost_by_model": {
+                    key: round(value, 4)
+                    for key, value in per_model.items()
+                },
+                "accounting_by_route": {
+                    f"{route.provider}/{route.model}": {
+                        "route": route.as_dict(),
+                        **route_summary.as_dict(),
+                    }
+                    for route, route_summary in sorted(
+                        route_accounting.items(),
+                        key=lambda item: (
+                            item[0].provider, item[0].model,
+                        ),
+                    )
+                },
+                "cache_hits": cache_hits,
+                "failed_dispatches": self._failed_attempts,
+                "unclassified_legacy_events": (
+                    self._unclassified_legacy_events
+                ),
+                **accounting_dict,
             }
             if self._thinking_tokens > 0:
                 summary["thinking_tokens"] = self._thinking_tokens
             return summary
+
+
+def _snapshot_verdicts(
+    results_by_id: dict[str, Any],
+) -> dict[str, bool | None]:
+    """Per-finding verdict snapshot for the reliability producers.
+
+    Preserves abstention: a missing or ``None`` ``is_exploitable``
+    (errored / refused / schema-nulled analysis) snapshots as ``None``
+    so downstream producers exclude the non-vote — bool()-coercing at
+    snapshot time silently wrote abstained primaries into the
+    JUDGE_REVIEW / SELF_CONSISTENCY ledgers as "not exploitable"
+    votes, poisoning outcomes against the judges who actually voted.
+    Error records are excluded entirely (their verdict fields are
+    never trusted).
+    """
+    from .tasks import primary_verdict_snapshot
+
+    out: dict[str, bool | None] = {}
+    for fid, r in results_by_id.items():
+        if isinstance(r, dict) and "error" not in r:
+            # Tri-state read of the analyst's OWN verdict: the
+            # earliest override-stage snapshot when the cross-family
+            # conservative override already mutated the field (this
+            # helper runs AFTER that stage — reading the raw field
+            # attributed the override to the primary analyst in the
+            # JUDGE_REVIEW / SELF_CONSISTENCY ledgers), else
+            # read_verdict — a junk shape snapshots as None too:
+            # bool()-coercing it wrote a fabricated primary vote
+            # into the ledgers (a phantom voter that could break a
+            # genuine judge tie and mint a "correct" outcome for a
+            # vote never cast).
+            out[fid] = primary_verdict_snapshot(r)
+    return out
+
+
+_ACCOUNTING_FIELD_NAMES = frozenset(
+    field.name for field in fields(AccountingSummary)
+)
+
+
+def _accounting_summary_from_mapping(value: Any) -> AccountingSummary:
+    if isinstance(value, AccountingSummary):
+        return value
+    if not isinstance(value, dict):
+        return AccountingSummary()
+    return AccountingSummary(**{
+        key: value[key]
+        for key in _ACCOUNTING_FIELD_NAMES
+        if key in value
+    })
+
+
+def _merge_accounting_summaries(
+    left: AccountingSummary,
+    right: AccountingSummary,
+) -> AccountingSummary:
+    if left == AccountingSummary():
+        return right
+    if right == AccountingSummary():
+        return left
+    return left.merge(right)
+
+
+def _overlay_failure_accounting(
+    base: AccountingSummary,
+    markers: AccountingSummary,
+) -> AccountingSummary:
+    """Overlay failure-only evidence already counted in a core snapshot.
+
+    Provider snapshots carry call/cost totals but not package-side knowledge
+    that those unknown-basis calls failed. ``max`` preserves a future provider
+    that supplies the same marker itself without double-counting it.
+    """
+    if markers.unknown_failed_attempts == 0:
+        return base
+    return replace(
+        base,
+        unknown_failed_attempts=max(
+            base.unknown_failed_attempts,
+            markers.unknown_failed_attempts,
+        ),
+        retained_reservation_estimate_usd=max(
+            base.retained_reservation_estimate_usd,
+            markers.retained_reservation_estimate_usd,
+        ),
+        exposure_unresolved=(
+            base.exposure_unresolved or markers.exposure_unresolved
+        ),
+        usd_total_complete=(
+            base.usd_total_complete and markers.usd_total_complete
+        ),
+        authoritative_remaining_usd=(
+            None
+            if (
+                base.authoritative_remaining_usd is None
+                or markers.authoritative_remaining_usd is None
+            )
+            else min(
+                base.authoritative_remaining_usd,
+                markers.authoritative_remaining_usd,
+            )
+        ),
+    )
+
+
+def _accounting_has_activity(summary: AccountingSummary) -> bool:
+    return bool(
+        summary.calls
+        or summary.unknown_failed_attempts
+        or summary.exposure_unresolved
+        or summary.retained_reservation_estimate_usd
+        or not summary.usd_total_complete
+    )
+
+
+def format_cost_summary(cost_summary: dict[str, Any]) -> str:
+    """Render a report cost object without treating compatibility zero as free."""
+    raw_accounting = cost_summary.get("accounting")
+    accounting = _accounting_summary_from_mapping(
+        raw_accounting if isinstance(raw_accounting, dict) else cost_summary,
+    )
+    total_cost = float(cost_summary.get("total_cost", 0.0) or 0.0)
+    unclassified_events = int(
+        cost_summary.get("unclassified_legacy_events", 0) or 0,
+    )
+    if unclassified_events and accounting.calls == 0:
+        return (
+            f"Estimated USD ${total_cost:.2f} "
+            "(legacy; accounting basis unavailable) — incomplete "
+            f"({unclassified_events} unclassified "
+            f"{'event' if unclassified_events == 1 else 'events'})"
+        )
+    if not _accounting_has_activity(accounting):
+        if total_cost <= 0:
+            return ""
+        return (
+            f"Estimated USD ${total_cost:.2f} "
+            "(legacy; accounting basis unavailable) — incomplete"
+        )
+    rendered = format_accounting_summary(accounting)
+    unclassified = total_cost - accounting.legacy_total_cost
+    if (
+        not accounting.usd_total_complete
+        and not unclassified_events
+        and not any((
+            accounting.unknown_calls,
+            accounting.subscription_calls,
+            accounting.unknown_failed_attempts,
+        ))
+    ):
+        rendered += " — incomplete"
+    if unclassified_events and unclassified > 0.00005:
+        rendered += (
+            f"; additional legacy estimate ${unclassified:.2f} "
+            "(basis unavailable) — incomplete "
+            f"({unclassified_events} unclassified "
+            f"{'event' if unclassified_events == 1 else 'events'})"
+        )
+    elif unclassified_events:
+        rendered += (
+            f"; incomplete ({unclassified_events} unclassified "
+            f"{'event' if unclassified_events == 1 else 'events'})"
+        )
+    return rendered
+
+
+def _label_claude_dispatch_result(result: Any) -> Any:
+    """Stamp the canonical logical provider on the direct CC adapter."""
+    from packages.llm_analysis.dispatch import DispatchResult
+    if isinstance(result, DispatchResult) and not result.provider:
+        result.provider = "claudecode"
+    return result
 
 
 def _cc_fallback_role_resolution(role_resolution: dict) -> dict:
@@ -215,6 +714,20 @@ def _cc_fallback_role_resolution(role_resolution: dict) -> dict:
         "analysis_models": [],
         "analysis_model": None,
     }
+
+
+def _should_fallback_to_cc(results: list[dict[str, Any]]) -> bool:
+    """Allow legacy fallback only for ordinary transport/model failures."""
+    return bool(
+        results
+        and all("error" in result for result in results)
+        # Defensive for wrapped integrations. Native LLMPolicyError values
+        # are re-raised by dispatch_task and never produce this record.
+        and not any(
+            result.get("error_type") == "policy_refusal"
+            for result in results
+        )
+    )
 
 
 def _classify_absent_consensus(
@@ -236,6 +749,91 @@ def _classify_absent_consensus(
     return True, False
 
 
+def _panel_summary_parts(
+    agreed: int, disputed: int, no_verdict: int,
+    panel_verdict: int = 0,
+) -> list[str]:
+    """Human-readable parts for a review-panel (consensus / judge)
+    summary line. The counts partition panels that RAN: an
+    all-abstain panel resolves to "no-verdict" — neither agreed nor
+    disputed — and omitting it made the printed line silently
+    undercount panels that ran. A panel (consensus or judge) that
+    voted on an abstained primary resolves to "panel-verdict" (there
+    was no primary vote to agree with). Zero counts stay off the
+    line."""
+    parts: list[str] = []
+    if agreed:
+        parts.append(f"{agreed} agreed")
+    if disputed:
+        parts.append(f"{disputed} disputed")
+    if no_verdict:
+        parts.append(f"{no_verdict} no-verdict")
+    if panel_verdict:
+        parts.append(f"{panel_verdict} panel-verdict")
+    return parts
+
+
+def _count_panel_stamps(
+    per_finding_results: list, field: str,
+) -> dict[str, int]:
+    """Count review-panel stage outcomes for one stamp field
+    ("consensus" or "judge"). The four stamp values partition panels
+    that RAN; both stages mint the same vocabulary, including
+    "panel-verdict" for a panel that voted on an abstained primary,
+    so one counter serves both summary lanes."""
+    counts = {"agreed": 0, "disputed": 0,
+              "no-verdict": 0, "panel-verdict": 0}
+    for r in per_finding_results:
+        stamp = r.get(field) if isinstance(r, dict) else None
+        if stamp in counts:
+            counts[stamp] += 1
+    return counts
+
+
+# Cost-prudent default when the primary is a metered cloud model and the
+# operator did not specify --max-findings. Local primaries bypass this
+# (free inference → analyse everything). Mirrors raptor_agentic.py's
+# documented agentic default.
+_CLOUD_DEFAULT_MAX_FINDINGS = 10
+
+
+def _is_local_primary(llm_config: Any | None) -> bool:
+    """True when the configured primary runs on a local inference server.
+
+    Delegates to ``core.llm.egress.is_local_inference`` for the actual
+    detection. Best-effort: any resolution failure returns False (keep
+    the cost-prudent cloud default).
+    """
+    primary = getattr(llm_config, "primary_model", None)
+    if primary is None:
+        return False
+    try:
+        from core.llm.egress import is_local_inference
+        return is_local_inference(
+            getattr(primary, "provider", "") or "",
+            getattr(primary, "api_base", None),
+        )
+    except Exception:  # noqa: BLE001 — detection is best-effort
+        return False
+
+
+def resolve_max_findings(
+    max_findings: int | None, llm_config: Any | None,
+) -> int:
+    """Turn the ``None`` / explicit-int from the CLI into a concrete cap.
+
+    ``None`` (operator didn't specify) → provider-aware: local primary
+    gets 0 (no cap, bound by the resource governor), cloud primary gets
+    ``_CLOUD_DEFAULT_MAX_FINDINGS``. An explicit int passes through
+    untouched.
+    """
+    if max_findings is not None:
+        return max_findings
+    if _is_local_primary(llm_config):
+        return 0
+    return _CLOUD_DEFAULT_MAX_FINDINGS
+
+
 def _cap_findings(findings: list, max_findings: int) -> list:
     """Apply the max_findings cap, stamping the dropped tail with
     ``skipped_over_budget`` at skip time. The dicts are the prep
@@ -252,6 +850,76 @@ def _cap_findings(findings: list, max_findings: int) -> list:
                 skip_reason="max_findings cap",
             )
     return findings[:max_findings]
+
+
+def _build_assessment_summary(
+    *,
+    requested: int,
+    eligible: int,
+    selected: int,
+    analyzed: int,
+    cap: int,
+    cap_source: str,
+) -> dict[str, Any]:
+    """Build the machine-readable assessment-completeness contract.
+
+    ``requested`` is the number of prepared findings presented to the
+    orchestrator. ``eligible`` excludes findings already resolved by a
+    mechanical skip before LLM selection. ``selected`` is the count admitted
+    to dispatch after the count cap, and ``analyzed`` is the count that
+    returned a non-error analysis result.
+
+    A run can therefore finish its pipeline successfully while this summary is
+    ``partial``. That distinction is consumed by the aggregate agentic report
+    and lifecycle metadata rather than turning useful partial output into a
+    hard failure.
+    """
+    requested = max(int(requested), 0)
+    eligible = max(min(int(eligible), requested), 0)
+    selected = max(min(int(selected), eligible), 0)
+    analyzed = max(min(int(analyzed), selected), 0)
+    cap = max(int(cap), 0)
+
+    unreviewed = eligible - analyzed
+    unselected = eligible - selected
+    analysis_failures = selected - analyzed
+    cap_applied = cap > 0 and eligible > cap and selected == cap
+    cap_reason = None
+    if cap_applied:
+        cap_reason = (
+            "provider default cap"
+            if cap_source == "provider_default"
+            else "explicit --max-findings cap"
+        )
+
+    reasons: list[str] = []
+    if cap_reason:
+        reasons.append(cap_reason)
+    elif unselected:
+        reasons.append("not all eligible findings were selected")
+    if analysis_failures:
+        reasons.append(
+            f"{analysis_failures} selected finding"
+            f"{'s' if analysis_failures != 1 else ''} failed analysis"
+        )
+    reason = "; ".join(reasons) or None
+
+    return {
+        "status": "complete" if unreviewed == 0 else "partial",
+        "requested": requested,
+        "eligible": eligible,
+        "selected": selected,
+        "analyzed": analyzed,
+        "unreviewed": unreviewed,
+        "unselected": unselected,
+        "analysis_failures": analysis_failures,
+        "not_eligible": requested - eligible,
+        "cap": cap,
+        "cap_applied": cap_applied,
+        "cap_source": cap_source,
+        "cap_reason": cap_reason,
+        "reason": reason,
+    }
 
 
 def _finalize_results_for_emit(results: list) -> None:
@@ -313,6 +981,7 @@ def build_llm_config_from_flags(
     consensus: str | None = None,
     judge: str | None = None,
     aggregate: str | None = None,
+    exploit: str | None = None,
     auto_detect: bool = True,
 ) -> Any | None:
     """Build an LLMConfig from CLI flags, shared by /agentic and /analyze.
@@ -327,96 +996,101 @@ def build_llm_config_from_flags(
         consensus: Blind second-opinion model name.
         judge: Non-blind review model name.
         aggregate: Final synthesis model name.
+        exploit: Model for PoC/patch generation.
         auto_detect: Try env vars / models.json if no --model given.
 
     Returns LLMConfig or None if no model could be resolved.
     """
+    from dataclasses import replace
+
     from core.llm.config import (
         LLMConfig,
+        _config_for_model_from_candidates,
+        _entry_auth_resolvable,
         _get_configured_models,
         _model_config_from_entry,
     )
     from core.llm.model_data import PROVIDER_ENV_KEYS
     from core.security.llm_family import (
         bare_model_id,
+        explicit_provider_of,
         provider_of,
-        resolve_model_shorthand,
+        routing_model_id,
     )
 
     models = models or []
     llm_config = None
+    configured_entries = [
+        entry for entry in _get_configured_models()
+        if isinstance(entry, dict)
+    ]
+    configured_pairs = [
+        (entry, _model_config_from_entry(entry))
+        for entry in configured_entries
+    ]
+    configured_candidates = [mc for _entry, mc in configured_pairs]
 
     def _resolve_model(name: str, role: str):
-        # Operators may write any of ``--model claude-haiku-4-5``,
-        # ``--model anthropic/claude-haiku-4-5``, or an aggregator
-        # form like ``--model together/anthropic/claude-haiku-4-5``;
-        # ``models.json`` always stores the bare model under a
-        # separate ``provider`` key. Compute provider via
-        # ``provider_of`` (which peels aggregators) and bare model
-        # via ``bare_model_id`` so all three forms collapse to the
-        # same lookup. Leaving the prefix in the entry's ``model``
-        # field would produce ``anthropic/anthropic/claude-haiku-4-5``
-        # when downstream re-prepends the provider — the SDK ships
-        # that to Anthropic which 404s as an unknown model.
-        #
-        # Shorthand pass first: bare tier tokens (``haiku`` / ``opus`` /
-        # ``sonnet``) that don't parse as a real model id resolve to a
-        # unique configured entry when possible, then re-enter the
-        # provider-lookup path with the full name. Ambiguous shorthand
-        # raises inside resolve_model_shorthand with the candidate
-        # list. Missing shorthand returns None → falls through to the
-        # existing loud-failure path unchanged.
-        if provider_of(name) == "":
-            # Pass only the canonical ``model`` field per configured
-            # entry. The ``_configured_model`` alias is deliberately
-            # excluded — including both would raise a false ambiguity
-            # error when they're just two names for the same entry
-            # (e.g. ``claude-haiku-4-5`` alias + ``claude-haiku-4-5-
-            # 20251001`` canonical, both with token "haiku"). Operators
-            # who want to select an entry by an alias-specific token
-            # can pass the alias directly — the exact-match path below
-            # handles that.
-            configured_names = [
-                cfg_entry.get("model") or ""
-                for cfg_entry in _get_configured_models()
-            ]
-            resolved = resolve_model_shorthand(name, configured_names)
-            if resolved is not None and resolved != name:
-                # Substitute the resolved full name and continue. The
-                # dated-snapshot lookup below still runs on the
-                # resolved name, so an aggregator-hosted or Bedrock-
-                # shaped configured model resolves correctly.
-                name = resolved
-        provider = provider_of(name)
-        bare = bare_model_id(name)
-        entry: dict[str, Any] = {"model": bare, "provider": provider, "role": role}
-        for cfg_entry in _get_configured_models():
-            # Match against either the resolved model name or the
-            # operator's original alias. The Anthropic resolver
-            # rewrites ``model`` to the dated snapshot and stashes
-            # the alias in ``_configured_model``; without the alias
-            # compare, an entry whose ``model`` is now
-            # ``claude-haiku-4-5-20251001`` would miss ``--model
-            # claude-haiku-4-5``. Gate by provider too so two
-            # same-named entries under different providers don't
-            # collide (e.g. ``ollama/llama-3`` vs ``together/llama-3``).
-            if provider and cfg_entry.get("provider") != provider:
+        # Exact configured names are authoritative even when the model
+        # vocabulary is unknown to RAPTOR. This is the path for a
+        # backend-specific alias: retain its declared provider, route,
+        # credentials, limits, and canonical alias resolution.
+        explicit_provider = explicit_provider_of(name)
+        requested_bare = bare_model_id(name)
+        mc = None
+        for entry, configured in configured_pairs:
+            if explicit_provider and configured.provider != explicit_provider:
                 continue
-            cfg_name = cfg_entry.get("model")
-            cfg_alias = cfg_entry.get("_configured_model")
-            if (bare in (cfg_name, cfg_alias)) and cfg_entry.get("api_key"):
-                entry["api_key"] = cfg_entry["api_key"]
+            entry_names = {
+                value
+                for value in (
+                    entry.get("model"),
+                    entry.get("_configured_model"),
+                )
+                if isinstance(value, str) and value
+            }
+            if name in entry_names or requested_bare in entry_names:
+                mc = configured
                 break
-        mc = _model_config_from_entry(entry)
-        if not mc.api_key:
-            if not provider:
-                # Unrecognizable name and no configured entry matched it by
-                # name — fail loudly with the recognizable-id hint rather
-                # than the unhelpful "Set ??? env var" path below.
-                from core.security.llm_family import unknown_model_message
-                print(f"\n  ✗ {unknown_model_message(name)}", file=sys.stderr)
+
+        if mc is None:
+            try:
+                mc = _config_for_model_from_candidates(
+                    configured_candidates,
+                    name,
+                )
+            except ValueError as exc:
+                if "ambiguous model shorthand" in str(exc):
+                    raise
+                print(f"\n  ✗ {exc}", file=sys.stderr)
                 return None
-            env_key = PROVIDER_ENV_KEYS.get(provider, "???")
+
+        mc = replace(mc, role=role)
+        if not _entry_auth_resolvable(mc):
+            provider = mc.provider or provider_of(name)
+            if provider:
+                env_config = _model_config_from_entry({
+                    "model": routing_model_id(name),
+                    "provider": provider,
+                    "role": role,
+                })
+                if _entry_auth_resolvable(env_config):
+                    mc = env_config
+
+        if not _entry_auth_resolvable(mc):
+            provider = mc.provider or provider_of(name)
+            if provider in ("claudecode", "claudecode-resumable"):
+                print(
+                    f"\n  ✗ Claude Code CLI unavailable for --model {name}",
+                    file=sys.stderr,
+                )
+                print(
+                    "  Install/authenticate the claude CLI or choose "
+                    "a configured API provider",
+                    file=sys.stderr,
+                )
+                return None
+            env_key = PROVIDER_ENV_KEYS.get(provider, "provider credentials")
             print(f"\n  ✗ No API key for --model {name}", file=sys.stderr)
             print(f"  Set {env_key} or add the key to models.json", file=sys.stderr)
             return None
@@ -432,10 +1106,19 @@ def build_llm_config_from_flags(
             # explicit --model list (here) and explicit --consensus/--judge/
             # --aggregate flags (below) populate roles — nothing the operator
             # didn't ask for sneaks in, and an explicit single-provider --model
-            # can never silently fall back cross-provider. Specialized
-            # fast-tier models are still auto-seeded by __post_init__ from the
-            # primary's OWN provider, so they stay same-provider (cheap).
+            # can never silently fall back cross-provider. Catalogued
+            # primaries retain same-provider fast-tier specialization;
+            # uncatalogued primaries clear it below because provider affinity
+            # alone is not permission to substitute a different model.
             llm_config = LLMConfig(primary_model=primary_mc, fallback_models=[])
+            from core.llm.model_data import resolve_model_limits
+            if resolve_model_limits(primary_mc.model_name) is None:
+                # The provider mapping alone is not evidence that an
+                # unlisted explicit model may be silently replaced by
+                # RAPTOR's catalogued fast-tier sibling. Keep every
+                # task on the operator's exact model unless they name
+                # another role model explicitly.
+                llm_config.specialized_models.clear()
             # Pin the operator's --model process-wide so any sub-consumer
             # deep in the run that constructs ``LLMConfig()`` no-arg
             # honours the operator's choice instead of silently falling
@@ -480,6 +1163,7 @@ def build_llm_config_from_flags(
         ("consensus", consensus),
         ("judge", judge),
         ("aggregate", aggregate),
+        ("exploit", exploit),
     ]
     has_role_flags = any(m for _, m in role_flags)
     if has_role_flags and not llm_config:
@@ -598,7 +1282,7 @@ def orchestrate(
     repo_path: Path,
     out_dir: Path,
     max_parallel: int = 0,
-    max_findings: int = 0,
+    max_findings: int | None = None,
     no_exploits: bool = False,
     no_patches: bool = False,
     llm_config: Any | None = None,
@@ -630,9 +1314,12 @@ def orchestrate(
         repo_path: Target repository path.
         out_dir: Output directory for orchestration results.
         max_parallel: Maximum concurrent agents (0 = auto from model RPM).
-        max_findings: Cap on findings dispatched — when > 0 and the
-            report carries more, only the first max_findings are
-            analysed. 0 (default) = no cap.
+        max_findings: Cap on findings dispatched. An explicit int is
+            honoured verbatim (> 0 caps; <= 0 = no cap). ``None`` (the
+            default = "operator did not specify") resolves provider-aware:
+            a LOCAL primary (ollama / loopback endpoint — free inference)
+            gets NO cap (analyse everything, bound by the resource
+            governor), a cloud primary keeps the cost-prudent default of 10.
         no_exploits: Skip exploit generation.
         no_patches: Skip patch generation.
         llm_config: LLMConfig for external LLM dispatch (None = CC only).
@@ -674,13 +1361,26 @@ def orchestrate(
     Returns:
         Orchestrated report dict, or None if orchestration was skipped.
     """
+    # Honesty fence for the LLM transcript seam: orchestrated dispatch
+    # (external-LLM parallel AND the CC sub-agent path) constructs its
+    # clients outside the record/replay seam. Under replay this
+    # refuses (it would dispatch live+paid while the operator believes
+    # the run is hermetic); under record it warns that the transcript
+    # will under-record. Adoption requires per-task subject tags first
+    # — positional replay is nondeterministic under parallel dispatch.
+    from core.llm.transcript import fence_unadopted_dispatch
+    fence_unadopted_dispatch(
+        "orchestrated dispatch (packages/llm_analysis/orchestrator"
+        ".orchestrate)",
+    )
+
     # Load Phase 3 report
     from core.json import load_json
     try:
         report = load_json(prep_report_path, strict=True)
     except Exception as e:  # noqa: BLE001 — logged; any parse failure aborts Phase 4
         logger.error("Failed to read Phase 3 report: %s", e)
-        print(f"\n  ✗ Failed to read analysis report: {e}", file=sys.stderr)
+        print(f"\n  ✗ Failed to read analysis report: {sanitise_for_terminal(str(e), max_len=300)}", file=sys.stderr)
         return None
     if report is None:
         logger.error("Phase 3 report not found: %s", prep_report_path)
@@ -691,7 +1391,11 @@ def orchestrate(
         logger.info("Phase 3 ran full analysis — orchestration not needed")
         return None
 
-    findings = report.get("results", [])
+    prepared_findings = report.get("results", [])
+    requested_findings = (
+        len(prepared_findings) if isinstance(prepared_findings, list) else 0
+    )
+    findings = prepared_findings if isinstance(prepared_findings, list) else []
     # Chokepoint-suppressed prep records are RETAINED in the report
     # (explicit disqualifier with a stamped skip status, never a
     # silent drop) — but they are pre-refuted: dispatching them would
@@ -706,6 +1410,7 @@ def orchestrate(
                 and f.get("status") in ALL_STATUSES
                 and is_skipped(f))
     ]
+    eligible_findings = len(findings)
     if not findings:
         print("\n  No findings to analyse")
         return None
@@ -776,16 +1481,26 @@ def orchestrate(
             findings, llm_config,
         )
 
+    was_unspecified = max_findings is None
+    max_findings = resolve_max_findings(max_findings, llm_config)
+    cap_source = "provider_default" if was_unspecified else "explicit"
+    if max_findings == 0 and was_unspecified:
+        logger.info(
+            "local primary: analysing all %d findings (no cap; bound by "
+            "--max-seconds / --max-calls)", len(findings),
+        )
+
     if max_findings > 0 and len(findings) > max_findings:
         logger.info("Capping at %d findings (of %d)", max_findings, len(findings))
         findings = _cap_findings(findings, max_findings)
+    selected_findings = len(findings)
 
     # Resolve model roles
     from core.llm.config import resolve_model_roles
     role_resolution: dict[str, Any] = {"analysis_model": None, "code_model": None,
-                       "consensus_models": [], "judge_models": [],
-                       "aggregate_models": [], "fallback_models": [],
-                       "analysis_models": []}
+                       "exploit_model": None, "consensus_models": [],
+                       "judge_models": [], "aggregate_models": [],
+                       "fallback_models": [], "analysis_models": []}
     if llm_config and llm_config.primary_model:
         role_resolution = resolve_model_roles(
             llm_config.primary_model,
@@ -794,7 +1509,10 @@ def orchestrate(
 
     # Cost tracking
     max_cost = getattr(llm_config, 'max_cost_per_scan', 0) if llm_config else 0
-    cost_tracker = CostTracker(max_cost=max_cost or 0)
+    cost_tracker = CostTracker(
+        max_cost=max_cost or 0,
+        diagnostic_dir=out_dir / "diagnostics",
+    )
     if rank_cost:
         cost_tracker.add_cost(rank_model or "ranking", rank_cost)
 
@@ -807,12 +1525,22 @@ def orchestrate(
     is_cc_dispatch = not (llm_config and llm_config.primary_model)
 
     if max_parallel <= 0:
-        from core.llm.concurrency import derive_max_workers
-        max_parallel = derive_max_workers(analysis_model_name) if analysis_model_name else 3
-        logger.info(
-            "auto workers: model=%s → max_parallel=%d",
-            analysis_model_name or "(cc)", max_parallel,
+        from core.llm.concurrency import (
+            derive_max_workers,
+            emit_llm_sibling_banner,
+            read_tuning_llm_account_posture,
         )
+        max_parallel = derive_max_workers(analysis_model_name) if analysis_model_name else 3
+        posture = read_tuning_llm_account_posture()
+        logger.info(
+            "auto workers: model=%s posture=%s → max_parallel=%d",
+            analysis_model_name or "(cc)", posture, max_parallel,
+        )
+        # Sibling observation: an honest banner about who else is on
+        # the account right now — a heuristic, never a gate, and
+        # contained (a poisoned sibling must not abort startup).
+        emit_llm_sibling_banner(posture, max_parallel,
+                                self_run_dir=out_dir, log=logger)
     analysis_models_all = role_resolution.get("analysis_models", [])
     n_analysis = len(analysis_models_all)
     if n_analysis > 1:
@@ -838,8 +1566,33 @@ def orchestrate(
     # is needed: anything raising here is a wiring bug that should
     # surface, not stall silently.
     from core.run.estimator import estimate_from_scorecard, format_estimate
+    if len(analysis_models_all) == 1:
+        estimate_model = analysis_models_all[0]
+        estimate_model_name = estimate_model.model_name
+        estimate_model_key_aggregation = (
+            model_key_aggregation_for_config(estimate_model)
+        )
+    else:
+        # Scorecard v2 is keyed only by model name. A panel has no single
+        # route identity whose history can be attributed safely.
+        estimate_model_name = ""
+        estimate_model_key_aggregation = ModelKeyAggregation.REFUSE
+    estimate_budget_contract = getattr(
+        llm_config,
+        "usd_budget_contract",
+        UsdBudgetContract.ADVISORY,
+    )
+    if not isinstance(estimate_budget_contract, (UsdBudgetContract, str)):
+        # Some compatibility callers pass lightweight config doubles whose
+        # undeclared attributes auto-materialise. Missing policy remains the
+        # historical advisory default rather than becoming an invalid enum.
+        estimate_budget_contract = UsdBudgetContract.ADVISORY
     _sc_est = estimate_from_scorecard(
-        analysis_model_name or "", n, max_parallel=max_parallel,
+        estimate_model_name,
+        n,
+        max_parallel=max_parallel,
+        model_key_aggregation=estimate_model_key_aggregation,
+        usd_budget_contract=estimate_budget_contract,
     )
     _sc_line = format_estimate(_sc_est)
     if _sc_line:
@@ -916,32 +1669,19 @@ def orchestrate(
                     validated = validate_structured_response(result, schema)
                     result = validated.data
                     quality = validated.quality
-                return DispatchResult(
-                    result=result, cost=response.cost,
-                    tokens=response.tokens_used, model=response.model,
-                    duration=response.duration, quality=quality,
-                    resolved_model=response.resolved_model,
-                    # getattr: StructuredResponse doesn't carry the
-                    # field yet — wired here so the tracker's
-                    # thinking-token telemetry fires as soon as the
-                    # provider layer surfaces it.
-                    thinking_tokens=getattr(
-                        response, "thinking_tokens", 0,
-                    ) or 0,
+                return DispatchResult.from_core_response(
+                    response,
+                    result=result,
+                    quality=quality,
                 )
             response = client.generate(
                 prompt=prompt, system_prompt=system_prompt,
                 model_config=model, temperature=temperature,
                 exclude_fallback_to=other_active,
             )
-            return DispatchResult(
-                result={"content": response.content}, cost=response.cost,
-                tokens=response.tokens_used, model=response.model,
-                duration=response.duration,
-                resolved_model=response.resolved_model,
-                thinking_tokens=getattr(
-                    response, "thinking_tokens", 0,
-                ) or 0,
+            return DispatchResult.from_core_response(
+                response,
+                result={"content": response.content},
             )
 
         dispatch_mode = "external_llm"
@@ -966,8 +1706,15 @@ def orchestrate(
             # regressing the documented trust separation — operator
             # instructions and finding-derived content arrived on the
             # SAME channel from the model's perspective.
-            return invoke_cc_simple(prompt, schema, repo_path, claude_bin,
-                                    out_dir, system_prompt=system_prompt)
+            result = invoke_cc_simple(
+                prompt,
+                schema,
+                repo_path,
+                claude_bin,
+                out_dir,
+                system_prompt=system_prompt,
+            )
+            return _label_claude_dispatch_result(result)
 
         dispatch_mode = "cc_dispatch"
 
@@ -978,7 +1725,7 @@ def orchestrate(
         [analysis_model] if analysis_model else []
     )
     _probe_failed = False
-    if dispatch_fn and _models_to_probe:
+    if dispatch_fn and _models_to_probe:  # type: ignore[truthy-function]
         from core.security.envelope_probe import probe_envelope_compatibility
         # Per-model profile collection. Pre-fix the outer `profile`
         # was set ONCE to the primary's profile and used unchanged
@@ -1059,9 +1806,11 @@ def orchestrate(
             # this list. `probe_result` itself may be unbound when
             # every model raised RuntimeError (the strict-mode
             # path), so refer to `_failed_probe_models` instead.
-            _fail_summary = "; ".join(
+            # Probe error strings can quote provider/model-authored
+            # bytes — escape + bound before the stderr banners below.
+            _fail_summary = sanitise_for_terminal("; ".join(
                 f"{_m}={_e}" for _m, _e in _failed_probe_models
-            )
+            ), max_len=512)
             if not accept_weakened_defenses:
                 print(f"\n  ✗ Envelope probe failed for {model_label}: {_fail_summary}", file=sys.stderr)
                 print("  The model cannot honour the defence envelope — aborting.", file=sys.stderr)
@@ -1109,16 +1858,72 @@ def orchestrate(
         # work items, but the cheap FP check is model-independent —
         # see make_prefilter_fn for the dedupe contract.
         from packages.llm_analysis.prefilter import make_prefilter_fn
+        # repo threads the ORCHESTRATOR-resolved target into the
+        # scorecard's target-diversity gate — not the findings'
+        # stamped repo_path field, which a prep report could carry
+        # pre-filled (the setdefault stamp above keeps an existing
+        # value, so that field is prep-report-controlled).
         prefilter_fn = make_prefilter_fn(
-            client, pending_claims=pending_fp_claims,
+            client,
+            pending_claims=pending_fp_claims,
+            repo=repo_path,
+            cost_tracker=cost_tracker,
         )
 
-    analysis_results = dispatch_task(
+    dispatch_batches: list[dict[str, Any]] = []
+
+    def _run_dispatch(
+        task,
+        items,
+        resolution,
+        prior,
+        *,
+        phase: str | None = None,
+        prefilter=None,
+    ) -> list[dict[str, Any]]:
+        batch_results = dispatch_task(
+            task,
+            items,
+            dispatch_fn,
+            resolution,
+            prior,
+            cost_tracker,
+            max_parallel,
+            prefilter_fn=prefilter,
+        )
+        if batch_results or task.name == "analysis":
+            dispatch_batches.append(_summarize_dispatch_batch(
+                task.name,
+                batch_results,
+                input_items=len(items),
+                phase=phase,
+            ))
+        return batch_results
+
+    analysis_results = _run_dispatch(
         AnalysisTask(profile=profile, allow_unreachable=allow_unreachable),
-        findings, dispatch_fn, role_resolution,
-        results_by_id, cost_tracker, max_parallel,
-        prefilter_fn=prefilter_fn,
+        findings,
+        role_resolution,
+        results_by_id,
+        phase="analysis_primary",
+        prefilter=prefilter_fn,
     )
+    analysis_attempt_results = list(analysis_results)
+
+    if prefilter_fn is not None:
+        dispatch_results = getattr(prefilter_fn, "dispatch_results", None)
+        if callable(dispatch_results):
+            prefilter_records = dispatch_results()
+            if prefilter_records:
+                dispatch_batches.insert(
+                    0,
+                    _summarize_dispatch_batch(
+                        "fast_tier_prefilter",
+                        prefilter_records,
+                        input_items=len(findings),
+                        phase="analysis_enrichment",
+                    ),
+                )
 
     # Adjudicate the fall-through cheap "clear_fp" claims against the
     # full verdicts so agentic:<rule_id> cells accumulate trust and
@@ -1130,15 +1935,17 @@ def orchestrate(
             )
             record_prefilter_outcomes(
                 client, pending_fp_claims, analysis_results,
+                repo=repo_path,
             )
         except Exception:
             logger.debug("prefilter outcome recording failed",
                          exc_info=True)
 
     # Fallback: if external LLM failed entirely, try CC
-    if (dispatch_mode == "external_llm"
-            and analysis_results
-            and all("error" in r for r in analysis_results)):
+    if (
+        dispatch_mode == "external_llm"
+        and _should_fallback_to_cc(analysis_results)
+    ):
         from core.llm.cc_adapter import resolve_claude_cli
         claude_bin = resolve_claude_cli()
         if claude_bin:
@@ -1148,8 +1955,15 @@ def orchestrate(
             def dispatch_fn(prompt, schema, system_prompt, temperature, model):
                 # Same dedicated system-prompt channel as the primary
                 # CC dispatch path above — never fold into user content.
-                return invoke_cc_simple(prompt, schema, repo_path, claude_bin,
-                                        out_dir, system_prompt=system_prompt)
+                result = invoke_cc_simple(
+                    prompt,
+                    schema,
+                    repo_path,
+                    claude_bin,
+                    out_dir,
+                    system_prompt=system_prompt,
+                )
+                return _label_claude_dispatch_result(result)
 
             # Carry the per-model intersected profile into the
             # CC-fallback AnalysisTask. Pre-fix `AnalysisTask()`
@@ -1166,11 +1980,14 @@ def orchestrate(
             cc_role_resolution = _cc_fallback_role_resolution(
                 role_resolution,
             )
-            analysis_results = dispatch_task(
+            analysis_results = _run_dispatch(
                 AnalysisTask(profile=profile, allow_unreachable=allow_unreachable),
-                findings, dispatch_fn, cc_role_resolution,
-                results_by_id, cost_tracker, max_parallel,
+                findings,
+                cc_role_resolution,
+                results_by_id,
+                phase="analysis_claude_fallback",
             )
+            analysis_attempt_results.extend(analysis_results)
             # Downstream stages (multi-model correlation, collapse
             # detection) must see the single-contributor reality of
             # the fallback, not the external panel that never ran.
@@ -1320,27 +2137,39 @@ def orchestrate(
         if checker_model:
             checker_name = checker_model.model_name
             checker_profile = get_profile_for(checker_name)
-            dispatch_task(
+            _run_dispatch(
                 CrossFamilyCheckTask(
                     checker_model=checker_model,
                     results_by_id=results_by_id,
                     profile=checker_profile,
                 ),
-                findings, dispatch_fn, role_resolution,
-                results_by_id, cost_tracker, max_parallel,
+                findings,
+                role_resolution,
+                results_by_id,
+            )
+        else:
+            # No cross-family checker could be resolved — commonly an
+            # all-same-lineage roster (e.g. every model served through
+            # one local provider). Say so rather than skipping silently:
+            # the cross-family re-check is simply not running this pass.
+            logger.warning(
+                "Cross-family re-check skipped for primary %s — no "
+                "different-lineage checker available among configured "
+                "models or auto-detect. Suspicious responses will not get "
+                "an independent-lineage second opinion this run.",
+                analysis_model.model_name,
             )
 
     # Snapshot verdicts before Stage F so the self-contradiction
     # producer can detect flips (RetryTask overwrites in place).
-    verdicts_pre_retry: dict[str, bool] = {}
-    for fid, r in results_by_id.items():
-        if isinstance(r, dict) and "error" not in r:
-            verdicts_pre_retry[fid] = bool(r.get("is_exploitable", False))
+    verdicts_pre_retry = _snapshot_verdicts(results_by_id)
 
     # Stage F: self-contradiction check + retry contradictions and low confidence
-    dispatch_task(
-        RetryTask(results_by_id=results_by_id, profile=profile), findings,
-        dispatch_fn, role_resolution, results_by_id, cost_tracker, max_parallel,
+    _run_dispatch(
+        RetryTask(results_by_id=results_by_id, profile=profile),
+        findings,
+        role_resolution,
+        results_by_id,
     )
 
     # Snapshot original primary verdicts BEFORE the consensus
@@ -1358,12 +2187,7 @@ def orchestrate(
     # the snapshot's purpose. Take it here, before BOTH stages,
     # so judge can compare against the actual primary verdict.
     sc = getattr(client, "scorecard", None) if client is not None else None
-    primary_verdicts_pre_consensus: dict[str, bool] = {}
-    for fid, r in results_by_id.items():
-        if isinstance(r, dict) and "error" not in r:
-            primary_verdicts_pre_consensus[fid] = bool(
-                r.get("is_exploitable", False)
-            )
+    primary_verdicts_pre_consensus = _snapshot_verdicts(results_by_id)
 
     # Consensus (if configured)
     consensus_models = role_resolution.get("consensus_models", [])
@@ -1376,9 +2200,11 @@ def orchestrate(
         # tell budget-skipped (no spend) from all-errored (spend
         # incurred but every call failed) afterwards.
         _ct_before = cost_tracker.total_cost if cost_tracker else 0.0
-        consensus_dispatch_records = dispatch_task(
-            consensus_task, findings, dispatch_fn, role_resolution,
-            results_by_id, cost_tracker, max_parallel,
+        consensus_dispatch_records = _run_dispatch(
+            consensus_task,
+            findings,
+            role_resolution,
+            results_by_id,
         )
         # Pre-fix the post-dispatch check was:
         #
@@ -1421,19 +2247,17 @@ def orchestrate(
         # overridden one. Falls back to the post-consensus state
         # for findings that didn't exist pre-consensus (shouldn't
         # happen in normal flow, but defensive).
-        primary_verdicts_before_judge: dict[str, bool] = dict(
+        primary_verdicts_before_judge: dict[str, bool | None] = dict(
             primary_verdicts_pre_consensus
         )
-        for fid, r in results_by_id.items():
-            if (fid not in primary_verdicts_before_judge
-                    and isinstance(r, dict) and "error" not in r):
-                primary_verdicts_before_judge[fid] = bool(
-                    r.get("is_exploitable", False)
-                )
-        dispatch_task(
+        for fid, snap in _snapshot_verdicts(results_by_id).items():
+            if fid not in primary_verdicts_before_judge:
+                primary_verdicts_before_judge[fid] = snap
+        _run_dispatch(
             JudgeTask(results_by_id=results_by_id, profile=profile),
-            findings, dispatch_fn, role_resolution,
-            results_by_id, cost_tracker, max_parallel,
+            findings,
+            role_resolution,
+            results_by_id,
         )
 
         # Record JUDGE_REVIEW scorecard events for multi-judge
@@ -1609,10 +2433,11 @@ def orchestrate(
             # Pass `findings` so AggregationTask can pull SI evidence
             # per memory-corruption finding for tie-breaking on
             # disputed cases (see AggregationTask.build_prompt).
-            aggregate_results = dispatch_task(
+            aggregate_results = _run_dispatch(
                 AggregationTask(profile=profile, findings=findings),
-                [aggregate_payload], dispatch_fn,
-                role_resolution, results_by_id, cost_tracker, max_parallel,
+                [aggregate_payload],
+                role_resolution,
+                results_by_id,
             )
             for r in aggregate_results:
                 if "error" not in r:
@@ -1626,9 +2451,11 @@ def orchestrate(
     # only select findings that are exploitable AND missing exploit_code/patch_code,
     # so this is a no-op when CC already generated them.
     if not no_exploits:
-        dispatch_task(
-            ExploitTask(profile=profile), findings, dispatch_fn, role_resolution,
-            results_by_id, cost_tracker, max_parallel,
+        _run_dispatch(
+            ExploitTask(profile=profile),
+            findings,
+            role_resolution,
+            results_by_id,
         )
 
     # checkers_dir lets the patch gate replay synthesized checkers
@@ -1642,10 +2469,11 @@ def orchestrate(
     _pre_gated_ids: set[str] = set()
     if not no_patches:
         _patch_task = PatchTask(profile=profile, checkers_dir=_checkers_dir)
-        dispatch_task(
+        _run_dispatch(
             _patch_task,
-            findings, dispatch_fn, role_resolution,
-            results_by_id, cost_tracker, max_parallel,
+            findings,
+            role_resolution,
+            results_by_id,
         )
         _pre_gated_ids = _patch_task.gated_ids
 
@@ -1667,9 +2495,11 @@ def orchestrate(
     group_task = GroupAnalysisTask(
         results_by_id=results_by_id, findings=findings, profile=profile,
     )
-    group_results = dispatch_task(
-        group_task, groups, dispatch_fn, role_resolution,
-        results_by_id, cost_tracker, max_parallel,
+    group_results = _run_dispatch(
+        group_task,
+        groups,
+        role_resolution,
+        results_by_id,
     )
     group_analyses = {}
     for r in group_results:
@@ -1719,14 +2549,16 @@ def orchestrate(
     if aggregation:
         merged["aggregation"] = aggregation
 
-    consensus_agreed = sum(1 for r in per_finding_results
-                           if r.get("consensus") == "agreed")
-    consensus_disputes = sum(1 for r in per_finding_results
-                             if r.get("consensus") == "disputed")
-    judge_agreed = sum(1 for r in per_finding_results
-                       if r.get("judge") == "agreed")
-    judge_disputes = sum(1 for r in per_finding_results
-                         if r.get("judge") == "disputed")
+    _cn_counts = _count_panel_stamps(per_finding_results, "consensus")
+    consensus_agreed = _cn_counts["agreed"]
+    consensus_disputes = _cn_counts["disputed"]
+    consensus_no_verdict = _cn_counts["no-verdict"]
+    consensus_panel_verdict = _cn_counts["panel-verdict"]
+    _jg_counts = _count_panel_stamps(per_finding_results, "judge")
+    judge_agreed = _jg_counts["agreed"]
+    judge_disputes = _jg_counts["disputed"]
+    judge_no_verdict = _jg_counts["no-verdict"]
+    judge_panel_verdict = _jg_counts["panel-verdict"]
     cross_family_checked = sum(1 for r in per_finding_results
                                if r.get("cross_family_check"))
     cross_family_disputes = sum(1 for r in per_finding_results
@@ -1735,10 +2567,32 @@ def orchestrate(
     low_confidence = sum(1 for r in per_finding_results if r.get("low_confidence"))
 
     analysis_models_list = role_resolution.get("analysis_models", [])
+    core_stats = client.get_stats() if client is not None else None
+    if not isinstance(core_stats, dict):
+        core_stats = None
+    cost_summary = cost_tracker.get_summary(
+        core_stats=core_stats,
+        core_precharged_cost=rank_cost,
+    )
+    findings_analysed = sum(
+        1 for r in per_finding_results if "error" not in r
+    )
+    findings_failed = sum(
+        1 for r in per_finding_results if "error" in r
+    )
+    assessment = _build_assessment_summary(
+        requested=requested_findings,
+        eligible=eligible_findings,
+        selected=selected_findings,
+        analyzed=findings_analysed,
+        cap=max_findings,
+        cap_source=cap_source,
+    )
+    merged["assessment"] = assessment
     merged["orchestration"] = {
         "mode": dispatch_mode,
         "multi_model": len(analysis_models_list) > 1,
-        "analysis_model": (role_resolution.get("analysis_model").model_name
+        "analysis_model": (role_resolution.get("analysis_model").model_name  # type: ignore[union-attr]
                           if role_resolution.get("analysis_model")
                           else ("Claude Code" if is_cc_dispatch else None)),
         "analysis_models": ([m.model_name for m in analysis_models_list]
@@ -1748,6 +2602,12 @@ def orchestrate(
         "consensus_models": [m.model_name for m in consensus_models],
         "consensus_agreed": consensus_agreed,
         "consensus_disputes": consensus_disputes,
+        "consensus_no_verdict": consensus_no_verdict,
+        # Consensus panels that voted on an abstained primary: the
+        # panel verdict stood in for the missing primary vote —
+        # neither "agreed" (nothing to agree with) nor "disputed".
+        # Mirrors judge_panel_verdict below.
+        "consensus_panel_verdict": consensus_panel_verdict,
         "consensus_budget_skipped": consensus_budget_skipped,
         # New: distinguish "budget capped before any LLM calls"
         # from "calls made but all errored". Operators reading the
@@ -1757,13 +2617,31 @@ def orchestrate(
         "judge_models": [m.model_name for m in judge_models],
         "judge_agreed": judge_agreed,
         "judge_disputes": judge_disputes,
+        "judge_no_verdict": judge_no_verdict,
+        # Judge panels that voted on an abstained primary: the panel
+        # verdict stood in for the missing primary vote — neither
+        # "agreed" (nothing to agree with) nor "disputed".
+        "judge_panel_verdict": judge_panel_verdict,
         "aggregate_models": [m.model_name for m in aggregate_models],
         "aggregated": aggregation is not None,
         "calibrated_aggregation": calibrated_summary,
-        "findings_dispatched": len(findings),
-        "findings_analysed": sum(1 for r in per_finding_results if "error" not in r),
-        "findings_failed": sum(1 for r in per_finding_results if "error" in r),
-        "failed_by_model": _per_model_failure_summary(analysis_results),
+        "findings_dispatched": selected_findings,
+        "findings_analysed": findings_analysed,
+        "findings_failed": findings_failed,
+        "assessment": assessment,
+        "failed_by_model": _per_model_failure_summary(
+            analysis_attempt_results,
+        ),
+        "dispatch_batches": dispatch_batches,
+        "dispatch_failures": sum(
+            int(batch.get("failed", 0) or 0)
+            for batch in dispatch_batches
+        ),
+        "dispatch_incomplete_tasks": [
+            batch.get("phase") or batch.get("task")
+            for batch in dispatch_batches
+            if not batch.get("complete", False)
+        ],
         "structural_groups": len(groups),
         "cross_family_checked": cross_family_checked,
         "cross_family_disputes": cross_family_disputes,
@@ -1773,7 +2651,7 @@ def orchestrate(
         "correlation": correlation.get("summary") if correlation else None,
         "elapsed_seconds": round(elapsed, 1),
         "max_parallel": max_parallel,
-        "cost": cost_tracker.get_summary(),
+        "cost": cost_summary,
         # Number of full ANALYSE calls avoided because the fast-tier
         # scorecard trusted the cheap-tier "clear FP" verdict. Zero
         # on CC-prep / CC-fallback paths (no prefilter wiring).
@@ -1812,7 +2690,6 @@ def orchestrate(
     # Summary
     orch = merged["orchestration"]
     cost_summary = orch["cost"]
-    cost_total = cost_summary["total_cost"]
     model_name = orch.get("analysis_model") or ""
     model_str = f" ({model_name})" if model_name else ""
 
@@ -1828,28 +2705,25 @@ def orchestrate(
         else:
             parts.append(f"{orch['findings_failed']} failed")
     parts.append(f"{_format_elapsed(orch['elapsed_seconds'])} elapsed")
-    if cost_total > 0:
-        parts.append(f"${cost_total:.2f}")
+    accounting_text = format_cost_summary(cost_summary)
+    if accounting_text:
+        parts.append(accounting_text)
 
     print(f"\n  Orchestration complete{model_str}: {', '.join(parts)}")
     thinking = cost_summary.get("thinking_tokens", 0)
     if thinking > 0:
         print(f"  Thinking tokens: {thinking:,}")
-    if consensus_agreed or consensus_disputes:
-        cn_parts = []
-        if consensus_agreed:
-            cn_parts.append(f"{consensus_agreed} agreed")
-        if consensus_disputes:
-            cn_parts.append(f"{consensus_disputes} disputed")
+    cn_parts = _panel_summary_parts(
+        consensus_agreed, consensus_disputes, consensus_no_verdict,
+        consensus_panel_verdict)
+    if cn_parts:
         print(f"  Consensus: {', '.join(cn_parts)}")
     elif consensus_budget_skipped:
         print(f"  Consensus: skipped (budget > {int(ConsensusTask.budget_cutoff * 100)}%)")
-    if judge_agreed or judge_disputes:
-        jg_parts = []
-        if judge_agreed:
-            jg_parts.append(f"{judge_agreed} agreed")
-        if judge_disputes:
-            jg_parts.append(f"{judge_disputes} disputed")
+    jg_parts = _panel_summary_parts(
+        judge_agreed, judge_disputes, judge_no_verdict,
+        judge_panel_verdict)
+    if jg_parts:
         print(f"  Judge: {', '.join(jg_parts)}")
     if aggregation:
         aggregate_by = aggregation.get("analysed_by")
@@ -1988,7 +2862,10 @@ def _resolve_cross_family_checker(
     in the role resolution (consensus / fallback); falls back to
     auto-detecting a cheap model from an env-var API key.
     """
-    from core.security.llm_family import family_of, same_family
+    from core.security.llm_family import (
+        family_of,
+        select_cross_family_checker,
+    )
 
     primary_name = analysis_model.model_name
     primary_family = family_of(primary_name)
@@ -2010,10 +2887,36 @@ def _resolve_cross_family_checker(
         + role_resolution.get("consensus_models", [])
         + role_resolution.get("fallback_models", [])
     )
-    for m in candidates:
-        if not same_family(primary_name, m.model_name):
-            logger.debug("Cross-family checker: %s (from resolved roles)", m.model_name)
-            return m
+    # One selector, one rule: llm_family.select_cross_family_checker
+    # owns the cross-family semantics (unknown producer → None,
+    # unknown candidates skipped — "Unprovable is not cross-family").
+    # The private `not same_family(...)` loop this replaces applied a
+    # WEAKER rule at the one consumer that wields conservative-
+    # override authority: an unknown-family primary (a self-hosted or
+    # rebadged id without a recognised stem) made every comparison
+    # True, handing back the FIRST candidate unconditionally —
+    # including a same-lineage variant of the primary.
+    chosen = select_cross_family_checker(
+        primary_name, [m.model_name for m in candidates],
+    )
+    if chosen is not None:
+        for m in candidates:
+            if m.model_name == chosen:
+                logger.debug(
+                    "Cross-family checker: %s (from resolved roles)",
+                    m.model_name,
+                )
+                return m
+    if primary_family == "unknown":
+        # No provable cross-family relation exists for an unknown
+        # producer — the env auto-detect below could only hand back
+        # a model that CANNOT be proven independent of it.
+        logger.info(
+            "Cross-family check skipped: primary model %s has no "
+            "recognised family (unprovable is not cross-family)",
+            primary_name,
+        )
+        return None
 
     return _auto_detect_cross_family_checker(primary_family)
 
@@ -2155,6 +3058,81 @@ def _per_model_failure_summary(
     return by_model
 
 
+def _summarize_dispatch_batch(
+    task: str,
+    results: list[dict[str, Any]],
+    *,
+    input_items: int,
+    phase: str | None = None,
+) -> dict[str, Any]:
+    """Summarize one task batch without dropping mixed failures.
+
+    Final fallback results can be entirely successful while an earlier review
+    or enrichment batch failed. Keeping each batch separate prevents the
+    successful subset from overwriting that operational evidence.
+    """
+    rows = [row for row in results if isinstance(row, dict)]
+    successful = [row for row in rows if "error" not in row]
+    errored = [row for row in rows if "error" in row]
+    def _was_not_run(row: dict[str, Any]) -> bool:
+        return (
+            row.get("error_type") in {"cancelled", "circuit_breaker"}
+            or str(row.get("error") or "").startswith(
+                ("aborted", "skipped"),
+            )
+        )
+
+    not_run = [row for row in errored if _was_not_run(row)]
+    failed = [row for row in errored if not _was_not_run(row)]
+    if successful and (failed or not_run):
+        status = "partial"
+    elif successful:
+        status = "succeeded"
+    elif failed:
+        status = "failed"
+    elif not_run:
+        status = "skipped"
+    else:
+        status = "not_run"
+
+    error_types = Counter(
+        str(row.get("error_type") or "error")
+        for row in failed
+    )
+    artifacts: list[object] = []
+    for row in errored:
+        for key in ("diagnostic_artifact", "cc_debug_file", "artifact"):
+            if row.get(key):
+                artifacts.append(row[key])
+        refs = row.get("artifacts")
+        if isinstance(refs, list):
+            artifacts.extend(refs)
+
+    summary: dict[str, Any] = {
+        "task": task,
+        "phase": phase or task,
+        "status": status,
+        "input_items": max(int(input_items), 0),
+        "result_records": len(rows),
+        "succeeded": len(successful),
+        "failed": len(failed),
+        "not_run": len(not_run),
+        "complete": not failed and not not_run,
+        "error_types": dict(sorted(error_types.items())),
+        "failed_by_model": _per_model_failure_summary(failed),
+    }
+    if failed:
+        summary["first_error"] = sanitise_for_terminal(
+            str(failed[0].get("error") or ""),
+            max_len=500,
+        )
+    if artifacts:
+        from core.run.safe_io import bounded_artifact_reference_fields
+
+        summary.update(bounded_artifact_reference_fields(artifacts))
+    return summary
+
+
 def _detect_multi_model_collapse(
     results_by_id: dict[str, dict],
     n_analysis_models: int,
@@ -2183,7 +3161,7 @@ def _detect_multi_model_collapse(
             if isinstance(item, dict) and "error" not in item:
                 contributors = {item.get("analysed_by")} - {None, "?"}
                 if len(contributors) < n_analysis_models:
-                    collapsed.append((fid, sorted(contributors)))
+                    collapsed.append((fid, sorted(contributors)))  # type: ignore[arg-type]
             continue
         distinct = {
             a.get("model") for a in analyses if isinstance(a, dict)
@@ -2191,7 +3169,7 @@ def _detect_multi_model_collapse(
         distinct.discard("?")
         distinct.discard(None)
         if len(distinct) < n_analysis_models:
-            collapsed.append((fid, sorted(distinct)))
+            collapsed.append((fid, sorted(distinct)))  # type: ignore[arg-type]
     return collapsed
 
 
@@ -2322,9 +3300,16 @@ def _merge_results(
     patches_generated = 0
 
     from core.run.finding_status import SKIPPED, set_status
+    from packages.llm_analysis.dispatch import DISPATCH_METADATA_FIELDS
     for finding in results:
         fid = finding.get("finding_id")
         cc = cc_by_id.get(fid)
+        for key in DISPATCH_METADATA_FIELDS:
+            finding.pop(key, None)
+        if cc is not None:
+            for key in DISPATCH_METADATA_FIELDS:
+                if key in cc:
+                    finding[key] = cc[key]
         if cc is None or "error" in cc:
             if cc is None:
                 # Never dispatched (cap / dedup / chokepoint
@@ -2350,6 +3335,12 @@ def _merge_results(
                     finding["error_type"] = cc["error_type"]
             if cc is not None and cc.get("cc_debug_file"):
                 finding["cc_debug_file"] = cc["cc_debug_file"]
+            if cc is not None and cc.get("diagnostic_artifact"):
+                finding["diagnostic_artifact"] = cc[
+                    "diagnostic_artifact"
+                ]
+            if cc is not None and isinstance(cc.get("artifacts"), list):
+                finding["artifacts"] = list(cc["artifacts"])
             continue
 
         analysed += 1
@@ -2360,6 +3351,8 @@ def _merge_results(
         # against prompt injection where LLM returns crafted field names.
         for k, v in cc.items():
             if k.startswith("_") or k == "finding_id":
+                continue
+            if k in DISPATCH_METADATA_FIELDS:
                 continue
             if k in ("patch_code", "patch_gate"):
                 # Handled explicitly below so every surviving patch is
@@ -2374,10 +3367,20 @@ def _merge_results(
         # exploitable. The LLM sometimes contradicts itself (e.g.
         # is_true_positive=False but is_exploitable=True); enforce
         # the logical floor here so downstream consumers never see
-        # an impossible verdict combination.
-        _is_tp = cc.get("is_true_positive", True)
-        _is_exp = cc.get("is_exploitable", False)
-        if not _is_tp and _is_exp:
+        # an impossible verdict combination. Only an EXPLICIT False
+        # fires the floor: response validation nulls a missing or
+        # malformed ``is_true_positive`` (an abstention, not a
+        # verdict), and a truthiness check read that None as "not a
+        # true positive" — silently flipping a voted-exploitable
+        # finding to not-exploitable at the final merge and dropping
+        # its exploit/patch artifacts. Same no-vote rule as
+        # ``tally_verdict_votes``: an abstained TP field casts no
+        # vote either way. ``read_verdict`` is the shared tri-state
+        # read: an abstained exploitability verdict stays None on the
+        # report record rather than masquerading as an explicit False.
+        _is_tp = read_verdict(cc, "is_true_positive")
+        _is_exp = read_verdict(cc, "is_exploitable")
+        if _is_tp is False and _is_exp:
             _is_exp = False
         finding["exploitable"] = _is_exp
         finding["is_exploitable"] = _is_exp

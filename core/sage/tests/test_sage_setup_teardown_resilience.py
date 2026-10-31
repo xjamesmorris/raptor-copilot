@@ -225,23 +225,31 @@ exit 0
         return proc, capture
 
     def test_zero_args_reexec_does_not_trip_set_u(self):
-        """Bare invocation (empty _ORIG_ARGS): the loop must expand to
-        nothing — never an unbound-variable abort — and the re-exec
-        command carries only the script path."""
+        """Bare invocation (empty _ORIG_ARGS): the expansion must
+        yield nothing — never an unbound-variable abort — and the
+        re-exec command carries only the script path (printf %q
+        rendering: a plain path stays unquoted, trailing space)."""
         proc, capture = self._run_check_docker("")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertNotIn("unbound variable", proc.stderr)
         # exec replaced the shell before the sentinel line.
         self.assertNotIn("NOT_REACHED", proc.stdout)
         cmd = capture.read_text()
-        self.assertEqual(cmd, f'"{self.dir}/driver.sh"')
+        self.assertEqual(cmd.split(), [f"{self.dir}/driver.sh"])
 
     def test_args_survive_the_reexec(self):
-        proc, capture = self._run_check_docker("'--install' '--reauthorize'")
+        """Round-trip through the %q string: eval-ing it yields the
+        original argv (the old naive quoting broke on quotes/$)."""
+        import subprocess
+        proc, capture = self._run_check_docker("'--install' 'quo\"te$X'")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         cmd = capture.read_text()
-        self.assertIn('"--install"', cmd)
-        self.assertIn('"--reauthorize"', cmd)
+        echo = subprocess.run(
+            ["bash", "-c", f'set -- {cmd}; shift; printf "%s\\n" "$@"'],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(echo.stdout.splitlines(),
+                         ["--install", 'quo"te$X'])
 
     def test_empty_array_guard_idiom_is_present(self):
         """The behavioural crash only reproduces on bash < 4.4, which

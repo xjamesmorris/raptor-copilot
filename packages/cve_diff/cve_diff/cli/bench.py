@@ -30,6 +30,8 @@ import typer
 
 from core.atomic_fs import write_text_atomically
 from core.json import save_json
+from core.security.log_sanitisation import sanitise_for_terminal
+from cve_diff.agent.loop import AgentConfig
 from cve_diff.core.exceptions import CveDiffError
 from cve_diff.infra import api_status
 from cve_diff.infra.github_client import warn_if_token_missing
@@ -114,6 +116,13 @@ class _CveResult:
     # "disagree" / "single_source") — see DiffBundle.extraction_agreement.
     consensus_agree: int | None = None
     extraction_agree: str = ""
+    # Per-CVE rate-limit / cache counter deltas captured INSIDE the
+    # worker (api_status counters are per-process module globals, so
+    # under -w>1 the parent never sees them otherwise). The parent
+    # absorbs these into its own api_status before rendering the
+    # end-of-run summaries. Keys may be JSON-round-tripped strings.
+    rate_limit_events: dict = field(default_factory=dict)
+    cache_events: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -126,7 +135,23 @@ class _BenchSummary:
 
 def _run_one(cve_id: str, output_dir: str, disk_limit_pct: float = 80.0,
              max_file_bytes: int = 128 * 1024) -> _CveResult:
-    """Worker entry point — runs pipeline + dumps OSV JSON for a single CVE.
+    """Worker entry point: :func:`_run_one_inner` plus per-CVE counter
+    deltas. api_status counters are per-process globals — a worker
+    serves many CVEs, so the result carries the DELTA for this CVE and
+    the parent absorbs it (absolute values would double-count)."""
+    before = api_status.counters_snapshot()
+    r = _run_one_inner(cve_id, output_dir, disk_limit_pct, max_file_bytes)
+    events_d, cache_d = api_status.counters_delta(
+        before, api_status.counters_snapshot()
+    )
+    r.rate_limit_events = events_d
+    r.cache_events = cache_d
+    return r
+
+
+def _run_one_inner(cve_id: str, output_dir: str, disk_limit_pct: float = 80.0,
+                   max_file_bytes: int = 128 * 1024) -> _CveResult:
+    """Runs pipeline + dumps OSV JSON for a single CVE.
 
     Each worker installs a SIGALRM watchdog so a runaway clone (e.g. a
     multi-GB writeup archive that slipped past the metadata scorer) cannot
@@ -155,7 +180,10 @@ def _run_one(cve_id: str, output_dir: str, disk_limit_pct: float = 80.0,
     # Cost is near-zero because OSV / NVD / GitHub-commit fetches share
     # caches with the agent's tool calls.
     pipeline = Pipeline(disk_limit_pct=disk_limit_pct, max_file_bytes=max_file_bytes)
-    model_id = "claude-opus-4-7"  # AgentConfig default
+    # Read the default from the dataclass field (pipeline._effective_model
+    # pattern) — a duplicated literal drifted silently when the default
+    # model changed.
+    model_id = AgentConfig.__dataclass_fields__["model_id"].default
     try:
         with tempfile.TemporaryDirectory(prefix=f"bench-{cve_id}-") as tmp:
             try:
@@ -357,6 +385,8 @@ def _classify_error(error_text: str) -> str:
         # The DiscoveryError pattern is "agent surrendered (REASON):"
         if f"({reason})" in error_text:
             return reason
+    if error_text.startswith("DiskBudgetExceeded"):
+        return "DiskBudgetExceeded"
     if error_text.startswith("PerCveTimeout"):
         return "PerCveTimeout"
     if error_text.startswith("UnsupportedSource"):
@@ -375,7 +405,14 @@ def _echo_result(i: int, n: int, r: _CveResult) -> None:
         tag = "" if r.shape == "source" else f" [{r.shape}]"
         typer.echo(f"[{i}/{n}] PASS {r.cve_id}{tag} ({r.elapsed_s}s)")
     else:
-        typer.echo(f"[{i}/{n}] FAIL {r.cve_id} — {r.error}", err=True)
+        # r.error can relay agent/tool exception text (LLM- and
+        # repo-derived bytes) — escape + bound before the TTY.
+        from core.security.log_sanitisation import sanitise_for_terminal
+        typer.echo(
+            f"[{i}/{n}] FAIL {r.cve_id} — "
+            f"{sanitise_for_terminal(str(r.error), max_len=512)}",
+            err=True,
+        )
 
 
 def _render_bench_markdown(summary: _BenchSummary) -> str:
@@ -440,10 +477,15 @@ def _render_bench_markdown(summary: _BenchSummary) -> str:
         for t, n in tool_calls_total.most_common()
     ]
 
-    # Failure cluster (excluding PASS). Markdown-escape pipes and
-    # flatten newlines so a multi-line error stays in one table cell.
+    # Failure cluster (excluding PASS). Error text relays agent/tool
+    # exception strings (LLM- and repo-derived bytes) into a table cell:
+    # md_inline flattens CR/LF (CommonMark treats a bare CR as a line
+    # ending too), escapes in-slot structure, and strips control bytes —
+    # pipe-and-newline-only escaping left CR and ANSI through.
     def _error_cell(error: str | None) -> str:
-        return (error or "")[:200].replace("|", "\\|").replace("\n", " ")
+        from core.security.markdown_render import md_inline
+
+        return md_inline((error or "")[:200], max_chars=250)
 
     fail_lines = [
         f"| {r.cve_id} | {r.error_class or 'Other'} | {_error_cell(r.error)} |"
@@ -702,7 +744,9 @@ def bench(
         with Path(sample).open(encoding="utf-8") as _sf:
             _sample_text = _sf.read(_MAX_SAMPLE_BYTES + 1)
     except OSError as e:
-        typer.echo(f"bench: cannot read sample {sample}: {e}", err=True)
+        typer.echo("bench: cannot read sample "
+                   f"{sanitise_for_terminal(str(sample), max_len=200)}: "
+                   f"{sanitise_for_terminal(str(e), max_len=300)}", err=True)
         raise typer.Exit(code=1) from e
     if len(_sample_text) > _MAX_SAMPLE_BYTES:
         typer.echo(
@@ -714,7 +758,10 @@ def bench(
     try:
         payload = json.loads(_sample_text)
     except json.JSONDecodeError as exc:
-        typer.echo(f"bench: sample {sample} is not valid JSON: {exc}", err=True)
+        typer.echo("bench: sample "
+                   f"{sanitise_for_terminal(str(sample), max_len=200)} is "
+                   f"not valid JSON: {sanitise_for_terminal(str(exc), max_len=300)}",
+                   err=True)
         raise typer.Exit(code=1) from exc
     # Pre-fix `payload["cves"]` and `c["cve_id"]` raised KeyError
     # / TypeError on malformed sample files — the operator saw an
@@ -796,6 +843,12 @@ def bench(
                 # error class.
                 try:
                     r = fut.result()
+                    # Worker counters live in the worker process; merge
+                    # this CVE's delta so the parent's end-of-run
+                    # rate-limit / cache summaries stop rendering empty
+                    # under -w>1. (Sequential path needs no merge — the
+                    # counters accumulated in this process directly.)
+                    api_status.absorb(r.rate_limit_events, r.cache_events)
                 except BaseException as worker_exc:
                     cid = futures[fut]
                     r = _CveResult(
@@ -890,7 +943,7 @@ def _persist_summary(summary_path: Path, sample: Path) -> None:
         shutil.copy2(summary_path, dest)
         typer.echo(f"persisted: {dest}")
     except Exception as exc:  # noqa: BLE001 — never fail the bench on a copy
-        typer.echo(f"(could not persist summary to data/runs/: {exc})", err=True)
+        typer.echo(f"(could not persist summary to data/runs/: {sanitise_for_terminal(str(exc), max_len=300)})", err=True)
 
 
 # Error classes the bench-layer retry pass re-runs. Anything else is a
@@ -899,6 +952,10 @@ def _persist_summary(summary_path: Path, sample: Path) -> None:
 # AcquisitionError covers "git clone died mid-fetch"; client_init_failed
 # covers a transient API auth flake (rate limit, DNS hiccup). Settled
 # outcomes (UnsupportedSource / no_evidence / budget_*) stay in.
+# DiskBudgetExceeded is deliberately NOT transient: a retry spends more
+# disk and more paid LLM turns while the host stays over its limit — the
+# pipeline re-raises it typed so it can never hide inside
+# AcquisitionError here.
 _TRANSIENT_CLASSES = frozenset({
     "llm_error", "PerCveTimeout", "AcquisitionError", "client_init_failed",
 })

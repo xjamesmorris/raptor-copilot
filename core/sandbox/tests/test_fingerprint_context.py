@@ -116,6 +116,13 @@ def test_sanitise_without_target_or_output_soft_degrades(monkeypatch, caplog):
     half-coverage (UTS + affinity engage; file overlays don't)."""
     from core.sandbox import sandbox
     import core.sandbox._spawn as _sp
+    import core.sandbox.context as ctx
+    # Pin the earlier persona-gate branches so the no-target/output
+    # branch under test is the one that fires: on a host whose kernel
+    # or LSM denies mount-ns, the real check_mount_available() probe
+    # takes the gate first and the warning names THAT condition
+    # instead of "no target/output".
+    monkeypatch.setattr(ctx, "check_mount_available", lambda: True)
     monkeypatch.setattr(_sp, "mount_ns_available", lambda: True)
     with caplog.at_level(logging.WARNING, logger="core.sandbox"):
         with sandbox(sanitise_host_fingerprint=True) as _run:
@@ -337,10 +344,16 @@ def test_persona_tmpdir_cleaned_up_on_exit(monkeypatch):
     import os
     from core.sandbox import sandbox
 
-    # Need mount_ns to be reported available for the persona to be built.
-    # On a CI host without uidmap this would otherwise short-circuit.
+    # Need the whole persona availability gate to pass for the persona
+    # to be built: platform, the mount-ns capability probe (False on
+    # userns-denied / mount-restricted hosts — the feature-matrix
+    # degraded lanes), and the uidmap-helpers probe. The persona tmpdir
+    # lifecycle under test is pure context.py bookkeeping; nothing is
+    # spawned.
     import core.sandbox._spawn as _sp
+    import core.sandbox.context as ctx
     import core.sandbox.fingerprint as _fp
+    monkeypatch.setattr(ctx, "check_mount_available", lambda: True)
     monkeypatch.setattr(_sp, "mount_ns_available", lambda: True)
     monkeypatch.setattr(_fp, "is_supported", lambda: True)
 
@@ -396,6 +409,10 @@ def test_persona_tmpdir_keepalive_spans_context_lifetime(tmp_path):
 
     seen = {}
     with (
+        # Pin the persona availability gate (see the cleanup test
+        # above) — the keepalive bookkeeping under test never spawns.
+        patch("core.sandbox.context.check_mount_available",
+              return_value=True),
         patch("core.sandbox._spawn.mount_ns_available", return_value=True),
         patch("core.sandbox.fingerprint.build_persona") as fake_build,
     ):

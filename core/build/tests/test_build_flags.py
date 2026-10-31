@@ -103,11 +103,15 @@ def test_cc_fortify_level(tmp_path):
 
 
 def test_cc_fortify_undef(tmp_path):
+    # Explicitly disabled (0) — a real observation, distinct from
+    # None = no mention. Consumers gate on level >= 2, so 0 can never
+    # feed suppression; reporting None here hid the only TU's explicit
+    # signal.
     target = _write_cc(tmp_path, [{
         "command": "gcc -U_FORTIFY_SOURCE foo.c",
     }])
     ctx = extract_flags(target)
-    assert ctx.fortify_source_level is None
+    assert ctx.fortify_source_level == 0
 
 
 def test_cc_stack_protector_strong(tmp_path):
@@ -119,10 +123,43 @@ def test_cc_stack_protector_strong(tmp_path):
 
 
 def test_cc_stack_protector_disabled(tmp_path):
-    """-fno-stack-protector dominates any earlier -fstack-protector*."""
+    """Within ONE command line the LAST flag wins (gcc semantics)."""
     target = _write_cc(tmp_path, [{
         "command": "gcc -fstack-protector-strong -fno-stack-protector foo.c",
     }])
+    ctx = extract_flags(target)
+    assert ctx.stack_protector_level == "none"
+
+
+def test_cc_stack_protector_reenabled_last_wins(tmp_path):
+    # The other direction of last-wins: disable then re-enable.
+    target = _write_cc(tmp_path, [{
+        "command": "gcc -fno-stack-protector -fstack-protector-strong foo.c",
+    }])
+    ctx = extract_flags(target)
+    assert ctx.stack_protector_level == "strong"
+
+
+def test_cc_stack_protector_strongest_across_tus(tmp_path):
+    """Across TUs the field carries the MOST-HARDENED observed setting
+    (the documented union rule): one unprotected TU must not flip a
+    mostly -fstack-protector-strong project to "none" — Stage-D
+    consumers weight mitigation evidence, and the least-hardened
+    reading overstates exploitability."""
+    target = _write_cc(tmp_path, [
+        {"command": "gcc -fno-stack-protector legacy.c"},
+        {"command": "gcc -fstack-protector-strong main.c"},
+        {"command": "gcc -fstack-protector util.c"},
+    ])
+    ctx = extract_flags(target)
+    assert ctx.stack_protector_level == "strong"
+
+
+def test_cc_stack_protector_all_tus_disabled_is_none(tmp_path):
+    target = _write_cc(tmp_path, [
+        {"command": "gcc -fno-stack-protector a.c"},
+        {"command": "gcc -fno-stack-protector b.c"},
+    ])
     ctx = extract_flags(target)
     assert ctx.stack_protector_level == "none"
 
@@ -463,16 +500,20 @@ def test_fifo_makefile_refused_gracefully(tmp_path):
     assert ctx.source == "absent"
 
 
-def test_symlinked_compile_commands_refused(tmp_path):
-    """The hardened reader opens with O_NOFOLLOW — a symlink at the
-    artifact path (which could point anywhere) is refused and the
-    extraction degrades."""
-    real = tmp_path / "elsewhere.json"
-    real.write_text(json.dumps([
+def test_symlinked_compile_commands_out_of_tree_refused(tmp_path):
+    """A symlink at the artifact path resolving OUTSIDE the target is
+    refused (containment gate) and the extraction degrades. In-tree
+    symlinks — the clangd `ln -s build/compile_commands.json .`
+    layout — are accepted via their resolved path instead (see
+    TestCompileCommandsCandidates in test_macro_config)."""
+    outside = tmp_path / "outside.json"
+    outside.write_text(json.dumps([
         {"file": "a.c", "command": "gcc -fstack-protector a.c"},
     ]))
-    (tmp_path / "compile_commands.json").symlink_to(real)
-    ctx = extract_flags(tmp_path)
+    target = tmp_path / "repo"
+    target.mkdir()
+    (target / "compile_commands.json").symlink_to(outside)
+    ctx = extract_flags(target)
     assert ctx.source == "absent"
 
 
@@ -485,3 +526,208 @@ def test_normal_sized_artifacts_still_parse(tmp_path):
     ctx = extract_flags(tmp_path)
     assert ctx.source == "makefile"
     assert ctx.stack_protector_level == "strong"
+
+
+class TestPerCommandLastWinsUnion:
+    """Per-command effective parse + documented most-hardened union,
+    for every field (the rule the stack-protector field established;
+    the sibling fields used first-match / any-position parses that
+    misreported in BOTH directions)."""
+
+    # -- cross-TU union: most-hardened observed setting per field ----
+
+    def test_undef_tu_plus_level2_tu_unions_to_2(self, tmp_path):
+        target = _write_cc(tmp_path, [
+            {"command": "gcc -U_FORTIFY_SOURCE a.c"},
+            {"command": "gcc -O2 -D_FORTIFY_SOURCE=2 b.c"},
+        ])
+        assert extract_flags(target).fortify_source_level == 2
+
+    def test_fortify_levels_union_to_max_not_first(self, tmp_path):
+        target = _write_cc(tmp_path, [
+            {"command": "gcc -D_FORTIFY_SOURCE=1 a.c"},
+            {"command": "gcc -D_FORTIFY_SOURCE=3 b.c"},
+        ])
+        assert extract_flags(target).fortify_source_level == 3
+
+    def test_werror_unused_result_union_enforced_wins(self, tmp_path):
+        target = _write_cc(tmp_path, [
+            {"command": "gcc -Werror=unused-result a.c"},
+            {"command": "gcc -Wno-error=unused-result b.c"},
+        ])
+        assert extract_flags(target).werror_unused_result is True
+
+    def test_dnpc_union_checks_preserved_wins(self, tmp_path):
+        # False (null checks preserved) is the hardened direction.
+        target = _write_cc(tmp_path, [
+            {"command": "gcc -fdelete-null-pointer-checks a.c"},
+            {"command": "gcc -fno-delete-null-pointer-checks b.c"},
+        ])
+        assert extract_flags(target).delete_null_pointer_checks is False
+
+    def test_dnpc_all_tus_delete_reports_true(self, tmp_path):
+        # Union direction pin: with no hardened observation the
+        # explicit weaker setting still surfaces.
+        target = _write_cc(tmp_path, [
+            {"command": "gcc -fdelete-null-pointer-checks a.c"},
+        ])
+        assert extract_flags(target).delete_null_pointer_checks is True
+
+    def test_stack_protector_union_still_strongest(self, tmp_path):
+        # Control: the landed strongest-across-TUs behavior holds
+        # through the refactor.
+        target = _write_cc(tmp_path, [
+            {"command": "gcc -fno-stack-protector a.c"},
+            {"command": "gcc -fstack-protector-strong b.c"},
+        ])
+        assert extract_flags(target).stack_protector_level == "strong"
+
+    # -- within one command: the compiler's own resolution ------------
+
+    def test_set_then_zero_is_effective_zero(self, tmp_path):
+        # gcc-effective 0: reporting 3 here OVERSTATED hardening on an
+        # unhardened build (exploitability down-weighting steered by a
+        # flag the compile never honoured).
+        target = _write_cc(tmp_path, [{
+            "command": "gcc -D_FORTIFY_SOURCE=3 -D_FORTIFY_SOURCE=0 a.c",
+        }])
+        assert extract_flags(target).fortify_source_level == 0
+
+    def test_distro_reset_then_set_idiom_keeps_signal(self, tmp_path):
+        # The Fedora/Debian spec idiom: -U resets, -D re-arms. An
+        # any-position -U voided the real level (signal loss on
+        # exactly the distros that harden hardest).
+        target = _write_cc(tmp_path, [{
+            "command": "gcc -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3 a.c",
+        }])
+        assert extract_flags(target).fortify_source_level == 3
+
+    def test_werror_specificity_beats_position(self, tmp_path):
+        # gcc: -Wno-error=unused-result excepts unused-result even
+        # when a bare -Werror comes later.
+        target = _write_cc(tmp_path, [{
+            "command": "gcc -Wno-error=unused-result -Werror a.c",
+        }])
+        ctx = extract_flags(target)
+        assert ctx.werror_unused_result is False
+        assert ctx.werror_all is True
+
+    def test_werror_specific_last_wins(self, tmp_path):
+        target = _write_cc(tmp_path, [{
+            "command": ("gcc -Werror=unused-result "
+                        "-Wno-error=unused-result a.c"),
+        }])
+        assert extract_flags(target).werror_unused_result is False
+
+    def test_dnpc_disable_then_reenable_is_true(self, tmp_path):
+        # Last-wins within a command: the old any-position "-fno-"
+        # check misread a command that disables then re-enables.
+        target = _write_cc(tmp_path, [{
+            "command": ("gcc -fno-delete-null-pointer-checks "
+                        "-fdelete-null-pointer-checks a.c"),
+        }])
+        assert extract_flags(target).delete_null_pointer_checks is True
+
+
+class TestModernKconfigSpellings:
+    """Post-5.19 / modern hardening keys carry signal in BOTH .config
+    directions; a member deleted from _HARDENING_CONFIGS fails here
+    (the executable half of the tuple's transcription stamp)."""
+
+    _MODERN = [
+        "CONFIG_RANDSTRUCT_FULL",
+        "CONFIG_RANDSTRUCT_PERFORMANCE",
+        "CONFIG_KMSAN",
+        "CONFIG_KCSAN",
+        "CONFIG_KFENCE",
+        "CONFIG_INIT_STACK_ALL_ZERO",
+        "CONFIG_CFI_CLANG",
+        "CONFIG_SHADOW_CALL_STACK",
+        "CONFIG_STRICT_KERNEL_RWX",
+    ]
+
+    def test_enabled_modern_keys_surface(self, tmp_path):
+        (tmp_path / ".config").write_text(
+            "".join(f"{k}=y\n" for k in self._MODERN))
+        ctx = extract_flags(tmp_path)
+        got = dict(ctx.relevant_configs)
+        for k in self._MODERN:
+            assert got.get(k) is True, k
+        # The sanitizer arm consumes the modern family too — a
+        # KMSAN/KFENCE-instrumented kernel used to report ().
+        assert "kmsan" in ctx.sanitizers_enabled
+        assert "kcsan" in ctx.sanitizers_enabled
+        assert "kfence" in ctx.sanitizers_enabled
+
+    def test_disabled_modern_keys_surface(self, tmp_path):
+        (tmp_path / ".config").write_text(
+            "".join(f"# {k} is not set\n" for k in self._MODERN))
+        ctx = extract_flags(tmp_path)
+        got = dict(ctx.relevant_configs)
+        for k in self._MODERN:
+            assert got.get(k) is False, k
+        assert ctx.sanitizers_enabled == ()
+
+    def test_pre519_randstruct_spelling_still_recognised(self, tmp_path):
+        (tmp_path / ".config").write_text(
+            "CONFIG_GCC_PLUGIN_RANDSTRUCT=y\n")
+        got = dict(extract_flags(tmp_path).relevant_configs)
+        assert got.get("CONFIG_GCC_PLUGIN_RANDSTRUCT") is True
+
+
+class TestMakefileAssignmentGrammar:
+    def test_modern_assignment_operators_recognised(self, tmp_path):
+        # GNU make ::= (POSIX) and 4.4's :::= dropped whole CFLAGS
+        # lines from the scan.
+        (tmp_path / "Makefile").write_text(
+            "CFLAGS ::= -D_FORTIFY_SOURCE=2\n"
+            "CXXFLAGS :::= -fstack-protector-strong\n",
+        )
+        ctx = extract_flags(tmp_path)
+        assert ctx.fortify_source_level == 2
+        assert ctx.stack_protector_level == "strong"
+
+    def test_backslash_continuations_join(self, tmp_path):
+        # make splices continuation lines; the scan used to keep only
+        # the first physical line of a continued assignment.
+        (tmp_path / "Makefile").write_text(
+            "CFLAGS = -O2 \\\n\t-fstack-protector-strong\n",
+        )
+        assert extract_flags(tmp_path).stack_protector_level == "strong"
+
+    def test_lowercase_makefile_name_recognised(self, tmp_path):
+        # make's own lookup order includes `makefile`; the name set
+        # had drifted against the detector's make entry.
+        (tmp_path / "makefile").write_text(
+            "CFLAGS = -fstack-protector\n",
+        )
+        assert extract_flags(tmp_path).stack_protector_level == "weak"
+
+    def test_crlf_continuation_folds_like_lf(self, tmp_path):
+        """A CRLF checkout of a continued assignment harvests the
+        same flags as its LF twin.
+
+        The direction matters: the extractors are last-wins, so an
+        UN-folded continuation truncates the flag stream at the
+        first physical line — this twin puts the hardening flag
+        first and its disablement on the continued line, so a fold
+        failure would report STRONGER hardening than the real build
+        (suppression-grade evidence on the trust-gated lane)."""
+        body_lf = (
+            "CFLAGS = -fstack-protector-strong \\\n"
+            "\t-fno-stack-protector -D_FORTIFY_SOURCE=0\n"
+        )
+        ctxs = {}
+        for name, data in (
+            ("lf", body_lf.encode()),
+            ("crlf", body_lf.replace("\n", "\r\n").encode()),
+        ):
+            root = tmp_path / name
+            root.mkdir()
+            (root / "Makefile").write_bytes(data)
+            ctxs[name] = extract_flags(root)
+        assert ctxs["lf"] == ctxs["crlf"]
+        # Non-vacuous, in the load-bearing direction: the disabling
+        # flags on the continued line win on BOTH twins.
+        assert ctxs["crlf"].stack_protector_level == "none"
+        assert ctxs["crlf"].fortify_source_level == 0

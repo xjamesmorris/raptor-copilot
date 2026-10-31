@@ -113,12 +113,37 @@ def source_control_snapshot(repo_dir: Path | None = None) -> dict[str, Any]:
                    dirty, else None. The diff *content* is never stored —
                    only its hash — so the manifest cannot leak source. Note
                    an untracked-only modification sets dirty=True but leaves
-                   diff_sha256 None (``git diff HEAD`` omits untracked files).
+                   diff_sha256 None (``git diff HEAD`` omits untracked files)
+                   — ``diff_sha256_reason`` then says so.
       version      human-readable ``git describe`` of the framework (e.g.
                    ``3.0.0-1786-g7fcf38ea``), or None if unknowable. Unlike the
                    banner's ``RaptorConfig.effective_version()`` this never
                    falls back to the baked constant — provenance must report
                    what it can actually verify, not a substituted value.
+
+    Dirt accounting — ``dirty=True`` is never a bare, unverifiable claim;
+    three additive keys are present ONLY when ``dirty`` is True (a clean or
+    unknowable tree keeps the exact legacy shape):
+      dirty_reason        dirt composition from the porcelain codes:
+                          ``tracked_only`` / ``untracked_only`` /
+                          ``tracked_and_untracked``.
+      status_sha256       sha256 hex over the ``git status --porcelain``
+                          lines, each whitespace-stripped, sorted, joined
+                          with ``\\n`` — a reproducible fingerprint of WHAT
+                          was dirty (hash only, never content). Per-line
+                          stripped because ``_git`` strips the whole
+                          output's ends, so the first line's leading
+                          status-column space is unreliable; sorted so the
+                          contract does not lean on git's line ordering.
+      diff_sha256_reason  present iff ``diff_sha256`` is None while dirty —
+                          the stated reason a hash could not be recorded:
+                          ``untracked_only`` (no tracked dirt, the empty
+                          diff is expected), ``diff_unavailable`` (the
+                          ``git diff`` invocation itself failed), or
+                          ``empty_diff`` (diff ran empty despite tracked
+                          dirt in the porcelain — honest catch-all). A
+                          reader can now tell "nothing tracked to hash"
+                          from "diff hashing failed silently".
     """
     repo_dir = repo_dir or _REPO_ROOT
     sha = _git(repo_dir, "rev-parse", "HEAD")
@@ -133,7 +158,23 @@ def source_control_snapshot(repo_dir: Path | None = None) -> dict[str, Any]:
     dirty = bool(porcelain) if porcelain is not None else None
 
     diff_sha256 = None
+    dirt_fields: dict[str, Any] = {}
     if dirty:
+        # Dirt accounting (see the docstring's contract): composition +
+        # reproducible fingerprint, so dirty=True is a verifiable claim.
+        lines = sorted(
+            ln.strip() for ln in porcelain.splitlines() if ln.strip()  # type: ignore[union-attr]
+        )
+        untracked_dirt = any(ln.startswith("??") for ln in lines)
+        tracked_dirt = any(not ln.startswith("??") for ln in lines)
+        dirt_fields["dirty_reason"] = (
+            "tracked_and_untracked" if tracked_dirt and untracked_dirt
+            else "untracked_only" if untracked_dirt
+            else "tracked_only"
+        )
+        dirt_fields["status_sha256"] = hashlib.sha256(
+            "\n".join(lines).encode("utf-8", "replace")
+        ).hexdigest()
         # --no-ext-diff: the hash must be a function of the tree contents,
         # not of whatever external diff driver the operator has configured.
         diff = _git(repo_dir, "diff", "--no-ext-diff", "HEAD")
@@ -141,6 +182,14 @@ def source_control_snapshot(repo_dir: Path | None = None) -> dict[str, Any]:
             diff_sha256 = hashlib.sha256(
                 diff.encode("utf-8", "replace")
             ).hexdigest()
+        elif diff is None:
+            # The diff call itself failed (non-zero / timeout / OSError) —
+            # previously indistinguishable from a legitimately empty diff.
+            dirt_fields["diff_sha256_reason"] = "diff_unavailable"
+        elif not tracked_dirt:
+            dirt_fields["diff_sha256_reason"] = "untracked_only"
+        else:
+            dirt_fields["diff_sha256_reason"] = "empty_diff"
 
     # Human-readable framework version, derived from the same checkout the
     # sha came from. ``--always`` falls back to a short sha for an untagged
@@ -150,7 +199,7 @@ def source_control_snapshot(repo_dir: Path | None = None) -> dict[str, Any]:
         version = version.lstrip("v")
 
     return {"base_sha": sha, "dirty": dirty, "diff_sha256": diff_sha256,
-            "version": version}
+            "version": version, **dirt_fields}
 
 
 def tool_version(name: str) -> str | None:
@@ -161,30 +210,21 @@ def tool_version(name: str) -> str | None:
     tool is unknown, not installed, times out, or reports nothing. Never raises
     — engine provenance is best-effort and must not break run finalisation.
     """
-    probe = _VERSION_PROBES.get(name)
-    if not probe:
+    probe_argv = _VERSION_PROBES.get(name)
+    if not probe_argv:
         return None
-    try:
-        from core.config import RaptorConfig
-        env = RaptorConfig.get_safe_env()
-    except Exception:  # noqa: BLE001
-        logger.warning("get_safe_env unavailable; using inherited env")
-        env = os.environ.copy()
-    try:
-        result = subprocess.run(
-            probe,
-            capture_output=True,
-            text=True,
-            timeout=_PROBE_TIMEOUT_S,
-            env=env,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+    # Thin wrapper over the toolprobe chokepoint — this module was one
+    # of the exec-the-BARE-name drifts toolprobe's docstring names as
+    # consolidated: probe() resolves via which() and execs the
+    # RESOLVED path under the sanitised env, and first_line implements
+    # the stdout-else-stderr convention this loop hand-rolled.
+    from core.run.toolprobe import probe
+    info = probe(probe_argv[0], args=tuple(probe_argv[1:]),
+                 timeout=_PROBE_TIMEOUT_S)
+    if info is None:
         return None
-    out = (result.stdout or result.stderr or "").strip()
-    if not out:
-        return None
-    return out.splitlines()[0].strip() or None
+    first = info.first_line
+    return first.strip() or None if isinstance(first, str) else None
 
 
 def target_snapshot(target_path: Any | None) -> dict[str, Any] | None:
@@ -210,26 +250,22 @@ def target_snapshot(target_path: Any | None) -> dict[str, Any] | None:
     sha = _git(p, "rev-parse", "HEAD", untrusted=True)
     if sha is None:
         return None
-    # Dirtiness via plumbing that never re-hashes worktree content. `git
-    # status` refreshes the index, and the refresh pushes stat-stale files
-    # through any clean filter the repo's own .git/config defines
-    # (filter.<name>.clean — an arbitrary command under a repo-chosen name,
-    # which the -c safety overrides cannot blanket-disable; see
-    # _SAFE_GIT_OVERRIDES in core.git.clone). diff-index WITHOUT a preceding
-    # refresh compares HEAD against the index's stat cache only, and
-    # ls-files is a pure directory walk — neither executes target-configured
-    # code. Trade-off: a stat-touched but content-identical file counts as
-    # dirty. That conservative bias is fine for a provenance flag (and it
-    # also skips the index refresh + lock write `status` performs, which
-    # matters on large targets).
-    tracked = _git(p, "diff-index", "--no-ext-diff", "HEAD", untrusted=True)
-    untracked = _git(
-        p, "ls-files", "--others", "--exclude-standard", untrusted=True,
-    )
-    if tracked is None and untracked is None:
-        dirty = None  # both probes failed — unknowable, never guessed
-    else:
-        dirty = bool(tracked) or bool(untracked)
+    # Dirtiness via core.git.dirty — the one probe that never lets git
+    # open a worktree file. `git status` refreshes the index, pushing
+    # stat-stale files through any clean filter the repo's own
+    # .git/config defines (filter.<name>.clean — an arbitrary command
+    # under a repo-chosen name, which the -c safety overrides cannot
+    # blanket-disable; see _SAFE_GIT_OVERRIDES in core.git.clone), and
+    # even worktree-side plumbing (`diff-index HEAD`, `ls-files -m`)
+    # re-reads content through the same filter chain for racily-clean
+    # entries — a raciness the hostile repo's shipped index controls.
+    # The probe compares index stat data against os.lstat instead.
+    # Trade-off: a stat-touched but content-identical file counts as
+    # dirty. That conservative bias is fine for a provenance flag.
+    # dirty is None when a probe channel failed and no dirt was seen —
+    # unknowable, never guessed.
+    from core.git.dirty import probe_worktree_dirt
+    dirty = probe_worktree_dirt(p, timeout=_GIT_TIMEOUT_S).dirty
     branch = _git(p, "rev-parse", "--abbrev-ref", "HEAD", untrusted=True)
     return {
         "vcs": "git",
@@ -439,7 +475,13 @@ def format_sha_short(manifest: dict[str, Any] | None) -> str:
     sha = sc.get("base_sha")
     if not sha:
         return ""
-    return sha[:7] + ("*" if sc.get("dirty") else "")
+    # base_sha is restored VERBATIM from child-writable run metadata
+    # (format_manifest_block documents and escapes the same field):
+    # coerce so a junk cell cannot TypeError the caller's row render,
+    # and escape so even seven kept bytes cannot carry a CSI.
+    from core.security.log_sanitisation import sanitise_for_terminal
+    return (sanitise_for_terminal(str(sha)[:7], max_len=32)
+            + ("*" if sc.get("dirty") else ""))
 
 
 def format_manifest_block(manifest: dict[str, Any] | None,
@@ -453,31 +495,43 @@ def format_manifest_block(manifest: dict[str, Any] | None,
     if manifest.get("provenance") == "unavailable":
         return f"{indent}Provenance: unavailable (run predates manifest capture)"
 
+    # Manifests are child-writable during the run and restored VERBATIM
+    # by /project import (a .raptor-run.json is not in the import
+    # quarantine set) — every string field here is attacker-selectable.
+    # Escape + bound per field; consumers print this block to the
+    # terminal (/project status, run provenance) and write it into
+    # provenance.md.
+    from core.security.log_sanitisation import sanitise_for_terminal
+
+    def _f(value: object, cap: int = 64) -> str:
+        return sanitise_for_terminal(str(value), max_len=cap)
+
     lines = []
     sc = manifest.get("source_control") or {}
     if sc.get("base_sha"):
         suffix = " (modified)" if sc.get("dirty") else ""
-        lines.append(f"{indent}RAPTOR: {sc['base_sha'][:12]}{suffix}")
+        lines.append(f"{indent}RAPTOR: {_f(str(sc['base_sha'])[:12])}{suffix}")
 
     env = manifest.get("environment") or {}
     if env:
         lines.append(
-            f"{indent}Env: Python {env.get('python', '?')} "
-            f"on {env.get('os', '?')}/{env.get('arch', '?')}"
+            f"{indent}Env: Python {_f(env.get('python', '?'))} "
+            f"on {_f(env.get('os', '?'))}/{_f(env.get('arch', '?'))}"
         )
 
     engines = manifest.get("engines") or {}
     if engines:
         rendered = ", ".join(
-            f"{name} {ver or '?'}" for name, ver in sorted(engines.items())
+            f"{_f(name)} {_f(ver or '?')}"
+            for name, ver in sorted(engines.items())
         )
         lines.append(f"{indent}Engines: {rendered}")
 
     for m in manifest.get("models") or []:
         resolved = m.get("resolved") or m.get("alias") or "?"
         lines.append(
-            f"{indent}Model: {m.get('alias', '?')} → {resolved} "
-            f"({m.get('role', '?')}, {m.get('calls', '?')}×)"
+            f"{indent}Model: {_f(m.get('alias', '?'))} → {_f(resolved)} "
+            f"({_f(m.get('role', '?'), cap=32)}, {_f(m.get('calls', '?'), cap=16)}×)"
         )
 
     if "deterministically_reproducible" in manifest:
@@ -519,15 +573,59 @@ def public_view(run_metadata: dict[str, Any] | None) -> dict[str, Any]:
     dirty flag, diff *hash* (never content), coarse env, engine versions, and
     model snapshots — so it is forwarded under an explicit field allowlist.
     """
-    md = run_metadata or {}
+    # Value validation, not just key allowlists: the underlying
+    # ``.raptor-run.json`` is sandbox-child-writable mid-run and
+    # import-restored verbatim, so every FORWARDED VALUE is
+    # type-checked per field and strings pass the same L1-strict
+    # rejection ``finding_public_view`` applies (control bytes / ANSI
+    # escapes / unicode C*). A failing value is DROPPED — the rest of
+    # the projection survives, and nothing nested or wrong-typed can
+    # ride an allowlisted key out.
+    from core.run.findings import _publish_string as _l1
+
+    _drop = object()
+
+    def _pub_str(value: Any) -> Any:
+        if not isinstance(value, str):
+            return _drop
+        cleaned = _l1(value)
+        return _drop if not isinstance(cleaned, str) else cleaned
+
+    def _pub_num(value: Any) -> Any:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return _drop
+        return value
+
+    def _pub_bool(value: Any) -> Any:
+        return value if isinstance(value, (bool, type(None))) else _drop
+
+    def _pub_opt_str(value: Any) -> Any:
+        return None if value is None else _pub_str(value)
+
+    def _fill(dst: dict[str, Any], src: dict[str, Any],
+              spec: dict[str, Any]) -> None:
+        for key, validator in spec.items():
+            if key not in src:
+                continue
+            cleaned = validator(src[key])
+            if cleaned is not _drop:
+                dst[key] = cleaned
+
+    md = run_metadata if isinstance(run_metadata, dict) else {}
     out: dict[str, Any] = {}
+    _fill(out, md, {
+        "command": _pub_str,
+        "timestamp": _pub_str,
+        "end_timestamp": _pub_str,
+        "duration_seconds": _pub_num,
+        "status": _pub_str,
+        "version": lambda v: v if (isinstance(v, int)
+                                   and not isinstance(v, bool))
+        else _pub_str(v),
+    })
 
-    for key in _PUBLIC_TOPLEVEL_FIELDS:
-        if key in md:
-            out[key] = md[key]
-
-    manifest = md.get("manifest") or {}
-    if not manifest:
+    manifest = md.get("manifest")
+    if not isinstance(manifest, dict) or not manifest:
         return out
 
     if manifest.get("provenance") == "unavailable":
@@ -535,14 +633,23 @@ def public_view(run_metadata: dict[str, Any] | None) -> dict[str, Any]:
         return out
 
     pub: dict[str, Any] = {}
-    sc = manifest.get("source_control") or {}
-    if sc:
-        pub["source_control"] = {
-            "base_sha": sc.get("base_sha"),
-            "dirty": sc.get("dirty"),
+    sc = manifest.get("source_control")
+    if isinstance(sc, dict) and sc:
+        sc_pub: dict[str, Any] = {}
+        _fill(sc_pub, sc, {
+            "base_sha": _pub_opt_str,
+            "dirty": _pub_bool,
             # Hash only — the diff content is never stored, so this is safe.
-            "diff_sha256": sc.get("diff_sha256"),
-        }
+            "diff_sha256": _pub_opt_str,
+            # Dirt accounting: a hash and fixed enum strings — the same
+            # publish-safety class as diff_sha256, and what lets a citation
+            # reader verify the dirty claim instead of trusting it.
+            "dirty_reason": _pub_str,
+            "status_sha256": _pub_str,
+            "diff_sha256_reason": _pub_str,
+        })
+        if sc_pub:
+            pub["source_control"] = sc_pub
     # Target block: a git target carries commit/branch (possibly a private
     # engagement) → dropped. A non-git target (archive / directory) is an
     # acquisition stamp — hashes + names only → publish-safe, the attribution a
@@ -550,38 +657,55 @@ def public_view(run_metadata: dict[str, Any] | None) -> dict[str, Any]:
     # content-equivalence id is the coverage store's, not published here.
     tgt = manifest.get("target")
     if isinstance(tgt, dict) and not tgt.get("commit"):
-        safe_tgt = {
-            k: tgt[k] for k in
-            ("source", "archive_sha256", "archive_name", "format")
-            if k in tgt
-        }
+        safe_tgt: dict[str, Any] = {}
+        _fill(safe_tgt, tgt, {
+            "source": _pub_str,
+            "archive_sha256": _pub_str,
+            "archive_name": _pub_str,
+            "format": _pub_str,
+        })
         if safe_tgt:
             pub["target"] = safe_tgt
-    # Field-allowlist INSIDE each sub-dict too — never forward verbatim, so a
-    # crafted/imported manifest can't smuggle a path or secret under an extra
-    # key in environment / engines / models.
-    env = manifest.get("environment") or {}
+    env = manifest.get("environment")
     if isinstance(env, dict):
-        env_pub = {k: env[k] for k in ("python", "os", "arch") if k in env}
+        env_pub: dict[str, Any] = {}
+        _fill(env_pub, env, {
+            "python": _pub_str, "os": _pub_str, "arch": _pub_str,
+        })
         if env_pub:
             pub["environment"] = env_pub
     engines = manifest.get("engines")
     if isinstance(engines, dict) and engines:
         # name -> version string. Richer engine metadata (rulesets/queries),
         # if ever added, must be re-allowlisted here — don't pass dicts through.
-        pub["engines"] = {
-            str(name): ver
-            for name, ver in engines.items()
-            if isinstance(name, str) and (ver is None or isinstance(ver, str))
-        }
+        eng_pub = {}
+        for name, ver in engines.items():
+            k = _pub_str(name)
+            v = _pub_opt_str(ver)
+            if k is not _drop and v is not _drop:
+                eng_pub[k] = v
+        if eng_pub:
+            pub["engines"] = eng_pub
     models = manifest.get("models")
     if isinstance(models, list) and models:
-        pub["models"] = [
-            {k: m.get(k) for k in ("provider", "alias", "resolved", "role", "calls")}
-            for m in models if isinstance(m, dict)
-        ]
-    if "deterministically_reproducible" in manifest:
-        pub["deterministically_reproducible"] = manifest["deterministically_reproducible"]
+        pub_models = []
+        for m in models:
+            if not isinstance(m, dict):
+                continue
+            m_pub: dict[str, Any] = {}
+            _fill(m_pub, m, {
+                "provider": _pub_opt_str,
+                "alias": _pub_opt_str,
+                "resolved": _pub_opt_str,
+                "role": _pub_opt_str,
+                "calls": _pub_num,
+            })
+            pub_models.append(m_pub)
+        if pub_models:
+            pub["models"] = pub_models
+    dr = manifest.get("deterministically_reproducible", _drop)
+    if dr is not _drop and isinstance(dr, (bool, type(None))):
+        pub["deterministically_reproducible"] = dr
     if pub:
         out["manifest"] = pub
     return out
@@ -629,21 +753,39 @@ def aggregate_provenance(
             summary["unavailable"] += 1
             summary["reproducible"]["unknown"] += 1
             continue
-        sc = m.get("source_control") or {}
+        sc = m.get("source_control")
+        if not isinstance(sc, dict):
+            # tolerate malformed/imported manifests, like engines and
+            # models below — one junk marker must not AttributeError
+            # the whole /project provenance rollup.
+            sc = {}
         sha = sc.get("base_sha")
-        if sha:
+        # Non-str base_sha (a crafted list/dict) is unusable as a
+        # count key — and an unhashable one crashed the rollup with
+        # TypeError. The status/show views isinstance-gate this same
+        # field (run_framework_sha).
+        if sha and isinstance(sha, str):
             summary["shas"][sha] = summary["shas"].get(sha, 0) + 1
         if sc.get("dirty"):
             summary["dirty_runs"] += 1
         engines = m.get("engines")
         if isinstance(engines, dict):  # tolerate malformed/imported manifests
             for name, ver in engines.items():
-                engines_acc.setdefault(name, set()).add(ver or "?")
+                # Non-str versions collapse to "?": an unhashable one
+                # TypeError'd the accumulator, and a mixed-type set
+                # TypeError'd the sorted() fold below.
+                if not (ver and isinstance(ver, str)):
+                    ver = "?"
+                engines_acc.setdefault(name, set()).add(ver)
         seen = {
-            (mdl.get("resolved") or mdl.get("alias") or "?")
+            key if isinstance(
+                key := (mdl.get("resolved") or mdl.get("alias") or "?"),
+                str) else "?"
             for mdl in (m.get("models") or [])
             # tolerate malformed/imported manifests, like engines above
-            # (run_models() filters non-dicts for the same reason)
+            # (run_models() filters non-dicts for the same reason);
+            # non-str resolved/alias values collapse to "?" — an
+            # unhashable one TypeError'd the set build.
             if isinstance(mdl, dict)
         }
         for key in seen:
@@ -656,7 +798,18 @@ def aggregate_provenance(
 
 
 def format_provenance_rollup(summary: dict[str, Any]) -> str:
-    """Human-readable project-level provenance rollup from aggregate_provenance."""
+    """Human-readable project-level provenance rollup from aggregate_provenance.
+
+    SHAs, engine names/versions, and model keys come from per-run
+    ``.raptor-run.json`` manifests — child-writable mid-run and restored
+    verbatim by /project import — so every value is escaped at
+    construction, like the sibling ``format_manifest_block``.
+    """
+    from core.security.log_sanitisation import sanitise_for_terminal
+
+    def _f(value: object, cap: int = 64) -> str:
+        return sanitise_for_terminal(str(value), max_len=cap)
+
     runs = summary.get("runs", 0)
     if not runs:
         return "No runs with provenance."
@@ -666,7 +819,7 @@ def format_provenance_rollup(summary: dict[str, Any]) -> str:
     if shas:
         ordered = sorted(shas.items(), key=lambda kv: (-kv[1], kv[0]))
         lines.append("  Framework SHAs: "
-                     + ", ".join(f"{s[:12]} ({n})" for s, n in ordered))
+                     + ", ".join(f"{_f(str(s)[:12])} ({n})" for s, n in ordered))
         if len(shas) > 1:
             lines.append(f"    ⚠ {len(shas)} distinct RAPTOR versions across runs")
 
@@ -677,12 +830,14 @@ def format_provenance_rollup(summary: dict[str, Any]) -> str:
     engines = summary.get("engines") or {}
     if engines:
         lines.append("  Engines: "
-                     + "; ".join(f"{k} {'/'.join(v)}" for k, v in engines.items()))
+                     + "; ".join(f"{_f(k)} {_f('/'.join(str(x) for x in v))}"
+                                 for k, v in engines.items()))
 
     models = summary.get("models") or {}
     if models:
         ordered_m = sorted(models.items(), key=lambda kv: (-kv[1], kv[0]))
-        lines.append("  Models: " + ", ".join(f"{k} ({n})" for k, n in ordered_m))
+        lines.append("  Models: "
+                     + ", ".join(f"{_f(k)} ({n})" for k, n in ordered_m))
 
     r = summary.get("reproducible") or {}
     lines.append(

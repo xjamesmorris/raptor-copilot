@@ -124,6 +124,27 @@ class TestEnrichAttackPaths:
         assert "parameter_constraints" in step
         assert step["parameter_constraints"][0]["rule"] == "len <= 4096"
 
+    def test_non_list_steps_do_not_kill_the_pass(self, tmp_path):
+        """LLM-authored attack paths can shape-drift ``steps`` to a
+        string or null; one malformed path entry must not abort the
+        enrichment of the well-formed ones."""
+        paths = [
+            {"steps": "parse_input then handle_data"},
+            {"steps": None},
+            {"steps": [
+                {"function": "parse_input", "file": "http.c"},
+            ]},
+        ]
+        ap_file = tmp_path / "attack-paths.json"
+        ap_file.write_text(json.dumps(paths), encoding="utf-8")
+        constraints = [
+            {"function": "parse_input", "file": "http.c",
+             "kind": "parameter", "target": "buf",
+             "rule": "len <= 4096", "violation": "stack overflow",
+             "status": "open"},
+        ]
+        assert enrich_attack_paths(ap_file, constraints) == 1
+
     def test_bare_function_fallback(self, tmp_path):
         paths = [{"steps": [{"function": "fn", "file": "other.c"}]}]
         ap_file = tmp_path / "attack-paths.json"
@@ -311,6 +332,14 @@ class TestNormalizeAuditFindings:
         result = normalize_audit_findings(findings)
         assert result[0]["origin"] == "pre_existing"
 
+    def test_non_string_evidence_tool_defaults_low(self):
+        # A shape-drifted evidence_tool (int/list) must not crash the
+        # whole import; the row falls back to low confidence.
+        findings = [{"id": "F1", "evidence_tool": 7},
+                    {"id": "F2", "evidence_tool": ["semgrep"]}]
+        result = normalize_audit_findings(findings)
+        assert [r["confidence"] for r in result] == ["low", "low"]
+
     def test_maps_description_to_candidate_reasoning(self):
         findings = [{"id": "F1", "description": "buffer overflow via parse"}]
         result = normalize_audit_findings(findings)
@@ -470,3 +499,18 @@ class TestInjectDarkAsHypotheses:
         surface_path = tmp_path / "attack-surface.json"
         surface_path.write_text(json.dumps({"hypotheses": []}))
         assert inject_dark_as_hypotheses([], surface_path) == 0
+
+
+class TestLoadSummariesKeyVocabulary:
+    def test_list_format_keys_join_function_key(self, tmp_path):
+        """The loader's keys must come from the shared function_key
+        constructor — enrich_with_summaries joins on it, and a
+        hand-built spelling on one side is how joins go silently
+        inert when the grammar moves."""
+        from core.analysis.taint_approx import function_key
+        data = [{"file": "src/a.c", "function": "parse",
+                 "taint_rules": []}]
+        (tmp_path / "summaries.json").write_text(
+            json.dumps(data), encoding="utf-8")
+        result = load_summaries(tmp_path)
+        assert set(result) == {function_key("src/a.c", "parse")}

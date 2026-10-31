@@ -34,8 +34,10 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
+from . import _MAX_REASONING_CHARS
 from .scorecard import EventType, ModelScorecard, Policy
 
 _logger = logging.getLogger(__name__)
@@ -67,6 +69,7 @@ def prefilter_decision(
     decision_class: str,
     model: str,
     cheap_says_fp: bool,
+    repo: str | Path | None = None,
 ) -> PrefilterDecision:
     """Decide whether to short-circuit on the cheap verdict.
 
@@ -82,6 +85,12 @@ def prefilter_decision(
     ``cheap_says_fp=False`` short-circuits on its own — the cheap
     model didn't make a confident FP claim, so there's nothing to
     gate; full analysis runs.
+
+    ``repo`` is the analysis target the skip would spend on —
+    forwarded to :meth:`ModelScorecard.should_short_circuit`'s
+    target-diversity gate. Pass the operator-resolved target path,
+    never a value read out of a scanned artifact; omitting it means
+    the cell must clear the cross-target diversity floor on its own.
     """
     if not cheap_says_fp:
         return PrefilterDecision(
@@ -97,7 +106,7 @@ def prefilter_decision(
             model=model,
             policy=Policy.FALL_THROUGH,
         )
-    policy = scorecard.should_short_circuit(decision_class, model)
+    policy = scorecard.should_short_circuit(decision_class, model, repo=repo)
     return PrefilterDecision(
         short_circuit=(policy == Policy.SHORT_CIRCUIT),
         decision_class=decision_class,
@@ -116,8 +125,14 @@ def record_prefilter_outcome(
     cheap_reasoning: str = "",
     full_reasoning: str = "",
     model_version: str | None = None,
+    repo: str | Path | None = None,
 ) -> None:
     """Record one observation of cheap-vs-full agreement.
+
+    ``repo`` is the analysis target the observation was earned on —
+    forwarded to the scorecard's target-diversity ledger (see
+    :meth:`ModelScorecard.record_event`). Pass the operator-resolved
+    target path, never a value read out of a scanned artifact.
 
     Only events where ``cheap_says_fp=True`` are recorded — the
     short-circuit gate's Wilson math is computed over "cheap claimed
@@ -144,16 +159,19 @@ def record_prefilter_outcome(
             # ending up in the scorecard. The first ~500 chars are
             # almost always the model's verdict-summary; the rest
             # is usually procedural or restating the question.
-            "this_reasoning": (cheap_reasoning or "")[:500],
-            "other_reasoning": (full_reasoning or "")[:500],
+            # str-coerced: schema-junk can put a dict/list here and
+            # the slice would raise TypeError, uncaught in-module.
+            "this_reasoning": str(cheap_reasoning or "")[:_MAX_REASONING_CHARS],
+            "other_reasoning": str(full_reasoning or "")[:_MAX_REASONING_CHARS],
         }
     scorecard.record_event(
         decision_class=decision_class,
         model=model,
         event_type=EventType.CHEAP_SHORT_CIRCUIT,
-        outcome=outcome,
+        outcome=outcome,  # type: ignore[arg-type]
         model_version=model_version,
         sample=sample,
+        repo=repo,
     )
 
 
@@ -234,8 +252,10 @@ def run_cheap_fp_check(
     result = structured_result(response, default={})
     if not isinstance(result, Mapping):
         result = {}
-    verdict = (result.get("verdict") or "").strip().lower()
-    reasoning = result.get("reasoning") or ""
+    verdict = str(result.get("verdict") or "").strip().lower()
+    # str-coerced: a dict/list-shaped reasoning from schema-junk must
+    # not TypeError the consumer's later slice.
+    reasoning = str(result.get("reasoning") or "")
     if verdict not in allowed_verdicts:
         # Defensive: an unexpected verdict string means we can't gate
         # on it. Fall through to full analysis.

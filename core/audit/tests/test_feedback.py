@@ -535,7 +535,7 @@ class TestImportValidationResults:
         ann_path = ann_dir / "src" / "vuln.c.md"
         content = ann_path.read_text().replace(
             "source=llm",
-            "source=human provenance=interactive-tty tty=stdin",
+            "source=human provenance=interactive-tty tty=stdin sid=inherited envm=trusted parents=bash",
         )
         ann_path.write_text(content)
 
@@ -946,7 +946,7 @@ class TestProvenanceGatedVeto:
         _write_annotation_meta(
             ann_dir, "src/vuln.c", "vuln_fn",
             "status=finding source=human "
-            "provenance=interactive-tty tty=stdin",
+            "provenance=interactive-tty tty=stdin sid=inherited envm=trusted parents=bash",
             "Manually verified by operator",
         )
         result = import_validation_results(
@@ -1126,6 +1126,8 @@ class TestDowngradeReferee:
             validation_report=report, annotations_dir=ann_dir,
             audit_out_dir=audit_out)
         assert result["downgraded"] == 1
+        assert result["downgraded_clean"] == 1
+        assert result["downgraded_suspicious"] == 0
         entry = _latest_journal_entry(audit_out, "src/vuln.c", "vuln_fn")
         assert entry.verdict == "clean"
         events = [e for e in self._audit_log_events(audit_out)
@@ -1166,6 +1168,8 @@ class TestDowngradeReferee:
             validation_report=report, annotations_dir=ann_dir,
             audit_out_dir=audit_out)
         assert result["downgraded"] == 1
+        assert result["downgraded_suspicious"] == 1
+        assert result["downgraded_clean"] == 0
         entry = _latest_journal_entry(audit_out, "src/vuln.c", "vuln_fn")
         assert entry.verdict == "suspicious"
         assert entry.prior_review == "finding"
@@ -1296,9 +1300,17 @@ class TestDowngradeReferee:
 
     def test_sanity_failure_with_structural_fact_cleans(
             self, tmp_path: Path):
+        # Producer shape: packages.coccinelle.prereqs.evaluate_finding
+        # nests the checks and only mints False from a complete sweep.
         ann_dir, audit_out = self._setup(tmp_path, ["semgrep"])
         report = self._report(tmp_path, {
-            "cocci_prereqs": {"applicable": True, "function_exists": False},
+            "cocci_prereqs": {
+                "applicable": True,
+                "checks": {"function_exists": False,
+                           "function_has_callers": None},
+                "details": {"function": "vuln_fn"},
+                "skipped_reason": None,
+            },
             "ruling": {"status": "ruled_out",
                         "disqualifier": "sanity_check_failed"},
         })
@@ -1307,6 +1319,89 @@ class TestDowngradeReferee:
             audit_out_dir=audit_out)
         entry = _latest_journal_entry(audit_out, "src/vuln.c", "vuln_fn")
         assert entry.verdict == "clean"
+
+    def test_flat_forged_cocci_fact_blocks_clean(self, tmp_path: Path):
+        """A bare/flat function_exists=False — a shape no mechanical
+        producer emits — must not upgrade a bare LLM disqualifier to
+        the accepted refutation class."""
+        ann_dir, audit_out = self._setup(tmp_path, ["semgrep"])
+        report = self._report(tmp_path, {
+            "cocci_prereqs": {"applicable": True,
+                              "function_exists": False},
+            "ruling": {"status": "ruled_out",
+                        "disqualifier": "sanity_check_failed"},
+        })
+        import_validation_results(
+            validation_report=report, annotations_dir=ann_dir,
+            audit_out_dir=audit_out)
+        entry = _latest_journal_entry(audit_out, "src/vuln.c", "vuln_fn")
+        assert entry is not None
+        assert entry.verdict == "suspicious"
+
+    def test_abstained_cocci_record_blocks_clean(self, tmp_path: Path):
+        """An abstention (null from a partial sweep) is not an
+        absence witness."""
+        ann_dir, audit_out = self._setup(tmp_path, ["semgrep"])
+        report = self._report(tmp_path, {
+            "cocci_prereqs": {
+                "applicable": True,
+                "checks": {"function_exists": None,
+                           "function_has_callers": None},
+                "details": {"function": "vuln_fn",
+                            "abstained": "sweep_partial"},
+                "skipped_reason": None,
+            },
+            "ruling": {"status": "ruled_out",
+                        "disqualifier": "sanity_check_failed"},
+        })
+        import_validation_results(
+            validation_report=report, annotations_dir=ann_dir,
+            audit_out_dir=audit_out)
+        entry = _latest_journal_entry(audit_out, "src/vuln.c", "vuln_fn")
+        assert entry is not None
+        assert entry.verdict == "suspicious"
+
+    def test_errored_sweep_end_to_end_blocks_clean(self, tmp_path: Path):
+        """End-to-end across the producer boundary: an all-rules-
+        errored spatch sweep must not manufacture the accepted
+        mechanical-refutation class. Drives the REAL producer
+        (gather_prereqs → evaluate_finding) with an errored
+        SpatchResult and feeds its record through the referee."""
+        from unittest import mock
+
+        import packages.coccinelle.prereqs as prereqs_mod
+        from packages.coccinelle.models import SpatchResult
+        from packages.coccinelle.prereqs import evaluate_finding
+
+        errored = SpatchResult(
+            rule="prereq-defs", returncode=2,
+            errors=["spatch: parse error"], elapsed_ms=10,
+        )
+        with mock.patch.object(prereqs_mod, "spatch_available",
+                               return_value=True), \
+             mock.patch.object(prereqs_mod, "_has_c_cpp_source",
+                               return_value=True), \
+             mock.patch.object(prereqs_mod, "_shipped_prereqs_rules_dir",
+                               return_value=Path("/nonexistent-rules")), \
+             mock.patch.object(prereqs_mod, "spatch_run_rules",
+                               return_value=[errored]):
+            facts = prereqs_mod.gather_prereqs(Path("/fake/target"))
+        record = evaluate_finding(
+            {"function": "vuln_fn", "file": "src/vuln.c"}, facts,
+        )
+
+        ann_dir, audit_out = self._setup(tmp_path, ["semgrep"])
+        report = self._report(tmp_path, {
+            "cocci_prereqs": record,
+            "ruling": {"status": "ruled_out",
+                        "disqualifier": "sanity_check_failed"},
+        })
+        import_validation_results(
+            validation_report=report, annotations_dir=ann_dir,
+            audit_out_dir=audit_out)
+        entry = _latest_journal_entry(audit_out, "src/vuln.c", "vuln_fn")
+        assert entry is not None
+        assert entry.verdict == "suspicious"
 
     def test_bare_sanity_failure_blocks_clean(self, tmp_path: Path):
         ann_dir, audit_out = self._setup(tmp_path, ["semgrep"])
@@ -1327,7 +1422,7 @@ class TestDowngradeReferee:
         _write_annotation_meta(
             ann_dir, "src/vuln.c", "vuln_fn",
             "status=finding source=human "
-            "provenance=interactive-tty tty=stdin",
+            "provenance=interactive-tty tty=stdin sid=inherited envm=trusted parents=bash",
             "operator confirmed",
         )
         report = self._report(tmp_path, {

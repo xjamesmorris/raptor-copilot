@@ -7,6 +7,7 @@ radare2 installed.
 """
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -306,3 +307,46 @@ class TestCache:
             lambda: tmp_path / "w.bin" / "not-a-dir")  # parent is a file
         save_cached_cfgs(binary, {0x1: BasicBlockCFG(entry=0x1, adjacency={})})
         # Best-effort: no exception is the assertion.
+
+
+class TestCacheWriteSubstrate:
+    def test_save_routes_through_atomic_save_json(
+        self, tmp_path, cache_dir,
+    ):
+        """Cache saves must go through core.json.save_json — the
+        hand-rolled predecessor used a CONSTANT `.json.tmp` sidecar
+        per key, racing concurrent saves on the same tempfile."""
+        from unittest.mock import patch
+
+        import core.json as core_json
+
+        real_save = core_json.save_json
+        calls = []
+
+        def spy(path, data, *args, **kwargs):
+            calls.append(path)
+            return real_save(path, data, *args, **kwargs)
+
+        binary = _make_binary(tmp_path, "atomic.bin")
+        cfgs = {0x10: BasicBlockCFG(entry=0x10, adjacency={0x10: []})}
+        with patch.object(core_json, "save_json", side_effect=spy):
+            save_cached_cfgs(binary, cfgs)
+
+        # The patch window is process-global: background work from
+        # other components may legitimately route saves through the
+        # same chokepoint while it is open, so count only writes into
+        # this test's cache dir.
+        cache_calls = [p for p in calls if Path(p).parent == cache_dir]
+        assert len(cache_calls) == 1
+        # No constant-name tempfile sidecar left (or racing) on disk.
+        assert list(cache_dir.glob("*.json.tmp")) == []
+        assert load_cached_cfgs(binary) is not None
+
+    def test_content_sha_matches_core_hash(self, tmp_path):
+        from core.hash import sha256_file
+
+        from packages.binary_analysis.function_cfg import _content_sha
+
+        binary = _make_binary(tmp_path, "hash.bin", b"some bytes")
+        assert _content_sha(binary) == sha256_file(binary)
+        assert _content_sha(tmp_path / "missing.bin") is None

@@ -43,6 +43,80 @@ def display_rule_id(rule_id: str | None) -> str:
     return short
 
 
+#: Security verdicts a validate-pipeline stage can issue. Provenance
+#: strings (test_code / dead_code / validated) are deliberately absent
+#: — see _stage_ruling_status.
+_SECURITY_RULING_STATUSES = frozenset({
+    "ruled_out", "ruled_out_unverified", "disproven", "confirmed",
+    "exploitable",
+})
+
+#: Display strings (prefixes) reserved for the exact status_map
+#: entries in get_display_status. The open title-case fallback exists
+#: so NEW non-verdict statuses render without a table update — but it
+#: must never mint verdict vocabulary: "EXPLOITABLE" misses every
+#: exact map key yet title-cases to "Exploitable", which
+#: build_findings_summary counts as a full exploitable verdict (and
+#: its startswith("Confirmed") / startswith("Error") buckets make the
+#: whole prefix space counting-relevant, not just exact strings).
+#: Fallback results matching these prefixes render as "Unknown".
+_VERDICT_DISPLAY_PREFIXES = (
+    "Exploitable", "Confirmed", "Ruled Out", "False Positive",
+    "Unconfirmed", "Error", "Disproven",
+)
+
+_AGENTIC_NEGATIVE_RULINGS = {
+    "false_positive": "False Positive",
+    "mitigated": "Mitigated",
+    "test_code": "Test Code",
+    "dead_code": "Dead Code",
+    "unreachable": "Unreachable",
+}
+
+
+def _agentic_negative_ruling(finding: dict[str, Any]) -> str:
+    """Return a categorical agentic negative ruling, if present.
+
+    ``is_true_positive=False`` remains the coarse vulnerability verdict, but
+    agentic analysis also records why it was negative. Preserve that typed
+    status in reports instead of collapsing ``mitigated`` and ``test_code``
+    into an undifferentiated False Positive bucket.
+    """
+    ruling = finding.get("ruling")
+    if isinstance(ruling, dict):
+        status = ruling.get("agentic_ruling") or ruling.get("status")
+    else:
+        status = ruling
+    return _AGENTIC_NEGATIVE_RULINGS.get(str(status or "").strip().lower(), "")
+
+
+def _stage_ruling_status(finding: dict[str, Any]) -> str:
+    """A validate-pipeline security ruling for the finding, or "".
+
+    Present when Stage E/F set a ``final_status``, Stage D issued a
+    dict ruling whose status is one of the security verdicts, or the
+    top-level ``status`` carries one (the IRIS Tier-1 gate refutes by
+    setting top-level ``status="disproven"`` only, with no ruling
+    object). The agentic pipeline's provenance rulings (``test_code``,
+    ``dead_code``, ``validated`` — bare strings, or dict-wrapped by
+    the agentic→validate bridge) do not count: they describe code
+    provenance, not exploitability, and must not outrank the boolean
+    verdict fields.
+    """
+    final = finding.get("final_status", "")
+    if final:
+        return str(final)
+    ruling = finding.get("ruling")
+    if isinstance(ruling, dict):
+        status = ruling.get("status", "")
+        if status in _SECURITY_RULING_STATUSES:
+            return status
+    status = finding.get("status", "")
+    if status in _SECURITY_RULING_STATUSES:
+        return status
+    return ""
+
+
 def get_display_status(finding: dict[str, Any]) -> str:
     """Derive human-readable display status from a finding dict.
 
@@ -86,10 +160,34 @@ def get_display_status(finding: dict[str, Any]) -> str:
         tp = _coerce_bool(finding.get("is_true_positive"))
         ex = _coerce_bool(finding.get("is_exploitable"))
         if tp is False:
-            return "False Positive"
+            # The boolean is the coarse "not a true positive" verdict;
+            # a typed agentic ruling refines that outcome instead of
+            # collapsing every negative assessment into False Positive.
+            return _agentic_negative_ruling(finding) or "False Positive"
+        # is_exploitable=True beside a ruled_out/disproven ruling is a
+        # contradictory shape no mechanical stage produces (prepare_F
+        # derives is_exploitable FROM final_status, and the provenance
+        # chokepoint demotes forged feasibility claims) — the boolean
+        # keeps priority here rather than guessing which side lied.
         if ex is True:
             return "Exploitable"
         if tp is True:
+            # Agentic can confirm that a dangerous pattern is real while
+            # ruling practical exploitation out because it is unreachable,
+            # dead code, or already mitigated. Preserve that typed ruling
+            # instead of flattening every real-but-non-exploitable bug to
+            # "Confirmed". ``test_code`` remains provenance-only and keeps
+            # the historical boolean behavior below.
+            negative = _agentic_negative_ruling(finding)
+            if negative in {"Unreachable", "Dead Code", "Mitigated"}:
+                return negative
+        # is_true_positive means "real bug", not "security-confirmed":
+        # a validate finding can be a true positive whose Stage-D
+        # ruling still rules it out (D-4 no security impact, D-2
+        # unreachable). When a security ruling exists it decides the
+        # display status; the bare boolean only stands in when no
+        # ruling was issued (agentic pipeline, mid-pipeline states).
+        if tp is True and not _stage_ruling_status(finding):
             return "Confirmed"
 
     # final_status is authoritative (set after Stage E feasibility adjustment)
@@ -116,6 +214,11 @@ def get_display_status(finding: dict[str, Any]) -> str:
         # meaning.
         "confirmed_unverified": "Confirmed (Unverified)",
         "ruled_out": "Ruled Out",
+        # Explicit entry for the same reason as confirmed_unverified:
+        # the title-case fallback would render "Ruled Out Unverified"
+        # and the counting code's exact-match buckets would file it
+        # under "other" instead of its own bucket.
+        "ruled_out_unverified": "Ruled Out (Unverified)",
         "false_positive": "False Positive",
         "poc_success": "Exploitable",
         "not_disproven": "Unconfirmed",
@@ -126,7 +229,18 @@ def get_display_status(finding: dict[str, Any]) -> str:
         "mitigated": "Ruled Out",
         "unreachable": "Ruled Out",
     }
-    return status_map.get(status, status.replace("_", " ").title() if status else "Unknown")
+    mapped = status_map.get(status)
+    if mapped is not None:
+        return mapped
+    if not status:
+        return "Unknown"
+    # Open fallback for unknown NON-verdict statuses only — verdict
+    # vocabulary comes exclusively from the exact map entries above
+    # (see _VERDICT_DISPLAY_PREFIXES).
+    title = status.replace("_", " ").title()
+    if title.startswith(_VERDICT_DISPLAY_PREFIXES):
+        return "Unknown"
+    return title
 
 
 _DISPLAY_NAMES = {
@@ -181,8 +295,20 @@ def truncate_path(path: str, max_len: int = 40) -> str:
     # display width until adding the next char would exceed
     # max_len - 3. `_display_width` belongs to console module — local
     # import to avoid an unconditional dependency.
-    from core.reporting.console import _display_width
+    from core.reporting.console import _cell_code_point_cap, _display_width
+    # Display width alone cannot bound the LENGTH of the result:
+    # combining marks are zero columns wide, so a path component
+    # flooded with them (≤255 bytes per component, thousands across a
+    # multi-component path from a scanned repo) reports a tiny width
+    # while carrying thousands of code points into the column the
+    # caller sized for max_len. Enforce the shared code-point ceiling
+    # in both branches; legitimate paths never approach 4 code points
+    # per display column, and a flood cut mid-cluster is already
+    # unrenderable text.
+    hard_cap = _cell_code_point_cap(max_len)
     if _display_width(path) <= max_len:
+        if len(path) > hard_cap:
+            return "..." + path[-hard_cap:]
         return path
     target = max_len - 3
     suffix_chars: list[str] = []
@@ -195,6 +321,8 @@ def truncate_path(path: str, max_len: int = 40) -> str:
             break
         suffix_chars.append(ch)
         width += w
+        if len(suffix_chars) >= hard_cap:
+            break  # zero-width flood: bound code points, not just width
     return "..." + "".join(reversed(suffix_chars))
 
 

@@ -159,6 +159,34 @@ def test_radare2_failure_is_reported_as_unavailable_not_empty_success(tmp_path: 
     assert "radare2 analysis unavailable" in report
 
 
+def test_exported_data_demotion_count_surfaces_in_report(tmp_path: Path) -> None:
+    """The exported_data demotion must stay operator-visible end to
+    end: the type byte that drives it is attacker-controlled, so a
+    demotion that only lives in JSON would still be a quiet
+    surface-hiding lever."""
+    binary = _write_binary(tmp_path / "sample", b"\x7fELF" + b"\x00" * 128)
+    out = tmp_path / "out"
+    ctx = BinaryContextMap(
+        binary_path=binary, arch="x86", bits=64, binary_format="elf",
+    )
+    ctx.exports = ["demo_parse", "demo_limits_table"]
+    ctx.export_types = {"demo_parse": "FUNC", "demo_limits_table": "OBJ"}
+
+    with patch(
+        "packages.binary_analysis.pipeline.analyse_binary_context",
+        return_value=ctx,
+    ):
+        result = analyse_blackbox_binary(binary, out_dir=out)
+
+    demoted = [
+        item for item in result.context_map["external_ingress_candidates"]
+        if item["kind"] == "exported_data"
+    ]
+    assert [item["name"] for item in demoted] == ["demo_limits_table"]
+    report = (out / "binary-analysis-report.md").read_text()
+    assert "- Exported data symbols demoted below API exports: 1" in report
+
+
 def test_input_channels_upgrade_only_when_runtime_observed() -> None:
     channels, static_evidence = recover_static_channels("a" * 64, ["recv", "getenv"])
     assert {channel.kind for channel in channels} == {"network", "environment"}
@@ -765,16 +793,33 @@ def test_load_investigation_summary_truncates_ranked(tmp_path):
 def test_c_string_null_byte():
     from packages.binary_analysis.harness import _c_string
 
-    assert _c_string("a\x00b") == '"a\\0b"'
+    assert _c_string("a\x00b") == '"a\\000b"'
+
+
+def test_c_string_null_byte_before_digit_stays_two_tokens():
+    from packages.binary_analysis.harness import _c_string
+
+    # '\0' + '7' would parse as one octal escape \07 (BEL);
+    # fixed-width \000 cannot absorb the following digit.
+    assert _c_string("\x007") == '"\\0007"'
 
 
 def test_c_string_non_ascii():
     from packages.binary_analysis.harness import _c_string
 
-    result = _c_string("café")
-    assert result.startswith('"')
-    assert result.endswith('"')
-    assert "\\x" in result
+    # UTF-8 bytes as fixed-width octal — é is C3 A9.
+    assert _c_string("café") == '"caf\\303\\251"'
+
+
+def test_c_string_escape_never_absorbs_following_hex_digit():
+    from packages.binary_analysis.harness import _c_string
+
+    # Greedy C hex escapes made "é1" render as "\xe91" — a single
+    # out-of-range escape (miscompile or wrong byte). Octal escapes
+    # are fixed-width, so the literal '1' survives as itself.
+    result = _c_string("é1")
+    assert result == '"\\303\\2511"'
+    assert "\\x" not in result
 
 
 def test_c_string_empty():
@@ -823,3 +868,179 @@ def test_pipeline_handles_random_bytes(tmp_path):
         result = analyse_blackbox_binary(binary, out_dir=tmp_path / "out")
     assert result is not None
     assert (tmp_path / "out" / "binary-manifest.json").is_file()
+
+
+def test_fuzz_replay_join_survives_run_dir_relocation(tmp_path: Path) -> None:
+    # replay-summary.json is written at replay time and consumed by a
+    # later process that re-enumerates the crash files — the join key
+    # is the crash BASENAME so a moved/adopted run dir (any absolute
+    # spelling drift) does not silently detach the REPLAYED_CRASH tier.
+    binary = _write_binary(tmp_path / "sample", b"\x7fELF" + b"\x00" * 128)
+    out = tmp_path / "out"
+    ctx = BinaryContextMap(binary_path=binary, arch="x86", bits=64, binary_format="elf")
+    ctx.entry_points = [FunctionInfo(name="main", address=0x401000, size=64, is_entry=True)]
+    ctx.interesting_functions = list(ctx.entry_points)
+
+    with patch("packages.binary_analysis.pipeline.analyse_binary_context", return_value=ctx):
+        analyse_blackbox_binary(binary, out_dir=out)
+
+    crashes_dir = out / "afl" / "main" / "crashes"
+    crashes_dir.mkdir(parents=True)
+    crash_name = "id:000001,sig:11,src:000000,op:havoc"
+    (crashes_dir / crash_name).write_bytes(b"boom")
+    replay_binary = _write_binary(tmp_path / "sample_asan", b"\x7fELF" + b"\x00" * 128)
+    replay_dir = out / "crash_analysis" / "replay"
+    replay_dir.mkdir(parents=True)
+    # Basename key: the producer's shape. The recorded absolute path
+    # (pre-relocation) would never match the re-enumerated one.
+    (replay_dir / "replay-summary.json").write_text(json.dumps({
+        crash_name: [{
+            "binary": str(replay_binary),
+            "returncode": -11,
+            "stdout": str(replay_dir / "stdout.log"),
+            "stderr": str(replay_dir / "stderr.log"),
+            "reproduced": True,
+        }],
+    }))
+    (out / "fuzz-summary.json").write_text(json.dumps({
+        "fuzzer": "afl++",
+        "target": str(binary),
+        "crashes": 1,
+        "crashes_dir": str(crashes_dir),
+        "total_executions": 10,
+        "coverage_percent": 1.0,
+    }))
+
+    bundle = append_fuzz_evidence_to_run(binary, out_dir=out)
+
+    assert bundle is not None
+    assert len(bundle.crashes) == 1
+    assert bundle.crashes[0].replay_evidence_ids, (
+        "basename-keyed replay summary failed to join — the "
+        "REPLAYED_CRASH tier silently detached"
+    )
+    evidence = json.loads((out / "binary-evidence.json").read_text())["evidence"]
+    assert any(item["kind"] == "crash_replay" for item in evidence)
+
+
+def test_fuzz_replay_join_keeps_legacy_absolute_path_keys(tmp_path: Path) -> None:
+    # Summaries written by earlier runs keyed on absolute paths must
+    # stay joinable (fallback lookup) as long as the path spelling is
+    # unchanged — the exact shape the sibling test above relocates.
+    binary = _write_binary(tmp_path / "sample", b"\x7fELF" + b"\x00" * 128)
+    out = tmp_path / "out"
+    ctx = BinaryContextMap(binary_path=binary, arch="x86", bits=64, binary_format="elf")
+    ctx.entry_points = [FunctionInfo(name="main", address=0x401000, size=64, is_entry=True)]
+    ctx.interesting_functions = list(ctx.entry_points)
+
+    with patch("packages.binary_analysis.pipeline.analyse_binary_context", return_value=ctx):
+        analyse_blackbox_binary(binary, out_dir=out)
+
+    crashes_dir = out / "afl" / "main" / "crashes"
+    crashes_dir.mkdir(parents=True)
+    crash_path = crashes_dir / "id:000002,sig:06,src:000000,op:havoc"
+    crash_path.write_bytes(b"boom")
+    replay_binary = _write_binary(tmp_path / "sample_asan", b"\x7fELF" + b"\x00" * 128)
+    replay_dir = out / "crash_analysis" / "replay"
+    replay_dir.mkdir(parents=True)
+    (replay_dir / "replay-summary.json").write_text(json.dumps({
+        str(crash_path): [{
+            "binary": str(replay_binary),
+            "returncode": -6,
+            "stdout": str(replay_dir / "stdout.log"),
+            "stderr": str(replay_dir / "stderr.log"),
+            "reproduced": True,
+        }],
+    }))
+    (out / "fuzz-summary.json").write_text(json.dumps({
+        "fuzzer": "afl++",
+        "target": str(binary),
+        "crashes": 1,
+        "crashes_dir": str(crashes_dir),
+        "total_executions": 10,
+        "coverage_percent": 1.0,
+    }))
+
+    bundle = append_fuzz_evidence_to_run(binary, out_dir=out)
+
+    assert bundle is not None
+    assert bundle.crashes[0].replay_evidence_ids
+
+
+def test_analysis_scope_lanes_escaped(tmp_path: Path) -> None:
+    """The landed header fix _esc'd format/arch with a comment naming
+    the derivation hostile; the Analysis Scope section 25 lines below
+    rendered the SAME values raw (Manifest.from_dict accepts
+    unbounded strings from run-dir JSON)."""
+    from packages.binary_analysis.manifest import BinaryManifest
+    from packages.binary_analysis.pipeline import (
+        BinaryAnalysisResult,
+        _write_report,
+    )
+    hostile = "arm64\x1b]0;pwned\x07\x9b2J"
+    manifest = BinaryManifest(
+        schema_version=1, binary_path="/x", binary_sha256="0" * 64,
+        size_bytes=1, executable=True, target_kind="binary",
+        arch=hostile, bits=64, binary_format="elf")
+    result = BinaryAnalysisResult(
+        manifest=manifest,
+        context_map={"analysis_scope": {
+            "selected_arch": hostile,
+            "deep_analysis_arch": hostile,
+            "analysis_depth": "full\x1b[2J",
+            "slice_count": "2\x1b[31m",
+        }},
+        evidence=[], input_channels=[], graph_path=Path("/g"),
+        decompilations={"coverage": {"decompiler": "r2\x1b[9A"}})
+    _write_report(result, tmp_path)
+    text = (tmp_path / "binary-analysis-report.md").read_text(
+        encoding="utf-8")
+    assert "Analysis Scope" in text
+    for raw in ("\x1b", "\x07", "\x9b"):
+        assert raw not in text
+
+
+def test_analyse_path_context_map_evidence_is_self_contained(tmp_path: Path) -> None:
+    """Every evidence id referenced from the map's candidate arrays
+    must resolve within the map's OWN embedded evidence list on the
+    analyse path — records minted after _context_map (external
+    ingress, runtime-parser flows, parser boundaries) previously
+    reached binary-evidence.json but dangled inside the document
+    until a later append rewrote it."""
+    binary = _write_binary(tmp_path / "sample", b"\x7fELF" + b"\x00" * 128)
+    out = tmp_path / "out"
+    ctx = BinaryContextMap(
+        binary_path=binary,
+        arch="x86",
+        bits=64,
+        binary_format="elf",
+        analysis_depth="full",
+    )
+    ctx.imports = ["recv", "read", "fopen"]
+
+    with patch("packages.binary_analysis.pipeline.analyse_binary_context", return_value=ctx):
+        result = analyse_blackbox_binary(binary, out_dir=out)
+
+    context_map = json.loads((out / "binary-context-map.json").read_text())
+    embedded_ids = {
+        item.get("id") for item in context_map.get("evidence", [])
+        if isinstance(item, dict)
+    }
+    # Whole-document parity with the sidecar first.
+    sidecar = json.loads((out / "binary-evidence.json").read_text())
+    sidecar_ids = {item.get("id") for item in sidecar["evidence"]}
+    assert embedded_ids == sidecar_ids
+    # And no candidate's evidence_ids dangle within the document.
+    for key in (
+        "external_ingress_candidates",
+        "parser_boundary_candidates",
+        "sources",
+    ):
+        for candidate in context_map.get(key, []) or []:
+            if not isinstance(candidate, dict):
+                continue
+            for evidence_id in candidate.get("evidence_ids", []) or []:
+                assert evidence_id in embedded_ids, (
+                    f"{key} references {evidence_id} missing from the "
+                    "map's embedded evidence")
+    assert result.context_map["evidence"] == context_map["evidence"]

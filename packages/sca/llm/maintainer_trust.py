@@ -92,6 +92,14 @@ def assess_batch(
     return results
 
 
+# Per-field cap for registry-sourced strings in the prompt block:
+# registry metadata is attacker-influenced, and an uncapped field
+# would let one hostile value dominate the prompt. (This module
+# renders metadata fields only — readme_preview is rendered, and
+# separately capped, by slopsquat_verdict.)
+_FIELD_CAP = 200
+
+
 def _format_metadata(dep: Dependency, meta: dict[str, Any]) -> str:
     """Render metadata into a structured text block for the LLM."""
     lines = [
@@ -100,17 +108,23 @@ def _format_metadata(dep: Dependency, meta: dict[str, Any]) -> str:
     ]
 
     maintainers = meta.get("maintainers", [])
-    if maintainers:
+    if isinstance(maintainers, list) and maintainers:
+        from .registry_view import iter_maintainers
+
         lines.append(f"Maintainers ({len(maintainers)}):")
-        for m in maintainers[:20]:
-            name = m.get("name", m.get("username", "?"))
-            email = m.get("email", "")
-            added = m.get("added", "")
-            line = f"  - {name}"
+        # iter_maintainers skips hostile entry shapes (non-dict rows,
+        # non-string fields) so a poisoned packument degrades instead
+        # of raising out of the review stage.
+        for name, email, added in iter_maintainers(meta, 20):
+            # Per-field caps: registry-sourced strings are attacker
+            # publishable; 20 maintainers x unbounded names/emails is
+            # an easy budget-domination channel into a trust verdict
+            # (same rationale as the readme_preview cap).
+            line = f"  - {name[:_FIELD_CAP]}"
             if email:
-                line += f" <{email}>"
+                line += f" <{email[:_FIELD_CAP]}>"
             if added:
-                line += f" (added {added})"
+                line += f" (added {added[:_FIELD_CAP]})"
             lines.append(line)
 
     publish_dates = meta.get("publish_dates", [])
@@ -119,7 +133,7 @@ def _format_metadata(dep: Dependency, meta: dict[str, Any]) -> str:
 
     repo = meta.get("repository_url", "")
     if repo:
-        lines.append(f"Repository: {repo}")
+        lines.append(f"Repository: {str(repo)[:_FIELD_CAP]}")
 
     downloads = meta.get("download_count")
     if downloads is not None:
@@ -127,11 +141,11 @@ def _format_metadata(dep: Dependency, meta: dict[str, Any]) -> str:
 
     deprecated = meta.get("deprecated")
     if deprecated:
-        lines.append(f"Deprecated: {deprecated}")
+        lines.append(f"Deprecated: {str(deprecated)[:_FIELD_CAP]}")
 
     for key in ("stars", "open_issues", "last_commit_date"):
         val = meta.get(key)
         if val is not None:
-            lines.append(f"{key}: {val}")
+            lines.append(f"{key}: {str(val)[:_FIELD_CAP]}")
 
     return "\n".join(lines)

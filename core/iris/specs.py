@@ -11,6 +11,7 @@ taint specifications doubled CodeQL's finding count vs stock rules.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -18,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from core.evidence import EvidenceTier
+from core.orchestration.llm_json import strip_json_fences
 from core.json import dumps_artifact
 
 logger = logging.getLogger(__name__)
@@ -135,13 +137,11 @@ def parse_spec_response(raw: str) -> list[TaintSpec]:
     specs = []
 
     cleaned = raw.strip()
-    # Strip fences: find the first ``` and last ```, keep only between
+    # A fence may follow prose: drop everything before the first one,
+    # then take that fenced block's payload.
     fence_start = cleaned.find("```")
     if fence_start >= 0:
-        after_fence = cleaned[fence_start:]
-        lines = after_fence.splitlines()
-        lines = [ln for ln in lines if not ln.strip().startswith("```")]
-        cleaned = "\n".join(lines)
+        cleaned = strip_json_fences(cleaned[fence_start:])
 
     for line in cleaned.splitlines():
         line = line.strip()
@@ -280,83 +280,160 @@ def compile_joern_config(specs: list[TaintSpec]) -> str:
     return "\n".join(lines)
 
 
-_CODEQL_LANG_IMPORTS: dict[str, tuple] = {
-    "cpp": (
-        "semmle.code.cpp.dataflow.DataFlow",
-        "semmle.code.cpp.dataflow.TaintTracking",
+# Per-language QL fragments for the generated query. The three helper
+# predicates are the ONLY language-specific surface — everything else
+# in the generated query (Config module, Flow instantiation, select /
+# message building) is language-independent, so a new language is one
+# registry row, not a new query shape.
+#
+# Why per-language helpers instead of one ``DataFlow::CallNode``
+# pattern: ``DataFlow::CallNode`` only exists in the JS/Go/Ruby
+# libraries (and only Go's has ``getTarget()``).  cpp/java/csharp
+# match calls through ``Node.asExpr()`` on their AST call class;
+# python matches through ``CallCfgNode``.  A single spelling can NEVER
+# compile across languages — each row below is compile-verified
+# against its stock ``codeql/<lang>-all`` pack (the e2e closure test
+# recompiles them against the locally cached packs).
+#
+# Helper contract (identical across languages):
+#   irisCallResult(n, name) — n is the result value of a call to a
+#     function/method named ``name`` (source + sanitiser-barrier form)
+#   irisCallArg(n, name)    — n is an argument of such a call (sink form)
+#   irisCallStep(pred, succ, name) — pred is an argument and succ the
+#     result of such a call (propagator taint step)
+
+
+@dataclass(frozen=True)
+class _LangQL:
+    """Language row: import lines + the three helper predicates."""
+
+    imports: tuple[str, ...]
+    helpers: str
+
+
+_CPP_STYLE_HELPERS = """\
+predicate irisCallResult(DataFlow::Node n, string name) {{
+  n.asExpr().({call_cls}).{target}.hasName(name)
+}}
+
+predicate irisCallArg(DataFlow::Node n, string name) {{
+  exists({call_cls} c | c.{target}.hasName(name) and n.asExpr() = c.getAnArgument())
+}}
+
+predicate irisCallStep(DataFlow::Node pred, DataFlow::Node succ, string name) {{
+  exists({call_cls} c |
+    c.{target}.hasName(name) and
+    pred.asExpr() = c.getAnArgument() and
+    succ.asExpr() = c
+  )
+}}"""
+
+_CALLNODE_STYLE_HELPERS = """\
+predicate irisCallTo({call_node} c, string name) {{
+  {match}
+}}
+
+predicate irisCallResult(DataFlow::Node n, string name) {{ irisCallTo(n, name) }}
+
+predicate irisCallArg(DataFlow::Node n, string name) {{
+  exists({call_node} c | irisCallTo(c, name) and n = c.{arg})
+}}
+
+predicate irisCallStep(DataFlow::Node pred, DataFlow::Node succ, string name) {{
+  exists({call_node} c | irisCallTo(c, name) and pred = c.{arg} and succ = c)
+}}"""
+
+_CODEQL_LANG_QL: dict[str, _LangQL] = {
+    "cpp": _LangQL(
+        imports=(
+            "import cpp",
+            "import semmle.code.cpp.dataflow.new.DataFlow",
+            "import semmle.code.cpp.dataflow.new.TaintTracking",
+        ),
+        helpers=_CPP_STYLE_HELPERS.format(
+            call_cls="Call", target="getTarget()",
+        ),
     ),
-    "java": (
-        "semmle.code.java.dataflow.DataFlow",
-        "semmle.code.java.dataflow.TaintTracking",
+    "java": _LangQL(
+        imports=(
+            "import java",
+            "import semmle.code.java.dataflow.DataFlow",
+            "import semmle.code.java.dataflow.TaintTracking",
+        ),
+        helpers=_CPP_STYLE_HELPERS.format(
+            call_cls="MethodCall", target="getMethod()",
+        ),
     ),
-    "javascript": (
-        "semmle.javascript.dataflow.DataFlow",
-        "semmle.javascript.dataflow.TaintTracking",
+    "csharp": _LangQL(
+        imports=(
+            "import csharp",
+            "import semmle.code.csharp.dataflow.DataFlow",
+            "import semmle.code.csharp.dataflow.TaintTracking",
+        ),
+        helpers=_CPP_STYLE_HELPERS.format(
+            call_cls="MethodCall", target="getTarget()",
+        ),
     ),
-    "python": (
-        "semmle.python.dataflow.new.DataFlow",
-        "semmle.python.dataflow.new.TaintTracking",
+    "python": _LangQL(
+        imports=(
+            "import python",
+            "import semmle.python.dataflow.new.DataFlow",
+            "import semmle.python.dataflow.new.TaintTracking",
+        ),
+        helpers=_CALLNODE_STYLE_HELPERS.format(
+            call_node="DataFlow::CallCfgNode",
+            match=(
+                "c.getFunction().asCfgNode().(NameNode).getId() = name\n"
+                "  or\n"
+                "  c.getFunction().asCfgNode().(AttrNode).getName() = name"
+            ),
+            arg="getArg(_)",
+        ),
     ),
-    "csharp": (
-        "semmle.code.csharp.dataflow.DataFlow",
-        "semmle.code.csharp.dataflow.TaintTracking",
+    "javascript": _LangQL(
+        imports=("import javascript",),
+        helpers=_CALLNODE_STYLE_HELPERS.format(
+            call_node="DataFlow::CallNode",
+            match="c.getCalleeName() = name",
+            arg="getAnArgument()",
+        ),
     ),
-    "go": (
-        "semmle.go.dataflow.DataFlow",
-        "semmle.go.dataflow.TaintTracking",
+    "go": _LangQL(
+        imports=("import go",),
+        helpers=_CALLNODE_STYLE_HELPERS.format(
+            call_node="DataFlow::CallNode",
+            match="c.getTarget().getName() = name",
+            arg="getAnArgument()",
+        ),
     ),
-    "ruby": (
-        "codeql.ruby.dataflow.DataFlow",
-        "codeql.ruby.dataflow.TaintTracking",
+    "ruby": _LangQL(
+        imports=(
+            "import codeql.ruby.DataFlow",
+            "import codeql.ruby.TaintTracking",
+        ),
+        helpers=_CALLNODE_STYLE_HELPERS.format(
+            call_node="DataFlow::CallNode",
+            match="c.getMethodName() = name",
+            arg="getArgument(_)",
+        ),
     ),
 }
 
-
-def _source_predicate(specs: list[TaintSpec]) -> str:
-    """Build a disjunction matching source function calls."""
-    parts = []
-    for s in specs:
-        safe = _escape_codeql(s.function)
-        parts.append(
-            f'    n.(DataFlow::CallNode).getTarget().hasName("{safe}")'
-        )
-    return " or\n".join(parts)
+#: Languages ``compile_codeql_config`` can generate a compilable query
+#: for (CodeQL canonical names). Callers gate on this BEFORE compiling;
+#: an unsupported language raises rather than silently producing a
+#: query for the wrong language's library.
+CODEQL_QUERY_LANGUAGES: frozenset[str] = frozenset(_CODEQL_LANG_QL)
 
 
-def _barrier_predicate(specs: list[TaintSpec]) -> str:
-    """Build a disjunction matching sanitiser call nodes as barriers."""
-    parts = []
-    for s in specs:
-        safe = _escape_codeql(s.function)
-        parts.append(
-            f'    exists(DataFlow::CallNode c | '
-            f'c.getTarget().hasName("{safe}") and n = c)'
-        )
-    return " or\n".join(parts)
-
-
-def _sink_predicate(specs: list[TaintSpec]) -> str:
-    """Build a disjunction matching arguments of sink function calls."""
-    parts = []
-    for s in specs:
-        safe = _escape_codeql(s.function)
-        parts.append(
-            f'    exists(DataFlow::CallNode c | '
-            f'c.getTarget().hasName("{safe}") and n = c.getAnArgument())'
-        )
-    return " or\n".join(parts)
-
-
-def _propagator_predicate(specs: list[TaintSpec]) -> str:
-    """Build a disjunction of additional taint steps through propagator calls."""
-    parts = []
-    for s in specs:
-        safe = _escape_codeql(s.function)
-        parts.append(
-            f'    exists(DataFlow::CallNode c | '
-            f'c.getTarget().hasName("{safe}") '
-            f"and pred = c.getAnArgument() and succ = c)"
-        )
+def _name_disjunction(
+    specs: list[TaintSpec], template: str,
+) -> str:
+    """Disjunction of ``template`` instantiated per spec function name."""
+    parts = [
+        "    " + template.format(name=_escape_codeql(s.function))
+        for s in specs
+    ]
     return " or\n".join(parts)
 
 
@@ -368,10 +445,23 @@ def compile_codeql_config(specs: list[TaintSpec], *, language: str = "cpp") -> s
     sources and sinks are present, produces a full taint-tracking
     path-problem query.  When only sinks are present, produces a
     simpler query reporting all matching call sites.
+
+    ``language`` must be a member of ``CODEQL_QUERY_LANGUAGES``
+    (CodeQL canonical names); anything else raises ``ValueError``.
+    Fail-closed by design: the pre-registry version silently fell back
+    to the cpp imports for unknown languages and emitted call-matching
+    QL that existed in no language's library — every generated query
+    failed to compile and the confirmation lane was dead while
+    reporting per-round tool errors only.
     """
-    df_import, tt_import = _CODEQL_LANG_IMPORTS.get(
-        language, _CODEQL_LANG_IMPORTS["cpp"],
-    )
+    lang_ql = _CODEQL_LANG_QL.get(language)
+    if lang_ql is None:
+        supported = ", ".join(sorted(_CODEQL_LANG_QL))
+        msg = (
+            f"unsupported CodeQL query language {language!r} "
+            f"(supported: {supported})"
+        )
+        raise ValueError(msg)
 
     sources = [s for s in specs if s.role == "source"]
     sinks = [s for s in specs if s.role == "sink"]
@@ -392,30 +482,38 @@ def compile_codeql_config(specs: list[TaintSpec], *, language: str = "cpp") -> s
         " * @tags security",
         " */",
         "",
-        f"import {df_import}",
-        f"import {tt_import}",
+        *lang_ql.imports,
+        "",
+        lang_ql.helpers,
         "",
     ]
 
     if sources and sinks:
         lines.append("private module Config implements DataFlow::ConfigSig {")
         lines.append("  predicate isSource(DataFlow::Node n) {")
-        lines.append(_source_predicate(sources))
+        lines.append(_name_disjunction(
+            sources, 'irisCallResult(n, "{name}")'))
         lines.append("  }")
         lines.append("")
         lines.append("  predicate isSink(DataFlow::Node n) {")
-        lines.append(_sink_predicate(sinks))
+        lines.append(_name_disjunction(
+            sinks, 'irisCallArg(n, "{name}")'))
         lines.append("  }")
         if sanitisers:
             lines.append("")
             lines.append("  predicate isBarrier(DataFlow::Node n) {")
-            lines.append(_barrier_predicate(sanitisers))
+            lines.append(_name_disjunction(
+                sanitisers, 'irisCallResult(n, "{name}")'))
             lines.append("  }")
         if propagators:
             lines.append("")
-            lines.append("  predicate isAdditionalTaintStep"
+            # ConfigSig's member is isAdditionalFlowStep (the old
+            # class-based API's isAdditionalTaintStep does not exist
+            # in the module API and fails compilation).
+            lines.append("  predicate isAdditionalFlowStep"
                          "(DataFlow::Node pred, DataFlow::Node succ) {")
-            lines.append(_propagator_predicate(propagators))
+            lines.append(_name_disjunction(
+                propagators, 'irisCallStep(pred, succ, "{name}")'))
             lines.append("  }")
         lines.append("}")
         lines.append("")
@@ -423,25 +521,87 @@ def compile_codeql_config(specs: list[TaintSpec], *, language: str = "cpp") -> s
         lines.append("")
         lines.append("import Flow::PathGraph")
         lines.append("")
-        lines.append("from Flow::PathNode source, Flow::PathNode sink")
-        lines.append("where Flow::flowPath(source, sink)")
+        # The result message MUST carry a machine-joinable identity
+        # for the matched source/sink specs: the runner's confirmation
+        # match-back (core.iris.codeql_runner._match_to_spec_keys)
+        # extracts the `[src=<token> sink=<token>]` suffix and maps
+        # each token back to its spec via spec_message_token. Fixed
+        # messages made confirmed_keys always empty — no XREF_BACKED
+        # promotion, no scorecard outcome, ever. Tokens (not free-text
+        # function names) are the join: names are LLM-derived from the
+        # studied repo, so a spec named after message boilerplate
+        # ("data", "sink") or a same-named spec in another file/role
+        # would false-confirm off a name search. Each token is bound
+        # from the same irisCall* name constraint its Config predicate
+        # uses; the human-readable name rides along for the operator.
+        src_parts = []
+        for s in sources:
+            safe = _escape_codeql(s.function)
+            tok = spec_message_token(s)
+            src_parts.append(
+                f'    (irisCallResult(source.getNode(), "{safe}") '
+                f'and srcName = "{safe}" and srcKey = "{tok}")'
+            )
+        snk_parts = []
+        for s in sinks:
+            safe = _escape_codeql(s.function)
+            tok = spec_message_token(s)
+            snk_parts.append(
+                f'    (irisCallArg(sink.getNode(), "{safe}") '
+                f'and snkName = "{safe}" and snkKey = "{tok}")'
+            )
+        lines.append("from Flow::PathNode source, Flow::PathNode sink, "
+                     "string srcName, string srcKey, "
+                     "string snkName, string snkKey")
+        lines.append("where")
+        lines.append("  Flow::flowPath(source, sink) and")
+        lines.append("  (")
+        lines.append(" or\n".join(src_parts))
+        lines.append("  ) and")
+        lines.append("  (")
+        lines.append(" or\n".join(snk_parts))
+        lines.append("  )")
         lines.append('select sink.getNode(), source, sink,')
-        lines.append('  "IRIS: tainted data from $@ reaches project-specific sink",')
-        lines.append('  source.getNode(), "this source"')
+        lines.append('  "IRIS: tainted data from $@ reaches '
+                     'project-specific sink " + snkName')
+        lines.append('    + " [src=" + srcKey + " sink=" + snkKey + "]",')
+        lines.append('  source.getNode(), srcName')
     elif sinks:
-        lines.append("from DataFlow::Node sink")
+        # Same match-back contract as the path-problem branch: the
+        # message must carry the sink spec's join token.
+        lines.append("from DataFlow::Node sink, string snkName, "
+                     "string snkKey")
         lines.append("where")
         sink_parts = []
         for s in sinks:
             safe = _escape_codeql(s.function)
+            tok = spec_message_token(s)
             sink_parts.append(
-                f'    exists(DataFlow::CallNode c | '
-                f'c.getTarget().hasName("{safe}") and sink = c.getAnArgument())'
+                f'    (irisCallArg(sink, "{safe}") '
+                f'and snkName = "{safe}" and snkKey = "{tok}")'
             )
         lines.append(" or\n".join(sink_parts))
-        lines.append('select sink, "Argument to IRIS-identified project sink"')
+        lines.append('select sink, "Argument to IRIS-identified '
+                     'project sink " + snkName')
+        lines.append('    + " [sink=" + snkKey + "]"')
 
     return "\n".join(lines)
+
+
+def spec_message_token(spec: TaintSpec) -> str:
+    """Stable join token binding a generated-query result to its spec.
+
+    Hash of the spec's full identity — the same ``file\\0function\\
+    0role`` triple ``store._spec_key`` uses — so same-named specs in
+    different files/roles get distinct tokens and cannot cross-bleed
+    a confirmation. Emitted into query result messages as
+    ``src=<token>`` / ``sink=<token>`` by ``compile_codeql_config``;
+    ``codeql_runner._match_to_spec_keys`` maps it back. 48 bits over
+    a per-run spec list (tens of rows) — collision-safe for the join.
+    Hex-only, so it needs no CodeQL string escaping.
+    """
+    identity = f"{spec.file}\0{spec.function}\0{spec.role}"
+    return hashlib.sha256(identity.encode()).hexdigest()[:12]
 
 
 def _escape_codeql(name: str) -> str:
@@ -455,8 +615,13 @@ def _escape_scala(name: str) -> str:
 
     The result is embedded in a Scala double-quoted string literal,
     so we must escape both regex metacharacters AND Scala string
-    characters (backslash and double-quote).
+    characters (backslash and double-quote). Control characters are
+    stripped first (mirroring _escape_codeql): re.escape keeps a raw
+    newline as-is, which would break the single-line Scala literal —
+    one malformed LLM-derived spec name then kills the whole generated
+    Joern config compile.
     """
+    name = name.replace("\n", "").replace("\r", "").replace("\0", "")
     escaped = re.escape(name)
     return escaped.replace("\\", "\\\\").replace('"', '\\"')
 

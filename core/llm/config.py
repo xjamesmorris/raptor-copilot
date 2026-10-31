@@ -17,7 +17,17 @@ from pathlib import Path
 from typing import Any, Optional
 
 from core.logging import get_logger
+from core.security.session_services import (
+    report_session_service_policy,
+    session_services_restricted,
+)
 
+from .accounting import (
+    TrustedUsdRoute,
+    UsdBudgetContract,
+    normalize_budget_contract,
+    normalize_trusted_routes,
+)
 from .detection import (
     OPENAI_SDK_AVAILABLE,
     _get_available_ollama_models,
@@ -78,6 +88,13 @@ def _get_configured_models() -> list[dict]:
 
     The JSON file supports // line comments (stripped before parsing).
     Uses _read_config_models() from detection.py for shared parsing logic.
+
+    Raises:
+        core.llm.models_config_perm.WorldReadableModelsConfigError:
+            the config file is group/other-readable AND carries inline
+            API keys (and the override env is not set) — the shared
+            fail-closed permission gate, identical to the dispatcher
+            seeder's. The message names the ``chmod 600`` remedy.
     """
     return _read_config_models()
 
@@ -198,16 +215,20 @@ def _get_best_thinking_model() -> Optional['ModelConfig']:
                                 if env_key:
                                     api_key = os.getenv(env_key)
 
-                            # Determine cost (dated ids resolve their
-                            # undated catalog entry, same ladder as
-                            # _model_config_from_entry)
-                            cost_info = (MODEL_COSTS.get(entry_model, {})
-                                         or MODEL_COSTS.get(entry_model_undated, {}))
+                            # Determine cost/limits via the canonical
+                            # resolver chain — the same one
+                            # _model_config_from_entry uses (dated,
+                            # prefixed, and combined id forms all
+                            # resolve their catalog row).
+                            from core.llm.model_data import (
+                                resolve_model_costs,
+                                resolve_model_limits,
+                            )
+                            cost_info = resolve_model_costs(entry_model) or {}
                             cost_per_1k = (cost_info.get('input', 0.005) + cost_info.get('output', 0.005)) / 2
 
                             # Determine max_tokens and max_context from config or limits
-                            limits = (MODEL_LIMITS.get(entry_model, {})
-                                      or MODEL_LIMITS.get(entry_model_undated, {}))
+                            limits = resolve_model_limits(entry_model) or {}
                             max_tokens = model_entry.get(
                                 'max_output',
                                 limits.get('max_output', _DEFAULT_MAX_OUTPUT_USER_CONFIGURED),
@@ -237,10 +258,10 @@ def _get_best_thinking_model() -> Optional['ModelConfig']:
                                 )
                                 api_base = f"{ollama_base.rstrip('/')}/v1"
                             else:
-                                api_base = PROVIDER_ENDPOINTS.get(entry_provider)
+                                api_base = PROVIDER_ENDPOINTS.get(entry_provider)  # type: ignore[assignment]
 
                             # Optional overrides from config
-                            api_base = model_entry.get('api_base') or api_base
+                            api_base = model_entry.get('api_base') or api_base  # type: ignore[assignment]
                             timeout = model_entry.get('timeout', 120)
 
                             best_model = ModelConfig(
@@ -295,7 +316,7 @@ def _build_anthropic_config() -> Optional['ModelConfig']:
         max_tokens=limits.get("max_output", _DEFAULT_MAX_OUTPUT_FRONTIER),
         max_context=limits.get("max_context", _DEFAULT_MAX_CONTEXT_FRONTIER),
         temperature=0.7,
-        cost_per_1k_tokens=(costs.get("input", 0.015) + costs.get("output", 0.075)) / 2,
+        cost_per_1k_tokens=(costs.get("input", 0.015) + costs.get("output", 0.075)) / 2,  # type: ignore[attr-defined]
     )
 
 
@@ -321,7 +342,7 @@ def _build_openai_compat_config(provider_name: str) -> Optional['ModelConfig']:
     default_model = PROVIDER_DEFAULT_MODELS[provider_name]
     limits = MODEL_LIMITS.get(default_model, {})
     costs = MODEL_COSTS.get(default_model, {})
-    avg_cost = (costs.get("input", 0.005) + costs.get("output", 0.005)) / 2 if costs else 0.002
+    avg_cost = (costs.get("input", 0.005) + costs.get("output", 0.005)) / 2 if costs else 0.002  # type: ignore[attr-defined]
     return ModelConfig(
         provider=provider_name,
         model_name=default_model,
@@ -449,6 +470,9 @@ def _build_claudecode_config() -> Optional['ModelConfig']:
     billed. Cloud APIs default to 120s in ``ModelConfig`` (well-tuned
     for them); CC's subprocess + structured-output overhead needs more.
     """
+    if session_services_restricted():
+        report_session_service_policy()
+        return None
     import shutil
     if not shutil.which("claude"):
         return None
@@ -610,7 +634,7 @@ def _build_bedrock_config() -> Optional['ModelConfig']:
     limits = MODEL_LIMITS.get(bare_default, {})
     costs = MODEL_COSTS.get(bare_default, {})
     avg_cost_per_1k = (
-        (costs.get("input", 0.005) + costs.get("output", 0.025)) / 2
+        (costs.get("input", 0.005) + costs.get("output", 0.025)) / 2  # type: ignore[attr-defined]
     )
     return ModelConfig(
         provider="bedrock",
@@ -748,6 +772,42 @@ def _config_bedrock_primary() -> Optional['ModelConfig']:
     return None
 
 
+def _config_ollama_primary() -> Optional['ModelConfig']:
+    """First config-file Ollama entry eligible to serve as the default
+    (primary) model.
+
+    Ollama is in the same blind spot as Bedrock: the thinking-model
+    scorer's pattern table (``_get_best_thinking_model``) is keyed to
+    direct cloud providers and never matches a local model, and the
+    env builder (``_build_ollama_config``) ignores the config file —
+    it probes ``/api/tags`` and returns the first available model.
+    Without this hook a role-less Ollama entry in ``models.json`` could
+    never become the auto-selected primary; the run silently fell
+    through to raw autodetect, ignoring the operator's declared choice.
+    Scoped to Ollama deliberately, mirroring ``_config_bedrock_primary``
+    so no other provider's selection semantics change.
+
+    Eligible = provider "ollama", carries no role (the "default" convention)
+    or an analysis/code role.  Entries with an auxiliary role (fallback /
+    consensus / judge / aggregate) are auxiliaries by declaration and never
+    become primary here.  Built via ``_model_config_from_entry`` so the
+    entry's ``api_base`` (from ``OLLAMA_HOST``), ``max_context`` and
+    ``max_output`` are preserved — unlike ``_build_ollama_config``'s
+    autodetect defaults.
+    """
+    for entry in _get_configured_models():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("provider", "") != "ollama":
+            continue
+        if (entry.get("role") or None) not in (None, "analysis", "code"):
+            continue
+        mc = _model_config_from_entry(entry)
+        if _entry_auth_resolvable(mc):
+            return mc
+    return None
+
+
 def _get_default_primary_model(
     prefer: list[str] | None = None,
     *,
@@ -794,6 +854,9 @@ def _get_default_primary_model(
     except when that primary could only ever be a live Ollama
     endpoint.
     """
+    if session_services_restricted():
+        report_session_service_policy()
+        return None
     if _operator_primary_override is not None:
         return _operator_primary_override
     if isinstance(prefer, str):
@@ -838,7 +901,7 @@ def _get_default_primary_model(
             logger.info(
                 "Using automatic thinking model: %s/%s", thinking_model.provider, thinking_model.model_name
             )
-            _get_default_primary_model._logged = True
+            _get_default_primary_model._logged = True  # type: ignore[attr-defined]
         return thinking_model
 
     # Step 2b: a config-file Bedrock entry with no auxiliary role is
@@ -851,8 +914,26 @@ def _get_default_primary_model(
             logger.info(
                 "Using configured Bedrock model: %s (%s)", bedrock_primary.model_name, bedrock_primary.bedrock_api
             )
-            _get_default_primary_model._bedrock_logged = True
+            _get_default_primary_model._bedrock_logged = True  # type: ignore[attr-defined]
         return bedrock_primary
+
+    # Step 2c: a config-file Ollama entry with no auxiliary role.
+    # Mirrors Step 2b (Bedrock): the thinking-model scorer in Step 2
+    # only knows cloud models, so a configured local model could never
+    # become primary and the run silently fell through to raw
+    # /api/tags autodetect (Step 3), ignoring the operator's file.
+    # ``offline`` skips this just like Steps 1/3 skip Ollama (it is the
+    # sole member of _NETWORK_PROBING_PROVIDERS).
+    if not (offline and "ollama" in _NETWORK_PROBING_PROVIDERS):
+        ollama_primary = _config_ollama_primary()
+        if (ollama_primary is not None
+                and (prefer_set is None or "ollama" in prefer_set)):
+            if not getattr(_get_default_primary_model, "_ollama_logged", False):
+                logger.info(
+                    "Using configured Ollama model: %s", ollama_primary.model_name
+                )
+                _get_default_primary_model._ollama_logged = True  # type: ignore[attr-defined]
+            return ollama_primary
 
     # Step 3: default-order autodetect via env vars. Skip providers
     # already tried in step 1.
@@ -953,20 +1034,31 @@ def _model_config_from_entry(entry: dict) -> 'ModelConfig':
     if not api_key and provider == "bedrock":
         api_key = os.getenv("AWS_BEARER_TOKEN_BEDROCK")
 
-    from core.llm.model_data import _strip_dated_alias
-    from core.security.llm_family import bare_model_id as _bare_model_id
-    undated = _strip_dated_alias(model_name)
-    # Peel Bedrock prefixes too (``anthropic.claude-x`` /
-    # ``us.anthropic.claude-x``) so prefixed entries resolve real
-    # catalog limits/costs instead of the 0.005 fallback rate.
-    bare = _bare_model_id(model_name)
-    limits = (MODEL_LIMITS.get(model_name, {})
-              or MODEL_LIMITS.get(undated, {})
-              or MODEL_LIMITS.get(bare, {}))
-    costs = (MODEL_COSTS.get(model_name, {})
-             or MODEL_COSTS.get(undated, {})
-             or MODEL_COSTS.get(bare, {}))
-    cost_per_1k = (costs.get("input", 0.005) + costs.get("output", 0.005)) / 2
+    # The canonical resolver chain (exact → dated → bedrock-prefix →
+    # both), not a hand-rolled probe ladder: a dated AND prefixed id
+    # (``us.anthropic.claude-x-20260101``) misses every single-strip
+    # probe and silently runs with the generic fallback limits — an 8K
+    # output ceiling and 32K context on a 128K/1M catalog model, the
+    # truncation failure mode _resolve_model_entry's docstring records.
+    from core.llm.model_data import resolve_model_costs, resolve_model_limits
+    limits = resolve_model_limits(model_name) or {}
+    costs = resolve_model_costs(model_name) or {}
+    if provider in ("ollama", "claudecode", "claudecode-resumable"):
+        # Local/CLI transports do not inherit direct-API catalogue
+        # pricing. Claude Code reports per-call cost in its result
+        # envelope when available; when absent the accounting basis is
+        # unknown, never an invented Anthropic rate.
+        cost_per_1k = 0.0
+    elif costs:
+        cost_per_1k = (
+            costs.get("input", 0.005) + costs.get("output", 0.005)
+        ) / 2
+    else:
+        # An explicitly configured, catalogue-unlisted model is still
+        # routable, but its price is unknown. A non-zero fallback here
+        # turns a guess into CONFIGURED_RATE accounting and presents it
+        # as budget evidence.
+        cost_per_1k = 0.0
 
     # Honour the operator-configured remote Ollama host (see
     # ``_get_configured_models`` for the same fix in the cold-start
@@ -1079,13 +1171,24 @@ def _build_fast_model_for(primary: 'ModelConfig') -> Optional['ModelConfig']:
     tiers — a future model addition only needs catalog entries, not
     plumbing changes here.
     """
-    fast_name = PROVIDER_FAST_MODELS.get(primary.provider)
+    from core.llm.model_data import resolve_model_limits
+
+    provider = getattr(primary, "provider", "")
+    fast_name = PROVIDER_FAST_MODELS.get(provider)
     if not fast_name:
+        return None
+
+    model_name = getattr(primary, "model_name", None)
+    if not model_name or resolve_model_limits(model_name) is None:
+        # Provider affinity does not authorize substituting a
+        # catalogued sibling for an explicitly selected unlisted
+        # model. The operator can still configure a specialist
+        # explicitly.
         return None
 
     limits = MODEL_LIMITS.get(fast_name, {})
     costs = MODEL_COSTS.get(fast_name, {})
-    cost_per_1k = (costs.get("input", 0.0) + costs.get("output", 0.0)) / 2
+    cost_per_1k = (costs.get("input", 0.0) + costs.get("output", 0.0)) / 2  # type: ignore[attr-defined]
 
     # Same Ollama-host fix as the cold-start + user-config paths —
     # inherit ``primary.api_base`` for Ollama since the primary was
@@ -1140,6 +1243,16 @@ def _entry_auth_resolvable(mc: 'ModelConfig') -> bool:
         # ({"provider": "claudecode", "role": "fallback"}).
         import shutil
         return shutil.which("claude") is not None
+    if mc.provider == "ollama":
+        # Local loopback / self-hosted inference server — no credential
+        # to carry.  The endpoint itself (``OLLAMA_HOST``) is the only
+        # thing needed and it always resolves (localhost default or an
+        # operator-configured host), so a configured Ollama entry is
+        # always auth-resolvable.  Without this, a role-less Ollama
+        # primary entry was dropped by ``_config_ollama_primary`` and
+        # every configured Ollama fallback was filtered out of
+        # ``_get_default_fallback_models`` (both gate on this helper).
+        return True
     return False
 
 
@@ -1204,7 +1317,7 @@ def _get_default_fallback_models() -> list['ModelConfig']:
                 max_tokens=limits.get("max_output", 32000),
                 max_context=limits.get("max_context", 1000000),
                 temperature=0.7,
-                cost_per_1k_tokens=(costs.get("input", 0.003) + costs.get("output", 0.015)) / 2,
+                cost_per_1k_tokens=(costs.get("input", 0.003) + costs.get("output", 0.015)) / 2,  # type: ignore[attr-defined]
             ))
 
     if "openai" not in config_providers and os.getenv("OPENAI_API_KEY"):
@@ -1221,7 +1334,7 @@ def _get_default_fallback_models() -> list['ModelConfig']:
                 max_tokens=limits.get("max_output", 16384),
                 max_context=limits.get("max_context", 128000),
                 temperature=0.7,
-                cost_per_1k_tokens=(costs.get("input", 0.006) + costs.get("output", 0.030)) / 2,
+                cost_per_1k_tokens=(costs.get("input", 0.006) + costs.get("output", 0.030)) / 2,  # type: ignore[attr-defined]
             ))
 
     if "gemini" not in config_providers and os.getenv("GEMINI_API_KEY"):
@@ -1238,7 +1351,7 @@ def _get_default_fallback_models() -> list['ModelConfig']:
                 max_tokens=limits.get("max_output", 8192),
                 max_context=limits.get("max_context", 1000000),
                 temperature=0.7,
-                cost_per_1k_tokens=(costs.get("input", 0.002) + costs.get("output", 0.010)) / 2,
+                cost_per_1k_tokens=(costs.get("input", 0.002) + costs.get("output", 0.010)) / 2,  # type: ignore[attr-defined]
             ))
 
     if (
@@ -1277,7 +1390,7 @@ def _get_default_fallback_models() -> list['ModelConfig']:
 # Model role resolution
 # ---------------------------------------------------------------------------
 
-VALID_ROLES = {"analysis", "code", "consensus", "fallback", "judge", "aggregate"}
+VALID_ROLES = {"analysis", "code", "consensus", "exploit", "fallback", "judge", "aggregate"}
 
 
 def get_configured_models() -> list[dict]:
@@ -1302,8 +1415,9 @@ def resolve_model_roles(
 
     Returns:
         {analysis_model: ModelConfig, code_model: ModelConfig,
-         consensus_models: [ModelConfig], judge_models: [ModelConfig],
-         aggregate_models: [ModelConfig], fallback_models: [ModelConfig]}
+         exploit_model: ModelConfig, consensus_models: [ModelConfig],
+         judge_models: [ModelConfig], aggregate_models: [ModelConfig],
+         fallback_models: [ModelConfig]}
 
     Raises:
         ConfigError on invalid role configurations.
@@ -1320,6 +1434,7 @@ def resolve_model_roles(
             "analysis_model": None,
             "analysis_models": [],
             "code_model": None,
+            "exploit_model": None,
             "consensus_models": [],
             "judge_models": [],
             "aggregate_models": [],
@@ -1342,6 +1457,7 @@ def resolve_model_roles(
             "analysis_model": first,
             "analysis_models": [first] if first is not None else [],
             "code_model": first,
+            "exploit_model": first,
             "consensus_models": [],
             "judge_models": [],
             "aggregate_models": [],
@@ -1354,6 +1470,7 @@ def resolve_model_roles(
     # Resolve by role
     analysis = [m for m in all_models if m.role == "analysis"]
     code = [m for m in all_models if m.role == "code"]
+    exploit = [m for m in all_models if m.role == "exploit"]
     consensus = [m for m in all_models if m.role == "consensus"]
     judge = [m for m in all_models if m.role == "judge"]
     aggregate = [m for m in all_models if m.role == "aggregate"]
@@ -1361,11 +1478,13 @@ def resolve_model_roles(
 
     analysis_model = analysis[0] if analysis else (all_models[0] if all_models else None)
     code_model = code[0] if code else analysis_model
+    exploit_model = exploit[0] if exploit else code_model
 
     return {
         "analysis_model": analysis_model,
         "analysis_models": analysis or ([all_models[0]] if all_models else []),
         "code_model": code_model,
+        "exploit_model": exploit_model,
         "consensus_models": consensus,
         "judge_models": judge,
         "aggregate_models": aggregate,
@@ -1388,15 +1507,22 @@ def _validate_model_roles(models: list['ModelConfig']) -> None:
 
     analysis_count = roles.count("analysis")
     code_count = roles.count("code")
-    has_analysis = analysis_count > 0
+    # A role-less entry is an implicit analysis model: the resolution in
+    # ``resolve_model_roles`` seats ``all_models[0]`` as the
+    # analysis_model when no entry carries an explicit "analysis" role.
+    # So "has an analysis model" is satisfied by EITHER an explicit
+    # analysis role OR any role-less entry — the auxiliary-role guards
+    # below (judge/consensus/aggregate/code "without an analysis model")
+    # must honour that, otherwise a role-less primary plus a judge/
+    # consensus/etc. entry is wrongly rejected even though it resolves
+    # to a perfectly valid lineup.
+    has_roleless = any(not m.role for m in models)
+    has_analysis = analysis_count > 0 or has_roleless
     has_consensus = "consensus" in roles
     has_code = code_count > 0
-    # A role-less entry is an implicit analysis model (the resolution
-    # below seats it as analysis_model and the loader defaults role-less
-    # extras to fallback), so its presence defeats the all-fallback
-    # refusal: a role-less primary plus one role:fallback entry is a
-    # working configuration, not "all models are fallback".
-    has_roleless = any(not m.role for m in models)
+    # ``only_fallback`` likewise defers to a role-less entry: a role-less
+    # primary plus one role:fallback entry is a working configuration,
+    # not "all models are fallback".
     only_fallback = (
         bool(roles)
         and all(r == "fallback" for r in roles)
@@ -1430,6 +1556,16 @@ def _validate_model_roles(models: list['ModelConfig']) -> None:
 
     if code_count > 1:
         msg = "Multiple models with role 'code'. Only one code model is supported"
+        raise ConfigError(msg)
+
+    has_exploit = "exploit" in roles
+    exploit_count = roles.count("exploit")
+    if exploit_count > 1:
+        msg = "Multiple models with role 'exploit'. Only one exploit model is supported"
+        raise ConfigError(msg)
+
+    if has_exploit and not has_analysis:
+        msg = "Exploit model configured without an analysis model"
         raise ConfigError(msg)
 
     if only_fallback:
@@ -1575,6 +1711,19 @@ def _default_cache_dir() -> Path:
     return Path("out/llm_cache")
 
 
+def _default_scorecard_path() -> Path:
+    """Default scorecard sidecar path — shared resolver.
+
+    Delegates to :func:`core.llm.scorecard.paths.default_scorecard_path`
+    (RAPTOR_SCORECARD_PATH override → RAPTOR_DIR-anchored → relative
+    fallback for hermetic tests). Imported lazily so constructing an
+    LLMConfig does not pull the scorecard package at module-import time.
+    """
+    from core.llm.scorecard.paths import default_scorecard_path
+
+    return default_scorecard_path()
+
+
 def _default_enable_caching() -> bool:
     """Default LLM response caching: on, env-overridable.
 
@@ -1631,19 +1780,44 @@ class LLMConfig:
     cache_max_entries: int | None = 10_000
     enable_cost_tracking: bool = True
     max_cost_per_scan: float = 10.0  # USD
+    # Non-dollar resource governor. The dollar cap above is inert for
+    # local/free models (cost reconciles to $0) and for audit runs that
+    # default max_cost_per_scan to inf — so a looping or runaway local
+    # run has no backstop. These caps gate at the same provider
+    # chokepoint as the dollar budget but independently of
+    # ``enable_cost_tracking`` (a free run may turn cost tracking off).
+    # ``None`` means that dimension is unlimited (the default, so
+    # existing behaviour is unchanged until an operator opts in).
+    max_seconds_per_scan: float | None = None   # wall-clock deadline
+    max_calls_per_scan: int | None = None       # total provider calls
+    max_tokens_per_scan: int | None = None      # aggregate tokens
+    # Existing budget arithmetic is advisory: estimates reserve headroom and
+    # completed observations reconcile later. Stronger contracts are explicit
+    # opt-ins and fail closed when a route lacks the required evidence.
+    usd_budget_contract: UsdBudgetContract = UsdBudgetContract.ADVISORY
+    # Operator declarations that allow catalog/configured estimates for an
+    # exact route to satisfy AUTHORITATIVE_REQUIRED. Nothing is trusted by
+    # default; these declarations are programmatic only and are not loaded
+    # from models.json.
+    trusted_usd_routes: tuple[TrustedUsdRoute, ...] = field(
+        default_factory=tuple,
+    )
+    # Exact pinned configurations disable every model-selection mechanism
+    # other than primary_model. Set through ``for_pinned_model``.
+    exact_pinned: bool = False
     # Model scorecard (core/llm/scorecard) — track per-model
     # reliability across decision classes and use measured miss-rate
     # to gate fast-tier short-circuit decisions. None or False
     # means consumers run their full path without scorecard
     # consultation. RAPTOR_SCORECARD_PATH overrides the default so
     # tests and sandboxed runs can isolate the on-disk reliability
-    # data (read at construction time, per config instance).
-    scorecard_path: Path = field(
-        default_factory=lambda: Path(
-            os.environ.get("RAPTOR_SCORECARD_PATH")
-            or "out/llm_scorecard.json"
-        )
-    )
+    # data (read at construction time, per config instance). The
+    # default is RAPTOR_DIR-anchored (see
+    # core.llm.scorecard.paths.default_scorecard_path) for the same
+    # reason as ``_default_cache_dir`` above: a cwd-relative ledger
+    # fragments reliability history per-cwd and lands inside the
+    # scanned repo on bare-shell runs.
+    scorecard_path: Path = field(default_factory=_default_scorecard_path)
     scorecard_enabled: bool = True
     # When False, do not retain disagreement-sample reasoning text.
     # Defense-in-depth privacy switch for operators on shared
@@ -1677,6 +1851,8 @@ class LLMConfig:
 
         Skips silently when:
           * no primary model is available (no provider to map from);
+          * the primary model itself is absent from the verified
+            capability catalogue;
           * the primary's provider has no entry in
             ``PROVIDER_FAST_MODELS`` (Ollama, Claude Code) — those
             providers don't have a meaningful "smaller, cheaper"
@@ -1684,6 +1860,26 @@ class LLMConfig:
         """
         from .task_types import FAST_TIER_TASKS
 
+        self.usd_budget_contract = normalize_budget_contract(
+            getattr(
+                self,
+                "usd_budget_contract",
+                UsdBudgetContract.ADVISORY,
+            ),
+        )
+        self.trusted_usd_routes = normalize_trusted_routes(
+            getattr(self, "trusted_usd_routes", ()) or (),
+        )
+        self.exact_pinned = bool(getattr(self, "exact_pinned", False))
+        if self.exact_pinned:
+            if self.primary_model is None:
+                raise ValueError(
+                    "exact pinned configuration requires primary_model",
+                )
+            self.enable_fallback = False
+            self.fallback_models = []
+            self.specialized_models = {}
+            return
         if self.primary_model is None:
             return
         fast_config = _build_fast_model_for(self.primary_model)
@@ -1691,6 +1887,33 @@ class LLMConfig:
             return
         for task in FAST_TIER_TASKS:
             self.specialized_models.setdefault(task, fast_config)
+
+    @classmethod
+    def for_pinned_model(
+        cls,
+        model: ModelConfig,
+        *,
+        usd_budget_contract: UsdBudgetContract | str = (
+            UsdBudgetContract.ADVISORY
+        ),
+        trusted_usd_routes: tuple[TrustedUsdRoute, ...] = (),
+    ) -> "LLMConfig":
+        """Build a no-fallback, no-specialization exact route config."""
+        if not isinstance(model, ModelConfig):
+            raise TypeError("model must be ModelConfig")
+        return cls(
+            primary_model=model,
+            fallback_models=[],
+            specialized_models={},
+            enable_fallback=False,
+            usd_budget_contract=normalize_budget_contract(
+                usd_budget_contract,
+            ),
+            trusted_usd_routes=normalize_trusted_routes(
+                trusted_usd_routes,
+            ),
+            exact_pinned=True,
+        )
 
     def _configured_models(self) -> list[ModelConfig]:
         """Every model the operator has configured: primary + fallbacks +
@@ -1708,7 +1931,9 @@ class LLMConfig:
 
         Resolution, most specific first:
           1. an exact configured entry for ``model_id`` — returned as-is, so
-             its per-model settings (temperature, base, role) are preserved;
+             its per-model settings (temperature, base, role) are preserved.
+             An explicit provider qualifier restricts exact matching to that
+             route; a bare exact unusual name retains its configured route;
           2. shorthand expansion — a bare token like ``"haiku"`` / ``"opus"``
              is looked up as a hyphen-separated segment of some configured
              model's bare name. When exactly one configured model matches,
@@ -1719,13 +1944,18 @@ class LLMConfig:
              carry a credential, the one whose name shares the longest prefix
              with ``model_id`` — a configured ``claude-opus-4-6`` lends its
              key to ``claude-opus-4-8`` ahead of a ``claude-haiku-*`` entry;
-             its api_key / api_base are borrowed onto a config for ``model_id``;
+             its credential and route fields are borrowed onto a config for
+             ``model_id``;
           4. otherwise a bare config (api_key=None) so the SDK / dispatcher /
              provider env var supplies the credential at call time.
         """
-        from core.llm.model_data import _strip_dated_alias
+        from core.llm.model_data import (
+            _strip_dated_alias,
+            resolve_model_limits,
+        )
         from core.security.llm_family import (
             bare_model_id,
+            explicit_provider_of,
             provider_of,
             resolve_model_shorthand,
             routing_model_id,
@@ -1734,7 +1964,15 @@ class LLMConfig:
 
         candidates = self._configured_models()
         bare = bare_model_id(model_id)
+        provider = provider_of(model_id)
+        explicit_provider = explicit_provider_of(model_id)
         for mc in candidates:
+            # An explicit/recognizable route is authoritative. Two
+            # providers may legitimately expose the same opaque model
+            # name; an exact bare-name match must not override the
+            # caller's provider qualifier.
+            if explicit_provider and mc.provider != explicit_provider:
+                continue
             if mc.model_name in (model_id, bare):
                 return mc
             if _strip_dated_alias(mc.model_name) == bare:
@@ -1767,11 +2005,10 @@ class LLMConfig:
                     return mc
 
         if model_id in _PROVIDER_BUILDERS:
-            mc = _PROVIDER_BUILDERS[model_id]()
+            mc = _PROVIDER_BUILDERS[model_id]()  # type: ignore[assignment]
             if mc is not None:
                 return mc
 
-        provider = provider_of(model_id)
         if not provider:
             # Fail loudly rather than synthesizing a keyless, provider-less
             # config that fails opaquely downstream — an explicit override
@@ -1793,9 +2030,15 @@ class LLMConfig:
                     target, bare_model_id(mc.model_name)
                 ),
             )
-            limits = MODEL_LIMITS.get(bare) or MODEL_LIMITS.get(
-                _strip_dated_alias(bare), {},
-            )
+            # Canonical resolver chain — covers dated/prefixed forms
+            # the two-step probe missed.
+            limits = resolve_model_limits(bare) or {}
+            model_kwargs: dict[str, Any] = {}
+            if limits:
+                model_kwargs.update(
+                    max_tokens=limits["max_output"],
+                    max_context=limits["max_context"],
+                )
             return ModelConfig(
                 provider=provider,
                 # Wire-form name: Bedrock ids need the vendor-dotted
@@ -1803,14 +2046,17 @@ class LLMConfig:
                 model_name=routing_model_id(model_id),
                 api_key=best.api_key,
                 api_base=best.api_base,
-                max_tokens=limits.get("max_output", best.max_tokens),
-                max_context=limits.get("max_context", best.max_context),
                 # Bedrock routing fields ride along (defaults for other
                 # providers): dropping them sent a borrowed-credential
                 # override to the wrong surface / ambient region.
                 bedrock_api=best.bedrock_api,
                 aws_profile=best.aws_profile,
                 aws_region=best.aws_region,
+                # Unknown models keep ModelConfig's conservative local
+                # request bounds. Do not borrow a sibling model's
+                # published capabilities and present them as this
+                # model's limits.
+                **model_kwargs,
             )
         return ModelConfig(provider=provider, model_name=routing_model_id(model_id))
 
@@ -1869,9 +2115,31 @@ class LLMConfig:
         but the signature should match reality so type-checkers
         catch new callers that miss the guard.
         """
+        if getattr(self, "exact_pinned", False):
+            return self.primary_model
         if task_type in self.specialized_models:
             model = self.specialized_models[task_type]
             if model.enabled:
                 return model
         return self.primary_model
 
+
+_LLM_CONFIG_RESOLVER_TYPE = LLMConfig
+
+
+def _config_for_model_from_candidates(
+    candidates: list[ModelConfig],
+    model_id: str,
+) -> ModelConfig:
+    """Resolve ``model_id`` with :meth:`LLMConfig.config_for_model`.
+
+    This lightweight adapter lets CLI resolution reuse the canonical
+    exact/shorthand/provider logic without constructing a full
+    auto-detected ``LLMConfig`` (and without loading any config-derived
+    fallback roles into the eventual explicit-model run).
+    """
+    resolver = object.__new__(_LLM_CONFIG_RESOLVER_TYPE)
+    resolver.primary_model = None
+    resolver.fallback_models = list(candidates)
+    resolver.specialized_models = {}
+    return _LLM_CONFIG_RESOLVER_TYPE.config_for_model(resolver, model_id)

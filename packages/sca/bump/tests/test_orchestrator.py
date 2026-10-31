@@ -91,6 +91,49 @@ def test_dockerfile_with_unknown_arg_skipped(tmp_path: Path) -> None:
     report = run_bump(tmp_path, http=http)
     assert report.candidates == []
     assert report.results == []
+    # ...and stay silent: an unmapped internal ARG is noise.
+    assert report.skipped == []
+
+
+def test_from_walker_strips_platform_flag_and_mixed_case_as(
+    tmp_path: Path,
+) -> None:
+    """``FROM --platform=... image`` must not glue the flag to the
+    ref (pre-fix: per-line 'unparseable FROM ref' noise), and
+    Dockerfile keywords are case-insensitive — ``aS builder`` names
+    a stage whose later reuse must not be looked up as an image."""
+    (tmp_path / "Dockerfile").write_text(
+        "FROM --platform=linux/amd64 python:3.12-slim aS builder\n"
+        "FROM builder\n"
+    )
+    http = _StubHttp({})
+    report = run_bump(tmp_path, http=http)
+    reasons = [reason for _, _, reason in report.skipped]
+    assert not any("unparseable FROM ref" in r for r in reasons)
+    # Neither the flag-glued string nor the stage alias reached the
+    # image-ref path; the real image ref did (its upstream lookup
+    # fails against the empty stub, which is fine).
+    assert not any("--platform" in name for name, _, _ in report.skipped)
+    assert not any(name == "builder" for name, _, _ in report.skipped)
+
+
+def test_cve_mapped_arg_without_upstream_surfaces_in_skipped(
+    tmp_path: Path,
+) -> None:
+    """Runtime-version ARGs (PYTHON_VERSION, GO_VERSION, ...) carry
+    CVE ecosystem mappings — scan-time gives them verdicts — but
+    have no upstream-latest source, so the bumper cannot act. That
+    gap must surface as a skipped row, not vanish."""
+    (tmp_path / "Dockerfile").write_text(
+        "ARG PYTHON_VERSION=3.12.0\n"
+    )
+    http = _StubHttp({})
+    report = run_bump(tmp_path, http=http)
+    assert report.candidates == []
+    assert len(report.skipped) == 1
+    arg, _path, reason = report.skipped[0]
+    assert arg == "PYTHON_VERSION"
+    assert "no upstream-latest source" in reason
 
 
 def test_dockerfile_with_known_arg_at_latest_no_candidate(
@@ -107,6 +150,27 @@ def test_dockerfile_with_known_arg_at_latest_no_candidate(
     })
     report = run_bump(tmp_path, http=http)
     assert report.candidates == []
+
+
+def test_dockerfile_arg_nonsemver_latest_is_skipped_not_proposed(
+    tmp_path: Path,
+) -> None:
+    """A non-semver "latest" release (bundle tag, nightly, hostile
+    upstream) must never become the proposed ARG pin — pre-fix it
+    sailed through with zero eco checks (Clean) and, worse,
+    lstrip("v") mangled hyphenated tags ("vault-1.2.3" → "ault-...").
+    """
+    (tmp_path / "Dockerfile").write_text(
+        "ARG SEMGREP_VERSION=1.50.0\n"
+    )
+    http = _StubHttp({
+        "https://api.github.com/repos/semgrep/semgrep/releases/latest":
+            {"tag_name": "vault-nightly-20260901"},
+    })
+    report = run_bump(tmp_path, http=http)
+    assert report.candidates == []
+    assert any("not a stable semver" in reason
+               for _, _, reason in report.skipped), report.skipped
 
 
 def test_dockerfile_with_known_arg_below_latest_becomes_candidate(
@@ -1118,6 +1182,79 @@ def test_git_submodule_candidate_via_parser(tmp_path: Path) -> None:
     assert c.extra["old_sha"] == current_sha
     assert c.extra["new_sha"] == target_sha
     assert c.extra["submodule_path"] == "vendor/checkout"
+
+
+def test_git_submodule_bundle_release_falls_back_to_stable_tag(
+    tmp_path: Path,
+) -> None:
+    """``/releases/latest`` may return a non-semver bundle tag
+    (``github/codeql-action`` → ``codeql-bundle-vX.Y.Z``). The
+    submodule walker must gate on stable-semver shape like every
+    other walker and fall through to the stable-filtered ``/tags``
+    path — an ungated bundle tag becomes a wrong-axis bump proposal
+    whose target the policy blocks can't even parse."""
+    from packages.sca.bump.orchestrator import (
+        _enumerate_git_submodule_candidates,
+    )
+    from packages.sca.models import (
+        Confidence,
+        Dependency,
+        PinStyle,
+    )
+
+    current_sha = "a" * 40
+    target_sha = "b" * 40
+    http = _StubHttp({
+        "https://api.github.com/repos/github/codeql-action/releases/latest":
+            {"tag_name": "codeql-bundle-v2.25.4"},
+        "https://api.github.com/repos/github/codeql-action/tags?per_page=100":
+            [
+                {"name": "codeql-bundle-v2.25.4"},   # non-semver — skip
+                {"name": "v3.30.1"},                  # stable — winner
+                {"name": "v3.30.0"},
+            ],
+        "https://api.github.com/repos/github/codeql-action/git/refs/tags/v3.30.1":
+            {"object": {"type": "commit", "sha": target_sha}},
+    })
+    fake_dep = Dependency(
+        ecosystem="GitHub",
+        name="github/codeql-action",
+        version=current_sha,
+        declared_in=tmp_path / ".gitmodules",
+        scope="main", is_lockfile=True, pin_style=PinStyle.GIT,
+        direct=True,
+        purl=f"pkg:github/github/codeql-action@{current_sha}",
+        parser_confidence=Confidence("high", reason="t"),
+        source_kind="git_submodule",
+        source_extra={"url": "https://github.com/github/codeql-action.git",
+                       "path": "vendor/codeql-action",
+                       "submodule_name": "vendor/codeql-action"},
+    )
+    from packages.sca import parsers as _parsers_mod
+    orig = _parsers_mod.parse_manifest
+
+    def _fake_parse(manifest):
+        if manifest.path.name == ".gitmodules":
+            return [fake_dep]
+        return orig(manifest)
+
+    _parsers_mod.parse_manifest = _fake_parse
+    try:
+        (tmp_path / ".gitmodules").write_text("# stub\n")
+        cands, skipped = _enumerate_git_submodule_candidates(
+            tmp_path, http=http, cache=None,
+            github_token=None, sub_cache={},
+        )
+    finally:
+        _parsers_mod.parse_manifest = orig
+
+    assert len(cands) == 1
+    c = cands[0]
+    # MUST be the stable-semver tag, NOT the ungated bundle tag.
+    assert c.target_version == "v3.30.1"
+    assert "codeql-bundle" not in c.target_version
+    assert c.extra["new_sha"] == target_sha
+    assert skipped == []
 
 
 def test_git_submodule_apply_emits_manual_instruction(
@@ -2433,3 +2570,108 @@ def test_pr_comment_reports_exclusions(tmp_path: Path) -> None:
     )
     md = render_pr_comment(report)
     assert "excluded from write by `--exclude` patterns" in md
+
+
+def test_from_and_yaml_walkers_share_oci_cache(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """The FROM and yaml walkers share ``latest_cache``, but keyed
+    it in different shapes (3-tuple with variant vs 2-tuple) — the
+    same repo was queried upstream once per walker. One key shape,
+    one fetch."""
+    import core.upstream_latest.oci_tags as oci_mod
+    from packages.sca.bump.orchestrator import (
+        _enumerate_from_image_candidates,
+        _enumerate_yaml_image_candidates,
+    )
+
+    calls: list[tuple[str, str]] = []
+
+    def _fake_latest_tag(image_ref, **kw):
+        calls.append((image_ref, kw.get("variant", "")))
+        return "3.99"
+
+    monkeypatch.setattr(oci_mod, "latest_tag", _fake_latest_tag)
+
+    shared: dict = {}
+    from_cands, _ = _enumerate_from_image_candidates(
+        text="FROM python:3.12\n",
+        dockerfile=tmp_path / "Dockerfile",
+        http=None, cache=None, from_cache=shared,
+    )
+    (tmp_path / "docker-compose.yml").write_text(
+        "services:\n  app:\n    image: python:3.12\n",
+        encoding="utf-8",
+    )
+    yaml_cands, _ = _enumerate_yaml_image_candidates(
+        tmp_path, http=None, cache=None, from_cache=shared,
+    )
+    assert [c.target_version for c in from_cands] == ["3.99"]
+    assert [c.target_version for c in yaml_cands] == ["3.99"]
+    # One upstream fetch for the one repo, shared across walkers.
+    assert len(calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Symlink containment: discovery and the read leg
+# ---------------------------------------------------------------------------
+
+_SEMGREP_RELEASE = {
+    "https://api.github.com/repos/semgrep/semgrep/releases/latest":
+        {"tag_name": "v1.119.0"},
+}
+
+
+def test_escaping_dockerfile_symlink_refused(tmp_path: Path) -> None:
+    """A Dockerfile symlink pointing outside the scan target must not
+    feed candidate enumeration — discovered files also feed the
+    rewriter, so an escaping link would redirect writes."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "Dockerfile").write_text("ARG SEMGREP_VERSION=1.50.0\n")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "Dockerfile").symlink_to(outside / "Dockerfile")
+
+    report = run_bump(repo, http=_StubHttp(_SEMGREP_RELEASE))
+    assert [c for c in report.candidates if c.kind == "arg"] == []
+
+
+def test_in_root_symlinked_dockerfile_still_parsed(
+    tmp_path: Path,
+) -> None:
+    """The monorepo pattern — a link resolving INSIDE the target —
+    keeps harvesting."""
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    (shared / "Dockerfile").write_text("ARG SEMGREP_VERSION=1.50.0\n")
+    (tmp_path / "Dockerfile").symlink_to(
+        Path("shared") / "Dockerfile")
+
+    report = run_bump(tmp_path, http=_StubHttp(_SEMGREP_RELEASE))
+    cands = [c for c in report.candidates if c.kind == "arg"]
+    assert cands and cands[0].target_version == "1.119.0"
+
+
+def test_walkers_refuse_escaping_symlinks(tmp_path: Path) -> None:
+    from packages.sca.bump.orchestrator import (
+        _find_dockerfiles,
+        _find_dockerfiles_and_workflows,
+        _find_gha_workflows,
+    )
+    outside = tmp_path / "outside"
+    (outside / ".github" / "workflows").mkdir(parents=True)
+    (outside / "Dockerfile").write_text("FROM x\n")
+    (outside / ".github" / "workflows" / "ci.yml").write_text(
+        "jobs: {}\n")
+    repo = tmp_path / "repo"
+    (repo / ".github").mkdir(parents=True)
+    (repo / "Dockerfile").symlink_to(outside / "Dockerfile")
+    (repo / ".github" / "workflows").symlink_to(
+        outside / ".github" / "workflows")
+
+    dockerfiles, workflows = _find_dockerfiles_and_workflows(repo)
+    assert dockerfiles == []
+    assert workflows == []
+    assert _find_dockerfiles(repo) == []
+    assert _find_gha_workflows(repo) == []

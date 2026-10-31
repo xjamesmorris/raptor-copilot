@@ -236,6 +236,47 @@ class TestAnnotateSarif:
         assert "nosemgrep" not in r_cql.get("properties", {})
 
 
+class TestAnnotateSarifContainment:
+    """URIs derive from SARIF over an untrusted repo — reads must stay
+    under the repo root (out-of-tree files must never be quoted into
+    properties.nosemgrep.justification)."""
+
+    def _outside(self, tmp_path):
+        outside = tmp_path / "outside.py"
+        outside.write_text("x = 1  # nosemgrep: test.rule leaked-text\n")
+        root = tmp_path / "repo"
+        root.mkdir()
+        return outside, root
+
+    def test_file_uri_outside_root_refused(self, tmp_path):
+        outside, root = self._outside(tmp_path)
+        result = _make_result(f"file://{outside}", 1)
+        sarif = _make_sarif_data([result])
+        assert annotate_sarif(sarif, str(root)) == 0
+        assert "properties" not in result
+
+    def test_absolute_uri_outside_root_refused(self, tmp_path):
+        outside, root = self._outside(tmp_path)
+        result = _make_result(str(outside), 1)
+        sarif = _make_sarif_data([result])
+        assert annotate_sarif(sarif, str(root)) == 0
+        assert "properties" not in result
+
+    def test_traversal_uri_refused(self, tmp_path):
+        _outside, root = self._outside(tmp_path)
+        result = _make_result("../outside.py", 1)
+        sarif = _make_sarif_data([result])
+        assert annotate_sarif(sarif, str(root)) == 0
+        assert "properties" not in result
+
+    def test_file_uri_inside_root_still_annotates(self, tmp_path):
+        src = tmp_path / "a.py"
+        src.write_text("x = eval(inp)  # nosemgrep: test.rule ok\n")
+        result = _make_result(f"file://{src}", 1)
+        sarif = _make_sarif_data([result])
+        assert annotate_sarif(sarif, str(tmp_path)) == 1
+
+
 # ── build_cmd flag ───────────────────────────────────────────────────────────
 
 
@@ -244,3 +285,168 @@ class TestBuildCmdDisableNosemgrep:
         from packages.semgrep.runner import build_cmd
         cmd = build_cmd(Path("/src"), "p/security-audit")
         assert "--disable-nosem" in cmd
+
+
+class TestAnnotateSarifMalformedShapes:
+    """One malformed result must never abort the whole SARIF merge.
+
+    Explicit ``null`` / wrong-typed nodes at any level read as absent;
+    well-formed sibling results still get annotated.
+    """
+
+    @staticmethod
+    def _suppressed_source(tmp_path):
+        src = tmp_path / "a.py"
+        src.write_text(
+            "x = eval(inp)  # nosemgrep: test.rule safe use\n",
+        )
+        return src
+
+    def _assert_sibling_survives(self, tmp_path, bad_result):
+        self._suppressed_source(tmp_path)
+        good = _make_result("a.py", 1)
+        sarif = _make_sarif_data([bad_result, good])
+        assert annotate_sarif(sarif, str(tmp_path)) == 1
+        assert good["properties"]["nosemgrep"]["suppressed"] is True
+
+    def test_null_physical_location(self, tmp_path):
+        self._assert_sibling_survives(
+            tmp_path, {"locations": [{"physicalLocation": None}]},
+        )
+
+    def test_null_artifact_location_and_region(self, tmp_path):
+        self._assert_sibling_survives(tmp_path, {
+            "locations": [{"physicalLocation": {
+                "artifactLocation": None, "region": None,
+            }}],
+        })
+
+    def test_wrong_typed_uri_and_line(self, tmp_path):
+        self._assert_sibling_survives(tmp_path, {
+            "locations": [{"physicalLocation": {
+                "artifactLocation": {"uri": 7},
+                "region": {"startLine": "12"},
+            }}],
+        })
+
+    def test_null_locations_and_results(self, tmp_path):
+        self._suppressed_source(tmp_path)
+        good = _make_result("a.py", 1)
+        sarif = {"runs": [
+            {"results": None},
+            {"results": [{"locations": None}, good]},
+        ]}
+        assert annotate_sarif(sarif, str(tmp_path)) == 1
+
+    def test_null_tool_and_driver(self, tmp_path):
+        self._suppressed_source(tmp_path)
+        good = _make_result("a.py", 1)
+        sarif = {"runs": [{"tool": None, "results": [good]}]}
+        assert annotate_sarif(sarif, str(tmp_path)) == 1
+        sarif2 = {"runs": [{"tool": {"driver": None},
+                            "results": [_make_result("a.py", 1)]}]}
+        assert annotate_sarif(sarif2, str(tmp_path)) == 1
+
+    def test_null_runs_returns_zero(self, tmp_path):
+        assert annotate_sarif({"runs": None}, str(tmp_path)) == 0
+
+    def test_non_dict_properties_skipped_not_clobbered(self, tmp_path):
+        self._suppressed_source(tmp_path)
+        bad = _make_result("a.py", 1)
+        bad["properties"] = "already-a-string"
+        good = _make_result("a.py", 1)
+        sarif = _make_sarif_data([bad, good])
+        assert annotate_sarif(sarif, str(tmp_path)) == 1
+        assert bad["properties"] == "already-a-string"
+
+
+class TestStandaloneReadIsCapped:
+    def test_extract_nosemgrep_routes_through_the_capped_reader(
+        self, tmp_path, monkeypatch,
+    ):
+        """The standalone path (no _lines) must use the same capped
+        read as annotate_sarif's _FileCache — it read files
+        unbounded."""
+        import packages.semgrep.nosemgrep as ns
+
+        f = tmp_path / "a.py"
+        f.write_text("x = 1  # nosemgrep: rule1\n")
+        calls = {"n": 0}
+        real = ns.read_text_capped
+
+        def counting(path, *a, **kw):
+            calls["n"] += 1
+            return real(path, *a, **kw)
+
+        monkeypatch.setattr(ns, "read_text_capped", counting)
+
+        def _no_unbounded(self, *a, **kw):  # pragma: no cover
+            raise AssertionError("unbounded Path.read_text used")
+
+        monkeypatch.setattr(Path, "read_text", _no_unbounded)
+        got = extract_nosemgrep(f, 1)
+        assert got is not None and got["suppressed"] is True
+        assert calls["n"] == 1
+
+
+class TestLineModelDesync:
+    r"""Suppression lookups speak semgrep's \n line model.
+
+    Semgrep counts \n only; splitlines() also breaks on \f — legal
+    inside a string literal.  The shifted index read a standalone
+    nosemgrep comment TWO physical lines above the finding (which per
+    semgrep's spec suppresses nothing at the finding line: semgrep's
+    own nosem enforcement still reports it) and forged a
+    developer-suppressed annotation for downstream consumers.
+    """
+
+    TARGET = (
+        'S = "a\x0cb"\n'          # 1: form feed inside a string literal
+        "x = input()\n"           # 2
+        "# nosemgrep: x1-eval\n"  # 3: suppresses line 4 only
+        "y = 1\n"                 # 4
+        "z = eval(x)\n"           # 5: the finding (semgrep says line 5)
+    )
+
+    def test_string_literal_form_feed_cannot_forge_suppression(
+        self, tmp_path,
+    ):
+        src = tmp_path / "a.py"
+        src.write_bytes(self.TARGET.encode())
+        assert extract_nosemgrep(src, 5) is None
+
+    def test_the_comment_still_suppresses_its_own_next_line(self, tmp_path):
+        src = tmp_path / "a.py"
+        src.write_bytes(self.TARGET.encode())
+        got = extract_nosemgrep(src, 4)
+        assert got is not None and got["suppressed"] is True
+        assert got["rule_ids"] == ["x1-eval"]
+        assert got["comment_line"] == 3
+
+    def test_annotate_sarif_cache_path_shares_the_model(self, tmp_path):
+        src = tmp_path / "a.py"
+        src.write_bytes(self.TARGET.encode())
+        sarif = {
+            "runs": [{"results": [{
+                "ruleId": "x1-eval",
+                "locations": [{"physicalLocation": {
+                    "artifactLocation": {"uri": "a.py"},
+                    "region": {"startLine": 5},
+                }}],
+            }]}],
+        }
+        assert annotate_sarif(sarif, tmp_path) == 0
+        props = sarif["runs"][0]["results"][0].get("properties", {})
+        assert "nosemgrep" not in props
+
+    def test_bare_carriage_return_cannot_forge_suppression(self, tmp_path):
+        # Same forgery with the OTHER plantable byte: semgrep keeps a
+        # bare \r inside the line (it is not a line break), so the
+        # eval is its \n-line 4 — the read must not translate the \r
+        # into a break either.
+        src = tmp_path / "a.py"
+        src.write_bytes(
+            b's = "a\rb"\n# nosemgrep: x1-eval\ny = 1\nz = eval(x)\n')
+        assert extract_nosemgrep(src, 4) is None
+        got = extract_nosemgrep(src, 3)
+        assert got is not None and got["comment_line"] == 2

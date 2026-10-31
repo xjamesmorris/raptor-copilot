@@ -67,6 +67,7 @@ from packages.osv import OsvRecord
 from packages.osv import parse_record as _shared_parse_record
 from packages.osv.client import OSV_BASE_URL
 
+from .naming import fold_name
 from .models import (
     Advisory,
     AffectedRange,
@@ -122,12 +123,24 @@ def _to_osv_ecosystem(ecosystem: str) -> str:
 
 
 def _canonical_name(ecosystem: str, name: str) -> str:
-    """Match the canonicalisation OSV expects per ecosystem."""
-    if ecosystem == "PyPI":
-        return re.sub(r"[-_.]+", "-", name).lower()
-    if ecosystem in ("npm", "Cargo"):
-        return name.lower()
-    return name
+    """Match the canonicalisation OSV expects per ecosystem.
+
+    Beyond the shared rule, OSV case-folds crates.io names — the
+    registry walk deliberately keeps Cargo case-sensitive, so the
+    fold is an OSV-boundary opt-in, not part of the shared rule.
+    GitHub Actions advisories are keyed on the parent ``owner/repo``
+    — a sub-action ref (``github/codeql-action/init``) must collapse
+    to it or its advisories silently never match (the registry client
+    already parents at fetch; this is the OSV-side twin)."""
+    if ecosystem == "GitHub Actions":
+        name = _gha_parent_repo(name)
+    return fold_name(name, ecosystem, extra_lower=("Cargo",))
+
+
+def _gha_parent_repo(name: str) -> str:
+    """Collapse a GHA sub-action ref to its ``owner/repo`` parent."""
+    parts = name.split("/")
+    return "/".join(parts[:2]) if len(parts) > 2 else name
 
 
 def _has_corridor(dep: Dependency) -> bool:
@@ -264,16 +277,30 @@ class OsvClient:
         # ``query_batch`` calls on this client instance.
         self.failed_lookups: int = 0
         self.failed_dep_keys: list[str] = []
+        # Full failed-key set — uncapped, unlike the display sample
+        # above. Consumers that must never read a failed slot as "no
+        # advisories" (harden's candidate-safety ranking) ask
+        # ``lookup_failed()`` per key; a later successful lookup for
+        # the same key clears it.
+        self._failed_keys: set[str] = set()
 
     @property
     def degraded(self) -> bool:
         """True when at least one lookup failed transiently this run."""
         return self.failed_lookups > 0
 
+    def lookup_failed(self, dep_key: str) -> bool:
+        """True when this client's most recent advisory lookup for
+        ``dep_key`` failed transiently — the slot returned no
+        advisories and was left uncached. Lets callers distinguish
+        "no advisories" from "answer unknown"."""
+        return dep_key in self._failed_keys
+
     _FAILED_KEY_SAMPLE_CAP = 20
 
     def _record_failed_lookup(self, dep_key: str) -> None:
         self.failed_lookups += 1
+        self._failed_keys.add(dep_key)
         if len(self.failed_dep_keys) < self._FAILED_KEY_SAMPLE_CAP:
             self.failed_dep_keys.append(dep_key)
 
@@ -298,6 +325,9 @@ class OsvClient:
             )
             if cached is not None and isinstance(cached, list):
                 dep_to_ids[key] = [str(i) for i in cached]
+                # A cached answer (written by this or another process)
+                # supersedes an earlier transient-failure record.
+                self._failed_keys.discard(key)
             else:
                 uncached.append(dep)
 
@@ -342,9 +372,18 @@ class OsvClient:
             for chunk in _chunked(queryable, _BATCH_CHUNK_SIZE):
                 queries = []
                 for d in chunk:
+                    # GHA sub-action refs must query the parent repo
+                    # — OSV has no package named owner/repo/sub, so
+                    # the raw name returned no advisories, ever.
+                    # Other ecosystems keep the parser-canonical name
+                    # verbatim (parsers own per-ecosystem folding).
+                    query_name = (
+                        _gha_parent_repo(d.name)
+                        if d.ecosystem == "GitHub Actions" else d.name
+                    )
                     q: dict[str, Any] = {
                         "package": {
-                            "name": d.name,
+                            "name": query_name,
                             "ecosystem": _to_osv_ecosystem(d.ecosystem),
                         },
                     }
@@ -413,6 +452,9 @@ class OsvClient:
                         ttl_seconds=self._query_ttl,
                     )
                     dep_to_ids[dep.key()] = ids
+                    # Successful retry clears an earlier batch's
+                    # transient-failure record for this key.
+                    self._failed_keys.discard(dep.key())
             # Empty-ID rows for non-queryable ecosystems so the OSS-Fuzz
             # fallback (next pass) sees them as "primary returned
             # nothing" and engages the retry path. Without this, those
@@ -460,7 +502,11 @@ class OsvClient:
                     continue
                 try:
                     advs = self._offline_db.query(
-                        dep.ecosystem, dep.name, dep.version,
+                        dep.ecosystem,
+                        (_gha_parent_repo(dep.name)
+                         if dep.ecosystem == "GitHub Actions"
+                         else dep.name),
+                        dep.version,
                     )
                 except Exception as e:                  # noqa: BLE001
                     logger.warning(
@@ -660,7 +706,7 @@ class OsvClient:
                 for dep, candidate in chunk
             ]
             results = self._inner.query_batch(queries)
-            for (dep, candidate), ids in zip(chunk, results, strict=True):
+            for (dep, candidate), ids in zip(chunk, results, strict=True):  # type: ignore[assignment]
                 if ids is None:
                     # Transient failure — same policy as the primary
                     # batch: no cache entry, record the degradation.
@@ -786,9 +832,21 @@ def _record_to_advisory(rec: OsvRecord) -> Advisory:
                 informational = v.strip()
                 break
 
+    # Fold ``upstream`` ids into the alias list. Debian/Ubuntu secdb
+    # records ship ``aliases: null`` with the CVE identity ONLY in
+    # ``upstream`` (DEBIAN-CVE-… → upstream ["CVE-…"]); an alias list
+    # without them loses KEV / EPSS / SSVC enrichment and the
+    # ``--fail-on-kev`` gate for every distro base-image finding.
+    # ``upstream`` means "the same vulnerability as tracked upstream"
+    # (identity-equivalent), unlike ``related`` which stays unfolded.
+    aliases = list(rec.aliases)
+    for up in rec.upstream:
+        if up and up != rec.id and up not in aliases:
+            aliases.append(up)
+
     return Advisory(
         osv_id=rec.id,
-        aliases=list(rec.aliases),
+        aliases=aliases,
         summary=rec.summary,
         details=rec.details,
         affected=affected,

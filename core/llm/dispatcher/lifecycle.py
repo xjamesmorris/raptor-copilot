@@ -2,7 +2,8 @@
 
 Constructs a dispatcher tied to a RAPTOR run directory: the audit log
 lands at ``<run_dir>/audit-llm-dispatcher.jsonl``, the dispatcher's
-``run_id`` is the run dir's basename, and shutdown is wired through
+``run_id`` is the run dir's RESOLVED basename
+(``core.coverage.journal.resolved_run_id``), and shutdown is wired through
 either ``atexit`` (when used directly) or the context-manager exit
 (when used via :func:`llm_dispatcher_in_run`).
 
@@ -17,13 +18,18 @@ from __future__ import annotations
 import atexit
 import contextlib
 import os
+import threading
 from pathlib import Path
 
-from core.run.tmp_ownership import sweep_dead_owner_dirs
+from core.security.session_services import ServiceAuthorizationError
 
-from .auth import CredentialStore, seed_from_config
+from .auth import (
+    CredentialStore,
+    WorldReadableModelsConfigError,
+    seed_from_config,
+)
 from .server import LLMDispatcher
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -55,10 +61,13 @@ def audit_path_for_run_dir(run_dir: Path) -> Path:
 # still wins when the operator sets it.
 _INPROCESS_TOKEN_TTL_S = 7 * 24 * 60 * 60
 
-# Socket-dir prefix minted by LLMDispatcher for the in-process route:
-# ``raptor-llm-<run_id>-`` with ``run_id = inproc-<hex8>``.
-_INPROC_SOCK_DIR_PREFIX = "raptor-llm-inproc-"
-
+# Serialises ensure_inprocess_dispatcher_env's check-construct-export
+# sequence: the env read and the env write are otherwise a
+# check-then-set race — two first-callers on different threads each
+# saw no route, constructed two dispatchers, and one RAPTOR_LLM_SOCKET
+# write silently overwrote the other (stray dispatcher + socket dir
+# until the atexit/dead-owner sweep).
+_INPROCESS_ENV_LOCK = threading.Lock()
 
 # Explicit pass-through signature, replacing an earlier ``**kwargs``
 # fan-out. Pre-fix the wildcard accepted anything — typos like
@@ -75,7 +84,8 @@ def dispatcher_for_run(
     creds: CredentialStore | None = None,
 ) -> LLMDispatcher:
     """Return a fresh ``LLMDispatcher`` whose audit log lives inside
-    ``run_dir`` and whose ``run_id`` matches the run dir name.
+    ``run_dir`` and whose ``run_id`` matches the RESOLVED run dir
+    basename.
 
     The caller is responsible for ``shutdown()``. An ``atexit`` hook
     is registered as defence-in-depth so a forgotten shutdown still
@@ -90,7 +100,13 @@ def dispatcher_for_run(
         msg = f"run_dir does not exist: {run_dir}"
         raise FileNotFoundError(msg)
     audit_path = audit_path_for_run_dir(run_dir)
-    run_id = run_dir.name
+    from core.coverage.journal import resolved_run_id
+
+    # Resolved basename, never the raw spelling: a relative run_dir
+    # ("." from inside the run dir) has name == "" — the dispatcher
+    # identity (audit rows, socket-dir prefix) would carry no run
+    # attribution (see resolved_run_id).
+    run_id = resolved_run_id(run_dir)
     # Use only the kwargs the caller actually set, so the dispatcher
     # keeps its module-level defaults for the rest.
     dispatcher_kwargs: dict = {}
@@ -156,37 +172,44 @@ def ensure_inprocess_dispatcher_env(
     The returned dispatcher is the caller's to ``shutdown()``; an
     ``atexit`` hook is registered as defence-in-depth, same contract
     as :func:`dispatcher_for_run`.
-    """
-    if os.environ.get("RAPTOR_LLM_SOCKET"):
-        return None
-    import uuid
 
-    # shutdown()/atexit remove the socket dir on normal teardown, but
-    # a SIGTERM'd/SIGKILL'd owner skips both — reclaim in-process
-    # socket dirs whose recorded owner pid is dead before minting a
-    # new one. Best-effort: the sweep never raises.
-    sweep_dead_owner_dirs(_INPROC_SOCK_DIR_PREFIX)
-    creds = CredentialStore()
-    seed_from_config(creds)
-    kwargs: dict = {}
-    if not os.environ.get("RAPTOR_LLM_DISPATCHER_TOKEN_TTL_S"):
-        # Only when the operator hasn't pinned a TTL — an explicit
-        # constructor arg would otherwise shadow the env override.
-        kwargs["token_ttl_s"] = _INPROCESS_TOKEN_TTL_S
-    if run_dir is not None and Path(run_dir).is_dir():
-        kwargs["audit_path"] = audit_path_for_run_dir(run_dir)
-    d = LLMDispatcher(
-        run_id=f"inproc-{uuid.uuid4().hex[:8]}", creds=creds, **kwargs,
-    )
-    try:
-        socket_path, token_fd = d.allocate_worker(label)
-    except Exception:
-        d.shutdown()
-        raise
-    os.environ["RAPTOR_LLM_SOCKET"] = socket_path
-    os.environ["RAPTOR_LLM_TOKEN_FD"] = str(token_fd)
-    atexit.register(d.shutdown)
-    return d
+    Thread-safe: the whole check-construct-export sequence runs under
+    ``_INPROCESS_ENV_LOCK`` — the second of two racing first-callers
+    sees the first one's route and no-ops instead of constructing a
+    duplicate dispatcher whose env write clobbers the winner's.
+    """
+    from core.security.session_services import require_service_authorization
+    require_service_authorization("an LLM dispatcher route")
+    with _INPROCESS_ENV_LOCK:
+        if os.environ.get("RAPTOR_LLM_SOCKET"):
+            return None
+        import uuid
+
+        # Orphaned socket dirs (SIGTERM'd/SIGKILL'd owners) are
+        # reclaimed by the dead-owner sweep inside LLMDispatcher's
+        # constructor — one chokepoint covering the in-process AND
+        # run-scoped prefixes.
+        creds = CredentialStore()
+        seed_from_config(creds)
+        kwargs: dict = {}
+        if not os.environ.get("RAPTOR_LLM_DISPATCHER_TOKEN_TTL_S"):
+            # Only when the operator hasn't pinned a TTL — an explicit
+            # constructor arg would otherwise shadow the env override.
+            kwargs["token_ttl_s"] = _INPROCESS_TOKEN_TTL_S
+        if run_dir is not None and Path(run_dir).is_dir():
+            kwargs["audit_path"] = audit_path_for_run_dir(run_dir)
+        d = LLMDispatcher(
+            run_id=f"inproc-{uuid.uuid4().hex[:8]}", creds=creds, **kwargs,
+        )
+        try:
+            socket_path, token_fd = d.allocate_worker(label)
+        except Exception:
+            d.shutdown()
+            raise
+        os.environ["RAPTOR_LLM_SOCKET"] = socket_path
+        os.environ["RAPTOR_LLM_TOKEN_FD"] = str(token_fd)
+        atexit.register(d.shutdown)
+        return d
 
 
 def ensure_route_for_model_configs(
@@ -222,3 +245,61 @@ def ensure_route_for_model_configs(
     ):
         return None
     return ensure_inprocess_dispatcher_env(label=label, run_dir=run_dir)
+
+
+def ensure_route_for_client(
+    client: Any,
+    label: str,
+    *,
+    run_dir: Path | None = None,
+) -> None:
+    """Self-serve the in-process dispatcher for a client's resolved
+    models (primary + fallbacks), by *label*. ``run_dir`` follows the
+    :func:`ensure_inprocess_dispatcher_env` audit-log placement
+    contract — pass the run output directory when the caller has one.
+
+    The one implementation of the bootstrap every standalone
+    LLM-calling CLI used to open-code: pipeline runs inherit a
+    dispatcher from their parent, but a standalone CLI is its own
+    parent — without this every Bedrock-routed call dies with
+    "requires the RAPTOR LLM dispatcher". No-op when a route exists
+    or none is needed (same gates as
+    :func:`ensure_route_for_model_configs`).
+
+    Service authorization refusals are terminal. Other bring-up errors
+    remain fire-and-forget —
+    provider/transport errors surface at call time on the LLM call
+    itself, and an oddly-shaped client config must not abort a CLI
+    that may never route a dispatcher-only model.
+
+    One exception is surfaced rather than swallowed:
+    :class:`WorldReadableModelsConfigError` (credential seeding
+    refused a group/other-readable ``models.json`` with inline keys).
+    Its message carries the operator's one-line remedy (``chmod 600``
+    / the override env) — silently dropping it here left the four
+    standalone CLIs on this seam falling to the direct transport with
+    no hint why. The never-raises contract is kept: the refusal is
+    printed loudly to stderr and the CLI continues exactly as before.
+    """
+    try:
+        configs = [getattr(client.config, "primary_model", None)]
+        configs += list(getattr(client.config, "fallback_models", []) or [])
+        ensure_route_for_model_configs(configs, label=label, run_dir=run_dir)
+    except ServiceAuthorizationError:
+        raise
+    except WorldReadableModelsConfigError as exc:
+        import sys
+        # The message embeds the config path (operator env) — render
+        # it terminal-inert before printing.
+        message = str(exc)
+        try:
+            from core.security.log_sanitisation import sanitise_for_terminal
+            message = sanitise_for_terminal(message, max_len=500)
+        except ImportError:
+            message = message[:500]
+        print(
+            f"{label}: dispatcher credential seeding refused — {message}",
+            file=sys.stderr,
+        )
+    except Exception:  # noqa: BLE001 — provider errors surface at call time
+        pass

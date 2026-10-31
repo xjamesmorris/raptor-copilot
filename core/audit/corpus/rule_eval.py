@@ -88,6 +88,16 @@ BUG_CLASS_CWES: dict[str, frozenset[str]] = {
                        "CWE-863"}),
     "concurrency": frozenset({"CWE-362", "CWE-366", "CWE-367", "CWE-413",
                               "CWE-667", "CWE-833"}),
+    # Peer-census deviance labels (one CWE family per mutation
+    # operator / dimension): unchecked return (CWE-252), missing
+    # release — leak / improper locking (CWE-401 / CWE-667), dropped
+    # null guard (CWE-476), dropped/flipped bounds — OOB read/write
+    # and off-by-one (CWE-125 / CWE-787 / CWE-193), call-order
+    # deviants — incorrect behavior order / TOCTOU shape (CWE-696 /
+    # CWE-367).
+    "consistency": frozenset({"CWE-125", "CWE-193", "CWE-252",
+                              "CWE-367", "CWE-401", "CWE-476",
+                              "CWE-667", "CWE-696", "CWE-787"}),
     "fail_open": frozenset({"CWE-636", "CWE-703"}),
     "integer": frozenset({"CWE-190", "CWE-191", "CWE-192", "CWE-197",
                           "CWE-681"}),
@@ -228,7 +238,7 @@ def discover_semgrep_rules(
     for d in dirs:
         for yf in sorted(list(d.glob("*.yaml")) + list(d.glob("*.yml"))):
             try:
-                doc = yaml.safe_load(yf.read_text(encoding="utf-8"))
+                doc = yaml.safe_load(yf.read_text(encoding="utf-8"))  # raw-open: operator-curated corpus rule fixture (eval lane)
             except (yaml.YAMLError, OSError, UnicodeDecodeError) as exc:
                 errors.append(f"{yf}: {exc}")
                 continue
@@ -288,7 +298,7 @@ def discover_cocci_rules(
     for path in sorted(rules_dir.glob("*.cocci")):
         cwes: set = set()
         try:
-            text = path.read_text(encoding="utf-8", errors="replace")
+            text = path.read_text(encoding="utf-8", errors="replace")  # raw-open: operator-curated corpus tree (eval lane)
         except OSError:
             continue
         for line in text.splitlines():
@@ -343,7 +353,7 @@ def discover_codeql_rules() -> list[RuleInfo]:
                                      frozenset({lang_dir.name}))
         for path in sorted(lang_dir.glob("*.ql")):
             try:
-                text = path.read_text(encoding="utf-8", errors="replace")
+                text = path.read_text(encoding="utf-8", errors="replace")  # raw-open: operator-curated corpus tree (eval lane)
             except OSError:
                 continue
             header = text.split("*/", 1)[0]
@@ -443,7 +453,7 @@ def find_engine_rules_base(
             project_name = pin.project
         if project_name and project_name != "-":
             proj = ProjectManager().load(project_name)
-            if proj is not None and getattr(proj, "output_dir", ""):
+            if proj is not None and getattr(proj, "output_dir", ""):  # type: ignore[arg-type]
                 candidates.append(Path(proj.output_dir) / "engine-rules")
         # Target-keyed standalone locations — the corpus fixture trees
         # are the "targets" here.
@@ -644,12 +654,17 @@ def run_cocci_engine(
     *,
     rules_dir: Path | None = None,
     timeout_per_rule: int = DEFAULT_SPATCH_TIMEOUT,
+    allow_scripting: bool = True,
 ) -> EngineOutcome:
     """Run the shipped .cocci rules over the excerpt tree.
 
     Mirrors the production cocci stage: ``--no-includes`` (excerpt
-    trees have no headers anyway) and ``allow_scripting=True`` — the
-    shipped rules are in-repo, code-trust content.
+    trees have no headers anyway) and ``allow_scripting=True`` by
+    default — a rationale that holds only for the SHIPPED rules
+    (in-repo, code-trust content). Graduated-rule callers pass
+    ``allow_scripting=False``: those rules arrive through the
+    synthesis pipeline, and script execution must not rest solely on
+    the synthesis-side persistence gate.
     """
     outcome = EngineOutcome(engine="coccinelle")
     from packages.coccinelle import runner as cocci_runner
@@ -673,7 +688,7 @@ def run_cocci_engine(
         excerpt, rules_dir,
         no_includes=True,
         timeout_per_rule=timeout_per_rule,
-        allow_scripting=True,
+        allow_scripting=allow_scripting,
     )
     for res in results:
         outcome.invocations += 1
@@ -829,7 +844,7 @@ def run_codeql_engine(
         if sarif_path and Path(sarif_path).is_file():
             from packages.semgrep.models import parse_sarif
 
-            findings = parse_sarif(Path(sarif_path).read_text(
+            findings = parse_sarif(Path(sarif_path).read_text(  # raw-open: SARIF produced by this harness run (eval lane)
                 encoding="utf-8", errors="replace",
             ))
             for f in findings:
@@ -1296,6 +1311,44 @@ def main(argv: list[str] | None = None) -> int:
         print("No labels found.", file=sys.stderr)
         return 1
 
+    # Synthetic mutants pin the UNMUTATED upstream; rule_eval scans
+    # the pinned sources as-is and never applies mutation specs, so
+    # running rules over a mutant label would score the CLEAN code
+    # against a defect expectation.  Skip taxonomy, never a failure —
+    # mutants evaluate through run_corpus's mutation-application step.
+    from .mutation import PROVENANCE_SYNTHETIC_MUTANT, label_kind
+
+    mutant_skips = [
+        {
+            "function_id": lb.function_id,
+            "reason": (
+                "synthetic_mutant label — rule_eval never applies "
+                "mutation specs (would score the clean code); "
+                "evaluate through run_corpus"
+            ),
+        }
+        for lb in labels
+        if label_kind(lb) == PROVENANCE_SYNTHETIC_MUTANT
+    ]
+    if mutant_skips:
+        skipped_ids = {s["function_id"] for s in mutant_skips}
+        labels = [
+            lb for lb in labels if lb.function_id not in skipped_ids
+        ]
+        print(
+            f"Skipping {len(mutant_skips)} synthetic_mutant label(s) "
+            f"(mutation application is a run_corpus step)",
+        )
+        if not labels:
+            print(
+                "All labels skipped (synthetic mutants) — nothing "
+                "to run.", file=sys.stderr,
+            )
+            for s in mutant_skips:
+                print(f"  {s['function_id']}: {s['reason']}",
+                      file=sys.stderr)
+            return 0
+
     engines = list(dict.fromkeys(args.engines)) or list(DEFAULT_ENGINES)
     print(f"Loaded {len(labels)} label(s); engines: {', '.join(engines)}")
 
@@ -1340,7 +1393,7 @@ def main(argv: list[str] | None = None) -> int:
           f"({len(discovery_errors)} discovery error(s))")
 
     evaluable: list[Any] = []
-    skipped_rows: list[dict[str, str]] = []
+    skipped_rows: list[dict[str, str]] = list(mutant_skips)
     for label in labels:
         status, detail = _label_source_status(label, source_dirs)
         if status == "ok":
@@ -1436,6 +1489,7 @@ def main(argv: list[str] | None = None) -> int:
                         grad = run_cocci_engine(
                             excerpt, rules_dir=grad_cocci,
                             timeout_per_rule=args.spatch_timeout,
+                            allow_scripting=False,
                         )
                         o = (
                             grad if o is None

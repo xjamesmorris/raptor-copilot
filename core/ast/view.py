@@ -52,8 +52,10 @@ from core.inventory.call_graph import (
     extract_call_graph_rust,
 )
 from core.inventory.extractors import extract_functions
+from core.source.contained import read_text_capped
 from core.inventory.languages import detect_language
 from typing import TYPE_CHECKING
+from core.source.lines import split_lines
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -125,10 +127,17 @@ def view(
         if language is None:
             return None
 
-    try:
-        content = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    # Guarded read: ``view`` runs against files inside untrusted
+    # target trees — a bare ``read_text`` blocks forever on a
+    # repo-planted reader-less FIFO and loads a planted multi-GB file
+    # whole. ``read_text_capped`` opens O_NOFOLLOW | O_NONBLOCK with an
+    # fstat(S_ISREG) fd check and caps the read; a function past the
+    # cap of a truncated read simply isn't found (None), the same
+    # degrade as an unreadable file.
+    got = read_text_capped(path)
+    if got is None:
         return None
+    content = got[0]
 
     # Function discovery — inventory handles per-language dispatch.
     functions = extract_functions(str(path), language, content)
@@ -149,12 +158,24 @@ def view(
         return None
     fi = matches[0]
 
-    # Calls — filter file-wide graph by the function's line range.
-    calls_made = _filter_calls(content, language, fi.line_start, fi.line_end)
+    # parse_origin: the call-graph and return walkers parse with
+    # tree-sitter; a budget-abandoned parse must name this file on
+    # the run's analysis-gap trail. (Function discovery above
+    # attributes itself — the extractor knows the path.)
+    from core.run.gaps import parse_origin
+    with parse_origin(path):
+        # Calls — filter file-wide graph by the function's line range.
+        calls_made = _filter_calls(
+            content, language, fi.line_start, fi.line_end,
+        )
 
-    # Returns + inline asm.
-    returns = _walk_returns(content, language, fi.line_start, fi.line_end)
-    has_asm = _has_inline_asm(content, language, fi.line_start, fi.line_end)
+        # Returns + inline asm.
+        returns = _walk_returns(
+            content, language, fi.line_start, fi.line_end,
+        )
+        has_asm = _has_inline_asm(
+            content, language, fi.line_start, fi.line_end,
+        )
 
     return FunctionView(
         function=fi.name,
@@ -165,7 +186,7 @@ def view(
         # by checking against the source length. Better than tripping
         # downstream assumptions about line_end being None.
         lines=(fi.line_start, fi.line_end if fi.line_end is not None else fi.line_start),
-        signature=fi.signature or "",
+        signature=fi.signature or "",  # type: ignore[attr-defined]
         calls_made=calls_made,
         returns=returns,
         has_inline_asm=has_asm,
@@ -338,16 +359,16 @@ def _ts_grammar_module(language: str):
             import tree_sitter_c as m
             return m
         if language == "cpp":
-            import tree_sitter_cpp as m
+            import tree_sitter_cpp as m  # type: ignore[no-redef]
             return m
         if language in ("javascript", "typescript", "tsx"):
-            import tree_sitter_javascript as m
+            import tree_sitter_javascript as m  # type: ignore[no-redef]
             return m
         if language == "java":
-            import tree_sitter_java as m
+            import tree_sitter_java as m  # type: ignore[no-redef]
             return m
         if language == "go":
-            import tree_sitter_go as m
+            import tree_sitter_go as m  # type: ignore[no-redef]
             return m
     except ImportError:
         return None
@@ -368,8 +389,11 @@ def _ts_grammar_module(language: str):
 # minimum the regex is the right precision/cost trade-off; a future
 # revision can switch to a tree-sitter ``gnu_asm_statement`` walk if
 # false positives surface in real corpora.
+# The optional qualifier gates its own trailing whitespace — the
+# naive ``\s*(?:volatile|goto)?\s*`` put two whitespace spans
+# around it, quadratic on an asm token followed by a whitespace run.
 _ASM_PATTERN = re.compile(
-    r"\b(__asm__|__asm|asm)\b\s*(?:volatile|goto)?\s*[(]",
+    r"\b(__asm__|__asm|asm)\b\s*(?:(?:volatile|goto)\s*)?[(]",
 )
 
 
@@ -387,6 +411,6 @@ def _has_inline_asm(
         return False
     # Slice the function body by lines (1-indexed). String slicing
     # is cheap relative to parsing the whole file again.
-    lines = content.splitlines()
+    lines = split_lines(content)
     body = "\n".join(lines[line_start - 1: line_end])
     return bool(_ASM_PATTERN.search(body))

@@ -84,7 +84,7 @@ class TestFindStaleAnnotations:
         (ann_dir / "src").mkdir(parents=True)
         (ann_dir / "src" / "auth.c.md").write_text(
             "## check_pw\n"
-            f"<!-- meta: status=clean hash={old_hash} line_start=1 line_end=1 -->\n\n"
+            f"<!-- meta: status=clean hash={old_hash} start_line=1 end_line=1 -->\n\n"
             "Was safe.\n"
         )
 
@@ -108,7 +108,7 @@ class TestFindStaleAnnotations:
         (ann_dir / "src").mkdir(parents=True)
         (ann_dir / "src" / "auth.c.md").write_text(
             "## check_pw\n"
-            f"<!-- meta: status=clean hash={current_hash} line_start=1 line_end=1 -->\n\n"
+            f"<!-- meta: status=clean hash={current_hash} start_line=1 end_line=1 -->\n\n"
             "Still safe.\n"
         )
 

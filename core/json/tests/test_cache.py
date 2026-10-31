@@ -411,15 +411,22 @@ def test_reaper_skipped_when_sentinel_is_fresh(
     to detect the call."""
     JsonCache(root=tmp_path)
     # Sentinel now exists with current mtime.
-    from core.json import cache as cache_mod
+    # Patch through the reaper's OWN globals rather than the
+    # sys.modules entry — suites that purge core.json.* from
+    # sys.modules (lazy-reexport tests) leave this file's JsonCache
+    # binding as a class whose function globals belong to a detached
+    # module object; a module-attr patch would
+    # then land on a fresh re-import the spy never observes, making
+    # the no-walk assertion vacuously true.
+    reaper_globals = JsonCache._reap_orphan_tempfiles.__globals__
     calls: list = []
-    original = cache_mod._iter_tempfile_candidates
+    original = reaper_globals["_iter_tempfile_candidates"]
 
     def spy(root, **kwargs):
         calls.append(str(root))
         return original(root, **kwargs)
 
-    monkeypatch.setattr(cache_mod, "_iter_tempfile_candidates", spy)
+    monkeypatch.setitem(reaper_globals, "_iter_tempfile_candidates", spy)
     JsonCache(root=tmp_path)
     cache_walks = [c for c in calls if str(tmp_path) in c]
     assert cache_walks == [], (
@@ -513,3 +520,21 @@ def test_memo_touch_keeps_hot_entry_alive(tmp_path: Path) -> None:
     assert "hot" in c._memo
     assert "cold_1" not in c._memo
     assert c.memo_evictions >= 1
+
+
+def test_nul_byte_key_degrades_never_crashes(tmp_path: Path) -> None:
+    # An embedded NUL survives segment sanitisation (unlike "..", it
+    # aliases nothing — the path simply cannot exist on disk) but the
+    # filesystem call itself raises ValueError, an exception type the
+    # OSError-only degrade handlers did not cover. Keys carry
+    # externally-influenced package names, and the documented
+    # contract is cache-degrades-never-crashes — so a NUL key must be
+    # a silent miss, not a consumer crash. Degenerate segments
+    # (".."), which CAN alias, stay loudly refused (pinned above).
+    cache = JsonCache(root=tmp_path)
+    cache.put("pkg\x00name", {"v": 1}, ttl_seconds=60)
+    assert cache.get("pkg\x00name", ttl_seconds=60) is None
+    cache.invalidate("pkg\x00name")
+    # And the cache still works for sane keys afterwards.
+    cache.put("pkg-name", {"v": 2}, ttl_seconds=60)
+    assert cache.get("pkg-name", ttl_seconds=60) == {"v": 2}

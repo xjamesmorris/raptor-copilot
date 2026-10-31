@@ -4,7 +4,7 @@ Three-tier pool:
 
   Bundled demo corpus      packages/llm_analysis/exploit_engine/eval/bundled_corpus/
                             ships with each RAPTOR release; immutable per release
-  Per-project (default)    <project>/labeled_attempts/<finding_id>/<oracle>-<ts>.json
+  Per-project (default)    <project>/labeled_attempts/<finding_signature>/<oracle>-<ts>.json
                             operator-owned, per-engagement, default writable
   Cross-project global     ~/.raptor/labeled_attempts/<finding_sig>/...
                             opt-in via ``/project corpus enable``
@@ -170,28 +170,51 @@ def _write_atomic(path: Path, payload: str, *, max_retries: int = 5) -> Path:
     # O_CREAT | O_EXCL: create new; fail if exists.
     # 0o600: records can carry target details and exploit payloads —
     # keep new files owner-only. Existing records are not migrated.
+    #
+    # Stage-then-link: the payload is written COMPLETELY to a private
+    # tmp name first (write-until-done loop — os.write may return
+    # short), then published under the final name with os.link, which
+    # fails with EEXIST instead of clobbering (rename would replace a
+    # racing writer's finished record). Readers therefore never see a
+    # truncated record at the final name, and a short write can no
+    # longer silently persist a partial JSON document.
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-    for _attempt_n in range(max_retries):
-        try:
-            fd = os.open(path, flags, 0o600)
-            try:
-                os.write(fd, payload.encode("utf-8"))
-            finally:
-                os.close(fd)
-            return path
-        except FileExistsError:
-            # Re-roll the random suffix and try again. Format is
-            # "<base>-<suffix>.json" — replace the suffix.
-            stem = path.stem  # e.g. "sandbox-20260603T140532.123Z-abc123"
-            base = "-".join(stem.split("-")[:-1])
-            new_suffix = secrets.token_hex(3)
-            path = path.with_name(f"{base}-{new_suffix}.json")
-            continue
-    msg = (
-        f"could not create unique filename after {max_retries} retries "
-        f"(this should never happen — bug?)"
+    data = payload.encode("utf-8")
+    tmp = path.with_name(
+        f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
     )
-    raise OSError(msg)
+    try:
+        fd = os.open(tmp, flags, 0o600)
+        try:
+            view = memoryview(data)
+            while view:
+                n = os.write(fd, view)
+                if n <= 0:  # defensive: only ever 0 on regular files
+                    msg = f"short write to {tmp} (os.write returned {n})"
+                    raise OSError(msg)
+                view = view[n:]
+        finally:
+            os.close(fd)
+        for _attempt_n in range(max_retries):
+            try:
+                os.link(tmp, path)
+                return path
+            except FileExistsError:
+                # Re-roll the random suffix and try again. Format is
+                # "<base>-<suffix>.json" — replace the suffix.
+                stem = path.stem  # e.g. "sandbox-2026...123Z-abc123"
+                base = "-".join(stem.split("-")[:-1])
+                new_suffix = secrets.token_hex(3)
+                path = path.with_name(f"{base}-{new_suffix}.json")
+                continue
+        msg = (
+            f"could not create unique filename after {max_retries} "
+            f"retries (this should never happen — bug?)"
+        )
+        raise OSError(msg)
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
 
 
 def write(
@@ -234,6 +257,36 @@ def write(
 # --------------------------------------------------------------------------
 
 
+def _read_record(record_file: Path) -> LabeledAttempt | None:
+    """Load one record file; ``None`` for corrupt / outdated /
+    unreadable records (retrieval is best-effort over the rest of the
+    corpus)."""
+    try:
+        data = load_json(
+            record_file, strict=True, max_bytes=8 * 1024 * 1024,
+        )
+        return LabeledAttempt.from_dict(data)
+    except (ValueError, KeyError, TypeError, OSError, AttributeError):
+        # OSError covers e.g. a permission-denied file in a shared
+        # pool; AttributeError covers valid JSON of the wrong shape
+        # (top-level array, non-dict sub-object).
+        _log.debug(
+            "skipping unreadable record %s", record_file,
+            exc_info=True,
+        )
+        return None
+
+
+def _iter_records_in_signature_dir(sig_dir: Path) -> Iterable[LabeledAttempt]:
+    """Yield every readable record in one ``<pool>/<signature>/`` dir."""
+    if not sig_dir.is_dir():
+        return
+    for record_file in sorted(sig_dir.glob("*.json")):
+        attempt = _read_record(record_file)
+        if attempt is not None:
+            yield attempt
+
+
 def _iter_records_in_dir(root: Path) -> Iterable[LabeledAttempt]:
     """Yield every readable record under ``root``. Unreadable files
     are skipped silently (an old schema with a missing required
@@ -243,23 +296,7 @@ def _iter_records_in_dir(root: Path) -> Iterable[LabeledAttempt]:
     for finding_dir in sorted(root.iterdir()):
         if not finding_dir.is_dir():
             continue
-        for record_file in sorted(finding_dir.glob("*.json")):
-            try:
-                data = load_json(
-                    record_file, strict=True, max_bytes=8 * 1024 * 1024,
-                )
-                yield LabeledAttempt.from_dict(data)
-            except (ValueError, KeyError, TypeError, OSError, AttributeError):
-                # Skip corrupt / outdated / unreadable records rather
-                # than fail the whole read. OSError covers e.g. a
-                # permission-denied file in a shared pool; AttributeError
-                # covers valid JSON of the wrong shape (top-level array,
-                # non-dict sub-object). Retrieval is best-effort.
-                _log.debug(
-                    "skipping unreadable record %s", record_file,
-                    exc_info=True,
-                )
-                continue
+        yield from _iter_records_in_signature_dir(finding_dir)
 
 
 def read_all(
@@ -371,16 +408,32 @@ def find_by_finding_signature(
     include_bundled: bool = True,
     include_global: bool = False,
 ) -> Iterable[LabeledAttempt]:
-    """Filter ``read_all`` to all attempts on a specific finding.
+    """All attempts on a specific finding, via direct directory lookup.
+
+    Records are laid out ``<pool>/<finding_signature>/*.json``, so the
+    lookup reads only that directory per enabled pool instead of
+    re-parsing every record in every pool (the pre-fix ``read_all``
+    scan). A ``signature`` that is not a legal finding signature
+    (types._VALID_SIGNATURE — also what makes the path join safe)
+    cannot exist in the store; yield nothing.
 
     Useful for "show me everything we've tried on this bug" reports.
     Returns records in arbitrary order; caller sorts by timestamp
     if needed.
     """
-    for attempt in read_all(
-        project_dir=project_dir,
-        include_bundled=include_bundled,
-        include_global=include_global,
-    ):
-        if attempt.finding_signature == signature:
-            yield attempt
+    from core.labeled_attempts.types import _VALID_SIGNATURE
+    if not _VALID_SIGNATURE.match(signature):
+        return
+    pools: list[Path] = []
+    if include_bundled:
+        pools.append(bundled_corpus_path())
+    if project_dir is not None:
+        pools.append(project_pool_path(project_dir))
+    if include_global:
+        pools.append(global_pool_path())
+    for pool in pools:
+        for attempt in _iter_records_in_signature_dir(pool / signature):
+            # A hand-moved record can disagree with its directory
+            # name; keep the pre-fix exact-match semantics.
+            if attempt.finding_signature == signature:
+                yield attempt

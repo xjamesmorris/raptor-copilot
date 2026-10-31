@@ -18,6 +18,7 @@ so every test runs against a fresh, usable key.
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 
@@ -26,6 +27,7 @@ import pytest
 from datetime import datetime, timezone
 
 from core.llm.scorecard import integrity
+from core.security import mac_key
 from core.llm.scorecard.scorecard import (
     EventType,
     ModelScorecard,
@@ -53,6 +55,16 @@ def _forged_cells(n_correct: int = 100000) -> dict:
                 },
             },
             "disagreement_samples": [],
+            # A competent forgery fabricates the target-diversity
+            # ledger too — the integrity layer, not the diversity
+            # gate, is what must stop this shape. (It also keeps the
+            # operator-adoption test honest: adopt restores FULL
+            # authority when the adopted history carries diversity.)
+            "repos": {
+                "0" * 16: _NOW_ISO,
+                "1" * 16: _NOW_ISO,
+                "2" * 16: _NOW_ISO,
+            },
         }}},
     }
 
@@ -108,6 +120,15 @@ def test_stamped_then_tampered_content_discarded(tmp_path):
     ) == Policy.LEARNING
 
 
+def _quarantines(path):
+    """All quarantine files for *path* (timestamped + legacy name)."""
+    found = sorted(path.parent.glob(path.name + ".*.unverified"))
+    legacy = path.with_suffix(path.suffix + ".unverified")
+    if legacy.exists():
+        found.append(legacy)
+    return found
+
+
 def test_unverified_content_never_restamped_by_write(tmp_path):
     # The laundering path: plant a forged file, then let an honest
     # writer record an event. The forged cells must NOT come back
@@ -124,9 +145,9 @@ def test_unverified_content_never_restamped_by_write(tmp_path):
     assert integrity.verify(
         on_disk, integrity.extract_token(on_disk),
     )
-    quarantine = path.with_suffix(path.suffix + ".unverified")
-    assert quarantine.exists()
-    saved = json.loads(quarantine.read_text(encoding="utf-8"))
+    quarantines = _quarantines(path)
+    assert len(quarantines) == 1
+    saved = json.loads(quarantines[0].read_text(encoding="utf-8"))
     assert "m" in saved["models"]                # audit trail kept
 
 
@@ -137,9 +158,7 @@ def test_read_only_paths_do_not_mutate_the_file(tmp_path):
     sc = ModelScorecard(path)
     assert sc.get_stats() == []                  # discarded in memory
     assert path.read_text(encoding="utf-8") == forged  # file untouched
-    assert not path.with_suffix(
-        path.suffix + ".unverified",
-    ).exists()
+    assert _quarantines(path) == []
 
 
 # ---------------------------------------------------------------------------
@@ -152,13 +171,15 @@ def test_honest_write_read_roundtrip_verifies_and_trusts(tmp_path):
     sc = ModelScorecard(path)
     # 200 zero-failure observations: Wilson 95% UB ~= 0.019, safely
     # under the 0.05 ceiling (50 would sit at ~0.071 and fall through).
+    # All earned on one target — the same-target grant is what spends.
     for _ in range(200):
         sc.record_event(
             "x:y", "m", EventType.CHEAP_SHORT_CIRCUIT, "correct",
+            repo="/proj/alpha",
         )
     # A fresh instance (fresh read) trusts the measured history.
     assert ModelScorecard(path).should_short_circuit(
-        "x:y", "m",
+        "x:y", "m", repo="/proj/alpha",
     ) == Policy.SHORT_CIRCUIT
     on_disk = json.loads(path.read_text(encoding="utf-8"))
     assert integrity.verify(on_disk, integrity.extract_token(on_disk))
@@ -181,7 +202,7 @@ def test_empty_or_absent_sidecar_is_fresh_not_suspect(tmp_path):
     ) == Policy.LEARNING
     path.write_text("", encoding="utf-8")
     assert ModelScorecard(path).get_stats() == []
-    assert not path.with_suffix(path.suffix + ".unverified").exists()
+    assert _quarantines(path) == []
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +225,7 @@ def test_key_unusable_clamps_but_keeps_content(tmp_path, _unusable_key):
     # ...but the trust surface clamps: no short-circuit.
     assert sc.should_short_circuit("x:y", "m") == Policy.LEARNING
     # No quarantine — this is an operator-side condition.
-    assert not path.with_suffix(path.suffix + ".unverified").exists()
+    assert _quarantines(path) == []
 
 
 def test_key_unusable_pin_clamp_directions(tmp_path, _unusable_key):
@@ -246,9 +267,8 @@ def test_adopt_from_quarantine_file(tmp_path):
     sc = ModelScorecard(path)
     # A write quarantines the unverified original...
     sc.record_event("a:b", "m2", EventType.JUDGE_REVIEW, "correct")
-    quarantine = path.with_suffix(path.suffix + ".unverified")
-    assert quarantine.exists()
-    # ...and adopt (defaulting to the quarantine) restores it.
+    assert len(_quarantines(path)) == 1
+    # ...and adopt (defaulting to the newest quarantine) restores it.
     assert sc.adopt_unverified() is True
     assert ModelScorecard(path).get_stat("x:y", "m") is not None
 
@@ -355,3 +375,99 @@ def test_truncated_key_file_reads_exact_length(tmp_path, monkeypatch) -> None:
     got = integrity._read_existing_key(key_file)
     assert isinstance(got, bytes)
     assert len(got) == 10
+
+
+# ---------------------------------------------------------------------------
+# Key-creation race: the loser must tolerate the winner's write gap
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def _race_warn_calls(monkeypatch):
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        integrity, "_warn_once_suspect_key",
+        lambda *args: calls.append(args),
+    )
+    return calls
+
+
+@pytest.fixture()
+def _lose_creation_race(monkeypatch, tmp_path):
+    """Make the key-create os.open lose the O_EXCL race."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    real_open = os.open
+
+    def fake_open(path, flags, mode=0o777):
+        if flags & os.O_EXCL:
+            raise FileExistsError(path)
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(os, "open", fake_open)
+    monkeypatch.setattr(mac_key.time, "sleep", lambda s: None)
+
+
+def test_race_loser_retries_through_empty_read(
+        monkeypatch, _race_warn_calls, _lose_creation_race) -> None:
+    """Between the winner's O_EXCL create and its write the key file
+    exists with 0 bytes. The loser must keep polling through that
+    transient shape and mint with the winner's full key — aborting on
+    the first short read left the loser's sidecar write unstamped and
+    flagged the operator's healthy key as suspect."""
+    full_key = b"k" * 32
+    reads = iter([None, b"", full_key])
+    monkeypatch.setattr(
+        integrity, "_read_existing_key", lambda path: next(reads),
+    )
+
+    assert integrity._load_or_create_key() == full_key
+    assert _race_warn_calls == []
+
+
+def test_persistent_wrong_length_warns_after_retries(
+        monkeypatch, _race_warn_calls, _lose_creation_race) -> None:
+    """A key file that STAYS short is genuinely suspect: the loop runs
+    out of retries, warns once, and refuses (None)."""
+    reads = itertools.chain([None], itertools.repeat(b"short"))
+    monkeypatch.setattr(
+        integrity, "_read_existing_key", lambda path: next(reads),
+    )
+
+    assert integrity._load_or_create_key() is None
+    assert len(_race_warn_calls) == 1
+    assert "wrong length" in _race_warn_calls[0][1]
+
+
+def test_repeated_quarantines_preserve_each_other(tmp_path, monkeypatch):
+    """Repeated tamper-then-rewrite cycles must not clobber earlier
+    quarantine evidence — each cycle gets its own timestamped file,
+    mirroring the ``.corrupt`` sibling. Pre-fix the fixed
+    ``.unverified`` name left only the LAST forgery for the operator
+    to inspect."""
+    import itertools
+
+    path = tmp_path / "sc.json"
+    # Distinct second per call — two quarantines within the same
+    # wall-clock second would share a name (same granularity
+    # trade-off as the .corrupt sibling).
+    ticks = itertools.count(1_000_000_001)
+
+    import core.llm.scorecard.scorecard as sc_mod
+    monkeypatch.setattr(sc_mod.time, "time", lambda: float(next(ticks)))
+
+    # First tamper + honest write → first quarantine.
+    path.write_text(json.dumps(_forged_cells()), encoding="utf-8")
+    sc = ModelScorecard(path)
+    sc.record_event("a:b", "m2", EventType.JUDGE_REVIEW, "correct")
+    assert len(_quarantines(path)) == 1
+
+    # Second tamper of the (now honest) sidecar + another write —
+    # the first quarantine must survive.
+    path.write_text(json.dumps(_forged_cells()), encoding="utf-8")
+    sc2 = ModelScorecard(path)
+    sc2.record_event("a:b", "m2", EventType.JUDGE_REVIEW, "correct")
+    q = _quarantines(path)
+    assert len(q) == 2
+    for f in q:
+        saved = json.loads(f.read_text(encoding="utf-8"))
+        assert "m" in saved["models"]

@@ -34,7 +34,9 @@ from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from core.json import save_json
-from core.sandbox import SandboxSetupError
+from core.sandbox import SandboxSetupError, executable_stage
+from core.security.log_sanitisation import sanitise_for_terminal
+from core.source import read_bytes_capped
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -53,6 +55,13 @@ _GCOV_TIMEOUT_S = 60
 # source size (low MB at the extreme); anything past the cap is
 # adversarial and gets truncated before parsing.
 _MAX_CAPTURE_BYTES = 4 * 1024 * 1024
+
+# Host-side cap on a single stdin replay input. Fuzz inputs are small
+# (AFL's default max is 1 MiB); 4 MiB matches the witness-intake cap,
+# so anything the bridge refuses here was never going to become a
+# witness either. Oversize means adversarial (or useless) — skip, never
+# truncate: a truncated input replays a DIFFERENT execution.
+_MAX_STDIN_INPUT_BYTES = 4 * 1024 * 1024
 
 _FUNC_RE = re.compile(r"^Function '(.+)'$")
 _FILE_RE = re.compile(r"^File '(.+)'$")
@@ -88,31 +97,62 @@ def _default_runner(
     for arg in cmd[1:]:
         try:
             p = Path(arg)
-            if p.is_file():
-                readable.add(str(p.resolve().parent))
+            # Read grants derive from lstat-honest paths only: the
+            # args come from target-writable dirs (queue/crashes
+            # entries, gcov data in the attacker-built tree), and
+            # resolving a symlinked arg grants its TARGET's parent —
+            # for a planted entry that hands the untrusted binary a
+            # read grant on an attacker-chosen host directory. A
+            # refused arg simply earns no grant; the sandbox then
+            # denies the read and that one replay fails, which is
+            # survivable.
+            if p.is_symlink() or not p.is_file():
+                continue
+            readable.add(str(p.resolve().parent))
         except OSError:
             continue
 
     is_gcov = Path(cmd[0]).name == "gcov"
-    proc = _sandbox_run(
-        cmd,
-        block_network=True,
-        target=str(workdir),
-        output=str(workdir),
-        readable_paths=sorted(readable),
-        cwd=str(workdir),
-        input=stdin_bytes,
-        stdout=subprocess.PIPE if is_gcov else subprocess.DEVNULL,
-        stderr=subprocess.PIPE if is_gcov else subprocess.DEVNULL,
-        timeout=timeout,
-        check=False,
-        caller_label="fuzz-coverage-bridge",
-        sanitise_host_fingerprint=True,
-    )
-    for stream in ("stdout", "stderr"):
-        data = getattr(proc, stream, None)
-        if isinstance(data, (bytes, str)) and len(data) > _MAX_CAPTURE_BYTES:
-            setattr(proc, stream, data[:_MAX_CAPTURE_BYTES])
+    if not is_gcov:
+        return _sandbox_run(
+            cmd,
+            block_network=True,
+            target=str(workdir),
+            output=str(workdir),
+            readable_paths=sorted(readable),
+            cwd=str(workdir),
+            input=stdin_bytes,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            check=False,
+            caller_label="fuzz-coverage-bridge",
+            sanitise_host_fingerprint=True,
+        )
+    # gcov output is captured via anonymous temp FILES, then read back
+    # capped: a PIPE buffers the whole stream in memory BEFORE any
+    # truncation could run, defeating the cap's stated purpose.
+    import tempfile
+    with tempfile.TemporaryFile() as out_fh, \
+            tempfile.TemporaryFile() as err_fh:
+        proc = _sandbox_run(
+            cmd,
+            block_network=True,
+            target=str(workdir),
+            output=str(workdir),
+            readable_paths=sorted(readable),
+            cwd=str(workdir),
+            input=stdin_bytes,
+            stdout=out_fh,
+            stderr=err_fh,
+            timeout=timeout,
+            check=False,
+            caller_label="fuzz-coverage-bridge",
+            sanitise_host_fingerprint=True,
+        )
+        for stream, fh in (("stdout", out_fh), ("stderr", err_fh)):
+            fh.seek(0)
+            setattr(proc, stream, fh.read(_MAX_CAPTURE_BYTES))
     return proc
 
 
@@ -131,12 +171,23 @@ def find_corpus_inputs(
     seen: set[Path] = set()
 
     def _add_dir(d: Path) -> None:
-        if not d.is_dir():
+        # lstat-honest selection over target-writable dirs: replay
+        # derives host-side reads (stdin mode) and sandbox read
+        # grants (file mode) from each selected input, so a planted
+        # symlink — at a directory component or at an entry — must
+        # never place a non-campaign file on the replay list.
+        if d.is_symlink() or not d.is_dir():
             return
         for f in sorted(d.iterdir()):
             if len(inputs) >= max_inputs:
                 return
-            if not f.is_file() or f.name == "README.txt":
+            if f.name == "README.txt":
+                continue
+            if f.is_symlink() or not f.is_file():
+                logger.warning(
+                    "corpus replay: refusing non-regular input %s",
+                    sanitise_for_terminal(str(f)),
+                )
                 continue
             rp = f.resolve()
             if rp in seen:
@@ -150,16 +201,21 @@ def find_corpus_inputs(
     # tolerated for operator-staged inputs but never produced.
     _add_dir(out_dir / "merged_crashes")
     _add_dir(afl_dir / "merged_crashes")
-    if afl_dir.is_dir():
-        for inst in sorted(afl_dir.iterdir()):
+    if afl_dir.is_dir() and not afl_dir.is_symlink():
+        # Instance dirs are target-writable names too: a symlinked
+        # instance routes crashes/queue at a foreign tree of REAL
+        # files that the per-entry check cannot see.
+        instances = [inst for inst in sorted(afl_dir.iterdir())
+                     if not inst.is_symlink()]
+        for inst in instances:
             _add_dir(inst / "crashes")
-        for inst in sorted(afl_dir.iterdir()):
+        for inst in instances:
             _add_dir(inst / "queue")
     # libFuzzer campaigns keep their working corpus and artifacts
     # under <out>/libfuzzer/ — without this branch they replayed zero
     # inputs and the bridge's coverage came only from stale counters.
     libfuzzer_dir = out_dir / "libfuzzer"
-    if libfuzzer_dir.is_dir():
+    if libfuzzer_dir.is_dir() and not libfuzzer_dir.is_symlink():
         _add_dir(libfuzzer_dir / "crashes")
         _add_dir(libfuzzer_dir / "corpus")
     return inputs
@@ -194,33 +250,52 @@ def replay_corpus(
     """
     binary = Path(binary)
     replayed = 0
-    for inp in inputs:
-        try:
-            if input_mode == "file":
-                runner(
-                    [str(binary), str(inp)],
-                    cwd=build_dir,
-                    timeout=_REPLAY_TIMEOUT_S,
-                )
-            else:
-                runner(
-                    [str(binary)],
-                    cwd=build_dir,
-                    stdin_bytes=inp.read_bytes(),
-                    timeout=_REPLAY_TIMEOUT_S,
-                )
-            replayed += 1
-        except (subprocess.TimeoutExpired, OSError):
-            continue
-        except SandboxSetupError:
-            # Sandbox isolation could not engage — fail loud rather
-            # than silently skipping every input (mirrors the
-            # afl-showmap sibling; the orchestrator surfaces this as
-            # a bridge failure and no unsandboxed replay happens).
-            raise
-        except Exception:
-            logger.debug("replay failed for %s", inp, exc_info=True)
-            continue
+    # Consented-exec staging: an env-built instrumented binary is
+    # 0444 in the run dir (core/env/build.py); replay a private
+    # 0o500 copy, staged once for the whole corpus.
+    with executable_stage(binary) as staged:
+        for inp in inputs:
+            try:
+                if input_mode == "file":
+                    runner(
+                        [str(staged), str(inp)],
+                        cwd=build_dir,
+                        timeout=_REPLAY_TIMEOUT_S,
+                    )
+                else:
+                    # Host-side read of a target-writable file: capped and
+                    # fd-honest (O_NOFOLLOW + fstat(S_ISREG) under the
+                    # hood). An unbounded by-name read_bytes() would
+                    # materialise a target-planted multi-GB file in host
+                    # RAM and follow a symlink at HOST (not sandbox)
+                    # privilege straight into the attacker binary's stdin.
+                    read = read_bytes_capped(inp, _MAX_STDIN_INPUT_BYTES)
+                    if read is None or read[1]:
+                        logger.warning(
+                            "corpus replay: skipping %s (non-regular, "
+                            "unreadable, or over %d bytes)",
+                            sanitise_for_terminal(str(inp)),
+                            _MAX_STDIN_INPUT_BYTES,
+                        )
+                        continue
+                    runner(
+                        [str(staged)],
+                        cwd=build_dir,
+                        stdin_bytes=read[0],
+                        timeout=_REPLAY_TIMEOUT_S,
+                    )
+                replayed += 1
+            except (subprocess.TimeoutExpired, OSError):
+                continue
+            except SandboxSetupError:
+                # Sandbox isolation could not engage — fail loud rather
+                # than silently skipping every input (mirrors the
+                # afl-showmap sibling; the orchestrator surfaces this as
+                # a bridge failure and no unsandboxed replay happens).
+                raise
+            except Exception:
+                logger.debug("replay failed for %s", inp, exc_info=True)
+                continue
     return replayed
 
 
@@ -571,6 +646,12 @@ _PAGE = 0x1000
 #: would turn the per-(pc, span) interval walk into a CPU/memory sink
 #: (millions of page candidates per pair). Real functions fit easily.
 _BASE_VOTE_MAX_SPAN = 256 * _PAGE
+#: Span COUNT cap for base voting. Span WIDTH is gated above, but the
+#: spans themselves build from the attacker-controlled checklist
+#: symtab, and the vote is O(sample x spans) — an unbounded span list
+#: is a CPU sink. Real binaries carry tens of thousands of functions
+#: at most.
+_BASE_VOTE_MAX_SPANS = 50_000
 #: Hit-validation sample for candidate SELECTION; the winner is then
 #: re-scored on the full PC set once.
 _BASE_VALIDATE_CAP = 200_000
@@ -594,6 +675,12 @@ def _base_candidates(pcs, spans) -> list:
     if len(sample) > _BASE_SAMPLE_CAP:
         stride = -(-len(sample) // _BASE_SAMPLE_CAP)
         sample = sample[::stride][:_BASE_SAMPLE_CAP]
+    if len(spans) > _BASE_VOTE_MAX_SPANS:
+        logger.debug(
+            "base vote: span list truncated %d -> %d (checklist symtab "
+            "is attacker-controlled)", len(spans), _BASE_VOTE_MAX_SPANS,
+        )
+        spans = spans[:_BASE_VOTE_MAX_SPANS]
     votes: Counter = Counter()
     for pc in sample:
         for start, end, _name in spans:
@@ -839,15 +926,28 @@ def emit_binary_fuzz_coverage(
     return out_path
 
 
+#: Budget for checklist.json — it lives in (or beside) the target-
+#: writable fuzz out dir, the same boundary MAX_TRACE_FILE_BYTES
+#: defends above. Real checklists (symtab of a large binary included)
+#: are a few MB.
+MAX_CHECKLIST_BYTES = 64 * 1024 * 1024
+
+
 def _load_binary_checklist(out_dir: Path) -> dict | None:
-    import json as _json
+    from core.json import load_json_bounded
     for cand in (out_dir / "checklist.json", out_dir.parent / "checklist.json"):
         if cand.is_file():
             try:
-                cl = _json.loads(cand.read_text())
+                # Budgeted loader: size is gated BEFORE the read, and
+                # the budget error subclasses ValueError so the
+                # malformed-file degrade below covers it.
+                cl = load_json_bounded(cand, max_bytes=MAX_CHECKLIST_BYTES)
             except (OSError, ValueError):
                 continue
-            if cl.get("target_kind") == "binary":
+            # Shape gate: a list-shaped (or otherwise non-object)
+            # planted file must degrade like a malformed one, not
+            # raise out of the .get() walk.
+            if isinstance(cl, dict) and cl.get("target_kind") == "binary":
                 return cl
     return None
 
@@ -860,7 +960,10 @@ def _binary_file_entry(checklist: dict | None, binary: Path) -> dict | None:
         wanted = binary_path_key(binary)
     except ImportError:
         wanted = f"binary:{Path(binary).stem}"
-    for fe in checklist.get("files", []):
-        if fe.get("path") == wanted:
+    files = checklist.get("files")
+    if not isinstance(files, list):
+        return None
+    for fe in files:
+        if isinstance(fe, dict) and fe.get("path") == wanted:
             return fe
     return None

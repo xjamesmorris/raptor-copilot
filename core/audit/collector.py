@@ -28,26 +28,116 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_GUARD_TYPE_VALUES = frozenset({
+    "bounds", "null_safety", "validation", "sanitisation",
+    "lifetime", "ordering", "concurrency", "other",
+})
+
+_FUNC_NAME_RE = None  # lazy compile
+
+
+def _get_func_name_re():
+    global _FUNC_NAME_RE
+    if _FUNC_NAME_RE is None:
+        import re
+        _FUNC_NAME_RE = re.compile(r"\b([a-zA-Z_][a-zA-Z0-9_]{2,})\s*\(")
+    return _FUNC_NAME_RE
+
+
+_NOISE_NAMES = frozenset({
+    "caller", "callers", "function", "method",
+    "return", "returns", "check", "checks",
+    "ensure", "ensures", "validate", "validates",
+    "NULL", "null", "True", "False", "None",
+    "assert", "sizeof", "static", "inline",
+})
+
+
+def extract_weaknesses(
+    hypotheses: list[dict[str, Any]],
+    function: str = "",
+    file: str = "",
+    cwe: str | None = None,
+) -> list[dict[str, Any]]:
+    """Extract weakness records from cross-function guard-shaped hypotheses.
+
+    A weakness is a hypothesis where the function's correctness depends
+    on an external entity (caller, framework) providing a guarantee it
+    does not verify itself.
+    """
+    result: list[dict[str, Any]] = []
+    pat = _get_func_name_re()
+    for h in hypotheses:
+        scope = str(h.get("counter_scope") or "").strip().lower()
+        if scope != "cross_function":
+            continue
+        guard_type = str(h.get("guard_type") or "").strip().lower()
+        if guard_type not in _GUARD_TYPE_VALUES:
+            continue
+        assumed = (h.get("assumed_property") or "").strip()
+        mechanism = (h.get("mechanism") or "").strip()
+        counter = (h.get("counter") or "").strip()
+        guarded_by: list[str] = []
+        if counter:
+            for m in pat.finditer(counter):
+                name = m.group(1)
+                if name not in _NOISE_NAMES and name != function:
+                    guarded_by.append(name)
+        w: dict[str, Any] = {
+            "property": assumed or mechanism[:200],
+            "guard_type": guard_type,
+            "assumed_by": f"{file}:{function}" if file else function,
+            "guarded_by": guarded_by,
+            "mechanism": mechanism[:200],
+            "source": "structured_pass",
+        }
+        h_cwe = h.get("cwe") or cwe
+        if h_cwe:
+            w["cwe_class"] = str(h_cwe)
+        result.append(w)
+    return result
+
 
 #: Per-run-dir snapshot of the latest journaled strategy set per
 #: reviewed site, for strategy inheritance on corrective re-journal
 #: writes (see ``_inherited_strategies``). Maps run-dir → (journal
 #: size at snapshot time, site → strategies). Built lazily on the
 #: first strategies-less audit write — the mid-loop review path
-#: always carries gap strategies and never touches this.
-_STRATEGY_SNAPSHOTS: dict[str, tuple[int, dict[tuple, list[str]]]] = {}
+#: always carries gap strategies and never touches this. A ``None``
+#: snapshot records a FAILED build (degraded — retried once the
+#: journal grows past the recorded size, like any lookup miss; the
+#: size is measured BEFORE the parse, so mid-parse growth fails
+#: toward a retry, never toward pinning the degraded marker).
+_STRATEGY_SNAPSHOTS: dict[str, tuple[int, dict[tuple, list[str]] | None]] = {}
 _STRATEGY_SNAPSHOTS_LOCK = threading.Lock()
 
 
 def _journal_size(out_dir: Path) -> int:
-    from .journal import JOURNAL_FILENAME
-    try:
-        return (out_dir / JOURNAL_FILENAME).stat().st_size
-    except OSError:
-        return 0
+    # Sum over the shard set: the snapshot key must keep growing
+    # monotonically across a shard roll, not reset to the new file.
+    from core.coverage.journal import journal_shard_paths
+    total = 0
+    for shard in journal_shard_paths(out_dir):
+        try:
+            total += shard.stat().st_size
+        except OSError:
+            continue
+    return total
 
 
-def _build_strategy_snapshot(out_dir: Path) -> dict[tuple, list[str]]:
+def _build_strategy_snapshot(out_dir: Path) -> dict[tuple, list[str]] | None:
+    """Parse the run's journal into a site → strategies map.
+
+    Returns ``None`` when the parse FAILED or the journal loaded
+    incompletely (memory-bounded loader stopped early) — an explicit
+    degraded marker, distinct from ``{}`` (parsed fine, nothing
+    eligible). A degraded parse must not pass off the rows it
+    happened to reach as the run's strategy state: a silently
+    returned partial map makes every site past the cutoff journal
+    corrective rows with ``strategies: []``, which cross-run verdict
+    reuse then refuses as ``strategy_changed`` — so the degrade is
+    uniform (no donations) and loud instead.
+    """
     snapshot: dict[tuple, list[str]] = {}
     try:
         from core.coverage import journal_mac
@@ -55,9 +145,23 @@ def _build_strategy_snapshot(out_dir: Path) -> dict[tuple, list[str]]:
         from .journal import (
             is_function_grade,
             is_mechanical_echo,
-            load_entries,
+            load_entries_checked,
         )
-        for e in load_entries(out_dir):
+        loaded = load_entries_checked(out_dir)
+        if not loaded.complete:
+            # An over-budget journal loads as a bounded PARTIAL list
+            # WITHOUT raising — the same silent-partial hazard as a
+            # mid-loop exception, so it takes the same uniform
+            # degrade (the reason string is loader-generated).
+            logger.warning(
+                "strategy-inheritance snapshot degraded for %s — the "
+                "journal loaded incompletely (%s); corrective journal "
+                "rows will record empty strategies until the journal "
+                "grows and a re-parse succeeds",
+                out_dir, loaded.reason,
+            )
+            return None
+        for e in loaded.entries:
             if e.verdict == "error" or not is_function_grade(e):
                 continue
             if getattr(e, "edge_callee", None):
@@ -78,14 +182,25 @@ def _build_strategy_snapshot(out_dir: Path) -> dict[tuple, list[str]]:
             if journal_mac.entry_provenance(e) != journal_mac.ROW_VERIFIED:
                 continue
             site = (e.file, e.function, e.line_start or 0)
-            # load_entries preserves append order; later entries
-            # overwrite so the newest record wins.
+            # Entries arrive in append order; later entries overwrite
+            # so the newest record wins.
             snapshot[site] = list(e.strategies)
-    except Exception:
-        logger.debug(
-            "strategy-inheritance snapshot failed for %s",
-            out_dir, exc_info=True,
+    except Exception as exc:
+        # The exception message can carry journal-derived bytes —
+        # escape and bound it before the operator-facing WARNING; the
+        # full traceback stays at DEBUG.
+        from core.security.log_sanitisation import sanitise_for_terminal
+        logger.warning(
+            "strategy-inheritance snapshot failed for %s — corrective "
+            "journal rows will record empty strategies until the "
+            "journal grows and a re-parse succeeds: %s",
+            out_dir,
+            sanitise_for_terminal(f"{type(exc).__name__}: {exc}"),
         )
+        logger.debug(
+            "strategy-inheritance snapshot detail", exc_info=True,
+        )
+        return None
     return snapshot
 
 
@@ -121,7 +236,14 @@ def _inherited_strategies(
     """
     key_dir = str(out_dir)
 
-    def _lookup(snapshot: dict[tuple, list[str]]) -> list[str] | None:
+    def _lookup(
+        snapshot: dict[tuple, list[str]] | None,
+    ) -> list[str] | None:
+        if snapshot is None:
+            # Degraded build — nothing donates (the caller's []
+            # fallback applies, same as a site the run never
+            # journaled).
+            return None
         found = snapshot.get((file, function, line_start or 0))
         if found is None and line_start:
             found = snapshot.get((file, function, 0))
@@ -212,7 +334,7 @@ def append_journal_for_outcome(
                     (gap.get("line_start", 0), gap.get("line_end")
                      or gap.get("line_start", 0)),
                     gap["edge_callee_file"],
-                    (callee_span[0], callee_span[1]),
+                    (callee_span[0], callee_span[1]),  # type: ignore[misc]
                 )
         else:
             from core.inventory.binary_builder import BINARY_PATH_PREFIX
@@ -244,6 +366,23 @@ def append_journal_for_outcome(
             {"mechanism": outcome.hypothesis, "confidence": "unknown"},
         ]
 
+    weaknesses: list[dict[str, Any]] | None = None
+    if hypotheses_list:
+        review_result = getattr(outcome, "review_result", None)
+        _cwe = (review_result.get("cwe") if review_result else None) or None
+        ws = extract_weaknesses(
+            hypotheses_list,
+            function=outcome.function,
+            file=outcome.file,
+            cwe=_cwe,
+        )
+        if ws:
+            weaknesses = ws
+            try:
+                outcome.weaknesses = ws
+            except Exception:
+                pass
+
     # ``evidence_tools`` is the CONFIRMING receipt only. The old union
     # with ``tools_dispatched`` blurred exactly the distinction
     # promotion_alarm documents as never-blur: a tool that
@@ -258,12 +397,20 @@ def append_journal_for_outcome(
     tools_dispatched = sorted(
         str(t) for t in (getattr(outcome, "tools_dispatched", None) or ())
     )
+    tools_skipped = sorted(
+        str(t) for t in (getattr(outcome, "tools_skipped", None) or ())
+    ) or None
 
     reading_list_items: list[str] = []
     review_result = getattr(outcome, "review_result", None)
     if review_result and review_result.get("reading_list"):
+        # LLM rows carry present-but-null / non-str questions; a
+        # .get default never fires on a present null, and the journal
+        # declares list[str] — route bad leaves to the str(item)
+        # fallback instead of persisting null.
         reading_list_items = [
-            item.get("question", str(item))
+            q if isinstance(q := item.get("question"), str) and q
+            else str(item)
             for item in review_result["reading_list"]
             if isinstance(item, dict)
         ]
@@ -317,6 +464,40 @@ def append_journal_for_outcome(
             logger.debug("domain model hash failed", exc_info=True)
             domain_model_hash = None
 
+    # Per-function domain-model slice stamp: the fingerprint of the
+    # domain-model prompt blocks THIS review was briefed with
+    # (same code path as build_context's assembly — see
+    # core.audit.context.domain_slice_hash_for). The gap fold's
+    # context-staleness gate compares it against a recompute so a
+    # model regeneration that leaves this function's slice
+    # byte-identical keeps the verdict reuse-eligible. Best-effort:
+    # any failure stamps nothing and the whole-model-hash behaviour
+    # applies (fail toward re-review). Edge rows and binary-path rows
+    # are not stamped — their prompt context is assembled differently
+    # and function-grade verdict reuse is what the stamp serves.
+    domain_slice_hash: str | None = None
+    if not edge_callee and domain_model_hash is not None:
+        try:
+            from core.inventory.binary_builder import BINARY_PATH_PREFIX
+            if not outcome.file.startswith(BINARY_PATH_PREFIX):
+                from .context import domain_slice_hash_for
+                domain_slice_hash = domain_slice_hash_for(
+                    out_dir,
+                    target_path,
+                    outcome.file,
+                    outcome.function,
+                    gap.get("line_start", 0),
+                    gap.get("line_end"),
+                )
+        except (ImportError, OSError):
+            domain_slice_hash = None
+        except Exception:
+            logger.debug(
+                "domain slice hash failed for %s:%s",
+                outcome.file, outcome.function, exc_info=True,
+            )
+            domain_slice_hash = None
+
     verdict_rationale = None
     counter_hypothesis = None
     if review_result:
@@ -356,6 +537,11 @@ def append_journal_for_outcome(
     context_reduced = bool(getattr(outcome, "context_reduced", False)) or None
     reused = bool(getattr(outcome, "reused", False)) or None
     reused_from_run = (getattr(outcome, "reused_from_run", "") or None) if reused else None
+    # Cadence-tick promotions journal immediately but unsettled: the
+    # mark rides into the row so readers (verdict reuse, report) can
+    # tell a finalized finding from one the post-loop passes have not
+    # yet confirmed or retracted.
+    provisional = bool(getattr(outcome, "provisional", False)) or None
 
     # Promotion-without-tool-evidence alarm: the journal write is the
     # chokepoint every review outcome flows through, so an evidence-less
@@ -392,6 +578,22 @@ def append_journal_for_outcome(
             gap.get("line_start", 0),
         ) or []
 
+    # External hypothesis-seed provenance: which sibling-hypotheses
+    # claims were injected into this review's context (id + source
+    # only — the claims themselves live in the seed file and the
+    # intake receipt). Audit-trail field, never verdict weight.
+    seed_provenance: list[dict] | None = None
+    stamped_seeds = gap.get("seed_hypotheses")
+    if isinstance(stamped_seeds, list) and stamped_seeds:
+        seed_provenance = [
+            {
+                "id": str(s.get("id", ""))[:200],
+                "source": str(s.get("source", ""))[:200],
+            }
+            for s in stamped_seeds
+            if isinstance(s, dict)
+        ] or None
+
     entry = ReviewJournalEntry(
         ts=now_iso(),
         run_id=run_id,
@@ -407,6 +609,7 @@ def append_journal_for_outcome(
         cwe=review_result.get("cwe") if review_result else None,
         strategies=strategies,
         domain_model_hash=domain_model_hash,
+        domain_slice_hash=domain_slice_hash,
         domain_concepts_available=domain_concepts,
         invariants_available=invariants_available,
         hypotheses=hypotheses_list,
@@ -416,6 +619,7 @@ def append_journal_for_outcome(
         model=getattr(outcome, "model", None) or None,
         evidence_tools=evidence_tools,
         tools_dispatched=tools_dispatched,
+        tools_skipped=tools_skipped,
         cost_usd=getattr(outcome, "cost_usd", None) or None,
         duration_s=getattr(outcome, "duration_s", None) or None,
         verdict_rationale=verdict_rationale,
@@ -423,7 +627,23 @@ def append_journal_for_outcome(
         context_reduced=context_reduced,
         reused=reused,
         reused_from_run=reused_from_run,
+        seed_provenance=seed_provenance,
+        # Seed-forced re-review marker (--seed-rereview): this row is
+        # a FRESH review of an already-covered function, scheduled by
+        # the hypothesis-seed intake. Provenance only, mirroring
+        # seed_provenance — no verdict weight; absent on ordinary
+        # rows.
+        seed_rereview=(True if gap.get("seed_rereview") else None),
+        provisional=provisional,
         producer=producer,
+        # Machine-readable failure class on error verdicts only:
+        # separates environment-caused non-reviews from genuine
+        # per-function review errors for journal readers.
+        error_class=(
+            (getattr(outcome, "error_class", "") or None)
+            if outcome.status == "error" else None
+        ),
+        weaknesses=weaknesses,
     )
     try:
         append_entry(out_dir, entry)
@@ -502,6 +722,11 @@ class Collector:
             entry["evidence_tool"] = outcome.evidence_tool
         if outcome.review_result and outcome.review_result.get("preconditions"):
             entry["preconditions"] = outcome.review_result["preconditions"]
+        if outcome.review_result and outcome.review_result.get("prompt_budget_event"):
+            # Prompt-budget disclosure (priority-0 elision / residual
+            # overshoot) rides the same per-row audit-log channel as
+            # preconditions.
+            entry["prompt_budget"] = outcome.review_result["prompt_budget_event"]
         strategies = gap.get("strategies")
         if strategies:
             entry["strategies"] = strategies
@@ -562,6 +787,16 @@ class Collector:
             from core.concepts.audit_bridge import _load_cached
             _load_cached.cache_clear()
 
+    def pending_count(self) -> int:
+        """Buffered rows not yet on disk — the journal checkpoint's
+        provably-empty assertion reads this AFTER :meth:`flush` (a
+        failed write retains its rows, and the checkpoint must skip
+        rather than compact across a write path it cannot prove
+        drained). Journal rows never buffer here (``submit`` appends
+        them synchronously), so zero means every submitted outcome is
+        on disk."""
+        return len(self._log_entries)
+
     def flush(self) -> None:
         """Write all buffered state to disk in bulk.
 
@@ -582,7 +817,10 @@ class Collector:
 
         try:
             self._flush_audit_log()
-        except (OSError, TypeError, ValueError):
+        except Exception:  # noqa: BLE001 — "never raises" must be exception-total:
+            # flush runs from end-of-run paths and the SIGTERM hook,
+            # where an uncaught row-shape surprise would take the
+            # whole shutdown path down with it.
             logger.warning(
                 "audit-log flush failed — %d buffered entries retained "
                 "for the next flush",
@@ -590,18 +828,29 @@ class Collector:
             )
 
     def _flush_audit_log(self) -> None:
-        """Append buffered rows via the hardened JSONL writer.
+        """Append buffered rows via the hardened, shard-rolling writer.
 
-        ``core.json.append_jsonl`` opens with O_APPEND|O_NOFOLLOW — a
-        symlink planted at the trail path in the target-writable run
-        dir is refused instead of followed (the bare ``open(..., "a")``
-        this replaces bypassed that hardening). Each written row is
-        popped immediately so a mid-batch failure retains only the
-        unwritten tail.
+        Each row goes through ``core.audit.record.append_audit_log``:
+        the O_APPEND|O_NOFOLLOW hardening (a symlink planted at the
+        trail path in the target-writable run dir is refused instead
+        of followed), the audit-log integrity stamp at the write
+        boundary (the buffered ``orchestrator_review`` rows are
+        exactly the class the resume reader grants suppression
+        authority), and per-row shard resolution — a large flush that
+        crosses the roll threshold moves to the next shard mid-batch
+        instead of pushing one shard past the reader's per-shard
+        budget. Written rows leave the buffer even when a mid-batch
+        append fails, so only the unwritten tail is retained for the
+        next flush (same retention contract as the pre-fix per-row
+        ``pop(0)``, without its O(n²) element shifts per flush).
         """
-        from core.json import append_jsonl
+        from .record import append_audit_log
 
-        log_path = self.out_dir / ".audit-log.jsonl"
-        while self._log_entries:
-            append_jsonl(log_path, self._log_entries[0], compact=True)
-            self._log_entries.pop(0)
+        written = 0
+        try:
+            while written < len(self._log_entries):
+                append_audit_log(
+                    self.out_dir, self._log_entries[written])
+                written += 1
+        finally:
+            del self._log_entries[:written]

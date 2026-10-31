@@ -2,23 +2,28 @@
 
 Sibling of the PyPI / npm / Go / Java tiers. Consumes Rust call-
 graph data emitted by ``core.inventory.call_graph.extract_call_graph_rust``
-and runs the cross-language resolver against OSV ``ecosystem_specific
-.imports[].symbols`` data.
+and runs the cross-language resolver against OSV symbol data.
 
 ## Verdict transitions
 
   * Any affected symbol CALLED -> ``likely_called``
-  * All affected symbols NOT_CALLED, none UNCERTAIN ->
-    ``not_function_reachable``
-  * Any UNCERTAIN OR mixed -> preserve existing verdict
+  * EVERY advisory-listed symbol evaluated and NOT_CALLED, none
+    UNCERTAIN -> ``not_function_reachable``
+  * Any UNCERTAIN, mixed, or unevaluable entry -> preserve existing
+    verdict
 
 ## Qualified-name shape
 
-Rust OSV records (RustSec advisories) ship symbols paired with
-the affected crate path. We construct ``<crate>::<symbol>`` and
-let the resolver match against project chains. The Rust extractor
-binds ``use foo::Bar`` -> ``imports["Bar"] = "foo::Bar"`` so chains
-like ``["Bar", "method"]`` resolve to ``foo::Bar.method``.
+RustSec advisories — the dominant Rust producer — ship per-function
+data as ``ecosystem_specific.affects.functions``: fully-qualified
+``crate::Type::method`` strings (live OSV export shape, e.g.
+RUSTSEC-2021-0003). The shared extractor also reads the Go-style
+``imports[].symbols`` and flat ``affected_symbols`` /
+``affected_functions`` shapes; ``::`` separators are normalised to
+dots. The Rust extractor's import map stores DOT-JOINED values
+(``use foo::Bar`` -> ``imports["Bar"] = "foo.Bar"`` — it keeps OSV
+symbol matching uniform), so chains like ``["Bar", "method"]``
+resolve to ``foo.Bar.method``.
 
 Limitation: instance-method calls where the variable name doesn't
 match the type (``let x = Bar::new(); x.method()``) won't bind —
@@ -40,6 +45,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _crate_head_fold(head: str) -> list[str]:
+    """Rust module spelling of a crate name: ``-`` folds to ``_``."""
+    return [head.replace("-", "_")] if "-" in head else []
+
+
 def build_cargo_symbol_map(
     osv_results: Iterable[Any] | None,
 ) -> dict[str, list[str]]:
@@ -56,7 +66,14 @@ def build_cargo_symbol_map(
         dep_name = dep_key.split(":", 1)[1].split("@", 1)[0]
         qualified: list[str] = []
         for adv in r.advisories:
-            qualified.extend(_extract_qualified(adv, dep_name))
+            # ``-``→``_`` is a Rust LANGUAGE RULE (crate ``foo-bar``
+            # is imported as ``foo_bar``), so the fold is exact:
+            # bare symbols under hyphenated crate names bind — and
+            # honestly downgrade — through the folded module name.
+            qualified.extend(_extract_qualified(
+                adv, dep_name,
+                head_fold=_crate_head_fold, fold_is_exact=True,
+            ))
         if qualified:
             out.setdefault(dep_key, []).extend(qualified)
     return {k: list(dict.fromkeys(v)) for k, v in out.items()}
@@ -70,12 +87,16 @@ def refine_cargo_verdicts(
     cargo_symbol_map: dict[str, list[str]],
     inventory: dict[str, Any] | None = None,
 ) -> None:
+    # The any-dot check skips deps whose advisory entries are ALL
+    # unresolved markers — nothing queryable, so the tier could
+    # neither upgrade nor honestly downgrade; don't pay for an
+    # inventory build to abstain.
     candidates = [
         d for d in deps
         if d.ecosystem == "Cargo"
         and out.get(d.key()) is not None
         and out[d.key()].verdict == "imported"
-        and cargo_symbol_map.get(d.key())
+        and any("." in q for q in cargo_symbol_map.get(d.key()) or [])
     ]
     if not candidates:
         return
@@ -109,6 +130,7 @@ def refine_cargo_verdicts(
         if not paired:
             continue
         verdicts = {r.verdict for _, r in paired}
+        covered = len(paired) == len(qualified_names)
         if Verdict.CALLED in verdicts:
             evidence: list[str] = []
             called: list[str] = []
@@ -128,7 +150,12 @@ def refine_cargo_verdicts(
                 ),
                 affected_summary=affected,
             )
-        elif Verdict.UNCERTAIN in verdicts:
+        elif Verdict.UNCERTAIN in verdicts or not covered:
+            # ``not covered``: some advisory entry never paired — an
+            # UNRESOLVED_ENTRY marker (bare symbol under a
+            # non-namespace crate spelling) or a resolver refusal.
+            # Downgrading on the bindable remainder alone would be a
+            # false suppression → abstain.
             continue
         else:
             out[d.key()] = Reachability(

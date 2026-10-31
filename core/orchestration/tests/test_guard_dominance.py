@@ -156,6 +156,16 @@ class TestApplyToFindings:
     @pytest.mark.parametrize("mutate", [
         {"status": "disproven"},
         {"ruling": {"status": "ruled_out"}},
+        # /agentic emits bare-STRING rulings (documented shape);
+        # pre-fix the dict .get() crashed on them mid-Stage-D prep.
+        {"ruling": "ruled_out"},
+        # The skip recognises the SHARED negative-verdict vocabulary,
+        # not the "ruled_out" literal — /agentic rules out as
+        # "false_positive", /validate as "disproven"; each burned a
+        # cap slot on an already-ruled-out claim.
+        {"ruling": "false_positive"},
+        {"ruling": "disproven"},
+        {"ruling": {"status": "false_positive"}},
         {"manual_override": True},
         {"guard_dominance": {"outcome": "refuted"}},
     ])
@@ -165,6 +175,20 @@ class TestApplyToFindings:
         stats = apply_to_findings([finding], [], Path("/t"), object())
         assert stats["checked"] == 0
         assert calls == []
+
+    @pytest.mark.parametrize("ruling", [
+        # Skip-too-wide is the harmful other direction: positive,
+        # unknown, and junk rulings must keep the finding checkable
+        # (and never crash the pre-filter).
+        "validated", "confirmed", "not_a_verdict", None, 7,
+        {"status": "validated"},
+    ])
+    def test_non_negative_ruling_shapes_stay_in_play(
+            self, monkeypatch, ruling):
+        _patch_query(monkeypatch, "inconclusive")
+        finding = _finding(ruling=ruling)
+        stats = apply_to_findings([finding], [], Path("/t"), object())
+        assert stats["checked"] == 1
 
     def test_cap_bounds_queries(self, monkeypatch):
         calls = _patch_query(monkeypatch, "inconclusive")

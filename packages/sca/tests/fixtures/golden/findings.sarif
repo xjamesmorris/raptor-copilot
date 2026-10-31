@@ -1,0 +1,395 @@
+{
+  "$schema": "https://docs.oasis-open.org/sarif/sarif/v2.1.0/os/schemas/sarif-schema-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "raptor-sca",
+          "version": "0.1",
+          "informationUri": "https://github.com/gadievron/raptor",
+          "rules": [
+            {
+              "id": "sca:vulnerable_dependency",
+              "name": "VulnerableDependency",
+              "shortDescription": {
+                "text": "A direct or transitive dependency matches a known CVE/GHSA advisory and should be upgraded."
+              },
+              "fullDescription": {
+                "text": "A direct or transitive dependency matches a known CVE/GHSA advisory and should be upgraded."
+              },
+              "helpUri": "https://github.com/gadievron/raptor",
+              "properties": {
+                "tags": [
+                  "security",
+                  "raptor",
+                  "vulnerability",
+                  "cve"
+                ]
+              }
+            },
+            {
+              "id": "sca:hygiene:loose_pin",
+              "name": "LoosePin",
+              "shortDescription": {
+                "text": "A dependency uses caret/tilde/range pinning. New patch versions land silently and may introduce vulns the operator ca..."
+              },
+              "fullDescription": {
+                "text": "A dependency uses caret/tilde/range pinning. New patch versions land silently and may introduce vulns the operator can't audit."
+              },
+              "helpUri": "https://github.com/gadievron/raptor",
+              "properties": {
+                "tags": [
+                  "security",
+                  "raptor",
+                  "hygiene",
+                  "supply-chain"
+                ]
+              }
+            },
+            {
+              "id": "sca:supply_chain:typosquat_candidate",
+              "name": "TyposquatCandidate",
+              "shortDescription": {
+                "text": "The dependency name is one or two edits away from a popular package and may be a typosquat targeting that package."
+              },
+              "fullDescription": {
+                "text": "The dependency name is one or two edits away from a popular package and may be a typosquat targeting that package."
+              },
+              "helpUri": "https://github.com/gadievron/raptor",
+              "properties": {
+                "tags": [
+                  "security",
+                  "raptor",
+                  "supply-chain"
+                ]
+              }
+            },
+            {
+              "id": "sca:supply_chain:image_capability_drift",
+              "name": "sca_supply_chain_image_capability_drift",
+              "shortDescription": {
+                "text": "RAPTOR /sca finding of type `sca:supply_chain:image_capability_drift`."
+              },
+              "fullDescription": {
+                "text": "RAPTOR /sca finding of type `sca:supply_chain:image_capability_drift`."
+              },
+              "helpUri": "https://github.com/gadievron/raptor",
+              "properties": {
+                "tags": [
+                  "security",
+                  "raptor",
+                  "supply-chain"
+                ]
+              }
+            },
+            {
+              "id": "sca:license:denied",
+              "name": "sca_license_denied",
+              "shortDescription": {
+                "text": "RAPTOR /sca finding of type `sca:license:denied`."
+              },
+              "fullDescription": {
+                "text": "RAPTOR /sca finding of type `sca:license:denied`."
+              },
+              "helpUri": "https://github.com/gadievron/raptor",
+              "properties": {
+                "tags": [
+                  "security",
+                  "raptor"
+                ]
+              }
+            },
+            {
+              "id": "sca:scan_health:osv_lookup_failed",
+              "name": "sca_scan_health_osv_lookup_failed",
+              "shortDescription": {
+                "text": "RAPTOR /sca finding of type `sca:scan_health:osv_lookup_failed`."
+              },
+              "fullDescription": {
+                "text": "RAPTOR /sca finding of type `sca:scan_health:osv_lookup_failed`."
+              },
+              "helpUri": "https://github.com/gadievron/raptor",
+              "properties": {
+                "tags": [
+                  "security",
+                  "raptor"
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "results": [
+        {
+          "ruleId": "sca:vulnerable_dependency",
+          "ruleIndex": 0,
+          "level": "error",
+          "message": {
+            "text": "lodash@4.17.20: Command injection in template (CVE-2021-23337) [KEV] [EPSS 0.97]"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "package.json"
+                },
+                "region": {
+                  "startLine": 1
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "raptorScaFingerprint": "ce2b734c7d4835e9"
+          },
+          "properties": {
+            "tags": [
+              "security",
+              "raptor",
+              "vulnerability",
+              "cve"
+            ],
+            "ecosystem": "npm",
+            "name": "lodash",
+            "version": "4.17.20",
+            "purl": "pkg:npm/lodash@4.17.20",
+            "advisory_id": "GHSA-aaaa-bbbb-cccc",
+            "aliases": [
+              "CVE-2021-23337"
+            ],
+            "in_kev": true,
+            "epss": 0.97,
+            "fixed_version": "4.17.21",
+            "cvss_score": 9.8,
+            "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+            "transitive_depth": 0,
+            "reachability_verdict": "likely_called"
+          }
+        },
+        {
+          "ruleId": "sca:vulnerable_dependency",
+          "ruleIndex": 0,
+          "level": "warning",
+          "message": {
+            "text": "requests@2.19.0: Credentials leak on redirect (CVE-2018-18074) [EPSS 0.12]"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "requirements.txt"
+                },
+                "region": {
+                  "startLine": 1
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "raptorScaFingerprint": "25d2576fc2e1eae1"
+          },
+          "properties": {
+            "tags": [
+              "security",
+              "raptor",
+              "vulnerability",
+              "cve"
+            ],
+            "ecosystem": "PyPI",
+            "name": "requests",
+            "version": "2.19.0",
+            "purl": "pkg:pypi/requests@2.19.0",
+            "advisory_id": "GHSA-dddd-eeee-ffff",
+            "aliases": [
+              "CVE-2018-18074"
+            ],
+            "in_kev": false,
+            "epss": 0.12,
+            "fixed_version": "2.20.0",
+            "cvss_score": 5.0,
+            "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+            "transitive_depth": 0,
+            "reachability_verdict": "not_evaluated"
+          },
+          "suppressions": [
+            {
+              "kind": "external",
+              "status": "accepted",
+              "justification": "accepted: internal-only service"
+            }
+          ]
+        },
+        {
+          "ruleId": "sca:hygiene:loose_pin",
+          "ruleIndex": 1,
+          "level": "note",
+          "message": {
+            "text": "express uses a caret range; patch releases land silently"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "package.json"
+                },
+                "region": {
+                  "startLine": 1
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "raptorScaFingerprint": "a76508dc19b7136b"
+          },
+          "properties": {
+            "tags": [
+              "security",
+              "raptor",
+              "hygiene",
+              "supply-chain"
+            ],
+            "ecosystem": "npm",
+            "name": "express",
+            "version": "4.0.0",
+            "purl": "pkg:npm/express@4.0.0"
+          }
+        },
+        {
+          "ruleId": "sca:supply_chain:typosquat_candidate",
+          "ruleIndex": 2,
+          "level": "error",
+          "message": {
+            "text": "reqeusts is 1 edit from requests (top-1k package)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "requirements.txt"
+                },
+                "region": {
+                  "startLine": 1
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "raptorScaFingerprint": "7d3533a06fb3ccdd"
+          },
+          "properties": {
+            "tags": [
+              "security",
+              "raptor",
+              "supply-chain"
+            ],
+            "ecosystem": "PyPI",
+            "name": "reqeusts",
+            "version": "1.0.0"
+          }
+        },
+        {
+          "ruleId": "sca:supply_chain:image_capability_drift",
+          "ruleIndex": 3,
+          "level": "warning",
+          "message": {
+            "text": "rebuilt image gained network capability"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "Dockerfile"
+                },
+                "region": {
+                  "startLine": 1
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "raptorScaFingerprint": "35e76a26a1071085"
+          },
+          "properties": {
+            "tags": [
+              "security",
+              "raptor",
+              "supply-chain"
+            ],
+            "ecosystem": "OCI",
+            "name": "alpine",
+            "version": "3.19"
+          }
+        },
+        {
+          "ruleId": "sca:license:denied",
+          "ruleIndex": 4,
+          "level": "error",
+          "message": {
+            "text": "left-pad is AGPL-3.0-only; policy denies AGPL"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "package.json"
+                },
+                "region": {
+                  "startLine": 1
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "raptorScaFingerprint": "832e2862ffb19560"
+          },
+          "properties": {
+            "tags": [
+              "security",
+              "raptor"
+            ],
+            "ecosystem": "npm",
+            "name": "left-pad",
+            "version": "1.3.0",
+            "purl": "pkg:npm/left-pad@1.3.0"
+          }
+        },
+        {
+          "ruleId": "sca:scan_health:osv_lookup_failed",
+          "ruleIndex": 5,
+          "level": "note",
+          "message": {
+            "text": "OSV lookups failed transiently for 1 ecosystem"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": ""
+                },
+                "region": {
+                  "startLine": 1
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "raptorScaFingerprint": "02dda818dab8eb10"
+          },
+          "properties": {
+            "tags": [
+              "security",
+              "raptor"
+            ]
+          }
+        }
+      ],
+      "invocations": [
+        {
+          "executionSuccessful": true,
+          "endTimeUtc": "2025-06-01T00:00:00Z"
+        }
+      ]
+    }
+  ]
+}

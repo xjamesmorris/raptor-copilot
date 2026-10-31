@@ -19,7 +19,10 @@ import re
 
 from ..models import Confidence, Reachability
 from ._shared import format_evidence as _format_evidence
+from ._shared import iter_matches_with_lines as _iter_matches_with_lines
+from ..parsers import _safe_read
 from typing import TYPE_CHECKING
+from core.source.lines import split_lines
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -31,8 +34,11 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MAX_DEPTH = 12
 
 # Single-line: ``import "foo"`` (with optional alias prefix).
+# Leading indent is HORIZONTAL-only ([^\S\n]): under MULTILINE the
+# ``^\s*`` spelling re-scans a run of blank lines from every line
+# start inside it — quadratic on attacker-supplied source files.
 _IMPORT_SINGLE_RE = re.compile(
-    r'^\s*import\s+(?:[A-Za-z_][A-Za-z0-9_]*\s+)?"([^"]+)"',
+    r'^[^\S\n]*import\s+(?:[A-Za-z_][A-Za-z0-9_]*\s+)?"([^"]+)"',
     re.MULTILINE,
 )
 # Block form: ``import (\n  "foo"\n  alias "bar"\n)``. Only the
@@ -41,8 +47,12 @@ _IMPORT_SINGLE_RE = re.compile(
 # inside a trailing comment (``"fmt" // formatting (stdlib)``) and
 # silently drops every subsequent import.
 _IMPORT_BLOCK_OPEN_RE = re.compile(r"^\s*import\s*\(")
+# Applied per-line via ``.match`` (no blank-run exposure), but the
+# indent keeps the horizontal spelling anyway — identical match set
+# on a single line, and no MULTILINE ^\s* member for the idiom
+# census to chase.
 _BLOCK_LINE_RE = re.compile(
-    r'^\s*(?:[A-Za-z_][A-Za-z0-9_]*\s+)?"([^"]+)"',
+    r'^[^\S\n]*(?:[A-Za-z_][A-Za-z0-9_]*\s+)?"([^"]+)"',
     re.MULTILINE,
 )
 
@@ -55,10 +65,8 @@ def scan_imports(
     out: dict[str, list[tuple[Path, int, bool]]] = {}
     for go_file in _walk_go_sources(target, max_depth=max_depth):
         is_test = _is_test_file(go_file)
-        try:
-            text = go_file.read_text(encoding="utf-8", errors="replace")
-        except OSError as e:
-            logger.debug("sca.reachability.gomod: skip %s (%s)", go_file, e)
+        text = _safe_read.read_bounded(go_file, follow_symlinks=False)
+        if text is None:
             continue
         for path, line in _imports_in(text):
             out.setdefault(path, []).append((go_file, line, is_test))
@@ -141,27 +149,30 @@ def _grep_symbols(
     Returns the subset of ``symbols`` that were found (identifier-boundary
     match, not substring).
     """
+    # Stream file-by-file: buffering every importing file's full
+    # text simultaneously (then joining, doubling it) held multiple
+    # bounded-at-50MB files in memory at once with no total budget.
+    # One file is resident at a time; symbols already found are not
+    # re-searched, and the sweep stops early once every symbol hit.
+    patterns = {
+        sym: re.compile(r"\b" + re.escape(sym) + r"\b")
+        for sym in dict.fromkeys(symbols)
+    }
+    found: set[str] = set()
     files_checked: set = set()
-    file_contents: dict[Path, str] = {}
     for f, _, _ in hits:
         if f in files_checked:
             continue
         files_checked.add(f)
-        try:
-            file_contents[f] = f.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        if len(found) == len(patterns):
+            break
+        text = _safe_read.read_bounded(f, follow_symlinks=False)
+        if text is None:
             continue
-
-    if not file_contents:
-        return []
-
-    found: list[str] = []
-    combined = "\n".join(file_contents.values())
-    for sym in symbols:
-        pat = re.compile(r"\b" + re.escape(sym) + r"\b")
-        if pat.search(combined):
-            found.append(sym)
-    return found
+        for sym, pat in patterns.items():
+            if sym not in found and pat.search(text):
+                found.add(sym)
+    return [sym for sym in patterns if sym in found]
 
 
 # ---------------------------------------------------------------------------
@@ -190,25 +201,27 @@ def _code_before_close(line: str) -> tuple[str, bool]:
 
 
 def _imports_in(text: str) -> Iterable[tuple[str, int]]:
-    # Single-line.
-    for m in _IMPORT_SINGLE_RE.finditer(text):
-        yield m.group(1), text.count("\n", 0, m.start()) + 1
+    # Single-line. Rolling-cursor line numbers — the naive
+    # full-prefix count is quadratic on dense-import files.
+    for m, line in _iter_matches_with_lines(
+            text, _IMPORT_SINGLE_RE.finditer(text)):
+        yield m.group(1), line
     # Block form — parsed line-wise from ``import (`` to the line
     # carrying the unquoted closing ``)``.
     in_block = False
-    for line_no, line in enumerate(text.splitlines(), start=1):
+    for line_no, line in enumerate(split_lines(text), start=1):  # type: ignore[assignment]
         if not in_block:
-            open_m = _IMPORT_BLOCK_OPEN_RE.match(line)
+            open_m = _IMPORT_BLOCK_OPEN_RE.match(line)  # type: ignore[call-overload]
             if not open_m:
                 continue
             # Same-line body (``import ( "fmt" )``) is legal Go.
-            code, closed = _code_before_close(line[open_m.end():])
+            code, closed = _code_before_close(line[open_m.end():])  # type: ignore[index]
             line_m = _BLOCK_LINE_RE.match(code.lstrip())
             if line_m:
                 yield line_m.group(1), line_no
             in_block = not closed
         else:
-            code, closed = _code_before_close(line)
+            code, closed = _code_before_close(line)  # type: ignore[arg-type]
             line_m = _BLOCK_LINE_RE.match(code)
             if line_m:
                 yield line_m.group(1), line_no

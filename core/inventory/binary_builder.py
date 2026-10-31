@@ -197,11 +197,19 @@ def build_binary_checklist(
         # Duplicate symbol names (cross-TU statics, or a forged
         # symtab aliasing a hot name) would collapse journal/coverage
         # keys — every instance after the first gets an address
-        # suffix so each function keys uniquely.
+        # suffix so each function keys uniquely. The minted spelling
+        # itself is forgeable (a symtab entry literally named
+        # "foo@0x.." collides with the disambiguation of a duplicate
+        # foo at that address), so minted names join the seen set and
+        # re-disambiguate until unique.
         item_name = func.name
         if item_name in seen_names:
             item_name = f"{func.name}@{func.address:#x}"
+            while item_name in seen_names:
+                item_name += "+"
         seen_names[func.name] = seen_names.get(func.name, 0) + 1
+        if item_name != func.name:
+            seen_names[item_name] = seen_names.get(item_name, 0) + 1
 
         item: Dict[str, Any] = {
             "name": item_name,
@@ -234,6 +242,18 @@ def build_binary_checklist(
 
     binary_provenance = _binary_provenance_block(bp, db)
 
+    file_entry: Dict[str, Any] = {
+        "path": path_key,
+        "language": "binary",
+        "lines": 0,
+        "sloc": 0,
+        "sha256": binary_sha,
+        "items": items,
+    }
+    identity_block = _module_identity_block(bp, binary_sha, db)
+    if identity_block:
+        file_entry["module_identity"] = identity_block
+
     return {
         "generated_at": datetime.now(tz=timezone.utc).isoformat(),
         "target_path": str(bp),
@@ -244,16 +264,7 @@ def build_binary_checklist(
         "skipped_files": 0,
         "excluded_patterns": [],
         "excluded_files": [],
-        "files": [
-            {
-                "path": path_key,
-                "language": "binary",
-                "lines": 0,
-                "sloc": 0,
-                "sha256": binary_sha,
-                "items": items,
-            },
-        ],
+        "files": [file_entry],
         "target_kind": "binary",
         "target_kind_reason": "binary target (REDatabase)",
         "target_kind_source": db.source_tool,
@@ -271,6 +282,58 @@ def build_binary_checklist(
             "provenance": binary_provenance,
         },
     }
+
+
+def _module_identity_block(
+    bp, binary_sha: str, db,
+) -> Dict[str, Any]:
+    """Content-identity block for the checklist's file entry.
+
+    ``{"kind", "value", "anchor"[, "image_base"]}`` — the join keys a
+    fid-carrying consumer (hypothesis-seed intake, ``--pin``) needs to
+    resolve ``<anchor>:0x<rel>`` back into this file's address space.
+    Identity comes from the kind-aware front door
+    (:func:`core.binary.identity.content_identity`); when the binary
+    is no longer readable the already-computed content hash still
+    identifies (same preference :func:`core.binary.addrmap.module_anchor`
+    applies). ``image_base`` appears only when the producer RECORDED
+    one (:func:`core.binary.addrmap.image_base` — absent means no
+    fid can resolve here, fail-closed, never a substituted 0).
+    Best-effort: an empty dict on any failure, the checklist schema
+    is unchanged for consumers that do not know the key.
+    """
+    block: Dict[str, Any] = {}
+    try:
+        ident = None
+        path = Path(bp)
+        if path.is_file():
+            from core.binary.identity import content_identity
+            ident = content_identity(path)
+        if ident is not None:
+            block = {
+                "kind": ident.kind,
+                "value": ident.value,
+                "anchor": ident.anchor_hex,
+            }
+        elif binary_sha:
+            from core.binary.identity import KIND_SHA256, identity_anchor
+            anchor = identity_anchor(KIND_SHA256, binary_sha)
+            if anchor is not None:
+                block = {
+                    "kind": KIND_SHA256,
+                    "value": binary_sha,
+                    "anchor": anchor,
+                }
+        if block:
+            from core.binary.addrmap import image_base
+            base = image_base(db)
+            if base is not None:
+                block["image_base"] = base
+    except Exception:
+        logger.debug("module identity probe failed for %s", bp,
+                     exc_info=True)
+        return {}
+    return block
 
 
 def _item_name_provenance(func) -> str:

@@ -4,10 +4,12 @@ witness/feasibility evidence records (W1 witness/verdict provenance).
 
 from __future__ import annotations
 
+import itertools
 import os
 
 import pytest
 
+from core.security import mac_key
 from core.witness import provenance as prov
 
 
@@ -212,13 +214,212 @@ class TestSanitiseFindingsEvidence:
         assert f["final_status"] == "confirmed_unverified"
         assert f["is_exploitable"] is False
 
+    def test_junk_exploitable_shape_normalised_on_demotion(self, tmp_path):
+        # A junk verdict shape is not a claim to demote to False,
+        # but this is a sanitisation chokepoint: the junk value is
+        # normalised to the explicit abstention (None) so external
+        # truthy readers of the sanitised output can't consume it.
+        f = _finding(final_status="likely_exploitable", is_exploitable="yes")
+        stats = prov.sanitise_findings_evidence({"findings": [f]}, tmp_path)
+        assert stats["final_status_demoted"] == 1
+        assert f["is_exploitable"] is None
+
+    def test_abstained_exploitable_untouched_on_demotion(self, tmp_path):
+        # Explicit None stays None — no fabricated False.
+        f = _finding(final_status="likely_exploitable", is_exploitable=None)
+        stats = prov.sanitise_findings_evidence({"findings": [f]}, tmp_path)
+        assert stats["final_status_demoted"] == 1
+        assert f["is_exploitable"] is None
+
+    def test_absent_exploitable_stays_absent_on_demotion(self, tmp_path):
+        # No is_exploitable key at all: the demotion clamps
+        # final_status but never materialises the key — absence and
+        # the explicit None are both abstentions, and the chokepoint
+        # only rewrites a value that is already present.
+        f = _finding(final_status="likely_exploitable")
+        stats = prov.sanitise_findings_evidence({"findings": [f]}, tmp_path)
+        assert stats["final_status_demoted"] == 1
+        assert "is_exploitable" not in f
+
     def test_non_dict_shapes_tolerated(self, tmp_path):
         assert prov.sanitise_findings_evidence(None, tmp_path) == {
             "witness_stripped": 0, "feasibility_demoted": 0,
-            "final_status_demoted": 0,
+            "final_status_demoted": 0, "exploitable_demoted": 0,
         }
         prov.sanitise_findings_evidence({"findings": "nope"}, tmp_path)
         prov.sanitise_findings_evidence({"findings": [42, None]}, tmp_path)
+
+
+class TestUnconditionalBooleanClamp:
+    """``is_exploitable`` has display priority over every status string
+    (``get_display_status`` returns "Exploitable" for a truthy boolean
+    before it ever reads final_status), so the boolean is a verdict
+    channel of its own: it must demote without a verified
+    exploitable-family feasibility verdict REGARDLESS of what
+    final_status says."""
+
+    def test_forged_boolean_beside_non_tier_final_status_demoted(self, tmp_path):
+        # final_status "confirmed" is not feasibility-tier, so the
+        # final_status clamp has nothing to do — the boolean still
+        # cannot stand without a verified exploitable verdict.
+        f = _finding(status="confirmed", final_status="confirmed",
+                     is_exploitable=True)
+        stats = prov.sanitise_findings_evidence({"findings": [f]}, tmp_path)
+        assert f["is_exploitable"] is False
+        assert stats["exploitable_demoted"] == 1
+        # The non-tier final_status itself is not a mechanical claim.
+        assert f["final_status"] == "confirmed"
+
+    def test_junk_boolean_beside_non_tier_final_status_normalised(self, tmp_path):
+        # "yes" coerces truthy at display time — junk shapes are
+        # normalised to the explicit abstention, never left in place.
+        f = _finding(status="confirmed", final_status="confirmed",
+                     is_exploitable="yes")
+        stats = prov.sanitise_findings_evidence({"findings": [f]}, tmp_path)
+        assert f["is_exploitable"] is None
+        assert stats["exploitable_demoted"] == 1
+
+    def test_boolean_without_any_status_demoted(self, tmp_path):
+        f = _finding(is_exploitable=True)
+        stats = prov.sanitise_findings_evidence({"findings": [f]}, tmp_path)
+        assert f["is_exploitable"] is False
+        assert stats["exploitable_demoted"] == 1
+
+    def test_verified_exploitable_verdict_keeps_boolean(self, tmp_path):
+        f = _finding(final_status="exploitable", is_exploitable=True)
+        feas = {"status": "analyzed", "verdict": "exploitable",
+                "binary_path": "/bin/app"}
+        f["feasibility"] = feas
+        prov.stamp_feasibility(f, feas, tmp_path)
+        stats = prov.sanitise_findings_evidence({"findings": [f]}, tmp_path)
+        assert f["is_exploitable"] is True
+        assert stats["exploitable_demoted"] == 0
+        assert f["final_status"] == "exploitable"
+
+    def test_verified_likely_verdict_keeps_boolean(self, tmp_path):
+        # "likely" is the raw analyzer spelling of likely_exploitable;
+        # both legitimately derive is_exploitable=True in Stage F.
+        f = _finding(final_status="likely_exploitable", is_exploitable=True)
+        feas = {"status": "analyzed", "verdict": "likely",
+                "binary_path": "/bin/app"}
+        f["feasibility"] = feas
+        prov.stamp_feasibility(f, feas, tmp_path)
+        stats = prov.sanitise_findings_evidence({"findings": [f]}, tmp_path)
+        assert f["is_exploitable"] is True
+        assert stats["exploitable_demoted"] == 0
+
+    def test_boolean_beside_verified_non_exploitable_verdict_demoted(self, tmp_path):
+        # A genuine stamped record whose verdict is NOT in the
+        # exploitable family cannot support the boolean either — here
+        # the forgery is the boolean grafted beside real evidence.
+        f = _finding(final_status="confirmed_blocked", is_exploitable=True)
+        feas = {"status": "analyzed", "verdict": "unlikely",
+                "binary_path": "/bin/app"}
+        f["feasibility"] = feas
+        prov.stamp_feasibility(f, feas, tmp_path)
+        stats = prov.sanitise_findings_evidence({"findings": [f]}, tmp_path)
+        assert f["is_exploitable"] is False
+        assert stats["exploitable_demoted"] == 1
+        # The verified record itself survives untouched.
+        assert f["feasibility"]["verdict"] == "unlikely"
+        assert stats["feasibility_demoted"] == 0
+
+    def test_explicit_false_never_touched(self, tmp_path):
+        # False is an abstention-compatible negative, not a claim that
+        # needs mechanical support — rewriting it would fabricate
+        # nothing and demoting it is meaningless.
+        f = _finding(status="confirmed", is_exploitable=False)
+        stats = prov.sanitise_findings_evidence({"findings": [f]}, tmp_path)
+        assert f["is_exploitable"] is False
+        assert stats["exploitable_demoted"] == 0
+
+    def test_absent_boolean_never_materialised(self, tmp_path):
+        f = _finding(status="confirmed")
+        stats = prov.sanitise_findings_evidence({"findings": [f]}, tmp_path)
+        assert "is_exploitable" not in f
+        assert stats["exploitable_demoted"] == 0
+
+
+class TestTierStatusClamp:
+    """``final_status`` / ``status`` are open string channels into the
+    same verdict tier the boolean clamp guards. The tier clamp must
+    (a) normalise spelling variants BEFORE the membership test — the
+    display layer's open fallback title-cases anything, so an
+    unnormalised "EXPLOITABLE" that slips past renders identically to
+    the canonical value — and (b) accept a verified feasibility record
+    only for the tier its OWN verdict maps to (the validation-helper
+    VERDICT_MAP families): a genuine "unlikely" record beside a forged
+    "exploitable" claim is a borrowed receipt, not support."""
+
+    def test_case_variant_final_status_clamped(self, tmp_path):
+        f = _finding(final_status="EXPLOITABLE")
+        stats = prov.sanitise_findings_evidence({"findings": [f]}, tmp_path)
+        assert f["final_status"] == "confirmed_unverified"
+        assert stats["final_status_demoted"] == 1
+
+    def test_title_case_final_status_clamped(self, tmp_path):
+        f = _finding(final_status="Likely Exploitable")
+        stats = prov.sanitise_findings_evidence({"findings": [f]}, tmp_path)
+        assert f["final_status"] == "confirmed_unverified"
+        assert stats["final_status_demoted"] == 1
+
+    def test_case_variant_status_clamped_without_final_status(self, tmp_path):
+        # No final_status at all: the top-level status is a display
+        # channel of its own (get_display_status falls through to it)
+        # and must be clamped independently.
+        f = _finding(status="EXPLOITABLE")
+        stats = prov.sanitise_findings_evidence({"findings": [f]}, tmp_path)
+        assert f["status"] == "confirmed_unverified"
+        assert stats["final_status_demoted"] == 1
+
+    def test_tier_claim_beside_mismatched_verified_verdict_clamped(self, tmp_path):
+        # The stamped record is genuine — but its verdict ("unlikely",
+        # mapping to confirmed_blocked) cannot support an "exploitable"
+        # claim. Pre-fix any verified analyzed record supported ANY
+        # tier claim.
+        f = _finding(final_status="exploitable")
+        feas = {"status": "analyzed", "verdict": "unlikely",
+                "binary_path": "/bin/app"}
+        f["feasibility"] = feas
+        prov.stamp_feasibility(f, feas, tmp_path)
+        stats = prov.sanitise_findings_evidence({"findings": [f]}, tmp_path)
+        assert f["final_status"] == "confirmed_unverified"
+        assert stats["final_status_demoted"] == 1
+        # The verified record itself survives untouched.
+        assert f["feasibility"]["verdict"] == "unlikely"
+        assert stats["feasibility_demoted"] == 0
+
+    def test_matching_tier_claim_survives_each_family(self, tmp_path):
+        for verdict, tier in (
+            ("exploitable", "exploitable"),
+            ("likely", "likely_exploitable"),
+            ("likely_exploitable", "likely_exploitable"),
+            ("difficult", "confirmed_constrained"),
+            ("unlikely", "confirmed_blocked"),
+        ):
+            f = _finding(final_status=tier)
+            feas = {"status": "analyzed", "verdict": verdict,
+                    "binary_path": "/bin/app"}
+            f["feasibility"] = feas
+            prov.stamp_feasibility(f, feas, tmp_path)
+            stats = prov.sanitise_findings_evidence(
+                {"findings": [f]}, tmp_path)
+            assert f["final_status"] == tier, verdict
+            assert stats["final_status_demoted"] == 0, verdict
+
+    def test_supported_case_variant_canonicalised(self, tmp_path):
+        # Even a SUPPORTED claim has its spelling canonicalised: the
+        # sanitised output feeds the display fallback, which must never
+        # see a tier value it cannot exact-match.
+        f = _finding(final_status="Exploitable", status="EXPLOITABLE")
+        feas = {"status": "analyzed", "verdict": "exploitable",
+                "binary_path": "/bin/app"}
+        f["feasibility"] = feas
+        prov.stamp_feasibility(f, feas, tmp_path)
+        stats = prov.sanitise_findings_evidence({"findings": [f]}, tmp_path)
+        assert f["final_status"] == "exploitable"
+        assert f["status"] == "exploitable"
+        assert stats["final_status_demoted"] == 0
 
 
 class TestVersionedRunBinding:
@@ -415,3 +616,95 @@ class TestWitnessManifestMAC:
         prov.stamp_witness_manifest(manifest)
         monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "this-xdg"))
         assert not prov.verify_witness_manifest(manifest)
+
+
+class TestKeyCreationRace:
+    """The loser of the O_EXCL creation race must tolerate the
+    winner's create-to-write window."""
+
+    @pytest.fixture()
+    def race_warn_calls(self, monkeypatch):
+        calls: list[tuple] = []
+        monkeypatch.setattr(
+            prov, "_warn_once_suspect_key",
+            lambda *args: calls.append(args),
+        )
+        return calls
+
+    @pytest.fixture()
+    def lose_creation_race(self, monkeypatch):
+        """Make the key-create os.open lose the O_EXCL race."""
+        real_open = os.open
+
+        def fake_open(path, flags, mode=0o777):
+            if flags & os.O_EXCL:
+                raise FileExistsError(path)
+            return real_open(path, flags, mode)
+
+        monkeypatch.setattr(os, "open", fake_open)
+        monkeypatch.setattr(mac_key.time, "sleep", lambda s: None)
+
+    def test_race_loser_retries_through_empty_read(
+            self, monkeypatch, race_warn_calls, lose_creation_race):
+        """Between the winner's O_EXCL create and its write the key
+        file exists with 0 bytes. The loser must keep polling through
+        that transient shape and stamp with the winner's full key —
+        aborting on the first short read persisted the loser's
+        evidence records unstamped (demoted to LLM-tier, re-derived)
+        and flagged the operator's healthy key as suspect."""
+        full_key = b"k" * 32
+        reads = iter([None, b"", full_key])
+        monkeypatch.setattr(
+            prov, "_read_existing_key", lambda path: next(reads),
+        )
+
+        assert prov._load_or_create_key() == full_key
+        assert race_warn_calls == []
+
+    def test_persistent_wrong_length_warns_after_retries(
+            self, monkeypatch, race_warn_calls, lose_creation_race):
+        """A key file that STAYS short is genuinely suspect: the loop
+        runs out of retries, warns once, and refuses (None)."""
+        reads = itertools.chain([None], itertools.repeat(b"short"))
+        monkeypatch.setattr(
+            prov, "_read_existing_key", lambda path: next(reads),
+        )
+
+        assert prov._load_or_create_key() is None
+        assert len(race_warn_calls) == 1
+        assert "wrong length" in race_warn_calls[0][1]
+
+
+class TestBindingNonceRead:
+    """The .witness-binding file lives in the directory UNDER
+    VERIFICATION — exactly the surface a stager controls — so the
+    nonce read must refuse a planted FIFO on the fd instead of
+    hanging every graded verifier, and cap what it buffers."""
+
+    def test_fifo_binding_refused_not_hung(self, tmp_path):
+        import signal as _signal
+
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("platform lacks mkfifo")
+        os.mkfifo(tmp_path / ".witness-binding")
+
+        def _on_alarm(signum, frame):
+            msg = "nonce read blocked on a planted FIFO"
+            raise AssertionError(msg)
+
+        old = _signal.signal(_signal.SIGALRM, _on_alarm)
+        _signal.alarm(30)
+        try:
+            assert prov._read_run_nonce(tmp_path) is None
+        finally:
+            _signal.alarm(0)
+            _signal.signal(_signal.SIGALRM, old)
+
+    def test_oversize_binding_malformed_not_buffered(self, tmp_path):
+        (tmp_path / ".witness-binding").write_text("a" * 1_000_000)
+        assert prov._read_run_nonce(tmp_path) is None
+
+    def test_valid_nonce_roundtrip(self, tmp_path):
+        nonce = prov._load_or_create_run_nonce(tmp_path)
+        assert nonce
+        assert prov._read_run_nonce(tmp_path) == nonce

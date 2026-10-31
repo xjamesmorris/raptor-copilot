@@ -1,8 +1,13 @@
 """Model scorecard — per-model reliability tracking across decision classes.
 
 The scorecard records how often each (model, decision_class) cell has
-been **overruled by an authoritative signal**. Six event-type signals
-are recognised:
+been **overruled by an authoritative signal**. The full event-type
+inventory lives in :data:`core.llm.scorecard.scorecard.ALL_EVENT_TYPES`
+(17 types at the time of writing); the founding six below illustrate
+the signal shapes — see each producer module for the rest
+(``dataflow_validation``, ``cross_run_stability``,
+``self_consistency``, ``cross_family_consistency``,
+``validate_feedback``, ``schema_valid``, ``study_question``, ...):
 
   * ``cheap_short_circuit`` — cheap-tier model said "clear FP";
     full ANALYSE later said "TP".
@@ -23,11 +28,12 @@ are recognised:
     ``incorrect``; non-outliers get ``correct``. Observability-only
     in v1: no policy gate consumes this signal yet.
 
-Only ``cheap_short_circuit`` has a producer wired in the first
-shipping PR; the other four event types live in the schema as
-reserved zero-count keys until their producer PRs land. See the
-``scorecard unwired producers`` project memory for each producer's
-intended outcome semantics + hook location.
+Most event types have wired producers today (the sibling
+``consensus`` / ``judge`` / ``prefilter`` / ``tool_evidence`` /
+``stability`` / ``self_consistency`` / ``cross_family`` /
+``reasoning_divergence`` / ``dataflow_validation`` /
+``validate_feedback`` modules); the remainder live in the schema as
+reserved zero-count keys until their producers land.
 
 The scorecard's primary policy method is
 :meth:`ModelScorecard.should_short_circuit`. Consumers ask the
@@ -47,11 +53,15 @@ a single dict delete rather than a walk.
 """
 
 # Canonical cap for disagreement-sample reasoning text length. Every
-# scorecard producer (`tool_evidence`, `judge`, `consensus`,
-# `reasoning_divergence`) slices `analysis_reasoning` /
-# `this_reasoning` / `sample_reasoning` by this value before persisting
-# the sample. Defined once here so the 4 producers cannot drift apart;
-# `tests/test_reasoning_cap_unique.py` is the parse-time guard.
+# scorecard producer slices its persisted reasoning text
+# (`analysis_reasoning` / `this_reasoning` / `sample_reasoning` /
+# `checker_ruling` / `reason`) by this value before handing the sample
+# over, and the sink (`ModelScorecard._append_sample`) additionally
+# bounds EVERY string leaf by it — so sibling fields without a
+# producer slice, and forged/corrupt upstream strings, are bounded by
+# construction. Defined once here so the producers cannot drift apart;
+# `tests/test_reasoning_cap_unique.py` is the parse-time guard and its
+# PRODUCERS list must name every module that slices by the cap.
 _MAX_REASONING_CHARS = 500
 
 from .prefilter import (

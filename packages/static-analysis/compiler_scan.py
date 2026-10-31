@@ -72,6 +72,7 @@ from core.audit.compiler_sweep import (
 )
 from core.inventory.exclusions import DEFAULT_EXCLUDES, should_exclude
 from core.run.scratch import scratch_dir
+from core.sarif import emit
 
 logger = logging.getLogger(__name__)
 
@@ -82,10 +83,7 @@ _C_SUFFIXES = frozenset({".c"})
 _CXX_SUFFIXES = frozenset({".cc", ".cpp", ".cxx", ".C"})
 _TU_SUFFIXES = _C_SUFFIXES | _CXX_SUFFIXES
 
-_SARIF_SCHEMA_URI = (
-    "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master"
-    "/Documents/CommitteeSpecifications/2.1.0/sarif-schema-2.1.0.json"
-)
+_SARIF_SCHEMA_URI = emit.SCHEMA_URI_COMMITTEE
 _TOOL_NAME = "compiler"
 _TOOL_FULL_NAME = "Compiler static analyzers (gcc -fanalyzer / clang --analyze)"
 
@@ -485,29 +483,21 @@ def to_sarif(result: CompilerScanResult) -> dict[str, Any]:
     CWE carried in both rule and result ``properties`` (the tag form
     ``external/cwe/cwe-N`` matches what core.sarif.parser extracts).
     """
-    rule_defs: list[dict[str, Any]] = []
-    seen_rules: set[str] = set()
+    rule_index = emit.RuleIndex()
     sarif_results: list[dict[str, Any]] = []
 
     for f in result.findings:
         rule_id = f["rule_id"]
         cwe = f.get("cwe")
-        if rule_id not in seen_rules:
-            props: dict[str, Any] = {}
-            if cwe:
-                props["cwe"] = cwe
-                props["tags"] = [f"external/cwe/{cwe.lower()}"]
-            rule_defs.append({
-                "id": rule_id,
-                "name": rule_id,
-                "shortDescription": {"text": rule_id},
-                "fullDescription": {
-                    "text": f"Compiler static-analyzer diagnostic {rule_id}",
-                },
-                "defaultConfiguration": {"level": "warning"},
-                **({"properties": props} if props else {}),
-            })
-            seen_rules.add(rule_id)
+        props: dict[str, Any] = {}
+        if cwe:
+            props["cwe"] = cwe
+            props["tags"] = [f"external/cwe/{cwe.lower()}"]
+        rule_index.add(emit.minimal_rule(
+            rule_id,
+            full_description=f"Compiler static-analyzer diagnostic {rule_id}",
+            properties=props or None,
+        ))
 
         res_props: dict[str, Any] = {
             "tool": _TOOL_NAME,
@@ -515,30 +505,17 @@ def to_sarif(result: CompilerScanResult) -> dict[str, Any]:
         }
         if cwe:
             res_props["cwe"] = cwe
-        sarif_results.append({
-            "ruleId": rule_id,
-            "level": "warning",
-            "message": {"text": f.get("message") or f"{rule_id} diagnostic"},
-            "locations": [{
-                "physicalLocation": {
-                    "artifactLocation": {"uri": f["file"]},
-                    "region": {"startLine": f["line"]},
-                },
-            }],
-            "properties": res_props,
-        })
+        sarif_results.append(emit.result(
+            rule_id,
+            f.get("message") or f"{rule_id} diagnostic",
+            [emit.location(f["file"], {"startLine": f["line"]})],
+            properties=res_props,
+        ))
 
-    return {
-        "$schema": _SARIF_SCHEMA_URI,
-        "version": "2.1.0",
-        "runs": [{
-            "tool": {
-                "driver": {
-                    "name": _TOOL_NAME,
-                    "fullName": _TOOL_FULL_NAME,
-                    "rules": rule_defs,
-                },
-            },
-            "results": sarif_results,
-        }],
-    }
+    return emit.document(
+        [emit.run(
+            _TOOL_NAME, rule_index.rules(), sarif_results,
+            full_name=_TOOL_FULL_NAME,
+        )],
+        schema_uri=_SARIF_SCHEMA_URI,
+    )

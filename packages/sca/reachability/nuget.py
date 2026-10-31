@@ -21,6 +21,8 @@ import re
 
 from ..models import Confidence, Reachability
 from ._shared import format_evidence as _format_evidence
+from ._shared import iter_matches_with_lines as _iter_matches_with_lines
+from ..parsers import _safe_read
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -32,22 +34,31 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_MAX_DEPTH = 12
 
-_TEST_DIR_NAMES = {"tests", "test", "Tests", "Test"}
+# Lowercase canon — membership checks fold the path segment first.
+_TEST_DIR_NAMES = {"tests", "test"}
 
+# Leading indent in all three is HORIZONTAL-only ([^\S\n]): under
+# MULTILINE the ``^\s*`` spelling re-scans a run of blank lines from
+# every line start inside it — quadratic on attacker-supplied source
+# files (the import sweep walks every file of the ecosystem).
 # C#: ``using Foo.Bar;`` / ``using Alias = Foo.Bar;``
 _CS_USING_RE = re.compile(
-    r"^\s*(?:global\s+)?using\s+(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?"
+    r"^[^\S\n]*(?:global\s+)?using\s+(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?"
     r"([A-Za-z_][A-Za-z0-9_.]*)\s*;",
     re.MULTILINE,
 )
-# F#: ``open Foo.Bar``
+# F#: ``open Foo.Bar``. The keyword gap is horizontal ([^\S\n]+):
+# an ``open`` directive is one line, and the newline-capable ``\s+``
+# let every ``open`` anchor re-scan a shared blank run — quadratic
+# over planted keyword lines. The dropped corner is a cross-line
+# ``open\nFoo``, which is not F#.
 _FS_OPEN_RE = re.compile(
-    r"^\s*open\s+([A-Za-z_][A-Za-z0-9_.]*)",
+    r"^[^\S\n]*open[^\S\n]+([A-Za-z_][A-Za-z0-9_.]*)",
     re.MULTILINE,
 )
 # VB: ``Imports Foo.Bar``
 _VB_IMPORTS_RE = re.compile(
-    r"^\s*Imports\s+(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?([A-Za-z_][A-Za-z0-9_.]*)",
+    r"^[^\S\n]*Imports\s+(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?([A-Za-z_][A-Za-z0-9_.]*)",
     re.MULTILINE,
 )
 
@@ -60,10 +71,8 @@ def scan_imports(
     out: dict[str, list[tuple[Path, int, bool]]] = {}
     for src in _walk_dotnet_sources(target, max_depth=max_depth):
         is_test = _is_test_file(src, target)
-        try:
-            text = src.read_text(encoding="utf-8", errors="replace")
-        except OSError as e:
-            logger.debug("sca.reachability.nuget: skip %s (%s)", src, e)
+        text = _safe_read.read_bounded(src, follow_symlinks=False)
+        if text is None:
             continue
         for ns, line in _imports_in(src.suffix.lower(), text):
             out.setdefault(ns, []).append((src, line, is_test))
@@ -135,8 +144,10 @@ def _imports_in(suffix: str, text: str) -> Iterable[tuple[str, int]]:
         regex = _VB_IMPORTS_RE
     else:
         return
-    for m in regex.finditer(text):
-        yield m.group(1), text.count("\n", 0, m.start()) + 1
+    # Rolling-cursor line numbers — the naive full-prefix count is
+    # quadratic on dense-import files.
+    for m, line in _iter_matches_with_lines(text, regex.finditer(text)):
+        yield m.group(1), line
 
 
 def _walk_dotnet_sources(
@@ -156,7 +167,7 @@ def _walk_dotnet_sources(
 
 def _is_test_file(path: Path, target: Path) -> bool:
     rel_parts = path.relative_to(target).parts
-    if any(p.lower() in {"tests", "test"} for p in rel_parts):
+    if any(p.lower() in _TEST_DIR_NAMES for p in rel_parts):
         return True
     return bool(path.stem.lower().endswith(("tests", "test")))
 

@@ -125,10 +125,10 @@ def test_offline_mode_serves_cached_hits(tmp_path) -> None:
 
 
 def test_get_vuln_path_safe_encoding(tmp_path) -> None:
-    """Vuln IDs containing ``/`` would corrupt the cache path; safe-id
-    transforms them so the cache file lands in a single segment."""
+    """Vuln IDs containing ``/`` would corrupt the cache path;
+    percent-encoding puts the cache file in a single segment."""
     cache = JsonCache(tmp_path / "cache")
-    cache.put("osv/vulns/with_slashes",
+    cache.put("osv/vulns/with%2Fslashes",
               {"id": "with/slashes", "summary": "edge case"},
               ttl_seconds=3600)
     http = _FakeHttp()
@@ -136,6 +136,50 @@ def test_get_vuln_path_safe_encoding(tmp_path) -> None:
     rec = client.get_vuln("with/slashes")
     assert rec is not None
     assert rec.id == "with/slashes"
+
+
+def test_get_vuln_cache_key_encoding_is_injective(tmp_path) -> None:
+    """The old ``/`` → ``_`` replacement was lossy: ``GHSA-a/b`` and
+    ``GHSA-a_b`` shared one cache file, so a crafted id could shadow
+    another id's cached record for the TTL. Distinct ids must map to
+    distinct cache entries."""
+    from urllib.parse import quote
+
+    cache = JsonCache(tmp_path / "cache")
+    http = _FakeHttp()
+    http.get_responses[f"{OSV_BASE_URL}/vulns/{quote('GHSA-a/b', safe='')}"] = {
+        "id": "GHSA-a/b", "summary": "slash",
+    }
+    http.get_responses[f"{OSV_BASE_URL}/vulns/GHSA-a_b"] = {
+        "id": "GHSA-a_b", "summary": "underscore",
+    }
+    client = OsvClient(http=http, cache=cache)  # type: ignore[arg-type]
+    rec1 = client.get_vuln("GHSA-a/b")
+    rec2 = client.get_vuln("GHSA-a_b")
+    assert rec1 is not None and rec1.id == "GHSA-a/b"
+    assert rec2 is not None and rec2.id == "GHSA-a_b", (
+        "underscore id was served the slash id's cached record"
+    )
+    assert len(http.get_calls) == 2
+
+
+def test_get_vuln_degenerate_ids_refused_before_cache_layer(tmp_path) -> None:
+    """Server-minted junk ids ('', '.', '..') must degrade per the
+    error contract (None / OsvLookupError), never raise ValueError out
+    of the cache-key layer — one hostile querybatch slot must not kill
+    the scan."""
+    import pytest
+
+    from packages.osv.client import OsvLookupError
+
+    cache = JsonCache(tmp_path / "cache")
+    http = _FakeHttp()
+    client = OsvClient(http=http, cache=cache)  # type: ignore[arg-type]
+    for junk in ("", ".", ".."):
+        assert client.get_vuln(junk) is None
+        with pytest.raises(OsvLookupError):
+            client.get_vuln(junk, raise_on_transient=True)
+    assert http.get_calls == [], "degenerate ids must never be fetched"
 
 
 # --- query_batch --------------------------------------------------------
@@ -208,6 +252,34 @@ def test_query_batch_skips_non_string_ids() -> None:
     client = OsvClient(http=http)  # type: ignore[arg-type]
     queries = [{"package": {"name": "x", "ecosystem": "npm"}, "version": "1"}]
     assert client.query_batch(queries) == [["GHSA-aaa", "GHSA-bbb"]]
+
+
+def test_query_batch_drops_empty_ids() -> None:
+    """A server-minted ``{"id": ""}`` slot member is junk — admitting
+    it hands the hydration loop an id the per-vuln endpoint can only
+    choke on."""
+    http = _FakeHttp()
+    http.post_responses[f"{OSV_BASE_URL}/querybatch"] = {
+        "results": [{"vulns": [{"id": ""}, {"id": "GHSA-ok"}]}],
+    }
+    client = OsvClient(http=http)  # type: ignore[arg-type]
+    queries = [{"package": {"name": "x", "ecosystem": "npm"}, "version": "1"}]
+    assert client.query_batch(queries) == [["GHSA-ok"]]
+
+
+def test_query_batch_non_list_vulns_field_is_empty() -> None:
+    """A truthy non-list ``vulns`` (hostile / mangled body) must not
+    raise out of the slot walk."""
+    http = _FakeHttp()
+    http.post_responses[f"{OSV_BASE_URL}/querybatch"] = {
+        "results": [{"vulns": 7}, {"vulns": [{"id": "GHSA-ok"}]}],
+    }
+    client = OsvClient(http=http)  # type: ignore[arg-type]
+    queries = [
+        {"package": {"name": "a", "ecosystem": "npm"}, "version": "1"},
+        {"package": {"name": "b", "ecosystem": "npm"}, "version": "1"},
+    ]
+    assert client.query_batch(queries) == [[], ["GHSA-ok"]]
 
 
 class _QueueHttp(_FakeHttp):
@@ -311,3 +383,80 @@ def test_query_batch_offline_returns_none_per_slot() -> None:
     queries = [{"package": {"name": "x", "ecosystem": "npm"}, "version": "1"}] * 2
     assert client.query_batch(queries) == [None, None]
     assert http.post_calls == []
+
+
+# --- transient-vs-definitive split ---------------------------------------
+
+def test_get_vuln_raise_on_transient_500() -> None:
+    import pytest
+
+    from packages.osv import OsvLookupError
+
+    http = _FakeHttp()
+    http.get_responses[f"{OSV_BASE_URL}/vulns/CVE-X"] = HttpError(
+        "server error", status=500,
+    )
+    client = OsvClient(http=http)  # type: ignore[arg-type]
+    with pytest.raises(OsvLookupError):
+        client.get_vuln("CVE-X", raise_on_transient=True)
+
+
+def test_get_vuln_raise_on_transient_404_still_none() -> None:
+    """404 is OSV's authoritative 'no such record' — definitive, so it
+    stays None even for callers opting into transient raises."""
+    http = _FakeHttp()
+    client = OsvClient(http=http)  # type: ignore[arg-type]
+    assert client.get_vuln("CVE-9999-0000", raise_on_transient=True) is None
+
+
+def test_get_vuln_raise_on_transient_offline_miss(tmp_path) -> None:
+    import pytest
+
+    from packages.osv import OsvLookupError
+
+    http = _FakeHttp()
+    client = OsvClient(
+        http=http, cache=JsonCache(tmp_path / "cache"),  # type: ignore[arg-type]
+        offline=True,
+    )
+    with pytest.raises(OsvLookupError):
+        client.get_vuln("CVE-X", raise_on_transient=True)
+    assert http.get_calls == []
+
+
+def test_get_vuln_transient_failure_not_cached(tmp_path) -> None:
+    """A transient failure must never enter the cache: after the host
+    recovers, the next call fetches the real record."""
+    url = f"{OSV_BASE_URL}/vulns/CVE-R"
+    http = _FakeHttp()
+    http.get_responses[url] = HttpError("server error", status=503)
+    cache = JsonCache(tmp_path / "cache")
+    client = OsvClient(http=http, cache=cache)  # type: ignore[arg-type]
+    assert client.get_vuln("CVE-R") is None  # swallowed by default
+    http.get_responses[url] = {"id": "CVE-R", "summary": "recovered"}
+    rec = client.get_vuln("CVE-R")
+    assert rec is not None and rec.id == "CVE-R"
+
+
+def test_get_vuln_parse_typeerror_degrades_to_none(tmp_path, monkeypatch) -> None:
+    """Parse failures on a fetched record must degrade per the
+    documented contract ("None on 404 / error / parse failure") even
+    when the parser raises TypeError rather than ValueError — and a
+    cached copy of the same record must degrade identically on later
+    reads instead of replaying a crash for the TTL."""
+    import packages.osv.client as osv_client_mod
+
+    def _boom(record):
+        raise TypeError("'int' object is not iterable")
+
+    monkeypatch.setattr(osv_client_mod, "parse_record", _boom)
+    cache = JsonCache(tmp_path / "cache")
+    http = _FakeHttp()
+    http.get_responses[f"{OSV_BASE_URL}/vulns/GHSA-x"] = {
+        "id": "GHSA-x", "references": 7,
+    }
+    client = OsvClient(http=http, cache=cache)  # type: ignore[arg-type]
+    assert client.get_vuln("GHSA-x") is None
+    # Second client reads the cached record — same graceful degrade.
+    client2 = OsvClient(http=_FakeHttp(), cache=cache, offline=True)  # type: ignore[arg-type]
+    assert client2.get_vuln("GHSA-x") is None

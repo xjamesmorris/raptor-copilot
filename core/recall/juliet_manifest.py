@@ -21,6 +21,12 @@ covers them with sink-anchored labeling.
 The suite is NOT bundled: the generator reads an operator-acquired
 clone of the public find-sec-bugs mirror of the NIST suite, pinned by
 sha (labels are sha-bound like every recall corpus).
+
+``--family`` selects the CWE-directory slice: ``injection`` (the
+historical OWASP-comparable set), ``concurrency`` (lock discipline),
+or ``integer`` (arithmetic errors). Every family is held-out under
+the same doctrine — the slice registry (FAMILY_DIRS) is chosen by
+directory semantics, never by measured detector output.
 """
 
 from __future__ import annotations
@@ -33,6 +39,7 @@ from pathlib import Path
 from core.json import save_json
 from core.recall.manifest import SCHEMA_VERSION
 from core.recall.pinned_clone import verify_pinned_clone
+from core.source.lines import split_lines
 
 #: Public mirror of the NIST Juliet Java suite (v1.2 content).
 JULIET_REPO_URL = "https://github.com/find-sec-bugs/juliet-test-suite"
@@ -57,9 +64,67 @@ COMPARABLE_DIRS: dict[str, int] = {
     "CWE328_Reversible_One_Way_Hash": 328,
 }
 
+#: Family slices beyond the injection set. Each family names the
+#: Juliet CWE directories whose defect semantics sit in one review
+#: strategy's domain (docs/audit.md strategy table): ``concurrency``
+#: is the lock-discipline set (the concurrency strategy / lock-region
+#: channels), ``integer`` is the arithmetic-error set (the integer
+#: strategy / SMT channel). Selection is a-priori — by directory
+#: semantics — never by measured detector output: these are held-out
+#: corpora and choosing dirs from detector results would tune the
+#: holdout. CWE383_Direct_Use_of_Threads is excluded from the
+#: concurrency slice: zero of its single-file cases pass the
+#: bad/good structural split (verified on the pinned mirror), so the
+#: slice would label nothing there.
+FAMILY_DIRS: dict[str, dict[str, int]] = {
+    "injection": COMPARABLE_DIRS,
+    "concurrency": {
+        "CWE572_Call_to_Thread_run_Instead_of_start": 572,
+        "CWE585_Empty_Sync_Block": 585,
+        "CWE609_Double_Checked_Locking": 609,
+        "CWE667_Improper_Locking": 667,
+        "CWE764_Multiple_Locks": 764,
+        "CWE765_Multiple_Unlocks": 765,
+        "CWE832_Unlock_Not_Locked": 832,
+        "CWE833_Deadlock": 833,
+    },
+    "integer": {
+        "CWE190_Integer_Overflow": 190,
+        "CWE191_Integer_Underflow": 191,
+        "CWE197_Numeric_Truncation_Error": 197,
+        "CWE369_Divide_by_Zero": 369,
+        "CWE681_Incorrect_Conversion_Between_Numeric_Types": 681,
+    },
+}
+
+#: Manifest names per family. ``injection`` keeps the historical
+#: names so existing reports and compare baselines stay joinable.
+_FAMILY_NAMES: dict[str, str] = {
+    "injection": "juliet-java-holdout",
+    "concurrency": "juliet-java-concurrency",
+    "integer": "juliet-java-integer",
+}
+_FAMILY_NAMES_B: dict[str, str] = {
+    "injection": "juliet-b-multifile",
+    "concurrency": "juliet-b-concurrency",
+    "integer": "juliet-b-integer",
+}
+
+
+def _family_dirs(family: str) -> dict[str, int]:
+    dirs = FAMILY_DIRS.get(family)
+    if dirs is None:
+        msg = (f"unknown Juliet family {family!r} "
+               f"(choose from {sorted(FAMILY_DIRS)})")
+        raise JulietManifestError(msg)
+    return dirs
+
 _MULTI_FILE_RE = re.compile(r"_\d+[a-z]\.java$")
+# Bounded type window (the unbounded lazy window overlapped the
+# whitespace separators — quadratic even at the anchored match
+# call); 256 chars sits far above real Java signatures.
 _DECL_RE = re.compile(
-    r"^\s*(?:public|private|protected)\s+[\w<>\[\]., ]*?"
+    r"^\s*(?:public|private|protected)\s+[\w<>\[\]., ]{0,256}?"
     r"\s(bad\w*|good\w*)\s*\(")
 
 _ACQUIRE_HINT = (
@@ -94,7 +159,7 @@ def split_bad_good_spans(
     would make span labels lie).
     """
     decls: list[tuple[int, str]] = []
-    lines = text.splitlines()
+    lines = split_lines(text)
     for i, line in enumerate(lines, 1):
         m = _DECL_RE.match(line)
         if m:
@@ -125,12 +190,16 @@ def _entry(case_id: str, rel_file: str, cwe: int,
 
 
 def generate_manifest(clone_dir: Path, *, cwes: list[int] | None = None,
-                      limit: int | None = None) -> dict:
-    """Build the held-out manifest dict from the verified clone.
+                      limit: int | None = None,
+                      family: str = "injection") -> dict:
+    """Build a held-out manifest dict from the verified clone.
 
     ``cwes`` filters to specific Juliet CWE numbers; ``limit`` caps
-    expected entries per CWE (deterministic: sorted by path).
+    expected entries per CWE (deterministic: sorted by path);
+    ``family`` selects the CWE-directory slice (see FAMILY_DIRS —
+    every family is held-out under the same doctrine).
     """
+    family_dirs = _family_dirs(family)
     _verify_clone(clone_dir)
     expected: list[dict] = []
     clean: list[dict] = []
@@ -138,7 +207,7 @@ def generate_manifest(clone_dir: Path, *, cwes: list[int] | None = None,
     skipped_unsplit = 0
     per_cwe_count: dict[int, int] = {}
 
-    for dirname, cwe in sorted(COMPARABLE_DIRS.items()):
+    for dirname, cwe in sorted(family_dirs.items()):
         if cwes and cwe not in cwes:
             continue
         cwe_dir = clone_dir / _TESTCASES / dirname
@@ -169,9 +238,23 @@ def generate_manifest(clone_dir: Path, *, cwes: list[int] | None = None,
         msg = "no expected entries survived the filters"
         raise JulietManifestError(msg)
 
+    # The default (injection) manifest's byte layout predates the
+    # family field, and downstream identity stamps hash regenerated
+    # manifests — so the default stays stamp-free (byte-identical
+    # output) and only the newer families carry the marker.
+    notes: dict = {
+        "holdout_doctrine": (
+            "Generalization check ONLY: mechanisms are tuned on "
+            "the OWASP corpus; Juliet runs are reported at first "
+            "contact and never used to tune."),
+        "skipped_multi_file_variants": skipped_multi,
+        "skipped_no_bad_good_split": skipped_unsplit,
+    }
+    if family != "injection":
+        notes = {"family": family, **notes}
     return {
         "schema_version": SCHEMA_VERSION,
-        "name": "juliet-java-holdout",
+        "name": _FAMILY_NAMES[family],
         "target": {
             "repo_url": JULIET_REPO_URL,
             "pinned_sha": JULIET_PINNED_SHA,
@@ -187,14 +270,7 @@ def generate_manifest(clone_dir: Path, *, cwes: list[int] | None = None,
         "clean_regions": clean,
         # Coverage honesty: what the generator dropped, and why this
         # corpus exists.
-        "notes": {
-            "holdout_doctrine": (
-                "Generalization check ONLY: mechanisms are tuned on "
-                "the OWASP corpus; Juliet runs are reported at first "
-                "contact and never used to tune."),
-            "skipped_multi_file_variants": skipped_multi,
-            "skipped_no_bad_good_split": skipped_unsplit,
-        },
+        "notes": notes,
     }
 
 
@@ -212,6 +288,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--limit", type=int, default=None,
                    help="cap expected entries per CWE (sorted, "
                         "deterministic)")
+    p.add_argument("--family", choices=sorted(FAMILY_DIRS),
+                   default="injection",
+                   help="CWE-directory slice to label (default: the "
+                        "historical injection set)")
     p.add_argument("--variant-b", action="store_true",
                    help="generate the Juliet-B (multi-file) manifest")
     args = p.parse_args(argv)
@@ -219,7 +299,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         gen = generate_manifest_b if args.variant_b else generate_manifest
         manifest = gen(
-            args.clone_dir, cwes=args.cwe or None, limit=args.limit)
+            args.clone_dir, cwes=args.cwe or None, limit=args.limit,
+            family=args.family)
     except JulietManifestError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -278,7 +359,7 @@ _FORWARD_RE = re.compile(r"\.\s*badSink\s*\(")
 def _method_spans(text: str) -> list[tuple[int, str]]:
     """(line, name) for every bad*/good* declaration, in order."""
     out: list[tuple[int, str]] = []
-    for i, line in enumerate(text.splitlines(), 1):
+    for i, line in enumerate(split_lines(text), 1):
         m = _DECL_RE.match(line)
         if m:
             out.append((i, m.group(1)))
@@ -304,7 +385,7 @@ def _chain_sink_file(files: dict[str, str]) -> tuple[str, str] | None:
         body_start = min(bad_lines)
         body_end = min(good_lines) - 1
         body = "\n".join(
-            files[terminal].splitlines()[body_start - 1:body_end])
+            split_lines(files[terminal])[body_start - 1:body_end])
         if _FORWARD_RE.search(body):
             return None  # chosen terminal still forwards — ambiguous
         return terminal, ""
@@ -322,13 +403,18 @@ def _decl_defines(text: str, name: str) -> bool:
 
 
 def generate_manifest_b(clone_dir: Path, *, cwes: list[int] | None = None,
-                        limit: int | None = None) -> dict:
+                        limit: int | None = None,
+                        family: str = "injection") -> dict:
     """Build the Juliet-B (multi-file) manifest from the verified clone.
 
     Sink-anchored: every expected entry sits at the file that contains
     the dangerous operation, because detectors report at the sink and
     labeling a forwarding file would manufacture phantom misses.
+    ``family`` selects the CWE-directory slice (see FAMILY_DIRS); a
+    family whose directories ship no multi-file variants refuses with
+    the usual no-entries error rather than emitting an empty manifest.
     """
+    family_dirs = _family_dirs(family)
     _verify_clone(clone_dir)
     expected: list[dict] = []
     clean: list[dict] = []
@@ -338,7 +424,7 @@ def generate_manifest_b(clone_dir: Path, *, cwes: list[int] | None = None,
     def _refuse(reason: str) -> None:
         refused[reason] = refused.get(reason, 0) + 1
 
-    for dirname, cwe in sorted(COMPARABLE_DIRS.items()):
+    for dirname, cwe in sorted(family_dirs.items()):
         if cwes and cwe not in cwes:
             continue
         cwe_dir = clone_dir / _TESTCASES / dirname
@@ -361,7 +447,12 @@ def generate_manifest_b(clone_dir: Path, *, cwes: list[int] | None = None,
 
         for key, members in sorted(chains.items()):
             if len(members) < 2:
-                continue  # single-letter leftovers are not multi-file
+                # Single-letter leftovers are not multi-file cases —
+                # refused BY REASON like every other drop (the
+                # module's coverage-honesty posture: counted, never
+                # silent).
+                _refuse("single_letter_chain_leftover")
+                continue
             if limit is not None and per_cwe_count.get(cwe, 0) >= limit:
                 continue
             texts = {letter: p.read_text(encoding="utf-8",
@@ -418,9 +509,14 @@ def generate_manifest_b(clone_dir: Path, *, cwes: list[int] | None = None,
         msg = "no Juliet-B expected entries survived the filters"
         raise JulietManifestError(msg)
 
+    # Same stamp rule as generate_manifest: the default slice's byte
+    # layout is preserved; only the newer families carry the marker.
+    notes: dict = {}
+    if family != "injection":
+        notes["family"] = family
     return {
         "schema_version": SCHEMA_VERSION,
-        "name": "juliet-b-multifile",
+        "name": _FAMILY_NAMES_B[family],
         "target": {
             "repo_url": JULIET_REPO_URL,
             "pinned_sha": JULIET_PINNED_SHA,
@@ -432,6 +528,7 @@ def generate_manifest_b(clone_dir: Path, *, cwes: list[int] | None = None,
         "expected": expected,
         "clean_regions": clean,
         "notes": {
+            **notes,
             "ledger": (
                 "LEDGER-FRESH first-contact corpus: no mechanism has "
                 "been tuned against multi-file Juliet cases. Record "

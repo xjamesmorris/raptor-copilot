@@ -303,6 +303,48 @@ def test_license_findings_carry_canonical_key() -> None:
     assert len(d.persistent) == 1
 
 
+def _scan_health_row(kind: str = "osv_lookup_degraded") -> dict:
+    return {
+        "id": f"sca:scan_health:{kind}",
+        "finding_id": f"sca:scan_health:{kind}",
+        "vuln_type": f"sca:scan_health:{kind}",
+        "severity": "info",
+        "suppressed": False,
+        "sca": {"kind": kind},
+    }
+
+
+def test_scan_health_rows_carry_canonical_key() -> None:
+    """The identical mechanism the license fix above closed, on the
+    unfixed sibling lane: scan_health rows are emitted specifically
+    so pipelines can see that a scan's coverage degraded, yet
+    _canonical_key returned None for them — a baseline-gated PR
+    pipeline reported \"0 new findings\" green when the current scan
+    NEWLY degraded (e.g. OSV feed unreachable, advisories
+    unchecked). New degradation must surface in the delta; a
+    degradation present on both sides is persistent; one that
+    cleared resolves."""
+    row = _scan_health_row()
+    d_new = diff.compute_delta([], [row])
+    assert len(d_new.new) == 1
+    d_persistent = diff.compute_delta([row], [row])
+    assert len(d_persistent.persistent) == 1
+    d_resolved = diff.compute_delta([row], [])
+    assert len(d_resolved.resolved) == 1
+
+
+def test_scan_health_kinds_are_distinct_identities() -> None:
+    """Different degradation kinds are different findings — an OSV
+    outage clearing while a registry outage appears must not read
+    as persistent."""
+    old = [_scan_health_row("osv_lookup_degraded")]
+    new = [_scan_health_row("registry_lookup_degraded")]
+    d = diff.compute_delta(old, new)
+    assert len(d.new) == 1
+    assert len(d.resolved) == 1
+    assert len(d.persistent) == 0
+
+
 def test_persistent_severity_breakdown_in_summary() -> None:
     """Markdown report's persistent line carries the severity
     breakdown so operators reading CI logs see whether the backlog
@@ -539,11 +581,11 @@ def test_table_newline_in_reason_stays_one_row() -> None:
 
 def test_md_cell_caps_length_and_escapes_controls() -> None:
     long_value = "x" * 5000
-    cell = diff._md_cell(long_value)
+    cell = diff.md_cell(long_value)
     assert len(cell) <= diff._MD_CELL_LIMIT + 1  # +1 for the ellipsis
     assert cell.endswith("…")
     # ANSI escape defanged, backtick escaped.
-    cell2 = diff._md_cell("a\x1b[31mred`tick")
+    cell2 = diff.md_cell("a\x1b[31mred`tick")
     assert "\x1b" not in cell2
     assert "\\x1b" in cell2
     assert "\\`" in cell2
@@ -556,3 +598,27 @@ def test_pr_comment_neutralises_repo_label() -> None:
     )
     assert "<script>" not in md
     assert "&lt;script&gt;" in md
+
+
+def test_md_cell_neutralises_link_and_image_syntax() -> None:
+    """``![x](url)`` / ``[x](url)`` from untrusted fields must not
+    render as an active image beacon / link in PR-comment tables —
+    the bracket syntax is backslash-escaped."""
+    cell = diff.md_cell("![beacon](https://evil.example/p)")
+    assert "![" not in cell
+    assert cell.startswith("!\\[")
+    cell2 = diff.md_cell("[phish](https://evil.example)")
+    assert "[phish]" not in cell2
+    assert "\\[phish\\]" in cell2
+
+
+def test_canonical_key_case_folds_cve_primary_id() -> None:
+    """Distro-secdb / kernel-CNA advisories are CVE-PRIMARY (the id IS
+    the CVE, no self-alias). A feed-case drift on the primary id must
+    read as the same persistent finding — not a spurious new+resolved
+    pair (which fails severity-gated PRs on nothing). The alias arm
+    two lines up already folds case; same discipline."""
+    a = [_vuln_row(advisory_id="CVE-2023-1111", aliases=[])]
+    b = [_vuln_row(advisory_id="cve-2023-1111", aliases=[])]
+    d = diff.compute_delta(a, b)
+    assert d.new == [] and d.resolved == []

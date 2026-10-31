@@ -9,9 +9,14 @@ coverage build:
 - ``collect_llvm(binary, profdata)`` runs ``llvm-cov export -format=lcov`` →
   :func:`parse_lcov`.
 
-Subprocesses use the sanitised env (``RaptorConfig.get_safe_env``) and
-list-form args (never shell-interpolate scanned-repo paths); tolerant — a tool
-failure yields ``{}``, never raises.
+Subprocesses run under the full sandbox (``core.sandbox.run``: network
+blocked, Landlock, rlimits — the same posture the binary oracle gives
+binutils, and for the same reason: gcov/llvm-cov/addr2line parse
+attacker-influenced build artifacts and their parsers have CVE
+history), with the sanitised env and list-form args (never
+shell-interpolate scanned-repo paths); tolerant — a tool failure (or a
+sandbox that cannot engage: never run these tools unsandboxed over
+hostile artifacts) yields ``{}``, never raises.
 """
 
 from __future__ import annotations
@@ -32,30 +37,82 @@ _TIMEOUT = 300
 
 
 import logging
+from core.security.env_sanitisation import safe_subprocess_env
 
 logger = logging.getLogger(__name__)
 
 
-def _safe_env() -> dict[str, str]:
-    try:
-        from core.config import RaptorConfig
-        return RaptorConfig.get_safe_env()
-    except (ImportError, AttributeError):
-        # Fail CLOSED: gcov/llvm-cov run over attacker-influenced
-        # build trees, and the repo rule is always-get_safe_env. If
-        # the config chokepoint is unavailable, hand subprocesses a
-        # minimal allowlisted env instead of the full inherited one.
-        keep = ("PATH", "HOME", "TMPDIR", "LANG", "TZ")
-        return {
-            k: v for k, v in os.environ.items()
-            if k in keep or k.startswith("LC_")
-        }
-
-
 # Per-.gcda cap on gcov report size. A legitimate report is
 # proportional to the source file; anything past this is a crafted
-# artifact — refuse rather than keep processing it.
+# artifact — refuse rather than keep processing it. Enforced on the
+# redirected output FILE before it is read, so a crafted artifact
+# cannot balloon this process's memory either (the pre-fix
+# capture_output shape buffered the whole report before checking).
 _MAX_GCOV_STDOUT = 64 * 1024 * 1024
+
+# Read budget for binary coverage artifacts (drcov / sancov dumps).
+# They arrive from instrumented target runs — attacker-influenced by
+# definition — and were read wholesale (a 4 GiB sancov materialises
+# ~30 GiB of Python ints). Same 64 MiB ceiling class as the gcov
+# stdout cap above; an over-budget artifact refuses (truncated PC
+# tables would silently misattribute coverage).
+_MAX_BINARY_COV_BYTES = 64 * 1024 * 1024
+
+# Cap on the DERIVED address count one collect_addr2line call may
+# resolve. Byte budgets bound the artifact FILE, not the sandboxed
+# work derived from it: an in-budget drcov packs ~8M records → ~16M
+# addresses after the PIE/non-PIE doubling → ~16k full sandbox spawns
+# per file, and the drcov import sits on the backfill path (every
+# coverage render). Refuse-over-truncate, matching the PC-table
+# posture above: a hostile artifact is refused whole with a warning.
+# Trade-off, both directions: LOWER starves genuinely huge legitimate
+# traces (a long fuzz run over a big binary can touch millions of
+# BBs — rare, and the drcov doubling halves the effective ceiling);
+# HIGHER re-admits the spawn storm (each 1000-address chunk is one
+# full sandbox setup). 100k ≈ ≤100 spawns per call.
+_MAX_ADDR2LINE_ADDRS = 100_000
+
+# Cap on how many .gcda files one collect_gcov call processes (one
+# sandboxed gcov + private tempdir per file; the rglob count is
+# build-tree-writable). Truncate-with-warning, NOT refuse: each
+# .gcda contributes independently, so a deterministic (sorted)
+# prefix claims LESS coverage, never wrong coverage — same safe
+# direction as the module's out-of-tree-source residual. Trade-off:
+# LOWER silently under-reports very large builds (one .gcda per
+# object file — thousands are legitimate); HIGHER re-admits the
+# spawn storm on the operator-invoked lane. 2048 covers typical
+# builds; a monorepo-scale build sees the warning and can import
+# per-subtree.
+_MAX_GCDA_FILES = 2048
+
+
+def _sandboxed_run(argv: list[str], *, target: str | None,
+                   env: dict[str, str],
+                   readable_paths: list[str] | None = None,
+                   output: str | None = None,
+                   cwd: str | None = None):
+    """Run one collector tool under the full sandbox; ``None`` on any
+    failure INCLUDING a sandbox that cannot engage — the artifacts the
+    tool parses are attacker-influenced, so degrading to an
+    unsandboxed run is never an option (fail closed to "no coverage").
+    """
+    from core.sandbox import run as _sandbox_run
+    from core.sandbox.errors import SandboxSetupError
+    try:
+        return _sandbox_run(
+            argv, block_network=True, target=target,
+            readable_paths=readable_paths, output=output,
+            env=env, strict_env=True, cwd=cwd,
+            capture_output=True, timeout=_TIMEOUT)
+    except SandboxSetupError as e:
+        logger.warning(
+            "coverage collect: sandbox could not engage for %s — "
+            "refusing to run it unsandboxed over untrusted build "
+            "artifacts (%s)", argv[0], e)
+        return None
+    except (OSError, subprocess.SubprocessError) as e:
+        logger.debug("coverage collect: %s failed: %s", argv[0], e)
+        return None
 
 # A gcov text report starts each per-source section with the
 # ``Source:`` metadata row (lineno 0).
@@ -93,29 +150,55 @@ def collect_gcov(build_dir, env: dict[str, str] | None = None) -> dict[str, set[
     purely so the recorded relative source paths resolve (without
     source text gcov omits the per-line rows); with ``-t`` that cwd
     is never written to. Sections are split per ``Source:`` header
-    and parsed from a private temp dir."""
+    and parsed from a private temp dir.
+
+    gcov runs under the full sandbox with ``build_dir`` as the read
+    grant; its stdout is redirected to a file in the sandbox-writable
+    temp dir (the sandbox runners capture rather than stream) and
+    size-checked BEFORE being read, so a crafted artifact can balloon
+    neither this process's memory nor the parse. Residual: on hosts
+    where the mount-ns backend engages, sources OUTSIDE ``build_dir``
+    (out-of-tree builds recording ``../``-relative paths) are not
+    visible to gcov, which then omits those per-line rows — the safe
+    direction (less coverage claimed, never wrong coverage)."""
     from .parsers import parse_gcov
 
     build = Path(build_dir)
     gcda = list(build.rglob("*.gcda"))
     if not gcda:
         return {}
-    env = env or _safe_env()
+    if len(gcda) > _MAX_GCDA_FILES:
+        logger.warning(
+            "coverage collect: %d .gcda files under %s — processing "
+            "the first %d (sorted); runtime coverage will "
+            "under-report the rest", len(gcda), build, _MAX_GCDA_FILES)
+        gcda = sorted(gcda)[:_MAX_GCDA_FILES]
+    env = dict(env) if env else safe_subprocess_env()
     out: dict[str, set[int]] = {}
     for f in gcda:
-        try:
-            r = subprocess.run(
-                ["gcov", "-t", "-o", str(f.parent), str(f)],
-                cwd=str(f.parent), env=env,
-                capture_output=True, timeout=_TIMEOUT, check=False)
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if r.returncode != 0 or not r.stdout:
-            continue
-        if len(r.stdout) > _MAX_GCOV_STDOUT:
-            continue
-        text = r.stdout.decode("utf-8", "replace")
         with tempfile.TemporaryDirectory(prefix="raptor-gcov-") as td:
+            out_path = os.path.join(td, "stdout.txt")
+            run_env = dict(env)
+            run_env["RAPTOR_GCOV_OUT"] = out_path
+            # The redirect happens inside bash via "$@"/env so
+            # attacker-influenced paths never enter a shell string
+            # (same shape as the binary oracle's stream helper).
+            wrapper = ["bash", "-c", 'exec "$@" > "$RAPTOR_GCOV_OUT"',
+                       "gcov-run",
+                       "gcov", "-t", "-o", str(f.parent), str(f)]
+            r = _sandboxed_run(wrapper, target=str(build), output=td,
+                               env=run_env, cwd=str(f.parent))
+            if r is None or r.returncode != 0:
+                continue
+            try:
+                if os.stat(out_path).st_size > _MAX_GCOV_STDOUT:
+                    continue
+                text = Path(out_path).read_text(
+                    encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if not text:
+                continue
             tdp = Path(td)
             for i, section in enumerate(_split_gcov_sections(text)):
                 (tdp / f"section-{i:04d}.gcov").write_text(
@@ -128,23 +211,32 @@ def collect_gcov(build_dir, env: dict[str, str] | None = None) -> dict[str, set[
 def collect_llvm(binary, profdata, env: dict[str, str] | None = None) -> dict[str, set[int]]:
     """Run ``llvm-cov export -format=lcov`` for an instrumented ``binary`` +
     ``.profdata`` and parse the emitted lcov. Returns
-    ``{source_path: set(executed_lines)}``."""
+    ``{source_path: set(executed_lines)}``.
+
+    Sandboxed like :func:`collect_gcov` (the binary and profdata are
+    attacker-influenced artifacts): the binary's directory is the read
+    grant, the profdata's directory an extra readable path."""
     from .parsers import parse_lcov
 
-    env = env or _safe_env()
+    env = dict(env) if env else safe_subprocess_env()
     try:
-        r = subprocess.run(
-            ["llvm-cov", "export", "-format=lcov",
-             f"-instr-profile={profdata}", str(binary)],
-            capture_output=True, text=True, env=env, timeout=_TIMEOUT, check=False)
-    except (OSError, subprocess.SubprocessError):
+        target = str(Path(binary).resolve().parent)
+        prof_dir = str(Path(profdata).resolve().parent)
+    except OSError:
         return {}
-    if r.returncode != 0 or not r.stdout.strip():
+    r = _sandboxed_run(
+        ["llvm-cov", "export", "-format=lcov",
+         f"-instr-profile={profdata}", str(binary)],
+        target=target, readable_paths=[prof_dir], env=env)
+    if r is None or r.returncode != 0:
+        return {}
+    r_stdout = (r.stdout or b"").decode("utf-8", "replace")
+    if not r_stdout.strip():
         return {}
     fd, tmp = tempfile.mkstemp(suffix=".info")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(r.stdout)
+            fh.write(r_stdout)
         return parse_lcov(tmp)
     finally:
         try:
@@ -172,19 +264,34 @@ def collect_addr2line(binary, addresses, env: dict[str, str] | None = None) -> d
     addrs = [a for a in addresses if a is not None]
     if not addrs:
         return {}
-    env = env or _safe_env()
+    if len(addrs) > _MAX_ADDR2LINE_ADDRS:
+        # The chokepoint for every address-set producer (drcov,
+        # sancov, frida bridge, direct import): the caller's byte
+        # budget bounds the artifact, not the derived spawn count —
+        # one sandboxed addr2line per 1000-address chunk. Refuse the
+        # whole set with a warning (truncating would silently claim
+        # partial runtime coverage for a hostile artifact).
+        logger.warning(
+            "coverage collect: %d addresses for %s exceeds the %d "
+            "address budget — refusing to resolve (hostile or "
+            "malformed coverage artifact?)", len(addrs), binary,
+            _MAX_ADDR2LINE_ADDRS)
+        return {}
+    env = dict(env) if env else safe_subprocess_env()
+    try:
+        target = str(Path(binary).resolve().parent)
+    except OSError:
+        return {}
     out: dict[str, set[int]] = {}
     for chunk in _chunks(addrs, 1000):          # avoid arg-length limits
         args = ["addr2line", "-e", str(binary)] + [
             hex(a) if isinstance(a, int) else str(a) for a in chunk]
-        try:
-            r = subprocess.run(args, capture_output=True, text=True, env=env,
-                               timeout=_TIMEOUT, check=False)
-        except (OSError, subprocess.SubprocessError):
+        # Sandboxed: addr2line parses the artifact's DWARF (untrusted
+        # bytes) — same posture as the binary oracle's binutils calls.
+        r = _sandboxed_run(args, target=target, env=env)
+        if r is None or r.returncode != 0:
             continue
-        if r.returncode != 0:
-            continue
-        for line in r.stdout.splitlines():
+        for line in (r.stdout or b"").decode("utf-8", "replace").splitlines():
             # "path:line", "path:line (discriminator N)", "??:0", "path:?"
             line = line.strip()
             path, sep, rest = line.rpartition(":")
@@ -209,6 +316,22 @@ def import_addresses(
     return mark_runtime(store, collect_addr2line(binary, addresses), checklist, tool)
 
 
+def _read_binary_cov(path) -> bytes | None:
+    """Byte-budgeted read of a coverage artifact; None on refusal."""
+    from core.source import read_bytes_capped
+    read = read_bytes_capped(path, _MAX_BINARY_COV_BYTES)
+    if read is None:
+        return None
+    raw, truncated = read
+    if truncated:
+        logger.warning(
+            "coverage artifact %s exceeds %d bytes; refusing rather "
+            "than importing a truncated PC table", path,
+            _MAX_BINARY_COV_BYTES)
+        return None
+    return raw
+
+
 def parse_drcov(path) -> dict[str, dict[str, Any]]:
     """Parse a drcov coverage file (DynamoRIO / Frida / AFL-QEMU / Lighthouse).
 
@@ -216,9 +339,8 @@ def parse_drcov(path) -> dict[str, dict[str, Any]]:
     addresses, not source (resolved later by :func:`collect_drcov`). drcov is a
     text header (module table) followed by a packed-binary BB table of
     ``<IHH>`` records (module-relative start u32, size u16, module_id u16)."""
-    try:
-        raw = Path(path).read_bytes()
-    except OSError:
+    raw = _read_binary_cov(path)
+    if raw is None:
         return {}
     marker = b"BB Table:"
     idx = raw.find(marker)
@@ -317,11 +439,8 @@ def parse_sancov(path) -> set[int]:
     """Parse an LLVM ``.sancov`` file (``-fsanitize-coverage=trace-pc-guard``
     dump) into its set of covered PCs. 8-byte magic selects 64/32-bit PC width;
     the remainder is a flat little-endian PC array."""
-    try:
-        raw = Path(path).read_bytes()
-    except OSError:
-        return set()
-    if len(raw) < 8:
+    raw = _read_binary_cov(path)
+    if raw is None or len(raw) < 8:
         return set()
     magic = struct.unpack_from("<Q", raw, 0)[0]
     if magic == _SANCOV_MAGIC64:

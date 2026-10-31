@@ -198,6 +198,11 @@ class TestRunUntrustedForwardsAuditKwargs:
             return subprocess.CompletedProcess(args=cmd, returncode=0)
 
         monkeypatch.setattr(ctx, "run", spy_run)
+        # The darwin arm of run_untrusted's entry gate smoke-tests the
+        # REAL host's sandbox-exec; pretend it holds so the plumbing
+        # under test is reached on every platform (including
+        # emulated-darwin runs — the gate itself has its own tests).
+        monkeypatch.setattr(ctx, "check_seatbelt_available", lambda: True)
 
         # Call run_untrusted with audit=True. target+output required
         # (run_untrusted enforces); audit is forwarded via **kwargs.
@@ -347,6 +352,10 @@ class TestAllowlistExtensionFlags:
         with pytest.raises(ValueError, match="incoherent"):
             cli_mod.apply_cli_args(args, None)
 
+    # The readable-paths union lands in _make_preexec_fn — the Linux
+    # lane's plumbing (requires_landlock already keeps it off real
+    # macs; the marker keeps it out of emulated-darwin runs too).
+    @pytest.mark.linux_native
     @requires_landlock
     def test_context_merges_cli_readable_paths(self, tmp_path):
         """sandbox() must union the CLI extension into the caller's

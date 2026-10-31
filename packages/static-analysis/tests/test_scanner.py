@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
+import pytest
+
 
 # static-analysis has a hyphen — load via importlib
 _SCANNER_PATH = Path(__file__).parent.parent / "scanner.py"
@@ -288,6 +290,97 @@ class TestComputePythonToolPaths:
         assert str(lib_dir) in result, \
             f"stdlib dir missing from {result!r}"
 
+    def _fake_prefix_layout(self, root, with_pyvenv_cfg):
+        """Synthesise a Python prefix layout under ``root``:
+        bin/python3.13 (fake interpreter file), lib/python3.13/,
+        and a console script whose shebang points at the fake
+        interpreter. With ``with_pyvenv_cfg`` the layout is a PEP
+        405 venv (pyvenv.cfg at the root); without it, a plain
+        prefix install. Returns (script, bin_dir, lib_dir)."""
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        lib_dir = root / "lib" / "python3.13"
+        lib_dir.mkdir(parents=True)
+        py = bin_dir / "python3.13"
+        py.write_text("#!/bin/sh\necho fake python\n")
+        py.chmod(0o755)
+        script = bin_dir / "sometool"
+        script.write_text(f"#!{py}\nprint('hi')\n")
+        script.chmod(0o755)
+        if with_pyvenv_cfg:
+            (root / "pyvenv.cfg").write_text(
+                "home = /usr/bin\n"
+                "include-system-site-packages = false\n"
+            )
+        return script, bin_dir, lib_dir
+
+    def test_venv_layout_with_pyvenv_cfg_includes_venv_root(
+            self, tmp_path):
+        """pyvenv.cfg visibility is the PEP 405 venv-activation
+        toggle; without it the interpreter falls back to the base
+        prefix and drops the venv site-packages. A layout WITH
+        pyvenv.cfg must therefore get the venv root (where the cfg
+        lives) into the bind set, alongside bin/ and lib/pythonX.Y/."""
+        venv = tmp_path / "venv"
+        venv.mkdir()
+        script, bin_dir, lib_dir = self._fake_prefix_layout(
+            venv, with_pyvenv_cfg=True)
+        result = _compute_python_tool_paths([str(script)])
+        assert str(venv) in result, \
+            f"venv root missing from {result!r}"
+        assert str(bin_dir) in result, \
+            f"bin dir missing from {result!r}"
+        assert str(lib_dir) in result, \
+            f"stdlib dir missing from {result!r}"
+
+    def test_layout_without_pyvenv_cfg_excludes_root(self, tmp_path):
+        """Identical layout but NO pyvenv.cfg → a plain prefix
+        install, not a venv; the root holds nothing Python needs and
+        must stay OUT of the bind set (least privilege for the mount
+        namespace). bin/ and lib/pythonX.Y/ keep their binds."""
+        prefix = tmp_path / "prefix"
+        prefix.mkdir()
+        script, bin_dir, lib_dir = self._fake_prefix_layout(
+            prefix, with_pyvenv_cfg=False)
+        result = _compute_python_tool_paths([str(script)])
+        assert str(prefix) not in result, \
+            f"non-venv root wrongly bound: {result!r}"
+        assert str(bin_dir) in result, \
+            f"bin dir regressed: {result!r}"
+        assert str(lib_dir) in result, \
+            f"stdlib dir regressed: {result!r}"
+
+    def test_system_prefix_venv_root_is_skipped(self, tmp_path):
+        """A /usr-rooted layout adds nothing: even when pyvenv.cfg
+        appears to exist at the system prefix root, /usr is already
+        in the mount-ns bind tree and must not enter the bind set.
+        The venv root is the only derived path that can land ON a
+        skip prefix (bin/stdlib dirs are always deeper), so fake the
+        cfg's existence to make the prefix skip the deciding gate."""
+        script = tmp_path / "tool"
+        script.write_text("#!/usr/bin/python3\nprint('hi')\n")
+        script.chmod(0o755)
+        real_is_file = Path.is_file
+
+        def fake_is_file(self):
+            # Fake interp + cfg so the venv-root branch runs without
+            # needing writable /usr; everything else stays real.
+            if str(self) in ("/usr/bin/python3", "/usr/pyvenv.cfg"):
+                return True
+            return real_is_file(self)
+
+        with patch.object(Path, "is_file", fake_is_file):
+            result = _compute_python_tool_paths([str(script)])
+        assert "/usr" not in result, \
+            f"system prefix root wrongly bound: {result!r}"
+        for p in result:
+            assert not p.startswith("/usr/"), \
+                f"{p!r} should have been filtered out"
+        # Sanity: the function did run past the interp branch — the
+        # script's own bin dir (interesting) is still returned.
+        assert str(tmp_path.resolve()) in result, \
+            f"script bin dir missing from {result!r}"
+
 
 class TestValidatePolicyGroups:
     """Unknown policy groups are an argparse-level hard error, not a
@@ -350,3 +443,171 @@ class TestValidatePolicyGroups:
             _scanner_mod._validate_policy_groups(
                 self._parser(), "whatever",
             )
+
+
+# ---------------------------------------------------------------------------
+# _CodeQLStageHandle — abort kill switch for the concurrent stage
+# ---------------------------------------------------------------------------
+# An exception between the stage submit and its join (semgrep's
+# fail-loud SandboxSetupError, KeyboardInterrupt) used to reach
+# sys.exit while concurrent.futures joined the non-daemon worker:
+# "scan aborted" then hung up to 1h on the agent's communicate.
+
+
+class TestCodeQLStageHandle:
+
+    def test_abort_kills_registered_process_group(self):
+        import subprocess as sp
+        handle = _scanner_mod._CodeQLStageHandle()
+        proc = sp.Popen(["sleep", "60"], start_new_session=True)
+        try:
+            handle.register(proc)
+            handle.abort()
+            # The join the abort exists to unwedge: must return
+            # promptly, not after sleep's 60s.
+            rc = proc.wait(timeout=10)
+            assert rc != 0
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+
+    def test_abort_before_register_kills_at_registration(self):
+        import subprocess as sp
+        handle = _scanner_mod._CodeQLStageHandle()
+        handle.abort()
+        proc = sp.Popen(["sleep", "60"], start_new_session=True)
+        try:
+            handle.register(proc)  # abort raced the spawn
+            rc = proc.wait(timeout=10)
+            assert rc != 0
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+
+    def test_run_codeql_skips_spawn_after_abort(self, tmp_path):
+        handle = _scanner_mod._CodeQLStageHandle()
+        handle.abort()
+        with patch("shutil.which", return_value="/usr/bin/codeql"), \
+             patch.object(_scanner_mod.subprocess, "Popen") as mock_proc:
+            result = run_codeql(
+                tmp_path, tmp_path / "out", ["python"],
+                stage_handle=handle,
+            )
+        assert result == []
+        mock_proc.assert_not_called()
+
+    def test_run_codeql_reports_abort_not_agent_rc(self, tmp_path):
+        # The agent was SIGKILLed by the abort path mid-communicate:
+        # run_codeql must report the abort and return [], not warn
+        # about a mysterious nonzero agent rc or glob half-written
+        # SARIFs into the merge.
+        handle = _scanner_mod._CodeQLStageHandle()
+        (tmp_path / "out").mkdir()
+        (tmp_path / "out" / "codeql_python.sarif").write_text("{}")
+
+        fake = _fake_popen(returncode=-9)
+
+        def _communicate(timeout=None):
+            handle.abort()  # abort lands while communicate is blocked
+            return ("", "")
+
+        fake.communicate.side_effect = _communicate
+        fake.poll.return_value = -9
+        with patch("shutil.which", return_value="/usr/bin/codeql"), \
+             patch.object(_scanner_mod.subprocess, "Popen",
+                          return_value=fake):
+            result = run_codeql(
+                tmp_path, tmp_path / "out", ["python"],
+                stage_handle=handle,
+            )
+        assert result == []
+
+
+class TestJoinCodeQLStage:
+    """The concurrent stage's JOIN carries the abort discipline too.
+
+    The guarded semgrep region only covers exceptions raised BEFORE
+    the join; a KeyboardInterrupt while the main thread is blocked in
+    future.result() — the single longest wait of the run once semgrep
+    finishes — is not an Exception, so it skipped the stage-isolation
+    handler and wedged interpreter shutdown on the non-daemon
+    worker's 3600s communicate.
+    """
+
+    @staticmethod
+    def _future(target):
+        from concurrent.futures import ThreadPoolExecutor
+        pool = ThreadPoolExecutor(max_workers=1)
+        try:
+            return pool.submit(target)
+        finally:
+            pool.shutdown(wait=False)
+
+    def test_keyboard_interrupt_runs_abort_and_reraises(self):
+        def _stage():
+            raise KeyboardInterrupt
+
+        aborted = []
+        future = self._future(_stage)
+        with pytest.raises(KeyboardInterrupt):
+            _scanner_mod._join_codeql_stage(
+                future, lambda: aborted.append(True),
+            )
+        assert aborted, (
+            "abort not invoked on KeyboardInterrupt — the codeql "
+            "agent's process group stays alive and the shutdown join "
+            "wedges"
+        )
+
+    def test_stage_exception_demoted_no_abort(self, capsys):
+        def _stage():
+            raise RuntimeError("db build failed")
+
+        aborted = []
+        future = self._future(_stage)
+        result = _scanner_mod._join_codeql_stage(
+            future, lambda: aborted.append(True),
+        )
+        assert result == []
+        assert not aborted
+        assert "CodeQL stage failed" in capsys.readouterr().err
+
+    def test_success_passes_sarifs_through(self):
+        def _fail_abort():
+            raise AssertionError("abort must not run on a successful join")
+
+        future = self._future(lambda: ["a.sarif", "b.sarif"])
+        result = _scanner_mod._join_codeql_stage(future, _fail_abort)
+        assert result == ["a.sarif", "b.sarif"]
+
+    def test_run_codeql_interrupt_mid_communicate_killpgs_and_reraises(
+        self, tmp_path,
+    ):
+        # Sequential sibling: only TimeoutExpired killed the group, so
+        # Ctrl-C during communicate orphaned the agent's whole process
+        # tree (codeql grandchildren burning CPU and holding cache
+        # locks).
+        fake = _fake_popen(
+            communicate_side_effect=KeyboardInterrupt(),
+        )
+        with patch("shutil.which", return_value="/usr/bin/codeql"), \
+             patch.object(_scanner_mod.subprocess, "Popen") as mock_popen, \
+             patch.object(_scanner_mod.os, "killpg") as mock_killpg, \
+             patch.object(_scanner_mod.os, "getpgid", return_value=12345):
+            mock_popen.return_value = fake
+            with pytest.raises(KeyboardInterrupt):
+                run_codeql(tmp_path, tmp_path / "out", languages=None)
+
+        assert mock_killpg.called, (
+            "killpg not invoked on KeyboardInterrupt — codeql will orphan"
+        )
+        args = mock_killpg.call_args.args
+        assert args[0] == 12345
+        assert args[1] == _scanner_mod.signal.SIGKILL
+        # Reap parity with the TimeoutExpired arm: without the wait,
+        # the direct child lingers as a zombie for as long as an
+        # interrupt-catching caller lives.
+        assert fake.wait.called, (
+            "child not reaped after killpg — zombie until the "
+            "interrupt-catching caller exits"
+        )

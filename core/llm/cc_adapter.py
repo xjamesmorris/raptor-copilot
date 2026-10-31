@@ -6,16 +6,26 @@ The subprocess counterpart to the SDK providers in ``core.llm.providers``.
 
 from __future__ import annotations
 
+import atexit
 import contextlib
+import hashlib
 import json
 import logging
+import math
 import os
 import stat
 import tempfile
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from core.security.credential_env import (
+    ANTHROPIC_FIRST_PARTY_AUTH_VARS,
+    CREDENTIAL_ENV_FAMILY,
+    is_credential_shaped,
+    is_model_traffic_redirect_shaped,
+)
 from core.security.redaction import redact_secrets
 
 if TYPE_CHECKING:
@@ -80,31 +90,27 @@ _CC_AWS_STATIC_CREDENTIAL_NAMES = (
     "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
 )
 
-# credential_mode="proxy": names/prefixes that must NOT ride the
-# backend overlay into a proxy-mode child. Credential material is the
-# obvious set. Operator base-URL pins are stripped because the caller
-# sets the one true gateway route after the overlay, and the
-# CLAUDE_CODE_SKIP_* family is stripped-then-reset so only the
-# skip-auth flags THIS mode needs are present. Backend-SELECTION flags
-# (CLAUDE_CODE_USE_*) are deliberately KEPT: the CLI's provider mode
-# decides which gateway env vars it reads (verified against the CLI —
-# a Bedrock install ignores ``ANTHROPIC_BASE_URL`` and reads
-# ``ANTHROPIC_BEDROCK_MANTLE_BASE_URL`` instead).
-_CC_PROXY_STRIP_EXACT = frozenset({
-    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
-})
-_CC_PROXY_STRIP_PREFIXES = ("CLAUDE_CODE_SKIP_",)
-
-
+# credential_mode="proxy": names that must NOT ride the backend
+# overlay into a proxy-mode child. Credential material is the obvious
+# set — the canonical vocabulary (family membership plus the
+# name-shape belt, so a future CLAUDE_CODE_*_TOKEN knob cannot slip an
+# exact-name list) rather than a local enumeration. Model-traffic
+# redirect names (operator base-URL pins across ALL per-cloud
+# variants, AWS_ENDPOINT_URL*, and the CLAUDE_CODE_SKIP_* auth-mode
+# flips, which are stripped-then-reset so only the skip flags THIS
+# mode needs are present) come from the SAME vocabulary shape rule
+# cc_trust's settings scan applies — the two surfaces reason about
+# the identical redirect primitive and must not drift. The caller
+# sets the one true gateway route after the overlay.
+# Backend-SELECTION flags (CLAUDE_CODE_USE_*) are deliberately KEPT:
+# the CLI's provider mode decides which gateway env vars it reads
+# (verified against the CLI — a Bedrock install ignores
+# ``ANTHROPIC_BASE_URL`` and reads ``ANTHROPIC_BEDROCK_MANTLE_BASE_URL``
+# instead).
 def _cc_proxy_strip(key: str) -> bool:
-    if key in _CC_PROXY_STRIP_EXACT:
+    if key in CREDENTIAL_ENV_FAMILY or is_credential_shaped(key):
         return True
-    if key.startswith(_CC_PROXY_STRIP_PREFIXES):
-        return True
-    # Operator base-URL pins (ANTHROPIC_BASE_URL, and the per-cloud
-    # ANTHROPIC_*_BASE_URL variants) — the caller sets the one true
-    # gateway route after the overlay.
-    return key.startswith("ANTHROPIC_") and "BASE_URL" in key
+    return is_model_traffic_redirect_shaped(key)
 
 
 #: When set (to anything but "" / "0"), every live ``claude`` spawn on
@@ -120,6 +126,8 @@ _CC_TRANSPORT_DISABLED_ENV = "RAPTOR_CC_TRANSPORT_DISABLED"
 
 def cc_transport_disabled() -> bool:
     """True when live ``claude`` CLI spawns are administratively off."""
+    from core.security.session_services import require_service_authorization
+    require_service_authorization("the Claude Code harness")
     import os as _os
     return _os.environ.get(_CC_TRANSPORT_DISABLED_ENV, "") not in ("", "0")
 
@@ -217,6 +225,8 @@ def cc_subprocess_env(
     children that execute target-repo code: get_safe_env()'s whole
     point is that untrusted children never see cloud credentials.
     """
+    from core.security.session_services import require_service_authorization
+    require_service_authorization("the Claude Code harness")
     import os
 
     from core.config import RaptorConfig
@@ -250,13 +260,15 @@ def cc_subprocess_env(
         if key.startswith(_CC_BACKEND_ENV_PREFIXES):
             env[key] = value
     if bedrock or vertex:
-        # The child's provider is an alternate cloud — the first-party
-        # Anthropic API key/token is dead weight there, and some of
-        # these children run with tools enabled against hostile repos.
-        # Keep the key only where the child's provider requires it
-        # (first-party API installs, where it IS the auth).
-        env.pop("ANTHROPIC_API_KEY", None)
-        env.pop("ANTHROPIC_AUTH_TOKEN", None)
+        # The child's provider is an alternate cloud — first-party
+        # Anthropic auth material (API key, auth token, and the
+        # ``claude setup-token`` OAuth credential) is dead weight
+        # there, and some of these children run with tools enabled
+        # against hostile repos. Keep it only where the child's
+        # provider requires it (first-party API installs, where it IS
+        # the auth).
+        for key in ANTHROPIC_FIRST_PARTY_AUTH_VARS:
+            env.pop(key, None)
     if bedrock:
         for key in _CC_AWS_PASSTHROUGH_NAMES:
             if key in os.environ:
@@ -393,12 +405,31 @@ def _cc_proxy_mode_env(
 
     # Belt-and-braces enforcement of the zero-credential invariant —
     # get_safe_env plus the strip above already guarantee it, but this
-    # assert is what the security posture rests on, so verify rather
-    # than trust the layering.
+    # sweep is what the security posture rests on, so verify rather
+    # than trust the layering. Vocabulary-driven: every AWS_* name,
+    # every credential-family member, and anything credential-SHAPED
+    # (so a name neither the enumeration nor the layering anticipated
+    # still cannot leak). Two documented survivors:
+    #   * ANTHROPIC_AUTH_TOKEN — the minted scoped gateway token set
+    #     above; the child's ONLY credential by contract.
+    #   * RAPTOR_SESSION_TOKEN — RAPTOR's own session-registry
+    #     credential (an allowlisted get_safe_env member that deep
+    #     children need to resolve their project binding; validated
+    #     on every read, never provider credential material).
+    #   GIT_ASKPASS-style family pins from GIT_ENV_VARS also survive,
+    #   but only at their inert get_safe_env-set values (/usr/bin/true
+    #   etc.), which get_safe_env re-pins after its own strip.
+    _allowed = {"ANTHROPIC_AUTH_TOKEN", "RAPTOR_SESSION_TOKEN"}
+    _git_pins = RaptorConfig.GIT_ENV_VARS
     leaked = [
-        k for k in env
-        if k.startswith("AWS_")
-        or (k == "ANTHROPIC_API_KEY")
+        k for k, v in env.items()
+        if k not in _allowed
+        and _git_pins.get(k) != v
+        and (
+            k.startswith("AWS_")
+            or k in CREDENTIAL_ENV_FAMILY
+            or is_credential_shaped(k)
+        )
     ]
     for key in leaked:
         env.pop(key, None)
@@ -479,6 +510,7 @@ def _mint_child_aws_credentials(env: dict) -> None:
 
 
 _neutral_cwd: str | None = None
+_neutral_cwd_lock = threading.Lock()
 
 
 def neutral_cwd() -> str:
@@ -500,13 +532,20 @@ def neutral_cwd() -> str:
     """
     import os
     global _neutral_cwd
-    if _neutral_cwd is None or not os.path.isdir(_neutral_cwd):
-        import atexit
-        from core.run.scratch import scratch_dir
-        stack = contextlib.ExitStack()
-        _neutral_cwd = str(stack.enter_context(scratch_dir("raptor-cc-cwd-")))
-        atexit.register(stack.close)
-    return _neutral_cwd
+    # Lock-guarded check-then-create (same discipline as
+    # ``_sysprompt_lock`` below): two threads spawning their first CC
+    # dispatch concurrently would otherwise each create a scratch dir
+    # + ExitStack, leaking the loser's dir until process exit.
+    with _neutral_cwd_lock:
+        if _neutral_cwd is None or not os.path.isdir(_neutral_cwd):
+            import atexit
+            from core.run.scratch import scratch_dir
+            stack = contextlib.ExitStack()
+            _neutral_cwd = str(
+                stack.enter_context(scratch_dir("raptor-cc-cwd-"))
+            )
+            atexit.register(stack.close)
+        return _neutral_cwd
 
 
 @dataclass(frozen=True)
@@ -517,7 +556,7 @@ class CCDispatchConfig:
     add_dirs: tuple[str, ...] = ()
     budget_usd: str = "1.00"
     timeout_s: int = 300
-    json_schema: dict[str, Any] | None = None
+    json_schema: dict[str, Any] | bool | None = None
     capture_json_envelope: bool = True
     # System prompt passed via the CLI's system-prompt channel
     # (`--system-prompt-file`, or inline `--system-prompt` for
@@ -673,6 +712,190 @@ def build_cc_command(
     return cmd
 
 
+# ── Content-addressed system-prompt file cache ────────────────────────
+# A dispatch's system prompt is byte-stable per mode/call class by
+# design (that byte stability is what makes the CLI's prefix caching
+# effective), so staging a fresh per-call tempfile wrote thousands of
+# identical files to TMPDIR over a long run — and a full tempdir then
+# fails every subsequent dispatch identically. Instead: one private
+# 0700 directory per process (``core.run.scratch.scratch_dir`` in its
+# ``keep=True`` ownership-transfer shape, keepalive-paired per the
+# substrate contract), holding one file per distinct prompt CONTENT,
+# named by content hash, written once and reused by every later call
+# with the same content, removed at process exit. Bounded without
+# eviction machinery — the set of distinct prompt contents a process
+# produces is the set of its dispatch modes, a handful per run.
+#
+# Concurrency contract:
+# * threads — creation is serialised by ``_sysprompt_lock``.
+# * independent processes sharing TMPDIR — each process writes only
+#   inside its own unpredictably-named 0700 scratch directory, so
+#   processes can never share, pre-create (squat), or unlink each
+#   other's files. A flat predictable name in a shared TMPDIR would
+#   let any local user pre-create a directory at the final path,
+#   failing every subsequent ``os.replace`` with EISDIR for the whole
+#   run. The content hash keeps the per-process reuse exact.
+# * forked children — every path is creator-pid-guarded: a child
+#   inheriting the parent's cache state neither honors an inherited
+#   cache HIT (the file belongs to the parent, whose exit could
+#   unlink it under the child mid-dispatch) nor writes into the
+#   parent's directory — it gets a fresh directory and fresh files on
+#   first use — and the atexit cleanup no-ops in the child (a child
+#   exiting normally must not unlink files the parent's in-flight
+#   dispatches still read).
+# * readers — the file appears at its final name only via
+#   ``os.replace`` of a fully written 0600 temp in the same
+#   directory (never opened for writing in place, never truncated),
+#   so no reader can observe partial content.
+# * external sweepers — a cache hit refreshes the file's mtime, so an
+#   age-based TMPDIR sweeper (tmpwatch) sees a file in active use,
+#   not an hours-old leftover; a swept file is recreated on next use.
+_sysprompt_cache: dict[str, Path] = {}
+_sysprompt_lock = threading.Lock()
+_sysprompt_dir: Path | None = None
+_sysprompt_owner_pid: int | None = None
+
+
+def _sysprompt_cache_dir() -> Path:
+    """The calling process's private 0700 cache directory, created on
+    first use (and re-created after a fork or an external sweep).
+    Caller holds ``_sysprompt_lock``."""
+    global _sysprompt_dir, _sysprompt_owner_pid
+    pid = os.getpid()
+    if (
+        _sysprompt_dir is None
+        or _sysprompt_owner_pid != pid
+        or not _sysprompt_dir.is_dir()
+    ):
+        from core.run.scratch import (
+            keepalive_register,
+            keepalive_unregister,
+            scratch_dir,
+        )
+
+        _sysprompt_cache.clear()
+        if _sysprompt_dir is not None and _sysprompt_owner_pid == pid:
+            # Externally-swept dir: stop refreshing the vanished path.
+            # A forked child (pid mismatch) never touches the
+            # inherited registration — it is the PARENT's (and the
+            # scratch substrate's at-fork hook already dropped the
+            # child's copy).
+            keepalive_unregister(_sysprompt_dir)
+        # Ownership-transfer shape (``keep=True``): the substrate
+        # creates the directory and lists the prefix for the stale-tmp
+        # sweep; deletion is ours, at the pid-guarded atexit cleanup
+        # below. A lexically-held context would be wrong here — the
+        # directory must outlive every dispatch in the process.
+        with scratch_dir("cc-sysprompt-", keep=True) as d:
+            pass
+        # 0700 is guaranteed by scratch_dir's mkdtemp contract; assert
+        # anyway — same fail-loud posture as the 0600 file assert
+        # below.
+        mode = stat.S_IMODE(d.stat().st_mode)
+        if mode != 0o700:
+            msg = f"scratch dir has mode {mode:04o}, expected 0700"
+            raise AssertionError(msg)
+        # Non-context-manager owner of a reaper-listed prefix: keep
+        # the live dir's mtime fresh so a long-quiet session is never
+        # false-reaped; unregistered at the cleanup site (the scratch
+        # substrate's own registration ended with the block above).
+        keepalive_register(d)
+        _sysprompt_dir = d
+        _sysprompt_owner_pid = pid
+    return _sysprompt_dir
+
+
+def _cleanup_sysprompt_cache() -> None:
+    """Remove this process's cached system-prompt files and their
+    directory (atexit). Creator-pid-guarded: in a forked child the
+    inherited state belongs to the parent — removing it would yank
+    files out from under the parent's live dispatches."""
+    global _sysprompt_dir, _sysprompt_owner_pid
+    with _sysprompt_lock:
+        if (
+            _sysprompt_owner_pid is not None
+            and _sysprompt_owner_pid != os.getpid()
+        ):
+            return
+        paths = list(_sysprompt_cache.values())
+        _sysprompt_cache.clear()
+        cache_dir = _sysprompt_dir
+        _sysprompt_dir = None
+        _sysprompt_owner_pid = None
+    if cache_dir is not None:
+        from core.run.scratch import keepalive_unregister
+
+        keepalive_unregister(cache_dir)
+    for path in paths:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+    if cache_dir is not None:
+        with contextlib.suppress(OSError):
+            os.rmdir(cache_dir)
+
+
+atexit.register(_cleanup_sysprompt_cache)
+
+
+def _sysprompt_file(content: str) -> Path:
+    """Return the process-lifetime 0600 file holding *content*.
+
+    Creates the file on first use for this content (atomic
+    write-temp-then-rename inside the process-private directory);
+    later calls with the same content reuse the same path. Recreates
+    the file if an external scratch sweeper (tmpwatch, session-scratch
+    cleanup) removed it mid-run.
+    """
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:24]
+    with _sysprompt_lock:
+        cached = _sysprompt_cache.get(digest)
+        # The hit is honored only for the creating process: a forked
+        # child inheriting a warm cache must not lean on the parent's
+        # file (the parent's exit unlinks it, possibly mid-dispatch) —
+        # it falls through to the miss path, where _sysprompt_cache_dir
+        # resets the inherited state and gives it a fresh directory.
+        if (
+            cached is not None
+            and _sysprompt_owner_pid == os.getpid()
+            and cached.exists()
+        ):
+            # Refresh mtime: an age-based TMPDIR sweeper must see a
+            # file in active use, not an hours-old candidate. Best
+            # effort — a lost race with the sweeper is recreated on
+            # the next call.
+            with contextlib.suppress(OSError):
+                os.utime(cached)
+            return cached
+        cache_dir = _sysprompt_cache_dir()
+        final = cache_dir / f"{digest}.txt"
+        fd, raw_path = tempfile.mkstemp(
+            prefix=".part-", suffix=".txt", dir=str(cache_dir),
+        )
+        try:
+            try:
+                # 0600 is guaranteed by the mkstemp contract; assert
+                # anyway — the prompt can embed operator context and
+                # target excerpts, so a permissive-umask regression in
+                # a future tempfile implementation must fail loud, not
+                # leak. os.replace preserves the temp file's mode.
+                mode = stat.S_IMODE(os.fstat(fd).st_mode)
+                if mode != 0o600:
+                    msg = f"mkstemp returned mode {mode:04o}, expected 0600"
+                    raise AssertionError(msg)
+            except BaseException:
+                os.close(fd)
+                raise
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(content)
+            os.replace(raw_path, final)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(raw_path)
+            raise
+        _sysprompt_cache[digest] = final
+        return final
+
+
 @contextlib.contextmanager
 def system_prompt_file_for(config: CCDispatchConfig) -> Iterator[Path | None]:
     """Stage ``config.system_prompt`` in a private tempfile for the
@@ -681,46 +904,30 @@ def system_prompt_file_for(config: CCDispatchConfig) -> Iterator[Path | None]:
     Yields ``None`` when the config carries no system prompt (empty or
     unset — mirrors build_cc_command's emit condition, so the pair
     composes as ``build_cc_command(cfg, system_prompt_file=path)``
-    unconditionally). Otherwise yields the path of a 0600 tempfile
-    (``cc-sysprompt-*.txt`` in TMPDIR) holding the prompt utf-8; the
-    file is unlinked when the block exits, so keep the child's spawn
-    AND wait inside the ``with`` block.
+    unconditionally). Otherwise yields the path of a 0600 file
+    (``<hash>.txt`` inside this process's private 0700
+    ``cc-sysprompt-*`` directory in TMPDIR) holding the prompt utf-8.
+    The file is content-addressed and process-cached (see
+    ``_sysprompt_file``): it is NOT unlinked when the block exits —
+    later dispatches with the same prompt reuse it, and atexit removes
+    the whole cache when the process ends.
 
     Sandboxed callers (Landlock restrict_reads / mount-ns spawns) must
     add the yielded path to the run's ``readable_paths`` — TMPDIR is
     not readable inside the sandbox by default.
 
-    Residual: a SIGKILL between spawn and cleanup leaves the 0600 file
-    behind in TMPDIR. It is same-user-readable only (never in argv, so
-    never in /proc/<pid>/cmdline), and pytest runs are contained by the
-    session scratch redirect.
+    Residual: a SIGKILL before the atexit cleanup leaves the private
+    0700 directory behind in TMPDIR — at most one 0600 file per
+    distinct prompt content, owner-readable only (never in argv, so
+    never in /proc/<pid>/cmdline), pytest runs are contained by the
+    session scratch redirect, and the scratch substrate's per-process
+    reaper registration lets a later run in the same long-lived
+    process family reclaim the stray past the age floor.
     """
     if config.system_prompt is None or not config.system_prompt.strip():
         yield None
         return
-    fd, raw_path = tempfile.mkstemp(prefix="cc-sysprompt-", suffix=".txt")
-    path = Path(raw_path)
-    try:
-        try:
-            # 0600 is guaranteed by the mkstemp contract; assert
-            # anyway — the prompt can embed operator context and
-            # target excerpts, so a permissive-umask regression in a
-            # future tempfile implementation must fail loud, not leak.
-            mode = stat.S_IMODE(os.fstat(fd).st_mode)
-            if mode != 0o600:
-                msg = f"mkstemp returned mode {mode:04o}, expected 0600"
-                raise AssertionError(msg)
-        except BaseException:
-            os.close(fd)
-            raise
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(config.system_prompt)
-        yield path
-    finally:
-        try:
-            os.unlink(path)
-        except FileNotFoundError:
-            pass
+    yield _sysprompt_file(config.system_prompt)
 
 
 def strip_json_fences(text: str) -> str:
@@ -753,7 +960,7 @@ def strip_json_fences(text: str) -> str:
     last_candidate: str | None = None
     last_valid: str | None = None
     for part in parts[1::2]:
-        lines = part.strip().split("\n", 1)
+        lines = part.strip().split("\n", 1)  # line-model: LLM response fence parsing
         # First line is a language tag ("json") only when it doesn't
         # already start the JSON payload. Pre-fix the check covered
         # "{" but not "[": a fenced array whose "[" sat alone on the
@@ -796,6 +1003,7 @@ def extract_envelope_metadata(envelope: dict, into: dict) -> None:
     cost = envelope.get("total_cost_usd")
     if isinstance(cost, (int, float)):
         into["cost_usd"] = cost
+        into["cost_reported"] = True
     duration_ms = envelope.get("duration_ms")
     if isinstance(duration_ms, (int, float)):
         into["duration_seconds"] = round(duration_ms / 1000, 1)
@@ -866,6 +1074,21 @@ def _envelope_error(envelope: dict) -> Any | None:
     return None
 
 
+def _sanitise_envelope_error(env_error: Any) -> str:
+    """One shared treatment for the envelope ``error`` field.
+
+    The field is CLI/model-authored text that flows into
+    DispatchResult error strings, per-finding records, and
+    operator-visible logs: truncate, redact credentials, then defang
+    control bytes / ANSI / BIDI. Shared by both parsers so the
+    envelope-error path cannot drift between them the way the
+    freeform parser once shipped the bytes verbatim while claiming
+    symmetry with the structured one.
+    """
+    from core.security.prompt_output_sanitise import escape_nonprintable
+    return escape_nonprintable(redact_secrets(str(env_error)[:500]))
+
+
 def parse_cc_structured(
     stdout: str,
     stderr: str = "",
@@ -910,12 +1133,9 @@ def parse_cc_structured(
             # terminal-control bytes.
             env_error = _envelope_error(result)
             if env_error is not None:
-                from core.security.prompt_output_sanitise import escape_nonprintable
                 out: dict[str, Any] = {
                     "finding_id": finding_id,
-                    "error": escape_nonprintable(
-                        redact_secrets(str(env_error)[:500])
-                    ),
+                    "error": _sanitise_envelope_error(env_error),
                 }
                 # Failed runs still cost money — keep the envelope's
                 # cost/duration/model telemetry, as parse_cc_freeform
@@ -932,8 +1152,17 @@ def parse_cc_structured(
             parts = content.split("```")
             last_valid = None
             for part in parts[1::2]:
-                lines = part.strip().split("\n", 1)
-                json_str = lines[1] if len(lines) > 1 and not lines[0].startswith("{") else part
+                lines = part.strip().split("\n", 1)  # line-model: LLM response fence parsing
+                # Drop a language-tag first line ("json") only when it
+                # is not itself the JSON start — same brace/bracket
+                # pair strip_json_fences uses; the previous "{"-only
+                # check dropped the opening line of a fenced ARRAY.
+                json_str = (
+                    lines[1]
+                    if len(lines) > 1
+                    and not lines[0].lstrip().startswith(("{", "["))
+                    else part
+                )
                 try:
                     candidate = json.loads(json_str.strip())
                     if isinstance(candidate, dict):
@@ -1005,7 +1234,7 @@ def parse_cc_freeform(stdout: str, stderr: str = "") -> dict[str, Any]:
             # keep behaviour symmetric here.
             env_error = _envelope_error(envelope)
             if env_error is not None:
-                parsed["error"] = env_error
+                parsed["error"] = _sanitise_envelope_error(env_error)
             extract_envelope_metadata(envelope, parsed)
             return parsed
     except json.JSONDecodeError:
@@ -1027,6 +1256,42 @@ def extract_session_id(stdout: str) -> str | None:
     return None
 
 
+class CCTransportError(RuntimeError):
+    """A claude-CLI transport boundary failure (nonzero exit, timeout).
+
+    The message relays the CLI's OWN error envelope — stderr or the
+    stream-json result event's ``error`` field — never model output,
+    which rides stdout stream-json content blocks. ``is_api_transport``
+    marks the exception transport-corroborated for the message-sniffing
+    classifiers (``core.llm.providers.is_api_transport_exception``):
+    quota/billing vocabulary in the relayed envelope is provider truth
+    on this transport, exactly like a ``status_code`` on an SDK
+    exception. Raise it ONLY for CLI process/envelope failures — never
+    for errors whose message embeds model-generated content.
+    """
+
+    is_api_transport = True
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        diagnostic: dict[str, Any] | None = None,
+        error_kind: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.diagnostic = diagnostic
+        self.error_kind = error_kind
+
+
+class CCRequestSchemaError(CCTransportError):
+    """Claude Code rejected ``--json-schema`` before model generation."""
+
+
+class CCMissingRootTypeError(CCRequestSchemaError):
+    """Claude Code requires an object root type for object keywords."""
+
+
 @dataclass
 class StreamJsonResult:
     """Parsed result from ``--output-format stream-json --verbose``."""
@@ -1034,12 +1299,65 @@ class StreamJsonResult:
     structured_output: dict[str, Any] | None = None
     session_id: str | None = None
     cost_usd: float = 0.0
+    cost_reported: bool = False
     input_tokens: int = 0
     output_tokens: int = 0
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
     model: str | None = None
     error: str | None = None
+    error_kind: str | None = None
+    diagnostic: dict[str, Any] | None = None
+
+
+def _cc_error_kind(message: str) -> str:
+    """Classify transport-authored Claude CLI failure text."""
+    lower = (message or "").lower()
+    if (
+        "input_schema.type: field required" in lower
+        or 'strict mode: missing type "object"' in lower
+    ):
+        return "missing_root_type"
+    if (
+        "--json-schema is not a valid json schema" in lower
+        or "strict mode: unknown keyword" in lower
+    ):
+        return "request_schema"
+    if "error_max_budget_usd" in lower:
+        return "budget"
+    return "transport"
+
+
+def _finite_cost(value: Any) -> float | None:
+    """A cost figure fit for a spend ledger, or ``None`` to refuse.
+
+    Stdlib ``json.loads`` accepts the ``NaN`` / ``Infinity`` literals
+    and ``isinstance(x, (int, float))`` passes them (and ``bool``);
+    one NaN booked into ``total_cost`` makes every budget comparison
+    False and silently disables ``max_cost_per_scan``. Finite,
+    non-negative, non-bool only — the same finite-guard idiom as the
+    EPSS score gate.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    as_float = float(value)
+    if not math.isfinite(as_float) or as_float < 0:
+        return None
+    return as_float
+
+
+def _token_count(value: Any) -> int | None:
+    """A token count fit for a usage ledger, or ``None`` to refuse.
+
+    Ints only (``bool`` excluded), non-negative — a float NaN or a
+    negative figure from a malformed usage block would poison the
+    accumulated totals the cost split and telemetry read.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value < 0:
+        return None
+    return value
 
 
 def parse_stream_json_lines(lines: list[str]) -> StreamJsonResult:
@@ -1049,6 +1367,10 @@ def parse_stream_json_lines(lines: list[str]) -> StreamJsonResult:
     - ``assistant``: contains the model response in ``message.content``
     - ``result``: final metadata — session_id, cost, usage
     - ``system``: hook events (ignored)
+
+    Numeric envelope fields pass the finite guards above — the parse
+    boundary refuses non-finite/negative cost and token figures rather
+    than booking them into the spend ledgers.
     """
     result = StreamJsonResult()
     for raw in lines:
@@ -1095,10 +1417,13 @@ def parse_stream_json_lines(lines: list[str]) -> StreamJsonResult:
             usage = message.get("usage")
             if not isinstance(usage, dict):
                 usage = {}
-            result.input_tokens += usage.get("input_tokens", 0) or 0
-            result.output_tokens += usage.get("output_tokens", 0) or 0
-            cache_read = usage.get("cache_read_input_tokens", 0)
-            cache_create = usage.get("cache_creation_input_tokens", 0)
+            result.input_tokens += _token_count(
+                usage.get("input_tokens")) or 0
+            result.output_tokens += _token_count(
+                usage.get("output_tokens")) or 0
+            cache_read = _token_count(usage.get("cache_read_input_tokens"))
+            cache_create = _token_count(
+                usage.get("cache_creation_input_tokens"))
             if cache_read:
                 result.cache_read_tokens += cache_read
             if cache_create:
@@ -1116,28 +1441,38 @@ def parse_stream_json_lines(lines: list[str]) -> StreamJsonResult:
             structured = obj.get("structured_output")
             if isinstance(structured, dict):
                 result.structured_output = structured
-            cost = obj.get("total_cost_usd")
-            if isinstance(cost, (int, float)):
+            cost = _finite_cost(obj.get("total_cost_usd"))
+            if cost is not None:
                 result.cost_usd = cost
+                result.cost_reported = True
             usage = obj.get("usage")
             if not isinstance(usage, dict):
                 # A null / non-object ``usage`` on the result event
                 # degrades the same way as on assistant events.
                 usage = {}
-            if isinstance(usage.get("input_tokens"), int):
-                result.input_tokens = usage["input_tokens"]
-            if isinstance(usage.get("output_tokens"), int):
-                result.output_tokens = usage["output_tokens"]
+            input_tokens = _token_count(usage.get("input_tokens"))
+            if input_tokens is not None:
+                result.input_tokens = input_tokens
+            output_tokens = _token_count(usage.get("output_tokens"))
+            if output_tokens is not None:
+                result.output_tokens = output_tokens
             if obj.get("is_error"):
                 # ``result`` may be an empty string on abort events
                 # (e.g. budget cap: subtype error_max_budget_usd with
                 # result "") — fall through to the subtype so the
                 # cause is never silently dropped.
-                result.error = (
+                # Redact + escape at the producer: the stream-json
+                # envelope's result/subtype are model/CLI-authored and
+                # this error string reaches TurnResponse.error_message,
+                # loop artifacts, and provider warning logs.
+                from core.security.log_sanitisation import (
+                    escape_nonprintable as _esc_np,
+                )
+                result.error = _esc_np(redact_secrets(str(
                     obj.get("result")
                     or obj.get("subtype")
                     or "stream-json reported is_error"
-                )
+                )[:500]))
 
     return result
 
@@ -1187,7 +1522,7 @@ class _CappedCapture:
         self._tail_cap = cap - self._head_cap
         self._head: list = []
         self._head_bytes = 0
-        self._tail = deque()
+        self._tail: deque[bytes] = deque()
         self._tail_bytes = 0
         self.dropped_bytes = 0
 
@@ -1233,9 +1568,10 @@ def run_cc_streaming(
     NOT the parent's cwd: the CLI loads project context (CLAUDE.md,
     settings hooks, memory bootstrap) from its working directory, so
     inheriting the parent's cwd makes every pure-LLM call boot
-    whatever project lives there — measured 98s / $0.35 for a
-    one-line prompt from the RAPTOR repo vs 7s / $0.05 from a neutral
-    dir — and executes that project's hooks, which is an injection
+    whatever project lives there — measured 98s for a one-line prompt
+    from the RAPTOR repo vs 7s from a neutral dir, with per-call cost
+    inflated by a similar factor — and executes that project's hooks,
+    which is an injection
     surface when the cwd is not operator-controlled. Pass an explicit
     path only when a caller genuinely wants project context loaded.
     """
@@ -1304,7 +1640,8 @@ def run_cc_streaming(
             return
         stdin_fd = None
         try:
-            proc.stdin.close()
+            if proc.stdin is not None:
+                proc.stdin.close()
         except (BrokenPipeError, OSError):
             pass
 
@@ -1369,7 +1706,12 @@ def run_cc_streaming(
                 if remaining <= 0:
                     _close_stdin()
                     proc.kill()
-                    proc.wait()
+                    try:
+                        proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        for pipe in (proc.stdout, proc.stderr, proc.stdin):
+                            if pipe is not None and not pipe.closed:
+                                pipe.close()
                     raise subprocess.TimeoutExpired(cmd, timeout_s or 0)
             read_set = [
                 fd for fd in (stdout_fd, stderr_fd) if fd is not None
@@ -1400,10 +1742,20 @@ def run_cc_streaming(
                 if chunk:
                     stdout_buf += chunk
                     _split_stdout_lines()
+                else:
+                    # EOF while the child still runs (it closed its
+                    # end, or a budget-abort path closed pipes before
+                    # exit). Drop the fd from the select set: a
+                    # closed-but-open-here pipe reports readable
+                    # forever, and re-selecting it spun this loop at
+                    # full CPU until the child exited.
+                    stdout_fd = None
             if stderr_fd is not None and stderr_fd in ready:
                 chunk = os.read(stderr_fd, 65536)
                 if chunk:
                     stderr_chunks.append(chunk)
+                else:
+                    stderr_fd = None
 
         # Child exited — if it did so without consuming the whole
         # prompt, release our end so nothing lingers.
@@ -1440,7 +1792,12 @@ def run_cc_streaming(
         # fires on an abnormal unwind while the child still runs.
         if proc.poll() is None:
             proc.kill()
-            proc.wait()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                for pipe in (proc.stdout, proc.stderr, proc.stdin):
+                    if pipe is not None and not pipe.closed:
+                        pipe.close()
 
     for stream_name, capture in (
         ("stdout", collected), ("stderr", stderr_chunks),
@@ -1454,18 +1811,36 @@ def run_cc_streaming(
 
     if proc.returncode != 0:
         stderr_text = b"".join(stderr_chunks.items()).decode("utf-8", "replace")
-        from core.security.prompt_output_sanitise import escape_nonprintable
+        from core.security.log_sanitisation import escape_nonprintable
         partial = parse_stream_json_lines(collected.items())
         # Aborts (budget cap, API refusal) exit nonzero with EMPTY
         # stderr — the cause lives in the final stream-json result
         # event. Prefer stderr when present, else the parsed event's
         # error/subtype, so the operator never sees a bare "exited 1:".
         cause = (stderr_text or "").strip() or (partial.error or "")
+        safe_cause = escape_nonprintable(
+            redact_secrets(cause),
+            preserve_newlines=True,
+        )
         err = StreamJsonResult()
         err.error = (
             f"claude -p exited {proc.returncode}: "
-            f"{escape_nonprintable(redact_secrets(cause[:500]))}"
+            f"{safe_cause[:500]}"
         )
+        err.error_kind = _cc_error_kind(err.error)
+        err.diagnostic = {
+            "returncode": proc.returncode,
+            "stderr": escape_nonprintable(
+                redact_secrets(stderr_text),
+                preserve_newlines=True,
+            ),
+            "stream_error": escape_nonprintable(
+                redact_secrets(partial.error or ""),
+                preserve_newlines=True,
+            ),
+            "stdout_truncated": collected.truncated,
+            "stderr_truncated": stderr_chunks.truncated,
+        }
         err.session_id = partial.session_id
         # A failed call still SPENT money — a budget abort
         # (error_max_budget_usd) burns up to the per-call cap before
@@ -1473,6 +1848,7 @@ def run_cc_streaming(
         # can book the spend on its ledger; dropping it here made N
         # budget-aborted calls invisible to max-cost enforcement.
         err.cost_usd = partial.cost_usd
+        err.cost_reported = partial.cost_reported
         err.input_tokens = partial.input_tokens
         err.output_tokens = partial.output_tokens
         err.cache_read_tokens = partial.cache_read_tokens

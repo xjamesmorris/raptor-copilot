@@ -103,6 +103,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
+from core.source import read_text_capped
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -308,7 +310,7 @@ def _join_continuations(text: str) -> list[str]:
     """Physical lines with backslash-newline continuations joined."""
     lines: list[str] = []
     buf: list[str] = []
-    for raw in text.split("\n"):
+    for raw in text.split("\n"):  # line-model: closure text from universal-newline reads
         if raw.endswith("\\"):
             buf.append(raw[:-1])
             continue
@@ -402,13 +404,18 @@ def resolve_include_closure(
         seen.add(path)
         if len(seen) > max_files:
             raise ProofRefusal("include closure exceeds the file cap")
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        # Capped fd read: closure members are in-tree (resolve +
+        # is_relative_to below) but target-writable — a FIFO plant
+        # blocked the raw read forever, and the byte cap fired only
+        # AFTER an unbounded buffer. A single over-budget file busts
+        # the closure budget by definition, so truncation refuses.
+        got = read_text_capped(path, max_bytes)
+        if got is None:
             unresolved.append(str(path))
             continue
+        text, truncated = got
         total_bytes += len(text)
-        if total_bytes > max_bytes:
+        if truncated or total_bytes > max_bytes:
             raise ProofRefusal("include closure exceeds the byte cap")
         resolved.append(path)
         for m in _INCLUDE_RE.finditer(text):
@@ -458,10 +465,10 @@ def _build_macro_table(target_path: str | Path, rel_file: str) -> MacroTable:
     table = MacroTable(unresolved_includes=tuple(unresolved))
     parser = _c_parser()
     for path in files:
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        got = read_text_capped(path, _MAX_CLOSURE_BYTES)
+        if got is None:
             continue
+        text = got[0]
         table.files_scanned += 1
         if parser is not None:
             table.function_names |= _declared_function_names(text, parser)
@@ -484,6 +491,7 @@ def _build_macro_table(target_path: str | Path, rel_file: str) -> MacroTable:
 
 
 _TABLE_CACHE: dict[tuple[str, str], MacroTable] = {}
+_TABLE_CACHE_LOCK = __import__("threading").Lock()
 
 
 def _macro_table_for(
@@ -492,13 +500,15 @@ def _macro_table_for(
     if not target_path or not rel_file:
         return MacroTable()
     key = (str(target_path), rel_file)
-    cached = _TABLE_CACHE.get(key)
-    if cached is not None:
-        return cached
+    with _TABLE_CACHE_LOCK:
+        cached = _TABLE_CACHE.get(key)
+        if cached is not None:
+            return cached
     table = _build_macro_table(target_path, rel_file)
-    if len(_TABLE_CACHE) >= _TABLE_CACHE_MAX:
-        _TABLE_CACHE.pop(next(iter(_TABLE_CACHE)))
-    _TABLE_CACHE[key] = table
+    with _TABLE_CACHE_LOCK:
+        if len(_TABLE_CACHE) >= _TABLE_CACHE_MAX:
+            _TABLE_CACHE.pop(next(iter(_TABLE_CACHE)))
+        _TABLE_CACHE[key] = table
     return table
 
 
@@ -1974,7 +1984,7 @@ def check_definite_assignment(
         return refusal(f"not a C identifier: {variable!r}")
     if not func_source or len(func_source) > _MAX_SOURCE_BYTES:
         return refusal("function source empty or too large")
-    if re.search(r"^\s*#", func_source, re.MULTILINE):
+    if re.search(r"^[^\S\n]*#", func_source, re.MULTILINE):
         return refusal(
             "preprocessor directive inside the function source"
         )

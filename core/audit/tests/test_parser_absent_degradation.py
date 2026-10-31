@@ -144,6 +144,48 @@ class TestFailOpenAnalyzersReturnNone:
         from core.audit.fail_open_lang import go_function_span
         assert go_function_span(self._GO, "run") is None
 
+    def test_kotlin_handlers_none(self, _no_tree_sitter):
+        from core.audit.fail_open_lang import kotlin_handlers
+        src = (
+            "class C {\n"
+            "    fun f() {\n"
+            "        try { g() } catch (e: Exception) { }\n"
+            "    }\n"
+            "}\n"
+        )
+        assert kotlin_handlers(src, "C.kt") is None
+
+    def test_csharp_handlers_none(self, _no_tree_sitter):
+        from core.audit.fail_open_lang import csharp_handlers
+        src = (
+            "class C {\n"
+            "    void F() {\n"
+            "        try { G(); } catch (Exception e) { }\n"
+            "    }\n"
+            "}\n"
+        )
+        assert csharp_handlers(src, "C.cs") is None
+
+    def test_swift_handlers_none(self, _no_tree_sitter):
+        from core.audit.fail_open_lang import swift_handlers
+        src = (
+            "class C {\n"
+            "    func f() {\n"
+            "        do { try g() } catch { }\n"
+            "    }\n"
+            "}\n"
+        )
+        assert swift_handlers(src, "C.swift") is None
+
+    def test_swift_erasure_sites_none(self, _no_tree_sitter):
+        from core.audit.fail_open_lang import swift_erasure_sites
+        src = (
+            "class C {\n"
+            "    func f() { _ = try? g() }\n"
+            "}\n"
+        )
+        assert swift_erasure_sites(src, "C.swift", "g") is None
+
 
 class TestFailOpenVerdictIsLanguageUnsupported:
     """The verify channel converts analyzer-None into the enumerated
@@ -167,6 +209,60 @@ class TestFailOpenVerdictIsLanguageUnsupported:
             "    boolean check() {\n"
             "        try { return verify(); }\n"
             "        catch (Exception e) { return true; }\n"
+            "    }\n"
+            "}\n",
+            "check",
+            "the broad catch in check() returns true — fail open",
+        )
+        assert res.outcome == "inconclusive"
+        assert res.reason.startswith(REASON_LANGUAGE_UNSUPPORTED)
+
+    def test_kotlin_inconclusive(self, _no_tree_sitter, tmp_path):
+        from core.audit.fail_open_verify import (
+            REASON_LANGUAGE_UNSUPPORTED,
+        )
+        res = self._check(
+            tmp_path, "C.kt",
+            "class C {\n"
+            "    fun check(): Boolean {\n"
+            "        try { return verify() } "
+            "catch (e: Exception) { return true }\n"
+            "    }\n"
+            "}\n",
+            "check",
+            "the broad catch in check() returns true — fail open",
+        )
+        assert res.outcome == "inconclusive"
+        assert res.reason.startswith(REASON_LANGUAGE_UNSUPPORTED)
+
+    def test_csharp_inconclusive(self, _no_tree_sitter, tmp_path):
+        from core.audit.fail_open_verify import (
+            REASON_LANGUAGE_UNSUPPORTED,
+        )
+        res = self._check(
+            tmp_path, "C.cs",
+            "class C {\n"
+            "    bool Check() {\n"
+            "        try { return Verify(); }\n"
+            "        catch (Exception e) { return true; }\n"
+            "    }\n"
+            "}\n",
+            "Check",
+            "the broad catch in Check() returns true — fail open",
+        )
+        assert res.outcome == "inconclusive"
+        assert res.reason.startswith(REASON_LANGUAGE_UNSUPPORTED)
+
+    def test_swift_inconclusive(self, _no_tree_sitter, tmp_path):
+        from core.audit.fail_open_verify import (
+            REASON_LANGUAGE_UNSUPPORTED,
+        )
+        res = self._check(
+            tmp_path, "C.swift",
+            "class C {\n"
+            "    func check() -> Bool {\n"
+            "        do { return try verify() } "
+            "catch { return true }\n"
             "    }\n"
             "}\n",
             "check",

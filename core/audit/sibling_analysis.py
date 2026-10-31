@@ -201,7 +201,16 @@ def _normalize_value(val: Any) -> str:
     if isinstance(val, bool):
         return str(val).lower()
     if isinstance(val, (list, tuple)):
-        return ",".join(str(v) for v in sorted(val))
+        try:
+            ordered = sorted(val)
+        except TypeError:
+            # Mixed-type list (extractor emitting e.g. [0, "err"]):
+            # bare sorted() raised and aborted the whole
+            # find_asymmetries pass. Type-tagged key keeps the
+            # normalisation deterministic without comparing across
+            # types.
+            ordered = sorted(val, key=lambda v: (type(v).__name__, str(v)))
+        return ",".join(str(v) for v in ordered)
     return str(val)
 
 
@@ -515,22 +524,27 @@ _STRICT_BOUND_RE = re.compile(
     re.IGNORECASE,
 )
 
+# The if-to-operand gaps are bounded: unbounded, a body that
+# repeats `if` inside the gap re-scans the remainder from every
+# occurrence — quadratic in hostile source length. A real guard's
+# operand sits well inside 300 chars of its `if` (the gap never
+# crosses a newline).
 _NULL_GUARD_RE = re.compile(
     r"(?:"
-    r"\bif\b.*\bis\s+None\b"
-    r"|\bif\s*\(.*==\s*(?:NULL|null|nil|nullptr)\b"
+    r"\bif\b.{0,300}\bis\s+None\b"
+    r"|\bif\s*\(.{0,300}==\s*(?:NULL|null|nil|nullptr)\b"
     r"|\bif\s*\(\s*!\s*\w+\s*[)\s{]"
     r"|\bif\s+not\s+\w+\b"
-    r"|\bif\s*\(.*!=\s*(?:NULL|null|nil|nullptr)\b"
+    r"|\bif\s*\(.{0,300}!=\s*(?:NULL|null|nil|nullptr)\b"
     r")",
     re.IGNORECASE,
 )
 
 _BOUNDS_GUARD_RE = re.compile(
     r"(?:"
-    r"\bif\b.*\blen\s*\("
-    r"|\bif\b.*\.(?:size|length|count)\s*\("
-    r"|\bif\b.*\b(?:index|idx|offset|pos)\s*[<>=!]"
+    r"\bif\b.{0,200}\blen\s*\("
+    r"|\bif\b.{0,200}\.(?:size|length|count)\s*\("
+    r"|\bif\b.{0,200}\b(?:index|idx|offset|pos)\s*[<>=!]"
     r")",
     re.IGNORECASE,
 )
@@ -738,6 +752,8 @@ def check_semantic_consistency(
         ``function``, ``siblings``, ``inconsistency``,
         ``confidence``, ``cwe``.
     """
+    from .source_view import sanitized_view
+
     findings: list[dict] = []
 
     for group in siblings:
@@ -745,6 +761,11 @@ def check_semantic_consistency(
             continue
 
         # Resolve source code for each sibling from the checklist.
+        # The practice regexes scan a comment/string-blanked view: a
+        # comment that merely mentions an auth call or a guard
+        # ("/* check_permission handled upstream */") must not count
+        # as the practice being present — that would suppress the
+        # outlier finding (or forge one against a peer).
         sources: dict[str, str] = {}
         for sib in group.siblings:
             key = f"{sib.file}:{sib.function}"
@@ -755,7 +776,7 @@ def check_semantic_consistency(
                 else ""
             )
             if src:
-                sources[sib.function] = src
+                sources[sib.function] = sanitized_view(src, sib.file)
 
         if len(sources) < 3:
             continue

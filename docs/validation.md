@@ -64,7 +64,49 @@ Chain with `/understand` for richer context:
 The `/understand` output is imported automatically by Stage 0 -- no manual
 `--out` alignment is needed.  See [Integration](#integration) below.
 
+Validate a compiled binary directly (requires an RE substrate -- a prior
+Ghidra import, project Ghidra attach, or binary `--study` run):
+
+```bash
+/validate ./firmware.elf
+```
+
+Stage 0 detects the binary by magic bytes, discovers the RE substrate
+(co-located run artifacts, project sibling runs, the project's
+`ghidra-attach` cache, then `out/ghidra-import-<stem>/` -- every candidate
+identity-gated to this binary), and builds the inventory over decompiled
+function units.  A content-verified re-database (its `binary_sha256` stamp
+matches the target's actual bytes) always outranks an unverified one,
+regardless of which run directory is newer; a name-match-only selection is
+recorded as `sha_verified: false` and labeled as such on the stage-0
+output line.  Malformed candidate files are rejected with a recorded
+reason, never crash discovery.  An existing decomp-tree is referenced in place; when only
+a re-database exists, the tree is materialized into the run directory
+(never the target's own directory).  Every inventory row carries
+`source: "decompilation"` plus the RE-database provenance (address, `fid`,
+decompiler), and the report states in one line that findings were
+validated against decompilation, not source.  A matching
+`binary-validation-handoff.json` from `/binary map` is imported into
+`attack-paths.json` with its per-flow missing evidence as blockers.
+Without any substrate, Stage 0 refuses and names what it looked for and
+the commands that produce one.  Nothing executes the target.
+
 ## Pipeline Stages
+
+Each LLM stage writes its output to a small `stage-X.json` file; the next
+stage's prep script merges it into the cumulative `findings.json`.  Stage
+inputs are immutable: the prep script never deletes a stage file.  Instead it
+records a consumption receipt in `stage-receipts.json` (content hash, size,
+timestamp, consumption count) and archives a byte-identical, hash-named copy
+under `stage-inputs/`.  The receipt carries the consume semantics --
+already-consumed content never merges twice, while a rewritten stage file
+(new content hash) merges again -- so delegated agents can safely re-read
+their stage output after the next prep has run, and a post-hoc audit can see
+exactly which bytes each merge consumed.  Stage A is the one reset-shaped
+apply (it rebuilds the findings container rather than merging updates), so
+its skip additionally requires that `findings.json` still match the
+receipted build: a re-run in a shared output directory rebuilds a clean
+container instead of carrying an earlier run's later-stage fields forward.
 
 ### Stage 0 -- Inventory (Mechanical)
 
@@ -456,6 +498,7 @@ verification:
 | `raptor-smt-check-null-deref` | Null pointer dereference | CWE-476 |
 | `raptor-smt-check-overflow-to-oob` | Chained overflow then OOB | CWE-680 |
 | `raptor-smt-check-negative-bypass` | Signed comparison bypass with negative values | CWE-839 |
+| `raptor-smt-check-encoding-residual` | Encoder completeness: can a target-grammar forbidden byte survive the emitter's supplied transfer semantics unescaped | CWE-116 |
 
 Z3 is a soft dependency (`pip install z3-solver`).  When absent, all tools
 return `feasible: null` and the pipeline falls back to LLM reasoning alone.
@@ -516,6 +559,9 @@ out/validate_<target>_<timestamp>/     (project mode: <project>/validate-<timest
   build/                    -- Compiled PoCs (Stage A)
   coverage-llm.json         -- Coverage record: items analysed (Stage 1)
   coverage-read.json        -- Coverage record: files read (Stage 1)
+  stage-{a..f}.json         -- Per-stage LLM outputs (retained after merge)
+  stage-receipts.json       -- Consumption receipts (hash, timestamp) per stage file
+  stage-inputs/             -- Byte-identical archive of each consumed stage file
 ```
 
 ### Validation gates

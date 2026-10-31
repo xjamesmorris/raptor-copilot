@@ -136,7 +136,8 @@ binary analyser uses radare2 for:
 On deep runs (`extract_cfgs=True` on the analyser API; the `/binary`
 pipeline passes it automatically — quick mode stays metadata-only and
 skips it), radare2 also recovers each interesting function's
-basic-block CFG (`afbj`, cached per build-id) and surfaces its
+basic-block CFG (`afbj`, cached per content identity — build-id for
+ELF, per-format identity for PE/Mach-O) and surfaces its
 complexity as a `cyclomatic` field on the function records in the
 context map. Cyclomatic complexity is the
 metric of record here because it won a head-to-head evaluation against
@@ -177,17 +178,93 @@ boundary or unchecked flow is emitted without actual evidence.
 
 | Artefact | Ingress RAPTOR looks for | Fuzz follow-on |
 |----------|--------------------------|----------------|
-| Mach-O app | URL/file handlers, XPC listeners, WebView callbacks, bundle metadata | Trace the handler, then extract a narrow harness |
+| Mach-O app | URL/file handlers, XPC listeners (Obj-C callback and C `xpc_*` import forms), IOKit `externalMethod` dispatch, WebView callbacks, bundle metadata | Trace the handler, then extract a narrow harness |
 | ELF executable | Process entry, imported input channels, exported APIs | Campaign only when an input contract exists |
 | ELF kernel module | `unlocked_ioctl`/`compat_ioctl` dispatchers | IOCTL harness or snapshot fuzzing |
-| PE EXE | Process entry, imported input channels | Runtime first unless a harness is already present |
+| PE EXE | Process entry, `ServiceMain` service entries, imported input channels (incl. Winsock and registry reads) | Runtime first unless a harness is already present |
 | PE DLL | Exported APIs bound back to recovered functions | Typed export harness |
 | PE driver | `EvtIoDeviceControl`/`DispatchDeviceControl` dispatchers | IOCTL harness or snapshot fuzzing |
+
+The sink and channel vocabularies are curated SEED sets in
+`core/function_taxonomy` (Win32: shlwapi/MBCS string copies, Rtl
+memory copies, Winsock ingest, registry read primitives, dynamic
+load, SEH markers, `DeviceIoControl`; darwin: IOKit user-client and
+XPC groups) — project-specific vocabulary is learned by the
+study/IRIS channel, never hardcoded. `DeviceIoControl` and
+`IOConnectCall*` classify as boundary-crossing sinks; `LoadLibrary`
+stays a surface (its CVE shape is search-path planting, and its
+ubiquity would drown ranked output).
 
 Architecture is read from the COFF/ELF/Mach-O header, so a 32-bit DLL,
 64-bit EXE and ARM64 driver are not flattened into the same bucket.
 Managed artefacts (JAR/APK, .NET, Go, Rust) are recorded as runtime
 signals for future adapters.
+
+TE (Terse Executable) UEFI images are recognised by their `VZ`
+signature and classified as their own kind, `te` — never as a PE
+variant, so they receive neither the Windows platform label nor the
+Windows driver-symbol probing. Intake records a `te_not_analysed`
+marker: the image is identified (kind, machine architecture) and
+deliberately not parsed further; use a firmware analysis toolchain
+for the image contents.
+
+### PE Signing Facts
+
+The PE facts record carries two signing fields:
+
+- `authenticode_present` — the image's security directory claims an
+  Authenticode certificate blob.
+- `claimed_signer` — the subject common name of the certificate the
+  signature's first SignerInfo names, recovered by a bounded skim of
+  the PKCS#7 structure.
+
+Both are **claims read from the file, not verification results**. No
+signature, digest, or certificate chain is checked, and no trust or
+validity decision is made — a hostile file controls every byte of
+these fields, including the signer name. Treat `claimed_signer` as
+attacker-authored text for correlation and display: it never gates,
+suppresses, or ranks anything, and reports escape it before
+rendering. An empty `claimed_signer` with `authenticode_present`
+true means the blob did not yield a claim; the record's `caps_hit`
+markers (`authenticode_*`, `signer_*`) say why.
+
+### Format Facts (PE / Mach-O / ELF)
+
+Each format tier exposes a shallow facts extractor (header claims
+only, hostile-input bounded, per-field degradation with `caps_hit`
+markers), and `core.binary.facts` normalizes the three into one
+record shape — sizes, sections, linked libraries, import/export
+counts, per-format mitigation map, entry point, stripped-ness and
+debug references. The intake attaches the PE and Mach-O facts to the
+binary manifest as `pe_facts` / `macho_facts` evidence, and
+`/describe` renders the normalized record when pointed at a single
+binary.
+
+Mitigation fields are **header claims, not verification**:
+
+- PE: `aslr` / `high_entropy_va` / `dep` / `cfg` / `no_seh` from
+  DllCharacteristics; `stack_cookie` (a configured /GS SecurityCookie
+  slot) and `safeseh` (PE32 only — PE32+ records unknown by
+  definition, the x64 unwind model replaces SafeSEH) from a bounded
+  load-config skim. Read `no_seh` and `safeseh` together: `no_seh`
+  yes moots a registered handler table (the image uses no SEH at
+  all). Stripped-ness signals: debug-directory presence and the COFF
+  symbol-count claim.
+- Mach-O: `pie` / `allow_stack_execution` / `no_heap_execution` from
+  the mach_header flags; `stack_canary` from a bounded scan of the
+  LC_SYMTAB string-table region for the `___stack_chk_*` names —
+  name-presence evidence a crafted file can plant or omit, never a
+  verified import and never suppression-grade.
+
+A fact a tier cannot answer is `unknown`/`None`, never a fabricated
+no — a capped or unreadable scan window refuses to render a
+confident answer, and a degraded PE optional header renders every
+DllCharacteristics-derived flag unknown rather than a default no.
+
+Two normalized fields keep format-native semantics: `arch` carries
+each extractor's own vocabulary unmapped, and `entrypoint` is the
+AddressOfEntryPoint RVA on PE but the LC_MAIN `entryoff` **file
+offset** on Mach-O — never compare them across formats.
 
 ### Parser Boundary Extraction
 
@@ -310,6 +387,16 @@ binaries unrelated to the source. A planted ELF for a different project
 is dropped with a warning rather than driving every source function to
 `absent`.
 
+Operator-declared binaries (explicit `--binary` flags and the project
+binary store) are exempt from the floor — the declaration is the trust
+assertion the drop warning names, so a low-match declared binary is
+kept with a warning instead. When the floor drops a non-declared
+binary that produced evidence, the run's `absent` verdicts lose
+suppression authority (`suppression_grade: false` per surviving
+record, `any_floor_dropped` in the summary): "absent only when EVERY
+declared binary lacks it" must not silently narrow to "every
+surviving binary".
+
 ### Precision
 
 The `absent` verdict is corpus-validated before it is allowed to
@@ -333,7 +420,7 @@ tree.
 | (default, no flags) | Auto-detect locally-built binaries; soft hint when nothing found. When auto-detect AND the project binary store both miss and the project `build` trust marker authorises it, the oracle builds a debug binary on demand (operator `build-command` slot first, detector synthesis second; network-isolated container; run-local artifact + `/project binary add` persist hint). |
 | `--binary <path>` | Explicit debug binary. Repeatable for hybrid targets. Bypasses the git-tracked filter (operator asserts trust). Suppresses default auto-detect. |
 | `--binary-auto` | Same auto-detect + git-filter logic as default, with louder "nothing found" message. Honours `--target-kind`. Warns at result cap (8). |
-| `--binary-edges` | Extract direct call edges and vtable resolution via r2 (single-invocation script-file mode; cached per build-id with cross-target collision check). Required for the `binary_call_edge` REACHABLE promote witness. Slow (~10-30s per binary, then cached). |
+| `--binary-edges` | Extract direct call edges and vtable resolution via r2 (single-invocation script-file mode; cached per content identity with cross-target collision check). Required for the `binary_call_edge` REACHABLE promote witness. Slow (~10-30s per binary, then cached). |
 | `--no-binary-oracle` | Disable binary-oracle filtering entirely. Use for library-only targets, runs where every finding should be unfiltered, or build-mismatch scenarios. Overrides `--binary`/`--binary-auto` with a warning if combined. |
 
 For `--target-kind=hybrid` deployments (library + application both
@@ -423,7 +510,7 @@ The output is structured into three categories:
 
 | Verdict | Meaning | Action |
 |---------|---------|--------|
-| Likely exploitable | Good primitives, clear path | Proceed with suggested techniques |
+| Likely Exploitable | Good primitives, clear path | Proceed with suggested techniques |
 | Difficult | Primitives exist but hard to chain | Be honest about challenges, try alternatives |
 | Unlikely | No known viable path | Suggest environment changes or move on |
 

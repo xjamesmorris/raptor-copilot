@@ -154,5 +154,267 @@ class TestImportQuarantinesPrivilegedArtifacts(unittest.TestCase):
             self.assertFalse((root2 / "coverage.json").exists())
 
 
+class TestImportQuarantinesCoverageRecords(unittest.TestCase):
+    """Per-run coverage records are a producer-named GLOB family
+    (``coverage-<tool>.json``, legacy ``coverage-record.json``) — the
+    fixed-name quarantine set could never cover them, so a forged
+    archive still minted examined-coverage that shrank the gap-audit
+    residual and passed ``/project coverage --fail-under``."""
+
+    def _build(self, src: Path) -> Path:
+        run = src / "scan_20260101-000000"
+        run.mkdir(parents=True)
+        (run / "findings.json").write_text('{"findings": []}')
+        (run / "coverage-semgrep.json").write_text(json.dumps({
+            "tool": "semgrep",
+            "files_examined": ["src/a.py", "src/evil_marked_reviewed.py"],
+            "timestamp": "2026-01-01T00:00:00+00:00",
+        }))
+        (run / "coverage-read.json").write_text(json.dumps({
+            "tool": "llm-read", "files_examined": ["src/c.py"],
+        }))
+        (run / "coverage-record.json").write_text(json.dumps({
+            "tool": "legacy", "files_examined": ["src/d.py"],
+        }))
+        # Tool-subdir variant the record glob also discovers.
+        (run / "scan").mkdir()
+        (run / "scan" / "coverage-codeql.json").write_text(json.dumps({
+            "tool": "codeql", "files_examined": ["src/e.py"],
+        }))
+        return run
+
+    def test_coverage_records_quarantined(self):
+        with TemporaryDirectory() as td:
+            d = Path(td)
+            src = d / "src" / "myproj"
+            self._build(src)
+            root = _import(d, src)
+            run = root / "scan_20260101-000000"
+            for canonical in (
+                run / "coverage-semgrep.json",
+                run / "coverage-read.json",
+                run / "coverage-record.json",
+                run / "scan" / "coverage-codeql.json",
+            ):
+                self.assertFalse(canonical.exists(),
+                                 f"{canonical} restored at canonical path")
+            q = root / _QUARANTINE / "scan_20260101-000000"
+            self.assertTrue((q / "coverage-semgrep.json").is_file())
+            self.assertTrue((q / "scan" / "coverage-codeql.json").is_file())
+
+    def test_coverage_view_sees_no_forged_records(self):
+        """Consumer-level check: the file-level coverage view over the
+        imported run must not count the archive's records as examined
+        coverage."""
+        from core.coverage.store_summary import file_level_view
+
+        with TemporaryDirectory() as td:
+            d = Path(td)
+            src = d / "src" / "myproj"
+            self._build(src)
+            root = _import(d, src)
+            view = file_level_view([root / "scan_20260101-000000"])
+            self.assertEqual(view.get("tools", {}), {})
+
+
+class TestImportQuarantinesChecklist(unittest.TestCase):
+    """Run-level checklists are what ``_promote_checklist`` elects
+    "newest" and copies to the project level (merging checked_by
+    credit) — a forged archive would mint reviewed checklist state
+    the next start_run promotes into authority."""
+
+    def test_checklists_quarantined(self):
+        with TemporaryDirectory() as td:
+            d = Path(td)
+            src = d / "src" / "myproj"
+            run = src / "scan_20260101-000000"
+            run.mkdir(parents=True)
+            (run / "findings.json").write_text('{"findings": []}')
+            (run / "checklist.json").write_text(
+                '{"items": [{"id": 1, "checked_by": "forged"}]}')
+            (src / "checklist.json").write_text(
+                '{"items": [{"id": 1, "checked_by": "forged-root"}]}')
+            root = _import(d, src)
+            self.assertFalse((root / "checklist.json").exists())
+            self.assertFalse(
+                (root / "scan_20260101-000000" / "checklist.json").exists())
+            q = root / _QUARANTINE
+            self.assertTrue((q / "checklist.json").is_file())
+            self.assertTrue(
+                (q / "scan_20260101-000000" / "checklist.json").is_file())
+
+
+class TestQuarantineUniverseDerivation(unittest.TestCase):
+    """The quarantine set is trust-bearing and was hand-picked — two
+    demonstrated escapes (the run marker's liveness claim; the
+    coverage-record glob family) were both omissions of the SAME hand
+    list. Derive the expected universe from the privileged consumers'
+    own canonical-name spellings and assert closure: an owner renaming
+    or re-homing a canonical artifact fails here until the quarantine
+    set moves with it."""
+
+    def _quarantine_covers(self, name: str) -> bool:
+        import fnmatch
+
+        from core.project.export import (
+            _PRIVILEGED_DIR_NAMES,
+            _PRIVILEGED_FILE_GLOBS,
+            _PRIVILEGED_FILE_NAMES,
+        )
+        return (name in _PRIVILEGED_FILE_NAMES
+                or name in _PRIVILEGED_DIR_NAMES
+                or any(fnmatch.fnmatch(name, pat)
+                       for pat in _PRIVILEGED_FILE_GLOBS))
+
+    def test_importable_canonical_constants_covered(self):
+        # Families whose owners export a canonical-name constant: the
+        # derivation imports the REAL spelling, so a rename cannot
+        # silently leave the quarantine matching a stale name.
+        from core.coverage.journal import INDEX_FILENAME, JOURNAL_FILENAME
+        from core.coverage.record import COVERAGE_RECORD_FILE
+        from core.coverage.store import COVERAGE_STORE_FILE
+        for name in (JOURNAL_FILENAME, INDEX_FILENAME,
+                     COVERAGE_STORE_FILE, COVERAGE_RECORD_FILE):
+            self.assertTrue(self._quarantine_covers(name), name)
+        # The record family is a producer-named glob; the fixed legacy
+        # name above must ride the same glob the consumers use.
+        import core.coverage.record as record_mod
+        import inspect
+        self.assertIn('glob("coverage-*.json")',
+                      inspect.getsource(record_mod))
+        self.assertTrue(self._quarantine_covers("coverage-semgrep.json"))
+
+    def test_literal_spelling_owners_covered(self):
+        # Families whose owners spell the canonical name inline: pin
+        # the spelling AT THE OWNER (a rename fails the pin, forcing
+        # this test — and the quarantine set — to move with it), then
+        # assert coverage.
+        import inspect
+
+        import core.coverage.store_summary as store_summary
+        import core.iris.store as iris_store
+        import core.labeled_attempts.view as outcomes_view
+        import core.run.metadata as run_metadata
+        import core.witness.discovery as witness_discovery
+        cases = [
+            (iris_store, "iris-taint-specs-refined.json"),
+            (iris_store, "iris-specs"),
+            (witness_discovery, "witnesses"),
+            (store_summary, "coverage-progress.jsonl"),
+            (outcomes_view, "verified-outcomes.jsonl"),
+            (run_metadata, "checklist.json"),
+        ]
+        for owner, name in cases:
+            src = inspect.getsource(owner)
+            self.assertIn(name, src,
+                          f"{owner.__name__} no longer spells "
+                          f"{name!r} — update the derivation AND the "
+                          f"quarantine set together")
+            self.assertTrue(self._quarantine_covers(name), name)
+
+    def test_labeled_attempts_store_dir_covered(self):
+        from core.labeled_attempts.store import project_pool_path
+        name = project_pool_path(Path("/x")).name
+        self.assertTrue(self._quarantine_covers(name), name)
+
+
+
+
+class TestImportedRunProjectionsRefused(unittest.TestCase):
+    """Adopt/add re-runs the completion projections on a run — but an
+    IMPORTED run's trust artifacts were quarantined, and its
+    ``.reads-manifest`` still ships at the canonical path (only the
+    DERIVED records are quarantined). Pre-fix,
+    ``project_run_projections`` had no imported-run guard: a forged
+    manifest was converted into a fresh ``coverage-read.json`` at the
+    canonical path and the file-level view counted the forged files as
+    examined coverage — re-minting exactly what the quarantine
+    stripped. The direct journal merge in the adopt lane mirrors the
+    same refusal (belt-and-braces: today's quarantine moves journals
+    out of the run dir, but the two lanes must not drift)."""
+
+    @staticmethod
+    def _forged_run(base: Path, imported: bool = True) -> Path:
+        run = base / "scan_20260101-000000"
+        run.mkdir(parents=True)
+        (run / "findings.json").write_text('{"findings": []}')
+        (run / ".reads-manifest").write_text(
+            "src/forged_a.py\nsrc/forged_b.py\n")
+        (run / "review-journal.jsonl").write_text(json.dumps({
+            "ts": "2026-01-01T00:00:00+00:00",
+            "run_id": "scan_20260101-000000",
+            "file": "src/forged_a.py",
+            "function": "check",
+            "verdict": "clean",
+            "source_hash": "0" * 12,
+        }) + "\n")
+        if imported:
+            (run / ".raptor-imported.json").write_text(
+                json.dumps({"imported": True, "source_sha256": "f" * 64}))
+        return run
+
+    def test_projections_refuse_imported_run(self):
+        from core.coverage.store_summary import file_level_view
+        from core.run.metadata import project_run_projections
+
+        with TemporaryDirectory() as td:
+            run = self._forged_run(Path(td))
+            project_run_projections(run)
+            self.assertFalse((run / "coverage-read.json").exists(),
+                             "forged manifest re-minted a coverage record")
+            self.assertEqual(file_level_view([run]).get("tools", {}), {})
+
+    def test_projections_convert_local_run(self):
+        # Two-direction guard: the same inputs WITHOUT the marker keep
+        # the pre-fix behaviour (also proves the forged inputs above
+        # are potent, so the refusal test cannot pass vacuously).
+        from core.run.metadata import project_run_projections
+
+        with TemporaryDirectory() as td:
+            run = self._forged_run(Path(td), imported=False)
+            project_run_projections(run)
+            self.assertTrue((run / "coverage-read.json").is_file())
+
+    def test_add_directory_does_not_remint_imported_trust(self):
+        """E2E through the operator adopt/add lane: neither the
+        chokepoint projections nor the adopt lane's direct journal
+        merge may launder an imported run's forged inputs."""
+        from core.coverage.journal import load_index
+        from core.project.project import ProjectManager
+
+        with TemporaryDirectory() as td:
+            d = Path(td)
+            run = self._forged_run(d / "incoming")
+            target = d / "target"
+            target.mkdir()
+            mgr = ProjectManager(projects_dir=d / "projects")
+            project = mgr.create("p1", str(target),
+                                 output_dir=str(d / "out" / "p1"))
+            added = mgr.add_directory("p1", str(run))
+            self.assertEqual(added, 1)
+            dest = project.output_path / run.name
+            self.assertTrue(dest.is_dir())
+            self.assertFalse((dest / "coverage-read.json").exists())
+            self.assertEqual(load_index(project.output_path), {})
+
+    def test_add_directory_projects_local_run(self):
+        # Two-direction guard for the E2E lane.
+        from core.coverage.journal import load_index
+        from core.project.project import ProjectManager
+
+        with TemporaryDirectory() as td:
+            d = Path(td)
+            run = self._forged_run(d / "incoming", imported=False)
+            target = d / "target"
+            target.mkdir()
+            mgr = ProjectManager(projects_dir=d / "projects")
+            project = mgr.create("p1", str(target),
+                                 output_dir=str(d / "out" / "p1"))
+            self.assertEqual(mgr.add_directory("p1", str(run)), 1)
+            dest = project.output_path / run.name
+            self.assertTrue((dest / "coverage-read.json").is_file())
+            self.assertNotEqual(load_index(project.output_path), {})
+
+
 if __name__ == "__main__":
     unittest.main()

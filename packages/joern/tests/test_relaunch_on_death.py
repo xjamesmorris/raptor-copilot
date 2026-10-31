@@ -60,6 +60,10 @@ class TestEnsureAlive:
     def test_live_process_is_noop(self):
         srv = JoernServer()
         proc = MagicMock()
+        # inert: beyond pid_max — a bare MagicMock pid renders as
+        # "pid 1" in stop() logs (MagicMock.__int__ returns 1),
+        # polluting log censuses with a plausible-looking real pid.
+        proc.pid = 2_000_000_000
         proc.poll.return_value = None
         srv._proc = proc
         with patch.object(srv, "restart") as restart:
@@ -115,6 +119,16 @@ class TestEnsureAlive:
         with patch.object(srv, "restart") as restart:
             assert srv.ensure_alive() is False
         restart.assert_not_called()
+
+    def test_dead_import_code_session_is_revived(self):
+        # restart() explicitly supports _code_path re-import; the
+        # liveness gate must not refuse the relaunch it delegates to.
+        srv = JoernServer()
+        srv._code_path = Path("/nonexistent/src")
+        with patch.object(srv, "restart", return_value=True) as restart, \
+                patch.object(srv, "health_check", return_value=False):
+            assert srv.ensure_alive() is True
+        restart.assert_called_once()
 
     def test_failed_relaunch_with_proc_none_retries(self):
         # A failed restart() leaves _proc None but _cpg_path set — the

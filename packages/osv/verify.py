@@ -10,6 +10,8 @@ may lack.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from core.url_patterns import (
     GITHUB_COMMIT_URL_RE,
     KERNEL_SHA_URL_RE,
@@ -18,6 +20,7 @@ from core.url_patterns import (
     normalize_slug,
 )
 
+from .client import OsvLookupError
 from .verdicts import OracleVerdict, Verdict
 from typing import TYPE_CHECKING
 
@@ -79,26 +82,39 @@ def _extract_pairs(
 def _collect_pairs_with_aliases(
     cve_id: str,
     client: OsvClient,
-) -> tuple[list[tuple[str, str]], list[tuple[str, str]], list[str]]:
-    """Fetch primary CVE record + follow GHSA aliases, merging all pairs."""
-    record = client.get_vuln(cve_id)
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]], list[str], bool]:
+    """Fetch primary CVE record + follow GHSA aliases, merging all pairs.
+
+    The trailing bool is ``degraded``: True when any lookup failed for
+    a transient reason (network, non-404 HTTP, offline) — the pair set
+    may be incomplete, which must never harden a negative verdict.
+    """
+    try:
+        record = client.get_vuln(cve_id, raise_on_transient=True)
+    except OsvLookupError:
+        return [], [], [], True
     if record is None:
-        return [], [], []
+        return [], [], [], False
 
     sources = [cve_id]
     ref_pairs, range_pairs = _extract_pairs(record)
 
+    degraded = False
     for alias in record.aliases:
         if not alias.startswith("GHSA-"):
             continue
-        ghsa_record = client.get_vuln(alias)
+        try:
+            ghsa_record = client.get_vuln(alias, raise_on_transient=True)
+        except OsvLookupError:
+            degraded = True
+            continue
         if ghsa_record is None:
             continue
         sources.append(alias)
         ar, ag = _extract_pairs(ghsa_record)
         ref_pairs.extend(ar)
         range_pairs.extend(ag)
-    return ref_pairs, range_pairs, sources
+    return ref_pairs, range_pairs, sources, degraded
 
 
 def verify(
@@ -112,14 +128,52 @@ def verify(
     *client* must be an :class:`OsvClient` instance.  The caller owns
     its lifetime and caching configuration.
     """
-    ref_pairs, range_pairs, sources = _collect_pairs_with_aliases(cve_id, client)
+    ref_pairs, range_pairs, sources, degraded = _collect_pairs_with_aliases(
+        cve_id, client,
+    )
     if not sources:
+        # Split definitive-404 from transient failure: during an OSV
+        # outage a whole verification batch must surface as UNKNOWN
+        # (unverifiable this run, retry) — not quietly degrade into
+        # don't-penalize ORPHANs that read as "the oracle ran and
+        # found no data".
+        if degraded:
+            return OracleVerdict(
+                cve_id=cve_id, picked_slug=picked_slug,
+                picked_sha=picked_sha,
+                verdict=Verdict.UNKNOWN, source="none",
+                notes="OSV lookup failed (network/transient) — "
+                      "unverifiable this run; retry",
+            )
         return OracleVerdict(
             cve_id=cve_id, picked_slug=picked_slug, picked_sha=picked_sha,
             verdict=Verdict.ORPHAN, source="none",
-            notes="OSV 404 / network failure",
+            notes="OSV has no record for this ID (404)",
         )
 
+    graded = _grade(cve_id, picked_slug, picked_sha,
+                    ref_pairs, range_pairs, sources)
+    if degraded and not graded.verdict.is_pass:
+        # A failed GHSA alias fetch can only have REMOVED pairs the
+        # pick might have matched — incomplete evidence may confirm a
+        # pick, never condemn it. Withhold negative verdicts minted
+        # from a partial pair set.
+        note = ("GHSA alias lookup failed (transient) — pair set "
+                "incomplete; negative verdict withheld, retry")
+        notes = f"{graded.notes}; {note}" if graded.notes else note
+        return replace(graded, verdict=Verdict.UNKNOWN, notes=notes)
+    return graded
+
+
+def _grade(
+    cve_id: str,
+    picked_slug: str,
+    picked_sha: str,
+    ref_pairs: list[tuple[str, str]],
+    range_pairs: list[tuple[str, str]],
+    sources: list[str],
+) -> OracleVerdict:
+    """Grade a pick against a (complete) merged pair set."""
     ref_pairs = list(dict.fromkeys(ref_pairs))
     range_pairs = list(dict.fromkeys(range_pairs))
     all_pairs = ref_pairs + range_pairs

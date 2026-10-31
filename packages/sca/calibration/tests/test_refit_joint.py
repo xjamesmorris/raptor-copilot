@@ -88,6 +88,19 @@ def test_joint_insufficient_samples_short_circuits(tmp_path: Path):
     assert report.restarts == []
 
 
+def test_joint_error_arm_keeps_accumulated_notes(tmp_path: Path):
+    """The joint too-few-samples report must carry the
+    ecosystem_filter provenance note gathered before the bail-out
+    (pre-fix the error arm rebuilt notes=[why] and dropped it)."""
+    _write_signals(tmp_path, ["CVE-1"])
+    _write_sample(tmp_path, "PyPI", "p", [_make_finding(cve="CVE-1")])
+    report = joint_grid_search_refit(
+        tmp_path, seed=42, ecosystem_filter="PyPI",
+    )
+    assert report.status == "insufficient_samples"
+    assert any("ecosystem_filter='PyPI'" in n for n in report.notes)
+
+
 def test_joint_no_samples_short_circuits(tmp_path: Path):
     """No samples at all → ``error`` status, no traces."""
     report = joint_grid_search_refit(tmp_path, seed=42)
@@ -96,8 +109,10 @@ def test_joint_no_samples_short_circuits(tmp_path: Path):
 
 
 def test_joint_report_writes_to_dot_joint_path(tmp_path: Path):
-    """Default report path is ``<corpus>/refit/<date>.joint.json``
-    so a joint refit doesn't clobber a same-day single-pass run."""
+    """The snapshot path is ``<corpus>/refit/<date>.joint.json`` so
+    a joint refit doesn't clobber a same-day single-pass run. The
+    write needs the explicit ``update_snapshot`` opt-in — the plain
+    default is metrics-only (the refit/ dir is repo-committed)."""
     _write_signals(tmp_path, [f"CVE-{i}" for i in range(60)])
     findings = [
         _make_finding(cve=f"CVE-{i}", in_kev=True) for i in range(60)
@@ -105,8 +120,14 @@ def test_joint_report_writes_to_dot_joint_path(tmp_path: Path):
         _make_finding(cve=f"CVE-N-{i}") for i in range(100)
     ]
     _write_sample(tmp_path, "PyPI", "p", findings)
+    metrics_only = joint_grid_search_refit(
+        tmp_path, improvement_threshold=0.0, seed=42,
+    )
+    assert not (tmp_path / "refit").exists()
+    assert metrics_only.status is not None
     report = joint_grid_search_refit(
         tmp_path, improvement_threshold=0.0, seed=42,
+        update_snapshot=True,
     )
     expected = tmp_path / "refit" / f"{report.snapshot_date}.joint.json"
     assert expected.is_file()
@@ -124,6 +145,39 @@ def test_joint_report_writes_to_dot_joint_path(tmp_path: Path):
 # ---------------------------------------------------------------------------
 # Determinism + restart count.
 # ---------------------------------------------------------------------------
+
+def test_joint_runs_on_read_only_corpus(tmp_path: Path):
+    """The joint search only READS the corpus: with an explicit
+    out_path elsewhere it must succeed on a read-only checkout —
+    pre-fix the in-line single pass wrote a throwaway file under
+    ``<corpus>/refit/`` regardless of out_path and failed with
+    PermissionError."""
+    import os
+    import stat
+    _write_signals(tmp_path, [f"CVE-{i}" for i in range(60)])
+    findings = [
+        _make_finding(cve=f"CVE-{i}", in_kev=True) for i in range(60)
+    ] + [
+        _make_finding(cve=f"CVE-N-{i}") for i in range(100)
+    ]
+    _write_sample(tmp_path, "PyPI", "p", findings)
+    out = tmp_path.parent / "elsewhere" / "joint.json"
+    ro = stat.S_IRUSR | stat.S_IXUSR
+    rw = ro | stat.S_IWUSR
+    dirs = [tmp_path, *(d for d in tmp_path.rglob("*") if d.is_dir())]
+    for d in dirs:
+        os.chmod(d, ro)
+    try:
+        report = joint_grid_search_refit(
+            tmp_path, improvement_threshold=0.0, seed=42,
+            out_path=out,
+        )
+    finally:
+        for d in dirs:
+            os.chmod(d, rw)
+    assert out.is_file()
+    assert report.status is not None
+
 
 def test_joint_seed_makes_restarts_deterministic(tmp_path: Path):
     """Same seed → same restart trajectories. Without this, CI

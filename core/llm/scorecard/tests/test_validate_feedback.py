@@ -76,6 +76,44 @@ class TestRecording:
         )
         assert sc.get_stat("audit:review", "m1") is not None
 
+    def test_suffixed_cwe_normalised_to_reader_key(self, tmp_path: Path):
+        """Journal-derived CWE text routinely carries suffixes; the
+        calibrated-merge reader regex-extracts CWE-N for exactly that
+        reason. The writer must mint the same key or the merge stays
+        prior-dominated with nothing warning."""
+        sc = self._scorecard(tmp_path)
+        for spelling in ("CWE-89: SQL Injection", "CWE-79 (XSS)", "cwe-121"):
+            record_validate_feedback_outcome(
+                sc, model="m1", cwe=spelling,
+                prior_verdict="finding", validate_verdict="confirmed",
+            )
+        assert sc.get_stat("audit:CWE-89", "m1") is not None
+        assert sc.get_stat("audit:CWE-79", "m1") is not None
+        assert sc.get_stat("audit:CWE-121", "m1") is not None
+
+    def test_non_cwe_text_lands_in_default_class(self, tmp_path: Path):
+        # No CWE tag at all: pool into the same catch-all the reader
+        # falls back to, never an orphan cell with whitespace in it.
+        sc = self._scorecard(tmp_path)
+        record_validate_feedback_outcome(
+            sc, model="m1", cwe="buffer overflow",
+            prior_verdict="finding", validate_verdict="confirmed",
+        )
+        assert sc.get_stat("audit:review", "m1") is not None
+
+    def test_writer_reader_grammar_join(self):
+        """The writer's mint and the reader's derivation share ONE
+        normaliser — every spelling joins."""
+        from core.audit.calibrated_merge import decision_class_for
+        from core.llm.scorecard.validate_feedback import _decision_class
+        for spelling in (
+            "CWE-89", "CWE-89: SQL Injection", "CWE-79 (XSS)",
+            "cwe-121", "CWE-89 ", "not a cwe", "",
+        ):
+            assert _decision_class(spelling) == decision_class_for(
+                [{"cwe": spelling}],
+            ), spelling
+
     def test_no_signal_records_nothing(self, tmp_path: Path):
         sc = self._scorecard(tmp_path)
         assert record_validate_feedback_outcome(
@@ -137,8 +175,12 @@ class TestCorpusProducerRecordsAgain:
         # Regression for the silent corpus-producer breakage: the
         # harness recorded against EventType.CORPUS_GROUND_TRUTH,
         # which didn't exist — AttributeError was swallowed and no
-        # audit:<bug_class> cell was ever written.
-        monkeypatch.setenv("RAPTOR_DIR", str(tmp_path))
+        # audit:<bug_class> cell was ever written. The producer
+        # resolves the sidecar through the shared resolver, so the
+        # override — not a hand-rolled RAPTOR_DIR/out — names the
+        # ledger under test.
+        sidecar = tmp_path / "llm_scorecard.json"
+        monkeypatch.setenv("RAPTOR_SCORECARD_PATH", str(sidecar))
         from core.audit.corpus.run_corpus import _record_scorecard
         _record_scorecard(
             [{
@@ -151,5 +193,30 @@ class TestCorpusProducerRecordsAgain:
             }],
             model="m1",
         )
-        sc = ModelScorecard(tmp_path / "out" / "llm_scorecard.json")
+        sc = ModelScorecard(sidecar)
         assert sc.get_stat("audit:CWE-190", "m1") is not None
+
+    def test_record_scorecard_normalises_cwe_spellings(self, tmp_path: Path,
+                                                       monkeypatch):
+        # r1's case half of the join finding: the corpus writer minted
+        # audit:<bug_class> raw, so "cwe-89"-labelled corpora created
+        # cells the calibrated reader never joins. CWE-shaped bug
+        # classes normalise through the shared grammar; non-CWE bug
+        # classes keep their raw (offline research) key.
+        sidecar = tmp_path / "llm_scorecard.json"
+        monkeypatch.setenv("RAPTOR_SCORECARD_PATH", str(sidecar))
+        from core.audit.corpus.run_corpus import _record_scorecard
+        base = {"function_id": "a.c:f", "expected": "finding",
+                "actual": "clean", "match": False, "hypothesis": "h"}
+        _record_scorecard(
+            [
+                {**base, "bug_class": "cwe-89"},
+                {**base, "bug_class": "CWE-190: overflow"},
+                {**base, "bug_class": "use_after_free"},
+            ],
+            model="m1",
+        )
+        sc = ModelScorecard(sidecar)
+        assert sc.get_stat("audit:CWE-89", "m1") is not None
+        assert sc.get_stat("audit:CWE-190", "m1") is not None
+        assert sc.get_stat("audit:use_after_free", "m1") is not None

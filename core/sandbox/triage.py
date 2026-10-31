@@ -7,6 +7,12 @@ signature pattern resembling an escape/recon/credential-theft attempt fired,
 as distinct from ordinary "tool needed something the profile didn't allow"
 denial noise.
 
+Signals: escape_primitive_denied, escape_burst (temporal clustering),
+hostile_syscall_argument, seccomp_denied_unattributed, resolved_ip_screened,
+host_recon_pattern, host_retry_pattern, credential_path_touch,
+volume_anomaly, udp_posture_gap, dns_exfil_indicator, domain_fronting_attempt,
+port_probe, telemetry_tampering, provenance_unavailable.
+
 Pure, rules-based, offline: no LLM call, no network, no cost — cheap
 enough that core/run/metadata.py runs it unconditionally on every
 terminal-state transition (complete/fail/cancel/interrupt), right after
@@ -15,14 +21,14 @@ re-runs it by hand (stranded runs, post-hoc re-classification after
 editing telemetry). This is the cheap deterministic pre-filter a future
 LLM-based deeper-reasoning pass would consume, not a replacement for one.
 
-Known limitation: socket()/ioctl() denials collapse to a generic
-syscall="socket"/"ioctl" under audit tracing (see
-core/sandbox/tracer.py:_NAME_TO_TYPE) — the AF_UNIX/AF_NETLINK/AF_PACKET
-family and TIOCSTI/TIOCCONS/TIOCSCTTY ioctl-cmd detail isn't captured by the
-current tracer record shape, so escape_primitive_denied can't distinguish a
-docker.sock-escape attempt from an ordinary blocked AF_UNIX call. Fixing
-this means enriching tracer.py's record with decoded syscall arguments — a
-separate, larger change.
+Syscall argument enrichment: tracer.py:_write_record calls
+escalation_signatures.decode_syscall_args on every denial, decorating
+records with socket_family/socket_type (socket) and ioctl_cmd (ioctl).
+_check_hostile_syscall_args consumes these via hostile_arg_label to
+distinguish AF_PACKET/SOCK_RAW/TIOCSTI escape attempts from ordinary
+AF_UNIX/AF_NETLINK noise. Residual: the target AF_UNIX *path* (e.g.
+docker.sock) is not captured because seccomp blocks the socket() call
+before connect() runs — inherent to the enforcement model.
 """
 
 from __future__ import annotations
@@ -45,6 +51,7 @@ from core.sandbox.escalation_signatures import (
     is_credential_path,
 )
 from core.sandbox.profiles import host_recon_threshold_for_profile
+from core.security.capped_read import read_capped
 from core.security.log_sanitisation import sanitise_for_terminal
 from core.sandbox.proxy import (
     PROXY_EVENTS_COUNT_FILENAME,
@@ -92,6 +99,30 @@ _VOLUME_ANOMALY_CAP_FRACTION = 0.9
 # masquerades as complete.
 _MAX_EVIDENCE_ITEMS = 32
 _MAX_EVIDENCE_ITEM_LEN = 512
+
+# Escape-burst detection: N escape-primitive denials within a T-second
+# window signals a scripted sweep rather than one-off tool probing.
+_ESCAPE_BURST_COUNT = 5
+_ESCAPE_BURST_WINDOW_SECS = 10.0
+
+# Repeated-host retry: same denied host hit this many times is
+# persistence probing (distinct from breadth scanning).
+_HOST_RETRY_THRESHOLD = 10
+
+# DNS exfil: minimum distinct subdomains of one parent domain.
+_DNS_EXFIL_SUBDOMAIN_THRESHOLD = 20
+
+
+def _parse_ts(ts) -> float:
+    """Parse a denial timestamp to a comparable float.
+
+    Records use ISO 8601 strings (datetime.now(tz).isoformat()); accept
+    numeric values too for test convenience."""
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    from datetime import datetime, timezone
+    return datetime.fromisoformat(str(ts)).replace(
+        tzinfo=timezone.utc).timestamp()
 
 
 # Verification outcomes for a triage input artifact. "verified" =
@@ -279,7 +310,7 @@ def _verify_proxy_events(
         seqs = []
         for e in usable:
             try:
-                seqs.append(int(e.get("seq")))
+                seqs.append(int(e.get("seq")))  # type: ignore[arg-type]
             except (TypeError, ValueError):
                 integrity = _INTEGRITY_TAMPERED
         if seqs and (len(set(seqs)) != len(seqs)
@@ -315,6 +346,7 @@ def _verify_summary(
             return None, _INTEGRITY_TAMPERED
         return summary, _INTEGRITY_LEGACY
     posture = summary.get("posture")
+    _refusals = summary.get("floor_refusals") or []
     fields = telemetry_mac.summary_fields(
         summary.get("total_denials", 0),
         _denials_sha256(summary.get("denials", [])),
@@ -323,6 +355,16 @@ def _verify_summary(
         inode_mismatch=inode_mismatch,
         planted_object=planted_object,
         posture=posture if isinstance(posture, dict) else None,
+        floor_refusals=len(_refusals)
+        if isinstance(_refusals, list) else 0,
+        floor_refusals_sha256=(
+            _denials_sha256(_refusals)
+            if isinstance(_refusals, list) and _refusals else ""),
+        # CLI-disable attribution: recompute each half of the pair
+        # from its own on-disk field so stripping or rewriting either
+        # one (flag or consent-source label) breaks verification.
+        cli_sandbox_disabled=bool(summary.get("cli_sandbox_disabled")),
+        disable_consent=str(summary.get("disable_consent") or ""),
     )
     if telemetry_mac.verify(fields, token):
         if writer_flagged:
@@ -348,11 +390,22 @@ def _verify_audit_degraded(
 
 
 def _cap_evidence(items: list[str]) -> list[str]:
+    """Escape + bound evidence values at the one chokepoint every
+    signal's evidence list passes through. Escaping is structural,
+    not per-consumer: evidence strings can carry target-derived
+    bytes (the Landlock-lane child-append residual means a hostile
+    child can forge whole denial records), and today's consumers
+    printing only sanitised fields is no contract for tomorrow's —
+    raw control bytes must never reach sandbox-triage.json. Escape
+    BEFORE capping so the length bound holds on what is actually
+    emitted."""
+    from core.security.log_sanitisation import escape_nonprintable
+    escaped = [escape_nonprintable(item) for item in items]
     capped = [
         item if len(item) <= _MAX_EVIDENCE_ITEM_LEN
         else item[:_MAX_EVIDENCE_ITEM_LEN]
         + f"...[+{len(item) - _MAX_EVIDENCE_ITEM_LEN} chars]"
-        for item in items
+        for item in escaped
     ]
     if len(capped) > _MAX_EVIDENCE_ITEMS:
         dropped = len(capped) - _MAX_EVIDENCE_ITEMS
@@ -577,6 +630,12 @@ def triage_run(run_dir: Path, *,
     signals += _check_host_recon(proxy_events, host_recon_threshold)
     signals += _check_credential_path_touch(enforcement_denials)
     signals += _check_volume_anomaly(summary, budget_markers)
+    signals += _check_escape_burst(enforcement_denials)
+    signals += _check_host_retry(proxy_events)
+    signals += _check_dns_exfil_indicator(proxy_events)
+    signals += _check_udp_posture_gap(posture)
+    signals += _check_domain_fronting(proxy_events)
+    signals += _check_port_probe(proxy_events)
 
     # Destruction detection: an artifact that exists but yields no
     # usable content (garbage bytes, oversized blob, FIFO, symlink)
@@ -783,7 +842,7 @@ def _check_resolved_ip_screened(proxy_events: list[dict]) -> list[dict]:
 
 
 def _check_host_recon(proxy_events: list[dict], threshold: int) -> list[dict]:
-    hosts = {e.get("host") for e in proxy_events
+    hosts = {e["host"].lower() for e in proxy_events
              if e.get("result") in ("denied_host", "would_deny_host")
              and e.get("host")}
     if len(hosts) < threshold:
@@ -792,7 +851,7 @@ def _check_host_recon(proxy_events: list[dict], threshold: int) -> list[dict]:
         "type": "host_recon_pattern",
         "severity": SEVERITY_MEDIUM,
         "count": len(hosts),
-        "evidence": _cap_evidence(sorted(hosts)),
+        "evidence": _cap_evidence(sorted(hosts)),  # type: ignore[arg-type]
     }]
 
 
@@ -823,7 +882,7 @@ def _check_volume_anomaly(summary: dict | None,
         evidence.append(
             f"total_denials={total} near/at cap ({MAX_DENIALS_PER_RUN})"
         )
-    marker_types = sorted({m.get("type") for m in budget_markers
+    marker_types = sorted({m.get("type") for m in budget_markers  # type: ignore[type-var]
                             if m.get("type") != "audit_summary"})
     if marker_types:
         evidence.append(f"audit budget markers present: {marker_types}")
@@ -834,6 +893,161 @@ def _check_volume_anomaly(summary: dict | None,
         "severity": SEVERITY_MEDIUM,
         "count": total,
         "evidence": evidence,
+    }]
+
+
+def _check_udp_posture_gap(posture: dict | None) -> list[dict]:
+    """Fire when block_network was True but UDP was not blocked."""
+    if posture is None:
+        return []
+    if not posture.get("block_network"):
+        return []
+    if posture.get("udp_block_engaged", True):
+        return []
+    return [{
+        "type": "udp_posture_gap",
+        "severity": SEVERITY_HIGH,
+        "count": 1,
+        "evidence": [
+            "block_network=True but udp_block_engaged=False — "
+            "the child had an unmonitored UDP egress path "
+            "(DNS exfiltration possible)"
+        ],
+    }]
+
+
+def _check_escape_burst(denials: list[dict]) -> list[dict]:
+    """Detect bursts of escape-primitive denials within a short window."""
+    hits = [d for d in denials
+            if d.get("syscall") in ESCAPE_PRIMITIVE_SYSCALLS
+            and d.get("ts") is not None]
+    if len(hits) < _ESCAPE_BURST_COUNT:
+        return []
+    try:
+        timestamps = sorted(_parse_ts(h["ts"]) for h in hits)
+    except (TypeError, ValueError):
+        return []
+    for i in range(len(timestamps) - _ESCAPE_BURST_COUNT + 1):
+        window = timestamps[i + _ESCAPE_BURST_COUNT - 1] - timestamps[i]
+        if window <= _ESCAPE_BURST_WINDOW_SECS:
+            return [{
+                "type": "escape_burst",
+                "severity": SEVERITY_HIGH,
+                "count": len(hits),
+                "evidence": [
+                    f"{_ESCAPE_BURST_COUNT}+ escape-primitive denials "
+                    f"within {window:.1f}s window — scripted sweep"
+                ],
+            }]
+    return []
+
+
+def _check_host_retry(proxy_events: list[dict]) -> list[dict]:
+    """Detect repeated attempts to reach the same denied host."""
+    from collections import Counter
+    host_counts: Counter[str] = Counter()
+    for e in proxy_events:
+        if e.get("result") in ("denied_host", "would_deny_host"):
+            host = e.get("host")
+            if host:
+                host_counts[host.lower()] += 1
+    retried = {h: c for h, c in host_counts.items()
+               if c >= _HOST_RETRY_THRESHOLD}
+    if not retried:
+        return []
+    return [{
+        "type": "host_retry_pattern",
+        "severity": SEVERITY_MEDIUM,
+        "count": sum(retried.values()),
+        "evidence": _cap_evidence([
+            f"{host} ({count}x)" for host, count
+            in sorted(retried.items(), key=lambda x: -x[1])
+        ]),
+    }]
+
+
+_KNOWN_2LD_TLDS = frozenset({
+    "co.uk", "co.jp", "co.kr", "co.nz", "co.za", "co.in",
+    "com.au", "com.br", "com.cn", "com.hk", "com.mx", "com.sg",
+    "com.tw", "net.au", "org.uk", "org.au", "ac.uk", "gov.uk",
+})
+
+
+def _effective_parent(host: str) -> str | None:
+    """Extract the registrable parent domain, handling common 2LD TLDs."""
+    parts = host.lower().split(".")
+    if len(parts) < 3:
+        return None
+    tail2 = ".".join(parts[-2:])
+    if tail2 in _KNOWN_2LD_TLDS:
+        if len(parts) < 4:
+            return None
+        return ".".join(parts[-3:])
+    return tail2
+
+
+def _check_dns_exfil_indicator(proxy_events: list[dict]) -> list[dict]:
+    """Detect subdomain-encoding exfiltration through allowed hosts."""
+    from collections import defaultdict
+    allowed = [e for e in proxy_events
+               if e.get("result") in ("allowed", "proxied")
+               and e.get("host")]
+    parent_map: dict[str, set[str]] = defaultdict(set)
+    for e in allowed:
+        parent = _effective_parent(e["host"])
+        if parent:
+            parent_map[parent].add(e["host"])
+    suspects = {parent: subs for parent, subs in parent_map.items()
+                if len(subs) >= _DNS_EXFIL_SUBDOMAIN_THRESHOLD}
+    if not suspects:
+        return []
+    return [{
+        "type": "dns_exfil_indicator",
+        "severity": SEVERITY_HIGH,
+        "count": sum(len(s) for s in suspects.values()),
+        "evidence": _cap_evidence([
+            f"{parent}: {len(subs)} distinct subdomain(s)"
+            for parent, subs
+            in sorted(suspects.items(), key=lambda x: -len(x[1]))
+        ]),
+    }]
+
+
+def _check_domain_fronting(proxy_events: list[dict]) -> list[dict]:
+    """Detect TLS SNI mismatch — a domain-fronting attempt.
+
+    Any ``denied_sni`` is purely adversarial: the child sent a
+    ClientHello whose SNI differs from the authorised CONNECT host.
+    """
+    hits = [e for e in proxy_events if e.get("result") == "denied_sni"]
+    if not hits:
+        return []
+    return [{
+        "type": "domain_fronting_attempt",
+        "severity": SEVERITY_HIGH,
+        "count": len(hits),
+        "evidence": _cap_evidence(sorted({
+            f"{e.get('host', '?')} (SNI: {e.get('reason', '?')})"
+            for e in hits})),
+    }]
+
+
+def _check_port_probe(proxy_events: list[dict]) -> list[dict]:
+    """Detect out-of-policy port access attempts.
+
+    ``denied_port`` means the child tried a port outside the
+    caller-declared contract.
+    """
+    hits = [e for e in proxy_events if e.get("result") == "denied_port"]
+    if not hits:
+        return []
+    return [{
+        "type": "port_probe",
+        "severity": SEVERITY_MEDIUM,
+        "count": len(hits),
+        "evidence": _cap_evidence(sorted({
+            f"{e.get('host', '?')}:{e.get('port', '?')}"
+            for e in hits})),
     }]
 
 
@@ -856,43 +1070,21 @@ _MAX_INPUT_BYTES = 64 * 1024 * 1024
 
 
 def _read_bounded(path: Path) -> bytes | None:
-    """Open-and-read a triage input with the same discipline the
-    writers use (see context._persist_proxy_events): the run dir is
+    """Read a triage input with the same discipline the writers use
+    (see context._persist_proxy_events): the run dir is
     target-writable, so a plain ``open()`` here would follow a
     target-planted symlink out of the sandbox boundary, and block the
     LIFECYCLE (complete_run/fail_run run this in-process) forever on
-    a target-planted FIFO with no writer. O_NOFOLLOW + O_NONBLOCK at
-    open, fstat regular-file check on the actually-opened inode,
-    bounded read. Any refusal returns None — absent and unreadable
-    collapse to "no input", matching the writers' fail-quiet stance.
+    a target-planted FIFO with no writer. Delegates the hardened
+    dance (O_NOFOLLOW + O_NONBLOCK + O_CLOEXEC at open, fstat
+    regular-file and size checks on the actually-opened inode,
+    bounded read) to ``core.security.capped_read``. Any refusal
+    returns None — absent and unreadable collapse to "no input",
+    matching the writers' fail-quiet stance. A file that grows past
+    the cap between fstat and read is REFUSED (None), never returned
+    as a silently-truncated prefix a racing writer could shape.
     """
-    try:
-        fd = os.open(
-            str(path),
-            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
-        )
-    except OSError:
-        # ENOENT (common case), ELOOP (planted symlink), and friends.
-        return None
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            return None  # FIFO / device / directory — never read
-        if st.st_size > _MAX_INPUT_BYTES:
-            return None
-        chunks = []
-        remaining = _MAX_INPUT_BYTES
-        while remaining > 0:
-            chunk = os.read(fd, min(remaining, 1 << 20))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        return b"".join(chunks)
-    except OSError:
-        return None
-    finally:
-        os.close(fd)
+    return read_capped(path, _MAX_INPUT_BYTES)
 
 
 def _load_json(path: Path) -> dict | None:
@@ -1115,14 +1307,22 @@ def _cli_main(argv: list | None = None) -> int:
                       "the triage report failed provenance "
                       "verification; see log)", file=sys.stderr)
             elif not args.json:
+                # Deep-report free text is LLM output. The producer
+                # (triage_deep._parse_assessments) escapes and caps it
+                # today, but that is a producer-side contract this
+                # print must not depend on — a new deep-report field or
+                # a consumer reading the report from disk without
+                # re-verification would reach the terminal raw.
+                # Sanitise at the emission site like the caveat print.
                 print(f"Deep assessment ({deep['model'] or 'LLM'}) — "
                       f"advisory, rules verdict stands:")
                 for a in deep["assessments"]:
-                    print(f"  - {a['signal_type']}: {a['judgement']} "
+                    print(f"  - {sanitise_for_terminal(str(a['signal_type']), max_len=64)}: "
+                          f"{sanitise_for_terminal(str(a['judgement']), max_len=32)} "
                           f"(confidence {a['confidence']:.2f}) — "
-                          f"{a['rationale']}")
+                          f"{sanitise_for_terminal(str(a['rationale']))}")
                 if deep.get("overall_note"):
-                    print(f"  note: {deep['overall_note']}")
+                    print(f"  note: {sanitise_for_terminal(str(deep['overall_note']))}")
     # Verdict-reflecting exit codes for scripting/CI gates:
     #   0 clean (or no telemetry), 1 error, 2 usage,
     #   3 notable, 4 suspicious. --deep never changes the code — the

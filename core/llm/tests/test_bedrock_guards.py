@@ -1,5 +1,5 @@
 """Tests for the Bedrock operational guards: the shared-quota worker
-cap, the same-weights multi-model warning, and the entitlement
+cap, duplicate-declared-model panel refusal, and the entitlement
 preflight's classification/caching behavior (probes stubbed — no
 network, no spend).
 """
@@ -62,28 +62,24 @@ class TestBedrockWorkerCap:
 
 
 # ---------------------------------------------------------------------------
-# Same-weights panel warning
+# Same-declared-model panel refusal
 # ---------------------------------------------------------------------------
 
-class TestSameWeightsWarning:
+class TestSameDeclaredModelRefusal:
 
-    def test_warns_on_same_underlying_model(self, caplog):
-        from core.llm.multi_model.dispatch import _warn_same_weights
-        with caplog.at_level("WARNING"):
-            _warn_same_weights([
-                "anthropic.claude-sonnet-5",
-                "us.anthropic.claude-sonnet-5",
-            ])
-        assert any("same" in r.message and "underlying" in r.message
-                   for r in caplog.records)
+    def test_refuses_bedrock_alias_of_declared_model(self):
+        from core.llm.multi_model.dispatch import (
+            _reject_same_declared_model,
+        )
 
-    def test_silent_on_distinct_models(self, caplog):
-        from core.llm.multi_model.dispatch import _warn_same_weights
-        with caplog.at_level("WARNING"):
-            _warn_same_weights([
-                "anthropic.claude-sonnet-5", "gemini-2.5-pro",
+        with pytest.raises(
+            ValueError,
+            match="declared same model via different routes",
+        ):
+            _reject_same_declared_model([
+                "anthropic/claude-sonnet-5",
+                "bedrock/anthropic.claude-sonnet-5",
             ])
-        assert not caplog.records
 
 
 # ---------------------------------------------------------------------------
@@ -234,3 +230,41 @@ class TestPreflightClassification:
         w2 = pf.preflight_configured_bedrock(CredentialStore())
         assert len(w1) == 1 and len(w2) == 1
         assert len(calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# Call-time preflight-cache path resolution
+# ---------------------------------------------------------------------------
+
+class TestPreflightCachePath:
+
+    def test_env_override_read_at_call_time(self, monkeypatch, tmp_path):
+        """RAPTOR_BEDROCK_PREFLIGHT_CACHE is read per call, not
+        snapshotted at import: a pin installed after the module was
+        imported redirects the cache, no reload needed."""
+        import core.llm.bedrock_preflight as pf
+        monkeypatch.setattr(pf, "_CACHE_PATH", None)
+        monkeypatch.setenv(
+            "RAPTOR_BEDROCK_PREFLIGHT_CACHE",
+            str(tmp_path / "preflight.json"),
+        )
+        assert pf._cache_path() == tmp_path / "preflight.json"
+
+        # Unset → legacy per-uid default (fabricated HOME so the
+        # assertion never resolves against the real home).
+        monkeypatch.delenv("RAPTOR_BEDROCK_PREFLIGHT_CACHE")
+        monkeypatch.setenv("HOME", str(tmp_path / "fakehome"))
+        assert pf._cache_path() == (
+            tmp_path / "fakehome" / ".raptor" / "cache"
+            / "bedrock-preflight.json"
+        )
+
+    def test_seam_overrides_env(self, monkeypatch, tmp_path):
+        """A monkeypatched _CACHE_PATH (this suite's isolation seam)
+        wins over the env override."""
+        import core.llm.bedrock_preflight as pf
+        monkeypatch.setenv(
+            "RAPTOR_BEDROCK_PREFLIGHT_CACHE", str(tmp_path / "ignored.json"),
+        )
+        monkeypatch.setattr(pf, "_CACHE_PATH", tmp_path / "pinned.json")
+        assert pf._cache_path() == tmp_path / "pinned.json"

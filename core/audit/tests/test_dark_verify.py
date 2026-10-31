@@ -173,6 +173,264 @@ class TestGenerateWitnessScript:
         assert "[42, true]" in script or "[42, True]" in script.replace("true", "True")
         assert "key" in script
 
+    def test_script_asserts_loaded_file(self, tmp_path):
+        spec = DarkWitnessSpec(
+            finding_key="f1", file="pkg/mod.py",
+            function="check", module_path="pkg.mod",
+        )
+        script = generate_witness_script(spec, tmp_path)
+        assert "binding_error" in script
+        assert "__file__" in script
+        assert str(tmp_path.resolve()) + "/pkg/mod.py" in script
+
+
+class TestWitnessScriptRuntimeBinding:
+    """The script's post-load ``__file__`` assertion is a best-effort
+    belt behind the static resolution engine: it reports binding_error
+    (never a verdict) for mis-binds where no plant code forges the
+    interpreter state — an executing plant can spoof ``__file__``, so
+    plants are the static engine's job to refuse pre-execution."""
+
+    def _run(self, script):
+        import subprocess
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True, text=True, timeout=30,
+        )
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+
+    def _tree(self, tmp_path):
+        (tmp_path / "pkg").mkdir()
+        (tmp_path / "pkg" / "mod.py").write_text(
+            "def check():\n    return 7\n", encoding="utf-8")
+        return tmp_path
+
+    def _spec(self):
+        return DarkWitnessSpec(
+            finding_key="f1", file="pkg/mod.py",
+            function="check", module_path="pkg.mod",
+            expected_return="7",
+        )
+
+    def test_clean_load_still_returns(self, tmp_path):
+        root = self._tree(tmp_path)
+        script = generate_witness_script(
+            self._spec(), root, witness_token="ab12")
+        data = self._run(script)
+        assert data["status"] == "returned"
+        assert data["token"] == "ab12"
+
+    def test_shadowed_load_reports_binding_error(self, tmp_path):
+        # A package-directory plant the loader binds ahead of the
+        # finding's module (the shape the static walk refuses; here it
+        # exercises the runtime belt directly).
+        root = self._tree(tmp_path)
+        (root / "pkg" / "mod").mkdir()
+        (root / "pkg" / "mod" / "__init__.py").write_text(
+            "def check():\n    return 7\n", encoding="utf-8")
+        script = generate_witness_script(
+            self._spec(), root, witness_token="ab12")
+        data = self._run(script)
+        assert data["status"] == "binding_error"
+        assert "__init__.py" in data["message"]
+
+    def test_sys_modules_hijack_reports_binding_error(self, tmp_path):
+        # Planted package code replacing the module in sys.modules at
+        # import time: the from-import succeeds against the impostor,
+        # but its __file__ is not the finding's file.
+        root = self._tree(tmp_path)
+        (root / "pkg" / "__init__.py").write_text(
+            "import sys, types\n"
+            "_m = types.ModuleType('pkg.mod')\n"
+            "_m.check = lambda: 7\n"
+            "_m.__file__ = __file__\n"
+            "sys.modules['pkg.mod'] = _m\n", encoding="utf-8")
+        script = generate_witness_script(
+            self._spec(), root, witness_token="ab12")
+        data = self._run(script)
+        assert data["status"] == "binding_error"
+
+
+class TestWitnessScriptArgBinding:
+    """The pre-call argument-binding gate: a vector that cannot bind
+    the target's signature reports ``arg_binding_error`` (the target
+    body never ran — its failure is the witness's, not the code's),
+    while the target's OWN TypeErrors keep status ``exception``."""
+
+    def _run(self, script):
+        import subprocess
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True, text=True, timeout=30,
+        )
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+
+    def _tree(self, tmp_path, body):
+        (tmp_path / "pkg").mkdir(exist_ok=True)
+        (tmp_path / "pkg" / "mod.py").write_text(body, encoding="utf-8")
+        return tmp_path
+
+    def _spec(self, args):
+        return DarkWitnessSpec(
+            finding_key="f1", file="pkg/mod.py",
+            function="check", module_path="pkg.mod", args=args,
+        )
+
+    def test_unbindable_vector_reports_arg_binding_error(self, tmp_path):
+        # Required second parameter, one-element vector: the guard
+        # body never runs, and the boundary refusal must not read as
+        # a semantic rejection.
+        root = self._tree(
+            tmp_path,
+            "def check(index, limit):\n"
+            "    if index >= limit:\n"
+            "        raise ValueError('oob')\n"
+            "    return index\n",
+        )
+        script = generate_witness_script(
+            self._spec([4]), root, witness_token="ab12")
+        data = self._run(script)
+        assert data["status"] == "arg_binding_error"
+        assert data["token"] == "ab12"
+        assert "limit" in data["message"]
+
+    def test_binding_vector_still_calls(self, tmp_path):
+        root = self._tree(
+            tmp_path,
+            "def check(index, limit=4):\n"
+            "    if index >= limit:\n"
+            "        raise ValueError('oob')\n"
+            "    return index\n",
+        )
+        script = generate_witness_script(
+            self._spec([1]), root, witness_token="ab12")
+        data = self._run(script)
+        assert data["status"] == "returned"
+        assert data["value"] == "1"
+
+    def test_target_own_typeerror_keeps_exception_status(self, tmp_path):
+        # The gate must not swallow the target's own TypeError: the
+        # vector binds, the body runs and raises — a real observation
+        # of the code under test.
+        root = self._tree(
+            tmp_path,
+            "def check(index):\n"
+            "    raise TypeError('inner semantics')\n",
+        )
+        script = generate_witness_script(
+            self._spec([1]), root, witness_token="ab12")
+        data = self._run(script)
+        assert data["status"] == "exception"
+        assert data["type"] == "TypeError"
+
+    def test_uninspectable_callable_belt_reclassifies(self, tmp_path):
+        # ``inspect.signature`` cannot describe this callable, so the
+        # precheck is skipped — the traceback belt catches the
+        # call-boundary TypeError instead (no callee frame entered).
+        root = self._tree(
+            tmp_path,
+            "class _C:\n"
+            "    @property\n"
+            "    def __signature__(self):\n"
+            "        raise ValueError('opaque')\n"
+            "    def __call__(self, a, b):\n"
+            "        return a\n"
+            "check = _C()\n",
+        )
+        script = generate_witness_script(
+            self._spec([4]), root, witness_token="ab12")
+        data = self._run(script)
+        assert data["status"] == "arg_binding_error"
+
+
+class TestClassifyBindingError:
+    def _spec(self, **kw):
+        return DarkWitnessSpec(
+            finding_key="f1", file="pkg/mod.py", function="check",
+            language="python", module_path="pkg.mod", **kw,
+        )
+
+    def test_binding_error_is_error_never_verdict(self):
+        out = json.dumps({
+            "status": "binding_error",
+            "message": "loaded '/t/pkg/mod/__init__.py', "
+                       "expected '/t/pkg/mod.py'",
+        })
+        r = _classify_output(self._spec(expected_return="7"), out, "python")
+        assert r.verdict == "error"
+        assert "binding failed" in r.match_detail
+        assert r.verdict not in ("confirmed", "refuted")
+
+    def test_binding_error_requires_token_like_any_status(self):
+        out = json.dumps({"status": "binding_error", "message": "x"})
+        r = _classify_output(
+            self._spec(), out, "python", expected_token="ab12")
+        assert r.verdict == "inconclusive"
+
+
+class TestPerlHarnessRuntimeBinding:
+    """%INC maps the bareword require's key to the path the loader
+    ACTUALLY bound — the harness asserts it is the finding's file, so
+    a load served by any other @INC entry reports binding_error."""
+
+    def _spec(self):
+        return DarkWitnessSpec(
+            finding_key="f1", file="lib/Auth.pm", function="check",
+            language="perl", expected_return="1",
+            lang_config={"use_module": "lib::Auth"},
+        )
+
+    def test_harness_asserts_inc_binding(self, tmp_path):
+        harness = hy.generate_perl_harness(
+            self._spec(), tmp_path, witness_token="ab12")
+        assert "binding_error" in harness
+        assert "$INC{'lib/Auth.pm'}" in harness
+        assert str(tmp_path.resolve()) + "/lib/Auth.pm" in harness
+
+    def _run_perl(self, harness, tmp_path, env_extra=None):
+        import os
+        import subprocess
+        perl = shutil.which("perl")
+        script = tmp_path / "witness.pl"
+        script.write_text(harness, encoding="utf-8")
+        env = dict(os.environ)
+        env.update(env_extra or {})
+        proc = subprocess.run(
+            [perl, str(script)], capture_output=True, text=True,
+            timeout=30, env=env,
+        )
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+
+    @pytest.mark.skipif(not shutil.which("perl"), reason="Perl not available")
+    def test_target_load_passes_binding(self, tmp_path):
+        target = tmp_path / "target"
+        (target / "lib").mkdir(parents=True)
+        (target / "lib" / "Auth.pm").write_text(
+            "sub check { return 1; }\n1;\n", encoding="utf-8")
+        harness = hy.generate_perl_harness(
+            self._spec(), target, witness_token="ab12")
+        data = self._run_perl(harness, tmp_path)
+        assert data["status"] == "returned"
+        assert data["token"] == "ab12"
+
+    @pytest.mark.skipif(not shutil.which("perl"), reason="Perl not available")
+    def test_foreign_inc_load_reports_binding_error(self, tmp_path):
+        # The module resolves through a DIFFERENT @INC entry (here
+        # PERL5LIB; in production any entry after the target root) —
+        # whatever loaded is not the finding's file.
+        target = tmp_path / "target"
+        target.mkdir()
+        other = tmp_path / "other"
+        (other / "lib").mkdir(parents=True)
+        (other / "lib" / "Auth.pm").write_text(
+            "sub check { return 1; }\n1;\n", encoding="utf-8")
+        harness = hy.generate_perl_harness(
+            self._spec(), target, witness_token="ab12")
+        data = self._run_perl(
+            harness, tmp_path, env_extra={"PERL5LIB": str(other)})
+        assert data["status"] == "binding_error"
+        assert "expected" in data["message"]
+
 
 # -- generate_c_harness -------------------------------------------------------
 
@@ -227,6 +485,27 @@ class TestGenerateCHarness:
         harness = generate_c_harness(spec, tmp_path)
         assert 'char buf[10] = "AAAA";' in harness
         assert "copy_buf(buf, 256)" in harness
+
+    def test_char_ptr_return_printed_as_pointer(self, tmp_path):
+        # %s would make the HARNESS dereference the returned buffer
+        # after the pre-call sentinel — a function legitimately
+        # returning a non-NUL-terminated buffer then overreads inside
+        # harness code, and the post-sentinel sanitizer report would
+        # read as a confirmed bug in the target.
+        spec = DarkWitnessSpec(
+            finding_key="f1", file="src/str.c", function="dup_prefix",
+            language="c",
+            lang_config={
+                "param_types": ["char *", "int"],
+                "return_type": "char *",
+                "arg_expressions": ["buf", "4"],
+                "includes": [],
+                "setup_lines": ['char buf[10] = "AAAA";'],
+            },
+        )
+        harness = generate_c_harness(spec, tmp_path)
+        assert "%s" not in harness
+        assert "%p" in harness
 
 
 # -- generate_go_harness ------------------------------------------------------
@@ -290,7 +569,9 @@ class TestGenerateJsHarness:
             lang_config={},
         )
         harness = generate_js_harness(spec, tmp_path)
-        assert "./lib/parser" in harness
+        # Exact file path with extension: a stripped stem would let a
+        # repo-planted extensionless `lib/parser` shadow the module.
+        assert "./lib/parser.js" in harness
 
 
 # -- _classify_output ---------------------------------------------------------
@@ -335,6 +616,65 @@ class TestClassifyOutput:
         stdout = json.dumps({
             "status": "exception", "type": "TypeError",
             "message": "wrong",
+        })
+        r = _classify_output(spec, stdout, "python")
+        assert r.verdict == "refuted"
+
+    def test_lua_error_message_substring_confirms(self):
+        # Lua's pcall carries no exception class — the harness reports
+        # a fixed type token ("error") and the prompt contract defines
+        # expected_exception as an error-MESSAGE substring.
+        spec = DarkWitnessSpec(
+            finding_key="f1", file="a.lua", function="f",
+            language="lua",
+            expected_exception="attempt to index a nil value",
+        )
+        stdout = json.dumps({
+            "status": "exception", "type": "error",
+            "message": "a.lua:3: attempt to index a nil value (local 'x')",
+        })
+        r = _classify_output(spec, stdout, "lua")
+        assert r.verdict == "confirmed"
+
+    def test_perl_die_message_substring_confirms(self):
+        # Perl's die is untyped — the harness reports type "die" and
+        # the prompt contract defines expected_exception as an
+        # error-MESSAGE substring.
+        spec = DarkWitnessSpec(
+            finding_key="f1", file="A.pm", function="f",
+            language="perl",
+            expected_exception="division by zero",
+        )
+        stdout = json.dumps({
+            "status": "exception", "type": "die",
+            "message": "Illegal division by zero at A.pm line 4.",
+        })
+        r = _classify_output(spec, stdout, "perl")
+        assert r.verdict == "confirmed"
+
+    def test_lua_error_message_mismatch_not_confirmed(self):
+        spec = DarkWitnessSpec(
+            finding_key="f1", file="a.lua", function="f",
+            language="lua",
+            expected_exception="attempt to index a nil value",
+        )
+        stdout = json.dumps({
+            "status": "exception", "type": "error",
+            "message": "a.lua:3: bad argument #1 to 'f'",
+        })
+        r = _classify_output(spec, stdout, "lua")
+        assert r.verdict == "refuted"
+
+    def test_typed_language_keeps_exact_type_match(self):
+        # Python's prompt contract promises an exception CLASS name —
+        # a message merely mentioning the class must not confirm.
+        spec = DarkWitnessSpec(
+            finding_key="f1", file="a.py", function="f",
+            module_path="a", expected_exception="ValueError",
+        )
+        stdout = json.dumps({
+            "status": "exception", "type": "TypeError",
+            "message": "expected ValueError here",
         })
         r = _classify_output(spec, stdout, "python")
         assert r.verdict == "refuted"
@@ -408,6 +748,49 @@ class TestClassifyOutput:
         )
         r = _classify_output(spec, "not json at all", "python")
         assert r.verdict == "inconclusive"
+
+    def test_char_ptr_return_value_check_is_inconclusive(self):
+        # char* results print as %p pointer identity, so a predicted
+        # string value can never be compared against the output — the
+        # mismatch is insufficiency of evidence, not a refutation.
+        spec = DarkWitnessSpec(
+            finding_key="f1", file="a.c", function="f", language="c",
+            expected_return="hello",
+            lang_config={"return_type": "char *"},
+        )
+        stdout = json.dumps({"status": "returned", "value": "0x5591ab0"})
+        r = _classify_output(spec, stdout, "c")
+        assert r.verdict == "inconclusive"
+
+    @pytest.mark.parametrize("return_type", [
+        "const char *", "unsigned char *", "void *", "int *",
+        "struct foo *", "char **",
+    ])
+    def test_any_pointer_return_value_check_is_inconclusive(
+        self, return_type,
+    ):
+        # The harness prints EVERY pointer as %p pointer identity —
+        # the guard must match the formatter, or a correct prediction
+        # (e.g. "NULL" vs glibc's "(nil)") on any non-char* pointer
+        # return mints a wrong authoritative refutation.
+        spec = DarkWitnessSpec(
+            finding_key="f1", file="a.c", function="f", language="c",
+            expected_return="NULL",
+            lang_config={"return_type": return_type},
+        )
+        stdout = json.dumps({"status": "returned", "value": "(nil)"})
+        r = _classify_output(spec, stdout, "c")
+        assert r.verdict == "inconclusive", return_type
+
+    def test_int_return_value_check_still_compares(self):
+        spec = DarkWitnessSpec(
+            finding_key="f1", file="a.c", function="f", language="c",
+            expected_return="7",
+            lang_config={"return_type": "int"},
+        )
+        stdout = json.dumps({"status": "returned", "value": "7"})
+        r = _classify_output(spec, stdout, "c")
+        assert r.verdict == "confirmed"
 
     def test_no_expected_return_is_inconclusive(self):
         spec = DarkWitnessSpec(
@@ -582,12 +965,56 @@ class TestValidateSpec:
         assert err is not None
         assert "invalid function name" in err
 
+    def test_ruby_bang_and_predicate_method_names_accepted(self):
+        # `save!` / `valid?` are ordinary ruby method names — refusing
+        # them refused every finding on such methods (over-refusal).
+        for fn in ("save!", "valid?"):
+            spec = DarkWitnessSpec(
+                finding_key="f1", file="app/m.rb", function=fn,
+                language="ruby",
+            )
+            assert validate_spec(spec) is None, fn
+
+    def test_ruby_suffix_grammar_stays_tight(self):
+        # One trailing sigil only, and only for ruby.
+        for fn, lang, file in (
+            ("save!!", "ruby", "a.rb"),
+            ("va!lid", "ruby", "a.rb"),
+            ("save!", "python", "a.py"),
+            ("valid?", "c", "a.c"),
+        ):
+            spec = DarkWitnessSpec(
+                finding_key="f1", file=file, function=fn, language=lang,
+            )
+            assert validate_spec(spec) is not None, (fn, lang)
+
     def test_function_with_semicolon_rejected(self):
         spec = DarkWitnessSpec(
             finding_key="f1", file="a.c", function="foo;bar",
             language="c",
         )
         assert validate_spec(spec) is not None
+
+    def test_trailing_newline_rejected(self):
+        """`$` matches before a trailing newline; the validation
+        allowlists must anchor with \\Z so a name/path carrying a
+        trailing newline never reaches harness generation."""
+        spec = DarkWitnessSpec(
+            finding_key="f1", file="a.py", function="check\n",
+            language="python",
+        )
+        err = validate_spec(spec)
+        assert err is not None
+        assert "invalid function name" in err
+
+        spec = DarkWitnessSpec(
+            finding_key="f1", file="a.rb", function="check",
+            language="ruby",
+            lang_config={"require_path": "lib/auth\n"},
+        )
+        err = validate_spec(spec)
+        assert err is not None
+        assert "invalid require_path" in err
 
     def test_dangerous_builtin_ruby(self):
         spec = DarkWitnessSpec(
@@ -743,9 +1170,12 @@ class TestValidateSpec:
         )
         assert validate_spec(spec) is not None
 
-    def test_valid_import_path(self):
+    def test_valid_import_path(self, tmp_path):
+        (tmp_path / "go.mod").write_text(
+            "module github.com/user/repo\n", encoding="utf-8",
+        )
         spec = DarkWitnessSpec(
-            finding_key="f1", file="a.go", function="Run",
+            finding_key="f1", file="pkg/a.go", function="Run",
             language="go",
             lang_config={
                 "package": "pkg",
@@ -753,7 +1183,7 @@ class TestValidateSpec:
                 "return_type": "int",
             },
         )
-        assert validate_spec(spec) is None
+        assert validate_spec(spec, tmp_path) is None
 
     def test_execute_witness_rejects_bad_spec(self, tmp_path):
         src = tmp_path / "a.rb"
@@ -771,6 +1201,22 @@ class TestValidateSpec:
 
 
 class TestExecuteWitness:
+    @pytest.fixture()
+    def real_execution_sandbox(self):
+        """Real execution needs an achievable containment tier — the
+        executors fail closed to verdict="error" without one, which
+        must read as skip, not failure. Same probe as the sandboxed-
+        compile write-grant tests."""
+        if ex._import_sandbox_run() is None:
+            pytest.skip("core.sandbox unavailable")
+        try:
+            from core.sandbox import check_landlock_available
+            from core.sandbox._spawn import mount_ns_available
+        except ImportError:
+            pytest.skip("core.sandbox unavailable")
+        if not (check_landlock_available() or mount_ns_available()):
+            pytest.skip("no sandbox containment tier on this host")
+
     def test_validation_failure_returns_error(self, tmp_path):
         spec = DarkWitnessSpec(
             finding_key="f1", file="missing.py",
@@ -791,7 +1237,7 @@ class TestExecuteWitness:
         assert r.verdict == "error"
         assert "unsupported" in r.match_detail
 
-    def test_real_execution_confirms(self, tmp_path):
+    def test_real_execution_confirms(self, tmp_path, real_execution_sandbox):
         mod = tmp_path / "pkg" / "demo.py"
         mod.parent.mkdir(parents=True)
         mod.write_text(textwrap.dedent("""\
@@ -808,7 +1254,7 @@ class TestExecuteWitness:
         r = execute_witness(spec, tmp_path)
         assert r.verdict == "confirmed"
 
-    def test_real_execution_refutes(self, tmp_path):
+    def test_real_execution_refutes(self, tmp_path, real_execution_sandbox):
         mod = tmp_path / "pkg" / "demo.py"
         mod.parent.mkdir(parents=True)
         mod.write_text(textwrap.dedent("""\
@@ -826,7 +1272,7 @@ class TestExecuteWitness:
         assert r.verdict == "refuted"
         assert "3" in r.actual_return
 
-    def test_language_auto_detected(self, tmp_path):
+    def test_language_auto_detected(self, tmp_path, real_execution_sandbox):
         mod = tmp_path / "lib" / "calc.py"
         mod.parent.mkdir(parents=True)
         mod.write_text("def double(x): return x * 2\n", encoding="utf-8")
@@ -904,7 +1350,7 @@ class TestGenerateTsHarness:
             lang_config={},
         )
         harness = generate_ts_harness(spec, tmp_path)
-        assert "./lib/parser" in harness
+        assert "./lib/parser.ts" in harness
 
 
 # -- generate_ruby_harness ----------------------------------------------------
@@ -933,6 +1379,61 @@ class TestGenerateRubyHarness:
         )
         harness = generate_ruby_harness(spec, tmp_path)
         assert "lib/parser" in harness
+
+    def test_loaded_features_binding_assert_present(self, tmp_path):
+        spec = DarkWitnessSpec(
+            finding_key="f1", file="lib/auth.rb", function="validate",
+            language="ruby", lang_config={"require_path": "lib/auth"},
+        )
+        harness = generate_ruby_harness(spec, tmp_path)
+        assert "$LOADED_FEATURES" in harness
+        assert "binding_error" in harness
+        assert str(tmp_path.resolve()) + "/lib/auth.rb" in harness
+        # The assert runs after the require (features are recorded at
+        # load) and before the target function is invoked.
+        assert harness.index("$LOADED_FEATURES") > harness.index("require ")
+        assert harness.index("binding_error") < harness.index("validate(")
+
+    @pytest.mark.skipif(not shutil.which("ruby"), reason="Ruby not available")
+    def test_live_target_load_passes_binding(self, tmp_path):
+        (tmp_path / "lib").mkdir()
+        (tmp_path / "lib" / "auth.rb").write_text(
+            "def validate(x)\n  1\nend\n", encoding="utf-8")
+        spec = DarkWitnessSpec(
+            finding_key="f1", file="lib/auth.rb", function="validate",
+            language="ruby", args=["x"],
+            lang_config={"require_path": "lib/auth"},
+        )
+        harness = generate_ruby_harness(spec, tmp_path, witness_token="ab12")
+        out = _run_stdout([shutil.which("ruby"), "-e", harness])
+        data = json.loads(out.strip().splitlines()[-1])
+        assert data["status"] == "returned"
+
+    @pytest.mark.skipif(not shutil.which("ruby"), reason="Ruby not available")
+    def test_live_foreign_load_reports_binding_error(self, tmp_path):
+        # The feature resolves through a LATER load-path entry (the
+        # target-root slot is empty): whatever loaded is not the
+        # finding's file.
+        target = tmp_path / "target"
+        target.mkdir()
+        other = tmp_path / "other"
+        (other / "lib").mkdir(parents=True)
+        (other / "lib" / "auth.rb").write_text(
+            "def validate(x)\n  1\nend\n", encoding="utf-8")
+        spec = DarkWitnessSpec(
+            finding_key="f1", file="lib/auth.rb", function="validate",
+            language="ruby", args=["x"],
+            lang_config={"require_path": "lib/auth"},
+        )
+        harness = generate_ruby_harness(spec, target, witness_token="ab12")
+        from core.audit.tests._live_transport import run_pinned_subprocess
+        proc = run_pinned_subprocess(
+            [shutil.which("ruby"), "-I", str(other), "-e", harness],
+            timeout=30, context="dark-verify ruby foreign-load pin",
+            skip_signals=(9,),
+        )
+        data = json.loads(proc.stdout.strip().splitlines()[-1])
+        assert data["status"] == "binding_error"
 
 
 # -- generate_php_harness -----------------------------------------------------
@@ -1077,7 +1578,7 @@ class TestExecuteWitnessJs:
             finding_key="f1", file="auth.js", function="check",
             language="javascript",
             args=["test"],
-            lang_config={"require_path": "./auth"},
+            lang_config={"require_path": "./auth.js"},
         )
         import shutil
         monkeypatch.setattr(shutil, "which", lambda cmd: None)
@@ -1132,6 +1633,104 @@ class TestGenerateLuaHarness:
         harness = generate_lua_harness(spec, tmp_path)
         assert "scripts.parser" in harness
 
+    def test_package_path_renders_engine_templates_in_order(self, tmp_path):
+        # The harness search order IS the engine's candidate order —
+        # both render from _LUA_PATH_TEMPLATES, asserted here against
+        # the generated text.
+        from core.audit.dark_verify._resolve import _LUA_PATH_TEMPLATES
+        spec = DarkWitnessSpec(
+            finding_key="f1", file="lib/auth.lua", function="validate",
+            language="lua", lang_config={"require_path": "lib.auth"},
+        )
+        harness = generate_lua_harness(spec, tmp_path)
+        path_line = harness.splitlines()[0]
+        positions = [path_line.index("/" + t + ";")
+                     for t in _LUA_PATH_TEMPLATES]
+        assert positions == sorted(positions)
+        assert path_line.rstrip().endswith(".. package.path")
+
+    def test_searchpath_binding_assert_present(self, tmp_path):
+        spec = DarkWitnessSpec(
+            finding_key="f1", file="lib/auth.lua", function="validate",
+            language="lua", lang_config={"require_path": "lib.auth"},
+        )
+        harness = generate_lua_harness(spec, tmp_path)
+        assert "package.searchpath" in harness
+        assert "binding_error" in harness
+        assert str(tmp_path.resolve()) + "/lib/auth.lua" in harness
+        # The assert must run BEFORE require executes any target code.
+        assert harness.index("package.searchpath") < harness.index(
+            "pcall(require")
+
+    @pytest.mark.skipif(
+        not (shutil.which("lua") or shutil.which("lua5.4")
+             or shutil.which("lua5.3") or shutil.which("luajit")),
+        reason="Lua not available")
+    def test_live_shadowed_init_reports_binding_error(self, tmp_path):
+        # Runtime belt: the plantable sibling occupies the earlier
+        # ?.lua slot, so searchpath lands on the plant, not the
+        # finding's init.lua.
+        lua = shutil.which("lua") or shutil.which("lua5.4") \
+            or shutil.which("lua5.3") or shutil.which("luajit")
+        (tmp_path / "lib" / "auth").mkdir(parents=True)
+        (tmp_path / "lib" / "auth" / "init.lua").write_text(
+            "return { validate = function() return 1 end }\n",
+            encoding="utf-8")
+        (tmp_path / "lib" / "auth.lua").write_text(
+            "return { validate = function() return 99 end }\n",
+            encoding="utf-8")
+        spec = DarkWitnessSpec(
+            finding_key="f1", file="lib/auth/init.lua",
+            function="validate", language="lua",
+            lang_config={"require_path": "lib.auth"},
+        )
+        harness = generate_lua_harness(spec, tmp_path, witness_token="ab12")
+        script = tmp_path / "witness.lua"
+        script.write_text(harness, encoding="utf-8")
+        out = _run_stdout([lua, str(script)])
+        data = json.loads(out.strip().splitlines()[-1])
+        # Lua 5.1 without package.searchpath skips the runtime belt;
+        # the static engine still refuses this spec pre-execution.
+        assert data["status"] in ("binding_error", "returned")
+        if data["status"] == "returned":
+            import subprocess
+            has_searchpath = subprocess.run(
+                [lua, "-e", "os.exit(package.searchpath and 1 or 0)"],
+                check=False).returncode
+            assert has_searchpath == 0
+
+    def test_json_encode_escapes_backslash_and_control_chars(self, tmp_path):
+        """A message containing backslash-quote or a raw newline must
+        survive json_encode as parseable single-line JSON — malformed
+        output degrades the verdict to inconclusive (target-influenced
+        verdict suppression)."""
+        spec = DarkWitnessSpec(
+            finding_key="f1", file="lib/auth.lua", function="validate",
+            language="lua",
+            args=["x"],
+            lang_config={"require_path": "lib.auth"},
+        )
+        harness = generate_lua_harness(spec, tmp_path)
+        # Backslash must be escaped BEFORE the quote: quote-first would
+        # let backslash-quote re-open the string. Control bytes must be
+        # spelt \uXXXX, never emitted raw.
+        bs_pos = harness.index("gsub('\\\\', '\\\\\\\\')")
+        quote_pos = harness.index("gsub('\"', '\\\\\"')")
+        assert bs_pos < quote_pos
+        assert "'\\\\u%04X'" in harness
+        lua = shutil.which("lua") or shutil.which("lua5.4") \
+            or shutil.which("lua5.3") or shutil.which("luajit")
+        if lua:
+            prologue = harness.split("if package.searchpath")[0]
+            hostile = 'boom \\" quote\nnewline\ttab'
+            snippet = prologue + (
+                'io.write(json_encode({status="exception", token=_tok,'
+                ' type="error", message=' + hy._lua_quote(hostile) + "}))"
+            )
+            out = _run_stdout([lua, "-e", snippet])
+            assert "\n" not in out
+            assert json.loads(out)["message"] == hostile
+
 
 # -- generate_perl_harness -----------------------------------------------------
 
@@ -1162,7 +1761,7 @@ class TestExecuteWitnessTs:
             finding_key="f1", file="auth.ts", function="check",
             language="typescript",
             args=["test"],
-            lang_config={"require_path": "./auth"},
+            lang_config={"require_path": "./auth.ts"},
         )
         import shutil
         monkeypatch.setattr(shutil, "which", lambda cmd: None)
@@ -1374,6 +1973,23 @@ class TestBuildWitnessPrompt:
         )
         assert "Ruby" in system
         assert "check" in user
+
+    def test_ruby_perl_prompts_request_bare_identifiers(self):
+        """validate_spec's identifier grammar rejects qualified names
+        ("Class.method", "MyModule::check") with verdict="error" — the
+        prompts must not invite spellings that can never execute."""
+        for language, file in (("ruby", "lib/auth.rb"), ("perl", "lib/Auth.pm")):
+            _user, system = build_witness_prompt(
+                file=file, function="check",
+                hypothesis="h", body="b", language=language,
+            )
+            assert "or Class.method" not in system
+            assert '"MyModule::check" or just' not in system
+            fn_line = next(
+                ln for ln in system.splitlines()
+                if ln.startswith('- "function"')
+            )
+            assert "bare" in fn_line
 
     def test_php_prompt(self):
         user, system = build_witness_prompt(
@@ -1784,6 +2400,26 @@ class TestResolveRustc:
         monkeypatch.setenv("PATH", str(empty))
         assert ex._resolve_rustc() is None
 
+    def test_sysroot_probe_uses_safe_env(self, tmp_path, monkeypatch):
+        """The host-side probe executes the operator's toolchain, but it
+        must still run under the sanitised allowlist env like every
+        other subprocess in the module."""
+        proxy_dir, proxy = self._fake_proxy(tmp_path, "", rc=1)
+        monkeypatch.setenv("PATH", str(proxy_dir))
+        monkeypatch.setenv("LD_PRELOAD", "/nonexistent/evil.so")
+        seen: dict[str, object] = {}
+        real_run = ex.subprocess.run
+
+        def spy_run(cmd, **kwargs):
+            seen["env"] = kwargs.get("env")
+            return real_run(cmd, **kwargs)
+
+        monkeypatch.setattr(ex.subprocess, "run", spy_run)
+        assert ex._resolve_rustc() == str(proxy)
+        env = seen["env"]
+        assert env is not None
+        assert "LD_PRELOAD" not in env
+
 
 # ============================================================================
 # Real execution tests per language — skip when runtime unavailable
@@ -1914,6 +2550,45 @@ class TestRealExecutionC:
         r = execute_witness(spec, tmp_path)
         assert r.verdict == "refuted"
         assert "7" in r.actual_return
+
+
+class TestTargetCopyReadRefusal:
+    """The Go/Rust executors copy the finding's source into the
+    compile sandbox through _read_splice_source, which REFUSES on
+    truncation — a silently cut-off copy would compile a DIFFERENT
+    target than the finding names. The refusal must land in the
+    executors' broad handler as verdict=error (inconclusive
+    direction), never a verdict from altered source."""
+
+    def test_go_truncated_copy_maps_to_error_verdict(
+            self, tmp_path, monkeypatch):
+        # No toolchain needed: the refusal fires before any compile.
+        import core.source
+
+        monkeypatch.setattr(
+            ex.shutil, "which",
+            lambda name: "/nonexistent/go" if name == "go" else None,
+        )
+        monkeypatch.setattr(
+            core.source, "read_text_capped",
+            lambda *a, **kw: ("package main\n", True),
+        )
+        src = tmp_path / "main.go"
+        src.write_text("package main\n\nfunc Add(a int) int { return a }\n",
+                       encoding="utf-8")
+        spec = DarkWitnessSpec(
+            finding_key="f1", file="main.go", function="Add",
+            language="go",
+            expected_return="1",
+            lang_config={
+                "package": "main",
+                "arg_expressions": ["1"],
+                "return_type": "int",
+            },
+        )
+        r = ex._execute_go(spec, tmp_path, timeout_s=5)
+        assert r.verdict == "error"
+        assert "read cap" in r.match_detail
 
 
 @pytest.mark.slow
@@ -2116,7 +2791,7 @@ class TestRealExecutionJs:
             language="javascript",
             args=["not valid json"],
             expected_exception="SyntaxError",
-            lang_config={"require_path": "./parser"},
+            lang_config={"require_path": "./parser.js"},
         )
         r = execute_witness(spec, tmp_path)
         assert r.verdict == "confirmed"
@@ -2133,7 +2808,7 @@ class TestRealExecutionJs:
             language="javascript",
             args=[5],
             expected_return="15",
-            lang_config={"require_path": "./math"},
+            lang_config={"require_path": "./math.js"},
         )
         r = execute_witness(spec, tmp_path)
         assert r.verdict == "confirmed"
@@ -2149,10 +2824,41 @@ class TestRealExecutionJs:
             language="javascript",
             args=[10],
             expected_exception="TypeError",
-            lang_config={"require_path": "./safe"},
+            lang_config={"require_path": "./safe.js"},
         )
         r = execute_witness(spec, tmp_path)
         assert r.verdict == "refuted"
+
+    def test_planted_extensionless_shadow_never_executes(self, tmp_path):
+        # Node's LOAD_AS_FILE tries the extensionless path first: a
+        # repo-planted file named `math` (no extension, loaded as CJS)
+        # shadows `math.js` under a stem require. The stem spelling is
+        # rejected before anything executes, and the derived default
+        # (exact file path with extension) loads the finding's file,
+        # not the plant.
+        (tmp_path / "math.js").write_text(textwrap.dedent("""\
+            function triple(x) { return x * 3; }
+            module.exports = { triple };
+        """), encoding="utf-8")
+        (tmp_path / "math").write_text(
+            "module.exports = { triple: (x) => 999 };\n", encoding="utf-8",
+        )
+        stem_spec = DarkWitnessSpec(
+            finding_key="f1", file="math.js", function="triple",
+            language="javascript", args=[5], expected_return="15",
+            lang_config={"require_path": "./math"},
+        )
+        r = execute_witness(stem_spec, tmp_path)
+        assert r.verdict == "error"
+        assert "not bound to the finding's file" in r.match_detail
+
+        default_spec = DarkWitnessSpec(
+            finding_key="f1", file="math.js", function="triple",
+            language="javascript", args=[5], expected_return="15",
+            lang_config={},
+        )
+        r2 = execute_witness(default_spec, tmp_path)
+        assert r2.verdict == "confirmed", r2.match_detail
 
     def test_confirms_through_symlinked_shim_layout(
         self, tmp_path, monkeypatch,
@@ -2182,7 +2888,7 @@ class TestRealExecutionJs:
             language="javascript",
             args=[5],
             expected_return="15",
-            lang_config={"require_path": "./math"},
+            lang_config={"require_path": "./math.js"},
         )
         r = execute_witness(spec, target)
         assert r.verdict == "confirmed", r.match_detail
@@ -2274,7 +2980,9 @@ class TestRealExecutionPerl:
             finding_key="f1", file="Strict.pm", function="fail_hard",
             language="perl",
             args=[],
-            expected_exception="die",
+            # Per the Perl prompt contract this is an error-MESSAGE
+            # substring, not a type token.
+            expected_exception="intentional failure",
             lang_config={"use_module": "Strict"},
         )
         r = execute_witness(spec, tmp_path)
@@ -3342,6 +4050,134 @@ class TestAnchoredCapture:
         assert at_sentinel < at_report, "stream order must be preserved"
 
 
+class TestCFormatWidths:
+    """printf conversions must be width-exact for the declared return
+    type: %lu for `unsigned int` and %ld for `long long` were
+    LP64-benign varargs mismatches but wrong on ILP32."""
+
+    def test_width_exact_conversions(self):
+        cases = {
+            "unsigned int": "%u",
+            "unsigned": "%u",
+            "unsigned char": "%u",
+            "unsigned short": "%u",
+            "unsigned long": "%lu",
+            "unsigned long long": "%llu",
+            "long long": "%lld",
+            "int64_t": "%lld",
+            "uint64_t": "%llu",
+            "uint32_t": "%u",
+            "size_t": "%zu",
+            "ssize_t": "%zd",
+            "ptrdiff_t": "%td",
+            "long": "%ld",
+            "int": "%d",
+            "char": "%c",
+            "char *": "%p",
+        }
+        for rt, expected in cases.items():
+            assert hy._c_format_for_type(rt) == expected, rt
+
+
+class TestChattyStdoutClassification:
+    """A target that prints its own text around the harness epilogue
+    must not classify inconclusive — the token-bearing epilogue line
+    is recoverable, and ONLY that line (the token authenticates it;
+    chatter can parse as JSON but never carries the token)."""
+
+    _TOKEN = "cafef00d"
+
+    def _spec(self):
+        return DarkWitnessSpec(
+            finding_key="f1", file="a.py", function="f",
+            language="python",
+        )
+
+    def test_epilogue_recovered_from_chatter(self):
+        stdout = (
+            "debug: opening database\n"
+            "progress 50%\n"
+            '{"status": "returned", "token": "' + self._TOKEN
+            + '", "value": "3"}\n'
+            "trailing chatter\n"
+        )
+        r = ex._classify_json_output(
+            self._spec(), stdout, "python", expected_token=self._TOKEN,
+        )
+        assert r.verdict != "inconclusive" or "unparseable" not in (
+            r.match_detail or "")
+        assert "unparseable" not in (r.match_detail or "")
+
+    def test_forged_untokened_line_not_recovered(self):
+        stdout = (
+            '{"status": "returned", "value": "forged"}\n'
+            "chatter\n"
+        )
+        r = ex._classify_json_output(
+            self._spec(), stdout, "python", expected_token=self._TOKEN,
+        )
+        assert r.verdict == "inconclusive"
+
+    def test_unauthenticated_lane_does_not_recover(self):
+        # No expected token → nothing distinguishes the epilogue from
+        # chatter; the conservative whole-stdout behavior stands.
+        stdout = 'chatter\n{"status": "returned", "value": "3"}\n'
+        r = ex._classify_json_output(
+            self._spec(), stdout, "python", expected_token="",
+        )
+        assert r.verdict == "inconclusive"
+        assert "unparseable" in (r.match_detail or "")
+
+    def test_tampered_duplicate_key_line_skipped(self):
+        stdout = (
+            "chatter\n"
+            '{"status": "x", "status": "returned", "token": "'
+            + self._TOKEN + '"}\n'
+        )
+        r = ex._classify_json_output(
+            self._spec(), stdout, "python", expected_token=self._TOKEN,
+        )
+        assert r.verdict == "inconclusive"
+
+
+class TestCapArtifactPlantRefusal:
+    """The capture artifacts live in the child-writable output dir —
+    dark-verify witnesses execute target-derived code by design, so
+    the child can unlink the parent-created cap file and plant a
+    symlink (exfil into persisted witness stdout) or a FIFO (the
+    unsandboxed parent blocks forever). The capped reader must refuse
+    both, reading them as an unreadable (empty) stream."""
+
+    def test_symlink_plant_reads_as_unreadable(self, tmp_path):
+        secret = tmp_path / "secret"
+        secret.write_text("KEY-MATERIAL-OUTSIDE-THE-SANDBOX\n")
+        plant = tmp_path / "raptor-cap-stdout"
+        plant.symlink_to(secret)
+        text, truncated = ex._read_capped(plant, keep_tail=False)
+        assert text == ""
+        assert truncated is False
+
+    def test_fifo_plant_does_not_block(self, tmp_path):
+        import time
+
+        fifo = tmp_path / "raptor-cap-stderr"
+        os.mkfifo(fifo)
+        t0 = time.monotonic()
+        text, truncated = ex._read_capped(
+            fifo, keep_tail=True, anchors=(ex._SANITIZER_ANCHOR,),
+        )
+        assert time.monotonic() - t0 < 2.0, "FIFO plant blocked the read"
+        assert text == ""
+        assert truncated is False
+
+    def test_regular_file_reads_as_before(self, tmp_path):
+        p = tmp_path / "raptor-cap-stdout"
+        p.write_bytes(b"hello witness")
+        text, truncated = ex._read_capped(p, keep_tail=False)
+        assert text == "hello witness"
+        assert truncated is False
+
+
 class TestSandboxFailClosed:
     """No core.sandbox → error verdict, never a bare-subprocess fallback."""
 
@@ -3687,6 +4523,42 @@ class TestToolchainReadPaths:
         # The narrow bin dir itself is acceptable; $HOME is not.
         for p in paths:
             assert p == str(bin_dir)
+
+    def test_never_grants_cargo_home(self, tmp_path, monkeypatch):
+        # The rustup proxy fallback resolves rustc to
+        # <cargo-home>/bin/rustc; a parent-dir grant there would expose
+        # the registry credential store to target-derived code (compile
+        # steps honour include_str! and witness stdout is persisted).
+        home = tmp_path / "home" / "user"
+        cargo = home / ".cargo"
+        bin_dir = cargo / "bin"
+        bin_dir.mkdir(parents=True)
+        tool = bin_dir / "rustc"
+        tool.write_text("#!/bin/sh\n")
+        (cargo / "credentials.toml").write_text("[registry]\n")
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.delenv("CARGO_HOME", raising=False)
+
+        paths = _toolchain_read_paths(str(tool))
+        assert str(bin_dir) in paths
+        assert str(cargo) not in paths
+
+    def test_never_grants_credential_bearing_parent(
+        self, tmp_path, monkeypatch,
+    ):
+        # A relocated cargo home is recognised by the credential file
+        # it directly holds, not only by its default location.
+        root = tmp_path / "toolhome"
+        bin_dir = root / "bin"
+        bin_dir.mkdir(parents=True)
+        tool = bin_dir / "rustc"
+        tool.write_text("#!/bin/sh\n")
+        (root / "credentials").write_text('token = "x"\n')
+        monkeypatch.delenv("CARGO_HOME", raising=False)
+
+        paths = _toolchain_read_paths(str(tool))
+        assert str(bin_dir) in paths
+        assert str(root) not in paths
 
     def test_system_prefix_binaries_need_no_extra_grant(self):
         # /bin, /usr are already in the restricted read allowlist.
@@ -4042,12 +4914,13 @@ class TestValidateSpecLoadPaths:
         assert "require_path" in err
 
     @pytest.mark.parametrize("field,language,file,value", [
-        ("require_path", "ruby", "a.rb", "lib/auth"),
-        ("require_path", "javascript", "a.js", "./parser"),
-        ("require_path", "lua", "a.lua", "lib.auth"),
+        ("require_path", "ruby", "lib/auth.rb", "lib/auth"),
+        ("require_path", "javascript", "parser.js", "./parser.js"),
+        ("require_path", "lua", "lib/auth.lua", "lib.auth"),
         ("use_path", "rust", "a.rs", "std::collections::HashMap"),
-        ("use_module", "perl", "A.pm", "MathUtil"),
-        ("import_path", "go", "a.go", "github.com/user/repo/pkg"),
+        ("use_module", "perl", "MathUtil.pm", "MathUtil"),
+        # Go import paths are exercised in TestGoImportBinding — the
+        # binding needs a readable go.mod, which this fixture lacks.
     ])
     def test_legitimate_values_pass(self, field, language, file, value):
         assert validate_spec(self._spec({field: value}, language, file)) is None
@@ -4058,14 +4931,14 @@ class TestValidateSpecLoadPaths:
         root = tmp_path / "root"
         root.mkdir()
         (root / "esc").symlink_to(outside)
-        spec = self._spec({"require_path": "esc/mod"})
+        spec = self._spec({"require_path": "esc/mod"}, file="esc/mod.rb")
         assert validate_spec(spec) is None  # lexically clean
         err = validate_spec(spec, root)
         assert err is not None
         assert "escapes target root" in err
 
     def test_confined_require_path_passes_with_root(self, tmp_path):
-        spec = self._spec({"require_path": "lib/auth"})
+        spec = self._spec({"require_path": "lib/auth"}, file="lib/auth.rb")
         assert validate_spec(spec, tmp_path) is None
 
     def test_execute_witness_rejects_traversal_require_path(self, tmp_path):
@@ -4075,6 +4948,807 @@ class TestValidateSpecLoadPaths:
         r = execute_witness(spec, tmp_path)
         assert r.verdict == "error"
         assert "spec validation failed" in r.match_detail
+
+
+class TestModuleBindingToFindingFile:
+    """The module reference must resolve to the finding's FILE: a
+    witness pointed at a lookalike in-tree module exporting a
+    same-named function would execute the wrong code and mint
+    confirmed/refuted for the original finding."""
+
+    @staticmethod
+    def _spec(field, value, language, file):
+        return DarkWitnessSpec(
+            finding_key="f1", file=file, function="check",
+            language=language, lang_config={field: value},
+        )
+
+    @pytest.mark.parametrize("field,language,file,wrong", [
+        ("require_path", "javascript", "src/auth.js", "./src/lookalike"),
+        ("require_path", "typescript", "src/auth.ts", "./src/lookalike"),
+        # Stem spelling: Node's LOAD_AS_FILE tries the EXTENSIONLESS
+        # path first, so a repo-planted file named `src/auth` (loaded
+        # as CJS) shadows `src/auth.js` — and under the TS loaders a
+        # planted `src/auth.js` shadows `src/auth.ts` (`.js` resolves
+        # before `.ts`). Only the exact file path binds.
+        ("require_path", "javascript", "src/auth.js", "./src/auth"),
+        ("require_path", "typescript", "src/auth.ts", "./src/auth"),
+        # Directory/index spelling: directory resolution consults a
+        # repo-plantable package.json "main" BEFORE index files.
+        ("require_path", "javascript", "src/auth/index.js", "./src/auth"),
+        ("require_path", "ruby", "lib/auth.rb", "lib/lookalike"),
+        ("require_path", "php", "src/auth.php", "src/lookalike.php"),
+        ("require_path", "lua", "lib/auth.lua", "lib.lookalike"),
+        # Dotted DIRNAME: require "a.b.c" resolves to a/b/c.lua (every
+        # dot maps to a separator), NOT the finding's a.b/c.lua — the
+        # spelling-direction check accepted this plantable lookalike.
+        ("require_path", "lua", "a.b/c.lua", "a.b.c"),
+        # Dotted FILENAME stem: same resolution ambiguity.
+        ("require_path", "lua", "lib/auth.spec.lua", "lib.auth.spec"),
+        ("use_module", "perl", "lib/Auth.pm", "lib::Lookalike"),
+    ])
+    def test_wrong_module_rejected(self, field, language, file, wrong):
+        err = validate_spec(self._spec(field, wrong, language, file))
+        assert err is not None
+        assert "not bound to the finding's file" in err
+
+    def test_lua_dotted_stem_has_no_derived_default(self):
+        # With no override the harness derives the dotted spelling
+        # from the stem — for a dotted-dirname file that inherits the
+        # SAME ambiguity (a.b/c.lua -> "a.b.c" -> a/b/c.lua), so the
+        # spec is rejected before anything executes.
+        spec = DarkWitnessSpec(
+            finding_key="f1", file="a.b/c.lua", function="check",
+            language="lua", lang_config={},
+        )
+        err = validate_spec(spec)
+        assert err is not None
+        assert "no unambiguous" in err
+
+    def test_lua_clean_stem_keeps_derived_default(self):
+        # Both directions: a dot-free stem stays on the derived
+        # default with no override, exactly as before.
+        spec = DarkWitnessSpec(
+            finding_key="f1", file="lib/auth.lua", function="check",
+            language="lua", lang_config={},
+        )
+        assert validate_spec(spec) is None
+
+    @pytest.mark.parametrize("field,language,file,value", [
+        ("require_path", "javascript", "src/auth.js", "./src/auth.js"),
+        ("require_path", "javascript", "src/auth/index.js",
+         "./src/auth/index.js"),
+        ("require_path", "typescript", "src/auth.ts", "./src/auth.ts"),
+        ("require_path", "ruby", "lib/auth.rb", "lib/auth"),
+        ("require_path", "ruby", "lib/auth.rb", "lib/auth.rb"),
+        ("require_path", "php", "src/auth.php", "src/auth.php"),
+        ("require_path", "lua", "lib/auth.lua", "lib.auth"),
+        # Dot-spelled directory module: require "lib.auth.init" maps to
+        # lib/auth/init.lua through the ?.lua template — deterministic.
+        ("require_path", "lua", "lib/auth/init.lua", "lib.auth.init"),
+        ("use_module", "perl", "lib/Auth.pm", "lib::Auth"),
+    ])
+    def test_bound_module_accepted(self, field, language, file, value):
+        assert validate_spec(self._spec(field, value, language, file)) is None
+
+    def test_lua_init_directory_spelling_needs_vacant_sibling(
+            self, tmp_path):
+        # The harness's ?.lua template is tried BEFORE ?/init.lua, so
+        # require "lib.auth" binds lib/auth/init.lua only when the
+        # plantable sibling slot lib/auth.lua is verified vacant —
+        # occupied means the loader picks the plant, no tree means the
+        # slot cannot be verified at all.
+        spec = self._spec(
+            "require_path", "lib.auth", "lua", "lib/auth/init.lua")
+        err = validate_spec(spec)
+        assert err is not None
+        assert "without the target tree" in err
+
+        (tmp_path / "lib" / "auth").mkdir(parents=True)
+        (tmp_path / "lib" / "auth" / "init.lua").write_text(
+            "return { check = function() return 1 end }\n",
+            encoding="utf-8")
+        assert validate_spec(spec, tmp_path) is None
+
+        (tmp_path / "lib" / "auth.lua").write_text(
+            "return { check = function() return 99 end }\n",
+            encoding="utf-8")
+        err = validate_spec(spec, tmp_path)
+        assert err is not None
+        assert "shadow slot occupied" in err
+
+    def test_empty_override_uses_derived_default(self):
+        spec = DarkWitnessSpec(
+            finding_key="f1", file="lib/auth.rb", function="check",
+            language="ruby", lang_config={},
+        )
+        assert validate_spec(spec) is None
+
+    def test_wrong_module_witness_errors_not_verdicts(self, tmp_path):
+        src = tmp_path / "lib"
+        src.mkdir()
+        (src / "auth.rb").write_text("def check; end\n", encoding="utf-8")
+        (src / "lookalike.rb").write_text(
+            "def check; true; end\n", encoding="utf-8",
+        )
+        spec = DarkWitnessSpec(
+            finding_key="f1", file="lib/auth.rb", function="check",
+            language="ruby", lang_config={"require_path": "lib/lookalike"},
+        )
+        r = execute_witness(spec, tmp_path)
+        assert r.verdict == "error"
+        assert r.verdict not in ("confirmed", "refuted")
+
+
+class TestGoImportBinding:
+    """Go resolves an import path by stripping the go.mod module
+    prefix and mapping the remainder to a directory — the binding
+    must hold in that RESOLUTION direction. The old suffix check
+    accepted module-prefixed lookalikes and left root-package imports
+    completely unchecked."""
+
+    @staticmethod
+    def _spec(file: str, ip: str):
+        return DarkWitnessSpec(
+            finding_key="f1", file=file, function="Check",
+            language="go",
+            lang_config={"package": "auth", "import_path": ip},
+        )
+
+    @staticmethod
+    def _root(tmp_path, module_line="module example.com/m"):
+        (tmp_path / "go.mod").write_text(
+            f"{module_line}\n\ngo 1.21\n", encoding="utf-8",
+        )
+        return tmp_path
+
+    def test_resolved_import_accepted(self, tmp_path):
+        root = self._root(tmp_path)
+        spec = self._spec("pkg/auth/a.go", "example.com/m/pkg/auth")
+        assert validate_spec(spec, root) is None
+
+    def test_module_prefixed_lookalike_rejected(self, tmp_path):
+        # "example.com/m/x/a/b" ends with "/a/b" (the old suffix check
+        # passed it) but Go resolves it to directory x/a/b — a
+        # plantable lookalike package.
+        root = self._root(tmp_path)
+        spec = self._spec("a/b/f.go", "example.com/m/x/a/b")
+        err = validate_spec(spec, root)
+        assert err is not None
+        assert "not bound to the finding's file" in err
+
+    def test_bare_directory_spelling_rejected(self, tmp_path):
+        # "pkg/auth" without the module prefix names a DIFFERENT
+        # module under Go resolution.
+        root = self._root(tmp_path)
+        spec = self._spec("pkg/auth/a.go", "pkg/auth")
+        err = validate_spec(spec, root)
+        assert err is not None
+        assert "not bound to the finding's file" in err
+
+    def test_root_package_bound_to_module_path(self, tmp_path):
+        # Root-package findings were previously not checked at all —
+        # any package in the repo could be named.
+        root = self._root(tmp_path)
+        assert validate_spec(
+            self._spec("a.go", "example.com/m"), root,
+        ) is None
+        err = validate_spec(
+            self._spec("a.go", "example.com/m/pkg/evil"), root,
+        )
+        assert err is not None
+        assert "not bound to the finding's file" in err
+
+    def test_unreadable_go_mod_refuses(self, tmp_path):
+        # No go.mod = no resolution to verify: refuse, never execute
+        # (mirrors the dotted-Lua-stem refusal).
+        spec = self._spec("pkg/auth/a.go", "example.com/m/pkg/auth")
+        err = validate_spec(spec, tmp_path)
+        assert err is not None
+        assert "go.mod" in err
+
+    def test_quoted_and_commented_module_lines_parse(self, tmp_path):
+        root = self._root(
+            tmp_path, 'module "example.com/m"  // legacy quoted form',
+        )
+        assert validate_spec(
+            self._spec("pkg/auth/a.go", "example.com/m/pkg/auth"), root,
+        ) is None
+
+    def test_empty_import_path_stays_unchecked(self, tmp_path):
+        # No import_path: the harness imports nothing (package-main
+        # findings compile the target source directly).
+        spec = DarkWitnessSpec(
+            finding_key="f1", file="a.go", function="Check",
+            language="go", lang_config={},
+        )
+        assert validate_spec(spec, tmp_path) is None
+
+    @pytest.mark.parametrize("alias", [
+        'x"\n\nfunc init() { println("forged") }\nvar _ = "',
+        "a b",
+        "x;",
+        "x\ny",
+        "3x",
+    ])
+    def test_import_alias_injection_rejected(self, tmp_path, alias):
+        # import_alias is pasted raw into the harness import block and
+        # call prefix — anything beyond a single identifier is Go code
+        # injection with verdict-forging reach.
+        root = self._root(tmp_path)
+        spec = DarkWitnessSpec(
+            finding_key="f1", file="pkg/auth/a.go", function="Check",
+            language="go",
+            lang_config={
+                "package": "auth",
+                "import_path": "example.com/m/pkg/auth",
+                "import_alias": alias,
+            },
+        )
+        err = validate_spec(spec, root)
+        assert err is not None
+        assert "import_alias" in err
+
+    def test_import_alias_identifier_accepted(self, tmp_path):
+        root = self._root(tmp_path)
+        spec = DarkWitnessSpec(
+            finding_key="f1", file="pkg/auth/a.go", function="Check",
+            language="go",
+            lang_config={
+                "package": "auth",
+                "import_path": "example.com/m/pkg/auth",
+                "import_alias": "target",
+            },
+        )
+        assert validate_spec(spec, root) is None
+
+
+# -- resolution-direction engine: registry closure + shadow batteries ---------
+
+
+class TestLaneBindingClosure:
+    """Every supported language answers the module-binding question
+    through the resolution engine — a lane outside the registry, or a
+    registered lane validate_spec does not route through it, would
+    re-open the per-lane drift the engine exists to close."""
+
+    def test_registry_covers_every_supported_language(self):
+        from core.audit.dark_verify import _resolve
+        from core.audit.dark_verify._types import _SUPPORTED_LANGS
+        assert set(_resolve._LANE_BINDINGS) == set(_SUPPORTED_LANGS)
+
+    def test_every_lane_declares_a_binding_mode(self):
+        from core.audit.dark_verify import _resolve
+        for lang, lane in _resolve._LANE_BINDINGS.items():
+            assert lane.mode in ("resolver", "structural"), lang
+            if lane.mode == "resolver":
+                assert lane.resolver is not None, lang
+            else:
+                # Structural lanes must NAME the mechanism that binds
+                # the load without a loader search.
+                assert lane.rationale, lang
+
+    def test_unregistered_language_is_refused(self):
+        from core.audit.dark_verify._resolve import binding_error
+        spec = DarkWitnessSpec(
+            finding_key="f1", file="a.zig", function="check",
+            language="zig",
+        )
+        err = binding_error(spec, "zig", None)
+        assert err is not None and "no module-binding lane" in err
+
+    def test_validate_spec_routes_through_the_engine(self, monkeypatch):
+        # validate_spec must surface the engine's verdict for every
+        # language — a lane that skips the engine call would fall back
+        # to nothing at all.
+        from core.audit.dark_verify import _execute
+        from core.audit.dark_verify._types import _SUPPORTED_LANGS
+        seen = []
+
+        def sentinel(spec, lang, target_root=None):
+            seen.append(lang)
+            return f"engine sentinel for {lang}"
+
+        monkeypatch.setattr(_execute, "binding_error", sentinel)
+        by_lang = {
+            "python": "a.py", "c": "a.c", "cpp": "a.cpp", "go": "a.go",
+            "javascript": "a.js", "typescript": "a.ts", "ruby": "a.rb",
+            "php": "a.php", "rust": "a.rs", "java": "A.java",
+            "lua": "a.lua", "perl": "A.pm",
+        }
+        assert set(by_lang) == set(_SUPPORTED_LANGS)
+        for lang, file in by_lang.items():
+            spec = DarkWitnessSpec(
+                finding_key="f1", file=file, function="check",
+                language=lang,
+            )
+            err = _execute.validate_spec(spec)
+            assert err == f"engine sentinel for {lang}", lang
+        assert set(seen) == set(_SUPPORTED_LANGS)
+
+    # One plantable-lookalike reference per resolver lane: the engine
+    # must refuse each one, whatever the lane.  Module-level so the
+    # coverage-totality test below derives its lane set from the SAME
+    # rows the battery runs — a lane added here is exercised, a
+    # resolver lane missing here fails the totality test.
+    _LOOKALIKE_ROWS = [
+        ("python", "src/auth.py", {}, "src.lookalike"),
+        ("javascript", "src/auth.js", {"require_path": "./src/auth"}, ""),
+        ("typescript", "src/auth.ts", {"require_path": "./src/auth"}, ""),
+        ("ruby", "lib/auth.rb", {"require_path": "lib/lookalike"}, ""),
+        ("php", "src/auth.php", {"require_path": "src/lookalike.php"}, ""),
+        ("lua", "lib/auth.lua", {"require_path": "lib.lookalike"}, ""),
+        ("perl", "lib/Auth.pm", {"use_module": "lib::Lookalike"}, ""),
+        ("go", "pkg/a/f.go",
+         {"package": "a", "import_path": "example.com/m/pkg/b"}, ""),
+        ("java", "src/Auth.java",
+         {"class_name": "Auth", "imports": ["com.evil.Auth"]}, ""),
+    ]
+
+    @pytest.mark.parametrize("lang,file,lang_config,module_path",
+                             _LOOKALIKE_ROWS)
+    def test_resolver_lanes_refuse_lookalikes(
+            self, tmp_path, lang, file, lang_config, module_path):
+        from core.audit.dark_verify._resolve import (
+            _LANE_BINDINGS, binding_error,
+        )
+        assert _LANE_BINDINGS[lang].mode == "resolver"
+        src = tmp_path / file
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_text("// finding\n", encoding="utf-8")
+        if lang == "go":
+            (tmp_path / "go.mod").write_text(
+                "module example.com/m\n", encoding="utf-8")
+        spec = DarkWitnessSpec(
+            finding_key="f1", file=file, function="check",
+            language=lang, module_path=module_path,
+            lang_config=lang_config,
+        )
+        assert binding_error(spec, lang, tmp_path) is not None
+
+    def test_resolver_lane_coverage_is_total(self):
+        # The lookalike battery above must cover every resolver lane;
+        # a new resolver lane without a battery row fails here.  The
+        # battery set is DERIVED from the parametrize rows, never
+        # hand-duplicated — a lane listed here but absent from the
+        # rows cannot pass vacuously.
+        from core.audit.dark_verify._resolve import _LANE_BINDINGS
+        battery = {row[0] for row in self._LOOKALIKE_ROWS}
+        resolver_lanes = {
+            lang for lang, lane in _LANE_BINDINGS.items()
+            if lane.mode == "resolver"
+        }
+        assert battery == resolver_lanes
+
+    def test_generator_derivations_are_engine_derivations(self):
+        # The engine validates exactly the reference the generators
+        # feed the loader — both sides call the same derivation
+        # helper, asserted here against the rendered harness text.
+        from core.audit.dark_verify import _resolve
+        ruby = DarkWitnessSpec(
+            finding_key="f1", file="lib/auth.rb", function="check",
+            language="ruby",
+        )
+        assert (_resolve.derive_ruby_require_path(ruby)
+                in hy.generate_ruby_harness(ruby, Path("/t")))
+        lua = DarkWitnessSpec(
+            finding_key="f1", file="lib/auth.lua", function="check",
+            language="lua",
+        )
+        assert (_resolve.derive_lua_require_path(lua)
+                in hy.generate_lua_harness(lua, Path("/t")))
+        perl = DarkWitnessSpec(
+            finding_key="f1", file="lib/Auth.pm", function="check",
+            language="perl",
+        )
+        assert (_resolve.derive_perl_use_module(perl)
+                in hy.generate_perl_harness(perl, Path("/t")))
+        js = DarkWitnessSpec(
+            finding_key="f1", file="src/auth.js", function="check",
+            language="javascript",
+        )
+        assert (json.dumps(_resolve.derive_js_require_path(js))
+                in hy.generate_js_harness(js, Path("/t")))
+
+
+class TestPythonPackageShadowBinding:
+    """CPython resolves a regular PACKAGE before a same-named module:
+    a repo-planted ``src/auth/__init__.py`` directory shadows the
+    finding's ``src/auth.py``, so ``from src.auth import f`` executes
+    the plant and mints a verdict for code that never ran."""
+
+    def _spec(self, file="src/auth.py", module_path="src.auth"):
+        return DarkWitnessSpec(
+            finding_key="f1", file=file, function="check",
+            language="python", module_path=module_path,
+        )
+
+    def _tree(self, tmp_path, *, shadow):
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "auth.py").write_text(
+            "def check():\n    return 1\n", encoding="utf-8")
+        if shadow:
+            (tmp_path / "src" / "auth").mkdir()
+            (tmp_path / "src" / "auth" / "__init__.py").write_text(
+                "def check():\n    return 99\n", encoding="utf-8")
+        return tmp_path
+
+    def test_clean_tree_accepted(self, tmp_path):
+        root = self._tree(tmp_path, shadow=False)
+        assert validate_import_path(self._spec(), root) is None
+        assert validate_spec(self._spec(), root) is None
+
+    def test_package_shadow_refused(self, tmp_path):
+        root = self._tree(tmp_path, shadow=True)
+        err = validate_import_path(self._spec(), root)
+        assert err is not None and "shadow" in err
+        err = validate_spec(self._spec(), root)
+        assert err is not None and "shadow" in err
+
+    def test_shadowed_witness_errors_not_verdicts(self, tmp_path):
+        root = self._tree(tmp_path, shadow=True)
+        spec = DarkWitnessSpec(
+            finding_key="f1", file="src/auth.py", function="check",
+            language="python", module_path="src.auth",
+            expected_return="99",
+        )
+        r = execute_witness(spec, root)
+        assert r.verdict == "error"
+        assert r.verdict not in ("confirmed", "refuted")
+
+    def test_package_finding_outranks_module_plant(self, tmp_path):
+        # A directory with an __init__ binds before any same-named
+        # module file — a planted module file cannot shadow an
+        # __init__.py finding (only an extension __init__ in the same
+        # directory can, covered below).
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "auth").mkdir()
+        (tmp_path / "src" / "auth" / "__init__.py").write_text(
+            "def check():\n    return 1\n", encoding="utf-8")
+        (tmp_path / "src" / "auth.py").write_text(
+            "def check():\n    return 99\n", encoding="utf-8")
+        spec = self._spec(file="src/auth/__init__.py",
+                          module_path="src.auth")
+        assert validate_import_path(spec, tmp_path) is None
+
+    def test_shadow_check_requires_tree(self):
+        # Without a target tree the shadow slot cannot be verified
+        # vacant — fail closed, never assume.
+        err = validate_spec(self._spec())
+        assert err is not None and "without the target tree" in err
+
+
+class TestPythonNamespaceParentShadowBinding:
+    """CPython defers a PEP 420 namespace portion below every module
+    and extension hit at the same level: for a finding ``pkg/mod.py``
+    whose ``pkg/`` has no ``__init__.py``, a repo-planted ``pkg.py``
+    binds the ``pkg`` name FIRST — its import-time code owns
+    ``sys.modules['pkg.mod']`` before the finding's file is ever
+    considered.  Intermediate components carry hijack direction at
+    every namespace level."""
+
+    def _spec(self, file="pkg/mod.py", module_path="pkg.mod", **kw):
+        return DarkWitnessSpec(
+            finding_key="f1", file=file, function="check",
+            language="python", module_path=module_path, **kw,
+        )
+
+    def _tree(self, tmp_path):
+        (tmp_path / "pkg").mkdir()
+        (tmp_path / "pkg" / "mod.py").write_text(
+            "def check():\n    return 7\n", encoding="utf-8")
+        return tmp_path
+
+    def test_namespace_layout_accepted_when_vacant(self, tmp_path):
+        root = self._tree(tmp_path)
+        assert validate_spec(self._spec(), root) is None
+
+    def test_namespace_parent_module_plant_refused(self, tmp_path):
+        root = self._tree(tmp_path)
+        (root / "pkg.py").write_text("# plant\n", encoding="utf-8")
+        err = validate_spec(self._spec(), root)
+        assert err is not None and "pkg.py" in err
+
+    def test_deep_namespace_ancestor_plant_refused(self, tmp_path):
+        (tmp_path / "a" / "b").mkdir(parents=True)
+        (tmp_path / "a" / "b" / "mod.py").write_text(
+            "def check():\n    return 7\n", encoding="utf-8")
+        (tmp_path / "a" / "b.py").write_text("# plant\n", encoding="utf-8")
+        err = validate_spec(
+            self._spec(file="a/b/mod.py", module_path="a.b.mod"), tmp_path)
+        assert err is not None and "a/b.py" in err
+
+    def test_regular_package_parent_ignores_module_plant(self, tmp_path):
+        # A regular package (own __init__.py) binds before a same-named
+        # module file — the parent-level plant carries no hijack
+        # direction there.
+        root = self._tree(tmp_path)
+        (root / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+        (root / "pkg.py").write_text("# plant\n", encoding="utf-8")
+        assert validate_spec(self._spec(), root) is None
+
+    def test_plain_sibling_dir_is_not_a_shadow(self, tmp_path):
+        # The reverse layout: a bare directory named like the finding's
+        # module is a namespace portion and LOSES to the module file —
+        # must stay accepted.
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "auth.py").write_text(
+            "def check():\n    return 7\n", encoding="utf-8")
+        (tmp_path / "src" / "auth").mkdir()
+        (tmp_path / "src" / "auth" / ".keep").write_text("", encoding="utf-8")
+        assert validate_spec(
+            self._spec(file="src/auth.py", module_path="src.auth"),
+            tmp_path) is None
+
+    def test_hijacking_plant_errors_not_verdicts(self, tmp_path):
+        # End to end: a plant that installs an impostor
+        # sys.modules['pkg.mod'] with a FORGED __file__ would satisfy
+        # both the from-import and the runtime __file__ belt — the
+        # static gate must refuse it before anything executes.
+        root = self._tree(tmp_path)
+        (root / "pkg.py").write_text(
+            "import sys, types, os.path\n"
+            "_m = types.ModuleType('pkg.mod')\n"
+            "_m.check = lambda: 7\n"
+            "_m.__file__ = os.path.join("
+            "os.path.dirname(__file__), 'pkg', 'mod.py')\n"
+            "sys.modules['pkg.mod'] = _m\n", encoding="utf-8")
+        r = execute_witness(self._spec(expected_return="7"), root)
+        assert r.verdict == "error"
+        assert r.verdict not in ("confirmed", "refuted")
+
+
+class TestPythonExtensionSuffixShadowBinding:
+    """CPython's FileFinder tries EXTENSION suffixes before ``.py``
+    for the same name, and any ``__init__`` artifact makes a directory
+    a regular package regardless of suffix — so a repo-planted
+    ``pkg/mod.so`` (or ``pkg/mod/__init__.so``) binds ahead of the
+    finding's ``pkg/mod.py``."""
+
+    def _spec(self, file="pkg/mod.py", module_path="pkg.mod", **kw):
+        return DarkWitnessSpec(
+            finding_key="f1", file=file, function="check",
+            language="python", module_path=module_path, **kw,
+        )
+
+    def _tree(self, tmp_path):
+        (tmp_path / "pkg").mkdir()
+        (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+        (tmp_path / "pkg" / "mod.py").write_text(
+            "def check():\n    return 7\n", encoding="utf-8")
+        return tmp_path
+
+    def test_clean_tree_accepted(self, tmp_path):
+        root = self._tree(tmp_path)
+        assert validate_spec(self._spec(), root) is None
+
+    @pytest.mark.parametrize("plant", [
+        "pkg/mod.so",
+        "pkg/mod.cpython-314-x86_64-linux-gnu.so",
+        "pkg/mod.pyd",
+        "pkg/mod/__init__.so",
+        "pkg/mod/__init__.pyc",
+    ])
+    def test_extension_plant_refused(self, tmp_path, plant):
+        root = self._tree(tmp_path)
+        p = root / plant
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"\x7fELF-plant")
+        err = validate_spec(self._spec(), root)
+        assert err is not None and "shadow" in err
+
+    def test_bytecode_ranks_after_source(self, tmp_path):
+        # Sourceless bytecode for the SAME name is a later slot than
+        # the finding's .py — not a shadow.
+        root = self._tree(tmp_path)
+        (root / "pkg" / "mod.pyc").write_bytes(b"\x00\x00\x00\x00")
+        assert validate_spec(self._spec(), root) is None
+
+    def test_package_finding_extension_init_plant_refused(self, tmp_path):
+        # An __init__.py finding is outranked by an extension init in
+        # its own directory.
+        root = self._tree(tmp_path)
+        (root / "pkg" / "__init__.so").write_bytes(b"\x7fELF-plant")
+        err = validate_spec(
+            self._spec(file="pkg/__init__.py", module_path="pkg"), root)
+        assert err is not None and "shadow" in err
+
+    def test_regular_package_ancestor_extension_init_refused(self, tmp_path):
+        # Even a regular-package ancestor keeps one plantable slot: an
+        # extension __init__ outranks its source __init__.
+        root = self._tree(tmp_path)
+        (root / "pkg" / "__init__.so").write_bytes(b"\x7fELF-plant")
+        err = validate_spec(self._spec(), root)
+        assert err is not None and "shadow" in err
+
+    def test_extension_plant_errors_not_verdicts(self, tmp_path):
+        # End to end: a valid planted extension module loads AS
+        # pkg.mod with in-process control of __file__ — the static
+        # gate must refuse before the interpreter ever sees it.
+        root = self._tree(tmp_path)
+        (root / "pkg" / "mod.so").write_bytes(b"\x7fELF-plant")
+        r = execute_witness(self._spec(expected_return="7"), root)
+        assert r.verdict == "error"
+        assert r.verdict not in ("confirmed", "refuted")
+
+
+class TestNativeSuffixOrderingOtherLanes:
+    """The extension-suffix shadow class, checked across the other
+    resolver lanes: Ruby resolves ``.rb`` across the load path before
+    native suffixes, Lua's package.path searcher runs before the
+    C-library searcher, and Node's suffix ladder only starts after the
+    exact-path hit — so a planted native artifact never outranks the
+    accepted reference, and these lanes stay accept."""
+
+    @pytest.mark.parametrize("lang,file,lang_config,plant", [
+        ("ruby", "lib/auth.rb", {"require_path": "lib/auth"},
+         "lib/auth.so"),
+        ("lua", "lib/auth.lua", {"require_path": "lib.auth"},
+         "lib/auth.so"),
+        ("javascript", "src/auth.js", {"require_path": "./src/auth.js"},
+         "src/auth.node"),
+        ("javascript", "src/auth.js", {"require_path": "./src/auth.js"},
+         "src/auth.json"),
+    ])
+    def test_native_plant_does_not_shadow(
+            self, tmp_path, lang, file, lang_config, plant):
+        from core.audit.dark_verify._resolve import binding_error
+        src = tmp_path / file
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_text("-- finding\n", encoding="utf-8")
+        (tmp_path / plant).write_bytes(b"\x7fELF-plant")
+        spec = DarkWitnessSpec(
+            finding_key="f1", file=file, function="check",
+            language=lang, lang_config=lang_config,
+        )
+        assert binding_error(spec, lang, tmp_path) is None
+
+
+class TestPerlBarewordResolution:
+    """``require Bareword`` maps ``::`` to ``/`` and appends ``.pm``
+    ONLY — no bareword spelling can ever load a ``.pl`` finding; the
+    loader would bind a same-stem ``.pm`` plant instead."""
+
+    def _spec(self, file, use_module=""):
+        lc = {"use_module": use_module} if use_module else {}
+        return DarkWitnessSpec(
+            finding_key="f1", file=file, function="check",
+            language="perl", lang_config=lc,
+        )
+
+    def test_pl_finding_refused_on_derived_default(self):
+        err = validate_spec(self._spec("lib/auth.pl"))
+        assert err is not None
+        assert "declining to verify" in err
+
+    def test_pl_finding_refused_on_explicit_module(self):
+        err = validate_spec(self._spec("lib/auth.pl", "lib::auth"))
+        assert err is not None
+        assert "declining to verify" in err
+
+    def test_pl_lookalike_pm_never_reached(self, tmp_path):
+        # The exact plant shape: same-stem .pm next to the .pl finding.
+        (tmp_path / "lib").mkdir()
+        (tmp_path / "lib" / "auth.pl").write_text(
+            "sub check { return 1; }\n1;\n", encoding="utf-8")
+        (tmp_path / "lib" / "auth.pm").write_text(
+            "sub check { return 99; }\n1;\n", encoding="utf-8")
+        r = execute_witness(self._spec("lib/auth.pl"), tmp_path)
+        assert r.verdict == "error"
+        assert r.verdict not in ("confirmed", "refuted")
+
+    def test_pm_finding_still_accepted(self):
+        assert validate_spec(self._spec("lib/Auth.pm", "lib::Auth")) is None
+        assert validate_spec(self._spec("lib/Auth.pm")) is None
+
+
+class TestJavaImportBinding:
+    """The harness's class reference resolves through javac's
+    simple-name rules: a single-type import whose terminal name is the
+    finding's class stem re-binds every reference to whatever class it
+    names on the whole-tree compile classpath — the import must be the
+    finding's own package-qualified name, derived from the file's
+    package declaration, or the spec is refused."""
+
+    def _spec(self, file="src/Auth.java", imports=(), class_name="Auth"):
+        return DarkWitnessSpec(
+            finding_key="f1", file=file, function="check",
+            language="java",
+            lang_config={
+                "class_name": class_name,
+                "imports": list(imports),
+                "arg_expressions": [],
+            },
+        )
+
+    def _tree(self, tmp_path, package="com.example"):
+        src = tmp_path / "src" / "Auth.java"
+        src.parent.mkdir(parents=True, exist_ok=True)
+        decl = f"package {package};\n" if package else ""
+        src.write_text(
+            decl + "public class Auth {\n"
+            "    public static int check() { return 1; }\n"
+            "}\n", encoding="utf-8")
+        return tmp_path
+
+    def test_lookalike_import_refused(self, tmp_path):
+        root = self._tree(tmp_path)
+        err = validate_spec(
+            self._spec(imports=["com.evil.Auth"]), root)
+        assert err is not None and "not bound" in err
+
+    def test_own_package_import_accepted(self, tmp_path):
+        root = self._tree(tmp_path)
+        assert validate_spec(
+            self._spec(imports=["com.example.Auth"]), root) is None
+
+    def test_packaged_class_requires_its_import(self, tmp_path):
+        # Without the single-type import the harness's reference can
+        # only resolve through an on-demand import — a channel a
+        # planted package on the whole-tree classpath can serve.
+        root = self._tree(tmp_path)
+        err = validate_spec(self._spec(imports=[]), root)
+        assert err is not None and "single-type import" in err
+
+    def test_default_package_rejects_stem_imports(self, tmp_path):
+        # The default package cannot be imported (JLS 7.5.1) — a stem
+        # import can only name a lookalike.
+        root = self._tree(tmp_path, package="")
+        err = validate_spec(
+            self._spec(imports=["com.evil.Auth"]), root)
+        assert err is not None and "default package" in err
+
+    def test_default_package_plain_spec_accepted(self, tmp_path):
+        root = self._tree(tmp_path, package="")
+        assert validate_spec(
+            self._spec(imports=["java.util.HashMap"]), root) is None
+
+    def test_static_stem_import_refused(self, tmp_path):
+        # `import static com.evil.Util.Auth` binds a member (or nested
+        # type) named like the stem — never the finding's class.
+        root = self._tree(tmp_path)
+        err = validate_spec(
+            self._spec(imports=["com.example.Auth",
+                                "static com.evil.Util.Auth"]), root)
+        assert err is not None and "not bound" in err
+
+    def test_on_demand_imports_stay_allowed(self, tmp_path):
+        # On-demand imports are shadowed by both single-type imports
+        # and same-package types (JLS 6.4.1) — they cannot re-bind the
+        # stem once the single-type discipline holds.
+        root = self._tree(tmp_path)
+        assert validate_spec(
+            self._spec(imports=["com.example.Auth", "java.util.*"]),
+            root) is None
+
+    def test_comment_wrapped_package_decl_parses(self, tmp_path):
+        src = tmp_path / "src" / "Auth.java"
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_text(
+            "/* copyright\n * package com.wrong; in prose\n */\n"
+            "// package com.also.wrong;\n"
+            "package com.example;\n"
+            "public class Auth { public static int check()"
+            " { return 1; } }\n", encoding="utf-8")
+        assert validate_spec(
+            self._spec(imports=["com.example.Auth"]), tmp_path) is None
+        err = validate_spec(
+            self._spec(imports=["com.wrong.Auth"]), tmp_path)
+        assert err is not None
+
+    def test_unreadable_finding_file_refused(self, tmp_path):
+        # No package declaration to resolve against = decline.
+        err = validate_spec(
+            self._spec(imports=["com.example.Auth"]), tmp_path)
+        assert err is not None and "declining to verify" in err
+
+    def test_stem_import_without_tree_refused(self):
+        err = validate_spec(self._spec(imports=["com.evil.Auth"]))
+        assert err is not None and "without the target tree" in err
+
+    def test_class_name_binding_still_enforced(self):
+        err = validate_spec(self._spec(class_name="SomeOtherClass"))
+        assert err is not None and "not bound" in err
 
 
 # -- scripting-language string args render as data, never code ----------------
@@ -4122,7 +5796,17 @@ def _sq_roundtrip(literal: str) -> str:
 
 
 def _run_stdout(argv: list[str]) -> str:
-    proc = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+    # Live interpreter spawn: transport degradation (the deadline, a
+    # fork failure, a KILL from the resource ceiling) skips; every exit
+    # the interpreter chooses itself — including crash signals like
+    # SIGSEGV, which are product-relevant for a generated harness —
+    # stays a hard failure on the assert below.
+    from core.audit.tests._live_transport import run_pinned_subprocess
+
+    proc = run_pinned_subprocess(
+        argv, timeout=30, context="dark-verify interpreter round-trip",
+        skip_signals=(9,),
+    )
     assert proc.returncode == 0, proc.stderr
     return proc.stdout
 
@@ -4874,3 +6558,362 @@ class TestJavaUnicodeEscapeInjection:
             },
         )
         assert validate_spec(spec) is None
+
+
+class TestJavaReturnValueEncoding:
+    """The Java return path pastes a repo-controlled string — the
+    target's ``toString()`` — into the token-authenticated verdict
+    JSON. Raw concatenation let a crafted return value smuggle
+    duplicate keys INSIDE the authenticated epilogue (``json.loads``
+    keeps the last duplicate), flipping real refutations into
+    attacker-chosen ``exception`` shapes and minting ``confirmed``
+    whenever the injected type matched the witness's prediction."""
+
+    # The duplicate-key payload: a toString() return that, pasted raw,
+    # closes the value string and appends a forged exception epilogue.
+    _INJECTED = (
+        'X","status":"exception","type":"AssertionError",'
+        '"message":"forged'
+    )
+
+    def _spec(self, **kw):
+        base = dict(
+            finding_key="f1", file="A.java", function="parse",
+            language="java", expected_exception="AssertionError",
+            lang_config={"class_name": "A", "return_type": "String"},
+        )
+        base.update(kw)
+        return DarkWitnessSpec(**base)
+
+    @staticmethod
+    def _java_esc(s: str) -> str:
+        # Python model of the template's esc(): per-char dispatch —
+        # backslash / quote get their JSON escapes, control chars
+        # become \\uXXXX (the Lua lane's json_escape coverage).
+        return "".join(
+            "\\\\" if c == "\\"
+            else '\\"' if c == '"'
+            else "\\u%04x" % ord(c) if ord(c) < 0x20
+            else c
+            for c in s
+        )
+
+    def test_return_path_escapes_before_interpolation(self):
+        src = generate_java_harness(
+            self._spec(), Path("/t"), witness_token="ab" * 16,
+        )
+        # Both epilogue paths route their repo-controlled text through
+        # the template's esc() helper — the value is pure data.
+        assert "private static String esc(String s)" in src
+        assert 'String.format("\\\\u%04x", (int) c)' in src
+        assert "String _val = esc(String.valueOf(result));" in src
+        assert "esc(e.getMessage())" in src
+        assert '+ _val + ' in src
+        assert '+ result + ' not in src
+
+    def test_escaped_epilogue_round_trips_hostile_value(self):
+        # Simulate the template's esc() on the injection payload: the
+        # emitted line stays ONE parseable object whose value is the
+        # payload verbatim, and the classifier reads the normal return
+        # as the refutation it is (an exception was predicted).
+        line = (
+            '{"status":"returned","token":"feedface",'
+            '"value":"' + self._java_esc(self._INJECTED) + '"}'
+        )
+        data = json.loads(line)
+        assert data["status"] == "returned"
+        assert data["value"] == self._INJECTED
+        r = _classify_output(
+            self._spec(), line, "java", expected_token="feedface",
+        )
+        assert r.verdict == "refuted"
+
+    def test_multiline_return_value_keeps_its_verdict(self):
+        # Loss-direction guard: a LEGITIMATE multi-line toString()
+        # (newlines, tabs, CR) must stay one parseable status line —
+        # an unescaped control char would degrade a truthful refuted
+        # to inconclusive.
+        payload = "line one\nline two\r\n\tindented"
+        line = (
+            '{"status":"returned","token":"feedface",'
+            '"value":"' + self._java_esc(payload) + '"}'
+        )
+        data = json.loads(line)
+        assert data["value"] == payload
+        r = _classify_output(
+            self._spec(), line, "java", expected_token="feedface",
+        )
+        assert r.verdict == "refuted"
+
+    def test_multiline_exception_message_still_confirms(self):
+        # Same loss-direction guard on the exception path's _msg.
+        msg = "boom:\n  at A.parse(A.java:3)"
+        line = (
+            '{"status":"exception","token":"feedface",'
+            '"type":"AssertionError",'
+            '"message":"' + self._java_esc(msg) + '"}'
+        )
+        data = json.loads(line)
+        assert data["message"] == msg
+        r = _classify_output(
+            self._spec(), line, "java", expected_token="feedface",
+        )
+        assert r.verdict == "confirmed"
+
+    def test_duplicate_key_line_never_confirms(self):
+        # Pre-fix repro: the raw-concatenation harness emitted exactly
+        # this line for the payload; json.loads kept the LAST duplicate
+        # and _classify_json_output minted verdict="confirmed" with
+        # "exception type matches prediction" — token authentication
+        # passed because the injection rode inside the authenticated
+        # epilogue.
+        line = (
+            '{"status":"returned","token":"feedface","value":"'
+            + self._INJECTED + '"}'
+        )
+        r = _classify_output(
+            self._spec(), line, "java", expected_token="feedface",
+        )
+        assert r.verdict == "inconclusive"
+        assert "duplicate" in r.match_detail
+
+    def test_clean_exception_line_still_confirms(self):
+        # Two-direction guard: the duplicate-key gate must not tax a
+        # legitimate epilogue.
+        line = json.dumps({
+            "status": "exception", "token": "feedface",
+            "type": "AssertionError", "message": "boom",
+        })
+        r = _classify_output(
+            self._spec(), line, "java", expected_token="feedface",
+        )
+        assert r.verdict == "confirmed"
+
+    def test_clean_return_line_still_classifies(self):
+        line = json.dumps({
+            "status": "returned", "token": "feedface", "value": "ok",
+        })
+        r = _classify_output(
+            self._spec(), line, "java", expected_token="feedface",
+        )
+        assert r.verdict == "refuted"  # exception predicted, returned
+
+
+class TestLaneValueEncoderClosure:
+    """Every registry lane's RETURN-path epilogue must route the
+    runtime value through a real encoder (or a typed numeric/%p format
+    for C) — never raw interpolation into the verdict JSON. The Java
+    lane regressed exactly this way; the table below is the mechanical
+    oracle for the all-lanes claim, keyed to ``_SUPPORTED_LANGS`` so a
+    new lane cannot land without declaring its encoder here."""
+
+    _TOKEN = "ab" * 16
+
+    @staticmethod
+    def _rows():
+        troot = Path("/t")
+
+        def spec(file, lang, **kw):
+            base = dict(finding_key="f1", file=file, function="check",
+                        language=lang)
+            base.update(kw)
+            return DarkWitnessSpec(**base)
+
+        return {
+            "python": (
+                generate_witness_script(
+                    spec("src/auth.py", "python", module_path="src.auth"),
+                    troot, witness_token=TestLaneValueEncoderClosure._TOKEN),
+                ['json.dumps({"status": "returned", "token": _tok, '
+                 '"value": repr(_result)})'],
+            ),
+            "c": (
+                generate_c_harness(
+                    spec("a.c", "c",
+                         lang_config={"return_type": "char *"}),
+                    troot, witness_token=TestLaneValueEncoderClosure._TOKEN),
+                ['\\"value\\":\\"%p\\"'],
+            ),
+            "cpp": (
+                generate_c_harness(
+                    spec("a.cpp", "cpp",
+                         lang_config={"return_type": "int"}),
+                    troot, witness_token=TestLaneValueEncoderClosure._TOKEN),
+                ['\\"value\\":\\"%d\\"'],
+            ),
+            "go": (
+                generate_go_harness(
+                    spec("pkg/a.go", "go",
+                         lang_config={"return_type": "string"}),
+                    troot, witness_token=TestLaneValueEncoderClosure._TOKEN),
+                ["json.Marshal(result{", 'Value:  fmt.Sprintf("%v", v)'],
+            ),
+            "javascript": (
+                generate_js_harness(
+                    spec("src/auth.js", "javascript",
+                         lang_config={"require_path": "./src/auth"}),
+                    troot, witness_token=TestLaneValueEncoderClosure._TOKEN),
+                ["JSON.stringify({", "value: String(result)"],
+            ),
+            "typescript": (
+                generate_ts_harness(
+                    spec("src/auth.ts", "typescript",
+                         lang_config={"require_path": "./src/auth"}),
+                    troot, witness_token=TestLaneValueEncoderClosure._TOKEN),
+                ["JSON.stringify({", "value: String(result)"],
+            ),
+            "ruby": (
+                generate_ruby_harness(
+                    spec("lib/auth.rb", "ruby"),
+                    troot, witness_token=TestLaneValueEncoderClosure._TOKEN),
+                ["JSON.generate({ status: 'returned', token: _tok, "
+                 "value: _result.inspect })"],
+            ),
+            "php": (
+                generate_php_harness(
+                    spec("src/auth.php", "php"),
+                    troot, witness_token=TestLaneValueEncoderClosure._TOKEN),
+                ["json_encode([", "'value' => var_export($result, true)"],
+            ),
+            "rust": (
+                generate_rust_harness(
+                    spec("src/lib.rs", "rust",
+                         lang_config={"return_type": "String"}),
+                    troot, witness_token=TestLaneValueEncoderClosure._TOKEN),
+                ['\\"value\\":\\"{:?}\\"'],
+            ),
+            "java": (
+                generate_java_harness(
+                    spec("A.java", "java",
+                         lang_config={"class_name": "A",
+                                      "return_type": "String"}),
+                    troot, witness_token=TestLaneValueEncoderClosure._TOKEN),
+                ['private static String esc(String s)',
+                 'String _val = esc(String.valueOf(result));',
+                 '+ _val + '],
+            ),
+            "lua": (
+                generate_lua_harness(
+                    spec("lib/auth.lua", "lua"),
+                    troot, witness_token=TestLaneValueEncoderClosure._TOKEN),
+                ["local function json_escape(s)",
+                 'json_encode({status="returned", token=_tok, '
+                 "value=tostring(result)})"],
+            ),
+            "perl": (
+                generate_perl_harness(
+                    spec("lib/Auth.pm", "perl"),
+                    troot, witness_token=TestLaneValueEncoderClosure._TOKEN),
+                ["encode_json({status => 'returned', token => $_tok, "
+                 'value => "$result"})'],
+            ),
+        }
+
+    def test_encoder_table_covers_every_supported_language(self):
+        from core.audit.dark_verify._types import _SUPPORTED_LANGS
+        assert set(self._rows()) == set(_SUPPORTED_LANGS)
+
+    def test_every_lane_emits_through_its_encoder(self):
+        for lang, (src, markers) in self._rows().items():
+            for marker in markers:
+                assert marker in src, (lang, marker)
+
+    def test_no_lane_concatenates_the_raw_value(self):
+        # The Java regression shape: the raw runtime value adjacent to
+        # the value field with no encoder in between. String-typed
+        # C-family formats would be the same class.
+        for lang, (src, _markers) in self._rows().items():
+            assert '+ result + ' not in src, lang
+            assert '\\"value\\":\\"%s\\"' not in src, lang
+
+
+class TestConfirmReceiptProvenance:
+    """A confirm must EXTEND the receipt chain, not replace it — the
+    refuted branch already preserves the prior deterministic receipt
+    (\"+dark_verify:refuted\"), while the confirm branch overwrote
+    it, erasing engine provenance from the exported record."""
+
+    def _outcome(self, tmp_path):
+        import textwrap as _tw
+
+        from core.audit.orchestrator import ReviewOutcome
+        src = tmp_path / "math_util.py"
+        src.write_text(_tw.dedent("""\
+            def divide(a, b):
+                return a / b
+        """), encoding="utf-8")
+        oc = ReviewOutcome(
+            file="math_util.py", function="divide", status="dark",
+            body="suspected bug", hypothesis="division by zero",
+        )
+        oc.evidence_tool = "smt"
+        return oc
+
+    def test_confirm_preserves_prior_tool_receipt(self, tmp_path):
+        import json as _json
+
+        from core.audit.orchestrator import (
+            OrchestratorConfig,
+            OrchestratorResult,
+            _run_dark_verification,
+        )
+        config = OrchestratorConfig(target_path=tmp_path, out_dir=tmp_path)
+        oc = self._outcome(tmp_path)
+        result = OrchestratorResult()
+        result.outcomes = [oc]
+        result.dormant = 1
+        llm_response = _json.dumps({
+            "module_path": "math_util",
+            "function": "divide",
+            "args": [1, 0],
+            "expected_exception": "ZeroDivisionError",
+            "rationale": "dividing by zero",
+        })
+        _run_dark_verification(
+            result, config, llm_client=lambda s, u: llm_response,
+        )
+        assert result.outcomes[0].status == "finding"
+        parts = (result.outcomes[0].evidence_tool or "").split("+")
+        assert "dark_verify:confirmed" in parts
+        assert "smt" in parts
+
+
+class TestSpliceSourceRead:
+    """_read_splice_source: spec.file is record-derived — the join is
+    contained and the read refuses (never truncates or blocks)."""
+
+    def _call(self, root, rel):
+        from core.audit.dark_verify._execute import _read_splice_source
+        return _read_splice_source(root, rel)
+
+    def test_reads_in_tree_source(self, tmp_path):
+        (tmp_path / "main.go").write_text("func main() {}\n")
+        assert "main" in self._call(tmp_path, "main.go")
+
+    def test_escaping_paths_raise(self, tmp_path):
+        root = tmp_path / "root"
+        root.mkdir()
+        secret = tmp_path / "secret.go"
+        secret.write_text("package secret\n")
+        with pytest.raises(OSError, match="escapes"):
+            self._call(root, "../secret.go")
+        with pytest.raises(OSError, match="escapes"):
+            self._call(root, str(secret))
+
+    def test_fifo_raises_instead_of_wedging(self, tmp_path):
+        import os
+
+        os.mkfifo(tmp_path / "wedge.go")
+        with pytest.raises(OSError, match="not a regular file"):
+            self._call(tmp_path, "wedge.go")
+
+    def test_oversize_refuses_never_truncates(self, tmp_path):
+        from core.source import DEFAULT_MAX_SOURCE_CHARS
+
+        big = tmp_path / "big.go"
+        with big.open("w") as fh:  # raw-open: test fixture writes its own sparse tmp plant
+            fh.write("package big\n")
+            fh.seek(DEFAULT_MAX_SOURCE_CHARS + 1024 * 1024)
+            fh.write("x")
+        with pytest.raises(OSError, match="exceeds the read cap"):
+            self._call(tmp_path, "big.go")

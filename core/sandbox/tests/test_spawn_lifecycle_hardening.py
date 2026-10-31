@@ -16,6 +16,7 @@
   unsandboxed parent, contra the pinned-resolver doctrine.
 """
 
+import json
 import os
 import shutil
 import stat
@@ -28,7 +29,11 @@ import unittest
 from pathlib import Path
 
 import pytest
-from core.sandbox.tests.capability import requires_landlock, requires_userns
+from core.sandbox.tests.capability import (
+    requires_landlock,
+    requires_mount,
+    requires_userns,
+)
 
 pytestmark = pytest.mark.skipif(
     sys.platform != "linux", reason="Linux spawn backend",
@@ -140,6 +145,8 @@ class TestHighFdSweep(unittest.TestCase):
         if not mount_ns_available():
             self.skipTest("mount-ns not available on this host")
 
+    # Exercises mount-delivered capability; hosts with userns but no mount capability degrade by design -> named SKIP, not a mid-flight mount failure.
+    @requires_mount
     def test_inheritable_fd_above_lowered_limit_is_closed(self):
         import resource
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -192,6 +199,108 @@ class TestHighFdSweep(unittest.TestCase):
             if raised:
                 import resource as _res
                 _res.setrlimit(_res.RLIMIT_NOFILE, (soft, hard))
+
+
+@requires_landlock
+@requires_userns
+class TestParentFdReuseRace(unittest.TestCase):
+    def setUp(self):
+        if not _mount_ns_usable():
+            self.skipTest("mount-ns unusable here")
+        from core.sandbox._spawn import mount_ns_available
+        if not mount_ns_available():
+            self.skipTest("mount-ns not available on this host")
+
+    def test_reused_preexisting_fd_cannot_close_handshake_or_escape_child(self):
+        """A stale numeric snapshot must not close a new handshake fd.
+
+        The isolated driver forces the first sandbox pipe to reuse a
+        descriptor present in the parent-time snapshot. Pre-fix the setup
+        child closed that pipe, hit EBADF before its setup catch-all, and
+        returned into the caller — producing two RESULT lines.
+        """
+        with tempfile.TemporaryDirectory(
+                prefix="raptor-fdreuse-target-") as out:
+            driver = textwrap.dedent(f"""
+                import json
+                import os
+                import sys
+
+                sys.path.insert(0, {_WT!r})
+                os.environ.setdefault("RAPTOR_DIR", {_WT!r})
+                from core.sandbox import _spawn
+
+                held = os.open("/dev/null", os.O_RDONLY)
+                real_pipe = os.pipe
+                pipes = []
+
+                def reuse_first_pipe_number():
+                    if not pipes:
+                        os.close(held)
+                    pair = real_pipe()
+                    pipes.append(pair)
+                    return pair
+
+                _spawn.os.pipe = reuse_first_pipe_number
+                try:
+                    result = _spawn.run_sandboxed(
+                        ["/bin/true"],
+                        target={out!r},
+                        output={out!r},
+                        block_network=False,
+                        nproc_limit=0,
+                        limits={{}},
+                        writable_paths=[{out!r}],
+                        readable_paths=None,
+                        allowed_tcp_ports=None,
+                        seccomp_profile="full",
+                        seccomp_block_udp=False,
+                        env=None,
+                        cwd=None,
+                        timeout=10,
+                        capture_output=True,
+                        text=True,
+                    )
+                    payload = {{
+                        "status": "returned",
+                        "returncode": result.returncode,
+                        "reused": bool(pipes and held in pipes[0]),
+                    }}
+                except BaseException as exc:
+                    payload = {{
+                        "status": "raised",
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                        "reused": bool(pipes and held in pipes[0]),
+                    }}
+                finally:
+                    _spawn.os.pipe = real_pipe
+                print("RESULT=" + json.dumps(payload, sort_keys=True))
+            """)
+            result = subprocess.run(
+                ["/usr/bin/python3", "-c", driver],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                start_new_session=True,
+                cwd=_WT,
+            )
+
+        result_lines = [
+            line for line in result.stdout.splitlines()
+            if line.startswith("RESULT=")
+        ]
+        self.assertEqual(result.returncode, 0, result.stderr[-500:])
+        self.assertEqual(
+            len(result_lines),
+            1,
+            "the fork child escaped back into the caller after fd reuse: "
+            f"{result_lines!r}",
+        )
+        payload = json.loads(result_lines[0].removeprefix("RESULT="))
+        self.assertTrue(payload["reused"], payload)
+        self.assertEqual(payload["status"], "returned", payload)
+        self.assertEqual(payload["returncode"], 0, payload)
 
 
 class TestPinnedHelperResolution(unittest.TestCase):
@@ -264,6 +373,8 @@ class TestTimeoutZeroMeansImmediateDeadline(unittest.TestCase):
         self.assertLess(time.monotonic() - start, 5.0,
                         "timeout=0 must not wait out the child")
 
+    # Exercises mount-delivered capability; hosts with userns but no mount capability degrade by design -> named SKIP, not a mid-flight mount failure.
+    @requires_mount
     def test_timeout_none_stays_unbounded(self):
         from core.sandbox._spawn import run_sandboxed
         out = tempfile.mkdtemp(prefix="raptor-tnone-")

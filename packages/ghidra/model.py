@@ -94,6 +94,23 @@ def normalise_name_provenance(value: object) -> str:
     return ""
 
 
+def _normalise_fid(value: object) -> Optional[str]:
+    """Coerce a serialised fid through the single strict parser.
+
+    Lazy import keeps this module importable stdlib-only (parsers
+    and tests construct records directly); a fid field in an
+    on-disk cache is only as trustworthy as its shape — junk
+    collapses to ``None`` (absent), never rides into consumers.
+    """
+    if value is None:
+        return None
+    try:
+        from core.binary.addrmap import normalise_fid
+    except ImportError:  # pragma: no cover - core tree absent
+        return None
+    return normalise_fid(value)
+
+
 def _rebase_item_address(item: Dict[str, Any], delta: int) -> Dict[str, Any]:
     """Copy of *item* with its ``address`` shifted by *delta*.
 
@@ -124,6 +141,11 @@ class REFunction:
     #: Where the NAME came from — one of KNOWN_NAME_PROVENANCES, or
     #: "" when the importing seam could not tell (treat as lowest).
     name_provenance: str = ""
+    #: Normalized function identity (``core.binary.addrmap``):
+    #: ``<content-anchor>:<rel-vaddr>``. ``None`` when the producer
+    #: recorded no image base (objdump fallback) — consumers fall
+    #: back to name matching; a guessed identity is never minted.
+    fid: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
@@ -146,6 +168,8 @@ class REFunction:
             d["decompilation"] = self.decompilation
         if self.name_provenance:
             d["name_provenance"] = self.name_provenance
+        if self.fid:
+            d["fid"] = self.fid
         return d
 
     @classmethod
@@ -170,6 +194,7 @@ class REFunction:
             name_provenance=normalise_name_provenance(
                 d.get("name_provenance", ""),
             ),
+            fid=_normalise_fid(d.get("fid")),
         )
 
 
@@ -348,7 +373,7 @@ class REDatabase:
         O(xrefs x functions) PER RENDERED FINDING on the prompt
         assembly hot path — a cost a large real binary pays in
         minutes and an attacker-authored cache maximizes for free
-        within the 64MiB read ceiling.
+        within the shared RE-database read ceiling.
         """
         cached = getattr(self, "_addr_index_cache", None)
         if cached is not None and cached[0] == len(self.functions):
@@ -491,6 +516,12 @@ class REDatabase:
                     decompilation=f.decompilation,
                     source_tool=f.source_tool,
                     name_provenance=f.name_provenance,
+                    # fid is base-RELATIVE module identity: rebasing
+                    # the absolute address into our space does not
+                    # change it — dropping it here would strip
+                    # identity from exactly the records the merge
+                    # exists to join.
+                    fid=f.fid,
                 )
                 for f in other.functions
             ]
@@ -606,7 +637,16 @@ class REDatabase:
             )
         return cls(
             source_tool=str(d.get("source_tool", "")),
-            binary_path=d.get("binary_path"),
+            # Type-gated like the other planted-cache fields (junk
+            # collapses to absent, never rides into consumers): a
+            # wrong-typed binary_path in an on-disk cache otherwise
+            # surfaces as TypeError at every Path(db.binary_path)
+            # consumer. Not str-coerced — str(12345) would mint a
+            # fake path spelling where None (identity unknown) is
+            # the truthful value.
+            binary_path=(d.get("binary_path")
+                         if isinstance(d.get("binary_path"), str)
+                         else None),
             architecture=str(d.get("architecture", "")),
             functions=[REFunction.from_dict(f) for f in d.get("functions", [])],
             xrefs=[REXref.from_dict(x) for x in d.get("xrefs", [])],

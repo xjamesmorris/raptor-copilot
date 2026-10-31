@@ -54,9 +54,18 @@ _TEMPLATE_ENTRY_RE = re.compile(
 )
 
 # Access site: the slot compared as an ANY container. ``a->d.fld`` /
-# ``a.d.fld`` / ``a->fld`` first-argument spellings.
+# ``a.d.fld`` / ``a->fld`` first-argument spellings.  The member
+# chain is bounded ({1,32}, the member-access chain bound the
+# condition scanners use): unbounded, a planted first argument of
+# dotted links with the closing ``,``/``)`` withheld makes the
+# chain/field split ambiguity re-scan the run per split — quadratic
+# on hostile source (measured exp 2.00; bounded, exp 1.0).  Both
+# directions: raising the bound re-opens the split cost; lowering
+# it drops real access sites (32 links is far past any real
+# ``a->d.fld`` spelling).
 _ANY_ACCESS_RE = re.compile(
-    r"\bASN1_TYPE_cmp\s*\(\s*(?:\w+\s*(?:->|\.)\s*)+(?P<field>[\w.]+?)\s*[,)]",
+    r"\bASN1_TYPE_cmp\s*\(\s*(?:\w+\s*(?:->|\.)\s*){1,32}"
+    r"(?P<field>[\w.]+?)\s*[,)]",
 )
 
 
@@ -101,6 +110,15 @@ def _template_types(source: str) -> dict[str, tuple[str, str]]:
 
 def scan_source(file_path: str, source: str) -> list[Asn1Mismatch]:
     """Scan one C translation unit for template/access mismatches."""
+    if "ASN1_TYPE_cmp" not in source:
+        return []
+    # Comments/string literals are blanked (offsets preserved) before
+    # matching: a commented-out template entry or access site must
+    # not mint a detection-grade lead (boost-only, but leads steer
+    # review attention).
+    from .source_view import sanitized_view
+
+    source = sanitized_view(source, file_path)
     if "ASN1_TYPE_cmp" not in source:
         return []
     templates = _template_types(source)

@@ -82,16 +82,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from core.paths import confine
+from core.source import read_text_capped
+
 # Scan bounds shared with the api_boundary enumeration machinery so
 # the two TU-completeness arguments stay aligned.
 from .api_boundary import (
     _MAX_FILE_BYTES,
     _MAX_SCAN_FILES,
     _MAX_WINDOW_LINE_CHARS,
+    _walk_tree_entries,
     _SOURCE_SUFFIXES,
     _balanced_span,
     _scan_file_for_calls,
 )
+from core.source.lines import split_lines
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +154,17 @@ _SCOPED_RELEASE_RE = re.compile(
 #: never serve as an unconditional caller-held acquire.
 _CONDITIONAL_ACQUIRE_RE = re.compile(
     r"(?:_interruptible|_killable|_?trylock|try_lock)\b",
+)
+
+#: ``static`` at a statement start (line start or after ``;``/``{``/
+#: ``}``) — local static state in the callee body.  The gap after the
+#: statement boundary is HORIZONTAL-only ([^\S\n]): with a ``\s*``
+#: gap the MULTILINE ``^`` branch re-scans a run of blank lines from
+#: every line start inside it — quadratic on attacker-shaped function
+#: source.  A ``static`` on a later line is still matched by the
+#: ``^`` branch anchoring its own line.
+_LOCAL_STATIC_RE = re.compile(
+    r"(?:^|[;{}])[^\S\n]*static\b", re.MULTILINE,
 )
 
 #: C keywords that look call-shaped to _CALL_IDENT_RE.
@@ -309,13 +325,18 @@ def _scan_tree_for_visibility(
 
     name_re = re.compile(rf"(?<![\w.>]){re.escape(function_name)}\b")
     basename = Path(rel_file).name
+    # Directive body and quoted-path spans are bounded: unbounded,
+    # a file that repeats the directive head inside the span
+    # re-scans the remainder from every occurrence — quadratic in
+    # hostile source length. Real include/define lines sit far
+    # inside 1000 chars; beyond that the line stops matching.
     include_re = re.compile(
-        rf"#\s*(?:include|define)\b[^\n]*[\"<][^\">]*?"
+        rf"#\s*(?:include|define)\b[^\n]{{0,1000}}[\"<][^\">]{{0,1000}}?"
         rf"{re.escape(basename)}\s*[\">]",
         re.IGNORECASE,
     )
     scanned = 0
-    for path in sorted(target_path.rglob("*")):
+    for path in _walk_tree_entries(target_path):
         if scanned >= _MAX_SCAN_FILES:
             return f"tree scan hit its {_MAX_SCAN_FILES}-file cap"
         if ".git" in path.parts:
@@ -340,12 +361,21 @@ def _scan_tree_for_visibility(
         except ValueError:
             continue
         is_source = path.suffix.lower() in _SOURCE_SUFFIXES
-        try:
-            if path.stat().st_size > _MAX_FILE_BYTES:
-                return f"{rel} exceeds the byte cap — unscannable"
-            text = path.read_text(errors="replace")
-        except OSError:
+        # Capped fd read, not stat-then-read: target-writable files
+        # race a by-name size gate, and a FIFO plant blocks a raw
+        # read forever. Refuse-on-oversize semantics preserved via
+        # the truncation flag. Confine-resolve first: an in-tree
+        # symlinked source stays readable (visibility intact), an
+        # escaping link reads as unverifiable.
+        resolved = confine(target_path, path)
+        if resolved is None:
             return f"{rel} unreadable — visibility unverifiable"
+        got = read_text_capped(resolved, _MAX_FILE_BYTES)
+        if got is None:
+            return f"{rel} unreadable — visibility unverifiable"
+        text, truncated = got
+        if truncated:
+            return f"{rel} exceeds the byte cap — unscannable"
         if is_source and include_re.search(text):
             # Matches the basename in an #include operand OR in a
             # #define'd quoted path (the computed-include shape
@@ -391,7 +421,10 @@ def _line_depths_before(lines: list[str]) -> list[int]:
 def _caller_name_from_head(head_line: str) -> str | None:
     """Function name from a definition's first line (the last
     identifier directly followed by ``(``), or None."""
-    matches = list(re.finditer(r"([A-Za-z_]\w*)\s*\(", head_line))
+    # \b pins each attempt to an identifier start: unanchored, every
+    # suffix of a long identifier is retried — quadratic on a hostile
+    # head line. Mid-word starts were never real function names.
+    matches = list(re.finditer(r"\b([A-Za-z_]\w*)\s*\(", head_line))
     if not matches:
         return None
     return matches[-1].group(1)
@@ -538,10 +571,10 @@ def _tu_function_bodies(
         cur_path, depth = frontier.pop(0)
         if depth >= _TU_INCLUDE_DEPTH:
             continue
-        try:
-            cur_raw = cur_path.read_text(errors="replace")
-        except OSError:
+        got_cur = read_text_capped(cur_path, _MAX_FILE_BYTES)
+        if got_cur is None:
             continue
+        cur_raw = got_cur[0]
         for ln in cur_raw.splitlines():
             m = _QUOTED_INCLUDE_RE.match(ln)
             if m is None:
@@ -552,11 +585,12 @@ def _tu_function_bodies(
                 hdr = (cur_path.parent / m.group(1)).resolve()
                 if not hdr.is_relative_to(root_resolved):
                     continue  # escapes the tree — not TU material
-                if hdr in seen_files or not hdr.is_file():
+                if hdr in seen_files:
                     continue
-                if hdr.stat().st_size > _MAX_FILE_BYTES:
+                got_hdr = read_text_capped(hdr, _MAX_FILE_BYTES)
+                if got_hdr is None or got_hdr[1]:
                     continue
-                text = hdr.read_text(errors="replace")
+                text = got_hdr[0]
             except (OSError, ValueError):
                 continue
             seen_files.add(hdr)
@@ -656,7 +690,11 @@ def _locks_held_at_call(
         if _has_goto_label(between):
             continue  # a goto could enter after the acquire
         b = re.escape(base)
-        decl_re = re.compile(rf"\bstruct\b[^;]*\b{b}\s*[;=]")
+        # The declarator span is bounded: unbounded, a line that
+        # repeats `struct` inside it re-scans the remainder from
+        # every occurrence — quadratic on a hostile line. A real
+        # declaration head fits far inside 1000 chars.
+        decl_re = re.compile(rf"\bstruct\b[^;]{{0,1000}}\b{b}\s*[;=]")
         rebound = any(decl_re.search(ln) for ln in between)
         if not rebound:
             for pat in prefix_pats:
@@ -823,19 +861,23 @@ def check_caller_lock_serialization(
     if any(kw in func_source for kw in ("def ", "import os", "class ")):
         return _refuse("Python source, not applicable")
 
-    try:
-        root = Path(target_path)
-        def_path = root / rel_file
-        if not def_path.is_file():
-            return _refuse(f"defining file {rel_file} not found")
-        if def_path.stat().st_size > _MAX_FILE_BYTES:
-            return _refuse(f"defining file {rel_file} exceeds the byte cap")
-        def_text = def_path.read_text(errors="replace")
-    except OSError:
+    # ``rel_file`` arrives from finding records (LLM-writable): the
+    # join is containment-checked (an absolute path replaces the
+    # base under pathlib semantics, ../ escapes it), and the read is
+    # the capped fd-checked one.
+    root = Path(target_path)
+    def_path = confine(root, rel_file)
+    if def_path is None or not def_path.is_file():
+        return _refuse(f"defining file {rel_file} not found")
+    got_def = read_text_capped(def_path, _MAX_FILE_BYTES)
+    if got_def is None:
         return _refuse(f"defining file {rel_file} unreadable")
+    def_text, def_truncated = got_def
+    if def_truncated:
+        return _refuse(f"defining file {rel_file} exceeds the byte cap")
 
     view = sanitized_view(def_text, str(def_path))
-    view_lines = view.splitlines()
+    view_lines = split_lines(view)
     name_re = re.compile(rf"(?<![\w.>]){re.escape(function_name)}\b")
 
     if _DIGRAPH_RE.search(view):
@@ -862,7 +904,7 @@ def check_caller_lock_serialization(
             f"be attributed"
         )
     pp_lines = _preprocessor_lines(view_lines)
-    raw_lines = def_text.splitlines()
+    raw_lines = split_lines(def_text)
     for i, raw in enumerate(raw_lines):
         if i not in pp_lines and raw.rstrip().endswith("\\"):
             return _refuse(
@@ -911,6 +953,12 @@ def check_caller_lock_serialization(
         return _refuse(f"defining file {rel_file} exceeds the byte cap")
     if freport.get("site_capped"):
         return _refuse("call-site enumeration capped — incomplete")
+    if freport.get("span_capped"):
+        return _refuse(
+            f"call-shaped match of {function_name} with an argument "
+            f"list unbalanced within the span bound in {rel_file} — "
+            f"the caller set is not verifiably TU-complete"
+        )
     if freport.get("alias_attr"):
         return _refuse(
             f'alias("{function_name}") attribute — an indirect entry '
@@ -1006,9 +1054,8 @@ def check_caller_lock_serialization(
     # is shared across ALL lock objects — out of the witness's scope.
     # Matched at every statement start, not just line starts.
     body_start = func_source.find("{")
-    if body_start >= 0 and re.search(
-        r"(?:^|[;{}])\s*static\b", func_source[body_start:],
-        re.MULTILINE,
+    if body_start >= 0 and _LOCAL_STATIC_RE.search(
+        func_source[body_start:],
     ):
         return _refuse(
             f"{function_name} declares local static state — a "

@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import threading
+import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
@@ -24,6 +25,19 @@ logger = logging.getLogger(__name__)
 
 _C_EXTENSIONS = frozenset({".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh"})
 _JOERN_STALL_FLOOR_S = 30
+# Forwarder orphan-idle horizon for the DIRECT-START (run-private)
+# server below: no lifecycle state file records it, so once this
+# process is gone no later run can ever re-acquire it — an orphaned
+# pair is pure multi-GB squatting from the first idle second. The
+# horizon still is not zero: parent death is observable mid-run (a
+# segment drain re-execs the orchestrator; an operator attaches a
+# debugger to a wedged run and the original parent exits) and a
+# too-short value (<~5 min) would reap a server a still-running
+# analysis is about to query again. Longer buys nothing — nobody can
+# reconnect after the run's process tree is gone — and re-creates the
+# multi-hour JVM squat this value exists to end. 15 min covers the
+# longest observed segment-handoff gaps with margin.
+_RUN_PRIVATE_ORPHAN_TTL_S = 900.0
 
 # Byte budget for .raptor-run.json / pre-sweep status metadata reads.
 _MAX_RUN_META_BYTES = 1024 * 1024
@@ -44,6 +58,12 @@ _MAX_JOERN_FLOWS_BYTES = 256 * 1024 * 1024
 # parser gem (empty CPG, exit 0) and php2cpg needs a php interpreter
 # on PATH — both probed and rejected; see lang_config's profile note.
 _UNPROFILED_EXTENSIONS = frozenset({".rb", ".php", ".scala"})
+
+# Reserved key in the taint-summary results dict: the builder's
+# in-band truncation marker. ``enrich_summaries_from_joern`` must
+# never write a method summary under this exact name — see the
+# collision guard at its merge loop.
+_TRUNCATION_KEY = "_truncation"
 
 
 def _joern_extensions() -> frozenset[str]:
@@ -98,6 +118,152 @@ def target_has_joern_sources(target_path: Path | None) -> bool:
     return False
 
 
+def scope_complement_exclude_dirs(
+    joern_root: Path,
+    scope: str | list[str] | None,
+    target_path: Path,
+) -> tuple[str, ...]:
+    """Directories under *joern_root* deliberately OUTSIDE the audit
+    scope — the ``--scope`` complement the CPG build excludes.
+
+    Walks the scope entries as a prefix tree: at each level, sibling
+    directories on no scope path are excluded; a level fully covered
+    by a scope entry excludes nothing below it. Coverage is therefore
+    always a SUPERSET of the scope (file-leaf scope entries keep
+    their whole parent directory's files).
+
+    Every anomaly degrades to ``()`` — the full-tree build the audit
+    always did — never to an over-exclusion: an absolute scope
+    outside the target, a ``..`` segment, a whole-tree entry, or a
+    scope inconsistent with the narrowed *joern_root* all mean the
+    complement cannot be derived safely. Scope entries are
+    target-relative (``./`` spellings tolerated, absolute paths
+    rebased under the target, root-alias entries dropped — the same
+    normalisation the gap selector applies), so the graph always
+    covers at least what the gap selector reviews.
+    """
+    if not scope:
+        return ()
+    scopes_raw = [scope] if isinstance(scope, str) else list(scope)
+    if not scopes_raw:
+        return ()
+    try:
+        root = Path(joern_root).resolve()
+        target = Path(target_path).resolve()
+    except OSError:
+        return ()
+    if not root.is_dir():
+        return ()
+    try:
+        root_rel_parts = root.relative_to(target).parts
+    except ValueError:
+        return ()
+
+    norm: list[tuple[str, ...]] = []
+    target_str = str(target).rstrip("/")
+    for raw in scopes_raw:
+        entry = str(raw)
+        while entry.startswith("./"):
+            entry = entry[2:]
+        if entry.startswith("/"):
+            stripped = entry.rstrip("/")
+            if stripped == target_str:
+                entry = ""
+            elif stripped.startswith(target_str + "/"):
+                entry = stripped[len(target_str) + 1:]
+            else:
+                return ()
+        entry = entry.strip("/")
+        if entry in ("", "."):
+            # Whole-tree scope: there is no complement.
+            return ()
+        if target_str == entry or target_str.endswith("/" + entry):
+            # Root-alias entry ("webapp" for a target at .../webapp):
+            # the gap selector DROPS these — its gaps then span the
+            # whole tree — so the complement must not read the alias
+            # as a subdirectory name and exclude every sibling.
+            # Dropping only the alias keeps parity on mixed lists.
+            continue
+        parts = Path(entry).parts
+        if ".." in parts:
+            return ()
+        if root_rel_parts:
+            # joern_root was narrowed to the scopes' common prefix —
+            # re-anchor the entry below it.
+            if parts[: len(root_rel_parts)] != root_rel_parts:
+                return ()
+            parts = parts[len(root_rel_parts):]
+            if not parts:
+                # The scope IS the narrowed root: full subtree.
+                return ()
+        norm.append(parts)
+
+    if not norm:
+        # Every entry was a root alias — the gap selector reviews
+        # the whole tree, so the graph must cover it too.
+        return ()
+
+    # Terminal marker: a scope entry ENDS at the node carrying this
+    # key. Emptiness cannot express terminality — with nested entries
+    # (--scope fs --scope fs/ext4) the outer entry's node is non-empty,
+    # and treating only-empty as terminal over-excluded fs/* siblings
+    # the selector reviews (wrong-direction, against the degrade-to-()
+    # contract). Path.parts segments are never "", so the key cannot
+    # collide with a real directory name.
+    _SCOPE_END = ""
+
+    tree: dict[str, dict] = {}
+    for parts in norm:
+        node = tree
+        for seg in parts:
+            node = node.setdefault(seg, {})
+        node[_SCOPE_END] = {}
+
+    excludes: list[str] = []
+
+    def _walk(dir_path: Path, node: dict[str, dict]) -> None:
+        if not node or _SCOPE_END in node:
+            # A scope entry ends here — everything below is in scope
+            # (also when DEEPER entries nest under it: scope "fs"
+            # admits all of fs/*, so fs/ext4 adds nothing to exclude).
+            return
+        try:
+            children = list(dir_path.iterdir())
+        except OSError:
+            return
+        for child in children:
+            try:
+                if not child.is_dir() or child.is_symlink():
+                    continue
+            except OSError:
+                continue
+            # Dot-dirs are already excluded by the shared
+            # directory-name rule on both the key and the build; the
+            # complement stays self-contained without them.
+            if child.name.startswith("."):
+                continue
+            if child.name in node:
+                _walk(child, node[child.name])
+            elif any(
+                seg and _SCOPE_END in sub
+                and child.name.startswith(seg + ".")
+                for seg, sub in node.items()
+            ):
+                # Mirror the gap selector's `sc + "."` arm
+                # (core/audit/gaps.py _in_scope): scope "ipc" reviews
+                # files under a sibling dir ipc.d/ too, so the graph
+                # must keep that whole subtree. The arm applies only
+                # where a scope entry ENDS (terminal node) — for a
+                # deeper scope like fs/ext4/jbd the selector never
+                # matches fs/ext4.old/, and neither do we.
+                continue
+            else:
+                excludes.append(str(child))
+
+    _walk(root, tree)
+    return tuple(sorted(excludes))
+
+
 def joern_available(overrides: dict[str, Any] | None = None) -> bool:
     """Check if Joern is installed, importable, and enabled in tuning."""
     if overrides and overrides.get("enabled") is False:
@@ -131,12 +297,19 @@ def joern_tunables(overrides: dict[str, Any] | None = None):
 
 
 def start_joern_server(target_path, joern_overrides=None, tunables=None,
-                       out_dir=None, exclude_dirs: tuple[str, ...] = ()):
+                       out_dir=None, exclude_dirs: tuple[str, ...] = (),
+                       scope_exclude_dirs: tuple[str, ...] = (),
+                       timings_out: dict[str, float] | None = None):
     """Start or reuse a persistent Joern server if Joern is available.
 
     Returns the server instance or None.  When reusing a lifecycle-managed
     server, builds/imports the CPG for *target_path* so queries run
     against the correct codebase.
+
+    ``timings_out``: optional dict receiving ``cpg_build_s`` — the
+    wall time of the CPG build/import step (near-zero on a warm cache
+    or an already-loaded server, the dominant startup cost when cold),
+    so run diagnostics can tell cold from warm starts.
 
     After the CPG loads, tool-corroborated project sanitisers from the
     IRIS store are installed as flow-semantics kill rows so taint
@@ -153,6 +326,11 @@ def start_joern_server(target_path, joern_overrides=None, tunables=None,
     also pins the IRIS store lookup, and the exclusion channel must not
     change store-resolution semantics for callers that only want the
     key stabilised.
+
+    ``scope_exclude_dirs``: the run's ``--scope`` complement
+    (:func:`scope_complement_exclude_dirs`) — semantic coverage
+    exclusions that also key the CPG cache slot, unlike the
+    freshness-neutral ``exclude_dirs``.
     """
     if not joern_available(overrides=joern_overrides):
         return None
@@ -175,21 +353,43 @@ def start_joern_server(target_path, joern_overrides=None, tunables=None,
         except ImportError:
             return None
         try:
-            srv = JoernServer.from_tunables(tunables)
+            # Run-private server: lifecycle acquire failed, so this
+            # server is never state-file-recorded — pass the short
+            # orphan horizon (see _RUN_PRIVATE_ORPHAN_TTL_S).
+            srv = JoernServer.from_tunables(
+                tunables, orphan_idle_ttl_s=_RUN_PRIVATE_ORPHAN_TTL_S,
+            )
             srv.start()
         except Exception:
             logger.debug("Joern server failed to start; using subprocess fallback",
                          exc_info=True)
             return None
 
-    if not _ensure_cpg_loaded(srv, target_path, tunables,
-                              exclude_dirs=exclude_dirs):
+    _cpg_start = time.monotonic()
+    _cpg_ok = _ensure_cpg_loaded(srv, target_path, tunables,
+                                 exclude_dirs=exclude_dirs,
+                                 scope_exclude_dirs=scope_exclude_dirs,
+                                 out_dir=out_dir)
+    if timings_out is not None:
+        timings_out["cpg_build_s"] = time.monotonic() - _cpg_start
+    if not _cpg_ok:
         logger.warning("Joern CPG failed to load for %s — disabling Joern", target_path)
         try:
             srv.stop()
         except Exception:
             logger.debug("joern server stop failed", exc_info=True)
         return None
+    try:
+        # Fresh coverage memo for the graph just loaded — entries from
+        # a previously loaded CPG describe a different graph. Stamped
+        # with the server's load epoch so a mid-run restart's CPG
+        # re-import (which never passes through here) also invalidates
+        # it — see joern_function_in_cpg.
+        setattr(srv, _FN_COVERAGE_CACHE_ATTR, {})
+        setattr(srv, _FN_COVERAGE_EPOCH_ATTR,
+                getattr(srv, "cpg_load_epoch", None))
+    except AttributeError:
+        logger.debug("joern server rejects coverage cache attribute")
     install_flow_semantics(srv, target_path, out_dir=out_dir)
     return srv
 
@@ -236,13 +436,108 @@ def install_flow_semantics(srv, target_path, out_dir=None) -> int:
     return installed
 
 
+# Scope-size threshold (estimated SLOC) arming the retry-at-derived-
+# max path. Below it a failed CPG build is rarely resource-shaped
+# (parse errors, missing frontend helpers) and a retry only doubles
+# the wall spent on a hopeless build; above it, resource kills
+# (heap / timeout) are the observed failure mode and ONE bounded
+# retry at the derivation's maxima rescues the channel for the run.
+_CPG_RETRY_MIN_SLOC = 500_000
+
+#: Run-dir artifact recording the audit CPG build outcome when it
+#: failed (channel lost) or was rescued by the derived-max retry.
+#: Read by the report summary so the channel loss is named in the
+#: run REPORT, not just a mid-run log line.
+JOERN_CPG_STATUS_FILENAME = "joern-cpg-status.json"
+
+
+def _write_cpg_build_status(out_dir, status: dict) -> None:
+    """Persist the CPG build outcome record. Best-effort."""
+    if not out_dir:
+        return
+    try:
+        from datetime import datetime, timezone
+
+        from core.json import save_json
+        record = dict(status)
+        record["ts"] = datetime.now(timezone.utc).isoformat()
+        save_json(Path(out_dir) / JOERN_CPG_STATUS_FILENAME, record)
+    except Exception:  # noqa: BLE001 — bookkeeping must not cost the run
+        logger.debug("CPG build status write failed", exc_info=True)
+
+
+def load_cpg_build_status(out_dir) -> dict | None:
+    """Read the CPG build outcome record, or None when absent."""
+    if not out_dir:
+        return None
+    path = Path(out_dir) / JOERN_CPG_STATUS_FILENAME
+    if not path.is_file():
+        return None
+    data = load_json(path, max_bytes=_MAX_RUN_META_BYTES)
+    return data if isinstance(data, dict) else None
+
+
+def _derived_max_retry_limits(
+    target_path,
+    exclude_dirs: tuple[str, ...],
+    first_heap_mb: int | None,
+    first_heap_is_derived: bool,
+    first_timeout_s: int,
+) -> tuple[int | None, int, int] | None:
+    """(heap_mb, timeout_s, estimated_sloc) for a derived-max retry.
+
+    None when the retry is not armed: scope below the size threshold,
+    the estimate unavailable, or the first attempt already ran at the
+    derivation's maxima (retrying with identical limits is pure wall
+    loss). The retry heap honors the same ceiling every derivation
+    does (:func:`core.tuning.derived_max_joern_heap_mb`) — and it
+    honors explicitness BOTH directions: only a DERIVED (or absent)
+    first heap is raised; an explicit operator heap is an assertion
+    and keeps its value exactly (the retry may then only extend the
+    timeout).
+    """
+    try:
+        from core.tuning import (
+            derive_joern_cpg_timeout_s,
+            derived_max_joern_heap_mb,
+        )
+        from packages.joern.runner import estimate_in_scope_sloc
+        sloc = estimate_in_scope_sloc(
+            Path(target_path), exclude_dirs=exclude_dirs,
+        )
+    except Exception:  # noqa: BLE001 — retry arming must not cost the run
+        logger.debug("derived-max retry arming failed", exc_info=True)
+        return None
+    if sloc < _CPG_RETRY_MIN_SLOC:
+        return None
+    if first_heap_mb is None or first_heap_is_derived:
+        heap: int | None = max(first_heap_mb or 0,
+                               derived_max_joern_heap_mb())
+    else:
+        heap = first_heap_mb
+    timeout = max(first_timeout_s, derive_joern_cpg_timeout_s(sloc))
+    if heap == first_heap_mb and timeout <= first_timeout_s:
+        return None
+    return heap, timeout, sloc
+
+
 def _ensure_cpg_loaded(srv, target_path, tunables=None,
-                       exclude_dirs: tuple[str, ...] = ()) -> bool | None:
+                       exclude_dirs: tuple[str, ...] = (),
+                       scope_exclude_dirs: tuple[str, ...] = (),
+                       out_dir=None) -> bool | None:
     """Build and import the CPG for *target_path* into *srv*.
 
     Returns True if the CPG was loaded (or already was), False on failure.
     ``exclude_dirs`` joins the CPG build's content key and ``--exclude``
-    set (key/analysis parity).
+    set (key/analysis parity). ``scope_exclude_dirs`` (the scope
+    complement) additionally keys the cache slot — see
+    :func:`packages.joern.runner.build_cpg_cached`.
+
+    Proportionate failure: a failed build on a scope above
+    :data:`_CPG_RETRY_MIN_SLOC` is retried ONCE at derived-max limits
+    (heap at the tuning ceiling, timeout from the SLOC curve). The
+    outcome — channel lost, or rescued by the retry — is persisted to
+    :data:`JOERN_CPG_STATUS_FILENAME` for the run report.
     """
     if getattr(srv, "_cpg_loaded", False):
         return True
@@ -252,38 +547,302 @@ def _ensure_cpg_loaded(srv, target_path, tunables=None,
         logger.debug("joern runner not importable; skipping CPG import")
         return False
 
-    from packages.joern.tunables import JoernTunables
-
     # Fallbacks defer to the canonical tunables defaults — a local
     # literal here silently drifts from the policy import_cpg and
     # from_tuning own (a 120s local import fallback once killed the
     # whole Joern tier for runs without resolved tunables).
-    cpg_timeout = (
-        getattr(tunables, "cpg_timeout_s", JoernTunables.cpg_timeout_s)
-        if tunables else JoernTunables.cpg_timeout_s
+    # resolve_cpg_timeout_s refines a derived ("auto") timeout from
+    # the scope's source-size estimate; non-auto tunables pass
+    # through unchanged.
+    from packages.joern.tunables import (
+        resolve_cpg_timeout_s,
+        resolve_import_timeout_s,
     )
-    import_timeout = (
-        getattr(tunables, "import_timeout_s", None) if tunables else None
+    combined_excludes = tuple(exclude_dirs) + tuple(scope_exclude_dirs)
+    cpg_timeout = resolve_cpg_timeout_s(
+        tunables, target_path, exclude_dirs=combined_excludes,
     )
+    # The parse frontend heap follows the tunables like the query
+    # server's: a retry at derived-max heap is meaningless if the
+    # first attempt never carried a heap at all.
+    heap_mb = getattr(tunables, "heap_mb", None) if tunables else None
+    heap_is_derived = bool(
+        getattr(tunables, "heap_is_derived", False)) if tunables else False
 
     cache_dir = Path.home() / ".cache" / "raptor" / "joern-cpg"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
+    retried = False
+    retry_heap: int | None = None
+    retry_timeout: int | None = None
+    est_sloc: int | None = None
+
+    # Bound before _status's first call site (the build-phase failure
+    # records) — the closure reads them for the record's import-retry
+    # fields.
+    import_retried = False
+    import_retry_timeout_s: int | None = None
+    # Failure honesty (ADDITIVE record fields — readers tolerate their
+    # absence and must tolerate their presence): a failed record
+    # without a machine-readable WHY left the run report unable to
+    # name which ceiling bound or what operation died.
+    reason: str | None = None
+    cpg_bytes: int | None = None
+    import_timeout: int | None = None
+
+    def _status(*, failed: bool, phase: str) -> dict:
+        return {
+            "target": str(target_path),
+            "failed": failed,
+            "phase": phase,
+            "retried": retried,
+            "first_heap_mb": heap_mb,
+            "first_timeout_s": cpg_timeout,
+            "retry_heap_mb": retry_heap,
+            "retry_timeout_s": retry_timeout,
+            "import_retried": import_retried,
+            "import_retry_timeout_s": import_retry_timeout_s,
+            "estimated_sloc": est_sloc,
+            "scope_excluded_dirs": len(scope_exclude_dirs),
+            "reason": reason,
+            "cpg_bytes": cpg_bytes,
+            "import_timeout_s": import_timeout,
+        }
+
     try:
         cpg = build_cpg_cached(Path(target_path), cache_dir,
                                timeout=cpg_timeout,
-                               exclude_dirs=exclude_dirs)
-        if cpg.exists():
-            srv.import_cpg(cpg.path, timeout=import_timeout)
-            return True
-        return False
+                               heap_mb=heap_mb,
+                               heap_is_derived=heap_is_derived,
+                               exclude_dirs=exclude_dirs,
+                               scope_exclude_dirs=scope_exclude_dirs)
+        if not cpg.exists() or getattr(cpg, "build_failed", False):
+            retry = _derived_max_retry_limits(
+                target_path, combined_excludes,
+                heap_mb, heap_is_derived, cpg_timeout,
+            )
+            if retry is not None:
+                retry_heap, retry_timeout, est_sloc = retry
+                logger.warning(
+                    "Joern CPG build for %s failed (heap=%s MB, "
+                    "timeout=%ds) — retrying once at derived-max "
+                    "limits: heap=%s MB, timeout=%ds (worst-case "
+                    "wall across both attempts %ds)",
+                    target_path, heap_mb if heap_mb else "default",
+                    cpg_timeout, retry_heap, retry_timeout,
+                    cpg_timeout + retry_timeout,
+                )
+                retried = True
+                cpg = build_cpg_cached(
+                    Path(target_path), cache_dir,
+                    timeout=retry_timeout,
+                    heap_mb=retry_heap,
+                    # The retry heap is itself derivation-sourced
+                    # unless the first attempt carried an explicit
+                    # operator heap (which the retry keeps verbatim).
+                    heap_is_derived=heap_mb is None or heap_is_derived,
+                    exclude_dirs=exclude_dirs,
+                    scope_exclude_dirs=scope_exclude_dirs,
+                )
+        ok = cpg.exists() and not getattr(cpg, "build_failed", False)
     except Exception:
-        logger.debug("CPG build/import failed for %s", target_path, exc_info=True)
+        logger.debug("CPG build failed for %s", target_path, exc_info=True)
+        # An exception is a channel loss like any failed build — it
+        # must reach the run report, not just this debug line.
+        reason = "build_error"
+        _write_cpg_build_status(out_dir, _status(
+            failed=True, phase="build"))
         return False
+    if not ok:
+        reason = "build_failed"
+        _write_cpg_build_status(out_dir, _status(
+            failed=True, phase="build"))
+        return False
+    # The serialized CPG size is the honest scale signal for the
+    # import budget: the import wall is CLIENT-SIDE deserialise work
+    # (a kernel-scale import expired its fixed window while the server
+    # sat idle far below its heap), so the budget scales with the
+    # bytes the client must walk — never with server resources. A
+    # stat failure degrades to the unresolved base, never to an error.
+    try:
+        cpg_bytes = cpg.path.stat().st_size
+    except OSError:
+        cpg_bytes = None
+    import_timeout = resolve_import_timeout_s(tunables, cpg_bytes)
+
+    def _try_import(timeout) -> bool:
+        # import_cpg reports failure BOTH ways: False for handled
+        # failures (server died mid-import — "remote end closed" —
+        # malformed response, binding check) and raise for transport
+        # errors. Ignoring the boolean minted a CPG-less server that
+        # read as loaded: Joern stayed enabled, every pre-sweep query
+        # returned "no CPG loaded" unrecoverably (restart() has no
+        # successful _cpg_path to re-import), and the status record
+        # claimed a channel the run never had.
+        try:
+            return bool(srv.import_cpg(cpg.path, timeout=timeout))
+        except Exception:
+            logger.debug(
+                "CPG import failed for %s", target_path, exc_info=True)
+            return False
+
+    def _import_failure_class() -> str:
+        """Classify the last import failure from the server's own
+        per-thread post classification (empty for handled non-transport
+        failures such as a malformed response or a failed binding
+        check, and for injected test doubles without the attribute)."""
+        detail = str(getattr(srv, "_last_post_error", "") or "").lower()
+        if "timed out" in detail:
+            return "import_timeout"
+        if "connect" in detail or "refused" in detail:
+            return "import_connection_lost"
+        return "import_failed"
+
+    imported = _try_import(import_timeout)
+    if not imported:
+        failure_class = _import_failure_class()
+        try:
+            from core.tuning import (
+                derive_joern_import_timeout_s,
+                derived_max_joern_import_timeout_s,
+            )
+            import_cap: int | None = derived_max_joern_import_timeout_s()
+            derived_budget = derive_joern_import_timeout_s(cpg_bytes)
+        except Exception:  # noqa: BLE001 — retry sizing must not cost the run
+            logger.debug("import retry sizing failed", exc_info=True)
+            import_cap = None
+            derived_budget = 0
+        if (failure_class == "import_timeout"
+                and import_cap is not None
+                and (import_timeout or 0) >= import_cap):
+            # Scale-aware fail-fast: the first attempt already ran at
+            # the derivation ceiling, so there is no larger budget to
+            # retry with — re-running the SAME wall against a slow
+            # client-side deserialise is guaranteed waste (the first
+            # timeout proved the wall insufficient; nothing about a
+            # restart makes the same wall enough). Record the honest
+            # reason instead of burning a second ceiling-length wall.
+            reason = "import_timeout"
+            logger.warning(
+                "CPG import for %s timed out after %ds (CPG %s bytes) "
+                "with the budget already at/above the derivation "
+                "ceiling (%ds) — no larger retry budget exists, not "
+                "retrying; set joern_import_timeout_s explicitly to "
+                "exceed the ceiling",
+                target_path, import_timeout, cpg_bytes, import_cap,
+            )
+            _write_cpg_build_status(out_dir, _status(
+                failed=True, phase="import"))
+            return False
+        # Channel-keep: a kernel-scale import can kill the server
+        # outright; one explicit retry against a restarted server —
+        # restart() alone cannot help here (no successful _cpg_path
+        # to re-import) so the import is re-issued by hand. The retry
+        # NEVER re-runs the first budget: a timeout-class failure just
+        # proved that wall too small (doubling, with the CPG-size
+        # derivation and the historical 30-min floor as raises, capped
+        # at the derivation ceiling); too small re-buys the same death
+        # on a slow import; unbounded would let one graph eat the
+        # run's wall — the build-side derived-max retry uses the same
+        # one-retry posture.
+        # Distinct name: `retry_timeout` is the BUILD retry's closure
+        # variable — _status() reads it for the record's
+        # retry_timeout_s field, and rebinding it here fabricated the
+        # reported derived-max build timeout.
+        import_retry_timeout_s = max(
+            (import_timeout or 0) * 2, derived_budget, 1800,
+        )
+        if import_cap is not None:
+            import_retry_timeout_s = min(import_retry_timeout_s, import_cap)
+        logger.warning(
+            "CPG import failed for %s (%s) — restarting the server "
+            "and retrying the import once (timeout %ds)",
+            target_path, failure_class, import_retry_timeout_s,
+        )
+        restarted = False
+        try:
+            restart = getattr(srv, "restart", None)
+            restarted = bool(restart()) if callable(restart) else False
+        except Exception:
+            logger.debug("server restart before import retry failed",
+                         exc_info=True)
+        if restarted:
+            import_retried = True
+            imported = _try_import(import_retry_timeout_s)
+    if not imported:
+        # A built-but-unimported graph is still a lost channel: the
+        # record must never claim a rescue the server can't serve —
+        # and it must say WHY (which operation died, classified from
+        # the LAST attempt).
+        reason = _import_failure_class()
+        _write_cpg_build_status(out_dir, _status(
+            failed=True, phase="import"))
+        return False
+    # Success record on EVERY successful import (only AFTER it, and
+    # only on a TRUTHFUL import result: a rescue claim for a graph
+    # that failed to import would report a channel the run never
+    # had). Writing the plain-success case too is what retires a
+    # stale failed=true record from an earlier segment in the same
+    # out dir — otherwise the report claims a channel loss beside
+    # that later segment's real receipts.
+    _write_cpg_build_status(out_dir, _status(
+        failed=False, phase="complete"))
+    return True
 
 
-def stop_joern_server(server) -> None:
-    """Stop the Joern server if it was started."""
+#: Grace budget for stop_joern_server's join on the graceful stop
+#: thread. Not lower: an orderly stop() legitimately takes tens of
+#: seconds (leader SIGTERM, bounded reap wait on a multi-GB JVM,
+#: workspace/socket-dir cleanup), and a shorter budget escalates a
+#: HEALTHY shutdown to a group kill, discarding the cleanup stop()
+#: was about to finish. Not higher: this join sits on the run's own
+#: teardown path (graceful finally, corpus shutdown), so every extra
+#: second is wall time added to every wedged-stop run before the
+#: backstop can fire — and past ~30s a stop that hasn't returned is
+#: wedged (TERM-ignoring JVM, stuck transport), not slow. Tests may
+#: shorten it via monkeypatch; the shipped default stays 30.
+_STOP_JOIN_GRACE_S = 30.0
+
+
+def stop_joern_server(
+    server: Any,
+    *,
+    caller_owns: bool = False,
+    lifecycle_shared: bool = False,
+) -> None:
+    """Stop the Joern server if it was started.
+
+    Runs the orderly ``server.stop()`` on a daemon thread with a
+    bounded join (``_STOP_JOIN_GRACE_S``). On join timeout, a stop
+    that wedged used to be simply abandoned — on non-TERM runs there
+    is no SIGTERM-watchdog or forced-exit hook behind this call, so a
+    TERM-ignoring JVM and its forwarder leaked for the life of the
+    host. Now, when THIS RUN owns the server's forwarder ``Popen``
+    handle, the timeout escalates to the server's own ``stop_fast()``
+    — the per-tier kill rules live there and are never re-implemented
+    here, and its double-fire against a still-running ``stop()`` is
+    benign by contract (no instance state mutated; both entries
+    early-return once ``_proc`` clears; signalling an already-dead
+    corroborated group is a no-op).
+
+    Ownership predicate (mirrors the forced-exit reap hook in the
+    orchestrator): refused classes keep the abandon-with-warning
+    behaviour unchanged —
+
+    * ``caller_owns``: the embedder's server, its lifecycle;
+    * ``lifecycle_shared``: a state-file-shared server another run
+      may still be using;
+    * reuse handles (``_proc is None``, re-checked here
+      independently of the flags): another session's process, never
+      ours to signal.
+
+    Both flags default to False because every in-repo caller reaches
+    this function only for a server THIS run started (the
+    orchestrator's release branches caller-owned and
+    lifecycle-shared handles away before calling; the corpus runner
+    stops the server it itself booted); callers that proxy for
+    another owner must say so explicitly.
+    """
     if server is None:
         return
 
@@ -295,9 +854,34 @@ def stop_joern_server(server) -> None:
 
     t = threading.Thread(target=_do_stop, daemon=True)
     t.start()
-    t.join(timeout=30)
-    if t.is_alive():
-        logger.warning("Joern server stop timed out after 30s — abandoning")
+    t.join(timeout=_STOP_JOIN_GRACE_S)
+    if not t.is_alive():
+        return
+    if (
+        caller_owns
+        or lifecycle_shared
+        or getattr(server, "_proc", None) is None
+    ):
+        # Another owner's process — killing it is cross-run
+        # collateral. Abandon exactly as before.
+        logger.warning(
+            "Joern server stop timed out after %.0fs — abandoning",
+            _STOP_JOIN_GRACE_S,
+        )
+        return
+    tier: str = getattr(server, "_supervision_tier", "group")
+    logger.warning(
+        "Joern server stop timed out after %.0fs — escalating to "
+        "stop_fast on the run-owned forwarder+JVM pair "
+        "(supervision tier=%s)",
+        _STOP_JOIN_GRACE_S, tier,
+    )
+    try:
+        server.stop_fast()
+    except Exception:
+        logger.debug(
+            "Joern stop_fast escalation failed", exc_info=True,
+        )
 
 
 def _flow_sort_key(flow: Any) -> tuple:
@@ -315,6 +899,211 @@ def _flow_sort_key(flow: Any) -> tuple:
         getattr(first, "line", 0) or 0,
         len(steps),
     )
+
+
+#: Attribute holding the per-server function-coverage memo. The
+#: entries describe the graph that was live when they were computed,
+#: so the memo is invalidated on EVERY load path: lane start
+#: (:func:`start_joern_server` installs a fresh dict) AND the mid-run
+#: ``restart()`` re-import, which never passes through lane start —
+#: :func:`joern_function_in_cpg` compares the epoch stamp below
+#: against the server's ``cpg_load_epoch`` and discards a stale memo.
+#: Pre-fix the restart path kept the memo: every probe answered during
+#: a restart window memoised None ("did not look") and the joern
+#: refutation lane stayed silently removed for those functions for the
+#: rest of the run.
+_FN_COVERAGE_CACHE_ATTR = "_raptor_fn_in_cpg_cache"
+#: CPG-load epoch the memo was stamped against (see above).
+_FN_COVERAGE_EPOCH_ATTR = "_raptor_fn_in_cpg_cache_epoch"
+
+
+def joern_name_queryable(function_name: str) -> bool:
+    """Whether *function_name* can be interpolated into a query at all.
+
+    Names outside the substitution allowlist — C++ qualified names and
+    operators, ``$``-prefixed dynamic-language names — are unqueryable
+    by construction: the live query returns empty without dialing the
+    server and the coverage probe cannot answer. That is a
+    definitional skip for the caller, never a channel-health error
+    (no transport round trip ever happened, so booking one as an
+    error farms the health breaker on ordinary C++ inventories).
+    """
+    try:
+        from packages.joern.runner import _validate_substitution_value
+    except ImportError:
+        return False
+    return bool(_validate_substitution_value(function_name))
+
+
+def joern_function_in_cpg(
+    server: Any,
+    function_name: str,
+    timeout: int = 10,
+    *,
+    file_path: str | None = None,
+    errors_out: list | None = None,
+) -> bool | None:
+    """Whether the loaded CPG actually MODELS *function_name*.
+
+    Verdict-bearing callers treat query silence as "looked and found
+    nothing". That is only true when the CPG actually models the
+    function: on a target whose dominant language has no Joern
+    frontend, the graph holds a sliver of the tree, every query is
+    vacuously silent, and silence-as-refutation steers verdicts toward
+    clean at scale. Returns None when the probe itself cannot answer
+    (no query API, transport error, unparseable output) — callers must
+    treat None as "did not look", never as absence.
+
+    ``file_path`` (checklist-relative) binds coverage to the item's
+    OWN file: a same-named definition elsewhere in the tree is not
+    coverage of this item (the same-named-definitions mechanism), so
+    it answers False → the caller skips instead of refuting. CPG
+    filenames are compared exact-or-suffix (``== path`` or
+    ``endsWith("/" + path)``) so relative- and absolute-rooted
+    imports both bind; a layout that matches neither degrades to
+    False — the fail-safe direction (skip, never a refutation).
+
+    ``errors_out``: optional list receiving the probe's transport
+    failure detail when the answer is None — a None is otherwise
+    AMBIGUOUS between "REPL busy, probe timed out" (contention — the
+    caller must not book channel sickness) and "transport broken /
+    echo unparseable" (a genuine channel error).
+    """
+    try:
+        from packages.joern.runner import (
+            _escape_scala_string,
+            _validate_substitution_value,
+        )
+    except ImportError:
+        return None
+    if not _validate_substitution_value(function_name):
+        return None
+    query_fn = getattr(server, "query", None)
+    if query_fn is None:
+        return None
+
+    cache = getattr(server, _FN_COVERAGE_CACHE_ATTR, None)
+    if cache is not None:
+        epoch = getattr(server, "cpg_load_epoch", None)
+        if (epoch is not None
+                and getattr(server, _FN_COVERAGE_EPOCH_ATTR, None) != epoch):
+            # A CPG (re)load happened since the memo was stamped —
+            # every entry (a restart window's poisoned Nones included)
+            # describes a graph that no longer exists. Concurrent
+            # sweep threads may race this swap; both install an empty
+            # dict stamped with the same epoch, so the worst case is a
+            # re-probe, never a stale answer.
+            cache = {}
+            try:
+                setattr(server, _FN_COVERAGE_CACHE_ATTR, cache)
+                setattr(server, _FN_COVERAGE_EPOCH_ATTR, epoch)
+            except AttributeError:
+                logger.debug("joern server rejects coverage cache attribute")
+    cache_key = (function_name, file_path)
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
+
+    nonce = hashlib.sha256(
+        f"fncov:{function_name}:{time.monotonic_ns()}".encode(),
+    ).hexdigest()[:12]
+    # The sentinel must ride the FINAL EXPRESSION's string echo:
+    # println output does not come back through the server's
+    # query-sync transport (see packages/joern/server.py — flows ride
+    # the final expression for the same reason). A println-shaped
+    # probe answers None on every real server, which silently demotes
+    # every silent live query to skipped — abolishing the refutation
+    # lane instead of gating it.
+    # Coverage = a non-external method WITH A BODY in the item's own
+    # file, live-verified filters (each closes a confirmed
+    # false-coverage shape):
+    # * .filterNot(_.isExternal) — Joern mints external METHOD STUBS
+    #   for called-but-undefined names, so a bare nameExact probe
+    #   answers true off a mere CALL SITE anywhere in the parsed
+    #   tree — exactly this gate's target cases (parse-failed file,
+    #   exclude_dirs drop, mixed-tree language sliver).
+    # * .filter(_.block.astChildren.nonEmpty) — a DECLARED prototype
+    #   is isExternal=false with an empty body; it models nothing.
+    #   Cost: a legitimately empty-bodied function also demotes to
+    #   skipped (its silence-refutation is vacuous anyway).
+    # * filename binding (when a file anchor is given) — a same-named
+    #   definition in a DIFFERENT file is not coverage of this item.
+    cov_expr = (
+        f'cpg.method.nameExact("{function_name}")'
+        '.filterNot(_.isExternal)'
+        '.filter(_.block.astChildren.nonEmpty).l'
+    )
+    if file_path is not None:
+        fp = _escape_scala_string(file_path)
+        query = (
+            'import io.shiftleft.semanticcpg.language._\n'
+            f'val raptorCov = {cov_expr}\n'
+            f'"{nonce}:" + (if (raptorCov.isEmpty) "false" '
+            f'else if (raptorCov.exists(m => m.filename == "{fp}" || '
+            f'm.filename.endsWith("/{fp}"))) "true" else "otherfile")\n'
+        )
+    else:
+        query = (
+            'import io.shiftleft.semanticcpg.language._\n'
+            f'val raptorCov = {cov_expr}\n'
+            f'"{nonce}:" + raptorCov.nonEmpty\n'
+        )
+    try:
+        try:
+            # no_restart: the probe is a cheap side-channel query and
+            # must not wield query()'s timeout-triggered restart — a
+            # probe queued behind a sibling's minutes-long taint query
+            # times out on a HEALTHY server, and the restart would
+            # SIGKILL the shared multi-GB JVM mid-run and destroy the
+            # sibling's in-flight evidence.
+            result = query_fn(query, timeout=timeout, check_length=False,
+                              no_restart=True)
+        except TypeError:
+            # Duck-typed server without the no_restart seam. The probe
+            # is a read-only query, so the plain re-post is idempotent;
+            # a real JoernServer never lands here.
+            result = query_fn(query, timeout=timeout, check_length=False)
+    except Exception as exc:  # noqa: BLE001 — degrade to "unanswered", never crash
+        logger.debug("joern coverage probe failed for %s",
+                     function_name, exc_info=True)
+        if errors_out is not None:
+            errors_out.append(f"{type(exc).__name__}: {exc}")
+        probe_timed_out = "timed out" in str(exc).lower()
+        answer: bool | None = None
+    else:
+        raw = str(getattr(result, "raw_output", "") or "")
+        probe_timed_out = False
+        if f"{nonce}:true" in raw:
+            answer = True
+        elif f"{nonce}:false" in raw or f"{nonce}:otherfile" in raw:
+            # otherfile = a same-named definition exists but not in
+            # the item's file — not coverage of THIS item.
+            answer = False
+        else:
+            answer = None
+            result_errors = list(getattr(result, "errors", None) or [])
+            probe_timed_out = any(
+                "timed out" in str(e).lower() for e in result_errors
+            )
+            if errors_out is not None:
+                if result_errors:
+                    errors_out.extend(str(e) for e in result_errors)
+                else:
+                    errors_out.append("unparseable probe echo")
+    if cache is not None and not probe_timed_out:
+        # None is memoised too: an unanswerable transport does not
+        # heal within one CPG load, and re-probing pays a full REPL
+        # round trip per silent hypothesis on the shared
+        # single-threaded server. The memo dies with the CPG (re)load.
+        # EXCEPT timeout-classified Nones: with the no_restart seam a
+        # probe timeout no longer bumps the load epoch via a restart,
+        # so memoising it would let ONE contention timeout silence
+        # this function's refutation lane until a reload that may
+        # never come. Contention clears on its own — re-ask next
+        # time. (No restart-thrash risk either way: the probe never
+        # restarts, and re-asking is one bounded round trip per
+        # hypothesis, the pre-memo cost.)
+        cache[cache_key] = answer
+    return answer
 
 
 def joern_live_query(
@@ -344,10 +1133,108 @@ def joern_live_query(
     if max_call_depth is not None:
         depth_kwargs["max_call_depth"] = max_call_depth
 
+    sink_names: list[str] = []
     for sink in sinks:
         sink_name = sink.split(".")[-1] if "." in sink else sink
         if not _validate_substitution_value(sink_name):
             continue
+        # Duplicate names would only re-run identical dataflow work in
+        # the same submission; first occurrence keeps the caller order.
+        if sink_name not in sink_names:
+            sink_names.append(sink_name)
+    if not sink_names:
+        return []
+
+    batch_fn = getattr(server, "run_taint_queries_batch", None)
+    if batch_fn is None:
+        # Duck-typed servers without the batch API (test doubles,
+        # minimal stand-ins) keep the historical per-sink behaviour.
+        return _joern_live_query_per_sink(
+            server, function_name, sink_names, timeout,
+            depth_kwargs, errors_out,
+        )
+
+    batch_error = False
+    try:
+        query_errors: list = []
+        # One REPL submission for every sink of this hypothesis, under
+        # a SUBLINEAR budget — base × ceil(sqrt(N)) — rather than the
+        # loop's N× or a flat 1×. Linear re-inherits the single-
+        # hypothesis monopoly of the shared single-threaded REPL the
+        # batch exists to avoid, and a batch timeout is dearer than a
+        # per-sink one (it costs a server restart + CPG reload for
+        # every pair at once); flat starves wide menus (11-sink
+        # dispatch entries exist) whose per-pair engine work is real
+        # even with compilation paid once.
+        flows = batch_fn(
+            [(function_name, s) for s in sink_names],
+            timeout=timeout * _sqrt_ceil(len(sink_names)),
+            errors_out=query_errors,
+            **depth_kwargs,
+        )
+        if flows:
+            if query_errors and errors_out is not None:
+                # Partial degradation (flows AND errors in one batch):
+                # the flows are the answer, but the error tier must
+                # still see that part of the batch went unanswered.
+                errors_out.append(
+                    f"{function_name}->[{','.join(sink_names)}]: "
+                    + "; ".join(str(e) for e in query_errors[:3])
+                )
+            logger.info(
+                "joern live query: %s → [%s] = %d flow(s)",
+                function_name, ",".join(sink_names), len(flows),
+            )
+            # All sinks' flows, not just the first sink with a hit —
+            # strictly more evidence than the historical
+            # first-hit-wins loop; consumers gate on truthiness.
+            return sorted(flows, key=_flow_sort_key)
+        batch_error = bool(query_errors)
+    except Exception:
+        logger.debug(
+            "joern live batch query failed: %s → [%s]",
+            function_name, ",".join(sink_names), exc_info=True,
+        )
+        batch_error = True
+
+    if batch_error:
+        # One-shot per-sink recovery pass: a degraded batch (timeout /
+        # restart / transport) must not cost every joern:live
+        # confirmation of the hypothesis at once — the loop can still
+        # answer sink-by-sink against the restarted server. Error
+        # accounting is delegated wholly to the loop: its verdicts
+        # (flows / clean / degraded) supersede the batch's failure,
+        # which would otherwise mislabel a loop-proven clean result
+        # as "unanswered".
+        logger.info(
+            "joern live batch degraded for %s — falling back to the "
+            "per-sink loop", function_name,
+        )
+        return _joern_live_query_per_sink(
+            server, function_name, sink_names, timeout,
+            depth_kwargs, errors_out,
+        )
+
+    return []
+
+
+def _sqrt_ceil(n: int) -> int:
+    """ceil(sqrt(n)) for n >= 1 — the batch-budget scale factor."""
+    import math
+
+    return math.isqrt(max(n, 1) - 1) + 1
+
+
+def _joern_live_query_per_sink(
+    server,
+    function_name: str,
+    sink_names: list[str],
+    timeout: int,
+    depth_kwargs: dict[str, int],
+    errors_out: list | None,
+) -> list[Any]:
+    """Historical per-sink loop: first sink with flows wins."""
+    for sink_name in sink_names:
         try:
             query_errors: list = []
             flows = server.run_taint_query(
@@ -395,7 +1282,7 @@ def enrich_joern_evidence(
         return
 
     from core.analysis.reachability_gates import (
-        query_sink_arg_index,
+        query_sink_arg_indices,
         query_unguarded_sinks,
     )
 
@@ -406,11 +1293,20 @@ def enrich_joern_evidence(
 
     if not rec.joern_sink_args:
         from packages.joern.runner import _validate_substitution_value
+        sink_names: list[str] = []
         for sink in sinks:
             sink_name = sink.split(".")[-1] if "." in sink else sink
             if not _validate_substitution_value(sink_name):
                 continue
-            args = query_sink_arg_index(function_name, sink_name, joern_server)
+            if sink_name not in sink_names:
+                sink_names.append(sink_name)
+        if sink_names:
+            # One batched submission for the whole sink list (records
+            # come back ordered by the caller's sink order, matching
+            # the per-sink loop this replaces).
+            args = query_sink_arg_indices(
+                function_name, sink_names, joern_server,
+            )
             if args:
                 rec.joern_sink_args.extend(args)
         if rec.joern_sink_args:
@@ -424,10 +1320,12 @@ def enrich_joern_evidence(
             rec.joern_sink_args = deduped
 
 
-#: Run-dir artifact recording an interrupted/re-queued pre-sweep.
-#: Written by :func:`build_joern_evidence`; read by the report
-#: summary and the critique pass so a lost taint window is surfaced
-#: instead of living only in a log WARNING.
+#: Run-dir artifact recording a degraded pre-sweep — interrupted/
+#: re-queued by a server restart, or errored (``interrupted`` count
+#: distinguishes the two for consumers). Written by
+#: :func:`build_joern_evidence`; read by the report summary and the
+#: critique pass so an incomplete taint window is surfaced instead of
+#: living only in a log WARNING.
 PRESWEEP_STATUS_FILENAME = "joern-presweep-status.json"
 
 
@@ -474,7 +1372,9 @@ _PRESWEEP_FLOWS_CACHE_VERSION = 1
 _PRESWEEP_FLOWS_CACHE_MAX_BYTES = 256 * 1024 * 1024
 
 
-def _presweep_flows_identity(target_path) -> tuple[str, str] | None:
+def _presweep_flows_identity(
+    target_path, scope_exclude_dirs: tuple[str, ...] = (),
+) -> tuple[str, str] | None:
     """(cpg_hash, sink_hash) identity of a pre-sweep result, or None.
 
     ``cpg_hash`` covers every axis the CPG build cache invalidates on
@@ -484,7 +1384,10 @@ def _presweep_flows_identity(target_path) -> tuple[str, str] | None:
     fingerprint recovered from compile_commands.json (a regenerated
     build database with different -D/-I flags changes the
     preprocessed code, and thus the flows, without touching the
-    source hash), and the exclusion rule. ``sink_hash`` covers the
+    source hash), the exclusion rule, and the run's scope-complement
+    exclusions (a scope change carves different coverage — flows
+    swept under one scope must not serve a differently-scoped or
+    unscoped segment as the complete sweep). ``sink_hash`` covers the
     query side: the standard_sinks.sc script body plus the rendered
     sink list substituted into it — a query-logic change across a
     framework upgrade must not serve flows computed by the old query.
@@ -496,6 +1399,7 @@ def _presweep_flows_identity(target_path) -> tuple[str, str] | None:
         )
         from packages.joern.runner import (
             CPG_EXCLUDE_REGEX,
+            _normalised_scope_excludes,
             _target_content_hash,
             discover_frontend_args,
         )
@@ -503,10 +1407,13 @@ def _presweep_flows_identity(target_path) -> tuple[str, str] | None:
         target = Path(target_path)
         if not target.is_dir():
             return None
+        scope_norm = _normalised_scope_excludes(scope_exclude_dirs)
         cpg_hash = hashlib.sha256("\n".join((
-            _target_content_hash(target),
+            _target_content_hash(
+                target, exclude_dirs=tuple(scope_norm)),
             discover_frontend_args(target).fingerprint(),
             CPG_EXCLUDE_REGEX,
+            *scope_norm,
         )).encode("utf-8")).hexdigest()
 
         import packages.joern as _joern_pkg
@@ -515,7 +1422,7 @@ def _presweep_flows_identity(target_path) -> tuple[str, str] | None:
         )
         rendered = scala_string_list(STANDARD_SWEEP_SINKS)
         sink_hash = hashlib.sha256(
-            script.read_bytes() + b"\x00" + rendered.encode("utf-8"),
+            script.read_bytes() + b"\x00" + rendered.encode("utf-8"),  # raw-open: shipped Joern script (RAPTOR-owned)
         ).hexdigest()
     except Exception:  # noqa: BLE001 — cache identity must not cost the sweep
         logger.debug("pre-sweep flow-cache identity failed", exc_info=True)
@@ -657,51 +1564,99 @@ def build_joern_evidence(
     target_path, out_dir, joern_overrides=None,
     on_progress: Callable | None = None,
     joern_server=None,
+    abort_check: Callable[[], bool] | None = None,
+    deadline_monotonic: float | None = None,
+    scope_exclude_dirs: tuple[str, ...] = (),
 ) -> dict[str, list] | None:
     """Run Joern pre-sweep (standard_sinks.sc) if available.
 
-    When the pre-sweep window was interrupted by a server restart, the
-    outcome (re-queued and recovered, or lost) is persisted to
+    When the pre-sweep ended degraded — window interrupted by a server
+    restart (re-queued and recovered, or lost) OR the taint query
+    errored on either execution path — the outcome is persisted to
     ``joern-presweep-status.json`` in the run dir for the summary and
-    critique — a lost taint window must not be a log-only event.
+    critique — an incomplete taint window must not be a log-only event.
 
     Completed sweeps are persisted to the run dir's prep cache keyed
     by (CPG content hash, sink-list hash); a resumed segment on an
     unchanged tree reloads instead of re-running the live query.
+
+    ``abort_check`` is polled at step boundaries here and inside
+    :func:`core.audit.sweep.run_joern_pre_sweep`: True returns None
+    without building/querying (and without writing cache or status) —
+    the consumer has discarded the result.
     """
     try:
         from .sweep import run_joern_pre_sweep
     except ImportError:
         return None
 
+    def _aborted() -> bool:
+        if abort_check is not None and abort_check():
+            logger.debug("joern pre-sweep build aborted by consumer")
+            return True
+        return False
+
+    if _aborted():
+        return None
+
     tunables = joern_tunables(overrides=joern_overrides)
     if tunables is None:
         return None
 
-    identity = _presweep_flows_identity(target_path)
+    identity = _presweep_flows_identity(
+        target_path, scope_exclude_dirs=scope_exclude_dirs)
     if identity is not None:
         cached = load_presweep_flows_cache(out_dir, identity)
         if cached is not None:
             return cached or None
 
+    if _aborted():
+        return None
+
     cache_dir = resolve_cpg_cache_dir(out_dir)
     status: dict = {}
+    # An in-target run output dir must not feed the CPG content
+    # key: its artifacts change every segment, flapping the key
+    # and re-buying a full rebuild per resume.
+    presweep_excludes = run_exclude_dirs(out_dir, target_path)
+    from packages.joern.tunables import resolve_cpg_timeout_s
     flows = run_joern_pre_sweep(
         target_path, {},
         cache_dir=cache_dir,
         on_progress=on_progress,
-        stall_timeout=tunables.cpg_timeout_s,
+        # A derived ("auto") CPG timeout resolves against this
+        # sweep's own target/exclusion set (non-auto passes through).
+        stall_timeout=resolve_cpg_timeout_s(
+            tunables, target_path,
+            exclude_dirs=presweep_excludes + tuple(scope_exclude_dirs),
+        ),
         query_timeout=tunables.query_timeout_s,
         heap_mb=tunables.heap_mb,
+        heap_is_derived=getattr(tunables, "heap_is_derived", False),
         server=joern_server,
         status_out=status,
-        # An in-target run output dir must not feed the CPG content
-        # key: its artifacts change every segment, flapping the key
-        # and re-buying a full rebuild per resume.
-        exclude_dirs=run_exclude_dirs(out_dir, target_path),
+        deadline_monotonic=deadline_monotonic,
+        exclude_dirs=presweep_excludes,
+        scope_exclude_dirs=scope_exclude_dirs,
+        abort_check=abort_check,
     )
+    if abort_check is not None and abort_check():
+        # Aborted mid-sweep: a partial result must not be cached or
+        # write interruption status for a run that discarded it.
+        return None
+    # Persist the status artifact for EVERY degraded end, not just the
+    # server-restart interruption: an errored query (server or file
+    # path) leaves the same incomplete flow set, and without the
+    # artifact the report and the critique cadence read its missing
+    # flows as "no flows" instead of "not swept". Consumers key their
+    # wording on the ``interrupted`` count.
     if status.get("interrupted"):
         status["flows_recovered"] = sum(
+            len(v) for v in (flows or {}).values()
+        )
+        _write_presweep_status(out_dir, status)
+    elif status.get("errors"):
+        status["flows_partial"] = sum(
             len(v) for v in (flows or {}).values()
         )
         _write_presweep_status(out_dir, status)
@@ -768,6 +1723,25 @@ def enrich_summaries_from_joern(
     for method_name, js in summaries.items():
         file_path = file_for_method.get(method_name, "")
         key = f"{file_path}:{method_name}" if file_path else method_name
+        if key == _TRUNCATION_KEY:
+            # ``_truncation`` is reserved for the in-band truncation
+            # marker the taint-summary builder stamps into this dict
+            # (colon-free by construction — every builder key carries
+            # a ``file:method`` colon). A hostile target exposing a
+            # method literally named ``_truncation`` with no file
+            # path would otherwise clobber the marker: a plain-dict
+            # marker fails the ``source != "joern_cpg"`` overwrite
+            # guard below. Keep the summary under the explicit
+            # empty-file colon spelling instead of dropping it —
+            # collision-free because the bare branch above is the
+            # only producer of colon-less keys.
+            key = f":{method_name}"
+            logger.warning(
+                "joern_summary_batch: a method literally named "
+                "'_truncation' (no file path) collides with the "
+                "reserved truncation marker key — its summary is "
+                "stored under ':_truncation' instead",
+            )
 
         fs = FunctionSummary(
             function=method_name,
@@ -814,10 +1788,17 @@ def resolve_joern_evidence(
     on_joern_progress: Callable[[str], None] | None = None,
     joern_server=None,
     out_dir=None,
+    abort_event=None,
+    deadline_monotonic: float | None = None,
+    scope_exclude_dirs: tuple[str, ...] = (),
 ) -> tuple:
     """Resolve Joern evidence.
 
     Returns (joern_flows, joern_future).
+
+    ``abort_event`` (threading.Event): set by a consumer that has
+    discarded the future — the background build stops at its next
+    step boundary instead of running to completion unread.
     """
     if not joern_available(overrides=joern_overrides):
         return (None, None)
@@ -840,11 +1821,42 @@ def resolve_joern_evidence(
     if joern_server is not None and joern_server.is_alive():
         _progress("Joern pre-sweep (server mode, background)...")
 
+    # The presweep thread outlives this call and, left to itself,
+    # would resolve its spawn seam (``core.sandbox.run``) lazily at
+    # each spawn — picking up whatever is globally live at that
+    # instant, including a transient process-wide patch some OTHER
+    # code in this process has installed by then (test fixtures
+    # monkeypatch that seam; a patched-in fake once dropped the cwd
+    # pin and left joern's ``workspace/`` debris at the caller's
+    # cwd). Resolve the runner NOW, while this caller's context is
+    # authoritative, and pin it for the worker. Resolution failure
+    # keeps its original surface — lazily, inside the thread, at
+    # first spawn (the future carries it to the drain).
+    from packages.joern.runner import bound_sandbox_runner, resolve_sandbox_runner
+    try:
+        pinned_runner = resolve_sandbox_runner()
+    except Exception:  # noqa: BLE001 — fail exactly where the lazy seam would
+        pinned_runner = None
+
+    def _presweep_job() -> dict[str, list] | None:
+        kwargs = dict(
+            abort_check=abort_event.is_set if abort_event is not None else None,
+            deadline_monotonic=deadline_monotonic,
+            scope_exclude_dirs=scope_exclude_dirs,
+        )
+        if pinned_runner is None:
+            return build_joern_evidence(
+                target_path, out_dir, joern_overrides, _progress,
+                joern_server, **kwargs,  # type: ignore[arg-type]
+            )
+        with bound_sandbox_runner(pinned_runner):
+            return build_joern_evidence(
+                target_path, out_dir, joern_overrides, _progress,
+                joern_server, **kwargs,  # type: ignore[arg-type]
+            )
+
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="joern-cpg")
-    future = executor.submit(
-        build_joern_evidence, target_path, out_dir, joern_overrides,
-        _progress, joern_server,
-    )
+    future = executor.submit(_presweep_job)
     executor.shutdown(wait=False)
     return (None, future)
 
@@ -867,11 +1879,15 @@ def merge_joern_flows(
         if key in evidence_index:
             existing = evidence_index[key]
             if rec.joern_flows and not existing.joern_flows:
-                truncated, _note = truncate_output(rec.joern_flows, "joern")
+                truncated, _note = truncate_output(
+                    rec.joern_flows, "joern_query",
+                )
                 existing.joern_flows = truncated
         else:
             if rec.joern_flows:
-                rec.joern_flows, _note = truncate_output(rec.joern_flows, "joern")
+                rec.joern_flows, _note = truncate_output(
+                    rec.joern_flows, "joern_query",
+                )
             evidence_index[key] = rec
 
     enriched = sum(1 for r in merged.values() if r.joern_flows)
@@ -1093,7 +2109,9 @@ def _sample_entry_point_depths(
         return []
 
     depths: list[int] = []
-    for ep in list(entry_points)[:50]:
+    # sorted(): sampling a SET here made the adaptive propagation
+    # depth hash-seed-dependent whenever >50 entry points exist.
+    for ep in sorted(entry_points)[:50]:
         name = ep.split(":")[-1] if ":" in ep else ep
         visited: set = set()
         queue = deque([(name, 0)])

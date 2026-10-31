@@ -236,6 +236,23 @@ class TestProofRefuterDominatesDetectorFloor:
         assert r is not None
         assert r.demote_to == "suspicious"
 
+    def test_embedded_bounded_name_not_dominated(self, tmp_path: Path):
+        """A custom identifier embedding a bounded libc name
+        (utf8_tolower) is not that libc function — its range guarantee
+        proves nothing about the custom function, so the receipt floor
+        stands instead of a proof-grade override demoting to clean."""
+        r = rescue_self_refuted(
+            self._outcome(
+                "CWE-190: integer overflow — the utf8_tolower() result "
+                "wraps the 32-bit accumulator downstream",
+            ),
+            config=_Config(out_dir=tmp_path),
+            pre_evidence="smt:check-parsed-int-contract",
+        )
+        assert r is not None
+        assert r.demote_to == "suspicious"
+        assert _read_suppressions(tmp_path) == []
+
     def test_incidental_bounded_name_far_from_claim_not_dominated(self):
         """Hostile/weird phrasing: a bounded function mentioned three
         sentences away from an unrelated overflow claim is not a range

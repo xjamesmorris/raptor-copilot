@@ -26,6 +26,12 @@ Direct vs transitive: a name listed under any importer's dependency
 buckets is direct in that workspace. The ``packages`` map is the union
 of every workspace's resolved tree.
 
+npm aliases: an importer entry ``my-lodash: {specifier:
+"npm:lodash@^4.17.21", …}`` installs the REAL package — the
+``packages`` / ``snapshots`` rows already carry it, so the alias only
+has to be joined back: the real package's row stays ``direct=True``
+and the alias spelling is preserved in ``Dependency.alias_name``.
+
 Pin style: lockfile rows are resolved → EXACT, unless ``resolution.tarball``
 or ``resolution.repo`` indicate a git/url source.
 """
@@ -37,7 +43,9 @@ import re
 from typing import Any, TYPE_CHECKING
 
 from ..models import Confidence, Dependency, PinStyle
+from ._base import PARSE_ESCAPE_ERRORS, build_purl, lockfile_confidence
 from . import _safe_read, register
+from ._npm_alias import split_npm_alias
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -73,7 +81,7 @@ def parse(path: Path) -> list[Dependency]:
         return []
     try:
         data = _safe_load(text)           # type: ignore[misc]
-    except _yaml.YAMLError as e:          # type: ignore[union-attr]
+    except (_yaml.YAMLError, *PARSE_ESCAPE_ERRORS) as e:  # type: ignore[union-attr]  # hostile-input escape classes
         logger.warning(
             "sca.parsers.pnpm_lock: YAML parse failed for %s: %s", path, e
         )
@@ -81,7 +89,7 @@ def parse(path: Path) -> list[Dependency]:
     if not isinstance(data, dict):
         return []
 
-    direct_names = _collect_direct_names(data)
+    direct_names, alias_by_real = _collect_direct_names(data)
     packages = data.get("packages")
     if not isinstance(packages, dict):
         packages = {}
@@ -123,8 +131,11 @@ def parse(path: Path) -> list[Dependency]:
                 is_lockfile=True,
                 pin_style=pin_style,
                 direct=name in direct_names,
-                purl=_build_purl(name, version_for_record),
+                purl=build_purl("npm", name, version_for_record),
                 parser_confidence=_confidence(pin_style, version_for_record),
+                alias_name=(alias_by_real.get((name, version_for_record))
+                            or alias_by_real.get((name, None))
+                            or None),
             ))
     if not deps:
         # A non-empty packages/snapshots map that produced zero rows
@@ -145,21 +156,44 @@ def parse(path: Path) -> list[Dependency]:
 # Internals
 # ---------------------------------------------------------------------------
 
-def _collect_direct_names(data: dict[str, Any]) -> set[str]:
-    """Names listed under any importer's direct-dep buckets."""
+def _collect_direct_names(
+    data: dict[str, Any],
+) -> tuple[set[str], dict[tuple[str, str | None], str]]:
+    """``(direct_names, alias_by_real)`` from the importer buckets.
+
+    Aliased entries (``my-lodash: {specifier: "npm:lodash@^4.17.21",
+    …}``) are declared under the ALIAS key, but the ``packages`` /
+    ``snapshots`` maps — where rows are emitted from — carry the REAL
+    package. Resolving the alias here (a) keeps the real package's
+    row ``direct=True`` and (b) preserves the alias spelling for
+    ``Dependency.alias_name``. Without it the aliased dep's row read
+    as transitive and the alias was silently dropped.
+
+    ``alias_by_real`` is keyed ``(real_name, resolved_version)`` — the
+    canonical alias use case is TWO aliases of the same package at
+    different versions side by side (``lodash-old`` / ``lodash-new``),
+    so a name-only key would attribute one alias to both rows. A
+    ``(real_name, None)`` fallback covers entries whose importer
+    version didn't parse; it is dropped (empty sentinel) when two
+    different aliases would contend for it.
+    """
     names: set[str] = set()
+    alias_by_real: dict[tuple[str, str | None], str] = {}
     importers = data.get("importers")
     if isinstance(importers, dict):
         for imp in importers.values():
             if isinstance(imp, dict):
-                names.update(_extract_direct_keys(imp))
+                _extract_direct_keys(imp, names, alias_by_real)
     # v5 shape — direct deps live at the top level.
-    names.update(_extract_direct_keys(data))
-    return names
+    _extract_direct_keys(data, names, alias_by_real)
+    return names, alias_by_real
 
 
-def _extract_direct_keys(scope_holder: dict[str, Any]) -> set[str]:
-    keys: set[str] = set()
+def _extract_direct_keys(
+    scope_holder: dict[str, Any],
+    names: set[str],
+    alias_by_real: dict[tuple[str, str | None], str],
+) -> None:
     for bucket in (
         "dependencies",
         "devDependencies",
@@ -167,9 +201,61 @@ def _extract_direct_keys(scope_holder: dict[str, Any]) -> set[str]:
         "optionalDependencies",
     ):
         block = scope_holder.get(bucket)
-        if isinstance(block, dict):
-            keys.update(k for k in block if isinstance(k, str))
-    return keys
+        if not isinstance(block, dict):
+            continue
+        for k, v in block.items():
+            if not isinstance(k, str):
+                continue
+            resolved = _alias_target(k, v)
+            if resolved is not None:
+                real, ver = resolved
+                names.add(real)
+                if ver is not None:
+                    alias_by_real.setdefault((real, ver), k)
+                # Version-blind fallback; ambiguity (two aliases of the
+                # same real package) blanks it rather than guessing.
+                fb = (real, None)
+                if fb not in alias_by_real:
+                    alias_by_real[fb] = k
+                elif alias_by_real[fb] != k:
+                    alias_by_real[fb] = ""
+            else:
+                names.add(k)
+
+
+def _alias_target(
+    declared: str, value: Any,
+) -> tuple[str, str | None] | None:
+    """``(installed_name, resolved_version)`` for an aliased importer
+    entry, else None.
+
+    v6/v9 importers: ``{specifier: "npm:lodash@^4.17.21", version:
+    "/lodash@4.17.4"}`` (v6) / ``version: "lodash@4.17.4"`` (v9) — the
+    specifier carries the alias protocol, the version field names the
+    resolved real package (peer suffixes stripped like packages keys).
+    v5 top-level: ``my-lodash: "/lodash/4.17.21"`` — the value is a
+    packages-map key naming the real package.
+    """
+    if isinstance(value, dict):
+        spec = value.get("specifier")
+        if not isinstance(spec, str):
+            return None
+        split = split_npm_alias(spec)
+        if split is None or split[0] == declared:
+            return None
+        real = split[0]
+        ver: str | None = None
+        vfield = value.get("version")
+        if isinstance(vfield, str) and vfield:
+            vname, vver = _split_packages_key(vfield)
+            if vname == real and vver:
+                ver = vver
+        return real, ver
+    if isinstance(value, str) and value.startswith("/"):
+        v5_real, v5_version = _split_packages_key(value)
+        if v5_real is not None and v5_real != declared:
+            return v5_real, v5_version
+    return None
 
 
 # Match v6 (/name@version, /@scope/name@version) and v5 (/name/version,
@@ -278,21 +364,15 @@ def _classify_packages_entry(
     return PinStyle.EXACT, version
 
 
-def _build_purl(name: str, version: str | None) -> str:
-    base = f"pkg:npm/{name}"
-    if version:
-        return f"{base}@{version}"
-    return base
-
 
 def _confidence(pin_style: PinStyle, version: str | None) -> Confidence:
-    if pin_style is PinStyle.GIT:
-        return Confidence("medium", reason="pnpm-lock.yaml git source")
-    if pin_style is PinStyle.PATH:
-        return Confidence("medium", reason="pnpm-lock.yaml file source")
-    if version is None:
-        return Confidence("low", reason="pnpm-lock.yaml entry without version")
-    return Confidence("high", reason="pnpm-lock.yaml resolved entry")
+    return lockfile_confidence(
+        pin_style, version,
+        git_reason="pnpm-lock.yaml git source",
+        path_reason="pnpm-lock.yaml file source",
+        unversioned_reason="pnpm-lock.yaml entry without version",
+        resolved_reason="pnpm-lock.yaml resolved entry",
+    )
 
 
 register(filenames=["pnpm-lock.yaml"])(parse)

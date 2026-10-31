@@ -192,13 +192,16 @@ def test_learning_mode_returns_none_no_short_circuit(llm):
 def test_short_circuit_on_trusted_cell(llm):
     """Pre-seed scorecard with a trustworthy track record →
     SHORT_CIRCUIT → cheap says clear_fp → returns FP analysis dict and
-    bumps client.short_circuits."""
+    bumps client.short_circuits. Trust is seeded on the SAME target
+    the query names — the diversity gate's same-target grant is what
+    lets a single-repo track record spend here."""
     client, prov = llm
     sc = ModelScorecard(client.config.scorecard_path)
     for _ in range(150):
         sc.record_event(
             "agentic:py/sql-injection", "haiku-stub",
             EventType.CHEAP_SHORT_CIRCUIT, "correct",
+            repo="/proj/alpha",
         )
     client._scorecard = None  # force lazy reload from sidecar
 
@@ -207,7 +210,7 @@ def test_short_circuit_on_trusted_cell(llm):
                  "reasoning": "value is constant 'admin'"}, "raw")
     prov.responder = responder
 
-    result = prefilter_for_finding(client, _finding())
+    result = prefilter_for_finding(client, _finding(), repo="/proj/alpha")
 
     assert result is not None
     assert result["is_true_positive"] is False
@@ -477,6 +480,37 @@ def test_make_prefilter_fn_distinct_findings_independent(llm):
     assert prov.call_count == 2
 
 
+def test_make_prefilter_fn_preserves_failed_enrichment_record(llm):
+    from core.llm.cc_adapter import CCRequestSchemaError
+    from packages.llm_analysis.orchestrator import CostTracker
+    from packages.llm_analysis.prefilter import make_prefilter_fn
+
+    client, prov = llm
+    prov.responder = lambda *args: (_ for _ in ()).throw(
+        CCRequestSchemaError(
+            "claude -p exited 1: strict mode: unknown keyword: "
+            '"reasoning"',
+            error_kind="request_schema",
+            diagnostic={"stderr": "unknown keyword: reasoning"},
+        )
+    )
+    tracker = CostTracker()
+    hook = make_prefilter_fn(
+        client,
+        pending_claims={},
+        cost_tracker=tracker,
+    )
+
+    assert hook(_finding()) is None
+    records = hook.dispatch_results()
+    assert len(records) == 1
+    assert records[0]["finding_id"] == "f1"
+    assert records[0]["analysed_by"] == "haiku-stub"
+    assert records[0]["error_type"] == "request_schema"
+    assert "unknown keyword" in records[0]["error"]
+    assert tracker.get_summary()["failed_dispatches"] == 1
+
+
 # ---------------------------------------------------------------------------
 # Severity vocabulary + abstention adjudication
 # ---------------------------------------------------------------------------
@@ -503,6 +537,19 @@ def test_abstaining_full_analysis_not_recorded_as_disagreement(llm):
         {"finding_id": "f1"},                       # missing verdict
         {"finding_id": "f2", "is_true_positive": None},  # explicit null
     ]
+    assert record_prefilter_outcomes(client, claims, results) == 0
+
+
+def test_junk_verdict_shape_not_recorded(llm):
+    """A truthy non-bool that survived validation is a non-verdict —
+    recording it adjudicated the cheap claim as 'incorrect'
+    (full_says_fp=False) on a verdict no model produced."""
+    client, prov = llm
+    claims = {
+        "f1": {"decision_class": "agentic:py/sql-injection",
+               "model": "haiku-stub", "cheap_reasoning": "r"},
+    }
+    results = [{"finding_id": "f1", "is_true_positive": "yes"}]
     assert record_prefilter_outcomes(client, claims, results) == 0
 
 

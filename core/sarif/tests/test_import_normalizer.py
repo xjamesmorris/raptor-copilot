@@ -1,11 +1,17 @@
 """Tests for the SARIF import normalizer."""
 
 import json
+import logging
 from pathlib import Path
 
+import pytest
+
 from core.sarif.import_normalizer import (
+    _MAX_DEPTH_CACHE,
+    _MAX_FULL_SCAN_SECONDS,
     _infer_cwe,
     _is_sca_finding,
+    _remember_depth,
     _resolve_uri,
     _strip_file_scheme,
     findings_to_sarif,
@@ -13,6 +19,20 @@ from core.sarif.import_normalizer import (
     format_import_summary,
     import_provenance_block,
 )
+
+
+@pytest.fixture(autouse=True)
+def _raptor_logger_propagates():
+    """Let caplog see records from the 'raptor' logger.
+
+    RaptorLogger sets propagate=False on logging.getLogger('raptor'),
+    so records never reach root where pytest's caplog handler lives.
+    """
+    raptor = logging.getLogger("raptor")
+    orig = raptor.propagate
+    raptor.propagate = True
+    yield
+    raptor.propagate = orig
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +268,104 @@ class TestResolveUri:
         idx = {}
         cache = [None]
         assert _resolve_uri("nonexistent.c", root, idx, cache) is None
+
+
+# ---------------------------------------------------------------------------
+# Depth-cache cost containment
+# ---------------------------------------------------------------------------
+
+class TestDepthCacheCap:
+    """The cached-depth loop runs BEFORE every budget gate, so its
+    per-URI cost must not be a document-controlled multiplier: a SARIF
+    that seeds one cache entry per strip depth must not make every
+    later unresolvable URI pay one ``_is_under_root`` resolve per
+    seeded depth after the scan budgets are spent."""
+
+    def _seed_cache(self, root, cache, depths):
+        """Cache one strip depth per member of *depths* via real
+        resolutions (junk prefix of that length ending in a real
+        file), with fresh budgets."""
+        idx: dict = {}
+        for d in depths:
+            uri = "/".join(f"s{j}" for j in range(d)) + "/x.c"
+            budget = [64]
+            clock = [0.0]
+            assert _resolve_uri(
+                uri, root, idx, cache,
+                scan_budget=budget, scan_clock=clock,
+            ) == "x.c"
+
+    def test_remember_depth_caps_cache(self):
+        cache: list = [None]
+        for d in range(1, 21):
+            _remember_depth(cache, d)
+        assert len(cache) == _MAX_DEPTH_CACHE
+        # Most-recent-first, oldest evicted.
+        assert cache[0] == 20
+        assert 1 not in cache
+
+    def test_seeded_cache_cannot_multiply_post_budget_cost(
+        self, tmp_path, monkeypatch,
+    ):
+        """After the scan budgets are spent, one unresolvable URI's
+        cached-depth cost is bounded by the cache cap — not by how
+        many depths the document managed to seed."""
+        (tmp_path / "x.c").write_text("int x;\n")
+        cache: list = [None]
+        self._seed_cache(tmp_path, cache, range(1, 33))
+
+        import core.sarif.import_normalizer as _mod
+        real = _mod._is_under_root
+        calls = [0]
+
+        def _counting(root, candidate):
+            calls[0] += 1
+            return real(root, candidate)
+
+        monkeypatch.setattr(_mod, "_is_under_root", _counting)
+        # Budgets spent: the full-scan lane is closed, only the
+        # cached-depth loop and the basename index run.
+        result = _resolve_uri(
+            "/".join(f"h{j}" for j in range(64)), tmp_path, {}, cache,
+            scan_budget=[0],
+            scan_clock=[_MAX_FULL_SCAN_SECONDS],
+        )
+        assert result is None
+        assert calls[0] <= _MAX_DEPTH_CACHE
+
+    def test_cached_shapes_survive_post_budget(self, tmp_path):
+        """Resolved scanner shapes keep the cached-depth fast path
+        after budget exhaustion (the documented post-budget contract)."""
+        (tmp_path / "x.c").write_text("int x;\n")
+        (tmp_path / "y.c").write_text("int y;\n")
+        cache: list = [None]
+        # Three alternating scanner shapes — all must stay cached.
+        self._seed_cache(tmp_path, cache, (1, 2, 3))
+        for d in (1, 2, 3):
+            uri = "/".join(f"p{j}" for j in range(d)) + "/y.c"
+            assert _resolve_uri(
+                uri, tmp_path, {}, cache,
+                scan_budget=[0],
+                scan_clock=[_MAX_FULL_SCAN_SECONDS],
+            ) == "y.c"
+
+    def test_evicted_depth_rediscovered_e2e(self, tmp_path):
+        """LRU eviction never loses findings: a shape whose depth was
+        evicted re-resolves through the (budgeted) full scan."""
+        (tmp_path / "real.c").write_text("int r;\n")
+        findings = []
+        for d in range(1, _MAX_DEPTH_CACHE + 5):
+            uri = "/".join(f"s{j}" for j in range(d)) + "/real.c"
+            findings.append(_make_finding(
+                finding_id=f"f{d}", file=uri, startLine=1, endLine=1,
+            ))
+        # Re-visit the first (now evicted) shape at the end.
+        findings.append(_make_finding(
+            finding_id="revisit", file="s0/real.c", startLine=1, endLine=1,
+        ))
+        result = normalize_imported_findings(findings, tmp_path)
+        assert result.stats.findings_skipped == 0
+        assert all(f["file"] == "real.c" for f in result.findings)
 
 
 # ---------------------------------------------------------------------------
@@ -514,6 +632,21 @@ class TestFormatImportSummary:
         result = normalize_imported_findings(findings, root)
         text = format_import_summary(result, ["test.sarif"])
         assert "0 dataflow paths" in text
+
+    def test_hostile_uri_escaped_in_warning_and_summary(self, tmp_path):
+        # Imported SARIF is untrusted and the summary is printed to
+        # the operator terminal by /agentic --sarif: a URI carrying
+        # OSC/BEL bytes must not survive raw into either the warning
+        # record or the joined summary examples.
+        root = _source_tree(tmp_path)
+        evil = "/bad/\x1b]0;pwned\x07/path.c"
+        findings = [_make_finding(file=evil)]
+        result = normalize_imported_findings(findings, root)
+        for w in result.warnings:
+            assert "\x1b" not in w.message and "\x07" not in w.message
+        text = format_import_summary(result, ["test.sarif"])
+        assert "\x1b" not in text and "\x07" not in text
+        assert "pwned" in text  # escaped content, not silently dropped
 
 
 # ---------------------------------------------------------------------------
@@ -1153,3 +1286,335 @@ class TestUntrustedTreeHardening:
         (tmp_path / "ok.c").write_text("line1\nline2\nline3\n")
         snippet = _synthesize_snippet(tmp_path, "ok.c", 2, 2)
         assert "line2" in snippet
+
+
+class TestResolveUriComponentCap:
+    def test_pathological_uri_rejected_fast(self, tmp_path):
+        # O(N^2) resolution: 8000 components measured ~62s pre-fix.
+        # The cap must reject far past-cap URIs in well under a
+        # second (structural bound: the loop never starts). CPU
+        # budget, not wall clock: the quadratic loop burns CPU.
+        from core.testing.wallclock import cpu_budget
+
+        root = _source_tree(tmp_path)
+        evil = "/".join(["d"] * 5000) + "/x.c"
+        findings = [_make_finding(file=evil)]
+        with cpu_budget(5.0, what="pathological-URI normalisation"):
+            result = normalize_imported_findings(findings, root)
+        assert result.stats.findings_skipped == 1
+
+    def test_deep_but_real_paths_still_resolve(self, tmp_path):
+        # Two-direction: a deep-but-plausible prefix strips fine.
+        root = _source_tree(tmp_path)
+        prefixed = "/".join(["ci", "build", "workspace", "src"]) + "/main.c"
+        findings = [_make_finding(file=prefixed)]
+        result = normalize_imported_findings(findings, root)
+        assert result.stats.total_imported == 1
+
+
+# ---------------------------------------------------------------------------
+# Aggregate URI-resolution budget + negative memo
+# ---------------------------------------------------------------------------
+
+class TestResolveUriAggregateBudget:
+    """The per-URI component cap bounds ONE scan, but the document cap
+    admits ~147k cap-sized findings — the aggregate axis of the same
+    wedge. Structural assertions (counting _is_under_root probes), not
+    wall-clock ones."""
+
+    def _counting_root(self, tmp_path, monkeypatch):
+        from core.sarif import import_normalizer as mod
+        root = _source_tree(tmp_path)
+        calls = {"n": 0}
+        real = mod._is_under_root
+
+        def counted(source_root, candidate):
+            calls["n"] += 1
+            return real(source_root, candidate)
+
+        monkeypatch.setattr(mod, "_is_under_root", counted)
+        return root, calls
+
+    def test_failed_memo_kills_repeat_scans(self, tmp_path, monkeypatch):
+        root, calls = self._counting_root(tmp_path, monkeypatch)
+        bad = "/".join(["x"] * 40) + "/nope.c"
+        memo: set = set()
+        budget = [999]
+        cache = [None]
+        assert _resolve_uri(bad, root, {}, cache,
+                            failed_memo=memo, scan_budget=budget) is None
+        first = calls["n"]
+        assert first > 0
+        # Same URI again: memo answers, zero probes — pre-fix each of
+        # 147k identical-URI findings re-paid the full quadratic scan.
+        assert _resolve_uri(bad, root, {}, cache,
+                            failed_memo=memo, scan_budget=budget) is None
+        assert calls["n"] == first
+
+    def test_scan_budget_stops_full_scans(self, tmp_path, monkeypatch):
+        root, calls = self._counting_root(tmp_path, monkeypatch)
+        memo: set = set()
+        budget = [2]
+        cache = [None]
+        for i in range(2):  # consume the budget with distinct failures
+            assert _resolve_uri(f"a/b/c/miss{i}.c", root, {}, cache,
+                                failed_memo=memo,
+                                scan_budget=budget) is None
+        assert budget[0] == 0
+        before = calls["n"]
+        # New distinct unresolvable URI: no probes spent at all.
+        assert _resolve_uri("d/e/f/other.c", root, {}, cache,
+                            failed_memo=memo, scan_budget=budget) is None
+        assert calls["n"] == before
+
+    def test_cached_depth_survives_budget_exhaustion(
+        self, tmp_path, monkeypatch,
+    ):
+        root, calls = self._counting_root(tmp_path, monkeypatch)
+        memo: set = set()
+        budget = [1]
+        cache = [None]
+        # Establish the scanner shape (strips /ci/workspace).
+        assert _resolve_uri("/ci/workspace/src/auth.c", root,
+                            {"auth.c": [Path("src/auth.c")]}, cache,
+                            failed_memo=memo,
+                            scan_budget=budget) == "src/auth.c"
+        # Exhaust the budget.
+        _resolve_uri("a/b/miss.c", root, {}, cache,
+                     failed_memo=memo, scan_budget=budget)
+        assert budget[0] == 0
+        # The established shape still resolves via the cached depth.
+        assert _resolve_uri("/ci/workspace/src/auth.c", root, {}, cache,
+                            failed_memo=memo,
+                            scan_budget=budget) == "src/auth.c"
+
+    def test_successful_scans_never_consume_budget(self, tmp_path):
+        root = _source_tree(tmp_path)
+        memo: set = set()
+        budget = [3]
+        for _ in range(10):
+            cache = [None]  # force the full scan each time
+            assert _resolve_uri("/ci/ws/src/auth.c", root, {}, cache,
+                                failed_memo=memo,
+                                scan_budget=budget) == "src/auth.c"
+        assert budget[0] == 3
+
+    def test_memo_size_is_capped(self, tmp_path):
+        from core.sarif import import_normalizer as mod
+        root = _source_tree(tmp_path)
+        memo: set = set()
+        budget = [10 ** 9]
+        cap = mod._MAX_FAILED_URI_MEMO
+        for i in range(cap + 10):
+            _resolve_uri(f"m/{i}.c", root, {}, [None],
+                         failed_memo=memo, scan_budget=budget)
+        assert len(memo) <= cap
+
+    def test_import_loop_threads_budget(self, tmp_path, monkeypatch):
+        """normalize_imported_findings wires memo+budget: a document of
+        identical unresolvable URIs costs one scan, and all findings
+        still degrade to skipped/unresolved (never a crash)."""
+        root, calls = self._counting_root(tmp_path, monkeypatch)
+        bad = "/".join(["x"] * 30) + "/nope.c"
+        findings = [
+            _make_finding(file=bad, finding_id=f"f{i}") for i in range(50)
+        ]
+        result = normalize_imported_findings(findings, root)
+        assert result.stats.uri_unresolved == 50
+        # One full scan's worth of probes, not 50 (memo short-circuit).
+        assert calls["n"] <= 40
+
+
+def test_oversized_snippet_warning_escapes_hostile_path(
+    tmp_path, monkeypatch, caplog,
+):
+    """The oversized-file warning prints a filename from the untrusted
+    scanned tree to the operator terminal — control bytes must be
+    escaped at creation (the ImportWarning sites already are)."""
+    import logging
+
+    from core.sarif import import_normalizer as mod
+
+    root = tmp_path
+    evil = "src/\x1b]0;pwned\x07big.c"
+    (tmp_path / "src").mkdir()
+    victim = tmp_path / evil
+    victim.write_text("x")
+    monkeypatch.setattr(mod, "_SNIPPET_SOURCE_MAX_BYTES", 0)
+    with caplog.at_level(logging.WARNING, logger="raptor"):
+        assert mod._synthesize_snippet(root, evil, 1, 1) == ""
+    joined = " ".join(r.getMessage() for r in caplog.records)
+    assert "big.c" in joined
+    assert "\x1b" not in joined and "\x07" not in joined
+
+
+class TestResolveUriBudgetRecallAndWallCap:
+    """Budget exhaustion must degrade the EXPENSIVE lane only: the
+    O(1) basename index and the cached-depth path stay live, and
+    RESOLVING deep URIs are bounded by depth caching + the aggregate
+    wall clock (the failure budget never sees a success)."""
+
+    def _counting_root(self, tmp_path, monkeypatch):
+        from core.sarif import import_normalizer as mod
+        root = _source_tree(tmp_path)
+        calls = {"n": 0}
+        real = mod._is_under_root
+
+        def counted(source_root, candidate):
+            calls["n"] += 1
+            return real(source_root, candidate)
+
+        monkeypatch.setattr(mod, "_is_under_root", counted)
+        return root, calls
+
+    def test_basename_index_survives_budget_exhaustion(self, tmp_path):
+        """Junk-first exhausts the failed-scan budget BEFORE any depth
+        is cached; a later legitimate URI with a unique basename must
+        still resolve — the basename lookup is O(1) and not part of
+        the wedge (skipping it dropped the finding)."""
+        root = _source_tree(tmp_path)
+        memo: set = set()
+        budget = [1]
+        cache = [None]
+        idx = {"auth.c": [Path("src/auth.c")]}
+        assert _resolve_uri("j/u/n/k/miss.c", root, idx, cache,
+                            failed_memo=memo, scan_budget=budget) is None
+        assert budget[0] == 0
+        assert _resolve_uri("/ci/prefix/wrong/auth.c", root, idx, cache,
+                            failed_memo=memo,
+                            scan_budget=budget) == "src/auth.c"
+
+    def test_import_junk_first_legit_findings_still_import(self, tmp_path):
+        """E2E recall shape: a document whose unmappable URIs
+        (generated/vendored paths grouped first) precede the real
+        results must still import every real result. Pre-fix the
+        exhausted budget skipped the basename index and dropped ALL
+        subsequent legitimate findings (imported 0 of 500)."""
+        from core.sarif import import_normalizer as mod
+        root = _source_tree(tmp_path)
+        junk = [
+            _make_finding(file=f"gen/out/{i}/nope-{i}.c",
+                          finding_id=f"junk-{i}")
+            for i in range(mod._MAX_FAILED_URI_SCANS + 36)
+        ]
+        legit = [
+            _make_finding(file="/ci/workspace/elsewhere/auth.c",
+                          finding_id=f"legit-{i}", startLine=1)
+            for i in range(500)
+        ]
+        result = normalize_imported_findings(junk + legit, root)
+        assert result.stats.findings_skipped == len(junk)
+        assert result.stats.uri_unresolved == len(junk)
+        imported = len(junk) + len(legit) - result.stats.findings_skipped
+        assert imported == 500
+
+    def test_alternating_deep_resolving_uris_bounded(
+        self, tmp_path, monkeypatch,
+    ):
+        """Two alternating deep-but-RESOLVING URIs (junk components
+        ending in a real in-repo path) thrashed the single-slot depth
+        cache — every finding re-paid the full quadratic scan and
+        nothing was charged (successes bypassed budget and memo).
+        The depth cache holds every successful depth, so the pair
+        costs two full scans total."""
+        root, calls = self._counting_root(tmp_path, monkeypatch)
+        depth_a, depth_b = 40, 60
+        uri_a = "/".join(["a"] * depth_a) + "/src/auth.c"
+        uri_b = "/".join(["b"] * depth_b) + "/src/main.c"
+        cache: list = [None]
+        memo: set = set()
+        budget = [999]
+        clock = [0.0]
+        for _ in range(50):
+            assert _resolve_uri(uri_a, root, {}, cache, failed_memo=memo,
+                                scan_budget=budget,
+                                scan_clock=clock) == "src/auth.c"
+            assert _resolve_uri(uri_b, root, {}, cache, failed_memo=memo,
+                                scan_budget=budget,
+                                scan_clock=clock) == "src/main.c"
+        # Two full scans (≤ depth+2 probes each) + ≤2 cached-depth
+        # probes per subsequent call — far below 100 full scans.
+        assert calls["n"] <= (depth_a + depth_b + 8) + 4 * 100
+        assert budget[0] == 999  # successes never touch the budget
+
+    def test_resolved_memo_short_circuits_repeat_successes(
+        self, tmp_path, monkeypatch,
+    ):
+        root, calls = self._counting_root(tmp_path, monkeypatch)
+        cache: list = [None]
+        rmemo: dict = {}
+        assert _resolve_uri("/ci/ws/src/auth.c", root, {}, cache,
+                            resolved_memo=rmemo) == "src/auth.c"
+        before = calls["n"]
+        assert _resolve_uri("/ci/ws/src/auth.c", root, {}, cache,
+                            resolved_memo=rmemo) == "src/auth.c"
+        assert calls["n"] == before  # memo answered, zero probes
+
+    def test_wall_clock_cap_stops_full_scans_basename_survives(
+        self, tmp_path, monkeypatch,
+    ):
+        """Aggregate wall cap: once full-scan time is spent, unknown
+        URIs skip the quadratic loop entirely — but unique basenames
+        still resolve. Both directions: under the cap the full scan
+        runs (distinct-depth URI resolves without an index)."""
+        from core.sarif import import_normalizer as mod
+        root, calls = self._counting_root(tmp_path, monkeypatch)
+        idx = {"auth.c": [Path("src/auth.c")]}
+        clock = [0.0]
+        # Under the cap: full scan allowed, resolves with empty index.
+        assert _resolve_uri("/p/q/src/main.c", root, {}, [None],
+                            scan_clock=clock) == "src/main.c"
+        assert clock[0] > 0.0
+        # Spent: no full scan probes, basename index still resolves.
+        spent = [mod._MAX_FULL_SCAN_SECONDS]
+        before = calls["n"]
+        assert _resolve_uri("/x/y/z/auth.c", root, idx, [None],
+                            scan_clock=spent) == "src/auth.c"
+        assert calls["n"] == before + 1  # only the basename probe
+        # ... and a non-unique/unknown basename degrades to None.
+        assert _resolve_uri("/x/y/z/nope.c", root, idx, [None],
+                            scan_clock=spent) is None
+
+
+class TestSnippetSourceGating:
+    """Snippet synthesis reads files the untrusted SARIF chooses from
+    the untrusted scanned tree — non-regular files must be refused on
+    the fd (a FIFO stats as 0 bytes and blocks the import stage
+    forever at a by-name open)."""
+
+    def test_fifo_does_not_hang_snippet_synthesis(self, tmp_path):
+        # URI resolution's is_file() gate keeps a PRE-planted FIFO
+        # from being targeted through the pipeline, so the read gate
+        # is the swap-race / defence-in-depth layer — exercise the
+        # reader directly.
+        import os as _os
+        import signal as _signal
+
+        if not hasattr(_os, "mkfifo"):
+            import pytest
+            pytest.skip("platform lacks mkfifo")
+
+        from core.sarif.import_normalizer import _synthesize_snippet
+
+        _os.mkfifo(tmp_path / "trap.c")
+
+        def _on_alarm(signum, frame):
+            msg = "snippet synthesis blocked on a planted FIFO"
+            raise AssertionError(msg)
+
+        old = _signal.signal(_signal.SIGALRM, _on_alarm)
+        _signal.alarm(30)
+        try:
+            snippet = _synthesize_snippet(tmp_path, "trap.c", 1, None)
+        finally:
+            _signal.alarm(0)
+            _signal.signal(_signal.SIGALRM, old)
+        assert snippet == ""
+
+    def test_regular_file_snippet_still_synthesized(self, tmp_path):
+        (tmp_path / "ok.c").write_text("line1\nline2\nline3\n")
+        result = normalize_imported_findings(
+            [_make_finding(file="ok.c", snippet="", startLine=2)],
+            tmp_path,
+        )
+        assert "line2" in result.findings[0]["snippet"]

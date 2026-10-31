@@ -6,6 +6,9 @@ text contradicts the boolean verdict fields.
 
 import logging
 import re
+import unicodedata
+
+from core.run.finding_status import read_verdict
 
 logger = logging.getLogger(__name__)
 
@@ -76,8 +79,15 @@ def check_self_contradiction(results_by_id: dict[str, dict]) -> int:
             # LLM shape drift ("string" field returned as list/dict)
             # must not crash the check — coerce for the regex pass.
             reasoning = str(reasoning)
-        is_tp = r.get("is_true_positive", True)
-        is_exp = r.get("is_exploitable", False)
+        # Tri-state reads (read_verdict): a contradiction requires an
+        # ACTUAL claimed verdict on one side. Pre-fix the default-True
+        # read fabricated is_true_positive=True for a record missing
+        # the field entirely, so an abstained response whose ruling
+        # said "false_positive" was flagged self-contradictory — and
+        # burned a targeted-resample retry — over a contradiction the
+        # LLM never emitted.
+        is_tp = read_verdict(r, "is_true_positive") is True
+        is_exp = read_verdict(r, "is_exploitable") is True
         # `ruling` travels through generate_structured's descriptive
         # (non-enforced) schema, so fallback extraction can hand back
         # a dict ({'status': 'false_positive'}) or other non-string
@@ -117,7 +127,19 @@ def check_self_contradiction(results_by_id: dict[str, dict]) -> int:
         # Text contradictions — word-boundary matched (see module
         # docstring for the rationale on `\b`).
         if reasoning:
-            if is_tp:
+            # NFKC-fold first: the signal patterns are ASCII with
+            # IGNORECASE, so fullwidth/compatibility spellings of the
+            # same phrases would otherwise sail past this self-QA
+            # heuristic (fewer targeted retries, not a gate bypass).
+            reasoning = unicodedata.normalize("NFKC", reasoning)
+            if is_tp and ruling not in {
+                "unreachable", "dead_code", "test_code", "mitigated",
+            }:
+                # A typed non-FP ruling can legitimately contrast itself
+                # with "false positive" in prose ("unreachable rather than
+                # a false positive"). The structured ruling is higher-signal
+                # than this substring heuristic, so do not manufacture a
+                # contradiction from that explanatory comparison.
                 for signal, pat in _SIGNAL_PATTERNS["false_positive"]:
                     if pat.search(reasoning):
                         contradictions.append(

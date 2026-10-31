@@ -58,8 +58,11 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
+from ..file_shapes import is_dockerfile as _is_dockerfile
 from pathlib import Path
 from collections.abc import Iterable
+
+from core.source.contained import read_contained
 
 from packages.sca.platform_matrix.glibc_db import (
     LibcVersion,
@@ -83,11 +86,29 @@ class PlatformPair:
 
     arch: str                  # "x86_64" | "aarch64" | "armv7l" | "i686" | …
     libc: LibcVersion | None
+    # OS family the pair runs on: "linux" | "windows" | "macosx" |
+    # None (unknown — e.g. an unrecognised self-hosted runner label).
+    # Carried EXPLICITLY: container-provenance pairs (Dockerfile,
+    # devcontainer, bake, build-push) are Linux by construction even
+    # when their libc is undetermined. Overloading ``libc=None`` as
+    # "non-Linux" made the compat matcher reject every Linux wheel
+    # for such pairs (false incompat findings per compiled dep) AND
+    # accept Windows-only wheels for them (false clean verdicts).
+    os: str | None = None
     # Source-trace for diagnostics ("Dockerfile FROM python:3.13-bookworm",
     # "GHA runs-on: ubuntu-22.04", etc.). Not used by the compat
     # checker; surfaces in operator-facing reports so a flagged
     # incompat says WHERE the platform came from.
-    source: str = ""
+    #
+    # ``compare=False``: the source is diagnostic-only and must not
+    # participate in eq/hash. With it in the identity, N declaration
+    # sites of the same (arch, libc) made N "distinct" pairs in the
+    # ProjectPlatformMatrix set, and check_compat emitted one verdict
+    # — and one finding with an IDENTICAL finding_id — per copy.
+    # Since ``set.add`` keeps the existing element on equality, the
+    # FIRST-discovered source (module-docstring walk order) is the
+    # one retained and reported.
+    source: str = field(default="", compare=False)
     # macOS minimum version the project accepts wheels against. A
     # project on a macos-13 runner has macos_version=(13, 0); a wheel
     # tagged ``macosx_14_0_arm64`` is too new and gets refused. ``None``
@@ -146,8 +167,12 @@ def _canonical_arch(arch_ref: str) -> str:
 # Dockerfile FROM parsing
 # ---------------------------------------------------------------------------
 
+# Leading indent is HORIZONTAL-only ([^\S\n]): under MULTILINE the
+# ``^\s*`` spelling re-scans a run of blank lines from every line
+# start inside it — quadratic on a hostile Dockerfile (this walk
+# runs on every discovered Dockerfile, no timeout).
 _FROM_RE = re.compile(
-    r"^\s*FROM\s+"                   # FROM keyword
+    r"^[^\S\n]*FROM\s+"              # FROM keyword
     r"(?:--platform=(\S+)\s+)?"       # optional --platform=...
     r"(\S+)"                          # image[:tag][@digest]
     r"(?:\s+AS\s+\S+)?\s*$",          # optional AS stage
@@ -174,14 +199,33 @@ def _from_image_to_distro(image_ref: str) -> str | None:
     return ref
 
 
+def _read_discovered(root: Path, path: Path) -> str | None:
+    """Containment-checked, size-capped read of a file discovered
+    under the scanned target.
+
+    Every file this module reads was found under (or referenced
+    from) the untrusted target tree — the same file classes the
+    parsers read through their bounded reader. A bare ``read_text``
+    here followed symlinks (a hostile ``devcontainer.json ->
+    /dev/stdin`` or an out-of-tree ``build.dockerfile`` reference
+    pulled operator files into the discovery pass) and loaded
+    multi-GB planted files whole into memory before the sandbox
+    limit."""
+    text = read_contained(root, path)
+    if text is None:
+        logger.debug(
+            "platform_matrix: refused or failed to read %s "
+            "(outside target, non-regular, or unreadable)", path,
+        )
+    return text
+
+
 def _walk_dockerfile(
-    path: Path, matrix: ProjectPlatformMatrix,
+    path: Path, matrix: ProjectPlatformMatrix, root: Path,
 ) -> None:
     """Parse FROM lines + add discovered (arch, libc) pairs."""
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError as e:
-        logger.debug("platform_matrix: failed to read %s: %s", path, e)
+    text = _read_discovered(root, path)
+    if text is None:
         return
 
     known_stages: set = set()
@@ -217,7 +261,7 @@ def _walk_dockerfile(
             archs = ["x86_64", "aarch64"]
         for arch in archs:
             matrix.add(PlatformPair(
-                arch=arch, libc=libc,
+                arch=arch, libc=libc, os="linux",
                 source=f"Dockerfile FROM {image_ref} in {path.name}",
             ))
 
@@ -227,7 +271,7 @@ def _walk_dockerfile(
 # ---------------------------------------------------------------------------
 
 def _walk_devcontainer(
-    path: Path, matrix: ProjectPlatformMatrix,
+    path: Path, matrix: ProjectPlatformMatrix, root: Path,
 ) -> None:
     """Parse a ``devcontainer.json`` and lift the ``image:`` /
     ``build.dockerfile`` reference into the matrix.
@@ -235,10 +279,8 @@ def _walk_devcontainer(
     devcontainer.json technically supports comments (JSONC); we
     try standard JSON first and fall back to a comment-strip pass.
     """
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError as e:
-        logger.debug("platform_matrix: failed to read %s: %s", path, e)
+    text = _read_discovered(root, path)
+    if text is None:
         return
 
     # devcontainer.json is JSONC (comments + trailing commas). Use the shared
@@ -266,7 +308,7 @@ def _walk_devcontainer(
             # Mirrors the Dockerfile walker.
         for arch in ("x86_64", "aarch64"):
             matrix.add(PlatformPair(
-                arch=arch, libc=libc,
+                arch=arch, libc=libc, os="linux",
                 source=f"devcontainer.json image: {image}",
             ))
 
@@ -274,9 +316,12 @@ def _walk_devcontainer(
     if isinstance(build, dict):
         dockerfile_rel = build.get("dockerfile")
         if isinstance(dockerfile_rel, str):
+            # Containment is enforced by the read itself: a hostile
+            # "dockerfile": "../../..." reference resolves outside
+            # the target and _read_discovered refuses it.
             dockerfile_path = (path.parent / dockerfile_rel).resolve()
             if dockerfile_path.exists():
-                _walk_dockerfile(dockerfile_path, matrix)
+                _walk_dockerfile(dockerfile_path, matrix, root)
 
 
 # ---------------------------------------------------------------------------
@@ -292,20 +337,45 @@ _BAKE_JSON_NAMES = (
     "docker-bake.json", "docker-bake.override.json",
 )
 
-# Regex over an HCL bake file. Matches both single-line and
-# multi-line list shapes:
-#   platforms = ["linux/amd64", "linux/arm64"]
-#   platforms = [
-#     "linux/amd64",
-#     "linux/arm64",
-#   ]
-# Non-greedy + DOTALL captures up to the first closing bracket.
-# Mismatch-tolerant: HCL allows comments inside the list, our
-# regex eats them as part of the captured group and splits on
-# comma afterwards (string-stripping handles whitespace).
-_BAKE_PLATFORMS_RE = re.compile(
-    r"platforms\s*=\s*\[(?P<list>[^\]]*?)\]", re.DOTALL,
-)
+# Anchor of an HCL bake ``platforms = [`` list opener. The list BODY
+# (everything up to the first ``]``, both single-line and multi-line
+# shapes) is captured by :func:`_iter_bracket_list_bodies`, never by
+# an unbounded regex span: the old ``\[(?P<list>[^\]]*?)\]`` spelling
+# re-scanned to EOF for EVERY unclosed ``platforms = [`` anchor — a
+# hostile bake file of repeated unclosed openers cost quadratic time
+# through the default discovery walk (hours at the 10 MiB read cap).
+# Mismatch-tolerant: HCL allows comments inside the list, the body
+# consumer splits on comma afterwards (string-stripping handles
+# whitespace).
+_BAKE_PLATFORMS_ANCHOR_RE = re.compile(r"platforms\s*=\s*\[")
+
+
+def _iter_bracket_list_bodies(
+    text: str, anchor_re: re.Pattern[str],
+) -> Iterable[str]:
+    """Yield the ``[...]`` body following each ``anchor_re`` match —
+    the same matches an ``<anchor>([^\\]]*?)\\]`` finditer produces,
+    computed in linear time.
+
+    Equivalence: a lazy ``[^\\]]*?\\]`` body is exactly "everything up
+    to the FIRST ``]`` after the opener", and ``finditer`` resumes
+    after each match's closing bracket — mirrored here by ``pos``
+    jumping past ``close``, so an opener inside a matched body is
+    skipped just as the regex engine skips it. Linearity: each failed
+    close-bracket search proves every LATER anchor fails too (its
+    search range is a subset), so the walk stops instead of re-scanning
+    the tail once per anchor (the measured quadratic).
+    """
+    pos = 0
+    while True:
+        m = anchor_re.search(text, pos)
+        if m is None:
+            return
+        close = text.find("]", m.end())
+        if close == -1:
+            return
+        yield text[m.end():close]
+        pos = close + 1
 
 
 def _extract_platforms_from_text(captured: str) -> Iterable[str]:
@@ -341,7 +411,7 @@ def _extract_platforms_from_text(captured: str) -> Iterable[str]:
 
 
 def _walk_bake_hcl(
-    path: Path, matrix: ProjectPlatformMatrix,
+    path: Path, matrix: ProjectPlatformMatrix, root: Path,
 ) -> None:
     """Parse a ``docker-bake.hcl`` and lift any ``platforms = [...]``
     into the matrix.
@@ -360,14 +430,11 @@ def _walk_bake_hcl(
       file-level comments are irrelevant — we only look at
       ``platforms = [...]`` shapes.
     """
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError as e:
-        logger.debug("platform_matrix: failed to read %s: %s", path, e)
+    text = _read_discovered(root, path)
+    if text is None:
         return
 
-    for match in _BAKE_PLATFORMS_RE.finditer(text):
-        captured = match.group("list")
+    for captured in _iter_bracket_list_bodies(text, _BAKE_PLATFORMS_ANCHOR_RE):
         for platform_ref in _extract_platforms_from_text(captured):
             # Bake platform refs look like Docker's ``linux/amd64``
             # form. ``_canonical_arch`` already maps these.
@@ -375,13 +442,13 @@ def _walk_bake_hcl(
             if not arch:
                 continue
             matrix.add(PlatformPair(
-                arch=arch, libc=None,
+                arch=arch, libc=None, os="linux",
                 source=f"docker-bake.hcl platforms in {path.name}",
             ))
 
 
 def _walk_bake_json(
-    path: Path, matrix: ProjectPlatformMatrix,
+    path: Path, matrix: ProjectPlatformMatrix, root: Path,
 ) -> None:
     """Same as :func:`_walk_bake_hcl` but for the JSON variant.
 
@@ -391,10 +458,12 @@ def _walk_bake_json(
     refs not platforms, so we ignore them.
     """
     import json
+    text = _read_discovered(root, path)
+    if text is None:
+        return
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
         data = json.loads(text)
-    except (OSError, json.JSONDecodeError) as e:
+    except json.JSONDecodeError as e:
         logger.debug(
             "platform_matrix: failed to parse %s as bake JSON: %s",
             path, e,
@@ -417,7 +486,7 @@ def _walk_bake_json(
             if not arch:
                 continue
             matrix.add(PlatformPair(
-                arch=arch, libc=None,
+                arch=arch, libc=None, os="linux",
                 source=f"docker-bake.json platforms in {path.name}",
             ))
 
@@ -432,11 +501,11 @@ def _walk_bake_configs(
     for name in _BAKE_HCL_NAMES:
         path = target / name
         if path.is_file():
-            _walk_bake_hcl(path, matrix)
+            _walk_bake_hcl(path, matrix, target)
     for name in _BAKE_JSON_NAMES:
         path = target / name
         if path.is_file():
-            _walk_bake_json(path, matrix)
+            _walk_bake_json(path, matrix, target)
 
 
 # ---------------------------------------------------------------------------
@@ -461,29 +530,53 @@ def _walk_gha_workflows(
     if not workflows_dir.is_dir():
         return
 
-    runs_on_re = re.compile(r"^\s*runs-on:\s*([^\n#]+)", re.MULTILINE)
-    matrix_os_re = re.compile(
-        r"^\s*(?:os|platform):\s*\[\s*([^\]]+)\s*\]", re.MULTILINE,
+    # Leading indent is HORIZONTAL-only ([^\S\n]) — the MULTILINE
+    # ``^\s*`` spelling is quadratic on blank-line runs (see
+    # _FROM_RE). The ``os:``/``platform:`` regex is an ANCHOR only;
+    # the bracket body is walked by _iter_bracket_list_bodies — the
+    # old inline ``\[([^\]]+)\]`` body re-scanned to EOF for every
+    # unclosed ``os: [`` opener (N openers = quadratic; the landed
+    # single-anchor fix bounded the whitespace competition, not the
+    # per-anchor tail scan). The body keeps its surrounding
+    # whitespace (consumers strip each item).
+    # Bounded key/value gap (same rationale as _PLATFORMS_INPUT_RE).
+    runs_on_re = re.compile(
+        r"^[^\S\n]*runs-on:\s{0,64}([^\n#]+)", re.MULTILINE,
+    )
+    matrix_os_anchor_re = re.compile(
+        r"^[^\S\n]*(?:os|platform):\s*\[", re.MULTILINE,
     )
 
     for wf in sorted(workflows_dir.glob("*.yml")) + sorted(workflows_dir.glob("*.yaml")):
-        try:
-            text = wf.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        text = _read_discovered(target, wf)
+        if text is None:
             continue
 
         # Collect all bare runs-on: values (scalar form).
+        # The matrix os/platform list is scanned ONCE per file and
+        # its items REGISTERED once: re-running the whole-file scan
+        # per ``${{``-bearing ``runs-on:`` match multiplied the scan
+        # cost by the number of such matches, and even a hoisted scan
+        # re-adds k*m runner entries when a hostile workflow stacks k
+        # variable runs-on lines against an m-item list — quadratic
+        # WORK for a set the dedup collapses anyway (every add stamps
+        # the identical per-file source string, so once is
+        # equivalent).
+        matrix_items_added = False
         for m in runs_on_re.finditer(text):
             value = m.group(1).strip().strip("'\"")
             if "${{" in value:
                 # Variable reference — look for matrix.os list.
-                for mm in matrix_os_re.finditer(text):
-                    items = [
-                        s.strip().strip("'\"")
-                        for s in mm.group(1).split(",")
-                    ]
-                    for item in items:
-                        _add_runner(item, matrix, wf)
+                if not matrix_items_added:
+                    matrix_items_added = True
+                    for body in _iter_bracket_list_bodies(
+                            text, matrix_os_anchor_re):
+                        if not body:  # old body class was [^\]]+
+                            continue
+                        for s in body.split(","):
+                            _add_runner(
+                                s.strip().strip("'\""), matrix, wf,
+                            )
                 continue
             _add_runner(value, matrix, wf)
 
@@ -506,15 +599,27 @@ def _walk_gha_workflows(
 # Same regex-tolerant approach the ``runs-on:`` parser uses — a
 # grammar-incomplete workflow (in-flight edit, typo) doesn't take
 # down discovery.
+# Leading indent is HORIZONTAL-only ([^\S\n]) — the MULTILINE ``^\s*``
+# spelling is quadratic on blank-line runs (see _FROM_RE), and the
+# uses-line's ADJACENT pair (``^\s*-?\s*``) was worse still: the two
+# unbounded spans split a run every possible way per anchor. The
+# second span therefore only exists behind the literal ``-`` — two
+# adjacent unbounded spans stay quadratic on a hostile single-line
+# space run even spelled horizontally.
 _BUILD_PUSH_USES_RE = re.compile(
-    r"^\s*-?\s*uses:\s*docker/build-push-action@[^\s\n]+",
+    r"^[^\S\n]*(?:-[^\S\n]*)?uses:\s*docker/build-push-action@[^\s\n]+",
     re.MULTILINE,
 )
 _NEXT_STEP_BOUNDARY_RE = re.compile(
-    r"^\s*-\s*(?:uses|run|name):", re.MULTILINE,
+    r"^[^\S\n]*-\s*(?:uses|run|name):", re.MULTILINE,
 )
+# Bounded key/value gap (\s{0,64}): the unbounded ``\s*`` let every
+# 'platforms:' anchor re-scan a shared whitespace run before failing
+# at the value — quadratic over planted key lines. 64 whitespace
+# chars keeps the next-line-value shape while capping per-anchor
+# reach.
 _PLATFORMS_INPUT_RE = re.compile(
-    r"^\s*platforms:\s*([^\n#]+)", re.MULTILINE,
+    r"^[^\S\n]*platforms:\s{0,64}([^\n#]+)", re.MULTILINE,
 )
 
 
@@ -536,14 +641,30 @@ def _extract_gha_build_push_platforms(
     is the lenient behaviour and correct here (build-push-action
     doesn't constrain libc on its own).
     """
-    for use_match in _BUILD_PUSH_USES_RE.finditer(text):
+    # Single forward pass: each step's block ends at the next step
+    # boundary AND never extends past the next build-push ``uses:``
+    # line (a later match is by definition a new step). Both the
+    # boundary search and the platforms search run inside the
+    # [step_start, step_end) window via pos/endpos — no tail slice.
+    # The old per-match ``search(text, pos=step_start)`` + tail-slice
+    # scanned to EOF once per boundary-less ``uses:`` line, so a
+    # hostile workflow of stacked dash-less uses lines cost quadratic
+    # time (blocks all overlapped the same tail). Windowing changes
+    # no discovered platform: a ``platforms:`` after the next uses
+    # line belongs to (and is found by) that step's own window, and
+    # both steps stamp the identical per-workflow source string.
+    use_matches = list(_BUILD_PUSH_USES_RE.finditer(text))
+    for i, use_match in enumerate(use_matches):
         step_start = use_match.end()
-        # Find the next step boundary OR end of file to scope our
-        # ``platforms:`` search to THIS step's block.
-        boundary = _NEXT_STEP_BOUNDARY_RE.search(text, pos=step_start)
-        step_end = boundary.start() if boundary else len(text)
-        block = text[step_start:step_end]
-        platforms_match = _PLATFORMS_INPUT_RE.search(block)
+        window_end = (
+            use_matches[i + 1].start()
+            if i + 1 < len(use_matches) else len(text)
+        )
+        boundary = _NEXT_STEP_BOUNDARY_RE.search(
+            text, pos=step_start, endpos=window_end)
+        step_end = boundary.start() if boundary else window_end
+        platforms_match = _PLATFORMS_INPUT_RE.search(
+            text, step_start, step_end)
         if platforms_match is None:
             continue
         value = platforms_match.group(1).strip().strip("'\"")
@@ -562,7 +683,7 @@ def _extract_gha_build_push_platforms(
             if not arch:
                 continue
             matrix.add(PlatformPair(
-                arch=arch, libc=None,
+                arch=arch, libc=None, os="linux",
                 source=(
                     f"GHA docker/build-push-action platforms in "
                     f"{workflow.name}"
@@ -572,11 +693,15 @@ def _extract_gha_build_push_platforms(
 
 # GitHub's macOS runner naming: ``macos-13``, ``macos-14``,
 # ``macos-15``, ``macos-latest``. The numeric form maps directly to
-# the macOS major version. ``macos-latest`` follows GitHub's policy
-# of the second-most-recent stable; track it loosely (current as of
-# 2026: latest = 14). If GitHub bumps this, the regression test
-# catches the lag; lift the constant when it does.
-_MACOS_RUNNER_LATEST = (14, 0)
+# the macOS major version. ``macos-latest`` is a floating alias with
+# no offline-verifiable value — this constant is a tracked snapshot
+# (GitHub migrated the alias to the macos-15 image in 2025), refreshed
+# by hand when GitHub announces the next migration. There is NO
+# network-free way to test the snapshot against the live fleet, so no
+# regression test claims to; the trade-off of a stale value is a
+# slightly-off acceptable-wheel window for projects that pin nothing
+# more specific than the alias.
+_MACOS_RUNNER_LATEST = (15, 0)
 
 _MACOS_RUNNER_RE = re.compile(r"^macos-(\d+)(?:\.(\d+))?$")
 
@@ -603,14 +728,25 @@ def _add_runner(
 ) -> None:
     """Resolve a runner label to a PlatformPair + add to matrix.
 
-    Standard GHA runners are x86_64-only today (no aarch64 hosted
-    runners in the free tier as of 2026; that may change).
+    Arm runner labels carry an ``-arm`` / ``-arm64`` SUFFIX on the
+    base image label (``ubuntu-24.04-arm``, ``windows-11-arm`` —
+    GitHub's hosted arm runners, free for public repos since early
+    2025). The suffix is parsed mechanically rather than table-listed:
+    arch comes from the suffix, libc from the base label's row (the
+    arm image ships the same distro libc). Recording these as x86_64
+    hid exactly the aarch64 wheel-gap class this subsystem exists to
+    catch for projects whose only arm signal is their CI runner.
     Windows / macOS runners get libc=None.
     """
-    libc = lookup_runner_libc(runner_ref)
+    arch = "x86_64"
+    base_ref = runner_ref
+    if runner_ref.endswith(("-arm", "-arm64")):
+        arch = "aarch64"
+        base_ref = runner_ref.rsplit("-", 1)[0]
+    libc = lookup_runner_libc(base_ref)
     if runner_ref.startswith("windows-"):
         matrix.add(PlatformPair(
-            arch="x86_64", libc=None,
+            arch=arch, libc=None, os="windows",
             source=f"GHA runs-on: {runner_ref} in {workflow.name}",
         ))
         return
@@ -618,7 +754,7 @@ def _add_runner(
         macos_version = _parse_macos_runner_version(runner_ref)
         arch = "aarch64" if macos_version is None or macos_version[0] >= 14 else "x86_64"
         matrix.add(PlatformPair(
-            arch=arch, libc=None,
+            arch=arch, libc=None, os="macosx",
             source=f"GHA runs-on: {runner_ref} in {workflow.name}",
             macos_version=macos_version,
         ))
@@ -629,7 +765,12 @@ def _add_runner(
             runner_ref, workflow,
         )
     matrix.add(PlatformPair(
-        arch="x86_64", libc=libc,
+        arch=arch, libc=libc,
+        # A label the runner table KNOWS is a Linux image; an
+        # unrecognised (self-hosted) label stays os=None — unknown,
+        # which the compat matcher treats with the legacy lenient
+        # fall-through rather than asserting an OS it can't know.
+        os="linux" if libc is not None else None,
         source=f"GHA runs-on: {runner_ref} in {workflow.name}",
     ))
 
@@ -637,18 +778,6 @@ def _add_runner(
 # ---------------------------------------------------------------------------
 # Top-level discovery
 # ---------------------------------------------------------------------------
-
-
-def _is_dockerfile(path: Path) -> bool:
-    # Same name grammar as the bump walker's predicate — including
-    # the ``<variant>.Dockerfile`` capital-D suffix form, which the
-    # other consumers accept and this discovery pass must too.
-    name = path.name
-    if name in ("Dockerfile", "Containerfile"):
-        return True
-    if name.startswith("Dockerfile.") or name.endswith(".Dockerfile"):
-        return True
-    return bool(name.endswith(".dockerfile"))
 
 
 def _iter_dockerfiles(target: Path) -> Iterable[Path]:
@@ -677,11 +806,11 @@ def discover_platform_matrix(target: Path) -> ProjectPlatformMatrix:
     matrix = ProjectPlatformMatrix()
 
     for dockerfile in _iter_dockerfiles(target):
-        _walk_dockerfile(dockerfile, matrix)
+        _walk_dockerfile(dockerfile, matrix, target)
 
     devcontainer = target / ".devcontainer" / "devcontainer.json"
     if devcontainer.exists():
-        _walk_devcontainer(devcontainer, matrix)
+        _walk_devcontainer(devcontainer, matrix, target)
 
     # buildx bake configs at the repo root — declares multi-arch
     # release targets independently of the Dockerfile. Read BEFORE
@@ -697,6 +826,7 @@ def discover_platform_matrix(target: Path) -> ProjectPlatformMatrix:
         matrix.add(PlatformPair(
             arch="x86_64",
             libc=LibcVersion("glibc", (2, 17)),
+            os="linux",
             source="default (no platform signals found)",
         ))
 

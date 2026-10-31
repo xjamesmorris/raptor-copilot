@@ -90,16 +90,42 @@ class _Batch:
     sources: list[str]
 
 
-class _BudgetExhaustedSkip(Exception):
+class _BatchSkip(Exception):
+    """Base for internal skip markers: the batch was dropped WITHOUT
+    an LLM call ever being made.
+
+    These still flow into the caller's ``on_error`` so per-batch
+    fallback results keep applying (spec synthesis degrades skipped
+    batches to the name heuristic), but consumers must not present
+    them as LLM failures: budget skips are reported once by the
+    aggregate line in ``_run_batches`` and auth skips end in
+    ``LLMAuthPersistentError``.  Subclasses carry an explicit message
+    so a stringified skip is never a blank error.
+    """
+
+
+class _BudgetExhaustedSkip(_BatchSkip):
     """Internal marker: batch skipped without an LLM call because the
     run budget is already exhausted (terminal — see
     ``core.llm.client.LLMBudgetExceededError``)."""
 
+    def __init__(self) -> None:
+        super().__init__(
+            "batch skipped: run budget already exhausted "
+            "(no LLM call made)"
+        )
 
-class _AuthAbortSkip(Exception):
+
+class _AuthAbortSkip(_BatchSkip):
     """Internal marker: batch skipped without an LLM call because the
     auth-failure tracker already tripped (terminal — see
     ``core.llm.client.LLMAuthPersistentError``)."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "batch skipped: persistent auth refusal already detected "
+            "(no LLM call made)"
+        )
 
 
 def _run_batches(
@@ -177,7 +203,7 @@ def _run_batches(
         return on_error(batch, exc) if on_error else None
 
     mw = getattr(llm_client, "recommended_max_workers", 1)
-    results = run_parallel(
+    results: list[Any] = run_parallel(
         batches, _fn,
         max_workers=mw,
         label=label,
@@ -330,17 +356,21 @@ def _read_candidate_source(
     if not full_path.is_file():
         return f"# file not found: {cand.file}"
 
-    try:
-        text = full_path.read_text(encoding="utf-8", errors="replace")
-        lines = text.splitlines()
-        if (cand.line_start or 0) > 0 and (cand.line_end or 0) > 0:
-            start = max(0, cand.line_start - 1)
-            end = min(len(lines), cand.line_end)
-            lines = lines[start:end]
-        lines = lines[:max_lines]
-        return "\n".join(lines)
-    except OSError:
+    # Capped read: the candidate file is scanned-target content and
+    # only a line window is wanted — a whole-file read let one planted
+    # huge file balloon memory before the slice.
+    from core.source import read_text_capped
+
+    got = read_text_capped(full_path)
+    if got is None:
         return f"# read error: {cand.file}"
+    lines = got[0].splitlines()
+    if (cand.line_start or 0) > 0 and (cand.line_end or 0) > 0:
+        start = max(0, cand.line_start - 1)
+        end = min(len(lines), cand.line_end)
+        lines = lines[start:end]
+    lines = lines[:max_lines]
+    return "\n".join(lines)
 
 
 def _build_user_prompt(
@@ -559,6 +589,19 @@ def synthesise_assumptions(
     def _on_error(
         batch: _Batch, exc: Exception,
     ) -> list[SafetyAssumption]:
+        # Skip sentinels are not LLM failures — the batch never made a
+        # call.  Budget skips are already reported ONCE by the
+        # aggregate "budget exhausted, dropping remaining N batch(es)"
+        # line and auth skips end in LLMAuthPersistentError, so a
+        # per-batch WARNING here would only bury those honest lines
+        # under one blank "LLM error" per skipped batch.
+        if isinstance(exc, _BatchSkip):
+            logger.debug(
+                "iris.synthesise: assumption batch of %d function(s) "
+                "skipped without an LLM call: %s",
+                len(batch.candidates), exc,
+            )
+            return []
         # Unlike spec synthesis there is no heuristic fallback here —
         # the name heuristics produce TaintSpecs, not SafetyAssumptions
         # — so a failed batch degrades to no assumptions.  Log loudly:
@@ -642,11 +685,10 @@ def _parse_assumption_response(response: str) -> list[SafetyAssumption]:
         logger.debug("iris.synthesise: assumption response not valid JSON")
         return []
 
-    if not isinstance(data, list):
-        data = [data]
+    items = data if isinstance(data, list) else [data]
 
     result: list[SafetyAssumption] = []
-    for item in data:
+    for item in items:
         if not isinstance(item, dict):
             continue
         if not item.get("target") or not item.get("assumption"):

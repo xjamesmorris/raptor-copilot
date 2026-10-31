@@ -28,6 +28,8 @@ from typing import Any
 
 from packages.checker_synthesis.cwe_families import cwe_siblings
 
+from core.source import read_contained, read_text_capped
+
 from core.recall.matcher import canonical_cwe
 from core.recall.score import LABEL_CLASS
 
@@ -86,11 +88,12 @@ def _read_source(entry: dict[str, Any],
                  source_root: Path | None) -> str | None:
     path = Path(entry.get("file", ""))
     if source_root is not None and not path.is_absolute():
-        path = source_root / path
-    try:
-        return path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
+        # Root-joined reads are containment-checked: a corpus entry
+        # whose relative path escapes the source root is mislabeled
+        # data, not a file to read (counts as unreadable).
+        return read_contained(source_root, path)
+    got = read_text_capped(path)
+    return None if got is None else got[0]
 
 
 def _rules_for_cwe(cwe: str, produced: list[dict[str, Any]],

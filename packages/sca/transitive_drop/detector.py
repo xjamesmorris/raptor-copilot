@@ -27,6 +27,7 @@ import re
 from dataclasses import dataclass
 
 from packages.sca.findings import severity_rank
+from packages.sca.naming import fold_name, parent_join_key, pep503_name
 from packages.sca.versions import VersionError
 from packages.sca.versions import compare as version_compare
 
@@ -96,6 +97,14 @@ def detect_droppable_transitives(
 
     Transitive must have ``source_kind == "cascade_resolver"``
     AND ``source_extra["via"]`` populated by the cascade-tagger.
+
+    Production reachability caveat: the cascade pipeline populates
+    ``via`` for PyPI / npm / Cargo / Packagist / RubyGems only
+    (:mod:`packages.sca.transitive` — Maven has no cascade lockfile
+    parser, NuGet has a parser but no parent extractor yet). The
+    Maven and NuGet arms above are therefore reachable only through
+    callers that supply their own ``via`` linkage; they do not fire
+    from the standard pipeline until those extractors land.
     """
     clients = {
         "PyPI": pypi_client,
@@ -111,25 +120,31 @@ def detect_droppable_transitives(
 
     deps_list = list(deps)
     # Index findings by their dep coordinate so we know which
-    # transitives have issues worth proposing a bump for.
+    # transitives have issues worth proposing a bump for. Keyed
+    # CANONICALLY, matching the ``by_eco_name`` grouping below: a
+    # raw-spelling key made the lookup depend on which spelling
+    # happened to be the group's first member (two manifests
+    # declaring ``zope.interface`` / ``zope-interface`` land in one
+    # canonical group, but only the first member's raw name was
+    # tried).
     issue_keys: dict[tuple[str, str], str] = {}
     for f in vuln_findings:
         d = f.dependency
         if d is not None:
-            key = (d.ecosystem, d.name)
+            key = (d.ecosystem, _canonical_name(d.ecosystem, d.name))
             sev = getattr(f, "severity", "medium")
             # Keep the most severe finding for tier escalation.
             issue_keys[key] = _max_severity(issue_keys.get(key), sev)
-    for f in supply_chain_findings:
+    for f in supply_chain_findings:  # type: ignore[assignment]
         d = f.dependency
         if d is not None:
-            key = (d.ecosystem, d.name)
+            key = (d.ecosystem, _canonical_name(d.ecosystem, d.name))
             sev = getattr(f, "severity", "info")
             issue_keys[key] = _max_severity(issue_keys.get(key), sev)
-    for f in hygiene_findings:
-        d = getattr(f, "dependency", None)
+    for f in hygiene_findings:  # type: ignore[assignment]
+        d = getattr(f, "dependency", None)  # type: ignore[assignment]
         if d is not None:
-            key = (d.ecosystem, d.name)
+            key = (d.ecosystem, _canonical_name(d.ecosystem, d.name))
             sev = getattr(f, "severity", "info")
             issue_keys[key] = _max_severity(issue_keys.get(key), sev)
 
@@ -151,47 +166,71 @@ def detect_droppable_transitives(
         canon = _canonical_name(d.ecosystem, d.name)
         by_eco_name.setdefault((d.ecosystem, canon), []).append(d)
 
-    # Direct deps indexed by (ecosystem, canonical name) — we need
+    # Direct deps indexed by (ecosystem, parent-join key) — we need
     # their currently-pinned version when querying parent metadata.
-    direct_versions: dict[tuple[str, str], str] = {}
+    # The join key MUST be the same rule the cascade parent-map
+    # producer uses (``source_extra["via"]`` values are emitted
+    # through it), not the pipeline-wide fold: the producer
+    # case-folds every ecosystem, so a case-preserving key here
+    # silently skips mixed-case parents. The value keeps the direct
+    # dep's manifest spelling for registry queries (case-sensitive
+    # registries) and operator-facing output.
+    direct_versions: dict[tuple[str, str], tuple[str, str]] = {}
     for d in deps_list:
         if d.direct and d.version and d.ecosystem in clients:
-            canon = _canonical_name(d.ecosystem, d.name)
-            direct_versions[(d.ecosystem, canon)] = d.version
+            jk = parent_join_key(d.name.strip(), d.ecosystem)
+            direct_versions[(d.ecosystem, jk)] = (d.name, d.version)
 
     for (eco, canon_name), transitive_deps in by_eco_name.items():
         client = clients[eco]
-        # Only spend the PyPI roundtrip on transitives whose
+        # Only spend the registry roundtrip on transitives whose
         # PROBLEMS make a bump worth surfacing.
-        sample = transitive_deps[0]
-        key = (sample.ecosystem, sample.name)
+        key = (eco, canon_name)
         if key not in issue_keys:
             continue
         underlying_sev = issue_keys[key]
 
-        for parent in sample.source_extra.get("via") or []:
-            parent_canon = _canonical_name(eco, parent)
-            pair = (eco, canon_name, parent_canon)
+        # Walk EVERY canonical-group member's parents — different
+        # lockfile rows for the same canonical dep can carry
+        # different ``via`` parents (one manifest pulls it through
+        # parent A, another through parent B); sampling only the
+        # first member silently skipped every other parent's
+        # cross-version diff, a missed recommendation.
+        # ``seen_pairs`` dedups parents shared across members.
+        member_parents = [
+            (member, parent)
+            for member in transitive_deps
+            for parent in (member.source_extra or {}).get("via") or []
+        ]
+        for sample, parent in member_parents:
+            parent_join = parent_join_key(parent.strip(), eco)
+            pair = (eco, canon_name, parent_join)
             if pair in seen_pairs:
                 continue
             seen_pairs.add(pair)
 
-            parent_pinned = direct_versions.get((eco, parent_canon))
-            if not parent_pinned:
+            direct_entry = direct_versions.get((eco, parent_join))
+            if not direct_entry:
                 # The "parent" came from the cascade resolver but
                 # isn't in our direct dep set — could be a
                 # transitive-of-transitive. Skip; cross-version
                 # diff needs the operator's current pin.
                 continue
+            parent_spelled, parent_pinned = direct_entry
+            # Registry queries use the direct dep's manifest
+            # spelling (pipeline-canonicalised) — the ``via``
+            # string is producer-case-folded and would 404 on
+            # case-sensitive registries.
+            parent_query = _canonical_name(eco, parent_spelled)
 
             try:
                 latest = _latest_stable_version(
-                    eco, client, parent_canon,
+                    eco, client, parent_query,
                 )
             except Exception as e:                       # noqa: BLE001
                 logger.debug(
                     "transitive_drop: latest-version lookup failed for "
-                    "parent %s: %s", parent_canon, e,
+                    "parent %s: %s", parent_query, e,
                 )
                 continue
             if latest is None:
@@ -212,10 +251,10 @@ def detect_droppable_transitives(
             # Diff current's dep state against latest's. Per-ecosystem
             # dep-state extraction is dispatched here.
             current_state = _dep_state_in_version(
-                eco, client, parent_canon, parent_pinned, canon_name,
+                eco, client, parent_query, parent_pinned, canon_name,
             )
             latest_state = _dep_state_in_version(
-                eco, client, parent_canon, latest, canon_name,
+                eco, client, parent_query, latest, canon_name,
             )
             if current_state is None or latest_state is None:
                 continue
@@ -237,7 +276,7 @@ def detect_droppable_transitives(
                     transitive_name=sample.name,
                     transitive_version=sample.version or "",
                     transitive_finding_severity=underlying_sev,
-                    parent_name=parent,
+                    parent_name=parent_spelled,
                     parent_current_version=parent_pinned or "(unknown)",
                     parent_latest_version=latest,
                     transitive_status_in_latest=transitive_status,
@@ -252,12 +291,15 @@ def detect_droppable_transitives(
 # ---------------------------------------------------------------------------
 
 def _canonical_name(ecosystem: str, name: str) -> str:
-    """Per-ecosystem canonical-name normalisation. Most ecosystems
-    case-fold + treat ``_`` ≡ ``-``; Maven keeps ``groupId:artifactId``
-    case-sensitive."""
-    if ecosystem == "Maven":
-        return name.strip()
-    return name.lower().replace("_", "-")
+    """Per-ecosystem canonical name — delegates to the shared rule
+    (:mod:`packages.sca.naming`) so the detector joins on the SAME
+    form as the rest of the pipeline. The hand-rolled
+    ``lower().replace("_", "-")`` fold diverged both ways: a dotted
+    PyPI name (``foo.bar`` ≡ ``foo-bar`` under PEP 503) evaded drop
+    detection, and case-sensitive ecosystems (Cargo/Go/Maven) were
+    folded here and nowhere else, minting false matches at this
+    boundary only."""
+    return fold_name(name.strip(), ecosystem)
 
 
 def _max_severity(a: str | None, b: str) -> str:
@@ -307,13 +349,16 @@ def _latest_stable_version(
     metadata shape. Dispatches because each registry exposes
     versions slightly differently:
 
-      * PyPI / Composer (Packagist): ``releases: {<ver>: [...]}``
-        (Packagist returns ``packages[<name>]: [{version, ...}]``,
-        adapted below)
+      * PyPI: ``releases: {<ver>: [...]}``
       * npm: ``versions: {<ver>: {...}}``
-      * Maven / Cargo / RubyGems / NuGet: also via ``releases:``
-        (our stubs normalise into that shape; real clients may
-        vary)
+      * Packagist: ``packages[<name>]: [{version, ...}]``
+        (adapted below)
+      * Cargo: raw crates.io aggregate
+        ``versions: [{num, yanked, ...}]`` — ``CratesClient
+        .get_metadata`` returns the registry response verbatim,
+        with no ``releases`` adapter
+      * Maven / RubyGems / NuGet: also via ``releases:`` (their
+        clients ship aggregate-shape adapters)
     """
     meta = client.get_metadata(name) \
         if hasattr(client, "get_metadata") else None
@@ -330,6 +375,18 @@ def _latest_stable_version(
                 for v in vlist:
                     if isinstance(v, dict) and v.get("version"):
                         candidates.append(v["version"])
+    elif ecosystem == "Cargo":
+        # Raw crates.io aggregate: ``versions`` is a LIST of
+        # ``{num, yanked, ...}`` rows. Reading ``releases`` here
+        # returned an empty candidate set for every real
+        # CratesClient response, silently killing the Cargo lane.
+        # Yanked versions are not bump targets.
+        for v in meta.get("versions") or []:
+            if not isinstance(v, dict) or v.get("yanked"):
+                continue
+            num = v.get("num")
+            if isinstance(num, str) and num:
+                candidates.append(num)
     else:
         candidates = list((meta.get("releases") or {}).keys())
     stable = [v for v in candidates if _is_stable(ecosystem, v)]
@@ -398,7 +455,7 @@ def _dep_state_pypi(
     if requires_dist is None:
         return None
 
-    transitive_canon = transitive_name.lower().replace("_", "-")
+    transitive_canon = pep503_name(transitive_name)
     extras: list[str] = []
     unconditional = False
     for req in requires_dist:
@@ -410,7 +467,7 @@ def _dep_state_pypi(
         )
         if not name_match:
             continue
-        req_name = name_match.group(1).lower().replace("_", "-")
+        req_name = pep503_name(name_match.group(1))
         if req_name != transitive_canon:
             continue
         if marker.strip():
@@ -445,10 +502,12 @@ def _dep_state_npm(
     transitive_name: str,
 ) -> dict | None:
     """npm's per-version metadata lives inline in the packument
-    (``versions[<ver>]``). Check for the transitive in ALL four
-    dep keys: ``dependencies`` (required), ``optionalDependencies``,
-    ``peerDependencies`` (with ``peerDependenciesMeta[name].optional``),
-    ``devDependencies`` (build-only)."""
+    (``versions[<ver>]``). Check for the transitive in the three
+    install-relevant dep keys: ``dependencies`` (required),
+    ``optionalDependencies``, ``peerDependencies`` (with
+    ``peerDependenciesMeta[name].optional``). ``devDependencies`` is
+    deliberately not consulted — it is never installed transitively,
+    so its presence says nothing about a runtime drop."""
     meta = client.get_metadata(parent_name)
     if not isinstance(meta, dict):
         return None
@@ -505,14 +564,19 @@ def _dep_state_cargo(
     deps = client.get_version_dependencies(parent_name, parent_version)
     if not isinstance(deps, list):
         return None
-    transitive_canon = transitive_name.lower().replace("_", "-")
+    # crates.io rejects new names that collide under case or -/_
+    # swaps, so the SYMMETRIC equivalence fold on both sides of this
+    # registry join is deliberate; pep503_name is byte-equivalent for
+    # crate names (dots are not legal in them) and keeps the rule in
+    # one module.
+    transitive_canon = pep503_name(transitive_name)
     extras: list[str] = []
     unconditional = False
     for d in deps:
         if not isinstance(d, dict):
             continue
         name = d.get("crate_id") or d.get("name") or ""
-        if name.lower().replace("_", "-") != transitive_canon:
+        if pep503_name(name) != transitive_canon:
             continue
         kind = d.get("kind") or "normal"
         is_optional = bool(d.get("optional"))

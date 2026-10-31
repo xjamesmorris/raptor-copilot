@@ -7,7 +7,8 @@ name: SCA-gated self-bump
 #
 #   1. ``raptor-sca fix --harden`` on Python / Debian apt / npm
 #      tooling pins — pins / bumps every
-#      loose dep in requirements.txt and requirements-dev.txt to the
+#      loose dep in pyproject.toml and the transitional requirements
+#      compatibility files to the
 #      highest version that passes the full SCA signal set (OSV vulns,
 #      KEV, EPSS, yanked-version detection, license diff, hygiene
 #      checks, supply-chain checks incl. install hooks / typo-squat /
@@ -29,6 +30,12 @@ name: SCA-gated self-bump
 # Auth surface: needs ``contents: write`` + ``pull-requests: write``
 # to open the bump PR. Same surface as Dependabot. Auto-merge is
 # deliberately NOT enabled — operator reviews the PR before merging.
+# Permissions are job-wide by GitHub's model (no per-step grants), so
+# the write token is kept away from the phases that parse untrusted
+# registry data two ways: checkout runs with persist-credentials:false
+# (nothing in .git/config), and only the publish steps (push branch,
+# create/update PR) receive the token via env — the harden / bump
+# steps run tokenless (same pattern as refresh-sca-data.yml).
 #
 # Branch-protection assumption: this workflow's safety relies on
 # ``main`` having branch protection that requires PR review before
@@ -90,29 +97,36 @@ jobs:
         # allowlist). Ubuntu 24.04 runner images block unprivileged
         # user namespaces via AppArmor by default and the tier needs
         # newuidmap/newgidmap from the uidmap package.
-        run: |
-          sudo apt-get install -y --no-install-recommends uidmap
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        uses: ./.github/actions/enable-userns
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          python-version: '3.14'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
 
       - name: Install RAPTOR + deps
+        shell: bash
         run: |
-          python -m pip install --upgrade pip==26.1.1
-          pip install -r requirements.txt -r requirements-dev.txt
+          uv export --locked --no-hashes | uv pip install --system -r -
           # CVSS v4 scoring — optional for end users (see the
-          # requirements.txt entry), required here so severity-based
+          # pyproject.toml entry), required here so severity-based
           # bump prioritisation sees numeric v4 scores.
-          pip install cvss==3.6
+          uv pip install --system cvss==3.6
 
       - name: Phase 1 — harden Python / Debian / npm manifests
         id: harden
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # higher rate limits for OSV / GitHub queries
+        # Deliberately NO GITHUB_TOKEN here: this phase fetches and
+        # parses OSV / registry / npm / PyPI metadata — attacker-
+        # influenceable content — and a write-capable token in its
+        # process env would re-open exactly the exfil surface the
+        # persist-credentials:false checkout closes one layer down.
+        # Cost: unauthenticated GitHub API rate limits for the
+        # hash-pin lookups (the code degrades gracefully); the write
+        # token is confined to the publish steps, mirroring the
+        # refresh-sca-* workflows.
         run: |
           set -euo pipefail
           # Subcommand: ``raptor-sca fix --harden`` — verified via
@@ -123,7 +137,7 @@ jobs:
           # patched worktree to confirm findings reduced before
           # emitting. ``--no-llm`` keeps the run mechanical-only
           # (no API keys in CI). NO ``--ecosystems`` filter — we
-          # want the bump to cover Python (requirements.txt),
+          # want the bump to cover Python (pyproject.toml / requirements.txt),
           # Debian (apt-installed in devcontainer), and npm
           # (yarn / pnpm in devcontainer).
           # ``--exclude``: never bump pins inside test / fixture
@@ -133,6 +147,11 @@ jobs:
           # This is repo policy passed explicitly; the tool itself
           # applies no default exclusion, and scanning still reports
           # findings in these trees.
+          # The sandbox feature-matrix images are runner-model pins
+          # (each Dockerfile's base tag IS a matrix lane's OS axis) —
+          # a bump once moved both to the same newer tag and collapsed
+          # the u24/u26 image axis into one substrate. Same rationale
+          # as fixture pins: the old versions are deliberate.
           rm -rf /tmp/sca-harden-out
           bin/raptor-sca fix . --harden \
             --out /tmp/sca-harden-out \
@@ -142,7 +161,8 @@ jobs:
             --exclude '**/tests/**' \
             --exclude '**/test/**' \
             --exclude '**/fixtures/**' \
-            --exclude '**/testdata/**'
+            --exclude '**/testdata/**' \
+            --exclude 'core/sandbox/scripts/feature-matrix/images/**'
           if [[ -s /tmp/sca-harden-out/upgrade.patch ]]; then
             echo "patch_present=true" >> "$GITHUB_OUTPUT"
           else
@@ -155,8 +175,7 @@ jobs:
 
       - name: Phase 2 — bump non-manifest surfaces
         id: bump
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # No GITHUB_TOKEN — same registry-parsing exposure as Phase 1.
         run: |
           set -euo pipefail
           # ``--apply`` writes Clean-verdict bumps in place. Review /
@@ -168,7 +187,9 @@ jobs:
           # committed file in the PR and the "Detect changes" step always
           # sees a spurious change.
           # Same fixture-protection policy as Phase 1 (see comment
-          # there): fixture pins are test assertions, never bumped.
+          # there): fixture pins are test assertions, never bumped —
+          # and the feature-matrix images are runner-model pins (the
+          # base tag is a matrix lane's OS axis).
           bin/raptor-sca bump . \
             --apply \
             --pr-comment \
@@ -177,6 +198,7 @@ jobs:
             --exclude '**/test/**' \
             --exclude '**/fixtures/**' \
             --exclude '**/testdata/**' \
+            --exclude 'core/sandbox/scripts/feature-matrix/images/**' \
             > "$RUNNER_TEMP/pr-body.md"
 
       - name: Exclude workflow-file changes (GITHUB_TOKEN can't push them)

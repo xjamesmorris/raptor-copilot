@@ -10,6 +10,7 @@ import json
 import logging
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -766,3 +767,68 @@ class TestSMTUnsatConclusiveFlag:
         ev = a.run("x == 0\nx != 0\n", tmp_path)
         assert "refutes" in ev.summary
         assert "confirms" in ev.summary
+
+
+class TestSMTAdapterDualSignedness:
+    """The default (unpinned) profile is a signedness GUESS — an unsat
+    verdict must be honored only when BOTH signedness profiles agree,
+    or the ubiquitous C signed error check (``ret < 0``) refutes any
+    hypothesis that carries it."""
+
+    def test_default_profile_routes_through_dual(self, tmp_path,
+                                                 monkeypatch):
+        import packages.hypothesis_validation.adapters.smt as smt_mod
+        calls: list[str] = []
+
+        def _fake(conditions, profile=None):
+            calls.append("dual")
+            return SimpleNamespace(
+                feasible=True, model={}, unknown=[], reasoning="sat")
+
+        monkeypatch.setattr(smt_mod, "check_path_feasibility_dual", _fake)
+        monkeypatch.setattr(
+            smt_mod.SMTAdapter, "is_available", lambda self: True)
+        ev = SMTAdapter().run("size > 0\n", tmp_path)
+        assert ev.success
+        assert calls == ["dual"]
+
+    def test_pinned_profile_keeps_single_check(self, tmp_path,
+                                               monkeypatch):
+        import packages.hypothesis_validation.adapters.smt as smt_mod
+        calls: list[str] = []
+
+        def _fake(conditions, profile=None):
+            calls.append("single")
+            return SimpleNamespace(
+                feasible=True, model={}, unknown=[], reasoning="sat")
+
+        monkeypatch.setattr(smt_mod, "check_path_feasibility", _fake)
+        monkeypatch.setattr(
+            smt_mod.SMTAdapter, "is_available", lambda self: True)
+        ev = SMTAdapter(bv_profile=object()).run("size > 0\n", tmp_path)
+        assert ev.success
+        assert calls == ["single"]
+
+    @pytest.mark.skipif(
+        not SMTAdapter().is_available(),
+        reason="z3-solver not installed",
+    )
+    def test_signed_error_check_not_refuted_by_default(self, tmp_path):
+        # Fails pre-adoption: single-profile uint64 encoded
+        # ``ret < 0`` as ULT(ret, 0) — unsat — confirming a false
+        # infeasibility.
+        ev = SMTAdapter().run("ret < 0\n", tmp_path)
+        assert ev.success
+        assert "sat" in ev.summary and "unsat" not in ev.summary
+
+    @pytest.mark.skipif(
+        not SMTAdapter().is_available(),
+        reason="z3-solver not installed",
+    )
+    def test_pinned_unsigned_profile_still_authoritative(self, tmp_path):
+        # Two-direction companion: an operator who PINS unsigned has
+        # asserted the signedness — the single-profile unsat stands.
+        from core.smt_solver import BV_C_UINT64
+        ev = SMTAdapter(bv_profile=BV_C_UINT64).run("ret < 0\n", tmp_path)
+        assert ev.success
+        assert "unsat" in ev.summary

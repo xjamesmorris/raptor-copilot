@@ -33,25 +33,19 @@ from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from core.json import dumps_artifact, load_json
-from core.security.log_sanitisation import escape_nonprintable
-
+from . import _md
 from .findings import severity_rank
+from .rows import FindingRow
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
 
 logger = logging.getLogger(__name__)
 
-# Length cap for interpolated markdown table cells. Finding labels
-# (eco:name@version + advisory id) and suppression reasons come from
-# findings.json, which downstream carries registry / manifest /
-# suppression-file content — long enough for legitimate values,
-# short enough that an adversarial multi-kilobyte string can't
-# balloon the PR comment past GitHub's cap.
-_MD_CELL_LIMIT = 200
+_MD_CELL_LIMIT = _md.MD_INLINE_LIMIT
 
 
-def _md_cell(value: Any, *, limit: int = _MD_CELL_LIMIT) -> str:
+def md_cell(value: Any, *, limit: int = _MD_CELL_LIMIT) -> str:
     """Neutralise an untrusted value for a markdown table cell.
 
     Finding labels and suppression reasons flow from findings.json
@@ -59,24 +53,13 @@ def _md_cell(value: Any, *, limit: int = _MD_CELL_LIMIT) -> str:
     tables that ``render_pr_comment`` wraps in ``<details>`` blocks.
     Unescaped ``|`` splits the row; raw ``</details>`` + a forged
     header closes the real section and injects content that renders
-    as if raptor-sca produced it. Escape the markdown/HTML
-    structural characters, collapse newlines (row terminators), defang
-    non-printables, and length-cap so every consumer of these tables
-    (baseline-delta.md, pr-comment.md, stdout) gets inert text.
+    as if raptor-sca produced it; ``![x](url)`` / ``[text](url)``
+    render as an ACTIVE inline image (beacon) or link (phishing) in
+    the PR comment. Delegates to the package-wide inline neutraliser
+    (:func:`packages.sca._md.neutralize_inline`) so tables and prose
+    share one mechanism.
     """
-    text = str(value)
-    text = text.replace("\r", " ").replace("\n", " ")
-    text = (
-        text.replace("\\", "\\\\")
-            .replace("|", "\\|")
-            .replace("`", "\\`")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-    )
-    text = escape_nonprintable(text)
-    if len(text) > limit:
-        text = text[:limit].rstrip() + "…"
-    return text
+    return _md.neutralize_inline(value, limit=limit)
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +160,8 @@ def compute_delta(
     a_full = _index_by_canonical_key(list(rows_a))
     b_full = _index_by_canonical_key(list(rows_b))
 
+    # Buckets carry the ORIGINAL row dicts (``FindingRow.raw``) — the
+    # JSON delta output re-emits them verbatim, so unknown keys survive.
     new: list[dict[str, Any]] = []
     resolved: list[dict[str, Any]] = []
     suppression_added: list[dict[str, Any]] = []
@@ -186,23 +171,23 @@ def compute_delta(
     for key, row in b_full.items():
         if key in a_full:
             continue
-        if row.get("suppressed") and not include_suppressed:
+        if row.suppressed and not include_suppressed:
             continue
-        new.append(row)
+        new.append(row.raw)
 
     for key, row in a_full.items():
         if key in b_full:
             continue
-        if row.get("suppressed") and not include_suppressed:
+        if row.suppressed and not include_suppressed:
             continue
-        resolved.append(row)
+        resolved.append(row.raw)
 
     for key in a_full.keys() & b_full.keys():
-        a_sup = bool(a_full[key].get("suppressed"))
-        b_sup = bool(b_full[key].get("suppressed"))
+        a_sup = a_full[key].suppressed
+        b_sup = b_full[key].suppressed
         if a_sup != b_sup:
             target = suppression_added if b_sup else suppression_lifted
-            target.append(b_full[key])
+            target.append(b_full[key].raw)
             continue
         # Same suppression state on both sides → persistent. Skip
         # suppressed rows from the bucket unless ``include_suppressed``
@@ -211,7 +196,7 @@ def compute_delta(
         # the operator's accepted-risk pile and clutters the count.
         if a_sup and not include_suppressed:
             continue
-        persistent.append(b_full[key])
+        persistent.append(b_full[key].raw)
 
     return DeltaResult(
         new=_sorted(new),
@@ -284,7 +269,7 @@ def _load_rows(path_str: str) -> list[dict[str, Any]] | None:
     return data
 
 
-def _canonical_key(row: dict[str, Any]) -> tuple[str, ...] | None:
+def _canonical_key(row: FindingRow) -> tuple[str, ...] | None:
     """Identity for cross-run comparison.
 
     Vulnerable_dependency: ``(eco, name, primary_cve_or_osvid)`` — the
@@ -297,26 +282,28 @@ def _canonical_key(row: dict[str, Any]) -> tuple[str, ...] | None:
     these are project-level concerns about a dep, not about its
     version.
     """
-    vuln_type = row.get("vuln_type", "")
-    sca = row.get("sca") or {}
-    eco = sca.get("ecosystem") or ""
-    name = sca.get("name") or ""
-    if vuln_type == "sca:vulnerable_dependency":
-        adv = sca.get("advisory") or {}
+    eco = row.sca.get("ecosystem") or ""
+    name = row.sca.get("name") or ""
+    if row.is_vulnerable_dependency:
+        adv = row.advisory
         cve = next(
             (a for a in (adv.get("aliases") or [])
              if isinstance(a, str) and a.upper().startswith("CVE-")),
             None,
         )
-        adv_key = (cve.upper() if cve else (adv.get("id") or ""))
+        # ``.upper()`` on BOTH arms: distro-secdb / kernel-CNA
+        # advisories are CVE-primary (the id IS the CVE, no
+        # self-alias), so a feed-case drift on the primary id would
+        # otherwise read as new+resolved instead of persistent.
+        adv_key = (cve or adv.get("id") or "").upper()
         if not adv_key:
             return None
         return ("vuln", eco, name, adv_key)
-    if vuln_type.startswith("sca:hygiene:"):
-        return ("hygiene", vuln_type, eco, name)
-    if vuln_type.startswith("sca:supply_chain:"):
-        return ("supply", vuln_type, eco, name)
-    if vuln_type.startswith("sca:license:"):
+    if row.is_hygiene:
+        return ("hygiene", row.vuln_type, eco, name)
+    if row.is_supply_chain:
+        return ("supply", row.vuln_type, eco, name)
+    if row.is_license:
         # Pre-fix license rows had no canonical key, so they were
         # invisibly dropped from every diff bucket — new license
         # violations in a PR never surfaced; persistent license
@@ -325,27 +312,38 @@ def _canonical_key(row: dict[str, Any]) -> tuple[str, ...] | None:
         # since license policy is a project-level concern about a
         # dep, not version-specific (an SPDX change between
         # versions is a separate finding anyway).
-        return ("license", vuln_type, eco, name)
+        return ("license", row.vuln_type, eco, name)
+    if row.is_scan_health:
+        # Same mechanism as the license fix above, unfixed sibling:
+        # scan_health rows are emitted precisely so pipelines can
+        # see that a scan's coverage degraded, yet they fell through
+        # to None — a baseline-gated pipeline reported "0 new
+        # findings" green while the current scan NEWLY degraded
+        # (quiet fail-open on the producer's own degradation
+        # signal). Identity is the degradation KIND (vuln_type =
+        # ``sca:scan_health:<kind>``): scan-level, no dep coords.
+        return ("scan_health", row.vuln_type)
     return None
 
 
 def _index_by_canonical_key(
     rows: Iterable[dict[str, Any]],
-) -> dict[tuple[str, ...], dict[str, Any]]:
+) -> dict[tuple[str, ...], FindingRow]:
     """Return ``{canonical_key: row}`` for every row that has a key.
 
     Suppression state is *part of the row*, not a filter — callers
     decide whether to skip suppressed rows when consuming the index.
     """
-    out: dict[tuple[str, ...], dict[str, Any]] = {}
-    for row in rows:
-        if not isinstance(row, dict):
+    out: dict[tuple[str, ...], FindingRow] = {}
+    for raw in rows:
+        row = FindingRow.from_row(raw)
+        if row is None:
             continue
         key = _canonical_key(row)
         if key is None:
             continue
         existing = out.get(key)
-        if existing is None or (existing.get("suppressed") and not row.get("suppressed")):
+        if existing is None or (existing.suppressed and not row.suppressed):
             out[key] = row
     return out
 
@@ -402,7 +400,7 @@ def _render_markdown(
     # Paths are operator-supplied argv, but they land in a shared
     # report — same cell treatment keeps the header inert.
     buf.write(
-        f"# raptor-sca diff — `{_md_cell(a_path)}` → `{_md_cell(b_path)}`\n\n"
+        f"# raptor-sca diff — `{md_cell(a_path)}` → `{md_cell(b_path)}`\n\n"
     )
     buf.write(f"- New: **{len(d.new)}**\n")
     buf.write(f"- Resolved: **{len(d.resolved)}**\n")
@@ -488,7 +486,7 @@ def render_pr_comment(
     # ``--repo-label`` is operator-supplied but flows into a PR
     # comment other reviewers read — neutralise like any other
     # interpolated field.
-    label = _md_cell(repo_label or "raptor-sca")
+    label = md_cell(repo_label or "raptor-sca")
     new_count = len(delta.new)
     resolved_count = len(delta.resolved)
     kev_new = sum(1 for r in delta.new
@@ -608,19 +606,19 @@ def _table(
     buf.write("|" + "|".join(["---"] * len(cols)) + "|\n")
     for r in rows:
         # Every interpolated field is untrusted (findings.json content)
-        # — route through ``_md_cell`` so a crafted package name,
+        # — route through ``md_cell`` so a crafted package name,
         # advisory id, or suppression reason can't break the table or
         # forge markup inside the surrounding <details> block.
-        sev = _md_cell((r.get("severity") or "info").title())
+        sev = md_cell((r.get("severity") or "info").title())
         sca = r.get("sca") or {}
         eco = sca.get("ecosystem") or ""
         name = sca.get("name") or ""
         version = sca.get("version") or ""
         adv = sca.get("advisory") or {}
         adv_id = (adv.get("id") if isinstance(adv, dict) else "") or ""
-        finding_label = _md_cell(f"{eco}:{name}@{version} {adv_id}".strip())
+        finding_label = md_cell(f"{eco}:{name}@{version} {adv_id}".strip())
         if show_suppression:
-            reason = _md_cell(r.get("suppression_reason") or "—")
+            reason = md_cell(r.get("suppression_reason") or "—")
             buf.write(f"| {sev} | {finding_label} | {reason} |\n")
         else:
             kev = "yes" if sca.get("in_kev") else ""
@@ -633,4 +631,4 @@ def _table(
     buf.write("\n")
 
 
-__all__ = ["DeltaResult", "compute_delta", "main"]
+__all__ = ["DeltaResult", "compute_delta", "main", "md_cell"]

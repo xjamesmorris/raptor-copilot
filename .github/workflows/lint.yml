@@ -103,6 +103,8 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
+          # Belt-and-braces: no step in this job needs git credentials.
+          persist-credentials: false
           # Need merge-base history for ``git diff origin/main...HEAD``.
           # Depth 200 covers any sane PR; shallower clones miss the base.
           fetch-depth: 200
@@ -113,20 +115,19 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
         with:
           enable-cache: true
-          cache-dependency-glob: "requirements*.txt"
+          cache-dependency-glob: "uv.lock"
 
       - name: Install ruff
         run: |
-          # Install only ruff (not full requirements-dev.txt) to keep
-          # this job fast and to avoid pulling pytest et al. just to
-          # lint. ruff is pinned to 0.15.12 in requirements-dev.txt —
-          # grep + uv pip install keeps a single source of truth.
+          # Install only ruff (not the full dev set) to keep this job
+          # fast. The pin lives in pyproject.toml — grep keeps a single
+          # source of truth.
           uv venv $VENV_PATH
           source $VENV_PATH/bin/activate
-          uv pip install "$(grep -E '^ruff==' requirements-dev.txt)"
+          uv pip install "$(grep -oE 'ruff==[0-9.]+' pyproject.toml)"
 
       - name: Compute changed Python files
         id: changed
@@ -173,14 +174,26 @@ jobs:
   # NOT a required status check — failure here means "drift, fix when
   # convenient" rather than "this PR is broken." Branch protection
   # gates on ``ruff-pr`` only.
+  #
+  # Deliberately EXEMPT from the pre_check dedup: the dedup treats a
+  # prior successful "Lint" run at the same (or PR-linked) SHA as
+  # equivalent, but PR-event runs execute ruff-pr (diff-only) and
+  # never this job — so on every squash/merge-landed PR the fallback
+  # found the PR run, set should_skip, and the push run's ONLY unique
+  # job was skipped: full-tree coverage was deferred to the weekly
+  # cron for every PR-landed change, and only direct pushes got it.
+  # Cost of the exemption: a true re-run at an identical push SHA
+  # repeats this ~2-minute informational job — accepted.
   ruff-tree:
-    needs: pre_check
-    if: needs.pre_check.outputs.should_skip != 'true' && (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    if: github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # Belt-and-braces: no step in this job needs git credentials.
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -188,16 +201,16 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
         with:
           enable-cache: true
-          cache-dependency-glob: "requirements*.txt"
+          cache-dependency-glob: "uv.lock"
 
       - name: Install ruff
         run: |
           uv venv $VENV_PATH
           source $VENV_PATH/bin/activate
-          uv pip install "$(grep -E '^ruff==' requirements-dev.txt)"
+          uv pip install "$(grep -oE 'ruff==[0-9.]+' pyproject.toml)"
 
       - name: Run ruff (full tree)
         run: |
@@ -206,14 +219,12 @@ jobs:
           ruff check --output-format=github \
             .
 
-  # Slash-command metadata: enforces every .claude/commands/*.md has a
-  # parseable ``dispatch:`` frontmatter (target exists on disk) and that
-  # commands.md's hardcoded exclusion list matches the frontmatter
-  # ``exclude_from_listing: true`` flags. Catches renamed libexec paths,
-  # missing dispatch fields on new commands, and alias-list drift at PR
-  # time — see CLAUDE.md SLASH-COMMAND DISPATCH for the design.
-  #
-  # Pure stdlib Python; no setup beyond checkout.
+  # Decision-layer metadata: validates slash-command dispatch metadata and
+  # the generated Copilot custom-agent projection plus the Claude plugin's
+  # identity-gated hook registry/configuration. Catches renamed libexec paths,
+  # alias-list drift, missing/duplicate agents, projection drift,
+  # frontend-incompatible model metadata, and unenforced sensitive-agent
+  # policies at PR time.
   command-metadata:
     needs: pre_check
     if: needs.pre_check.outputs.should_skip != 'true'
@@ -222,6 +233,104 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # Belt-and-braces: no step in this job needs git credentials.
+          persist-credentials: false
 
-      - name: Lint slash-command metadata
-        run: python3 .github/scripts/check_command_metadata.py
+      - name: Install metadata parser
+        run: python3 -m pip install "$(grep -oE 'pyyaml==[0-9.]+' pyproject.toml)"
+
+      - name: Lint decision-layer metadata
+        run: |
+          python3 .github/scripts/check_command_metadata.py
+          python3 .github/scripts/project_agent_projection.py
+
+  # Repo-invariant detectors as a PR gate. Every detector below also
+  # runs in the daily scheduled sweep (miswiring-scan.yml, kept as
+  # belt-and-braces + the stale-baseline triage surface; the two step
+  # lists are parity-pinned by test_ci_controls_docs — hand-counted
+  # copies of this set had already drifted), but schedule-only
+  # coverage means a change that
+  # introduces a NEW finding merges green and turns main red at the
+  # next morning's scan — a delayed failure attributed to the scan,
+  # not to the change that caused it. Running them here closes that
+  # gap at review time.
+  #
+  # Deliberately NO paths filter: the detectors are repo-global
+  # invariants (any file type can introduce a finding — Python, bash,
+  # libexec scripts, docs for env-var drift) and cheap; a paths filter
+  # is exactly how this coverage gap gets reborn. This workflow's
+  # triggers (pull_request → main, push → main, merge_group) mean a
+  # direct push to main cannot smuggle a finding either.
+  #
+  # Pure stdlib Python; no setup beyond checkout + interpreter
+  # (plus a pytest install for the ReDoS census rider at the end).
+  # Wall-clock budget: ~1 min total for all nine; check_miswiring's
+  # single-pass parallel AST index is ~5-10 s on 4-vCPU runners; the
+  # others are ~5-20 s each. timeout-minutes: 10 leaves generous
+  # headroom.
+  repo-invariants:
+    needs: pre_check
+    if: needs.pre_check.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # Invocations are verbatim (no flags, pipes, or wrappers) so a
+      # failure surfaces each detector's own report unfiltered, and
+      # local reproduction is exactly the command shown in the log.
+      - name: Run miswiring detector against baseline
+        run: python3 .github/scripts/check_miswiring.py
+
+      - name: Run env-var documentation drift check
+        run: python3 .github/scripts/check_env_docs.py
+
+      - name: Run vocabulary-list guardrail against baseline
+        run: python3 .github/scripts/check_vocab_lists.py
+
+      - name: Run canonical-JSON guardrail against baseline
+        run: python3 .github/scripts/check_canonical_json.py
+
+      - name: Run optional-dep import lint against baseline
+        run: python3 .github/scripts/check_optional_dep_imports.py
+
+      - name: Run report-writer closure gate against baseline
+        run: python3 .github/scripts/check_report_writer_closure.py
+
+      - name: Run console-chokepoint closure gate
+        run: python3 .github/scripts/check_console_chokepoint.py
+
+      - name: Run workflow pipefail lint against baseline
+        run: python3 .github/scripts/check_workflow_pipefail.py
+
+      - name: Run tracked-file census over the rule-pack subsystems
+        # --require-git: CI runs post-checkout, so the exported-tree
+        # notice arm must never be reachable here.
+        run: python3 .github/scripts/check_tracked_file_census.py --require-git
+
+      - name: Run run-dir read census against baseline
+        run: python3 .github/scripts/check_run_dir_reads.py
+
+      # The ReDoS idiom census rides this job rather than keeping its
+      # own single-step job in tests.yml: same whole-repo-invariant
+      # shape (its universe is the runtime tree), same checkout, and
+      # this job's no-paths-filter trigger is a superset of the old
+      # import-graph gate — every runtime-source PR still runs it.
+      # It is a pytest suite, not a check_*.py detector, so it sits
+      # outside the daily-sweep parity set above.
+      - name: Install pytest
+        # grep + pip install keeps pyproject.toml the single source
+        # of truth for the pytest pin (the ruff idiom above).
+        run: pip install "$(grep -oE 'pytest==[0-9.]+' pyproject.toml)"
+
+      - name: Run ReDoS idiom census
+        run: python -m pytest .github/tests/test_redos_idiom_census.py -q

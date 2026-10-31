@@ -21,6 +21,12 @@ if TYPE_CHECKING:
 
 
 def main(argv: Sequence[str]) -> int:
+    # Escaping-console chokepoint: this subcommand runs as its own
+    # libexec-dispatched process; with no logging config,
+    # logging.lastResort would relay WARNING+ foreign text
+    # (resolver/registry text) to the TTY with a plain formatter.
+    from .cli import _configure_logging  # local import: avoid cycle
+    _configure_logging(0)
     args = _parse_args(argv)
     eco_canonical = canonicalise(args.ecosystem)
     if eco_canonical is None:
@@ -42,7 +48,14 @@ def main(argv: Sequence[str]) -> int:
             file=sys.stderr,
         )
         return 2
-    print(f"pkg:{eco_canonical.lower()}/{args.name}@{args.version}")
+    name = args.name
+    if name.startswith("@"):
+        # purl-spec: namespace segments are percent-encoded — the
+        # scope's ``@`` must be ``%40`` (pkg:npm/%40types/node@...);
+        # the raw spelling is not a canonical purl, which is this
+        # utility's whole claim.
+        name = "%40" + name[1:]
+    print(f"pkg:{eco_canonical.lower()}/{name}@{args.version}")
     return 0
 
 

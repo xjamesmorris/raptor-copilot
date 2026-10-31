@@ -29,9 +29,14 @@ Scope — control-flow constructs handled:
   operand into its own node (so a sanitizer in the RHS of
   ``a && escape(x)`` is independently attributable) is documented
   as a Phase 10/11 refinement and deferred — none of the canonical
-  fixtures need it, and the conservative collapse over-suppresses
-  rather than under-suppresses (a sanitizer in any short-circuit
-  operand still appears in ``call_sites``).
+  fixtures need it. CAUTION on the collapse's direction: attributing
+  a possibly-skipped operand's sanitizer to a node that sits
+  unconditionally on the path is the FALSE-SUPPRESSION direction for
+  a suppression gate, not a safe over-approximation. What keeps it
+  sound today is the assigned_names discipline — collapsed call
+  sites carry empty ``assigned_names``, so the value-bound gate's
+  condition 3 never binds them and the verdict degrades to
+  candidate_only instead of suppress.
 
 What this module deliberately does NOT do:
 
@@ -57,6 +62,7 @@ from typing import (
 )
 from collections.abc import Iterable
 
+from core.analysis.cfg_node_tables import CPP_TABLES as _NODE_TABLES
 from core.analysis.cfg_builder import (
     ENTRY_LINENO,
     EXIT_LINENO,
@@ -111,11 +117,14 @@ class CPPCFGNode:
     arrow field access (``obj->field``), or a call to a bulk-copy
     function in :data:`_BULK_COPY_FUNCS` (``memcpy``, ``strcpy``,
     etc. — they write through a destination pointer the gate can't
-    track). evaluate_finding downgrades ``SUPPRESS → CANDIDATE_ONLY``
-    when any node on a source→sink path is ``may_escape``. The flag
-    is non-load-bearing for Python (PyCFGNode lacks the attribute and
-    ``getattr(..., "may_escape", False)`` keeps the Python path
-    bit-identical).
+    track), or a bare-name store to a symbol that is NOT a declared
+    local/parameter of the function (a file-scope global / static /
+    class member assigned by unqualified name — any callee can
+    rewrite it between this statement and a later read, so the
+    stored value's identity at the sink is unprovable).
+    evaluate_finding downgrades ``SUPPRESS → CANDIDATE_ONLY`` when
+    any node on a source→sink path is ``may_escape``. PyCFGNode
+    carries the same flag for ``global`` / ``nonlocal`` stores.
     """
     kind: str          # "entry" | "exit" | "stmt"
     lineno: int
@@ -184,7 +193,7 @@ def _get_parser(language: str):
         if language == "c":
             import tree_sitter_c as ts_lang
         elif language == "cpp":
-            import tree_sitter_cpp as ts_lang
+            import tree_sitter_cpp as ts_lang  # type: ignore[no-redef]
         else:
             return None
         # Reuse the call_graph parser cache so we don't re-allocate
@@ -273,6 +282,15 @@ _INDIRECTION_NODE_TYPES = frozenset({
     "pointer_expression",
     "subscript_expression",
 })
+
+# C++ lambda (tree-sitter-cpp; the C grammar never produces it). A
+# lambda is BOTH deferred execution (its body's calls are excluded
+# from the statement payload — see _walk_subtree_for_call_sites) and
+# an alias hazard: a by-reference capture lets the body rebind
+# enclosing locals whenever the lambda later runs, invisibly to
+# reaching-defs. The enclosing statement therefore stamps
+# ``may_escape`` — the gate demotes SUPPRESS → CANDIDATE_ONLY.
+_LAMBDA_EXPR = "lambda_expression"
 
 
 # ---------------------------------------------------------------------------
@@ -451,9 +469,17 @@ def _walk_subtree_for_call_sites(
 
     def visit(node: Node) -> None:
         t = node.type
+        if t == _LAMBDA_EXPR:
+            # Deferred execution: the body runs when the lambda is
+            # CALLED, not at this statement — attributing its calls
+            # here would put a possibly-never-executed sanitizer
+            # unconditionally on the path (false-suppression
+            # direction). The enclosing node is stamped may_escape
+            # instead (see _subtree_has_indirection).
+            return
         if t == _CALL_EXPR:
             callee = node.child_by_field_name("function")
-            name = _resolve_callable_name(callee)
+            name = _resolve_callable_name(callee)  # type: ignore[arg-type]
             args = _arg_surface_names(node)
             is_root = id(_unwrap_value_expr(node)) == root_id or \
                 id(node) == root_id
@@ -487,11 +513,15 @@ def _walk_subtree_for_calls(n) -> frozenset[str]:
     """Set of dotted callable names referenced anywhere in ``n``.
     Equivalent to ``{cs.name for cs in
     _walk_subtree_for_call_sites(n)}`` but without the position
-    plumbing; used to populate the back-compat ``calls`` field."""
+    plumbing; used to populate the back-compat ``calls`` field.
+    Lambda bodies are excluded — deferred execution, same rule as
+    the call-site walker."""
     out: set[str] = set()
     stack = [n] if n is not None else []
     while stack:
         cur = stack.pop()
+        if cur.type == _LAMBDA_EXPR:
+            continue
         if cur.type == _CALL_EXPR:
             callee = cur.child_by_field_name("function")
             name = _resolve_callable_name(callee)
@@ -522,7 +552,7 @@ def _subtree_has_indirection(n) -> bool:
     while stack:
         cur = stack.pop()
         t = cur.type
-        if t in _INDIRECTION_NODE_TYPES:
+        if t in _INDIRECTION_NODE_TYPES or t == _LAMBDA_EXPR:
             return True
         if t == _FIELD_EXPR:
             op = cur.child_by_field_name("operator")
@@ -567,6 +597,9 @@ def _payload_from_declaration(decl) -> tuple[frozenset[str], frozenset[str],
                 )
                 calls_acc |= _walk_subtree_for_calls(val)
                 uses_acc |= _walk_subtree_for_uses(val)
+                # Embedded stores in the INITIALIZER (``char *z =
+                # (y = x);``) — see _embedded_store_names.
+                defs |= _embedded_store_names(val)
         elif child.type in (
             _IDENT, _POINTER_DECLARATOR,
             "array_declarator", "function_declarator",
@@ -579,13 +612,26 @@ def _payload_from_declaration(decl) -> tuple[frozenset[str], frozenset[str],
             tuple(cs_acc))
 
 
-def _payload_from_assignment(expr: Node) -> tuple[frozenset[str], frozenset[str],
-                                             frozenset[str], tuple[CallSite, ...]]:
+def _payload_from_assignment(
+    expr: Node, local_scopes: _LocalNameScopes | None = None,
+) -> tuple[frozenset[str], frozenset[str],
+           frozenset[str], tuple[CallSite, ...]]:
     """``x = f(y);`` / ``x += f(y);`` — defs={x}, RHS feeds uses + call_sites.
 
     Compound LHSes (``a.b = ...``, ``arr[i] = ...``) contribute the
     base name only as a def. Phase 10's ``may_escape`` policy
-    handles the through-indirection write semantics."""
+    handles the through-indirection write semantics.
+
+    ``assigned_names`` (sanitizer-output identity) is granted only
+    for a plain-identifier ``=`` LHS a declared local/param
+    declarator positionally vouches for (``local_scopes``). A
+    compound LHS mutates through the base name without rebinding it,
+    and a bare-name store no in-scope preceding declarator vouches
+    for resolves to a file-scope global / static / class member —
+    a binding any callee can rewrite between this statement and a
+    later read, so the value gate must not treat it as a clean local
+    rebinding (the enclosing node is additionally stamped
+    ``may_escape`` by the builder)."""
     lhs = expr.child_by_field_name("left")
     rhs = expr.child_by_field_name("right")
     op_node = expr.child_by_field_name("operator")
@@ -599,12 +645,18 @@ def _payload_from_assignment(expr: Node) -> tuple[frozenset[str], frozenset[str]
     if op != "=" and lhs_name is not None:
         uses_acc.add(lhs_name)
     if rhs is not None:
-        assigned = defs if op == "=" else frozenset()
+        clean_lhs = (lhs is not None and lhs.type == _IDENT
+                     and op == "=" and local_scopes is not None
+                     and local_scopes.vouches(lhs_name, lhs.start_byte))  # type: ignore[arg-type]
+        assigned = defs if clean_lhs else frozenset()
         cs_acc.extend(
             _walk_subtree_for_call_sites(rhs, assigned_for_root=assigned)
         )
         calls_acc |= _walk_subtree_for_calls(rhs)
         uses_acc |= _walk_subtree_for_uses(rhs)
+        # Embedded stores in the RHS (``z = (y = x);``) — defs only,
+        # never assigned_names; see _embedded_store_names.
+        defs = defs | _embedded_store_names(rhs)
     # The LHS may also contain uses — e.g. ``arr[i] = ...`` reads
     # ``arr`` and ``i``. Walk it but exclude the bare LHS target.
     if lhs is not None and lhs.type != _IDENT:
@@ -612,18 +664,59 @@ def _payload_from_assignment(expr: Node) -> tuple[frozenset[str], frozenset[str]
     return (frozenset(calls_acc), defs, frozenset(uses_acc), tuple(cs_acc))
 
 
+def _embedded_store_names(n) -> frozenset[str]:
+    """Store-side base names of assignments and updates EMBEDDED in
+    an expression subtree (a condition, a for-step, a call argument).
+
+    ``if ((p = malloc(n)))`` / ``while ((c = getc(f)) != EOF)`` write
+    their LHS; a payload with ``defs=∅`` makes that definer invisible
+    to reaching-defs, so the value-bound gate's condition-3
+    exclusivity holds falsely on a live re-taint. Recording the def
+    only (never ``assigned_names``) is the refusal direction: an
+    extra definer can break an exclusivity proof but never grants
+    sanitizer-output identity.
+    """
+    return frozenset(name for name, _ in _embedded_store_sites(n))
+
+
+def _embedded_store_sites(n) -> tuple[tuple[str, int], ...]:
+    """``(name, store_byte)`` pairs for the same stores
+    :func:`_embedded_store_names` collects — positional so the scope
+    oracle can bind each store site to a preceding in-scope
+    declarator rather than function-wide name presence."""
+    if n is None:
+        return ()
+    out: list[tuple[str, int]] = []
+    stack = [n]
+    while stack:
+        cur = stack.pop()
+        if cur.type == _ASSIGNMENT:
+            name = _innermost_ident(cur.child_by_field_name("left"))
+            if name is not None:
+                out.append((name, cur.start_byte))
+        elif cur.type == "update_expression":
+            arg = cur.child_by_field_name("argument")
+            name = _innermost_ident(arg) if arg is not None else None
+            if name is not None:
+                out.append((name, cur.start_byte))
+        stack.extend(c for c in cur.children if c.is_named)
+    return tuple(out)
+
+
 def _payload_from_subtree(n) -> tuple[frozenset[str], frozenset[str],
                                        frozenset[str], tuple[CallSite, ...]]:
     """Fall-through payload extractor for expression-only statements:
     ``return f(x);``, ``if (cond)``, plain expression statements,
-    switch subjects, etc. No defs (no LHS); every identifier feeds
-    uses; every call_expression feeds call_sites + calls.
+    switch subjects, etc. Defs cover only stores EMBEDDED in the
+    expression (assignment-in-condition, ``i++`` in a for-step — see
+    :func:`_embedded_store_names`); every identifier feeds uses;
+    every call_expression feeds call_sites + calls.
     """
     if n is None:
         return (frozenset(), frozenset(), frozenset(), ())
     return (
         _walk_subtree_for_calls(n),
-        frozenset(),
+        _embedded_store_names(n),
         _walk_subtree_for_uses(n),
         _walk_subtree_for_call_sites(n),
     )
@@ -635,8 +728,10 @@ def _payload_from_subtree(n) -> tuple[frozenset[str], frozenset[str],
 
 
 def _find_function_definition(root, function_name: str):
-    """First ``function_definition`` whose declarator's innermost
-    identifier matches ``function_name``. ``None`` if not found.
+    """A ``function_definition`` whose declarator's innermost
+    identifier matches ``function_name`` (DFS order — with multiple
+    same-named definitions the one found is NOT necessarily the
+    textually first). ``None`` if not found.
 
     The walker descends into ``namespace_definition`` and
     ``class_specifier`` for C++ but does NOT join the namespace /
@@ -708,6 +803,162 @@ def _function_params(fn_def: Node) -> tuple[str, ...]:
     return tuple(names)
 
 
+# Nested scopes whose declarations are not locals of the enclosing
+# function. A lambda's parameters/locals belong to the lambda frame;
+# treating them as function locals would grant bare-name stores to
+# same-named globals local-grade semantics. Nested class/struct/union
+# bodies (C++ local classes) likewise bind their own members and
+# method locals — without the barrier a local class's declarations
+# leaked into the outer function's local set.
+# Single-homed in cfg_node_tables (grammar-validated by its closure
+# test — a dead / renamed node name fails CI instead of silently
+# disarming the barrier).
+_LOCAL_SCOPE_BARRIERS = _NODE_TABLES.scope_barriers
+
+# Constructs that bound a declarator's vouch window: a declaration
+# inside one of these is out of scope past its end. Missing a member
+# here widens a window toward the function end (suppression-ward),
+# so the set errs inclusive — an over-narrow window only refuses.
+# Single-homed in cfg_node_tables (grammar-validated).
+_LOCAL_SCOPE_BOUNDS = _NODE_TABLES.scope_bounds
+
+# Storage-class specifiers whose block-scope declarations do NOT bind
+# a function-local object: ``extern`` declares the GLOBAL itself
+# (block-scope extern is a declaration, never a definition), and
+# ``static`` / ``thread_local`` name storage shared across calls (or
+# threads' reentrancy) that an interleaved call can rewrite — none may
+# earn local-grade rebinding semantics.
+_NONLOCAL_STORAGE_CLASSES = frozenset({
+    "extern", "static", "thread_local", "__thread",
+})
+
+# Declarator wrappers whose innermost identifier is the declared name.
+_DECLARATOR_TYPES = frozenset({
+    _IDENT, _POINTER_DECLARATOR, "array_declarator",
+    "function_declarator", "reference_declarator",
+    "parenthesized_declarator",
+})
+
+
+class _LocalNameScopes:
+    """Positional scope oracle over a function's declared
+    locals/params.
+
+    Each declared name carries vouch windows ``[declarator_start,
+    enclosing_scope_end)``: a bare-name store earns local-grade
+    semantics only when some window of its name contains the store's
+    byte offset. Flat per-function name membership was steerable — a
+    dead block-scoped declarator anywhere in the function (after the
+    sink, in unreachable code) re-armed local-grade semantics for
+    every same-named global store. Binding the store site to a
+    declarator that PRECEDES it inside a live scope closes that;
+    C/C++'s declare-before-use rule for locals means the positional
+    check never refuses a genuinely local store."""
+
+    __slots__ = ("_windows",)
+
+    def __init__(
+        self, windows: dict[str, tuple[tuple[int, int], ...]],
+    ) -> None:
+        self._windows = windows
+
+    def vouches(self, name: str, store_byte: int) -> bool:
+        return any(
+            lo <= store_byte < hi
+            for lo, hi in self._windows.get(name, ())
+        )
+
+
+_EMPTY_LOCAL_SCOPES = _LocalNameScopes({})
+
+
+def _declaration_storage_nonlocal(decl: Node) -> bool:
+    """True when a block-scope ``declaration`` carries a storage-class
+    specifier that binds outside the local frame (see
+    :data:`_NONLOCAL_STORAGE_CLASSES`)."""
+    return any(
+        c.type == "storage_class_specifier"
+        and _node_text(c) in _NONLOCAL_STORAGE_CLASSES
+        for c in decl.children
+    )
+
+
+def _declared_local_scopes(fn_def: Node) -> _LocalNameScopes:
+    """Positional oracle for every name ``fn_def`` binds as a local or
+    parameter: formal parameters, block-scope declarations (including
+    ``for`` inits and C++ condition declarations), range-``for``
+    declarators, catch parameters, and structured bindings.
+
+    This is the scope oracle behind the value gate's locals-are-
+    unaliasable premise: an identifier-LHS store that no in-scope
+    PRECEDING declarator vouches for resolves to a file-scope global
+    / static / class member — a binding any callee can rewrite
+    between the store and a later read — so it must not earn
+    local-grade rebinding semantics.
+    """
+    windows: dict[str, list[tuple[int, int]]] = {}
+
+    def add(name: str, decl_byte: int, bound_end: int) -> None:
+        windows.setdefault(name, []).append((decl_byte, bound_end))
+
+    for p in _function_params(fn_def):
+        add(p, fn_def.start_byte, fn_def.end_byte)
+    body = fn_def.child_by_field_name("body")
+    if body is None:
+        return _LocalNameScopes(
+            {k: tuple(v) for k, v in windows.items()})
+    stack: list[tuple[Node, int]] = [(body, body.end_byte)]
+    while stack:
+        cur, bound = stack.pop()
+        t = cur.type
+        if t in _LOCAL_SCOPE_BARRIERS:
+            continue
+        if t in _LOCAL_SCOPE_BOUNDS:
+            bound = min(bound, cur.end_byte)
+        if t == _DECLARATION:
+            if _declaration_storage_nonlocal(cur):
+                # ``extern char *g;`` in a function body declares the
+                # GLOBAL g — registering it as a local handed every
+                # subsequent bare store to g local-grade semantics.
+                # static / thread_local are storage shared across
+                # calls: demoted too (fail closed — the value remains
+                # rewritable under reentrancy).
+                continue
+            for child in cur.children:
+                if not child.is_named:
+                    continue
+                if child.type == _INIT_DECLARATOR:
+                    tgt = child.child_by_field_name("declarator")
+                    if tgt is not None and tgt.type == \
+                            "structured_binding_declarator":
+                        for c in tgt.children:
+                            if c.type == _IDENT:
+                                add(_node_text(c), cur.start_byte, bound)
+                        continue
+                    name = _innermost_ident(tgt) if tgt is not None else None
+                    if name is not None:
+                        add(name, cur.start_byte, bound)
+                elif child.type in _DECLARATOR_TYPES:
+                    name = _innermost_ident(child)
+                    if name is not None:
+                        add(name, cur.start_byte, bound)
+        elif t == _PARAM_DECL:
+            # Catch-clause parameters (C++). Lambda parameters are
+            # excluded by the scope barrier above.
+            pdecl = cur.child_by_field_name("declarator")
+            name = _innermost_ident(pdecl) if pdecl is not None else None
+            if name is not None:
+                add(name, cur.start_byte, bound)
+        elif t == "for_range_loop":
+            tgt = cur.child_by_field_name("declarator")
+            name = _innermost_ident(tgt) if tgt is not None else None
+            if name is not None:
+                add(name, cur.start_byte, bound)
+        stack.extend(
+            (c, bound) for c in cur.children if c.is_named)
+    return _LocalNameScopes({k: tuple(v) for k, v in windows.items()})
+
+
 # ---------------------------------------------------------------------------
 # CFG builder
 # ---------------------------------------------------------------------------
@@ -719,10 +970,16 @@ class _CPPCFGBuilder:
     ``_build_*`` takes an incoming-predecessor list and returns the
     outgoing-successor list, the structured-block CFG idiom."""
 
-    def __init__(self, function_name: str, file_path: str, language: str) -> None:
+    def __init__(self, function_name: str, file_path: str, language: str,
+                 local_scopes: _LocalNameScopes = _EMPTY_LOCAL_SCOPES,
+                 ) -> None:
         self.function_name = function_name
         self.file_path = file_path
         self.language = language
+        # Positional scope oracle over the function's declared
+        # locals/params. The fail-closed default (empty) demotes
+        # EVERY bare-name store to may_escape — refusal direction.
+        self._local_scopes = local_scopes
         self.entry = CPPCFGNode(
             kind="entry", lineno=ENTRY_LINENO,
             label=f"ENTRY:{function_name}",
@@ -733,6 +990,11 @@ class _CPPCFGBuilder:
         )
         self._adjacency: dict[CPPCFGNode, list[CPPCFGNode]] = {}
         self._all_nodes: list[CPPCFGNode] = [self.entry, self.exit]
+        # Hash-set twin of _all_nodes for the _make_node collision
+        # probe — a list scan per node made CFG construction quadratic
+        # in statement count (machine-generated/hostile sources reach
+        # 100k+ statements per function). _all_nodes keeps ordering.
+        self._node_seen: set[CPPCFGNode] = {self.entry, self.exit}
         # Loop context stack: (break_target, continue_target).
         self._loop_stack: list[tuple[CPPCFGNode, CPPCFGNode]] = []
         # switch context stack: (break_target, fallthrough-from-prev-case)
@@ -779,7 +1041,7 @@ class _CPPCFGBuilder:
             calls=calls, defs=defs, uses=uses, call_sites=call_sites,
             may_escape=may_escape,
         )
-        if node in self._adjacency or node in self._all_nodes:
+        if node in self._adjacency or node in self._node_seen:
             self._dedupe_counter += 1
             tag = f" #{self._dedupe_counter}"
             node = CPPCFGNode(
@@ -788,13 +1050,28 @@ class _CPPCFGBuilder:
                 may_escape=may_escape,
             )
         self._all_nodes.append(node)
+        self._node_seen.add(node)
         return node
 
     # ----- statement dispatch -----
 
+    def _escapes(self, n) -> bool:
+        """Alias-conservatism stamp for one payload subtree: the
+        Phase 10 syntactic indirections plus any embedded/direct
+        store no in-scope preceding declarator vouches for — a
+        bare-name global / static / member write any interleaved
+        call can rewrite (the value gate demotes SUPPRESS →
+        CANDIDATE_ONLY on may_escape paths)."""
+        if _subtree_has_indirection(n):
+            return True
+        return any(
+            not self._local_scopes.vouches(name, byte)
+            for name, byte in _embedded_store_sites(n)
+        )
+
     def _short_label(self, n) -> str:
         # Use just the first 60 chars of the source span for the label.
-        text = _node_text(n).split("\n", 1)[0].strip()
+        text = _node_text(n).split("\n", 1)[0].strip()  # line-model: display label slice; strip() drops any trailing \r
         return text[:60] + ("…" if len(text) > 60 else "")
 
     def _build_stmts(
@@ -873,7 +1150,8 @@ class _CPPCFGBuilder:
                     inner = c
                     break
             if inner is not None and inner.type == _ASSIGNMENT:
-                calls, defs, uses, css = _payload_from_assignment(inner)
+                calls, defs, uses, css = _payload_from_assignment(
+                    inner, self._local_scopes)
             else:
                 calls, defs, uses, css = _payload_from_subtree(inner)
         else:
@@ -882,7 +1160,7 @@ class _CPPCFGBuilder:
             kind="stmt", lineno=stmt.start_point[0] + 1,
             label=self._short_label(stmt),
             calls=calls, defs=defs, uses=uses, call_sites=css,
-            may_escape=_subtree_has_indirection(stmt),
+            may_escape=self._escapes(stmt),
         )
 
     # ----- compound constructs -----
@@ -894,7 +1172,7 @@ class _CPPCFGBuilder:
             kind="stmt", lineno=stmt.start_point[0] + 1,
             label="if " + self._short_label(cond) if cond is not None else "if",
             calls=calls, defs=defs, uses=uses, call_sites=css,
-            may_escape=_subtree_has_indirection(cond),
+            may_escape=self._escapes(cond),
         )
         self._link_many(incoming, cond_node)
         then_body = stmt.child_by_field_name("consequence")
@@ -926,7 +1204,7 @@ class _CPPCFGBuilder:
             kind="stmt", lineno=stmt.start_point[0] + 1,
             label="while " + self._short_label(cond) if cond is not None else "while",
             calls=calls, defs=defs, uses=uses, call_sites=css,
-            may_escape=_subtree_has_indirection(cond),
+            may_escape=self._escapes(cond),
         )
         self._link_many(incoming, header)
         after_loop: list[CPPCFGNode] = [header]
@@ -959,7 +1237,7 @@ class _CPPCFGBuilder:
                 kind="stmt", lineno=stmt.start_point[0] + 1,
                 label="for " + self._short_label(cond),
                 calls=calls, defs=defs, uses=uses, call_sites=css,
-                may_escape=_subtree_has_indirection(cond),
+                may_escape=self._escapes(cond),
             )
         else:
             # ``for(;;)`` infinite loop header
@@ -975,7 +1253,7 @@ class _CPPCFGBuilder:
                 kind="stmt", lineno=step.start_point[0] + 1,
                 label="step " + self._short_label(step),
                 calls=calls_s, defs=defs_s, uses=uses_s, call_sites=css_s,
-                may_escape=_subtree_has_indirection(step),
+                may_escape=self._escapes(step),
             )
             self._link(step_node, header)
         else:
@@ -996,24 +1274,37 @@ class _CPPCFGBuilder:
         cond = stmt.child_by_field_name("condition")
         # body entry has the same predecessors as the do statement.
         # tail node = the condition test; body falls through to it.
+        # The label prefix is "do-while", NOT "while": label-driven
+        # condition extraction treats a condition label as an entry
+        # guard, which a do-while tail is not (the body precedes the
+        # first evaluation) — the Java leg's "do-while" label never
+        # matched, and this keeps both legs symmetric in the refusal
+        # direction.
         if cond is not None:
             calls, defs, uses, css = _payload_from_subtree(cond)
             tail = self._make_node(
                 kind="stmt", lineno=cond.start_point[0] + 1,
-                label="while " + self._short_label(cond),
+                label="do-while " + self._short_label(cond),
                 calls=calls, defs=defs, uses=uses, call_sites=css,
-                may_escape=_subtree_has_indirection(cond),
+                may_escape=self._escapes(cond),
             )
         else:
             tail = self._make_node(
                 kind="stmt", lineno=stmt.end_point[0] + 1,
-                label="while (...)",
+                label="do-while (...)",
             )
-        # Pre-allocate the body entry as a sentinel so break/continue
-        # have something to point at. We use the first body node as
-        # the loop "header" for continue.
+        # ``break`` exits the whole do statement WITHOUT evaluating
+        # the tail condition (C11 6.8.6.3): it targets a payload-free
+        # after-loop join, never the condition — routing it through
+        # the tail invented condition dominance over post-loop code
+        # (SMT guard consumers read dominance as "this condition held
+        # here"). ``continue`` targets the condition (real path).
+        after = self._make_node(
+            kind="stmt", lineno=stmt.end_point[0] + 1,
+            label="do-while-join",
+        )
         self._loop_stack.append((tail, tail))
-        self._break_stack.append(tail)
+        self._break_stack.append(after)
         # Tail loops back to body entry.  _build_stmts links incoming →
         # first body node(s), so we snapshot incoming's successors before
         # and diff after to recover the body entry set.
@@ -1026,9 +1317,10 @@ class _CPPCFGBuilder:
             body_entry |= set(self._adjacency.get(n, ())) - pre_succs.get(n, set())
         for entry in body_entry:
             self._link(tail, entry)
+        self._link(tail, after)
         self._break_stack.pop()
         self._loop_stack.pop()
-        return [tail]
+        return [after]
 
     def _build_switch(self, stmt: Node, incoming):
         subj = stmt.child_by_field_name("condition")
@@ -1037,7 +1329,7 @@ class _CPPCFGBuilder:
             kind="stmt", lineno=stmt.start_point[0] + 1,
             label="switch " + (self._short_label(subj) if subj is not None else ""),
             calls=calls, defs=defs, uses=uses, call_sites=css,
-            may_escape=_subtree_has_indirection(subj),
+            may_escape=self._escapes(subj),
         )
         self._link_many(incoming, header)
         # Join node — every break in the switch body links here; the
@@ -1155,9 +1447,16 @@ class _CPPCFGBuilder:
         self._link_many(incoming, ln)
         self._labels.setdefault(label_name, ln)
         # Inner stmt — tree-sitter exposes it as the next named child.
+        # NB: the Python bindings mint a FRESH Node wrapper per access,
+        # so ``c is not label_node`` was always True and the loop
+        # picked the label identifier itself as the "inner" statement —
+        # the real inner statement (and its calls/defs/uses payload)
+        # silently vanished from the graph. A missing statement is
+        # unsound in BOTH directions (an invisible re-taint write lets
+        # an exclusivity proof hold falsely). Skip by node TYPE.
         inner: Any | None = None
         for c in stmt.children:
-            if c.is_named and c is not label_node:
+            if c.is_named and c.type != "statement_identifier":
                 inner = c
                 break
         if inner is None:
@@ -1167,6 +1466,7 @@ class _CPPCFGBuilder:
     # ----- driver -----
 
     def build(self, fn_def: Node) -> CPPCFG:
+        self._local_scopes = _declared_local_scopes(fn_def)
         body = fn_def.child_by_field_name("body")
         if body is None:
             # Pure declaration — no body. Just hook entry → exit.
@@ -1180,8 +1480,11 @@ class _CPPCFGBuilder:
             if target is not None:
                 self._link(goto_node, target)
             else:
-                # Unknown label — goto becomes a no-op flowing to exit
-                # so the function isn't a sink-trap for analysis.
+                # Unknown label (macro-generated or outside the
+                # parsed span) — route the goto to EXIT: the jump
+                # target is unknowable, so treating the path as
+                # function-terminating refuses rather than invents a
+                # fall-through successor.
                 self._link(goto_node, self.exit)
         adjacency: dict[CPPCFGNode, tuple[CPPCFGNode, ...]] = {
             k: tuple(v) for k, v in self._adjacency.items()
@@ -1211,6 +1514,7 @@ class _CPPCFGBuilder:
 
 def build_cpp_intraproc_cfg(
     source: str | Path, function_name: str, *, language: str = "c",
+    _ts_tree: "Any | None" = None,
 ) -> CPPCFG | None:
     """Build the CFG for one named C/C++ function.
 
@@ -1230,6 +1534,11 @@ def build_cpp_intraproc_cfg(
     recovery yields ``ERROR`` subtrees that the walker treats as
     opaque straight-line statements. This matches the inventory
     walks' degrade-cleanly contract.
+
+    ``_ts_tree`` — when the caller already holds a tree-sitter tree
+    for the same ``source`` text, pass it here to skip the redundant
+    ``parser.parse()``.  Internal optimisation for the finding
+    resolver (one parse per finding instead of two).
     """
     if language not in ("c", "cpp"):
         return None
@@ -1238,11 +1547,25 @@ def build_cpp_intraproc_cfg(
         return None
     if isinstance(source, Path):
         file_path = str(source)
-        source_text = source.read_text(encoding="utf-8")
+        try:
+            source_text = source.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            # Hostile / binary bytes on the direct-Path API: refuse
+            # (None) like every other unbuildable input — decoding
+            # with replacement could mangle string literals that
+            # downstream folds read as values.
+            return None
     else:
         file_path = "<string>"
         source_text = source
-    tree = parser.parse(source_text.encode("utf-8", errors="replace"))
+    if _ts_tree is not None:
+        tree = _ts_tree
+    else:
+        # parse_origin: a budget-abandoned parse must name this file on
+        # the run's analysis-gap trail.
+        from core.run.gaps import parse_origin
+        with parse_origin(file_path):
+            tree = parser.parse(source_text.encode("utf-8", errors="replace"))
     fn_def = _find_function_definition(tree.root_node, function_name)
     if fn_def is None:
         return None

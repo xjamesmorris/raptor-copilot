@@ -38,9 +38,11 @@ without context:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Literal, Union, TYPE_CHECKING
+
+from core.llm.accounting import AccountingSummary, CostObservation
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -124,11 +126,22 @@ class ToolDef:
 @dataclass(frozen=True)
 class ToolCall:
     """Model-emitted request to call a tool. Surfaced as one of the
-    content blocks of an assistant-role :class:`Message`."""
+    content blocks of an assistant-role :class:`Message`.
+
+    ``input_parse_error`` marks a streaming call whose accumulated
+    JSON arguments never parsed into an object (per-turn max_tokens
+    truncation is the routine cause). The block still rides in the
+    assistant message so the wire shape stays valid (a tool_result
+    needs a matching tool_use), but the loop NEVER dispatches it —
+    ``input`` is a placeholder ``{}``, not arguments the model
+    authored — and a parse-failed terminal-tool call never sets
+    ``terminal_tool_input``. Additive default: provider-built calls
+    with parsed arguments are unaffected."""
 
     id: str
     name: str
     input: dict[str, Any]
+    input_parse_error: bool = False
 
 
 @dataclass(frozen=True)
@@ -136,11 +149,22 @@ class ToolResult:
     """Caller's response to a :class:`ToolCall`, fed back to the model
     on the next turn. Carried as a content block of a user-role
     :class:`Message`. ``is_error=True`` lets the model distinguish
-    legitimate empty results from handler failures."""
+    legitimate empty results from handler failures.
+
+    ``raw_content`` is loop-internal provenance, never sent on the
+    wire (providers read ``content`` only): when the loop persists the
+    messages-bound copy envelope-WRAPPED, it records the raw tool
+    output here so resume-time x-source seeding extracts from exactly
+    the bytes in-run discovery saw. Textual unwrap heuristics cannot
+    distinguish a loop-wrapped result from attacker output that
+    arrived envelope-shaped, so the raw bytes ride alongside instead.
+    Consumers persisting histories to disk must round-trip this field
+    with the rest of the block."""
 
     tool_use_id: str
     content: str
     is_error: bool = False
+    raw_content: str | None = None
 
 
 @dataclass(frozen=True)
@@ -148,6 +172,13 @@ class TextBlock:
     """Plain text emitted by either role."""
 
     text: str
+    # True for user-role text the LOOP itself appended (max-tokens /
+    # no-tool-call nudges, submission warnings, in-fire steering).
+    # In-run these never enter the x-source discovered-values set;
+    # the tag lets resume-time history seeding apply the same rule
+    # instead of reading them as user-authored. Additive default so
+    # provider-built and hand-built blocks are unaffected.
+    loop_injected: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +244,9 @@ class TurnResponse:
     cache_write_tokens: int = 0
     cost_usd: float | None = None
     error_message: str | None = None
+    cost_observation: CostObservation = field(
+        default_factory=CostObservation.unknown,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -332,10 +366,12 @@ class ContextOverflow(RuntimeError):
         *args: Any,
         messages: list[Any] | None = None,
         tool_calls_made: int = 0,
+        accounting: AccountingSummary | None = None,
     ) -> None:
         super().__init__(*args)
         self.messages = list(messages) if messages else []
         self.tool_calls_made = tool_calls_made
+        self.accounting = accounting or AccountingSummary()
 
 
 # ---------------------------------------------------------------------------
@@ -363,10 +399,12 @@ class CostBudgetExceeded(RuntimeError):
         *args: Any,
         messages: list[Any] | None = None,
         tool_calls_made: int = 0,
+        accounting: AccountingSummary | None = None,
     ) -> None:
         super().__init__(*args)
         self.messages = list(messages) if messages else []
         self.tool_calls_made = tool_calls_made
+        self.accounting = accounting or AccountingSummary()
 
 
 class ToolHandlerTimeout(RuntimeError):
@@ -468,13 +506,39 @@ class StreamDelta:
     chunk: StreamChunk
 
 
+# One alias for the loop's terminal-outcome vocabulary —
+# :attr:`LoopTerminated.reason` and :attr:`ToolLoopResult.terminated_by`
+# carry the SAME string by contract, and two hand-synced Literal unions
+# were a silent drift channel (a value added to one but not the other
+# type-checks fine at every call site that only touches one).
+TerminationReason = Literal[
+    "complete",                  # COMPLETE response from model
+    "terminal_tool",             # model called designated terminal tool
+    "max_iterations",            # loop hit max_iterations cap
+    "max_cost_usd",              # cumulative cost crossed cap
+    "max_seconds",               # wall-clock budget exceeded
+    "max_total_tokens",          # cumulative input+output tokens crossed cap
+    "max_tokens",                # provider truncated response (no tool calls)
+    "refused",                   # provider safety / content filter
+    "tool_error",                # handler exception under terminate_on_handler_error
+    "tool_timeout",              # handler timeout under terminate_on_handler_error
+                                 # (without that flag, both convert to an
+                                 # is_error ToolResult and the loop continues)
+    "context_overflow",          # request would exceed context window
+    "provider_error",            # transport / API failure after retries
+    "credit_exhausted",          # account out of credit / billing failure
+    "give_up",                   # caller-supplied should_continue returned False
+]
+
+
 @dataclass(frozen=True)
 class LoopTerminated:
     """Emitted as the final event of a :meth:`ToolUseLoop.run` call.
 
     ``reason`` mirrors :attr:`ToolLoopResult.terminated_by` — the same
-    string is in both places so consumers can either subscribe to
-    events live or inspect the result after the fact.
+    string is in both places (one shared :data:`TerminationReason`
+    alias) so consumers can either subscribe to events live or inspect
+    the result after the fact.
 
     ``iterations`` always reports turns completed: pre-flight gate
     termination at iteration N reports ``N`` (N turns 0..N-1 done);
@@ -482,27 +546,13 @@ class LoopTerminated:
     0..N done). Same convention as :attr:`ToolLoopResult.iterations`.
     """
 
-    reason: Literal[
-        "complete",                  # COMPLETE response from model
-        "terminal_tool",             # model called designated terminal tool
-        "max_iterations",            # loop hit max_iterations cap
-        "max_cost_usd",              # cumulative cost crossed cap
-        "max_seconds",               # wall-clock budget exceeded
-        "max_total_tokens",          # cumulative input+output tokens crossed cap
-        "max_tokens",                # provider truncated response (no tool calls)
-        "refused",                   # provider safety / content filter
-        "tool_error",                # handler exception under terminate_on_handler_error
-        "tool_timeout",              # handler timeout under terminate_on_handler_error
-                                     # (without that flag, both convert to an
-                                     # is_error ToolResult and the loop continues)
-        "context_overflow",          # request would exceed context window
-        "provider_error",            # transport / API failure after retries
-        "credit_exhausted",          # account out of credit / billing failure
-        "give_up",                   # caller-supplied should_continue returned False
-    ]
+    reason: TerminationReason
     iterations: int
     total_cost_usd: float
     error_message: str | None = None
+    accounting: AccountingSummary = field(
+        default_factory=AccountingSummary,
+    )
 
 
 LoopEvent = Union[
@@ -553,28 +603,22 @@ class ToolLoopResult:
     total_input_tokens: int
     total_output_tokens: int
     total_cost_usd: float
-    terminated_by: Literal[
-        "complete",
-        "terminal_tool",
-        "max_iterations",
-        "max_cost_usd",
-        "max_seconds",
-        "max_total_tokens",
-        "max_tokens",
-        "refused",
-        "tool_error",
-        "tool_timeout",
-        "context_overflow",
-        "provider_error",
-        "credit_exhausted",
-        "give_up",
-    ]
+    terminated_by: TerminationReason
     error_message: str | None = None
     # Per-turn token accounting — one (input, output) tuple per
-    # assistant turn in ``messages``, in order. Zero entries when
-    # the loop couldn't populate them (defensive default; producers
-    # populate on every real turn). Consumers that want per-turn
-    # cost use these alongside the pricing table; consumers that
-    # only want totals use ``total_input_tokens`` / ``total_output
-    # _tokens``.
+    # assistant turn appended THIS RUN, in append order,
+    # pre-truncation. NOT one per assistant turn in ``messages``:
+    # a resumed history (``run_with_history``) contributes assistant
+    # turns with no tuple, and context truncation pops head messages
+    # without remapping — so zipping ``messages`` by assistant-turn
+    # index misaligns on exactly the long/resumed runs where
+    # per-turn cost matters. Consumers must align from the TAIL of
+    # this run's turns or track message indices themselves. Zero
+    # entries when the loop couldn't populate them (defensive
+    # default; producers populate on every real turn). Consumers
+    # that only want totals use ``total_input_tokens`` /
+    # ``total_output_tokens``.
     per_turn_tokens: tuple[tuple[int, int], ...] = ()
+    accounting: AccountingSummary = field(
+        default_factory=AccountingSummary,
+    )

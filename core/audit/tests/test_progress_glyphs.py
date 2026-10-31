@@ -51,3 +51,45 @@ class TestStatusGlyphs:
                "future run)")
         line = format_progress_line(-1, 15, _outcome("error", body=msg))
         assert line == f"  {msg}"
+
+
+class TestHostileFieldsEscaped:
+    """file/function/body are foreign-derived (scanned-repo names, tool
+    output); ESC/OSC/BEL/bidi bytes in them must never reach the
+    operator's terminal raw."""
+
+    HOSTILE = "\x1b]0;pwned\x07\x1b[2J\x9b1m‮evil"
+
+    def test_hostile_file_and_function_escaped(self):
+        outcome = ReviewOutcome(
+            file=f"src/{self.HOSTILE}.c",
+            function=f"fn{self.HOSTILE}",
+            status="clean", body="",
+        )
+        line = format_progress_line(0, 3, outcome)
+        for raw in ("\x1b", "\x07", "\x9b", "‮"):
+            assert raw not in line
+        # RAPTOR's own framing survives untouched.
+        assert line.startswith("  [1/3] ")
+        assert line.endswith("→ clean ✓")
+
+    def test_hostile_body_escaped_on_verbatim_channel(self):
+        outcome = _outcome("error", body=f"joern: {self.HOSTILE} done")
+        line = format_progress_line(-1, 3, outcome)
+        for raw in ("\x1b", "\x07", "\x9b", "‮"):
+            assert raw not in line
+        assert "joern:" in line
+
+    def test_hostile_status_escaped(self):
+        outcome = _outcome(self.HOSTILE)
+        line = format_progress_line(0, 3, outcome)
+        assert "\x1b" not in line and "\x07" not in line
+
+    def test_oversized_field_bounded(self):
+        # A hostile 100 KB "file name" must not flood the terminal.
+        outcome = ReviewOutcome(
+            file="a" * 100_000, function="f", status="clean", body="",
+        )
+        line = format_progress_line(0, 3, outcome)
+        assert len(line) < 1_000
+        assert "chars]" in line

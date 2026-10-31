@@ -57,13 +57,14 @@ bytes upstream.
 
 from __future__ import annotations
 
+import contextlib
 import http.server
 import json
 import logging
 import math
 import os
-import re
 import secrets
+import select
 import socket
 import socketserver
 import struct
@@ -71,13 +72,22 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import httpx
 
+if TYPE_CHECKING:
+    from core.llm.http_pool import ClientShards
+
 from core.json.jsonl import append_jsonl
-from core.run.tmp_ownership import remove_owner_marker, write_owner_marker
+from core.run.tmp_ownership import (
+    remove_owner_marker,
+    sweep_dead_owner_dirs,
+    write_owner_marker,
+)
 from core.security.log_sanitisation import escape_nonprintable
 
 from .auth import (
@@ -86,6 +96,7 @@ from .auth import (
     ProviderRule,
     build_rules,
 )
+from .usage_scan_jail import UsageScanJailUnavailable, get_usage_scan_jail
 
 _logger = logging.getLogger(__name__)
 
@@ -105,7 +116,14 @@ _logger = logging.getLogger(__name__)
 #   abstraction layer. The dispatcher's INFO-level audit was a
 #   third copy of the same fact, alongside the provider's own
 #   error log — see the retry-dedupe commit for the full cluster.
-_DEMOTED_AUDIT_EVENTS = frozenset({"request.dispatch"})
+# * ``request.retry`` (status="attempt"): a stale pooled upstream
+#   connection died pre-response and a fresh-connection re-send is
+#   about to fire. The row is written BEFORE the retry's outcome is
+#   known (status "attempt", not "ok" — trail readers must not count
+#   these as recoveries; the following request.dispatch/request.error
+#   row carries the outcome). No operator action either way; the
+#   on-disk row keeps the churn measurable.
+_DEMOTED_AUDIT_EVENTS = frozenset({"request.dispatch", "request.retry"})
 
 
 def _scrub(value: str | None) -> str | None:
@@ -220,7 +238,13 @@ def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
 
 
 def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
-    """Float twin of :func:`_env_int` — same silent-fallback contract."""
+    """Float twin of :func:`_env_int` — same silent-fallback contract.
+
+    Unlike the int twin (where ``int("nan")`` already raises),
+    ``float()`` happily parses nan/inf, so finiteness is checked
+    explicitly — non-finite values fall back like any other invalid
+    value instead of bypassing the ``minimum`` floor.
+    """
     raw = os.environ.get(name)
     if not raw:
         return default
@@ -228,6 +252,18 @@ def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
         value = float(raw)
     except ValueError:
         _logger.debug("llm-dispatcher: ignoring non-float %s=%r", name, raw)
+        return default
+    if not math.isfinite(value):
+        # nan defeats the floor below (``nan < minimum`` is False, like
+        # every nan comparison) and inf passes it outright — both would
+        # ride into consumers as-is. The failure shapes are concrete:
+        # ``Event.wait(nan)`` returns immediately, so a nan poll
+        # interval busy-spins its watcher thread at 100% CPU, and an
+        # inf interval never polls at all. Non-finite is invalid, same
+        # fallback as the other invalid shapes.
+        _logger.debug(
+            "llm-dispatcher: ignoring non-finite %s=%r", name, raw,
+        )
         return default
     if value < minimum:
         _logger.debug(
@@ -282,6 +318,34 @@ def _relay_deadline_s() -> int:
     )
 
 
+# Pre-auth bounds. Until a request's headers have parsed and its token
+# has cleared, the peer has proven nothing — so the header read gets a
+# short bespoke deadline instead of the relay deadline (3600 s), and
+# the TCP loopback plane (no peer-UID gate: any local UID connects)
+# caps concurrent connections. Without both, tokenless slow-header
+# clients pin one uncapped ThreadingMixIn thread each for up to an
+# hour per recv, wedging the credential dispatcher — and with it every
+# LLM call in the run. Ten seconds clears any legitimate client (a CLI
+# child on loopback sends its header block in one write); the cap
+# clears the largest legitimate CC child fan-out.
+_PREAUTH_HEADER_DEADLINE_S_DEFAULT = 10
+_TCP_MAX_CONNECTIONS_DEFAULT = 32
+
+
+def _preauth_header_deadline_s() -> int:
+    return _env_int(
+        "RAPTOR_LLM_DISPATCHER_PREAUTH_DEADLINE_S",
+        _PREAUTH_HEADER_DEADLINE_S_DEFAULT,
+    )
+
+
+def _tcp_max_connections() -> int:
+    return _env_int(
+        "RAPTOR_LLM_DISPATCHER_TCP_MAX_CONNECTIONS",
+        _TCP_MAX_CONNECTIONS_DEFAULT,
+    )
+
+
 class RelayLimitExceeded(OSError):
     """Upstream response exceeded the relay byte cap or total deadline.
 
@@ -290,6 +354,52 @@ class RelayLimitExceeded(OSError):
     ``request.error`` audit row records the class name, and the
     connection is torn down.
     """
+
+
+class WorkerDisconnected(OSError):
+    """The worker-side connection died while the relay was blocked on
+    the upstream — there is nobody left to receive the response.
+
+    Raised by the relay thread at its liveness checkpoints once the
+    orphan watcher has flagged the worker gone. An ``OSError``
+    subclass for the same reason as :class:`RelayLimitExceeded`: the
+    existing abort path books partial usage, writes the
+    ``request.error`` row (naming this class), and tears down.
+    """
+
+
+# Worker-liveness poll cadence while a relay thread is blocked on the
+# upstream (head dwell or an SSE inter-chunk gap). Both directions of
+# this value: TOO LOW busy-polls — each tick is a select() + MSG_PEEK
+# recv() per in-flight relay, and worker abandonment is a
+# ~100-seconds-scale event (the worker SDK's client timeout), so
+# sub-second sampling burns CPU for zero detection value; the ≥1s
+# floor exists so no configuration can busy-poll. TOO HIGH erodes the
+# point of the watcher — the orphaned upstream call keeps generating
+# (and billing) for the whole interval after the worker left, and a
+# value approaching the worker's own timeout would mean most orphans
+# are only noticed at write time again (the pre-fix behaviour).
+_ORPHAN_POLL_INTERVAL_DEFAULT_S = 2.0
+_ORPHAN_POLL_INTERVAL_FLOOR_S = 1.0
+
+
+def _orphan_poll_interval_s() -> float:
+    """Env-tunable per relay (one lookup), same knob pattern as the
+    upstream timeout. Values below the busy-poll floor fall back to
+    the default (the ``_env_float`` contract).
+
+    Test seam: the floor guards operator *configuration* against
+    busy-polling; it is not a bound on test rigs. Tests that need a
+    sub-second grace window inject one by monkeypatching THIS
+    accessor (it is consulted at watcher construction, per relay) —
+    never by widening the floor or the env parse. When nothing is
+    patched the production path is bit-identical.
+    """
+    return _env_float(
+        "RAPTOR_LLM_DISPATCHER_ORPHAN_POLL_S",
+        _ORPHAN_POLL_INTERVAL_DEFAULT_S,
+        minimum=_ORPHAN_POLL_INTERVAL_FLOOR_S,
+    )
 
 
 # Per-request budget reservation for scoped child tokens. The budget
@@ -433,6 +543,649 @@ def _upstream_timeout() -> httpx.Timeout:
         _UPSTREAM_DEFAULT_TIMEOUT_S,
     )
     return httpx.Timeout(float(read_s), connect=_UPSTREAM_CONNECT_TIMEOUT_S)
+
+
+# Stall watchdog for STREAMING relays — two-phase. A silently wedged
+# tunnel (no FIN/RST — the reads just never complete) must trip well
+# before the full upstream read timeout, but a stream's silence means
+# different things before and after its first body byte:
+#
+# * PRE-first-event (request send → first upstream body byte,
+#   response head included): nothing on the wire is NORMAL — reasoning
+#   dwell and big-prompt prefill legitimately idle here far past any
+#   sane inter-chunk window. This phase rides the request's native
+#   per-read timeout, set to the generous first-event budget below.
+#   (h1 pins this shape: httpcore captures the response-body read
+#   timeout ONCE when the body generator is created, so the budget
+#   must cover the head-to-first-byte span too — it cannot be
+#   re-tightened after the request is sent.)
+# * POST-first-event: healthy token-delta cadence keeps inter-chunk
+#   gaps small, so the tight stall window below applies — enforced by
+#   the per-relay _OrphanWatcher's stall arm (socket teardown on
+#   HTTP/1.x), precisely because the native timeout can no longer be
+#   tightened at that point.
+#
+# Non-streaming requests are left on the full timeout: their single
+# body read legitimately spans the whole generation. Both directions
+# of the stall default: TOO LOW and genuine generation pauses between
+# SSE events (extended thinking, long tool deliberation) abort
+# healthy streams mid-generation — unrecoverable, since a stream
+# cannot be resumed mid-generation and timeouts are deliberately
+# excluded from the transparent retry (double-billing); TOO HIGH and
+# a wedged tunnel holds the relay, its worker, and the upstream slot
+# toward the full read-timeout ceiling before anything notices. 120s
+# sits well above observed healthy inter-event pauses while detecting
+# a wedge five times faster than the 600s default ceiling.
+_STREAM_STALL_DEFAULT_S = 120.0
+# Values below the floor fall back to the DEFAULT (the _env_float
+# contract): a sub-floor stall window is indistinguishable from
+# normal event pacing and would abort every stream it watches.
+_STREAM_STALL_FLOOR_S = 5.0
+
+# Pre-first-event budget default, both directions: TOO LOW and a
+# healthy stream that legitimately idles before its first byte
+# (reasoning dwell, prefill on a large prompt) is aborted at the
+# open and — timeouts being retry-excluded — the whole request
+# fails; TOO HIGH and a stream that is dead BEFORE its first byte
+# (wedged tunnel at the open) holds the relay toward the full
+# read-timeout ceiling before anything notices. 300s admits the
+# longest plausible pre-first-token dwell while still detecting a
+# dead open at half the 600s ceiling.
+_STREAM_FIRST_EVENT_DEFAULT_S = 300.0
+# Same _env_float floor contract as the stall knob: a sub-floor
+# first-event budget would abort every stream at the open before a
+# provider could plausibly answer.
+_STREAM_FIRST_EVENT_FLOOR_S = 5.0
+
+
+def _stream_stall_s() -> float:
+    return _env_float(
+        "RAPTOR_LLM_DISPATCHER_STREAM_STALL_S",
+        _STREAM_STALL_DEFAULT_S,
+        minimum=_STREAM_STALL_FLOOR_S,
+    )
+
+
+def _stream_first_event_s() -> float:
+    """The pre-first-event budget, clamped to at least the stall
+    window. Both directions of the clamp: WITHOUT it, an operator
+    value below the (possibly raised) stall window would police the
+    stream OPEN more strictly than its steady state — recreating the
+    slow-start exposure this knob removes; and the clamp must never
+    LOWER a value above the stall window, or raising the stall knob
+    alone could silently drag a deliberately generous first-event
+    budget down. Tightening the open means tightening the stall
+    window itself."""
+    return max(
+        _env_float(
+            "RAPTOR_LLM_DISPATCHER_STREAM_FIRST_EVENT_S",
+            _STREAM_FIRST_EVENT_DEFAULT_S,
+            minimum=_STREAM_FIRST_EVENT_FLOOR_S,
+        ),
+        _stream_stall_s(),
+    )
+
+
+# URL-method streaming surfaces: provider APIs that select streaming
+# by the request PATH and carry no JSON "stream" field — Gemini's
+# models.streamGenerateContent method and Bedrock's
+# InvokeModelWithResponseStream / ConverseStream actions. Exact
+# method-name suffixes matched against the query-stripped path: a
+# false positive here would TIGHTEN the read timeout on a
+# non-streaming request whose single body read legitimately spans the
+# whole generation, so nothing looser (substring scans, case folding)
+# is acceptable. Body detection stays primary — this is a small seed
+# for the URL-method surfaces the dispatcher fronts, not a registry
+# of every provider's streaming spelling.
+_STREAM_PATH_SUFFIXES = (
+    ":streamGenerateContent",        # Gemini streaming generateContent
+    "/invoke-with-response-stream",  # Bedrock InvokeModelWithResponseStream
+    "/converse-stream",              # Bedrock ConverseStream
+)
+
+
+def _path_wants_stream(upstream_path: str) -> bool:
+    """True when the request path names a URL-method streaming
+    endpoint. Fail-closed on fragments, like ``_is_cost_free_endpoint``
+    above: the router rejects ``#`` before routing, but this
+    classifier independently refuses them so it can never be steered
+    by one."""
+    if not upstream_path or "#" in upstream_path:
+        return False
+    # Tolerate AT MOST one trailing slash: a single ".../method/" is a
+    # routine client spelling of the same endpoint, so it keeps the
+    # streaming classification; two or more trailing slashes are a
+    # degenerate shape no provider publishes, so they refuse (safe
+    # direction — an unclassified path keeps the full read timeout).
+    path = upstream_path.partition("?")[0].removesuffix("/")
+    return path.endswith(_STREAM_PATH_SUFFIXES)
+
+
+def _request_wants_stream(body: bytes, upstream_path: str = "") -> bool:
+    """True when the worker's request asks the provider for a
+    streaming (SSE) response — JSON ``"stream": true`` on the
+    body-marked provider surfaces, or a URL-method streaming path
+    (see ``_STREAM_PATH_SUFFIXES``) on the surfaces that mark
+    streaming in the URL instead. Fail-safe: anything unparseable,
+    non-dict, or non-boolean reads as non-streaming, which keeps the
+    FULL read timeout (the watchdog can only ever shorten, never
+    abort a shape it did not positively identify)."""
+    if _path_wants_stream(upstream_path):
+        return True
+    if not body or b'"stream"' not in body:
+        return False
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    return isinstance(payload, dict) and payload.get("stream") is True
+
+
+def _upstream_timeout_for(
+    body: bytes, upstream_path: str = "",
+) -> httpx.Timeout:
+    """Per-request forwarding-leg timeout: the pre-first-event budget
+    for streaming requests, the full upstream timeout otherwise.
+
+    The read bound set here carries the PRE-first-event phase only.
+    On HTTP/1.x httpcore captures the response-body read timeout once
+    at body-generator creation, so this single value necessarily
+    spans request send → response head → first body byte; after the
+    first byte the watcher's stall arm owns the tighter inter-chunk
+    window. (On HTTP/2 the read timeout is re-fetched per read, so a
+    post-first-event wedge is ALSO bounded by this budget natively —
+    slower than the stall window, never slower than this.)
+
+    The watchdog only ever TIGHTENS the read bound — if the operator
+    set an upstream timeout at or below the first-event budget, the
+    stricter upstream timeout stands."""
+    base = _upstream_timeout()
+    if not _request_wants_stream(body, upstream_path):
+        return base
+    first_event = _stream_first_event_s()
+    if base.read is not None and first_event >= base.read:
+        return base
+    return httpx.Timeout(
+        connect=base.connect, read=first_event,
+        write=base.write, pool=base.pool,
+    )
+
+
+# Failure shapes eligible for the transparent pre-response retry —
+# the stale keep-alive reuse signature: the far side (egress-proxy
+# CONNECT tunnel or provider) idled out a pooled connection, and when
+# the teardown is half-open (client side held open, no FIN delivered)
+# the pool's readable-socket checkout guard cannot see it, so the
+# death only surfaces when the next request is written into it —
+# as RemoteProtocolError (FIN answers the write) or ReadError (RST
+# answers it). Measured with core/llm/scripts/transport-churn-measure:
+# settled closes are silently discarded at pool checkout (never seen
+# here); half-open teardown fails EVERY reuse past the far side's
+# idle threshold; and in those measured stale-reuse regimes none of
+# the failed requests reached upstream request handling.
+# Deliberately narrow: timeouts (the request may be mid-generation
+# upstream — re-sending double-bills) and connect errors (fresh-
+# connection failure means the provider is down; a retry only delays
+# the worker's failover) are excluded. Large-body coverage rests on
+# the current httpcore behaviour of surfacing write-side failures
+# during request transmission under these read-class shapes rather
+# than WriteError (version-dependent; pinned by the large-body test
+# in test_upstream_stale_retry.py).
+_STALE_REUSE_ERRORS = (httpx.RemoteProtocolError, httpx.ReadError)
+
+# Transport-death shapes that indict the HELD SHARD's own
+# connections and feed its consecutive-failure counter
+# (ClientShards.report_failure): connection establishment failures,
+# read-side deaths, protocol violations, and read-timeout trips (the
+# stall watchdog surfaces a wedged tunnel as ReadTimeout). Distinct
+# from _STALE_REUSE_ERRORS above — that tuple decides what may be
+# transparently RETRIED (deliberately excluding timeouts and connect
+# errors: double-billing / failover-delay), this one decides what
+# counts as evidence the shard's client needs a drain-shaped rebuild.
+# Counting is further gated at the relay: orphan-cancel aborts
+# (the dispatcher shut the upstream socket because the WORKER left)
+# are evidence about the worker, not the shard, so they stay neutral
+# behind the worker_gone gate — while a stall-arm abort (the
+# dispatcher shut the socket because the UPSTREAM went silent
+# mid-stream) is exactly the wedged-tunnel evidence this tuple
+# counts, so its ReadError/RemoteProtocolError deliberately passes
+# the gate and strikes. Also, a
+# relay that took the transparent stale retry strikes exactly once
+# — at the retry (the stale death was the shard's), never again for
+# the one-shot client's own outcome. Worker-side failures
+# (WorkerDisconnected, RelayLimitExceeded, wfile OSErrors) are plain
+# OSError shapes and never match this tuple.
+_SHARD_HEALTH_ERRORS: tuple[type[Exception], ...] = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.ReadError,
+    httpx.RemoteProtocolError,
+    httpx.ReadTimeout,
+)
+
+# Retry-eligibility ceiling: a failed attempt is only retried when it
+# died within this many seconds of the request being sent. The error
+# CLASS alone cannot distinguish "stale pooled connection, request
+# never read" from "upstream read the request, did billable work,
+# then died before the response head" — both surface pre-response as
+# the same exceptions. Elapsed time can: measured stale-reuse deaths
+# complete within ~2 RTTs of the send (p50 3-40ms on loopback, well
+# under a second even through a slow proxy chain), while a death that
+# follows real generation work arrives seconds-to-minutes later.
+# Both directions of this value: TOO LOW and a sluggish egress path
+# (long CONNECT chains, congested RTTs) pushes genuine stale deaths
+# past the ceiling — recovery is lost and churn bursts resurface as
+# 502s. TOO HIGH re-admits the was-probably-mid-generation retry:
+# a double-buy of upstream work, and a SigV4 signature whose age at
+# re-send approaches the provider's clock-skew window (a stale
+# X-Amz-Date turns a transient death into a terminal 403). The
+# ceiling also bounds signature age at retry, which is what keeps the
+# SigV4 re-send valid.
+_STALE_RETRY_CEILING_DEFAULT_S = 2.0
+
+
+def _stale_retry_ceiling_s() -> float:
+    """Env-tunable per request (one lookup), same knob pattern as the
+    upstream timeout."""
+    return _env_float(
+        "RAPTOR_LLM_DISPATCHER_STALE_RETRY_CEILING_S",
+        _STALE_RETRY_CEILING_DEFAULT_S,
+    )
+
+
+@contextlib.contextmanager
+def _upstream_stream_with_stale_retry(
+    client: httpx.Client,
+    fresh_client: Callable[[], httpx.Client],
+    method: str,
+    url: str,
+    *,
+    content: bytes,
+    headers: dict[str, str],
+    timeout: httpx.Timeout,
+    on_retry: Callable[[Exception], None],
+) -> Iterator[httpx.Response]:
+    """Open the upstream response stream, retrying a stale-reuse death
+    ONCE on a dedicated fresh connection.
+
+    Only the stream OPEN is retried — ``httpx.Client.stream`` sends
+    the request and reads the response head inside ``__enter__``, so a
+    failure there guarantees ZERO BYTES WERE RELAYED to the worker (no
+    headers seen). That is a relay-side guarantee, not an upstream
+    one: a pre-response death can still follow upstream request
+    handling (read the request, did billable work, died before the
+    response head). The elapsed-time gate is what bounds that
+    residual: a retry fires only when the attempt died within
+    ``_stale_retry_ceiling_s()`` of the send — the window measured
+    stale-reuse deaths live in (in those regimes the request provably
+    never reached upstream handling) and far too early for real
+    generation work to be at stake. Once the response has started, or
+    the death arrives past the ceiling, failures propagate unchanged
+    to the ordinary 502 + worker-retry path.
+
+    Why exactly one retry, and why NOT through the shared pool: when
+    the far side idles out its connections, it condemns the whole
+    idle pool at once, so an immediate pooled retry frequently draws
+    ANOTHER condemned connection — measured under 8 synchronized
+    workers, two pooled retries still leaked ~10% of calls as 502s,
+    while a single retry on a fresh one-shot connection recovered
+    every stale-reuse failure. Fewer (zero) retries leaks every churn
+    burst as spurious 502s that burn the worker retry loop's paid-
+    attempt budget; more would only mask an upstream that genuinely
+    dies pre-response on every attempt (each extra try is a full
+    re-send against a broken provider and delays worker failover).
+    The fresh connection costs one connection setup (through a proxy:
+    a CONNECT chain + TLS) — paid only after an actual stale failure.
+
+    SigV4 path: the retry re-sends the identical prepared bytes, and
+    the ceiling bounds the signature's age at re-send to a couple of
+    seconds — well inside the provider's clock-skew window. Without
+    the gate, a death late in a long pre-response dwell would re-send
+    an expired X-Amz-Date and turn a transient failure into a
+    terminal 403.
+    """
+    oneshot: httpx.Client | None = None
+    try:
+        cm = client.stream(
+            method, url, content=content, headers=headers, timeout=timeout,
+        )
+        sent_at = time.monotonic()
+        try:
+            up = cm.__enter__()
+        except _STALE_REUSE_ERRORS as exc:
+            if time.monotonic() - sent_at > _stale_retry_ceiling_s():
+                # Died pre-response but slowly: the upstream plausibly
+                # spent that time HANDLING the request, and a SigV4
+                # signature has aged by the same amount. Not the
+                # stale-reuse shape — no retry.
+                raise
+            on_retry(exc)
+            oneshot = fresh_client()
+            cm = oneshot.stream(
+                method, url, content=content, headers=headers,
+                timeout=timeout,
+            )
+            # A failure here propagates: the fresh connection rules
+            # out connection-reuse artifacts, so this is genuine
+            # upstream trouble for the ordinary 502 + worker-retry
+            # path.
+            up = cm.__enter__()
+        try:
+            yield up
+        finally:
+            cm.__exit__(None, None, None)
+    finally:
+        if oneshot is not None:
+            oneshot.close()
+
+
+def _worker_socket_dead(sock: socket.socket) -> bool:
+    """Non-consuming liveness probe of the worker-side connection.
+
+    During the upstream leg the worker has sent its full request and
+    owes the relay nothing, so its socket polls unreadable while the
+    worker lives. Readable therefore means one of:
+
+    * a successful zero-byte peek — EOF, the worker closed (client
+      timeout/abandon): DEAD.
+    * peeked data — bytes after the request body are a protocol
+      violation, but a live-and-misbehaving worker must never be
+      cancelled on suspicion: treat as ALIVE and let the existing
+      write-time failure own it.
+    * a socket error on the probe — the connection is unusable: DEAD.
+
+    MSG_PEEK never consumes, so the probe cannot race the handler's
+    own reads (none are pending during the relay anyway).
+
+    ``select.poll`` rather than ``select.select``: select() raises
+    ValueError for any fd >= FD_SETSIZE (1024), which a loaded
+    ThreadingMixIn server reaches — and this probe must never call a
+    HEALTHY worker dead on a probe artifact.
+    """
+    try:
+        poller = select.poll()
+        poller.register(
+            sock, select.POLLIN | select.POLLERR | select.POLLHUP,
+        )
+        events = poller.poll(0)
+    except (OSError, ValueError):
+        return True   # fd closed/invalid — the worker leg is gone
+    if not events:
+        return False
+    try:
+        data = sock.recv(
+            1, socket.MSG_PEEK | getattr(socket, "MSG_DONTWAIT", 0),
+        )
+    except (BlockingIOError, InterruptedError):
+        return False
+    except OSError:
+        return True
+    return not data
+
+
+class _OrphanWatcher:
+    """Abandon the upstream call promptly when the worker is gone.
+
+    Pre-fix, a worker that timed out client-side abandoned its
+    dispatcher connection while the relay thread stayed blocked in the
+    upstream dwell — the death only surfaced at the next write, often
+    minutes later, and the abandoned upstream generation kept running
+    (billed) with nobody to receive it.
+
+    One watcher per relayed request, alive only for the upstream leg.
+    It polls the worker-side socket every ``poll_interval_s`` (see
+    ``_ORPHAN_POLL_INTERVAL_DEFAULT_S`` for the cadence rationale) and
+    on death:
+
+    * sets :attr:`worker_gone` — the relay thread checks it at its
+      seams (after the response head arrives, and between streamed
+      chunks) and raises :class:`WorkerDisconnected` into the
+      existing abort path;
+    * calls ``on_worker_gone(cancel)`` exactly once (the relay leg
+      audits the abandonment from it);
+    * when a response is attached and its connection is
+      request-exclusive (HTTP/1.x), tears the upstream socket down
+      with ``shutdown(SHUT_RDWR)`` — the one cross-thread action that
+      reliably wakes a thread blocked in a socket read (closing the
+      httpx response from another thread provably does NOT: the
+      blocked read keeps running against the freed fd). The woken
+      read surfaces as ``httpx.RemoteProtocolError``/``ReadError`` in
+      the relay thread, which the existing handler books and audits.
+
+    Second duty — the STALL ARM (streaming relays only,
+    ``stream_stall_s`` non-None): after the first upstream body
+    chunk, the relay stamps every chunk via
+    :meth:`note_upstream_chunk`; when no chunk lands within the stall
+    window the watcher sets :attr:`stall_fired` and reuses the same
+    upstream teardown (HTTP/1.x; flag-only on HTTP/2, exactly like
+    the orphan cancel). The arm exists because an inter-chunk window
+    TIGHTER than the request's native read timeout cannot come from
+    httpx itself: the per-read timeout is fixed for the request (on
+    HTTP/1.1, httpcore captures the body-read timeout once, at the
+    first body pull), and once a read has timed out the stream is
+    unrecoverable — grace cannot be granted after the fact, so the
+    tight window must interrupt the blocked read from outside. The
+    arm never owns the pre-first-chunk phase: that dwell (response
+    head included) is bounded by the request's own read timeout (see
+    ``_upstream_timeout_for``) — which is also the only bound the
+    watcher COULD offer there (head-dwell residual below). A stall
+    fire is one-shot — never re-fires, never cancels twice — and a
+    fire that actually tore the socket down retires the thread,
+    mirroring the worker-gone arm. A FLAG-ONLY fire (HTTP/2, or
+    teardown not possible) does NOT retire it: the relay stays
+    blocked in its read until the native timeout, so the primary
+    worker-gone duty keeps polling for an abandonment in that span.
+    The relay's error row carries the fire as the ``stall_abort``
+    flag.
+
+    What it deliberately does NOT cancel:
+
+    * the head dwell (no response object yet): the pooled connection
+      serving the send cannot be identified from outside httpx, so
+      the flag is set and the relay aborts the moment the head
+      arrives. Long non-streaming dwells therefore still orphan
+      until the head or the upstream timeout — an honest residual.
+    * HTTP/2 responses: the socket is shared with multiplexed sibling
+      streams; shutting it down would abort every relay on it.
+      Flag-only, detected at the next chunk/write seam.
+
+    Pool safety: :meth:`stop` and the cancel action are mutually
+    excluded by the lock — once the relay declares the stream drained
+    (calling ``stop()`` before the response leaves scope), a
+    concurrent detection can no longer shut down a socket that may
+    already be back in the shared connection pool.
+    """
+
+    def __init__(
+        self,
+        worker_sock: socket.socket,
+        poll_interval_s: float,
+        on_worker_gone: Callable[[str], None],
+        *,
+        stream_stall_s: float | None = None,
+    ) -> None:
+        self._sock = worker_sock
+        self._interval = poll_interval_s
+        self._on_worker_gone = on_worker_gone
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self.worker_gone = threading.Event()
+        self._response: httpx.Response | None = None
+        # Stall arm (class doc). None = never arms: non-streaming
+        # relays keep their single whole-generation body read.
+        self.stream_stall_s = stream_stall_s
+        self.stall_fired = threading.Event()
+        self._last_chunk_at: float | None = None
+        self._thread = threading.Thread(
+            target=self._run,
+            name="llm-dispatcher-orphan-watch",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def attach_response(self, up: httpx.Response) -> None:
+        """Register the opened upstream response so a later detection
+        can tear its connection down (HTTP/1.x only, see class doc)."""
+        with self._lock:
+            self._response = up
+
+    def stop(self) -> None:
+        """Idempotent; taken under the lock so no cancel can fire
+        after the relay declared the stream drained."""
+        with self._lock:
+            self._stop.set()
+
+    def join(self) -> None:
+        """Bounded: the poll loop wakes within one interval of
+        ``stop()`` (Event.wait returns immediately once set); the
+        timeout is belt-and-braces on top of the daemon flag."""
+        self._thread.join(timeout=self._interval + 1.0)
+
+    def note_upstream_chunk(self) -> None:
+        """Stamp upstream body progress: the first call arms the stall
+        deadline, every call refreshes it. Lock-free on purpose — the
+        relay loop calls this once per relayed chunk (hot path), and a
+        single float store is atomic under the GIL. The poll thread
+        may read it one tick stale; the under-lock re-check in
+        :meth:`_fire_stall` absorbs that race."""
+        self._last_chunk_at = time.monotonic()
+
+    def _stall_deadline_passed(self) -> bool:
+        """True when the stall arm is armed (streaming relay, first
+        body chunk seen) and no chunk has landed within the window.
+        Never true before the first chunk — the pre-first-event dwell
+        is the native request timeout's phase (class doc)."""
+        stall = self.stream_stall_s
+        stamp = self._last_chunk_at
+        if stall is None or stamp is None:
+            return False
+        return (time.monotonic() - stamp) > stall
+
+    def _fire_stall(self) -> str | None:
+        """One-shot stall cancel; returns the cancel action taken
+        (``upstream_shutdown`` / ``flag_only``) when the watcher
+        fired, None when it did not (stopped, already fired, or the
+        stream resumed). Callers pre-check
+        :meth:`_stall_deadline_passed` cheaply outside the lock; this
+        re-checks under it so a chunk that landed between the two
+        checks — the stream resumed within the poll tick — is spared,
+        shrinking the poll-granularity false-kill window to the lock
+        handoff. ``stop()`` excludes a late fire the same way it
+        excludes a late orphan cancel: never shut down a socket that
+        may already be back in the shared pool."""
+        with self._lock:
+            if self._stop.is_set():
+                return None
+            if self.stall_fired.is_set():
+                # One-shot: a flag-only fire leaves the thread
+                # polling (worker-gone duty), and it must never
+                # cancel again — a re-fire could tear down a
+                # response attached after the first fire.
+                return None
+            if not self._stall_deadline_passed():
+                return None
+            self.stall_fired.set()
+            return self._cancel_upstream_locked()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval):
+            if (
+                not self.stall_fired.is_set()
+                and self._stall_deadline_passed()
+                and self._fire_stall() == "upstream_shutdown"
+            ):
+                # HTTP/1.x teardown: the relay thread is being woken
+                # by it — this relay is over, retire like the
+                # worker-gone arm below. A FLAG-ONLY fire (HTTP/2
+                # shared socket, teardown not possible) falls
+                # through instead: the relay stays blocked in its
+                # read until the native timeout, and the worker may
+                # abandon it meanwhile — the PRIMARY orphan duty
+                # keeps polling (stall_fired stays set: one-shot,
+                # never re-cancel).
+                return
+            if not _worker_socket_dead(self._sock):
+                continue
+            with self._lock:
+                if self._stop.is_set():
+                    return
+                self.worker_gone.set()
+                cancel = self._cancel_upstream_locked()
+            try:
+                self._on_worker_gone(cancel)
+            except Exception:  # noqa: BLE001 — observability only
+                _logger.debug(
+                    "llm-dispatcher: orphan-cancel audit failed",
+                    exc_info=True,
+                )
+            return
+
+    def _cancel_upstream_locked(self) -> str:
+        """Best-effort upstream teardown; returns the action taken
+        (``upstream_shutdown`` or ``flag_only``) for the audit row."""
+        up = self._response
+        if up is None:
+            # Head dwell — nothing safely cancellable (class doc).
+            return "flag_only"
+        try:
+            if not (up.http_version or "").upper().startswith("HTTP/1"):
+                # h2: socket shared with sibling streams (class doc).
+                return "flag_only"
+            stream = up.extensions.get("network_stream")
+            sock = (
+                stream.get_extra_info("socket")
+                if stream is not None else None
+            )
+            if sock is None:
+                return "flag_only"
+            sock.shutdown(socket.SHUT_RDWR)
+            return "upstream_shutdown"
+        except Exception:  # noqa: BLE001 — cancel is best-effort
+            return "flag_only"
+
+
+# Upstream attempt-state stamp toward the worker. The worker's retry
+# loop cannot tell, from its exception alone, a transport death on a
+# request the upstream never handled (safe to re-send) from one whose
+# response had already STARTED — the upstream fully processed (and
+# billed) the generation, so a blind re-send buys it a second time.
+# The dispatcher is the one party that knows which case it saw, so it
+# stamps the response heads it sends toward the worker:
+#
+#   * ``response-started`` — a relayed upstream head. Any transport
+#     failure the worker sees AFTER this head is a mid-response death:
+#     the attempt is consumed and re-sending double-bills.
+#   * ``pre-response`` — the dispatcher's own 502 for a forward-leg
+#     failure before any upstream response byte. Worker-side retry
+#     stays eligible exactly as today (the slow-pre-response residual
+#     is owned by the elapsed-time ceiling above, not by this stamp).
+#
+# Absence of the header = the response never involved the upstream
+# forward leg (control planes, auth rejects) or predates the stamp;
+# the worker-side gate treats absence as "no signal" and keeps its
+# existing behaviour. The upstream's own copy of the header (never
+# legitimately present) is stripped so the stamp stays
+# dispatcher-authoritative.
+_UPSTREAM_STATE_HEADER = "X-Raptor-Upstream-State"
+_UPSTREAM_STATE_STARTED = "response-started"
+_UPSTREAM_STATE_PRE = "pre-response"
+
+
+# Socket-dir prefix shared by every construction route: run-scoped
+# dispatchers (``raptor-llm-<run_id>-`` via dispatcher_for_run) and the
+# in-process self-serve route (``raptor-llm-inproc-<hex8>-``) both mint
+# under it, so one dead-owner sweep covers the whole family.
+_SOCK_DIR_SWEEP_PREFIX = "raptor-llm-"
+
+# Socket-path budget, in BYTES of the fsencoded path — the unit the
+# kernel compares against sun_path (108 bytes on Linux including the
+# trailing NUL; 104 on the BSD family). 100 keeps headroom under the
+# tightest common cap. Higher (toward 107) admits dirs whose sockets
+# fail bind() on smaller-sun_path platforms; lower diverts to the
+# system-global /tmp fallback needlessly, abandoning the caller's
+# TMPDIR containment. Measured against "llm-child.sock" — the longest
+# socket name in the dir — so the budget covers its siblings too.
+_SUN_PATH_BUDGET = 100
 
 
 @dataclass
@@ -592,157 +1345,21 @@ class _UsageScanner:
                 del self._tail[:len(self._tail) - self._TAIL_CAP]
                 self.truncated = True
 
-    def _is_sse(self, head: str, tail: str) -> bool:
-        """SSE classification. Header wins; the body fallback is
-        LINE-anchored (an SSE field name starts a line) — a ``data:``
-        substring inside a JSON string value cannot start a line
-        because JSON string encoding escapes newlines."""
-        if self._content_type is not None:
-            return "text/event-stream" in self._content_type.lower()
-        # Tail bytes start mid-line whenever the tail buffer is in
-        # use (it only fills after the head cap, and front-trimming
-        # also cuts mid-line) — skip that fragment line so a cut
-        # landing inside a JSON string can't fabricate a line start.
-        for lines in (head.splitlines(), tail.splitlines()[1:]):
-            for line in lines:
-                if line.startswith(("data:", "event:")):
-                    return True
-        return False
-
     def extract(self) -> dict:
         """Return ``{model, input_tokens, output_tokens,
         cache_read_tokens, cache_creation_tokens}`` (zeros / None when
-        the body carried no usage)."""
-        out = {
-            "model": None,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "cache_read_tokens": 0,
-            "cache_creation_tokens": 0,
-        }
-        head = self._head.decode("utf-8", "replace")
-        tail = self._tail.decode("utf-8", "replace")
-        if self._is_sse(head, tail):
-            for text in (head, tail):
-                for line in text.splitlines():
-                    line = line.strip()
-                    if not line.startswith("data:"):
-                        continue
-                    try:
-                        obj = json.loads(line[len("data:"):].strip())
-                    except (json.JSONDecodeError, ValueError):
-                        continue
-                    if not isinstance(obj, dict):
-                        continue
-                    self._merge_event(obj, out)
-            return out
-        # Non-streamed JSON body.
-        if not self.truncated:
-            try:
-                obj = json.loads(head + tail)
-            except (json.JSONDecodeError, ValueError):
-                obj = None
-            if isinstance(obj, dict):
-                if isinstance(obj.get("model"), str):
-                    out["model"] = obj["model"]
-                self._merge_usage(obj.get("usage"), out)
-            return out
-        # Truncated non-SSE body: the middle is gone, so a full parse
-        # is impossible — but Anthropic Messages JSON carries its
-        # ``usage`` block at the END, inside the retained tail.
-        # Recover it there so an oversize response still books its
-        # real cost instead of $0 (the caller warns loudly when even
-        # this fails — see ``_book_child_usage``).
-        self._merge_usage(_usage_object_from_text(tail), out)
-        model = _model_id_from_text(head) or _model_id_from_text(tail)
-        if model:
-            out["model"] = model
-        return out
-
-    @staticmethod
-    def _merge_event(obj: dict, out: dict) -> None:
-        etype = obj.get("type")
-        if etype == "message_start":
-            message = obj.get("message")
-            if isinstance(message, dict):
-                if isinstance(message.get("model"), str):
-                    out["model"] = message["model"]
-                _UsageScanner._merge_usage(message.get("usage"), out)
-        elif etype == "message_delta":
-            _UsageScanner._merge_usage(obj.get("usage"), out)
-
-    @staticmethod
-    def _merge_usage(usage, out: dict) -> None:
-        if not isinstance(usage, dict):
-            return
-        for src, dst in (
-            ("input_tokens", "input_tokens"),
-            ("output_tokens", "output_tokens"),
-            ("cache_read_input_tokens", "cache_read_tokens"),
-            ("cache_creation_input_tokens", "cache_creation_tokens"),
-        ):
-            v = usage.get(src)
-            if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
-                # Later frames report cumulative totals — take the max
-                # so a final message_delta overrides, while partial
-                # streams (abort) keep whatever the upstream reported.
-                out[dst] = max(out[dst], v)
-
-
-# Injection note for both recovery helpers below: model-authored
-# response text rides inside JSON string values, whose ``"`` and
-# newline characters arrive escaped (``\"``, ``\n``) — so a raw
-# ``"usage"`` / ``"model"`` key token (unescaped quotes) can only come
-# from the response document's own structure, never from content a
-# prompt-injected child steered the model into emitting.
-_MODEL_KEY_RE = re.compile(r'"model"\s*:\s*"([^"\\]+)"')
-
-
-def _model_id_from_text(text: str) -> str | None:
-    """Best-effort model id from a partial JSON document (the model
-    key rides early in Anthropic Messages JSON, so it survives in the
-    head window of a truncated body)."""
-    m = _MODEL_KEY_RE.search(text)
-    return m.group(1) if m else None
-
-
-def _usage_object_from_text(text: str) -> dict | None:
-    """Recover the trailing ``usage`` object from a truncated non-SSE
-    body's retained tail. Bounded: one reverse find plus a single
-    brace scan over the (already capped) tail. Returns ``None`` when
-    no parseable usage object is present."""
-    idx = text.rfind('"usage"')
-    if idx < 0:
-        return None
-    brace = text.find("{", idx)
-    if brace < 0:
-        return None
-    depth = 0
-    in_str = False
-    escaped = False
-    for i in range(brace, len(text)):
-        c = text[i]
-        if in_str:
-            if escaped:
-                escaped = False
-            elif c == "\\":
-                escaped = True
-            elif c == '"':
-                in_str = False
-            continue
-        if c == '"':
-            in_str = True
-        elif c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                try:
-                    obj = json.loads(text[brace:i + 1])
-                except (json.JSONDecodeError, ValueError):
-                    return None
-                return obj if isinstance(obj, dict) else None
-    return None
+        the body carried no usage), plus ``scan_failed`` and
+        ``usage_scan_tier`` for the booking path. This class only
+        buffers — all interpretation of the retained bytes runs in the
+        confined usage-scan worker (``usage_scan_jail``; the pure core
+        in ``_usage_scan`` serves the in-process degradation tier),
+        never in this credential-holding process while a jail tier is
+        available."""
+        return get_usage_scan_jail().scan(
+            bytes(self._head), bytes(self._tail),
+            truncated=self.truncated,
+            content_type=self._content_type,
+        )
 
 
 def _usage_cost_usd(usage: dict) -> tuple[float, bool]:
@@ -800,6 +1417,8 @@ class LLMDispatcher:
         token_budget: int | None = None,
         creds: CredentialStore | None = None,
     ) -> None:
+        from core.security.session_services import require_service_authorization
+        require_service_authorization("a credential-bearing LLM dispatcher")
         self.run_id = run_id
         # TTL/budget resolution order: explicit caller arg →
         # ``RAPTOR_LLM_DISPATCHER_TOKEN_TTL_S`` / ``..._BUDGET`` env →
@@ -826,16 +1445,21 @@ class LLMDispatcher:
         self._creds = creds or CredentialStore()
         self._rules: dict[str, ProviderRule] = build_rules(self._creds)
 
-        # One pooled client for the forwarding leg, shared by every
+        # Pooled clients for the forwarding leg, shared by every
         # request (httpx.Client is thread-safe). Building a client
         # per request forced a fresh TCP + TLS handshake — and,
         # behind chained proxies, CONNECT negotiation per hop — on
-        # every forwarded LLM call. Built lazily and keyed on the
-        # proxy env (see _upstream_client): httpx snapshots proxy
-        # routes at client construction, and the egress chokepoint
-        # mutates HTTPS_PROXY in-process after the dispatcher may
-        # already exist — a construction-time client would bypass it.
-        self._upstream_http: httpx.Client | None = None
+        # every forwarded LLM call. A small shard pool rather than
+        # one client: under HTTP/2 a single client multiplexes ALL
+        # concurrent relays onto one connection, so one connection
+        # loss aborts every in-flight stream at once (see
+        # core.llm.http_pool.ClientShards). Built lazily and keyed on
+        # the proxy env (see _upstream_client_shards): httpx
+        # snapshots proxy routes at client construction, and the
+        # egress chokepoint mutates HTTPS_PROXY in-process after the
+        # dispatcher may already exist — a construction-time client
+        # would bypass it.
+        self._upstream_shards: ClientShards | None = None
         self._upstream_http_env: tuple | None = None
         self._upstream_http_lock = threading.Lock()
 
@@ -850,14 +1474,51 @@ class LLMDispatcher:
         self._loopback_lock = threading.Lock()
 
         # L1 — filesystem isolation.
-        self._sock_dir = Path(tempfile.mkdtemp(prefix=f"raptor-llm-{run_id}-"))
+        # AF_UNIX sun_path tops out around 108 bytes: a deep TMPDIR
+        # (nested session/pytest scratch layers) pushes
+        # ``<dir>/llm-child.sock`` past it and bind() fails at init.
+        # Fall back to the system-global /tmp (short by construction)
+        # with the SAME 0700 + owner-marker discipline; the run-id
+        # part of the prefix is clamped so a pathological run_id can't
+        # re-create the overflow. Residual: a SIGKILL'd owner's
+        # fallback dir is reclaimed by the dead-owner sweep only when
+        # gettempdir() is /tmp — bounded by the owner marker either
+        # way.
+        # Reclaim orphaned sibling socket dirs before minting a new
+        # one. shutdown()/atexit remove the dir on normal teardown,
+        # but a SIGTERM'd or SIGKILL'd owner skips both. Sweeping here
+        # — the one chokepoint every construction route passes through
+        # — covers run-scoped dirs (``raptor-llm-<run_id>-`` via
+        # dispatcher_for_run) and in-process dirs alike; the previous
+        # lifecycle-level sweep matched only ``raptor-llm-inproc-``,
+        # so a hard-killed launcher's run-scoped dir waited on the
+        # 24 h age-based reaper after all. The broad prefix is safe:
+        # the sweep removes a dir only when its recorded owner pid is
+        # dead (marker-less: only past the 24 h legacy age gate) and
+        # no live process holds it (cwd / answering-socket probes).
+        # Best-effort by contract — never blocks construction.
+        sweep_dead_owner_dirs(_SOCK_DIR_SWEEP_PREFIX)
+        _sock_prefix = f"raptor-llm-{run_id[:40]}-"
+        sock_dir = Path(tempfile.mkdtemp(prefix=_sock_prefix))
+        # os.fsencode, not str.encode(): the budget is in bytes as the
+        # kernel sees them, and an undecodable TMPDIR reaches Python
+        # as surrogate-escaped str — bare .encode() raised
+        # UnicodeEncodeError here, killing construction before this
+        # very fallback could rescue the path.
+        if len(os.fsencode(sock_dir / "llm-child.sock")) > _SUN_PATH_BUDGET:
+            fallback = Path(tempfile.mkdtemp(prefix=_sock_prefix, dir="/tmp"))
+            with contextlib.suppress(OSError):
+                os.rmdir(sock_dir)
+            sock_dir = fallback
+        self._sock_dir = sock_dir
         # 0o700 = owner-only — the socket lives here and must not be
         # group/other-readable on a multi-user host.
         os.chmod(self._sock_dir, 0o700)  # nosemgrep: python.lang.security.audit.insecure-file-permissions
         # Ownership marker: shutdown()/atexit remove this dir, but a
         # SIGTERM'd or SIGKILL'd owner skips both — the marker lets
-        # the next boot's dead-owner sweep (lifecycle.py) reclaim the
-        # orphan instead of waiting on the 24 h age-based reaper.
+        # the next dispatcher construction's dead-owner sweep (above)
+        # reclaim the orphan instead of waiting on the 24 h age-based
+        # reaper.
         write_owner_marker(self._sock_dir)
         self.socket_path = self._sock_dir / "llm.sock"
         # Child-plane UDS: same peer-UID gate, REDUCED surface (scoped
@@ -961,7 +1622,7 @@ class LLMDispatcher:
                 return True
 
         handler_cls = _make_request_handler(dispatcher)
-        self._server = _UnixThreadingHTTPServer(str(self.socket_path), handler_cls)
+        self._server = _UnixThreadingHTTPServer(str(self.socket_path), handler_cls)  # type: ignore[arg-type]
 
         self._thread = threading.Thread(
             target=self._server.serve_forever,
@@ -980,7 +1641,7 @@ class LLMDispatcher:
             dispatcher, plane="child_uds",
         )
         self._child_server = _UnixThreadingHTTPServer(
-            str(self.child_socket_path), child_handler_cls,
+            str(self.child_socket_path), child_handler_cls,  # type: ignore[arg-type]
         )
         self._child_thread = threading.Thread(
             target=self._child_server.serve_forever,
@@ -1194,7 +1855,8 @@ class LLMDispatcher:
         self._audit(AuditEvent(
             ts=now, event="token.renew",
             peer_pid=None, peer_uid=None,
-            token_id=_short(rec.value), worker_label=rec.worker_label,
+            token_id=(rec.token_id or _short(rec.value)),
+            worker_label=rec.worker_label,
             status="ok",
             extra={
                 "ttl_s": self._token_ttl_s,
@@ -1432,6 +2094,10 @@ class LLMDispatcher:
         provider-ledger contract for failed CC calls).
         """
         usage = scanner.extract()
+        # The jailed scan never raises into the relay: a worker that
+        # died or deviated on these bytes yields the zeros verdict
+        # with scan_failed=true, which books $0 — loudly, below.
+        scan_failed = bool(usage.get("scan_failed"))
         cost, priced = _usage_cost_usd(usage)
         saw_usage = any(
             usage[k] for k in (
@@ -1465,6 +2131,14 @@ class LLMDispatcher:
                 "against the USD budget (unscanned_response)",
                 rec.token_id,
             )
+        if scan_failed:
+            _logger.warning(
+                "llm-dispatcher: usage scan for scoped token %s failed "
+                "(the confined scan worker died or deviated on this "
+                "response) — this call books $0 against the USD budget "
+                "(scan_failed)",
+                rec.token_id,
+            )
         self._audit(AuditEvent(
             ts=time.time(), event="child_token.spend",
             peer_pid=None, peer_uid=None,
@@ -1478,6 +2152,8 @@ class LLMDispatcher:
                 "output_tokens": usage["output_tokens"],
                 "priced": priced,
                 "unscanned_response": unscanned,
+                "scan_failed": scan_failed,
+                "usage_scan_tier": usage.get("usage_scan_tier"),
             },
         ))
 
@@ -1505,6 +2181,18 @@ class LLMDispatcher:
                 daemon_threads = True
                 allow_reuse_address = True
 
+                def server_activate(self) -> None:
+                    # Concurrency cap for the TCP plane: unlike the
+                    # UDS planes there is no peer-UID gate — any local
+                    # UID connects — and ThreadingMixIn spawns one
+                    # uncapped daemon thread per accepted connection,
+                    # so tokenless idle connections could pin handler
+                    # threads without ever authenticating. Sized at
+                    # activation so the env knob applies per listener.
+                    self._conn_slots = threading.BoundedSemaphore(
+                        _tcp_max_connections())
+                    super().server_activate()
+
                 def verify_request(self, request, client_address) -> bool:
                     # Loopback-only peers. The bind address already
                     # guarantees this; the check defends against a
@@ -1520,17 +2208,53 @@ class LLMDispatcher:
                         return False
                     return True
 
+                def process_request(self, request, client_address) -> None:
+                    # Over-cap connections are refused pre-thread —
+                    # fail closed with an audit row rather than
+                    # queueing an unbounded thread per socket.
+                    if not self._conn_slots.acquire(blocking=False):
+                        dispatcher._audit(AuditEvent(
+                            ts=time.time(), event="peer.reject",
+                            peer_pid=None, peer_uid=None,
+                            token_id=None, worker_label=None,
+                            status="reject",
+                            reason=(
+                                "tcp connection cap reached "
+                                f"({_tcp_max_connections()})"
+                            ),
+                        ))
+                        self.shutdown_request(request)
+                        return
+                    try:
+                        super().process_request(request, client_address)
+                    except BaseException:
+                        self._conn_slots.release()
+                        raise
+
+                def process_request_thread(
+                    self, request, client_address,
+                ) -> None:
+                    # The slot is held for the handler thread's whole
+                    # life; ThreadingMixIn's finish/shutdown pairing
+                    # runs inside this frame, so the finally is the
+                    # one release point on the success path.
+                    try:
+                        super().process_request_thread(
+                            request, client_address)
+                    finally:
+                        self._conn_slots.release()
+
             handler_cls = _make_request_handler(dispatcher, plane="tcp")
-            self._tcp_server = _LoopbackHTTPServer(
+            self._tcp_server = _LoopbackHTTPServer(  # type: ignore[assignment]
                 ("127.0.0.1", 0), handler_cls,
             )
-            self._tcp_port = self._tcp_server.server_address[1]
-            self._tcp_thread = threading.Thread(
-                target=self._tcp_server.serve_forever,
+            self._tcp_port = self._tcp_server.server_address[1]  # type: ignore[attr-defined]
+            self._tcp_thread = threading.Thread(  # type: ignore[assignment]
+                target=self._tcp_server.serve_forever,  # type: ignore[attr-defined]
                 name=f"raptor-llm-dispatcher-tcp-{self.run_id}",
                 daemon=True,
             )
-            self._tcp_thread.start()
+            self._tcp_thread.start()  # type: ignore[attr-defined]
             self._audit(AuditEvent(
                 ts=time.time(), event="server.loopback_start",
                 peer_pid=None, peer_uid=None,
@@ -1539,44 +2263,98 @@ class LLMDispatcher:
             ))
             return self._tcp_port
 
-    def _upstream_client(self) -> httpx.Client:
-        """The pooled forwarding-leg client, rebuilt on proxy-env change.
+    def _upstream_client_shards(self) -> ClientShards:
+        """The pooled forwarding-leg clients, rebuilt on proxy-env
+        change.
 
-        httpx resolves proxy routes when the client is CONSTRUCTED,
+        A shard pool rather than one client: under HTTP/2 a single
+        client funnels every concurrent relay onto one multiplexed
+        connection, so one connection loss aborts all in-flight
+        streams at once. Relays acquire the least-loaded shard for
+        their full lifetime (see ``ClientShards``). With HTTP/2 off
+        the pool degenerates to one shard — exactly the previous
+        single-client behaviour.
+
+        httpx resolves proxy routes when a client is CONSTRUCTED,
         not per request. The egress chokepoint
         (``core.llm.egress.enable_llm_egress``) points HTTPS_PROXY at
-        the in-process proxy after startup, so the client is keyed on
+        the in-process proxy after startup, so the pool is keyed on
         a snapshot of the proxy env: same env → full connection
-        reuse; env changed → rebuild once and reuse from there. Env
-        changes happen at startup, before workers dispatch — closing
-        the superseded client here cannot race an in-flight stream in
-        any real sequence, and a hypothetical racer surfaces as a
-        502 the worker SDK already retries.
+        reuse; env changed → rebuild once and reuse from there. The
+        superseded pool RETIRES rather than closing: its idle shard
+        clients close immediately, but a relay already holding a
+        shard keeps its client (and its in-flight stream) until the
+        relay's own release — a rebuild racing an in-flight relay
+        (the egress chokepoint arming after a worker dispatched)
+        no longer aborts that relay's stream mid-flight.
         """
         env = tuple(os.environ.get(v) for v in _PROXY_ENV_VARS)
         with self._upstream_http_lock:
-            if self._upstream_http is None or self._upstream_http_env != env:
+            if self._upstream_shards is None or self._upstream_http_env != env:
                 from core.llm.http_pool import (
+                    ClientShards,
+                    forwarding_client,
                     http2_enabled,
                     pool_limits,
                     response_event_hooks,
+                    shard_failure_threshold,
+                    shard_max_age_s,
+                    upstream_shard_count,
                 )
-                old = self._upstream_http
-                self._upstream_http = httpx.Client(
-                    timeout=_upstream_timeout(), limits=pool_limits(),
-                    http2=http2_enabled(),
-                    event_hooks=response_event_hooks(),
+
+                def _build() -> httpx.Client:
+                    # forwarding_client = plain client + TCP keepalive
+                    # on both the direct and proxied routes, so an
+                    # idle pooled connection whose far side silently
+                    # died is reaped by the kernel between relays.
+                    return forwarding_client(
+                        timeout=_upstream_timeout(), limits=pool_limits(),
+                        http2=http2_enabled(),
+                        event_hooks=response_event_hooks(),
+                    )
+
+                old = self._upstream_shards
+                self._upstream_shards = ClientShards(
+                    _build, upstream_shard_count(),
+                    # Shard lifecycle: consecutive transport failures
+                    # drain-and-rebuild the sick shard (both HTTP
+                    # modes); age-based rotation replaces long-lived
+                    # HTTP/2 connections before a middlebox-imposed
+                    # tunnel lifetime does (None = off under
+                    # HTTP/1.1).
+                    failure_threshold=shard_failure_threshold(),
+                    max_age_s=shard_max_age_s(),
                 )
                 self._upstream_http_env = env
                 if old is not None:
                     try:
-                        old.close()
+                        old.retire()
                     except Exception:
                         _logger.debug(
                             "llm-dispatcher: superseded upstream client "
-                            "close failed", exc_info=True,
+                            "retire failed", exc_info=True,
                         )
-            return self._upstream_http
+            return self._upstream_shards
+
+    def _fresh_upstream_client(self) -> httpx.Client:
+        """One-shot forwarding-leg client for the stale-reuse retry —
+        a guaranteed fresh connection, never the shared pool, whose
+        remaining idle connections may be condemned by the same
+        far-side idle timeout that killed the first attempt (see
+        :func:`_upstream_stream_with_stale_retry`). Same proxy-env
+        behaviour and protocol observability as the pooled client;
+        the retry helper closes it once the relayed response is
+        drained."""
+        from core.llm.http_pool import (
+            forwarding_client,
+            http2_enabled,
+            response_event_hooks,
+        )
+        return forwarding_client(
+            timeout=_upstream_timeout(),
+            http2=http2_enabled(),
+            event_hooks=response_event_hooks(),
+        )
 
     def shutdown(self) -> None:
         """Stop the server thread and remove the socket directory.
@@ -1636,8 +2414,8 @@ class LLMDispatcher:
             )
             errors.append("child_shutdown")
         try:
-            if self._upstream_http is not None:
-                self._upstream_http.close()
+            if self._upstream_shards is not None:
+                self._upstream_shards.close()
         except Exception:
             _logger.warning(
                 "llm-dispatcher: upstream client close failed", exc_info=True,
@@ -1690,11 +2468,14 @@ class LLMDispatcher:
 
     def _audit(self, ev: AuditEvent) -> None:
         # Defang nonprintable / ANSI escapes on operator-visible
-        # fields. ``token_id`` is already a hex prefix (12 chars)
-        # so it doesn't need scrubbing, and ``event`` / ``status``
+        # fields. ``token_id`` is dispatcher-minted hex ONLY on the
+        # issue path — on token.reject it is the first bytes of
+        # whatever the CLIENT put in the auth header, so it gets the
+        # same scrub (a no-op for minted ids). ``event`` / ``status``
         # are internally produced strings.
         safe_worker = _scrub(ev.worker_label)
         safe_reason = _scrub(ev.reason)
+        safe_token = _scrub(ev.token_id)
         # Log level chosen by event type:
         # * Events in ``_DEMOTED_AUDIT_EVENTS`` → DEBUG. These are
         #   duplicated by a higher-level layer's own operator-
@@ -1714,15 +2495,16 @@ class LLMDispatcher:
         # ``AuditEvent.token_id`` docstring) — explicitly NOT the
         # full token. Operator visibility for the auth flow needs
         # SOME identifier; the prefix gives correlation without
-        # disclosure.
+        # disclosure. On reject the prefix is caller-supplied bytes,
+        # hence ``safe_token`` below.
         # nosemgrep: python.lang.security.audit.logging.logger-credential-leak.python-logger-credential-disclosure
         parts = [f"llm-dispatcher {ev.event} {ev.status}"]
         if ev.peer_pid is not None:
             parts.append(f"pid={ev.peer_pid}")
         if ev.peer_uid is not None:
             parts.append(f"uid={ev.peer_uid}")
-        if ev.token_id:
-            parts.append(f"token={ev.token_id}")
+        if safe_token:
+            parts.append(f"token={safe_token}")
         if safe_worker:
             parts.append(f"label={safe_worker}")
         if safe_reason:
@@ -1750,7 +2532,7 @@ class LLMDispatcher:
                         "event": ev.event,
                         "peer_pid": ev.peer_pid,
                         "peer_uid": ev.peer_uid,
-                        "token_id": ev.token_id,
+                        "token_id": safe_token,
                         "worker_label": safe_worker,
                         "status": ev.status,
                         "reason": safe_reason,
@@ -1827,7 +2609,9 @@ class LLMDispatcher:
 
 def _short(token: str) -> str:
     """Return a short prefix of a token for audit correlation. Never
-    log the full token — it's a credential."""
+    log the full token — it's a credential. On the reject path the
+    input is caller-supplied header bytes, not a minted token; the
+    prefix is display-scrubbed at the ``_audit`` chokepoint."""
     return token[:12]
 
 
@@ -1836,28 +2620,42 @@ def _short(token: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-_PROVIDER_FROM_PATH_PREFIX = {
+# Injected headers that HONOUR a caller-supplied value (setdefault
+# semantics at the forward site). Only protocol-negotiation headers
+# belong here — never credentials, which must always replace the
+# worker's placeholders.
+_CALLER_WINS_INJECT_HEADERS = frozenset({"anthropic-version"})
+
+_DIRECT_PATH_PREFIXES = {
     "/anthropic/":    "anthropic",
-    "/openai/":       "openai",
     "/gemini/":       "gemini",
-    # OpenAI-compatible aggregators + ecosystem providers added in
-    # Phase C-β. Each routes by the same prefix shape; the rule's
-    # ``upstream_base_url`` decides where the request actually goes.
-    "/mistral/":      "mistral",
+    "/openai/":       "openai",
+}
+
+_AGGREGATOR_PATH_PREFIXES = {
+    "/apiroute/": "apiroute",
+    "/cheaperinference/": "cheaperinference",
+    "/cohere/":       "cohere",
+    "/deepinfra/":    "deepinfra",
+    "/fireworks/":    "fireworks",
     "/groq/":         "groq",
-    "/together/":     "together",
+    "/mistral/":      "mistral",
     "/openrouter/":   "openrouter",
     "/orcarouter/":   "orcarouter",
-    "/fireworks/":    "fireworks",
-    "/deepinfra/":    "deepinfra",
     "/perplexity/":   "perplexity",
-    "/cohere/":       "cohere",
     "/replicate/":    "replicate",
+    "/together/":     "together",
+}
+
+_CLOUD_PATH_PREFIXES = {
     "/azure_openai/": "azure_openai",
-    # AWS Bedrock — routed by prefix like the others, but the rule
-    # carries a ``prepare_request`` hook that rewrites + SigV4-signs the
-    # request rather than injecting a static header.
     "/bedrock/":      "bedrock",
+}
+
+_PROVIDER_FROM_PATH_PREFIX = {
+    **_DIRECT_PATH_PREFIXES,
+    **_AGGREGATOR_PATH_PREFIXES,
+    **_CLOUD_PATH_PREFIXES,
 }
 
 
@@ -1886,27 +2684,49 @@ def _make_request_handler(
             # blocking, so a client that declares Content-Length N and
             # sends N-1 bytes — or stops reading its response — pins
             # the handler thread, its upstream pool connection, and
-            # any child-token reservation forever. Bound = the relay's
-            # total-deadline knob (``_relay_deadline_s``, read per
-            # connection so the env override applies without a
+            # any child-token reservation forever.
+            #
+            # The bound is STAGED by authentication state. Until the
+            # token clears, the peer gets the short pre-auth deadline
+            # (``_preauth_header_deadline_s``) — with the relay
+            # deadline here instead, a tokenless slow-header client
+            # held the handler thread for up to 3600 s per recv.
+            # ``_dispatch`` stretches the accepted connection to the
+            # relay's total-deadline knob (``_relay_deadline_s``, read
+            # per connection so env overrides apply without a
             # dispatcher rebuild): as a PER-IO cap it is generous — no
             # legitimate client-leg stall approaches the whole-relay
-            # deadline — while a smaller bespoke value would need its
-            # own knob and could cut streams whose consumer lawfully
-            # pauses between reads. A timeout raises
+            # deadline — while a smaller value could cut streams whose
+            # consumer lawfully pauses between reads. A timeout raises
             # ``TimeoutError``/``socket.timeout`` (an OSError), which
             # the relay's abort path handles exactly like
             # RelayLimitExceeded: aborted usage is booked and the
             # caller's ``finally`` releases the reservation.
-            self.timeout = float(_relay_deadline_s())
+            self.timeout = float(_preauth_header_deadline_s())  # type: ignore[misc]
             super().setup()
+
+        def handle_one_request(self) -> None:
+            # Re-arm the pre-auth deadline for EVERY request on the
+            # connection: _dispatch stretches the socket to the relay
+            # deadline once a token clears, and without the reset a
+            # keep-alive peer could authenticate once and then
+            # slow-header the NEXT request at the relay bound.
+            try:
+                self.connection.settimeout(
+                    float(_preauth_header_deadline_s()))
+            except OSError:
+                pass
+            super().handle_one_request()
 
         # Disable BaseHTTPRequestHandler's reverse DNS log spam — peer
         # is always the local socket on UDS anyway.
         def log_message(self, format, *args) -> None:
             return
 
-        def _send_simple(self, status: int, reason: str) -> None:
+        def _send_simple(
+            self, status: int, reason: str,
+            extra_headers: dict[str, str] | None = None,
+        ) -> None:
             body = json.dumps({"error": reason}).encode("utf-8")
             # Status line carries the STANDARD reason phrase only —
             # ``reason`` is caller-composed and can embed peer input
@@ -1914,21 +2734,31 @@ def _make_request_handler(
             # text raised out of send_response_only and CR/LF split
             # the status line. The detail rides exclusively in the
             # JSON body, where encoding escapes it.
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Connection", "close")
-            self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                # ``extra_headers`` values are dispatcher-composed
+                # constants (the attempt-state stamp), never peer input.
+                for k, v in (extra_headers or {}).items():
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
         def _send_json(self, status: int, payload: dict) -> None:
             body = json.dumps(payload).encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Connection", "close")
-            self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
         def _presented_token(self) -> str | None:
             """The credential the peer presented, wherever it rides.
@@ -1996,6 +2826,14 @@ def _make_request_handler(
                 ))
                 self._send_simple(401, reason or "unauthorized")
                 return
+
+            # Token cleared — stretch the per-IO bound from the
+            # pre-auth header deadline to the relay deadline for the
+            # body read and response relay (see ``setup``).
+            try:
+                self.connection.settimeout(float(_relay_deadline_s()))
+            except OSError:
+                pass
 
             # ---- worker-token renewal (/_token/renew) ----
             if self.path.split("?", 1)[0] == _TOKEN_RENEW_PATH:
@@ -2085,7 +2923,8 @@ def _make_request_handler(
                 dispatcher._audit(AuditEvent(
                     ts=time.time(), event="provider.reject",
                     peer_pid=None, peer_uid=None,
-                    token_id=_short(rec.value), worker_label=rec.worker_label,
+                    token_id=(rec.token_id or _short(rec.value)),
+                    worker_label=rec.worker_label,
                     status="reject", reason=f"unknown path: {self.path}",
                 ))
                 self._send_simple(404, "unknown provider path")
@@ -2129,7 +2968,8 @@ def _make_request_handler(
                 dispatcher._audit(AuditEvent(
                     ts=time.time(), event="provider.unconfigured",
                     peer_pid=None, peer_uid=None,
-                    token_id=_short(rec.value), worker_label=rec.worker_label,
+                    token_id=(rec.token_id or _short(rec.value)),
+                    worker_label=rec.worker_label,
                     status="reject", reason=provider_name,
                 ))
                 self._send_simple(503, f"provider not configured: {provider_name}")
@@ -2169,7 +3009,7 @@ def _make_request_handler(
 
             try:
                 self._forward_upstream(
-                    rec, rule, provider_name, method, upstream_path,
+                    rec, rule, provider_name, method, upstream_path,  # type: ignore[arg-type]
                     body,
                 )
             finally:
@@ -2199,13 +3039,14 @@ def _make_request_handler(
                 # any edit would invalidate the signature.
                 try:
                     prepared = rule.prepare_request(
-                        method, upstream_path, self.headers, body,
+                        method, upstream_path, self.headers, body,  # type: ignore[arg-type]
                     )
                 except BedrockTransformError as exc:
                     dispatcher._audit(AuditEvent(
                         ts=time.time(), event="provider.transform_reject",
                         peer_pid=None, peer_uid=None,
-                        token_id=_short(rec.value), worker_label=rec.worker_label,
+                        token_id=(rec.token_id or _short(rec.value)),
+                        worker_label=rec.worker_label,
                         status="reject", reason=f"{provider_name}: {exc.message}",
                     ))
                     self._send_simple(exc.status, exc.message)
@@ -2225,7 +3066,8 @@ def _make_request_handler(
                     dispatcher._audit(AuditEvent(
                         ts=time.time(), event="provider.transform_error",
                         peer_pid=None, peer_uid=None,
-                        token_id=_short(rec.value), worker_label=rec.worker_label,
+                        token_id=(rec.token_id or _short(rec.value)),
+                        worker_label=rec.worker_label,
                         status="error", reason=f"{provider_name}: {type(exc).__name__}",
                     ))
                     self._send_simple(502, f"request signing failed: {type(exc).__name__}")
@@ -2240,10 +3082,32 @@ def _make_request_handler(
                 for k, v in self.headers.items():
                     if k.lower() in rule.strip_request_headers:
                         continue
-                    if k.lower() in ("host", "content-length", _TOKEN_HEADER.lower()):
+                    # transfer-encoding: _read_body consumes a
+                    # Content-Length body only, so relaying the
+                    # client's framing header would mislabel the
+                    # re-framed body — the response side already
+                    # strips its twin for the same reason.
+                    if k.lower() in (
+                        "host", "content-length", "transfer-encoding",
+                        _TOKEN_HEADER.lower(),
+                    ):
                         continue
                     forwarded[k] = v
-                forwarded.update(rule.inject_headers())
+                # Credential headers always overwrite the worker's
+                # placeholders, but protocol-NEGOTIATION headers use
+                # setdefault semantics: Claude Code negotiates
+                # ``anthropic-version`` (and betas) per request, and
+                # the Bedrock ``prepare_request`` leg already honours
+                # the caller's value — a blanket update() silently
+                # clobbered it on the static anthropic rule only.
+                present = {k.lower() for k in forwarded}
+                for k, v in rule.inject_headers().items():
+                    if (
+                        k.lower() in _CALLER_WINS_INJECT_HEADERS
+                        and k.lower() in present
+                    ):
+                        continue
+                    forwarded[k] = v
                 url = rule.upstream_base_url + upstream_path
 
             # Scoped tokens are spend-capped from the upstream-reported
@@ -2254,6 +3118,36 @@ def _make_request_handler(
             # unsigned headers don't participate in verification.
             scanner: _UsageScanner | None = None
             if rec.kind == "child":
+                # Spend-capped tokens exist to enforce budget, and the
+                # booking scan runs in a confined worker — confirm a
+                # scan path exists BEFORE any upstream byte is spent.
+                # Raises only on the fail-closed arm (Landlock-capable
+                # kernel whose worker cannot spawn+confine): relaying
+                # unbooked would silently disable the cap, so refuse
+                # pre-upstream; the next request retries the spawn
+                # under backoff. Degraded hosts (no Landlock / no
+                # worker at all) never raise — the jail's tier ladder
+                # serves them. Worker-token relays (no scanner) are
+                # unaffected.
+                try:
+                    get_usage_scan_jail().ensure_available()
+                except UsageScanJailUnavailable as exc:
+                    dispatcher._audit(AuditEvent(
+                        ts=time.time(), event="usage_scan.unavailable",
+                        peer_pid=None, peer_uid=None,
+                        token_id=rec.token_id,
+                        worker_label=rec.worker_label,
+                        status="reject", reason=str(exc),
+                    ))
+                    self._send_simple(
+                        503, "usage-scan worker unavailable",
+                        extra_headers={
+                            # No upstream byte was seen — the worker's
+                            # retry policy stays in force.
+                            _UPSTREAM_STATE_HEADER: _UPSTREAM_STATE_PRE,
+                        },
+                    )
+                    return
                 scanner = _UsageScanner()
                 # REPLACE the client's accept-encoding, all case
                 # variants — dict-assigning only the canonical
@@ -2274,11 +3168,154 @@ def _make_request_handler(
             # Booking is not idempotent — the abort handler must know
             # whether the ok-path already settled this scanner.
             _usage_booked = False
+            # Provenance clock for the failure-path audit rows below:
+            # ``elapsed_s`` records monotonic seconds since the
+            # upstream send began, and ``response_started`` records
+            # whether the worker-facing response had begun (the same
+            # condition that selects the mid-stream abort path over
+            # the stamped 502). Together they let trail readers
+            # separate "relay belatedly noticing a worker that had
+            # already left" (long elapsed, response never started)
+            # from a genuine mid-response loss — flat rows made those
+            # indistinguishable.
+            upstream_sent_at = time.monotonic()
+            # Shard-health provenance: the stale-reuse death that
+            # triggers the transparent retry happened on the SHARD's
+            # own client, so it is one strike toward the drain
+            # threshold even when the retry recovers — a shard whose
+            # idle pool keeps getting condemned within the retry
+            # ceiling pays a one-shot fresh connection per relay and
+            # needs the drain repair, not masking. From the retry on,
+            # the response rides the one-shot client, so the retry's
+            # OUTCOME stays neutral both ways: a success must not
+            # reset the counter (falsely acquitting the shard whose
+            # own open just failed) and a failure must not strike a
+            # second time for one relay (see _SHARD_HEALTH_ERRORS).
+            _stale_retried = False
+
+            def _note_stale_retry(exc: Exception) -> None:
+                nonlocal _stale_retried
+                _stale_retried = True
+                # The strike for the shard's own stale death. The
+                # _stale_retried gates below keep the one-shot's
+                # outcome from adding or erasing evidence on top.
+                shards.report_failure(shard_index)
+                # Written before the retry's outcome is known —
+                # status "attempt", never "ok" (the next dispatch/
+                # error row carries the outcome). The row keeps the
+                # connection churn observable (how often the egress
+                # path idles out pooled connections) without an
+                # operator-facing error line.
+                dispatcher._audit(AuditEvent(
+                    ts=time.time(), event="request.retry",
+                    peer_pid=None, peer_uid=None,
+                    token_id=(rec.token_id or _short(rec.value)),
+                    worker_label=rec.worker_label,
+                    status="attempt",
+                    reason=f"{type(exc).__name__} (fresh-connection retry)",
+                    # Same provenance shape as request.error. A retry
+                    # is pre-response by construction (the helper only
+                    # retries stream-open failures), so
+                    # response_started is always False here.
+                    extra={
+                        "response_started": False,
+                        "elapsed_s": round(
+                            time.monotonic() - upstream_sent_at, 3,
+                        ),
+                    },
+                ))
+
+            def _note_worker_gone(cancel: str) -> None:
+                # Audit trail for the abandonment itself, distinct
+                # from the request.error row the aborting relay
+                # thread writes next: this row records WHEN the
+                # worker was noticed gone and WHAT was done about the
+                # upstream call (``cancel``: upstream_shutdown /
+                # flag_only / pre-upstream). ``response_started`` /
+                # ``elapsed_s`` are read at call time, so the row
+                # carries the relay's state at detection.
+                dispatcher._audit(AuditEvent(
+                    ts=time.time(), event="request.orphan_cancel",
+                    peer_pid=None, peer_uid=None,
+                    token_id=(rec.token_id or _short(rec.value)),
+                    worker_label=rec.worker_label,
+                    status="ok",
+                    reason=f"worker connection closed ({cancel})",
+                    extra={
+                        "response_started": response_started,
+                        "elapsed_s": round(
+                            time.monotonic() - upstream_sent_at, 3,
+                        ),
+                        "cancel": cancel,
+                    },
+                ))
+
+            # A worker that died while the request was being read,
+            # authorized, or signed must not launch an upstream call
+            # at all — the cheapest orphan is the one never opened.
+            if _worker_socket_dead(self.connection):
+                _note_worker_gone("pre-upstream")
+                self.close_connection = True
+                return
+            watcher = _OrphanWatcher(
+                self.connection, _orphan_poll_interval_s(),
+                _note_worker_gone,
+                # Stall arm: positively-identified streaming relays
+                # only (same classifier as the timeout selection —
+                # fail-safe: ambiguity keeps the arm off). Non-
+                # streaming relays must never arm it: their single
+                # body read legitimately spans the whole generation.
+                stream_stall_s=(
+                    _stream_stall_s()
+                    if _request_wants_stream(body, upstream_path)
+                    else None
+                ),
+            )
+
+            # Least-loaded shard, held for the relay's full lifetime
+            # (open through drain) and released in the same finally
+            # that retires the watcher. Under HTTP/2 this spreads
+            # concurrent relays across independent connections so one
+            # connection loss cannot abort every in-flight stream.
             try:
-                with dispatcher._upstream_client().stream(
+                shards = dispatcher._upstream_client_shards()
+                shard_client, shard_index = shards.acquire()
+            except BaseException:
+                # The watcher thread is already polling, but the
+                # relay's finally below is not armed yet — without
+                # this stop a failed acquire (pool closed in a
+                # shutdown race) leaks the watcher, which then reads
+                # the handler's own connection close as a worker
+                # abandonment and audits a spurious orphan cancel
+                # for a relay that never opened an upstream. stop()
+                # makes that row impossible rather than unlikely:
+                # stop and the cancel action exclude each other
+                # under the watcher's lock.
+                watcher.stop()
+                watcher.join()
+                raise
+            try:
+                with _upstream_stream_with_stale_retry(
+                    shard_client,
+                    dispatcher._fresh_upstream_client,
                     method, url, content=body, headers=forwarded,
-                    timeout=_upstream_timeout(),
+                    timeout=_upstream_timeout_for(body, upstream_path),
+                    on_retry=_note_stale_retry,
                 ) as up:
+                    watcher.attach_response(up)
+                    if watcher.worker_gone.is_set():
+                        # The worker left during the head dwell. The
+                        # watcher could not interrupt the blocked
+                        # open (no response object existed yet — see
+                        # _OrphanWatcher), but nothing has gone on
+                        # the worker wire, so abandon before relaying
+                        # a byte. OSError subclass → the ordinary
+                        # abort path below books any scanned usage
+                        # and writes the request.error row.
+                        raise WorkerDisconnected(
+                            "worker connection closed during "
+                            "upstream head dwell"
+                        )
                     try:
                         from core.llm.http_pool import (
                             _normalize_http_version,
@@ -2303,6 +3340,24 @@ def _make_request_handler(
                         )
                     response_started = True
                     self.send_response(up.status_code)
+                    # Attempt-state stamp: this head came FROM THE
+                    # UPSTREAM — from here on, the generation is
+                    # processed (and billed) upstream, and the
+                    # worker's retry gate must treat any subsequent
+                    # transport death as consumed spend. 2xx heads
+                    # only: an error head (429/5xx) is never a billed
+                    # generation, and rate-limit storms — exactly when
+                    # retry matters most — are when its body read is
+                    # likeliest to die on the wire; stamping it would
+                    # turn that wire death into a false terminal veto
+                    # with a false "billed" claim. Unstamped = "no
+                    # signal", so the worker's status-code retry
+                    # policy stays in force for relayed errors.
+                    if 200 <= up.status_code < 300:
+                        self.send_header(
+                            _UPSTREAM_STATE_HEADER,
+                            _UPSTREAM_STATE_STARTED,
+                        )
                     for k, v in up.headers.items():
                         # Strip hop-by-hop headers only. ``content-
                         # encoding`` is response-scoped and MUST be
@@ -2313,9 +3368,13 @@ def _make_request_handler(
                         # Stripping it ships gzipped bytes labelled
                         # as plain JSON — Anthropic always gzips,
                         # so worker SDK calls choke on the bytes.
+                        # The attempt-state header is stripped too:
+                        # only the dispatcher's own stamp above may
+                        # speak for the relay.
                         if k.lower() in (
                             "transfer-encoding",
                             "connection",
+                            _UPSTREAM_STATE_HEADER.lower(),
                         ):
                             continue
                         self.send_header(k, v)
@@ -2327,6 +3386,22 @@ def _make_request_handler(
                     )
                     _prev_chunk: bytes | None = None
                     for chunk in up.iter_raw():
+                        # Upstream liveness stamp — the first chunk
+                        # arms the watcher's stall deadline, every
+                        # chunk refreshes it.
+                        watcher.note_upstream_chunk()
+                        if watcher.worker_gone.is_set():
+                            # Detection seam for the cases the
+                            # watcher cannot interrupt (h2 shared
+                            # socket, failed shutdown): abandon at
+                            # the next chunk instead of writing to a
+                            # dead worker. When the watcher DID shut
+                            # the upstream socket down, iter_raw
+                            # raises before this line and the same
+                            # abort path runs.
+                            raise WorkerDisconnected(
+                                "worker connection closed mid-relay"
+                            )
                         relayed_bytes += len(chunk)
                         if relayed_bytes > max_relay_bytes:
                             _logger.warning(
@@ -2348,28 +3423,70 @@ def _make_request_handler(
                                 "upstream relay exceeded the "
                                 f"{_relay_deadline_s()}s total deadline"
                             )
-                        if scanner is None:
-                            # No spend ledger on this token: nothing
-                            # to order against — relay directly.
+                        if scanner is None and response_is_sse:
+                            # Unscoped SSE: real-time delivery, each
+                            # event out as it lands. No lookahead
+                            # needed for the watcher ordering below —
+                            # an SSE worker can only observe
+                            # completion at connection close (no
+                            # in-band length), which cannot precede
+                            # stop() — and holding events one
+                            # inter-event gap would break real-time
+                            # consumers (inter-event timeouts,
+                            # incremental display). Accepted residual:
+                            # a worker that treats a terminal SSE
+                            # event as completion and closes before
+                            # transport EOF re-enters the poll window
+                            # — transport-level completion is the only
+                            # signal the relay can order against.
                             self.wfile.write(chunk)
                             continue
-                        scanner.feed(chunk)
-                        # One-chunk lookahead (scoped tokens only):
-                        # the final chunk is held until the scanned
-                        # usage is BOOKED, so a client can never
-                        # observe a completed response whose cost has
-                        # not yet landed on spent_usd — pipelining a
-                        # follow-up request the instant the body ends
-                        # must meet the updated ledger at admission.
-                        # Reservations bound the overrun only while
-                        # actual cost stays within the admission
-                        # ceiling; this ordering closes the gap for
-                        # responses that over-report usage relative
-                        # to the request. Cost: each chunk is
-                        # delayed by one upstream inter-chunk gap.
+                        if scanner is not None:
+                            scanner.feed(chunk)
+                        # One-chunk lookahead: the final chunk is held
+                        # until the post-drain bookkeeping below has
+                        # run, so a worker can never observe a
+                        # completed response while that bookkeeping is
+                        # still pending. Two duties:
+                        #  * watcher ordering (any token, non-SSE): a
+                        #    Content-Length worker sees completion
+                        #    in-band, and one that closes the instant
+                        #    it has the full body is a HEALTHY close —
+                        #    the relay stops the watcher before the
+                        #    final chunk goes out, so that close can
+                        #    never be polled as an abandonment.
+                        #    Pre-fix, unscoped relays wrote every
+                        #    chunk in-loop, and a relay descheduled
+                        #    for one poll interval between its last
+                        #    write and stop() had the worker's healthy
+                        #    close audited as request.orphan_cancel;
+                        #  * spend ordering (scoped tokens, SSE
+                        #    included): the scanned usage is BOOKED
+                        #    before the body ends, so a client
+                        #    pipelining a follow-up request the
+                        #    instant the response completes must meet
+                        #    the updated ledger at admission.
+                        #    Reservations bound the overrun only
+                        #    while actual cost stays within the
+                        #    admission ceiling; this ordering closes
+                        #    the gap for responses that over-report
+                        #    usage relative to the request.
+                        # Cost: each chunk is delayed by one upstream
+                        # inter-chunk gap.
                         if _prev_chunk is not None:
                             self.wfile.write(_prev_chunk)
                         _prev_chunk = chunk
+                    # Stream drained: stop the watcher BEFORE the
+                    # final chunk (and the response's scope exit)
+                    # below. A worker that closes the instant it has
+                    # the full body is a HEALTHY close — it can only
+                    # observe completion after this line, so a
+                    # detection can neither audit its close as an
+                    # abandonment nor shut down an upstream socket
+                    # already returned to the shared pool (stop() and
+                    # the cancel action exclude each other under the
+                    # watcher's lock).
+                    watcher.stop()
                     if scanner is not None:
                         dispatcher._book_child_usage(
                             rec, scanner, aborted=False,
@@ -2381,10 +3498,19 @@ def _make_request_handler(
                     if _prev_chunk is not None:
                         self.wfile.write(_prev_chunk)
                     self.wfile.flush()
+                if not _stale_retried:
+                    # Clean drain on the shard's own client: reset
+                    # its consecutive-failure counter. Skipped after
+                    # a stale-reuse retry — that success rode the
+                    # one-shot client and would erase the strike the
+                    # retry just recorded, falsely acquitting a
+                    # shard whose own open failed.
+                    shards.report_success(shard_index)
                 dispatcher._audit(AuditEvent(
                     ts=time.time(), event="request.dispatch",
                     peer_pid=None, peer_uid=None,
-                    token_id=_short(rec.value), worker_label=rec.worker_label,
+                    token_id=(rec.token_id or _short(rec.value)),
+                    worker_label=rec.worker_label,
                     status="ok",
                     extra={
                         "provider": provider_name, "method": method,
@@ -2396,6 +3522,18 @@ def _make_request_handler(
                     },
                 ))
             except (httpx.HTTPError, OSError) as exc:
+                if (
+                    not _stale_retried
+                    and not watcher.worker_gone.is_set()
+                    and isinstance(exc, _SHARD_HEALTH_ERRORS)
+                ):
+                    # Transport death on the shard's own client (not
+                    # the watcher shutting the socket down itself):
+                    # one strike toward the drain-and-rebuild
+                    # threshold. A stale-retried relay already struck
+                    # at the retry, so its one-shot's failure adds
+                    # nothing here.
+                    shards.report_failure(shard_index)
                 if scanner is not None and not _usage_booked:
                     # Aborted mid-stream — book what the upstream
                     # already reported (message_start input tokens at
@@ -2410,16 +3548,48 @@ def _make_request_handler(
                 dispatcher._audit(AuditEvent(
                     ts=time.time(), event="request.error",
                     peer_pid=None, peer_uid=None,
-                    token_id=_short(rec.value), worker_label=rec.worker_label,
+                    token_id=(rec.token_id or _short(rec.value)),
+                    worker_label=rec.worker_label,
                     status="error", reason=type(exc).__name__,
+                    # Extra keys only — consumers filter rows by the
+                    # ``event`` field and tolerate additions (same
+                    # contract as request.dispatch's http_version).
+                    extra={
+                        "response_started": response_started,
+                        "elapsed_s": round(
+                            time.monotonic() - upstream_sent_at, 3,
+                        ),
+                        # Ties the error row to the orphan_cancel row
+                        # when the abort was watcher-induced: a
+                        # shutdown-woken read surfaces as a plain
+                        # httpx error whose class name alone cannot
+                        # say the worker was already gone.
+                        "worker_disconnected":
+                            watcher.worker_gone.is_set(),
+                        # Stall-arm provenance, a FLAG rather than a
+                        # dedicated audit event: unlike an orphan
+                        # cancel — worker-initiated, possibly with no
+                        # request.error row at all — a stall cancel
+                        # always co-occurs with exactly one
+                        # request.error row, so a separate row would
+                        # double-count wedge events in trail tooling.
+                        "stall_abort": watcher.stall_fired.is_set(),
+                    },
                 ))
                 if not response_started:
                     # Nothing on the wire yet — a clean HTTP error
-                    # response is still possible.
+                    # response is still possible. The ``pre-response``
+                    # stamp tells the worker's retry gate no upstream
+                    # response byte was seen for this attempt, so its
+                    # existing retry policy stays in force.
                     try:
                         self._send_simple(
                             502,
                             f"upstream error: {type(exc).__name__}",
+                            extra_headers={
+                                _UPSTREAM_STATE_HEADER:
+                                    _UPSTREAM_STATE_PRE,
+                            },
                         )
                     except OSError:
                         pass
@@ -2443,6 +3613,20 @@ def _make_request_handler(
                         if isinstance(exc, RelayLimitExceeded)
                         else type(exc).__name__
                     )
+                    if (
+                        watcher.stall_fired.is_set()
+                        and watcher.stream_stall_s is not None
+                    ):
+                        # A stall cancel surfaces as the transport
+                        # class the teardown woke (ReadError /
+                        # RemoteProtocolError) — that names the
+                        # watcher's own socket shutdown, not the
+                        # upstream wedge that caused it. Name the
+                        # stall explicitly for SSE consumers.
+                        detail = (
+                            "stream stall: no upstream bytes for "
+                            f"{watcher.stream_stall_s:g}s"
+                        )
                     # Leading blank line closes whatever partial event
                     # (or partial ``data:`` line — iter_raw chunk
                     # boundaries are arbitrary) was already relayed,
@@ -2469,6 +3653,16 @@ def _make_request_handler(
                     except OSError:
                         pass
                 self.close_connection = True
+            finally:
+                # Every exit — normal drain (already stopped above,
+                # idempotent), abort, and the pre-response 502 return
+                # — retires the watcher: bounded thread lifetime, no
+                # polling of a connection the handler is done with.
+                # The shard hold is returned on the same paths so the
+                # least-loaded counter tracks live relays exactly.
+                shards.release(shard_index)
+                watcher.stop()
+                watcher.join()
 
         def _child_admin(self, rec: _TokenRecord) -> None:
             """Handle /_child/{mint,revoke,spend} for a validated
@@ -2540,6 +3734,27 @@ def _make_request_handler(
                     self._send_simple(404, "unknown token_id")
                     return
                 self._send_json(200, snapshot)
+                return
+            if op == "loopback":
+                # Enable (idempotently) the loopback TCP plane and
+                # report its port. Same worker-plane-only gate as the
+                # other ops (the caller already refused non-UDS planes
+                # and child tokens before dispatching here). The op
+                # exists for workers whose CLI/SDK children speak
+                # plain HTTP to a base URL (``claude`` reads
+                # ``ANTHROPIC_BASE_URL``; OpenAnt's anthropic provider
+                # takes ``base_url``) but run in a DIFFERENT process
+                # than the dispatcher, where
+                # ``enable_loopback_listener()`` cannot be called on
+                # the instance. Capability-neutral for the caller: the
+                # plane it opens only ever authenticates scoped child
+                # tokens (worker tokens are refused there), and a
+                # worker can already mint those. One shared listener —
+                # concurrent workers each get the same port and scope
+                # their own tokens; the dispatcher's ``shutdown()``
+                # owns the teardown.
+                port = dispatcher.enable_loopback_listener()
+                self._send_json(200, {"port": port})
                 return
             self._send_simple(404, f"unknown child-admin op: {op!r}")
 

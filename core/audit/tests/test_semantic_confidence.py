@@ -25,6 +25,25 @@ class TestClassifySemanticConfidence:
         src = "int check(int x) {\n    if (x > 0)\n        return 1;\n    return 0;\n}\n"
         assert classify_semantic_confidence(hyp, src, line_start=1) == "high"
 
+    def test_operator_fragment_does_not_confirm(self):
+        # `!=` and `+=` contain "=" as a fragment — after removing
+        # `==` the old substring test confirmed a nonexistent
+        # `=`-for-`==` symptom on any such line.
+        hyp = "line 1 uses `=` instead of `==` in a conditional"
+        src = "if (x != 0) {\n    total += 1;\n}\n"
+        assert classify_semantic_confidence(hyp, src, line_start=1) == "low"
+
+    def test_real_assignment_still_confirms(self):
+        # Other direction: a genuine `=`-for-`==` keeps its rescue.
+        hyp = "line 1 uses `=` instead of `==` in a conditional"
+        src = "if (uid = 0) {\n    grant_access();\n}\n"
+        assert classify_semantic_confidence(hyp, src, line_start=1) == "high"
+
+    def test_word_token_fragment_does_not_confirm(self):
+        hyp = "uses `cmp` instead of `strcmp`"
+        src = "if (strcmp(a, b)) {\n    fail();\n}\n"
+        assert classify_semantic_confidence(hyp, src) == "low"
+
     def test_wrong_value_not_in_source(self):
         hyp = "line 10 uses `=` instead of `==`"
         src = "if (uid == 0) {\n    grant_access();\n}\n"

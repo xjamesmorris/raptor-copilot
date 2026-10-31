@@ -24,6 +24,7 @@ Available Modes:
     describe    - Pre-flight inspection: target type, tool readiness, cost estimate
     doctor      - Status report for local setup (no claude needed)
     frida       - Dynamic instrumentation via Frida (alpha)
+    openant     - OpenAnt AST+LLM source-code vulnerability scan
 
 Examples:
     # Full autonomous workflow
@@ -88,16 +89,20 @@ def _extract_target(args: list) -> str | None:
     the target path for project resolution.
     """
     for flag in ("--repo", "--binary", "--url"):
-        # `--flag value` form.
-        if flag in args:
-            idx = args.index(flag)
-            if idx + 1 < len(args):
-                return args[idx + 1]
-        # `--flag=value` form.
+        # Both spellings scanned in ONE positional pass, keeping the
+        # LAST occurrence — argparse resolves a repeated flag to its
+        # last value, and lifecycle records/gates must key to the
+        # same tree the run actually analyses (first-occurrence keyed
+        # them to the overridden value on `--repo a --repo b`).
         prefix = f"{flag}="
-        for arg in args:
-            if arg.startswith(prefix):
-                return arg[len(prefix):]
+        value = None
+        for idx, arg in enumerate(args):
+            if arg == flag and idx + 1 < len(args):
+                value = args[idx + 1]
+            elif arg.startswith(prefix):
+                value = arg[len(prefix):]
+        if value is not None:
+            return value
     return None
 
 
@@ -419,7 +424,14 @@ def _unpack_archive_target(target: str, args: list, out_dir: Path):
             os.replace(tmp, canonical)
         except OSError:
             shutil.rmtree(tmp, ignore_errors=True)  # lost the race; canonical is there
-        print(f"[*] Unpacked {stats['format']} archive: {stats['files']} files (cache {sha[:12]})")
+        # Hostile/unsafe members (zip-slip paths, links, specials the
+        # safety filter rejected) must not vanish silently — the
+        # operator is scanning a semi-trusted input and a nonzero drop
+        # count is signal about it.
+        dropped = stats.get("dropped", 0)
+        drop_note = f" ({dropped} unsafe members dropped)" if dropped else ""
+        print(f"[*] Unpacked {stats['format']} archive: {stats['files']} "
+              f"files{drop_note} (cache {sha[:12]})")
 
     # Acquisition stamp only — {source, archive_sha256, archive_name, format}.
     # The extracted tree's content-equivalence id is the coverage store's to
@@ -443,7 +455,7 @@ def _unpack_archive_target(target: str, args: list, out_dir: Path):
 # fuzz and web children do NOT parse --repo as their target: fuzz
 # needs --binary and web needs --url, and a project target (a source
 # directory) is meaningless for both.
-_REPO_TARGET_COMMANDS = frozenset({"scan", "agentic", "codeql"})
+_REPO_TARGET_COMMANDS = frozenset({"scan", "agentic", "codeql", "openant"})
 _REQUIRED_TARGET_FLAG = {"fuzz": "--binary", "web": "--url"}
 # fuzz utility modes that legitimately run without --binary.
 _FUZZ_STANDALONE_FLAGS = ("--export-seed-corpus", "--prepare-corpus")
@@ -466,6 +478,68 @@ def _forward_max_cost_args(command: str, args: list,
     if max_cost_usd is None or command not in _MAX_COST_FORWARD_COMMANDS:
         return args
     return args + ["--max-cost-usd", str(max_cost_usd)]
+
+
+# Modes whose child script defines --project in its own argparse —
+# the same class as _MAX_COST_FORWARD_COMMANDS above: every child uses
+# a strict parse_args, so re-injecting the flag unconditionally made a
+# flag-less child (raptor_openant.py) exit 2 on the unknown flag AFTER
+# archive extraction had run and the run dir was sealed with the
+# OUTPUT_DIR sentinel printed — a guaranteed failed run for any
+# --project openant invocation.
+_PROJECT_FORWARD_COMMANDS = frozenset({"scan", "agentic", "codeql",
+                                       "fuzz", "web"})
+
+
+def _forward_project_args(command: str, args: list,
+                          project_arg: str | None) -> list:
+    """Re-inject --project so the child's own override agrees with the
+    pin the parent just sealed, but only when the ``command``'s child
+    parser defines the flag (see ``_PROJECT_FORWARD_COMMANDS``).
+    Flag-less children still agree with the pin: every child
+    bootstraps from the run marker start_run sealed."""
+    if project_arg is None or command not in _PROJECT_FORWARD_COMMANDS:
+        return args
+    return args + ["--project", project_arg]
+
+
+# Name-shaped archive suffixes for the stray-positional gate below —
+# a token like `app.zip` deserves the `--repo` hint even when the path
+# doesn't exist (typo'd path); everything else nonexistent is left to
+# the child parser's own error.
+_ARCHIVE_NAME_SUFFIXES = (
+    ".zip", ".tar", ".tgz", ".tar.gz", ".tar.bz2", ".tar.xz",
+    ".tar.zst", ".gz", ".bz2", ".xz", ".zst",
+)
+
+
+def _stray_target_token(args: list) -> str | None:
+    """First bare (non-flag) token that plausibly names a target: it
+    exists on disk, or is archive-named. None when there is none.
+
+    Conservative flag-value handling: any ``-x``/``--x`` token NOT
+    carrying an inline ``=value`` is assumed to take the NEXT token as
+    its value, which is therefore never treated as a positional. This
+    deliberately trades misses for safety in both directions — a
+    boolean flag followed by a stray positional slips through (child
+    argparse still errors, no worse than pre-fix), but a value flag
+    whose argument happens to exist on disk (``--extra-config
+    rules.yml``) can never be misread as a stray target and break a
+    legitimate run.
+    """
+    expect_value = False
+    for a in args:
+        if expect_value:
+            expect_value = False
+            continue
+        if not isinstance(a, str) or not a:
+            continue
+        if a.startswith("-"):
+            expect_value = "=" not in a
+            continue
+        if Path(a).exists() or a.lower().endswith(_ARCHIVE_NAME_SUFFIXES):
+            return a
+    return None
 
 
 def _is_fuzz_standalone(args: list) -> bool:
@@ -493,6 +567,24 @@ def _resolve_target_for_command(command: str, args: list,
     if target is not None:
         return target, args, None
     if command in _REPO_TARGET_COMMANDS:
+        # Stray-positional gate BEFORE any default back-fill: an argv
+        # like `raptor.py scan /path/app.zip` carries its target as a
+        # positional token the child parsers don't define. Pre-fix the
+        # wrapper back-filled the active project's target (or
+        # RAPTOR_CALLER_DIR) as --repo anyway — sealing a failed run
+        # dir inside the WRONG project when the child exited 2, and
+        # one tolerant child away from scanning the wrong codebase
+        # outright. When a bare token names something on disk (or is
+        # archive-named), the operator clearly meant it as the target:
+        # fail fast with the canonical form, NO run dir (mirrors the
+        # fuzz/web required-flag fail-fast below).
+        stray = _stray_target_token(args)
+        if stray is not None:
+            return None, args, (
+                f"{command}: unrecognized positional argument '{stray}' "
+                f"— did you mean --repo {stray}? Refusing to fall back "
+                f"to the project/caller default target."
+            )
         # CLAUDE.md DEFAULT TARGET DIRECTORY: (1) active project,
         # (2) RAPTOR_CALLER_DIR. Explicit --repo always wins (the
         # caller only reaches here when args carry no target).
@@ -723,9 +815,9 @@ def _run_with_lifecycle(command: str, script_path: Path, args: list,
     # Re-inject --project so the child's own override agrees with the
     # pin the parent just sealed (children also bootstrap from the run
     # marker; the argv keeps direct-invocation and wrapper flows on
-    # one code path).
-    if project_arg is not None:
-        args = args + ["--project", project_arg]
+    # one code path). Only for children whose parser defines the flag
+    # (see _forward_project_args).
+    args = _forward_project_args(command, args, project_arg)
 
     # ``flush=True``: when stdout is piped (e.g. operator's ``| tee
     # run.log``) Python switches to block-buffering, so the banner
@@ -767,6 +859,17 @@ def _run_with_lifecycle(command: str, script_path: Path, args: list,
 
 
     if rc == 0:
+        # Some child-owned workflows intentionally pause the SAME run for a
+        # host-managed continuation. Copilot-native /agentic marks the run
+        # interrupted after mechanical prep; completing it here would erase
+        # the resumable handoff state before managed subagents can return.
+        from core.run.metadata import load_run_metadata
+        child_metadata = load_run_metadata(out_dir)
+        if (
+            isinstance(child_metadata, dict)
+            and child_metadata.get("status") == "interrupted"
+        ):
+            return 0
         # Engine versions + deterministically_reproducible are filled by the
         # lifecycle itself now (core.run.complete_run), uniformly for every
         # command — no per-command manifest wiring here.
@@ -782,6 +885,31 @@ def _run_with_lifecycle(command: str, script_path: Path, args: list,
                     print("\n" + summary)
             except Exception as e:  # noqa: BLE001
                 logging.getLogger(__name__).debug("coverage summary skipped: %s", e)
+
+        # Graph store enrichment for standalone /scan and /codeql only.
+        # /agentic does NOT ingest its findings into the graph yet —
+        # this lane is skipped for command=="agentic" and raptor_agentic.py
+        # has no ingest call of its own (wiring pending).
+        if command in ("scan", "codeql"):
+            try:
+                _target_str = target or ""
+                if command == "scan":
+                    from core.understand_graph import ingest_scan_findings
+                    ingest_scan_findings(out_dir, _target_str)
+                if command == "codeql":
+                    from core.understand_graph import ingest_codeql_sarif
+                    ingest_codeql_sarif(out_dir, _target_str)
+            # Broad except: enrichment is best-effort by design (the
+            # sibling graph-enrichment sites use the same spelling). The
+            # ingest mkdirs the graph dir and binds artifact-derived
+            # values, so the failure surface spans OSError, sqlite errors,
+            # shape errors, and bind overflows — any of them must degrade
+            # to this warning lane, not revoke the already-complete run's
+            # success at its final optional step.
+            except Exception:
+                logging.getLogger(__name__).debug(
+                    "graph store enrichment skipped", exc_info=True,
+                )
     else:
         fail_run(out_dir, error=f"exit code {rc}")
     return rc
@@ -800,6 +928,12 @@ _NO_TRUST_REPO_SEEN = False
 
 _active_dispatcher = None
 
+# Why the dispatcher is unavailable, when it is ("TypeName: message").
+# Set by _get_or_start_dispatcher's failure path, consumed by
+# _announce_env_direct_downgrade so the downgrade banner and the run's
+# credential-posture.json record can name the cause.
+_dispatcher_failure_reason: str | None = None
+
 
 def _get_or_start_dispatcher(audit_path=None):
     """Lazy single dispatcher per ``raptor.py`` invocation.
@@ -814,6 +948,11 @@ def _get_or_start_dispatcher(audit_path=None):
     in-memory/logger-only. First construction wins — the singleton's
     audit destination cannot move mid-invocation.
     """
+    from core.security.session_services import (
+        ServiceAuthorizationError,
+        require_service_authorization,
+    )
+    require_service_authorization("a standalone LLM dispatcher")
     global _active_dispatcher
     if _active_dispatcher is not None:
         return _active_dispatcher
@@ -867,25 +1006,20 @@ def _get_or_start_dispatcher(audit_path=None):
         )
         atexit.register(_active_dispatcher.shutdown)
         return _active_dispatcher
+    except ServiceAuthorizationError:
+        raise
     except Exception as exc:  # noqa: BLE001
         # Failure to start the dispatcher must not break the run —
-        # fall through to the env-direct path. The credential leak
-        # channel stays open in this case but is no worse than today.
-        # Surface the failure on stderr (in addition to the logger
-        # warning) so operators see it regardless of log-level
-        # config. Once API keys are stripped from ``get_llm_env``,
-        # this fallback produces workers without auth — the symptom
-        # is a confusing "first LLM call fails" 30 seconds later.
-        # Surface it loudly now so operators see it immediately.
+        # fall through to the env-direct path. The fallback itself is
+        # DELIBERATELY kept (dispatcher-down resilience), but it is a
+        # credential-isolation downgrade, so it must never be silent:
+        # record the reason here; the single prominent operator-facing
+        # banner prints at the fallback site
+        # (_announce_env_direct_downgrade), which also drops a
+        # credential-posture.json record into the run's output dir.
         import logging
-        import sys as _sys
-        msg = (
-            f"raptor.py: credential-isolation dispatcher failed to "
-            f"start ({type(exc).__name__}: {exc}). Falling back to "
-            f"env-direct credential propagation."
-        )
-        _sys.stderr.write(msg + "\n")
-        _sys.stderr.flush()
+        global _dispatcher_failure_reason
+        _dispatcher_failure_reason = f"{type(exc).__name__}: {exc}"
         logging.getLogger(__name__).warning(
             "credential-isolation dispatcher failed to start, falling back "
             "to env-direct: %s", exc,
@@ -924,6 +1058,74 @@ def _cleanup_refused_run_dir(out_dir: Path) -> None:
         out_dir.rmdir()
 
 
+def _announce_env_direct_downgrade(
+    script_name: str, out_dir: Path | None,
+) -> None:
+    """One prominent warning + a run-artifact record whenever a run
+    falls back to env-direct credential propagation.
+
+    The fallback stays (dispatcher-down resilience is a live
+    requirement) but it is an isolation DOWNGRADE: the child loses the
+    dispatcher route's per-run scoping, budget enforcement, audit
+    trail, and parent-side revocation. (It is NOT a keyless-vs-keyed
+    flip — ``get_llm_env`` carries provider keys into the child on the
+    dispatcher path too unless ``RAPTOR_LLM_WORKER_KEYLESS=1``, the
+    separate pre-existing opt-in.) The operator must see the downgrade
+    once, loudly, with the reason, and the run's output directory must
+    carry a durable ``credential-posture.json`` record of it.
+    Credential VALUES never appear in either. Best-effort on the
+    record write: a failed write logs and never blocks the run.
+    """
+    reason = _dispatcher_failure_reason or (
+        "dispatcher not started (no failure recorded)"
+    )
+    # The reason quotes exception text; render it terminal-inert
+    # before printing (log_sanitisation contract).
+    try:
+        from core.security.log_sanitisation import sanitise_for_terminal
+        shown_reason = sanitise_for_terminal(reason, max_len=500)
+    except ImportError:
+        shown_reason = reason[:500]
+    rule = "=" * 72
+    sys.stderr.write(
+        f"\n{rule}\n"
+        f"⚠  CREDENTIAL-ISOLATION DOWNGRADE — env-direct fallback\n"
+        f"   The LLM dispatcher is unavailable, so the {script_name} "
+        f"child runs\n"
+        f"   env-direct for this run — without the dispatcher route's "
+        f"per-run\n"
+        f"   scoping, budget enforcement, audit trail, and "
+        f"revocation.\n"
+        f"   Why: {shown_reason}\n"
+        f"{rule}\n\n"
+    )
+    sys.stderr.flush()
+    logging.getLogger(__name__).warning(
+        "credential-isolation downgrade: env-direct fallback for %s "
+        "(dispatcher unavailable: %s)", script_name, reason,
+    )
+    if out_dir is None:
+        return
+    import json as _json
+    from datetime import datetime, timezone
+    record = {
+        "posture": "env_direct_fallback",
+        "credential_isolation": "downgraded",
+        "reason": reason,
+        "script": script_name,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        (Path(out_dir) / "credential-posture.json").write_text(
+            _json.dumps(record, indent=2) + "\n", encoding="utf-8",
+        )
+    except OSError as write_exc:
+        logging.getLogger(__name__).warning(
+            "could not write credential-posture.json to %s: %s",
+            out_dir, write_exc,
+        )
+
+
 def _run_script(script_path: Path, args: list, out_dir: Path | None = None) -> int:
     """
     Run a RAPTOR script with given arguments.
@@ -959,6 +1161,18 @@ def _run_script(script_path: Path, args: list, out_dir: Path | None = None) -> i
 
     try:
         from core.config import RaptorConfig
+        from core.sandbox.disable_consent import passthrough_nonce_env
+        from core.security.session_services import (
+            report_session_service_policy,
+            session_services_restricted,
+        )
+        if session_services_restricted():
+            report_session_service_policy()
+            return subprocess.run(
+                cmd,
+                env=RaptorConfig.get_safe_env(include_python_user_base=True),
+                check=False,
+            ).returncode
         audit_path = None
         if out_dir is not None:
             from core.llm.dispatcher.lifecycle import audit_path_for_run_dir
@@ -984,6 +1198,14 @@ def _run_script(script_path: Path, args: list, out_dir: Path | None = None) -> i
                 worker_env = RaptorConfig.get_llm_env(
                     include_python_user_base=True,
                 )
+            # This process forwards argv to raptor_<mode>.py without
+            # parsing the sandbox flags itself, so an inherited
+            # RAPTOR_NO_SANDBOX_NONCE must ride to the child that DOES
+            # run the disable-consent gate — the safe-env scrub would
+            # otherwise drop a CI-minted consent before it could be
+            # validated. Forwarding grants nothing by itself: the child
+            # validates against the uid-owned consent file.
+            passthrough_nonce_env(worker_env)
             proc = spawn_worker(
                 dispatcher,
                 cmd=cmd,
@@ -991,13 +1213,20 @@ def _run_script(script_path: Path, args: list, out_dir: Path | None = None) -> i
                 env=worker_env,
             )
             return proc.wait()
-        # Fallback: env-direct (no dispatcher available).
+        # Fallback: env-direct (no dispatcher available). Kept on
+        # purpose — but it is a credential-isolation downgrade, so it
+        # is announced prominently and recorded in the run's output
+        # directory (credential-posture.json).
         # Same opt-in as the dispatcher path above — the canonical
         # operator entry point must preserve PYTHONUSERBASE for the
         # spawned ``raptor_<mode>.py`` subprocess.
+        _announce_env_direct_downgrade(script_path.name, out_dir)
+        fallback_env = RaptorConfig.get_llm_env(include_python_user_base=True)
+        # Same nonce forwarding as the dispatcher path above.
+        passthrough_nonce_env(fallback_env)
         result = subprocess.run(
             cmd,
-            env=RaptorConfig.get_llm_env(include_python_user_base=True),
+            env=fallback_env,
             check=False,
         )
         return result.returncode
@@ -1155,9 +1384,16 @@ def mode_fuzz(args: list) -> int:
     # Running the full lifecycle for them sealed an empty 'completed'
     # run directory per export with an OUTPUT_DIR sentinel pointing
     # at nothing — phantom runs in /project status. They are
-    # utilities, not runs: spawn the script directly.
+    # utilities, not runs: spawn the script directly. Peek (don't
+    # strip) an operator --out so an env-direct fallback still lands
+    # its credential-posture.json somewhere durable — the child keeps
+    # parsing the flag itself.
     if _is_fuzz_standalone(args):
-        return _run_script(fuzzing_script, args)
+        out_str, _ = _extract_and_strip_out(args)
+        return _run_script(
+            fuzzing_script, args,
+            out_dir=Path(out_str) if out_str else None,
+        )
 
     return _run_with_lifecycle("fuzz", fuzzing_script, args,
                               "Starting binary fuzzing workflow...")
@@ -1285,6 +1521,57 @@ def mode_codeql(args: list) -> int:
                               "Running CodeQL analysis...")
 
 
+def _refuse_archive_analyze_target(args: list) -> str | None:
+    """Refusal message when analyze's ``--repo`` names an archive, else
+    None.
+
+    analyze is the one repo-taking mode that runs OUTSIDE the run
+    lifecycle (no run dir, hence no ``_sources`` cache anchor of its
+    own), so the archive target is REFUSED with the canonical form
+    rather than routed through the scan-style unpack: its input SARIF
+    is keyed to whatever tree the producing scan actually ran on — the
+    content-addressed extraction that scan already cached — so the
+    correct remedy is pointing at that tree, not bolting a second
+    extraction path onto a lifecycle-less mode. Pre-fix the archive
+    passed straight through and agent.py's containment gate dropped
+    EVERY SARIF finding as "path traversal" (nothing resolves under a
+    file), exiting 0 — a silently-wrong empty analysis.
+    """
+    if _wants_help(args):
+        return None  # help is not a run; let the child render it
+    repo = _extract_target(args)
+    if not repo:
+        return None
+    p = Path(repo)
+    try:
+        if not p.is_file():
+            return None
+        from core.archive import is_archive
+        if not is_archive(p):
+            return None
+    except OSError:
+        return None
+    hint = ""
+    try:
+        # Name the concrete cached tree when a prior run extracted it.
+        from core.archive import safe_cache_name
+        from packages.describe.cli import _find_cached_extraction
+        cached = _find_cached_extraction(p, safe_cache_name)
+        if cached is not None:
+            hint = f" A prior run already extracted it: --repo {cached}"
+    except Exception:  # noqa: BLE001 — the hint is best-effort decoration
+        pass
+    return (
+        f"analyze: --repo {repo} is an archive. analyze joins existing "
+        f"SARIF findings to the source TREE they were scanned from — "
+        f"against an archive file every finding path fails containment "
+        f"and is silently dropped. Pass the extracted tree the SARIF "
+        f"was produced from (archive-target scans extract to "
+        f"<out>/_sources/<name>-<sha>/), or scan the archive itself: "
+        f"python3 raptor.py scan --repo {repo}.{hint}"
+    )
+
+
 def mode_llm_analysis(args: list) -> int:
     """Run LLM-powered vulnerability analysis on existing SARIF files."""
     script_root = Path(__file__).parent
@@ -1294,8 +1581,20 @@ def mode_llm_analysis(args: list) -> int:
         print(f"✗ LLM analysis script not found: {llm_script}", file=sys.stderr)
         return 1
 
+    refusal = _refuse_archive_analyze_target(args)
+    if refusal:
+        print(f"✗ {refusal}", file=sys.stderr)
+        return 2
+
     print("\n[*] Running LLM-powered vulnerability analysis...\n")
-    return _run_script(llm_script, args)
+    # Peek (don't strip) an operator --out so an env-direct fallback
+    # still lands its credential-posture.json somewhere durable — the
+    # child keeps parsing the flag itself.
+    out_str, _ = _extract_and_strip_out(args)
+    return _run_script(
+        llm_script, args,
+        out_dir=Path(out_str) if out_str else None,
+    )
 
 
 def mode_describe(args: list) -> int:
@@ -1403,6 +1702,7 @@ def _mode_help_scripts() -> dict:
         'agentic': script_root / "raptor_agentic.py",
         'codeql': script_root / "raptor_codeql.py",
         'analyze': script_root / "packages/llm_analysis/agent.py",
+        'openant': script_root / "raptor_openant.py",
     }
 
 
@@ -1410,6 +1710,20 @@ def _mode_help_scripts() -> dict:
 # argparse (no run lifecycle). Derived from _mode_help_scripts so it stays in
 # lockstep with what show_mode_help can actually render.
 _HELP_RENDER_MODES = frozenset(_mode_help_scripts().keys())
+
+
+
+def mode_openant(args: list) -> int:
+    """Run OpenAnt AST+LLM source-code vulnerability scan."""
+    script_root = Path(__file__).parent
+    openant_script = script_root / "raptor_openant.py"
+
+    if not openant_script.exists():
+        print(f"\u2717 OpenAnt script not found: {openant_script}")
+        return 1
+
+    return _run_with_lifecycle("openant", openant_script, args,
+                              "Running OpenAnt LLM-powered source-code scan...")
 
 
 def show_mode_help(mode: str, preamble: bool = True) -> None:
@@ -1434,6 +1748,7 @@ def show_mode_help(mode: str, preamble: bool = True) -> None:
             'doctor': mode_doctor,
             'sca': mode_sca,
             'frida': mode_frida,
+        'openant': mode_openant,
         }
         mode_handlers[mode](["--help"])
         return
@@ -1483,12 +1798,13 @@ Available Modes:
   binary      - Black-box binary investigation and evidence collection
   fuzz        - Binary fuzzing with AFL++
   web         - Web application security testing
-  agentic     - Full autonomous workflow (Semgrep + LLM analysis; --codeql adds CodeQL)
+  agentic     - Full autonomous workflow (Semgrep + CodeQL + LLM analysis; --no-codeql skips CodeQL)
   codeql      - CodeQL-only analysis
   analyze     - LLM-powered vulnerability analysis (requires SARIF input)
   describe    - Pre-flight inspection: target type, tool readiness, cost estimate
   doctor      - Status report for local setup (no claude needed)
   frida       - Dynamic instrumentation via Frida (alpha)
+  openant     - OpenAnt AST+LLM source-code vulnerability scan
 
 Examples:
   # Full autonomous workflow
@@ -1523,6 +1839,12 @@ not before; the top-level parser does not declare them directly):
                         (composes with --sandbox profiles other than 'none')
   --audit-verbose       With --audit, log every traced syscall
                         (strace-style diagnostic)
+  --sandbox-floor {mount-ns,mountless-ns,ns-only,landlock,none}
+                        Per-run consent for the UNTRUSTED containment
+                        floor (both directions: lower to accept a
+                        degraded host, raise to pin the full contract
+                        over the project setting / env waiver; 'none'
+                        is never a consentable untrusted floor)
   --sandbox-readable-path PATH
                         Extend the read allowlist (repeatable) — the
                         fix when a read-restricting run denies a path
@@ -1645,6 +1967,7 @@ def main():
         'doctor': mode_doctor,
         'describe': mode_describe,
         'frida': mode_frida,
+        'openant': mode_openant,
     }
     
     if mode not in mode_handlers:
@@ -1695,11 +2018,14 @@ if __name__ == "__main__":
         print("\n\nInterrupted by user", file=sys.stderr)
         sys.exit(130)
     except Exception as e:  # noqa: BLE001
+        from core.project.registry_home import RegistryHomeError
         from core.run.pin import ProjectArgvError
-        if isinstance(e, ProjectArgvError):
-            # The designed clean hard-error, not an internal fault —
-            # it can fire before start_run (get_output_dir resolves
-            # the override), so catch it here too, without traceback.
+        if isinstance(e, (ProjectArgvError, RegistryHomeError)):
+            # The designed clean hard-errors (invalid --project value;
+            # invalid RAPTOR_REGISTRY_HOME override), not internal
+            # faults — both can fire before start_run (get_output_dir
+            # resolves the overrides), so catch them here too, without
+            # traceback.
             print(f"✗ {e}", file=sys.stderr)
             sys.exit(1)
         print(f"\n✗ Fatal error: {e}", file=sys.stderr)

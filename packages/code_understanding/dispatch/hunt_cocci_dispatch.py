@@ -43,7 +43,6 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
-import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -165,19 +164,35 @@ Example (for "find all strcpy calls"):
 """
 
 
-_RULE_FENCE_RE = re.compile(
-    r"```cocci\s*\n(.*?)```",
-    re.DOTALL | re.IGNORECASE,
-)
-
-
 def _strip_fences(text: str) -> str:
     """Pull the rule text out of ```cocci ... ``` fences. If the model
-    returned plain text without fences, take the whole thing."""
-    m = _RULE_FENCE_RE.search(text)
-    if m:
-        return m.group(1).strip()
-    return text.strip()
+    returned plain text without fences, take the whole thing.
+
+    Find-based walk, match-identical to the lazy-DOTALL fence regex
+    it replaces (case-insensitive opener, whitespace run ending in a
+    newline, body up to the first later triple-backtick): the regex
+    re-scanned to end-of-text from every planted opener when the
+    closer was withheld — quadratic on model-produced text."""
+    lowered = text.lower()
+    pos = 0
+    while True:
+        opener = lowered.find("```cocci", pos)
+        if opener == -1:
+            return text.strip()
+        run_start = opener + len("```cocci")
+        run_end = run_start
+        while run_end < len(text) and text[run_end].isspace():
+            run_end += 1
+        newline = text.rfind("\n", run_start, run_end)
+        if newline == -1:
+            # No newline after the marker: not a fence opener.
+            pos = opener + 1
+            continue
+        close = text.find("```", newline + 1)
+        if close == -1:
+            # No closer anywhere later: no opener can match either.
+            return text.strip()
+        return text[newline + 1:close].strip()
 
 
 def translate_pattern_to_cocci_rule(
@@ -321,7 +336,22 @@ def _make_locked_sandbox_runner(
     except Exception as exc:  # noqa: BLE001 — any import failure means no isolation
         from core.run.sandbox_policy import require_sandbox_or_optout
         require_sandbox_or_optout(f"{caller_label} (locked sandbox runner)", exc)
-        return subprocess.run
+
+        def _unsandboxed_runner(cmd, **kwargs):
+            # The opt-out waives the sandbox, never environment
+            # hygiene: spatch parses hostile target source and
+            # executes an LLM-emitted rule, and bare subprocess.run
+            # handed it the operator's FULL environment (tokens,
+            # GIT_* overrides). Same fix shape as the joern opt-out
+            # lane.
+            try:
+                from core.config import RaptorConfig
+                kwargs.setdefault("env", RaptorConfig.get_safe_env())
+            except ImportError:
+                pass
+            return subprocess.run(cmd, **kwargs)
+
+        return _unsandboxed_runner
 
     def _runner(cmd, **kwargs):
         sandbox_kwargs: dict[str, Any] = {
@@ -480,14 +510,33 @@ def cocci_hunt_dispatch(
             pass
         _scratch_stack.close()
 
-    if not result.ok and not result.matches:
-        # Nothing matched AND spatch reported errors — surface the
-        # error so the operator can refine the pattern. (Empty
-        # matches with rc=0 is a legitimate "no variants found"
-        # answer — return [] in that case.)
+    if not result.ok:
         err = "; ".join(result.errors)[:500] if result.errors else (
             f"spatch returncode {result.returncode}"
         )
-        return [{"error": f"cocci rule did not execute cleanly: {err}"}]
+        if not result.matches:
+            # Nothing matched AND spatch reported errors — surface the
+            # error so the operator can refine the pattern. (Empty
+            # matches with rc=0 is a legitimate "no variants found"
+            # answer — return [] in that case.)
+            return [{"error": f"cocci rule did not execute cleanly: {err}"}]
+        # Partial yield: the run errored (a file failed to parse, a
+        # per-file timeout hit, ...) but still produced matches.
+        # Swallowing the errors made the incomplete match set read as
+        # a complete answer — stamp each variant with a degradation
+        # note instead (extra keys ride variant dicts by contract; an
+        # appended error ENTRY would be stripped by the substrate's
+        # error filter and surface nowhere).
+        logger.warning(
+            "cocci hunt: rule did not execute cleanly; %d match(es) "
+            "may be a partial set: %s", len(result.matches), err,
+        )
+        variants = _spatch_matches_to_variants(result, repo_path)
+        for v in variants:
+            v["degradation"] = (
+                f"cocci rule did not execute cleanly: {err}; "
+                f"match set may be partial"
+            )
+        return variants
 
     return _spatch_matches_to_variants(result, repo_path)

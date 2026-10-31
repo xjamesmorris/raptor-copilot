@@ -4,6 +4,22 @@ RAPTOR uses large language models for vulnerability analysis, exploit generation
 validation, and autonomous decision-making. This guide covers provider configuration,
 model selection, multi-model workflows, and cost management.
 
+## Copilot session restriction
+
+The standalone provider configuration below applies outside restricted
+Copilot sessions. Under Copilot, RAPTOR cannot verify that an SDK, a
+dispatcher, or another CLI process uses the account/service that started
+the active session. Autodetection, model inventory/key probes, explicit
+standalone dispatch, and Claude fallback are therefore refused or reported
+as unavailable without making requests. Ambient keys, `models.json`,
+`--model`, and previous consent do not grant current authorization.
+
+Native Copilot reasoning stays in the current host session. RAPTOR has no
+headless Copilot provider or verified per-operation external authorization
+bridge; no configuration opt-out is offered. Offline transcript replay
+does not authorize live calls. See `README-Copilot.md` for the kernel
+network ceiling, requirements, and enforcement limits.
+
 ## Supported Providers
 
 Eight providers are supported. RAPTOR probes for configured providers in this order
@@ -27,6 +43,59 @@ auto-selected — pick it explicitly in `models.json`):
 workloads; a stale session resets and retries as fresh.
 
 See [dependencies](dependencies.md) for SDK installation.
+
+### Copilot CLI synthetic probe boundary
+
+`core.llm.copilot_probe` currently implements **Level A synthetic validation
+only**. The public operation is plan construction, which is non-spawning and
+contains only prompt length/hash metadata. Explicit execution accepts only an
+opaque capability issued for the repository-owned generic fake CLI, rechecks
+the generated script and config bytes plus their inode identities, and runs
+once through `run_untrusted_networked(..., no_degrade=True)`.
+The capability is a trusted in-process fixture boundary, not a claim that
+Python objects isolate malicious code already running as the same UID.
+
+This is not a provider, launcher, model-selection route, SDK integration, or
+claim that real Copilot CLI inference works. There is no reachable
+operator-installed executable branch in this probe/provider path, and
+`allow_live=True` is refused.
+`RAPTOR_COPILOT_TRANSPORT_DISABLED` is checked at the single execution
+chokepoint before the synthetic canary environment or sandbox is created.
+Tests force the switch on by default; a fixture clears it only after verifying
+the owned fake capability.
+
+The parser provenance is pinned to schema-derived Copilot CLI `1.0.84-4`
+facts. A `1.0.84-5` static receipt profile is a separate evidence object, not
+an upgrade of this parser provenance, and is neither added nor consumed here.
+
+The synthetic command fixes the caller's model, effort, context tier, and
+session ID; sends the prompt only through stdin; requests JSON output; and
+disables auto-update, custom instructions, ask-user, remote export, built-in
+MCP, and broad tool/path/URL permissions. It uses a private fake home and
+state/cache/log/usage paths and never inherits ambient Copilot loader/cache,
+model, or GitHub-token variables.
+
+`record_only` stores bounded stdout/stderr as mode-0600 private evidence with
+hashes, an owner, and an expiry. That artifact is explicitly classified as
+prompt-bearing and potentially secret-bearing; it is not copied to public
+logs or result representations. Exact, base64, URL-safe-base64, and percent
+encoded synthetic-canary matches quarantine the artifact and block
+admission. This scan detects those encodings only; it is not a proof that
+every possible transformation is absent. `candidate_admission` never admits
+truncated output and preserves `candidate_complete_unevidenced` as a blocked
+candidate outcome. Candidate completion content remains caller-sensitive and
+is excluded from result reprs.
+
+Interactive frontend launch is a separate boundary:
+`raptor --frontend copilot` can use a verified native Linux Copilot executable
+to host RAPTOR's decision layer. That does not register Copilot under
+`core.llm`, route analysis-dispatch prompts through this probe, or change any
+candidate-admission rule described here.
+
+Real record-only probes are a separately authorized Level B activity with
+B1-B4 initially unknown. Production/admission on real streams remains Level C
+and requires those proofs plus provider/route integration that does not exist
+in this change.
 
 ### Claude Code transport
 
@@ -240,9 +309,12 @@ contradicts the configured region.
 
 - **Worker cap:** Bedrock quota is shared account-wide (most visibly
   with a live Claude Code session on the same account), so analysis
-  parallelism is clamped to 8 workers by default;
-  `RAPTOR_BEDROCK_MAX_WORKERS` overrides, `tuning.json`'s
-  `max_llm_workers` beats both.
+  parallelism is clamped to 8 workers by default. The cap is
+  posture-aware: `tuning.json`'s `llm_account_posture=solo` raises it
+  to 16 (the account is declared this host's alone — still a ceiling,
+  since bursting past the quota's token-rate churns 429s even solo).
+  `RAPTOR_BEDROCK_MAX_WORKERS` overrides posture in both directions,
+  `tuning.json`'s `max_llm_workers` beats everything.
 - **Entitlement preflight:** at dispatcher startup, one 1-token probe
   per configured (model, surface, region, profile) combination turns
   an un-entitled model into an actionable warning up front instead of
@@ -253,10 +325,11 @@ contradicts the configured region.
   limit at construction time. `RAPTOR_LLM_STREAM_TRANSPORT=1` carries
   otherwise-non-streaming calls (plain generation AND instructor
   structured generation) over SSE — see Long Structured Calls below.
-- **Multi-model panels:** two entries that peel to the same
-  underlying model (e.g. a Bedrock id and its direct-API name) log a
-  same-weights warning — their agreement is transport consistency,
-  not independent consensus.
+- **Multi-model panels:** two route-qualified entries that peel to the same
+  declared model (for example, a Bedrock ID and its direct-API name) are
+  rejected before submission. Their agreement would measure transport
+  consistency, not independent consensus. Distinct models from the same
+  family remain valid, as do explicit `#sc0`/`#sc1` self-consistency handles.
 
 ### Long Structured Calls
 
@@ -380,9 +453,112 @@ primary — resolvable whenever the `claude` binary is installed.
    A Bedrock entry without an auxiliary role gets its own step here —
    the tier table can't score Bedrock ids, so the entry itself is the
    declared default for API work.
-3. Provider auto-detect: first configured provider in the default order wins.
-4. Shorthand resolution: bare tokens like `haiku`, `opus`, `sonnet` match against
+3. The same goes for Ollama. The tier table only knows the closed
+   cloud models, so a local entry would never score — a role-less (or
+   `analysis`/`code`-role) Ollama entry therefore gets its own step,
+   and the first such entry in the file is the declared default. This
+   is what lets `models.json` pin *which* local model is primary rather
+   than leaving it to the `/api/tags` probe order below. Give it an
+   auxiliary role (`fallback`, `judge`, etc.) to keep it out of primary
+   selection.
+4. Provider auto-detect: first configured provider in the default order
+   wins. For Ollama with no primary-eligible entry, this falls through
+   to the probe's own preference order (see [Ollama](#ollama-offline--airgapped)).
+5. Shorthand resolution: bare tokens like `haiku`, `opus`, `sonnet` match against
    configured model names. Ambiguous matches raise an error.
+
+### Explicit catalogue-unlisted Claude models
+
+The built-in model tables provide verified limits and prices; they are not an
+allowlist. A model that the selected Claude backend actually serves can be used
+without editing the catalogue:
+
+```bash
+# Interactive frontend: forwarded verbatim to the native Claude Code CLI.
+bin/raptor --frontend claude --model rhyolite-preview /path/to/target
+
+# Headless analysis through Claude Code.
+python3 raptor.py agentic --repo /path/to/target \
+  --model claudecode/rhyolite-preview
+
+# Direct Anthropic API route.
+python3 raptor.py agentic --repo /path/to/target \
+  --model anthropic/rhyolite-preview
+```
+
+The interactive launcher does not validate or rewrite the model string. For
+headless analysis, `provider/model` selects the route explicitly and the model
+portion is retained exactly. A direct Anthropic selection may borrow only a
+configured Anthropic credential and `api_base`; it does not borrow a sibling
+model's limits or price. A `claudecode/...` selection uses the installed
+Claude Code CLI's own authentication. In both cases an upstream "unknown
+model", entitlement, or other rejection remains a visible call failure; RAPTOR
+does not substitute a catalogue model. A single explicit `--model` also
+suppresses config-derived fallback models; an unlisted explicit model also
+does not acquire a catalogue-derived fast-tier specialist.
+
+Only the first recognized route qualifier is structural. Everything after it
+is an opaque upstream model ID and is preserved byte-for-byte, including
+additional `/`, `.`, `:`, `_`, `+`, and `@` separators. Thus
+`claudecode/vendor/rhyolite.preview:beta+tools@20261016` reaches Claude Code as
+`vendor/rhyolite.preview:beta+tools@20261016`. Route aliases such as
+`claude-code/...` canonicalize the provider to `claudecode` without rewriting
+the model. If the same opaque model name appears under multiple configured
+providers, an explicit qualifier wins; it cannot be captured by an exact name
+on another provider. For headless and pinned calls, a usable configured
+same-provider credential/`api_base` also wins over ambient provider defaults,
+so an environment API key cannot silently move the explicit model off its
+configured gateway.
+
+This route/family split also applies to local models:
+`ollama/gpt-oss:20b`, `ollama/gemma3`, `ollama/mistral`, and
+`ollama/command-r` all stay on the configured Ollama endpoint even though
+their underlying families are OpenAI, Google, Mistral, and Cohere
+respectively. Family detection remains available for cross-family review; it
+never overrides an explicit routing provider.
+
+An unusual unqualified name is accepted only when it exactly matches a
+`models.json` entry, which supplies the otherwise unknowable provider route:
+
+```json
+{
+  "models": [
+    {
+      "provider": "claudecode",
+      "model": "rhyolite-preview",
+      "max_context": 200000,
+      "max_output": 32000
+    }
+  ]
+}
+```
+
+Unqualified names that are neither exact configured entries nor unambiguous
+configured shorthand still fail loudly with a `provider/model` remedy. This
+keeps typo handling and shorthand ambiguity unchanged.
+
+Catalogue-unlisted means capability and price metadata are **unknown**:
+
+- no limits or prices are added to `MODEL_LIMITS` / `MODEL_COSTS`;
+- direct-provider USD accounting remains Unknown rather than using an invented
+  zero or sibling price;
+- Claude Code cost is CLI-reported when its result envelope supplies it and
+  Unknown otherwise;
+- for an exact configured entry, set `max_context` and `max_output` to values
+  documented by that backend. Provider-qualified one-off selections use
+  conservative internal request bounds, not a claim about the model's true
+  capacity.
+
+Core callers that require an immutable route can construct
+`LLMClient(pinned_config=ModelConfig(...))`. This disables fallback and task
+specialization and revalidates the provider, model, and route fields before
+every fresh, structured-repair, or tool-use dispatch. Exact-pinned clients do
+not read or write the shared response cache because its logical identity
+cannot attest the pin's full route. Mutating the configuration or supplying a
+different per-call route raises `PinnedRouteViolation`; error messages do not
+include credentials or endpoint values. Legacy provider-only pins such as
+`pinned_model="claudecode"` remain advisory provider selection, not an
+exact-model attestation.
 
 ### Fast-Tier Models
 
@@ -411,6 +587,14 @@ over the CodeQL SARIF):
 
 Constraints: consensus/judge/aggregate require at least one analysis model. The same
 model cannot serve as both analysis and consensus.
+
+Correlation notes: a finding where every model abstained
+(errored/refused) carries the `no-verdict` confidence signal in
+`correlation.json` — abstentions never count as votes, so an
+all-abstain panel is never reported as unanimous. A model's failure
+circuit breaker also opens after ten consecutive failures even when
+the model succeeded earlier in the run (one early success previously
+held a dying transport closed for the rest of the work items).
 
 Example:
 ```bash
@@ -463,22 +647,120 @@ Beyond per-call recording, four producers run at analysis time:
 
 Controlled by `LLMConfig.scorecard_enabled` (default `True`).
 
+The current scorecard schema is v2 and is keyed only by model name. Existing
+unambiguous API and Claude CLI routes continue recording numeric history for
+compatibility, but the CLI labels every persisted dollar value
+**Estimated USD (legacy; authority unknown)**. Routes whose provider declares
+model-name aggregation unsafe, and configurations that reuse one model name
+across different routes, fail closed: trust reads return learning/no data and
+writes are refused without modifying the sidecar. Unknown and subscription
+cost observations are not inserted as zero-cost calls, and provider-billed
+observations cannot be represented in v2.
+
 ## Cost Management
 
-### Budget Cap
+### Advisory Budget and Strict Contracts
 
-`LLMConfig.max_cost_per_scan` sets a USD budget cap (default $10.00). Enforced via
-atomic pre-debit reservation before each provider call. Concurrent dispatchers cannot
-race past the cap. Override with `--max-cost-usd` on the CLI.
+`LLMConfig.max_cost_per_scan` remains an **advisory** USD budget by default
+(`usd_budget_contract="advisory"`). The client atomically reserves an estimated
+amount before each provider call, so concurrent dispatchers see in-flight
+estimates, then reconciles successful attempts to the observed amount. This is
+not a provider-native hard ceiling: a call can cost more than its reservation,
+and a timed-out process may continue billing upstream.
 
 **Note:** there is no `RAPTOR_MAX_COST` environment variable — no code reads it.
-The budget cap is set exclusively via `--max-cost-usd` (CLI) or `max_cost_per_scan`
-(config).
+The budget cap is set via `--max-cost-usd` (CLI), `max_cost_per_scan` (config), or —
+for runs that configure no cap at all — the tuning.json default ceiling below.
+
+### Default Ceiling for Uncapped Runs
+
+Some entry points express "no cap" as `max_cost_per_scan = float('inf')` (the audit
+pipeline without `--max-cost`, `/agentic`'s audit post-pass when no `--max-cost-usd`
+was given). At first dispatch the client resolves the run's ceiling once:
+
+- `default_max_cost_usd` in `tuning.json`, when set, applies to an uncapped run
+  exactly as if passed on the CLI. A CLI/programmatic cap always wins — the knob is
+  only consulted when nothing else set a cap.
+- With no knob, the run **stays uncapped** (no hard default is ever imposed) and a
+  single prominent warning banner names the cap flags and the knob.
+
+Invalid knob values (non-numeric, non-finite, zero/negative) are ignored — the run
+stays uncapped with the banner, never surprise-capped at zero.
+`enable_cost_tracking=False` is a deliberate programmatic opt-out of all spend
+accounting and bypasses both the knob and the banner.
+
+### Degraded-Mode Breaker
+
+Budget caps bound *total* spend; the run-level degraded-mode breaker
+(`core/llm/breaker.py`) bounds spend on *failure*. It watches a sliding window of
+provider outcomes across the whole process, and when transport-class failures
+(timeouts, wire/5xx errors and response-shape failures, mid-response deaths) make up
+a sustained majority of recent attempts — a provider brown-out, or a systematic
+`max_tokens`-truncation loop — it latches and every new LLM dispatch raises
+`LLMDegradedModeError`. That error is a subclass of `LLMBudgetExceededError`, so the
+run stops on the same graceful contract as budget exhaustion: loop drivers stop
+dispatching, in-flight calls drain, run state and per-attempt spend evidence persist,
+and the trip verdict (dominant failure class, window stats) is appended to the run's
+`llm-telemetry.jsonl`.
+
+The breaker deliberately does **not** trip on:
+
+- model refusals / content filters (`blocked`) — a hostile corpus legitimately
+  drives those, and they must not become a denial-of-analysis lever;
+- 429s (`quota`) — the adaptive throttle and daily-quota latch own that lane;
+- auth failures — the consecutive-auth-streak tracker aborts the phase;
+- short bursts (a minimum sustain span) or low-volume runs (a minimum-sample floor).
+
+Two accepted subtleties: response-shape failures (malformed JSON, schema
+violations) count as `retryable`, so a corpus that steers the model into
+systematic non-JSON output *can* contribute to the fraction — the deliberate
+price of catching the truncation-loop class; the refusal exclusion narrows the
+denial-of-analysis lever rather than fully closing it. And the fraction is
+per-*attempt*, not per-call: a dead primary whose retries all fail can trip the
+breaker even while calls complete through a healthy fallback — a run burning
+several failed attempts per completed call is degradation an operator should
+rule on.
+
+Thresholds default to: failure fraction 0.5 over a 10-minute window, minimum 20
+outcomes, sustained for at least 5 minutes. Each is env-overridable
+(`RAPTOR_LLM_BREAKER_THRESHOLD` / `_WINDOW_S` / `_MIN_SAMPLES` / `_SUSTAIN_S`), and
+`RAPTOR_LLM_BREAKER=0` disables the breaker for a run — see
+[Environment Variables](environment.md).
+
+### Strict Accounting Admission
+
+Library callers can opt into stronger accounting admission:
+
+- `authoritative_required` permits `provider_billed`, or
+  `catalog_priced`/`configured_rate` only when the operator declares that exact
+  `(provider, model, basis)` in `trusted_usd_routes`. The default declaration
+  set is empty. A failed attempt with no authorized observation latches the
+  client or tool loop: no retry, fallback, or later fresh call is allowed.
+  Its retained reservation is reported only as an estimate; actual exposure
+  remains unknown.
+- `hard_limit_required` is explicitly unsupported for every current provider
+  and refuses before dispatch. No current transport proves a preemptive,
+  provider-enforced USD limit.
+
+Cache hits remain usable because they dispatch no new provider request.
 
 ### Token Pricing
 
-Per-1K-token input/output rates are maintained in `core/llm/model_data.py` for every
-known model, verified against provider pricing pages. Includes:
+RAPTOR preserves the existing numeric cost fields and adds a basis to explain
+what each number means:
+
+- `provider_billed`: provider/invoice-reported USD. No current provider emits
+  this basis.
+- `catalog_priced`: provider token counts multiplied by RAPTOR's versioned
+  price catalog.
+- `configured_rate`: an operator-supplied flat rate.
+- `cli_reported`: the Claude CLI's `total_cost_usd` when that field was
+  actually present, including an explicit `0.0`.
+- `subscription`: incremental USD is not represented.
+- `unknown`: no trustworthy USD amount is available.
+
+Per-1K-token input/output rates are maintained in `core/llm/model_data.py` for
+known models. Catalog arithmetic includes:
 
 - Bedrock cross-region surcharge (10%, applied to geo-prefixed models with a
   confirmed `global.` cross-region SKU; other geo prefixes stay at 1.0x)
@@ -486,12 +768,74 @@ known model, verified against provider pricing pages. Includes:
   1-hour cache writes, 0.1x for cache reads)
 - Thinking/reasoning tokens billed at output rate across all providers
 
-Unknown models log a warning and record $0 cost (budget caps silently defeated).
+For compatibility, legacy numeric fields remain numeric and therefore use
+`0.0` when no USD amount is available. The additive accounting fields mark
+that observation `unknown` or `subscription`, set `usd_total_complete=false`,
+and exclude it from cost means and scorecard denominators. Reports must not
+interpret that compatibility zero as free or authoritative.
 
 ### Viewing Costs
 
-Costs are reported at the end of each run. The scorecard also tracks cumulative
-per-model cost and token usage.
+Core statistics report per-basis subtotals and counts, incomplete totals,
+unknown failed attempts, and unresolved exposure. The scorecard retains
+cumulative legacy estimated cost and token history for eligible existing
+routes; its USD values are not evidence for a strict budget contract.
+
+## Transcript Record / Replay
+
+The transcript seam (`core/llm/transcript.py`) freezes a run's LLM
+behaviour so the detection pipeline can be re-run against it
+hermetically — no network, no cost, deterministic. This is the
+substrate for detection-quality evals in CI: record once on a live
+run, then replay the frozen responses through *new* pipeline code.
+
+```bash
+# Record: a normal (paid) run, plus a JSONL transcript in the run dir
+RAPTOR_LLM_TRANSCRIPT=record:out/myrun/llm-transcript.jsonl \
+    python3 raptor.py analyze --sarif findings.sarif ...
+
+# Replay: the same analysis, served entirely from the transcript.
+# Needs NO provider configuration or credentials.
+RAPTOR_LLM_TRANSCRIPT=replay:out/myrun/llm-transcript.jsonl \
+    python3 raptor.py analyze --sarif findings.sarif ...
+```
+
+How it works:
+
+- **Record** wraps `LLMClient.generate` / `generate_structured` (the
+  same chokepoint the response cache intercepts) and appends every
+  request/response pair — and every failure, so replay stays
+  sequence-faithful — to the trail. All recorded strings are
+  secret-redacted at write time; prompts are stored as hashes plus a
+  bounded diagnostic excerpt, never in full.
+- **Replay** serves recorded responses before model resolution — no
+  provider is ever constructed, and provider dispatch is hard-blocked.
+  Matching survives prompt-template drift and queue re-ordering:
+  exact prompt/schema hashes first, then the per-finding subject tag
+  the analysis loop declares, then recorded order within the call
+  class — positionally, a tagged entry never serves a different
+  subject (a new finding misses instead of stealing its neighbour's
+  verdict). An unmatched call fails loudly with a structured miss
+  report (at the /analyze surface it lands as that finding's
+  error-status record); it never falls through to a live provider.
+  An eval harness should fail on all three signals: misses
+  (`session.misses`), error-status findings, and leftovers — recorded
+  entries the replay never consumed (`session.leftover_report()`),
+  which mean the replay run issued fewer calls than the recorded one.
+- Dispatch surfaces not yet transcript-adopted (the orchestrated
+  multi-model path, the ranking stage) refuse under replay with a
+  clear error and warn under record that the transcript will
+  under-record — they never silently dispatch live during a replay.
+- Replayed structured responses re-run the strict schema floor
+  against the current schema and flow through the same downstream
+  validation as live responses — transcript content is treated as
+  untrusted, exactly like model output.
+
+Scope: the seam covers clients constructed through
+`core.llm.factory.get_client` and the /analyze agent. A replayed
+response that originally contained a secret comes back with the
+redaction placeholder — evals score verdict fields, not echoed
+secrets.
 
 ## Rate Limiting
 
@@ -506,6 +850,49 @@ No operator configuration is needed — the defaults adapt automatically.
 If a provider is consistently throttled, RAPTOR logs the effective rate
 at run end.
 
+## Response Cache Identity
+
+Free-form and structured response-cache keys are versioned and include the
+normalized routing provider as well as the requested model, prompt, system
+prompt, generation options, and (for structured calls) schema. The same model
+name reached through two providers therefore uses separate cache entries.
+Cache identity never includes API keys, credentials, or endpoint URLs.
+
+Exact-pinned clients intentionally bypass shared response-cache reads and
+writes, including pins whose route fields use defaults. Every exact-pinned call
+therefore dispatches fresh until a separately reviewed cache format can carry
+full-route evidence. This does not prove that two default-looking routes used
+different endpoints; it means the logical cache entry cannot prove which full
+route produced it. Ordinary unpinned clients and legacy provider-only advisory
+pins retain the shared-cache behavior described below.
+
+Fallback output remains filed under the originally requested route so repeated
+requests retain the existing fallback behavior. The MAC-covered entry records
+that requested route separately from the provider/model that actually served
+the response; cache replays report the serving route rather than relabeling it
+as the primary.
+
+Before replay, RAPTOR rechecks the stored serving provider/model against the
+same current candidate list used for a cold call. Disabling fallback, removing
+or disabling its `ModelConfig`, crossing the local/cloud tier boundary,
+same-name fallback suppression, and per-call `exclude_fallback_to` therefore
+turn a previously warmed fallback entry into a miss. Re-enabling the route can
+reuse the same entry; policy state is not added to the key. Daily quota
+throttling is intentionally separate: it blocks a new provider round-trip but
+does not de-authorize an already-produced eligible cache entry.
+
+When a provider reports an optional concrete `resolved_model` snapshot, RAPTOR
+stores it separately from the logical provider/model route and preserves it on
+replay. The field is covered by cache integrity, but it remains provider
+self-report, not served-model attestation and not an authorization input.
+Missing or malformed values remain unknown (`None`); RAPTOR never fabricates a
+snapshot from the configured alias.
+
+Entries written before route-qualified identity was introduced are safe misses:
+RAPTOR does not infer a provider from legacy response fields or migrate those
+records in place. Legacy files can remain until normal size-based eviction or
+operator cleanup; the first matching call writes a fresh route-qualified entry.
+Integrity verification and tamper quarantine continue to apply unchanged.
 
 ## Credential Isolation
 
@@ -528,18 +915,77 @@ deepseek-coder > deepseek.
 Models that reject tool/function calling are auto-detected at runtime and silently
 fall back to JSON-in-prompt synthesis.
 
+### Pinning which local model is primary
+
+Auto-detection is a convenience, not a choice — on a box with several
+models pulled it picks the first one matching the preference order
+above, which is rarely the one you want driving a run. To decide
+explicitly, name the models in `models.json`. The first role-less (or
+`analysis`/`code`-role) Ollama entry becomes the primary; everything
+else is an auxiliary:
+
+```json
+{
+  "models": [
+    { "provider": "ollama", "model": "qwen3-27b", "max_context": 60000, "max_output": 8192 },
+    { "provider": "ollama", "model": "qwen3-coder", "role": "code",     "max_context": 60000, "max_output": 8192 },
+    { "provider": "ollama", "model": "qwen3-122b",  "role": "judge",    "max_context": 30000, "max_output": 8192 }
+  ]
+}
+```
+
+Here `qwen3-27b` is the primary, the coder model is seated as the
+`code` specialist, and the big model is held back as a `judge` for
+multi-model review rather than becoming the everyday default. Confirm
+what a run will actually resolve to with:
+
+```bash
+libexec/raptor-llm-ask --show-primary
+```
+
+Two things worth knowing, both of which bite on a multi-model box:
+
+- **Context sizing is yours to declare.** An Ollama model absent from
+  the built-in catalogue defaults to a conservative 32k context. If the
+  model serves more, set `max_context`/`max_output` on the entry — and
+  make sure the server actually grants it. Ollama caps the window at
+  `num_ctx` (default 2048, or whatever `OLLAMA_CONTEXT_LENGTH` is set
+  to), independent of what the model was trained for; a prompt that
+  exceeds the served window comes back empty. Keep `max_context` at or
+  below the server's `num_ctx`, raising `num_ctx` (a per-model
+  Modelfile `PARAMETER`, or the server env var) to match.
+- **Reference the model by the exact name in the entry.** `--model`
+  matches against your configured names, so `--model qwen3-27b` works;
+  a `provider/model`-prefixed form (`ollama/qwen3-27b`) is not needed
+  and currently routes less reliably — prefer the bare name.
+
 ### Quality Tradeoffs
 
-| Capability | Frontier Models | Ollama (Local) |
+Reliability tracks model scale and quantization, not the Ollama transport itself.
+A frontier-scale open-weight model (100B+ parameters, Q8/FP8 or better, full
+context) is a different proposition than a small, heavily-quantized, or
+safety-ablated ("abliterated") fine-tune — the table below is a starting
+expectation, not a fixed rule for "local" as a category:
+
+| Capability | Frontier closed models | Local (Ollama) |
 |-----------|-----------------|----------------|
-| Vulnerability analysis | Excellent | Good |
-| Exploitability triage | Excellent | Good |
-| Exploit code generation | Compilable, working C | Often broken — invalid assembly, non-existent libc calls |
-| Dataflow validation | Accurate | Prone to hallucination |
+| Vulnerability analysis | Excellent | Good to excellent — scales with model size |
+| Exploitability triage | Excellent | Good to excellent — scales with model size |
+| Exploit code generation | Compilable, working C | Varies widely — large models at high precision can be competitive; small, quantized, or ablated models often produce invalid assembly or non-existent libc calls |
+| Dataflow validation | Accurate | Good for large models; smaller ones are more prone to hallucination |
 | Cost | ~$0.01/finding | Free |
 
-Use Ollama for offline triage and analysis. Use a frontier model for exploit generation
-and high-confidence validation.
+Exploit-dev precision (exact offsets, gadget addresses, byte-accurate
+shellcode) is a narrow domain most training data underrepresents, open or
+closed — expect a real gap there even from strong open models, and treat
+generated PoCs as a draft to verify rather than ground truth, regardless of
+provider.
+
+Don't take this table's word for it, either: RAPTOR's model scorecard
+(`/scorecard`, or `libexec/raptor-llm-scorecard list`) tracks real per-model
+pass/fail data — including a `_structured` decision class for schema
+validity — so after a few runs you can check what your specific model is
+actually achieving instead of relying on defaults.
 
 ## Gemini
 
@@ -596,7 +1042,15 @@ the two transports with real failure modes need a deliberate one:
   between calls but stay inside middlebox idle-kill horizons (squid's
   default `read_timeout` is 15 minutes; NAT tables usually 5+). The
   default sits well inside both bounds — tune only if your proxy's
-  idle timer is unusually tight.
+  idle timer is unusually tight. Raising it far is harmless but
+  useless: the knob is a local pool ceiling, not a path guarantee.
+  On a measured proxied path, idle connections always survived
+  300 s gaps and never survived 600 s — identically with TCP
+  keepalives armed and unarmed, because keepalive probes are not
+  tunnel payload and do not reset middlebox idle timers. Past the
+  path's window the middlebox expires the connection first, and the
+  pool re-dials transparently at the cost of roughly one TLS
+  handshake after the silence.
 - **HTTP/2** is a per-deployment, evidence-based opt-in. A clean
   sequential smoke test is *not* sufficient evidence — the risk cases
   are multiplexed concurrency under packet loss (TCP head-of-line
@@ -663,6 +1117,7 @@ behavior, and credential-isolation details — is
 | `RAPTOR_CC_PROBE_WARM` | `0` skips the run-start probe warm |
 | `RAPTOR_LLM_CACHE` | `off` disables the LLM response cache entirely |
 | `RAPTOR_LLM_CACHE_TTL_S` | LLM response cache TTL override (default 24 h) |
+| `RAPTOR_LLM_TRANSCRIPT` | `record:<path>` / `replay:<path>` LLM transcript seam (see above) |
 | `RAPTOR_HTTP_KEEPALIVE_S` | SDK transport idle keepalive expiry (default 60) |
 | `RAPTOR_HTTP_MAX_KEEPALIVE` | SDK transport pooled idle connections (default 20) |
 | `RAPTOR_HTTP_MAX_CONNECTIONS` | SDK transport total connections (default 100) |

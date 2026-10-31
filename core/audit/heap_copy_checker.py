@@ -28,7 +28,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 
 @dataclass
@@ -46,8 +47,8 @@ class HeapCopyFinding:
     confidence: str = "medium"
     is_cross_function: bool = False
 
-    def to_dict(self) -> Dict[str, Any]:
-        d: Dict[str, Any] = {
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
             "function": self.function,
             "copy_call": self.copy_call,
             "dest_var": self.dest_var,
@@ -66,33 +67,41 @@ class HeapCopyFinding:
 
 
 # Patterns for checked-copy wrappers: fn(dst, dst_size, src, count)
+# The wrapper-name prefix and every argument window are BOUNDED:
+# unbounded, hostile source that repeats the call head inside one
+# delimiter-free run makes every occurrence re-scan the rest of the
+# run — quadratic. Real wrapper names sit far under 256 chars and
+# real argument expressions far under 1024; past a bound the call
+# stops matching instead of scanning without bound.
 _CHECKED_COPY_RE = re.compile(
-    r'\b(\w*(?:memcpy|memmove)\w*)\s*\('
-    r'([^,]+),'          # dst
-    r'([^,]+),'          # dst_size
-    r'([^,]+),'          # src
-    r'([^)]+)\)',        # count
+    r'\b(\w{0,256}(?:memcpy|memmove)\w*)\s*\('
+    r'([^,]{1,1024}),'          # dst
+    r'([^,]{1,1024}),'          # dst_size
+    r'([^,]{1,1024}),'          # src
+    r'([^)]{1,1024})\)',        # count
 )
 
 # Standard copy: memcpy(dst, src, len) / memmove(dst, src, len)
 _STD_COPY_RE = re.compile(
     r'\b(memcpy|memmove)\s*\('
-    r'([^,]+),'         # dst
-    r'([^,]+),'         # src
-    r'([^)]+)\)',       # len
+    r'([^,]{1,1024}),'         # dst
+    r'([^,]{1,1024}),'         # src
+    r'([^)]{1,1024})\)',       # len
 )
 
 # strcpy(dst, src) — unbounded by definition
 _STRCPY_RE = re.compile(
     r'\b(strcpy)\s*\('
-    r'([^,]+),'         # dst
-    r'([^)]+)\)',       # src
+    r'([^,]{1,1024}),'         # dst
+    r'([^)]{1,1024})\)',       # src
 )
 
 # malloc/calloc/realloc
+# Variable group \b-pinned (mid-word suffix matches were false
+# tokens); cast and argument windows bounded like the copy patterns.
 _ALLOC_RE = re.compile(
-    r'(\w+)\s*=\s*(?:\([^)]*\)\s*)?'
-    r'(malloc|calloc|realloc)\s*\(([^)]+)\)',
+    r'\b(\w+)\s*=\s*(?:\([^)]{0,256}\)\s*)?'
+    r'(malloc|calloc|realloc)\s*\(([^)]{1,1024})\)',
 )
 
 # Stack array: type name[SIZE]
@@ -104,10 +113,22 @@ _STACK_ARRAY_RE = re.compile(
 # Comparison: if (var < N) or if (var > N) or similar.  The operator
 # is captured — equality tests and lower bounds must not read as
 # bounds checks (see _is_bounds_checked).
+# \b pins the LHS group to a word start and the RHS group to its
+# full word — each overlapped the neighbouring filler on word chars,
+# so a long identifier run with no operator (or no closing paren)
+# cost every split of the run — quadratic. Earliest-match captures
+# unchanged.
+# Both condition windows are BOUNDED (comparison within 150 chars
+# of the open paren, close paren within 150 chars of the
+# comparison): unbounded, a paren-free hostile run dense in
+# comparison teasers costs every window split from every `if (` —
+# worse than quadratic. A real condition sits far under 150 chars;
+# past the bound the check is not seen, which only widens the
+# finding (a bounds check missed is never a suppressed one).
 _COMPARISON_RE = re.compile(
-    r'\b(?:if|while)\s*\([^)]*?'
-    r'(\w+)\s*([<>]=?|==|!=)\s*(\w+|\d+(?:x[\da-fA-F]+)?)'
-    r'[^)]*\)',
+    r'\b(?:if|while)\s*\([^)]{0,150}?'
+    r'\b(\w+)\s*([<>]=?|==|!=)\s*(\w+|\d+(?:x[\da-fA-F]+)?)\b'
+    r'[^)]{0,150}\)',
 )
 
 # Function parameter extraction
@@ -118,7 +139,7 @@ _PARAM_RE = re.compile(
 )
 
 
-def _try_parse_int(s: str) -> Optional[int]:
+def _try_parse_int(s: str) -> int | None:
     """Parse an integer from a decompiled expression."""
     s = s.strip()
     try:
@@ -180,20 +201,38 @@ def _is_bounds_checked(
     return False
 
 
+def copy_sites_present(source: str) -> bool:
+    """Whether the checker's structural precondition — any copy-call
+    site (checked-copy wrapper, bare memcpy/memmove, strcpy family) —
+    appears in *source* at all.
+
+    The sweep wrapper consults this before booking a refutation: a
+    function with no copy sites was never tested by this model, and
+    recording 'refuted' for that model miss would clear tool
+    confirmations on the strength of an analysis that did not run
+    (the ``_negative_outcome`` doctrine).
+    """
+    return bool(
+        _CHECKED_COPY_RE.search(source)
+        or _STD_COPY_RE.search(source)
+        or _STRCPY_RE.search(source)
+    )
+
+
 def check_decompiled_function(
     function_name: str,
     source: str,
     *,
     file: str = "",
-) -> List[HeapCopyFinding]:
+) -> list[HeapCopyFinding]:
     """Analyse one decompiled C function for heap/copy size mismatches.
 
     Returns a list of findings, empty if none detected.
     """
-    findings: List[HeapCopyFinding] = []
+    findings: list[HeapCopyFinding] = []
 
     # Collect allocation sizes: var -> (size_expr, size_int_or_None)
-    alloc_sizes: Dict[str, tuple] = {}
+    alloc_sizes: dict[str, tuple] = {}
     for m in _ALLOC_RE.finditer(source):
         var = m.group(1).strip()
         size_expr = m.group(3).strip()
@@ -209,7 +248,7 @@ def check_decompiled_function(
             alloc_sizes[var] = (size_expr, _try_parse_int(size_expr))
 
     # Collect stack array sizes: name -> (size_expr, size_int)
-    stack_sizes: Dict[str, tuple] = {}
+    stack_sizes: dict[str, tuple] = {}
     for m in _STACK_ARRAY_RE.finditer(source):
         name = m.group(1)
         size_int = _try_parse_int(m.group(2))
@@ -368,8 +407,11 @@ def check_decompiled_function(
     return findings
 
 
+# Argument window bounded: unbounded `[^)]*` re-scans a paren-free
+# hostile run from every identifier-plus-paren occurrence —
+# quadratic. Real argument lists sit far under 400 chars.
 _CALL_WITH_ARGS_RE = re.compile(
-    r'\b(\w+)\s*\(([^)]*)\)',
+    r'\b(\w+)\s*\(([^)]{0,400})\)',
 )
 
 
@@ -377,9 +419,9 @@ def _param_copy_findings(
     callee: str,
     source: str,
     param_name: str,
-    alloc_size: Optional[int],
+    alloc_size: int | None,
     file: str,
-) -> List[HeapCopyFinding]:
+) -> list[HeapCopyFinding]:
     """Copies in *source* whose destination is *param_name*, judged
     against the CALLER's allocation size.
 
@@ -390,7 +432,7 @@ def _param_copy_findings(
     size is known; an unknown allocation is inconclusive, never a
     finding.
     """
-    findings: List[HeapCopyFinding] = []
+    findings: list[HeapCopyFinding] = []
     if alloc_size is None:
         return findings
     for m in _STD_COPY_RE.finditer(source):
@@ -461,12 +503,17 @@ def _param_copy_findings(
 
 
 def check_cross_function(
-    functions: Sequence[Dict[str, Any]],
-    xrefs: Optional[Sequence[Dict[str, Any]]] = None,
+    functions: Sequence[dict[str, Any]],
+    xrefs: Sequence[dict[str, Any]] | None = None,
     *,
     file: str = "",
-) -> List[HeapCopyFinding]:
+) -> list[HeapCopyFinding]:
     """Cross-function analysis: track allocations through call boundaries.
+
+    Exported for the binary/Ghidra verification surface (its
+    ``functions``/``xrefs`` shapes are the Ghidra export's) and pinned
+    by tests; no in-repo pipeline consumes it yet — wire it up rather
+    than duplicating it.
 
     For each function that allocates a buffer and passes it to another
     function, check if the callee's copy operations on that parameter
@@ -483,9 +530,9 @@ def check_cross_function(
     -------
     List of cross-function findings.
     """
-    findings: List[HeapCopyFinding] = []
+    findings: list[HeapCopyFinding] = []
 
-    func_map: Dict[str, str] = {}
+    func_map: dict[str, str] = {}
     for f in functions:
         name = f.get("name", "")
         decomp = f.get("decompilation", "")
@@ -494,7 +541,7 @@ def check_cross_function(
 
     for fname, source in func_map.items():
         # Collect allocations in this function: var → size
-        allocs: Dict[str, Optional[int]] = {}
+        allocs: dict[str, int | None] = {}
         for m in _ALLOC_RE.finditer(source):
             var = m.group(1).strip()
             size_expr = m.group(3).strip()

@@ -101,6 +101,46 @@ class TestParseManifest:
         with pytest.raises(ManifestError, match="profile"):
             parse_manifest(data)
 
+    def test_agentic_taint_profile_accepted(self):
+        # The flip-gate candidate profile is part of the closed
+        # vocabulary; near-miss spellings keep refusing (no fuzzy
+        # fallback between baseline and candidate shapes).
+        data = _valid()
+        data["profile"] = "agentic-taint"
+        assert parse_manifest(data).profile == "agentic-taint"
+        for typo in ("agentic_taint", "agentic-taint ", "taint"):
+            data["profile"] = typo
+            with pytest.raises(ManifestError, match="profile"):
+                parse_manifest(data)
+
+    def test_synthetic_provenance_accepted_kind_separated(self):
+        data = _valid()
+        data["expected"][0]["provenance"] = {
+            "kind": "synthetic", "generator": "crossfile-python",
+            "seed": 7, "case": "xf_sql_injection_000"}
+        parsed = parse_manifest(data)
+        prov = parsed.expected[0].provenance
+        assert prov.kind == "synthetic"
+        assert prov.generator == "crossfile-python"
+        assert prov.seed == 7
+        assert prov.suite is None  # never masquerades as benchmark
+        assert prov.to_dict() == data["expected"][0]["provenance"]
+
+    def test_synthetic_provenance_needs_generator_and_case(self):
+        data = _valid()
+        data["expected"][0]["provenance"] = {"kind": "synthetic",
+                                             "seed": 7}
+        with pytest.raises(ManifestError, match="generator"):
+            parse_manifest(data)
+
+    def test_synthetic_provenance_seed_must_be_int(self):
+        data = _valid()
+        data["expected"][0]["provenance"] = {
+            "kind": "synthetic", "generator": "g", "case": "c",
+            "seed": "seven"}
+        with pytest.raises(ManifestError, match="seed"):
+            parse_manifest(data)
+
     def test_absolute_expected_path_refused(self):
         data = _valid()
         data["expected"][0]["file"] = "/etc/passwd"

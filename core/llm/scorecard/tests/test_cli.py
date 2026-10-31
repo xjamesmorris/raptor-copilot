@@ -29,46 +29,50 @@ from core.llm.scorecard import cli as cli_mod
 
 
 @pytest.fixture
-def seeded_scorecard(tmp_path):
+def seeded_scorecard(tmp_path: Path) -> Path:
     """Three cells across two models so the renderers have
     something representative to work with: trustworthy, learning,
-    and fall-through."""
+    and fall-through.
+
+    Seeded through ``record_events`` — ONE lock/fsync cycle for all
+    180 observations. This fixture is function-scoped (tests mutate
+    the file via mark/pin/reset), so per-event ``record_event``
+    seeding re-paid ~180 full flock + load + fsync + rename cycles
+    for every test in this module — seconds of pure disk churn per
+    test on CI runners, the exact bulk-seeding waste the batch API's
+    docstring names.
+    """
     path = tmp_path / "sc.json"
     sc = ModelScorecard(path)
 
-    # trustworthy
-    for _ in range(100):
-        sc.record_event(
-            "codeql:py/sql-injection", "claude-haiku-4-5",
-            EventType.CHEAP_SHORT_CIRCUIT, "correct",
-        )
-    # learning (n<10)
-    for _ in range(5):
-        sc.record_event(
-            "codeql:cpp/uncontrolled-format", "claude-haiku-4-5",
-            EventType.CHEAP_SHORT_CIRCUIT, "correct",
-        )
-    # fall-through (high miss rate) + samples
-    for _ in range(20):
-        sc.record_event(
-            "codeql:js/path-injection", "claude-haiku-4-5",
-            EventType.CHEAP_SHORT_CIRCUIT, "correct",
-        )
-    for i in range(5):
-        sc.record_event(
-            "codeql:js/path-injection", "claude-haiku-4-5",
-            EventType.CHEAP_SHORT_CIRCUIT, "incorrect",
-            sample={
-                "this_reasoning": f"cheap thought FP {i}",
-                "other_reasoning": f"full found real bug {i}",
-            },
-        )
-    # second model
-    for _ in range(50):
-        sc.record_event(
-            "codeql:py/sql-injection", "gemini-2.5-flash-lite",
-            EventType.CHEAP_SHORT_CIRCUIT, "correct",
-        )
+    def _batch(n: int, dc: str, model: str, outcome: str = "correct",
+               sample_fmt: dict[str, str] | None = None) -> list[dict]:
+        return [
+            {"decision_class": dc, "model": model,
+             "event_type": EventType.CHEAP_SHORT_CIRCUIT,
+             "outcome": outcome,
+             **({"sample": {k: v.format(i=i)
+                            for k, v in sample_fmt.items()}}
+                if sample_fmt else {})}
+            for i in range(n)
+        ]
+
+    sc.record_events([
+        # trustworthy
+        *_batch(100, "codeql:py/sql-injection", "claude-haiku-4-5"),
+        # learning (n<10)
+        *_batch(5, "codeql:cpp/uncontrolled-format", "claude-haiku-4-5"),
+        # fall-through (high miss rate) + samples
+        *_batch(20, "codeql:js/path-injection", "claude-haiku-4-5"),
+        *_batch(5, "codeql:js/path-injection", "claude-haiku-4-5",
+                outcome="incorrect",
+                sample_fmt={
+                    "this_reasoning": "cheap thought FP {i}",
+                    "other_reasoning": "full found real bug {i}",
+                }),
+        # second model
+        *_batch(50, "codeql:py/sql-injection", "gemini-2.5-flash-lite"),
+    ])
     return path
 
 
@@ -729,6 +733,83 @@ def test_recommend_picks_cheapest_trusted(tmp_path):
     assert "also trusted: sonnet" in out
 
 
+def test_recommend_does_not_rank_zero_cost_as_cheapest(tmp_path):
+    sc = ModelScorecard(tmp_path / "sc.json", shadow_rate=0.0)
+    for _ in range(80):
+        sc.record_event(
+            "codeql:py/sqli",
+            "unpriced",
+            EventType.CHEAP_SHORT_CIRCUIT,
+            "correct",
+        )
+        sc.record_event(
+            "codeql:py/sqli",
+            "priced",
+            EventType.CHEAP_SHORT_CIRCUIT,
+            "correct",
+        )
+    sc.register_uses([
+        {
+            "model": "unpriced",
+            "decision_class": "_usage",
+            "calls": 10,
+            "cost_usd": 0.0,
+        },
+        {
+            "model": "priced",
+            "decision_class": "_usage",
+            "calls": 10,
+            "cost_usd": 1.0,
+        },
+    ])
+
+    rc, out, _ = _capture(
+        cli_mod.cmd_recommend,
+        _make_args(
+            path=tmp_path / "sc.json",
+            decision_class="codeql:py/sqli",
+        ),
+    )
+
+    assert rc == 0
+    assert "use: priced" in out
+
+
+def test_summary_skips_zero_call_unpriced_before_priced(tmp_path):
+    sc = ModelScorecard(tmp_path / "sc.json", shadow_rate=0.0)
+    for model in ("a-unpriced", "z-priced"):
+        for _ in range(80):
+            sc.record_event(
+                "codeql:py/sqli",
+                model,
+                EventType.CHEAP_SHORT_CIRCUIT,
+                "correct",
+            )
+    sc.register_uses([
+        {
+            "model": "a-unpriced",
+            "decision_class": "_usage",
+            "calls": 0,
+            "cost_usd": 0.0,
+        },
+        {
+            "model": "z-priced",
+            "decision_class": "_usage",
+            "calls": 10,
+            "cost_usd": 1.0,
+        },
+    ])
+
+    rc, out, _ = _capture(
+        cli_mod.cmd_summary,
+        _make_args(path=tmp_path / "sc.json"),
+    )
+
+    assert rc == 0
+    assert "lowest legacy estimate among trusted: z-priced" in out
+    assert "a-unpriced @" not in out
+
+
 def test_recommend_no_data_reports_clearly(tmp_path):
     """Unknown decision_class -> clear message, exit 0 (informational, not
     an error to operator scripts)."""
@@ -775,8 +856,7 @@ def test_recommend_freshness_shows_banner(tmp_path):
 
 
 def test_list_shows_cost_column_and_by_cost_sorts(tmp_path):
-    """`list` surfaces per-cell spend in the $$ column, and `--by-cost` ranks
-    by it. The cost data is the universal 'did I get value for money' axis."""
+    """`list` labels v2 cost as a legacy estimate and can sort by it."""
     sc = ModelScorecard(tmp_path / "sc.json")
     sc.register_uses([
         {"model": "haiku", "decision_class": "_usage",
@@ -786,7 +866,7 @@ def test_list_shows_cost_column_and_by_cost_sorts(tmp_path):
     ])
     rc, out, _ = _capture(cli_mod.cmd_list, _make_args(path=tmp_path / "sc.json"))
     assert rc == 0
-    assert "$$" in out                              # the cost column header
+    assert "Estimated USD (legacy; authority unknown)" in out
     assert "$0.40" in out and "$0.05" in out        # both cells render their spend
     # --by-cost ranks sonnet ($0.40) above haiku ($0.05)
     rc2, out2, _ = _capture(
@@ -841,7 +921,8 @@ def test_list_json_emits_parseable_array(tmp_path):
     sample = parsed["cells"][0]
     for required in (
         "decision_class", "model", "policy", "n",
-        "calls", "cost_usd", "max_miss_pct", "last_seen_at",
+        "calls", "cost_usd", "cost_basis", "usd_authority",
+        "max_miss_pct", "last_seen_at",
     ):
         assert required in sample, f"missing {required} in {sample}"
 
@@ -857,6 +938,8 @@ def test_recommend_json_emits_recommendation(tmp_path):
     assert rc == 0
     parsed = _json.loads(out)
     assert parsed["decision_class"] == "codeql:py/sqli"
+    assert parsed["cost_basis"] == "scorecard_legacy"
+    assert parsed["usd_authority"] == "unknown"
     assert parsed["recommendation"]["model"] == "haiku"
     assert any(t["model"] == "haiku" for t in parsed["short_circuit"])
 
@@ -869,8 +952,8 @@ def test_summary_text_dashboard(tmp_path):
         cli_mod.cmd_summary, _make_args(path=tmp_path / "sc.json"))
     assert rc == 0
     assert "cells:" in out and "trusted" in out
-    assert "total spend:" in out
-    assert "cheapest trusted: haiku" in out
+    assert "Estimated USD (legacy; authority unknown):" in out
+    assert "lowest legacy estimate among trusted: haiku" in out
 
 
 def test_summary_json_dashboard(tmp_path):
@@ -884,6 +967,8 @@ def test_summary_json_dashboard(tmp_path):
     parsed = _json.loads(out)
     assert parsed["cells_total"] > 0
     assert parsed["policy_breakdown"]["short_circuit"] >= 1
+    assert parsed["cost_basis"] == "scorecard_legacy"
+    assert parsed["usd_authority"] == "unknown"
     assert parsed["cheapest_short_circuit"]["model"] == "haiku"
 
 
@@ -938,8 +1023,9 @@ def test_chain_closure_scoped_to_specific_cwe(tmp_path):
 
 def test_chain_closure_empty_reports_clearly(tmp_path):
     """No chain-closure data → informational message to stderr,
-    exit 0 (informational, not error). Points operators at
-    --scorecard flag on /exploit."""
+    exit 0 (informational, not error). The message must be honest:
+    no producer for the event type is wired yet, so it must not send
+    the operator to a flag or run that cannot populate it."""
     ModelScorecard(tmp_path / "sc.json")
     rc, _, err = _capture(
         cli_mod.cmd_chain_closure,
@@ -947,7 +1033,8 @@ def test_chain_closure_empty_reports_clearly(tmp_path):
     )
     assert rc == 0
     assert "no chain-closure data" in err
-    assert "/exploit with --scorecard" in err
+    assert "not wired" in err
+    assert "--scorecard" not in err
 
 
 def test_chain_closure_rate_zero_never_recommended(tmp_path):
@@ -1038,7 +1125,7 @@ def test_chain_closure_json_emits_recommendation(tmp_path):
 
 
 def test_compare_text_includes_cost_and_calls(tmp_path):
-    """Extended `compare` shows $$ + calls per side, not just reliability."""
+    """Extended `compare` labels legacy estimates and calls per side."""
     _seed_minimal(tmp_path / "sc.json")
     # need a shared decision_class for both models — give sonnet a sql cell too
     sc = ModelScorecard(tmp_path / "sc.json", shadow_rate=0.0)
@@ -1050,7 +1137,8 @@ def test_compare_text_includes_cost_and_calls(tmp_path):
         _make_args(path=tmp_path / "sc.json",
                    model_a="haiku", model_b="sonnet"))
     assert rc == 0
-    assert "haiku $$" in out and "sonnet $$" in out
+    assert "haiku legacy estimate" in out
+    assert "sonnet legacy estimate" in out
     assert "haiku calls" in out and "sonnet calls" in out
 
 
@@ -1183,3 +1271,282 @@ def test_reset_bare_invocation_prints_error_not_traceback(tmp_path):
     assert "filter" in err
     # Nothing was deleted.
     assert ModelScorecard(path).get_stats()
+
+
+def test_summary_policy_breakdown_excludes_bookkeeping_cells(tmp_path):
+    """Underscore-prefixed cells (_usage, _structured) are bookkeeping,
+    not policy cells — they must not inflate the "learning" count."""
+    import json as _json
+    path = tmp_path / "sc.json"
+    sc = ModelScorecard(path, shadow_rate=0.0)
+    sc.record_event("codeql:py/sqli", "haiku",
+                    EventType.CHEAP_SHORT_CIRCUIT, "correct")
+    sc.register_uses([
+        {"model": "haiku", "decision_class": "_usage",
+         "calls": 10, "cost_usd": 0.25},
+        {"model": "haiku", "decision_class": "_structured",
+         "calls": 6, "schema_valid_pass": 6},
+    ])
+    rc, out, _ = _capture(
+        cli_mod.cmd_summary, _make_args(path=path, json=True))
+    assert rc == 0
+    parsed = _json.loads(out)
+    bd = parsed["policy_breakdown"]
+    # One real cell (learning at n=1); the two bookkeeping cells
+    # contribute nothing to any policy bucket.
+    assert bd["learning"] == 1
+    assert (bd["learning"] + bd["short_circuit"] + bd["fall_through"]) == 1
+
+
+def test_render_samples_defangs_control_bytes(tmp_path):
+    """Persisted reasoning can quote analysed-repo tool output; ANSI
+    escapes must not reach the operator's terminal raw."""
+    sc = ModelScorecard(tmp_path / "sc.json", shadow_rate=0.0)
+    sc.retain_samples = True
+    sc.record_event(
+        "agentic:r", "haiku", EventType.CHEAP_SHORT_CIRCUIT, "incorrect",
+        sample={
+            "this_reasoning": "before \x1b[31mred\x1b[0m after",
+            "other_reasoning": "plain",
+            "custom_field": "x\x1b]0;title\x07y",
+        },
+    )
+    stat = sc.get_stat("agentic:r", "haiku")
+    rendered = cli_mod._render_samples(stat)
+    assert "\x1b" not in rendered
+    assert "\x07" not in rendered
+    assert "red" in rendered  # content survives, escapes defang
+
+
+# ---------------------------------------------------------------------------
+# tool-evidence — abstentions never grade
+# ---------------------------------------------------------------------------
+
+
+class TestToolEvidenceAbstentions:
+    """A nulled ``is_exploitable`` (errored / refused / schema-failed
+    response) is an abstention, not a "not exploitable" vote — same
+    counting rule as the auto-back-prop join in ``tool_evidence.py``.
+    Grading an abstainer against the validator would mint a
+    TOOL_EVIDENCE reliability event for a vote never cast."""
+
+    def _run(self, tmp_path, analysis_results, validation_findings):
+        import json as _json
+
+        analysis = tmp_path / "orchestrated_report.json"
+        validation = tmp_path / "validation_report.json"
+        analysis.write_text(_json.dumps({"results": analysis_results}))
+        validation.write_text(
+            _json.dumps({"findings": validation_findings}))
+        sc_path = tmp_path / "sc.json"
+        args = _make_args(
+            path=sc_path, analysis=analysis, validation=validation,
+            prefix="agentic",
+        )
+        rc, out, err = _capture(cli_mod.cmd_tool_evidence, args)
+        assert rc == 0
+        return sc_path, err
+
+    def test_null_analysis_verdict_records_nothing(self, tmp_path):
+        """Pre-fix ``bool(r.get("is_exploitable", False))`` coerced a
+        nulled analysis verdict into a False vote and graded it."""
+        sc_path, _ = self._run(
+            tmp_path,
+            analysis_results=[
+                {"finding_id": "f1", "analysed_by": "claude-opus",
+                 "rule_id": "py/sqli", "is_exploitable": None,
+                 "reasoning": ""},
+            ],
+            validation_findings=[
+                {"finding_id": "f1", "is_exploitable": False},
+            ],
+        )
+        sc = ModelScorecard(sc_path)
+        assert sc.get_stat("agentic:py/sqli", "claude-opus") is None
+
+    def test_voting_record_still_grades(self, tmp_path):
+        """A real bool verdict keeps grading (both directions)."""
+        sc_path, _ = self._run(
+            tmp_path,
+            analysis_results=[
+                {"finding_id": "f1", "analysed_by": "claude-opus",
+                 "rule_id": "py/sqli", "is_exploitable": True,
+                 "reasoning": "r"},
+                {"finding_id": "f2", "analysed_by": "claude-opus",
+                 "rule_id": "py/sqli", "is_exploitable": False,
+                 "reasoning": "r"},
+            ],
+            validation_findings=[
+                {"finding_id": "f1", "is_exploitable": True},
+                {"finding_id": "f2", "is_exploitable": True},
+            ],
+        )
+        sc = ModelScorecard(sc_path)
+        stat = sc.get_stat("agentic:py/sqli", "claude-opus")
+        ev = stat.events[EventType.TOOL_EVIDENCE]
+        assert (ev.correct, ev.incorrect) == (1, 1)
+
+    def test_stringy_validation_verdict_skipped(self, tmp_path):
+        """"true"/"yes" in the validator slot must not quietly coerce
+        — typed-bool rule mirrors the auto-back-prop walk."""
+        sc_path, _ = self._run(
+            tmp_path,
+            analysis_results=[
+                {"finding_id": "f1", "analysed_by": "claude-opus",
+                 "rule_id": "py/sqli", "is_exploitable": True},
+            ],
+            validation_findings=[
+                {"finding_id": "f1", "is_exploitable": "true"},
+            ],
+        )
+        sc = ModelScorecard(sc_path)
+        assert sc.get_stat("agentic:py/sqli", "claude-opus") is None
+
+    def test_non_dict_entries_do_not_traceback(self, tmp_path):
+        """Corrupted list entries in either report degrade to a skip,
+        matching the auto-back-prop walk's shape guard."""
+        sc_path, _ = self._run(
+            tmp_path,
+            analysis_results=[
+                "junk",
+                {"finding_id": "f1", "analysed_by": "claude-opus",
+                 "rule_id": "py/sqli", "is_exploitable": True},
+            ],
+            validation_findings=[
+                42,
+                {"finding_id": "f1", "is_exploitable": True},
+            ],
+        )
+        sc = ModelScorecard(sc_path)
+        stat = sc.get_stat("agentic:py/sqli", "claude-opus")
+        ev = stat.events[EventType.TOOL_EVIDENCE]
+        assert (ev.correct, ev.incorrect) == (1, 0)
+
+
+def test_list_since_typo_is_usage_error_not_traceback(seeded_scorecard):
+    """`--since 7days` must print the N[smhd] hint and exit 2 —
+    _parse_since raises ArgumentTypeError, which argparse never
+    converts for a type=str argument."""
+    rc, _, err = _capture(
+        cli_mod.cmd_list,
+        _make_args(path=seeded_scorecard, since="7days"),
+    )
+    assert rc == 2
+    assert "N[smhd]" in err
+
+
+def test_list_since_valid_window_still_filters(seeded_scorecard):
+    rc, out, _ = _capture(
+        cli_mod.cmd_list,
+        _make_args(path=seeded_scorecard, since="365d"),
+    )
+    assert rc == 0
+
+
+class TestToolEvidenceReminderAccuracy:
+    """The command's operator guidance must describe landed behaviour:
+    finding_id-keyed records are idempotent (the atomic
+    claim-and-record), so the old 're-running double-records' warning
+    was false and steered operators into building unnecessary external
+    dedup state. The real residual is seen-set eviction: a cell that
+    accumulates more than the id cap between imports can double-count
+    a re-imported finding older than the window."""
+
+    def _run(self, tmp_path):
+        import json as _json
+
+        analysis = tmp_path / "orchestrated_report.json"
+        validation = tmp_path / "validation_report.json"
+        analysis.write_text(_json.dumps({"results": [
+            {"finding_id": "f1", "analysed_by": "m", "rule_id": "r",
+             "is_exploitable": True, "reasoning": "x"},
+        ]}))
+        validation.write_text(_json.dumps({"findings": [
+            {"finding_id": "f1", "is_exploitable": False},
+        ]}))
+        args = _make_args(
+            path=tmp_path / "sc.json", analysis=analysis,
+            validation=validation, prefix="agentic",
+        )
+        return _capture(cli_mod.cmd_tool_evidence, args)
+
+    def test_no_false_double_record_warning(self, tmp_path):
+        rc, _out, err = self._run(tmp_path)
+        assert rc == 0
+        assert "double-records" not in err
+
+    def test_reminder_names_the_eviction_residual(self, tmp_path):
+        rc, _out, err = self._run(tmp_path)
+        assert rc == 0
+        assert "idempotent" in err
+        assert "evict" in err
+
+    def test_rerun_is_actually_idempotent(self, tmp_path):
+        self._run(tmp_path)
+        self._run(tmp_path)
+        sc = ModelScorecard(tmp_path / "sc.json")
+        ev = sc.get_stat("agentic:r", "m").events[
+            EventType.TOOL_EVIDENCE]
+        assert (ev.correct, ev.incorrect) == (0, 1)
+
+
+class TestHumaniseAgeFutureTimestamps:
+    def test_future_timestamp_flagged_not_negative(self):
+        """A future last_seen_at only comes from clock skew or a
+        forged sidecar row — flag it instead of rendering a negative
+        age ("-42s ago")."""
+        import datetime as dt
+        future = (
+            dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=90)
+        ).isoformat()
+        rendered = cli_mod._humanise_age(future)
+        assert "in the future" in rendered
+        assert "-" not in rendered.split("T")[0] or "ago" not in rendered
+
+    def test_past_timestamp_unchanged(self):
+        import datetime as dt
+        past = (
+            dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=2)
+        ).isoformat()
+        assert cli_mod._humanise_age(past) == "2h ago"
+
+
+class TestCliDocstringSubcommandClosure:
+    def test_module_docstring_names_every_subcommand(self):
+        """Parse-time drift guard: the module docstring's subcommand
+        list had drifted to 6 of 12."""
+        import re as _re
+
+        import core.llm.scorecard.cli as _cli
+        source = open(_cli.__file__, encoding="utf-8").read()
+        registered = set(_re.findall(r'add_parser\(\s*"([a-z-]+)"', source))
+        assert registered, "expected add_parser registrations"
+        missing = [s for s in registered if s not in (_cli.__doc__ or "")]
+        assert missing == [], (
+            f"module docstring omits subcommands: {missing}"
+        )
+
+
+class TestSummaryCallsSingleCounted:
+    def test_usage_rollup_not_double_counted_with_real_dc_calls(
+        self, tmp_path, capsys,
+    ):
+        """``_usage`` is the per-model roll-up of every real call;
+        real-dc ``calls`` (register_uses on e.g. study_question)
+        re-count a subset of the same calls — summing both
+        over-counted "most-used"."""
+        import json as _json
+
+        sc_path = tmp_path / "sc.json"
+        sc = ModelScorecard(sc_path)
+        sc.register_uses([
+            {"model": "m", "decision_class": "_usage", "calls": 10},
+            {"model": "m", "decision_class": "study_question",
+             "calls": 10},
+        ])
+        args = _make_args(path=sc_path, json=True)
+        rc, out, _err = _capture(cli_mod.cmd_summary, args)
+        assert rc == 0
+        payload = _json.loads(out)
+        assert payload["calls_by_model"]["m"] == 10
+        assert payload["most_used"] == {"model": "m", "calls": 10}

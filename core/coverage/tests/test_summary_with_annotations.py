@@ -35,11 +35,15 @@ class TestAnnotationsInCoverage(unittest.TestCase):
         write_annotation(ann, Annotation(
             file="src/foo.py", function="alpha", body="clean",
             metadata={"source": "human", "status": "clean",
-                      "provenance": "interactive-tty", "tty": "stdin"}))
+                      "provenance": "interactive-tty", "tty": "stdin",
+             "sid": "inherited", "envm": "trusted",
+             "parents": "bash"}))
         write_annotation(ann, Annotation(
             file="src/foo.py", function="beta", body="bug",
             metadata={"source": "human", "status": "finding",
-                      "provenance": "interactive-tty", "tty": "stdin"}))
+                      "provenance": "interactive-tty", "tty": "stdin",
+             "sid": "inherited", "envm": "trusted",
+             "parents": "bash"}))
         rec = build_from_annotations(ann)
         assert rec is not None
         write_record(run_dir, rec, tool_name="annotations")
@@ -65,6 +69,36 @@ class TestAnnotationsInCoverage(unittest.TestCase):
             assert "gamma" in gap and "alpha" not in gap
             # The finding annotation makes beta read `open`.
             assert view["verdicts"]["open"] == 1
+
+    def test_machine_annotations_do_not_clear_the_review_gap(self):
+        # Agent-written notes are hint-tier: llm-extent examination
+        # evidence, but never operator-grade review credit. A
+        # human-grade note on alpha clears the gap; an agent note on
+        # gamma must not (both directions).
+        with TemporaryDirectory() as d:
+            run = Path(d)
+            (run / "checklist.json").write_text(json.dumps(_CHECKLIST))
+            ann = run / "annotations"
+            write_annotation(ann, Annotation(
+                file="src/foo.py", function="alpha", body="clean",
+                metadata={"source": "human", "status": "clean",
+                          "provenance": "interactive-tty", "tty": "stdin",
+             "sid": "inherited", "envm": "trusted",
+             "parents": "bash"}))
+            write_annotation(ann, Annotation(
+                file="src/foo.py", function="gamma", body="agent note",
+                metadata={"source": "agent", "status": "clean",
+                          "provenance": "non-tty", "tty": "none"}))
+            store = CoverageStore(run / "coverage.json")
+            backfill(store, [run], _CHECKLIST,
+                     annotations_base=run / "annotations")
+            view = store_view(store, _CHECKLIST)
+            # Both notes are llm-extent...
+            assert view["functions_by_category"]["llm"] == 2
+            # ...but only the human note counts as a review.
+            gap = {g["function"] for g in view["llm_gap_functions"]}
+            assert "alpha" not in gap
+            assert "gamma" in gap
 
 
 if __name__ == "__main__":

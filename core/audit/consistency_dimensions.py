@@ -46,8 +46,9 @@ from .callsite_consistency import (
     parse_source_cached,
 )
 from .fail_open_roles import SecurityFlag, security_flag_role
-from .peer_evidence import PeerEvidence, PeerExhibit
+from .peer_evidence import FamilyMember, PeerEvidence, PeerExhibit
 from typing import TYPE_CHECKING
+from core.source.lines import split_lines
 
 if TYPE_CHECKING:
     from tree_sitter import Node
@@ -206,7 +207,7 @@ def _arg_sites_for_file(
     call_types = _CALL_TYPES.get(lang, ())
     if call_types:
         src = source.encode("utf-8", errors="replace")
-        lines = source.splitlines()
+        lines = split_lines(source)
         for node in _walk_descendants(tree.root_node):
             if node.type not in call_types:
                 continue
@@ -342,14 +343,14 @@ def detect_flag_mode_deviations(
             if is_mask_position and len(flagged) >= min_sites:
                 all_tokens: set[str] = set()
                 for s in flagged:
-                    all_tokens |= token_sets[id(s)]
+                    all_tokens |= token_sets[id(s)]  # type: ignore[arg-type]
                 for token in sorted(all_tokens):
                     have = [
-                        s for s in flagged if token in token_sets[id(s)]
+                        s for s in flagged if token in token_sets[id(s)]  # type: ignore[operator]
                     ]
                     lack = [
                         s for s in flagged
-                        if token not in token_sets[id(s)]
+                        if token not in token_sets[id(s)]  # type: ignore[operator]
                     ]
                     if not lack or len(have) < len(flagged) * ratio \
                             or len(have) <= len(lack):
@@ -386,7 +387,7 @@ def detect_flag_mode_deviations(
                 continue
             counts: dict[int, int] = {}
             for s in resolved:
-                counts[values[id(s)]] = counts.get(values[id(s)], 0) + 1
+                counts[values[id(s)]] = counts.get(values[id(s)], 0) + 1  # type: ignore[index,arg-type]
             majority_value = max(counts, key=lambda v: counts[v])
             if counts[majority_value] < len(resolved) * ratio:
                 continue
@@ -398,7 +399,7 @@ def detect_flag_mode_deviations(
                     continue
                 sec = None
                 cwe = ""
-                if _mode_grades_permissive(values[id(s)], majority_value):
+                if _mode_grades_permissive(values[id(s)], majority_value):  # type: ignore[arg-type]
                     cwe = "CWE-732"
                 deviations.append(FlagModeDeviation(
                     callee=callee,
@@ -643,6 +644,15 @@ def _function_spans(
     return spans
 
 
+#: Public spelling of :func:`_function_spans` — cross-module
+#: consumers (uniform-absence, clone-drift, the mutation corpus)
+#: import the extraction surface by this name; the underscore
+#: spelling stays as the in-module idiom. Rename the pair together.
+#: (Distinct from ``field_census.function_spans``, which extracts
+#: one source string into FunctionSpan records.)
+function_spans = _function_spans
+
+
 def _function_spans_for_file(
     file_path: str,
     source: str,
@@ -656,7 +666,7 @@ def _function_spans_for_file(
     if not func_types:
         return
     src = source.encode("utf-8", errors="replace")
-    lines = source.splitlines()
+    lines = split_lines(source)
     for node in _walk_descendants(tree.root_node):
         if node.type not in func_types:
             continue
@@ -883,8 +893,16 @@ DIMENSION_ARGUMENT_SHAPE = "argument-shape"
 ARGSHAPE_MIN_SITES = 4
 ARGSHAPE_RATIO = 0.9
 
+# Every optional atom gates its own whitespace span: the naive
+# ``\s*\(?\s*(\**)\s*…(\[..\])?\s*\)?`` stacked unbounded whitespace
+# spans around optional atoms, and a ``sizeof``-opening argument
+# ending in a long whitespace run made the engine try every split of
+# the run between them — cubic even at the anchored match call.
+# Match set unchanged; absent stars now capture None instead of ''
+# (the consumer truth-tests the group).
 _SIZEOF_ARG_RE = re.compile(
-    r"^sizeof\s*\(?\s*(\**)\s*([A-Za-z_]\w*)\s*(\[[^\]]*\])?\s*\)?$",
+    r"^sizeof\s*(?:\(\s*)?(?:(\*+)\s*)?([A-Za-z_]\w*)"
+    r"\s*(?:(\[[^\]]*\])\s*)?\)?$",
 )
 _TYPEISH_RE = re.compile(
     r"^(?:struct|union|enum)\b|_t$|^u?int\d+_t$",
@@ -1101,7 +1119,7 @@ def _shape_sites_for_file(
     call_types = _CALL_TYPES.get(lang, ())
     if call_types:
         src = source.encode("utf-8", errors="replace")
-        lines = source.splitlines()
+        lines = split_lines(source)
         for node in _walk_descendants(tree.root_node):
             if node.type not in call_types:
                 continue
@@ -1229,13 +1247,18 @@ def detect_argument_shape_deviations(
 #
 # "n implementors of the same interface validate, 1 doesn't." Peer
 # groups are NOT formed here — they come from the layered resolver
-# (``core.analysis.peer_groups``): dispatch-table members (L2) and
-# same-type cohorts (L4), the two layers whose membership is a
-# mechanical fact rather than a naming heuristic. The comparator is
-# the existing property-vector majority vote
+# (``core.analysis.peer_groups``): dispatch-table members (L2),
+# same-type cohorts (L4), route families (L10) and interface slots
+# (L7 — ops-struct slot / subclass-override census), the layers whose
+# membership is a mechanical fact rather than a naming heuristic.
+# The comparator is the existing property-vector majority vote
 # (``sibling_analysis.find_asymmetries``) over structural safety
 # properties (auth check, null guard, bounds guard, error handling —
-# the in-tree property regexes, no project vocabulary).
+# the in-tree property regexes, no project vocabulary). Route-family
+# members additionally vote their recorded auth-decorator presence
+# as its OWN two-valued property — a decoration fact, deliberately
+# NEVER folded into the body-evidence ``auth_check`` vote (see the
+# adapter note in :func:`detect_interface_deviations`).
 #
 # Escalation-only (§3.8): interface members legitimately differ (a
 # read-only op skipping the write-permission check is correct), so
@@ -1248,9 +1271,63 @@ DIMENSION_INTERFACE = "interface"
 
 INTERFACE_MIN_GROUP = MIN_GROUP_SITES
 
+# Family-size CEILING at comparator intake — for every formation
+# layer (the floors above are mins; until now no max existed at the
+# point where groups enter a vote). Both directions: an uncapped
+# family turns one hub group into a whole-tree blob where a single
+# deviant among hundreds is noise for the N-vs-K vote (and multiplies
+# per-member body extraction); too low splits genuinely wide
+# interface families. 32 matches the formation layers' own member-cap
+# class (route/slot 32, binary/type-cohort 24), so honest producers
+# are unaffected — the ceiling is the backstop for producers that do
+# not cap. Selection at the ceiling is seeded-random, never a
+# sortable prefix: member names are attacker-chosen text, and a
+# deterministic cut would let a hostile repo name the deviant past it.
+MAX_FAMILY_MEMBERS = 32
+
+
+def _intake_capped(members: list[Any]) -> tuple[list[Any], bool]:
+    """Apply :data:`MAX_FAMILY_MEMBERS` at comparator intake.
+
+    Returns ``(members, capped)`` — order-preserving under the
+    ceiling, seeded-random survivors above it (see the constant's
+    rationale)."""
+    if len(members) <= MAX_FAMILY_MEMBERS:
+        return members, False
+    import os
+    import random as _random
+
+    rnd = _random.Random(os.urandom(16))
+    keep = set(rnd.sample(range(len(members)), MAX_FAMILY_MEMBERS))
+    return [m for i, m in enumerate(members) if i in keep], True
+
+
+#: Public spelling of :func:`_intake_capped` — cross-module consumers
+#: (the negative-space intake) import the ceiling by this name; the
+#: underscore spelling stays as the in-module idiom. Rename the pair
+#: together.
+intake_capped = _intake_capped
+
 # Peer-group layers whose membership is mechanical (L2 dispatch-site
-# extraction, L4 type-cohort index).
-_INTERFACE_GROUP_TYPES = frozenset({"dispatch_site", "type_cohort"})
+# extraction, L4 type-cohort index, L10 route families, L7
+# interface-slot census). Literal strings by convention here; the
+# route and interface-slot entries are pinned against
+# ``peer_groups.GROUP_TYPE_ROUTE_FAMILY`` /
+# ``interface_slots.GROUP_TYPE_INTERFACE_SLOT`` by test so drift dies
+# loudly instead of the frozenset silently missing the layer.
+_INTERFACE_GROUP_TYPES = frozenset({
+    "dispatch_site", "type_cohort", "route_family", "interface_slot",
+})
+
+_ROUTE_FAMILY_GROUP_TYPE = "route_family"
+
+# The route layer's two-valued auth-decoration property (literal for
+# the same reason; pinned against peer_groups.ROUTE_AUTH_PROPERTY by
+# test). Voted as its own property on route-family groups only — a
+# DECORATION fact ("carries the auth decorator"), never a protection
+# claim (chain entries do not prove wrapping) and never an input to
+# the body-evidence ``auth_check`` vote.
+_ROUTE_AUTH_PRESENCE_PROPERTY = "route_auth_decorator_present"
 
 # Property → CWE, per the §3.8 set (auth omission is CWE-862; the
 # validation-shaped properties map to the broad input-validation
@@ -1258,6 +1335,7 @@ _INTERFACE_GROUP_TYPES = frozenset({"dispatch_site", "type_cohort"})
 # is prepass-lead-only and must not widen the CWE dispatch surface).
 _INTERFACE_PROPERTY_CWE = {
     "auth_check": "CWE-862",
+    _ROUTE_AUTH_PRESENCE_PROPERTY: "CWE-862",
     "null_guard": "CWE-20",
     "bounds_guard": "CWE-20",
     "error_handling": "CWE-20",
@@ -1279,6 +1357,13 @@ def _interface_properties(body: str) -> dict[str, bool]:
     }
 
 
+#: Public spelling of :func:`_interface_properties` — cross-module
+#: consumers (uniform-absence) import the property census by this
+#: name; the underscore spelling stays as the in-module idiom. Rename
+#: the pair together.
+interface_properties = _interface_properties
+
+
 @dataclass
 class InterfaceDeviation:
     """One implementor lacking a property its interface peers share."""
@@ -1291,6 +1376,10 @@ class InterfaceDeviation:
     n: int
     conforming: int
     cwe: str
+    #: When the family exceeded MAX_FAMILY_MEMBERS at intake, the
+    #: ORIGINAL resolved size — the vote ran over a seeded sample of
+    #: n members, and the description says so (0 = no sampling).
+    sampled_from: int = 0
     peer_evidence: PeerEvidence | None = None
 
     @property
@@ -1299,11 +1388,28 @@ class InterfaceDeviation:
 
     @property
     def description(self) -> str:
-        return (
-            f"{self.conforming}/{self.n} implementors in "
-            f"{self.group_id} perform {self.property_name}; "
-            f"{self.enclosing_function} does not"
-        )
+        # Decoration facts get decoration wording: the lead claims a
+        # DIFFERENCE in decoration, never that the peers perform (or
+        # are protected by) an auth check — a recorded decorator may
+        # not wrap the registered callable.
+        if self.property_name == _ROUTE_AUTH_PRESENCE_PROPERTY:
+            base = (
+                f"{self.conforming}/{self.n} implementors in "
+                f"{self.group_id} carry the auth decorator; "
+                f"{self.enclosing_function} does not"
+            )
+        else:
+            base = (
+                f"{self.conforming}/{self.n} implementors in "
+                f"{self.group_id} perform {self.property_name}; "
+                f"{self.enclosing_function} does not"
+            )
+        if self.sampled_from:
+            base += (
+                f" (vote over a seeded sample of {self.n} of the "
+                f"family's {self.sampled_from} members)"
+            )
+        return base
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -1317,6 +1423,8 @@ class InterfaceDeviation:
             "ratio": round(self.ratio, 3),
             "cwe": self.cwe,
         }
+        if self.sampled_from:
+            d["sampled_from"] = self.sampled_from
         if self.peer_evidence is not None:
             d["peer_evidence"] = self.peer_evidence.to_dict()
         return d
@@ -1364,6 +1472,36 @@ def detect_interface_deviations(
                 resolved.append((s, named[1], named[2]))
         if len(resolved) < min_group:
             continue
+        # Family-size ceiling (see MAX_FAMILY_MEMBERS): the vote runs
+        # over a bounded, unchoosable sample of an oversized family —
+        # and every receipt SAYS so (in-band degradation: a reviewer
+        # must never read "31/32 conform" as the whole family).
+        total_resolved = len(resolved)
+        resolved, intake_capped = _intake_capped(resolved)
+
+        def _member_properties(
+            s: Any, body: str,
+        ) -> dict[str, bool]:
+            props = _interface_properties(body)
+            # Route-family adapter: the L10 layer stamps every
+            # member with a two-valued auth-DECORATION fact; it is
+            # voted as its own property so a decoration deviant
+            # surfaces ("peers carry the auth decorator, this one
+            # doesn't"). Deliberately NOT folded into ``auth_check``:
+            # chain entries do not prove wrapping (a decorator above
+            # the registration decorator protects nothing), so
+            # target-authored decorator text must never be able to
+            # raise a member's ``auth_check`` and mask a
+            # body-evidence lead. Body evidence keeps that vote to
+            # itself, in both directions. Truncated/unknown chains
+            # were excluded at family formation; a member without
+            # the stamp simply does not vote on it.
+            if gtype == _ROUTE_FAMILY_GROUP_TYPE:
+                sp = getattr(s, "properties", None) or {}
+                stamped = sp.get(_ROUTE_AUTH_PRESENCE_PROPERTY)
+                if isinstance(stamped, bool):
+                    props[_ROUTE_AUTH_PRESENCE_PROPERTY] = stamped
+            return props
 
         from .sibling_analysis import SiblingPath
         voting = SiblingGroup(
@@ -1376,7 +1514,7 @@ def detect_interface_deviations(
                     file=s.file,
                     function=s.function,
                     line=line,
-                    properties=_interface_properties(body),
+                    properties=_member_properties(s, body),
                 )
                 for s, line, body in resolved
             ],
@@ -1392,14 +1530,32 @@ def detect_interface_deviations(
                 continue
             if asym.confidence < ratio:
                 continue
+            def _phrase(fn: str, *, positive: bool) -> str:
+                # Decoration wording for the decoration fact (see
+                # the InterfaceDeviation.description note).
+                if asym.property_name == _ROUTE_AUTH_PRESENCE_PROPERTY:
+                    return (f"{fn} carries the auth decorator"
+                            if positive else
+                            f"{fn} does not carry the auth decorator")
+                return (f"{fn} performs {asym.property_name}"
+                        if positive else
+                        f"{fn} lacks {asym.property_name}")
+
+            conforming_names = sorted(
+                line_of.keys() - set(asym.minority_siblings),
+            )
             exhibits = [
                 PeerExhibit(
                     file_of.get(fn, ""), line_of.get(fn, 0),
-                    f"{fn} performs {asym.property_name}",
+                    _phrase(fn, positive=True),
                 )
-                for fn in sorted(
-                    line_of.keys() - set(asym.minority_siblings),
-                )[:3]
+                for fn in conforming_names[:3]
+            ]
+            family = [
+                FamilyMember(
+                    file_of.get(fn, ""), fn, line_of.get(fn, 0),
+                )
+                for fn in conforming_names
             ]
             total = asym.majority_count + asym.minority_count
             for fn in asym.minority_siblings:
@@ -1414,6 +1570,9 @@ def detect_interface_deviations(
                     cwe=_INTERFACE_PROPERTY_CWE.get(
                         asym.property_name, "CWE-20",
                     ),
+                    sampled_from=(
+                        total_resolved if intake_capped else 0
+                    ),
                     peer_evidence=PeerEvidence(
                         dimension=DIMENSION_INTERFACE,
                         formation="interface",
@@ -1423,12 +1582,20 @@ def detect_interface_deviations(
                         ratio=asym.confidence,
                         deviant=PeerExhibit(
                             file_of.get(fn, ""), line_of.get(fn, 0),
-                            f"{fn} lacks {asym.property_name}",
+                            _phrase(fn, positive=False),
                         ),
                         exhibits=exhibits,
+                        family=list(family),
                         contract_source="majority",
+                        # In-band sampling marker: the vote ran over
+                        # a seeded sample of an oversized family.
                         provenance=(
                             f"interface:{gtype}:{asym.property_name}"
+                            + (
+                                f":sampled{len(resolved)}"
+                                f"of{total_resolved}"
+                                if intake_capped else ""
+                            )
                         ),
                     ),
                 ))
@@ -1583,7 +1750,7 @@ def _call_events_for_file(
     if not call_types:
         return
     src = source.encode("utf-8", errors="replace")
-    lines = source.splitlines()
+    lines = split_lines(source)
     # One read index per file: the per-site fallback would rebuild a
     # full scope index for every call site, costing more than the
     # per-site walk it replaced.
@@ -1999,8 +2166,10 @@ def detect_sanitize_sink_deviations(
         annotated = bool(meta.get("registry"))
         exhibits = []
         for (fp, _fn), _ev, dom in conforming[:3]:
+            if dom is None:
+                continue
             san_name, san_line = dom
-            lines = source_texts.get(fp, "").splitlines()
+            lines = split_lines(source_texts.get(fp, ""))
             snippet = (
                 lines[san_line - 1].strip()[:200]
                 if 1 <= san_line <= len(lines) else ""
@@ -2365,7 +2534,7 @@ def _bounds_leg_sites(
                     cmp_table.get(index, []), idx, m.start(),
                 )
                 guarded = guard_j is not None
-                guard_line = start + guard_j if guarded else 0
+                guard_line = start + guard_j if guard_j is not None else 0
                 by_field.setdefault(fld, []).append(_AccessSite(
                     file=file_path,
                     line=start + idx,

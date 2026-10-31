@@ -8,14 +8,19 @@ markdown auto-render) when the operator views findings.
 Pipeline:
   1. strip autofetch markup (envelope regex + the report-side
      supplement below — a genuine second layer, not an alias)
-  2. blank block-structure forgery lines (setext underlines, ---
+  2. entity-escape raw-HTML construct openers (`<` before a tag
+     letter / `/` / `!` / `?` → `&lt;`) — non-fetching structural
+     HTML (`<h1>`, `<table>`, `<details>`, `<!--`) is the HTML
+     spelling of block-structure forgery, and the comment/collapse
+     forms hide the REST of the rendered report
+  3. blank block-structure forgery lines (setext underlines, ---
      rules, table delimiter rows)
-  3. defang line-leading markdown control chars (`*_#|> at line
+  4. defang line-leading markdown control chars (`*_#|> at line
      start) on real newline boundaries — keeps prose readable
      mid-string while disabling block-level rendering
-  4. escape ANSI / BIDI / control bytes (preserves `\n`, `\t` so
+  5. escape ANSI / BIDI / control bytes (preserves `\n`, `\t` so
      multi-line prose still renders as paragraphs in reports)
-  5. length-cap at max_chars with a single Unicode ellipsis (…)
+  6. length-cap at max_chars with a single Unicode ellipsis (…)
 
 Note: the /tmp/llm.md spec listed escape→strip→cap. We deviate to strip→
 escape→cap because `core.security.log_sanitisation.escape_nonprintable`
@@ -41,8 +46,14 @@ from core.security.prompt_envelope import _strip_autofetch_markup
 # REPEATED runs (separated by spaces/tabs) are consumed together:
 # stripping only the first run left `# # X` as ` # X`, which markdown
 # (up to 3 leading spaces) still renders as an h1.
+# `~` joined for tilde fences: a line-leading `~~~` opens a fenced
+# code block exactly like ``` (CommonMark), and a hostile value that
+# opens one swallows the REST of the rendered report — the writer's
+# own fences, headings, and every later finding render as literal
+# code until a closing tilde run. The backtick was in the class from
+# day one; the tilde spelling of the same construct was not.
 _LINE_LEAD_MD_RE = re.compile(
-    r'(?m)^([ \t]*)([`*_#|>]+(?:[ \t]+[`*_#|>]+)*)'
+    r'(?m)^([ \t]*)([`*_#|>~]+(?:[ \t]+[`*_#|>~]+)*)'
 )
 
 # Line-leading list markers (`- item`, `+ item`, `1. item`, `1) item`)
@@ -66,6 +77,9 @@ _LIST_MARKER_RE = re.compile(r'(?m)^([ \t]*)([-+]|\d{1,9}[.)])([ \t])')
 # construct.
 _MD_STRUCTURE_LINE_RE = re.compile(
     r'(?m)^(?=[ \t|:=-]+$)(?=.*[-=])[ \t|:=-]+$'
+    # line-model: a \r-tailed line slips this blanking, but the
+    # escape_nonprintable pass below renders that \r as visible \x0d
+    # text — no renderer sees an intact structure line either way
 )
 
 # Report-side autofetch supplement: forms verified to slip the
@@ -88,6 +102,29 @@ _REPORT_AUTOFETCH_SUPPLEMENT_RE = re.compile(
     r'|<[a-zA-Z][^>]{0,8192}?style\s*=[^>]{0,8192}?url\s*\([^>]{0,8192}>',
     re.IGNORECASE,
 )
+
+# Raw-HTML construct openers. CommonMark passes raw HTML through
+# verbatim, and its HTML-block rules (types 1-7) plus inline raw HTML
+# make a bare `<` the entry point for every structural forgery the
+# line-leading class above blocks in its markdown spelling: `<h1>ALL
+# CLEAR</h1>` forges a heading, `<table>` forges a metrics table,
+# `<blockquote>` reformats attacker prose as authoritative quotation —
+# and the suppression direction is worse: a line-leading `<!--`
+# comments out EVERY subsequent finding, heading and fence until a
+# `-->`, and `<details>` collapses the remainder of the report. The
+# autofetch layers above only strip FETCHING tags; non-fetching
+# structural HTML sailed through both. Entity-escape the opener
+# instead of stripping: `&lt;` renders as a literal `<` so prose that
+# legitimately quotes markup stays readable, while no renderer can
+# form a tag, comment (`<!--`), declaration (`<!DOCTYPE`), CDATA
+# section (`<![CDATA[`), or processing instruction (`<?`) from it.
+# The lookahead keeps comparison prose (`a < b`, `x <- y`) untouched:
+# only `<` immediately followed by a tag-name letter, `/` (close
+# tag), `!` (comment/declaration/CDATA) or `?` (PI) can open an HTML
+# construct. Already-escaped text (`&lt;h1&gt;`) has no raw `<` and
+# passes unchanged — CommonMark renders entities as literal text,
+# never as markup, so there is no decode-then-parse reintroduction.
+_HTML_CONSTRUCT_OPEN_RE = re.compile(r'<(?=[A-Za-z/!?])')
 
 _ELLIPSIS = '…'
 
@@ -116,6 +153,10 @@ def sanitise_string(s: str, *, max_chars: int = 500) -> str:
     s = _REPORT_AUTOFETCH_SUPPLEMENT_RE.sub(
         '[REDACTED-AUTOFETCH-MARKUP]', s,
     )
+    # After both autofetch layers (they match raw tags), before the
+    # markdown-structure passes: raw HTML is the HTML spelling of the
+    # same block-structure forgery those passes defang.
+    s = _HTML_CONSTRUCT_OPEN_RE.sub('&lt;', s)
     s = _MD_STRUCTURE_LINE_RE.sub('', s)
     s = _LINE_LEAD_MD_RE.sub(lambda m: m.group(1), s)
     s = escape_nonprintable(s, preserve_newlines=True)
@@ -125,6 +166,47 @@ def sanitise_string(s: str, *, max_chars: int = 500) -> str:
     s = _LIST_MARKER_RE.sub(
         lambda m: m.group(1) + m.group(2) + '​' + m.group(3), s,
     )
+    if len(s) > max_chars:
+        s = s[: max_chars - 1] + _ELLIPSIS
+    return s
+
+
+def sanitise_inline(s: str, *, max_chars: int = 300) -> str:
+    """Defang for SINGLE-LINE slots — headings, labels, table cells —
+    where the rendered value never begins a markdown line of its own.
+
+    Newlines/line separators are flattened to spaces (so the value
+    cannot START a line), autofetch markup is stripped (both layers —
+    ``<img>`` in a table cell still fetches), control/bidi bytes are
+    escaped, and the result is length-capped. The line-leading
+    markdown stripping of :func:`sanitise_string` is deliberately
+    omitted: the slot's own prefix (``# ``, ``| ``, ``**``) makes
+    mid-string ``#``/``*``/``-`` inert, and stripping them would eat
+    legitimate label text (a literal ``#`` column header, a ``-``
+    placeholder cell).
+
+    In-slot STRUCTURE characters are entity-escaped (the ``_md_cell``
+    idiom, cf. cve-diff's table renderer): an in-cell ``|`` splits the
+    table row and shifts attacker text under different column
+    headers, and a backtick closes a wrapping `` ` `` code span so
+    the tail renders as live inline markdown. ``&#124;`` / ``&#96;``
+    render as the literal character in plain markdown slots; inside a
+    code span they display as the entity text — the safe direction,
+    since no raw delimiter survives to terminate the span.
+    """
+    s = (str(s)
+         .replace("\r", " ").replace("\n", " ")
+         .replace("\u2028", " ").replace("\u2029", " "))
+    s = _strip_autofetch_markup(s)
+    s = _REPORT_AUTOFETCH_SUPPLEMENT_RE.sub(
+        '[REDACTED-AUTOFETCH-MARKUP]', s,
+    )
+    # Inline raw HTML forms anywhere in a slot (`t<h1>x</h1>` in a
+    # heading, `<details>` in a table cell collapses the row's tail) —
+    # same construct-opener escape as the prose lane.
+    s = _HTML_CONSTRUCT_OPEN_RE.sub('&lt;', s)
+    s = escape_nonprintable(s)
+    s = s.replace("|", "&#124;").replace("`", "&#96;")
     if len(s) > max_chars:
         s = s[: max_chars - 1] + _ELLIPSIS
     return s

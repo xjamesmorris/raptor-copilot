@@ -162,13 +162,44 @@ class TestProxyPeerGate:
         finally:
             proxy.stop()
 
-    def test_unknown_uid_fails_open(self, reset_proxy, monkeypatch):
-        # None = "could not determine" — documented fail-open so
-        # non-Linux hosts and kernel races don't break the proxy.
+    def test_unknown_uid_fails_closed_where_table_exists(
+            self, reset_proxy, monkeypatch):
+        # The second-uid race shape: a peer whose socket row never
+        # becomes visible. On hosts WITH /proc/net/tcp an undetermined
+        # UID is retried once (the row can lag the connect) and then
+        # DROPPED — the old allow-on-None handed a different-uid local
+        # process a deterministic ride on the allowlisted egress.
+        calls: list = []
+
+        def never_resolves(peer, sockname):
+            calls.append(peer)
+            return None
+
+        monkeypatch.setattr(proxy_mod, "_loopback_peer_uid",
+                            never_resolves)
+        monkeypatch.setattr(proxy_mod, "_PEER_UID_TABLE_AVAILABLE", True)
+        proxy = proxy_mod.EgressProxy(allowed_hosts={"allowed.example"})
+        try:
+            buf = _connect_raw(proxy.port)
+            assert buf == b"", (
+                "an unverifiable loopback peer must be dropped on "
+                "hosts where the socket table exists")
+            assert len(calls) == 2, "the lookup must be retried once"
+        finally:
+            proxy.stop()
+
+    def test_unknown_uid_allowed_without_table(
+            self, reset_proxy, monkeypatch):
+        # Platform incapability (macOS: no /proc/net) is not a lookup
+        # failure — every peer resolves None there, so the gate stays
+        # advisory and the connection reaches the policy gates (403 =
+        # served, not dropped).
         monkeypatch.setattr(
             proxy_mod, "_loopback_peer_uid",
             lambda peer, sockname: None,
         )
+        monkeypatch.setattr(proxy_mod, "_PEER_UID_TABLE_AVAILABLE",
+                            False)
         proxy = proxy_mod.EgressProxy(allowed_hosts={"allowed.example"})
         try:
             buf = _connect_raw(proxy.port)

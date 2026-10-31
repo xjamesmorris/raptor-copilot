@@ -40,6 +40,8 @@ from __future__ import annotations
 import logging
 import re
 
+from core.source import open_regular
+
 logger = logging.getLogger(__name__)
 
 DETECTOR_NAME = "asm_zero_len_loop"
@@ -98,7 +100,7 @@ def _parse(asm_text: str) -> list[dict]:
     """Tokenise into label / insn records with 1-based line numbers."""
     records: list[dict] = []
     in_block = False
-    for lineno, raw in enumerate(asm_text.split("\n"), start=1):
+    for lineno, raw in enumerate(asm_text.split("\n"), start=1):  # line-model: host-generated perlasm output is \n-model; tokens are strip()-normalised
         line, in_block = _strip_comment(raw, in_block)
         if not line.strip():
             continue
@@ -430,7 +432,13 @@ def scan_inventory_asm(checklist: dict | None) -> list[dict]:
         if not gen_path:
             continue
         try:
-            with open(gen_path, "rb") as fh:
+            # gen_path arrives from checklist records: fd-checked
+            # regular + O_NOFOLLOW + O_NONBLOCK (FIFO/symlink plants
+            # refuse), read bounded as before.
+            fh = open_regular(gen_path, "rb")
+            if fh is None:
+                continue
+            with fh:
                 text = fh.read(_MAX_ASM_BYTES).decode("utf-8", "replace")
         except OSError as exc:
             logger.warning(

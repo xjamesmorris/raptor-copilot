@@ -219,3 +219,205 @@ class TestFastPathIdCollisions:
         second = load_json(tmp_path / "hypotheses.json")
         assert [h["id"] for h in second] == [h["id"] for h in first]
         assert len(load_json(tmp_path / "attack-paths.json")) == 2
+
+
+class TestIdlessFindingDiagnostics:
+    """The id-less finding is exactly the one that takes the WARN
+    branch — a KeyError there wedges the pipeline AFTER the stage
+    file was consumed and deleted, and every re-run crashes the same
+    way from the persisted findings.json."""
+
+    def test_prepare_b_warn_path_tolerates_missing_id(self, tmp_path,
+                                                      capsys):
+        mod = _load_helper()
+        f = _finding("FIND-1")
+        del f["id"]
+        del f["stage_a_summary"]
+        _write(tmp_path, "findings.json", {"stage": "A", "findings": [f]})
+        mod.prepare_B(str(tmp_path))  # must not KeyError
+        err = capsys.readouterr().err
+        assert "missing stage_a_summary" in err
+
+    def test_prepare_c_warn_and_c0_paths_tolerate_missing_id(
+            self, tmp_path, capsys):
+        mod = _load_helper()
+        _write(tmp_path, "checklist.json",
+               {"files": [{"path": "a.c", "lines": 10}]})
+        f = _finding("FIND-1", file="not-in-inventory.c")
+        del f["id"]
+        _write(tmp_path, "findings.json", {"stage": "B", "findings": [f]})
+        mod.prepare_C(str(tmp_path))  # must not KeyError
+        err = capsys.readouterr().err
+        assert "missing stage_b_summary" in err
+        assert "C0 FAIL" in err
+
+    def test_prepare_d_warn_path_tolerates_missing_id(self, tmp_path,
+                                                      capsys):
+        mod = _load_helper()
+        f = _finding("FIND-1")
+        del f["id"]
+        _write(tmp_path, "findings.json", {"stage": "C", "findings": [f]})
+        mod.prepare_D(str(tmp_path))  # must not KeyError
+        err = capsys.readouterr().err
+        assert "missing stage_c_summary" in err
+
+
+class TestNonDictSummaries:
+    """poc / stage summaries may be bare strings — findings.json is
+    LLM-authored and schema validation is advisory; the same file
+    already guards this shape in _finding_poc_payload."""
+
+    def test_prepare_b_tolerates_string_poc_and_summary(self, tmp_path):
+        mod = _load_helper()
+        _write(tmp_path, "findings.json", {
+            "stage": "A",
+            "findings": [_finding(
+                "FIND-1", status="poc_success",
+                poc="segfault at 0x41414141",
+                stage_a_summary="high",
+            )],
+        })
+        mod.prepare_B(str(tmp_path))  # must not AttributeError
+        data = load_json(tmp_path / "findings.json")
+        assert len(data["findings"]) == 1
+
+    def test_prepare_d_tolerates_string_stage_c_summary(self, tmp_path,
+                                                        capsys):
+        mod = _load_helper()
+        _write(tmp_path, "findings.json", {
+            "stage": "C",
+            "findings": [_finding("FIND-1", stage_c_summary="passed")],
+        })
+        mod.prepare_D(str(tmp_path))  # must not AttributeError
+        err = capsys.readouterr().err
+        assert "must be a dict" in err
+
+
+class TestBinaryDiscoveryFailuresAreLoud:
+    """A find timeout/failure must not masquerade as "no binary
+    found" attrition — the old contextlib.suppress(Exception) wrapped
+    the whole discovery body and the operator never learned discovery
+    itself failed."""
+
+    def test_timeout_warns_and_returns_empty(self, tmp_path, capsys,
+                                             monkeypatch):
+        import subprocess
+        mod = _load_helper()
+
+        def fake_run(*a, **kw):
+            raise subprocess.TimeoutExpired(cmd="find", timeout=30)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        result = mod._discover_executables(str(tmp_path))
+        assert result == {}
+        err = capsys.readouterr().err
+        assert "binary discovery timed out" in err
+
+    def test_oserror_warns_and_returns_empty(self, tmp_path, capsys,
+                                             monkeypatch):
+        import subprocess
+        mod = _load_helper()
+
+        def fake_run(*a, **kw):
+            raise OSError("find: command not found")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        result = mod._discover_executables(str(tmp_path))
+        assert result == {}
+        err = capsys.readouterr().err
+        assert "binary discovery failed" in err
+        assert "OSError" in err
+
+
+class TestStageSchemaHints:
+    def test_every_llm_stage_has_a_hint(self):
+        """The module docstring promises per-stage schema hints for
+        A-F; Stage E was missing, so the E→F handoff printed no
+        contract for stage-e.json."""
+        mod = _load_helper()
+        for stage in ("A", "B", "C", "D", "E", "F"):
+            assert stage in mod.STAGE_SCHEMA_HINTS, stage
+        assert "stage-e.json" in mod.STAGE_SCHEMA_HINTS["E"]
+
+
+class TestNonDictRulingShapes:
+    """A bare-string / non-dict ``ruling`` (LLM-authored) is NO
+    ruling: consumers must neither crash nor read it as a verdict."""
+
+    def test_ruling_accessor_tolerates_every_shape(self):
+        mod = _load_helper()
+        assert mod._ruling({"ruling": {"status": "confirmed"}}) == {
+            "status": "confirmed",
+        }
+        for junk in ("confirmed", ["confirmed"], 7, None, True):
+            assert mod._ruling({"ruling": junk}) == {}
+        assert mod._ruling({}) == {}
+
+    def test_string_ruling_never_counts_as_verdict(self):
+        # Fail closed: a malformed shape neither confirms nor rules
+        # out — both directions matter (a string "ruled_out" must not
+        # drop the finding; a string "confirmed" must not promote it).
+        mod = _load_helper()
+        f_conf = {"ruling": "confirmed"}
+        f_ruled = {"ruling": "ruled_out"}
+        assert mod._ruling(f_conf).get("status") != "confirmed"
+        assert mod._ruling(f_ruled).get("status") != "ruled_out"
+
+    def test_finding_binaries_survives_string_ruling(self, tmp_path):
+        mod = _load_helper()
+        bx = tmp_path / "x.bin"
+        by = tmp_path / "y.bin"
+        for p in (bx, by):
+            p.write_bytes(b"\x7fELF" + b"\x00" * 12)
+        findings = [
+            _finding("F-1", ruling="confirmed",
+                     feasibility={"binary_path": str(bx)}),
+            _finding("F-2", ruling={"status": "ruled_out"},
+                     feasibility={"binary_path": str(by)}),
+        ]
+        binaries = mod._finding_binaries(findings)
+        # No AttributeError; the dict-shaped ruled_out finding is
+        # skipped, the string-ruling finding stays in play.
+        assert str(bx) in binaries
+        assert str(by) not in binaries
+
+
+class TestPrepareFToleratesHostileShapes:
+    """prepare_F walks every finding for verdict mapping, the
+    dead-verdict cross-check and the proximity consistency pass —
+    id-less findings and bare-string stage summaries are documented
+    /agentic and operator --findings shapes and must not wedge the
+    stage (the s10 consumed-stage-file class, unswept at these
+    sites)."""
+
+    def _data(self):
+        good = _finding("F-1")
+        good["feasibility"] = {"verdict": "likely_exploitable"}
+        good["stage_b_summary"] = {"proximity": 5}
+        idless = _finding("drop-me")
+        del idless["id"]
+        idless["feasibility"] = {"verdict": "likely_exploitable"}
+        stringy = _finding("F-3", stage_b_summary="validated")
+        return {"findings": [good, idless, stringy]}
+
+    def test_prepare_f_survives_idless_and_string_summary(
+            self, tmp_path, capsys):
+        mod = _load_helper()
+        _write(tmp_path, "findings.json", self._data())
+        mod.prepare_F(str(tmp_path))  # must not raise
+        out = capsys.readouterr().out
+        assert "F-1" in out
+
+    def test_prepare_e_skip_report_survives_idless(self, tmp_path, capsys):
+        mod = _load_helper()
+        idless = _finding("gone")
+        del idless["id"]
+        _write(tmp_path, "findings.json", {"findings": [idless]})
+        # No binaries discovered: the skip lane appends (id, reason)
+        # for memory-corruption findings — id-less must not KeyError.
+        mod.prepare_E(str(tmp_path))
+        # The pin is shape tolerance: the stage ran to completion and
+        # the findings artifact is still intact and loadable.
+        saved = load_json(tmp_path / "findings.json")
+        assert isinstance(saved.get("findings"), list)
+        assert len(saved["findings"]) == 1

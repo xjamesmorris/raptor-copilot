@@ -45,6 +45,12 @@ def make_finding_id(
     prefix is sufficient for corpus-scale uniqueness; collisions
     surface via the corpus-integrity test
     (``test_corpus_finding_ids_are_unique``).
+
+    Known limitation: the id is location-anchored (file path + line
+    of source and sink), so a file rename or move — or any edit that
+    shifts those line numbers — yields a new id for the same defect,
+    weakening cross-run correlation. A content-anchored redesign is
+    deliberately deferred.
     """
     key = (
         f"{producer}|{rule_id}|"

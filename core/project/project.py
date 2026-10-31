@@ -15,19 +15,52 @@ from pathlib import Path
 from typing import ClassVar
 
 from core.config import RaptorConfig
+from core.atomic_fs.fs_lock import artifact_lock
 from core.json import load_json, save_json
 from core.logging import get_logger
+from core.sandbox.tiers import (
+    CONSENTABLE_FLOOR_LABELS as VALID_SANDBOX_FLOORS,
+)
 
-try:
-    import fcntl
-    _HAS_FCNTL = True
-except ImportError:                                    # pragma: no cover
-    _HAS_FCNTL = False
+from . import registry_home as _registry_home
 
 logger = get_logger()
 
-# Default locations
-PROJECTS_DIR = Path.home() / ".raptor" / "projects"
+
+def _projects_dir() -> Path:
+    """The projects registry directory for THIS call.
+
+    Historically a module-level ``PROJECTS_DIR`` constant computed at
+    import time — which resolved the REAL home with no override seam
+    (env-less product misuse; conftest-less test extracts). Now
+    resolved at call time through the shared operator-registry seam
+    (``core.project.registry_home`` — one resolution for this
+    registry, the ``.active`` bookmark and the sessions registry,
+    honouring ``RAPTOR_REGISTRY_HOME``).
+
+    Test-estate compatibility: a module-dict entry named
+    ``PROJECTS_DIR`` (the suite-wide ``monkeypatch.setattr`` /
+    ``mock.patch`` pin spelling) takes precedence over the seam, so
+    every existing per-test registry pin keeps working unchanged.
+    """
+    override = globals().get("PROJECTS_DIR")
+    if override is not None:
+        return Path(override)
+    return _registry_home.projects_dir()
+
+
+def __getattr__(name: str) -> Path:
+    # PEP 562: the historical constant name stays importable
+    # (``from core.project.project import PROJECTS_DIR`` and the
+    # attribute spelling both work) but now resolves at ACCESS time
+    # through the seam. Only reached when no module-dict override
+    # exists — a test's setattr wins by construction.
+    if name == "PROJECTS_DIR":
+        return _registry_home.projects_dir()
+    raise AttributeError(
+        f"module {__name__!r} has no attribute {name!r}")
+
+
 # Anchored to the repo-rooted out/ dir. Pre-fix this was the
 # cwd-relative Path("out/projects"): create() minted default output
 # dirs relative to whatever cwd the process happened to have, the
@@ -45,7 +78,7 @@ except Exception:  # noqa: BLE001 — invalid RAPTOR_OUT_DIR
     DEFAULT_OUTPUT_BASE = RaptorConfig.BASE_OUT_DIR / "projects"
 
 
-_PROJECT_SCHEMA_VERSION = 5
+_PROJECT_SCHEMA_VERSION = 6
 
 #: Generated (non-run) directories that live directly inside a
 #: project output dir. Every run-dir enumeration must skip them —
@@ -89,19 +122,29 @@ def _normalize_url_target(target: str) -> str:
 #             the repo's config as operator-reviewed.
 #   build   — traced-build C/C++ CodeQL extraction (``--traced-build``):
 #             the repo's build system may execute during DB creation.
+#             ALSO build-flags finding suppression: the source-intel
+#             lane treats fortify-source / stack-protector evidence
+#             from repo-declared build config as suppression-grade
+#             only under this marker, and only when the run's analysed
+#             root matches this project's target (the one-target rule;
+#             see packages/source_intel/adapter.py
+#             ``_build_flags_trusted``). No per-run flag pair exists
+#             for that consumer — the marker is the only control.
 #   dynamic — dynamic validation (Frida auto-launch / target execution):
 #             ``config.dynamic_validation`` defaults on for this project.
 #
 # ``build`` deliberately does NOT imply ``config`` — a traced run
 # hitting unsafe CodeQL pack config must still refuse (see
 # packages/codeql/tests/test_buildless_mode.py::
-# TestTracedBuildTrustIndependence). A marker may only loosen gates the
-# corresponding per-run flag can already loosen; per-run flags always win.
+# TestTracedBuildTrustIndependence). Where a per-run flag pair exists,
+# flags always win over the marker, in both directions.
 VALID_TRUST_MARKERS = ("config", "build", "dynamic")
 
 _TRUST_MARKER_HELP = {
     "config": "--trust-repo umbrella (cc_trust + codeql_trust overrides)",
-    "build": "traced-build C/C++ CodeQL extraction (--traced-build)",
+    "build": "traced-build C/C++ CodeQL extraction (--traced-build) "
+             "+ build-flags finding suppression (one-target rule; "
+             "no flag pair — marker is the only control)",
     "dynamic": "dynamic validation (Frida / target execution opt-in)",
 }
 
@@ -114,6 +157,19 @@ _TRUST_MARKER_HELP = {
 # by design.
 VALID_TARGET_KINDS = ("library", "hybrid", "application", "auto")
 
+# ``journal-checkpoint``: plain on/off configuration (not a trust
+# grant — the automatic checkpoint tiers are spend-safe by the
+# compactor's loss contract either way; the lossy slim tier keeps its
+# own operator consent surface on `raptor-audit journal compact`).
+VALID_JOURNAL_CHECKPOINT = ("on", "off")
+
+# VALID_SANDBOX_FLOORS (imported above from core/sandbox/tiers.py —
+# single source of truth, tiny and dependency-free): the untrusted
+# containment-floor consent values. ``none`` is deliberately NOT
+# accepted: a standing bare floor is not a project-consentable value
+# — untrusted work never runs bare by consent; the operator-explicit
+# per-run ``--sandbox none`` / ``--no-sandbox`` remains the only
+# sandbox-off surface.
 SETTINGS_REGISTRY = {
     "description": "one-line project description (string)",
     "notes": "free-form project notes (string)",
@@ -123,11 +179,23 @@ SETTINGS_REGISTRY = {
     "build-command": ("build command (string); per-language form "
                       "``build-command.<lang>`` (bare key sets the "
                       "``default`` language slot)"),
+    "sandbox-floor": ("untrusted containment-floor consent, one of: "
+                      + "|".join(VALID_SANDBOX_FLOORS)
+                      + " (consumed at run start; per-run "
+                        "--sandbox-floor overrides)"),
+    "journal-checkpoint": ("mid-run journal checkpoint (automatic "
+                           "dedup+supersede tiers), one of: "
+                           + "|".join(VALID_JOURNAL_CHECKPOINT)
+                           + " (default on; per-run "
+                             "--no-journal-checkpoint overrides)"),
 }
 
 # Keys persisted in the ``settings`` dict (the others map to existing
 # top-level Project fields).
-_DICT_SETTINGS_KEYS = ("target-kind", "build-command")
+_DICT_SETTINGS_KEYS = (
+    "target-kind", "build-command", "sandbox-floor",
+    "journal-checkpoint",
+)
 
 # Language slot names for ``build-command.<lang>``.
 _LANG_SLOT_RE = re.compile(r"\A[a-zA-Z0-9_+#.-]{1,32}\Z")
@@ -157,7 +225,8 @@ def _run_target_path(run_dir: Path) -> Path | str | None:
     meta_path = Path(run_dir) / ".raptor-run.json"
     if not meta_path.is_file():
         return None
-    meta = load_json(meta_path, max_bytes=1024 * 1024)
+    from core.run.metadata import load_run_metadata
+    meta = load_run_metadata(Path(run_dir))  # budget single-homed there
     raw = meta.get("target_path") if isinstance(meta, dict) else None
     if not raw or not isinstance(raw, str):
         return None
@@ -229,26 +298,20 @@ def project_file_lock(project_file: Path):
     The ``.lock`` file is deliberately left behind — unlinking after
     unlock races and can split lockers across two inodes.
     """
-    if not _HAS_FCNTL:
-        yield
-        return
+    # The hoisted sidecar idiom (core.atomic_fs.fs_lock): hardened
+    # open (O_NOFOLLOW / O_NONBLOCK / regularity), foreign-uid
+    # refusal, bounded announce-once wait. Every lock-unavailable
+    # shape — uncreatable (read-only dir, ENOSPC), tamper-shaped,
+    # foreign-uid, or held past the deadline — degrades LOUDLY to the
+    # unlocked path rather than failing the mutation (the previous
+    # silent degrade kept the same disposition but hid it).
     path = Path(project_file)
-    lock_path = path.with_suffix(path.suffix + ".lock")
-    try:
-        fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT, 0o600)
-    except OSError:
-        # Lock file uncreatable (read-only dir, ENOSPC) — proceed
-        # unserialised rather than failing the mutation.
+    # create_parent=False: a missing projects dir means the owner
+    # removed it — the lock degrades loudly to the unlocked path
+    # instead of resurrecting the directory as a side effect.
+    with artifact_lock(path, subject="project file",
+                       create_parent=False):
         yield
-        return
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
 
 
 def _validate_trust_marker(marker: str) -> str:
@@ -288,7 +351,12 @@ class Project:
     # v5 adds ``ghidra_projects`` — operator-attached Ghidra .gpr
     # paths for bidirectional RE sync. Older files still load with
     # the list defaulted; the next write upgrades them.
-    version: int = 5
+    #
+    # v6 adds ``binary_witnesses`` — sha256 content pins recorded at
+    # ``/project binary add`` and re-verified at load. Older files
+    # still load with the map defaulted (their binaries downgrade to
+    # enrichment-only until re-added); the next write upgrades them.
+    version: int = 6
     # Operator-supplied debug binaries for binary_oracle reachability
     # enrichment. Persisted across runs so the operator doesn't re-pass
     # ``--binary`` every invocation. List for ``--target-kind=hybrid``
@@ -296,6 +364,20 @@ class Project:
     # into ``RaptorConfig.BINARY_ORACLE_PATHS`` at /agentic / /codeql
     # start; explicit ``--binary`` on the CLI is additive.
     binaries: list[str] = field(default_factory=list)
+    # v6: content witnesses for the binary store — resolved path (the
+    # exact string held in ``binaries``) → sha256 hexdigest recorded
+    # at ``/project binary add``. The store is the one surface where
+    # run-writable content is promoted to durable suppression
+    # authority (an env-built artifact lives inside the run dir's
+    # write grant), so the operator's trust assertion is pinned to
+    # the BYTES they pointed at, not the path: the oracle load seam
+    # re-hashes and refuses an entry whose content changed
+    # (``binary_oracle_cli._project_binaries``). Entries with no
+    # witness (pre-v6 stores) stay enrichment-only — never
+    # ``absent``-suppression — until re-added. Same posture as the
+    # trust-marker archive lane (``trust._archive_target_equivalent``,
+    # sha256 fail-closed).
+    binary_witnesses: dict[str, str] = field(default_factory=dict)
     # v5: operator-attached Ghidra projects (.gpr paths) for
     # bidirectional sync — review context injection reads their
     # cached REDatabases; /ghidra sync exports findings back into
@@ -333,6 +415,7 @@ class Project:
             "description": self.description,
             "notes": self.notes,
             "binaries": list(self.binaries),
+            "binary_witnesses": dict(self.binary_witnesses),
             "ghidra_projects": list(self.ghidra_projects),
             "threat_model_path": self.threat_model_path,
             "threat_model_updated": self.threat_model_updated,
@@ -349,6 +432,9 @@ class Project:
         binaries = data.get("binaries") or []
         if not isinstance(binaries, list):
             binaries = []
+        witnesses = data.get("binary_witnesses") or {}
+        if not isinstance(witnesses, dict):
+            witnesses = {}
         ghidra_projects = data.get("ghidra_projects") or []
         if not isinstance(ghidra_projects, list):
             ghidra_projects = []
@@ -375,6 +461,14 @@ class Project:
             notes=data.get("notes", ""),
             version=version,
             binaries=[str(b) for b in binaries if isinstance(b, str)],
+            # Type-screened like ``binaries``: a witness value that is
+            # not a string carries no pin (dropped → the entry reads
+            # as unwitnessed, the enrichment-only tier — fail closed,
+            # never a crash on a hand-edited file).
+            binary_witnesses={
+                str(k): str(v) for k, v in witnesses.items()
+                if isinstance(k, str) and isinstance(v, str) and v
+            },
             ghidra_projects=[str(g) for g in ghidra_projects
                              if isinstance(g, str)],
             threat_model_path=str(data.get("threat_model_path") or ""),
@@ -420,6 +514,19 @@ class Project:
             # A bare string form (hand-edited JSON) upgrades to the
             # canonical lang→cmd dict on the default slot.
             settings["build-command"] = {"default": build}
+        floor = raw.get("sandbox-floor")
+        if isinstance(floor, str) and floor in VALID_SANDBOX_FLOORS:
+            # A value outside the consent vocabulary (hand-edited
+            # JSON, schema drift) is DROPPED here — a containment
+            # consent is never guessed; the run proceeds at the
+            # fail-closed default floor.
+            settings["sandbox-floor"] = floor
+        checkpoint = raw.get("journal-checkpoint")
+        if isinstance(checkpoint, str) and checkpoint in VALID_JOURNAL_CHECKPOINT:
+            # A label outside the vocabulary (hand-edited JSON) is
+            # DROPPED here — consumers fall back to the default-ON
+            # behaviour rather than guessing what a bogus label meant.
+            settings["journal-checkpoint"] = checkpoint
         return settings
 
     def is_expired_machine_project(self, now: datetime | None = None) -> bool:
@@ -505,6 +612,28 @@ class Project:
                 commands = {}
             commands[slot] = value
             self.settings["build-command"] = commands
+        elif base == "sandbox-floor":
+            if value not in VALID_SANDBOX_FLOORS:
+                extra = ""
+                if value == "none":
+                    extra = (
+                        " ('none' is not a consentable untrusted "
+                        "floor — untrusted work never runs bare by "
+                        "consent; the per-run --sandbox none / "
+                        "--no-sandbox operator surface is the only "
+                        "sandbox-off)")
+                raise ValueError(
+                    "sandbox-floor must be one of: "
+                    + ", ".join(VALID_SANDBOX_FLOORS)
+                    + f" (got {value!r}){extra}")
+            self.settings["sandbox-floor"] = value
+        elif base == "journal-checkpoint":
+            if value not in VALID_JOURNAL_CHECKPOINT:
+                raise ValueError(
+                    "journal-checkpoint must be one of: "
+                    + ", ".join(VALID_JOURNAL_CHECKPOINT)
+                    + f" (got {value!r})")
+            self.settings["journal-checkpoint"] = value
         else:  # pragma: no cover — split_setting_key guards this
             msg = f"Unknown setting {key!r}"
             raise ValueError(msg)
@@ -528,6 +657,11 @@ class Project:
             return had
         if base == "target-kind":
             return self.settings.pop("target-kind", None) is not None
+        if base == "sandbox-floor":
+            return self.settings.pop("sandbox-floor", None) is not None
+        if base == "journal-checkpoint":
+            return self.settings.pop(
+                "journal-checkpoint", None) is not None
         if base == "build-command":
             commands = self.settings.get("build-command")
             if not isinstance(commands, dict):
@@ -552,6 +686,10 @@ class Project:
             return self.threat_model_path or None
         if base == "target-kind":
             return self.settings.get("target-kind")
+        if base == "sandbox-floor":
+            return self.settings.get("sandbox-floor")
+        if base == "journal-checkpoint":
+            return self.settings.get("journal-checkpoint")
         if base == "build-command":
             commands = self.settings.get("build-command")
             if not isinstance(commands, dict):
@@ -590,7 +728,13 @@ class Project:
         extraction) share a ``content_id`` even though their ``target`` paths
         differ — this is what lets them resolve to the same project."""
         try:
-            data = load_json(self.output_path / "coverage.json")
+            # Budgeted (run-artifact class): find_project_by_content_id
+            # loads this store for EVERY registered project — one
+            # oversize plant must degrade to "no id", not buffer
+            # unbounded per project scanned.
+            from core.coverage.record import RUN_ARTIFACT_MAX_BYTES
+            data = load_json(self.output_path / "coverage.json",
+                             max_bytes=RUN_ARTIFACT_MAX_BYTES)
         except Exception:  # noqa: BLE001 — any read failure means "no id yet"
             return None
         return data.get("content_id") if isinstance(data, dict) else None
@@ -615,13 +759,20 @@ class Project:
         Default is sweep=False to avoid damaging active runs from read-only
         commands (status, findings, coverage).
         """
+        from core.project.findings_utils import safe_run_mtime
         from core.run.metadata import parse_timestamp_from_name
 
         def _sort_key(d: Path) -> str:
             ts = parse_timestamp_from_name(d.name)
             if ts:
                 return ts
-            return datetime.fromtimestamp(d.stat().st_mtime, tz=timezone.utc).isoformat()
+            # safe_run_mtime, not a bare d.stat(): the dir can vanish
+            # between _list_run_dirs and this sort key (a concurrent
+            # /project clean, manual rm) — the helper was built for
+            # exactly this crash and every consumer funnels through
+            # this enumerator. A vanished dir sorts oldest.
+            return datetime.fromtimestamp(
+                safe_run_mtime(d), tz=timezone.utc).isoformat()
 
         dirs = self._list_run_dirs()
         if sweep:
@@ -655,20 +806,28 @@ class Project:
                          if its session is dead (legacy fallback for runs
                          without session_pid).
         """
-        from core.json import load_json
         from core.run.metadata import (
             RUN_METADATA_FILE,
             _session_alive_for_meta,
             fail_run,
+            load_run_metadata,
         )
 
-        # Find all running dirs with their timestamps and PIDs
+        # Find all running dirs with their timestamps and PIDs.
+        # Budgeted read (load_run_metadata): the marker is
+        # sandbox-writable, and the sweep's pre-fix bare load both
+        # buffered an oversize plant unbounded AND crashed the whole
+        # get_run_dirs(sweep=True) consumer set — the sweep parsed the
+        # plant, decided to fail the run, and the BUDGETED fail_run
+        # then refused the same file, escaping as FileNotFoundError.
+        # Budgeted, an oversize marker reads None and the dir is
+        # skipped (not sweepable, not a crash).
         running = []
         for d in dirs:
             meta_file = d / RUN_METADATA_FILE
             if not meta_file.exists():
                 continue
-            meta = load_json(meta_file)
+            meta = load_run_metadata(d)
             if isinstance(meta, dict) and meta.get("status") == "running":
                 running.append((meta.get("timestamp", ""), d,
                                 meta.get("session_pid"), meta))
@@ -720,7 +879,7 @@ class ProjectManager:
     """Manages project lifecycle."""
 
     def __init__(self, projects_dir: Path | None = None) -> None:
-        self.projects_dir = projects_dir or PROJECTS_DIR
+        self.projects_dir = projects_dir or _projects_dir()
         self.projects_dir.mkdir(parents=True, exist_ok=True)
 
     # Reserved names that cannot be used as project names
@@ -770,6 +929,43 @@ class ProjectManager:
             )
             raise ValueError(msg)
 
+    def _output_dir_claim_lock(self, output_dir: str | Path):
+        """Cross-NAME serialisation of an output-dir claim.
+
+        Keyed by the RESOLVED output dir (hashed into a dot-file in the
+        registry dir, invisible to the ``*.json`` listing glob), so two
+        creates of different names contending for one directory
+        serialise regardless of which registry files they hold. Same
+        flock idiom and fail direction as :func:`project_file_lock`.
+        """
+        import hashlib
+        try:
+            key = str(Path(output_dir).resolve())
+        except OSError:
+            key = str(output_dir)
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+        return project_file_lock(self.projects_dir / f".outdir-{digest}")
+
+    def _output_dir_owner(self, output_dir: str | Path,
+                          exclude: str | None = None) -> str | None:
+        """Name of the registered project already claiming *output_dir*
+        (resolved-path comparison), or ``None``. ``exclude`` skips one
+        project name (rename compares against everyone else)."""
+        try:
+            needle = str(Path(output_dir).resolve())
+        except OSError:
+            needle = str(output_dir)
+        for p in self.list_projects():
+            if not p.output_dir or (exclude and p.name == exclude):
+                continue
+            try:
+                other = str(Path(p.output_dir).resolve())
+            except OSError:
+                other = p.output_dir
+            if other == needle:
+                return p.name
+        return None
+
     def create(self, name: str, target: str, description: str = "",
                output_dir: str | None = None, resolve_target: bool = True,
                created: str | None = None,
@@ -796,6 +992,29 @@ class ProjectManager:
         """
         self._validate_name(name)
         project_file = self.projects_dir / f"{name}.json"
+        # Registry-file serialisation for the exists-check + save
+        # window (every other registry mutator holds this lock): the
+        # CLI op lock keys on the OUTPUT dir, so two creates with
+        # different --output-dir (or a create racing import_project's
+        # mgr.create) don't serialise there — both passed the exists
+        # check, both reported success, and the loser's target/
+        # description was silently last-writer-overwritten while its
+        # output dir was left orphaned. create is registry-keyed, so
+        # lock the registry file.
+        with project_file_lock(project_file):
+            return self._create_locked(
+                name=name, project_file=project_file, target=target,
+                description=description, output_dir=output_dir,
+                resolve_target=resolve_target, created=created,
+                binaries=binaries,
+            )
+
+    def _create_locked(self, *, name: str, project_file: Path,
+                       target: str, description: str,
+                       output_dir: str | None, resolve_target: bool,
+                       created: str | None,
+                       binaries: list[str] | None) -> Project:
+        """Body of :meth:`create`; caller holds the registry-file lock."""
         if project_file.exists():
             msg = f"Project '{name}' already exists"
             raise ValueError(msg)
@@ -828,8 +1047,46 @@ class ProjectManager:
             binaries=resolved_binaries,
         )
 
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
-        save_json(project_file, project.to_dict())
+        # Two projects must never share one output dir: status/findings
+        # would interleave, and `/project clean` or `delete --purge` on
+        # one would destroy the other's runs (the purge containment
+        # check passes — the dir is under the base). Reachable via
+        # explicit --output-dir, and historically via rename A→B then
+        # create A (both defaulted to <base>/A). Fail closed.
+        #
+        # The claim check + save hold a lock keyed by the RESOLVED
+        # output dir: the registry-file lock the caller holds is
+        # per-NAME, so two concurrent creates of DIFFERENT names with
+        # the same --output-dir would both pass an unlocked owner scan
+        # and mint exactly the forbidden shared-dir state. Lock order
+        # is always name lock (caller) then dir claim — no inversion.
+        with self._output_dir_claim_lock(output_dir):
+            owner = self._output_dir_owner(output_dir)
+            if owner:
+                msg = (
+                    f"Output directory {output_dir} already belongs to "
+                    f"project '{owner}' — two projects must never share "
+                    f"an output directory (clean/purge on one would "
+                    f"delete the other's runs). Pass --output-dir to "
+                    f"pick a different directory."
+                )
+                raise ValueError(msg)
+
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+            save_json(project_file, project.to_dict())
+        # Warn-only advisory (WSL hosts): a project whose target or
+        # output dir sits on a Windows-interop mount degrades every
+        # subsequent run there (slow file I/O, client-local flock).
+        # Never blocks creation; free off WSL (cached detection).
+        try:
+            from core.startup.wsl import warn_windows_interop_mount
+            if not _URL_SCHEME_RE.match(resolved_target):
+                warn_windows_interop_mount(
+                    resolved_target, "project target")
+            warn_windows_interop_mount(
+                output_dir, "project output directory")
+        except Exception:  # noqa: BLE001 — advisory must never break create
+            logger.debug("windows-interop advisory failed", exc_info=True)
         logger.info("Created project '%s' → %s", name, output_dir)
         return project
 
@@ -859,7 +1116,19 @@ class ProjectManager:
         directory — REFUSED while any run under it is live (another
         session's in-flight run would have its dir deleted underneath
         it; the same ``split_live_runs`` predicate clean/dedup/merge
-        already use — purge never had it). ``force=True`` overrides."""
+        already use — purge never had it). ``force=True`` overrides.
+
+        Holds the registry-file RMW lock for the whole load → unlink
+        window: an in-flight locked mutator (trust marker, setting,
+        threat-model stamp) that loaded before an UNLOCKED delete
+        unlinked the file would ``_save()`` afterwards and resurrect
+        the deleted project as a zombie registry entry.
+        """
+        with self._mutation_lock(name):
+            self._delete_locked(name, purge=purge, force=force)
+
+    def _delete_locked(self, name: str, *, purge: bool,
+                       force: bool) -> None:
         project = self.load(name)
         if not project:
             msg = f"Project '{name}' not found"
@@ -989,8 +1258,40 @@ class ProjectManager:
         """Rename a project. ``force`` overrides the live-run refusal
         (needed for runs whose foreign-stamped metadata reads as
         unverifiable-alive forever — e.g. dirs restored from another
-        machine with ``status=running``)."""
+        machine with ``status=running``).
+
+        A name-derived default output dir (``<base>/<old_name>``) is
+        MOVED to ``<base>/<new_name>`` and the project record updated.
+        Pre-fix the record kept pointing at the old-name path, so a
+        later ``create(old_name)`` silently minted a second project on
+        the SAME output dir — clean/purge on either destroyed the
+        other's runs. The move only happens when no run is live (an
+        in-flight run's directory must never move under it — the same
+        contract as run pins); a --force rename past live runs keeps
+        the old path and warns. Operator-chosen custom output dirs are
+        never moved.
+
+        Holds BOTH names' registry-file RMW locks (fixed sorted order,
+        so two crossing renames cannot deadlock) across the whole
+        load → save(new) → unlink(old) window: an in-flight locked
+        mutator that loaded the old name before an UNLOCKED rename
+        completed would ``_save()`` afterwards and recreate the
+        old-name file — the project then exists under BOTH names over
+        ONE output dir, the exact forbidden state the shared-dir
+        refusals exist to prevent.
+        """
         self._validate_name(new_name)
+        if new_name == old_name:
+            # Identical names would self-deadlock on the double lock;
+            # keep the pre-existing error shape for this input.
+            msg = f"Project '{new_name}' already exists"
+            raise ValueError(msg)
+        first, second = sorted((old_name, new_name))
+        with self._mutation_lock(first), self._mutation_lock(second):
+            return self._rename_locked(old_name, new_name, force)
+
+    def _rename_locked(self, old_name: str, new_name: str,
+                       force: bool) -> Project:
         project = self.load(old_name)
         if not project:
             msg = f"Project '{old_name}' not found"
@@ -1028,6 +1329,68 @@ class ProjectManager:
                    "foreign-stamped runs read as live forever)")
             raise ValueError(msg)
 
+        # Re-derive a name-derived default output dir. Custom
+        # (operator-chosen) dirs are left alone: nothing about them is
+        # derived from the name, and create()'s shared-dir refusal
+        # protects them from a later re-create of the old name.
+        old_output = project.output_path
+        new_output: Path | None = None
+        try:
+            derived_old = (DEFAULT_OUTPUT_BASE / old_name).resolve()
+            is_derived = old_output.resolve() == derived_old
+        except OSError:
+            is_derived = False
+        if is_derived:
+            new_output = (DEFAULT_OUTPUT_BASE / new_name).resolve()
+            if live:
+                # --force past live runs: a live run's directory must
+                # never move under it (run-pin contract). Keep the old
+                # path; create()'s shared-dir refusal still prevents a
+                # re-create of the old name from sharing it.
+                logger.warning(
+                    "rename: %d live run(s) — output directory stays at "
+                    "%s (a live run's directory never moves); re-run "
+                    "'raptor project rename' semantics do not apply to "
+                    "the retained path",
+                    len(live), old_output,
+                )
+                new_output = None
+            elif new_output.exists():
+                msg = (
+                    f"Cannot rename '{old_name}' → '{new_name}': the "
+                    f"output directory {new_output} already exists. "
+                    f"Remove or rename it first."
+                )
+                raise ValueError(msg)
+            else:
+                dir_owner = self._output_dir_owner(
+                    new_output, exclude=old_name)
+                if dir_owner:
+                    msg = (
+                        f"Cannot rename '{old_name}' → '{new_name}': "
+                        f"output directory {new_output} is registered "
+                        f"to project '{dir_owner}'."
+                    )
+                    raise ValueError(msg)
+
+        # Move the output dir BEFORE the registry rewrite: a move
+        # failure aborts the rename cleanly (registry untouched); a
+        # registry failure after the move rolls the move back below.
+        moved = False
+        if new_output is not None:
+            if old_output.exists():
+                try:
+                    os.rename(old_output, new_output)
+                    moved = True
+                except OSError as e:
+                    msg = (
+                        f"Cannot rename '{old_name}': moving the output "
+                        f"directory {old_output} → {new_output} failed: "
+                        f"{e}"
+                    )
+                    raise ValueError(msg) from e
+            project.output_dir = str(new_output)
+
         # Update project
         project.name = new_name
 
@@ -1042,7 +1405,24 @@ class ProjectManager:
         # old file is removed; FileNotFoundError is fine (already
         # gone), any other OSError is logged loudly and re-raised so
         # the operator knows the old file needs manual cleanup.
-        save_json(new_file, project.to_dict())
+        try:
+            save_json(new_file, project.to_dict())
+        except Exception:
+            # Registry write failed after the dir move: put the dir
+            # back so the (still old-named) registry entry keeps
+            # pointing at real data. Best-effort — a failed rollback
+            # is logged, never masks the original error.
+            if moved:
+                try:
+                    os.rename(new_output, old_output)  # type: ignore[arg-type]
+                except OSError:
+                    logger.error(
+                        "rename: registry write failed AND the output "
+                        "dir rollback failed — runs now live at %s "
+                        "while project '%s' records %s; move them back "
+                        "manually", new_output, old_name, old_output,
+                    )
+            raise
         old_file = self.projects_dir / f"{old_name}.json"
         try:
             old_file.unlink()
@@ -1091,9 +1471,9 @@ class ProjectManager:
         # project's journal merges, coverage snapshots, and trust
         # consumption. Best-effort per run — a failure names the dir.
         try:
-            from core.json import load_json as _lj
             from core.json import save_json as _sj
             from core.run.metadata import RUN_METADATA_FILE as _MF
+            from core.run.metadata import _load_meta, _metadata_lock
             _pin_dirs = list(project.get_run_dirs())
             # External pinned runs join the rewrite via the ledgers'
             # surviving WITNESSES (not witnessed records — a witness
@@ -1117,11 +1497,23 @@ class ProjectManager:
             for run_dir in _pin_dirs:
                 marker = run_dir / _MF
                 try:
-                    meta = _lj(marker)
-                    if (isinstance(meta, dict)
-                            and meta.get("project") == old_name):
-                        meta["project"] = new_name
-                        _sj(marker, meta)
+                    # LOCKED read-modify-write, budgeted read, and
+                    # ONLY the project field rewritten. The unlocked
+                    # whole-dict load→save this replaces raced the
+                    # marker's other writers (a concurrent
+                    # complete_run under --force rename, an external
+                    # --out run finishing — the project op lock
+                    # covers only the project dir): the loop's stale
+                    # snapshot wrote back wholesale and resurrected a
+                    # just-completed run to status=running, losing
+                    # its terminal fields — the abandon sweep then
+                    # fail-stamped the genuinely completed run.
+                    with _metadata_lock(marker):
+                        meta = _load_meta(marker)
+                        if (isinstance(meta, dict)
+                                and meta.get("project") == old_name):
+                            meta["project"] = new_name
+                            _sj(marker, meta)
                 except Exception:  # noqa: BLE001 — leave a loud trail
                     logger.warning(
                         "rename: could not re-point the run pin in %s "
@@ -1205,6 +1597,29 @@ class ProjectManager:
                 self._save(project)
         return removed
 
+    def update_threat_model_stamp(
+        self, name: str, *, updated_at: str, path: str | None = None,
+    ) -> Project:
+        """RMW update of the threat-model registry fields.
+
+        The threat-model CLI actions and the /agentic threat-model
+        pass previously persisted a project snapshot loaded BEFORE
+        potentially long context-map work with a bare full-dict
+        save_json: racing ``/project untrust`` re-persisted the
+        snapshot's trust dict — a just-removed trust marker silently
+        resurrected (trust markers gate repo-trust witnesses) — and
+        racing ``set``/``binary add`` dropped that write wholesale.
+        Same RMW lock discipline as every other registry mutator; only
+        the threat-model fields are touched.
+        """
+        with self._mutation_lock(name):
+            project = self._load_or_raise(name)
+            if path is not None:
+                project.threat_model_path = path
+            project.threat_model_updated = updated_at
+            self._save(project)
+        return project
+
     def update_notes(self, name: str, notes: str) -> Project:
         """Update project notes.
 
@@ -1258,6 +1673,12 @@ class ProjectManager:
         if not src.exists():
             msg = f"Directory not found: {directory}"
             raise ValueError(msg)
+        if not src.is_dir():
+            # An easy operator slip (`project add myproj findings.json`)
+            # otherwise surfaces as an unhandled NotADirectoryError
+            # traceback from the child-run scan below.
+            msg = f"Not a directory: {directory}"
+            raise ValueError(msg)
 
         from core.run import generate_run_metadata, is_run_directory
 
@@ -1285,6 +1706,18 @@ class ProjectManager:
                     "target %s", run_src.name, recorded, project.target,
                 )
                 return False
+            from core.run.metadata import (
+                RUN_METADATA_FILE,
+                _metadata_file_has_receipt_state,
+                load_run_metadata,
+            )
+            if _metadata_file_has_receipt_state(run_src / RUN_METADATA_FILE):
+                logger.warning(
+                    "adopt refused for %s: receipt-backed runs are "
+                    "projectless and cannot be adopted",
+                    run_src.name,
+                )
+                return False
             # Liveness BEFORE the move: write_run_pin refuses live
             # runs, and raising after the move leaves a half-adopted
             # dir (moved, pin not rewritten, projections skipped).
@@ -1292,7 +1725,6 @@ class ProjectManager:
                 from core.run.metadata import (
                     STATUS_RUNNING,
                     _session_alive_for_meta,
-                    load_run_metadata,
                 )
                 _meta = load_run_metadata(run_src) or {}
                 if (_meta.get("status") == STATUS_RUNNING
@@ -1304,6 +1736,7 @@ class ProjectManager:
             except Exception:  # noqa: BLE001 — write_run_pin backstops
                 pass
             dest = dest_base / run_src.name
+            _claimed_in_place = False
             try:
                 dest.mkdir()
             except FileExistsError:
@@ -1314,16 +1747,14 @@ class ProjectManager:
                 # reaches for, and skipping silently left the run's
                 # projections suppressed with no discoverable remedy.
                 try:
-                    from core.json import load_json as _lj
-                    _m = _lj(dest / ".raptor-run.json",
-                             max_bytes=1024 * 1024)
+                    from core.run.metadata import load_run_metadata
+                    _m = load_run_metadata(dest)
                     _pin = (_m.get("project")
                             if isinstance(_m, dict) else None)
                     # Repair ONLY a pin naming a MISSING project (the
                     # rename-crash artifact): an authoritative pin to
-                    # an EXISTING other project — or an explicit
-                    # projectless pin — is the run's identity, and
-                    # topology must not override it.
+                    # an EXISTING other project is the run's identity,
+                    # and topology must not override it.
                     if (isinstance(_pin, str) and _pin != project.name
                             and self.load(_pin) is None):
                         from core.run.metadata import write_run_pin
@@ -1332,6 +1763,30 @@ class ProjectManager:
                             "adopt: re-pointed the stale pin on "
                             "already-present run %s (named missing "
                             "project %r)", dest.name, _pin)
+                    # A PROJECTLESS pin on a run sitting in place
+                    # inside this project's output dir is the adopt
+                    # command's core case ("retro-create a project
+                    # around existing project-less run(s)"): a run
+                    # launched via --out into the project path before
+                    # the project existed kept project=null, so trust
+                    # markers and settings never resolved for it.
+                    # Topology alone must not override a projectless
+                    # pin — but adopt is an explicit operator claim,
+                    # the same authority the moved-run path exercises
+                    # unconditionally. Liveness was checked above
+                    # (run_src == dest here). Restricted to the
+                    # in-place case: a name COLLISION between an
+                    # outside source and an unrelated in-project run
+                    # must not silently re-pin the bystander.
+                    elif (_pin is None and isinstance(_m, dict) and _m
+                            and run_src.resolve() == dest.resolve()):
+                        from core.run.metadata import write_run_pin
+                        write_run_pin(dest, project.name, "adopted")
+                        logger.info(
+                            "adopt: claimed projectless in-place run "
+                            "%s for project %r", dest.name,
+                            project.name)
+                        _claimed_in_place = True
                     # Witnesses naming missing projects for this dir
                     # get the same repair — a rename that crashed (or
                     # skipped a held ledger) leaves witness=old vs
@@ -1345,24 +1800,27 @@ class ProjectManager:
                 except Exception:  # noqa: BLE001 — repair best-effort
                     logger.debug("adopt: stale-pin repair failed",
                                  exc_info=True)
-                return False
-            dest.rmdir()
-            try:
-                shutil.move(str(run_src), str(dest))
-            except (FileNotFoundError, shutil.Error) as e:
-                # A concurrent adopt of the same source won the move —
-                # skip this run, keep the batch going.
-                logger.warning("adopt skipped for %s: %s",
-                               run_src.name, e)
-                return False
-            generate_run_metadata(dest)
-            # The move changed the run's governing project: rewrite
-            # the pin to the adopting project so the projections
-            # below (and every later consumer) resolve HERE — the
-            # pre-move pin (a foreign project, or none) must not
-            # keep steering a run that now lives in this project.
-            from core.run.metadata import write_run_pin
-            write_run_pin(dest, project.name, "adopted")
+                if not _claimed_in_place:
+                    return False
+            if not _claimed_in_place:
+                dest.rmdir()
+                try:
+                    shutil.move(str(run_src), str(dest))
+                except (FileNotFoundError, shutil.Error) as e:
+                    # A concurrent adopt of the same source won the
+                    # move — skip this run, keep the batch going.
+                    logger.warning("adopt skipped for %s: %s",
+                                   run_src.name, e)
+                    return False
+                generate_run_metadata(dest)
+                # The move changed the run's governing project:
+                # rewrite the pin to the adopting project so the
+                # projections below (and every later consumer)
+                # resolve HERE — the pre-move pin (a foreign project,
+                # or none) must not keep steering a run that now
+                # lives in this project.
+                from core.run.metadata import write_run_pin
+                write_run_pin(dest, project.name, "adopted")
             # An adopted run already had its completion, so the
             # projections that make its data VISIBLE (journal → index
             # merge, reads-manifest conversion, coverage snapshot)
@@ -1371,9 +1829,24 @@ class ProjectManager:
             # completion chokepoint infers the project from the run's
             # parent via checklist.json/coverage.json, which a
             # freshly retro-created project does not have yet.
+            # IMPORTED runs skip both projection lanes: import
+            # quarantined their trust-bearing artifacts, and adopting
+            # the run must not re-mint archive-supplied journal or
+            # coverage state as locally-earned (the chokepoint guard
+            # in project_run_projections is the shared refusal; the
+            # direct merge here mirrors it so the two lanes cannot
+            # drift).
+            try:
+                from core.project.findings_utils import run_is_imported
+                _imported = run_is_imported(dest)
+            except Exception:  # noqa: BLE001 — predicate is an aid, never a crash
+                _imported = False
+                logger.debug("adopt: imported-run check failed for %s",
+                             dest, exc_info=True)
             try:
                 from core.coverage.journal import merge_run_into_index
-                merged = merge_run_into_index(dest_base, dest)
+                merged = 0 if _imported else \
+                    merge_run_into_index(dest_base, dest)
                 if merged:
                     logger.info(
                         "adopt: %d journal entries merged into the "
@@ -1417,26 +1890,37 @@ class ProjectManager:
         # command. The metadata lock file survives the deletion.
         _run_remnants = (src / ".raptor-run.json.lock").exists()
         # And a src already INSIDE this project's output dir is a
-        # REPAIR, never an import of its subdirectories.
+        # REPAIR, never an import of its subdirectories. The project
+        # output dir ITSELF is the exception: it is never a single
+        # run, so `adopt <name> <project-dir>` means "sweep the
+        # children" (repairing/claiming each in place) — the pre-fix
+        # single-run route tried to shutil.move the dir into itself
+        # and warned "Cannot move a directory into itself".
         try:
-            _inside_project = src.resolve().is_relative_to(
-                project.output_path.resolve())
+            _src_res = src.resolve()
+            _proj_res = project.output_path.resolve()
+            _is_project_dir = _src_res == _proj_res
+            _inside_project = (not _is_project_dir
+                               and _src_res.is_relative_to(_proj_res))
         except (OSError, ValueError):
+            _is_project_dir = False
             _inside_project = False
-        _is_container = (not _inside_project
-                         and not _run_remnants
-                         and ((src / "project.json").is_file()
-                              or (_has_child_runs
-                                  and not is_run_directory(
-                                      src, strict=True))))
+        _is_container = (_is_project_dir
+                         or (not _inside_project
+                             and not _run_remnants
+                             and ((src / "project.json").is_file()
+                                  or (_has_child_runs
+                                      and not is_run_directory(
+                                          src, strict=True)))))
         # Inside-project and remnant-bearing dirs take the single-run
         # (repair) path even when the lenient match fails — a
         # marker-destroyed dir with an unprefixed name otherwise fell
         # through to the child-import loop, and the planted subdir was
         # adopted anyway.
-        if (_inside_project or _run_remnants
-                or (is_run_directory(src, strict=False)
-                    and not _is_container)):
+        if (not _is_project_dir
+                and (_inside_project or _run_remnants
+                     or (is_run_directory(src, strict=False)
+                         and not _is_container))):
             # Single run directory
             if _adopt_one(src):
                 added = 1
@@ -1483,8 +1967,8 @@ class ProjectManager:
         checklist build failure logs and leaves the pre-existing
         behaviour (snapshot deferred to the next lifecycle run).
         """
-        checklist_path = project.output_path / "checklist.json"
-        if checklist_path.exists() or not adopted:
+        from core.inventory import checklist_exists
+        if checklist_exists(project.output_path) or not adopted:
             return
         target = Path(project.target)
         if not target.exists():

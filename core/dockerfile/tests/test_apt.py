@@ -432,6 +432,61 @@ def test_truncated_var_substitution_skipped():
     assert pkgs == []
 
 
+def test_substitution_closing_fragment_not_laundered_into_package():
+    """``$(cat pkgs.txt)`` splits into ``$(cat`` and ``pkgs.txt)`` —
+    the paren strip ran BEFORE the substitution rejection, so the
+    closing fragment shed its ``)`` and landed in the inventory as a
+    phantom package ``pkgs.txt``. (A ``/``-prefixed fixture masked
+    this: the path rejection caught it for the wrong reason.)"""
+    src = "FROM ubuntu\nRUN apt-get install -y $(cat pkgs.txt)\n"
+    pkgs = extract_apt_packages(parse_dockerfile(src))
+    assert pkgs == []
+
+
+def test_substitution_middle_fragments_not_laundered():
+    """Middle tokens of a multi-word substitution look completely
+    clean (``a.txt`` carries no marker at all) — the whole span must
+    be dropped, while a real package NEXT TO the substitution is
+    still extracted (the miss direction)."""
+    src = "FROM ubuntu\nRUN apt-get install -y $(cat a.txt b.txt) curl\n"
+    pkgs = extract_apt_packages(parse_dockerfile(src))
+    assert [p.name for p in pkgs] == ["curl"]
+
+
+def test_backtick_substitution_span_not_laundered():
+    src = "FROM ubuntu\nRUN apt-get install -y `cat a.txt b.txt` curl\n"
+    pkgs = extract_apt_packages(parse_dockerfile(src))
+    assert [p.name for p in pkgs] == ["curl"]
+
+
+# ---------------------------------------------------------------------------
+# Background ``&`` is a command separator
+# ---------------------------------------------------------------------------
+
+
+def test_background_ampersand_separates_commands():
+    """``foo & apt-get install pkg`` starts a NEW command — the old
+    connector set kept ``apt-get`` inside foo's token list and
+    silently missed the install (the fail-open direction for SCA)."""
+    src = "FROM ubuntu\nRUN sleep 1 & apt-get install -y curl\n"
+    pkgs = extract_apt_packages(parse_dockerfile(src))
+    assert [p.name for p in pkgs] == ["curl"]
+
+
+def test_fused_background_ampersand_separates_commands():
+    src = "FROM ubuntu\nRUN sleep 1& apt-get install -y curl\n"
+    pkgs = extract_apt_packages(parse_dockerfile(src))
+    assert [p.name for p in pkgs] == ["curl"]
+
+
+def test_fd_dup_redirect_survives_ampersand_padding():
+    """``2>&1`` contains ``&`` — padding it must not eat the install's
+    packages or mint phantoms (the over-split direction)."""
+    src = "FROM ubuntu\nRUN apt-get install -y curl 2>&1 && apt-get install -y git\n"
+    pkgs = extract_apt_packages(parse_dockerfile(src))
+    assert [p.name for p in pkgs] == ["curl", "git"]
+
+
 # ---------------------------------------------------------------------------
 # Multi-stage stage attribution
 # ---------------------------------------------------------------------------
@@ -566,3 +621,36 @@ def test_redirection_tokens_are_not_packages():
     )
     pkgs = extract_apt_packages(insts)
     assert sorted(p.name for p in pkgs) == ["curl", "jq", "wget"]
+
+
+class TestTrailingHeredoc:
+    def test_trailing_heredoc_body_not_parsed_as_packages(self):
+        insts = parse_dockerfile(
+            "FROM debian\n"
+            "RUN apt-get install -y curl <<EOF\n"
+            "phantom-package\n"
+            "EOF\n"
+        )
+        assert [p.name for p in extract_apt_packages(insts)] == ["curl"]
+
+    def test_chomp_heredoc_variant_cut(self):
+        insts = parse_dockerfile(
+            "FROM debian\n"
+            "RUN apt-get install -y curl <<-MARK\n"
+            "\tphantom\n"
+            "MARK\n"
+        )
+        assert [p.name for p in extract_apt_packages(insts)] == ["curl"]
+
+    def test_quoted_angle_tokens_do_not_truncate(self):
+        insts = parse_dockerfile(
+            "FROM debian\n"
+            "RUN echo 'placeholder <<VERSION' && apt-get install -y curl\n"
+        )
+        assert [p.name for p in extract_apt_packages(insts)] == ["curl"]
+
+    def test_plain_install_unaffected(self):
+        insts = parse_dockerfile(
+            "FROM debian\nRUN apt-get install -y curl wget\n")
+        assert [p.name for p in extract_apt_packages(insts)] == [
+            "curl", "wget"]

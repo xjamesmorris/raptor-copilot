@@ -236,3 +236,18 @@ def test_dns_pinning_prevents_rebind_toctou():
 
         assert resp.status_code == 200
         assert handler.hits[-1]["path"] == "/pinned"
+
+
+def test_blocked_redirect_error_carries_destination():
+    """The scope block stays a ValueError (existing handlers keep
+    working) but callers can read WHERE the target tried to send the
+    scan — preflight uses it for the http->https guidance message."""
+    from packages.web.client import ScopeRedirectBlockedError
+
+    redirect_headers = {"Location": "https://elsewhere.example/landing"}
+    with _server(status=301, headers=redirect_headers) as (target, _):
+        client = WebClient(_base_url(target), block_private_ips=False)
+        with pytest.raises(ScopeRedirectBlockedError) as excinfo:
+            client.get("/")
+    assert isinstance(excinfo.value, ValueError)
+    assert excinfo.value.next_url == "https://elsewhere.example/landing"

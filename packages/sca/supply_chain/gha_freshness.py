@@ -47,6 +47,7 @@ import logging
 import re
 from collections.abc import Iterable
 
+from ..kinds import SUPPLYCHAIN_ID_PREFIX
 from ..models import (
     Confidence,
     Dependency,
@@ -166,7 +167,7 @@ def _build_finding(
         f"sunset window."
     )
     finding_id = (
-        f"sca:supplychain:gha_action_outdated:"
+        f"{SUPPLYCHAIN_ID_PREFIX}gha_action_outdated:"
         f"{dep.name}:{dep.version}".replace(" ", "_")
     )
     return SupplyChainFinding(

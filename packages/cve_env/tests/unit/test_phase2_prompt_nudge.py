@@ -53,16 +53,3 @@ def test_fix4_library_no_service_verify_guidance_present() -> None:
     assert "exec_check ONLY" in sp, "library-verify rule (exec_check only) missing"
     assert "http.createServer" in sp, "must warn against scaffolding a listener"
     assert "DROP that check and re-verify" in sp, "drop-and-re-verify guidance missing"
-
-
-def test_fix8_continuation_verify_imperative_present() -> None:
-    """#3b (2026-06-02): the fix8 continuation re-prompt (CONTINUATION_USER_PROMPT)
-    must IMPERATIVELY steer a launched env to verify, not exploratory Bash — tier-1
-    forensic (CVE-2022-25396) showed the agent doing Bash/Read instead of verify
-    after the gate fired. LOW-CONFIDENCE (prompt-follow-through); drift-locked so a
-    future edit can't silently drop it; efficacy measured on the next bench."""
-    from cve_env.agent.prompts import CONTINUATION_USER_PROMPT as p
-
-    assert "ALREADY running" in p
-    assert "ONLY next action is `verify`" in p
-    assert "do NOT call Bash/Read to inspect" in p

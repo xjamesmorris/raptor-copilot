@@ -326,7 +326,10 @@ repos:
     # The mypy main row + two additional dep rows.
     assert "mypy" in by_name
     assert "pydantic" in by_name
-    assert "types-PyYAML" in by_name
+    # PEP 503-normalised, like every other PyPI parser — OSV keys
+    # PyPI advisories on the normalised spelling.
+    assert "types-pyyaml" in by_name
+    assert "types-PyYAML" not in by_name
     assert by_name["pydantic"].ecosystem == "PyPI"
     assert by_name["pydantic"].version == ">=2.5"
     assert by_name["pydantic"].pin_style == PinStyle.RANGE
@@ -442,7 +445,7 @@ repos:
     deps = parse(p)
     addl = {d.name: d for d in deps if d.source_kind == "precommit_additional"}
     assert addl["pydantic"].source_extra["hook_id"] == "mypy"
-    assert addl["types-PyYAML"].source_extra["hook_id"] == "mypy-strict"
+    assert addl["types-pyyaml"].source_extra["hook_id"] == "mypy-strict"
 
 
 # ---------------------------------------------------------------------------
@@ -487,3 +490,80 @@ def test_addl_at_bare_version_stays_exact(tmp_path: Path) -> None:
     d = next(d for d in parse(p) if d.name == "eslint-config-x")
     assert d.pin_style is PinStyle.EXACT
     assert d.version == "8.57.0"
+
+
+def test_additional_dependencies_pypi_names_pep503_normalised(tmp_path):
+    """Non-canonical PyPI spellings in additional_dependencies must be
+    PEP 503-folded — the as-written form breaks OSV matching and
+    join-key parity with every other PyPI parser."""
+    p = _write(tmp_path, """\
+repos:
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.11.2
+    hooks:
+      - id: mypy
+        additional_dependencies: ["Flask_SQLAlchemy==3.1.1"]
+""")
+    deps = parse(p)
+    by_name = {d.name: d for d in deps}
+    assert "flask-sqlalchemy" in by_name
+    assert by_name["flask-sqlalchemy"].version == "3.1.1"
+
+
+def test_additional_dependencies_npm_names_case_folded(tmp_path):
+    """The npm arm routes through the same canonical fold as PyPI
+    (``naming.fold_name`` lowercases npm, matching the inline-install
+    producer) — a hand-rolled PyPI-only special case left as-written
+    npm casing breaking join-key parity, scoped names included."""
+    p = _write(tmp_path, """\
+repos:
+  - repo: https://github.com/pre-commit/mirrors-eslint
+    rev: v9.10.0
+    hooks:
+      - id: eslint
+        additional_dependencies:
+          - "ESLint-Plugin-Foo@2.0.0"
+          - "@Scope/Name@1.0.0"
+""")
+    deps = parse(p)
+    by_name = {d.name: d for d in deps}
+    assert "eslint-plugin-foo" in by_name
+    assert by_name["eslint-plugin-foo"].version == "2.0.0"
+    assert "@scope/name" in by_name
+    assert by_name["@scope/name"].version == "1.0.0"
+
+
+def test_repo_map_loaded_once_per_parse(tmp_path, monkeypatch):
+    """The curated repo-map is one JSON file: `parse` loads it once and
+    hands it to the per-entry extractor — re-loading per repos-entry
+    was an N+1 file read/parse on every config."""
+    import packages.sca.parsers.precommit as pc
+
+    calls = {"n": 0}
+    real = pc._load_repo_map
+
+    def _counting():
+        calls["n"] += 1
+        return real()
+
+    monkeypatch.setattr(pc, "_load_repo_map", _counting)
+    p = _write(tmp_path, """\
+repos:
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.11.2
+    hooks:
+      - id: mypy
+        additional_dependencies: ["pydantic>=2.5"]
+  - repo: https://github.com/pre-commit/mirrors-eslint
+    rev: v9.10.0
+    hooks:
+      - id: eslint
+        additional_dependencies: ["eslint-plugin-foo@2.0.0"]
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.0
+    hooks:
+      - id: ruff
+""")
+    deps = pc.parse(p)
+    assert deps  # non-vacuous
+    assert calls["n"] == 1

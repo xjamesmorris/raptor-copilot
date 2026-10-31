@@ -52,6 +52,25 @@ def _have_toolchain() -> bool:
                                          "objdump", "readelf"))
 
 
+# Per-test toolchain gates for tests that compile their own binaries
+# instead of using the ``built_demo`` fixture (whose skip lives in the
+# fixture body). Skip-or-hermetic: a toolchain-less runner must skip,
+# never ERROR with FileNotFoundError. The classifier the compiled
+# binaries feed shells out to nm/objdump/readelf, so those join the
+# compiler in each gate.
+_needs_cc = pytest.mark.skipif(
+    not all(shutil.which(t) for t in ("gcc", "nm", "objdump", "readelf")),
+    reason="gcc toolchain (gcc/nm/objdump/readelf) not available",
+)
+_needs_cxx = pytest.mark.skipif(
+    not all(shutil.which(t) for t in ("g++", "nm", "objdump", "readelf")),
+    reason="g++ toolchain (g++/nm/objdump/readelf) not available",
+)
+_needs_strip = pytest.mark.skipif(
+    not shutil.which("strip"), reason="strip not available",
+)
+
+
 @pytest.fixture(scope="module")
 def built_demo(tmp_path_factory):
     """Build the fixture's ``demo`` binary in a tmp copy of the fixture dir
@@ -248,7 +267,6 @@ def test_enrich_operator_command_build_keeps_suppression(
 
 
 @pytest.mark.slow
-@pytest.mark.slow
 def test_guessed_build_never_reaches_the_suppression_gates(
         built_demo: Path) -> None:
     """S5.4 adversarial-review F1: the summary flag is decorative — the
@@ -439,6 +457,8 @@ def test_classifier_does_not_crash_on_stripped_real_binary() -> None:
     ls = Path("/usr/bin/ls")
     if not ls.exists():
         pytest.skip("/usr/bin/ls not present")
+    if not all(shutil.which(t) for t in ("nm", "objdump", "readelf")):
+        pytest.skip("binutils (nm/objdump/readelf) not available")
     v = classify_binary_evidence(["main", "no_such_function"], ls)
     assert isinstance(v, dict)
     assert read_build_id(ls)
@@ -449,6 +469,8 @@ def test_classifier_does_not_crash_on_stripped_real_binary() -> None:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.slow
+@_needs_cc
+@_needs_strip
 def test_classifier_falls_back_to_symbol_only_on_stripped_binary(
     tmp_path: Path,
 ) -> None:
@@ -483,6 +505,7 @@ def test_classifier_falls_back_to_symbol_only_on_stripped_binary(
 
 
 @pytest.mark.slow
+@_needs_strip
 def test_inventory_earns_suppression_downgrades_for_stripped(
     tmp_path: Path, built_demo: Path,
 ) -> None:
@@ -597,6 +620,7 @@ def test_strip_ipa_suffix_handles_gcc_clone_patterns() -> None:
 
 
 @pytest.mark.slow
+@_needs_cxx
 def test_classifier_treats_internal_linkage_with_low_pc_as_present(
     tmp_path: Path,
 ) -> None:
@@ -627,6 +651,7 @@ def test_classifier_treats_internal_linkage_with_low_pc_as_present(
 
 
 @pytest.mark.slow
+@_needs_cxx
 def test_classifier_qualifies_cpp_methods_with_namespace(
     tmp_path: Path,
 ) -> None:
@@ -663,6 +688,8 @@ def _nm_qualified_cpp_binary(tmp_path_factory):
     on CI runners can take ~30s for a 2-line program). Used only by
     ``test_nm_index_stores_qualified_no_args_form_for_cpp``."""
     import subprocess as _sp
+    if not all(shutil.which(t) for t in ("g++", "nm")):
+        pytest.skip("g++ toolchain (g++/nm) not available")
     work = tmp_path_factory.mktemp("nm_qualified")
     src = work / "x.cc"
     src.write_text(
@@ -693,6 +720,7 @@ def test_nm_index_stores_qualified_no_args_form_for_cpp(
 
 
 @pytest.mark.slow
+@_needs_cc
 def test_classifier_recognises_always_inline_empty_body(
     tmp_path: Path,
 ) -> None:
@@ -772,6 +800,7 @@ def test_build_inventory_swallows_enrichment_errors(
 
 
 @pytest.mark.slow
+@_needs_cc
 def test_enrich_combines_multi_binary_verdicts_with_alive_in_any_wins(
     tmp_path: Path,
 ) -> None:
@@ -904,6 +933,9 @@ def _planted_unrelated_binary(tmp_path_factory):
     nothing to do with the analysed source tree.
     """
     import subprocess as _sp
+    if not all(shutil.which(t) for t in ("gcc", "nm", "objdump",
+                                         "readelf")):
+        pytest.skip("gcc toolchain (gcc/nm/objdump/readelf) not available")
     work = tmp_path_factory.mktemp("planted_binary")
     src = work / "hostile.c"
     src.write_text(
@@ -1338,3 +1370,51 @@ def test_inline_marker_subprogram_also_indexes_bare_name(monkeypatch, tmp_path):
     fake_bin.write_bytes(b"\x7fELF-stub")
     verdicts = bo_mod.classify_binary_evidence(["tr_static_init"], fake_bin)
     assert verdicts["tr_static_init"].classification == "inlined"
+
+
+class TestHostileBytesEscapedInLogs:
+    """Tool stderr over a hostile ELF and scanned-repo file paths are
+    attacker bytes; the operator-facing log records must carry them
+    escaped (core.security.log_sanitisation), never raw — a crafted
+    section name can otherwise drive OSC/CSI onto the terminal."""
+
+    _ESC_STDERR = "boom \x1b]0;pwned\x07 tail"
+
+    def test_run_status_escapes_stderr_and_path(self, monkeypatch, caplog):
+        import logging
+
+        import core.sandbox as _sb
+        from core.analysis.binary_oracle import _run_status
+
+        class _Proc:
+            returncode = 1
+            stderr = TestHostileBytesEscapedInLogs._ESC_STDERR
+            stdout = ""
+
+        monkeypatch.setattr(_sb, "run", lambda *a, **k: _Proc())
+        with caplog.at_level(logging.WARNING):
+            out, ok = _run_status(["readelf", "-n", "/tmp/x\x1b[2Jy"])
+        assert (out, ok) == ("", False)
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "\x1b" not in joined
+        assert "\\x1b" in joined
+
+    def test_stream_escapes_stderr_on_nonzero_rc(self, monkeypatch, caplog):
+        import logging
+
+        import core.sandbox as _sb
+        from core.analysis.binary_oracle import _stream
+
+        class _Proc:
+            returncode = 2
+            stderr = TestHostileBytesEscapedInLogs._ESC_STDERR
+            stdout = ""
+
+        monkeypatch.setattr(_sb, "run", lambda *a, **k: _Proc())
+        with caplog.at_level(logging.WARNING):
+            lines = list(_stream(["objdump", "--dwarf=info", "/tmp/x"],
+                                 timeout=5))
+        assert lines == []
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "\x1b" not in joined
+        assert "\\x1b" in joined

@@ -83,8 +83,17 @@ def test_dispute_bench_refused(stub) -> None:
     assert v.verdict == Verdict.DISPUTE
 
 
-def test_orphan_on_fetch_error(stub) -> None:
+def test_unknown_on_transient_fetch_error(stub) -> None:
+    # A transient failure (outage/quota) means the oracle could not
+    # look — that must never read as a don't-penalize ORPHAN.
     for _ in range(6):
         stub.add(status=500)
+    v = verify("CVE-2024-0001", "curl/curl", "abc1234", _client())
+    assert v.verdict == Verdict.UNKNOWN
+    assert "transient" in (v.notes or "")
+
+
+def test_orphan_on_definitive_404(stub) -> None:
+    stub.add(status=404)
     v = verify("CVE-2024-0001", "curl/curl", "abc1234", _client())
     assert v.verdict == Verdict.ORPHAN

@@ -23,6 +23,7 @@ plug into the same schema.
 from __future__ import annotations
 
 import argparse
+import datetime
 import random
 import re
 import sqlite3
@@ -64,8 +65,14 @@ _ECOSYSTEM_LANG = {
 # coverage (4 originals + the 2 expansions in cvefix_loader.INJECTION_CWES).
 _DEFAULT_CWES = ("CWE-22", "CWE-78", "CWE-79", "CWE-89", "CWE-94", "CWE-918")
 
-# Default year range — 2024-2026 is the post-CVEfixes-v1.0.8 slice.
-_DEFAULT_YEARS = ("2024", "2025", "2026")
+# Default year range — 2024 (the post-CVEfixes-v1.0.8 boundary)
+# through the CURRENT year, derived at import: a hardcoded upper year
+# silently stopped covering new advisories every January.
+_POST_CVEFIXES_YEAR = 2024
+_DEFAULT_YEARS = tuple(
+    str(y) for y in range(_POST_CVEFIXES_YEAR,
+                          datetime.date.today().year + 1)
+)
 
 # ``github.com/owner/repo/commit/sha`` — strict, full SHA preferred but
 # accept 7-40 hex chars (GHSA refs sometimes use shortened SHAs).  We
@@ -150,9 +157,9 @@ def _pick_cwe_eco(adv: dict, cwes: set, ecosystems: set) -> tuple[str, str]:
     )
     adv_ecos = sorted(
         {(a.get("package") or {}).get("ecosystem")
-         for a in adv.get("affected") or []} & ecosystems
+         for a in adv.get("affected") or []} & ecosystems  # type: ignore[type-var]
     )
-    return adv_cwes[0], adv_ecos[0]
+    return str(adv_cwes[0]), str(adv_ecos[0])
 
 
 # ---------------------------------------------------------------------------
@@ -197,22 +204,25 @@ def _resolve_parent(repo_url: str, fix_hash: str, timeout: int = 60) -> str | No
                            check=True, timeout=15, capture_output=True,
                            env=_env, preexec_fn=_pds)
             r = subprocess.run(
+                # "--" pins the hash as a positional refspec — same
+                # belt-and-braces as cvefix_walk's documented fetch
+                # (the hex validation upstream is the primary gate).
                 safe_git_command("-C", str(td_p), "fetch", "-q", "--depth", "2",
-                                 "origin", fix_hash),
+                                 "origin", "--", fix_hash),
                 check=False, timeout=timeout, capture_output=True,
                 env=_env, preexec_fn=_pds,
             )
             if r.returncode != 0:
                 return None
-            r = subprocess.run(
+            r2 = subprocess.run(
                 safe_git_readonly_command(
                     "-C", str(td_p), "rev-list", "--parents", "-n", "1", fix_hash),
                 check=False, timeout=15, capture_output=True, text=True,
                 env=_env, preexec_fn=_pds,
             )
-            if r.returncode != 0:
+            if r2.returncode != 0:
                 return None
-            parts = r.stdout.split()
+            parts = r2.stdout.split()
             # `rev-list --parents -n 1 <sha>` -> "<sha> <parent1> [<parent2> ...]"
             # We want the single-parent case: exactly one parent.  Merge
             # commits (2+ parents) and roots (0 parents) are deliberately

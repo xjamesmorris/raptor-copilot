@@ -26,6 +26,7 @@ import sqlite3
 import stat
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,6 +37,7 @@ from core.git.clone import (
     safe_git_command,
     safe_git_readonly_command,
 )
+from core.sarif.parser import SARIF_MAX_BYTES
 
 # CodeQL resource tunables live in ``packages.codeql`` — the central
 # home for all CodeQL-related utilities.  We re-export the type at the
@@ -48,6 +50,12 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 DEFAULT_CODEQL_BIN = "codeql"
+
+# CodeQL SARIF over corpus code — the SARIF budget class shared with
+# core.sarif.parser.load_sarif (one constant, aliased for the local
+# call sites; the cap-parity test derives its universe from this
+# alias name).
+_MAX_SARIF_BYTES = SARIF_MAX_BYTES
 
 # Abbreviated-to-full commit hash, hex only — the same shape the GHSA
 # harvester enforces at parse time. CVEfixes-DB metadata is only
@@ -383,8 +391,7 @@ def _count_query(db: Path, query: str, out: Path, codeql_bin: str, timeout: int,
     if not _run(cmd, timeout):
         return None
     from core.json import load_json
-    # 100 MiB: canonical SARIF budget (matches core.sarif.parser).
-    data = load_json(out, max_bytes=100 * 1024 * 1024)
+    data = load_json(out, max_bytes=_MAX_SARIF_BYTES)
     if data is None:
         return None
     return sum(len(r.get("results") or []) for r in (data.get("runs") or []))
@@ -454,9 +461,16 @@ def process_pair(
         else "autobuild" if lang in _AUTOBUILD_ONLY
         else None
     )
-    repo = work_dir / "repo"
-    db_a, db_b = work_dir / "db-a", work_dir / "db-b"
-    sa, sb = work_dir / "a.sarif", work_dir / "b.sarif"
+    # Unique per-invocation scratch: the subpath names used to be
+    # fixed ("repo", "db-a", ...), so two walkers sharing a work dir
+    # interleaved clone/build state mid-run and the loser persisted
+    # wrong-commit counts as normal rows (the finally-rmtree of one
+    # invocation deleted the other's in-flight tree). No attacker
+    # input in the name — pid + random suffix only.
+    scratch = work_dir / f"pair-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    repo = scratch / "repo"
+    db_a, db_b = scratch / "db-a", scratch / "db-b"
+    sa, sb = scratch / "a.sarif", scratch / "b.sarif"
     try:
         if not _fetch_pair(pair.repo_url, pair.fix_hash, repo, fetch_timeout):
             return WalkResult(pair.fix_hash, "fetch_fail")
@@ -481,8 +495,13 @@ def process_pair(
         # extraction fails).  Java's Maven cache doesn't have this
         # conflict shape — version conflicts resolve last-write-wins —
         # so cross-pair Maven reuse is fine and we leave it alone.
-        if lang in _AUTOBUILD_PROFILES and lang == "go":
+        # (The autobuild env keys the caches off db.parent, which is
+        # now this invocation's scratch dir; work_dir is swept too for
+        # caches left by pre-scratch layouts.)
+        if lang == "go":
+            _clean_go_caches(scratch)
             _clean_go_caches(work_dir)
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 # --- resumable results store ---
@@ -516,7 +535,7 @@ def walk(
     db_path: Path, results_db: Path, *,
     cwes: Sequence[str] = INJECTION_CWES,
     languages=("Python", "JavaScript", "TypeScript"),
-    work_dir: Path = Path("/data/corpus/clones/walk"),
+    work_dir: Path,
     codeql_bin: str = DEFAULT_CODEQL_BIN,
     limit: int | None = None,
     fetch_timeout: int = 150,
@@ -584,7 +603,7 @@ def walk(
 
 def promote_misses(
     results_db: Path, *,
-    work_dir: Path = Path("/data/corpus/clones/promote"),
+    work_dir: Path,
     codeql_bin: str = DEFAULT_CODEQL_BIN,
     promote_languages: Sequence[str] = ("Java",),
     build_timeout: int = 600,
@@ -647,9 +666,12 @@ def main(argv=None) -> None:
     import argparse
 
     ap = argparse.ArgumentParser(description="Walk CVEfixes pairs through CodeQL, harvest yielders.")
-    ap.add_argument("--db", type=Path, default=Path("/data/corpus/cvefixes-meta.db"))
-    ap.add_argument("--results", type=Path, default=Path("/data/corpus/walk-results.db"))
-    ap.add_argument("--work-dir", type=Path, default=Path("/data/corpus/clones/walk"))
+    # Required: these used to default to one specific corpus host's
+    # /data/corpus layout — a machine detail that doesn't belong in the
+    # repo and misdirected every other host.
+    ap.add_argument("--db", type=Path, required=True)
+    ap.add_argument("--results", type=Path, required=True)
+    ap.add_argument("--work-dir", type=Path, required=True)
     ap.add_argument("--languages", nargs="+", default=["Python", "JavaScript", "TypeScript"])
     ap.add_argument("--cwes", nargs="+", default=list(INJECTION_CWES))
     ap.add_argument("--codeql-bin", default=DEFAULT_CODEQL_BIN)

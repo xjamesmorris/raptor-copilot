@@ -608,3 +608,89 @@ def test_strip_descriptor_glob_segment_skipped():
 
 def test_strip_descriptor_chain_child_with_selector():
     assert _strip_descriptor("@scope/parent/child@npm:^1.0") == "child"
+
+
+# ---------------------------------------------------------------------------
+# Workspace-root walk bounds — scan root / .git / depth cap
+# ---------------------------------------------------------------------------
+
+def test_pnpm_walk_stops_at_git_boundary(tmp_path: Path) -> None:
+    """A stray pnpm-workspace.yaml ABOVE the repo's .git boundary
+    (a sibling-checkout / operator file) must not be adopted."""
+    (tmp_path / "pnpm-workspace.yaml").write_text(
+        "catalog:\n  react: ^18.0.0\n")
+    repo = tmp_path / "checkout"
+    (repo / ".git").mkdir(parents=True)
+    member = repo / "packages" / "app"
+    member.mkdir(parents=True)
+
+    assert find_workspace_root(member) is None
+
+
+def test_pnpm_walk_stops_at_scan_root(tmp_path: Path) -> None:
+    """With a declared scan root, a pnpm-workspace.yaml above it is
+    outside the target and must not steer catalog resolution — even
+    when no .git exists (extracted-tarball scans)."""
+    from packages.sca.parsers._safe_read import scan_root_context
+
+    (tmp_path / "pnpm-workspace.yaml").write_text(
+        "catalog:\n  react: ^18.0.0\n")
+    target = tmp_path / "extracted"
+    member = target / "packages" / "app"
+    member.mkdir(parents=True)
+
+    with scan_root_context(target):
+        assert find_workspace_root(member) is None
+    # Yaml INSIDE the scan root is still found.
+    (target / "pnpm-workspace.yaml").write_text(
+        "catalog:\n  react: ^18.0.0\n")
+    with scan_root_context(target):
+        assert find_workspace_root(member) == target
+
+
+def test_pnpm_walk_depth_capped(tmp_path: Path) -> None:
+    (tmp_path / "pnpm-workspace.yaml").write_text("catalog: {}\n")
+    deep = tmp_path
+    for i in range(14):
+        deep = deep / f"d{i}"
+    deep.mkdir(parents=True)
+    assert find_workspace_root(deep) is None
+
+
+def test_npm_workspace_walk_stops_at_git_boundary(tmp_path: Path) -> None:
+    """An operator package.json with a permissive ``workspaces`` glob
+    above the checkout must not become the workspace root (and must
+    not even be read as workspace metadata)."""
+    from packages.sca.parsers._pnpm_catalog import find_npm_workspace_root
+
+    _write_pkg(tmp_path / "package.json",
+               {"name": "operator", "workspaces": ["**"]})
+    repo = tmp_path / "checkout"
+    (repo / ".git").mkdir(parents=True)
+    member = repo / "app"
+    member.mkdir()
+    _write_pkg(member / "package.json", {"name": "app"})
+
+    assert find_npm_workspace_root(member / "package.json") is None
+
+
+def test_npm_workspace_walk_stops_at_scan_root(tmp_path: Path) -> None:
+    from packages.sca.parsers._pnpm_catalog import find_npm_workspace_root
+    from packages.sca.parsers._safe_read import scan_root_context
+
+    _write_pkg(tmp_path / "package.json",
+               {"name": "operator", "workspaces": ["**"]})
+    target = tmp_path / "extracted"
+    member = target / "app"
+    member.mkdir(parents=True)
+    _write_pkg(member / "package.json", {"name": "app"})
+
+    with scan_root_context(target):
+        assert find_npm_workspace_root(member / "package.json") is None
+
+    # A root INSIDE the scan target still resolves.
+    _write_pkg(target / "package.json",
+               {"name": "mono", "workspaces": ["app"]})
+    with scan_root_context(target):
+        assert (find_npm_workspace_root(member / "package.json")
+                == target)

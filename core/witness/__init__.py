@@ -34,7 +34,12 @@ from core.witness.matching import (
     best_match_for_finding,
     score_witness_for_finding,
 )
-from core.witness.sandbox_outcome import outcome_from_sandbox_info
+from core.witness.sandbox_outcome import (
+    UNVERIFIABLE_ENVIRONMENT,
+    outcome_from_sandbox_info,
+    refusal_detail,
+    refusal_summary_line,
+)
 from core.witness.store import WitnessStore, WitnessStoreError
 from core.witness.types import (
     Witness,
@@ -44,6 +49,7 @@ from core.witness.types import (
 )
 
 __all__ = [
+    "UNVERIFIABLE_ENVIRONMENT",
     "Witness",
     "WitnessMatch",
     "WitnessOutcome",
@@ -55,5 +61,7 @@ __all__ = [
     "discover_witness_stores",
     "iter_visible_witnesses",
     "outcome_from_sandbox_info",
+    "refusal_detail",
+    "refusal_summary_line",
     "score_witness_for_finding",
 ]

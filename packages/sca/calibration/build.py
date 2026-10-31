@@ -29,6 +29,9 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import threading
+import weakref
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -116,7 +119,10 @@ def build_corpus(
 
     if http is None:
         from core.http import default_client
-        http = default_client()
+        # Fixed-host scheduled job: pass the known source hosts as the
+        # egress allowlist (repo standard — "production paths SHOULD
+        # pass an allowlist"). Injected clients bypass this by design.
+        http = default_client(allowed_hosts=_CORPUS_SOURCE_HOSTS)
 
     if sources is None:
         sources = ["kev", "epss", "exploitdb", "metasploit",
@@ -124,6 +130,14 @@ def build_corpus(
 
     if jobs <= 0:
         jobs = min(len(sources), 8) or 1
+
+    # Fresh EDB CSV per build: an injected long-lived client must not
+    # reuse a previous build's download.
+    with _EDB_FETCH_LOCK:
+        try:
+            _EDB_FETCH_MEMO.pop(http, None)
+        except TypeError:
+            pass
 
     results: list[BuildResult | None] = [None] * len(sources)
     if jobs <= 1 or len(sources) <= 1:
@@ -186,15 +200,58 @@ def _build_kev(out_dir: Path, http: Any) -> BuildResult:
     )
 
 
-# Exploit-DB index CSV. Fetched by BOTH _build_exploitdb and
-# _build_github_poc (the latter re-parses it for github.com PoC URLs),
-# so it lives here as a single source of truth. The ``HEAD`` ref
+# Exploit-DB index CSV. Parsed by BOTH _build_exploitdb and
+# _build_github_poc (the latter re-parses it for github.com PoC URLs)
+# but downloaded once per build via _fetch_edb_csv. The ``HEAD`` ref
 # resolves to the repo's default branch at request time (GitLab raw
 # honours HEAD), so a branch rename upstream can't 404 us.
+# Every remote host the corpus builders talk to. Passed as the egress
+# allowlist when build_corpus constructs its own client.
+_CORPUS_SOURCE_HOSTS = [
+    "www.cisa.gov",
+    "gitlab.com",
+    "raw.githubusercontent.com",
+    "api.first.org",
+    "api.osv.dev",
+    "codeload.github.com",
+]
+
 _EDB_CSV_URL = (
     "https://gitlab.com/exploit-database/exploitdb/-/raw/HEAD/"
     "files_exploits.csv"
 )
+
+# One EDB CSV download per corpus build. Both EDB-derived builders
+# parse the same ~64MB index, and under the default parallel pool
+# they used to start two concurrent downloads of it. Memoised per
+# http client (build_corpus constructs one client per run and clears
+# its entry up front, so the memo's lifetime is exactly one build);
+# the weak keying drops the bytes with the client.
+_EDB_FETCH_LOCK = threading.Lock()
+_EDB_FETCH_MEMO: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _fetch_edb_csv(http: Any) -> bytes:
+    """Fetch (or reuse) the Exploit-DB index CSV for this build.
+
+    The lock spans the download deliberately: the second builder
+    blocks until the first fetch lands, then reuses the bytes.
+    Clients that can't be weak-referenced fall back to a plain
+    fetch (still correct, just unshared).
+    """
+    with _EDB_FETCH_LOCK:
+        try:
+            cached = _EDB_FETCH_MEMO.get(http)
+        except TypeError:
+            cached = None
+        if cached is not None:
+            return cached
+        raw = http.get_bytes(_EDB_CSV_URL, max_bytes=64 * 1024 * 1024)
+        try:
+            _EDB_FETCH_MEMO[http] = raw
+        except TypeError:
+            pass
+        return raw
 
 
 def _build_exploitdb(out_dir: Path, http: Any) -> BuildResult:
@@ -222,7 +279,7 @@ def _build_exploitdb(out_dir: Path, http: Any) -> BuildResult:
     import csv
     import io
 
-    raw = http.get_bytes(_EDB_CSV_URL, max_bytes=64 * 1024 * 1024)
+    raw = _fetch_edb_csv(http)
     text = raw.decode("utf-8", errors="replace")
     reader = csv.DictReader(io.StringIO(text))
     cve_to_ids: dict[str, list[int]] = {}
@@ -372,7 +429,7 @@ def _build_github_poc(out_dir: Path, http: Any) -> BuildResult:
     import csv
     import io
 
-    raw = http.get_bytes(_EDB_CSV_URL, max_bytes=64 * 1024 * 1024)
+    raw = _fetch_edb_csv(http)
     text = raw.decode("utf-8", errors="replace")
     reader = csv.DictReader(io.StringIO(text))
     cve_to_urls: dict[str, list[str]] = {}
@@ -453,7 +510,16 @@ def _msf_ref_to_cve(ref: Any) -> str | None:
             return ref
         return None
     if isinstance(ref, dict) and ref.get("type") == "CVE":
-        cve_num = ref.get("ref") or ""
+        raw = ref.get("ref")
+        # Feed rows have shipped integer refs; a non-str here used
+        # to AttributeError on .startswith and abort the WHOLE
+        # metasploit source build for the run (caught upstream as
+        # source-skipped, prior file silently retained).
+        if not isinstance(raw, (str, int)):
+            # None, and container shapes that would stringify into
+            # garbage signal keys.
+            return None
+        cve_num = raw if isinstance(raw, str) else str(raw)
         if cve_num and not cve_num.startswith("CVE-"):
             cve_num = f"CVE-{cve_num}"
         return cve_num or None
@@ -483,6 +549,7 @@ def _build_epss(out_dir: Path, http: Any) -> BuildResult:
     offset = 0
     total: int | None = None
     pages = 0
+    rejected = 0
     while pages < _EPSS_MAX_PAGES:
         pages += 1
         url = f"{_EPSS_BASE_URL}&limit={_EPSS_PAGE_SIZE}&offset={offset}"
@@ -501,6 +568,20 @@ def _build_epss(out_dir: Path, http: Any) -> BuildResult:
                 score = float(entry["epss"])
                 percentile = float(entry["percentile"])
             except (TypeError, ValueError):
+                continue
+            # Both fields are probabilities: finite and within
+            # [0, 1] inclusive (mirrors core.cve.epss._valid_score,
+            # the ingest-side guard for the same FIRST.org feed).
+            # Float-parseable poison ("NaN", "Infinity", "1e999",
+            # 7.5) otherwise lands in the repo-committed corpus
+            # artifact: bare NaN/Infinity tokens make the whole
+            # file spec-invalid JSON — every strict consumer drops
+            # the entire label source — and out-of-range scores
+            # corrupt numeric consumers.
+            if not (math.isfinite(score) and 0.0 <= score <= 1.0
+                    and math.isfinite(percentile)
+                    and 0.0 <= percentile <= 1.0):
+                rejected += 1
                 continue
             signals[cve] = {
                 "epss": score,
@@ -523,6 +604,11 @@ def _build_epss(out_dir: Path, http: Any) -> BuildResult:
             "sca.calibration: EPSS fetch hit the %d-page ceiling "
             "(offset=%d, total=%s) — corpus may be truncated",
             _EPSS_MAX_PAGES, offset, total,
+        )
+    if rejected:
+        logger.warning(
+            "sca.calibration: EPSS feed: rejected %d row(s) with "
+            "non-finite or out-of-range epss/percentile", rejected,
         )
     output = {
         "_source": {
@@ -687,6 +773,15 @@ def _build_osv_evidence(out_dir: Path, http: Any) -> BuildResult:
 # an exploit. We already capture vulnerability-knowledge via OSV's
 # core advisory graph; this signal is specifically for "exploit
 # code is one click away".
+#
+# Hand-curated universe feeding a ground-truth label source —
+# accepted deliberately (which hosts publish EXPLOITS is operator
+# judgment; no mechanical source exists). Named refresh trigger:
+# review when osv_evidence record_count stalls while the corpus
+# grows, or when EVIDENCE refs to an unlisted exploit-archive host
+# start appearing — the emitted ``exploit_host_allowlist``
+# provenance block makes the active universe auditable per
+# snapshot.
 _OSV_EVIDENCE_EXPLOIT_HOSTS = frozenset({
     "exploit-db.com",
     "packetstormsecurity.com",
@@ -809,7 +904,7 @@ def _build_vulnrichment(out_dir: Path, http: Any) -> BuildResult:
     files_scanned = 0
     with gzip.GzipFile(fileobj=io.BytesIO(raw)) as gz:
         capped = _CappedReader(gz, max_decompressed)
-        with tarfile.open(fileobj=capped, mode="r|") as tar:
+        with tarfile.open(fileobj=capped, mode="r|") as tar:  # type: ignore[call-overload]
             for member in tar:
                 if not member.isfile():
                     continue
@@ -964,8 +1059,13 @@ def _write_if_changed(
     timestamp churn doesn't trigger spurious diffs). Returns a
     BuildResult with ``written`` reflecting whether disk changed.
     """
+    # allow_nan=False: belt-and-braces against any builder letting a
+    # non-finite float through — a bare NaN/Infinity token would make
+    # the committed artifact spec-invalid JSON and strict consumers
+    # would silently lose the whole label source.
     new_bytes = json.dumps(
         data, indent=2, sort_keys=True, ensure_ascii=False,
+        allow_nan=False,
     ).encode("utf-8") + b"\n"
     if path.exists():
         try:
@@ -977,7 +1077,12 @@ def _write_if_changed(
                 source=source, written=False, error=None,
                 record_count=record_count,
             )
-    path.write_bytes(new_bytes)
+    # Atomic (tmp + rename), like every other calibration writer: a
+    # crash mid-write left torn JSON that the ground-truth loaders
+    # warn-and-skip — silently dropping a whole label source from
+    # validation/refit until the next weekly refresh.
+    from core.atomic_fs import write_bytes_atomically
+    write_bytes_atomically(path, new_bytes)
     return BuildResult(
         source=source, written=True, error=None,
         record_count=record_count,

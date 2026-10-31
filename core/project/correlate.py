@@ -14,8 +14,12 @@ from typing import Any
 from core.json import load_json
 from core.run import load_run_metadata
 
+from .anchor_join import (
+    AnchorJoin,
+    build_anchor_join,
+    load_project_span_index,
+)
 from .findings_utils import (
-    dedup_key,
     finding_file,
     load_findings_from_dir,
     safe_run_mtime,
@@ -66,6 +70,145 @@ def get_finding_status(finding: dict) -> str:
 
 # --- Main entry point ---
 
+
+def correlate_sandbox_triage(
+    run_dirs: list[Path],
+) -> dict[str, Any] | None:
+    """Campaign-level aggregation of sandbox denial triage across runs.
+
+    Groups runs by target path and clusters ``(category, example)``
+    signatures, computing persistence (fraction of triage-bearing runs
+    where each signature appeared) and trend (new/stable/resolved).
+
+    Returns ``None`` when no runs carry triage data.
+    """
+    from core.sandbox.summary import SUMMARY_FILE
+
+    _MAX_HISTORY = 50
+    _MAX_EXAMPLES = 10
+    _TRIAGE_CATEGORIES = (
+        "escape_primitives", "network_probing", "udp_egress",
+        "filesystem_escape", "routine",
+    )
+
+    per_target: dict[str, list[dict]] = defaultdict(list)
+    for d in run_dirs:
+        summary = load_json(d / SUMMARY_FILE)
+        if not isinstance(summary, dict):
+            continue
+        triage = summary.get("triage")
+        if not isinstance(triage, dict):
+            continue
+        meta = load_run_metadata(d)
+        target = (meta or {}).get("target_path", "unknown")
+        ts = (meta or {}).get("started_at", "")
+        per_target[target].append({
+            "run": d.name,
+            "triage": triage,
+            "ts": ts,
+        })
+
+    if not per_target:
+        return None
+
+    targets: dict[str, Any] = {}
+    all_severities: list[str] = []
+
+    for target, entries in sorted(per_target.items()):
+        entries.sort(key=lambda e: e["ts"])
+        n = len(entries)
+
+        sigs: dict[str, dict[str, Any]] = {}
+        for cat in _TRIAGE_CATEGORIES:
+            runs_with_cat = []
+            all_examples: set[str] = set()
+            total = 0
+            for e in entries:
+                bucket = e["triage"].get(cat) or {}
+                count = bucket.get("count", 0)
+                if count > 0:
+                    runs_with_cat.append(e)
+                    total += count
+                    all_examples.update(bucket.get("examples", []))
+
+            runs_seen = len(runs_with_cat)
+            persistence = runs_seen / n if n else 0.0
+
+            # Trend detection (adaptive window)
+            if n == 0:
+                trend = "stable"
+            elif n == 1:
+                trend = "new" if runs_seen else "stable"
+            else:
+                window = min(3, n - 1)
+                recent = entries[-window:]
+                earlier = entries[:-window]
+                in_recent = any(
+                    (e["triage"].get(cat) or {}).get("count", 0) > 0
+                    for e in recent
+                )
+                in_earlier = any(
+                    (e["triage"].get(cat) or {}).get("count", 0) > 0
+                    for e in earlier
+                )
+                if in_recent and not in_earlier:
+                    trend = "new"
+                elif in_earlier and not in_recent:
+                    trend = "resolved"
+                else:
+                    trend = "stable"
+
+            sigs[cat] = {
+                "total_occurrences": total,
+                "runs_seen": runs_seen,
+                "persistence": round(persistence, 3),
+                "examples": sorted(all_examples)[:_MAX_EXAMPLES],
+                "trend": trend,
+            }
+            if runs_with_cat:
+                sigs[cat]["first_seen"] = runs_with_cat[0]["ts"]
+                sigs[cat]["last_seen"] = runs_with_cat[-1]["ts"]
+
+        sev_history = [
+            {"run": e["run"], "severity": e["triage"].get("severity", "routine"),
+             "ts": e["ts"]}
+            for e in entries
+        ][-_MAX_HISTORY:]
+
+        per_run_sevs = [e["triage"].get("severity", "routine") for e in entries]
+        sev_rank = {"critical": 2, "elevated": 1, "routine": 0}
+        worst = max(per_run_sevs, key=lambda s: sev_rank.get(s, 0))
+
+        # Persistence upgrade: only with enough data points
+        campaign_sev = worst
+        if n >= 4:
+            persistent_elevated = any(
+                sigs[cat]["persistence"] > 0.5
+                for cat in _TRIAGE_CATEGORIES if cat != "routine"
+                and sigs[cat]["total_occurrences"] > 0
+            )
+            if persistent_elevated and worst == "routine":
+                campaign_sev = "elevated"
+            elif persistent_elevated and worst == "elevated":
+                campaign_sev = "critical"
+
+        all_severities.append(campaign_sev)
+        targets[target] = {
+            "runs_with_triage": n,
+            "campaign_severity": campaign_sev,
+            "signatures": sigs,
+            "severity_history": sev_history,
+        }
+
+    return {
+        "campaign_severity": max(
+            all_severities,
+            key=lambda s: {"critical": 2, "elevated": 1, "routine": 0}.get(s, 0),
+        ),
+        "targets": targets,
+    }
+
+
 def correlate_project(project) -> dict[str, Any]:
     """Correlate findings and coverage across all runs in a project.
 
@@ -80,28 +223,41 @@ def correlate_project(project) -> dict[str, Any]:
     run_types = _get_run_types(run_dirs)
     findings_by_run = _load_all_findings(run_dirs)
 
+    # Anchor-identity join: one site key per defect across anchor
+    # drift, synthetic-scope name variants, and explicit lineage
+    # notes (see core.project.anchor_join). Recency ranks feed only
+    # the canonical-anchor tie-break.
+    recency = {d.name: i for i, d
+               in enumerate(sorted(run_dirs, key=safe_run_mtime))}
+    span_index = load_project_span_index(project, run_dirs)
+    join = build_anchor_join(findings_by_run, span_index, recency)
+
     # Existing
-    persistent = _find_persistent(findings_by_run, run_models)
-    trends = _build_trends(findings_by_run, run_dirs, run_models)
+    persistent = _find_persistent(findings_by_run, run_models, join=join)
+    trends = _build_trends(findings_by_run, run_dirs, run_models, join=join)
     tool_coverage = _build_tool_coverage(run_dirs)
 
     # New actionable analyses
-    disagreements = _find_disagreements(findings_by_run, run_models)
-    new_resolved = _find_new_and_resolved(findings_by_run, run_dirs, run_types)
-    tool_gaps = _build_tool_gaps(run_dirs, findings_by_run, run_types)
+    disagreements = _find_disagreements(findings_by_run, run_models,
+                                        join=join)
+    new_resolved = _find_new_and_resolved(findings_by_run, run_dirs,
+                                          run_types, join=join)
+    tool_gaps = _build_tool_gaps(run_dirs, findings_by_run, run_types,
+                                 join=join)
+    token_drift = _find_token_drift(run_dirs)
     actions = _build_action_list(
         disagreements, new_resolved, tool_gaps, persistent,
+        join_uncertain=join.uncertain_pairs,
     )
 
     n_persistent = len(persistent)
-    n_total_unique = len({
-        dedup_key(f)
-        for findings in findings_by_run.values()
-        for f in findings
-    })
+    n_total_unique = join.site_count()
 
-    return {
+    sandbox_campaign = correlate_sandbox_triage(run_dirs)
+
+    result = {
         "actions": actions,
+        "join": _join_summary(join),
         "disagreements": disagreements,
         "new_findings": new_resolved["new_findings"],
         "potentially_resolved": new_resolved["potentially_resolved"],
@@ -109,6 +265,7 @@ def correlate_project(project) -> dict[str, Any]:
         "persistent_findings": persistent,
         "tool_coverage": tool_coverage,
         "trends": trends,
+        "token_enforcement_drift": token_drift,
         "summary": {
             "runs": len(run_dirs),
             "total_unique_findings": n_total_unique,
@@ -117,13 +274,35 @@ def correlate_project(project) -> dict[str, Any]:
             "disagreements": len(disagreements),
             "new_findings": len(new_resolved["new_findings"]),
             "potentially_resolved": len(new_resolved["potentially_resolved"]),
+            "token_enforcement_drift": len(token_drift),
         },
+    }
+    if sandbox_campaign is not None:
+        result["sandbox_campaign"] = sandbox_campaign
+        result["summary"]["sandbox_campaign_severity"] = (  # type: ignore[index]
+            sandbox_campaign["campaign_severity"]
+        )
+    return result
+
+
+def _join_summary(join: AnchorJoin) -> dict[str, Any]:
+    """Operator-facing join facts: every multi-anchor site plus the
+    flagged (NOT joined) uncertain pairs awaiting a human."""
+    return {
+        "multi_anchor_sites": join.multi_anchor_sites(),
+        "uncertain_pairs": join.uncertain_pairs,
+        "uncertain_total": join.uncertain_total,
     }
 
 
 def _empty_result() -> dict[str, Any]:
     return {
         "actions": [],
+        "join": {
+            "multi_anchor_sites": [],
+            "uncertain_pairs": [],
+            "uncertain_total": 0,
+        },
         "disagreements": [],
         "new_findings": [],
         "potentially_resolved": [],
@@ -136,6 +315,7 @@ def _empty_result() -> dict[str, Any]:
         "persistent_findings": [],
         "tool_coverage": {},
         "trends": {},
+        "token_enforcement_drift": [],
         "summary": {
             "runs": 0,
             "total_unique_findings": 0,
@@ -144,15 +324,29 @@ def _empty_result() -> dict[str, Any]:
             "disagreements": 0,
             "new_findings": 0,
             "potentially_resolved": 0,
+            "token_enforcement_drift": 0,
         },
     }
 
 
 # --- Helpers ---
 
+def _load_orchestrated_report(run_dir: Path) -> Any:
+    """Budgeted read of a run's ``orchestrated_report.json``.
+
+    The report lives in the sandbox-writable run dir and correlate
+    loads one per run — an oversize plant degrades to None (findings
+    fall back to the size-gated findings.json path) instead of
+    buffering unbounded.
+    """
+    from core.coverage.record import RUN_ARTIFACT_MAX_BYTES
+    return load_json(run_dir / "orchestrated_report.json",
+                     max_bytes=RUN_ARTIFACT_MAX_BYTES)
+
+
 def _get_run_model(run_dir: Path) -> str:
     """Extract the analysis model name for a run."""
-    orch = load_json(run_dir / "orchestrated_report.json")
+    orch = _load_orchestrated_report(run_dir)
     if orch and isinstance(orch, dict):
         o = orch.get("orchestration") or {}
         models = o.get("analysis_models") or []
@@ -192,7 +386,7 @@ def _load_all_findings(
     """
     result = {}
     for d in run_dirs:
-        orch = load_json(d / "orchestrated_report.json")
+        orch = _load_orchestrated_report(d)
         if orch and isinstance(orch, dict):
             findings = orch.get("results", [])
             if findings:
@@ -209,15 +403,15 @@ def _load_all_findings(
 def _find_disagreements(
     findings_by_run: dict[str, list[dict]],
     run_models: dict[str, str],
+    join: AnchorJoin | None = None,
 ) -> list[dict[str, Any]]:
     """Find findings where runs disagree on verdict (positive vs negative)."""
+    join = join or build_anchor_join(findings_by_run)
     key_to_verdicts: dict[tuple, list[dict]] = defaultdict(list)
-    key_to_finding: dict[tuple, dict] = {}
 
     for run_name, findings in findings_by_run.items():
-        for f in findings:
-            k = dedup_key(f)
-            key_to_finding[k] = f
+        for i, f in enumerate(findings):
+            k = join.key_for(run_name, i)
             status = get_finding_status(f)
             if not status:
                 continue
@@ -245,17 +439,17 @@ def _find_disagreements(
         else:
             continue
 
-        f = key_to_finding[k]
+        f = join.finding_for(k)
         scores = [v["score"] for v in verdicts if v["score"] is not None]
-        disagreements.append({
-            "file": finding_file(f),
-            "function": f.get("function", ""),
-            "line": f.get("line") or 0,
+        disagreements.append(join.annotate({
+            "file": k[0],
+            "function": k[1],
+            "line": k[2],
             "vuln_type": f.get("vuln_type", ""),
             "verdicts": verdicts,
             "disagreement_type": dtype,
             "max_score": max(scores) if scores else 0,
-        })
+        }, k))
 
     disagreements.sort(key=lambda d: (
         0 if d["disagreement_type"] == "positive_vs_negative" else 1,
@@ -270,31 +464,31 @@ def _find_new_and_resolved(
     findings_by_run: dict[str, list[dict]],
     run_dirs: list[Path],
     run_types: dict[str, str],
+    join: AnchorJoin | None = None,
 ) -> dict[str, list[dict]]:
     """Detect findings that appeared or disappeared across runs.
 
     Only compares runs of the same command type — a finding in scan-001
     but absent from validate-001 is expected, not "resolved."
     """
+    join = join or build_anchor_join(findings_by_run)
     run_order = [d.name for d in sorted(run_dirs, key=safe_run_mtime)]
 
     key_to_runs_by_type: dict[tuple, dict[str, list[str]]] = defaultdict(
         lambda: defaultdict(list),
     )
-    key_to_finding: dict[tuple, dict] = {}
 
     for run_name, findings in findings_by_run.items():
         cmd_type = run_types.get(run_name, "unknown")
-        for f in findings:
-            k = dedup_key(f)
+        for i, _f in enumerate(findings):
+            k = join.key_for(run_name, i)
             key_to_runs_by_type[k][cmd_type].append(run_name)
-            key_to_finding[k] = f
 
     new_findings = []
     potentially_resolved = []
 
     for k, type_runs in key_to_runs_by_type.items():
-        f = key_to_finding[k]
+        f = join.finding_for(k)
         for cmd_type, runs in type_runs.items():
             typed_order = [r for r in run_order if run_types.get(r) == cmd_type]
             if len(typed_order) < 2:
@@ -308,16 +502,16 @@ def _find_new_and_resolved(
             ))
             if first_run != earliest:
                 status = get_finding_status(f)
-                new_findings.append({
-                    "file": finding_file(f),
-                    "function": f.get("function", ""),
-                    "line": f.get("line") or 0,
+                new_findings.append(join.annotate({
+                    "file": k[0],
+                    "function": k[1],
+                    "line": k[2],
                     "vuln_type": f.get("vuln_type", ""),
                     "status": status,
                     "verdict": normalize_verdict(status),
                     "first_seen_run": first_run,
                     "command_type": cmd_type,
-                })
+                }, k))
 
             if latest not in runs:
                 last_run = max(runs, key=lambda r: (
@@ -328,15 +522,15 @@ def _find_new_and_resolved(
                     if r not in runs
                     and run_order.index(r) > run_order.index(last_run)
                 ]
-                potentially_resolved.append({
-                    "file": finding_file(f),
-                    "function": f.get("function", ""),
-                    "line": f.get("line") or 0,
+                potentially_resolved.append(join.annotate({
+                    "file": k[0],
+                    "function": k[1],
+                    "line": k[2],
                     "vuln_type": f.get("vuln_type", ""),
                     "last_seen_run": last_run,
                     "absent_from": absent,
                     "command_type": cmd_type,
-                })
+                }, k))
 
     new_findings.sort(key=lambda n: (
         0 if n["verdict"] == "positive" else 1,
@@ -350,14 +544,16 @@ def _build_tool_gaps(
     _run_dirs: list[Path],
     findings_by_run: dict[str, list[dict]],
     run_types: dict[str, str],
+    join: AnchorJoin | None = None,
 ) -> dict[str, Any]:
     """Identify coverage gaps between scan tools and LLM analysis."""
+    join = join or build_anchor_join(findings_by_run)
     scan_files: dict[str, set] = defaultdict(set)
     llm_files: dict[str, set] = defaultdict(set)
 
     for run_name, findings in findings_by_run.items():
         cmd = run_types.get(run_name, "unknown")
-        for f in findings:
+        for i, f in enumerate(findings):
             # finding_file handles both scan-shaped (`file`) and
             # orchestrated (`file_path`) findings — pre-fix agentic
             # findings were silently skipped here, so LLM coverage
@@ -366,7 +562,7 @@ def _build_tool_gaps(
             fp = finding_file(f)
             if not fp:
                 continue
-            k = dedup_key(f)
+            k = join.key_for(run_name, i)
             if cmd in SCAN_COMMAND_TYPES:
                 scan_files[fp].add(k)
             elif cmd in LLM_COMMAND_TYPES:
@@ -391,7 +587,7 @@ def _build_tool_gaps(
 
     suggested = []
     if scanned_not_validated:
-        n = sum(item["finding_count"] for item in scanned_not_validated)
+        n = sum(item["finding_count"] for item in scanned_not_validated)  # type: ignore[misc]
         suggested.append(
             f"raptor validate  # {n} unvalidated scan finding"
             f"{'s' if n != 1 else ''}"
@@ -414,11 +610,21 @@ def _build_tool_gaps(
 
 # --- Action list ---
 
+def _anchor_label(pair: dict[str, Any]) -> str:
+    """Compact ``file:lineA/lineB`` label for an uncertain pair."""
+    anchors = pair.get("anchors") or []
+    if not anchors:
+        return "?"
+    lines = "/".join(str(a.get("line", 0)) for a in anchors)
+    return f"{anchors[0].get('file', '?')}:{lines}"
+
+
 def _build_action_list(
     disagreements: list[dict],
     new_resolved: dict[str, list[dict]],
     tool_gaps: dict[str, Any],
     _persistent: list[dict],
+    join_uncertain: list[dict] | None = None,
 ) -> list[dict[str, Any]]:
     """Synthesize all analyses into a single prioritised action list."""
     actions: list[dict[str, Any]] = []
@@ -468,6 +674,19 @@ def _build_action_list(
             "detail": gap,
         } for gap in tool_gaps.get("scanned_not_validated", []))
 
+    # Anchor pairs the join declined (uncertainty is never a join) —
+    # each needs a human same-or-distinct call, like the manual
+    # dedupe pass this machinery replaces.
+    actions.extend({
+            "priority": 5,
+            "category": "join_uncertain",
+            "summary": (
+                f"{_anchor_label(pair)} — possible same defect "
+                f"({pair.get('reason', '')}); needs manual adjudication"
+            ),
+            "detail": pair,
+        } for pair in (join_uncertain or []))
+
     actions.extend({
             "priority": 5,
             "category": "resolved",
@@ -495,36 +714,39 @@ def _build_action_list(
 def _find_persistent(
     findings_by_run: dict[str, list[dict]],
     run_models: dict[str, str],
+    join: AnchorJoin | None = None,
 ) -> list[dict[str, Any]]:
     """Find findings that appear across 2+ runs."""
-    key_to_runs: dict[tuple, list[str]] = defaultdict(list)
-    key_to_finding: dict[tuple, dict] = {}
+    join = join or build_anchor_join(findings_by_run)
+    # Unique runs per site: a joined site can carry several anchors
+    # from ONE run, which must not inflate runs_seen.
+    key_to_runs: dict[tuple, set] = defaultdict(set)
     key_to_models: dict[tuple, set] = defaultdict(set)
 
     for run_name, findings in findings_by_run.items():
-        for f in findings:
-            k = dedup_key(f)
-            key_to_runs[k].append(run_name)
-            key_to_finding[k] = f
+        for i, f in enumerate(findings):
+            k = join.key_for(run_name, i)
+            key_to_runs[k].add(run_name)
             model = f.get("analysed_by") or run_models.get(run_name, "")
             if model:
                 key_to_models[k].add(model)
 
     persistent = []
-    for k, runs in sorted(key_to_runs.items(), key=lambda x: -len(x[1])):
+    for k, runs in sorted(key_to_runs.items(),
+                          key=lambda x: (-len(x[1]), x[0])):
         if len(runs) < 2:
             continue
-        f = key_to_finding[k]
-        persistent.append({
-            "file": finding_file(f),
-            "function": f.get("function", ""),
-            "line": f.get("line") or 0,
+        f = join.finding_for(k)
+        persistent.append(join.annotate({
+            "file": k[0],
+            "function": k[1],
+            "line": k[2],
             "vuln_type": f.get("vuln_type", ""),
             "status": f.get("final_status") or f.get("status", ""),
             "runs_seen": len(runs),
             "run_names": sorted(runs),
             "models": sorted(key_to_models.get(k, set())),
-        })
+        }, k))
 
     return persistent
 
@@ -533,17 +755,19 @@ def _build_trends(
     findings_by_run: dict[str, list[dict]],
     run_dirs: list[Path],
     run_models: dict[str, str],
+    join: AnchorJoin | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """Track how each finding's status changed across runs.
 
     Returns {finding_label: [{run, status, score, model}]} ordered by run time.
     """
+    join = join or build_anchor_join(findings_by_run)
     run_order = [d.name for d in sorted(run_dirs, key=safe_run_mtime)]
 
     key_to_history: dict[tuple, list[dict]] = defaultdict(list)
     for run_name, findings in findings_by_run.items():
-        for f in findings:
-            k = dedup_key(f)
+        for i, f in enumerate(findings):
+            k = join.key_for(run_name, i)
             model = f.get("analysed_by") or run_models.get(run_name, "")
             es = f.get("exploitability_score")
             key_to_history[k].append({
@@ -562,6 +786,38 @@ def _build_trends(
         trends[label] = history
 
     return trends
+
+
+def _find_token_drift(run_dirs: list[Path]) -> list[dict[str, Any]]:
+    """Token-enforcement drift between consecutive map-bearing runs.
+
+    Compares the per-run ``token-map.json`` artifacts
+    (:mod:`core.concepts.token_map`) pairwise in run-time order — the
+    monitored-invariant view for gated-fragile disproofs whose
+    reconsideration condition names the token as sole guard. Pure
+    comparison over artifacts that already exist: no new pipeline
+    stage, no verdict weight (a ``lost_enforcement`` row is queue food
+    for the operator, never an auto-overturn of the recorded
+    disproof).
+    """
+    try:
+        from core.concepts.token_map import load_token_map, token_map_drift
+    except Exception:  # noqa: BLE001 — enrichment, never a gate
+        return []
+    ordered = sorted(run_dirs, key=safe_run_mtime)
+    maps = [(d.name, load_token_map(d)) for d in ordered]
+    with_maps = [(name, m) for name, m in maps if m]
+    drift_records: list[dict[str, Any]] = []
+    for (p_name, p_map), (c_name, c_map) in zip(with_maps, with_maps[1:]):
+        try:
+            records = token_map_drift(p_map, c_map)
+        except Exception:  # noqa: BLE001 — one bad artifact pair
+            continue
+        for rec in records:
+            rec["prior_run"] = p_name
+            rec["current_run"] = c_name
+            drift_records.append(rec)
+    return drift_records
 
 
 def _build_tool_coverage(run_dirs: list[Path]) -> dict[str, list[str]]:

@@ -1,18 +1,19 @@
-"""Sandbox policy for /audit external tool invocations.
+"""Sandbox policy reference table for /audit external tools.
 
-Every external tool invocation in the audit pipeline must go through
-the sandbox infrastructure.  This module maps each tool to
-its required sandbox profile and provides a dispatch function that
-enforces the policy.
+Advisory reference data, not an enforcement layer: this module maps
+each external tool the audit pipeline can invoke to its recommended
+sandbox profile and resource limits.  Enforcement happens in
+core.sandbox at the spawn layer — tool runners call core.sandbox.run
+/ run_trusted directly and do not consult this table on that path.
+The require_* helpers below are available as a policy-backed hard
+gate, but no production runner is currently wired through them; the
+one production consumer is validate_all_tools_sandboxed, a post-run
+reporting check fed cost-ledger phase names.
 
 Sandbox profiles (from core/sandbox/):
   - run:         full namespace + Landlock + seccomp + network deny
   - run_trusted: Landlock filesystem isolation + resource limits (no namespace)
   - container:   OCI container isolation (for JVM/heavy tools)
-
-The policy is a data table, not a framework.  Callers use
-get_sandbox_profile() to look up the profile, then call
-core.sandbox.run or core.sandbox.run_trusted directly.
 """
 
 from __future__ import annotations
@@ -24,11 +25,13 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+# No NONE profile: every registered tool carries an isolation tier —
+# an unsandboxed tier would contradict the containment-floor doctrine
+# ("never none") and nothing ever referenced one.
 class SandboxProfile:
     FULL = "full"
     TRUSTED = "trusted"
     CONTAINER = "container"
-    NONE = "none"
 
 
 @dataclass(frozen=True)
@@ -136,20 +139,34 @@ _TOOL_POLICIES: dict[str, ToolPolicy] = {
         timeout_seconds=300,
         memory_limit_mb=4096,
     ),
+    "php": ToolPolicy(
+        tool="php", profile=SandboxProfile.FULL,
+        reason=(
+            "interpreter executing grammar-validated sanitizer chains "
+            "extracted from attacker-controlled source (sanwit witness)"
+        ),
+        timeout_seconds=30,
+        memory_limit_mb=256,
+    ),
 }
 
 
 def get_sandbox_profile(tool: str) -> ToolPolicy | None:
     """Look up the sandbox policy for a tool.
 
-    Returns None for unknown tools — callers should refuse to run
-    unregistered tools without an explicit policy.
+    Returns None for unknown tools.  Advisory lookup only — nothing
+    is refused based on this result; isolation is enforced by
+    core.sandbox at the spawn layer.
     """
     return _TOOL_POLICIES.get(tool.lower())
 
 
 def require_sandbox_profile(tool: str) -> ToolPolicy:
-    """Look up the sandbox policy, raising ValueError for unknown tools."""
+    """Look up the sandbox policy, raising ValueError for unknown tools.
+
+    Available for callers that want a hard policy gate; currently no
+    production runner is wired through it.
+    """
     policy = get_sandbox_profile(tool)
     if policy is None:
         msg = (
@@ -185,26 +202,57 @@ _LLM_PHASES = frozenset({
     "unclassified", "concept_discovery", "rule_refinement", "stress",
     "triage", "prefilter", "clean_check", "sweep", "synthesis",
     "dynamic", "reachability", "propagation", "attacker_synthesis",
-    "dark_verify", "report", "deepen", "study",
+    "dark_verify", "differential", "report", "deepen", "study",
     # On-demand checker synthesis books its own call class; a resumed
     # segment books the prior segments' spend as a pseudo-phase.
     # Both are ledger rows, not tool invocations (each warned as an
     # "unsandboxed tool" on a live run).
     "checker_synthesis_ondemand", "prior_segments",
+    # Degraded-mode breaker trip: core.llm.breaker persists one $0
+    # telemetry record (call_class="run_breaker") when it stops a run;
+    # book_unbooked_classes imports it as a ledger row. A ledger row,
+    # never a tool invocation (warned "invoked without policy:
+    # run_breaker" on every breaker-stopped run's finalize).
+    "run_breaker",
+    # Pass-ledger phase names the orchestrator books directly
+    # (``_phase(...)`` / ``start_phase(...)`` literals) — prep stages,
+    # post-loop passes, and resolution sweeps. Same construction
+    # argument as above: ledger rows, never tool invocations (a live
+    # run's finalize warned on every one of these as an "unsandboxed
+    # tool"). The closure test enumerates the orchestrator's literals
+    # so a new phase name cannot silently re-open the advisory noise.
+    "adversarial_refute", "auto_synthesize_rules",
+    "confidence_propagation", "flow_trace_review", "iterative_re_review",
+    "live_sink_requeue", "post_deepen_sweep", "post_loop_checks",
+    "prep_artifact_import", "prep_capability_probe",
+    "prep_channel_prepasses", "prep_consistency_prepass",
+    "prep_consistency_seeding", "prep_context_map", "prep_context_sets",
+    "prep_edge_pass",
+    "prep_evidence_index", "prep_fail_open_census", "prep_finalize",
+    "prep_gap_compute", "prep_gap_scoring", "prep_iris_specs",
+    "prep_lifecycle_channels", "prep_macro_recovery",
+    "prep_mechanical_detectors", "prep_peer_groups", "prep_taint_passes",
+    "prep_triage", "resolve_gate_demoted", "sweep_promotion",
+    # Direct per-call ledger mints (``cost_tracker.record_call``
+    # literals) that no pass-ledger phase name covers: the IRIS
+    # refinement health-gate skip marker, the tier-1 edge-contract
+    # review class, and the adversarial-refuter pass.
+    "adversarial", "edge_review", "iris_refinement_skipped",
 })
 
 
 def validate_all_tools_sandboxed(
     invoked_tools: list[str],
 ) -> list[str]:
-    """Check that every invoked tool has a sandbox policy.
+    """Advisory post-run report: ledger names without a policy entry.
 
-    Returns a list of tools WITHOUT a policy (should be empty).
-    LLM-only phases and cost-ledger spend buckets (review,
-    checker_synthesis, refinement, iris, etc.) are excluded — they
-    don't invoke external tools; subprocess tools enforce their
-    policies at the runner chokepoint and never appear in the cost
-    ledger this validator is fed from.
+    NOT an enforcement gate, and structurally unable to observe a
+    real unsandboxed tool: the orchestrator feeds this COST-LEDGER
+    phase names, and subprocess tools never book cost there — their
+    isolation is enforced at the core.sandbox spawn layer.  All this
+    can flag is a ledger spend class missing from the _LLM_PHASES
+    allowlist (historically false positives; see the list's inline
+    notes).  Returns the names without a policy.
     """
     missing = []
     for tool in invoked_tools:

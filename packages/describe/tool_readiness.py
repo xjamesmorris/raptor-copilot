@@ -71,26 +71,43 @@ class ToolCheck:
 # build system is autotools and ``autoreconf`` isn't on PATH,
 # the operator gets a specific install hint instead of "CodeQL
 # might fail" hand-waving.
-_BUILD_SYSTEM_DEPS = {
+#
+# The KEY UNIVERSE derives from the detector's own probe table
+# (``BuildDetector._VALIDATION_COMMANDS``, whose keys a detector-side
+# regression test pins to exactly the BUILD_SYSTEMS emit vocabulary):
+# a hand-typed universe here drifted to 8 emit-able systems with no
+# row — each rendering "✓ build deps ok" with the build tool absent
+# from PATH, the exact misleading signal this check exists to
+# prevent — plus 2 dead rows the detector never emits. The default
+# dep for a system is the binary its validation probe runs; the
+# overrides below carry richer knowledge where the probe binary is
+# not the whole story.
+_BUILD_SYSTEM_DEP_OVERRIDES: dict[str, list[str]] = {
     # ``libtoolize`` not ``libtool``: the Debian ``libtool``
     # package ships ``libtoolize`` (the binary autoreconf
     # actually invokes during bootstrap) but doesn't always
     # ship a bare ``libtool`` command. Checking ``libtool``
     # gave false-positive "missing" warnings on systems with
-    # the package fully installed.
+    # the package fully installed. (The detector's probe runs
+    # ``make`` — the DB build itself needs the bootstrap chain.)
     "autotools": ["autoreconf", "automake", "libtoolize"],
-    "cmake": ["cmake"],
+    # meson builds drive ninja; the probe only runs meson.
     "meson": ["meson", "ninja"],
-    "make": ["make"],
-    "maven": ["mvn"],
-    "gradle": ["gradle"],
-    "poetry": ["poetry"],
-    "pip": ["pip"],
-    "npm": ["npm"],
-    "yarn": ["yarn"],
-    "cargo": ["cargo"],
-    "go": ["go"],
 }
+
+
+def _derive_build_system_deps() -> dict[str, list[str]]:
+    from core.build.build_detector import BuildDetector
+
+    deps = {
+        bs_type: [cmd[0]]
+        for bs_type, cmd in BuildDetector._VALIDATION_COMMANDS.items()
+    }
+    deps.update(_BUILD_SYSTEM_DEP_OVERRIDES)
+    return deps
+
+
+_BUILD_SYSTEM_DEPS: dict[str, list[str]] = _derive_build_system_deps()
 
 def _format_build_deps_hint(missing_deps: list[str]) -> str:
     """Group missing build deps by their per-PM package name +
@@ -136,11 +153,12 @@ def _format_build_deps_hint(missing_deps: list[str]) -> str:
         # automake share no package, but autoreconf is from
         # ``autoconf`` and any future dep mapping the same way
         # wouldn't double-print).
-        seen = set()
-        dedup_pkgs = [
-            p for p in distro_pkgs
-            if not (p in seen or seen.add(p))
-        ]
+        seen: set[str] = set()
+        dedup_pkgs: list[str] = []
+        for p in distro_pkgs:
+            if p not in seen:
+                seen.add(p)
+                dedup_pkgs.append(p)
         parts.append(format_install_hint(dedup_pkgs))
     parts.extend(other_hints)
     return "; ".join(parts)
@@ -193,11 +211,32 @@ def _check_codeql(shape: TargetShape) -> ToolCheck | None:
     if not shutil.which("codeql"):
         return _doctor_deferral("CodeQL")
     version = _bin_version("codeql")
+    if shape.primary_language == "rust":
+        return ToolCheck(
+            name="CodeQL",
+            status="ok",
+            version=version,
+            detail=(
+                "Rust no-build extraction - Cargo is not required "
+                "unless a build command is explicitly supplied"
+            ),
+        )
     # Build-deps check for the target's primary-language build.
     missing_deps: list[str] = []
     if shape.primary_language and shape.primary_language in shape.build_systems:
         bs = shape.build_systems[shape.primary_language]
-        required = _BUILD_SYSTEM_DEPS.get(bs, [])
+        required = _BUILD_SYSTEM_DEPS.get(bs)
+        if required is None:
+            # No dep data for this build system: honest "?" — a "✓
+            # build deps ok" here would be a verification claim with
+            # nothing behind it.
+            return ToolCheck(
+                name="CodeQL",
+                status="unknown",
+                version=version,
+                detail=f"no dependency data for build system '{bs}'",
+                hint="run `raptor doctor` to diagnose host setup",
+            )
         missing_deps.extend(dep for dep in required if not shutil.which(dep))
         if missing_deps:
             hint = _format_build_deps_hint(missing_deps)
@@ -211,12 +250,19 @@ def _check_codeql(shape: TargetShape) -> ToolCheck | None:
                 ),
                 hint=hint,
             )
+        return ToolCheck(
+            name="CodeQL",
+            status="ok",
+            version=version,
+            detail=f"build deps ok for {bs}",
+        )
     return ToolCheck(
         name="CodeQL",
         status="ok",
         version=version,
         detail=(
-            f"build deps ok for {shape.build_systems.get(shape.primary_language or '', 'this target')}"
+            "no build system detected — DB-build dependency check "
+            "not applicable"
         ),
     )
 
@@ -277,14 +323,15 @@ def _check_binary_oracle(shape: TargetShape) -> ToolCheck | None:
     # don't produce the ELF artefacts the oracle parses.
     if shape.primary_language not in ("cpp", "rust", "go"):
         return None
-    target = shape.target_path
-    common_build_dirs = (
-        "build", "target/release", "target/debug",
-        "bazel-bin", "cmake-build-debug", "cmake-build-release",
+    # The oracle's OWN detection universe (named build dirs + Rust
+    # cross-target globs + the in-source top-level arm) — a hand-typed
+    # 6-dir subset here said "will activate after build" for meson
+    # builddir, in-source autotools builds and cross-compiled Rust,
+    # all targets where the oracle WOULD activate.
+    from core.analysis.binary_oracle_autodetect import (
+        build_artefact_dirs_present,
     )
-    has_artefacts = any(
-        (target / d).exists() for d in common_build_dirs
-    )
+    has_artefacts = build_artefact_dirs_present(shape.target_path)
     if has_artefacts:
         return ToolCheck(
             name="Binary oracle",

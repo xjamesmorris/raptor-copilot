@@ -191,6 +191,58 @@ class TestSageClientWithMock(unittest.TestCase):
             _restore_sdk(client_mod, snapshot)
 
     @patch("core.sage.client._use_direct_embed", return_value=False)
+    def test_list_memories_forwards_domain(self, _mock_direct):
+        import core.sage.client as client_mod
+
+        snapshot = _snapshot_sdk(client_mod)
+        try:
+            _, mock_instance = _install_mock_sdk(client_mod)
+            from core.sage.client import SageClient
+            from core.sage.config import SageConfig
+
+            sc = SageClient(SageConfig(enabled=True))
+            mock_instance.list_memories.return_value = "page"
+            self.assertEqual(
+                sc.list_memories(limit=5, offset=10, domain="d"), "page")
+            mock_instance.list_memories.assert_called_once_with(
+                limit=5, offset=10, domain="d")
+            # No domain -> the kwarg is omitted entirely.
+            mock_instance.list_memories.reset_mock()
+            sc.list_memories(limit=5, offset=10)
+            mock_instance.list_memories.assert_called_once_with(
+                limit=5, offset=10)
+        finally:
+            _restore_sdk(client_mod, snapshot)
+
+    @patch("core.sage.client._use_direct_embed", return_value=False)
+    def test_list_memories_domain_falls_back_on_legacy_sdk(
+            self, _mock_direct):
+        # An SDK that predates server-side domain filtering raises
+        # TypeError on the kwarg; the wrapper retries unfiltered so
+        # the caller's client-side filter still sees every row.
+        import core.sage.client as client_mod
+
+        snapshot = _snapshot_sdk(client_mod)
+        try:
+            _, mock_instance = _install_mock_sdk(client_mod)
+            from core.sage.client import SageClient
+            from core.sage.config import SageConfig
+
+            sc = SageClient(SageConfig(enabled=True))
+            calls = []
+
+            def legacy(limit=200, offset=0):
+                calls.append((limit, offset))
+                return "page"
+
+            mock_instance.list_memories = legacy
+            self.assertEqual(
+                sc.list_memories(limit=5, offset=0, domain="d"), "page")
+            self.assertEqual(calls, [(5, 0)])
+        finally:
+            _restore_sdk(client_mod, snapshot)
+
+    @patch("core.sage.client._use_direct_embed", return_value=False)
     def test_propose_auto_embeds(self, _mock_direct):
         import core.sage.client as client_mod
 
@@ -207,6 +259,102 @@ class TestSageClientWithMock(unittest.TestCase):
             self.assertTrue(sc.propose("hello", domain_tag="raptor-findings"))
             mock_instance.embed.assert_called_once_with("hello")
             mock_instance.propose.assert_called_once()
+        finally:
+            _restore_sdk(client_mod, snapshot)
+
+
+class TestResolveMemoryType(unittest.TestCase):
+    """The shared memory-type allowlist (used by SageClient.propose and
+    the seeding scripts): dict membership, never getattr on the enum."""
+
+    _ENUM = SimpleNamespace(
+        fact="fact", observation="observation",
+        inference="inference", task="task",
+    )
+
+    def _resolve(self, name):
+        from core.sage.client import resolve_memory_type
+        return resolve_memory_type(name, self._ENUM)
+
+    def test_canonical_names_map(self):
+        self.assertEqual(self._resolve("fact"), "fact")
+        self.assertEqual(self._resolve("task"), "task")
+
+    def test_legacy_aliases_fold(self):
+        self.assertEqual(self._resolve("hypothesis"), "inference")
+        self.assertEqual(self._resolve("lesson"), "observation")
+
+    def test_dunder_name_never_resolves_via_attribute(self):
+        # getattr(enum, "__class__") would hand back the class object;
+        # the allowlist must fall back to observation instead.
+        with self.assertLogs("raptor", level="WARNING"):
+            self.assertEqual(self._resolve("__class__"), "observation")
+
+    def test_typo_warns_and_falls_back(self):
+        with self.assertLogs("raptor", level="WARNING") as cm:
+            self.assertEqual(self._resolve("observatoin"), "observation")
+        self.assertIn("unknown memory_type", " ".join(cm.output))
+
+
+class TestQueryCacheBoundAndRace(unittest.TestCase):
+    """The per-instance query cache is FIFO-bounded (256, insertion
+    order — not LRU), and its eviction tolerates the concurrent-pop
+    race hook consumers can hit from ThreadPoolExecutor workers."""
+
+    def _client_with_mock(self, client_mod):
+        _, mock_instance = _install_mock_sdk(client_mod)
+        from core.sage.config import SageConfig
+        from core.sage.client import SageClient
+
+        sc = SageClient(SageConfig(enabled=True))
+        mock_instance.embed.return_value = [0.1]
+        mock_instance.query.return_value = SimpleNamespace(results=[])
+        return sc
+
+    @patch("core.sage.client._use_direct_embed", return_value=False)
+    def test_cache_is_fifo_bounded_at_256(self, _mock_direct):
+        import core.sage.client as client_mod
+
+        snapshot = _snapshot_sdk(client_mod)
+        try:
+            sc = self._client_with_mock(client_mod)
+            for i in range(257):
+                sc.query(f"q{i}")
+            self.assertEqual(len(sc._query_cache), 256)
+            keys = {k[0] for k in sc._query_cache}
+            self.assertNotIn("q0", keys)      # first inserted evicted
+            self.assertIn("q256", keys)
+        finally:
+            _restore_sdk(client_mod, snapshot)
+
+    @patch("core.sage.client._use_direct_embed", return_value=False)
+    def test_lost_eviction_race_does_not_escape_query(self, _mock_direct):
+        # Simulate the loser of a concurrent eviction: the key picked
+        # by next(iter(...)) was already popped by another thread, so
+        # pop raises KeyError. That must be absorbed like
+        # StopIteration — pre-fix it escaped query() and the caller's
+        # broad except silently dropped the recall.
+        import core.sage.client as client_mod
+
+        class _RacingDict(dict):
+            raced = False
+
+            def pop(self, key, *default):
+                if not self.raced:
+                    self.raced = True
+                    raise KeyError(key)
+                return super().pop(key, *default)
+
+        snapshot = _snapshot_sdk(client_mod)
+        try:
+            sc = self._client_with_mock(client_mod)
+            racing = _RacingDict(
+                {(f"q{i}", "general", 5, None): () for i in range(256)}
+            )
+            sc._query_cache = racing
+            self.assertEqual(sc.query("fresh"), [])   # must not raise
+            self.assertTrue(racing.raced)
+            self.assertIn(("fresh", "general", 5, None), racing)
         finally:
             _restore_sdk(client_mod, snapshot)
 

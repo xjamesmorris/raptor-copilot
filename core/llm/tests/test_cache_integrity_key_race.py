@@ -15,6 +15,7 @@ import os
 import pytest
 
 from core.llm import cache_integrity
+from core.security import mac_key
 
 
 @pytest.fixture(autouse=True)
@@ -43,7 +44,7 @@ def _lose_creation_race(monkeypatch):
         return real_open(path, flags, mode)
 
     monkeypatch.setattr(cache_integrity.os, "open", fake_open)
-    monkeypatch.setattr(cache_integrity.time, "sleep", lambda s: None)
+    monkeypatch.setattr(mac_key.time, "sleep", lambda s: None)
 
 
 def test_race_loser_retries_through_empty_read(

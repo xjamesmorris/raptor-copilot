@@ -26,6 +26,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from ._base import PARSE_ESCAPE_ERRORS, iter_walk_up
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -38,23 +40,20 @@ logger = logging.getLogger(__name__)
 # every package.json in a workspace pays the YAML parse once.
 _CATALOG_CACHE: dict[Path, dict[str, dict[str, str]]] = {}
 
-
 def find_workspace_root(start: Path) -> Path | None:
     """Walk up from ``start`` looking for ``pnpm-workspace.yaml``.
 
     ``start`` is typically the directory containing a member
     ``package.json``. Returns the directory containing the YAML, or
-    None if no such ancestor exists. Stops at the filesystem root.
+    None if no such ancestor exists. Bounded by the active scan root
+    (when declared), the nearest ``.git`` repo boundary, and a
+    defence-in-depth depth cap — a ``pnpm-workspace.yaml`` outside
+    the scanned tree must never steer version resolution.
     """
-    cur = start.resolve()
-    if cur.is_file():
-        cur = cur.parent
-    while True:
+    for cur in iter_walk_up(start):
         if (cur / "pnpm-workspace.yaml").is_file():
             return cur
-        if cur.parent == cur:
-            return None
-        cur = cur.parent
+    return None
 
 
 def get_catalogs(root: Path) -> dict[str, dict[str, str]]:
@@ -142,9 +141,12 @@ def _parse_catalogs(path: Path) -> dict[str, dict[str, str]]:
 
     try:
         data = safe_load(text)
-    except yaml.YAMLError as e:
+    except (yaml.YAMLError, *PARSE_ESCAPE_ERRORS) as e:  # hostile-input escape classes
+        # ``<kind> parse failed for`` — the leading kind token is what
+        # the parse-failure collector's regex requires; without it the
+        # failure never reaches the report's parse_failures.
         logger.warning(
-            "sca.parsers._pnpm_catalog: parse failed for %s: %s",
+            "sca.parsers._pnpm_catalog: YAML parse failed for %s: %s",
             path, e,
         )
         return {}
@@ -171,9 +173,19 @@ def _parse_catalogs(path: Path) -> dict[str, dict[str, str]]:
     return out
 
 
+def reset_cache() -> None:
+    """Drop the per-process catalog cache. Called from the discovery
+    entry point at the start of each scan — same contract as the CPM
+    and Gradle-catalog caches — so a stale catalog from a previous
+    run on a different target (or the same reused path with a changed
+    ``pnpm-workspace.yaml``) can't resolve this scan's ``catalog:``
+    specs. Within a single scan the cache is intentionally retained."""
+    _CATALOG_CACHE.clear()
+
+
 def _clear_cache() -> None:
     """Test helper — clear the per-root catalog cache."""
-    _CATALOG_CACHE.clear()
+    reset_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -217,22 +229,26 @@ def find_npm_workspace_root(start: Path) -> Path | None:
     Returns ``None`` for a package.json that IS the workspace root —
     callers wanting to distinguish "this is a member" from "this is
     the root" check ``find_npm_workspace_root(p) != p.parent.resolve()``.
-    """
-    cur = start.resolve()
-    if cur.is_file():
-        cur = cur.parent
 
-    target = cur
-    walk = cur.parent
-    while True:
+    Bounded like :func:`find_workspace_root`: the walk stops at the
+    active scan root / nearest ``.git`` / depth cap so operator
+    ``package.json`` files ABOVE the scanned tree are never read or
+    adopted as workspace roots.
+    """
+    target = start.resolve()
+    if target.is_file():
+        target = target.parent
+
+    # ``include_start=False``: only ancestors are eligible, but the
+    # start level is still bound-checked — a member that IS the scan
+    # / repo root has no eligible ancestor.
+    for walk in iter_walk_up(start, include_start=False):
         parent_pkg = walk / "package.json"
         if parent_pkg.is_file():
             patterns = _read_workspaces_field(parent_pkg)
             if patterns and _target_matches_any(target, walk, patterns):
                 return walk
-        if walk.parent == walk:
-            return None
-        walk = walk.parent
+    return None
 
 
 def _read_workspaces_field(pkg_json: Path) -> list | None:
@@ -249,7 +265,7 @@ def _read_workspaces_field(pkg_json: Path) -> list | None:
         return None
     try:
         data = _json.loads(text)
-    except _json.JSONDecodeError:
+    except (_json.JSONDecodeError, *PARSE_ESCAPE_ERRORS):  # type: ignore[misc]  # hostile-input escape classes
         return None
     if not isinstance(data, dict):
         return None

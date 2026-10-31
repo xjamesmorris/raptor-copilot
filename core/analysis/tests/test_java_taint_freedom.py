@@ -400,3 +400,272 @@ class TestBanThreadingComposedSurfaces:
             rd, sink, expr, index, allow_taint_free=True,
             ban_tf_system_reads=True) is REFUSE
         assert TAINT_FREE is not REFUSE  # keep both imports honest
+class TestFieldStoreScopeDiscipline:
+    """Bare-name FIELD stores must never count as helper-local writes:
+    the flow-insensitive union is sound only for locals (definite
+    assignment guarantees a body write precedes any read); a field's
+    ambient — possibly tainted — value on the un-written path is an
+    invisible union member."""
+
+    def test_field_write_helper_refuses(self):
+        # The confirmed shape: `data` is a FIELD tainted elsewhere;
+        # `get(false)` returns the ambient attacker value while the
+        # union folds only the body write ("safe").
+        src = _cls(
+            "    private String data;\n"
+            "    public void seed(String req) { data = req; }\n"
+            "    private String get(boolean flag) {\n"
+            "        if (flag) { data = \"safe\"; }\n"
+            "        return data;\n"
+            "    }\n"
+        )
+        idx = derive_tf_helpers(src)
+        assert idx.ok
+        assert ("get", 1) not in idx.taint_free, (
+            "field store counted as a local write — returns-taint-free "
+            "claim on a helper that returns ambient field state"
+        )
+
+    def test_declared_local_control_still_qualifies(self):
+        src = _cls(
+            "    private boolean flag = false;\n"
+            "    private String get() {\n"
+            "        String d = \"other\";\n"
+            "        if (flag) { d = \"safe\"; }\n"
+            "        return d;\n"
+            "    }\n"
+        )
+        idx = derive_tf_helpers(src)
+        assert ("get", 0) in idx.taint_free
+
+    def test_field_shadowing_local_refuses(self):
+        # A local sharing a FIELD's name is a shadow-collision hazard:
+        # a bare read before the declarator binds the field. The name
+        # refuses outright.
+        src = _cls(
+            "    private String d;\n"
+            "    private String get(boolean flag) {\n"
+            "        String r = d;\n"
+            "        String d = \"safe\";\n"
+            "        return flag ? r : d;\n"
+            "    }\n"
+        )
+        idx = derive_tf_helpers(src)
+        assert ("get", 1) not in idx.taint_free
+
+    def test_inherited_field_shadow_read_refuses(self):
+        # Read direction, INHERITED field: the block-local declarator
+        # writes "safe" (a vouched store), but the OUTER `return data`
+        # read binds the superclass field — invisible to the
+        # directly-enclosing-class field scan, caught by vouching the
+        # read site positionally (no superclass resolution needed).
+        src = (
+            "class Base {\n"
+            "    protected String data;\n"
+            "    public void seed(String req) { data = req; }\n"
+            "}\n"
+            "class T extends Base {\n"
+            "    private String get(boolean f) {\n"
+            "        if (f) { String data = \"safe\"; return data; }\n"
+            "        return data;\n"
+            "    }\n"
+            "}\n"
+        )
+        idx = derive_tf_helpers(src)
+        assert idx.ok
+        assert ("get", 1) not in idx.taint_free, (
+            "un-vouched read bound the inherited field — "
+            "returns-taint-free claim on ambient superclass state"
+        )
+
+    def test_inherited_field_shadow_rhs_read_refuses(self):
+        # Same mechanism one hop removed: the returned local is
+        # vouched everywhere, but one of its RHS reads binds the
+        # inherited field outside the shadow declarator's window.
+        src = (
+            "class Base {\n"
+            "    protected String data;\n"
+            "    public void seed(String req) { data = req; }\n"
+            "}\n"
+            "class T extends Base {\n"
+            "    private String get(boolean f) {\n"
+            "        String out = \"init\";\n"
+            "        if (f) { String data = \"safe\"; out = data; }\n"
+            "        else { out = data; }\n"
+            "        return out;\n"
+            "    }\n"
+            "}\n"
+        )
+        idx = derive_tf_helpers(src)
+        assert idx.ok
+        assert ("get", 1) not in idx.taint_free
+
+    def test_vouched_reads_still_qualify(self):
+        # The read vouch must not refuse genuinely local flow: every
+        # read of `d` sits inside its method-level declarator window.
+        src = _cls(
+            "    private String get(boolean f) {\n"
+            "        String d = \"other\";\n"
+            "        if (f) { d = \"safe\"; }\n"
+            "        String e = d;\n"
+            "        return e;\n"
+            "    }\n"
+        )
+        idx = derive_tf_helpers(src)
+        assert ("get", 1) in idx.taint_free
+
+    def test_block_scoped_declarator_does_not_vouch_outer_store(self):
+        # Positional rule: a declarator inside a nested block must not
+        # vouch a store OUTSIDE its window.
+        src = _cls(
+            "    private String data;\n"
+            "    private String get(boolean flag) {\n"
+            "        if (flag) { String data = \"x\"; use(data); }\n"
+            "        data = \"safe\";\n"
+            "        return data;\n"
+            "    }\n"
+        )
+        idx = derive_tf_helpers(src)
+        assert ("get", 1) not in idx.taint_free
+
+
+class TestTaintFreeMintDangerDiscipline:
+    """Every TAINT_FREE-minting arm that has SEEN a concrete string
+    member holds itself to the _tf_union bar: the member must clear
+    the caller's danger predicate, and no predicate means no danger
+    authority (refuse). A value-based finding class is violated by the
+    constant itself, however attacker-free — "'" + File.separator is
+    exactly a quote reaching a SQL sink."""
+
+    def _rd_setup(self, decl_line: str):
+        from core.analysis.cfg_builder_java import (
+            build_java_intraproc_cfg,
+        )
+        from core.analysis.const_fold_java import JavaConstIndex
+        from core.analysis.dataflow import reaching_defs
+        src = ("public class T {\n"
+               "    public void m(String x) {\n"
+               f"{decl_line}"
+               "        sink(v);\n"
+               "    }\n"
+               "}\n")
+        graph = build_java_intraproc_cfg(src, "m")
+        assert graph is not None
+        rd = reaching_defs(graph)
+        sink = next(n for n in graph.nodes()
+                    if getattr(n, "lineno", 0) == 4)
+        index = JavaConstIndex(src, (1, src.count("\n") + 1))
+        return rd, sink, index
+
+    def _adc(self, decl_line: str, **kw):
+        from core.analysis.const_fold_java import all_definers_constant
+        rd, sink, index = self._rd_setup(decl_line)
+        return all_definers_constant(rd, sink, "v", index, **kw)
+
+    def test_concat_plus_danger_member_refuses(self):
+        line = '        String v = "\'" + java.io.File.separator;\n'
+        assert self._adc(
+            line, union_member_check=lambda s: False) is None
+        assert self._adc(line) is None  # no predicate = no authority
+
+    def test_concat_plus_clear_member_still_mints(self):
+        line = '        String v = "safe" + java.io.File.separator;\n'
+        seen: list = []
+        reason = self._adc(
+            line,
+            union_member_check=lambda s: not seen.extend([s]) and True)
+        assert reason is not None
+        assert any("safe" in m for batch in seen for m in batch)
+
+    def test_concat_call_danger_member_refuses(self):
+        line = ('        String v = '
+                '"\'".concat(java.io.File.separator);\n')
+        assert self._adc(
+            line, union_member_check=lambda s: False) is None
+        assert self._adc(line) is None
+
+    def test_concat_call_clear_member_still_mints(self):
+        line = ('        String v = '
+                '"safe".concat(java.io.File.separator);\n')
+        assert self._adc(
+            line, union_member_check=lambda s: True) is not None
+
+    def test_ternary_danger_member_refuses(self):
+        line = ('        String v = x.isEmpty() ? "\'" '
+                ': java.io.File.separator;\n')
+        assert self._adc(
+            line, union_member_check=lambda s: False) is None
+        assert self._adc(line) is None
+
+    def test_ternary_clear_members_still_mint(self):
+        line = ('        String v = x.isEmpty() ? "a" '
+                ': java.io.File.separator;\n')
+        assert self._adc(
+            line, union_member_check=lambda s: True) is not None
+
+    def test_agreed_value_arm_runs_member_check(self):
+        # Two definers AGREEING on a danger constant minted the
+        # "same compile-time str constant" reason with no member
+        # check, while the identical constants DISAGREEING refused
+        # via _tf_union — the single-value arm now holds the same bar.
+        from core.analysis.const_fold_java import all_definers_constant
+        from core.analysis.cfg_builder_java import (
+            build_java_intraproc_cfg,
+        )
+        from core.analysis.const_fold_java import JavaConstIndex
+        from core.analysis.dataflow import reaching_defs
+        src = ("public class T {\n"
+               "    public void m(String x) {\n"
+               "        String v;\n"
+               "        if (x.isEmpty()) {\n"
+               "            v = \"x' OR 1=1\";\n"
+               "        } else {\n"
+               "            v = \"x' OR 1=1\";\n"
+               "        }\n"
+               "        sink(v);\n"
+               "    }\n"
+               "}\n")
+        graph = build_java_intraproc_cfg(src, "m")
+        assert graph is not None
+        rd = reaching_defs(graph)
+        sink = next(n for n in graph.nodes()
+                    if getattr(n, "lineno", 0) == 9)
+        index = JavaConstIndex(src, (1, src.count("\n") + 1))
+        assert all_definers_constant(
+            rd, sink, "v", index,
+            union_member_check=lambda s: False) is None
+        assert all_definers_constant(rd, sink, "v", index) is None
+        # Control: the check clearing keeps the constant proof.
+        reason = all_definers_constant(
+            rd, sink, "v", index, union_member_check=lambda s: True)
+        assert reason is not None and "constant" in reason
+
+    def test_agreed_value_with_production_predicate(self):
+        # The real danger authority (the value gate's per-CWE member
+        # check, a strs-list -> bool predicate): a benign agreed
+        # constant keeps minting through it; a quote-carrying one
+        # refuses. Pins the production API shape end-to-end so a
+        # predicate-signature drift cannot silently flip either
+        # direction.
+        from core.analysis.const_fold_java import all_definers_constant
+        from core.analysis.sanitizer_cut import _union_member_check
+        chk = _union_member_check("CWE-89")
+        assert chk is not None
+        benign = self._rd_setup('        String v = "abc";\n')
+        reason = all_definers_constant(
+            benign[0], benign[1], "v", benign[2],
+            union_member_check=chk)
+        assert reason is not None and "constant" in reason
+        danger = self._rd_setup(
+            "        String v = \"x' OR 1=1\";\n")
+        assert all_definers_constant(
+            danger[0], danger[1], "v", danger[2],
+            union_member_check=chk) is None
+
+    def test_agreed_int_value_needs_no_member_check(self):
+        # ints cannot carry a danger charset — the member discipline
+        # is strings-only (no over-refusal on numeric constants).
+        line = "        int v = 41 + 1;\n"
+        from core.analysis.const_fold_java import all_definers_constant
+        rd, sink, index = self._rd_setup(line)
+        assert all_definers_constant(rd, sink, "v", index) is not None

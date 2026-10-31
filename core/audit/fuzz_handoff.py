@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from core.json import load_json, save_json
+from core.source import read_text_capped
 
 logger = logging.getLogger(__name__)
 
@@ -101,12 +102,12 @@ def _checklist_sources(
                 "skipping: %r", rel,
             )
             continue
-        try:
-            if not full.is_file() or full.stat().st_size > MAX_FILE_BYTES:
-                continue
-            sources[rel] = full.read_text(errors="replace")
-        except OSError:
+        # Capped fd read after the confine: stat-then-read raced a
+        # growing plant, and a FIFO plant blocked the raw read.
+        got = read_text_capped(full, MAX_FILE_BYTES)
+        if got is None or got[1]:
             continue
+        sources[rel] = got[0]
     return sources
 
 
@@ -269,7 +270,10 @@ def emit_fuzz_dict(target_path: Path, out_dir: Path) -> Path | None:
             used_names.add(name)
             lines.append(f'{name}="{tok["value"]}"')
         afl_path = Path(out_dir) / DICT_AFL_FILENAME
-        afl_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        # Atomic: /fuzz auto-discovers this file from OTHER runs — a
+        # torn write must not hand a half dictionary to a fuzzer.
+        from core.atomic_fs import write_text_atomically
+        write_text_atomically(afl_path, "\n".join(lines) + "\n")
 
         logger.info(
             "fuzz handoff: %d dictionary token(s), %d seed hint(s) → %s",

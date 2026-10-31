@@ -315,6 +315,7 @@ def test_cli_dispatch_routes_dt_push(tmp_path: Path, monkeypatch,
     monkeypatch.setattr(
         "packages.sca.dependency_track.push_bom", fake_push_bom,
     )
+    monkeypatch.delenv("DT_API_KEY", raising=False)
 
     from packages.sca.cli import main as cli_main
     rc = cli_main([
@@ -336,20 +337,74 @@ def test_cli_dispatch_routes_dt_push(tmp_path: Path, monkeypatch,
     assert "token=tok" in out
 
 
-def test_cli_api_key_falls_back_to_env(tmp_path: Path, monkeypatch):
-    """Operator can set $DT_API_KEY instead of passing --api-key
-    on the command line (avoids leaking the key into ps / shell
-    history)."""
+def test_hostile_token_escaped_on_success_print(tmp_path: Path,
+                                                monkeypatch, capsys):
+    """The success-lane ``token=`` print relays a REMOTE SERVER's
+    bytes (the token is parsed from the DT JSON response — arbitrary
+    content via \\u escapes). Terminal escapes must be neutralised
+    and length bounded before the operator's TTY sees them."""
     bom = _make_bom(tmp_path)
+    hostile = "\x1b]0;pwned\x07tok\n" + "A" * 500
+
+    monkeypatch.setattr(
+        "packages.sca.dependency_track.push_bom",
+        lambda **kw: {"status": "uploaded", "token": hostile,
+                      "error": None},
+    )
+    from packages.sca.dependency_track import main
+    rc = main([
+        "--url", "https://dt.example.com", "--api-key", "k",
+        "--bom", str(bom), "--project", "p", "--version", "1",
+    ])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "\x1b" not in out and "\x07" not in out
+    assert "token=\\x1b" in out          # escaped, not stripped
+    assert "A" * 100 not in out          # length bounded (UUID-sized)
+
+
+def test_hostile_error_text_escaped_on_stderr(tmp_path: Path,
+                                              monkeypatch, capsys):
+    """The error lane can quote server bytes (HTTP error bodies via
+    exception text) — same neutralisation on the stderr print."""
+    bom = _make_bom(tmp_path)
+    monkeypatch.setattr(
+        "packages.sca.dependency_track.push_bom",
+        lambda **kw: {"status": "error", "token": None,
+                      "error": "DT upload failed: \x1b[2J\x1b[H boom"},
+    )
+    from packages.sca.dependency_track import main
+    rc = main([
+        "--url", "https://dt.example.com", "--api-key", "k",
+        "--bom", str(bom), "--project", "p", "--version", "1",
+    ])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "\x1b" not in err
+    assert "boom" in err
+
+
+def _capture_push(monkeypatch) -> Dict[str, Any]:
+    """Stub ``push_bom`` and return the dict its kwargs land in."""
     captured: Dict[str, Any] = {}
 
-    def fake_push_bom(**kwargs):
+    def fake_push_bom(**kwargs: Any) -> Dict[str, Any]:
         captured.update(kwargs)
         return {"status": "uploaded", "token": "t", "error": None}
 
     monkeypatch.setattr(
         "packages.sca.dependency_track.push_bom", fake_push_bom,
     )
+    return captured
+
+
+def test_cli_env_key_is_primary_path(tmp_path: Path, monkeypatch,
+                                     capsys):
+    """$DT_API_KEY alone drives the upload — the primary path — with
+    no deprecation noise on stderr (an argv key would be
+    world-readable via /proc/*/cmdline)."""
+    bom = _make_bom(tmp_path)
+    captured = _capture_push(monkeypatch)
     monkeypatch.setenv("DT_API_KEY", "env-key-xyz")
 
     from packages.sca.cli import main as cli_main
@@ -361,6 +416,64 @@ def test_cli_api_key_falls_back_to_env(tmp_path: Path, monkeypatch):
     ])
     assert rc == 0
     assert captured["api_key"] == "env-key-xyz"
+    err = capsys.readouterr().err
+    assert "warning" not in err
+    assert "deprecated" not in err
+
+
+def test_cli_env_key_wins_when_both_set(tmp_path: Path, monkeypatch,
+                                        capsys):
+    """When both --api-key and $DT_API_KEY are set the env var wins,
+    with a both-set warning on stderr. Neither key VALUE may appear
+    in any output stream."""
+    bom = _make_bom(tmp_path)
+    captured = _capture_push(monkeypatch)
+    monkeypatch.setenv("DT_API_KEY", "env-key-wins")
+
+    from packages.sca.cli import main as cli_main
+    rc = cli_main([
+        "dt-push",
+        "--url", "https://dt.example.com",
+        "--api-key", "argv-key-loses",
+        "--bom", str(bom),
+        "--project", "x", "--version", "1",
+    ])
+    assert rc == 0
+    assert captured["api_key"] == "env-key-wins"
+    out, err = capsys.readouterr()
+    assert "both --api-key and" in err
+    assert "$DT_API_KEY" in err
+    for stream in (out, err):
+        assert "env-key-wins" not in stream
+        assert "argv-key-loses" not in stream
+
+
+def test_cli_argv_key_warns_deprecated(tmp_path: Path, monkeypatch,
+                                       capsys):
+    """--api-key alone still works (deprecated fallback for existing
+    pipelines) but warns about the /proc/*/cmdline exposure on
+    stderr, steering to $DT_API_KEY. The key value never appears in
+    the warning."""
+    bom = _make_bom(tmp_path)
+    captured = _capture_push(monkeypatch)
+    monkeypatch.delenv("DT_API_KEY", raising=False)
+
+    from packages.sca.cli import main as cli_main
+    rc = cli_main([
+        "dt-push",
+        "--url", "https://dt.example.com",
+        "--api-key", "argv-only-key",
+        "--bom", str(bom),
+        "--project", "x", "--version", "1",
+    ])
+    assert rc == 0
+    assert captured["api_key"] == "argv-only-key"
+    out, err = capsys.readouterr()
+    assert "deprecated" in err
+    assert "/proc/*/cmdline" in err
+    assert "DT_API_KEY" in err
+    for stream in (out, err):
+        assert "argv-only-key" not in stream
 
 
 def test_cli_missing_api_key_returns_2(

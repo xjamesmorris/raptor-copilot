@@ -12,14 +12,13 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, TYPE_CHECKING
 from pathlib import Path
+from typing import Any
 
 from core.json import load_json
 from core.sarif.parser import load_sarif
 
-if TYPE_CHECKING:
-    from pathlib import Path
+from .kinds import MAX_SELF_FINDINGS_BYTES
 
 logger = logging.getLogger(__name__)
 
@@ -73,9 +72,15 @@ def link_related_findings(
 
 
 def _load_findings(path: Path) -> list[dict[str, Any]]:
-    # SCA-written findings artifact; missing / corrupt / oversize come
-    # back as None and fall into the isinstance guard.
-    data = load_json(Path(path), max_bytes=64 * 1024 * 1024)
+    # Self-produced budget, NOT the steered-path one: the only
+    # production caller (api.analyse) passes RunResult.findings_path
+    # from the in-process run_sca that just wrote the file, so its
+    # size is the pipeline's own legitimate output (rationale on both
+    # budgets in kinds.py). At the 64 MiB steered budget, big-target
+    # runs silently dropped every cross-tool link (oversize -> None
+    # -> "no findings"). Missing / corrupt / oversize come back as
+    # None and fall into the isinstance guard.
+    data = load_json(Path(path), max_bytes=MAX_SELF_FINDINGS_BYTES)
     return data if isinstance(data, list) else []
 
 
@@ -109,18 +114,22 @@ def _extract_cves_from_finding(f: dict[str, Any]) -> set[str]:
     sca = f.get("sca") or {}
     # Primary advisory.
     primary = sca.get("advisory") or {}
+    # isinstance guards: findings.json can be hand-edited; a non-str
+    # id/alias must not crash the whole cross-tool pass.
     adv_id = primary.get("id", "")
-    if adv_id:
+    if isinstance(adv_id, str) and adv_id:
         ids.add(adv_id.upper())
     for alias in primary.get("aliases", []):
-        ids.add(alias.upper())
+        if isinstance(alias, str):
+            ids.add(alias.upper())
     # All advisories (includes primary + siblings).
     for adv in sca.get("all_advisories", []):
         aid = adv.get("id", "")
-        if aid:
+        if isinstance(aid, str) and aid:
             ids.add(aid.upper())
         for alias in adv.get("aliases", []):
-            ids.add(alias.upper())
+            if isinstance(alias, str):
+                ids.add(alias.upper())
     return ids
 
 
@@ -135,11 +144,10 @@ def _collect_sarif_refs(
     for d in sarif_dirs:
         if not d.is_dir():
             continue
-        for sarif_file in d.glob("*.sarif"):
-            _scan_sarif_file(sarif_file, out)
+        # One recursive walk — the earlier top-level glob + recursive
+        # glob pair walked the whole tree twice.
         for sarif_file in d.glob("**/*.sarif"):
-            if sarif_file.parent != d:
-                _scan_sarif_file(sarif_file, out)
+            _scan_sarif_file(sarif_file, out)
     return out
 
 

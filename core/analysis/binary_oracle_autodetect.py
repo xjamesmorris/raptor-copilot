@@ -29,6 +29,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, TYPE_CHECKING
 
+from core.binary.elf import is_elf
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -93,6 +95,38 @@ TargetKind = Literal["library", "application", "hybrid", "auto", "unknown"]
 class _Candidate:
     path: Path
     kind: Literal["library", "executable"]
+
+
+def build_artefact_dirs_present(target_root: Path) -> bool:
+    """Cheap advisory probe: would :func:`detect_binaries` have
+    anywhere to look?
+
+    True when any named build dir or Rust cross-target dir exists, or
+    the source root's top level carries an ELF candidate
+    (autotools-style in-source builds). Mirrors detect_binaries'
+    search universe WITHOUT the provenance/DWARF work, so advisory
+    consumers (/describe readiness) key off the oracle's own dirs
+    instead of hand-typing a list that drifts.
+    """
+    target_root = Path(target_root)
+    if not target_root.is_dir():
+        return False
+    if any((target_root / d).is_dir() for d in _BUILD_DIRS):
+        return True
+    for pattern in _RUST_TARGET_GLOBS:
+        if any(hit.is_dir() for hit in target_root.glob(pattern)):
+            return True
+    # Source-root arm: top-level ELF candidates only — the same "."
+    # bucket detect_binaries scans.
+    try:
+        for p in target_root.iterdir():
+            if p.is_file():
+                cand = _classify_candidate(p)
+                if cand is not None and _is_elf(cand.path):
+                    return True
+    except OSError:
+        return False
+    return False
 
 
 def detect_binaries(
@@ -301,13 +335,9 @@ def _classify_candidate(p: Path) -> _Candidate | None:
 
 
 def _is_elf(path: Path) -> bool:
-    """Cheap 4-byte ELF magic check — no subprocess. False on any read
-    error (unreadable file is not a usable candidate anyway)."""
-    try:
-        with Path(path).open("rb") as fh:
-            return fh.read(4) == b"\x7fELF"
-    except OSError:
-        return False
+    """Shared magic check — core.binary.elf.is_elf (kept as the
+    module-local name callers and patches use)."""
+    return is_elf(path)
 
 
 def _has_dwarf(path: Path) -> bool:

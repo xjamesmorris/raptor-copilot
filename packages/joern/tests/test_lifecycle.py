@@ -329,7 +329,7 @@ class TestContextManager(unittest.TestCase):
 
     @patch.object(lifecycle, "_start_fresh", return_value=None)
     def test_session_yields_none_on_failure(self, _sf):
-        with lifecycle.joern_session() as srv:
+        with lifecycle.shared_joern_session() as srv:
             self.assertIsNone(srv)
 
     @patch.object(lifecycle, "_kill_server")
@@ -338,7 +338,7 @@ class TestContextManager(unittest.TestCase):
         srv = _mock_server()
         mock_start.return_value = srv
 
-        with lifecycle.joern_session() as s:
+        with lifecycle.shared_joern_session() as s:
             self.assertIs(s, srv)
             with lifecycle._locked() as fd:
                 state = lifecycle._read_state(fd)
@@ -354,7 +354,7 @@ class TestContextManager(unittest.TestCase):
         srv = _mock_server()
         mock_start.return_value = srv
 
-        with self.assertRaises(ValueError), lifecycle.joern_session():
+        with self.assertRaises(ValueError), lifecycle.shared_joern_session():
             raise ValueError("boom")
 
         mock_kill.assert_called_once()
@@ -368,21 +368,100 @@ class TestStaleRecycle(unittest.TestCase):
     def tearDown(self):
         self._ts.cleanup()
 
-    @patch.object(lifecycle, "_kill_server")
-    @patch.object(lifecycle, "_start_fresh")
-    def test_stale_server_recycled(self, mock_start, mock_kill):
-        state = {
-            "pid": os.getpid(), "port": 8888,
-            "refcount": 1,
-            "started_at": time.time() - lifecycle._STALE_THRESHOLD_S - 100,
-        }
+    def _write(self, state):
         with lifecycle._locked() as fd:
             lifecycle._write_state(fd, state)
+
+    def _stale_started_at(self):
+        return time.time() - lifecycle._STALE_THRESHOLD_S - 100
+
+    @patch.object(lifecycle, "_kill_server")
+    @patch.object(lifecycle, "_start_fresh")
+    def test_stale_unreferenced_server_recycled(self, mock_start, mock_kill):
+        """refcount 0 (defensive: release normally removes the state
+        file at zero) + stale → the recycle lane still retires it."""
+        self._write({
+            "pid": os.getpid(), "port": 8888,
+            "refcount": 0,
+            "started_at": self._stale_started_at(),
+        })
 
         new_srv = _mock_server(pid=99999, port=7777)
         mock_start.return_value = new_srv
 
         result = lifecycle.joern_acquire()
+        self.assertIs(result, new_srv)
+        mock_kill.assert_called_once()
+
+    @patch.object(lifecycle, "_connect_existing")
+    @patch.object(lifecycle, "_kill_server")
+    @patch.object(lifecycle, "_start_fresh")
+    def test_stale_referenced_server_not_killed(
+        self, mock_start, mock_kill, mock_connect,
+    ):
+        """refcount > 0 means another session may be mid-query on
+        this server (>8h audit runs are routine) — staleness must NOT
+        SIGKILL it. It is reused instead; joern_release retires it at
+        refcount zero."""
+        self._write({
+            "pid": os.getpid(), "port": 8888,
+            "refcount": 1,
+            "started_at": self._stale_started_at(),
+        })
+        reused = MagicMock()
+        reused.port = 8888
+        mock_connect.return_value = reused
+
+        result = lifecycle.joern_acquire()
+
+        self.assertIs(result, reused)
+        mock_kill.assert_not_called()
+        mock_start.assert_not_called()
+        with lifecycle._locked() as fd:
+            state = lifecycle._read_state(fd)
+        self.assertEqual(state["refcount"], 2)
+
+    @patch.object(lifecycle, "_connect_existing")
+    @patch.object(lifecycle, "_kill_server")
+    @patch.object(lifecycle, "_start_fresh")
+    def test_fresh_server_not_recycled(
+        self, mock_start, mock_kill, mock_connect,
+    ):
+        """Threshold direction two: a server younger than the horizon
+        is never staleness-recycled regardless of refcount."""
+        self._write({
+            "pid": os.getpid(), "port": 8888,
+            "refcount": 0,
+            "started_at": time.time() - 60,
+        })
+        reused = MagicMock()
+        reused.port = 8888
+        mock_connect.return_value = reused
+
+        result = lifecycle.joern_acquire()
+
+        self.assertIs(result, reused)
+        mock_kill.assert_not_called()
+
+    @patch.object(lifecycle, "_connect_existing", return_value=None)
+    @patch.object(lifecycle, "_kill_server")
+    @patch.object(lifecycle, "_start_fresh")
+    def test_stale_referenced_but_dead_server_still_recycled(
+        self, mock_start, mock_kill, _ce,
+    ):
+        """The refcount gate defers only the STALENESS kill — a
+        stale+referenced server that fails the health/liveness check
+        is still recycled through the ordinary dead-server lane."""
+        self._write({
+            "pid": os.getpid(), "port": 8888,
+            "refcount": 3,
+            "started_at": self._stale_started_at(),
+        })
+        new_srv = _mock_server(pid=99999, port=7777)
+        mock_start.return_value = new_srv
+
+        result = lifecycle.joern_acquire()
+
         self.assertIs(result, new_srv)
         mock_kill.assert_called_once()
 
@@ -538,3 +617,128 @@ class TestAuthCredentialPersistence(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSessionNames(unittest.TestCase):
+    def test_alias_and_distinct_package_root_manager(self):
+        """lifecycle.shared_joern_session is the shared refcounted
+        manager; the legacy lifecycle.joern_session name stays as an
+        alias, and the package-root joern_session (private per-call
+        server) is a DIFFERENT function — the identical names once
+        made an import-path switch silently change server lifetime."""
+        import packages.joern as joern_pkg
+
+        self.assertIs(lifecycle.joern_session,
+                      lifecycle.shared_joern_session)
+        self.assertIsNot(joern_pkg.joern_session,
+                         lifecycle.shared_joern_session)
+
+
+class TestSignalServerSentinelRefusal(unittest.TestCase):
+    """pid ≤ 1 is never signalled — and a real leader still is.
+
+    The pid reaches _signal_server from a lifecycle STATE FILE; a
+    corrupt record carrying 1 passes the own-leader check (init leads
+    group 1) and killpg(1, sig) is kill(-1, sig) — a same-uid
+    broadcast. Every kill/killpg below is a recording fake so a
+    regressed guard fails an assertion instead of signalling for real.
+    """
+
+    def test_sentinel_pids_refused_on_both_delivery_paths(self):
+        for pid in (1, 0, -1):
+            sent: list[tuple[str, int, int]] = []
+            with patch.object(
+                lifecycle.os, "killpg",
+                lambda pgid, sig: sent.append(("killpg", pgid, sig)),
+            ), patch.object(
+                lifecycle.os, "kill",
+                lambda p, sig: sent.append(("kill", p, sig)),
+            ):
+                with self.assertRaises(ProcessLookupError):
+                    lifecycle._signal_server(pid, 15)
+            self.assertEqual(
+                sent, [], f"signalled sentinel pid {pid}: {sent}",
+            )
+
+    def test_real_leader_still_group_signalled(self):
+        # Direction two: the guard must not swallow legitimate
+        # group signals to a spawn-recorded leader.
+        pid = 2**22 + 555
+        sent: list[tuple[str, int, int]] = []
+        with patch.object(
+            lifecycle.os, "getpgid", lambda p: p,
+        ), patch.object(
+            lifecycle.os, "killpg",
+            lambda pgid, sig: sent.append(("killpg", pgid, sig)),
+        ), patch.object(
+            lifecycle.os, "kill",
+            lambda p, sig: sent.append(("kill", p, sig)),
+        ):
+            lifecycle._signal_server(pid, 15)
+        self.assertEqual(sent, [("killpg", pid, 15)])
+
+
+class StatePathResolution(unittest.TestCase):
+    """Call-time resolution of the cross-session state/lock paths."""
+
+    def setUp(self):
+        self._saved_env = {
+            k: os.environ.get(k) for k in ("XDG_CACHE_HOME", "HOME")
+        }
+        self._saved_seams = (
+            lifecycle._STATE_DIR, lifecycle._STATE_FILE,
+            lifecycle._LOCK_FILE,
+        )
+        lifecycle._STATE_DIR = None
+        lifecycle._STATE_FILE = None
+        lifecycle._LOCK_FILE = None
+        self._tmp = tempfile.TemporaryDirectory()
+        self._dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        (lifecycle._STATE_DIR, lifecycle._STATE_FILE,
+         lifecycle._LOCK_FILE) = self._saved_seams
+        for key, val in self._saved_env.items():
+            if val is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = val
+        self._tmp.cleanup()
+
+    def test_xdg_cache_home_read_at_call_time(self):
+        """XDG_CACHE_HOME is read per call, not snapshotted at
+        import: a pin installed after the module was imported
+        redirects state, lock, and dir together."""
+        os.environ["XDG_CACHE_HOME"] = str(self._dir / "xdg-cache")
+        root = self._dir / "xdg-cache" / "raptor"
+        self.assertEqual(lifecycle._state_dir(), root)
+        self.assertEqual(lifecycle._state_file(),
+                         root / "joern-server.json")
+        self.assertEqual(lifecycle._lock_file(),
+                         root / "joern-server.lock")
+
+    def test_unset_env_keeps_shared_default_path(self):
+        """No XDG_CACHE_HOME → the legacy shared rendezvous
+        ``~/.cache/raptor`` byte-identical (fabricated HOME so the
+        real home is never resolved)."""
+        os.environ.pop("XDG_CACHE_HOME", None)
+        fakehome = self._dir / "fakehome"
+        os.environ["HOME"] = str(fakehome)
+        root = fakehome / ".cache" / "raptor"
+        self.assertEqual(lifecycle._state_dir(), root)
+        self.assertEqual(lifecycle._state_file(),
+                         root / "joern-server.json")
+        self.assertEqual(lifecycle._lock_file(),
+                         root / "joern-server.lock")
+        self.assertFalse(fakehome.exists())
+
+    def test_seams_win_over_env(self):
+        """Monkeypatched seams (this suite's _TmpState pattern) win
+        over any env pin."""
+        os.environ["XDG_CACHE_HOME"] = str(self._dir / "ignored")
+        lifecycle._STATE_DIR = self._dir
+        lifecycle._STATE_FILE = self._dir / "s.json"
+        lifecycle._LOCK_FILE = self._dir / "s.lock"
+        self.assertEqual(lifecycle._state_dir(), self._dir)
+        self.assertEqual(lifecycle._state_file(), self._dir / "s.json")
+        self.assertEqual(lifecycle._lock_file(), self._dir / "s.lock")

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 
+from packages.sca.kinds import HYGIENE_PREFIX
 from packages.sca.models import (
     Confidence, Dependency, HygieneFinding,
 )
@@ -149,13 +150,13 @@ def _make_finding(
     pair_id = verdict.pair.as_str()
     return HygieneFinding(
         finding_id=(
-            f"sca:hygiene:platform_compat:PyPI:{dep.name}:"
+            f"{HYGIENE_PREFIX}platform_compat:PyPI:{dep.name}:"
             f"{dep.version}:{pair_id}"
         ),
         kind="platform_compat",
         dependency=dep,
         detail=detail,
-        severity=sev,
+        severity=sev,  # type: ignore[arg-type]
         confidence=Confidence(
             "high",
             reason="wheel platform tags compared against project matrix",

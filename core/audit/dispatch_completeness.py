@@ -30,6 +30,7 @@ from dataclasses import dataclass
 
 from ._util import find_enclosing_function as _find_enclosing_function
 from pathlib import Path
+from core.source.lines import split_lines
 
 logger = logging.getLogger(__name__)
 
@@ -222,7 +223,7 @@ def _extract_if_elif_tables_from_source(
 ) -> list[DispatchTable]:
     """Find if/elif chains comparing a variable to string literals."""
     tables: list[DispatchTable] = []
-    lines = source.splitlines()
+    lines = split_lines(source)
     i = 0
     while i < len(lines):
         m = _IF_ELIF_STR_RE.match(lines[i])
@@ -292,7 +293,7 @@ def _find_string_producers(
             ):
                 producers.append((node.value.value, node.lineno))
         elif isinstance(node, ast.Assign) or (isinstance(node, ast.AnnAssign) and node.value is not None):
-            _collect_string_constants(node.value, producers)
+            _collect_string_constants(node.value, producers)  # type: ignore[arg-type]
     return producers
 
 
@@ -387,9 +388,10 @@ def find_dispatch_gaps(
             absent, falls back to reading each file from ``call_graphs``
             keys.
         target_root: The run's source root.  Disk fallback reads are
-            confined to it (symlink-aware); without it the fallback
-            keeps only the lexical traversal guard and resolves
-            relative to the process CWD (legacy behaviour).
+            confined to it (symlink-aware); without it there is no
+            disk fallback at all — a bare relative read would resolve
+            against the process CWD, never the scanned target — so
+            files absent from ``source_texts`` read as unavailable.
 
     Returns:
         List of ``DispatchGap`` instances describing produced-but-
@@ -547,7 +549,7 @@ def _shares_affix(candidate: str, existing_keys: set[str], min_affix: int = 3) -
 
 
 def _key_shape(key: str) -> str:
-    """Classify a key's shape: 'lower', 'upper', 'mixed', 'other'."""
+    """Classify a key's shape: 'lower', 'upper', 'title', 'mixed'."""
     if key.islower() or ("_" in key and key.replace("_", "").islower()):
         return "lower"
     if key.isupper() or ("_" in key and key.replace("_", "").isupper()):
@@ -570,24 +572,40 @@ def _get_source(
         return None
     if source_texts and fpath in source_texts:
         return source_texts[fpath]
-    if target_root is not None:
-        # Symlink-aware containment: the lexical guard above cannot
-        # catch an in-repo symlink pointing outside the tree, and a
-        # bare Path(fpath) resolves against the process CWD rather
-        # than the scanned target.
-        from core.paths import confine
-
-        full = confine(target_root, fpath)
-        if full is None:
-            logger.warning(
-                "_get_source: refusing path outside target root: %r",
-                fpath,
-            )
-            return None
-    else:
-        full = Path(fpath)
-    try:
-        with full.open(encoding="utf-8", errors="replace") as f:
-            return f.read()
-    except OSError:
+    if target_root is None:
+        # No root to confine against: a bare Path(fpath) would resolve
+        # relative to the process CWD — the tool's own repo dir, never
+        # the scanned target. Source-unavailable, not a CWD read.
+        logger.debug(
+            "_get_source: no target root — skipping disk fallback "
+            "for %r", fpath,
+        )
         return None
+    # Symlink-aware containment: the lexical guard above cannot
+    # catch an in-repo symlink pointing outside the tree.
+    from core.paths import confine
+
+    full = confine(target_root, fpath)
+    if full is None:
+        logger.warning(
+            "_get_source: refusing path outside target root: %r",
+            fpath,
+        )
+        return None
+    # Capped like every migrated core/audit sibling: unbounded
+    # f.read() let a planted multi-hundred-MB file cost its full
+    # size in peak memory. Refuse the truncated prefix outright —
+    # dispatch-arm analysis over a partial file would mint
+    # missing-case hypotheses about arms the cap cut off.
+    from core.source import read_text_capped
+    got = read_text_capped(full, errors="replace")
+    if got is None:
+        return None
+    text, truncated = got
+    if truncated:
+        logger.debug(
+            "_get_source: %r exceeds the source read cap — "
+            "skipping dispatch analysis for it", fpath,
+        )
+        return None
+    return text

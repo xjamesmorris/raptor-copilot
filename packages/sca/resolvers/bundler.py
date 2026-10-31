@@ -22,12 +22,12 @@ confined to the temp dir.
 from __future__ import annotations
 
 import logging
-import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 
 from . import ResolverResult, _check_tool, _run
+from ._safe_io import copy_regular_file
 
 logger = logging.getLogger(__name__)
 
@@ -80,16 +80,19 @@ class BundlerResolver:
         # in-place which is why the temp-copy pattern is needed.
         with tempfile.TemporaryDirectory(prefix="raptor-sca-bundler-") as tmp:
             tmp_path = Path(tmp)
+            # lstat-gated, size-bounded copies — these paths live in
+            # the SCANNED (hostile) directory; a plain ``copy2``
+            # follows symlinks (``Gemfile.lock -> ~/.aws/credentials``
+            # exfiltrates operator files into the resolve, and into
+            # cached / reported tool output) and opens special files.
             for fname in ("Gemfile", "Gemfile.lock"):
-                src = project_dir / fname
-                if src.exists():
-                    shutil.copy2(src, tmp_path / fname)
+                copy_regular_file(project_dir / fname, tmp_path / fname)
             # Copy top-level *.gemspec files so the ``gemspec`` DSL
             # directive in Gemfile resolves. Note: ``eval_gemfile``
             # siblings are NOT covered — those require bespoke
             # handling per project layout.
             for spec in project_dir.glob("*.gemspec"):
-                shutil.copy2(spec, tmp_path / spec.name)
+                copy_regular_file(spec, tmp_path / spec.name)
 
             try:
                 proc = _run(

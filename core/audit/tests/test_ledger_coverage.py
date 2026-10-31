@@ -1,11 +1,11 @@
 """Every audit call class must ride the budget-governed client and
 land in the unified ledger.
 
-Observed field failure (openssl comparison run): telemetry $29.18 vs
-summary ledger $24.10 — 17.4% divergence, $4.18 true cap overshoot.
+Observed field failure (openssl comparison run): telemetry vs summary
+ledger — 17.4% divergence and a true cap overshoot.
 Two isolated causes: (a) the second call of two-call reviews
 (clean-check / refinement continuations) was never phase-booked
-($8.93 unbooked); (b) iris / spec_inference / study / synthesis /
+(a material sum unbooked); (b) iris / spec_inference / study / synthesis /
 summary classes built private ``LLMClient()`` instances whose spend
 never reached the run ledger and whose dispatch bypassed the per-call
 reservation gate (a post-loop iris call ran 11 minutes after budget
@@ -140,7 +140,7 @@ class TestStudySpendDelta:
 
         import core.concepts.study as _study_mod
 
-        def fake_run_study(study_list, out_dir, client):
+        def fake_run_study(study_list, out_dir, client, **kwargs):
             client._note("study", 0.5)
 
         monkeypatch.setattr(_study_mod, "run_study", fake_run_study)

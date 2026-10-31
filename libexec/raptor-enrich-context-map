@@ -5,12 +5,13 @@
 
 Usage: raptor-enrich-context-map <understand_dir>
 
-Replaces the pattern of calling each enricher script separately, which
-rebuilds the checklist/inventory 3-4 times. This loads checklist and
-context-map once, runs each enricher function in sequence, and saves
-the result once at the end.
-
-Individual enricher scripts remain for standalone use.
+A combined alternative to calling each enricher script separately
+(which rebuilds the checklist/inventory 3-4 times): loads checklist
+and context-map once, runs each enricher function in sequence, and
+saves the result once at the end. NOTE: covers the callgraph /
+forward-reachable / ast-view / sites / sinks stages only, and no
+production skill dispatches it yet — map.md still runs the standalone
+shims, which remain the production path.
 """
 import argparse
 import logging
@@ -35,11 +36,31 @@ if not (os.environ.get("CLAUDECODE")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import core.startup.process_init  # noqa: E402,F401
 from core.artifacts.context_map_budget import (  # noqa: E402
-    enforce_context_map_budget,
+    save_context_map,
 )
-from core.json import load_json, save_json  # noqa: E402
+from core.json import load_json  # noqa: E402
 
 logger = logging.getLogger(__name__)
+
+
+def _stage_failed(stage: str, exc: Exception) -> None:
+    """One loud stderr line per failed stage, escaped in-file.
+
+    EVERY stage's failure lane must route through here. The script
+    configures no logging ITSELF — substrate imports happen to
+    install an escaping console formatter as a side effect, but a
+    lane's escaping (and its visibility: a bare logger record can
+    vanish, leaving "no enrichments applied" with zero diagnostic)
+    must not hang on a transitive import any refactor can drop. The
+    print below owns the terminal escape; the standalone shims print
+    explicit skip reasons. Traceback detail stays on the debug
+    channel."""
+    from core.security.log_sanitisation import sanitise_for_terminal
+    # Exception text can quote target-file/LLM-artifact bytes.
+    print(f"raptor-enrich-context-map: {stage} failed: "
+          f"{exc.__class__.__name__}: {sanitise_for_terminal(str(exc))}",
+          file=sys.stderr)
+    logger.debug("%s failed", stage, exc_info=True)
 
 
 def main() -> int:
@@ -69,11 +90,9 @@ def main() -> int:
               "JSON object", file=sys.stderr)
         return 1
 
-    checklist = load_json(understand_dir / "checklist.json") or {}
-    target_path = (
-        checklist.get("target_path") if isinstance(checklist, dict) else None
-    )
-    checklist_path = understand_dir / "checklist.json"
+    from core.inventory import read_checklist
+    checklist = read_checklist(understand_dir)
+    target_path = checklist.get("target_path")
 
     # checklist.json is a mutable run artefact — corroborate the
     # recovered target against the target_path sealed into
@@ -86,26 +105,40 @@ def main() -> int:
                   "recovered target", file=sys.stderr)
             return 1
 
-    changed = False
     summary: list[str] = []
 
     if not target_path:
         print("raptor-enrich-context-map: checklist missing target_path; "
               "only callgraph enrichment available", file=sys.stderr)
 
-    # 1. Call-graph edges (uses checklist only)
+    # 1. Call-graph edges (uses checklist only). Store routing
+    # mirrors the per-stage sibling (raptor-enrich-context-map-
+    # callgraph): the combined shim was the sibling-drift producer
+    # that never ingested, so maps enriched through it carried only
+    # the capped in-artifact list.
     try:
         from core.orchestration.context_map_callgraph import (
             enrich_with_call_edges,
         )
+        graph_store = None
+        if target_path:
+            try:
+                from core.understand_graph.store import graph_path_for_run
+                candidate = graph_path_for_run(
+                    understand_dir, str(target_path))
+                if not candidate.resolve().is_relative_to(understand_dir):
+                    graph_store = candidate
+            except Exception:  # noqa: BLE001 — routing is additive; enrichment must survive resolution failure
+                graph_store = None
         n_edges = enrich_with_call_edges(
-            context_map, checklist_path, checklist=checklist,
+            context_map, checklist=checklist,
+            graph_store=graph_store, run_dir=understand_dir,
+            target_path=str(target_path or ""),
         )
         if n_edges:
-            changed = True
             summary.append(f"callgraph: {n_edges} edges")
     except Exception as e:
-        logger.debug("callgraph enrichment failed: %s", e, exc_info=True)
+        _stage_failed("callgraph enrichment", e)
 
     # 2. Inventory shared by ast-view, forward-reachable, and sites.
     # Reuse the checklist as the inventory — no re-parse of the
@@ -120,7 +153,7 @@ def main() -> int:
             with tempfile.TemporaryDirectory() as td:
                 inventory = build_inventory(str(target_path), td)
         except Exception as e:
-            logger.debug("inventory build failed: %s", e, exc_info=True)
+            _stage_failed("inventory build", e)
 
     # 3. Forward reachability (needs target_path + inventory)
     if target_path:
@@ -132,11 +165,9 @@ def main() -> int:
                 context_map, Path(target_path), inventory=inventory,
             )
             if n_ep:
-                changed = True
                 summary.append(f"forward-reachable: {n_ep} entry points")
         except Exception as e:
-            logger.debug("forward-reachable enrichment failed: %s", e,
-                         exc_info=True)
+            _stage_failed("forward-reachable enrichment", e)
 
     # 4. AST views (needs target_path + inventory)
     if inventory and target_path:
@@ -148,10 +179,9 @@ def main() -> int:
                 context_map, Path(target_path), inventory=inventory,
             )
             if n_ast:
-                changed = True
                 summary.append(f"ast-view: {n_ast} entries")
         except Exception as e:
-            logger.debug("ast-view enrichment failed: %s", e, exc_info=True)
+            _stage_failed("ast-view enrichment", e)
 
     # 5. Sites (source_intel — spatch, needs target_path)
     if target_path:
@@ -181,15 +211,18 @@ def main() -> int:
             counts = enrich_context_map_with_sites(
                 context_map, si, repo_root=target_path,
             )
-            total = counts["ownership_model"] + counts["privilege_model"]
-            if total:
-                changed = True
+            from packages.code_understanding.context_map_sites import (
+                total_enriched_sites,
+            )
+            if total_enriched_sites(counts):
                 summary.append(
                     f"sites: {counts['ownership_model']} ownership + "
-                    f"{counts['privilege_model']} privilege"
+                    f"{counts['privilege_model']} privilege + "
+                    f"{counts['shared_state']} shared-state + "
+                    f"{counts['crypto_inventory']} crypto"
                 )
         except Exception as e:
-            logger.debug("sites enrichment failed: %s", e, exc_info=True)
+            _stage_failed("sites enrichment", e)
 
     # 6. Sink discovery (needs target_path)
     if target_path:
@@ -228,17 +261,19 @@ def main() -> int:
                 context_map, Path(target_path), **sink_kwargs,
             )
             if n_sinks:
-                changed = True
                 summary.append(f"sinks: {n_sinks} entries")
         except Exception as e:
-            logger.warning("sink enrichment failed: %s", e, exc_info=True)
+            _stage_failed("sink enrichment", e)
 
-    # Budget check even when nothing changed: an already-oversize map
-    # from an earlier writer must not survive a pass through here.
-    if enforce_context_map_budget(context_map):
-        changed = True
-    if changed:
-        save_json(context_map_path, context_map)
+    # Save unconditionally through the producer chokepoint: even a
+    # no-op enrichment pass must not let an oversize or pretty-printed
+    # map from an earlier writer survive — compact re-encoding alone
+    # can bring an over-read-cap artifact back under the consumer cap,
+    # and the chokepoint degrades further only when the compact form
+    # still exceeds the producer budget.
+    applied = save_context_map(context_map_path, context_map)
+    if applied:
+        summary.append(f"size budget: {'; '.join(applied)}")
 
     if summary:
         print(f"raptor-enrich-context-map: {', '.join(summary)} "

@@ -42,16 +42,38 @@ def test_cheap_did_not_claim_fp_never_short_circuits(tmp_path):
 
 
 def test_cheap_says_fp_with_trusted_cell_short_circuits(tmp_path):
+    # Trust earned on the SAME target the skip spends on — the glue
+    # forwards ``repo`` through both the record and the query side.
     sc = ModelScorecard(tmp_path / "sc.json")
     sc.record_events([
         {"decision_class": "x:y", "model": "m",
-         "event_type": EventType.CHEAP_SHORT_CIRCUIT, "outcome": "correct"}
+         "event_type": EventType.CHEAP_SHORT_CIRCUIT, "outcome": "correct",
+         "repo": "/proj/alpha"}
     ] * 200)
     decision = prefilter_decision(
         sc, decision_class="x:y", model="m", cheap_says_fp=True,
+        repo="/proj/alpha",
     )
     assert decision.short_circuit is True
     assert decision.policy == Policy.SHORT_CIRCUIT
+
+
+def test_cheap_says_fp_cross_target_does_not_short_circuit(tmp_path):
+    """Same trusted cell, but the querying target contributed none of
+    the evidence and the cell is below the diversity floor — the glue
+    must surface the withheld grant (LEARNING → no skip)."""
+    sc = ModelScorecard(tmp_path / "sc.json")
+    sc.record_events([
+        {"decision_class": "x:y", "model": "m",
+         "event_type": EventType.CHEAP_SHORT_CIRCUIT, "outcome": "correct",
+         "repo": "/proj/alpha"}
+    ] * 200)
+    decision = prefilter_decision(
+        sc, decision_class="x:y", model="m", cheap_says_fp=True,
+        repo="/proj/stranger",
+    )
+    assert decision.short_circuit is False
+    assert decision.policy == Policy.LEARNING
 
 
 def test_cheap_says_fp_in_learning_falls_through(tmp_path):
@@ -110,6 +132,24 @@ def test_records_incorrect_with_sample_when_cheap_was_wrong(tmp_path):
     assert len(stat.disagreement_samples) == 1
     assert "hardcoded" in stat.disagreement_samples[0]["this_reasoning"]
     assert "user-tainted" in stat.disagreement_samples[0]["other_reasoning"]
+
+
+def test_record_outcome_forwards_repo_to_diversity_ledger(tmp_path):
+    """The record side of the glue threads ``repo`` through to the
+    substrate's target-diversity ledger — without it, consumers could
+    never accrue the diversity the gate demands."""
+    import json
+
+    path = tmp_path / "sc.json"
+    sc = ModelScorecard(path)
+    record_prefilter_outcome(
+        sc, decision_class="x:y", model="m",
+        cheap_says_fp=True, full_says_fp=True,
+        cheap_reasoning="fp", full_reasoning="fp",
+        repo="/proj/alpha",
+    )
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
+    assert len(on_disk["models"]["m"]["x:y"]["repos"]) == 1
 
 
 def test_no_record_when_cheap_did_not_claim_fp(tmp_path):
@@ -272,3 +312,41 @@ def test_run_cheap_fp_check_custom_verdict_literals():
         client2, system="s", schema=_SCHEMA,
         allowed_verdicts=("clear_safe", "needs_analysis"),
     ) is None
+
+
+class TestReasoningShapeCoercion:
+    """Schema-junk can put a dict/list where reasoning belongs; the
+    ``[:_MAX_REASONING_CHARS]`` slice raised TypeError, uncaught
+    in-module. One str() coercion at each boundary."""
+
+    def test_record_outcome_tolerates_dict_reasoning(self, tmp_path):
+        from core.llm.scorecard.scorecard import ModelScorecard
+        sc = ModelScorecard(tmp_path / "sc.json")
+        record_prefilter_outcome(
+            sc,
+            decision_class="dc", model="m",
+            cheap_says_fp=True, full_says_fp=False,
+            cheap_reasoning={"not": "a string"},
+            full_reasoning=["also", "not"],
+        )
+        stat = sc.get_stat("dc", "m")
+        assert stat.events["cheap_short_circuit"].incorrect == 1
+
+    def test_run_cheap_fp_check_str_coerces_reasoning(self):
+        class FakeResponse:
+            pass
+
+        class FakeClient:
+            def generate_structured(self, **kw):
+                return {"verdict": "clear_fp",
+                        "reasoning": {"shape": "junk"}}
+
+        result = run_cheap_fp_check(
+            FakeClient(),
+            system="s",
+            schema={"type": "object"},
+        )
+        assert result is not None
+        verdict, reasoning = result
+        assert verdict == "clear_fp"
+        assert isinstance(reasoning, str)

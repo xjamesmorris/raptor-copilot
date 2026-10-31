@@ -42,6 +42,25 @@ class TestVerdictBucketing:
         assert b["true_positives"] == 0
         assert b["false_positives"] == 0
 
+    def test_junk_verdict_shape_is_unverdicted(self):
+        # A non-bool shape that bypassed response validation is a
+        # non-verdict — same bucket as an explicit null.
+        results = [{"is_true_positive": "yes"},
+                   {"is_true_positive": 1}]
+        b = bucket_orchestration_results(results)
+        assert b["unverdicted"] == 2
+        assert b["true_positives"] == 0
+        assert b["false_positives"] == 0
+
+    def test_junk_exploitable_shape_is_not_counted_exploitable(self):
+        # Pre-fix the truthy check read `"yes"` as an exploitable
+        # verdict on the headline funnel count.
+        results = [{"is_true_positive": True, "is_exploitable": "yes"}]
+        b = bucket_orchestration_results(results)
+        assert b["true_positives"] == 1
+        assert b["exploitable"] == 0
+        assert b["inconsistent"] == 0
+
     def test_missing_key_is_not_counted(self):
         # Pre-existing semantics: results without the ``is_true_positive``
         # key are treated as "not analysed" and contribute to none of
@@ -319,3 +338,21 @@ class TestStatusAwareBucketing:
         b = bucket_orchestration_results(results)
         assert b["failed"] == 1
         assert b["true_positives"] == 0
+
+
+class TestNonDictRows:
+    """Whole-row shape drift: a bare string or scalar row must be
+    skipped, never crash the bucketing (str rows raised
+    AttributeError at `.get`, int rows TypeError at `"error" in r`)."""
+
+    def test_string_row_skipped(self):
+        b = bucket_orchestration_results(
+            ["an error occurred somewhere",
+             {"is_true_positive": True, "is_exploitable": False}])
+        assert b["true_positives"] == 1
+        assert b["failed"] == 0
+
+    def test_int_and_none_rows_skipped(self):
+        b = bucket_orchestration_results([42, None, []])
+        assert b["true_positives"] == 0
+        assert b["failed"] == 0

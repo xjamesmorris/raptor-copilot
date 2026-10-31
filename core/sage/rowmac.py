@@ -54,13 +54,11 @@ import hashlib
 import hmac
 import os
 import re
-import secrets
-import stat
-import time
 from collections.abc import Mapping
 from pathlib import Path
 
 from core.logging import get_logger
+from core.security import mac_key
 
 logger = get_logger(__name__)
 
@@ -70,14 +68,18 @@ _KEY_LEN = 32
 # group/other-readable). Distinct from "absent" — an unusable key must
 # never be silently replaced (re-keying would mask tampering and
 # permanently demote legitimate rows) and must never mint or verify.
-_REFUSED = object()
+_REFUSED = mac_key.REFUSED
 
 # One loud warning per suspect path per process; repeats go to debug.
 _warned_paths: set = set()
 
 # Trailing token appended by stamp(); strip() removes it (and any
 # whitespace immediately before it) from the end of the content.
-_TOKEN_RE = re.compile(r"\s*\[mac:([0-9a-f]{64})\]\s*$")
+# (?<!\s) pins the match to the start of its whitespace run (a bare
+# leading \s* re-consumes a whitespace run from every scan position
+# — quadratic); the earliest match always starts at the run start,
+# so the stripped span is unchanged.
+_TOKEN_RE = re.compile(r"(?<!\s)\s*\[mac:([0-9a-f]{64})\]\s*$")
 
 
 def _key_path() -> Path:
@@ -108,8 +110,9 @@ def _warn_once_suspect_key(path: Path, reason: str, remedy: str) -> None:
     )
 
 
-def _read_existing_key(path: Path):
-    """Read an EXISTING key with the fd-fstat discipline.
+def _read_existing_key(path: Path) -> bytes | mac_key.Refused | None:
+    """Read an EXISTING key with the shared fd-fstat discipline
+    (:func:`core.security.mac_key.read_existing_key`).
 
     Returns the key bytes, ``None`` when the file is absent, or
     ``_REFUSED`` when the file exists but is unusable. An exposed or
@@ -120,125 +123,34 @@ def _read_existing_key(path: Path):
     permission bits. Creation (``O_EXCL`` + 0600) needs no such check;
     this guard covers only the read-existing branch.
     """
-    try:
-        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        # ELOOP: symlink at the key path. Other OSErrors are equally
-        # unusable — never fall back to a follow-the-link read.
-        _warn_once_suspect_key(
-            path, f"open refused ({exc})",
-            "if the key is a symlink, remove it and investigate how it "
-            "got there; a fresh key is created on the next store",
-        )
-        return _REFUSED
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            _warn_once_suspect_key(
-                path, "not a regular file",
-                "remove the object at that path and investigate",
-            )
-            return _REFUSED
-        if st.st_uid != os.geteuid():
-            _warn_once_suspect_key(
-                path,
-                f"owned by uid={st.st_uid}, expected uid={os.geteuid()}",
-                "investigate the foreign-owned key; restore your own "
-                "0600 key file",
-            )
-            return _REFUSED
-        if st.st_mode & 0o077:
-            _warn_once_suspect_key(
-                path,
-                f"mode {stat.S_IMODE(st.st_mode):04o} grants group/other "
-                "access",
-                f"chmod 600 {path}",
-            )
-            return _REFUSED
-        # A single os.read may return fewer bytes than requested
-        # (network filesystems); a short read would land a healthy key
-        # in the wrong-length refusal, so loop to EOF. The cap stays at
-        # _KEY_LEN * 4 — genuinely oversized files still fail-close in
-        # the caller's length check.
-        chunks: list[bytes] = []
-        remaining = _KEY_LEN * 4
-        while remaining > 0:
-            chunk = os.read(fd, remaining)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        return b"".join(chunks)
-    except OSError:
-        return None
-    finally:
-        os.close(fd)
+    return mac_key.read_existing_key(
+        path, key_len=_KEY_LEN, warn=_warn_once_suspect_key)
 
 
 def _load_or_create_key() -> bytes | None:
-    """Read the key, lazily creating it (0700 dir, 0600 file) if absent.
+    """Read the key, lazily creating it (0700 dir, 0600 file) if absent
+    — the shared hardened discipline in
+    :func:`core.security.mac_key.load_or_create_key`.
 
     Creation uses ``O_EXCL`` so concurrent first-users race safely: the
-    loser re-reads whatever the winner wrote. A briefly-empty file (the
-    winner is between ``open`` and ``write``) is retried a few times.
+    loser polls through the winner's create-to-write window (a briefly
+    empty/short file) and reads whatever the winner wrote.
 
     Returns ``None`` when a key file exists but is unusable (symlink,
     foreign owner, permissive mode, wrong length): the suspect key is
     never used, never replaced, and the caller refuses to mint/verify.
-    A zero/short key (torn write from ENOSPC or a kill between the
-    ``O_EXCL`` create and the write) is refused like ``_REFUSED`` —
-    silently HMAC'ing with an empty or truncated key would make every
-    token forgeable, re-enabling the poisoned-row mechanical effect
-    the MAC exists to block.
+    A STABLE zero/short key (torn write from ENOSPC or a kill between
+    the ``O_EXCL`` create and the write) is refused immediately with a
+    wrong-length warning — silently HMAC'ing with an empty or truncated
+    key would make every token forgeable, re-enabling the poisoned-row
+    mechanical effect the MAC exists to block, and spinning the race
+    budget on it would stall every mint/verify behind a misleading
+    race-window message when the only remedy is removing the file.
     """
-    path = _key_path()
-    data = _read_existing_key(path)
-    if data is _REFUSED:
-        return None
-    if data is not None and len(data) == _KEY_LEN:
-        return data
-    if data:
-        _warn_once_suspect_key(
-            path,
-            f"key file is {len(data)} bytes (expected {_KEY_LEN}) — "
-            "torn write or truncation",
-            f"remove {path} to re-mint a fresh key (tokens minted "
-            "under the old key will demote to hint-only)",
-        )
-        return None
-
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    key = secrets.token_bytes(_KEY_LEN)
-    try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        # Lost the creation race — re-read the winner's key (same
-        # fd-fstat discipline: an attacker pre-placing a symlink also
-        # lands here, because O_EXCL refuses to create through one).
-        for _ in range(20):
-            raced = _read_existing_key(path)
-            if raced is _REFUSED:
-                return None
-            if raced is not None and len(raced) == _KEY_LEN:
-                return raced
-            time.sleep(0.01)
-        # Still absent/empty/short after the race window: the "winner"
-        # never finished its write. Refuse — never fall back to an
-        # empty-key HMAC.
-        _warn_once_suspect_key(
-            path,
-            "key file never reached full length after the creation "
-            "race window",
-            f"remove {path} so the next store re-mints a fresh key",
-        )
-        return None
-    try:
-        os.write(fd, key)
-    finally:
-        os.close(fd)
-    return key
+    return mac_key.load_or_create_key(
+        _key_path(), key_len=_KEY_LEN, warn=_warn_once_suspect_key,
+        read_existing=_read_existing_key,
+        recreate_hint="a fresh key is created on the next store")
 
 
 def _canonical(fields: Mapping[str, object]) -> bytes:

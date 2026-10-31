@@ -92,6 +92,13 @@ class TestGetSafeEnv:
         env = RaptorConfig.get_safe_env()
         assert env.get("PYTHONUNBUFFERED") == "1"
 
+    def test_degraded_untrusted_consent_reaches_raptor_workers(self):
+        with patch.dict(os.environ, {
+            "RAPTOR_ALLOW_DEGRADED_UNTRUSTED": "1",
+        }):
+            env = RaptorConfig.get_safe_env()
+        assert env.get("RAPTOR_ALLOW_DEGRADED_UNTRUSTED") == "1"
+
     def test_ef_benign_knobs_survive_scrub(self):
         """Numeric/boolean feasibility knobs must reach scrub-spawned
         children (the loader runs inside them); the exec-path class
@@ -113,6 +120,70 @@ class TestGetSafeEnv:
                             "RAPTOR_EF_ONE_GADGET_PATH",
                             "RAPTOR_EF_CONFIG", "RAPTOR_EF_CACHE_DIR"):
                 assert blocked not in env, blocked
+
+    def test_llm_transcript_var_survives_scrub_and_llm_env(self):
+        """RAPTOR_LLM_TRANSCRIPT must cross the subprocess boundary:
+        raptor.py spawns the analysis scripts through get_llm_env
+        (built on get_safe_env), and a stripped var means record mode
+        silently produces a paid run with NO transcript while replay
+        mode silently dispatches LIVE — the two failures the
+        transcript seam exists to prevent. Parse-validated in the
+        child; no injection surface beyond same-UID file access."""
+        with patch.dict(os.environ, {
+            "RAPTOR_LLM_TRANSCRIPT": "replay:/tmp/t.jsonl",
+        }):
+            safe = RaptorConfig.get_safe_env()
+            llm = RaptorConfig.get_llm_env()
+        assert safe.get("RAPTOR_LLM_TRANSCRIPT") == "replay:/tmp/t.jsonl"
+        assert llm.get("RAPTOR_LLM_TRANSCRIPT") == "replay:/tmp/t.jsonl"
+
+    def test_llm_transcript_var_stripped_from_target_envs(self):
+        """Target-bound envs must NOT carry the transcript var — it is
+        a framework tell plus a host path leaking the run layout, and
+        no target consumes it. Membership in TARGET_ENV_STRIP_SET is
+        what the table-driven strip harnesses key on."""
+        assert (
+            "RAPTOR_LLM_TRANSCRIPT" in RaptorConfig.TARGET_ENV_STRIP_SET
+        )
+
+    def test_registry_home_var_survives_scrub(self):
+        """RAPTOR_REGISTRY_HOME must cross the subprocess boundary:
+        RAPTOR's own scrub-spawned children (libexec lifecycle
+        helpers, coverage hooks, nested dispatches) re-resolve the
+        operator registries through core.project.registry_home, and a
+        stripped var means the child resolves the DEFAULT home while
+        the parent runs against the override — the registry contract
+        (session binding, .active bookmark, ledger locks) silently
+        splits at every spawn boundary. Path value, absolute-only
+        validated at consumption; an attacker setting it gains
+        nothing beyond same-UID write access to the home dirs it
+        redirects (the RAPTOR_OUT_DIR argument)."""
+        with patch.dict(os.environ, {
+            "RAPTOR_REGISTRY_HOME": "/tmp/reg-scratch",
+        }):
+            safe = RaptorConfig.get_safe_env()
+        assert safe.get("RAPTOR_REGISTRY_HOME") == "/tmp/reg-scratch"
+
+    def test_registry_home_var_stripped_from_target_envs(self):
+        """Target-bound envs must NOT carry the registry override — it
+        is a framework tell plus a host path leaking the operator's
+        registry layout, and no target consumes it. Membership in
+        TARGET_ENV_STRIP_SET is what the table-driven strip harnesses
+        key on."""
+        assert (
+            "RAPTOR_REGISTRY_HOME" in RaptorConfig.TARGET_ENV_STRIP_SET
+        )
+
+    def test_redb_ceiling_override_survives_scrub(self):
+        """RAPTOR_REDB_MAX_BYTES must reach scrub-spawned children:
+        the RE-database ceiling is resolved per process, so stripping
+        it means a parent's raised ceiling writes a database its own
+        child pipelines then refuse. Numeric knob, strictly
+        re-validated at consumption — no injection surface."""
+        with patch.dict(os.environ,
+                        {"RAPTOR_REDB_MAX_BYTES": "1048576"}):
+            env = RaptorConfig.get_safe_env()
+            assert env.get("RAPTOR_REDB_MAX_BYTES") == "1048576"
 
     def test_does_not_strip_term(self):
         """TERM is read as a string (terminfo lookup), not shell-evaluated — must not be stripped."""
@@ -156,7 +227,7 @@ class TestGetGitEnv:
 
     def test_sets_askpass(self):
         env = RaptorConfig.get_git_env()
-        assert env.get("GIT_ASKPASS") == "true"
+        assert env.get("GIT_ASKPASS") == "/usr/bin/true"
 
     def test_also_strips_dangerous_vars(self):
         injected = {var: "bad" for var in RaptorConfig.DANGEROUS_ENV_VARS}
@@ -419,12 +490,23 @@ class TestGetLlmEnvIncludePythonUserBase:
         injected = {var: f"malicious_{var}" for var in RaptorConfig.DANGEROUS_ENV_VARS}
         with patch.dict(os.environ, injected):
             env = RaptorConfig.get_llm_env(include_python_user_base=True)
+            # get_llm_env's own documented overlay (provider keys +
+            # transport routing) re-admits its members AFTER the
+            # blocklist strip — a name that is both DANGEROUS (for
+            # general child-env lanes) and an LLM-lane re-admit
+            # (GOOGLE_APPLICATION_CREDENTIALS) is expected present
+            # here. The opt-in under test must add nothing beyond
+            # PYTHONUSERBASE on top of that documented overlay.
+            llm_readmits = set(RaptorConfig.LLM_API_KEY_VARS) | set(
+                RaptorConfig.LLM_ROUTING_ENV_VARS)
             for var in RaptorConfig.DANGEROUS_ENV_VARS:
                 if var == "PYTHONUSERBASE":
                     assert env.get(var) == "malicious_PYTHONUSERBASE"
                 elif var in RaptorConfig.GIT_ENV_VARS:
                     # Replaced with our pinned safe value, not stripped.
                     assert env.get(var) == RaptorConfig.GIT_ENV_VARS[var]
+                elif var in llm_readmits:
+                    assert env.get(var) == f"malicious_{var}"
                 else:
                     assert var not in env, f"{var} should still be stripped"
 
@@ -749,3 +831,34 @@ class TestGetOutDirRootRefusal:
         # a legitimate operator choice; only true system roots refuse.
         with patch.dict(os.environ, {"RAPTOR_OUT_DIR": str(tmp_path)}):
             assert RaptorConfig.get_out_dir() == tmp_path.resolve()
+
+
+class TestStripTargetExecMarkers:
+    """Target-exec spawns must carry no RAPTOR-identifying names;
+    tooling paths keep the allowlisted RAPTOR_* knobs."""
+
+    def test_strips_marker_family_and_strip_set(self):
+        env = {
+            "PATH": "/usr/bin",
+            "HOME": "/home/u",
+            "RAPTOR_EF_TIMEOUT_FAST": "5",
+            "RAPTOR_CI": "1",
+            "RAPTOR_CC_TRANSPORT_DISABLED": "1",
+            "_RAPTOR_TRUSTED": "1",
+            "CLAUDECODE": "1",
+            "RAPTOR_SESSION_TOKEN": "s",
+        }
+        out = RaptorConfig.strip_target_exec_markers(env)
+        assert out == {"PATH": "/usr/bin", "HOME": "/home/u"}
+
+    def test_prefix_closed_against_future_allowlist_growth(self):
+        # Any future RAPTOR_*-named allowlist addition must not
+        # silently re-open the target fingerprint.
+        out = RaptorConfig.strip_target_exec_markers(
+            {"RAPTOR_FUTURE_KNOB": "x", "LANG": "C"})
+        assert out == {"LANG": "C"}
+
+    def test_tooling_baseline_untouched(self, monkeypatch):
+        monkeypatch.setenv("RAPTOR_EF_MAX_GADGETS", "9")
+        env = RaptorConfig.get_safe_env()
+        assert env.get("RAPTOR_EF_MAX_GADGETS") == "9"

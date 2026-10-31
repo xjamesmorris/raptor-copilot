@@ -28,7 +28,7 @@ Two groups:
 
 import os
 import re
-import sys as _sys
+import shutil
 from pathlib import Path
 
 import pytest
@@ -40,10 +40,13 @@ _MOUNT_NS = Path(__file__).resolve().parent.parent / "mount_ns.py"
 
 
 def _read_extra_ro_block() -> str:
-    """Return the slice of mount_ns.py that handles extra_ro_paths."""
+    """Return the slice of mount_ns.py that handles extra_ro_paths —
+    the per-entry bind helper (the plan itself is normalised and
+    ancestor-ordered before step 8; every entry funnels through this
+    helper, so the step-diagnostic machinery lives here)."""
     src = _MOUNT_NS.read_text()
-    start = src.index("Bind any extra read-only paths")
-    end = src.index("# 9. pivot_root")
+    start = src.index("def _bind_one_extra_ro")
+    end = src.index("# Split the plan")
     return src[start:end]
 
 
@@ -153,10 +156,10 @@ def test_step_labels_are_bytes_not_str():
 # the mount/pivot syscall wrappers mocked out)
 # ---------------------------------------------------------------------------
 
-_linux_only = pytest.mark.skipif(
-    _sys.platform != "linux",
-    reason="mount-ns setup logic is Linux-only",
-)
+# mount-ns setup logic is Linux-only
+# Real-Linux-kernel binding: these tests carry the linux_native
+# marker (pytest.ini) instead of an ad hoc skipif — honest skip on
+# other native platforms, deselected under the darwin-emulation gate.
 
 
 def _run_setup(monkeypatch, tmp_path, extra_ro_paths, cwd=None):
@@ -170,7 +173,13 @@ def _run_setup(monkeypatch, tmp_path, extra_ro_paths, cwd=None):
     for var in ("TMPDIR", "TEMP", "TMP"):
         monkeypatch.delenv(var, raising=False)
     root = tmp_path / "sbx-root"
-    root.mkdir(exist_ok=True)
+    # Fresh contents per invocation: with _mount stubbed out, the
+    # tmpfs that normally gives setup a pristine root never mounts,
+    # so the /dev stubs and symlinks a previous invocation created
+    # would collide with this one's O_EXCL creates.
+    if root.exists():
+        shutil.rmtree(root)
+    root.mkdir()
     saved_cwd = os.getcwd()
     try:
         if cwd is not None:
@@ -185,7 +194,7 @@ def _run_setup(monkeypatch, tmp_path, extra_ro_paths, cwd=None):
     return root, mounts
 
 
-@_linux_only
+@pytest.mark.linux_native
 def test_dotdot_entry_cannot_evade_shadow_check(monkeypatch, tmp_path):
     # "/tmp/../etc" normalises to "/etc", which is a per-ns
     # shadow path and must be skipped entirely.
@@ -203,7 +212,7 @@ def test_dotdot_entry_cannot_evade_shadow_check(monkeypatch, tmp_path):
     )
 
 
-@_linux_only
+@pytest.mark.linux_native
 def test_relative_entry_no_malformed_bind_target(monkeypatch, tmp_path):
     # A relative entry used to produce inside=f"{root}etc" — a
     # SIBLING of the sandbox root, not a path within it.
@@ -221,7 +230,7 @@ def test_relative_entry_no_malformed_bind_target(monkeypatch, tmp_path):
     assert bound[0][1] == expected_inside
 
 
-@_linux_only
+@pytest.mark.linux_native
 def test_relative_and_absolute_spellings_equivalent(monkeypatch, tmp_path):
     (tmp_path / "ro").mkdir()
     _, rel_mounts = _run_setup(
@@ -233,3 +242,40 @@ def test_relative_and_absolute_spellings_equivalent(monkeypatch, tmp_path):
     rel_targets = sorted(m[1] for m in rel_mounts if m[1])
     abs_targets = sorted(m[1] for m in abs_mounts if m[1])
     assert rel_targets == abs_targets
+
+
+@pytest.mark.linux_native
+def test_per_process_procfs_entry_not_bound_without_pins(monkeypatch,
+                                                         tmp_path):
+    # Legacy callers (src_fds=None) reach the extra_ro loop with
+    # mount-time resolution: without the class skip, a /proc/self/*
+    # entry would bind THIS setup process's own pid file over the
+    # magic link, freezing one process's per-reader view for every
+    # sandbox process (and, for cgroup, re-exposing the host-layout
+    # path the fresh cgroup namespace hides). The pinned production
+    # path never gets here for the class (the parent takes no pin),
+    # so this legacy route is the one that keeps the skip live.
+    root, mounts = _run_setup(
+        monkeypatch, tmp_path, ["/proc/self/cgroup"],
+    )
+    _, baseline = _run_setup(monkeypatch, tmp_path, None)
+    assert len(mounts) == len(baseline), (
+        "per-process procfs entry produced extra mounts"
+    )
+    assert not any(
+        m[1] and "/proc/self/cgroup" in str(m[1]) for m in mounts
+    ), "per-process procfs entry was bind-mounted"
+
+
+@pytest.mark.linux_native
+def test_double_slash_procfs_spelling_not_bound(monkeypatch, tmp_path):
+    # "//proc/self/cgroup" survives abspath (POSIX two-slash prefix)
+    # — the classification must catch the spelling here too.
+    root, mounts = _run_setup(
+        monkeypatch, tmp_path, ["//proc/self/cgroup"],
+    )
+    _, baseline = _run_setup(monkeypatch, tmp_path, None)
+    assert len(mounts) == len(baseline)
+    assert not any(
+        m[1] and "proc/self/cgroup" in str(m[1]) for m in mounts
+    )

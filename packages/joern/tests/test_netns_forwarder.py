@@ -15,6 +15,8 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -22,10 +24,12 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
+from packages.joern import netns_forwarder
 from packages.joern.netns_forwarder import Forwarder, create_listener
 
 _SCRIPT = Path(__file__).resolve().parents[1] / "netns_forwarder.py"
@@ -118,8 +122,19 @@ class _BlastServer:
 
 @pytest.fixture
 def uds_dir():
-    with tempfile.TemporaryDirectory(prefix="raptor-joern-uds-test-") as d:
+    # AF_UNIX sun_path is 108 bytes: the socket bound under this dir
+    # ("joern.sock") must fit, so a deep TMPDIR (private per-run tmp
+    # roots) overflows the bind. Fall back to /tmp when the budget
+    # doesn't fit rather than failing on hosts with long TMPDIRs.
+    d = tempfile.mkdtemp(prefix="raptor-joern-uds-test-")
+    if len(os.fsencode(os.path.join(d, "joern.sock"))) > 107:
+        shutil.rmtree(d, ignore_errors=True)
+        d = tempfile.mkdtemp(prefix="raptor-joern-uds-test-", dir="/tmp")
+    os.chmod(d, 0o700)
+    try:
         yield d
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def _forwarder_to(port: int, uds_dir: str) -> tuple[Forwarder, str]:
@@ -375,7 +390,9 @@ def _wait_for(predicate, timeout_s: float = 15.0) -> None:
 @needs_userns
 class TestNamespaceIsolation:
     @pytest.fixture
-    def running_stack(self, uds_dir):
+    def running_stack(
+        self, uds_dir: str,
+    ) -> Iterator[tuple[str, int, subprocess.Popen[bytes]]]:
         """Forwarder script + stub in-namespace HTTP child."""
         path = os.path.join(uds_dir, "joern.sock")
         # Free on the host right now (so "connection refused" below
@@ -393,8 +410,28 @@ class TestNamespaceIsolation:
             _wait_for(lambda: os.path.exists(path))
             yield path, port, proc
         finally:
+            # The socket (this fixture's readiness gate) exists before
+            # the supervisor installs its SIGTERM handler, and that
+            # handler DROPS the signal while the wrapped child is not
+            # yet bound (netns_forwarder.main: create_listener precedes
+            # both the signal.signal calls and the Popen). A terminate()
+            # landing in that boot window is absorbed entirely, and
+            # under load a delivered one can simply be slow to unwind —
+            # either way a bare fixed wait errored the teardown with
+            # TimeoutExpired. Escalate instead: a second SIGTERM sent
+            # after the window has passed still gets the clean
+            # forwarded shutdown; SIGKILL is the total backstop for a
+            # supervisor that cannot act on signals at all.
             proc.terminate()
-            proc.wait(timeout=10)
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=10)
 
     @staticmethod
     def _uds_roundtrip(path: str) -> dict:
@@ -449,6 +486,23 @@ class TestNamespaceIsolation:
         assert proc.wait(timeout=10) != 0
         assert not os.path.exists(path)
 
+    def test_teardown_reclaims_unresponsive_supervisor(
+        self,
+        running_stack: tuple[str, int, subprocess.Popen[bytes]],
+    ) -> None:
+        """The fixture teardown must reclaim a supervisor that cannot
+        act on SIGTERM. SIGSTOP simulates that faithfully: a stopped
+        process holds a handled SIGTERM pending, exactly like the
+        supervisor's boot window where the installed handler drops the
+        signal because the wrapped child is not yet bound. The real
+        assertion is the fixture's own finally block (the shipped
+        teardown, not a copy): it must escalate and reclaim the
+        process within its bounds instead of erroring the teardown
+        with TimeoutExpired."""
+        path, _port, proc = running_stack
+        self._uds_roundtrip(path)  # fully booted first
+        os.kill(proc.pid, signal.SIGSTOP)  # own Popen child only
+
 
 class TestSelfProbe:
     def test_probe_exit_code_is_boolean(self):
@@ -461,3 +515,87 @@ class TestSelfProbe:
     @needs_userns
     def test_probe_passes_where_userns_works(self):
         assert _HAS_USERNS  # gate and assertion agree by construction
+
+
+class TestUnmappedEuidHint:
+    """The EPERM hint fires only for PermissionError + an empty uid_map."""
+
+    @pytest.fixture
+    def empty_map(self, tmp_path, monkeypatch):
+        path = tmp_path / "uid_map"
+        path.write_bytes(b"")
+        monkeypatch.setattr(netns_forwarder, "_UID_MAP_PATH", str(path))
+        return path
+
+    def test_euid_unmapped_false_on_this_process(self):
+        # Whatever namespace pytest runs in, its creator wrote a map —
+        # an empty map would mean this very process couldn't have been
+        # set up the way it was.
+        assert netns_forwarder._euid_unmapped() is False
+
+    def test_euid_unmapped_true_on_empty_map(self, empty_map):
+        assert netns_forwarder._euid_unmapped() is True
+
+    def test_euid_unmapped_false_when_map_unreadable(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            netns_forwarder, "_UID_MAP_PATH", str(tmp_path / "absent"),
+        )
+        assert netns_forwarder._euid_unmapped() is False
+
+    def _probe_stderr(self, capsys, exc, include_pid=False, monkeypatch=None):
+        def _refuse(include_pid=False):
+            raise exc
+
+        monkeypatch.setattr(netns_forwarder, "enter_private_netns", _refuse)
+        rc = netns_forwarder.self_probe(include_pid=include_pid)
+        assert rc == 1
+        return capsys.readouterr().err
+
+    def test_hint_on_eperm_with_empty_map(self, capsys, monkeypatch, empty_map):
+        err = self._probe_stderr(
+            capsys, PermissionError(1, "Operation not permitted"),
+            monkeypatch=monkeypatch,
+        )
+        assert "netns self-probe failed" in err
+        assert netns_forwarder._UNMAPPED_EUID_HINT in err
+
+    def test_hint_on_pidns_arm_too(self, capsys, monkeypatch, empty_map):
+        err = self._probe_stderr(
+            capsys, PermissionError(1, "Operation not permitted"),
+            include_pid=True, monkeypatch=monkeypatch,
+        )
+        assert "pidns self-probe failed" in err
+        assert netns_forwarder._UNMAPPED_EUID_HINT in err
+
+    def test_no_hint_when_map_is_populated(self, capsys, monkeypatch, tmp_path):
+        path = tmp_path / "uid_map"
+        path.write_text("0 0 4294967295\n")
+        monkeypatch.setattr(netns_forwarder, "_UID_MAP_PATH", str(path))
+        err = self._probe_stderr(
+            capsys, PermissionError(1, "Operation not permitted"),
+            monkeypatch=monkeypatch,
+        )
+        assert "self-probe failed" in err
+        assert netns_forwarder._UNMAPPED_EUID_HINT not in err
+
+    def test_no_hint_on_other_failures(self, capsys, monkeypatch, empty_map):
+        err = self._probe_stderr(
+            capsys, RuntimeError("loopback refused"), monkeypatch=monkeypatch,
+        )
+        assert "self-probe failed" in err
+        assert netns_forwarder._UNMAPPED_EUID_HINT not in err
+
+    @needs_userns
+    @pytest.mark.skipif(
+        shutil.which("unshare") is None, reason="needs the unshare binary",
+    )
+    def test_hint_end_to_end_under_unmapped_userns(self):
+        # A bare `unshare -U` (no uid map) is exactly the misuse the
+        # hint exists for: the probe's nested CLONE_NEWUSER gets EPERM.
+        proc = subprocess.run(
+            ["unshare", "-U", sys.executable, str(_SCRIPT), "--self-probe"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        assert proc.returncode == 1
+        assert "self-probe failed" in proc.stderr
+        assert "unshare --map-current-user" in proc.stderr

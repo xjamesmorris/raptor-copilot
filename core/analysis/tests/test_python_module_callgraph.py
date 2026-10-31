@@ -391,3 +391,257 @@ class TestConditionalRedefinition:
         s = _compute_one_summary(cg, "f", {})
         assert s.summary_unknown
         assert "variant" in (s.summary_unknown_reason or "")
+
+
+def test_non_utf8_file_degrades_instead_of_raising(tmp_path):
+    # A latin-1 byte in a scanned file must not raise
+    # UnicodeDecodeError through the builder — decode with
+    # replacement and let the parse decide.
+    p = tmp_path / "m.py"
+    p.write_bytes(b"# caf\xe9\ndef f(x):\n    return x\n")
+    cg = build_python_module_callgraph(p)
+    assert cg is not None
+    assert cg.find("f") is not None
+
+
+class TestShadowGuardedCalleeResolution:
+    """Bare-name callee resolution must not bind through a caller's
+    local rebinding of the name — the runtime callee is the local
+    object, not the module-level def."""
+
+    def test_local_rebind_drops_module_edge(self):
+        from core.analysis.python_module_callgraph import (
+            build_python_module_callgraph,
+        )
+        cg = build_python_module_callgraph(
+            "def esc(s):\n"
+            "    return s\n"
+            "def handle(x):\n"
+            "    esc = str\n"
+            "    return esc(x)\n"
+        )
+        assert cg is not None
+        handle = cg.find("handle")
+        esc = cg.find("esc")
+        assert esc not in set(cg.successors(handle))
+
+    def test_nested_def_preference_survives_guard(self):
+        from core.analysis.python_module_callgraph import (
+            build_python_module_callgraph,
+        )
+        cg = build_python_module_callgraph(
+            "def esc(s):\n"
+            "    return s\n"
+            "def handle(x):\n"
+            "    def esc(s):\n"
+            "        return s + s\n"
+            "    return esc(x)\n"
+        )
+        assert cg is not None
+        handle = cg.find("handle")
+        names = {n.name for n in cg.successors(handle)}
+        assert "handle.esc" in names
+        assert "esc" not in names
+
+    def test_unshadowed_bare_name_edge_unchanged(self):
+        from core.analysis.python_module_callgraph import (
+            build_python_module_callgraph,
+        )
+        cg = build_python_module_callgraph(
+            "def esc(s):\n"
+            "    return s\n"
+            "def handle(x):\n"
+            "    return esc(x)\n"
+        )
+        assert cg is not None
+        handle = cg.find("handle")
+        assert "esc" in {n.name for n in cg.successors(handle)}
+
+
+class TestLocalBindingNames:
+    def test_collects_scope_binding_shapes(self):
+        import ast
+
+        from core.analysis.python_module_callgraph import (
+            local_binding_names,
+        )
+        src = (
+            "def f(a, b=1, *args, kw=None, **kwargs):\n"
+            "    x = 1\n"
+            "    y: int = 2\n"
+            "    z += 3\n"
+            "    (p, q), *rest = point\n"
+            "    for i in it:\n"
+            "        pass\n"
+            "    with open('f') as fh:\n"
+            "        pass\n"
+            "    try:\n"
+            "        pass\n"
+            "    except ValueError as exc:\n"
+            "        pass\n"
+            "    import html\n"
+            "    import os.path\n"
+            "    from shlex import quote as q2\n"
+            "    if (w := 1):\n"
+            "        pass\n"
+            "    vals = [v2 for v2 in it if (v3 := v2)]\n"
+            "    def nested():\n"
+            "        hidden = 1\n"
+            "    class C:\n"
+            "        attr = 1\n"
+            "    lam = lambda l_param: l_param\n"
+        )
+        fn_ast = ast.parse(src).body[0]
+        names = local_binding_names(fn_ast)
+        expected = {
+            "a", "b", "args", "kw", "kwargs", "x", "y", "z", "p", "q",
+            "rest", "i", "fh", "exc", "html", "os", "q2", "w", "vals",
+            "v3", "nested", "C", "lam",
+        }
+        assert expected <= names
+        # Own-scope names of nested defs/classes and comprehension
+        # for-targets do NOT bind the function's scope.
+        assert "hidden" not in names
+        assert "attr" not in names
+        assert "v2" not in names
+        assert "l_param" not in names
+
+
+class TestModuleDistrustedRoots:
+    def test_distrust_shapes(self):
+        import ast
+
+        from core.analysis.python_module_callgraph import (
+            module_shadowed_identity_roots,
+        )
+        tree = ast.parse(
+            "import html\n"                     # self-import: trusted
+            "import os.path\n"                  # self-import: trusted
+            "import fakelib as shlex\n"         # alias: distrusted
+            "from fakelib import bleach\n"      # from-import: distrusted
+            "markupsafe = object()\n"           # assignment: distrusted
+            "def werkzeug():\n"
+            "    pass\n"                        # def name: distrusted
+            "class django:\n"
+            "    pass\n"                        # class name: distrusted
+            "def evil():\n"
+            "    global html\n"                 # global decl: distrusted
+            "    html = None\n"
+        )
+        roots = module_shadowed_identity_roots(tree)
+        assert {"shlex", "bleach", "markupsafe", "werkzeug",
+                "django", "html"} <= roots
+        assert "os" not in roots
+        # Import aliases live only in the identity set; the non-import
+        # rebind set resolves them through the import map instead.
+        from core.analysis.python_module_callgraph import (
+            module_distrusted_roots,
+        )
+        nonimport = module_distrusted_roots(tree)
+        assert "shlex" not in nonimport
+        assert "bleach" not in nonimport
+        assert "markupsafe" in nonimport
+
+    def test_import_map_shapes(self):
+        import ast
+
+        from core.analysis.python_module_callgraph import (
+            module_import_map,
+        )
+        tree = ast.parse(
+            "import html\n"
+            "import a.b as c\n"
+            "from functools import lru_cache\n"
+            "from m import n as k\n"
+            "from . import rel\n"
+        )
+        m = module_import_map(tree)
+        assert m["html"] == "html"
+        assert m["c"] == "a.b"
+        assert m["lru_cache"] == "functools.lru_cache"
+        assert m["k"] == "m.n"
+        assert m["rel"].startswith("<relative>")
+
+
+class TestModuleDynamicNamespace:
+    def _dyn(self, src):
+        import ast
+
+        from core.analysis.python_module_callgraph import (
+            module_dynamic_namespace,
+        )
+        return module_dynamic_namespace(ast.parse(src))
+
+    def test_star_import_poisons_whole_module(self):
+        whole, _names = self._dyn("from evilmod import *\n")
+        assert whole
+
+    def test_module_scope_exec_poisons_whole_module(self):
+        whole, _names = self._dyn("exec('esc = str')\n")
+        assert whole
+
+    def test_function_exec_with_globals_arg_poisons(self):
+        whole, _names = self._dyn(
+            "def f():\n    exec('esc = str', globals())\n")
+        assert whole
+
+    def test_plain_function_exec_does_not_poison_module(self):
+        # A bare exec in a function cannot rebind module names (its
+        # stores land in the throwaway locals copy); the containing
+        # function's own summary is poisoned separately.
+        whole, names = self._dyn("def f(c):\n    exec(c)\n")
+        assert not whole
+        assert not names
+
+    def test_sys_modules_reference_poisons_whole_module(self):
+        whole, _names = self._dyn(
+            "import sys\n"
+            "setattr(sys.modules[__name__], 'esc', str)\n")
+        assert whole
+
+    def test_aliased_sys_modules_poisons(self):
+        whole, _names = self._dyn(
+            "import sys as s\n"
+            "m = s.modules['x']\n")
+        assert whole
+
+    def test_from_import_modules_poisons(self):
+        whole, _names = self._dyn(
+            "from sys import modules\n"
+            "m = modules['x']\n")
+        assert whole
+
+    def test_constant_key_globals_write_poisons_that_name(self):
+        whole, names = self._dyn("globals()['esc'] = str\n")
+        assert not whole
+        assert names == frozenset({"esc"})
+
+    def test_constant_key_globals_delete_poisons_that_name(self):
+        whole, names = self._dyn("del globals()['esc']\n")
+        assert not whole
+        assert names == frozenset({"esc"})
+
+    def test_computed_key_globals_write_poisons_whole_module(self):
+        whole, _names = self._dyn("globals()[k] = str\n")
+        assert whole
+
+    def test_escaping_globals_dict_poisons_whole_module(self):
+        whole, _names = self._dyn("g = globals()\n")
+        assert whole
+
+    def test_globals_update_poisons_whole_module(self):
+        whole, _names = self._dyn("globals().update(d)\n")
+        assert whole
+
+    def test_constant_key_globals_read_is_harmless(self):
+        whole, names = self._dyn("v = globals()['esc']\n")
+        assert not whole
+        assert not names
+
+    def test_plain_module_has_no_dynamic_poison(self):
+        whole, names = self._dyn(
+            "import html\n"
+            "def esc(s):\n"
+            "    return html.escape(s)\n")
+        assert not whole
+        assert not names

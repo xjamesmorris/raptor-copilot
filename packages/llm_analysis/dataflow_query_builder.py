@@ -439,9 +439,9 @@ import semmle.code.cpp.security.FlowSources as FS
 // "module DataFlow is ambiguous between: DataFlow::DataFlow,
 // DataFlow::DataFlow". Aliasing FlowSources scopes its DataFlow under
 // FS::DataFlow and leaves the new-style DataFlow as the unique top-level
-// `DataFlow`. Matches the canonical pattern in
-// /home/raptor/.local/codeql-queries/cpp/ql/src/Security/CWE/CWE-120/
-// UnboundedWrite.ql. LLM-generated source/sink bodies that need
+// `DataFlow`. Matches the canonical pattern in the CodeQL standard
+// packs (cpp/ql/src/Security/CWE/CWE-120/UnboundedWrite.ql, resolved
+// from the installed query packs). LLM-generated source/sink bodies that need
 // FlowSources types must use the FS:: prefix (e.g. `n instanceof
 // FS::FlowSource`) — see the prompt instructions in
 // _ask_llm_for_predicates.
@@ -524,6 +524,84 @@ def supported_languages_for_template() -> set:
     return set(_TAINT_TEMPLATES.keys())
 
 
+# Shared tail of every taint template. build_predicate_probe_query
+# splits on it to reuse each language's exact import/alias header, so
+# a predicate body that compiled inside the flow query compiles
+# identically inside the probe. Template drift is guarded by a unit
+# test asserting every template carries this tail exactly once; a
+# template without it makes the probe builder refuse (None) rather
+# than mis-assemble a query.
+_FLOW_QUERY_TAIL = """\
+module IrisFlow = TaintTracking::Global<IrisConfig>;
+import IrisFlow::PathGraph
+
+from IrisFlow::PathNode source, IrisFlow::PathNode sink
+where IrisFlow::flowPath(source, sink)
+select sink.getNode(), source, sink, "IRIS dataflow path"
+"""
+
+_PROBE_TAILS: dict[str, str] = {
+    "source": """\
+from DataFlow::Node n
+where IrisConfig::isSource(n)
+select n, "IRIS isSource probe"
+""",
+    "sink": """\
+from DataFlow::Node n
+where IrisConfig::isSink(n)
+select n, "IRIS isSink probe"
+""",
+}
+
+
+def build_predicate_probe_query(
+    *,
+    language: str,
+    source_predicate_body: str,
+    sink_predicate_body: str,
+    probe_role: str,
+    query_id: str = "raptor/iris/predicate-probe",
+) -> str | None:
+    """Assemble a standalone selector for ONE LLM-written predicate.
+
+    The Tier 2 vacuity control: before a zero-flow taint result is
+    trusted as refutation, each endpoint predicate is run on its own —
+    a predicate that selects zero nodes anywhere in the DB makes "no
+    flow" vacuously true, which is a property of the LLM's model, not
+    of the code. The probe keeps the taint template's full per-language
+    header (imports, aliases, the IrisConfig module with BOTH predicate
+    bodies) and swaps the flow query for a plain node selection over
+    ``probe_role`` (``"source"`` → ``isSource``, ``"sink"`` →
+    ``isSink``), downgrading ``@kind path-problem`` to ``@kind
+    problem`` for the two-column select.
+
+    Returns the full .ql text, or None when the language has no
+    template, either predicate body is empty / blank, ``probe_role``
+    is unknown, or the template lacks the shared flow tail (drift).
+    """
+    probe_tail = _PROBE_TAILS.get(probe_role)
+    if probe_tail is None:
+        return None
+    template = _TAINT_TEMPLATES.get(language.lower())
+    if template is None:
+        return None
+    if not source_predicate_body or not source_predicate_body.strip():
+        return None
+    if not sink_predicate_body or not sink_predicate_body.strip():
+        return None
+    header, sep, _ = template.partition(_FLOW_QUERY_TAIL)
+    if not sep:
+        return None
+    probe = (header + probe_tail).replace(
+        "@kind path-problem", "@kind problem", 1,
+    )
+    return probe.format(
+        source_predicate_body=source_predicate_body.strip(),
+        sink_predicate_body=sink_predicate_body.strip(),
+        query_id=query_id,
+    )
+
+
 def build_template_query(
     *,
     language: str,
@@ -592,6 +670,10 @@ TEMPLATE_PREDICATE_SCHEMA = {
 # lose the CWE → prebuilt query mapping for these findings.
 #
 # Order matters: more specific patterns first. The first match wins.
+# Co-occurrence gaps are bounded ({0,200}): with an unbounded `.*`
+# gap a crafted rule id that repeats the head token re-scans the
+# rest of the id from every occurrence — quadratic. Real rule ids
+# are far shorter than the bound.
 _RULE_ID_TO_CWE: list = [
     # Command injection — variants seen in real rule sets:
     # "command-injection", "os-command-injection", "command_injection",
@@ -600,7 +682,7 @@ _RULE_ID_TO_CWE: list = [
     (re.compile(
         r"command[-_]?injection"
         r"|os[-_]?command"
-        r"|subprocess[-_.].*shell"
+        r"|subprocess[-_.].{0,200}shell"
         r"|shell[-_]?true"
         r"|command[-_]shell"
         r"|exec[-_]?shell",
@@ -611,7 +693,7 @@ _RULE_ID_TO_CWE: list = [
     # first-match-wins loop would misroute NoSQL rule ids to CWE-89
     # (and Tier 1 would then run the SQL-injection prebuilt query
     # against a MongoDB-injection claim).
-    (re.compile(r"nosql[-_]?injection|\bnosqli\b|mongo[-_].*injection",
+    (re.compile(r"nosql[-_]?injection|\bnosqli\b|mongo[-_].{0,200}injection",
                 re.IGNORECASE), "CWE-943"),
     # SQL injection
     (re.compile(r"sql[-_]?injection|sqli\b", re.IGNORECASE), "CWE-89"),
@@ -621,7 +703,7 @@ _RULE_ID_TO_CWE: list = [
     # XSS — DOM-based and reflected both map to CWE-79
     (re.compile(r"\bxss\b|cross[-_]?site[-_]?scripting", re.IGNORECASE), "CWE-79"),
     # Code injection / eval
-    (re.compile(r"code[-_]?injection|\beval\b.*injection", re.IGNORECASE), "CWE-94"),
+    (re.compile(r"code[-_]?injection|\beval\b.{0,200}injection", re.IGNORECASE), "CWE-94"),
     # XXE / XML external entity
     (re.compile(r"\bxxe\b|xml[-_]?external[-_]?entit", re.IGNORECASE), "CWE-611"),
     # SSRF

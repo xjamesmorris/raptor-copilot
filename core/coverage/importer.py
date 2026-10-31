@@ -30,8 +30,15 @@ from core.run.provenance import (
     run_timestamp,
 )
 
-from .record import load_records
+from .record import (
+    MAX_FLOW_TRACE_FILES as _MAX_FLOW_TRACE_FILES,
+)
+from .record import (
+    RUN_ARTIFACT_MAX_BYTES,
+    load_records,
+)
 from .registry import category_of
+from .schema import _opt_int, iter_file_entries, iter_item_entries
 from .summary import _inventory_name_index, _match_to_inventory
 
 if TYPE_CHECKING:
@@ -42,7 +49,10 @@ logger = logging.getLogger(__name__)
 
 
 def _inventory_paths(checklist: dict[str, Any]) -> set:
-    return {fe.get("path") for fe in checklist.get("files", []) if fe.get("path")}
+    return {
+        fe.get("path") for fe in iter_file_entries(checklist)
+        if fe.get("path") and isinstance(fe.get("path"), str)
+    }
 
 
 def _to_inventory_path(
@@ -128,10 +138,13 @@ def _tool_stamp(tool: str, prov: dict[str, Any],
 
 def _total_lines_by_file(checklist: dict[str, Any]) -> dict[str, int]:
     out: dict[str, int] = {}
-    for fe in checklist.get("files", []):
+    for fe in iter_file_entries(checklist):
         path = fe.get("path")
-        tl = fe.get("lines")
-        if path and tl:
+        # Genuine ints only (schema._opt_int): a forged string count
+        # flowed into mark()'s interval arithmetic and the coverage-%
+        # division.
+        tl = _opt_int(fe.get("lines"))
+        if path and isinstance(path, str) and tl:
             out[path] = tl
     return out
 
@@ -145,21 +158,126 @@ def import_checked_by(store: CoverageStore, checklist: dict[str, Any]) -> int:
     partial upgrades (new engine reading a pre-migration checklist)
     still surface prior review state. Delete after the migration
     settles.
+
+    Claim-authority tiering: the checklist lives in target-writable
+    run/project directories, and a review-grade mark minted here
+    clears the function from every store-derived review-gap view — so
+    a forged ``checked_by`` row was durable review suppression. Each
+    ``(item, label)`` claim is now stamped at creation
+    (``core.inventory.checklist_mac``, minted by ``update_coverage``);
+    this importer is the one consumer that converts claims into
+    authority, so it verifies here: verified claims import under
+    their label, everything else on a review-grade label — tampered
+    tokens AND unstamped rows (pre-MAC legacy or forged) — demotes to
+    ``<label>:machine`` (hint tier: llm-extent examination evidence
+    at scanned depth, see ``core.coverage.registry.classify``), with
+    one loud structured warning. Never a refusal — the import always
+    completes. Only review-grade labels are tiered: scanned-depth
+    labels (``understand:*``, ``read``, unknown bases) grant no
+    review credit, so demotion would be pure label churn — same rule
+    as :func:`import_functions_analysed`.
+
+    Currency gate on VERIFIED claims: a genuine token replayed with
+    its whole historical file entry (old ``sha256`` + old lines,
+    token intact) verifies — the MAC binds the claim to the
+    PRESENTED entry, not to the current source. So a verified
+    review-grade claim earns its full label only when the file
+    entry's ``sha256`` matches a hash of the CURRENT source under
+    the checklist's ``target_path``; otherwise it demotes to the
+    same ``<label>:machine`` tier, counted distinctly as stale.
+    Same currency posture as the journal fold
+    (``core.audit.gaps._fold_journal_into_covered``) and
+    :func:`import_functions_analysed`'s ``_hash_current``.
     """
+    from core.audit._util import safe_join
+    from core.hash import sha256_bytes
+    from core.inventory import checklist_mac
+
+    from .registry import CATEGORY_LLM, DEPTH_ANALYSED, classify
+
+    target = _checklist_target(checklist)
+    currency_cache: dict[tuple[str, str], bool] = {}
+
+    def _fe_current(path: str, fe: dict[str, Any]) -> bool:
+        """Whether the file entry's recorded ``sha256`` matches the
+        current source file. FAIL-CLOSED on every unverifiable case —
+        no ``target_path`` in the checklist, no/blank recorded
+        ``sha256``, path escaping the target, missing or unreadable
+        file: all read as NOT current (the claim demotes to the hint
+        tier, never a refusal). Deliberate divergence from the
+        journal fold's verified-keeps-credit carve-out for missing
+        evidence: there ``target_path`` arrives from the run's own
+        caller, while here it rides in the SAME attacker-writable
+        artifact as the claims — stripping it (or the sha256) must
+        not preserve replayed review credit. Same fail-closed
+        contract as :func:`import_functions_analysed`'s
+        ``_hash_current``."""
+        stored = fe.get("sha256")
+        if not target or not isinstance(stored, str) or not stored:
+            return False
+        key = (path, stored)
+        if key not in currency_cache:
+            ok = False
+            resolved = safe_join(Path(target), path)
+            if resolved is not None and resolved.is_file():
+                try:
+                    ok = sha256_bytes(resolved.read_bytes()) == stored
+                except OSError:
+                    ok = False
+            currency_cache[key] = ok
+        return currency_cache[key]
+
     marks = 0
-    for fe in checklist.get("files", []):
+    tampered = 0
+    unstamped = 0
+    stale = 0
+    review_claims = 0
+    for fe in iter_file_entries(checklist):
         path = fe.get("path")
-        if not path:
+        if not path or not isinstance(path, str):
             continue
-        for fn in fe.get("items", fe.get("functions", [])) or []:
-            lo = fn.get("line_start")
+        for fn in iter_item_entries(fe):
+            lo = _opt_int(fn.get("line_start"))
             if lo is None:
                 continue
-            hi = fn.get("line_end")
+            hi = _opt_int(fn.get("line_end"))
             hi = hi if hi is not None else lo
-            for tool in fn.get("checked_by", []) or []:
-                store.mark(path, lo, hi, tool)
+            checked_by = fn.get("checked_by")
+            if not isinstance(checked_by, list):
+                continue
+            for tool in checked_by:
+                if not isinstance(tool, str):
+                    continue
+                effective = tool
+                if classify(tool) == (CATEGORY_LLM, DEPTH_ANALYSED):
+                    review_claims += 1
+                    provenance = checklist_mac.claim_provenance(
+                        fe, fn, tool)
+                    if provenance != checklist_mac.CLAIM_VERIFIED:
+                        effective = f"{tool}:machine"
+                        if provenance == checklist_mac.CLAIM_TAMPERED:
+                            tampered += 1
+                        else:
+                            unstamped += 1
+                    elif not _fe_current(path, fe):
+                        # Genuine token, non-current content: a
+                        # wholesale replay of a historical file entry
+                        # (or a since-changed source). Real install
+                        # history, but not a review of TODAY's code.
+                        effective = f"{tool}:machine"
+                        stale += 1
+                store.mark(path, lo, hi, effective)
                 marks += 1
+    if tampered or unstamped or stale:
+        logger.warning(
+            "coverage import: %d of %d review-grade checked_by "
+            "claim(s) imported at machine tier (%d tampered token(s), "
+            "%d unstamped — pre-MAC legacy or unauthenticated, "
+            "%d stale — genuinely stamped but not matching the "
+            "current source content) — examination evidence kept, "
+            "review credit withheld",
+            tampered + unstamped + stale, review_claims,
+            tampered, unstamped, stale)
     return marks
 
 
@@ -187,7 +305,11 @@ def import_journal(
 
     Returns the number of function-level marks applied.
     """
-    from .journal import entry_producer, load_index
+    from .journal import (
+        entry_earns_function_coverage,
+        entry_producer,
+        load_index,
+    )
 
     try:
         entries = load_index(project_dir)
@@ -213,22 +335,16 @@ def import_journal(
 
     marks = 0
     for entry in entries.values():
-        if entry.verdict == "error":
-            # Error verdicts are transient failures (budget exceeded,
-            # API error, truncation) — the function was never actually
-            # reviewed. Marking it as covered would misrepresent the
-            # coverage view AND suppress it from any consumer that
-            # derives "already reviewed" from the store. Keep it
-            # unreviewed, consistent with journal.reviewed_set() and
-            # the gap computation's index fold.
-            continue
-        if entry.edge_callee:
-            # Tier-1 edge-contract review: only the CALL EDGE was
-            # examined, not the caller's body. JournalEntry.key
-            # documents the invariant ("an edge review must never mark
-            # the caller function itself as reviewed") — marking the
-            # caller's full range here made unreviewed functions
-            # vanish from store-derived gap listings.
+        if not entry_earns_function_coverage(entry):
+            # The shared screening rule (journal.py): error rows are
+            # transient failures that must be retried, dark rows are
+            # the unresolved gate-resolution bucket with no
+            # re-adjudication route out of a store mark, and an
+            # edge-contract row examined only the CALL EDGE — none of
+            # them may mark the function reviewed in any store-derived
+            # coverage view. Consistent with journal.reviewed_set()
+            # and the record builder (record.build_from_journal),
+            # which consumes the same predicate.
             continue
         rng = ranges.get((entry.file, entry.function))
         if rng is None:
@@ -273,7 +389,12 @@ def import_record(
     inv_paths = set(total_lines)                     # inventory keys (target-relative)
     inv_index = _inventory_name_index(inv_paths)     # once per record, not per path
     marked = 0
-    for path in record.get("files_examined", []) or []:
+    files_examined = record.get("files_examined")
+    if not isinstance(files_examined, list):
+        files_examined = []
+    for path in files_examined:
+        if not isinstance(path, str):
+            continue
         key = _to_inventory_path(path, inv_paths, inv_index)  # tools may report abs paths
         tl = total_lines.get(key)
         if not tl:
@@ -303,20 +424,27 @@ def import_findings(
     """
     linked = 0
     inv_index = _inventory_name_index(inventory_paths) if inventory_paths else None
-    for f in findings or []:
+    if not isinstance(findings, list):
+        findings = []
+    for f in findings:
         if not isinstance(f, dict):
             continue
         file = _field(f, "file", "file_path", "path")
-        if not file:
+        if not file or not isinstance(file, str):
             continue
         if inventory_paths:
             file = _to_inventory_path(file, inventory_paths, inv_index)   # match verdict's key
-        line = _field(f, "line", "line_start", "start_line")
+        # Genuine ints only (schema._opt_int): findings.json is
+        # LLM-written inside the sandbox write grant, and a forged
+        # `"line": "42"` crashed function_verdict at every render. An
+        # unusable line degrades to a file-level link — the finding is
+        # never dropped.
+        line = _opt_int(_field(f, "line", "line_start", "start_line"))
         if not line and f.get("address") is not None:
             # Binary findings: the store's intervals for binary:<stem>
             # files live in address space — the finding's address IS
             # its position, so function_verdict can attribute it.
-            line = f.get("address")
+            line = _opt_int(f.get("address"))
         # A stable, position-independent id so re-linking the same finding
         # (e.g. backfill then a clean snapshot's retained flip) targets the
         # SAME store entry rather than appending a duplicate. The list index
@@ -344,7 +472,11 @@ _FINDINGS_LOCATIONS = ("findings.json", "validation/findings.json")
 
 
 def _load_findings_file(path: Path) -> list[dict[str, Any]]:
-    data = load_json(path)
+    # Byte-budgeted: findings.json sits in the sandbox-writable run
+    # dir, so its size is as attacker-controlled as its shapes (an
+    # oversize file warns and loads as nothing — same class as the
+    # journal's 256 MiB gate).
+    data = load_json(path, max_bytes=RUN_ARTIFACT_MAX_BYTES)
     if isinstance(data, dict):
         data = data.get("findings", data.get("results", []))
     return data if isinstance(data, list) else []
@@ -466,7 +598,8 @@ def _understand_points(run_dir: Path):
     """Yield (file, line) pairs from a run's /understand outputs: context-map
     entry points / sinks / trust boundaries, and every flow-trace step."""
     run = Path(run_dir)
-    cm = load_json(run / "context-map.json")
+    cm = load_json(run / "context-map.json",
+                   max_bytes=RUN_ARTIFACT_MAX_BYTES)
     if isinstance(cm, dict):
         for section in _UNDERSTAND_SECTIONS:
             for entry in cm.get(section) or []:
@@ -478,8 +611,17 @@ def _understand_points(run_dir: Path):
                     ln = entry.get("line_start")
                 if isinstance(f, str) and f and isinstance(ln, int):
                     yield f, ln
-    for tf in sorted(run.glob("flow-trace-*.json")):
-        trace = load_json(tf)
+    # Both the per-file SIZE and the file COUNT are run-dir-writable;
+    # cap both (an unbounded glob of tiny traces is the same memory
+    # lever as one huge trace).
+    traces = sorted(run.glob("flow-trace-*.json"))
+    if len(traces) > _MAX_FLOW_TRACE_FILES:
+        logger.warning(
+            "coverage import: %d flow-trace files in %s; reading the "
+            "first %d", len(traces), run, _MAX_FLOW_TRACE_FILES)
+        traces = traces[:_MAX_FLOW_TRACE_FILES]
+    for tf in traces:
+        trace = load_json(tf, max_bytes=RUN_ARTIFACT_MAX_BYTES)
         if not isinstance(trace, dict):
             continue
         for step in trace.get("steps") or []:
@@ -535,26 +677,29 @@ def _function_ranges(
     ``line_start`` so consumers can mark ``(lo, hi)`` directly.
     """
     out: dict[tuple, tuple] = {}
-    for fe in checklist.get("files", []):
+    for fe in iter_file_entries(checklist):
         path = fe.get("path")
-        if not path:
+        if not path or not isinstance(path, str):
             continue
-        for it in fe.get("items", fe.get("functions", [])) or []:
+        for it in iter_item_entries(fe):
             name = it.get("name")
-            if not name:
+            if not name or not isinstance(name, str):
                 continue
-            address = it.get("address")
+            # Genuine ints only (schema._opt_int) — the checklist is a
+            # run-dir JSON artifact, and a forged string span crashed
+            # every consumer of these ranges in interval arithmetic.
+            address = _opt_int(it.get("address"))
             if address is not None:
                 # Binary items have no line numbers — project onto the
                 # function's address range instead. Coherent within
                 # the store: binary:<stem> file entries never mix with
                 # line-numbered intervals.
-                size = it.get("size") or 0
+                size = _opt_int(it.get("size")) or 0
                 out[(path, name)] = (address, address + max(size - 1, 0))
                 continue
-            lo = it.get("line_start")
+            lo = _opt_int(it.get("line_start"))
             if lo is not None:
-                hi = it.get("line_end")
+                hi = _opt_int(it.get("line_end"))
                 if normalise_hi and hi is None:
                     hi = lo
                 out[(path, name)] = (lo, hi)
@@ -567,6 +712,7 @@ def import_functions_analysed(
     ranges: dict[tuple, tuple],
     inventory_paths: set,
     provenance: dict[str, Any] | None = None,
+    checklist_target: str | None = None,
 ) -> int:
     """Function-level marks from a record's ``functions_analysed`` — the precise
     "this function was reviewed" signal (an operator ``--mark``, or a
@@ -574,29 +720,158 @@ def import_functions_analysed(
     ``files_examined`` (whole-file "the tool looked at this file"): marking one
     function must NOT mark the whole file. Each (file, function) is resolved to
     its inventory line range and marked with the record's tool; entries that
-    don't resolve to an inventory function are skipped. Returns the count."""
+    don't resolve to an inventory function are skipped. Returns the count.
+
+    ``checklist_target`` — the joining inventory's ``target_path``,
+    consumed by the deferred-join gate (:func:`_deferred_join_refused`):
+    a scanner-overlay record whose rows were never build-time-joined
+    may only import into the inventory of the tree it scanned, and a
+    caller that cannot supply the target refuses deferred records
+    fail-closed."""
     tool = record.get("tool")
     fa_list = record.get("functions_analysed")
-    if not tool or not fa_list:
+    if not tool or not fa_list or not isinstance(fa_list, list):
+        return 0
+    if _deferred_join_refused(record, checklist_target):
+        logger.warning(
+            "coverage import: refusing deferred scanner-overlay join "
+            "for record %r — record target does not match (or does "
+            "not bind to) this inventory's target_path", tool)
         return 0
     stamp = _tool_stamp(
         tool, provenance, record_version=record.get("version"),
     ) if provenance else None
     marked = 0
+    demoted = 0
     inv_index = _inventory_name_index(inventory_paths)
+    # Row-authority tiering, same three tiers as the audit gap fold
+    # (core.audit.gaps._build_covered_set): coverage records live in
+    # target-writable run/project directories, and the store mark is
+    # the OTHER durable review-suppression surface beside the fold —
+    # without this gate a planted functions_analysed row imported
+    # under a review-grade label cleared the function from every
+    # store-derived gap view. MAC-verified rows import under the
+    # record's tool label; unstamped/tampered rows import under the
+    # label only behind the exact current-source-hash gate (and never
+    # for finding-class rows, which have no re-import route); every
+    # other row demotes to ``<tool>:machine`` — the mark survives as
+    # examination evidence but grades scanned-depth (see
+    # ``core.coverage.registry.classify``). Only review-grade labels
+    # are tiered: scanned/runtime labels grant no review credit, so
+    # demotion would be pure label churn.
+    from core.audit._util import safe_join
+    from core.audit.context import fallback_span_end
+    from core.staleness import hash_spans
+
+    from . import journal_mac
+    from .registry import CATEGORY_LLM, DEPTH_ANALYSED, classify
+
+    review_grade = classify(tool) == (CATEGORY_LLM, DEPTH_ANALYSED)
+    hash_cache: dict[str, dict[str, str]] = {}
+
+    def _hash_current(f: str, lo: int, hi: int | None, stored: str) -> bool:
+        if not checklist_target or not stored:
+            return False
+        key = f"{lo}-{hi}"
+        per_span = hash_cache.setdefault(f, {})
+        if key not in per_span:
+            resolved = safe_join(Path(checklist_target), f)
+            current = ""
+            if resolved is not None and resolved.is_file():
+                try:
+                    # hi=None = the fallback read window — the row's
+                    # hash was stamped over that window (see
+                    # core.audit.context.fallback_span_end), so the
+                    # gate must hash the same lines or every
+                    # window-stamped row demotes to machine tier.
+                    current = hash_spans(
+                        resolved,
+                        [(lo, fallback_span_end(lo, hi))])[0]
+                except OSError:
+                    current = ""
+            per_span[key] = current
+        # Exact, full-length equality — a short stored prefix never
+        # matches; "" (unreadable / span past cap) never matches.
+        current = per_span[key]
+        return bool(current) and stored == current
+
     for fa in fa_list:
-        if not isinstance(fa, dict):
+        if not isinstance(fa, dict) or not isinstance(fa.get("file"), str):
+            continue
+        if fa.get("status") in ("error", "dark"):
+            # A row that errored — or sits in the unresolved ``dark``
+            # gate-resolution bucket — is not review evidence: the
+            # store mark has no re-adjudication route, so it would
+            # durably suppress the function from every store-derived
+            # gap view. The record BUILDERS no longer emit such rows,
+            # but legacy records persisted before that screen are
+            # re-imported raw at every render; same discipline as the
+            # audit gap fold (core.audit.gaps._build_covered_set).
             continue
         f = _to_inventory_path(fa.get("file") or "", inventory_paths, inv_index)
         rng = ranges.get((f, fa.get("function")))
         if rng is None:
             continue
         lo, hi = rng
-        store.mark(f, lo, hi if hi is not None else lo, tool)
+        effective = tool
+        if review_grade and (journal_mac.coverage_row_provenance(fa, tool)
+                             != journal_mac.ROW_VERIFIED):
+            stored = fa.get("hash")
+            if (fa.get("status") in ("finding", "suspicious")
+                    or not isinstance(stored, str)
+                    or not _hash_current(f, lo, hi, stored)):
+                effective = f"{tool}:machine"
+                demoted += 1
+        store.mark(f, lo, hi if hi is not None else lo, effective)
         if stamp:
-            store.stamp_coverage(f, tool, **stamp)
+            store.stamp_coverage(f, effective, **stamp)
         marked += 1
+    if demoted:
+        logger.info(
+            "coverage import: %d of %d functions_analysed row(s) from "
+            "%r imported at machine tier (unverified provenance, no "
+            "matching current source hash) — examination evidence "
+            "kept, review credit withheld", demoted, marked, tool)
     return marked
+
+
+def _deferred_join_refused(
+    record: dict[str, Any], checklist_target: str | None,
+) -> bool:
+    """Whether a scanner-overlay record's ``functions_analysed`` rows
+    must NOT join the inventory whose target is ``checklist_target``.
+
+    A ``scanner_coverage.join == "deferred"`` record carries RAW rows
+    that were never validated against any inventory (a project-less
+    scan). Joining them by name into an arbitrary checklist would let
+    a record from one tree mint marks in another project whose
+    inventory happens to share ``(file, function)`` names — so a
+    deferred join is allowed only when the record's recorded
+    ``target_path`` names the same tree as the joining checklist's,
+    and FAIL-CLOSED when either side is missing (an unbindable
+    deferred record stays unjoined; its unit accounting remains
+    visible in the --scanners view). Spelling comparison is lexical
+    (``normpath``) — both sides record resolved absolute paths at
+    write time; symlink-alias spellings of the same tree refuse, the
+    safe direction. Build-time-joined records (``join ==
+    "inventory"``) were validated against their own run's inventory
+    and pass through.
+    """
+    sc = record.get("scanner_coverage")
+    if not isinstance(sc, dict) or sc.get("join") != "deferred":
+        return False
+    have = sc.get("target_path")
+    if not (isinstance(checklist_target, str) and checklist_target
+            and isinstance(have, str) and have):
+        return True
+    import os
+    return os.path.normpath(checklist_target) != os.path.normpath(have)
+
+
+def _checklist_target(checklist: dict[str, Any]) -> str | None:
+    target = checklist.get("target_path") if isinstance(checklist, dict) \
+        else None
+    return target if isinstance(target, str) and target else None
 
 
 def import_run_dir(
@@ -612,8 +887,33 @@ def import_run_dir(
     prov = run_provenance(run_dir)
     total = 0
     for rec in load_records(Path(run_dir)):
-        total += import_record(store, rec, total_lines, prov)
-        total += import_functions_analysed(store, rec, ranges, inv_paths, prov)
+        if not isinstance(rec, dict):
+            # The legacy list-of-records shape is an audit-loader
+            # contract (core.audit.loaders splices it flat) — the
+            # coverage importer consumes record OBJECTS only, so a
+            # list element quarantines here instead of detonating
+            # inside import_record.
+            logger.warning(
+                "coverage import: skipping non-object record (%s) "
+                "in %s", type(rec).__name__, run_dir)
+            continue
+        try:
+            total += import_record(store, rec, total_lines, prov)
+            total += import_functions_analysed(
+                store, rec, ranges, inv_paths, prov,
+                checklist_target=_checklist_target(checklist))
+        except Exception as exc:  # noqa: BLE001 — record containment boundary
+            # Coverage records are run-dir JSON: the per-field
+            # normalisation above covers the fields the importer
+            # consumes, and this arm contains whatever shape the next
+            # generation plants to the RECORD that carries it — one
+            # hostile record must never crash the whole rebuild (the
+            # store re-imports raw files at every render). Driven by
+            # the generative containment oracle
+            # (core/coverage/tests/test_intake_containment.py).
+            logger.warning(
+                "coverage import: skipping record %r in %s: %s: %s",
+                rec.get("tool"), run_dir, type(exc).__name__, exc)
     return total
 
 
@@ -649,9 +949,21 @@ def backfill(
         total = import_checked_by(store, checklist)
     run_dir_list = list(run_dirs)
     for run_dir in run_dir_list:
-        total += import_run_dir(store, run_dir, checklist)
-        total += import_understand(store, run_dir, checklist)   # /understand fold-in
-        import_run_findings(store, run_dir, inv_paths)   # link findings for verdicts
+        try:
+            total += import_run_dir(store, run_dir, checklist)
+            total += import_understand(store, run_dir, checklist)   # /understand fold-in
+            import_run_findings(store, run_dir, inv_paths)   # link findings for verdicts
+        except Exception as exc:  # noqa: BLE001 — run containment boundary
+            # One hostile run dir (every file in it sits inside the
+            # sandbox write grant) quarantines to that run — the
+            # backfill is the single store-construction path, so an
+            # exception here crashed every coverage consumer on every
+            # render until the file was hand-deleted. Driven by the
+            # generative containment oracle
+            # (core/coverage/tests/test_intake_containment.py).
+            logger.warning(
+                "coverage import: skipping run dir %s: %s: %s",
+                run_dir, type(exc).__name__, exc)
     try:
         from core.coverage.frida_bridge import import_frida_coverage
         total += import_frida_coverage(
@@ -719,4 +1031,4 @@ def import_runtime(
     if not fmt:
         return 0
     tool = tool or default_tool(fmt)
-    return mark_runtime(store, parse(path, fmt), checklist, tool)
+    return mark_runtime(store, parse(path, fmt), checklist, tool)  # type: ignore[arg-type]

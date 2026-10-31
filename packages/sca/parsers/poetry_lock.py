@@ -32,11 +32,12 @@ pass flip rows that also appear in pyproject.toml.
 from __future__ import annotations
 
 import logging
-import re
 import sys
 from typing import Any, TYPE_CHECKING
 
 from ..models import Confidence, Dependency, PinStyle
+from ..naming import pep503_name
+from ._base import PARSE_ESCAPE_ERRORS, build_purl, lockfile_confidence
 from . import _safe_read, register
 
 if TYPE_CHECKING:
@@ -46,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 _tomllib = None
 if sys.version_info >= (3, 11):
-    import tomllib as _tomllib            # type: ignore[no-redef]
+    import tomllib as _tomllib            # type: ignore[no-redef,assignment]
 else:                                     # pragma: no cover — env-dependent
     try:
         import tomli as _tomllib          # type: ignore[no-redef]
@@ -73,7 +74,7 @@ def parse(path: Path) -> list[Dependency]:
 
     try:
         data = _tomllib.loads(text)
-    except _tomllib.TOMLDecodeError as e:
+    except (_tomllib.TOMLDecodeError, *PARSE_ESCAPE_ERRORS) as e:  # hostile-input escape classes
         logger.warning(
             "sca.parsers.poetry_lock: TOML parse failed for %s: %s", path, e
         )
@@ -130,15 +131,15 @@ def _build_dep(pkg: dict[str, Any], path: Path) -> Dependency | None:
 
     return Dependency(
         ecosystem=ECOSYSTEM,
-        name=_normalise_name(name),
+        name=pep503_name(name),
         version=version,
         declared_in=path,
         scope=scope,
         is_lockfile=True,
         pin_style=pin_style,
         direct=False,
-        purl=_build_purl(name, version),
-        parser_confidence=_confidence(pin_style, version, scope, confidence_reason),
+        purl=build_purl("pypi", pep503_name(name), version),
+        parser_confidence=_confidence(pin_style, version, confidence_reason),
     )
 
 
@@ -157,27 +158,16 @@ def _infer_scope(pkg: dict[str, Any]) -> str:
 def _confidence(
     pin_style: PinStyle,
     version: str | None,
-    scope: str,                           # noqa: ARG001 — kept for symmetry
     base_reason: str,
 ) -> Confidence:
-    if pin_style is PinStyle.GIT:
-        return Confidence("medium", reason=base_reason)
-    if pin_style is PinStyle.PATH:
-        return Confidence("medium", reason=base_reason)
-    if version is None:
-        return Confidence("low", reason="poetry.lock entry without version")
-    return Confidence("high", reason=base_reason)
+    return lockfile_confidence(
+        pin_style, version,
+        git_reason=base_reason,
+        path_reason=base_reason,
+        unversioned_reason="poetry.lock entry without version",
+        resolved_reason=base_reason,
+    )
 
-
-def _normalise_name(name: str) -> str:
-    return re.sub(r"[-_.]+", "-", name).lower()
-
-
-def _build_purl(name: str, version: str | None) -> str:
-    base = f"pkg:pypi/{_normalise_name(name)}"
-    if version:
-        return f"{base}@{version}"
-    return base
 
 
 register(filenames=["poetry.lock"])(parse)

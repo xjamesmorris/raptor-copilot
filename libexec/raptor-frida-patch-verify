@@ -37,13 +37,13 @@ while [ -L "$SCRIPT" ]; do
         echo "raptor-frida-patch-verify: symlink hop limit exceeded resolving $0" >&2
         exit 2
     fi
-    DIR="$(cd "$(dirname "$SCRIPT")" && pwd)"
+    DIR="$(CDPATH= cd -- "$(dirname "$SCRIPT")" && pwd)"
     SCRIPT="$(readlink "$SCRIPT")"
     [[ "$SCRIPT" != /* ]] && SCRIPT="$DIR/$SCRIPT"
 done
 unset _symhops
 unset DIR
-RAPTOR_DIR="$(cd "$(dirname "$SCRIPT")/.." && pwd)"
+RAPTOR_DIR="$(CDPATH= cd -- "$(dirname "$SCRIPT")/.." && pwd)"
 
 if [ ! -f "$RAPTOR_DIR/raptor.py" ]; then
     echo "raptor-frida-patch-verify: cannot find raptor.py under $RAPTOR_DIR" >&2
@@ -81,6 +81,10 @@ i=0
 while [ $i -lt ${#ARGS[@]} ]; do
     a="${ARGS[$i]}"
     case "$a" in
+        # Everything after -- is positional: stop extracting wrapper
+        # flags (a --before/--out after -- must pass through verbatim,
+        # matching the short-circuit loop).
+        --)         break ;;
         --before)   i=$((i + 1)); BEFORE="${ARGS[$i]:-}" ;;
         --before=*) BEFORE="${a#--before=}" ;;
         --out)      i=$((i + 1)); OUT="${ARGS[$i]:-}" ;;
@@ -118,26 +122,47 @@ else
     LIFECYCLE_OWNED=0
 fi
 
-# ─── signal trap: fail the lifecycle run on interrupt/terminate ─────
-_cleanup() {
-    local sig="${1:-EXIT}"
-    if [ $LIFECYCLE_OWNED -eq 1 ] && [ -n "${OUT:-}" ]; then
-        "$RAPTOR_DIR/libexec/raptor-run-lifecycle" fail "$OUT" \
-            "patch-verify interrupted by signal $sig" 2>/dev/null || true
-    fi
+# ─── signal trap: forward to the child, decide disposition later ───
+# The trap must NOT write the lifecycle disposition: the exit status
+# after the signal decides it once, below — writing fail here and
+# complete after the wait made the final status a last-write race.
+# The child runs in its own session (setsid, when available) so the
+# whole tree gets the signal, not just the direct child.
+INTERRUPTED=""
+CHILD_GROUP=0
+if command -v setsid >/dev/null 2>&1; then
+    CHILD_GROUP=1
+fi
+_on_signal() {
+    INTERRUPTED="$1"
     if [ -n "${CHILD_PID:-}" ]; then
-        kill "$CHILD_PID" 2>/dev/null || true
+        if [ "$CHILD_GROUP" -eq 1 ]; then
+            kill -- "-$CHILD_PID" 2>/dev/null \
+                || kill "$CHILD_PID" 2>/dev/null || true
+        else
+            kill "$CHILD_PID" 2>/dev/null || true
+        fi
     fi
 }
-trap '_cleanup INT'  INT
-trap '_cleanup TERM' TERM
-trap '_cleanup HUP'  HUP
+trap '_on_signal INT'  INT
+trap '_on_signal TERM' TERM
+trap '_on_signal HUP'  HUP
 
 set +e
-python3 -m packages.frida.patch_oracle "${PASS_ARGS[@]}" &
+if [ "$CHILD_GROUP" -eq 1 ]; then
+    setsid python3 -m packages.frida.patch_oracle "${PASS_ARGS[@]}" &
+else
+    python3 -m packages.frida.patch_oracle "${PASS_ARGS[@]}" &
+fi
 CHILD_PID=$!
 wait $CHILD_PID
 RC=$?
+if [ -n "$INTERRUPTED" ]; then
+    # A trapped signal interrupts the first wait before the child has
+    # exited; re-wait to collect the child's real disposition.
+    wait $CHILD_PID 2>/dev/null
+    RC=$?
+fi
 set -e
 
 trap - INT TERM HUP
@@ -150,8 +175,13 @@ if [ $LIFECYCLE_OWNED -eq 1 ]; then
             "$RAPTOR_DIR/libexec/raptor-run-lifecycle" complete "$OUT" || true
             ;;
         *)
-            "$RAPTOR_DIR/libexec/raptor-run-lifecycle" fail "$OUT" \
-                "patch-verify exited $RC" || true
+            if [ -n "$INTERRUPTED" ]; then
+                "$RAPTOR_DIR/libexec/raptor-run-lifecycle" fail "$OUT" \
+                    "patch-verify interrupted by signal $INTERRUPTED (exited $RC)" || true
+            else
+                "$RAPTOR_DIR/libexec/raptor-run-lifecycle" fail "$OUT" \
+                    "patch-verify exited $RC" || true
+            fi
             ;;
     esac
 fi

@@ -44,8 +44,10 @@ from pathlib import Path
 
 
 from .models import Dependency, Manifest
-from .osv import _canonical_name as _osv_canonical_name
+from .naming import parent_join_key as _parent_join_key
+from .parsers._safe_read import read_bounded
 from typing import TYPE_CHECKING
+from core.source.lines import split_lines
 
 if TYPE_CHECKING:
     from core.json import JsonCache
@@ -86,27 +88,26 @@ _REQ_INCLUDE_MAX_DEPTH = 5
 
 def _parent_map_key(ecosystem: str, name: str) -> str:
     """Canonical key for the child → parents maps extracted from
-    cascade lockfiles.
+    cascade lockfiles — keys AND parent values.
 
-    PyPI needs full PEP 503 folding (runs of ``-``/``_``/``.`` → ``-``,
-    via the shared OSV canonicaliser) so dotted names emitted by
-    pip-compile (``zope.interface``) join with the parser-canonicalised
-    dep names (``zope-interface``) — a partial fold on one side loses
-    the parent linkage and the transitive-drop detector skips the dep.
-    Other ecosystems' maps store plain case-folded names (dots are
-    significant in npm / Cargo package names).
+    Delegates to the shared rule (:func:`packages.sca.naming
+    .parent_join_key`) because the transitive-drop detector joins
+    ``source_extra["via"]`` back against direct deps: producer and
+    consumer must fold identically or mixed-case parents silently
+    lose their linkage.
     """
-    if ecosystem == "PyPI":
-        return _osv_canonical_name(ecosystem, name)
-    return name.lower()
+    return _parent_join_key(name, ecosystem)
 
 
 def _requirements_include_targets(path: Path) -> set[Path]:
     """Resolved ``-r``/``-c`` include targets of one requirements file."""
     targets: set[Path] = set()
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    # Bounded no-follow read: requirements files come from the scanned
+    # tree — a planted multi-hundred-MB file allocated ~2x its size
+    # here, and a symlink leaked host-file content into the include
+    # resolution.
+    text = read_bounded(path, follow_symlinks=False)
+    if text is None:
         return targets
     for raw in text.splitlines():
         line = raw.strip()
@@ -177,9 +178,8 @@ def _augment_declared_with_includes(
 
 def _is_cargo_workspace_root(cargo_toml: Path) -> bool:
     """True if *cargo_toml* declares ``[workspace]``."""
-    try:
-        text = cargo_toml.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    text = read_bounded(cargo_toml, follow_symlinks=False)
+    if text is None:
         return False
     for line in text.splitlines():
         stripped = line.strip()
@@ -710,13 +710,22 @@ def _typosquat_dirs(
     return out
 
 
-def _common_ancestor(paths: Sequence[Path]) -> Path:
+def _common_ancestor(paths: Sequence[Path]) -> Path | None:
     """Common-prefix path that every input is under. Used by the
     cascade batch to size the sandbox cwd to cover all manifests in
     one session. Single-input collapses to that input's parent (so
-    behaviour matches the sequential per-manifest path)."""
+    behaviour matches the sequential per-manifest path).
+
+    Returns ``None`` when the only shared prefix is the filesystem
+    root: sizing the batch sandbox cwd to ``/`` would grant the
+    resolver session filesystem-wide reads. ``None`` makes the batch
+    resolvers take their documented sequential per-dir fallback
+    (each sandboxed to its own manifest dir) instead. The
+    single-input shortcut returns that input itself (matching the
+    sequential per-manifest path) and gets the same root refusal."""
     if len(paths) == 1:
-        return paths[0]
+        only = paths[0].resolve()
+        return None if only == Path(only.anchor or "/") else paths[0]
     parts_lists = [p.resolve().parts for p in paths]
     shortest = min(len(pl) for pl in parts_lists)
     common: list[str] = []
@@ -726,9 +735,10 @@ def _common_ancestor(paths: Sequence[Path]) -> Path:
             common.append(seg)
         else:
             break
-    if not common:
-        return Path("/")
-    return Path(*common)
+    ancestor = Path(*common) if common else None
+    if ancestor is None or ancestor == Path(ancestor.anchor or "/"):
+        return None
+    return ancestor
 
 
 # ---------------------------------------------------------------------------
@@ -743,7 +753,7 @@ def _extract_cargo_lock_parents(blob: bytes) -> dict[str, list[str]]:
         try:
             import tomllib
         except ImportError:
-            import tomli as tomllib  # type: ignore[import]
+            import tomli as tomllib  # type: ignore[import,no-redef]
         data = tomllib.loads(blob.decode("utf-8", errors="replace"))
     except Exception:                                       # noqa: BLE001
         return {}
@@ -763,7 +773,9 @@ def _extract_cargo_lock_parents(blob: bytes) -> dict[str, list[str]]:
             # ``"<name> <version> (<source>)"`` or ``"<name>"``.
             child = dep_str.split(" ", 1)[0]
             if child:
-                out.setdefault(child.lower(), []).append(parent_name.lower())
+                out.setdefault(
+                    _parent_map_key("Cargo", child), [],
+                ).append(_parent_map_key("Cargo", parent_name))
     return out
 
 
@@ -788,8 +800,8 @@ def _extract_composer_lock_parents(blob: bytes) -> dict[str, list[str]]:
                 continue
             for child_name in (pkg.get("require") or {}):
                 out.setdefault(
-                    child_name.lower(), [],
-                ).append(parent_name.lower())
+                    _parent_map_key("Packagist", child_name), [],
+                ).append(_parent_map_key("Packagist", parent_name))
     return out
 
 
@@ -832,9 +844,11 @@ def _extract_gemfile_lock_parents(blob: bytes) -> dict[str, list[str]]:
         # Top-level gems in specs: are 4-space indented;
         # their children are 6-space indented (2 deeper).
         if len(indent) == 4:
-            current_parent = name.lower()
+            current_parent = _parent_map_key("RubyGems", name)
         elif len(indent) >= 6 and current_parent is not None:
-            out.setdefault(name.lower(), []).append(current_parent)
+            out.setdefault(
+                _parent_map_key("RubyGems", name), [],
+            ).append(current_parent)
     return out
 
 
@@ -874,9 +888,22 @@ def _extract_npm_lock_parents(blob: bytes) -> dict[str, list[str]]:
         # means y is a child of x. The path's last segment is the
         # package name; everything before identifies the parent.
         for dep_name in (meta.get("dependencies") or {}):
-            child_canon = dep_name.lower()
-            out.setdefault(child_canon, []).append(parent_name.lower())
+            child_canon = _parent_map_key("npm", dep_name)
+            out.setdefault(child_canon, []).append(
+                _parent_map_key("npm", parent_name),
+            )
     return out
+
+
+def _strip_pep508_extras(name: str) -> str:
+    """Drop a PEP 508 extras suffix (``Celery[redis]`` → ``Celery``).
+
+    Extras are requirement syntax, not part of the package name —
+    PEP 503 canonical names never contain brackets, so an extras-
+    carrying name is its own fold fixpoint yet can never equal a
+    direct dep's join key. Strip before folding or the linkage is
+    silently lost."""
+    return name.split("[", 1)[0].strip()
 
 
 def _extract_pip_compile_via(blob: bytes) -> dict[str, list[str]]:
@@ -892,6 +919,14 @@ def _extract_pip_compile_via(blob: bytes) -> dict[str, list[str]]:
             #   instructor
             #   sphinx
 
+    Pinned lines may carry PEP 508 extras (``celery[redis]==5.3.6``,
+    pip-compile default keeps them) and environment markers
+    (``redis==4.5.0 ; python_version >= "3.9"``); via annotations
+    name the requirement as written, extras included
+    (``# via celery[redis]``). Both are requirement syntax, not part
+    of the name — extras are stripped and markers ignored so the
+    edge still joins.
+
     We only need the parent list per package; downstream consumers
     use it to ask "if I bump <parent>, does this transitive
     disappear?". Keys AND parent values are PEP 503 canonicalised
@@ -900,14 +935,17 @@ def _extract_pip_compile_via(blob: bytes) -> dict[str, list[str]]:
     import re as _re
 
     text = blob.decode("utf-8", errors="replace")
-    # Match: ``<name>==<version>`` followed by indented ``# via``
-    # block, possibly continuing across lines as ``#   <parent>``.
+    # Match: ``<name>[extras]==<version> ; marker`` (extras group and
+    # marker tail optional) followed by an indented ``# via`` block,
+    # possibly continuing across lines as ``#   <parent>``. The name
+    # capture excludes the extras group; versions never contain ``;``.
     pkg_re = _re.compile(
-        r"^([A-Za-z0-9][A-Za-z0-9._-]*)==[^\s]+\s*$",
+        r"^([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^\]]*\])?"
+        r"==[^\s;]+\s*(?:;.*)?$",
         _re.MULTILINE,
     )
     out: dict[str, list[str]] = {}
-    lines = text.splitlines()
+    lines = split_lines(text)
     for i, line in enumerate(lines):
         m = pkg_re.match(line.strip())
         if m is None:
@@ -928,14 +966,15 @@ def _extract_pip_compile_via(blob: bytes) -> dict[str, list[str]]:
                 if rest:
                     # Single-line form: ``# via <parent>``
                     for p in rest.split(","):
-                        p = p.strip()
+                        p = _strip_pep508_extras(p)
                         if p and not p.startswith("-"):
                             parents.append(_parent_map_key("PyPI", p))
                 in_via = True
             elif in_via:
                 # Continuation: ``#   <parent>``
-                if content and not content.startswith("-"):
-                    parents.append(_parent_map_key("PyPI", content))
+                parent = _strip_pep508_extras(content)
+                if parent and not parent.startswith("-"):
+                    parents.append(_parent_map_key("PyPI", parent))
             j += 1
         if parents:
             out[name] = parents
@@ -1055,22 +1094,22 @@ def _import_lockfile_parser(ecosystem: str) -> Callable | None:
         from .parsers.requirements import parse as _parse
         return _parse
     if ecosystem == "npm":
-        from .parsers.package_lock_json import parse as _parse
+        from .parsers.package_lock_json import parse as _parse  # type: ignore[assignment]
         return _parse
     if ecosystem == "Cargo":
-        from .parsers.cargo import parse_lockfile as _parse
+        from .parsers.cargo import parse_lockfile as _parse  # type: ignore[assignment]
         return _parse
     if ecosystem == "Go":
-        from .parsers.gomod import parse_lockfile as _parse
+        from .parsers.gomod import parse_lockfile as _parse  # type: ignore[assignment]
         return _parse
     if ecosystem == "RubyGems":
-        from .parsers.gemfile import parse_lockfile as _parse
+        from .parsers.gemfile import parse_lockfile as _parse  # type: ignore[assignment]
         return _parse
     if ecosystem == "Packagist":
-        from .parsers.composer import parse_lockfile as _parse
+        from .parsers.composer import parse_lockfile as _parse  # type: ignore[assignment]
         return _parse
     if ecosystem == "NuGet":
-        from .parsers.nuget import parse_lockfile as _parse
+        from .parsers.nuget import parse_lockfile as _parse  # type: ignore[assignment]
         return _parse
     return None
 

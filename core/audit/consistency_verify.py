@@ -35,7 +35,10 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .consistency_stats import Floors
 
 from .callsite_consistency import (
     USAGE_ACKNOWLEDGED,
@@ -47,6 +50,7 @@ from .callsite_consistency import (
 from .fail_open_roles import RoleContext, bind_role
 from .peer_evidence import PeerEvidence, PeerExhibit, rule_id
 from .return_contracts import bind_return_contract
+from core.source.lines import split_lines
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +60,9 @@ DIMENSION_ARGUMENT_SHAPE = "argument-shape"
 DIMENSION_CLONE_DRIFT = "clone-drift"
 DIMENSION_SANITIZE_SINK = "sanitize-sink"
 DIMENSION_GUARD_PRESENCE = "guard-presence"
+# Guard-predicate lives in its own census module; the name is pinned
+# equal there by test (sibling-drift fence).
+DIMENSION_GUARD_PREDICATE = "guard-predicate"
 
 RULE_RETURN_CHECK = rule_id(DIMENSION_RETURN_CHECK, detection=False)
 RULE_RETURN_CHECK_MAJORITY = rule_id(DIMENSION_RETURN_CHECK, detection=True)
@@ -64,8 +71,19 @@ RULE_ARGUMENT_SHAPE = rule_id(DIMENSION_ARGUMENT_SHAPE, detection=False)
 RULE_CLONE_DRIFT = rule_id(DIMENSION_CLONE_DRIFT, detection=False)
 RULE_SANITIZE_SINK = rule_id(DIMENSION_SANITIZE_SINK, detection=False)
 RULE_GUARD_PRESENCE = rule_id(DIMENSION_GUARD_PRESENCE, detection=False)
+RULE_GUARD_PREDICATE = rule_id(DIMENSION_GUARD_PREDICATE, detection=False)
 
 # Mechanical-path thresholds (§2.3 — stricter than the lead path).
+# Registered in core.audit.consistency_stats (run-config overrides
+# arrive via census_verdict's ``floors``).
+# Trade-off, both directions: LOWER (ratio) mints detection-grade
+# confirmations from small dissent — the deviant itself counts in
+# ``considered``, so 0.9 already demands ≥ 9 checking sites per
+# deviant, and each confirmation is a prompt-injected claim the LLM
+# anchors on; HIGHER starves the majority leg entirely and the
+# census degrades to registry-witness dimensions only. The min-sites
+# floor below is the cheap early refusal for micro-families the
+# ratio test would reject anyway.
 VERDICT_MIN_SITES = 4
 VERDICT_MAJORITY_RATIO = 0.9
 
@@ -80,8 +98,20 @@ REASON_HYPOTHESIS_UNBINDABLE = "hypothesis-unbindable"
 REASON_OWNERSHIP_UNRESOLVED = "ownership-unresolved"
 REASON_GUARD_ELSEWHERE = "guard-elsewhere"
 REASON_CENSUS_TRUNCATED = "census-truncated"
+# The supplied census has no entry for any hypothesis callee. Distinct
+# from REASON_HYPOTHESIS_UNBINDABLE (no callee candidates AT ALL —
+# retrying cannot help): the orchestrator's prep-census pass-through
+# keys its fallback rebuild on this code, so it must stay structured,
+# not a prose fragment.
+REASON_CENSUS_MISS = "census-miss"
+# The guard-predicate adjudicator found no peer group covering the
+# claimed function (distinct from a refutation: an unformed family
+# proves nothing about the claim, and the return-check census may
+# still bind the same hypothesis).
+REASON_PREDICATE_FAMILY_UNFORMED = "predicate-family-unformed"
 
 INCONCLUSIVE_REASONS = frozenset({
+    REASON_PREDICATE_FAMILY_UNFORMED,
     REASON_CONTRACT_UNRESOLVED,
     REASON_GROUP_TOO_SMALL,
     REASON_RATIO_BELOW_THRESHOLD,
@@ -92,6 +122,7 @@ INCONCLUSIVE_REASONS = frozenset({
     REASON_OWNERSHIP_UNRESOLVED,
     REASON_GUARD_ELSEWHERE,
     REASON_CENSUS_TRUNCATED,
+    REASON_CENSUS_MISS,
 })
 
 # Enumerated refutation reasons.
@@ -100,6 +131,7 @@ REFUTED_DISCARD_OK = "majority-discard-convention"
 REFUTED_SITE_CHECKS = "site-tests-the-value"
 REFUTED_VOID_CALLEE = "void-return-callee"
 REFUTED_PATH_INFEASIBLE = "deviant-path-infeasible"
+REFUTED_PREDICATE_CONFORMS = "predicate-matches-majority"
 
 # CWE families the channel joins via the fallback chain (§4.3).
 # CWE-252 keeps its existing cocci entry; consistency joins its chain
@@ -119,13 +151,13 @@ CONSISTENCY_CWES = frozenset({
 # "unchecked return" phrasing deliberately does NOT dispatch here —
 # without a majority/peer claim that is fail_open (role premise) or
 # CWE-seeded territory.
-_PEER_NOUN = r"(?:callers?|call\s?-?sites?|sites?|implementations?|branches?|usages?)"
+_PEER_NOUN = r"(?:callers?|call\s?-?sites?|sites?|implementations?|branches?|usages?|loops?)"
 _CONSISTENCY_HYPOTHESIS_RE = re.compile(
-    rf"(?:\b\d+\s*/\s*\d+\s+(?:other\s+)?{_PEER_NOUN}\b"
+    rf"(?:\b\d+\s*/\s*\d+\s+(?:other\s+|sibling\s+)?{_PEER_NOUN}\b"
     rf"|\b(?:most|all\s+other|every\s+other|the\s+other|other)\s+"
     rf"(?:\d+\s+)?{_PEER_NOUN}[^.]{{0,80}}?"
     r"\b(?:check|test|validat|verif|saniti|handle|free|unlock|lock|"
-    r"releas|clos)"
+    r"releas|clos|guard|bound|compar)"
     r"|\binconsistent\s+with\s+(?:its\s+)?(?:peers?|siblings?|other)"
     r"|\bdeviates?\s+from\s+(?:the\s+)?(?:majority|its\s+peers?|"
     r"the\s+(?:project\s+)?convention))",
@@ -231,7 +263,7 @@ def _snippet(source_texts: dict[str, str] | None,
     source = source_texts.get(file_path)
     if not source:
         return ""
-    lines = source.splitlines()
+    lines = split_lines(source)
     if 1 <= line <= len(lines):
         return lines[line - 1].strip()[:200]
     return ""
@@ -445,9 +477,25 @@ def census_verdict(
     inventory: dict[str, Any] | None = None,
     source_texts: dict[str, str] | None = None,
     joern_server: Any = None,
+    floors: Floors | None = None,
 ) -> ConsistencyResult:
-    """Adjudicate one deviant site against its callee census (§2.3)."""
+    """Adjudicate one deviant site against its callee census (§2.3).
+
+    *floors* (a :class:`core.audit.consistency_stats.Floors`) carries
+    the run's effective majority-leg thresholds; ``None`` means the
+    module defaults — identical arithmetic.
+    """
     ctx = context or RoleContext()
+    if floors is not None:
+        verdict_min_sites = int(
+            floors.value("return-check.verdict_min_sites"),
+        )
+        verdict_majority_ratio = float(
+            floors.value("return-check.verdict_majority_ratio"),
+        )
+    else:
+        verdict_min_sites = VERDICT_MIN_SITES
+        verdict_majority_ratio = VERDICT_MAJORITY_RATIO
     callee = entry.callee
     language = _language_of(deviant.file)
 
@@ -575,14 +623,14 @@ def census_verdict(
             "statistics computed over partial data",
             callee=callee,
         )
-    if entry.considered < VERDICT_MIN_SITES:
+    if entry.considered < verdict_min_sites:
         return _inconclusive(
             REASON_GROUP_TOO_SMALL,
             f"{entry.considered} considered site(s) < "
-            f"{VERDICT_MIN_SITES}",
+            f"{verdict_min_sites}",
             callee=callee,
         )
-    if entry.check_ratio < VERDICT_MAJORITY_RATIO:
+    if entry.check_ratio < verdict_majority_ratio:
         if contract is None and entry.all_python:
             return _inconclusive(
                 REASON_PYTHON_EXCEPTION_SEMANTICS,
@@ -594,13 +642,13 @@ def census_verdict(
             return _inconclusive(
                 REASON_CONTRACT_UNRESOLVED,
                 f"no contract source for {callee} and check ratio "
-                f"{entry.check_ratio:.2f} < {VERDICT_MAJORITY_RATIO}",
+                f"{entry.check_ratio:.2f} < {verdict_majority_ratio}",
                 callee=callee,
             )
         return _inconclusive(
             REASON_RATIO_BELOW_THRESHOLD,
             f"check ratio {entry.check_ratio:.2f} < "
-            f"{VERDICT_MAJORITY_RATIO}",
+            f"{verdict_majority_ratio}",
             callee=callee,
         )
 
@@ -843,9 +891,18 @@ def _caller_guard_walk(
     )
     by_key: dict[tuple[str, str], list[str]] = {}
     by_name: dict[str, tuple[str, list[str]]] = {}
+    # Names defined in more than one file: the name-only fallbacks
+    # below refuse these — a same-named function from an unrelated
+    # file could donate (or hide) a guard, and a wrongly donated
+    # guard suppresses the SMT escalation.
+    ambiguous_names: set[str] = set()
     for fp, fn, _start, body in _function_spans(source_texts):
         by_key.setdefault((fp, fn), body)
-        by_name.setdefault(fn, (fp, body))
+        prior = by_name.get(fn)
+        if prior is None:
+            by_name[fn] = (fp, body)
+        elif prior[0] != fp:
+            ambiguous_names.add(fn)
 
     def _seed_candidates() -> list[Any]:
         """Canonicalise the deviant's enclosing function to its
@@ -874,7 +931,17 @@ def _caller_guard_walk(
                     exact.append(node)
                 else:
                     by_name_only.append(node)
-        return exact or by_name_only
+        if exact:
+            return exact
+        # Name-only fallback: legitimate only for path-representation
+        # drift between the inventory and the deviation record. With
+        # several same-named definitions in other files the identity
+        # is ambiguous — walking the wrong function's callers could
+        # surface a guard that suppresses SMT escalation, so return
+        # nothing and let the verdict fall through to SMT.
+        if len(by_name_only) == 1:
+            return by_name_only
+        return []
 
     seeds = _seed_candidates()
     if not seeds:
@@ -902,17 +969,27 @@ def _caller_guard_walk(
                         continue
                     visited.add(key)
                     searched.append(caller.name)
-                    body = by_key.get(key)
-                    if body is None:
+                    body = by_key.get(key)  # type: ignore[assignment]
+                    if body is None and caller.name not in ambiguous_names:
+                        # Same path-drift rationale as the seed
+                        # fallback: a unique name is trustworthy, an
+                        # ambiguous one is not.
                         named = by_name.get(caller.name)
                         body = named[1] if named else None
                     next_frontier.append(caller)
                     if body is None:
                         continue
+                    # A missed call-site locator (multi-line call,
+                    # aliased callee, dispatch table) must fail toward
+                    # SMT escalation: default 0 scans nothing. The old
+                    # whole-body default let ANY guard-shaped line —
+                    # even one after the call, or guarding an
+                    # unrelated variable — count as "guarding" and
+                    # suppress the escalation.
                     call_idx = next(
                         (i for i, ln in enumerate(body)
                          if call_re.search(ln)),
-                        len(body),
+                        0,
                     )
                     for i in range(call_idx):
                         if guard_re.search(body[i]):
@@ -975,6 +1052,7 @@ def guard_presence_verdict(
     source_texts: dict[str, str] | None = None,
     joern_server: Any = None,
     smt_check: Any = None,
+    floors: Floors | None = None,
 ) -> ConsistencyResult:
     """Adjudicate one bounds/null-guard presence deviation (§3.4).
 
@@ -1045,7 +1123,11 @@ def guard_presence_verdict(
         else ""
     )
     from .consistency_dimensions import RATIO_PROMOTE
-    if feasible is True and deviation.ratio >= RATIO_PROMOTE:
+    promote_ratio = (
+        float(floors.value("guard-presence.promote_ratio"))
+        if floors is not None else RATIO_PROMOTE
+    )
+    if feasible is True and deviation.ratio >= promote_ratio:
         pe = deviation.peer_evidence
         if pe is not None:
             pe.contract_source = "smt_witness"
@@ -1086,7 +1168,7 @@ def guard_presence_verdict(
             f"majority evidence only (detection grade"
             + (
                 f"; SMT feasible but ratio "
-                f"{deviation.ratio:.2f} < {RATIO_PROMOTE}"
+                f"{deviation.ratio:.2f} < {promote_ratio}"
                 if feasible is True else "; no SMT witness"
             )
             + ")"
@@ -1098,6 +1180,231 @@ def guard_presence_verdict(
     )
     if walk is not None:
         result.corroboration.append({"caller_guard_walk": walk})
+    # Detection-grade never reaches `finding` — cheap leg only.
+    result.reachability = _entry_reachability(
+        ctx, inventory, deviation.file, deviation.enclosing_function,
+    )
+    return result
+
+
+def _off_by_one_boundary_smt(deviation: Any) -> Any:
+    """Boundary-admission check for an operator-drift deviant: is the
+    value the deviant's operator ADMITS and the majority's EXCLUDES
+    reachable?  Only resolvable-with-integer bounds reach the solver
+    (symbolic bounds degrade to detection grade, never a guess)."""
+    bound = (deviation.bound_expr or "").strip()
+    if not re.fullmatch(r"(?:0[xX][0-9a-fA-F]+|\d+)", bound):
+        return None
+    var = deviation.tested_var
+    neg_major = {
+        "<": ">=", "<=": ">", ">": "<=", ">=": "<",
+    }.get(deviation.majority_relop)
+    if not neg_major or not var or "->" in var or "." in var:
+        return None
+    try:
+        from .condition_extraction import GuardCondition
+        from .condition_smt import check_path_feasibility
+        guard = GuardCondition(
+            text=(
+                f"{var} {deviation.relop} {bound} && "
+                f"{var} {neg_major} {bound}"
+            ),
+            category="bounds",
+            polarity="required",
+            line=deviation.line,
+        )
+        return check_path_feasibility([guard])
+    except Exception:
+        logger.debug("guard predicate: boundary SMT failed",
+                     exc_info=True)
+        return None
+
+
+def _signedness_mismatch_smt(
+    deviation: Any, source_texts: dict[str, str] | None,
+) -> Any:
+    """Route a signedness-mix deviant through the existing
+    ``condition_smt`` signed-mismatch checker, scoped to the
+    deviant's own function span."""
+    body = ""
+    if source_texts:
+        try:
+            from .consistency_dimensions import _function_spans
+            source = source_texts.get(deviation.file)
+            if source:
+                for _fp, fn, _start, lines in _function_spans(
+                    {deviation.file: source},
+                ):
+                    if fn == deviation.enclosing_function:
+                        body = "\n".join(lines)
+                        break
+        except Exception:
+            logger.debug("guard predicate: span lookup failed",
+                         exc_info=True)
+    try:
+        from .condition_extraction import GuardCondition
+        from .condition_smt import check_signed_mismatch
+        guard = GuardCondition(
+            text=(
+                f"{deviation.tested_var} {deviation.relop} "
+                f"{deviation.bound_expr}"
+            ),
+            category="bounds",
+            polarity="required",
+            line=deviation.line,
+        )
+        res = check_signed_mismatch(guard, source=body)
+    except Exception:
+        logger.debug("guard predicate: signed-mismatch SMT failed",
+                     exc_info=True)
+        return None
+    if res is None:
+        return None
+    # Adapt to the feasibility shape the verdict folds over: a
+    # witnessed mismatch is the "deviant predicate admits the bad
+    # value" direction; no mismatch is solver-silent (None), never a
+    # refutation — absence of an int-resolvable bound proves nothing.
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        feasible=True if res.mismatch else None,
+        reasoning=res.reasoning,
+        witness=res.witness,
+    )
+
+
+def guard_predicate_verdict(
+    deviation: Any,
+    *,
+    context: RoleContext | None = None,
+    inventory: dict[str, Any] | None = None,
+    source_texts: dict[str, str] | None = None,
+    joern_server: Any = None,
+    smt_check: Any = None,
+    floors: Floors | None = None,
+) -> ConsistencyResult:
+    """Adjudicate one guard-predicate deviation.
+
+    The dimension's deterministic escalation partners are the
+    existing ``condition_smt`` legs — never a rival solver path:
+
+    * ``off-by-one`` / ``operator-mismatch`` → boundary admission
+      (the value the deviant admits and the majority excludes) via
+      path feasibility;
+    * ``missing-null-arm`` → the deviant's own dominating guards via
+      path feasibility (the guard-presence pattern);
+    * ``signedness-mix`` → the signed-mismatch checker over the
+      deviant's predicate, scoped to its function span;
+    * ``guard-variable-mismatch`` → no deterministic partner; stays
+      detection-grade.
+
+    A concrete witness upgrades the deviant to a promote-capable
+    ``smt_witness`` confirmation when the majority meets the
+    promote-adjacent floor; provable infeasibility refutes
+    (``deviant-path-infeasible``); everything else is a
+    detection-grade ``-majority`` confirmation, aggregation-eligible
+    only.
+    """
+    from .guard_predicate import (
+        KIND_MISSING_NULL_ARM,
+        KIND_OFF_BY_ONE,
+        KIND_OPERATOR_MISMATCH,
+        KIND_SIGNEDNESS_MIX,
+    )
+
+    ctx = context or RoleContext()
+    if smt_check is not None:
+        smt = smt_check(deviation)
+    elif deviation.kind in (KIND_OFF_BY_ONE, KIND_OPERATOR_MISMATCH):
+        smt = _off_by_one_boundary_smt(deviation)
+    elif deviation.kind == KIND_MISSING_NULL_ARM:
+        smt = _default_guard_smt(deviation)
+    elif deviation.kind == KIND_SIGNEDNESS_MIX:
+        smt = _signedness_mismatch_smt(deviation, source_texts)
+    else:
+        smt = None
+    feasible = getattr(smt, "feasible", None)
+    smt_reason = getattr(smt, "reasoning", "") or ""
+    witness = getattr(smt, "witness", None)
+
+    if feasible is False:
+        if deviation.kind in (KIND_OFF_BY_ONE, KIND_OPERATOR_MISMATCH):
+            # Boundary-admission unsat means the deviant admits NO
+            # value its peers exclude — subset-side (strict-side)
+            # drift.  Named distinctly for the audit trail: an
+            # under-inclusion bug (peers <=, deviant <) is suppressed
+            # on this leg, not disproven as a code defect.
+            detail = (
+                "admits no value the majority predicate excludes "
+                f"(subset-side drift; {smt_reason})"
+            )
+        else:
+            detail = f"is unsatisfiable ({smt_reason})"
+        return ConsistencyResult(
+            outcome="refuted",
+            reason=(
+                f"{REFUTED_PATH_INFEASIBLE}: the deviant predicate at "
+                f"{deviation.file}:{deviation.line} {detail}"
+            ),
+            rule_id=RULE_GUARD_PREDICATE,
+            dimension=DIMENSION_GUARD_PREDICATE,
+            callee=deviation.group_key,
+        )
+
+    from .consistency_dimensions import RATIO_PROMOTE
+    promote_ratio = (
+        float(floors.value("guard-predicate.promote_ratio"))
+        if floors is not None else RATIO_PROMOTE
+    )
+    if feasible is True and deviation.ratio >= promote_ratio:
+        pe = deviation.peer_evidence
+        if pe is not None:
+            pe.contract_source = "smt_witness"
+            pe.provenance = (
+                f"condition_smt:{witness or 'feasible'}"
+            )
+        detail = f" (witness: {witness})" if witness else ""
+        result = ConsistencyResult(
+            outcome="confirmed",
+            reason=(
+                f"{deviation.description} — condition_smt witnesses "
+                f"the value space the deviant predicate admits beyond "
+                f"its peers'{detail}: {smt_reason}"
+            ),
+            rule_id=RULE_GUARD_PREDICATE,
+            dimension=DIMENSION_GUARD_PREDICATE,
+            callee=deviation.group_key,
+            peer_evidence=pe,
+            contract={
+                "source": "smt_witness",
+                "provenance": (
+                    f"condition_smt:{witness or 'feasible'}"
+                ),
+                "grade": "registry",
+            },
+        )
+        result.reachability = _escalate_reachability(
+            ctx, inventory, deviation.file,
+            deviation.enclosing_function, joern_server,
+        )
+        return result
+
+    result = ConsistencyResult(
+        outcome="confirmed",
+        reason=(
+            f"{deviation.description} — majority evidence only "
+            f"(detection grade"
+            + (
+                f"; SMT feasible but ratio "
+                f"{deviation.ratio:.2f} < {promote_ratio}"
+                if feasible is True else "; no SMT witness"
+            )
+            + ")"
+        ),
+        rule_id=rule_id(DIMENSION_GUARD_PREDICATE, detection=True),
+        dimension=DIMENSION_GUARD_PREDICATE,
+        callee=deviation.group_key,
+        peer_evidence=deviation.peer_evidence,
+    )
     # Detection-grade never reaches `finding` — cheap leg only.
     result.reachability = _entry_reachability(
         ctx, inventory, deviation.file, deviation.enclosing_function,
@@ -1177,27 +1484,30 @@ def _gather_source_texts(
     callee_candidates: list[str],
 ) -> dict[str, str]:
     """Bounded scan: the hypothesis's own file plus files mentioning a
-    candidate callee (the same-callee peer group lives across files)."""
+    candidate callee (the same-callee peer group lives across files).
+
+    ``file_path`` arrives from LLM-writable artifacts: reads route
+    through :func:`core.source.read_contained` (the release_order
+    idiom) so absolute values, ``..`` traversal, and symlink escapes
+    read as nothing, and the primary read is capped like the
+    candidates.
+    """
+    from core.source import read_contained
+
     texts: dict[str, str] = {}
     target = Path(target_path)
-    own = target / file_path
-    try:
-        if own.is_file():
-            texts[file_path] = own.read_text(
-                encoding="utf-8", errors="replace",
-            )
-    except OSError:
-        pass
-    try:
-        paths = sorted(
-            p for p in target.rglob("*")
-            if p.is_file() and p.suffix in _SOURCE_SUFFIXES
-        )
-    except OSError:
-        return texts
-    for p in paths:
+    own = read_contained(target, file_path, max_chars=_MAX_FILE_BYTES)
+    if own is not None:
+        texts[file_path] = own
+    # Streaming walk (see api_boundary._walk_tree_entries): the old
+    # sorted-rglob materialised the whole tree before the cap.
+    from .api_boundary import _walk_tree_entries
+
+    for p in _walk_tree_entries(target):
         if len(texts) >= _MAX_SCAN_FILES:
             break
+        if not p.is_file() or p.suffix not in _SOURCE_SUFFIXES:
+            continue
         try:
             rel = str(p.relative_to(target))
         except ValueError:
@@ -1207,12 +1517,171 @@ def _gather_source_texts(
         try:
             if p.stat().st_size > _MAX_FILE_BYTES:
                 continue
-            content = p.read_text(encoding="utf-8", errors="replace")
         except OSError:
+            continue
+        content = read_contained(target, rel, max_chars=_MAX_FILE_BYTES)
+        if content is None:
             continue
         if any(c in content for c in callee_candidates):
             texts[rel] = content
     return texts
+
+
+def _hypothesis_names_site(hypothesis: str, site: Any) -> bool:
+    """Does the hypothesis text name this site's predicate material
+    (tested identifier, subscript base/index, deref field, or bound
+    expression)?  Used only to NARROW refutation to the sites the
+    claim is plausibly about — both failure directions land on
+    inconclusive, never on a refute."""
+    tokens: set[str] = {
+        site.base, site.index, site.field_name, site.bound_expr,
+    }
+    tokens.update(site.tested_var.replace("->", ".").split("."))
+    for tok in tokens:
+        tok = (tok or "").strip()
+        if not tok:
+            continue
+        if re.search(
+            rf"(?<![0-9A-Za-z_]){re.escape(tok)}(?![0-9A-Za-z_])",
+            hypothesis,
+        ):
+            return True
+    return False
+
+
+def run_guard_predicate_check(
+    target_path: Path,
+    file_path: str,
+    function_name: str,
+    hypothesis: str,
+    *,
+    inventory: dict[str, Any] | None = None,
+    context: RoleContext | None = None,
+    source_texts: dict[str, str] | None = None,
+    joern_server: Any = None,
+) -> ConsistencyResult:
+    """Adjudicate one guard-predicate hypothesis ("3/4 sibling loops
+    bound i with < n; this uses <=").
+
+    The channel never trusts the claimed drift: it re-runs the
+    predicate census over the (bounded) peer group and re-derives the
+    majority profile.  A census deviation at the claimed function
+    goes to :func:`guard_predicate_verdict` (SMT escalation
+    included); a group the census genuinely VOTED whose member at the
+    claimed function CONFORMS refutes; everything else is an
+    enumerated inconclusive — a group the census skipped without
+    voting (call-shaped bound, ops budget, macro divergence, cap
+    closure) reports THAT reason, and no covering group at all is
+    ``predicate-family-unformed`` — the caller may still bind the
+    same hypothesis through the return census.
+    """
+    from .guard_predicate import (
+        REASON_CENSUS_DEGRADED,
+        collect_predicate_sites,
+        detect_guard_predicate_deviations,
+        predicate_group_key,
+    )
+
+    ctx = context or RoleContext()
+    if ctx.inventory is None and inventory is not None:
+        ctx.inventory = inventory
+
+    if source_texts is None:
+        source_texts = _gather_source_texts(
+            Path(target_path), file_path,
+            _candidate_callees(hypothesis),
+        )
+    if not source_texts:
+        return _inconclusive(
+            REASON_EXTRACTOR_UNAVAILABLE,
+            f"no sources readable under {target_path}",
+        )
+
+    deviations, stats = detect_guard_predicate_deviations(
+        source_texts,
+    )
+    tail = function_name.rsplit(".", 1)[-1]
+
+    def _at_claimed(file: str, function: str) -> bool:
+        return file == file_path and \
+            function.rsplit(".", 1)[-1] == tail
+
+    for dev in deviations:
+        if _at_claimed(dev.file, dev.enclosing_function):
+            return guard_predicate_verdict(
+                dev,
+                context=ctx,
+                inventory=inventory,
+                source_texts=source_texts,
+                joern_server=joern_server,
+            )
+
+    # No deviation at the claimed site.  Refute only when the census
+    # genuinely VOTED this function's predicate site(s) and they
+    # conformed — group SIZE alone is not a vote: a group the census
+    # skipped without voting (call-shaped bound, ops budget, macro
+    # divergence, cap closure) or a member it individually excluded
+    # proves nothing about the claim.  When the function holds both
+    # voted and unvoted sites, refute only if the hypothesis binds to
+    # a VOTED one and to no unvoted one; both binding-failure
+    # directions land on inconclusive, never on a refute.
+    sites = collect_predicate_sites(source_texts)
+    local = [
+        s for s in sites
+        if _at_claimed(s.file, s.enclosing_function)
+    ]
+    voted_ids = stats.get("voted_sites") or set()
+    group_skips = stats.get("group_skips") or {}
+    excluded = stats.get("excluded_sites") or {}
+    voted = [
+        s for s in local if (s.file, s.line, s.leg) in voted_ids
+    ]
+    unvoted = [
+        s for s in local if (s.file, s.line, s.leg) not in voted_ids
+    ]
+    named_voted = [
+        s for s in voted if _hypothesis_names_site(hypothesis, s)
+    ]
+    named_unvoted = [
+        s for s in unvoted if _hypothesis_names_site(hypothesis, s)
+    ]
+    if voted and (
+        not unvoted or (named_voted and not named_unvoted)
+    ):
+        s = (named_voted or voted)[0]
+        group_size = sum(
+            1 for site in sites
+            if predicate_group_key(site) == predicate_group_key(s)
+        )
+        return ConsistencyResult(
+            outcome="refuted",
+            reason=(
+                f"{REFUTED_PREDICATE_CONFORMS}: the predicate census "
+                f"voted {s.tested_var} {s.relop} {s.bound_expr} at "
+                f"{s.file}:{s.line} with its {group_size}-member "
+                f"peer group and found no drift at {function_name}"
+            ),
+            rule_id=RULE_GUARD_PREDICATE,
+            dimension=DIMENSION_GUARD_PREDICATE,
+        )
+    if unvoted:
+        s = (named_unvoted or unvoted)[0]
+        skip = excluded.get((s.file, s.line, s.leg)) or \
+            group_skips.get(predicate_group_key(s))
+        if skip is None and stats.get("caps_hit"):
+            skip = REASON_CENSUS_DEGRADED
+        if skip:
+            return _inconclusive(
+                skip,
+                f"the census never voted {s.tested_var} {s.relop} "
+                f"{s.bound_expr} at {s.file}:{s.line} ({skip}) — "
+                f"the claim at {function_name} is unadjudicated",
+            )
+    return _inconclusive(
+        REASON_PREDICATE_FAMILY_UNFORMED,
+        f"no voted predicate peer group covers the claim at "
+        f"{function_name} in {file_path}",
+    )
 
 
 def run_consistency_check(
@@ -1232,10 +1701,47 @@ def run_consistency_check(
     The channel never trusts the claimed arithmetic: it recomputes the
     census for the named callee over the (bounded) peer group and
     re-derives majority, exhibits and contract.
+
+    Guard-predicate-shaped hypotheses detour through the predicate
+    census first; its enumerated non-answers (family unformed,
+    sources unreadable) fall back here so the detour can only add
+    coverage, never narrow what the return census could bind.
     """
     ctx = context or RoleContext()
     if ctx.inventory is None and inventory is not None:
         ctx.inventory = inventory
+
+    try:
+        from .guard_predicate import is_guard_predicate_hypothesis
+        _gp_shaped = is_guard_predicate_hypothesis(hypothesis)
+    except ImportError:
+        _gp_shaped = False
+    if _gp_shaped:
+        from .guard_predicate import (
+            REASON_CENSUS_DEGRADED,
+            REASON_MACRO_DIVERGENT,
+            REASON_PREDICATE_DATA_DEPENDENT,
+        )
+        gp_res = run_guard_predicate_check(
+            target_path, file_path, function_name, hypothesis,
+            inventory=inventory, context=ctx,
+            source_texts=source_texts, joern_server=joern_server,
+        )
+        # Every enumerated non-answer falls back (family unformed,
+        # sources unreadable, and the census's skipped-without-voting
+        # reasons): the detour can only add coverage, never narrow
+        # what the return census could bind.
+        if not (
+            gp_res.outcome == "inconclusive"
+            and gp_res.reason.startswith((
+                REASON_PREDICATE_FAMILY_UNFORMED,
+                REASON_EXTRACTOR_UNAVAILABLE,
+                REASON_PREDICATE_DATA_DEPENDENT,
+                REASON_MACRO_DIVERGENT,
+                REASON_CENSUS_DEGRADED,
+            ))
+        ):
+            return gp_res
 
     candidates = _candidate_callees(hypothesis)
     if not candidates:
@@ -1272,7 +1778,7 @@ def run_consistency_check(
             break
     if entry is None:
         return _inconclusive(
-            REASON_HYPOTHESIS_UNBINDABLE,
+            REASON_CENSUS_MISS,
             f"no census entry for any hypothesis callee "
             f"({', '.join(candidates[:5])})",
         )

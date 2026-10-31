@@ -1,8 +1,8 @@
 """Receiver-qualified keys end-to-end.
 
-The v5 corpus run showed distinct methods collapsing onto one bare
-key: seven ``Null*.Scan`` labels all printed and scored as
-``sql.go:Scan`` (mixed verdicts under one name), and attribution
+Distinct methods used to collapse onto one bare key: multiple
+``Null*.Scan`` labels all printed and scored as ``sql.go:Scan``
+(mixed verdicts under one name), and attribution
 receipts never joined qualified label ids at all.  The qualified name
 must ride from the inventory metadata through the gap, the review
 outcome, the journal/audit-log rows, and back into corpus scoring and

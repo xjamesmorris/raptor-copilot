@@ -108,7 +108,7 @@ class TestSmugglingVariants(unittest.TestCase):
         return results, calls
 
     def test_all_three_variants_probe_with_correct_framing(self):
-        results, calls = self._run([(None, 0.0)] * 3)
+        results, calls = self._run([(None, 0.0, False)] * 3)
         self.assertEqual(results, [])
         self.assertEqual(len(calls), 3)
         clte, tecl, clzero = calls
@@ -126,8 +126,8 @@ class TestSmugglingVariants(unittest.TestCase):
 
     def test_tecl_stall_flags_with_variant_named(self):
         results, _ = self._run([
-            ("HTTP/1.1 200 OK\r\n\r\nok", 0.1),  # CL.TE clean
-            ("", 5.0),  # TE.CL: server sat on the ambiguous framing
+            ("HTTP/1.1 200 OK\r\n\r\nok", 0.1, False),  # CL.TE clean
+            ("", 5.0, False),  # TE.CL: server sat on the ambiguous framing
         ])
         self.assertEqual(len(results), 1)
         self.assertIn("TE.CL", results[0].evidence)
@@ -138,9 +138,9 @@ class TestSmugglingVariants(unittest.TestCase):
         # rejection of the ambiguity — flagging it marked every
         # hardened proxy as a smuggling prerequisite.
         results, _ = self._run([
-            ("HTTP/1.1 400 Bad Request\r\n\r\n", 0.1),
-            ("HTTP/1.1 400 Bad Request\r\n\r\n", 0.1),
-            ("HTTP/1.1 200 OK\r\n\r\nok", 0.1),
+            ("HTTP/1.1 400 Bad Request\r\n\r\n", 0.1, False),
+            ("HTTP/1.1 400 Bad Request\r\n\r\n", 0.1, False),
+            ("HTTP/1.1 200 OK\r\n\r\nok", 0.1, False),
         ])
         self.assertEqual(results, [])
 
@@ -148,18 +148,18 @@ class TestSmugglingVariants(unittest.TestCase):
         # 'Content-Length: 2400' and echoed request lines must never
         # satisfy the signals: only real response status lines count.
         results, _ = self._run([
-            ("HTTP/1.1 200 OK\r\nContent-Length: 2400\r\n\r\nx", 0.05),
-            ("HTTP/1.1 200 OK\r\nContent-Length: 2400\r\n\r\nx", 0.05),
+            ("HTTP/1.1 200 OK\r\nContent-Length: 2400\r\n\r\nx", 0.05, False),
+            ("HTTP/1.1 200 OK\r\nContent-Length: 2400\r\n\r\nx", 0.05, False),
             # Error page quoting the request line: one status line only.
-            ("HTTP/1.1 200 OK\r\n\r\nbad: GET /raptor-clzero-probe HTTP/1.1", 0.1),
+            ("HTTP/1.1 200 OK\r\n\r\nbad: GET /raptor-clzero-probe HTTP/1.1", 0.1, False),
         ])
         self.assertEqual(results, [])
 
     def test_clzero_double_response_flags(self):
         results, _ = self._run([
-            ("HTTP/1.1 200 OK\r\n\r\nok", 0.1),
-            ("HTTP/1.1 200 OK\r\n\r\nok", 0.1),
-            ("HTTP/1.1 200 OK\r\n\r\nHTTP/1.1 404 Not Found\r\n\r\n", 0.3),
+            ("HTTP/1.1 200 OK\r\n\r\nok", 0.1, False),
+            ("HTTP/1.1 200 OK\r\n\r\nok", 0.1, False),
+            ("HTTP/1.1 200 OK\r\n\r\nHTTP/1.1 404 Not Found\r\n\r\n", 0.3, False),
         ])
         self.assertEqual(len(results), 1)
         self.assertIn("CL.0", results[0].evidence)
@@ -167,9 +167,9 @@ class TestSmugglingVariants(unittest.TestCase):
 
     def test_slow_400_is_not_a_signal(self):
         results, _ = self._run([
-            ("HTTP/1.1 400 Bad Request\r\n\r\n", 3.0),
-            ("HTTP/1.1 200 OK\r\n\r\nok", 0.1),
-            ("HTTP/1.1 200 OK\r\n\r\nok", 0.1),
+            ("HTTP/1.1 400 Bad Request\r\n\r\n", 3.0, False),
+            ("HTTP/1.1 200 OK\r\n\r\nok", 0.1, False),
+            ("HTTP/1.1 200 OK\r\n\r\nok", 0.1, False),
         ])
         self.assertEqual(results, [])
 
@@ -266,3 +266,39 @@ class TestContextMapRendererContract(unittest.TestCase):
         self.assertIn("parameter 'q'", mermaid)
         self.assertNotIn('"?', mermaid)
         self.assertNotIn("unknown", mermaid)
+
+
+class TestFormMethodChokepoint(unittest.TestCase):
+    """The crawled form's method attribute is hostile HTML (bs4
+    entity-decodes `&#10;` into a live newline) and rides into fuzz
+    requests and PoC artifacts — normalise it at the discovery
+    chokepoint."""
+
+    def _parse(self, form_html: str) -> dict:
+        import pytest
+
+        bs4 = pytest.importorskip("bs4")
+        from unittest.mock import MagicMock as _Mock
+
+        from packages.web.crawler import WebCrawler
+
+        soup = bs4.BeautifulSoup(form_html, "html.parser")
+        crawler = WebCrawler(_Mock(), max_depth=1, max_pages=1)
+        return crawler._parse_form(soup.find("form"), "http://t.example/")
+
+    def test_entity_decoded_newline_method_defaults_to_get(self):
+        form = self._parse(
+            '<form action="/x" method="post&#10;x-injected: y">'
+            '<input name="a"></form>'
+        )
+        self.assertEqual(form["method"], "GET")
+
+    def test_legitimate_methods_survive_case_normalised(self):
+        self.assertEqual(
+            self._parse('<form method="post"><input name="a"></form>')["method"],
+            "POST",
+        )
+        self.assertEqual(
+            self._parse('<form><input name="a"></form>')["method"],
+            "GET",
+        )

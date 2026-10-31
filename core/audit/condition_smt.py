@@ -198,32 +198,32 @@ class DomainVocabulary:
             "security_fields", "security_attributes", "sensitive_fields",
         ):
             for entry in domain_model.get(key, []):
-                name = _entry_name(entry)
-                name = _vocab_name(name) if name else None
-                if name:
-                    sec_fields.add(name)
+                raw_name = _entry_name(entry)
+                vname = _vocab_name(raw_name) if raw_name else None
+                if vname:
+                    sec_fields.add(vname)
 
         nullable: set[str] = set()
         for entry in domain_model.get("nullable_returns", []):
-            name = _entry_name(entry)
-            name = _vocab_name(name) if name else None
-            if name:
-                nullable.add(name)
+            raw_name = _entry_name(entry)
+            vname = _vocab_name(raw_name) if raw_name else None
+            if vname:
+                nullable.add(vname)
 
         auth: set[tuple[str, str]] = set()
         for entry in domain_model.get("auth_predicates", []):
             if isinstance(entry, str):
-                name = _vocab_name(entry)
-                if name:
-                    auth.add((name, "domain"))
+                vname = _vocab_name(entry)
+                if vname:
+                    auth.add((vname, "domain"))
             elif (
                 isinstance(entry, dict) and entry.get("name")
                 and _entry_actionable(entry)
             ):
-                name = _vocab_name(str(entry["name"]))
+                vname = _vocab_name(str(entry["name"]))
                 kind_label = str(entry.get("kind", "domain"))
-                if name and _VOCAB_IDENT_RE.match(kind_label):
-                    auth.add((name, kind_label))
+                if vname and _VOCAB_IDENT_RE.match(kind_label):
+                    auth.add((vname, kind_label))
 
         return cls(
             allocators=frozenset(alloc),
@@ -385,15 +385,19 @@ class SignedMismatchResult:
 # ---------------------------------------------------------------------------
 
 # Matches comparisons: var <op> value, value <op> var
+# \b pins each scan to a token start (an unpinned identifier head
+# re-scans every suffix of a long hostile word — quadratic) and the
+# dotted-path depth is bounded: 32 segments sits far above real
+# code while an unbounded chain re-splits against the scan loop.
 _COMPARISON_RE = re.compile(
-    r"([a-zA-Z_]\w*(?:\.\w+)*)\s*(==|!=|<=|>=|<|>)\s*"
-    r"([a-zA-Z_]\w*(?:\.\w+)*|0x[0-9a-fA-F]+|\d+(?:\.\d+)?)",
+    r"\b([a-zA-Z_]\w*(?:\.\w+){0,32})\s*(==|!=|<=|>=|<|>)\s*"
+    r"([a-zA-Z_]\w*(?:\.\w+){0,32}|0x[0-9a-fA-F]+|\d+(?:\.\d+)?)",
 )
 
-# Reverse comparisons: value <op> var
+# Reverse comparisons: value <op> var (same pinning/bounding)
 _COMPARISON_REV_RE = re.compile(
-    r"(0x[0-9a-fA-F]+|\d+(?:\.\d+)?)\s*(==|!=|<=|>=|<|>)\s*"
-    r"([a-zA-Z_]\w*(?:\.\w+)*)",
+    r"\b(0x[0-9a-fA-F]+|\d+(?:\.\d+)?)\s*(==|!=|<=|>=|<|>)\s*"
+    r"([a-zA-Z_]\w*(?:\.\w+){0,32})",
 )
 
 
@@ -532,15 +536,18 @@ def constraints_for_guard(
 ) -> list[BoundsConstraint] | None:
     """Extract constraints with polarity awareness.
 
-    When polarity is "excluded" (sink is in the else-branch), the
-    guard condition is negated: ``len < 1024`` becomes ``len >= 1024``.
+    When polarity is "excluded" (sink in the else-branch) or
+    "negated_guard" (early-return guard clause), the taken path
+    satisfies the NEGATED condition, so the guard is negated:
+    ``len < 1024`` becomes ``len >= 1024``.
 
     Returns ``None`` when the constraints cannot faithfully represent
     the guard:
 
     * the guard text contains ``||`` / ``!`` / ternary structure the
       flat conjunction cannot model, or
-    * polarity is "excluded" and more than one atom was extracted —
+    * polarity is "excluded"/"negated_guard" and more than one atom
+      was extracted —
       by De Morgan ``NOT (A AND B)`` is ``NOT A OR NOT B``, a
       disjunction; negating the atoms individually would instead
       assert ``NOT A AND NOT B``, which is strictly stronger and
@@ -549,7 +556,9 @@ def constraints_for_guard(
     if not _boolean_structure_tractable(guard.text):
         return None
     raw = extract_bounds_constraints(guard)
-    if not respect_polarity or guard.polarity != "excluded":
+    if not respect_polarity or guard.polarity not in (
+        "excluded", "negated_guard",
+    ):
         return raw
     if len(raw) > 1 or "&&" in guard.text or re.search(
         r"\band\b", guard.text,
@@ -636,7 +645,7 @@ def _try_z3_path_feasibility(
     out = _run_z3_child("path_feasibility", {
         "constraints": [asdict(c) for c in constraints],
     })
-    return _verdict_tuple_from_child(out)
+    return _verdict_tuple_from_child(out)  # type: ignore[return-value]
 
 
 def _arithmetic_path_feasibility(
@@ -714,7 +723,10 @@ def declared_signedness(var_name: str, source: str) -> bool | None:
         r"|__[su](?:8|16|32|64)"
         r"|[su](?:8|16|32|64)"
         r"|size_t|ssize_t|off_t|loff_t|uintptr_t|ptrdiff_t)"
-        r"\s+\**\s*" + re.escape(var_name) + r"\b",
+        # The star run gates its own trailing whitespace: the naive
+        # ``\s+\**\s*`` put two whitespace spans around it —
+        # quadratic on a type token followed by a whitespace run.
+        r"\s+(?:\*+\s*)?" + re.escape(var_name) + r"\b",
     )
     m = type_re.search(source)
     if not m:
@@ -764,7 +776,7 @@ def check_signed_mismatch(
     for c in constraints:
         unsigned = var_is_unsigned
         if unsigned is None:
-            unsigned = declared_signedness(c.variable, source)
+            unsigned = declared_signedness(c.variable, source)  # type: ignore[assignment]
         if unsigned is not True:
             # Signed or unknown signedness: no witness-stamped
             # mismatch finding without type evidence.
@@ -1761,8 +1773,17 @@ def _auth_patterns(
             patterns.append((re.compile(rf"\b({alts})\s*\("), kind))
     return patterns
 
+# Horizontal-only indent in the three return-line patterns — the
+# MULTILINE ^\s* idiom is quadratic on blank-line runs in scanned
+# source (identical match set per line for the per-line users).
+# The statement tail folds its trailing whitespace INTO the optional
+# group (``(?:;\s*)?$``, equivalent match set): the naive
+# ``\s*;?\s*$`` puts two unbounded whitespace spans around the
+# optional semicolon, and a return value followed by a long
+# whitespace run with no line end makes the engine try every split
+# of the run between them — quadratic on a single return token.
 _SUCCESS_RETURN_RE = re.compile(
-    r"^\s*return\s+(0|nil|None|True|true|EXIT_SUCCESS)\s*;?\s*$",
+    r"^[^\S\n]*return\s+(0|nil|None|True|true|EXIT_SUCCESS)\s*(?:;\s*)?$",
     re.MULTILINE,
 )
 
@@ -1823,7 +1844,7 @@ def check_auth_bypass(
     from .safety_contract import assert_boost_only
     assert_boost_only("condition_smt")
 
-    lines = source.split("\n")
+    lines = source.split("\n")  # line-model: callers deliver \n-model text (universal-newline reads / split_lines span joins)
 
     auth_checks = _extract_auth_checks(lines, vocab)
     if not auth_checks:
@@ -2068,7 +2089,7 @@ _LOCK_PAIRS = [
     (re.compile(r"\b(rcu_read_lock)\s*\("), "rcu_read_unlock"),
 ]
 
-_RETURN_RE = re.compile(r"^\s*return\b", re.MULTILINE)
+_RETURN_RE = re.compile(r"^[^\S\n]*return\b", re.MULTILINE)
 
 _GOTO_RE = re.compile(r"\bgoto\s+(\w+)\s*;")
 
@@ -2122,7 +2143,7 @@ def check_lock_discipline(
     from .safety_contract import assert_boost_only
     assert_boost_only("condition_smt")
 
-    lines = source.split("\n")
+    lines = source.split("\n")  # line-model: callers deliver \n-model text (universal-newline reads / split_lines span joins)
     acquires = _extract_lock_acquires(lines, vocab)
     if not acquires:
         return LockDisciplineResult(
@@ -2508,10 +2529,13 @@ _FREE_NAMES = frozenset({
     "free", "kfree",
 })
 
-_FREE_RE = re.compile(r"\b(\w+_free_\w+)\s*\(")
+# The name head is bounded: two unbounded word runs around
+# ``_free_`` re-split a long hostile identifier against each other
+# (quadratic); 256 chars of prefix sits far above real names.
+_FREE_RE = re.compile(r"\b(\w{1,256}_free_\w+)\s*\(")
 
 _ERROR_RETURN_RE = re.compile(
-    r"^\s*return\s+(-\w+|NULL|ERR_PTR\s*\(|err|ret|rc|status)",
+    r"^[^\S\n]*return\s+(-\w+|NULL|ERR_PTR\s*\(|err|ret|rc|status)",
     re.MULTILINE,
 )
 
@@ -2561,7 +2585,7 @@ def check_resource_leak(
     from .safety_contract import assert_boost_only
     assert_boost_only("condition_smt")
 
-    lines = source.split("\n")
+    lines = source.split("\n")  # line-model: callers deliver \n-model text (universal-newline reads / split_lines span joins)
     allocs = _extract_allocs(lines, vocab)
     if not allocs:
         return ResourceLeakResult(
@@ -2676,8 +2700,9 @@ def _build_free_patterns(
         rf"\b({'|'.join(re.escape(f) for f in sorted(all_frees))})"
         rf"\s*\(\s*{re.escape(var_name)}\b"
     )
+    # Same bounded name head as _FREE_RE above.
     subsystem_free_pat = re.compile(
-        rf"\b\w+_free_\w+\s*\(\s*{re.escape(var_name)}\b"
+        rf"\b\w{{1,256}}_free_\w+\s*\(\s*{re.escape(var_name)}\b"
     )
     return free_pat, subsystem_free_pat
 
@@ -2996,7 +3021,7 @@ def check_null_propagation(
     from .safety_contract import assert_boost_only
     assert_boost_only("condition_smt")
 
-    lines = source.split("\n")
+    lines = source.split("\n")  # line-model: callers deliver \n-model text (universal-newline reads / split_lines span joins)
     assigns = _extract_nullable_assigns(lines, vocab=vocab)
     if not assigns:
         return NullPropagationResult(
@@ -3204,7 +3229,7 @@ def check_integer_narrowing(source: str) -> IntegerNarrowingResult:
     from .safety_contract import assert_boost_only
     assert_boost_only("condition_smt")
 
-    lines = source.split("\n")
+    lines = source.split("\n")  # line-model: callers deliver \n-model text (universal-newline reads / split_lines span joins)
     is_go = any(
         "func " in ln or "package " in ln
         for ln in lines[:30]
@@ -3293,16 +3318,28 @@ _GO_TYPE_WIDTHS: dict[str, int] = {
     "int": 64, "uint": 64, "uintptr": 64,
 }
 
+# \b pins the assignee to a token start: an unpinned leading word
+# run re-scans every suffix of a long hostile word — quadratic.
 _GO_CAST_RE = re.compile(
-    r"(\w+)\s*(?::?=)\s*((?:u?int(?:8|16|32|64)?|byte|rune|uint|uintptr))\s*\(\s*(\w+)\s*\)"
+    r"\b(\w+)\s*(?::?=)\s*((?:u?int(?:8|16|32|64)?|byte|rune|uint|uintptr))\s*\(\s*(\w+)\s*\)"
 )
 
+# The optional second assignee gates its own trailing whitespace
+# ((?:,\s*\w+\s*)?): the naive ``\s*(?:,\s*\w+)?\s*`` put two
+# whitespace spans around it — quadratic on an assignment line
+# ending in a whitespace run.
+# \b pins the assignee to a token start (see _GO_CAST_RE).
 _GO_ATOI_RE = re.compile(
-    r"(\w+)\s*(?:,\s*\w+)?\s*(?::?=)\s*strconv\.(?:Atoi|ParseInt|ParseUint)\s*\("
+    r"\b(\w+)\s*(?:,\s*\w+\s*)?(?::?=)\s*strconv\.(?:Atoi|ParseInt|ParseUint)\s*\("
 )
 
+# One branch per RHS shape (math token or bare word), each gating
+# its own trailing whitespace: the naive
+# ``\s*(?:math\.Max|math\.Min)?\w*\s*\{`` chained whitespace spans
+# around two optional atoms — quadratic on an if-line ending in a
+# whitespace run with no brace. Same match set.
 _GO_BOUNDS_CHECK_RE = re.compile(
-    r"if\s+\w+\s*[<>]=?\s*(?:math\.Max|math\.Min)?\w*\s*\{"
+    r"if\s+\w+\s*[<>]=?\s*(?:(?:math\.Max|math\.Min)\w*\s*|\w+\s*)?\{"
     r"|if\s+\w+\s*<\s*0\s*(?:\|\||&&)"
     r"|if\s+\w+\s*>\s*math\.Max"
 )
@@ -3342,8 +3379,12 @@ def _check_integer_narrowing_go(lines: list[str]) -> IntegerNarrowingResult:
 
         has_check = False
         for j in range(max(0, i - 15), i):
+            # Bounded gap: the check operator sits on the same line
+            # as the variable; 500 chars sits far above real lines
+            # while an unbounded gap re-scans hostile long lines
+            # from every variable occurrence — quadratic.
             if re.search(
-                rf"\b{re.escape(src_var)}\b.*[<>]=?\s*(?:math\.Max|0\b|\d{{4,}})",
+                rf"\b{re.escape(src_var)}\b.{{0,500}}[<>]=?\s*(?:math\.Max|0\b|\d{{4,}})",
                 lines[j],
             ):
                 has_check = True
@@ -3378,7 +3419,9 @@ def _check_integer_narrowing_go(lines: list[str]) -> IntegerNarrowingResult:
 def _extract_param_types(source: str) -> dict[str, str]:
     """Extract parameter name → type from function signature."""
     results: dict[str, str] = {}
-    sig_match = re.search(r"\([^)]*\)", source[:500])
+    # The window matches the scanned 500-char signature slice; an
+    # unbounded interior re-scans from every '(' — quadratic.
+    sig_match = re.search(r"\([^)]{0,500}\)", source[:500])
     if not sig_match:
         return results
     params_str = sig_match.group(0)[1:-1]
@@ -3433,12 +3476,20 @@ def _var_only_in_call_args(rhs: str, var_name: str) -> bool:
 # strto*/ato* family. Target-specific parse wrappers are NOT listed —
 # they arrive via the learned vocabulary, never hardcoded.
 _PARSED_INT_ASSIGN_RES: tuple[re.Pattern, ...] = (
+    # Same gated-assignee respelling as _GO_ATOI_RE above; \b pins
+    # the assignee to a token start (unpinned word runs re-scan
+    # every suffix of a long hostile word — quadratic).
     re.compile(
-        r"(\w+)\s*(?:,\s*\w+)?\s*(?::?=)\s*"
+        r"\b(\w+)\s*(?:,\s*\w+\s*)?(?::?=)\s*"
         r"strconv\.(?:Atoi|ParseInt|ParseUint)\s*\(",
     ),
+    # The cast interior subsumes its leading whitespace
+    # ([\w\s*] includes whitespace): the naive ``\(\s*[\w\s*]+``
+    # overlapped two unbounded spans — quadratic on a cast-opening
+    # line ending in a whitespace run. Same language. \b pins the
+    # assignee to a token start.
     re.compile(
-        r"(\w+)\s*=\s*(?:\(\s*[\w\s*]+\)\s*)?"
+        r"\b(\w+)\s*=\s*(?:\([\w\s*]+\)\s*)?"
         r"(?:strtou?ll?|strtou?l|atoi|atoll?|strtou?imax|strtoumax)"
         r"\s*\(",
     ),
@@ -3452,7 +3503,11 @@ _PARSED_INT_COMPARE_TEMPLATE = (
     r"\b{var}\b\s*[<>]=?|[<>]=?\s*\b{var}\b"
 )
 
-_PARSED_INT_CALL_ARG_RE = re.compile(r"\b([A-Za-z_][\w.]*)\s*\(([^()]*)\)")
+# Name run bounded — same boundary-fill rationale as the call
+# scans (separator fills keep \b live; unbounded runs re-scan per
+# planted head).
+_PARSED_INT_CALL_ARG_RE = re.compile(
+    r"\b([A-Za-z_][\w.]{0,128})\s*\(([^()]*)\)")
 
 # A direct text-to-integer parse call anywhere in a function body marks
 # that function as a parse WRAPPER: callers receive text-derived
@@ -3463,8 +3518,11 @@ _PARSE_CALL_BODY_RE = re.compile(
 )
 
 _GO_FUNC_DEF_RE = re.compile(r"^func\s+(?:\([^)]*\)\s*)?(\w+)\s*\(")
+# Bounded head window: the unbounded lazy head overlapped the star
+# run and the name on word/star chars — quadratic even at the
+# anchored match call. 256 chars sits far above real C heads.
 _C_FUNC_DEF_RE = re.compile(
-    r"^[A-Za-z_][\w\s*]*?\**(\w+)\s*\(",
+    r"^[A-Za-z_][\w\s*]{0,256}?\**(\w+)\s*\(",
 )
 _C_KEYWORD_STARTS = ("if", "for", "while", "switch", "return", "else")
 
@@ -3489,7 +3547,7 @@ def derive_parse_wrappers(file_text: str) -> frozenset:
     definition (Go ``func`` at column 0, or a C-style definition at
     column 0).
     """
-    lines = file_text.split("\n")
+    lines = file_text.split("\n")  # line-model: callers deliver \n-model text (universal-newline reads / split_lines span joins)
     wrappers: set[str] = set()
     for i, line in enumerate(lines):
         stripped = line.lstrip()
@@ -3612,12 +3670,18 @@ def check_parsed_int_contract(
     from .safety_contract import assert_boost_only
     assert_boost_only("condition_smt")
 
-    lines = source.split("\n")
+    lines = source.split("\n")  # line-model: callers deliver \n-model text (universal-newline reads / split_lines span joins)
     parsed_vars: dict[str, int] = {}
     wrapper_re = None
     if parse_wrappers:
+        # Bounded assignee loop: the loop and the final name overlap
+        # on word chars, so the unbounded spelling cost every split
+        # of an assignee run with no '=' — quadratic. Sixteen
+        # assignees sits far above real code. \b pins the first
+        # assignee to a token start (an unpinned word run re-scans
+        # every suffix of a long hostile word).
         wrapper_re = re.compile(
-            r"((?:\w+\s*,\s*)*\w+)\s*(?::?=)\s*(?:\w+\.)?(?:"
+            r"\b((?:\w+\s*,\s*){0,16}\w+)\s*(?::?=)\s*(?:\w+\.)?(?:"
             + "|".join(re.escape(w) for w in sorted(parse_wrappers))
             + r")\s*\(",
         )
@@ -3713,8 +3777,18 @@ def check_parsed_int_contract(
                 and line.lstrip().startswith("return")
             ):
                 continue
+            # Bounded, line-scoped subscript windows: real index
+            # expressions sit far below 64 chars, while unbounded
+            # interiors re-scan a hostile long line from every '['
+            # — worse than quadratic. The pre-variable window also
+            # excludes '[': with nested subscripts the innermost
+            # bracket still witnesses the indexed use, so the
+            # detected boolean is unchanged.
             indexed = bool(
-                re.search(rf"\[[^\]]*\b{re.escape(var)}\b[^\]]*\]", line),
+                re.search(
+                    rf"\[[^][\n]{{0,64}}\b{re.escape(var)}\b[^\]\n]{{0,64}}\]",
+                    line,
+                ),
             )
             if not consumer and not indexed:
                 continue
@@ -3946,7 +4020,7 @@ def check_early_release(
     """
     from .safety_contract import assert_boost_only
     assert_boost_only("condition_smt")
-    lines = source.split("\n")
+    lines = source.split("\n")  # line-model: callers deliver \n-model text (universal-newline reads / split_lines span joins)
     is_go = any(
         "func " in ln or "package " in ln or ".Lock()" in ln
         for ln in lines[:30]
@@ -3957,19 +4031,26 @@ def check_early_release(
     return _check_early_release_c(lines, vocab)
 
 
+# \b pins the assignee to a token start (an unpinned word run
+# re-scans every suffix of a long hostile word — quadratic); the
+# call-argument and subscript interiors are bounded — 500 chars
+# sits far above real expressions, while unbounded interiors
+# re-scan a hostile line from every planted opener.
 _GO_READ_RE = re.compile(
-    r"(\w+)\s*(?::=|=)\s*"
-    r"(?:\w+\.(\w+)(?:\s*\(.*\))?|\w+\[.+\])"
+    r"\b(\w+)\s*(?::=|=)\s*"
+    r"(?:\w+\.(\w+)(?:\s*\(.{0,500}\))?|\w+\[.{1,500}\])"
 )
 
 _GO_MULTI_RETURN_RE = re.compile(
-    r"(\w+)\s*,\s*\w+\s*(?::=|=)\s*\w+\.(\w+)\s*\("
+    r"\b(\w+)\s*,\s*\w+\s*(?::=|=)\s*\w+\.(\w+)\s*\("
 )
 
 
 def _check_early_release_go(lines: list[str]) -> EarlyReleaseResult:
     """Go-specific early lock release detection."""
-    lock_re = re.compile(r"(\w+)\.(RLock|Lock)\s*\(\s*\)")
+    # \b pins the receiver to a token start (unpinned word runs
+    # re-scan every suffix of a long hostile word — quadratic).
+    lock_re = re.compile(r"\b(\w+)\.(RLock|Lock)\s*\(\s*\)")
     unlock_re_tpl = r"{name}\.(?:RUnlock|Unlock)\s*\(\s*\)"
     defer_re = re.compile(r"defer\s+(\w+)\.(RUnlock|Unlock)\s*\(\s*\)")
 
@@ -4052,19 +4133,28 @@ def _check_early_release_c(
     vocab: DomainVocabulary = _EMPTY_VOCAB,
 ) -> EarlyReleaseResult:
     """C-specific early lock release detection (RCU/spinlock/mutex)."""
+    # \b pins each scan to a token start: an unpinned leading word
+    # run re-scans every suffix of a long hostile word — quadratic.
     # Direct struct field read: var = ptr->field  /  var = obj.field
     field_read_re = re.compile(
-        r"(\w+)\s*=\s*(?:(\w+)->(\w+)|(\w+)\.(\w+))"
+        r"\b(\w+)\s*=\s*(?:(\w+)->(\w+)|(\w+)\.(\w+))"
     )
     # Macro-wrapped field read: var = MACRO(ptr->field) or MACRO(&ptr->field)
     # Covers rcu_dereference*, READ_ONCE, smp_load_acquire, atomic*_read, etc.
+    # The scan is per line, so the argument interior excludes
+    # newlines, and both windows are bounded — a real macro read
+    # keeps '->' within tens of chars of the '(' — while unbounded
+    # interiors re-scan a hostile line from every planted opener,
+    # worse than quadratic. The pre-arrow window also excludes '='
+    # (an assignment inside the macro argument is not the
+    # field-read idiom), which keeps every scan attempt local.
     macro_read_re = re.compile(
-        r"(\w+)\s*=\s*\w+\s*\([^)]*->[^)]*\)"
+        r"\b(\w+)\s*=\s*\w+\s*\([^)\n=]{0,256}->[^)\n]{0,64}\)"
     )
     # Function-call assignment: var = func(args)
-    func_assign_re = re.compile(r"(\w+)\s*=\s*\w+\s*\(")
+    func_assign_re = re.compile(r"\b(\w+)\s*=\s*\w+\s*\(")
     # Output parameter: func(&var)
-    out_param_re = re.compile(r"\w+\s*\(\s*&(\w+)\s*[,)]")
+    out_param_re = re.compile(r"\b\w+\s*\(\s*&(\w+)\s*[,)]")
 
     acquires = _extract_lock_acquires(lines, vocab)
     if not acquires:
@@ -4092,7 +4182,7 @@ def _check_early_release_c(
                 applicable=False,
                 reasoning="no lock acquires found",
             )
-        acquires = release_only
+        acquires = release_only  # type: ignore[assignment]
 
     for acq_line, lock_func, unlock_name, *_ in acquires:
         unlock_re = re.compile(
@@ -4161,7 +4251,8 @@ def _check_early_release_c(
 
         # Decision variables: scalars assigned from a function call
         # under the lock, then used in a branch after unlock.
-        func_assigned_re = re.compile(r"(\w+)\s*=\s*\w+\s*\(")
+        # \b pins the assignee to a token start (see field_read_re).
+        func_assigned_re = re.compile(r"\b(\w+)\s*=\s*\w+\s*\(")
         for read_line, var_name in reads_under_lock:
             assign_line_str = lines[read_line]
             if not func_assigned_re.search(assign_line_str):
@@ -4177,7 +4268,7 @@ def _check_early_release_c(
                     has_side_effect = False
                     for eff in range(k + 1, min(len(lines), k + 5)):
                         eff_s = lines[eff].strip()
-                        if re.search(r"\w+\s*\(", eff_s) or "return" in eff_s:
+                        if re.search(r"\b\w+\s*\(", eff_s) or "return" in eff_s:
                             has_side_effect = True
                             break
                     if has_side_effect:
@@ -4262,7 +4353,7 @@ def check_lock_domain(
     """
     from .safety_contract import assert_boost_only
     assert_boost_only("condition_smt")
-    lines = source.split("\n")
+    lines = source.split("\n")  # line-model: callers deliver \n-model text (universal-newline reads / split_lines span joins)
     is_go = any(
         "func " in ln or "package " in ln or ".Lock()" in ln
         for ln in lines[:30]
@@ -4275,9 +4366,11 @@ def check_lock_domain(
 
 def _check_lock_domain_go(lines: list[str]) -> LockDomainResult:
     """Go-specific lock-domain mismatch detection."""
-    lock_re = re.compile(r"(\w+)\.(RLock|Lock)\s*\(\s*\)")
+    # \b pins receiver/field scans to token starts (unpinned word
+    # runs re-scan every suffix of a long hostile word — quadratic).
+    lock_re = re.compile(r"\b(\w+)\.(RLock|Lock)\s*\(\s*\)")
     unlock_re_tpl = r"{name}\.(?:RUnlock|Unlock)\s*\(\s*\)"
-    field_re = re.compile(r"(\w+)\.(\w+)")
+    field_re = re.compile(r"\b(\w+)\.(\w+)")
 
     lock_scopes: list[tuple[int, int, str]] = []
 
@@ -4369,7 +4462,9 @@ def _check_correlated_field_access(
     if not sec_fields:
         return None
 
-    field_re = re.compile(r"(\w+)->(\w+)")
+    # \b pins the base to a token start (unpinned word runs re-scan
+    # every suffix of a long hostile word — quadratic).
+    field_re = re.compile(r"\b(\w+)->(\w+)")
     security_accesses: dict[str, list[tuple[int, str]]] = {}
 
     for scope_start, scope_end, lock_func, _ in lock_scopes:
@@ -4423,7 +4518,7 @@ def _check_lock_domain_c(
     vocab: DomainVocabulary = _EMPTY_VOCAB,
 ) -> LockDomainResult:
     """C-specific lock-domain mismatch detection."""
-    field_re = re.compile(r"(\w+)->(\w+)")
+    field_re = re.compile(r"\b(\w+)->(\w+)")
 
     acquires = _extract_lock_acquires(lines, vocab)
 
@@ -4598,10 +4693,13 @@ _TOCTOU_GO_USES = re.compile(
     r"|ioutil\.ReadFile|ioutil\.WriteFile)\s*\(",
 )
 
+# Bounded Path() argument windows: a real path expression sits far
+# below 500 chars, while an unbounded interior re-scans a hostile
+# line from every planted ``Path(`` — quadratic.
 _TOCTOU_PY_CHECKS = re.compile(
     r"\b(os\.path\.exists|os\.path\.isfile|os\.path\.isdir"
-    r"|os\.access|os\.stat|os\.lstat|Path\([^)]*\)\.exists\(\)"
-    r"|Path\([^)]*\)\.is_file\(\)|Path\([^)]*\)\.is_dir\(\))"
+    r"|os\.access|os\.stat|os\.lstat|Path\([^)]{0,500}\)\.exists\(\)"
+    r"|Path\([^)]{0,500}\)\.is_file\(\)|Path\([^)]{0,500}\)\.is_dir\(\))"
     r"\s*[\(.]?",
 )
 
@@ -4609,7 +4707,7 @@ _TOCTOU_PY_USES = re.compile(
     r"\b(open|os\.open|os\.remove|os\.unlink|os\.rename"
     r"|os\.chmod|os\.chown|os\.mkdir|os\.makedirs"
     r"|shutil\.rmtree|shutil\.move"
-    r"|Path\([^)]*\)\.open\(\)|Path\([^)]*\)\.unlink\(\))"
+    r"|Path\([^)]{0,500}\)\.open\(\)|Path\([^)]{0,500}\)\.unlink\(\))"
     r"\s*\(",
 )
 
@@ -4833,7 +4931,7 @@ def check_race_protection(
     if not source or not source.strip():
         return RaceProtectionResult(reasoning="empty source")
 
-    lines = source.split("\n")
+    lines = source.split("\n")  # line-model: callers deliver \n-model text (universal-newline reads / split_lines span joins)
 
     # Non-C: bail
     if any(kw in source for kw in ("func ", "package ", "import (")):
@@ -4841,7 +4939,7 @@ def check_race_protection(
     if any(kw in source for kw in ("def ", "import os", "class ")):
         return RaceProtectionResult(reasoning="Python source, not applicable")
 
-    field_re = re.compile(r"(\w+)->(\w+)")
+    field_re = re.compile(r"\b(\w+)->(\w+)")
 
     # Build lock scopes.  Each scope carries the lock OBJECT (first
     # argument of the acquire) so that multi-access protection claims
@@ -4940,8 +5038,10 @@ def check_race_protection(
     # Variables bound from rcu_dereference*() — only THEIR
     # dereferences are RCU-protected inside an RCU read-side section.
     rcu_deref_vars: set[str] = set()
+    # \b pins the assignee to a token start (unpinned word runs
+    # re-scan every suffix of a long hostile word — quadratic).
     rcu_bind_re = re.compile(
-        r"(\w+)\s*=\s*rcu_dereference(?:_protected|_check|_raw)?\s*\(",
+        r"\b(\w+)\s*=\s*rcu_dereference(?:_protected|_check|_raw)?\s*\(",
     )
     for line in lines:
         m = rcu_bind_re.search(line)
@@ -5090,11 +5190,20 @@ def check_race_protection(
 # Hypothesis disproof
 # ---------------------------------------------------------------------------
 
+# Every whitespace run is pinned with (?=\S) — the run ends where
+# the non-whitespace tail begins (same language: the following lazy
+# classes absorbed any remainder) — so the runs cannot split against
+# the lazy filler: the naive spelling was quadratic on an
+# 'integer overflow'-opening hypothesis ending in a whitespace run.
+# \b pins the opening keyword to a token start, and the two filler
+# gaps are bounded: a hypothesis names its expression within a few
+# hundred chars (500 is far above real phrasing), while unbounded
+# fillers re-scan a hostile hypothesis from every keyword tease.
 _INT_HYPO_RE = re.compile(
-    r"(?:integer|int)\s*(?:overflow|underflow|wraparound)"
-    r".*?(?:in|of|when|during)\s+"
-    r"(?:the\s+)?(?:calculation|multiplication|expression|addition|subtraction)?"
-    r"[^.]*?(`[^`]+`|[a-zA-Z_]\w*(?:\s*[*+\-]\s*[a-zA-Z_]\w*)*)",
+    r"\b(?:integer|int)\s*(?:overflow|underflow|wraparound)"
+    r".{0,500}?(?:in|of|when|during)\s+(?=\S)"
+    r"(?:the\s+(?=\S))?(?:calculation|multiplication|expression|addition|subtraction)?"
+    r"[^.]{0,500}?(`[^`]+`|[a-zA-Z_]\w*(?:\s*[*+\-]\s*[a-zA-Z_]\w*)*)",
     re.IGNORECASE,
 )
 
@@ -5200,7 +5309,12 @@ def disprove_integer_overflow(
             ),
         )
     op_char = ops_in_expr.pop() if ops_in_expr else "*"
-    parts = re.split(r"\s*[*+\-]\s*", expr_text)
+    # (?<!\s) pins each separator match to the start of its
+    # whitespace run: an unpinned `\s*` prefix re-consumes the run
+    # from every position — quadratic on hostile expression text.
+    # The earliest match always starts at the run start, so the
+    # split pieces are identical.
+    parts = re.split(r"(?<!\s)\s*[*+\-]\s*", expr_text)
     var_names = [p.strip() for p in parts if p.strip() and re.match(r"[a-zA-Z_]", p.strip())]
     literal_operands = [
         p.strip() for p in parts

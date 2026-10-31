@@ -1,7 +1,8 @@
 # Fuzzing
 
 RAPTOR's fuzzing subsystem orchestrates coverage-guided fuzzing campaigns
-against compiled binaries and source-level targets.  It detects what kind of
+against compiled binaries, source-level targets, and Python packages.  It
+detects what kind of
 target it is looking at, probes the host for available tooling, selects the
 appropriate fuzzing engine, manages corpus generation, and triages crashes into
 deduplicated, ranked findings wrapped as `core.witness.Witness` objects for
@@ -68,6 +69,173 @@ uses it when available.
 The orchestrator detects libFuzzer-instrumented binaries by scanning for the
 `LLVMFuzzerTestOneInput` symbol.
 
+### Atheris (Python, alpha)
+
+Coverage-guided fuzzing for Python packages via
+[atheris](https://github.com/google/atheris) — libFuzzer driving a Python
+`TestOneInput(data: bytes)` callback.  Detected automatically for `python-pkg`
+targets (a directory with `pyproject.toml` or `setup.py`); force it with
+`--engine atheris`.  Alpha caveats up front: single-instance campaigns that
+stop at the first crash (libFuzzer semantics), no Python coverage bridge yet,
+and no LLM harness synthesis — the harness is yours or a mechanical template.
+
+Atheris needs a harness.  Two routes:
+
+- **Operator harness** (`--py-harness <file>`): a `.py` file you wrote that
+  defines `TestOneInput` and calls `atheris.Setup`/`atheris.Fuzz`.  This is
+  the recommended route for anything beyond the trivial case.
+- **Template scaffold** (`--py-entry module:function`, optionally
+  `--py-input bytes|text`): for the simple case only — a target function
+  taking a single `bytes` or `str` argument.  RAPTOR generates a
+  clearly-marked harness file into the run directory (no LLM involved; the
+  entry point must be a plain dotted-identifier chain).  The scaffold treats
+  EVERY uncaught exception as a crash: if the target legitimately raises on
+  malformed input (a parser's `ValueError`), edit the generated file to
+  swallow the expected types before trusting the crash list.
+
+```bash
+python3 raptor.py fuzz --binary /path/to/pypkg --py-entry mypkg.parser:parse
+python3 raptor.py fuzz --binary /path/to/pypkg --py-harness ./fuzz_parse.py
+```
+
+Crashes are usually uncaught Python exceptions: the exception type and
+traceback parsed from atheris output become the triage signal on the
+normalized crash records (`atheris/atheris-crashes.json`), and each crash
+artifact is wrapped as a Witness under `<out>/witnesses/`
+(`produced_by: atheris`) — the same record shape and store the AFL++ path
+uses, so `/validate` and `raptor-verified-outcomes` consume atheris crashes
+with no extra wiring.
+
+Containment: atheris executes target code in-process, so the harness
+interpreter itself runs as an untrusted target under the full sandbox —
+network deny, read restriction to the harness/package/corpus/output paths
+plus the Python runtime, write scoping to the run directory, resource
+rlimits, and a scrubbed (never ambient) environment.
+
+atheris is an optional dependency.  When it is not importable the detector
+still reports the target with an install hint (`pip install atheris`) and
+the plan blocks instead of running.
+
+### cargo-fuzz (Rust, alpha)
+
+Coverage-guided fuzzing for Rust crates via
+[cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) — the crate's
+`fuzz/fuzz_targets/*.rs` harnesses compiled as native libFuzzer binaries.
+Detected automatically for `rust-crate` targets (a directory with
+`Cargo.toml`); force it with `--engine cargo-fuzz`.  Alpha caveats up front:
+single-instance campaigns that stop at the first crash (libFuzzer
+semantics), no Rust coverage bridge yet, and no harness synthesis — the fuzz
+targets are the crate's own (`cargo fuzz init` / `cargo fuzz add` scaffold
+them in a trusted context).
+
+Target selection: `--fuzz-target <name>` picks one of the crate's fuzz
+targets; a crate with exactly one auto-selects it, several targets block the
+plan with the list (never a silent pick).  Without an operator `--corpus`,
+the crate's own `fuzz/corpus/<target>/` seeds are staged when present
+(through the same bounded, symlink-refusing corpus stager as every other
+engine).
+
+```bash
+python3 raptor.py fuzz --binary /path/to/crate --fuzz-target parse_input
+python3 raptor.py fuzz --binary /path/to/crate            # single target
+```
+
+The campaign has two phases.  The BUILD (`cargo fuzz build <target>`)
+executes target code — `build.rs`, proc macros — so it runs under the full
+sandbox with the network denied and cargo pinned offline
+(`CARGO_NET_OFFLINE`): dependencies must already be in the local cargo cache
+(the failure message says to run `cargo fetch` once in a trusted context).
+Build artifacts are routed into the run directory (`CARGO_TARGET_DIR`), the
+cargo home the build sees is a hermetic run-local copy seeded from the host
+cache's `registry/index` + `registry/cache` (the host `~/.cargo` is never
+build-writable — a hostile `build.rs` could otherwise poison the shared
+registry extraction that later builds silently compile), and the build's
+write scope additionally covers the crate's `fuzz/` workspace — the one
+place cargo itself must write — while the rest of the crate stays
+read-only.  The CAMPAIGN then executes the built binary directly under the
+strict libFuzzer-runner sandbox (cargo never runs inside the campaign).
+
+A nightly Rust toolchain enables cargo-fuzz's default AddressSanitizer
+build; without one the build degrades to `--sanitizer none` with a hint
+(panics and crashes are still caught, ASan findings are not).
+
+Crashes are usually Rust panics: the panic message, location, and
+`RUST_BACKTRACE=1` frames parsed from the harness output become the triage
+signal on the normalized crash records (`cargofuzz/cargofuzz-crashes.json`),
+and each crash artifact is wrapped as a Witness under `<out>/witnesses/`
+(`produced_by: cargo-fuzz`, with the built binary's hash) — the same record
+shape and store the AFL++ and atheris paths use, so `/validate` and
+`raptor-verified-outcomes` consume cargo-fuzz crashes with no extra wiring.
+
+cargo and cargo-fuzz are optional dependencies.  When either is missing the
+detector still reports the target with an install hint
+(`cargo install cargo-fuzz`) and the plan blocks instead of running.
+
+### Jazzer (Java/JVM, alpha)
+
+Coverage-guided fuzzing for Java/Kotlin projects via
+[Jazzer](https://github.com/CodeIntelligenceTesting/jazzer) — a native
+libFuzzer driver loading the JVM and calling a harness class's
+`fuzzerTestOneInput`.  Detected automatically for `java-project` targets (a
+directory with a `pom.xml` / Gradle build marker, or a bare Java/Kotlin
+source tree); force it with `--engine jazzer`.  Alpha caveats up front:
+single-instance campaigns that stop at the first crash (libFuzzer
+semantics), no JVM coverage bridge yet (JaCoCo is a later lane), and no
+harness synthesis — the fuzz targets are the project's own (a class with
+`public static void fuzzerTestOneInput(byte[] data)` or a `@FuzzTest` JUnit
+method).
+
+Target selection: `--fuzz-target <class>` picks one of the project's
+enumerated target classes (fully-qualified, or the simple name when it is
+unambiguous); a project with exactly one auto-selects it, several targets
+block the plan with the list (never a silent pick).  Without an operator
+`--corpus`, the project's own `src/test/resources/<pkg>/<Class>Inputs`
+seeds (the jazzer JUnit convention) are staged when present (through the
+same bounded, symlink-refusing corpus stager as every other engine).
+
+```bash
+python3 raptor.py fuzz --binary /path/to/project --fuzz-target com.example.ParserFuzz
+python3 raptor.py fuzz --binary /path/to/project           # single target
+```
+
+The campaign has two phases.  The BUILD compiles the harness classpath by
+layout — Maven (`mvn -B -o test-compile dependency:build-classpath`),
+Gradle (`gradle --offline --no-daemon` with a RAPTOR init script collecting
+the runtime classpath), or a bare `javac` compile into the run directory —
+and executes target code (Maven plugins ARE code, `build.gradle` IS code),
+so it runs under the full sandbox with the network denied and the tool
+pinned offline: dependencies must already be in the local cache (the
+failure message says to run one trusted-context build first).  The
+dependency caches the build sees are hermetic run-local copies seeded from
+the host `~/.m2/repository` / `~/.gradle/caches` dependency subtree — the
+host caches are never build-writable (a hostile build could otherwise
+poison the shared cache that the operator's own later, trusted builds
+silently consume) — and the build's in-project write scope covers only the
+build tool's own output dirs (module `target/` / `build/` plus the root
+`.gradle/`), while the rest of the project stays read-only.  The repo's own
+`mvnw`/`gradlew` wrappers are never executed.  The CAMPAIGN then executes
+the jazzer binary directly under the strict libFuzzer-runner sandbox with
+`--cp`/`--target_class` (the build tool never runs inside the campaign);
+the classpath entries coming out of the build are vetted — kept only when
+they exist inside the project or the run directory — before jazzer sees
+them.
+
+Crashes are usually uncaught Java exceptions (Jazzer's security detectors
+raise `FuzzerSecurityIssue*` exception types through the same report): the
+exception type, message, and stack frames parsed from the harness output
+become the triage signal on the normalized crash records
+(`jazzer/jazzer-crashes.json`), and each crash artifact is wrapped as a
+Witness under `<out>/witnesses/` (`produced_by: jazzer`, with the harness
+source file's hash) — the same record shape and store the AFL++, atheris,
+and cargo-fuzz paths use, so `/validate` and `raptor-verified-outcomes`
+consume jazzer crashes with no extra wiring.
+
+jazzer and a JVM are optional dependencies.  When either is missing the
+detector still reports the target with an install hint (the standalone
+release from the Jazzer GitHub releases page) and the plan blocks instead
+of running; a missing build tool for the project's layout (`mvn`,
+`gradle`, or `javac` for bare trees) blocks the plan the same way.
+
 ## Target Detection
 
 Before any campaign starts, RAPTOR identifies the target and recommends the
@@ -81,13 +249,14 @@ appropriate approach.  The detector recognises:
 | `pe-exe` | Windows PE executable | WinAFL (not orchestrated) |
 | `pe-dll` | Windows DLL | WinAFL (not orchestrated) |
 | `pe-sys` | Windows kernel driver (.sys) | kAFL / Snapchange (not orchestrated) |
-| `java-class` | Java class file | Not yet orchestrated |
-| `java-archive` | Java JAR archive | Not yet orchestrated |
+| `java-class` | Java class file | Not orchestrated (point at the source tree for Jazzer) |
+| `java-archive` | Java JAR archive | Not orchestrated (point at the source tree for Jazzer) |
 | `apk` | Android APK archive | Not yet orchestrated |
 | `source-c` | C/C++ sources (file or tree) | Env build-on-demand (trees, trust-gated) or harness generation then libFuzzer |
 | `source-cpp` | C++ source / header files | Harness generation then libFuzzer |
 | `rust-crate` | Rust crate (Cargo.toml present) | `cargo-fuzz` |
 | `python-pkg` | Python package (pyproject.toml / setup.py) | Atheris |
+| `java-project` | Java/Kotlin project (Maven / Gradle / bare sources) | Jazzer |
 
 Detection works by reading magic bytes (ELF, Mach-O, PE, PK/ZIP), inspecting
 file extensions, and checking for project markers (`Cargo.toml`,
@@ -167,6 +336,11 @@ python3 raptor.py fuzz --binary <path> [flags]
 | `--orchestrator` | Force the orchestrator pipeline (target detection + capability checks + engine selection) |
 | `--legacy` | Force the legacy AFL++-only path |
 | `--plan-only` | Print the campaign plan and exit without running |
+| `--engine <afl\|libfuzzer\|atheris\|cargo-fuzz\|jazzer>` | Force a specific engine; honoured only when the detected target kind supports it, otherwise the plan blocks. Implies `--orchestrator` |
+| `--py-harness <file>` | Operator-written atheris `TestOneInput` harness for python-pkg targets. Implies `--orchestrator` |
+| `--py-entry <module:function>` | Scaffold a template atheris harness around this entry point (simple bytes/str case only). Implies `--orchestrator` |
+| `--py-input <bytes\|text>` | Payload type the scaffolded harness feeds the entry point (default: bytes) |
+| `--fuzz-target <name>` | In-repo harness to build and run: the cargo-fuzz target name (rust-crate) or the Jazzer target class (java-project; fully-qualified, or the simple name when unambiguous); auto-selected when the project has exactly one. Implies `--orchestrator` |
 
 ### Witness and exploit flags
 
@@ -445,11 +619,60 @@ out/fuzz_<binary>_<timestamp>/
     secondaryNN/              -- Parallel instance results
     merged_crashes/           -- All instances' crashes (hardlinked) when a
                                  secondary found any; analysis reads this dir
-  analysis/
-    crash_*.json              -- Per-crash LLM analysis
+  analysis/                   -- LLM crash-analysis output
+    analysis/
+      <safe_id>.json          -- Per-crash LLM analysis (<safe_id> is the
+                                 AFL crash id sanitised for filesystem
+                                 use; there is no crash_ prefix)
     exploits/
-      crash_*_exploit.c       -- Generated exploit PoCs
-  witnesses/                  -- Crash Witness objects
+      <safe_id>_exploit.cpp   -- Generated exploit PoCs
+      <safe_id>_exploit_validated.c
+                              -- Refined exploit that passed
+                                 validate-and-refine (--autonomous)
+      <safe_id>_exploit_best_attempt.c
+                              -- Refinement attempted but did not
+                                 validate; best attempt kept
+                                 (--autonomous)
+    witnesses/                -- LLM-exploit Witness objects
+                                 (skipped with --no-record-witnesses)
+  witnesses/                  -- Crash Witness objects for the fuzz
+                                 crashes themselves (always recorded;
+                                 atheris, cargo-fuzz, and jazzer
+                                 campaigns write here too)
+  atheris/                    -- atheris campaign results (python-pkg targets)
+    corpus/                   -- working corpus (seeds staged in)
+    crashes/                  -- crash-* / timeout-* / oom-* artifacts
+    atheris-crashes.json      -- normalized crash records with the
+                                 Python exception triage signal
+  atheris-harness/            -- generated template harness (--py-entry only)
+  cargofuzz/                  -- cargo-fuzz campaign results (rust-crate targets)
+    cargo-target/             -- sandboxed build artifacts (the built
+                                 fuzz-target binary lives here)
+    corpus/                   -- working corpus (seeds staged in)
+    crashes/                  -- crash-* / timeout-* / oom-* artifacts
+    build-stdout.log          -- cargo fuzz build output
+    build-stderr.log
+    cargofuzz-crashes.json    -- normalized crash records with the
+                                 Rust panic triage signal
+  crate-corpus.json           -- record of the crate's own fuzz/corpus/<target>
+                                 seeds being used (cargo-fuzz, no --corpus)
+  jazzer/                     -- jazzer campaign results (java-project targets)
+    classes/                  -- bare-lane javac output (Maven/Gradle
+                                 builds write their module target/ or
+                                 build/ dirs instead)
+    m2-repo/ gradle-home/     -- hermetic run-local dependency caches
+                                 (seeded by copy from the host caches)
+    classpath.txt             -- the build's classpath output (vetted
+                                 before the campaign uses it)
+    corpus/                   -- working corpus (seeds staged in)
+    crashes/                  -- crash-* / timeout-* / oom-* artifacts
+    build-stdout.log          -- build-tool output
+    build-stderr.log
+    jazzer-crashes.json       -- normalized crash records with the
+                                 Java exception triage signal
+  jazzer-corpus.json          -- record of the project's own
+                                 <Class>Inputs seeds being used
+                                 (jazzer, no --corpus)
   binary-context-map.json     -- radare2 binary analysis (when enabled)
   coverage-fuzz.json          -- Function-precise runtime coverage record
                                  (gcov-instrumented targets; reaches the

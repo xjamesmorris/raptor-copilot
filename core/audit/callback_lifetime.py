@@ -132,8 +132,12 @@ def _call_re(names: tuple[str, ...]) -> re.Pattern:
     )
     return re.compile(r"\b(" + alts + r")\s*\(")
 
+# \b pins the assigned variable to a word start: unanchored, every
+# position inside a long identifier run starts a fresh scan of the
+# rest of the run — quadratic on hostile source. A mid-word start is
+# a false token (the tail of a longer identifier) either way.
 _RCU_DEREF_RE = re.compile(
-    r"(\w+)\s*=\s*rcu_dereference\w*\s*\("
+    r"\b(\w+)\s*=\s*rcu_dereference\w*\s*\("
 )
 
 _KFREE_VAR_RE = re.compile(
@@ -231,7 +235,7 @@ def check_safe_teardown(
     )
     free_re = _call_re(_free_names(vocab))
 
-    lines = sanitized_view(source, language="c").split("\n")
+    lines = sanitized_view(source, language="c").split("\n")  # line-model: callers deliver \n-model text (universal-newline reads / split_lines span joins)
     async_lines: list[int] = []
     free_lines: list[int] = []
     # (line, column) call positions: C statements on one line execute
@@ -243,12 +247,14 @@ def check_safe_teardown(
     barrier_pos: list[tuple[int, int]] = []   # waiting or RCU calls
     waiting = rcu = False
     for i, line in enumerate(lines):
-        m = async_re.search(line)
-        # A waiting variant (timer_delete_sync) contains the async
-        # spelling as a prefix — only count a true async call.
-        if m and not re.search(
-            re.escape(m.group(1)) + r"_sync\s*\(", line,
-        ):
+        # The async pattern requires `(` directly after the name, so
+        # a waiting variant (timer_delete_sync) can never match it —
+        # every match IS a true async call, and all of them count.
+        # (A same-line "contains _sync(" disambiguator here could
+        # only ever fire on the two-call-one-line shape, where it
+        # dropped a REAL async cancel: `del_timer(&a->t);
+        # del_timer_sync(&b->t); … kfree(a);` certified safe.)
+        for m in async_re.finditer(line):
             async_lines.append(i)
             async_pos.append((i, m.start()))
         for fm in free_re.finditer(line):
@@ -348,7 +354,7 @@ def check_callback_lifetime_local(
     cancel_re = _call_re(_cancel_names(vocab))
     free_re = _call_re(_free_names(vocab))
 
-    lines = source.split("\n")
+    lines = source.split("\n")  # line-model: callers deliver \n-model text (universal-newline reads / split_lines span joins)
 
     registrations: list[int] = []
     frees: list[int] = []
@@ -503,9 +509,29 @@ def check_callback_lifetime_cross(
             if free_func == reg_func:
                 continue
 
+            # free_func comes out of a prior Joern query result — a
+            # method name of the SCANNED repo's CPG, i.e. attacker-
+            # influenced text (C++ user-defined-literal operators and
+            # frontend-mangled names can carry quotes). It must pass
+            # the identifier grammar + Scala escaping before being
+            # interpolated into a query the unsandboxed JVM executes.
+            # Rejection is counted as a degraded cancel check, not a
+            # clean bill — same discipline as a failed refuter query.
+            from ._util import safe_joern_name
+            safe_free_func = safe_joern_name(str(free_func))
+            if safe_free_func is None:
+                logger.debug(
+                    "callback_lifetime: free-site method name %r "
+                    "fails identifier validation; skipping cancel "
+                    "check for this pair",
+                    free_func,
+                )
+                cancel_query_errors += 1
+                continue
+
             escaped_member = str(member_expr).replace("\\", "\\\\").replace('"', '\\"')
             cancel_query = (
-                f'cpg.method.name("{free_func}")'
+                f'cpg.method.name("{safe_free_func}")'
                 f'.ast.isCall.name("{cancel_names}")'
                 f'.filter(_.argument.order(0).code(".*{escaped_member}.*"))'
                 f".l"

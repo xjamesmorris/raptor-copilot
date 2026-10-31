@@ -25,12 +25,33 @@ import pytest
 from core.run import workdir
 
 
+# Captured pre-patch so test_family_name_is_the_launcher_shape pins
+# the production name even though the autouse fixture swaps it out.
+_REAL_FAMILY_NAME = workdir._family_name
+
+
 @pytest.fixture(autouse=True)
 def _fresh(monkeypatch, tmp_path):
-    """Reset the process cache and point the temp root at a private dir."""
+    """Reset the process cache and point the temp root at a private dir.
+
+    The family name is patched to a test-private one: this suite may
+    itself run under the ``bin/raptor`` launcher, where pytest's
+    ``tmp_path`` ALREADY lies inside the real ``raptor-<euid>`` family
+    (``TMPDIR=/…/raptor-<euid>/session-…``). The no-op detection then
+    correctly vetoes consolidation for any dir we can create, and every
+    standalone-behaviour test would fail while testing nothing. A
+    private name keeps all the logic under test real (mkdir posture,
+    squat refusal, dead-pid sweep, session naming) while making
+    "outside the family" constructible on any host;
+    test_family_name_is_the_launcher_shape pins the production name.
+    """
     monkeypatch.setattr(workdir, "_resolved", False)
     monkeypatch.setattr(workdir, "_cached", None)
     monkeypatch.delenv("RAPTOR_WORK_DIR", raising=False)
+    monkeypatch.setattr(
+        workdir, "_family_name",
+        lambda: f"raptor-{os.geteuid()}-selftest",
+    )
     tmp_root = tmp_path / "tmproot"
     tmp_root.mkdir()
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_root))
@@ -39,7 +60,14 @@ def _fresh(monkeypatch, tmp_path):
 
 
 def _family(base: Path) -> Path:
-    return base / f"raptor-{os.geteuid()}"
+    return base / workdir._family_name()
+
+
+def test_family_name_is_the_launcher_shape():
+    """The production family name must stay byte-compatible with the
+    ``bin/raptor`` launcher's session base (its sweep and this module
+    reclaim each other's dirs by that shared shape)."""
+    assert _REAL_FAMILY_NAME() == f"raptor-{os.geteuid()}"
 
 
 class TestLauncherNoOp:
@@ -181,3 +209,73 @@ class TestSafetyPosture:
         assert workdir.exec_workdir() is not None
         assert (victim / "keep").exists(), \
             "sweep must never follow a planted symlink"
+
+
+class TestTempRootInteropAdvisory:
+    """exec_workdir resolution is a temp-root advisory chokepoint."""
+
+    pytestmark = pytest.mark.wsl
+
+    @pytest.fixture(autouse=True)
+    def _reset_latch(self):
+        from core.startup import wsl
+        wsl._tmpdir_warned = False
+        yield
+        wsl._tmpdir_warned = False
+
+    def test_resolution_fires_advisory_once(
+        self, _fresh, monkeypatch, capsys,
+    ):
+        from core.startup import wsl
+        monkeypatch.setattr(wsl, "is_wsl", lambda kernel_id=None: True)
+        monkeypatch.setattr(wsl, "fs_is_drvfs_or_9p", lambda path: True)
+        workdir.exec_workdir()
+        workdir.exec_workdir()
+        err = capsys.readouterr().err
+        assert err.count("temp root (TMPDIR/RAPTOR_WORK_DIR)") == 1
+
+    def test_fires_even_on_launcher_noop_path(
+        self, _fresh, monkeypatch, capsys,
+    ):
+        # gettempdir() inside the raptor-<euid> family returns None
+        # (launcher no-op) — but the family still sits ON the temp
+        # root, so the advisory applies just the same.
+        from core.startup import wsl
+        monkeypatch.setattr(wsl, "is_wsl", lambda kernel_id=None: True)
+        monkeypatch.setattr(wsl, "fs_is_drvfs_or_9p", lambda path: True)
+        fam = _fresh / workdir._family_name() / "session-1-1"
+        fam.mkdir(parents=True)
+        monkeypatch.setattr(tempfile, "gettempdir", lambda: str(fam))
+        assert workdir.exec_workdir() is None
+        assert "temp root (TMPDIR/RAPTOR_WORK_DIR)" in capsys.readouterr().err
+
+    def test_silent_off_wsl(self, _fresh, monkeypatch, capsys):
+        from core.startup import wsl
+        monkeypatch.setattr(wsl, "is_wsl", lambda kernel_id=None: False)
+        workdir.exec_workdir()
+        assert "temp root" not in capsys.readouterr().err
+
+    def test_work_dir_override_probed_over_gettempdir(
+        self, _fresh, monkeypatch, capsys,
+    ):
+        # The docs warn about RAPTOR_WORK_DIR too: the chokepoint
+        # probes the base workdir actually resolves, so a WORK_DIR
+        # on a Windows-interop mount warns even when TMPDIR (the
+        # _fresh tmp root) is clean.
+        from core.startup import wsl
+        override = _fresh / "winmount"
+        override.mkdir()
+        monkeypatch.setenv("RAPTOR_WORK_DIR", str(override))
+        monkeypatch.setattr(wsl, "is_wsl", lambda kernel_id=None: True)
+        probed: list[str] = []
+
+        def probe(path):
+            probed.append(str(path))
+            return str(path) == str(override)
+
+        monkeypatch.setattr(wsl, "fs_is_drvfs_or_9p", probe)
+        workdir.exec_workdir()
+        err = capsys.readouterr().err
+        assert probed == [str(override)]
+        assert "temp root (TMPDIR/RAPTOR_WORK_DIR)" in err
+        assert str(override) in err

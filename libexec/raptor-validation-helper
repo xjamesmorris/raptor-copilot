@@ -36,16 +36,30 @@ if not (os.environ.get("CLAUDECODE")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import core.startup.process_init  # noqa: E402,F401
 import hashlib  # noqa: E402
+import json  # noqa: E402
+import stat  # noqa: E402
 
 from core.artifacts.provenance import sanitise_free_text, stamp_provenance  # noqa: E402
 from core.inventory.lookup import normalise_path  # noqa: E402
 from core.json import load_json, save_json  # noqa: E402
-from core.schema_constants import MEMORY_CORRUPTION_TYPES, normalise_vuln_type  # noqa: E402
+from core.security.log_sanitisation import (  # noqa: E402
+    sanitise_excerpt as _excerpt,
+    sanitise_for_terminal as _sft,
+)
+from core.status import normalize_status  # noqa: E402
+from core.schema_constants import (  # noqa: E402
+    CWE_TO_VULN_TYPE,
+    MEMORY_CORRUPTION_TYPES,
+    VULN_TYPES,
+    is_dark_row as _is_dark_row,
+    normalise_vuln_type,
+)
 from packages.exploitability_validation.schemas import (  # noqa: E402
     ATTACK_PATH_SCHEMA,
     ATTACK_SURFACE_SCHEMA,
     ATTACK_TREE_SCHEMA,
     DISPROVEN_SCHEMA,
+    FINDING_SCHEMA,
     FINDINGS_SCHEMA,
     HYPOTHESIS_SCHEMA,
     create_empty_findings,
@@ -73,6 +87,19 @@ _DOC_TEXT_SCHEMAS = {
     "attack-paths.json": {"items": ATTACK_PATH_SCHEMA},
     "hypotheses.json": {"items": HYPOTHESIS_SCHEMA},
 }
+
+
+def _ruling(finding):
+    """The finding's ruling dict, or {} when absent or non-dict.
+
+    LLM-authored stage files sometimes carry a bare-string ruling
+    ("confirmed"); calling .get() on it raised AttributeError and
+    wedged the helper mid-merge. A non-dict ruling is NO ruling — it
+    neither confirms nor rules out (fail closed: malformed shapes
+    never mint a verdict).
+    """
+    r = finding.get("ruling")
+    return r if isinstance(r, dict) else {}
 
 
 def _save_artifact(path, data):
@@ -120,6 +147,12 @@ Output: stage-d.json  {"stage":"D", "updates":{"FIND-XXXX": {ruling:{...}, cvss_
   cvss_vector: "CVSS:3.1/AV:.../AC:.../PR:.../UI:.../S:.../C:.../I:.../A:..."
   stage_d_summary: {ruling:"confirmed"|"ruled_out"|"exploitable", disqualifiers_checked:[], disqualifiers_failed:[], evidence:str}''',
 
+    "E": '''\
+Output: stage-e.json  {"stage":"E", "updates":{"FIND-XXXX": {"stage_e_summary":{...}}, ...}}
+  stage_e_summary: {verdict, binary_path, impact}
+  (raptor-run-feasibility writes the feasibility data into findings.json
+  directly; stage-e.json carries only your additional notes/corrections)''',
+
     "F": '''\
 Output: stage-f.json  {"stage":"F", "updates":{"FIND-XXXX": {"stage_f_summary":{...}}, ...}}
   stage_f_summary: {corrections:[], notes:str}
@@ -142,7 +175,13 @@ def _is_validated(workdir, filename):
     current = hashlib.sha256(filepath.read_bytes()).hexdigest()
     for line in vfile.read_text().splitlines():
         if line.startswith(f"{filename}:"):
-            return line.split(":", 1)[1].strip() == current
+            recorded = line.split(":", 1)[1].strip()
+            # raptor-validate-schema records ``type:hash`` (the cache
+            # is keyed by WHICH validator passed); older records are a
+            # bare hash. Compare the hash component — a reader pinned
+            # to one form silently never matches the other and the
+            # documented skip becomes dead code.
+            return recorded.rsplit(":", 1)[-1] == current
     return False
 
 
@@ -185,7 +224,7 @@ def _validate_file(workdir, filename, validator_func):
         # complete list still returns to callers that want it.
         print(
             f"  {filename}: WARNING {len(errors)} validation "
-            f"problem(s) — first: {errors[0]}",
+            f"problem(s) — first: {_sft(str(errors[0]), max_len=300)}",
             file=sys.stderr,
         )
     else:
@@ -234,6 +273,141 @@ def _normalise_finding_ids(container):
         next_n += 1
         renamed += 1
     return renamed
+
+
+# Finding fields other pipelines mark their exports with — presence of
+# any means "audit-shaped" (mirrors is_audit_format in
+# core.orchestration.audit_bridge, applied per finding).
+_AUDIT_SHAPE_FIELDS = ("evidence_tool", "hypothesis", "provenance_refs")
+
+_FINDING_STATUS_VALUES = frozenset(
+    FINDING_SCHEMA["properties"]["status"]["enum"])
+
+_CWE_SHAPE_RE = re.compile(r"^CWE-[0-9]+$", re.IGNORECASE)
+
+
+def _mechanical_vuln_type(finding: dict) -> str | None:
+    """Schema-canonical vuln_type derivable WITHOUT guessing, or None.
+
+    Sources, in order: the finding's own ``vuln_type`` (alias- and
+    case-normalised; audit exports stamp the CWE id or ``novel``
+    there), then the ``cwe`` / ``cwe_id`` fields. CWE ids map through
+    the shared CWE_TO_VULN_TYPE table (unambiguous by construction);
+    ``novel`` is audit's explicit no-known-class marker and maps to
+    the schema's catch-all ``other``. Anything else returns None —
+    a schema warning is acceptable, a guessed value is not.
+    """
+    own = finding.get("vuln_type")
+    if isinstance(own, str) and own.strip():
+        norm = normalise_vuln_type(own.strip())
+        if norm in VULN_TYPES:
+            return norm
+        if _CWE_SHAPE_RE.match(norm):
+            return CWE_TO_VULN_TYPE.get(norm.upper())
+        if norm.lower() == "novel":
+            return "other"
+        return None
+    for key in ("cwe", "cwe_id"):
+        cwe = finding.get(key)
+        if isinstance(cwe, str) and _CWE_SHAPE_RE.match(cwe.strip()):
+            mapped = CWE_TO_VULN_TYPE.get(cwe.strip().upper())
+            if mapped:
+                return mapped
+    return None
+
+
+def _evidence_tool_confidence(evidence_tool: object) -> "str | None":
+    """Confidence graded from an audit ``evidence_tool`` stamp, or None.
+
+    Uses the audit bridge's own tool→confidence table so the two
+    import paths cannot drift. Only tools the table knows grade a
+    confidence — an unknown tool returns None (never guess), and the
+    seeded stage_a_summary simply omits the field.
+    """
+    if not isinstance(evidence_tool, str) or not evidence_tool:
+        return None
+    from core.orchestration.audit_bridge import EVIDENCE_TOOL_CONFIDENCE
+    return EVIDENCE_TOOL_CONFIDENCE.get(evidence_tool.split(":")[0])
+
+
+def _map_imported_finding_fields(container: dict | None) -> dict[str, int]:
+    """Mechanically fill the schema fields a ``--findings`` import can
+    carry from another pipeline's vocabulary.
+
+    Audit exports carry ``evidence_tool`` / ``tree_class`` /
+    ``hypothesis`` / receipts but no /validate ``status``, an
+    out-of-enum ``origin``, and a CWE-shaped (or absent) ``vuln_type``
+    — every stage prep then re-printed schema warnings until the LLM
+    stages back-filled the fields. The mapping is derivation, never
+    invention:
+
+    * ``status`` — missing or out-of-enum values become the imported-
+      shape entry state ``not_disproven`` (the same default the
+      variants import applies); the original is preserved as
+      ``source_status`` for provenance.
+    * ``vuln_type`` — see :func:`_mechanical_vuln_type`; unmappable
+      values are left untouched (fail-soft).
+    * ``origin`` — a bare ``audit`` provenance stamp (or an absent one
+      on an audit-shaped finding) becomes the schema's established
+      ``audit_import``; non-audit shapes stay absent rather than
+      guessed.
+    * ``stage_a_summary`` — for audit-shaped findings only, seeded
+      from the finding's own hypothesis / description / title first
+      line so Stage B has upstream context; an existing summary is
+      never overwritten, and canonical (native) findings pass through
+      unchanged.
+
+    Returns per-field fill counts (zeros omitted) for the import log.
+    """
+    counts = {"status": 0, "vuln_type": 0, "origin": 0,
+              "stage_a_summary": 0}
+    for f in (container or {}).get("findings", []):
+        if not isinstance(f, dict):
+            continue
+
+        status = f.get("status")
+        # isinstance FIRST: a list/dict-typed status is unhashable and
+        # the set probe alone would TypeError — the chokepoint is
+        # fail-soft by contract, so wrong-typed values map like any
+        # other out-of-enum value instead of aborting the import.
+        if not isinstance(status, str) or status not in _FINDING_STATUS_VALUES:
+            if isinstance(status, str) and status:
+                f.setdefault("source_status", status)
+            f["status"] = "not_disproven"
+            counts["status"] += 1
+
+        vt = f.get("vuln_type")
+        mapped_vt = _mechanical_vuln_type(f)
+        if mapped_vt is not None and mapped_vt != vt:
+            f["vuln_type"] = mapped_vt
+            counts["vuln_type"] += 1
+
+        origin = f.get("origin")
+        audit_shaped = any(f.get(k) for k in _AUDIT_SHAPE_FIELDS)
+        if origin == "audit" or (origin is None and audit_shaped):
+            f["origin"] = "audit_import"
+            counts["origin"] += 1
+
+        if "stage_a_summary" not in f and audit_shaped:
+            reasoning = next(
+                (v for v in (f.get("hypothesis"), f.get("description"),
+                             f.get("title"))
+                 if isinstance(v, str) and v.strip()), None)
+            if reasoning:
+                summary = {
+                    "status": f.get("status"),
+                    "candidate_reasoning":
+                        reasoning.strip().splitlines()[0][:500],
+                }
+                confidence = f.get("confidence")
+                if not (isinstance(confidence, str) and confidence):
+                    confidence = _evidence_tool_confidence(
+                        f.get("evidence_tool"))
+                if isinstance(confidence, str) and confidence:
+                    summary["confidence"] = confidence
+                f["stage_a_summary"] = summary
+                counts["stage_a_summary"] += 1
+    return {k: v for k, v in counts.items() if v}
 
 
 def _coerce_findings_container(
@@ -301,31 +475,413 @@ def _coerce_findings_container(
     return None, None
 
 
+# Dark-eligibility predicate: shared with the /audit post-pass
+# selection — ONE definition (core.schema_constants.is_dark_row,
+# imported above as _is_dark_row) so the import chokepoint and the
+# post-pass cannot drift on what counts as a dark row.
+
+
+#: Sites listed per witness-backlog cluster. An oversize class is
+#: CHUNKED into same-class clusters of this size — never truncated:
+#: the backlog is the drain's only row source, so every routed site
+#: identity must be listed (the overall listing stays bounded by
+#: ``_BACKLOG_CLUSTER_CAP`` × this).
+_BACKLOG_SITES_PER_CLUSTER = 50
+
+#: Clusters listed in the backlog artifact (chunks included). Cluster
+#: classes derive from attacker-influenced fields (cwe_id / vuln_type
+#: free text), so a hostile import can mint one cluster per row — the
+#: listing stays bounded (at most cap × sites-per-cluster listed
+#: sites), the ``total`` stays exact, and truncation is flagged.
+_BACKLOG_CLUSTER_CAP = 100
+
+
+def _remove_stale_witness_backlog(dest_dir: Path) -> None:
+    """Remove a backlog artifact that would outlive its inputs.
+
+    A re-import with no dark rows — or with ``--include-dark`` — into
+    the same ``--out`` must not leave the PREVIOUS import's backlog on
+    disk: the validation report reads the file and would render a
+    phantom routed count the fresh import marker contradicts. Same
+    staleness semantics as the re-adjudication queue's fresh-write.
+    Regular files only (lstat, no follow) — a planted special is left
+    alone with a loud note, never operated through.
+    """
+    import stat as _stat_mod
+    path = Path(dest_dir) / "witness-backlog.json"
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return
+    if _stat_mod.S_ISREG(st.st_mode):
+        path.unlink(missing_ok=True)
+    else:
+        print(f"  ⚠️  witness-backlog.json is not a regular file "
+              f"(mode=0o{st.st_mode:o}) — left in place (planted "
+              f"special?)", file=sys.stderr)
+
+
+def _remove_stale_import_marker(dest_dir: Path) -> None:
+    """Remove a findings-import marker left by a previous
+    findings-driven run into the same ``--out``.
+
+    The report generator reads the marker to suppress sweep-shaped
+    coverage stats — a stale one makes a fresh sweep run render as
+    findings-driven (and hide "Functions checked" entirely). Same
+    regular-file-only guard as :func:`_remove_stale_witness_backlog`:
+    a planted special is left alone with a loud note, never operated
+    through.
+    """
+    import stat as _stat_mod
+    path = Path(dest_dir) / "findings-import.json"
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return
+    if _stat_mod.S_ISREG(st.st_mode):
+        path.unlink(missing_ok=True)
+        print("  Stale findings-import marker from a previous "
+              "findings-driven run removed (this run is a sweep)")
+    else:
+        print(f"  ⚠️  findings-import.json is not a regular file "
+              f"(mode=0o{st.st_mode:o}) — left in place (planted "
+              f"special?)", file=sys.stderr)
+
+
+def _remove_stale_dedup_report(dest_dir: Path) -> None:
+    """Remove a dedup-report artifact that would outlive its inputs.
+
+    A re-import that dedups nothing — or a sweep run — into the same
+    ``--out`` must not leave the PREVIOUS import's dedup report on
+    disk: the validation report reads the file and would render a
+    phantom fan-out for findings the fresh import never collapsed.
+    Same regular-file-only guard as
+    :func:`_remove_stale_witness_backlog`: a planted special is left
+    alone with a loud note, never operated through.
+    """
+    import stat as _stat_mod
+    from packages.exploitability_validation.import_dedup import (
+        DEDUP_REPORT_FILENAME,
+    )
+    path = Path(dest_dir) / DEDUP_REPORT_FILENAME
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return
+    if _stat_mod.S_ISREG(st.st_mode):
+        path.unlink(missing_ok=True)
+    else:
+        print(f"  ⚠️  {DEDUP_REPORT_FILENAME} is not a regular file "
+              f"(mode=0o{st.st_mode:o}) — left in place (planted "
+              f"special?)", file=sys.stderr)
+
+
+def _remove_stale_preflight(dest_dir: Path) -> None:
+    """Remove a previous run's capability-preflight artifact.
+
+    Called BEFORE the preflight body (outside its guard), so a
+    crashing preflight can never leave the previous run's warnings on
+    disk looking current in a reused ``--out`` — the artifact is
+    fresh-or-absent, never stale. Never raises (it runs outside the
+    preflight's try block). Same regular-file-only posture as the
+    sibling removers.
+    """
+    import stat as _stat_mod
+    # Single-homed in capability_preflight.PREFLIGHT_FILENAME; the
+    # literal is a fallback so a broken module import cannot disable
+    # the stale-removal (equality is test-pinned).
+    filename = "capability-preflight.json"
+    try:
+        from packages.exploitability_validation.capability_preflight import (
+            PREFLIGHT_FILENAME,
+        )
+        filename = PREFLIGHT_FILENAME
+    except Exception:  # noqa: BLE001 — fall back to the pinned literal
+        pass
+    path = Path(dest_dir) / filename
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return
+    if not _stat_mod.S_ISREG(st.st_mode):
+        print(f"  ⚠️  {filename} is not a regular file "
+              f"(mode=0o{st.st_mode:o}) — left in place (planted "
+              f"special?)", file=sys.stderr)
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as e:
+        print(f"  ⚠️  could not remove stale {filename}: "
+              f"{_sft(str(e), max_len=200)}", file=sys.stderr)
+
+
+def _route_dark_to_witness_backlog(
+    container: dict, dest_dir: Path, source_name: str,
+) -> int:
+    """Split dark rows out of stage-A candidacy into the witness backlog.
+
+    Dark items are a WITNESS-ACQUISITION backlog, not validate
+    candidates: no tool could adjudicate them during the audit, so a
+    /validate pass has nothing mechanical to stand on either — running
+    them by default spends the budget re-hypothesising (sampling them
+    is calibration, opted into with ``--include-dark``). The backlog
+    artifact clusters the routed rows per CWE class / vuln_type so the
+    operator sees WHICH classes need new witnesses. Rows keep their
+    original ids and statuses — nothing here changes a verdict, and
+    already-written artifacts are never touched (this runs only on a
+    fresh ``--findings`` import).
+
+    Returns the number of rows routed (0 = no artifact written).
+    """
+    findings = container.get("findings", [])
+    dark = [f for f in findings if isinstance(f, dict) and _is_dark_row(f)]
+    if not dark:
+        return 0
+    container["findings"] = [
+        f for f in findings
+        if not (isinstance(f, dict) and _is_dark_row(f))
+    ]
+
+    def _cluster_class(finding: dict) -> str:
+        # Class strings are attacker-influenced free text — capped so
+        # a hostile row cannot bloat the artifact via its class key.
+        for key in ("cwe_id", "cwe"):
+            cwe = finding.get(key)
+            if isinstance(cwe, str) and cwe.strip():
+                return cwe.strip().upper()[:100]
+        vt = finding.get("vuln_type")
+        if isinstance(vt, str) and vt.strip():
+            return vt.strip().lower()[:100]
+        return "unclassified"
+
+    def _site(finding: dict) -> dict:
+        # ``line`` in a hostile row can be dict/list-shaped — only a
+        # real int is stored (0 = unknown), matching the queue
+        # records' coercion.
+        line = finding.get("line")
+        if isinstance(line, bool) or not isinstance(line, int):
+            line = 0
+        return {
+            "id": str(finding.get("id") or "")[:120],
+            "file": str(finding.get("file")
+                        or finding.get("file_path") or "")[:300],
+            "function": str(finding.get("function") or "")[:200],
+            "line": line,
+            "title": str(finding.get("title")
+                         or finding.get("hypothesis") or "")[:300],
+        }
+
+    grouped: dict[str, list[dict]] = {}
+    for f in dark:
+        grouped.setdefault(_cluster_class(f), []).append(f)
+    clusters: list[dict] = []
+    for cls, rows in sorted(
+            grouped.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        # Chunk, never truncate: an oversize class becomes several
+        # same-class clusters of <= _BACKLOG_SITES_PER_CLUSTER sites,
+        # so no site identity is dropped from the artifact (the drain
+        # consumer dedups by site identity and iterates clusters
+        # agnostically, so same-class chunks are safe). Each chunk's
+        # count is its own listing — counts stay exact per cluster.
+        for start in range(0, len(rows), _BACKLOG_SITES_PER_CLUSTER):
+            chunk = rows[start:start + _BACKLOG_SITES_PER_CLUSTER]
+            clusters.append({
+                "class": cls,
+                "count": len(chunk),
+                "sites": [_site(f) for f in chunk],
+            })
+
+    backlog = {
+        "source_file": source_name,
+        "total": len(dark),
+        "note": (
+            "dark items (no tool could adjudicate) routed to the "
+            "witness-acquisition backlog — excluded from stage-A "
+            "candidacy by default; re-import with --include-dark to "
+            "validate them"
+        ),
+        "clusters": clusters[:_BACKLOG_CLUSTER_CAP],
+    }
+    if len(clusters) > _BACKLOG_CLUSTER_CAP:
+        backlog["clusters_truncated"] = True
+        backlog["cluster_classes_total"] = len(grouped)
+
+    # Loud-and-replace on a planted special: _save_artifact's atomic
+    # tempfile+rename never opens the destination (no FIFO hang, no
+    # symlink follow) — the plant is replaced, and the note says so.
+    try:
+        import stat as _stat_mod
+        st = os.lstat(dest_dir / "witness-backlog.json")
+        if not _stat_mod.S_ISREG(st.st_mode):
+            print(f"  ⚠️  replacing non-regular witness-backlog.json "
+                  f"(mode=0o{st.st_mode:o} — planted special?)",
+                  file=sys.stderr)
+    except OSError:
+        pass
+    _save_artifact(dest_dir / "witness-backlog.json", backlog)
+    return len(dark)
+
+
+def _queue_import_readjudication(
+    container: dict, dest: Path, source_name: str,
+) -> None:
+    """Cross-check incoming ``--findings`` rows against verdicts the
+    run dir already recorded — new claims against recorded disproofs,
+    and incoming disproofs against recorded confirmed-tier verdicts
+    (the overturn shape; see core.project.readjudication).
+
+    Pipeline handoff shares ``--out`` across runs, so a prior pass's
+    verdicts sit in *dest* (findings.json) until this import
+    OVERWRITES them — the one moment a new independent claim meets a
+    recorded disproof at the same site, and pre-fix the contradiction
+    vanished with the overwrite. Emit re-adjudication queue records IN
+    ADDITION to the (unchanged) overwrite; nothing is auto-overturned
+    — the queue is input for a scoped /validate. Runs on the RAW
+    incoming rows (before id/status normalisation) so records carry
+    the producer's own identity and status vocabulary.
+
+    Best-effort: a cross-check failure warns and never blocks the
+    import.
+    """
+    try:
+        from core.project.readjudication import (
+            QUEUE_FILENAME,
+            detect_contradictions,
+            queued_count,
+            write_queue,
+        )
+        prior = load_json(dest)
+        if isinstance(prior, dict):
+            prior_rows = prior.get("findings") or []
+        elif isinstance(prior, list):
+            prior_rows = prior
+        else:
+            prior_rows = []
+        prior_rows = [r for r in prior_rows if isinstance(r, dict)]
+        # Incoming dark rows count as claims here by design: a dark
+        # grade is still an independent assertion of the site. The
+        # record's new_claim.status field carries the grade so a
+        # queue reader can weigh a tool-blind hypothesis accordingly
+        # — weighting is the reader's job, not a filter's.
+        incoming = [
+            f for f in container.get("findings", []) if isinstance(f, dict)
+        ]
+        # Oldest-first ordering contract: the recorded disproofs
+        # precede the incoming claims.
+        records = detect_contradictions([
+            ("prior findings.json", prior_rows),
+            (source_name, incoming),
+        ]) if prior_rows else []
+        # Fresh recomputation semantics: always (re)write so a stale
+        # queue from an earlier import doesn't outlive its inputs.
+        write_queue(dest.parent, records)
+        n = queued_count(records)
+        if n:
+            print(f"  ⚠️  {n} incoming finding(s) contradict recorded "
+                  f"verdicts — re-adjudication queue: {QUEUE_FILENAME} "
+                  f"(nothing auto-overturned; adjudicate the queued "
+                  f"sites with a scoped /validate)")
+    except Exception as e:  # noqa: BLE001 — additive trail, never import-fatal
+        print(f"  ⚠️  re-adjudication cross-check failed: "
+              f"{_sft(str(e), max_len=200)}", file=sys.stderr)
+
+
 def _import_findings_file(
     findings_path: str | Path, dest: Path, target: str | None = None,
+    include_dark: bool = False,
 ) -> None:
     """Import a ``--findings`` file as *dest* (findings.json).
 
     Loads the source file, coerces recognised shapes into the
     canonical container (see :func:`_coerce_findings_container`),
-    normalises foreign finding ids, and persists via the provenance-
-    stamping artifact writer. An unrecognisable payload preserves the
-    legacy behaviour: the file is copied verbatim (so the operator can
-    inspect exactly what was imported) and the count reports 0.
+    cross-checks the incoming rows against disproofs already recorded
+    in the run dir (re-adjudication queue — additive, never a verdict
+    change), routes audit dark-grade rows to the witness backlog
+    (unless ``include_dark``), normalises foreign finding ids, and
+    persists via the provenance-stamping artifact writer. An
+    unrecognisable payload preserves the legacy behaviour: the file is
+    copied verbatim (so the operator can inspect exactly what was
+    imported) and the count reports 0.
     """
     import shutil
 
     src = Path(findings_path)
+
+    def _write_import_marker(count: int, dark_routed: int = 0,
+                             deduped: int = 0) -> None:
+        # Durable findings-driven marker: the container itself is
+        # rebuilt by the stage-A merge, so mode detection cannot ride
+        # a top-level container key. The report generator reads this
+        # to suppress sweep-shaped coverage stats ("Functions checked
+        # 0/N") that are meaningless for a findings-driven run.
+        # ``dark_routed`` / ``deduped`` are additive (readers tolerate
+        # extra keys).
+        save_json(dest.parent / "findings-import.json", {
+            "mode": "findings",
+            "source_file": src.name,
+            "imported": count,
+            "dark_routed": dark_routed,
+            "deduped": deduped,
+        })
+
     container, shape_note = _coerce_findings_container(
         load_json(src), target_path=target)
     if container is None:
         shutil.copy2(src, dest)
+        _remove_stale_dedup_report(dest.parent)
+        _write_import_marker(0)
         print(f"  ⚠️  {src.name}: no recognisable findings/variants "
               f"shape — copied verbatim", file=sys.stderr)
         print(f"Pre-existing findings: 0 from {src.name}")
         return
     if shape_note:
         print(f"  Import shape: {shape_note}")
+
+    # Contradiction check BEFORE dest is overwritten and before any
+    # normalisation rewrites ids/statuses.
+    _queue_import_readjudication(container, dest, src.name)
+
+    # Dark-import policy: witness backlog by default, candidacy only
+    # on explicit opt-in. Runs before id normalisation so backlog rows
+    # keep the producer's own ids. Suspicious rows are untouched —
+    # they stay eligible under the same contract as scanner findings.
+    # Either way the PREVIOUS import's backlog must not outlive its
+    # inputs: when nothing routes on THIS import (no dark rows, or
+    # --include-dark), a stale artifact would make the report render a
+    # phantom routed count.
+    dark_routed = 0
+    if include_dark:
+        n_dark = sum(1 for f in container.get("findings", [])
+                     if isinstance(f, dict) and _is_dark_row(f))
+        if n_dark:
+            print(f"  {n_dark} dark item(s) included in stage-A "
+                  f"candidacy (--include-dark)")
+        _remove_stale_witness_backlog(dest.parent)
+    else:
+        dark_routed = _route_dark_to_witness_backlog(
+            container, dest.parent, src.name)
+        if dark_routed:
+            print(f"  {dark_routed} dark item(s) routed to the witness "
+                  f"backlog — not validated; --include-dark to override "
+                  f"(witness-backlog.json)")
+            if dark_routed > len(container.get("findings", [])):
+                # Majority-dark anomaly hint. Threshold = routed
+                # outnumber the surviving candidates: below that,
+                # routing is incidental attrition and a second line is
+                # noise; above it, most of what the operator handed in
+                # will NOT be judged by this run — usually a sign the
+                # import was an audit dark follow-up that needed
+                # --include-dark, or that witness acquisition, not
+                # validation, is the actual next step.
+                print(f"  note: majority of the import is dark "
+                      f"({dark_routed} routed vs "
+                      f"{len(container.get('findings', []))} candidate(s)) "
+                      f"— the witness backlog is this run's main output; "
+                      f"pass --include-dark if these rows were "
+                      f"deliberately selected for validation")
+        else:
+            _remove_stale_witness_backlog(dest.parent)
+
     # Normalise foreign ids at the import chokepoint so the container
     # satisfies its own schema before any stage prep validates it.
     renamed = _normalise_finding_ids(container)
@@ -333,7 +889,57 @@ def _import_findings_file(
         print(f"  Normalised {renamed} foreign finding "
               f"id(s) to FIND-<n> (originals kept as "
               f"source_id)")
+    mapped = _map_imported_finding_fields(container)
+    if mapped:
+        summary = ", ".join(f"{k}: {v}" for k, v in sorted(mapped.items()))
+        print(f"  Mapped import fields — {summary}")
+
+    # Same-sink/same-vector dedup AFTER id normalisation (final
+    # FIND-<n> ids anchor the audit trail) and field mapping (the
+    # canonical vuln_type is part of the sink identity). Provable
+    # duplicates would each pay the full stage A→F cost; unsure rows
+    # are KEPT and flagged (conservative by contract). Every decision
+    # — drop and keep-unsure alike — lands in dedup-report.json;
+    # either way the PREVIOUS import's report must not outlive its
+    # inputs (fresh-write semantics, matching the witness backlog).
+    deduped = 0
+    from packages.exploitability_validation.import_dedup import (
+        DEDUP_REPORT_FILENAME,
+        dedup_imported_findings,
+    )
+    dedup_report, dedup_stats = dedup_imported_findings(container, src.name)
+    if dedup_report is not None:
+        # Loud-and-replace on a planted special (same posture as the
+        # witness backlog writer: _save_artifact's tempfile+rename
+        # never opens the destination).
+        try:
+            import stat as _stat_mod
+            st = os.lstat(dest.parent / DEDUP_REPORT_FILENAME)
+            if not _stat_mod.S_ISREG(st.st_mode):
+                print(f"  ⚠️  replacing non-regular {DEDUP_REPORT_FILENAME} "
+                      f"(mode=0o{st.st_mode:o} — planted special?)",
+                      file=sys.stderr)
+        except OSError:
+            pass
+        _save_artifact(dest.parent / DEDUP_REPORT_FILENAME, dedup_report)
+        deduped = dedup_stats["dropped"]
+        if deduped:
+            print(f"  Import dedup: {deduped} duplicate finding(s) "
+                  f"collapsed into {dedup_stats['clusters']} canonical "
+                  f"finding(s) — same sink + same vector; each "
+                  f"canonical verdict fans out to its duplicates "
+                  f"({DEDUP_REPORT_FILENAME})")
+        if dedup_stats["kept_unsure"]:
+            print(f"  Import dedup: {dedup_stats['kept_unsure']} "
+                  f"same-sink finding(s) KEPT (vector not provably "
+                  f"identical) — flagged potential_dup "
+                  f"({DEDUP_REPORT_FILENAME})")
+    else:
+        _remove_stale_dedup_report(dest.parent)
+
     _save_artifact(dest, container)
+    _write_import_marker(len(container["findings"]), dark_routed,
+                         deduped=deduped)
     print(f"Pre-existing findings: {len(container['findings'])} "
           f"from {src.name}")
 
@@ -379,24 +985,472 @@ def _deep_merge(target, source):
             target[key] = value
 
 
+# ─── immutable stage inputs (consume-by-copy receipts) ──────────────
+
+#: Receipt ledger recording every stage-file consumption: which file
+#: was merged, its content hash, and when. The receipt IS the consume
+#: marker — the pre-fix delete of the stage file broke delegated
+#: agents that re-read their stage output after the next prep ran
+#: (stage inputs are immutable from their side) and erased the
+#: post-hoc record of what each merge actually saw.
+STAGE_RECEIPTS_FILENAME = "stage-receipts.json"
+
+#: Durable per-stage archive under the workdir: a byte-identical,
+#: hash-named copy of each consumed stage file. The in-place original
+#: stays the LLM's to rewrite (rewritten content re-consumes); the
+#: archive copy preserves exactly the bytes each merge consumed even
+#: after such a rewrite. Never deleted mid-run.
+STAGE_ARCHIVE_DIRNAME = "stage-inputs"
+
+#: Consumption events kept in the ledger's ``history`` list. Bounds
+#: the ledger against a retry loop that rewrites and re-consumes
+#: stage files indefinitely (the ledger is rewritten whole on every
+#: consumption). Higher keeps a longer event trail at linearly
+#: growing rewrite cost; lower starts dropping the EARLY events a
+#: post-hoc audit reads first. Skip correctness never degrades: the
+#: per-file ``receipts`` map (latest consumption per file) and the
+#: hash-named archive copies are not capped.
+_RECEIPT_HISTORY_CAP = 100
+
+
+def _read_workdir_bytes(path: Path) -> "bytes | None":
+    """Raw bytes of a workdir artifact, or None when refused/unreadable.
+
+    One read serves the parse, the receipt hash, and the archive copy
+    — hashing a second read could describe different bytes than the
+    ones the merge consumed. The workdir holds LLM-authored artifacts,
+    so the read goes through ``core.source.gated``'s discipline, the
+    same gate ``load_json`` reads stage files through: regular files
+    only, checked on the OPENED fd (a planted FIFO stats as 0 bytes
+    and then blocks a plain reader forever; a symlink to a device
+    passes any size gate and feeds unbounded bytes), ``O_NONBLOCK``
+    open, and the byte budget checked on the fstat size AND re-checked
+    after a capped read (a file that grows mid-read is refused, not
+    buffered unbounded). Budget mirrors ``load_json``'s default.
+    """
+    from core.json.utils import DEFAULT_JSON_MAX_BYTES
+    from core.source.gated import read_bytes_gated
+    try:
+        return read_bytes_gated(path, DEFAULT_JSON_MAX_BYTES)
+    except FileNotFoundError:
+        return None
+    except (ValueError, OSError) as e:
+        print(f"  ⚠️  {_sft(path.name, max_len=64)} not consumed: "
+              f"{_sft(str(e), max_len=200)}", file=sys.stderr)
+        return None
+
+
+def _load_stage_receipts(workdir: "str | Path") -> dict:
+    """The receipts ledger, or a fresh one when absent or malformed.
+
+    Malformed reads as no-receipts: consumption re-applies, matching
+    the no-ledger state. Fail-open toward re-merge is safe here — the
+    merge is idempotent-by-content for update stages and a rebuild
+    for stage A, and neither mints a verdict.
+    """
+    data = load_json(Path(workdir) / STAGE_RECEIPTS_FILENAME)
+    if not isinstance(data, dict) or not isinstance(
+            data.get("receipts"), dict):
+        return {"schema": 1, "receipts": {}, "history": []}
+    if not isinstance(data.get("history"), list):
+        data["history"] = []
+    return data
+
+
+def _stage_consumed_unchanged(workdir: "str | Path", filename: str,
+                              digest: str) -> bool:
+    """True when the latest receipt for *filename* matches *digest*.
+
+    The immutable-inputs replacement for "the file is gone": content
+    already consumed never re-applies; rewritten content (new hash)
+    does — exactly the delete regime's reachable behaviours, kept as
+    metadata instead of by removal.
+    """
+    entry = _load_stage_receipts(workdir)["receipts"].get(filename)
+    return isinstance(entry, dict) and entry.get("sha256") == digest
+
+
+def _stage_a_container_unchanged(workdir: "str | Path",
+                                 filename: str) -> bool:
+    """True when findings.json still matches what the receipted stage-A
+    build wrote — the only state in which skipping stage A is a
+    genuine no-op.
+
+    Stage A's apply is a container RESET, not an idempotent update
+    merge. In a shared ``--out`` re-run, run 1's later-stage merges
+    (stage-B summaries, rulings) live in findings.json; skipping an
+    unchanged stage-a.json there would carry run 1's stale verdicts
+    into run 2, where the delete regime rebuilt a clean container.
+    The receipt records findings.json's sha256 as built; any drift —
+    or a missing/unreadable findings.json, or a receipt without the
+    field — re-applies. Fail-open toward the rebuild: that is the
+    delete regime's reset, and stage A never mints a verdict.
+    """
+    entry = _load_stage_receipts(workdir)["receipts"].get(filename)
+    expected = (entry.get("findings_sha256")
+                if isinstance(entry, dict) else None)
+    if not isinstance(expected, str) or not expected:
+        return False
+    current = _read_workdir_bytes(Path(workdir) / "findings.json")
+    if current is None:
+        return False
+    return hashlib.sha256(current).hexdigest() == expected
+
+
+def _warn_archive_failure(filename: str, reason: str) -> None:
+    """Stderr warning for a refused/failed archive copy (the
+    best-effort path — the receipt hash stays the consumption
+    authority). Both fields go through ``_sft``: the filename is
+    helper-derived, but an OSError's text can carry a path from a
+    hostile plant in the workdir."""
+    print(f"  ⚠️  stage-input archive copy failed for "
+          f"{_sft(str(filename), max_len=64)}: "
+          f"{_sft(reason, max_len=200)}", file=sys.stderr)
+
+
+def _open_archive_dir_fd(workdir: "str | Path") -> int:
+    """fd of the ``stage-inputs/`` directory, refusing any plant at
+    that name; raises ``OSError`` on refusal.
+
+    ``O_EXCL | O_NOFOLLOW`` on the archive file guards only the FINAL
+    path component — a symlink pre-planted AT ``stage-inputs`` would
+    route the copy outside the run dir while the receipt claimed a
+    run-dir path. So: mkdir (EEXIST tolerated — whatever occupies the
+    name is vetted next), then open the name itself with
+    ``O_DIRECTORY | O_NOFOLLOW`` plus an fstat ``S_ISDIR`` re-check
+    (belt-and-braces where either flag is unavailable). A symlink
+    (dangling or not), regular file, or anything else at the name
+    fails the open instead of being traversed. The caller creates the
+    archive file fd-relatively (openat semantics) so no path
+    component is re-traversed after this vetting.
+    """
+    archive_dir = Path(workdir) / STAGE_ARCHIVE_DIRNAME
+    try:
+        os.mkdir(archive_dir)
+    except FileExistsError:
+        pass  # existing entry vetted by the no-follow open below
+    flags = (os.O_RDONLY
+             | getattr(os, "O_DIRECTORY", 0)
+             | getattr(os, "O_NOFOLLOW", 0)
+             | getattr(os, "O_CLOEXEC", 0))
+    fd = os.open(str(archive_dir), flags)
+    try:
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(
+                f"plant at the {STAGE_ARCHIVE_DIRNAME} name: not a "
+                f"directory")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _existing_archive_matches(dir_fd: int, name: str,
+                              raw: bytes) -> bool:
+    """True when the entry already at the archive *name* is a regular
+    file holding exactly *raw* — the earlier-consume dedup case.
+
+    An EEXIST on the exclusive create is NOT proof the content is
+    already archived: the hash name is predictable from LLM-authored
+    content, so a plant (wrong-bytes file, symlink) can occupy it.
+    Verified through the same directory fd, no-follow, fd-checked
+    regularity, capped read — anything that fails is the caller's
+    archive-failure path.
+    """
+    flags = (os.O_RDONLY
+             | getattr(os, "O_NONBLOCK", 0)
+             | getattr(os, "O_NOFOLLOW", 0)
+             | getattr(os, "O_CLOEXEC", 0))
+    try:
+        fd = os.open(name, flags, dir_fd=dir_fd)
+    except OSError:
+        return False
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size != len(raw):
+            return False
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1  # fdopen owns it now
+            existing = fh.read(len(raw) + 1)
+        return existing == raw
+    except OSError:
+        return False
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _archive_stage_input(workdir: "str | Path", filename: str,
+                         raw: bytes, digest: str) -> "str | None":
+    """Copy the consumed bytes into the per-stage archive; return the
+    workdir-relative archive path, or None on failure.
+
+    Hash-named (``stage-a-<sha12>.json``), so identical content
+    deduplicates naturally and a later rewrite of the in-place file
+    can never disturb what an earlier merge saw. The workdir holds
+    LLM-authored artifacts, so every component of the archive path is
+    plantable: the ``stage-inputs`` directory is opened no-follow and
+    vetted (``_open_archive_dir_fd``), and the copy is created
+    fd-relatively with ``O_EXCL | O_NOFOLLOW`` — a plant at the
+    predictable hash name refuses instead of being followed or
+    overwritten, and counts as archived only after byte-identity is
+    verified (``_existing_archive_matches``). Best-effort: the
+    receipt hash is the consumption authority; every refusal warns
+    and the receipt records ``archived_to: null`` — never a path this
+    call did not itself write or verify.
+    """
+    name = f"{Path(filename).stem}-{digest[:12]}.json"
+    rel = f"{STAGE_ARCHIVE_DIRNAME}/{name}"
+    try:
+        dir_fd = _open_archive_dir_fd(workdir)
+    except (OSError, NotImplementedError) as e:
+        _warn_archive_failure(filename, str(e))
+        return None
+    try:
+        create_flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                        | getattr(os, "O_NOFOLLOW", 0)
+                        | getattr(os, "O_CLOEXEC", 0))
+        try:
+            fd = os.open(name, create_flags, 0o644, dir_fd=dir_fd)
+        except FileExistsError:
+            if _existing_archive_matches(dir_fd, name, raw):
+                # Same bytes already archived (an earlier consume of
+                # identical content) — the honest dedup case.
+                return rel
+            _warn_archive_failure(
+                filename,
+                "existing entry at the archive name does not hold "
+                "the consumed bytes — refusing to claim it")
+            return None
+        try:
+            view = memoryview(raw)
+            written = 0
+            while written < len(view):
+                n = os.write(fd, view[written:])
+                if n <= 0:
+                    raise OSError(
+                        f"short write: os.write returned {n}")
+                written += n
+        finally:
+            os.close(fd)
+    except (OSError, NotImplementedError) as e:
+        _warn_archive_failure(filename, str(e))
+        return None
+    finally:
+        os.close(dir_fd)
+    return rel
+
+
+def _record_stage_receipt(workdir: "str | Path", filename: str,
+                          stage_letter: str, digest: str, size: int,
+                          archived_to: "str | None",
+                          findings_sha256: "str | None" = None) -> None:
+    """Record a consumption receipt — the metadata that replaced the
+    pre-fix delete of the stage file.
+
+    ``findings_sha256`` (stage A only): sha256 of findings.json as the
+    build wrote it, so the stage-A skip can tell a genuine no-op retry
+    from a shared ``--out`` re-run whose container has since accrued
+    later-stage merges (see ``_stage_a_container_unchanged``).
+
+    Plain ``save_json``: the ledger is helper-owned mechanical
+    bookkeeping (like the auto-sink-watch ledger), not an LLM-derived
+    working doc — no provenance stamp.
+    """
+    ledger = _load_stage_receipts(workdir)
+    consumed_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    prev = ledger["receipts"].get(filename)
+    count = (prev.get("consumed_count", 0)
+             if isinstance(prev, dict) else 0)
+    if not isinstance(count, int) or count < 0:
+        count = 0
+    entry = {
+        "stage": stage_letter.upper(),
+        "sha256": digest,
+        "size": size,
+        "consumed_at": consumed_at,
+        "archived_to": archived_to,
+        "consumed_count": count + 1,
+    }
+    if findings_sha256 is not None:
+        entry["findings_sha256"] = findings_sha256
+    ledger["receipts"][filename] = entry
+    ledger["history"].append({
+        "file": filename,
+        "stage": stage_letter.upper(),
+        "sha256": digest,
+        "consumed_at": consumed_at,
+    })
+    ledger["history"] = ledger["history"][-_RECEIPT_HISTORY_CAP:]
+    save_json(Path(workdir) / STAGE_RECEIPTS_FILENAME, ledger)
+
+
+# Structural stage-file keys the merge itself consumes — never copied
+# onto the container (``stage`` is re-stamped separately below).
+_STAGE_STRUCTURAL_KEYS = frozenset({"stage", "updates", "findings"})
+
+# Container-metadata keys a stage file may set on findings.json, per
+# stage. The container is the pipeline's ground truth: ``target_path``
+# steers every later path resolution and ``summary``/``timestamp`` feed
+# the report, so an update-stage file must not be able to rewrite them.
+# Only keys a downstream consumer actually reads from the container are
+# copyable, and only from the stage that legitimately produces them
+# (report.py reads ``stage_f_review`` — the Stage F review prose).
+CONTAINER_COPY_ALLOWLIST: "dict[str, frozenset[str]]" = {
+    "F": frozenset({"stage_f_review"}),
+}
+
+
+# Identity coordinates of a finding — the exact fields the
+# provenance MAC binds records to (core.witness.provenance
+# _finding_coords). An update payload rewriting them can clone a
+# sibling's identity and borrow its stamped record, or mint duplicate
+# finding identities; refused unless the value is a no-op echo of the
+# existing one (the findings-array update shape carries "id" by
+# construction).
+_UPDATE_IDENTITY_KEYS = frozenset({"id", "file", "function"})
+
+# Mechanically stamped record keys. These are written ONLY by the
+# programmatic stages (orchestrator stamp_feasibility, witness-stage
+# stamp_witness_execution) — never through a stage file — so a
+# payload-supplied copy is always a forgery vehicle. "provenance" is
+# the stamp-token key itself (core.witness.provenance.PROVENANCE_KEY).
+_UPDATE_MECHANICAL_KEYS = frozenset({
+    "witness_execution", "feasibility", "provenance",
+})
+
+# Suppression vocabulary (any spelling — values are normalised before
+# the membership test). Without a mechanical refutation receipt these
+# quarantine as ruled_out_unverified on EVERY status-bearing field.
+_DISPROVEN_FAMILY = frozenset({"ruled_out", "disproven"})
+
+
+def _gate_update_payload(
+    update: dict, existing: dict, workdir,
+) -> "tuple[dict, list[str], int]":
+    """Screen one LLM-authored stage-file update payload before it
+    deep-merges into *existing*. Returns
+    ``(cleaned, refused_keys, quarantined)``: *cleaned* is a shallow
+    copy safe to merge, *refused_keys* names dropped top-level keys,
+    *quarantined* counts suppression statuses rewritten to
+    ``ruled_out_unverified``.
+
+    Scope: stage-file update payloads ONLY. The programmatic writers
+    (orchestrator stamping, witness stage, IRIS Tier-1 gate) mutate
+    findings.json directly and never pass through here.
+    """
+    cleaned: dict = {}
+    refused: "list[str]" = []
+    quarantined = 0
+    for key, value in update.items():
+        if key in _UPDATE_IDENTITY_KEYS:
+            if existing.get(key) != value:
+                refused.append(str(key))
+            continue
+        if key in _UPDATE_MECHANICAL_KEYS:
+            refused.append(str(key))
+            continue
+        cleaned[key] = value
+
+    # The receipt is read from the EXISTING finding: mechanical keys
+    # above never enter through the payload, so an update cannot
+    # self-supply the record that authenticates its own rule-out.
+    receipt: "bool | None" = None  # tri-state: None = not yet checked
+
+    def _screen(value: str) -> str:
+        nonlocal receipt, quarantined
+        norm = normalize_status(value)
+        if not isinstance(norm, str):
+            return value
+        if norm in _DISPROVEN_FAMILY:
+            if receipt is None:
+                receipt = _refutation_receipt(existing, workdir)
+            if not receipt:
+                quarantined += 1
+                return "ruled_out_unverified"
+        # Canonical spelling always: a case/spacing variant dodges
+        # every downstream exact-match consumer while the display
+        # layer still renders it.
+        return norm
+
+    for field in ("status", "final_status"):
+        if isinstance(cleaned.get(field), str):
+            cleaned[field] = _screen(cleaned[field])
+    ruling = cleaned.get("ruling")
+    if isinstance(ruling, dict) and isinstance(ruling.get("status"), str):
+        ruling = dict(ruling)
+        ruling["status"] = _screen(ruling["status"])
+        cleaned["ruling"] = ruling
+    return cleaned, refused, quarantined
+
+
+def _refutation_receipt(finding: dict, workdir) -> bool:
+    """True when the finding carries a mechanically verified refutation:
+    a ``witness_execution`` record whose verdict is ``refuted`` AND whose
+    provenance stamp authenticates (the record was minted by the witness
+    machinery for THIS finding in THIS run). The record shape alone is
+    forgeable prose — only the verifying stamp makes it a receipt.
+    """
+    record = finding.get("witness_execution")
+    if not isinstance(record, dict) or record.get("verdict") != "refuted":
+        return False
+    from core.witness.provenance import verify_witness_execution
+    return verify_witness_execution(finding, workdir)
+
+
 def _apply_stage_file(workdir, stage_letter):
-    """Merge stage-X.json into findings.json, then delete the stage file.
+    """Merge stage-X.json into findings.json and record a consumption
+    receipt. Stage inputs are immutable: the stage file stays in place
+    (delegated agents may re-read it) and a byte-identical copy lands
+    in the per-stage archive; the receipt (content hash + timestamp)
+    carries the consume semantics the pre-fix delete provided.
 
     Stage A: stage-a.json contains a full findings container — builds findings.json.
     Stages B-F: stage-X.json contains per-finding updates — merges into findings.json.
 
-    Returns True if a stage file was found and applied.
+    Returns True if a stage file was found and applied. False when the
+    file is absent, empty/invalid, or already consumed with unchanged
+    content (the receipt-metadata equivalent of the pre-fix
+    deleted-after-consumption state). For stage A the skip is
+    additionally conditioned on findings.json still matching the
+    receipted build (``_stage_a_container_unchanged``) — its apply is
+    a reset, and a drifted container must be rebuilt as the delete
+    regime did.
     """
     stage_path = Path(workdir) / f"stage-{stage_letter.lower()}.json"
     if not stage_path.exists():
         return False
 
-    staged = load_json(stage_path)
+    raw = _read_workdir_bytes(stage_path)
+    staged = None
+    if raw is not None:
+        try:
+            # utf-8-sig mirrors core.json.load_json's BOM tolerance.
+            staged = json.loads(raw.decode("utf-8-sig"))
+        except ValueError:
+            staged = None
     if not staged:
         print(f"  ⚠️  stage-{stage_letter.lower()}.json exists but is empty/invalid", file=sys.stderr)
         return False
 
+    digest = hashlib.sha256(raw).hexdigest()
+    if _stage_consumed_unchanged(workdir, stage_path.name, digest) and (
+            stage_letter.upper() != "A"
+            or _stage_a_container_unchanged(workdir, stage_path.name)):
+        # Already-consumed content never re-applies — the exact skip
+        # the pre-fix delete provided (the file was simply gone),
+        # expressed as receipt metadata so re-readers and post-hoc
+        # audits still find the file in place. Stage A additionally
+        # requires an undrifted findings.json: its apply is a reset,
+        # so a container carrying later-stage merges (shared --out
+        # re-run) rebuilds clean instead of skipping.
+        print(f"  stage-{stage_letter.lower()}.json already consumed "
+              f"(content unchanged since receipt) — merge skipped, "
+              f"file kept in place")
+        return False
+
     findings_path = Path(workdir) / "findings.json"
+    findings_digest: "str | None" = None
 
     if stage_letter.upper() == "A":
         # Build: stage-a.json IS the findings container
@@ -404,6 +1458,13 @@ def _apply_stage_file(workdir, stage_letter):
         container = create_empty_findings("A", target_path, staged.get("vuln_type_focus"))
         container["findings"] = staged.get("findings", [])
         _save_artifact(findings_path, container)
+        # Hash the container as built: the stage-A skip is valid only
+        # while findings.json still matches this state (an unreadable
+        # read-back records nothing — the skip then re-applies, the
+        # reset-biased direction).
+        built = _read_workdir_bytes(findings_path)
+        if built is not None:
+            findings_digest = hashlib.sha256(built).hexdigest()
         count = len(container["findings"])
         print(f"  Built findings.json from stage-a.json: {count} findings")
     else:
@@ -420,6 +1481,21 @@ def _apply_stage_file(workdir, stage_letter):
         by_id = {f["id"]: f for f in container.get("findings", [])
                  if isinstance(f, dict) and f.get("id")}
         applied = 0
+        refused = 0
+        payload_quarantined = 0
+
+        def _gated_merge(finding, update_dict):
+            nonlocal payload_quarantined
+            cleaned, refused_keys, quarantined = _gate_update_payload(
+                update_dict, finding, workdir)
+            if refused_keys:
+                print(f"  WARNING: update for "
+                      f"{_sft(str(finding.get('id')), max_len=120)} tried "
+                      f"to set protected key(s) — refused: "
+                      f"{_sft(', '.join(sorted(refused_keys)), max_len=200)}",
+                      file=sys.stderr)
+            payload_quarantined += quarantined
+            _deep_merge(finding, cleaned)
 
         if "updates" in staged and isinstance(staged["updates"], dict):
             # Preferred format: {"updates": {"FIND-001": {fields...}}}
@@ -428,26 +1504,32 @@ def _apply_stage_file(workdir, stage_letter):
                     continue
                 finding = by_id.get(finding_id)
                 if finding:
-                    _deep_merge(finding, update_dict)
+                    _gated_merge(finding, update_dict)
                     applied += 1
                 else:
-                    print(f"  WARNING: {finding_id} not found in findings.json — skipped", file=sys.stderr)
+                    refused += 1
+                    print(f"  WARNING: {_sft(str(finding_id), max_len=120)} not found in findings.json — skipped", file=sys.stderr)
 
         elif "findings" in staged and isinstance(staged["findings"], list):
-            # Fallback: Claude wrote a findings array — merge by ID, don't replace
+            # Fallback: Claude wrote a findings array — merge by ID.
+            # Update stages (B-F) never grow the inventory: an unknown
+            # id here is a whole-finding injection channel (a
+            # fabricated finding, verdict fields included, riding a
+            # stage file into findings.json after the inventory was
+            # fixed at Stage A), so it is refused, not appended.
             for staged_finding in staged["findings"]:
+                if not isinstance(staged_finding, dict):
+                    continue
                 fid = staged_finding.get("id")
                 if not fid:
                     continue
                 existing = by_id.get(fid)
                 if existing:
-                    _deep_merge(existing, staged_finding)
+                    _gated_merge(existing, staged_finding)
                     applied += 1
                 else:
-                    # New finding not in findings.json — append
-                    container["findings"].append(staged_finding)
-                    by_id[fid] = staged_finding
-                    applied += 1
+                    refused += 1
+                    print(f"  WARNING: {_sft(str(fid), max_len=120)} not found in findings.json — refused (update stages cannot add findings)", file=sys.stderr)
 
         # Propagate ruling.status → status so get_display_status
         # picks up the Stage D verdict instead of the stale Stage A
@@ -466,40 +1548,90 @@ def _apply_stage_file(workdir, stage_letter):
                 "confirmed": "confirmed",
                 "exploitable": "exploitable",
             }
+            quarantined = 0
             for finding in container.get("findings", []):
                 ruling = finding.get("ruling")
                 if isinstance(ruling, dict):
                     rs = ruling.get("status", "")
-                    if rs in ("confirmed", "ruled_out", "exploitable"):
+                    rs = ((normalize_status(rs) or "")
+                          if isinstance(rs, str) else "")
+                    if rs and ruling.get("status") != rs:
+                        # Canonical spelling: a case/spacing variant
+                        # dodges every exact-match consumer downstream
+                        # while the display layer still renders it.
+                        ruling["status"] = rs
+                    if (rs in _DISPROVEN_FAMILY
+                            and not _refutation_receipt(finding, workdir)):
+                        # An LLM-tier rule-out with no mechanical
+                        # refutation receipt is a suppression claim
+                        # nothing vouches for — quarantine it instead
+                        # of propagating: ruled_out_unverified carries
+                        # no suppression authority downstream and
+                        # stays witness-eligible (a witness run is
+                        # exactly what could upgrade it to a receipted
+                        # rule-out).
+                        ruling["status"] = "ruled_out_unverified"
+                        finding["status"] = "ruled_out_unverified"
+                        quarantined += 1
+                        continue
+                    if rs in ("confirmed", "ruled_out", "exploitable",
+                              "ruled_out_unverified"):
                         finding["status"] = rs
                     final = _RULING_TO_FINAL.get(rs)
                     if final:
                         finding["final_status"] = final
+            if quarantined:
+                print(f"  {quarantined} rule-out(s) without a verified "
+                      f"refutation record quarantined as "
+                      f"ruled_out_unverified")
         for finding in container.get("findings", []):
             # Empty cvss_vector fails schema pattern; normalise to None
             if finding.get("cvss_vector") == "":
                 finding["cvss_vector"] = None
 
-        # Copy top-level metadata (but NOT findings or updates — those are handled above)
+        # Copy top-level metadata — allowlisted per stage. The stage
+        # file is LLM-authored; letting it set arbitrary container
+        # keys meant it could overwrite target_path (redirecting every
+        # later path resolution) or plant report-facing prose.
+        allowed = CONTAINER_COPY_ALLOWLIST.get(stage_letter.upper(),
+                                               frozenset())
+        refused_keys = []
         for key, value in staged.items():
-            if key not in ("stage", "updates", "findings"):
+            if key in _STAGE_STRUCTURAL_KEYS:
+                continue
+            if key in allowed:
                 container[key] = value
+            else:
+                refused_keys.append(str(key))
+        if refused_keys:
+            print(f"  WARNING: stage-{stage_letter.lower()}.json "
+                  f"container key(s) refused (not copyable from this "
+                  f"stage): "
+                  f"{_sft(', '.join(sorted(refused_keys)), max_len=300)}",
+                  file=sys.stderr)
 
         container["stage"] = staged.get("stage", stage_letter.upper())
         _save_artifact(findings_path, container)
-        print(f"  Merged stage-{stage_letter.lower()}.json: {applied} findings updated")
+        if payload_quarantined:
+            print(f"  {payload_quarantined} suppression status(es) "
+                  f"without a verified refutation record quarantined "
+                  f"as ruled_out_unverified")
+        summary = f"  Merged stage-{stage_letter.lower()}.json: {applied} findings updated"
+        if refused:
+            summary += f" ({refused} unknown finding id(s) refused)"
+        print(summary)
 
-    # Delete the stage file. Guard the unlink — pre-fix
-    # `stage_path.unlink()` raised `FileNotFoundError` if the
-    # file disappeared between the read above and here (rare
-    # but real: parallel /project clean, operator manually
-    # rm'ing the file mid-stage, an aborted-and-restarted
-    # validate run that moved the file). The exception leaked
-    # and crashed the stage-merge call, leaving the operator
-    # with a partial state where the merge happened but the
-    # cleanup didn't. Subsequent stage retries hit the same
-    # condition. `missing_ok=True` makes the unlink idempotent.
-    stage_path.unlink(missing_ok=True)
+    # Consume-by-copy: the stage file stays in place (delegated
+    # agents re-read their stage output after the next prep runs;
+    # deleting it broke them and erased the post-hoc audit trail).
+    # The receipt's content hash is what now prevents the same
+    # content from merging twice; the archive copy preserves the
+    # exact bytes this merge consumed.
+    archived_to = _archive_stage_input(
+        workdir, stage_path.name, raw, digest)
+    _record_stage_receipt(workdir, stage_path.name, stage_letter,
+                          digest, len(raw), archived_to,
+                          findings_sha256=findings_digest)
     return True
 
 
@@ -646,6 +1778,11 @@ def _build_standalone_pocs(target, build_dir):
         cmd = [compiler] + _POC_GCC_FLAGS + ["-o", str(output), str(source)]
         with contextlib.suppress(Exception):
             if _sandbox_run is not None:
+                # env_caller_filtered: _safe_env comes from
+                # get_safe_env() (or the equivalent inline allowlist
+                # fallback above), so the sandbox's "unfiltered caller
+                # env" warning is contradictory noise — and it fires
+                # once per compile straight into the stage's stderr.
                 result = _sandbox_run(
                     cmd,
                     target=str(target.resolve()),
@@ -653,25 +1790,33 @@ def _build_standalone_pocs(target, build_dir):
                     block_network=True,
                     capture_output=True, text=True, timeout=30,
                     env=_safe_env,
+                    env_caller_filtered=True,
                 )
             else:
                 result = _sp.run(cmd, capture_output=True, text=True, timeout=30,
                                 check=False, env=_safe_env)
+            # Compiler stderr quotes target-source bytes and the file
+            # names are target-derived — escape before the terminal.
             if result.returncode == 0:
-                print(f"  Built: {source.name} -> {output.name}")
+                print(f"  Built: {_sft(source.name, max_len=120)} -> "
+                      f"{_sft(output.name, max_len=120)}")
                 if result.stderr.strip():
                     for line in result.stderr.strip().splitlines()[:5]:
-                        print(f"    warning: {line}", file=sys.stderr)
+                        print(f"    warning: {_sft(line, max_len=200)}",
+                              file=sys.stderr)
                 built += 1
             else:
-                print(f"  Build failed: {source.name} ({result.stderr.strip()[:80]})", file=sys.stderr)
+                print(f"  Build failed: {_sft(source.name, max_len=120)} "
+                      f"({_sft(result.stderr.strip(), max_len=80)})",
+                      file=sys.stderr)
 
     if built:
         print(f"PoC binaries: {built}/{len(sources)} in {build_dir}")
 
 
 def prepare_A(workdir, target=None):
-    checklist = load_json(Path(workdir) / "checklist.json")
+    from core.inventory import read_checklist
+    checklist = read_checklist(Path(workdir))
     existing = load_json(Path(workdir) / "findings.json")
     if not checklist:
         print("✗ checklist.json not found", file=sys.stderr)
@@ -691,7 +1836,10 @@ def prepare_A(workdir, target=None):
     if priority_targets:
         print(f"Priority targets from /understand: {len(priority_targets)} unchecked flows")
         for pt in priority_targets:
-            print(f"  {pt.get('entry_point')} → {pt.get('sink')}: {pt.get('missing_boundary')}")
+            # Bridge fields are LLM-authored (/understand output).
+            print(f"  {_sft(str(pt.get('entry_point')), max_len=120)} → "
+                  f"{_sft(str(pt.get('sink')), max_len=120)}: "
+                  f"{_sft(str(pt.get('missing_boundary')), max_len=200)}")
 
     # Surface prior SAGE validation memories (stage-0 recall dump).
     # Hint-only priors per core.sage.hooks.recall_context_for_validation:
@@ -712,9 +1860,11 @@ def prepare_A(workdir, target=None):
             f"against current code"
         )
         for row in verified[:8]:
+            # MAC verification proves provenance, not byte hygiene —
+            # stored memories quote analysed-target text.
             content = " ".join(str(row.get("content", "")).split())[:160]
             if content:
-                print(f"  [prior] {content}")
+                print(f"  [prior] {_sft(content, max_len=200)}")
 
     # Discover existing binaries and build PoCs for standalone C files
     if target:
@@ -759,8 +1909,9 @@ def prepare_A(workdir, target=None):
                   f"(full map: {map_path})")
             _MAP_PRINT_CAP = 20
             for src, entry in list(mapped.items())[:_MAP_PRINT_CAP]:
-                parts = [f"{k}={v}" for k, v in entry.items()]
-                print(f"  {src}: {', '.join(parts)}")
+                parts = [f"{k}={_sft(str(v), max_len=120)}"
+                         for k, v in entry.items()]
+                print(f"  {_sft(str(src), max_len=200)}: {', '.join(parts)}")
             if len(mapped) > _MAP_PRINT_CAP:
                 print(f"  ... {len(mapped) - _MAP_PRINT_CAP} more mapped "
                       f"files in {map_path}")
@@ -786,7 +1937,8 @@ def prepare_B(workdir, target=None):
         vt = finding.get("vuln_type", "")
         normalised = normalise_vuln_type(vt)
         if normalised != vt:
-            print(f"  Normalised: {finding.get('id', '?')} vuln_type '{vt}' -> '{normalised}'")
+            print(f"  Normalised: {_sft(str(finding.get('id', '?')), max_len=120)} "
+                  f"vuln_type '{_sft(str(vt), max_len=64)}' -> '{normalised}'")
             finding["vuln_type"] = normalised
 
     # --- Dedup flag ---
@@ -807,19 +1959,26 @@ def prepare_B(workdir, target=None):
             # An id-less f1 can't be referenced as the duplicate anchor.
             if (same_func or nearby) and f1.get("id"):
                 f2["dedup_flag"] = f"potential_dup:{f1['id']}"
-                print(f"  Dedup flag: {f2.get('id', '?')} may duplicate {f1['id']}")
+                print(f"  Dedup flag: {_sft(str(f2.get('id', '?')), max_len=120)} "
+                      f"may duplicate {_sft(str(f1['id']), max_len=120)}")
 
     # --- Carry-forward check (Stage A) ---
     for finding in findings:
         if finding.get("status") == "disproven":
             continue
+        # Diagnostics tolerate id-less findings (the merge path does,
+        # so the WARN branch is exactly where one shows up) and
+        # non-dict summaries — findings.json is LLM-authored and
+        # schema validation is advisory. A KeyError here wedges the
+        # pipeline AFTER the stage file was consumed and deleted.
+        fid = finding.get("id", "?")
         sa = finding.get("stage_a_summary")
         if not sa:
-            print(f"  WARN: {finding['id']} missing stage_a_summary — add it", file=sys.stderr)
-        elif not all(k in sa for k in ("confidence", "status")):
-            print(f"  WARN: {finding['id']} stage_a_summary incomplete — needs confidence, status", file=sys.stderr)
+            print(f"  WARN: {_sft(str(fid), max_len=120)} missing stage_a_summary — add it", file=sys.stderr)
+        elif not isinstance(sa, dict) or not all(k in sa for k in ("confidence", "status")):
+            print(f"  WARN: {_sft(str(fid), max_len=120)} stage_a_summary incomplete — needs confidence, status", file=sys.stderr)
         if not finding.get("origin"):
-            print(f"  WARN: {finding['id']} missing origin field", file=sys.stderr)
+            print(f"  WARN: {_sft(str(fid), max_len=120)} missing origin field", file=sys.stderr)
 
     # --- ast_view enrichment ---
     # Attach a compact per-function AST view (signature, calls
@@ -912,8 +2071,14 @@ def prepare_B(workdir, target=None):
     for finding in findings:
         if finding.get("status") == "disproven":
             continue
-        sa = finding.get("stage_a_summary", {})
-        poc = finding.get("poc", {})
+        # poc / stage_a_summary may be bare strings (LLM-authored,
+        # advisory schema) — same guard as _finding_poc_payload.
+        sa = finding.get("stage_a_summary")
+        if not isinstance(sa, dict):
+            sa = {}
+        poc = finding.get("poc")
+        if not isinstance(poc, dict):
+            poc = {}
         fid = finding.get("id")
         if not fid:
             continue
@@ -995,6 +2160,14 @@ def prepare_B(workdir, target=None):
         _save_artifact(wdir / "attack-tree.json", {"root": "ROOT", "nodes": []})
     if not (wdir / "disproven.json").exists():
         _save_artifact(wdir / "disproven.json", {"disproven": []})
+
+    # Bootstrap/gate facts (PHP targets): per-finding
+    # bootstrap_context from the include graph's per-entry
+    # environment walk, so Stage B verifies the pre-derived gate
+    # facts (citing lines) before reasoning past them. Advisory —
+    # never a status writer. Silent skip when no walk was derived.
+    _attach_bootstrap_context(workdir, data)
+
     _save_findings(workdir, data)
 
     # SMT feasibility over bridge-imported paths BEFORE Stage B runs,
@@ -1084,14 +2257,16 @@ def prepare_C(workdir, target=None):
         print("✗ findings.json not found — cannot run stage C", file=sys.stderr)
         sys.exit(1)
     for finding in _active(findings_data):
+        fid = finding.get("id", "?")
         sb = finding.get("stage_b_summary")
         if not sb:
-            print(f"  WARN: {finding['id']} missing stage_b_summary — add it", file=sys.stderr)
-        elif not all(k in sb for k in ("hypothesis_id", "hypothesis_status", "proximity")):
-            print(f"  WARN: {finding['id']} stage_b_summary incomplete", file=sys.stderr)
+            print(f"  WARN: {_sft(str(fid), max_len=120)} missing stage_b_summary — add it", file=sys.stderr)
+        elif not isinstance(sb, dict) or not all(k in sb for k in ("hypothesis_id", "hypothesis_status", "proximity")):
+            print(f"  WARN: {_sft(str(fid), max_len=120)} stage_b_summary incomplete", file=sys.stderr)
 
     # --- Pre-check findings against inventory ---
-    checklist = load_json(Path(workdir) / "checklist.json")
+    from core.inventory import read_checklist
+    checklist = read_checklist(Path(workdir))
     if not checklist:
         print("✗ checklist.json not found — cannot run stage C", file=sys.stderr)
         sys.exit(1)
@@ -1112,13 +2287,15 @@ def prepare_C(workdir, target=None):
             inv = inv_files.get(normalised) if normalised else None
         if inv is None:
             finding["checklist_verified"] = False
-            print(f"  C0 FAIL: {finding['id']} — file '{fpath}' not in inventory", file=sys.stderr)
+            print(f"  C0 FAIL: {_sft(str(finding.get('id', '?')), max_len=120)} — "
+                  f"file '{_sft(str(fpath), max_len=200)}' not in inventory", file=sys.stderr)
         # "line" is LLM-authored (advisory schema): a non-int value
         # can't be range-checked, so it just skips this comparison
         # instead of raising a str/int TypeError.
         elif isinstance(fline, int) and fline > inv.get("lines", 0):
             finding["checklist_verified"] = False
-            print(f"  C0 FAIL: {finding['id']} — line {fline} > file length {inv['lines']}", file=sys.stderr)
+            print(f"  C0 FAIL: {_sft(str(finding.get('id', '?')), max_len=120)} — "
+                  f"line {fline} > file length {inv['lines']}", file=sys.stderr)
         else:
             finding["checklist_verified"] = True
 
@@ -1129,6 +2306,19 @@ def prepare_C(workdir, target=None):
     # missing spatch, or absent prereqs rules dir — no operator noise
     # when prerequisites aren't met.
     _run_cocci_prereqs(workdir, findings_data, target=target)
+
+    # --- Include-graph facts (PHP targets) ---
+    # Hint-tier includer-set evidence for the reachability check,
+    # census-qualified. Advisory like cocci_prereqs — never decides
+    # finding status. Silent skip when no graph was derived.
+    _attach_include_facts(workdir, findings_data)
+
+    # --- Gadget-oracle facts (PHP targets, CWE-502 shapes) ---
+    # Hint-tier gadget-chain evidence, census-qualified. Advisory —
+    # never decides finding status. Silent skip when no artifact or
+    # when the artifact was derived from a different target tree
+    # (one-target rule, fail-closed).
+    _attach_gadget_facts(workdir, findings_data, target=target)
 
     _save_findings(workdir, findings_data)
     failed = sum(1 for f in findings_data["findings"] if f.get("checklist_verified") is False)
@@ -1184,13 +2374,205 @@ def _run_cocci_prereqs(workdir, findings_data, target=None):
                 and result["checks"].get("function_exists") is True
                 and result["checks"].get("function_has_callers") is False):
             flagged += 1
+            # finding id and function name are target/LLM-derived —
+            # escape + bound before they reach the operator terminal.
             print(
-                f"  C-cocci WARN: {finding['id']} — function "
-                f"{result['details'].get('function')!r} has no callers "
+                f"  C-cocci WARN: {_sft(str(finding.get('id', '?')), max_len=64)} — function "
+                f"{_sft(repr(result['details'].get('function')), max_len=128)} has no callers "
                 f"in tree (orphan-static-helper or dead code)"
             )
     total = len(findings_data.get("findings", []))
     print(f"Cocci structural pre-check: {flagged} orphan-fn warnings across {total} findings")
+
+
+def _attach_include_facts(workdir, findings_data):
+    """Stage C includer-set attachment from include-graph.json.
+
+    Annotates each finding whose file has an include-graph entry with
+    ``include_facts``: the file's role, its includer set, and the
+    MANDATORY two-component census + qualifier (an includer-set fact
+    without its completeness qualifier is the dishonest shape the
+    include-graph design forbids). Hint-tier, advisory — the Stage C
+    LLM consults it for the reachability check; it never decides
+    finding status.
+    """
+    try:
+        from core.inventory.include_graph import (
+            include_facts_for_file,
+            load_include_graph,
+        )
+    except ImportError:
+        return
+    graph = load_include_graph(workdir)
+    if not graph:
+        return
+    graph_paths = list(graph.get("files") or {})
+    graph_target = (graph.get("target_path")
+                    if isinstance(graph.get("target_path"), str) else "")
+    attached = 0
+    for finding in findings_data.get("findings", []):
+        if finding.get("status") == "disproven":
+            continue
+        fpath = finding.get("file", "")
+        if not isinstance(fpath, str) or not fpath:
+            continue
+        facts = include_facts_for_file(graph, fpath)
+        if facts is None:
+            key = _graph_key_for_finding(graph_paths, graph_target,
+                                         fpath)
+            if key is not None:
+                facts = include_facts_for_file(graph, key)
+        if facts is None:
+            continue
+        finding["include_facts"] = facts
+        attached += 1
+    if attached:
+        print(f"Include-graph facts: attached to {attached} finding(s) "
+              "(hint-tier, census-qualified)")
+
+
+#: Finding shapes the gadget facts attach to: the deserialization
+#: class, or prose naming its mechanism. Bounded, case-insensitive.
+_GADGET_FINDING_RE = re.compile(
+    r"cwe-?502|unseriali[sz]e|deseriali[sz]at|gadget|object\s+injection",
+    re.IGNORECASE,
+)
+
+
+def _attach_gadget_facts(workdir, findings_data, target=None):
+    """Stage C gadget-surface attachment from gadget-chains.json.
+
+    Annotates each deserialization-shaped finding with
+    ``gadget_facts``: the oracle's chains touching the finding's file
+    (or the tree-level chain summary), its unserialize sites, and the
+    MANDATORY completeness qualifier (an absence quote without its
+    census is the dishonest shape the oracle exists to replace).
+    Hint-tier, advisory — the Stage C LLM consults it as evidence;
+    it never decides finding status.
+
+    One-target rule, fail-closed: a shared ``--out`` can hold an
+    artifact derived from a DIFFERENT tree, and its chains/absence
+    census must never attach to this run's findings. No usable
+    ``target`` (or a mismatch) skips the attachment entirely.
+    """
+    try:
+        from core.analysis.gadget_oracle import (
+            gadget_facts_for_file,
+            load_gadget_report,
+            report_matches_target,
+        )
+    except ImportError:
+        return
+    report = load_gadget_report(workdir)
+    if not report:
+        return
+    if not report_matches_target(report, target):
+        return
+    report_target = (report.get("target_path")
+                     if isinstance(report.get("target_path"), str)
+                     else "")
+    known_files = {
+        c.get("file") for c in (report.get("chains") or [])
+        if isinstance(c, dict)
+    } | {
+        s.get("file") for s in (report.get("unserialize_sites") or [])
+        if isinstance(s, dict)
+    }
+    known_files.discard(None)
+    attached = 0
+    for finding in findings_data.get("findings", []):
+        if finding.get("status") == "disproven":
+            continue
+        probe = " ".join(
+            str(finding.get(k, ""))
+            for k in ("cwe", "type", "title", "description", "rule_id")
+        )
+        if not _GADGET_FINDING_RE.search(probe):
+            continue
+        fpath = finding.get("file", "")
+        if not isinstance(fpath, str) or not fpath:
+            continue
+        key = _graph_key_for_finding(
+            sorted(str(f) for f in known_files), report_target, fpath,
+        )
+        if key is None and fpath.replace("\\", "/").startswith("/"):
+            # Foreign absolute path — refuse rather than attaching
+            # another tree's summary (the include-facts discipline).
+            continue
+        facts = gadget_facts_for_file(report, key if key else fpath)
+        if facts is None:
+            continue
+        finding["gadget_facts"] = facts
+        attached += 1
+    if attached:
+        print(f"Gadget-oracle facts: attached to {attached} finding(s) "
+              "(hint-tier, census-qualified)")
+
+
+def _graph_key_for_finding(graph_paths, graph_target, fpath):
+    """Resolve an LLM-authored finding path to a graph key without
+    guessing. Absolute paths resolve ONLY via the graph's own
+    target prefix (a bare tail-endswith wrong-attached subdir
+    siblings' facts); relative shortened paths accept only a UNIQUE
+    key whose own tail is the finding path, component-aligned from
+    the key's left."""
+    fp = fpath.replace("\\", "/")
+    if fp.startswith("/"):
+        if graph_target:
+            root = graph_target.rstrip("/")
+            if fp.startswith(root + "/"):
+                return fp[len(root) + 1:]
+        return None
+    matches = [k for k in graph_paths
+               if k == fp or k.endswith("/" + fp)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _attach_bootstrap_context(workdir, findings_data):
+    """Stage B bootstrap/gate facts from the environment walk.
+
+    Annotates each finding whose file the walk knows with
+    ``bootstrap_context``: the entry classes reaching it (with
+    receipts), the guaranteed-prefix files shared by every
+    guaranteed-reaching class, and the MANDATORY census + qualifier
+    (the producer refuses to build the object at all when the graph
+    census fails validation). Hint-tier inputs to Stage B's gate
+    verification — never a status writer; disproven findings are
+    skipped.
+    """
+    try:
+        from core.inventory.include_graph import (
+            bootstrap_context_for_file,
+            load_include_graph,
+        )
+    except ImportError:
+        return
+    graph = load_include_graph(workdir)
+    if not graph or not isinstance(graph.get("walk"), dict):
+        return
+    graph_paths = list(graph.get("files") or {})
+    graph_target = (graph.get("target_path")
+                    if isinstance(graph.get("target_path"), str) else "")
+    attached = 0
+    for finding in findings_data.get("findings", []):
+        if finding.get("status") == "disproven":
+            continue
+        fpath = finding.get("file", "")
+        if not isinstance(fpath, str) or not fpath:
+            continue
+        ctx = bootstrap_context_for_file(graph, fpath)
+        if ctx is None:
+            key = _graph_key_for_finding(graph_paths, graph_target,
+                                         fpath)
+            if key is not None:
+                ctx = bootstrap_context_for_file(graph, key)
+        if ctx is None:
+            continue
+        finding["bootstrap_context"] = ctx
+        attached += 1
+    if attached:
+        print(f"Bootstrap context: attached to {attached} finding(s) "
+              "(hint-tier gate facts, census-qualified)")
 
 
 # ---------------------------------------------------------------------------
@@ -1222,14 +2604,15 @@ def prepare_D(workdir, target=None):
     for finding in data["findings"]:
         if finding.get("status") == "disproven":
             continue
+        fid = finding.get("id", "?")
         sc = finding.get("stage_c_summary")
         if not sc:
-            print(f"  WARN: {finding['id']} missing stage_c_summary — add it", file=sys.stderr)
-        elif not isinstance(sc.get("checks"), dict):
-            print(f"  WARN: {finding['id']} stage_c_summary.checks must be a dict "
+            print(f"  WARN: {_sft(str(fid), max_len=120)} missing stage_c_summary — add it", file=sys.stderr)
+        elif not isinstance(sc, dict) or not isinstance(sc.get("checks"), dict):
+            print(f"  WARN: {_sft(str(fid), max_len=120)} stage_c_summary.checks must be a dict "
                   f"with keys: {REQUIRED_CHECKS}", file=sys.stderr)
         elif not all(k in sc["checks"] for k in REQUIRED_CHECKS):
-            print(f"  WARN: {finding['id']} stage_c_summary.checks incomplete", file=sys.stderr)
+            print(f"  WARN: {_sft(str(fid), max_len=120)} stage_c_summary.checks incomplete", file=sys.stderr)
 
     # Count the Stage C verdict from stage_c_summary.passed — that is
     # where the stage-c.json contract (STAGE_SCHEMA_HINTS["C"]) puts
@@ -1242,11 +2625,15 @@ def prepare_D(workdir, target=None):
     # fallback for producers (e.g. the Python orchestrator) that set
     # the verdict there instead.
     def _c_verdict(f):
-        summary = f.get("stage_c_summary") or {}
-        if isinstance(summary.get("passed"), bool):
+        # Both summaries may be bare strings (LLM-authored, advisory
+        # schema) — only dict shapes carry a verdict.
+        summary = f.get("stage_c_summary")
+        if isinstance(summary, dict) and isinstance(
+                summary.get("passed"), bool):
             return summary["passed"]
-        sanity = f.get("sanity_check") or {}
-        if isinstance(sanity.get("passed"), bool):
+        sanity = f.get("sanity_check")
+        if isinstance(sanity, dict) and isinstance(
+                sanity.get("passed"), bool):
             return sanity["passed"]
         return None
 
@@ -1266,8 +2653,8 @@ def prepare_D(workdir, target=None):
     # point. D-1's skill section reads the richer signal first;
     # the simpler flag is kept for skills that haven't been
     # updated.
-    inventory_path = Path(workdir) / "checklist.json"
-    inventory = load_json(inventory_path) if inventory_path.is_file() else None
+    from core.inventory import read_checklist
+    inventory = read_checklist(Path(workdir)) or None
     try:
         from core.inventory.fixture_detection import detect_fixture
     except ImportError:
@@ -1293,19 +2680,28 @@ def prepare_D(workdir, target=None):
         if finding["test_code_flag"]:
             label = finding.get("likely_test_harness", "?")
             print(
-                f"  D-1 FLAG: {finding['id']} test path "
-                f"(likely_test_harness={label}): {fpath}"
+                f"  D-1 FLAG: {_sft(str(finding.get('id', '?')), max_len=120)} "
+                f"test path (likely_test_harness={label}): "
+                f"{_sft(str(fpath), max_len=200)}"
             )
 
     # --- Evidence card assembly ---
     for finding in data.get("findings", []):
         if finding.get("status") == "disproven":
             continue
+        # Bare-string summaries carry no evidence fields (LLM-
+        # authored, advisory schema) — treat as absent.
         a = finding.get("stage_a_summary", {})
         b = finding.get("stage_b_summary", {})
         c = finding.get("stage_c_summary", {})
+        a = a if isinstance(a, dict) else {}
+        b = b if isinstance(b, dict) else {}
+        c = c if isinstance(c, dict) else {}
         if a or b or c:
-            finding.setdefault("ruling", {})
+            # A non-dict ruling (bare LLM string) is no ruling; replace
+            # rather than crash on the item assignment below.
+            if not isinstance(finding.get("ruling"), dict):
+                finding["ruling"] = {}
             finding["ruling"]["evidence_synthesis"] = {
                 "stage_a_confidence": a.get("confidence", ""),
                 "stage_b_hypothesis": b.get("hypothesis_status", "none"),
@@ -1314,7 +2710,15 @@ def prepare_D(workdir, target=None):
             }
 
     # --- Guard-dominance refuter (P23, pre-LLM, warm CPG only) ---
-    _run_guard_dominance(workdir, target, data)
+    # Best-effort: the refuter is an enrichment. A crash here (odd
+    # finding shape, joern hiccup) previously killed Stage-D prep
+    # AFTER evidence-card assembly but BEFORE _save_findings — losing
+    # the whole run's evidence synthesis and test-filter flags.
+    try:
+        _run_guard_dominance(workdir, target, data)
+    except Exception as exc:  # noqa: BLE001 — enrichment must not kill the save
+        print(f"WARNING: guard-dominance refuter skipped: {_sft(str(exc), max_len=300)}",
+              file=sys.stderr)
 
     _save_findings(workdir, data)
     flagged = sum(1 for f in data["findings"] if f.get("test_code_flag"))
@@ -1486,7 +2890,12 @@ def _discover_executables(target):
         except Exception:  # noqa: BLE001, S110 — observability must never break the fail-closed path
             pass
     result = {}
-    with contextlib.suppress(Exception):
+    # Best-effort, but never SILENT: a swallowed discovery failure
+    # (find timeout on a big tree, missing binary, permission error)
+    # returns {} and every memory-corruption finding gets stamped
+    # "stage_e: skipped, no binary found" — the operator reads
+    # routine attrition where discovery itself failed.
+    try:
         proc = _sp.run(
             ["find", target, "-executable", "-type", "f"],
             capture_output=True, text=True, timeout=30, check=False, env=_env
@@ -1529,7 +2938,9 @@ def _discover_executables(target):
             # bare "38 executables" on a source-only tree hid that
             # every one was a script / autotools helper.
             _SKIP_PRINT_CAP = 10
-            shown = ", ".join(sorted(skipped_non_binary)[:_SKIP_PRINT_CAP])
+            # target-derived file names
+            shown = _sft(", ".join(sorted(skipped_non_binary)[:_SKIP_PRINT_CAP]),
+                         max_len=300)
             extra = len(skipped_non_binary) - _SKIP_PRINT_CAP
             print(
                 f"  Skipped {len(skipped_non_binary)} exec-bit "
@@ -1552,6 +2963,22 @@ def _discover_executables(target):
                     file=sys.stderr,
                 )
             result[name] = paths[0]
+    except _sp.TimeoutExpired:
+        print(
+            "  WARN: binary discovery timed out (find exceeded 30s on "
+            f"{target}) — Stage E will report 'no binary found' for "
+            "every finding; pass --binary or narrow the target",
+            file=sys.stderr,
+        )
+        return {}
+    except Exception as e:  # noqa: BLE001 — discovery is best-effort; failures degrade, loudly
+        print(
+            "  WARN: binary discovery failed "
+            f"({type(e).__name__}: {_sft(str(e), max_len=300)}) — Stage E will report "
+            "'no binary found' for every finding",
+            file=sys.stderr,
+        )
+        return {}
     return result
 
 
@@ -1579,24 +3006,29 @@ def _any_elf(executables):
     return any_elf(executables)
 
 
-def _env_build_on_demand(workdir, target, data, build):
+def _env_build_on_demand(workdir, target, data, build,
+                         build_command=None):
     """Delegates to the importable core (also consumed by the Python
     orchestrator's Stage E); returns {rel: (path, sha256)}."""
     from packages.exploitability_validation.env_build_stage import (
         env_build_on_demand,
     )
-    return env_build_on_demand(workdir, target, data, build, log=print)
+    return env_build_on_demand(workdir, target, data, build,
+                               build_command=build_command, log=print)
 
 
-def _run_mitigation_matrix(workdir, target, data, build):
+def _run_mitigation_matrix(workdir, target, data, build,
+                           build_command=None):
     from packages.exploitability_validation.env_build_stage import (
         mitigation_matrix_hook,
     )
-    mitigation_matrix_hook(workdir, target, data, build, log=print)
+    mitigation_matrix_hook(workdir, target, data, build,
+                           build_command=build_command, log=print)
 
 
 def _discover_and_match_binaries(workdir, target, data, build=None,
-                                 mitigation_matrix=False):
+                                 mitigation_matrix=False,
+                                 build_command=None):
     """Discover binaries and match to findings."""
 
     executables = _discover_executables(target)
@@ -1612,7 +3044,8 @@ def _discover_and_match_binaries(workdir, target, data, build=None,
         # "no executable file exists" (adversarial-review finding: an
         # executable configure script silently disabled the feature
         # on typical source trees).
-        env_built = _env_build_on_demand(workdir, target, data, build)
+        env_built = _env_build_on_demand(workdir, target, data, build,
+                                         build_command)
         if env_built:
             # rel-keyed (stems collide: bin/app vs test/app); the
             # matching map below keys by stem only for UNIQUE stems.
@@ -1621,7 +3054,8 @@ def _discover_and_match_binaries(workdir, target, data, build=None,
                 stem = Path(rel).stem
                 if stem in executables:
                     print(f"  note: multiple env artifacts share stem "
-                          f"{stem!r}; stem matching disabled for it")
+                          f"{_sft(repr(stem), max_len=120)}; "
+                          f"stem matching disabled for it")
                     executables.pop(stem)
                 else:
                     executables[stem] = str(path)
@@ -1659,7 +3093,7 @@ def _discover_and_match_binaries(workdir, target, data, build=None,
     for finding in data.get("findings", []):
         if finding.get("status") == "disproven":
             continue
-        if finding.get("ruling", {}).get("status") == "ruled_out":
+        if _ruling(finding).get("status") == "ruled_out":
             continue
         if finding.get("vuln_type", "") not in MEMORY_CORRUPTION_TYPES:
             finding.setdefault("feasibility", {})["status"] = "not_applicable"
@@ -1679,33 +3113,45 @@ def _discover_and_match_binaries(workdir, target, data, build=None,
                 else:
                     finding.setdefault("feasibility", {})[
                         "binary_path"] = bp
-                print(f"  {finding['id']}: matched -> {bp}")
+                print(f"  {_sft(str(finding.get('id', '?')), max_len=120)}: matched -> {_sft(str(bp), max_len=200)}")
                 matched += 1
         if not bp:
             reason = "no binary found"
             finding.setdefault("feasibility", {})["status"] = "skipped"
             finding["stage_e_summary"] = {"status": "skipped", "reason": reason}
-            skipped.append((finding["id"], reason))
+            skipped.append((finding.get("id", "?"), reason))
 
     _save_findings(workdir, data)
 
     groups = {}
     for f in data.get("findings", []):
-        bp = f.get("feasibility", {}).get("binary_path", "")
+        # findings.json is LLM-authored and schema validation is
+        # advisory — an id-less finding that acquired a binary_path
+        # (the single-ELF / env-build fallback sets it without
+        # consulting the id) must not KeyError here: the crash aborts
+        # Stage-E prep after _save_findings, including the
+        # mitigation-matrix leg. Group it under a placeholder id
+        # (mirrors the sibling prints).
+        if not isinstance(f, dict):
+            continue
+        feas = f.get("feasibility")
+        bp = feas.get("binary_path", "") if isinstance(feas, dict) else ""
         if bp:
-            groups.setdefault(bp, []).append(f["id"])
+            groups.setdefault(bp, []).append(str(f.get("id") or "?"))
     print(f"{len(groups)} binary group(s), {matched} matched, "
           f"{len(skipped)} skipped")
     for bp, ids in groups.items():
-        print(f"  {bp}: {', '.join(ids)}")
+        print(f"  {_sft(str(bp), max_len=200)}: "
+              f"{_sft(', '.join(ids), max_len=300)}")
     # Name what was skipped and why — an anonymous count hid which
     # findings never reached feasibility analysis (and made a run
     # where EVERYTHING was skipped look like routine attrition).
     for fid, reason in skipped:
-        print(f"  skipped: {fid} ({reason})")
+        print(f"  skipped: {_sft(str(fid), max_len=120)} ({_sft(str(reason), max_len=200)})")
 
     if mitigation_matrix and groups:
-        _run_mitigation_matrix(workdir, target, data, build)
+        _run_mitigation_matrix(workdir, target, data, build,
+                               build_command)
         _save_findings(workdir, data)
 
 
@@ -1828,7 +3274,7 @@ def _finding_binaries(findings):
     for f in findings or []:
         if not isinstance(f, dict) or f.get("status") == "disproven":
             continue
-        if f.get("ruling", {}).get("status") == "ruled_out":
+        if _ruling(f).get("status") == "ruled_out":
             continue
         bp = f.get("feasibility", {}).get("binary_path", "")
         if not bp or bp in binaries or not Path(bp).is_file():
@@ -1863,7 +3309,7 @@ def _finding_poc_payload(findings, binary):
     for f in findings or []:
         if not isinstance(f, dict) or f.get("status") == "disproven":
             continue
-        if f.get("ruling", {}).get("status") == "ruled_out":
+        if _ruling(f).get("status") == "ruled_out":
             continue
         if f.get("feasibility", {}).get("binary_path", "") != binary:
             continue
@@ -1892,13 +3338,112 @@ def _write_poc_file(wdir, data, binary, run_stamp, index):
                 / f"frida-sink-watch-poc-{run_stamp}-{index}-"
                   f"{Path(binary).name}")
     try:
-        poc_path.write_bytes(data)
+        # Exclusive create (lstat-honest replace): the workdir is
+        # target-writable and the basename component is
+        # target-derived — a planted symlink at the predictable name
+        # must never route the PoC bytes elsewhere.
+        from core.atomic_fs import write_new_bytes
+        write_new_bytes(poc_path, data, replace=True)
     except OSError:
         return None
     return poc_path
 
 
-def _run_auto_sink_watch(workdir, target, data, dynamic=None):
+def _effective_stage_consent(
+    workdir: "str | Path", dynamic: "bool | None", build: "bool | None",
+) -> "tuple[bool | None, bool | None, str | None]":
+    """Merge THIS invocation's tri-state consent flags with the
+    stage-0 persisted record (``trust_consent.load_consent``):
+    per-invocation flags win, then a VERIFIED stage-0 record decides
+    the channels the invocation left at ``None``, then ``None``
+    stands (project markers decide at the gates). Returns
+    ``(dynamic, build, dynamic_source)`` where *dynamic_source* is
+    ``"flag"`` / ``"stage-0"`` / ``"tamper"`` / ``None`` for
+    refusal-message provenance. A tamper-suspect consent substrate
+    (``load_consent``'s fail-closed verdict: record without mint
+    state, state without record, unverifiable record) DENIES the
+    channels this invocation left open — grants AND denials both need
+    the verified stamp, and a broken substrate must not silently
+    resurrect marker grants."""
+    dynamic_source = "flag" if dynamic is not None else None
+    if dynamic is not None and build is not None:
+        return dynamic, build, dynamic_source
+    try:
+        from packages.exploitability_validation.trust_consent import (
+            load_consent,
+        )
+    except ImportError:
+        return dynamic, build, dynamic_source
+    rec = load_consent(Path(workdir))
+    if rec is None:
+        return dynamic, build, dynamic_source
+    if getattr(rec, "provenance", "record") == "fail-closed":
+        denied = []
+        if dynamic is None:
+            dynamic = False
+            dynamic_source = "tamper"
+            denied.append("dynamic")
+        if build is None:
+            build = False
+            denied.append("build")
+        if denied:
+            # The loud tamper diagnosis already logged inside
+            # load_consent; this line names the consequence for THIS
+            # invocation's channels.
+            print(f"  Stage-0 consent substrate tamper-suspect: "
+                  f"{', '.join(denied)} denied fail-closed (project "
+                  "markers do not apply; re-run stage 0 with explicit "
+                  "consent flags to re-mint)")
+        return dynamic, build, dynamic_source
+    applied = []
+    if dynamic is None and rec.dynamic is not None:
+        dynamic = rec.dynamic
+        dynamic_source = "stage-0"
+        applied.append(f"dynamic={'granted' if dynamic else 'denied'}")
+    if build is None and rec.build is not None:
+        build = rec.build
+        applied.append(f"build={'granted' if build else 'denied'}")
+    if applied:
+        # Consent state must never be invisible: one line naming the
+        # channels the stage-0 record decided for this invocation.
+        print(f"  Stage-0 consent record applied: {', '.join(applied)} "
+              "(explicit flags persisted at stage 0; this invocation "
+              "passed none)")
+    return dynamic, build, dynamic_source
+
+
+def _dynamic_refusal_detail(
+    res: "core.project.trust.TrustResolution",
+    dynamic_source: "str | None" = None,
+) -> str:
+    """Operator-facing provenance clause for a dynamic-trust refusal:
+    names WHICH project answered and through WHICH resolution layer
+    (run-pin vs ambient session), so a refusal caused by the wrong
+    project being consulted is diagnosable from the skip line alone.
+    *res* is a ``core.project.trust.TrustResolution``;
+    *dynamic_source* is ``_effective_stage_consent``'s provenance for
+    an explicit denial. The project name can originate from the
+    run-dir pin marker (target-writable during execution windows), so
+    it is terminal-sanitised."""
+    layer = "run-pin" if res.layer == "run-pin" else "ambient session"
+    if res.source == "explicit":
+        if dynamic_source == "stage-0":
+            return "denied by the stage-0 persisted --no-dynamic"
+        if dynamic_source == "tamper":
+            return ("denied fail-closed: the stage-0 consent record or "
+                    "its mint state is tamper-suspect")
+        return "denied by explicit flag"
+    name = _sft(str(res.project), max_len=120) if res.project else None
+    if res.source == "marker-target-mismatch":
+        return (f"project '{name}' ({layer}) 'dynamic' marker ignored: "
+                "run target is not the project's target")
+    if name:
+        return f"project '{name}' ({layer}) has no 'dynamic' marker"
+    return f"no project governs this run ({layer} resolution)"
+
+
+def _run_auto_sink_watch(workdir, target, data, dynamic=None,
+                         dynamic_source=None):
     """Stage E auto sink-watch: run the findings' own sink list against
     the matched binaries under frida, then fold the runtime evidence
     back into attack-paths.json.
@@ -1934,14 +3479,21 @@ def _run_auto_sink_watch(workdir, target, data, dynamic=None):
         return
 
     try:
-        from core.project.trust import resolve_dynamic_validation
+        from core.project.trust import resolve_dynamic_validation_detail
     except ImportError:
         return
-    if not resolve_dynamic_validation(dynamic, target_path=target):
+    # run_dir=wdir routes the marker lookup to the RUN PIN's project —
+    # the ambient session project must never answer for a pinned run
+    # (in either direction: a pinned grant must not go missing, an
+    # unrelated ambient grant must not authorise execution).
+    res = resolve_dynamic_validation_detail(
+        dynamic, target_path=target, run_dir=wdir)
+    if not res.granted:
         print(
             f"  Auto sink-watch: {len(specs)} watchable sink(s) skipped "
-            "— dynamic execution not granted (pass --dynamic or set "
-            "the project 'dynamic' trust marker)"
+            f"— dynamic execution not granted "
+            f"({_dynamic_refusal_detail(res, dynamic_source)}; pass "
+            "--dynamic or set the project 'dynamic' trust marker)"
         )
         return
 
@@ -1983,7 +3535,7 @@ def _run_auto_sink_watch(workdir, target, data, dynamic=None):
             poc_upgrade = poc_data is not None and entry.get("poc") is not True
             if 0 <= age < _STALENESS_THRESHOLD_S and not poc_upgrade:
                 print(f"  Auto sink-watch: recent launch recorded for "
-                      f"{Path(binary).name}; skipped")
+                      f"{_sft(Path(binary).name, max_len=120)}; skipped")
                 continue
         # Written only for an imminent launch — a skipped binary must
         # not leave orphan PoC files behind.
@@ -2011,7 +3563,8 @@ def _run_auto_sink_watch(workdir, target, data, dynamic=None):
                                    extra_targets=watched)
 
 
-def _run_witness_execution(workdir, target, data, dynamic=None):
+def _run_witness_execution(workdir, target, data, dynamic=None,
+                           dynamic_source=None):
     """Stage E witness execution (P9) — dark-verify oracle for /validate.
 
     Gate: ``core.project.trust.resolve_dynamic_validation`` — explicit
@@ -2026,7 +3579,7 @@ def _run_witness_execution(workdir, target, data, dynamic=None):
     is contained inside the stage.
     """
     try:
-        from core.project.trust import resolve_dynamic_validation
+        from core.project.trust import resolve_dynamic_validation_detail
         from packages.exploitability_validation.witness_stage import (
             eligible_findings,
             run_witness_stage,
@@ -2042,12 +3595,16 @@ def _run_witness_execution(workdir, target, data, dynamic=None):
     # to the run's actual --target (same as the sink-watch and
     # symbolic-replay gates in this stage) — the marker must not grant
     # or refuse based on the launcher cwd fallback when the run
-    # analyses a different tree.
-    if not resolve_dynamic_validation(dynamic, target_path=target):
+    # analyses a different tree. run_dir=workdir routes the marker
+    # lookup to the RUN PIN's project, never the ambient session's.
+    res = resolve_dynamic_validation_detail(
+        dynamic, target_path=target, run_dir=Path(workdir))
+    if not res.granted:
         print(
             f"  Witness execution: {len(eligible)} eligible finding(s) "
-            "skipped — dynamic execution not granted (pass --dynamic or "
-            "set the project 'dynamic' trust marker)"
+            f"skipped — dynamic execution not granted "
+            f"({_dynamic_refusal_detail(res, dynamic_source)}; pass "
+            "--dynamic or set the project 'dynamic' trust marker)"
         )
         return
 
@@ -2059,15 +3616,64 @@ def _run_witness_execution(workdir, target, data, dynamic=None):
     try:
         from core.llm.client import LLMClient
         client = LLMClient()
+        # Standalone-CLI transport resolution: the helper is its own
+        # parent, so a Bedrock-routed model has no RAPTOR_LLM_SOCKET
+        # and every witness-spec call would die with "requires the
+        # RAPTOR LLM dispatcher" (one failure cascade per eligible
+        # finding). The fallback wrapper self-serves the dispatcher
+        # route first (same as raptor-llm-ask); when that cannot come
+        # up it swaps in the claudecode session transport (the
+        # /agentic --gap-audit mechanism), and with no session
+        # transport either it returns None after ONE notice. Never
+        # raises.
+        from core.llm.session_fallback import client_with_session_fallback
+        transport_notes: list[str] = []
+        client = client_with_session_fallback(
+            client, "validate-witness", run_dir=Path(workdir),
+            notice=transport_notes.append)
     except Exception as e:  # noqa: BLE001 — no LLM, no witness specs
-        print(f"  Witness execution: no LLM available ({e}); skipped",
+        print(f"  Witness execution: no LLM available "
+              f"({_sft(str(e), max_len=200)}); skipped",
               file=sys.stderr)
         return
+    if client is None:
+        # Exactly one operator-facing line — the wrapper's notice names
+        # the transport gap; no per-finding provider refusals follow.
+        reason = (transport_notes[-1] if transport_notes
+                  else "no LLM transport available")
+        print(f"  Witness execution: {_sft(reason, max_len=300)}; skipped",
+              file=sys.stderr)
+        return
+    for note in transport_notes:  # fallback-taken info line, at most one
+        print(f"  Witness execution: {_sft(note, max_len=300)}")
 
     def _llm_call(prompt, system):
         return client.generate(prompt, system_prompt=system or None).content
 
-    stats = run_witness_stage(data, target, llm_call=_llm_call)
+    # ``except ()`` matches nothing: without core.sandbox the executor
+    # fails closed and a containment-floor refusal cannot occur.
+    try:
+        from core.sandbox import SandboxFloorError
+        _floor_errors = (SandboxFloorError,)
+    except ImportError:
+        _floor_errors = ()
+    try:
+        # run_dir=workdir: witness provenance binds to the directory
+        # holding findings.json — Stage F's sanitise pass verifies
+        # against the workdir, so any other binding gets the records
+        # stripped (a since-removed target default did exactly that,
+        # and dropped the .witness-binding nonce into the target).
+        stats = run_witness_stage(data, target, llm_call=_llm_call,
+                                  run_dir=workdir)
+    except _floor_errors:
+        # Record-then-raise: the stage stamped the structured
+        # unverifiable-environment record on the refused finding —
+        # persist the findings (including any witness verdicts
+        # executed earlier in the stage) before the typed error fails
+        # the run loudly. Other exception types keep their
+        # pre-existing flight path (no save), unchanged.
+        _save_findings(workdir, data)
+        raise
     _save_findings(workdir, data)
     print(
         f"  Witness execution: {stats['executed']} executed of "
@@ -2078,9 +3684,33 @@ def _run_witness_execution(workdir, target, data, dynamic=None):
 
 
 def prepare_E(workdir, target=None, dynamic=None, build=None,
-              mitigation_matrix=False):
+              mitigation_matrix=False, build_command=None):
     _apply_stage_file(workdir, "D")
 
+    # Freeze the run pin BEFORE any consent window opens in this
+    # process: stage E runs target code with the run dir writable
+    # (env-build inside binary discovery, sink-watch, witness
+    # execution), and a .raptor-run.json rewritten inside such a
+    # window must not steer a LATER gate's trust resolution toward a
+    # different project. The freeze also rides the session ledger's
+    # pin witness, so a marker rewritten in an EARLIER stage's window
+    # loses to the out-of-grant witness where one exists.
+    from core.project.trust import freeze_gate_context
+    freeze_gate_context(workdir)
+
+    # Stage-0 consent reload (mirrors the sanitizer-cut reload in
+    # main()): the orchestrated stage-E invocation passes no consent
+    # flags, so the explicit --dynamic/--no-dynamic/--build/--no-build
+    # the operator gave stage 0 governs here — this invocation's own
+    # flags still win, and only a MAC-verified record speaks.
+    dynamic, build, dynamic_source = _effective_stage_consent(
+        workdir, dynamic, build)
+
+    # D/E boundary: the attack paths Stage B materialised (and C/D
+    # settled) exist now — re-run the audit bridge's path enrichment
+    # so Stage E sees the constraints the Stage-0 pass loaded before
+    # any paths existed. Idempotent; quiet no-op without audit output.
+    _reenrich_attack_paths(Path(workdir), target)
 
     data = _findings(workdir)
     if not data:
@@ -2094,37 +3724,72 @@ def prepare_E(workdir, target=None, dynamic=None, build=None,
     for finding in data["findings"]:
         if finding.get("status") == "disproven":
             continue
-        if finding.get("ruling", {}).get("status") == "ruled_out":
+        if _ruling(finding).get("status") == "ruled_out":
             continue
+        fid = finding.get("id", "?")
         sd = finding.get("stage_d_summary")
         if not sd:
-            print(f"  WARN: {finding['id']} missing stage_d_summary — add it", file=sys.stderr)
-        elif "ruling" not in sd:
-            print(f"  WARN: {finding['id']} stage_d_summary missing 'ruling' key", file=sys.stderr)
+            print(f"  WARN: {_sft(str(fid), max_len=120)} missing stage_d_summary — add it", file=sys.stderr)
+        elif not isinstance(sd, dict) or "ruling" not in sd:
+            print(f"  WARN: {_sft(str(fid), max_len=120)} stage_d_summary missing 'ruling' key", file=sys.stderr)
 
     ruled_out = sum(1 for f in data["findings"]
-                    if f.get("ruling", {}).get("status") == "ruled_out")
+                    if _ruling(f).get("status") == "ruled_out")
     confirmed = sum(1 for f in data["findings"]
-                    if f.get("ruling", {}).get("status") in ("confirmed", "exploitable"))
+                    if _ruling(f).get("status") in ("confirmed", "exploitable"))
     print(f"Ruling: {confirmed} confirmed, {ruled_out} ruled out")
+
+    # --- D→E transition: stamp rows Stage E never analyses ---
+    # A Stage-D ruling that legitimately skips Stage E (disproven /
+    # ruled_out — including D-1 test-code rulings — and non-memory-
+    # corruption classes) gets an automatic not_applicable stage-E
+    # record. Without it, prepare_F's carry-forward check demanded a
+    # hand-stubbed stage_e_summary for findings no stage was ever
+    # going to analyse. Rows Stage E actually skips for OPERATIONAL
+    # reasons (no binary) keep their distinct "skipped" record from
+    # the binary-discovery pass.
+    # The status assignments below overwrite any pre-existing
+    # feasibility.status: safe because the stage_e_summary guard above
+    # skips every analysed row (a completed Stage E always writes its
+    # summary), so only pre-analysis placeholders ("", "pending") can
+    # reach the overwrite.
+    for finding in data["findings"]:
+        if finding.get("stage_e_summary"):
+            continue
+        if (finding.get("status") == "disproven"
+                or _ruling(finding).get("status") == "ruled_out"):
+            finding.setdefault("feasibility", {})["status"] = "not_applicable"
+            finding["stage_e_summary"] = {
+                "status": "not_applicable",
+                "reason": "stage-D ruling skips feasibility analysis",
+            }
+        elif finding.get("vuln_type", "") not in MEMORY_CORRUPTION_TYPES:
+            # Same record the binary-discovery pass stamps — repeated
+            # here so no-target runs (binary discovery skipped) get it
+            # too.
+            finding.setdefault("feasibility", {})["status"] = "not_applicable"
+            finding["stage_e_summary"] = {"status": "not_applicable"}
 
     _save_findings(workdir, data)
 
     # --- Discover binaries ---
     if target:
         _discover_and_match_binaries(workdir, target, data, build=build,
-                                     mitigation_matrix=mitigation_matrix)
+                                     mitigation_matrix=mitigation_matrix,
+                                     build_command=build_command)
     else:
         print("  No --target provided, skipping binary discovery")
 
     # --- Auto sink-watch (frida; gated on dynamic trust) ---
-    _run_auto_sink_watch(workdir, target, data, dynamic=dynamic)
+    _run_auto_sink_watch(workdir, target, data, dynamic=dynamic,
+                         dynamic_source=dynamic_source)
 
     # --- Symbolic witness synthesis (angr; mechanical, no LLM) ---
     _run_symbolic_witnesses(workdir, data, dynamic=dynamic, target=target)
 
     # --- Witness execution (dark-verify oracle, gated on dynamic trust) ---
-    _run_witness_execution(workdir, target, data, dynamic=dynamic)
+    _run_witness_execution(workdir, target, data, dynamic=dynamic,
+                           dynamic_source=dynamic_source)
 
 
 def _run_symbolic_witnesses(workdir, data, dynamic=None, target=None):
@@ -2147,7 +3812,10 @@ def _run_symbolic_witnesses(workdir, data, dynamic=None, target=None):
     if not symbolic_available():
         return
     from core.project.trust import resolve_dynamic_validation
-    allow_replay = resolve_dynamic_validation(dynamic, target_path=target)
+    # run_dir=workdir: replay executes the target, so the grant comes
+    # from the RUN PIN's project, never the ambient session's.
+    allow_replay = resolve_dynamic_validation(
+        dynamic, target_path=target, run_dir=Path(workdir))
     findings = data.get("findings", [])
     stats = synthesize_witnesses(
         findings, Path(workdir), replay=allow_replay,
@@ -2248,7 +3916,8 @@ def prepare_F(workdir, target=None):
             f"  provenance: demoted unverified evidence claims "
             f"(witness {stats['witness_stripped']}, feasibility "
             f"{stats['feasibility_demoted']}, final_status "
-            f"{stats['final_status_demoted']})"
+            f"{stats['final_status_demoted']}, is_exploitable "
+            f"{stats['exploitable_demoted']})"
         )
     for finding in data.get("findings", []):
         feas = finding.get("feasibility")
@@ -2258,14 +3927,14 @@ def prepare_F(workdir, target=None):
             continue
         if not (feas.get("chain_breaks") or feas.get("what_would_help")):
             continue
-        ruling = finding.get("ruling") or {}
-        if ruling.get("status") not in ("confirmed", "exploitable"):
+        if _ruling(finding).get("status") not in ("confirmed", "exploitable"):
             continue
         verdict = _derive_verdict_from_source(feas)
         feas["status"] = "analyzed"
         feas["verdict"] = verdict
         stamp_feasibility(finding, feas, workdir)
-        print(f"  {finding.get('id', '?')}: source-derived verdict {verdict}")
+        print(f"  {_sft(str(finding.get('id', '?')), max_len=120)}: "
+              f"source-derived verdict {_sft(str(verdict), max_len=64)}")
 
     # --- Verdict-to-status mapping ---
     for finding in data.get("findings", []):
@@ -2277,9 +3946,12 @@ def prepare_F(workdir, target=None):
             old_status = finding.get("status", "")
             if old_status != mapped:
                 finding["status"] = mapped
-                print(f"  {finding['id']}: {verdict} -> {mapped} (was {old_status})")
+                print(f"  {_sft(str(finding.get('id', '?')), max_len=120)}: "
+                      f"{_sft(str(verdict), max_len=64)} -> {mapped} "
+                      f"(was {_sft(str(old_status), max_len=64)})")
             else:
-                print(f"  {finding['id']}: {verdict} -> {mapped}")
+                print(f"  {_sft(str(finding.get('id', '?')), max_len=120)}: "
+                      f"{_sft(str(verdict), max_len=64)} -> {mapped}")
 
     # --- Set final_status for findings not handled by Stage E verdict mapping ---
     # Covers two cases: (1) final_status never set, (2) final_status is stale
@@ -2314,10 +3986,18 @@ def prepare_F(workdir, target=None):
             finding["is_exploitable"] = False
 
     # --- Carry-forward check (Stage E) ---
+    # Rows whose Stage-D ruling skips Stage E normally carry the
+    # not_applicable record stamped at the D→E transition; the ruling
+    # re-check here keeps resumed pre-stamp runs from warning about a
+    # summary no stage was ever going to produce.
     for finding in data.get("findings", []):
         se = finding.get("stage_e_summary")
-        if not se and finding.get("vuln_type") in MEMORY_CORRUPTION_TYPES:
-            print(f"  WARN: {finding['id']} missing stage_e_summary — add it", file=sys.stderr)
+        if se or finding.get("vuln_type") not in MEMORY_CORRUPTION_TYPES:
+            continue
+        if (finding.get("status") == "disproven"
+                or _ruling(finding).get("status") == "ruled_out"):
+            continue
+        print(f"  WARN: {_sft(str(finding.get('id', '?')), max_len=120)} missing stage_e_summary — add it", file=sys.stderr)
 
     _save_findings(workdir, data)
 
@@ -2329,10 +4009,11 @@ def prepare_F(workdir, target=None):
             score = finding.get("cvss_score_estimate")
             vector = finding.get("cvss_vector")
             if score is not None:
-                print(f"  {finding['id']}: {vector} -> {score}")
+                print(f"  {_sft(str(finding.get('id', '?')), max_len=120)}: "
+                      f"{_sft(str(vector), max_len=120)} -> {score}")
         _save_findings(workdir, data)
     except Exception as e:  # noqa: BLE001
-        print(f"  ⚠️  CVSS scoring error: {e}", file=sys.stderr)
+        print(f"  ⚠️  CVSS scoring error: {_sft(str(e), max_len=200)}", file=sys.stderr)
 
     # --- Verdict mapping consistency ---
     # This guards against future code paths between the verdict-mapping
@@ -2353,22 +4034,25 @@ def prepare_F(workdir, target=None):
             expected = VERDICT_MAP[verdict]
             actual = finding.get("final_status")
             if actual != expected:
-                print(f"  MISMATCH: {finding['id']} verdict={verdict} "
-                      f"expected={expected} got={actual}")
+                print(f"  MISMATCH: {_sft(str(finding.get('id', '?')), max_len=120)} "
+                      f"verdict={_sft(str(verdict), max_len=64)} "
+                      f"expected={expected} got={_sft(str(actual), max_len=64)}")
 
     # --- Proximity consistency ---
     by_vuln = defaultdict(list)
     for finding in data.get("findings", []):
-        b = finding.get("stage_b_summary", {})
-        if b.get("proximity") is not None:
+        # Bare-string stage summaries are a documented /agentic shape;
+        # a .get() on one crashed the consistency pass mid-Stage-E.
+        b = finding.get("stage_b_summary")
+        if isinstance(b, dict) and b.get("proximity") is not None:
             by_vuln[finding.get("vuln_type", "")].append(
-                (finding["id"], b["proximity"])
+                (finding.get("id", "?"), b["proximity"])
             )
     for vuln, scores in by_vuln.items():
         if len(scores) > 1:
             vals = [s[1] for s in scores]
             if max(vals) - min(vals) > 3:
-                print(f"  PROXIMITY SPREAD: {vuln} — {scores} (spread > 3)")
+                print(f"  PROXIMITY SPREAD: {_sft(str(vuln), max_len=120)} — {scores} (spread > 3)")
 
     _report_workdir_files(workdir, "available for review")
 
@@ -2402,12 +4086,36 @@ def _bridge_understand_output(out_dir, checklist, target,
         enrich_checklist,
         find_understand_output,
         load_understand_context,
+        load_understand_graph_context,
     )
 
+
+    # File lane first: in-session /understand writes context-map.json /
+    # flow-trace-*.json WITHOUT a graph ingest, so a fresh co-located (or
+    # sibling / global) artifact must win. Graph memory is a fallback only
+    # — it can be stale, and its latest snapshot can even belong to a
+    # different codebase than this run's target.
     understand_dir, stale_files = find_understand_output(
         out_dir, target_path=target,
     )
     if not understand_dir:
+        graph_bridge = load_understand_graph_context(out_dir, target)
+        if graph_bridge.get("context_map_loaded"):
+            enrich_checklist(checklist, graph_bridge["context_map"],
+                             str(out_dir))
+            n_sources = graph_bridge["attack_surface"]["sources"]
+            n_sinks = graph_bridge["attack_surface"]["sinks"]
+            n_paths = graph_bridge.get("graph_attack_paths", {}).get(
+                "imported_as_paths", 0)
+            n_targets = len(checklist.get("priority_targets", []))
+            stale = graph_bridge.get("stale_files_excluded") or []
+            stale_note = (f", {len(stale)} stale file(s) excluded"
+                          if stale else "")
+            print(f"  Bridge: no /understand files found —"
+                  f" loaded graph memory"
+                  f" — {n_sources} sources, {n_sinks} sinks,"
+                  f" {n_paths} graph paths,"
+                  f" {n_targets} priority targets{stale_note}")
         return
 
     # Tier 1 (shared --out): find_understand_output can't detect stale files
@@ -2519,6 +4227,62 @@ def _bridge_audit_output(out_dir, target=None):
         print(f"  Audit bridge: enriched {enriched_steps} attack-path steps with callee contracts")
 
 
+def _reenrich_attack_paths(out_dir: "str | Path",
+                           target: "str | None" = None) -> None:
+    """Re-run the audit bridge's attack-path enrichment once paths exist.
+
+    Stage 0 runs the bridge before Stage B has materialised
+    attack-paths.json, so on a run without imported flow traces the
+    constraints/summaries loaded fine but enriched ZERO steps (the
+    file was not there yet). Stage B (and the C/D evidence passes)
+    create and settle the path set; re-running the enrichment at the
+    D/E boundary annotates the real steps so Stage E's feasibility and
+    SMT work see the audit's parameter preconditions and callee
+    contracts. Both enrichers ASSIGN per-step fields
+    (parameter_constraints / callee_contract), so a second invocation
+    is idempotent — steps the Stage-0 pass already annotated are
+    rewritten with the same values, never duplicated. Fail-soft like
+    the Stage-0 bridge: no audit run, no constraints, or no paths file
+    is a quiet no-op.
+    """
+    try:
+        from core.orchestration.audit_bridge import (
+            enrich_attack_paths,
+            enrich_with_summaries,
+            find_audit_output,
+            load_audit_constraints,
+            load_summaries,
+        )
+    except ImportError:
+        return
+
+    out_dir = Path(out_dir)
+    bridge_cfg = load_json(out_dir / "bridge-config.json")
+    if isinstance(bridge_cfg, dict) and bridge_cfg.get("no_bridge"):
+        return  # stage 0 ran with --no-bridge — the opt-out is durable
+
+    attack_paths_file = out_dir / "attack-paths.json"
+    if not attack_paths_file.exists():
+        return
+
+    audit_dir = find_audit_output(out_dir, target_path=target)
+    if not audit_dir:
+        return
+
+    constraints = load_audit_constraints(audit_dir)
+    if constraints:
+        enriched = enrich_attack_paths(attack_paths_file, constraints)
+        print(f"  Audit bridge: re-enriched {enriched} attack-path "
+              f"steps with {len(constraints)} constraints "
+              f"from {audit_dir.name}")
+
+    summaries = load_summaries(audit_dir)
+    if summaries:
+        enriched_steps = enrich_with_summaries(attack_paths_file, summaries)
+        print(f"  Audit bridge: re-enriched {enriched_steps} attack-path "
+              f"steps with callee contracts")
+
+
 _PRIORITY_TARGET_QUERY = (
     "Rank these unchecked source-to-sink flows by how likely "
     "exploitability validation will confirm a real, reachable "
@@ -2574,6 +4338,23 @@ def _rank_priority_targets(checklist: dict, out_dir) -> None:
             ])
 
         client = LLMClient()
+        # Standalone-CLI transport resolution (see the witness-stage
+        # site): self-serve the dispatcher route, else fall back to
+        # the claudecode session transport, else degrade with ONE
+        # notice instead of a provider-refusal per rank batch.
+        from core.llm.session_fallback import client_with_session_fallback
+        transport_notes: list[str] = []
+        client = client_with_session_fallback(
+            client, "validate-rank", run_dir=Path(out_dir),
+            notice=transport_notes.append)
+        if client is None:
+            reason = (transport_notes[-1] if transport_notes
+                      else "no LLM transport available")
+            print(f"  Rank: skipped ({_sft(reason, max_len=300)}); "
+                  "bridge order kept")
+            return
+        for note in transport_notes:  # fallback-taken info, at most one
+            print(f"  Rank: {_sft(note, max_len=300)}")
         # Ordering is an opening move, not the run: cap its budget
         # well below the client default (inert on the claude-code
         # transport, which reports $0 — the head cap bounds that
@@ -2602,13 +4383,23 @@ def _rank_priority_targets(checklist: dict, out_dir) -> None:
         )
     except Exception as e:  # noqa: BLE001 — ordering refinement must
         # never break stage 0; the bridge order is a valid fallback.
-        print(f"  Rank: failed ({e}); bridge order kept")
+        print(f"  Rank: failed ({_sft(str(e), max_len=300)}); bridge order kept")
 
 
 def prepare_0(workdir_unused, target=None, explicit_out=None, no_bridge=False,
               sanitizer_cut_mode=None, sanitizer_cut_parity_log=None,
-              findings_path=None, rank=False):
-    """Stage 0: start lifecycle, build checklist, bridge understand output."""
+              findings_path=None, rank=False, include_dark=False,
+              dynamic=None, build=None):
+    """Stage 0: start lifecycle, build checklist, bridge understand output.
+
+    ``dynamic`` / ``build`` are the tri-state per-run consent flags
+    (None = the project trust marker decides). Stage 0 feeds them to
+    the capability preflight's warning AND persists them as the
+    MAC-stamped run consent record
+    (``trust_consent.persist_consent``) — the orchestrated stage-E
+    invocation passes no flags, so without the record an explicit
+    stage-0 grant or denial silently degraded to marker resolution.
+    """
     if not target:
         print("ERROR: --target is required for stage 0", file=sys.stderr)
         sys.exit(1)
@@ -2624,9 +4415,13 @@ def prepare_0(workdir_unused, target=None, explicit_out=None, no_bridge=False,
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
+        from core.project.registry_home import RegistryHomeError as _RHE
         from core.run.pin import ProjectArgvError as _PAE
-        if isinstance(e, _PAE):
-            print(f"ERROR: {e}", file=sys.stderr)
+        if isinstance(e, (_PAE, _RHE)):
+            # Operator overrides that could not be honoured (--project
+            # argv, RAPTOR_REGISTRY_HOME env): designed refusal before
+            # any run dir exists, never a raw traceback.
+            print(f"ERROR: {_sft(str(e), max_len=300)}", file=sys.stderr)
             sys.exit(1)
         raise
 
@@ -2692,24 +4487,117 @@ def prepare_0(workdir_unused, target=None, explicit_out=None, no_bridge=False,
             )
             sanitizer_cut_config.persist(str(out_dir))
 
+        # Persist the stage-0 execution consent for the stage-E gates
+        # (same reload pattern as the sanitizer-cut mode above, but
+        # MAC-stamped: the run dir is target-writable during build /
+        # witness windows and this record carries execution consent).
+        # Fresh-or-absent inside persist_consent: a no-flags run
+        # REMOVES any stale record, so it runs unconditionally.
+        # Never raises — consent transport must not fail stage 0; a
+        # key problem warns loudly and later stages fall back to
+        # marker resolution against the run pin.
+        from packages.exploitability_validation.trust_consent import (
+            persist_consent,
+        )
+        persist_consent(out_dir, dynamic=dynamic, build=build)
+
         # Snapshot understand hashes before the rebuild overwrites checklist.json.
         # In the shared --out case (tier 1), the understand run's checklist is in
         # the same directory.  build_checklist will overwrite it with current hashes,
         # so we capture the old hashes now for stale-file detection.
         pre_rebuild_checklist = None
-        checklist_path = out_dir / "checklist.json"
-        if checklist_path.exists() and (out_dir / "context-map.json").exists():
-            from core.json import load_json
-            pre_rebuild_checklist = load_json(checklist_path)
+        from core.inventory import checklist_exists, read_checklist
+        if checklist_exists(out_dir) and (out_dir / "context-map.json").exists():
+            pre_rebuild_checklist = read_checklist(out_dir) or None
 
-        checklist = build_checklist(target, str(out_dir))
+        from packages.exploitability_validation.binary_substrate import (
+            BinarySubstrateMissingError,
+        )
+        try:
+            checklist = build_checklist(target, str(out_dir))
+        except BinarySubstrateMissingError as e:
+            # Binary target with no RE substrate: an ACTIONABLE
+            # refusal, not a traceback — the message names every
+            # location searched and the commands that produce a
+            # substrate. Mark the run failed (same lifecycle
+            # consequence as the generic handler below), print the
+            # message line-by-line sanitised (it embeds the escaped
+            # target name), and exit non-zero.
+            with contextlib.suppress(Exception):
+                fail_run(out_dir, str(e))
+            print(
+                "ERROR: "
+                + "\n".join(_sft(line, max_len=300)
+                            for line in str(e).splitlines()),
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
         (out_dir / "build").mkdir(exist_ok=True)
 
         if findings_path:
             _import_findings_file(findings_path, out_dir / "findings.json",
-                                  target=target)
+                                  target=target, include_dark=include_dark)
+        else:
+            # Mode state must reflect THIS invocation both ways (same
+            # doctrine as bridge-config below): a marker and backlog
+            # left by a previous findings-driven run on the same out
+            # dir would make a fresh sweep run report findings-mode
+            # stats and a phantom routed count.
+            _remove_stale_import_marker(out_dir)
+            _remove_stale_witness_backlog(out_dir)
+            _remove_stale_dedup_report(out_dir)
 
+        # Capability preflight (warning-only): name the verdict ceiling
+        # BEFORE any LLM spend. A run with no binary, no usable project
+        # binary, and no build consent discovers only at stage E —
+        # after the stage A–D spend — that its memory-corruption
+        # findings cap at 'confirmed_unverified' (prepare_F demotes
+        # exploitable-family statuses without a mechanical feasibility
+        # stamp). The assessment artifact is fresh-or-absent (the
+        # previous run's artifact is removed BEFORE the body, so a
+        # crashing preflight cannot leave stale warnings looking
+        # current) and the report generator renders
+        # it. Best-effort by contract: a preflight failure warns and
+        # NEVER blocks stage 0 — this must not turn a working run into
+        # a failed one.
+        _remove_stale_preflight(out_dir)
+        try:
+            from packages.exploitability_validation.capability_preflight import (
+                PREFLIGHT_FILENAME,
+                assess_capabilities,
+                render_warning_lines,
+            )
+            findings_container = (load_json(out_dir / "findings.json")
+                                  if findings_path else None)
+            assessment = assess_capabilities(
+                target, run_dir=out_dir,
+                findings=(findings_container
+                          if isinstance(findings_container, dict) else None),
+                checklist=checklist if isinstance(checklist, dict) else None,
+                dynamic=dynamic, build=build,
+            )
+            from core.json import save_json as _preflight_save
+            _preflight_save(out_dir / PREFLIGHT_FILENAME, assessment)
+            for _line in render_warning_lines(assessment):
+                print(_line)
+        except Exception as e:  # noqa: BLE001 — warning-only, never fatal
+            print(f"  ⚠️  capability preflight skipped: "
+                  f"{_sft(str(e), max_len=200)}", file=sys.stderr)
+
+        # Durable bridge opt-out marker, rewritten to THIS
+        # invocation's truth BOTH ways: later stage boundaries re-run
+        # bridge enrichment (see _reenrich_attack_paths) and must
+        # honour the operator's --no-bridge — but a stale opt-out left
+        # by a previous stage-0 run on the same out dir must not keep
+        # a fresh bridged run opted out forever. Local import: the
+        # SAGE recall block above imports save_json inside its
+        # suppress guard, which makes the name function-local for all
+        # of prepare_0 — reaching for it here when that import never
+        # ran is an UnboundLocalError.
+        from core.json import save_json as _save_json
+        _save_json(out_dir / "bridge-config.json",
+                   {"no_bridge": bool(no_bridge)})
         if not no_bridge:
             _bridge_understand_output(out_dir, checklist, target,
                                       pre_rebuild_checklist=pre_rebuild_checklist)
@@ -2722,6 +4610,24 @@ def prepare_0(workdir_unused, target=None, explicit_out=None, no_bridge=False,
             _rank_priority_targets(checklist, out_dir)
 
         print(f"Checklist: {checklist['total_files']} files, {checklist['total_items']} items")
+        _substrate = (checklist.get("substrate")
+                      if isinstance(checklist, dict) else None)
+        if isinstance(_substrate, dict) \
+                and _substrate.get("source") == "decompilation":
+            # Identity honesty: sha_verified means the substrate
+            # carries a content stamp matching the target's bytes; an
+            # unverified (name-match-only) pairing must say so on the
+            # operator surface, never read as content-identified.
+            _ident = ("content-verified"
+                      if _substrate.get("sha_verified")
+                      else "name-match only, no content stamp")
+            print(
+                "Substrate: decompilation (decompiler: "
+                f"{_sft(str(_substrate.get('decompiler') or 'unknown'), max_len=40)}; "
+                f"identity: {_ident})"
+                " — findings will be validated against decompiled "
+                "code, not source"
+            )
         print(f"OUTPUT_DIR={out_dir}")
     except Exception as e:
         # Mark the run as failed so /project status / cleanup
@@ -2778,9 +4684,34 @@ def prepare_1(workdir, target=None, model=None):
         write_validation_report(workdir)
         print("Report generated")
     except Exception as e:  # noqa: BLE001
-        print(f"⚠️  Report error: {e}", file=sys.stderr)
+        print(f"⚠️  Report error: {_sft(str(e), max_len=300)}", file=sys.stderr)
 
     print(generate_summary(workdir))
+
+    # Machine-readable per-finding outcomes + graph enrichment: the
+    # writer projects findings.json's verdicts into
+    # validation-outcomes.json, then the graph lane promotes them into
+    # verified_outcome nodes (VALIDATES edges).
+    with contextlib.suppress(Exception):
+        from packages.exploitability_validation.report import (
+            write_validation_outcomes,
+        )
+        outcomes_path = write_validation_outcomes(workdir)
+        if outcomes_path is not None:
+            try:
+                from core.understand_graph import ingest_validation_outcomes
+                ingest_validation_outcomes(Path(workdir), target or "")
+            # Broad except: enrichment is best-effort by design (the
+            # sibling graph-enrichment sites use the same spelling).
+            # The ingest mkdirs the graph dir and binds
+            # artifact-derived values, so the failure surface spans
+            # OSError, sqlite errors, shape errors, and bind
+            # overflows — any of them must degrade here, not revoke
+            # an otherwise-complete validation run at its final
+            # optional step.
+            except Exception as e:  # noqa: BLE001
+                print(f"⚠️  Graph enrichment skipped: "
+                      f"{_sft(str(e), max_len=300)}", file=sys.stderr)
 
     with contextlib.suppress(Exception):
         _write_stage1_coverage_records(Path(workdir))
@@ -2812,7 +4743,7 @@ def prepare_1(workdir, target=None, model=None):
         render_and_write(Path(workdir))
         print("Diagrams generated")
     except Exception as e:  # noqa: BLE001
-        print(f"⚠️  Diagram error: {e}", file=sys.stderr)
+        print(f"⚠️  Diagram error: {_sft(str(e), max_len=300)}", file=sys.stderr)
 
     # Coverage summary (unified store-backed report; file-level tier when
     # there's no function inventory).
@@ -2848,7 +4779,606 @@ def prepare_1(workdir, target=None, model=None):
         # completion of a STARTED run must exit nonzero, otherwise
         # the run is orphaned with status=running while the caller
         # believes the pipeline sealed it.
-        print(f"ERROR: {e}", file=sys.stderr)
+        print(f"ERROR: {_sft(str(e), max_len=300)}", file=sys.stderr)
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Parts assembly — merge stage-<x>-parts/*.json into the canonical
+# stage output(s).
+#
+# Contract (one flow covers A-F; single-part stages are the degenerate
+# case):
+#   * Stage A: findings array append; duplicate finding id across
+#     parts = conflict. The assembled id set is checked against the
+#     findings.json inventory when present (reported loudly, never
+#     fatal: quarantine-and-proceed makes partial assemblies legal and
+#     the receipt is the re-dispatch target).
+#   * Stage B: hybrid — hypotheses / attack_tree_nodes / attack_paths /
+#     disproven appended into their working docs, attack_surface
+#     dedup-unioned, and the per-finding updates{} dict unioned with
+#     refuse-on-duplicate-key. A part entry whose id matches a
+#     PRE-EXISTING working-doc entry replaces it (an update); the same
+#     id in two PARTS is a conflict.
+#   * Stages C-F: updates{} union, refuse-on-duplicate-key.
+#
+# A part that fails its slice of the contract (parse failure, fragment
+# lint errors, key/id conflict with an earlier part) is QUARANTINED:
+# a named-reason record is written under stage-<x>-parts/quarantine/,
+# the part file itself is never moved or deleted, and the merge
+# proceeds with the good parts. Never last-writer-wins, never
+# all-or-nothing abort.
+#
+# Free text is sanitised EXACTLY ONCE, at part ingestion. Assembly
+# writes therefore bypass _save_artifact (which would re-sanitise) —
+# the promote-time idempotence gate still verifies the result, so a
+# sanitiser regression fails validation instead of corrupting bytes.
+#
+# Part order is observationally irrelevant: parts are read in sorted
+# filename order, conflicts quarantine the LATER part, and every
+# assembled collection is canonically sorted, so re-assembly is
+# byte-stable and independent of arrival order.
+# ---------------------------------------------------------------------------
+
+from collections.abc import Callable  # noqa: E402
+from typing import Any  # noqa: E402
+
+from packages.exploitability_validation import lint as _lint  # noqa: E402
+
+# One ingested part: (filename, parsed data, sha256, sanitised paths).
+_Part = tuple[str, Any, str, list[str]]
+
+
+def _part_sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+# Bounds on the quarantine reason record. Reason strings quote
+# producer/LLM-derived content and the record is what re-dispatch
+# briefs later quote, so each reason is escaped and bounded AT WRITE.
+# Nothing forensic is destroyed: the part file itself is never moved
+# or deleted and the record carries its sha256 — the part, not the
+# reason text, is the forensic store. Churn-prone limits — rationale
+# in both directions:
+#
+# * ``_REASON_MAX_LEN`` not smaller: a reason legitimately composed
+#   from per-value excerpts tops out near ~350 characters (trusted
+#   skeleton plus two EXCERPT_MAX_LEN excerpts with their elision
+#   markers, or a lint error's dotted schema path) — a tighter cap
+#   would elide the trusted attribution tail rather than the
+#   untrusted excerpt. Not larger: this cap only bites when a
+#   composition site missed per-value excerpting, and widening it
+#   just widens what such a miss floods into the record/brief
+#   channels.
+# * ``_REASON_MAX_COUNT`` not smaller: stage-B conflicts legally span
+#   five channels (four collections plus updates{}) and a
+#   mispartitioned producer can genuinely own dozens of colliding ids
+#   its single re-dispatch must see named. Not larger: no reader
+#   consumes more — the brief quotes excerpts and the untouched part
+#   file holds the full evidence — while the record would otherwise
+#   scale with an attacker-chosen id count.
+_REASON_MAX_LEN = 500
+_REASON_MAX_COUNT = 50
+
+# Bound on the receipt's per-part ``sanitised_fields`` list. Each entry
+# is a dotted path whose middle segment is a producer-chosen key
+# (``updates.<fid>.description``), so a hostile fid would otherwise
+# ride raw into the assembly receipt — the authoritative index
+# re-dispatch briefs read. Paths are excerpted per-entry and the COUNT
+# is capped because it scales with attacker-chosen key counts.
+# Churn-prone limit — rationale in both directions: not smaller, a
+# legitimate part spanning dozens of findings can genuinely have every
+# free-text field sanitised and diagnostics should name them; not
+# larger, no reader consumes more — the elided paths are recomputable
+# by re-running ingestion sanitisation on the untouched part file.
+_SANITISED_FIELDS_MAX_COUNT = 100
+
+
+def _bound_sanitised_fields(paths: list[str]) -> list[str]:
+    """Excerpt each changed-field path and cap the list length.
+
+    Same escape-THEN-bound funnel as reasons; the explicit elision
+    entry names how many paths were dropped (the true count travels
+    out-of-band as ``sanitised_fields_total`` on the receipt entry).
+    """
+    bounded = [_excerpt(p) for p in paths[:_SANITISED_FIELDS_MAX_COUNT]]
+    if len(paths) > _SANITISED_FIELDS_MAX_COUNT:
+        bounded.append(
+            f"...[+{len(paths) - _SANITISED_FIELDS_MAX_COUNT} more "
+            "sanitised path(s) elided]")
+    return bounded
+
+
+def _quarantine_part(parts_dir: Path, part_name: str, sha: str,
+                     reasons: list[str],
+                     quarantined: list[dict[str, Any]]) -> None:
+    """Record a named-reason quarantine; the part file itself stays put."""
+    qdir = parts_dir / "quarantine"
+    qdir.mkdir(exist_ok=True)
+    from datetime import datetime, timezone
+    bounded = [_sft(str(r), max_len=_REASON_MAX_LEN)
+               for r in reasons[:_REASON_MAX_COUNT]]
+    if len(reasons) > _REASON_MAX_COUNT:
+        bounded.append(
+            f"...[+{len(reasons) - _REASON_MAX_COUNT} more reason(s) "
+            "elided — the part file retains the full content]")
+    record = {
+        # ``part`` stays byte-exact: it is the join key that names the
+        # on-disk part file and this record's own filename (it is a
+        # real filename on this filesystem, so its length is already
+        # bounded by the OS).
+        "part": part_name,
+        "sha256": sha,
+        "reasons": bounded,
+        # Out-of-band authority for the elision entry: the true count
+        # is a structured field, never recovered from reason text (a
+        # producer-controlled excerpt could embed marker-shaped text).
+        "reasons_total": len(reasons),
+        "quarantined_at": datetime.now(timezone.utc).isoformat(),
+    }
+    save_json(qdir / f"{part_name}.reason.json", record)
+    # The receipt entry mirrors the record INCLUDING reasons_total:
+    # the receipt's quarantined[] list is the authoritative re-dispatch
+    # index, so the out-of-band count must travel on that channel too.
+    quarantined.append({"part": part_name, "reasons": record["reasons"],
+                        "reasons_total": record["reasons_total"]})
+    print(f"⚠️  QUARANTINED {_sft(part_name, max_len=120)}:", file=sys.stderr)
+    for r in record["reasons"]:
+        print(f"    {_sft(str(r), max_len=300)}", file=sys.stderr)
+
+
+def _normalise_part(stage: str, data: Any) -> Any:
+    """Ingestion-shape normalisation (before fragment lint).
+
+    * Stage A: a bare findings array is wrapped as {"findings": [...]},
+      and vuln_type aliases are normalised to their canonical enum
+      values — exactly what the promote path does before validating,
+      so an alias a producer legally used is never a false quarantine.
+    * Stage B: a node's leads_to given as a LIST of ids becomes the
+      canonical comma-separated string (see ATTACK_TREE_SCHEMA — the
+      string form is settled).
+    * Every stage: feasibility slices are normalised (status alias
+      spellings such as "binary_not_found" -> "skipped", null
+      binary_path dropped) so the assembled artifact carries the
+      canonical values — again matching the promote path.
+    """
+    if stage == "A":
+        if isinstance(data, list):
+            data = {"findings": data}
+        if isinstance(data, dict):
+            _lint.normalise_findings_vuln_types(data)
+            _lint.normalise_feasibility_fields(data)
+        return data
+    if isinstance(data, dict):
+        _lint.normalise_feasibility_fields(data)
+    if stage == "B" and isinstance(data, dict):
+        for node in data.get("attack_tree_nodes") or []:
+            if isinstance(node, dict) and isinstance(node.get("leads_to"),
+                                                     list):
+                node["leads_to"] = ",".join(str(x) for x in node["leads_to"])
+    return data
+
+
+def _ingest_parts(stage: str, parts_dir: Path,
+                  quarantined: list[dict[str, Any]]) -> list[_Part]:
+    """Load, lint, and sanitise each part. Returns the good parts as
+    [(name, data, sha, sanitised_paths)] in sorted-name order."""
+    good = []
+    for path in sorted(parts_dir.glob("*.json")):
+        sha = _part_sha(path)
+        data = load_json(path)
+        if data is None:
+            _quarantine_part(parts_dir, path.name, sha,
+                             ["cannot parse JSON"], quarantined)
+            continue
+        data = _normalise_part(stage, data)
+        result = _lint.lint_fragment(stage, data)
+        if result.errors:
+            _quarantine_part(parts_dir, path.name, sha, result.errors,
+                             quarantined)
+            continue
+        for w in result.warnings:
+            # Part filenames are producer-chosen: escape them like any
+            # other untrusted text before they reach the terminal.
+            print(f"WARNING: {_sft(path.name, max_len=120)}: "
+                  f"{_sft(str(w), max_len=300)}",
+                  file=sys.stderr)
+        # The single sanitise pass for this content (ingestion).
+        sanitised = sanitise_free_text(
+            data, _lint.fragment_text_schema(stage, data))
+        good.append((path.name, data, sha, sanitised))
+    return good
+
+
+def _merge_updates(
+    parts: list[_Part], parts_dir: Path,
+    quarantined: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[str]]:
+    """Union the per-finding updates{} dicts; duplicate key across two
+    parts quarantines the later part. Returns (updates, merged_names)."""
+    updates: dict = {}
+    owner: dict = {}
+    merged_names = []
+    for name, data, sha, _sanitised in parts:
+        part_updates = data.get("updates") or {}
+        dupes = sorted(set(part_updates) & set(updates))
+        if dupes:
+            # ``fid`` is a producer-chosen key (the owner name is a
+            # producer-chosen filename): excerpt both — escaped and
+            # bounded with an explicit elision marker — before they
+            # join a reason string.
+            _quarantine_part(
+                parts_dir, name, sha,
+                [f"duplicate update key {_excerpt(fid)} (already "
+                 f"contributed by {_excerpt(owner[fid])})"
+                 for fid in dupes],
+                quarantined)
+            continue
+        for fid, fields in part_updates.items():
+            updates[fid] = fields
+            owner[fid] = name
+        merged_names.append(name)
+    return {k: updates[k] for k in sorted(updates)}, merged_names
+
+
+def _assemble_a(
+    workdir: Path, parts: list[_Part], parts_dir: Path,
+    quarantined: list[dict[str, Any]],
+) -> tuple[dict[str, tuple[str, Any]], list[str]]:
+    """Stage A: append findings; duplicate id across parts is a
+    conflict. Returns (outputs, merged_names)."""
+    findings: list = []
+    owner: dict = {}
+    merged_names = []
+    for name, data, sha, _sanitised in parts:
+        rows = data.get("findings") or []
+        part_ids = [f.get("id") for f in rows]
+        # Finding ids and owner part names are producer-chosen:
+        # excerpt them before they join a reason string.
+        reasons = [
+            f"duplicate finding id {_excerpt(fid)} (already contributed "
+            f"by {_excerpt(owner[fid])})"
+            for fid in sorted({i for i in part_ids if i in owner})
+        ]
+        reasons.extend(
+            f"finding id {_excerpt(fid)} appears more than once in "
+            "this part"
+            for fid in sorted({i for i in part_ids
+                               if part_ids.count(i) > 1})
+        )
+        if reasons:
+            _quarantine_part(parts_dir, name, sha, reasons, quarantined)
+            continue
+        for f in rows:
+            owner[f["id"]] = name
+            findings.append(f)
+        merged_names.append(name)
+
+    findings.sort(key=lambda f: f["id"])
+    assembled = {"stage": "A", "findings": findings}
+    from core.inventory import read_checklist
+    checklist = read_checklist(workdir)
+    if checklist.get("target_path"):
+        assembled["target_path"] = checklist["target_path"]
+
+    # Exact-id-set check against the inventory (loud, never fatal —
+    # see the contract comment above).
+    inventory = load_json(workdir / "findings.json")
+    if isinstance(inventory, dict):
+        expected = {f.get("id") for f in inventory.get("findings", [])
+                    if isinstance(f, dict) and f.get("id")}
+        got = {f["id"] for f in findings}
+        # Both id sets are producer-derived (findings.json rides in
+        # from imports; part rows are LLM-written): escape and bound
+        # each id before it joins a terminal line — a raw id carrying
+        # ESC/newline bytes is a terminal-injection / log-splitting
+        # primitive on this stderr channel.
+        for fid in sorted(expected - got, key=str):
+            print(f"WARNING: inventory id {_sft(str(fid), max_len=120)} "
+                  "missing from assembled findings", file=sys.stderr)
+        for fid in sorted(got - expected, key=str):
+            print(f"WARNING: assembled finding "
+                  f"{_sft(str(fid), max_len=120)} not in the "
+                  "findings.json inventory", file=sys.stderr)
+
+    return {"stage-a.json": ("stage", assembled)}, merged_names
+
+
+def _dedup_extend(existing: list[Any], new_rows: list[Any],
+                  key: Callable[[dict[str, Any]], Any]) -> None:
+    """Append new_rows to existing, skipping key-duplicates."""
+    seen = {key(r) for r in existing if isinstance(r, dict)}
+    for row in new_rows:
+        if not isinstance(row, dict) or key(row) not in seen:
+            seen.add(key(row) if isinstance(row, dict) else None)
+            existing.append(row)
+
+
+def _assemble_b(
+    workdir: Path, parts: list[_Part], parts_dir: Path,
+    quarantined: list[dict[str, Any]],
+) -> tuple[dict[str, tuple[str, Any]], list[str]]:
+    """Stage B hybrid merge into the six canonical outputs."""
+    # Pre-existing working docs are the merge base: a part entry whose
+    # id matches an existing entry REPLACES it (that is an update, not
+    # a part-vs-part conflict).
+    hypotheses = load_json(workdir / "hypotheses.json")
+    hypotheses = hypotheses if isinstance(hypotheses, list) else []
+    paths_doc = load_json(workdir / "attack-paths.json")
+    paths_doc = paths_doc if isinstance(paths_doc, list) else []
+    tree = load_json(workdir / "attack-tree.json")
+    tree = tree if isinstance(tree, dict) else {}
+    nodes = tree.get("nodes") if isinstance(tree.get("nodes"), list) else []
+    disproven_doc = load_json(workdir / "disproven.json")
+    disproven_doc = (disproven_doc if isinstance(disproven_doc, dict)
+                     else {})
+    disproven = (disproven_doc.get("disproven")
+                 if isinstance(disproven_doc.get("disproven"), list) else [])
+    surface = load_json(workdir / "attack-surface.json")
+    surface = surface if isinstance(surface, dict) else {}
+
+    by_id = {
+        "hypotheses": {h.get("id"): h for h in hypotheses
+                       if isinstance(h, dict)},
+        "attack_tree_nodes": {n.get("id"): n for n in nodes
+                              if isinstance(n, dict)},
+        "attack_paths": {p.get("id"): p for p in paths_doc
+                         if isinstance(p, dict)},
+        "disproven": {d.get("finding"): d for d in disproven
+                      if isinstance(d, dict)},
+    }
+    id_key = {"hypotheses": "id", "attack_tree_nodes": "id",
+              "attack_paths": "id", "disproven": "finding"}
+    part_owner: dict = {}  # (collection, id) -> part name
+
+    updates: dict = {}
+    updates_owner: dict = {}
+    merged_names = []
+
+    for name, data, sha, _sanitised in parts:
+        conflicts = []
+        part_updates = data.get("updates") or {}
+        # Update keys, entry ids, and owner part names are
+        # producer-chosen: excerpt them before they join a reason
+        # string (``coll`` is a trusted collection constant).
+        conflicts.extend(
+            f"duplicate update key {_excerpt(fid)} (already contributed "
+            f"by {_excerpt(updates_owner[fid])})"
+            for fid in sorted(set(part_updates) & set(updates)))
+        for coll in by_id:
+            rids = [row.get(id_key[coll]) for row in data.get(coll) or []]
+            # Within-part duplicates would silently collapse via the
+            # by_id merge below — refuse them like Stage A does.
+            conflicts.extend(
+                f"{coll} entry {_excerpt(rid)} appears more than once "
+                "in this part"
+                for rid in sorted({r for r in rids if rids.count(r) > 1},
+                                  key=str))
+            for rid in rids:
+                if (coll, rid) in part_owner:
+                    conflicts.append(
+                        f"duplicate {coll} entry {_excerpt(rid)} (already "
+                        f"contributed by "
+                        f"{_excerpt(part_owner[(coll, rid)])})")
+        if conflicts:
+            _quarantine_part(parts_dir, name, sha, conflicts, quarantined)
+            continue
+
+        for fid, fields in part_updates.items():
+            updates[fid] = fields
+            updates_owner[fid] = name
+        for coll in by_id:
+            for row in data.get(coll) or []:
+                rid = row.get(id_key[coll])
+                by_id[coll][rid] = row  # replaces a pre-existing entry
+                part_owner[(coll, rid)] = name
+        part_surface = data.get("attack_surface") or {}
+        surface.setdefault("sources", [])
+        surface.setdefault("sinks", [])
+        surface.setdefault("trust_boundaries", [])
+        _dedup_extend(surface["sources"], part_surface.get("sources") or [],
+                      key=lambda r: (r.get("type"), r.get("entry")))
+        _dedup_extend(surface["sinks"], part_surface.get("sinks") or [],
+                      key=lambda r: (r.get("type"), r.get("location")))
+        _dedup_extend(surface["trust_boundaries"],
+                      part_surface.get("trust_boundaries") or [],
+                      key=lambda r: (r.get("boundary"), r.get("check")))
+        merged_names.append(name)
+
+    def _sorted_rows(coll: str) -> list:
+        return [by_id[coll][k] for k in sorted(by_id[coll], key=str)]
+
+    nodes = _sorted_rows("attack_tree_nodes")
+    root = tree.get("root")
+    if not root:
+        node_ids = {n.get("id") for n in nodes}
+        if "ROOT" not in node_ids:
+            referenced = set()
+            for n in nodes:
+                referenced.update(
+                    x for x in str(n.get("leads_to") or "").split(",") if x)
+                referenced.update(n.get("children") or [])
+            top_level = sorted(i for i in node_ids if i not in referenced)
+            nodes.append({
+                "id": "ROOT",
+                "goal": "Attack tree root (synthesised at assembly)",
+                "status": "exploring",
+                "leads_to": ",".join(top_level),
+            })
+            nodes.sort(key=lambda n: str(n.get("id")))
+        root = "ROOT"
+
+    # Referential integrity lives HERE, not in fragment lint — links
+    # legally cross part boundaries and only the merged tree can judge
+    # them. Loud warnings, never fatal: quarantine-and-proceed makes
+    # partial assemblies legal (a dangling target may name a
+    # quarantined part's node — the receipt is the re-dispatch target).
+    node_ids = {n.get("id") for n in nodes}
+    for n in nodes:
+        for tgt in str(n.get("leads_to") or "").split(","):
+            if tgt and tgt not in node_ids:
+                print("WARNING: attack-tree node "
+                      f"{_sft(str(n.get('id')), max_len=80)} leads_to "
+                      f"{_sft(tgt, max_len=80)} which is not in the "
+                      "assembled tree", file=sys.stderr)
+    inventory = load_json(workdir / "findings.json")
+    if isinstance(inventory, dict):
+        known = {f.get("id") for f in inventory.get("findings", [])
+                 if isinstance(f, dict)}
+        for fid in sorted(set(updates) - known):
+            print(f"WARNING: updates key {_sft(str(fid), max_len=80)} is "
+                  "not in the findings.json inventory", file=sys.stderr)
+
+    outputs = {
+        "hypotheses.json": ("hypotheses", _sorted_rows("hypotheses")),
+        "attack-paths.json": ("attack-paths", _sorted_rows("attack_paths")),
+        "attack-tree.json": ("attack-tree",
+                             {"root": root, "nodes": nodes}),
+        "disproven.json": ("disproven",
+                           {"disproven": _sorted_rows("disproven")}),
+        "attack-surface.json": ("attack-surface", surface),
+        "stage-b.json": ("stage", {
+            "stage": "B",
+            "updates": {k: updates[k] for k in sorted(updates)},
+        }),
+    }
+    return outputs, merged_names
+
+
+def assemble_parts(stage: str, workdir: str | Path) -> bool:
+    """Merge stage-<x>-parts/*.json into the canonical stage output(s).
+
+    Returns True when at least one part merged and every assembled
+    output passed validation (quarantines are reported, not fatal);
+    False when nothing could be merged or an assembled output failed.
+    """
+    stage = stage.upper()
+    workdir = Path(workdir)
+    parts_dir = workdir / f"stage-{stage.lower()}-parts"
+    if not parts_dir.is_dir():
+        print(f"ERROR: no parts directory: {parts_dir}", file=sys.stderr)
+        return False
+
+    quarantined: list = []
+    parts = _ingest_parts(stage, parts_dir, quarantined)
+    if not parts and not quarantined:
+        print(f"ERROR: no *.json parts in {parts_dir}", file=sys.stderr)
+        return False
+
+    if stage == "A":
+        outputs, merged_names = _assemble_a(workdir, parts, parts_dir,
+                                            quarantined)
+    elif stage == "B":
+        outputs, merged_names = _assemble_b(workdir, parts, parts_dir,
+                                            quarantined)
+    else:
+        updates, merged_names = _merge_updates(parts, parts_dir, quarantined)
+        inventory = load_json(workdir / "findings.json")
+        if isinstance(inventory, dict):
+            known = {f.get("id") for f in inventory.get("findings", [])
+                     if isinstance(f, dict)}
+            for fid in sorted(set(updates) - known):
+                print(f"WARNING: updates key {_sft(str(fid), max_len=80)} "
+                      "is not in the findings.json inventory",
+                      file=sys.stderr)
+        doc: dict[str, Any] = {"stage": stage, "updates": updates}
+        if stage == "F":
+            # [F-4] top-level review note: the stage merge copies it
+            # into findings.json and the report renders it — dropping
+            # it here silently lost every sharded run's Stage F notes.
+            # Join the surviving parts' notes in sorted-part-filename
+            # order (the `parts` list order), so reassembly stays
+            # deterministic and order-independent.
+            merged = set(merged_names)
+            notes = [
+                data["stage_f_review"].strip()
+                for name, data, _sha, _sanitised in parts
+                if name in merged
+                and isinstance(data.get("stage_f_review"), str)
+                and data["stage_f_review"].strip()
+            ]
+            if notes:
+                doc["stage_f_review"] = "\n\n".join(notes)
+        outputs = {f"stage-{stage.lower()}.json": ("stage", doc)}
+
+    if not merged_names:
+        print("ERROR: every part was quarantined — nothing to assemble",
+              file=sys.stderr)
+        return False
+
+    # Stamp, then validate EVERY output before writing ANY of them
+    # (content was sanitised once at ingestion; the lint's idempotence
+    # gate verifies that, it does not re-sanitise).
+    failed = False
+    for fname, (schema_type, data) in outputs.items():
+        stamp_provenance(data, _GENERATOR, untrusted=True,
+                         overwrite_generator=False)
+        result = _lint.lint_artifact(schema_type, data, fname)
+        for w in result.warnings:
+            print(f"WARNING: {_sft(fname, max_len=100)}: "
+                  f"{_sft(str(w), max_len=300)}",
+                  file=sys.stderr)
+        if result.errors:
+            failed = True
+            print(f"ERRORS in assembled {_sft(fname, max_len=100)}:",
+                  file=sys.stderr)
+            for e in result.errors:
+                print(f"  {_sft(str(e), max_len=300)}", file=sys.stderr)
+    if failed:
+        print("ERROR: assembled output failed validation — nothing "
+              "promoted", file=sys.stderr)
+        return False
+
+    written = {}
+    for fname, (_schema_type, data) in outputs.items():
+        path = workdir / fname
+        save_json(path, data)  # atomic tempfile+rename
+        written[fname] = _part_sha(path)
+
+    from datetime import datetime, timezone
+    part_index = {name: (data, sha, sanitised)
+                  for name, data, sha, sanitised in parts}
+    receipt = {
+        "stage": stage,
+        "parts": [
+            {
+                "name": name,
+                "sha256": part_index[name][1],
+                "provenance": (part_index[name][0].get("provenance")
+                               if isinstance(part_index[name][0], dict)
+                               else None),
+                # Changed-path entries embed producer-chosen keys:
+                # excerpted + count-capped at receipt build (the part
+                # file itself is untouched and recomputable).
+                "sanitised_fields": _bound_sanitised_fields(
+                    part_index[name][2]),
+                "sanitised_fields_total": len(part_index[name][2]),
+            }
+            for name in merged_names
+        ],
+        "quarantined": quarantined,
+        "outputs": written,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    save_json(workdir / f"stage-{stage.lower()}-assembly-receipt.json",
+              receipt)
+
+    print(f"Assembled stage {stage}: {len(merged_names)} part(s) merged, "
+          f"{len(quarantined)} quarantined -> "
+          f"{_sft(', '.join(sorted(written)), max_len=300)}")
+    return True
+
+
+def _parts_main(argv: list[str]) -> None:
+    if len(argv) < 2 or argv[0].upper() not in STAGE_LETTERS:
+        print(f"Usage: {sys.argv[0]} parts <A|B|C|D|E|F> <workdir>",
+              file=sys.stderr)
+        sys.exit(1)
+    workdir = Path(argv[1])
+    if not workdir.is_dir():
+        print(f"ERROR: workdir not found: {workdir}", file=sys.stderr)
+        sys.exit(1)
+    if not assemble_parts(argv[0], workdir):
         sys.exit(1)
 
 
@@ -2882,13 +5412,17 @@ def _flag_value(args, flag):
     n = len(args)
     for i, a in enumerate(args):
         if a == flag:
-            if i + 1 >= n or args[i + 1].startswith("-"):
+            # Bare "-" is a legal value ("explicitly projectless" for
+            # --project, per core/run/pin.py); only flag-SHAPED tokens
+            # (-x, --xyz) are rejected as a missing value.
+            if i + 1 >= n or (args[i + 1].startswith("-")
+                              and args[i + 1] != "-"):
                 print(f"ERROR: {flag} requires a value", file=sys.stderr)
                 sys.exit(1)
             value = args[i + 1]
         elif a.startswith(flag + "="):
             value = a[len(flag) + 1:]
-            if not value or value.startswith("-"):
+            if not value or (value.startswith("-") and value != "-"):
                 print(f"ERROR: {flag} requires a value", file=sys.stderr)
                 sys.exit(1)
     return value
@@ -2896,8 +5430,11 @@ def _flag_value(args, flag):
 
 def main():
     args = sys.argv[1:]
+    if args and args[0] == "parts":
+        _parts_main(args[1:])
+        return
     if not args or args[0] not in STAGES:
-        print(f"Usage: {sys.argv[0]} <0|A|B|C|D|E|F|1> [workdir] [--target <path>] [--out <dir>] [--findings <file>] [--model <id>] [--no-bridge] [--rank] [--dynamic|--no-dynamic] [--build|--no-build] [--mitigation-matrix] [--sanitizer-cut <off|on|strict|shadow>] [--sanitizer-cut-parity-log <path>] [--project <name|->]", file=sys.stderr)
+        print(f"Usage: {sys.argv[0]} <0|A|B|C|D|E|F|1> [workdir] [--target <path>] [--out <dir>] [--findings <file>] [--include-dark] [--model <id>] [--no-bridge] [--rank] [--dynamic|--no-dynamic] [--build|--no-build] [--mitigation-matrix] [--sanitizer-cut <off|on|strict|shadow>] [--sanitizer-cut-parity-log <path>] [--project <name|->] | parts <A|B|C|D|E|F> <workdir>", file=sys.stderr)
         sys.exit(1)
 
     stage = args[0]
@@ -2907,6 +5444,19 @@ def main():
     if project_flag is not None:
         from core.run.pin import set_process_project
         set_process_project(project_flag)
+    # Project sandbox-floor consent: /validate's witness execution
+    # (stage E/F payload runs) goes through core.sandbox in THIS
+    # process, so re-read the standing consent like the run entry
+    # points do (one-target rule: --target / RAPTOR_CALLER_DIR is the
+    # match signal; the workdir positional pins the run's project).
+    # banner=False: this helper's stdout is machine-parsed (the
+    # OUTPUT_DIR sentinel and stage summaries); the sandbox-side
+    # once-per-process banner still logs the in-force surface.
+    _floor_run_dir = (args[1] if len(args) > 1
+                      and not args[1].startswith("--") else None)
+    from core.project.trust import apply_project_sandbox_floor
+    apply_project_sandbox_floor(
+        target_path=target, run_dir=_floor_run_dir, banner=False)
     # Ambient harness model the agent passes (only it knows /model); stage 1
     # records it into models[]. Omitted when absent.
     model = _flag_value(args, "--model")
@@ -2924,6 +5474,10 @@ def main():
     elif "--build" in args:
         build = True
     mitigation_matrix = "--mitigation-matrix" in args
+    # Per-run explicit build command (--build-command): wins over the
+    # project setting and the detector; NOT consent — the build gate
+    # above still decides whether anything builds.
+    build_command = _flag_value(args, "--build-command")
     if "--no-dynamic" in args:
         dynamic = False
     elif "--dynamic" in args:
@@ -2933,6 +5487,9 @@ def main():
         print(f"ERROR: findings file not found: {findings_path}",
               file=sys.stderr)
         sys.exit(1)
+    # Dark-import opt-in: audit dark-grade rows in a --findings import
+    # enter stage-A candidacy instead of the witness backlog.
+    include_dark = "--include-dark" in args
 
     # Sanitizer-cut mode (review #4, PR #794). Stage 0 resolves +
     # persists it; later stages reload it. None means "not passed".
@@ -2944,7 +5501,8 @@ def main():
         prepare_0(None, target, explicit_out=explicit_out, no_bridge=no_bridge,
                   sanitizer_cut_mode=sanitizer_cut_mode,
                   sanitizer_cut_parity_log=sanitizer_cut_parity_log,
-                  findings_path=findings_path, rank=rank)
+                  findings_path=findings_path, rank=rank,
+                  include_dark=include_dark, dynamic=dynamic, build=build)
         return
 
     # All other stages need a workdir
@@ -2966,7 +5524,8 @@ def main():
         prepare_1(workdir, target, model=model)
     elif stage == "E":
         prepare_E(workdir, target, dynamic=dynamic, build=build,
-                  mitigation_matrix=mitigation_matrix)
+                  mitigation_matrix=mitigation_matrix,
+                  build_command=build_command)
     else:
         STAGES[stage](workdir, target)
 

@@ -1,6 +1,7 @@
 """Tests for the Semgrep runner."""
 
 import json
+import shutil
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -11,13 +12,32 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from packages.semgrep.models import SemgrepResult
 from packages.semgrep.runner import (
+    _SCOPE_ISOLATION_MIN_VERSION,
     _config_to_name,
     build_cmd,
     is_available,
     run_rule,
     run_rules,
+    scope_isolation_available,
     version,
 )
+from packages.semgrep.tests.scope_fixture import (
+    EXPECTED_SCOPE_FINDINGS,
+    GIT_NEAR_MISS_FINDINGS,
+    SCOPE_MARKER,
+    create_git_scope_fixture,
+    relative_scope_path,
+    write_scope_rule,
+)
+
+
+@pytest.fixture(autouse=True)
+def _scope_isolation_ok():
+    """Most tests don't care about the version gate — default to available."""
+    with patch("packages.semgrep.runner.scope_isolation_available",
+               return_value=True):
+        yield
+
 
 # Helpers ----------------------------------------------------------------------
 
@@ -39,10 +59,11 @@ def _make_sarif(rule_id="r1", file="a.py", line=1, count=1) -> str:
     return json.dumps({"runs": [{"results": results}]})
 
 
-def _make_json_output(scanned=None, errors=None, version="1.79.0") -> str:
+def _make_json_output(scanned=None, errors=None, version="1.79.0",
+                      skipped=None) -> str:
     """Build minimal --json-output content."""
     return json.dumps({
-        "paths": {"scanned": scanned or []},
+        "paths": {"scanned": scanned or [], "skipped": skipped or []},
         "errors": errors or [],
         "version": version,
     })
@@ -79,6 +100,29 @@ class TestAvailability:
             assert version() is None
 
 
+class TestScopeIsolationAvailable:
+    def test_true_at_floor(self):
+        ver = ".".join(str(p) for p in _SCOPE_ISOLATION_MIN_VERSION)
+        with patch("shutil.which", return_value="/usr/bin/semgrep"), \
+             patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                stdout=f"{ver}\n", stderr="", returncode=0,
+            )
+            assert scope_isolation_available()
+
+    def test_false_below_floor(self):
+        with patch("shutil.which", return_value="/usr/bin/semgrep"), \
+             patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                stdout="1.79.0\n", stderr="", returncode=0,
+            )
+            assert not scope_isolation_available()
+
+    def test_false_when_missing(self):
+        with patch("shutil.which", return_value=None):
+            assert not scope_isolation_available()
+
+
 # build_cmd --------------------------------------------------------------------
 
 class TestBuildCmd:
@@ -90,8 +134,95 @@ class TestBuildCmd:
         idx = cmd.index("--config")
         assert cmd[idx + 1] == "p/security-audit"
         assert "--sarif" in cmd
-        assert "--quiet" in cmd
         assert cmd[-1] == "/src"
+
+    def test_target_ignore_files_neutralised(self):
+        """Scan scope must be RAPTOR-owned, never target-owned.
+
+        Without these flags a hostile repo's ``.semgrepignore`` (root
+        or nested) or ``.gitignore`` silently exempts its own subtrees
+        from the scan — empirically verified on semgrep 1.172.0: a
+        planted ``.semgrepignore`` of ``*`` drops every finding with a
+        clean exit, and both flags restore them.
+        """
+        cmd = build_cmd(Path("/src"), "p/x", semgrep_bin="semgrep")
+        assert "--disable-nosem" in cmd
+        assert "--no-git-ignore" in cmd
+        assert "--x-ignore-semgrepignore-files" in cmd
+
+    def test_scope_isolation_false_omits_flag(self):
+        """Below-floor semgrep: the flag is omitted so the scan can run,
+        but --no-git-ignore (always available) stays."""
+        cmd = build_cmd(Path("/src"), "p/x", semgrep_bin="semgrep",
+                        scope_isolation=False)
+        assert "--no-git-ignore" in cmd
+        assert "--x-ignore-semgrepignore-files" not in cmd
+
+    def test_scope_exclude_baseline_pinned(self):
+        """The RAPTOR-owned exclude baseline is a curated security
+        boundary (dependency/build/artifact names ONLY — adding a
+        first-party-plausible name like ``tests/`` re-opens a
+        name-steerable hiding channel), so its exact contents are
+        pinned literally: any edit must consciously update this test.
+        """
+        from packages.semgrep.runner import SCOPE_EXCLUDE_BASELINE
+        assert SCOPE_EXCLUDE_BASELINE == (
+            ".git",
+            "node_modules/",
+            "bower_components/",
+            ".yarn/",
+            ".npm/",
+            "vendor/",
+            "third_party/",
+            "site-packages/",
+            ".venv/",
+            ".tox/",
+            "build/",
+            "dist/",
+            "*.min.js",
+            "*.min.css",
+            "package-lock.json",
+            "yarn.lock",
+            "pnpm-lock.yaml",
+            "poetry.lock",
+            "Pipfile.lock",
+            "Cargo.lock",
+            "composer.lock",
+            "Gemfile.lock",
+            "go.sum",
+        )
+        # First-party names a target could hide real code under must
+        # never creep in (reject-direction guard for the curation rule).
+        for steerable in (
+            "test/",
+            "tests/",
+            "examples/",
+            "docs/",
+            ".env/",
+            ".*",
+        ):
+            assert steerable not in SCOPE_EXCLUDE_BASELINE
+
+    def test_scope_exclude_baseline_in_cmd(self):
+        """Every baseline pattern rides as an ``--exclude <pattern>``
+        pair — --x-ignore-semgrepignore-files drops semgrep's built-in
+        default ignores, and these args restore Git metadata plus the
+        dependency/build/artifact part of that set."""
+        from packages.semgrep.runner import SCOPE_EXCLUDE_BASELINE
+        cmd = build_cmd(Path("/src"), "p/x", semgrep_bin="semgrep")
+        pairs = [
+            (cmd[i], cmd[i + 1])
+            for i, a in enumerate(cmd[:-1]) if a == "--exclude"
+        ]
+        assert pairs == [("--exclude", p) for p in SCOPE_EXCLUDE_BASELINE]
+
+    def test_verbose_not_quiet(self):
+        """``paths.skipped`` is only populated at --verbose (mutually
+        exclusive with --quiet); --quiet both starved skipped_summary
+        and hid semgrep's own skipped-paths notice."""
+        cmd = build_cmd(Path("/src"), "p/x", semgrep_bin="semgrep")
+        assert "--verbose" in cmd
+        assert "--quiet" not in cmd
 
     def test_includes_disable_version_check(self):
         """The post-scan version-check HTTP GET must never fire: its
@@ -157,6 +288,28 @@ class TestRunRuleMocked:
         assert result.findings == []
         assert not result.ok
 
+    def test_below_floor_warns_and_omits_scope_flag(self, tmp_path, caplog):
+        import logging
+        target = tmp_path / "src"
+        target.mkdir()
+        json_output = _make_json_output(scanned=["src/a.py"])
+        with patch("packages.semgrep.runner.is_available", return_value=True), \
+             patch("packages.semgrep.runner.scope_isolation_available",
+                   return_value=False), \
+             patch("packages.semgrep.runner.version", return_value="1.79.0"), \
+             patch("subprocess.run") as mock_run:
+            def side_effect(cmd, **kwargs):
+                assert "--x-ignore-semgrepignore-files" not in cmd
+                if "--json-output" in cmd:
+                    idx = cmd.index("--json-output")
+                    Path(cmd[idx + 1]).write_text(json_output)
+                return MagicMock(stdout=_make_sarif(count=0), stderr="",
+                                returncode=0)
+            mock_run.side_effect = side_effect
+            with caplog.at_level(logging.WARNING, logger="raptor"):
+                run_rule(target, "p/x", unsandboxed=True)
+        assert any("semgrepignore" in r.message for r in caplog.records)
+
     def test_run_basic(self, tmp_path):
         target = tmp_path / "src"
         target.mkdir()
@@ -186,6 +339,61 @@ class TestRunRuleMocked:
         assert result.semgrep_version == "1.79.0"
         assert result.sarif == sarif
         assert result.elapsed_ms >= 0
+
+    def test_run_surfaces_skipped_summary(self, tmp_path, caplog):
+        """Paths semgrep did NOT scan must reach the result and the
+        log — an empty-findings scan over a heavily skipped tree must
+        not read as a clean verdict."""
+        import logging
+
+        target = tmp_path / "src"
+        target.mkdir()
+        json_output = _make_json_output(
+            scanned=["src/a.py"],
+            skipped=[
+                {"path": "src/vendored/x.js", "reason": "cli_exclude_flags_match"},
+                {"path": "src/huge.py", "reason": "exceeded_size_limit"},
+                {"path": "src/vendored/y.js", "reason": "cli_exclude_flags_match"},
+            ],
+        )
+        with patch("packages.semgrep.runner.is_available", return_value=True), \
+             patch("subprocess.run") as mock_run:
+            def side_effect(cmd, **kwargs):
+                idx = cmd.index("--json-output")
+                Path(cmd[idx + 1]).write_text(json_output)
+                return MagicMock(stdout=_make_sarif(), stderr="", returncode=0)
+            mock_run.side_effect = side_effect
+            with caplog.at_level(logging.INFO, logger="packages.semgrep.runner"):
+                result = run_rule(target, "p/x", unsandboxed=True)
+
+        assert result.skipped_summary["total"] == 3
+        reasons = result.skipped_summary["reasons"]
+        assert reasons["cli_exclude_flags_match"]["count"] == 2
+        assert reasons["exceeded_size_limit"]["sample"] == ["src/huge.py"]
+        assert result.to_dict()["skipped_summary"] == result.skipped_summary
+        # Log line: counts per reason, no target-derived sample paths.
+        log_text = "\n".join(r.getMessage() for r in caplog.records)
+        assert "3 path(s) skipped" in log_text
+        assert "cli_exclude_flags_match=2" in log_text
+        assert "src/huge.py" not in log_text
+
+    def test_run_no_skips_no_summary_no_log(self, tmp_path, caplog):
+        import logging
+
+        target = tmp_path / "src"
+        target.mkdir()
+        with patch("packages.semgrep.runner.is_available", return_value=True), \
+             patch("subprocess.run") as mock_run:
+            def side_effect(cmd, **kwargs):
+                idx = cmd.index("--json-output")
+                Path(cmd[idx + 1]).write_text(_make_json_output(scanned=["a.py"]))
+                return MagicMock(stdout=_make_sarif(), stderr="", returncode=0)
+            mock_run.side_effect = side_effect
+            with caplog.at_level(logging.INFO, logger="packages.semgrep.runner"):
+                result = run_rule(target, "p/x", unsandboxed=True)
+        assert result.skipped_summary == {}
+        assert "skipped" not in "\n".join(
+            r.getMessage() for r in caplog.records)
 
     def test_run_handles_timeout(self, tmp_path):
         target = tmp_path / "src"
@@ -375,7 +583,13 @@ class TestSandboxDefaultPolicy:
         mk.assert_not_called()
         assert "cmd" in calls
 
-    def test_registry_config_keeps_network_local_blocks(self, tmp_path):
+    def test_registry_config_gets_proxied_egress_local_blocks(
+            self, tmp_path):
+        """Posture pin: registry configs route through the egress
+        proxy with the shared semgrep hostname allowlist — never
+        open network (semgrep parses attacker-controlled source; a
+        parser compromise must not get a free exfil channel). Local
+        rule paths keep the full network block."""
         from packages.semgrep.runner import _default_sandbox_runner
         captured = {}
 
@@ -386,10 +600,18 @@ class TestSandboxDefaultPolicy:
         with patch("core.sandbox.context.run", side_effect=fake_sandbox_run):
             runner = _default_sandbox_runner(tmp_path, "p/security-audit")
             runner(["semgrep"], capture_output=True)
-            assert captured["block_network"] is False
+            assert captured.get("block_network") is not False
+            assert captured["use_egress_proxy"] is True
+            assert captured["proxy_hosts"], (
+                "registry lane must carry a hostname allowlist"
+            )
+            assert any("semgrep" in h for h in captured["proxy_hosts"])
+
+            captured.clear()
             runner = _default_sandbox_runner(tmp_path, "/local/rules.yaml")
             runner(["semgrep"], capture_output=True)
             assert captured["block_network"] is True
+            assert "use_egress_proxy" not in captured
             assert captured["target"] == str(tmp_path)
 
 
@@ -530,6 +752,11 @@ class TestErrorTruthLive:
     verified silence. Runs the real binary (trusted local fixtures,
     hence unsandboxed=True)."""
 
+    @pytest.fixture(autouse=True)
+    def _scope_isolation_ok(self):
+        """Override the module-level fixture — live tests need the real check."""
+        yield
+
     def test_invalid_rule_reports_error_not_silence(self, tmp_path):
         rule = tmp_path / "invalid.yaml"
         rule.write_text(
@@ -548,6 +775,201 @@ class TestErrorTruthLive:
         assert result.errors, "invalid rule read as verified silence"
         assert not result.ok
         assert result.findings == []
+
+
+@pytest.mark.skipif(not is_available(), reason="semgrep not installed")
+@pytest.mark.skipif(
+    is_available() and not scope_isolation_available(),
+    reason="semgrep below scope-isolation floor",
+)
+class TestScanScopeLive:
+    """Real-semgrep regression for target-steered scan scope: semgrep
+    honours the SCANNED repo's ``.semgrepignore`` by default, so a
+    hostile target shipping one line of config could silently exempt
+    its own subtrees (clean exit, empty findings). Runs the real
+    binary (trusted local fixtures, hence unsandboxed=True)."""
+
+    @pytest.fixture(autouse=True)
+    def _scope_isolation_ok(self):
+        """Override the module-level fixture — live tests need the real check."""
+        yield
+
+    @staticmethod
+    def _eval_rule(tmp_path):
+        rule = tmp_path / "rule.yaml"
+        rule.write_text(
+            "rules:\n"
+            "  - id: eval.use\n"
+            "    pattern: eval(...)\n"
+            "    message: eval use\n"
+            "    languages: [python]\n"
+            "    severity: ERROR\n",
+            encoding="utf-8",
+        )
+        return rule
+
+    def test_planted_semgrepignore_does_not_suppress(self, tmp_path):
+        rule = self._eval_rule(tmp_path)
+        target = tmp_path / "tgt"
+        target.mkdir()
+        (target / "vuln.py").write_text('eval("x")\n', encoding="utf-8")
+        (target / ".semgrepignore").write_text("*\n", encoding="utf-8")
+        result = run_rule(target, str(rule), timeout=120, unsandboxed=True)
+        assert result.ok, result.errors
+        assert any(f.file.endswith("vuln.py") for f in result.findings), (
+            "target-shipped .semgrepignore suppressed the scan scope"
+        )
+
+    @pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+    def test_planted_gitignore_untracked_file_still_scanned(self, tmp_path):
+        """--no-git-ignore semantic pin: inside a git repo, semgrep by
+        default drops files matched by the TARGET's ``.gitignore`` —
+        an untracked-but-gitignored source file vanishes from scope.
+        A hostile repo gitignoring its own payload must not work."""
+        import subprocess as sp
+        rule = self._eval_rule(tmp_path)
+        target = tmp_path / "tgt"
+        target.mkdir()
+        sp.run(
+            ["git", "init", "-q", str(target)],
+            check=True, capture_output=True, timeout=60,
+        )
+        (target / ".gitignore").write_text("vuln.py\n", encoding="utf-8")
+        (target / "vuln.py").write_text('eval("x")\n', encoding="utf-8")
+        result = run_rule(target, str(rule), timeout=120, unsandboxed=True)
+        assert result.ok, result.errors
+        assert any(f.file.endswith("vuln.py") for f in result.findings), (
+            "target-shipped .gitignore suppressed an untracked source file"
+        )
+
+    def test_tests_dirname_is_scanned(self, tmp_path):
+        """Steerable-channel pin: semgrep's built-in defaults skip any
+        directory NAMED ``tests/`` — a target could hide real code by
+        picking the name. SCOPE_EXCLUDE_BASELINE deliberately leaves
+        first-party-plausible names in scope."""
+        rule = self._eval_rule(tmp_path)
+        target = tmp_path / "tgt"
+        (target / "tests").mkdir(parents=True)
+        (target / "tests" / "vuln.py").write_text(
+            'eval("x")\n', encoding="utf-8",
+        )
+        result = run_rule(target, str(rule), timeout=120, unsandboxed=True)
+        assert result.ok, result.errors
+        assert any("tests" in f.file and f.file.endswith("vuln.py")
+                   for f in result.findings), (
+            "a dir named tests/ was silently exempted from the scan"
+        )
+
+    def test_baseline_excludes_node_modules_and_reports_skip(self, tmp_path):
+        """The RAPTOR-owned baseline replaces semgrep's built-in
+        defaults for dependency trees: node_modules/ stays out of
+        scope AND the skip is visible in skipped_summary."""
+        rule = self._eval_rule(tmp_path)
+        target = tmp_path / "tgt"
+        (target / "node_modules").mkdir(parents=True)
+        (target / "node_modules" / "dep.py").write_text(
+            'eval("x")\n', encoding="utf-8",
+        )
+        (target / "app.py").write_text('eval("x")\n', encoding="utf-8")
+        result = run_rule(target, str(rule), timeout=120, unsandboxed=True)
+        assert result.ok, result.errors
+        assert any(f.file.endswith("app.py") for f in result.findings)
+        assert not any("node_modules" in f.file for f in result.findings)
+        reasons = result.skipped_summary.get("reasons", {})
+        assert reasons.get("cli_exclude_flags_match", {}).get("count", 0) >= 1, (
+            "baseline exclusion happened but was invisible in skipped_summary"
+        )
+
+    @pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+    def test_exact_git_exclusion_keeps_near_misses_and_first_party_scope(
+        self, tmp_path,
+    ):
+        """Only exact .git metadata is excluded; near misses remain live.
+
+        ``git init`` supplies the same sample hooks that produced SG-1's
+        four Bash parse warnings. A nested repository exercises basename
+        matching below the root, while pointer files model submodules and
+        linked worktrees. The matching .github, filename, and application
+        directory near misses prove the policy did not widen beyond .git.
+        Everything else is deliberately uncommitted.
+        """
+        rule = write_scope_rule(tmp_path)
+        target = create_git_scope_fixture(tmp_path)
+
+        result = run_rule(
+            target,
+            str(rule),
+            timeout=120,
+            unsandboxed=True,
+        )
+
+        assert result.ok, result.errors
+        finding_paths = sorted(
+            relative_scope_path(f.file, target) for f in result.findings
+        )
+        assert finding_paths == list(EXPECTED_SCOPE_FINDINGS)
+        assert set(GIT_NEAR_MISS_FINDINGS).issubset(finding_paths)
+
+        failed_paths = [
+            relative_scope_path(entry["path"], target)
+            for entry in result.files_failed
+        ]
+        assert failed_paths == ["broken.sh"]
+        assert "Syntax error" in result.files_failed[0]["reason"]
+        assert not any(".git" in Path(path).parts for path in failed_paths)
+
+        reasons = result.skipped_summary.get("reasons", {})
+        git_skips = reasons.get("cli_exclude_flags_match", {})
+        assert git_skips.get("count", 0) >= 4
+        git_skip_samples = {
+            relative_scope_path(path, target)
+            for path in git_skips.get("sample", [])
+        }
+        assert {
+            ".git",
+            "nested-repo/.git",
+            "submodule/.git",
+            "worktree/.git",
+        }.issubset(git_skip_samples)
+
+    def test_root_and_nested_git_pointer_files_are_excluded(self, tmp_path):
+        """A worktree root cannot also contain a normal ``.git/`` directory."""
+        rule = write_scope_rule(tmp_path)
+        target = tmp_path / "worktree-target"
+        nested = target / "submodule"
+        nested.mkdir(parents=True)
+        (target / ".git").write_text(
+            f"gitdir: ../metadata/{SCOPE_MARKER}\n",
+            encoding="utf-8",
+        )
+        (nested / ".git").write_text(
+            f"gitdir: ../../metadata/{SCOPE_MARKER}\n",
+            encoding="utf-8",
+        )
+        (target / "app.txt").write_text(
+            f"{SCOPE_MARKER}\n",
+            encoding="utf-8",
+        )
+
+        result = run_rule(
+            target,
+            str(rule),
+            timeout=120,
+            unsandboxed=True,
+        )
+
+        assert result.ok, result.errors
+        assert [
+            relative_scope_path(f.file, target) for f in result.findings
+        ] == ["app.txt"]
+        assert result.files_failed == []
+        reasons = result.skipped_summary.get("reasons", {})
+        git_skips = reasons.get("cli_exclude_flags_match", {})
+        assert git_skips.get("count") == 2
+        assert {
+            relative_scope_path(path, target)
+            for path in git_skips.get("sample", [])
+        } == {".git", "submodule/.git"}
 
 
 # Opt-in with ``pytest -m integration``.
@@ -650,3 +1072,30 @@ class TestOutputBudget:
         )
         assert not result.ok
         assert result.sarif == ""  # oversized text never retained
+
+
+class TestBudgetMeasuresBytes:
+    def test_non_ascii_payload_over_byte_budget_is_refused(
+        self, tmp_path, monkeypatch,
+    ):
+        """The budget is declared in bytes; len(str) counts
+        characters and UTF-8 encodes up to 4 bytes per char — a
+        non-ASCII payload could weigh 4x the budget while passing a
+        character-count gate."""
+        import packages.semgrep.runner as runner_mod
+
+        target = tmp_path / "src"
+        target.mkdir()
+        # 100 chars, 200 bytes in UTF-8.
+        payload = "é" * 100
+        monkeypatch.setattr(runner_mod, "_MAX_TOOL_OUTPUT_BYTES", 150)
+        with patch("packages.semgrep.runner.is_available",
+                   return_value=True), \
+             patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                stdout=payload, stderr="", returncode=0,
+            )
+            result = run_rule(target, "p/x", unsandboxed=True)
+        assert not result.ok
+        assert any("budget" in e and "bytes" in e for e in result.errors)
+        assert result.sarif == ""

@@ -122,6 +122,28 @@ class TestComputeStats:
         assert by_name["llm"]["mechanical"] is False
         assert by_name["mech"]["mechanical"] is True
 
+    def test_load_review_state_carries_site_span(self, monkeypatch):
+        # The verdict-override join binds a finding's line to the
+        # journal site whose span contains it — the records must
+        # carry both span ends, not just line_start.
+        from types import SimpleNamespace
+
+        from core.audit import journal as journal_mod
+        from core.audit.report import _load_review_state
+
+        entry = SimpleNamespace(
+            file="a.c", function="f1", verdict="clean",
+            source_hash="h", strategies=["taint"], body="deep dive",
+            line_start=40, line_end=60, ts="2026-01-01T00:00:00Z",
+        )
+        monkeypatch.setattr(
+            journal_mod, "load_entries", lambda out_dir: [entry],
+        )
+        state = _load_review_state(Path("/nonexistent"))
+        (rec,) = state["functions_analysed"]
+        assert rec["line_start"] == 40
+        assert rec["line_end"] == 60
+
     def test_functions_analysed_format(self):
         audit_data = {
             "functions_analysed": [
@@ -220,6 +242,54 @@ class TestFormatSummary:
         assert "Findings" not in summary.split("Tool-confirmed")[0]
 
 
+class TestToolchainScreenSurfacing:
+    @staticmethod
+    def _screen_record(function: str) -> str:
+        return json.dumps({
+            "rule_id": "audit:toolchain-screen",
+            "verdict": "toolchain_glance_screened",
+            "file_path": "binary:libx",
+            "function": function,
+            "dropped": False,
+        })
+
+    def test_loader_counts_screen_records(self, tmp_path: Path):
+        from core.audit.report import _load_toolchain_screen
+
+        (tmp_path / "suppressions.jsonl").write_text(
+            "\n".join([
+                self._screen_record("std::vector<int>::push_back(int)"),
+                self._screen_record("__cxa_throw"),
+                json.dumps({"rule_id": "audit:glance-escalation-cap"}),
+            ]) + "\n"
+        )
+        assert _load_toolchain_screen(tmp_path) == 2
+
+    def test_loader_zero_without_records(self, tmp_path: Path):
+        from core.audit.report import _load_toolchain_screen
+
+        assert _load_toolchain_screen(tmp_path) == 0
+        (tmp_path / "suppressions.jsonl").write_text(
+            json.dumps({"rule_id": "audit:vendored-triage"}) + "\n"
+        )
+        assert _load_toolchain_screen(tmp_path) == 0
+
+    def test_report_field_and_summary_line(self, tmp_path: Path):
+        (tmp_path / "suppressions.jsonl").write_text(
+            self._screen_record("std::vector<int>::push_back(int)")
+            + "\n"
+        )
+        report = generate_report(tmp_path)
+        assert report["toolchain_glance_screened"] == 1
+        assert "Toolchain screen: 1 binary toolchain" in report["summary"]
+        assert "by-design name-evidence screen" in report["summary"]
+
+    def test_no_summary_line_without_records(self, tmp_path: Path):
+        report = generate_report(tmp_path)
+        assert "toolchain_glance_screened" not in report
+        assert "Toolchain screen:" not in report["summary"]
+
+
 class TestGenerateReport:
     def test_basic_report(self, tmp_path: Path):
         # Post-migration: review state comes from the review journal,
@@ -294,6 +364,47 @@ class TestUnrecordedReads:
 
     def test_no_manifest(self, tmp_path: Path):
         result = _find_unrecorded_reads(tmp_path, {"files": {}}, None)
+        assert result == []
+
+    def _checklist_and_target(self, tmp_path: Path) -> Path:
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "a.c").write_text("int f1() {}")
+        (tmp_path / "checklist.json").write_text(json.dumps({
+            "files": [
+                {
+                    "path": "a.c",
+                    "items": [
+                        {"name": "f1", "kind": "function",
+                         "line_start": 1},
+                    ],
+                },
+            ],
+        }))
+        return target
+
+    def test_fifo_manifest_does_not_block(self, tmp_path: Path):
+        # The manifest sits in the sandbox write grant: a planted
+        # FIFO wedged report finalize forever on a raw open(). The
+        # chokepoint reader refuses non-regular files.
+        import os as _os
+        import time as _time
+
+        target = self._checklist_and_target(tmp_path)
+        _os.mkfifo(tmp_path / ".reads-manifest")
+        t0 = _time.monotonic()
+        result = _find_unrecorded_reads(tmp_path, {"files": {}}, target)
+        assert _time.monotonic() - t0 < 2.0, "FIFO plant blocked finalize"
+        assert result == []
+
+    def test_symlink_manifest_not_followed(self, tmp_path: Path):
+        # A symlink plant pulled a foreign file into the comparison —
+        # the chokepoint reader refuses the link inode.
+        target = self._checklist_and_target(tmp_path)
+        foreign = tmp_path / "foreign-listing"
+        foreign.write_text(str(target / "a.c") + "\n")
+        (tmp_path / ".reads-manifest").symlink_to(foreign)
+        result = _find_unrecorded_reads(tmp_path, {"files": {}}, target)
         assert result == []
 
     def test_all_recorded(self, tmp_path: Path):
@@ -635,3 +746,183 @@ class TestRemainingGapsSetDifference:
             {"functions_analysed": [
                 {"file": "a.c", "function": "f", "status": "clean"}]},
         ) == 4
+
+
+class TestEdgeObligationsBlock:
+    """_load_edge_obligations journal join — latest verdict per edge."""
+
+    @staticmethod
+    def _write_obligations(out_dir: Path) -> None:
+        (out_dir / "edge-obligations.json").write_text(json.dumps({
+            "tier1": [{
+                "caller_file": "src/a.c", "caller": "caller_fn",
+                "callee_file": "src/b.c", "callee": "callee_fn",
+            }],
+            "tier2": [],
+            "blind_spots": [],
+        }))
+
+    @staticmethod
+    def _edge_entry(ts: str, verdict: str):
+        from core.audit.edge_review import edge_callee_id
+        from core.coverage.journal import ReviewJournalEntry
+        return ReviewJournalEntry(
+            ts=ts, run_id="r1", file="src/a.c", function="caller_fn",
+            verdict=verdict, source_hash="",
+            edge_callee=edge_callee_id("src/b.c", "callee_fn"),
+        )
+
+    def test_re_reviewed_finding_to_clean_drops_stale_row(self, tmp_path):
+        from core.audit.report import _load_edge_obligations
+        from core.coverage.journal import append_entry
+        self._write_obligations(tmp_path)
+        append_entry(tmp_path, self._edge_entry(
+            "2026-01-01T00:00:00", "finding"))
+        append_entry(tmp_path, self._edge_entry(
+            "2026-01-02T00:00:00", "clean"))
+        block = _load_edge_obligations(tmp_path)
+        assert block is not None
+        assert "edge_findings" not in block
+        assert block["tier1_unreviewed"] == 0
+
+    def test_latest_finding_listed_exactly_once(self, tmp_path):
+        from core.audit.report import _load_edge_obligations
+        from core.coverage.journal import append_entry
+        self._write_obligations(tmp_path)
+        append_entry(tmp_path, self._edge_entry(
+            "2026-01-01T00:00:00", "clean"))
+        append_entry(tmp_path, self._edge_entry(
+            "2026-01-02T00:00:00", "finding"))
+        block = _load_edge_obligations(tmp_path)
+        assert block is not None
+        assert block.get("edge_findings") == [{
+            "caller": "src/a.c:caller_fn",
+            "callee": self._edge_entry("t", "finding").edge_callee,
+            "cwe": None,
+        }]
+
+
+class TestFormatSummaryFallback:
+    def test_present_summary_returned_without_recompute(self):
+        # The fallback must be lazy: with "summary" present the report
+        # need not be _format_summary-shaped at all (a stats value the
+        # recompute would choke on proves the fallback never ran).
+        report = {"summary": "precomputed", "stats": ["not-a-dict"]}
+        assert format_summary(report) == "precomputed"
+
+
+class TestChannelHealthBlockSanitised:
+    """trip_reason originates from channel error strings (tool stderr
+    that can echo target-derived bytes) persisted in
+    tier-diagnostics.json — the summary block must sanitise it and the
+    channel name like every sibling block."""
+
+    def _report(self, name: str, reason: str) -> dict:
+        return {
+            "stats": {
+                "reviewed": 1, "clean": 1, "suspicious": 0,
+                "finding": 0, "error": 0,
+            },
+            "findings_count": 0,
+            "gaps_remaining": 0,
+            "findings": [],
+            "channel_health": {
+                name: {
+                    "tripped": True,
+                    "trip_reason": reason,
+                    "total_successes": 2,
+                    "total_errors": 3,
+                    "gated_spends": [],
+                },
+            },
+        }
+
+    def test_hostile_trip_reason_and_name_escaped(self):
+        summary = _format_summary(self._report(
+            "joern\x1b[2J",
+            "query failed: \x1b]0;pwned\x07 /target/a.c",
+        ))
+        assert "\x1b" not in summary
+        assert "\x07" not in summary
+        assert "channel unhealthy" in summary
+
+    def test_clean_reason_rendered(self):
+        summary = _format_summary(
+            self._report("joern", "consecutive dispatch failures"),
+        )
+        assert "consecutive dispatch failures" in summary
+        assert "2 dispatch(es) completed before the trip" in summary
+
+
+class TestSubstrateSkipBlock:
+    """Report honesty block for substrate skips: a tier that could
+    not look must be named, with its skip count and dominant
+    unmodeled language — and stays silent on unaffected runs."""
+
+    def _tier_diag(self, tmp_path: Path, data: dict) -> None:
+        (tmp_path / "tier-diagnostics.json").write_text(
+            json.dumps(data),
+        )
+
+    def test_block_names_tier_count_and_language(self, tmp_path: Path):
+        self._tier_diag(tmp_path, {
+            "coccinelle": {
+                "confirmed": 0, "refuted": 0, "inconclusive": 0,
+                "skipped": 283, "errors": 0, "wall_time_s": 0.0,
+                "skipped_substrate": 283,
+                "substrate_skip_languages": {"php": 280, "unknown": 3},
+            },
+            "semgrep": {
+                "confirmed": 2, "refuted": 5, "inconclusive": 0,
+                "skipped": 0, "errors": 0, "wall_time_s": 1.0,
+            },
+        })
+        report = generate_report(tmp_path)
+        assert report["substrate_skips"] == {
+            "coccinelle": {
+                "count": 283,
+                "languages": {"php": 280, "unknown": 3},
+            },
+        }
+        summary = report["summary"]
+        assert "Substrate skips" in summary
+        assert "coccinelle: 283 check(s) skipped" in summary
+        assert "`php`" in summary
+        assert "Skipped is not refuted" in summary
+
+    def test_no_block_without_substrate_skips(self, tmp_path: Path):
+        # Early-exit/health skips alone must not raise the banner.
+        self._tier_diag(tmp_path, {
+            "coccinelle": {
+                "confirmed": 1, "refuted": 2, "inconclusive": 0,
+                "skipped": 4, "errors": 0, "wall_time_s": 0.0,
+            },
+        })
+        report = generate_report(tmp_path)
+        assert "substrate_skips" not in report
+        assert "Substrate skips" not in report["summary"]
+
+    def test_hostile_language_value_escaped(self, tmp_path: Path):
+        self._tier_diag(tmp_path, {
+            "coccinelle": {
+                "confirmed": 0, "refuted": 0, "inconclusive": 0,
+                "skipped": 1, "errors": 0, "wall_time_s": 0.0,
+                "skipped_substrate": 1,
+                # ANSI bytes must be escaped AND an embedded backtick
+                # must not terminate the rendered code span (live
+                # markdown breakout).
+                "substrate_skip_languages": {
+                    "php\x1b[2J` **pwned**": 1,
+                },
+            },
+        })
+        summary = generate_report(tmp_path)["summary"]
+        assert "\x1b" not in summary
+        assert "Substrate skips" in summary
+        assert "`php" in summary
+        # The hostile payload stays inside one code span: no bare
+        # backtick from the value survives to close it early.
+        line = next(
+            ln for ln in summary.splitlines() if "dominant" in ln
+        )
+        assert line.count("`") == 2

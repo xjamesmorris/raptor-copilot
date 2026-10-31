@@ -194,6 +194,50 @@ class TestCheckInterproceduralGuards:
         assert result.unguarded_callers >= 1
         assert not result.all_callers_guarded
 
+    def test_joern_guarded_call_site_line_reaches_guards_query(self):
+        """Guard lookup must anchor on the CALL-SITE line, not the
+        caller's declaration line.
+
+        The mock emulates a CPG where method ``handle`` is DECLARED at
+        line 70 and calls the callee at line 77 inside an if-guard:
+        a .caller-based callers query can only see the declaration
+        line (70), a .callIn-based one sees the call-site line (77),
+        and — like real Joern — the guards query finds the enclosing
+        IF only when filtered on the call-site line. Wiring the
+        declaration line through reads every call site as unguarded
+        and fabricates unguarded_callers evidence.
+        """
+        class FakeJoernResult:
+            def __init__(self, raw, ok=True):
+                self.raw_output = raw
+                self.ok = ok
+
+        class MockCpgServer:
+            def query(self, q):
+                if ".callIn" in q:
+                    # Call-site node: the actual call line.
+                    return FakeJoernResult("List((src/main.c, handle, 77))")
+                if ".caller" in q:
+                    # Calling Method node: its declaration line.
+                    return FakeJoernResult("List((src/main.c, handle, 70))")
+                if "Some(77)" in q:
+                    # Only a call anchored at the call-site line has
+                    # an enclosing IF.
+                    return FakeJoernResult('List("is_valid(req)")')
+                return FakeJoernResult("List()")
+
+        result = check_interprocedural_guards(
+            "do_copy", "src/handler.c",
+            joern_server=MockCpgServer(),
+        )
+        assert result.total_callers == 1
+        assert result.guarded_callers == 1
+        assert result.unguarded_callers == 0
+        assert result.all_callers_guarded
+        assert result.caller_guards[0].caller_function == "handle"
+        assert result.caller_guards[0].caller_line == 77
+        assert result.caller_guards[0].guard_text == "is_valid(req)"
+
     def test_to_dict(self):
         result = InterproceduralGuardResult(
             callee_function="process",
@@ -315,18 +359,24 @@ class TestQueryBuilders:
     def test_safe_name_rejects_empty(self):
         assert _safe_name("") is None
 
-    def test_callers_query_uses_caller_not_callIn(self):
+    def test_callers_query_uses_callIn_not_caller(self):
+        # .callIn yields the call-site node whose lineNumber is the
+        # actual call line; .caller yields the calling Method whose
+        # lineNumber is its DECLARATION line, which can never match
+        # the isCall line filter in the caller-guards query.
         q = _build_callers_query("process_input")
         assert q is not None
-        assert ".caller" in q
-        assert ".callIn" not in q
+        assert ".callIn" in q
+        assert ".caller" not in q
 
-    def test_callers_query_maps_filename_name_line(self):
+    def test_callers_query_maps_filename_name_callsite_line(self):
         q = _build_callers_query("handle_request")
         assert q is not None
-        assert "m.filename" in q
-        assert "m.name" in q
-        assert "lineNumber" in q
+        assert "c.method.filename" in q
+        assert "c.method.name" in q
+        # The tuple's line is the CALL node's line, not the method's.
+        assert "c.lineNumber" in q
+        assert "m.lineNumber" not in q
 
     def test_guard_identifiers_query(self):
         q = _build_guard_identifiers_query("my_func", 42)
@@ -371,6 +421,16 @@ class TestQueryBuilders:
         assert "lineNumber == Some(25)" in q
         assert "isControlStructure" in q
         assert "condition.code.l" in q
+
+    def test_caller_guards_query_anchors_call_then_walks_ancestors(self):
+        # The line filter anchors on the CALL node at the call-site
+        # line; enclosing IFs are collected by walking AST ancestors
+        # with the traversal collect step (node-level predicates like
+        # filter(_.isControlStructure) do not exist on stored nodes).
+        q = _build_caller_guards_query("main", 25)
+        assert q is not None
+        assert ".ast.isCall" in q
+        assert '.inAst.isControlStructure.controlStructureType("IF")' in q
 
     def test_invalid_name_returns_none(self):
         assert _build_callers_query("") is None
@@ -482,3 +542,20 @@ class TestContractCompliance:
         )
         assert ev.source == "condition_cpg"
         assert ev.action == "add_finding"
+
+
+class TestSplitScalaItemsEscapes:
+    def test_escaped_quote_does_not_shear_items(self):
+        # A Scala-escaped \" inside an element toggled the naive
+        # string state and sheared every later element at the wrong
+        # comma (advisory channel: garbage identifiers fail to match).
+        from core.audit.condition_cpg import _split_scala_items
+
+        items = _split_scala_items(r'"a\"b", "c", "d"')
+        assert len(items) == 3
+        assert items[1] == "c" and items[2] == "d"
+
+    def test_plain_items_unchanged(self):
+        from core.audit.condition_cpg import _split_scala_items
+
+        assert _split_scala_items('"a", "b,c", d') == ["a", "b,c", "d"]

@@ -22,12 +22,12 @@ from __future__ import annotations
 
 import logging
 import re
-import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 
 from . import ResolverResult, _check_tool, _run
+from ._safe_io import copy_regular_file
 
 logger = logging.getLogger(__name__)
 
@@ -86,16 +86,26 @@ class YarnResolver:
         # Berry (2.x+) removed --ignore-scripts; the equivalent is the
         # YARN_ENABLE_SCRIPTS env var.  Set it unconditionally — harmless
         # on classic (ignores unknown env), load-bearing on Berry.
-        env = {"YARN_ENABLE_SCRIPTS": "false"}
+        # Overlay on the allowlisted safe environment — the sandbox
+        # passes a caller-supplied env dict VERBATIM, so a bare
+        # ``{"YARN_ENABLE_SCRIPTS": ...}`` replaced get_safe_env()
+        # wholesale (dropping PATH/locale and, more importantly,
+        # bypassing the one place env hygiene for children is
+        # defined; repo standard: every child env derives from
+        # RaptorConfig.get_safe_env()).
+        from core.config import RaptorConfig
+        env = RaptorConfig.get_safe_env()
+        env["YARN_ENABLE_SCRIPTS"] = "false"
 
         # Copy manifest files into a writable tempdir — the sandbox
         # only allows writes to the output dir and /tmp, not cwd.
         with tempfile.TemporaryDirectory(prefix="raptor-sca-yarn-") as tmp:
             tmp_path = Path(tmp)
+            # lstat-gated, size-bounded copies — a symlinked or
+            # special-file manifest in the scanned (hostile) tree is
+            # refused instead of followed / opened.
             for fname in ("package.json", "yarn.lock"):
-                src = project_dir / fname
-                if src.exists():
-                    shutil.copy2(src, tmp_path / fname)
+                copy_regular_file(project_dir / fname, tmp_path / fname)
 
             try:
                 proc = _run(
@@ -133,9 +143,13 @@ class YarnResolver:
 def _detect_major_version() -> int | None:
     """Return Yarn's major version, or None if it can't be parsed."""
     try:
+        # Sanitised env (the codeql version-probe idiom): yarn is a
+        # node launcher and honours NODE_OPTIONS from the shell.
+        from core.security.env_sanitisation import safe_subprocess_env
         proc = subprocess.run(
             ["yarn", "--version"],
             capture_output=True, text=True, timeout=5,
+            env=safe_subprocess_env(strip_target_markers=True),
         )
     except (FileNotFoundError, subprocess.SubprocessError, OSError):
         return None

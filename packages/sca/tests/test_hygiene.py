@@ -318,3 +318,169 @@ def test_lockfile_missing_not_silenced_by_bare_shrinkwrap_name(
         [_manifest(pkg, "npm")], [_dep("lodash", path=pkg)],
     )
     assert any(f.kind == "lockfile_missing" for f in findings)
+
+
+# ---------------------------------------------------------------------------
+# lockfile_missing silenced by -r include chain
+# ---------------------------------------------------------------------------
+
+
+def test_lockfile_missing_silenced_by_r_include_with_lockfile_sibling(
+    tmp_path: Path,
+) -> None:
+    """A ``requirements-dev.txt`` with ``-r ../common/requirements.txt``
+    should not fire lockfile_missing when ``common/`` has a lockfile
+    sibling."""
+    dev_dir = tmp_path / "app"
+    dev_dir.mkdir()
+    dev_reqs = dev_dir / "requirements-dev.txt"
+    dev_reqs.write_text("-r ../common/requirements.txt\npytest==8.0\n")
+
+    common_dir = tmp_path / "common"
+    common_dir.mkdir()
+    (common_dir / "requirements.txt").write_text("flask==3.0\n")
+    (common_dir / "requirements.lock").write_text("flask==3.0.0\n")
+
+    deps = [_dep("pytest", ecosystem="PyPI", path=dev_reqs)]
+    findings = check_lockfile_missing(
+        [_manifest(dev_reqs, "PyPI")],
+        deps,
+    )
+    assert all(f.kind != "lockfile_missing" for f in findings), (
+        "-r include target's sibling lockfile should suppress"
+    )
+
+
+def test_lockfile_missing_still_fires_when_r_include_target_has_no_lockfile(
+    tmp_path: Path,
+) -> None:
+    """The -r include chain should NOT suppress when the included
+    directory ALSO lacks a lockfile.  We use ``base.txt`` (not
+    ``requirements.txt``) as the include target so the target's own
+    filename doesn't accidentally satisfy the physical-file check
+    (``requirements.txt`` IS one of the expected lockfile names)."""
+    dev_dir = tmp_path / "app"
+    dev_dir.mkdir()
+    dev_reqs = dev_dir / "requirements-dev.txt"
+    dev_reqs.write_text("-r ../common/base.txt\npytest==8.0\n")
+
+    common_dir = tmp_path / "common"
+    common_dir.mkdir()
+    (common_dir / "base.txt").write_text("flask==3.0\n")
+    # No lockfile in common/.
+
+    deps = [_dep("pytest", ecosystem="PyPI", path=dev_reqs)]
+    findings = check_lockfile_missing(
+        [_manifest(dev_reqs, "PyPI")],
+        deps,
+    )
+    assert any(f.kind == "lockfile_missing" for f in findings)
+
+
+def test_r_include_with_traversal_is_skipped(tmp_path) -> None:
+    """A hostile ``-r ../../...`` include must not steer the lockfile
+    probe outside the scanned target (the old guard's two branches
+    were byte-identical — a no-op). Containment, not a ``..`` ban:
+    monorepo includes inside the root keep working."""
+    from packages.sca.hygiene import _included_dir_has_lockfile
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "requirements.lock").write_text("x==1\n", encoding="utf-8")
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    manifest = proj / "requirements.txt"
+    manifest.write_text("-r ../outside/requirements.txt\n",
+                        encoding="utf-8")
+    (outside / "requirements.txt").write_text("x==1\n", encoding="utf-8")
+
+    assert _included_dir_has_lockfile(
+        manifest, ("requirements.lock",), set(), "PyPI", root=proj,
+    ) is False
+
+    # Direction two: a legitimate same-tree include still counts.
+    sub = proj / "sub"
+    sub.mkdir()
+    (sub / "requirements.txt").write_text("y==1\n", encoding="utf-8")
+    (sub / "requirements.lock").write_text("y==1\n", encoding="utf-8")
+    manifest.write_text("-r sub/requirements.txt\n", encoding="utf-8")
+    assert _included_dir_has_lockfile(
+        manifest, ("requirements.lock",), set(), "PyPI", root=proj,
+    ) is True
+    # Monorepo direction: a ``..`` include that stays INSIDE the
+    # scanned root keeps counting (containment, not a ``..`` ban).
+    common = tmp_path / "common"
+    common.mkdir()
+    (common / "requirements.txt").write_text("z==1\n", encoding="utf-8")
+    (common / "requirements.lock").write_text("z==1\n", encoding="utf-8")
+    manifest.write_text("-r ../common/requirements.txt\n",
+                        encoding="utf-8")
+    assert _included_dir_has_lockfile(
+        manifest, ("requirements.lock",), set(), "PyPI", root=tmp_path,
+    ) is True
+
+
+def test_r_include_blank_line_run_is_fast(tmp_path) -> None:
+    """Hostile requirements.txt carrying a blank-line RUN the greedy
+    span cannot hand to a match: under the MULTILINE ``^`` anchor a
+    ``\\s*`` indent matched at every line start inside the run and
+    re-scanned the remainder per anchor — quadratic. The firing shape
+    is an include with NO lockfile sibling (a resolved include
+    short-circuits before the run is scanned). Horizontal-only indent
+    is linear. Both-direction bound: the miss is fast AND a real
+    include still resolves."""
+    import time
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    bare = proj / "bare"
+    bare.mkdir()
+    (bare / "requirements.txt").write_text("z==1\n", encoding="utf-8")
+    manifest = proj / "requirements.txt"
+    manifest.write_text("-r bare/requirements.txt\nx==1\n"
+                        + "\n" * (1 << 17) + "# end\n",
+                        encoding="utf-8")
+
+    from packages.sca.hygiene import _included_dir_has_lockfile
+
+    start = time.monotonic()
+    hit = _included_dir_has_lockfile(
+        manifest, ("requirements.lock",), set(), "PyPI", root=proj,
+    )
+    assert time.monotonic() - start < 5.0
+    assert hit is False
+
+    # Both-direction: a real include with a lockfile sibling still
+    # resolves through the same hostile tail.
+    sub = proj / "sub"
+    sub.mkdir()
+    (sub / "requirements.txt").write_text("y==1\n", encoding="utf-8")
+    (sub / "requirements.lock").write_text("y==1\n", encoding="utf-8")
+    manifest.write_text("-r sub/requirements.txt\nx==1\n"
+                        + "\n" * (1 << 17) + "# end\n",
+                        encoding="utf-8")
+    start = time.monotonic()
+    hit = _included_dir_has_lockfile(
+        manifest, ("requirements.lock",), set(), "PyPI", root=proj,
+    )
+    assert time.monotonic() - start < 5.0
+    assert hit is True
+
+
+def test_r_include_argument_must_share_the_line(tmp_path) -> None:
+    """``-r`` with its argument on the NEXT line is not a pip include;
+    the old cross-line ``\\s+`` silently captured it."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    sub = proj / "sub"
+    sub.mkdir()
+    (sub / "requirements.txt").write_text("y==1\n", encoding="utf-8")
+    (sub / "requirements.lock").write_text("y==1\n", encoding="utf-8")
+    manifest = proj / "requirements.txt"
+    manifest.write_text("-r\nsub/requirements.txt\n", encoding="utf-8")
+
+    from packages.sca.hygiene import _included_dir_has_lockfile
+
+    assert _included_dir_has_lockfile(
+        manifest, ("requirements.lock",), set(), "PyPI", root=proj,
+    ) is False

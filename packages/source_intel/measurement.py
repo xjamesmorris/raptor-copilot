@@ -56,7 +56,7 @@ whether the sample size justifies the exit-gate claim.
 Why this lives under ``packages/source_intel/`` rather than
 ``libexec/``: it's source_intel-specific tooling for a one-shot
 exit-gate validation, not the general-purpose corpus infrastructure
-(``raptor-corpus-run`` / ``raptor-corpus-metrics`` in ``libexec/``)
+(``corpus-run`` / ``corpus-metrics`` in ``core/dataflow/scripts/``)
 that any validator can plug into. Operators who want to re-run the
 measurement do so as a Python module invocation, not via the
 ``raptor`` CLI.
@@ -187,7 +187,7 @@ def _iter_memory_corruption_corpus(
         if prefix and not fp.name.startswith(prefix):
             continue
         try:
-            finding = Finding.from_json(fp.read_text(encoding="utf-8"))
+            finding = Finding.from_json(fp.read_text(encoding="utf-8"))  # raw-open: corpus finding fixture (eval lane)
         except Exception:
             logger.debug("skipping %s: parse error", fp.name, exc_info=True)
             continue
@@ -197,7 +197,7 @@ def _iter_memory_corruption_corpus(
         if not label_path.exists():
             continue
         try:
-            label = GroundTruth.from_json(label_path.read_text(encoding="utf-8"))
+            label = GroundTruth.from_json(label_path.read_text(encoding="utf-8"))  # raw-open: corpus label fixture (eval lane)
         except Exception:
             logger.debug(
                 "skipping %s: label parse error",
@@ -252,7 +252,14 @@ def _run_one(
 
 def _result_to_verdict(result) -> ValidatorVerdict:
     """Map DataflowValidation result → ValidatorVerdict.
-    Mirrors CodeQLEvidenceValidator's mapping."""
+    Mirrors CodeQLEvidenceValidator's mapping — including the
+    error-state guard: ``validate_dataflow_path`` returns errored
+    results (LLM transport failure, budget exhaustion, parse errors)
+    with ``error`` set and ``is_exploitable=False`` as a DEFAULT, not
+    a verdict. Mapping those to NOT_EXPLOITABLE would count transport
+    failures as confident negatives in the A/B error rates."""
+    if getattr(result, "error", None):
+        return ValidatorVerdict.UNCERTAIN
     is_exploitable = getattr(result, "is_exploitable", None)
     if is_exploitable is True:
         return ValidatorVerdict.EXPLOITABLE
@@ -304,7 +311,7 @@ def _aggregate(results: list[dict[str, Any]]) -> dict[str, Any]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description=__doc__.split("\n")[0],
+        description=__doc__.split("\n")[0],  # line-model: module docstring, RAPTOR-owned
     )
     parser.add_argument("--count", type=int, default=10)
     parser.add_argument("--output", type=Path, default=None)

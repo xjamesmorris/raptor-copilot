@@ -68,7 +68,8 @@ class FingerprintDrift:
         )
 
     def high_severity(self) -> bool:
-        """True when ANY added bucket is exec or network — the
+        """True when ANY added bucket is in HIGH_SEVERITY_BUCKETS
+        (exec / network / runtime_privilege / kernel_trace) — the
         strongest signal that a re-tagged image now does
         something dangerous it previously didn't."""
         return any(

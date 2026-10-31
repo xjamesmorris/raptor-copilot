@@ -35,12 +35,12 @@ Or as a context manager::
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import json
 import logging
 import os
 import signal
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -49,10 +49,57 @@ from .tunables import JoernTunables
 
 logger = logging.getLogger(__name__)
 
-_STATE_DIR = Path.home() / ".cache" / "raptor"
-_STATE_FILE = _STATE_DIR / "joern-server.json"
-_LOCK_FILE = _STATE_DIR / "joern-server.lock"
+# Test-override seams: when set (tests monkeypatch tmp paths here)
+# they win over the env-derived defaults. Production leaves them None
+# so the accessors re-read ``XDG_CACHE_HOME`` on every call — an env
+# pin installed AFTER this module is imported still redirects the
+# state instead of being silently ignored by an import-time snapshot.
+# The unset-env defaults are the shared cross-session rendezvous
+# (every session must resolve the SAME state/lock files for server
+# reuse to arbitrate anything), so they are a cross-consumer contract.
+_STATE_DIR: Path | None = None
+_STATE_FILE: Path | None = None
+_LOCK_FILE: Path | None = None
 
+
+def _state_dir() -> Path:
+    """State root, resolved at call time: ``$XDG_CACHE_HOME/raptor``
+    (default ``~/.cache/raptor``)."""
+    if _STATE_DIR is not None:
+        return _STATE_DIR
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".cache"
+    return base / "raptor"
+
+
+def _state_file() -> Path:
+    if _STATE_FILE is not None:
+        return _STATE_FILE
+    return _state_dir() / "joern-server.json"
+
+
+def _lock_file() -> Path:
+    if _LOCK_FILE is not None:
+        return _LOCK_FILE
+    return _state_dir() / "joern-server.lock"
+
+# SIGTERM grace for ``_kill_server``: how long the whole recorded
+# server tree gets to exit before SIGKILL escalation. Module-level so
+# tests exercising the escalation ladder against stand-in children can
+# shrink it; production keeps the 5s a multi-GB JVM's orderly shutdown
+# needs.
+_KILL_GRACE_S = 5.0
+
+# Staleness horizon for an UNREFERENCED server (see joern_acquire).
+# Trade-off, both directions: lower and a warm multi-GB JVM gets
+# recycled between closely-spaced runs, re-paying the 30-120s boot
+# plus CPG re-import; higher and a server whose state file carries a
+# leaked refcount (crashed session that never released) squats on
+# multi-GB of RAM for longer before an operator notices. 8h ≈ longer
+# than any inter-run gap in a working day, shorter than "forgotten
+# overnight". The recycle NEVER applies while refcount > 0 — audit
+# runs routinely exceed 8h, and killing a referenced server SIGKILLs
+# a JVM another session is mid-query on.
 _STALE_THRESHOLD_S = 3600 * 8
 
 
@@ -62,6 +109,28 @@ def _pid_alive(pid: int) -> bool:
         return True
     except (ProcessLookupError, PermissionError):
         return False
+
+
+def _pid_running(pid: int) -> bool:
+    """Alive AND not a zombie.
+
+    A killed process awaiting its parent's reap still answers the
+    ``kill(pid, 0)`` probe but holds no memory and needs no further
+    signal — the same distinction ``_pgid_alive`` draws for whole
+    groups. Only meaningful where procfs exists; the member-anchor
+    path that consumes this has already required a readable
+    ``/proc/<pid>/stat``.
+    """
+    if not _pid_alive(pid):
+        return False
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(
+            encoding="ascii", errors="replace",
+        )
+    except OSError:
+        return False
+    fields = stat.rsplit(")", 1)[-1].split()
+    return bool(fields) and fields[0] != "Z"
 
 
 def _read_comm(pid: int) -> str | None:
@@ -98,15 +167,43 @@ def _pid_is_our_server(state: dict[str, Any]) -> bool:
     return "java" in comm.lower() or "joern" in comm.lower()
 
 
+def _member_anchor_fields(srv: JoernServer) -> dict[str, Any]:
+    """State-file JVM-member anchor fields from a server handle.
+
+    Shape-guarded at the write side: handles reach here from tests
+    (mocks whose attribute reads return non-ints) and from lifecycle
+    reuse (class-default None) — only a plausible ``(pid, starttime)``
+    pair is persisted; anything else records the absence explicitly so
+    ``_kill_recorded_member`` declines instead of chasing garbage.
+    """
+    pid = getattr(srv, "_member_pid", None)
+    starttime = getattr(srv, "_member_starttime", None)
+    comm = getattr(srv, "_member_comm", None)
+    if (not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0
+            or not isinstance(starttime, int) or isinstance(starttime, bool)
+            or starttime < 0):
+        return {
+            "member_pid": None,
+            "member_starttime": None,
+            "member_comm": None,
+        }
+    return {
+        "member_pid": pid,
+        "member_starttime": starttime,
+        "member_comm": comm if isinstance(comm, str) else None,
+    }
+
+
 def _read_state(_lock_fd: int) -> dict[str, Any] | None:
-    if not _STATE_FILE.exists():
+    state_file = _state_file()
+    if not state_file.exists():
         return None
     # The state file carries the server credential; tighten legacy
     # files that predate the 0600 write path.
     with contextlib.suppress(OSError):
-        _STATE_FILE.chmod(0o600)
+        state_file.chmod(0o600)
     from core.json import load_json
-    return load_json(_STATE_FILE, max_bytes=1024 * 1024)
+    return load_json(state_file, max_bytes=1024 * 1024)
 
 
 def _write_state(_lock_fd: int, state: dict[str, Any]) -> None:
@@ -114,26 +211,22 @@ def _write_state(_lock_fd: int, state: dict[str, Any]) -> None:
     # save_json installs the mode on its tempfile before the rename
     # publishes it, so the credential is never readable in transit.
     from core.json import save_json
-    save_json(_STATE_FILE, state, mode=0o600)
+    save_json(_state_file(), state, mode=0o600)
 
 
 def _remove_state(_lock_fd: int) -> None:
     try:
-        _STATE_FILE.unlink(missing_ok=True)
+        _state_file().unlink(missing_ok=True)
     except OSError:
         pass
 
 
 @contextlib.contextmanager
 def _locked():
-    _STATE_DIR.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(_LOCK_FILE), os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield fd
-    finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
+    from core.atomic_fs.fs_lock import sidecar_flock
+
+    with sidecar_flock(_lock_file(), subject="Joern lifecycle"):
+        yield -1
 
 
 def _health_check(
@@ -246,12 +339,38 @@ def joern_acquire(tunables: JoernTunables | None = None) -> JoernServer | None:
 
         if state is not None:
             started_at = state.get("started_at", 0)
+            # Wall clock on purpose: started_at must be comparable
+            # across PROCESSES and reboots (monotonic clocks are
+            # per-boot). The cost is clock-step sensitivity — a
+            # backward step delays recycling, a forward step can
+            # recycle early — but only ever for an UNREFERENCED
+            # server (the refcount guard below bounds the damage to
+            # re-paying one JVM boot).
             if time.time() - started_at > _STALE_THRESHOLD_S:
-                logger.info("joern lifecycle: server older than %ds — recycling",
-                            _STALE_THRESHOLD_S)
-                _kill_server(state)
-                _remove_state(fd)
-                state = None
+                # Staleness recycle only at refcount zero. A live
+                # refcount means another session acquired this server
+                # and may be mid-query — an audit run routinely
+                # exceeds 8h, and killing its JVM here loses that
+                # window's taint evidence and lets two sessions
+                # leapfrog-kill each other's servers. Referenced
+                # servers are retired by joern_release at refcount
+                # zero (or by the health check below once dead); a
+                # leaked refcount from a crashed session keeps the
+                # server alive until then — the documented cost of
+                # never killing a server in use (see the threshold
+                # comment above).
+                if state.get("refcount", 0) <= 0:
+                    logger.info(
+                        "joern lifecycle: unreferenced server older "
+                        "than %ds — recycling", _STALE_THRESHOLD_S)
+                    _kill_server(state)
+                    _remove_state(fd)
+                    state = None
+                else:
+                    logger.info(
+                        "joern lifecycle: server older than %ds but "
+                        "refcount=%d — leaving it running",
+                        _STALE_THRESHOLD_S, state.get("refcount", 0))
 
         if state is not None:
             srv = _connect_existing(state)
@@ -265,6 +384,15 @@ def joern_acquire(tunables: JoernTunables | None = None) -> JoernServer | None:
                         tunables.heap_mb, state["heap_mb"],
                     )
                 state["refcount"] = state.get("refcount", 0) + 1
+                # Lineage token: joern_release(token=...) decrements
+                # only when the state still records THIS lineage — a
+                # concurrent kill-and-replace by another session must
+                # not have its fresh server decremented (and killed at
+                # zero) by our bookkeeping. Legacy states are upgraded
+                # in place.
+                if not state.get("boot_nonce"):
+                    state["boot_nonce"] = uuid.uuid4().hex
+                srv._lifecycle_token = state["boot_nonce"]
                 _write_state(fd, state)
                 logger.info(
                     "joern lifecycle: reusing server on port %d "
@@ -282,12 +410,17 @@ def joern_acquire(tunables: JoernTunables | None = None) -> JoernServer | None:
 
         new_state = {
             "pid": srv.pid,
-            "comm": _read_comm(srv.pid),
+            "comm": _read_comm(srv.pid),  # type: ignore[arg-type]
             "port": srv.port,
             "heap_mb": tunables.heap_mb,
             "query_timeout_s": tunables.query_timeout_s,
             "refcount": 1,
             "started_at": time.time(),
+            # Lineage identity for this server (restart() replacements
+            # included — note_server_replaced preserves it). Handed to
+            # the acquirer as srv._lifecycle_token; joern_release
+            # matches it before touching the record.
+            "boot_nonce": uuid.uuid4().hex,
             # Per-boot HTTP Basic credential — required to reconnect
             # to the reused server. The state file is mode 0600.
             "auth_user": srv._auth_user,
@@ -295,7 +428,13 @@ def joern_acquire(tunables: JoernTunables | None = None) -> JoernServer | None:
             # Strong tier: unix socket through which the private-netns
             # server is reached (None on the TCP fallback tier).
             "socket_path": srv._uds_path,
+            # JVM MEMBER identity anchor (pid + /proc starttime +
+            # comm), derived at boot: lets _kill_server reap the JVM
+            # after the group leader died mid-stop. Nones when boot
+            # could not derive it unambiguously (fail-safe).
+            **_member_anchor_fields(srv),
         }
+        srv._lifecycle_token = new_state["boot_nonce"]
         _write_state(fd, new_state)
         logger.info(
             "joern lifecycle: started fresh server on port %d (pid %d)",
@@ -304,13 +443,41 @@ def joern_acquire(tunables: JoernTunables | None = None) -> JoernServer | None:
         return srv
 
 
-def joern_release() -> None:
+def joern_release(
+    token: str | None = None,
+    srv: JoernServer | None = None,
+) -> None:
     """Release one reference to the shared Joern server.
 
     When the refcount reaches zero, the server is stopped.
+
+    ``token`` is the lineage token ``joern_acquire`` attached to the
+    handle (``srv._lifecycle_token``). Release used to decrement —
+    and kill at zero — WHATEVER the state file recorded: after a
+    restart + concurrent-acquire interleaving (this session's server
+    replaced mid-restart by another session's fresh one), that killed
+    the OTHER session's live server mid-query while this session's
+    replacement JVM leaked untracked. With a token, the record is
+    only touched when it still belongs to this lineage; on mismatch
+    the caller's own untracked handle (``srv``) is stopped directly —
+    its per-boot credential was never written to the state file, so
+    no other session can be using it. ``token=None`` keeps the legacy
+    unverified behaviour for out-of-tree callers.
     """
     with _locked() as fd:
         state = _read_state(fd)
+        recorded_nonce = state.get("boot_nonce") if state else None
+        if token is not None and (state is None or recorded_nonce != token):
+            logger.warning(
+                "joern lifecycle: state no longer records this "
+                "session's server lineage (replaced by a concurrent "
+                "session?) — leaving the recorded server alone and "
+                "stopping this session's untracked handle directly",
+            )
+            if srv is not None:
+                with contextlib.suppress(Exception):
+                    srv.stop()
+            return
         if state is None:
             return
 
@@ -337,22 +504,60 @@ def joern_cleanup() -> None:
         pid = state.get("pid")
         if pid and not _pid_alive(pid):
             logger.info("joern lifecycle: cleanup — PID %d is dead", pid)
+            # A dead leader can leave the JVM MEMBER orphaned (TERM
+            # landed mid-stop: the leader/forwarder exited, the JVM
+            # wedged in its shutdown hook). Dropping the state file
+            # here used to discard the boot-time member anchor — the
+            # only identity that could still reap that JVM. Attempt
+            # the anchored reap first; it refuses safely on identity
+            # mismatch or an absent anchor (old state files), which
+            # keeps the pre-anchor behaviour.
+            if _kill_recorded_member(state):
+                logger.info(
+                    "joern lifecycle: cleanup reaped the orphaned JVM "
+                    "member before dropping state",
+                )
+            else:
+                logger.info(
+                    "joern lifecycle: cleanup — no verified member to "
+                    "reap (dead, absent anchor, or identity mismatch)",
+                )
             _remove_state(fd)
 
 
 @contextlib.contextmanager
-def joern_session(tunables: JoernTunables | None = None):
-    """Context manager wrapping acquire/release."""
+def shared_joern_session(tunables: JoernTunables | None = None):
+    """Context manager wrapping acquire/release of the SHARED server.
+
+    Distinct name on purpose: ``packages.joern.joern_session`` boots a
+    PRIVATE server (plus CPG build/import) and stops it on exit, while
+    this one joins the refcounted singleton and only decrements on
+    exit. The two used to share the name ``joern_session``, so a
+    caller switching import paths silently swapped server lifetime
+    semantics (per-call JVM boot vs shared reuse).
+    """
     srv = joern_acquire(tunables)
     try:
         yield srv
     finally:
         if srv is not None:
-            joern_release()
+            joern_release(
+                token=getattr(srv, "_lifecycle_token", None), srv=srv,
+            )
+
+
+#: Compatibility alias for the pre-rename import path — prefer
+#: :func:`shared_joern_session` (see its docstring for why the name
+#: collision with the package-root ``joern_session`` was a trap).
+joern_session = shared_joern_session
 
 
 def _start_fresh(tunables: JoernTunables) -> JoernServer | None:
     try:
+        # No orphan_idle_ttl_s override: this server IS lifecycle-
+        # recorded (the caller writes the state file and hands it to
+        # later runs warm), so the forwarder's default orphan horizon
+        # — synced to _STALE_THRESHOLD_S — is the correct one.
         srv = JoernServer.from_tunables(tunables)
         srv.start()
         return srv
@@ -370,7 +575,19 @@ def _signal_server(pid: int, sig: int) -> None:
     signalled (``JoernServer.stop()`` does the same). Only ``killpg``
     when the pid leads its own group; anything else means the pid was
     reused and the group is not ours to signal.
+
+    pid ≤ 1 is refused outright (the callers' normal dead-process
+    handling catches the raise): the pid comes from a lifecycle STATE
+    FILE, and a corrupt record carrying 1 would pass the own-leader
+    check (init leads group 1) — ``killpg(1, sig)`` is ``kill(-1,
+    sig)`` at the kernel, a same-uid broadcast; so are the ``kill(0,
+    ·)``/``kill(-1, ·)`` fallbacks for 0/-1. No recorded server can
+    have pid ≤ 1.
     """
+    if pid <= 1:
+        raise ProcessLookupError(
+            f"refusing to signal sentinel pid {pid}",
+        )
     try:
         if os.getpgid(pid) == pid:
             os.killpg(pid, sig)
@@ -380,27 +597,190 @@ def _signal_server(pid: int, sig: int) -> None:
     os.kill(pid, sig)
 
 
-def _kill_server(state: dict[str, Any]) -> None:
+def _kill_server(state: dict[str, Any]) -> bool:
+    """Kill the recorded server tree. Returns True when a kill was
+    actually dispatched; False when the record was empty or the
+    pid-reuse comm gate refused (nothing verified ours to signal)."""
     pid = state.get("pid")
     if not pid:
-        return
+        return False
     if not _pid_is_our_server(state):
-        return
+        # The leader is dead (or its pid was recycled): there is no
+        # live leader identity to anchor a group kill on, and an
+        # unverified pgid is not ours to signal (pid-reuse class). A
+        # hard kill landing mid-stop produces exactly this state —
+        # TERM delivered, the forwarder exits, the JVM wedges in its
+        # shutdown hook and is orphaned. Fall back to the boot-time
+        # JVM MEMBER anchor, whose /proc starttime proves identity
+        # without a live leader.
+        return _kill_recorded_member(state)
+    # Capture the group BEFORE any signal, while the leader is still
+    # verified ours: on the strong tier the leader is only the netns
+    # forwarder, and it can die (and stop being resolvable via
+    # ``getpgid``) during the grace window while the JVM member
+    # survives in the same group. The group id cannot be recycled
+    # while any member holds it, so a pgid captured here stays ours
+    # for as long as there is anything left to kill. Never our own
+    # group (a corrupt state file must not kill the caller's session).
+    from .server import _ensure_group_dead, _pgid_alive
+    pgid: int | None = None
+    try:
+        if os.getpgid(pid) == pid and pid != os.getpgrp():
+            pgid = pid
+    except OSError:
+        pgid = None
     try:
         _signal_server(pid, signal.SIGTERM)
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + _KILL_GRACE_S
         while time.monotonic() < deadline:
-            if not _pid_alive(pid):
+            # Leader-only liveness let the grace loop declare victory
+            # while the JVM member lived on — require the whole tree
+            # dead.
+            if not _pid_alive(pid) and not _pgid_alive(pgid):
                 _remove_socket_dir(state)
-                return
+                return True
             time.sleep(0.5)
         # Re-verify before SIGKILL: the pid may have died and been
-        # reused during the grace window.
+        # reused during the grace window — but surviving group
+        # MEMBERS still escalate (they are the multi-GB JVM this
+        # exists to kill; the captured pgid is pinned by them).
         if _pid_is_our_server(state):
             _signal_server(pid, signal.SIGKILL)
+        _ensure_group_dead(
+            pgid, label=f"lifecycle kill of pid {pid}",
+            member_anchor=(state.get("member_pid"),
+                           state.get("member_starttime")),
+        )
     except (ProcessLookupError, PermissionError):
         pass
     _remove_socket_dir(state)
+    return True
+
+
+def _kill_recorded_member(state: dict[str, Any]) -> bool:
+    """Dead-leader fallback: kill the recorded JVM MEMBER when its
+    recorded identity still proves out.
+
+    ``_kill_server`` anchors on the LEADER; with the leader dead there
+    is no live pid to comm-verify, so it used to refuse outright and
+    the surviving JVM stayed orphaned. The state file's boot-time
+    member anchor (pid + ``/proc/<pid>/stat`` starttime + comm)
+    restores a safe identity: starttime is assigned once per process
+    incarnation, so a live member whose CURRENT starttime equals the
+    recorded one is provably the process the server boot recorded — a
+    recycled pid cannot match. Starttime mismatch, an unreadable
+    starttime (procfs absent off-Linux, or the member exiting under
+    us), or a comm that contradicts the record → refuse, loudly.
+    Absent anchor fields (old state files, boots that could not derive
+    the member) → decline silently, exactly the pre-anchor behaviour.
+    Returns True only when a kill was actually dispatched.
+    """
+    member = state.get("member_pid")
+    recorded_start = state.get("member_starttime")
+    if (not isinstance(member, int) or isinstance(member, bool)
+            or member <= 0
+            or not isinstance(recorded_start, int)
+            or isinstance(recorded_start, bool)):
+        # Old state file / no boot-derived anchor — nothing verified
+        # ours to signal, same as before the anchor existed.
+        return False
+    if not _pid_running(member):
+        return False
+    from .server import _ensure_group_dead, _pgid_alive, _proc_starttime
+    current_start = _proc_starttime(member)
+    if current_start is None:
+        logger.warning(
+            "joern lifecycle: leader pid %s is gone and member pid %d "
+            "has no readable /proc starttime — no identity proof; "
+            "refusing to kill an unverified pid", state.get("pid"), member,
+        )
+        return False
+    if current_start != recorded_start:
+        logger.warning(
+            "joern lifecycle: member pid %d starttime %d does not match "
+            "recorded %d — the pid was recycled by another process; "
+            "refusing to kill it", member, current_start, recorded_start,
+        )
+        return False
+    comm = _read_comm(member)
+    expected_comm = state.get("member_comm")
+    if comm is not None and expected_comm and comm != expected_comm:
+        # Belt-and-braces: a matching starttime with a different comm
+        # should be impossible without an in-place exec/prctl — treat
+        # it as an identity failure, not a curiosity.
+        logger.warning(
+            "joern lifecycle: member pid %d comm %r does not match "
+            "recorded %r despite matching starttime — refusing to "
+            "kill it", member, comm, expected_comm,
+        )
+        return False
+    logger.warning(
+        "joern lifecycle: leader pid %s is gone but recorded JVM member "
+        "pid %d is alive with matching starttime — reaping the orphaned "
+        "member", state.get("pid"), member,
+    )
+    # Same capture-then-escalate shape as _kill_server: group only
+    # when the member leads its own (never the caller's), captured
+    # while the member is still verified ours.
+    pgid: int | None = None
+    try:
+        if os.getpgid(member) == member and member != os.getpgrp():
+            pgid = member
+    except OSError:
+        pgid = None
+    try:
+        _signal_server(member, signal.SIGTERM)
+        deadline = time.monotonic() + _KILL_GRACE_S
+        while time.monotonic() < deadline:
+            if not _pid_running(member) and not _pgid_alive(pgid):
+                _remove_socket_dir(state)
+                return True
+            time.sleep(0.1)
+        # Re-verify the incarnation before SIGKILL: the member may
+        # have exited and its pid been recycled during the grace.
+        if _proc_starttime(member) == recorded_start:
+            _signal_server(member, signal.SIGKILL)
+        _ensure_group_dead(
+            pgid, label=f"lifecycle member kill of pid {member}",
+            member_anchor=(member, recorded_start),
+        )
+    except (ProcessLookupError, PermissionError):
+        pass
+    _remove_socket_dir(state)
+    return True
+
+
+def kill_recorded_server(
+    port: int | None = None,
+    socket_path: str | None = None,
+) -> bool:
+    """Kill the state-file-recorded server when it matches *port* or
+    *socket_path*.
+
+    For ``JoernServer.restart()`` on a lifecycle-reused handle
+    (``connect_existing``): the handle owns no ``Popen``, so
+    ``stop()`` has nothing to signal, and without this the stuck JVM
+    survives every restart while ``note_server_replaced`` repoints
+    the state file at the replacement — erasing the last record of
+    it. Identity-gated so a handle whose server the state file no
+    longer tracks cannot kill an unrelated one. Returns True only
+    when a kill was actually dispatched — False on an identity
+    mismatch AND when ``_kill_server``'s pid-reuse comm gate refused.
+    """
+    if port is None and socket_path is None:
+        return False
+    with _locked() as fd:
+        state = _read_state(fd)
+        if not state:
+            return False
+        matches = (
+            (port is not None and state.get("port") == port)
+            or (socket_path is not None
+                and state.get("socket_path") == socket_path)
+        )
+        if not matches:
+            return False
+        return _kill_server(state)
 
 
 def _remove_socket_dir(state: dict[str, Any]) -> None:
@@ -434,7 +814,15 @@ def note_server_replaced(
     ``joern_release`` can neither authenticate against nor stop the
     new multi-GB JVM (unreleasable orphan), and later acquires kill
     an unrelated pid. No-op when the state file tracks a different
-    server (or none).
+    server (or none) — the token-checked ``joern_release`` then stops
+    the untracked replacement through the caller's own handle.
+
+    Match rule: the handle's lineage token first (survives the
+    restart — it lives on the Python object); else the recorded pid;
+    else the recorded port ONLY when the recorded pid is dead — a
+    live recorded server that merely shares the old port number is a
+    DIFFERENT server, and repointing the state at our replacement
+    would orphan it unreleasably.
     """
     new_pid = srv.pid
     if new_pid is None:
@@ -443,7 +831,15 @@ def note_server_replaced(
         state = _read_state(fd)
         if state is None:
             return
-        if state.get("pid") != old_pid and state.get("port") != old_port:
+        token = getattr(srv, "_lifecycle_token", None)
+        token_match = (token is not None
+                       and state.get("boot_nonce") == token)
+        pid_match = state.get("pid") == old_pid
+        port_match_dead = (
+            state.get("port") == old_port
+            and not (state.get("pid") and _pid_alive(state["pid"]))
+        )
+        if not (token_match or pid_match or port_match_dead):
             return
         state["pid"] = new_pid
         state["comm"] = _read_comm(new_pid)
@@ -452,6 +848,8 @@ def note_server_replaced(
         state["auth_user"] = srv._auth_user
         state["auth_password"] = srv._auth_password
         state["socket_path"] = srv._uds_path
+        # The replacement boot re-derived the JVM member anchor.
+        state.update(_member_anchor_fields(srv))
         _write_state(fd, state)
         logger.info(
             "joern lifecycle: state updated for restarted server "

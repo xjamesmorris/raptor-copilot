@@ -62,22 +62,41 @@ def extract_conditions_from_flow_trace(
     """
     conditions = []
 
-    for step in trace.get("steps", trace.get("hops", [])):
+    raw_steps = trace.get("steps", trace.get("hops", []))
+    if not isinstance(raw_steps, list):
+        # LLM-authored traces can carry ``steps: null`` or scalar
+        # shapes; degrade to no steps rather than raising.
+        raw_steps = []
+    for step in raw_steps:
+        if not isinstance(step, dict):
+            # LLM-authored traces can carry malformed steps.
+            continue
         raw_conditions = step.get("path_conditions", [])
+        if isinstance(raw_conditions, str):
+            # A bare string char-iterates into one-character
+            # conditions handed to the SMT verb — treat it as a
+            # single condition.
+            raw_conditions = [raw_conditions]
+        elif not isinstance(raw_conditions, list):
+            raw_conditions = []
         for cond in raw_conditions:
             if isinstance(cond, str):
                 conditions.append(PathCondition(
                     text=cond,
-                    source=step.get("definition", step.get("file", "")),
+                    source=step.get("definition", step.get("file", "")) or "",
                 ))
             elif isinstance(cond, dict):
                 conditions.append(PathCondition(
                     text=cond.get("text", ""),
                     negated=bool(cond.get("negated", False)),
-                    source=step.get("definition", step.get("file", "")),
+                    source=step.get("definition", step.get("file", "")) or "",
                 ))
 
     top_level = trace.get("path_conditions", [])
+    if isinstance(top_level, str):
+        top_level = [top_level]
+    elif not isinstance(top_level, list):
+        top_level = []
     for cond in top_level:
         if isinstance(cond, str):
             conditions.append(PathCondition(text=cond, source="trace"))
@@ -102,8 +121,13 @@ def extract_conditions_from_hypothesis(
     - "provided that Y > 0"
     """
 
+    # Gated optional paren — the naive ``\(?\s*`` pair was
+    # quadratic on a keyword followed by a whitespace run.
+    # \b pins each attempt to a word start: unanchored, a hostile
+    # word run retries every suffix — quadratic. A mid-word keyword
+    # ('elif' read as 'if') was a false token, not a condition.
     if_patterns = re.findall(
-        r'(?:if|when|where|provided that|assuming)\s*\(?\s*'
+        r'\b(?:if|when|where|provided that|assuming)\s*(?:\(\s*)?'
         r'([a-zA-Z_]\w*\s*(?:[<>=!]+|!=|==)\s*(?:\w+|0x[0-9a-fA-F]+|\d+))',
         hypothesis,
         re.IGNORECASE,
@@ -114,7 +138,7 @@ def extract_conditions_from_hypothesis(
         ) for match in if_patterns]
 
     null_patterns = re.findall(
-        r'(\w+)\s+is\s+(?:non-null|not null|not NULL)',
+        r'\b(\w+)\s+is\s+(?:non-null|not null|not NULL)',
         hypothesis,
         re.IGNORECASE,
     )
@@ -124,7 +148,7 @@ def extract_conditions_from_hypothesis(
         ) for var in null_patterns)
 
     nonneg_patterns = re.findall(
-        r'(\w+)\s+(?:is|must be)\s+(?:non-negative|positive|greater than zero)',
+        r'\b(\w+)\s+(?:is|must be)\s+(?:non-negative|positive|greater than zero)',
         hypothesis,
         re.IGNORECASE,
     )

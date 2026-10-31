@@ -14,6 +14,7 @@ import time
 from collections import deque
 from typing import Any, TYPE_CHECKING
 
+from core.orchestration.llm_json import strip_json_fences
 from core.security.prompt_framing import with_audit_framing
 
 from .orchestrator import OrchestratorConfig, ReviewOutcome
@@ -154,11 +155,7 @@ def parse_batch_response(
     individually (schema-invalid == malformed; the keyed lookup in
     ``batch_review_fn`` then error-routes the affected functions).
     """
-    text = raw.strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        lines = [ln for ln in lines if not ln.startswith("```")]
-        text = "\n".join(lines)
+    text = strip_json_fences(raw)
     try:
         results = json.loads(text)
     except json.JSONDecodeError:
@@ -233,7 +230,12 @@ def _classify_batch_error(exc: Exception) -> str:
         return "api_error"
     if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
         return "api_error"
-    if "budget exceeded" in msg:
+    # Chokepoint, not a bare substring: exception text can quote
+    # model-chosen content (the schema floor embeds unknown field
+    # names verbatim), and the classifier vetoes shape failures on
+    # the causal chain.
+    from core.llm.client import is_budget_exceeded_error
+    if is_budget_exceeded_error(exc):
         return "budget"
     if isinstance(exc, json.JSONDecodeError):
         return "json_parse"
@@ -365,18 +367,15 @@ def make_batch_review_fn(
         for _i, ctx in enumerate(contexts):
             pair = f"{ctx['file']}:{ctx['function']}"
             ckey = f"{pair}:{ctx.get('line_start', 0)}"
-            r = results_by_key.get(ckey)
+            r = results_by_key.get(ckey)  # type: ignore[assignment]
             if r is None and ctx_pair_counts.get(pair, 0) == 1:
                 r = results_by_pair.get(pair)
             if r is not None:
-                status = r.get("status", "suspicious")
-                if status not in ("clean", "suspicious"):
-                    logger.warning(
-                        "batch glance returned invalid status %r for "
-                        "%s:%s — falling back to suspicious",
-                        status, ctx["file"], ctx["function"],
-                    )
-                    status = "suspicious"
+                # parse_batch_response is the sole producer of
+                # ``results`` and drops any element whose status is
+                # outside _BATCH_STATUSES, so status is always a
+                # valid "clean"/"suspicious" here.
+                status = r["status"]
                 outcomes.append(ReviewOutcome(
                     file=ctx["file"],
                     function=ctx["function"],

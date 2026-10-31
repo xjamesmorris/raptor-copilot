@@ -89,9 +89,10 @@ class TestPartitionStudyBatch:
     def test_multilang_files_route_in_process(self) -> None:
         c, ml, un = _partition_study_batch([
             _req("a.py"), _req("b.go"), _req("C.java"),
-            _req("d.ts"), _req("e.rs"), _req("f.js"),
+            _req("d.ts"), _req("e.rs"), _req("f.js"), _req("g.php"),
+            _req("h.kt"), _req("i.cs"), _req("j.swift"),
         ])
-        assert not c and len(ml) == 6 and not un
+        assert not c and len(ml) == 10 and not un
 
     def test_unsupported_language_partitioned_out(self) -> None:
         c, ml, un = _partition_study_batch([_req("a.rb"), _req("b.lua")])
@@ -106,6 +107,43 @@ class TestPartitionStudyBatch:
             [_req("a.c"), _req("b.py"), _req("c.rb")],
         )
         assert len(c) == 1 and len(ml) == 1 and len(un) == 1
+
+    def test_non_str_source_files_route_like_absent(self) -> None:
+        # Enqueue sites feed LLM review output straight into
+        # StudyRequest; present-but-null and non-str leaves heal to
+        # "" at construction, so partitioning (Path().suffix on the
+        # field) routes them like a missing source_file instead of
+        # killing the study consumer thread — a thread death here is
+        # SILENT (no disable line), the worst fail direction.
+        c, ml, un = _partition_study_batch([
+            _req(None), _req(9), _req(["a.c"]),
+        ])
+        assert len(c) == 3 and not ml and not un
+
+
+class TestStudyRequestHealing:
+    def test_non_str_leaves_heal_at_construction(self) -> None:
+        req = StudyRequest(
+            question=None,
+            source_file=9,
+            source_function=["f"],
+            priority=None,
+            resolution=None,
+            context={"k": 1},
+        )
+        assert req.question == ""
+        assert req.source_file == ""
+        assert req.source_function == ""
+        assert req.context == ""
+        # Enum-backed fields heal to their defaults, not "".
+        assert req.priority == "normal"
+        assert req.resolution == "identifier"
+
+    def test_clean_request_untouched(self) -> None:
+        req = _req("a.c", priority="high", resolution="concept")
+        assert req.source_file == "a.c"
+        assert req.priority == "high"
+        assert req.resolution == "concept"
 
 
 # ------------------------------------------------------------------
@@ -535,12 +573,14 @@ def _stub_prep(monkeypatch, out_dir, calls=None):
 
 
 def _stub_llm(monkeypatch):
-    import core.llm.client as _client_mod
+    # Stub at the orchestrator's construction chokepoint: patching
+    # core.llm.client.LLMClient no longer intercepts — construction
+    # goes through the transcript seam, whose module body subclasses
+    # whatever LLMClient is bound to at first import.
+    import core.audit.orchestrator as _orch
 
-    monkeypatch.setattr(
-        _client_mod, "LLMClient",
-        lambda *a, **kw: types.SimpleNamespace(total_cost=0.0),
-    )
+    stub = types.SimpleNamespace(total_cost=0.0)
+    monkeypatch.setattr(_orch, "_run_llm_client", lambda config: stub)
 
 
 def _stub_run_study(monkeypatch, out_dir, concepts, *, tier="mechanical"):
@@ -612,6 +652,137 @@ class TestConsumerMultilangDispatch:
         names = {i["name"] for i in study_list["items"]}
         assert "parse_config" in names
         # Reading-list item resolved against the domain model
+        rl = _load_rl(out)
+        assert rl["items"][0]["resolved"]
+
+    def test_php_question_resolves_and_merges(
+        self, monkeypatch, tmp_path,
+    ) -> None:
+        target = tmp_path / "src"
+        (target / "app").mkdir(parents=True)
+        (target / "app" / "auth.php").write_text(
+            "<?php\n"
+            "/** Constant-time comparison of two digests. */\n"
+            "function compare_digest(string $a, string $b): bool {\n"
+            "    return hash_equals($a, $b);\n"
+            "}\n",
+        )
+        out = tmp_path / "out"
+        out.mkdir()
+        config = OrchestratorConfig(target_path=target, out_dir=out)
+        _stub_prep(monkeypatch, out)
+        _stub_llm(monkeypatch)
+        _stub_run_study(
+            monkeypatch, out, [{"id": "compare_digest_contract"}],
+        )
+
+        q = "Does `compare_digest` reject digests of unequal length?"
+        _run_loop(config, _queue(StudyRequest(
+            question=q, source_file="app/auth.php",
+            source_function="login",
+        )))
+
+        study_list = json.loads((out / "study-list.json").read_text())
+        names = {i["name"] for i in study_list["items"]}
+        assert "compare_digest" in names
+        rl = _load_rl(out)
+        assert rl["items"][0]["resolved"]
+
+    def test_kotlin_question_resolves_and_merges(
+        self, monkeypatch, tmp_path,
+    ) -> None:
+        target = tmp_path / "src"
+        (target / "app").mkdir(parents=True)
+        (target / "app" / "Auth.kt").write_text(
+            "/** Constant-time comparison of two digests. */\n"
+            "fun compareDigest(a: ByteArray, b: ByteArray): Boolean {\n"
+            "    return MessageDigest.isEqual(a, b)\n"
+            "}\n",
+        )
+        out = tmp_path / "out"
+        out.mkdir()
+        config = OrchestratorConfig(target_path=target, out_dir=out)
+        _stub_prep(monkeypatch, out)
+        _stub_llm(monkeypatch)
+        _stub_run_study(
+            monkeypatch, out, [{"id": "compareDigest_contract"}],
+        )
+
+        q = "Does `compareDigest` reject digests of unequal length?"
+        _run_loop(config, _queue(StudyRequest(
+            question=q, source_file="app/Auth.kt",
+            source_function="login",
+        )))
+
+        study_list = json.loads((out / "study-list.json").read_text())
+        names = {i["name"] for i in study_list["items"]}
+        assert "compareDigest" in names
+        rl = _load_rl(out)
+        assert rl["items"][0]["resolved"]
+
+    def test_csharp_question_resolves_and_merges(
+        self, monkeypatch, tmp_path,
+    ) -> None:
+        target = tmp_path / "src"
+        (target / "App").mkdir(parents=True)
+        (target / "App" / "Auth.cs").write_text(
+            "/// <summary>Constant-time comparison of two digests."
+            "</summary>\n"
+            "static bool CompareDigest(byte[] a, byte[] b)\n"
+            "{\n"
+            "    return CryptographicOperations.FixedTimeEquals(a, b);\n"
+            "}\n",
+        )
+        out = tmp_path / "out"
+        out.mkdir()
+        config = OrchestratorConfig(target_path=target, out_dir=out)
+        _stub_prep(monkeypatch, out)
+        _stub_llm(monkeypatch)
+        _stub_run_study(
+            monkeypatch, out, [{"id": "CompareDigest_contract"}],
+        )
+
+        q = "Does `CompareDigest` reject digests of unequal length?"
+        _run_loop(config, _queue(StudyRequest(
+            question=q, source_file="App/Auth.cs",
+            source_function="Login",
+        )))
+
+        study_list = json.loads((out / "study-list.json").read_text())
+        names = {i["name"] for i in study_list["items"]}
+        assert "CompareDigest" in names
+        rl = _load_rl(out)
+        assert rl["items"][0]["resolved"]
+
+    def test_swift_question_resolves_and_merges(
+        self, monkeypatch, tmp_path,
+    ) -> None:
+        target = tmp_path / "src"
+        (target / "App").mkdir(parents=True)
+        (target / "App" / "Auth.swift").write_text(
+            "/// Constant-time comparison of two digests.\n"
+            "func compareDigest(_ a: [UInt8], _ b: [UInt8]) -> Bool {\n"
+            "    return constantTimeEquals(a, b)\n"
+            "}\n",
+        )
+        out = tmp_path / "out"
+        out.mkdir()
+        config = OrchestratorConfig(target_path=target, out_dir=out)
+        _stub_prep(monkeypatch, out)
+        _stub_llm(monkeypatch)
+        _stub_run_study(
+            monkeypatch, out, [{"id": "compareDigest_contract"}],
+        )
+
+        q = "Does `compareDigest` reject digests of unequal length?"
+        _run_loop(config, _queue(StudyRequest(
+            question=q, source_file="App/Auth.swift",
+            source_function="login",
+        )))
+
+        study_list = json.loads((out / "study-list.json").read_text())
+        names = {i["name"] for i in study_list["items"]}
+        assert "compareDigest" in names
         rl = _load_rl(out)
         assert rl["items"][0]["resolved"]
 
@@ -752,6 +923,8 @@ class TestStudyGateSuffixes:
         ("a.c", True), ("b.cpp", True),
         ("pkg/app.py", True), ("srv/main.go", True),
         ("App.java", True), ("web/app.ts", True), ("lib.rs", True),
+        ("web/index.php", True),
+        ("App.kt", True), ("Prog.cs", True), ("ui/View.swift", True),
         ("script.rb", False), ("conf.lua", False), ("style.css", False),
     ])
     def test_supported_path(self, path, expected) -> None:

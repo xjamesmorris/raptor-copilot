@@ -126,8 +126,10 @@ def test_cache_save_then_version_mismatch_load_returns_none(
     from core.config import RaptorConfig
     monkeypatch.setattr(RaptorConfig, "BASE_OUT_DIR", tmp_path)
 
-    idx = BinaryEdgeIndex(binary_path="/bin/x")
-    idx.edges = [BinaryCallEdge("main", "foo", "/bin/x")]
+    bin_x = tmp_path / "x"
+    bin_x.write_bytes(b"\x7fELF x bytes")
+    idx = BinaryEdgeIndex(binary_path=str(bin_x))
+    idx.edges = [BinaryCallEdge("main", "foo", str(bin_x))]
     cache_file = _cache_path_for("abcdef" * 7)
     assert cache_file is not None
     _save_cached_index(cache_file, idx)
@@ -135,7 +137,7 @@ def test_cache_save_then_version_mismatch_load_returns_none(
     payload = json.loads(cache_file.read_text())
     payload["version"] = 9999
     cache_file.write_text(json.dumps(payload))
-    assert _load_cached_index(cache_file, "/bin/x") is None
+    assert _load_cached_index(cache_file, str(bin_x)) is None
 
 
 def test_parse_axffj_handles_adjacent_batch_lines_no_body() -> None:
@@ -188,14 +190,16 @@ def test_clean_r2_function_name_iteratively_strips_stacked() -> None:
 def test_vtable_slot_junk_is_filtered() -> None:
     """Slot lines whose ``method`` token is a raw address, ``0x...``,
     or section-prefixed entry must be dropped — they're not real
-    callees."""
-    # The filter logic in _parse_vtable_output:
-    #   skip if method starts with "0x" / "section." / "loc." / "0"
-    #   AND requires at least one alphanumeric / underscore.
+    callees. Exercises the PRODUCTION filter in _parse_vtable_output
+    (the earlier version asserted the junk strings' prefixes against
+    themselves — a tautology that tested nothing)."""
+    from core.analysis.binary_oracle_edges import _parse_vtable_output
     for junk in ("0x00000000", "0x12345678", "section.text", "loc.42"):
-        # The slot regex itself matches these — the filter is at
-        # the call-site level. Document expected behaviour:
-        assert junk.startswith(("0x", "section.", "loc.", "0"))
+        out = f"Vtable Found at 0x4ea0\n0x4ea8 : {junk}\n"
+        assert _parse_vtable_output(out, "/x/bin") == [], junk
+    # Direction check: a real method in the same shape survives.
+    out = "Vtable Found at 0x4ea0\n0x4ea8 : sym.Widget::draw\n"
+    assert len(_parse_vtable_output(out, "/x/bin")) == 1
 
 
 # ---------------------------------------------------------------------------

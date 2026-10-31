@@ -80,6 +80,41 @@ class TestInstallSigtermGrace:
         monkeypatch.setattr("signal.signal", _boom)
         assert orch.install_sigterm_grace() is False
 
+    def test_install_uninstall_roundtrip_restores_disposition(
+            self, monkeypatch):
+        """The handler is process-wide state: a REAL install must be
+        reversible, or it leaks past the installing test and every
+        later fork child in this process inherits salvage semantics
+        instead of dying on TERM."""
+        monkeypatch.setitem(orch._sigterm_state, "installed", False)
+        prev = signal.getsignal(signal.SIGTERM)
+        assert prev is not orch._handle_sigterm
+        assert orch.install_sigterm_grace() is True
+        assert signal.getsignal(signal.SIGTERM) is orch._handle_sigterm
+        assert orch.uninstall_sigterm_grace() is True
+        assert signal.getsignal(signal.SIGTERM) is prev
+        # Idempotent: nothing installed, nothing to restore.
+        assert orch.uninstall_sigterm_grace() is False
+
+    def test_uninstall_leaves_foreign_handler_untouched(
+            self, monkeypatch):
+        """A handler installed OVER ours is someone else's state —
+        uninstall clears only the bookkeeping."""
+        monkeypatch.setitem(orch._sigterm_state, "installed", False)
+        prev = signal.getsignal(signal.SIGTERM)
+        assert orch.install_sigterm_grace() is True
+
+        def _foreign(signum, frame):
+            pass
+
+        signal.signal(signal.SIGTERM, _foreign)
+        try:
+            assert orch.uninstall_sigterm_grace() is True
+            assert signal.getsignal(signal.SIGTERM) is _foreign
+            assert orch._sigterm_state["installed"] is False
+        finally:
+            signal.signal(signal.SIGTERM, prev)
+
 
 class TestHandlerSemantics:
 
@@ -279,3 +314,47 @@ class TestSigtermE2E:
         assert ledger["totals"]["cost_usd"] == pytest.approx(
             0.25 * final_entries,
         )
+
+
+class TestGuardRestoresForeignBaseline:
+    """The conftest guard must hand back a legitimate pre-test
+    handler (the case a pytest plugin's SIGTERM handler exercises)
+    even when the grace handler leaked in and the production
+    uninstall's bookkeeping was lost — SIG_DFL is the fallback for an
+    unrecoverable baseline only, never a replacement for a
+    recoverable one.
+
+    Two tests, definition order load-bearing: the first leaves the
+    poisoned state for its own guard teardown to unwind; the second
+    witnesses what the guard restored.
+    """
+
+    @staticmethod
+    def _foreign_handler(signum: int, frame: object) -> None:
+        raise AssertionError("marker handler is never invoked")
+
+    @pytest.fixture(scope="class", autouse=True)
+    @classmethod
+    def _foreign_baseline(cls):
+        # Class scope: installs BEFORE the function-scoped conftest
+        # guard snapshots, so the guard sees this handler as ``prev``.
+        baseline = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, cls._foreign_handler)
+        yield
+        try:
+            signal.signal(signal.SIGTERM, baseline)
+        except TypeError:  # baseline None = C-installed handler
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
+    def test_grace_leak_with_lost_bookkeeping(self):
+        assert orch.install_sigterm_grace() is True
+        assert signal.getsignal(signal.SIGTERM) is orch._handle_sigterm
+        # An earlier teardown cleared the uninstall's bookkeeping
+        # while the handler stayed installed: the production uninstall
+        # can no longer act, only the guard's belt-and-braces path
+        # remains — and its snapshot is the foreign handler.
+        orch._sigterm_state["installed"] = False
+        orch._sigterm_state["prev"] = None
+
+    def test_guard_restored_the_foreign_handler(self):
+        assert signal.getsignal(signal.SIGTERM) is self._foreign_handler

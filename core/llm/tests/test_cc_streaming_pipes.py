@@ -95,6 +95,55 @@ def test_child_exiting_before_reading_prompt_reports_exit_code():
     assert "exited 7" in sr.error
 
 
+def test_invalid_json_schema_exit_is_typed_and_keeps_full_diagnostic():
+    message = (
+        'Error: --json-schema is not a valid JSON Schema: strict mode: '
+        'unknown keyword: "reasoning"'
+    )
+    script = (
+        "import sys\n"
+        f"sys.stderr.write({message!r})\n"
+        "sys.stderr.flush()\n"
+        "sys.exit(1)\n"
+    )
+
+    sr = run_cc_streaming(
+        [sys.executable, "-c", script],
+        prompt="",
+        env=_env(),
+        timeout_s=30,
+    )
+
+    assert sr.error_kind == "request_schema"
+    assert sr.diagnostic["returncode"] == 1
+    assert sr.diagnostic["stderr"] == message
+    assert sr.diagnostic["stream_error"] == ""
+    assert message in sr.error
+
+
+def test_missing_root_type_is_distinct_from_unknown_keyword():
+    message = (
+        'strict mode: missing type "object" for keyword "properties" at "#"'
+    )
+    script = (
+        "import sys\n"
+        f"sys.stderr.write({message!r})\n"
+        "sys.stderr.flush()\n"
+        "sys.exit(1)\n"
+    )
+
+    sr = run_cc_streaming(
+        [sys.executable, "-c", script],
+        prompt="",
+        env=_env(),
+        timeout_s=30,
+    )
+
+    assert sr.error_kind == "missing_root_type"
+    assert sr.error_kind != "request_schema"
+    assert sr.diagnostic["stderr"] == message
+
+
 def test_failed_call_carries_parsed_spend_telemetry():
     """A budget abort exits nonzero AFTER emitting a result event with
     the real spend. The error StreamJsonResult must carry that
@@ -351,3 +400,56 @@ def test_timeout_covers_stdin_write():
     # Well under the child's sleep — the deadline, not the child,
     # ended the call.
     assert time.monotonic() - start < 30
+
+
+def test_early_pipe_close_does_not_busy_spin(monkeypatch):
+    """A child that closes stdout AND stderr then lingers (cleanup,
+    budget-abort teardown) must not peg a core: a closed pipe reports
+    readable forever, so an fd left in the select set after EOF turns
+    the drain loop into a busy spin for the child's remaining
+    lifetime. Count select() calls — the fixed loop parks in ~1s
+    blocking selects (a handful of calls); the spin shape was tens of
+    thousands."""
+    import select as select_mod
+
+    result_line = json.dumps({
+        "type": "result",
+        "session_id": "sess-early-close",
+        "is_error": False,
+    })
+    script = (
+        "import os, sys, time\n"
+        f"sys.stdout.write({result_line!r} + '\\n')\n"
+        "sys.stdout.flush()\n"
+        "os.close(1)\n"
+        "os.close(2)\n"
+        "time.sleep(1.5)\n"
+    )
+
+    real_select = select_mod.select
+    calls = {"n": 0}
+
+    def counting_select(*args, **kwargs):
+        calls["n"] += 1
+        return real_select(*args, **kwargs)
+
+    monkeypatch.setattr(select_mod, "select", counting_select)
+    try:
+        sr = run_cc_streaming(
+            [sys.executable, "-c", script],
+            prompt="",
+            env=_env(),
+            timeout_s=30,
+        )
+    finally:
+        monkeypatch.setattr(select_mod, "select", real_select)
+
+    assert sr.error is None
+    assert sr.session_id == "sess-early-close"
+    # Generous bound: the fixed loop needs ~2-4 selects for the whole
+    # 1.5s lingering window (plus the prompt/stdin iterations); the
+    # busy-spin regression shape is unbounded (>10k in 1.5s).
+    assert calls["n"] < 100, (
+        f"select() called {calls['n']} times — EOF fds are being "
+        "re-selected (busy spin)"
+    )

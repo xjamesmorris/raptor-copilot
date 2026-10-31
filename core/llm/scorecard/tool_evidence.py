@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from core.json import load_json
+from core.run.finding_status import read_verdict
 
 from . import _MAX_REASONING_CHARS
 from .scorecard import EventType, ModelScorecard
@@ -107,7 +108,7 @@ def record_tool_evidence_outcome(
                 decision_class=decision_class,
                 model=str(model),
                 finding_id=str(finding_id),
-                outcome=outcome,
+                outcome=outcome,  # type: ignore[arg-type]
                 sample=sample,
             )
         except Exception as e:                          # noqa: BLE001
@@ -131,7 +132,7 @@ def record_tool_evidence_outcome(
             decision_class=decision_class,
             model=str(model),
             event_type=EventType.TOOL_EVIDENCE,
-            outcome=outcome,
+            outcome=outcome,  # type: ignore[arg-type]
             sample=sample,
         )
         return True
@@ -247,14 +248,15 @@ def auto_back_prop_from_validate_run(
         if not isinstance(vf, dict):
             continue
         fid = vf.get("finding_id")
-        verdict = vf.get("is_exploitable")
+        verdict = read_verdict(vf, "is_exploitable")
         # Tighten: a finding_id must be a non-empty str/int (a list/dict in
         # that slot would stringify to nonsense and miscount silently).
         if not isinstance(fid, (str, int)) or fid == "":
             continue
         # Tighten: is_exploitable must be a real bool — JSON spec says bool;
-        # a stringy "true"/"false" or "yes" shouldn't be quietly coerced.
-        if not isinstance(verdict, bool):
+        # a stringy "true"/"false" or "yes" shouldn't be quietly coerced
+        # (read_verdict reads those, None, and absence as no-verdict).
+        if verdict is None:
             continue
         val_by_id[str(fid)] = verdict
     if not val_by_id:
@@ -275,8 +277,12 @@ def auto_back_prop_from_validate_run(
         # under a stringified key and silently mangle attribution).
         if not isinstance(model, str) or not model:
             continue
-        analysis_verdict = r.get("is_exploitable", False)
-        if not isinstance(analysis_verdict, bool):
+        # Tri-state read: a record with NO analysis verdict (missing,
+        # nulled, or malformed is_exploitable) is the same abstention —
+        # skip it rather than record a fabricated "not exploitable"
+        # analysis verdict against the validation outcome.
+        analysis_verdict = read_verdict(r, "is_exploitable")
+        if analysis_verdict is None:
             continue
         records.append({
             "model": model,
@@ -290,16 +296,11 @@ def auto_back_prop_from_validate_run(
         return 0
 
     if scorecard is None:
-        # Resolve the scorecard path via RAPTOR_DIR so /validate run from
-        # any cwd writes to the same sidecar the rest of RAPTOR uses,
-        # not a stray ./out/llm_scorecard.json next to the target repo.
-        import os
-        raptor_dir = os.environ.get("RAPTOR_DIR")
-        if raptor_dir:
-            default_path = Path(raptor_dir) / "out" / "llm_scorecard.json"
-        else:
-            default_path = Path("out/llm_scorecard.json")
-        scorecard = ModelScorecard(default_path)
+        # Shared resolver: /validate run from any cwd writes to the
+        # same sidecar the rest of RAPTOR uses, not a stray
+        # ./out/llm_scorecard.json next to the target repo.
+        from .paths import default_scorecard_path
+        scorecard = ModelScorecard(default_scorecard_path())
     return record_tool_evidence_outcomes(
         scorecard, records=records,
         decision_class_prefix=decision_class_prefix,

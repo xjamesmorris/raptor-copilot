@@ -18,6 +18,10 @@ Patterns provided (each replaces a family of per-suite copies):
 * :func:`reset_llm_egress_state` — the egress/proxy-env/OLLAMA_HOST
   hermeticity fixture body shared by per-directory conftests (wrap
   with ``yield from`` in an autouse fixture).
+* :func:`make_hermetic_cli` — protocol-neutral real-process fakes with
+  isolated HOME/XDG/RAPTOR state, no inherited ambient credentials,
+  guarded caller overrides, pinned PATH guards, and invocation/process
+  capture.
 * :func:`init_scratch_repo` / :func:`git_run` — hermetic git fixture
   repos: scrubbed global/system config, pinned identity, signing off,
   deterministic default branch.
@@ -34,6 +38,18 @@ from core.testing.fake_llm import (
     make_anthropic_provider,
     make_test_client,
 )
+from core.testing.fake_cli import (
+    FAKE_CLI_CONFIG_ERROR,
+    FAKE_CLI_GUARD_EXIT,
+    FAKE_CLI_SPAWN_ERROR,
+    FakeCLIBehavior,
+    FakeCLIInvocation,
+    FakeCLIProcess,
+    FakeCLISecretObservation,
+    HermeticCLIWorkspace,
+    OwnedFakeExecutable,
+    make_hermetic_cli,
+)
 from core.testing.gitrepo import git_run, init_scratch_repo
 from core.testing.llm_env import (
     DEFAULT_OLLAMA_HOST,
@@ -48,15 +64,25 @@ from core.testing.treesitter import (
 
 __all__ = [
     "DEFAULT_OLLAMA_HOST",
+    "FAKE_CLI_CONFIG_ERROR",
+    "FAKE_CLI_GUARD_EXIT",
+    "FAKE_CLI_SPAWN_ERROR",
     "PROXY_ENV_VARS",
+    "FakeCLIBehavior",
+    "FakeCLIInvocation",
+    "FakeCLIProcess",
+    "FakeCLISecretObservation",
     "FakeModel",
     "FakeStructuredProvider",
+    "HermeticCLIWorkspace",
+    "OwnedFakeExecutable",
     "ensure_anthropic_error_types",
     "force_census_regex_fallback",
     "git_run",
     "init_scratch_repo",
     "install_provider",
     "make_anthropic_provider",
+    "make_hermetic_cli",
     "make_test_client",
     "requires_ts",
     "reset_llm_egress_state",

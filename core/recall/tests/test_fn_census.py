@@ -132,3 +132,17 @@ class TestBuildCensus:
         assert "chain-breaking construct" in md
         assert "collection_indirection" in md
         json.dumps(census)  # serialisable
+
+
+class TestReadSourceContainment:
+    def test_relative_entry_joins_root(self, tmp_path):
+        from core.recall.fn_census import _read_source
+        (tmp_path / "T.java").write_text("alpha")
+        assert _read_source({"file": "T.java"}, tmp_path) == "alpha"
+
+    def test_escaping_relative_entry_unreadable(self, tmp_path):
+        from core.recall.fn_census import _read_source
+        (tmp_path / "outside.java").write_text("secret")
+        root = tmp_path / "corpus"
+        root.mkdir()
+        assert _read_source({"file": "../outside.java"}, root) is None

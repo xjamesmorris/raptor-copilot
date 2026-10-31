@@ -23,6 +23,7 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import patch
 
@@ -31,11 +32,68 @@ import pytest
 _RAPTOR_ROOT = Path(__file__).resolve().parents[3]
 
 
+@pytest.fixture(autouse=True)
+def _user_state_in_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """User registries stay out of the real home: the root-conftest
+    layer doing this is stripped from release extracts (conftest.py
+    is export-ignore), so the pin must travel in-file."""
+    from core.testing.state_isolation import pin_user_state_dirs
+    pin_user_state_dirs(monkeypatch, tmp_path)
+
+
 def _import_agentic():
     if str(_RAPTOR_ROOT) not in sys.path:
         sys.path.insert(0, str(_RAPTOR_ROOT))
     import raptor_agentic
     return raptor_agentic
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _audit_log_dir_in_tmp(
+        tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
+    """Redirect the audit-log file away from the real checkout.
+
+    ``RaptorConfig.LOG_DIR`` is file-anchored (``REPO_ROOT/out/logs``,
+    no env override) and the RaptorLogger singleton bakes a
+    ``raptor_*.jsonl`` file-handler path at initialisation — which the
+    root ``conftest.py`` import triggers before any fixture can run.
+    The in-process ``run_command_streaming`` tests here then emit
+    through that handler, appending an audit file into the real
+    checkout's ``out/logs`` on every pytest run. Contain both stages:
+    point LOG_DIR at a tmp dir (covers a not-yet-initialised
+    singleton), and repoint the already-baked AUDIT file handlers on
+    the "raptor" logger for the duration of this module. The close +
+    rebind is lossless for the audit handler only because its
+    ``_open`` is O_APPEND with ``delay=True`` reopen: it reopens from
+    ``baseFilename`` on the next emit without truncating. Sweep
+    strictly that handler class — pytest attaches its session
+    ``--log-file`` handler (mode ``"w"``) to every non-propagating
+    logger including this one, and stdlib ``FileHandler.emit`` never
+    reopens a closed mode-``"w"`` handler, so closing it would
+    silence the operator's ``--log-file`` for the rest of the run.
+    """
+    import logging as _logging
+
+    from core.config import RaptorConfig
+    from core.logging import _OwnerOnlyFileHandler
+    tmp_dir = tmp_path_factory.mktemp("audit-logs")
+    prev_log_dir = RaptorConfig.LOG_DIR
+    RaptorConfig.LOG_DIR = tmp_dir
+    handlers = [
+        h for h in _logging.getLogger("raptor").handlers
+        if isinstance(h, _OwnerOnlyFileHandler)
+    ]
+    saved = [(h, h.baseFilename) for h in handlers]
+    for h, base in saved:
+        h.close()
+        h.baseFilename = str(tmp_dir / Path(base).name)
+    try:
+        yield
+    finally:
+        RaptorConfig.LOG_DIR = prev_log_dir
+        for h, base in saved:
+            h.close()
+            h.baseFilename = base
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +167,40 @@ class TestReplayReproduced:
 # ---------------------------------------------------------------------------
 
 
+def _tree_kill_took(pid: int) -> bool:
+    """True once *pid* is dead — including dead-but-unreaped.
+
+    When pytest itself runs as pid 1 (pid-namespace batches:
+    ``unshare -pf``), the SIGKILLed grandchild reparents to the TEST
+    PROCESS and lingers as a zombie no init will ever reap —
+    ``kill(pid, 0)`` succeeds on zombies, so the bare probe misread
+    a dead grandchild as a survivor. Reap the adoptee if it is ours,
+    then treat a readable Z state as dead. The probe stays a real
+    liveness check in both directions: a running (R/S) grandchild
+    still fails the test, and an UNREADABLE ``/proc`` (masked over,
+    non-procfs) proves nothing about death — kill-0 just succeeded,
+    so it reads ALIVE and the caller keeps polling. A pid that exits
+    between the two probes reads dead on the next iteration via
+    ProcessLookupError.
+    """
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except (ChildProcessError, OSError):
+        pass  # not our child (normal host run) — probe below decides
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    try:
+        with open(f"/proc/{pid}/stat", encoding="ascii",
+                  errors="replace") as fh:
+            stat = fh.read()
+    except OSError:
+        return False  # can't prove death — never a vacuous pass
+    # State is the first field after the comm's closing paren.
+    return stat.rpartition(")")[2].split()[:1] == ["Z"]
+
+
 @pytest.mark.skipif(not hasattr(os, "killpg"), reason="killpg unavailable")
 class TestKillProcessTree:
     def test_grandchild_is_reaped(self):
@@ -126,9 +218,7 @@ class TestKillProcessTree:
             proc.wait(timeout=5)
             # Give the kernel a beat to deliver the group SIGKILL.
             for _ in range(50):
-                try:
-                    os.kill(grandchild, 0)
-                except ProcessLookupError:
+                if _tree_kill_took(grandchild):
                     break
                 time.sleep(0.1)
             else:
@@ -231,6 +321,314 @@ class TestFailRunAndExit:
         src = (_RAPTOR_ROOT / "raptor_agentic.py").read_text(encoding="utf-8")
         assert '_fail_run_and_exit(out_dir, "no SARIF files generated from scanning")' in src
         assert '_fail_run_and_exit(out_dir, "CodeQL-only mode failed")' in src
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 / Phase 3 failure capture
+# ---------------------------------------------------------------------------
+
+
+class TestValidationPhaseChecked:
+    def test_crash_fails_the_run_and_exits(self, tmp_path):
+        agentic = _import_agentic()
+        calls = []
+        with patch("packages.exploitability_validation."
+                   "run_validation_phase",
+                   side_effect=ValueError("bad sarif")), \
+                patch("core.run.fail_run",
+                      side_effect=lambda out_dir, reason: calls.append(
+                          (out_dir, reason))), \
+                pytest.raises(SystemExit) as exc:
+            agentic._run_validation_phase_checked(
+                tmp_path, repo_path="x", out_dir=tmp_path)
+        assert exc.value.code == 1
+        assert calls and calls[0][0] == tmp_path
+        assert "ValueError" in calls[0][1]
+
+    def test_success_passes_result_through(self, tmp_path):
+        agentic = _import_agentic()
+        sentinel = ({"completed": True}, 7)
+        with patch("packages.exploitability_validation."
+                   "run_validation_phase", return_value=sentinel), \
+                patch("core.run.fail_run") as fail_run:
+            result = agentic._run_validation_phase_checked(
+                tmp_path, repo_path="x", out_dir=tmp_path)
+        assert result == sentinel
+        assert not fail_run.called
+
+    def test_sandbox_error_keeps_propagating(self, tmp_path):
+        # SandboxSetupError has its own actionable handler and exit
+        # code at the entry point — never converted to a plain fail.
+        agentic = _import_agentic()
+        from core.sandbox import SandboxSetupError
+        with patch("packages.exploitability_validation."
+                   "run_validation_phase",
+                   side_effect=SandboxSetupError("m", "hint")), \
+                pytest.raises(SandboxSetupError):
+            agentic._run_validation_phase_checked(
+                tmp_path, repo_path="x", out_dir=tmp_path)
+
+    def test_call_site_uses_the_checked_wrapper(self):
+        src = (_RAPTOR_ROOT / "raptor_agentic.py").read_text(
+            encoding="utf-8")
+        assert "_run_validation_phase_checked(\n        out_dir," in src
+
+
+class TestMissingAnalysisReport:
+    def test_nonzero_rc_fails_the_run(self, tmp_path, capsys):
+        agentic = _import_agentic()
+        calls = []
+        with patch("core.run.fail_run",
+                   side_effect=lambda out_dir, reason: calls.append(
+                       (out_dir, reason))), \
+                pytest.raises(SystemExit) as exc:
+            agentic._fail_or_warn_missing_analysis(tmp_path, 2, "boom")
+        assert exc.value.code == 1
+        assert calls and "exited 2" in calls[0][1]
+
+    def test_zero_rc_keeps_the_degrade_path(self, tmp_path, capsys):
+        # Direction two: a clean subprocess with nothing to report
+        # still degrades with a warning — completed runs stay rc 0.
+        agentic = _import_agentic()
+        with patch("core.run.fail_run") as fail_run:
+            agentic._fail_or_warn_missing_analysis(tmp_path, 0, "")
+        assert not fail_run.called
+        assert "produced no output" in capsys.readouterr().err
+
+
+class TestReportWithNonzeroRc:
+    """Phase 3 wrote its report but exited nonzero (post-report
+    teardown window). The run deliberately proceeds on the written
+    report and exits 0 — but the child rc must surface as a warning,
+    never be silently absorbed into "Analysis complete"."""
+
+    def test_nonzero_rc_warns_and_returns(self, capsys):
+        agentic = _import_agentic()
+        agentic._warn_analysis_rc_with_report(3)
+        err = capsys.readouterr().err
+        assert "exited 3" in err
+        assert "written report" in err
+
+    def test_zero_rc_stays_silent(self, capsys):
+        agentic = _import_agentic()
+        agentic._warn_analysis_rc_with_report(0)
+        assert capsys.readouterr().err == ""
+
+    def test_call_site_guards_the_report_branch(self):
+        src = (_RAPTOR_ROOT / "raptor_agentic.py").read_text(
+            encoding="utf-8")
+        assert ("if analysis_report.exists():\n"
+                "            _warn_analysis_rc_with_report(rc)") in src
+
+
+# ---------------------------------------------------------------------------
+# _cli_entry lifecycle backstop
+# ---------------------------------------------------------------------------
+
+
+class TestCliEntryBackstop:
+    """Uncaught exceptions and Ctrl-C at the entry point must close the
+    lifecycle — pre-fix only SandboxSetupError was handled and the run
+    marker stayed at "running" forever on a direct invocation."""
+
+    def test_uncaught_exception_stamps_failed_and_reraises(
+            self, tmp_path):
+        agentic = _import_agentic()
+        calls = []
+        with patch.object(agentic, "main",
+                          side_effect=RuntimeError("phase exploded")), \
+                patch.object(agentic, "_LIFECYCLE_OUT_DIR", tmp_path), \
+                patch("core.run.fail_run",
+                      side_effect=lambda out_dir, reason: calls.append(
+                          (out_dir, reason))), \
+                pytest.raises(RuntimeError):
+            agentic._cli_entry()
+        assert calls and calls[0][0] == tmp_path
+        assert "RuntimeError" in calls[0][1]
+
+    def test_keyboard_interrupt_cancels_and_exits_130(self, tmp_path):
+        agentic = _import_agentic()
+        calls = []
+        with patch.object(agentic, "main",
+                          side_effect=KeyboardInterrupt), \
+                patch.object(agentic, "_LIFECYCLE_OUT_DIR", tmp_path), \
+                patch("core.run.cancel_run",
+                      side_effect=lambda out_dir: calls.append(out_dir)), \
+                pytest.raises(SystemExit) as exc:
+            agentic._cli_entry()
+        assert exc.value.code == 130
+        assert calls == [tmp_path]
+
+    def test_nonzero_system_exit_stamps_failed(self, tmp_path):
+        # A bare sys.exit(N) deep in a phase is not an Exception — it
+        # sailed through the handler chain with the marker "running".
+        agentic = _import_agentic()
+        calls = []
+        with patch.object(agentic, "main",
+                          side_effect=SystemExit(3)), \
+                patch.object(agentic, "_LIFECYCLE_OUT_DIR", tmp_path), \
+                patch("core.run.fail_run",
+                      side_effect=lambda out_dir, reason: calls.append(
+                          (out_dir, reason))), \
+                pytest.raises(SystemExit) as exc:
+            agentic._cli_entry()
+        assert exc.value.code == 3
+        assert calls and "3" in calls[0][1]
+
+    def test_zero_system_exit_never_stamps(self, tmp_path):
+        agentic = _import_agentic()
+        with patch.object(agentic, "main",
+                          side_effect=SystemExit(0)), \
+                patch.object(agentic, "_LIFECYCLE_OUT_DIR", tmp_path), \
+                patch("core.run.fail_run") as fail_run, \
+                pytest.raises(SystemExit) as exc:
+            agentic._cli_entry()
+        assert exc.value.code == 0
+        assert not fail_run.called
+
+    def test_backstop_never_clobbers_a_specific_reason(self, tmp_path):
+        # _fail_run_and_exit stamps a precise reason then sys.exit(1);
+        # the SystemExit backstop must not overwrite it with the
+        # generic "exited with code 1".
+        import json
+        agentic = _import_agentic()
+        from core.run.metadata import RUN_METADATA_FILE
+        (tmp_path / RUN_METADATA_FILE).write_text(json.dumps({
+            "status": "failed", "extra": {"error": "specific reason"},
+        }), encoding="utf-8")
+        with patch.object(agentic, "main",
+                          side_effect=SystemExit(1)), \
+                patch.object(agentic, "_LIFECYCLE_OUT_DIR", tmp_path), \
+                patch("core.run.fail_run") as fail_run, \
+                pytest.raises(SystemExit):
+            agentic._cli_entry()
+        assert not fail_run.called
+
+    def test_base_exception_stamps_failed_and_reraises(self, tmp_path):
+        agentic = _import_agentic()
+
+        class Escape(BaseException):
+            pass
+
+        calls = []
+        with patch.object(agentic, "main", side_effect=Escape("gone")), \
+                patch.object(agentic, "_LIFECYCLE_OUT_DIR", tmp_path), \
+                patch("core.run.fail_run",
+                      side_effect=lambda out_dir, reason: calls.append(
+                          reason)), \
+                pytest.raises(Escape):
+            agentic._cli_entry()
+        assert calls == ["uncaught Escape: gone"]
+
+    def test_raising_dunder_str_still_stamps(self, tmp_path):
+        # A hostile/broken __str__ on the escaping exception must not
+        # defeat the marker write.
+        agentic = _import_agentic()
+
+        class Hostile(Exception):
+            def __str__(self):
+                raise RuntimeError("nope")
+
+        calls = []
+        with patch.object(agentic, "main", side_effect=Hostile()), \
+                patch.object(agentic, "_LIFECYCLE_OUT_DIR", tmp_path), \
+                patch("core.run.fail_run",
+                      side_effect=lambda out_dir, reason: calls.append(
+                          reason)), \
+                pytest.raises(Hostile):
+            agentic._cli_entry()
+        assert calls == ["uncaught Hostile"]
+
+    def test_unarmed_backstop_never_touches_a_marker(self):
+        # Failure BEFORE start_run (argparse, git init): there is no
+        # run to close; the backstop must stay quiet.
+        agentic = _import_agentic()
+        with patch.object(agentic, "main",
+                          side_effect=RuntimeError("pre-lifecycle")), \
+                patch.object(agentic, "_LIFECYCLE_OUT_DIR", None), \
+                patch("core.run.fail_run") as fail_run, \
+                pytest.raises(RuntimeError):
+            agentic._cli_entry()
+        assert not fail_run.called
+
+    def test_clean_return_exits_zero_without_backstop(self):
+        agentic = _import_agentic()
+        with patch.object(agentic, "main", return_value=0), \
+                patch("core.run.fail_run") as fail_run, \
+                patch("core.run.cancel_run") as cancel_run, \
+                pytest.raises(SystemExit) as exc:
+            agentic._cli_entry()
+        assert exc.value.code == 0
+        assert not fail_run.called and not cancel_run.called
+
+    def test_subprocess_crash_leaves_no_running_marker(self, tmp_path):
+        # End-to-end shape of the original defect: a direct invocation
+        # whose pipeline raises after start_run must leave the marker
+        # terminal, not "running".
+        import json
+        out = tmp_path / "agentic_run"
+        script = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(_RAPTOR_ROOT)!r})\n"
+            # RaptorConfig.LOG_DIR is file-anchored (REPO_ROOT/out/logs,
+            # no env override), and importing raptor_agentic instantiates
+            # the RaptorLogger singleton at module import — every run of
+            # this test otherwise appends a raptor_*.jsonl audit file
+            # into the real checkout's out/logs. Redirect LOG_DIR into
+            # the test tmp dir BEFORE that import; core.config itself
+            # does not instantiate the logger, so the override lands
+            # ahead of any file-handler path computation.
+            "from pathlib import Path\n"
+            "from core.config import RaptorConfig\n"
+            f"RaptorConfig.LOG_DIR = Path({str(tmp_path / 'logs')!r})\n"
+            "import raptor_agentic as ra\n"
+            f"out = Path({str(out)!r})\n"
+            "def boom():\n"
+            "    out.mkdir(parents=True, exist_ok=True)\n"
+            "    from core.run import start_run\n"
+            "    start_run(out, 'agentic', target=str(out))\n"
+            "    ra._LIFECYCLE_OUT_DIR = out\n"
+            "    raise RuntimeError('phase exploded')\n"
+            "ra.main = boom\n"
+            "ra._cli_entry()\n"
+        )
+        # Hermetic session posture for the subprocess: the child's
+        # REAL start_run resolves the session itself, and with an
+        # inherited environment a run from inside a live claude
+        # session ledger-records this test run into that session's
+        # real ~/.local/share/raptor/sessions.d ledger — where the
+        # session's lifecycle Stop hook can race the test and
+        # finalize the run out from under it. A fresh HOME means no
+        # registered session entry, so ledger writes are refused; the
+        # env credential pair outranks the HOME redirect, so pop it
+        # too. CLAUDECODE keeps the session-bound worker-stamp lane
+        # via the getppid fallback when no claude ancestor is
+        # walkable (CI). XDG_DATA_HOME likewise outranks the HOME
+        # redirect wherever user state is XDG-anchored — the
+        # $XDG_DATA_HOME/raptor/*.key per-purpose MAC key files fall
+        # back to $HOME/.local/share only when it is unset — so drop
+        # the whole XDG family too: the scratch HOME must be the only
+        # user-state root the child can resolve.
+        home = tmp_path / "home"
+        home.mkdir()
+        env = dict(os.environ)
+        env["HOME"] = str(home)
+        env["CLAUDECODE"] = "1"
+        env.pop("RAPTOR_SESSION_PID", None)
+        env.pop("RAPTOR_SESSION_TOKEN", None)
+        for _xdg in ("XDG_DATA_HOME", "XDG_CACHE_HOME",
+                     "XDG_CONFIG_HOME", "XDG_STATE_HOME"):
+            env.pop(_xdg, None)
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=_RAPTOR_ROOT, capture_output=True, text=True,
+            timeout=120, env=env,
+        )
+        assert proc.returncode != 0
+        marker = json.loads(
+            (out / ".raptor-run.json").read_text(encoding="utf-8"))
+        assert marker["status"] == "failed"
+        assert "RuntimeError" in marker.get("extra", {}).get("error", "")
 
 
 # ---------------------------------------------------------------------------

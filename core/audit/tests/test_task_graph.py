@@ -300,18 +300,25 @@ class TestRepass:
         assert g.repass_tasks() == []
 
     def test_repass_sorted_by_priority(self) -> None:
+        # Full 3-mesh: the spanning tree keeps 2 of 6 edges, so at
+        # least two distinct callers lose a back-edge — the fixture
+        # GUARANTEES multiple repass tasks (a 2-cycle produced one,
+        # hiding the ordering assertion behind a vacuous condition).
         wq = [
             _gap("a.py", "high", 0.9),
+            _gap("a.py", "mid", 0.5),
             _gap("a.py", "low", 0.1),
         ]
+        names = ["high", "mid", "low"]
         edges = [
-            _edge("a.py", "high", "a.py", "low"),
-            _edge("a.py", "low", "a.py", "high"),
+            _edge("a.py", a, "a.py", b)
+            for a in names for b in names if a != b
         ]
         g = TaskGraph.from_workqueue(wq, edges)
         repass = g.repass_tasks()
-        if len(repass) > 1:
-            assert repass[0].priority >= repass[1].priority
+        assert len(repass) >= 2
+        priorities = [t.priority for t in repass]
+        assert priorities == sorted(priorities, reverse=True)
 
 
 class TestBottleneckRelaxation:
@@ -986,4 +993,42 @@ class TestSoftDependencies:
         first = g.pop_ready(1)[0]
         assert first.key == "vnd.h:vnd_helper:1", (
             "without softening, the callee inherits rank and gates"
+        )
+
+
+class TestBreakCyclesDeterminism:
+    """Dropped back-edges must be identical across processes: set
+    iteration fed the spanning-tree DFS, so PYTHONHASHSEED chose which
+    edges got dropped and artifacts churned run to run."""
+
+    _SNIPPET = (
+        "import json\n"
+        "from core.audit.task_graph import _break_cycles\n"
+        "names = ['a.c:f%d' % i for i in range(6)]\n"
+        "graph = {a: {b for b in names if b != a} for a in names}\n"
+        "scores = dict.fromkeys(names, 0.5)\n"
+        "print(json.dumps(sorted(_break_cycles(graph, scores))))\n"
+    )
+
+    def test_dropped_edges_stable_across_hash_seeds(self) -> None:
+        import os
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        repo_root = Path(__file__).resolve().parents[3]
+        outputs = set()
+        for seed in ("0", "1", "2", "3"):
+            env = dict(os.environ)
+            env["PYTHONHASHSEED"] = seed
+            env["PYTHONPATH"] = str(repo_root)
+            proc = subprocess.run(
+                [sys.executable, "-c", self._SNIPPET],
+                capture_output=True, text=True, timeout=60,
+                env=env, check=True,
+            )
+            outputs.add(proc.stdout.strip())
+        assert len(outputs) == 1, (
+            "cycle-break edge drops varied with PYTHONHASHSEED:\n"
+            + "\n".join(sorted(outputs))
         )

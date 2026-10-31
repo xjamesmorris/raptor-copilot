@@ -47,6 +47,10 @@ _VENDOR_SECRET_PATTERNS = (
     (re.compile(r"\bgh[opusr]_[A-Za-z0-9]{36}\b"), "[REDACTED]"),
     # GitHub fine-grained PAT (github_pat_ + 22-char prefix + _ + 59-char body).
     (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{82}\b"), "[REDACTED]"),
+    # GitLab personal/project/group access token: `glpat-` + 20+ char body.
+    (re.compile(r"\bglpat-[0-9A-Za-z_-]{20,}"), "[REDACTED]"),
+    # Hugging Face access token: `hf_` + 30+ char alnum body.
+    (re.compile(r"\bhf_[A-Za-z0-9]{30,}\b"), "[REDACTED]"),
     # Slack tokens. Full letter class: beyond the app/bot/user set,
     # `xoxc` (browser session) and `xoxe` (refresh) are live secret
     # shapes — any xox?- + version + body redacts.
@@ -68,7 +72,15 @@ _VENDOR_SECRET_PATTERNS = (
     # (= any JSON-object first byte); strict length floors on all
     # three segments keep `a.b.c`-style dotted tokens out.
     (re.compile(
-        r"\be[wy][A-Za-z0-9_-]{7,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"),
+        # Segment ceilings: the base64url class contains '-', so a
+    # dash-fill run makes every planted `e[wy]` head a live \b
+    # attempt that re-scans the run — quadratic in the logged
+    # text. Real JWT segments sit far below the caps (header
+    # 2048, payload/signature 4096); a segment beyond them
+    # escapes this redactor — the documented trade-off against
+    # an unbounded scan of hostile logs.
+    r"\be[wy][A-Za-z0-9_-]{7,2048}\.[A-Za-z0-9_-]{8,4096}"
+    r"\.[A-Za-z0-9_-]{8,4096}\b"),
      "[REDACTED]"),
     # Google API key: `AIza` + 35 chars.
     (re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"), "[REDACTED]"),
@@ -161,11 +173,38 @@ _URL_PAIR_RE = re.compile(
 )
 
 
+# Code-expression value shapes the assignment pass must NOT redact.
+# `token = lexer.next_token()` / `signature = inspect.signature(func)` /
+# `auth = request.headers.get(...)` are diagnostic code snippets (LLM
+# reasoning quotes them into disagreement samples); their "values" are
+# dotted attribute paths or call expressions, never credentials.
+# Trade-off, both directions: skipping them preserves sample/log
+# diagnostic value; a REAL secret shaped exactly like a dotted
+# identifier path (segments starting with letters, no +/=) under a
+# secret-named assignment would evade — canonical dotted secrets
+# (JWTs) are caught by the vendor pattern that runs earlier, and
+# random credentials virtually never parse as attribute paths.
+_CODE_VALUE_RE = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+\Z")
+
+
 def _redact_assignment(match: re.Match[str]) -> str:
     if not is_secret_field_name(match.group(2)):
         return match.group(0)
+    value = match.group(5)
+    end = match.end()
+    is_call = end < len(match.string) and match.string[end] == "("
+    if is_call or _CODE_VALUE_RE.match(value):
+        return match.group(0)
     return (f"{match.group(1)}{match.group(2)}{match.group(1)}"
             f"{match.group(3)}{match.group(4)}[REDACTED]")
+
+
+def _redact_basic(match: re.Match[str]) -> str:
+    value = match.group(1)
+    mixed_case = value != value.lower() and value != value.upper()
+    if mixed_case or re.search(r"[0-9+/=]", value):
+        return "Basic [REDACTED]"
+    return match.group(0)
 
 
 def _redact_url_pair(match: re.Match[str]) -> str:
@@ -177,6 +216,13 @@ def _redact_url_pair(match: re.Match[str]) -> str:
 def is_secret_field_name(name: object) -> bool:
     """Return whether a field/parameter name conventionally carries a secret value."""
     normalized = str(name).strip().lower()
+    # npm's canonical .npmrc secret spellings carry a LEADING
+    # underscore (`_authToken`, `_auth`, `_password`) — `_authtoken`
+    # is neither an exact member (`authtoken` is) nor a `_token`
+    # suffix match. Strip leading `_`/`-` so the npm spellings hit
+    # the same vocabulary; resolver/npm stderr quoting an .npmrc
+    # line is a routine leak path into shareable artifacts.
+    normalized = normalized.lstrip("_-")
     return normalized in _SECRET_QUERY_KEYS or normalized.endswith(
         _SECRET_FIELD_SUFFIXES
     )
@@ -317,9 +363,18 @@ def redact_secrets(value: object, *, reveal_secrets: bool = False) -> str:
         text,
         flags=re.IGNORECASE,
     )
+    # Basic credentials are base64("user:pass"); real encodings carry
+    # a digit, '+', '/', '=' or mixed case essentially always, while
+    # an all-one-case digitless word after "Basic"/"basic" is prose
+    # ("basic understanding of heap grooming"). Trade-off, both
+    # directions: the value gate preserves prose in disagreement
+    # samples and reports; the residual — a credential whose base64
+    # happens to be all-one-case letters with no digits or padding —
+    # is a vanishing corner of the encoding space, accepted and
+    # pinned by test.
     text = re.sub(
-        r"Basic\s+[A-Za-z0-9+/]{8,}={0,2}",
-        "Basic [REDACTED]",
+        r"Basic\s+([A-Za-z0-9+/]{8,}={0,2})",
+        _redact_basic,
         text,
         flags=re.IGNORECASE,
     )
@@ -328,8 +383,12 @@ def redact_secrets(value: object, *, reveal_secrets: bool = False) -> str:
     # token shape published by the vendor; substring-only false positives
     # are acceptable here because the redaction target is shareable
     # logs / artifacts where false-positive redaction is far cheaper than
-    # a credential leak. Order doesn't matter — patterns are mutually
-    # disjoint by prefix.
+    # a credential leak. Order doesn't matter for correctness even
+    # though the prefixes are NOT all disjoint (the generic
+    # `sk-(proj-)?` OpenAI arm also matches `sk-ant-…` prefixes):
+    # every overlapping pair substitutes the identical replacement
+    # text, so whichever arm wins first leaves nothing sensitive
+    # behind. Revisit if a pattern ever gains a distinct replacement.
     for pattern, replacement in _VENDOR_SECRET_PATTERNS:
         text = pattern.sub(replacement, text)
 

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 from typing import Optional
+
+from core.json import save_json
 
 from .detect import (
     pyghidra_available,
@@ -17,6 +18,48 @@ from .session import GhidraSession, GhidraSessionError
 logger = logging.getLogger(__name__)
 
 AUTO_NAMED_WARN_THRESHOLD = 0.80
+
+
+def _stamp_ebpf_capability(db: REDatabase) -> None:
+    """Stamp the eBPF lifter capability tier onto an eBPF database.
+
+    Every REDatabase produced from an eBPF-language Ghidra program
+    carries ``metadata["ebpf_lifter_capability"]`` — the blocking
+    probe-gate verdict from
+    :func:`packages.ghidra.ebpf_capability.ebpf_lifter_capability`.
+    Consumers must honour it: unless ``tier`` is ``trusted`` (probe
+    passed for this exact Ghidra install), Ghidra's eBPF decode is
+    hint-tier steering evidence only and never rides into verdicts.
+    Fail-closed: a failed consult stamps ``downgraded``, never
+    nothing.
+    """
+    language_id = str(db.metadata.get("language_id") or "")
+    architecture = db.architecture or ""
+    if not (language_id.startswith("eBPF")
+            or architecture.startswith("eBPF")):
+        return
+    from .ebpf_capability import (
+        TIER_DOWNGRADED,
+        TIER_TRUSTED,
+        ebpf_lifter_capability,
+    )
+    try:
+        meta = ebpf_lifter_capability().as_metadata()
+    except Exception:  # noqa: BLE001 — stamp fails closed, never open
+        logger.warning("eBPF capability consult failed", exc_info=True)
+        meta = {"tier": TIER_DOWNGRADED,
+                "reason": "capability consult failed"}
+    db.metadata["ebpf_lifter_capability"] = meta
+    if meta.get("tier") != TIER_TRUSTED:
+        # The reason can carry record-derived text (failed feature
+        # names from the on-disk record) — escape at the log seam.
+        from core.security.log_sanitisation import escape_nonprintable
+        logger.warning(
+            "eBPF lifter capability DOWNGRADED for this Ghidra "
+            "install (%s) — Ghidra eBPF decode output is hint-tier "
+            "only and must not ride into verdicts",
+            escape_nonprintable(str(meta.get("reason", ""))),
+        )
 
 
 class GhidraBridge:
@@ -67,6 +110,7 @@ class GhidraBridge:
         output_dir: Path,
         *,
         decompile: bool = False,
+        timeout: Optional[int] = None,
     ) -> REDatabase:
         """Import a Ghidra project into an REDatabase (trust mode).
 
@@ -77,10 +121,20 @@ class GhidraBridge:
             output_dir: Directory for output files.
             decompile: If True, decompile every function (slow).
                 Default False — import metadata only.
+            timeout: Maximum seconds for the headless subprocess.
+                Default None scales with the work requested: 300 for a
+                metadata-only export, 3600 when ``decompile`` is set —
+                decompiling every function of a large stripped binary
+                routinely needs tens of minutes, while a shorter cap is
+                what keeps a wedged JVM from stalling a metadata-only
+                attach. Ignored on the in-process (pyghidra) path,
+                which has no subprocess to bound.
 
         Returns:
             The populated REDatabase.
         """
+        if timeout is None:
+            timeout = 3600 if decompile else 300
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -102,6 +156,7 @@ class GhidraBridge:
                 export_json,
                 program_name=self.program_name,
                 decompile=decompile,
+                timeout=timeout,
             )
             db = parse_export(export_json)
 
@@ -139,6 +194,8 @@ class GhidraBridge:
         output_dir: Path,
         *,
         binary_path: Optional[Path] = None,
+        decompile: bool = False,
+        timeout: Optional[int] = None,
     ) -> REDatabase:
         """Import Ghidra data and enrich with r2 analysis.
 
@@ -150,11 +207,17 @@ class GhidraBridge:
             binary_path: Path to the raw binary for r2 analysis.
                 If None, attempts to extract the path from the Ghidra
                 project metadata.
+            decompile: If True, decompile every function during the
+                Ghidra import (see ``import_project``).
+            timeout: Maximum seconds for the headless subprocess
+                (see ``import_project``).
 
         Returns:
             The merged REDatabase.
         """
-        ghidra_db = self.import_project(output_dir)
+        ghidra_db = self.import_project(
+            output_dir, decompile=decompile, timeout=timeout,
+        )
 
         bin_path = binary_path
         if bin_path is None and ghidra_db.binary_path:
@@ -248,8 +311,10 @@ class GhidraBridge:
         enrichments = self._build_enrichments(db, findings)
 
         enrichments_json = output_dir / "ghidra-enrichments.json"
-        with open(enrichments_json, "w") as f:
-            json.dump(enrichments, f, indent=2)
+        # save_json (atomic tempfile + rename) like this module's
+        # other JSON artifacts: a raw open("w") at the predictable
+        # name follows a symlink planted in the reused output dir.
+        save_json(enrichments_json, enrichments)
 
         from .detect import prefer_in_process
         if prefer_in_process():
@@ -281,16 +346,53 @@ class GhidraBridge:
         project_name = get_project_name(gpr_path)
         project = open_project(str(gpr_path.parent), project_name)
 
-        root = project.getProjectData().getRootFolder()
-        files = list(root.getFiles())
-        if not files:
-            project.close()
-            raise GhidraSessionError(
-                f"cannot apply enrichments: project {project_name} "
-                f"contains no programs"
+        # Everything between open and consume must close the project
+        # on failure — a raise here otherwise leaks the open pyghidra
+        # project (and its lock) for the process lifetime.
+        try:
+            programs = _walk_program_paths(
+                project.getProjectData().getRootFolder(),
             )
-
-        program, consumer = consume_program(project, f"/{files[0].getName()}")
+            if not programs:
+                raise GhidraSessionError(
+                    f"cannot apply enrichments: project {project_name} "
+                    f"contains no programs"
+                )
+            # Honour the operator's program selection exactly like the
+            # headless path (`headless._project_process_args`) and the
+            # worker path (`server_worker._Session.open`) do — pre-fix
+            # this branch always consumed the first ROOT file, so on a
+            # multi-program project the enrichments were silently
+            # applied to the WRONG program, and a project whose
+            # programs all live in subfolders failed outright.
+            target = (self.program_name or programs[0]).strip("/")
+            parts = target.split("/")
+            if any(not part or part.startswith("-") or part == ".."
+                   for part in parts):
+                # Same refusal as headless._project_process_args:
+                # program names come from the analysed project's own
+                # (attacker-controlled) database.
+                raise GhidraSessionError(
+                    f"refusing suspicious program name: {target!r} "
+                    "(empty, dash-leading, or traversal component)"
+                )
+            if target not in programs:
+                # Program names come from the hostile project's own
+                # database and this exception text reaches the
+                # operator's terminal — scrub control bytes and bound
+                # the length.
+                from core.security.log_sanitisation import (
+                    sanitise_for_terminal,
+                )
+                raise GhidraSessionError(
+                    f"cannot apply enrichments: program {target!r} not "
+                    f"found in project {project_name} "
+                    f"(has: {sanitise_for_terminal(', '.join(programs))})"
+                )
+            program, consumer = consume_program(project, f"/{target}")
+        except BaseException:
+            project.close()
+            raise
 
         try:
             tx = program.startTransaction("RAPTOR enrichments")
@@ -491,15 +593,37 @@ class GhidraBridge:
 
         Stamps the analysed binary's content hash into the metadata so
         cache reuse can verify the database belongs to the binary it
-        is being used for.
+        is being used for, and — for eBPF-language programs — the
+        eBPF lifter capability tier (probe gate).
         """
+        _stamp_ebpf_capability(db)
         doc = db.to_dict()
         try:
             bp = Path(db.binary_path or "")
-            if bp.is_file():
+            # binary_path is a free string inside the (attacker-
+            # controlled) project — the same field import_and_enrich
+            # already refuses outside the .gpr's directory. Hashing it
+            # unconstrained turned this writer into a same-user
+            # file-existence + sha256 oracle: whatever local path the
+            # project author named got its digest stamped into the
+            # long-lived re-database.json deliverable. Same
+            # containment rule, and on refusal the hash is simply
+            # omitted (consumers already tolerate its absence).
+            if bp.parts and not bp.is_absolute():
+                bp = self.gpr_path.parent / bp
+            contained = bool(bp.parts) and bp.resolve().is_relative_to(
+                self.gpr_path.parent.resolve(),
+            )
+            if contained and bp.is_file():
                 from core.hash import sha256_file
                 doc.setdefault("metadata", {})["binary_sha256"] = (
                     sha256_file(bp)
+                )
+            elif bp.parts and bp.is_file():
+                logger.info(
+                    "re-database: not stamping binary_sha256 — the "
+                    "project-metadata binary path resolves outside "
+                    "the project directory",
                 )
         except OSError:
             logger.debug("could not hash %s", db.binary_path, exc_info=True)
@@ -512,6 +636,36 @@ class GhidraBridge:
         from core.json import save_json
         save_json(out_path, doc)
         logger.info("wrote %s (%d functions)", out_path, len(db.functions))
+        # Writer-side parity with the shared read ceiling: silently
+        # writing past what every capped reader accepts strands the
+        # operator with an artifact only a re-import can replace.
+        from core.json.utils import RE_DATABASE_MAX_BYTES
+        try:
+            size = out_path.stat().st_size
+        except OSError:
+            return
+        if size > RE_DATABASE_MAX_BYTES:
+            logger.warning(
+                "wrote %s at %d bytes — past the %d-byte shared read "
+                "ceiling; capped readers will refuse it "
+                "(RAPTOR_REDB_MAX_BYTES raises the ceiling on "
+                "large-memory hosts)",
+                out_path, size, RE_DATABASE_MAX_BYTES,
+            )
+
+
+def _walk_program_paths(folder, prefix: str = "") -> list:
+    """Program paths relative to the project root — subfolder programs
+    included (``sub/dir/prog``), root files bare. Mirrors
+    ``server_worker._Session._walk_programs`` (kept separate: the
+    worker module is an isolated subprocess entry point with no
+    package imports)."""
+    out = [prefix + str(f.getName()) for f in folder.getFiles()]
+    for sub in folder.getFolders():
+        out.extend(_walk_program_paths(
+            sub, prefix + str(sub.getName()) + "/",
+        ))
+    return out
 
 
 def _get_comment_type_map() -> dict:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 from pathlib import Path
 from unittest.mock import patch
@@ -77,9 +79,41 @@ def test_successful_clone_calls_sandbox(tmp_path: Path) -> None:
         assert mock_run.called
         cmd = _strip_pins(mock_run.call_args.args[0])
         assert cmd[:4] == ["git", "clone", "--depth", "1"]
+        # "--" separates options from the URL: the option/positional
+        # boundary must hold even if the URL allowlist ever widens to
+        # shapes git could parse as flags.
+        assert cmd[-3:] == ["--", "https://github.com/foo/bar",
+                            cmd[-1]]
         kwargs = mock_run.call_args.kwargs
         proxy_hosts = set(kwargs.get("proxy_hosts", []))
         assert {"github.com", "codeload.github.com"} <= proxy_hosts
+
+
+def test_mirror_clone_passes_mirror_flag(tmp_path: Path) -> None:
+    """``mirror=True`` produces ``git clone --mirror`` with no shallow
+    flags — the git-forensics shape (dangling/force-pushed history
+    needs refs a plain clone never fetches)."""
+    with patch("core.sandbox.run_untrusted_networked") as mock_run:
+        mock_run.side_effect = _clone_materialises
+        ok = clone_repository(
+            "https://github.com/foo/bar", tmp_path / "out.git",
+            depth=None, mirror=True,
+        )
+        assert ok is True
+        cmd = _strip_pins(mock_run.call_args.args[0])
+        assert cmd[:3] == ["git", "clone", "--mirror"]
+        assert "--depth" not in cmd
+        assert "--no-tags" not in cmd
+
+
+def test_mirror_with_depth_is_refused(tmp_path: Path) -> None:
+    """A shallow mirror would betray the forensic purpose; the
+    contradictory combination fails closed before any subprocess."""
+    with patch("core.sandbox.run_untrusted_networked") as mock_run:
+        with pytest.raises(ValueError):
+            clone_repository("https://github.com/foo/bar",
+                             tmp_path / "out.git", depth=1, mirror=True)
+        mock_run.assert_not_called()
 
 
 def test_clone_failure_raises_runtime_error(tmp_path: Path) -> None:
@@ -88,6 +122,29 @@ def test_clone_failure_raises_runtime_error(tmp_path: Path) -> None:
         with pytest.raises(RuntimeError, match="not found"):
             clone_repository("https://github.com/foo/bar",
                               tmp_path / "out")
+
+
+def test_clone_proxy_hosts_follow_isolated_override(tmp_path: Path) -> None:
+    """The conftest fixture redirects the operator proxy-hosts
+    override to a per-test path — writing an override THERE must steer
+    ``clone_repository``'s allowlist. This pins both the resolution
+    seam and the suite's hermeticity: a real operator override (e.g. a
+    private-mirror config that bans github.com) can no longer leak
+    into these tests."""
+    import json
+
+    from core.git import _proxy_hosts as mod
+
+    mod._OVERRIDE_CONFIG_PATH.write_text(
+        json.dumps({"hosts": ["mirror.example.test"]}), encoding="utf-8",
+    )
+    with patch("core.sandbox.run_untrusted_networked") as mock_run:
+        mock_run.side_effect = _clone_materialises
+        # Any allowlisted-shape URL; the override governs proxy_hosts,
+        # not URL validation.
+        clone_repository("https://github.com/foo/bar", tmp_path / "out")
+        kwargs = mock_run.call_args.kwargs
+        assert kwargs.get("proxy_hosts") == ["mirror.example.test"]
 
 
 def test_clone_engages_egress_proxy(tmp_path: Path) -> None:
@@ -212,10 +269,16 @@ def test_fetch_into_existing_repo_skips_init(tmp_path: Path) -> None:
         fetch_commit(repo, "https://github.com/foo/bar", _VALID_SHA)
 
     cmds = [_strip_pins(c.args[0]) for c in mock_local.call_args_list]
-    # First local call should be ``remote add``, not ``init`` —
-    # the ``.git`` dir already exists.
-    assert "init" not in cmds[0]
-    assert cmds[0][3] == "remote"
+    # No ``init`` — the ``.git`` dir already exists. The first local
+    # call is the pre-existing-config audit (config --local -z --list),
+    # then ``remote add``.
+    assert not any("init" in c for c in cmds)
+    assert cmds[0][3] == "config"
+    assert "--local" in cmds[0]
+    # ... then the history-rewrite audit (replace refs + grafts),
+    # then ``remote add``.
+    assert cmds[1][3] == "for-each-ref"
+    assert cmds[3][3] == "remote"
 
 
 def test_fetch_existing_origin_remote_falls_back_to_set_url(
@@ -1111,3 +1174,373 @@ def test_writable_path_ordinary_tmp_dir_accepted(tmp_path: Path) -> None:
     from core.git.clone import _validate_writable_path
 
     _validate_writable_path(tmp_path / "clone-target", role="output")
+
+
+# ---------------------------------------------------------------------------
+# fetch_commit pre-existing-config audit
+# ---------------------------------------------------------------------------
+
+def test_foreign_local_config_keys_detects_transport_class() -> None:
+    """Every member of the unpinnable transport class must surface:
+    proxy keys, URL-scoped http keys, insteadOf rewrites, URL-scoped
+    credential helpers, per-remote proxy/vcs."""
+    from core.git.clone import _foreign_local_config_keys
+    listing = "\0".join([
+        "http.proxy\nhttp://attacker.example:8080",
+        "http.https://github.com/.sslverify\nfalse",
+        "url.https://evil.example/.insteadof\nhttps://github.com/",
+        "credential.https://github.com.helper\n!curl attacker",
+        "remote.origin.proxy\nhttp://attacker.example:8080",
+        "remote.origin.vcs\next",
+        "core.repositoryformatversion\n0",       # benign — must NOT surface
+        "remote.origin.url\nhttps://github.com/foo/bar",  # benign
+    ]) + "\0"
+    foreign = _foreign_local_config_keys(listing)
+    assert "http.proxy" in foreign
+    assert "http.https://github.com/.sslverify" in foreign
+    assert "url.https://evil.example/.insteadof" in foreign
+    assert "credential.https://github.com.helper" in foreign
+    assert "remote.origin.proxy" in foreign
+    assert "remote.origin.vcs" in foreign
+    assert "core.repositoryformatversion" not in foreign
+    assert "remote.origin.url" not in foreign
+
+
+def test_foreign_local_config_keys_passes_own_footprint() -> None:
+    """The exact key set fetch_commit's init + remote-add steps write
+    (including the platform-dependent init defaults) audits clean."""
+    from core.git.clone import _foreign_local_config_keys
+    listing = "\0".join([
+        "core.repositoryformatversion\n0",
+        "core.filemode\ntrue",
+        "core.bare\nfalse",
+        "core.logallrefupdates\ntrue",
+        "core.ignorecase\ntrue",
+        "core.precomposeunicode\ntrue",
+        "core.symlinks\nfalse",
+        "remote.origin.url\nhttps://github.com/foo/bar",
+        "remote.origin.fetch\n+refs/heads/*:refs/remotes/origin/*",
+    ]) + "\0"
+    assert _foreign_local_config_keys(listing) == []
+
+
+def test_foreign_local_config_keys_nul_framing_defeats_value_injection() -> None:
+    """A hostile VALUE containing key-looking lines stays one NUL-framed
+    entry — it can neither forge a benign entry nor hide a hostile key
+    (line-wise parsing of the non-``-z`` form could be steered)."""
+    from core.git.clone import _foreign_local_config_keys
+    # Benign key whose value embeds what LOOKS like a hostile key line:
+    # stays benign (it is one entry; the audit reads only the key).
+    listing = "remote.origin.url\nhttps://x\nhttp.proxy=evil\0"
+    assert _foreign_local_config_keys(listing) == []
+    # The hostile key as its OWN entry is always caught.
+    listing = (
+        "remote.origin.url\nhttps://x\0"
+        "http.proxy\nhttp://attacker.example:8080\0"
+    )
+    assert _foreign_local_config_keys(listing) == ["http.proxy"]
+
+
+def test_fetch_preexisting_repo_hostile_config_refused(tmp_path: Path) -> None:
+    """A pre-existing repo_dir whose local config carries transport-
+    altering keys (insteadOf redirect + attacker proxy) must refuse
+    BEFORE the network step — no finite ``-c`` pin list covers the
+    URL-scoped key class, so the fetch never runs over it."""
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    hostile = (
+        "url.https://evil.example/.insteadof\nhttps://github.com/\0"
+        "http.proxy\nhttp://attacker.example:8080\0"
+    )
+
+    def _side_effect(cmd, **kwargs):
+        if "config" in cmd:
+            return _completed(0, stdout=hostile)
+        return _local_ok(cmd, **kwargs)
+
+    with patch("core.sandbox.run_untrusted", side_effect=_side_effect), \
+         patch("core.sandbox.run_untrusted_networked") as mock_net:
+        with pytest.raises(RuntimeError, match="never writes"):
+            fetch_commit(repo, "https://github.com/foo/bar", _VALID_SHA)
+        mock_net.assert_not_called()
+
+
+def test_fetch_preexisting_repo_unreadable_config_refused(
+    tmp_path: Path,
+) -> None:
+    """Config listing failure = unverifiable configuration → refuse
+    (fail closed), never fetch blind."""
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+
+    def _side_effect(cmd, **kwargs):
+        if "config" in cmd:
+            return _completed(128, stderr="fatal: unable to read config")
+        return _local_ok(cmd, **kwargs)
+
+    with patch("core.sandbox.run_untrusted", side_effect=_side_effect), \
+         patch("core.sandbox.run_untrusted_networked") as mock_net:
+        with pytest.raises(RuntimeError, match="unverifiable"):
+            fetch_commit(repo, "https://github.com/foo/bar", _VALID_SHA)
+        mock_net.assert_not_called()
+
+
+def test_fetch_preexisting_repo_own_footprint_still_fetches(
+    tmp_path: Path,
+) -> None:
+    """Two-direction: a repo_dir whose config is exactly fetch_commit's
+    own footprint (the cve_diff re-fetch loop shape) keeps working."""
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    own = (
+        "core.repositoryformatversion\n0\0"
+        "core.filemode\ntrue\0"
+        "core.bare\nfalse\0"
+        "core.logallrefupdates\ntrue\0"
+        "remote.origin.url\nhttps://github.com/foo/bar\0"
+        "remote.origin.fetch\n+refs/heads/*:refs/remotes/origin/*\0"
+    )
+
+    def _side_effect(cmd, **kwargs):
+        if "config" in cmd:
+            return _completed(0, stdout=own)
+        return _local_ok(cmd, **kwargs)
+
+    with patch("core.sandbox.run_untrusted", side_effect=_side_effect), \
+         patch("core.sandbox.run_untrusted_networked") as mock_net:
+        mock_net.return_value = _completed(0)
+        ok = fetch_commit(repo, "https://github.com/foo/bar", _VALID_SHA)
+        assert ok is True
+        assert mock_net.called
+
+
+def test_foreign_local_config_keys_non_origin_remotes_surface() -> None:
+    """fetch_commit writes ONLY remote.origin — a planted foreign
+    remote (e.g. an ``ext::`` URL waiting for an out-of-band
+    ``git fetch --all``) must surface as foreign."""
+    from core.git.clone import _foreign_local_config_keys
+    listing = (
+        "remote.origin.url\nhttps://github.com/foo/bar\0"
+        "remote.evil.url\next::sh -c whoami\0"
+        "remote.evil.fetch\n+refs/*:refs/*\0"
+    )
+    foreign = _foreign_local_config_keys(listing)
+    assert "remote.evil.url" in foreign
+    assert "remote.evil.fetch" in foreign
+    assert "remote.origin.url" not in foreign
+
+
+def test_fetch_preexisting_repo_replace_refs_refused(tmp_path: Path) -> None:
+    """A pre-existing repo_dir carrying ``refs/replace/*`` must refuse
+    BEFORE the network step: with a correctly-hashed attacker object
+    planted, the fetch succeeds from the REAL upstream, FETCH_HEAD
+    verifies the requested SHA — and every reader without the
+    ``core.useReplaceRefs=false`` pin gets the replacement content.
+    The config audit cannot see it (a ref is not a config key)."""
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+
+    def _side_effect(cmd, **kwargs):
+        if "config" in cmd:
+            return _completed(0, stdout="")
+        if "for-each-ref" in cmd:
+            return _completed(
+                0,
+                stdout=("0123456789abcdef0123456789abcdef01234567 commit\t"
+                        "refs/replace/deadbeef\n"),
+            )
+        return _local_ok(cmd, **kwargs)
+
+    with patch("core.sandbox.run_untrusted", side_effect=_side_effect), \
+         patch("core.sandbox.run_untrusted_networked") as mock_net:
+        with pytest.raises(RuntimeError, match="refs/replace"):
+            fetch_commit(repo, "https://github.com/foo/bar", _VALID_SHA)
+        mock_net.assert_not_called()
+
+
+def test_fetch_preexisting_repo_grafts_refused(tmp_path: Path) -> None:
+    """``info/grafts`` rewrites parent links for every reader and has
+    NO config off-switch — a pre-existing plant must refuse before
+    the network step."""
+    repo = tmp_path / "repo"
+    (repo / ".git" / "info").mkdir(parents=True)
+    (repo / ".git" / "info" / "grafts").write_text(
+        "0123456789abcdef0123456789abcdef01234567\n")
+
+    def _side_effect(cmd, **kwargs):
+        if "config" in cmd:
+            return _completed(0, stdout="")
+        if "for-each-ref" in cmd:
+            return _completed(0, stdout="")
+        if "--git-path" in cmd:
+            return _completed(0, stdout=".git/info/grafts\n")
+        return _local_ok(cmd, **kwargs)
+
+    with patch("core.sandbox.run_untrusted", side_effect=_side_effect), \
+         patch("core.sandbox.run_untrusted_networked") as mock_net:
+        with pytest.raises(RuntimeError, match="info/grafts"):
+            fetch_commit(repo, "https://github.com/foo/bar", _VALID_SHA)
+        mock_net.assert_not_called()
+
+
+def test_fetch_preexisting_repo_rewrite_audit_unreadable_refused(
+    tmp_path: Path,
+) -> None:
+    """The history-rewrite audit fails closed like the unreadable-
+    config arm: an unreadable ref listing refuses, never fetches
+    blind."""
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+
+    def _side_effect(cmd, **kwargs):
+        if "config" in cmd:
+            return _completed(0, stdout="")
+        if "for-each-ref" in cmd:
+            return _completed(128, stderr="fatal: not a git repository")
+        return _local_ok(cmd, **kwargs)
+
+    with patch("core.sandbox.run_untrusted", side_effect=_side_effect), \
+         patch("core.sandbox.run_untrusted_networked") as mock_net:
+        with pytest.raises(RuntimeError, match="unverifiable"):
+            fetch_commit(repo, "https://github.com/foo/bar", _VALID_SHA)
+        mock_net.assert_not_called()
+
+
+def test_safe_git_overrides_pin_replace_refs_off() -> None:
+    """Posture pin: every safe git command must carry the replace-ref
+    off-switch — object substitution behind a verified SHA otherwise
+    reaches every log/show/diff over a target repo."""
+    from core.git.clone import (
+        _SAFE_GIT_OVERRIDES,
+        _SAFE_GIT_READONLY_OVERRIDES,
+    )
+    assert "core.useReplaceRefs=false" in _SAFE_GIT_OVERRIDES
+    assert "core.useReplaceRefs=false" in _SAFE_GIT_READONLY_OVERRIDES
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+def test_replace_ref_substitution_neutralised_live(tmp_path: Path) -> None:
+    """Live repro of the object-substitution vector: a planted
+    ``refs/replace/<sha>`` makes bare ``git show`` return attacker
+    content for the REAL commit OID; the ``core.useReplaceRefs=false``
+    pin in the safe overrides restores the real content."""
+    from core.git.clone import safe_git_readonly_command
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    env = {"GIT_TERMINAL_PROMPT": "0", "HOME": str(tmp_path),
+           "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+           "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null",
+           "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+
+    def _git(*args: str) -> str:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), *args], env=env,
+            capture_output=True, text=True, timeout=30, check=True,
+        )
+        return proc.stdout.strip()
+
+    _git("init", "-q")
+    (repo / "f.txt").write_text("real\n", encoding="utf-8")
+    _git("add", "f.txt")
+    _git("commit", "-q", "-m", "real")
+    real_sha = _git("rev-parse", "HEAD")
+    (repo / "f.txt").write_text("attacker\n", encoding="utf-8")
+    _git("add", "f.txt")
+    _git("commit", "-q", "-m", "attacker")
+    evil_sha = _git("rev-parse", "HEAD")
+    _git("replace", real_sha, evil_sha)
+
+    # The vector: default git substitutes the attacker object.
+    substituted = _git("show", f"{real_sha}:f.txt")
+    assert substituted == "attacker"
+    # The pin: safe overrides read the real object.
+    pinned = subprocess.run(
+        safe_git_readonly_command(
+            "-C", str(repo), "show", f"{real_sha}:f.txt",
+        ) + ["--no-ext-diff"],
+        env=env, capture_output=True, text=True, timeout=30, check=True,
+    ).stdout.strip()
+    assert pinned == "real"
+
+
+def test_writable_path_refuses_system_state_prefixes() -> None:
+    """The writable scope is target.parent — a target under persistent
+    system state hands a hostile git server write access to host
+    configuration (/etc/cron.d, ld.so.conf.d, /var/spool/cron) with
+    the rest of the isolation engaged."""
+    from core.git.clone import _validate_writable_path
+    for bad in (
+        Path("/etc/clone"),
+        Path("/boot/kernels/x"),
+        Path("/usr/bin/x"),
+        Path("/var/spool/cron/x"),
+        Path("/var/tmp"),   # parent (= writable scope) would be /var
+    ):
+        with pytest.raises(ValueError, match="pseudo-fs|system-state|root"):
+            _validate_writable_path(bad, role="target")
+
+
+def test_writable_path_allows_var_tmp_children(tmp_path: Path) -> None:
+    """Two-direction: /var/tmp/<child> is the documented operator
+    scratch location and must keep validating (alongside /tmp)."""
+    from core.git.clone import _validate_writable_path
+    _validate_writable_path(Path("/var/tmp/raptor-wt/repo"), role="target")
+    _validate_writable_path(tmp_path / "repo", role="target")
+
+
+def test_git_failure_messages_escape_remote_controlled_bytes(
+    tmp_path: Path,
+) -> None:
+    """git relays server-controlled ``remote:`` banners verbatim into
+    stderr; the RuntimeError message flows to consumer logs/terminals,
+    so ESC/C1 control bytes must be neutralised at the message-builder
+    (and hostile banners length-capped)."""
+    hostile = "remote: \x1b]0;pwned\x07\x1b[2J fatal: nope"
+    with patch("core.sandbox.run_untrusted_networked") as mock_run:
+        mock_run.return_value = _completed(128, stderr=hostile)
+        with pytest.raises(RuntimeError) as exc_info:
+            clone_repository("https://github.com/foo/bar", tmp_path / "out")
+    msg = str(exc_info.value)
+    assert "\x1b" not in msg and "\x07" not in msg
+    assert "fatal: nope" in msg          # the useful part survives
+
+    with patch("core.sandbox.run_untrusted") as mock_local, \
+         patch("core.sandbox.run_untrusted_networked") as mock_net:
+        mock_local.side_effect = _local_ok
+        mock_net.return_value = _completed(128, stderr=hostile)
+        with pytest.raises(RuntimeError) as exc_info:
+            fetch_commit(tmp_path / "repo",
+                         "https://github.com/foo/bar", _VALID_SHA)
+    msg = str(exc_info.value)
+    assert "\x1b" not in msg and "\x07" not in msg
+
+
+def test_git_failure_messages_are_length_capped(tmp_path: Path) -> None:
+    """A hostile remote can stream an arbitrarily long banner; the
+    message must stay bounded (and still identify the operation)."""
+    with patch("core.sandbox.run_untrusted_networked") as mock_run:
+        mock_run.return_value = _completed(128, stderr="A" * 100_000)
+        with pytest.raises(RuntimeError) as exc_info:
+            clone_repository("https://github.com/foo/bar", tmp_path / "out")
+    msg = str(exc_info.value)
+    assert len(msg) < 3000
+    assert msg.startswith("git clone failed:")
+
+
+def test_writable_path_refuses_opt_srv_root_prefixes() -> None:
+    """The denylist's own rationale ("not in system-state locations")
+    covers /opt, /srv, and /root exactly as much as the listed
+    members: add-on package trees, served content, and the superuser
+    home are host state a hostile git server must not gain write scope
+    over."""
+    from core.git.clone import _validate_writable_path
+    for bad in (
+        Path("/opt/scratch/clone"),
+        Path("/opt/clone"),      # writable scope would be /opt itself
+        Path("/srv/www/clone"),
+        Path("/root/work/clone"),
+    ):
+        with pytest.raises(ValueError, match="pseudo-fs|system-state|root"):
+            _validate_writable_path(bad, role="target")

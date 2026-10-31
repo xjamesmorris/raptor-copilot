@@ -37,26 +37,41 @@ def _coerce(v: Any) -> Verdict:
     return v if v in _VALID else "inconclusive"
 
 
-def verdict_from(evidence: Any, llm_claim: Any = "inconclusive") -> Verdict:
+def verdict_from(
+    evidence: Any,
+    llm_claim: Any = "inconclusive",
+    *,
+    polarity: str = "",
+) -> Verdict:
     """Mechanically derive the verdict from one piece of evidence.
 
     Accepts any object exposing `.success` and `.matches` — both the
     `Evidence` dataclass from `result.py` and the `ToolEvidence`
-    dataclass from `adapters/base.py` qualify.
+    dataclass from `adapters/base.py` qualify. ``polarity`` is the
+    hypothesis's declared reading (``Hypothesis.polarity``:
+    "reachability" / "infeasibility" / "" undeclared) — set at
+    formation time, before any tool output exists.
 
-    Behaviour matches the runner's existing logic exactly:
+    Rules:
 
       - If the tool didn't run successfully: inconclusive. (The error
         text lives on the evidence object; we don't reproduce it here.)
+      - If the tool ran, produced no matches, and the evidence carries
+        ``empty_matches_conclusive`` (the adapter's assertion that the
+        empty-match outcome is itself a definitive tool result — SMT
+        ``unsat`` proving "these constraints are mutually exclusive"):
+        the verdict DIRECTION comes from the declared polarity, never
+        from the LLM's phrasing-aware reading of the hypothesis after
+        seeing the tool output. unsat mechanically REFUTES a
+        reachability-phrased claim and CONFIRMS an
+        infeasibility-phrased one. With no declared polarity the proof
+        is sound but its direction is unknowable mechanically, so an
+        LLM "confirmed" downgrades to inconclusive (the claim is
+        hint-tier — it must not mint a confirmed finding from zero
+        matches); refuted/inconclusive claims pass through as before.
       - If the tool ran but produced no matches and the LLM claimed
-        confirmed: downgrade to refuted (you can't confirm without
-        evidence) — UNLESS the evidence carries
-        ``empty_matches_conclusive``, the adapter's assertion that the
-        empty-match outcome is itself a definitive tool result. Example:
-        SMT ``unsat`` proves "these constraints are mutually exclusive",
-        which CONFIRMS an infeasibility-phrased hypothesis; inverting
-        the LLM's phrasing-aware reading to refuted would report the
-        exact opposite of what the tool proved.
+        confirmed (no conclusiveness assertion): downgrade to refuted
+        (you can't confirm without evidence).
       - If the tool ran and matches are present but the LLM claimed
         refuted: downgrade to inconclusive. (Matches deserve a human
         look even if the LLM dismissed them.)
@@ -69,9 +84,15 @@ def verdict_from(evidence: Any, llm_claim: Any = "inconclusive") -> Verdict:
     matches = bool(getattr(evidence, "matches", []) or [])
     claim = _coerce(llm_claim)
 
+    if not matches and bool(
+        getattr(evidence, "empty_matches_conclusive", False)
+    ):
+        if polarity == "infeasibility":
+            return "confirmed"
+        if polarity == "reachability":
+            return "refuted"
+        return claim if claim != "confirmed" else "inconclusive"
     if claim == "confirmed" and not matches:
-        if bool(getattr(evidence, "empty_matches_conclusive", False)):
-            return claim
         return "refuted"
     if claim == "refuted" and matches:
         return "inconclusive"
@@ -81,18 +102,21 @@ def verdict_from(evidence: Any, llm_claim: Any = "inconclusive") -> Verdict:
 def aggregate(
     evidence_list: Iterable[Any],
     llm_claim: Any = "inconclusive",
+    *,
+    polarity: str = "",
 ) -> Verdict:
     """Combine multi-adapter evidence into one verdict.
 
     Empty list → inconclusive (no mechanical evidence at all).
     Otherwise: compute each adapter's per-evidence verdict via
-    `verdict_from`, then meet them — equal verdicts compose, any
-    disagreement collapses to inconclusive.
+    `verdict_from` (same ``polarity`` semantics), then meet them —
+    equal verdicts compose, any disagreement collapses to
+    inconclusive.
     """
     items = list(evidence_list)
     if not items:
         return "inconclusive"
-    verdicts = [verdict_from(e, llm_claim) for e in items]
+    verdicts = [verdict_from(e, llm_claim, polarity=polarity) for e in items]
     out = verdicts[0]
     for v in verdicts[1:]:
         out = out if out == v else "inconclusive"

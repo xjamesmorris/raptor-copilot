@@ -523,9 +523,16 @@ class TestHostileResourceBounds:
         new = _db([_func("root", 0x2000),
                    _func("FUN_1", 0x2100, auto=True)],
                   xrefs=[(0x2010, 0x2100, "call")] * 20_000)
-        t0 = time.perf_counter()
+        # CPU time, not wall clock: the dedup is pure computation, so
+        # a regression burns CPU while an oversubscribed runner only
+        # adds scheduling delay — process_time keeps the regression
+        # signal without load-induced flakes. Bound trade-off: high
+        # enough for slow CI CPUs (~10x headroom over the deduped
+        # path), low enough that re-walking 20k duplicate edges still
+        # trips it.
+        t0 = time.process_time()
         match_databases(old, new)
-        assert time.perf_counter() - t0 < 2.0
+        assert time.process_time() - t0 < 2.0
 
     def test_long_chain_fixpoint_is_not_quadratic(self):
         import time
@@ -542,17 +549,20 @@ class TestHostileResourceBounds:
                0x10000 + (i + 1) * 0x100, "call") for i in range(n)]
         nx = [(0x900000 + i * 0x100 + 0x10,
                0x900000 + (i + 1) * 0x100, "call") for i in range(n)]
-        t0 = time.perf_counter()
+        # CPU time, not wall clock — load-immune quadratic pin (see
+        # test_duplicate_xref_spam_is_deduped for the trade-off).
+        t0 = time.process_time()
         r = match_databases(_db(of, ox), _db(nf, nx))
-        elapsed = time.perf_counter() - t0
-        assert elapsed < 10.0, f"{elapsed:.1f}s for a {n}-chain"
+        elapsed = time.process_time() - t0
+        assert elapsed < 10.0, f"{elapsed:.1f}s CPU for a {n}-chain"
         assert r.stats["matched"] > n // 2
 
     def test_shingles_are_token_capped(self):
         import packages.ghidra.match as m
+        from packages.ghidra.similarity import MAX_SHINGLE_TOKENS
         f = _func("big", 0x1000,
                   decomp="x = a + b; " * 200_000)
-        assert len(m._shingles(f)) <= m._MAX_SHINGLE_TOKENS
+        assert len(m._shingles(f)) <= MAX_SHINGLE_TOKENS
 
     def test_set_work_budget_skips_loudly(self, monkeypatch):
         monkeypatch.setattr(match_mod, "_MAX_SIM_WORK", 10)

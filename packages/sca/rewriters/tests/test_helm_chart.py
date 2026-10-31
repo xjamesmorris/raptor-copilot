@@ -192,3 +192,179 @@ def test_chart_lock_NOT_routed_to_chart_yaml_rewriter(
     assert results == []
     # File untouched.
     assert "13.4.4" in lock.read_text()
+
+
+def test_chart_yaml_aliased_twin_entries_both_bumped(
+    tmp_path: Path,
+) -> None:
+    """Two aliased entries of the SAME chart at the same vulnerable
+    version: both must be bumped — a first-match count=1 substitution
+    bumped one alias and left its twin vulnerable while the run
+    reported applied."""
+    chart = tmp_path / "Chart.yaml"
+    chart.write_text(
+        "apiVersion: v2\n"
+        "name: my-chart\n"
+        "version: 1.0.0\n"
+        "dependencies:\n"
+        "  - name: redis\n"
+        "    alias: cache\n"
+        "    version: 17.0.0\n"
+        "  - name: redis\n"
+        "    alias: queue\n"
+        "    version: 17.0.0\n",
+        encoding="utf-8",
+    )
+    edits = [RewriteEdit(
+        locator="redis", old_value="17.0.0", new_value="18.1.0",
+    )]
+    results = rewrite_chart_yaml(chart, edits)
+    assert results[0].applied
+    text = chart.read_text()
+    assert text.count("version: 18.1.0") == 2
+    assert "17.0.0" not in text
+
+
+def test_chart_yaml_mixed_versions_partial_reported(
+    tmp_path: Path,
+) -> None:
+    chart = tmp_path / "Chart.yaml"
+    chart.write_text(
+        "apiVersion: v2\n"
+        "name: my-chart\n"
+        "version: 1.0.0\n"
+        "dependencies:\n"
+        "  - name: redis\n"
+        "    version: 17.0.0\n"
+        "  - name: redis\n"
+        "    version: 16.5.0\n",
+        encoding="utf-8",
+    )
+    edits = [RewriteEdit(
+        locator="redis", old_value="17.0.0", new_value="18.1.0",
+    )]
+    results = rewrite_chart_yaml(chart, edits)
+    assert results[0].applied
+    assert results[0].reason.startswith("partial:")
+    text = chart.read_text()
+    assert "version: 18.1.0" in text
+    assert "version: 16.5.0" in text
+
+
+def test_pathological_chart_yaml_is_fast(tmp_path: Path) -> None:
+    """Hostile Chart.yaml: a matching ``- name:`` block padded with
+    filler lines and NO same-indent ``version:`` line. The previous
+    between-lines group backtracked exponentially on the overall-match
+    failure (~x16 per two filler lines; 30 lines hung the harden/bump
+    run) — the attacker controls both the dep name (their Chart.yaml
+    produced the plan) and the filler. Both-direction bound: fast AND
+    still a clean not_found."""
+    import time
+
+    chart = tmp_path / "Chart.yaml"
+    chart.write_text(
+        "dependencies:\n"
+        "  - name: postgresql\n"
+        + "    key: value\n" * 40
+        + "  - name: other\n"
+        "    version: 1.0.0\n"
+    )
+    edits = [RewriteEdit(
+        locator="postgresql", old_value="13.4.4", new_value="14.0.0",
+    )]
+    start = time.monotonic()
+    results = rewrite_chart_yaml(chart, edits)
+    assert time.monotonic() - start < 5.0
+    assert not results[0].applied
+    assert results[0].reason == "not_found"
+
+
+def test_version_first_pathological_is_fast(tmp_path: Path) -> None:
+    """Same bound for the version-then-name shape."""
+    import time
+
+    chart = tmp_path / "Chart.yaml"
+    chart.write_text(
+        "dependencies:\n"
+        "  - version: 13.4.4\n"
+        + "    key: value\n" * 40
+        + "  - version: 1.0.0\n"
+        "    name: other\n"
+    )
+    edits = [RewriteEdit(
+        locator="postgresql", old_value="13.4.4", new_value="14.0.0",
+    )]
+    start = time.monotonic()
+    results = rewrite_chart_yaml(chart, edits)
+    assert time.monotonic() - start < 5.0
+    assert not results[0].applied
+
+
+def test_nested_list_between_anchors_declines(tmp_path: Path) -> None:
+    """Boundary is STRICTER than the pre-fix pattern: a nested list
+    (tags:/condition: blocks) between name and version hard-stops the
+    window at the first `-` line, so the edit declines with not_found
+    (visible, refusal direction) instead of the old accidental
+    cross-line match. Documented capability regression."""
+    chart = tmp_path / "Chart.yaml"
+    chart.write_text(
+        "dependencies:\n"
+        "  - name: postgresql\n"
+        "    tags:\n"
+        "      - database\n"
+        "    version: 13.4.4\n"
+    )
+    edits = [RewriteEdit(
+        locator="postgresql", old_value="13.4.4", new_value="14.0.0",
+    )]
+    results = rewrite_chart_yaml(chart, edits)
+    assert not results[0].applied
+    assert results[0].reason == "not_found"
+
+
+def test_blank_line_run_is_fast(tmp_path: Path) -> None:
+    """Hostile Chart.yaml made of a blank-line RUN: under the
+    MULTILINE ``^`` anchor a ``\\s+`` indent group matched at every
+    line start inside the run and backtracked per character —
+    quadratic (a 64KB file of newlines took ~30s end-to-end while the
+    filler-line exponential class above stayed green). Horizontal-only
+    indent is linear. Both-direction bound: fast AND the dep after
+    the run still bumps."""
+    import time
+
+    chart = tmp_path / "Chart.yaml"
+    chart.write_text(
+        "dependencies:\n"
+        + "\n" * 65536
+        + "  - name: redis\n"
+        "    version: 1.0.0\n"
+    )
+    edits = [RewriteEdit(
+        locator="redis", old_value="1.0.0", new_value="2.0.0",
+    )]
+    start = time.monotonic()
+    results = rewrite_chart_yaml(chart, edits)
+    assert time.monotonic() - start < 5.0
+    assert results[0].applied
+    assert "version: 2.0.0" in chart.read_text()
+
+
+def test_indent_never_captures_across_blank_line(tmp_path: Path) -> None:
+    """The indent group is horizontal-only: a blank line between two
+    deps must hard-stop the window (the ``\\s+`` spelling silently
+    captured across it, contradicting the documented hard-stop
+    contract). The version separated from its name by a blank line
+    declines not_found instead of splicing."""
+    chart = tmp_path / "Chart.yaml"
+    chart.write_text(
+        "dependencies:\n"
+        "  - name: postgresql\n"
+        "\n"
+        "    version: 13.4.4\n"
+    )
+    edits = [RewriteEdit(
+        locator="postgresql", old_value="13.4.4", new_value="14.0.0",
+    )]
+    results = rewrite_chart_yaml(chart, edits)
+    assert not results[0].applied
+    assert results[0].reason == "not_found"

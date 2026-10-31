@@ -175,24 +175,6 @@ def format_contract_violations_for_prompt(
 # Mechanical precondition checking (best-effort, regex-based)
 # ---------------------------------------------------------------------------
 
-# Regex patterns for common precondition idioms.  Each entry maps a
-# precondition keyword to a (pattern_builder, cwe) pair.  The pattern
-# builder takes the parameter name and returns a compiled regex that
-# matches a satisfying check in the caller source.
-
-_NULL_CHECK_RE = re.compile(
-    r"(?:!=\s*NULL|!=\s*nullptr|!=\s*0\b|!=\s*\(\s*void\s*\*\s*\)\s*0"
-    r"|\bif\s*\([^)]*\b{param}\b[^)]*\))",
-)
-
-_POSITIVE_CHECK_RE = re.compile(
-    r"(?:>\s*0|>=\s*1|>=\s*0)",
-)
-
-_SIZE_CHECK_RE = re.compile(
-    r"(?:>=\s*\d+|<=\s*\d+|<\s*\d+|>\s*\d+|\bsizeof\b|\blen(?:gth)?\b)",
-)
-
 _LOCK_PATTERNS = (
     "pthread_mutex_lock", "mutex_lock", "spin_lock", "lock_acquire",
     "EnterCriticalSection", "lock(", "acquire(",

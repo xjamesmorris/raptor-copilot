@@ -35,10 +35,42 @@ _MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
 
 logger = logging.getLogger(__name__)
 
+# Context-volume limits for the classifier's flow/caller channel.
+# Already-named siblings of the line-window limits in
+# core.llm.context_window; each is argued in both directions because
+# these bound what the per-finding classifier sees:
+
+# Flow traces attached to one finding. Too small (0-1): a function on
+# several traced flows shows only one path's reachability story. Too
+# large: traces through the same file overlap heavily, so extra
+# traces mostly re-bill the same hops and dilute the finding's own
+# code.
 MAX_TRACES_PER_FINDING = 2
+
+# Hops rendered per trace before the "... N more hop(s)" elision. Too
+# small: the rendered chain loses its sink end — exactly the part
+# that argues reachability. Too large: a pathological or hostile
+# trace artifact with hundreds of steps floods the prompt.
 MAX_HOPS_PER_TRACE = 8
+
+# Callers (with call-site snippets) shown per finding. Too small: the
+# classifier judges "how is this function invoked" from one caller
+# that may be unrepresentative. Too large: each caller costs a file
+# read plus snippet lines, and the marginal caller repeats the same
+# calling convention. Tighter than the audit reviewer's cap
+# (core.audit.context.MAX_CALL_SITE_CALLERS) on purpose: here the
+# snippets ride EVERY finding's analysis prompt, not one review.
 MAX_CALLERS_PER_FINDING = 5
+
+# Trace artifacts parsed and cached per repo. Too small: findings on
+# later-numbered traces silently lose flow context. Too large: a
+# hostile run dir with thousands of planted trace files costs memory
+# proportional to the cap.
 MAX_TRACES_CACHED = 50
+
+# Width cap per rendered dynamic field (descriptions, names, tainted
+# vars). Too small: step descriptions truncate to uselessness. Too
+# large: a single minified/hostile field line dominates the block.
 _MAX_FIELD_CHARS = 160
 
 # repo path → (flow traces, checklist, context map)
@@ -293,6 +325,29 @@ def _render_trace(
 # ---------------------------------------------------------------------------
 
 
+def caller_call_sites_block(
+    checklist: dict[str, Any] | None,
+    file_path: str,
+    function: str,
+    repo_path: Path,
+    *,
+    context_map: dict[str, Any] | None = None,
+    max_callers: int = MAX_CALLERS_PER_FINDING,
+) -> UntrustedBlock | None:
+    """Public seam over the caller-channel block builder.
+
+    Same bounded rendering as the per-finding channel; ``max_callers``
+    lets a consumer with a different volume policy (the verdict-
+    triggered context expansion uses the audit-side cap) reuse the
+    builder instead of forking it. Returns ``None`` when no caller
+    resolves.
+    """
+    return _build_caller_block(
+        checklist, file_path, function, repo_path,
+        context_map=context_map, max_callers=max_callers,
+    )
+
+
 def _build_caller_block(
     checklist: dict[str, Any] | None,
     file_path: str,
@@ -300,16 +355,30 @@ def _build_caller_block(
     repo_path: Path,
     *,
     context_map: dict[str, Any] | None = None,
+    max_callers: int = MAX_CALLERS_PER_FINDING,
 ) -> UntrustedBlock | None:
-    from core.audit.context import collect_caller_call_sites
+    from core.audit.context import (
+        CALL_SITE_CONTEXT_LINES,
+        collect_caller_call_sites,
+    )
 
     callers = collect_caller_call_sites(
         checklist, file_path, function, repo_path,
-        max_callers=MAX_CALLERS_PER_FINDING,
+        max_callers=max_callers,
         context_map=context_map,
     )
     if not callers:
         return None
+
+    # Height cap DERIVED from the audit-side window at call time:
+    # the enricher builds call_site snippets of exactly
+    # 2 * CALL_SITE_CONTEXT_LINES + 1 lines, so an independent
+    # literal here silently clips this channel the day the window
+    # grows (that drift existed: a hardcoded [:3] twin of the ±1
+    # window). Deriving keeps the defensive property too — a
+    # hostile/pathological call_site still cannot exceed the
+    # contract height.
+    snippet_height = 2 * CALL_SITE_CONTEXT_LINES + 1
 
     lines = [f"Known callers of {_clip(function, 80)}:"]
     for caller in callers:
@@ -317,7 +386,15 @@ def _build_caller_block(
         lines.append(f"- {_clip(caller.get('name', ''), 80)} at {where}")
         call_site = caller.get("call_site")
         if call_site:
-            lines.extend(f"    {snippet_line}" for snippet_line in str(call_site).splitlines()[:3])
+            # Width-capped like every other dynamic field in this
+            # module: the snippet is a raw target-source line
+            # (core.audit.context attaches it with no per-line bound),
+            # so a single minified line otherwise rides into the
+            # prompt at up to the upstream file cap.
+            lines.extend(
+                f"    {_clip(snippet_line, 200)}"
+                for snippet_line in str(call_site).splitlines()[:snippet_height]
+            )
     return UntrustedBlock(
         content="\n".join(lines),
         kind="caller-call-sites",

@@ -29,21 +29,26 @@ systems; if the system pip-compile refuses (or is missing), we fall
 back to creating an ephemeral venv, installing pip-tools into it,
 and re-running pip-compile with the venv's pip (which doesn't have
 the marker). Per-run cost is ~3-5s for venv create + pip-tools
-install. The venv lives at ``/tmp/raptor-sca-venv-<pid>-<hash>/``
-— the sandbox mounts most of the project tree read-only, so the
-per-call tmpfs at ``/tmp`` is the writeable surface — and vanishes
-with that tmpfs when the sandbox call ends. See
-:meth:`PipResolver._venv_dir` for the path rationale.
+install. The venv lives at an unpredictable ``mkdtemp``-created
+``/tmp/raptor-sca-venv-*/`` path — the sandbox mounts most of the
+project tree read-only, so ``/tmp`` is the writeable surface — and
+vanishes with the sandbox tmpfs when the call ends (with a
+best-effort host-side cleanup for sandbox lanes that share the host
+``/tmp``). See :meth:`PipResolver._venv_dir` for the path rationale.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import secrets
 import shlex
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+
+from core.atomic_fs import rmtree_hardened
 
 from . import ResolverResult, _check_tool, _run
 
@@ -96,8 +101,8 @@ class PipResolver:
     First tries system ``pip-compile`` in the sandbox; if that fails
     for any reason (PEP 668 refusal, missing binary, ``$HOME``-hidden
     install path under ``fake_home=True``, version mismatch, …) we
-    fall back to creating an ephemeral venv at
-    ``/tmp/raptor-sca-venv-<pid>-<hash>/`` and running pip-tools we
+    fall back to creating an ephemeral venv at an unpredictable
+    ``/tmp/raptor-sca-venv-*/`` path and running pip-tools we
     install into it. The venv path always works given network access
     to PyPI, at the cost of ~5-8s setup per PyPI manifest dir.
 
@@ -253,28 +258,32 @@ class PipResolver:
 
     # --- ephemeral-venv pipeline ---------------------------------------
 
-    def _venv_dir(self, project_dir: Path) -> Path:
-        """Per-run venv path.
+    def _venv_dir(self) -> Path:
+        """Fresh per-call venv path — ``mkdtemp``, never a derived name.
 
-        Lives under ``/tmp`` rather than the project tree because the
-        sandbox makes most subdirs of the project read-only at the
-        mount-ns level (``output=cwd`` permits writes only to a
-        narrow surface — a deeply-nested manifest dir like
+        Lives under the host temp dir rather than the project tree
+        because the sandbox makes most subdirs of the project
+        read-only at the mount-ns level (``output=cwd`` permits writes
+        only to a narrow surface — a deeply-nested manifest dir like
         ``.devcontainer/`` may hit "Read-only file system" when we
         try to mkdir inside it). ``/tmp`` is in the sandbox's default
-        writable_paths and is per-pid namespaced so concurrent runs
-        on the same project don't collide.
+        writable_paths.
 
-        ``project_dir`` is hashed into the suffix so two parallel
-        scans of different projects (e.g. CI matrix) get distinct
-        venvs even when their PIDs happen to clash across containers.
+        The path MUST be unpredictable: the pre-fix
+        ``/tmp/raptor-sca-venv-<pid>-<hash>`` name was fully
+        derivable (pid guessable, hash of the scan-target path), and
+        in sandbox lanes that share the host ``/tmp`` (the Landlock
+        containment floor) a co-resident local user could pre-create
+        it and pre-plant ``bin/pip-compile`` — which the pipeline then
+        executes with PyPI egress. ``mkdtemp`` creates the directory
+        mode 0700 with an unpredictable suffix, refusing pre-planted
+        paths by construction. In mount-ns lanes the sandbox's own
+        tmpfs at ``/tmp`` is fresh, so the host-side directory simply
+        doesn't exist inside — the setup script's ``mkdir -p`` /
+        ``python -m venv`` recreate it there; callers clean the
+        host-side dir up after the sandbox call returns.
         """
-        import hashlib
-        import os as _os
-        proj_hash = hashlib.sha256(
-            str(project_dir).encode("utf-8")
-        ).hexdigest()[:8]
-        return Path("/tmp") / f"raptor-sca-venv-{_os.getpid()}-{proj_hash}"
+        return Path(tempfile.mkdtemp(prefix="raptor-sca-venv-"))
 
     def _create_venv(
         self, project_dir: Path, _timeout: int,
@@ -289,11 +298,12 @@ class PipResolver:
         :meth:`_run_pip_compile_in_venv`, builds that pipeline with
         :meth:`_venv_setup_script` as its prefix; this helper only
         returns ``(venv_dir, None)`` so the caller can locate the venv
-        by path inside its own sandbox call. Filesystem state is
-        intentionally NOT created or inspected here (it would be gone
-        with the sandbox tmpfs anyway).
+        by path inside its own sandbox call. The host-side directory
+        ``mkdtemp`` creates exists only to reserve the unpredictable
+        name; the sandbox pipeline rebuilds it inside its own tmpfs.
         """
-        return self._venv_dir(project_dir), None
+        del project_dir  # name no longer derived from the target
+        return self._venv_dir(), None
 
     def _venv_setup_script(self, venv_dir: Path) -> str:
         """Shell snippet that creates the venv + bootstraps pip.
@@ -400,18 +410,25 @@ class PipResolver:
                 rel_manifest = manifest.relative_to(pd)
                 manifests.append((pd, rel_dir, rel_manifest))
 
-        # Use a single venv for the whole batch. Path includes the
-        # common_root hash so concurrent scans of different repos
-        # don't collide. Lives under /tmp (sandbox-writable).
-        import hashlib
-        proj_hash = hashlib.sha256(
-            str(common_root).encode("utf-8")
-        ).hexdigest()[:8]
-        venv_dir = Path(
-            f"/tmp/raptor-sca-venv-batch-{os.getpid()}-{proj_hash}"
-        )
+        # Use a single venv for the whole batch. mkdtemp gives an
+        # unpredictable, mode-0700 path (see _venv_dir — a derived
+        # name is pre-plantable in shared-/tmp sandbox lanes).
+        venv_dir = self._venv_dir()
 
-        script = self._build_batch_script(venv_dir, manifests)
+        # Per-invocation random marker nonce: the batch markers
+        # frame attacker-influenceable pip-compile output (a hostile
+        # manifest can make pip-compile echo chosen text), and the
+        # parser takes the FIRST occurrence of each marker — a
+        # forged plaintext marker shifted every following section,
+        # attributing attacker-chosen 'lockfiles' to other
+        # manifests. Fresh randomness per run is unforgeable from
+        # inside the batch — EXCEPT under ``--allow-sdist-builds``,
+        # where a build backend executes with enough access to read
+        # the batch script (e.g. via /proc) and recover the nonce;
+        # that opt-in already grants code execution, so the residual
+        # is attribution shuffling inside an accepted trust grant.
+        nonce = secrets.token_hex(16)
+        script = self._build_batch_script(venv_dir, manifests, nonce)  # type: ignore[arg-type]
         try:
             proc = _run(
                 ["sh", "-c", script],
@@ -419,22 +436,39 @@ class PipResolver:
                 proxy_hosts=self.proxy_hosts,
             )
         except subprocess.TimeoutExpired:
+            # One shared budget across venv setup + N pip-compiles:
+            # a single slow batch used to mark ALL N manifests failed
+            # (and, pre-fix, cache those failures for a full TTL)
+            # while sequential resolution — each project on a fresh
+            # full budget — would have succeeded. Fall back rather
+            # than fabricate N failures.
+            logger.warning(
+                "sca.resolvers.pip: batch venv pipeline timed out "
+                "after %ss; falling back to sequential per-manifest "
+                "resolution", timeout,
+            )
             return [
-                ResolverResult(
-                    ecosystem=self.ecosystem, success=False, available=True,
-                    error=f"PEP 668 batch venv pipeline timed out "
-                          f"after {timeout}s",
-                )
-                for _ in project_dirs
+                self.dry_run(p, timeout=timeout) for p in project_dirs
             ]
+        finally:
+            # Host-side cleanup: in mount-ns lanes the sandbox tmpfs
+            # already discarded the venv and this removes the empty
+            # mkdtemp reservation; in shared-/tmp lanes it removes the
+            # populated venv (mkdtemp names never dedupe across calls
+            # the way the old derived name did). rmtree_hardened: the
+            # venv ran attacker-influenced installs — a griefed
+            # mode-0 subdirectory defeats plain rmtree.
+            rmtree_hardened(venv_dir)
 
         return self._parse_batch_output(
-            proc.stdout, proc.stderr, proc.returncode, manifests,
+            proc.stdout, proc.stderr, proc.returncode, manifests,  # type: ignore[arg-type]
+            nonce,
         )
 
     def _build_batch_script(
         self, venv_dir: Path,
         manifests: list[tuple[Path, Path, Path | None]],
+        nonce: str,
     ) -> str:
         """Generate the combined sh script. One venv build, then N
         parallel pip-compile invocations writing to per-manifest
@@ -481,18 +515,19 @@ class PipResolver:
         # output (no pip-compile error message uses these literal
         # tokens).
         for i in range(len(manifests)):
-            parts.append(f"echo '===RAPTOR_BATCH_OUT_{i}==='")
+            parts.append(f"echo '===RAPTOR_BATCH_{nonce}_OUT_{i}==='")
             parts.append(f"cat {results_dir}/{i}.out 2>/dev/null || true")
-            parts.append(f"echo '===RAPTOR_BATCH_RC_{i}==='")
+            parts.append(f"echo '===RAPTOR_BATCH_{nonce}_RC_{i}==='")
             parts.append(f"cat {results_dir}/{i}.rc 2>/dev/null || echo 99")
-            parts.append(f"echo '===RAPTOR_BATCH_ERR_{i}==='")
+            parts.append(f"echo '===RAPTOR_BATCH_{nonce}_ERR_{i}==='")
             parts.append(f"cat {results_dir}/{i}.err 2>/dev/null || true")
-        parts.append("echo '===RAPTOR_BATCH_END==='")
+        parts.append(f"echo '===RAPTOR_BATCH_{nonce}_END==='")
         return "\n".join(parts)
 
     def _parse_batch_output(
         self, stdout: str, stderr: str, _returncode: int,
         manifests: list[tuple[Path, Path, Path | None]],
+        nonce: str,
     ) -> list[ResolverResult]:
         """Split the batch sh stdout back into per-manifest
         ResolverResults. The script emitted three markers per index
@@ -511,7 +546,7 @@ class PipResolver:
                 )
                 for _ in manifests
             ]
-        if "===RAPTOR_BATCH_END===" not in stdout:
+        if f"===RAPTOR_BATCH_{nonce}_END===" not in stdout:
             # Pipeline died before reaching the end marker. Fall back
             # to per-result failure with the raw output so the
             # operator can diagnose.
@@ -532,13 +567,13 @@ class PipResolver:
         # marker offsets and slice the stdout between them.
         results: list[ResolverResult] = []
         for i in range(len(manifests)):
-            out_marker = f"===RAPTOR_BATCH_OUT_{i}==="
-            rc_marker = f"===RAPTOR_BATCH_RC_{i}==="
-            err_marker = f"===RAPTOR_BATCH_ERR_{i}==="
+            out_marker = f"===RAPTOR_BATCH_{nonce}_OUT_{i}==="
+            rc_marker = f"===RAPTOR_BATCH_{nonce}_RC_{i}==="
+            err_marker = f"===RAPTOR_BATCH_{nonce}_ERR_{i}==="
             next_marker = (
-                f"===RAPTOR_BATCH_OUT_{i + 1}==="
+                f"===RAPTOR_BATCH_{nonce}_OUT_{i + 1}==="
                 if i + 1 < len(manifests)
-                else "===RAPTOR_BATCH_END==="
+                else f"===RAPTOR_BATCH_{nonce}_END==="
             )
             sections = _slice_between(
                 stdout, out_marker, rc_marker, err_marker, next_marker,
@@ -598,7 +633,7 @@ class PipResolver:
         # whole call returns the first failing step's stderr.
         qvenv = shlex.quote(str(venv_dir))
         script = (
-            self._venv_setup_script(venv_dir)
+            self._venv_setup_script(venv_dir)  # type: ignore[arg-type]
             + f"{qvenv}/bin/python -m pip install --quiet pip-tools && "
             + f"{qvenv}/bin/pip-compile --quiet "
             + f"--output-file - {shlex.quote(str(rel_manifest))}"
@@ -614,6 +649,13 @@ class PipResolver:
                 ecosystem=self.ecosystem, success=False, available=True,
                 error=f"venv pipeline timed out after {timeout}s",
             )
+        finally:
+            # Remove the host-side mkdtemp reservation (and, in
+            # shared-/tmp sandbox lanes, the populated venv itself) —
+            # unpredictable names never dedupe across calls.
+            # rmtree_hardened: see the batch dry_run finally above.
+            if venv_dir is not None:
+                rmtree_hardened(venv_dir)
         raw = (proc.stdout + "\n" + proc.stderr).strip()
         if proc.returncode != 0:
             return ResolverResult(

@@ -2,7 +2,10 @@
 :mod:`core.analysis._reach_cache`."""
 from __future__ import annotations
 
+import sys
+
 import core.analysis._reach_cache as rc_mod
+import core.inventory._ts_cache as ts_cache
 
 
 def _inv():
@@ -42,3 +45,72 @@ def test_fingerprint_still_changes_on_content_change():
     inv["files"][0]["sha256"] = "cc" * 32
     fp2 = rc_mod.compute_fingerprint(inv)
     assert fp1 != fp2
+
+
+def test_identity_excludes_findable_but_unimportable_grammar(
+    tmp_path, monkeypatch,
+):
+    # A module that is FINDABLE but raises at import time (a
+    # dependency-simulation stub, a broken wheel) must not count as
+    # available: the extractor probes by import, so an identity that
+    # over-claims lets a degraded index be persisted under — and
+    # served from — the full-toolchain fingerprint.
+    stub_name = "tree_sitter_reachfp_stub"
+    (tmp_path / f"{stub_name}.py").write_text(
+        'raise ModuleNotFoundError("No module named '
+        f'{stub_name}", name="{stub_name}")\n',
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(rc_mod, "_EXTRACTOR_IDENTITY", None)
+    monkeypatch.setattr(
+        rc_mod, "_GRAMMAR_MODULES", (*rc_mod._GRAMMAR_MODULES, stub_name),
+    )
+    # Fresh probe state for the stub: neither the shared grammar-import
+    # cache nor sys.modules may carry a verdict from another test.
+    monkeypatch.delitem(ts_cache._GRAMMAR_CACHE, stub_name, raising=False)
+    monkeypatch.delitem(sys.modules, stub_name, raising=False)
+
+    identity = rc_mod._extractor_identity()
+
+    assert stub_name not in identity.split(",")
+    # The real language grammars, when importable, still register —
+    # the probe rejects import failure, not the mechanism itself.
+    # (The base ``tree_sitter`` runtime is NOT a grammar and is
+    # deliberately absent from ``_GRAMMAR_MODULES``.)
+    try:
+        import tree_sitter_c  # noqa: F401
+    except ImportError:
+        pass
+    else:
+        assert "tree_sitter_c" in identity.split(",")
+
+
+def test_identity_degrades_on_non_importerror_grammar(
+    tmp_path, monkeypatch,
+):
+    # A findable module that raises a NON-ImportError at import time
+    # (a corrupted wheel — the class the import-probe exists for)
+    # must degrade to unavailable, matching extraction's per-file
+    # fail-soft, not crash every reachability consumer out of its
+    # documented degrade path.
+    stub_name = "tree_sitter_reachfp_syntax_stub"
+    (tmp_path / f"{stub_name}.py").write_text("def broken(:\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(rc_mod, "_EXTRACTOR_IDENTITY", None)
+    monkeypatch.setattr(
+        rc_mod, "_GRAMMAR_MODULES", (*rc_mod._GRAMMAR_MODULES, stub_name),
+    )
+    monkeypatch.delitem(ts_cache._GRAMMAR_CACHE, stub_name, raising=False)
+    monkeypatch.delitem(sys.modules, stub_name, raising=False)
+
+    identity = rc_mod._extractor_identity()
+    assert stub_name not in identity.split(",")
+
+    # The whole fingerprint path stays crash-free on this env shape.
+    assert rc_mod.compute_fingerprint(_inv()) is not None
+
+
+def test_header_magic_tracks_cache_version():
+    # The comment contract: the header magic's numeric suffix tracks
+    # _CACHE_VERSION. Convention-only until pinned here.
+    assert str(rc_mod._CACHE_VERSION).encode() in rc_mod._HEADER_MAGIC

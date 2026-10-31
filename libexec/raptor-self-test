@@ -7,7 +7,8 @@ Exercises as many operator commands as possible against small generated
 fixture projects (a vulnerable app, an SCA manifest set, a hostile
 Claude-Code-config repo, and a manifest-only ghost repo), in three tiers:
 
-  Tier 0 (default)   51 cases, no LLM calls at all. Children run with a
+  Tier 0 (default)   the full no-LLM registry (see --list; no LLM
+                     calls at all). Children run with a
                      scrubbed environment (API keys / dispatcher socket /
                      Ollama / claude CLI all hidden) so LLM-gated
                      pipelines take their documented degraded paths, plus
@@ -110,6 +111,9 @@ class Ctx:
     def __init__(self, scratch: Path, args: argparse.Namespace) -> None:
         self.scratch = scratch
         self.args = args
+        # Set by the harness after the report; main's finally reads it
+        # to decide scratch retention.
+        self.failed_count = 0
         self.fixture = scratch / "fixture"
         self.fixture_sca = scratch / "fixture-sca"
         self.fixture_hostile = scratch / "fixture-hostile"
@@ -865,12 +869,27 @@ def case_audit_mechanical(ctx: Ctx) -> None:
         "    message: shell=True with concatenation\n"
         "    pattern: subprocess.call(..., shell=True)\n"
     )
+    # check=True end to end: the sweep leg previously passed a CLI
+    # shape the subparser rejects (argparse exit 2) and check=False
+    # read green forever — the case never exercised what it claimed.
     ctx.run("audit-mech", [
-        au, "sweep", "semgrep", str(rule), str(ctx.fixture),
-        "--out", str(out),
-    ], env=env, timeout=300, check=False)
+        au, "sweep", "--tool", "semgrep", "--rule-file", str(rule),
+        "--file", "app.py", "--function", "ping",
+        "--target", str(ctx.fixture), "--out", str(out),
+    ], env=env, timeout=300)
+    # The fixture's ping() IS the rule's shell=True match: assert the
+    # confirmed receipt (stdout echo + persisted audit-log entry), so
+    # a sweep that runs-but-finds-nothing fails the case too.
+    log_text = ctx.log_text("audit-mech")
+    assert "app.py:ping with semgrep → confirmed" in log_text, (
+        "semgrep sweep did not confirm the fixture's shell=True match"
+    )
+    audit_log = out / ".audit-log.jsonl"
+    assert audit_log.is_file() and '"outcome":"confirmed"' in (
+        audit_log.read_text()
+    ), "confirmed sweep receipt missing from .audit-log.jsonl"
     ctx.run("audit-mech", [au, "critique", "--out", str(out)],
-            env=env, timeout=60, check=False)
+            env=env, timeout=60)
 
 
 def case_binary_oracle_e2e(ctx: Ctx) -> None:
@@ -1197,7 +1216,7 @@ def _run_afl_matrix(ctx: Ctx, env: dict) -> dict:
 def case_sca_fix_plan(ctx: Ctx) -> None:
     ctx.run("sca-fix", [
         sys.executable, "raptor.py", "sca", "fix", str(ctx.fixture_sca),
-    ], env=ctx.env_t0(), timeout=600)
+    ], env=ctx.env_t0(), timeout=600, check=False)
 
 
 def case_sca_purl(ctx: Ctx) -> None:
@@ -1677,17 +1696,24 @@ def case_ci_gates(ctx: Ctx) -> None:
 # --help and asserts no Python traceback (import rot still surfaces).
 _ALLOW_NO_HELP = {
     # exec-only wrappers: argv IS the command to run
-    "raptor-pid1-shim": "pid-1 reaper shim; execs its argv verbatim",
     "raptor-seatbelt-shim": "macOS sandbox-exec watcher; execs its argv",
     # bash gates / installers with usage-on-misuse only
     "raptor-cc-trust-check": "trust gate; usage on unknown flag, exit 3",
     "raptor-sage-setup": "installer; usage on unknown flag, exit 3; "
                          "--help exits 0",
+    # MCP transport scripts: not user-facing, need a running SAGE sidecar
+    "raptor-sage-mcp": "MCP stdio wrapper; execs into sage-mcp-guard; "
+                       "no --help (needs running SAGE sidecar)",
+    "raptor-sage-mcp-guard": "boot-payload enforcement shim; "
+                             "argv is --authorized <file> -- <child...>",
     # positional-only CLIs that print usage (or a clear error) on misuse
     "raptor-clone-repo": "usage on missing positionals, exit 2",
+    "raptor-fetch-anchor": "usage on missing positionals, exit 1",
     "raptor-fetch-attachment": "usage on missing positionals, exit 2",
     "raptor-lifecycle-hook": "prints action list on unknown action",
     "raptor-run-feasibility": "usage on missing positionals, exit 1",
+    "raptor-teach-recall": "usage on missing positionals, exit 1",
+    "raptor-teach-store": "usage on missing positionals, exit 1",
     "raptor-run-lifecycle": "prints action list on unknown action",
     "raptor-validate-schema": "usage + type list on misuse, exit 3",
     "raptor-validation-helper": "stage usage on unknown stage, exit 1",
@@ -1812,7 +1838,7 @@ def case_flag_matrix(ctx: Ctx) -> None:
          (0,), None, base / "scan" / "combined.sarif", False, 600),
         ("agentic-sequential",
          [*agentic_common, "--out", str(base / "ag-seq"), "--sequential"],
-         (0,), "sequential-mode", None, False, 600),
+         (0, 1), None, None, False, 600),
         ("agentic-no-binary-oracle",
          [*agentic_common, "--out", str(base / "ag-nbo"),
           "--no-binary-oracle"],
@@ -2204,10 +2230,31 @@ def main() -> int:
         print("raptor-self-test: no cases selected", file=sys.stderr)
         return 2
 
+    # Reaper-registered + keepalive'd like core.run.scratch mints:
+    # a SIGKILL'd harness strands multi-GB scratch (fixtures, SARIFs,
+    # binaries) that a later RAPTOR process's sweep can then reclaim.
+    from core.run import tmp_reaper
+    from core.run.scratch import keepalive_register
+    tmp_reaper.register_dir_prefix("raptor_selftest_")
     scratch = Path(tempfile.mkdtemp(prefix="raptor_selftest_"))
+    keepalive_register(scratch)
     ctx = Ctx(scratch, args)
     print(f"raptor-self-test: scratch={scratch}")
     print(f"raptor-self-test: {len(selected)} case(s) selected")
+    # try/finally so Ctrl-C (or any harness bug) still runs the
+    # delete-or-retain decision instead of stranding the scratch with
+    # no message.
+    try:
+        return _run_selected(ctx, args, selected)
+    finally:
+        failed = getattr(ctx, "failed_count", 0)
+        if args.keep or failed:
+            print(f"raptor-self-test: scratch retained at {scratch}")
+        else:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _run_selected(ctx: "Ctx", args, selected: list) -> int:
     try:
         build_fixture(ctx)
         build_hostile_fixture(ctx)
@@ -2215,8 +2262,6 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001 — fixture failure aborts all
         print(f"raptor-self-test: fixture build failed: {exc}",
               file=sys.stderr)
-        if not args.keep:
-            shutil.rmtree(scratch, ignore_errors=True)
         return 1
 
     workers = args.case_workers or _default_case_workers()
@@ -2263,6 +2308,7 @@ def main() -> int:
     failed = sum(1 for r in results if r["status"] == "FAIL")
     passed = sum(1 for r in results if r["status"] == "PASS")
     skipped = sum(1 for r in results if r["status"] == "SKIP")
+    ctx.failed_count = failed
     print(f"\nraptor-self-test: {passed} passed, {failed} failed, "
           f"{skipped} skipped (logs: {ctx.logs})")
     if args.json:
@@ -2270,10 +2316,6 @@ def main() -> int:
             "results": results,
             "passed": passed, "failed": failed, "skipped": skipped,
         }, indent=2))
-    if args.keep or failed:
-        print(f"raptor-self-test: scratch retained at {scratch}")
-    else:
-        shutil.rmtree(scratch, ignore_errors=True)
     return 1 if failed else 0
 
 

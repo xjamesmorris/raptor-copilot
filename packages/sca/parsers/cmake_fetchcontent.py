@@ -59,10 +59,19 @@ logger = logging.getLogger(__name__)
 # the entire arg block. Permissive whitespace handling — CMake is
 # free-form; the args are "<key> <value>" pairs (case-insensitive
 # keys, values may be unquoted).
+# (?=\S) pins the whitespace run after the name (same language —
+# the args class absorbed any remainder): the naive
+# ``\s+(?P<args>[^)]*)`` overlapped the run and the args body —
+# quadratic on a declare-opening block ending in a whitespace run.
+# The args body is bounded: an unbounded ``[^)]*`` re-scans every
+# planted ``FetchContent_Declare(`` opener inside an unclosed block
+# — quadratic on hostile CMake text. 4000 is far above any real
+# declare block (a URL + a hash + a handful of options); a longer
+# block stops matching and the declaration is simply skipped.
 _FETCHCONTENT_RE = re.compile(
     r"FetchContent_Declare\s*\(\s*"
-    r"(?P<name>[A-Za-z_][A-Za-z0-9_-]*)\s+"
-    r"(?P<args>[^)]*)"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_-]*)\s+(?=\S)"
+    r"(?P<args>[^)]{0,4000})"
     r"\)",
     re.IGNORECASE | re.DOTALL,
 )

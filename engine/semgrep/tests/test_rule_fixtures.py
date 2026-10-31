@@ -1,9 +1,19 @@
-"""Fixture gate for the in-repo semgrep rules added by the taint-rules wave.
+"""Fixture and validity gates for the in-repo semgrep rules.
 
-Every rule file under test ships a positive fixture (must fire) and a
-negative fixture (must stay silent), mirroring the engine/negative_controls
-discipline for synthesized rules. The real semgrep binary adjudicates —
-skipped when it is not installed.
+Two tiers:
+
+1. **Universe gates** — derived mechanically from ``rules/**/*.yaml``
+   (registry-cache excluded), never a hand-typed list: every rule
+   file must pass ``semgrep --validate`` and every rule must carry
+   CWE metadata for the coverage machinery.
+2. **Fixture pairs** (``_CASES``) — rule files with a positive
+   fixture (must fire) and a negative fixture (must stay silent),
+   mirroring the engine/negative_controls discipline. ``_CASES``
+   started as the taint-rules wave and is the burn-down frontier:
+   rule files outside it meet only the universe bar, so new fixture
+   pairs grow it toward the full universe.
+
+The real semgrep binary adjudicates — skipped when not installed.
 """
 
 from __future__ import annotations
@@ -17,6 +27,24 @@ import pytest
 
 _RULES_DIR = Path(__file__).resolve().parents[1] / "rules"
 _FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+
+def _rule_universe() -> list[Path]:
+    """Every in-repo rule file — registry-cache holds fetched packs,
+    not in-repo rules, and is excluded."""
+    files = sorted(
+        p
+        for pattern in ("*.yaml", "*.yml")
+        for p in _RULES_DIR.rglob(pattern)
+        if "registry-cache" not in p.parts
+    )
+    # Non-vacuity floor: a moved rules dir must not turn the universe
+    # gates into zero-case passes.
+    assert len(files) >= 40, (
+        f"only {len(files)} rule files derived — universe derivation "
+        f"looks broken"
+    )
+    return files
 
 # rule file → (positive fixtures that must fire, negative fixtures that
 # must not). Fixture names double as the language matrix.
@@ -32,6 +60,10 @@ _CASES = {
     "deserialisation/unsafe-python-jsonpickle.yaml": (
         ["deser_python_pos.py"],
         ["deser_python_neg.py"],
+    ),
+    "deserialisation/unsafe-deserialize.yaml": (
+        ["deser_noloader_pos.py", "deser_nodeserialize_pos.js"],
+        ["deser_noloader_neg.py", "deser_nodeserialize_neg.js"],
     ),
     "web/prototype-pollution-implementation.yaml": (
         ["protopoll_impl_pos.js"],
@@ -67,9 +99,14 @@ _CASES = {
         ["cmdi_exec_array_pos.java"],
         ["cmdi_exec_array_neg.java"],
     ),
+    "injection/regex-dos.yaml": (
+        ["redos_java_literal_pos.java", "redos_java_taint_pos.java"],
+        ["redos_java_literal_neg.java", "redos_java_taint_neg.java"],
+    ),
     "injection/sql-concat.yaml": (
         ["sqlconcat_pos.java", "sqlconcat_pos.py", "sqlconcat_pos.js",
-         "sqlconcat_pos.php"],
+         "sqlconcat_pos.php", "sqlconcat_ws_pos.java",
+         "sqlconcat_ws_pos.py"],
         ["sqlconcat_neg.java", "sqlconcat_neg.py"],
     ),
     "logging/logs-secrets.yaml": (
@@ -79,6 +116,46 @@ _CASES = {
     "go/go-security.yaml": (
         ["gotls_pos.go"],
         ["gotls_neg.go"],
+    ),
+    "php/crlf-injection.yaml": (
+        ["crlf_socket_pos.php"],
+        ["crlf_socket_neg.php"],
+    ),
+    "php/unsafe-reflection.yaml": (
+        ["unsafe_reflection_pos.php"],
+        ["unsafe_reflection_neg.php"],
+    ),
+    "php/argument-injection.yaml": (
+        ["arg_injection_pos.php"],
+        ["arg_injection_neg.php"],
+    ),
+    "php/attr-encoding.yaml": (
+        ["attr_encoding_pos.php"],
+        ["attr_encoding_neg.php"],
+    ),
+    "php/weak-prng-token.yaml": (
+        ["weak_prng_token_pos.php"],
+        ["weak_prng_token_neg.php"],
+    ),
+    "php/weak-password-hash.yaml": (
+        ["weak_password_hash_pos.php"],
+        ["weak_password_hash_neg.php"],
+    ),
+    "php/unserialize-taint.yaml": (
+        ["unserialize_taint_pos.php"],
+        ["unserialize_taint_neg.php"],
+    ),
+    "php/attr-xss.yaml": (
+        ["attr_xss_pos.php"],
+        ["attr_xss_neg.php"],
+    ),
+    "php/open-redirect.yaml": (
+        ["open_redirect_pos.php"],
+        ["open_redirect_neg.php"],
+    ),
+    "php/include-injection.yaml": (
+        ["include_injection_pos.php"],
+        ["include_injection_neg.php"],
     ),
 }
 
@@ -109,6 +186,39 @@ def _run_semgrep(rule_file: Path, targets: list[Path]) -> dict:
     return json.loads(proc.stdout)
 
 
+def test_cases_are_within_the_universe():
+    """Guards _CASES against silent staleness (renamed/moved files)."""
+    universe = {p.relative_to(_RULES_DIR).as_posix() for p in _rule_universe()}
+    stale = sorted(set(_CASES) - universe)
+    assert not stale, f"_CASES entries not in rules/: {stale}"
+
+
+def test_every_rule_file_validates(tmp_path: Path):
+    """Whole-universe --validate in one invocation: an unparseable or
+    schema-invalid rule file anywhere under rules/ fails here instead
+    of erroring out mid-scan. The universe is copied so a populated
+    registry-cache on an operator checkout cannot leak into the run.
+    """
+    universe = _rule_universe()
+    stage = tmp_path / "rules"
+    for rule_file in universe:
+        dest = stage / rule_file.relative_to(_RULES_DIR)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(rule_file.read_bytes())
+    proc = subprocess.run(
+        ["semgrep", "scan", "--validate", "--config", str(stage),
+         "--metrics", "off"],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert proc.returncode == 0, (
+        f"--validate failed over {len(universe)} rule files:\n"
+        f"{proc.stderr[-3000:]}"
+    )
+
+
 @pytest.mark.parametrize("rule_rel", sorted(_CASES))
 def test_rule_file_is_valid(rule_rel: str):
     rule_file = _RULES_DIR / rule_rel
@@ -129,10 +239,18 @@ def test_positive_fixtures_fire(rule_rel: str):
     positives, _ = _CASES[rule_rel]
     rule_file = _RULES_DIR / rule_rel
     for fixture in positives:
-        target = _FIXTURES / fixture
-        assert target.is_file(), target
-        results = _run_semgrep(rule_file, [target])["results"]
-        assert results, f"{rule_rel} produced no findings on {fixture}"
+        assert (_FIXTURES / fixture).is_file(), fixture
+    # ONE semgrep run over all of the rule's positive fixtures, then
+    # per-fixture attribution via each result's path: the contract is
+    # per-fixture (every one must fire), but a run per fixture re-paid
+    # semgrep's ~1.3s startup for each — the multi-second parametrized
+    # cases were pure spawn overhead, not scan time.
+    results = _run_semgrep(
+        rule_file, [_FIXTURES / f for f in positives],
+    )["results"]
+    fired = {Path(r["path"]).name for r in results}
+    silent = [f for f in positives if f not in fired]
+    assert not silent, f"{rule_rel} produced no findings on {silent}"
 
 
 @pytest.mark.parametrize("rule_rel", sorted(_CASES))
@@ -140,18 +258,200 @@ def test_negative_fixtures_stay_silent(rule_rel: str):
     _, negatives = _CASES[rule_rel]
     rule_file = _RULES_DIR / rule_rel
     for fixture in negatives:
-        target = _FIXTURES / fixture
-        assert target.is_file(), target
-        results = _run_semgrep(rule_file, [target])["results"]
-        hits = [(r["check_id"], r["start"]["line"]) for r in results]
-        assert not hits, f"{rule_rel} fired on clean fixture {fixture}: {hits}"
+        assert (_FIXTURES / fixture).is_file(), fixture
+    # ONE batched run (see test_positive_fixtures_fire); any hit
+    # anywhere is a failure, attributed by result path.
+    results = _run_semgrep(
+        rule_file, [_FIXTURES / f for f in negatives],
+    )["results"]
+    hits = [
+        (Path(r["path"]).name, r["check_id"], r["start"]["line"])
+        for r in results
+    ]
+    assert not hits, f"{rule_rel} fired on clean fixture(s): {hits}"
+
+
+def test_php_rules_silent_on_c_targets(tmp_path: Path):
+    """The php/ pack must neither fire nor load-error when a scan
+    hands it C sources — the audit dispatch is language-gated, but a
+    whole-tree /scan is not, so a C/C++ target sweeping rules/ must
+    see the PHP rules stay inert."""
+    c_file = tmp_path / "native.c"
+    c_file.write_text(
+        "#include <stdio.h>\n"
+        "int main(int argc, char **argv) {\n"
+        "    char buf[64];\n"
+        '    snprintf(buf, sizeof buf, "%s", argv[1]);\n'
+        '    printf("%s\\n", buf);\n'
+        "    return 0;\n"
+        "}\n"
+    )
+    php_rules = sorted((_RULES_DIR / "php").glob("*.yaml"))
+    assert php_rules, "php rule pack missing"
+    # ONE run with the whole pack as --config, not one per rule file:
+    # a per-rule run re-paid semgrep startup ~12 times (~18s of pure
+    # spawn overhead). The single run preserves both contract arms —
+    # a load-error anywhere in the pack fails _run_semgrep's
+    # returncode assert (schema validity is additionally pinned
+    # universe-wide by test_every_rule_file_validates), and any
+    # firing is attributed below via its check_id.
+    data = _run_semgrep(_RULES_DIR / "php", [c_file])
+    fired = sorted({r["check_id"] for r in data["results"]})
+    assert not fired, f"php rule(s) fired on C source: {fired}"
 
 
 def test_every_rule_has_cwe_metadata():
-    """New rules must carry CWE metadata for the coverage machinery."""
+    """Every rule in the universe must carry CWE metadata for the
+    coverage machinery — enforced over the derived universe, not just
+    the fixture-paired subset."""
     yaml = pytest.importorskip("yaml")
-    for rule_rel in _CASES:
-        doc = yaml.safe_load((_RULES_DIR / rule_rel).read_text())
-        for rule in doc["rules"]:
-            cwes = rule.get("metadata", {}).get("cwe", [])
-            assert cwes, f"{rule['id']} has no cwe metadata"
+    missing = []
+    for rule_file in _rule_universe():
+        doc = yaml.safe_load(rule_file.read_text())
+        rules = doc.get("rules") if isinstance(doc, dict) else None
+        if not rules:
+            missing.append(f"{rule_file}: no rules key")
+            continue
+        for rule in rules:
+            if not rule.get("metadata", {}).get("cwe"):
+                missing.append(f"{rule.get('id')} ({rule_file.name})")
+    assert not missing, "rules with no cwe metadata:\n  " + "\n  ".join(missing)
+
+
+# --- PHP web-family exact-line pins ------------------------------------------
+
+# rule file → (positive fixture, expected (line, rule-id suffix) set).
+# The fires-at-least-once positive gate would let a single sub-shape
+# (the interpolated header form, the assignment-hop include, the
+# unquoted-attribute shape) regress silently; exact (line, id) sets
+# keep every variant individually witnessed.
+_PHP_EXACT_LINES = {
+    "php/unserialize-taint.yaml": ("unserialize_taint_pos.php", {
+        (3, "request-data"), (8, "request-data"),
+        (12, "request-data"), (16, "request-data"),
+        (20, "request-data"), (23, "request-data"),
+        (26, "request-data"), (29, "request-data"),
+        (32, "request-data"),
+    }),
+    "php/attr-xss.yaml": ("attr_xss_pos.php", {
+        (4, "attr-context"), (8, "attr-context"),
+        (12, "attr-context"), (15, "attr-context"),
+        (18, "attr-context"), (22, "attr-context"),
+        (25, "attr-context"), (29, "attr-context"),
+        (32, "attr-context"),
+    }),
+    "php/open-redirect.yaml": ("open_redirect_pos.php", {
+        (4, "header-location"), (8, "header-location"),
+        (12, "header-location"), (15, "header-location"),
+        (19, "header-location"), (22, "header-location"),
+        (25, "header-location"), (28, "header-location"),
+        (31, "header-location"), (35, "header-location"),
+        (38, "header-location"), (41, "header-location"),
+    }),
+    "php/include-injection.yaml": ("include_injection_pos.php", {
+        (4, "request-path"), (7, "request-path"),
+        (11, "request-path"), (16, "request-path"),
+        (23, "request-path"),
+    }),
+}
+
+
+@pytest.mark.parametrize("rule_rel", sorted(_PHP_EXACT_LINES))
+def test_php_web_family_exact_lines(rule_rel: str):
+    fixture, expected = _PHP_EXACT_LINES[rule_rel]
+    results = _run_semgrep(
+        _RULES_DIR / rule_rel, [_FIXTURES / fixture],
+    )["results"]
+    fired = {
+        (r["start"]["line"], r["check_id"].rsplit(".", 1)[-1])
+        for r in results
+    }
+    assert fired == expected, (
+        f"{rule_rel} variant coverage drifted on {fixture}: "
+        f"fired {sorted(fired)}, expected {sorted(expected)}"
+    )
+
+
+def test_php_pack_holds_flat_on_adversarial_concat_chains(tmp_path: Path):
+    """Perf pin for the whole php pack against concatenation-chain
+    fodder: a 100+-term single-expression chain of attribute-opener
+    literals and superglobals. The unconstrained ``$LIT . $V`` sink
+    shape was superlinear here (minutes at 100 terms, timeout at 800
+    — and a per-file semgrep timeout strips the pack from exactly
+    the files these rules target); the literal-anchored shape holds
+    a flat per-rule constant. The bound is generous for slow CI
+    hosts while still catching a superlinear regression by orders of
+    magnitude; the chain is also a true positive series, so the
+    attr-xss rule must FIRE on it, keeping the pin non-vacuous."""
+    import time
+
+    seg = "\"<td style='\" . $_GET[\"x\"]"
+    chain = " . ".join([seg] * 120)
+    target = tmp_path / "chain.php"
+    target.write_text("<?php\nfunction f() {\n    echo " + chain + ";\n}\n")
+    started = time.monotonic()
+    results = _run_semgrep(_RULES_DIR / "php", [target])["results"]
+    elapsed = time.monotonic() - started
+    assert elapsed < 90, (
+        f"php pack took {elapsed:.1f}s on a 120-term concat chain — "
+        "superlinear sink shape regression"
+    )
+    assert any("attr-xss" in r["check_id"] for r in results)
+
+
+# --- case-insensitive algorithm names (JCA / OpenSSL lookup) ----------------
+
+# rule file → (fixture, expected firing lines). JCA getInstance and
+# OpenSSL digest lookups are case-insensitive per spec, so every
+# case-variant line is a fully working weak-crypto use; exact line
+# sets keep each variant individually witnessed (a fires-at-least-once
+# assertion would let single variants regress silently).
+_CASE_FOLD_CASES = {
+    "crypto/weak-hash.yaml": ("weakcrypto_case_pos.java", [6, 7, 8, 9]),
+    "crypto/weak-symmetric-cipher.yaml": (
+        "weakcrypto_case_pos.java", [12, 13, 14, 15],
+    ),
+    "crypto/pkcs1v15-padding.yaml": (
+        "weakcrypto_case_pos.java", [18, 19],
+    ),
+    "crypto/weak-hash-extended.yaml": ("weakhash_case_pos.rb", [4, 5, 6]),
+}
+
+
+@pytest.mark.parametrize("rule_rel", sorted(_CASE_FOLD_CASES))
+def test_weak_crypto_matches_case_insensitively(rule_rel: str):
+    fixture, expected_lines = _CASE_FOLD_CASES[rule_rel]
+    rule_file = _RULES_DIR / rule_rel
+    target = _FIXTURES / fixture
+    results = _run_semgrep(rule_file, [target])["results"]
+    lines = sorted({r["start"]["line"] for r in results})
+    assert lines == expected_lines, (
+        f"{rule_rel} case-fold coverage drifted on {fixture}: "
+        f"fired {lines}, expected {expected_lines}"
+    )
+
+
+@pytest.mark.parametrize(
+    "rule_rel",
+    ["crypto/weak-hash.yaml", "crypto/weak-symmetric-cipher.yaml",
+     "crypto/pkcs1v15-padding.yaml"],
+)
+def test_weak_crypto_case_negatives_stay_silent(rule_rel: str):
+    rule_file = _RULES_DIR / rule_rel
+    target = _FIXTURES / "weakcrypto_case_neg.java"
+    results = _run_semgrep(rule_file, [target])["results"]
+    hits = [(r["check_id"], r["start"]["line"]) for r in results]
+    assert not hits, f"{rule_rel} fired on clean fixture: {hits}"
+
+
+def test_prototype_pollution_impl_exact_lines():
+    """Exact-line pin for the deep-set + unguarded-merge rules: the
+    Object.keys-iterating merge is individually witnessed (Object.keys
+    is NOT a guard — JSON.parse yields an own __proto__ key that it
+    enumerates), and the fires-at-least-once positive gate alone would
+    let it regress silently."""
+    rule_file = _RULES_DIR / "web/prototype-pollution-implementation.yaml"
+    results = _run_semgrep(
+        rule_file, [_FIXTURES / "protopoll_impl_pos.js"],
+    )["results"]
+    assert sorted({r["start"]["line"] for r in results}) == [1, 16, 23]

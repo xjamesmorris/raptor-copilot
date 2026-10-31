@@ -44,6 +44,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from core.sandbox import SANDBOX_ENGAGE_EXIT_CODE, SandboxSetupError
+from core.security.log_sanitisation import sanitise_for_terminal as _sft
+from core.logging import configure_cli_logging
 
 from .pipeline import run_sca
 from typing import TYPE_CHECKING
@@ -177,9 +179,11 @@ def _positional_to_target_flag(argv: list[str]) -> list[str]:
     has_findings = "--findings" in argv
     # Every update.py flag that consumes a value — a value missing here
     # gets mistaken for the positional target (``--format pr-comment``
-    # would become ``--target pr-comment``).
-    _VALUE_FLAGS = {"--findings", "--out", "--fix", "--target",
-                    "--cache-root", "--format", "--validate-against"}
+    # would become ``--target pr-comment``) or silently swallowed.
+    # Derived from update.py's own parser: the hand-typed copy this
+    # replaces had already drifted (no ``--exclude``).
+    from .update import value_flags
+    _VALUE_FLAGS = value_flags()
     out: list[str] = []
     expect_value = False
     for arg in argv:
@@ -208,14 +212,9 @@ def _run_analyse(argv: list[str]) -> int:
     args = _parse_analyse_args(argv)
     _configure_logging(args.verbose)
 
-    # --no-llm umbrella: disable every LLM stage in one switch.
-    if getattr(args, "no_llm", False):
-        args.skip_review = True
-        args.skip_triage = True
-        args.review_maintainers = False
-        args.review_slopsquats = False
-        args.llm_inline_installs = False
-        args.impact_analysis = False
+    # --no-llm umbrella handled by apply_no_llm_umbrella() below —
+    # the single owner of the per-stage switch mapping (a second inline
+    # copy here drifted silently whenever a stage was added).
 
     target = Path(args.target).resolve()
     if not target.exists():
@@ -287,12 +286,22 @@ def _run_analyse(argv: list[str]) -> int:
     )
     cfg = cfg_from_args(args)
     if cfg.is_active:
-        import json as _json
+        from core.json import load_json as _load_json
+
+        # Self-produced budget, NOT the steered-path one: this reads
+        # the findings.json the in-process run_sca above just wrote.
+        # --out names the DIRECTORY, but the read is only reachable
+        # after run_sca succeeded, so the file's CONTENT is this
+        # run's own output — the same provenance class as run_sca's
+        # SARIF re-read (rationale on both budgets in kinds.py). At
+        # the 64 MiB steered budget, a completed big-target
+        # --fail-on-* scan exited 3 here ("cannot read findings for
+        # threshold check").
+        from .kinds import MAX_SELF_FINDINGS_BYTES as _MAX_SELF_FINDINGS
         try:
-            rows = _json.loads(
-                (output_dir / "findings.json").read_text(encoding="utf-8")
-            )
-        except (OSError, _json.JSONDecodeError, UnicodeDecodeError) as e:
+            rows = _load_json(output_dir / "findings.json", strict=True,
+                              max_bytes=_MAX_SELF_FINDINGS)
+        except (OSError, ValueError) as e:
             logger.error("raptor-sca: cannot read findings for "
                          "threshold check: %s", e)
             return 3
@@ -325,7 +334,6 @@ def _emit_baseline_delta(
     comment --body-file``. ``pr_comment_label`` overrides the header
     label (default: ``raptor-sca``).
     """
-    import json as _json
 
     from core.json import save_json
 
@@ -342,10 +350,21 @@ def _emit_baseline_delta(
         return
 
     try:
-        baseline_rows = _json.loads(
-            baseline_path.read_text(encoding="utf-8"))
-        current_rows = _json.loads(
-            current_findings.read_text(encoding="utf-8"))
+        from core.json import load_json as _load_json
+
+        from .kinds import MAX_FINDINGS_BYTES as _MAX_FINDINGS
+        from .kinds import MAX_SELF_FINDINGS_BYTES as _MAX_SELF_FINDINGS
+        # Steered budget: --baseline points wherever the operator says.
+        baseline_rows = _load_json(baseline_path, strict=True,
+                                   max_bytes=_MAX_FINDINGS)
+        # Self-produced budget: current_findings is the findings.json
+        # the in-process run_sca just wrote (the only caller passes
+        # output_dir/"findings.json" straight after the run), so its
+        # size is this run's own legitimate output (kinds.py). At the
+        # steered budget, big-target --baseline runs silently lost
+        # baseline-delta.json / pr-comment.md here.
+        current_rows = _load_json(current_findings, strict=True,
+                                  max_bytes=_MAX_SELF_FINDINGS)
     except (ValueError, OSError) as exc:
         logger.warning("raptor-sca: cannot read baseline/findings: %s", exc)
         return
@@ -405,9 +424,13 @@ def _configure_logging(
         level = logging.INFO
     else:
         level = logging.DEBUG
-    logging.basicConfig(
-        level=min(level, logging.DEBUG) if log_dir else level,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    # configure_cli_logging (not bare basicConfig): the escaping
+    # console formatter is the chokepoint that keeps logger-relayed
+    # foreign text (resolver stderr, SBOM import errors quoting
+    # scanned-repo content) control-byte-free on the operator TTY.
+    configure_cli_logging(
+        min(level, logging.DEBUG) if log_dir else level,
+        fmt="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     if log_dir:
         root = logging.getLogger()
@@ -516,10 +539,11 @@ def _format_transitive_line(result) -> str | None:
     # Collapse whitespace so the summary stays one line. Truncate
     # only at very long lengths — earlier 90-char cap silently hid
     # critical context (e.g., the full path the resolver couldn't
-    # find a manifest in).
-    collapsed = " ".join(top_reason.split())
-    if len(collapsed) > 200:
-        collapsed = collapsed[:197] + "..."
+    # find a manifest in). The reason text quotes resolver stderr,
+    # which echoes hostile-manifest bytes — escape control characters
+    # before the summary reaches the operator terminal (str.split
+    # collapses whitespace but passes ESC/C1 through).
+    collapsed = _sft(" ".join(top_reason.split()), max_len=200)
     return (f"raptor-sca: transitive        skipped — {collapsed} "
             f"({eco_list})")
 

@@ -272,6 +272,45 @@ class TestIncompleteCleanup:
         assert result is not None
         assert result.verified is False
 
+    def test_set_difference_alone_does_not_confirm(self):
+        # Teardown reads flag/count fields it correctly never frees;
+        # without the hypothesis-named field that set-difference must
+        # stay inconclusive, not promote the finding as verified.
+        server = MockJoernServer()
+        server.add_response(
+            ".ast.isFieldIdentifier.map",
+            'List((pending, 5), (flags, 10), (refcount, 12))',
+        )
+        server.add_response(
+            ".argument.isFieldIdentifier",
+            'List((pending, 30), (refcount, 35))',
+        )
+        result = _verify_incomplete_cleanup(
+            "dev_teardown",
+            "resource leak in the teardown path",
+            server,
+        )
+        assert result is None
+
+    def test_hypothesis_named_field_still_confirms(self):
+        server = MockJoernServer()
+        server.add_response(
+            ".ast.isFieldIdentifier.map",
+            'List((pending, 5), (io, 10), (refcount, 12))',
+        )
+        server.add_response(
+            ".argument.isFieldIdentifier",
+            'List((pending, 30), (refcount, 35))',
+        )
+        result = _verify_incomplete_cleanup(
+            "dev_teardown",
+            "fails to clean up requests on the `io` list",
+            server,
+        )
+        assert result is not None
+        assert result.verified is True
+        assert result.details["hypothesis_field"] == "io"
+
 
 # ── Dispatcher tests ─────────────────────────────────────────────────
 
@@ -471,3 +510,132 @@ class TestCallerConstraintQueryShape:
         assert result is not None and result.verified is False
         assert "presence" in result.evidence
         assert "hold" not in result.evidence
+
+
+class TestAllocSinkNamePattern:
+    """The alloc-sink alternation is matched against Joern call NAMES
+    (``.ast.isCall.name(...)``), which never contain "(" — the old
+    paren-suffixed Go arms (``make\\(`` etc.) were unmatchable and the
+    verifier silently never covered Go allocation-overflow shapes."""
+
+    def test_go_builtin_names_matchable(self):
+        import ast
+        import re
+        from pathlib import Path
+
+        from core.audit import cross_function_verify as cfv
+
+        tree = ast.parse(Path(cfv.__file__).read_text())
+        pattern = None
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Assign)
+                and any(
+                    isinstance(t, ast.Name) and t.id == "alloc_sinks"
+                    for t in node.targets
+                )
+                and isinstance(node.value, ast.Constant)
+            ):
+                pattern = node.value.value
+        assert pattern, "alloc_sinks literal not found"
+        # The Scala string sees one unescape level: "\\(" -> \( .
+        rx = re.compile(pattern.replace("\\\\", "\\"))
+        for name in ("make", "append", "len", "kmalloc", "memcpy"):
+            assert rx.fullmatch(name), name
+        # Call names never carry parens — a paren-suffixed arm can
+        # match nothing.
+        assert "\\(" not in pattern
+
+
+class TestCounterDrivenDispatch:
+    """When the hypothesis doesn't match a verifier but the counter does,
+    the counter-side dispatch kicks in."""
+
+    def test_counter_triggers_caller_constraint(self):
+        """Counter with 'callers guarantee' dispatches caller_constraint
+        even when the hypothesis is about a buffer over-read."""
+        server = MockJoernServer()
+        server.add_response(".caller", 'List((process_auth, auth.c, 10))')
+        # No strlen/strnlen calls in the caller → unguarded.
+        server.add_response("nonEmpty", "List()")
+        result = cross_function_verify(
+            function_name="validate_token_format",
+            file_path="auth_handler.c",
+            hypothesis=(
+                "A buffer over-read occurs if the input token is not "
+                "null-terminated, as the validating loop lacks a "
+                "bounds check."
+            ),
+            server=server,
+            counter=(
+                "All callers could be guaranteeing that the token "
+                "is null-terminated before passing it to this function."
+            ),
+        )
+        assert result is not None
+        assert result.verified is True
+        assert result.verifier_name == "caller_constraint"
+        assert "input validation" in result.evidence
+
+    def test_counter_with_null_terminated_keyword(self):
+        server = MockJoernServer()
+        server.add_response(".caller", 'List((main, main.c, 5))')
+        server.add_response("nonEmpty", "List()")
+        result = cross_function_verify(
+            function_name="parse_input",
+            file_path="input.c",
+            hypothesis="buffer over-read in parse_input",
+            server=server,
+            counter="the caller ensures the buffer is null-terminated",
+        )
+        assert result is not None
+        assert result.verified is True
+        assert result.verifier_name == "caller_constraint"
+
+    def test_no_dispatch_without_counter(self):
+        """Hypothesis alone doesn't match any verifier → None."""
+        server = MockJoernServer()
+        result = cross_function_verify(
+            function_name="validate_token_format",
+            file_path="auth_handler.c",
+            hypothesis=(
+                "A buffer over-read occurs if the input token is not "
+                "null-terminated."
+            ),
+            server=server,
+        )
+        assert result is None
+
+    def test_validation_fallback_uses_strlen_not_locks(self):
+        """When counter is set, the fallback query checks for
+        length/bounds functions, not lock/mutex patterns."""
+        server = _RecordingJoernServer()
+        server.add_response(".caller", 'List((caller_a, file.c, 10))')
+        server.add_response("nonEmpty", "List()")
+        _verify_caller_constraint(
+            "parse_token",
+            "buffer over-read in parse_token",
+            server,
+            counter="callers guarantee null-termination",
+        )
+        guard_queries = [
+            q for q in server.queries if "nonEmpty" in q
+        ]
+        assert guard_queries, "expected a guard query"
+        assert "strlen" in guard_queries[0]
+        assert "lock" not in guard_queries[0]
+
+    def test_callers_with_strlen_are_guarded(self):
+        """When the caller has a strlen call, the verifier treats it
+        as guarded — returns False (swallowed by confirmation-only)."""
+        server = MockJoernServer()
+        server.add_response(".caller", 'List((safe_caller, file.c, 10))')
+        server.add_response("strlen", 'List(true)')
+        result = _verify_caller_constraint(
+            "parse_input",
+            "buffer over-read",
+            server,
+            counter="callers validate the length",
+        )
+        assert result is not None
+        assert result.verified is False

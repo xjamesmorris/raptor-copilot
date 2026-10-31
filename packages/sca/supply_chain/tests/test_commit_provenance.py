@@ -434,3 +434,47 @@ def test_normal_commits_still_parse_alongside_form_feed_subject(
         assert row["paths_touched"] == ["package.json"]
         assert len(row["sha"]) == 40
         assert row["author_email"] == "test@example.com"
+
+
+def test_bad_or_lapsed_signature_does_not_evade_the_conjunction(
+    tmp_path: Path,
+) -> None:
+    """A forged bot commit carrying a BAD / expired / revoked
+    signature is not validly signed — attaching garbage signature
+    bytes must not short-circuit past the detector (that would be a
+    trivially cheap evasion of the identity-forgery check)."""
+    host = commit_provenance._placeholder_dep(tmp_path)
+    for sig in ("B", "X", "Y", "R"):
+        finding = commit_provenance._classify(
+            _row(sig, "attacker@evil.example"), host, 90,
+        )
+        assert finding is not None, f"status {sig} must stay eligible"
+        assert finding.severity == "high"
+        assert finding.claim_shape == "impersonation"
+
+
+def test_only_valid_signatures_prove_identity(tmp_path: Path) -> None:
+    """G (good) and U (good, untrusted key) are the only statuses
+    that prove the committer held the key — everything else stays
+    conjunction-eligible."""
+    assert (
+        commit_provenance._VALID_SIGNATURE_STATUSES
+        == frozenset({"G", "U"})
+    )
+
+
+def test_unknown_signature_status_fails_toward_unsigned(
+    tmp_path: Path,
+) -> None:
+    """A ``%G?`` status this code doesn't recognize (a future git
+    addition, or anything unexpected on the parse) must fall on the
+    NOT-validly-signed side — fail-closed, never silently exempting
+    the commit from the forgery conjunction."""
+    host = commit_provenance._placeholder_dep(tmp_path)
+    for sig in ("Z", "?", ""):
+        finding = commit_provenance._classify(
+            _row(sig, "attacker@evil.example"), host, 90,
+        )
+        assert finding is not None, (
+            f"unknown status {sig!r} must stay eligible"
+        )

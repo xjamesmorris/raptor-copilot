@@ -44,6 +44,42 @@ def test_prepare_seed_corpus_groups_supported_inputs_and_writes_manifest(tmp_pat
     assert manifest["seeds"][0]["sha256"]
 
 
+def test_prepare_seed_corpus_planted_kind_dir_symlink_not_traversed(
+    tmp_path, monkeypatch,
+):
+    """Belt-and-braces containment for the reset→write window: a kind
+    directory symlink that survives into the write phase must never
+    carry the mkdir + seed write outside out_dir (the exclusive
+    create hardens only the final component; mkdir(parents=True)
+    follows intermediate symlinks). The reset normally clears planted
+    kind entries — stub it out to model a plant landing after it."""
+    import packages.fuzzing.seed_corpus as sc
+
+    attacker_dir = tmp_path / "attacker_dir"
+    attacker_dir.mkdir()
+    (attacker_dir / "keep").write_text("operator content\n")
+
+    source = tmp_path / "project"
+    (source / "examples").mkdir(parents=True)
+    (source / "examples" / "case.json").write_text("{}\n", encoding="utf-8")
+
+    out = tmp_path / "seeds"
+    out.mkdir()
+    (out / "json").symlink_to(attacker_dir)
+    monkeypatch.setattr(sc, "_reset_generated_output", lambda _out: None)
+
+    manifest = prepare_seed_corpus(
+        SeedCorpusOptions(source_dir=source, out_dir=out))
+
+    assert manifest["seed_count"] == 0
+    assert any(
+        "outside the output directory" in s["reason"]
+        for s in manifest["skipped"]
+    )
+    assert (attacker_dir / "keep").read_text() == "operator content\n"
+    assert not (attacker_dir / "seed-0001.json").exists()
+
+
 def test_prepare_seed_corpus_skips_sensitive_and_uninteresting_files(tmp_path):
     source = tmp_path / "project"
     out = tmp_path / "seeds"
@@ -312,3 +348,134 @@ def test_prepare_builtin_seed_corpus_refuses_dangerous_outputs(tmp_path, monkeyp
 
     with pytest.raises(ValueError, match="too broad or dangerous"):
         prepare_builtin_seed_corpus(Path(fake_home.anchor))
+
+
+class TestBuiltinResetProvenance:
+    """Deletion in the builtin-reset path must be provenance-gated —
+    the generated sibling documents that contract for both helpers.
+    Name-colliding operator data on FIRST contact (no generator-owned
+    manifest) must be refused, never deleted; a directory is never
+    rmtree'd regardless of manifest state."""
+
+    def test_first_run_refuses_to_delete_colliding_operator_file(
+        self, tmp_path,
+    ):
+        out = tmp_path / "builtin"
+        out.mkdir()
+        collide = out / "seed-0001-text-small"
+        collide.write_text("OPERATOR-CONTENT\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="refusing"):
+            prepare_builtin_seed_corpus(out)
+        assert collide.read_text(encoding="utf-8") == "OPERATOR-CONTENT\n"
+
+    def test_colliding_directory_never_rmtreed(self, tmp_path):
+        out = tmp_path / "builtin"
+        out.mkdir()
+        nested = out / "seed-0001-text-small"
+        nested.mkdir()
+        (nested / "precious.txt").write_text("keep\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="refusing"):
+            prepare_builtin_seed_corpus(out)
+        assert (nested / "precious.txt").read_text(
+            encoding="utf-8") == "keep\n"
+
+    def test_colliding_directory_refused_even_with_our_manifest(
+        self, tmp_path,
+    ):
+        out = tmp_path / "builtin"
+        prepare_builtin_seed_corpus(out)
+        victim = out / "seed-0001-text-small"
+        victim.unlink()
+        victim.mkdir()
+        (victim / "precious.txt").write_text("keep\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="refusing"):
+            prepare_builtin_seed_corpus(out)
+        assert (victim / "precious.txt").read_text(
+            encoding="utf-8") == "keep\n"
+
+    def test_foreign_manifest_refused(self, tmp_path):
+        import json
+
+        out = tmp_path / "builtin"
+        out.mkdir()
+        (out / "manifest.json").write_text(
+            json.dumps({"source": "someone-elses-tool"}),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="refusing"):
+            prepare_builtin_seed_corpus(out)
+        assert (out / "manifest.json").is_file(), (
+            "a foreign manifest must not be unlinked"
+        )
+
+    def test_list_shaped_manifest_degrades_without_attributeerror(
+        self, tmp_path,
+    ):
+        out = tmp_path / "builtin"
+        out.mkdir()
+        (out / "manifest.json").write_text('["junk"]', encoding="utf-8")
+        # No collisions on disk: a corrupt manifest is treated as
+        # foreign, and with nothing to delete the run may proceed —
+        # but never raise AttributeError.
+        with pytest.raises(ValueError, match="refusing"):
+            prepare_builtin_seed_corpus(out)
+
+
+def test_generated_seed_copy_is_bounded_against_growth(tmp_path, monkeypatch):
+    """The stat pre-check leaves a grow window before the copy — the
+    copy itself must be a bounded read so a file growing under the
+    scan can never land oversize in the corpus."""
+    import os
+
+    source = tmp_path / "repo"
+    source.mkdir()
+    grower = source / "data.json"
+    grower.write_text("{}" + "x" * 4094, encoding="utf-8")  # 4096 bytes
+    out = tmp_path / "out"
+
+    real_stat = type(grower).stat
+
+    def lying_stat(self, **kw):
+        st = real_stat(self, **kw)
+        if self.name == "data.json" and st.st_size == 4096:
+            vals = list(st)
+            vals[6] = 100  # the pre-growth size the stat check saw
+            return os.stat_result(vals)
+        return st
+
+    monkeypatch.setattr(type(grower), "stat", lying_stat)
+    manifest = prepare_seed_corpus(SeedCorpusOptions(
+        source_dir=source, out_dir=out, max_file_size=1024,
+    ))
+    copied = [s for s in manifest["seeds"] if s["source"] == "data.json"]
+    assert copied == [], "grown file must not be copied past the cap"
+    assert any(
+        sk["path"] == "data.json" and sk["reason"] == "too large"
+        for sk in manifest["skipped"]
+    )
+
+
+def test_prepare_builtin_refuses_symlinked_out_dir(tmp_path):
+    # The out dir sits at a predictable name inside a reused run dir
+    # the previous campaign's sandboxed target could write; resolve()
+    # would follow the plant and every seed + the manifest os.replace
+    # would land in the attacker's directory.
+    attacker = tmp_path / "attacker"
+    attacker.mkdir()
+    out = tmp_path / "seeds"
+    out.symlink_to(attacker)
+    with pytest.raises(ValueError,
+                       match="refusing built-in seed corpus output"):
+        prepare_builtin_seed_corpus(out)
+    assert list(attacker.iterdir()) == []
+    # The plant is left in place for forensics, never followed.
+    assert out.is_symlink()
+
+
+def test_prepare_builtin_refuses_file_planted_at_out_dir(tmp_path):
+    out = tmp_path / "seeds"
+    out.write_text("plant")
+    with pytest.raises(ValueError,
+                       match="refusing built-in seed corpus output"):
+        prepare_builtin_seed_corpus(out)
+    assert out.read_text() == "plant"

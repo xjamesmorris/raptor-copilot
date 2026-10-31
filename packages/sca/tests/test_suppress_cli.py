@@ -282,3 +282,102 @@ def test_main_cli_routes_suppress_to_subcommand(
     assert rc == 0
     out = capsys.readouterr().out
     assert "GHSA-via-main" in out
+
+
+# ---------------------------------------------------------------------------
+# Terminal safety — entries come from the SCANNED target's YAML
+# ---------------------------------------------------------------------------
+
+def test_list_escapes_hostile_entry_bytes(tmp_path: Path, capsys) -> None:
+    """Reasons/ids from the target's suppress file must not reach the
+    operator terminal as live control bytes."""
+    _write_yaml(tmp_path / ".raptor-sca-suppress.yml", [
+        {"advisory_id": "GHSA-\x1b[2Jx", "reason": "ok \x9bhidden"},
+    ])
+    rc = suppress_cli.main(["list", "--target", str(tmp_path)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "\x1b" not in out
+    assert "\x9b" not in out
+    assert "GHSA-" in out and "hidden" in out
+
+
+def test_list_json_lane_escapes_c1_controls(tmp_path: Path, capsys) -> None:
+    """The --json lane must stay valid JSON while never carrying live
+    C1 controls (ensure_ascii escapes them; the previous
+    dumps_display spelling passed them raw)."""
+    _write_yaml(tmp_path / ".raptor-sca-suppress.yml", [
+        {"advisory_id": "GHSA-j", "reason": "r \x9bhidden \x1b[31m"},
+    ])
+    rc = suppress_cli.main(["list", "--target", str(tmp_path), "--json"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "\x9b" not in out
+    assert "\x1b" not in out
+    parsed = json.loads(out)
+    assert parsed[0]["reason"].startswith("r ")
+
+
+def test_check_orphan_lines_escape_hostile_bytes(
+    tmp_path: Path, capsys,
+) -> None:
+    """Orphan/expired report lines print entry fields — same escaping
+    requirement as list."""
+    _write_yaml(tmp_path / ".raptor-sca-suppress.yml", [
+        {"advisory_id": "GHSA-orphan\x1b[1A", "reason": "why\x0c"},
+    ])
+    findings = tmp_path / "findings.json"
+    findings.write_text("[]", encoding="utf-8")
+    rc = suppress_cli.main(["check", "--target", str(tmp_path),
+                              "--findings", str(findings)])
+    assert rc == 1  # orphan present → actionable
+    out = capsys.readouterr().out
+    assert "\x1b" not in out
+    assert "\x0c" not in out
+    assert "GHSA-orphan" in out
+
+
+def test_check_tolerates_stray_non_dict_rows(tmp_path: Path, capsys) -> None:
+    """Hand-edited findings.json may contain stray non-dict elements
+    and wrong-typed fields — the sibling thresholds gate soft-skips
+    exactly these shapes (FindingRow.from_row); check must not turn a
+    policy signal into an AttributeError traceback."""
+    _write_yaml(tmp_path / ".raptor-sca-suppress.yml", [
+        {"advisory_id": "GHSA-active", "reason": "still relevant"},
+    ])
+    findings = tmp_path / "findings.json"
+    findings.write_text(
+        json.dumps([
+            "stray-string",
+            42,
+            None,
+            _vuln_row(advisory_id="GHSA-active"),
+        ]),
+        encoding="utf-8",
+    )
+    rc = suppress_cli.main(["check",
+                              "--target", str(tmp_path),
+                              "--findings", str(findings)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "1 active" in out
+    assert "0 orphan" in out
+
+
+def test_check_tolerates_non_dict_sca_field(tmp_path: Path, capsys) -> None:
+    """A truthy non-dict ``sca`` value must read as no-sca-block, not
+    crash SuppressionEntry.matches one line after the row.get."""
+    _write_yaml(tmp_path / ".raptor-sca-suppress.yml", [
+        {"advisory_id": "GHSA-active", "reason": "still relevant"},
+    ])
+    row = _vuln_row(advisory_id="GHSA-active")
+    junk = dict(row)
+    junk["sca"] = "not-a-dict"
+    findings = tmp_path / "findings.json"
+    findings.write_text(json.dumps([junk, row]), encoding="utf-8")
+    rc = suppress_cli.main(["check",
+                              "--target", str(tmp_path),
+                              "--findings", str(findings)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "1 active" in out

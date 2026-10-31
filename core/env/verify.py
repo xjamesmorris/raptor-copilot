@@ -387,6 +387,19 @@ def check_http(
             "reason": f"connection error: {exc}",
             "details": {"url": url, "error": str(exc)[:400]},
         }
+    except (ValueError, TypeError) as exc:
+        # http.client validates header names/values (and the request
+        # line) at send time: a plan step carrying "a\r\nInj: b" in a
+        # header raises ValueError from putheader. Plans are untrusted
+        # (LLM-authored / on-disk replay), so a malformed step is a
+        # failed CHECK — provision's failures-are-data contract — not
+        # an exception escaping verify_plan.
+        return {
+            "type": "http_check",
+            "passed": False,
+            "reason": f"invalid request shape: {exc}",
+            "details": {"url": url, "error": str(exc)[:400]},
+        }
 
     response_size_bytes = len(content)
     details: dict[str, Any] = {
@@ -474,16 +487,28 @@ def check_logs(
     # own quantifier (incl. bounded {m,n} — "(a|a)+" and "(a{1,9}){1,9}"
     # both blow up). Unquantified groups like "(ERROR|FATAL)" stay
     # regex, so the guard does not degrade ordinary log asserts.
+    # Group spans bounded at 500 = the length gate below: identical
+    # verdicts on every input the scan can see (the third
+    # alternative's first span additionally stops at the first
+    # marker — the first-marker split is the only one that matters,
+    # so the language is unchanged and the backtracking fan-out is
+    # gone), and the scan itself
+    # stays linear if it is ever reused on longer text (an unbounded
+    # [^)]* re-scans a hostile pattern from every "(" — quadratic).
     _dangerous_re = re.compile(
         r"[+*]{2,}"
-        r"|\(\?[^)]*\+"
-        r"|\([^)]*[|+*{][^)]*\)\s*[+*{]"
-        r"|\([^)]*\)[+*{][^)]*\)\s*[+*{]"
+        r"|\(\?[^)]{0,500}\+"
+        r"|\([^)|+*{]{0,500}[|+*{][^)]{0,500}\)\s*[+*{]"
+        r"|\([^)]{0,500}\)[+*{][^)]{0,500}\)\s*[+*{]"
     )
     missing: list[str] = []
     for pattern in expected_patterns:
         try:
-            if _dangerous_re.search(pattern) or len(pattern) > 500:
+            # Length gate FIRST: the shape scan then only ever runs
+            # on <=500-char inputs, so its own cost is bounded by
+            # construction (same boolean either way — both operands
+            # are pure).
+            if len(pattern) > 500 or _dangerous_re.search(pattern):
                 # Literal fallback for risky or excessively long patterns.
                 matched = pattern in combined
             else:
@@ -678,6 +703,17 @@ def check_http_request(
             "type": "http_request_check",
             "passed": False,
             "reason": f"connection error: {exc}",
+            "details": {"url": url, "error": str(exc)[:400]},
+        }
+    except (ValueError, TypeError) as exc:
+        # Same failures-are-data fold as check_http: hostile plan
+        # headers (CRLF in a value, an illegal name, a non-string
+        # type) raise ValueError/TypeError from http.client's send
+        # validation and must degrade to a failed check.
+        return {
+            "type": "http_request_check",
+            "passed": False,
+            "reason": f"invalid request shape: {exc}",
             "details": {"url": url, "error": str(exc)[:400]},
         }
 
@@ -1326,7 +1362,7 @@ def inject_version_assertion(
     if (
         command_pattern is None
         or not version_literal
-        or not re.search(r"\d+\.\d+", version_literal)
+        or not re.search(r"(?<!\d)\d+\.\d+", version_literal)
     ):
         return plan, injected
     new_plan: list[dict[str, Any]] = []
@@ -1340,7 +1376,11 @@ def inject_version_assertion(
             continue
         existing = step.get("expected_stdout_contains")
         already_has_version = (
-            isinstance(existing, str) and re.search(r"\d+\.\d+", existing) is not None
+            isinstance(existing, str)
+            # (?<!\d) pins the scan to digit-run starts (identical
+            # first match; unpinned, a hostile digit run is re-read
+            # from every offset — quadratic).
+            and re.search(r"(?<!\d)\d+\.\d+", existing) is not None
         )
         if already_has_version:
             new_plan.append(step)
@@ -1487,6 +1527,17 @@ def _run_executor(
         }
 
 
+# Plan-length ceiling. Trade-off, both directions: real generated
+# plans run well under 20 steps, and each step may legally wait up to
+# 300 s (stability_wait ceiling), so 64 already admits ~5.3 hours of
+# worst-case serial waiting; higher re-opens the wall-clock sink an
+# untrusted (LLM-authored / on-disk) plan can aim at the trusted
+# parent, lower starts rejecting legitimately thorough multi-service
+# plans. Raise deliberately if a real plan ever hits it — the refusal
+# names the cap.
+_MAX_PLAN_STEPS = 64
+
+
 def verify_plan(
     handle: RuntimeHandle | None = None,
     plan: list[dict[str, Any]] | None = None,
@@ -1533,6 +1584,22 @@ def verify_plan(
             "reason": (
                 f"verify: plan must be a list, got {type(plan).__name__} — "
                 "caller may have passed json.dumps(plan) instead of plan"
+            ),
+        }
+    if len(plan) > _MAX_PLAN_STEPS:
+        # Plans are untrusted (LLM-authored / on-disk spec artifacts)
+        # and each step can legally wait up to 300 s (stability_wait),
+        # so an uncapped N-step plan burns 300·N wall-seconds serially
+        # in the trusted parent. Fail loudly instead of truncating —
+        # a silently-shortened plan would report "passed" for checks
+        # that never ran.
+        return {
+            "passed": False,
+            "results": [],
+            "reason": (
+                f"verify: plan has {len(plan)} steps — refusing plans "
+                f"over {_MAX_PLAN_STEPS} (each step may wait minutes; "
+                "an unbounded hostile plan is a wall-clock sink)"
             ),
         }
     if endpoint is None and handle is not None:

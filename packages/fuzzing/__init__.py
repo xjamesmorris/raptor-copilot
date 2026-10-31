@@ -15,9 +15,18 @@ from .seed_corpus import (
     prepare_seed_corpus,
 )
 from .capability import CapabilityReport, probe as probe_capabilities, select_fuzzer
+from .harness_census import (
+    EngineCensus,
+    FuzzHarnessCensus,
+    census_fuzz_harnesses,
+)
 from .target_detector import TargetInfo, detect as detect_target
 from .orchestrator import FuzzingOrchestrator, CampaignPlan
 from .libfuzzer_runner import LibFuzzerRunner, LibFuzzerResult, LibFuzzerStats
+from .atheris_runner import AtherisRunner, AtherisResult
+from .atheris_harness import AtherisHarnessSpec, write_atheris_harness
+from .cargofuzz_runner import CargoFuzzRunner, CargoFuzzResult
+from .jazzer_runner import JazzerRunner, JazzerResult
 from .harness_generator import HarnessGenerator, HarnessSpec, GeneratedHarness
 from .telemetry import FuzzingTelemetry, CampaignStats, FuzzEvent
 from packages.binary_analysis import (
@@ -30,30 +39,41 @@ from packages.binary_analysis import (
 __all__ = [
     "DEFAULT_MAX_FILE_SIZE",
     "AFLRunner",
+    "AtherisHarnessSpec",
+    "AtherisResult",
+    "AtherisRunner",
     "BinaryContextMap",
     "BinaryFunctionInfo",
     "BinaryUnderstand",
     "CampaignPlan",
     "CampaignStats",
     "CapabilityReport",
+    "CargoFuzzResult",
+    "CargoFuzzRunner",
     "CorpusManager",
     "Crash",
     "CrashCollector",
+    "EngineCensus",
     "FuzzEvent",
+    "FuzzHarnessCensus",
     "FuzzingOrchestrator",
     "FuzzingTelemetry",
     "GeneratedHarness",
     "HarnessGenerator",
     "HarnessSpec",
+    "JazzerResult",
+    "JazzerRunner",
     "LibFuzzerResult",
     "LibFuzzerRunner",
     "LibFuzzerStats",
     "SeedCorpusOptions",
     "TargetInfo",
     "analyse_binary_context",
+    "census_fuzz_harnesses",
     "detect_target",
     "prepare_builtin_seed_corpus",
     "prepare_seed_corpus",
     "probe_capabilities",
     "select_fuzzer",
+    "write_atheris_harness",
 ]

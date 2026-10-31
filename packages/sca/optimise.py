@@ -34,6 +34,12 @@ from typing import Any, TYPE_CHECKING
 
 from core.json import load_json, save_json
 
+from .naming import pep503_name
+from .kinds import (
+    HYGIENE_PREFIX,
+    SUPPLY_CHAIN_GHA_ACTION_REF_DRIFT,
+)
+from .rows import FindingRow
 from .update import (
     UpgradeChange,
     _change_to_dict,
@@ -44,13 +50,16 @@ from .update import (
     _PlanEntry,
     _proposed_rel_path as _cve_proposed_rel,
     _rewrite_one,
+    refuse_unsafe_target,
 )
+from ._md import code_cell, neutralize_inline
 from .versions import VersionError
 from .versions import compare as version_compare
 
-# findings.json artifacts are RAPTOR-written run output — the
-# findings-class budget.
-_MAX_FINDINGS_BYTES = 64 * 1024 * 1024
+# The only findings.json read here is of the file the in-process
+# analyse prepass (run_sca) just wrote — the self-produced budget,
+# not the steered-path one (rationale on both in kinds.py).
+from .kinds import MAX_SELF_FINDINGS_BYTES as _MAX_SELF_FINDINGS_BYTES
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -127,7 +136,8 @@ def main(argv: Sequence[str]) -> int:
 
     try:
         loaded_rows = load_json(
-            result.findings_path, strict=True, max_bytes=_MAX_FINDINGS_BYTES,
+            result.findings_path, strict=True,
+            max_bytes=_MAX_SELF_FINDINGS_BYTES,
         )
         if loaded_rows is None:
             # Strict load_json soft-returns None for a MISSING file —
@@ -179,9 +189,9 @@ def main(argv: Sequence[str]) -> int:
 
     # ---- Phase 3a: detect GHA-action-ref drift (independent of pins) -------
     has_gha_drift = any(
-        isinstance(r, dict)
-        and r.get("vuln_type") == "sca:supply_chain:gha_action_ref_drift"
-        for r in findings_rows
+        fr is not None
+        and fr.vuln_type == SUPPLY_CHAIN_GHA_ACTION_REF_DRIFT
+        for fr in map(FindingRow.from_row, findings_rows)
     )
     do_hash_pin = has_gha_drift and not args.no_hash_pin
 
@@ -200,6 +210,7 @@ def main(argv: Sequence[str]) -> int:
     if major_blocked and not args.no_llm:
         llm_approved, llm_verdicts = _analyze_major_bumps(
             major_blocked, vuln_plans, target,
+            promote=args.llm_approve_major,
         )
 
     # Default: plan only. --apply writes in-place, --out writes proposed/.
@@ -372,7 +383,7 @@ def _plan_hygiene_pins(
         if not isinstance(row, dict):
             continue
         vt = row.get("vuln_type", "")
-        kind = vt.removeprefix("sca:hygiene:")
+        kind = vt.removeprefix(HYGIENE_PREFIX)
         if kind not in _HYGIENE_PIN_KINDS and kind != "cross_manifest_inconsistency":
             continue
 
@@ -582,15 +593,21 @@ def _materialise_pin_changes(
             if proposed_copy.exists():
                 read_from = proposed_copy
                 break
-        try:
-            original = read_from.read_text(encoding="utf-8")
-        except OSError as e:
+        # lstat-gated, size-bounded read: discovery rejected symlinks
+        # at SCAN time, but this write path runs later — a symlink
+        # swapped in between scan and fix must not route host-file
+        # content into the staged rewrites.
+        from .resolvers._safe_io import read_regular_text
+        original = read_regular_text(read_from)
+        if original is None:
             out.extend(UpgradeChange(
                     ecosystem=plan.ecosystem, name=plan.name,
                     old_version=plan.installed, new_version=plan.target,
                     manifest=plan.manifest,
                     advisory_ids=tuple(plan.advisory_ids),
-                    skipped_reason=f"cannot read manifest: {e}",
+                    skipped_reason=("cannot read manifest: refused "
+                                    "(symlink / non-regular / oversized) "
+                                    "or unreadable"),
                 ) for plan in plan_list)
             continue
 
@@ -630,14 +647,18 @@ def _materialise_pin_changes(
 # Bare-name pinning (fallback when the standard rewriter misses)
 # ---------------------------------------------------------------------------
 
-def _normalise_pypi_name(name: str) -> str:
-    return re.sub(r"[-_.]+", "-", name).lower()
-
-
 def _pin_bare_name(
     manifest: Path, text: str, plan: _PlanEntry,
 ) -> tuple[str, bool, str | None]:
     """Insert an exact version pin for a bare (unversioned) dep name."""
+    # Same untrusted-target gate as ``update._rewrite_one`` — this is
+    # the one rewrite entry point that does not route through it (the
+    # bare-name fallback runs precisely when the standard rewriter
+    # declined, including a decline BY the gate itself), so the raw
+    # target would otherwise splice verbatim between JSON/TOML quotes.
+    refusal = refuse_unsafe_target(plan)
+    if refusal is not None:
+        return text, False, refusal
     name = manifest.name
 
     if name.startswith("requirements") and name.endswith(".txt"):
@@ -654,7 +675,7 @@ def _pin_bare_requirements(
     text: str, plan: _PlanEntry,
 ) -> tuple[str, bool, str | None]:
     """Pin ``name`` (bare, no version) → ``name==target``."""
-    norm = _normalise_pypi_name(plan.name)
+    norm = pep503_name(plan.name)
     out_lines: list[str] = []
     rewrote = False
     for raw in text.splitlines(keepends=True):
@@ -663,12 +684,17 @@ def _pin_bare_requirements(
             out_lines.append(raw)
             continue
         # Split off inline comments, preserving them for re-assembly.
-        comment_split = re.split(r"(\s+#)", stripped, maxsplit=1)
+        # (?<!\s) pins the separator to the start of its whitespace
+        # run — a bare unanchored `\s+` re-consumes the run from
+        # every position (quadratic on hostile requirement lines);
+        # the earliest match already starts at the run start, so the
+        # pinned spelling splits identically.
+        comment_split = re.split(r"(?<!\s)(\s+#)", stripped, maxsplit=1)
         line_value = comment_split[0].strip()
         comment_tail = "".join(comment_split[1:])  # separator + comment text
 
         m = re.match(r"^([A-Za-z0-9_\-.]+)\s*$", line_value)
-        if m and _normalise_pypi_name(m.group(1)) == norm:
+        if m and pep503_name(m.group(1)) == norm:
             pinned = f"{m.group(1)}=={plan.target}{comment_tail}"
             out_lines.append(raw.replace(stripped, pinned))
             rewrote = True
@@ -682,7 +708,15 @@ def _pin_bare_requirements(
 def _pin_bare_package_json(
     text: str, plan: _PlanEntry,
 ) -> tuple[str, bool, str | None]:
-    """Pin ``"name": "*"`` or ``"name": ""`` → ``"name": "target"``."""
+    """Pin ``"name": "*"`` or ``"name": ""`` → ``"name": "target"``.
+
+    Confined to the root-level dependency sections via the same span
+    helper the hardened rewriter uses — this fallback runs exactly
+    when that rewriter declined, and a whole-file ``pat.sub`` spliced
+    version pins into same-named keys in ``scripts`` / ``config`` /
+    arbitrary nested objects (decoy content, corrupted data).
+    """
+    from .update import _package_json_dep_spans
     pat = re.compile(
         r'("' + re.escape(plan.name) + r'"\s*:\s*")'
         r'([^"]*?)'
@@ -698,29 +732,137 @@ def _pin_bare_package_json(
             return f"{m.group(1)}{plan.target}{m.group(3)}"
         return m.group(0)
 
-    new_text = pat.sub(_replace, text)
+    spans = _package_json_dep_spans(text)
+    if not spans:
+        return text, False, "no dependency section found"
+    new_text = text
+    # Back-to-front so earlier span offsets stay valid after edits.
+    for start, end in sorted(spans, reverse=True):
+        segment = pat.sub(_replace, new_text[start:end])
+        new_text = new_text[:start] + segment + new_text[end:]
     if not rewrote:
         return text, False, "no wildcard/empty spec found"
     return new_text, True, None
 
 
+# TOML (section, array-key) contexts whose bare-string entries are
+# PEP 508 dependency specs. Everything else (``keywords = [...]``,
+# ``classifiers``, tool config arrays) is data a pin must never be
+# spliced into.
+_PYPROJECT_DEP_SECTION_ARRAYS: tuple[tuple[str, str | None], ...] = (
+    ("project", "dependencies"),
+    # Every array key inside these tables is a dependency group.
+    ("project.optional-dependencies", None),
+    ("dependency-groups", None),
+    ("build-system", "requires"),
+)
+
+
+def _toml_bracket_delta(line: str) -> int:
+    """Net ``[``/``]`` balance of one TOML line, ignoring brackets
+    inside single-line string literals and after a comment ``#``.
+
+    A naive ``count("[") - count("]")`` reads brackets INSIDE strings:
+    a dependency entry like ``"foo[",`` carries a net-positive delta,
+    so the tracker stayed "inside" the dependencies array past its
+    real ``]`` and the stale array context silently rewrote a bare
+    string in a FOLLOWING non-dependency array (``keywords``) in the
+    same section. Basic (``"``) strings honour backslash escapes;
+    literal (``'``) strings have none (TOML rules). Multi-line
+    strings are beyond a line heuristic — a bracket inside one can
+    only inflate the depth, which makes the pinner refuse (array
+    openers are only recognised at depth 0), never mis-splice.
+    """
+    delta = 0
+    quote: str | None = None
+    escaped = False
+    for ch in line:
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif quote == '"' and ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+        elif ch == "#":
+            break
+        elif ch == "[":
+            delta += 1
+        elif ch == "]":
+            delta -= 1
+    return delta
+
+
+def _pyproject_dep_context(section: str, array_key: str | None) -> bool:
+    """True when a bare string at (``[section]``, ``key = [``) is a
+    dependency spec."""
+    if array_key is None:
+        return False
+    for sec, key in _PYPROJECT_DEP_SECTION_ARRAYS:
+        if section == sec and (key is None or array_key == key):
+            return True
+    return False
+
+
 def _pin_bare_pyproject(
     text: str, plan: _PlanEntry,
 ) -> tuple[str, bool, str | None]:
-    """Pin a bare dep name in pyproject.toml (PEP 621 or Poetry)."""
-    norm = _normalise_pypi_name(plan.name)
+    """Pin a bare dep name in pyproject.toml (PEP 621).
 
-    # PEP 621 list form: "name" or 'name' as a bare string in
-    # [project.dependencies] or [project.optional-dependencies.*]
+    Confined to dependency arrays (``[project] dependencies``,
+    optional-dependency groups, ``[dependency-groups]``,
+    ``[build-system] requires``): the unscoped line rewrite turned a
+    same-named entry in ANY toml array — a multi-line
+    ``keywords = ["requests",]`` — into ``"requests==X",``, corrupting
+    non-dependency data. Poetry's ``name = "^1.0"`` key-value form is
+    not a bare string, so it never matched here.
+    """
+    norm = pep503_name(plan.name)
+
     out_lines: list[str] = []
     rewrote = False
+    section = ""
+    array_key: str | None = None
+    bracket_depth = 0
     for raw in text.splitlines(keepends=True):
         stripped = raw.strip()
-        m = re.match(
-            r"""^(['"])([A-Za-z0-9_\-.]+)\s*(['"])\s*,?\s*$""",
+        # \S-delimited section name: the naive trim spelling
+        # ``\s*([^\]]+?)\s*`` overlaps three unbounded repeats on
+        # whitespace — a '['-opening line ending in a long whitespace
+        # run with no ']' cost every split of the run, cubic in the
+        # line length. Real headers are unchanged; the dropped corner
+        # is a whitespace-only section name ('[  ]'), which stripped
+        # to '' downstream.
+        header = re.match(
+            r"^\[+\s*([^\]\s](?:[^\]]*[^\]\s])?)\s*\]+\s*$",
             stripped,
         )
-        if m and _normalise_pypi_name(m.group(2)) == norm:
+        if header and bracket_depth == 0:
+            section = header.group(1).strip().strip('"').strip("'")
+            # optional-dependency group headers keep the table prefix.
+            if section.startswith("project.optional-dependencies."):
+                section = "project.optional-dependencies"
+            array_key = None
+            out_lines.append(raw)
+            continue
+        if bracket_depth == 0:
+            opener = re.match(
+                r"""^(['"]?)([A-Za-z0-9_\-.]+)\1\s*=\s*\[""", stripped,
+            )
+            if opener:
+                array_key = opener.group(2)
+        # gated optional comma — the ``\s*,?\s*$`` tail was
+        # quadratic on a dep row ending in a whitespace run
+        m = re.match(
+            r"""^(['"])([A-Za-z0-9_\-.]+)\s*(['"])\s*(?:,\s*)?$""",
+            stripped,
+        )
+        if (m and bracket_depth > 0
+                and _pyproject_dep_context(section, array_key)
+                and pep503_name(m.group(2)) == norm):
             q = m.group(1)
             new_val = f"{q}{m.group(2)}=={plan.target}{q}"
             if stripped.endswith(","):
@@ -729,9 +871,16 @@ def _pin_bare_pyproject(
             rewrote = True
         else:
             out_lines.append(raw)
+        # String- and comment-aware bracket balance tracks whether the
+        # next line is still inside the opened array (see
+        # ``_toml_bracket_delta`` for why naive counting mis-spliced).
+        bracket_depth += _toml_bracket_delta(stripped)
+        if bracket_depth <= 0:
+            bracket_depth = 0
+            array_key = None
     if rewrote:
         return "".join(out_lines), True, None
-    return text, False, "bare name not found in pyproject.toml"
+    return text, False, "bare name not found in a dependency array"
 
 
 # ---------------------------------------------------------------------------
@@ -742,12 +891,21 @@ def _analyze_major_bumps(
     major_blocked: dict[tuple[str, str, str], _PlanEntry],
     vuln_plans: dict[tuple[str, str, str], _PlanEntry],
     target: Path,
+    *,
+    promote: bool = False,
 ) -> tuple[set, dict]:
     """Run LLM impact analysis on major-blocked CVE fixes.
 
     For each blocked dep, asks the LLM whether the major bump is safe
-    given the project's actual call sites.  "safe" verdicts are moved
-    from *major_blocked* into *vuln_plans* so they get applied.
+    given the project's actual call sites. By default every verdict —
+    including a high-confidence "safe" — is ANNOTATION only: the bump
+    stays blocked, because LLM output is not operator consent
+    (``--allow-major`` is the documented opt-in for applying a major
+    bump, and the assessment reads target-tree call sites, so the tree
+    can steer the classification of its own bump). Only with
+    ``promote=True`` (the operator's explicit ``--llm-approve-major``)
+    are high-confidence "safe" verdicts moved from *major_blocked*
+    into *vuln_plans* for application.
 
     Returns ``(llm_approved_keys, remaining_verdicts)``.  Both are
     empty when no LLM is available — the caller falls back to
@@ -797,7 +955,17 @@ def _analyze_major_bumps(
         if verdict is None:
             continue
 
-        if verdict.verdict == "safe":
+        # Promotion needs BOTH gates: the operator's explicit
+        # ``--llm-approve-major`` (LLM output never substitutes the
+        # documented ``--allow-major`` consent on its own) AND the
+        # high-confidence floor. Trade-off on the floor, both
+        # directions: raising it to high leaves more CVE-fixing bumps
+        # in the manual-review bucket (they still pass
+        # ``refuse_unsafe_target`` and are one flag away); lowering
+        # it back to any-"safe" lets a hedged verdict apply a
+        # breaking major.
+        if (promote and verdict.verdict == "safe"
+                and verdict.confidence == "high"):
             vuln_plans[key] = major_blocked.pop(key)
             approved.add(key)
         else:
@@ -825,7 +993,19 @@ def _print_dry_run(
     llm_approved: set | None = None,
     llm_verdicts: dict | None = None,
 ) -> None:
-    """Print what fix *would* do, grouped by manifest file."""
+    """Print what fix *would* do, grouped by manifest file.
+
+    Every interpolated value below is untrusted for TERMINAL purposes:
+    plan names / installed versions come from the scanned manifests,
+    targets from OSV ``fixed`` strings (the ``refuse_unsafe_target``
+    grammar gate runs only at rewrite time, after this print), verdict
+    summaries / breaking-change notes from the LLM. Escape
+    non-printables (ANSI / OSC) before they reach the operator's
+    terminal; LLM free text takes the full output sanitiser.
+    """
+    from core.security.log_sanitisation import escape_nonprintable
+    from core.security.prompt_output_sanitise import sanitise_string
+
     all_plans = list(vuln_plans.values()) + list(hygiene_plans.values())
     vuln_keys = set(vuln_plans)
 
@@ -847,17 +1027,20 @@ def _print_dry_run(
         plans = sorted(by_manifest[manifest], key=lambda p: p.name)
         label = (str(manifest) if name_count[manifest.name] > 1
                  else manifest.name)
-        print(f"  {label}")
+        print(f"  {escape_nonprintable(label)}")
         for plan in plans:
             key = (plan.ecosystem, plan.name, str(plan.manifest))
             if key in vuln_keys:
-                ids = ", ".join(plan.advisory_ids)
+                ids = escape_nonprintable(", ".join(plan.advisory_ids))
                 suffix = ""
                 if llm_approved and key in llm_approved:
                     suffix = "  (LLM: safe to bump)"
-                print(f"    {plan.name} {plan.installed} → {plan.target}  [{ids}]{suffix}")
+                line = (f"{plan.name} {plan.installed} → "
+                        f"{plan.target}")
+                print(f"    {escape_nonprintable(line)}  [{ids}]{suffix}")
             else:
-                print(f"    {plan.name} → =={plan.target}")
+                print(f"    {escape_nonprintable(plan.name)} "
+                      f"→ =={escape_nonprintable(plan.target)}")
         print()
 
     if major_blocked:
@@ -865,18 +1048,23 @@ def _print_dry_run(
               f"(require major version bump):\n")
         for plan in sorted(major_blocked.values(), key=lambda p: p.name):
             key = (plan.ecosystem, plan.name, str(plan.manifest))
-            ids = ", ".join(plan.advisory_ids)
-            print(f"    {plan.name} {plan.installed} → {plan.target}  "
-                  f"[{ids}]")
+            ids = escape_nonprintable(", ".join(plan.advisory_ids))
+            line = f"{plan.name} {plan.installed} → {plan.target}"
+            print(f"    {escape_nonprintable(line)}  [{ids}]")
             if llm_verdicts and key in llm_verdicts:
                 v = llm_verdicts[key]
-                label = v.verdict.replace("_", " ")
-                print(f"      LLM: {label} ({v.confidence})")
+                label = escape_nonprintable(v.verdict.replace("_", " "))
+                print(f"      LLM: {label} "
+                      f"({escape_nonprintable(str(v.confidence))})")
                 if v.summary:
-                    print(f"      {v.summary}")
+                    print(f"      {sanitise_string(v.summary)}")
                 for bc in v.breaking_changes[:3]:
-                    print(f"        {bc.site}: {bc.what_breaks}")
-        print("\n  Re-run with --allow-major to include these.\n")
+                    site = sanitise_string(bc.site, max_chars=200)
+                    breaks = sanitise_string(bc.what_breaks, max_chars=300)
+                    print(f"        {site}: {breaks}")
+        print("\n  Re-run with --allow-major to include these "
+              "(or --llm-approve-major to apply only the LLM-safe "
+              "subset).\n")
 
     print("Run with --apply to modify files in-place, "
           "or --out <dir> to write proposed/ for review.")
@@ -917,8 +1105,12 @@ def _render_optimise_markdown(changes: list[UpgradeChange]) -> str:
         parts.append("")
         parts.append("| Ecosystem | Name | Old | New | Advisories |")
         parts.append("|---|---|---|---|---|")
-        parts.extend(f"| {c.ecosystem} | {c.name} | {c.old_version} | "
-                f"{c.new_version} | {', '.join(c.advisory_ids)} |" for c in vuln_applied)
+        parts.extend(
+            f"| {c.ecosystem} | {code_cell(c.name)} | "
+            f"{neutralize_inline(c.old_version, limit=60)} | "
+            f"{neutralize_inline(c.new_version, limit=60)} | "
+            f"{', '.join(neutralize_inline(a, limit=60) for a in c.advisory_ids)} |"
+            for c in vuln_applied)
         parts.append("")
 
     if pin_applied:
@@ -926,16 +1118,21 @@ def _render_optimise_markdown(changes: list[UpgradeChange]) -> str:
         parts.append("")
         parts.append("| Ecosystem | Name | Pinned To | Manifest |")
         parts.append("|---|---|---|---|")
-        parts.extend(f"| {c.ecosystem} | {c.name} | {c.new_version} | "
-                f"`{c.manifest}` |" for c in pin_applied)
+        parts.extend(
+            f"| {c.ecosystem} | {code_cell(c.name)} | "
+            f"{neutralize_inline(c.new_version, limit=60)} | "
+            f"{code_cell(c.manifest)} |" for c in pin_applied)
         parts.append("")
 
     if skipped:
         parts.append("## Skipped")
         parts.append("")
-        parts.extend(f"- **{c.ecosystem}:{c.name}** "
-                f"({c.old_version} → {c.new_version}, `{c.manifest}`): "
-                f"{c.skipped_reason}" for c in skipped)
+        parts.extend(
+            f"- **{neutralize_inline(f'{c.ecosystem}:{c.name}', limit=120)}** "
+            f"({neutralize_inline(c.old_version, limit=60)} → "
+            f"{neutralize_inline(c.new_version, limit=60)}, "
+            f"{code_cell(c.manifest)}): "
+            f"{neutralize_inline(c.skipped_reason)}" for c in skipped)
         parts.append("")
 
     return "\n".join(parts)
@@ -960,6 +1157,12 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--out",
                    help="write proposed/ to this directory for review "
                         "(mutually exclusive with --apply)")
+    p.add_argument("--llm-approve-major", action="store_true",
+                   help="apply major-bump CVE fixes the LLM assesses "
+                        "safe with high confidence. Without this flag "
+                        "the LLM verdict is annotation only — applying "
+                        "a major bump requires the operator's "
+                        "--allow-major (or this flag).")
     p.add_argument("--allow-major", action="store_true",
                    help="allow CVE-fix upgrades that cross a major version")
     p.add_argument("--git-patch", action="store_true",

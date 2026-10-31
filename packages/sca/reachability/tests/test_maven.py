@@ -223,3 +223,47 @@ def test_orchestrator_routes_maven_to_this_handler(tmp_path: Path) -> None:
     )
     out = scan(tmp_path, [dep])
     assert out[dep.key()].verdict == "imported"
+
+
+def test_blank_line_run_is_fast(tmp_path: Path) -> None:
+    """Hostile .java carrying a TRAILING blank-line RUN: under the
+    MULTILINE ``^`` anchor a ``\\s*`` indent matched at every line
+    start inside the run and re-scanned the remainder per anchor —
+    quadratic (a run the greedy span cannot hand to a match; 128K of
+    newlines hung the sweep for minutes). Horizontal-only indent is
+    linear. Both-direction bound: fast AND the file's real import is
+    still found."""
+    import time
+
+    _java(tmp_path, "src/main/java/X.java",
+          "import org.springframework.core.Foo;\nclass X {}\n"
+          + "\n" * (1 << 17))
+    start = time.monotonic()
+    scan = scan_imports(tmp_path)
+    assert time.monotonic() - start < 5.0
+    assert "org.springframework.core.Foo" in scan
+
+
+def test_import_whitespace_run_is_fast(tmp_path: Path) -> None:
+    """Hostile .java where an ``import x`` token is followed by a long
+    whitespace RUN and no terminating ``;``: with the tail spelled
+    ``\\s*(?:\\.\\*)?\\s*;`` two unbounded whitespace spans border the
+    optional wildcard and the engine tries every split of the run
+    between them — quadratic on a single import token. Folding the
+    trailing span into the ``;``-gated group is linear. Both-direction
+    bound: fast AND regular / wildcard imports still parse."""
+    import time
+
+    _java(tmp_path, "src/main/java/X.java",
+          "import org.springframework.core.Foo;\n"
+          "import x" + " " * (1 << 19) + "?\n"
+          "import com.example.foo.*;\n"
+          "import static java.util.Collections.emptyList;\n"
+          "class X {}\n")
+    start = time.monotonic()
+    scan = scan_imports(tmp_path)
+    assert time.monotonic() - start < 5.0
+    assert "org.springframework.core.Foo" in scan
+    assert "com.example.foo" in scan
+    assert "java.util.Collections.emptyList" in scan
+    assert not any(p.startswith("x") for p in scan)

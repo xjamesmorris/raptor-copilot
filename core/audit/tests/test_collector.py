@@ -26,6 +26,7 @@ class _FakeOutcome:
     # (that path is exercised in test_promotion_alarm.py).
     evidence_tool: str = "semgrep:sql-injection"
     review_result: dict[str, Any] | None = None
+    weaknesses: list[dict[str, Any]] | None = None
 
 
 def _make_gap(file: str = "src/auth.py", name: str = "check_pw") -> dict[str, Any]:
@@ -164,6 +165,36 @@ class TestCollectorJournalDualWrite:
         entries = load_entries(tmp_path)
         assert len(entries) == 1
         assert entries[0].model == "test-model"
+
+    def test_reading_list_null_question_never_persists_null(
+        self, tmp_path: Path,
+    ) -> None:
+        # The journal declares reading_list_items: list[str]. LLM
+        # rows carry present-but-null / non-str questions, and a
+        # .get default never fires on a present null — the str(item)
+        # fallback must catch those leaves instead of persisting
+        # JSON null into the typed field.
+        from core.audit.collector import append_journal_for_outcome
+        from core.coverage.journal import load_entries
+        append_journal_for_outcome(
+            out_dir=tmp_path,
+            target_path=tmp_path,
+            run_id="r1",
+            outcome=_FakeOutcome(review_result={"reading_list": [
+                {"question": None},
+                {"question": 42},
+                {"question": "real question?"},
+                "stray-non-dict",
+            ]}),
+            gap=_make_gap(),
+        )
+        (entry,) = load_entries(tmp_path)
+        assert "real question?" in entry.reading_list_items
+        assert all(
+            isinstance(q, str) and q
+            for q in entry.reading_list_items
+        )
+        assert len(entry.reading_list_items) == 3
 
     def test_submit_creates_journal_entry(self, tmp_path: Path) -> None:
         from core.coverage.journal import load_entries
@@ -490,6 +521,194 @@ class TestCorrectiveStrategyInheritance:
         assert not is_mechanical_echo(entry)
 
 
+class TestStrategySnapshotDegrade:
+    """A failed journal parse must degrade loudly and uniformly (no
+    donations, explicit ``None`` marker) — a silently returned partial
+    snapshot passes off the rows it happened to reach as the run's
+    strategy state, and the failure retries once the journal grows."""
+
+    _LOGGER = "core.audit.collector"
+
+    def _write(self, out_dir: Path, gap: dict, **outcome_over) -> None:
+        from core.audit.collector import append_journal_for_outcome
+        outcome = _FakeOutcome(**outcome_over)
+        append_journal_for_outcome(
+            out_dir=out_dir, target_path=out_dir, run_id="run-1",
+            outcome=outcome, gap=gap,
+        )
+
+    def test_parse_failure_returns_none_and_warns(
+        self, tmp_path: Path, monkeypatch, caplog,
+    ) -> None:
+        from core.audit.collector import _build_strategy_snapshot
+        import core.audit.journal as journal_mod
+
+        def _boom(*a, **kw):
+            raise OSError("journal unreadable")
+
+        monkeypatch.setattr(journal_mod, "load_entries_checked", _boom)
+        with caplog.at_level("WARNING", logger=self._LOGGER):
+            snapshot = _build_strategy_snapshot(tmp_path)
+        assert snapshot is None
+        warnings = [
+            r for r in caplog.records
+            if r.levelname == "WARNING" and r.name == self._LOGGER
+        ]
+        assert len(warnings) == 1
+        assert str(tmp_path) in warnings[0].getMessage()
+
+    def test_empty_journal_is_empty_dict_not_none(
+        self, tmp_path: Path,
+    ) -> None:
+        # {} = parsed fine, nothing eligible — distinct from the
+        # degraded None marker.
+        from core.audit.collector import _build_strategy_snapshot
+        assert _build_strategy_snapshot(tmp_path) == {}
+
+    def test_degraded_snapshot_never_donates_then_recovers(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        # Corrective write during the outage journals [] (the
+        # pre-existing no-donation fallback); once the journal has
+        # grown and the parse works again, inheritance resumes.
+        from core.coverage.journal import load_entries
+        import core.audit.journal as journal_mod
+
+        self._write(
+            tmp_path,
+            {"line_start": 10, "line_end": 30, "strategies": ["auth"]},
+            status="suspicious",
+        )
+        real_load_entries = journal_mod.load_entries_checked
+
+        def _boom(*a, **kw):
+            raise OSError("journal unreadable")
+
+        monkeypatch.setattr(journal_mod, "load_entries_checked", _boom)
+        self._write(tmp_path, {"line_start": 10}, status="clean",
+                    body="[resolution] corrective")
+        assert load_entries(tmp_path)[-1].strategies == []
+
+        monkeypatch.setattr(journal_mod, "load_entries_checked", real_load_entries)
+        # The corrective row above grew the journal, so the next
+        # strategies-less write re-parses and inherits again.
+        self._write(tmp_path, {"line_start": 10}, status="clean",
+                    body="[resolution] corrective again")
+        assert load_entries(tmp_path)[-1].strategies == ["auth"]
+
+    def test_healthy_inheritance_unchanged(self, tmp_path: Path) -> None:
+        from core.coverage.journal import load_entries
+        self._write(
+            tmp_path,
+            {"line_start": 10, "line_end": 30, "strategies": ["auth"]},
+            status="suspicious",
+        )
+        self._write(tmp_path, {"line_start": 10}, status="clean",
+                    body="[resolution] corrective")
+        assert load_entries(tmp_path)[-1].strategies == ["auth"]
+
+    def test_mid_loop_failure_degrades_uniformly(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        # A failure part-way through the eligibility walk must not
+        # pass off the rows reached so far as the run's strategy
+        # state — the degrade is uniform (None), never a partial map.
+        import core.coverage.journal_mac as journal_mac
+
+        from core.audit.collector import _build_strategy_snapshot
+
+        self._write(
+            tmp_path,
+            {"line_start": 10, "line_end": 30, "strategies": ["auth"]},
+            status="suspicious",
+        )
+        self._write(
+            tmp_path,
+            {"line_start": 50, "line_end": 70, "strategies": ["memory"]},
+            status="suspicious", function="login",
+        )
+        real = journal_mac.entry_provenance
+        calls = {"n": 0}
+
+        def _flaky(entry: Any, *a: Any, **kw: Any) -> Any:
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                raise OSError("mac key unreadable")
+            return real(entry, *a, **kw)
+
+        monkeypatch.setattr(journal_mac, "entry_provenance", _flaky)
+        assert _build_strategy_snapshot(tmp_path) is None
+        assert calls["n"] >= 2
+
+    def test_incomplete_journal_load_degrades(
+        self, tmp_path: Path, monkeypatch, caplog,
+    ) -> None:
+        # An over-budget journal loads as a bounded PARTIAL list
+        # WITHOUT raising — it must take the same uniform degrade as
+        # a parse failure, and the corrective row then donates [].
+        import core.audit.journal as journal_mod
+
+        from core.audit.collector import _build_strategy_snapshot
+        from core.coverage.journal import JournalLoad, load_entries
+
+        self._write(
+            tmp_path,
+            {"line_start": 10, "line_end": 30, "strategies": ["auth"]},
+            status="suspicious",
+        )
+        real = journal_mod.load_entries_checked
+
+        def _partial(out_dir: Path, **kw: Any) -> JournalLoad:
+            loaded = real(out_dir, **kw)
+            return JournalLoad(
+                entries=loaded.entries, complete=False,
+                reason="retained budget exceeded",
+            )
+
+        monkeypatch.setattr(journal_mod, "load_entries_checked", _partial)
+        with caplog.at_level("WARNING", logger=self._LOGGER):
+            assert _build_strategy_snapshot(tmp_path) is None
+        warnings = [
+            r for r in caplog.records
+            if r.levelname == "WARNING" and r.name == self._LOGGER
+        ]
+        assert len(warnings) == 1
+        assert "retained budget exceeded" in warnings[0].getMessage()
+
+        self._write(tmp_path, {"line_start": 10}, status="clean",
+                    body="[resolution] corrective")
+        assert load_entries(tmp_path)[-1].strategies == []
+
+    def test_exception_warning_escaped_and_bounded(
+        self, tmp_path: Path, monkeypatch, caplog,
+    ) -> None:
+        # A hostile exception message (control bytes + flooding
+        # length) must land escaped and truncated in the WARNING;
+        # the traceback is DEBUG-only.
+        import core.audit.journal as journal_mod
+
+        from core.audit.collector import _build_strategy_snapshot
+
+        hostile = "\x1b]0;pwn\x07" + "A" * 100_000
+
+        def _boom(*a: Any, **kw: Any) -> None:
+            raise OSError(hostile)
+
+        monkeypatch.setattr(journal_mod, "load_entries_checked", _boom)
+        with caplog.at_level("WARNING", logger=self._LOGGER):
+            assert _build_strategy_snapshot(tmp_path) is None
+        warnings = [
+            r for r in caplog.records
+            if r.levelname == "WARNING" and r.name == self._LOGGER
+        ]
+        assert len(warnings) == 1
+        msg = warnings[0].getMessage()
+        assert "\x1b" not in msg
+        assert "\\x1b" in msg
+        assert "chars]" in msg  # explicit elision marker
+        assert len(msg) < 1000  # bounded, not the 100 KB flood
+
+
 class TestFlushDurability:
     """flush() is re-usable (post-loop passes submit AFTER the first
     flush), retains entries on write failure, and appends through the
@@ -632,3 +851,278 @@ class TestReusedVerdictChokepoint:
         alarms = load_alarms(tmp_path)
         assert len(alarms) == 1
         assert alarms[0]["blocked"] is True
+
+
+class TestFlushExceptionTotal:
+    def test_flush_never_raises_on_unexpected_error(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        # "Never raises" must be exception-total: flush runs from
+        # end-of-run paths and the SIGTERM hook.
+        collector = Collector(out_dir=tmp_path, target_path=tmp_path)
+
+        def boom() -> None:
+            raise RuntimeError("row-shape surprise")
+
+        monkeypatch.setattr(collector, "_flush_audit_log", boom)
+        collector.flush()  # must not raise
+
+
+class TestDomainSliceStamp:
+    """Journal rows carry the per-function domain-slice fingerprint."""
+
+    _SOURCE = (
+        "int check_pw(const char *pw) {\n"
+        "    return strcmp(pw, stored) == 0;\n"
+        "}\n"
+    )
+
+    def _setup(self, tmp_path: Path, *, with_model: bool = True):
+        import json as _json
+
+        from core.concepts.audit_bridge import _load_cached
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "auth.c").write_text(self._SOURCE, encoding="utf-8")
+        run = tmp_path / "run1"
+        run.mkdir()
+        if with_model:
+            (run / "domain-model.json").write_text(
+                _json.dumps({
+                    "concepts": [{
+                        "id": "pw_compare_rules",
+                        "description": (
+                            "check_pw must compare in constant time"
+                        ),
+                    }],
+                    "invariants": [],
+                    "contracts": [],
+                }),
+                encoding="utf-8",
+            )
+        _load_cached.cache_clear()
+        return run, target
+
+    @staticmethod
+    def _gap() -> dict[str, Any]:
+        return {
+            "file": "auth.c", "name": "check_pw",
+            "line_start": 1, "line_end": 3,
+        }
+
+    def _append(self, run: Path, target: Path, gap=None) -> None:
+        from core.audit.collector import append_journal_for_outcome
+        append_journal_for_outcome(
+            out_dir=run,
+            target_path=target,
+            run_id="run1",
+            outcome=_FakeOutcome(file="auth.c", function="check_pw"),
+            gap=gap or self._gap(),
+        )
+
+    def test_stamp_matches_the_fold_recompute(self, tmp_path: Path) -> None:
+        from core.audit.context import domain_slice_hash_for
+        from core.coverage.journal import load_entries
+        run, target = self._setup(tmp_path)
+        self._append(run, target)
+        [entry] = load_entries(run)
+        assert entry.domain_slice_hash is not None
+        # Record-time stamp and reuse-time recompute are the SAME
+        # code path — they must agree on unchanged input.
+        assert entry.domain_slice_hash == domain_slice_hash_for(
+            run, target, "auth.c", "check_pw", 1, 3)
+
+    def test_no_model_no_stamp(self, tmp_path: Path) -> None:
+        from core.coverage.journal import load_entries
+        run, target = self._setup(tmp_path, with_model=False)
+        self._append(run, target)
+        [entry] = load_entries(run)
+        assert entry.domain_slice_hash is None
+
+    def test_edge_rows_not_stamped(self, tmp_path: Path) -> None:
+        from core.coverage.journal import load_entries
+        run, target = self._setup(tmp_path)
+        gap = dict(self._gap(), edge_callee="auth.c:stored_cmp")
+        self._append(run, target, gap=gap)
+        [entry] = load_entries(run)
+        assert entry.domain_slice_hash is None
+
+    def test_renderer_failure_stamps_nothing(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        import core.audit.context as context_mod
+        from core.coverage.journal import load_entries
+
+        def _boom(*a, **kw):
+            raise RuntimeError("renderer failure")
+
+        monkeypatch.setattr(context_mod, "domain_slice_hash_for", _boom)
+        run, target = self._setup(tmp_path)
+        self._append(run, target)
+        # The row still lands — a slice-stamp failure must never cost
+        # the review record — just without the stamp.
+        [entry] = load_entries(run)
+        assert entry.verdict
+        assert entry.domain_slice_hash is None
+
+
+class TestExtractWeaknesses:
+    """Tests for extract_weaknesses (weakness tier extraction)."""
+
+    def test_cross_function_with_guard_type(self):
+        from core.audit.collector import extract_weaknesses
+
+        hyps = [{
+            "mechanism": "CWE-120 buffer overflow in parse_input",
+            "confidence": "refuted",
+            "counter": "the caller validate_input() checks buffer length",
+            "counter_scope": "cross_function",
+            "guard_type": "bounds",
+            "assumed_property": "input length <= 256",
+        }]
+        ws = extract_weaknesses(hyps, function="parse_input", file="src/parse.c")
+        assert len(ws) == 1
+        w = ws[0]
+        assert w["guard_type"] == "bounds"
+        assert w["property"] == "input length <= 256"
+        assert w["assumed_by"] == "src/parse.c:parse_input"
+        assert "validate_input" in w["guarded_by"]
+        assert w["source"] == "structured_pass"
+
+    def test_local_scope_no_weakness(self):
+        from core.audit.collector import extract_weaknesses
+
+        hyps = [{
+            "mechanism": "CWE-120 overflow",
+            "confidence": "refuted",
+            "counter": "length is checked at line 42",
+            "counter_scope": "local",
+            "guard_type": "bounds",
+        }]
+        ws = extract_weaknesses(hyps, function="f", file="a.c")
+        assert ws == []
+
+    def test_missing_guard_type_no_weakness(self):
+        from core.audit.collector import extract_weaknesses
+
+        hyps = [{
+            "mechanism": "CWE-120 overflow",
+            "confidence": "refuted",
+            "counter": "caller caps the buffer",
+            "counter_scope": "cross_function",
+        }]
+        ws = extract_weaknesses(hyps, function="f", file="a.c")
+        assert ws == []
+
+    def test_missing_counter_scope_no_weakness(self):
+        from core.audit.collector import extract_weaknesses
+
+        hyps = [{
+            "mechanism": "CWE-120 overflow",
+            "confidence": "refuted",
+            "counter": "caller caps the buffer",
+            "guard_type": "bounds",
+        }]
+        ws = extract_weaknesses(hyps, function="f", file="a.c")
+        assert ws == []
+
+    def test_cwe_carried_from_hypothesis(self):
+        from core.audit.collector import extract_weaknesses
+
+        hyps = [{
+            "mechanism": "CWE-476 null dereference",
+            "confidence": "refuted",
+            "counter": "caller guarantees non-NULL",
+            "counter_scope": "cross_function",
+            "guard_type": "null_safety",
+            "assumed_property": "pointer is non-NULL",
+        }]
+        ws = extract_weaknesses(hyps, cwe="CWE-476")
+        assert len(ws) == 1
+        assert ws[0]["cwe_class"] == "CWE-476"
+
+    def test_invalid_guard_type_rejected(self):
+        from core.audit.collector import extract_weaknesses
+
+        hyps = [{
+            "mechanism": "overflow",
+            "confidence": "refuted",
+            "counter": "caller caps it",
+            "counter_scope": "cross_function",
+            "guard_type": "magic",
+        }]
+        ws = extract_weaknesses(hyps, function="f")
+        assert ws == []
+
+    def test_all_guard_types_accepted(self):
+        from core.audit.collector import extract_weaknesses
+
+        for gt in ("bounds", "null_safety", "validation", "sanitisation",
+                    "lifetime", "ordering", "concurrency", "other"):
+            hyps = [{
+                "mechanism": "test",
+                "confidence": "refuted",
+                "counter": "caller provides",
+                "counter_scope": "cross_function",
+                "guard_type": gt,
+            }]
+            ws = extract_weaknesses(hyps, function="f")
+            assert len(ws) == 1, f"guard_type={gt} rejected"
+            assert ws[0]["guard_type"] == gt
+
+    def test_mechanism_used_when_no_assumed_property(self):
+        from core.audit.collector import extract_weaknesses
+
+        hyps = [{
+            "mechanism": "CWE-120 stack buffer overflow via strcpy",
+            "confidence": "refuted",
+            "counter": "caller provides safe input",
+            "counter_scope": "cross_function",
+            "guard_type": "bounds",
+        }]
+        ws = extract_weaknesses(hyps, function="f")
+        assert len(ws) == 1
+        assert ws[0]["property"] == "CWE-120 stack buffer overflow via strcpy"
+
+    def test_empty_guard_type_rejected(self):
+        from core.audit.collector import extract_weaknesses
+
+        hyps = [{
+            "mechanism": "overflow",
+            "confidence": "refuted",
+            "counter": "caller caps it",
+            "counter_scope": "cross_function",
+            "guard_type": "",
+        }]
+        ws = extract_weaknesses(hyps, function="f")
+        assert ws == []
+
+    def test_empty_guarded_by_when_no_function_names(self):
+        from core.audit.collector import extract_weaknesses
+
+        hyps = [{
+            "mechanism": "overflow",
+            "confidence": "refuted",
+            "counter": "the input is safe",
+            "counter_scope": "cross_function",
+            "guard_type": "bounds",
+            "assumed_property": "length bounded",
+        }]
+        ws = extract_weaknesses(hyps, function="f")
+        assert len(ws) == 1
+        assert ws[0]["guarded_by"] == []
+
+    def test_hypothesis_cwe_overrides_fallback(self):
+        from core.audit.collector import extract_weaknesses
+
+        hyps = [{
+            "mechanism": "null dereference",
+            "confidence": "refuted",
+            "counter": "caller guarantees non-NULL",
+            "counter_scope": "cross_function",
+            "guard_type": "null_safety",
+            "cwe": "CWE-476",
+        }]
+        ws = extract_weaknesses(hyps, cwe="CWE-120")
+        assert len(ws) == 1
+        assert ws[0]["cwe_class"] == "CWE-476"

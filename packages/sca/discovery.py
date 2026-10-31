@@ -19,9 +19,10 @@ from pathlib import Path
 
 from .models import Manifest
 from typing import TYPE_CHECKING
+from .file_shapes import is_compose_file
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -29,11 +30,20 @@ logger = logging.getLogger(__name__)
 # These are package install dirs, build outputs, VCS metadata, editor
 # state. Skipping them is a 10-100x speedup on real repos and avoids
 # treating vendored copies as direct deps.
-EXCLUDED_DIR_NAMES: set[str] = {
-    # Per-ecosystem package install dirs
+# Package-manager install directories. Split out from the general
+# exclusion set because they are NEVER walked, not even inside the
+# composite-actions carve-out below: the publish-helper attestation
+# (supply_chain._hook_patterns) trusts that a manifest under one of
+# these names cannot have come from the discovery walk — an action
+# directory literally named ``node_modules`` must not re-open that
+# hole.
+VENDOR_INSTALL_DIR_NAMES: frozenset[str] = frozenset({
     "node_modules",
     "vendor",
     "bower_components",
+})
+
+EXCLUDED_DIR_NAMES: set[str] = set(VENDOR_INSTALL_DIR_NAMES) | {
     # NB: ``packages`` is NOT excluded — it's a legitimate top-level
     # directory in many monorepos (raptor, rush, lerna, etc.). Skipping
     # it silently dropped real manifests in the wild.
@@ -301,10 +311,12 @@ def find_manifests(
     # Within this scan the caches are retained — csproj parsers
     # walking up to the same Directory.Packages.props don't re-
     # parse the file once per csproj.
+    from .parsers import _pnpm_catalog as _pnpm
     from .parsers import directory_packages_props as _cpm
     from .parsers import gradle_version_catalog as _gvc
     _cpm.reset_cache()
     _gvc.reset_cache()
+    _pnpm.reset_cache()
 
     excludes = EXCLUDED_DIR_NAMES | (extra_excludes or set())
     found: list[Manifest] = []
@@ -312,8 +324,9 @@ def find_manifests(
     # Test-path filtering is deferred until after classification so a
     # rejected path doesn't pay the parse-classification cost twice.
     # Imported lazily to avoid a circular dep at module-import time.
+    is_test_path: Callable[[Path, Path], bool] | None
     if not include_test_paths:
-        from ._test_paths import is_test_path
+        from ._test_paths import is_test_path as is_test_path
     else:
         is_test_path = None
 
@@ -411,7 +424,16 @@ def _walk(root: Path, max_depth: int, excludes: set[str]) -> Iterator[Path]:
             # ``dist`` / ``out`` that collide with EXCLUDED_DIR_NAMES;
             # pruning them silently drops the embedded
             # ``action.yml``.
-            pass
+            #
+            # The package-install names stay pruned even here: no
+            # legitimate composite action is NAMED ``node_modules``,
+            # and suspending them let a hostile repo walk a committed
+            # ``.github/actions/node_modules/<name>/package.json``
+            # into the scan — self-attesting a publish-helper name
+            # the attestation layer trusts to be walk-unreachable.
+            dirnames[:] = [
+                d for d in dirnames if d not in VENDOR_INSTALL_DIR_NAMES
+            ]
         else:
             # In-place prune.
             dirnames[:] = [d for d in dirnames if not _should_skip_dir(d, excludes)]
@@ -445,13 +467,17 @@ def _walk(root: Path, max_depth: int, excludes: set[str]) -> Iterator[Path]:
 
 
 def _is_composite_actions_parent(cur: Path) -> bool:
-    """True when ``cur`` is the ``.github/actions`` directory whose
-    immediate children are individual composite-action folders."""
+    """True when ``cur`` is the ``.github/actions`` directory or any
+    directory beneath it. The exclude-list exemption must hold for
+    the whole composite-actions SUBTREE (the call site's documented
+    claim): matching only the parent meant a grouped action
+    (``.github/actions/group/build/action.yml``) was pruned by the
+    generic exclude list one level down. Vendor-install names stay
+    pruned throughout — see the call site."""
     parts = cur.parts
-    return (
-        len(parts) >= 2
-        and parts[-1] == "actions"
-        and parts[-2] == ".github"
+    return any(
+        parts[i] == ".github" and parts[i + 1] == "actions"
+        for i in range(len(parts) - 1)
     )
 
 
@@ -490,7 +516,7 @@ def _classify(path: Path) -> str | None:
     # Docker Compose / overlay variants. ``docker-compose.dev.yml``
     # etc. — too many shapes for static MANIFEST_FILENAMES; matched
     # by predicate.
-    if _is_compose_file(name):
+    if is_compose_file(Path(name)):
         return "OCI"
     # Kubernetes manifests — content-sniffed by the parser
     # (top-level ``kind:`` must match a workload). Discovery
@@ -499,16 +525,3 @@ def _classify(path: Path) -> str | None:
     if path.suffix.lower() in (".yml", ".yaml"):
         return "Kubernetes"
     return None
-
-
-def _is_compose_file(name: str) -> bool:
-    """Match ``compose.yml`` / ``compose.yaml`` /
-    ``docker-compose*.yml`` / ``compose.<overlay>.yml``."""
-    lower = name.lower()
-    if not (lower.endswith((".yml", ".yaml"))):
-        return False
-    if lower.startswith("docker-compose"):
-        return True
-    if lower in {"compose.yml", "compose.yaml"}:
-        return True
-    return bool(lower.startswith("compose."))

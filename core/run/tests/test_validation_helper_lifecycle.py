@@ -32,7 +32,7 @@ def _load_helper():
     return mod
 
 
-def _run_stage0(tmp_path: Path, *extra: str):
+def _run_stage0(tmp_path: Path, *extra: str, no_bridge: bool = True):
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
     target = tmp_path / "target"
@@ -43,11 +43,12 @@ def _run_stage0(tmp_path: Path, *extra: str):
     env["HOME"] = str(home)
     env["_RAPTOR_TRUSTED"] = "1"
     env.pop("RAPTOR_CALLER_DIR", None)
-    result = subprocess.run(
-        [sys.executable, HELPER, "0", "--target", str(target),
-         "--out", str(out), "--no-bridge", *extra],
-        capture_output=True, text=True, env=env,
-    )
+    args = [sys.executable, HELPER, "0", "--target", str(target),
+            "--out", str(out)]
+    if no_bridge:
+        args.append("--no-bridge")
+    args.extend(extra)
+    result = subprocess.run(args, capture_output=True, text=True, env=env)
     return result, out
 
 
@@ -71,12 +72,71 @@ class TestStage0Stranding:
         assert meta["status"] == "running"
 
 
+class TestBridgeConfigMarker:
+
+    def test_no_bridge_marker_rewritten_both_ways(self, tmp_path):
+        # --no-bridge persists its opt-out for the D/E boundary
+        # re-enrichment ...
+        result, out = _run_stage0(tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert load_json(out / "bridge-config.json") == {"no_bridge": True}
+        # ... and a later stage-0 run WITHOUT the flag on the same out
+        # dir must clear the stale opt-out — the marker is rewritten
+        # to each invocation's truth, never left sticky.
+        result, out = _run_stage0(tmp_path, no_bridge=False)
+        assert result.returncode == 0, result.stderr
+        assert load_json(out / "bridge-config.json") == {"no_bridge": False}
+
+
+class TestStage0ConsentRecord:
+    """Stage 0 persists the explicit consent tri-states as the MAC'd
+    run record (and removes a stale one on a no-flags run), through
+    the real CLI path."""
+
+    def test_explicit_flags_persist_verified_record(self, tmp_path,
+                                                    monkeypatch):
+        monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+        result, out = _run_stage0(tmp_path, "--no-dynamic", "--build")
+        assert result.returncode == 0, result.stderr
+        from packages.exploitability_validation.trust_consent import (
+            load_consent,
+        )
+        rec = load_consent(out)
+        assert rec is not None
+        assert (rec.dynamic, rec.build) == (False, True)
+        assert rec.provenance == "record"
+
+    def test_no_flags_run_removes_stale_record(self, tmp_path,
+                                               monkeypatch):
+        monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+        result, out = _run_stage0(tmp_path, "--no-dynamic")
+        assert result.returncode == 0, result.stderr
+        assert (out / "trust-consent.json").exists()
+        # A later stage 0 on the same out dir WITHOUT flags must not
+        # leave the previous run's denial looking current (same
+        # rewrite-both-ways doctrine as bridge-config above).
+        result, out = _run_stage0(tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert not (out / "trust-consent.json").exists()
+        # The out-of-band mint state must be cleared WITH the record:
+        # a leftover state file would read as deletion-of-denial and
+        # deny the run's dynamic channels fail-closed.
+        from packages.exploitability_validation.trust_consent import (
+            load_consent as load_consent_after,
+        )
+        assert load_consent_after(out) is None
+
+
 class TestWitnessExecutionGate:
 
-    def test_gate_receives_run_target(self, tmp_path, monkeypatch, capsys):
+    def test_gate_receives_run_target_and_run_dir(self, tmp_path,
+                                                  monkeypatch, capsys):
         # The project 'dynamic' marker's one-target rule must be
         # resolved from the run's --target (like the sibling sink-watch
-        # and symbolic-replay gates), not from the launcher cwd.
+        # and symbolic-replay gates), not from the launcher cwd — and
+        # the marker lookup must be routed to the RUN PIN's project by
+        # passing the workdir as run_dir (an omitted run_dir consults
+        # the ambient session project, wrong in both directions).
         mod = _load_helper()
         trust = pytest.importorskip("core.project.trust")
         ws = pytest.importorskip(
@@ -86,12 +146,14 @@ class TestWitnessExecutionGate:
         def fake_gate(explicit, *, banner=True, target_path=None,
                       run_dir=None):
             seen["target_path"] = target_path
-            return False
+            seen["run_dir"] = run_dir
+            return trust.TrustResolution(False, "default", None, "run-pin")
 
         def never(*args, **kwargs):
             raise AssertionError("must not execute when gate refuses")
 
-        monkeypatch.setattr(trust, "resolve_dynamic_validation", fake_gate)
+        monkeypatch.setattr(trust, "resolve_dynamic_validation_detail",
+                            fake_gate)
         monkeypatch.setattr(ws, "eligible_findings",
                             lambda findings: list(findings))
         monkeypatch.setattr(ws, "run_witness_stage", never)
@@ -100,4 +162,5 @@ class TestWitnessExecutionGate:
         mod._run_witness_execution(str(tmp_path), str(tmp_path / "tree"),
                                    data, dynamic=None)
         assert seen["target_path"] == str(tmp_path / "tree")
+        assert Path(seen["run_dir"]) == tmp_path
         assert "dynamic execution not granted" in capsys.readouterr().out

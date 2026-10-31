@@ -9,9 +9,12 @@ pretending the relationship is exploitable.
 
 from __future__ import annotations
 
+import glob
 import os
 from pathlib import Path
 from typing import Any
+
+from .manifest import platform_label
 
 
 def _find_declared_artifact(bundle_root: Path, name: str) -> Path | None:
@@ -27,7 +30,12 @@ def _find_declared_artifact(bundle_root: Path, name: str) -> Path | None:
         if path.is_file() and path.resolve().is_relative_to(resolved_root):
             return path
     try:
-        for path in bundle_root.rglob(name):
+        # The name comes from a hostile Info.plist: escape glob
+        # metacharacters so a declared name of '*' cannot bind an
+        # arbitrary bundle file as the "declared privileged helper"
+        # (or make the walk pathologically expensive). The rglob is a
+        # filename lookup, never a pattern.
+        for path in bundle_root.rglob(glob.escape(name)):
             if path.is_file() and path.resolve().is_relative_to(resolved_root):
                 return path
     except OSError:
@@ -188,15 +196,9 @@ def build_component_topology(
     }
 
 
-def _platform(manifest: Any) -> str:
-    kind = str(getattr(manifest, "target_kind", "") or "")
-    if kind == "macho":
-        return "macos"
-    if kind.startswith("pe-"):
-        return "windows"
-    if kind in {"elf-linux", "elf-kmod"}:
-        return "linux"
-    return "generic"
+# Shared target_kind -> OS mapping (kept under the module-local name
+# the call sites use).
+_platform = platform_label
 
 
 def _boundary_description(kind: str) -> str:

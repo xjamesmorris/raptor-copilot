@@ -42,6 +42,7 @@ import logging
 import re
 
 from ..models import Confidence, Dependency, PinStyle
+from ._base import build_purl
 from . import _safe_read, register
 from typing import TYPE_CHECKING
 
@@ -299,7 +300,7 @@ def _build_dep(
     if not name:
         return None
     pin_style = _classify_pin_style(version)
-    purl = _build_purl(name, version)
+    purl = build_purl(_PURL_TYPE, name, version)
     reason = "go.mod plain-text grammar"
     if is_lockfile:
         reason = "go.sum plain-text — deterministic"
@@ -336,12 +337,6 @@ def _classify_pin_style(version: str | None) -> PinStyle:
         return PinStyle.EXACT
     return PinStyle.UNKNOWN
 
-
-def _build_purl(name: str, version: str | None) -> str:
-    base = f"pkg:{_PURL_TYPE}/{name}"
-    if version:
-        return f"{base}@{version}"
-    return base
 
 
 __all__ = ["parse_lockfile", "parse_manifest"]

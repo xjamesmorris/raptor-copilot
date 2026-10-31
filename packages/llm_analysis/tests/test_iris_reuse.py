@@ -415,6 +415,26 @@ class TestSmtPreFlight:
         v = self._make_vuln_with_conditions(["x > 1"], profile="bogus")
         assert agent._smt_pre_flight(v) == "no_check"
 
+    def test_non_string_profile_never_raises(self, tmp_path):
+        """LLM schema drift: `path_profile` arrives as a list/int/dict
+        (the schema says string-or-null). The gate must degrade to the
+        default profile, not raise AttributeError out of
+        `generate_exploit` and abort the whole sequential run."""
+        agent = self._agent(tmp_path)
+        for bad_profile in (["uint32"], 64, {"profile": "uint64"}):
+            v = self._make_vuln_with_conditions(
+                ["x > 100", "x < 5"], profile=bad_profile,
+            )
+            # Coerced to the default profile; the unsat conditions
+            # still produce a real verdict.
+            assert agent._smt_pre_flight(v) == "refuted"
+
+    def test_null_profile_uses_default(self, tmp_path):
+        agent = self._agent(tmp_path)
+        v = self._make_vuln_with_conditions(["x > 100", "x < 5"],
+                                            profile=None)
+        assert agent._smt_pre_flight(v) == "refuted"
+
     def test_smt_unavailable_no_check(self, tmp_path):
         """When the SMT substrate isn't importable, no_check (silent
         fallthrough) — exploit gen continues blind."""
@@ -582,6 +602,59 @@ class TestValidateDataflowGate:
 
         # Inconclusive does NOT block the LLM validation
         mock_validate_df.assert_called_once()
+
+    def test_abstained_validation_verdict_does_not_demote(self, tmp_path):
+        # Schema validation nulls a malformed is_exploitable in the
+        # deep-validation response — an abstention. Pre-fix the
+        # truthiness gate read the None as "not exploitable" and
+        # silently demoted the finding off a degraded response.
+        agent = self._agent(tmp_path)
+        v = self._make_vuln()
+        analysis = self._llm_analysis_response(is_exploitable=True)
+
+        agent.llm = MagicMock()
+        agent.llm.generate_structured.return_value = (analysis, None)
+
+        with patch(
+            "core.llm.response_validation.validate_structured_response",
+        ) as mock_validate, patch.object(
+            agent, "_tier1_pre_flight", return_value="inconclusive",
+        ), patch.object(
+            agent, "validate_dataflow",
+            return_value={"is_exploitable": None},
+        ):
+            mock_validate.return_value = MagicMock(
+                data=analysis, quality=1.0, incomplete=False,
+            )
+            agent.analyze_vulnerability(v)
+
+        assert v.exploitable is True
+
+    def test_explicit_false_validation_verdict_still_demotes(self, tmp_path):
+        # Two-direction: an explicit not-exploitable verdict from
+        # deep validation still downgrades.
+        agent = self._agent(tmp_path)
+        v = self._make_vuln()
+        analysis = self._llm_analysis_response(is_exploitable=True)
+
+        agent.llm = MagicMock()
+        agent.llm.generate_structured.return_value = (analysis, None)
+
+        with patch(
+            "core.llm.response_validation.validate_structured_response",
+        ) as mock_validate, patch.object(
+            agent, "_tier1_pre_flight", return_value="inconclusive",
+        ), patch.object(
+            agent, "validate_dataflow",
+            return_value={"is_exploitable": False,
+                          "exploitability_confidence": 0.4},
+        ):
+            mock_validate.return_value = MagicMock(
+                data=analysis, quality=1.0, incomplete=False,
+            )
+            agent.analyze_vulnerability(v)
+
+        assert v.exploitable is False
 
     def test_no_check_proceeds_to_validate_dataflow(self, tmp_path):
         """`no_check` (no DB, no query, etc.) means the gate couldn't

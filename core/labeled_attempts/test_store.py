@@ -13,6 +13,7 @@ sys.path.insert(0, str(REPO))
 
 from core.labeled_attempts import (
     LabeledAttempt,
+    Outcome,
     SandboxEvidence,
     bundled_corpus_path,
     find_by_cwe,
@@ -36,7 +37,7 @@ def _make_attempt(
     finding_id: str = "FND-001",
     finding_signature: str = "deadbeef" * 4,
     cwe: str = "CWE-787",
-    outcome: str = "success",
+    outcome: Outcome = "success",
     timestamp: str = "2026-06-03T14:05:32+00:00",
     failure_mode: FailureMode | None = None,
 ) -> LabeledAttempt:
@@ -370,6 +371,48 @@ def test_find_by_finding_signature(project_dir):
     assert {r.finding_id for r in by_sig} == {"A", "B"}
 
 
+def test_find_by_finding_signature_reads_only_that_directory(
+        project_dir, monkeypatch):
+    # The layout keys records by <pool>/<signature>/, so the lookup
+    # must be a direct directory read — never a full-pool scan that
+    # re-parses every record of every finding.
+    from core.labeled_attempts import store as store_mod
+
+    SIG = "fafa" * 8
+    write(_make_attempt(finding_id="A", finding_signature=SIG),
+          project_dir=project_dir)
+    write(_make_attempt(finding_id="C", finding_signature="eeee" * 8),
+          project_dir=project_dir)
+
+    read: list[Path] = []
+    orig = store_mod._read_record
+
+    def _spy(record_file):
+        read.append(record_file)
+        return orig(record_file)
+    monkeypatch.setattr(store_mod, "_read_record", _spy)
+
+    by_sig = list(find_by_finding_signature(
+        SIG, project_dir=project_dir, include_bundled=False,
+    ))
+    assert {r.finding_id for r in by_sig} == {"A"}
+    assert read, "lookup read no files at all"
+    assert all(p.parent.name == SIG for p in read), (
+        "lookup touched records outside the signature directory"
+    )
+
+
+def test_find_by_finding_signature_refuses_non_signature_shapes(project_dir):
+    SIG = "fafa" * 8
+    write(_make_attempt(finding_id="A", finding_signature=SIG),
+          project_dir=project_dir)
+    # Not legal signatures (and unsafe as path segments): yield nothing.
+    for bogus in ("../" + SIG, "not-hex!", "", "zz" * 8):
+        assert list(find_by_finding_signature(
+            bogus, project_dir=project_dir, include_bundled=False,
+        )) == []
+
+
 # --------------------------------------------------------------------------
 # Resilience — corrupt records skipped, not fatal
 # --------------------------------------------------------------------------
@@ -668,6 +711,94 @@ def test_write_atomic_with_existing_symlink_refuses_open(tmp_path):
     # The security property is that the *victim* file is never modified.
     _write_atomic(link, "{}")
     assert victim.read_text() == "untouched"
+
+
+# --------------------------------------------------------------------------
+# Adversarial: short kernel writes must not truncate records
+# --------------------------------------------------------------------------
+
+
+def test_short_kernel_writes_do_not_truncate_record(
+    tmp_path, monkeypatch,
+):
+    """os.write may return a short count (signal interruption, quota
+    edge). The writer must loop until the whole payload is on disk —
+    a single unchecked write would silently persist a truncated JSON
+    document that readers then skip as corrupt, losing the record."""
+    import os
+
+    from core.labeled_attempts.store import _write_atomic
+
+    real_open = os.open
+    real_write = os.write
+    tracked: set[int] = set()
+
+    def tracking_open(path, flags, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        fd = real_open(path, flags, *args, **kwargs)
+        if str(tmp_path) in str(path):
+            tracked.add(fd)
+        return fd
+
+    def short_write(fd, data):  # noqa: ANN001, ANN202
+        if fd in tracked:
+            # Kernel accepts at most 7 bytes per call.
+            return real_write(fd, bytes(memoryview(data)[:7]))
+        return real_write(fd, data)
+
+    monkeypatch.setattr(os, "open", tracking_open)
+    monkeypatch.setattr(os, "write", short_write)
+
+    payload = '{"k": "' + "x" * 100 + '"}'
+    out = _write_atomic(tmp_path / "sandbox-x-aaaaaa.json", payload)
+
+    monkeypatch.undo()
+    assert out.read_text(encoding="utf-8") == payload
+    # No stage-file debris survives a successful publish.
+    assert [p.name for p in tmp_path.iterdir()] == [out.name]
+
+
+def test_failed_write_leaves_no_partial_at_final_name(
+    tmp_path, monkeypatch,
+):
+    """A write that dies midway (short write, then ENOSPC) must raise
+    AND leave nothing at the final name — readers scanning the pool
+    must never observe a partially-written record under a
+    publishable filename."""
+    import os
+
+    from core.labeled_attempts.store import _write_atomic
+
+    real_open = os.open
+    real_write = os.write
+    tracked: set[int] = set()
+    calls = {"n": 0}
+
+    def tracking_open(path, flags, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        fd = real_open(path, flags, *args, **kwargs)
+        if str(tmp_path) in str(path):
+            tracked.add(fd)
+        return fd
+
+    def dying_write(fd, data):  # noqa: ANN001, ANN202
+        if fd in tracked:
+            if calls["n"] == 0:
+                calls["n"] += 1
+                return real_write(fd, bytes(memoryview(data)[:7]))
+            raise OSError(28, "No space left on device")
+        return real_write(fd, data)
+
+    monkeypatch.setattr(os, "open", tracking_open)
+    monkeypatch.setattr(os, "write", dying_write)
+
+    final = tmp_path / "sandbox-x-aaaaaa.json"
+    with pytest.raises(OSError):
+        _write_atomic(final, '{"k": "' + "x" * 100 + '"}')
+
+    monkeypatch.undo()
+    assert not final.exists()
+    # No partial record under ANY name — the failed stage file is
+    # cleaned up too.
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_missing_oracle_record_is_skipped(project_dir):

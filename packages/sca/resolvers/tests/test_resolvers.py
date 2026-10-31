@@ -356,7 +356,6 @@ def test_pip_no_system_pipcompile_falls_back_to_venv(
     pipeline (which always works given network access to PyPI)."""
     (tmp_path / "requirements.txt").write_text(
         "django>=4.0\n", encoding="utf-8")
-    venv_dir = _resolver_venv_dir(tmp_path)
     plan = [
         (lambda c: c == ["pip", "--version"],
          _FakeProc(returncode=0, stdout="pip 23.0")),
@@ -369,14 +368,9 @@ def test_pip_no_system_pipcompile_falls_back_to_venv(
          _FakeProc(returncode=0, stdout="django==4.2.10\n")),
     ]
     _patch_run_with_callable(monkeypatch, plan)
-    try:
-        res = PipResolver().dry_run(tmp_path)
-        assert res.success is True, f"got: {res.error!r}"
-        assert b"django==4.2.10" in (res.proposed_lockfile or b"")
-    finally:
-        if venv_dir.exists():
-            import shutil
-            shutil.rmtree(venv_dir, ignore_errors=True)
+    res = PipResolver().dry_run(tmp_path)
+    assert res.success is True, f"got: {res.error!r}"
+    assert b"django==4.2.10" in (res.proposed_lockfile or b"")
 
 
 def test_pip_resolver_failure_propagates_via_venv(
@@ -387,7 +381,6 @@ def test_pip_resolver_failure_propagates_via_venv(
     """
     (tmp_path / "requirements.txt").write_text(
         "impossible>=99\n", encoding="utf-8")
-    venv_dir = _resolver_venv_dir(tmp_path)
     plan = [
         (lambda c: c == ["pip", "--version"],
          _FakeProc(returncode=0, stdout="pip 23.0")),
@@ -401,37 +394,19 @@ def test_pip_resolver_failure_propagates_via_venv(
          _FakeProc(returncode=2, stderr="Cannot satisfy in venv too")),
     ]
     _patch_run_with_callable(monkeypatch, plan)
-    try:
-        res = PipResolver().dry_run(tmp_path)
-        assert res.success is False
-        # Venv pipeline's error surfaces (the system attempt's error
-        # is logged at debug, not propagated).
-        assert "Cannot satisfy" in (res.error or "")
-    finally:
-        if venv_dir.exists():
-            import shutil
-            shutil.rmtree(venv_dir, ignore_errors=True)
+    res = PipResolver().dry_run(tmp_path)
+    assert res.success is False
+    # Venv pipeline's error surfaces (the system attempt's error
+    # is logged at debug, not propagated).
+    assert "Cannot satisfy" in (res.error or "")
 
 
-def _make_pep668_plan(venv_dir: Path, lockfile_text: str = "django==4.2.10\n"):
-    """Build a fake-run plan that simulates the PEP 668 fallback path.
-
-    The venv-create matcher creates ``<venv>/bin/python`` on the disk so
-    the resolver's existence check passes when it runs after the mock
-    venv command. ``shutil.rmtree`` may have wiped a pre-existing dir
-    just before, so creation has to happen inside the matcher.
-    """
+def _make_pep668_plan(lockfile_text: str = "django==4.2.10\n"):
+    """Build a fake-run plan that simulates the PEP 668 fallback path."""
     pep668_stderr = (
         "error: externally-managed-environment\n"
         "× This environment is externally managed\n"
     )
-
-    def _create_files_then_succeed(cmd):
-        bin_dir = venv_dir / "bin"
-        bin_dir.mkdir(parents=True, exist_ok=True)
-        (bin_dir / "python").touch()
-        (bin_dir / "pip-compile").touch()
-        return _FakeProc(returncode=0)
 
     return [
         (lambda c: c == ["pip", "--version"],
@@ -471,13 +446,24 @@ def _patch_run_with_callable(monkeypatch, plan):
     return calls
 
 
-def _resolver_venv_dir(project_dir: Path) -> Path:
-    """Compute the venv path the resolver would use for ``project_dir``.
+def _recording_mkdtemp(monkeypatch) -> list[Path]:
+    """Record every venv dir the resolver mkdtemps (they are
+    unpredictable by design, so tests observe rather than predict)."""
+    import tempfile
 
-    Mirrors ``PipResolver._venv_dir`` so tests can target the same
-    location for pre-mocking and cleanup assertions.
-    """
-    return PipResolver()._venv_dir(project_dir)
+    from packages.sca.resolvers import pip as pip_mod
+
+    created: list[Path] = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def recording(*args, **kwargs):
+        d = real_mkdtemp(*args, **kwargs)
+        if Path(d).name.startswith("raptor-sca-venv-"):
+            created.append(Path(d))
+        return d
+
+    monkeypatch.setattr(pip_mod.tempfile, "mkdtemp", recording)
+    return created
 
 
 def test_pip_compile_pep668_falls_back_to_venv(
@@ -487,22 +473,12 @@ def test_pip_compile_pep668_falls_back_to_venv(
     an ephemeral venv and succeeds."""
     (tmp_path / "requirements.txt").write_text(
         "django>=4.0\n", encoding="utf-8")
-    venv_dir = _resolver_venv_dir(tmp_path)
-    _patch_run_with_callable(monkeypatch, _make_pep668_plan(venv_dir))
-    try:
-        res = PipResolver().dry_run(tmp_path)
-        assert res.success is True, \
-            f"expected success, got error: {res.error!r}"
-        assert res.proposed_lockfile is not None
-        assert b"django==4.2.10" in res.proposed_lockfile
-    finally:
-        # Test-side cleanup — the resolver's cleanup is inside _run
-        # which is monkeypatched, so the dir we pre-created may
-        # outlive the test if the resolver's finally clause never
-        # ran a real shutil.rmtree.
-        if venv_dir.exists():
-            import shutil
-            shutil.rmtree(venv_dir, ignore_errors=True)
+    _patch_run_with_callable(monkeypatch, _make_pep668_plan())
+    res = PipResolver().dry_run(tmp_path)
+    assert res.success is True, \
+        f"expected success, got error: {res.error!r}"
+    assert res.proposed_lockfile is not None
+    assert b"django==4.2.10" in res.proposed_lockfile
 
 
 def test_pep668_fallback_cleans_up_venv(
@@ -512,16 +488,90 @@ def test_pep668_fallback_cleans_up_venv(
     finishes, success or failure."""
     (tmp_path / "requirements.txt").write_text(
         "django>=4.0\n", encoding="utf-8")
-    venv_dir = _resolver_venv_dir(tmp_path)
-    _patch_run_with_callable(monkeypatch, _make_pep668_plan(venv_dir))
+    created = _recording_mkdtemp(monkeypatch)
+    _patch_run_with_callable(monkeypatch, _make_pep668_plan())
 
     PipResolver().dry_run(tmp_path)
 
-    # Venv directory should be removed by the resolver's finally clause.
-    assert not venv_dir.exists(), (
-        f"venv leaked at {venv_dir}; contents: "
-        f"{list(venv_dir.rglob('*')) if venv_dir.exists() else '(gone)'}"
-    )
+    # The resolver created exactly one venv reservation and its
+    # finally clause removed it, success or failure.
+    assert len(created) == 1
+    venv_dir = created[0]
+    assert not venv_dir.exists(), f"venv leaked at {venv_dir}"
+
+
+def test_pip_venv_dir_is_unpredictable_and_private(tmp_path: Path) -> None:
+    """The venv path must never be derivable by a co-resident user
+    (the old /tmp/raptor-sca-venv-<pid>-<hash> name was pre-plantable
+    in shared-/tmp sandbox lanes): mkdtemp reserves an unpredictable
+    directory, mode 0700, distinct per call."""
+    import shutil
+    import stat
+
+    r = PipResolver()
+    d1 = r._venv_dir()
+    d2 = r._venv_dir()
+    try:
+        assert d1 != d2
+        for d in (d1, d2):
+            assert d.is_dir()
+            assert d.name.startswith("raptor-sca-venv-")
+            mode = stat.S_IMODE(d.stat().st_mode)
+            assert mode == 0o700, f"expected 0700, got {oct(mode)}"
+    finally:
+        shutil.rmtree(d1, ignore_errors=True)
+        shutil.rmtree(d2, ignore_errors=True)
+
+
+def test_pip_batch_venv_uses_mkdtemp_and_cleans_up(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """The batch pipeline shares the single-venv path discipline:
+    unpredictable mkdtemp name threaded into the script, host-side
+    reservation removed when the sandbox call returns."""
+    projects = []
+    for name in ("proj-a", "proj-b"):
+        proj = tmp_path / name
+        proj.mkdir()
+        (proj / "requirements.txt").write_text("django>=4.0\n",
+                                               encoding="utf-8")
+        projects.append(proj)
+    created = _recording_mkdtemp(monkeypatch)
+    scripts: list[str] = []
+
+    def fake_run(cmd, **kwargs):
+        if cmd[0] == "sh":
+            scripts.append(cmd[2])
+            # Markers carry a per-invocation random nonce — recover
+            # it from the generated script the way the real shell
+            # output would echo it.
+            import re as _re
+            m = _re.search(r"===RAPTOR_BATCH_([0-9a-f]+)_OUT_0===",
+                           cmd[2])
+            assert m, "nonce marker missing from batch script"
+            n = m.group(1)
+            return _FakeProc(
+                returncode=0,
+                stdout=(f"===RAPTOR_BATCH_{n}_OUT_0===\n"
+                        "django==4.2.10\n"
+                        f"===RAPTOR_BATCH_{n}_RC_0===\n0\n"
+                        f"===RAPTOR_BATCH_{n}_ERR_0===\n"
+                        f"===RAPTOR_BATCH_{n}_OUT_1===\n"
+                        "django==4.2.10\n"
+                        f"===RAPTOR_BATCH_{n}_RC_1===\n0\n"
+                        f"===RAPTOR_BATCH_{n}_ERR_1===\n"
+                        f"===RAPTOR_BATCH_{n}_END===\n"),
+            )
+        return _FakeProc(returncode=0, stdout="pip 23.0")
+
+    _patch_exec(monkeypatch, fake_run)
+    results = PipResolver().dry_run_batch(projects, common_root=tmp_path)
+    assert len(results) == 2
+    assert all(r.success for r in results)
+    assert len(created) == 1
+    venv_dir = created[0]
+    assert scripts and str(venv_dir) in scripts[0]
+    assert not venv_dir.exists(), f"batch venv leaked at {venv_dir}"
 
 
 # ---------------------------------------------------------------------------
@@ -1276,11 +1326,11 @@ def test_pip_batch_script_exports_only_binary(tmp_path):
     per-manifest pip-compile subshell inherits the wheels-only policy."""
     manifests = [(tmp_path, Path("."), Path("requirements.txt"))]
     venv_dir = Path("/tmp/raptor-test-venv")
-    script = PipResolver()._build_batch_script(venv_dir, manifests)
+    script = PipResolver()._build_batch_script(venv_dir, manifests, "ab12")
     assert "export PIP_ONLY_BINARY=:all:; " in script
     script_sdist = PipResolver(
         allow_sdist_builds=True,
-    )._build_batch_script(venv_dir, manifests)
+    )._build_batch_script(venv_dir, manifests, "ab12")
     assert "PIP_ONLY_BINARY" not in script_sdist
 
 
@@ -1301,3 +1351,159 @@ def test_pip_set_allow_sdist_builds_process_default():
     finally:
         pip_mod.set_allow_sdist_builds(False)
     assert r.allow_sdist_builds is False
+
+
+def test_yarn_env_overlays_safe_env(monkeypatch, tmp_path) -> None:
+    """The Berry scripts-off variable must OVERLAY the allowlisted
+    safe environment — a bare one-key dict replaced get_safe_env()
+    wholesale (the sandbox passes caller env verbatim), dropping
+    PATH/locale and bypassing the repo's one child-env chokepoint."""
+    from packages.sca.resolvers import yarn as yarn_mod
+
+    seen: dict = {}
+
+    class _Proc:
+        returncode = 0
+        stdout = "{}"
+        stderr = ""
+
+    def _fake_run(cmd, **kw):
+        seen["env"] = kw.get("env")
+        return _Proc()
+
+    monkeypatch.setattr(yarn_mod, "_run", _fake_run)
+    monkeypatch.setattr(yarn_mod, "_check_tool", lambda *a, **k: True)
+    monkeypatch.setattr(
+        yarn_mod.YarnResolver, "_detect_major_version",
+        lambda self=None: 3, raising=False)
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "yarn.lock").write_text("", encoding="utf-8")
+    resolver = yarn_mod.YarnResolver()
+    resolver.dry_run(tmp_path)
+    env = seen.get("env")
+    assert env is not None
+    assert env.get("YARN_ENABLE_SCRIPTS") == "false"
+    assert "PATH" in env, "safe-env base missing — bare dict again"
+
+
+def test_pip_batch_markers_unforgeable_from_manifest_output(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """A hostile manifest can make pip-compile ECHO chosen text — a
+    plaintext '===RAPTOR_BATCH_OUT_1===' forged inside project 0's
+    output section used to shift every following section, attributing
+    attacker-chosen 'lockfiles' to other manifests. With the random
+    per-invocation nonce the forged legacy marker is inert data."""
+    projects = []
+    for name in ("victim-a", "victim-b"):
+        proj = tmp_path / name
+        proj.mkdir()
+        (proj / "requirements.txt").write_text("django>=4.0\n",
+                                               encoding="utf-8")
+        projects.append(proj)
+
+    def fake_run(cmd, **kwargs):
+        if cmd[0] == "sh":
+            import re as _re
+            m = _re.search(r"===RAPTOR_BATCH_([0-9a-f]+)_OUT_0===",
+                           cmd[2])
+            assert m
+            n = m.group(1)
+            # Project 0's output embeds a forged LEGACY marker plus a
+            # poisoned lockfile aimed at project 1's slot.
+            return _FakeProc(
+                returncode=0,
+                stdout=(f"===RAPTOR_BATCH_{n}_OUT_0===\n"
+                        "django==4.2.10\n"
+                        "===RAPTOR_BATCH_OUT_1===\n"      # forged
+                        "evil==6.6.6\n"
+                        f"===RAPTOR_BATCH_{n}_RC_0===\n0\n"
+                        f"===RAPTOR_BATCH_{n}_ERR_0===\n"
+                        f"===RAPTOR_BATCH_{n}_OUT_1===\n"
+                        "django==4.2.10\n"
+                        f"===RAPTOR_BATCH_{n}_RC_1===\n0\n"
+                        f"===RAPTOR_BATCH_{n}_ERR_1===\n"
+                        f"===RAPTOR_BATCH_{n}_END===\n"),
+            )
+        return _FakeProc(returncode=0, stdout="pip 23.0")
+
+    _patch_exec(monkeypatch, fake_run)
+    results = PipResolver().dry_run_batch(projects, common_root=tmp_path)
+    assert len(results) == 2
+    assert all(r.success for r in results)
+    # Project 1's lockfile is its own — never the forged payload.
+    lock1 = (results[1].proposed_lockfile or b"").decode(
+        "utf-8", errors="replace")
+    assert "evil==6.6.6" not in lock1
+    assert "django==4.2.10" in lock1
+    # The forged marker stays inside project 0's data.
+    lock0 = (results[0].proposed_lockfile or b"").decode(
+        "utf-8", errors="replace")
+    assert "RAPTOR_BATCH_OUT_1" in lock0 or "evil" in lock0
+
+
+# ---------------------------------------------------------------------------
+# gomod hostile-tree walk
+# ---------------------------------------------------------------------------
+
+
+def test_gomod_copy_does_not_follow_directory_symlinks(tmp_path):
+    """A directory symlink in the scanned (hostile) tree must not be
+    traversed — pre-3.13 ``rglob`` recursed through it, pulling
+    regular ``.go`` files from OUTSIDE the project into the resolve
+    input (host-filesystem walk / go.sum encoding host-module facts)."""
+    import os
+
+    from packages.sca.resolvers.gomod import _copy_go_sources
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.go").write_text("package secret\n")
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "main.go").write_text("package main\n")
+    os.symlink(outside, project / "linked")
+
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    _copy_go_sources(project, dest)
+    assert (dest / "main.go").exists()
+    assert not (dest / "linked").exists()
+    assert "secret.go" not in [p.name for p in dest.rglob("*")]
+
+
+def test_gomod_copy_terminates_on_symlink_cycle(tmp_path):
+    """A self-referential directory symlink must not hang the cascade
+    worker — the walk terminates and the regular files still copy."""
+    import os
+
+    from packages.sca.resolvers.gomod import _copy_go_sources
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "main.go").write_text("package main\n")
+    os.symlink(project, project / "loop")
+
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    _copy_go_sources(project, dest)
+    assert (dest / "main.go").exists()
+    assert not (dest / "loop").exists()
+
+
+def test_gomod_copy_prunes_skip_dirs_from_traversal(tmp_path):
+    """vendor/ and friends are pruned from TRAVERSAL, not just from
+    the copied paths."""
+    from packages.sca.resolvers.gomod import _copy_go_sources
+
+    project = tmp_path / "project"
+    (project / "vendor" / "dep").mkdir(parents=True)
+    (project / "vendor" / "dep" / "dep.go").write_text("package dep\n")
+    (project / "pkg").mkdir()
+    (project / "pkg" / "ok.go").write_text("package pkg\n")
+
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    _copy_go_sources(project, dest)
+    assert (dest / "pkg" / "ok.go").exists()
+    assert not (dest / "vendor").exists()

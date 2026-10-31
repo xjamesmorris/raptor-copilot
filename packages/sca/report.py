@@ -45,6 +45,8 @@ from urllib.parse import urlparse
 from core.security.log_sanitisation import escape_nonprintable
 from core.security.prompt_output_sanitise import sanitise_string
 
+from ._md import inline_code, neutralize_inline
+
 from .findings import severity_rank
 from .models import (
     REACHABILITY_LABELS,
@@ -89,16 +91,20 @@ def _render_untrusted_url(url: str) -> str:
 
     http/https URLs become ``<url>`` autolinks (non-printables
     escaped); every other scheme is demoted to inert code text —
-    visible for triage, never clickable.
+    visible for triage, never clickable. A ``<``/``>`` or whitespace
+    INSIDE the URL would close the autolink early and let the tail
+    render as live markdown — such URLs are demoted to code text too.
     """
     try:
         scheme = (urlparse(url).scheme or "").lower()
     except ValueError:
         scheme = ""
     text = escape_nonprintable(url)
-    if scheme in _LINK_SCHEME_ALLOWLIST:
+    if (scheme in _LINK_SCHEME_ALLOWLIST
+            and not any(c in text for c in "<>")
+            and not any(c.isspace() for c in text)):
         return f"<{text}>"
-    return "`" + text.replace("`", "'") + "`"
+    return inline_code(url)
 
 # Severity → display label (Title Case per CLAUDE.md).
 _SEV_LABEL: dict[str, str] = {
@@ -213,7 +219,7 @@ def _render_parse_failures_section(failures) -> str:
         # parser error message; manifest paths are filesystem-
         # local and operator-supplied so they go through as-is.
         reason = sanitise_string(f.reason, max_chars=_DETAIL_MAX_CHARS)
-        lines.append(f"- `{f.path}` — {reason}")
+        lines.append(f"- {inline_code(f.path)} — {reason}")
     lines.append("")
     return "\n".join(lines)
 
@@ -228,9 +234,7 @@ def _render_license_section(findings) -> str:
         # header): defang control bytes / autofetch markup and
         # neutralise backticks so the value can't escape its code
         # span in the rendered report.
-        spdx = sanitise_string(
-            f.spdx or "(none)", max_chars=120,
-        ).replace("`", "'")
+        spdx = sanitise_string(f.spdx or "(none)", max_chars=120)
         kind_label = {
             "license_denied": "Denied",
             "license_warned": "Warned",
@@ -239,10 +243,10 @@ def _render_license_section(findings) -> str:
         }.get(f.kind, f.kind)
         lines.append(
             f"### {kind_label} — "
-            f"{dep.ecosystem}:{escape_nonprintable(dep.name)}"
-            f"@{escape_nonprintable(dep.version or '*')}"
+            f"{dep.ecosystem}:{neutralize_inline(dep.name)}"
+            f"@{neutralize_inline(dep.version or '*')}"
         )
-        lines.append(f"- License: `{spdx}`")
+        lines.append(f"- License: {inline_code(spdx)}")
         lines.append(
             f"- Severity: "
             f"**{_SEV_LABEL.get(f.severity, f.severity.title())}**"
@@ -250,7 +254,7 @@ def _render_license_section(findings) -> str:
         lines.append(
             f"- Detail: {sanitise_string(f.detail, max_chars=_DETAIL_MAX_CHARS)}"
         )
-        lines.append(f"- Source: `{dep.declared_in}`")
+        lines.append(f"- Source: {inline_code(dep.declared_in)}")
         lines.append("")
     return "\n".join(lines)
 
@@ -285,7 +289,7 @@ def _render_header(
         # value comes from the scanned tree, so it's defanged like
         # any other target-controlled string.
         spdx = sanitise_string(project_license, max_chars=120)
-        header += f"_Project license: `{spdx}`_\n"
+        header += f"_Project license: {inline_code(spdx)}_\n"
     return header
 
 
@@ -316,12 +320,12 @@ def _render_summary(
         severity_counts[f.severity] += 1
         if f.in_kev:
             kev_count += 1
-    for f in supply_chain_findings:
+    for f in supply_chain_findings:  # type: ignore[assignment]
         if getattr(f, "suppressed", False):
             suppressed_count += 1
             continue
         severity_counts[f.severity] += 1
-    for f in hygiene_findings:
+    for f in hygiene_findings:  # type: ignore[assignment]
         if getattr(f, "suppressed", False):
             suppressed_count += 1
             continue
@@ -585,7 +589,7 @@ def _render_one_vuln_group(
     if omit_dep_shared or len(paths) <= 1:
         return body
     src_lines = [f"- Sources ({len(paths)}):"]
-    src_lines.extend(f"  - `{escape_nonprintable(p)}`" for p in paths)
+    src_lines.extend(f"  - {inline_code(p)}" for p in paths)
     # Insert sources bullet right after the head line so it's near
     # the top of the section rather than buried at the bottom.
     head, _, rest = body.partition("\n")
@@ -601,26 +605,28 @@ def _render_one_vuln(
     dep = f.dependency
     primary: Advisory | None = f.advisories[0] if f.advisories else None
     label = _SEV_LABEL.get(f.severity, f.severity.title())
-    # Dep name comes from the operator's manifest — sanitise defensively
-    # against ANSI / BIDI / control-character smuggling in package names.
+    # Dep name / version / fixed_version come from the scanned
+    # manifest and OSV records — inline-neutralised so printable
+    # markdown metacharacters (link/image syntax, raw HTML) render
+    # inert in the heading, not just ANSI/BIDI control bytes.
     heading = "#" * max(3, heading_level)
     head_parts = [
-        (f"{heading} {label} — {escape_nonprintable(dep.name)} "
-         f"{escape_nonprintable(dep.version or '*')}"),
+        (f"{heading} {label} — {neutralize_inline(dep.name)} "
+         f"{neutralize_inline(dep.version or '*')}"),
     ]
     if f.fixed_version:
-        head_parts.append(f" → fix: {escape_nonprintable(f.fixed_version)}")
+        head_parts.append(f" → fix: {neutralize_inline(f.fixed_version)}")
     if f.suppressed:
-        reason = escape_nonprintable(f.suppression_reason or 'no reason')
+        reason = neutralize_inline(f.suppression_reason or 'no reason')
         head_parts.append(f" _(suppressed: {reason})_")
     head = "".join(head_parts)
 
     bullets: list[str] = []
     if primary is not None:
-        aliases = ", ".join(escape_nonprintable(a) for a in primary.aliases[:3]) \
+        aliases = ", ".join(neutralize_inline(a) for a in primary.aliases[:3]) \
             if primary.aliases else "—"
         bullets.append(
-            f"- Advisory: **{escape_nonprintable(primary.osv_id)}** "
+            f"- Advisory: **{neutralize_inline(primary.osv_id)}** "
             f"(aliases: {aliases})"
         )
         if primary.summary:
@@ -653,8 +659,7 @@ def _render_one_vuln(
             # non-printables and keep code-span rendering intact.
             msf_count = len(ev.msf_modules)
             shown = ", ".join(
-                "`" + escape_nonprintable(m).replace("`", "'") + "`"
-                for m in ev.msf_modules[:2]
+                inline_code(m) for m in ev.msf_modules[:2]
             )
             extra = f" (+{msf_count - 2} more)" if msf_count > 2 else ""
             bullets.append(f"- Metasploit: {shown}{extra}")
@@ -669,9 +674,17 @@ def _render_one_vuln(
 
     if not omit_source:
         if dep.is_lockfile:
-            bullets.append(f"- Source: lockfile (`{escape_nonprintable(str(dep.declared_in))}`)")
+            bullets.append(
+                f"- Source: lockfile ({inline_code(dep.declared_in)})")
         else:
-            bullets.append(f"- Source: manifest (`{escape_nonprintable(str(dep.declared_in))}`)")
+            bullets.append(
+                f"- Source: manifest ({inline_code(dep.declared_in)})")
+        # Aliased install — the heading shows the INSTALLED package
+        # (what the advisory applies to); this line shows the manifest
+        # spelling operators will grep for.
+        if dep.alias_name:
+            bullets.append(
+                f"- Declared as npm alias: {inline_code(dep.alias_name)}")
         # Source-specific context — Dockerfile FROM rows surface
         # the base image + stage so operators can group findings
         # by build stage in their review.
@@ -679,9 +692,16 @@ def _render_one_vuln(
             image = dep.source_extra.get("image")
             stage = dep.source_extra.get("stage_name")
             if image:
-                stage_part = f" stage `{stage}`" if stage else ""
+                # ``image`` / ``stage`` come straight from the scanned
+                # repo's FROM line — same treatment as alias_name
+                # above: defang non-printables and neutralise
+                # backticks so the value cannot escape its code span
+                # and inject markdown into the report.
+                stage_part = (
+                    f" stage {inline_code(stage)}" if stage else ""
+                )
                 bullets.append(
-                    f"- Base image: `{image}`{stage_part}"
+                    f"- Base image: {inline_code(image)}{stage_part}"
                 )
     # Dep-level lines (Direct / scope / Reachability / Version-
     # match / Parser) are identical for every advisory on the same
@@ -708,7 +728,7 @@ def _render_one_vuln(
         )
         reach_line = (f"- Reachability: {reach_label} "
                        f"(confidence {f.reachability.confidence.level}"
-                       + (f" — {escape_nonprintable(reach_reason)}"
+                       + (f" — {neutralize_inline(reach_reason)}"
                           if reach_reason else "")
                        + ")")
         bullets.append(reach_line)
@@ -719,13 +739,13 @@ def _render_one_vuln(
         vmc_reason = f.version_match_confidence.reason
         bullets.append(
             f"- Version match: {f.version_match_confidence.level}"
-            + (f" — {escape_nonprintable(vmc_reason)}"
+            + (f" — {neutralize_inline(vmc_reason)}"
                if vmc_reason else "")
         )
         pc_reason = dep.parser_confidence.reason
         bullets.append(
             f"- Parser: {dep.parser_confidence.level}"
-            + (f" — {escape_nonprintable(pc_reason)}"
+            + (f" — {neutralize_inline(pc_reason)}"
                if pc_reason else "")
         )
 
@@ -771,14 +791,21 @@ def _render_one_vuln(
 
     detail = (primary.details if primary else "") or ""
     if detail:
-        from core.security.prompt_envelope import _strip_autofetch_markup
         clipped = detail.strip()
         if len(clipped) > _DETAIL_TRUNCATE:
             clipped = clipped[:_DETAIL_TRUNCATE].rstrip() + (
                 f"… (truncated; see findings.json `{f.finding_id}`)"
             )
-        clipped = _strip_autofetch_markup(clipped)
-        clipped = escape_nonprintable(clipped)
+        # ``sanitise_string``: autofetch strip + line-leading markdown
+        # defang (a forged ``# Findings`` heading would render as a
+        # report section) + non-printable escape, newline-preserving.
+        clipped = sanitise_string(clipped, max_chars=_DETAIL_TRUNCATE * 2)
+        # This block is embedded inside ``<details>``: a raw
+        # ``</details>`` in the (attacker-writable) advisory text
+        # closes the real collapsed block and the remainder renders as
+        # if raptor-sca produced it — escape ALL raw HTML angle
+        # brackets before embedding.
+        clipped = clipped.replace("<", "&lt;").replace(">", "&gt;")
         bullets.append("\n<details><summary>Advisory detail</summary>\n\n"
                        f"{clipped}\n\n</details>")
 
@@ -825,11 +852,10 @@ def _group_kinded(findings: Sequence) -> list[list]:
     the same fields we key on, so one helper covers both.
 
     ``detail`` is part of the key — without it kind-level groupings
-    over-collapse: ``gha_action_ref_drift`` findings on different
-    workflow line:action pairs all share
-    ``(kind, ecosystem, '<github-actions>', None)`` and would
-    otherwise be reported as one section showing only the first
-    detail. Identical-detail findings (e.g. the same ``loose_pin``
+    over-collapse: ``gha_action_ref_drift`` findings for the same
+    action referenced on different workflow lines all share
+    ``(kind, 'GitHub Actions', action, ref)`` and would otherwise be
+    reported as one section showing only the first detail. Identical-detail findings (e.g. the same ``loose_pin``
     detail repeated across N manifests) still collapse to a single
     section with a Sources list — that's the duplication we
     actually want to remove. Ordering preserves first-seen so the
@@ -865,7 +891,7 @@ def _render_one_kinded_group(group: Sequence) -> str:
     label = _SEV_LABEL.get(primary.severity, primary.severity.title())
     head = (
         f"### {label} — {primary.kind}: "
-        f"{dep.ecosystem}:{escape_nonprintable(dep.name)}"
+        f"{dep.ecosystem}:{neutralize_inline(dep.name)}"
     )
     # Pick the strongest confidence in the group.
     confidence_levels = ["low", "medium", "high"]
@@ -895,10 +921,12 @@ def _render_one_kinded_group(group: Sequence) -> str:
                 if r not in escalation_reasons:
                     escalation_reasons.append(str(r))
     if len(escalation_reasons) == 1:
-        bullets.append(f"- Escalated: {escape_nonprintable(escalation_reasons[0])}")
+        bullets.append(
+            f"- Escalated: {neutralize_inline(escalation_reasons[0])}")
     elif escalation_reasons:
         bullets.append("- Escalated:")
-        bullets.extend(f"  - {escape_nonprintable(r)}" for r in escalation_reasons)
+        bullets.extend(
+            f"  - {neutralize_inline(r)}" for r in escalation_reasons)
 
     # Switch to a list when there are MULTIPLE distinct source
     # paths. A group of N findings that all share one declared_in
@@ -907,15 +935,15 @@ def _render_one_kinded_group(group: Sequence) -> str:
     # need to be told "Sources (1):" when there's just one.
     paths = sorted({str(f.dependency.declared_in) for f in group})
     if len(paths) == 1:
-        bullets.append(f"- Source: `{paths[0]}`")
+        bullets.append(f"- Source: {inline_code(paths[0])}")
     else:
         bullets.append(f"- Sources ({len(paths)}):")
-        bullets.extend(f"  - `{escape_nonprintable(p)}`" for p in paths)
+        bullets.extend(f"  - {inline_code(p)}" for p in paths)
 
     if best_conf.reason:
         bullets.append(
             f"- Confidence: {best_conf.level} "
-            f"({escape_nonprintable(best_conf.reason)})"
+            f"({neutralize_inline(best_conf.reason)})"
         )
     else:
         bullets.append(f"- Confidence: {best_conf.level}")

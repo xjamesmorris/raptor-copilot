@@ -14,6 +14,16 @@ import pytest
 from core.inventory.dead_scope import detect_dead_scopes
 
 
+def _requires_lexical_grammar(language: str) -> None:
+    """Positive-detection tests need the tokenizer-grade blanker's
+    grammar; without it the detector fails closed (no ranges), which
+    the degradation tests pin separately."""
+    from core.inventory import lexical_view
+
+    if lexical_view._language_for(language) is None:
+        pytest.skip(f"{language} tree-sitter grammar not installed")
+
+
 # ---------------------------------------------------------------------------
 # Python
 # ---------------------------------------------------------------------------
@@ -78,6 +88,7 @@ def test_python_syntax_error_returns_empty():
 
 
 def test_js_if_false_block_detected():
+    _requires_lexical_grammar("javascript")
     src = (
         "function alive() { return 1; }\n"
         "if (false) {\n"
@@ -89,6 +100,7 @@ def test_js_if_false_block_detected():
 
 
 def test_js_if_zero_detected():
+    _requires_lexical_grammar("javascript")
     src = "if (0) {\n  bad();\n}\n"
     assert (1, 3) in detect_dead_scopes("javascript", src)
 
@@ -108,6 +120,7 @@ def test_js_commented_if_false_not_detected():
 
 
 def test_js_template_literals_do_not_break_brace_match():
+    _requires_lexical_grammar("javascript")
     src = (
         "if (false) {\n"
         "  function shell(input) {\n"
@@ -124,6 +137,7 @@ def test_js_template_literals_do_not_break_brace_match():
 
 
 def test_js_strings_do_not_break_brace_match():
+    _requires_lexical_grammar("javascript")
     src = (
         "throw new Error('not loadable');\n"
         "if (false) {\n"
@@ -138,8 +152,24 @@ def test_js_strings_do_not_break_brace_match():
 
 
 def test_typescript_alias_detected():
+    _requires_lexical_grammar("typescript")
     src = "if (false) {\n  bad();\n}\n"
     assert detect_dead_scopes("typescript", src) == [(1, 3)]
+
+
+@pytest.mark.parametrize("language", ["typescript", "tsx"])
+def test_ts_template_literal_type_if_false_does_not_range(language):
+    # Type-level template literal text is compile-time-erased; a
+    # dead-guard shape inside it must not range live code dead.
+    _requires_lexical_grammar(language)
+    src = (
+        "type T = `\n"
+        "if (false) {\n"
+        "}\n"
+        "`;\n"
+        "function live() { return 1; }\n"
+    )
+    assert detect_dead_scopes(language, src) == []
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +178,7 @@ def test_typescript_alias_detected():
 
 
 def test_rust_cfg_any_empty_gates_fn():
+    _requires_lexical_grammar("rust")
     src = (
         "#[cfg(any())]\n"
         "fn dead_rs() {\n"
@@ -164,6 +195,7 @@ def test_rust_cfg_any_empty_gates_fn():
 
 
 def test_rust_if_false_block_detected():
+    _requires_lexical_grammar("rust")
     src = (
         "fn f() {\n"
         "    if false {\n"
@@ -214,6 +246,7 @@ def test_rust_cfg_on_const_does_not_grab_later_fn():
 
 
 def test_rust_cfg_chained_attrs_then_fn():
+    _requires_lexical_grammar("rust")
     # cfg + other attributes + visibility qualifiers still resolve to
     # the gated fn.
     src = (
@@ -228,6 +261,7 @@ def test_rust_cfg_chained_attrs_then_fn():
 
 
 def test_rust_cfg_on_mod_ranges_module_body():
+    _requires_lexical_grammar("rust")
     # #[cfg(any())] gating a module makes everything inside dead —
     # the range covers the nested fn.
     src = (
@@ -495,11 +529,13 @@ def test_c_never_closing_params_bounded():
 
 
 def test_php_if_false_block_detected():
+    _requires_lexical_grammar("php")
     src = "<?php\nif (false) {\n  function dead() {}\n}\n"
     assert (2, 4) in detect_dead_scopes("php", src)
 
 
 def test_php_if_zero_and_null_detected():
+    _requires_lexical_grammar("php")
     assert detect_dead_scopes("php", "<?php\nif (0) {\n  x();\n}\n") == [(2, 4)]
     assert detect_dead_scopes("php", "<?php\nif (null) {\n  x();\n}\n") == [(2, 4)]
 
@@ -581,6 +617,7 @@ def test_php_dead_if_inside_nowdoc_not_detected():
 
 
 def test_php_real_dead_if_still_detected():
+    _requires_lexical_grammar("php")
     src = (
         "<?php\n"
         "if (false) {\n"
@@ -595,6 +632,7 @@ def test_php_real_dead_if_still_detected():
 
 
 def test_php_hash_in_string_does_not_truncate_dead_block():
+    _requires_lexical_grammar("php")
     # Under the old two-phase stripping, the '#' inside the string ate
     # the closing quote and the block's real closing brace was swallowed
     # by the mispaired string skip — the dead block went undetected.
@@ -611,6 +649,7 @@ def test_php_hash_in_string_does_not_truncate_dead_block():
 
 
 def test_php_dead_if_after_heredoc_still_detected():
+    _requires_lexical_grammar("php")
     # Heredoc blanking must resume normal parsing after the closer.
     src = (
         "<?php\n"
@@ -630,15 +669,18 @@ def test_php_dead_if_after_heredoc_still_detected():
 
 
 def test_ruby_if_false_block_detected():
+    _requires_lexical_grammar("ruby")
     src = "class C\n  if false\n    def dead; end\n  end\nend\n"
     assert (3, 3) in detect_dead_scopes("ruby", src)
 
 
 def test_ruby_unless_true_detected():
+    _requires_lexical_grammar("ruby")
     assert detect_dead_scopes("ruby", "  unless true\n    x\n  end\n") == [(2, 2)]
 
 
 def test_ruby_if_false_else_branch_live():
+    _requires_lexical_grammar("ruby")
     # only the if-false branch is dead; the else body stays live.
     src = "  if false\n    dead\n  else\n    live\n  end\n"
     assert detect_dead_scopes("ruby", src) == [(2, 2)]
@@ -710,6 +752,7 @@ def test_builder_tags_lexical_dead(tmp_path):
 
 
 def test_ruby_hash_in_string_not_treated_as_comment():
+    _requires_lexical_grammar("ruby")
     src = (
         'x = "has # in string"\n'
         "if false\n"
@@ -728,13 +771,28 @@ def test_ruby_hash_in_string_not_treated_as_comment():
 
 def test_js_line_comment_marker_inside_string_does_not_eat_close():
     # `//` inside the string used to start a "comment" that blanked
-    # the dead-if's real closing brace; the regex literal's quote
-    # then resynced string state and _match_brace closed the block
-    # inside live code — function live() read as dead.
+    # the dead-if's real closing brace, so _match_brace closed the
+    # block inside live code — function live() read as dead.
+    _requires_lexical_grammar("javascript")
     src = (
         'if (false) { var s = "//"; }\n'
         "function live() {\n"
         "  steal();\n"
+        "  var q = /x/;\n"
+        "}\n"
+    )
+    assert detect_dead_scopes("javascript", src) == [(1, 1)]
+
+
+def test_js_quote_in_regex_candidate_resolved_by_grammar():
+    # The heuristic lexer refused to guess regex-vs-division through a
+    # quote-carrying candidate span and bailed on the whole file. The
+    # grammar-backed view disambiguates ``/"/`` as a regex literal, so
+    # the GENUINE dead-if on line 1 is detected instead of dropped.
+    _requires_lexical_grammar("javascript")
+    src = (
+        'if (false) { var s = "//"; }\n'
+        "function live() {\n"
         '  var q = /"/;\n'
         "}\n"
     )
@@ -742,6 +800,7 @@ def test_js_line_comment_marker_inside_string_does_not_eat_close():
 
 
 def test_js_regex_literal_braces_do_not_move_depth():
+    _requires_lexical_grammar("javascript")
     src = (
         "if (false) {\n"
         "  var m = /}}/;\n"
@@ -754,6 +813,7 @@ def test_js_regex_literal_braces_do_not_move_depth():
 
 
 def test_js_division_is_not_a_regex_literal():
+    _requires_lexical_grammar("javascript")
     src = (
         "var a = b / 2 / c;\n"
         "if (false) {\n"
@@ -764,8 +824,10 @@ def test_js_division_is_not_a_regex_literal():
 
 
 def test_js_regex_after_return_keyword():
+    _requires_lexical_grammar("javascript")
+    # Keyword-preceded `/` is a regex; its brace must not move depth.
     src = (
-        "function f() { return /\"{/; }\n"
+        "function f() { return /}{/; }\n"
         "if (false) {\n"
         "  dead();\n"
         "}\n"
@@ -787,9 +849,472 @@ def test_ruby_one_liner_if_false_does_not_range_following_code():
 
 
 def test_ruby_then_with_multiline_body_still_detected():
+    _requires_lexical_grammar("ruby")
     src = (
         "if false then\n"
         "  dead\n"
         "end\n"
+    )
+    assert detect_dead_scopes("ruby", src) == [(2, 2)]
+# ---------------------------------------------------------------------------
+# JS hostile-shape fixtures: string/template data must never mint a
+# dead range over live code, in either regex-vs-division direction.
+# All fixtures are valid, node-verified JavaScript.
+# ---------------------------------------------------------------------------
+
+
+def test_js_real_regex_after_unbraced_if_header_no_false_range():
+    # `/x`y/` after the `)` of an unbraced if header is a REAL regex.
+    # Reading it as division lets its backtick open a phantom template
+    # and the later template's data (`if (false) {`) lex as code —
+    # a fabricated dead range over the live function.
+    src = (
+        "if (a) /x`y/.test(b);\n"
+        "function liveTarget() { return 2; }\n"
+        "const t = `if (false) {\n"
+        "  x\n"
+        "}`;\n"
+    )
+    assert detect_dead_scopes("javascript", src) == []
+
+
+def test_js_division_terminating_at_comment_opener_no_false_range():
+    # `{a:1} /2; // don`t` — the `/` after the object literal is real
+    # division. A fake-regex read ending at the comment opener's first
+    # slash exposes the comment TAIL as code; its backtick flips
+    # template parity for the REST OF THE FILE (not one line), so the
+    # later template's `if (false) {` data ranged the live function.
+    src = (
+        "x = {a:1} /2; // don`t\n"
+        "function liveTarget() { return 1; }\n"
+        "const t = `if (false) {\n"
+        "  x\n"
+        "}`;\n"
+    )
+    assert detect_dead_scopes("javascript", src) == []
+
+
+def test_js_no_false_dead_scope_from_template_data():
+    # The `if (false) {` on line 3 is template DATA; backdoor() is a
+    # live top-level function (executes under node).
+    src = (
+        "const a = `${`}`}`;\n"
+        "const b = `\n"
+        "if (false) {\n"
+        "`; // `\n"
+        "function backdoor(req) { return req.q; }\n"
+        "const c = `${`}`}`;\n"
+        "const d = `\n"
+        "}\n"
+        "`; // `\n"
+    )
+    assert detect_dead_scopes("javascript", src) == []
+
+
+def test_js_real_dead_scope_after_nested_interpolation():
+    # The conservative direction must not overcorrect: a genuine
+    # if-false block AFTER a hostile-nesting template is still found.
+    _requires_lexical_grammar("javascript")
+    src = (
+        'const x = `${"}"}ok`;\n'
+        "if (false) {\n"
+        "  dead();\n"
+        "}\n"
+    )
+    assert detect_dead_scopes("javascript", src) == [(2, 4)]
+
+
+def test_js_backtick_after_division_no_false_dead_range():
+    # `x = {a:1} /`/;` is real division by a template literal whose
+    # data merely looks like a dead-if opener. node: prints LOADED OK.
+    src = (
+        "x = {a:1} /`/;\n"
+        "if (false) {\n"
+        "`;\n"
+        "function backdoor() { return 7; }\n"
+        "q = `}`;\n"
+        'console.log("LOADED OK", backdoor());\n'
+    )
+    assert detect_dead_scopes("javascript", src) == []
+
+
+def test_js_parse_error_bails_whole_file():
+    # Broken JS: recovered token boundaries are guesses — no ranges.
+    src = "function f( {\nif (false) {\n  x();\n}\n"
+    assert detect_dead_scopes("javascript", src) == []
+
+
+def test_js_grammar_absent_fails_closed(monkeypatch):
+    # Without the grammar the detector must report nothing (bail),
+    # never fall back to a guessed lexical view.
+    from core.inventory import lexical_view
+
+    monkeypatch.setattr(
+        lexical_view._ts_cache, "import_grammar", lambda name: None,
+    )
+    monkeypatch.setattr(lexical_view, "_VALIDATED", {})
+    src = "if (false) {\n  dead();\n}\n"
+    assert detect_dead_scopes("javascript", src) == []
+# ---------------------------------------------------------------------------
+# Rust hostile-shape fixtures: comment / string data must never range
+# live code dead. All fixtures are valid, compiling Rust.
+# ---------------------------------------------------------------------------
+
+
+def test_rust_if_false_in_comment_no_false_range():
+    src = (
+        "fn outer() { // note: if false { legacy gate\n"
+        "  inner();\n"
+        "}\n"
+        "fn inner() { target(); }\n"
+    )
+    assert detect_dead_scopes("rust", src) == []
+
+
+def test_rust_if_false_in_string_no_false_range():
+    src = (
+        'fn f() {\n'
+        '    let s = "if false { gate\\n";\n'
+        '    let r = r#"if false { raw"#;\n'
+        "    live(s, r);\n"
+        "}\n"
+    )
+    assert detect_dead_scopes("rust", src) == []
+
+
+def test_rust_cfg_any_in_doc_comment_no_false_range():
+    src = (
+        "/// example: #[cfg(any())]\n"
+        "fn documented() { live(); }\n"
+    )
+    assert detect_dead_scopes("rust", src) == []
+
+
+def test_rust_cfg_any_in_block_comment_no_false_range():
+    src = (
+        "/* #[cfg(any())]\n"
+        "   fn gated() { } */\n"
+        "fn live() { target(); }\n"
+    )
+    assert detect_dead_scopes("rust", src) == []
+
+
+def test_rust_real_dead_if_after_comment_decoy_still_detected():
+    _requires_lexical_grammar("rust")
+    src = (
+        "fn f() { // if false { decoy\n"
+        "    if false {\n"
+        "        dead();\n"
+        "    }\n"
+        "}\n"
+    )
+    assert (2, 4) in detect_dead_scopes("rust", src)
+
+
+def test_rust_parse_error_bails_whole_file():
+    src = "fn f( { let = ;\nif false {\n  x();\n}\n"
+    assert detect_dead_scopes("rust", src) == []
+
+
+def test_rust_grammar_absent_fails_closed(monkeypatch):
+    from core.inventory import lexical_view
+
+    monkeypatch.setattr(
+        lexical_view._ts_cache, "import_grammar", lambda name: None,
+    )
+    monkeypatch.setattr(lexical_view, "_VALIDATED", {})
+    src = "fn f() {\n    if false {\n        dead();\n    }\n}\n"
+    assert detect_dead_scopes("rust", src) == []
+# ---------------------------------------------------------------------------
+# Ruby hostile-shape fixtures: heredoc / multi-line-string data must
+# never open a dead range over live code. All fixtures are valid Ruby.
+# ---------------------------------------------------------------------------
+
+
+def test_ruby_if_false_in_heredoc_no_false_range():
+    # `if false` inside a heredoc plus a later column-0 `end` (any
+    # class/def end) used to range the live method as dead.
+    src = (
+        "banner = <<~EOT\n"
+        "  usage:\n"
+        "if false\n"
+        "EOT\n"
+        "def live_method\n"
+        "  steal\n"
+        "end\n"
+    )
+    assert detect_dead_scopes("ruby", src) == []
+
+
+def test_ruby_if_false_in_multiline_string_no_false_range():
+    src = (
+        's = "text\n'
+        'if false\n'
+        'more"\n'
+        "def live_method\n"
+        "  steal\n"
+        "end\n"
+    )
+    assert detect_dead_scopes("ruby", src) == []
+
+
+def test_ruby_real_dead_if_after_heredoc_still_detected():
+    _requires_lexical_grammar("ruby")
+    src = (
+        "banner = <<~EOT\n"
+        "  if false\n"
+        "EOT\n"
+        "if false\n"
+        "  dead_code\n"
+        "end\n"
+    )
+    assert detect_dead_scopes("ruby", src) == [(5, 5)]
+
+
+def test_ruby_grammar_absent_fails_closed(monkeypatch):
+    from core.inventory import lexical_view
+
+    monkeypatch.setattr(
+        lexical_view._ts_cache, "import_grammar", lambda name: None,
+    )
+    monkeypatch.setattr(lexical_view, "_VALIDATED", {})
+    src = "if false\n  dead\nend\n"
+    assert detect_dead_scopes("ruby", src) == []
+def test_php_dead_if_in_html_text_no_false_range():
+    # `if (false) {` in the HTML around the PHP tags is output, not
+    # code — it must never open a dead range.
+    src = (
+        "<pre>if (false) {</pre>\n"
+        "<?php\n"
+        "function live() { return 1; }\n"
+    )
+    assert detect_dead_scopes("php", src) == []
+
+
+def test_php_grammar_absent_fails_closed(monkeypatch):
+    from core.inventory import lexical_view
+
+    monkeypatch.setattr(
+        lexical_view._ts_cache, "import_grammar", lambda name: None,
+    )
+    monkeypatch.setattr(lexical_view, "_VALIDATED", {})
+    src = "<?php\nif (false) {\n  dead();\n}\n"
+    assert detect_dead_scopes("php", src) == []
+
+
+# ---------------------------------------------------------------------------
+# Prefixed literals must not desynchronise the blanked view's brace
+# matching. The token span of ``b"x"`` / ``r"y"`` / ``b'z'`` starts at
+# the PREFIX byte: an edges blanking that keeps the raw first byte
+# leaves the closing quote unpaired, so `_match_brace`'s string skip
+# pairs it with a LATER literal's opener, swallows real braces, and
+# ranges live functions as lexical_dead — enforce-eligible
+# hard-suppress evidence minted over live code.
+# ---------------------------------------------------------------------------
+
+
+def test_rust_prefixed_literals_do_not_desync_dead_range():
+    _requires_lexical_grammar("rust")
+    src = (
+        "fn setup() {\n"
+        '    if false { let a = b"x"; }\n'
+        "}\n"
+        "\n"
+        "fn live_vuln() {\n"
+        '    let b = b"y";\n'
+        "    dangerous();\n"
+        "}\n"
+    )
+    ranges = detect_dead_scopes("rust", src)
+    # The dead block is the one-line ``if false { … }`` only; the
+    # live fn (lines 5-8) must never fall inside a returned range.
+    assert ranges == [(2, 2)]
+
+
+def test_php_prefixed_literals_do_not_desync_dead_range():
+    _requires_lexical_grammar("php")
+    src = (
+        "<?php\n"
+        "if (false) {\n"
+        "    $a = b'x';\n"
+        "}\n"
+        "function live() {\n"
+        "    $b = b'y';\n"
+        "    danger();\n"
+        "}\n"
+    )
+    ranges = detect_dead_scopes("php", src)
+    # Dead range closes at the guard's own brace (line 4); the live
+    # function (lines 5-8) must never fall inside a returned range.
+    assert ranges == [(2, 4)]
+
+
+def test_rust_prefixed_literals_inside_one_block_still_range():
+    # Balance control: prefixed literals wholly inside the dead block
+    # pair with themselves — the range must still be found.
+    _requires_lexical_grammar("rust")
+    src = (
+        "if false {\n"
+        '    let a = b"x";\n'
+        "    let b = b'y';\n"
+        "}\n"
+        "fn live() {}\n"
+    )
+    assert detect_dead_scopes("rust", src) == [(1, 4)]
+
+
+# ---------------------------------------------------------------------------
+# Rust lifetime tokens — `'_` / `'a` / `'label` never close with a
+# quote; treating one as a string opener swallows text to the next `'`
+# byte and extends a dead range over live functions (a hard-suppress
+# witness over rustc-clean, idiomatic code).
+# ---------------------------------------------------------------------------
+
+
+def test_rust_anonymous_lifetime_does_not_extend_dead_range():
+    _requires_lexical_grammar("rust")
+    src = (
+        "fn setup() {\n"
+        "    if false {\n"
+        "        let x: &'_ str = a();\n"
+        "    }\n"
+        "}\n"
+        "fn vuln() {\n"
+        "    let y: &'_ str = b();\n"
+        "    dangerous();\n"
+        "}\n"
+    )
+    assert detect_dead_scopes("rust", src) == [(2, 4)]
+
+
+def test_rust_anonymous_lifetime_in_cfg_lane_does_not_extend():
+    _requires_lexical_grammar("rust")
+    src = (
+        "#[cfg(any())]\n"
+        "fn dead() {\n"
+        "    let x: &'_ str = a();\n"
+        "}\n"
+        "fn vuln() {\n"
+        "    let y: &'_ str = b();\n"
+        "}\n"
+    )
+    assert detect_dead_scopes("rust", src) == [(1, 4)]
+
+
+def test_rust_named_lifetime_and_label_do_not_desync():
+    _requires_lexical_grammar("rust")
+    src = (
+        "fn f() {\n"
+        "    if false {\n"
+        "        let x: &'a str = g();\n"
+        "        'outer: loop { break 'outer; }\n"
+        "    }\n"
+        "}\n"
+        "fn live() { let y: &'_ str = h(); }\n"
+    )
+    assert detect_dead_scopes("rust", src) == [(2, 5)]
+
+
+def test_rust_unicode_lifetime_does_not_desync():
+    # rustc accepts XID_Start lifetimes; isalpha() is Unicode-aware.
+    _requires_lexical_grammar("rust")
+    src = (
+        "fn f() {\n"
+        "    if false {\n"
+        "        let x: &'\u03b1 str = g();\n"
+        "    }\n"
+        "}\n"
+        "fn live() {}\n"
+    )
+    assert detect_dead_scopes("rust", src) == [(2, 4)]
+
+
+def test_rust_char_literal_with_escape_still_balanced():
+    _requires_lexical_grammar("rust")
+    src = (
+        "fn f() {\n"
+        "    if false {\n"
+        "        let c = '\\n';\n"
+        "        let d = 'x';\n"
+        "    }\n"
+        "}\n"
+        "fn live() {}\n"
+    )
+    assert detect_dead_scopes("rust", src) == [(2, 5)]
+
+
+def test_rust_raw_string_braces_still_balanced():
+    _requires_lexical_grammar("rust")
+    src = (
+        "fn f() {\n"
+        "    if false {\n"
+        '        let r = r#"}}"#;\n'
+        "    }\n"
+        "}\n"
+        "fn live() {}\n"
+    )
+    assert detect_dead_scopes("rust", src) == [(2, 4)]
+
+
+def test_rust_lifetime_at_end_of_source_no_error():
+    _requires_lexical_grammar("rust")
+    # Truncated input ending in a quote must not raise (the dispatch
+    # swallows exceptions into [], hiding an IndexError as a silent
+    # behavior change).
+    assert detect_dead_scopes("rust", "fn f() { if false { let x: &'") == []
+
+
+# ---------------------------------------------------------------------------
+# Ruby indentation anchoring — whitespace-class confusion. An `end`
+# whose indent has the same LENGTH but different bytes (space vs tab)
+# matches neither the byte-equal closer check nor a length-only dedent
+# bail, so the scan latches onto a later byte-equal `end` and ranges
+# the intervening live defs dead.
+# ---------------------------------------------------------------------------
+
+
+def test_ruby_same_length_different_whitespace_end_bails():
+    _requires_lexical_grammar("ruby")
+    src = (
+        "class A\n"
+        "\tif false\n"
+        "\t\tx = 1\n"
+        " end\n"          # space indent, same length as the tab opener
+        "\tdef vuln\n"
+        "\t\tdangerous\n"
+        "\tend\n"
+        "end\n"
+    )
+    # tree-sitter ground truth: the if node closes at the space-indented
+    # end (line 4); `def vuln` (5-7) is OUTSIDE it. The indentation
+    # anchor cannot see that — it must bail, not range the def dead.
+    assert detect_dead_scopes("ruby", src) == []
+
+
+def test_ruby_byte_equal_indent_still_ranges():
+    _requires_lexical_grammar("ruby")
+    src = (
+        "class A\n"
+        "\tif false\n"
+        "\t\tx = 1\n"
+        "\tend\n"
+        "\tdef vuln\n"
+        "\t\tdangerous\n"
+        "\tend\n"
+        "end\n"
+    )
+    assert detect_dead_scopes("ruby", src) == [(3, 3)]
+
+
+def test_ruby_same_indent_statement_lines_do_not_bail():
+    _requires_lexical_grammar("ruby")
+    # Unindented body (same column as the opener, same bytes) is
+    # tolerated exactly as before — only a whitespace-MIX difference
+    # breaks the anchor.
+    src = (
+        "if false\n"
+        "x = 1\n"
+        "end\n"
+        "def live; end\n"
     )
     assert detect_dead_scopes("ruby", src) == [(2, 2)]

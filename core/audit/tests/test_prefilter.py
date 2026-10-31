@@ -7,7 +7,6 @@ from pathlib import Path
 from core.audit.prefilter import (
     detect_language,
     run_prefilter,
-    run_prefilter_batch,
 )
 
 
@@ -575,82 +574,6 @@ void parse(char *buf) {
         assert not result.skip_llm or "no sink path" not in result.skip_reason
 
 
-class TestRunPrefilterBatch:
-    def test_batch_returns_keyed_dict(self, tmp_path: Path):
-        (tmp_path / "handler.c").write_text(
-            "void handle(char *buf) { strcpy(dst, buf); }\n"
-        )
-        functions = [
-            {
-                "file": "handler.c",
-                "name": "handle",
-                "source": "void handle(char *buf) { strcpy(dst, buf); }",
-                "line_start": 1,
-                "line_end": 1,
-            },
-        ]
-        results = run_prefilter_batch(
-            target_path=tmp_path, functions=functions,
-        )
-        assert "handler.c:handle" in results
-        result = results["handler.c:handle"]
-        assert hasattr(result, "hits")
-        assert hasattr(result, "skip_llm")
-
-    def test_batch_multiple_functions(self, tmp_path: Path):
-        functions = [
-            {
-                "file": "a.c",
-                "name": "f1",
-                "source": "int f1() { return 0; }",
-                "line_start": 1,
-                "line_end": 1,
-            },
-            {
-                "file": "b.c",
-                "name": "f2",
-                "source": "void f2(char *s) { system(s); }",
-                "line_start": 1,
-                "line_end": 1,
-            },
-        ]
-        results = run_prefilter_batch(
-            target_path=tmp_path, functions=functions,
-        )
-        assert len(results) == 2
-        assert "a.c:f1" in results
-        assert "b.c:f2" in results
-
-    def test_batch_reads_source_from_disk(self, tmp_path: Path):
-        (tmp_path / "src").mkdir()
-        (tmp_path / "src" / "vuln.c").write_text(
-            "void vuln(char *input) {\n"
-            "    char buf[16];\n"
-            "    strcpy(buf, input);\n"
-            "}\n"
-        )
-        functions = [
-            {
-                "file": "src/vuln.c",
-                "name": "vuln",
-                "line_start": 1,
-                "line_end": 4,
-            },
-        ]
-        results = run_prefilter_batch(
-            target_path=tmp_path, functions=functions,
-        )
-        assert "src/vuln.c:vuln" in results
-        result = results["src/vuln.c:vuln"]
-        assert len(result.hits) > 0
-
-    def test_batch_empty_list(self, tmp_path: Path):
-        results = run_prefilter_batch(
-            target_path=tmp_path, functions=[],
-        )
-        assert results == {}
-
-
 class TestAssignInConditional:
     def _run(self, tmp_path, source, function_name="check"):
         return run_prefilter(
@@ -838,3 +761,189 @@ class TestPrefilterSkipKnobWiring:
 
         cfg = OrchestratorConfig(target_path=Path("."), out_dir=Path("."))
         assert cfg.prefilter_skip is True
+
+
+class TestAccessorTierHonesty:
+    """The simple-accessor skip judges the WHOLE body on the shared
+    sanitized views — never raw prefix-dropped lines or a
+    suffix-anchored arm.
+
+    The old mechanism dropped any raw line starting with ``*`` or
+    ``#`` (a column-0 deref-store read as a block-comment
+    continuation; a string-continuation line carrying live code read
+    as a comment) and matched its arms with a suffix anchor (any
+    side-effecting statement rode in front of the accessor return).
+    Each shape below was journalled durably clean ("cannot contain
+    vulnerabilities") over live deref-stores, lifecycle ops, and an
+    os.system call.
+    """
+
+    def _run(self, name, fp, src, callees=None):
+        return run_prefilter(
+            target_path=Path("/nonexistent-target"), file_path=fp,
+            function_name=name, source=src, callees=callees,
+        )
+
+    def test_c_deref_store_col0_not_an_accessor(self):
+        r = self._run("get_val", "a.c",
+            "int get_val(struct ctx *x, int v) {\n"
+            "*x->owner_uid = v;\nreturn x->val;\n}")
+        assert not r.skip_llm
+
+    def test_c_privilege_flag_store_not_an_accessor(self):
+        r = self._run("mk", "a.c",
+            "int mk(struct s *s) {\n*s->is_admin = 1;\nreturn s->val;\n}")
+        assert not r.skip_llm
+
+    def test_go_deref_store_not_an_accessor(self):
+        r = self._run("G", "a.go",
+                      "func G(p *int, s *S) int {\n*p = 9\nreturn s.f\n}")
+        assert not r.skip_llm
+
+    def test_py_side_effect_before_return_not_an_accessor(self):
+        r = self._run("f", "a.py",
+                      "def f(path, ok):\n    os.unlink(path)\n    return ok",
+                      callees=[{"name": "os.unlink"}])
+        assert not r.skip_llm
+
+    def test_c_refcount_put_not_an_accessor(self):
+        r = self._run("put", "a.c",
+            "void put(struct obj *p){\np->refs--;\nreturn p->parent;\n}")
+        assert not r.skip_llm
+
+    def test_py_hash_continuation_hides_no_sink(self):
+        r = self._run("f", "a.py",
+            'def f(c):\n    s = """\n#"""; os.system(c)\n    return ok')
+        assert not r.skip_llm
+
+    def test_c_array_store_control_still_refused(self):
+        r = self._run("get_val", "a.c",
+            "int get_val(struct ctx *x, int v) {\n  y[0] = v;\n"
+            "  return x->val;\n}")
+        assert not r.skip_llm
+
+    # ── keep direction: honest accessors keep their skip ────────────
+
+    def test_c_field_accessor_keeps_skip(self):
+        r = self._run("get_uid", "a.c",
+            "int get_uid(const struct ctx *x)\n{\n"
+            "    /* owner uid */\n    return x->owner_uid;\n}")
+        assert r.skip_llm and "accessor" in r.skip_reason
+
+    def test_py_self_field_accessor_keeps_skip(self):
+        r = self._run("value", "a.py",
+                      "def value(self):\n    return self._value")
+        assert r.skip_llm and "accessor" in r.skip_reason
+
+    def test_py_docstring_accessor_keeps_skip(self):
+        r = self._run("value", "a.py",
+                      'def value(self):\n    """The value."""\n'
+                      "    return self._value")
+        assert r.skip_llm and "accessor" in r.skip_reason
+
+    def test_go_field_accessor_keeps_skip(self):
+        r = self._run("F", "a.go", "func (s *S) F() int {\nreturn s.f\n}")
+        assert r.skip_llm and "accessor" in r.skip_reason
+
+    def test_java_field_accessor_keeps_skip(self):
+        r = self._run("getName", "A.java",
+            "public String getName() {\n    return this.name;\n}")
+        assert r.skip_llm and "accessor" in r.skip_reason
+
+    def test_returned_sink_reference_refused_every_language(self):
+        # The dangerous-name gate the lua arm documented, applied to
+        # every arm: handing a sink back as a VALUE is never a clean
+        # accessor.
+        for name, fp, src in [
+            ("get", "a.py", "def get(self):\n    return system"),
+            ("get", "a.go", "func get() F {\nreturn os.Exec\n}"),
+        ]:
+            r = self._run(name, fp, src)
+            assert not r.skip_llm, (fp, src)
+
+
+class TestAccessorDefTimeCode:
+    """Def-time-executed expressions (decorators, default args,
+    annotations) are live code the body-shape check never sees — a
+    Call/NamedExpr/Await in any of them refuses the accessor skip.
+    Pre-existing at BASE (adversarial-review member): the AST arm
+    judged only the body statements."""
+
+    def _run(self, src):
+        return run_prefilter(
+            target_path=Path("/nonexistent-target"), file_path="a.py",
+            function_name="g", source=src,
+        )
+
+    def test_decorator_call_refuses(self):
+        r = self._run(
+            "@reg(os.system(c))\ndef g(self):\n    return self._x")
+        assert not r.skip_llm
+
+    def test_walrus_default_refuses(self):
+        r = self._run(
+            "def g(self, n=(m := f(c))):\n    return self._x")
+        assert not r.skip_llm
+
+    def test_return_annotation_call_refuses(self):
+        r = self._run("def g(self) -> f(c):\n    return self._x")
+        assert not r.skip_llm
+
+    def test_param_annotation_call_refuses(self):
+        r = self._run("def g(self, x: f(c)):\n    return self._x")
+        assert not r.skip_llm
+
+    def test_default_call_refuses(self):
+        r = self._run("def g(self, x=f(c)):\n    return self._x")
+        assert not r.skip_llm
+
+    # ── keep direction ───────────────────────────────────────────────
+
+    def test_property_accessor_keeps_skip(self):
+        r = self._run("@property\ndef g(self):\n    return self._x")
+        assert r.skip_llm and "accessor" in r.skip_reason
+
+    def test_plain_annotations_and_defaults_keep_skip(self):
+        for src in (
+            "def g(self) -> bool:\n    return True",
+            "def g(self, x: int = 3):\n    return self._x",
+        ):
+            r = self._run(src)
+            assert r.skip_llm and "accessor" in r.skip_reason, src
+
+
+class TestAccessorSplitSignature:
+    """The BSD/K&R return-type-on-its-own-line form (`int\\nname(...)
+    \\n{\\n\\treturn 0;\\n}`) — the dominant kernel style — was refused
+    wholesale after the whole-body rewrite (the signature matcher only
+    understood one-line signatures). The type-only leading line joins
+    the signature; honesty still rests on the whole-body arm."""
+
+    def _run(self, name, src):
+        return run_prefilter(
+            target_path=Path("/nonexistent-target"), file_path="a.c",
+            function_name=name, source=src,
+        )
+
+    def test_type_on_own_line_field_accessor_skips(self):
+        r = self._run("get_name",
+            "static const char *\nget_name(struct s *x)\n{\n"
+            "\treturn x->name;\n}")
+        assert r.skip_llm and "accessor" in r.skip_reason
+
+    def test_type_on_own_line_constant_return_skips(self):
+        r = self._run("diskmapopen",
+            "int\ndiskmapopen(dev_t dev, int flag, int mode)\n{\n"
+            "\treturn 0;\n}")
+        assert r.skip_llm and "accessor" in r.skip_reason
+
+    def test_statement_first_line_still_refused(self):
+        r = self._run("get_val",
+            "int get_val(struct ctx *x, int v)\n{\n"
+            "*x->owner_uid = v;\nreturn x->val;\n}")
+        assert not r.skip_llm
+
+    def test_two_statement_body_still_refused(self):
+        r = self._run("put",
+            "void\nput(struct obj *p)\n{\np->refs--;\nreturn p->parent;\n}")
+        assert not r.skip_llm

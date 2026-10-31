@@ -236,3 +236,111 @@ def test_blocked_list_is_copied_not_aliased():
     _, detail = outcome_from_sandbox_info(info)
     detail["blocked"].append({"kind": "write"})
     assert len(blocked) == 1
+
+
+# ----------------------------------------------------------------------
+# Floor-refusal chokepoint — refusal_detail / refusal_summary_line
+# ----------------------------------------------------------------------
+
+
+def _floor_error(remedies: str = "install uidmap; re-run"):
+    from core.sandbox.errors import SandboxFloorError
+    from core.sandbox.tiers import ContainmentTier
+
+    return SandboxFloorError(
+        "sandbox containment floor violated",
+        remedies,
+        achievable=ContainmentTier.LANDLOCK_ONLY,
+        floor=ContainmentTier.MOUNT_NS,
+        setup_category="U",
+    )
+
+
+def test_refusal_detail_maps_floor_error_to_canonical_payload():
+    from core.witness import UNVERIFIABLE_ENVIRONMENT, refusal_detail
+
+    detail = refusal_detail(_floor_error())
+    assert detail == {
+        "status": UNVERIFIABLE_ENVIRONMENT,
+        "floor": "mount-ns",
+        "achievable": "landlock",
+        "remedies": "install uidmap; re-run",
+        "failure_mode": "constrained_by_env",
+    }
+
+
+def test_refusal_detail_payload_is_flat_json_safe_strings():
+    import json
+
+    from core.witness import refusal_detail
+
+    detail = refusal_detail(_floor_error())
+    assert all(isinstance(v, str) for v in detail.values())
+    json.dumps(detail)  # must not raise
+
+
+def test_refusal_detail_failure_mode_matches_labeled_attempts_enum():
+    """The payload's failure_mode string must stay in lockstep with
+    FailureMode.CONSTRAINED_BY_ENV so attempt-record writers can pass
+    it through verbatim."""
+    from core.labeled_attempts.types import FailureMode
+    from core.witness import refusal_detail
+
+    detail = refusal_detail(_floor_error())
+    assert detail["failure_mode"] == FailureMode.CONSTRAINED_BY_ENV.value
+
+
+def test_refusal_detail_none_for_plain_setup_error():
+    """Only the typed floor subtype maps — a generic SandboxSetupError
+    keeps its existing fail-loud flight path (caller re-raises)."""
+    from core.sandbox.errors import SandboxSetupError
+    from core.witness import refusal_detail
+
+    assert refusal_detail(SandboxSetupError("engage failed", "fix")) is None
+
+
+def test_refusal_detail_none_for_ordinary_exceptions():
+    from core.witness import refusal_detail
+
+    assert refusal_detail(ValueError("nope")) is None
+    assert refusal_detail(OSError("nope")) is None
+
+
+def test_refusal_detail_empty_remedies_stay_empty_string():
+    from core.witness import refusal_detail
+
+    detail = refusal_detail(_floor_error(remedies=""))
+    assert detail["remedies"] == ""
+
+
+def test_refusal_detail_unknown_tier_falls_back_to_str():
+    """A floor error carrying a non-lattice value (defensive: a test
+    double or a future field widening) must not crash the mapping."""
+    from core.sandbox.errors import SandboxFloorError
+    from core.witness import refusal_detail
+
+    exc = SandboxFloorError(
+        "violated", "fix", achievable="weird", floor="weirder",
+    )
+    detail = refusal_detail(exc)
+    assert detail["achievable"] == "weird"
+    assert detail["floor"] == "weirder"
+
+
+def test_refusal_summary_line_shape():
+    from core.witness import refusal_detail, refusal_summary_line
+
+    line = refusal_summary_line(refusal_detail(_floor_error()))
+    assert line == (
+        "1 execution(s) refused: environment cannot meet the "
+        "containment floor (mount-ns required, landlock achievable) "
+        "— remedies: install uidmap; re-run"
+    )
+
+
+def test_refusal_summary_line_empty_remedies_named_honestly():
+    from core.witness import refusal_summary_line
+
+    line = refusal_summary_line({"floor": "mount-ns", "achievable": "none",
+                                 "remedies": ""})
+    assert "(none recorded)" in line

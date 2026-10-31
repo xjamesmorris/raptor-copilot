@@ -33,6 +33,8 @@ if not (os.environ.get("CLAUDECODE")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import core.startup.process_init  # noqa: E402,F401
+from core.logging import configure_cli_logging  # noqa: E402
+from core.security.log_sanitisation import sanitise_for_terminal as _sft  # noqa: E402
 
 logger = logging.getLogger("raptor-compile-invariants")
 
@@ -54,16 +56,21 @@ def main() -> int:
                     help="Target codebase to sweep for violations.")
     ap.add_argument("--engine", default=None, choices=["semgrep", "coccinelle"],
                     help="Force engine (default: infer from evidence).")
+    from core.concepts.model import CONFIDENCE_GRADES
     ap.add_argument("--min-confidence", default="traced",
-                    help="Minimum confidence grade (default: traced).")
+                    choices=list(CONFIDENCE_GRADES),
+                    help="Minimum confidence grade (default: traced). "
+                         "A mistyped grade used to silently disable "
+                         "the floor; argparse now rejects it.")
     ap.add_argument("--max", type=int, default=10,
                     help="Maximum invariants to compile (default: 10).")
     ap.add_argument("-v", "--verbose", action="store_true")
     parsed = ap.parse_args()
 
-    logging.basicConfig(
-        level=logging.DEBUG if parsed.verbose else logging.INFO,
-        format="%(name)s: %(message)s",
+    # Escaping console formatter — see core.logging.configure_cli_logging.
+    configure_cli_logging(
+        logging.DEBUG if parsed.verbose else logging.INFO,
+        fmt="%(name)s: %(message)s",
     )
     for _noisy in ("httpx", "httpcore", "urllib3"):
         logging.getLogger(_noisy).setLevel(logging.WARNING)
@@ -77,11 +84,8 @@ def main() -> int:
     from core.concepts.model import DomainModel
     model = DomainModel.load(dm_path)
 
-    from core.concepts.model import CONFIDENCE_GRADES
-    try:
-        floor = CONFIDENCE_GRADES.index(parsed.min_confidence)
-    except ValueError:
-        floor = 0
+    # choices= guarantees membership; a bare index cannot raise.
+    floor = CONFIDENCE_GRADES.index(parsed.min_confidence)
     qualified = [
         inv for inv in model.invariants
         if inv.statement and inv.negation and not inv.mechanical_rule
@@ -118,19 +122,17 @@ def main() -> int:
         client = LLMClient()
 
     # Self-serve the in-process LLM dispatcher for dispatcher-only
-    # providers (Bedrock) — same gate as raptor-study-run /
-    # raptor-llm-ask; no-op when a route exists or none is needed.
+    # providers (Bedrock) — the shared gate never raises; no-op when
+    # a route exists or none is needed. run_dir places the
+    # dispatcher's L5 audit JSONL in this run's output directory
+    # instead of the in-memory default.
     try:
-        from core.llm.dispatcher.lifecycle import (
-            ensure_route_for_model_configs,
-        )
-        configs = [getattr(client.config, "primary_model", None)]
-        configs += list(getattr(client.config, "fallback_models", []) or [])
-        ensure_route_for_model_configs(
-            configs, label="raptor-compile-invariants",
-        )
-    except Exception:  # noqa: BLE001 — provider errors surface at call time
+        from core.llm.dispatcher.lifecycle import ensure_route_for_client
+    except ImportError:  # no dispatcher machinery, no route to serve
         pass
+    else:
+        ensure_route_for_client(
+            client, "raptor-compile-invariants", run_dir=output_dir)
 
     def llm_callable(prompt, schema, system_prompt):
         try:
@@ -171,11 +173,13 @@ def main() -> int:
 
     for r in succeeded:
         match_info = f", {len(r.matches)} sweep match(es)" if r.matches else ""
-        _progress(f"  compiled {r.invariant_id} -> {r.rule_id}{match_info}")
+        _progress(f"  compiled {_sft(str(r.invariant_id), max_len=120)} -> "
+                  f"{_sft(str(r.rule_id), max_len=120)}{match_info}")
 
     for r in failed:
-        errs = "; ".join(r.errors[:2]) if r.errors else "unknown"
-        _progress(f"  failed {r.invariant_id}: {errs}")
+        errs = _sft("; ".join(str(e) for e in r.errors[:2]), max_len=300) \
+            if r.errors else "unknown"
+        _progress(f"  failed {_sft(str(r.invariant_id), max_len=120)}: {errs}")
 
     _progress(
         f"done: {len(succeeded)} compiled, {len(failed)} failed "

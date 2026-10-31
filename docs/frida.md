@@ -115,7 +115,7 @@ only, which is unreachable from another host.
 From the RAPTOR host:
 
 ```bash
-raptor frida --target some-process --host 10.10.20.1 --template api-trace
+raptor frida --target some-process --host 192.0.2.10 --template api-trace
 ```
 
 Treat the network channel as unauthenticated. Frida-server has no auth
@@ -126,7 +126,7 @@ in front of it. On shared networks, prefer SSH-forwarding:
 ./frida-server -l 127.0.0.1:27042 &
 
 # On the host: SSH-forward instead of --host
-ssh -L 27042:127.0.0.1:27042 target-user@10.10.20.1
+ssh -L 27042:127.0.0.1:27042 target-user@192.0.2.10
 raptor frida --target some-process --host 127.0.0.1 --template api-trace
 ```
 
@@ -179,7 +179,7 @@ raptor frida --target ./victim --template api-trace --duration 60
 raptor frida --target com.example.app --template ssl-unpin --usb --spawn --duration 120
 
 # Remote frida-server on the LAN
-raptor frida --target target-binary --template api-trace --host 10.10.20.1
+raptor frida --target target-binary --template api-trace --host 192.0.2.10
 
 # Operator-supplied hook script
 raptor frida --target Safari --script ./my-hook.js --duration 30

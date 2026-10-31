@@ -39,6 +39,8 @@ from __future__ import annotations
 import heapq
 from io import StringIO
 
+from .._md import code_cell as _code_cell
+from .._md import inline_code, neutralize_inline
 from .orchestrator import (
     BumpReport, BumpResult,
     _VERDICT_BLOCK, _VERDICT_CLEAN, _VERDICT_REVIEW,
@@ -116,11 +118,14 @@ def render_pr_comment(
             head = group[0]
             n_files = len(group)
             notes = _notes_for_group(group, n_files)
+            # Locator / versions come from the scanned repo and the
+            # registry — untrusted for a PR-facing artifact. Same
+            # neutraliser family as the report/review/diff renderers.
             buf.write(
                 f"| {head.candidate.kind} "
-                f"| `{head.candidate.locator}` "
-                f"| `{head.candidate.current_version}` "
-                f"| `{head.candidate.target_version}` "
+                f"| {_code_cell(head.candidate.locator)} "
+                f"| {_code_cell(head.candidate.current_version)} "
+                f"| {_code_cell(head.candidate.target_version)} "
                 f"| {_verdict_label_md(head.verdict)} "
                 f"| {notes} |\n"
             )
@@ -146,9 +151,12 @@ def render_pr_comment(
             f"</summary>\n\n"
         )
         for arg, path, reason in report.skipped[:cap]:
+            # ``arg`` is a repo-sourced surface locator and ``reason``
+            # often carries upstream exception text — both untrusted.
             buf.write(
-                f"- `{arg}` ({path.name}): "
-                f"{_truncate_one_line(reason, 240)}\n"
+                f"- {inline_code(arg)} "
+                f"({neutralize_inline(path.name, limit=80)}): "
+                f"{neutralize_inline(_truncate_one_line(reason, 240))}\n"
             )
         if len(report.skipped) > cap:
             buf.write(
@@ -221,14 +229,17 @@ def _notes_for_group(group: list[BumpResult], n_files: int) -> str:
     for member in group:
         for sf in member.bump_supply_chain_findings:
             if sf.kind not in seen_kinds:
-                bits.append(sf.kind)
+                # ``kind`` is an internal enum, but neutralise anyway
+                # — one mechanism for every cell fragment.
+                bits.append(neutralize_inline(sf.kind, limit=60))
                 seen_kinds.add(sf.kind)
         for vf in member.bump_vuln_findings:
             adv = vf.advisories[0] if vf.advisories else None
             cve_id = (adv.osv_id if adv else "?")
             if cve_id not in seen_cves:
                 kev = " (KEV)" if vf.in_kev else ""
-                bits.append(f"new-CVE `{cve_id}`{kev}")
+                # osv_id is remote data landing in a table cell.
+                bits.append(f"new-CVE {_code_cell(cve_id)}{kev}")
                 seen_cves.add(cve_id)
     if n_files > 1:
         bits.append(f"{n_files} files")
@@ -236,5 +247,6 @@ def _notes_for_group(group: list[BumpResult], n_files: int) -> str:
         bits.append("applied")
     errors = [m.error for m in group if m.error]
     if errors:
-        bits.append(f"error: {errors[0]}")
+        # Exception text can quote remote payloads verbatim.
+        bits.append(f"error: {neutralize_inline(errors[0], limit=160)}")
     return " · ".join(bits) if bits else "—"

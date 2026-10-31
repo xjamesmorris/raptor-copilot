@@ -26,6 +26,9 @@ import re
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+
+from core.paths import confine
+from core.source import read_text_capped
 from typing import Any
 
 from core.build.build_flags import BuildFlagsContext, extract_flags
@@ -41,6 +44,7 @@ from core.function_taxonomy import (
 from packages.source_intel.aliases import (
     ALL_WUR_ALIASES,
 )
+from core.source.lines import split_lines
 
 logger = logging.getLogger(__name__)
 
@@ -101,10 +105,14 @@ _SOURCE_SIDE_FD_READ_FUNCS: frozenset[str] = frozenset({
 
 # The shared taxonomy sets are intentionally broader for binary fingerprinting.
 # Keep only call sites that directly ingest bytes for L1 source evidence.
+# WSAAccept is excluded with accept — both return a socket, no bytes land at
+# the call site. AcceptEx stays: its lpOutputBuffer receives the connection's
+# first data block, so the call site itself ingests attacker bytes.
 _SOURCE_SIDE_SOCKET_INPUT_FUNCS: frozenset[str] = NETWORK_INGEST_FUNCS - frozenset({
     "accept",
     "bind",
     "listen",
+    "WSAAccept",
 })
 _SOURCE_SIDE_STREAM_INPUT_FUNCS: frozenset[str] = (
     STREAM_INPUT_FUNCS | SCAN_FAMILY_FUNCS
@@ -661,7 +669,14 @@ class SourceIntelResult:
             return "prereqs_skipped"
         if facts.is_skipped:
             return "prereqs_skipped"
-        return "in_tree" if facts.function_exists(function_name) else "name_not_in_tree"
+        if facts.function_exists(function_name):
+            return "in_tree"
+        if not facts.complete:
+            # An errored rule may be the one that would have seen the
+            # definition — "I scanned and the name isn't here" is only
+            # claimable from a complete sweep.
+            return "prereqs_skipped"
+        return "name_not_in_tree"
 
     def variant_ratio(self, allocator: str) -> tuple[int, int]:
         """Return (checked_count, unchecked_count) for ``allocator``
@@ -753,7 +768,7 @@ def _materialize_rules_dir(axis_dir: Path) -> tuple[Path, Any]:
     slotted: dict[Path, str] = {}
     for rule_path in rule_paths:
         try:
-            text = rule_path.read_text(encoding="utf-8")
+            text = rule_path.read_text(encoding="utf-8")  # raw-open: shipped semgrep rule file (RAPTOR-owned)
         except OSError:
             continue
         if not has_api_pack_marker(text):
@@ -806,8 +821,15 @@ def _axis_dirs(rules_root: Path) -> list[Path]:
 # =====================================================================
 
 
-_C_CPP_EXTS: tuple[str, ...] = (
-    ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh",
+# Single home for the package's C-family extension set — cache.py's
+# staleness signature and adapter.py's pointer-reference guard import
+# it. Three hand-copied sets had drifted (one missing .hh, one
+# missing .hxx): a static function referenced as a callback only in a
+# header spelt with the missing extension read as dead code — a wrong
+# Not Exploitable, the one direction the dead-code axis promises not
+# to err in. Compare against ``suffix.lower()``.
+C_CPP_EXTS: tuple[str, ...] = (
+    ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx",
 )
 
 
@@ -827,7 +849,7 @@ def _checklist_has_c_cpp(checklist: dict[str, Any] | None) -> bool:
     return any(
         isinstance(f, dict) and (
             f.get("language") in ("c", "cpp")
-            or str(f.get("path", "")).lower().endswith(_C_CPP_EXTS)
+            or str(f.get("path", "")).lower().endswith(C_CPP_EXTS)
         )
         for f in files
     )
@@ -840,13 +862,13 @@ def _has_c_cpp_source(target: Path, max_files: int = 200) -> bool:
     """
     if not target.is_dir():
         # Single-file target — accept if it's C-family.
-        return target.suffix.lower() in _C_CPP_EXTS
+        return target.suffix.lower() in C_CPP_EXTS
     seen = 0
     for entry in target.rglob("*"):
         if not entry.is_file():
             continue
         seen += 1
-        if entry.suffix.lower() in _C_CPP_EXTS:
+        if entry.suffix.lower() in C_CPP_EXTS:
             return True
         if seen >= max_files:
             return False
@@ -1255,10 +1277,12 @@ def _classify_size_source(
     """
     if not file_path or not line_no:
         return None
-    try:
-        with Path(file_path).open(encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-    except OSError:
+    # Sanitized view: a comment on the alloc line (`kmalloc(8
+    # /* n * len */, ...)`) must not steer the shape class — the
+    # classification feeds the axis-3 verdict.
+    from packages.source_intel._source_view import sanitized_lines
+    lines = sanitized_lines(file_path)
+    if lines is None:
         return None
     if line_no < 1 or line_no > len(lines):
         return None
@@ -1444,13 +1468,22 @@ def _classify_call_site_grade(file_path: str, call_line: int) -> str:
 
     Conservative on file-read failure or unparseable shape — returns
     SAME_FUNCTION.
+
+    The walk reads the shared sanitized view, never the raw text:
+    DOMINATES is the adapter's strongest NOT_EXPLOITABLE lever (no
+    proximity gate), and the per-line regex stripping this used to do
+    removed only SAME-LINE comments — interior lines of a multi-line
+    block comment fed their braces into the depth walk, so one
+    planted ``/*\\n}\\n*/`` (or an organic unbalanced brace in ASCII
+    art) minted DOMINATES for a branch-local abort and suppressed
+    every memory-corruption finding below it. Preprocessor lines are
+    skipped too: a ``#define OPEN {`` is not control flow.
     """
     if not file_path or not call_line:
         return GRADE_SAME_FUNCTION
-    try:
-        with Path(file_path).open(encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-    except OSError:
+    from packages.source_intel._source_view import sanitized_lines
+    lines = sanitized_lines(file_path)
+    if lines is None:
         return GRADE_SAME_FUNCTION
     if call_line < 1 or call_line > len(lines):
         return GRADE_SAME_FUNCTION
@@ -1465,12 +1498,12 @@ def _classify_call_site_grade(file_path: str, call_line: int) -> str:
     bypass_re = re.compile(r"\b(?:return\b|goto\b)")
 
     for i in range(call_idx + 1):
-        line = lines[i]
-        # Strip comments and string literals (rough)
-        stripped = re.sub(r"/\*.*?\*/", "", line, flags=re.DOTALL)
-        stripped = re.sub(r"//.*$", "", stripped, flags=re.MULTILINE)
-        stripped = re.sub(r'"(?:[^"\\]|\\.)*"', '""', stripped)
-        stripped = re.sub(r"'(?:[^'\\]|\\.)*'", "''", stripped)
+        stripped = lines[i]
+        # Comment / string content is already blanked by the
+        # sanitized view. Preprocessor directives take no part in
+        # the brace/exit walk.
+        if stripped.lstrip().startswith("#"):
+            continue
 
         # Look for `return` / `goto` BEFORE the call line at depth 1
         # (function body), which would mean a normal exit path
@@ -2098,6 +2131,7 @@ def _enclosing_function_via_inventory(
     except ImportError:
         return None
     # Inventory keys files by the relative path from the target dir.
+    assert target_dir is not None
     try:
         rel = str(Path(file_path).resolve().relative_to(target_dir))
     except (ValueError, OSError):
@@ -2151,10 +2185,14 @@ def _enclosing_function(file_path: str, line: int) -> str | None:
     if via_inv is not None:
         return via_inv
     # 2. Regex fallback (only path when no inventory is cached).
-    try:
-        with Path(file_path).open(encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-    except OSError:
+    # Sanitized view: an opener-shaped line on the INTERIOR of a
+    # block comment would otherwise win the backward walk (the
+    # prefix skip below only catches lines that start with comment
+    # tokens), misattributing the enclosing function — which flips
+    # same-function abort/capability matching.
+    from packages.source_intel._source_view import sanitized_lines
+    lines = sanitized_lines(file_path)
+    if lines is None:
         return None
     if line < 1 or line > len(lines):
         return None
@@ -2218,9 +2256,49 @@ def _enclosing_function(file_path: str, line: int) -> str | None:
     return None
 
 
+def _sub_block_comments(
+    text: str, repl: str = "", *, cross_lines: bool = False,
+) -> str:
+    """Replace every complete ``/* ... */`` comment with ``repl``.
+
+    Performs the same replacement as the lazy ``/\\*.*?\\*/`` regex
+    (with ``cross_lines`` standing in for ``re.DOTALL``) via a linear
+    ``str.find`` walk: an unanchored regex scan re-reads the tail
+    from every ``/*`` occurrence when no closer follows — quadratic
+    on hostile source with planted openers. An unclosed trailing
+    comment is kept as-is, exactly like the regex (no match without
+    a closer); without ``cross_lines`` an opener whose first closer
+    sits past a newline is skipped, exactly like ``.`` stopping at
+    the line end.
+    """
+    out: list[str] = []
+    i = 0
+    while True:
+        start = text.find("/*", i)
+        if start == -1:
+            out.append(text[i:])
+            break
+        end = text.find("*/", start + 2)
+        if end == -1:
+            out.append(text[i:])
+            break
+        if not cross_lines:
+            newline = text.find("\n", start + 2)
+            if newline != -1 and newline < end:
+                # `.` cannot cross the newline: no match starts at
+                # this opener; keep scanning after it.
+                out.append(text[i:start + 1])
+                i = start + 1
+                continue
+        out.append(text[i:start])
+        out.append(repl)
+        i = end + 2
+    return "".join(out)
+
+
 def _strip_trailing_comments(s: str) -> str:
     """Trim ``// …`` and ``/* … */`` trailing comments + whitespace."""
-    s = re.sub(r"/\*.*?\*/", "", s)
+    s = _sub_block_comments(s)
     s = re.sub(r"/\*.*$", "", s)
     s = re.sub(r"//.*$", "", s)
     return s.rstrip()
@@ -2253,7 +2331,7 @@ def _join_until_paren_balanced(
         # now-single-line joined text — see _strip_trailing_comments
         # which is line-anchored and assumes /* without */ on same
         # line means comment-to-EOF).
-        text_clean = re.sub(r"/\*.*?\*/", "", text)
+        text_clean = _sub_block_comments(text)
         text_clean = re.sub(r"//.*$", "", text_clean)
         pieces.append(text_clean)
         for ch in text_clean:
@@ -2336,7 +2414,7 @@ def _scan_alias_observations(target: Path) -> list[AttributeEvidence]:
     observations: list[AttributeEvidence] = []
     if not target.is_dir():
         # Single-file target — scan that file directly.
-        if target.is_file() and target.suffix.lower() in _C_CPP_EXTS:
+        if target.is_file() and target.suffix.lower() in C_CPP_EXTS:
             return _scan_alias_in_file(target)
         return observations
 
@@ -2347,7 +2425,7 @@ def _scan_alias_observations(target: Path) -> list[AttributeEvidence]:
             break
         if not entry.is_file():
             continue
-        if entry.suffix.lower() not in _C_CPP_EXTS:
+        if entry.suffix.lower() not in C_CPP_EXTS:
             continue
         seen_files += 1
         observations.extend(_scan_alias_in_file(entry))
@@ -2364,22 +2442,27 @@ def _scan_c_level_source_inputs(target: Path) -> list[CLevelSourceEvidence]:
     context without changing verdict policy.
     """
     files: list[Path] = []
-    if target.is_file() and target.suffix.lower() in _C_CPP_EXTS:
+    if target.is_file() and target.suffix.lower() in C_CPP_EXTS:
         files = [target]
     elif target.is_dir():
         for entry in sorted(target.rglob("*")):
             if len(files) >= 500:
                 break
-            if entry.is_file() and entry.suffix.lower() in _C_CPP_EXTS:
+            if entry.is_file() and entry.suffix.lower() in C_CPP_EXTS:
                 files.append(entry)
 
     observations: list[CLevelSourceEvidence] = []
     seen: set[tuple[str, int, str, str]] = set()
     for path in files:
-        try:
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError:
+        resolved = confine(target, path)
+        if resolved is None:
             continue
+        # newline="" + split_lines: emitted line_no is a raw-byte-model
+        # coordinate — a plantable bare \r must stay in-line.
+        got = read_text_capped(resolved, newline="")
+        if got is None:
+            continue
+        lines = split_lines(got[0])
         in_block_comment = False
         for line_no, line in enumerate(lines, start=1):
             if _PREPROC_LINE_RE.match(line):
@@ -2492,11 +2575,18 @@ def _line_has_c_source_call(line: str, name: str) -> bool:
     # This intentionally stays conservative: calls embedded in assignment
     # statements (``n = read(...)``) do not match this declaration shape.
     return not bool(
+        # Bounded qualifier loop and parameter window (the loop
+        # overlapped the star/whitespace span and the window let the
+        # anchored call re-scan a paren-less tail — quadratic).
+        # Star tokens ride the qualifier loop and the residual
+        # pointer span is stars-only (the old ``[*\s]*`` duplicated
+        # the loop's whitespace separator and split against it —
+        # quadratic).
         re.match(
             r"^\s*(?:extern\s+|static\s+|inline\s+|"
-            r"[A-Za-z_][\w_]*\s+)+[*\s]*"
+            r"[A-Za-z_][\w_]*\s+|\*\s+){1,24}\**"
             + re.escape(name)
-            + r"\s*\([^;{}]*\)\s*;\s*$",
+            + r"\s*\([^;{}]{0,4096}\)\s*;\s*$",
             line,
         )
     )
@@ -2549,14 +2639,17 @@ def _scan_project_alias_observations(
             break
         if not entry.is_file():
             continue
-        if entry.suffix.lower() not in _C_CPP_EXTS:
+        if entry.suffix.lower() not in C_CPP_EXTS:
             continue
         seen_files += 1
-        try:
-            text = entry.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        resolved = confine(target, entry)
+        if resolved is None:
             continue
-        file_lines = text.split("\n")
+        got = read_text_capped(resolved)
+        if got is None:
+            continue
+        text = got[0]
+        file_lines = text.split("\n")  # line-model: universal-newline read_text_capped above
         for family, alias_name in alias_pairs:
             # Word-boundary check; substring would risk false positives
             # on prefix-overlap (FOO_CHECK vs MUST_CHECK).
@@ -2617,13 +2710,19 @@ def _scan_alias_in_file(path: Path) -> list[AttributeEvidence]:
     declaration, ``function_name`` stays empty (the consumer
     renders the file-level observation either way).
     """
+    # resolve-first traversal parity (no target root in scope to
+    # confine against); the open stays fd-vetted regular + capped.
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        resolved = path.resolve()
     except OSError:
         return []
+    got = read_text_capped(resolved)
+    if got is None:
+        return []
+    text = got[0]
 
     observations: list[AttributeEvidence] = []
-    file_lines = text.split("\n")
+    file_lines = text.split("\n")  # line-model: universal-newline read_text_capped above
     for spelling in ALL_WUR_ALIASES:
         if spelling not in text:
             continue
@@ -2712,8 +2811,13 @@ def _extract_function_name_near_alias(
     ]
     joined = " ".join(filtered)
     cleaned = joined.replace(alias, " ")
-    cleaned = re.sub(r"__attribute__\s*\(\([^)]*\)\)", " ", cleaned)
-    cleaned = re.sub(r"/\*.*?\*/", " ", cleaned)
+    # The attribute body is bounded: with an unbounded span, hostile
+    # source repeating `__attribute__((` inside one close-paren-free
+    # run makes every opener re-scan the rest of the run — quadratic.
+    # Real attribute argument lists are tiny; 256 chars is generous
+    # (beyond it the decoration survives into the candidate scan).
+    cleaned = re.sub(r"__attribute__\s*\(\([^)]{0,256}\)\)", " ", cleaned)
+    cleaned = _sub_block_comments(cleaned, " ")
     cleaned = re.sub(r"//.*", " ", cleaned)
 
     # Collect ALL `<name>(` candidates first. We then prefer:
@@ -2810,7 +2914,10 @@ def compute_privilege_back_walk_evidence(
         facts = gather_prereqs(target)
     except Exception:  # noqa: BLE001
         return None
-    if facts.is_skipped:
+    if facts.is_skipped or not facts.complete:
+        # Both the "all paths gated" and the "no callers" claims
+        # quantify over the caller map — an incomplete sweep (an
+        # errored rule) may be missing exactly the ungated caller.
         return None
 
     callers = facts.callers_of(finding_function)
@@ -2933,11 +3040,13 @@ def _local_line_uses_privileged_cap(file_path: str, line_no: int) -> bool:
     """Fallback used only when adapter.py isn't importable. Reads the
     line at ``file_path:line_no`` and checks for any privileged cap
     constant. Functionally equivalent to adapter's helper but
-    duplicated here to break the import cycle in minimal installs."""
-    try:
-        with Path(file_path).open(encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-    except OSError:
+    duplicated here to break the import cycle in minimal installs —
+    including the forgery defence: the check runs on the sanitized
+    view so a constant planted in a comment or string cannot mint
+    privilege-gate evidence."""
+    from packages.source_intel._source_view import sanitized_lines
+    lines = sanitized_lines(file_path)
+    if lines is None:
         return False
     if line_no < 1 or line_no > len(lines):
         return False

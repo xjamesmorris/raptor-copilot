@@ -155,19 +155,23 @@ def evaluate_run(
     """
     findings = _load_findings(out_dir)
     result = EvaluationResult(
-        total_findings=len(findings),
+        # Verdict rows only: the graded file carries clean/dormant
+        # rows too, and counting them deflated fp_rate's denominator.
+        total_findings=sum(
+            1 for f in findings
+            if f.get("status", "") in ("finding", "suspicious")
+        ),
         total_ground_truth=len(ground_truth),
     )
 
-    truth_keys: dict[str, GroundTruthEntry] = {}
+    # Several planted bugs can share a file:function — keep a list per
+    # key so co-located entries are each countable (dropping duplicates
+    # left them neither TP nor FN).
+    truth_keys: dict[str, list[GroundTruthEntry]] = {}
     for entry in ground_truth:
-        k = entry.key()
-        if k in truth_keys:
-            logger.warning("duplicate ground-truth key %r — keeping first", k)
-            continue
-        truth_keys[k] = entry
+        truth_keys.setdefault(entry.key(), []).append(entry)
 
-    found_keys: set[str] = set()
+    found_ids: set[int] = set()
 
     for finding in findings:
         key = f"{finding.get('file', '')}:{finding.get('function', '')}"
@@ -176,10 +180,28 @@ def evaluate_run(
         if status not in ("finding", "suspicious"):
             continue
 
-        if key in truth_keys:
-            entry = truth_keys[key]
+        entries = truth_keys.get(key)
+        if entries is not None:
+            unfound = [e for e in entries if id(e) not in found_ids]
+            if not unfound:
+                # Every planted bug at this location is already
+                # credited; a re-report of a genuinely vulnerable
+                # function is neither a new detection nor a false
+                # positive.
+                continue
+            # Vuln type is a PREFERENCE among co-located entries, never
+            # a gate — finding and manifest type vocabularies differ,
+            # so a location hit with a non-matching type stays a TP.
+            ftype = str(
+                finding.get("vuln_type") or finding.get("cwe") or "",
+            ).strip().casefold()
+            entry = next(
+                (e for e in unfound
+                 if ftype and e.vuln_type.strip().casefold() == ftype),
+                unfound[0],
+            )
             result.true_positives.append(entry)
-            found_keys.add(key)
+            found_ids.add(id(entry))
 
             evidence_sources = _extract_evidence_sources(finding)
             for src in evidence_sources:
@@ -196,8 +218,8 @@ def evaluate_run(
                 cap = result.per_capability.setdefault(src, {"tp": 0, "fp": 0})
                 cap["fp"] += 1
 
-    for key, entry in truth_keys.items():
-        if key not in found_keys:
+    for entry in ground_truth:
+        if id(entry) not in found_ids:
             result.false_negatives.append(entry)
             cell_key = f"{entry.depth}:{entry.failure_mode or 'none'}"
             cell = result.per_cell.setdefault(cell_key, {"tp": 0, "fn": 0})
@@ -236,8 +258,9 @@ def format_evaluation(result: EvaluationResult) -> str:
     if result.false_positives:
         lines.append("")
         lines.append(f"### False positives ({len(result.false_positives)})")
+        # `or` — a present-but-null hypothesis raised on the slice.
         lines.extend(f"- {fp.get('file', '?')}:{fp.get('function', '?')} "
-                f"({fp.get('hypothesis', '?')[:60]})" for fp in result.false_positives[:10])
+                f"({(fp.get('hypothesis') or '?')[:60]})" for fp in result.false_positives[:10])
         if len(result.false_positives) > 10:
             lines.append(f"  ... and {len(result.false_positives) - 10} more")
 
@@ -276,7 +299,10 @@ def _load_findings(out_dir: Path) -> list[dict[str, Any]]:
         data = load_json(graded_path, strict=True, max_bytes=256 * 1024 * 1024)
         if data is None:  # vanished between exists() and the read
             raise FileNotFoundError(graded_path)
-        return data.get("findings", [])
+        if isinstance(data, list):
+            return data
+        rows = data.get("findings", [])
+        return rows if isinstance(rows, list) else []
 
     standard_path = out_dir / "findings.json"
     if standard_path.exists():
@@ -285,6 +311,7 @@ def _load_findings(out_dir: Path) -> list[dict[str, Any]]:
             raise FileNotFoundError(standard_path)
         if isinstance(data, list):
             return data
-        return data.get("findings", [])
+        rows = data.get("findings", [])
+        return rows if isinstance(rows, list) else []
 
     return []

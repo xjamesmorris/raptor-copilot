@@ -43,8 +43,9 @@ class TrajectoryStep:
     assistant turns. ``tool_results`` is a list of
     ``{tool_use_id, content, is_error}`` dicts for user turns.
 
-    Text and tool-result content are truncated at :data:`_MAX_TEXT_LEN`
-    in :func:`store.serialize_messages` to keep individual trajectories
+    Text and tool-result content are truncated at
+    ``store._MAX_TEXT_LEN`` (defined in :mod:`core.trajectories.store`)
+    by :func:`store.serialize_messages` to keep individual trajectories
     bounded. Truncation is indicated with a ``...[truncated N chars]``
     suffix.
     """
@@ -61,6 +62,14 @@ class TrajectoryStep:
     # "zero-token turn".
     input_tokens: int = 0
     output_tokens: int = 0
+    # Indices into ``text_blocks`` whose text was injected by the
+    # tool-use loop itself (budget warnings, steering nudges) rather
+    # than authored by the user. Persisted so a future
+    # trajectory-to-Message resume bridge can rebuild the
+    # ``loop_injected`` provenance tag instead of inheriting a
+    # tag-stripped history where loop text seeds as user-authored.
+    # Empty for legacy trajectories written before this field existed.
+    loop_injected_blocks: list[int] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

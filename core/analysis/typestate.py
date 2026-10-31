@@ -166,8 +166,16 @@ def extract_typestate_models(
     if not checklist:
         return models
 
-    items = checklist.get("items", [])
-    func_names = [item.get("name", "") for item in items]
+    # Walk the real checklist shape ({"files": [{"path": ..., "items":
+    # [...]}]}) through the producer package's shared walker. A flat
+    # top-level ``items`` read matched no artifact any producer emits,
+    # so the checklist leg of pair discovery silently never fired.
+    from core.inventory import iter_checklist_items
+
+    func_names = [
+        item.get("name", "")
+        for _file_path, _file_entry, item in iter_checklist_items(checklist)
+    ]
 
     # Discovery input: project-defined names PLUS callee names from the
     # Joern summaries. Callees cover external-library lifecycle APIs
@@ -238,7 +246,7 @@ def check_typestate_violations(
             models[key] = _build_alloc_free_model(alloc, free)
 
     violations: list[TypeStateViolation] = []
-    lines = source.split("\n")
+    lines = source.split("\n")  # line-model: byte-decoded prompt context; state tracking runs on strip()-normalised lines
 
     alloc_lookup: dict[str, list[TypeStateModel]] = {}
     free_lookup: dict[str, list[TypeStateModel]] = {}
@@ -554,7 +562,12 @@ def _check_resource_leaks(
     total_lines: int,
     violations: list[TypeStateViolation],
 ) -> None:
-    """Check for resources that were allocated but never freed."""
+    """Function-exit check for LOCK-model objects only: a lock still
+    held at exit reports ``lock_not_released``. Non-lock allocations
+    (malloc never freed) are deliberately NOT reported here — exit-
+    liveness for memory needs escape analysis this module doesn't do;
+    the ``resource_leak`` kind fires on realloc-without-free in the
+    operation checker instead."""
     for obj in tracked.values():
         if obj.state == "allocated" and obj.alloc_line > 0:
             is_lock = any(

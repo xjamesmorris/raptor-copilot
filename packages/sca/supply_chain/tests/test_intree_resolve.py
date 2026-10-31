@@ -184,3 +184,43 @@ def test_iron_target_dataclass_executable_predicate() -> None:
     assert not IntreeTarget(Path("/x"), "script").is_executable_payload
     assert not IntreeTarget(Path("/x"), "source").is_executable_payload
     assert not IntreeTarget(Path("/x"), "unknown").is_executable_payload
+
+
+def test_resolve_body_input_bounded(tmp_path) -> None:
+    """A giant hook body is cut (at a whitespace boundary) before
+    compound splitting — intree evidence is promote-only, so the
+    bound costs at most a missed promotion, never a missed hook
+    finding. References before the bound keep resolving."""
+    from packages.sca.supply_chain._intree_resolve import (
+        _MAX_RESOLVE_BODY_BYTES,
+        resolve_intree_targets,
+    )
+    payload = tmp_path / "run.sh"
+    payload.write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
+    body = "./run.sh\n" + ("echo pad\n" * (_MAX_RESOLVE_BODY_BYTES // 9 + 2))
+    targets = resolve_intree_targets(body, tmp_path)
+    assert [t.path.name for t in targets] == ["run.sh"]
+
+
+def test_multibyte_char_split_at_head_boundary_is_source(tmp_path) -> None:
+    """The fixed-size head read can split a multibyte UTF-8 char at
+    the 256-byte boundary; the resulting UnicodeDecodeError used to
+    classify plain TEXT as ``binary`` — a false intree_has_binary
+    promotion. Truncation at the tail is not binary content."""
+    from packages.sca.supply_chain._intree_resolve import (
+        _classify_first_bytes,
+    )
+    f = tmp_path / "notes.txt"
+    f.write_bytes(b"a" * 255 + "é".encode("utf-8") + b" plain text\n")
+    assert _classify_first_bytes(f) == "source"
+
+
+def test_genuinely_binary_head_still_binary(tmp_path) -> None:
+    """Invalid bytes BEFORE the tail window stay classified binary —
+    the truncation tolerance is 3 bytes, not a blanket pass."""
+    from packages.sca.supply_chain._intree_resolve import (
+        _classify_first_bytes,
+    )
+    f = tmp_path / "blob.dat"
+    f.write_bytes(b"\x89PNG-ish\xff\xfe" + b"\x00" * 300)
+    assert _classify_first_bytes(f) == "binary"

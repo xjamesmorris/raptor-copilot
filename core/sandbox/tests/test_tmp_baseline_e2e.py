@@ -40,10 +40,18 @@ def _sandbox_usable() -> bool:
     return False
 
 
-pytestmark = pytest.mark.skipif(
-    not _sandbox_usable(),
-    reason="sandbox enforcement unavailable on this host",
-)
+# Real-enforcement E2E on whichever kernel is underneath (Landlock on
+# Linux, seatbelt on macOS) — a real-kernel binding on BOTH platforms,
+# so both native markers ride alongside the capability probe and the
+# darwin-emulation gate deselects the file.
+pytestmark = [
+    pytest.mark.linux_native,
+    pytest.mark.darwin_native,
+    pytest.mark.skipif(
+        not _sandbox_usable(),
+        reason="sandbox enforcement unavailable on this host",
+    ),
+]
 
 
 def _write_probe_script(target_file: str) -> list[str]:

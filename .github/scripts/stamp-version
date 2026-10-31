@@ -14,6 +14,7 @@ from __future__ import annotations
 import re
 import sys
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
 TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(-[a-zA-Z0-9.]+)?$")
@@ -77,6 +78,7 @@ def stamp_pyproject(ver: str) -> str:
         text, count=1, flags=re.MULTILINE,
     )
     if n == 0:
+        print("warning: version pattern not found in pyproject.toml", file=sys.stderr)
         return ""
     atomic_write(path, text)
     match = re.search(r'^version = ".*"', text, re.MULTILINE)
@@ -121,27 +123,37 @@ def main() -> None:
 
     ver = tag.lstrip("v")
 
-    stamped = 0
+    # EVERY expected target must stamp, not just one. Warn-only per-file
+    # misses let a drifted README banner or CITATION.cff pattern ship a
+    # release with a stale version in that one file, flagged only by a
+    # log line nobody reads. The flip side of failing hard: deliberately
+    # retiring a stamp target now means removing it from this list, not
+    # just deleting the pattern from the file.
+    targets: list[tuple[str, Callable[[], str]]] = [
+        ("core/config/__init__.py", lambda: stamp_config(ver)),
+        ("CITATION.cff", lambda: stamp_citation(ver)),
+        ("pyproject.toml", lambda: stamp_pyproject(ver)),
+        ("README.md", lambda: stamp_readme(tag)),
+    ]
+    failures: list[str] = []
     print("Stamped:")
-    result = stamp_config(ver)
-    if result:
-        print(f"  {result}")
-        stamped += 1
-    result = stamp_citation(ver)
-    if result:
-        print(f"  {result}")
-        stamped += 1
-    result = stamp_pyproject(ver)
-    if result:
-        print(f"  {result}")
-        stamped += 1
-    result = stamp_readme(tag)
-    if result:
-        print(f"  {result}")
-        stamped += 1
+    for label, stamp in targets:
+        if label == "pyproject.toml" and not Path(label).exists():
+            # Optional target: present in source checkouts, permitted to
+            # be absent (e.g. a pruned tree). A PRESENT file whose
+            # pattern misses still fails below.
+            continue
+        result = stamp()
+        if result:
+            print(f"  {result}")
+        else:
+            failures.append(label)
 
-    if stamped == 0:
-        print("error: no files were stamped", file=sys.stderr)
+    if failures:
+        print(
+            "error: version pattern not stamped in: " + ", ".join(failures),
+            file=sys.stderr,
+        )
         sys.exit(1)
 
 

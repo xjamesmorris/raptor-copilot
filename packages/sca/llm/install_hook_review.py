@@ -87,7 +87,7 @@ def _review_one(
     """Run the LLM on a single install script."""
     blocks: list[UntrustedBlock] = [
         UntrustedBlock(
-            content=script_body,
+            content=_cap_script_body(script_body),
             kind="SCRIPT",
             origin=f"{ecosystem}/{pkg_name} scripts.{script_key}",
         ),
@@ -158,11 +158,19 @@ def _merge_verdict(
 
     if verdict.verdict == "malicious":
         finding.severity = "critical"
-        finding.confidence = Confidence(
-            level=verdict.confidence,
-            numeric=_confidence_numeric(verdict.confidence),
-            reason="LLM classified as malicious",
-        )
+        # Escalate-only applies to confidence too: a low-confidence LLM
+        # "malicious" must not replace the mechanical detector's high
+        # confidence with 0.30 — numeric-confidence consumers would rank
+        # the escalated finding BELOW untouched ones. Keep whichever
+        # confidence is higher (the LLM's stays in evidence either way).
+        llm_numeric = _confidence_numeric(verdict.confidence)
+        mechanical_numeric = getattr(finding.confidence, "numeric", 0.0) or 0.0
+        if llm_numeric >= mechanical_numeric:
+            finding.confidence = Confidence(
+                level=verdict.confidence,
+                numeric=llm_numeric,
+                reason="LLM classified as malicious",
+            )
     elif verdict.verdict == "suspicious" and finding.severity in ("low", "info"):
         finding.severity = "medium"
 
@@ -173,6 +181,31 @@ def _merge_verdict(
             if tag not in existing:
                 existing.append(tag)
         finding.evidence["reasons"] = existing
+
+
+# Package convention caps every untrusted prompt payload (version diff
+# 200k, changelog 10k, inline file 50k). script_body was the one
+# uncapped slot — a hostile multi-megabyte postinstall string could
+# dominate the prompt budget (burying the exfil-exemplar block) or trip
+# context limits so the review silently degraded to no-verdict.
+_SCRIPT_BODY_CAP = 50_000
+
+
+def _cap_script_body(body: str) -> str:
+    """Cap an install-script body, keeping head + tail.
+
+    Malicious payloads hide at either end (obfuscated preamble /
+    appended exfil one-liner), so sample both rather than truncating.
+    """
+    if len(body) <= _SCRIPT_BODY_CAP:
+        return body
+    half = _SCRIPT_BODY_CAP // 2
+    omitted = len(body) - 2 * half
+    return (
+        body[:half]
+        + f"\n... [{omitted} chars omitted — body exceeded review cap] ...\n"
+        + body[-half:]
+    )
 
 
 def _confidence_numeric(level: str) -> float:

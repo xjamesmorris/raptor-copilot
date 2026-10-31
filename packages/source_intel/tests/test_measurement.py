@@ -66,6 +66,21 @@ def test_result_to_verdict_missing_attr():
     assert M._result_to_verdict(r) == ValidatorVerdict.UNCERTAIN
 
 
+def test_result_to_verdict_error_state_is_uncertain():
+    # Error-state results don't raise: validate_dataflow_path returns
+    # them with ``error`` set and ``is_exploitable=False`` as a DEFAULT,
+    # not a verdict. Counting them as confident negatives skews the
+    # measured error rates in BOTH conditions.
+    r = SimpleNamespace(is_exploitable=False, error="LLM transport failed")
+    assert M._result_to_verdict(r) == ValidatorVerdict.UNCERTAIN
+
+
+def test_result_to_verdict_empty_error_still_confident():
+    # Two-direction: a falsy error field keeps the confident mapping.
+    r = SimpleNamespace(is_exploitable=False, error=None)
+    assert M._result_to_verdict(r) == ValidatorVerdict.NOT_EXPLOITABLE
+
+
 # =====================================================================
 # _is_memory_corruption — rule-id prefix filter
 # =====================================================================

@@ -95,7 +95,7 @@ class TestPrescreenHook:
         with patch.object(
             v, "_extract_path_conditions", return_value=([], {}),
         ) as extract, patch(
-            "packages.codeql.dataflow_validator.check_path_feasibility",
+            "packages.codeql.dataflow_validator.check_path_feasibility_dual",
             return_value=SimpleNamespace(
                 feasible=False, reasoning="stub", unsatisfied=[],
                 smt_available=True, model=None,
@@ -112,7 +112,7 @@ class TestPrescreenHook:
         with patch.object(
             v, "_extract_path_conditions", return_value=([], {}),
         ), patch(
-            "packages.codeql.dataflow_validator.check_path_feasibility",
+            "packages.codeql.dataflow_validator.check_path_feasibility_dual",
             return_value=SimpleNamespace(
                 feasible=False, reasoning="stub", unsatisfied=[],
                 smt_available=True, model=None,
@@ -130,7 +130,7 @@ class TestPrescreenHook:
         ), patch.object(
             v, "_extract_path_conditions", return_value=([], {}),
         ), patch(
-            "packages.codeql.dataflow_validator.check_path_feasibility",
+            "packages.codeql.dataflow_validator.check_path_feasibility_dual",
             return_value=SimpleNamespace(
                 feasible=False, reasoning="stub", unsatisfied=[],
                 smt_available=True, model=None,
@@ -148,7 +148,7 @@ class TestPrescreenHook:
         with patch.object(
             v, "_extract_path_conditions", return_value=([], {}),
         ), patch(
-            "packages.codeql.dataflow_validator.check_path_feasibility",
+            "packages.codeql.dataflow_validator.check_path_feasibility_dual",
             return_value=SimpleNamespace(
                 feasible=False, reasoning="stub", unsatisfied=[],
                 smt_available=True, model=None,

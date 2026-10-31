@@ -74,6 +74,14 @@ caller runs it:
 Fork-safety: only ``os`` syscall wrappers and str/bytes ops — callable
 from post-fork children and preexec functions (same constraints as
 core/sandbox/landlock.py / mount_ns.py setup code).
+
+Sibling: :mod:`core.source.beneath` carries the READER-side anchored
+open (``open_regular_beneath`` — openat2/dir-fd walk returning a file
+object, macOS-capable). Same walk doctrine, different substrate
+constraints: this module must stay fork-safe and returns an O_PATH
+pin for mount/grant targeting, so the two bodies deliberately do not
+merge — new READERS of attacker-influenced paths consume
+core.source, not this module.
 """
 
 from __future__ import annotations
@@ -82,7 +90,92 @@ import errno
 import os
 import stat as _stat
 
-__all__ = ["open_pinned"]
+__all__ = ["ViewAnchoredPath", "canonical_bind_path",
+           "is_per_process_procfs", "open_pinned"]
+
+
+class ViewAnchoredPath(str):
+    """A Landlock rule path anchored to the MOUNT VIEW, not the host.
+
+    Rule opens for a mount-tree spawn happen POST-pivot in the child,
+    where a bind target serves the validated (pinned) inode AT THE
+    BIND PATH — while the parent-side ``realpath`` of the same grant
+    resolves in the HOST view, which can name a tree the mount view
+    does not carry (an ``output=`` given as a symlink spelling
+    resolves to the symlink's destination; the view carries only the
+    bind path). Entries of this type are already canonical bind
+    paths; ``landlock._resolve_grant_paths`` passes them through
+    without the host-view ``realpath`` step, and the child's pinned
+    walk still refuses any symlink met inside the view (there are
+    none by construction — the bind machinery refuses symlink
+    components — so a hit is tamper). Produced only by the spawn
+    assembly for grants it verified against the bind set
+    (``_spawn._anchor_grants_to_bind_view``).
+    """
+
+    __slots__ = ()
+
+
+def canonical_bind_path(path: str) -> str:
+    """``os.path.abspath`` plus leading-double-slash collapse.
+
+    POSIX reserves an exactly-two-slash prefix as implementation-
+    defined, so ``abspath`` (and ``normpath``) PRESERVE it: ``//tmp``
+    stays ``//tmp`` while naming the same file as ``/tmp``. Every
+    exact-string policy comparison over bind paths — the per-ns
+    shadow-path refusal, ancestor classification, masked-path
+    refusal, target/output identity checks — must therefore run on
+    ONE spelling, or the two-slash form walks around the policy
+    (e.g. ``//tmp`` in readable_paths binding HOST /tmp over the
+    fresh per-sandbox tmpfs). Same class as the collapse inside
+    :func:`is_per_process_procfs` below — centralised here so the
+    next path consumer doesn't re-grow the hole.
+
+    Fork-safe (str ops + ``os.path`` only), same contract as the rest
+    of this module.
+    """
+    path = os.path.abspath(path)
+    if path.startswith("//"):
+        path = "/" + path.lstrip("/")
+    return path
+
+# procfs magic links whose resolution is a property of the WALKING
+# process: /proc/self and /proc/thread-self name a different pid dir
+# for every reader, so no two processes' walks of the same path land
+# on the same inode.
+_PER_PROCESS_PROCFS = ("/proc/self", "/proc/thread-self")
+
+
+def is_per_process_procfs(path: str) -> bool:
+    """True for paths at or beneath a per-process procfs magic link.
+
+    ``path`` must already be absolute and normalized (all callers
+    ``os.path.abspath`` / ``normpath`` first). These paths are
+    volatile by construction — the file identity changes with every
+    reader — so no cross-process identity pin, inode-bound rule, or
+    parent-resolved grant can ever hold for them:
+
+    * the mount-ns bind pin skips them (a parent-taken pin can never
+      match the forked child's walk; procfs serves the paths
+      per-reader, so there is nothing to bind either);
+    * Landlock grant resolution skips them (a parent-side realpath
+      would bind the inode rule to the PARENT's pid dir — granting
+      the child the parent's files while never matching the child's
+      own reads).
+
+    Real-filesystem paths are never in this class; every pin and
+    tamper refusal stays intact for them.
+    """
+    if path.startswith("//"):
+        # POSIX reserves an exactly-two-slash prefix, so abspath and
+        # normpath both PRESERVE it ("//proc/self/x" stays
+        # "//proc/self/x") while realpath still resolves it into a
+        # pid dir — a spelling that would otherwise escape this
+        # classification and reach the cross-process consumers.
+        # Collapse leading slashes for classification only.
+        path = "/" + path.lstrip("/")
+    return any(path == p or path.startswith(p + "/")
+               for p in _PER_PROCESS_PROCFS)
 
 # O_PATH is Linux-only; the pinned walk backs the mount-ns bind
 # machinery, which never engages on platforms without it (macOS uses

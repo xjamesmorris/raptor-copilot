@@ -40,10 +40,17 @@ def _find_frida_site() -> str | None:
         if not python or not os.path.isfile(python):
             return None
         try:
+            # Sanitised env (the codeql version-probe idiom): a bare
+            # python probe would import through the shell's
+            # PYTHONPATH / PYTHONSTARTUP.
+            from core.security.env_sanitisation import (
+                safe_subprocess_env,
+            )
             r = subprocess.run(
                 [python, "-c",
                  "import frida; print(frida.__file__)"],
                 capture_output=True, text=True, timeout=5,
+                env=safe_subprocess_env(strip_target_markers=True),
             )
             if r.returncode == 0 and r.stdout.strip():
                 site = Path(r.stdout.strip()).parent.parent
@@ -173,6 +180,13 @@ def main() -> int:
     if out_dir and not os.path.isdir(out_dir):
         os.makedirs(out_dir, exist_ok=True)
 
+    # restrict_reads carries the fileless-exec seccomp deny; the frida
+    # profile carves memfd_create back out of it (agent injection
+    # writes frida-agent.so into a memfd and the target dlopen-maps it
+    # from /proc/self/fd — the wholesale deny aborts every spawn/attach
+    # at injection). Consented-instrumentation rationale and the
+    # execveat arm that stays: core/sandbox/seccomp.py,
+    # _make_seccomp_preexec docstring.
     result = sandbox_run(
         cmd,
         profile="frida",

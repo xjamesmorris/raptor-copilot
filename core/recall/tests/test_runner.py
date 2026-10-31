@@ -79,6 +79,46 @@ class TestArgv:
                                    tmp_path)
         assert argv[2] == "agentic"
 
+    def test_agentic_taint_profile_exact_argv(self, tmp_path):
+        # The flip-gate candidate: full-list equality — the profile is
+        # the agentic argv plus exactly `--taint-crossfile` (any other
+        # drift would make baseline/candidate deltas unattributable).
+        argv = build_pipeline_argv(_manifest("agentic-taint"),
+                                   tmp_path / "t", tmp_path)
+        assert argv == [
+            sys.executable, str(tmp_path / "raptor.py"), "agentic",
+            "--repo", str(tmp_path / "t"), "--taint-crossfile",
+            "--project", "-",
+        ]
+
+    def test_agentic_taint_pins_out_dir_like_agentic(self, tmp_path):
+        out = tmp_path / "run" / "pipeline-run"
+        argv = build_pipeline_argv(_manifest("agentic-taint"),
+                                   tmp_path / "t", tmp_path,
+                                   pipeline_out=out)
+        assert argv[argv.index("--out") + 1] == str(out)
+        # --out rides between the flag and the projectless pin, like
+        # every profile; the engine flag stays immediately after the
+        # base agentic argv.
+        assert argv.index("--taint-crossfile") < argv.index("--out")
+
+    def test_existing_profiles_argv_unchanged(self, tmp_path):
+        # Differential pin: adding agentic-taint must leave the three
+        # pre-existing profiles' argv byte-identical. Full-list
+        # equality so ANY drift (reordering, new flags) reds this.
+        t, root = tmp_path / "t", tmp_path
+        base = [sys.executable, str(root / "raptor.py")]
+        cases = {
+            "scan": [*base, "scan", "--repo", str(t), "--project", "-"],
+            "scan-codeql": [*base, "scan", "--repo", str(t), "--codeql",
+                            "--project", "-"],
+            "agentic": [*base, "agentic", "--repo", str(t),
+                        "--project", "-"],
+        }
+        for profile, want in cases.items():
+            assert build_pipeline_argv(_manifest(profile), t,
+                                       root) == want, profile
+
     def test_build_command_threaded(self, tmp_path):
         argv = build_pipeline_argv(
             _manifest("scan", build_command="make -j2"),
@@ -108,15 +148,22 @@ class TestArgv:
 
 
 class TestRunPipeline:
-    def _proc(self, stdout="", rc=0):
-        return SimpleNamespace(stdout=stdout, stderr="", returncode=rc)
+    def _proc(self, stdout="", rc=0, stderr=""):
+        """side_effect for the streamed subprocess.run call shape:
+        writes the fake pipeline output to the passed stdout/stderr
+        files (the runner no longer buffers the streams)."""
+        def _run(argv, **kw):
+            kw["stdout"].write(stdout.encode("utf-8"))
+            kw["stderr"].write(stderr.encode("utf-8"))
+            return SimpleNamespace(returncode=rc)
+        return _run
 
     def test_sentinel_parsed_and_log_written(self, tmp_path):
         out = tmp_path / "run_out"
         out.mkdir()
         log = tmp_path / "pipeline.log"
         with patch("core.recall.runner.subprocess.run",
-                   return_value=self._proc(f"noise\nOUTPUT_DIR={out}\n")):
+                   side_effect=self._proc(f"noise\nOUTPUT_DIR={out}\n")):
             got = run_pipeline(_manifest(), tmp_path / "t", tmp_path, log)
         assert got == out
         assert "OUTPUT_DIR" in log.read_text(encoding="utf-8")
@@ -132,14 +179,14 @@ class TestRunPipeline:
         log = tmp_path / "pipeline.log"
         stdout = f"OUTPUT_DIR={early}\nprogress\nOUTPUT_DIR={final}\n"
         with patch("core.recall.runner.subprocess.run",
-                   return_value=self._proc(stdout)):
+                   side_effect=self._proc(stdout)):
             got = run_pipeline(_manifest(), tmp_path / "t", tmp_path, log)
         assert got == final
 
     def test_missing_sentinel_errors(self, tmp_path):
         log = tmp_path / "pipeline.log"
         with patch("core.recall.runner.subprocess.run",
-                   return_value=self._proc("no sentinel here", rc=3)), \
+                   side_effect=self._proc("no sentinel here", rc=3)), \
              pytest.raises(RunnerError, match="OUTPUT_DIR"):
             run_pipeline(_manifest(), tmp_path / "t", tmp_path, log)
 
@@ -156,7 +203,7 @@ class TestRunPipeline:
         elsewhere = tmp_path / "project_dir"
         elsewhere.mkdir()
         with patch("core.recall.runner.subprocess.run",
-                   return_value=self._proc(f"OUTPUT_DIR={elsewhere}\n")):
+                   side_effect=self._proc(f"OUTPUT_DIR={elsewhere}\n")):
             got = run_pipeline(_manifest(), tmp_path / "t", tmp_path, log)
         assert got == pinned
         assert "diverges" in caplog.text
@@ -165,7 +212,7 @@ class TestRunPipeline:
         out = tmp_path / "run_out"
         out.mkdir()
         with patch("core.recall.runner.subprocess.run",
-                   return_value=self._proc(f"OUTPUT_DIR={out}\n", rc=1)):
+                   side_effect=self._proc(f"OUTPUT_DIR={out}\n", rc=1)):
             got = run_pipeline(_manifest(), tmp_path / "t", tmp_path,
                                tmp_path / "l.log")
         assert got == out
@@ -174,7 +221,7 @@ class TestRunPipeline:
         out = tmp_path / "run_out"
         out.mkdir()
         with patch("core.recall.runner.subprocess.run",
-                   return_value=self._proc(f"OUTPUT_DIR={out}\n")), \
+                   side_effect=self._proc(f"OUTPUT_DIR={out}\n")), \
              caplog.at_level("WARNING"):
             run_pipeline(_manifest("agentic"), tmp_path / "t", tmp_path,
                          tmp_path / "l.log")
@@ -246,3 +293,93 @@ class TestCollectFindings:
 
     def test_empty_dir(self, tmp_path):
         assert collect_findings(tmp_path) == []
+
+
+class TestStreamedPipelineOutput:
+    """The pipeline's stdout/stderr stream to disk — a multi-hour
+    run's output is never buffered in memory to grep one sentinel."""
+
+    def test_run_called_with_file_streams(self, tmp_path):
+        out = tmp_path / "run_out"
+        out.mkdir()
+        log = tmp_path / "pipeline.log"
+        seen = {}
+
+        def _run(argv, **kw):
+            seen.update(kw)
+            kw["stdout"].write(f"OUTPUT_DIR={out}\n".encode())
+            kw["stderr"].write(b"warn: something\n")
+            return SimpleNamespace(returncode=0)
+
+        with patch("core.recall.runner.subprocess.run",
+                   side_effect=_run):
+            got = run_pipeline(_manifest(), tmp_path / "t", tmp_path,
+                               log)
+        assert got == out
+        assert not seen.get("capture_output"), (
+            "pipeline output buffered in memory"
+        )
+        assert hasattr(seen.get("stdout"), "write")
+        assert hasattr(seen.get("stderr"), "write")
+        body = log.read_text(encoding="utf-8")
+        # Log keeps its historical shape: stdout, separator, stderr.
+        assert f"OUTPUT_DIR={out}" in body
+        assert "--- stderr ---" in body
+        assert "warn: something" in body
+        assert body.index("OUTPUT_DIR") < body.index("--- stderr ---")
+        # No temp stream file left behind.
+        assert not list(tmp_path.glob("*.stderr.tmp"))
+
+    def test_symlink_swapped_stderr_tmp_refused(self, tmp_path):
+        # The temp stream file has a predictable name in a directory
+        # the pipeline's children write under; a child swapping it
+        # for a symlink must get a refusal at the reopen, never have
+        # its target's bytes copied into the log.
+        victim = tmp_path / "victim"
+        victim.write_text("INJECTED-VICTIM-LINE\n", encoding="utf-8")
+        out = tmp_path / "run_out"
+        out.mkdir()
+        log = tmp_path / "pipeline.log"
+
+        def _run(argv, **kw):
+            kw["stdout"].write(f"OUTPUT_DIR={out}\n".encode())
+            kw["stderr"].write(b"real stderr\n")
+            stderr_tmp = log.with_suffix(log.suffix + ".stderr.tmp")
+            stderr_tmp.unlink()
+            stderr_tmp.symlink_to(victim)
+            return SimpleNamespace(returncode=0)
+
+        with patch("core.recall.runner.subprocess.run",
+                   side_effect=_run), \
+                pytest.raises(RunnerError, match="hardened reopen"):
+            run_pipeline(_manifest(), tmp_path / "t", tmp_path, log)
+        assert "INJECTED-VICTIM-LINE" not in log.read_text(
+            encoding="utf-8")
+
+    def test_symlink_swapped_log_refused_before_sentinel_binding(
+            self, tmp_path):
+        # Same swap on the log itself: the sentinel scan reopens the
+        # log after the children ran, and a planted symlink there
+        # must be refused rather than let an attacker-chosen file
+        # supply the OUTPUT_DIR binding.
+        attacker_dir = tmp_path / "attacker"
+        attacker_dir.mkdir()
+        bait = tmp_path / "bait.log"
+        bait.write_text(f"OUTPUT_DIR={attacker_dir}\n",
+                        encoding="utf-8")
+        log = tmp_path / "pipeline.log"
+
+        def _run(argv, **kw):
+            kw["stdout"].write(b"noise\n")
+            log.unlink()
+            log.symlink_to(bait)
+            return SimpleNamespace(returncode=0)
+
+        # RunnerError, not bare OSError: the refusal is a deliberate
+        # fail-closed verdict and must ride the runner's clean error
+        # channel (the CLI prints ``error:`` for RunnerError; a bare
+        # OSError surfaces as a traceback).
+        with patch("core.recall.runner.subprocess.run",
+                   side_effect=_run), \
+                pytest.raises(RunnerError, match="hardened reopen"):
+            run_pipeline(_manifest(), tmp_path / "t", tmp_path, log)

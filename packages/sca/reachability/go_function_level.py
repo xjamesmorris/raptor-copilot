@@ -21,9 +21,10 @@ match against Go projects.
 ## Verdict transitions (mirror the PyPI + npm tiers)
 
   * Any affected function CALLED → ``likely_called``.
-  * All affected functions NOT_CALLED, none UNCERTAIN →
-    ``not_function_reachable``.
-  * Any UNCERTAIN OR mixed → leave at ``imported``.
+  * EVERY advisory-listed symbol evaluated and NOT_CALLED, none
+    UNCERTAIN → ``not_function_reachable``.
+  * Any UNCERTAIN, mixed, or unevaluable entry → leave at
+    ``imported``.
 
 ## Qualified-name shape
 
@@ -49,13 +50,36 @@ because the resolver concatenates middle parts.
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Any
 from collections.abc import Iterable
 
 from ..models import Confidence, Dependency, Reachability
+from ._shared import UNRESOLVED_ENTRY
+
+# The Go extractor's convention authority for what binding names a
+# bare ``import "<path>"`` makes available: last path segment PLUS
+# the /vN pre-version segment (path-versioned modules declare the
+# pre-version package name) and go-/hyphen aliases (go-multierror →
+# package multierror). Shared so the advisory-entry rebinds below
+# can never drift from what the call-graph pass actually binds.
+from core.inventory.call_graph import _go_bare_binding_names
 
 logger = logging.getLogger(__name__)
+
+
+_VERSION_SUFFIX_RE = re.compile(r"/v\d+$")
+
+
+def _unversioned_root(module_path: str) -> str:
+    """The module path without its ``/vN`` major-version suffix
+    (``github.com/foo/bar/v2`` → ``github.com/foo/bar``), or ``""``
+    when the path carries no version suffix. A ``/vN`` module is the
+    SAME dependency spelled for a different major — advisory entries
+    routinely use the unversioned spelling."""
+    stripped = _VERSION_SUFFIX_RE.sub("", module_path)
+    return stripped if stripped != module_path else ""
 
 
 def build_go_symbol_map(
@@ -110,9 +134,15 @@ def _extract_qualified(advisory: Any, dep_name: str) -> list[str]:
     ``"<path>.<symbol>"``.
 
     Flat fallback shapes (``affected_symbols`` /
-    ``affected_functions``) lack a per-symbol path; for those we
-    emit ``"<dep_name>.<symbol>"`` — operator gets module-level
-    matching for that case.
+    ``affected_functions``) lack a per-symbol path. An entry that
+    already carries the ``<dep_name>.`` or ``<dep_name>/`` prefix is
+    emitted verbatim; an entry spelled with the package TAIL
+    (``lib.Parse`` under ``example.com/lib``) is rebound onto the
+    module path; every dotted entry additionally emits the
+    slash-joined direct-sub-package twin
+    (``<dep_name>/<seg0>.<rest>``) and keeps the blindly-prefixed
+    twin; anything else is emitted as ``"<dep_name>.<symbol>"`` —
+    operator gets module-level matching for that case.
     """
     out: list[str] = []
     es = getattr(advisory, "ecosystem_specific", None) or {}
@@ -124,22 +154,107 @@ def _extract_qualified(advisory: Any, dep_name: str) -> list[str]:
             if not isinstance(imp, dict):
                 continue
             path = imp.get("path")
+            junk_path = path is not None and not isinstance(path, str)
             symbols = imp.get("symbols") or []
+            if not isinstance(symbols, list):
+                # Junk-shaped container (a bare string iterates
+                # char-by-char into garbage queries): one counted
+                # marker instead.
+                out.append(UNRESOLVED_ENTRY)
+                continue
             for s in symbols:
-                if not isinstance(s, str):
+                if not (isinstance(s, str) and s):
+                    continue
+                if junk_path:
+                    # A junk (non-string) path admits no honest
+                    # composition — dep-qualifying its symbols is a
+                    # guess whose wrong readings pair NOT_CALLED and
+                    # satisfy the coverage gate. Count the entry
+                    # unresolved so the tier abstains instead.
+                    out.append(UNRESOLVED_ENTRY)
                     continue
                 head = path if isinstance(path, str) and path else dep_name
                 if not head:
                     continue
                 out.append(f"{head}.{s}")
-    # Flat-list fallback — no per-symbol path.
+    # Flat-list fallback — no per-symbol path. Blindly composing ONE
+    # reading of an entry minted well-formed garbage queries the
+    # resolver answers NOT_CALLED, manufacturing a false
+    # high-confidence ``not_function_reachable`` on a symbol the
+    # project genuinely calls. Per entry, emit the honest query for
+    # EVERY plausible reading — all twins are counted and queried, so
+    # whichever reading the advisory meant, the honest query is
+    # present and a flat entry can never pair vacuously and mint the
+    # suppression:
+    #   * already fully qualified, dot-joined (``<dep_name>.<sym>``)
+    #     or slash-joined sub-package path
+    #     (``example.com/lib/sub.Parse`` — the canonical OSV symbol
+    #     shape appearing in a flat list) → verbatim;
+    #   * package-TAIL spelling (``lib.Parse`` under
+    #     ``example.com/lib`` — the source-level spelling
+    #     human-written advisory function lists use, since Go call
+    #     sites read ``lib.Parse``) → rebind onto the module path
+    #     (``example.com/lib.Parse``);
+    #   * dotted head that may name a direct SUB-PACKAGE
+    #     (``sub.Parse`` meaning ``example.com/lib/sub.Parse`` —
+    #     realistically ``ssh.ParsePublicKey`` under
+    #     ``golang.org/x/crypto``) → slash-joined twin;
+    #   * every dotted entry keeps the blindly-prefixed twin
+    #     (``example.com/lib.lib.Parse``) for the rare type genuinely
+    #     named after its package, and bare entries get the plain
+    #     module-path prefix.
+    # A NESTED sub-package tail (``b.Parse`` meaning
+    # ``example.com/lib/a/b.Parse``) has no statically-composable
+    # honest spelling here — the refine pass closes it by deriving
+    # twins from the project's own imports of this module (a project
+    # can only call the function after importing its package, so the
+    # import-derived twin always exists for a called function).
+    #
+    # Tail candidates come from the Go extractor's binding-name
+    # conventions, NOT the literal last path segment alone: a
+    # path-versioned module (``github.com/foo/bar/v2``) declares
+    # package ``bar``, and a ``go-<name>`` repo declares its package
+    # without the prefix — the literal-tail-only rebind composed
+    # garbage for both classes and re-minted the suppression on
+    # their source-level spellings.
+    tails: list[str] = (
+        [t for t in _go_bare_binding_names(dep_name) if t]
+        if dep_name else []
+    )
+    root: str = _unversioned_root(dep_name) if dep_name else ""
     for key in ("affected_symbols", "affected_functions"):
         for source in (es, ds):
             if not isinstance(source, dict):
                 continue
             v = source.get(key)
-            if isinstance(v, list):
-                out.extend(f"{dep_name}.{s}" for s in v if isinstance(s, str) and dep_name)
+            if not (isinstance(v, list) and dep_name):
+                continue
+            for s in v:
+                if not (isinstance(s, str) and s):
+                    continue
+                if s.startswith(dep_name + ".") or s.startswith(dep_name + "/"):
+                    out.append(s)
+                    continue
+                if root and (s.startswith(root + ".")
+                             or s.startswith(root + "/")):
+                    spelled_rest = s[len(root):]
+                    # The unversioned-root spelling names the SAME
+                    # module (advisories routinely omit the /vN
+                    # suffix) — respell it onto the dep's module
+                    # path so the honest query exists. A remainder
+                    # opening with ANOTHER version segment is a
+                    # different major, not a respell target.
+                    if not re.match(r"/v\d+[./]", spelled_rest):
+                        out.append(s)
+                        out.append(f"{dep_name}{spelled_rest}")
+                        continue
+                for t in tails:
+                    if len(s) > len(t) + 1 and s.startswith(t + "."):
+                        out.append(f"{dep_name}.{s[len(t) + 1:]}")
+                seg0, _, rest = s.partition(".")
+                if seg0 and rest:
+                    out.append(f"{dep_name}/{seg0}.{rest}")
+                out.append(f"{dep_name}.{s}")
     return out
 
 
@@ -193,25 +308,139 @@ def refine_go_verdicts(
             return
 
     from core.analysis.reachability import (
+        ReachabilityResult,
         Verdict,
         function_called,
     )
 
+    # The project's import universe — every import path the
+    # call-graph pass recorded. Used to derive per-entry twins for
+    # advisory spellings that name a sub-package by tail or by
+    # relative dotted path: a project can only CALL a function after
+    # IMPORTING its package, so for any spelling of a genuinely
+    # called function the import-derived twin exists and binds — the
+    # statically-composed reading can never pair vacuously alone.
+    universe: set[str] = {
+        v
+        for f in (inventory.get("files") or [])
+        for v in ((f.get("call_graph") or {}).get("imports") or {}).values()
+        if isinstance(v, str) and v
+    }
+
+    # Prefer-stronger ordering for combining one entry's verdicts
+    # across its reading twins: any CALLED wins outright, else any
+    # UNCERTAIN, and NOT_CALLED only when every reading came back
+    # not-called.
+    strength = {Verdict.NOT_CALLED: 0, Verdict.UNCERTAIN: 1, Verdict.CALLED: 2}
+
+    # Binding-name conventions per imported path (versioned modules
+    # bind the pre-version segment, go-/hyphen repos bind the
+    # collapsed forms) — memoised, the universe is shared across deps.
+    _bare_names_cache: dict[str, list[str]] = {}
+
+    def _bare_names(pth: str) -> list[str]:
+        names = _bare_names_cache.get(pth)
+        if names is None:
+            names = _go_bare_binding_names(pth)
+            _bare_names_cache[pth] = names
+        return names
+
     for d in candidates:
+        dep_module = d.name
+        dep_root = _unversioned_root(dep_module)
         qualified_names = go_symbol_map[d.key()]
         paired = []
         for qualified in qualified_names:
             if not qualified or "." not in qualified:
                 continue
-            try:
-                paired.append((qualified, function_called(inventory, qualified)))
-            except ValueError:
+            queries: list[str] = [qualified]
+            # Import-derived sub-package twins (restricted to imports
+            # under THIS dep's module path — a crafted entry can never
+            # borrow another module's packages): for a reading
+            # ``<module>.<head>.<rest>``, every imported
+            # ``<module>/...`` path whose binding names contain the
+            # head, or whose slash-relative path dot-spells a prefix
+            # of the remainder, yields a ``<import_path>.<suffix>``
+            # twin; the module-ROOT import contributes the honest
+            # reading of ``<module>.<binding>.<rest>`` (the middle
+            # segment being one of the module's own binding names —
+            # the advisory-literal blind spelling of a /vN or go-
+            # module); a BARE remainder (``<module>.<sym>``) twins
+            # onto every imported sub-package, since a flat advisory
+            # entry names a function that may live in any package of
+            # the module. A ``<unversioned-root>.``-spelled reading
+            # is the SAME dep (/vN is version selection) and is
+            # respelled onto the module path first.
+            rem = ""
+            if dep_module and qualified.startswith(dep_module + "."):
+                rem = qualified[len(dep_module) + 1:]
+            elif dep_root and qualified.startswith(dep_root + "."):
+                rem = qualified[len(dep_root) + 1:]
+                respelled = f"{dep_module}.{rem}"
+                if respelled not in queries:
+                    queries.append(respelled)
+            if rem:
+                if "/" in rem:
+                    # TRAILING-PATH spelling riding the blindly-
+                    # prefixed reading (``<module>.foo/bar.Parse``
+                    # from flat entry ``foo/bar.Parse``): a realistic
+                    # human spelling of the import path by its tail.
+                    # Rebind the slashy head onto the module or any
+                    # imported sub-package whose path ends with it at
+                    # a ``/`` boundary — still restricted to THIS
+                    # dep's module, so a fully-qualified FOREIGN
+                    # module spelling derives nothing and the
+                    # downgrade arm stays honest.
+                    trail_end = rem.find(".", rem.rfind("/"))
+                    if trail_end > 0 and rem[trail_end + 1:]:
+                        p_head = rem[:trail_end]
+                        sym_rest = rem[trail_end + 1:]
+                        for pth in universe:
+                            if not (pth == dep_module
+                                    or pth.startswith(dep_module + "/")):
+                                continue
+                            if (pth == p_head
+                                    or pth.endswith("/" + p_head)):
+                                twin = f"{pth}.{sym_rest}"
+                                if twin not in queries:
+                                    queries.append(twin)
+                head, _, rest = rem.partition(".")
+                for pth in universe:
+                    twin = None  # type: ignore[assignment]
+                    if pth == dep_module:
+                        if rest and head and head in _bare_names(pth):
+                            twin = f"{pth}.{rest}"
+                    elif pth.startswith(dep_module + "/"):
+                        rel_dot = pth[len(dep_module) + 1:].replace("/", ".")
+                        if rem.startswith(rel_dot + "."):
+                            suffix = rem[len(rel_dot) + 1:]
+                            if suffix:
+                                twin = f"{pth}.{suffix}"
+                        elif rest and head and head in _bare_names(pth):
+                            twin = f"{pth}.{rest}"
+                        elif not rest and head:
+                            twin = f"{pth}.{head}"
+                    if twin and twin not in queries:
+                        queries.append(twin)
+            best: ReachabilityResult | None = None
+            for q in queries:
+                try:
+                    r = function_called(inventory, q)
+                except ValueError:
+                    continue
+                if best is None or strength[r.verdict] > strength[best.verdict]:
+                    best = r
+                if best.verdict == Verdict.CALLED:
+                    break
+            if best is None:
                 continue
+            paired.append((qualified, best))
 
         if not paired:
             continue
 
         verdicts = {r.verdict for _, r in paired}
+        covered = len(paired) == len(qualified_names)
         if Verdict.CALLED in verdicts:
             evidence_lines: list[str] = []
             called_qns: list[str] = []
@@ -231,7 +460,12 @@ def refine_go_verdicts(
                 ),
                 affected_summary=affected,
             )
-        elif Verdict.UNCERTAIN in verdicts:
+        elif Verdict.UNCERTAIN in verdicts or not covered:
+            # ``not covered``: at least one advisory entry was never
+            # evaluated (unresolvable spelling / resolver refusal) —
+            # claiming "all listed symbols unreached" from the
+            # bindable remainder would be a false suppression. Same
+            # epistemic state as UNCERTAIN → preserve the verdict.
             continue
         else:
             out[d.key()] = Reachability(

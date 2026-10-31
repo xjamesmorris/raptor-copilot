@@ -38,9 +38,13 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
+from core.source.lines import split_lines
 from pathlib import Path
 from typing import Any
 from typing import TYPE_CHECKING
+
+from core.paths import confine
+from core.source import DEFAULT_MAX_SOURCE_CHARS, read_bytes_capped, read_text_capped
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
@@ -58,6 +62,21 @@ _SENTINEL = -1
 # Self-limits (return-census discipline: a detector must bound its own
 # work and stamp truncation rather than stall the prep phase).
 _DEFAULT_BUDGET_S = 20.0
+# Deliberately NOT derived from sweep size (unlike the census budget
+# in callsite_consistency): raising this buys nothing on large trees
+# today — findings are gated by ``proven_wider = wider and not
+# truncated`` and BOTH supporting walks truncate structurally on any
+# root with more than _MAX_WALK_FILES C-family files (a kernel tree
+# has ~64k: the definition walk never reaches mm//fs//kernel/ in walk
+# order, and the truncated constants walk is excluded from its cache
+# so it repeats per derivation). A bigger wall-clock budget converts
+# a 20s zero-yield sweep into a minutes-long zero-yield sweep. The
+# real fix is a walk-cap/indexing redesign (cache the complete
+# per-root enumeration, indexed definition lookup) — until it lands
+# the fixed budget is the honest bound. The truncation gate also
+# fail-closes a wrong-definition hazard the capped walk creates
+# (walk-order matches in tools//samples/ shadowing the real kernel
+# definitions); do not relax it independently.
 _MAX_HOPS = 2
 _MAX_DEFINITIONS = 4
 _MAX_SITES_PER_FILE = 200
@@ -408,7 +427,7 @@ def sentinel_comparison_sites(
         logger.debug("return_domain: parse failed for %s", file_path,
                      exc_info=True)
         return []
-    lines = source.splitlines()
+    lines = split_lines(source)
     sites: list[SentinelSite] = []
     for node in _walk(tree.root_node):
         if node.type != "call_expression":
@@ -484,10 +503,16 @@ def _find_definitions(
         for path in _c_family_files(root, budget):
             if not budget.ok() or len(results) >= _MAX_DEFINITIONS:
                 break
-            try:
-                raw = path.read_bytes()
-            except OSError:
+            resolved_p = confine(root, path)
+            if resolved_p is None:
                 continue
+            got = read_bytes_capped(resolved_p, DEFAULT_MAX_SOURCE_CHARS)
+            if got is None or got[1]:
+                # over-cap refuses whole (a truncated definition
+                # must not parse as the real one), same as the WUR
+                # scan's skip
+                continue
+            raw = got[0]
             if not prefilter.search(raw):
                 continue
             lang = _language_of(str(path)) or "c"
@@ -571,7 +596,9 @@ def _strip_include_guard(text: str) -> str:
 _CONSTANTS_CACHE: dict[str, dict[str, int]] = {}
 
 
-def _constants_for_root(root: Path) -> dict[str, int]:
+def _constants_for_root(
+    root: Path, budget: _Budget | None = None,
+) -> dict[str, int]:
     """Uniqueness-gated integer constants under *root*, include-guard
     aware.
 
@@ -581,16 +608,22 @@ def _constants_for_root(root: Path) -> dict[str, int]:
     family must not read as conditional merely because the header
     guards itself. Local to this witness; the SMT-facing table keeps
     its stricter reading.
+
+    *budget* is the caller's LIVE budget — minting a fresh default here
+    let a nearly-exhausted derivation spend another whole window on the
+    header walk. A walk cut short by exhaustion is never cached (the
+    partial table must not poison later full-budget callers).
     """
     cache_key = str(root)
-    if cache_key in _CONSTANTS_CACHE:
-        return _CONSTANTS_CACHE[cache_key]
+    with _DOMAIN_CACHE_LOCK:
+        if cache_key in _CONSTANTS_CACHE:
+            return _CONSTANTS_CACHE[cache_key]
     try:
         from core.inventory.macro_resolve import (
-            _ENUM_BLOCK_RE,
             _ENUMERATOR_NAME_RE,
             _MACRO_DEF_RE,
             _SKIP_IDENTS_C,
+            _iter_enum_bodies,
             _parse_enumerator_value,
         )
 
@@ -599,18 +632,22 @@ def _constants_for_root(root: Path) -> dict[str, int]:
             _try_evaluate,
         )
     except ImportError:
-        _CONSTANTS_CACHE[cache_key] = {}
+        with _DOMAIN_CACHE_LOCK:
+            _CONSTANTS_CACHE[cache_key] = {}
         return {}
     defs: dict[str, list[int]] = {}
-    budget = _Budget(_DEFAULT_BUDGET_S)
+    if budget is None:
+        budget = _Budget(_DEFAULT_BUDGET_S)
     for path in _c_family_files(Path(root), budget):
         if not budget.ok():
             break
-        try:
-            text = path.read_text(errors="replace", encoding="utf-8")
-        except OSError:
+        resolved = confine(Path(root), path)
+        if resolved is None:
             continue
-        text = _strip_include_guard(text)
+        got = read_text_capped(resolved)
+        if got is None:
+            continue
+        text = _strip_include_guard(got[0])
         depths = _compute_conditional_depths(text)
         for m in _MACRO_DEF_RE.finditer(text):
             name = m.group(1)
@@ -622,11 +659,10 @@ def _constants_for_root(root: Path) -> dict[str, int]:
             value = _try_evaluate(m.group(3).strip())
             if value is not None:
                 defs.setdefault(name, []).append(value)
-        for em in _ENUM_BLOCK_RE.finditer(text):
-            line = text[:em.start()].count("\n") + 1
+        for block_start, body in _iter_enum_bodies(text):
+            line = text[:block_start].count("\n") + 1
             if depths.get(line, 0) != 0:
                 continue
-            body = em.group(1)
             for ev in _ENUMERATOR_NAME_RE.finditer(body):
                 name = ev.group(1).strip()
                 if name in _SKIP_IDENTS_C:
@@ -640,7 +676,11 @@ def _constants_for_root(root: Path) -> dict[str, int]:
     table = {
         name: vals[0] for name, vals in defs.items() if len(vals) == 1
     }
-    _CONSTANTS_CACHE[cache_key] = table
+    if not budget.truncated:
+        with _DOMAIN_CACHE_LOCK:
+            while len(_CONSTANTS_CACHE) >= _MAX_CONSTANTS_CACHE:
+                _CONSTANTS_CACHE.pop(next(iter(_CONSTANTS_CACHE)))
+            _CONSTANTS_CACHE[cache_key] = table
     return table
 
 
@@ -911,11 +951,29 @@ def _guarded_jump_of_condition_assign(assign_node, src: bytes, var: str):
 
 
 _DOMAIN_CACHE: dict[tuple[str, tuple[str, ...]], ReturnDomain | None] = {}
+_DOMAIN_CACHE_LOCK = __import__("threading").RLock()
+
+# Caps: caches are content-unstamped (keys are names/paths, cleared at
+# each sweep entry), so bounding is the backstop against a pathological
+# callee population in one long-lived process. A run's working set is
+# far below both caps; eviction is FIFO (oldest insertion first).
+_MAX_DOMAIN_CACHE = 4096
+_MAX_CONSTANTS_CACHE = 32
 
 
 def clear_cache() -> None:
-    _DOMAIN_CACHE.clear()
-    _CONSTANTS_CACHE.clear()
+    with _DOMAIN_CACHE_LOCK:
+        _DOMAIN_CACHE.clear()
+        _CONSTANTS_CACHE.clear()
+
+
+def _cache_domain(
+    key: tuple[str, tuple[str, ...]], value: ReturnDomain | None,
+) -> None:
+    with _DOMAIN_CACHE_LOCK:
+        while len(_DOMAIN_CACHE) >= _MAX_DOMAIN_CACHE:
+            _DOMAIN_CACHE.pop(next(iter(_DOMAIN_CACHE)))
+        _DOMAIN_CACHE[key] = value
 
 
 def derive_return_domain(
@@ -933,14 +991,15 @@ def derive_return_domain(
     witness).
     """
     key = (callee, tuple(str(r) for r in roots))
-    if key in _DOMAIN_CACHE:
-        return _DOMAIN_CACHE[key]
+    with _DOMAIN_CACHE_LOCK:
+        if key in _DOMAIN_CACHE:
+            return _DOMAIN_CACHE[key]
     budget = _Budget(budget_s)
     result = _derive(callee, roots, budget, _MAX_HOPS, set())
     if not budget.truncated:
         # A truncated derivation must not poison the cache — a later
         # caller with a fresh budget deserves the full analysis.
-        _DOMAIN_CACHE[key] = result
+        _cache_domain(key, result)
     return result
 
 
@@ -993,7 +1052,7 @@ def _analyze_definition(
     hops: int,
     visited: set[str],
 ) -> tuple[set[int], list[ReturnValueProof]]:
-    consts = _constants_for_root(root)
+    consts = _constants_for_root(root, budget)
     values: set[int] = set()
     proofs: list[ReturnValueProof] = []
 
@@ -1145,15 +1204,19 @@ def _peer_checks(
     domain (``!= 0`` / ``< 0`` / ``>= 0``-style) — recorded as
     corroboration on the witness."""
     peers: list[str] = []
+    # The argument window is bounded: unbounded, source that repeats
+    # the callee name makes every occurrence re-scan the rest of the
+    # text for the closing ``)`` — quadratic on hostile source; a
+    # real argument list sits far inside 400 chars.
     pattern = re.compile(
-        rf"\b{re.escape(callee)}\s*\([^;{{}}]*?\)\s*"
+        rf"\b{re.escape(callee)}\s*\([^;{{}}]{{0,400}}?\)\s*"
         rf"(!=\s*0|<\s*0|>=\s*0)\b",
     )
     for fp, source in source_texts.items():
         lang = _language_of(fp)
         if lang not in _C_LANGUAGES:
             continue
-        for idx, line_text in enumerate(source.splitlines(), 1):
+        for idx, line_text in enumerate(split_lines(source), 1):
             if (fp, idx) == exclude:
                 continue
             m = pattern.search(line_text)
@@ -1181,6 +1244,11 @@ def detect_return_domain_mismatches(
     in-tree definition, an unproven domain, or a budget truncation
     yields nothing.
     """
+    # Sweep entry = run boundary for this module's caches. Keys carry
+    # no content signal, so a prior sweep's domains/constants (same
+    # process, possibly changed tree) must not be served; within one
+    # sweep the tree is stable and the caches hit freely.
+    clear_cache()
     budget = _Budget(budget_s)
     findings: list[ReturnDomainMismatch] = []
     for fp, source in source_texts.items():

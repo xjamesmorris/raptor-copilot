@@ -56,32 +56,111 @@ if not (os.environ.get("CLAUDECODE")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import core.startup.process_init  # noqa: E402,F401
+from core.security.log_sanitisation import sanitise_for_terminal as _sft  # noqa: E402
 
 import argparse  # noqa: E402
 import re  # noqa: E402
 import subprocess  # noqa: E402
+from typing import TYPE_CHECKING  # noqa: E402
 
+from core.concepts.study_failure import (  # noqa: E402
+    clear_study_failure,
+    load_study_failure,
+    write_study_failure,
+)
 from core.json import load_json, save_json  # noqa: E402
 
-#: Read ceiling shared with the other RE-database readers.
-_MAX_DB_BYTES = 64 * 1024 * 1024
+if TYPE_CHECKING:
+    from packages.ghidra.model import REDatabase
+
+#: Read ceiling shared with the other RE-database readers AND the
+#: write-side guard below — bound to the ONE core constant
+#: (env-overridable via RAPTOR_REDB_MAX_BYTES), never a value copy,
+#: so this script cannot drift from what the other readers accept.
+from core.json.utils import (  # noqa: E402
+    RE_DATABASE_MAX_BYTES as _MAX_DB_BYTES,
+)
 
 #: Confidence order for the decomp clamp — from the model's own
 #: grade ladder so a legal below-ceiling grade ("observed") is never
-#: demoted to the floor by the unknown-grade fallback.
+#: demoted to the floor by the unknown-grade fallback. Ceiling and
+#: tag come from the SAME module (the one shared spelling — the
+#: audit's tree-wide decomp sweep clamps against the identical
+#: constants); the literals below exist only for the import-failure
+#: fallback, mirroring the grading-table fallback above.
 try:
-    from core.concepts.model import CONFIDENCE_GRADES
+    from core.concepts.model import (
+        CONFIDENCE_GRADES,
+        DECOMP_EVIDENCE_MAX_CONFIDENCE,
+        DECOMP_EVIDENCE_TAG,
+        clamp_decomp_confidence as _clamp_shared,
+    )
     _CONF_ORDER = list(CONFIDENCE_GRADES)
-except Exception:  # noqa: BLE001 — study.md grading table fallback
+    _DECOMP_MAX_CONF = DECOMP_EVIDENCE_MAX_CONFIDENCE
+    _DECOMP_TAG = DECOMP_EVIDENCE_TAG
+except ImportError:  # study.md grading table fallback — ImportError
+    # ONLY: any non-import failure class (a broken model module, a
+    # future refactor exception) fails loudly instead of silently
+    # pinning this script to the fallback spelling forever. A typo'd
+    # import NAME still lands here (it raises ImportError), so the
+    # identity tests additionally pin that the shared objects are
+    # actually bound on a healthy tree.
     _CONF_ORDER = ["inferred", "observed", "traced", "corroborated",
                    "documented", "tested"]
-_DECOMP_MAX_CONF = "traced"
-_DECOMP_TAG = "decompiled-evidence"
+    _DECOMP_MAX_CONF = "traced"
+    _DECOMP_TAG = "decompiled-evidence"
+    _clamp_shared = None
+
+
+#: Do not launch another study pass with less than this much budget
+#: left: a pass that cannot afford even one batch still pays prep and
+#: trips the cap on its first call, reporting a failure the operator
+#: then has to triage. Too high and legitimately cheap tail passes
+#: (a handful of reading-list items) get skipped with money left.
+_MIN_PASS_BUDGET_USD = 0.25
 
 
 def _fail(msg: str) -> int:
     print(f"error: {msg}", file=sys.stderr)
     return 1
+
+
+def _read_pass_cost(output_dir: Path) -> float:
+    """This pass's LLM spend from study-run's ``study-cost.json``.
+
+    Missing or malformed records read as zero spend — the budget then
+    degrades to per-pass caps (each pass still launched with the
+    unreduced remainder), never to a refusal to study.
+    """
+    path = output_dir / "study-cost.json"
+    if not path.is_file():
+        return 0.0
+    try:
+        data = load_json(path, max_bytes=1024 * 1024)
+        return max(0.0, float(data.get("cost_usd", 0.0)))
+    except (AttributeError, TypeError, ValueError):
+        return 0.0
+
+
+def _pass_budget(max_cost: float, spent_total: float,
+                 output_dir: Path, pass_no: int) -> "float | None":
+    """Budget for the NEXT study pass, or ``None`` to stop the loop.
+
+    ``None`` when the remainder is below ``_MIN_PASS_BUDGET_USD``
+    (see the constant's trade-off note). Otherwise unlinks the
+    previous pass's spend record BEFORE launching — a stale
+    ``study-cost.json`` from an earlier pass (or an earlier run in a
+    reused output dir) must not be double-counted when the pass dies
+    before study-run writes a fresh one — and returns the remainder.
+    """
+    remaining = max_cost - spent_total
+    if remaining < _MIN_PASS_BUDGET_USD:
+        print(f"binary-study: LLM budget exhausted "
+              f"(${spent_total:.2f} of ${max_cost:.2f} spent) — "
+              f"stopping before pass {pass_no}", file=sys.stderr)
+        return None
+    (output_dir / "study-cost.json").unlink(missing_ok=True)
+    return remaining
 
 
 def _resolve_redb_path(arg: Path) -> "Path | None":
@@ -121,11 +200,60 @@ def _load_db(redb_path: Path):
     return REDatabase.from_dict(raw)
 
 
-def _run(cmd: list[str], verbose: bool) -> int:
+#: Per-child wall bound, mirroring raptor-study-loop's subprocess
+#: timeout. The children here scan fully attacker-shaped input (a
+#: decompilation tree derived from the analysed binary), so an
+#: unbounded child turns one pathological file into an indefinite
+#: hang of the whole binary-study run.
+_CHILD_TIMEOUT_S = 3600
+
+
+def _record_analysis_gap(gap_dir: "Path | None", tool: str,
+                         detail: str) -> None:
+    """Append a durable analysis-gap record to the run directory.
+
+    One JSON object per line in ``analysis-gaps.jsonl`` (additive
+    schema — consumers must tolerate unknown keys, the
+    ``suppressions.jsonl`` rule). Best-effort: a failed append never
+    masks the failure being recorded.
+    """
+    if gap_dir is None:
+        return
+    from datetime import datetime, timezone
+    record = {
+        "event": "analysis-gap",
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "file_path": "",
+        "reason": "child-timeout",
+        "tool": tool,
+        "detail": detail,
+    }
+    try:
+        import json as _json
+        with (gap_dir / "analysis-gaps.jsonl").open(
+                "a", encoding="utf-8") as fh:
+            fh.write(_json.dumps(record, sort_keys=True) + "\n")
+    except OSError as exc:
+        print(f"binary-study: could not record analysis gap: {exc}",
+              file=sys.stderr)
+
+
+def _run(cmd: list[str], verbose: bool,
+         gap_dir: "Path | None" = None) -> int:
     printable = " ".join(str(c) for c in cmd)
     print(f"binary-study: running {printable}", file=sys.stderr)
     try:
-        result = subprocess.run(cmd, check=False)
+        result = subprocess.run(cmd, check=False,
+                                timeout=_CHILD_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        tool = Path(cmd[1]).name if len(cmd) > 1 else str(cmd[0])
+        detail = (f"child produced no exit within {_CHILD_TIMEOUT_S}s "
+                  "and was killed; study output for this pass is "
+                  "missing or incomplete")
+        print(f"binary-study: subprocess timed out after "
+              f"{_CHILD_TIMEOUT_S}s: {tool}", file=sys.stderr)
+        _record_analysis_gap(gap_dir, tool, detail)
+        return 1
     except OSError as exc:
         print(f"binary-study: failed to run {cmd[0]}: {exc}",
               file=sys.stderr)
@@ -159,12 +287,22 @@ def _pending_reading_names(output_dir: Path) -> list[str]:
     return out
 
 
-def _decompile_batch(db, gpr: Path, names: list[str], batch: int) -> int:
+def _decompile_batch(
+    db: "REDatabase", gpr: Path, names: list[str], batch: int,
+) -> "tuple[int, str | None]":
     """Decompile up to *batch* named functions into *db* in place.
 
     Uses the sandboxed persistent decompile server (same engine
-    raptor-ghidra decompile prefers); failures skip the function with
-    a note — a batch member must never abort the pass.
+    raptor-ghidra decompile prefers); per-function failures skip the
+    function with a note — a batch member must never abort the pass.
+
+    Returns ``(decompiled_count, server_unavailable_reason)``: the
+    reason is None while the server served the batch; a non-None
+    reason means the server itself was unavailable — it failed to
+    boot, died mid-batch, or lost its connection — and server-
+    resolved reading was lost, and the caller owns surfacing that
+    capability loss as a WARNING (a skipped function is routine, a
+    dead server degrades the whole run).
     """
     want = []
     queued: set[int] = set()
@@ -203,29 +341,83 @@ def _decompile_batch(db, gpr: Path, names: list[str], batch: int) -> int:
               "name(s) skipped (ambiguous duplicate symbol names — "
               "the server resolves by name)", file=sys.stderr)
     if not want:
-        return 0
+        return 0, None
     done = 0
     try:
-        from packages.ghidra.server import GhidraServer
+        from packages.ghidra.server import (
+            GhidraServer,
+            GhidraServerDied,
+            GhidraServerError,
+        )
         with GhidraServer(gpr) as srv:
             srv.open()
             for f in want:
                 try:
                     code = srv.decompile(f.name, timeout=30)
                 except Exception as exc:  # noqa: BLE001 — skip, keep batch
-                    print(f"binary-study: decompile {f.name} failed: "
-                          f"{str(exc)[:200]}", file=sys.stderr)
+                    # The not-connected test is an EXACT match, never
+                    # a substring one: worker per-function errors
+                    # relay hostile-binary symbol names verbatim
+                    # ("function not found: <name>"), so a symbol
+                    # containing "server not connected" could steer a
+                    # routine skip into the loss channel — aborting
+                    # the batch at the poisoned symbol every pass and
+                    # firing a false loss WARNING. The parent mints
+                    # exactly this string for a torn-down connection
+                    # (and worker-relayed errors always carry a
+                    # prefix), so exact match separates cleanly.
+                    if isinstance(exc, GhidraServerDied) or (
+                            isinstance(exc, GhidraServerError)
+                            and str(exc) == "server not connected"):
+                        # The worker DIED mid-batch (or the connection
+                        # is already torn down): every remaining name
+                        # would fail the same way — that is the same
+                        # run-level capability loss as a boot failure,
+                        # not a routine per-function skip, and it must
+                        # reach the caller's loss channel instead of
+                        # drowning in skip notes.
+                        reason = _sft(str(exc), max_len=300)
+                        print("binary-study: decompile server lost "
+                              f"mid-batch: {reason}", file=sys.stderr)
+                        return done, reason
+                    # f.name is an attacker-chosen symbol from the
+                    # hostile binary; the exception can quote it too.
+                    print(f"binary-study: decompile {_sft(f.name, max_len=120)} "
+                          f"failed: {_sft(str(exc), max_len=200)}",
+                          file=sys.stderr)
                     continue
                 if code:
                     f.decompilation = str(code)
                     done += 1
     except Exception as exc:  # noqa: BLE001 — server unavailable
+        reason = _sft(str(exc), max_len=300)
         print(f"binary-study: decompile server unavailable: "
-              f"{str(exc)[:300]}", file=sys.stderr)
-    return done
+              f"{reason}", file=sys.stderr)
+        return done, reason
+    return done, None
 
 
-def _clamp_domain_model(output_dir: Path, tree_root: Path) -> None:
+def _warn_server_loss(reason: str, pending: int, clamped: int) -> None:
+    """ONE consolidated end-of-run WARNING for a dead decompile server.
+
+    Honest degradation: the run finished, but WITHOUT the sandboxed
+    decompile server — name exactly what was lost instead of leaving
+    the loss scattered across per-batch stderr notes. The confidence
+    clamp itself is by-design for every binary study; the loss is the
+    reading the server would have resolved.
+    """
+    print(
+        "binary-study: WARNING — decompile server unavailable "
+        f"({reason}); server-resolved reading was lost for this run: "
+        f"{pending} reading-list item(s) could not be resolved by "
+        "fresh decompilation, and the domain model rests on the "
+        f"pre-existing decompilation only ({clamped} grading(s)/"
+        "rule(s) at the binary evidence ceiling)",
+        file=sys.stderr,
+    )
+
+
+def _clamp_domain_model(output_dir: Path, tree_root: Path) -> int:
     """Clamp the whole model to the binary confidence ceiling.
 
     Every entry in a binary study derives from decompilation: the
@@ -237,16 +429,25 @@ def _clamp_domain_model(output_dir: Path, tree_root: Path) -> None:
     of compiled mechanical rules. A future corroboration channel
     (runtime evidence, source alignment) must come with VERIFIED
     receipts and its own explicit exemption here.
+
+    Returns the number of gradings/rules clamped (0 when no model
+    exists) so degradation reporting can name the count.
     """
     path = output_dir / "domain-model.json"
     if not path.is_file():
-        return
+        return 0
     data = load_json(path, max_bytes=_MAX_DB_BYTES)
     if not isinstance(data, dict):
-        return
+        return 0
     del tree_root  # every entry clamps; kept for signature stability
 
     def _clamp(conf: object) -> str:
+        if _clamp_shared is not None:
+            # The shared ceiling mechanism (core.concepts.model) —
+            # one clamp implementation for every decomp-evidence
+            # consumer; the local logic below is the import-failure
+            # fallback only.
+            return _clamp_shared(conf)
         c = str(conf or "inferred")
         try:
             if (_CONF_ORDER.index(c)
@@ -319,7 +520,36 @@ def _clamp_domain_model(output_dir: Path, tree_root: Path) -> None:
         _promote_to_project(path, output_dir)
     except Exception as exc:  # noqa: BLE001 — promotion is best-effort
         print(f"binary-study: canonical re-promotion failed: "
-              f"{str(exc)[:200]}", file=sys.stderr)
+              f"{str(_sft(str(exc), max_len=300))[:200]}", file=sys.stderr)
+    return clamped
+
+
+def _persist_enriched_db(redb_path: Path, enriched: dict) -> bool:
+    """Persist the enriched database unless the ON-DISK size would
+    cross the shared read ceiling and brick every capped reader of
+    this cache thereafter (recovery is a full re-import).
+
+    Measures the bytes that will actually be written: the guard used
+    to measure COMPACT json.dumps while save_json writes indent=2
+    (typically 1.2-2x larger), so a database that passed the guard
+    could still exceed the ceiling on disk. Serialise once with the
+    artifact encoder and write those exact bytes.
+    """
+    from core.atomic_fs import write_text_atomically
+    from core.json import dumps_artifact
+    content = dumps_artifact(enriched) + "\n"
+    size = len(content.encode("utf-8"))
+    if size <= _MAX_DB_BYTES:
+        write_text_atomically(redb_path, content)
+        return True
+    print(
+        "binary-study: NOT persisting the enriched "
+        f"database ({size} bytes exceeds the "
+        f"{_MAX_DB_BYTES}-byte read ceiling); the "
+        "in-memory copy still feeds this run",
+        file=sys.stderr,
+    )
+    return False
 
 
 def main() -> int:
@@ -338,8 +568,9 @@ def main() -> int:
                     help="Comma-separated abstract concepts to study.")
     ap.add_argument("--model", default=None,
                     help="LLM model override for study-run.")
-    ap.add_argument("--batch-target", type=int, default=80,
-                    help="Items per Phase-2 study batch.")
+    ap.add_argument("--batch-target", type=int, default=None,
+                    help="Items per Phase-2 study batch (default: "
+                         "computed within the output budget).")
     ap.add_argument("--prep-only", action="store_true",
                     help="Materialize the tree and run prep only "
                          "(phase 2 runs in-session).")
@@ -355,8 +586,31 @@ def main() -> int:
                     help="Outer prep+study passes (default 3).")
     ap.add_argument("--decompile-batch", type=int, default=12,
                     help="Max functions decompiled between passes.")
+    ap.add_argument("--no-bridge-seeds", action="store_true",
+                    help="Skip the map→study bridge (binary --map / "
+                         "hunt artifacts seeding pass 1 at the "
+                         "bridge_seed tier).")
+    ap.add_argument("--max-cost", type=float, default=None,
+                    metavar="USD",
+                    help="Total LLM budget in USD across ALL study "
+                         "passes of this invocation: each pass runs "
+                         "with the remaining budget and the pass "
+                         "loop stops cleanly when it is spent. "
+                         "Covers the study-run leg (the dominant "
+                         "spend). Without this flag every pass runs "
+                         "on the LLM config's default per-scan cap — "
+                         "an effective ceiling of passes x default.")
     ap.add_argument("-v", "--verbose", action="store_true")
     parsed = ap.parse_args()
+
+    # isfinite: argparse's float() accepts "nan"/"inf", and NaN
+    # passes a naive `<= 0` gate — the remaining-budget arithmetic
+    # then never stops a pass, silently unlimited.
+    import math
+    if parsed.max_cost is not None and (
+            not math.isfinite(parsed.max_cost) or parsed.max_cost <= 0):
+        return _fail("--max-cost must be a positive finite dollar "
+                     "amount")
 
     if parsed.finalize:
         out = parsed.output_dir
@@ -420,6 +674,33 @@ def main() -> int:
     common = ["--redb", str(redb_path),
               "--redb-map", str(tree.sidecar_path)]
 
+    # Map→study bridge: mechanically seed pass 1 from a prior binary
+    # --map (and hunt artifacts) at the distinct bridge_seed tier.
+    # Enrichment only — a broken/missing artifact never blocks the
+    # study, and later passes stay reading-list-driven (the bridge
+    # never bypasses the pass loop).
+    bridge_file = None
+    if not parsed.no_bridge_seeds:
+        try:
+            from core.concepts.study import _phase2_batch_target
+            from core.orchestration.binary_study_bridge import (
+                build_bridge_seeds,
+            )
+            # No explicit --batch-target → hand the bridge the same
+            # ceiling-folded target the study itself will compute, so
+            # its item budget matches the batches that actually run.
+            item_budget = (parsed.batch_target
+                           if parsed.batch_target is not None
+                           else _phase2_batch_target())
+            bridge_file = build_bridge_seeds(
+                output_dir, db, item_budget=item_budget)
+        except Exception as exc:  # noqa: BLE001 — bridge is enrichment
+            print(f"binary-study: map→study bridge skipped: "
+                  f"{_sft(str(exc), max_len=200)}", file=sys.stderr)
+        if bridge_file is not None:
+            print(f"binary-study: bridge seeds written to "
+                  f"{bridge_file}", file=sys.stderr)
+
     if parsed.prep_only:
         cmd = [sys.executable, str(libexec / "raptor-study-prep"),
                str(tree_root), str(output_dir),
@@ -428,7 +709,9 @@ def main() -> int:
             cmd.extend(["--identifier", parsed.identifier])
         if parsed.concept:
             cmd.extend(["--concept", parsed.concept])
-        rc = _run(cmd, parsed.verbose)
+        if bridge_file is not None:
+            cmd.extend(["--bridge-seed-file", str(bridge_file)])
+        rc = _run(cmd, parsed.verbose, gap_dir=output_dir)
         if rc == 0:
             print(
                 "binary-study: prep complete — study-list.json is "
@@ -442,10 +725,21 @@ def main() -> int:
     # Fresh-run semantics are owned here: a study-list.json from an
     # older run in a reused output dir would short-circuit prep.
     (output_dir / "study-list.json").unlink(missing_ok=True)
+    # Same fresh-run rule for the failure record: a stale one from an
+    # earlier run must never be read as THIS run's diagnosis.
+    clear_study_failure(output_dir)
 
     identifiers = parsed.identifier
     last_pending: "set[str] | None" = None
     loop_rc = 0
+    spent_total = 0.0
+    # Server-loss accounting for the end-of-run degradation WARNING:
+    # a dead decompile server must not stay a scattered per-batch
+    # stderr note — the run-level capability loss (server-resolved
+    # reading) gets ONE consolidated WARNING after the clamp.
+    server_loss_reason: "str | None" = None
+    server_loss_pending = 0
+    budget_stopped = False
     for pass_no in range(1, max(1, parsed.max_passes) + 1):
         cmd = [sys.executable, str(libexec / "raptor-study-loop"),
                str(tree_root), str(output_dir),
@@ -454,16 +748,36 @@ def main() -> int:
                # enforces the grading, this prevents the wasted (and
                # policy-violating) compile pass entirely.
                "--skip-compile",
-               "--batch-target", str(parsed.batch_target)]
+               # This driver's contract is domain-model.json: a pass
+               # that cannot produce one must fail at the study
+               # loop's own exit with the cause recorded, not exit 0
+               # and surface here as a bare no-model symptom.
+               "--require-domain-model"]
+        if parsed.batch_target is not None:
+            cmd.extend(["--batch-target", str(parsed.batch_target)])
         if identifiers:
             cmd.extend(["--identifier", identifiers])
+        if bridge_file is not None and pass_no == 1:
+            # Pass 1 only — later passes are reading-list-driven and
+            # must stay narrowed; re-seeding them would re-widen the
+            # scope and re-spend the study.
+            cmd.extend(["--bridge-seed-file", str(bridge_file)])
         if parsed.concept and pass_no == 1:
             cmd.extend(["--concept", parsed.concept])
         if parsed.model:
             cmd.extend(["--model", parsed.model])
+        if parsed.max_cost is not None:
+            remaining = _pass_budget(
+                parsed.max_cost, spent_total, output_dir, pass_no)
+            if remaining is None:
+                budget_stopped = True
+                break
+            cmd.extend(["--max-cost", f"{remaining:.4f}"])
         if parsed.verbose:
             cmd.append("-v")
-        rc = _run(cmd, parsed.verbose)
+        rc = _run(cmd, parsed.verbose, gap_dir=output_dir)
+        if parsed.max_cost is not None:
+            spent_total += _read_pass_cost(output_dir)
         if rc != 0:
             print(f"binary-study: study-loop failed on pass "
                   f"{pass_no} (exit {rc})", file=sys.stderr)
@@ -488,8 +802,24 @@ def main() -> int:
         last_pending = set(pending)
 
         if parsed.gpr is not None:
-            got = _decompile_batch(db, parsed.gpr, pending,
-                                   parsed.decompile_batch)
+            got, lost = _decompile_batch(db, parsed.gpr, pending,
+                                         parsed.decompile_batch)
+            if lost is not None:
+                server_loss_reason = lost
+                # Functions the dying batch served BEFORE the loss
+                # WERE freshly decompiled — count only what the loss
+                # actually left unresolved, or the WARNING overstates.
+                server_loss_pending = len(pending) - got
+            elif got:
+                # A later batch ENGAGED the server successfully: a
+                # memo from an earlier transient failure is now stale
+                # (the reading it counted has since been served) and
+                # warning on it would overstate the loss. Only real
+                # server contact clears — an empty batch (got == 0,
+                # lost None) proves nothing about the server and must
+                # keep a recorded loss visible.
+                server_loss_reason = None
+                server_loss_pending = 0
             if got:
                 print(f"binary-study: decompiled {got} function(s) "
                       "for the reading list; refreshing the tree",
@@ -500,19 +830,7 @@ def main() -> int:
                 # enriched database would cross the shared read
                 # ceiling and brick every capped reader of this
                 # cache thereafter.
-                import json as _json
-                enriched = db.to_dict()
-                approx = len(_json.dumps(enriched))
-                if approx <= _MAX_DB_BYTES:
-                    save_json(redb_path, enriched)
-                else:
-                    print(
-                        "binary-study: NOT persisting the enriched "
-                        f"database ({approx} bytes exceeds the "
-                        f"{_MAX_DB_BYTES}-byte read ceiling); the "
-                        "in-memory copy still feeds this run",
-                        file=sys.stderr,
-                    )
+                _persist_enriched_db(redb_path, db.to_dict())
 
         # Force a fresh, reading-list-NARROWED prep on the next pass:
         # prep short-circuits on a cached study-list.json, and
@@ -520,21 +838,59 @@ def main() -> int:
         # handful of reading-list entries re-spends the whole study.
         (output_dir / "study-list.json").unlink(missing_ok=True)
 
-    _clamp_domain_model(output_dir, tree_root)
+    clamped_total = _clamp_domain_model(output_dir, tree_root)
+    if server_loss_reason is not None:
+        _warn_server_loss(server_loss_reason, server_loss_pending,
+                          clamped_total)
+    dm = output_dir / "domain-model.json"
     if loop_rc != 0:
+        if not dm.is_file() and load_study_failure(output_dir) is None:
+            # The failing pass died without recording its own cause
+            # (killed mid-run, or an error path outside study-run's
+            # chokepoint) — leave the fallback diagnosis so the
+            # record contract holds on every no-model failure.
+            write_study_failure(
+                output_dir, "study_error",
+                detail=f"study pass {pass_no} failed (exit {loop_rc})",
+            )
         return loop_rc
 
-    dm = output_dir / "domain-model.json"
-    if dm.is_file():
-        data = load_json(dm, max_bytes=_MAX_DB_BYTES)
-        if isinstance(data, dict):
-            print(
-                "binary-study: domain-model.json — "
-                f"{len(data.get('concepts') or [])} concept(s), "
-                f"{len(data.get('invariants') or [])} invariant(s), "
-                f"{len(data.get('contracts') or [])} contract(s)",
-                file=sys.stderr,
+    if not dm.is_file():
+        # Exit contract: rc 0 is reserved for runs that produced a
+        # domain model. Exiting 0 here would defer the failure to
+        # whichever consumer looks for the model next — one stage
+        # late and stripped of its cause.
+        if budget_stopped:
+            detail = (
+                f"LLM budget exhausted (${spent_total:.2f} of "
+                f"${parsed.max_cost:.2f} spent) before any domain "
+                "model was produced"
             )
+            write_study_failure(
+                output_dir, "llm_budget_exhausted", detail=detail)
+            return _fail(detail)
+        write_study_failure(
+            output_dir, "no_domain_model",
+            detail=(
+                "study pass(es) exited 0 without producing "
+                "domain-model.json (no study scope derived, or the "
+                "pass stopped before Phase 2)"
+            ),
+        )
+        return _fail(
+            "study exited without producing domain-model.json")
+
+    # A produced model supersedes any earlier failure record.
+    clear_study_failure(output_dir)
+    data = load_json(dm, max_bytes=_MAX_DB_BYTES)
+    if isinstance(data, dict):
+        print(
+            "binary-study: domain-model.json — "
+            f"{len(data.get('concepts') or [])} concept(s), "
+            f"{len(data.get('invariants') or [])} invariant(s), "
+            f"{len(data.get('contracts') or [])} contract(s)",
+            file=sys.stderr,
+        )
     print(f"binary-study: artefacts in {output_dir}", file=sys.stderr)
     return 0
 

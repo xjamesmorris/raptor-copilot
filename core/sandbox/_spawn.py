@@ -58,9 +58,18 @@ from __future__ import annotations
 import array
 import contextlib
 import errno
+import fcntl
 import logging
 import os
 import platform
+import resource
+# Module-level, ALIASED: the setup child's step-7 go-pipe wait needs
+# select POST-FORK, where imports are banned (an import can allocate,
+# lock, and run arbitrary module code in the forked child) — and the
+# bare name `select` is function-LOCAL inside run_sandboxed (the
+# capture loop's own `import select`), so the child must reference a
+# distinct module-scope name or it hits UnboundLocalError pre-exec.
+import select as _select_mod
 import signal
 import socket as _socket_mod
 import subprocess
@@ -69,14 +78,17 @@ import threading
 import time
 import traceback
 import warnings
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from . import _pathpin, state
+from ._pathpin import canonical_bind_path as _canonical_bind_path
+from ._pathpin import is_per_process_procfs as _is_per_process_procfs
 from ._fork_safe_warn import warn_post_fork
 from ._unix_scope import UnixScopeSupervisor as _UnixScopeSupervisor
 from .landlock import _make_landlock_preexec
+from .mount_ns import ExtraRoBindError as _ExtraRoBindError
 from .mount_ns import _ESTALE as _PIN_TAMPER_ERRNO
 from .mount_ns import setup_mount_ns
 from .probes import _find_sandbox_binary
@@ -126,6 +138,139 @@ CLONE_NEWCGROUP = getattr(os, "CLONE_NEWCGROUP", 0x02000000)
 CLONE_NEWNET  = getattr(os, "CLONE_NEWNET",  0x40000000)
 
 
+# ---------------------------------------------------------------------------
+# Death-pipe write-end registry: cross-spawn fd hygiene.
+#
+# Every live parent-held death-pipe write end in THIS process is
+# registered here — _spawn's per-call pipe and context.py's reaper-cell
+# pipe alike. os.pipe() fds are close-on-exec, but fork(2) copies the
+# whole fd table regardless: a never-exec'ing fork child (the
+# intermediate watcher below, and the plain-lane sweeper it mirrors)
+# forked while another spawn is in flight inherits a copy of that
+# SIBLING's death_w. The sibling's watcher then never reads EOF while
+# this child lives — concurrent spawns mutually pin each other's
+# orphan-teardown signal, and a hard-killed orchestrator leaves the
+# whole cohort running to completion. The registry lets the forked
+# child close every death-pipe write end it inherited (its own owning
+# parent keeps the only surviving copy), restoring the "parent dies →
+# EOF" contract under concurrency.
+#
+# Consistency contract: registration (pipe creation), unregistration
+# (close), and the intermediate fork all happen under _DEATH_W_LOCK.
+# That makes the child's fork-time snapshot of _LIVE_DEATH_W exactly
+# match its inherited fd table — no window where an fd is open but
+# unregistered (the child would skip it) or closed-and-reused but
+# still registered (the child would close an unrelated fd of the same
+# number). The forked child reads the snapshot WITHOUT the lock: it is
+# single-threaded, and the forking thread's `with` block releases the
+# inherited lock before the child branch runs.
+# ---------------------------------------------------------------------------
+
+_DEATH_W_LOCK = threading.Lock()
+_LIVE_DEATH_W: set[int] = set()
+
+
+def _open_capture_pipes() -> tuple[int, int, int, int]:
+    """(out_r, out_w, err_r, err_w) for output capture.
+
+    Split out so tests can simulate sibling write-end retention (a
+    concurrent spawn's intermediate transiently holds inherited
+    copies) — see ``_POST_EXIT_DRAIN_SECONDS``.
+    """
+    out_r, out_w = os.pipe()
+    err_r, err_w = os.pipe()
+    return out_r, out_w, err_r, err_w
+
+
+def open_death_pipe() -> tuple[int, int]:
+    """``os.pipe()`` for a death pipe, registering the write end.
+
+    Creation and registration are atomic w.r.t. the intermediate fork
+    (same lock), so a concurrently-forked child either never inherits
+    the fd or sees it registered and closes its copy.
+    """
+    with _DEATH_W_LOCK:
+        death_r, death_w = os.pipe()
+        _LIVE_DEATH_W.add(death_w)
+    return death_r, death_w
+
+
+def close_death_w(fd: int) -> bool:
+    """Close and unregister a registered death-pipe write end.
+
+    Returns False (and closes nothing) when *fd* is not registered:
+    every close of a death_w routes through here, so an unregistered
+    number means it was already closed — and possibly reused for an
+    unrelated fd — making this idempotent against the double-close
+    paths (timeout teardown then the outer ``finally``, in either
+    order).
+    """
+    with _DEATH_W_LOCK:
+        if fd not in _LIVE_DEATH_W:
+            return False
+        _LIVE_DEATH_W.discard(fd)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return True
+
+
+def _close_inherited_death_w_post_fork() -> None:
+    """Forked-child side: close EVERY registered death-pipe write end.
+
+    Post-fork safe (os.close + iteration over an inherited set — no
+    locks, no allocation beyond the list). Includes this spawn's own
+    death_w: the child watches death_r only, and the owning parent's
+    copy is the one that must be the last to close.
+
+    Clears the inherited registry afterwards: the entries describe
+    the PARENT's fd table, and in this child every one is now closed
+    — a stale entry re-consulted later (its number possibly reused by
+    a child-side fd) would close an unrelated descriptor.
+    """
+    for _dw in list(_LIVE_DEATH_W):
+        try:
+            os.close(_dw)
+        except OSError:
+            pass
+    _LIVE_DEATH_W.clear()
+
+
+# Structural closure: run the sweep in EVERY child forked by this
+# process — os.fork(), os.forkpty(), and multiprocessing's fork start
+# method all route through the at-fork hooks. Without this, the
+# contract held only at fork sites that opted in (the intermediate
+# below, plus preexec's sweeper via its wholesale fd sweep): every
+# other never-exec'ing fork — probe children, the Landlock-audit
+# lane's target/tracer children until their own sweeps, fork-context
+# pool workers for their whole lifetime — inherited registered
+# death_w copies and pinned the cohort-teardown EOF for its window,
+# and any NEW fork site silently re-opened the class. exec'ing
+# children were never affected (os.pipe fds are CLOEXEC): subprocess
+# children run these hooks too when a preexec_fn forces the Python
+# fork path — harmless there, the sweep just precedes the exec's
+# CLOEXEC clear — and plain fork_exec children skip the hooks but
+# always exec.
+#
+# Deliberately NO `before=_DEATH_W_LOCK.acquire` /
+# `after_in_*=release` pair (both directions weighed): holding the
+# lock across every fork would extend the exact-snapshot guarantee
+# to all forks, but _spawn's own intermediate fork below runs UNDER
+# _DEATH_W_LOCK — a before-hook acquiring that non-reentrant Lock on
+# the already-holding thread self-deadlocks at the fork, wedging
+# every sandboxed spawn instantly. Unlocked, the sweep is still
+# reuse-safe (close_death_w unregisters BEFORE closing and
+# open_death_pipe registers AFTER creating, both under the lock, so
+# a stale set entry can never name a reused fd); the residual is a
+# microseconds-wide window on both edges — a just-created
+# not-yet-registered death_w, and symmetrically a just-unregistered
+# not-yet-closed one inside close_death_w — that the sweep misses,
+# the transient pre-fix behaviour. _spawn's own fork below keeps
+# fork-under-lock for the exact snapshot at the cohort-owning site.
+os.register_at_fork(after_in_child=_close_inherited_death_w_post_fork)
+
+
 def _scrub_env_image_values(names: Iterable[bytes]) -> None:
     """Zero the VALUES of the named variables in this process's
     execve-time environment image (``mm->env_start..env_end``).
@@ -134,11 +279,20 @@ def _scrub_env_image_values(names: Iterable[bytes]) -> None:
     ``/proc/<pid>/environ`` serves exactly that region — so every
     un-exec'd process in the spawn chain re-publishes the invoking
     orchestrator's FULL environment (session credential included) to
-    any reader the kernel's ptrace gate admits. Host processes proper
-    are unreadable from the sandbox user namespace, but the spawn
-    chain's own processes share that namespace, so on any lane where
-    host procfs is visible (skip_pid_ns, operator-accepted degrades)
-    the image is one ``/proc`` read away from the target.
+    any reader the kernel's ptrace gate admits. That gate is the
+    ``PTRACE_MODE_READ`` check, and for a dumpable same-cred target
+    (an un-exec'd spawn-chain fork is both) it passes for every
+    same-uid reader at every Yama scope: Yama's ``ptrace_scope``
+    hooks only ATTACH-class access (``/proc/<pid>/mem``,
+    ``PTRACE_ATTACH``/``SEIZE``), never environ reads — verified on
+    a live scope-1 kernel, where a same-uid non-descendant environ
+    read succeeds while ``/proc/<pid>/mem`` on the same pid is
+    denied. Where a sandboxed reader IS denied on such a target,
+    the denial is this sandbox's own Landlock ptrace scoping
+    (out-of-domain target), never host Yama hardening: on any lane
+    where host procfs is visible and no such domain intervenes
+    (skip_pid_ns, operator-accepted degrades) the image is one
+    ``/proc`` read away from the target.
 
     Values are zeroed in place; names survive, so ``getenv()`` of a
     scrubbed name returns the empty string and everything else is
@@ -192,6 +346,30 @@ def _write_setup_status(fd: int, category: bytes, reason: str = "") -> None:
              (host-procfs visibility refused for an untrusted
              target — fail loud, operator override via
              RAPTOR_ALLOW_DEGRADED_UNTRUSTED=1)
+        b'C' fail-closed child setup abort (unusable caller cwd=
+             inside the pivoted root; a caller-named readable path
+             that failed its ro bind; a mandatory hardening rlimit
+             that could not apply) — fail loud, no degrade path.
+             EVERY fail-closed child exit must write its byte first:
+             a bare os._exit reads as EOF-no-byte, and the parent
+             would have returned the aborted setup as a genuine
+             target result. The parent default-DENIES categories it
+             does not recognise.
+        b'G' POSITIVE exec confirmation — written immediately before
+             execvpe, the last child-side instruction that can fail
+             silently having passed. Only ``G`` followed by EOF (or
+             by an exec-failure ``X`` payload) reads as "the target
+             ran": bare EOF used to mean "execed", so an INVOLUNTARY
+             pre-exec child death that no fail-closed site could
+             report — SIGKILL/OOM mid-setup — fabricated a genuine-
+             looking CompletedProcess carrying the setup child's
+             wait status. The parser maps missing confirmation to the
+             synthetic category '!' (typed refusal in the parent,
+             never a result — with one parent-side exemption: a
+             signal death after the live pid was delivered to an
+             exec_pid_callback is the caller's own documented kill
+             channel, kept as a CompletedProcess; see the
+             classification block above the result construction).
     ``reason`` is a short diagnostic. The whole payload is one ``os.write``
     well under PIPE_BUF (4096) so it lands atomically. Runs in a dying
     child after fork — must not raise and must not touch the Python logger
@@ -201,19 +379,42 @@ def _write_setup_status(fd: int, category: bytes, reason: str = "") -> None:
     # child (see docstring) — any propagation here would run the
     # parent's stack in the child.
     with contextlib.suppress(BaseException):
+        if category == b"G":
+            # The confirmation is a bare prefix: any reason bytes
+            # would be misparsed as the next payload's category by
+            # the parent's 'G:'-strip (only exec-failure writers
+            # legitimately follow it).
+            reason = ""
         payload = category + b":" + reason.encode("utf-8", "replace")[:512]
         os.write(fd, payload)
 
 
 def _parse_setup_status(raw: bytes):
-    """Parse the exec-status payload (``<cat>:<reason>``) the child wrote.
+    """Parse the exec-status pipe contents the child wrote.
 
-    Returns ``None`` for empty input (EOF ⇒ the target execed; genuine
-    result), else ``(category, reason)`` where category is one of
-    M/L/S/U/X/P/F. Kept standalone for unit-testing the contract.
+    Returns ``None`` only for the POSITIVE exec confirmation (``G``
+    then EOF ⇒ the target execed; genuine result). A ``G`` followed
+    by more bytes is an exec-failure report written after the
+    confirmation (the ``X`` payloads) and parses as that payload.
+    Everything else is ``(category, reason)`` — including EMPTY input:
+    EOF without the confirmation byte means the child died during
+    setup without reaching any reporting site (SIGKILL/OOM mid-setup),
+    mapped to the synthetic category ``'!'`` so the parent refuses
+    typed instead of returning the setup child's wait status as a
+    fabricated target result. Kept standalone for unit-testing the
+    contract.
     """
+    if raw.startswith(b"G:"):
+        raw = raw[2:]
+        if not raw:
+            return None
     if not raw:
-        return None
+        return (
+            "!",
+            "child terminated during sandbox setup without reporting "
+            "(no exec confirmation on the status pipe — involuntary "
+            "death: external SIGKILL, OOM kill, or a hard cap)",
+        )
     return (
         chr(raw[0]),
         raw[2:].decode("utf-8", "replace") if len(raw) > 2 else "",
@@ -377,8 +578,8 @@ def _gidmap_allow_available() -> str | None:
             # (unreadable path, missing/hung getcap) means "helper
             # unavailable", cached as False.
             pass
-        state._gidmap_allow_cache = result
-        return result or None
+        state._gidmap_allow_cache = result  # type: ignore[assignment]
+        return result or None  # type: ignore[return-value]
 
 
 def mount_ns_available() -> bool:
@@ -409,7 +610,7 @@ def mount_ns_available() -> bool:
         newuidmap = _find_sandbox_binary("newuidmap")
         newgidmap = _find_sandbox_binary("newgidmap")
         if not newuidmap or not newgidmap:
-            state._mount_ns_available_cache = False
+            state._mount_ns_available_cache = False  # type: ignore[assignment]
             return False
         try:
             import subprocess as _sp
@@ -430,10 +631,43 @@ def mount_ns_available() -> bool:
             )
             _ = r.returncode  # binary is callable
         except Exception:  # noqa: BLE001
-            state._mount_ns_available_cache = False
+            state._mount_ns_available_cache = False  # type: ignore[assignment]
             return False
-        state._mount_ns_available_cache = True
+        state._mount_ns_available_cache = True  # type: ignore[assignment]
         return True
+
+
+def _idmap_denied_in_self_owned_userns(stderr: str) -> bool:
+    """Diagnostic-only detector for the nested-userns id-map refusal.
+
+    True when a newuidmap/newgidmap EPERM happened while THIS process
+    runs inside a user namespace owned by its own (non-root) uid —
+    i.e. pid 1 is our own init, not the root-owned system init
+    (rootless container, pid-namespaced test runner). There the
+    subuid/subgid range is unmapped in the writer's namespace, so the
+    kernel refuses range map writes no matter what /etc/subuid or the
+    setuid helpers say — "fix the host" advice would mislead. Never
+    changes behaviour: the caller only appends explanatory text.
+    """
+    if "Operation not permitted" not in stderr or os.getuid() == 0:
+        return False
+    import array
+    import fcntl
+    ns_get_owner_uid = 0xB704  # _IO(0xb7, 0x4) — linux/nsfs.h
+    try:
+        fd = os.open("/proc/1/ns/user", os.O_RDONLY)
+    except OSError:
+        # Cannot even open pid 1's ns/user: the normal unprivileged
+        # posture on a real host — not the nested case.
+        return False
+    try:
+        owner = array.array("I", [0])
+        fcntl.ioctl(fd, ns_get_owner_uid, owner, True)
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    return owner[0] == os.getuid()
 
 
 def _run_newuidmap(child_pid: int, binary: str, mapping_lines: Sequence[str]) -> None:
@@ -458,10 +692,18 @@ def _run_newuidmap(child_pid: int, binary: str, mapping_lines: Sequence[str]) ->
             f"{binary} for child {child_pid} failed "
             f"(rc={r.returncode}, stderr={r.stderr.strip()!r})"
         )
+        if _idmap_denied_in_self_owned_userns(r.stderr):
+            msg += (
+                " — this process is inside an unprivileged nested "
+                "user namespace (pid 1's user namespace is owned by "
+                "this uid), where subuid/subgid-range maps cannot be "
+                "written: the range is unmapped here, so the kernel "
+                "refuses the write regardless of host configuration"
+            )
         raise RuntimeError(msg)
 
 
-def _set_rlimits(limits: dict) -> None:
+def _set_rlimits(limits: dict, status_fd: "int | None" = None) -> None:
     """Apply rlimits in the child. Mirrors preexec.py's _set_limits but
     designed to run before mount ops / Landlock / seccomp.
 
@@ -469,11 +711,11 @@ def _set_rlimits(limits: dict) -> None:
     aborts the rest. Failures surface via fork-safe stderr warning so
     operators can spot when a documented cap silently became a no-op.
     One deliberate exception: RLIMIT_CORE is fail-closed — if
-    suppressing coredumps fails, the child warns and os._exit(99)s
-    rather than continuing (see the inline rationale).
+    suppressing coredumps fails, the child reports category 'C' on
+    ``status_fd`` (the exec-status pipe — a bare exit would read as
+    "target execed" in the parent), warns, and os._exit(99)s rather
+    than continuing (see the inline rationale).
     """
-    import resource
-
     from .preexec import _DEFAULT_LIMITS
     mem = limits.get("memory_mb", _DEFAULT_LIMITS["memory_mb"])
     file_mb = limits.get("max_file_mb", _DEFAULT_LIMITS["max_file_mb"])
@@ -514,6 +756,11 @@ def _set_rlimits(limits: dict) -> None:
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     except (ValueError, OSError) as exc:
         _errno = getattr(exc, "errno", 0) or 0
+        if status_fd is not None:
+            _write_setup_status(
+                status_fd, b"C",
+                f"RLIMIT_CORE setrlimit failed (errno={_errno}) — "
+                f"coredump suppression is mandatory")
         try:
             os.write(2, b"sandbox: _spawn: RLIMIT_CORE setrlimit failed "
                      b"(errno=%d), exiting\n" % _errno)
@@ -646,10 +893,7 @@ def _teardown_target(child_pid: int, death_w: int, parent_fds: set,
         pgid = None
     reaped = False
     if death_w in parent_fds:
-        try:
-            os.close(death_w)
-        except OSError:
-            pass
+        close_death_w(death_w)
         parent_fds.discard(death_w)
         deadline = time.monotonic() + grace_s
         while time.monotonic() < deadline:
@@ -708,20 +952,23 @@ def _reap_tracer(tracer_pid: int, timeout_s: float = 2.0) -> None:
 
 def _sweep_stale_audit_configs(max_age_s: float = 3600.0) -> None:
     """Remove stale raptor-audit-cfg-* tempfiles in /tmp owned by
-    the current UID, dating from prior crashed runs.
+    the current UID — LEGACY-ORPHAN cleanup only.
 
-    Audit-config tempfiles get unlinked in the normal lifecycle path
-    (BaseException + final finally in run_sandboxed) AND by the tracer
-    itself right after it parses the config. But if both processes get
-    SIGKILL'd mid-audit (OOM, kernel panic, operator's session
-    terminated externally), the tempfile leaks. Accumulation is slow
-    but real on long-lived dev machines.
+    Current spawns never mint these files: the audit config is an
+    anonymous memfd (_evidence_mod.anonymous_fd) passed to the tracer
+    as /proc/self/fd/N, so there is nothing on disk to leak. Files
+    matching the pattern are orphans from runs of older versions
+    (whose mkstemp'd configs leaked when both processes were
+    SIGKILL'd mid-audit). Accumulation was slow but real on
+    long-lived dev machines; the sweep stays until those hosts have
+    cycled their tempdirs.
 
-    Runs on EVERY engaged-audit spawn. That is safe because of the
-    ``max_age_s`` floor: a live config belongs to a concurrent spawn
-    and exists only for the seconds between mkstemp and the tracer
-    parsing (then deleting) it — an hour-old file is unambiguously an
-    orphan. (The floor also fixes a latent race in the previous
+    Runs on EVERY engaged-audit spawn. Safe even against a
+    same-host process still running an OLD version because of the
+    ``max_age_s`` floor: that version's live configs existed only for
+    the seconds between mkstemp and the tracer parsing (then
+    deleting) them — an hour-old file is unambiguously an orphan.
+    (The floor also fixed a latent race in the previous
     once-per-process form, which could delete a concurrent process's
     just-minted config.) Same-UID-only — never touch other operators'
     files. Best-effort: any unlink failure is silently ignored (file
@@ -804,6 +1051,8 @@ def _pin_bind_sources(
     output: str | None,
     rootfs: str | None,
     readable_paths: Iterable[str] | None,
+    writable_extra_paths: Iterable[str] | None = None,
+    expected_identities: Mapping[str, tuple[int, int]] | None = None,
 ) -> dict[str, int]:
     """Validation-time O_PATH pins for every mount-ns bind SOURCE.
 
@@ -825,8 +1074,10 @@ def _pin_bind_sources(
     held fd also keeps the validation-time inode allocated, so its
     (st_dev, st_ino) identity cannot be recycled by a replacement.
 
-    Keys are ``os.path.abspath`` of the caller path (matching the
-    child-side absolutisation in ``setup_mount_ns``). ``target`` /
+    Keys are ``canonical_bind_path`` of the caller path — abspath
+    plus leading-double-slash collapse, matching the child-side
+    canonicalisation in ``setup_mount_ns`` (a ``//``-spelled path
+    must find its pin under the same key the child looks up). ``target`` /
     ``output`` / ``rootfs`` pins are REQUIRED — a failure to pin (the
     path vanished, or a component swapped to a symlink mid-walk)
     raises the corresponding OSError, before any fork happens; the
@@ -836,7 +1087,11 @@ def _pin_bind_sources(
     ``readable_paths`` entries that cannot be pinned are SKIPPED, and
     the child then refuses to bind them at all (matching the previous
     "not a dir or file → skip" behaviour, minus the late
-    re-resolution).
+    re-resolution). Entries under a per-process procfs magic link
+    (``/proc/self/*``, ``/proc/thread-self/*``) are never pinned:
+    their identity is per-reader by construction, so a pin taken here
+    could never match any child's walk, and the child serves them
+    through the /proc mount instead of a bind.
 
     Fds carry O_CLOEXEC: they survive every fork in the spawn chain
     but never leak across an exec (newuidmap, tracer, target). The
@@ -848,18 +1103,30 @@ def _pin_bind_sources(
 
     fds: dict[str, int] = {}
     try:
-        for req in (target, output, rootfs):
+        # writable_extra_paths (out-of-view writable grants carried
+        # into the view as read-write binds) join the REQUIRED class:
+        # a write-bind whose source cannot be pinned is exactly the
+        # steering surface the required posture exists for.
+        for req in (target, output, rootfs,
+                    *(writable_extra_paths or ())):
             if not req:
                 continue
-            key = os.path.abspath(req)
+            key = _canonical_bind_path(req)
             if key in fds:
                 continue
             fds[key] = open_pinned(os.path.realpath(key))
         for extra in (readable_paths or ()):
             if not extra:
                 continue
-            key = os.path.abspath(extra)
+            key = _canonical_bind_path(extra)
             if key in fds:
+                continue
+            if _is_per_process_procfs(key):
+                # Per-reader procfs magic-link paths: the child never
+                # binds these (setup_mount_ns skips them — procfs
+                # serves them per-reader already), and a pin taken
+                # here would name THIS process's file, an identity no
+                # other process's walk can reproduce. Nothing to pin.
                 continue
             try:
                 fds[key] = open_pinned(os.path.realpath(key))
@@ -869,6 +1136,20 @@ def _pin_bind_sources(
                 # optional tool dir). The child skips unpinned
                 # extra_ro_paths entries outright.
                 continue
+        for raw_path, expected in (expected_identities or {}).items():
+            key = _canonical_bind_path(raw_path)
+            fd = fds.get(key)
+            if fd is None:
+                raise OSError(
+                    _PIN_TAMPER_ERRNO,
+                    f"required bind source was not pinned: {key}",
+                )
+            pinned = os.fstat(fd)
+            if (pinned.st_dev, pinned.st_ino) != expected:
+                raise OSError(
+                    _PIN_TAMPER_ERRNO,
+                    f"required bind source identity changed: {key}",
+                )
         return fds
     except BaseException:
         for fd in fds.values():
@@ -880,39 +1161,246 @@ def _pin_bind_sources(
 def _subid_range(path: str, user: str, numeric_id: str) -> tuple[int, int] | None:
     """First /etc/subuid|/etc/subgid entry for the user (matched by name
     or numeric id), as ``(start, count)``. None when absent/unreadable —
-    the caller degrades to the single-id mapping with a warning."""
+    the caller degrades to the single-id mapping with a warning.
+
+    Count is capped at 65535: the consumer maps the range at child id
+    1 with id 0 taken by the mapped host id, so 65535 keeps the whole
+    child id space within the conventional 2^16 container range. The
+    consumer clamps to the same value (belt-and-braces); the producer
+    previously capped one higher (65536), a silent off-by-one between
+    the two sites. Raising either cap buys nothing (no image
+    entrypoint needs ids above the 2^16 convention) while a lower one
+    breaks images that chown to high ids — change both together or
+    neither.
+    """
     try:
         for line in Path(path).read_text(encoding="utf-8").splitlines():
             parts = line.strip().split(":")
             if len(parts) == 3 and parts[0] in (user, numeric_id):
-                return int(parts[1]), min(int(parts[2]), 65536)
+                return int(parts[1]), min(int(parts[2]), 65535)
     except (OSError, ValueError):
         return None
     return None
 
 
-def _pid1_split_for_waiter() -> None:
+def _drop_host_tmpdir_grants(
+    writable: list[str],
+    target: str | None,
+    output: str | None,
+    rootfs: str | None,
+) -> list[str]:
+    """Filter a host-custom TMPDIR grant out of a mount-tree spawn's
+    writable set.
+
+    The context's writable baseline carries ``tempfile.gettempdir()``.
+    When the host TMPDIR is customised (per-session scratch dirs,
+    build-farm scratch mounts), that path exists only on the HOST
+    filesystem: the mount-tree child pivots onto a fresh tmpfs at
+    /tmp, so the post-pivot Landlock grant-open fails and the child
+    emits ``sandbox: Landlock writable path could not be opened`` on
+    stderr. That line lands in the PAYLOAD's captured stderr, where
+    consumers reading a tool's diagnostics (PoC-compile evidence,
+    build-failure summaries) misattribute it as the tool failing.
+
+    Dropping the entry costs nothing on this lane: the baseline adds
+    ``/tmp`` alongside the custom-tmpdir grant, and the child's temp
+    env is served inside the tmpfs for the shapes that matter —
+    branded TMPDIR values are rewritten out of the target-bound env,
+    unbranded /tmp-rooted ones are re-created inside the private /tmp
+    (mount_ns step 7b). An UNBRANDED TMPDIR outside /tmp passes
+    through to a path that does not exist in the mount view — a
+    pre-existing residual of the temp-env staging, unchanged by this
+    filter. Entries that are also the bind-mounted target/output/
+    rootfs are kept — those exist post-pivot by construction, and
+    removing them would revoke a caller-requested write surface. The
+    LITERAL ``/tmp`` entry is always kept: on hosts where /tmp itself
+    is a symlink, its realpath equals the host-tmpdir realpath, but
+    the entry names the per-sandbox tmpfs and dropping it would
+    revoke the child's /tmp.
+    """
+    import tempfile
+    host_tmp = os.path.realpath(tempfile.gettempdir())
+    if host_tmp == "/tmp":
+        return writable
+    bound = {os.path.abspath(p) for p in (target, output, rootfs) if p}
+
+    def _keep(path: str) -> bool:
+        abspath = os.path.abspath(path)
+        if abspath == "/tmp" or abspath in bound:
+            return True
+        return os.path.realpath(path) != host_tmp
+
+    return [p for p in writable if _keep(p)]
+
+
+def _anchor_grants_to_bind_view(
+    grant_paths: list,
+    target: str | None,
+    output: str | None,
+    rootfs: str | None,
+    readable_paths: Iterable[str] | None,
+    *,
+    kind: str,
+) -> tuple[list, list[str]]:
+    """Re-anchor Landlock rule paths for a MOUNT-TREE spawn — whose
+    rule opens happen POST-pivot inside the bind view — and plan the
+    deliberate view extension for legitimate out-of-view grants.
+
+    Returns ``(rule_paths, carry_rw_paths)``: the rule list to hand
+    Landlock, and the out-of-view WRITABLE grant roots the spawn must
+    bind read-write into the view (pinned like every other bind
+    source) so the grant is honoured on the mount lane instead of
+    dying at the rule open.
+
+    Three shapes where the parent-side host-view ``realpath`` names a
+    tree the mount view does not carry, all previously surfacing as a
+    buried "Landlock ... path could not be opened" child warning
+    followed by EACCES at first use:
+
+    * a grant naming a bind target through a symlink spelling (an
+      ``output=`` that is a symlink): the view serves the pinned
+      inode AT THE BIND PATH, while the host realpath resolves to the
+      symlink's destination — absent from the view. Grants matching a
+      bind target (by canonical bind path, or by realpath — the
+      resolved spelling of the same source) become
+      :class:`~._pathpin.ViewAnchoredPath` entries: the child opens
+      the bind path post-pivot, symlink-free by construction (the
+      bind machinery refuses symlink components), and the rule lands
+      on the validated inode.
+    * a WRITABLE grant naming an existing host directory or regular
+      file outside every view tree. This is a LEGITIMATE cross-lane
+      shape — callers build one writable list for every lane, and
+      entries like a shared log directory are live policy on the
+      host-view (mountless / Landlock-only) lanes — so the view is
+      extended DELIBERATELY: the root joins ``carry_rw_paths`` (bound
+      read-write at its own path, source-pinned) and its rule anchors
+      to the bind. Refusing these at assembly aborted runs whose
+      grants were honoured after a benign lane demotion, and at BASE
+      the grant was silently dead on the mount lane.
+    * a grant the view can never carry — out-of-view AND nothing to
+      bind (the path does not exist, or is neither a directory nor a
+      regular file): no lane could ever honour it, so refuse at spawn
+      assembly with a named error instead of a bare use-time EACCES.
+
+    Readable grants never populate ``carry_rw_paths``: every readable
+    entry is already its own read-only bind target and anchors to
+    itself. Rootfs mode skips the carry/refusal arms: the image tree
+    is the root and its top-level entries are all legitimately
+    grantable — only the bind-target anchoring applies there.
+    Deliberate residual, kept: a grant naming a path UNDER a
+    symlink-spelled bind target keeps its host-view realpath rule
+    (in-view only when the spellings agree); anchoring subpaths would
+    need per-component translation the bind set does not describe.
+    """
+    anchor_map: dict[str, str] = {}
+    for bind_path in (target, output, rootfs,
+                      *(readable_paths or ())):
+        if not bind_path:
+            continue
+        canonical = _canonical_bind_path(bind_path)
+        anchor_map.setdefault(canonical, canonical)
+        anchor_map.setdefault(os.path.realpath(canonical), canonical)
+    from .mount_ns import _SYSTEM_RO_DIRS
+    view_trees = [
+        "/tmp", "/run", "/dev", "/sys", "/proc",
+        *(f"/{d}" for d in _SYSTEM_RO_DIRS),
+        *anchor_map,
+    ]
+
+    def _under(path: str, root: str) -> bool:
+        return path == root or path.startswith(root.rstrip("/") + "/")
+
+    anchored: list = []
+    carry_rw: list[str] = []
+    for entry in grant_paths:
+        if isinstance(entry, _pathpin.ViewAnchoredPath):
+            anchored.append(entry)
+            continue
+        canonical = _canonical_bind_path(str(entry))
+        bind_target = anchor_map.get(canonical)
+        if bind_target is None:
+            bind_target = anchor_map.get(os.path.realpath(canonical))
+        if bind_target is not None:
+            anchored.append(_pathpin.ViewAnchoredPath(bind_target))
+            continue
+        if rootfs is not None:
+            anchored.append(entry)
+            continue
+        realpath = os.path.realpath(canonical)
+        if any(_under(canonical, tree) or _under(realpath, tree)
+               for tree in view_trees):
+            anchored.append(entry)
+            continue
+        if kind == "writable":
+            import stat as _stat
+            try:
+                grant_mode = os.stat(realpath).st_mode
+            except OSError:
+                grant_mode = None
+            if grant_mode is not None and (
+                    _stat.S_ISDIR(grant_mode) or _stat.S_ISREG(grant_mode)):
+                # Legitimate out-of-view writable root: carry it into
+                # the view as a pinned read-write bind (dedup — the
+                # same root can arrive via several spellings) and
+                # anchor its rule to the bind.
+                if canonical not in carry_rw:
+                    carry_rw.append(canonical)
+                anchored.append(_pathpin.ViewAnchoredPath(canonical))
+                continue
+        from .errors import SandboxSetupError
+        raise SandboxSetupError(
+            f"sandbox {kind} grant {str(entry)!r} resolves outside "
+            f"the mount view and cannot be carried into it (the path "
+            f"is missing, or is neither a directory nor a regular "
+            f"file) — no lane could ever honour this grant (the "
+            f"child would fail its rule open and every access would "
+            f"EACCES at use time).",
+            "create the directory before the call, pass the path as "
+            "output= or readable_paths= (bind-mounted into the "
+            "view), relocate it under the run's output directory or "
+            "/tmp, or pass skip_mount_ns=True if host-view grants "
+            "are intended for this call.",
+        )
+    return anchored, carry_rw
+
+
+def _pid1_split_for_waiter(wstat_w: int | None = None) -> None:
     """Fork so the exec target becomes PID 2 of the pid-ns; PID 1 (this
     process) stays as a minimal in-process init that reaps children and
     mirrors the target's exit.
 
-    Rationale (rootfs mode): a container-image entrypoint running as
-    pid-ns PID 1 has kill(2)-delivered signals silently filtered by the
-    kernel (abort(), raise(SIGFPE), self-kill test harnesses) — the
-    same problem libexec/raptor-pid1-shim solves for the subprocess
-    path, solved here in-process because the shim's interpreter isn't
-    guaranteed to exist inside a foreign image rootfs. PID 1 cannot
-    re-raise the death signal on itself (same filter), so a signalled
-    target is mirrored as exit ``128 + signum`` — the shim convention
-    ``observe._interpret_result`` already decodes. SIGTERM / SIGINT /
-    SIGHUP / SIGQUIT arriving at PID 1 are forwarded to the target;
-    orphans are reaped and their statuses discarded.
+    Rationale: a target running as pid-ns PID 1 has kill(2)-delivered
+    signals silently filtered by the kernel (abort(), raise(SIGFPE),
+    self-kill test harnesses) — solved in-process because a wrapper
+    interpreter isn't guaranteed to exist inside a foreign image
+    rootfs. PID 1 cannot re-raise the death signal on itself (same
+    filter), so a signalled target is mirrored as exit ``128 +
+    signum`` — the convention ``observe._interpret_result`` already
+    decodes. SIGTERM / SIGINT / SIGHUP / SIGQUIT arriving at PID 1
+    are forwarded to the target; orphans are reaped and their
+    statuses discarded.
+
+    ``wstat_w``: write end of the raw-wait-status side channel to the
+    setup child. The 128+sig mirror is TARGET-FORGEABLE at the exit-
+    code layer (``exit(139)`` is indistinguishable from a real
+    SIGSEGV), so this trusted init also reports the kernel's raw
+    ``waitpid`` status for the target out-of-band; the setup child
+    re-raises a genuinely-signalled status on itself, preserving the
+    parent's WIFSIGNALED view (rc < 0, mechanical evidence grade) that
+    the target-as-PID-1 layout used to provide for fault signals.
+    The write end exists ONLY here and (briefly, CLOEXEC + swept)
+    in the exec path — the target can never reach it.
 
     Returns in the CHILD (the exec path). The PID 1 side never returns
     (``os._exit``).
     """
     child = os.fork()
     if child == 0:
+        # Exec path: drop the side-channel write end immediately so
+        # EOF semantics never depend on the pre-exec fd sweep.
+        if wstat_w is not None:
+            with contextlib.suppress(OSError):
+                os.close(wstat_w)
         return  # exec path continues as PID 2
 
     def _forward(signum, _frame, _child=child) -> None:
@@ -922,6 +1410,15 @@ def _pid1_split_for_waiter() -> None:
     for _sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT):
         with contextlib.suppress(OSError, ValueError):
             signal.signal(_sig, _forward)
+
+    def _report_and_exit(status: int, code: int) -> None:
+        if wstat_w is not None:
+            with contextlib.suppress(OSError):
+                os.write(wstat_w, f"{status}".encode("ascii"))
+            with contextlib.suppress(OSError):
+                os.close(wstat_w)
+        os._exit(code)
+
     while True:
         try:
             pid_, status = os.wait()
@@ -932,9 +1429,9 @@ def _pid1_split_for_waiter() -> None:
         if pid_ != child:
             continue  # reap orphans; only the target's status mirrors
         if os.WIFEXITED(status):
-            os._exit(os.WEXITSTATUS(status))
+            _report_and_exit(status, os.WEXITSTATUS(status))
         if os.WIFSIGNALED(status):
-            os._exit(128 + os.WTERMSIG(status))
+            _report_and_exit(status, 128 + os.WTERMSIG(status))
         # stopped/continued — keep waiting
 
 
@@ -946,6 +1443,108 @@ def _pid1_split_for_waiter() -> None:
 # Module-level and read at call time so the ceiling-behavior tests can
 # exercise it without shipping tens of real megabytes per run.
 _CAPTURE_CAP = 64 * 1024 * 1024
+
+#: Post-exit capture drain window (seconds). Once OUR child has been
+#: reaped, the only writers left on the out/err pipes are descendants
+#: it deliberately backgrounded — or, far more commonly, sibling
+#: sandbox intermediates transiently retaining inherited write-end
+#: copies: under concurrency an instant `echo` run's return was pinned
+#: to a sibling's full lifetime (~12s observed), and a shorter caller
+#: timeout then raised TimeoutExpired for a target that had already
+#: exited 0. Trade-off, both directions: too short loses output a
+#: just-exited child's backgrounded descendant flushes moments later;
+#: too long re-couples every return (and the timeout verdict) to
+#: unrelated siblings' lifetimes. 0.5s covers real descendant flush
+#: latency while keeping the sibling coupling human-imperceptible.
+_POST_EXIT_DRAIN_SECONDS = 0.5
+
+#: Deadline for the parent's step-4 wait on the child's 'R' ready
+#: byte. A healthy child writes it within milliseconds of unshare(2),
+#: so the deadline never fires on the good path; it bounds only the
+#: EOF-on-death signal, which a sibling spawn's transiently-inherited
+#: p_ready_w copy can withhold for that sibling's full lifetime (the
+#: same cross-spawn pin class as _POST_EXIT_DRAIN_SECONDS and the
+#: t_ready_r/pid_r waits — 15s matches those waits' deadline).
+_P_READY_DEADLINE_S = 15.0
+
+
+def _read_capture_chunk(fd: int) -> bytes:
+    return os.read(fd, 65536)
+
+
+def _append_capture(
+    chunks: list[bytes],
+    current_len: int,
+    chunk: bytes,
+    capture_cap: int,
+) -> tuple[int, bool]:
+    remaining = max(0, capture_cap - current_len)
+    kept = chunk[:remaining]
+    if kept:
+        chunks.append(kept)
+    return current_len + len(kept), len(kept) < len(chunk)
+
+
+def _capture_output(
+    buffer: bytes,
+    *,
+    truncated: bool,
+    stream: str,
+    text: bool,
+    capture_cap: int,
+) -> str | bytes:
+    rendered = buffer
+    if truncated:
+        rendered += (
+            f"\n[sandbox: {stream} capture truncated at "
+            f"{capture_cap} bytes]\n"
+        ).encode("ascii")
+    if text:
+        return rendered.decode("utf-8", errors="replace")
+    return rendered
+
+
+def _backend_id(
+    *,
+    block_network: bool,
+    inherit_netns: bool,
+    skip_mount_ns: bool,
+    skip_pid_ns: bool,
+) -> str:
+    parts = ["linux-fork"]
+    if not skip_mount_ns:
+        parts.append("mount")
+    if not skip_pid_ns:
+        parts.append("pid")
+    if block_network and not inherit_netns:
+        parts.append("netns")
+    return "-".join(parts)
+
+
+def _attach_capture_metadata(
+    result_or_error,
+    *,
+    capture_output: bool,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+    stdout_bytes_kept: int,
+    stderr_bytes_kept: int,
+    backend: str,
+) -> None:
+    result_or_error.stdout_truncated = bool(stdout_truncated)
+    result_or_error.stderr_truncated = bool(stderr_truncated)
+    result_or_error.stdout_bytes_kept = int(stdout_bytes_kept)
+    result_or_error.stderr_bytes_kept = int(stderr_bytes_kept)
+    info = dict(getattr(result_or_error, "sandbox_info", {}) or {})
+    info["capture"] = {
+        "enabled": bool(capture_output),
+        "stdout_truncated": bool(stdout_truncated),
+        "stderr_truncated": bool(stderr_truncated),
+        "stdout_bytes_kept": int(stdout_bytes_kept),
+        "stderr_bytes_kept": int(stderr_bytes_kept),
+    }
+    info.setdefault("backend", backend)
+    result_or_error.sandbox_info = info
 
 
 def run_sandboxed(
@@ -981,17 +1580,49 @@ def run_sandboxed(
     persona: Persona | None = None,
     inherit_netns: bool = False,
     etc_overlay: dict | None = None,
+    stage_files: dict[str, bytes] | None = None,
+    stage_dirs: Sequence[str] | None = None,
     skip_pid_ns: bool = False,
     skip_mount_ns: bool = False,
     require_fresh_procfs: bool = False,
+    landlock_required: bool = True,
     proxy_unix_socket: str | None = None,
     proxy_forwarder_port: int | None = None,
     extra_unix_bridges: Sequence[tuple[int, str]] | None = None,
     exec_pid_callback: Callable[[int], None] | None = None,
     child_pid_callback: Callable[[int], None] | None = None,
     rootfs: str | None = None,
+    max_capture_bytes: int | None = None,
+    cancel_fd: int | None = None,
+    bind_source_identities: Mapping[str, tuple[int, int]] | None = None,
 ) -> subprocess.CompletedProcess:
     """Run `cmd` inside a fully-isolated sandbox.
+
+    stage_files / stage_dirs: forwarded verbatim to
+    ``mount_ns.setup_mount_ns`` (see its docstring for validation and
+    failure contracts) — files/empty dirs materialised in the private
+    tmpfs root pre-pivot, so they exist at their in-sandbox paths
+    without any host-path bind (nothing about their origin appears in
+    the child's mountinfo). Mount-ns lane only; the mountless and
+    skip_mount_ns lanes have no private root to stage into and ignore
+    both.
+
+    landlock_required: containment-floor plumbing, set ONLY by
+    ``context.run()`` from the call's resolved floor (never a caller
+    choice — ``run()``/``sandbox()`` expose no kwarg for it). True
+    (default): current behaviour — when the requested policy builds a
+    Landlock ruleset, an install failure (including a kernel without
+    the Landlock ABI) aborts the spawn fail-closed ('L'). False: the
+    resolved floor admits NS_NOMOUNT, so on a kernel WITHOUT Landlock
+    the layer is skipped instead of aborting — the spawn delivers the
+    ns-only tier (namespaces + fresh procfs + seccomp + rlimits). On
+    a kernel WITH Landlock the flag is inert: the ruleset is built
+    and an install failure still aborts 'L' (tolerating *absence* is
+    consented by the floor; tolerating a *failed install* on a
+    capable kernel never is). Everything the ns-only tier does
+    promise stays fail-closed regardless: namespace setup ('U'),
+    seccomp install ('S'), and — when the caller demands it via
+    require_fresh_procfs — the fresh procfs mount ('F').
 
     child_pid_callback: optional callable invoked in the PARENT with
     the pid of the sandbox SETUP child (the root of the whole sandbox
@@ -1050,6 +1681,52 @@ def run_sandboxed(
     degrade marker, instead of running the command without a tracer.
     The raise happens before the fork, so the target never executes.
     """
+    if cancel_fd is not None:
+        if isinstance(cancel_fd, bool) or not isinstance(cancel_fd, int):
+            raise TypeError("cancel_fd must be an integer file descriptor")
+        if cancel_fd < 3:
+            raise ValueError("cancel_fd must not alias stdin/stdout/stderr")
+        try:
+            cancel_flags = fcntl.fcntl(cancel_fd, fcntl.F_GETFD)
+        except OSError as exc:
+            raise ValueError(f"cancel_fd is not open: {exc}") from exc
+        if not cancel_flags & fcntl.FD_CLOEXEC:
+            raise ValueError("cancel_fd must be close-on-exec")
+        for stream_name, stream in (
+            ("stdin", stdin),
+            ("stdout", stdout),
+            ("stderr", stderr),
+        ):
+            if stream is None or stream in (
+                subprocess.DEVNULL,
+                subprocess.PIPE,
+                subprocess.STDOUT,
+            ):
+                continue
+            try:
+                stream_fd = stream if isinstance(stream, int) else stream.fileno()
+            except (AttributeError, OSError, ValueError):
+                continue
+            if stream_fd == cancel_fd:
+                raise ValueError(
+                    f"cancel_fd must not alias the child {stream_name}"
+                )
+
+    if bind_source_identities is not None:
+        for path, identity in bind_source_identities.items():
+            if not isinstance(path, str) or not os.path.isabs(path):
+                raise ValueError(
+                    "bind_source_identities keys must be absolute paths"
+                )
+            if (
+                not isinstance(identity, tuple)
+                or len(identity) != 2
+                or any(type(value) is not int for value in identity)
+            ):
+                raise ValueError(
+                    "bind_source_identities values must be (device, inode)"
+                )
+
     if rootfs is not None:
         # Rootfs mode is mount-ns-or-nothing: without the pivot there is
         # no image filesystem to run against — the command would execute
@@ -1327,9 +2004,10 @@ def run_sandboxed(
             # ambiguous "tracer attach failed" minutes later.
             import json as _json
             # sort_keys=True — same rationale as _landlock_audit.py:
-            # the serialised audit config is hashed elsewhere for
-            # cache lookups; stable ordering keeps the identity
-            # contract intact across Python versions.
+            # deterministic serialisation (no consumer hashes or
+            # caches the config; stable ordering keeps the fd
+            # contents byte-comparable across runs for debugging and
+            # any future fingerprint consumer).
             _serialised = _json.dumps(audit_config, sort_keys=True).encode("utf-8")
             try:
                 _audit_config_fd = _evidence_mod.anonymous_fd(_serialised)
@@ -1381,6 +2059,50 @@ def run_sandboxed(
                     "degradation.",
                 )
 
+    # Snapshot descriptors that pre-date this spawn as a fallback for hosts
+    # where the post-fork child cannot enumerate /proc/self/fd. The setup
+    # child must not hold arbitrary caller fds for the lifetime of the
+    # sandbox: they are not target capabilities (the grandchild already
+    # sweeps before exec), but a leaked pipe writer defeats EOF-based parent
+    # cancellation.
+    #
+    # This snapshot is NOT authoritative by fd number. Another thread can
+    # close one of these fds before the sandbox pipes below are created, and
+    # pipe() can reuse that number. Closing the stale numeric snapshot in the
+    # child then closes a live handshake fd. Enumerate the child's actual fd
+    # table after fork and subtract the sandbox-owned keep set instead.
+    _stdio_source_fds: set[int] = set()
+    for _stream in (stdin, stdout, stderr):
+        if _stream is None or _stream in (
+            subprocess.DEVNULL,
+            subprocess.PIPE,
+            subprocess.STDOUT,
+        ):
+            continue
+        try:
+            _stream_fd = (
+                _stream
+                if isinstance(_stream, int)
+                else _stream.fileno()
+            )
+        except (AttributeError, OSError, ValueError):
+            continue
+        if _stream_fd > 2:
+            _stdio_source_fds.add(_stream_fd)
+    try:
+        _preexisting_fds = set()
+        for _name in os.listdir("/proc/self/fd"):
+            _fd = int(_name)
+            if _fd <= 2:
+                continue
+            try:
+                fcntl.fcntl(_fd, fcntl.F_GETFD)
+            except OSError:
+                continue
+            _preexisting_fds.add(_fd)
+    except (OSError, ValueError):
+        _preexisting_fds = set()
+
     # Track every fd we hold in the parent so a failure ANYWHERE from
     # pipe()/fork() through the newuidmap handshake closes the lot.
     # Built before any pipe is opened so partial-open failures also get
@@ -1390,10 +2112,18 @@ def run_sandboxed(
 
     def _close_leftover() -> None:
         for fd in list(_parent_fds):
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+            # A registered death-pipe write end must unregister under
+            # the registry lock as it closes (close_death_w) — a bare
+            # close would leave a stale registry entry whose fd number
+            # can be reused, steering a sibling's forked child into
+            # closing an unrelated fd. Non-death fds can never collide
+            # with a registered number (both are live fds in one
+            # table), so the fallthrough close is safe.
+            if not close_death_w(fd):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
             _parent_fds.discard(fd)
 
     try:
@@ -1405,14 +2135,19 @@ def run_sandboxed(
 
         # Exec-status pipe. The child writes a typed status — which setup
         # step failed (mount/Landlock/seccomp/unshare) or that exec itself
-        # failed — to status_w BEFORE exiting; on a SUCCESSFUL execvpe the
-        # write end auto-closes (PEP 446 default O_CLOEXEC) and the parent
-        # reads EOF. This is the unspoofable, unambiguous "did the target
-        # exec, and if not exactly why" signal that replaces the brittle
-        # exit-code + stderr-emptiness heuristics. The target cannot forge
-        # it: status_w is close-on-exec, so it's gone before the target
-        # runs. status_w is NOT marked inheritable-across-exec (unlike the
-        # tracer's t_ready_w) precisely so the EOF-on-success contract holds.
+        # failed — to status_w BEFORE exiting, and a POSITIVE 'G'
+        # confirmation immediately before execvpe; on a SUCCESSFUL exec
+        # the write end auto-closes (PEP 446 default O_CLOEXEC) and the
+        # parent reads 'G' + EOF. This is the unspoofable, unambiguous
+        # "did the target exec, and if not exactly why" signal that
+        # replaces the brittle exit-code + stderr-emptiness heuristics;
+        # the confirmation closes the last silent shape (involuntary
+        # child death mid-setup produced the same bare EOF a successful
+        # exec used to). The target cannot forge it: status_w is
+        # close-on-exec, so it's gone before the target runs. status_w
+        # is NOT marked inheritable-across-exec (unlike the tracer's
+        # t_ready_w) precisely so the confirmation-then-EOF contract
+        # holds.
         status_r, status_w = os.pipe()
         # SECURITY INVARIANT: status_w MUST stay close-on-exec (non-
         # inheritable). That is the ONE thing that makes the status
@@ -1442,19 +2177,21 @@ def run_sandboxed(
 
         # Output capture pipes (optional).
         if capture_output:
-            out_r, out_w = os.pipe()
-            _parent_fds.update({out_r, out_w})
-            err_r, err_w = os.pipe()
-            _parent_fds.update({err_r, err_w})
+            out_r, out_w, err_r, err_w = _open_capture_pipes()
+            _parent_fds.update({out_r, out_w, err_r, err_w})
         else:
-            out_r = err_r = out_w = err_w = None
+            out_r = err_r = out_w = err_w = None  # type: ignore[assignment]
 
         # Death pipe: orphan-teardown signal. Parent holds death_w for
         # the duration of the sandbox call; intermediate child watches
         # death_r via select(). If the orchestrator is hard-killed
         # (SIGKILL/OOM/crash), death_w auto-closes → child reads EOF →
         # SIGKILLs the grandchild so the pid-namespace doesn't leak.
-        death_r, death_w = os.pipe()
+        # Registered creation: concurrently-forked sibling children
+        # must close their inherited copies of THIS death_w, or its
+        # EOF is pinned for as long as any sibling lives (see the
+        # registry block at module top).
+        death_r, death_w = open_death_pipe()
         _parent_fds.update({death_r, death_w})
 
         # Exec-pid pipe (optional): when exec_pid_callback is supplied,
@@ -1464,6 +2201,12 @@ def run_sandboxed(
         # child that dies before the fork closes its copies and the
         # parent reads EOF, degrading to "no callback".
         pid_r = pid_w = None
+        # True once the live grandchild pid has been handed to the
+        # exec_pid_callback — from that point the caller owns a kill
+        # channel to the child ("SIGKILL is fine" is the documented
+        # contract), which the no-confirmation classifier below must
+        # treat as caller-initiated, not involuntary.
+        _exec_pid_delivered = False
         if exec_pid_callback is not None:
             pid_r, pid_w = os.pipe()
             _parent_fds.update({pid_r, pid_w})
@@ -1499,7 +2242,7 @@ def run_sandboxed(
         # tree is granted wholesale). In those cases the mount flag
         # must fail CLOSED instead of warning.
         _target_under_writable = bool(target) and any(
-            target == _w or target.startswith(_w.rstrip("/") + "/")
+            target == _w or target.startswith(_w.rstrip("/") + "/")  # type: ignore[union-attr]
             for _w in (writable_paths or []) if _w
         )
         _require_target_ro = bool(
@@ -1541,22 +2284,43 @@ def run_sandboxed(
         # instead of failing the spawn on the ENOSYS the pin walk
         # raises. On Linux O_PATH always exists, so the required-pin
         # posture below is unchanged where the threat is real.
+        # Mount-lane grant plan: drop the host-custom TMPDIR grant,
+        # anchor bind-target grants onto their in-view bind paths,
+        # carry legitimate out-of-view WRITABLE roots into the view as
+        # read-write binds (pinned below like every other bind
+        # source), and refuse — named, pre-fork — grants no lane could
+        # ever honour. Computed BEFORE the pin block so the carries
+        # join the required pin set; the Landlock arm below reuses the
+        # anchored rule list. See _anchor_grants_to_bind_view.
+        _carry_rw_paths: list[str] = []
+        _mount_writable_rules: list | None = None
+        if (target or output or rootfs) and not skip_mount_ns:
+            _mount_writable_rules = _drop_host_tmpdir_grants(
+                [p for p in (writable_paths or ()) if p],
+                target, output, rootfs)
+            _mount_writable_rules, _carry_rw_paths = (
+                _anchor_grants_to_bind_view(
+                    _mount_writable_rules, target, output, rootfs,
+                    readable_paths, kind="writable"))
         _bind_src_fds: dict[str, int] | None = None
         if ((target or output or rootfs) and not skip_mount_ns
                 and _pathpin._HAVE_O_PATH):
             try:
                 _bind_src_fds = _pin_bind_sources(
-                    target, output, rootfs, readable_paths)
+                    target, output, rootfs, readable_paths,
+                    writable_extra_paths=_carry_rw_paths,
+                    expected_identities=bind_source_identities)
             except OSError as _pin_exc:
                 from .errors import SandboxSetupError
                 msg = (
                     f"sandbox bind-source validation pin failed for a "
                     f"required source ({_pin_exc}) — refusing every "
-                    f"fallback tier: a target/output/rootfs path that "
-                    f"cannot be pinned at validation time would let a "
-                    f"concurrently planted symlink steer the "
-                    f"Landlock-only fallback's write grants on the "
-                    f"host filesystem."
+                    f"fallback tier: a target/output/rootfs path (or "
+                    f"an out-of-view writable grant carried into the "
+                    f"mount view) that cannot be pinned at validation "
+                    f"time would let a concurrently planted symlink "
+                    f"steer the bind or the Landlock-only fallback's "
+                    f"write grants on the host filesystem."
                 )
                 raise SandboxSetupError(
                     msg,
@@ -1586,25 +2350,70 @@ def run_sandboxed(
             )
             persona = None
         landlock_fn = None
+        # Floor-consented Landlock-absence tolerance (see the
+        # landlock_required docstring): on a kernel without the
+        # Landlock ABI, a floor that admits NS_NOMOUNT skips the layer
+        # instead of aborting 'L' in the grandchild — the ns-only tier
+        # this spawn then delivers is declared (and capped) by the
+        # caller's checked dispatch, so the floor comparison, not this
+        # module, decides admission. Scoped strictly to kernel absence:
+        # with Landlock present the ruleset is built below exactly as
+        # for landlock_required=True.
+        _landlock_absent_tolerated = (
+            not landlock_required and not _ll_avail()
+        )
+        if _landlock_absent_tolerated and (
+                writable_paths or allowed_tcp_ports
+                or (readable_paths and restrict_reads)):
+            logger.debug(
+                "_spawn: Landlock unavailable on this kernel and the "
+                "call's containment floor admits the ns-only tier — "
+                "running without the Landlock policy layer "
+                "(namespaces + fresh procfs + seccomp still "
+                "fail-closed).",
+            )
         # readable_paths under restrict_reads is a POLICY too: a
         # read-restricted spawn with no writable paths and no TCP
         # ports (skip_mount_ns + exclude_tmp_baseline shapes) must
         # still build the Landlock read allowlist — the preexec-path
         # twin of this gate already includes it.
-        if (writable_paths or allowed_tcp_ports
-                or (readable_paths and restrict_reads)):
-            effective_paths = list(writable_paths) if writable_paths else []
+        if (not _landlock_absent_tolerated
+                and (writable_paths or allowed_tcp_ports
+                     or (readable_paths and restrict_reads))):
+            # Mount-tree spawns use the precomputed grant plan
+            # (host-custom TMPDIR dropped, bind-target grants
+            # anchored, out-of-view roots carried as rw binds);
+            # host-view lanes keep the caller's list verbatim.
+            effective_paths = (
+                list(_mount_writable_rules)
+                if _mount_writable_rules is not None
+                else (list(writable_paths) if writable_paths else []))
+            if (target or output or rootfs) and not skip_mount_ns:
+                # This spawn builds the mount tree (same predicate as
+                # the step-9 setup_mount_ns call), so /dev/pts is the
+                # FRESH per-sandbox devpts instance
+                # (mount_ns._mount_minimal_dev) — grant it write so
+                # openpty()/grantpt can open the multiplexor and slave
+                # O_RDWR. The grant lives HERE, not in the context's
+                # shared writable_paths: on the mountless/skip_mount
+                # retries and the subprocess fallbacks /dev/pts is the
+                # HOST's pty slaves, and a write grant there hands
+                # sandboxed code the operator's terminal (escape-
+                # sequence injection). The rule path is opened
+                # post-pivot; if the devpts mount degraded, it names
+                # the empty stub dir — a no-op grant.
+                effective_paths.append("/dev/pts")
             if rootfs is not None:
                 # Landlock rule paths are opened POST-pivot (the child
                 # applies landlock_fn at step 10, after setup_mount_ns),
                 # where the image rootfs IS "/". The image's own tree
                 # must stay writable for the environment to function —
                 # but a wholesale "/" grant is WRONG in rootfs mode:
-                # /dev and /sys are recursive HOST binds there, so "/"
-                # would hand the child Landlock write access to
-                # same-UID host device nodes (the operator's other
-                # ptys, most damningly — "host dirs are not bound in"
-                # is false for exactly those two). Enumerate the
+                # /sys is a recursive HOST bind there and /dev carries
+                # per-node binds of host devices, so "/" would hand
+                # the child Landlock write access to same-UID host
+                # nodes and sysfs ("host dirs are not bound in" is
+                # false for exactly those two). Enumerate the
                 # image's top-level entries instead, skipping
                 # dev/sys/proc (device writes that tools legitimately
                 # need — /dev/null, /dev/tty — are covered by the
@@ -1647,12 +2456,23 @@ def run_sandboxed(
             # The setup-report at the bottom of this function already
             # reported read_allowlist only when restrict_reads — the
             # enforcement now matches it.
+            _ll_readable = (list(readable_paths)
+                            if (readable_paths and restrict_reads)
+                            else None)
+            if (_ll_readable
+                    and (target or output or rootfs)
+                    and not skip_mount_ns):
+                # Mount-tree spawn: read-rule opens happen POST-pivot
+                # too, so anchor readable grants onto their own bind
+                # paths (every readable entry is its own read-only
+                # bind target — the carry list is always empty here).
+                _ll_readable, _ = _anchor_grants_to_bind_view(
+                    _ll_readable, target, output, rootfs,
+                    readable_paths, kind="readable")
             landlock_fn = _make_landlock_preexec(
                 effective_paths,
                 list(allowed_tcp_ports) if allowed_tcp_ports else None,
-                readable_paths=(list(readable_paths)
-                                if (readable_paths and restrict_reads)
-                                else None),
+                readable_paths=_ll_readable,
                 # Spawn lane: fail-closed aborts RAISE so the grandchild
                 # catch-all reports them on the setup-status pipe ('L' +
                 # reason) and the parent fails loud with a typed
@@ -1666,12 +2486,21 @@ def run_sandboxed(
         # mount-ns (fresh tmpfs masks /run's pathname sockets; the rest
         # of the host is read-only under pivot_root) on top of its
         # netns (abstract sockets are namespace-scoped). Mirrors the
-        # child-side engagement condition at step 9; a mount failure
-        # aborts the child before the payload runs, and the caller's
-        # fallback re-runs through the preexec path where AF_UNIX
-        # stays blocked. Needed for Python >= 3.14 multiprocessing
-        # (forkserver listener) inside sandboxed tools.
-        _allow_unix = bool((target or output) and not skip_mount_ns)
+        # child-side engagement condition at step 9 — INCLUDING
+        # rootfs-only spawns (cve-env / fuzzing image runs pass
+        # neither target nor output): rootfs mode mounts the same
+        # per-sandbox /tmp + /run tmpfs (step 7) and minimal-dev
+        # /dev/shm, so the allowance rationale and the supervisor's
+        # tmpfs-dev pins hold identically; excluding it left
+        # unix-socket IPC (postgres/php-fpm entrypoints, Python >=
+        # 3.14 forkserver) EPERM-blocked inside image workloads. A
+        # mount failure aborts the child before the payload runs, and
+        # the caller's fallback re-runs through the preexec path
+        # where AF_UNIX stays blocked. Needed for Python >= 3.14
+        # multiprocessing (forkserver listener) inside sandboxed
+        # tools.
+        _allow_unix = bool((target or output or rootfs)
+                           and not skip_mount_ns)
         # CONNECT SCOPING for the allowed AF_UNIX sockets (enforcement
         # mode). allow_unix's harmlessness rationale has one hole: the
         # OUTPUT dir is a READ-WRITE bind, so a host-side (or sibling-
@@ -1722,13 +2551,25 @@ def run_sandboxed(
             allow_unix_sockets=_allow_unix,
             unix_scope_export_sock=_unix_scope_child_sock,
             # This filter installs in the GRANDCHILD, after every
-            # namespace the sandbox itself needs already exists — the
-            # one install point where denying namespace creation to
-            # the target costs nothing and closes the nested-userns
-            # kernel attack surface. The subprocess/preexec lanes
-            # must NOT set this (their filter precedes the unshare
-            # CLI bootstrap).
+            # namespace the sandbox itself needs already exists — an
+            # install point where denying namespace creation to the
+            # target costs nothing and closes the nested-userns
+            # kernel attack surface. The subprocess lanes carry the
+            # same rules unconditionally in their preexec (nothing
+            # they exec legitimately unshares since the unshare-CLI
+            # bootstrap lane was deleted).
             block_ns_creation=True,
+            # Fileless-exec deny, keyed on the restrict_reads posture
+            # exactly like the plain-subprocess preexec (context.py)
+            # and Landlock's EXECUTE handling: memfd_create + execveat
+            # AT_EMPTY_PATH are refused for restricted-reads children.
+            # A memfd's SB_NOUSER inode is exempt from every Landlock
+            # rule, so this seccomp deny is the ONLY layer standing
+            # between an untrusted payload and an anonymous in-memory
+            # process image on this lane too. (The frida profile keeps
+            # memfd_create — consented instrumentation; see
+            # _make_seccomp_preexec's carve-out.)
+            deny_fd_exec=bool(restrict_reads),
         ) if seccomp_profile else None
 
         # Tracer-ready pipe: the tracer subprocess writes a byte once
@@ -1766,6 +2607,8 @@ def run_sandboxed(
         from core.sandbox._proxy_bridge import (
             _bring_up_loopback as _loopback_up_fn,
         )
+        from core.security.session_services import session_services_restricted
+        _loopback_allowed = not session_services_restricted()
         # Bridge pairs (listen_port, unix_socket_path): the egress
         # proxy's relay plus any caller-declared extra loopback
         # services (LLM dispatcher for credential-proxy CLI children).
@@ -1779,30 +2622,91 @@ def run_sandboxed(
                 (int(port), str(path)) for port, path in extra_unix_bridges
             )
         if _bridge_pairs:
-            from core.sandbox._proxy_bridge import (
+            from core.sandbox._proxy_bridge import (  # type: ignore[assignment]
                 _run_bridges as _proxy_forwarder_fn,
             )
 
         # Names whose values the child zeroes from its inherited
         # environ image (see _scrub_env_image_values): the target-env
         # strip set (trust markers + session credential), RAPTOR_DIR,
-        # and every LLM provider credential the orchestrator may
+        # and every credential-bearing name the orchestrator may
         # carry — none of these is consumed via getenv() anywhere in
         # the spawn chain, so emptying the image values is free.
+        # The credential class is DERIVED from the canonical
+        # vocabulary (core.security.credential_env), not hand-typed:
+        # CREDENTIAL_BEARING_ENV_VARS is exactly the value-IS-the-
+        # secret tier — the zero-the-value semantic — and covers the
+        # first-party session credentials (ANTHROPIC_AUTH_TOKEN,
+        # CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_CUSTOM_HEADERS) that the
+        # enumerated LLM_API_KEY_VARS list misses; LLM_API_KEY_VARS
+        # stays in the union for its provider-key members that are
+        # deliberately NOT general-blocklist credential vocabulary;
+        # and a name-SHAPE sweep of the image's own names catches
+        # operator-environment credentials no consumed set enumerates.
         # Computed PRE-FORK — the child must not import post-pivot,
-        # and the config module is already loaded here.
+        # and both source modules are already loaded here.
         from core.config import RaptorConfig as _RC_scrub
-        _env_image_scrub_names = tuple(
+        from core.security.credential_env import (
+            CREDENTIAL_BEARING_ENV_VARS as _CRED_BEARING_scrub,
+        )
+        from core.security.credential_env import (
+            is_credential_shaped as _is_cred_shaped,
+        )
+        from core.security.credential_env import (
+            is_model_traffic_redirect_shaped as _is_redirect_shaped,
+        )
+        # Shape sweep over the image's OWN names: the exact-name sets
+        # cannot enumerate every credential the operator's launcher
+        # environment happens to carry (GITHUB_TOKEN / GH_TOKEN /
+        # HF_TOKEN and kin have no consumed set), so the names in
+        # /proc/self/environ — the parent's execve image, which is
+        # byte-identical to what every un-exec'd fork republishes —
+        # are filtered through the vocabulary's name-shape grammar
+        # (segment-exact TOKEN/KEY/SECRET/... with the documented
+        # benign-knob carve-outs). Best-effort: an unreadable procfs
+        # skips the sweep, the exact-name union still applies.
+        _image_shaped_names: set[str] = set()
+        try:
+            with open("/proc/self/environ", "rb") as _envf:
+                for _entry in _envf.read().split(b"\0"):
+                    _nm = _entry.split(b"=", 1)[0]
+                    if not _nm:
+                        continue
+                    try:
+                        _nm_s = _nm.decode("utf-8")
+                    except UnicodeDecodeError:
+                        continue
+                    if (_is_cred_shaped(_nm_s)
+                            or _is_redirect_shaped(_nm_s)):
+                        # Credential-shaped names AND model-traffic
+                        # redirect knobs (ANTHROPIC_*BASE_URL /
+                        # AWS_ENDPOINT_URL* / CLAUDE_CODE_SKIP_*):
+                        # a gateway endpoint identifies the
+                        # deployment even when every key is
+                        # elsewhere — the same class the OLLAMA_HOST
+                        # entry below is hand-listed for, derived
+                        # from the vocabulary instead of enumerated.
+                        _image_shaped_names.add(_nm_s)
+        except OSError:
+            pass
+        _env_image_scrub_names = tuple(sorted(
             n.encode() for n in
-            (*_RC_scrub.TARGET_ENV_STRIP_SET,
+            {*_RC_scrub.TARGET_ENV_STRIP_SET,
              *_RC_scrub.LLM_API_KEY_VARS,
+             *_CRED_BEARING_scrub,
+             *_image_shaped_names,
              "RAPTOR_DIR",
-             # Endpoint-locating values: the LLM backend location and
-             # proxy URLs (which may embed credentials) identify the
-             # deployment even when every key is elsewhere.
+             # Endpoint-locating values with NO derived predicate:
+             # the local-LLM backend location and proxy URLs (which
+             # may embed credentials) identify the deployment even
+             # when every key is elsewhere. The provider-gateway
+             # half of this class (ANTHROPIC_*BASE_URL and kin) is
+             # derived via is_model_traffic_redirect_shaped in the
+             # image sweep above — only the members the vocabulary
+             # deliberately does not model stay hand-listed here.
              "OLLAMA_HOST",
              "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
-             "http_proxy", "https_proxy", "all_proxy"))
+             "http_proxy", "https_proxy", "all_proxy"}))
 
         # Fresh-proc-mount expectation — resolved PRE-FORK (the probe
         # spawns a subprocess and logs; both are off-limits after
@@ -1831,11 +2735,31 @@ def run_sandboxed(
                 use_errno=True,
             )
 
+        # Persona lane: step 8.5's set_uts lazily resolves
+        # fingerprint's own libc binding on first use, which without
+        # this prime happens inside the forked child of the FIRST
+        # persona spawn — the same banned pattern. Resolve (or cache
+        # the failure) in the parent now; the child's call is then a
+        # lock-free cache read, or an immediate OSError it already
+        # degrades on. Also imports the module pre-fork, so the
+        # child's `from .fingerprint import set_uts` is a
+        # sys.modules hit.
+        if persona is not None:
+            with contextlib.suppress(ImportError, OSError):
+                from .fingerprint import _get_libc as _fp_get_libc
+                _fp_get_libc()
+
         # posix_spawn() can't do the bespoke namespace setup, so we
         # need raw fork; the multi-threaded-fork DeprecationWarning is
         # filtered once at module level (fork-safety contract in the
         # module docstring).
-        child_pid = os.fork()
+        # Forked under the death-pipe registry lock so the child's
+        # inherited _LIVE_DEATH_W snapshot exactly matches its
+        # inherited fd table (registration and close both take the
+        # same lock); the `with` exit releases the lock in BOTH
+        # processes before either branch runs.
+        with _DEATH_W_LOCK:
+            child_pid = os.fork()
     except BaseException:
         # Any failure before fork returns: close opened pipes, release
         # the audit-config fd and evidence file if created, and remove
@@ -1859,6 +2783,22 @@ def run_sandboxed(
         raise
     if child_pid == 0:
         # ================ CHILD ================
+        _child_keep_fds = set(_parent_fds) | _stdio_source_fds
+        for _sock in (_unix_scope_parent_sock, _unix_scope_child_sock):
+            if _sock is not None:
+                with contextlib.suppress(OSError, ValueError):
+                    _child_keep_fds.add(_sock.fileno())
+        try:
+            _child_open_fds = {
+                int(_name)
+                for _name in os.listdir("/proc/self/fd")
+                if _name.isdigit() and int(_name) > 2
+            }
+        except (OSError, ValueError):
+            _child_open_fds = set(_preexisting_fds)
+        for _fd in _child_open_fds - _child_keep_fds:
+            with contextlib.suppress(OSError):
+                os.close(_fd)
         # Close the ends of the pipes we don't use.
         os.close(p_ready_r)
         os.close(p_go_w)
@@ -1866,9 +2806,13 @@ def run_sandboxed(
         # read end. status_w is kept open through setup and auto-closes on
         # a successful execvpe (its default O_CLOEXEC) → parent reads EOF.
         os.close(status_r)
-        # Death pipe: child watches death_r; close the write end so only
-        # the parent holds it. Parent dying → death_w closes → EOF.
-        os.close(death_w)
+        # Death pipes: child watches death_r; close the write end so
+        # only the parent holds it. Parent dying → death_w closes →
+        # EOF. The sweep covers our own death_w AND every sibling
+        # spawn's registered write end we inherited across the fork —
+        # a retained sibling copy would pin that sibling's EOF (and
+        # its orphan teardown) to this child's lifetime.
+        _close_inherited_death_w_post_fork()
         # Exec-pid pipe: the child side only WRITES (pid_w, from the
         # intermediate after the grandchild fork); close the read end.
         if pid_r is not None:
@@ -1884,121 +2828,129 @@ def run_sandboxed(
         # knows whether to degrade (mount) or fail loud (Landlock/seccomp/
         # unshare). Default 'U' (fail-loud) for any pre-mount step.
         _status_step = b"U"
-        # Tracer-ready pipe: target child doesn't read from or write to
-        # this pipe; the tracer subprocess writes one end and the main
-        # parent reads the other. Close both inherited ends so the pipe
-        # doesn't keep references to the target child's fd table.
-        if _audit_engaged:
-            os.close(t_ready_r)
-            os.close(t_ready_w)
-        if capture_output:
-            os.close(out_r)
-            os.close(err_r)
-            os.dup2(out_w, 1)
-            os.dup2(err_w, 2)
-            os.close(out_w)
-            os.close(err_w)
-        else:
-            # stdout=/stderr= redirects (int fd, file-like, DEVNULL,
-            # STDOUT for stderr). Pre-fix these kwargs were silently
-            # DROPPED on this path — the child inherited the parent's
-            # fd 1/2 regardless, which also defeated run_untrusted's
-            # write-only tty reopen (the child kept the O_RDWR pty
-            # slave and could read() the operator's keystrokes
-            # through its own stdout). PIPE is unsupported here, same
-            # as stdin: fail closed to /dev/null with a stderr note.
-            for _redir, _fdnum, _label in ((stdout, 1, b"stdout"),
-                                           (stderr, 2, b"stderr")):
-                if _redir is None:
-                    continue
-                if _redir == subprocess.PIPE:
+        # The guard starts HERE, before any stdio plumbing: a bad
+        # caller-supplied stdout=/stderr=/stdin= argument (closed file,
+        # object without a usable fileno(), invalid fd int) raises in
+        # the FORKED child, and without the os._exit backstop that
+        # exception unwinds the caller's stack in BOTH processes — the
+        # orchestrator's finally handlers (proxy unregister, evidence
+        # close, lifecycle writes) would run twice, and the parent
+        # mis-diagnoses the death as "no ready signal".
+        try:
+            # Tracer-ready pipe: target child doesn't read from or write to
+            # this pipe; the tracer subprocess writes one end and the main
+            # parent reads the other. Close both inherited ends so the pipe
+            # doesn't keep references to the target child's fd table.
+            if _audit_engaged:
+                os.close(t_ready_r)  # type: ignore[arg-type]
+                os.close(t_ready_w)  # type: ignore[arg-type]
+            if capture_output:
+                os.close(out_r)  # type: ignore[arg-type]
+                os.close(err_r)  # type: ignore[arg-type]
+                os.dup2(out_w, 1)  # type: ignore[arg-type]
+                os.dup2(err_w, 2)  # type: ignore[arg-type]
+                os.close(out_w)  # type: ignore[arg-type]
+                os.close(err_w)  # type: ignore[arg-type]
+            else:
+                # stdout=/stderr= redirects (int fd, file-like, DEVNULL,
+                # STDOUT for stderr). Pre-fix these kwargs were silently
+                # DROPPED on this path — the child inherited the parent's
+                # fd 1/2 regardless, which also defeated run_untrusted's
+                # write-only tty reopen (the child kept the O_RDWR pty
+                # slave and could read() the operator's keystrokes
+                # through its own stdout). PIPE is unsupported here, same
+                # as stdin: fail closed to /dev/null with a stderr note.
+                for _redir, _fdnum, _label in ((stdout, 1, b"stdout"),
+                                               (stderr, 2, b"stderr")):
+                    if _redir is None:
+                        continue
+                    if _redir == subprocess.PIPE:
+                        try:
+                            os.write(2, b"sandbox: %s=subprocess."
+                                        b"PIPE not supported via the "
+                                        b"mount-ns path; falling back to "
+                                        b"/dev/null.\n" % _label)
+                        except OSError:
+                            pass
+                        _redir = subprocess.DEVNULL
+                    if _redir == subprocess.DEVNULL:
+                        _dn = os.open("/dev/null", os.O_WRONLY)
+                        os.dup2(_dn, _fdnum)
+                        os.close(_dn)
+                        continue
+                    if _fdnum == 2 and _redir == subprocess.STDOUT:
+                        os.dup2(1, 2)
+                        continue
+                    _rfd = _redir if isinstance(_redir, int) else _redir.fileno()
+                    if _rfd != _fdnum:
+                        os.dup2(_rfd, _fdnum)
+            # stdin: caller-supplied fd/file if any, else /dev/null (defence
+            # against tty-based escapes — a child with an inherited tty can
+            # TIOCSTI-inject or ^Z into the parent's job control). The
+            # Landlock-only path honours stdin=; the mount-ns path MUST do
+            # the same or it silently drops input (bug previously hit by
+            # packages/binary_analysis/debugger.py passing `stdin=open(...)`
+            # for gdb's crash-replay input).
+            # Map the caller's stdin= into fd 0. Handles the same cases
+            # subprocess.Popen does:
+            #   - None or subprocess.DEVNULL → /dev/null
+            #   - subprocess.PIPE  → unsupported on this path (context.py
+            #     already routes `input=` callers away from _spawn, so PIPE
+            #     is always a caller mistake — fail closed with /dev/null
+            #     and a stderr note rather than silently letting the child
+            #     talk to whatever fd -1 resolves to).
+            #   - int fd (real)    → dup2 onto 0
+            #   - file-like object → dup2 on .fileno() onto 0
+            _use_devnull = (
+                stdin is None
+                or stdin == subprocess.DEVNULL
+                or stdin == subprocess.PIPE
+            )
+            if _use_devnull:
+                if stdin == subprocess.PIPE:
                     try:
-                        os.write(2, b"sandbox: %s=subprocess."
-                                    b"PIPE not supported via the "
-                                    b"mount-ns path; falling back to "
-                                    b"/dev/null.\n" % _label)
+                        os.write(2, b"sandbox: stdin=subprocess.PIPE "
+                                    b"not supported via the mount-ns path; "
+                                    b"use `input=` or an explicit fd. "
+                                    b"Falling back to /dev/null.\n")
                     except OSError:
                         pass
-                    _redir = subprocess.DEVNULL
-                if _redir == subprocess.DEVNULL:
-                    _dn = os.open("/dev/null", os.O_WRONLY)
-                    os.dup2(_dn, _fdnum)
-                    os.close(_dn)
-                    continue
-                if _fdnum == 2 and _redir == subprocess.STDOUT:
-                    os.dup2(1, 2)
-                    continue
-                _rfd = _redir if isinstance(_redir, int) else _redir.fileno()
-                if _rfd != _fdnum:
-                    os.dup2(_rfd, _fdnum)
-        # stdin: caller-supplied fd/file if any, else /dev/null (defence
-        # against tty-based escapes — a child with an inherited tty can
-        # TIOCSTI-inject or ^Z into the parent's job control). The
-        # Landlock-only path honours stdin=; the mount-ns path MUST do
-        # the same or it silently drops input (bug previously hit by
-        # packages/binary_analysis/debugger.py passing `stdin=open(...)`
-        # for gdb's crash-replay input).
-        # Map the caller's stdin= into fd 0. Handles the same cases
-        # subprocess.Popen does:
-        #   - None or subprocess.DEVNULL → /dev/null
-        #   - subprocess.PIPE  → unsupported on this path (context.py
-        #     already routes `input=` callers away from _spawn, so PIPE
-        #     is always a caller mistake — fail closed with /dev/null
-        #     and a stderr note rather than silently letting the child
-        #     talk to whatever fd -1 resolves to).
-        #   - int fd (real)    → dup2 onto 0
-        #   - file-like object → dup2 on .fileno() onto 0
-        _use_devnull = (
-            stdin is None
-            or stdin == subprocess.DEVNULL
-            or stdin == subprocess.PIPE
-        )
-        if _use_devnull:
-            if stdin == subprocess.PIPE:
-                try:
-                    os.write(2, b"sandbox: stdin=subprocess.PIPE "
-                                b"not supported via the mount-ns path; "
-                                b"use `input=` or an explicit fd. "
-                                b"Falling back to /dev/null.\n")
-                except OSError:
-                    pass
-            devnull = os.open("/dev/null", os.O_RDONLY)
-            os.dup2(devnull, 0)
-            os.close(devnull)
-        else:
-            try:
-                stdin_fd = stdin if isinstance(stdin, int) else stdin.fileno()
-                os.dup2(stdin_fd, 0)
-                # Close the original fd so the child doesn't inherit a
-                # duplicate (the caller's file object may not have
-                # O_CLOEXEC, in which case execvpe would leave both
-                # fds pointing at the same file). dup2 clears CLOEXEC
-                # on fd 0, which is what we want — stdin stays open
-                # across exec.
-                if stdin_fd != 0:
-                    try:
-                        os.close(stdin_fd)
-                    except OSError:
-                        pass
-            except (AttributeError, OSError):
                 devnull = os.open("/dev/null", os.O_RDONLY)
                 os.dup2(devnull, 0)
                 os.close(devnull)
-        # New session → no controlling tty. Honoured only when caller
-        # explicitly or implicitly opts in — subprocess.run defaults to
-        # start_new_session=False (session inherited) and callers relying
-        # on a controlling tty (e.g. interactive gdb under /crash-analysis
-        # via `sandbox(profile='debug')` + start_new_session=False) need
-        # the same behaviour through this path. Previously _spawn
-        # unconditionally setsid'd, silently defeating that escape
-        # hatch on mount-ns-capable hosts.
-        if start_new_session:
-            try:
-                os.setsid()
-            except OSError:
-                pass
+            else:
+                try:
+                    stdin_fd = stdin if isinstance(stdin, int) else stdin.fileno()
+                    os.dup2(stdin_fd, 0)
+                    # Close the original fd so the child doesn't inherit a
+                    # duplicate (the caller's file object may not have
+                    # O_CLOEXEC, in which case execvpe would leave both
+                    # fds pointing at the same file). dup2 clears CLOEXEC
+                    # on fd 0, which is what we want — stdin stays open
+                    # across exec.
+                    if stdin_fd != 0:
+                        try:
+                            os.close(stdin_fd)
+                        except OSError:
+                            pass
+                except (AttributeError, OSError):
+                    devnull = os.open("/dev/null", os.O_RDONLY)
+                    os.dup2(devnull, 0)
+                    os.close(devnull)
+            # New session → no controlling tty. Honoured only when caller
+            # explicitly or implicitly opts in — subprocess.run defaults to
+            # start_new_session=False (session inherited) and callers relying
+            # on a controlling tty (e.g. interactive gdb under /crash-analysis
+            # via `sandbox(profile='debug')` + start_new_session=False) need
+            # the same behaviour through this path. Previously _spawn
+            # unconditionally setsid'd, silently defeating that escape
+            # hatch on mount-ns-capable hosts.
+            if start_new_session:
+                try:
+                    os.setsid()
+                except OSError:
+                    pass
 
-        try:
             # Step 3: create namespaces. Leaves us as "nobody" in the
             # new user-ns until the parent runs newuidmap on us.
             # CLONE_NEWCGROUP: without it every process in the
@@ -2035,7 +2987,10 @@ def run_sandboxed(
             # block_network. We own the netns (created by our user-ns)
             # so SIOCSIFFLAGS is permitted even pre-uidmap. Best-effort:
             # on failure the netns behaves exactly as before this fix.
-            if ns_flags & CLONE_NEWNET:
+            # The Copilot session ceiling forbids socket(AF_INET), including
+            # the ioctl socket used solely to raise lo. Leave it down there;
+            # an attempted bring-up would abort namespace setup before exec.
+            if ns_flags & CLONE_NEWNET and _loopback_allowed:
                 try:
                     _loopback_up_fn()
                 except OSError as e:
@@ -2092,11 +3047,38 @@ def run_sandboxed(
             os.close(p_ready_w)
 
             # Step 7: wait for parent 'go' signal — parent has run
-            # newuidmap by this point.
+            # newuidmap by this point. Select-with-deadline, not a
+            # bare blocking read (the same cross-spawn pin class as
+            # the parent's t_ready_r/pid_r/status_r waits): p_go_w
+            # lives in the parent's fd table until step 8, so a
+            # sibling spawn forked in the step-4..8 window holds a
+            # transient copy in its never-exec'ing setup child —
+            # after an orchestrator hard-kill, this dead run's setup
+            # child otherwise stays parked on the pipe until the
+            # longest concurrent sibling completes. Deadline is 2x
+            # the ready deadline: the parent's step-4..8 window
+            # legitimately contains newuidmap plus, under audit, the
+            # tracer fork and its own ready wait — the go deadline
+            # must not fire while the parent is lawfully inside that
+            # budget. (_select_mod, not the bare `select` name —
+            # that name is function-local here; see the import.)
             try:
-                if os.read(p_go_r, 1) != b"G":
+                _go = b""
+                _go_deadline = (time.monotonic()
+                                + 2 * _P_READY_DEADLINE_S)
+                while True:
+                    _go_left = _go_deadline - time.monotonic()
+                    if _go_left <= 0:
+                        break
+                    _go_ready, _, _ = _select_mod.select(
+                        [p_go_r], [], [], _go_left)
+                    if _go_ready:
+                        _go = os.read(p_go_r, 1)
+                        break
+                if _go != b"G":
                     # Parent failed before signalling go (it has already
-                    # raised + killed us). Write a status anyway so the pipe
+                    # raised + killed us), or the deadline expired with
+                    # the parent gone. Write a status anyway so the pipe
                     # is self-sufficient and never relies on caller ordering.
                     _write_setup_status(status_w, b"U", "no go signal")
                     os._exit(125)
@@ -2113,7 +3095,7 @@ def run_sandboxed(
                 os._exit(124)
 
             # rlimits as early as possible so later setup is constrained.
-            _set_rlimits(limits)
+            _set_rlimits(limits, status_fd=status_w)
 
             # Step 8.5 (fingerprint sanitisation): sethostname /
             # setdomainname inside our fresh UTS namespace. Done before
@@ -2217,13 +3199,18 @@ def run_sandboxed(
                 try:
                     setup_mount_ns(target, output,
                                    extra_ro_paths=readable_paths,
+                                   extra_rw_paths=_carry_rw_paths or None,
                                    root_path=_root_dir,
                                    persona=persona,
                                    etc_overlay=etc_overlay,
+                                   stage_files=stage_files,
+                                   stage_dirs=stage_dirs,
                                    rw_submounts_ok=_rw_submounts_ok,
                                    rootfs=rootfs,
                                    require_target_ro=_require_target_ro,
-                                   src_fds=_bind_src_fds)
+                                   src_fds=_bind_src_fds,
+                                   fresh_netns=bool(
+                                       ns_flags & CLONE_NEWNET))
                 except OSError as _mnt_exc:
                     # ESTALE out of a pinned bind = the source stopped
                     # resolving to its validation-time inode — a
@@ -2234,9 +3221,22 @@ def run_sandboxed(
                     # planted symlink resolves on the HOST filesystem
                     # and the steering this pin exists to refuse
                     # succeeds at the fallback tier instead.
+                    # The tamper check outranks the fail-closed
+                    # category below: an ExtraRoBindError wraps the
+                    # underlying errno, so a pinned readable-path
+                    # bind that hit ESTALE is still reported as 'P'
+                    # (previously the extra_ro fail-closed exit
+                    # shadowed the pin signal entirely).
                     if (_bind_src_fds
                             and _mnt_exc.errno == _PIN_TAMPER_ERRNO):
                         _status_step = b"P"
+                    elif isinstance(_mnt_exc, _ExtraRoBindError):
+                        # Caller-named readable path failed its ro
+                        # bind — fail-closed by contract ('C': the
+                        # parent refuses loudly; the 'M' degrade path
+                        # would silently drop a protection the caller
+                        # explicitly asked for).
+                        _status_step = b"C"
                     raise
                 # The validation-time source pins have served their
                 # one purpose (every bind above verified its source
@@ -2277,15 +3277,21 @@ def run_sandboxed(
             # exist (or isn't executable), surface the error rather
             # than silently running from /. A silent fallback masks
             # genuine caller bugs (wrong repo_path, deleted target).
-            # The stderr write lets the parent's observability layer
-            # see what happened; the os._exit(127) code matches
-            # subprocess's ENOENT-during-exec convention so callers
-            # testing `result.returncode == 127` behave identically
-            # across the two sandbox paths.
+            # Status byte FIRST ('C', fail-closed child abort): a bare
+            # os._exit here reads as EOF-no-byte to the parent, i.e.
+            # "the target execed" — the aborted setup came back as a
+            # genuine CompletedProcess whose rc=127 collided with the
+            # shell command-not-found convention and fed downstream
+            # returncode oracles a fabricated target result. The
+            # stderr write stays as the human-readable diagnostic.
             if cwd:
                 try:
                     os.chdir(cwd)
                 except OSError as e:
+                    _write_setup_status(
+                        status_w, b"C",
+                        f"cwd {cwd!r} unusable inside sandbox "
+                        f"({e.__class__.__name__}: {e})")
                     try:
                         os.write(2,
                             f"sandbox: cwd={cwd!r} unusable inside "
@@ -2327,6 +3333,12 @@ def run_sandboxed(
             # CAP_SYS_PTRACE doesn't apply). Found via bpftrace 2026-06-14:
             # __ptrace_may_access fires with target_pid=1 target_comm=systemd
             # then returns -EPERM, breaking gdb's bp insertion.
+            # Raw-wait-status side channel from the in-ns init waiter
+            # (see _pid1_split_for_waiter): created before the pid-ns
+            # fork so the waiter inherits the write end.
+            _tgt_wstat_r = _tgt_wstat_w = -1
+            if not skip_pid_ns:
+                _tgt_wstat_r, _tgt_wstat_w = os.pipe()
             if not skip_pid_ns:
                 os.unshare(CLONE_NEWPID)
             grand = os.fork()
@@ -2380,13 +3392,21 @@ def run_sandboxed(
                 # with the host-pid procfs bind retained, the target
                 # can read /proc/<pid>/environ of the sandbox's own
                 # in-userns spawn-chain intermediary (an un-exec'd fork
-                # of the invoking process: same user namespace, so the
-                # kernel's ptrace gate passes, and its environ image is
-                # the parent's FULL pre-strip environment — session
-                # credential included). Host processes proper stay
-                # unreadable (they are unmapped in our user namespace);
-                # the spawn chain's own processes are the exception the
-                # earlier warn-and-continue rationale missed.
+                # of the invoking process whose environ image is the
+                # parent's FULL pre-strip environment — session
+                # credential included). Dumpable same-cred host
+                # processes are exposed the same way: the kernel's
+                # PTRACE_MODE_READ check passes for any same-uid
+                # reader of such a target at every Yama scope — Yama
+                # hooks only ATTACH-class access (/proc/<pid>/mem,
+                # PTRACE_ATTACH/SEIZE), never environ reads (verified
+                # on a live scope-1 kernel: same-uid non-descendant
+                # environ read succeeds while /proc/<pid>/mem on the
+                # same pid is denied). A denial here is never host
+                # Yama hardening — the sandbox's own Landlock ptrace
+                # scoping denies out-of-domain targets, and a
+                # non-dumpable target denies to everyone — so this
+                # mount, not the host, is the credential boundary.
                 #
                 # skip_pid_ns runs (gdb) keep the host procfs bind on
                 # purpose: gdb's host-info probe needs the host pid
@@ -2433,14 +3453,14 @@ def run_sandboxed(
                         for _pt, _pfd in _persona_proc_pins:
                             _rb = -1
                             try:
-                                _rb = int(_libc.mount(
+                                _rb = int(_libc.mount(  # type: ignore[union-attr]
                                     f"/proc/self/fd/{_pfd}".encode(),
                                     _pt.encode(), None, _MS_BIND_G,
                                     None))
                             except Exception:  # noqa: BLE001
                                 _rb = -1
                             if _rb != 0:
-                                if persona.strict:
+                                if persona.strict:  # type: ignore[union-attr]
                                     _write_setup_status(
                                         status_w, b"M",
                                         f"persona re-overlay bind "
@@ -2514,13 +3534,32 @@ def run_sandboxed(
                     _status_step = b"S"
                     seccomp_fn()
                 _status_step = b"X"
-                if rootfs is not None and not skip_pid_ns:
-                    # Rootfs mode: split so the image entrypoint is PID 2
-                    # (a PID-1 entrypoint has kill(2)-delivered signals
-                    # filtered — abort()/raise() deaths would vanish).
-                    # Returns in the exec-path child; PID 1 stays behind
-                    # as the in-process init mirroring exit statuses.
-                    _pid1_split_for_waiter()
+                if not skip_pid_ns:
+                    # Split so the target is PID 2 of the pid-ns, not
+                    # PID 1: a PID-1 target has kill(2)-delivered
+                    # signals silently filtered by the kernel —
+                    # abort() falls through raise(SIGABRT) to glibc's
+                    # ABORT_INSTRUCTION and reads as SIGSEGV,
+                    # raise(SIGFPE)/self-kill harnesses vanish
+                    # entirely — corrupting crash observability for
+                    # every oracle downstream. Originally rootfs-only
+                    # (the deleted pid1 shim carried this duty on the
+                    # unshare-CLI lane; the mount lane silently had
+                    # the distortion); now every pid-ns spawn splits,
+                    # so signal identity is preserved on all shapes.
+                    # Returns in the exec-path child; PID 1 stays
+                    # behind as the in-process init mirroring exit
+                    # statuses (128+sig, the convention
+                    # observe._interpret_result decodes; the raw
+                    # kernel wait status also travels the trusted
+                    # side channel so signal evidence keeps its
+                    # mechanical waitstatus grade) and forwarding
+                    # SIGTERM/SIGINT/SIGHUP/SIGQUIT.
+                    if _tgt_wstat_r >= 0:
+                        with contextlib.suppress(OSError):
+                            os.close(_tgt_wstat_r)
+                    _pid1_split_for_waiter(
+                        _tgt_wstat_w if _tgt_wstat_w >= 0 else None)
                 if env is not None:
                     exec_env = env
                     # Defense-in-depth: context.py:run() already strips
@@ -2531,11 +3570,14 @@ def run_sandboxed(
                     # protect direct callers of this function that
                     # bypass the run() wrapper (tests, future helpers).
                     if strict_env:
+                        # is_dangerous_env_name = DANGEROUS_ENV_VARS
+                        # plus the credential-env name patterns.
                         from core.config import RaptorConfig
-                        _dangerous = set(RaptorConfig.DANGEROUS_ENV_VARS)
+                        _safe_git = RaptorConfig.GIT_ENV_VARS
                         exec_env = {
                             k: v for k, v in exec_env.items()
-                            if k not in _dangerous
+                            if (not RaptorConfig.is_dangerous_env_name(k)
+                                or _safe_git.get(k) == v)
                         }
                 else:
                     # env=None → scrubbed allowlist env, NOT the full
@@ -2549,15 +3591,13 @@ def run_sandboxed(
                     exec_env = RaptorConfig.get_safe_env()
                 # bounded fork count via RLIMIT_NPROC (prlimit).
                 if nproc_limit and nproc_limit > 0:
-                    import resource
                     try:
                         resource.setrlimit(resource.RLIMIT_NPROC,
                                            (nproc_limit, nproc_limit))
                     except (ValueError, OSError):
                         warn_post_fork(b"sandbox: _spawn grandchild RLIMIT_NPROC setrlimit failed -- fork-bomb bound not applied\n")
-                import resource as _resource
                 try:
-                    _soft_nofile = _resource.getrlimit(_resource.RLIMIT_NOFILE)[0]
+                    _soft_nofile = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
                 except (ValueError, OSError):
                     _soft_nofile = 1024
                 _keep_fds = {status_w}
@@ -2581,6 +3621,16 @@ def run_sandboxed(
                             os.close(_fd)
                         except OSError:
                             pass
+                # POSITIVE exec confirmation, the last write before
+                # execvpe: status_w is CLOEXEC, so a successful exec
+                # leaves exactly 'G' + EOF on the pipe. Without it,
+                # bare EOF meant "execed" — an involuntary child death
+                # anywhere in setup (SIGKILL mid-rlimits, OOM kill)
+                # produced EOF too, and the parent returned the dead
+                # setup child's wait status as a genuine-looking
+                # target result. The parent now refuses typed on
+                # EOF-without-confirmation ('!').
+                _write_setup_status(status_w, b"G")
                 try:
                     # nosemgrep: python.lang.security.audit.dangerous-os-exec-tainted-env-args.dangerous-os-exec-tainted-env-args
                     os.execvpe(cmd[0], list(cmd), exec_env)
@@ -2611,6 +3661,13 @@ def run_sandboxed(
                     os._exit(126)
                 os._exit(125)  # unreachable
             else:
+                # Drop our copy of the waiter's wait-status write end
+                # NOW: the post-reap read below must see EOF once the
+                # waiter (sole remaining writer) exits, and a held
+                # write end here would deadlock it.
+                if _tgt_wstat_w >= 0:
+                    with contextlib.suppress(OSError):
+                        os.close(_tgt_wstat_w)
                 # Report the exec'ing grandchild's pid to the parent.
                 # One short ASCII write is atomic (well under PIPE_BUF);
                 # best-effort — if the parent went away the observation
@@ -2686,6 +3743,48 @@ def run_sandboxed(
                         os.close(_forwarder_death_w)
                     except OSError:
                         pass
+                # Raw target wait status from the trusted in-ns init
+                # waiter (see _pid1_split_for_waiter): the waiter can
+                # only mirror a signalled target as exit 128+sig — an
+                # exit-code shape the target itself can forge — so it
+                # reports the kernel's waitpid status out-of-band and
+                # THIS process (outside the pid-ns, not its init)
+                # re-raises the signal, restoring the parent's
+                # WIFSIGNALED view (rc < 0, mechanical evidence
+                # grade). The waiter exited, so the read is a bounded
+                # bytes-then-EOF drain; garbage or absence falls back
+                # to mirroring the waiter's own status below.
+                _tgt_status: int | None = None
+                if _tgt_wstat_r >= 0:
+                    _wbuf = b""
+                    with contextlib.suppress(OSError):
+                        while len(_wbuf) < 64:
+                            _chunk = os.read(_tgt_wstat_r, 64)
+                            if not _chunk:
+                                break
+                            _wbuf += _chunk
+                    with contextlib.suppress(OSError):
+                        os.close(_tgt_wstat_r)
+                    with contextlib.suppress(ValueError):
+                        _parsed = int(_wbuf.decode("ascii", "replace"))
+                        # Bound to the C wait-status domain: an
+                        # oversized integer would OverflowError inside
+                        # the WIFSIGNALED macro below. Unreachable from
+                        # the trusted waiter (it writes a real wait
+                        # status); robustness against a future writer.
+                        if 0 <= _parsed < 2 ** 32:
+                            _tgt_status = _parsed
+                if (_tgt_status is not None and _tgt_status >= 0
+                        and os.WIFSIGNALED(_tgt_status)
+                        and os.WIFEXITED(status)):
+                    sig = os.WTERMSIG(_tgt_status)
+                    import signal as _signal
+                    try:
+                        _signal.signal(sig, _signal.SIG_DFL)
+                    except (OSError, ValueError):
+                        pass
+                    os.kill(os.getpid(), sig)
+                    os._exit(128 + sig)
                 if os.WIFEXITED(status):
                     os._exit(os.WEXITSTATUS(status))
                 if os.WIFSIGNALED(status):
@@ -2703,14 +3802,30 @@ def run_sandboxed(
             # parent can degrade (mount) or fail loud (Landlock/seccomp/
             # unshare) deterministically — unspoofably, regardless of exit
             # code or stderr. Then the last-chance stderr diagnostic.
-            _tb = traceback.format_exc().strip()
+            # Setup-failure exception text embeds target-influenced
+            # strings (bind paths under the scanned tree, mount
+            # arguments) and this write lands on the operator's
+            # inherited stderr — escape control bytes, keeping the
+            # traceback's line structure. Best-effort: if the
+            # sanitiser import itself fails at this point, keep the
+            # step signal and skip the stderr diagnostic rather than
+            # relay raw bytes.
+            try:
+                from core.security.log_sanitisation import (
+                    escape_nonprintable as _enp,
+                )
+                _tb = _enp(traceback.format_exc(),
+                           preserve_newlines=True).strip()
+            except BaseException:  # noqa: BLE001 — last-chance path
+                _tb = ""
             _write_setup_status(
                 status_w, _status_step,
                 _tb.splitlines()[-1] if _tb else "",
             )
             # os.write to a possibly-closed/broken stderr → OSError.
-            with contextlib.suppress(OSError):
-                os.write(2, f"sandbox child failure:\n{traceback.format_exc()}\n".encode())
+            if _tb:
+                with contextlib.suppress(OSError):
+                    os.write(2, f"sandbox child failure:\n{_tb}\n".encode())
             os._exit(126)
 
     # ================ PARENT ================
@@ -2722,6 +3837,7 @@ def run_sandboxed(
     # the supervisor.
     _unix_scope_supervisor: list = []
     if _unix_scope_parent_sock is not None:
+        assert _unix_scope_child_sock is not None
         _unix_scope_child_sock.close()
 
         def _unix_scope_receiver() -> None:
@@ -2857,14 +3973,57 @@ def run_sandboxed(
             os.close(pid_w)
             _parent_fds.discard(pid_w)
         if capture_output:
-            os.close(out_w)
+            os.close(out_w)  # type: ignore[arg-type]
             _parent_fds.discard(out_w)
-            os.close(err_w)
+            os.close(err_w)  # type: ignore[arg-type]
             _parent_fds.discard(err_w)
 
         # Step 4: wait for child to signal "unshare done, ready for newuidmap".
+        # Non-blocking + bounded deadline, same idiom as the tracer-
+        # ready (t_ready_r) and exec-pid (pid_r) waits below: a
+        # sibling spawn forked inside the pipe-creation → parent-
+        # close(p_ready_w) window inherits a p_ready_w copy, and the
+        # sibling's SETUP child closes only its OWN fds (its
+        # grandchild's pre-exec sweep never runs in the intermediate,
+        # which doesn't exec), so it retains that copy for its entire
+        # life. A blocking read here therefore pinned this run to the
+        # SIBLING's schedule whenever OUR child died before writing
+        # 'R' (unshare EPERM on a userns-restricted host, stdio
+        # failure, transient EAGAIN): the EOF could not arrive until
+        # the sibling target finished, and the run timeout only arms
+        # later. A healthy child writes 'R' within milliseconds of
+        # unshare, so the deadline never fires on the good path; only
+        # the EOF-on-death signal can be withheld, which the deadline
+        # bounds.
         try:
-            if os.read(p_ready_r, 1) != b"R":
+            _ready = b""
+            _ready_timed_out = False
+            os.set_blocking(p_ready_r, False)
+            import select as _pr_sel
+            _pr_deadline = time.monotonic() + _P_READY_DEADLINE_S
+            while True:
+                _pr_remaining = _pr_deadline - time.monotonic()
+                if _pr_remaining <= 0:
+                    _ready_timed_out = True
+                    break
+                _pr_readable, _, _ = _pr_sel.select(
+                    [p_ready_r], [], [], _pr_remaining)
+                if not _pr_readable:
+                    continue  # loop re-checks the deadline
+                try:
+                    _ready = os.read(p_ready_r, 1)
+                except BlockingIOError:
+                    continue  # spurious wakeup — keep waiting
+                break  # 1 byte (ready) or b"" (EOF — child died)
+            if _ready_timed_out:
+                # One final non-blocking read: an 'R' that landed in
+                # the same instant the last select timed out must not
+                # get its (ready!) child killed as wedged.
+                with contextlib.suppress(BlockingIOError, OSError):
+                    _ready = os.read(p_ready_r, 1)
+                if _ready == b"R":
+                    _ready_timed_out = False
+            if _ready != b"R":
                 _kill_and_reap(child_pid)
                 # The child died before "R" — almost always because its
                 # unshare(USER|NS|IPC|[NET]) was refused (userns-
@@ -2883,10 +4042,47 @@ def run_sandboxed(
                 from .probes import ENGAGE_FAIL_INSTRUCTIONS
                 _detail = (f" ({_status[0]}: {_status[1]})"
                            if _status else "")
+                if _ready_timed_out and _status is not None \
+                        and _status[0] == "!":
+                    # The synthetic '!' text blames an external kill;
+                    # on the deadline path WE killed the wedged child
+                    # — drop the contradictory prose, keep the
+                    # category for the typed field.
+                    _detail = ""
+                # '!' (no reported category — the status parser
+                # maps an empty pipe to the synthetic '!' entry) is
+                # per-invocation, not an engagement failure: the
+                # engagement instructions' "a retry cannot help"
+                # doctrine would misguide the operator there. On the
+                # deadline path the '!' shape means the child was
+                # WEDGED and killed by us just above (a real
+                # engagement refusal writes its category before
+                # exiting and is seen by the drain) — name that
+                # honestly instead of blaming an external kill.
+                _no_category = _status is None or _status[0] == "!"
+                if _ready_timed_out and _no_category:
+                    _instr = (
+                        "the child neither signalled ready nor "
+                        "reported a setup failure within "
+                        f"{_P_READY_DEADLINE_S:g}s — it was killed "
+                        "as wedged. Retry the run; if it recurs, "
+                        "check host load and dmesg.")
+                elif _status is not None and _status[0] == "!":
+                    _instr = (
+                        "the child was terminated during namespace "
+                        "setup before it could report (external "
+                        "SIGKILL, OOM kill). Retry the run; if it "
+                        "recurs, check for OOM kills (dmesg) or an "
+                        "external process sweeper.")
+                else:
+                    _instr = ENGAGE_FAIL_INSTRUCTIONS
                 raise SandboxSetupError(
                     "sandbox namespace child did not signal ready — "
-                    f"setup failed in the spawn child{_detail}",
-                    ENGAGE_FAIL_INSTRUCTIONS,
+                    + ("timed out waiting for the spawn child"
+                       if _ready_timed_out else
+                       "setup failed in the spawn child")
+                    + _detail,
+                    _instr,
                     setup_category=_status[0] if _status else None,
                 )
         finally:
@@ -2979,9 +4175,35 @@ def run_sandboxed(
             # fd and its sync write would silently fail.
             #
             # Suppress Python 3.12+ multi-threaded-fork DeprecationWarning.
-            # Tracer subprocess does only fd-close + execvpe in the
-            # child path — no Python objects, no GIL. Same fork-safety
+            # Tracer child path: fd sweep + argv/env prep + execvpe
+            # using PRE-IMPORTED modules only — post-fork imports are
+            # banned here (the import machinery's locks can be held
+            # by another thread at fork; `resource` is imported at
+            # module level for exactly this branch). Same fork-safety
             # contract as the main child fork above.
+            #
+            # Resolve the tracer's import root PRE-FORK, in the
+            # parent, where logging works. PYTHONPATH-to-child is
+            # sys.path-equivalent injection, so the path-safety
+            # doctrine applies: RAPTOR_DIR is authoritative. The
+            # Path(__file__) fallback is a BLESSED doctrine
+            # exception, decided here rather than left implicit —
+            # this lane must stay usable as a library (bare callers
+            # without the launcher), and a hard KeyError would kill
+            # runs the fallback serves correctly on single-checkout
+            # hosts; the multi-checkout ambiguity is surfaced loudly
+            # instead of guessed silently.
+            _tracer_raptor_dir = os.environ.get("RAPTOR_DIR")
+            if _tracer_raptor_dir is None:
+                _tracer_raptor_dir = str(
+                    Path(__file__).resolve().parent.parent.parent
+                )
+                logger.warning(
+                    "spawn audit: RAPTOR_DIR unset — tracer will "
+                    "import from the tree containing this module "
+                    "(%s); on multi-checkout hosts export RAPTOR_DIR "
+                    "to pin the intended tree", _tracer_raptor_dir,
+                )
             tracer_pid = os.fork()
             if tracer_pid == 0:
                 # ===== TRACER SUBPROCESS =====
@@ -2998,7 +4220,7 @@ def run_sandboxed(
                 except OSError:
                     pass
                 # Close the read end — only the parent reads.
-                os.close(t_ready_r)
+                os.close(t_ready_r)  # type: ignore[arg-type]
                 # Defence-in-depth: close all inherited fds except
                 # stdio (0/1/2) and the sync write end. The tracer
                 # subprocess has no legitimate need for the parent's
@@ -3024,9 +4246,8 @@ def run_sandboxed(
                 # range on Linux (close_range(2) on 5.9+) instead
                 # of per-fd python-level close+EBADF-handling. ~1ms
                 # → ~10us per tracer fork.
-                import resource as _resource
-                soft, _hard = _resource.getrlimit(
-                    _resource.RLIMIT_NOFILE)
+                soft, _hard = resource.getrlimit(
+                    resource.RLIMIT_NOFILE)
                 upper = min(soft, 65536)
                 # fds the tracer legitimately needs across its exec:
                 # the sync write end, the audit-config anonymous fd,
@@ -3069,7 +4290,7 @@ def run_sandboxed(
                 # exec keeps the default close-on-exec, so the
                 # nonce-carrying config and the evidence fd never
                 # reach the target's fd table.
-                for _fd in (_audit_config_fd,
+                for _fd in (_audit_config_fd,  # type: ignore[assignment]
                             _evidence_file.fd if _evidence_file is not None
                             else None):
                     if _fd is not None:
@@ -3083,15 +4304,12 @@ def run_sandboxed(
                 # consistency. Interpreter lockdown comes from the
                 # hand-crafted 2-key env below, not from `-I` — see
                 # the note ahead of tracer_env for why isolated mode
-                # is deliberately not used here (unlike
-                # raptor-pid1-shim, which can afford it).
+                # is deliberately not used here (unlike the isolated
+                # `python3 -I` seatbelt shim, which can afford it).
                 try:
-                    raptor_dir = os.environ.get("RAPTOR_DIR")
-                    if raptor_dir is None:
-                        # Last-resort: derive from this module's path.
-                        raptor_dir = str(
-                            Path(__file__).resolve().parent.parent.parent
-                        )
+                    # Resolved pre-fork in the parent (see the fork
+                    # site) — the child only closes over it.
+                    raptor_dir = _tracer_raptor_dir
                     # Tightly-controlled env: PYTHONPATH for module
                     # resolution, minimal PATH, nothing inherited.
                     # We do NOT use `-I` (isolated mode) because that
@@ -3157,7 +4375,7 @@ def run_sandboxed(
             # below would block FOREVER on tracer death, because the
             # parent's own t_ready_w would keep the pipe write end
             # alive and EOF would never be signalled to the read.
-            os.close(t_ready_w)
+            os.close(t_ready_w)  # type: ignore[arg-type]
             _parent_fds.discard(t_ready_w)
 
             # Parent: wait for tracer to signal ready. If tracer dies
@@ -3174,26 +4392,26 @@ def run_sandboxed(
             # withheld, which the deadline bounds.
             _tracer_ready_wait_timed_out = False
             try:
-                os.set_blocking(t_ready_r, False)
+                os.set_blocking(t_ready_r, False)  # type: ignore[arg-type]
                 import select as _tr_sel
                 _tr_deadline = time.monotonic() + 15.0
-                ready = b""
+                ready = b""  # type: ignore[assignment]
                 while True:
                     _tr_remaining = _tr_deadline - time.monotonic()
                     if _tr_remaining <= 0:
                         _tracer_ready_wait_timed_out = True
                         break
-                    _tr_ready, _, _ = _tr_sel.select(
+                    _tr_ready, _, _ = _tr_sel.select(  # type: ignore[type-var]
                         [t_ready_r], [], [], _tr_remaining)
                     if not _tr_ready:
                         continue  # loop re-checks the deadline
                     try:
-                        ready = os.read(t_ready_r, 1)
+                        ready = os.read(t_ready_r, 1)  # type: ignore[assignment,arg-type]
                     except BlockingIOError:
                         continue  # spurious wakeup — keep waiting
                     break  # 1 byte (ready) or b"" (EOF — tracer died)
             finally:
-                os.close(t_ready_r)
+                os.close(t_ready_r)  # type: ignore[arg-type]
                 _parent_fds.discard(t_ready_r)
             if not ready:
                 # Tracer failed to attach. Reap it (capture exit code
@@ -3308,8 +4526,12 @@ def run_sandboxed(
                     pass
                 _parent_fds.discard(pid_r)
             if _exec_pid is not None and _exec_pid > 0:
+                # Delivered = the caller holds a kill channel from here
+                # on. Set BEFORE invoking: a callback that kills the
+                # child and then raises has still killed it.
+                _exec_pid_delivered = True
                 try:
-                    exec_pid_callback(_exec_pid)
+                    exec_pid_callback(_exec_pid)  # type: ignore[misc]
                 except Exception:
                     logger.warning(
                         "exec_pid_callback raised; continuing with the "
@@ -3374,7 +4596,107 @@ def run_sandboxed(
     # .raptor-sbx-* dir under /tmp.
     stdout_buf = b"" if capture_output else None
     stderr_buf = b"" if capture_output else None
+    # Effective per-stream capture ceiling: callers that only consume
+    # bounded tails (SandboxHandle.exec keeps kilobytes) request a
+    # tighter transient bound than the 64 MiB default; never above
+    # the module ceiling.
+    _capture_cap = _CAPTURE_CAP
+    if max_capture_bytes is not None:
+        _capture_cap = max(0, min(int(max_capture_bytes), _CAPTURE_CAP))
     _truncated = {1: False, 2: False}
+    _sandbox_backend = _backend_id(
+        block_network=block_network,
+        inherit_netns=inherit_netns,
+        skip_mount_ns=skip_mount_ns,
+        skip_pid_ns=skip_pid_ns,
+    )
+    _teardown_done = False
+    stdout_chunks: list[bytes] = []
+    stderr_chunks: list[bytes] = []
+    out_len = err_len = 0
+
+    def _materialize() -> None:
+        nonlocal stdout_buf, stderr_buf
+        if stdout_chunks:
+            stdout_buf += b"".join(stdout_chunks)  # type: ignore[operator]
+            stdout_chunks.clear()
+        if stderr_chunks:
+            stderr_buf += b"".join(stderr_chunks)  # type: ignore[operator]
+            stderr_chunks.clear()
+
+    def _teardown_once() -> None:
+        nonlocal _teardown_done
+        if _teardown_done:
+            return
+        _teardown_done = True
+        _teardown_target(child_pid, death_w, _parent_fds)
+
+    def _render_partial() -> tuple[str | bytes | None, str | bytes | None]:
+        if not capture_output:
+            return None, None
+        _materialize()
+        return (
+            _capture_output(
+                stdout_buf or b"",
+                truncated=_truncated[1],
+                stream="stdout",
+                text=text,
+                capture_cap=_capture_cap,
+            ),
+            _capture_output(
+                stderr_buf or b"",
+                truncated=_truncated[2],
+                stream="stderr",
+                text=text,
+                capture_cap=_capture_cap,
+            ),
+        )
+
+    def _stamp_partial(error) -> None:
+        _attach_capture_metadata(
+            error,
+            capture_output=capture_output,
+            stdout_truncated=_truncated[1],
+            stderr_truncated=_truncated[2],
+            stdout_bytes_kept=out_len,
+            stderr_bytes_kept=err_len,
+            backend=_sandbox_backend,
+        )
+
+    def _raise_timeout() -> None:
+        _teardown_once()
+        out_value, err_value = _render_partial()
+        error = subprocess.TimeoutExpired(
+            list(cmd),
+            timeout if timeout is not None else 0.0,
+            output=out_value,
+            stderr=err_value,
+        )
+        _stamp_partial(error)
+        raise error
+
+    def _raise_cancelled() -> None:
+        from .errors import SandboxCancelled
+
+        _teardown_once()
+        out_value, err_value = _render_partial()
+        error = SandboxCancelled(
+            list(cmd),
+            output=out_value,
+            stderr=err_value,
+        )
+        _stamp_partial(error)
+        raise error
+
+    def _cancel_ready(wait_s: float = 0.0) -> bool:
+        if cancel_fd is None:
+            return False
+        ready, _, _ = _select_mod.select([cancel_fd], [], [], wait_s)
+        return bool(ready)
+
+    # Raw wait-status once the capture loop's exit poll reaps the
+    # child (None = not yet reaped there).
+    child_status = None
     # time.monotonic() for deadline math — see _reap_tracer() above for the
     # NTP/wall-clock-jump rationale; same hazard applies here.
     # `is not None`, NOT truthiness: timeout=0 means "zero budget
@@ -3389,51 +4711,113 @@ def run_sandboxed(
         if capture_output:
             import select
             fds = [out_r, err_r]
+            # Exit/drain decoupling: waiting for plain pipe EOF couples
+            # this run's return to every retained sibling write-end
+            # copy (see _POST_EXIT_DRAIN_SECONDS). Reap-poll the child
+            # inside the loop; once it has exited, drain what is
+            # readable for a BOUNDED window and stop — and never call
+            # an exited-0 target a timeout.
+            #
+            # List-accumulate + join, not `bytes +=`: CPython bytes
+            # has no in-place resize, so each append near the capture
+            # cap costs a full-buffer memcpy — quadratic in total,
+            # and the byte PACING is attacker-chosen (fill fast to
+            # near-cap, then dribble 1-byte writes; each wakes
+            # select() and forced tens of milliseconds of
+            # trusted-parent copy work, total bounded only by
+            # cap²/chunk). Same idiom as the audit lane's
+            # _drain_pipes_until_eof. `_materialize` folds the
+            # pending chunks into stdout_buf/stderr_buf at every loop
+            # exit (including the in-loop TimeoutExpired raises and
+            # the finally, so no path observes a stale buffer).
+            drain_deadline = None
             try:
                 while fds:
-                    remaining = ((deadline - time.monotonic())
+                    if child_status is None:
+                        try:
+                            pid_, st = os.waitpid(child_pid, os.WNOHANG)
+                        except ChildProcessError:
+                            # Already reaped elsewhere — status lost;
+                            # same SIGKILL synthesis as the wait below.
+                            logger.warning(
+                                "waitpid: child %d already reaped "
+                                "(ECHILD); exit status unknown",
+                                child_pid,
+                            )
+                            child_status = 9
+                        else:
+                            if pid_ != 0:
+                                child_status = st
+                        if child_status is not None:
+                            drain_deadline = (
+                                time.monotonic() + _POST_EXIT_DRAIN_SECONDS
+                            )
+                    now = time.monotonic()
+                    remaining = ((deadline - now)
                                  if deadline is not None else None)
                     if remaining is not None and remaining <= 0:
+                        if child_status is not None:
+                            # The target already exited — the deadline
+                            # expiring during the post-exit drain must
+                            # not misfire TimeoutExpired.
+                            break
                         # Death-pipe EOF BEFORE killing the
                         # intermediate — see _teardown_target: a
                         # setsid()'d target escapes the killpg sweep
                         # and only the (still-alive) watcher can
                         # reach it by pid.
-                        _teardown_target(child_pid, death_w, _parent_fds)
-                        out_str = stdout_buf.decode("utf-8", errors="replace") if text else stdout_buf
-                        err_str = stderr_buf.decode("utf-8", errors="replace") if text else stderr_buf
-                        raise subprocess.TimeoutExpired(
-                            list(cmd), timeout, output=out_str, stderr=err_str
-                        )
-                    ready, _, _ = select.select(fds, [], [], remaining)
-                    for fd in ready:
-                        chunk = os.read(fd, 65536)
+                        _raise_timeout()
+                    waits = []
+                    if remaining is not None:
+                        waits.append(remaining)
+                    if drain_deadline is not None:
+                        drain_left = drain_deadline - now
+                        if drain_left <= 0:
+                            break
+                        waits.append(drain_left)
+                    else:
+                        # Reap-poll cadence while the child is alive
+                        # (same order as the waitpid poll loop below).
+                        waits.append(0.05)
+                    watched = list(fds)
+                    if cancel_fd is not None and child_status is None:
+                        watched.append(cancel_fd)
+                    ready, _, _ = select.select(
+                        watched, [], [], min(waits))
+                    if (cancel_fd is not None
+                            and child_status is None
+                            and cancel_fd in ready):
+                        _raise_cancelled()
+                    for fd in tuple(ready):
+                        if fd == cancel_fd:
+                            continue
+                        chunk = _read_capture_chunk(fd)
                         if not chunk:
                             os.close(fd)
                             _parent_fds.discard(fd)
                             fds.remove(fd)
                         elif fd == out_r:
-                            if len(stdout_buf) < _CAPTURE_CAP:
-                                stdout_buf += chunk
-                            else:
-                                _truncated[1] = True
+                            out_len, lost = _append_capture(
+                                stdout_chunks,
+                                out_len,
+                                chunk,
+                                _capture_cap,
+                            )
+                            _truncated[1] = _truncated[1] or lost
                         else:
-                            if len(stderr_buf) < _CAPTURE_CAP:
-                                stderr_buf += chunk
-                            else:
-                                _truncated[2] = True
-                _cap_mib = _CAPTURE_CAP // (1024 * 1024)
-                if _truncated[1]:
-                    stdout_buf += (
-                        b"\n[sandbox: stdout capture truncated "
-                        b"at %d MiB]\n" % _cap_mib
-                    )
-                if _truncated[2]:
-                    stderr_buf += (
-                        b"\n[sandbox: stderr capture truncated "
-                        b"at %d MiB]\n" % _cap_mib
-                    )
+                            err_len, lost = _append_capture(
+                                stderr_chunks,
+                                err_len,
+                                chunk,
+                                _capture_cap,
+                            )
+                            _truncated[2] = _truncated[2] or lost
+                _materialize()
             finally:
+                # Fold pending chunks on EVERY exit path (the normal
+                # exit above already did; this covers exceptions) so
+                # no later reader sees a stale buffer.
+                _materialize()
                 # Close any pipes we didn't drain (timeout, exception).
                 for fd in fds:
                     try:
@@ -3448,21 +4832,29 @@ def run_sandboxed(
             # falsy float is not a thing, but keep the check shape
             # identical to the deadline construction above (timeout=0
             # must reach the bounded branch).
-            if deadline is not None:
+            if child_status is not None:
+                # Already reaped by the capture loop's exit poll.
+                status = child_status
+            elif deadline is not None or cancel_fd is not None:
                 while True:
                     pid_, status = os.waitpid(child_pid, os.WNOHANG)
                     if pid_ != 0:
                         break
-                    if time.monotonic() > deadline:
-                        # Death-pipe EOF first — same setsid-escape
-                        # rationale as the capture_output branch above.
-                        _teardown_target(child_pid, death_w, _parent_fds)
-                        out_str = (stdout_buf or b"").decode("utf-8", errors="replace") if text else stdout_buf
-                        err_str = (stderr_buf or b"").decode("utf-8", errors="replace") if text else stderr_buf
-                        raise subprocess.TimeoutExpired(
-                            list(cmd), timeout, output=out_str, stderr=err_str
-                        )
-                    time.sleep(0.01)
+                    if _cancel_ready():
+                        _raise_cancelled()
+                    if deadline is not None and time.monotonic() > deadline:
+                        _raise_timeout()
+                    if cancel_fd is not None:
+                        wait_s = 0.01
+                        if deadline is not None:
+                            wait_s = max(
+                                0.0,
+                                min(wait_s, deadline - time.monotonic()),
+                            )
+                        if _cancel_ready(wait_s):
+                            _raise_cancelled()
+                    else:
+                        time.sleep(0.01)
             else:
                 _, status = os.waitpid(child_pid, 0)
         except ChildProcessError:
@@ -3472,6 +4864,22 @@ def run_sandboxed(
             logger.warning("waitpid: child %d already reaped (ECHILD); "
                            "exit status unknown", child_pid)
             status = 9
+    except BaseException as exc:
+        try:
+            _teardown_once()
+        except Exception:
+            logger.debug(
+                "child teardown during collection failed",
+                exc_info=True,
+            )
+        if not hasattr(exc, "output"):
+            out_value, err_value = _render_partial()
+            with contextlib.suppress(Exception):
+                setattr(exc, "output", out_value)
+                setattr(exc, "stdout", out_value)
+                setattr(exc, "stderr", err_value)
+        _stamp_partial(exc)
+        raise
     finally:
         # Drain + close the exec-status pipe FIRST so status_r is reclaimed
         # even if a cleanup step below raises — an unclosed status_r leaks
@@ -3479,15 +4887,13 @@ def run_sandboxed(
         # breaking all subsequent sandboxing. The child is reaped by now
         # (success: waitpid above; timeout: _kill_and_reap before the raise),
         # so any status byte is already buffered. On timeout the target had
-        # execed (hence the timeout) → no status → None.
+        # execed (hence the timeout) → the 'G' confirmation → None.
         setup_status = _drain_status_pipe(status_r, _parent_fds)
         # Death pipe write end: child has exited (or been killed), no
-        # longer needed. Close it so the fd doesn't leak.
+        # longer needed. Close it so the fd doesn't leak (registry-
+        # routed: unregisters atomically with the close).
         if death_w in _parent_fds:
-            try:
-                os.close(death_w)
-            except OSError:
-                pass
+            close_death_w(death_w)
             _parent_fds.discard(death_w)
         # Unix-scope supervisor: the run is over — close the notify fd
         # so any straggler's connect(2) gets ENOSYS from the kernel
@@ -3529,14 +4935,39 @@ def run_sandboxed(
         returncode = -1
 
     # setup_status was drained from the exec-status pipe in the finally above
-    # (on every exit path). Bytes ⇒ the child reported a setup failure BEFORE
-    # exec (M/L/S/U/X); None ⇒ the target actually execed, so the
-    # returncode/output are a genuine result. Unspoofable: status_w is
-    # close-on-exec, gone before the target runs.
+    # (on every exit path). A failure category (M/L/S/U/X/P/F/C) ⇒ the child
+    # reported a setup failure; None ⇒ the 'G' exec confirmation arrived and
+    # the target actually execed, so the returncode/output are a genuine
+    # result; '!' ⇒ EOF with NO confirmation — the child died mid-setup
+    # without reaching any reporting site (SIGKILL/OOM), and the wait status
+    # below belongs to the setup child, not the target. Unspoofable:
+    # status_w is close-on-exec, gone before the target runs.
+    #
+    # Caller-initiated-kill exemption: once the live grandchild pid was
+    # DELIVERED to an exec_pid_callback, the documented contract is that
+    # the callback may terminate the child at any point ("SIGKILL is
+    # fine; the normal reap flow handles the rest") — and the delivery
+    # deliberately happens while setup may still be in flight ("the
+    # callback may be invoked slightly before the target's execve
+    # completes"). A SIGNAL death with no exec confirmation after that
+    # delivery is therefore the caller's own kill exercising its
+    # documented channel, not an involuntary external death: keep the
+    # caller-visible CompletedProcess contract (rc=-N, the pre-'G'
+    # behaviour) instead of the '!' refusal. Keyed on the delivery flag
+    # — parent-owned state — never on timing. Residual (documented): a
+    # genuinely external SIGKILL landing in that window on a
+    # callback-bearing run is indistinguishable from the caller's kill
+    # and reads as one; scoped to runs that opted into the observation
+    # hook, whose callers own termination for the run by contract. A
+    # pre-exec death by NORMAL exit (rc >= 0) stays '!' even with the
+    # flag: nothing exits cleanly between fork and exec without writing
+    # a byte, so that shape is never the callback's kill.
+    if (setup_status is not None and setup_status[0] == "!"
+            and _exec_pid_delivered and returncode < 0):
+        setup_status = None
     stdout_out = stderr_out = None
     if capture_output:
-        stdout_out = stdout_buf.decode("utf-8", errors="replace") if text else stdout_buf
-        stderr_out = stderr_buf.decode("utf-8", errors="replace") if text else stderr_buf
+        stdout_out, stderr_out = _render_partial()
 
     cp = subprocess.CompletedProcess(
         args=list(cmd),
@@ -3546,5 +4977,15 @@ def run_sandboxed(
     )
     # Authoritative setup-failure signal for context.py's decision table
     # (degrade on M/X, fail loud on L/S/U). None ⇒ target execed.
-    cp._setup_status = setup_status
+    setattr(cp, "_setup_status", setup_status)
+    setattr(cp, "_sandbox_backend", _sandbox_backend)
+    _attach_capture_metadata(
+        cp,
+        capture_output=capture_output,
+        stdout_truncated=_truncated[1],
+        stderr_truncated=_truncated[2],
+        stdout_bytes_kept=out_len,
+        stderr_bytes_kept=err_len,
+        backend=_sandbox_backend,
+    )
     return cp

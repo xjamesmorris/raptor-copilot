@@ -7,11 +7,27 @@ traced-build mode. These tests are fully mocked — no codeql CLI, no
 network — plus version-probe tests that only need the probe seam.
 """
 
+import logging
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _raptor_logger_propagates():
+    """Let caplog see records from the 'raptor' logger.
+
+    RaptorLogger sets propagate=False on logging.getLogger('raptor'),
+    so records never reach root where pytest's caplog handler lives.
+    """
+    raptor = logging.getLogger("raptor")
+    orig = raptor.propagate
+    raptor.propagate = True
+    yield
+    raptor.propagate = orig
+
 
 # packages/codeql/tests/test_buildless_mode.py -> repo root
 sys.path.insert(0, str(Path(__file__).parents[3]))
@@ -197,7 +213,7 @@ class TestBuildlessDefault:
         pre-existing traced behaviour — but loudly disclosed, never
         silently."""
         import logging
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.WARNING, logger="raptor"):
             result, cmd = _run_create(
                 db_manager, tmp_path, language="java",
                 build_system=_build_system(tmp_path, "mvn"),
@@ -215,7 +231,7 @@ class TestBuildlessDefault:
         """Languages with no buildless mode (go) keep autobuild but
         the untrusted-build banner must fire."""
         import logging
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.WARNING, logger="raptor"):
             result, _cmd = _run_create(db_manager, tmp_path, language="go")
         assert result.success
         joined = " ".join(r.getMessage() for r in caplog.records)
@@ -225,7 +241,7 @@ class TestBuildlessDefault:
         self, db_manager, tmp_path, caplog,
     ):
         import logging
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.WARNING, logger="raptor"):
             result, _cmd = _run_create(
                 db_manager, tmp_path, language="go", traced_build=True,
             )
@@ -401,6 +417,76 @@ class TestAgentBuildlessRouting:
         lang_map = agent.database_manager.create_databases_parallel.call_args[0][1]
         assert lang_map["cpp"].command == "make"
 
+    @pytest.mark.parametrize(
+        ("spelling", "canonical"),
+        [
+            ("javascript", "javascript"),
+            ("js", "javascript"),
+            ("typescript", "typescript"),
+            ("ts", "typescript"),
+            ("rust", "rust"),
+        ],
+    )
+    def test_source_extraction_skips_package_build_detection(
+        self, tmp_path, spelling, canonical,
+    ):
+        agent = self._agent(tmp_path)
+        agent.run_autonomous_analysis(languages=[spelling])
+
+        agent.build_detector.detect_build_system.assert_not_called()
+        agent.build_detector.validate_build_command.assert_not_called()
+        agent.build_detector.synthesise_build_command.assert_not_called()
+        agent.build_detector.generate_no_build_config.assert_called_once_with(
+            canonical,
+        )
+        lang_map = (
+            agent.database_manager.create_databases_parallel.call_args[0][1]
+        )
+        assert lang_map[canonical].type == "no-build"
+        assert lang_map[canonical].command == ""
+
+    @pytest.mark.parametrize(
+        ("spelling", "canonical", "command"),
+        [
+            ("js", "javascript", "node operator-build.js"),
+            ("ts", "typescript", "node operator-build.js"),
+            ("rust", "rust", "cargo build --offline"),
+        ],
+    )
+    def test_explicit_alias_build_command_preserves_opt_in(
+        self, tmp_path, spelling, canonical, command,
+    ):
+        agent = self._agent(tmp_path)
+        agent.run_autonomous_analysis(
+            languages=[spelling],
+            build_commands={spelling: command},
+        )
+
+        agent.build_detector.generate_no_build_config.assert_not_called()
+        lang_map = (
+            agent.database_manager.create_databases_parallel.call_args[0][1]
+        )
+        assert lang_map[canonical].type == "custom"
+        assert lang_map[canonical].command == command
+        _, kwargs = agent.database_manager.create_databases_parallel.call_args
+        assert kwargs["traced_languages"] == {canonical}
+
+    @pytest.mark.parametrize("language", ("javascript", "rust"))
+    def test_trust_marker_without_command_stays_no_build(
+        self, tmp_path, language,
+    ):
+        agent = self._agent(tmp_path)
+        agent.run_autonomous_analysis(
+            languages=[language],
+            traced_build=True,
+        )
+
+        agent.build_detector.detect_build_system.assert_not_called()
+        lang_map = (
+            agent.database_manager.create_databases_parallel.call_args[0][1]
+        )
+        assert lang_map[language].command == ""
+
     def test_old_cli_skips_language_with_error(self, tmp_path):
         agent = self._agent(tmp_path)
         agent.database_manager.supports_buildless.return_value = (
@@ -442,6 +528,24 @@ class TestAgentBuildlessRouting:
             languages=["go"], traced_build=True,
         )
         assert result.untrusted_build_languages == []
+
+
+class TestInterpretedBuildEvidencePreserved:
+    def test_build_detector_still_reports_npm_for_other_consumers(
+        self, tmp_path,
+    ):
+        from core.build.build_detector import BuildDetector
+
+        (tmp_path / "package.json").write_text(
+            '{"name":"detector-witness","scripts":{"test":"node test.js"}}',
+            encoding="utf-8",
+        )
+
+        build = BuildDetector(tmp_path).detect_build_system("javascript")
+
+        assert build is not None
+        assert build.type == "npm"
+        assert build.command == "npm install"
 
 
 class TestBuildlessDegradationSummary:
@@ -692,3 +796,154 @@ class TestBuildlessFallback:
             )
         assert len(calls) == 1
         assert not result.success
+
+
+# ---------------------------------------------------------------------------
+# Build mode joins the cache contract
+# ---------------------------------------------------------------------------
+
+
+def _plant_cached_db(db_manager, repo, language, build_system_value):
+    """Plant a valid cached DB + metadata in the manager's db_root."""
+    import json
+    from datetime import datetime, timezone
+
+    repo_hash = db_manager.compute_repo_hash(repo)
+    db = db_manager.get_database_dir(repo_hash, language)
+    (db / f"db-{language}").mkdir(parents=True)
+    (db / "codeql-database.yml").write_text(
+        f"primaryLanguage: {language}\n",
+    )
+    # > 10KB clears validate_database's minimal-substance check.
+    (db / f"db-{language}" / "blob.bin").write_bytes(b"\0" * 20480)
+    meta = {
+        "repo_path": str(repo), "repo_hash": repo_hash,
+        "language": language,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "codeql_version": "2.26.3", "success": True, "errors": [],
+        "build_system": build_system_value, "build_command": "",
+        "file_count": 1, "duration_seconds": 1.0,
+        "database_path": str(db),
+    }
+    db_manager.get_metadata_path(repo_hash, language).write_text(
+        json.dumps(meta),
+    )
+    return db
+
+
+@pytest.fixture
+def repo(tmp_path):
+    r = tmp_path / "repo"
+    r.mkdir()
+    (r / "main.cpp").write_text("int main(){return 0;}\n")
+    return r
+
+
+class TestBuildModeCacheContract:
+    """A cached DB's build mode is part of the serve contract: an
+    explicit traced request is never silently served a buildless
+    entry; the reverse direction serves, disclosed."""
+
+    def _create(self, db_manager, repo, *, traced_build,
+                expect_build=True):
+        ran = {"create": False}
+
+        def fake_run(cmd, **kwargs):
+            if "database" in cmd and "create" in cmd:
+                ran["create"] = True
+                staging = Path(cmd[3])
+                (staging / "db-cpp").mkdir(parents=True, exist_ok=True)
+                (staging / "codeql-database.yml").write_text(
+                    "primaryLanguage: cpp\n",
+                )
+                (staging / "db-cpp" / "trie.bin").write_bytes(
+                    b"\1" * 20480,
+                )
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = ""
+            r.stderr = "Finalizing database.\n"
+            return r
+
+        with patch('core.sandbox.run', side_effect=fake_run), \
+             patch.object(db_manager, 'get_codeql_version',
+                          return_value="2.26.3"), \
+             patch.object(db_manager, '_count_database_files',
+                          return_value=1):
+            result = db_manager.create_database(
+                repo, "cpp", None, traced_build=traced_build,
+            )
+        assert ran["create"] is expect_build
+        return result
+
+    def test_traced_request_refuses_cached_buildless_db(
+            self, db_manager, repo, caplog):
+        """The repro shape: valid cached cpp DB with
+        build_system=buildless, then create_database(traced_build=
+        True) — must rebuild, never serve the buildless entry."""
+        _plant_cached_db(db_manager, repo, "cpp", "buildless")
+        import logging
+        with caplog.at_level(logging.INFO, logger="raptor"):
+            result = self._create(db_manager, repo, traced_build=True)
+        assert result.success is True
+        assert result.cached is False
+        assert result.metadata.build_system != "buildless"
+        # Visible rebuild note, not a silent miss.
+        assert any(
+            "traced build" in rec.getMessage()
+            and "buildless" in rec.getMessage()
+            for rec in caplog.records
+        )
+
+    def test_buildless_request_serves_traced_cache_disclosed(
+            self, db_manager, repo, caplog):
+        """Reverse direction: a traced entry is strictly higher
+        fidelity and nothing untrusted executes by serving it — so
+        serve it, but say so."""
+        planted = _plant_cached_db(db_manager, repo, "cpp", "make")
+        import logging
+        with caplog.at_level(logging.INFO, logger="raptor"):
+            result = self._create(
+                db_manager, repo, traced_build=False, expect_build=False,
+            )
+        assert result.cached is True
+        assert result.database_path == planted
+        assert any(
+            "Serving traced-build cached" in rec.getMessage()
+            for rec in caplog.records
+        )
+
+    def test_buildless_request_serves_buildless_cache(
+            self, db_manager, repo):
+        planted = _plant_cached_db(db_manager, repo, "cpp", "buildless")
+        result = self._create(
+            db_manager, repo, traced_build=False, expect_build=False,
+        )
+        assert result.cached is True
+        assert result.database_path == planted
+
+    def test_mode_agnostic_lookup_serves_either(self, db_manager, repo):
+        """Discovery-probe callers pass no mode and keep the old
+        behaviour."""
+        planted = _plant_cached_db(db_manager, repo, "cpp", "buildless")
+        assert db_manager.get_cached_database(repo, "cpp") == planted
+
+    def test_sibling_acceptability_closes_the_race_window(
+            self, db_manager, repo):
+        """Lost-promote-race gate: for a traced cpp request the
+        sibling's canonical needs a POSITIVE non-buildless record."""
+        repo_hash = db_manager.compute_repo_hash(repo)
+        # No metadata at all → not acceptable for traced.
+        assert db_manager._sibling_canonical_acceptable(
+            repo_hash, "cpp", True) is False
+        _plant_cached_db(db_manager, repo, "cpp", "buildless")
+        assert db_manager._sibling_canonical_acceptable(
+            repo_hash, "cpp", True) is False
+        # Buildless / mode-agnostic requests accept anything.
+        assert db_manager._sibling_canonical_acceptable(
+            repo_hash, "cpp", False) is True
+        assert db_manager._sibling_canonical_acceptable(
+            repo_hash, "cpp", None) is True
+        # Non-buildless-default languages are out of scope.
+        assert db_manager._sibling_canonical_acceptable(
+            repo_hash, "python", True) is True

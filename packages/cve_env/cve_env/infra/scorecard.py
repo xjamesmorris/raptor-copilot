@@ -1,5 +1,9 @@
 """Scorecard feed for environment builds.
 
+SIBLING MODULE: ``cve_diff/infra/scorecard.py`` — the discovery-side
+feed with the same no-record policy over ``core/llm/scorecard``. A
+feed-policy fix here usually applies there.
+
 Records one ``TOOL_EVIDENCE`` observation per adjudicated build onto
 the ``(model, "cve-env:build")`` cell of RAPTOR's model scorecard
 (``core/llm/scorecard``). Adjudication is mechanical: the verify DAG
@@ -21,8 +25,6 @@ never write the operator's scorecard sidecar as a side effect.
 from __future__ import annotations
 
 import logging
-import os
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover — type-only import
@@ -48,17 +50,13 @@ _ADJUDICATION: dict[str, str] = {
 
 
 def _default_scorecard() -> ModelScorecard:
-    """Resolve the shared scorecard sidecar (tool_evidence convention:
-    RAPTOR_SCORECARD_PATH override, then RAPTOR_DIR/out, then bare)."""
+    """Resolve the shared scorecard sidecar through the shared
+    resolver (RAPTOR_SCORECARD_PATH override, then RAPTOR_DIR/out,
+    then bare) — see ``core/llm/scorecard/paths.py``."""
+    from core.llm.scorecard.paths import default_scorecard_path
     from core.llm.scorecard.scorecard import ModelScorecard
 
-    override = os.environ.get("RAPTOR_SCORECARD_PATH")
-    if override:
-        return ModelScorecard(Path(override))
-    raptor_dir = os.environ.get("RAPTOR_DIR")
-    if raptor_dir:
-        return ModelScorecard(Path(raptor_dir) / "out" / "llm_scorecard.json")
-    return ModelScorecard(Path("out/llm_scorecard.json"))
+    return ModelScorecard(default_scorecard_path())
 
 
 def record_build_outcome(
@@ -84,7 +82,7 @@ def record_build_outcome(
         decision_class = (DECISION_CLASS_DESCRIBED
                           if cve_id.startswith("DESC-")
                           else DECISION_CLASS)
-        sc.record_event(decision_class, model_id, EventType.TOOL_EVIDENCE, outcome)
+        sc.record_event(decision_class, model_id, EventType.TOOL_EVIDENCE, outcome)  # type: ignore[arg-type]
         return True
     except Exception:  # noqa: BLE001 — telemetry must never break the run
         logger.debug(

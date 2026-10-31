@@ -29,6 +29,14 @@ CVEs and an aggressive 7-day TTL, a warm cache makes the lookup
 free; a cold cache costs ~50 ms per CVE in parallel-friendly
 HTTPS GETs through the existing in-process egress proxy.
 
+Scans outside that envelope — container-image scans carry 10^4+
+distro CVE findings — must not loop :meth:`~VulnrichmentClient.lookup`
+per finding: use :meth:`~VulnrichmentClient.lookup_many`, which
+resolves cache hits for free and runs the remaining fetches on a
+bounded thread pool under a caller-set network budget. The upstream
+publishes no bulk artifact (no releases; only the per-CVE files in
+the git tree), so budgeted parallel per-CVE GETs are the fetch shape.
+
 Failure modes:
   * Network down + cold cache → ``lookup()`` returns ``None``;
     callers degrade gracefully (Vulnrichment is a bonus signal
@@ -47,9 +55,13 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from core.http import HttpClient, HttpError
 from core.json import JsonCache
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +84,11 @@ _REPO_RAW_BASE = (
 _DEFAULT_TTL = 7 * 24 * 3600   # SSVC drifts slowly; weekly refresh is fine
 _CACHE_KEY_PREFIX = "vulnrichment"
 _NEGATIVE_TTL = 24 * 3600      # 404s cache for 1 day so we re-probe
+
+# Sentinel distinguishing "record decoded to no SSVC signal" (a valid
+# outcome, memoisable) from "the decoder itself failed on this record"
+# (per-id degrade + cache eviction; see ``_decode_guarded``).
+_DECODE_FAILED = object()
 
 
 @dataclass(frozen=True)
@@ -124,7 +141,7 @@ class VulnrichmentClient:
         self._cache = cache
         self._offline = offline
         self._ttl = ttl_seconds
-        self._memo: dict = {}
+        self._memo: dict[str, SSVCDecision | None] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -157,70 +174,276 @@ class VulnrichmentClient:
         if key in self._memo:
             return self._memo[key]
 
-        record = self._fetch_record(key)
-        decision = _decode_ssvc(record) if record is not None else None
+        hit, record = self._cached_record(key)
+        if hit:
+            decision: SSVCDecision | None = self._decode_guarded(key, record)  # type: ignore[assignment]
+            if decision is not _DECODE_FAILED:
+                self._memo[key] = decision
+                return decision
+            # Poisoned cache entry (written before the validate-
+            # before-cache gate, or by decoder drift): already
+            # evicted by _decode_guarded — fall through to a fresh
+            # fetch instead of serving the poison for its TTL.
+        if self._offline:
+            self._memo[key] = None
+            return None
+        record, _definitive = self._fetch_remote(key)
+        decision = self._decode_guarded(key, record)  # type: ignore[assignment]
+        if decision is _DECODE_FAILED:
+            decision = None
         self._memo[key] = decision
         return decision
+
+    def lookup_many(
+        self,
+        cve_ids: Iterable[str],
+        *,
+        fetch_budget: int | None = None,
+        max_workers: int = 8,
+    ) -> dict[str, SSVCDecision]:
+        """Batched SSVC lookup for a whole scan's CVE set.
+
+        Same per-id contract as :meth:`lookup`, minus the redundant
+        entries: the returned dict carries only ids that resolved to
+        an actual :class:`SSVCDecision` — malformed ids, upstream
+        404s, scorecard-less records, and offline cache misses are
+        simply absent, and callers treat absence as "no signal".
+
+        Purpose: the per-CVE on-demand design assumes a scan touching
+        5-30 unique CVEs; container-image scans carry 10^4+ distro CVE
+        findings, and calling :meth:`lookup` once per finding turns
+        into hours of serial HTTPS GETs. This entry point makes the
+        cold-cache cost bounded and parallel:
+
+        * ``fetch_budget`` caps the number of NETWORK fetches (memo /
+          disk-cache hits are always resolved and never consume
+          budget, so repeat scans progressively warm the cache past
+          the budget line). Input order is the fetch-priority order —
+          the first ``fetch_budget`` uncached ids are fetched, the
+          rest are skipped with ONE summary log line. ``None`` means
+          unbounded.
+        * Uncached fetches run on a bounded thread pool
+          (``max_workers``); the injected ``HttpClient`` and
+          ``JsonCache`` are shared across threads exactly as the SCA
+          registry-enrichment passes already share them.
+
+        Skipped and failed ids are NOT memoised, so a later direct
+        :meth:`lookup` (or the next run's budget) still gets its
+        chance to fetch them.
+        """
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for cid in cve_ids:
+            if not isinstance(cid, str):
+                continue
+            key = cid.upper()
+            if key in seen or _CVE_ID_RE.fullmatch(key) is None:
+                continue
+            seen.add(key)
+            ordered.append(key)
+
+        out: dict[str, SSVCDecision] = {}
+        uncached: list[str] = []
+        for key in ordered:
+            if key in self._memo:
+                memoed = self._memo[key]
+                if memoed is not None:
+                    out[key] = memoed
+                continue
+            hit, record = self._cached_record(key)
+            if hit:
+                decision = self._decode_guarded(key, record)  # type: ignore[assignment]
+                if decision is _DECODE_FAILED:
+                    # Poisoned entry evicted — requeue for a fresh
+                    # fetch under the normal budget rules.
+                    uncached.append(key)
+                    continue
+                self._memo[key] = decision  # type: ignore[assignment]
+                if decision is not None:
+                    out[key] = decision  # type: ignore[assignment]
+                continue
+            uncached.append(key)
+
+        if self._offline or not uncached:
+            return out
+
+        skipped = 0
+        if fetch_budget is not None and len(uncached) > fetch_budget:
+            skipped = len(uncached) - fetch_budget
+            uncached = uncached[:fetch_budget]
+
+        def _fetch_one(
+            key: str,
+        ) -> tuple[str, SSVCDecision | None, bool]:
+            """Returns ``(key, decision, definitive)``. ``definitive``
+            is False for transport-class failures — those ids stay
+            un-memoised (the documented contract) so a later direct
+            :meth:`lookup` in the same process still gets a fetch."""
+            try:
+                record, definitive = self._fetch_remote(key)
+            except Exception as e:  # noqa: BLE001 — degrade per id, never
+                # let one hostile / malformed response sink the batch
+                # (HttpError is already absorbed inside _fetch_remote;
+                # this catches transport-layer surprises).
+                logger.debug(
+                    "core.cve.vulnrichment: lookup failed for %s: %s",
+                    key, e,
+                )
+                return key, None, False
+            decision: SSVCDecision | None = self._decode_guarded(key, record)  # type: ignore[assignment]
+            if decision is _DECODE_FAILED:
+                # The fetch itself succeeded — the record is junk.
+                # Definitive for this run; a refetch returns the
+                # same bytes.
+                return key, None, True
+            return key, decision, definitive
+
+        # Same small-input cutoff as the SCA license-enrichment pass:
+        # below a handful of ids the pool spin-up costs more than the
+        # sequential walk.
+        if len(uncached) <= 4 or max_workers <= 1:
+            fetched = [_fetch_one(k) for k in uncached]
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(
+                max_workers=min(max_workers, len(uncached)),
+                thread_name_prefix="cve-vulnrichment",
+            ) as pool:
+                fetched = list(pool.map(_fetch_one, uncached))
+
+        # Memo writes happen on the calling thread — workers only
+        # touch the (thread-safe) JsonCache and HttpClient. Failed
+        # (non-definitive) fetches are NOT memoised — the docstring
+        # promises a later direct lookup its own chance.
+        for key, decision, definitive in fetched:
+            if definitive:
+                self._memo[key] = decision
+            if decision is not None:
+                out[key] = decision
+
+        if skipped:
+            logger.info(
+                "core.cve.vulnrichment: SSVC fetch budget reached — "
+                "fetched %d uncached CVE(s), skipped %d (budget %d); "
+                "skipped ids degrade to no-signal and are retried by "
+                "later runs against the warmed cache",
+                len(uncached), skipped, fetch_budget,
+            )
+        return out
 
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
 
-    def _fetch_record(self, cve_id: str) -> dict | None:
-        """Disk-cached fetch of one Vulnrichment entry. Returns
-        the decoded JSON document, ``None`` on miss / failure.
+    def _decode_guarded(self, cve_id: str, record: dict | None) -> SSVCDecision | None | object:
+        """Per-id decode boundary. Returns the decision (or ``None``
+        for a signal-less record) — or the ``_DECODE_FAILED`` sentinel
+        when :func:`_decode_ssvc` raised on this record.
 
-        Cache shape distinguishes three states so we don't
-        re-probe the upstream needlessly:
-          * ``None`` cache entry: never fetched / TTL expired
-          * ``{"_status": "missing"}``: 404 seen at upstream
-            (cached for the shorter ``_NEGATIVE_TTL`` so a
-            backfill from CISA gets picked up in ≤1 day)
-          * dict: the actual CVE-JSON-5 record
+        ``_decode_ssvc`` is itself written to tolerate any shape, so a
+        raise here means decoder drift or a record class it has never
+        seen — exactly the case that must degrade ONE id (structured,
+        log-visible) rather than sink a scan. On failure the disk
+        entry is evicted so an already-poisoned cache (written before
+        the validate-before-cache gate below) isn't served for the
+        rest of its 7-day TTL.
+        """
+        if record is None:
+            return None
+        try:
+            return _decode_ssvc(record)
+        except Exception as e:  # noqa: BLE001 — decode failure degrades
+            # per id; the record shape is upstream-controlled.
+            logger.warning(
+                "core.cve.vulnrichment: undecodable record for %s "
+                "(%s: %s) — degrading to no-signal and evicting the "
+                "cached entry",
+                cve_id, type(e).__name__, e,
+            )
+            self._cache.invalidate(f"{_CACHE_KEY_PREFIX}/{cve_id}")
+            return _DECODE_FAILED
+
+    def _cached_record(self, cve_id: str) -> tuple[bool, dict | None]:
+        """Disk-cache read half of :meth:`_fetch_record`.
+
+        Returns ``(hit, record)`` — ``(True, None)`` is a cached
+        negative marker (upstream 404 within its TTL), distinct from
+        ``(False, None)`` = never fetched / expired. Split out so
+        :meth:`lookup_many` can resolve cache hits without spending
+        its network budget on them.
         """
         cache_key = f"{_CACHE_KEY_PREFIX}/{cve_id}"
         cached = self._cache.get(cache_key, ttl_seconds=self._ttl)
         if isinstance(cached, dict):
             if cached.get("_status") == "missing":
-                return None
-            return cached
+                return True, None
+            return True, cached
+        return False, None
 
-        if self._offline:
-            return None
-
+    def _fetch_remote(self, cve_id: str) -> tuple[dict | None, bool]:
+        """Network fetch of one Vulnrichment entry plus the positive /
+        negative cache writes. Returns ``(record, definitive)`` —
+        ``definitive`` is False only for transport-class failures
+        (5xx, network error), where a ``None`` record means "the
+        lookup did not happen" rather than "the upstream has no
+        SSVC for this id". Thread-safe — the injected ``JsonCache``
+        locks internally and the ``HttpClient`` backends are shared
+        across worker threads by the existing SCA enrichment passes."""
+        cache_key = f"{_CACHE_KEY_PREFIX}/{cve_id}"
         url = _url_for_cve(cve_id)
         if url is None:
-            return None
+            return None, True
 
         try:
             record = self._http.get_json(url)
         except HttpError as e:
-            # 404 is the common case (CVE not yet enriched).
-            # Cache a negative marker so the next call within
-            # the 1-day window doesn't re-probe and waste an
-            # HTTP request. ``HttpError`` carries the status code
-            # as a structured field; fall back to substring match
-            # on the message for stubs that don't propagate it.
+            # 404 is the common case (CVE not yet enriched); 410 is
+            # equally authoritative. Cache a negative marker so the
+            # next call within the 1-day window doesn't re-probe and
+            # waste an HTTP request. ONLY the structured status
+            # decides: the message embeds the request URL (which
+            # embeds the CVE id — thousands of ids contain "404") and
+            # status-less transport errors ("name or service not
+            # found") are transient, so any substring fallback turns
+            # blips into a day of cached "CISA hasn't enriched this".
             status = getattr(e, "status", None)
-            msg = str(e).lower()
-            is_404 = status == 404 or "404" in msg or "not found" in msg
-            if is_404:
+            is_missing = (
+                status in (404, 410)
+                and not getattr(e, "circuit_break", False)
+            )
+            if is_missing:
                 self._cache.put(
                     cache_key, {"_status": "missing"},
                     ttl_seconds=_NEGATIVE_TTL,
                 )
-                return None
+                return None, True
             # Other errors (transport, 5xx) — don't cache so the
             # next call gets a fresh try.
             logger.debug(
                 "core.cve.vulnrichment: fetch failed for %s: %s",
                 cve_id, e,
             )
-            return None
+            return None, False
         if not isinstance(record, dict):
-            return None
+            # A 200 whose body isn't a record object (proxy/CDN error
+            # page shaped as JSON) — not the upstream saying "no
+            # record"; treat as transient.
+            return None, False
+        # Validate decodability BEFORE the positive cache write: a
+        # record the decoder cannot walk must never become a sticky
+        # 7-day entry (it would replay the failure — offline runs
+        # included — until the TTL expired).
+        try:
+            _decode_ssvc(record)
+        except Exception as e:  # noqa: BLE001 — upstream-controlled shape
+            logger.warning(
+                "core.cve.vulnrichment: undecodable record for %s "
+                "(%s: %s) — not caching; id degrades to no-signal",
+                cve_id, type(e).__name__, e,
+            )
+            return None, True
         self._cache.put(cache_key, record, ttl_seconds=self._ttl)
-        return record
+        return record, True
 
 
 def _url_for_cve(cve_id: str) -> str | None:
@@ -275,15 +498,27 @@ def _decode_ssvc(record: object) -> SSVCDecision | None:
     for entry in adp:
         if not isinstance(entry, dict):
             continue
-        provider = (
-            (entry.get("providerMetadata") or {}).get("shortName") or ""
-        )
-        if "CISA-ADP" not in provider:
+        # ``or {}`` is not shape tolerance: a truthy non-dict (e.g.
+        # ``"providerMetadata": "CISA-ADP"``) survives it and crashes
+        # the attribute walk. isinstance-gate every lane instead.
+        provider_meta = entry.get("providerMetadata")
+        if not isinstance(provider_meta, dict):
             continue
-        for metric in entry.get("metrics") or []:
+        provider = provider_meta.get("shortName")
+        if not isinstance(provider, str) or "CISA-ADP" not in provider:
+            continue
+        metrics = entry.get("metrics")
+        if not isinstance(metrics, list):
+            continue
+        for metric in metrics:
             if not isinstance(metric, dict):
                 continue
-            content = (metric.get("other") or {}).get("content") or {}
+            other = metric.get("other")
+            if not isinstance(other, dict):
+                continue
+            content = other.get("content")
+            if not isinstance(content, dict):
+                continue
             options = content.get("options")
             if not isinstance(options, list):
                 continue

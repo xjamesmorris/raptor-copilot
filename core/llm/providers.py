@@ -15,7 +15,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from inspect import isclass
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -25,6 +25,23 @@ if TYPE_CHECKING:
 from core.json import dumps_display
 from core.logging import get_logger
 
+from .accounting import (
+    AccountingCapability,
+    AccountingMode,
+    AccountingSummary,
+    CostBasis,
+    CostObservation,
+    ModelKeyAggregation,
+    PinnedRouteSnapshot,
+    PinnedRouteViolation,
+    attach_cost_observation,
+    cli_cost_observation,
+    cost_basis_for_model_config,
+    cost_observation_from_exception,
+    direct_api_accounting_capability,
+    estimated_cost_observation,
+    route_identity_from_config,
+)
 from .cc_adapter import strip_json_fences
 from .config import ModelConfig
 
@@ -49,7 +66,11 @@ _DEFAULT_CACHE_CONTROL = CacheControl()
 
 logger = get_logger()
 
+# Lock-guarded like the sibling warn-once latches in this module —
+# an unlocked check-then-add only risks a duplicate warning, but the
+# latch discipline should not vary by site.
 _ZERO_PRICE_WARNED: set[str] = set()
+_ZERO_PRICE_WARNED_LOCK = threading.Lock()
 
 # Instructor resilience: allow this many consecutive failures before
 # permanently disabling tool-use structured output for a provider.
@@ -80,6 +101,50 @@ def _instructor_refusal_stop(exc: Exception) -> str | None:
         if getattr(completion, "stop_reason", None) == "refusal":
             return "refusal"
     return None
+
+
+def _llm_truncation_error(msg: str) -> RuntimeError:
+    """Output-truncation error with the typed classification marker.
+
+    Every output-truncation guard raises through this constructor so
+    consumers can classify ATTRIBUTE-FIRST (``llm_truncation=True``)
+    instead of matching the four guards' divergent message phrasings
+    (the Gemini native guard says neither "output token limit" nor
+    the instructor leg's exact wording). Message-phrase matching
+    stays a legacy fallback for wrappers that re-raise with a copied
+    string. Stays a ``RuntimeError`` (not a subclass) so existing
+    ``except RuntimeError`` call sites and retry taxonomies are
+    untouched.
+    """
+    err = RuntimeError(msg)
+    err.llm_truncation = True  # type: ignore[attr-defined]
+    return err
+
+
+def _attach_billed_usage(
+    err: BaseException,
+    *,
+    cost_usd: float,
+    tokens_in: int,
+    tokens_out: int,
+) -> None:
+    """Stamp what a FAILED attempt already paid onto the exception.
+
+    A response the shape guards reject (empty content, thinking-only,
+    output truncation) is still a completed, billed generation. The
+    provider ledger books that money (``track_usage`` at the guard),
+    but per-attempt ATTRIBUTION — which call class, which telemetry
+    row — only travels on the exception: the client's attempt-failure
+    handler reads these attributes to put the paid token counts and
+    cost on the ``attempt_failed`` record. Without them a burn loop
+    (every call failing the same way) is invisible in the per-call
+    ledger: each row reads $0 while the run bleeds full-price calls.
+    Attribute names are read chain-walked, so wrappers that re-raise
+    ``from`` the original keep the attribution.
+    """
+    err.billed_cost_usd = float(cost_usd or 0.0)  # type: ignore[attr-defined]
+    err.billed_tokens_in = int(tokens_in or 0)  # type: ignore[attr-defined]
+    err.billed_tokens_out = int(tokens_out or 0)  # type: ignore[attr-defined]
 
 
 def _instructor_truncation_stop(exc: Exception) -> str | None:
@@ -116,14 +181,14 @@ def _instructor_truncation_stop(exc: Exception) -> str | None:
 # Package roots whose exception classes come from an HTTP / SDK
 # transport layer. Used to decide whether an exception MESSAGE is
 # trustworthy evidence about the API's behaviour (status codes,
-# rate-limit vocabulary) — see ``_is_api_transport_exception``.
+# rate-limit vocabulary) — see ``is_api_transport_exception``.
 _TRANSPORT_EXC_MODULE_ROOTS: frozenset[str] = frozenset({
     "openai", "anthropic", "google", "httpx", "httpcore",
     "requests", "urllib3", "aiohttp", "ssl", "socket",
 })
 
 
-def _is_api_transport_exception(exc: Exception) -> bool:
+def is_api_transport_exception(exc: BaseException) -> bool:
     """Whether *exc* originates from an HTTP/SDK transport layer.
 
     Message sniffing for quota / rate-limit / auth vocabulary is only
@@ -132,13 +197,39 @@ def _is_api_transport_exception(exc: Exception) -> bool:
     message — a ``429`` or ``rate limit`` inside it describes the
     CONTENT of a completed, recoverable generation, not the API's
     status, and must not be routed as a quota boundary.
+
+    Public: every classifier whose verdict can disable, demote, or
+    latch-out a transport (retry kill, session-wide model skip,
+    ``budget``/``quota`` dispositions) gates its message arms on this
+    predicate so model-echoed content cannot steer model selection.
     """
     if getattr(exc, "status_code", None) is not None:
         return True
     if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
         return True
+    # Explicit opt-in for RAPTOR's own transport-boundary exception
+    # types (e.g. ``cc_adapter.CCTransportError``, which relays the
+    # claude CLI's error envelope): a class-level marker, set by code,
+    # never derivable from message content.
+    if getattr(exc, "is_api_transport", False) is True:
+        return True
     module_root = (type(exc).__module__ or "").split(".")[0]
     return module_root in _TRANSPORT_EXC_MODULE_ROOTS
+
+
+class TransportRelayError(RuntimeError):
+    """RuntimeError shape whose message RELAYS a transport exception.
+
+    Wrap sites that re-shape a raw SDK/socket exception into the
+    ``RuntimeError`` convention (e.g. ``_convert_stream_failure``)
+    would otherwise strip the transport provenance the message-based
+    classifiers now require — a genuine mid-stream billing error would
+    become inert. Raise this ONLY when the wrapped source passed
+    ``is_api_transport_exception``; never for messages that embed
+    model-generated content.
+    """
+
+    is_api_transport = True
 
 
 _TEMPERATURE_DEPRECATED_FROM = (4, 7)
@@ -179,6 +270,45 @@ def supports_temperature(model_name: str) -> bool:
     return (major, minor) < _TEMPERATURE_DEPRECATED_FROM
 
 
+# Same version boundary as the temperature deprecation: 4.7 is where
+# the reasoning tier's request surface changed (verified empirically
+# for temperature; the thinking-parameter removal shipped in the same
+# generation per the provider's migration notes).
+_THINKING_SHARES_OUTPUT_FROM = (4, 7)
+
+
+def thinking_shares_output_budget(model_name: str) -> bool:
+    """Whether ``model_name`` bills thinking inside ``max_tokens``
+    with no way to cap it per request.
+
+    The operative contract from the 4.7 reasoning tier onward: the
+    fixed thinking-budget request parameter is rejected, and whenever
+    the model DOES think (always on the 5 family; whenever thinking is
+    enabled on 4.7/4.8), those tokens count against the response's
+    ``max_tokens`` — so a caller cannot reserve text room by capping
+    thinking. The only lever left is a larger shared ceiling: a
+    ``max_tokens`` sized for the TEXT alone can be consumed entirely
+    by reasoning, ending the turn at ``stop_reason=max_tokens`` with a
+    thinking-only (or empty) content list — a full-price call with
+    zero yield, deterministic on identical retry. Callers that cap
+    structured output below the model's ceiling (the study lane)
+    consult this to add thinking headroom on top of their text budget;
+    where thinking is off the extra headroom is harmless (billing is
+    per generated token — an unused ceiling costs nothing).
+
+    Same identifier parsing as :func:`supports_temperature` (Bedrock
+    prefixes, bare ids, dated snapshots; the 5-family's single-number
+    versions gate as (5, 0)). Non-claude / unparseable names return
+    False — an unknown model keeps the caller's plain text budget.
+    """
+    m = _CLAUDE_VERSION_RE.search(model_name or "")
+    if not m:
+        return False
+    major = int(m.group(1))
+    minor = int(m.group(2)) if m.group(2) is not None else 0
+    return (major, minor) >= _THINKING_SHARES_OUTPUT_FROM
+
+
 def _safe_float(value: Any, *, default: float) -> float:
     """`float(value)` with all error paths collapsed to `default`.
 
@@ -190,7 +320,7 @@ def _safe_float(value: Any, *, default: float) -> float:
     aborted the entire turn. Track the failure in debug logs so a
     real upstream regression is visible without crashing the run.
 
-    Delegates to :func:`core.coerce.to_float_safe` with a CC-
+    Delegates to :func:`core.llm.coerce.to_float_safe` with a CC-
     envelope-specific ``on_error`` so the debug log line stays
     scoped to this producer.
     """
@@ -306,6 +436,9 @@ class LLMResponse:
     # "gemini-2.5-pro-002"). None when the provider doesn't surface it — the
     # provenance manifest then records the alias only, never a guess.
     resolved_model: str | None = None
+    cost_observation: CostObservation = field(
+        default_factory=CostObservation.unknown,
+    )
 
 
 @dataclass
@@ -334,6 +467,9 @@ class StructuredResponse:
     cache_write_tokens: int = 0
     # Concrete model snapshot the provider served (see LLMResponse.resolved_model).
     resolved_model: str | None = None
+    cost_observation: CostObservation = field(
+        default_factory=CostObservation.unknown,
+    )
 
     def __iter__(self):
         """Allow unpacking as 2-tuple for backwards compatibility."""
@@ -374,6 +510,8 @@ class LLMProvider(ABC):
     """Abstract base class for LLM providers."""
 
     def __init__(self, config: ModelConfig) -> None:
+        from core.security.session_services import require_service_authorization
+        require_service_authorization("a standalone LLM provider")
         import threading
         self.config = config
         self.total_tokens = 0
@@ -384,6 +522,7 @@ class LLMProvider(ABC):
         self.total_duration = 0.0
         self.total_cache_read_tokens = 0
         self.total_cache_write_tokens = 0
+        self.accounting_summary = AccountingSummary()
         self._usage_lock = threading.Lock()
 
     @abstractmethod
@@ -464,6 +603,41 @@ class LLMProvider(ABC):
         sequentially today regardless — informational flag for v1."""
         return False
 
+    def accounting_capability(self) -> AccountingCapability:
+        """Fail-closed accounting capability for an unclassified provider."""
+        return AccountingCapability()
+
+    def validate_pinned_route(self) -> None:
+        """Reject mutation of a route pinned by :class:`LLMClient`."""
+        from core.security.session_services import require_service_authorization
+        require_service_authorization("a standalone LLM request")
+        snapshot = getattr(self, "_raptor_pinned_route_snapshot", None)
+        if not isinstance(snapshot, PinnedRouteSnapshot):
+            return
+        current = PinnedRouteSnapshot.from_model_config(self.config)
+        if current != snapshot:
+            raise PinnedRouteViolation(
+                "Pinned route violation before provider dispatch: expected "
+                f"{snapshot.provider}/{snapshot.model}; effective route "
+                "or configuration changed",
+            )
+
+    def expected_cost_basis(self) -> CostBasis:
+        """Expected observation basis before a fresh provider call."""
+        return CostBasis.UNKNOWN
+
+    def cost_observation(
+        self,
+        cost: float,
+        *,
+        cost_reported: bool | None = None,
+    ) -> CostObservation:
+        """Return this provider's typed observation for a numeric cost."""
+        del cost, cost_reported
+        return CostObservation.unknown(
+            route=route_identity_from_config(self.config),
+        )
+
     def context_window(self) -> int:
         """Total tokens the model accepts. Drives the loop's context-
         policy enforcement. Sourced from :mod:`core.llm.model_data`
@@ -503,18 +677,39 @@ class LLMProvider(ABC):
         if (
             in_per_m == 0.0 and out_per_m == 0.0
             and (response.input_tokens or response.output_tokens)
-            and self.config.model_name not in _ZERO_PRICE_WARNED
         ):
-            _ZERO_PRICE_WARNED.add(self.config.model_name)
-            logger.warning(
-                "no pricing for model %s — cost tracking disabled, "
-                "max_cost_usd budget cap will not trigger",
-                self.config.model_name,
-            )
+            with _ZERO_PRICE_WARNED_LOCK:
+                first = self.config.model_name not in _ZERO_PRICE_WARNED
+                _ZERO_PRICE_WARNED.add(self.config.model_name)
+            if first:
+                logger.warning(
+                    "no pricing for model %s — cost tracking disabled, "
+                    "max_cost_usd budget cap will not trigger",
+                    self.config.model_name,
+                )
         return (
             response.input_tokens * in_per_m
             + response.output_tokens * out_per_m
         ) / 1_000_000.0
+
+    def turn_cost_observation(
+        self, response: TurnResponse,
+    ) -> CostObservation:
+        """Typed cost evidence for one tool-use turn."""
+        observation = getattr(response, "cost_observation", None)
+        if (
+            isinstance(observation, CostObservation)
+            and observation.basis is not CostBasis.UNKNOWN
+        ):
+            return observation
+        if response.stop_reason in (StopReason.ERROR, StopReason.REFUSED):
+            return CostObservation.unknown(
+                route=route_identity_from_config(self.config),
+            )
+        return self.cost_observation(
+            self.compute_cost(response),
+            cost_reported=response.cost_usd is not None,
+        )
 
     def turn(
         self,
@@ -601,14 +796,21 @@ class LLMProvider(ABC):
         can echo auth headers, the prompt, and the request URL, plus
         control bytes that forge log/terminal output) and keeps the
         original text so message-based classifiers (credit exhaustion,
-        rate-limit vocabulary) still see it.
+        rate-limit vocabulary) still see it. When the source exception
+        is transport-corroborated, the wrapper is a
+        ``TransportRelayError`` so that corroboration survives the
+        re-shaping — the classifiers' message arms are transport-gated.
         """
         from core.security.log_sanitisation import escape_nonprintable
         from core.security.redaction import redact_secrets
         detail = escape_nonprintable(redact_secrets(_redact_endpoint(
             str(exc), getattr(self.config, "api_base", None),
         )))[:512]
-        return RuntimeError(
+        exc_cls = (
+            TransportRelayError if is_api_transport_exception(exc)
+            else RuntimeError
+        )
+        return exc_cls(
             f"stream failed mid-turn ({type(exc).__name__}): {detail}"
         )
 
@@ -616,17 +818,29 @@ class LLMProvider(ABC):
                     input_tokens: int = 0, output_tokens: int = 0,
                     duration: float = 0.0,
                     cache_read_tokens: int = 0,
-                    cache_write_tokens: int = 0) -> None:
-        """Track token usage, cost, and call duration (thread-safe)."""
+                    cache_write_tokens: int = 0,
+                    cost_observation: CostObservation | None = None) -> None:
+        """Track token usage, cost, and call duration (thread-safe).
+
+        ``sanitize_cost`` at the write: this ledger is the budget
+        enforcement floor (``max(total_cost, provider_spend)``), and a
+        single NaN booked here makes every budget comparison False.
+        """
+        from core.llm.cost import sanitize_cost
+        observation = cost_observation or self.cost_observation(cost)
         with self._usage_lock:
             self.total_tokens += tokens
             self.total_input_tokens += input_tokens
             self.total_output_tokens += output_tokens
             self.total_cache_read_tokens += cache_read_tokens
             self.total_cache_write_tokens += cache_write_tokens
-            self.total_cost += (cost or 0.0)
+            self.total_cost += sanitize_cost(cost)
             self.call_count += 1
             self.total_duration += duration
+            summary = getattr(
+                self, "accounting_summary", AccountingSummary(),
+            )
+            self.accounting_summary = summary.add(observation)
         logger.debug("LLM usage: %s tokens, $%.4f (total: %s tokens, $%.4f)", tokens, cost or 0.0, self.total_tokens, self.total_cost)
 
     def _calculate_cost_split(self, input_tokens: int, output_tokens: int,
@@ -787,6 +1001,7 @@ class LLMProvider(ABC):
         say nothing about instructor's reliability.
         """
         from core.llm.structured_call import (
+            RATE_LIMIT_KEYWORDS_RE,
             is_auth_error_text,
             is_content_filter_text,
         )
@@ -803,7 +1018,7 @@ class LLMProvider(ABC):
         # routing it as a boundary skipped the fallback entirely.
         # Type-name and status-code checks stay unconditional — those
         # attributes only exist on real SDK exceptions.
-        transport = _is_api_transport_exception(exc)
+        transport = is_api_transport_exception(exc)
         # Quota before auth: AUTH_KEYWORDS_RE deliberately covers
         # billing vocabulary ("quota", "rate limit"), so the
         # rate-limit check must win for the label to be honest.
@@ -811,7 +1026,12 @@ class LLMProvider(ABC):
             getattr(exc, "status_code", None) == 429
             or "RateLimitError" in type_name
             or (transport and (
-                "429" in text
+                # Anchored 429 (RATE_LIMIT_KEYWORDS_RE) — even
+                # transport messages embed unrelated numerics (ports,
+                # byte counts, httpx-decoded body fragments), so a
+                # bare "429" substring misroutes. The word-shaped
+                # quota arms stay as-is.
+                RATE_LIMIT_KEYWORDS_RE.search(text)
                 or "rate limit" in lowered
                 or ("quota" in lowered and "exceeded" in lowered)
             ))
@@ -825,7 +1045,7 @@ class LLMProvider(ABC):
 
     def _book_instructor_failure_usage(
         self, exc: Exception, duration: float,
-    ) -> None:
+    ) -> CostObservation | None:
         """Book the spend of a failed instructor call.
 
         A pydantic-validation failure happens AFTER a completed (paid)
@@ -840,7 +1060,7 @@ class LLMProvider(ABC):
             completion = getattr(exc, "last_completion", None)
             usage = getattr(completion, "usage", None)
             if usage is None:
-                return
+                return None
             input_tokens = getattr(usage, "prompt_tokens", None)
             if input_tokens is None:
                 input_tokens = getattr(usage, "input_tokens", 0)
@@ -850,16 +1070,27 @@ class LLMProvider(ABC):
             input_tokens = int(input_tokens or 0)
             output_tokens = int(output_tokens or 0)
             if input_tokens <= 0 and output_tokens <= 0:
-                return
+                return None
             cost = self._calculate_cost_split(input_tokens, output_tokens, 0)
+            observation = self.cost_observation(cost)
             self.track_usage(
                 input_tokens + output_tokens, cost,
                 input_tokens, output_tokens, duration,
+                cost_observation=observation,
             )
+            # Per-attempt attribution for the telemetry row — the
+            # ledger booking above is aggregate-only and cannot say
+            # WHICH call class paid (see _attach_billed_usage).
+            _attach_billed_usage(
+                exc, cost_usd=cost, tokens_in=input_tokens,
+                tokens_out=output_tokens,
+            )
+            return observation
         except Exception as book_exc:  # noqa: BLE001 — best-effort booking
             logger.debug(
                 "instructor failure usage booking skipped: %s", book_exc,
             )
+            return None
 
     def _structured_fallback(self, prompt: str, schema: dict[str, Any],
                              pydantic_model, system_prompt: str | None = None,
@@ -881,6 +1112,7 @@ class LLMProvider(ABC):
         ``None`` means "not overridden" and leaves ``generate``'s own
         config-default resolution in effect.
         """
+        self.validate_pinned_route()
         schema_json = dumps_display(schema)
         schema_block = (
             f"\n\n## Output format\n"
@@ -910,7 +1142,20 @@ class LLMProvider(ABC):
                 "Response truncated (output token limit reached, "
                 f"finish_reason={response.finish_reason})"
             )
-            raise RuntimeError(msg)
+            err = _llm_truncation_error(msg)
+            # generate() completed and already booked this call on the
+            # provider ledger — no re-track here; the stamp only
+            # carries per-attempt attribution to the telemetry row.
+            _attach_billed_usage(
+                err,
+                cost_usd=getattr(response, "cost", 0.0),
+                tokens_in=getattr(response, "input_tokens", 0),
+                tokens_out=(
+                    (getattr(response, "output_tokens", 0) or 0)
+                    + (getattr(response, "thinking_tokens", 0) or 0)
+                ),
+            )
+            raise err
         try:
             # Strip markdown fences via the shared hardened helper.
             # It prefers the LAST fenced JSON block, defeating
@@ -941,6 +1186,7 @@ class LLMProvider(ABC):
                 cache_read_tokens=response.cache_read_tokens,
                 cache_write_tokens=response.cache_write_tokens,
                 resolved_model=response.resolved_model,
+                cost_observation=response.cost_observation,
             )
         except Exception as e:
             # Pre-fix the logger interpolated `e` directly into the
@@ -995,6 +1241,7 @@ class LLMProvider(ABC):
     ) -> TurnResponse:
         """Synthesise one tool-use round-trip via plain ``generate()``."""
         del cache_control, provider_specific  # unused by fallback
+        self.validate_pinned_route()
         tool_protocol = self._render_tool_protocol(tools) if tools else ""
         sys_combined = "\n\n".join(s for s in (system, tool_protocol) if s) or None
         rendered_prompt = self._render_messages_as_prompt(messages)
@@ -1019,6 +1266,13 @@ class LLMProvider(ABC):
             input_tokens=getattr(response, "input_tokens", 0) or 0,
             output_tokens=getattr(response, "output_tokens", 0) or 0,
             cost_usd=float(cost) if cost is not None else None,
+            cost_observation=getattr(
+                response,
+                "cost_observation",
+                CostObservation.unknown(
+                    route=route_identity_from_config(self.config),
+                ),
+            ),
         )
 
     @staticmethod
@@ -1226,67 +1480,19 @@ def _coerce_to_schema(data: dict[str, Any], schema: dict[str, Any]) -> dict[str,
     return coerced
 
 
-def _normalize_schema(schema: dict[str, Any]) -> dict[str, Any]:
-    """Normalize simple format schema to JSON Schema format.
+def _normalize_schema(
+    schema: dict[str, Any] | bool,
+) -> dict[str, Any] | bool:
+    """Convert only RAPTOR descriptive shorthand to JSON Schema.
 
-    Simple format: {"field": "type description"}
-    JSON Schema format: {"properties": {...}, "required": [...]}
-
-    Returns the schema unchanged if already in JSON Schema format.
+    Advanced JSON Schema roots are deep-copied without semantic rewriting.
+    Ordinary property-based object nodes gain a missing ``type: object`` for
+    Claude's stricter transport contract. Caller-owned nested objects stay
+    isolated from later provider adaptation.
     """
-    if "properties" in schema:
-        return schema  # Already JSON Schema
+    from .schema_normalization import normalize_schema
 
-    type_aliases = {
-        "bool": "boolean", "str": "string", "int": "integer",
-        "float": "number", "list": "array", "dict": "object",
-    }
-
-    properties = {}
-    for field_name, field_desc in schema.items():
-        if isinstance(field_desc, dict):
-            properties[field_name] = field_desc
-            continue
-
-        field_desc_str = str(field_desc)
-        parts = field_desc_str.split()
-        field_type = parts[0].strip() if parts else "string"
-        field_type = type_aliases.get(field_type, field_type)
-
-        desc_lower = field_desc_str.lower()
-        # Detect nullable: "string or null", "float or null"
-        if " or null" in desc_lower:
-            prop = {"type": [field_type, "null"]}
-        elif desc_lower.startswith("null or "):
-            # "null or string" — the type is the token after "null or",
-            # i.e. parts[2] (parts[1] is always the literal "or")
-            actual = parts[2].strip() if len(parts) > 2 else "string"
-            actual = type_aliases.get(actual, actual)
-            prop = {"type": [actual, "null"]}
-        else:
-            prop = {"type": field_type}
-
-        # Arrays need an items definition for Gemini
-        if field_type == "array":
-            prop["items"] = {"type": "string"}
-
-        # Extract description
-        if " - " in field_desc_str:
-            prop["description"] = field_desc_str.split(" - ", 1)[1].strip()
-        elif "(" in field_desc_str:
-            prop["description"] = field_desc_str[field_desc_str.find("("):].strip()
-
-        properties[field_name] = prop
-
-    required = []
-    for field_name, field_desc in schema.items():
-        if isinstance(field_desc, dict):
-            required.append(field_name)
-            continue
-        desc_lower = str(field_desc).lower()
-        if "optional" not in desc_lower and "or null" not in desc_lower:
-            required.append(field_name)
-    return {"properties": properties, "required": required}
+    return normalize_schema(schema)
 
 
 def _schema_to_gemini(schema: dict[str, Any]) -> dict[str, Any]:
@@ -1326,7 +1532,7 @@ def _schema_to_gemini(schema: dict[str, Any]) -> dict[str, Any]:
 
     result = {"type": "OBJECT"}
     if "properties" in schema:
-        result["properties"] = {k: convert_property(v) for k, v in schema["properties"].items()}
+        result["properties"] = {k: convert_property(v) for k, v in schema["properties"].items()}  # type: ignore[assignment]
     if "required" in schema:
         result["required"] = schema["required"]
     return result
@@ -1404,7 +1610,7 @@ def _dict_schema_to_pydantic(schema: dict[str, Any] | type['BaseModel'], _model_
         enum_values = field_spec.get("enum")
         if enum_values:
             from typing import Literal
-            python_type = Literal[tuple(enum_values)]
+            python_type = Literal[tuple(enum_values)]  # type: ignore[valid-type]
         elif field_type == "object" and "properties" in field_spec:
             nested_name = f"{_model_name}_{field_name.title().replace('_', '')}"
             python_type = _dict_schema_to_pydantic(field_spec, _model_name=nested_name)
@@ -1418,9 +1624,9 @@ def _dict_schema_to_pydantic(schema: dict[str, Any] | type['BaseModel'], _model_
                 item_type = Literal[tuple(items_spec["enum"])]
             else:
                 item_type = type_map.get(items_spec.get("type", "string"), str)
-            python_type = list[item_type]
+            python_type = list[item_type]  # type: ignore[valid-type, assignment]
         else:
-            python_type = type_map.get(field_type, str)
+            python_type = type_map.get(field_type, str)  # type: ignore[assignment]
 
         if nullable:
             python_type = python_type | None
@@ -1457,7 +1663,7 @@ def _dict_schema_to_pydantic(schema: dict[str, Any] | type['BaseModel'], _model_
             field_definitions[field_name] = (python_type, default_value)
 
     # Create and return Pydantic model
-    return create_model(_model_name, **field_definitions)
+    return create_model(_model_name, **field_definitions)  # type: ignore[call-overload]
 
 
 # OpenAI reasoning-tier detection. Gated on the version *number*, not a
@@ -1489,7 +1695,7 @@ def _is_openai_reasoning_model(model_name: str) -> bool:
     if _OPENAI_OSERIES_RE.match(m):
         return True
     gm = _OPENAI_GPT_VERSION_RE.match(m)
-    return bool(gm) and int(gm.group(1)) >= _OPENAI_REASONING_GPT_FROM
+    return bool(gm) and int(gm.group(1)) >= _OPENAI_REASONING_GPT_FROM  # type: ignore[union-attr]
 
 
 def _openai_sampling_kwargs(
@@ -1518,6 +1724,26 @@ class OpenAICompatibleProvider(LLMProvider):
     Works with any OpenAI-compatible API: OpenAI, Ollama, vLLM, LM Studio,
     Gemini (via OpenAI compat), Mistral, etc.
     """
+
+    def accounting_capability(self) -> AccountingCapability:
+        return direct_api_accounting_capability(self.config)
+
+    def expected_cost_basis(self) -> CostBasis:
+        return cost_basis_for_model_config(self.config)
+
+    def cost_observation(
+        self,
+        cost: float,
+        *,
+        cost_reported: bool | None = None,
+    ) -> CostObservation:
+        del cost_reported
+        try:
+            return estimated_cost_observation(self.config, cost)
+        except (TypeError, ValueError):
+            return CostObservation.unknown(
+                route=route_identity_from_config(self.config),
+            )
 
     def __init__(self, config: ModelConfig) -> None:
         super().__init__(config)
@@ -1663,10 +1889,12 @@ class OpenAICompatibleProvider(LLMProvider):
 
             tokens_used = input_tokens + output_tokens + thinking_tokens
             cost = self._calculate_cost_split(input_tokens, output_tokens, thinking_tokens)
+            observation = self.cost_observation(cost)
 
             self.track_usage(
                 tokens_used, cost, input_tokens, output_tokens, duration,
                 cache_read_tokens=cache_read_tokens,
+                cost_observation=observation,
             )
             logger.debug("[OpenAI] model=%s, tokens=%s, cost=$%.4f, duration=%.2fs%s",
                          self.config.model_name, tokens_used, cost, duration,
@@ -1685,6 +1913,7 @@ class OpenAICompatibleProvider(LLMProvider):
                 duration=duration,
                 cache_read_tokens=cache_read_tokens,
                 resolved_model=extract_resolved_model(response),
+                cost_observation=observation,
             )
 
         except Exception as e:
@@ -1766,9 +1995,11 @@ class OpenAICompatibleProvider(LLMProvider):
 
                 tokens_used = input_tokens + output_tokens + thinking_tokens
                 cost = self._calculate_cost_split(input_tokens, output_tokens, thinking_tokens)
+                observation = self.cost_observation(cost)
                 self.track_usage(
                     tokens_used, cost, input_tokens, output_tokens, duration,
                     cache_read_tokens=cache_read_tokens,
+                    cost_observation=observation,
                 )
 
                 self._note_instructor_success()
@@ -1786,11 +2017,12 @@ class OpenAICompatibleProvider(LLMProvider):
                     output_tokens=output_tokens,
                     cache_read_tokens=cache_read_tokens,
                     resolved_model=extract_resolved_model(completion),
+                    cost_observation=observation,
                 )
 
             except Exception as e:
                 # A completed-but-invalid generation still spent money.
-                self._book_instructor_failure_usage(
+                failed_observation = self._book_instructor_failure_usage(
                     e, time.monotonic() - t_start)
                 route = self._instructor_exception_route(e)
                 if route != "fallback":
@@ -1804,6 +2036,8 @@ class OpenAICompatibleProvider(LLMProvider):
                         "%s/%s — skipping JSON fallback re-send",
                         route, self.config.provider, self.config.model_name,
                     )
+                    if failed_observation is not None:
+                        attach_cost_observation(e, failed_observation)
                     raise
                 self._note_instructor_failure(e)
 
@@ -1910,6 +2144,12 @@ class OpenAICompatibleProvider(LLMProvider):
         )
         t_start = time.monotonic()
         for attempt in range(max_retries + 1):
+            # Attempt-local spend signal — same contract as the
+            # LLMClient loops: a stale response-started stamp from an
+            # earlier dispatcher-routed success must not veto THIS
+            # attempt's failure.
+            from core.llm.client import _clear_attempt_spend_signal
+            _clear_attempt_spend_signal()
             try:
                 resp = self.client.chat.completions.create(**kwargs)
                 break
@@ -1949,6 +2189,22 @@ class OpenAICompatibleProvider(LLMProvider):
                     )
                 if is_credit_exhausted(exc):
                     raise  # let callers fail fast
+                # Spend-aware gate before the transient policy: a
+                # mid-response death classifies transient (connection
+                # error) but its generation is already billed
+                # upstream — terminal for the turn, never re-sent.
+                # The veto already logged the spend warning.
+                consumed_msg = _consumed_attempt_message(
+                    exc, self.config.provider, self.config.model_name,
+                )
+                if consumed_msg is not None:
+                    return TurnResponse(
+                        content=[],
+                        stop_reason=StopReason.ERROR,
+                        input_tokens=0,
+                        output_tokens=0,
+                        error_message=consumed_msg,
+                    )
                 if _is_rate_limit(exc):
                     from core.llm.throttle import broadcast_rate_limit
                     broadcast_rate_limit()
@@ -2073,12 +2329,17 @@ class OpenAICompatibleProvider(LLMProvider):
         # reports 0 cost / 0 tokens for tool-use no matter how many
         # turns the loop ran for.
         cost = self.compute_cost(turn_response)
+        observation = self.cost_observation(cost)
+        turn_response = replace(
+            turn_response, cost_observation=observation,
+        )
         self.track_usage(
             tokens=turn_response.input_tokens + turn_response.output_tokens,
             cost=cost,
             input_tokens=turn_response.input_tokens,
             output_tokens=turn_response.output_tokens,
             duration=duration,
+            cost_observation=observation,
         )
         return turn_response
 
@@ -2302,23 +2563,30 @@ class OpenAICompatibleProvider(LLMProvider):
             # buffering the stream) — then raise the sanitised typed
             # error the non-streaming paths use.
             booked_out = output_tokens or approx_output_chars // 4
+            booked_observation: CostObservation | None = None
             if input_tokens or booked_out:
                 try:
+                    cost = self._calculate_cost_split(
+                        input_tokens, booked_out,
+                    )
+                    booked_observation = self.cost_observation(cost)
                     self.track_usage(
                         tokens=input_tokens + booked_out,
-                        cost=self._calculate_cost_split(
-                            input_tokens, booked_out,
-                        ),
+                        cost=cost,
                         input_tokens=input_tokens,
                         output_tokens=booked_out,
                         duration=time.monotonic() - t_start,
+                        cost_observation=booked_observation,
                     )
                 except Exception as book_exc:  # noqa: BLE001 — best-effort booking
                     logger.debug(
                         "stream failure usage booking skipped: %s",
                         book_exc,
                     )
-            raise self._convert_stream_failure(exc) from exc
+            converted = self._convert_stream_failure(exc)
+            if booked_observation is not None:
+                attach_cost_observation(converted, booked_observation)
+            raise converted from exc
         finally:
             resp.close()
 
@@ -2375,6 +2643,35 @@ _OPENAI_FINISH_REASON_MAP = {
     "content_filter": StopReason.REFUSED,
     "function_call": StopReason.NEEDS_TOOL_CALL,            # legacy alias
 }
+
+
+def _consumed_attempt_message(
+    exc: BaseException, provider: str, model_name: str,
+) -> str | None:
+    """Spend-aware veto for the ``turn()`` transient-retry loops — the
+    sibling surface of ``LLMClient``'s attempt loops. Returns the
+    terminal error message when the failed attempt's upstream
+    generation is already processed (and billed) — the dispatcher
+    stamped its response head ``response-started`` and the failure is
+    wire-class — so a transient-class re-send would buy the same
+    generation again; ``None`` when ordinary transient policy applies.
+
+    Delegates to ``core.llm.client._consumed_attempt_veto`` so there
+    is exactly ONE gate, one ``RAPTOR_LLM_RETRY_CONSUMED`` escape
+    hatch, and one operator-warning shape across both retry surfaces
+    (the veto logs the spend; callers only turn the returned message
+    into their own terminal error value). Lazy import keeps the
+    module graph acyclic. Only the non-streaming ``turn()`` loops
+    need this: the ``turn_stream()`` retry loops wrap the stream OPEN
+    alone (which completes at the response head, before any billed
+    output is at stake), and mid-stream deaths there propagate to the
+    tool-use loop's content-gated retry instead of being re-sent.
+    """
+    if not isinstance(exc, Exception):
+        return None
+    from core.llm.client import _consumed_attempt_veto
+    veto = _consumed_attempt_veto(exc, provider, model_name)
+    return str(veto) if veto is not None else None
 
 
 def _is_transient_openai(exc: BaseException) -> bool:
@@ -2610,6 +2907,26 @@ class AnthropicProvider(LLMProvider):
     and token counting.
     """
 
+    def accounting_capability(self) -> AccountingCapability:
+        return direct_api_accounting_capability(self.config)
+
+    def expected_cost_basis(self) -> CostBasis:
+        return cost_basis_for_model_config(self.config)
+
+    def cost_observation(
+        self,
+        cost: float,
+        *,
+        cost_reported: bool | None = None,
+    ) -> CostObservation:
+        del cost_reported
+        try:
+            return estimated_cost_observation(self.config, cost)
+        except (TypeError, ValueError):
+            return CostObservation.unknown(
+                route=route_identity_from_config(self.config),
+            )
+
     def __init__(self, config: ModelConfig) -> None:
         super().__init__(config)
         if not ANTHROPIC_SDK_AVAILABLE:
@@ -2726,6 +3043,60 @@ class AnthropicProvider(LLMProvider):
                 response = self.client.messages.create(**create_kwargs)
             duration = time.monotonic() - t_start
 
+            # Usage/cost first, THEN the shape guards: a response the
+            # guards reject (empty content, thinking-only) is still a
+            # completed, billed generation. Booking before raising
+            # keeps the provider ledger — the budget-enforcement floor
+            # (``max(total_cost, provider_spend_usd)``) — honest for
+            # failed attempts; pre-fix a class-wide shape failure
+            # (thinking consuming the whole shared output budget on a
+            # reasoning-tier model) burned full-price calls that
+            # reached neither ledger nor telemetry.
+            input_tokens = 0
+            output_tokens = 0
+            thinking_tokens = 0
+            cache_read_tokens = 0
+            cache_write_tokens = 0
+            if response.usage:
+                input_tokens = response.usage.input_tokens or 0
+                output_tokens = response.usage.output_tokens or 0
+                thinking_tokens = getattr(response.usage, 'thinking_tokens', 0) or 0
+                cache_read_tokens = getattr(response.usage, 'cache_read_input_tokens', 0) or 0
+                cache_write_tokens = getattr(response.usage, 'cache_creation_input_tokens', 0) or 0
+            tokens_used = input_tokens + output_tokens + thinking_tokens
+            cost = self._calculate_cost_split(
+                input_tokens, output_tokens, thinking_tokens,
+                cache_read_tokens=cache_read_tokens,
+                cache_write_tokens=cache_write_tokens,
+            )
+            observation = self.cost_observation(cost)
+
+            def _raise_paid(err: BaseException) -> None:
+                """Book the rejected response's spend, stamp the
+                attribution attributes, raise. Booking is best-effort
+                (same never-raises contract as the instructor booking
+                twin) — a ledger exception must not replace the shape
+                error the caller's classifiers key on."""
+                try:
+                    self.track_usage(
+                        tokens_used, cost, input_tokens, output_tokens,
+                        duration,
+                        cache_read_tokens=cache_read_tokens,
+                        cache_write_tokens=cache_write_tokens,
+                        cost_observation=observation,
+                    )
+                except Exception:  # noqa: BLE001 — booking must not mask the shape error
+                    logger.debug(
+                        "shape-guard spend booking failed",
+                        exc_info=True,
+                    )
+                attach_cost_observation(err, observation)
+                _attach_billed_usage(
+                    err, cost_usd=cost, tokens_in=input_tokens,
+                    tokens_out=output_tokens + thinking_tokens,
+                )
+                raise err
+
             # Extract text from response (guard against empty/non-text
             # content). Reasoning-tier models prepend thinking blocks —
             # the text block is not necessarily first, so take the
@@ -2751,7 +3122,7 @@ class AnthropicProvider(LLMProvider):
                         "Anthropic model refused request "
                         "(stop_reason=refusal, empty content)"
                     )
-                    raise RuntimeError(msg)
+                    _raise_paid(RuntimeError(msg))
                 if stop == "max_tokens":
                     msg = (
                         "Anthropic returned empty content with "
@@ -2760,12 +3131,12 @@ class AnthropicProvider(LLMProvider):
                         "(on reasoning-tier models thinking can "
                         "consume the entire budget)"
                     )
-                    raise RuntimeError(msg)
+                    _raise_paid(_llm_truncation_error(msg))
                 msg = (
                     f"Anthropic returned empty content "
                     f"(stop_reason={stop})"
                 )
-                raise RuntimeError(msg)
+                _raise_paid(RuntimeError(msg))
             text_block = next(
                 (b for b in response.content if hasattr(b, 'text')), None,
             )
@@ -2786,32 +3157,26 @@ class AnthropicProvider(LLMProvider):
                     f"(got: {block_types}; stop_reason="
                     f"{response.stop_reason or 'unknown'})"
                 )
-                raise RuntimeError(msg)
-            content = text_block.text
+                if (response.stop_reason or "") == "max_tokens":
+                    # Thinking-only content ended by the output cap is
+                    # the same condition as the empty-content
+                    # max_tokens guard above — reasoning consumed the
+                    # whole shared budget before the first text block —
+                    # so it must carry the same typed truncation
+                    # marker. Pre-fix it raised untyped: the study
+                    # lane's split-retry/classification saw a generic
+                    # provider failure, and one live run re-bought the
+                    # identical full-price failure for hours.
+                    _raise_paid(_llm_truncation_error(msg))
+                _raise_paid(RuntimeError(msg))
+            content = text_block.text  # type: ignore[union-attr]
             finish_reason = response.stop_reason or "complete"
-
-            input_tokens = 0
-            output_tokens = 0
-            thinking_tokens = 0
-            cache_read_tokens = 0
-            cache_write_tokens = 0
-            if response.usage:
-                input_tokens = response.usage.input_tokens or 0
-                output_tokens = response.usage.output_tokens or 0
-                thinking_tokens = getattr(response.usage, 'thinking_tokens', 0) or 0
-                cache_read_tokens = getattr(response.usage, 'cache_read_input_tokens', 0) or 0
-                cache_write_tokens = getattr(response.usage, 'cache_creation_input_tokens', 0) or 0
-            tokens_used = input_tokens + output_tokens + thinking_tokens
-            cost = self._calculate_cost_split(
-                input_tokens, output_tokens, thinking_tokens,
-                cache_read_tokens=cache_read_tokens,
-                cache_write_tokens=cache_write_tokens,
-            )
 
             self.track_usage(
                 tokens_used, cost, input_tokens, output_tokens, duration,
                 cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=cache_write_tokens,
+                cost_observation=observation,
             )
             logger.debug("[Anthropic] model=%s, tokens=%s, cost=$%.4f, duration=%.2fs", self.config.model_name, tokens_used, cost, duration)
 
@@ -2829,6 +3194,7 @@ class AnthropicProvider(LLMProvider):
                 cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=cache_write_tokens,
                 resolved_model=extract_resolved_model(response),
+                cost_observation=observation,
             )
 
         except Exception as e:
@@ -2949,10 +3315,12 @@ class AnthropicProvider(LLMProvider):
                     cache_read_tokens=cache_read_tokens,
                     cache_write_tokens=cache_write_tokens,
                 )
+                observation = self.cost_observation(cost)
                 self.track_usage(
                     tokens_used, cost, input_tokens, output_tokens, duration,
                     cache_read_tokens=cache_read_tokens,
                     cache_write_tokens=cache_write_tokens,
+                    cost_observation=observation,
                 )
 
                 self._note_instructor_success()
@@ -2961,8 +3329,9 @@ class AnthropicProvider(LLMProvider):
                 # SHARED aggregate counters before/after the call —
                 # under parallel workers that delta swallows every
                 # concurrent call's spend and multiply-books the same
-                # money (observed live: a $38 run enforced as $85+ and
-                # terminated at 25/40 reviews). The exact figures are
+                # money (observed live: one run's spend enforced as
+                # more than double actual and terminated at 25/40
+                # reviews). The exact figures are
                 # computed right here; return them.
                 return StructuredResponse(
                     result=result_dict,
@@ -2975,11 +3344,12 @@ class AnthropicProvider(LLMProvider):
                     cache_read_tokens=cache_read_tokens,
                     cache_write_tokens=cache_write_tokens,
                     resolved_model=extract_resolved_model(completion),
+                    cost_observation=observation,
                 )
 
             except Exception as e:
                 # A completed-but-invalid generation still spent money.
-                self._book_instructor_failure_usage(
+                failed_observation = self._book_instructor_failure_usage(
                     e, time.monotonic() - t_start)
                 refusal = _instructor_refusal_stop(e)
                 if refusal is not None:
@@ -2996,7 +3366,10 @@ class AnthropicProvider(LLMProvider):
                         f"(stop_reason={refusal}, instructor tool-use "
                         "leg — tool args empty)"
                     )
-                    raise RuntimeError(msg) from e
+                    error = RuntimeError(msg)
+                    if failed_observation is not None:
+                        attach_cost_observation(error, failed_observation)
+                    raise error from e
                 truncation = _instructor_truncation_stop(e)
                 if truncation is not None:
                     # Output budget exhausted mid-tool-call. Not
@@ -3024,7 +3397,10 @@ class AnthropicProvider(LLMProvider):
                         f"limit reached, stop_reason={truncation}, "
                         "instructor tool-use leg)"
                     )
-                    raise RuntimeError(msg) from e
+                    error = _llm_truncation_error(msg)
+                    if failed_observation is not None:
+                        attach_cost_observation(error, failed_observation)
+                    raise error from e
                 route = self._instructor_exception_route(e)
                 if route != "fallback":
                     # Boundary failure (blocked/auth/quota): see the
@@ -3035,6 +3411,8 @@ class AnthropicProvider(LLMProvider):
                         "%s/%s — skipping JSON fallback re-send",
                         route, self.config.provider, self.config.model_name,
                     )
+                    if failed_observation is not None:
+                        attach_cost_observation(e, failed_observation)
                     raise
                 self._note_instructor_failure(e)
 
@@ -3208,6 +3586,12 @@ class AnthropicProvider(LLMProvider):
         )
         t_start = time.monotonic()
         for attempt in range(max_retries + 1):
+            # Attempt-local spend signal — same contract as the
+            # LLMClient loops: a stale response-started stamp from an
+            # earlier dispatcher-routed success must not veto THIS
+            # attempt's failure.
+            from core.llm.client import _clear_attempt_spend_signal
+            _clear_attempt_spend_signal()
             try:
                 if use_stream_transport:
                     with self.client.messages.stream(
@@ -3220,6 +3604,21 @@ class AnthropicProvider(LLMProvider):
             except (APIConnectionError, APIStatusError, APIError) as exc:
                 if is_credit_exhausted(exc):
                     raise  # let callers fail fast
+                # Spend-aware gate before the transient policy — same
+                # contract as the OpenAI turn() loop above: a
+                # mid-response death's generation is already billed
+                # upstream; the veto logged the spend warning.
+                consumed_msg = _consumed_attempt_message(
+                    exc, self.config.provider, self.config.model_name,
+                )
+                if consumed_msg is not None:
+                    return TurnResponse(
+                        content=[],
+                        stop_reason=StopReason.ERROR,
+                        input_tokens=0,
+                        output_tokens=0,
+                        error_message=consumed_msg,
+                    )
                 if _is_rate_limit(exc):
                     from core.llm.throttle import broadcast_rate_limit
                     broadcast_rate_limit()
@@ -3306,6 +3705,10 @@ class AnthropicProvider(LLMProvider):
         # when the loop ran for many turns. Cost via ``compute_cost``
         # so cache multipliers (1.25x write, 0.1x read) apply.
         cost = self.compute_cost(turn_response)
+        observation = self.cost_observation(cost)
+        turn_response = replace(
+            turn_response, cost_observation=observation,
+        )
         self.track_usage(
             tokens=turn_response.input_tokens + turn_response.output_tokens,
             cost=cost,
@@ -3314,6 +3717,7 @@ class AnthropicProvider(LLMProvider):
             duration=duration,
             cache_read_tokens=turn_response.cache_read_tokens,
             cache_write_tokens=turn_response.cache_write_tokens,
+            cost_observation=observation,
         )
         self._maybe_warn_silent_cache_failure(turn_response, cache_control)
         return turn_response
@@ -3534,6 +3938,7 @@ class AnthropicProvider(LLMProvider):
             # received — then raise the sanitised typed error the
             # non-streaming paths use.
             booked_out = output_tokens or approx_output_chars // 4
+            booked_observation: CostObservation | None = None
             if input_tokens or booked_out or cache_read or cache_write:
                 try:
                     cost = self.compute_cost(TurnResponse(
@@ -3543,6 +3948,7 @@ class AnthropicProvider(LLMProvider):
                         cache_read_tokens=cache_read,
                         cache_write_tokens=cache_write,
                     ))
+                    booked_observation = self.cost_observation(cost)
                     self.track_usage(
                         tokens=input_tokens + booked_out,
                         cost=cost,
@@ -3551,13 +3957,17 @@ class AnthropicProvider(LLMProvider):
                         duration=time.monotonic() - t_start,
                         cache_read_tokens=cache_read,
                         cache_write_tokens=cache_write,
+                        cost_observation=booked_observation,
                     )
                 except Exception as book_exc:  # noqa: BLE001 — best-effort booking
                     logger.debug(
                         "stream failure usage booking skipped: %s",
                         book_exc,
                     )
-            raise self._convert_stream_failure(exc) from exc
+            converted = self._convert_stream_failure(exc)
+            if booked_observation is not None:
+                attach_cost_observation(converted, booked_observation)
+            raise converted from exc
 
         duration = time.monotonic() - t_start
 
@@ -3644,6 +4054,14 @@ def is_credit_exhausted(exc: BaseException) -> bool:
     Provider-agnostic: checks the exception message for credit/billing
     keywords across Anthropic (400 ``credit balance is too low``),
     OpenAI (429 ``exceeded your current quota``), and generic shims.
+
+    The message/body arms require transport corroboration
+    (``is_api_transport_exception``): billing exhaustion is a statement
+    the PROVIDER makes via its error envelope, never something model
+    output can assert. A validation/shape exception quoting model
+    content that happens to contain billing vocabulary is inert —
+    logged at DEBUG, never classified — because this verdict kills the
+    retry policy and labels the telemetry disposition ``budget``.
     """
     status = getattr(exc, "status_code", None)
     # Only 400/401/402/403/429 carry billing errors — 5xx never does.
@@ -3657,7 +4075,7 @@ def is_credit_exhausted(exc: BaseException) -> bool:
             text += " " + str(err.get("message", "")).lower()
         elif isinstance(err, str):
             text += " " + err.lower()
-    return any(phrase in text for phrase in (
+    matched = any(phrase in text for phrase in (
         "credit balance is too low",
         "exceeded your current quota",
         "insufficient_quota",
@@ -3666,6 +4084,16 @@ def is_credit_exhausted(exc: BaseException) -> bool:
         "billing not active",
         "reached your specified api usage limits",
     ))
+    if not matched:
+        return False
+    if not is_api_transport_exception(exc):
+        logger.debug(
+            "Billing vocabulary in non-transport %s ignored "
+            "(content-level match without transport corroboration)",
+            type(exc).__name__,
+        )
+        return False
+    return True
 
 
 def _message_to_anthropic_wire(m: Message) -> dict[str, Any]:
@@ -3747,6 +4175,26 @@ class GeminiProvider(LLMProvider):
     Falls back to OpenAICompatibleProvider if google-genai is not installed.
     """
 
+    def accounting_capability(self) -> AccountingCapability:
+        return direct_api_accounting_capability(self.config)
+
+    def expected_cost_basis(self) -> CostBasis:
+        return cost_basis_for_model_config(self.config)
+
+    def cost_observation(
+        self,
+        cost: float,
+        *,
+        cost_reported: bool | None = None,
+    ) -> CostObservation:
+        del cost_reported
+        try:
+            return estimated_cost_observation(self.config, cost)
+        except (TypeError, ValueError):
+            return CostObservation.unknown(
+                route=route_identity_from_config(self.config),
+            )
+
     def __init__(self, config: ModelConfig) -> None:
         super().__init__(config)
         if not GENAI_SDK_AVAILABLE:
@@ -3769,8 +4217,8 @@ class GeminiProvider(LLMProvider):
         from google.genai.types import SafetySetting
         self._safety_settings = [
             SafetySetting(
-                category="HARM_CATEGORY_DANGEROUS_CONTENT",
-                threshold="BLOCK_NONE",
+                category="HARM_CATEGORY_DANGEROUS_CONTENT",  # type: ignore[arg-type]
+                threshold="BLOCK_NONE",  # type: ignore[arg-type]
             ),
         ]
 
@@ -3854,7 +4302,7 @@ class GeminiProvider(LLMProvider):
             "config": config_kwargs,
         }
         if system_prompt:
-            generate_kwargs["config"]["system_instruction"] = system_prompt
+            generate_kwargs["config"]["system_instruction"] = system_prompt  # type: ignore[index]
 
         try:
             t_start = time.monotonic()
@@ -3898,8 +4346,12 @@ class GeminiProvider(LLMProvider):
 
             tokens_used = input_tokens + output_tokens + thinking_tokens
             cost = self._calculate_cost_split(input_tokens, output_tokens, thinking_tokens)
+            observation = self.cost_observation(cost)
 
-            self.track_usage(tokens_used, cost, input_tokens, output_tokens, duration)
+            self.track_usage(
+                tokens_used, cost, input_tokens, output_tokens, duration,
+                cost_observation=observation,
+            )
             logger.debug("[Gemini] model=%s, tokens=%s, cost=$%.4f, duration=%.2fs, thinking=%s",
                          self.config.model_name, tokens_used, cost, duration, thinking_tokens)
 
@@ -3915,6 +4367,7 @@ class GeminiProvider(LLMProvider):
                 output_tokens=output_tokens,
                 thinking_tokens=thinking_tokens,
                 duration=duration,
+                cost_observation=observation,
             )
 
         except Exception as e:
@@ -3955,7 +4408,7 @@ class GeminiProvider(LLMProvider):
                     budget = min(raw_budget, 32768)
                 budget = max(budget, 128)
                 config_kwargs["thinking_config"] = ThinkingConfig(
-                    thinkingBudget=budget,
+                    thinkingBudget=budget,  # type: ignore[call-arg]
                 )
             except (ImportError, TypeError):
                 pass
@@ -3968,7 +4421,7 @@ class GeminiProvider(LLMProvider):
             "config": config_kwargs,
         }
         if system_prompt:
-            generate_kwargs["config"]["system_instruction"] = system_prompt
+            generate_kwargs["config"]["system_instruction"] = system_prompt  # type: ignore[index]
 
         try:
             t_start = time.monotonic()
@@ -3985,7 +4438,11 @@ class GeminiProvider(LLMProvider):
 
             tokens_used = input_tokens + output_tokens + thinking_tokens
             cost = self._calculate_cost_split(input_tokens, output_tokens, thinking_tokens)
-            self.track_usage(tokens_used, cost, input_tokens, output_tokens, duration)
+            observation = self.cost_observation(cost)
+            self.track_usage(
+                tokens_used, cost, input_tokens, output_tokens, duration,
+                cost_observation=observation,
+            )
 
             logger.debug("[Gemini] structured model=%s, tokens=%s, cost=$%.4f, duration=%.2fs, thinking=%s",
                          self.config.model_name, tokens_used, cost, duration, thinking_tokens)
@@ -4001,7 +4458,7 @@ class GeminiProvider(LLMProvider):
                     f"(finish_reason={finish_reason}, "
                     f"output_tokens={output_tokens})"
                 )
-                raise RuntimeError(msg)
+                raise _llm_truncation_error(msg)
 
             # Safety/prohibited-content block: empty text with a
             # blocking finish_reason previously fell through to
@@ -4049,6 +4506,7 @@ class GeminiProvider(LLMProvider):
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 resolved_model=extract_resolved_model(response),
+                cost_observation=observation,
             )
 
         except (json.JSONDecodeError, ValueError, KeyError) as e:
@@ -4188,6 +4646,47 @@ class ClaudeCodeLLMProvider(LLMProvider):
 
     is_stub = False
 
+    def accounting_capability(self) -> AccountingCapability:
+        return AccountingCapability(
+            mode=AccountingMode.UNKNOWN,
+            hard_limit_supported=False,
+            model_key_aggregation=ModelKeyAggregation.LEGACY_MODEL_NAME,
+        )
+
+    def expected_cost_basis(self) -> CostBasis:
+        return CostBasis.UNKNOWN
+
+    def cost_observation(
+        self,
+        cost: float,
+        *,
+        cost_reported: bool | None = None,
+    ) -> CostObservation:
+        return cli_cost_observation(
+            cost_usd=cost,
+            cost_reported=bool(cost_reported),
+            route=route_identity_from_config(self.config),
+        )
+
+    def turn_cost_observation(
+        self, response: TurnResponse,
+    ) -> CostObservation:
+        observation = getattr(response, "cost_observation", None)
+        if isinstance(observation, CostObservation):
+            if observation.route is None:
+                return CostObservation(
+                    basis=observation.basis,
+                    provider_billed_usd=observation.provider_billed_usd,
+                    estimated_usd=observation.estimated_usd,
+                    catalog_version=observation.catalog_version,
+                    route=route_identity_from_config(self.config),
+                )
+            return observation
+        return self.cost_observation(
+            float(response.cost_usd or 0.0),
+            cost_reported=response.cost_usd is not None,
+        )
+
     def __init__(
         self,
         config: ModelConfig,
@@ -4196,8 +4695,9 @@ class ClaudeCodeLLMProvider(LLMProvider):
         # Per-CALL abort ceiling (claude -p --max-budget-usd), not a
         # run budget — orchestrators cap total spend via --max-cost.
         # Audit-sized structured reviews (system prompt + context
-        # slice + schema) measure $0.9-1.3 per call on Opus-class
-        # models; the old "1.00" default aborted them mid-response
+        # slice + schema) routinely measure around or above the old
+        # "1.00" per-call default on Opus-class models; that default
+        # aborted them mid-response
         # with subtype error_max_budget_usd. On pricier backends the
         # biggest call classes (Mode 2 checker synthesis: multi-KB
         # system prompt, no cross-process cache reuse) can exceed
@@ -4308,6 +4808,9 @@ class ClaudeCodeLLMProvider(LLMProvider):
 
         from .cc_adapter import (
             CCDispatchConfig,
+            CCMissingRootTypeError,
+            CCRequestSchemaError,
+            CCTransportError,
             build_cc_command,
             run_cc_streaming,
             system_prompt_file_for,
@@ -4326,7 +4829,7 @@ class ClaudeCodeLLMProvider(LLMProvider):
             # us via _tool_use_fallback's JSON-protocol synthesis.
             tools="",
             budget_usd=self._budget_usd,
-            timeout_s=call_timeout,
+            timeout_s=call_timeout,  # type: ignore[arg-type]
             capture_json_envelope=False,
             stream_json=True,
             system_prompt=system_prompt,
@@ -4361,7 +4864,17 @@ class ClaudeCodeLLMProvider(LLMProvider):
                 )
         except subprocess.TimeoutExpired as e:
             msg = f"claude -p timed out after {call_timeout}s"
-            raise RuntimeError(msg) from e
+            raise CCTransportError(
+                msg,
+                diagnostic={
+                    "transport": "claude_code",
+                    "structured": False,
+                    "per_call_budget_usd": self._budget_usd,
+                    "timeout_s": call_timeout,
+                    "model": self.config.model_name,
+                },
+                error_kind="timeout",
+            ) from e
         duration = _time.monotonic() - start
 
         # Book usage BEFORE the error check: a failed call (budget
@@ -4372,6 +4885,10 @@ class ClaudeCodeLLMProvider(LLMProvider):
         # ``max(total_cost, provider_spend)``), so raising first
         # made the spend invisible to max-cost enforcement.
         total_tokens = sr.input_tokens + sr.output_tokens
+        observation = self.cost_observation(
+            sr.cost_usd,
+            cost_reported=sr.cost_reported,
+        )
         self.track_usage(
             tokens=total_tokens,
             cost=sr.cost_usd,
@@ -4380,10 +4897,36 @@ class ClaudeCodeLLMProvider(LLMProvider):
             cache_read_tokens=sr.cache_read_tokens,
             cache_write_tokens=sr.cache_creation_tokens,
             duration=duration,
+            cost_observation=observation,
         )
 
         if sr.error:
-            raise RuntimeError(sr.error)
+            if sr.error_kind == "missing_root_type":
+                error_cls = CCMissingRootTypeError
+            elif sr.error_kind == "request_schema":
+                error_cls = CCRequestSchemaError
+            else:
+                error_cls = CCTransportError
+            transport_error = error_cls(
+                sr.error,
+                diagnostic={
+                    **(sr.diagnostic or {}),
+                    "transport": "claude_code",
+                    "structured": False,
+                    "per_call_budget_usd": self._budget_usd,
+                    "timeout_s": call_timeout,
+                    "model": self.config.model_name,
+                },
+                error_kind=sr.error_kind,
+            )
+            _attach_billed_usage(
+                transport_error,
+                cost_usd=sr.cost_usd,
+                tokens_in=sr.input_tokens,
+                tokens_out=sr.output_tokens,
+            )
+            attach_cost_observation(transport_error, observation)
+            raise transport_error
 
         # The claude-code harness reports the model it used in the
         # stream-json output; treat that as the resolved snapshot. But
@@ -4409,26 +4952,31 @@ class ClaudeCodeLLMProvider(LLMProvider):
             cache_read_tokens=sr.cache_read_tokens,
             cache_write_tokens=sr.cache_creation_tokens,
             duration=duration,
+            cost_observation=observation,
         )
 
     def generate_structured(
         self,
         prompt: str,
-        schema: dict[str, Any],
+        schema: dict[str, Any] | bool,
         system_prompt: str | None = None,
         **kwargs,
     ) -> StructuredResponse:
         """Dispatch with ``--json-schema`` for structured output via
         stream-json.
 
-        Accepts and ignores ``**kwargs`` — `claude` CLI has no
-        temperature flag (see ClaudeCodeProvider.generate_structured).
+        Honours ``timeout_s`` from ``**kwargs`` (popped below); the
+        rest is accepted and ignored — `claude` CLI has no temperature
+        flag (see ClaudeCodeProvider.generate_structured).
         """
         import subprocess
         import time as _time
 
         from .cc_adapter import (
             CCDispatchConfig,
+            CCMissingRootTypeError,
+            CCRequestSchemaError,
+            CCTransportError,
             build_cc_command,
             run_cc_streaming,
             system_prompt_file_for,
@@ -4456,13 +5004,14 @@ class ClaudeCodeLLMProvider(LLMProvider):
         # CCDispatchConfig.system_prompt (which build_cc_command
         # converts into a `--system-prompt-file` flag).
         call_timeout = self._effective_timeout_s(kwargs.pop("timeout_s", None))
+        wire_schema = _normalize_schema(schema)
 
         cc_config = CCDispatchConfig(
             claude_bin=self._claude_bin,
             tools="",                                # see generate() comment
             budget_usd=self._budget_usd,
-            timeout_s=call_timeout,
-            json_schema=schema,
+            timeout_s=call_timeout,  # type: ignore[arg-type]
+            json_schema=wire_schema,
             capture_json_envelope=False,
             stream_json=True,
             system_prompt=system_prompt,
@@ -4494,7 +5043,18 @@ class ClaudeCodeLLMProvider(LLMProvider):
                 )
         except subprocess.TimeoutExpired as e:
             msg = f"claude -p timed out after {call_timeout}s"
-            raise RuntimeError(msg) from e
+            raise CCTransportError(
+                msg,
+                diagnostic={
+                    "transport": "claude_code",
+                    "structured": True,
+                    "request_schema": wire_schema,
+                    "per_call_budget_usd": self._budget_usd,
+                    "timeout_s": call_timeout,
+                    "model": self.config.model_name,
+                },
+                error_kind="timeout",
+            ) from e
         duration = _time.monotonic() - start
 
         # Book usage BEFORE the error/parse checks: a failed call
@@ -4505,6 +5065,10 @@ class ClaudeCodeLLMProvider(LLMProvider):
         # ``max(total_cost, provider_spend)``), so raising first
         # made the spend invisible to max-cost enforcement.
         total_tokens = sr.input_tokens + sr.output_tokens
+        observation = self.cost_observation(
+            sr.cost_usd,
+            cost_reported=sr.cost_reported,
+        )
         self.track_usage(
             tokens=total_tokens,
             cost=sr.cost_usd,
@@ -4513,10 +5077,37 @@ class ClaudeCodeLLMProvider(LLMProvider):
             cache_read_tokens=sr.cache_read_tokens,
             cache_write_tokens=sr.cache_creation_tokens,
             duration=duration,
+            cost_observation=observation,
         )
 
         if sr.error:
-            raise RuntimeError(sr.error)
+            if sr.error_kind == "missing_root_type":
+                error_cls = CCMissingRootTypeError
+            elif sr.error_kind == "request_schema":
+                error_cls = CCRequestSchemaError
+            else:
+                error_cls = CCTransportError
+            error = error_cls(
+                sr.error,
+                diagnostic={
+                    **(sr.diagnostic or {}),
+                    "transport": "claude_code",
+                    "structured": True,
+                    "request_schema": wire_schema,
+                    "per_call_budget_usd": self._budget_usd,
+                    "timeout_s": call_timeout,
+                    "model": self.config.model_name,
+                },
+                error_kind=sr.error_kind,
+            )
+            _attach_billed_usage(
+                error,
+                cost_usd=sr.cost_usd,
+                tokens_in=sr.input_tokens,
+                tokens_out=sr.output_tokens,
+            )
+            attach_cost_observation(error, observation)
+            raise error
 
         if sr.structured_output is not None:
             result = sr.structured_output
@@ -4524,7 +5115,9 @@ class ClaudeCodeLLMProvider(LLMProvider):
             result = self._parse_stream_content(sr.content)
             if isinstance(result, dict) and "error" in result and result["error"]:
                 msg = f"claude -p structured parse failed: {result['error']}"
-                raise RuntimeError(msg)
+                parse_error = RuntimeError(msg)
+                attach_cost_observation(parse_error, observation)
+                raise parse_error
 
         return StructuredResponse(
             result=result,
@@ -4538,6 +5131,7 @@ class ClaudeCodeLLMProvider(LLMProvider):
             output_tokens=sr.output_tokens,
             cache_read_tokens=sr.cache_read_tokens,
             cache_write_tokens=sr.cache_creation_tokens,
+            cost_observation=observation,
         )
 
     def supports_tool_use(self) -> bool: return True
@@ -4635,6 +5229,13 @@ class ClaudeCodeLLMProvider(LLMProvider):
                 input_tokens=getattr(response, "input_tokens", 0) or 0,
                 output_tokens=getattr(response, "output_tokens", 0) or 0,
                 cost_usd=float(cost) if cost is not None else None,
+                cost_observation=getattr(
+                    response,
+                    "cost_observation",
+                    CostObservation.unknown(
+                        route=route_identity_from_config(self.config),
+                    ),
+                ),
             )
 
         if self._resumable:
@@ -4661,19 +5262,40 @@ class ClaudeCodeLLMProvider(LLMProvider):
                 system_prompt=sys_combined,
             )
         except RuntimeError as exc:
-            err_msg = f"subprocess error: {exc}"
+            # Redact + escape: the exception text can relay CC
+            # subprocess stderr (model/CLI-authored bytes) into the
+            # operator's console log and TurnResponse.error_message.
+            from core.security.log_sanitisation import escape_nonprintable
+            from core.security.redaction import redact_secrets
+            err_msg = ("subprocess error: "
+                       + escape_nonprintable(redact_secrets(str(exc)[:500])))
             logger.warning("ClaudeCodeLLMProvider.turn: %s", err_msg)
+            observation = cost_observation_from_exception(exc)
             return TurnResponse(
                 content=[],
                 stop_reason=StopReason.ERROR,
                 input_tokens=0,
                 output_tokens=0,
+                cost_usd=(
+                    observation.legacy_cost_usd
+                    if observation is not None
+                    and observation.has_numeric_usd
+                    else None
+                ),
                 error_message=err_msg,
+                cost_observation=(
+                    observation
+                    if observation is not None
+                    else CostObservation.unknown(
+                        route=route_identity_from_config(self.config),
+                    )
+                ),
             )
 
         if isinstance(response, StructuredResponse):
             result = response.result
             cost_usd = response.cost
+            cost_observation = response.cost_observation
             # Preserve the real input/output split —
             # generate_structured populates both fields, and
             # ToolUseLoop records per-turn (input, output) pairs plus
@@ -4683,7 +5305,10 @@ class ClaudeCodeLLMProvider(LLMProvider):
             output_tokens = response.output_tokens
         else:
             result, _ = response
-            cost_usd = 0.0
+            cost_usd = None
+            cost_observation = CostObservation.unknown(
+                route=route_identity_from_config(self.config),
+            )
             input_tokens = 0
             output_tokens = 0
 
@@ -4693,6 +5318,7 @@ class ClaudeCodeLLMProvider(LLMProvider):
             cost_usd=cost_usd,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cost_observation=cost_observation,
         )
 
     def _turn_resumable(
@@ -4755,7 +5381,7 @@ class ClaudeCodeLLMProvider(LLMProvider):
             claude_bin=self._claude_bin,
             tools="",
             budget_usd=self._budget_usd,
-            timeout_s=self._timeout_s,
+            timeout_s=self._timeout_s,  # type: ignore[arg-type]
             json_schema=schema,
             capture_json_envelope=False,
             stream_json=True,
@@ -4793,6 +5419,11 @@ class ClaudeCodeLLMProvider(LLMProvider):
                 error_message=err_msg,
             )
         duration = _time.monotonic() - start
+        observation = self.cost_observation(
+            sr.cost_usd,
+            cost_reported=sr.cost_reported,
+        )
+        reported_cost = sr.cost_usd if sr.cost_reported else None
 
         # Book usage BEFORE the error/empty-content returns: a failed
         # turn (budget abort, refusal) still spent real money, and
@@ -4807,11 +5438,18 @@ class ClaudeCodeLLMProvider(LLMProvider):
             cache_read_tokens=sr.cache_read_tokens,
             cache_write_tokens=sr.cache_creation_tokens,
             duration=duration,
+            cost_observation=observation,
         )
 
         if sr.error:
             err_msg = sr.error
-            logger.warning("ClaudeCodeLLMProvider._turn_resumable: %s", err_msg)
+            # sr.error is sanitised at the stream-json producer;
+            # escape again at the log site so this console emission
+            # never depends on the producer contract (idempotent on
+            # already-escaped text).
+            from core.security.log_sanitisation import escape_nonprintable
+            logger.warning("ClaudeCodeLLMProvider._turn_resumable: %s",
+                           escape_nonprintable(err_msg)[:500])
             if first_turn and sr.session_id:
                 self._session_id = sr.session_id
             if (
@@ -4830,9 +5468,11 @@ class ClaudeCodeLLMProvider(LLMProvider):
             return TurnResponse(
                 content=[],
                 stop_reason=StopReason.ERROR,
-                input_tokens=0,
-                output_tokens=0,
+                input_tokens=sr.input_tokens,
+                output_tokens=sr.output_tokens,
+                cost_usd=reported_cost,
                 error_message=err_msg,
+                cost_observation=observation,
             )
 
         self._messages_seen = len(messages)
@@ -4850,7 +5490,9 @@ class ClaudeCodeLLMProvider(LLMProvider):
                 stop_reason=StopReason.ERROR,
                 input_tokens=sr.input_tokens,
                 output_tokens=sr.output_tokens,
+                cost_usd=reported_cost,
                 error_message="empty response from stream-json",
+                cost_observation=observation,
             )
 
         if sr.structured_output is not None:
@@ -4863,15 +5505,18 @@ class ClaudeCodeLLMProvider(LLMProvider):
                     stop_reason=StopReason.ERROR,
                     input_tokens=sr.input_tokens,
                     output_tokens=sr.output_tokens,
+                    cost_usd=reported_cost,
                     error_message=f"structured parse: {result['error']}",
+                    cost_observation=observation,
                 )
 
         turn_resp = self._parse_turn_structured_result(
             result,
             tools,
-            cost_usd=sr.cost_usd,
+            cost_usd=reported_cost,
             input_tokens=sr.input_tokens,
             output_tokens=sr.output_tokens,
+            cost_observation=observation,
         )
         # Remember what this turn emitted so the next resumed turn can
         # recognise the loop's echo of it (see the unseen-slice skip).
@@ -4900,7 +5545,12 @@ class ClaudeCodeLLMProvider(LLMProvider):
                 return obj
         except (ValueError, json.JSONDecodeError):
             pass
-        return {"error": f"unparseable stream content: {text[:200]}"}
+        # Raw model output — redact + escape before it becomes an
+        # error string that reaches warning logs and loop artifacts.
+        from core.security.log_sanitisation import escape_nonprintable
+        from core.security.redaction import redact_secrets
+        return {"error": "unparseable stream content: "
+                         + escape_nonprintable(redact_secrets(str(text)[:200]))}
 
     # ------------------------------------------------------------------
     # turn() helpers
@@ -5026,15 +5676,19 @@ class ClaudeCodeLLMProvider(LLMProvider):
         result: dict[str, Any],
         tools: Sequence[ToolDef],
         *,
-        cost_usd: float = 0.0,
+        cost_usd: float | None = None,
         input_tokens: int = 0,
         output_tokens: int = 0,
+        cost_observation: CostObservation | None = None,
     ) -> TurnResponse:
         """Translate CC's structured response into a
         :class:`TurnResponse`. Defensive against malformed output —
         falls back to a text block if the result doesn't fit either
         branch of the discriminated schema."""
         usd: float | None = float(cost_usd) if cost_usd is not None else None
+        observation = cost_observation or CostObservation.unknown(
+            route=route_identity_from_config(self.config),
+        )
         rtype = result.get("type")
         if rtype == "tool_call":
             name = result.get("tool_name")
@@ -5052,6 +5706,7 @@ class ClaudeCodeLLMProvider(LLMProvider):
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     cost_usd=usd,
+                    cost_observation=observation,
                 )
             # Malformed tool_call — surface the raw result as text so
             # callers can see what went wrong rather than silently
@@ -5062,6 +5717,7 @@ class ClaudeCodeLLMProvider(LLMProvider):
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 cost_usd=usd,
+                cost_observation=observation,
             )
         # Default to "complete" for type="complete" and any other
         # unexpected discriminator value.
@@ -5072,6 +5728,7 @@ class ClaudeCodeLLMProvider(LLMProvider):
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cost_usd=usd,
+            cost_observation=observation,
         )
 
 
@@ -5164,6 +5821,8 @@ def create_provider(config: ModelConfig) -> LLMProvider:
     Returns:
         LLMProvider instance
     """
+    from core.security.session_services import require_service_authorization
+    require_service_authorization("a standalone LLM provider")
     provider = config.provider.lower()
     if provider in (
         "claudecode-resumable",
@@ -5220,9 +5879,23 @@ def create_provider(config: ModelConfig) -> LLMProvider:
         # response unchanged.
         from core.llm.dispatcher.client import make_bedrock_client
         provider_instance = AnthropicProvider(config)
+        # __init__ built a dispatcher-routed Anthropic client
+        # (RAPTOR_LLM_SOCKET is guaranteed set on this path); close it
+        # when superseding, or every Bedrock provider construction
+        # leaks that client's httpx transport + renewal-side client
+        # (one fd each) until process exit.
+        superseded = getattr(provider_instance, "client", None)
         provider_instance.client = make_bedrock_client(
             api=api, timeout=config.timeout,
         )
+        if superseded is not None:
+            try:
+                superseded.close()
+            except Exception:  # noqa: BLE001 — cleanup must not fail construction
+                logger.debug(
+                    "Bedrock provider: superseded client close failed",
+                    exc_info=True,
+                )
         if api == "mantle":
             # Mantle streams natively; runtime (InvokeModel) has no
             # SSE surface, so its instructor leg stays on plain

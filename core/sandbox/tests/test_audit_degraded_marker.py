@@ -21,20 +21,14 @@ F063 tests are Linux-only (the silent-degrade paths only run inside the
 import ast
 import json
 import re
-import sys
 from pathlib import Path
 
 import pytest
 
-linux_only = pytest.mark.skipif(
-    sys.platform != "linux",
-    reason="F063 silent-degrade paths only run on the Linux _spawn backend",
-)
-
-macos_only = pytest.mark.skipif(
-    sys.platform != "darwin",
-    reason="F064 seatbelt log streamer only runs on macOS",
-)
+# F063 silent-degrade paths only run on the Linux _spawn backend and
+# F064's seatbelt log streamer only on macOS — real-kernel bindings, so
+# the tests carry the *_native markers (pytest.ini): honest skip on the
+# other native platform, deselected under the darwin-emulation gate.
 
 
 _SANDBOX_DIR = Path(__file__).resolve().parent.parent
@@ -103,7 +97,7 @@ def _read_marker(audit_run_dir: Path) -> dict:
     return json.loads(marker.read_text(encoding="utf-8"))
 
 
-@linux_only
+@pytest.mark.linux_native
 def test_f063a_no_seccomp_profile_writes_marker(tmp_path, monkeypatch):
     """audit_mode=True with seccomp_profile=None must write a marker
     naming the missing seccomp filter as the reason."""
@@ -134,7 +128,7 @@ def test_f063a_no_seccomp_profile_writes_marker(tmp_path, monkeypatch):
     assert "seccomp_profile=" in payload["instructions"]
 
 
-@linux_only
+@pytest.mark.linux_native
 def test_f063b_libseccomp_unavailable_writes_marker(tmp_path, monkeypatch):
     """audit_mode=True with libseccomp missing must write a marker
     naming the missing library."""
@@ -158,7 +152,7 @@ def test_f063b_libseccomp_unavailable_writes_marker(tmp_path, monkeypatch):
     assert "libseccomp2" in payload["instructions"]
 
 
-@linux_only
+@pytest.mark.linux_native
 def test_f063c_ptrace_blocked_writes_marker(tmp_path):
     """audit_mode=True with ptrace blocked must write a marker citing
     the Yama / cap-drop / AppArmor remediation path."""
@@ -299,7 +293,7 @@ def test_macos_spawn_streamer_marker_call_has_expected_keywords():
     )
 
 
-@macos_only
+@pytest.mark.darwin_native
 def test_f064_streamer_exception_writes_marker(tmp_path):
     """audit_mode=True on macOS with start_log_streamer() raising must
     write a marker naming the streamer-start failure."""

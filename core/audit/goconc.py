@@ -97,6 +97,8 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from core.source import read_text_capped
 from typing import Any, Iterator, Mapping
 
 logger = logging.getLogger(__name__)
@@ -175,9 +177,19 @@ def load_go_package(
     here — :func:`check_goroutine_isolation` decides membership from
     the parsed tree, where a comment or encoding quirk cannot fool it.
     """
+    from ._util import safe_join
+
     try:
-        anchor = Path(target_path) / rel_file
-        if anchor.suffix != ".go" or not anchor.is_file():
+        # rel_file arrives on outcome records (LLM-writable): confine
+        # the join — absolute discards target_path, ``..`` escapes it,
+        # and the sibling glob below would then sweep an arbitrary
+        # host directory into the witness. Refusal returns None ("no
+        # adjudication"), never a verdict. The sibling reads below
+        # deliberately stay containment-free (resolve-then-read):
+        # only the anchor entry is record-derived.
+        anchor = safe_join(Path(target_path), rel_file)
+        if anchor is None or anchor.suffix != ".go" \
+                or not anchor.is_file():
             return None
         siblings = sorted(anchor.parent.glob("*.go"))
     except OSError:
@@ -188,9 +200,21 @@ def load_go_package(
         if path.name.endswith("_test.go"):
             continue
         try:
-            text = _strip_bom(
-                path.read_text(encoding="utf-8", errors="strict"),
+            # Capped fd read (FIFO plants refuse instead of blocking;
+            # a single file over the package budget refuses like the
+            # cumulative check below). errors="strict" preserved: an
+            # undecodable file refuses the whole package, as before.
+            # resolve() first so a symlinked sibling (generated-tree
+            # layouts) keeps reading as it always did — the capped
+            # reader refuses final-component links by design. Stated
+            # traversal parity, not containment: this helper receives
+            # no target root to confine against.
+            got = read_text_capped(
+                path.resolve(), _MAX_PACKAGE_BYTES, errors="strict",
             )
+            if got is None or got[1]:
+                return None
+            text = _strip_bom(got[0])
         except (OSError, ValueError, UnicodeDecodeError):
             return None
         files[path.name] = text

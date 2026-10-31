@@ -27,6 +27,8 @@ from pathlib import Path
 from typing import Any
 
 from core.json import load_json, save_json
+from core.analysis.taint_approx import function_key
+from core.orchestration.llm_json import list_at
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +131,7 @@ def enrich_attack_paths(
     for path_entry in data:
         if not isinstance(path_entry, dict):
             continue
-        for step in path_entry.get("steps", []):
+        for step in list_at(path_entry, "steps"):
             if not isinstance(step, dict):
                 continue
             func = step.get("function", "")
@@ -137,9 +139,9 @@ def enrich_attack_paths(
             if not func:
                 continue
 
-            matched = constraint_index.get(f"{file_path}:{func}", [])
+            matched = constraint_index.get(function_key(file_path, func), [])
             if not matched:
-                matched = constraint_index.get(f":{func}", [])
+                matched = constraint_index.get(function_key("", func), [])
             if matched:
                 step["parameter_constraints"] = matched
                 enriched += 1
@@ -183,9 +185,9 @@ def _build_constraint_index(
             "violation": c.get("violation", ""),
         }
 
-        key = f"{file_path}:{func}"
+        key = function_key(file_path, func)
         index.setdefault(key, []).append(entry)
-        bare_key = f":{func}"
+        bare_key = function_key("", func)
         index.setdefault(bare_key, []).append(entry)
 
     return index
@@ -224,7 +226,9 @@ def normalize_audit_findings(findings: list[dict[str, Any]]) -> list[dict[str, A
             out.setdefault("origin", "audit_import")
 
         evidence_tool = out.get("evidence_tool", "")
-        tool_prefix = evidence_tool.split(":")[0] if evidence_tool else ""
+        tool_prefix = (evidence_tool.split(":")[0]
+                       if isinstance(evidence_tool, str) and evidence_tool
+                       else "")
         confidence = EVIDENCE_TOOL_CONFIDENCE.get(tool_prefix, "low")
         out.setdefault("confidence", confidence)
 
@@ -401,8 +405,12 @@ def load_summaries(audit_dir: Path) -> dict[str, Any]:
 
     data = load_json(path, max_bytes=_MAX_AUDIT_ARTIFACT_BYTES)
     if isinstance(data, list):
+        # function_key like every other join site in this module — a
+        # hand-built f-string here is byte-identical today but is the
+        # one-sided-drift shape the constructor exists to kill
+        # (enrich_with_summaries joins on function_key).
         return {
-            f"{s.get('file', '')}:{s.get('function', '')}": s
+            function_key(s.get("file", ""), s.get("function", "")): s
             for s in data if isinstance(s, dict)
         }
     if isinstance(data, dict):
@@ -512,7 +520,7 @@ def enrich_with_summaries(
     for path_entry in data:
         if not isinstance(path_entry, dict):
             continue
-        for step in path_entry.get("steps", []):
+        for step in list_at(path_entry, "steps"):
             if not isinstance(step, dict):
                 continue
             func = step.get("function", "")
@@ -520,7 +528,7 @@ def enrich_with_summaries(
             if not func:
                 continue
 
-            key = f"{file_path}:{func}"
+            key = function_key(file_path, func)
             summary = summaries.get(key)
             if not summary:
                 continue

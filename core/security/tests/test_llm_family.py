@@ -5,6 +5,9 @@ from __future__ import annotations
 from core.security.llm_family import (
     bare_model_id,
     family_of,
+    provider_of,
+    resolve_model_shorthand,
+    routing_model_id,
     same_family,
     select_cross_family_checker,
 )
@@ -25,9 +28,12 @@ def test_bare_model_id_peels_provider_prefix():
 def test_bare_model_id_peels_aggregator_then_provider():
     # ``together/anthropic/claude-haiku-4-5`` — aggregator + provider
     # both peel; the lookup in models.json sees just ``claude-haiku-4-5``.
-    assert bare_model_id("together/anthropic/claude-haiku-4-5") == "claude-haiku-4-5"
+    assert bare_model_id("apiroute/deepseek-v4.1-flash") == "deepseek-v4.1-flash"
+    assert bare_model_id("apiroute/anthropic/claude-haiku-4-5") == "claude-haiku-4-5"
+    assert bare_model_id("cheaperinference/gpt-5.4-mini") == "gpt-5.4-mini"
     assert bare_model_id("openrouter/openai/gpt-5") == "gpt-5"
     assert bare_model_id("orcarouter/openai/gpt-5") == "gpt-5"
+    assert bare_model_id("together/anthropic/claude-haiku-4-5") == "claude-haiku-4-5"
 
 
 def test_bare_model_id_leaves_unknown_prefixes_alone():
@@ -74,10 +80,61 @@ def test_meta_models_resolve_to_meta():
     assert family_of("meta-llama/Llama-3.1-8B") == "meta"
 
 
-def test_ollama_resolves_to_ollama():
-    assert family_of("ollama/llama3-8b") == "ollama"
-    assert family_of("ollama/qwen2.5-7b") == "ollama"
-    assert family_of("ollama/llama-3.1-8b") == "ollama"  # not meta
+def test_ollama_prefix_resolves_underlying_lineage():
+    # The provider prefix is peeled and the UNDERLYING model's lineage
+    # wins — so two models served through the same Ollama transport are
+    # still told apart by family (the cross-family guarantee depends on
+    # this). Previously every ``ollama/*`` collapsed to ``ollama``.
+    assert family_of("ollama/llama-3.1-8b") == "meta"
+    assert family_of("ollama/qwen3-27b") == "qwen"
+    assert family_of("ollama/deepseek-coder-v3") == "deepseek"
+
+
+def test_ollama_prefix_falls_back_to_transport_when_unknown():
+    # Only when the underlying model is itself unrecognised does the
+    # transport family stand.
+    assert family_of("ollama/some-local-finetune") == "ollama"
+
+
+def test_open_weight_lineages_resolve_distinctly():
+    assert family_of("qwen3-27b") == "qwen"
+    assert family_of("qwen2.5-coder") == "qwen"
+    assert family_of("deepseek-r1") == "deepseek"
+    assert family_of("deepseek-coder-v3") == "deepseek"
+    assert family_of("gemma-3-27b") == "google"   # Google's open line
+    assert family_of("yi-34b") == "yi"
+    assert family_of("phi-4") == "phi"
+    assert family_of("phi4") == "phi"  # digit-glued, no separator
+
+
+def test_aggregator_plus_provider_double_prefix():
+    """Aggregator strip + provider peel compose: together/ollama/qwen3
+    peels both layers and resolves the underlying lineage."""
+    assert family_of("together/ollama/qwen3-27b") == "qwen"
+    assert family_of("groq/ollama/deepseek-r1") == "deepseek"
+    assert family_of("openrouter/ollama/llama-3.1-8b") == "meta"
+
+
+def test_short_stems_require_separator():
+    """Short stems (o1/o3/o4) only match with a separator, not a
+    digit — ``o100`` is not an OpenAI model."""
+    assert family_of("o1-preview") == "openai"
+    assert family_of("o3-mini") == "openai"
+    assert family_of("o4-mini") == "openai"
+    assert family_of("o1") == "openai"
+    # Digit-glued short stems must NOT match.
+    assert family_of("o100-model") == "unknown"
+    assert family_of("o3000") == "unknown"
+
+
+def test_gpt_oss_is_openai_not_matched_as_bare_gpt():
+    # gpt-oss must resolve via its own stem (ordered before ``gpt``) —
+    # the point is it doesn't fall through to something else; it is
+    # OpenAI's open-weight line.
+    assert family_of("gpt-oss-20b") == "openai"
+    assert family_of("gpt-oss-120b") == "openai"
+    # the hosted API line still resolves too
+    assert family_of("gpt-5") == "openai"
 
 
 def test_mistral_family():
@@ -149,6 +206,33 @@ def test_select_skips_unknown_family_candidates():
         ["custom-model-xyz", "gemini-2.5-pro"],
     )
     assert pick == "gemini-2.5-pro"
+
+
+def test_select_open_weight_cross_family_by_lineage():
+    """Two distinct open lineages served through the same transport ARE
+    cross-family — a Qwen producer gets a DeepSeek/Llama checker. This is
+    the core of #969: previously everything collapsed to 'ollama' and no
+    checker could be chosen."""
+    pick = select_cross_family_checker(
+        "ollama/qwen3-27b",
+        ["ollama/qwen3-coder", "ollama/deepseek-coder-v3"],
+    )
+    assert pick == "ollama/deepseek-coder-v3"
+
+
+def test_select_open_weight_same_lineage_is_not_cross_family():
+    """A Qwen producer with only other Qwen candidates has no cross-family
+    option — returns None (and warns)."""
+    assert select_cross_family_checker(
+        "ollama/qwen3-27b",
+        ["ollama/qwen3-coder", "qwen2.5-7b"],
+    ) is None
+
+
+def test_open_weight_models_are_same_family_within_lineage():
+    assert same_family("ollama/qwen3-27b", "qwen2.5-coder") is True
+    assert same_family("ollama/qwen3-27b", "ollama/deepseek-coder") is False
+    assert same_family("deepseek-r1", "ollama/deepseek-coder-v3") is True
 
 
 def test_select_returns_none_when_no_cross_family_candidate():
@@ -567,13 +651,13 @@ class TestBedrockRouteForm:
 
     def test_provider_and_family(self):
         from core.security.llm_family import family_of, provider_of
-        assert provider_of("bedrock/anthropic.claude-mythos-5") == "bedrock"
-        assert family_of("bedrock/anthropic.claude-mythos-5") == "anthropic"
+        assert provider_of("bedrock/anthropic.claude-fable-5") == "bedrock"
+        assert family_of("bedrock/anthropic.claude-fable-5") == "anthropic"
 
     def test_bare_model_id_fully_peels(self):
         from core.security.llm_family import bare_model_id
         assert bare_model_id(
-            "bedrock/anthropic.claude-mythos-5") == "claude-mythos-5"
+            "bedrock/anthropic.claude-fable-5") == "claude-fable-5"
         assert bare_model_id(
             "bedrock/us.anthropic.claude-opus-4-7") == "claude-opus-4-7"
 
@@ -581,10 +665,85 @@ class TestBedrockRouteForm:
         # Bedrock model ids REQUIRE the vendor-dotted segment; the
         # wire-form helper peels only the route prefix. (A fully-bared
         # name sent to the SDK 403s — observed live when a resolved
-        # bedrock/ override synthesized model_name=claude-mythos-5.)
+        # bedrock/ override synthesized model_name=claude-fable-5.)
         from core.security.llm_family import routing_model_id
         assert routing_model_id(
-            "bedrock/anthropic.claude-mythos-5") == "anthropic.claude-mythos-5"
+            "bedrock/anthropic.claude-fable-5") == "anthropic.claude-fable-5"
         assert routing_model_id(
-            "anthropic.claude-mythos-5") == "anthropic.claude-mythos-5"
+            "anthropic.claude-fable-5") == "anthropic.claude-fable-5"
         assert routing_model_id("claude-haiku-4-5") == "claude-haiku-4-5"
+
+
+# --- iterated peel convergence (regional/aggregator chains) ---
+
+
+def test_family_of_converges_on_doubled_regional_prefix():
+    # The peel loop iterates until convergence: a router that stacks
+    # regional prefixes (region-of-region re-dispatch) still resolves.
+    # Regression shape: an iteration whose ONLY progress is the
+    # regional strip must count as progress, or the loop stops one
+    # peel short and the id degrades to "unknown".
+    assert family_of("us.eu.anthropic.claude-opus-4-6") == "anthropic"
+
+
+def test_provider_of_converges_on_doubled_regional_prefix():
+    assert provider_of("us.eu.anthropic.claude-opus-4-6") == "bedrock"
+
+
+def test_provider_of_resolves_bedrock_under_four_aggregators():
+    # Deep-but-bounded chains resolve: four aggregator peels plus the
+    # regional/provider peel fit inside the loop bound.
+    assert provider_of(
+        "together/groq/openrouter/fireworks/us.anthropic.claude-opus-4-6"
+    ) == "bedrock"
+
+
+def test_provider_of_bounds_pathological_nesting_at_five_peels():
+    # The peel loop is bounded to defend against adversarially nested
+    # ids: beyond five peels the id is treated as unresolvable (empty
+    # provider) rather than looping further. Both directions with the
+    # test above.
+    assert provider_of(
+        "together/groq/openrouter/fireworks/deepinfra/"
+        "us.anthropic.claude-opus-4-6"
+    ) == ""
+
+
+# --- routing_model_id peels ALL aggregator layers, keeps provider ---
+
+
+def test_routing_model_id_peels_chained_aggregators():
+    assert routing_model_id(
+        "together/openrouter/anthropic.claude-opus-4-6"
+    ) == "anthropic.claude-opus-4-6"
+
+
+def test_routing_model_id_keeps_unprefixed_ids():
+    assert routing_model_id("gpt-5") == "gpt-5"
+
+
+# --- bare_model_id provider-head peel strips exactly one segment ---
+
+
+def test_bare_model_id_provider_head_keeps_multi_segment_rest():
+    # ollama model paths carry their own slash ("ollama/library/llama3")
+    # — the provider-head peel removes the head segment only and the
+    # remainder passes through whole.
+    assert bare_model_id("ollama/library/llama3") == "library/llama3"
+
+
+# --- resolve_model_shorthand length floor ---
+
+
+def test_shorthand_three_chars_is_resolvable():
+    # The junk-id floor is "at least 3 characters" — real tier tokens
+    # ("gpt") sit exactly at it.
+    assert resolve_model_shorthand("gpt", ["gpt-5-mini"]) == "gpt-5-mini"
+
+
+def test_shorthand_two_chars_rejected():
+    assert resolve_model_shorthand("o3", ["o3-mini"]) is None
+
+
+def test_shorthand_pure_numeric_rejected():
+    assert resolve_model_shorthand("445", ["m-445-x"]) is None

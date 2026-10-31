@@ -235,6 +235,105 @@ class TestApplyJournalVerdictOverrides:
         out = _apply_journal_verdict_overrides(findings, audit_data)
         assert out == []
 
+    def test_benign_twin_site_never_drops_lined_finding(self):
+        # Same-named checklist items (prototype + body, macro twins)
+        # are distinct review subjects keyed per site. A clean verdict
+        # on the prototype at line 10 must not stand in for — let
+        # alone drop — the body's finding at line 50.
+        findings = [
+            {"file": "a.c", "function": "f1", "line": 50,
+             "status": "finding"},
+        ]
+        audit_data = {"functions_analysed": [
+            {"file": "a.c", "function": "f1", "status": "clean",
+             "line_start": 10, "line_end": 10},
+        ]}
+        out = _apply_journal_verdict_overrides(findings, audit_data)
+        assert len(out) == 1
+        assert out[0]["status"] == "finding"
+        assert "_verdict_source" not in out[0]
+
+    def test_lined_finding_binds_to_containing_site(self):
+        # Both sites reviewed; the benign prototype row appears LAST.
+        # The finding's line binds to the span that contains it, so
+        # the body's own verdict wins over any same-name row order.
+        findings = [
+            {"file": "a.c", "function": "f1", "line": 50,
+             "status": "suspicious"},
+        ]
+        audit_data = {"functions_analysed": [
+            {"file": "a.c", "function": "f1", "status": "finding",
+             "line_start": 40, "line_end": 60},
+            {"file": "a.c", "function": "f1", "status": "clean",
+             "line_start": 10, "line_end": 10},
+        ]}
+        out = _apply_journal_verdict_overrides(findings, audit_data)
+        assert len(out) == 1
+        assert out[0]["status"] == "finding"
+        assert out[0]["_verdict_source"] == "journal"
+
+    def test_same_site_rereview_to_clean_still_drops(self):
+        # The join must keep dropping genuinely refuted findings: a
+        # re-review of THE SAME site (span contains the finding's
+        # line) to clean retires the stale finding.
+        findings = [
+            {"file": "a.c", "function": "f1", "line": 50,
+             "status": "finding"},
+        ]
+        audit_data = {"functions_analysed": [
+            {"file": "a.c", "function": "f1", "status": "clean",
+             "line_start": 40, "line_end": 60},
+        ]}
+        out = _apply_journal_verdict_overrides(findings, audit_data)
+        assert out == []
+
+    def test_span_unknown_journal_rows_keep_coarse_join(self):
+        # Rows without site info (line_start 0/absent) cannot be told
+        # apart per site; when the name has no positioned row at all,
+        # the pre-site coarse join is preserved.
+        findings = [
+            {"file": "a.c", "function": "f1", "line": 50,
+             "status": "finding"},
+        ]
+        audit_data = {"functions_analysed": [
+            {"file": "a.c", "function": "f1", "status": "clean"},
+        ]}
+        out = _apply_journal_verdict_overrides(findings, audit_data)
+        assert out == []
+
+    def test_coarse_join_prefers_non_benign_over_last_wins(self):
+        # No line on the finding → coarse name-level join. With
+        # ambiguous same-name rows, a benign row must not win by mere
+        # list order and silently retire a live verdict.
+        findings = [
+            {"file": "a.c", "function": "f1", "status": "suspicious"},
+        ]
+        audit_data = {"functions_analysed": [
+            {"file": "a.c", "function": "f1", "status": "finding"},
+            {"file": "a.c", "function": "f1", "status": "clean"},
+        ]}
+        out = _apply_journal_verdict_overrides(findings, audit_data)
+        assert len(out) == 1
+        assert out[0]["status"] == "finding"
+        assert out[0]["_verdict_source"] == "journal"
+
+    def test_mechanical_rows_never_override(self):
+        # Post-loop mechanical echo rows are pattern-scan echoes, not
+        # LLM reviews — the same exclusion rule the reviewed-stats
+        # counting applies. They carry no verdict authority here.
+        findings = [
+            {"file": "a.c", "function": "f1", "line": 50,
+             "status": "finding"},
+        ]
+        audit_data = {"functions_analysed": [
+            {"file": "a.c", "function": "f1", "status": "clean",
+             "line_start": 40, "line_end": 60, "mechanical": True},
+        ]}
+        out = _apply_journal_verdict_overrides(findings, audit_data)
+        assert len(out) == 1
+        assert out[0]["status"] == "finding"
+        assert "_verdict_source" not in out[0]
+
 
 # ---------------------------------------------------------------------
 # Helpers

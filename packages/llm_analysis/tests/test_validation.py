@@ -24,6 +24,17 @@ class TestCheckSelfConsistency:
         assert flagged == 1
         assert "safe" in results["F1"]["contradictions"][0] or "no security impact" in results["F1"]["contradictions"][0]
 
+    def test_fullwidth_signal_spelling_still_flags(self):
+        # The signal patterns are ASCII; NFKC folding catches
+        # fullwidth/compatibility spellings of the same phrases.
+        results = {"F1": {
+            "is_true_positive": True, "is_exploitable": False,
+            "reasoning": "This is a \uff46\uff41\uff4c\uff53\uff45 \uff50\uff4f\uff53\uff49\uff54\uff49\uff56\uff45.",
+        }}
+        flagged = check_self_contradiction(results)
+        assert flagged == 1
+        assert results["F1"]["self_contradictory"] is True
+
     def test_no_flag_when_consistent(self):
         results = {"F1": {
             "is_true_positive": True, "is_exploitable": True,
@@ -32,6 +43,32 @@ class TestCheckSelfConsistency:
         flagged = check_self_contradiction(results)
         assert flagged == 0
         assert "self_contradictory" not in results["F1"]
+
+    def test_abstained_verdict_is_never_a_contradiction_side(self):
+        # A record MISSING is_true_positive (abstained — e.g. a
+        # response that failed schema validation upstream of the
+        # null-backfill) makes no verdict claim: a "false_positive"
+        # ruling or FP-flavoured reasoning cannot contradict a verdict
+        # that was never issued. Pre-fix the default-True read
+        # fabricated the True side and flagged it.
+        results = {"F1": {
+            "ruling": "false_positive",
+            "reasoning": "This is a false positive because the input is sanitized.",
+        }}
+        flagged = check_self_contradiction(results)
+        assert flagged == 0
+        assert "self_contradictory" not in results["F1"]
+
+    def test_explicit_true_verdict_still_flags(self):
+        # Two-direction: an EXPLICIT True verdict against an FP ruling
+        # remains a typed contradiction.
+        results = {"F1": {
+            "is_true_positive": True,
+            "ruling": "false_positive",
+            "reasoning": "",
+        }}
+        flagged = check_self_contradiction(results)
+        assert flagged == 1
 
     def test_skips_errors(self):
         results = {"F1": {"error": "timeout", "reasoning": "false positive"}}

@@ -31,6 +31,9 @@ from pathlib import Path
 from core.dataflow.adapters.codeql import from_sarif_result
 from core.dataflow.finding import Finding, Step
 from core.json import load_json
+from core.paths import confine
+from core.sarif.parser import SARIF_MAX_BYTES
+from core.source import read_text_capped
 from core.dataflow.label import (
     FP_MISSING_SANITIZER_MODEL,
     GroundTruth,
@@ -40,8 +43,9 @@ from core.dataflow.label import (
 from typing import TYPE_CHECKING
 
 # CodeQL SARIF over corpus code — the SARIF budget class shared with
-# core.sarif.parser.load_sarif.
-_MAX_SARIF_BYTES = 100 * 1024 * 1024
+# core.sarif.parser.load_sarif (one constant, aliased for the local
+# call sites).
+_MAX_SARIF_BYTES = SARIF_MAX_BYTES
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -115,16 +119,14 @@ def _rewrite_finding_paths_and_snippets(
     line_cache: dict[Path, list[str]] = {}
 
     def _read_line(rel_path: str, line: int) -> str | None:
-        full = (repo_root / rel_path).resolve()
-        if not full.is_relative_to(repo_root.resolve()):
+        full = confine(repo_root, rel_path)
+        if full is None:
             return None
         if full not in line_cache:
-            try:
-                line_cache[full] = full.read_text(
-                    encoding="utf-8", errors="replace",
-                ).splitlines()
-            except OSError:
-                line_cache[full] = []
+            # Capped read: SARIF-named paths into the benchmark clone;
+            # a snippet past the cap just stays empty (no-signal).
+            got = read_text_capped(full)
+            line_cache[full] = got[0].splitlines() if got is not None else []
         lines = line_cache[full]
         if 1 <= line <= len(lines):
             return lines[line - 1].strip()
@@ -164,8 +166,11 @@ def _balance_subsample(
     n_fp = min(len(fps), target - n_tp)
     n_tp = min(len(tps), target - n_fp)
     rng = random.Random(seed)
-    chosen_tps = rng.sample(tps, n_tp) if n_tp <= len(tps) else tps
-    chosen_fps = rng.sample(fps, n_fp) if n_fp <= len(fps) else fps
+    # n_tp / n_fp are min()-clamped above, so sample() can never be
+    # asked for more than the population (the old conditional's else
+    # arms were unreachable).
+    chosen_tps = rng.sample(tps, n_tp)
+    chosen_fps = rng.sample(fps, n_fp)
     chosen = chosen_tps + chosen_fps
     chosen.sort(key=lambda x: x[0].finding_id)
     return chosen

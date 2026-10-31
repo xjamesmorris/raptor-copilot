@@ -98,18 +98,48 @@ def _resolve_output(target_path: Path, output: Path | None) -> tuple[str, str | 
     target tree a writable bind — a hostile target could rewrite the
     scanned repo. An explicit ``output`` that resolves (realpath) to
     the target is refused for the same reason.
+
+    The RESOLVED path is what gets returned: the guard compares
+    realpaths, so the mount must consume exactly the path that was
+    vetted — returning the raw argument would let a symlink swapped
+    between check and use (or a dangling link) re-route the rw bind
+    to a location the guard never saw.
     """
     if output is None:
         owned = tempfile.mkdtemp(prefix="raptor-host-out-")
         return owned, owned
-    if os.path.realpath(os.fspath(output)) == os.path.realpath(
-            str(target_path)):
+    _out_real = os.path.realpath(os.fspath(output))
+    _tgt_real = os.path.realpath(str(target_path))
+    # Refuse BOTH nesting directions, not just equality — the path
+    # relation enumeration is {equal, output-under-target,
+    # target-under-output} and every element defeats the ro contract:
+    # - output under target lands the rw output bind INSIDE the
+    #   target tree, handing a spawned hostile target a writable
+    #   window back into the scanned repo;
+    # - target under output is subtler: the mount-ns setup binds the
+    #   target ro FIRST, then binds the output rw ON TOP of it (the
+    #   ancestor mount shadows the target's ro bind), and Landlock's
+    #   writable grant on output is a subtree grant covering the
+    #   target too — the ro remount succeeds and is then silently
+    #   shadowed, so neither layer holds.
+    if _out_real == _tgt_real or _out_real.startswith(
+            _tgt_real.rstrip("/") + "/"):
         raise ValueError(
-            f"output {str(output)!r} resolves to the target directory "
-            f"{target_path} — the target tree must stay read-only "
-            f"inside the sandbox; choose a distinct output directory"
+            f"output {str(output)!r} resolves into the target "
+            f"directory {target_path} — the target tree must stay "
+            f"read-only inside the sandbox; choose a distinct output "
+            f"directory outside it"
         )
-    return os.fspath(output), None
+    if _tgt_real.startswith(_out_real.rstrip("/") + "/"):
+        raise ValueError(
+            f"output {str(output)!r} resolves to an ancestor of the "
+            f"target directory {target_path} — its rw bind would "
+            f"shadow the target's read-only bind and its Landlock "
+            f"grant would cover the target subtree; the target tree "
+            f"must stay read-only inside the sandbox; choose a "
+            f"distinct output directory that does not contain it"
+        )
+    return _out_real, None
 
 
 def _resolve_daemon_script() -> Path:
@@ -326,7 +356,7 @@ class SandboxHost:
         if getattr(self, "_owned_output", None):
             # Default-output scratch dir this host created; removed
             # after the worker released the sandbox that bound it.
-            shutil.rmtree(self._owned_output, ignore_errors=True)
+            shutil.rmtree(self._owned_output, ignore_errors=True)  # type: ignore[arg-type]
             self._owned_output = None
 
     # ------------------------------------------------------------------
@@ -434,8 +464,17 @@ class SandboxHost:
     def _write_frame(self, payload: dict) -> None:
         body = json.dumps(payload).encode("utf-8")
         hdr = struct.pack("!I", len(body))
+        # Write ALL the bytes: os.write can return a partial count on
+        # a >PIPE_BUF frame (spawn requests embed unbounded caller
+        # stdin_hex) when a signal lands after a partial transfer —
+        # PEP 475 only retries zero-progress EINTR. A truncated frame
+        # desynchronises the persistent channel: the daemon parses
+        # the next request from mid-frame bytes.
+        view = memoryview(hdr + body)
         try:
-            os.write(self._write_fd, hdr + body)
+            while view:
+                n = os.write(self._write_fd, view)
+                view = view[n:]
         except OSError as e:
             msg = f"write to daemon failed: {e}"
             raise HostRPCError(msg) from e

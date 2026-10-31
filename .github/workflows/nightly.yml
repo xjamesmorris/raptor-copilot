@@ -1,9 +1,15 @@
 name: Nightly (slow + integration)
 
 # The `slow` and `integration` markers are deselected by default in
-# pytest.ini (`addopts = -m "not integration and not slow"`), so these
-# tests run NOWHERE in the per-PR / per-push test matrix. This workflow
-# is the only place they execute in CI.
+# pytest.ini (`addopts = -m "not integration and not slow"`), so most
+# of these tests run NOWHERE in the per-PR / per-push test matrix and
+# this workflow is their only CI execution. One carve-out: the
+# core/sandbox + packages/exploit_feasibility slow/integration subset
+# ALSO runs in tests.yml on gated PRs — the sandbox job carries the
+# combined tier, the exploit-feasibility job a package-scoped mirror
+# for PRs that fire only its own filter (a sandbox regression once sat
+# in this nightly-only window for days) — this workflow remains the
+# full-repo, unfiltered pass over both markers.
 #
 #   * slow        — perf baselines + sandbox-setup-heavy resolver tests
 #                   (deterministic; a failure is a real regression).
@@ -58,9 +64,7 @@ jobs:
         # untrusted-run fresh-procfs contract correctly refuses the
         # host-procfs-visible fallback and every untrusted-target test
         # fails at setup.
-        run: |
-          sudo apt-get install -y --no-install-recommends uidmap
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        uses: ./.github/actions/enable-userns
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -68,40 +72,91 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
         with:
           enable-cache: true
-          cache-dependency-glob: "requirements*.txt"
+          cache-dependency-glob: "uv.lock"
 
-      - name: Create venv and install deps
-        run: |
-          uv venv $VENV_PATH
-          source $VENV_PATH/bin/activate
-          uv pip install -r requirements-dev.txt
-          # semgrep is deliberately NOT a requirements dep (optional
-          # tool, same as radare2/LLVM below), but the audit-pipeline
-          # slow tests exercise real sweeps: G2's receipt gate demands
-          # an EXECUTED confirmed sweep, so without the binary those
-          # tests can only skip. Installed here so the nightly keeps
-          # covering the sweep → record → report → feedback chain.
-          uv pip install semgrep==1.172.0
-          # Grammar wheels: grammar-dependent tests skip-with-reason
-          # where these are absent (every PR tier), which means the
-          # span-accurate detection paths were never exercised in CI
-          # at all. The nightly installs them so that family runs
-          # somewhere, same rationale as semgrep above.
-          uv pip install -r requirements-grammars.txt
+      # Grammars-flavoured venv (dev deps + grammar wheels, an
+      # optional-dependency group in pyproject.toml, locked in uv.lock)
+      # under its own cache-key prefix so a prefix-match restore never
+      # hands this job the plain venv that lacks the grammar wheels.
+      # save-on-rebuild: no other job saves this flavour, so the
+      # rebuild cost is paid once per uv.lock change instead of nightly.
+      - name: Restore or rebuild venv (with grammars)
+        uses: ./.github/actions/setup-venv
+        with:
+          cache-key-prefix: venv-grammars
+          uv-export-extra-args: --extra grammars
+          save-on-rebuild: 'true'
+
+      - name: Install semgrep
+        # semgrep is deliberately NOT a pyproject.toml dep (optional
+        # tool, same as radare2/LLVM below), but the audit-pipeline
+        # slow tests exercise real sweeps: G2's receipt gate demands
+        # an EXECUTED confirmed sweep, so without the binary those
+        # tests can only skip. Installed here so the nightly keeps
+        # covering the sweep → record → report → feedback chain.
+        run: uv tool install semgrep==1.177.0
+
+      # The toolchain .debs are cached so the warm path installs from
+      # local files instead of round-tripping apt.llvm.org every night
+      # (the install step's most outage-prone leg). The key carries no
+      # package-version component — a cached LLVM 21.x point release is
+      # fine for these test families; bump the -v1 suffix to force a
+      # refresh.
+      - name: Restore apt toolchain cache (radare2 + LLVM 21 .debs)
+        id: apt-debs
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # was v6.1.0
+        with:
+          path: ${{ runner.temp }}/apt-debs
+          key: apt-debs-${{ runner.os }}-llvm21-radare2-v1
 
       - name: Install binary-analysis toolchain (radare2 + LLVM 21)
+        # continue-on-error so a transient apt/LLVM mirror outage doesn't
+        # abort the whole nightly before the (toolchain-independent) test
+        # families run; the "Refuse a toolchain-less..." step below still
+        # reddens the RUN afterwards so the outage can't silently convert
+        # the r2/llvm families into permanent skips (same rationale as
+        # weekly_corpus.yml's all-skipped guard).
+        id: toolchain
         continue-on-error: true
+        env:
+          DEBS_DIR: ${{ runner.temp }}/apt-debs
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends radare2
-          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
-          chmod +x /tmp/llvm.sh
-          sudo /tmp/llvm.sh 21
-          sudo apt-get install -y --no-install-recommends llvm-21 clang-21
+          if ls "$DEBS_DIR"/*.deb >/dev/null 2>&1; then
+            # Warm path: install straight from the cached .debs — no
+            # network. dpkg resolves inter-deb ordering itself; a
+            # dependency that left the runner image since the cache
+            # was cut is mopped up from the network by ``apt-get -f``,
+            # and the refuse step below still guards the end state.
+            sudo dpkg -i "$DEBS_DIR"/*.deb \
+              || sudo apt-get install -f -y --no-install-recommends
+          else
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends radare2
+            wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+            chmod +x /tmp/llvm.sh
+            sudo /tmp/llvm.sh 21
+            sudo apt-get install -y --no-install-recommends llvm-21 clang-21
+            # Capture this run's full apt transaction closure as .debs
+            # for the cache: on a fresh runner the history log holds
+            # only this job's installs, and --reinstall --download-only
+            # fetches exactly those packages (dependencies included)
+            # without touching the installed state.
+            mkdir -p "$DEBS_DIR/partial"
+            # Entries in the log line look like ``name:arch (version,
+            # automatic)`` — match on the ``name:arch (`` shape so the
+            # comma inside the parens can't leak stray tokens.
+            pkgs=$(sed -n 's/^Install: //p' /var/log/apt/history.log \
+                     | grep -oE '[A-Za-z0-9][A-Za-z0-9.+-]*:[a-z0-9-]+ \(' \
+                     | sed 's/:.*//' | sort -u)
+            [ -n "$pkgs" ]
+            sudo apt-get install -y --reinstall --download-only \
+              -o Dir::Cache::archives="$DEBS_DIR" $pkgs
+            sudo rm -rf "$DEBS_DIR/partial"
+          fi
           sudo update-alternatives --install /usr/bin/clang clang \
             /usr/bin/clang-21 100
           sudo update-alternatives --install /usr/bin/clang++ clang++ \
@@ -111,6 +166,20 @@ jobs:
           clang --version || true
           /usr/lib/llvm-21/bin/llvm-cov --version || true
           /usr/lib/llvm-21/bin/llvm-profdata --version || true
+
+      # Explicit save (not actions/cache's implicit post-job save) so a
+      # partial download from a failed cold path can never be cached:
+      # only a fully successful install step banks its .debs.
+      - name: Save apt toolchain cache
+        # continue-on-error: a transient tar/cache-service failure must
+        # not abort the nightly before tests run — the next cold run
+        # rebuilds and retries the save.
+        continue-on-error: true
+        if: steps.apt-debs.outputs.cache-hit != 'true' && steps.toolchain.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # was v6.1.0
+        with:
+          path: ${{ runner.temp }}/apt-debs
+          key: apt-debs-${{ runner.os }}-llvm21-radare2-v1
 
       # RAPTOR_MAX_SESSION_SECONDS: tier wallclock tripwire (root
       # conftest) — flags the session with a named summary when the
@@ -130,7 +199,16 @@ jobs:
           # .github test dirs included for their slow-marked
           # whole-repo import-graph classes (excluded from ci-lint's
           # bounded PR job by the default addopts marker filter).
-          python -m pytest -m slow core packages .github/tests .github/scripts/tests -q --durations=25
+          python -m pytest -m slow core packages engine .github/tests .github/scripts/tests -q --durations=25 \
+            --junitxml="$RUNNER_TEMP/slow.xml"
+
+      # Full-collection lane, so --full: a count below the recorded
+      # one is stale headroom worth a warning, not a filtered subset.
+      - name: Check slow-lane skip count against its recorded budget
+        run: |
+          python3 .github/scripts/check_skip_budget.py \
+            --lane nightly-slow --full \
+            --junit-xml "$RUNNER_TEMP/slow.xml"
 
       - name: Run integration tests (retry once on external outage)
         env:
@@ -138,7 +216,7 @@ jobs:
         run: |
           source $VENV_PATH/bin/activate
           rc=0
-          python -m pytest -m integration core packages --durations=25 \
+          python -m pytest -m integration core packages engine --durations=25 \
             --tb=short --junitxml="$RUNNER_TEMP/integration-attempt-1.xml" \
             || rc=$?
           if [ "$rc" -eq 0 ]; then
@@ -148,12 +226,50 @@ jobs:
           echo "::warning::Integration tests failed (exit $rc) — retrying in 60s"
           echo ""
           sleep 60
-          python -m pytest -m integration core packages --durations=25 \
+          python -m pytest -m integration core packages engine --durations=25 \
             --tb=short --junitxml="$RUNNER_TEMP/integration-attempt-2.xml"
+
+      # Budget over the attempt that produced the green: attempt 2
+      # exists only when attempt 1 failed and was retried.
+      - name: Check integration skip count against its recorded budget
+        run: |
+          xml="$RUNNER_TEMP/integration-attempt-2.xml"
+          [ -f "$xml" ] || xml="$RUNNER_TEMP/integration-attempt-1.xml"
+          python3 .github/scripts/check_skip_budget.py \
+            --lane nightly-integration --full \
+            --junit-xml "$xml"
+
+      # Backstop for the continue-on-error toolchain install above: the
+      # r2 / llvm-cov test families skip-with-reason when their binaries
+      # are absent, so a persistently broken install would read as a
+      # green nightly with those families never executing. Verify the
+      # tools actually landed and fail the run with a named reason if
+      # not. Runs AFTER the test steps (and even when they failed) so
+      # the toolchain-independent signal is still collected either way.
+      # Trade-off both ways: checking earlier would save the ~30 min of
+      # tests on a broken mirror day but would also discard the healthy
+      # families' signal; checking here keeps the signal and still
+      # refuses the silent-skip rot.
+      - name: Refuse a toolchain-less binary-analysis nightly
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          missing=""
+          command -v r2 >/dev/null 2>&1 || missing="$missing radare2"
+          /usr/lib/llvm-21/bin/llvm-cov --version >/dev/null 2>&1 \
+            || missing="$missing llvm-21"
+          if [ -n "$missing" ]; then
+            echo "::error::binary-analysis toolchain missing:${missing} —" \
+              "the r2/llvm test families above can only skip, so this" \
+              "nightly produced no binary-analysis signal. Check the" \
+              "toolchain install step's log."
+            exit 1
+          fi
+          echo "Toolchain present: r2 + llvm-21."
 
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: nightly-slow-integration-results
           path: ${{ runner.temp }}/integration-attempt-*.xml

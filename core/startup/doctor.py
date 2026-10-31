@@ -193,6 +193,66 @@ def _module_dep_warnings() -> list[str]:
     return out
 
 
+def _frontend_readiness(
+    *,
+    search_path: str | None = None,
+) -> tuple[list[str], list[str]]:
+    """Return launch-readiness passes and actionable frontend warnings.
+
+    The startup banner reports the selected frontend but does not inspect every
+    installed frontend. Doctor is explicitly diagnostic, so it checks both
+    supported hosts without executing either one. This catches an upstream-
+    supported Copilot npm loader that RAPTOR must refuse because the live host
+    contract requires a directly identifiable native Linux executable.
+    """
+    from .host import FrontendLaunchState, FrontendPreparation, prepare_frontend
+
+    passes: list[str] = []
+    warnings: list[str] = []
+    ready = 0
+    gated: list[tuple[str, str, FrontendPreparation]] = []
+    for name, label in (
+        ("claude", "Claude Code"),
+        ("copilot", "GitHub Copilot CLI"),
+    ):
+        preparation = prepare_frontend(name, search_path=search_path)
+        if preparation.launch_state is FrontendLaunchState.READY:
+            ready += 1
+            passes.append(
+                f"{label} frontend ready: {preparation.executable}"
+            )
+            continue
+        if not preparation.installed:
+            continue
+        gated.append((name, label, preparation))
+
+    for name, label, preparation in gated:
+        reason = (
+            preparation.reason
+            or "frontend launch contract is not met"
+        )
+        if name == "copilot":
+            if sys.platform == "linux":
+                warnings.append(
+                    f"{label} is installed at {preparation.executable} but "
+                    f"RAPTOR cannot launch it: {reason}; install the native "
+                    "Linux CLI with "
+                    "`curl -fsSL https://gh.io/copilot-install | bash`"
+                )
+            elif ready == 0:
+                warnings.append(
+                    f"{label} is installed but RAPTOR's Copilot frontend "
+                    "currently requires native Linux; install Claude Code "
+                    "or use standalone RAPTOR commands on this platform"
+                )
+        else:
+            warnings.append(
+                f"{label} is installed at {preparation.executable} but RAPTOR "
+                f"cannot launch it: {reason}"
+            )
+    return passes, warnings
+
+
 # Bounded-scan caps for the imported-annotation advisory sweep. Doctor
 # is on-demand, but a project output dir can hold arbitrarily many runs
 # and notes — the sweep reads at most this much before reporting what
@@ -366,7 +426,7 @@ def _gather() -> tuple[
     str | None,           # project_line
     list[str],               # advisories
 ]:
-    """Run every check and return the same shape ``init.main`` builds.
+    """Run startup checks and return doctor-rendering inputs.
 
     Silences logging like ``init.main`` does — these checks are
     noisy at WARNING level (LLM key validation, sandbox probes).
@@ -374,6 +434,7 @@ def _gather() -> tuple[
     from .init import (
         check_active_project,
         check_env,
+        check_frontend,
         check_lang,
         check_llm,
         check_tools,
@@ -391,6 +452,12 @@ def _gather() -> tuple[
         tool_warnings = list(tool_warnings) + _module_dep_warnings()
         llm_lines, llm_warnings = check_llm()
         env_parts, env_warnings = check_env(unavailable)
+        frontend_status = check_frontend()
+        if frontend_status:
+            env_parts = [*env_parts, f"frontend {frontend_status}"]
+        frontend_passes, frontend_warnings = _frontend_readiness()
+        env_parts = [*env_parts, *frontend_passes]
+        env_warnings = [*env_warnings, *frontend_warnings]
         lang_line, lang_warnings = check_lang()
         env_warnings = list(env_warnings) + list(lang_warnings)
         # Doctor-only depth (same rationale shape as the module-import
@@ -448,7 +515,7 @@ def _render(
       * Anything in a ``*_warnings`` list is a warning.
     """
     failures: list[str] = []
-    warnings: list[str] = []
+    warnings: list[str | tuple[str, str]] = []
     passes: list[str] = []
 
     # Tools — single line summary of present/missing, then individual
@@ -539,17 +606,17 @@ def _render(
     if warnings:
         out.append("")
         out.append("WARNINGS:")
-        for w in warnings:
+        for entry in warnings:
             # Tuple-marked continuation lines (currently just
             # install hints) get a continuation prefix instead of
             # the warning bullet, so the operator reads them as a
             # follow-up to the prior warning.
-            if isinstance(w, tuple) and len(w) == 2 and w[0] == "hint":
+            if isinstance(entry, tuple):
                 out.append(
-                    f"      hint: {escape_nonprintable(w[1])}"
+                    f"      hint: {escape_nonprintable(entry[1])}"
                 )
             else:
-                out.append(f"  ! {escape_nonprintable(w)}")
+                out.append(f"  ! {escape_nonprintable(entry)}")
 
     advisory_lines = [a for a in advisories if a]
     if advisory_lines:
@@ -572,8 +639,8 @@ def _render(
     # Continuation entries (install-hint tuples) don't count as
     # warnings — only the real warning bullets do.
     real_warnings = sum(
-        1 for w in warnings
-        if not (isinstance(w, tuple) and w and w[0] == "hint")
+        1 for ww in warnings
+        if not (isinstance(ww, tuple) and ww and ww[0] == "hint")
     )
     out.append(
         f"Summary: {len(failures)} failure(s), "

@@ -22,6 +22,10 @@ _CASES = [
      ["--op", "+", "--operand", "a", "--operand", "b"]),
     ("raptor-smt-check-null-deref", ["--ptr", "p"]),
     ("raptor-smt-check-negative-bypass", ["--value", "v", "--limit", "10"]),
+    ("raptor-smt-check-overflow-to-oob",
+     ["--count", "n", "--element-size", "sz", "--index", "i"]),
+    ("raptor-smt-check-encoding-residual",
+     ["--transfer", '{"escaped": ["\\""]}', "--grammar", "quoted-string"]),
 ]
 
 

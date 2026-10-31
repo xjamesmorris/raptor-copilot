@@ -25,11 +25,13 @@ from pathlib import Path
 from core.dataflow.codeql_augmented_run import DEFAULT_CODEQL_BIN, RunnerFn, analyze
 from core.dataflow.cvefix_corpus_generator import generate_from_sarif, write_corpus
 from core.json import load_json
+from core.sarif.parser import SARIF_MAX_BYTES
 from typing import TYPE_CHECKING
 
 # CodeQL SARIF over corpus code — the SARIF budget class shared with
-# core.sarif.parser.load_sarif.
-_MAX_SARIF_BYTES = 100 * 1024 * 1024
+# core.sarif.parser.load_sarif (one constant, aliased for the local
+# call sites).
+_MAX_SARIF_BYTES = SARIF_MAX_BYTES
 
 if TYPE_CHECKING:
     from core.dataflow.label import GroundTruth

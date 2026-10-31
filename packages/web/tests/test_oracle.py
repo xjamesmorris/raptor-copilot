@@ -179,3 +179,133 @@ class TestUnknownClass:
         result = oracle.verify("http://t/", "q", "x", "nosuchclass")
         assert result.status == INCONCLUSIVE
         assert oracle.requests_used == 0
+
+
+class _FormServerClient:
+    """Simulates a CSRF-protected multi-field form endpoint.
+
+    Server-side validation rejects any request missing the csrf token
+    or the required sibling field BEFORE the fuzzed value reaches the
+    injectable sink — the shape that demoted every multi-field form
+    hit to inconclusive when replay sent the fuzzed field alone.
+    """
+
+    reveal_secrets = False
+
+    def __init__(self):
+        self.requests: list[dict] = []
+
+    def _respond(self, values):
+        self.requests.append(dict(values))
+        if values.get("csrf") != "tok123" or "email" not in values:
+            return _Resp("<html>form validation failed</html>", 400)
+        if "OR 1=1" in values.get("q", ""):
+            return _Resp(SQL_ERROR, 500)
+        return _Resp(CLEAN)
+
+    def post(self, url, data=None, **kw):
+        return self._respond(data or {})
+
+    def get(self, url, params=None, **kw):
+        return self._respond(params or {})
+
+
+class TestSiblingFormFields:
+    PAYLOAD = "' OR 1=1--"
+    BASE = {"csrf": "tok123", "email": "a@example.invalid", "q": "hello"}
+
+    def test_replay_carries_siblings_and_confirms(self):
+        client = _FormServerClient()
+        result = VerificationOracle(client).verify(
+            "http://t/search", "q", self.PAYLOAD, "sqli",
+            method="POST", base_data=self.BASE)
+        assert result.status == VERIFIED
+        # Every leg (replay + both controls) rode the full field set.
+        assert len(client.requests) == 3
+        for sent in client.requests:
+            assert sent["csrf"] == "tok123"
+            assert sent["email"] == "a@example.invalid"
+        # The fuzzed field is REPLACED in the payload leg, and the
+        # control legs substitute the control value into that field.
+        assert client.requests[0]["q"] == self.PAYLOAD
+        assert client.requests[1]["q"] == client.requests[2]["q"]
+        assert client.requests[1]["q"].startswith("raptorcanary")
+
+    def test_siblings_ride_get_replays_too(self):
+        client = _FormServerClient()
+        result = VerificationOracle(client).verify(
+            "http://t/search", "q", self.PAYLOAD, "sqli",
+            method="GET", base_data=self.BASE)
+        assert result.status == VERIFIED
+        assert all(r["csrf"] == "tok123" for r in client.requests)
+
+    def test_without_siblings_form_hit_stays_inconclusive(self):
+        # The pre-carry failure mode: bare {param: value} replays fail
+        # server-side validation on every leg — no marker anywhere, so
+        # the verdict degrades instead of confirming.
+        client = _FormServerClient()
+        result = VerificationOracle(client).verify(
+            "http://t/search", "q", self.PAYLOAD, "sqli", method="POST")
+        assert result.status == INCONCLUSIVE
+
+
+class _UrlRecordingClient:
+    """Records the exact URL + params/data of every request."""
+
+    reveal_secrets = False
+
+    def __init__(self):
+        self.calls = []
+
+    def get(self, url, params=None, **kw):
+        self.calls.append(("GET", url, dict(params or {})))
+        return _Resp(CLEAN)
+
+    def post(self, url, data=None, **kw):
+        self.calls.append(("POST", url, dict(data or {})))
+        return _Resp(CLEAN)
+
+
+class TestProbeQueryDeduplication:
+    """The recorded hit URL is the PRE-injection URL and commonly
+    already carries the fuzzed parameter; requests appends ``params=``
+    to the existing query, so pre-fix every replay/control leg sent
+    ``?id=1&id=<probe>`` and first-occurrence-wins frameworks never
+    saw the probed value — real query-vector hits demoted to
+    inconclusive."""
+
+    def test_fuzzed_param_stripped_from_recorded_url(self):
+        client = _UrlRecordingClient()
+        VerificationOracle(client)._probe(
+            "http://t/page.php?id=1&keep=x", "id", "PROBE", "GET")
+        _, url, params = client.calls[0]
+        assert "id=" not in url
+        assert "keep=x" in url
+        assert params == {"id": "PROBE"}
+
+    def test_base_data_keys_stripped_from_recorded_url(self):
+        client = _UrlRecordingClient()
+        VerificationOracle(client)._probe(
+            "http://t/f?q=a&csrf=old&other=1", "q", "PROBE", "GET",
+            base_data={"csrf": "tok"})
+        _, url, params = client.calls[0]
+        assert "q=" not in url and "csrf=old" not in url
+        assert "other=1" in url
+        assert params == {"q": "PROBE", "csrf": "tok"}
+
+    def test_url_without_query_passes_through(self):
+        client = _UrlRecordingClient()
+        VerificationOracle(client)._probe(
+            "http://t/search", "q", "PROBE", "GET")
+        _, url, _ = client.calls[0]
+        assert url == "http://t/search"
+
+    def test_post_body_never_rewrites_the_url(self):
+        # POST data cannot duplicate into the query string; the form
+        # action URL is replayed exactly as detected.
+        client = _UrlRecordingClient()
+        VerificationOracle(client)._probe(
+            "http://t/f?stage=2", "q", "PROBE", "POST")
+        _, url, data = client.calls[0]
+        assert url == "http://t/f?stage=2"
+        assert data == {"q": "PROBE"}

@@ -80,6 +80,71 @@ def test_cargo_symbol_map_filters_by_prefix():
     assert out["Cargo:serde@1.0.0"] == ["serde.from_str"]
 
 
+_RUSTSEC_ADV = _Adv(ecosystem_specific={
+    # Real RustSec OSV export shape (RUSTSEC-2021-0003): per-function
+    # data lives under ``affects.functions`` as fully-qualified
+    # ``crate::Type::method`` strings; the flat key is present but
+    # null.
+    "affected_functions": None,
+    "affects": {
+        "functions": ["smallvec::SmallVec::insert_many"],
+        "arch": [], "os": [],
+    },
+})
+
+
+def test_cargo_rustsec_affects_called_not_downgraded(tmp_path: Path):
+    """A RustSec-convention advisory whose affected function the
+    project genuinely calls must land on ``likely_called`` through
+    the REAL producer (build → refine). Pre-fix the tier read only
+    ``imports[]`` / flat lists, so the dominant Rust producer's
+    shape extracted nothing and the tier silently no-oped."""
+    from packages.sca.reachability.cargo_function_level import (
+        build_cargo_symbol_map,
+        refine_cargo_verdicts,
+    )
+    smap = build_cargo_symbol_map([
+        _OsvResult(dep_key="Cargo:smallvec@1.6.0",
+                   advisories=[_RUSTSEC_ADV]),
+    ])
+    assert smap == {
+        "Cargo:smallvec@1.6.0": ["smallvec.SmallVec.insert_many"],
+    }
+    (tmp_path / "main.rs").write_text(
+        "use smallvec::SmallVec;\n"
+        "fn main() { SmallVec::insert_many(v); }\n"
+    )
+    deps = [_dep("smallvec", "1.6.0", "Cargo")]
+    out: Dict[str, Reachability] = {deps[0].key(): _imported()}
+    refine_cargo_verdicts(
+        deps, out, target=tmp_path, cargo_symbol_map=smap,
+    )
+    assert out[deps[0].key()].verdict == "likely_called"
+
+
+def test_cargo_rustsec_affects_uncalled_downgrades(tmp_path: Path):
+    """Counter-direction: the RustSec shape must feed the suppression
+    arm too — an uncalled affected function still downgrades."""
+    from packages.sca.reachability.cargo_function_level import (
+        build_cargo_symbol_map,
+        refine_cargo_verdicts,
+    )
+    smap = build_cargo_symbol_map([
+        _OsvResult(dep_key="Cargo:smallvec@1.6.0",
+                   advisories=[_RUSTSEC_ADV]),
+    ])
+    (tmp_path / "main.rs").write_text(
+        "use smallvec::SmallVec;\n"
+        "fn main() { SmallVec::with_capacity(4); }\n"
+    )
+    deps = [_dep("smallvec", "1.6.0", "Cargo")]
+    out: Dict[str, Reachability] = {deps[0].key(): _imported()}
+    refine_cargo_verdicts(
+        deps, out, target=tmp_path, cargo_symbol_map=smap,
+    )
+    assert out[deps[0].key()].verdict == "not_function_reachable"
+
+
 def test_cargo_refine_likely_called(tmp_path: Path):
     from packages.sca.reachability.cargo_function_level import (
         refine_cargo_verdicts,
@@ -289,10 +354,12 @@ def test_nuget_refine_likely_called_explicit_class_alias(tmp_path: Path):
 
 
 def test_nuget_bare_namespace_using_preserves_imported(tmp_path: Path):
-    """Bare ``using Namespace`` shape — chain head ``JsonConvert``
-    isn't bound (only ``Json`` is, mapping to ``Newtonsoft.Json``),
-    so the function-level match doesn't fire. Verdict stays at
-    the prior tier's value rather than incorrectly downgrading."""
+    """Bare ``using Namespace`` shape — the DOMINANT C# import
+    shape: ``using Newtonsoft.Json;`` binds only ``Json``, so the
+    chain head ``JsonConvert`` is unbound and the resolver cannot
+    see the call. The fixture plainly CALLS the affected function,
+    so the tier must preserve ``imported`` — a NOT_CALLED-driven
+    downgrade here is a false high-confidence suppression."""
     from packages.sca.reachability.nuget_function_level import (
         refine_nuget_verdicts,
     )
@@ -310,17 +377,34 @@ def test_nuget_bare_namespace_using_preserves_imported(tmp_path: Path):
                 ["Newtonsoft.Json.JsonConvert.DeserializeObject"],
         },
     )
-    # Without an explicit class binding, the call doesn't resolve.
-    # That returns NOT_CALLED → all-NOT_CALLED → the tier
-    # downgrades to ``not_function_reachable``. This is the
-    # documented C# limitation; operators see the verdict +
-    # reason, but the function isn't actually called from this
-    # stub. Either ``not_function_reachable`` or ``imported`` is
-    # an acceptable answer here — what we want to assert is that
-    # the call path doesn't crash and yields a stable verdict.
-    assert out[deps[0].key()].verdict in (
-        "imported", "not_function_reachable",
+    assert out[deps[0].key()].verdict == "imported"
+
+
+def test_nuget_bare_namespace_without_class_call_still_downgrades(
+    tmp_path: Path,
+):
+    """Counter-direction: the namespace is ``using``-bound but the
+    affected class/method is never mentioned — NOT_CALLED is
+    well-supported and the downgrade must still fire (the
+    bare-using mask may not disable the tier's suppression arm)."""
+    from packages.sca.reachability.nuget_function_level import (
+        refine_nuget_verdicts,
     )
+    (tmp_path / "X.cs").write_text(
+        "using Newtonsoft.Json;\n"
+        "class C { void M() { Other.DoThing(s); } }\n"
+    )
+    deps = [_dep("Newtonsoft.Json", "13.0.1", "NuGet")]
+    out: Dict[str, Reachability] = {deps[0].key(): _imported()}
+    refine_nuget_verdicts(
+        deps, out,
+        target=tmp_path,
+        nuget_symbol_map={
+            deps[0].key():
+                ["Newtonsoft.Json.JsonConvert.DeserializeObject"],
+        },
+    )
+    assert out[deps[0].key()].verdict == "not_function_reachable"
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +434,16 @@ def test_packagist_symbol_map_filters_by_prefix():
 
 
 def test_packagist_refine_likely_called(tmp_path: Path):
+    """A genuinely-called OSV symbol MUST land on ``likely_called``.
+
+    The symbol map is built through the real producer from the OSV
+    backslash shape (``Request::create`` under a ``Foo\\Bar`` path)
+    — hand-set dotted maps masked the missing ``\\`` normalisation,
+    and the previous three-way ``in (...)`` assert accepted every
+    possible verdict including the false high-confidence
+    ``not_function_reachable`` downgrade."""
     from packages.sca.reachability.packagist_function_level import (
+        build_packagist_symbol_map,
         refine_packagist_verdicts,
     )
     (tmp_path / "X.php").write_text(
@@ -358,20 +451,50 @@ def test_packagist_refine_likely_called(tmp_path: Path):
         'class C { function m() { Request::create("/"); } }\n'
     )
     deps = [_dep("symfony/http-foundation", "5.4.0", "Packagist")]
+    adv = _Adv(ecosystem_specific={
+        "imports": [{"path": "Symfony\\Component\\HttpFoundation",
+                     "symbols": ["Request::create"]}],
+    })
+    symbol_map = build_packagist_symbol_map([
+        _OsvResult(dep_key=deps[0].key(), advisories=[adv]),
+    ])
+    assert symbol_map[deps[0].key()] == [
+        "Symfony.Component.HttpFoundation.Request.create",
+    ]
     out: Dict[str, Reachability] = {deps[0].key(): _imported()}
     refine_packagist_verdicts(
         deps, out,
         target=tmp_path,
-        packagist_symbol_map={
-            deps[0].key(): [
-                "Symfony\\Component\\HttpFoundation.Request.create",
-            ],
-        },
+        packagist_symbol_map=symbol_map,
     )
-    # Reachability resolver chain matching: PHP uses '\' as separator
-    # in the qualified name, but the call_graph stores ':' between
-    # parts. The resolver tail-matches against [Request, create] →
-    # qualified names ending in .Request.create count as a match.
-    assert out[deps[0].key()].verdict in (
-        "likely_called", "imported", "not_function_reachable",
+    assert out[deps[0].key()].verdict == "likely_called"
+
+
+def test_packagist_refine_not_called_still_downgrades(tmp_path: Path):
+    """Counter-direction: the namespace is imported but the affected
+    symbol is never called — the downgrade to
+    ``not_function_reachable`` must still fire (the separator fix
+    may not silently disable the tier's suppression arm)."""
+    from packages.sca.reachability.packagist_function_level import (
+        build_packagist_symbol_map,
+        refine_packagist_verdicts,
     )
+    (tmp_path / "X.php").write_text(
+        '<?php\nuse Symfony\\Component\\HttpFoundation\\Request;\n'
+        'class C { function m() { Request::createFromGlobals(); } }\n'
+    )
+    deps = [_dep("symfony/http-foundation", "5.4.0", "Packagist")]
+    adv = _Adv(ecosystem_specific={
+        "imports": [{"path": "Symfony\\Component\\HttpFoundation",
+                     "symbols": ["Request::create"]}],
+    })
+    symbol_map = build_packagist_symbol_map([
+        _OsvResult(dep_key=deps[0].key(), advisories=[adv]),
+    ])
+    out: Dict[str, Reachability] = {deps[0].key(): _imported()}
+    refine_packagist_verdicts(
+        deps, out,
+        target=tmp_path,
+        packagist_symbol_map=symbol_map,
+    )
+    assert out[deps[0].key()].verdict == "not_function_reachable"

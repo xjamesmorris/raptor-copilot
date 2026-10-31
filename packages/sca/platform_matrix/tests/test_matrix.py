@@ -14,9 +14,58 @@ from packages.sca.platform_matrix.glibc_db import (
     lookup_runner_libc,
 )
 from packages.sca.platform_matrix.matrix import (
+    PlatformPair,
     ProjectPlatformMatrix,
     _walk_devcontainer,
 )
+
+
+# ---------------------------------------------------------------------------
+# PlatformPair identity — source is diagnostic-only
+# ---------------------------------------------------------------------------
+
+def test_pair_identity_ignores_source() -> None:
+    """Two pairs differing only in ``source`` are the same platform:
+    equal AND hash-equal, so set membership dedups them. With source
+    in the identity, N declaration sites of one (arch, libc) made N
+    'distinct' pairs and the compat checker emitted N findings with
+    identical finding_ids."""
+    libc = LibcVersion("glibc", (2, 36))
+    a = PlatformPair(arch="x86_64", libc=libc,
+                     source="Dockerfile FROM debian:bookworm")
+    b = PlatformPair(arch="x86_64", libc=libc,
+                     source="GHA runs-on: ubuntu-22.04")
+    assert a == b
+    assert hash(a) == hash(b)
+
+
+def test_matrix_dedups_same_pair_from_many_sources() -> None:
+    """The matrix keeps ONE pair per genuine (arch, libc) combo and
+    retains the FIRST-discovered source (set.add keeps the existing
+    element on equality) so reports still say where it came from."""
+    libc = LibcVersion("glibc", (2, 36))
+    matrix = ProjectPlatformMatrix()
+    matrix.add(PlatformPair(arch="x86_64", libc=libc,
+                            source="first-seen"))
+    matrix.add(PlatformPair(arch="x86_64", libc=libc,
+                            source="later-duplicate"))
+    assert len(matrix) == 1
+    [pair] = matrix
+    assert pair.source == "first-seen"
+
+
+def test_pair_identity_still_distinguishes_real_axes() -> None:
+    """compare=False on source must not collapse genuinely different
+    platforms: arch, libc, and macos_version still participate."""
+    libc = LibcVersion("glibc", (2, 36))
+    base = PlatformPair(arch="x86_64", libc=libc, source="s")
+    assert base != PlatformPair(arch="aarch64", libc=libc, source="s")
+    assert base != PlatformPair(
+        arch="x86_64", libc=LibcVersion("glibc", (2, 39)), source="s",
+    )
+    assert base != PlatformPair(
+        arch="x86_64", libc=None, source="s", macos_version=(13, 0),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +202,7 @@ def test_devcontainer_unknown_libc_logs_debug(tmp_path: Path, caplog) -> None:
     matrix = ProjectPlatformMatrix()
     with caplog.at_level(logging.DEBUG,
                          logger="packages.sca.platform_matrix.matrix"):
-        _walk_devcontainer(path, matrix)
+        _walk_devcontainer(path, matrix, tmp_path)
     assert any(
         "unknown libc" in rec.getMessage()
         for rec in caplog.records
@@ -167,7 +216,7 @@ def test_devcontainer_unknown_libc_still_registers_pairs(
     register the same pair set (both arches, libc=None)."""
     path = _write_devcontainer(tmp_path, "totally-unknown-image:v1")
     matrix = ProjectPlatformMatrix()
-    _walk_devcontainer(path, matrix)
+    _walk_devcontainer(path, matrix, tmp_path)
     assert len(matrix) == 2
     assert {p.arch for p in matrix} == {"x86_64", "aarch64"}
     assert all(p.libc is None for p in matrix)
@@ -180,7 +229,7 @@ def test_devcontainer_known_image_does_not_log_unknown(
     matrix = ProjectPlatformMatrix()
     with caplog.at_level(logging.DEBUG,
                          logger="packages.sca.platform_matrix.matrix"):
-        _walk_devcontainer(path, matrix)
+        _walk_devcontainer(path, matrix, tmp_path)
     resolved = [p for p in matrix if p.libc is not None]
     if resolved:            # glibc DB knows bookworm
         assert not any(
@@ -238,7 +287,9 @@ def test_discover_excludes_out_directories(tmp_path: Path) -> None:
     matrix = discover_platform_matrix(tmp_path)
     libcs = {p.libc for p in matrix}
     assert LibcVersion("glibc", (2, 36)) in libcs
-    assert LibcVersion("glibc", (2, 39)) not in libcs
+    # trixie's row (2.41) must be absent — the out/ Dockerfile was
+    # never scanned.
+    assert LibcVersion("glibc", (2, 41)) not in libcs
 
 
 # ---------------------------------------------------------------------------
@@ -491,3 +542,287 @@ def test_is_dockerfile_accepts_capital_d_suffix_variant() -> None:
     assert _is_dockerfile(Path("Dockerfile.slim"))
     assert _is_dockerfile(Path("app.dockerfile"))
     assert not _is_dockerfile(Path("dockerfile_notes.md"))
+
+
+# ---------------------------------------------------------------------------
+# Discovery reads are containment-checked (never follow escapes)
+# ---------------------------------------------------------------------------
+
+def test_walk_dockerfile_refuses_symlink_escape(tmp_path: Path) -> None:
+    """A symlinked Dockerfile resolving outside the scanned target
+    must be refused — the discovery pass previously read it bare
+    (symlink-following, unbounded), unlike every parser in the
+    package."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "Dockerfile").write_text(
+        "FROM debian:bookworm\n", encoding="utf-8")
+    target = tmp_path / "repo"
+    target.mkdir()
+    link = target / "Dockerfile"
+    link.symlink_to(outside / "Dockerfile")
+
+    from packages.sca.platform_matrix.matrix import _walk_dockerfile
+    matrix = ProjectPlatformMatrix()
+    _walk_dockerfile(link, matrix, target)
+    assert len(matrix) == 0
+
+
+def test_devcontainer_dockerfile_reference_cannot_escape_target(
+    tmp_path: Path,
+) -> None:
+    """A hostile devcontainer.json "build.dockerfile" pointing above
+    the target must not pull out-of-tree files into discovery."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "Dockerfile").write_text(
+        "FROM debian:bookworm\n", encoding="utf-8")
+    target = tmp_path / "repo"
+    (target / ".devcontainer").mkdir(parents=True)
+    (target / ".devcontainer" / "devcontainer.json").write_text(
+        '{"build": {"dockerfile": "../../outside/Dockerfile"}}',
+        encoding="utf-8",
+    )
+    from packages.sca.platform_matrix.matrix import discover_platform_matrix
+    matrix = discover_platform_matrix(target)
+    # Only the no-signal default may appear — never bookworm pairs
+    # sourced from the out-of-tree Dockerfile.
+    assert not any("Dockerfile" in p.source for p in matrix)
+
+
+def test_walk_gha_refuses_symlinked_workflow(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "ci.yml").write_text(
+        "jobs:\n  a:\n    runs-on: ubuntu-22.04\n", encoding="utf-8")
+    target = tmp_path / "repo"
+    wfdir = target / ".github" / "workflows"
+    wfdir.mkdir(parents=True)
+    (wfdir / "ci.yml").symlink_to(outside / "ci.yml")
+
+    from packages.sca.platform_matrix.matrix import _walk_gha_workflows
+    matrix = ProjectPlatformMatrix()
+    _walk_gha_workflows(target, matrix)
+    assert len(matrix) == 0
+
+
+def test_blank_line_run_is_fast(tmp_path: Path) -> None:
+    """Hostile Dockerfile + workflow carrying blank-line RUNS the
+    greedy span cannot hand to a match: under the MULTILINE ``^``
+    anchor a ``\\s*`` indent matched at every line start inside a run
+    and re-scanned the remainder per anchor — quadratic (and the
+    build-push uses-line's adjacent ``^\\s*-?\\s*`` pair hung outright
+    on 16KB). Horizontal-only indent is linear. Both-direction bound:
+    fast AND the files' real signals still discover."""
+    import time
+
+    run = "\n" * (1 << 17)
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.13-bookworm\nRUN echo hi\n" + run + "# end\n")
+    wf_dir = tmp_path / ".github" / "workflows"
+    wf_dir.mkdir(parents=True)
+    # The single-line SPACE run guards the uses-line pattern's other
+    # hostile shape: two adjacent unbounded spans backtrack
+    # quadratically on horizontal runs too, so the optional ``-``
+    # span must live behind the literal ``-``.
+    (wf_dir / "ci.yml").write_text(
+        "jobs:\n  build:\n"
+        "    runs-on: ubuntu-22.04\n"
+        "    steps:\n"
+        "      - uses: docker/build-push-action@v5\n"
+        "        with:\n"
+        "          platforms: linux/amd64,linux/arm64\n"
+        + " " * (1 << 16) + "\n"
+        + run + "# end\n")
+    start = time.monotonic()
+    matrix = discover_platform_matrix(tmp_path)
+    assert time.monotonic() - start < 5.0
+    pairs = _arch_libc(matrix)
+    assert ("x86_64", LibcVersion("glibc", (2, 36))) in pairs
+    assert any(arch == "aarch64" for arch, _ in pairs)
+
+
+def test_unclosed_matrix_os_bracket_is_fast(tmp_path: Path) -> None:
+    """A hostile ``os: [`` with no closing bracket and a long
+    whitespace tail: the old ``\\[\\s*([^\\]]+)\\s*\\]`` spelling made
+    ``\\s*`` and ``[^\\]]+`` compete over the same whitespace —
+    quadratic on a SINGLE anchor (16KB hung the walk). The capture now
+    owns the body and consumers strip the items."""
+    import time
+
+    wf_dir = tmp_path / ".github" / "workflows"
+    wf_dir.mkdir(parents=True)
+    (wf_dir / "ci.yml").write_text(
+        "jobs:\n  build:\n"
+        "    runs-on: ${{ matrix.os }}\n"
+        "    strategy:\n"
+        "      matrix:\n"
+        "        os: [" + " " * (1 << 17) + "\n")
+    start = time.monotonic()
+    discover_platform_matrix(tmp_path)
+    assert time.monotonic() - start < 5.0
+
+
+def test_matrix_os_list_items_with_padding_still_parse(tmp_path: Path) -> None:
+    """The bracket-body capture keeps surrounding whitespace; item
+    parsing strips it — padded lists resolve the same runners."""
+    wf_dir = tmp_path / ".github" / "workflows"
+    wf_dir.mkdir(parents=True)
+    (wf_dir / "ci.yml").write_text(
+        "jobs:\n  build:\n"
+        "    runs-on: ${{ matrix.os }}\n"
+        "    strategy:\n"
+        "      matrix:\n"
+        "        os: [  'ubuntu-22.04' ,  ubuntu-24.04  ]\n")
+    matrix = discover_platform_matrix(tmp_path)
+    pairs = _arch_libc(matrix)
+    # ubuntu-22.04 → glibc 2.35; the 24.04 item must resolve too.
+    assert ("x86_64", LibcVersion("glibc", (2, 35))) in pairs
+    assert ("x86_64", LibcVersion("glibc", (2, 39))) in pairs
+
+def test_repeated_unclosed_matrix_os_anchors_are_fast(tmp_path: Path) -> None:
+    """MANY unclosed ``os: [`` anchors: each anchor's bracket body
+    scanned to EOF looking for a ``]`` that never comes — quadratic
+    in the anchor count (the single-anchor whitespace fix didn't
+    bound the per-anchor tail scan). The monotonic body walk stops
+    at the first failed close-bracket search. Wall bound is the
+    suite's <5s convention; the hostile size sat at ~40s before."""
+    import time
+
+    wf_dir = tmp_path / ".github" / "workflows"
+    wf_dir.mkdir(parents=True)
+    (wf_dir / "ci.yml").write_text(
+        "runs-on: ${{ matrix.os }}\n" + ("os: [x\n" * 32000) + "# end\n")
+    start = time.monotonic()
+    discover_platform_matrix(tmp_path)
+    assert time.monotonic() - start < 5.0
+
+
+def test_stacked_variable_runs_on_lines_are_fast(tmp_path: Path) -> None:
+    """The matrix os/platform list is scanned once per FILE, not once
+    per ``${{``-bearing ``runs-on:`` line — stacking such lines
+    multiplied the whole-file scan cost linearly on top of the
+    unclosed-anchor cost."""
+    import time
+
+    wf_dir = tmp_path / ".github" / "workflows"
+    wf_dir.mkdir(parents=True)
+    (wf_dir / "ci.yml").write_text(
+        ("runs-on: ${{ matrix.os }}\n" * 64) + ("os: [x\n" * 16000))
+    start = time.monotonic()
+    discover_platform_matrix(tmp_path)
+    assert time.monotonic() - start < 5.0
+
+
+def test_stacked_boundaryless_build_push_steps_are_fast(tmp_path: Path) -> None:
+    """N dash-less ``uses: docker/build-push-action`` lines with no
+    step boundary anywhere: every step's block search ran to EOF plus
+    a tail slice — quadratic. The windowed pass bounds each block at
+    the next uses line."""
+    import time
+
+    wf_dir = tmp_path / ".github" / "workflows"
+    wf_dir.mkdir(parents=True)
+    (wf_dir / "ci.yml").write_text(
+        "uses: docker/build-push-action@v5\n" * 16000)
+    start = time.monotonic()
+    discover_platform_matrix(tmp_path)
+    assert time.monotonic() - start < 5.0
+
+
+def test_repeated_unclosed_bake_platform_anchors_are_fast(tmp_path: Path) -> None:
+    """docker-bake.hcl sibling of the unclosed ``os: [`` shape: each
+    unclosed ``platforms = [`` anchor's DOTALL body scanned to EOF.
+    Same monotonic body walk, same wall bound."""
+    import time
+
+    (tmp_path / "docker-bake.hcl").write_text(
+        ("platforms = [x\n" * 16000) + "# end\n")
+    start = time.monotonic()
+    discover_platform_matrix(tmp_path)
+    assert time.monotonic() - start < 5.0
+
+
+def test_multiline_matrix_os_flow_list_still_parses(tmp_path: Path) -> None:
+    """Match-equivalence guard for the monotonic body walk: a YAML
+    flow list that WRAPS lines (the shape the old newline-capable
+    bracket body matched) must keep resolving its runners."""
+    wf_dir = tmp_path / ".github" / "workflows"
+    wf_dir.mkdir(parents=True)
+    (wf_dir / "ci.yml").write_text(
+        "jobs:\n  build:\n"
+        "    runs-on: ${{ matrix.os }}\n"
+        "    strategy:\n"
+        "      matrix:\n"
+        "        os: [ubuntu-22.04,\n"
+        "             ubuntu-24.04]\n")
+    matrix = discover_platform_matrix(tmp_path)
+    pairs = _arch_libc(matrix)
+    assert ("x86_64", LibcVersion("glibc", (2, 35))) in pairs
+    assert ("x86_64", LibcVersion("glibc", (2, 39))) in pairs
+
+
+def test_second_build_push_step_platforms_still_found(tmp_path: Path) -> None:
+    """Match-equivalence guard for the windowed build-push pass: two
+    steps in one job each contribute their own ``platforms:``, and a
+    consumed list body doesn't hide a later step."""
+    wf_dir = tmp_path / ".github" / "workflows"
+    wf_dir.mkdir(parents=True)
+    (wf_dir / "ci.yml").write_text(
+        "jobs:\n  release:\n"
+        "    runs-on: ubuntu-22.04\n"
+        "    steps:\n"
+        "      - uses: docker/build-push-action@v6\n"
+        "        with:\n"
+        "          platforms: linux/amd64\n"
+        "      - uses: docker/build-push-action@v5\n"
+        "        with:\n"
+        "          platforms: linux/ppc64le\n")
+    matrix = discover_platform_matrix(tmp_path)
+    archs = {p.arch for p in matrix}
+    assert "x86_64" in archs
+    assert "ppc64le" in archs
+
+
+def test_arm_runner_labels_resolve_aarch64_with_base_libc(tmp_path: Path) -> None:
+    """``ubuntu-24.04-arm`` is GitHub's hosted arm runner: arch from
+    the mechanical ``-arm``/``-arm64`` suffix, libc from the base
+    label's row. Recorded as x86_64/no-libc, a project whose only
+    aarch64 signal is its CI runner never got the aarch64 wheel-gap
+    check this subsystem exists for."""
+    wf_dir = tmp_path / ".github" / "workflows"
+    wf_dir.mkdir(parents=True)
+    (wf_dir / "ci.yml").write_text(
+        "jobs:\n"
+        "  a:\n    runs-on: ubuntu-24.04-arm\n"
+        "  b:\n    runs-on: ubuntu-22.04-arm64\n"
+        "  c:\n    runs-on: windows-11-arm\n")
+    matrix = discover_platform_matrix(tmp_path)
+    rows = {(p.arch, p.libc, p.os) for p in matrix}
+    assert ("aarch64", LibcVersion("glibc", (2, 39)), "linux") in rows
+    assert ("aarch64", LibcVersion("glibc", (2, 35)), "linux") in rows
+    assert ("aarch64", None, "windows") in rows
+    assert not any(arch == "x86_64" for arch, _, _ in rows)
+
+
+def test_stacked_variable_runs_on_times_large_matrix_is_fast(
+    tmp_path: Path,
+) -> None:
+    """k variable runs-on lines times an m-item matrix list is k*m
+    runner registrations even with the list SCAN hoisted — quadratic
+    work for a set the dedup collapses. Items register once per file
+    (every add stamps the identical per-file source string, so the
+    resulting matrix is the same)."""
+    import time
+
+    wf_dir = tmp_path / ".github" / "workflows"
+    wf_dir.mkdir(parents=True)
+    items = ",".join(f"r{i}" for i in range(100000))
+    (wf_dir / "ci.yml").write_text(
+        ("runs-on: ${{ matrix.os }}\n" * 2000)
+        + f"os: [{items}]\n")
+    start = time.monotonic()
+    matrix = discover_platform_matrix(tmp_path)
+    assert time.monotonic() - start < 5.0
+    # The items were still registered (unknown labels → x86_64 rows).
+    assert len(matrix) >= 1

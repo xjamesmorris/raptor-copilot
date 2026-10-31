@@ -12,6 +12,7 @@ is written to the run's output directory.
 [commands](commands.md) |
 [validation](validation.md) |
 [LLM providers](llm.md) |
+[agent security](agent-security.md) |
 [binary analysis](binary-analysis.md) |
 [static analysis](static-analysis.md) |
 [CodeQL](codeql.md)
@@ -43,6 +44,11 @@ scan  →  dedup  →  prep  →  analyse (per finding)
 
 1. **Scan** -- Semgrep, with CodeQL in parallel by default (disable with
    `--no-codeql`, or set `codeql_enabled: false` in tuning.json).
+   In Copilot sessions the service boundary keeps scanner workers offline:
+   Semgrep drops uncached registry packs but runs local rules, and the
+   mechanical SCA phase uses cached advisories only. LLM analysis is handed
+   to host-managed Copilot subagents through bounded result parts; repository
+   code never launches another harness or receives session credentials.
    C/C++ CodeQL databases build in buildless mode by default (no repo
    build scripts execute); pass `--traced-build` to opt into
    full-fidelity traced extraction on a repo you trust (see
@@ -55,6 +61,17 @@ scan  →  dedup  →  prep  →  analyse (per finding)
    TUs.
    External SARIF can be imported with `--sarif` instead of scanning
    (repeatable; add `--also-scan` to merge with a fresh scan).
+   `--openant` adds the [OpenAnt](commands.md#openant) LLM semantic scan
+   as a further channel alongside the pattern scanners.  `--openant-only`
+   replaces Semgrep/CodeQL entirely with OpenAnt (combining it with
+   `--codeql`/`--codeql-only` is refused at parse time).  Configure it
+   with `--openant-core`, `--openant-model`, and `--openant-level`.
+   `--openant-core` is consent-gated: a core that is not a clean
+   checkout of the pinned commit (wrong commit, modified/untracked
+   files at the pin, unverifiable provenance) refuses at startup
+   unless `--openant-core-unpinned` or the project `config` trust
+   marker consents (the `$OPENANT_CORE` env / auto-detect default
+   keeps warn-not-refuse).
 2. **Dedup** -- collapse duplicate and overlapping findings so the same bug is
    not analysed twice.  Skip with `--skip-dedup`.
 3. **Prep** -- read the code around each finding, pull surrounding context, and
@@ -198,10 +215,14 @@ Findings are dispatched for analysis one of two ways:
   configured in `models.json` or environment variables.  When both are
   available, the external LLM is preferred; Claude Code is the fallback.
 
-If **neither** is available, the pipeline produces prep-only output (scan,
-dedup, prep, dataflow -- no analysis).  In that mode the findings sit in
-`autonomous_analysis_report.json` with code and dataflow attached, ready for
-manual analysis.
+If **neither** is available outside Copilot, Phase 3 is skipped; the
+aggregate report marks the findings unreviewed. Under Copilot, `/agentic`
+runs Phase 3 mechanically with `--prep-only`, writes a native handoff
+manifest, and the top-level session dispatches managed subagents. Each
+subagent owns one non-overlapping part, and a deterministic finalizer rejects
+missing, duplicate, extra, stale, or schema-invalid results before completing
+the original run. Exploitable native results must carry a bounded PoC and a
+mechanically reviewable unified-diff patch; snippets/prose do not pass lint.
 
 ### Persona injection
 
@@ -288,7 +309,29 @@ with a verdict naming the check, and per-check counters join the report:
 - **SAGE prior verdicts** -- with SAGE installed, cross-run
   false-positive verdicts for the same finding (source unchanged) skip
   re-analysis (`sage_<verdict>`).  Set `manual_override` on a finding to
-  force it through to fresh review.
+  force it through to fresh review.  The operator surface for both is
+  `raptor-review verdict <finding-id> fp|tp|retest` -- `fp` records a
+  suppressing verdict, gated on the live-context operator grant (its
+  row carries pipeline-grade suppression authority). In practice the
+  grant refuses the dispatch trust markers every shipped launcher
+  route carries (`bin/raptor` exports `_RAPTOR_TRUSTED=1`; the
+  libexec preamble requires a marker), so a plain `fp` does not mint
+  in production. The sanctioned production route is the typed-consent
+  ceremony at the operator's own terminal --
+  `raptor review verdict <finding-id> fp --ceremony` -- which
+  requires every standard fd to be a terminal, shows what is being
+  suppressed (finding, effect, TTL, the recorded invocation
+  context), and mints only after the operator types the confirmation
+  phrase naming that finding id; the row is stamped
+  `minted=ceremony` with the grant result and invocation context
+  recorded alongside — MAC-bound into the row's verified fields, so
+  the mint authority cannot be edited after the fact — and
+  `retest` revokes it at any time. Record operator FP assertions
+  without a standing suppression with `/annotate` (human grade,
+  production-reachable); `tp` clears prior suppression and sets
+  `manual_override` on the stored records, `retest` clears the
+  stored verdict so the next run re-analyzes (both work
+  non-interactively; they only cause re-analysis).
 
 
 ## Output
@@ -299,12 +342,14 @@ or this session's project directory).
 | File | Contents |
 |------|----------|
 | `agentic-report.md` | Human-readable summary |
-| `autonomous_analysis_report.json` | Structured data -- all findings with analysis, verdicts, and metadata |
+| `autonomous_analysis_report.json` | Structured Phase 3 findings (only when Phase 3 runs) |
 | `suppressions.jsonl` | Pre-LLM suppression audit trail (binary oracle, guard dominance, fail-open channel, SAGE prior verdicts) |
 
-The report carries one of three modes:
+When Phase 3 runs, its autonomous report carries one of three modes; without
+an LLM, there is no autonomous report or mode and the aggregate assessment is
+partial.
 
-- **`prep_only`** -- no LLM ran; findings have `code`, `surrounding_context`,
+- **`prep_only`** -- the preparation subprocess ran; findings have `code`, `surrounding_context`,
   `dataflow`, and `feasibility` attached for manual review.
 - **`full`** -- sequential LLM analysis (`--sequential`, or no Claude Code).
 - **`orchestrated`** -- parallel analysis; findings carry `analysed_by`,

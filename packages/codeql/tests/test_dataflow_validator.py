@@ -285,6 +285,10 @@ class TestLlmFailureIsErrorState:
             lambda conditions, profile=None, **kwargs: smt,
         )
         monkeypatch.setattr(
+            dv, "check_path_feasibility_dual",
+            lambda conditions, profile=None, **kwargs: smt,
+        )
+        monkeypatch.setattr(
             validator, "_cheap_dataflow_fp_check", lambda dataflow: None,
         )
         monkeypatch.setattr(
@@ -350,6 +354,7 @@ class TestLlmFailureIsErrorState:
 from types import SimpleNamespace  # noqa: E402
 from unittest.mock import patch  # noqa: E402
 
+from core.smt_solver import z3_available  # noqa: E402
 from core.smt_solver.path_feasibility import PathCondition  # noqa: E402
 from packages.codeql.dataflow_validator import (  # noqa: E402
     MAX_SMT_PATHS,
@@ -458,7 +463,7 @@ class TestMultiPathSMT:
     def _validate(self, v, smt_side_effects):
         dp = v.extract_dataflow_from_sarif(_sarif_two_flows())
         with patch(
-            "packages.codeql.dataflow_validator.check_path_feasibility",
+            "packages.codeql.dataflow_validator.check_path_feasibility_dual",
             side_effect=smt_side_effects,
         ), patch(
             "core.llm.scorecard.prefilter_decision",
@@ -509,7 +514,7 @@ class TestMultiPathSMT:
         dp = v.extract_dataflow_from_sarif(_sarif_two_flows())
         dp.alternatives = []
         with patch(
-            "packages.codeql.dataflow_validator.check_path_feasibility",
+            "packages.codeql.dataflow_validator.check_path_feasibility_dual",
             return_value=_smt(False, "contradiction", ["x > 1", "x < 0"]),
         ):
             result = v.validate_dataflow_path(dp, _Path("/nonexistent-repo"))
@@ -518,18 +523,128 @@ class TestMultiPathSMT:
         assert "Path conditions are mutually exclusive" in result.reasoning
         assert result.smt_paths_checked == 1
 
-    def test_alternatives_capped_at_max_smt_paths(self):
-        v = _validator()
+    def _validate_with_alternatives(self, v, n_alternatives, smt_result):
         dp = v.extract_dataflow_from_sarif(_sarif_two_flows())
         extra = v.extract_dataflow_from_sarif(_sarif_two_flows())
-        dp.alternatives = [extra, extra, extra, extra]
+        dp.alternatives = [extra] * n_alternatives
+        with patch(
+            "packages.codeql.dataflow_validator.check_path_feasibility_dual",
+            return_value=smt_result,
+        ), patch(
+            "core.llm.scorecard.prefilter_decision",
+            return_value=SimpleNamespace(short_circuit=False),
+        ), patch("core.llm.scorecard.record_prefilter_outcome"), patch(
+            "packages.codeql.dataflow_validator.load_methodology",
+            return_value="",
+        ):
+            return v.validate_dataflow_path(dp, _Path("/nonexistent-repo"))
+
+    def test_truncated_unsat_coverage_never_refutes(self):
+        # 5 total paths, cap 3: every CHECKED path is unsat, but two
+        # paths were never SMT-checked — a live path may be among
+        # them, so the finding must fall through to full LLM analysis
+        # instead of being refuted.
+        v = _validator()
+        result = self._validate_with_alternatives(
+            v, 4, _smt(False, "c", ["u"]),
+        )
+        assert result.is_exploitable is True  # full analysis ran
+        assert v.llm.generate_structured.call_count == 1
+        # The cap still bounds WORK: extraction ran once per checked
+        # path, never for the uncovered remainder.
+        assert v._extract_path_conditions.call_count == MAX_SMT_PATHS
+        assert result.smt_paths_checked == MAX_SMT_PATHS
+        # The verdict is grounded on the primary path.
+        assert result.smt_path_index == 0
+
+    def test_full_coverage_at_exactly_the_cap_still_refutes(self):
+        # cap == total paths: coverage is complete, so all-unsat is a
+        # sound refutation — the cap must not weaken it.
+        v = _validator()
+        result = self._validate_with_alternatives(
+            v, MAX_SMT_PATHS - 1, _smt(False, "c", ["u"]),
+        )
+        assert result.is_exploitable is False
+        assert (
+            f"all {MAX_SMT_PATHS} dataflow paths refuted"
+            in result.reasoning
+        )
+        assert result.smt_paths_checked == MAX_SMT_PATHS
+        assert v.llm.generate_structured.call_count == 0
+
+
+class TestSignednessProfileSelection:
+    """Refutation soundness: when the LLM hint does not pin signedness
+    the heuristic profile is a guess, so the SMT pre-check must require
+    both signedness profiles to agree (the dual checker); a pinned hint
+    keeps the cheaper single-profile check."""
+
+    def _run(self, v):
+        dp = v.extract_dataflow_from_sarif(_sarif_two_flows())
         with patch(
             "packages.codeql.dataflow_validator.check_path_feasibility",
-            return_value=_smt(False, "c", ["u"]),
+            return_value=_smt(True, "sat"),
+        ) as single, patch(
+            "packages.codeql.dataflow_validator.check_path_feasibility_dual",
+            return_value=_smt(True, "sat"),
+        ) as dual, patch(
+            "core.llm.scorecard.prefilter_decision",
+            return_value=SimpleNamespace(short_circuit=False),
+        ), patch("core.llm.scorecard.record_prefilter_outcome"), patch(
+            "packages.codeql.dataflow_validator.load_methodology",
+            return_value="",
+        ):
+            v.validate_dataflow_path(dp, _Path("/nonexistent-repo"))
+        return single, dual
+
+    def test_unpinned_signedness_uses_dual_checker(self):
+        v = _validator()  # hint {} — signedness not pinned
+        single, dual = self._run(v)
+        assert dual.call_count == 1
+        assert single.call_count == 0
+
+    def test_pinned_signedness_uses_single_profile(self):
+        v = _validator()
+        v._extract_path_conditions = MagicMock(
+            return_value=([], {"width": 64, "signed": True}),
+        )
+        single, dual = self._run(v)
+        assert single.call_count == 1
+        assert dual.call_count == 0
+        assert single.call_args.kwargs["profile"].signed is True
+
+    def test_non_bool_signed_hint_counts_as_unpinned(self):
+        v = _validator()
+        v._extract_path_conditions = MagicMock(
+            return_value=([], {"signed": "yes"}),
+        )
+        single, dual = self._run(v)
+        assert dual.call_count == 1
+        assert single.call_count == 0
+
+    @pytest.mark.skipif(
+        not z3_available(), reason="z3-solver not installed",
+    )
+    def test_signed_error_guard_does_not_refute_end_to_end(self):
+        # The empirical repro: `ret < 0` is unsat under the default
+        # unsigned profile; pre-fix a single such guard refuted the
+        # whole finding pre-LLM. With the dual checker the finding
+        # proceeds to full analysis.
+        v = _validator()
+        v._extract_path_conditions = MagicMock(
+            return_value=([PathCondition("ret < 0", step_index=0)], {}),
+        )
+        dp = v.extract_dataflow_from_sarif(_sarif_two_flows())
+        with patch(
+            "core.llm.scorecard.prefilter_decision",
+            return_value=SimpleNamespace(short_circuit=False),
+        ), patch("core.llm.scorecard.record_prefilter_outcome"), patch(
+            "packages.codeql.dataflow_validator.load_methodology",
+            return_value="",
         ):
             result = v.validate_dataflow_path(dp, _Path("/nonexistent-repo"))
-        assert result.smt_paths_checked == MAX_SMT_PATHS
-        assert v._extract_path_conditions.call_count == MAX_SMT_PATHS
+        assert result.is_exploitable is True  # full LLM analysis ran
+        assert v.llm.generate_structured.call_count == 1
 
 
 class TestWitnessSteering:
@@ -548,13 +663,21 @@ class TestWitnessSteering:
         ) is None
         assert _steering_target([]) is None
 
+    def test_steering_target_never_yields_hex_fragments(self):
+        # The regex alone guarantees this (leading letter/underscore
+        # + digit lookbehind) — pinned so the guarantee survives a
+        # future regex change.
+        from packages.codeql.dataflow_validator import _steering_target
+        conds = [PathCondition("0xdead < buffer_len", step_index=0)]
+        assert _steering_target(conds) == "buffer_len"
+
     def _capture_prefer(self, rule_id, conditions):
         v = _validator()
         v._extract_path_conditions = MagicMock(return_value=(conditions, {}))
         dp = v.extract_dataflow_from_sarif(_sarif_two_flows())
         dp.rule_id = rule_id
         with patch(
-            "packages.codeql.dataflow_validator.check_path_feasibility",
+            "packages.codeql.dataflow_validator.check_path_feasibility_dual",
             return_value=_smt(True, "sat"),
         ) as smt_mock, patch(
             "core.llm.scorecard.prefilter_decision",
@@ -583,3 +706,68 @@ class TestWitnessSteering:
     def test_unidentifiable_target_skips_steering(self):
         prefer = self._capture_prefer("cpp/integer-overflow", [])
         assert prefer is None
+
+
+class TestReadSourceContext:
+    def _v(self) -> DataflowValidator:
+        llm = MagicMock()
+        llm.scorecard = None
+        return DataflowValidator(llm_client=llm)
+
+    def test_reads_marked_window(self, tmp_path):
+        f = tmp_path / "a.c"
+        f.write_text(
+            "\n".join(f"line{i}" for i in range(1, 30)) + "\n",
+            encoding="utf-8",
+        )
+        out = self._v().read_source_context(
+            str(f), 10, context_lines=2, repo_root=tmp_path)
+        assert ">>>" in out and "line10" in out
+        assert "line20" not in out
+
+    def test_out_of_root_refused(self, tmp_path):
+        outside = tmp_path / "outside.c"
+        outside.write_text("secret\n", encoding="utf-8")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        out = self._v().read_source_context(
+            str(outside), 1, repo_root=repo)
+        assert out == ""
+
+
+class TestSourceContextLineModel:
+    r"""read_source_context speaks CodeQL's \n line model.
+
+    The line number comes from CodeQL SARIF (\n-counted); a
+    splitlines() view put the >>> marker and the whole context window
+    on the wrong lines after any in-literal form feed.
+    """
+
+    def _validator(self):
+        from unittest.mock import MagicMock
+
+        return DataflowValidator(MagicMock())
+
+    def test_marker_lands_on_the_reported_line(self, tmp_path):
+        src = tmp_path / "vuln.c"
+        src.write_bytes(
+            'const char *P = "a\x0c\x0cb";\n'
+            "void safe(void) {}\n"
+            "void handle(char *d, const char *s) {\n"
+            "    strcpy(d, s);\n"
+            "}\n".encode()
+        )
+        out = self._validator().read_source_context(
+            str(src), 4, context_lines=1, repo_root=tmp_path,
+        )
+        marked = [ln for ln in out.split("\n") if ln.startswith(">>>")]
+        assert len(marked) == 1
+        assert "strcpy(d, s);" in marked[0]
+
+    def test_clean_twin_content_unchanged(self, tmp_path):
+        src = tmp_path / "vuln.c"
+        src.write_text("int a;\nint b;\nint c;\n")
+        out = self._validator().read_source_context(
+            str(src), 2, context_lines=1, repo_root=tmp_path,
+        )
+        assert ">>>    2: int b;" in out

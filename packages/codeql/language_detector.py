@@ -8,7 +8,9 @@ to determine which CodeQL databases need to be created.
 
 import os
 import sys
+import json
 from collections import defaultdict
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
@@ -19,7 +21,6 @@ from typing import ClassVar
 # silently breaking under relocation.
 sys.path.insert(0, os.environ["RAPTOR_DIR"])
 
-from core.json import dumps_display
 from core.logging import get_logger
 
 logger = get_logger()
@@ -73,14 +74,14 @@ class LanguageDetector:
             "min_confidence": 0.5,
         },
         "javascript": {
-            "extensions": {".js", ".jsx", ".mjs", ".cjs"},
+            "extensions": {".js", ".jsx", ".mjs", ".cjs", ".vue"},
             "build_files": {"package.json", "package-lock.json", "yarn.lock", "webpack.config.js", ".npmrc"},
             "build_file_suffixes": (),
             "indicators": {"node_modules/", "src/", "dist/"},
             "min_confidence": 0.5,
         },
         "typescript": {
-            "extensions": {".ts", ".tsx"},
+            "extensions": {".ts", ".tsx", ".mts", ".cts"},
             "build_files": {"tsconfig.json", "package.json"},
             "build_file_suffixes": (),
             "indicators": {"src/", "dist/"},
@@ -154,6 +155,36 @@ class LanguageDetector:
     # the repo's build, verified on CLI 2.26.3.)
     EXTRACTOR_PROBED: ClassVar[set[str]] = {"rust"}
 
+    # Source extensions with NO CodeQL extractor, mapped to the
+    # language they indicate. Operator messaging only — when the
+    # repo's dominant source language lives here, the CodeQL lane is
+    # structurally absent and its silence must not read as coverage.
+    # Membership criterion, declared: every UNAMBIGUOUS source
+    # extension of a language people ship whole repos in — an
+    # enumerated set, so a missing member silently reads
+    # clean-by-silence; extend it when a no-extractor language is
+    # encountered. Deliberately excluded as ambiguous: ``.m``
+    # (Objective-C/MATLAB), ``.d`` (D/Makefile deps), ``.v``
+    # (Verilog/Coq), ``.sc`` (Scala scripts/SuperCollider).
+    NO_EXTRACTOR_EXTENSIONS: ClassVar[dict[str, str]] = {
+        ".php": "php", ".phtml": "php",
+        ".pl": "perl", ".pm": "perl",
+        ".lua": "lua",
+        ".ex": "elixir", ".exs": "elixir",
+        ".erl": "erlang", ".hrl": "erlang",
+        ".hs": "haskell",
+        ".ml": "ocaml", ".mli": "ocaml",
+        ".dart": "dart",
+        ".r": "r",
+        ".scala": "scala",
+        ".groovy": "groovy",
+        ".clj": "clojure", ".cljc": "clojure",
+        ".zig": "zig",
+        ".nim": "nim",
+        ".jl": "julia",
+        ".f90": "fortran", ".f95": "fortran",
+    }
+
     # Directories to ignore during scanning
     IGNORE_DIRS: ClassVar[set[str]] = {
         ".git", ".svn", ".hg", ".bzr",
@@ -182,16 +213,40 @@ class LanguageDetector:
     # File suffixes to ignore (endswith match)
     IGNORE_SUFFIXES = (".lock", ".min.js", ".bundle.js")
 
-    def __init__(self, repo_path: Path, max_files: int = 10000) -> None:
+    # Scan-size limit. The walk is name/suffix STATISTICS only — no
+    # file contents are read — measured at ~24 us/file (a 94k-file
+    # kernel tree walks whole in ~2.3 s). Both directions: LOWER
+    # samples the tree in walk order and the extension counts feeding
+    # language confidence become order-dependent (a kernel-scale repo
+    # under the old 10k cap scored rust from whichever slice the walk
+    # met first); HIGHER only buys wall time on pathological trees or
+    # network filesystems — at this ceiling the worst case is ~12 s,
+    # and the cap stays the escape hatch for anything beyond it.
+    _MAX_SCAN_FILES = 500_000
+
+    # Wall-clock cap on the `git ls-files` tracked-baseline probe.
+    # Both directions: LOWER falsely times out on cold-cache indexes
+    # of large repos and silently degrades the census to the raw walk
+    # (untracked scratch re-enters the counts); HIGHER only delays
+    # the fallback when git hangs (network filesystem, index.lock
+    # contention) — the walk still runs afterwards, so nothing is
+    # lost beyond wall time.
+    _GIT_LS_TIMEOUT_S = 30.0
+
+    def __init__(self, repo_path: Path,
+                 max_files: int | None = None) -> None:
         """
         Initialize language detector.
 
         Args:
             repo_path: Path to repository
-            max_files: Maximum files to scan (performance limit)
+            max_files: Maximum files to scan (performance limit;
+                None derives the class default — see _MAX_SCAN_FILES)
         """
         self.repo_path = Path(repo_path)
-        self.max_files = max_files
+        self.max_files = (
+            max_files if max_files is not None else self._MAX_SCAN_FILES
+        )
 
         if not self.repo_path.exists():
             msg = f"Repository path does not exist: {repo_path}"
@@ -200,7 +255,21 @@ class LanguageDetector:
             msg = f"Repository path is not a directory: {repo_path}"
             raise ValueError(msg)
 
-    def detect_languages(self, min_files: int = 3) -> dict[str, LanguageInfo]:
+    def scan_repository(self) -> dict:
+        """One repository walk's raw statistics, for reuse across
+        detection tiers within a single run.
+
+        Fresh walk on every call — never memoised on the instance or
+        module, because repo state can change between runs. Callers
+        driving the tiered ``detect_languages`` retries pass the
+        returned dict to each tier so the walk (and its once-per-scan
+        banners) happens exactly once per run.
+        """
+        logger.info("Detecting languages in: %s", self.repo_path)
+        return self._scan_repository()
+
+    def detect_languages(self, min_files: int = 3,
+                         scan: dict | None = None) -> dict[str, LanguageInfo]:
         """
         Detect all languages in repository with confidence scores.
 
@@ -211,14 +280,16 @@ class LanguageDetector:
                 etc.) are detected regardless of source-file count,
                 provided the per-language confidence threshold is met
                 (gh #548).
+            scan: Statistics from a prior :meth:`scan_repository` walk
+                to reuse (retry tiers within one run — a re-walk would
+                also re-emit the once-per-scan banners). None = walk
+                now. The dict is annotated in place to record banners
+                already emitted for this walk.
 
         Returns:
             Dict mapping language name -> LanguageInfo
         """
-        logger.info("Detecting languages in: %s", self.repo_path)
-
-        # Scan repository and collect statistics
-        stats = self._scan_repository()
+        stats = scan if scan is not None else self.scan_repository()
 
         # Calculate confidence scores for each language
         detected = {}
@@ -267,9 +338,47 @@ class LanguageDetector:
         else:
             logger.info("Total languages detected: %d", len(detected))
 
+        # Unsupported-primary visibility: when more source files sit
+        # in a language CodeQL cannot extract than in ANY detected
+        # language, the CodeQL lane is structurally absent for the
+        # code that matters and the operator must hear it here — the
+        # per-language "Detected"/"Skipping" lines above only ever
+        # mention extractor languages, so a PHP or Perl codebase read
+        # as clean-by-silence otherwise.
+        unsupported: dict[str, int] = defaultdict(int)
+        for ext, count in stats["extensions"].items():
+            no_extractor_lang = self.NO_EXTRACTOR_EXTENSIONS.get(ext.lower())
+            if no_extractor_lang:
+                unsupported[no_extractor_lang] += count
+        # The marker rides on the stats dict, so a walk shared across
+        # retry tiers announces once while independent walks (separate
+        # runs) each announce — a module/instance flag would silence
+        # later runs of a changed repo.
+        if unsupported and not stats.get("unsupported_primary_announced"):
+            top_lang, top_count = max(
+                unsupported.items(), key=lambda kv: kv[1],
+            )
+            detected_max = max(
+                (info.file_count for info in detected.values()), default=0,
+            )
+            if top_count > detected_max:
+                stats["unsupported_primary_announced"] = True
+                covered = ", ".join(
+                    f"{lang} ({info.file_count} files)"
+                    for lang, info in sorted(detected.items())
+                ) or "no language"
+                logger.warning(
+                    "⚠ Primary language appears to be %s (%d files) — "
+                    "CodeQL has no extractor for it; the CodeQL lane "
+                    "covers %s. Other channels are unaffected.",
+                    top_lang, top_count, covered,
+                )
+
         return detected
 
-    def detect_languages_floor(self, floor: int = 2) -> dict[str, LanguageInfo]:
+    def detect_languages_floor(self, floor: int = 2,
+                               scan: dict | None = None,
+                               ) -> dict[str, LanguageInfo]:
         """
         Last-resort detection tier — include any language with at least
         ``floor`` source files, **ignoring the per-language confidence
@@ -288,17 +397,21 @@ class LanguageDetector:
             floor: Minimum source files required per language. Default 2
                 — high enough to filter out a single stray file from
                 another language, low enough to admit minimal repros.
+            scan: Statistics from a prior :meth:`scan_repository` walk
+                to reuse (this tier only ever runs after two
+                detect_languages passes — a third walk of the same
+                tree buys nothing and re-emits the walk banner).
+                None = walk now.
 
         Returns:
             Dict mapping language name -> LanguageInfo for languages
             meeting only the file-count floor.
         """
         logger.info(
-            "Detecting languages in: %s (floor tier, floor=%s, ignoring confidence gate)",
-            self.repo_path,
+            "Floor-tier detection: floor=%s, ignoring confidence gate",
             floor
         )
-        stats = self._scan_repository()
+        stats = scan if scan is not None else self.scan_repository()
 
         detected = {}
         for lang, patterns in self.LANGUAGE_PATTERNS.items():
@@ -322,6 +435,67 @@ class LanguageDetector:
             )
         else:
             logger.info("Floor-tier detected: %d language(s)", len(detected))
+
+        return detected
+
+    def detect_languages_tiered(
+        self,
+        min_files: int = 3,
+        *,
+        codeql_filter: bool = False,
+    ) -> dict[str, LanguageInfo]:
+        """Three-tier detection cascade for small and large targets.
+
+        Tier 1: ``detect_languages(min_files=min_files)`` — the normal
+        confidence + file-count gate.
+
+        Tier 2: ``detect_languages(min_files=1)`` — drops the file-count
+        floor so single-file targets pass (confidence gate still active).
+
+        Tier 3: ``detect_languages_floor(floor=2)`` — ignores the
+        confidence gate entirely; a last resort for fixture trees with
+        no build manifests.
+
+        Walks the repository once; the same scan statistics are reused
+        across all tiers.
+
+        Args:
+            min_files: Starting file-count threshold (tier 1).
+            codeql_filter: When True, each tier's result is narrowed to
+                CodeQL-supported languages via
+                :meth:`filter_codeql_supported` before the emptiness
+                check that triggers the next tier.
+
+        Returns:
+            The detected-languages dict from whichever tier first
+            produced a non-empty result (or empty if all three fail).
+        """
+        scan = self.scan_repository()
+
+        def _maybe_filter(d: dict[str, LanguageInfo]) -> dict[str, LanguageInfo]:
+            return self.filter_codeql_supported(d) if codeql_filter else d
+
+        detected = _maybe_filter(self.detect_languages(
+            min_files=min_files, scan=scan))
+
+        if not detected and min_files > 1:
+            logger.warning(
+                "No languages met min_files=%s threshold; retrying "
+                "with min_files=1 (small target — single-file fixtures "
+                "and minimal repros land here)",
+                min_files,
+            )
+            detected = _maybe_filter(self.detect_languages(
+                min_files=1, scan=scan))
+
+        if not detected:
+            logger.warning(
+                "No languages cleared the confidence gate after two "
+                "retries; falling back to file-count floor "
+                "(low-confidence detection — verify results)",
+            )
+            detected = _maybe_filter(self.detect_languages_floor(
+                floor=2, scan=scan))
 
         return detected
 
@@ -350,29 +524,40 @@ class LanguageDetector:
         pruned_dirs: list[str] = []
         try:
             for file_path in self._walk_repository(pruned_dirs):
-                stats["scanned_files"] += 1
+                stats["scanned_files"] += 1  # type: ignore[operator]
 
                 # Check for build files (exact name or suffix)
                 fname = file_path.name
                 if fname in build_files or fname.endswith(build_suffixes):
-                    stats["build_files"].add(fname)
+                    stats["build_files"].add(fname)  # type: ignore[attr-defined]
 
                 # Check for structural indicators
                 relative = file_path.relative_to(self.repo_path).as_posix()
                 for indicator in indicators:
                     if self._indicator_matches(indicator, relative):
-                        stats["indicators"].add(indicator)
+                        stats["indicators"].add(indicator)  # type: ignore[attr-defined]
 
-                # Count extensions
+                # Count extensions, case-folded: LANGUAGE_PATTERNS /
+                # NO_EXTRACTOR_EXTENSIONS keys are lowercase and the
+                # membership tests downstream are case-sensitive, so
+                # raw suffixes made uppercase spellings (.C/.CPP/.PY —
+                # common in legacy C++ and Windows-authored trees)
+                # invisible to detection: a pure-.C repo detected
+                # zero languages through all three retry tiers, and a
+                # mixed repo silently lost its C++ bulk with no
+                # unsupported-primary warning.
                 if file_path.suffix:
-                    stats["extensions"][file_path.suffix] += 1
+                    stats["extensions"][file_path.suffix.lower()] += 1  # type: ignore[index]
 
-                stats["total_files"] += 1
+                stats["total_files"] += 1  # type: ignore[operator]
 
                 # Performance limit
-                if stats["scanned_files"] >= self.max_files:
+                if stats["scanned_files"] >= self.max_files:  # type: ignore[operator]
                     logger.warning(
-                        "Reached max file scan limit (%s), detection may be incomplete",
+                        "Reached max file scan limit (%s) — language "
+                        "statistics computed from a walk-order sample; "
+                        "confidence scores for long-tail languages may "
+                        "be distorted",
                         self.max_files
                     )
                     break
@@ -388,7 +573,7 @@ class LanguageDetector:
         for rel_dir in pruned_dirs:
             for indicator in indicators:
                 if self._indicator_matches(indicator, rel_dir):
-                    stats["indicators"].add(indicator)
+                    stats["indicators"].add(indicator)  # type: ignore[attr-defined]
 
         logger.debug("Scanned %s files", stats['scanned_files'])
         return stats
@@ -409,15 +594,308 @@ class LanguageDetector:
         # File-name indicator: must be a complete final segment.
         return relative_path == indicator or relative_path.endswith("/" + indicator)
 
-    def _walk_repository(self, pruned_dirs: list[str] | None = None):
+    def _walk_repository(
+        self, pruned_dirs: list[str] | None = None,
+    ) -> Iterator[Path]:
+        """Enumerate census files, preferring the git tracked baseline.
+
+        A raw directory walk also counts UNTRACKED content that
+        commonly nests inside real targets — run-output directories,
+        clone caches, scratch worktrees — and those files inflate
+        every language's file count and distort the confidence ratios
+        the detection gates reason over. Scratch directories carry
+        arbitrary names, so no ignore-list can enumerate them; the
+        git index can. When the target is a git work tree, the census
+        therefore comes from ``git ls-files`` (with the same ignore
+        policy applied on top); non-git targets keep the walk.
+
+        Args:
+            pruned_dirs: Optional accumulator. Receives the repo-
+                relative path (with trailing ``/``) of every ignored
+                directory excluded from the census, so the caller can
+                still treat the directory's presence as structural
+                evidence (e.g. ``node_modules/``) without scanning
+                its contents.
+        """
+        tracked = self._git_tracked_files()
+        if tracked is not None:
+            # Materialised so the banner reports the POST-filter count
+            # — what is actually counted, not the raw listing size
+            # (which includes entries the ignore policy then drops).
+            files = list(self._iter_tracked(tracked, pruned_dirs))
+            logger.info(
+                "File census from the git tracked baseline (%d files "
+                "after ignore policy) — untracked content (run output, "
+                "clone caches, scratch) is not counted",
+                len(files),
+            )
+            self._warn_untracked_exclusions()
+            yield from files
+            return
+        yield from self._walk_all_files(pruned_dirs)
+
+    def _git_tracked_files(self) -> list[str] | None:
+        """Repo-relative tracked paths from ``git ls-files``, or None
+        when the baseline is unavailable (not a git work tree, git
+        absent / failed / timed out, or an empty index — a fresh
+        ``git init`` over a source dump must keep the walk census).
+        A failure on a target that CARRIES a ``.git`` entry warns
+        loudly: that downgrade re-admits untracked content to the
+        census and a hostile repo can manufacture it, so it must be
+        distinguishable from a legit non-git target (debug only).
+
+        Security posture: the target repo is untrusted input. The
+        argv is list-based via ``safe_git_readonly_command`` under
+        the sanitised git env — the per-invocation ``-c`` pins are
+        the control here (``core.fsmonitor=``, hooksPath, askpass,
+        every transport refused): fsmonitor DOES fire on a plain
+        ``ls-files`` on current git, and git propagates the pins to
+        submodule children via GIT_CONFIG_PARAMETERS, so a hostile
+        repo or submodule config cannot turn the listing into code
+        execution. ``ls-files`` additionally never re-hashes worktree
+        content, which keeps clean/smudge filter drivers (repo-chosen
+        names no finite ``-c`` list can neutralise) out of reach.
+        """
+        try:
+            import subprocess
+
+            from core.git import get_safe_git_env, safe_git_readonly_command
+
+            result = subprocess.run(
+                safe_git_readonly_command(
+                    "-C", str(self.repo_path),
+                    # Submodule work trees are checked-out source;
+                    # without recursion their files vanish from the
+                    # census entirely (plain ls-files shows only the
+                    # gitlink entry, which is_file() drops).
+                    "ls-files", "-z", "--recurse-submodules",
+                ),
+                capture_output=True,
+                timeout=self._GIT_LS_TIMEOUT_S,
+                env=get_safe_git_env(),
+                check=False,
+            )
+        except Exception as e:  # noqa: BLE001 — baseline is best-effort; any failure degrades to the walk census
+            self._warn_baseline_degraded(str(e))
+            return None
+        if result.returncode != 0:
+            self._warn_baseline_degraded(f"exit {result.returncode}")
+            return None
+        # -z output is NUL-separated raw bytes (tracked paths need not
+        # be UTF-8); fsdecode spells them the way the walk's Path
+        # objects would. De-dup preserving order: a conflicted path
+        # holds one index entry PER STAGE mid-merge, and plain
+        # ls-files prints the name once per stage — counting it three
+        # times would inflate the census it exists to keep honest.
+        entries = list(dict.fromkeys(
+            os.fsdecode(part)
+            for part in result.stdout.split(b"\0")
+            if part
+        ))
+        if not entries:
+            return None
+        return entries
+
+    def _warn_baseline_degraded(self, reason: str) -> None:
+        """Loud on ``.git``-carrying targets, quiet otherwise (see
+        :meth:`_git_tracked_files`)."""
+        try:
+            has_git_entry = (self.repo_path / ".git").exists()
+        except OSError:
+            has_git_entry = False
+        if has_git_entry:
+            logger.warning(
+                "git tracked-file baseline probe failed on a target "
+                "that has a .git entry (%s) — census degrades to the "
+                "raw walk, so untracked content re-enters the counts",
+                reason,
+            )
+        else:
+            logger.debug("git tracked-file baseline unavailable: %s", reason)
+
+    def _warn_untracked_exclusions(self) -> None:
+        """Surface what the tracked baseline EXCLUDES. Census-only —
+        nothing here enters any count. A dirty development tree can
+        carry real not-yet-added source; dropping it from the
+        statistics silently would be operator-hostile, so the
+        exclusion is loud: one line with the excluded source-file
+        count, plus a dedicated line when an untracked build manifest
+        is dropped (a manifest steers the build-file gate, so its
+        absence can flip a detection).
+        """
+        try:
+            import subprocess
+
+            from core.git import get_safe_git_env, safe_git_readonly_command
+
+            result = subprocess.run(
+                safe_git_readonly_command(
+                    "-C", str(self.repo_path),
+                    "ls-files", "-z", "--others", "--exclude-standard",
+                ),
+                capture_output=True,
+                timeout=self._GIT_LS_TIMEOUT_S,
+                env=get_safe_git_env(),
+                check=False,
+            )
+        except Exception as e:  # noqa: BLE001 — visibility probe is best-effort; its loss never affects the census
+            logger.debug("untracked-exclusion probe unavailable: %s", e)
+            return
+        if result.returncode != 0:
+            return
+        source_exts: set[str] = set()
+        for patterns in self.LANGUAGE_PATTERNS.values():
+            source_exts |= patterns["extensions"]
+        build_files = self._get_all_build_files()
+        build_suffixes = self._get_all_build_suffixes()
+        n_source = 0
+        manifests: set[str] = set()
+        for part in result.stdout.split(b"\0"):
+            if not part:
+                continue
+            name = os.fsdecode(part).rsplit("/", 1)[-1]
+            if name in build_files or name.endswith(build_suffixes):
+                manifests.add(name)
+            if os.path.splitext(name)[1].lower() in source_exts:
+                n_source += 1
+        if n_source:
+            logger.warning(
+                "%d untracked source file(s) under the target are "
+                "excluded from the language census (tracked-baseline "
+                "policy) — commit them if they belong to the target",
+                n_source,
+            )
+        if manifests:
+            # Suffix-admitted manifest names (.csproj/.sln/.gemspec)
+            # carry the full repo-chosen basename — render inert
+            # before logging.
+            from core.security.log_sanitisation import sanitise_for_terminal
+            logger.warning(
+                "untracked build manifest(s) excluded from the "
+                "census: %s",
+                sanitise_for_terminal(
+                    ", ".join(sorted(manifests)), max_len=256,
+                ),
+            )
+
+    # Bounds for the ignored-dir PRESENCE probe in the tracked lane.
+    # Both directions: a SMALLER depth misses nested build outputs
+    # (module-level bin//obj/ sit one or two levels down in real
+    # trees) and their indicator evidence flips detections; a LARGER
+    # depth (or no dir cap) walks arbitrarily deep untracked scratch
+    # — the very cost the tracked baseline exists to avoid. Dir-only
+    # scandir at these bounds is a few ms even on scratch-laden
+    # targets.
+    _IGNORE_PROBE_MAX_DEPTH = 3
+    _IGNORE_PROBE_MAX_DIRS = 5_000
+
+    def _probe_ignored_dir_presence(
+        self,
+        pruned_dirs: list[str] | None,
+        seen_pruned: set[str],
+    ) -> None:
+        """Register IGNORE_DIRS presence as pruned-dir structural
+        evidence in the tracked lane.
+
+        Several IGNORE_DIRS members double as LANGUAGE_PATTERNS
+        indicators (``bin/``/``obj/`` for csharp, ``node_modules/``/
+        ``dist/`` for javascript), and in real repos they are
+        gitignored build outputs — absent from ls-files entirely — so
+        tracked entries alone cannot register the evidence the walk
+        lane gets from pruning them. Directory-only ``os.scandir``,
+        never descending INTO an ignored directory and never
+        enumerating files, bounded by depth and total-dirs caps (see
+        the constants above). Symlinked directories are not followed
+        (hostile targets ship ``dir -> /``).
+        """
+        if pruned_dirs is None:
+            return
+        stack: list[tuple[Path, str, int]] = [(self.repo_path, "", 0)]
+        scanned = 0
+        while stack:
+            cur, rel, depth = stack.pop()
+            try:
+                with os.scandir(cur) as it:
+                    for entry in it:
+                        try:
+                            if not entry.is_dir(follow_symlinks=False):
+                                continue
+                        except OSError:
+                            continue
+                        scanned += 1
+                        if scanned > self._IGNORE_PROBE_MAX_DIRS:
+                            return
+                        child_rel = f"{rel}{entry.name}/"
+                        if entry.name in self.IGNORE_DIRS:
+                            if child_rel not in seen_pruned:
+                                seen_pruned.add(child_rel)
+                                pruned_dirs.append(child_rel)
+                            continue
+                        if depth + 1 < self._IGNORE_PROBE_MAX_DEPTH:
+                            stack.append(
+                                (Path(entry.path), child_rel, depth + 1),
+                            )
+            except OSError:
+                continue
+
+    def _iter_tracked(
+        self,
+        tracked: list[str],
+        pruned_dirs: list[str] | None,
+    ) -> Iterator[Path]:
+        """Yield census files from the tracked baseline under the SAME
+        ignore policy as the walk: files below an IGNORE_DIRS segment
+        are excluded while the segment still registers as pruned-dir
+        structural evidence (untracked ignore-dirs register via the
+        presence probe), and IGNORE_FILES / IGNORE_SUFFIXES filtering
+        keeps declared build files.
+        """
+        build_files = self._get_all_build_files()
+        seen_pruned: set[str] = set()
+        self._probe_ignored_dir_presence(pruned_dirs, seen_pruned)
+        for rel in tracked:
+            parts = rel.split("/")
+            # Belt-and-braces: a git index cannot hold absolute or
+            # ``..`` paths, but this listing feeds Path joins against
+            # the target root — refuse escapes outright.
+            if rel.startswith("/") or ".." in parts:
+                continue
+            ignored_prefix: str | None = None
+            for i, segment in enumerate(parts[:-1]):
+                if segment in self.IGNORE_DIRS:
+                    ignored_prefix = "/".join(parts[: i + 1]) + "/"
+                    break
+            if ignored_prefix is not None:
+                if pruned_dirs is not None and ignored_prefix not in seen_pruned:
+                    seen_pruned.add(ignored_prefix)
+                    pruned_dirs.append(ignored_prefix)
+                continue
+            name = parts[-1]
+            if (
+                name not in build_files
+                and (name in self.IGNORE_FILES
+                     or name.endswith(self.IGNORE_SUFFIXES))
+            ):
+                continue
+            p = self.repo_path / rel
+            # Drops gitlink entries (directories) and tracked paths
+            # deleted from the work tree; follows file symlinks —
+            # matching what the walk census yields.
+            if p.is_file():
+                yield p
+
+    def _walk_all_files(
+        self, pruned_dirs: list[str] | None = None,
+    ) -> Iterator[Path]:
         """Walk repository while respecting ignore patterns.
 
-        Uses `os.walk` with in-place `dirnames` pruning so we
-        DON'T descend into ignored directories. Pre-fix `rglob`
-        walked the entire tree first then post-filtered via `if
-        any(ignored in path.parts)` — for repos with
-        `node_modules` (millions of files), `__pycache__`, or
-        large `target/` builds, that meant enumerating those
+        Fallback census for non-git targets (and git targets whose
+        baseline probe failed). Uses `os.walk` with in-place
+        `dirnames` pruning so we DON'T descend into ignored
+        directories. Pre-fix `rglob` walked the entire tree first
+        then post-filtered via `if any(ignored in path.parts)` — for
+        repos with `node_modules` (millions of files), `__pycache__`,
+        or large `target/` builds, that meant enumerating those
         files just to discard them, taking minutes on monorepos.
         os.walk + dirnames-prune skips the descent entirely.
 
@@ -429,7 +907,6 @@ class LanguageDetector:
                 evidence (e.g. ``node_modules/``) without scanning
                 its contents.
         """
-        import os
         # Declared build files (poetry.lock, yarn.lock, Gemfile.lock)
         # would otherwise be swallowed by the ".lock" ignore suffix —
         # detection evidence must win over noise filtering.
@@ -604,9 +1081,12 @@ class LanguageDetector:
         return supported
 
     # Class-level cache: the installed CLI's extractor set doesn't
-    # change mid-process. None = not probed yet; frozenset() = probe
-    # failed (conservative: probed languages read as unavailable, the
-    # statically-supported set is unaffected).
+    # change mid-process. None = not probed yet. Only SUCCESSFUL
+    # probes are cached: a transient `codeql resolve languages`
+    # failure used to lock in frozenset() for the process lifetime,
+    # silently dropping every probed language (rust) for the whole
+    # run — the current call still answers unavailable
+    # (conservative), but the next call re-probes.
     _extractor_langs: "frozenset[str] | None" = None
 
     def _extractor_available(self, language: str) -> bool:
@@ -621,6 +1101,7 @@ class LanguageDetector:
         cls = type(self)
         if cls._extractor_langs is None:
             langs: set[str] = set()
+            probe_ok = False
             try:
                 import re
                 import subprocess
@@ -644,15 +1125,27 @@ class LanguageDetector:
                         check=False, env=RaptorConfig.get_safe_env(),
                     )
                     if result.returncode == 0:
+                        probe_ok = True
                         # Lines look like: "rust (/path/to/extractor)"
                         for line in result.stdout.splitlines():
                             m = re.match(r"^\s*([a-z][\w+-]*)\s*\(", line)
                             if m:
                                 langs.add(m.group(1))
+                    else:
+                        logger.warning(
+                            "codeql resolve languages exited %s — "
+                            "probed languages read as unavailable for "
+                            "this call; will re-probe",
+                            result.returncode,
+                        )
             except Exception as e:  # noqa: BLE001 — probe must never crash detection
                 logger.debug("codeql extractor probe failed: %s", e)
                 langs = set()
-            cls._extractor_langs = frozenset(langs)
+            if probe_ok:
+                cls._extractor_langs = frozenset(langs)
+            # Failed probes are NOT cached (see the class attribute
+            # comment): answer conservatively now, re-probe next call.
+            return language in langs
         return language in cls._extractor_langs
 
 
@@ -680,18 +1173,26 @@ def main() -> None:
             }
             for lang, info in supported.items()
         }
-        print(dumps_display(output, indent=2))
+        # ensure_ascii: extension/build-file names come from the
+        # scanned repo; C1 controls pass raw without it.
+        print(json.dumps(output, indent=2, ensure_ascii=True, default=str))
     else:
         print(f"\n{'=' * 70}")
         print("DETECTED LANGUAGES (CodeQL-supported only)")
         print(f"{'=' * 70}")
+        from core.security.log_sanitisation import sanitise_for_terminal
         for lang, info in supported.items():
             print(f"\n{lang.upper()}:")
             print(f"  Confidence: {info.confidence:.2f}")
             print(f"  Files: {info.file_count}")
             print(f"  Extensions: {', '.join(info.extensions_found)}")
             if info.build_files_found:
-                print(f"  Build files: {', '.join(info.build_files_found)}")
+                # Build-file names come from the scanned repo (the
+                # same field the --json lane gets ensure_ascii for);
+                # suffix-match admission keeps the full hostile
+                # basename on .csproj/.sln/.gemspec hits.
+                print("  Build files: "
+                      f"{sanitise_for_terminal(', '.join(info.build_files_found), max_len=512)}")
 
 
 if __name__ == "__main__":

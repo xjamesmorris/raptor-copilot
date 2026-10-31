@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from core.audit import vocab_packs
@@ -44,6 +46,46 @@ class TestKernelPack:
         a = load_pack("linux_kernel")
         b = load_pack("linux_kernel")
         assert a is b
+
+
+class TestMalformedPacks:
+    """The documented contract is None + a logged warning on ANY
+    malformed pack — never an exception, never a silently degraded
+    vocabulary (a string-valued name list used to become a frozenset
+    of single characters)."""
+
+    @staticmethod
+    def _write(tmp_path, monkeypatch, payload: str) -> None:
+        monkeypatch.setattr(vocab_packs, "_PACK_DIR", tmp_path)
+        (tmp_path / "p.json").write_text(payload, encoding="utf-8")
+
+    def test_string_valued_name_list_returns_none(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        self._write(tmp_path, monkeypatch, '{"allocators": "kmalloc"}')
+        with caplog.at_level(logging.WARNING):
+            assert load_pack("p") is None
+        assert any("malformed" in r.getMessage() for r in caplog.records)
+
+    def test_list_shaped_auth_predicates_returns_none(
+        self, tmp_path, monkeypatch,
+    ):
+        self._write(tmp_path, monkeypatch, '{"auth_predicates": ["x"]}')
+        assert load_pack("p") is None
+
+    def test_string_lock_pairs_returns_none(self, tmp_path, monkeypatch):
+        self._write(tmp_path, monkeypatch, '{"lock_pairs": "ab"}')
+        assert load_pack("p") is None
+
+    def test_failed_load_is_not_cached(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(vocab_packs, "_PACK_DIR", tmp_path)
+        assert load_pack("p") is None
+        (tmp_path / "p.json").write_text(
+            '{"allocators": ["kmalloc"]}', encoding="utf-8",
+        )
+        pack = load_pack("p")
+        assert pack is not None
+        assert "kmalloc" in pack.allocators
 
 
 class TestKernelTreeDetection:

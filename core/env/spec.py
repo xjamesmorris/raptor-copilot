@@ -116,7 +116,27 @@ class RunSpec:
         if isinstance(d.get("env"), dict):
             d["env"] = tuple(sorted(d["env"].items()))
         elif isinstance(d.get("env"), list):
-            d["env"] = tuple(tuple(pair) for pair in d["env"])
+            # Accept the natural compose/docker spelling ("KEY=VALUE"
+            # strings) alongside pair lists. A bare tuple() over a
+            # string char-splits it, constructing a spec that only
+            # crashes much later at provision time (env_dict) — reject
+            # anything else loudly HERE instead.
+            pairs: list[tuple[Any, Any]] = []
+            for pair in d["env"]:
+                if isinstance(pair, str):
+                    key, sep, value = pair.partition("=")
+                    if not sep or not key:
+                        raise ValueError(
+                            f"RunSpec env entry {pair!r} is not KEY=VALUE "
+                            "(pass-through entries are not supported)")
+                    pairs.append((key, value))
+                elif isinstance(pair, (list, tuple)) and len(pair) == 2:
+                    pairs.append(tuple(pair))
+                else:
+                    raise ValueError(
+                        f"RunSpec env entry {pair!r} is not a "
+                        "(key, value) pair or a 'KEY=VALUE' string")
+            d["env"] = tuple(pairs)
         if isinstance(d.get("entrypoint"), list):
             d["entrypoint"] = tuple(d["entrypoint"])
         return cls(**d)

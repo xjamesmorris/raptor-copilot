@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
 from core.json.jsonc import load_jsonc
+from core.source.contained import read_contained
 
 if TYPE_CHECKING:
     from types import TracebackType
@@ -259,6 +260,11 @@ class SourceBuildResult:
 # -- main builder ----------------------------------------------------------
 
 
+# git ref grammar subset for release tags: no separators that could
+# re-route the codeload URL (/ ? # % whitespace), no leading dash.
+_SAFE_TAG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~@-]{0,199}")
+
+
 class SourceBuilder:
     """Clone + checkout + discovery. Use as context manager for auto-cleanup."""
 
@@ -358,7 +364,7 @@ class SourceBuilder:
             )
 
         dockerfile_path = self._find_dockerfile(target)
-        dockerfile_text = self._read_dockerfile(dockerfile_path)
+        dockerfile_text = self._read_dockerfile(dockerfile_path, target)
         warnings = outcome.warnings
         devcontainer_image = self._find_devcontainer_image(target)
         if devcontainer_image is not None:
@@ -547,8 +553,16 @@ class SourceBuilder:
         return out
 
     def _download_tarball(self, owner: str, repo: str, tag: str, target: Path) -> bool:
+        # ``tag`` comes from the (potentially attacker-chosen) repo's own
+        # tag list: refuse ref shapes that would re-route the request
+        # path/query, and percent-encode the remainder. Host stays fixed
+        # to codeload.github.com either way; this closes the
+        # different-archive-than-asked-for path.
+        if not _SAFE_TAG_RE.fullmatch(tag):
+            return False
         codeload_url = (
-            f"https://codeload.github.com/{owner}/{repo}/tar.gz/refs/tags/{tag}"
+            "https://codeload.github.com/"
+            f"{owner}/{repo}/tar.gz/refs/tags/{urllib.parse.quote(tag, safe='')}"
         )
         try:
             payload = _http_get_bytes(
@@ -705,46 +719,80 @@ class SourceBuilder:
             return False
         return outcome.returncode == 0
 
+    @staticmethod
+    def _contained_repo_file(repo_dir: Path, path: Path) -> Path | None:
+        """Return ``path`` iff it is a regular file whose resolved target
+        stays inside ``repo_dir`` (symlinked parents included); else None.
+
+        ``git clone`` runs on the HOST and materialises committed
+        symlinks verbatim (mode-120000 blobs, absolute and ``..``
+        targets included), so a hostile repo carrying
+        ``Dockerfile -> /etc/...`` would otherwise hand host file
+        content to every clone-path reader. The tarball fallback
+        already refuses this class via ``extract(filter="data")``
+        (out-of-tree link targets rejected, in-tree links kept) — this
+        is the clone path's equivalent of that rule, shared by every
+        repo-file probe/read below so the two acquisition paths cannot
+        drift apart again.
+        """
+        try:
+            resolved = path.resolve()
+            if not resolved.is_relative_to(repo_dir.resolve()):
+                return None
+            if not resolved.is_file():
+                return None
+        except OSError:
+            return None
+        return path
+
     def _find_dockerfile(self, repo_dir: Path) -> Path | None:
         for loc in _DOCKERFILE_LOCATIONS:
             path = repo_dir / loc
-            if path.is_file():
+            if self._contained_repo_file(repo_dir, path) is not None:
                 return path
         for name in _DOCKERFILE_GLOB_NAMES:
             for candidate in repo_dir.rglob(name):
+                if self._contained_repo_file(repo_dir, candidate) is None:
+                    continue
                 rel = candidate.relative_to(repo_dir)
                 if not any(p in str(rel).lower() for p in _SKIP_DOCKERFILE_SUBSTRINGS):
                     return candidate
         return None
 
-    def _read_dockerfile(self, path: Path | None) -> str | None:
+    def _read_dockerfile(self, path: Path | None, repo_dir: Path) -> str | None:
         if path is None:
             return None
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError:
+        # Re-vet at read time (not only at find time) so no future caller
+        # can hand this reader an unvetted repo path.
+        if self._contained_repo_file(repo_dir, path) is None:
             return None
-        # Cap at 64 KiB: real Dockerfiles are much smaller; anything bigger is
-        # pathological and would bloat the tool_result payload.
-        max_bytes = 64 * 1024
-        if len(text) > max_bytes:
-            return text[:max_bytes]
-        return text
+        # The read itself goes through the containment-checked capped-read
+        # chokepoint: confine() re-resolves under the repo root and the
+        # open carries O_NOFOLLOW plus fstat(S_ISREG) on the OPENED fd —
+        # a symlink (or FIFO/device) swapped in between the vet above and
+        # the read is refused at the fd, never by a re-check of the name
+        # (which would just re-open the same race). Cap at 64 KiB: real
+        # Dockerfiles are much smaller; anything bigger is pathological
+        # and would bloat the tool_result payload.
+        return read_contained(repo_dir, path, max_chars=64 * 1024)
 
     def _find_build_config(self, repo_dir: Path) -> str | None:
         for filename, build_type in _BUILD_CONFIG_TO_TYPE.items():
-            if (repo_dir / filename).is_file():
+            if self._contained_repo_file(repo_dir, repo_dir / filename) is not None:
                 return build_type
         return None
 
     def _find_devcontainer_image(self, repo_dir: Path) -> str | None:
         for rel in (_DEVCONTAINER_JSON, _DEVCONTAINER_ROOT_JSON):
             path = repo_dir / rel
-            if not path.is_file():
+            if self._contained_repo_file(repo_dir, path) is None:
                 continue
-            try:
-                raw = path.read_text(encoding="utf-8")
-            except OSError:
+            # Same fd-disciplined chokepoint read as _read_dockerfile
+            # (O_NOFOLLOW + fstat on the opened fd defeats a vet-to-read
+            # swap); also bounds a pathological devcontainer.json, which
+            # the old bare read_text() loaded whole.
+            raw = read_contained(repo_dir, path, max_chars=64 * 1024)
+            if raw is None:
                 continue
             # devcontainer.json is JSONC (// and /* */ comments,
             # trailing commas); load_jsonc strips comment markers
@@ -851,7 +899,12 @@ def _http_get_json(url: str, *, timeout: int) -> Any:
         return None
 
 
-_LINK_NEXT_RE = re.compile(r'<([^>]+)>;\s*rel="next"')
+# The URL body excludes both angle brackets: with ``[^>]`` alone, a
+# response header repeating ``<`` inside one ``>``-free run made
+# every opener re-scan the run — quadratic. RFC 8288 URI references
+# cannot carry a raw ``<``, so valid headers match identically (a
+# malformed nested-``<`` header now yields the innermost span).
+_LINK_NEXT_RE = re.compile(r'<([^<>]+)>;\s*rel="next"')
 
 
 def _http_get_json_paginated(url: str, *, timeout: int) -> tuple[Any, str | None]:

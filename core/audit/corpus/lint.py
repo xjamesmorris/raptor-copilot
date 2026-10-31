@@ -61,6 +61,7 @@ from core.json import dumps_artifact, load_json
 
 from .label import FunctionLabel, compute_span_sha, load_label
 from .sources import FIXTURES_DIR
+from core.source.lines import split_lines
 
 LABELS_DIR = Path(__file__).parent / "labels"
 
@@ -223,6 +224,44 @@ def schema_check(pairs: Sequence[tuple[Path, FunctionLabel]]) -> list[str]:
         if not label.labeled_at.strip():
             err("labeled_at is empty")
     return errors
+
+
+# Labels whose expected grade asserts a real defect: these need PUBLIC
+# provenance (a CVE or an upstream fix commit) — the corpus must never
+# carry an undisclosed vulnerability as ground truth.
+_VULNERABLE_STATUSES = frozenset({"finding", "suspicious"})
+
+
+def provenance_check(
+    pairs: Sequence[tuple[Path, FunctionLabel]],
+) -> list[str]:
+    """WARNINGS (never failures) for vulnerable-class labels that
+    carry neither ``cve`` nor ``fix_commit``. A warning, not an error:
+    existing labels predate the field, and provenance may live in the
+    rationale prose — the warning surfaces the gap for curation.
+
+    Carve-out, keyed EXPLICITLY on the provenance kind: a
+    ``synthetic_mutant`` label has no public provenance by
+    construction (its defect is machine-introduced on a pinned clean
+    ref and the kind field declares exactly that), so warning on it
+    would only train operators to ignore this warning where it is
+    real.  The schema separately refuses cve/fix_commit on synthetic
+    labels, so the carve-out can never hide a laundered anchor."""
+    warnings: list[str] = []
+    for path, label in pairs:
+        if label.provenance_kind == "synthetic_mutant":
+            continue
+        if (
+            label.expected_status in _VULNERABLE_STATUSES
+            and not label.cve.strip()
+            and not label.fix_commit.strip()
+        ):
+            warnings.append(
+                f"{path}: {label.function_id}: vulnerable-class label "
+                f"({label.expected_status}) has no public provenance — "
+                f"set cve or fix_commit"
+            )
+    return warnings
 
 
 def expected_rule_hits_check(
@@ -461,10 +500,10 @@ def _tree_search(tree: Path, name: str, limit: int = 3) -> list[str]:
                 continue
             fpath = Path(root) / fname
             try:
-                text = fpath.read_text(encoding="utf-8", errors="replace")
+                text = fpath.read_text(encoding="utf-8", errors="replace")  # raw-open: operator-curated corpus tree (eval lane)
             except OSError:
                 continue
-            for i, line in enumerate(text.splitlines()):
+            for i, line in enumerate(split_lines(text)):
                 if pattern.search(line):
                     rel = fpath.relative_to(tree)
                     hits.append(f"{rel}:{i + 1}")
@@ -627,14 +666,14 @@ def verify_pin(
             )
 
     try:
-        text = src_file.read_text(encoding="utf-8", errors="replace")
+        text = src_file.read_text(encoding="utf-8", errors="replace")  # raw-open: operator-curated corpus tree (eval lane)
     except OSError as exc:
         return PinCheck(
             label=label, path=path, outcome=PIN_MISSING,
             detail=f"unreadable: {exc}",
         )
     return _check_span(
-        label, text.splitlines(), rel_file, path,
+        label, split_lines(text), rel_file, path,
         tree=tree, tree_search=tree_search,
     )
 
@@ -846,6 +885,8 @@ def main(argv: list[str] | None = None) -> int:
     schema_errors.extend(expected_rule_hits_check(pairs))
 
     print(f"Loaded {len(pairs)} label(s) from {len(files)} file(s)")
+    for w in provenance_check(pairs):
+        print(f"WARNING: {w}")
     if schema_errors:
         print(f"{len(schema_errors)} schema error(s):", file=sys.stderr)
         for e in schema_errors:

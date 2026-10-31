@@ -10,8 +10,9 @@ module fixes once:
   toolchain recorder) instead of ``RaptorConfig.get_safe_env()`` —
   version probes exec real binaries, and env-injection vectors
   (``JAVA_TOOL_OPTIONS``, ``LD_PRELOAD``…) apply to them like any
-  other subprocess. Probes here always use the safe env when
-  ``core.config`` is importable.
+  other subprocess. Probes here always use the sanitised env
+  (``safe_subprocess_env``): when ``core.config`` cannot import,
+  the probe gets a minimal allowlisted env — never the parent's.
 * **TOCTOU**: some probes ``which()``-checked availability and then
   exec'd the BARE tool name, letting a PATH rewrite between check and
   exec swap the binary (the race packages/coccinelle/runner.py
@@ -38,12 +39,21 @@ import shutil
 import subprocess
 import threading
 from dataclasses import dataclass, field
+from core.security.env_sanitisation import safe_subprocess_env
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["ToolInfo", "probe", "reset_probe_cache"]
 
-_VERSION_RE = re.compile(r"(\d+)\.(\d+)(?:\.(\d+))?")
+# (?<!\d) pins the match to the start of its digit run (a bare
+# leading \d+ re-scans a digit run from every position — quadratic);
+# the earliest match always starts at the run start, so the
+# extracted version is unchanged.
+_VERSION_RE = re.compile(r"(?<!\d)(\d+)\.(\d+)(?:\.(\d+))?")
+
+#: Per-stream retention cap on probe output (see the run call for the
+#: rationale). 64k chars keeps every real tool's banner intact.
+_CAPTURE_RETAIN_CHARS = 64 * 1024
 
 _CACHE_LOCK = threading.Lock()
 _CACHE: dict[tuple[str, tuple[str, ...]], ToolInfo | None] = {}
@@ -88,16 +98,6 @@ class ToolInfo:
         return tuple(int(g) for g in m.groups() if g is not None)
 
 
-def _safe_env() -> dict | None:
-    """Sanitised env for the probe; ``None`` (inherit) only when
-    core.config is unimportable (early-bootstrap callers)."""
-    try:
-        from core.config import RaptorConfig
-    except ImportError:
-        return None
-    return RaptorConfig.get_safe_env()
-
-
 def probe(
     name: str,
     *,
@@ -131,13 +131,20 @@ def probe(
                 text=True,
                 check=False,
                 timeout=timeout,
-                env=_safe_env(),
+                env=safe_subprocess_env(),
             )
+            # Retention cap: probes exec whatever PATH resolves, and a
+            # hostile tool can answer --version with an arbitrarily
+            # large stream — every ToolInfo consumer wants a first
+            # line, not the payload. The capture itself stays
+            # subprocess.run (the module's patched-run test contract);
+            # its transient buffer is bounded in practice by the probe
+            # timeout.
             info = ToolInfo(
                 name=name, path=path, args=args,
                 returncode=proc.returncode,
-                stdout=proc.stdout or "",
-                stderr=proc.stderr or "",
+                stdout=(proc.stdout or "")[:_CAPTURE_RETAIN_CHARS],
+                stderr=(proc.stderr or "")[:_CAPTURE_RETAIN_CHARS],
             )
         except (subprocess.TimeoutExpired, OSError) as exc:
             logger.debug("toolprobe: %s %s failed: %s", name, args, exc)

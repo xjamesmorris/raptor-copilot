@@ -271,7 +271,12 @@ def estimate(
             # twice — e.g. merged cross-run panels. Keep the first
             # observation; silently letting the last record win would
             # replace an already-counted vote, and counting both would
-            # double-weight one model.
+            # double-weight one model. First-wins is the panel
+            # contract shared with panel_log.load_from_paths (docs),
+            # calibrated_aggregation's same-model dedupe, and
+            # replay._recorded_verdict_index — all four must agree or
+            # replay flips get computed against a different run than
+            # the panels that fed the EM.
             duplicates_ignored += 1
             continue
         by_model[r.model] = r.verdict

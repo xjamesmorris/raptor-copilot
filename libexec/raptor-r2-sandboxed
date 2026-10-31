@@ -221,7 +221,7 @@ if not target_dir:
 # normally and stack correctly on top of the per-ns mounts. So we pass
 # target_dir through unmodified and let mount_ns make the decision.
 
-from core.sandbox import sandbox  # noqa: E402
+from core.sandbox import sandbox, SandboxSetupError  # noqa: E402
 
 try:
     with sandbox(
@@ -268,7 +268,13 @@ try:
             timeout=1800,
             strict_env=True,
         )
-except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as e:
+except (SandboxSetupError, OSError, RuntimeError, ValueError,
+        subprocess.TimeoutExpired) as e:
+    # SandboxSetupError subclasses BaseException by design (it must
+    # escape broad `except Exception` layers), so it has to be NAMED
+    # here — otherwise an engage failure tracebacks and exits 1,
+    # inside r2's own 0-127 range that the ≥100 wrapper codes exist
+    # to disambiguate.
     _die(f"sandbox invocation failed: {e.__class__.__name__}: {e}",
          code=_RC_WRAPPER_SANDBOX_FAILED)
 

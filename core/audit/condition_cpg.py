@@ -147,7 +147,7 @@ class InterproceduralGuardResult:
 # sink_function is often just a bare name without package prefix.
 #
 # Query patterns validated against:
-#   - callers: .caller.fullName.l
+#   - callers: .callIn (call-site nodes; lineNumber = the call line)
 #   - guards:  .ast.isControlStructure.condition.code.l
 #   - packages/joern/runner.py _build_taint_query: reachableByFlows
 
@@ -231,18 +231,23 @@ def _build_dominance_query(
 
 
 def _build_callers_query(function_name: str) -> str | None:
-    """Find all callers of a function.
+    """Find all call sites of a function.
 
-    Uses .caller (not .callIn) — resolves to the calling METHOD
-    rather than the call site node.
+    Uses .callIn (not .caller) — resolves to the CALL SITE nodes, whose
+    lineNumber is the line of the call inside the caller's body. A
+    Method node's lineNumber is its declaration line, which never
+    matches the isCall line filter in the caller-guards query, so a
+    .caller-based tuple would make every call site read as unguarded.
+    One tuple per call site: a caller with several call sites is
+    checked at each of them.
     """
     safe = _safe_name(function_name)
     if safe is None:
         return None
     return (
         f'cpg.method.name("{safe}")'
-        f".caller"
-        f".map(m => (m.filename, m.name, m.lineNumber.getOrElse(0)))"
+        f".callIn"
+        f".map(c => (c.method.filename, c.method.name, c.lineNumber.getOrElse(0)))"
         f".l"
     )
 
@@ -253,8 +258,10 @@ def _build_caller_guards_query(
 ) -> str | None:
     """Find guard conditions enclosing a call site in a caller.
 
-    Pattern:
-    .ast.isControlStructure.controlStructureType("IF").condition.code.l
+    ``call_line`` must be the CALL-SITE line (the .callIn lineNumber
+    from the callers query), never the caller's declaration line —
+    the isCall line filter anchors on the call itself, then .inAst
+    walks its AST ancestors to collect enclosing IF conditions.
     """
     safe = _safe_name(caller_method)
     if safe is None:
@@ -263,7 +270,7 @@ def _build_caller_guards_query(
         f'cpg.method.name("{safe}")'
         f".ast.isCall"
         f".filter(_.lineNumber == Some({call_line}))"
-        f'.inAst.filter(_.isControlStructure).where(_.controlStructureType("IF"))'
+        f'.inAst.isControlStructure.controlStructureType("IF")'
         f".condition.code.l"
     )
 
@@ -344,7 +351,7 @@ def verify_guard_relevance_cpg(
                     guard_idents_cpg = _run_query(joern_server, guard_q)
                     sink_idents_cpg = _run_query(joern_server, sink_q)
                     if guard_idents_cpg and sink_idents_cpg:
-                        overlap = set(guard_idents_cpg) & set(sink_idents_cpg)
+                        overlap = set(guard_idents_cpg) & set(sink_idents_cpg)  # type: ignore[no-redef,assignment]
                         result.data_dep_bound = bool(overlap)
                         result.tainted_vars_in_guard = sorted(overlap)
                     elif guard_idents_cpg is None or sink_idents_cpg is None:
@@ -640,18 +647,37 @@ def _run_query(server: Any, query: str) -> list | None:
 
 
 def _split_scala_items(text: str) -> list:
-    """Split comma-separated items, respecting double-quoted strings."""
+    """Split comma-separated items, respecting double-quoted strings.
+
+    Backslash escapes inside strings are honoured like
+    :func:`_extract_list_literal` beside it — a Scala-escaped ``\\"``
+    in an element (an identifier echoed with a quote) must not toggle
+    the string state and shear every later element at the wrong
+    comma.
+    """
     items: list[str] = []
     current: list[str] = []
     in_quotes = False
+    escaped = False
     for ch in text:
-        if ch == '"' and not in_quotes:
+        if escaped:
+            escaped = False
+            current.append(ch)
+            continue
+        if in_quotes:
+            if ch == "\\":
+                escaped = True
+                current.append(ch)
+                continue
+            if ch == '"':
+                in_quotes = False
+                continue
+            current.append(ch)
+            continue
+        if ch == '"':
             in_quotes = True
             continue
-        if ch == '"' and in_quotes:
-            in_quotes = False
-            continue
-        if ch == ',' and not in_quotes:
+        if ch == ',':
             items.append("".join(current).strip())
             current = []
             continue
@@ -666,7 +692,12 @@ def _split_scala_items(text: str) -> list:
 # (``val res0: List[String] = List(...)``).  Intermediate statement
 # binders (``val src: ... = ...`` in the taint query) echo too, so
 # only ``res<N>`` binders anchor the answer and the LAST one wins.
-_VAL_ECHO_RE = re.compile(r"val res\d+: .*? = ")
+# The type window is bounded: unbounded, echo text that repeats
+# ``val res0: `` makes every occurrence re-scan the rest of the line
+# for `` = `` — quadratic on hostile-code-derived output. A real
+# binder type sits far inside 1000 chars (trade-off: a longer type
+# stops matching, versus an unbounded scan).
+_VAL_ECHO_RE = re.compile(r"val res\d+: .{0,1000}? = ")
 
 
 def _extract_list_literal(body: str) -> str | None:
@@ -802,7 +833,7 @@ def _fallback_interprocedural(
         if not lang:
             continue
 
-        for i, line in enumerate(source.split("\n"), 1):
+        for i, line in enumerate(source.split("\n"), 1):  # line-model: source_map reads are universal-newline (read_contained)
             if call_pattern.search(line):
                 guards = extract_sink_guards(
                     source, fp, sink_lines=[i],

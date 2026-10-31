@@ -41,7 +41,6 @@ from core.atomic_fs import write_text_atomically
 from core.hash import sha256_file as _sha256_file
 from core.json import JsonBudgetExceededError, dumps_artifact, load_json_bounded
 
-from .binary_oracle import read_build_id
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +49,10 @@ logger = logging.getLogger(__name__)
 # the serialised edge format (BinaryEdgeIndex fields, edge record
 # shape). Old cache entries with a stale version are ignored and the
 # extractor re-runs from scratch.
-_EDGE_CACHE_VERSION = 1
+# v2: the payload carries a mandatory ``binary_sha256`` binding the
+# entry to the analysed binary's content (see _load_cached_index);
+# v1 entries lack the field and re-extract once.
+_EDGE_CACHE_VERSION = 2
 
 # One cached edge index. Indexes are per-build-id and grow with
 # the binary's call graph; the cache dir is shared, so a planted
@@ -88,6 +90,26 @@ def _content_hash(binary_path: Path) -> str | None:
         return None
 
 
+def _identity_cache_key(binary_path: Path) -> str | None:
+    """Edge-cache key: the module's content-identity VALUE via the
+    kind-aware front door (build-id for ELF, LC_UUID for the thin
+    Mach-O slice, canonical GUID+age for PE, whole-file sha256
+    otherwise).  Every kind's value is a lowercase hex run, so
+    ``_cache_path_for``'s validator applies unchanged; ELF and
+    hash-fallback keys are byte-identical to the historical
+    build-id-or-hash scheme, keeping existing cache entries valid.
+    The format sniff means no readelf spawn ever runs on non-ELF
+    bytes."""
+    try:
+        from core.binary.identity import content_identity
+        ident = content_identity(binary_path)
+    except Exception:  # noqa: BLE001 — cache keying is an optimisation; the hash fallback still keys
+        ident = None
+    if ident is not None:
+        return ident.value
+    return _content_hash(binary_path)
+
+
 def _fn_addr(f: dict) -> int | None:
     """Function entry address from an ``aflj`` record. r2 6.x keys this
     as ``addr``; r2 5.x (the version Ubuntu/Debian apt ships, used by the
@@ -116,9 +138,9 @@ _BUILD_ID_RE = re.compile(r"^[0-9a-f]{8,128}$")
 def _cache_path_for(build_id: str) -> Path | None:
     """Cache path for a given build_id, or ``None`` when the build_id
     isn't a safely-embeddable hex string. Belt-and-braces against any
-    future regression in the upstream ``read_build_id`` helper: a
-    hostile binary defining its build_id note (e.g. arbitrary bytes in
-    ``.note.gnu.build-id``) could otherwise drive cache-file path
+    future regression in the upstream identity helpers: a hostile
+    binary defines its own identity bytes (``.note.gnu.build-id``,
+    LC_UUID, RSDS record) and could otherwise drive cache-file path
     composition. Validate at use-site, not just at production."""
     if not isinstance(build_id, str) or not _BUILD_ID_RE.match(build_id):
         return None
@@ -180,6 +202,35 @@ def _load_cached_index(
             cached_path, binary_path,
         )
         return None
+    # Content binding: version and
+    # binary_path only bind the entry to a NAME. The cache outlives
+    # the run, so an extraction persisted while impostor bytes sat at
+    # the name (pin-bracket withholds the edges from THAT run, but the
+    # impl already wrote the cache), or a pre-poisoned file dropped
+    # under the shared cache dir with the right version+path, would be
+    # served on the NEXT run — after the identity pin re-verifies
+    # against the restored honest binary. Bind the payload to the
+    # binary's content sha, exactly as _try_graph_store binds
+    # graph-store reuse. Same posture as binary_path: the field must
+    # be PRESENT and match — missing/non-string is a miss, never a
+    # pass (a crafted payload could otherwise just omit it).
+    cached_sha = payload.get("binary_sha256")
+    if not isinstance(cached_sha, str):
+        logger.warning(
+            "binary_oracle_edges: cache entry for %s lacks a valid "
+            "binary_sha256 field; treating as cache miss",
+            binary_path,
+        )
+        return None
+    current_sha = _content_hash(Path(binary_path))
+    if current_sha is None or cached_sha != current_sha:
+        logger.warning(
+            "binary_oracle_edges: cache entry for %s was extracted "
+            "from different binary content than the bytes now at the "
+            "name; treating as cache miss (re-extracting)",
+            binary_path,
+        )
+        return None
     edges_raw = payload.get("edges") or []
     idx = BinaryEdgeIndex(binary_path=binary_path)
     for r in edges_raw:
@@ -199,10 +250,24 @@ def _save_cached_index(cache_file: Path, idx: BinaryEdgeIndex) -> None:
     """Persist the edge index. Best-effort — IO failures are logged at
     debug and don't break the extraction path."""
     try:
+        # Content binding: stamp the sha of the bytes at the name at
+        # save time so the load side can refuse the entry once the
+        # binary's content changes (or was never what the entry
+        # claims). An entry the saver cannot hash could only ever
+        # load as a miss — skip the write instead of persisting a
+        # payload one field short of the contract in a shared dir.
+        content_sha = _content_hash(Path(idx.binary_path))
+        if content_sha is None:
+            logger.debug(
+                "binary_oracle_edges: cache write skipped for %s "
+                "(binary unreadable at save time — cannot bind the "
+                "entry to its content)", idx.binary_path)
+            return
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "version":     _EDGE_CACHE_VERSION,
-            "binary_path": idx.binary_path,
+            "version":       _EDGE_CACHE_VERSION,
+            "binary_path":   idx.binary_path,
+            "binary_sha256": content_sha,
             "edges": [
                 {"caller": e.caller, "callee": e.callee,
                  "binary_path": e.binary_path}
@@ -254,7 +319,8 @@ def _try_graph_store(binary_path: Path) -> BinaryEdgeIndex | None:
     # the project-dir search leg never fired.
     projects_dir: Path | None
     try:
-        from core.project.project import PROJECTS_DIR as projects_dir
+        from core.project.project import PROJECTS_DIR as projects_dir_  # noqa: N812
+        projects_dir = projects_dir_
     except ImportError:
         projects_dir = None
     if projects_dir is not None:
@@ -282,7 +348,6 @@ def _try_graph_store(binary_path: Path) -> BinaryEdgeIndex | None:
                 latest = summary.get("latest_snapshot") or {}
                 if latest.get("binary_sha256") != requested_sha256:
                     continue
-                _CALL_KINDS = {"CALLS", "CALLS_FUNCTION", "CALLS_SURFACE"}
                 raw_edges = query_edges(gpath, kind=None)
             except Exception as exc:  # noqa: BLE001 - best-effort cache reuse only
                 logger.debug(
@@ -340,12 +405,88 @@ def extract_direct_call_edges(
     consumer treats absence as 'no binary evidence'; never licenses
     additional suppression).
 
+    Identity-pinned binaries (project-store entries whose content
+    witness was verified fd-honestly at load —
+    ``RaptorConfig.BINARY_ORACLE_IDENTITY_PINS``) are re-verified
+    BRACKETING the extraction, the same discipline the classify pass
+    applies: fd-honest open + fstat + hash before anything reads the
+    path (including the content-keyed caches, whose keys are derived
+    by name), fd held across the extraction, held-fd re-hash +
+    by-name inode check after. Any failure — including a load-time
+    ``None`` pin — WITHHOLDS the edges (empty index, the documented
+    'no binary evidence' shape): edges are positive-reachability
+    evidence attributed to the pinned path, and bytes the witness
+    never verified must not steer reachability under its authority.
+    Never a run refusal, and unpinned paths (auto-detect, --binary,
+    env-build) verify nothing. Residual stated honestly: r2 re-opens
+    the path by name inside its sandbox, so a swap-in/swap-back pair
+    completing entirely within the extraction evades both bracket
+    checks.
+
     ``use_cache`` controls the per-build_id cache (under
     ``out/binary-oracle-precision/edge-cache/<build_id>.json``).
     A cache hit returns near-instantly; a miss runs the full r2
     extraction and persists the result. Pass False to force re-extract
     (test scenarios, debugging cache staleness)."""
     binary_path = Path(binary_path)
+    from core.config import RaptorConfig
+    pins = RaptorConfig.BINARY_ORACLE_IDENTITY_PINS
+    key = str(binary_path)
+    if key not in pins:
+        return _extract_direct_call_edges_impl(
+            binary_path, timeout=timeout, use_cache=use_cache)
+    from core.security.log_sanitisation import escape_nonprintable
+    pin = pins[key]
+    if pin is None:
+        # Demoted at load time (witness unverifiable: plant or
+        # content drift) — already warned there; edges from those
+        # bytes carry no witness authority.
+        logger.warning(
+            "binary_oracle_edges: %s was demoted at witness load — "
+            "withholding its call edges (no binary evidence)",
+            escape_nonprintable(key))
+        return BinaryEdgeIndex(binary_path=key)
+    # Same-package bracket helpers as the classify pass (shared so
+    # the two consumers cannot drift on what 'verified' means).
+    from core.analysis.binary_oracle import (
+        _pin_open_verified,
+        _pin_still_holds,
+    )
+    held = _pin_open_verified(binary_path, pin)
+    if held is None:
+        logger.warning(
+            "binary_oracle_edges: identity pin for %s did not verify "
+            "(fd-honest open failed, or content/inode changed since "
+            "the witness read) — withholding its call edges "
+            "(no binary evidence)",
+            escape_nonprintable(key))
+        return BinaryEdgeIndex(binary_path=key)
+    try:
+        idx = _extract_direct_call_edges_impl(
+            binary_path, timeout=timeout, use_cache=use_cache)
+        if not _pin_still_holds(held, binary_path, pin):
+            logger.warning(
+                "binary_oracle_edges: identity pin for %s did not "
+                "hold across the extraction (content/inode changed "
+                "while r2 ran) — withholding its call edges "
+                "(no binary evidence)",
+                escape_nonprintable(key))
+            return BinaryEdgeIndex(binary_path=key)
+        return idx
+    finally:
+        try:
+            held.close()
+        except OSError:
+            pass
+
+
+def _extract_direct_call_edges_impl(
+    binary_path: Path,
+    *,
+    timeout: int,
+    use_cache: bool,
+) -> BinaryEdgeIndex:
+    """The unbracketed extraction body (see the public wrapper)."""
     if use_cache:
         from_graph = _try_graph_store(binary_path)
         if from_graph is not None:
@@ -356,16 +497,14 @@ def extract_direct_call_edges(
     if not binary_path.is_file():
         return BinaryEdgeIndex(binary_path=str(binary_path))
 
-    # Cache lookup keyed by build_id (mechanically-derived from
-    # ``.note.gnu.build-id`` — changes whenever the binary's code does).
-    # Stripped binaries (Go without -trimpath, PGO-stripped vendor
-    # binaries, custom-link binaries that drop .note.gnu.build-id) may
-    # have no build_id; fall back to a content sha256 so the cache
-    # still works (slower than a 40-char hex constant but bounded —
-    # one full-file digest per extraction).
-    cache_key = read_build_id(binary_path) if use_cache else None
-    if use_cache and not cache_key:
-        cache_key = _content_hash(binary_path)
+    # Cache lookup keyed by the module's content identity
+    # (mechanically-derived; changes whenever the binary's code
+    # does): GNU build-id for ELF, per-format identity for PE /
+    # Mach-O, and a content sha256 for everything without one
+    # (stripped Go, PGO-stripped vendor binaries, custom-link
+    # binaries that drop .note.gnu.build-id — slower than a 40-char
+    # hex constant but bounded: one full-file digest per extraction).
+    cache_key = _identity_cache_key(binary_path) if use_cache else None
     cache_file = _cache_path_for(cache_key) if cache_key else None
     build_id = cache_key  # alias for the log message + cache payload
     if cache_file is not None:
@@ -373,7 +512,7 @@ def extract_direct_call_edges(
         if cached is not None:
             logger.info(
                 "binary_oracle_edges: cache hit for %s (build_id=%s, %d edges)",
-                binary_path.name, build_id[:12], len(cached.edges))
+                binary_path.name, build_id[:12] if build_id else "", len(cached.edges))
             return cached
 
     # ``aaa`` is the heavy analyse-all; ~10s on a snappy_unittest-sized
@@ -391,10 +530,15 @@ def extract_direct_call_edges(
     # the necessary reads; no write paths needed (we capture stdout).
     from core.sandbox import run as _sandbox_run
     try:
+        # errors="replace": r2 stdout over a malformed/hostile ELF can
+        # carry non-UTF-8 bytes; strict decoding raises
+        # UnicodeDecodeError (a ValueError, NOT in the caught tuple
+        # below) and would crash the must-not-crash inventory path.
         fns_proc = _sandbox_run(
             ["r2", "-q", "-c", "aaa; aflj", str(binary_path)],
             target=str(binary_path.parent), block_network=True,
             capture_output=True, text=True, check=False, timeout=timeout,
+            errors="replace",
         )
     except (subprocess.TimeoutExpired, subprocess.SubprocessError,
             OSError) as e:
@@ -464,6 +608,7 @@ def extract_direct_call_edges(
     # + writable) inside mount-ns — the per-sandbox /tmp would
     # otherwise hide it from r2. TemporaryDirectory guarantees the
     # script is removed however the block exits.
+    complete_run = True
     try:
         with tempfile.TemporaryDirectory(
                 prefix="raptor-bo-edges-") as scratch:
@@ -477,6 +622,22 @@ def extract_direct_call_edges(
                 capture_output=True, text=True, check=False,
                 timeout=timeout, errors="replace",
             )
+            if proc.returncode != 0:
+                # r2 killed mid-script (OOM, sandbox rlimit, signal)
+                # leaves a PARTIAL transcript. Parse it best-effort
+                # for THIS run — the witness is promote-only, so a
+                # partial edge set can only rescue fewer functions —
+                # but it must never be cached: a cached partial index
+                # is reused by every later run under this build-id
+                # and permanently forfeits the missing rescues while
+                # reading green (never cache a partial result — the
+                # exception paths' standing rule).
+                complete_run = False
+                logger.warning(
+                    "binary_oracle_edges: r2 rc=%s for %s — using "
+                    "partial edges for this run only, not caching",
+                    proc.returncode, binary_path,
+                )
             axffj_part, vtable_part = _split_at_vtable_sentinel(
                 proc.stdout or "")
             _parse_axffj_batch(axffj_part, addr_to_name, index)
@@ -502,11 +663,11 @@ def extract_direct_call_edges(
         index.edges.append(edge)
         index.callees.add(edge.callee)
 
-    if cache_file is not None:
+    if cache_file is not None and complete_run:
         _save_cached_index(cache_file, index)
         logger.info(
             "binary_oracle_edges: cached %d edges for %s (build_id=%s)",
-            len(index.edges), binary_path.name, build_id[:12])
+            len(index.edges), binary_path.name, build_id[:12] if build_id else "")
     return index
 
 
@@ -591,6 +752,9 @@ def _parse_vtable_output(
         ))
     return edges
 
+
+# Graph-store edge kinds that represent calls (vs contains/xref rows).
+_CALL_KINDS = frozenset({"CALLS", "CALLS_FUNCTION", "CALLS_SURFACE"})
 
 _R2_PREFIXES = ("sym.", "method.", "func.", "fcn.", "dbg.", "imp.")
 
@@ -699,7 +863,7 @@ def load_cached_edge_index(binary_path: Path) -> BinaryEdgeIndex | None:
 
     Returns ``None`` on any miss. Consumers that must stay fast (audit
     prep) use this instead of ``extract_direct_call_edges`` so a cold
-    cache costs one build-id read, not a 10-30s r2 ``aaa`` run.
+    cache costs one identity read, not a 10-30s r2 ``aaa`` run.
     """
     binary_path = Path(binary_path)
     if not binary_path.is_file():
@@ -707,7 +871,7 @@ def load_cached_edge_index(binary_path: Path) -> BinaryEdgeIndex | None:
     from_graph = _try_graph_store(binary_path)
     if from_graph is not None:
         return from_graph
-    cache_key = read_build_id(binary_path) or _content_hash(binary_path)
+    cache_key = _identity_cache_key(binary_path)
     cache_file = _cache_path_for(cache_key) if cache_key else None
     if cache_file is None:
         return None

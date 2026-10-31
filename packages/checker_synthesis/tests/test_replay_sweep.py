@@ -20,11 +20,14 @@ def _manifest_entry(
     cwe: str = "CWE-787",
     tp_rate: float = 0.9,
     dual_control: bool = True,
-    n_targets: int = 1,
+    # Default clears the replay floor (RULE_REPLAY_MIN_TARGETS): a
+    # helper-built "good" entry is replayable unless a test narrows it.
+    n_targets: int = 3,
     archived: bool = False,
+    rule_tier: str | None = None,
 ) -> dict:
     ext = ".yml" if engine == "semgrep" else ".cocci"
-    return {
+    d = {
         "rule_id": rule_id,
         "engine": engine,
         "cwe": cwe,
@@ -51,6 +54,9 @@ def _manifest_entry(
         ],
         "archived": archived,
     }
+    if rule_tier is not None:
+        d["rule_tier"] = rule_tier
+    return d
 
 
 def _write_library(tmp_path: Path, entries: list[dict]) -> Path:
@@ -96,7 +102,13 @@ class TestReplayableEntries:
             _manifest_entry("good-cocci", engine="coccinelle"),
             _manifest_entry("low-tp", tp_rate=0.5),
             _manifest_entry("no-dual", dual_control=False),
+            # dual passed, fix-mutant failed: never proved it
+            # distinguishes fixed from unfixed code — not replayable.
+            _manifest_entry("dual-no-mutant", rule_tier="sweep_once"),
             _manifest_entry("no-targets", n_targets=0),
+            # One target short of the replay floor — precision proven
+            # on too few targets must not sweep.
+            _manifest_entry("below-floor", n_targets=2),
             _manifest_entry("archived", archived=True),
             _manifest_entry("odd-engine", engine="codeql"),
         ]
@@ -105,6 +117,22 @@ class TestReplayableEntries:
         assert [e.rule_id for e in sg] == ["good-semgrep"]
         assert [e.rule_id for e in cc] == ["good-cocci"]
         assert unsupported == ["odd-engine (engine=codeql)"]
+
+    def test_floor_counts_distinct_target_hashes(self, tmp_path):
+        # Three records sharing one hash are one target's evidence —
+        # they must not clear the floor (writers dedup on append; the
+        # vector is a hand-edited manifest). Distinct-hash control in
+        # the same sweep pins the grant direction.
+        dup = _manifest_entry("dup-hash")
+        dup["targets"] = [
+            dict(t, target_hash="t0") for t in dup["targets"]
+        ]
+        entries = [dup, _manifest_entry("distinct-hashes")]
+        lib = RuleLibrary(_write_library(tmp_path, entries))
+        sg, cc, unsupported = rs.replayable_entries(lib)
+        assert [e.rule_id for e in sg] == ["distinct-hashes"]
+        assert cc == []
+        assert unsupported == []
 
     def test_gates_match_library_constants(self, tmp_path):
         # An entry exactly at the replay threshold passes here iff
@@ -116,6 +144,31 @@ class TestReplayableEntries:
         assert [e.rule_id for e in sg] == ["edge"]
         assert [e.rule_id for e in lib.find_replayable("CWE-89", "semgrep")] \
             == ["edge"]
+
+
+class TestTargetHashConvention:
+    def test_public_spelling_resolves_and_joins(self, tmp_path):
+        # Relative / symlinked spellings of one physical target must
+        # produce ONE TargetRecord identity — the public spelling for
+        # out-of-package recorders joins the private convention.
+        real = tmp_path / "repo"
+        real.mkdir()
+        link = tmp_path / "link"
+        link.symlink_to(real)
+        assert rs.target_hash_for(link) == rs._target_hash(real)
+
+    def test_followup_recorder_uses_the_convention(self):
+        # The per-run replay recorder hashed str(repo_root) as passed
+        # (no resolve), minting a second TargetRecord for the same
+        # target off a non-canonical spelling. Pin that the module
+        # routes target hashing through target_hash_for and carries
+        # no inline hashing of its own.
+        import inspect
+
+        import packages.llm_analysis.checker_followup as cf
+        src = inspect.getsource(cf)
+        assert "target_hash_for" in src
+        assert "hashlib" not in src
 
 
 class TestDispatch:
@@ -261,7 +314,7 @@ class TestRecording:
         report = rs.run_sweep([target], library_dir=lib_dir, record=True)
         assert report.recorded_updates == 1
         entry = RuleLibrary(lib_dir).all_entries()[0]
-        assert len(entry.targets) == 2  # original + sweep target
+        assert len(entry.targets) == 4  # seeded targets + sweep target
         sweep_rec = entry.targets[-1]
         assert sweep_rec.matches == 3
         assert sweep_rec.tp_rate is None  # no triage → no verdict
@@ -295,17 +348,116 @@ class TestRecording:
         report = rs.run_sweep([target], library_dir=lib_dir, record=True)
         assert report.recorded_updates == 1
         entry = RuleLibrary(lib_dir).all_entries()[0]
-        assert len(entry.targets) == 2  # original + zero-match sweep target
+        assert len(entry.targets) == 4  # seeded targets + zero-match sweep target
         sweep_rec = entry.targets[-1]
         assert sweep_rec.matches == 0
         assert sweep_rec.tp_rate is None  # no triage → no verdict
         assert entry.tp_rate == pytest.approx(0.9)  # precision untouched
 
+    def test_engine_errored_run_records_no_coverage(
+        self, tmp_path, monkeypatch,
+    ):
+        # A target the engine could NOT scan proves nothing: it must
+        # not become a zero-match TargetRecord (negative coverage
+        # evidence that inflates targets_tested and feeds
+        # auto-archive). The failure surfaces on report.errors only.
+        lib_dir = _write_library(tmp_path, [_manifest_entry("sg")])
+        before = (lib_dir / "manifest.json").read_text()
+        target = tmp_path / "t"
+        target.mkdir()
+        monkeypatch.setattr(
+            rs.semgrep_runner, "run_rule",
+            lambda *a, **k: SemgrepResult(
+                name="sg", errors=["sandbox unavailable"], returncode=-1,
+            ),
+        )
+        report = rs.run_sweep([target], library_dir=lib_dir, record=True)
+        assert report.recorded_updates == 0
+        assert report.matches == []
+        assert len(report.errors) == 1
+        entry = RuleLibrary(lib_dir).all_entries()[0]
+        assert len(entry.targets) == 3  # seeded targets only — no sweep record
+        assert (lib_dir / "manifest.json").read_text() == before
+
+    def test_errored_run_keeps_matches_but_records_no_coverage(
+        self, tmp_path, monkeypatch,
+    ):
+        # One fatal per-file failure on a large target must not
+        # discard every match the rule DID produce: the matches stay
+        # in the report (flagged partial), only the coverage
+        # recording is skipped — an errored run is not evidence.
+        lib_dir = _write_library(tmp_path, [_manifest_entry("sg")])
+        before = (lib_dir / "manifest.json").read_text()
+        target = tmp_path / "t"
+        target.mkdir()
+        partial = _semgrep_result(2, rule_id="sg")
+        partial.errors = ["fatal: src/broken.c parse failure"]
+        monkeypatch.setattr(
+            rs.semgrep_runner, "run_rule", lambda *a, **k: partial,
+        )
+        report = rs.run_sweep([target], library_dir=lib_dir, record=True)
+        assert len(report.matches) == 2
+        assert report.partial == [f"sg@{target}"]
+        assert len(report.errors) == 1
+        # No coverage: no recorded update, manifest untouched.
+        assert report.recorded_updates == 0
+        assert (lib_dir / "manifest.json").read_text() == before
+
+    def test_cocci_errored_run_records_no_coverage(
+        self, tmp_path, monkeypatch,
+    ):
+        lib_dir = _write_library(
+            tmp_path, [_manifest_entry("cc", engine="coccinelle")],
+        )
+        target = tmp_path / "t"
+        target.mkdir()
+        (target / "a.c").write_text("int main(void){return 0;}\n")
+        monkeypatch.setattr(
+            rs.cocci_runner, "run_rule",
+            lambda *a, **k: SpatchResult(
+                rule="cc", errors=["spatch crashed"], returncode=2,
+            ),
+        )
+        report = rs.run_sweep([target], library_dir=lib_dir, record=True)
+        assert report.recorded_updates == 0
+        assert report.matches == []
+        assert len(report.errors) == 1
+        entry = RuleLibrary(lib_dir).all_entries()[0]
+        assert len(entry.targets) == 3  # seeded targets only — no sweep record
+
+    def test_errored_rule_does_not_feed_auto_archive(
+        self, tmp_path, monkeypatch,
+    ):
+        # Counterpart to test_zero_match_sweeps_can_auto_archive:
+        # three ERRORED runs (vs three genuine zero-match runs) must
+        # NOT retire the rule — failed scans are not evidence the
+        # rule never fires.
+        lib_dir = _write_library(
+            tmp_path, [_manifest_entry("dud")],
+        )
+        manifest = json.loads((lib_dir / "manifest.json").read_text())
+        manifest["rules"][0]["total_variants"] = 0
+        (lib_dir / "manifest.json").write_text(json.dumps(manifest))
+        targets = []
+        for i in range(3):
+            t = tmp_path / f"t{i}"
+            t.mkdir()
+            targets.append(t)
+        monkeypatch.setattr(
+            rs.semgrep_runner, "run_rule",
+            lambda *a, **k: SemgrepResult(
+                name="dud", errors=["engine failure"], returncode=-1,
+            ),
+        )
+        rs.run_sweep(targets, library_dir=lib_dir, record=True)
+        entry = RuleLibrary(lib_dir).all_entries()[0]
+        assert entry.archived is False
+
     def test_zero_match_sweeps_can_auto_archive(self, tmp_path, monkeypatch):
         # Enough zero-match targets push a never-firing rule over the
         # prune threshold — sweep evidence alone can retire it.
         lib_dir = _write_library(
-            tmp_path, [_manifest_entry("dud", n_targets=1)],
+            tmp_path, [_manifest_entry("dud")],
         )
         # Strip prior variant evidence so the rule counts as never
         # having fired.
@@ -384,23 +536,92 @@ class TestOutput:
                                  % target]
 
 
-class TestCli:
-    def test_missing_target_exits_2(self, tmp_path, capsys):
-        rc = rs.main([str(tmp_path / "nope")])
-        assert rc == 2
-        assert "do not exist" in capsys.readouterr().err
+class TestGraduatedStemJoin:
+    """Graduated file stems are SANITISED rule ids — the sweep's joins
+    back to the library must compare through graduated_stem, or an
+    unsafe original id double-sweeps and never accrues coverage."""
 
-    def test_empty_library_happy_path(self, tmp_path, capsys):
+    def test_unsafe_id_graduated_twin_runs_once(self, tmp_path, monkeypatch):
+        lib_dir = _write_library(tmp_path, [_manifest_entry("weird id")])
+        engine_rules = tmp_path / "engine-rules"
+        (engine_rules / "semgrep" / "rules").mkdir(parents=True)
+        # graduate() names the file with the sanitised stem.
+        from packages.checker_synthesis.library import graduated_stem
+        stem = graduated_stem("weird id")
+        assert stem != "weird id"
+        (engine_rules / "semgrep" / "rules" / f"{stem}.yaml").write_text(
+            "rules: []\n",
+        )
         target = tmp_path / "t"
         target.mkdir()
-        out = tmp_path / "out"
-        rc = rs.main([
-            str(target),
-            "--library-dir", str(tmp_path / "no-library"),
-            "--out", str(out),
-            "--no-record",
-        ])
-        assert rc == 0
-        assert (out / "matches.jsonl").exists()
-        assert (out / "summary.json").exists()
-        assert "0 match(es)" in capsys.readouterr().out
+        monkeypatch.setattr(
+            rs.semgrep_runner, "run_rule",
+            lambda *a, **k: _semgrep_result(1, rule_id="weird id"),
+        )
+        report = rs.run_sweep(
+            [target], library_dir=lib_dir,
+            engine_rules_dir=engine_rules, record=False,
+        )
+        assert sorted(m.provenance for m in report.matches) == [
+            "rule-library",
+        ]
+
+    def test_unsafe_id_graduated_only_rule_records_coverage(
+        self, tmp_path, monkeypatch,
+    ):
+        # Non-replayable entry (sweep_once tier): only its graduated
+        # copy runs — coverage must still land on the library entry.
+        lib_dir = _write_library(
+            tmp_path,
+            [_manifest_entry("weird id", dual_control=False,
+                             rule_tier="sweep_once")],
+        )
+        engine_rules = tmp_path / "engine-rules"
+        (engine_rules / "semgrep" / "rules").mkdir(parents=True)
+        from packages.checker_synthesis.library import graduated_stem
+        stem = graduated_stem("weird id")
+        (engine_rules / "semgrep" / "rules" / f"{stem}.yaml").write_text(
+            "rules: []\n",
+        )
+        target = tmp_path / "t"
+        target.mkdir()
+        monkeypatch.setattr(
+            rs.semgrep_runner, "run_rule",
+            lambda *a, **k: _semgrep_result(2, rule_id=stem),
+        )
+        report = rs.run_sweep(
+            [target], library_dir=lib_dir,
+            engine_rules_dir=engine_rules, record=True,
+        )
+        assert report.recorded_updates == 1
+        entry = RuleLibrary(lib_dir).all_entries()[0]
+        assert any(t.matches == 2 for t in entry.targets)
+
+
+class TestGraduatedSkipAccounting:
+    def test_graduated_only_non_c_target_records_skip(
+        self, tmp_path, monkeypatch,
+    ):
+        """A graduated-only sweep on a non-C target skips its cocci
+        rules the same way library entries do — the skip must land in
+        cocci_skipped_targets, not vanish from the accounting."""
+        lib_dir = _write_library(tmp_path, [])
+        engine_rules = tmp_path / "engine-rules"
+        (engine_rules / "coccinelle").mkdir(parents=True)
+        (engine_rules / "coccinelle" / "gradc.cocci").write_text(
+            "@@\n@@\n- x\n",
+        )
+        target = tmp_path / "pyproj"
+        target.mkdir()
+        (target / "app.py").write_text("x = 1\n")
+        called = []
+        monkeypatch.setattr(
+            rs.cocci_runner, "run_rule",
+            lambda *a, **k: called.append(a) or _spatch_result(0),
+        )
+        report = rs.run_sweep(
+            [target], library_dir=lib_dir,
+            engine_rules_dir=engine_rules, record=False,
+        )
+        assert not called
+        assert report.cocci_skipped_targets == [str(target)]

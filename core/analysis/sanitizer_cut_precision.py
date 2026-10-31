@@ -23,12 +23,15 @@ fixture — only ``suppress`` fails the gate.
 shapes the gate actually suppresses); a miss there is reported but is
 NOT a gate failure — soundness first.
 
-Until a run of this harness is clean across every covered sink class
-AND its report is recorded alongside the flip, the
-``sanitizer_dominated`` entry in :mod:`core.analysis.reach_witness`
-stays ``earns_suppression=False`` and the live producer
-(:func:`core.dataflow.smt_barrier._record_value_bound_audit`) writes
-record-only evidence (``dropped: false``).
+The flip happened 2026-08-19: a clean run across every covered sink
+class was recorded alongside it, the ``sanitizer_dominated`` entry in
+:mod:`core.analysis.reach_witness` carries ``earns_suppression=True``,
+and the scan post-pass enforces full-proof suppress verdicts by
+default. This harness remains the regression gate: any change to the
+cut, its resolvers, or the corpus must keep the run clean, and the
+SMT-barrier lane
+(:func:`core.dataflow.smt_barrier._record_value_bound_audit`) still
+writes record-only evidence (``dropped: false``).
 
 Run via ``core/analysis/scripts/sanitizer-cut-precision``.
 """
@@ -44,6 +47,7 @@ from pathlib import Path
 from typing import Any
 
 from core.json import dumps_display, save_json
+from core.source.lines import split_lines
 
 LABEL_MUST_NOT_SUPPRESS = "must_not_suppress"
 LABEL_MAY_SUPPRESS = "may_suppress"
@@ -142,9 +146,48 @@ class PrecisionReport:
         }
 
 
+# Catalog roots the python fixtures use, mapped to the import line a
+# legitimate module would carry. The unbound-root refusal ("UNBOUND
+# names refuse" — builtins are repo-writable, so an identity with no
+# self-import is untrusted) means fixtures exercising OTHER defeat
+# mechanisms must bind their sanitizer the way real code does, or
+# every row degenerates into the same trivial unbound refusal and
+# stops testing its own mechanism. ``_fx`` normalises python sources
+# by prepending the missing import(s) and shifting the line numbers;
+# fixtures whose MECHANISM is the missing binding opt out via
+# ``auto_import=False``.
+_FIXTURE_IMPORTS: dict[str, str] = {
+    "html": "import html\n",
+    "shlex": "import shlex\n",
+    "werkzeug": "import werkzeug.security\nimport werkzeug.utils\n",
+}
+
+
+def _normalise_python_source(
+    source: str, src_ln: int, sink_ln: int,
+) -> tuple[str, int, int]:
+    import re as _re
+    prefix = ""
+    for root, import_line in _FIXTURE_IMPORTS.items():
+        if not _re.search(rf"\b{root}\.", source):
+            continue
+        if _re.search(rf"^[^\S\n]*(import|from)\s+{root}\b", source,
+                      _re.MULTILINE):
+            continue
+        prefix += import_line
+    if not prefix:
+        return source, src_ln, sink_ln
+    shift = prefix.count("\n")
+    return prefix + source, src_ln + shift, sink_ln + shift
+
+
 def _fx(name, sink_class, cwe, shape, label, source, src_ln, sink_ln,
         language: str="python", suffix: str=".py", aux_files=None,
-        use_repo_root: bool=False) -> CutFixture:
+        use_repo_root: bool=False, auto_import: bool=True) -> CutFixture:
+    if language == "python" and auto_import:
+        source, src_ln, sink_ln = _normalise_python_source(
+            source, src_ln, sink_ln,
+        )
     return CutFixture(
         name=name, sink_class=sink_class, cwe=cwe, language=language,
         shape=shape, label=label, source=source,
@@ -221,6 +264,52 @@ def _class_fixtures(sink_class, cwe, sanitizer, wrong_sanitizer,
             f"    if not x.isalnum():\n"
             f"        log('bad')\n"
             f"    {sink}(x)\n", 1, 4),
+        # Same-line statement pairs: two writes to one name on ONE
+        # physical line collide any (lineno, name)-keyed machinery —
+        # the multi-line rebinds above structurally cannot see the
+        # shape (caller and helper positions both covered).
+        _fx(f"{c}_sameline_rebind", c, cwe,
+            "sanitized_then_rebound_same_line",
+            LABEL_MUST_NOT_SUPPRESS,
+            f"def handle(x):\n"
+            f"    y = {sanitizer}(x); y = x\n"
+            f"    {sink}(y)\n", 1, 3),
+        _fx(f"{c}_sameline_augassign", c, cwe,
+            "sanitized_then_augmented_same_line",
+            LABEL_MUST_NOT_SUPPRESS,
+            f"def handle(x):\n"
+            f"    y = {sanitizer}(x); y += x\n"
+            f"    {sink}(y)\n", 1, 3),
+        _fx(f"{c}_helper_sameline_rebind", c, cwe,
+            "wrapper_sanitized_then_rebound_same_line",
+            LABEL_MUST_NOT_SUPPRESS,
+            f"def _clean(s):\n"
+            f"    t = {sanitizer}(s); t = s\n"
+            f"    return t\n"
+            f"def handle(x):\n"
+            f"    y = _clean(x)\n"
+            f"    {sink}(y)\n", 4, 6),
+        _fx(f"{c}_helper_sameline_augassign", c, cwe,
+            "wrapper_sanitized_then_augmented_same_line",
+            LABEL_MUST_NOT_SUPPRESS,
+            f"def _clean(s):\n"
+            f"    t = {sanitizer}(s); t += s\n"
+            f"    return t\n"
+            f"def handle(x):\n"
+            f"    y = _clean(x)\n"
+            f"    {sink}(y)\n", 4, 6),
+        # Callee-shadow: the caller locally rebinds the helper's name,
+        # so the runtime callee is a raw pass-through while the module
+        # table still holds the clean wrapper.
+        _fx(f"{c}_shadowed_callable", c, cwe,
+            "callee_shadowed_by_local_rebind",
+            LABEL_MUST_NOT_SUPPRESS,
+            f"def esc(s):\n"
+            f"    return {sanitizer}(s)\n"
+            f"def handle(x):\n"
+            f"    esc = str\n"
+            f"    y = esc(x)\n"
+            f"    {sink}(y)\n", 3, 6),
     ]
 
 
@@ -295,6 +384,61 @@ def _java_fixtures() -> list[CutFixture]:
                    params="String x, String[] items, "
                           "java.io.PrintWriter out"),
         3, 6, language="java", suffix=".java"))
+    j.append(_fx(
+        # Rebind hidden inside a CONDITION — an assignment-expression
+        # write the CFG must surface as a def, or reaching-defs sees
+        # only the sanitizer and condition-3 exclusivity holds falsely
+        # (the ubiquitous ``while ((line = read()) != null)`` idiom's
+        # adversarial twin).
+        "java_xss_condition_rebind", "xss", "CWE-79",
+        "sanitized_then_condition_rebound", LABEL_MUST_NOT_SUPPRESS,
+        imp + meth("        String y = Encode.forHtml(x);\n"
+                   "        if (flag && (y = x) != null) { }\n"
+                   "        out.println(y);\n",
+                   params="String x, boolean flag, "
+                          "java.io.PrintWriter out"),
+        3, 6, language="java", suffix=".java"))
+    # The condition pin's EXPRESSION-CONTEXT siblings: the same
+    # embedded assignment write in a declaration initializer, a plain
+    # assignment RHS, a ternary initializer, and an array-store RHS —
+    # every payload extractor must surface embedded stores, not an
+    # enumerated subset of contexts.
+    j.append(_fx(
+        "java_xss_decl_init_rebind", "xss", "CWE-79",
+        "sanitized_then_decl_initializer_rebound",
+        LABEL_MUST_NOT_SUPPRESS,
+        imp + meth("        String y = Encode.forHtml(x);\n"
+                   "        String z = (y = x);\n"
+                   "        out.println(y);\n"),
+        3, 6, language="java", suffix=".java"))
+    j.append(_fx(
+        "java_xss_assign_rhs_rebind", "xss", "CWE-79",
+        "sanitized_then_assignment_rhs_rebound",
+        LABEL_MUST_NOT_SUPPRESS,
+        imp + meth("        String y = Encode.forHtml(x);\n"
+                   "        String z;\n"
+                   "        z = (y = x);\n"
+                   "        out.println(y);\n"),
+        3, 7, language="java", suffix=".java"))
+    j.append(_fx(
+        "java_xss_ternary_decl_rebind", "xss", "CWE-79",
+        "sanitized_then_ternary_initializer_rebound",
+        LABEL_MUST_NOT_SUPPRESS,
+        imp + meth("        String y = Encode.forHtml(x);\n"
+                   "        String z = flag ? (y = x) : \"s\";\n"
+                   "        out.println(y);\n",
+                   params="String x, boolean flag, "
+                          "java.io.PrintWriter out"),
+        3, 6, language="java", suffix=".java"))
+    j.append(_fx(
+        "java_xss_array_store_rhs_rebind", "xss", "CWE-79",
+        "sanitized_then_array_store_rhs_rebound",
+        LABEL_MUST_NOT_SUPPRESS,
+        imp + meth("        String y = Encode.forHtml(x);\n"
+                   "        String[] a = new String[1];\n"
+                   "        a[0] = (y = x);\n"
+                   "        out.println(y);\n"),
+        3, 7, language="java", suffix=".java"))
     j.append(_fx(
         "java_xss_wrong_variable", "xss", "CWE-79",
         "wrong_variable_sanitized", LABEL_MUST_NOT_SUPPRESS,
@@ -643,6 +787,41 @@ def _java_array_fixtures() -> list[CutFixture]:
                    "        a[0] = y;\n"
                    "        out.println(y);\n"),
         3, 7, language="java", suffix=".java"))
+    # ---- composed pins: element read × sink-sibling taint ----
+    # The element-exclusive pre-check must not trust the local taint
+    # front for sibling arguments — a sibling fed by a same-file
+    # helper is invisible to it (the b34/b41 incident shape restated
+    # on the b19 door). The corpus previously composed element reads
+    # only with front-visible sibling taint.
+    srv = ("import org.owasp.encoder.Encode;\n"
+           "import javax.servlet.http.HttpServletRequest;\n")
+    handle_srv = ("    public void handle(HttpServletRequest request, "
+                  "java.io.PrintWriter out) {\n"
+                  "        String x = request.getParameter(\"q\");\n")
+    fetch_srv = ("    private static String fetch("
+                 "HttpServletRequest r) {\n"
+                 "        return r.getParameter(\"h\");\n    }\n")
+    j.append(_marked(
+        "java_arr_sibling_helper_taint", "xss", "CWE-79",
+        "element_sibling_helper_taint", LABEL_MUST_NOT_SUPPRESS,
+        srv + "public class T {\n" + handle_srv
+        + "        String[] a = new String[2];\n"
+        + "        a[0] = Encode.forHtml(x);\n"
+        + "        String pre = fetch(request);\n"
+        + "        out.printf(pre, a[0]);\n    }\n"
+        + fetch_srv + "}\n",
+        "request.getParameter(\"q\")", "out.printf(pre, a[0])"))
+    # Constant-sibling control: the guard folds the sibling and the
+    # element suppression survives.
+    j.append(_marked(
+        "java_arr_sibling_const", "xss", "CWE-79",
+        "element_sibling_const", LABEL_MAY_SUPPRESS,
+        srv + "public class T {\n" + handle_srv
+        + "        String[] a = new String[2];\n"
+        + "        a[0] = Encode.forHtml(x);\n"
+        + "        String pre = \"Result: %s\";\n"
+        + "        out.printf(pre, a[0]);\n    }\n}\n",
+        "request.getParameter(\"q\")", "out.printf(pre, a[0])"))
     return j
 
 
@@ -825,7 +1004,7 @@ def _marked(name, sink_class, cwe, shape, label, source,
     """b21 fixture constructor: source/sink lines are computed from
     unique substring markers — a hand-miscounted line number turned a
     corpus run into a false-positive hunt once; never again."""
-    lines = source.splitlines()
+    lines = split_lines(source)
     src_ln = next(i for i, ln in enumerate(lines, 1) if src_marker in ln)
     sink_ln = next(i for i, ln in enumerate(lines, 1) if sink_marker in ln)
     return _fx(name, sink_class, cwe, shape, label, source,
@@ -1238,6 +1417,342 @@ def build_corpus() -> list[CutFixture]:
         "def handle(x):\n"
         "    y = _maybe(x)\n"
         "    render(y)\n", 5, 7))
+    # Rebindable-identity battery: every way a hostile module makes a
+    # written callable name stop meaning the certified body. Each is
+    # a distinct join collision (parameter shadow, nested-def shadow,
+    # walrus, module-level rebind, sibling global, decorator swap,
+    # catalog-root local shadow); the two trailing may_suppress pins
+    # hold the guards to their scope rules (comprehension targets and
+    # class attributes do NOT shadow at runtime).
+    fixtures.append(_fx(
+        "xss_param_shadowed_callable", "xss", "CWE-79",
+        "callee_shadowed_by_parameter", LABEL_MUST_NOT_SUPPRESS,
+        "import html\n"
+        "def esc(s):\n"
+        "    return html.escape(s)\n"
+        "def handle(x, esc):\n"
+        "    y = esc(x)\n"
+        "    render(y)\n", 4, 6))
+    fixtures.append(_fx(
+        "xss_nested_def_shadowed_callable", "xss", "CWE-79",
+        "callee_shadowed_by_nested_def", LABEL_MUST_NOT_SUPPRESS,
+        "import html\n"
+        "def esc(s):\n"
+        "    return html.escape(s)\n"
+        "def handle(x):\n"
+        "    def esc(s):\n"
+        "        return s\n"
+        "    y = esc(x)\n"
+        "    render(y)\n", 4, 8))
+    fixtures.append(_fx(
+        "xss_walrus_shadowed_callable", "xss", "CWE-79",
+        "callee_shadowed_by_walrus", LABEL_MUST_NOT_SUPPRESS,
+        "import html\n"
+        "def esc(s):\n"
+        "    return html.escape(s)\n"
+        "def handle(x):\n"
+        "    if (esc := str):\n"
+        "        y = esc(x)\n"
+        "    render(y)\n", 4, 7))
+    fixtures.append(_fx(
+        "xss_module_level_rebound_callable", "xss", "CWE-79",
+        "callee_rebound_at_module_level", LABEL_MUST_NOT_SUPPRESS,
+        "import html\n"
+        "def esc(s):\n"
+        "    return html.escape(s)\n"
+        "esc = str\n"
+        "def handle(x):\n"
+        "    y = esc(x)\n"
+        "    render(y)\n", 5, 7))
+    fixtures.append(_fx(
+        "xss_global_sibling_rebound_callable", "xss", "CWE-79",
+        "callee_rebound_via_sibling_global", LABEL_MUST_NOT_SUPPRESS,
+        "import html\n"
+        "def esc(s):\n"
+        "    return html.escape(s)\n"
+        "def evil():\n"
+        "    global esc\n"
+        "    esc = str\n"
+        "evil()\n"
+        "def handle(x):\n"
+        "    y = esc(x)\n"
+        "    render(y)\n", 8, 10))
+    fixtures.append(_fx(
+        "xss_decorator_rebound_callable", "xss", "CWE-79",
+        "callee_swapped_by_decorator", LABEL_MUST_NOT_SUPPRESS,
+        "import html\n"
+        "def nullify(f):\n"
+        "    return str\n"
+        "@nullify\n"
+        "def esc(s):\n"
+        "    return html.escape(s)\n"
+        "def handle(x):\n"
+        "    y = esc(x)\n"
+        "    render(y)\n", 7, 9))
+    fixtures.append(_fx(
+        "xss_class_shadow_of_def_callable", "xss", "CWE-79",
+        "callee_shadowed_by_module_class", LABEL_MUST_NOT_SUPPRESS,
+        "import html\n"
+        "def esc(s):\n"
+        "    return html.escape(s)\n"
+        "class esc:\n"
+        "    def __init__(self, s):\n"
+        "        self.s = s\n"
+        "def handle(x):\n"
+        "    y = esc(x)\n"
+        "    render(y)\n", 7, 9))
+    fixtures.append(_fx(
+        "xss_catalog_root_local_shadow", "xss", "CWE-79",
+        "catalog_root_shadowed_by_local", LABEL_MUST_NOT_SUPPRESS,
+        "class FakeHtml:\n"
+        "    escape = staticmethod(str)\n"
+        "def handle(x):\n"
+        "    html = FakeHtml\n"
+        "    y = html.escape(x)\n"
+        "    render(y)\n", 3, 6))
+    fixtures.append(_fx(
+        "xss_module_import_alias_catalog_root", "xss", "CWE-79",
+        "catalog_root_import_aliased", LABEL_MUST_NOT_SUPPRESS,
+        "import fakelib as html\n"
+        "def handle(x):\n"
+        "    y = html.escape(x)\n"
+        "    render(y)\n", 2, 4))
+    fixtures.append(_fx(
+        "xss_local_import_alias_catalog_root", "xss", "CWE-79",
+        "catalog_root_import_aliased_locally", LABEL_MUST_NOT_SUPPRESS,
+        "def handle(x):\n"
+        "    import fakelib as html\n"
+        "    y = html.escape(x)\n"
+        "    render(y)\n", 1, 4))
+    fixtures.append(_fx(
+        "xss_global_sibling_catalog_root", "xss", "CWE-79",
+        "catalog_root_rebound_via_sibling_global",
+        LABEL_MUST_NOT_SUPPRESS,
+        "import html\n"
+        "def evil():\n"
+        "    global html\n"
+        "    html = object()\n"
+        "def handle(x):\n"
+        "    y = html.escape(x)\n"
+        "    render(y)\n", 5, 7))
+    fixtures.append(_fx(
+        "xss_nonlocal_writeback_direct", "xss", "CWE-79",
+        "sanitized_then_nonlocal_writeback", LABEL_MUST_NOT_SUPPRESS,
+        "import html\n"
+        "def handle(x):\n"
+        "    y = html.escape(x)\n"
+        "    def fixup():\n"
+        "        nonlocal y\n"
+        "        y = x\n"
+        "    fixup()\n"
+        "    render(y)\n", 2, 8))
+    fixtures.append(_fx(
+        "xss_nonlocal_writeback_helper", "xss", "CWE-79",
+        "wrapper_sanitized_then_nonlocal_writeback",
+        LABEL_MUST_NOT_SUPPRESS,
+        "import html\n"
+        "def _clean(s):\n"
+        "    t = html.escape(s)\n"
+        "    def f():\n"
+        "        nonlocal t\n"
+        "        t = s\n"
+        "    f()\n"
+        "    return t\n"
+        "def handle(x):\n"
+        "    y = _clean(x)\n"
+        "    render(y)\n", 9, 11))
+    fixtures.append(_fx(
+        "xss_repo_defined_allowlist_decorator", "xss", "CWE-79",
+        "decorator_allowlist_name_repo_defined",
+        LABEL_MUST_NOT_SUPPRESS,
+        "import html\n"
+        "def staticmethod(f):\n"
+        "    return str\n"
+        "@staticmethod\n"
+        "def esc(s):\n"
+        "    return html.escape(s)\n"
+        "def handle(x):\n"
+        "    y = esc(x)\n"
+        "    render(y)\n", 7, 9))
+    fixtures.append(_fx(
+        "xss_from_import_decorator_still_rescues", "xss", "CWE-79",
+        "decorator_from_import_resolved_identity", LABEL_MAY_SUPPRESS,
+        "import html\n"
+        "from functools import lru_cache\n"
+        "@lru_cache\n"
+        "def esc(s):\n"
+        "    return html.escape(s)\n"
+        "def handle(x):\n"
+        "    y = esc(x)\n"
+        "    render(y)\n", 6, 8))
+    fixtures.append(_fx(
+        "xss_unbound_catalog_root", "xss", "CWE-79",
+        "catalog_root_unbound_builtins_writable",
+        LABEL_MUST_NOT_SUPPRESS,
+        "def handle(x):\n"
+        "    y = html.escape(x)\n"
+        "    render(y)\n", 1, 3, auto_import=False))
+    fixtures.append(_fx(
+        "xss_imported_catalog_root_control", "xss", "CWE-79",
+        "catalog_root_self_imported", LABEL_MAY_SUPPRESS,
+        "import html\n"
+        "def handle(x):\n"
+        "    y = html.escape(x)\n"
+        "    render(y)\n", 2, 4, auto_import=False))
+    _html_shadow_aux = (
+        "def escape(s, quote=True):\n"
+        "    return s\n"
+    )
+    fixtures.append(_fx(
+        "xss_repo_shadowed_html_module", "xss", "CWE-79",
+        "catalog_root_shadowed_by_repo_module",
+        LABEL_MUST_NOT_SUPPRESS,
+        "import html\n"
+        "def handle(x):\n"
+        "    y = html.escape(x)\n"
+        "    render(y)\n", 2, 4, auto_import=False,
+        aux_files={"html.py": _html_shadow_aux}, use_repo_root=True))
+    fixtures.append(_fx(
+        "xss_repo_shadowed_html_package", "xss", "CWE-79",
+        "catalog_root_shadowed_by_repo_package",
+        LABEL_MUST_NOT_SUPPRESS,
+        "import html\n"
+        "def handle(x):\n"
+        "    y = html.escape(x)\n"
+        "    render(y)\n", 2, 4, auto_import=False,
+        aux_files={"html/__init__.py": _html_shadow_aux},
+        use_repo_root=True))
+    fixtures.append(_fx(
+        "xss_repo_shadowed_html_helper_position", "xss", "CWE-79",
+        "helper_chain_through_repo_shadowed_root",
+        LABEL_MUST_NOT_SUPPRESS,
+        "import html\n"
+        "def _clean(s):\n"
+        "    return html.escape(s)\n"
+        "def handle(x):\n"
+        "    y = _clean(x)\n"
+        "    render(y)\n", 4, 6, auto_import=False,
+        aux_files={"html.py": _html_shadow_aux}, use_repo_root=True))
+    fixtures.append(_fx(
+        "xss_repo_root_without_shadow_control", "xss", "CWE-79",
+        "origin_check_clean_repo_control", LABEL_MAY_SUPPRESS,
+        "import html\n"
+        "def handle(x):\n"
+        "    y = html.escape(x)\n"
+        "    render(y)\n", 2, 4, auto_import=False,
+        use_repo_root=True))
+    fixtures.append(_fx(
+        "xss_star_import_catalog_root", "xss", "CWE-79",
+        "catalog_root_star_import_shadowable", LABEL_MUST_NOT_SUPPRESS,
+        "import html\n"
+        "from evilmod import *\n"
+        "def handle(x):\n"
+        "    y = html.escape(x)\n"
+        "    render(y)\n", 3, 5))
+    fixtures.append(_fx(
+        "xss_star_import_callee", "xss", "CWE-79",
+        "callee_star_import_shadowable", LABEL_MUST_NOT_SUPPRESS,
+        "import html\n"
+        "def esc(s):\n"
+        "    return html.escape(s)\n"
+        "from evilmod import *\n"
+        "def handle(x):\n"
+        "    y = esc(x)\n"
+        "    render(y)\n", 5, 7))
+    fixtures.append(_fx(
+        "xss_globals_write_callee", "xss", "CWE-79",
+        "callee_rebound_via_globals_write", LABEL_MUST_NOT_SUPPRESS,
+        "import html\n"
+        "def esc(s):\n"
+        "    return html.escape(s)\n"
+        "globals()['esc'] = str\n"
+        "def handle(x):\n"
+        "    y = esc(x)\n"
+        "    render(y)\n", 5, 7))
+    fixtures.append(_fx(
+        "xss_globals_write_catalog_root", "xss", "CWE-79",
+        "catalog_root_rebound_via_globals_write",
+        LABEL_MUST_NOT_SUPPRESS,
+        "globals()['html'] = object()\n"
+        "def handle(x):\n"
+        "    y = html.escape(x)\n"
+        "    render(y)\n", 2, 4))
+    fixtures.append(_fx(
+        "xss_setattr_sys_modules_callee", "xss", "CWE-79",
+        "callee_rebound_via_sys_modules_setattr",
+        LABEL_MUST_NOT_SUPPRESS,
+        "import html\n"
+        "import sys\n"
+        "def esc(s):\n"
+        "    return html.escape(s)\n"
+        "setattr(sys.modules[__name__], 'esc', str)\n"
+        "def handle(x):\n"
+        "    y = esc(x)\n"
+        "    render(y)\n", 6, 8))
+    fixtures.append(_fx(
+        "xss_exec_assign_callee", "xss", "CWE-79",
+        "callee_rebound_via_module_exec", LABEL_MUST_NOT_SUPPRESS,
+        "import html\n"
+        "def esc(s):\n"
+        "    return html.escape(s)\n"
+        "exec('esc = str')\n"
+        "def handle(x):\n"
+        "    y = esc(x)\n"
+        "    render(y)\n", 5, 7))
+    fixtures.append(_fx(
+        "xss_conditional_import_fallback", "xss", "CWE-79",
+        "callee_conditional_import_fallback", LABEL_MUST_NOT_SUPPRESS,
+        "import html\n"
+        "def esc(s):\n"
+        "    return html.escape(s)\n"
+        "try:\n"
+        "    from fastesc import esc\n"
+        "except ImportError:\n"
+        "    pass\n"
+        "def handle(x):\n"
+        "    y = esc(x)\n"
+        "    render(y)\n", 8, 10))
+    fixtures.append(_fx(
+        "xss_local_from_import_callee", "xss", "CWE-79",
+        "callee_local_from_import", LABEL_MUST_NOT_SUPPRESS,
+        "import html\n"
+        "def esc(s):\n"
+        "    return html.escape(s)\n"
+        "def handle(x):\n"
+        "    from evilmod import esc\n"
+        "    y = esc(x)\n"
+        "    render(y)\n", 4, 7))
+    fixtures.append(_fx(
+        "xss_globals_read_still_rescues", "xss", "CWE-79",
+        "globals_constant_read_harmless", LABEL_MAY_SUPPRESS,
+        "import html\n"
+        "v = globals()['__name__']\n"
+        "def esc(s):\n"
+        "    return html.escape(s)\n"
+        "def handle(x):\n"
+        "    y = esc(x)\n"
+        "    render(y)\n", 5, 7))
+    fixtures.append(_fx(
+        "xss_comprehension_target_not_shadow", "xss", "CWE-79",
+        "comprehension_target_scoped_no_shadow", LABEL_MAY_SUPPRESS,
+        "import html\n"
+        "def esc(s):\n"
+        "    return html.escape(s)\n"
+        "def handle(x):\n"
+        "    items = [esc for esc in [str]]\n"
+        "    y = esc(x)\n"
+        "    render(y)\n", 4, 7))
+    fixtures.append(_fx(
+        "xss_class_attr_not_shadow", "xss", "CWE-79",
+        "class_attribute_no_bare_name_shadow", LABEL_MAY_SUPPRESS,
+        "import html\n"
+        "def esc(s):\n"
+        "    return html.escape(s)\n"
+        "class C:\n"
+        "    esc = str\n"
+        "    def m(self, x):\n"
+        "        y = esc(x)\n"
+        "        render(y)\n", 6, 8))
     # Catalog-empty class: python has no sqli sanitizer entries, so
     # nothing may EVER suppress a CWE-89 python finding — including a
     # plausible-looking wrong-class escape.
@@ -1604,11 +2119,10 @@ def _java_b27_fixtures() -> list[CutFixture]:
               + "        public String pick(String p) {\n"
               + "            String bar;\n"
               + "            int num = 106;\n"
-              + "            return_helper: ;\n"
               + "            bar = (7 * 18) + num > 200 ?"
               " \"always\" : p;\n"
               + "            return bar;\n        }\n"
-              + "    }\n").replace("            return_helper: ;\n", ""),
+              + "    }\n"),
         "public void handle", "out.println(bar)"))
     j.append(_marked(
         "java_conduit_ifelse_folded_const", "xss", "CWE-79",
@@ -1689,6 +2203,60 @@ def _java_b27_fixtures() -> list[CutFixture]:
               + "            return \"safe\";\n        }\n"
               + "    }\n"),
         "public void handle", "out.println(bar)"))
+    # ---- composed pins: conduit pick × sink-sibling taint ----
+    # The conduit door must obey the same sibling-argument guard the
+    # flat value-bound path applies: proving the picked argument
+    # through conduit hops says nothing about taint riding a sibling
+    # of the same sink call. Helper-fed sibling taint is invisible to
+    # the local taint front — the b34/b41 incident shape restated
+    # through the b27 door.
+    j.append(_marked(
+        "java_conduit_sanitized_sibling_helper_taint", "xss", "CWE-79",
+        "conduit_sanitized_sibling_helper_taint",
+        LABEL_MUST_NOT_SUPPRESS,
+        cls_t(handle
+              + "        String clean = Encode.forHtml(x);\n"
+              + "        String bar = new W().pass(clean);\n"
+              + "        String pre = fetch(request);\n"
+              + "        out.println(pre + bar);\n    }\n"
+              + "    private class W {\n"
+              + "        public String pass(String p) {\n"
+              + "            return p;\n        }\n"
+              + "    }\n"
+              + "    private static String fetch("
+              "HttpServletRequest r) {\n"
+              + "        return r.getParameter(\"h\");\n    }\n"),
+        "request.getParameter(\"q\")", "out.println(pre + bar)"))
+    j.append(_marked(
+        "java_conduit_sanitized_sibling_direct_taint", "xss", "CWE-79",
+        "conduit_sanitized_sibling_direct_taint",
+        LABEL_MUST_NOT_SUPPRESS,
+        cls_t(handle
+              + "        String clean = Encode.forHtml(x);\n"
+              + "        String bar = new W().pass(clean);\n"
+              + "        String pre = x;\n"
+              + "        out.println(pre + bar);\n    }\n"
+              + "    private class W {\n"
+              + "        public String pass(String p) {\n"
+              + "            return p;\n        }\n"
+              + "    }\n"),
+        "request.getParameter(\"q\")", "out.println(pre + bar)"))
+    # Constant-sibling control: the guard folds the sibling and the
+    # conduit suppression survives — pins that the sibling guard
+    # refuses taint, not mere sibling presence.
+    j.append(_marked(
+        "java_conduit_sanitized_sibling_const", "xss", "CWE-79",
+        "conduit_sanitized_sibling_const", LABEL_MAY_SUPPRESS,
+        cls_t(handle
+              + "        String clean = Encode.forHtml(x);\n"
+              + "        String bar = new W().pass(clean);\n"
+              + "        String pre = \"Result: \";\n"
+              + "        out.println(pre + bar);\n    }\n"
+              + "    private class W {\n"
+              + "        public String pass(String p) {\n"
+              + "            return p;\n        }\n"
+              + "    }\n"),
+        "request.getParameter(\"q\")", "out.println(pre + bar)"))
     return j
 
 
@@ -2735,6 +3303,35 @@ def _java_b28_collection_fixtures() -> list[CutFixture]:
               + "        String bar = (String) m.get(\"k\");\n"
               + "        out.printf(bar, x);\n    }\n"),
         "public void handle", "out.printf(bar, x)"))
+    # Composed pin: round-trip read × HELPER-FED sibling taint. The
+    # front-visible pin above cannot catch a pre-check that trusts
+    # the local taint front — a sibling fed by a same-file helper is
+    # invisible to it (the b34/b41 incident shape on the b28 door).
+    j.append(_marked(
+        "java_coll_sibling_helper_taint", "xss", "CWE-79",
+        "coll_sibling_helper_taint", LABEL_MUST_NOT_SUPPRESS,
+        cls_t(handle
+              + "        HashMap<String, String> m = new HashMap<>();\n"
+              + "        m.put(\"k\", Encode.forHtml(x));\n"
+              + "        String bar = m.get(\"k\");\n"
+              + "        String pre = fetch(request);\n"
+              + "        out.printf(pre, bar);\n    }\n"
+              + "    private static String fetch("
+              "HttpServletRequest r) {\n"
+              + "        return r.getParameter(\"h\");\n    }\n"),
+        "request.getParameter(\"q\")", "out.printf(pre, bar)"))
+    # Constant-sibling control: the guard folds the sibling and the
+    # round-trip suppression survives.
+    j.append(_marked(
+        "java_coll_sibling_const", "xss", "CWE-79",
+        "coll_sibling_const", LABEL_MAY_SUPPRESS,
+        cls_t(handle
+              + "        HashMap<String, String> m = new HashMap<>();\n"
+              + "        m.put(\"k\", Encode.forHtml(x));\n"
+              + "        String bar = m.get(\"k\");\n"
+              + "        String pre = \"Result: %s\";\n"
+              + "        out.printf(pre, bar);\n    }\n"),
+        "request.getParameter(\"q\")", "out.printf(pre, bar)"))
 
     # ---- may-suppress: the shapes the mechanism exists for ----
     j.append(_marked(

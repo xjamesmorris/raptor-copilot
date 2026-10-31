@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from core.json import load_json
+from core.source.lines import split_lines
 
 logger = logging.getLogger(__name__)
 
@@ -81,13 +82,18 @@ def _snippet_for(
     """Bounded source snippet under path containment; "" on any miss."""
     if not file_path or line_start <= 0:
         return ""
-    try:
-        target = Path(target_path).resolve()
-        full = (target / file_path).resolve()
-        full.relative_to(target)
-        lines = full.read_text(encoding="utf-8", errors="replace").splitlines()
-    except (ValueError, OSError):
+    # Contained + capped + fd-checked regular: file_path is
+    # record-derived and the file target-writable (a FIFO plant
+    # wedged the raw read; oversize buffered whole).
+    # newline="": seed spans are raw-byte-model line numbers — a
+    # bare \r must stay in-line (a universal-newline read would
+    # translate the plantable byte into a break above the splitter).
+    from core.source import read_contained
+
+    text = read_contained(Path(target_path), file_path, newline="")
+    if text is None:
         return ""
+    lines = split_lines(text)
     end = min(line_end or line_start, line_start + 120, len(lines))
     return "\n".join(lines[line_start - 1: end])[:8000]
 
@@ -250,11 +256,24 @@ def seeds_from_crash_contexts(
             extra = ""
             if isinstance(analysis, dict):
                 extra = str(analysis.get("reasoning") or "")[:300]
+            # Key-membership + branch for the graded verdict field,
+            # never a defaulted raw read: this line is display-only
+            # (the module's "?" placeholder convention, shared with
+            # the crash_id/signal siblings), so an ABSENT key renders
+            # the placeholder and any PRESENT value — an explicit
+            # None or a junk shape included — renders exactly as the
+            # raw value always did. No level is ever consumed, and
+            # the membership spelling keeps the site outside the
+            # tri-state closure's misread vocabulary by construction
+            # instead of behind a line-keyed exemption.
+            level = (
+                ctx["exploitability"] if "exploitability" in ctx else "?"
+            )
             reasoning = (
                 f"Fuzzing crash {ctx.get('crash_id', '?')}: "
                 f"{crash_type or 'crash'} at {rel}:{line} "
                 f"(signal {ctx.get('signal', '?')}, "
-                f"exploitability {ctx.get('exploitability', '?')})."
+                f"exploitability {level})."
             )
             if extra:
                 reasoning = f"{reasoning} {extra}"

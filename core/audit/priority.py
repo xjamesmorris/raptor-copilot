@@ -43,14 +43,14 @@ from .parser_shape import (
     LENGTH_ARITH_DENSITY_FLOOR,
     LENGTH_ARITH_SITES_FLOOR,
 )
+from .tree_class import NON_PRODUCTION_TREE_CLASSES
 
 logger = logging.getLogger(__name__)
 
-# Byte budgets: coverage/diff sidecars are findings-class documents;
-# the checklist is the largest artifact class (measured up to ~36 MB
-# on big targets — 256 MiB mirrors the coverage-store budget).
+# Byte budgets: coverage/diff sidecars are findings-class documents.
+# (Checklist reads go through core.inventory.read_checklist, which
+# owns the checklist budget class.)
 _MAX_COVERAGE_BYTES = 64 * 1024 * 1024
-_MAX_CHECKLIST_BYTES = 256 * 1024 * 1024
 # Flow-trace artifacts are RAPTOR-written run output, parsed in a
 # glob loop — the audit-artifact budget class.
 _MAX_FLOW_TRACE_BYTES = 64 * 1024 * 1024
@@ -91,6 +91,19 @@ SCORE_ERROR_PATHS = 2
 SCORE_VALIDATE_CONFIRMED = 6
 SCORE_VALIDATE_RULED_OUT = -3
 SCORE_BINARY_ABSENT = -10
+# Non-production tree demotion (vendored-compat / test-harness files,
+# core.audit.tree_class). Weighting ONLY — never a skip by itself: the
+# functions stay scheduled, they just yield slots to production code.
+# Budget truncation composes with ALL weights, though: under a
+# --budget cut a demoted equal-signal function can rank past the cut
+# line (within-tier ranking only — tier dominance is preserved). Both
+# directions of the magnitude matter: stronger (approaching
+# SCORE_ENTRY_POINT) and a vendored parser that IS the production
+# attack surface loses to trivial first-party code; weaker (0) and
+# compat-shim / regress-harness findings keep drowning the production
+# findings operators read first. -3 mirrors the other mild demotion
+# (SCORE_VALIDATE_RULED_OUT) — below every affirmative surface signal.
+SCORE_NON_PRODUCTION_TREE = -3
 
 _COMPLEX_SLOC = 80
 _MODERATE_SLOC = 30
@@ -122,6 +135,7 @@ def score_functions(
     validate_confirmed_keys: set[str] | None = None,
     validate_ruled_out_keys: set[str] | None = None,
     binary_absent_keys: set[str] | None = None,
+    tree_classes: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Score and re-sort gaps by attack-surface proximity.
 
@@ -178,6 +192,13 @@ def score_functions(
             suppression-earning). Hard-deprioritised with
             SCORE_BINARY_ABSENT so live functions win budget slots;
             the triage classifier separately skips them.
+        tree_classes: ``{file: tree_class}`` map from
+            ``core.audit.tree_class.tree_class_map``. Files classed
+            vendored-compat / test-harness get the mild
+            SCORE_NON_PRODUCTION_TREE demotion — weighting only, never
+            a skip. ``None`` disables the demotion entirely (the
+            weight-off knob: scoring is then exactly the pre-tag
+            behaviour).
 
     Returns:
         Gaps sorted by (priority ASC, priority_score DESC, sloc DESC).
@@ -288,6 +309,12 @@ def score_functions(
 
         if binary_absent_keys and key in binary_absent_keys:
             score += SCORE_BINARY_ABSENT
+
+        if (
+            tree_classes
+            and tree_classes.get(gap["file"]) in NON_PRODUCTION_TREE_CLASSES
+        ):
+            score += SCORE_NON_PRODUCTION_TREE
 
         func_name = gap.get("name", "")
         if key in binary_sink_callers or func_name in binary_sink_callers:
@@ -461,19 +488,26 @@ def _latest_sibling_checklist(
     except Exception:
         logger.debug("sibling run discovery failed", exc_info=True)
         return None
+    from core.inventory import read_checklist
     best: Path | None = None
     best_mtime = -1.0
     for d in dirs:
-        p = d / "checklist.json"
-        try:
-            mtime = p.stat().st_mtime
-        except OSError:
+        # Slot timestamp covers BOTH on-disk forms: the single file,
+        # or the sharded layout's index manifest.
+        mtime: float | None = None
+        for probe in (d / "checklist.json", d / "checklist" / "index.json"):
+            try:
+                mtime = probe.stat().st_mtime
+                break
+            except OSError:
+                continue
+        if mtime is None:
             continue
         if mtime > best_mtime:
-            best, best_mtime = p, mtime
+            best, best_mtime = d, mtime
     if best is None:
         return None
-    return load_json(best, max_bytes=_MAX_CHECKLIST_BYTES)
+    return read_checklist(best) or None
 
 
 def ensure_inventory_diff(
@@ -554,7 +588,10 @@ def detect_widely_used(
     # No memoisation: each (file, name) checklist item is visited
     # exactly once per call, so a per-call cache could never hit —
     # and a duplicate name within one file would silently reuse the
-    # first definition's count.
+    # first definition's count.  Per-item callers_of is not a rescan
+    # either: reachability memoises its adjacency index per inventory
+    # identity, so the first call builds it and every later call is a
+    # reverse-index lookup.
     for file_path, items in file_iter:
         for item in items:
             name = item.get("name", "")

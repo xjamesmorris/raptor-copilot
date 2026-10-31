@@ -55,8 +55,15 @@ def joern_session(
     tunables: JoernTunables | None = None,
     register_reach_audit: bool = True,
     exclude_dirs: tuple[str, ...] = (),
+    scope_exclude_dirs: tuple[str, ...] = (),
 ) -> Iterator[JoernServer | None]:
     """Context manager for a cross-tool Joern session.
+
+    ``exclude_dirs``: freshness-neutral run-artifact exclusions (a
+    run's output dir inside the target). ``scope_exclude_dirs``: the
+    caller's scope COMPLEMENT — semantic coverage exclusions that key
+    the CPG cache slot (see
+    :func:`packages.joern.runner.build_cpg_cached`).
 
     Boots a Joern server, builds/loads the CPG, imports it into
     the server, and optionally registers the server with
@@ -93,19 +100,40 @@ def joern_session(
         # profiles rather than trusting parse-side auto-detection.
         from .lang_config import parse_languages_for
         parse_langs = parse_languages_for(str(target_path))
+        # heap_mb reaches BOTH JVMs: the query server above
+        # (from_tunables) and the joern-parse frontend here — on large
+        # targets the parse JVM is exactly where the operator's
+        # joern_heap_mb matters; omitting it left big builds
+        # GC-thrashing at the JVM default while the setting silently
+        # applied only to the server.
+        # A derived ("auto") CPG timeout resolves HERE, where the
+        # target is known — from_tuning only holds the unknown-scope
+        # fallback.
+        from .tunables import resolve_cpg_timeout_s
+        combined_excludes = tuple(exclude_dirs) + tuple(scope_exclude_dirs)
+        build_timeout = resolve_cpg_timeout_s(
+            tunables, target_path, exclude_dirs=combined_excludes,
+        )
         if cache_dir is not None:
             cpg = build_cpg_cached(
                 target_path, cache_dir,
                 languages=parse_langs,
-                timeout=tunables.cpg_timeout_s,
+                timeout=build_timeout,
+                heap_mb=tunables.heap_mb,
+                heap_is_derived=tunables.heap_is_derived,
                 exclude_dirs=exclude_dirs,
+                scope_exclude_dirs=scope_exclude_dirs,
             )
         else:
             cpg = build_cpg(
                 target_path,
                 languages=parse_langs,
-                timeout=tunables.cpg_timeout_s,
-                exclude_dirs=exclude_dirs,
+                timeout=build_timeout,
+                heap_mb=tunables.heap_mb,
+                heap_is_derived=tunables.heap_is_derived,
+                # No cache slot to key on the uncached path — scope
+                # exclusions still shape the graph (analysis parity).
+                exclude_dirs=combined_excludes,
             )
         if cpg.exists():
             srv.import_cpg(cpg.path, timeout=tunables.import_timeout_s)

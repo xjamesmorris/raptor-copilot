@@ -29,6 +29,9 @@ from core.audit.expanded_semgrep import (
     run_expanded_semgrep_rule,
     translate_corpus_findings,
 )
+from core.audit.tests._live_transport import (
+    skip_if_expanded_view_transport_degraded,
+)
 
 pv._reset_probe_cache()
 HAVE_CPP = pv._preprocessor_for(False) is not None
@@ -40,6 +43,43 @@ needs_cpp = pytest.mark.skipif(
 needs_semgrep = pytest.mark.skipif(
     not HAVE_SEMGREP, reason="semgrep not installed",
 )
+
+# Lazy (probe only when a real-semgrep test actually runs — the
+# ~1s child spawn is not paid at collection) and cached (one probe
+# per session).
+_SEMGREP_RUNNABLE: bool | None = None
+
+
+def _skip_unless_semgrep_runnable() -> None:
+    """Skip unless ``semgrep`` actually RUNS in this test environment.
+
+    ``shutil.which`` only proves the entry point exists. semgrep is a
+    Python program: an environment whose ``PYTHONPATH`` shadows its
+    libraries — the CI preflight's hidden-optional-deps simulation
+    stubs ``jsonschema``, which semgrep imports at startup — crashes
+    it on launch while the PATH probe still passes, turning the E2E
+    into an environment failure instead of a skip. The E2E child
+    inherits this process's environment (``sandbox_spy`` executes the
+    tool directly), so probe by running the binary the same way; a
+    runner that cannot execute semgrep skips, never errors.
+    """
+    global _SEMGREP_RUNNABLE
+    if _SEMGREP_RUNNABLE is None:
+        try:
+            _SEMGREP_RUNNABLE = subprocess.run(
+                ["semgrep", "--version"],
+                capture_output=True,
+                timeout=120,
+                check=False,
+            ).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            _SEMGREP_RUNNABLE = False
+    if not _SEMGREP_RUNNABLE:
+        pytest.skip(
+            "semgrep is on PATH but not runnable in this environment "
+            "(its own imports fail under the active PYTHONPATH, or "
+            "the version probe crashed/timed out)",
+        )
 
 
 @pytest.fixture(autouse=True)
@@ -351,6 +391,31 @@ def test_non_c_file_degrades(tmp_path):
     assert "not a C/C++" in res.reason
 
 
+def test_scratch_root_must_be_empty(tmp_path):
+    """Expanded copies land at target-derived relative paths — a
+    pre-populated scratch root (planted symlinks at those paths) could
+    alias the writes onto foreign files, so anything but a fresh dir
+    is refused loudly."""
+    target = tmp_path / "repo"
+    target.mkdir()
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    (scratch / "planted").write_text("x")
+    with pytest.raises(ValueError, match="not empty"):
+        build_expanded_corpus(target, scratch)
+
+
+def test_scratch_root_symlink_refused(tmp_path):
+    target = tmp_path / "repo"
+    target.mkdir()
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "scratch"
+    link.symlink_to(real)
+    with pytest.raises(ValueError, match="symlink"):
+        build_expanded_corpus(target, link)
+
+
 def test_path_escape_degrades(tmp_path):
     res = run_expanded_semgrep_rule(
         target_path=tmp_path, file_path="../../etc/passwd.c",
@@ -489,6 +554,7 @@ rules:
 @needs_cpp
 @needs_semgrep
 def test_e2e_real_semgrep_finds_macro_hidden_strcpy(tmp_path, sandbox_spy):
+    _skip_unless_semgrep_runnable()
     target = _write_fixture(tmp_path)
     rule = tmp_path / "rule.yaml"
     rule.write_text(_RULE_YAML)
@@ -497,6 +563,7 @@ def test_e2e_real_semgrep_finds_macro_hidden_strcpy(tmp_path, sandbox_spy):
         target_path=target, file_path="main.c", rule_config=str(rule),
         budget=ExpansionBudget(),
     )
+    skip_if_expanded_view_transport_degraded(res)
     assert res.ok is True, res.reason
     assert any(m["line"] == _MACRO_CALL_LINE for m in res.matches), res.matches
     for m in res.matches:

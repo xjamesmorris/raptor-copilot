@@ -27,7 +27,6 @@ import argparse
 import re
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 # ─── trust-marker check (do not import; inline by design) ───
@@ -46,7 +45,32 @@ if not (os.environ.get("CLAUDECODE")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import core.startup.process_init  # noqa: E402,F401
+from core.config import RaptorConfig  # noqa: E402
 from core.json import load_json, save_json  # noqa: E402
+from core.concepts.study_failure import (  # noqa: E402
+    clear_study_failure,
+    write_study_failure,
+)
+from core.security.log_sanitisation import sanitise_for_terminal  # noqa: E402
+from core.security.prompt_output_sanitise import (  # noqa: E402
+    sanitise_code,
+    sanitise_string,
+)
+
+
+def _prose(text: object) -> str:
+    """Defang LLM/target-derived free text for the study report."""
+    return sanitise_string(str(text), max_chars=4000)
+
+
+def _line(text: object) -> str:
+    """Single-line variant for headings, labels, and list items."""
+    return sanitise_string(str(text), max_chars=300).replace("\n", " ")
+
+
+def _cell(text: object) -> str:
+    """Markdown-table-cell variant (pipes escaped)."""
+    return _line(text).replace("|", "\\|")
 
 # Study artifacts (reading/study lists, domain model, overview,
 # struct annotations) are small RAPTOR-written run output.
@@ -57,7 +81,18 @@ _MAX_STUDY_ARTIFACT_BYTES = 64 * 1024 * 1024
 # ------------------------------------------------------------------
 
 def _run(cmd: list[str], *, verbose: bool = False) -> int:
-    env = os.environ.copy()
+    # Curated env, not a full os.environ copy: the children (study-prep
+    # / study-run / compile-invariants) are RAPTOR's own LLM-calling
+    # scripts, so they get the sanitised baseline plus LLM keys and
+    # transport routing (get_llm_env) — the same env the canonical
+    # raptor.py spawn path hands its children — instead of whatever the
+    # operator's shell happened to carry. Documented study knobs are
+    # forwarded explicitly; the trust marker is set as before.
+    env = RaptorConfig.get_llm_env()
+    for knob in ("RAPTOR_STUDY_MAX_OUTPUT_TOKENS",):
+        val = os.environ.get(knob)
+        if val is not None:
+            env[knob] = val
     env["_RAPTOR_TRUSTED"] = "1"
     try:
         result = subprocess.run(
@@ -74,96 +109,59 @@ def _run(cmd: list[str], *, verbose: bool = False) -> int:
     return result.returncode
 
 
-def _load_pending_reading_list(output_dir: Path) -> list[dict]:
-    rl_path = output_dir / "reading-list.json"
+def _struct_definitions(sl: dict) -> list[dict]:
+    """Struct-definition report entries from a study-list payload.
+
+    Study-list items are LLM-adjacent artifacts: tolerate a missing
+    name (skip the item) and a junk relevance tier (keep the item —
+    fail toward review). A malformed item must not raise here — this
+    runs in main() AFTER the paid study completed, before the report,
+    project promotion, and SAGE storage, so an escaping KeyError
+    throws all of that away.
+    """
+    struct_defs: list[dict] = []
+    for item in sl.get("items", []):
+        if not isinstance(item, dict) or item.get("kind") != "struct":
+            continue
+        tier = item.get("relevance_tier")
+        if isinstance(tier, (int, float)) and tier > 2:
+            continue
+        name = item.get("name")
+        if not name:
+            continue
+        struct_defs.append({
+            "name": name,
+            "file": item.get("file", ""),
+            "definition": item.get("definition", ""),
+            "fields": item.get("fields", []),
+            "relevance_tier": tier,
+            "doc_comment": item.get("doc_comment", ""),
+        })
+    return struct_defs
+
+
+def _pending_items(rl_path: Path) -> list[dict]:
     if not rl_path.is_file():
         return []
     raw = load_json(rl_path, max_bytes=_MAX_STUDY_ARTIFACT_BYTES)
     if not isinstance(raw, dict):
         return []
+    # Shape-tolerant like every other raw reader of this multi-writer
+    # artifact: a present-but-null items array or non-dict rows come
+    # from legacy/externally-edited files and must cost those rows
+    # only, not the count.
+    items = raw.get("items")
+    if not isinstance(items, list):
+        return []
     return [
-        i for i in raw.get("items", [])
-        if not i.get("resolved") and not i.get("unresolvable")
+        i for i in items
+        if isinstance(i, dict)
+        and not i.get("resolved") and not i.get("unresolvable")
     ]
 
 
-def _extract_rl_identifiers(pending: list[dict]) -> tuple[list[str], list[str]]:
-    """Partition pending reading-list items into identifiers and concepts."""
-    identifiers: list[str] = []
-    concepts: list[str] = []
-    seen: set[str] = set()
-    for item in pending:
-        resolution = item.get("resolution", "identifier")
-        q = item.get("question", "").strip()
-        if not q or q in seen:
-            continue
-        seen.add(q)
-        if resolution == "concept":
-            concepts.append(q)
-            continue
-        ctx = item.get("context", "")
-        m = re.search(r"`([A-Za-z_]\w*)`", ctx)
-        if m:
-            identifiers.append(m.group(1))
-            continue
-        m = re.search(r"`([A-Za-z_]\w*)`", q)
-        if m:
-            identifiers.append(m.group(1))
-            continue
-        m = re.search(r"\b(struct\s+\w+|[A-Za-z_]\w{3,}_[A-Za-z_]\w*)\b", q)
-        if m:
-            identifiers.append(m.group(1))
-            continue
-        concepts.append(q)
-    return identifiers, concepts
-
-
-def _mark_items_resolved(output_dir: Path, idents: list[str],
-                         concepts: list[str]) -> int:
-    """Mark reading-list items as resolved after studying them."""
-    rl_path = output_dir / "reading-list.json"
-    if not rl_path.is_file():
-        return 0
-    rl_data = load_json(rl_path, max_bytes=_MAX_STUDY_ARTIFACT_BYTES)
-    if not isinstance(rl_data, dict):
-        return 0
-
-    ident_set = {i.lower() for i in idents}
-    concept_set = {c.strip().lower() for c in concepts}
-    resolved_count = 0
-
-    for item in rl_data.get("items", []):
-        if item.get("resolved") or item.get("unresolvable"):
-            continue
-        q = item.get("question", "").strip()
-        if not q:
-            continue
-
-        matched = False
-        for text in (item.get("context", ""), q):
-            m = re.search(r"`([A-Za-z_]\w*)`", text)
-            if m and m.group(1).lower() in ident_set:
-                matched = True
-                break
-        if not matched:
-            m = re.search(
-                r"\b(struct\s+\w+|[A-Za-z_]\w{3,}_[A-Za-z_]\w*)\b", q)
-            if m and m.group(1).lower() in ident_set:
-                matched = True
-        if not matched and q.lower() in concept_set:
-            matched = True
-
-        if matched:
-            item["resolved"] = True
-            item["resolved_concept_id"] = "studied"
-            resolved_count += 1
-
-    if resolved_count:
-        save_json(rl_path, rl_data)
-        print(f"study-loop: resolved {resolved_count} reading-list items",
-              file=sys.stderr)
-
-    return resolved_count
+def _load_pending_reading_list(output_dir: Path) -> list[dict]:
+    return _pending_items(output_dir / "reading-list.json")
 
 
 # ------------------------------------------------------------------
@@ -185,16 +183,50 @@ def _detect_concepts_dir(output_dir: Path) -> Path | None:
     return None
 
 
-def _load_prior_knowledge(output_dir: Path, concepts_dir: Path | None) -> None:
+def _load_prior_knowledge(
+    output_dir: Path,
+    concepts_dir: Path | None,
+    *,
+    explicit_focus: bool = False,
+) -> None:
     if concepts_dir is None:
         return
     for name in ("domain-model.json", "reading-list.json", "patterns.json"):
         prior = concepts_dir / name
         target = output_dir / name
         if prior.is_file() and not target.is_file():
+            if name == "reading-list.json" and explicit_focus:
+                # Store-inherited scope must not override operator
+                # focus: run_study re-scopes the ENTIRE item set to
+                # the pending questions of the run-local reading list
+                # (_scope_items_for_reading_list), so copying a
+                # mature project store's list (hundreds of pending
+                # questions, some belonging to other trees) into a
+                # run the operator focused with --identifier or
+                # --concept hands the study to the store, not the
+                # operator. The store list is untouched — the
+                # legitimate resume shape (no explicit focus) still
+                # inherits it, and a run-local list already on disk
+                # is always honoured as-is. Counts only in the line:
+                # question text is target-derived free text.
+                n_pending = len(_pending_items(prior))
+                print(
+                    "study-loop: explicit focus given — not "
+                    f"inheriting the project reading list "
+                    f"({n_pending} pending question(s) stay in the "
+                    "store; a run without --identifier/--concept "
+                    "resumes them)",
+                    file=sys.stderr,
+                )
+                continue
             try:
-                import shutil
-                shutil.copy2(str(prior), str(target))
+                # Atomic: a torn copy (crash mid-write) leaves e.g. a
+                # malformed reading-list.json that load_json reads as
+                # None → [] pending → the next prep silently de-scopes
+                # to a full-tree scan.
+                from core.atomic_fs import write_text_atomically
+                write_text_atomically(
+                    target, prior.read_text(encoding="utf-8"))
                 print(f"study-loop: loaded prior {name} from {concepts_dir}",
                       file=sys.stderr)
             except OSError as exc:
@@ -203,32 +235,60 @@ def _load_prior_knowledge(output_dir: Path, concepts_dir: Path | None) -> None:
 
 
 def _promote_to_project(output_dir: Path, concepts_dir: Path | None) -> None:
+    """Promote run artifacts to the project concepts store — by MERGE.
+
+    A byte-copy here loses updates: ``run_study`` has already
+    merge-promoted this run's domain model into the canonical copy
+    (core.concepts.study._promote_to_project), and a concurrent run
+    may have contributed between that promote and this call, so every
+    promotion below folds the run's artifact INTO the canonical file
+    instead of replacing it. The domain model goes through the core
+    merge implementation so there is exactly one promotion semantics
+    to maintain.
+    """
     if concepts_dir is None:
         return
     promoted = 0
-    for name in ("domain-model.json", "reading-list.json", "patterns.json"):
-        src = output_dir / name
-        if not src.is_file():
-            continue
-        dst = concepts_dir / name
+
+    dm_src = output_dir / "domain-model.json"
+    if dm_src.is_file():
         try:
-            fd, tmp_name = tempfile.mkstemp(
-                dir=str(concepts_dir), suffix=".tmp", prefix=f".{name}.")
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    f.write(src.read_text(encoding="utf-8"))
-                Path(tmp_name).rename(dst)
-            except BaseException:
-                Path(tmp_name).unlink(missing_ok=True)
-                raise
-        except OSError as exc:
-            print(f"study-loop: WARNING: failed to promote {name}: {exc}",
-                  file=sys.stderr)
-            continue
-        promoted += 1
+            from core.concepts.study import merge_promote_domain_model
+            merge_promote_domain_model(
+                dm_src, concepts_dir / "domain-model.json")
+            promoted += 1
+        except (OSError, ValueError) as exc:
+            print("study-loop: WARNING: failed to promote "
+                  f"domain-model.json: {exc}", file=sys.stderr)
+
+    rl_src = output_dir / "reading-list.json"
+    if rl_src.is_file():
+        try:
+            from core.concepts.reading_list import ReadingList
+            run_list = ReadingList.load(rl_src)
+            # Folds in items already on disk at the canonical path;
+            # the run's own item states win for ids it knows.
+            run_list.save_merged(concepts_dir / "reading-list.json")
+            promoted += 1
+        except (OSError, ValueError, TypeError) as exc:
+            # TypeError: a torn/hand-edited run list with items missing
+            # required fields must degrade to a warning, not a crash.
+            print("study-loop: WARNING: failed to promote "
+                  f"reading-list.json: {exc}", file=sys.stderr)
+
+    pat_src = output_dir / "patterns.json"
+    if pat_src.is_file():
+        try:
+            from core.concepts.study import merge_promote_patterns
+            merge_promote_patterns(pat_src, concepts_dir / "patterns.json")
+            promoted += 1
+        except (OSError, ValueError) as exc:
+            print("study-loop: WARNING: failed to promote "
+                  f"patterns.json: {exc}", file=sys.stderr)
+
     # Only report success when something actually landed — a run that
-    # produced no artifacts (or whose copies all failed) must not claim
-    # the project concepts dir was refreshed.
+    # produced no artifacts (or whose promotions all failed) must not
+    # claim the project concepts dir was refreshed.
     if promoted:
         print(f"study-loop: promoted domain model to {concepts_dir}",
               file=sys.stderr)
@@ -253,7 +313,7 @@ def _store_in_sage(output_dir: Path, target: str) -> None:
             print(f"study-loop: stored {stored} concepts in SAGE",
                   file=sys.stderr)
     except Exception as exc:  # noqa: BLE001 - SAGE storage is best-effort
-        print(f"study-loop: WARNING: SAGE storage failed: {exc}",
+        print(f"study-loop: WARNING: SAGE storage failed: {sanitise_for_terminal(str(exc), max_len=300)}",
               file=sys.stderr)
 
 
@@ -311,10 +371,13 @@ _OVERVIEW_HEADER_EXTENSIONS = frozenset((".h", ".hpp", ".hxx"))
 def _overview_from_directory(
     target: Path,
     model: str | None = None,
+    run_dir: Path | None = None,
 ) -> tuple[list[str], list[str], str, str]:
     """Cheap inventory: file names + header types + one LLM call.
 
     Returns (identifiers, concepts, summary, subject_title).
+    ``run_dir`` rides through to the dispatcher gate (L5 audit-log
+    placement).
     """
     # The target may be a single file (per the CLI help) — rglob on a
     # non-directory yields nothing, so handle it explicitly.
@@ -324,9 +387,12 @@ def _overview_from_directory(
         )
         listing_base = target.parent
     else:
+        # Skip symlinks like the prep scan does — a hostile tree's
+        # out-pointing link must not feed host file content into the
+        # overview prompt.
         c_files = sorted(
             f for f in target.rglob("*")
-            if f.suffix in _OVERVIEW_EXTENSIONS
+            if f.suffix in _OVERVIEW_EXTENSIONS and not f.is_symlink()
         )
         listing_base = target
     if not c_files:
@@ -337,9 +403,19 @@ def _overview_from_directory(
     )
 
     struct_names: list[str] = []
+    # Cap full-text header reads: the prompt keeps at most 200 struct
+    # names, so reading EVERY header in a huge tree is pure I/O cost;
+    # too low a cap and a deep tree's core types (sorted order ≈
+    # path order) can miss the overview. 500 comfortably covers the
+    # 200-name budget while bounding the walk.
+    _HEADER_READ_CAP = 500
+    headers_read = 0
     for h in c_files:
         if h.suffix not in _OVERVIEW_HEADER_EXTENSIONS:
             continue
+        if headers_read >= _HEADER_READ_CAP:
+            break
+        headers_read += 1
         try:
             text = h.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -353,7 +429,7 @@ def _overview_from_directory(
     intent_lines: list[str] = []
     for name in ("Kconfig", "Makefile", "README", "README.md"):
         p = target / name
-        if p.is_file():
+        if p.is_file() and not p.is_symlink():
             try:
                 text = p.read_text(encoding="utf-8", errors="replace")
                 intent_lines.append(f"--- {name} (first 40 lines) ---")
@@ -388,7 +464,8 @@ def _overview_from_directory(
             client = LLMClient(pinned_model=model)
         else:
             client = get_client()
-        _ensure_llm_dispatcher(client, "raptor-study-loop")
+        _ensure_llm_dispatcher(client, "raptor-study-loop",
+                               run_dir=run_dir)
     except Exception:  # noqa: BLE001 - overview is best-effort
         print("study-loop: WARNING: no LLM available for overview",
               file=sys.stderr)
@@ -404,7 +481,7 @@ def _overview_from_directory(
         )
         result = response.result if hasattr(response, "result") else {}
     except Exception as exc:  # noqa: BLE001 - overview is best-effort
-        print(f"study-loop: WARNING: overview LLM call failed: {exc}",
+        print(f"study-loop: WARNING: overview LLM call failed: {sanitise_for_terminal(str(exc), max_len=300)}",
               file=sys.stderr)
         return [], [], "", ""
 
@@ -415,9 +492,11 @@ def _overview_from_directory(
     subject_title = result.get("subject_title", "")
 
     if subject_title:
-        print(f"study-loop: subject: {subject_title}", file=sys.stderr)
+        print("study-loop: subject: "
+              f"{sanitise_for_terminal(subject_title)}", file=sys.stderr)
     if summary:
-        print(f"study-loop: overview: {summary}", file=sys.stderr)
+        print("study-loop: overview: "
+              f"{sanitise_for_terminal(summary, max_len=512)}", file=sys.stderr)
     print(
         f"study-loop: overview produced {len(idents)} identifiers, "
         f"{len(concepts)} concepts (${cost:.4f})",
@@ -521,11 +600,13 @@ _SYNTHESIS_SCHEMA = {
 def _synthesise_overview(
     dm_data: dict,
     model: str | None,
+    run_dir: Path | None = None,
 ) -> tuple[str, str, str, dict | None]:
     """Generate subject_title + overview + trust_summary + architecture.
 
     Returns (subject_title, overview_summary, trust_summary, architecture).
-    Falls back to ("", "", "", None) on any failure.
+    Falls back to ("", "", "", None) on any failure. ``run_dir`` rides
+    through to the dispatcher gate (L5 audit-log placement).
     """
     concepts = dm_data.get("concepts", [])
     invariants = dm_data.get("invariants", [])
@@ -533,14 +614,19 @@ def _synthesise_overview(
     if not concepts:
         return "", "", "", None
 
+    # .get throughout: the model is a load_json dict (drift-tolerant
+    # loader), and a KeyError here escapes the caller's
+    # (OSError, ValueError) handler.
     concept_lines = "\n".join(
-        f"- {c['id']}: {c.get('description', '')}" for c in concepts
+        f"- {c.get('id', '?')}: {c.get('description', '')}"
+        for c in concepts
     )
     invariant_lines = "\n".join(
-        f"- {inv['id']}: {inv.get('statement', '')}" for inv in invariants
+        f"- {inv.get('id', '?')}: {inv.get('statement', '')}"
+        for inv in invariants
     )
     contract_lines = "\n".join(
-        f"- {ct['function']}: {ct.get('input_semantics', '')}"
+        f"- {ct.get('function', '?')}: {ct.get('input_semantics', '')}"
         for ct in contracts
     )
     target = dm_data.get("target", "")
@@ -572,7 +658,8 @@ def _synthesise_overview(
             client = LLMClient(pinned_model=model)
         else:
             client = get_client()
-        _ensure_llm_dispatcher(client, "raptor-study-loop")
+        _ensure_llm_dispatcher(client, "raptor-study-loop",
+                               run_dir=run_dir)
     except Exception:  # noqa: BLE001 - synthesis is best-effort
         return "", "", "", None
     if client is None:
@@ -584,7 +671,7 @@ def _synthesise_overview(
         )
         result = response.result if hasattr(response, "result") else {}
     except Exception as exc:  # noqa: BLE001 - synthesis is best-effort
-        print(f"study-loop: WARNING: synthesis LLM call failed: {exc}",
+        print(f"study-loop: WARNING: synthesis LLM call failed: {sanitise_for_terminal(str(exc), max_len=300)}",
               file=sys.stderr)
         return "", "", "", None
 
@@ -603,11 +690,13 @@ def _synthesise_overview(
             if last_space > 100:
                 trust = trust[:last_space] + "."
     if title:
-        print(f"study-loop: synthesised title: {title} (${cost:.4f})",
+        print(f"study-loop: synthesised title: {sanitise_for_terminal(title)} "
+              f"(${float(cost):.4f})",
               file=sys.stderr)
     if arch:
         tm = arch.get("threading_model", "unknown")
-        print(f"study-loop: architecture: threading={tm}",
+        print("study-loop: architecture: "
+              f"threading={sanitise_for_terminal(str(tm), max_len=64)}",
               file=sys.stderr)
     return title or "", overview or "", trust or "", arch
 
@@ -747,7 +836,7 @@ def _score_doc_relevance(filepath: str, identifiers: set[str]) -> float:
     if not content.strip():
         return 0.0
 
-    lines = content.split("\n")
+    lines = content.split("\n")  # line-model: universal-newline read above
     score = 0.0
 
     # Title / first heading (lines 0-5)
@@ -803,7 +892,11 @@ def _render_study_report(output_dir: Path) -> None:
     if not title:
         title = Path(target).name
 
-    parts.append(f"# {title}\n")
+    # Every free-text field below is LLM-authored or read from
+    # target source — route prose through _prose/_line and code
+    # through sanitise_code so study-report.md carries no live
+    # markdown structure, autofetch markup, or control bytes.
+    parts.append(f"# {_line(title)}\n")
 
     # --- Key files ---
     key_files = dm.get("key_files", [])
@@ -818,22 +911,22 @@ def _render_study_report(output_dir: Path) -> None:
             parts.append("## Source Files\n")
             if headers:
                 for kf in headers:
-                    desc = kf.get("description", "")
+                    desc = _line(kf.get("description", ""))
                     desc_str = f" — {desc}" if desc else ""
-                    parts.append(f"- `{kf['file']}`{desc_str}")
+                    parts.append(f"- `{_line(kf['file'])}`{desc_str}")
             if impls:
                 for kf in impls:
-                    desc = kf.get("description", "")
+                    desc = _line(kf.get("description", ""))
                     desc_str = f" — studies {desc}" if desc else ""
-                    parts.append(f"- `{kf['file']}`{desc_str}")
+                    parts.append(f"- `{_line(kf['file'])}`{desc_str}")
             parts.append("")
 
         if docs:
             parts.append("## Documentation\n")
             for kf in docs:
-                desc = kf.get("description", "")
+                desc = _line(kf.get("description", ""))
                 desc_str = f" — {desc}" if desc else ""
-                parts.append(f"- `{kf['file']}`{desc_str}")
+                parts.append(f"- `{_line(kf['file'])}`{desc_str}")
             parts.append("")
 
     # --- Overview ---
@@ -842,13 +935,13 @@ def _render_study_report(output_dir: Path) -> None:
     if overview_summary or concepts:
         parts.append("## Overview\n")
         if overview_summary:
-            parts.append(overview_summary)
+            parts.append(_prose(overview_summary))
             parts.append("")
         else:
             for c in concepts:
                 desc = c.get("description", "")
                 if desc:
-                    parts.append(desc)
+                    parts.append(_prose(desc))
                 parts.append("")
 
     # --- Data Structures ---
@@ -874,20 +967,23 @@ def _render_study_report(output_dir: Path) -> None:
             rendered_structs.add(name)
             defn = sd.get("definition", "")
             doc_comment = sd.get("doc_comment", "")
-            parts.append(f"### `struct {name}`\n")
+            parts.append(f"### `struct {_line(name)}`\n")
             if doc_comment:
-                parts.append(doc_comment.strip())
+                parts.append(_prose(doc_comment.strip()))
                 parts.append("")
             if defn:
+                # sanitise_code: control bytes escaped AND embedded
+                # ``` runs defanged — a struct block quoting a fence
+                # must not spill live markdown out of this block.
                 parts.append("```c")
-                parts.append(defn.rstrip())
+                parts.append(sanitise_code(defn.rstrip()))
                 parts.append("```\n")
             # Render field annotations below the definition
             annots = field_annots.get(name, {})
             if annots:
                 for field_name, annotation in annots.items():
                     parts.append(
-                        f"**`{field_name}`**: {annotation}\n")
+                        f"**`{_line(field_name)}`**: {_line(annotation)}\n")
                 parts.append("")
 
     # --- Data Structures (contracts for structs) ---
@@ -905,23 +1001,23 @@ def _render_study_report(output_dir: Path) -> None:
         parts.append("## API Reference\n")
         for c in struct_contracts + impl_contracts:
             parts.append(
-                f"### `{c['function']}` "
-                f"({c.get('file', '')})\n")
+                f"### `{_line(c.get('function', '?'))}` "
+                f"({_line(c.get('file', ''))})\n")
             if c.get("when"):
-                parts.append(f"**When:** {c['when']}\n")
+                parts.append(f"**When:** {_prose(c['when'])}\n")
             if c.get("input_semantics"):
-                parts.append(f"**Input:** {c['input_semantics']}\n")
+                parts.append(f"**Input:** {_prose(c['input_semantics'])}\n")
             if c.get("output_semantics"):
-                parts.append(f"**Output:** {c['output_semantics']}\n")
+                parts.append(f"**Output:** {_prose(c['output_semantics'])}\n")
             if c.get("ownership_transfer"):
                 parts.append(
-                    f"**Ownership:** {c['ownership_transfer']}\n")
+                    f"**Ownership:** {_prose(c['ownership_transfer'])}\n")
             if c.get("implication"):
                 parts.append(
-                    f"**Implication:** {c['implication']}\n")
+                    f"**Implication:** {_prose(c['implication'])}\n")
             if c.get("security_note"):
                 parts.append(
-                    f"**Security:** {c['security_note']}\n")
+                    f"**Security:** {_prose(c['security_note'])}\n")
 
     # --- Invariants & Safety ---
     invariants = dm.get("invariants", [])
@@ -929,12 +1025,12 @@ def _render_study_report(output_dir: Path) -> None:
         parts.append("## Invariants & Safety\n")
         for inv in invariants:
             cwes = inv.get("relevant_cwes", [])
-            cwe_str = f" ({', '.join(cwes)})" if cwes else ""
-            parts.append(f"### {inv.get('id', '')}{cwe_str}\n")
-            parts.append(f"{inv.get('statement', '')}\n")
+            cwe_str = f" ({_line(', '.join(str(c) for c in cwes))})" if cwes else ""
+            parts.append(f"### {_line(inv.get('id', ''))}{cwe_str}\n")
+            parts.append(f"{_prose(inv.get('statement', ''))}\n")
             neg = inv.get("negation", "")
             if neg:
-                parts.append(f"**Violation:** {neg}\n")
+                parts.append(f"**Violation:** {_prose(neg)}\n")
 
     # --- Bug patterns ---
     bug_patterns = dm.get("bug_patterns", [])
@@ -943,8 +1039,8 @@ def _render_study_report(output_dir: Path) -> None:
         for i, bp in enumerate(bug_patterns, 1):
             desc = bp.get("description", bp.get("id", ""))
             # Use first sentence only for terse rendering
-            first_sentence = desc.split(". ")[0].rstrip(".")
-            parts.append(f"{i}. **{first_sentence}**")
+            first_sentence = str(desc).split(". ")[0].rstrip(".")
+            parts.append(f"{i}. **{_line(first_sentence)}**")
         parts.append("")
 
     # --- State machines ---
@@ -952,16 +1048,16 @@ def _render_study_report(output_dir: Path) -> None:
     if state_machines:
         parts.append("## State Machines\n")
         for sm in state_machines:
-            parts.append(f"### {sm.get('name', '')}\n")
+            parts.append(f"### {_line(sm.get('name', ''))}\n")
             if sm.get("description"):
-                parts.append(f"{sm['description']}\n")
+                parts.append(f"{_prose(sm['description'])}\n")
             states = sm.get("states", [])
             if states:
                 parts.append("| State | Description |")
                 parts.append("|-------|-------------|")
-                for s in states:
-                    desc = s.get("description", "")
-                    parts.append(f"| {s.get('name', '')} | {desc} |")
+                for st in states:
+                    desc = st.get("description", "")
+                    parts.append(f"| {_cell(st.get('name', ''))} | {_cell(desc)} |")
                 parts.append("")
 
     # --- Security context ---
@@ -970,21 +1066,91 @@ def _render_study_report(output_dir: Path) -> None:
         parts.append("## Security Context\n")
         if sc.get("privilege_level"):
             parts.append(
-                f"- **Privilege level:** {sc['privilege_level']}")
+                f"- **Privilege level:** {_line(sc['privilege_level'])}")
         if sc.get("attack_surface"):
             parts.append(
-                f"- **Attack surface:** {sc['attack_surface']}")
+                f"- **Attack surface:** {_line(sc['attack_surface'])}")
         if sc.get("isolation"):
-            parts.append(f"- **Isolation:** {sc['isolation']}")
+            parts.append(f"- **Isolation:** {_line(sc['isolation'])}")
         if sc.get("trust_summary"):
             parts.append(
-                f"- **Key trust boundary:** {sc['trust_summary']}")
+                f"- **Key trust boundary:** {_line(sc['trust_summary'])}")
         parts.append("")
 
+    seed_section = _render_seed_table(output_dir)
+    if seed_section:
+        parts.extend(seed_section)
+
     report_path = output_dir / "study-report.md"
-    report_path.write_text("\n".join(parts) + "\n", encoding="utf-8")
+    # Atomic write (planted-symlink defence at the predictable report
+    # name in the reused run dir).
+    from core.atomic_fs import write_text_atomically
+    write_text_atomically(report_path, "\n".join(parts) + "\n")
     print(f"\nstudy-loop: report written to {report_path}",
           file=sys.stderr)
+
+
+def _render_seed_table(output_dir: Path) -> list[str]:
+    """The report's seed-provenance table: every seeded item with
+    its source and why. Honesty first — seed selection is
+    target-influenced (bridge seeds derive from attacker-controlled
+    bytes; even operator seeds steer attention), so the table opens
+    with that line rather than presenting seeded focus as neutral.
+    Why-texts come from bridge-seeds.json (escaped at capture) and
+    are re-escaped here for the markdown surface anyway.
+    """
+    sl_path = output_dir / "study-list.json"
+    if not sl_path.is_file():
+        return []
+    sl = load_json(sl_path, max_bytes=_MAX_STUDY_ARTIFACT_BYTES)
+    if not isinstance(sl, dict):
+        return []
+    seeded = [
+        item for item in sl.get("items") or []
+        if isinstance(item, dict) and item.get("seed_source")
+    ]
+    if not seeded:
+        return []
+
+    whys: dict[str, str] = {}
+    bridge_path = output_dir / "bridge-seeds.json"
+    if bridge_path.is_file():
+        bridge = load_json(bridge_path, max_bytes=4 * 1024 * 1024)
+        if isinstance(bridge, dict):
+            for seed in bridge.get("seeds") or []:
+                if isinstance(seed, dict) and seed.get("name"):
+                    whys[str(seed["name"])] = str(seed.get("why") or "")
+
+    # The honesty line is the bridge's CONSTANT (capitalised
+    # mechanically) — a re-typed copy here would let the contract
+    # string and the report drift apart.
+    from core.orchestration.binary_study_bridge import HONESTY_LINE
+    honesty = HONESTY_LINE[:1].upper() + HONESTY_LINE[1:]
+    parts = [
+        "## Seed Provenance\n",
+        f"{honesty}. Seeds steer study "
+        "attention only — they are hints, never verdicts.\n",
+        "| Item | Source | Why |",
+        "|------|--------|-----|",
+    ]
+    order = {"operator": 0, "bridge_seed": 1,
+             "bridge_seed_overflow": 2, "bridge_corroborated": 3}
+    seeded.sort(key=lambda i: order.get(str(i.get("seed_source")), 9))
+    for item in seeded:
+        name = str(item.get("name") or "")
+        source = str(item.get("seed_source") or "")
+        if source == "operator":
+            why = "operator-asked identifier"
+        elif source == "bridge_seed_overflow":
+            why = whys.get(name, "bridge-derived lead") + (
+                " — beyond the derived-attention cap; baseline "
+                "treatment")
+        else:
+            why = whys.get(name, "bridge-derived lead")
+        parts.append(f"| `{_cell(name)}` | {_cell(source)} "
+                     f"| {_cell(why)} |")
+    parts.append("")
+    return parts
 
 
 # ------------------------------------------------------------------
@@ -993,22 +1159,22 @@ def _render_study_report(output_dir: Path) -> None:
 
 
 
-def _ensure_llm_dispatcher(client, label: str) -> None:
+def _ensure_llm_dispatcher(client, label: str,
+                           run_dir: Path | None = None) -> None:
     """Self-serve the in-process LLM dispatcher for Bedrock-routed
-    models. Pipeline runs inherit one from their parent; a standalone
-    CLI is its own parent — without this every Bedrock call dies with
-    "requires the RAPTOR LLM dispatcher". Shared gate with
-    raptor-llm-ask; no-op when a route exists or none is needed.
+    models — delegates to the shared gate
+    (core.llm.dispatcher.lifecycle.ensure_route_for_client, which
+    never raises). Kept as a local name: it is this script's test
+    seam, and the lazy import keeps dispatcher machinery off the
+    no-LLM startup path. ``run_dir`` places the dispatcher's L5 audit
+    JSONL in the run's output directory instead of the in-memory
+    default.
     """
     try:
-        from core.llm.dispatcher.lifecycle import (
-            ensure_route_for_model_configs,
-        )
-        configs = [getattr(client.config, "primary_model", None)]
-        configs += list(getattr(client.config, "fallback_models", []) or [])
-        ensure_route_for_model_configs(configs, label=label)
-    except Exception:  # noqa: BLE001 — provider errors surface at call time
-        pass
+        from core.llm.dispatcher.lifecycle import ensure_route_for_client
+    except ImportError:  # no dispatcher machinery, no route to serve
+        return
+    ensure_route_for_client(client, label, run_dir=run_dir)
 
 
 def main() -> int:
@@ -1026,8 +1192,10 @@ def main() -> int:
                     help="Initial semantic concepts (comma-separated).")
     ap.add_argument("--model", default=None,
                     help="LLM model override for study-run.")
-    ap.add_argument("--batch-target", type=int, default=80,
-                    help="Items per Phase-2 study batch (passed to raptor-study-run).")
+    ap.add_argument("--batch-target", type=int, default=None,
+                    help="Items per Phase-2 study batch (passed to "
+                         "raptor-study-run; default: study-run "
+                         "computes it within the output budget).")
     ap.add_argument("--include-dir", action="append", default=None,
                     dest="include_dirs", metavar="DIR",
                     help="Additional include search directories (repeatable).")
@@ -1043,18 +1211,60 @@ def main() -> int:
     ap.add_argument("--redb-map", default=None, metavar="PATH",
                     help="Passed through to raptor-study-prep "
                          "(decomp-map.json sidecar).")
+    ap.add_argument("--bridge-seed-file", default=None, metavar="PATH",
+                    help="Passed through to raptor-study-prep "
+                         "(bridge-seeds.json from the map→study "
+                         "bridge). Also counts as an initial scope: "
+                         "a run with bridge seeds proceeds to study "
+                         "instead of the overview-only shortcut.")
+    ap.add_argument("--max-cost", type=float, default=None,
+                    metavar="USD",
+                    help="Maximum LLM cost in USD before stopping — "
+                         "passed through to raptor-study-run (the "
+                         "dominant-spend leg; the overview and "
+                         "compile legs run on the config default).")
+    ap.add_argument("--require-domain-model", action="store_true",
+                    help="The caller consumes domain-model.json "
+                         "(binary study / engagement chains): a run "
+                         "that ends without it exits nonzero and "
+                         "records the cause in study-failure.json, "
+                         "and the overview-only fallback refuses "
+                         "instead of exiting 0 with no model. "
+                         "Without this flag the documented operator "
+                         "outcomes (overview shortcut, zero-item "
+                         "warning) keep their clean exits.")
     ap.add_argument("-v", "--verbose", action="store_true")
     parsed = ap.parse_args()
+
+    # isfinite: argparse's float() accepts "nan"/"inf", and NaN
+    # passes a naive `<= 0` gate — the forwarded cap then never
+    # trips downstream, silently unlimited.
+    import math
+    if parsed.max_cost is not None and (
+            not math.isfinite(parsed.max_cost) or parsed.max_cost <= 0):
+        print("study-loop: --max-cost must be a positive finite "
+              "dollar amount", file=sys.stderr)
+        return 1
 
     target = Path(parsed.target).resolve()
     output_dir = Path(parsed.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # This run's outcome supersedes any earlier failure record — a
+    # stale one in a reused output dir must never be read as THIS
+    # run's diagnosis.
+    clear_study_failure(output_dir)
+
     concepts_dir = _detect_concepts_dir(output_dir)
     if concepts_dir:
         print(f"study-loop: project concepts dir: {concepts_dir}",
               file=sys.stderr)
-    _load_prior_knowledge(output_dir, concepts_dir)
+    _load_prior_knowledge(
+        output_dir, concepts_dir,
+        # Operator-typed focus channels only: bridge seeds are
+        # derived attention and do not suppress the inherited list.
+        explicit_focus=bool(parsed.identifier or parsed.concept),
+    )
 
     libexec_dir = Path(__file__).resolve().parent
     prep_bin = str(libexec_dir / "raptor-study-prep")
@@ -1066,13 +1276,40 @@ def main() -> int:
 
     rl_path = output_dir / "reading-list.json"
     has_reading_list = rl_path.is_file()
+    bridge_seed_file = (Path(parsed.bridge_seed_file)
+                        if parsed.bridge_seed_file else None)
+    has_bridge_seeds = (bridge_seed_file is not None
+                        and bridge_seed_file.is_file())
 
     # --- Overview mode ---
-    if not identifiers and not concepts and not has_reading_list:
+    # Bridge seeds are an initial scope like operator identifiers
+    # (one tier down): with them present the run studies instead of
+    # stopping at the overview shortcut — the one-shot binary flow
+    # depends on this.
+    if (not identifiers and not concepts and not has_reading_list
+            and not has_bridge_seeds):
+        if parsed.require_domain_model:
+            # The caller's contract needs domain-model.json and an
+            # overview-only run can never produce one — refuse HERE,
+            # before spending the overview LLM call, instead of
+            # exiting 0 and burning the caller's stage on a run that
+            # already cannot meet its contract (observed: the
+            # engagement chain converging on an overview-only pass
+            # and failing a stage later with a bare "no model").
+            detail = (
+                "the caller requires domain-model.json but no study "
+                "scope was given (no --identifier/--concept, no "
+                "reading list, no bridge seeds) — the overview-only "
+                "fallback cannot produce a domain model"
+            )
+            write_study_failure(output_dir, "no_domain_model", detail)
+            print(f"study-loop: ERROR: {detail}", file=sys.stderr)
+            return 1
         print("study-loop: no identifier/concept given — running overview",
               file=sys.stderr)
         overview_idents, overview_concepts, overview_summary, overview_title = (
-            _overview_from_directory(target, model=parsed.model)
+            _overview_from_directory(target, model=parsed.model,
+                                     run_dir=output_dir)
         )
         if not overview_idents and not overview_concepts:
             print(
@@ -1089,12 +1326,14 @@ def main() -> int:
         }
         overview_path = output_dir / "overview.json"
         save_json(overview_path, overview)
+        # identifiers/concepts are LLM-returned free text — escape
+        # control bytes before the operator terminal.
         print("\nIdentifiers:", file=sys.stderr)
         for ident in overview_idents:
-            print(f"  - {ident}", file=sys.stderr)
+            print(f"  - {sanitise_for_terminal(str(ident))}", file=sys.stderr)
         print("\nConcepts:", file=sys.stderr)
         for concept in overview_concepts:
-            print(f"  - {concept}", file=sys.stderr)
+            print(f"  - {sanitise_for_terminal(str(concept))}", file=sys.stderr)
         print(
             f"\nOverview written to {overview_path}\n"
             "Run again with --identifier or --concept to study specific topics.",
@@ -1116,7 +1355,6 @@ def main() -> int:
         prep_cmd.extend(["--identifier", identifiers])
     if concepts:
         prep_cmd.extend(["--concept", concepts])
-    rl_path = output_dir / "reading-list.json"
     if rl_path.is_file():
         prep_cmd.extend(["--reading-list", str(rl_path)])
     if parsed.include_dirs:
@@ -1128,6 +1366,8 @@ def main() -> int:
         prep_cmd.extend(["--redb", parsed.redb])
     if parsed.redb_map:
         prep_cmd.extend(["--redb-map", parsed.redb_map])
+    if has_bridge_seeds:
+        prep_cmd.extend(["--bridge-seed-file", str(bridge_seed_file)])
 
     rc = _run(prep_cmd, verbose=parsed.verbose)
     if rc != 0:
@@ -1151,14 +1391,30 @@ def main() -> int:
         _collect_key_files(data, key_files, seen_key_files, str(target))
 
         if n_items == 0:
-            print("study-loop: no study items — done", file=sys.stderr)
+            dropped = data.get("reading_list_dropped")
+            if isinstance(dropped, int) and dropped > 0:
+                # Never a silent empty study: prep dropped foreign
+                # reading-list identifiers (project-store carryover
+                # from a different tree/binary) and still ended with
+                # zero items — name the cause instead of "done".
+                print(
+                    f"study-loop: WARNING: 0 study items — {dropped} "
+                    "reading-list identifier(s) resolved to no file "
+                    "in this tree (different binary?); the domain "
+                    "model was NOT updated by this pass",
+                    file=sys.stderr,
+                )
+            else:
+                print("study-loop: no study items — done", file=sys.stderr)
         else:
             # --- Study ---
             run_cmd = [sys.executable, run_bin, str(output_dir)]
             if parsed.model:
                 run_cmd.extend(["--model", parsed.model])
-            if parsed.batch_target != 80:
+            if parsed.batch_target is not None:
                 run_cmd.extend(["--batch-target", str(parsed.batch_target)])
+            if parsed.max_cost is not None:
+                run_cmd.extend(["--max-cost", str(parsed.max_cost)])
             if parsed.verbose:
                 run_cmd.append("-v")
 
@@ -1206,8 +1462,13 @@ def main() -> int:
                 exit_code = rc
 
     # --- Attach key files, overview, and struct definitions to domain model ---
+    # Gated on success: on a failed run domain-model.json may be the
+    # PRIOR canonical model copied in by _load_prior_knowledge — the
+    # attach/synthesis pass would decorate a stale model with this
+    # run's key files and pay the synthesis LLM call for a run that
+    # already failed.
     dm_path = output_dir / "domain-model.json"
-    if dm_path.is_file():
+    if exit_code == 0 and dm_path.is_file():
         try:
             dm_data = load_json(
                 dm_path, strict=True, max_bytes=_MAX_STUDY_ARTIFACT_BYTES,
@@ -1238,21 +1499,7 @@ def main() -> int:
                         study_list_path, strict=True,
                         max_bytes=_MAX_STUDY_ARTIFACT_BYTES,
                     ) or {}
-                    struct_defs = []
-                    for item in sl.get("items", []):
-                        if item.get("kind") != "struct":
-                            continue
-                        tier = item.get("relevance_tier")
-                        if tier is not None and tier > 2:
-                            continue
-                        struct_defs.append({
-                            "name": item["name"],
-                            "file": item.get("file", ""),
-                            "definition": item.get("definition", ""),
-                            "fields": item.get("fields", []),
-                            "relevance_tier": tier,
-                            "doc_comment": item.get("doc_comment", ""),
-                        })
+                    struct_defs = _struct_definitions(sl)
                     if struct_defs:
                         dm_data["struct_definitions"] = struct_defs
                 except (OSError, ValueError):
@@ -1286,7 +1533,8 @@ def main() -> int:
             )
             if needs_synthesis:
                 syn_title, syn_overview, syn_trust, syn_arch = (
-                    _synthesise_overview(dm_data, parsed.model)
+                    _synthesise_overview(dm_data, parsed.model,
+                                         run_dir=output_dir)
                 )
                 if syn_title:
                     dm_data["subject_title"] = syn_title
@@ -1306,6 +1554,19 @@ def main() -> int:
     # --- Render human-readable report ---
     _render_study_report(output_dir)
 
+    # study-questions.md is a RENDERING of reading-list.json (the
+    # one store) — derived, regenerable, never a place questions
+    # live. Best-effort: the renderer never fails the run.
+    try:
+        from core.concepts.reading_list import write_study_questions
+        questions_path = write_study_questions(output_dir)
+    except Exception:  # noqa: BLE001 — render is a convenience
+        questions_path = None
+    if questions_path:
+        print(f"study-loop: study questions rendered to "
+              f"{questions_path} (from reading-list.json)",
+              file=sys.stderr)
+
     # --- Summary ---
     if dm_path.is_file():
         try:
@@ -1322,9 +1583,11 @@ def main() -> int:
     if key_files:
         print(f"\nKey files ({len(key_files)}):", file=sys.stderr)
         for kf in key_files:
-            role = kf.get("role", "")
-            path = kf.get("file", "")
-            desc = kf.get("description", "")
+            # role/path are target-derived; description quotes doc
+            # titles extracted verbatim from target file content.
+            role = sanitise_for_terminal(str(kf.get("role", "")), max_len=32)
+            path = sanitise_for_terminal(str(kf.get("file", "")), max_len=200)
+            desc = sanitise_for_terminal(str(kf.get("description", "")))
             label = f"  [{role}] {path}"
             if desc:
                 label += f" — {desc}"
@@ -1335,11 +1598,48 @@ def main() -> int:
         print(f"\n{len(remaining)} unresolved reading-list items:",
               file=sys.stderr)
         for item in remaining:
-            q = item.get("question", "")[:100]
+            # reading-list questions are LLM-authored free text.
+            # present-but-null question: route like absent, not "None".
+            q = sanitise_for_terminal(str(item.get("question") or ""), max_len=100)
             print(f"  - {q}", file=sys.stderr)
 
-    _promote_to_project(output_dir, concepts_dir)
-    _store_in_sage(output_dir, str(target))
+    # --- Required-output contract (--require-domain-model) ---
+    # A contract-carrying run that ends without the model must fail
+    # AT THIS BOUNDARY with its actual cause, not exit 0 and leave
+    # the diagnosis to whichever consumer looks for the model next —
+    # one stage late and stripped of the cause. Legs that already
+    # failed (prep / study-run / compile) exited nonzero above and
+    # study-run wrote its own record, so exit_code == 0 here means
+    # no record describes this run yet.
+    if (parsed.require_domain_model and exit_code == 0
+            and not dm_path.is_file()):
+        dropped = data.get("reading_list_dropped")
+        if n_items == 0 and isinstance(dropped, int) and dropped > 0:
+            detail = (
+                f"prep derived no study scope — {dropped} "
+                "reading-list identifier(s) resolved to no file in "
+                "this tree (different binary?); no domain model was "
+                "produced"
+            )
+        elif n_items == 0:
+            detail = ("prep derived no study scope (0 study items) "
+                      "— no domain model was produced")
+        else:
+            detail = (f"study pass completed over {n_items} item(s) "
+                      "without writing domain-model.json")
+        write_study_failure(output_dir, "no_domain_model", detail)
+        print(f"study-loop: ERROR: {detail}", file=sys.stderr)
+        exit_code = 1
+
+    # Promotion and SAGE storage are durable-store WRITES — a failed
+    # run must not push its (possibly prior/stale) domain model over
+    # the project canonical copy or into persistent memory.
+    if exit_code == 0:
+        _promote_to_project(output_dir, concepts_dir)
+        _store_in_sage(output_dir, str(target))
+    else:
+        print("study-loop: run failed — skipping project promotion "
+              "and SAGE store", file=sys.stderr)
 
     return exit_code
 

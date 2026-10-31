@@ -46,14 +46,14 @@ The default (no subcommand) is `scan` -- the full analyse pipeline.
 | `scan` (default) | Walk the target, match every dep against OSV/KEV/EPSS, write findings + report + SBOM + SARIF. |
 | `fix` | Pin loose deps and fix CVEs. Safe plan by default; `--apply` to modify files. |
 | `check <eco> <name> <ver>` | Single-dep pre-install safety verdict (Clean / Review / Block). |
-| `upgrade <eco> <name> <from> <to>` | Forward-looking upgrade impact: advisories resolved vs introduced. |
+| `upgrade <eco> <name> <from> <to>` | Forward-looking upgrade impact: advisories resolved vs introduced. Exit codes: 0 = no new advisories introduced, 1 = non-trivial trade-off, 2 = invalid arguments **or verdict unavailable** (OSV lookup degraded; the report carries a "verdict unavailable" section instead of a wrong 0/1). |
 | `diff <a.json> <b.json>` | Compare two `findings.json` files. |
 | `verify <path> --proposed <dir>` | Round-trip check: re-scan with proposed overlay applied. |
 | `health` | Probe every registry client; report reachability. |
 | `purl <eco> <name> <ver>` | Build a canonical Package URL. |
 | `render <findings.json>` | Re-render `report.md` / SARIF from an existing findings file. |
 | `clean-cache` | Reclaim disk space from stale cache entries. Removes entries older than `--max-age` days from `~/.raptor/cache/sca/`. |
-| `dt-push` | Upload a CycloneDX SBOM to a Dependency-Track instance. Requires `--url` and `--api-key` (or `$DT_API_KEY`). |
+| `dt-push` | Upload a CycloneDX SBOM to a Dependency-Track instance. Requires `--url` and `$DT_API_KEY` (or the deprecated `--api-key` flag — argv is world-readable via `/proc/*/cmdline`; the env var wins when both are set). |
 | `suppress` | Manage the suppression overlay (`.raptor-sca-suppress.yml`). Sub-actions: `list` (view current suppressions), `check` (validate against fresh findings and surface stale entries). |
 | `bump` | Dependency version bump operations. |
 | `fingerprint` | Compute, save or check-drift on a binary or OCI image fingerprint. Modes: compute+print (default), `--save` (store baseline), `--check` (detect drift from saved baseline). Accepts local file paths or OCI image refs. |
@@ -104,7 +104,16 @@ Recognised commands across all four shapes: `pip`, `pipx`, `uv pip`,
 | OSV.dev (`/v1/querybatch`, `/v1/vulns/<id>`) | Advisory and affected ranges | 24h disk |
 | CISA KEV catalogue | Known-exploited filter | 24h disk |
 | FIRST.org EPSS | Exploitation probability | 24h disk |
+| CISA Vulnrichment | SSVC exploitation decision (`active`/`poc`/`none`) | 7d disk (1d for upstream misses) |
 | Per-ecosystem registries | Version listing for fix | 24h disk |
+
+EPSS and Vulnrichment are fetched once per scan over the unique CVE
+set: EPSS in 100-id batches, Vulnrichment SSVC in parallel under a
+per-scan budget of 1000 uncached fetches (container-image scans can
+carry tens of thousands of distro CVE findings). The budget is spent
+on the highest-value CVEs first — non-KEV before KEV-listed, then by
+severity and EPSS; findings past the budget simply show no SSVC
+signal for that run, and later runs pick them up as the cache warms.
 
 Registries supported: PyPI, npm, crates.io, RubyGems,
 Go (proxy.golang.org), Maven Central, Packagist, NuGet, Debian Sources,
@@ -114,7 +123,15 @@ Bundled data (the popular-package lists behind the typosquat
 heuristics, the KEV/EPSS calibration corpus, and the calibration
 project samples) is kept fresh by scheduled repository workflows —
 see [CI controls](ci-controls.md) for the refresh cadence and the
-matching manual scripts under `packages/sca/scripts/`.
+matching manual scripts under `packages/sca/scripts/`. The typosquat
+list refresh refuses an upstream feed that would replace more than
+half of the existing reference set (supply-chain guard against a
+poisoned feed); `--allow-churn` overrides after review.
+
+Maven coordinates parsed from Gradle DSL files use the canonical
+`group:artifact` (colon) shape. Findings from historical runs that
+recorded the old slash shape will not correlate with new runs — those
+rows never matched an advisory, so re-scan rather than merge.
 
 ### Scan Flags
 
@@ -140,6 +157,22 @@ matching manual scripts under `packages/sca/scripts/`.
 --no-trust-repo           keep strict checks, overriding --trust-repo
                           and the project's `config` trust marker
 ```
+
+In a Copilot session, the `/agentic` mechanical SCA worker uses this
+offline mode in a network-blocked sandbox rather than creating an
+unauthorised egress proxy. Its results are marked partial because
+uncached or stale vulnerability feeds cannot be refreshed. A standalone
+`/sca` scan also supports explicit `--offline`; live feed requests remain
+blocked by the session service policy. Workflow-history signing checks
+use an empty, private GPG home in that sandbox: presence of a signature
+is distinguishable from an unsigned commit, but keys unavailable to the
+worker cannot verify the signature's validity.
+
+The Copilot host may refresh public OSV/KEV/EPSS/Vulnrichment cache entries
+after an explicit operation-scoped approval. A fresh anonymous receipt at
+`~/.raptor/cache/sca/host-refresh-receipt.json`, bound to the exact target,
+lets `/agentic` distinguish approved fresh feed data from an arbitrary stale
+offline cache; repository networking remains disabled either way.
 
 Repo trust is gated: on untrusted runs a repo-shipped suppression
 overlay (`.raptor-sca-suppress.yml`) and license-policy file are
@@ -263,7 +296,7 @@ bin/raptor-sca fix /path/to/project --apply \
 | `--apply` | Apply changes directly to manifest files |
 | `--out <dir>` | Write rewritten manifests to a separate directory |
 | `--cve-only` | Only fix CVEs -- do not tighten loose pins |
-| `--harden` | Upgrade all deps to the latest safe version |
+| `--harden` | Upgrade all deps to the latest safe version. Candidates the promotion-safety check demotes carry the distinct `demoted_safety` status in the candidates JSON and report (inert under every flag combination). |
 | `--allow-major` | Include fixes that cross a major version boundary |
 | `--no-llm` | Skip LLM analysis (mechanical-only, fast, CI-safe) |
 | `--findings <path>` | Reuse findings from a previous scan |
@@ -377,6 +410,57 @@ Every scan run produces:
 | `sbom.cdx.json` | CycloneDX 1.5 + VEX | SBOM consumers, Dependency-Track, etc. |
 | `sbom.spdx.json` | SPDX 2.3 | Compliance pipelines (only when `--spdx` passed) |
 | `findings.sarif` | SARIF 2.1.0 | GitHub / GitLab / IDE integrations |
+| `diagnostics.json` | Private JSON (mode `0600`) | Current/completed phase, deadline, cancellation/timeout reason, and final success/failed/skipped/unsupported disposition |
+
+When `/agentic` launches its always-on SCA subprocess, that child is
+mechanical: LLM review and triage remain gated behind the distinct deep
+`--sca` phase. The parent propagates a slightly shorter child deadline and
+the child caps each HTTP retry loop, leaving time to write
+`diagnostics.json` and exit before the parent timeout. A timeout or
+cancellation is therefore a visible failed disposition with an active phase,
+never an empty successful scan.
+For targets outside the RAPTOR checkout, the sandbox mounts only the canonical
+RAPTOR `core/` and `packages/` trees and the Python runtime read-only, not the
+whole checkout. An external `RAPTOR_SCA_AGENT` override grants its agent file
+only; logs and the SCA cache retain their existing writable paths. The logger
+does not require unrelated `out/jobs` or CodeQL directories inside the worker.
+
+The mode contract is enforced centrally: the public API normalizes
+`analysis_mode="mechanical"` to review/triage disabled, while direct
+`RunOptions` construction rejects contradictory mechanical-plus-LLM gates.
+Sub-second remaining deadlines are passed as sub-second transport bounds (or
+refused before dispatch when too little time remains); they are never rounded
+up beyond the declared deadline. The direct agent accepts the documented SCA
+and shared sandbox flags only, including wrapper-forwarded `--sandbox-floor`;
+unknown options fail at argparse instead of being silently dropped.
+
+Under `/agentic`, SCA retains its historical 600-second bounded subprocess
+default when `--phase-timeout` is omitted; the repository-wide default used by
+the other phases does not silently lengthen it. An explicitly supplied
+positive `--phase-timeout` overrides SCA too. Explicit
+`--phase-timeout 0` means unbounded for both the parent wait and the child:
+no internal SCA deadline is installed.
+
+When `/agentic` is already running under an accepted `--no-sandbox` or
+`--sandbox none` consent, the SCA worker receives that same backed nonce
+through a dedicated RAPTOR-worker dispatch channel. The SCA launcher cannot
+mint consent from an arbitrary environment value, and ordinary sandboxed
+children still have the nonce stripped.
+
+The direct internal `python -m packages.sca.agent` compatibility surface is
+narrower: it runs RAPTOR's data parsers and does not execute target
+build/install code, so its historical `--sandbox none` / `--no-sandbox`
+library path remains available without minting a global disable consent.
+`--no-sandbox` overrides a simultaneously supplied profile before strict
+argument parsing. Agentic workers carry a hidden provenance bit and always
+re-enter the shared consent gate; external target-execution entry points are
+unchanged.
+
+In imported-SARIF-only and `--openant-only` workflows, always-on SCA is
+additive rather than a primary scanner requirement. Its failure remains
+visible as a partial-run reason and private diagnostic, but cannot by itself
+turn otherwise usable imported/OpenAnt output into exit status 1. Explicit
+`--sca` and normal Semgrep/CodeQL runs keep SCA in the required scanner set.
 
 ### Render Flags
 

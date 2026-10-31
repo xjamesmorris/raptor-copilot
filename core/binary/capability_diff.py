@@ -61,7 +61,8 @@ class CapabilityDelta:
         return not self.new_dangerous_imports
 
     def high_severity(self) -> bool:
-        """True when any added bucket is exec or network."""
+        """True when any added bucket is in HIGH_SEVERITY_BUCKETS
+        (exec / network / runtime_privilege / kernel_trace)."""
         return any(
             bucket in HIGH_SEVERITY_BUCKETS
             for bucket in self.new_dangerous_imports

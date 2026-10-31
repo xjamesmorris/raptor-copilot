@@ -472,3 +472,100 @@ class TestAgreementGate:
         )
         assert not out["agreed"]
         assert "no extracted snippets" in out["reason"]
+
+
+class TestValueAssertionStopwordGate:
+    """The value-assertion path applies the same stopword gate as the
+    fallback identifier scan: a prose word naming a same-named corpus
+    global must not become a trusted mechanical verdict."""
+
+    _GLOBALS = [
+        {"name": "size", "kind": "variable", "file": "ring.c",
+         "line": 3, "definition": "static int size = 0;"},
+        {"name": "RING_CAP", "kind": "macro", "file": "ring.c",
+         "line": 1, "definition": "#define RING_CAP 100"},
+    ]
+
+    def test_stopword_value_assertion_not_trusted(self) -> None:
+        r = spot_check_question(
+            "Does size equal 100 in the ring buffer setup?",
+            self._GLOBALS,
+        )
+        # The unrelated `size` global must not answer with a
+        # matches=False verdict against the question's 100.
+        assert r is None or r.matches is None, (
+            f"stopword global answered a value assertion: {r}"
+        )
+
+    def test_identifier_cased_assertion_still_trusted(self) -> None:
+        r = spot_check_question("Does RING_CAP equal 100?",
+                                self._GLOBALS)
+        assert r is not None
+        assert r.identifier == "RING_CAP"
+        assert r.matches is True
+
+    def test_identifier_cased_mismatch_still_flags(self) -> None:
+        r = spot_check_question("Does RING_CAP equal 200?",
+                                self._GLOBALS)
+        assert r is not None
+        assert r.matches is False
+
+
+class TestLedgerKeyedByOrigin:
+    """The study-answers ledger keys records by (question, file,
+    function): a same-text question from another function must not
+    overwrite the first record."""
+
+    def test_same_question_two_functions_both_recorded(self, tmp_path):
+        n = append_answers(tmp_path, [StudyAnswer(
+            question="can this fail?", source_file="a.c",
+            source_function="foo", answer="yes: returns -1 on EIO",
+            status="resolved")])
+        assert n == 1
+        n = append_answers(tmp_path, [StudyAnswer(
+            question="can this fail?", source_file="b.c",
+            source_function="bar", answer="no: cannot fail",
+            status="resolved")])
+        assert n == 1
+        assert len(load_answers(tmp_path)) == 2
+        foo = answers_for_function(tmp_path, "a.c", "foo")
+        assert [a["answer"] for a in foo] == ["yes: returns -1 on EIO"]
+
+    def test_same_origin_updates_in_place(self, tmp_path):
+        for answer in ("first", "second"):
+            append_answers(tmp_path, [StudyAnswer(
+                question="q?", source_file="a.c",
+                source_function="foo", answer=answer)])
+        recs = load_answers(tmp_path)
+        assert len(recs) == 1
+        assert recs[0]["answer"] == "second"
+
+
+class TestAmbiguousSameNamedConstantRefused:
+    """Same-named corpus constants with DIFFERENT values are ambiguous
+    authority — the mechanical channel refuses rather than picking one
+    file's definition arbitrarily."""
+
+    _AMBIG = [
+        {"name": "BUF_CAP", "kind": "macro", "file": "a.h", "line": 1,
+         "definition": "#define BUF_CAP 64"},
+        {"name": "BUF_CAP", "kind": "macro", "file": "b.h", "line": 1,
+         "definition": "#define BUF_CAP 4096"},
+    ]
+
+    def test_conflicting_values_refuse(self) -> None:
+        r = spot_check_question("Is BUF_CAP 4096?", self._AMBIG)
+        assert r is None, (
+            f"ambiguous constant answered mechanically: {r}"
+        )
+
+    def test_agreeing_duplicates_still_answer(self) -> None:
+        items = [
+            {"name": "BUF_CAP", "kind": "macro", "file": "a.h",
+             "line": 1, "definition": "#define BUF_CAP 4096"},
+            {"name": "BUF_CAP", "kind": "macro", "file": "b.h",
+             "line": 1, "definition": "#define BUF_CAP 0x1000"},
+        ]
+        r = spot_check_question("Is BUF_CAP 4096?", items)
+        assert r is not None
+        assert r.matches is True

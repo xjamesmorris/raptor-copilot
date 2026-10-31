@@ -13,6 +13,14 @@ from google.oauth2 import service_account
 
 from ..schema.common import EvidenceSource
 
+# Per-query billing cap, mirroring the typed wrapper's default
+# (core/forensics/bq_query.py DEFAULT_MAX_BYTES_BILLED = 200 GB).
+# Verification runs one whole-day GH Archive scan per evidence item
+# and calls this client DIRECTLY (not through the wrapper), so the
+# cap must live here too — without it a mis-scoped query bills
+# unbounded bytes.
+_MAX_BYTES_BILLED = 200 * 1000**3
+
 
 class GHArchiveClient:  # nosemgrep: generic.secrets.security.detected-google-gcm-service-account.detected-google-gcm-service-account
     """Client for GH Archive BigQuery queries.
@@ -77,6 +85,11 @@ class GHArchiveClient:  # nosemgrep: generic.secrets.security.detected-google-gc
         # File path or ADC fallback
         return google.auth.default(scopes=scopes)
 
+    # Default row cap. Callers making absence claims must compare the
+    # result count against the limit they passed: a result that HIT the
+    # cap is truncated and proves nothing about rows beyond it.
+    DEFAULT_LIMIT = 1000
+
     def query_events(
         self,
         repo: str | None = None,
@@ -84,6 +97,7 @@ class GHArchiveClient:  # nosemgrep: generic.secrets.security.detected-google-gc
         event_type: str | None = None,
         from_date: str = "",
         to_date: str | None = None,
+        limit: int = DEFAULT_LIMIT,
     ) -> list[dict[str, Any]]:
         """Query GH Archive for events using parameterized queries.
 
@@ -95,8 +109,19 @@ class GHArchiveClient:  # nosemgrep: generic.secrets.security.detected-google-gc
           hour/minute filter. This is the granularity the recover_*
           collectors need — they match candidate rows against the full
           timestamp themselves.
+
+        ``limit`` caps the rows returned. When a result's length equals
+        ``limit`` it is truncated — callers must not conclude absence
+        from it.
         """
         client = self._get_client()
+
+        # LIMIT cannot be parameterized; validate to a bounded int
+        # before interpolation.
+        limit = int(limit)
+        if not 1 <= limit <= 100_000:
+            msg = f"limit must be between 1 and 100000, got {limit}"
+            raise ValueError(msg)
 
         # Build table reference - use daily table.
         # Table names can't be parameterized, but the format is
@@ -148,9 +173,12 @@ class GHArchiveClient:  # nosemgrep: generic.secrets.security.detected-google-gc
         FROM {table}
         WHERE {where}
         ORDER BY created_at
-        LIMIT 1000
+        LIMIT {limit}
         """
 
-        job_config = bigquery.QueryJobConfig(query_parameters=params)
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=params,
+            maximum_bytes_billed=_MAX_BYTES_BILLED,
+        )
         results = client.query(query, job_config=job_config)
         return [dict(row) for row in results]

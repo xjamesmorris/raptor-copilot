@@ -15,21 +15,22 @@ archetype.
 Tree-sitter only — no Joern dependency. The analysis runs on raw
 source text without needing a full project checkout.
 
-Consumers: ``install_hooks.py``, ``python_lifecycle_hooks.py``,
-``cargo_build_scripts.py`` via the ``analyze_hook_payload`` entry
-point.
+Consumer: ``supply_chain/__init__.py`` via ``analyze_intree_targets``
+(npm lane). ``analyze_hook_payload`` is the per-payload entry point it
+wraps; the Python/Cargo adapters do not currently receive guard
+analysis.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, TYPE_CHECKING
+from pathlib import Path
+from typing import Any
 
 from .sink_vocab import HOOK_PAYLOAD_EXTRA_SINKS, SHARED_SUPPLY_CHAIN_SINKS
 
-if TYPE_CHECKING:
-    from pathlib import Path
+from ..parsers._safe_read import read_bounded
 
 logger = logging.getLogger(__name__)
 
@@ -180,12 +181,18 @@ def analyze_intree_targets(
     """
     results: list[HookGuardAnalysis] = []
     for t in intree_targets:
-        target_path = project_root / t.path
-        try:
-            source = target_path.read_text(
-                encoding="utf-8", errors="replace",
-            )
-        except OSError:
+        # ``t.path`` may already be absolute (resolver output) —
+        # join only the relative case instead of leaning on
+        # pathlib's absolute-rhs-wins operator semantics.
+        t_path = Path(t.path)
+        target_path = (
+            t_path if t_path.is_absolute() else project_root / t_path
+        )
+        # Bounded read: the payload file is attacker-controlled — an
+        # unbounded read_text of a multi-GB in-tree file referenced
+        # from a hook body was the one uncapped read in this lane.
+        source = read_bounded(target_path, follow_symlinks=False)
+        if source is None:
             continue
 
         analysis = analyze_hook_payload(source, str(t.path))

@@ -19,9 +19,10 @@ Design constraints:
   ``is_exploitable`` boolean cast to 0.0 / 1.0 so triage ordering
   still has something usable; an abstaining record (no boolean
   verdict) yields an inconclusive 0.5 posterior with a full-width CI.
-* **Pure function.** No IO; no scorecard reads; no logging. The
-  orchestrator owns side effects. This module is reusable from
-  test code and the (future) offline replay harness.
+* **Pure function.** No IO; no scorecard reads; no logging beyond the
+  WARNING ``dawid_skene.estimate`` emits on duplicate same-model
+  records. The orchestrator owns side effects. This module is
+  reusable from test code and the offline replay harness.
 """
 from __future__ import annotations
 
@@ -242,12 +243,12 @@ def calibrate_results(
                 ds_index[fp.finding_id] = fp
                 ds_convergence[fp.finding_id] = ds_result.converged
                 ds_reliabilities[fp.finding_id] = [
-                    {"model": r.model, "alpha": r.alpha, "beta": r.beta}
+                    {"model": r.model, "alpha": r.alpha, "beta": r.beta}  # type: ignore[dict-item]
                     for r in ds_result.model_reliabilities
                 ]
                 ds_class_prior[fp.finding_id] = prior_payload
         for fid in eligible_finding_ids:
-            fp = ds_index.get(fid)
+            fp = ds_index.get(fid)  # type: ignore[assignment]
             if fp is None:
                 # Defensive: shouldn't happen — every eligible finding
                 # was fed into the EM. Fall through to vote so the

@@ -1,7 +1,7 @@
 """Preprocessor-dead (#if 0) labels: dormant with a receipt, not error.
 
-Replays the v5 rose_route error cell: the pinned function exists in
-the raw fixture text (pin verifies ok), taint-approx indexes it, but
+Replays the failure shape: the pinned function exists in the raw
+fixture text (pin verifies ok), taint-approx indexes it, but
 the inventory honours ``#if 0`` and drops it from the checklist — the
 label scored ``error not_reviewed:function_not_in_checklist`` and the
 pin warning's diagnosis ("name or file path does not exist in the

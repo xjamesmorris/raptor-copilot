@@ -5,6 +5,7 @@ Analyses crashes from fuzzing to extract exploitability information.
 This is so much of a WIP, it's not even funny. However, you can see what we are trying to do and how it could be useful. 
 """
 
+import contextlib
 import os
 import platform
 import re
@@ -13,6 +14,7 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from core.binary.inspect import addr2line as _addr2line
 from core.binary.inspect import inspect_binary as _inspect_binary
 from core.binary.inspect import nm as _nm
 from core.binary.inspect import objdump as _objdump
@@ -24,11 +26,11 @@ from core.run.toolprobe import probe
 from core.sandbox import run as _sandbox_run
 from core.sandbox import run_trusted as _run_trusted
 
-# readelf/nm go through core.binary.inspect (FULL sandbox — the bytes
-# they parse are the crashing target's, and binutils' ELF parsers have
-# a long CVE history). _run_trusted remains for the remaining
-# read-only tools (file, strings, objdump, addr2line, otool) — sweep
-# candidates for the same helper.
+# readelf/nm/file/objdump/addr2line go through core.binary.inspect
+# (FULL sandbox — the bytes they parse are the crashing target's,
+# and binutils' ELF/DWARF parsers have a long CVE history).
+# _run_trusted remains only for the darwin-only otool seam and the
+# sysctl host probe.
 # Crash-analysis work runs a debugger or ASAN-instrumented binary:
 # - GDB / LLDB: need ptrace → profile='debug' (keeps net/Landlock/most seccomp).
 # - ASAN binary: no ptrace needed → default full sandbox via _sandbox_run.
@@ -36,6 +38,10 @@ from core.sandbox import run_trusted as _run_trusted
 from packages.binary_analysis._validators import is_valid_hex_address
 
 logger = get_logger()
+
+#: Linux ASLR level pseudo-file — module-level so tests can point it
+#: at a fixture instead of intercepting a subprocess.
+_PROC_ASLR_PATH = Path("/proc/sys/kernel/randomize_va_space")
 
 _SIGSEGV_SIGNALS = frozenset({"11", "sigsegv", "segmentation fault"})
 _SIGABRT_SIGNALS = frozenset({"6", "06", "sigabrt", "abort"})
@@ -52,7 +58,16 @@ _DISASM_MARKERS = frozenset({"<", ">", "mov", "call", "jmp", "ret", "push", "pop
 
 @dataclass
 class CrashContext:
-    """Complete context for a crash. The more information, the better for LLM analysis."""
+    """Complete context for a crash. The more information, the better
+    for LLM analysis.
+
+    Provenance caveat: the debugger/ASAN output these fields derive
+    from includes the crashing INFERIOR's own stdout/stderr
+    (size-capped at 64 KiB per stream). A binary that prints a fake
+    sanitizer report can steer its own ``crash_type`` / ``stack_hash``
+    classification — inherent to black-box triage; treat those fields
+    as target-influenced evidence, not ground truth.
+    """
     crash_id: str
     binary_path: Path
     input_file: Path
@@ -282,24 +297,17 @@ class CrashAnalyser:
         if not is_valid_hex_address(address):
             return "unknown", "unknown"
             
-        try:
-            result = _run_trusted(
-                ["addr2line", "-f", "-C", "-e", str(self.binary), address],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            
-            if result.returncode == 0:
-                lines = result.stdout.strip().split("\n")
-                if len(lines) >= 2:
-                    function = lines[0].strip()
-                    file_line = lines[1].strip()
-                    return function, file_line
-                    
-        except Exception as e:  # noqa: BLE001 — defensive: degrade, never crash the analysis
-            logger.debug("addr2line failed: %s", e)
-            
+        # Full sandbox: addr2line walks the crashing target's DWARF,
+        # attacker-shaped bytes. Never raises; failure → rc=None.
+        result = _addr2line(self.binary, address, timeout=5)
+
+        if result.returncode == 0:
+            lines = result.stdout.strip().split("\n")
+            if len(lines) >= 2:
+                function = lines[0].strip()
+                file_line = lines[1].strip()
+                return function, file_line
+
         return "unknown", "unknown"
 
     def analyse_crash(self, crash_id: str, input_file: Path, signal: str) -> CrashContext:
@@ -360,6 +368,18 @@ class CrashAnalyser:
                 self._parse_lldb_output(context, debugger_output)
             else:
                 self._parse_gdb_output(context, debugger_output)
+            # ASan reports ride the inferior's stderr — on the LLDB
+            # path via the redirect stubs appended to the analysis
+            # output, on the GDB path interleaved into batch stdout.
+            # Route them through the ASan parser when the direct
+            # ASan re-run above didn't already capture a report
+            # (that path's diagnostics take precedence), so the
+            # sanitizer's crash type / stack trace reach the record.
+            if (debugger_output
+                    and "AddressSanitizer" in debugger_output
+                    and "asan_output" not in context.binary_info):
+                self._parse_asan_output(context, debugger_output)
+                logger.info("✓ ASan diagnostics parsed from debugger output")
             logger.info("✓ Debugger analysis complete")
         except Exception as e:  # noqa: BLE001 — defensive: degrade, never crash the analysis
             logger.error("✗ Debugger analysis failed: %s", e)
@@ -540,20 +560,25 @@ class CrashAnalyser:
         including the random name (defeats symlink pre-plant on shared
         systems) and the explicit 0o600.
         """
+        # binary_dir placement is a sandbox-visibility constraint (see
+        # docstring) — the dir is target-writable by design, so the
+        # write goes through the fd mkstemp returned (O_EXCL-created,
+        # race-free): a close-then-reopen-by-path write_text would
+        # follow a symlink swapped in at the tempfile name.
         binary_dir = self.binary.parent
         fd, script_name = tempfile.mkstemp(
             prefix=prefix, suffix=".txt", dir=str(binary_dir),
         )
         script_file = Path(script_name)
-        os.close(fd)
         try:
-            os.chmod(script_file, 0o600)
-        except OSError:
+            os.fchmod(fd, 0o600)
+        except (OSError, AttributeError):
             # Non-POSIX filesystem — mkstemp's own 0600 default is the
             # best available; not fatal.
             pass
         try:
-            script_file.write_text("\n".join(commands), encoding="utf-8")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(commands))
         except BaseException:
             script_file.unlink(missing_ok=True)
             raise
@@ -645,6 +670,57 @@ class CrashAnalyser:
 
         return result.stdout
 
+    # Per-stream cap on how much of the inferior's redirected
+    # stdout/stderr is folded back into the analysis output. ASan
+    # reports are tens of KB at most; 64 KB keeps the whole report
+    # while bounding a runaway inferior that spews gigabytes.
+    _INFERIOR_OUTPUT_CAP = 64 * 1024
+
+    @staticmethod
+    def _read_inferior_capped(fd: int | None, cap: int) -> str:
+        """First ``cap`` chars of an inferior redirect stub, read via
+        the KEPT mkstemp fd ('' when unset/unreadable).
+
+        The attacker binary runs between stub creation and this read,
+        so a by-path reopen would follow a symlink swapped in at the
+        stub name and fold an attacker-chosen host file's head into
+        the crash report. The fd is bound to the original inode:
+        LLDB's ``-o``/``-e`` redirect truncates the existing path in
+        place (same inode), so our fd sees the inferior's output — and
+        a swapped path yields an empty read, fail-safe."""
+        if fd is None:
+            return ""
+        try:
+            dup = os.dup(fd)
+        except OSError:
+            return ""
+        try:
+            os.lseek(dup, 0, os.SEEK_SET)
+            reader = os.fdopen(dup, "r", encoding="utf-8", errors="replace")
+        except OSError:
+            with contextlib.suppress(OSError):
+                os.close(dup)
+            return ""
+        with reader:
+            try:
+                return reader.read(cap)
+            except OSError:
+                return ""
+
+    @classmethod
+    def _inferior_output_sections(
+        cls, out_fd: int | None, err_fd: int | None,
+    ) -> str:
+        """Labelled, size-capped dump of the inferior's redirected
+        stdout/stderr (via the kept stub fds), or '' when both are
+        empty."""
+        sections = []
+        for label, stub_fd in (("stdout", out_fd), ("stderr", err_fd)):
+            text = cls._read_inferior_capped(stub_fd, cls._INFERIOR_OUTPUT_CAP)
+            if text.strip():
+                sections.append(f"=== inferior {label} ===\n{text}")
+        return "\n".join(sections)
+
     def _run_lldb_analysis(self, input_file: Path) -> str:
         """Run LLDB to analyze crash (macOS)."""
         # Initialise to None so the outer finally can safely reference
@@ -657,20 +733,26 @@ class CrashAnalyser:
         # `process launch -o/-e <host-tmp-path>` would fail there.
         lldb_out = None
         lldb_err = None
+        out_fd = None
+        err_fd = None
         cmd_file = None
         binary_dir_path = self.binary.parent
         try:
+            # The stub fds stay OPEN for the whole session: the
+            # attacker binary runs (with write on this dir) between
+            # mkstemp and the read-back, so the reads go through the
+            # kept fds — bound to the original inodes — never a
+            # by-path reopen of the swappable stub names (see
+            # _read_inferior_capped).
             out_fd, out_name = tempfile.mkstemp(
                 prefix=".raptor_lldb_out_", suffix=".txt",
                 dir=str(binary_dir_path),
             )
-            os.close(out_fd)
             lldb_out = Path(out_name)
             err_fd, err_name = tempfile.mkstemp(
                 prefix=".raptor_lldb_err_", suffix=".txt",
                 dir=str(binary_dir_path),
             )
-            os.close(err_fd)
             lldb_err = Path(err_name)
 
             # LLDB commands - different syntax from GDB
@@ -718,13 +800,21 @@ class CrashAnalyser:
                     )
             except subprocess.TimeoutExpired:
                 logger.warning("LLDB analysis timed out - trying fallback approach")
+                # The inferior may already have written its ASan
+                # report / abort message to the redirect stubs before
+                # LLDB wedged — read them before the cleanup below so
+                # the diagnostics survive into the fallback's output.
+                inferior = self._inferior_output_sections(out_fd, err_fd)
                 # Clean up temp files before fallback
                 try:
                     lldb_out.unlink()
                     lldb_err.unlink()
                 except OSError:
                     pass
-                return self._run_lldb_fallback(input_file)
+                fallback_output = self._run_lldb_fallback(input_file)
+                if inferior:
+                    return f"{fallback_output}\n{inferior}"
+                return fallback_output
 
             # Pre-fix this branch wrote LLDB output to a
             # `tempfile.NamedTemporaryFile(delete=False)` debug
@@ -738,8 +828,23 @@ class CrashAnalyser:
             if result.stderr:
                 logger.debug("LLDB stderr length: %d chars", len(result.stderr))
 
-            return result.stdout
+            # `process launch -o/-e` redirected the CRASHING INFERIOR's
+            # stdout/stderr into the two stub files — result.stdout is
+            # only LLDB's own output. On macOS the ASan report / abort
+            # message lands on the inferior's stderr, which is exactly
+            # what the ASan parser and crash classification want. Read
+            # the stubs (size-capped) into the returned analysis output
+            # before the finally below deletes them.
+            output = result.stdout or ""
+            inferior = self._inferior_output_sections(out_fd, err_fd)
+            if inferior:
+                output = f"{output}\n{inferior}" if output else inferior
+            return output
         finally:
+            for stub_fd in (out_fd, err_fd):
+                if stub_fd is not None:
+                    with contextlib.suppress(OSError):
+                        os.close(stub_fd)
             # Clean up temp files. cmd_file may be None if the initial
             # write raised before assignment.
             if cmd_file:
@@ -821,7 +926,7 @@ class CrashAnalyser:
 
     def _parse_lldb_output(self, context: CrashContext, lldb_output: str) -> None:
         """Parse LLDB output to extract crash information."""
-        lines = lldb_output.split("\n")
+        lines = lldb_output.split("\n")  # line-model: debugger output captured text=True (universal-newline)
         
         # First, try to detect the signal that caused the stop
         for line in lines:
@@ -1006,7 +1111,7 @@ class CrashAnalyser:
 
     def _parse_gdb_output(self, context: CrashContext, gdb_output: str) -> None:
         """Parse GDB output to extract crash information."""
-        lines = gdb_output.split("\n")
+        lines = gdb_output.split("\n")  # line-model: debugger output captured text=True (universal-newline)
         
         # First, try to detect the signal that caused the stop
         for line in lines:
@@ -1280,20 +1385,19 @@ class CrashAnalyser:
                 info["aslr_enabled"] = "true"
                 info["aslr_level"] = "macos-default"
             elif sys_platform == "Linux":
-                result = _run_trusted(
-                    ["cat", "/proc/sys/kernel/randomize_va_space"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
-                if result.returncode == 0:
-                    aslr_level = result.stdout.strip()
+                # Read the procfs file directly — spawning `cat` for
+                # a 2-byte pseudo-file added a subprocess round-trip
+                # for nothing.
+                try:
+                    aslr_level = _PROC_ASLR_PATH.read_text(
+                        encoding="ascii").strip()
+                except OSError:
+                    info["aslr_enabled"] = "unknown"
+                else:
                     info["aslr_enabled"] = (
                         "true" if aslr_level != "0" else "false"
                     )
                     info["aslr_level"] = aslr_level
-                else:
-                    info["aslr_enabled"] = "unknown"
             else:
                 # Other unixes (BSD variants etc) — best-effort
                 # try sysctl, otherwise mark unknown.
@@ -1314,7 +1418,7 @@ class CrashAnalyser:
             
         # Check if binary has stack canaries via symbol table (not objdump -d
         # which disassembles the entire binary and can OOM on large inputs)
-        result = _nm(self.binary, "-D", timeout=10)
+        result = _nm(self.binary, "-D", timeout=10)  # type: ignore[assignment]
         if result.returncode == 0:
             if "__stack_chk_fail" in result.stdout or "__chk_fail" in result.stdout:
                 info["stack_canaries"] = "enabled"
@@ -1323,7 +1427,10 @@ class CrashAnalyser:
         else:
             info["stack_canaries"] = "unknown"
             
-        # Check for NX/DEP
+        # Check for NX/DEP. otool under run_trusted is the documented
+        # darwin-only sandbox seam — see macho._run_readonly_tool: the
+        # tool exists only on macOS, where the Linux mount-ns/Landlock
+        # stack degrades to this posture anyway.
         try:
             result = _run_trusted(
                 ["otool", "-hv", str(self.binary)],  # macOS
@@ -1337,7 +1444,7 @@ class CrashAnalyser:
                 info["nx_enabled"] = "not_detected"
         except (OSError, subprocess.SubprocessError):
             # Try Linux way
-            result = _readelf(self.binary, "-l", timeout=5)
+            result = _readelf(self.binary, "-l", timeout=5)  # type: ignore[assignment]
             if result.returncode is None:
                 info["nx_enabled"] = "unknown"
             elif "GNU_STACK" in result.stdout and "RWE" not in result.stdout:
@@ -1477,10 +1584,8 @@ class CrashAnalyser:
 
         # Extract function names from stack trace (ignore addresses for better deduplication)
         # Format: #0  0xaddress in function_name (args) at file:line
-        import re
-
         functions = []
-        for line in stack_trace.split('\n'):
+        for line in stack_trace.split('\n'):  # line-model: assembled from text=True debugger output (universal-newline)
             # Match GDB format: #N  0xADDR in function_name
             # Word-boundary `\bin\b` so we don't match
             # substring-`in` inside other tokens — pre-fix
@@ -1524,8 +1629,10 @@ class CrashAnalyser:
                 if symbol in result.stdout:
                     return True
                     
-            # Check for ASan runtime library dependencies
-            result = _run_trusted(
+            # Check for ASan runtime library dependencies. otool under
+            # run_trusted: documented darwin-only sandbox seam — see
+            # macho._run_readonly_tool.
+            result = _run_trusted(  # type: ignore[assignment]
                 ["otool", "-L", str(self.binary)],
                 capture_output=True,
                 text=True,
@@ -1632,7 +1739,7 @@ class CrashAnalyser:
             context.crash_type = "memory_leak"
             
         # Extract stack trace (ASan provides excellent stack traces)
-        lines = asan_output.split("\n")
+        lines = asan_output.split("\n")  # line-model: runtime output captured text=True (universal-newline)
         in_stack_trace = False
         stack_trace_lines = []
         

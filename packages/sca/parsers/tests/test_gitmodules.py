@@ -2,10 +2,31 @@
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
+
+import pytest
 
 from packages.sca.models import PinStyle
 from packages.sca.parsers.gitmodules import parse
+
+# skip-or-hermetic: the ls-tree fallback tests build REAL git repos —
+# on a git-less runner they must skip, not error.
+_needs_git = pytest.mark.skipif(
+    shutil.which("git") is None, reason="git binary not available",
+)
+
+
+def _git_env(tmp_path: Path) -> dict[str, str]:
+    """Hermetic git env: neutralise global/system config and hooks so
+    an operator's ~/.gitconfig (fsmonitor, hooksPath, templates) can't
+    steer the fixture repos."""
+    import os
+
+    env = dict(os.environ)
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    return env
 
 
 def _write_gitmodules(tmp_path: Path, content: str) -> Path:
@@ -267,3 +288,153 @@ def test_unparseable_url_skips_row_not_file(tmp_path, caplog):
     assert [d.name for d in deps] == ["o/r"]
     assert any("unparseable submodule URL" in r.getMessage()
                for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# git ls-tree fallback (no .git/modules/ but tree object has the SHA)
+# ---------------------------------------------------------------------------
+
+@_needs_git
+def test_ls_tree_fallback_resolves_sha(tmp_path):
+    """When .git/modules/<name>/HEAD is absent, fall back to
+    ``git ls-tree`` which reads the pinned SHA from the tree object."""
+    import subprocess
+    # Build a real git repo with a submodule-like tree entry.
+    subprocess.run(["git", "init", str(tmp_path)], capture_output=True,
+                   env=_git_env(tmp_path))
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "t@t"],
+        capture_output=True, env=_git_env(tmp_path),
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "t"],
+        capture_output=True, env=_git_env(tmp_path),
+    )
+    # Create a .gitmodules file.
+    gm = tmp_path / ".gitmodules"
+    gm.write_text(
+        '[submodule "ext/lib"]\n'
+        '\tpath = ext/lib\n'
+        '\turl = https://github.com/owner/lib.git\n',
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "add", ".gitmodules"],
+        capture_output=True, env=_git_env(tmp_path),
+    )
+    # Manually insert a gitlink (160000 mode) for ext/lib.
+    fake_sha = "a" * 40
+    (tmp_path / "ext").mkdir()
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "update-index", "--add",
+         "--cacheinfo", f"160000,{fake_sha},ext/lib"],
+        capture_output=True, env=_git_env(tmp_path),
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "commit", "-m", "init",
+         "--allow-empty"],
+        capture_output=True, env=_git_env(tmp_path),
+    )
+    # No .git/modules/ directory — the submodule hasn't been cloned.
+    assert not (tmp_path / ".git" / "modules").exists()
+    [d] = parse(gm)
+    assert d.version == fake_sha
+    assert d.pin_style == PinStyle.GIT
+
+
+@_needs_git
+def test_ls_tree_fallback_no_commit(tmp_path):
+    """When there's no commit at all, the fallback returns None
+    gracefully (no crash)."""
+    import subprocess
+    subprocess.run(["git", "init", str(tmp_path)], capture_output=True,
+                   env=_git_env(tmp_path))
+    gm = tmp_path / ".gitmodules"
+    gm.write_text(
+        '[submodule "x"]\n\tpath = x\n'
+        '\turl = https://github.com/o/x.git\n',
+    )
+    [d] = parse(gm)
+    assert d.version is None
+
+
+def test_ls_tree_runs_hardened_and_env_sanitised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ls-tree child runs inside an UNTRUSTED repo: it must get
+    the strict read-only git overrides (committed config cannot pick
+    core.fsmonitor / core.hooksPath / core.sshCommand commands) and
+    the sanitised environment — never the operator's full env."""
+    from packages.sca.parsers import gitmodules as gm
+
+    seen: dict = {}
+
+    class _Result:
+        returncode = 0
+        stdout = ("160000 commit "
+                  "0123456789abcdef0123456789abcdef01234567\tlibs/x\n")
+        stderr = ""
+
+    def _fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        seen["kwargs"] = kwargs
+        return _Result()
+
+    monkeypatch.setattr(gm.subprocess, "run", _fake_run)
+    monkeypatch.setenv("GITHUB_TOKEN", "hostile-must-not-leak")
+    sha = gm._resolve_from_ls_tree(tmp_path, "libs/x")
+    assert sha == "0123456789abcdef0123456789abcdef01234567"
+
+    cmd = seen["cmd"]
+    assert cmd[0] == "git"
+    joined = " ".join(cmd)
+    # Config-neutralising overrides present before the subcommand.
+    assert "core.fsmonitor=" in joined
+    assert "core.hooksPath=" in joined
+    assert cmd.index("ls-tree") > cmd.index("-c")
+    # Sanitised env passed explicitly; allowlist drops the token.
+    env = seen["kwargs"].get("env")
+    assert env is not None
+    assert "GITHUB_TOKEN" not in env
+
+
+# ---------------------------------------------------------------------------
+# Repo-root walk-up is bounded
+# ---------------------------------------------------------------------------
+
+
+def test_repo_root_walk_stops_at_scan_root(tmp_path):
+    """A target WITHOUT its own ``.git`` (extracted tarball, exported
+    subtree) scanned under a directory that IS a git repo must NOT
+    adopt that outer repo as the submodule-resolution root — git would
+    then run (and ``.git/modules`` refs be read) in a repo above the
+    scan target, at attacker-chosen submodule paths."""
+    from packages.sca.parsers._safe_read import scan_root_context
+    from packages.sca.parsers.gitmodules import _find_repo_root
+
+    outer = tmp_path / "operator-repo"
+    target = outer / "extracted" / "src"
+    target.mkdir(parents=True)
+    (outer / ".git").mkdir()
+    gm = target / ".gitmodules"
+    gm.write_text('[submodule "x"]\n  path = libs/x\n  url = u\n')
+    with scan_root_context(target):
+        assert _find_repo_root(gm) is None
+    # Without a scan-root bound the .git boundary still stops the
+    # walk AT the outer repo (the depth-capped legacy behaviour).
+    assert _find_repo_root(gm) == outer.resolve()
+
+
+def test_repo_root_walk_depth_capped(tmp_path):
+    """No scan root, no ``.git`` anywhere near: the walk gives up at
+    the shared depth cap instead of proceeding to ``/``."""
+    from packages.sca.parsers.gitmodules import _find_repo_root
+
+    deep = tmp_path
+    for i in range(15):
+        deep = deep / f"d{i}"
+    deep.mkdir(parents=True)
+    gm = deep / ".gitmodules"
+    gm.write_text('[submodule "x"]\n  path = libs/x\n  url = u\n')
+    # A .git thirteen-plus levels above the manifest is out of reach.
+    (tmp_path / ".git").mkdir()
+    assert _find_repo_root(gm) is None

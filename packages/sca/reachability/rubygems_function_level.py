@@ -8,17 +8,23 @@ the cross-language resolver against OSV symbol data.
 ## Verdict transitions
 
   * Any affected symbol CALLED -> ``likely_called``
-  * All affected symbols NOT_CALLED, none UNCERTAIN ->
-    ``not_function_reachable``
-  * Any UNCERTAIN OR mixed -> preserve existing verdict
+  * EVERY advisory-listed symbol evaluated and NOT_CALLED, none
+    UNCERTAIN -> ``not_function_reachable``
+  * Any UNCERTAIN, mixed, or unevaluable entry -> preserve existing
+    verdict
 
 ## Qualified-name shape
 
 Ruby OSV records ship symbols as Ruby module / class paths
-(``ActionDispatch::Routing::Mapper#draw``). We construct
-``<gem>.<symbol>`` and let the resolver match. The Ruby extractor
-produces chains like ``["JSON", "parse"]`` for ``JSON.parse(s)``;
-the resolver tail-matches against ``json.parse``.
+(``ActionDispatch::Routing::Mapper#draw``). Gem names never head
+code namespaces, so the shared extractor runs with
+``dep_is_namespace_head=False``: qualified symbols are emitted
+verbatim (``::`` / ``#`` normalised to dots) and BARE symbols
+become the counted unresolved marker — never a minted
+``<gem>.<symbol>`` prefix, which the resolver could only answer
+NOT_CALLED. The Ruby extractor produces chains like
+``["JSON", "parse"]`` for ``JSON.parse(s)``; the resolver
+tail-matches against the normalised qualified names.
 
 Limitation: Ruby's metaprogramming (define_method, method_missing,
 send) defeats static analysis; the extractor flags ``send`` /
@@ -56,7 +62,13 @@ def build_rubygems_symbol_map(
         dep_name = dep_key.split(":", 1)[1].split("@", 1)[0]
         qualified: list[str] = []
         for adv in r.advisories:
-            qualified.extend(_extract_qualified(adv, dep_name))
+            qualified.extend(_extract_qualified(
+                adv, dep_name,
+                # Gem / Composer package names never head code
+                # namespaces - a dep-prefixed spelling is
+                # unbindable by construction.
+                dep_is_namespace_head=False,
+            ))
         if qualified:
             out.setdefault(dep_key, []).extend(qualified)
     return {k: list(dict.fromkeys(v)) for k, v in out.items()}
@@ -70,12 +82,16 @@ def refine_rubygems_verdicts(
     rubygems_symbol_map: dict[str, list[str]],
     inventory: dict[str, Any] | None = None,
 ) -> None:
+    # The any-dot check skips deps whose advisory entries are ALL
+    # unresolved markers — nothing queryable, so the tier could
+    # neither upgrade nor honestly downgrade; don't pay for an
+    # inventory build to abstain.
     candidates = [
         d for d in deps
         if d.ecosystem == "RubyGems"
         and out.get(d.key()) is not None
         and out[d.key()].verdict == "imported"
-        and rubygems_symbol_map.get(d.key())
+        and any("." in q for q in rubygems_symbol_map.get(d.key()) or [])
     ]
     if not candidates:
         return
@@ -109,6 +125,7 @@ def refine_rubygems_verdicts(
         if not paired:
             continue
         verdicts = {r.verdict for _, r in paired}
+        covered = len(paired) == len(qualified_names)
         if Verdict.CALLED in verdicts:
             evidence: list[str] = []
             called: list[str] = []
@@ -126,7 +143,12 @@ def refine_rubygems_verdicts(
                 ),
                 affected_summary=affected,
             )
-        elif Verdict.UNCERTAIN in verdicts:
+        elif Verdict.UNCERTAIN in verdicts or not covered:
+            # ``not covered``: some advisory entry never paired — an
+            # UNRESOLVED_ENTRY marker (bare symbol; gem names never
+            # head code namespaces) or a resolver refusal.
+            # Downgrading on the bindable remainder alone would be a
+            # false suppression → abstain.
             continue
         else:
             out[d.key()] = Reachability(

@@ -7,8 +7,9 @@ entirely.
 
 A — input provenance: which entry points reach this function, and their
     trust classification (trusted/untrusted from the threat model).
-B — callee defense: when a callee validates/guards a parameter the
-    reviewed function passes to it, surface that as a defense signal.
+B — callee assumptions: when a callee declares preconditions on a
+    parameter the reviewed function passes to it, surface each as a
+    caller OBLIGATION (the callee assumes it; it does not validate).
 C — security-decision reachability: whether this function's output
     feeds a security-sensitive callee (auth, crypto, access control).
 D — constant arguments: whether a dangerous API call uses only
@@ -44,6 +45,23 @@ def build_provenance_map(
     edges = context_map.get("call_edges") or []
     if not entries or not edges:
         return {}
+    # A truncated edge list cannot support a NEGATIVE conclusion:
+    # "reachable ONLY from trusted entry points" needs the complete
+    # graph — a dropped untrusted-entry path reads as trusted-only
+    # and SUPPRESSES the finding (verdict-affecting, observed exposure
+    # on kernel-scale runs where the 200k cap kept 26% of the graph).
+    # The sentinel below joins every reaching set so both consumers
+    # (provenance_all_trusted; the prompt's "Do not flag" block)
+    # degrade to the untrusted-tags-only rendering, which is
+    # fail-safe. Positive (untrusted) tags stay: more edges can only
+    # ADD reachers, never remove them. Cost direction, stated
+    # both ways: under truncation, genuinely trusted-only functions
+    # lose the auto-clean veto (design-pattern-CWE promotion still
+    # needs its trust-boundary receipt; the clean-direction override
+    # only ever applied to detection-only evidence) — a bounded FP
+    # increase bought deliberately, because the suppression it
+    # prevents is a silent wrong-direction verdict.
+    truncated = bool(context_map.get("call_edges_truncated"))
 
     ep_trust = _classify_entry_points(entries, threat_model)
 
@@ -55,6 +73,12 @@ def build_provenance_map(
         if callee_name:
             adj.setdefault(caller_key, []).append(f"{callee_file}:{callee_name}")
 
+    _TRUNC_SENTINEL = {
+        "ep_id": "call-graph-truncated",
+        "ep_name": "call graph truncated — provenance incomplete",
+        "trust": "unknown",
+        "ep_type": "incomplete-graph",
+    }
     result: dict[str, list[dict[str, str]]] = {}
     for ep in entries:
         if not isinstance(ep, dict):
@@ -83,6 +107,9 @@ def build_provenance_map(
                 if neighbor not in visited:
                     queue.append(neighbor)
 
+    if truncated:
+        for reaching in result.values():
+            reaching.append(dict(_TRUNC_SENTINEL))
     return result
 
 
@@ -134,6 +161,50 @@ def format_provenance_for_context(
     return "\n".join(lines)
 
 
+def _looks_like_identifier(word: str) -> bool:
+    """True for tokens shaped like code identifiers, not prose words.
+
+    Underscores, dots, and colons never appear in English prose words,
+    and camelCase needs both cases; plain lowercase (or ALL-CAPS
+    acronym) words like "file", "parsing", or "HTTP" are prose.
+    """
+    if not re.fullmatch(r"[A-Za-z_][\w.:]*", word):
+        return False
+    return (
+        "_" in word
+        or "." in word
+        or ":" in word
+        or (word != word.lower() and word != word.upper())
+    )
+
+
+def _threat_model_names(items: list[Any]) -> set[str]:
+    """Matchable names from threat-model input items (lowercased).
+
+    Each item matches as a WHOLE name, plus any identifier-shaped
+    tokens it contains ("the load_config startup path" → "load_config";
+    "loadconf(path) at startup" → "loadconf"). Prose words are NOT
+    split out: an item like "local config file parsing" must not turn
+    every entry point named "file" or "parsing" into a trusted name —
+    the all-trusted branch renders a "Do not flag" instruction, so an
+    over-broad allowlist here steers real findings into suppression.
+    """
+    names: set[str] = set()
+    for item in items:
+        text = str(item).strip()
+        if not text:
+            continue
+        names.add(text.lower())
+        for word in text.split():
+            had_signature = "(" in word and not word.startswith("(")
+            word = word.split("(")[0].strip(".,;:()")
+            if not word or word.startswith("—"):
+                continue
+            if had_signature or _looks_like_identifier(word):
+                names.add(word.lower())
+    return names
+
+
 def _classify_entry_points(
     entries: list[Any],
     threat_model: dict[str, Any] | None,
@@ -146,18 +217,12 @@ def _classify_entry_points(
     trusted_names: set[str] = set()
     untrusted_names: set[str] = set()
     if threat_model:
-        for item in threat_model.get("trusted_inputs") or []:
-            for word in str(item).split():
-                if "(" in word:
-                    word = word.split("(")[0]
-                if word and not word.startswith("—"):
-                    trusted_names.add(word.lower())
-        for item in threat_model.get("untrusted_inputs") or []:
-            for word in str(item).split():
-                if "(" in word:
-                    word = word.split("(")[0]
-                if word and not word.startswith("—"):
-                    untrusted_names.add(word.lower())
+        trusted_names = _threat_model_names(
+            threat_model.get("trusted_inputs") or [],
+        )
+        untrusted_names = _threat_model_names(
+            threat_model.get("untrusted_inputs") or [],
+        )
 
     _UNTRUSTED_TYPES = {
         "socket", "http", "https", "rpc", "grpc", "graphql",
@@ -178,18 +243,25 @@ def _classify_entry_points(
         ep_type = str(ep.get("type") or "").lower()
         trust_level = str(ep.get("trust_level") or "").lower()
 
-        if trust_level in ("internal_value", "runtime_constant"):
-            trust = "trusted"
-        elif trust_level in ("attacker_controlled", "persistent_store"):
+        # Authority order: operator threat-model names FIRST — the
+        # context map's trust_level is LLM-authored /understand
+        # output (imported unconditionally at prep), so it may only
+        # mark an entry UNTRUSTED. A "trusted" classification comes
+        # from the operator or the type heuristic alone: a hostile or
+        # hallucinated map stamping entries internal_value flowed
+        # into provenance_all_trusted, which resolves corroborated
+        # suspicious outcomes to clean and vetoes design-pattern-CWE
+        # promotion.
+        if ep_name in untrusted_names:
             trust = "untrusted"
         elif ep_name in trusted_names:
             trust = "trusted"
-        elif ep_name in untrusted_names:
+        elif trust_level in ("attacker_controlled", "persistent_store"):
+            trust = "untrusted"
+        elif ep_type in _UNTRUSTED_TYPES:
             trust = "untrusted"
         elif ep_type in _TRUSTED_TYPES:
             trust = "trusted"
-        elif ep_type in _UNTRUSTED_TYPES:
-            trust = "untrusted"
         else:
             trust = "untrusted"
 
@@ -204,32 +276,42 @@ def format_callee_defenses(
     callee_summaries: list[Any],
     _callees: list[dict[str, Any]] | None = None,
 ) -> str:
-    """Surface callee preconditions/guards as explicit defense signals.
+    """Surface callee PRECONDITIONS as caller obligations.
 
-    When a callee has preconditions on a parameter, that parameter is
-    validated before reaching any dangerous sink inside the callee.
+    A callee precondition is what the callee ASSUMES about a
+    parameter (the llm_summaries prompt semantics) — it is NOT
+    validation performed inside the callee, so it must never render
+    as "flow through this callee is defended" (an inverted,
+    suppression-direction hint). Rendered as an obligation instead —
+    the reviewed function must establish the assumption before the
+    call — and tier-tagged so LLM-extracted prose never reads as a
+    mechanical guarantee.
     """
     if not callee_summaries:
         return ""
-    defenses: list[str] = []
+    obligations: list[str] = []
     for summary in callee_summaries:
         preconditions = getattr(summary, "preconditions", None) or []
         func_name = getattr(summary, "function", "?")
         if not preconditions:
             continue
+        tier = getattr(summary, "evidence_tier", None)
+        tier_tag = f" [{getattr(tier, 'value', tier)}]" if tier else ""
         for pre in preconditions:
             param = getattr(pre, "param", "?")
             conditions = getattr(pre, "conditions", [])
             if conditions:
                 cond_str = ", ".join(str(c)[:80] for c in conditions[:3])
-                defenses.append(
-                    f"CALLEE DEFENSE: `{func_name}()` validates param "
-                    f"`{param}` with: {cond_str} — flow through this "
-                    f"callee is defended."
+                obligations.append(
+                    f"CALLEE ASSUMPTION{tier_tag}: `{func_name}()` "
+                    f"ASSUMES param `{param}` satisfies: {cond_str} — "
+                    f"the callee does not itself guarantee this; check "
+                    f"whether THIS function establishes it before the "
+                    f"call."
                 )
-    if not defenses:
+    if not obligations:
         return ""
-    return "\n".join(defenses[:10])
+    return "\n".join(obligations[:10])
 
 
 # ── C: Security-decision reachability ─────────────────────────────
@@ -379,21 +461,54 @@ def detect_constant_dangerous_calls(
     return results
 
 
+def format_constant_dangerous_calls(
+    const_calls: list[dict[str, Any]],
+) -> str:
+    """Format gate-D annotations for LLM context injection.
+
+    Call names and argument reprs derive from analysed source, so
+    each renders through ``defend_prompt_field`` (newline flatten +
+    tag/heading neutralise).
+    """
+    if not const_calls:
+        return ""
+    from core.audit.prompt_defence import defend_prompt_field as _dpf
+
+    lines = ["CONSTANT-ARGUMENT CALLS (mechanical):"]
+    for cc in const_calls[:10]:
+        args = ", ".join(_dpf(str(a), 80) for a in cc.get("args", [])[:5])
+        lines.append(
+            f"- `{_dpf(str(cc.get('call', '?')), 120)}` at line "
+            f"{cc.get('line', 0)} uses only literal/module-constant "
+            f"arguments ({args}) — not attacker-controllable unless a "
+            f"binding this analysis missed exists."
+        )
+    return "\n".join(lines)
+
+
 def _collect_module_constants(tree: ast.Module) -> dict[str, Any]:
     """Collect module-level constant assignments (NAME = literal).
 
-    A later NON-literal rebinding (``CMD = input()``) invalidates the
-    name: keeping the first literal let detect_constant_dangerous_calls
-    report a tainted call as all-constant ("definitively not
-    attacker-controllable") — a false-suppression hint.
+    A name is a constant only when NO other binding of it exists
+    anywhere in the tree: a later non-literal module rebinding
+    (``CMD = input()``), a tuple/list unpacking, a function-local
+    shadow, a for/with/walrus binder, a parameter, an import alias,
+    or a global/nonlocal declaration all invalidate — keeping the
+    first literal let detect_constant_dangerous_calls report a
+    tainted call as all-constant ("definitively not
+    attacker-controllable"), a false-suppression hint. Deliberately
+    scope-blind: refusing the hint costs nothing, minting it wrongly
+    steers suppression.
     """
     constants: dict[str, Any] = {}
+    defining_targets: set[int] = set()
     for node in ast.iter_child_nodes(tree):
         if isinstance(node, ast.Assign) and len(node.targets) == 1:
             target = node.targets[0]
             if isinstance(target, ast.Name) and target.id.isupper():
                 if isinstance(node.value, ast.Constant):
                     constants[target.id] = node.value.value
+                    defining_targets.add(id(target))
                 else:
                     constants.pop(target.id, None)
         elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
@@ -404,8 +519,28 @@ def _collect_module_constants(tree: ast.Module) -> dict[str, Any]:
                     node, ast.AnnAssign,
                 ) and target.id.isupper():
                     constants[target.id] = value.value
+                    defining_targets.add(id(target))
                 else:
                     constants.pop(target.id, None)
+    if not constants:
+        return constants
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, (ast.Store, ast.Del))
+            and node.id in constants
+            and id(node) not in defining_targets
+        ):
+            constants.pop(node.id, None)
+        elif isinstance(node, ast.arg) and node.arg in constants:
+            constants.pop(node.arg, None)
+        elif isinstance(node, ast.alias):
+            constants.pop(node.asname or node.name.split(".")[0], None)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            for name in node.names:
+                constants.pop(name, None)
+        if not constants:
+            break
     return constants
 
 
@@ -445,7 +580,7 @@ def _call_name(node: ast.Call) -> str:
         obj = node.func
         while isinstance(obj, ast.Attribute):
             parts.append(obj.attr)
-            obj = obj.value
+            obj = obj.value  # type: ignore[assignment]
         if isinstance(obj, ast.Name):
             parts.append(obj.id)
         return ".".join(reversed(parts))
@@ -528,14 +663,21 @@ def _normalise_call_site(site: str) -> str:
     literals and structure so that calls with identical argument
     shapes hash together.
     """
-    text = re.sub(r"^\s*\d+\s+", "", site, flags=re.MULTILINE)
+    text = re.sub(r"^[^\S\n]*\d+[^\S\n]+", "", site, flags=re.MULTILINE)
     # Strip comments only OUTSIDE string literals: a '#' inside a
     # string arg used to truncate the call-site (losing the closing
     # quote), so f("a #b", x) and f("a #c", y) collided in
     # dedup_callers and a differently-argumented caller vanished from
-    # the review prompt.
+    # the review prompt.  String openers pinned to UNESCAPED
+    # delimiters ((?<!\\)): an unterminated literal whose interior
+    # repeats escaped delimiters (`"` + `\"`*n) otherwise makes every
+    # embedded delimiter a fresh match attempt that re-scans to the
+    # end of the snippet — quadratic on a hostile call site (measured
+    # exp 2.04; pinned, exp 1.0).  On a well-formed token stream no
+    # string opens at an escaped delimiter, so the strip is
+    # unchanged; dropping the pin re-opens the quadratic.
     text = re.sub(
-        r'("(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\')|#.*$',
+        r'((?<!\\)"(?:[^"\\]|\\.)*"|(?<!\\)\'(?:[^\'\\]|\\.)*\')|#.*$',
         lambda m: m.group(1) or "",
         text,
         flags=re.MULTILINE,
@@ -557,15 +699,31 @@ def detect_universal_preconditions(
 ) -> list[dict[str, str]]:
     """Detect when ALL callers guard the same parameter.
 
-    Returns a list of ``{param, conditions, n_callers}`` for parameters
-    where every caller with a taint summary enforces at least one
-    precondition.  This is a definitive structural constraint — the LLM
-    should not hypothesise unguarded input on these parameters.
+    Returns a list of ``{param, conditions, n_callers, arg_verified}``
+    for parameters where every caller with a taint summary enforces at
+    least one precondition.  Guards are grouped by the CALLER's own
+    bare parameter name, so two callers coincidentally guarding
+    same-named locals would collide; ``arg_verified`` is "true" only
+    when every such caller's recorded call site actually passes the
+    guarded name as an argument.  Only arg-verified entries are a
+    definitive structural constraint — the rest render observation-
+    grade (see ``format_universal_preconditions``).
     """
     if not callers or not taint_summaries:
         return []
 
+    # Universe gate: "ALL callers validate" is only claimable when
+    # every caller HAS a summary — quantifying over the summarized
+    # subset rendered a definitive false guarantee ("CANNOT reach
+    # this function unvalidated") while an unsummarized caller passes
+    # anything.
+    for c in callers:
+        key = f"{c.get('file', '')}:{c.get('name', '')}"
+        if taint_summaries.get(key) is None:
+            return []
+
     param_guards: dict[str, list[set[str]]] = {}
+    param_arg_verified: dict[str, bool] = {}
     n_with_summary = 0
 
     for c in callers:
@@ -574,6 +732,7 @@ def detect_universal_preconditions(
         if summary is None:
             continue
         n_with_summary += 1
+        call_site = str(c.get("call_site") or "")
         caller_params: set[str] = set()
         for pre in getattr(summary, "preconditions", []) or []:
             param = getattr(pre, "param", "")
@@ -581,6 +740,14 @@ def detect_universal_preconditions(
                 caller_params.add(param)
                 conds = {str(c)[:80] for c in (getattr(pre, "conditions", []) or [])}
                 param_guards.setdefault(param, []).append(conds)
+                # The guarded name must appear as its own identifier in
+                # the call site (`obj.size` is not the local `size`).
+                passed = bool(call_site) and re.search(
+                    rf"(?<![\w.]){re.escape(param)}(?!\w)", call_site,
+                ) is not None
+                param_arg_verified[param] = (
+                    param_arg_verified.get(param, True) and passed
+                )
 
     if n_with_summary < 2:
         return []
@@ -595,6 +762,8 @@ def detect_universal_preconditions(
                 "param": param,
                 "conditions": ", ".join(sorted(all_conds)[:5]),
                 "n_callers": str(n_with_summary),
+                "arg_verified":
+                    "true" if param_arg_verified.get(param, False) else "false",
             })
 
     return results
@@ -603,13 +772,35 @@ def detect_universal_preconditions(
 def format_universal_preconditions(
     preconditions: list[dict[str, str]],
 ) -> str:
-    """Format universal precondition annotations for LLM context."""
+    """Format universal precondition annotations for LLM context.
+
+    Entries whose caller-param → call-site-argument mapping is verified
+    (``arg_verified == "true"``) render as a definitive constraint;
+    unverified entries (name-coincidence risk, or produced before the
+    field existed) render as an observation with no suppression
+    instruction.
+    """
     if not preconditions:
         return ""
+    from core.audit.prompt_defence import defend_prompt_field as _dpf
+
     lines = ["UNIVERSAL CALLER CONSTRAINT (mechanical):"]
-    lines.extend(f"- ALL {p['n_callers']} callers validate param `{p['param']}` "
-            f"with: {p['conditions']}. This parameter CANNOT reach this "
-            f"function unvalidated." for p in preconditions)
+    for p in preconditions:
+        param = _dpf(p["param"], 120)
+        conds = _dpf(p["conditions"], 400)
+        if p.get("arg_verified") == "true":
+            lines.append(
+                f"- ALL {p['n_callers']} callers validate param `{param}` "
+                f"with: {conds}. This parameter CANNOT reach this "
+                f"function unvalidated.",
+            )
+        else:
+            lines.append(
+                f"- {p['n_callers']} callers each guard a variable named "
+                f"`{param}` ({conds}), but the guarded name "
+                f"was not confirmed to be passed at the call sites — "
+                f"treat as an observation, not a structural guarantee.",
+            )
     return "\n".join(lines)
 
 
@@ -654,11 +845,17 @@ def extract_type_constraints(
 
 
 def format_type_constraints(constraints: list[dict[str, str]]) -> str:
+    """Param and type names derive from analysed source — rendered
+    through ``defend_prompt_field`` like every repo-derived field."""
     if not constraints:
         return ""
+    from core.audit.prompt_defence import defend_prompt_field as _dpf
+
     lines = ["TYPE CONSTRAINTS (mechanical):"]
-    lines.extend(f"- param `{tc['param']}` is `{tc['type']}` — "
-            f"{tc['constraint_note']}" for tc in constraints)
+    lines.extend(
+        f"- param `{_dpf(tc['param'], 120)}` is `{_dpf(tc['type'], 120)}` — "
+        f"{tc['constraint_note']}" for tc in constraints
+    )
     return "\n".join(lines)
 
 
@@ -717,7 +914,7 @@ def _ast_type_name(node: ast.AST) -> str:
         obj = node
         while isinstance(obj, ast.Attribute):
             parts.append(obj.attr)
-            obj = obj.value
+            obj = obj.value  # type: ignore[assignment]
         if isinstance(obj, ast.Name):
             parts.append(obj.id)
         return ".".join(reversed(parts))
@@ -726,10 +923,35 @@ def _ast_type_name(node: ast.AST) -> str:
     return ""
 
 
+# Flood-safe declaration patterns. The enrichment source is repo
+# content (hostile), so the same bounds as the taint extractors'
+# patterns apply: no repeated-modifier prefix (a keyword flood is
+# quadratic through it; the lazy type group absorbs the modifiers
+# instead — only the name/params groups are consumed), word-start
+# anchoring via lookbehind (an unanchored scan re-anchors at every
+# character of a long word run), and every variable-length class
+# bounded (an unclosed-paren/generics flood otherwise re-scans to
+# EOF from every candidate). The modifiers-plus-type group is a
+# short sequence of whitespace-separated tokens, lazy on the TOKEN
+# count — a flat character class mixing ``\s`` with a variable
+# whitespace separator re-split a flood at every character, so the
+# split candidates per anchor must be the handful of token
+# boundaries, not every position. Trade-off: declarations with more
+# than 9 modifier/type tokens, a token past 61 chars, or a
+# parameter list past the cap go unenriched — acceptable for this
+# hint-tier consumer.
+#
+# The C parameter cap is 1000 where the other arms use 400: real C
+# prototypes routinely carry long, column-aligned multi-line
+# parameter lists that overrun 400 chars, and at 400 those
+# declarations silently lose enrichment. The cost of raising it is
+# only a larger linear constant on unclosed-paren floods (each
+# candidate scans up to the cap); lowering it back would re-drop
+# real prototypes. Both directions are pinned by tests.
 _C_FUNC_PAT = re.compile(
-    r"(?:static\s+|inline\s+|extern\s+|const\s+)*"
-    r"(\w[\w\s\*]*?)\s+"
-    r"(\w+)\s*\(([^)]*)\)",
+    r"(?<!\w)"
+    r"(\w[\w\*]{0,60}(?:\s+[\w\*]{1,61}){0,8}?)\s+"
+    r"(\w+)\s*\(([^)]{0,1000})\)",
     re.MULTILINE,
 )
 
@@ -765,8 +987,12 @@ def _extract_c_types(source: str, function_name: str) -> list[dict[str, str]]:
     return results
 
 
+# Whitespace before the parameter list rides inside the optional
+# generics group (adjacent \s* runs across a skipped optional are
+# quadratic on a whitespace flood after ``fn name``); classes
+# bounded per the block comment above _C_FUNC_PAT.
 _RUST_FUNC_PAT = re.compile(
-    r"fn\s+(\w+)\s*(?:<[^>]*>)?\s*\(([^)]*)\)",
+    r"fn\s+(\w+)\s*(?:<[^>]{0,400}>\s*)?\(([^)]{0,400})\)",
     re.MULTILINE,
 )
 
@@ -803,8 +1029,11 @@ def _extract_rust_types(source: str, function_name: str) -> list[dict[str, str]]
     return results
 
 
+# Receiver and parameter classes bounded per the block comment above
+# _C_FUNC_PAT (a repeated unclosed ``func (`` re-scanned to EOF from
+# every occurrence).
 _GO_FUNC_PAT = re.compile(
-    r"func\s+(?:\([^)]*\)\s+)?(\w+)\s*\(([^)]*)\)",
+    r"func\s+(?:\([^)]{0,400}\)\s+)?(\w+)\s*\(([^)]{0,400})\)",
     re.MULTILINE,
 )
 
@@ -837,10 +1066,14 @@ def _extract_go_types(source: str, function_name: str) -> list[dict[str, str]]:
     return results
 
 
+# No modifier/whitespace prefix loop (its bare ``|\s`` arm made a
+# whitespace or keyword flood catastrophic — the lazy type group
+# absorbs the modifiers instead); anchored and bounded per the block
+# comment above _C_FUNC_PAT.
 _JAVA_METHOD_PAT = re.compile(
-    r"(?:public|private|protected|static|final|abstract|synchronized|\s)*"
-    r"(\w[\w<>\[\],\s]*?)\s+"
-    r"(\w+)\s*\(([^)]*)\)",
+    r"(?<!\w)"
+    r"(\w[\w<>\[\],]{0,60}(?:\s+[\w<>\[\],]{1,61}){0,8}?)\s+"
+    r"(\w+)\s*\(([^)]{0,400})\)",
     re.MULTILINE,
 )
 

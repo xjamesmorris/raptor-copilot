@@ -116,6 +116,20 @@ class _LiteralExtractor(ast.NodeVisitor):
         self._field_params: list[str] = [
             p for p in (param_names or []) if _FIELD_NAME_RE.match(p)
         ]
+        self._entered_root = False
+
+    def _visit_function(self, node: ast.AST) -> None:
+        # The first function node is the one being extracted; a NESTED
+        # def's literals belong to the nested function's own record
+        # (ast.walk in _extract_function_literals visits it separately)
+        # — descending here would double-attribute them.
+        if self._entered_root:
+            return
+        self._entered_root = True
+        self.generic_visit(node)
+
+    visit_FunctionDef = _visit_function
+    visit_AsyncFunctionDef = _visit_function
 
     # -- producers ----------------------------------------------------------
 
@@ -268,7 +282,14 @@ def _extract_function_literals(
     results: list[_FunctionLiterals] = []
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            param_names = [a.arg for a in node.args.args]
+            param_names = [
+                a.arg
+                for a in (
+                    node.args.posonlyargs
+                    + node.args.args
+                    + node.args.kwonlyargs
+                )
+            ]
             extractor = _LiteralExtractor(
                 file_path, node.name, param_names=param_names
             )
@@ -384,6 +405,22 @@ def _link_by_call_graph(
     return links
 
 
+# Field names too generic to imply a producer-consumer relationship on
+# their own: they occur in nearly every module, so a shared spelling is
+# coincidence, not a link. Trade-off cuts both ways — excluding MORE
+# names loses genuine links on codebases that really route state
+# through e.g. `status`; excluding FEWER cross-products unrelated
+# functions into quadratic medium-confidence links that drown review.
+# This set is only the names that match on essentially every package.
+_GENERIC_FIELD_NAMES = frozenset({"type", "result", "method", "status"})
+
+# Cap on producer×consumer pairs emitted per field name within one
+# package: past this the field is package-wide plumbing and more pairs
+# add noise, not signal. Too low drops real fan-out pairs; too high
+# re-opens the quadratic pair explosion the cap exists to stop.
+_MAX_PAIRS_PER_FIELD = 25
+
+
 def _link_by_field_heuristic(
     all_funcs: dict[str, list[_FunctionLiterals]],
 ) -> list[tuple[_FunctionLiterals, _FunctionLiterals, str]]:
@@ -392,6 +429,8 @@ def _link_by_field_heuristic(
     When function A assigns ``ecosystem = "PyPI"`` and function B tests
     ``if ecosystem == "npm":``, and both are in the same package, they
     are likely a producer-consumer pair for the ``ecosystem`` field.
+    Generic field names are excluded and pairs are capped per field —
+    see _GENERIC_FIELD_NAMES / _MAX_PAIRS_PER_FIELD.
     """
     links: list[tuple[_FunctionLiterals, _FunctionLiterals, str]] = []
 
@@ -413,12 +452,20 @@ def _link_by_field_heuristic(
             for fname in fl.field_consumed:
                 consumers.setdefault(fname, []).append(fl)
 
-        for field_name in set(producers) & set(consumers):
+        for field_name in sorted(set(producers) & set(consumers)):
+            if field_name.lower() in _GENERIC_FIELD_NAMES:
+                continue
+            emitted = 0
             for p in producers[field_name]:
                 for c in consumers[field_name]:
                     if p is c:
                         continue
                     links.append((p, c, "medium"))
+                    emitted += 1
+                    if emitted >= _MAX_PAIRS_PER_FIELD:
+                        break
+                if emitted >= _MAX_PAIRS_PER_FIELD:
+                    break
 
     return links
 
@@ -469,7 +516,11 @@ def _template_matches(template: str, literal: str) -> bool:
     """Check if a literal could have been produced by a template."""
     import re as _re
     pattern = _re.escape(template).replace(r"\{\}", r".+")
-    for fmt_spec in _re.findall(r"\\\{[^}]*\\\}", pattern):
+    # The placeholder body is bounded: unbounded, a template that
+    # repeats ``{`` without ``}`` re-scans the rest of the text per
+    # occurrence — quadratic on hostile config values; real format
+    # specs sit far inside 200 chars.
+    for fmt_spec in _re.findall(r"\\\{[^}]{0,200}\\\}", pattern):
         pattern = pattern.replace(fmt_spec, ".+")
     try:
         return bool(_re.fullmatch(pattern, literal))

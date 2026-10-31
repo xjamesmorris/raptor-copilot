@@ -12,9 +12,22 @@ not.
 
 Writers stamp each artifact with an HMAC-SHA256 token over the exact
 fields triage acts on; triage verifies and demotes records that fail.
-Key-handling discipline is copied from core/sage/rowmac.py: symlinked
-/ foreign-owned / group-readable key files are refused rather than
-replaced, and verification failure is a demote path, never an error.
+Key-handling discipline follows core/sage/rowmac.py's fd-fstat reads,
+with one deliberate divergence: an on-disk key whose STATE no honest
+writer produces (group/other permission bits, a planted symlink, a
+non-regular file, over-length content) is treated as TAMPER — the
+object is quarantined beside the key (evidence preserved), a tamper
+marker is appended (see ``tamper_marker_path``), and a fresh key is
+created. Refusing forever instead — the rowmac behaviour — turned a
+same-uid ``chmod g+r`` (cheap from any lane whose DAC reaches the
+key; Landlock has no metadata rights) into a persistent integrity
+DoS: ``key_usable()`` stayed False and triage accepted telemetry at
+legacy confidence for every future run. Post-quarantine, tokens
+minted under the old key FAIL verification, so triage fails toward
+tampering — the honest verdict. Foreign-owned or unreadable keys stay
+refused (unattributable; never recovered over another principal's
+object), and verification failure remains a demote path, never an
+error.
 
 POSTURE DEPENDENCY — what a verifying token actually proves. The key
 lives outside the run output directory (the tree the target holds
@@ -49,8 +62,10 @@ as another.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import hmac
+import json
 import os
 import secrets
 import stat
@@ -67,10 +82,40 @@ logger = get_logger(__name__)
 
 _KEY_LEN = 32
 
-# Sentinel: a key file EXISTS but is unusable (symlink, foreign owner,
-# group/other-readable). Distinct from "absent" — an unusable key must
-# never be silently replaced and must never mint or verify.
+# Sentinel: a key file EXISTS but is unusable in a way this module
+# cannot attribute or safely recover from (foreign owner, unreadable).
+# Distinct from "absent" — a refused key is never used and never
+# replaced.
 _REFUSED = object()
+
+
+class _TamperedKey:
+    """A key whose ON-DISK STATE can only be the product of tampering
+    (or debris no honest writer produces): permission bits granted to
+    group/other on an own-uid regular file (the creator opens with
+    0600 atomically — umask can only narrow that), a symlink at the
+    key path, a non-regular file, or over-length content (a partial
+    32-byte creation write can be SHORT, never long).
+
+    Deliberately NOT ``_REFUSED``: refusing forever turns a same-uid
+    ``chmod g+r`` — cheap from any lane whose DAC reaches the key,
+    since Landlock has no metadata rights — into a persistent
+    integrity DoS where ``key_usable()`` stays False and triage
+    accepts telemetry at legacy confidence for every FUTURE run until
+    an operator notices. Tamper is instead handled by quarantining the
+    object (evidence preserved), recording a tamper marker, and
+    re-keying — old tokens then FAIL verification, so triage fails
+    toward tampering rather than toward acceptance.
+
+    Stable SHORT content stays on the refusal path: it is the one
+    shape that overlaps an honest creation race (winner crashed or
+    stalled between its O_EXCL create and its write), and quarantining
+    a slow winner's file mid-write would split-brain the key.
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+
 
 _warned_paths: set = set()
 
@@ -96,28 +141,34 @@ def _warn_once_suspect_key(path: Path, reason: str, remedy: str) -> None:
 
 
 def _read_existing_key(path: Path):
-    """Read an EXISTING key with rowmac's fd-fstat discipline: refuse
-    symlinks (O_NOFOLLOW + fstat on the opened inode), foreign owners,
-    and any group/other permission bits."""
+    """Read an EXISTING key with rowmac's fd-fstat discipline.
+
+    Returns the raw bytes, ``None`` (absent), ``_REFUSED``
+    (foreign-owned / unreadable — unattributable, never recovered),
+    or a ``_TamperedKey`` (symlink, non-regular file, group/other
+    permission bits on an own-uid file — states no honest writer
+    produces; the caller quarantines and re-keys)."""
     try:
         fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
     except FileNotFoundError:
         return None
     except OSError as exc:
+        if getattr(exc, "errno", None) == errno.ELOOP:
+            try:
+                if stat.S_ISLNK(os.lstat(str(path)).st_mode):
+                    return _TamperedKey("symlink planted at the key path")
+            except OSError:
+                pass
         _warn_once_suspect_key(
             path, f"open refused ({exc})",
-            "if the key is a symlink, remove it and investigate how it "
-            "got there; a fresh key is created on the next stamp",
+            "investigate how the object at the key path got there; a "
+            "fresh key is created on the next stamp once it is removed",
         )
         return _REFUSED
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
-            _warn_once_suspect_key(
-                path, "not a regular file",
-                "remove the object at that path and investigate",
-            )
-            return _REFUSED
+            return _TamperedKey("not a regular file")
         if st.st_uid != os.geteuid():
             _warn_once_suspect_key(
                 path,
@@ -127,13 +178,11 @@ def _read_existing_key(path: Path):
             )
             return _REFUSED
         if st.st_mode & 0o077:
-            _warn_once_suspect_key(
-                path,
-                f"mode {stat.S_IMODE(st.st_mode):04o} grants group/other "
-                "access",
-                f"chmod 600 {path}",
+            return _TamperedKey(
+                f"mode {stat.S_IMODE(st.st_mode):04o} grants "
+                "group/other access (the creator writes 0600; nothing "
+                "honest widens it)",
             )
-            return _REFUSED
         # A single os.read may return fewer bytes than requested
         # (network filesystems); a short read would land a healthy key
         # in the wrong-length refusal, so loop to EOF. The cap stays at
@@ -154,80 +203,176 @@ def _read_existing_key(path: Path):
         os.close(fd)
 
 
+def tamper_marker_path() -> Path:
+    """The append-only tamper-event record kept BESIDE the key (same
+    operator-owned data dir, outside every run directory). One JSON
+    line per quarantine, so triage/operators can attribute a re-key:
+    tokens minted under a quarantined key fail verification, and this
+    marker is the loud explanation of why."""
+    return _key_path().with_name("telemetry-mac.key.tamper.jsonl")
+
+
+def _record_tamper_event(reason: str, quarantined_to: str) -> None:
+    record = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "reason": reason,
+        "quarantined_to": quarantined_to,
+        "pid": os.getpid(),
+    }
+    line = json.dumps(record, sort_keys=True) + "\n"
+    try:
+        fd = os.open(
+            tamper_marker_path(),
+            os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            os.write(fd, line.encode("utf-8"))
+        finally:
+            os.close(fd)
+    except OSError:
+        # The quarantine + WARNING already carry the event; a marker
+        # write failure must not block the re-key.
+        logger.warning(
+            "telemetry_mac: could not append the key tamper marker "
+            "(%s)", tamper_marker_path())
+
+
+def tamper_events() -> list[dict]:
+    """Parsed tamper-marker records, oldest first (forensics /
+    triage). Best-effort: unparseable lines are skipped."""
+    events: list[dict] = []
+    try:
+        with open(tamper_marker_path(), encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict):
+                    events.append(rec)
+    except OSError:
+        return []
+    return events
+
+
+def _quarantine_tampered_key(path: Path, reason: str) -> bool:
+    """Move a tampered key object aside (evidence preserved), record
+    the tamper marker, and warn LOUDLY. Returns True when the path is
+    clear for re-keying."""
+    dest = path.with_name(
+        f"{path.name}.tampered-"
+        f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-"
+        f"{secrets.token_hex(4)}")
+    try:
+        os.rename(str(path), str(dest))
+    except FileNotFoundError:
+        # A concurrent detector already moved it — the path is clear.
+        return True
+    except OSError as exc:
+        _warn_once_suspect_key(
+            path, f"{reason}; quarantine failed ({exc})",
+            "remove the object at the key path and investigate",
+        )
+        return False
+    logger.warning(
+        "telemetry_mac: KEY TAMPER — %s. The object was quarantined to "
+        "%s and a fresh key will be created; telemetry stamped under "
+        "the old key will FAIL verification (triage reads that as "
+        "tampering, which is the honest verdict here). Investigate "
+        "what reached %s.",
+        reason, dest, path,
+    )
+    _record_tamper_event(reason, dest.name)
+    return True
+
+
 def _load_or_create_key() -> bytes | None:
     """Read the key, lazily creating it (0700 dir, 0600 file, O_EXCL)
-    if absent. Returns None when a key file exists but is unusable —
-    the suspect key is never used, never replaced."""
+    if absent. A TAMPERED key (see _TamperedKey) is quarantined and
+    replaced — with the event recorded — so a same-uid metadata flip
+    cannot park provenance in ``key_usable()=False`` forever. Returns
+    None when the key exists but is refused (foreign owner,
+    unreadable) or when recovery is not possible."""
     path = _key_path()
-    data = _read_existing_key(path)
-    if data is _REFUSED:
-        return None
-    if data is not None and len(data) == _KEY_LEN:
-        return data
-    if data is not None and len(data) > _KEY_LEN:
-        # Over-length can never be a concurrent creator's partial
-        # _KEY_LEN write — genuinely suspect, abort.
-        _warn_once_suspect_key(
-            path,
-            f"wrong length ({len(data)} bytes, expected {_KEY_LEN})",
-            "remove the suspect key and investigate; a fresh key is "
-            "created on the next stamp",
-        )
-        return None
-    # data is None (no key yet) or SHORT (a concurrent creator may be
-    # mid-write between its O_EXCL create and its write): attempt
-    # creation — an absent file wins the O_EXCL, a concurrent creator
-    # makes it fail FileExistsError, whose retry loop below rides out
-    # the mid-write window instead of mis-flagging a suspect key.
-
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    key = secrets.token_bytes(_KEY_LEN)
-    try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        # Lost the creation race — re-read the winner's key (an
-        # attacker pre-placing a symlink also lands here: O_EXCL
-        # refuses to create through one, and the re-read refuses it).
-        # SHORT reads (0 <= len < _KEY_LEN) are RETRIED, not aborted:
-        # the winner opens with O_EXCL and writes the key in a second
-        # step, so the loser can legitimately observe an empty or
-        # partial file mid-write — treating that as a suspect
-        # wrong-length key aborted on the first iteration and left the
-        # run unstamped (honest runs then triaged toward tampered).
-        # Only content that can never be a partial _KEY_LEN write
-        # (over-length) aborts immediately; a file still short after
-        # the full retry budget is genuinely wrong-length stable
-        # content and aborts then.
-        raced = None
-        for _ in range(20):
-            raced = _read_existing_key(path)
-            if raced is _REFUSED:
+    # Two passes with AT MOST ONE quarantine per call: the second pass
+    # serves the retry after a quarantine (whether the tamper was seen
+    # on the direct read or through the creation-race re-read); a key
+    # that is tampered AGAIN after this call's quarantine refuses —
+    # the marker and warning already fired, no quarantine treadmill.
+    _quarantined = False
+    for _pass in range(2):
+        data = _read_existing_key(path)
+        if isinstance(data, _TamperedKey) or (
+                isinstance(data, bytes) and len(data) > _KEY_LEN):
+            # Over-length content can never be a concurrent creator's
+            # partial _KEY_LEN write — same tamper class as the
+            # metadata shapes.
+            reason = (data.reason if isinstance(data, _TamperedKey)
+                      else f"wrong length ({len(data)} bytes, expected "
+                           f"{_KEY_LEN})")
+            if _quarantined or not _quarantine_tampered_key(path, reason):
                 return None
-            if raced is not None and len(raced) == _KEY_LEN:
-                return raced
-            if raced is not None and len(raced) > _KEY_LEN:
+            _quarantined = True
+            data = None  # quarantined — fall through to creation
+        if data is _REFUSED:
+            return None
+        if data is not None and len(data) == _KEY_LEN:
+            return data
+        # data is None (no key yet) or SHORT (a concurrent creator may
+        # be mid-write between its O_EXCL create and its write):
+        # attempt creation — an absent file wins the O_EXCL, a
+        # concurrent creator makes it fail FileExistsError, whose retry
+        # loop below rides out the mid-write window instead of
+        # mis-flagging a suspect key.
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        key = secrets.token_bytes(_KEY_LEN)
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                         0o600)
+        except FileExistsError:
+            # Lost the creation race — re-read the winner's key.
+            # SHORT reads (0 <= len < _KEY_LEN) are RETRIED, not
+            # aborted: the winner opens with O_EXCL and writes the key
+            # in a second step, so the loser can legitimately observe
+            # an empty or partial file mid-write — treating that as a
+            # suspect wrong-length key aborted on the first iteration
+            # and left the run unstamped (honest runs then triaged
+            # toward tampered). A file still short after the full
+            # retry budget is genuinely wrong-length stable content
+            # and refuses then (quarantining it could split-brain a
+            # slow winner). Tampered / over-length observations break
+            # to the outer pass, which quarantines and re-keys.
+            raced = None
+            for _ in range(20):
+                raced = _read_existing_key(path)
+                if raced is _REFUSED:
+                    return None
+                if isinstance(raced, _TamperedKey):
+                    break
+                if raced is not None and len(raced) == _KEY_LEN:
+                    return raced
+                if raced is not None and len(raced) > _KEY_LEN:
+                    break
+                time.sleep(0.01)
+            if isinstance(raced, _TamperedKey) or (
+                    isinstance(raced, bytes) and len(raced) > _KEY_LEN):
+                continue  # outer pass quarantines + re-keys
+            if raced is not None:
                 _warn_once_suspect_key(
                     path,
-                    f"wrong length ({len(raced)} bytes, expected {_KEY_LEN})",
-                    "remove the suspect key and investigate; a fresh key "
-                    "is created on the next stamp",
+                    f"wrong length ({len(raced)} bytes, expected "
+                    f"{_KEY_LEN}) after the creation-race retry budget",
+                    "remove the suspect key and investigate; a fresh "
+                    "key is created on the next stamp",
                 )
-                return None
-            time.sleep(0.01)
-        if raced is not None:
-            _warn_once_suspect_key(
-                path,
-                f"wrong length ({len(raced)} bytes, expected {_KEY_LEN}) "
-                "after the creation-race retry budget",
-                "remove the suspect key and investigate; a fresh key "
-                "is created on the next stamp",
-            )
-        return None
-    try:
-        os.write(fd, key)
-    finally:
-        os.close(fd)
-    return key
+            return None
+        try:
+            os.write(fd, key)
+        finally:
+            os.close(fd)
+        return key
+    return None
 
 
 def _canonical(fields: Mapping[str, object]) -> bytes:
@@ -249,11 +394,15 @@ def key_usable() -> bool:
     Triage uses it to attribute unverifiable telemetry correctly:
     unstamped artefacts under a USABLE key mean the writer chose not
     to stamp — target-rewrite territory, fail toward tampering. An
-    UNUSABLE key (symlinked, foreign-owned, wrong length, unwritable
-    data dir) is an operator-side condition that makes verification
-    impossible for every artefact, honest or not — misreading that
-    as a target attack turns a host misconfiguration into permanent
-    suspicious verdicts."""
+    UNUSABLE key (foreign-owned, unreadable, unwritable data dir,
+    stable short content) is an operator-side condition that makes
+    verification impossible for every artefact, honest or not —
+    misreading that as a target attack turns a host misconfiguration
+    into permanent suspicious verdicts. TAMPERED keys (permission
+    flips, planted symlinks, over-length content) do NOT land here:
+    they are quarantined and re-keyed inside ``_load_or_create_key``,
+    so this returns True and the old key's tokens fail verification
+    instead — fail toward tampering, not toward legacy acceptance."""
     try:
         return bool(_load_or_create_key())
     except OSError:
@@ -349,7 +498,7 @@ def proxy_events_count_fields(
     if isinstance(flags, str):
         flag_list = [flags] if flags else []
     else:
-        flag_list = [str(f) for f in (flags or [])]
+        flag_list = [str(f) for f in (flags or [])]  # type: ignore[attr-defined]
     return {
         "kind": "proxy-events-count",
         "run": run,
@@ -414,7 +563,11 @@ def summary_fields(total_denials: int, denials_sha256: str, run: str,
                    corrupt_lines: int = 0,
                    inode_mismatch: bool = False,
                    planted_object: str = "",
-                   posture: "Mapping | None" = None) -> dict:
+                   posture: "Mapping | None" = None,
+                   floor_refusals: int = 0,
+                   floor_refusals_sha256: str = "",
+                   cli_sandbox_disabled: bool = False,
+                   disable_consent: str = "") -> dict:
     """MAC fields for sandbox-summary.json: the denial payload is
     covered by its content hash, so a planted or edited summary fails
     verification even when the headline counters are preserved.
@@ -448,4 +601,24 @@ def summary_fields(total_denials: int, denials_sha256: str, run: str,
     if posture is not None:
         fields["posture_mac_key_hidden"] = bool(
             posture.get("mac_key_hidden"))
+    # Containment-floor refusal binding (join only when refusals were
+    # recorded, so tokens minted before the field existed keep
+    # verifying — same posture as the tamper flags above). Binding
+    # the count + content hash means a target that can edit the
+    # summary cannot strip or forge the "environment could not
+    # execute this payload" record without breaking the token.
+    if floor_refusals:
+        fields["floor_refusals"] = int(floor_refusals)
+        fields["floor_refusals_sha256"] = str(floor_refusals_sha256)
+    # CLI-disable attribution binding (join only when the writer
+    # recorded an accepted disable, so pre-existing tokens keep
+    # verifying — same join posture as the fields above). Both halves
+    # of the pair join together and the verifier recomputes each from
+    # its own on-disk field, so stripping or rewriting EITHER the
+    # cli_sandbox_disabled flag or the consent-source label breaks
+    # the token — the "this run executed unsandboxed, admitted by
+    # this consent source" record is all-or-nothing.
+    if cli_sandbox_disabled or disable_consent:
+        fields["cli_sandbox_disabled"] = bool(cli_sandbox_disabled)
+        fields["disable_consent"] = str(disable_consent)
     return fields

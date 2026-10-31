@@ -7,6 +7,7 @@ import os
 import subprocess
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from packages.frida.active import (
@@ -21,26 +22,57 @@ from packages.frida.active import (
 # ── _extract_output_dir ───────────────────────────────────────────────
 
 
+NONCE = "0123456789abcdef"
+
+
+def _framed(path) -> str:
+    return f"RAPTOR_FRIDA_RUN_DIR:{NONCE}={path}\n"
+
+
 class TestExtractOutputDir:
 
-    def test_parses_valid_line(self, tmp_path):
+    def test_parses_framed_line(self, tmp_path):
         d = tmp_path / "out" / "frida_123"
         d.mkdir(parents=True)
-        stdout = f"some preamble\nOUTPUT_DIR={d}\nmore stuff\n"
-        assert _extract_output_dir(stdout) == d
+        stderr = f"preamble\nOUTPUT_DIR={d}\n" + _framed(d) + "more\n"
+        assert _extract_output_dir(stderr, NONCE) == d
 
     def test_returns_none_on_missing(self):
-        assert _extract_output_dir("no output dir here\n") is None
+        assert _extract_output_dir("no output dir here\n", NONCE) is None
+
+    def test_bare_output_dir_line_not_trusted(self, tmp_path):
+        # The un-nonce'd lifecycle line is operator/pipeline output,
+        # never an evidence-dir source (the spawned target inherits
+        # the wrapper's stdio and can forge it).
+        d = tmp_path / "out" / "frida_123"
+        d.mkdir(parents=True)
+        assert _extract_output_dir(f"OUTPUT_DIR={d}\n", NONCE) is None
+
+    def test_wrong_nonce_not_trusted(self, tmp_path):
+        d = tmp_path / "out" / "frida_123"
+        d.mkdir(parents=True)
+        forged = f"RAPTOR_FRIDA_RUN_DIR:{'f' * 16}={d}\n"
+        assert _extract_output_dir(forged, NONCE) is None
+
+    def test_first_framed_line_wins_over_later_forgery(self, tmp_path):
+        # The wrapper's line precedes any target output in the pipe;
+        # a target that somehow learned the nonce still cannot
+        # displace the first framed line.
+        real = tmp_path / "real"
+        real.mkdir()
+        evil = tmp_path / "evil"
+        evil.mkdir()
+        stderr = _framed(real) + _framed(evil)
+        assert _extract_output_dir(stderr, NONCE) == real
 
     def test_returns_none_on_nonexistent_path(self):
-        stdout = "OUTPUT_DIR=/tmp/nonexistent_abcdef_xyz\n"
-        assert _extract_output_dir(stdout) is None
+        stderr = f"RAPTOR_FRIDA_RUN_DIR:{NONCE}=/tmp/nonexistent_ab\n"
+        assert _extract_output_dir(stderr, NONCE) is None
 
     def test_handles_path_with_equals(self, tmp_path):
         d = tmp_path / "out=test" / "frida_123"
         d.mkdir(parents=True)
-        stdout = f"OUTPUT_DIR={d}\n"
-        assert _extract_output_dir(stdout) == d
+        assert _extract_output_dir(_framed(d), NONCE) == d
 
 
 # ── _safe_env ────────────────────────────────────────────────────────
@@ -100,10 +132,12 @@ class TestObserveTarget:
 
         fake_result = MagicMock()
         fake_result.returncode = 0
-        fake_result.stdout = f"OUTPUT_DIR={run_dir}\n"
-        fake_result.stderr = ""
+        fake_result.stdout = ""
+        fake_result.stderr = _framed(run_dir)
 
         with patch("packages.frida.available", return_value=True), \
+             patch("packages.frida.active._mint_nonce",
+                   return_value=NONCE), \
              patch("subprocess.run", return_value=fake_result) as mock_run:
             result = observe_target(str(binary), template="api-trace",
                                     duration_sec=10)
@@ -156,17 +190,42 @@ class TestObserveTarget:
 
         fake_result = MagicMock()
         fake_result.returncode = 0
-        fake_result.stdout = f"OUTPUT_DIR={out_dir}\n"
+        fake_result.stdout = ""
+        # No sentinel at all: the explicit out_dir must win on its own
+        # (parsed sentinels only resolve wrapper-owned lifecycle dirs).
         fake_result.stderr = ""
 
         with patch("packages.frida.available", return_value=True), \
              patch("subprocess.run", return_value=fake_result) as mock_run:
-            observe_target(str(binary), out_dir=out_dir)
+            result = observe_target(str(binary), out_dir=out_dir)
 
+        assert result == out_dir
         call_args = mock_run.call_args[0][0]
         assert "--out" in call_args
         idx = call_args.index("--out")
         assert call_args[idx + 1] == str(out_dir)
+
+    def test_forged_stdout_sentinel_never_selects_evidence_dir(
+        self, tmp_path, monkeypatch,
+    ):
+        # A hostile target writing OUTPUT_DIR=<pre-planted dir> into
+        # the inherited stdout must not substitute the evidence dir.
+        monkeypatch.setenv("RAPTOR_DIR", str(tmp_path))
+        binary = tmp_path / "app"
+        binary.write_bytes(b"\x7fELF")
+        evil = tmp_path / "evil"
+        evil.mkdir()
+        (evil / "metadata.json").write_text('{"ok": true}')
+
+        fake_result = MagicMock()
+        fake_result.returncode = 0
+        fake_result.stdout = f"OUTPUT_DIR={evil}\n"
+        fake_result.stderr = f"OUTPUT_DIR={evil}\n"
+
+        with patch("packages.frida.available", return_value=True), \
+             patch("subprocess.run", return_value=fake_result):
+            result = observe_target(str(binary))
+        assert result is None
 
     def test_enforces_minimum_duration(self, tmp_path, monkeypatch):
         monkeypatch.setenv("RAPTOR_DIR", str(tmp_path))
@@ -265,9 +324,13 @@ class TestObservePaired:
         assert request["target"]["cmd"] == ["./myserver", "--port", "8080"]
         assert request["target"]["profile"] == "target_run"
         # The target binary is hostile code: the spec must carry a
-        # filesystem boundary (the run dir as output) and restricted
-        # reads, or the coordinator's fail-closed floor refuses it.
-        assert request["target"]["output"] == str(run_dir)
+        # filesystem boundary and restricted reads, or the
+        # coordinator's fail-closed floor refuses it. The write grant
+        # is the work SUBDIRECTORY, never the run dir root — the run
+        # dir carries parent-attributed state (metadata.json is this
+        # flow's own success check) a hostile child must not rewrite.
+        assert request["target"]["output"] == str(run_dir / "work-target")
+        assert (run_dir / "work-target").is_dir()
         assert request["target"]["restrict_reads"] is True
         assert request["exploit"]["profile"] == "frida"
         assert request["wait_listen_port"] == 8080
@@ -396,10 +459,12 @@ class TestAutoObserve:
 
         fake_result = MagicMock()
         fake_result.returncode = 0
-        fake_result.stdout = f"OUTPUT_DIR={new_run}\n"
-        fake_result.stderr = ""
+        fake_result.stdout = ""
+        fake_result.stderr = _framed(new_run)
 
         with patch("packages.frida.available", return_value=True), \
+             patch("packages.frida.active._mint_nonce",
+                   return_value=NONCE), \
              patch("subprocess.run", return_value=fake_result):
             result = auto_observe(
                 target_path=target,
@@ -419,10 +484,12 @@ class TestAutoObserve:
 
         fake_result = MagicMock()
         fake_result.returncode = 0
-        fake_result.stdout = f"OUTPUT_DIR={new_run}\n"
-        fake_result.stderr = ""
+        fake_result.stdout = ""
+        fake_result.stderr = _framed(new_run)
 
         with patch("packages.frida.available", return_value=True), \
+             patch("packages.frida.active._mint_nonce",
+                   return_value=NONCE), \
              patch("subprocess.run", return_value=fake_result):
             result = auto_observe(
                 target_path=target,
@@ -444,10 +511,12 @@ class TestAutoObserve:
 
         fake_result = MagicMock()
         fake_result.returncode = 0
-        fake_result.stdout = f"OUTPUT_DIR={new_run}\n"
-        fake_result.stderr = ""
+        fake_result.stdout = ""
+        fake_result.stderr = _framed(new_run)
 
         with patch("packages.frida.available", return_value=True), \
+             patch("packages.frida.active._mint_nonce",
+                   return_value=NONCE), \
              patch("subprocess.run", return_value=fake_result):
             result = auto_observe(
                 target_path=target,
@@ -472,10 +541,12 @@ class TestAutoObserve:
 
         fake_result = MagicMock()
         fake_result.returncode = 0
-        fake_result.stdout = f"OUTPUT_DIR={new_run}\n"
-        fake_result.stderr = ""
+        fake_result.stdout = ""
+        fake_result.stderr = _framed(new_run)
 
         with patch("packages.frida.available", return_value=True), \
+             patch("packages.frida.active._mint_nonce",
+                   return_value=NONCE), \
              patch("subprocess.run", return_value=fake_result):
             result = auto_observe(
                 target_path=target,
@@ -532,3 +603,33 @@ class TestAutoObserveTemplateAwareness:
 
         monkeypatch.setattr(active, "observe_target", boom)
         assert active.auto_observe("/bin/t", [tmp_path]) is None
+
+
+class TestSandboxedProbeEnvHygiene:
+    def test_find_frida_site_probe_uses_sanitised_env(
+        self, tmp_path, monkeypatch,
+    ):
+        # The interpreter probe would import through the shell's
+        # PYTHONPATH / PYTHONSTARTUP (the codeql version-probe idiom).
+        from packages.frida import sandboxed
+
+        py = tmp_path / "python3"
+        py.write_text("#!/bin/sh\n")
+
+        seen: dict = {}
+
+        def fake_run(cmd, **kw):
+            seen["env"] = kw.get("env")
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setenv("PYTHONPATH", "/evil")
+        monkeypatch.setenv("PYTHONSTARTUP", "/evil/rc.py")
+        monkeypatch.setattr(sandboxed.sys, "executable", str(py))
+
+        sandboxed._find_frida_site()
+
+        env = seen.get("env")
+        assert env is not None, "probe ran with inherited environment"
+        assert "PYTHONPATH" not in env
+        assert "PYTHONSTARTUP" not in env

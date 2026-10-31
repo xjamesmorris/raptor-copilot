@@ -37,9 +37,9 @@ if not (os.environ.get("CLAUDECODE")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import core.startup.process_init  # noqa: E402,F401
 from core.artifacts.context_map_budget import (  # noqa: E402
-    enforce_context_map_budget,
+    save_context_map,
 )
-from core.json import load_json, save_json  # noqa: E402
+from core.json import load_json  # noqa: E402
 
 
 def main() -> int:
@@ -78,10 +78,9 @@ def main() -> int:
         )
         return 1
 
-    checklist = load_json(understand_dir / "checklist.json") or {}
-    target_path = (
-        checklist.get("target_path") if isinstance(checklist, dict) else None
-    )
+    from core.inventory import read_checklist
+    checklist = read_checklist(understand_dir)
+    target_path = checklist.get("target_path")
     if not target_path:
         print(
             "raptor-enrich-context-map-sites: checklist missing target_path; "
@@ -147,22 +146,25 @@ def main() -> int:
     counts = enrich_context_map_with_sites(
         context_map, si, repo_root=target_path,
     )
-    total = counts["ownership_model"] + counts["privilege_model"]
-    if total:
-        enforce_context_map_budget(context_map)
-        save_json(context_map_path, context_map)
+    from packages.code_understanding.context_map_sites import (
+        total_enriched_sites,
+    )
+    if total_enriched_sites(counts):
+        save_context_map(context_map_path, context_map)
         print(
             f"raptor-enrich-context-map-sites: enriched "
             f"{counts['ownership_model']} ownership + "
-            f"{counts['privilege_model']} privilege site(s) in "
+            f"{counts['privilege_model']} privilege + "
+            f"{counts['shared_state']} shared-state + "
+            f"{counts['crypto_inventory']} crypto site(s) in "
             f"{context_map_path}"
         )
     else:
         reason = getattr(si, "skipped_reason", None)
         suffix = f" ({reason})" if reason else ""
         print(
-            "raptor-enrich-context-map-sites: no ownership/privilege sites "
-            f"detected{suffix}",
+            "raptor-enrich-context-map-sites: no sites detected in any "
+            f"section{suffix}",
             file=sys.stderr,
         )
     return 0

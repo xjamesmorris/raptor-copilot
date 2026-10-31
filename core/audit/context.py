@@ -14,13 +14,18 @@ from __future__ import annotations
 
 import logging
 import re
+from functools import partial
 from itertools import islice
 from pathlib import Path
 from typing import Any
 
 from core.json import load_json
 from core.paths import confine
+from core.source.lines import split_lines
+from core.security.log_sanitisation import escape_nonprintable
 from core.security.prompt_envelope import neutralize_tag_forgery, wrap_untrusted
+
+from .run_memo import BoundedMemo
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +48,131 @@ CONSISTENCY_SITES_PROMPT_CAP = 5
 # is in the fail_open_census audit-log record.
 FAIL_OPEN_LEADS_PROMPT_CAP = 5
 
+# Bound on rendered includer sites in the include-topology block
+# (caller-contract MAX_SITES_RENDERED precedent); the full includer
+# set lives in include-graph.json.
+MAX_INCLUDERS_RENDERED = 10
+
+# ── Caller call-site window limits ──────────────────────────────────
+# These four bound the "1-hop callers with call-site snippets" slice
+# that BOTH the audit review prompt and /agentic's per-finding
+# classifier consume (the classifier reaches it through
+# collect_caller_call_sites — see
+# packages.llm_analysis.flow_context_inject). Each value was
+# previously a bare literal at its use site; a change here changes
+# what every consumer's LLM sees, in both directions:
+
+# Lines of context before AND after a matched call line in the
+# attached call_site snippet — so a snippet is exactly
+# 2 * CALL_SITE_CONTEXT_LINES + 1 lines high, and downstream
+# consumers that bound snippet height (the /agentic caller channel
+# in packages.llm_analysis.flow_context_inject) DERIVE their cap
+# from this constant rather than duplicating it. Too small (0): only
+# the call line itself — an argument built on the line above
+# (`len = strlen(src);` then `copy(dst, src, len)`) is invisible, so
+# the reviewer cannot see whether the caller validated what it
+# passes. Too large: the snippet cost multiplies by the number of
+# enriched callers, and the call-site block's job is to show HOW the
+# function is invoked — a wide window turns it into an unreviewed
+# second function body that competes with the reviewed source for
+# attention.
+CALL_SITE_CONTEXT_LINES: int = 1
+
+# How many lines below the caller's start line to search for the
+# call expression. The inventory gives us the caller's START line
+# only — not its end — so this span stands in for "the caller's
+# body". Too small: a call site deep in a long caller silently gets
+# no call_site attached (the reviewer sees the caller's name but not
+# the invocation). Too large: past the real end of the caller the
+# scan runs into the NEXT function's body, and a same-named call
+# there gets attributed to the wrong caller — a misleading snippet
+# is worse than none.
+CALLER_CALL_SEARCH_SPAN_LINES: int = 80
+
+# At most this many callers get call-site enrichment / are returned
+# by collect_caller_call_sites by default / are rendered in the
+# "Callers (1-hop)" prompt section (one constant for all three on
+# purpose: a lower render cap would waste the snippets enriched past
+# it, a higher one would render bare un-enriched rows). Too small: a
+# widely-used function's trust surface is judged from an
+# unrepresentative sample of its callers. Too large: each caller
+# costs a file read plus a rendered snippet, and past a handful the
+# marginal caller repeats the same calling convention — the token
+# spend buys repetition.
+MAX_CALL_SITE_CALLERS: int = 10
+
+# At most this many callees rendered in the "Callees (1-hop)" prompt
+# section. The callee SNIPPET volume is separately bounded by the
+# two line budgets below; this bounds the row count. Too small: the
+# reviewer cannot see what the function delegates to — exactly the
+# calls whose contracts decide use-after-free / unchecked-return
+# hypotheses. Too large: a dispatcher calling dozens of handlers
+# floods the prompt with rows whose marginal value is near zero.
+MAX_PROMPT_CALLEES: int = 10
+
+# Per-callee body span (lines) attached as the callee's
+# source_snippet — the callee-side sibling of
+# SOURCE_SPAN_FALLBACK_LINES (same fallback pattern when the
+# checklist carries no line_end, and also the clamp when it does).
+# Too small: the snippet cuts off before the free / return / guard
+# that decides the callee's contract, so the reviewer judges the
+# delegation on the callee's opening lines. Too large: one long
+# callee eats the whole shared budget below, starving every other
+# callee of a body.
+CALLEE_SNIPPET_SPAN_LINES: int = 20
+
+# Total line budget across ALL callee snippets for one reviewed
+# function (iterated in security-relevance order — sinks and
+# validators first — so the budget goes to the callees most likely
+# to decide the verdict). Too small: only the first callee or two
+# get bodies and later security-relevant callees render as bare
+# names. Too large: a function with many callees floods the prompt
+# with unreviewed peer bodies that compete with the reviewed source
+# for attention, at token cost paid on every review of that
+# function.
+CALLEE_SNIPPET_TOTAL_LINES: int = 150
+
+# Default source span (lines) for the reviewed function when the
+# inventory carries no line_end. Audit-side sibling of the
+# classifier's window (core.llm.context_window.FINDING_CONTEXT_LINES
+# — same value, DIFFERENT meaning: this is "assume the function body
+# is at most N lines", not "N lines of context around the finding";
+# keep them separate). Too small: long functions get reviewed on a
+# truncated body — verdicts rendered without the later half where
+# the bug or its guard may live. Too large: for the common short
+# function the span spills into the file's NEXT functions, which the
+# reviewer may misattribute to the one under review.
+SOURCE_SPAN_FALLBACK_LINES: int = 50
+
+
+def fallback_span_end(line_start: int, line_end: int | None) -> int:
+    """Inclusive 1-indexed end of the span a review actually covers.
+
+    A measured ``line_end`` passes through unchanged. ``None`` means
+    the inventory never measured one — the review prompt then shows
+    the SOURCE_SPAN_FALLBACK_LINES window starting at ``line_start``
+    (:func:`_read_source`), and every source-hash producer and
+    verifier must cover that SAME window: the stamp side
+    (``core.audit.record._compute_hash``) so a body edit below the
+    header line flips the hash instead of staying invisible to
+    staleness/reuse gating, and the verify side (the journal fold's
+    span candidates, the coverage-record hash oracles, the resume
+    drift gate) so a window-stamped row can actually verify instead
+    of reading as permanent drift. Callers clamp to the file's real
+    length at slice/hash time (``slice_lines`` and ``_read_source``
+    both clamp), so the returned value may exceed the file.
+    """
+    if line_end is not None:
+        return line_end
+    return max(line_start, 1) + SOURCE_SPAN_FALLBACK_LINES - 1
+
+
+# Bound on the uniform-absence prompt section: a whole-family record
+# is heavier than a per-function lead, and a function rarely sits in
+# more than a couple of certain-membership families — the full record
+# set is in the prepass audit-log entry.
+UNIFORM_ABSENCE_PROMPT_CAP = 3
+
 
 def _safe_path(target_path: Path, file_path: str) -> Path | None:
     """Join target_path / file_path with traversal guard.
@@ -54,7 +184,8 @@ def _safe_path(target_path: Path, file_path: str) -> Path | None:
     """
     full = confine(target_path, file_path)
     if full is None:
-        logger.warning("path traversal blocked: %s", file_path)
+        logger.warning("path traversal blocked: %s",
+                       escape_nonprintable(file_path))
     return full
 
 
@@ -77,32 +208,23 @@ def _read_target_text(full_path: Path) -> str | None:
     Returns the decoded text, or None when the file is unreadable OR
     larger than ``_MAX_SOURCE_FILE_BYTES`` — callers take their
     existing unreadable-file fallback in both cases. The bounded read
-    of cap+1 bytes detects a file that grew past the cap between stat
-    and read without ever loading more than the cap into memory.
+    (``core.source.read_bytes_capped``: cap+1 probe, never
+    stat-then-read) detects an over-cap file without ever loading
+    more than the cap into memory.
     """
-    try:
-        st = full_path.stat()
-        if st.st_size > _MAX_SOURCE_FILE_BYTES:
-            logger.warning(
-                "target source file too large (%.0f MiB > %.0f MiB cap), "
-                "skipping: %s",
-                st.st_size / 1024 / 1024,
-                _MAX_SOURCE_FILE_BYTES / 1024 / 1024,
-                full_path,
-            )
-            return None
-        with full_path.open("rb") as f:
-            raw = f.read(_MAX_SOURCE_FILE_BYTES + 1)
-        if len(raw) > _MAX_SOURCE_FILE_BYTES:
-            logger.warning(
-                "target source file grew past %.0f MiB cap during read, "
-                "skipping: %s",
-                _MAX_SOURCE_FILE_BYTES / 1024 / 1024, full_path,
-            )
-            return None
-        return raw.decode("utf-8", errors="replace")
-    except OSError:
+    from core.source import read_bytes_capped
+
+    got = read_bytes_capped(full_path, _MAX_SOURCE_FILE_BYTES)
+    if got is None:
         return None
+    raw, truncated = got
+    if truncated:
+        logger.warning(
+            "target source file over %.0f MiB cap, skipping: %s",
+            _MAX_SOURCE_FILE_BYTES / 1024 / 1024, full_path,
+        )
+        return None
+    return raw.decode("utf-8", errors="replace")
 
 
 def _build_tool_catalog() -> str:
@@ -229,6 +351,11 @@ def assemble_context(
     }
 
     ctx["target_path"] = str(target_path)
+    # The renderer's language-specific pattern blocks key off
+    # ctx["language"]; nothing produced it, so the go/python exemplar
+    # sections never rendered outside system-prompt mode.
+    from core.audit.prefilter import detect_language
+    ctx["language"] = detect_language(file_path)
     ctx["source"] = _read_source(target_path, file_path, line_start, line_end)
     ctx["metadata"] = _extract_metadata(checklist, file_path, function_name)
     ctx["callers"] = _find_callers(
@@ -280,6 +407,18 @@ def assemble_context(
         source=ctx.get("source", ""),
         has_inventory=bool(context_map),
     )
+    # PHP include topology (hint-tier, prompt-context only): the
+    # file's role, includer set, and the mandatory two-component
+    # census from include-graph.json. Steering context for
+    # hypothesis formation — NO verdict path reads it. Absent for
+    # non-PHP files and pre-graph runs (graceful None).
+    ctx["include_context"] = _build_include_context(out_dir, file_path)
+    # PHP gadget surface (hint-tier, prompt-context only): magic-
+    # method chains and unserialize sites from gadget-chains.json,
+    # with the mandatory completeness qualifier. Steering context for
+    # CWE-502 hypothesis formation — NO verdict path reads it. Absent
+    # for non-PHP targets and runs the oracle never touched.
+    ctx["gadget_context"] = _build_gadget_context(out_dir, file_path)
 
     strategies = None
     try:
@@ -316,6 +455,13 @@ def assemble_context(
     ctx["strategy_exemplars"] = _load_strategy_exemplars(strategies)
     ctx["strategy_primers"] = _load_strategy_primers(strategies)
     # Always inject security context + bug patterns (independent of primers)
+    # NOTE: the domain-model blocks assembled below (security context,
+    # bug patterns, dynamic primers, and the primer-conditional
+    # domain-knowledge block) are fingerprinted per function by
+    # core.concepts.audit_bridge.domain_slice_hash for the journal's
+    # verdict-reuse staleness gate. Adding, removing, or re-gating a
+    # domain-model block here must be mirrored there, or the
+    # fingerprint stops covering what the prompt actually contains.
     if out_dir:
         # Domain-model blocks are LLM-paraphrased TARGET content (study
         # reads the repo under analysis; SAGE recall is prior-run
@@ -346,6 +492,23 @@ def assemble_context(
                 )
         except Exception:
             logger.debug("domain bug patterns failed", exc_info=True)
+        try:
+            from core.concepts.audit_bridge import token_enforcement_context
+            te_block = token_enforcement_context(
+                out_dir, file_path, target_path,
+            )
+            if te_block:
+                # Mechanical projection over study-LEARNED check names
+                # (LLM-derived vocabulary) plus target-parsed call
+                # facts — same provenance class as the domain-model
+                # blocks, so it rides the same untrusted envelope.
+                ctx["token_enforcement"] = wrap_untrusted(
+                    te_block,
+                    kind="token-enforcement",
+                    origin="study token-map projection",
+                )
+        except Exception:
+            logger.debug("token enforcement context failed", exc_info=True)
 
     _has_domain_primers = False
     if out_dir:
@@ -446,8 +609,8 @@ def defend_repo_text(ctx: dict[str, Any], text: str, *,
             ctx.setdefault("injection_warnings", []).extend(warnings)
         return sanitised
     except Exception:
-        logger.warning("prompt defence failed for %s", location,
-                       exc_info=True)
+        logger.warning("prompt defence failed for %s",
+                       escape_nonprintable(location), exc_info=True)
         return text
 
 
@@ -459,20 +622,111 @@ _IDENT_FLATTEN_RE = re.compile(r"[\x00-\x1f\x7f]+")
 
 
 def _defend_identifier(value: Any, max_length: int = 200) -> str:
-    """Render a repo/LLM-derived identifier safely for a trusted
+    r"""Render a repo/LLM-derived identifier safely for a trusted
     prompt region: newlines and control chars flatten to a single
-    space, envelope-tag/heading shapes are neutralised in place, and
-    the length is bounded. Purely a RENDER-time transform — ctx fields
-    keep their original values for lookups."""
-    text = _IDENT_FLATTEN_RE.sub(" ", str(value))
+    space, envelope-tag/heading shapes are neutralised in place,
+    every remaining non-printable becomes a visible ``\xHH``/
+    ``\uHHHH`` escape, backticks become ``\x60``, and the length is
+    bounded. Purely a RENDER-time transform — ctx fields keep their
+    original values for lookups.
+
+    Printable identifiers stay byte-faithful (escaping, never
+    rejection: an identifier must remain renderable and recognisable
+    in the prompt). Two hostile classes get escaped rather than
+    passed through:
+
+    - **Non-printables beyond C0/DEL** (the log-sanitisation
+      contract's classifier): bidi overrides/embeddings/isolates
+      enable visual-reorder deception in rendered prompts and
+      reports, zero-width characters enable homoglyph-adjacent
+      spoofing, and C1 controls are terminal-live. All of Unicode
+      Cc/Cf/Cn/Co/Cs/Zl/Zp escapes to the contract's literal form.
+    - **Backticks**: most call sites wrap the returned identifier in
+      a single-backtick code span; a backtick INSIDE the identifier
+      closes that span early and the identifier's remainder renders
+      as live prompt prose (instruction/heading forgery without any
+      newline). Escaping at the shared helper keeps every wrapping
+      site's span intact; no legitimate identifier grammar needs a
+      live backtick.
+
+    Known limitations (documented by design, not gaps this helper
+    closes):
+
+    - Escaping is NOT injective — an attacker writing the literal
+      text ``\x60`` produces the same rendered bytes as a real
+      escaped backtick. The security property (nothing live) holds
+      either way; forensic consumers needing byte fidelity read the
+      ctx fields, never the rendered prompt. A model that decodes
+      and re-quotes an escape when regenerating text is a
+      second-order consumer concern, same as for the log contract.
+    - Homoglyph/fullwidth respellings of tag vocabulary (e.g.
+      fullwidth brackets) pass byte-faithful: printable, semantic
+      layer — ownership documented at ``_ENVELOPE_TAG_RE``'s
+      spelling note (a confusable fold belongs in the character
+      layer there, one home for all arms).
+    - The ``...[truncated]`` marker is plain text an attacker can
+      also write — cosmetic; truncation grants nothing.
+    """
+    text = str(value)
+    # Bound WORK before the pipeline, not just output after it: the
+    # pipeline is linear but a multi-megabyte "identifier" still pays
+    # flatten+neutralise+escape over the whole input to keep 200
+    # chars. 8x the output cap leaves every printable input's final
+    # rendering identical (flatten never shrinks printable text and
+    # the later passes only insert/expand, so the first max_length
+    # output chars come from well inside the bound); outputs can
+    # differ only for inputs whose first 8*max_length chars are
+    # dominated by control-run padding that flatten would collapse —
+    # hostile by shape. Do not lower toward max_length: escape
+    # expansion (up to 10 chars per input char) plus run-collapse
+    # need the headroom for legitimate escape-heavy identifiers.
+    input_cap = max_length * 8
+    if len(text) > input_cap:
+        text = text[:input_cap]
+    text = _IDENT_FLATTEN_RE.sub(" ", text)
     try:
         from core.security.prompt_envelope import neutralize_tag_forgery
         text = neutralize_tag_forgery(text)
     except Exception:
         logger.debug("identifier defence degraded", exc_info=True)
+    # AFTER tag-forgery neutralisation on purpose: the pass above
+    # breaks forged shapes by inserting zero-width spaces, and this
+    # escape materialises those (plus any attacker-supplied Cf/C1
+    # character) as literal escape text — the forged shape stays
+    # broken while the returned identifier is 100% printable. For a
+    # short inline identifier, a visible escape beats an invisible
+    # zero-width space.
+    text = escape_nonprintable(text)
+    text = text.replace("`", "\\x60")
     if len(text) > max_length:
         text = text[:max_length] + "...[truncated]"
     return text
+
+
+def _defend_line(value: Any) -> str:
+    """Render a target/artifact-derived LINE NUMBER for a trusted
+    prompt region. Line numbers are the one identifier class with a
+    grammar strict enough for rejection over escaping: a genuine value
+    coerces to int and renders bare; anything else (a "line" carrying
+    prose or forged headings from a hostile artifact) renders as the
+    existing unknown-value convention ``?`` — escaping it would keep
+    hostile text in a slot every reader treats as a number.
+
+    Only integral values pass: a float-typed value (``5.0`` from a
+    JSON artifact) or float-shaped text (``"3.5"``) degrades to ``?``
+    too — line provenance is integral, and widening the grammar for
+    a value no in-tree producer emits would loosen the rejection.
+
+    Known limitation (by design): routing a PROSE field through this
+    helper silently collapses it to ``?`` — fail-closed, never
+    fail-open (the value was hostile or mis-plumbed either way, and
+    a reader must not see it in a numeric slot), but the rejected
+    content is not surfaced. Prose-bearing fields belong with
+    :func:`_defend_identifier`, which keeps them renderable."""
+    try:
+        return str(int(str(value).strip()))
+    except (TypeError, ValueError):
+        return "?"
 
 
 _BACKTICK_RUN_RE = re.compile(r"`+")
@@ -551,6 +805,21 @@ def _defend_assembled_context(ctx: dict[str, Any], file_path: str,
                 )
                 for name, body in ctx["macro_definitions"]
             ]
+        # Caller-contract site excerpts are raw repo lines around
+        # calls of contract-risk functions, rendered into a
+        # priority-0 (never-shed) section — plantable steering text
+        # beside any call site would otherwise inject into every
+        # review of that function with injection_warnings unset.
+        cc = ctx.get("caller_contract")
+        if isinstance(cc, dict):
+            for site in cc.get("sites") or []:
+                if isinstance(site, dict) and site.get("excerpt"):
+                    site["excerpt"] = defend_repo_text(
+                        ctx, site["excerpt"],
+                        location=f"{site.get('file', '?')} "
+                                 f"(caller-contract site of "
+                                 f"{function_name})",
+                    )
     except Exception:
         logger.warning("prompt defence failed", exc_info=True)
 
@@ -572,11 +841,16 @@ _KERNEL_SOURCE_MARKERS = (
     "#include <linux/", "#include <asm/", "EXPORT_SYMBOL",
     "MODULE_LICENSE", "MODULE_AUTHOR", "SPDX-License-Identifier: GPL-2.0",
 )
-_kernel_file_cache: dict[str, bool] = {}
+#: Keyed (target_path, relative file path) — the relative path alone
+#: collides across targets in one process (a kernel verdict from one
+#: run bled into the next target's identically-named file).
+# Bounded + thread-safe (per-key in-flight collapse): concurrent
+# review workers raced the bare dict's check-then-set.
+_kernel_file_cache: "BoundedMemo[bool]" = BoundedMemo(2048)
 
 
 def _file_has_kernel_markers(ctx: dict[str, Any]) -> bool:
-    """Sniff the file head for kernel markers (cached per file).
+    """Sniff the file head for kernel markers (cached per target+file).
 
     Falls back to True (trust the path hint) when the file can't be
     read — the old, over-inclusive behaviour, chosen because kernel
@@ -584,20 +858,26 @@ def _file_has_kernel_markers(ctx: dict[str, Any]) -> bool:
     rare unreadable userland file.
     """
     fp = ctx.get("file", "")
-    cached = _kernel_file_cache.get(fp)
-    if cached is not None:
-        return cached
-    result = True
-    target = ctx.get("target_path")
-    if target:
-        full = _safe_path(Path(target), fp)
-        if full is not None and full.is_file():
-            text = _read_target_text(full)
-            if text is not None:
-                head = text[:4096]
-                result = any(m in head for m in _KERNEL_SOURCE_MARKERS)
-    _kernel_file_cache[fp] = result
-    return result
+    cache_key = (str(ctx.get("target_path") or ""), fp)
+
+    def _compute() -> bool:
+        result = True
+        target = ctx.get("target_path")
+        if target:
+            full = _safe_path(Path(target), fp)
+            if full is not None and full.is_file():
+                text = _read_target_text(full)
+                if text is not None:
+                    head = text[:4096]
+                    result = any(
+                        m in head for m in _KERNEL_SOURCE_MARKERS
+                    )
+        return result
+
+    value, _cached = _kernel_file_cache.get_or_compute(
+        cache_key, _compute,
+    )
+    return value
 
 
 def _is_kernel_c(ctx: dict[str, Any]) -> bool:
@@ -769,8 +1049,13 @@ def render_pattern_library() -> str:
     exemplar_lines: list[str] = []
     for strategy in sorted(_STRATEGY_EXEMPLARS):
         for ex in _STRATEGY_EXEMPLARS[strategy]:
+            # Curated module literals today, but the render path
+            # must stay forgery-safe if the table ever gains loaded
+            # entries — and the file's contract is raw-clean under
+            # the envelope audit.
             exemplar_lines.append(
-                f"\n**{ex['cve']}** ({strategy}): {ex['title']}")
+                f"\n**{ex['cve']}** ({strategy}): "
+                f"{neutralize_tag_forgery(ex['title'])}")
             exemplar_lines.append(ex["reasoning"])
     if exemplar_lines:
         parts.append("\n## Strategy exemplars")
@@ -827,10 +1112,17 @@ def format_context_for_prompt(
     here: they change as the run learns and must not churn the cached
     prefix.
     """
+    # Stale-stamp guard: this ctx dict re-enters prompt assembly
+    # (timeout retries, deepen re-reviews, bucket/budget changes) — a
+    # budget event from a previous pass must never survive a pass that
+    # did not elide.  Cleared before ANY early return so a glance-path
+    # or budget-0 re-entry cannot carry a stale stamp forward.
+    ctx.pop("prompt_budget_event", None)
+
     if ctx.get("triage_bucket") == "glance":
         return _format_glance_prompt(ctx)
 
-    from core.llm.prompt_budget import PromptSection, fit_to_budget
+    from core.llm.prompt_budget import PromptSection, fit_to_budget_report
 
     sections: list[PromptSection] = []
 
@@ -842,10 +1134,25 @@ def format_context_for_prompt(
     # cap) at render time; a repo path of `x.c\n## INJECTED` would
     # otherwise forge a peer heading. Bodies render through _fenced so
     # a ``` line inside repo text cannot escape its code fence.
-    safe_file = _defend_identifier(ctx.get("file", ""), max_length=512)
-    safe_function = _defend_identifier(ctx.get("function", ""),
-                                       max_length=256)
-    header_parts = [f"## {safe_file}:{safe_function}"]
+    # Join-then-defend (the callers-section precedent): when multiple
+    # target-derived fragments compose into ONE text run, the defence
+    # runs on the JOINED text — separately-defended halves of a
+    # boundary-tag shape are individually invisible to the neutraliser
+    # and reassemble live across the join. This is load-bearing for
+    # ANY separator, including pure whitespace: the neutraliser's
+    # arms tolerate whitespace inside a tag (`[ name`), so a bare
+    # whitespace join can itself supply the gap two clean halves
+    # need. The same seam exists when the TEMPLATE authors brackets
+    # around a fragment (`[{fragment}]`): a fragment that is a bare
+    # registered tag name carries no hostile character at all —
+    # those sites defend the composed bracketed text (see the
+    # constraints cwe / prior-attempts tier / session-observation
+    # label rows).
+    safe_heading = _defend_identifier(
+        f"{ctx.get('file', '')}:{ctx.get('function', '')}",
+        max_length=768,
+    )
+    header_parts = [f"## {safe_heading}"]
     if ctx.get("metadata"):
         meta = ctx["metadata"]
         if meta.get("signature"):
@@ -857,9 +1164,9 @@ def format_context_for_prompt(
                 f"**Visibility:** "
                 f"{_defend_identifier(meta['visibility'], max_length=64)}")
         if meta.get("attributes"):
-            attrs = ", ".join(
-                _defend_identifier(a, max_length=128)
-                for a in meta["attributes"]
+            attrs = _defend_identifier(
+                ", ".join(str(a) for a in meta["attributes"]),
+                max_length=512,
             )
             header_parts.append(f"**Attributes:** {attrs}")
 
@@ -900,6 +1207,153 @@ def format_context_for_prompt(
         sections.append(PromptSection(
             "role", "\n### Role & reachability\n" + rc["reachability_note"], 1))
 
+    if ctx.get("include_context"):
+        # Hint-tier include topology (PHP): role, includer set, and
+        # the MANDATORY two-component census qualifier. Steering
+        # context only — the block itself says so, and no verdict
+        # path consumes it.
+        ic = ctx["include_context"]
+        ip = ["\n### Include topology (hint-tier)"]
+        includers = ic.get("includers") or []
+        total = ic.get("includer_total", len(includers))
+        if ic.get("role") == "library":
+            guard = "yes" if ic.get("direct_access_guard") else "no"
+            ip.append(
+                f"- File role: library — included by {total} file(s); "
+                f"file-scope direct-access guard: {guard}. (In classic "
+                f"PHP any webroot file is also directly requestable — "
+                f"'library' does not mean unreachable.)")
+        elif ic.get("role") == "designed_entry":
+            ip.append(
+                "- File role: designed entry — no includers found "
+                "in the tree.")
+        for inc in includers[:MAX_INCLUDERS_RENDERED]:
+            ident = _defend_identifier(
+                f"{inc.get('file', '?')}:{inc.get('line', '?')}",
+                max_length=512,
+            )
+            cond = ", conditional" if inc.get("conditional") else ""
+            ip.append(
+                f"- included by `{ident}` "
+                f"({inc.get('keyword', 'include')}, "
+                f"{inc.get('position', 'file_scope')}{cond})")
+        extra = total - min(len(includers), MAX_INCLUDERS_RENDERED)
+        if extra > 0:
+            ip.append(f"- (+{extra} more includers — full set in "
+                      "include-graph.json)")
+        bc = ic.get("bootstrap")
+        if isinstance(bc, dict):
+            for cls in (bc.get("entry_classes") or [])[:3]:
+                if not isinstance(cls, dict):
+                    continue
+                sample = ", ".join(
+                    _defend_identifier(str(e), max_length=200)
+                    for e in (cls.get("entries") or [])[:3])
+                ip.append(
+                    f"- Entry class `{_defend_identifier(str(cls.get('class', '?')), max_length=32)}` "
+                    f"reaches this file "
+                    f"({cls.get('entry_count', 0)} entries, "
+                    f"{'guaranteed' if cls.get('guaranteed') else 'reachability only'}"
+                    f"; e.g. {sample})")
+            prefix = bc.get("guaranteed_prefix") or []
+            if prefix:
+                names = ", ".join(
+                    _defend_identifier(str(r.get("file", "?")),
+                                       max_length=200)
+                    for r in prefix[:10] if isinstance(r, dict))
+                # Elision counts against the producer's TRUE shared
+                # total (the carried list is itself capped) — the
+                # "+N more" must never understate what was cut.
+                total = bc.get("guaranteed_prefix_total")
+                if not (isinstance(total, int)
+                        and not isinstance(total, bool)
+                        and total >= len(prefix)):
+                    total = len(prefix)
+                more = total - min(len(prefix), 10)
+                ip.append(
+                    "- Guaranteed to have executed BEFORE this file "
+                    "on every guaranteed entry path (hint — verify "
+                    f"against source, cite lines): {names}"
+                    + (f" (+{more} more)" if more > 0 else ""))
+            if bc.get("note"):
+                ip.append("- Note: " + _defend_identifier(
+                    str(bc["note"]), max_length=300))
+        census_q = str(ic.get("qualifier", ""))
+        if isinstance(bc, dict) and bc.get("qualifier"):
+            # The bootstrap qualifier is the graph-level qualifier
+            # plus the walk's own honesty (the "environment walk was
+            # TRUNCATED for N entries" sentence) — when gate lines
+            # render above, the census line must carry it too, or a
+            # budget-starved walk reads as a complete class partition.
+            census_q = str(bc["qualifier"])
+        ip.append("- Census: " + _defend_identifier(
+            census_q, max_length=600))
+        sections.append(PromptSection("include_context",
+                                      "\n".join(ip), 1))
+
+    if ctx.get("gadget_context"):
+        # Hint-tier PHP gadget surface: chains the oracle found (or
+        # census-qualified absence) plus this file's unserialize
+        # sites. Steering context only — the block itself says so,
+        # and no verdict path consumes it.
+        gc = ctx["gadget_context"]
+        gp = ["\n### PHP gadget surface (hint-tier)"]
+
+        def _render_chain(c: dict) -> str:
+            steps = c.get("steps") or []
+            hop = (" via " + _defend_identifier(
+                "::".join(steps), max_length=200)) if steps else ""
+            req = c.get("trigger_requires")
+            req_s = (f"; requires: {_defend_identifier(str(req), max_length=200)}"
+                     if req else "")
+            return (
+                f"- `{_defend_identifier(str(c.get('class', '?')), max_length=256)}"
+                f"::{_defend_identifier(str(c.get('magic_method', '?')), max_length=64)}`"
+                f"{hop} -> {_defend_identifier(str(c.get('sink_category', '?')), max_length=32)}"
+                f":`{_defend_identifier(str(c.get('sink_callee', '?')), max_length=128)}`"
+                f" via property `{_defend_identifier(str(c.get('property_path', '?')), max_length=120)}`"
+                f" ({_defend_identifier(str(c.get('file', '?')), max_length=512)}"
+                f":{c.get('sink_line', '?')};"
+                f" availability: {_defend_identifier(str(c.get('availability', '?')), max_length=64)}"
+                f"{req_s}) — hint, verify against source, cite lines")
+
+        in_file = gc.get("chains_in_file") or []
+        elsewhere = gc.get("chains_elsewhere") or []
+        total = gc.get("chains_total", 0)
+        if in_file:
+            gp.append(f"- Gadget chain(s) rooted in THIS file "
+                      f"({len(in_file)} shown of {total} in tree):")
+            gp.extend(_render_chain(c) for c in in_file)
+        elif elsewhere:
+            gp.append(f"- Gadget chain(s) elsewhere in the tree "
+                      f"({len(elsewhere)} shown of {total}):")
+            gp.extend(_render_chain(c) for c in elsewhere)
+        elif total == 0:
+            gp.append(
+                "- No magic-method gadget chains found by the oracle "
+                "(see the census line — absence is evidence only "
+                "modulo the census and the stated flow depth, never "
+                "a verdict).")
+        for site in (gc.get("unserialize_sites_in_file") or [])[:5]:
+            rd = (" — argument text references request data"
+                  if site.get("request_derived") else "")
+            gp.append(
+                f"- unserialize() site in this file at line "
+                f"{site.get('line', '?')}{rd}: "
+                f"`{_defend_identifier(str(site.get('excerpt', '')), max_length=200)}`")
+        gp.append("- Census: " + _defend_identifier(
+            str(gc.get("qualifier", "")), max_length=600))
+        sections.append(PromptSection("gadget_context",
+                                      "\n".join(gp), 1))
+
+    if ctx.get("threat_model"):
+        # Operator-authored project threat model (assemble_context
+        # loads the prompt block; it was computed for every review
+        # but never rendered).
+        sections.append(PromptSection(
+            "threat_model", "\n" + str(ctx["threat_model"]), 1,
+        ))
+
     if ctx.get("edge_contracts"):
         ec = [
             "\n### Edge contracts to verdict",
@@ -910,12 +1364,22 @@ def format_context_for_prompt(
              "assumes about its inputs. Return one edge_verdicts "
              "entry per edge (clean / suspicious / finding)."),
         ]
+        # Edge records are propagation-derived (callee names and files
+        # from the target's call graph, contracts from earlier LLM
+        # reviews) — render through the identifier defence like every
+        # sibling section; call_line is a number or it is nothing.
         for e in ctx["edge_contracts"][:20]:
-            line = e.get("call_line", "?")
-            row = (f"- `{e.get('callee')}` "
-                   f"({e.get('callee_file')}) called at line {line}")
+            line = _defend_line(e.get("call_line", "?"))
+            callee = _defend_identifier(str(e.get("callee")),
+                                        max_length=256)
+            callee_file = _defend_identifier(str(e.get("callee_file")),
+                                             max_length=512)
+            row = (f"- `{callee}` "
+                   f"({callee_file}) called at line {line}")
             if e.get("contract"):
-                row += f"\n  contract: {e['contract']}"
+                contract = _defend_identifier(str(e["contract"]),
+                                              max_length=300)
+                row += f"\n  contract: {contract}"
             ec.append(row)
         extra = len(ctx["edge_contracts"]) - 20
         if extra > 0:
@@ -938,8 +1402,8 @@ def format_context_for_prompt(
         caller_contract_digest and caller_contract_digest.get("sites")
     ):
         cp = ["\n### Callers (1-hop)"]
-        for c in ctx["callers"][:10]:
-            line = c.get('line_start', '?')
+        for c in ctx["callers"][:MAX_CALL_SITE_CALLERS]:
+            line = _defend_line(c.get('line_start', '?'))
             ident = _defend_identifier(
                 f"{c.get('file', '?')}:{c.get('name', '?')}",
                 max_length=512,
@@ -951,8 +1415,8 @@ def format_context_for_prompt(
 
     if ctx.get("callees"):
         cp = ["\n### Callees (1-hop)"]
-        for c in ctx["callees"][:10]:
-            line = c.get('line_start', '?')
+        for c in ctx["callees"][:MAX_PROMPT_CALLEES]:
+            line = _defend_line(c.get('line_start', '?'))
             ident = _defend_identifier(
                 f"{c.get('file', '?')}:{c.get('name', '?')}",
                 max_length=512,
@@ -1001,6 +1465,17 @@ def format_context_for_prompt(
             spec_priority = 0 if has_mechanical else 1
             sections.append(PromptSection("inferred_spec", "\n" + spec_text, spec_priority))
 
+    if ctx.get("spec_infer_request"):
+        # Folded spec inference: the contract-inference task rides the
+        # review call for functions whose mechanical spec lacks intent
+        # (the response's inferred_spec field carries the result).
+        from .spec_inference import format_spec_infer_instruction
+        sections.append(PromptSection(
+            "spec_infer",
+            "\n" + format_spec_infer_instruction(ctx.get("inferred_spec")),
+            1,
+        ))
+
     if ctx.get("precondition_verifications"):
         from .spec_inference import format_precondition_verification
         pv_text = format_precondition_verification(ctx["precondition_verifications"])
@@ -1018,6 +1493,13 @@ def format_context_for_prompt(
 
     if ctx.get("clean_check"):
         sections.append(PromptSection("clean_check", "\n" + ctx["clean_check"], 0))
+
+    if ctx.get("flow_preview"):
+        # Clean-check pre-run: the rescue sweep's flows surfaced in the
+        # FIRST review prompt (see orchestrator._clean_check_flows).
+        sections.append(
+            PromptSection("flow_preview", "\n" + ctx["flow_preview"], 0)
+        )
 
     if ctx.get("negative_space"):
         from .negative_space import format_negative_space_prose
@@ -1105,6 +1587,181 @@ def format_context_for_prompt(
             "mechanical_detector_findings", "\n".join(lines_mdf), 1,
         ))
 
+    # ── Mechanical gate + enrichment annotations ─────────────────────
+    # Producer↔renderer closure: every ctx enrichment key the
+    # orchestrator computes must have a section here (or a documented
+    # non-prompt consumer) — 15 paid enrichments once had no renderer
+    # at all. Two-direction oracle: test_context_key_closure.py.
+    if ctx.get("entry_point_provenance"):
+        # Pre-formatted by format_provenance_for_context (fields go
+        # through defend_prompt_field there) — instruction-position
+        # trusted structure.
+        sections.append(PromptSection(
+            "entry_point_provenance",
+            "\n### Input provenance (mechanical)\n"
+            + str(ctx["entry_point_provenance"]),
+            1,
+        ))
+
+    if ctx.get("is_security_decision"):
+        sections.append(PromptSection(
+            "is_security_decision",
+            "\n### Security-decision point\nThis function IS a "
+            "security decision point (auth / crypto / access-control "
+            "naming). A correctness bug here has SECURITY impact — do "
+            "not dismiss as non-security.",
+            1,
+        ))
+
+    if ctx.get("feeds_security_decision"):
+        from .mechanical_gates import format_security_decision_for_context
+        sd_text = format_security_decision_for_context(True)
+        if sd_text:
+            sections.append(PromptSection(
+                "feeds_security_decision", "\n" + sd_text, 1,
+            ))
+
+    if ctx.get("constant_dangerous_calls"):
+        from .mechanical_gates import format_constant_dangerous_calls
+        cdc_text = format_constant_dangerous_calls(
+            ctx["constant_dangerous_calls"],
+        )
+        if cdc_text:
+            sections.append(PromptSection(
+                "constant_dangerous_calls", "\n" + cdc_text, 2,
+            ))
+
+    if ctx.get("type_constraints"):
+        from .mechanical_gates import format_type_constraints
+        tc_text = format_type_constraints(ctx["type_constraints"])
+        if tc_text:
+            sections.append(PromptSection(
+                "type_constraints", "\n" + tc_text, 2,
+            ))
+
+    if ctx.get("universal_preconditions"):
+        from .mechanical_gates import format_universal_preconditions
+        up_text = format_universal_preconditions(
+            ctx["universal_preconditions"],
+        )
+        if up_text:
+            sections.append(PromptSection(
+                "universal_preconditions", "\n" + up_text, 2,
+            ))
+
+    if ctx.get("interprocedural_guards"):
+        ipg = ctx["interprocedural_guards"]
+        total = ipg.get("total_callers", 0)
+        unguarded = ipg.get("unguarded_callers", 0)
+        guarded = ipg.get("guarded_callers", 0)
+        ipg_lines = [
+            "\n### Interprocedural guards (Joern CPG)",
+            f"- {guarded} of {total} callers guard this call site; "
+            f"{unguarded} do NOT — an unguarded caller reaches this "
+            f"function without the precondition a guarded caller "
+            f"establishes.",
+        ]
+        for cg in (ipg.get("caller_guards") or [])[:5]:
+            ipg_lines.append(
+                f"  - guarded by "
+                f"`{_defend_identifier(str(cg.get('caller_function', '?')), max_length=200)}` "
+                f"(line {_defend_line(cg.get('caller_line', 0))}): "
+                f"{_defend_identifier(str(cg.get('guard_text', ''))[:120], max_length=160)}"
+            )
+        sections.append(PromptSection(
+            "interprocedural_guards", "\n".join(ipg_lines), 1,
+        ))
+
+    if ctx.get("smt_pre_evidence"):
+        sections.append(PromptSection(
+            "smt_pre_evidence",
+            "\n### SMT pre-pass evidence\n- "
+            + _defend_identifier(str(ctx["smt_pre_evidence"]),
+                                 max_length=300),
+            1,
+        ))
+
+    if ctx.get("postcondition_violations"):
+        from .postcondition_verify import format_postcondition_context
+        pv_text = format_postcondition_context(
+            [], ctx["postcondition_violations"],
+        )
+        if pv_text:
+            sections.append(PromptSection(
+                "postcondition_violations", "\n" + pv_text, 1,
+            ))
+
+    # fused_evidence renders ONCE, below, at trusted position: the
+    # block is orchestrator-authored (_store_fused_evidence renders
+    # and defends it through the defend_repo_text chokepoint before
+    # storing), and its shed priority follows the fusion module's own
+    # injection-priority contract.  A second, untrusted-enveloped
+    # rendering here duplicated the same bytes with contradictory
+    # trust framing and shed independently under budget pressure.
+
+    if ctx.get("capability_displacement"):
+        sections.append(PromptSection(
+            "capability_displacement",
+            "\n### Capability displacement\n"
+            + wrap_untrusted(
+                str(ctx["capability_displacement"]),
+                kind="capability-displacement",
+                origin="audit-dispatch-table",
+            ),
+            2,
+        ))
+
+    if ctx.get("co_accessor_analysis"):
+        sections.append(PromptSection(
+            "co_accessor_analysis",
+            "\n### Co-accessor analysis\n"
+            + wrap_untrusted(
+                str(ctx["co_accessor_analysis"]),
+                kind="co-accessor-analysis",
+                origin="audit-struct-accessor-index",
+            ),
+            2,
+        ))
+
+    if ctx.get("intra_function_analysis"):
+        sections.append(PromptSection(
+            "intra_function_analysis",
+            "\n### Intra-function sibling analysis\n"
+            + wrap_untrusted(
+                str(ctx["intra_function_analysis"]),
+                kind="intra-function-analysis",
+                origin="audit-intra-function",
+            ),
+            2,
+        ))
+
+    if ctx.get("live_sinks"):
+        ls_lines = [
+            "\n### Live sinks (dynamic classification)",
+            ("These sinks were classified LIVE for this run — this "
+             "re-review runs at DEEP_DIVE depth because the function "
+             "can reach one of them:"),
+        ]
+        ls_lines.extend(
+            f"- {_defend_identifier(str(s), max_length=200)}"
+            for s in ctx["live_sinks"][:15]
+        )
+        sections.append(PromptSection(
+            "live_sinks", "\n".join(ls_lines), 1,
+        ))
+
+    if ctx.get("exploit_feedback"):
+        sections.append(PromptSection(
+            "exploit_feedback",
+            "\n"
+            + wrap_untrusted(
+                str(ctx["exploit_feedback"]),
+                kind="exploit-feedback",
+                origin="audit-exploit-feedback",
+            ),
+            3,
+        ))
+
     if ctx.get("consistency_leads"):
         leads = ctx["consistency_leads"][:CONSISTENCY_LEADS_PROMPT_CAP]
         # Callee names, descriptions and peer-site snippets are
@@ -1140,6 +1797,42 @@ def format_context_for_prompt(
         )
         sections.append(PromptSection(
             "consistency_leads", "\n".join(lines_cl), 1,
+        ))
+
+    if ctx.get("uniform_absence"):
+        ua_records = ctx["uniform_absence"][:UNIFORM_ABSENCE_PROMPT_CAP]
+        # Group ids and descriptions are target-derived (family keys
+        # quote struct/route names) — envelope like every other
+        # untrusted section.
+        body_ua = []
+        for rec in ua_records:
+            prop = str(rec.get("property", "?"))
+            gid = str(rec.get("group_id", ""))
+            n = rec.get("n")
+            body_ua.append(
+                f"- `{prop}` absent in all {n} members of {gid}"
+            )
+            body_ua.extend(
+                f"  member: {m.get('file', '')}:"
+                f"{m.get('function', '')}"
+                for m in (rec.get("members") or [])[:3]
+            )
+        lines_ua = [
+            "\n### Uniformly-absent family properties (hint only)",
+            wrap_untrusted(
+                "\n".join(body_ua),
+                kind="uniform-absence",
+                origin="audit-uniform-absence",
+            ),
+            "\nEvery member of this mechanically-certain family lacks "
+            "the property — there is no deviant to flag, and a "
+            "syntactic scan proves nothing by itself. Treat as review "
+            "context only: check whether the protection lives at a "
+            "shared chokepoint before assuming the family is weak. "
+            "Never classify on this record alone.",
+        ]
+        sections.append(PromptSection(
+            "uniform_absence", "\n".join(lines_ua), 1,
         ))
 
     if ctx.get("fail_open_leads"):
@@ -1285,19 +1978,32 @@ def format_context_for_prompt(
             "related functions. Check whether this function satisfies or "
             "violates them."),
         ]
+        # Constraint records are propagated from earlier LLM reviews
+        # of target functions — every rendered field goes through the
+        # identifier defence like the sibling sections.
         for ac in ctx["active_constraints"]:
-            src = ac.get("source", "?")
-            kind = ac.get("kind", "?")
-            target = ac.get("target", "?")
-            rule = ac.get("rule", "?")
-            violation = ac.get("violation", "")
-            cwe = ac.get("cwe", "")
-            status = ac.get("status", "open")
+            src = _defend_identifier(ac.get("source", "?"),
+                                     max_length=256)
+            kind = _defend_identifier(ac.get("kind", "?"), max_length=64)
+            target = _defend_identifier(ac.get("target", "?"),
+                                        max_length=256)
+            rule = _defend_identifier(ac.get("rule", "?"), max_length=300)
+            violation = _defend_identifier(ac.get("violation", ""),
+                                           max_length=300)
+            cwe = str(ac.get("cwe", "") or "")
+            status = _defend_identifier(ac.get("status", "open"),
+                                        max_length=32)
             line = f"- **{kind}** `{target}`: {rule}"
             if violation:
                 line += f" (violation: {violation})"
             if cwe:
-                line += f" [{cwe}]"
+                # Compose-then-defend: this template authors the
+                # brackets, so a fragment that IS a registered
+                # boundary-tag name would reassemble a live tag with
+                # zero hostile characters of its own — the defence
+                # must see the composed [cwe].
+                line += " " + _defend_identifier(f"[{cwe}]",
+                                                 max_length=48)
             line += f" — from {src}, status: {status}"
             cp.append(line)
         sections.append(PromptSection("constraints", "\n".join(cp), 1))
@@ -1324,11 +2030,28 @@ def format_context_for_prompt(
 
     if ctx.get("prior_attempts", {}).get("exemplars"):
         pp = ["\n### Prior attempts"]
+        # Exemplars are journal-derived (earlier LLM output over the
+        # target): full identifier defence, not bare tag
+        # neutralisation — the summary's newlines stayed live and the
+        # evidence field rendered raw.
         for ex in ctx["prior_attempts"]["exemplars"]:
-            tier_label = f" [{ex['tier']}]" if ex.get("tier") else ""
-            pp.append(f"- {ex['cwe']}{tier_label}: {ex.get('summary', '')}")
+            tier = str(ex.get("tier", "") or "")
+            # Compose-then-defend: the brackets are template-authored,
+            # so tier values spelling the boundary-tag vocabulary
+            # (an opener/closer PAIR across two exemplars) would
+            # reassemble live tags — defend the composed [tier].
+            tier_label = (
+                " " + _defend_identifier(f"[{tier}]", max_length=48)
+                if tier else ""
+            )
+            cwe = _defend_identifier(ex.get("cwe", "?"), max_length=32)
+            summary = _defend_identifier(ex.get("summary", ""),
+                                         max_length=400)
+            pp.append(f"- {cwe}{tier_label}: {summary}")
             if ex.get("evidence"):
-                pp.append(f"  Evidence: {ex['evidence']}")
+                evidence = _defend_identifier(ex["evidence"],
+                                              max_length=400)
+                pp.append(f"  Evidence: {evidence}")
         sections.append(PromptSection("prior_attempts", "\n".join(pp), 3))
 
     if ctx.get("prior_attempts", {}).get("failure_summary"):
@@ -1363,9 +2086,53 @@ def format_context_for_prompt(
     if ctx.get("strategy_exemplars") and not patterns_in_system:
         ep = ["\n### Strategy exemplars"]
         for ex in ctx["strategy_exemplars"]:
-            ep.append(f"\n**{ex['cve']}** ({ex['strategy']}): {ex['title']}")
+            ep.append(
+                f"\n**{ex['cve']}** ({ex['strategy']}): "
+                f"{neutralize_tag_forgery(ex['title'])}")
             ep.append(ex["reasoning"])
         sections.append(PromptSection("strategy_exemplars", "\n".join(ep), 3))
+
+    if ctx.get("flow_hops"):
+        # Whole-flow review context (orchestrator flow pass): every
+        # hop was reviewed clean individually — the prompt must show
+        # the composed chain it is being asked to judge (the pass
+        # once sent only the source, its distinguishing context
+        # unrendered).
+        fh = ["\n### Flow under review"]
+        tid = ctx.get("trace_id")
+        if tid:
+            fh.append(
+                f"Trace `{_defend_identifier(str(tid), max_length=120)}`: "
+                "every hop below was reviewed clean individually — judge "
+                "the COMPOSED source→sink flow."
+            )
+        for hop in ctx["flow_hops"][:12]:
+            ident = _defend_identifier(
+                f"{hop.get('file', '?')}:{hop.get('name', '?')}",
+                max_length=300,
+            )
+            row = f"- `{ident}` (line {_defend_line(hop.get('line', 0))})"
+            # Join-then-defend: this list renders as one bare-joined
+            # text run (no per-item wrapping), so the defence must see
+            # the joined text — see the heading-composition note above.
+            tainted = _defend_identifier(
+                ", ".join(
+                    str(v) for v in (hop.get("tainted_vars") or [])[:5]
+                ),
+                max_length=400,
+            )
+            if tainted:
+                row += f" — tainted: {tainted}"
+            control = hop.get("attacker_control")
+            if control:
+                row += (
+                    f" — control: "
+                    f"{_defend_identifier(str(control), max_length=160)}"
+                )
+            if hop.get("has_evidence"):
+                row += " [mechanical evidence]"
+            fh.append(row)
+        sections.append(PromptSection("flow_hops", "\n".join(fh), 1))
 
     if ctx.get("flow_traces"):
         is_auto = all(t.get("auto_trace") for t in ctx["flow_traces"])
@@ -1392,7 +2159,7 @@ def format_context_for_prompt(
             source = trace.get("source", {})
             sink = trace.get("sink", {})
             pos = trace.get("position")
-            total = trace.get("total_hops", "?")
+            total = _defend_line(trace.get("total_hops", "?"))
             role = _defend_identifier(trace.get("role", "intermediate"),
                                       max_length=32)
 
@@ -1434,7 +2201,7 @@ def format_context_for_prompt(
                 )
                 fp.append(
                     f"  Upstream: `{up_ident}` "
-                    f"(line {upstream.get('line', '?')})"
+                    f"(line {_defend_line(upstream.get('line', '?'))})"
                 )
                 if up_vars:
                     fp.append(f"    Tainted vars passed to you: {up_vars}")
@@ -1471,7 +2238,7 @@ def format_context_for_prompt(
                 )
                 fp.append(
                     f"  Downstream: `{dn_ident}` "
-                    f"(line {downstream.get('line', '?')})"
+                    f"(line {_defend_line(downstream.get('line', '?'))})"
                 )
                 if dn_vars:
                     fp.append(f"    Receives tainted: {dn_vars}")
@@ -1554,6 +2321,10 @@ def format_context_for_prompt(
     if ctx.get("domain_model"):
         sections.append(PromptSection("domain_model", "\n" + ctx["domain_model"], 1))
 
+    if ctx.get("token_enforcement"):
+        sections.append(PromptSection(
+            "token_enforcement", "\n" + ctx["token_enforcement"], 1))
+
     if ctx.get("fp_warnings"):
         sections.append(PromptSection("fp_warnings",
             f"\n### Previous false positives\n{ctx['fp_warnings']}", 3))
@@ -1565,6 +2336,17 @@ def format_context_for_prompt(
     if ctx.get("block_analysis"):
         sections.append(PromptSection(
             "block_analysis", ctx["block_analysis"], 0))
+
+    if ctx.get("fused_evidence"):
+        # Rendered + defended at the producer
+        # (orchestrator._store_fused_evidence — defend_repo_text
+        # chokepoint); previously the key was written and never
+        # consumed, so the fused pre-review evidence never reached
+        # the reviewer. Shed priority comes from the fusion module's
+        # own injection-priority contract (strongest item wins).
+        sections.append(PromptSection(
+            "fused_evidence", "\n" + ctx["fused_evidence"],
+            ctx.get("fused_evidence_priority", 1)))
 
     if ctx.get("project_context"):
         # Cross-run learnings are LLM-authored text persisted in the
@@ -1602,8 +2384,14 @@ def format_context_for_prompt(
                 for o in injected
                 if _obs_directory(o.get("source", "")) == current_dir
             })
+            # current_dir is a repo-derived path fragment — rendered
+            # into a trusted heading, so it goes through the
+            # identifier defence like every sibling section's
+            # identifiers (a newline-bearing directory name would
+            # forge a peer heading).
             obs_parts.append(
-                f"\n### Subsystem patterns for {current_dir}/ "
+                f"\n### Subsystem patterns for "
+                f"{_defend_identifier(current_dir, max_length=512)}/ "
                 f"(from {total_in_dir} functions reviewed)"
             )
             obs_parts.extend(f"- {pat}" for pat in patterns)
@@ -1623,17 +2411,36 @@ def format_context_for_prompt(
             "before inheriting the callee's verdict."
         )
         for obs in injected:
-            source = obs.get("source", "?")
+            # The observation label is `file:function` — repo-derived
+            # (Linux filenames may contain newlines), so it renders
+            # through the identifier defence; a hostile name would
+            # otherwise forge a trusted-shaped line for every LATER
+            # review in the run. The text half is defended at the
+            # producer (_sanitise_observation).
+            # Compose-then-defend (this is the most directly
+            # reachable of the bracket-template sites: the label is a
+            # repo-derived file:function name): the template authors
+            # the brackets, so a name that IS a registered
+            # boundary-tag name reassembles a live tag unless the
+            # defence sees the composed [source].
+            source_label = _defend_identifier(
+                f"[{obs.get('source', '?')}]", max_length=514,
+            )
             text = obs.get("text", "")
-            obs_parts.append(f"- [{source}] {text}")
+            obs_parts.append(f"- {source_label} {text}")
         sections.append(PromptSection(
             "session_observations", "\n".join(obs_parts), 4))
 
     if ctx.get("fuzz_coverage"):
         fc = ctx["fuzz_coverage"]
         fp = ["\n### Fuzz coverage (does NOT replace review)"]
-        harness = fc.get("harness", "unknown")
-        iters = fc.get("iterations", "?")
+        # Run-artifact-derived fields rendered into trusted prose /
+        # backticks — same identifier defence as sibling sections.
+        harness = _defend_identifier(
+            fc.get("harness", "unknown"), max_length=256,
+        )
+        iters = _defend_identifier(fc.get("iterations", "?"),
+                                   max_length=64)
         fp.append(
             f"This function was exercised by fuzzer harness `{harness}` "
             f"({iters} iterations). Fuzz coverage means the function "
@@ -1642,9 +2449,15 @@ def format_context_for_prompt(
             f"input handling has been stress-tested."
         )
         if fc.get("crashes"):
-            fp.append(f"**Crashes found:** {fc['crashes']}")
+            fp.append(
+                f"**Crashes found:** "
+                f"{_defend_identifier(fc['crashes'], max_length=64)}"
+            )
         if fc.get("corpus_size"):
-            fp.append(f"**Corpus size:** {fc['corpus_size']}")
+            fp.append(
+                f"**Corpus size:** "
+                f"{_defend_identifier(fc['corpus_size'], max_length=64)}"
+            )
         sections.append(PromptSection("fuzz_coverage", "\n".join(fp), 0))
 
     if ctx.get("type_definitions"):
@@ -1754,12 +2567,19 @@ def format_context_for_prompt(
             "inherit a verdict, and still review the whole function, "
             "not just the claimed line."
         )
+        # The head line renders OUTSIDE the untrusted envelope the
+        # body gets — its store-derived fields (an earlier run's LLM
+        # verdict/cwe/model strings) take the identifier defence.
         for pa in ctx["prior_finding_analyses"]:
-            head = f"- Prior claim: **{pa.get('verdict') or 'unknown'}**"
+            verdict = _defend_identifier(pa.get("verdict") or "unknown",
+                                         max_length=64)
+            head = f"- Prior claim: **{verdict}**"
             if pa.get("cwe"):
-                head += f" ({pa['cwe']})"
+                cwe = _defend_identifier(pa["cwe"], max_length=32)
+                head += f" ({cwe})"
             if pa.get("model"):
-                head += f" by {pa['model']}"
+                model = _defend_identifier(pa["model"], max_length=64)
+                head += f" by {model}"
             pfa.append(head)
             # Bodies are excerpted at collection time
             # (prior_claim_excerpt_chars) — one bound, every consumer.
@@ -1774,12 +2594,59 @@ def format_context_for_prompt(
             PromptSection("prior_finding_analyses", "\n".join(pfa), 4),
         )
 
+    if ctx.get("sage_fp_priors"):
+        # FP primers from cross-run memory: a prior pipeline stage
+        # adjudicated a scanner finding located in this function as
+        # false_positive / not_exploitable (MAC-verified, source
+        # window unchanged). HINT TIER by design: the review still
+        # runs and the verdict is the reviewer's own — a
+        # finding-scoped adjudication (one rule at one site) says
+        # nothing about bug classes it never examined, so it must
+        # never skip or pre-decide a FUNCTION-grade review. Rule ids
+        # originate in scanner configs, so they are single-line
+        # clamped before joining the prompt.
+        fpp = ["\n### Prior finding adjudications (hints, not verdicts)"]
+        fpp.append(
+            "Cross-run memory records prior adjudications of "
+            "individual scanner findings located in this function "
+            "(source unchanged since). Each covers ONE rule at ONE "
+            "site — verify independently, never inherit a verdict, "
+            "and still review the whole function."
+        )
+        for pr in ctx["sage_fp_priors"]:
+            rule = " ".join(
+                str(pr.get("rule") or "a prior finding").split(),
+            )[:120]
+            if str(pr.get("verdict") or "") == "not_exploitable":
+                fpp.append(
+                    f"- {rule}: previously adjudicated not_exploitable "
+                    "— a REAL defect judged unexploitable in that "
+                    "run's context (dormant-leaning, never clean on "
+                    "this hint alone). If you confirm the defect, "
+                    "re-judge exploitability against THIS review's "
+                    "evidence."
+                )
+            else:
+                fpp.append(
+                    f"- {rule}: previously adjudicated false_positive "
+                    "for that one finding."
+                )
+        sections.append(
+            PromptSection("sage_fp_priors", "\n".join(fpp), 4),
+        )
+
     injected_hyp_text = _format_injected_hypotheses(
         ctx.get("injected_hypotheses"),
     )
     if injected_hyp_text:
         sections.append(
             PromptSection("injected_hypotheses", injected_hyp_text, 1),
+        )
+
+    seed_hyp_text = _format_seed_hypotheses(ctx.get("seed_hypotheses"))
+    if seed_hyp_text:
+        sections.append(
+            PromptSection("seed_hypotheses", seed_hyp_text, 1),
         )
 
     if ctx.get("disagreement_override"):
@@ -1930,7 +2797,12 @@ def format_context_for_prompt(
 
     # ── Budget gate ─────────────────────────────────────────────────
     if budget_limit > 0:
-        kept, shed = fit_to_budget(sections, budget_limit)
+        # (stale-stamp guard runs at function top, before any early
+        # return — see the top of format_context_for_prompt)
+        report = fit_to_budget_report(
+            sections, budget_limit, elide_priority0=True,
+        )
+        kept, shed = report.kept, report.shed
         if shed:
             labels = [s.label for s in shed]
             logger.debug(
@@ -1938,6 +2810,28 @@ def format_context_for_prompt(
                 len(shed), ctx.get("file", "?"), ctx.get("function", "?"),
                 ", ".join(labels),
             )
+        if report.elisions or report.overshoot_tokens:
+            # One operator-visible line per affected row: without it
+            # the overshoot is invisible in run accounting — the send
+            # either burns a provider context-length failure (retry +
+            # spend) or the provider silently truncates exactly the
+            # evidence tail the review needs.
+            tokens_elided = sum(e.tokens_elided for e in report.elisions)
+            logger.warning(
+                "prompt_budget: %s:%s — elided %d tokens from %d "
+                "priority-0 section(s), %d tokens still over budget",
+                ctx.get("file", "?"), ctx.get("function", "?"),
+                tokens_elided, len(report.elisions),
+                report.overshoot_tokens,
+            )
+            ctx["prompt_budget_event"] = {
+                "tokens_elided": tokens_elided,
+                "overshoot_tokens": report.overshoot_tokens,
+                "elisions": [
+                    {"label": e.label, "tokens_elided": e.tokens_elided}
+                    for e in report.elisions
+                ],
+            }
         return "\n".join(s.text for s in kept)
 
     return "\n".join(s.text for s in sections)
@@ -1996,7 +2890,14 @@ def _format_study_answers(study_answers: list[dict]) -> str:
             r"[^a-z0-9_-]", "", str(a.get("status", "")).lower(),
         )[:20]
         receipt = a.get("receipt") or {}
-        label = f"[{tier or 'unverified'}]"
+        # The alphabet filter above is not sufficient here: the
+        # boundary-tag vocabulary itself fits [a-z0-9_-] (and the
+        # neutraliser matches it case-insensitively), so a tier that
+        # IS a registered name passes the filter whole and this
+        # template's own brackets complete the tag. Compose, then
+        # defend the composed [tier].
+        label = _defend_identifier(f"[{tier or 'unverified'}]",
+                                   max_length=48)
         if tier not in _ACTIONABLE_STUDY_TIERS:
             label += " UNVERIFIED HINT"
         elif status == "inconclusive":
@@ -2124,6 +3025,84 @@ def _format_injected_hypotheses(injected: Any) -> str:
     return "\n".join(lines)
 
 
+# Render caps for the external-seed block. The intake already stamps
+# at most MAX_SEEDS_PER_FUNCTION escaped, length-capped seeds per gap
+# (core.audit.hypothesis_intake); these re-caps are defence in depth
+# at the render boundary — a stamped gap dict is still mutable
+# in-process, and this renderer must hold its own bounds like every
+# sibling injector does.
+_MAX_SEED_HYPOTHESES = 8
+_MAX_SEED_TEXT_CHARS = 300
+_MAX_SEED_REF_CHARS = 200
+_MAX_SEED_REFS = 4
+
+
+def _format_seed_hypotheses(seeds: Any) -> str:
+    """Render external hypothesis seeds as a hint-tier enveloped block.
+
+    Seeds arrive from ``sibling-hypotheses.json`` via
+    ``core.audit.hypothesis_intake`` — claim text and disproof
+    recipes are ``derived_from_target`` (typically extracted from a
+    hostile binary's artifacts), so the whole seed body goes through
+    ``wrap_untrusted`` (nonce envelope + autofetch strip +
+    tag-forgery neutralisation), exactly like the mechanical-evidence
+    section; only the trusted framing lives outside the envelope.
+    Hints, never verdicts: the framing directs the reviewer to
+    validate or refute each claim — a seed can never resolve the
+    function by itself.
+    """
+    if not seeds:
+        return ""
+    entries = [
+        s for s in seeds
+        if isinstance(s, dict) and (s.get("claim") or "").strip()
+    ]
+    if not entries:
+        return ""
+
+    body: list[str] = []
+    for s in entries[:_MAX_SEED_HYPOTHESES]:
+        tier = _SOURCE_SAFE_RE.sub(
+            "", str(s.get("tier", "") or "").lower(),
+        )[:32] or "ungraded"
+        line = f"- [{tier}] {str(s.get('claim', '')).strip()[:_MAX_SEED_TEXT_CHARS]}"
+        source = str(s.get("source", "") or "")[:_MAX_SEED_REF_CHARS]
+        if source:
+            line += f" [seed source: {source}]"
+        body.append(line)
+        disproof = str(s.get("disproof", "") or "").strip()
+        if disproof:
+            body.append(f"  disproof recipe: {disproof[:_MAX_SEED_TEXT_CHARS]}")
+        for ref in (s.get("evidence") or [])[:_MAX_SEED_REFS]:
+            if not isinstance(ref, dict):
+                continue
+            artifact = str(ref.get("artifact", "") or "")[:_MAX_SEED_REF_CHARS]
+            pointer = str(ref.get("pointer", "") or "")[:_MAX_SEED_REF_CHARS]
+            if artifact or pointer:
+                body.append(
+                    f"  evidence: {artifact}"
+                    + (f" ({pointer})" if pointer else ""),
+                )
+
+    lines = [
+        "\n### External hypothesis seeds (hints, not verdicts)",
+        ("An external analysis supplied hypothesis seeds for THIS "
+         "function. They are hint-tier claims derived from "
+         "target-influenced artifacts — investigate each one "
+         "concretely against the code: confirm it with line "
+         "references and tool evidence, or refute it (the disproof "
+         "recipe, where given, is the suggested refutation path). "
+         "Never inherit a seed as a verdict, and do not dismiss one "
+         "without stating what evidence rules it out."),
+        wrap_untrusted(
+            "\n".join(body),
+            kind="hypothesis-seeds",
+            origin="audit-seed-intake",
+        ),
+    ]
+    return "\n".join(lines)
+
+
 def _format_glance_prompt(ctx: dict[str, Any]) -> str:
     """Minimal prompt for GLANCE-bucket functions.
 
@@ -2144,9 +3123,16 @@ def _format_glance_prompt(ctx: dict[str, Any]) -> str:
             "vulnerability (memory safety, injection, auth bypass, "
             "information disclosure, logic flaw)? Answer in one sentence."
         )
+    # Join-then-defend: file and function compose one heading —
+    # defending the halves separately lets a boundary-tag shape split
+    # across them reassemble live (see the main prompt's
+    # heading-composition note).
+    safe_heading = _defend_identifier(
+        f"{ctx.get('file', '')}:{ctx.get('function', '')}",
+        max_length=768,
+    )
     parts = [
-        f"## {_defend_identifier(ctx.get('file', ''), max_length=512)}:"
-        f"{_defend_identifier(ctx.get('function', ''), max_length=256)}",
+        f"## {safe_heading}",
         _source_heading(ctx),
         _fenced(ctx.get("source", "(not available)")),
     ]
@@ -2206,14 +3192,46 @@ def _read_source(
     text = _read_target_text(full_path)
     if text is None:
         return "(read error)"
-    lines = text.splitlines()
+    lines = split_lines(text)  # \n model: line ranges come from inventory/SARIF
 
     start = max(0, line_start - 1)
-    end = line_end if line_end is not None else min(start + 50, len(lines))
+    # The shared window rule IS the read/hash coupling: the prompt
+    # and every source-hash site must cover the same lines (see
+    # fallback_span_end).
+    end = min(fallback_span_end(line_start, line_end), len(lines))
     return "\n".join(
         f"{i + 1:4d}  {line}"
         for i, line in enumerate(lines[start:end], start=start)
     )
+
+
+def domain_slice_hash_for(
+    out_dir: Path,
+    target_path: Path,
+    file_path: str,
+    function_name: str,
+    line_start: int,
+    line_end: int | None,
+) -> str | None:
+    """Per-function domain-model slice fingerprint, prompt-faithful.
+
+    Derives the function source with the SAME reader
+    :func:`build_context` uses for ``ctx["source"]`` — the exact
+    string the bridge selectors score against — and hands it to
+    :func:`core.concepts.audit_bridge.domain_slice_hash`. This is the
+    single entry point for BOTH sides of the compare: the journal
+    writer stamps rows with it at record time, and the gap fold's
+    context-staleness gate recomputes with it at reuse time, so a
+    match means the recompute walked the same selection code over the
+    same source text.
+
+    Returns None when no domain model exists. Propagates renderer
+    errors — callers treat any exception as "no stamp" / "no match"
+    (fail toward re-review, never toward stale reuse).
+    """
+    from core.concepts.audit_bridge import domain_slice_hash
+    source = _read_source(target_path, file_path, line_start, line_end)
+    return domain_slice_hash(out_dir, file_path, function_name, source)
 
 
 def _extract_metadata(
@@ -2358,7 +3376,7 @@ def _format_caller_contract(digest: dict[str, Any]) -> str:
             f"{site.get('file', '?')}:{site.get('caller') or '?'}",
             max_length=512,
         )
-        lines.append(f"- `{ident}` line {site.get('line', '?')}:")
+        lines.append(f"- `{ident}` line {_defend_line(site.get('line', '?'))}:")
         if site.get("excerpt"):
             block = _fenced(site["excerpt"])
             lines.append(block)
@@ -2386,7 +3404,7 @@ def _enrich_callers_with_call_sites(
     callers: list[dict[str, Any]],
     target_path: Path,
     function_name: str,
-    context_lines: int = 1,
+    context_lines: int = CALL_SITE_CONTEXT_LINES,
 ) -> None:
     """Add call_site snippets to caller dicts.
 
@@ -2398,7 +3416,7 @@ def _enrich_callers_with_call_sites(
     call_pat = re.compile(
         rf'\b{re.escape(function_name)}\s*\(', re.IGNORECASE,
     )
-    for caller in callers[:10]:
+    for caller in callers[:MAX_CALL_SITE_CALLERS]:
         caller_file = caller.get("file", "")
         if not caller_file:
             continue
@@ -2408,11 +3426,15 @@ def _enrich_callers_with_call_sites(
         text = _read_target_text(full_path)
         if text is None:
             continue
-        lines = text.splitlines()
+        lines = split_lines(text)  # \n model: line ranges come from inventory/SARIF
 
         caller_line = caller.get("line_start", 0)
         search_start = max(0, caller_line - 1) if caller_line else 0
-        search_end = min(len(lines), (caller_line + 80) if caller_line else len(lines))
+        search_end = min(
+            len(lines),
+            (caller_line + CALLER_CALL_SEARCH_SPAN_LINES)
+            if caller_line else len(lines),
+        )
 
         for i in range(search_start, search_end):
             if call_pat.search(lines[i]):
@@ -2512,7 +3534,10 @@ def _resolve_types(
     return results
 
 
-_header_cache: dict[str, list[Path]] = {}
+# Bounded + thread-safe (per-key in-flight collapse): concurrent
+# review workers raced the bare dict's check-then-set and re-walked
+# the tree in parallel.
+_header_cache: "BoundedMemo[list[Path]]" = BoundedMemo(16)
 
 
 def _admissible_header(target_path: Path, header: Path) -> bool:
@@ -2559,13 +3584,13 @@ def _find_headers(target_path: Path, source_file: str) -> list[Path]:
             )
 
     cache_key = str(target_path)
-    all_headers = _header_cache.get(cache_key)
-    if all_headers is None:
-        all_headers = [
+    all_headers, _cached = _header_cache.get_or_compute(
+        cache_key,
+        lambda: [
             h for h in sorted(islice(target_path.rglob("*.h"), 1000))
             if _admissible_header(target_path, h)
-        ]
-        _header_cache[cache_key] = all_headers
+        ],
+    )
 
     for h in all_headers:
         if h not in headers:
@@ -2579,15 +3604,18 @@ def _extract_type_definition(
     content: str, type_name: str,
 ) -> dict[str, Any] | None:
     """Extract a struct/typedef/enum definition from file content."""
-    lines = content.splitlines()
+    lines = split_lines(content)  # \n model: shared with the extractors' coordinates
 
     # Per-line patterns (no DOTALL needed).
     line_patterns = [
         re.compile(
             rf'^\s*(?:typedef\s+)?struct\s+{re.escape(type_name)}\s*\{{',
         ),
+        # (?=\S) pins the whitespace run to end at the tail (same
+        # language — the dot-star absorbed any remainder), killing
+        # the run-vs-dot-star split that was quadratic here.
         re.compile(
-            rf'^\s*typedef\s+.*\b{re.escape(type_name)}\s*;',
+            rf'^\s*typedef\s+(?=\S).*\b{re.escape(type_name)}\s*;',
         ),
         re.compile(
             rf'^\s*(?:typedef\s+)?enum\s+{re.escape(type_name)}\s*\{{',
@@ -2606,8 +3634,17 @@ def _extract_type_definition(
     # Multi-line typedef: ``typedef struct { ... } Name;``
     # Must be applied against the full content block so the DOTALL
     # dot matches the newlines between braces.
+    # The optional struct tag gates its own trailing whitespace
+    # ((?:\w+\s*)?): the naive ``\s+\w*\s*`` put two whitespace
+    # spans around the optional tag — quadratic on a
+    # 'typedef struct'-opening run with no brace. The brace body is
+    # bounded (16384 chars — far above real typedef structs;
+    # trade-off both directions: larger admits huge bodies but
+    # raises per-anchor re-scan reach, smaller drops them) so a
+    # planted brace-less run cannot make every line anchor re-scan
+    # the whole tail. Match set otherwise unchanged.
     multiline_pat = re.compile(
-        rf'^\s*typedef\s+struct\s+\w*\s*\{{[^}}]*\}}\s*{re.escape(type_name)}\s*;',
+        rf'^[^\S\n]*typedef\s+struct\s+(?:\w+\s*)?\{{[^}}]{{0,16384}}\}}\s*{re.escape(type_name)}\s*;',
         re.DOTALL | re.MULTILINE,
     )
     m = multiline_pat.search(content)
@@ -2649,8 +3686,8 @@ def _enrich_callees_with_source(
     callees: list[dict[str, Any]],
     target_path: Path,
     checklist: dict[str, Any] | None,
-    max_lines: int = 20,
-    max_total_lines: int = 150,
+    max_lines: int = CALLEE_SNIPPET_SPAN_LINES,
+    max_total_lines: int = CALLEE_SNIPPET_TOTAL_LINES,
 ) -> None:
     """Add source snippets to callee dicts.
 
@@ -2706,7 +3743,7 @@ def _enrich_callees_with_source(
         text = _read_target_text(full_path)
         if text is None:
             continue
-        lines = text.splitlines()
+        lines = split_lines(text)  # \n model: line ranges come from inventory/SARIF
 
         start = max(0, line_start - 1) if line_start else 0
         end = line_end or min(start + max_lines, len(lines))
@@ -2735,8 +3772,8 @@ def collect_caller_call_sites(
     function_name: str,
     target_path: Path,
     *,
-    max_callers: int = 10,
-    context_lines: int = 1,
+    max_callers: int = MAX_CALL_SITE_CALLERS,
+    context_lines: int = CALL_SITE_CONTEXT_LINES,
     context_map: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Public seam: 1-hop callers with call-site snippets attached.
@@ -2754,6 +3791,39 @@ def collect_caller_call_sites(
             callers, target_path, function_name, context_lines,
         )
     return callers
+
+
+def collect_callee_sources(
+    inventory: dict[str, Any] | None,
+    file_path: str,
+    function_name: str,
+    target_path: Path,
+    *,
+    max_callees: int = MAX_PROMPT_CALLEES,
+    max_lines: int = CALLEE_SNIPPET_SPAN_LINES,
+    max_total_lines: int = CALLEE_SNIPPET_TOTAL_LINES,
+    context_map: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Public seam: 1-hop callees with source snippets attached.
+
+    The callee-direction mirror of :func:`collect_caller_call_sites`:
+    combines the callee lookup with source enrichment so other
+    pipelines can reuse the audit-side extractor without reaching
+    into private helpers. Enrichment iterates in security-relevance
+    order (sinks and validators first) under the shared line budget —
+    the same behaviour :func:`assemble_context` gets. Returns
+    ``[{file, name, line_start, source_snippet?}]`` (bounded; external
+    callees render with ``file="(external)"`` and, when a header
+    definition is found, gain a snippet like internal ones).
+    """
+    callees = _find_callees(
+        inventory, file_path, function_name, context_map=context_map,
+    )[:max_callees]
+    if callees:
+        _enrich_callees_with_source(
+            callees, target_path, inventory, max_lines, max_total_lines,
+        )
+    return callees
 
 
 def _find_callers(
@@ -2963,10 +4033,28 @@ def _load_existing_annotation(
     try:
         if out_dir:
             from .journal import latest_entries
+            # Called once PER REVIEWED FUNCTION: latest_entries serves
+            # the load cache's maintained latest-per-key view (one
+            # collapse per journal parse, folded incrementally across
+            # appends), so this per-function call is a view copy, not
+            # a whole-journal re-collapse. Do not add caller-side
+            # caching here — it would go stale across appends the
+            # maintained view already absorbs.
             latest = latest_entries(out_dir)
             entry = latest.get(f"{file_path}:{function_name}")
             if entry and entry.body:
                 return entry.body
+            if entry and getattr(entry, "body_offload", None):
+                # Slim-tier stub (journal compact --slim-clean): the
+                # prose lives in the run sidecar — hydrate so the
+                # re-review sees the same prior reasoning it saw
+                # pre-slim. Unresolvable → fall through to the
+                # annotation, the pre-existing no-journal-body path.
+                from core.coverage.journal_sidecar import resolve_offload
+                fields = resolve_offload(out_dir, entry)
+                body = fields.get("body") if fields else None
+                if isinstance(body, str) and body:
+                    return body
     except (ImportError, OSError):
         pass
     except Exception:
@@ -3008,6 +4096,8 @@ def _is_prior_audit_annotation(
     try:
         if out_dir:
             from .journal import latest_entries
+            # Per-reviewed-function call served from the maintained
+            # latest-per-key view — see _load_existing_annotation.
             latest = latest_entries(out_dir)
             entry = latest.get(f"{file_path}:{function_name}")
             if entry and entry.verdict in (
@@ -3725,6 +4815,11 @@ def _resolve_macros(
         return []
 
 
+# Extension → PATTERN-FILE key (tiers/patterns/<key>.md), not the
+# inventory language: pattern files exist at coarser granularity, so
+# the whole C/C++ family shares c.md and TypeScript shares
+# javascript.md. Divergences from core.inventory.languages are
+# deliberate and pinned by test_language_map_alignment.
 _LANG_PATTERN_EXT_MAP = {
     ".c": "c", ".h": "c",
     ".cpp": "c", ".cc": "c", ".cxx": "c", ".hpp": "c", ".hxx": "c",
@@ -3852,8 +4947,10 @@ _TRIGGER_KEYWORDS: dict[str, list[str]] = {
 }
 
 _PATTERNS_DIR = Path(__file__).resolve().parent / "patterns"
-_patterns_cache: dict[str, Any] = {}
-_pattern_file_cache: dict[str, list[tuple]] = {}
+# Bounded + thread-safe (per-key in-flight collapse): concurrent
+# review workers raced the bare dicts' check-then-set.
+_patterns_cache: "BoundedMemo[dict[str, Any] | None]" = BoundedMemo(32)
+_pattern_file_cache: "BoundedMemo[list[tuple]]" = BoundedMemo(32)
 
 _PATTERN_HEADING_RE = re.compile(r"^## \d+\.\s+(.+)$", re.MULTILINE)
 
@@ -3871,7 +4968,7 @@ def _parse_patterns(text: str) -> list[tuple]:
         full_text = text[start:end].rstrip()
         body_after_heading = text[m.end():end].strip()
         first_line = ""
-        for line in body_after_heading.split("\n"):
+        for line in body_after_heading.split("\n"):  # line-model: RAPTOR-authored patterns markdown
             line = line.strip()
             if line and not line.startswith("---") and not line.startswith("```"):
                 first_line = line
@@ -3909,62 +5006,60 @@ def _load_language_patterns(
 
     cache_key = lang_key if not source else None
 
-    if cache_key and cache_key in _patterns_cache:
-        return _patterns_cache[cache_key]
+    def _compute() -> dict[str, Any] | None:
+        all_patterns: list[tuple] = []
+        for name in ("common", lang_key):
+            pats, _cached = _pattern_file_cache.get_or_compute(
+                name, partial(_load_pattern_file, name),
+            )
+            all_patterns.extend(pats)
 
-    all_patterns: list[tuple] = []
-    for name in ("common", lang_key):
-        cached_pats = _pattern_file_cache.get(name)
-        if cached_pats is not None:
-            all_patterns.extend(cached_pats)
-            continue
-        p = _PATTERNS_DIR / f"{name}.md"
-        if not p.is_file():
-            _pattern_file_cache[name] = []
-            continue
-        try:
-            text = p.read_text()
-        except OSError:
-            _pattern_file_cache[name] = []
-            continue
-        tier1_set = _TIER1.get(name, set())
-        file_pats = []
-        for title, full_text, summary in _parse_patterns(text):
-            is_t1 = _is_tier1(title, tier1_set)
-            file_pats.append((title, full_text, summary, is_t1))
-        _pattern_file_cache[name] = file_pats
-        all_patterns.extend(file_pats)
+        tier1_parts: list[str] = []
+        tier2_parts: list[str] = []
+        source_lower = source.lower()
 
-    tier1_parts: list[str] = []
-    tier2_parts: list[str] = []
-    source_lower = source.lower()
+        for title, full_text, summary, is_t1 in all_patterns:
+            if is_t1:
+                tier1_parts.append(full_text)
+                continue
+            promoted = False
+            if source:
+                keywords = _match_trigger_keywords(title)
+                if keywords:
+                    for kw in keywords:
+                        if kw.lower() in source_lower:
+                            tier1_parts.append(full_text)
+                            promoted = True
+                            break
+            if not promoted:
+                tier2_parts.append(f"- **{title}**: {summary}")
 
-    for title, full_text, summary, is_t1 in all_patterns:
-        if is_t1:
-            tier1_parts.append(full_text)
-            continue
-        promoted = False
-        if source:
-            keywords = _match_trigger_keywords(title)
-            if keywords:
-                for kw in keywords:
-                    if kw.lower() in source_lower:
-                        tier1_parts.append(full_text)
-                        promoted = True
-                        break
-        if not promoted:
-            tier2_parts.append(f"- **{title}**: {summary}")
-
-    if not tier1_parts and not tier2_parts:
-        result = None
-    else:
-        result = {
+        if not tier1_parts and not tier2_parts:
+            return None
+        return {
             "tier1": "\n\n".join(tier1_parts),
             "tier2": "\n".join(tier2_parts),
         }
-    if cache_key:
-        _patterns_cache[cache_key] = result
+
+    result, _cached = _patterns_cache.get_or_compute(cache_key, _compute)
     return result
+
+
+def _load_pattern_file(name: str) -> list[tuple]:
+    """(title, full_text, summary, is_tier1) tuples for one pattern
+    file; empty list when missing/unreadable."""
+    p = _PATTERNS_DIR / f"{name}.md"
+    if not p.is_file():
+        return []
+    try:
+        text = p.read_text()  # raw-open: shipped pattern pack under core/audit/patterns (RAPTOR-owned)
+    except OSError:
+        return []
+    tier1_set = _TIER1.get(name, set())
+    return [
+        (title, full_text, summary, _is_tier1(title, tier1_set))
+        for title, full_text, summary in _parse_patterns(text)
+    ]
 
 
 def _load_strategy_primers(
@@ -4225,7 +5320,7 @@ def _read_flow_node_source(
     text = _read_target_text(full_path)
     if text is None:
         return ""
-    lines = text.splitlines()
+    lines = split_lines(text)  # \n model: line ranges come from inventory/SARIF
 
     start = max(0, node_line - 1) if node_line else 0
     end = line_end or min(start + max_lines, len(lines))
@@ -4317,6 +5412,112 @@ def _detect_framework_guarantees(
     except Exception:
         logger.debug("framework detection failed", exc_info=True)
         return []
+
+
+# Include-graph artifact memo: keyed by (path, mtime, size) so a
+# rebuilt graph invalidates naturally; the graph is re-read once per
+# run, not once per reviewed function.
+_include_graph_memo: "BoundedMemo[dict[str, Any] | None]" = BoundedMemo(8)
+
+def _build_include_context(
+    out_dir: Path | None, file_path: str,
+) -> dict[str, Any] | None:
+    """Hint-tier include-topology facts for one file, or None.
+
+    Reads ``include-graph.json`` (written at inventory build). The
+    returned block always carries the two-component census and its
+    qualifier — an includer-set fact without the completeness
+    qualifier is exactly the dishonest shape the include-graph
+    design forbids. Enum fields are re-validated here because the
+    artifact lives in a run directory (JSON shapes are not trusted).
+    """
+    if not out_dir:
+        return None
+    try:
+        from core.inventory.include_graph import (
+            include_facts_for_file,
+            load_include_graph,
+            resolve_artifact_path,
+        )
+    except ImportError:
+        return None
+    try:
+        artifact = resolve_artifact_path(out_dir)
+        if artifact is None:
+            return None
+        st = artifact.stat()
+        key = (str(artifact), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+    graph, _cached = _include_graph_memo.get_or_compute(
+        key, lambda: load_include_graph(out_dir))
+    if not graph:
+        return None
+    # Enum/bound re-validation of the untrusted artifact lives in
+    # include_facts_for_file — the ONE query both consumers (this
+    # block and validate stage C) go through.
+    facts = include_facts_for_file(graph, file_path)
+    if not facts:
+        return None
+    # Phase-1b bootstrap facts, when the environment walk ran: the
+    # entry classes reaching this file and the guaranteed-prefix
+    # files shared by every guaranteed-reaching class. Same producer
+    # discipline (census-mandatory: the builder refuses without a
+    # valid census), hint tier, prompt-context only.
+    try:
+        from core.inventory.include_graph import (
+            bootstrap_context_for_file,
+        )
+        bc = bootstrap_context_for_file(graph, file_path)
+        if bc:
+            facts["bootstrap"] = bc
+    except Exception:
+        logger.debug("bootstrap context build failed", exc_info=True)
+    return facts
+
+
+# Gadget-oracle artifact memo: keyed by (path, mtime, size) so a
+# rewritten artifact invalidates naturally; the report is re-read
+# once per run, not once per reviewed function.
+_gadget_report_memo: "BoundedMemo[dict[str, Any] | None]" = BoundedMemo(8)
+
+
+def _build_gadget_context(
+    out_dir: Path | None, file_path: str,
+) -> dict[str, Any] | None:
+    """Hint-tier gadget-surface facts for one file, or None.
+
+    Reads ``gadget-chains.json`` (written by the gadget-oracle
+    channel or the standalone scan). The returned block always
+    carries the completeness qualifier — a gadget fact without it is
+    exactly the dishonest "no gadgets in tree" shape the oracle
+    exists to replace. Every field is re-coerced in
+    ``gadget_facts_for_file`` because the artifact lives in a run
+    directory (JSON shapes are not trusted).
+    """
+    if not out_dir:
+        return None
+    try:
+        from core.analysis.gadget_oracle import (
+            gadget_facts_for_file,
+            load_gadget_report,
+            resolve_artifact_path,
+        )
+    except ImportError:
+        return None
+    try:
+        artifact = resolve_artifact_path(out_dir)
+        if artifact is None:
+            return None
+        st = artifact.stat()
+        key = (str(artifact), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+    report, _cached = _gadget_report_memo.get_or_compute(
+        key, lambda: load_gadget_report(out_dir))
+    if not report:
+        return None
+    return gadget_facts_for_file(report, file_path)
 
 
 def _load_project_context(

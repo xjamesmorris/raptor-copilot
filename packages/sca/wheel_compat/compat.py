@@ -33,6 +33,7 @@ The verdict ladder for emitting findings (``_FINDING_TIER`` in
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 
 from packages.sca.wheel_compat.wheel_tags import (
@@ -94,7 +95,16 @@ def wheel_matrix_for_version(
     if not isinstance(meta, dict):
         return None
     releases = meta.get("releases") or {}
-    files = releases.get(version)
+    return _wheel_matrix_from_files(name, version, releases.get(version))
+
+
+def _wheel_matrix_from_files(
+    name: str, version: str, files: object,
+) -> WheelMatrix | None:
+    """Build the matrix from one version's release-file list — the
+    fetch-free half of :func:`wheel_matrix_for_version`, shared with
+    the version walker so a caller already holding the package's
+    ``releases`` dict doesn't re-fetch metadata once per version."""
     if not isinstance(files, list) or not files:
         return None
 
@@ -134,47 +144,59 @@ def _best_match(
             continue
         if w.arch not in (pair.arch, "any", "universal2"):
             continue
-        # OS-family check. macOS / Windows tags don't satisfy a
-        # Linux project pair and vice-versa. The platform_matrix
-        # only currently emits Linux pairs (with libc) or
-        # libc=None for Windows/macOS pairs.
-        if pair.libc is None:
-            # Project pair is non-Linux — wheel must match the OS.
-            # We don't distinguish macOS / Windows in PlatformPair
-            # today; fall through and let arch match decide.
-            if w.os == "windows":
+        # OS-family check on the pair's EXPLICIT os field. macOS /
+        # Windows tags don't satisfy a Linux project pair and
+        # vice-versa. The old dispatch overloaded ``libc is None`` as
+        # "non-Linux", which mis-filed every Linux-provenance pair
+        # whose libc is undetermined (bake / build-push / unknown
+        # base image): their manylinux wheels were rejected (false
+        # incompat findings) while win_amd64 wheels matched (false
+        # clean verdicts). A pair minted WITHOUT an os (external
+        # constructor) keeps the historical inference — a declared
+        # libc implies Linux; libc-less falls to the legacy
+        # Windows/macOS arm at the bottom.
+        if pair.os == "linux" or (pair.os is None and pair.libc is not None):
+            # Linux pair → wheel must be Linux; libc gates only when
+            # BOTH sides declare one (libc=None means "no libc
+            # constraint" — the documented lenient behaviour).
+            if w.os != "linux":
+                continue
+            if pair.libc is None or w.libc is None:
                 candidates.append(w)
                 continue
-            if w.os == "macosx":
-                # macOS version gating: a project pinned to macos-13
-                # (pair.macos_version=(13, 0)) can install
-                # ``macosx_11_0_arm64`` wheels but NOT
-                # ``macosx_14_0_arm64`` wheels. When pair.macos_version
-                # is set + wheel declares a tag version, reject too-new
-                # wheels. When EITHER side is missing version info,
-                # fall through to "arch match decides" (the existing
-                # lenient behaviour).
-                if (pair.macos_version is not None
-                        and w.macos_version is not None
-                        and w.macos_version > pair.macos_version):
-                    # Wheel requires a NEWER macOS than the project
-                    # accepts — not a fit.
-                    continue
-                candidates.append(w)
-            continue
-        # Linux pair → wheel must be Linux + libc family + version OK.
-        if w.os != "linux":
-            continue
-        if w.libc is None:
-            # Raw ``linux_x86_64`` tag — no libc constraint declared.
-            # Treat as OK (the wheel might still fail at runtime but
-            # we have no signal to gate on).
+            if w.libc.family != pair.libc.family:
+                continue
+            if w.libc.version > pair.libc.version:
+                # Wheel requires NEWER libc than project provides →
+                # not a fit.
+                continue
             candidates.append(w)
             continue
-        if w.libc.family != pair.libc.family:
+        if pair.os == "windows":
+            if w.os == "windows":
+                candidates.append(w)
             continue
-        if w.libc.version > pair.libc.version:
-            # Wheel requires NEWER libc than project provides → not a fit.
+        # pair.os == "macosx", or the legacy os-less libc-less shape
+        # (pre-os constructors for Windows/macOS runners). The legacy
+        # shape can't tell Windows from macOS, so it accepts Windows
+        # wheels too — exactly the pre-os behaviour.
+        if pair.os is None and w.os == "windows":
+            candidates.append(w)
+            continue
+        if w.os != "macosx":
+            continue
+        # macOS version gating: a project pinned to macos-13
+        # (pair.macos_version=(13, 0)) can install
+        # ``macosx_11_0_arm64`` wheels but NOT ``macosx_14_0_arm64``
+        # wheels. When pair.macos_version is set + wheel declares a
+        # tag version, reject too-new wheels. When EITHER side is
+        # missing version info, fall through to "arch match decides"
+        # (the existing lenient behaviour).
+        if (pair.macos_version is not None
+                and w.macos_version is not None
+                and w.macos_version > pair.macos_version):
+            # Wheel requires a NEWER macOS than the project
+            # accepts — not a fit.
             continue
         candidates.append(w)
 
@@ -244,13 +266,13 @@ def _verdict_for_pair(
         ]
         if same_family:
             min_libc = min(
-                same_family, key=lambda w: w.libc.version,
+                same_family, key=lambda w: w.libc.version,  # type: ignore[union-attr]
             )
             return CompatVerdict(
                 pair=pair, verdict="libc_too_new",
                 reason=(
                     f"{wm.name}=={wm.version}'s {pair.arch} wheels "
-                    f"require {min_libc.libc.as_str()} or newer; "
+                    f"require {min_libc.libc.as_str()} or newer; "  # type: ignore[union-attr]
                     f"project pair has only {pair.libc.as_str()}"
                 ),
                 matching_wheel=min_libc.raw,
@@ -268,15 +290,15 @@ def _verdict_for_pair(
         ]
         if same_macos:
             min_required = min(
-                same_macos, key=lambda w: w.macos_version,
+                same_macos, key=lambda w: w.macos_version,  # type: ignore[arg-type,return-value]
             )
-            if min_required.macos_version > pair.macos_version:
+            if min_required.macos_version > pair.macos_version:  # type: ignore[operator]
                 return CompatVerdict(
                     pair=pair, verdict="macos_too_new",
                     reason=(
                         f"{wm.name}=={wm.version}'s {pair.arch} wheels "
                         f"require macOS "
-                        f"{min_required.macos_version[0]}.{min_required.macos_version[1]} "
+                        f"{min_required.macos_version[0]}.{min_required.macos_version[1]} "  # type: ignore[index]
                         f"or newer; project pair targets macOS "
                         f"{pair.macos_version[0]}.{pair.macos_version[1]}"
                     ),
@@ -348,7 +370,8 @@ _RECOMMENDATION_CACHE: dict[
     tuple[
         str,
         frozenset[
-            tuple[str, LibcVersion | None, tuple[int, int] | None]
+            tuple[str, LibcVersion | None, str | None,
+                  tuple[int, int] | None]
         ],
     ],
     str | None,
@@ -356,21 +379,23 @@ _RECOMMENDATION_CACHE: dict[
 
 
 def _matrix_cache_key(matrix: ProjectPlatformMatrix) -> frozenset[
-    tuple[str, LibcVersion | None, tuple[int, int] | None]
+    tuple[str, LibcVersion | None, str | None, tuple[int, int] | None]
 ]:
     """Build a cache key that ignores ``PlatformPair.source``.
 
-    Two matrices with the same ``{(arch, libc, macos_version)}`` set
-    produce the same recommendation regardless of which Dockerfile /
-    GHA / etc. each pair was discovered from.
+    Two matrices with the same ``{(arch, libc, os, macos_version)}``
+    set produce the same recommendation regardless of which
+    Dockerfile / GHA / etc. each pair was discovered from.
 
     ``macos_version`` MUST be in the key — a project on macos-13 and
     one on macos-14 have different acceptable-wheel windows
     (macos-13 rejects ``macosx_14_arm64`` wheels). Sharing a cache
-    entry would mis-recommend.
+    entry would mis-recommend. ``os`` MUST be in the key for the same
+    reason — a Linux pair and an unknown-OS pair with equal
+    (arch, libc) accept different wheel sets.
     """
     return frozenset(
-        (p.arch, p.libc, p.macos_version) for p in matrix.pairs
+        (p.arch, p.libc, p.os, p.macos_version) for p in matrix.pairs
     )
 
 
@@ -436,7 +461,12 @@ def find_compatible_version(
     stable.sort(key=_version_key, reverse=True)
 
     for version in stable[:max_versions_walked]:
-        wm = wheel_matrix_for_version(pypi_client, name, version)
+        # The releases dict in hand already carries every version's
+        # file list — building the matrix from it directly avoids one
+        # identical get_metadata fetch PER WALKED VERSION (up to 20;
+        # client-side caching sometimes masked the cost, never the
+        # dependency on it).
+        wm = _wheel_matrix_from_files(name, version, releases.get(version))
         if wm is None:
             continue
         verdicts = check_compat(matrix, wm)
@@ -450,8 +480,8 @@ def find_compatible_version(
     return None
 
 
-_STABLE_VERSION_RE = __import__("re").compile(
-    r"^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:\.(\d+))?(?:\.post\d+)?$"
+_STABLE_VERSION_RE = re.compile(
+    r"^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:\.(\d+))?(?:\.post(\d+))?$"
 )
 
 
@@ -464,7 +494,10 @@ def _is_stable_version(v: str) -> bool:
 
 
 def _version_key(v: str) -> tuple:
-    """Numeric-component sort key. Treats missing components as 0."""
+    """Numeric-component sort key. Treats missing components as 0.
+    The ``.postN`` number is the LAST component so a post-release
+    ranks above its base version (PEP 440) instead of tying with it
+    — a tie let the walk recommend the superseded base build."""
     m = _STABLE_VERSION_RE.match(v)
     if not m:
         return (0,)

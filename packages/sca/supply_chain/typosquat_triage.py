@@ -39,6 +39,7 @@ from collections.abc import Callable
 
 from core.json import load_json_bounded, save_json
 
+from ..parsers import _safe_read
 from .typosquat_audit import Candidate, _load_name_set
 
 logger = logging.getLogger(__name__)
@@ -183,10 +184,23 @@ def triage_pending(
     Pure given the injected seams."""
     out: list[TriageOutcome] = []
     for c in candidates:
-        ev = evidence_fn(c)
-        verdict = triage_fn(c, ev)
-        gr = gate(ev, verdict, min_age_days=min_age_days,
-                  min_versions=min_versions)
+        # Per-candidate fault isolation: the evidence fetchers walk
+        # HOSTILE registry JSON — one crafted document must not abort
+        # the whole triage run after the LLM / network budget is
+        # spent.  A skipped candidate simply stays pending, which
+        # escalates to a human — the safe direction (never
+        # auto-legit on a crash).
+        try:
+            ev = evidence_fn(c)
+            verdict = triage_fn(c, ev)
+            gr = gate(ev, verdict, min_age_days=min_age_days,
+                      min_versions=min_versions)
+        except Exception:
+            logger.warning(
+                "typosquat_triage: triage failed for %r — skipping "
+                "(stays pending / escalates)", c.name, exc_info=True,
+            )
+            continue
         out.append(TriageOutcome(c, ev, verdict, gr))
     return out
 
@@ -213,6 +227,25 @@ def apply_auto_legit(
             if o.gate_result.disposition is Disposition.AUTO_LEGIT]
     if not auto:
         return []
+    # Inter-process exclusion around the read-modify-write: the
+    # atomic replace protects against torn FILES, not lost UPDATES —
+    # two concurrent triage runs each read, merged their own rows,
+    # and the last writer silently dropped the other's.
+    with _safe_read.sidecar_lock(reviewed_legit_path):
+        return _apply_auto_legit_locked(
+            auto, ecosystem, reviewed_legit_path,
+            model=model, now=now,
+        )
+
+
+def _apply_auto_legit_locked(
+    auto: list[TriageOutcome],
+    ecosystem: str,
+    reviewed_legit_path: Path,
+    *,
+    model: str,
+    now: str | None,
+) -> list[str]:
     try:
         # Curation file this function also rewrites; ValueError covers
         # malformed JSON and the byte-budget refusal.
@@ -260,6 +293,18 @@ def _atomic_write_json(path: Path, obj: object) -> None:
 # the candidate escalates to a human, which is the safe direction.
 
 
+def _as_dict(value: object) -> dict:
+    """Hostile-doc guard: registry JSON is attacker-publishable, so
+    any nested field expected to be a mapping may be a list / str /
+    number.  Non-dicts degrade to ``{}`` — thin evidence, which
+    fails the auto-legit floor and escalates (the safe direction)."""
+    return value if isinstance(value, dict) else {}
+
+
+def _as_str(value: object) -> str:
+    return value if isinstance(value, str) else ""
+
+
 def _age_days(iso: str | None) -> int | None:
     if not isinstance(iso, str) or not iso:
         return None
@@ -272,15 +317,13 @@ def _age_days(iso: str | None) -> int | None:
 
 
 def _norm_npm(meta: dict) -> dict:
-    versions = meta.get("versions") or {}
-    if not isinstance(versions, dict):
-        versions = {}
-    latest = (meta.get("dist-tags") or {}).get("latest")
-    vm = versions.get(latest, {}) if latest else {}
+    versions = _as_dict(meta.get("versions"))
+    latest = _as_dict(meta.get("dist-tags")).get("latest")
+    vm = _as_dict(versions.get(latest)) if isinstance(latest, str) else {}
     return dict(
         description=vm.get("description"),     # often stripped → None
         num_versions=len(versions),
-        age_days=_age_days((meta.get("time") or {}).get("created")),
+        age_days=_age_days(_as_dict(meta.get("time")).get("created")),
         has_repo=bool(vm.get("repository") or vm.get("homepage")),
         deprecated=bool(vm.get("deprecated")),
         downloads_per_month=None,              # needs a separate npm API
@@ -288,7 +331,7 @@ def _norm_npm(meta: dict) -> dict:
 
 
 def _norm_crates(meta: dict) -> dict:
-    crate = meta.get("crate") or {}
+    crate = _as_dict(meta.get("crate"))
     return dict(
         description=crate.get("description"),
         num_versions=crate.get("num_versions") or len(meta.get("versions") or []),
@@ -300,7 +343,7 @@ def _norm_crates(meta: dict) -> dict:
 
 
 def _norm_pypi(meta: dict) -> dict:
-    info = meta.get("info") or {}
+    info = _as_dict(meta.get("info"))
     return dict(
         description=info.get("summary"),       # often stripped → None
         num_versions=len(meta.get("releases") or {}),
@@ -313,7 +356,7 @@ def _norm_pypi(meta: dict) -> dict:
 
 def _norm_packagist(meta: dict) -> dict:
     pkgs = meta.get("packages")
-    vlist = next(iter(pkgs.values()), []) if isinstance(pkgs, dict) else []
+    vlist: list = next(iter(pkgs.values()), []) if isinstance(pkgs, dict) else []
     head = vlist[0] if vlist and isinstance(vlist[0], dict) else {}
     return dict(
         description=head.get("description"),
@@ -379,16 +422,16 @@ def _evidence_npm_rich(candidate: Candidate, http) -> Evidence:
     doc = _raw_doc(http, _NPM_RAW + urllib.parse.quote(candidate.name, safe="@"))
     if doc is None:
         return Evidence(candidate=candidate)
-    versions = doc.get("versions") or {}
-    latest = (doc.get("dist-tags") or {}).get("latest")
-    vm = versions.get(latest, {}) if latest else {}
+    versions = _as_dict(doc.get("versions"))
+    latest = _as_dict(doc.get("dist-tags")).get("latest")
+    vm = _as_dict(versions.get(latest)) if isinstance(latest, str) else {}
     repo = doc.get("repository") or vm.get("repository") or vm.get("homepage")
     return Evidence(
         candidate=candidate,
         description=doc.get("description") or vm.get("description"),
-        readme=((doc.get("readme") or "")[:_README_CAP] or None),
+        readme=(_as_str(doc.get("readme"))[:_README_CAP] or None),
         num_versions=len(versions),
-        age_days=_age_days((doc.get("time") or {}).get("created")),
+        age_days=_age_days(_as_dict(doc.get("time")).get("created")),
         has_repo=bool(repo),
         deprecated=bool(vm.get("deprecated")),
     )
@@ -398,21 +441,21 @@ def _evidence_pypi_rich(candidate: Candidate, http) -> Evidence:
     doc = _raw_doc(http, _PYPI_RAW + candidate.name.lower() + "/json")
     if doc is None:
         return Evidence(candidate=candidate)
-    info = doc.get("info") or {}
-    releases = doc.get("releases") or {}
+    info = _as_dict(doc.get("info"))
+    releases = _as_dict(doc.get("releases"))
     # Earliest upload across all release files = first-publish (raw doc keeps
     # upload_time, which the client strips → recovers PyPI age).
     times = [f.get("upload_time_iso_8601") or f.get("upload_time")
              for files in releases.values() if isinstance(files, list)
              for f in files if isinstance(f, dict)]
-    times = [t for t in times if t]
+    times = [t for t in times if isinstance(t, str)]
     urls = info.get("project_urls") or {}
     return Evidence(
         candidate=candidate,
         description=info.get("summary"),
-        readme=((info.get("description") or "")[:_README_CAP] or None),
+        readme=(_as_str(info.get("description"))[:_README_CAP] or None),
         num_versions=len(releases),
-        age_days=_age_days(min(times)) if times else None,
+        age_days=_age_days(min(times)) if times else None,  # type: ignore[type-var]
         has_repo=bool(urls or info.get("home_page")),
         deprecated=bool(info.get("yanked")),
     )
@@ -592,7 +635,7 @@ def reaudit_reviewed_legit(
                     "removed from registry or unreachable")
                 continue
             ev = collect_evidence(Candidate(name, "", 0, 0, 0), eco,
-                                  lambda _n, _meta=meta: _meta)
+                                  lambda _n, _meta=meta: _meta)  # type: ignore[misc]
             if ev.deprecated:
                 flags.setdefault(name, []).append("now deprecated")
         if osv_malicious_fn is not None:

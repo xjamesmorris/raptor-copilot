@@ -11,11 +11,11 @@ domain-model.json.
 
 from __future__ import annotations
 
-import concurrent.futures
 import contextlib
 import logging
 import os
 import re
+from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -33,6 +33,7 @@ from .model import (
     Invariant,
     SecurityContext,
     StudyItem,
+    evidence_hash_composite,
 )
 
 logger = logging.getLogger(__name__)
@@ -49,17 +50,19 @@ def _quarantine_stale_prior(
     on_progress: Any = None,
     reading_list: Any = None,
 ) -> None:
-    """Quarantine prior-run concepts whose evidence drifted on disk.
+    """Quarantine prior-run entries whose evidence drifted on disk.
 
     ``check_evidence_staleness`` existed with zero production callers —
     prior-run concepts merged into this run carried drifted evidence
     with their original (possibly ``verbatim``) provenance intact.
-    Wire it into the load path: any concept with stale evidence is
-    moved to lifecycle state ``stale`` and its provenance demoted to
-    ``llm_summarized`` (the receipt no longer matches the source, so
-    tier-gated consumers must treat the claim as an unverified hint).
-    The re-derive signal is machine-consumed via the reading list
-    (one pending re-derive question per stale concept — the loop
+    Wire it into the load path: any concept, invariant, or contract
+    with stale evidence is marked ``state="stale"`` and its provenance
+    demoted to ``llm_summarized`` (the receipt / span hash no longer
+    matches the source, so tier-gated consumers must treat the claim
+    as an unverified hint — a drifted [verbatim] invariant otherwise
+    reaches review prompts as "a violation is a real bug" ground
+    truth). The re-derive signal is machine-consumed via the reading
+    list (one pending re-derive question per stale entry — the loop
     drains pending items on its next pass) and mirrored to
     ``study-stale.json`` for the operator.
 
@@ -82,11 +85,36 @@ def _quarantine_stale_prior(
     if not stale:
         return
     from .receipts import TIER_LLM_SUMMARIZED
-    stale_ids = {s["concept_id"] for s in stale}
+
+    def _kind(s: dict[str, Any]) -> str:
+        # Pre-kind records only ever described concepts.
+        return str(s.get("kind") or "concept")
+
+    stale_concept_ids = {s["id"] for s in stale if _kind(s) == "concept"}
+    stale_inv_ids = {s["id"] for s in stale if _kind(s) == "invariant"}
+    stale_ct_fns = {s["id"] for s in stale if _kind(s) == "contract"}
     for concept in prior.concepts:
-        if concept.id in stale_ids:
+        if concept.id in stale_concept_ids:
             concept.state = "stale"
             concept.provenance = TIER_LLM_SUMMARIZED
+    for inv in prior.invariants:
+        if inv.id in stale_inv_ids:
+            inv.state = "stale"
+            inv.provenance = TIER_LLM_SUMMARIZED
+            if isinstance(inv.receipt, dict):
+                # The receipt no longer verifies — a verified=True
+                # receipt must not ride along with a quarantined entry.
+                inv.receipt = {
+                    **inv.receipt,
+                    "verified": False,
+                    "note": "stale: quote no longer verifies at "
+                            "stated location",
+                }
+    for ct in prior.contracts:
+        if ct.function in stale_ct_fns:
+            ct.state = "stale"
+            ct.provenance = TIER_LLM_SUMMARIZED
+    stale_ids = stale_concept_ids | stale_inv_ids | stale_ct_fns
     try:
         stale_path = output_dir / "study-stale.json"
         save_json(stale_path, {"stale_evidence": stale})
@@ -99,14 +127,19 @@ def _quarantine_stale_prior(
                 ReadingListItem,
                 Resolution,
             )
-            by_concept: dict[str, dict[str, Any]] = {}
+            by_entry: dict[tuple[str, str], dict[str, Any]] = {}
             for s in stale:
-                by_concept.setdefault(s["concept_id"], s)
-            for cid, s in sorted(by_concept.items()):
+                by_entry.setdefault((_kind(s), s["id"]), s)
+            for (kind, eid), s in sorted(by_entry.items()):
+                # Concept ids keep the pre-kind "stale-<id>" shape so a
+                # re-run resolves the same queued item; invariant /
+                # contract ids are namespaced to avoid collisions.
+                item_id = (f"stale-{eid}" if kind == "concept"
+                           else f"stale-{kind}-{eid}")
                 reading_list.queue(ReadingListItem(
-                    id=f"stale-{cid}",
+                    id=item_id,
                     question=(
-                        f"re-derive concept {cid} — its evidence at "
+                        f"re-derive {kind} {eid} — its evidence at "
                         f"{s.get('evidence_file', '?')}:"
                         f"{s.get('evidence_line', '?')} has "
                         f"{s.get('status', 'drifted')}"
@@ -121,15 +154,15 @@ def _quarantine_stale_prior(
             logger.debug("stale re-derive queueing failed",
                          exc_info=True)
     logger.warning(
-        "study: %d prior concept(s) have drifted evidence — "
-        "quarantined as stale (provenance demoted; re-derive signal "
-        "in study-stale.json): %s",
+        "study: %d prior entrie(s) (concepts/invariants/contracts) "
+        "have drifted evidence — quarantined as stale (provenance "
+        "demoted; re-derive signal in study-stale.json): %s",
         len(stale_ids), ", ".join(sorted(stale_ids)),
     )
     if on_progress:
         on_progress(
             "staleness",
-            f"{len(stale_ids)} prior concept(s) quarantined as stale",
+            f"{len(stale_ids)} prior entrie(s) quarantined as stale",
         )
 
 
@@ -157,13 +190,19 @@ def _merge_domain_models(prior: DomainModel, new: DomainModel) -> DomainModel:
     for bp in new.bug_patterns:
         bp_map[bp.id] = bp
 
+    # Two schema-typed attach shapes exist: the study pass emits
+    # {"path", ...} entries; the study-loop attach emits
+    # {"role", "file"}. Keying on "path" alone silently dropped every
+    # loop-attached entry on merge-promote, so the canonical project
+    # model never accumulated the loop's key files.
     kf_map: dict[str, dict[str, str]] = {}
-    for kf in prior.key_files:
-        if isinstance(kf, dict) and kf.get("path"):
-            kf_map[kf["path"]] = kf
-    for kf in new.key_files:
-        if isinstance(kf, dict) and kf.get("path"):
-            kf_map[kf["path"]] = kf
+    for source_list in (prior.key_files, new.key_files):
+        for kf in source_list:
+            if not isinstance(kf, dict):
+                continue
+            kf_key = kf.get("path") or kf.get("file")
+            if kf_key:
+                kf_map[kf_key] = kf
 
     def _merge_vocab(attr: str) -> list:
         """Merge a vocabulary list — new wins on the entry key."""
@@ -201,6 +240,7 @@ def _merge_domain_models(prior: DomainModel, new: DomainModel) -> DomainModel:
         fallibility_contracts=_merge_vocab("fallibility_contracts"),
         resource_limits=_merge_vocab("resource_limits"),
         state_fields=_merge_vocab("state_fields"),
+        token_checks=_merge_vocab("token_checks"),
     )
 
 
@@ -237,10 +277,6 @@ def _promote_to_project(per_run_path: Path, output_dir: Path) -> None:
     ``project.json`` marker that ProjectManager writes, or lives under
     ``out/projects/``).
     """
-    import os
-    import shutil
-    import tempfile
-
     # Promotion is a durable project-store WRITE: the run pin decides
     # the destination. Pre-fix the parent-shape probe let an --out run
     # placed under project B's dir promote project A's domain model
@@ -281,38 +317,159 @@ def _promote_to_project(per_run_path: Path, output_dir: Path) -> None:
     concepts_dir.mkdir(parents=True, exist_ok=True)
     canonical = concepts_dir / "domain-model.json"
 
-    tmp = None
     try:
-        if canonical.is_file():
-            # MERGE into the canonical model, never replace it: a
-            # reading-list-scoped (or zero-item) pass produces a tiny
-            # per-run model, and an unconditional copy would clobber
-            # the project's accumulated knowledge with that subset.
-            # Merge semantics match the in-run prior merge: the new
-            # run wins on ID collisions, everything else accumulates.
-            canon_model = DomainModel.load(canonical)
-            run_model = DomainModel.load(per_run_path)
-            merged = _merge_domain_models(canon_model, run_model)
-            merged.save(canonical)
-            logger.info(
-                "merged domain-model.json into %s "
-                "(%d concepts, %d invariants, %d contracts)",
-                canonical, len(merged.concepts),
-                len(merged.invariants), len(merged.contracts),
-            )
-            return
-        fd, tmp = tempfile.mkstemp(
-            dir=str(concepts_dir), suffix=".tmp", prefix="domain-model-",
-        )
-        os.close(fd)
-        shutil.copy2(str(per_run_path), tmp)
-        Path(tmp).rename(canonical)
-        logger.info("promoted domain-model.json to %s", canonical)
+        merge_promote_domain_model(per_run_path, canonical)
     except OSError:
         logger.debug("domain-model promotion failed", exc_info=True)
+
+
+@contextlib.contextmanager
+def _promotion_lock(canonical: Path) -> Iterator[None]:
+    """Cross-process exclusive lock over a canonical study artifact's
+    load → merge → write window.
+
+    Delegates to :func:`core.atomic_fs.fs_lock.artifact_lock` (the shared flock
+    idiom: sibling ``.lock`` file, whole-window hold, O_NOFOLLOW, loud
+    unlocked degrade, no-op without fcntl). Without it, concurrent
+    promoters on one project (parallel study runs, the study loop
+    beside /agentic — projects explicitly support concurrent sessions)
+    read the same canonical state and the later writer silently drops
+    the earlier run's entire study contribution.
+    """
+    from core.atomic_fs.fs_lock import artifact_lock
+
+    with artifact_lock(canonical, subject="study promotion"):
+        yield
+
+
+def merge_promote_domain_model(per_run_path: Path,
+                               canonical: Path) -> None:
+    """Fold a per-run domain model into the *canonical* copy.
+
+    THE promotion write for domain models — every promoter (the
+    in-run promote above, the study-loop wrapper) must route through
+    it so there is exactly one merge semantics to maintain. MERGE
+    into the canonical model, never replace it: a reading-list-scoped
+    (or zero-item) pass produces a tiny per-run model, and an
+    unconditional copy would clobber the project's accumulated
+    knowledge with that subset. The whole load → merge → write cycle
+    (including the absent-canonical seeding branch) runs under
+    :func:`_promotion_lock`, so a concurrent run's contribution landed
+    since this run seeded is folded in, not lost, and two first-time
+    promoters cannot both take the seeding branch. Merge semantics
+    match the in-run prior merge: the new run wins on ID collisions
+    (the last promoter to hold the lock is the well-defined winner for
+    a shared ID), everything else accumulates. Raises OSError on write
+    failure — callers decide how loudly to report.
+    """
+    with _promotion_lock(canonical):
+        _merge_promote_domain_model_locked(per_run_path, canonical)
+
+
+def _merge_promote_domain_model_locked(per_run_path: Path,
+                                       canonical: Path) -> None:
+    """Body of :func:`merge_promote_domain_model`; caller holds the lock."""
+    import shutil
+    import tempfile
+
+    if canonical.is_file():
+        canon_model = DomainModel.load(canonical)
+        run_model = DomainModel.load(per_run_path)
+        merged = _merge_domain_models(canon_model, run_model)
+        # Carry non-schema top-level keys through the merge — the
+        # study loop attaches dict-level extras (subject_title,
+        # overview_summary, architecture, struct_definitions,
+        # struct_annotations) that DomainModel.load drops; losing
+        # them here forces every subsequent run to re-pay the
+        # overview-synthesis LLM call. Run wins per key, canonical
+        # fills the rest.
+        import dataclasses
+        import json as _json
+
+        from core.atomic_fs import write_text_atomically
+        schema_keys = {
+            f.name for f in dataclasses.fields(DomainModel)
+        }
+        extras: dict[str, Any] = {}
+        for raw_path in (canonical, per_run_path):
+            with contextlib.suppress(OSError, ValueError):
+                raw = _json.loads(
+                    raw_path.read_text(encoding="utf-8"),
+                )
+                if isinstance(raw, dict):
+                    extras.update({
+                        k: v for k, v in raw.items()
+                        if k not in schema_keys
+                    })
+        final = {**dataclasses.asdict(merged), **extras}
+        write_text_atomically(
+            canonical, _json.dumps(final, indent=2) + "\n",
+        )
+        logger.info(
+            "merged domain-model.json into %s "
+            "(%d concepts, %d invariants, %d contracts)",
+            canonical, len(merged.concepts),
+            len(merged.invariants), len(merged.contracts),
+        )
+        return
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(
+            dir=str(canonical.parent), suffix=".tmp",
+            prefix="domain-model-",
+        )
+        # Copy through the fd mkstemp returned (O_EXCL-created,
+        # race-free): a close-then-reopen-by-path copy would follow a
+        # symlink swapped in at the tempfile name in this shared
+        # project dir.
+        with os.fdopen(fd, "wb") as tmp_fh, \
+                open(per_run_path, "rb") as src_fh:
+            shutil.copyfileobj(src_fh, tmp_fh)
+        Path(tmp).rename(canonical)
+    except OSError:
         if tmp:
             with contextlib.suppress(OSError):
                 Path(tmp).unlink(missing_ok=True)
+        raise
+    logger.info("promoted domain-model.json to %s", canonical)
+
+
+def merge_promote_patterns(src: Path, canonical: Path) -> None:
+    """Merge a run's ``patterns.json`` into the canonical copy.
+
+    THE promotion write for discovered patterns — both study-prep and
+    the study loop route through it. Keyed by pattern name, run wins
+    per key: a narrowly scoped run must never replace the whole-tree
+    accumulation. The canonical load → merge → save window runs under
+    :func:`_promotion_lock` (same lost-update interleave as the domain
+    model above). Raises OSError/ValueError on unreadable input —
+    callers decide how loudly to report.
+    """
+    from core.json import load_json
+
+    # Study artifacts are small RAPTOR-written run output; the cap
+    # matches the study loop's artifact ceiling.
+    max_bytes = 64 * 1024 * 1024
+    run_data = load_json(src, strict=True, max_bytes=max_bytes) or {}
+    if not isinstance(run_data, dict):
+        return
+    with _promotion_lock(canonical):
+        merged: dict[str, Any] = {}
+        if canonical.is_file():
+            prior = load_json(canonical, strict=True, max_bytes=max_bytes)
+            if isinstance(prior, dict):
+                merged = prior
+        patterns = merged.get("patterns")
+        if not isinstance(patterns, dict):
+            patterns = {}
+        run_patterns = run_data.get("patterns")
+        if isinstance(run_patterns, dict):
+            patterns.update(run_patterns)
+        merged.update(
+            {k: v for k, v in run_data.items() if k != "patterns"},
+        )
+        merged["patterns"] = patterns
+        save_json(canonical, merged)
 
 
 def _is_under_projects_base(directory: Path) -> bool:
@@ -333,36 +490,384 @@ def _is_under_projects_base(directory: Path) -> bool:
 _DOC_MAX_BYTES = 8192
 _BATCH_WALL_TIMEOUT = 660  # seconds — abandon a hung API call.
 
-# Per-call output ceiling for Phase 2 batch calls. Study extraction is
-# a structured task, not open-ended reasoning: a batch's concepts fit
-# comfortably in this budget, and capping it keeps generation time on
-# slow/thinking models inside BOTH this module's wall timeout and the
-# provider's non-streaming request limit (Anthropic aborts ~10-minute
-# non-streaming requests; with a 128k ceiling a thinking model's batch
-# generation blew straight through it — observed live as
-# 'Request timed out ... long-requests' on every batch). Tunable via
-# RAPTOR_STUDY_MAX_OUTPUT_TOKENS; if a batch truncates at the cap,
-# shrink --batch-target rather than raising it past the transport
-# limits.
-def _study_max_output_tokens() -> int:
+# Phase 2 batch calls opt into per-call streaming (SSE-capable
+# surfaces honour it, others degrade to plain create). This constant
+# is only the OPT-IN half of that decision: the provider layer
+# resolves the actual per-call mode as opt-in AND surface capability
+# (its ``_stream_sse_ok`` gate — a surface with no SSE support, e.g.
+# a non-streaming runtime API, silently downgrades the call to plain
+# create). The one-shot output-cap escalation below therefore keys on
+# the same RESOLVED decision (``_batch_call_streams``), not on this
+# flag alone: an escalated ceiling's worst-case generation time only
+# fits inside the provider's ~10-minute non-streaming abort when the
+# call actually streams.
+_BATCH_CALLS_STREAM = True
+
+
+def _batch_call_streams(llm_client: Any = None) -> bool:
+    """Whether a Phase 2 batch call will ACTUALLY stream.
+
+    The module opt-in (``_BATCH_CALLS_STREAM``) resolved against the
+    client's primary provider surface, mirroring the provider layer's
+    own per-call gate (stream opt-in AND ``_stream_sse_ok``, which
+    defaults True for surfaces that never declare). When no provider
+    is resolvable (no client, no ``primary_provider``, resolution
+    raises) the opt-in stands — the provider layer would apply the
+    same fail-open default for such a surface.
+    """
+    if not _BATCH_CALLS_STREAM:
+        return False
+    if llm_client is None:
+        return True
+    try:
+        provider = llm_client.primary_provider
+    except Exception:  # noqa: BLE001 — capability undeterminable
+        return True
+    return bool(getattr(provider, "_stream_sse_ok", True))
+
+# Per-call TEXT output budget for Phase 2 batch calls. Study
+# extraction is a structured task, not open-ended reasoning: a batch's
+# concepts fit comfortably in this budget, and capping it keeps
+# generation time on slow/thinking models inside BOTH this module's
+# wall timeout and the provider's non-streaming request limit
+# (Anthropic aborts ~10-minute non-streaming requests; with a 128k
+# ceiling a thinking model's batch generation blew straight through
+# it — observed live as 'Request timed out ... long-requests' on every
+# batch). Tunable via RAPTOR_STUDY_MAX_OUTPUT_TOKENS; if a batch
+# truncates at the cap, shrink --batch-target rather than raising it
+# past the transport limits.
+def _study_text_output_tokens() -> int:
     import os
     try:
         return int(os.environ.get("RAPTOR_STUDY_MAX_OUTPUT_TOKENS", "16384"))
     except ValueError:
         return 16384
+
+
+def _study_max_output_tokens(model_name: str | None = None) -> int:
+    """Request-level ``max_tokens`` for one study call.
+
+    The text budget above, plus equal thinking headroom on models
+    whose reasoning bills inside ``max_tokens`` with no per-request
+    cap (``thinking_shares_output_budget``; where thinking is off the
+    headroom goes unused and costs nothing). Both directions of this
+    threshold hurt, and both were observed live:
+
+    * Too LOW: on that tier a ceiling sized for the
+      text alone is consumed entirely by reasoning on large study
+      prompts — the turn ends at stop_reason=max_tokens with a
+      thinking-only content list, a full-price call with zero yield,
+      deterministic on retry (one run failed >90% of its study calls
+      this way for hours). The doubled ceiling gives reasoning the
+      text budget's worth of headroom while keeping the text floor.
+    * Too HIGH: generation time at the ceiling must stay inside
+      _BATCH_WALL_TIMEOUT (660s) and, on non-SSE surfaces where the
+      per-call stream opt-in degrades to plain create, the provider's
+      ~10-minute non-streaming abort. At the ~65 tok/s generation
+      rate observed on the reasoning tier, 2x16384 = 32768 tokens is
+      ~500s worst-case — inside both walls; the pre-cap 128k ceiling
+      timed out on every batch.
+
+    The env override sets the TEXT budget (it also sizes the batch
+    ceiling below); the thinking headroom scales with it.
+
+    One exception to the too-HIGH wall math: the split ladder's
+    ONE-SHOT escalated retry (``_escalated_output_tokens``) may
+    request past this ceiling for a single already-truncated batch —
+    it stretches the wall timeout proportionally
+    (``_escalated_wall_timeout``) so the larger ceiling keeps the
+    same generation-rate headroom the 660s wall gives the standard
+    2x ceiling.
+    """
+    text = _study_text_output_tokens()
+    if model_name:
+        try:
+            from core.llm.providers import thinking_shares_output_budget
+            if thinking_shares_output_budget(model_name):
+                return text * 2
+        except ImportError:
+            pass
+    return text
+
+
+# One-shot escalation step for a truncated batch, as a multiple of
+# the TEXT budget (``_study_text_output_tokens``): before the split
+# ladder halves a truncated batch, it retries the SAME batch once at
+# ``min(multiplier * text, model max_output)``. Both directions
+# hurt:
+# * Too LOW (< 3): on the thinking tier the standard request ceiling
+#   is already 2x the text budget, so a 2x escalated cap sits AT the
+#   standard ceiling and the stand-down guard below (escalated <=
+#   standard -> None) suppresses the retry permanently — escalation
+#   becomes dead code on exactly the tier whose truncations it exists
+#   to cure, and every truncated batch goes straight to the costlier
+#   split ladder.
+# * Too HIGH (> 4): the escalated wall timeout scales with the
+#   ceiling (``_escalated_wall_timeout``), so past 4x a single hung
+#   escalated call holds its worker slot for well over 20 minutes
+#   before being abandoned — and when the retry still truncates, the
+#   wasted call was that much longer and costlier.
+_TRUNCATION_ESCALATION_MULTIPLIER = 3
+
+
+def _escalated_output_tokens(
+    model_name: str, llm_client: Any = None,
+) -> int | None:
+    """One-shot escalated ``max_tokens`` for a truncated batch.
+
+    ``min(_TRUNCATION_ESCALATION_MULTIPLIER * text_budget, model
+    max_output)`` — or ``None`` whenever escalation cannot help and
+    the split ladder should engage directly: the batch call will not
+    actually stream (opt-in off, or the resolved provider surface has
+    no SSE and downgrades the call to plain create — where an
+    escalated generation cannot finish inside the provider's
+    non-streaming abort, making the retry a deterministic billed dead
+    call), the model is unknown (an over-ceiling request would be
+    rejected, not truncated), or the standard request ceiling already
+    sits at / above the escalated one (no headroom to buy).
+    """
+    if not _batch_call_streams(llm_client):
+        return None
+    if not model_name:
+        return None
+    try:
+        from core.llm.model_data import resolve_model_limits
+    except ImportError:
+        return None
+    limits = resolve_model_limits(model_name)
+    if not isinstance(limits, dict):
+        return None
+    try:
+        model_max = int(limits.get("max_output") or 0)
+    except (TypeError, ValueError):
+        return None
+    if model_max <= 0:
+        return None
+    escalated = min(
+        _TRUNCATION_ESCALATION_MULTIPLIER * _study_text_output_tokens(),
+        model_max,
+    )
+    if escalated <= _study_max_output_tokens(model_name):
+        return None
+    return escalated
+
+
+def _escalated_wall_timeout(escalated_tokens: int) -> float:
+    """Wall timeout for an escalated retry, scaled to its ceiling.
+
+    ``_BATCH_WALL_TIMEOUT`` is sized for the STANDARD request ceiling
+    (2x the text budget: ~500s worst-case generation at the observed
+    ~65 tok/s, inside the 660s wall — see
+    ``_study_max_output_tokens``). An escalated ceiling needs
+    proportionally more time or a healthy-but-slow retry is abandoned
+    here after its tokens were already billed; the standard wall
+    stays the floor so a ceiling clamped back to (or below) 2x keeps
+    the standard timeout.
+    """
+    import math
+    scale = escalated_tokens / (2 * _study_text_output_tokens())
+    return max(
+        float(_BATCH_WALL_TIMEOUT),
+        math.ceil(_BATCH_WALL_TIMEOUT * scale),
+    )
+
+
+def _max_batch_wall_timeout() -> float:
+    """Longest wall any single Phase 2 batch attempt can hold.
+
+    The escalated retry's wall at the multiplier's full stretch:
+    ``_escalated_output_tokens`` never exceeds ``multiplier x text
+    budget`` and ``_escalated_wall_timeout`` is monotone in the
+    ceiling, so this bounds every attempt. Text-budget-independent —
+    the multiplier-to-2x ratio cancels the budget out (990s at the
+    shipped 3x). The study-drain ceiling derives from this bound: a
+    drain bound below it abandons a healthy escalated retry
+    mid-generation after its tokens were billed.
+    """
+    text = _study_text_output_tokens()
+    if text <= 0:
+        # A zero/negative env text budget disables escalation
+        # entirely (the stand-down guard); the standard wall is then
+        # the longest attempt. Guards the division below, which the
+        # escalation path itself never reaches with text <= 0.
+        return float(_BATCH_WALL_TIMEOUT)
+    return _escalated_wall_timeout(
+        _TRUNCATION_ESCALATION_MULTIPLIER * text,
+    )
+
+
+def _client_model_name(llm_client: Any) -> str:
+    """Primary model name of *llm_client*, or '' when undeterminable.
+
+    Duplicated inline resolution collapsed here: the output-budget
+    floor and the parallelism derivation both key on the model.
+    """
+    model_name = getattr(llm_client, "model", None)
+    if not isinstance(model_name, str):
+        cfg = getattr(llm_client, "config", None)
+        pm = getattr(cfg, "primary_model", None)
+        model_name = getattr(pm, "model_name", "") if pm else ""
+    return model_name if isinstance(model_name, str) else ""
 # Must exceed the slowest per-call transport timeout (claudecode
 # fallback: 600s) or healthy-but-slow CLI calls get abandoned here
 # after their tokens were already billed.
 _CONSECUTIVE_FAIL_LIMIT = 3  # abort run after N consecutive batch failures
 
+# Truncation-failed batches are exempt from the consecutive-failure
+# abort (content-sized, not provider health — the split ladder handles
+# them), but they are NOT free: each is a full-price call with zero
+# yield, and when they keep arriving after split-retry the cause is
+# config-shaped (output budget vs model), identical for every future
+# batch. This cap bounds how many the phase will buy before conceding.
+# Both directions hurt: too LOW and a handful of genuinely oversized
+# items kills the phase for an otherwise healthy run (the split ladder
+# already discards per-item offenders); too HIGH and a systemic budget
+# misconfiguration burns that many full-price calls before the phase
+# stops (observed live pre-cap: hours of them). Six = two full split
+# ladders' worth of terminal single-item failures.
+_TRUNCATION_FAIL_LIMIT = 6
+
+# Estimated structured-output tokens ONE focus item costs in a Phase 2
+# response (concept + invariant/contract share, with evidence quotes).
+# Divides the per-call output budget into the batch-size ceiling
+# (``_phase2_batch_ceiling``) that bounds the computed batch target
+# (``_phase2_batch_target``) and clamps an explicit over-ceiling
+# operator target. Both directions hurt: estimate too LOW and the
+# ceiling admits batches whose response truncates at the output cap —
+# a wasted full-prompt round-trip before split-retry recovers; too
+# HIGH and batches shrink, multiplying prompt-side token cost (each
+# batch re-sends the header, doc context, and context items).
+_PHASE2_ITEM_OUTPUT_TOKENS_EST = 512
+
+# Heuristic upper bound on focus items per Phase 2 batch when the
+# operator passes no explicit --batch-target. Both directions hurt:
+# too LOW splits coherent subsystems across batches — cross-file
+# cohesion is lost (``_cluster_items`` keeps a sub-target subsystem
+# whole) and prompt-side token cost multiplies (each batch re-sends
+# the header, doc context, and context items); too HIGH is inert at
+# the shipped output budget (the ceiling in ``_phase2_batch_target``
+# binds first) but would balloon single batches — and their
+# truncation exposure — the moment a raised output budget lifts the
+# ceiling past it.
+_PHASE2_BATCH_TARGET_HEURISTIC = 80
+
+
+def _phase2_batch_ceiling() -> int:
+    """Max focus items one Phase 2 batch may carry.
+
+    Derived from the per-call output budget so a batch's structured
+    response fits under the cap it is generated against — sized at
+    call time because the budget is env-tunable.
+    """
+    # TEXT budget, not the request ceiling: on always-thinking models
+    # the extra request headroom is for reasoning, and letting it
+    # admit more items per batch would grow the required TEXT output
+    # past the share actually reserved for it.
+    return max(
+        1, _study_text_output_tokens() // _PHASE2_ITEM_OUTPUT_TOKENS_EST,
+    )
+
+
+def _phase2_batch_target() -> int:
+    """Default Phase 2 batch target, computed WITHIN the ceiling.
+
+    ``min(heuristic, output-budget ceiling)`` at computation time:
+    the ceiling every batch is always subject to is folded into the
+    target here — in one visible place — so the computed default
+    never needs a dispatch-time clamp (only an EXPLICIT over-ceiling
+    operator target does). Computed at call time because the ceiling
+    derives from the env-tunable output budget.
+    """
+    return min(_PHASE2_BATCH_TARGET_HEURISTIC, _phase2_batch_ceiling())
+
 
 class _BatchLLMError(Exception):
-    """LLM call failed for a batch — lets callers distinguish from empty-but-ok."""
+    """LLM call failed for a batch — lets callers distinguish from empty-but-ok.
+
+    ``truncation`` marks output-token-limit failures (the provider's
+    structured guards); the batch loops treat those as content-sized,
+    not provider-health, failures: split-retried, never counted toward
+    the consecutive-failure abort.
+
+    ``budget_exhausted`` (class default ``False``, stamped ``True``
+    post-hoc like ``config_shaped``) marks a zero-yield phase whose
+    failures came from the spend cap tripping — consumers surface
+    "budget exhausted" as the root cause instead of a generic
+    all-batches-failed symptom. Read it with ``getattr`` (the
+    ``config_shaped`` idiom) so foreign exceptions stay compatible.
+    """
+
+    budget_exhausted: bool = False
+
+    def __init__(self, msg: str, *, truncation: bool = False) -> None:
+        super().__init__(msg)
+        self.truncation = truncation
+
+
+class _PhaseBudgetExhausted(Exception):
+    """The LLM client's spend cap tripped mid-phase.
+
+    Deterministic and non-retryable: every further call fails the
+    same way, so the batch loops stop dispatching immediately and
+    keep whatever already succeeded — never burning the
+    consecutive-failure counter (a provider-health breaker) or the
+    remaining batches on a known-terminal condition.
+
+    ``partial`` carries results already PAID FOR inside the failing
+    batch (a split sibling that succeeded before the cap tripped) so
+    the phase loops can salvage them — a budget stop must never
+    convert paid partial coverage into an empty-handed failure.
+    """
+
+    def __init__(
+        self,
+        msg: str,
+        *,
+        partial: "tuple[list, list, list, list, list] | None" = None,
+    ) -> None:
+        super().__init__(msg)
+        self.partial: tuple[list, list, list, list, list] = (
+            partial if partial is not None else ([], [], [], [], [])
+        )
+
+
+def _is_truncation_error(exc: BaseException) -> bool:
+    """Chain-walking output-truncation check.
+
+    Attribute-first: every provider output-truncation guard raises
+    through ``core.llm.providers._llm_truncation_error``, which
+    stamps ``llm_truncation=True`` on the error — the four guards'
+    message phrasings diverge (the Gemini native guard says neither
+    "output token limit" nor the instructor leg's wording), so the
+    typed marker is the contract. Message matching stays as a legacy
+    fallback for wrappers that re-raise with a copied string, using
+    the audit orchestrator's ``_classify_error`` vocabulary
+    ("truncated" / "output token limit"). Wrappers re-raise ``from``
+    the original, so walk the causal chain like the other shared
+    classifiers.
+    """
+    try:
+        from core.llm.client import _exception_chain
+        chain: Any = list(_exception_chain(exc))
+    except ImportError:
+        chain = [exc]
+    for e in chain:
+        if getattr(e, "llm_truncation", False):
+            return True
+        msg = str(e).lower()
+        if "truncated" in msg or "output token limit" in msg:
+            return True
+    return False
+
+
+# The optional slash gates its own trailing whitespace — the naive
+# ``\s*/?\s*`` put two whitespace spans around it, quadratic on a
+# '<'-opening run.
 _INJECTION_RE = re.compile(
     r"(?:ignore|disregard|forget)\s+(?:all\s+)?(?:previous|above|prior)"
     r"|you\s+are\s+now"
     r"|system\s*(?:prompt|message|instruction)"
-    r"|<\s*/?\s*(?:system|instruction|prompt)",
+    r"|<\s*(?:/\s*)?(?:system|instruction|prompt)",
     re.IGNORECASE,
 )
 
@@ -487,8 +992,8 @@ def _classify_scope(
     if target_rel == ".":
         return items, []
 
-    in_scope: list[StudyItem] = []
-    deps: list[StudyItem] = []
+    in_scope: list[StudyItem] = []  # type: ignore[no-redef]
+    deps: list[StudyItem] = []  # type: ignore[no-redef]
     for item in items:
         if item.file.startswith(target_rel + "/") or item.file == target_rel:
             in_scope.append(item)
@@ -630,6 +1135,16 @@ it in `unresolved_references`).
 - `auth_predicates`: privilege/permission gate functions — the \
   return value decides allow vs deny (kind: `capability`, \
   `permission`, `uid`, or `domain`).
+- `token_checks`: the function(s) implementing the application's \
+  anti-request-forgery enforcement idiom — the call that validates a \
+  per-session/per-request token (CSRF token, form nonce) and \
+  rejects/aborts the request on mismatch (kind: `csrf`, `nonce`, or \
+  `other`). Candidate names often contain token/csrf/nonce, but \
+  classify by the enforcement BEHAVIOUR shown in the provided code, \
+  not the name: a validator named without those words still \
+  qualifies, and a function that only MINTS or ECHOES a token never \
+  does. Name only functions whose enforcement you can see in the \
+  provided items.
 - `security_fields`: struct fields holding privilege, credential, \
   or access-control state (uid/gid fields, capability masks, \
   security flags, ACL pointers).
@@ -1178,6 +1693,27 @@ _RESPONSE_SCHEMA: dict[str, Any] = {
                         "required": ["name"],
                     },
                 },
+                "token_checks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "kind": {
+                                "type": "string",
+                                "enum": ["csrf", "nonce", "other"],
+                            },
+                            "when": {
+                                "type": "string",
+                                "description": (
+                                    "What the check compares and "
+                                    "what happens on mismatch."
+                                ),
+                            },
+                        },
+                        "required": ["name"],
+                    },
+                },
                 "security_fields": {
                     "type": "array",
                     "items": {
@@ -1512,7 +2048,7 @@ def _cluster_items(
     in_scope: list[StudyItem],
     deps: list[StudyItem],
     max_context: int = 20,
-    batch_target: int = 80,
+    batch_target: int = _PHASE2_BATCH_TARGET_HEURISTIC,
 ) -> list[tuple[list[StudyItem], list[StudyItem]]]:
     """Group in-scope items into batches with relevant context.
 
@@ -1934,8 +2470,13 @@ def _apply_receipts(
       ``verbatim`` and carries the verified receipt.
     - An entry whose quotes ALL fail verification is DISCARDED (never
       delivered); the discard is recorded in *discard_sink* with the
-      reason "receipt verification failed" so the consumer can mark
-      the originating reading-list question unresolvable.
+      reason "receipt verification failed" — plus every failed
+      attempt (claimed file, line, per-attempt failure note, bounded
+      quote), so a discard is adjudicable from artifacts: a
+      fabricated quote, an over-normalised rendering, and a
+      wrong-file resolution no longer collapse into one opaque
+      record. The consumer marks the originating reading-list
+      question unresolvable.
     - An entry with no quotes at all is kept but demoted to
       ``llm_summarized`` — tier-gated consumers treat it as an
       unverified hint only.
@@ -1947,14 +2488,21 @@ def _apply_receipts(
     from .receipts import (
         TIER_LLM_SUMMARIZED,
         TIER_VERBATIM,
+        Receipt,
         mechanical_receipt,
         verify_receipt,
     )
 
-    def _discard(kind: str, entry_id: str, names: list[str]) -> None:
+    def _discard(kind: str, entry_id: str, names: list[str],
+                 attempts: list[Receipt]) -> None:
+        # Name the REAL failure class(es) from the attempted receipts
+        # — verify_receipt already discriminates fabricated quote /
+        # file-not-found / unreadable / too-short in Receipt.note, and
+        # a hardcoded "quote not found in source" misreports the rest.
+        classes = sorted({a.note or "unverified" for a in attempts})
         logger.warning(
             "study receipts: discarding %s %r — receipt verification "
-            "failed (quote not found in source)", kind, entry_id,
+            "failed (%s)", kind, entry_id, "; ".join(classes),
         )
         if discard_sink is not None:
             discard_sink.append({
@@ -1962,6 +2510,14 @@ def _apply_receipts(
                 "id": entry_id,
                 "reason": "receipt verification failed",
                 "names": names,
+                # Quotes are bounded: the record is a diagnosis aid,
+                # not a second copy of the study output.
+                "attempts": [{
+                    "file": a.file,
+                    "line": a.line,
+                    "note": a.note,
+                    "quote": (a.quote or "")[:200],
+                } for a in attempts],
             })
 
     kept_concepts: list[Concept] = []
@@ -1972,19 +2528,21 @@ def _apply_receipts(
             kept_concepts.append(c)
             continue
         verified = None
+        attempts: list[Receipt] = []
         for e in quoted:
             r = verify_receipt(source_root, e.file, e.line, e.quote or "")
             if r.verified:
                 r.tier = TIER_VERBATIM
                 verified = r
                 break
+            attempts.append(r)
         if verified is not None:
             c.provenance = TIER_VERBATIM
             c.receipt = verified.to_dict()
             kept_concepts.append(c)
         else:
             names = [e.item for e in c.evidence if e.item]
-            _discard("concept", c.id, [c.id, *names])
+            _discard("concept", c.id, [c.id, *names], attempts)
 
     kept_invariants: list[Invariant] = []
     for inv in invariants:
@@ -2007,7 +2565,7 @@ def _apply_receipts(
             inv.receipt = r.to_dict()
             kept_invariants.append(inv)
         else:
-            _discard("invariant", inv.id, [inv.id, inv.concept])
+            _discard("invariant", inv.id, [inv.id, inv.concept], [r])
 
     item_by_name = {it.name: it for it in focus_items}
     for ct in contracts:
@@ -2057,7 +2615,7 @@ def _stamp_evidence_hashes(
         if full_path is None:
             continue
         spans = [(ev.line, ev.line) for ev in file_evs]  # type: ignore[arg-type]
-        hashes = hash_spans(full_path, spans)
+        hashes = hash_spans(full_path, spans)  # type: ignore[arg-type]
         for ev, h in zip(file_evs, hashes):
             if h:
                 ev.hash = h
@@ -2080,9 +2638,9 @@ def _stamp_contract_hashes(
     for item in focus_items:
         item_by_name[item.name] = item
 
-    by_file: dict[Path, list[tuple[Contract, int, int]]] = {}
+    by_file: dict[Path, list[tuple[Contract, str, int, int]]] = {}
     for ct in contracts:
-        item = item_by_name.get(ct.function)
+        item = item_by_name.get(ct.function)  # type: ignore[assignment]
         if item is None or item.line is None:
             continue
         defn_lines = len(item.definition.splitlines()) if item.definition else 1
@@ -2090,14 +2648,20 @@ def _stamp_contract_hashes(
         full_path = _resolve_in_root(source_root, item.file)
         if full_path is None:
             continue
-        by_file.setdefault(full_path, []).append((ct, item.line, end_line))
+        by_file.setdefault(full_path, []).append(
+            (ct, item.file, item.line, end_line),
+        )
 
     for full_path, entries in by_file.items():
-        spans = [(start, end) for _, start, end in entries]
+        spans = [(start, end) for _, _, start, end in entries]
         hashes = hash_spans(full_path, spans)
-        for (ct, _, _), h in zip(entries, hashes):
+        for (ct, item_file, start, end), h in zip(entries, hashes):
             if h:
                 ct.hash = h
+                # Record the hashed span so check_evidence_staleness
+                # can re-verify the hash later — a bare hash has no
+                # reader without the (file, start, end) it covered.
+                ct.hash_span = {"file": item_file, "start": start, "end": end}
 
 
 def _queue_unresolved(
@@ -2114,22 +2678,49 @@ def _queue_unresolved(
 
     Returns the number of items queued.
     """
-    from .reading_list import Priority, ReadingList, ReadingListItem
+    from .reading_list import (
+        Priority,
+        ReadingList,
+        ReadingListItem,
+        question_scoped_id,
+    )
 
     if not isinstance(reading_list, ReadingList):
         return 0
 
     queued = 0
 
-    for ref in result.get("unresolved_references") or []:
+    refs = result.get("unresolved_references")
+    if not isinstance(refs, list):
+        refs = []
+    for ref in refs:
+        # isinstance guards, not .get defaults: unresolved_references
+        # is LLM output — the array itself, its rows, and every leaf
+        # arrive present-but-null or as the wrong type (int/list file
+        # hints observed), and a non-str persisted into
+        # reading-list.json poisons every later reader that assumes
+        # the str schema.
+        if not isinstance(ref, dict):
+            continue
         name = ref.get("name", "")
         question = ref.get("question", "")
+        if not isinstance(name, str) or not isinstance(question, str):
+            continue
         if not name or not question:
             continue
-        kind = ref.get("kind", "type")
-        file_hint = ref.get("file_hint", "")
+        kind = ref.get("kind")
+        if not isinstance(kind, str) or not kind:
+            kind = "type"
+        file_hint = ref.get("file_hint")
+        if not isinstance(file_hint, str):
+            file_hint = ""
         reading_list.queue(ReadingListItem(
-            id=f"study_unresolved_{_normalise_id(name)}",
+            # Name alone is lossy — two different questions about one
+            # unresolved name must not share an id (the persistence
+            # fold keeps one per identity).
+            id=question_scoped_id(
+                f"study_unresolved_{_normalise_id(name)}", question,
+            ),
             question=question,
             source_command="/understand --study",
             source_file=file_hint,
@@ -2211,12 +2802,13 @@ def _parse_api_vocabulary(
       when the claim is corroborated by a study-prep-extracted signal
       (``paired_with``/``lock_sites``/``alloc_frees`` for pairs,
       ``null_guards`` for nullable returns, ``gate_checks`` for auth
-      predicates), ``llm_summarized`` otherwise (name verified, but
-      the classification is the LLM's judgement).
+      predicates and token checks), ``llm_summarized`` otherwise
+      (name verified, but the classification is the LLM's judgement).
 
     Returns flat entries carrying a ``class`` key (one of
     paired_operations / nullable_returns / auth_predicates /
-    security_fields) for :func:`_assemble_vocabulary`.
+    token_checks / security_fields / fallibility_contracts /
+    resource_limits / state_fields) for :func:`_assemble_vocabulary`.
     """
     from .receipts import TIER_LLM_SUMMARIZED, TIER_MECHANICAL
 
@@ -2315,6 +2907,35 @@ def _parse_api_vocabulary(
             "kind": str(pred.get("kind") or "domain").lower(),
             "provenance": tier,
         })
+
+    # Token checks: enforcement-idiom identification is LEARNED here
+    # (learn-vocab rule) — the name-shape seeds in
+    # core.concepts.token_map.TOKEN_SEED_RE are discovery hints for
+    # candidate selection, never a classification. Same corroboration
+    # signal as auth_predicates: a study-prep-extracted gate_checks
+    # hit earns mechanical tier, otherwise the classification is the
+    # LLM's judgement (llm_summarized).
+    for tc in vocab_raw.get("token_checks") or []:
+        if not isinstance(tc, dict):
+            continue
+        name = _bare_name(str(tc.get("name") or ""))
+        if not name:
+            continue
+        if name not in universe:
+            _discard("token_checks", name)
+            continue
+        tier = (
+            TIER_MECHANICAL if name in gate_signal else TIER_LLM_SUMMARIZED
+        )
+        entry = {
+            "class": "token_checks",
+            "name": name,
+            "kind": str(tc.get("kind") or "other").lower(),
+            "provenance": tier,
+        }
+        if tc.get("when"):
+            entry["when"] = str(tc["when"])
+        entries.append(entry)
 
     for fld in vocab_raw.get("security_fields") or []:
         if not isinstance(fld, dict):
@@ -2456,8 +3077,9 @@ def _assemble_vocabulary(
     list[dict[str, Any]], list[dict[str, Any]],
     list[dict[str, Any]],
     list[dict[str, Any]], list[dict[str, Any]],
+    list[dict[str, Any]],
 ]:
-    """Dedup flat vocab entries into the seven DomainModel lists.
+    """Dedup flat vocab entries into the eight DomainModel lists.
 
     Keyed by (acquire, release, kind) for pairs and the entry name
     (``name`` / ``field`` / ``field_or_macro``) for the name classes;
@@ -2479,10 +3101,11 @@ def _assemble_vocabulary(
         "fallibility_contracts": {},
         "resource_limits": {},
         "state_fields": {},
+        "token_checks": {},
     }
     for entry in entries:
         vclass = entry.get("class")
-        bucket = by_class.get(vclass)
+        bucket = by_class.get(vclass)  # type: ignore[arg-type]
         if bucket is None:
             continue
         entry = {k: v for k, v in entry.items() if k != "class"}
@@ -2508,6 +3131,7 @@ def _assemble_vocabulary(
         list(by_class["fallibility_contracts"].values()),
         list(by_class["resource_limits"].values()),
         list(by_class["state_fields"].values()),
+        list(by_class["token_checks"].values()),
     )
 
 
@@ -2525,52 +3149,102 @@ def _run_one_batch(
     correlate: list[str] | None = None,
     discard_sink: list | None = None,
     vocab_sink: list | None = None,
+    max_tokens: int | None = None,
+    wall_timeout: float | None = None,
 ) -> tuple[
     list[Concept], list[Invariant], list[Contract],
     list[BugPattern], list[dict[str, str]],
 ]:
-    """Execute a single Phase 2 batch (blocking). Thread-safe."""
+    """Execute a single Phase 2 batch (blocking). Thread-safe.
+
+    ``max_tokens`` / ``wall_timeout`` override the standard request
+    ceiling and wall for the split ladder's one-shot escalated retry;
+    ``None`` keeps the model-derived defaults.
+    """
     if on_batch:
         on_batch(idx, total, focus)
+
+    request_max_tokens = (
+        max_tokens
+        if max_tokens is not None
+        else _study_max_output_tokens(_client_model_name(llm_client))
+    )
+    wall = (
+        wall_timeout if wall_timeout is not None
+        else float(_BATCH_WALL_TIMEOUT)
+    )
 
     prompt = _build_batch_prompt(
         focus, context, target,
         doc_context=doc_context, correlate=correlate,
     )
 
-    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    future = ex.submit(
-        llm_client.generate_structured,
-        prompt, _RESPONSE_SCHEMA,
-        system_prompt=_SYSTEM_PROMPT, task_type="study",
-        max_tokens=_study_max_output_tokens(),
-        # Study batches are the canonical long structured call —
-        # per-call streaming opt-in (SSE-capable surfaces honour it,
-        # others ignore it).
-        stream=True,
+    # Daemon worker thread, not a ThreadPoolExecutor: a wall-timeout
+    # cannot cancel the RUNNING call either way (the thread lives
+    # until the call returns), but executor threads are non-daemon and
+    # joined at interpreter exit — one hung API call per timed-out
+    # batch used to block study process exit indefinitely. A daemon
+    # thread leaks only until the stray call returns and never holds
+    # the process hostage.
+    import queue as _queue
+    import threading as _threading
+
+    result_q: _queue.Queue = _queue.Queue(maxsize=1)
+
+    def _call() -> None:
+        try:
+            result_q.put(("ok", llm_client.generate_structured(
+                prompt, _RESPONSE_SCHEMA,
+                system_prompt=_SYSTEM_PROMPT, task_type="study",
+                max_tokens=request_max_tokens,
+                # Study batches are the canonical long structured
+                # call — per-call streaming opt-in (SSE-capable
+                # surfaces honour it, others degrade to plain
+                # create). The one-shot cap escalation keys on this
+                # opt-in resolved against the surface's capability
+                # (``_batch_call_streams``).
+                stream=_BATCH_CALLS_STREAM,
+            )))
+        except BaseException as exc:  # noqa: BLE001 — marshalled to caller
+            result_q.put(("err", exc))
+
+    worker = _threading.Thread(
+        target=_call, daemon=True, name=f"study-batch-{idx + 1}",
     )
+    worker.start()
     try:
-        response = future.result(timeout=_BATCH_WALL_TIMEOUT)
-        result = structured_result(response)
-    except concurrent.futures.TimeoutError:
-        future.cancel()
-        ex.shutdown(wait=False, cancel_futures=True)
+        kind, payload = result_q.get(timeout=wall)
+    except _queue.Empty:
         logger.warning(
-            "Phase 2 batch %d/%d wall-timeout (%ds)",
-            idx + 1, total, _BATCH_WALL_TIMEOUT,
+            # The EFFECTIVE wall for this attempt (an escalated retry
+            # stretches it past the base constant); %g keeps integral
+            # walls clean ("990s", not "990.0s").
+            "Phase 2 batch %d/%d wall-timeout (%gs)",
+            idx + 1, total, wall,
         )
         msg = f"batch {idx + 1}/{total} wall-timeout"
-        raise _BatchLLMError(msg)
-    except Exception as exc:
-        ex.shutdown(wait=False)
+        raise _BatchLLMError(msg) from None
+    if kind == "err":
+        try:
+            from core.llm.client import is_budget_exceeded_error
+            budget = is_budget_exceeded_error(payload)
+        except ImportError:
+            budget = False
+        if budget:
+            # Terminal for the phase, not a batch-shaped failure —
+            # classified before the generic wrap so the loops can
+            # stop dispatching instead of churning.
+            msg = f"batch {idx + 1}/{total}: {payload}"
+            raise _PhaseBudgetExhausted(msg) from payload
         logger.warning(
             "Phase 2 batch %d/%d failed", idx + 1, total,
-            exc_info=True,
+            exc_info=payload,
         )
-        msg = f"batch {idx + 1}/{total}: {exc}"
-        raise _BatchLLMError(msg) from exc
-    else:
-        ex.shutdown(wait=False)
+        msg = f"batch {idx + 1}/{total}: {payload}"
+        raise _BatchLLMError(
+            msg, truncation=_is_truncation_error(payload),
+        ) from payload
+    result = structured_result(payload)
 
     if not isinstance(result, dict):
         logger.warning("Phase 2 batch %d: non-dict response", idx + 1)
@@ -2621,6 +3295,210 @@ def _run_one_batch(
     return concepts, invariants, contracts, bug_patterns, struct_annots
 
 
+def _run_batch_splitting_on_truncation(
+    idx: int,
+    total: int,
+    focus: list[StudyItem],
+    context: list[StudyItem],
+    target: str,
+    source_root: str,
+    llm_client: Any,
+    reading_list: Any,
+    on_batch: Any,
+    doc_context: str = "",
+    correlate: list[str] | None = None,
+    discard_sink: list | None = None,
+    vocab_sink: list | None = None,
+    trunc_events: list | None = None,
+) -> tuple[
+    list[Concept], list[Invariant], list[Contract],
+    list[BugPattern], list[dict[str, str]],
+]:
+    """Run one batch, halving-and-retrying on output truncation.
+
+    A truncated response means the batch's CONTENT outgrew the output
+    budget, not that the provider failed — an identical re-send
+    re-truncates deterministically. Before splitting, the SAME batch
+    is retried ONCE at an escalated ceiling
+    (``_escalated_output_tokens``): the standard cap sits well below
+    most models' max_output, so a content-sized batch often fits one
+    step up and the whole split subtree (each level a fresh
+    full-prompt paid call) is skipped. The retry is one-shot per
+    batch level — when it truncates too, the normal split path
+    engages, and each half fits twice the per-item budget. Recurses
+    down to single items; a single item that still truncates past its
+    own escalated retry is recorded as failed (log + discard record)
+    and its siblings' results are returned, so one oversized item can
+    never zero out a batch, let alone the phase.
+
+    Failure semantics: only errors whose OWN ``truncation`` flag is
+    set are absorbed by the split loop. Any non-truncation
+    ``_BatchLLMError`` from a half re-raises and fails the whole
+    batch honestly (its sibling's results are dropped in favour of
+    correct breaker accounting — a transport failure must reach the
+    consecutive-failure abort, never be laundered into a
+    truncation-flagged partial success). The escalated retry is the
+    one exception: its subject batch ALREADY failed with truncation
+    first-hand, so however the opportunistic retry dies (truncation,
+    wall-timeout, transport), the batch keeps its established
+    truncation classification and proceeds to the split path exactly
+    as if the escalation had never run — downstream behavior
+    unchanged (a genuinely downed provider fails the split ladder's
+    own calls, which DO reach the breaker). ``_PhaseBudgetExhausted``
+    still propagates from the retry untouched. Raises
+    truncation-flagged ``_BatchLLMError`` only when every item
+    truncated.
+
+    The recursion and the escalated retry run OUTSIDE the ``except``
+    handler on purpose: inside it, Python chains every new
+    exception's ``__context__`` to the truncation error being
+    handled, and the chain-walking classifier would then read
+    unrelated transport failures as truncation.
+
+    ``trunc_events``: caller-owned sink recording each ITEM the
+    ladder terminally discarded — still truncating past its own
+    escalated retry (or the retry's stand-down) with nothing left to
+    split. Appended once at the discarding leaf and at NO level above
+    it, so a salvaged batch's record count equals its discarded items
+    regardless of batch size or ladder depth (one oversized item in a
+    batch of 32 is one record, not one per halving level — the unit
+    the consumer's per-item lane budget is sized in). Escalation- and
+    split-cured truncations are deliberately absent, and on a batch
+    that terminally FAILS the phase loops discard the sink's records
+    (success-only fold), so a terminal failure is never stacked with
+    its own leaf records: the sink exists solely to surface per-item
+    discards inside batches that limped to success without
+    re-counting the terminal failures the loops already account for
+    themselves.
+    """
+    trunc_exc: _BatchLLMError | None = None
+    try:
+        return _run_one_batch(
+            idx, total, focus, context, target, source_root,
+            llm_client, reading_list, on_batch, doc_context=doc_context,
+            correlate=correlate, discard_sink=discard_sink,
+            vocab_sink=vocab_sink,
+        )
+    except _BatchLLMError as exc:
+        if not exc.truncation:
+            raise
+        trunc_exc = exc
+
+    # From here down we are outside the handler (see docstring).
+    escalated = _escalated_output_tokens(
+        _client_model_name(llm_client), llm_client,
+    )
+    if escalated is not None:
+        logger.warning(
+            "Phase 2 batch %d/%d: response truncated at %d items — "
+            "retrying once at an escalated output ceiling (%d tokens) "
+            "before splitting",
+            idx + 1, total, len(focus), escalated,
+        )
+        try:
+            return _run_one_batch(
+                idx, total, focus, context, target, source_root,
+                llm_client, reading_list,
+                # Progress was already reported for the full batch;
+                # the escalated retry stays silent.
+                None,
+                doc_context=doc_context, correlate=correlate,
+                discard_sink=discard_sink, vocab_sink=vocab_sink,
+                max_tokens=escalated,
+                wall_timeout=_escalated_wall_timeout(escalated),
+            )
+        except _PhaseBudgetExhausted:
+            raise
+        except _BatchLLMError as retry_exc:
+            # Keep the batch's first-hand truncation classification
+            # (see docstring); when the retry itself truncated, its
+            # fresher error carries the escalated-cap context.
+            if retry_exc.truncation:
+                trunc_exc = retry_exc
+
+    if len(focus) <= 1:
+        item = focus[0] if focus else None
+        if item is not None:
+            logger.warning(
+                "Phase 2 batch %d/%d: single item %s (%s) still "
+                "truncates the output budget — recording it as "
+                "failed and continuing with the rest",
+                idx + 1, total, item.name, item.file,
+            )
+            if discard_sink is not None:
+                discard_sink.append({
+                    "kind": "item",
+                    "id": item.name,
+                    "reason": "batch response truncated at the "
+                              "output token limit for this single "
+                              "item",
+                    "names": [item.name],
+                })
+            if trunc_events is not None:
+                # Terminal leaf — the ONLY ladder level that records
+                # (see docstring): one record per discarded item keeps
+                # the fold depth- and batch-size-independent.
+                # GIL-atomic list.append — same sharing convention as
+                # discard_sink/vocab_sink.
+                trunc_events.append({
+                    "items": 1,
+                    "escalated": escalated is not None,
+                })
+        raise trunc_exc
+
+    mid = len(focus) // 2
+    if not 0 < mid < len(focus):
+        # Unsplittable despite len(focus) >= 2 would mean an empty
+        # half recursing forever on the same input — surface the
+        # truncation instead of hanging.
+        raise trunc_exc
+    logger.warning(
+        "Phase 2 batch %d/%d: response truncated at %d items — "
+        "splitting in half and retrying",
+        idx + 1, total, len(focus),
+    )
+    combined: tuple[list, list, list, list, list] = (
+        [], [], [], [], [],
+    )
+    succeeded = False
+    last_trunc: _BatchLLMError | None = None
+    for half in (focus[:mid], focus[mid:]):
+        try:
+            parts = _run_batch_splitting_on_truncation(
+                idx, total, half, context, target, source_root,
+                llm_client, reading_list,
+                # Progress was already reported for the full
+                # batch; retried halves stay silent.
+                None,
+                doc_context=doc_context, correlate=correlate,
+                discard_sink=discard_sink, vocab_sink=vocab_sink,
+                trunc_events=trunc_events,
+            )
+        except _PhaseBudgetExhausted as stop:
+            # Salvage the sibling half's already-paid results onto
+            # the budget stop before it propagates (see the class
+            # docstring) — a budget trip must never convert paid
+            # partial coverage into an empty-handed failure.
+            for acc, part in zip(stop.partial, combined):
+                acc.extend(part)
+            raise
+        except _BatchLLMError as sub:
+            if sub.truncation:
+                last_trunc = sub
+                continue
+            # Non-truncation failure in a split subtree: fail the
+            # batch honestly (never silently absorbed, never
+            # truncation-masked) so the provider-health breaker
+            # sees it.
+            raise
+        succeeded = True
+        for acc, part in zip(combined, parts):  # type: ignore[assignment]
+            acc.extend(part)
+    if not succeeded and last_trunc is not None:
+        raise last_trunc
+    return combined
+
+
 def run_phase2(
     items: list[StudyItem],
     target: str,
@@ -2633,7 +3511,9 @@ def run_phase2(
     correlate: list[str] | None = None,
     discard_sink: list | None = None,
     vocab_sink: list | None = None,
-    batch_target: int = 80,
+    batch_target: int | None = None,
+    should_stop: Any = None,
+    phase_stats: dict | None = None,
 ) -> tuple[
     list[Concept], list[Invariant], list[Contract],
     list[BugPattern], list[dict[str, str]],
@@ -2642,6 +3522,27 @@ def run_phase2(
 
     When the model's RPM allows it, batches run in parallel using
     ``derive_max_workers`` from the audit executor to cap concurrency.
+
+    ``batch_target``: items per batch. ``None`` (the default) means
+    "compute it" — ``_phase2_batch_target`` folds the output-budget
+    ceiling into the heuristic at computation time. An explicit value
+    is the operator's ask and is honoured up to the ceiling.
+
+    ``should_stop``: zero-arg callable polled at every batch boundary;
+    True stops dispatching NEW paid calls (in-flight batches finish).
+    The audit study consumer passes its queue's stop flag here — the
+    drain path's cooperative stop previously could not reach a running
+    phase, and an abandoned daemon thread kept buying batches until
+    process exit. ``phase_stats``: caller-owned dict this phase fills
+    with failure accounting (``batches_failed``,
+    ``truncation_failures``, ``truncation_capped``) — exceptions only
+    surface the all-failed case, and the consumer's burn breaker needs
+    to see partial-failure churn too. ``truncation_failures`` counts
+    terminally truncation-failed batches PLUS items the split ladder
+    terminally discarded inside batches it salvaged — one count per
+    discarded item, independent of batch size and ladder depth (each
+    such item re-bought paid calls even though its batch limped to
+    success); ``truncation_capped`` keys on the terminal count only.
 
     Returns:
         (concepts, invariants, contracts, bug_patterns, struct_annotations)
@@ -2658,16 +3559,36 @@ def run_phase2(
         len(in_scope), len(deps),
     )
 
+    # Batch sizing: the DEFAULT target is computed within the
+    # output-budget ceiling (``_phase2_batch_target`` folds the
+    # ceiling in at computation time), so it never needs a clamp.
+    # Only an EXPLICIT operator target above the ceiling is clamped
+    # (never replaced) — with disclosure, because the response budget
+    # cannot honour the ask: a batch whose structured response cannot
+    # fit under the per-call output cap truncates deterministically
+    # and wastes the whole round-trip before split-retry recovers.
+    if batch_target is None:
+        batch_target = _phase2_batch_target()
+        logger.debug(
+            "Phase 2: batch target %d (computed within the "
+            "output-budget ceiling)", batch_target,
+        )
+    else:
+        ceiling = _phase2_batch_ceiling()
+        if batch_target > ceiling:
+            logger.info(
+                "Phase 2: batch_target %d exceeds the output-budget "
+                "ceiling %d (%d-token response budget / ~%d tokens per "
+                "item) — clamping",
+                batch_target, ceiling, _study_text_output_tokens(),
+                _PHASE2_ITEM_OUTPUT_TOKENS_EST,
+            )
+            batch_target = ceiling
+
     batches = _cluster_items(in_scope, deps, batch_target=batch_target)
 
     from core.llm.concurrency import derive_max_workers
-    model_name = getattr(llm_client, "model", None)
-    if not isinstance(model_name, str):
-        cfg = getattr(llm_client, "config", None)
-        pm = getattr(cfg, "primary_model", None)
-        model_name = getattr(pm, "model_name", "") if pm else ""
-    if not isinstance(model_name, str):
-        model_name = ""
+    model_name = _client_model_name(llm_client)
     max_workers = derive_max_workers(model_name) if model_name else 1
     max_workers = min(max_workers, len(batches))
 
@@ -2676,7 +3597,8 @@ def run_phase2(
             batches, target, source_root, llm_client,
             on_batch, reading_list, doc_context=doc_context,
             correlate=correlate, discard_sink=discard_sink,
-            vocab_sink=vocab_sink,
+            vocab_sink=vocab_sink, should_stop=should_stop,
+            phase_stats=phase_stats,
         )
 
     logger.info("Phase 2: parallel dispatch, max_workers=%d", max_workers)
@@ -2684,7 +3606,8 @@ def run_phase2(
         batches, target, source_root, llm_client,
         on_batch, reading_list, max_workers, doc_context=doc_context,
         correlate=correlate, discard_sink=discard_sink,
-        vocab_sink=vocab_sink,
+        vocab_sink=vocab_sink, should_stop=should_stop,
+        phase_stats=phase_stats,
     )
 
 
@@ -2699,6 +3622,8 @@ def _run_phase2_serial(
     correlate: list[str] | None = None,
     discard_sink: list | None = None,
     vocab_sink: list | None = None,
+    should_stop: Any = None,
+    phase_stats: dict | None = None,
 ) -> tuple[
     list[Concept], list[Invariant], list[Contract],
     list[BugPattern], list[dict[str, str]],
@@ -2710,48 +3635,158 @@ def _run_phase2_serial(
     all_struct_annots: list[dict[str, str]] = []
     total = len(batches)
     consecutive_failures = 0
+    truncation_failures = 0
+    salvaged_truncations = 0
     failures = 0
     successes = 0
+    stopped = False
+    budget_stop_msg: str | None = None
+
+    def _note_stats() -> None:
+        if phase_stats is not None:
+            phase_stats["batches_failed"] = failures
+            # Terminal batch failures PLUS items the split ladder
+            # terminally discarded inside batches it salvaged: the
+            # consumer's per-lane truncation budget must see sub-cap
+            # churn even when each batch limps to success — in the
+            # budget's own unit (one count per discarded ITEM,
+            # independent of ladder depth; the ladder records only at
+            # the discarding leaf). A terminally failed batch
+            # contributes only its terminal +1 — its ladder events
+            # are discarded, never double-counted.
+            phase_stats["truncation_failures"] = (
+                truncation_failures + salvaged_truncations
+            )
+            # The phase-halt marker stays keyed to TERMINAL
+            # truncations only — salvaged churn is budget-relevant
+            # but not "this configuration produces no output".
+            phase_stats["truncation_capped"] = (
+                truncation_failures >= _TRUNCATION_FAIL_LIMIT
+            )
 
     for idx, (focus, context) in enumerate(batches):
+        if should_stop is not None and should_stop():
+            # Cooperative stop between paid calls: results already
+            # earned are kept, nothing new is bought.
+            logger.info(
+                "Phase 2: stop requested at batch %d/%d — halting "
+                "dispatch", idx + 1, total,
+            )
+            stopped = True
+            break
+        batch_trunc_events: list = []
         try:
             concepts, invariants, contracts, bug_patterns, struct_annots = (
-                _run_one_batch(
+                _run_batch_splitting_on_truncation(
                     idx, total, focus, context, target, source_root,
                     llm_client, reading_list, on_batch, doc_context=doc_context,
                     correlate=correlate, discard_sink=discard_sink,
                     vocab_sink=vocab_sink,
+                    trunc_events=batch_trunc_events,
                 )
             )
-        except _BatchLLMError:
-            consecutive_failures += 1
+        except _PhaseBudgetExhausted as exc:
             failures += 1
+            budget_stop_msg = str(exc)
+            # A budget stop is deterministic — every remaining batch
+            # would fail identically, so stop dispatching NOW and
+            # keep the partial coverage already earned. Distinct from
+            # the consecutive-failure abort: this is a chosen spend
+            # cap, not a provider outage.
+            if any(exc.partial):
+                # Paid results salvaged from inside the failing
+                # batch (a split sibling that finished before the
+                # cap tripped) count as coverage — never let the
+                # empty-model guard discard money already spent.
+                for acc, part in zip(
+                    (all_concepts, all_invariants, all_contracts,
+                     all_bug_patterns, all_struct_annots),
+                    exc.partial,
+                ):
+                    acc.extend(part)  # type: ignore[attr-defined]
+                successes += 1
+            logger.error(
+                "Phase 2: LLM budget exhausted at batch %d/%d — "
+                "stopping cleanly with %d completed batch(es): %s",
+                idx + 1, total, successes, exc,
+            )
+            break
+        except _BatchLLMError as exc:
+            failures += 1
+            if exc.truncation:
+                # Content outgrew the output budget and the split
+                # retries were already exhausted — says nothing about
+                # provider health, so it never feeds the
+                # consecutive-failure abort (which exists to stop
+                # paying a downed provider). It DOES feed the
+                # cumulative cap: persistent truncation after
+                # splitting is config-shaped (output budget vs model)
+                # and every further batch re-buys it at full price.
+                truncation_failures += 1
+                if truncation_failures >= _TRUNCATION_FAIL_LIMIT:
+                    logger.error(
+                        "Phase 2: %d output-truncation batch failures "
+                        "— output budget misconfigured for this model; "
+                        "halting the phase (raise "
+                        "RAPTOR_STUDY_MAX_OUTPUT_TOKENS or shrink "
+                        "--batch-target)",
+                        truncation_failures,
+                    )
+                    break
+                continue
+            consecutive_failures += 1
             if consecutive_failures >= _CONSECUTIVE_FAIL_LIMIT:
                 logger.error(
-                    "Phase 2: %d consecutive batch failures — aborting "
-                    "(provider may be down or budget exceeded)",
+                    "Phase 2: %d consecutive batch failures — "
+                    "aborting (provider may be down)",
                     consecutive_failures,
                 )
                 break
             continue
         consecutive_failures = 0
         successes += 1
+        # The batch made it — each item its ladder terminally
+        # discarded is one salvaged-churn count (leaf-only records
+        # keep the fold depth-independent; terminally failed batches
+        # raised instead, discarding their events, so nothing is
+        # counted twice).
+        salvaged_truncations += len(batch_trunc_events)
         all_concepts.extend(concepts)
         all_invariants.extend(invariants)
         all_contracts.extend(contracts)
         all_bug_patterns.extend(bug_patterns)
         all_struct_annots.extend(struct_annots)
 
-    if total and successes == 0 and failures:
+    _note_stats()
+    if total and successes == 0 and failures and not stopped:
         # Zero successful batches with at least one LLM failure —
         # "the run never happened", not "the code contains nothing".
         # A silently-empty result would synthesise and persist an
         # empty domain model, poisoning the project-canonical model
         # and churning every journal entry's domain_model_hash.
-        raise _BatchLLMError(
-            f"all {failures} attempted Phase 2 batch(es) failed — "
-            "no study output; refusing to synthesise an empty domain "
-            "model")
+        if budget_stop_msg is not None:
+            # Name the root cause: the spend cap stopped the phase
+            # before ANY batch yielded — "budget exhausted", not a
+            # generic all-failed symptom two consumers removed from
+            # the cap that tripped.
+            err = _BatchLLMError(
+                "LLM budget exhausted with 0 completed Phase 2 "
+                "batch(es) — no study output; refusing to "
+                "synthesise an empty domain model "
+                f"({budget_stop_msg})")
+            err.budget_exhausted = True
+        else:
+            err = _BatchLLMError(
+                f"all {failures} attempted Phase 2 batch(es) failed "
+                "— no study output; refusing to synthesise an empty "
+                "domain model")
+        if truncation_failures >= _TRUNCATION_FAIL_LIMIT:
+            # Deterministic-config marker: the consumer disables the
+            # study lane on sight instead of counting strikes — the
+            # same configuration re-buys the same failure on every
+            # future invocation.
+            err.config_shaped = True  # type: ignore[attr-defined]
+        raise err
 
     return (all_concepts, all_invariants, all_contracts,
             all_bug_patterns, all_struct_annots)
@@ -2769,6 +3804,8 @@ def _run_phase2_parallel(
     correlate: list[str] | None = None,
     discard_sink: list | None = None,
     vocab_sink: list | None = None,
+    should_stop: Any = None,
+    phase_stats: dict | None = None,
 ) -> tuple[
     list[Concept], list[Invariant], list[Contract],
     list[BugPattern], list[dict[str, str]],
@@ -2781,36 +3818,103 @@ def _run_phase2_parallel(
     _abort = _threading.Event()
     _fail_lock = _threading.Lock()
     _consecutive_failures = [0]
+    _truncation_failures = [0]
+    _salvaged_truncations = [0]
 
     _successes = [0]
 
     def _do_batch(args: tuple[int, list[StudyItem], list[StudyItem]]) -> tuple:
         if _abort.is_set():
             return ([], [], [], [], [])
+        if should_stop is not None and should_stop():
+            # Cooperative stop between paid calls — same contract as
+            # the serial loop; queued batches drain without buying.
+            _abort.set()
+            return ([], [], [], [], [])
         idx, focus, ctx = args
-        result = _run_one_batch(
+        batch_trunc_events: list = []
+        result = _run_batch_splitting_on_truncation(
             idx, total, focus, ctx, target, source_root,
             llm_client, reading_list, on_batch,
             doc_context=doc_context, correlate=correlate,
             discard_sink=discard_sink, vocab_sink=vocab_sink,
+            trunc_events=batch_trunc_events,
         )
         with _fail_lock:
             _consecutive_failures[0] = 0
             _successes[0] += 1
+            # Items the ladder terminally discarded inside a batch
+            # that still made it — one count per item, see the
+            # sequential path's twin. A terminally failed batch never
+            # reaches here; its events die with this thread-local
+            # list, so terminal counts once.
+            _salvaged_truncations[0] += len(batch_trunc_events)
         return result
 
     items = [(i, focus, ctx) for i, (focus, ctx) in enumerate(batches)]
 
     _failed = [0]
 
+    _budget_stopped = [False]
+    _budget_stop_msg: list[str | None] = [None]
+
     def _on_batch_error(item: Any, exc: Exception) -> tuple:
+        if isinstance(exc, _PhaseBudgetExhausted):
+            # Deterministic spend-cap trip — stop dispatching, keep
+            # the partial coverage; see the sequential path's twin.
+            salvaged = any(exc.partial)
+            with _fail_lock:
+                _failed[0] += 1
+                if salvaged:
+                    # Paid split-sibling results ride the exception;
+                    # returning them (instead of the empty tuple)
+                    # folds them into the phase output and keeps the
+                    # empty-model guard honest.
+                    _successes[0] += 1
+                first = not _budget_stopped[0]
+                _budget_stopped[0] = True
+                if first:
+                    _budget_stop_msg[0] = str(exc)
+                completed = _successes[0]
+                _abort.set()
+            if first:
+                # Unlike the sequential twin, this count is only a
+                # lower bound: batches already past the abort check
+                # keep running and fold in after this line prints —
+                # the post-join summary below carries the final count.
+                logger.error(
+                    "Phase 2: LLM budget exhausted — stopping "
+                    "dispatch (%d batch(es) done at the trip; "
+                    "in-flight batches still fold in): %s",
+                    completed, exc,
+                )
+            return exc.partial
+        truncated = (
+            isinstance(exc, _BatchLLMError) and exc.truncation
+        )
         with _fail_lock:
             _failed[0] += 1
-            _consecutive_failures[0] += 1
+            # Truncation is content-sized, already split-retried, and
+            # no provider-health signal — see the sequential path. It
+            # still counts toward the cumulative config-shaped cap.
+            if truncated:
+                _truncation_failures[0] += 1
+                if _truncation_failures[0] == _TRUNCATION_FAIL_LIMIT:
+                    logger.error(
+                        "Phase 2: %d output-truncation batch failures "
+                        "— output budget misconfigured for this "
+                        "model; halting the phase (raise "
+                        "RAPTOR_STUDY_MAX_OUTPUT_TOKENS or shrink "
+                        "--batch-target)",
+                        _truncation_failures[0],
+                    )
+                    _abort.set()
+            else:
+                _consecutive_failures[0] += 1
             if _consecutive_failures[0] >= _CONSECUTIVE_FAIL_LIMIT:
                 logger.error(
-                    "Phase 2: %d consecutive batch failures — aborting "
-                    "(provider may be down or budget exceeded)",
+                    "Phase 2: %d consecutive batch failures — "
+                    "aborting (provider may be down)",
                     _consecutive_failures[0],
                 )
                 _abort.set()
@@ -2821,20 +3925,56 @@ def _run_phase2_parallel(
             )
         return ([], [], [], [], [])
 
-    results = run_parallel(
+    results: list = run_parallel(
         items, _do_batch,
         max_workers=max_workers,
         label="study-p2",
         on_error=_on_batch_error,
     )
 
-    if items and _successes[0] == 0 and _failed[0]:
+    if phase_stats is not None:
+        with _fail_lock:
+            phase_stats["batches_failed"] = _failed[0]
+            # Terminal + salvaged, capped on terminal only — see the
+            # sequential path's _note_stats for the rationale.
+            phase_stats["truncation_failures"] = (
+                _truncation_failures[0] + _salvaged_truncations[0]
+            )
+            phase_stats["truncation_capped"] = (
+                _truncation_failures[0] >= _TRUNCATION_FAIL_LIMIT
+            )
+
+    if _budget_stopped[0]:
+        # The trip-time line above could only see a lower bound.
+        # run_parallel has joined every worker here, so this count is
+        # the final one — the record the operator should trust.
+        with _fail_lock:
+            logger.error(
+                "Phase 2: budget-stopped — kept output from %d of "
+                "%d batch(es)", _successes[0], total,
+            )
+
+    _ext_stop = should_stop is not None and should_stop()
+    if items and _successes[0] == 0 and _failed[0] and not _ext_stop:
         # Zero successful batches with at least one LLM failure — the
         # run never happened; see the sequential path's twin check.
-        raise _BatchLLMError(
-            f"all {_failed[0]} attempted Phase 2 batch(es) failed — "
-            "no study output; refusing to synthesise an empty domain "
-            "model")
+        if _budget_stop_msg[0] is not None:
+            # Name the root cause — see the sequential twin.
+            err = _BatchLLMError(
+                "LLM budget exhausted with 0 completed Phase 2 "
+                "batch(es) — no study output; refusing to "
+                "synthesise an empty domain model "
+                f"({_budget_stop_msg[0]})")
+            err.budget_exhausted = True
+        else:
+            err = _BatchLLMError(
+                f"all {_failed[0]} attempted Phase 2 batch(es) "
+                "failed — no study output; refusing to synthesise "
+                "an empty domain model")
+        if _truncation_failures[0] >= _TRUNCATION_FAIL_LIMIT:
+            # Deterministic-config marker — see the sequential twin.
+            err.config_shaped = True  # type: ignore[attr-defined]
+        raise err
 
     all_concepts: list[Concept] = []
     all_invariants: list[Invariant] = []
@@ -2896,8 +4036,17 @@ def _dedup_concepts(concepts: list[Concept]) -> list[Concept]:
 def _dedup_invariants(
     invariants: list[Invariant],
     valid_concepts: set[str],
+    discard_sink: list | None = None,
 ) -> list[Invariant]:
-    """Deduplicate invariants, dropping those with orphan concept refs."""
+    """Deduplicate invariants, dropping those with orphan concept refs.
+
+    Orphan drops are recorded to *discard_sink* (same record shape as
+    the receipt-verification discards): a receipt-VERIFIED invariant
+    can die here when its concept was discarded upstream, and the
+    accounting contract is total over discards — the consumer marks
+    the originating reading-list question unresolvable instead of
+    losing the invariant without trace.
+    """
     by_id: dict[str, Invariant] = {}
     for inv in invariants:
         norm = _normalise_id(inv.id)
@@ -2907,6 +4056,13 @@ def _dedup_invariants(
                 "Dropping invariant %s: concept %s not found",
                 inv.id, inv.concept,
             )
+            if discard_sink is not None:
+                discard_sink.append({
+                    "kind": "invariant",
+                    "id": inv.id,
+                    "reason": "orphan concept reference",
+                    "names": [inv.concept] if inv.concept else [],
+                })
             continue
         inv.id = norm
         inv.concept = concept_norm
@@ -3058,8 +4214,14 @@ def _semantic_dedup_concepts(concepts: list[Concept]) -> list[Concept]:
 def _semantic_dedup_invariants(
     invariants: list[Invariant],
     valid_concepts: set[str],
+    discard_sink: list | None = None,
 ) -> list[Invariant]:
-    """Merge semantically similar invariants (high keyword overlap on statement)."""
+    """Merge semantically similar invariants (high keyword overlap on statement).
+
+    Merge-group winners whose concept is orphaned are dropped like the
+    phase-3 dedup drops them — and recorded to *discard_sink* the same
+    way (the accounting contract is total over discards).
+    """
     if len(invariants) <= 1:
         return invariants
 
@@ -3123,6 +4285,13 @@ def _semantic_dedup_invariants(
                     winner.provenance = donor.provenance
         if winner.concept in valid_concepts:
             merged.append(winner)
+        elif discard_sink is not None:
+            discard_sink.append({
+                "kind": "invariant",
+                "id": winner.id,
+                "reason": "orphan concept reference",
+                "names": [winner.concept] if winner.concept else [],
+            })
 
     if len(merged) < len(invariants):
         logger.info(
@@ -3193,6 +4362,64 @@ _LOCAL_SOCKET_MARKERS = frozenset({
     "AF_ALG", "AF_UNIX", "AF_LOCAL", "AF_NETLINK",
     "PF_ALG", "sock_create(", "kernel_bind(",
 })
+
+
+# Caps for the security-context marker scan. Both directions matter
+# for each: too low and a large target's marker-bearing files (socket
+# setup, capability checks) fall outside the sample, silently losing
+# the severity-context prompt section; too high and every study pass
+# walks/reads an unbounded amount of tree for a coarse five-field
+# heuristic (a study-list source_root of "/" must stay cheap). 200
+# files of markers saturates the classifier's thresholds (>=2 kernel
+# hits, any-of for the rest); 1000 directories reaches the source
+# dirs of every real layout seen so far.
+_SECURITY_CONTEXT_MAX_FILES = 200
+_SECURITY_CONTEXT_MAX_DIRS = 1000
+
+
+def _collect_security_context_texts(src_root: Path) -> dict[str, str]:
+    """Gather C source texts for ``infer_security_context``.
+
+    Recursive with file AND directory caps — the previous top-level
+    ``iterdir()`` scan missed every target that keeps sources in
+    subdirectories (the common layout), so ``security_context`` was
+    silently None and the severity-context prompt section never
+    rendered. The walk is top-down with sorted entries (deterministic
+    sample under the caps), skips dot-directories (VCS internals
+    carry no markers), and does not follow directory symlinks. Keys
+    are root-relative so same-named files in different directories
+    don't collapse.
+    """
+    from core.source import read_text_capped
+
+    source_texts: dict[str, str] = {}
+    dirs_seen = 0
+    for dirpath, dirnames, filenames in os.walk(src_root):
+        dirs_seen += 1
+        if dirs_seen > _SECURITY_CONTEXT_MAX_DIRS:
+            break
+        dirnames[:] = sorted(
+            d for d in dirnames if not d.startswith(".")
+        )
+        for name in sorted(filenames):
+            if not name.endswith((".c", ".h")):
+                continue
+            fp = Path(dirpath) / name
+            try:
+                if not fp.is_file():
+                    continue
+                # Capped per file: the count/dir caps alone still let
+                # a few planted multi-hundred-MB files dominate memory
+                # (marker inference needs no more than the cap).
+                got = read_text_capped(fp)
+                if got is None:
+                    continue
+                source_texts[str(fp.relative_to(src_root))] = got[0]
+            except (OSError, ValueError):
+                continue
+            if len(source_texts) >= _SECURITY_CONTEXT_MAX_FILES:
+                return source_texts
+    return source_texts
 
 
 def infer_security_context(
@@ -3300,17 +4527,23 @@ def run_phase3(
     target: str = "",
     source_root: str = "",
     security_context: SecurityContext | None = None,
+    discard_sink: list | None = None,
 ) -> DomainModel:
-    """Run Phase 3: deduplicate, filter, resolve, assemble domain model."""
+    """Run Phase 3: deduplicate, filter, resolve, assemble domain model.
+
+    Invariants dropped for orphan concept references are recorded to
+    *discard_sink* (receipt-discard record shape).
+    """
     deduped_concepts = _dedup_concepts(concepts)
     sem_deduped_concepts = _semantic_dedup_concepts(deduped_concepts)
     filtered_concepts = _filter_thin_concepts(sem_deduped_concepts)
     valid_ids = {c.id for c in filtered_concepts}
 
-    deduped_invariants = _dedup_invariants(invariants, valid_ids)
+    deduped_invariants = _dedup_invariants(
+        invariants, valid_ids, discard_sink)
     filtered_invariants = _filter_guard_invariants(deduped_invariants)
     sem_deduped_invariants = _semantic_dedup_invariants(
-        filtered_invariants, valid_ids,
+        filtered_invariants, valid_ids, discard_sink,
     )
 
     deduped_contracts = _dedup_contracts(contracts)
@@ -3586,7 +4819,8 @@ def _derive_threat_frame_invariants(
             prompt, _THREAT_FRAME_SCHEMA,
             system_prompt=_THREAT_FRAME_SYSTEM_PROMPT,
             task_type="study",
-            max_tokens=_study_max_output_tokens(),
+            max_tokens=_study_max_output_tokens(
+                _client_model_name(llm_client)),
             stream=True,
         )
         from core.llm.coerce import structured_result
@@ -3620,6 +4854,11 @@ def _derive_threat_frame_invariants(
                 + f" [threat-frame derived from "
                   f"{raw.get('derived_from_function', '?')} contract]"
             ).strip(),
+            # "derived" is deliberately OUTSIDE CONFIDENCE_GRADES:
+            # threat-frame invariants are LLM inference over contract
+            # text, and the grade ladder gates rule compilation — a
+            # derived invariant must never compile into a mechanical
+            # checker. Consumers render it as a hint tier instead.
             confidence="derived",
             relevant_cwes=[
                 str(x) for x in (raw.get("relevant_cwes") or [])
@@ -3644,7 +4883,9 @@ def run_study(
     *,
     on_progress: Any = None,
     correlate: list[str] | None = None,
-    batch_target: int = 80,
+    batch_target: int | None = None,
+    should_stop: Any = None,
+    phase_stats: dict | None = None,
 ) -> DomainModel:
     """Run the full study pipeline: load items → Phase 2 → Phase 3 → save.
 
@@ -3656,10 +4897,28 @@ def run_study(
         correlate: Identifier names to correlate. When set, the LLM
             is additionally asked to examine the relationship between
             these identifiers (shared callers, contract kind, invariants).
+        batch_target: Items per Phase 2 batch. ``None`` (the default)
+            computes it within the output-budget ceiling
+            (``_phase2_batch_target``); an explicit value is honoured
+            up to the ceiling (see ``run_phase2``). Resolved HERE so
+            downstream consumers (the derived-attention cap, Phase 2)
+            all see the same effective target.
+        should_stop: Zero-arg callable polled at every paid-call
+            boundary (Phase 2 batches, threat-frame derivation);
+            True stops buying new calls while keeping results already
+            earned. The audit study consumer wires its queue's
+            cooperative-stop flag here.
+        phase_stats: Caller-owned dict Phase 2 fills with failure
+            accounting (see ``run_phase2``) — partial-failure churn
+            is invisible in the return value, and the consumer's
+            burn breaker keys on it.
 
     Returns:
         The assembled DomainModel.
     """
+    if batch_target is None:
+        batch_target = _phase2_batch_target()
+
     from core.json import load_json
     raw = load_json(study_list_path, strict=True, max_bytes=64 * 1024 * 1024)
     if raw is None:
@@ -3708,6 +4967,18 @@ def run_study(
     except Exception:
         logger.debug("SAGE concept recall skipped", exc_info=True)
 
+    # Joint derived-attention accounting: bridge seeds (map→study)
+    # and SAGE prior-concept seed blocks are BOTH derived attention —
+    # one shares the budget of the other, and operator-asked
+    # identifiers outrank both and never count. The bridge half is
+    # counted on the pre-SAGE item set (an upper bound: SAGE skips
+    # can only shrink it, so the SAGE half is allocated at worst
+    # slightly conservatively — never over the joint cap).
+    derived_cap = _derived_attention_cap(batch_target)
+    n_bridge = _enforce_bridge_seed_cap(
+        items, derived_cap, on_progress=on_progress,
+    )
+
     # Apply skip/seed from SAGE prior
     skipped_concepts: list[Concept] = []
     skipped_invariants: list[Invariant] = []
@@ -3720,6 +4991,7 @@ def run_study(
                 items, sage_prior, output_dir,
                 source_root=Path(source_root) if source_root else None,
                 on_progress=on_progress,
+                seed_block_cap=max(0, derived_cap - n_bridge),
             )
 
     if on_progress:
@@ -3776,6 +5048,8 @@ def run_study(
         discard_sink=receipt_discards,
         vocab_sink=vocab_entries,
         batch_target=batch_target,
+        should_stop=should_stop,
+        phase_stats=phase_stats,
     )
     _record_discards(output_dir, receipt_discards)
     if receipt_discards and on_progress:
@@ -3802,15 +5076,7 @@ def run_study(
     try:
         src_root = Path(source_root) if source_root else None
         if src_root and src_root.is_dir():
-            source_texts = {}
-            for fp in src_root.iterdir():
-                if fp.is_file() and fp.suffix in (".c", ".h"):
-                    try:
-                        source_texts[fp.name] = fp.read_text(
-                            encoding="utf-8", errors="replace",
-                        )
-                    except OSError:
-                        pass
+            source_texts = _collect_security_context_texts(src_root)
             if source_texts:
                 sc = infer_security_context(source_texts)
                 if sc and on_progress:
@@ -3823,19 +5089,25 @@ def run_study(
     except Exception:
         logger.debug("security context inference failed", exc_info=True)
 
+    phase3_discards: list[dict] = []
     model = run_phase3(
         concepts, invariants, contracts, bug_patterns,
         target=target,
         source_root=source_root,
         security_context=sc,
+        discard_sink=phase3_discards,
     )
+    _record_discards(output_dir, phase3_discards)
 
-    try:
-        _derive_threat_frame_invariants(
-            model, llm_client, on_progress=on_progress,
-        )
-    except Exception:
-        logger.debug("threat-frame derivation skipped", exc_info=True)
+    if should_stop is None or not should_stop():
+        # One more paid structured call — honours the same stop gate
+        # as the Phase 2 batches.
+        try:
+            _derive_threat_frame_invariants(
+                model, llm_client, on_progress=on_progress,
+            )
+        except Exception:
+            logger.debug("threat-frame derivation skipped", exc_info=True)
 
     if vocab_entries:
         (
@@ -3846,6 +5118,7 @@ def run_study(
             model.fallibility_contracts,
             model.resource_limits,
             model.state_fields,
+            model.token_checks,
         ) = _assemble_vocabulary(vocab_entries)
         if on_progress:
             on_progress(
@@ -3857,7 +5130,8 @@ def run_study(
                 f"{len(model.fallibility_contracts)} fallibility "
                 f"contracts, "
                 f"{len(model.resource_limits)} resource limits, "
-                f"{len(model.state_fields)} state fields",
+                f"{len(model.state_fields)} state fields, "
+                f"{len(model.token_checks)} token checks",
             )
 
     out_path = output_dir / "domain-model.json"
@@ -3873,6 +5147,17 @@ def run_study(
         model = _merge_domain_models(prior, model)
     _stamp_related_strategies(model)
     model.save(out_path)
+
+    # Token-enforcement projection (mechanical, best-effort): when the
+    # study learned the target's token check idiom and an entry-point
+    # source is co-located, write token-map.json beside the model.
+    try:
+        from .token_map import project_token_map_for_run
+        tm_path = project_token_map_for_run(model, output_dir, source_root)
+        if tm_path is not None and on_progress:
+            on_progress("token_map", f"Token-enforcement map: {tm_path.name}")
+    except Exception:
+        logger.debug("token-map projection hook failed", exc_info=True)
 
     if struct_annots:
         annots_path = output_dir / "struct-annotations.json"
@@ -3898,7 +5183,10 @@ def run_study(
 
     pending = reading_list.pending()
     if pending:
-        reading_list.save(rl_path)
+        # Merge-save: this instance was loaded at pass start; a plain
+        # save would overwrite items other writers queued while the
+        # study ran.
+        reading_list.save_merged(rl_path)
         if on_progress:
             on_progress(
                 "reading_list",
@@ -3921,8 +5209,6 @@ def run_study(
 # ------------------------------------------------------------------
 
 
-_EVIDENCE_HASH_RE = re.compile(r"\[h=([a-f0-9]+)\]")
-
 #: Minimum normalised-name length for a non-exact (segment-boundary)
 #: concept match in the SAGE-prior lookup.  Short generic names
 #: ('walk', 'init') appear as segments inside many unrelated concept
@@ -3930,9 +5216,117 @@ _EVIDENCE_HASH_RE = re.compile(r"\[h=([a-f0-9]+)\]")
 _SAGE_PRIOR_MIN_MATCH_LEN = 6
 
 
+def _normalise_concept_id(name: str) -> str:
+    """Case/punctuation-insensitive form used for concept-id matching."""
+    return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+
+
+def concept_matches_identifier(concept_id: str, identifier: str) -> bool:
+    """Whether the SAGE-prior matching rule associates *concept_id*
+    with study *identifier*.
+
+    Exact normalised match always counts. Anything looser needs
+    segment boundaries AND a minimum length: a bare substring test
+    let a short item name ('walk') claim an unrelated concept
+    ('scatter_walk_state_machine'), skipping the item from study
+    while injecting the wrong prior.
+
+    ONE rule, two callers: the local-model prior match in
+    _apply_sage_prior and the recall-side addressee gate in
+    core.sage.hooks. Stored concept ids are routinely the LLM's
+    semantic names ('scatter_walk_state_machine'), not the study
+    identifier ('scatter_walk') — a stricter gate than this rule
+    drops legitimately-recalled self rows and silently disables
+    skip/seed for semantic-named concepts; a looser one re-opens the
+    cross-identifier mis-key ('get_page' driving 'put_page').
+    """
+    norm = _normalise_concept_id(identifier)
+    c_norm = _normalise_concept_id(concept_id)
+    if c_norm == norm:
+        return True
+    if len(norm) < _SAGE_PRIOR_MIN_MATCH_LEN:
+        return False
+    return re.search(rf"(?:^|_){re.escape(norm)}(?:_|$)", c_norm) is not None
+
+
+def _match_evidence_line(line: str) -> re.Match[str] | None:
+    """Anchored match of ONE physical line against the evidence grammar.
+
+    THE single extraction discipline for evidence lines. Every consumer
+    that turns SAGE row content back into evidence values — the
+    hash-set extractor (:func:`_extract_evidence_hashes`), the
+    staleness verifier (:func:`_verify_evidence_hashes`), and the
+    reconstruction parser (:func:`_reconstruct_from_sage`) — must match
+    whole stripped lines through here, and must take the lines
+    themselves from :func:`_iter_row_lines` (one canonical split — a
+    private splitter re-opens the divergence this closes). The
+    discipline is anchored per-line because reconstruction's is, and
+    reconstruction mints the Evidence objects the mechanical path acts
+    on: an unanchored multi-line scan pairs text differently (a match
+    whose ``\\s+`` separator crosses a newline swallows the NEXT
+    physical line into its observation group), so any consumer on that
+    discipline verifies a different hash set than reconstruction
+    consumes — a line it never saw can still become a minted Evidence
+    object.
+    """
+    return _SAGE_EVIDENCE_RE.match(line.strip())
+
+
+def _iter_row_lines(content: str) -> Iterator[tuple[str, re.Match[str] | None]]:
+    """Iterate a row's lines, each paired with its evidence match.
+
+    THE single line-splitting discipline, owning iteration for every
+    consumer that walks row content (the hash-set extractor, the
+    composite fold, the staleness verifier, and the reconstruction
+    parser) — none keeps a private splitter. ``str.splitlines`` is the
+    canonical split: it breaks on every character Python treats as a
+    line boundary (``\\r``, ``\\v``, ``\\f``, FS/GS/RS, NEL,
+    U+2028/U+2029), all of which the grammar's ``.`` and ``\\s`` match
+    INSIDE a line. A consumer splitting only on ``\\n`` reads one
+    PARSING line where this split reads two non-parsing fragments — a
+    hash invisible to the fold and the verifier would still be minted
+    by that consumer. On the shared split every boundary character
+    splits for everyone alike, and a fragment that no longer parses is
+    dropped by everyone alike (fail-closed).
+    """
+    for line in content.splitlines():
+        yield line, _match_evidence_line(line)
+
+
+def _iter_evidence_matches(content: str) -> Iterator[re.Match[str]]:
+    """Every evidence-line match in *content* (see :func:`_iter_row_lines`)."""
+    for _line, m in _iter_row_lines(content):
+        if m:
+            yield m
+
+
 def _extract_evidence_hashes(content: str) -> set[str]:
     """Extract per-evidence [h=...] hashes from SAGE content."""
-    return set(_EVIDENCE_HASH_RE.findall(content))
+    return {m.group(4) for m in _iter_evidence_matches(content) if m.group(4)}
+
+
+def stamped_evidence_composite(content: str) -> str:
+    """Fold a concept row's evidence hashes into its composite.
+
+    The hash of every evidence line the shared per-line extraction
+    sees — i.e. exactly the lines the staleness verifier checks and
+    the reconstruction parser mints — folded with the one formula
+    (:func:`core.concepts.model.evidence_hash_composite`). The store
+    hook computes the ``Source hash:`` value it binds into the row MAC
+    by running THIS function over the rendered row content, and the
+    recall gate in ``core.sage.hooks`` recomputes it over the recalled
+    content and requires equality with the MAC-bound value — writer
+    and verifier cannot disagree on a row's evidence-hash multiset
+    because both run the same extraction and fold.
+
+    Duplicates are preserved (one fold entry per evidence line):
+    collapsing to a set would let a line whose hash another line
+    shares be added or dropped without moving the composite.
+    """
+    hashes = [
+        m.group(4) for m in _iter_evidence_matches(content) if m.group(4)
+    ]
+    return evidence_hash_composite(hashes)
 
 
 def _verify_evidence_hashes(
@@ -3953,9 +5347,14 @@ def _verify_evidence_hashes(
     from core.staleness import hash_spans
 
     # (path, line, stored_hash) triples grouped by file for one read
-    # per file.
+    # per file. Extraction is the shared per-line discipline
+    # (_iter_evidence_matches): the verifier must see exactly the
+    # evidence lines reconstruction will mint — an unanchored scan of
+    # the same content can miss a hashed line (swallowed into a
+    # neighbouring match's observation across a newline) and verify a
+    # smaller hash set than the mechanical path then consumes.
     by_file: dict[Path, list[tuple[int, str]]] = {}
-    for m in _SAGE_EVIDENCE_RE.finditer(content):
+    for m in _iter_evidence_matches(content):
         file_str = m.group(2).strip()
         line_str = m.group(3)
         stored_hash = m.group(4)
@@ -3982,12 +5381,34 @@ def _verify_evidence_hashes(
     return checked > 0
 
 
+# The file group is \S-delimited (still lazy — the first colon that
+# satisfies the tail keeps splitting file:line exactly as before)
+# and the hash group carries its trailing whitespace inside the
+# gated optional group: the naive ``\s+(.+?)…(?:\s+\[h=…\])?\s+``
+# chained overlapping whitespace spans around optional atoms, so an
+# 'Evidence (x):' row ending in a long whitespace run with no dash
+# cost every split of the run — cubic in the recall-row length.
+# Match set and all five captures unchanged on writer-shaped rows.
+# The statement gap is bounded: unbounded, every 'Evidence (x):'
+# head planted in a hostile row re-scans the rest of the row —
+# quadratic. Writer-shaped statements sit far below 500 chars
+# (beyond it the row is not parsed, versus an unbounded scan).
 _SAGE_EVIDENCE_RE = re.compile(
-    r"Evidence\s+\((\w+)\):\s+(.+?)(?::(\d+))?"
-    r"(?:\s+\[h=([a-f0-9]+)\])?\s+[-–—]\s+(.*)"
+    r"Evidence\s+\((\w+)\):\s+(\S(?:.{0,500}?\S)??)(?::(\d+))?"
+    r"\s+(?:\[h=([a-f0-9]+)\]\s+)?[-–—]\s+(.*)"
 )
+# The statement group is \S-delimited and carries its trailing
+# whitespace inside the optional group, and the negation group is
+# \S-headed: the naive trim spelling \s+(.*?)\s*\( overlaps three
+# unbounded repeats on horizontal whitespace, and an 'Invariant [x]:'
+# line ending in a long whitespace run with no '(negation:' makes
+# the engine try every split of the run between them — cubic in the
+# recall-line length. Match set unchanged (statement trimmed exactly
+# as before; an all-whitespace statement now captures None instead
+# of '' and the consumer normalises).
 _SAGE_INVARIANT_RE = re.compile(
-    r"Invariant\s+\[([^\]]+)\]:\s+(.*?)\s*\(negation:\s*(.*)\)"
+    r"Invariant\s+\[([^\]]+)\]:\s+(?:(\S(?:.*\S)?)\s*)?"
+    r"\(negation:\s*((?:\S.*)?)\)"
 )
 _SAGE_CONTRACT_RE = re.compile(r"Contract\s+\[([^\]]+)\]")
 _SAGE_CWE_RE = re.compile(r"CWEs:\s+(.*)")
@@ -4001,13 +5422,20 @@ def _reconstruct_from_sage(
 
     Returns None if the content doesn't parse into at least one concept.
     """
-    lines = content.split("\n")
-    if not lines:
+    # Shared iteration (_iter_row_lines): reconstruction consumes the
+    # same split and the same per-line matches as the composite fold
+    # and the staleness verifier — a private split here once read one
+    # parsing line where the fold read two non-parsing fragments,
+    # minting a hash the verifier never saw.
+    row_lines = list(_iter_row_lines(content))
+    if not row_lines:
         return None
 
     # First line is "Concept [id] in scope: description"
-    first = lines[0]
-    m = re.match(r"Concept\s+\[([^\]]+)\]\s+in\s+.+?:\s+(.*)", first)
+    first = row_lines[0][0]
+    # (?=\S) pins the whitespace run before the lazy scope (same
+    # language — the lazy tail absorbed any remainder).
+    m = re.match(r"Concept\s+\[([^\]]+)\]\s+in\s+(?=\S).+?:\s+(.*)", first)
     if not m:
         return None
 
@@ -4019,10 +5447,9 @@ def _reconstruct_from_sage(
     contracts: list[Contract] = []
     pending_inv_cwes: Invariant | None = None
 
-    for ln in lines[1:]:
+    for ln, ev_m in row_lines[1:]:
         stripped = ln.strip()
 
-        ev_m = _SAGE_EVIDENCE_RE.match(stripped)
         if ev_m:
             evidence.append(Evidence(
                 type=ev_m.group(1),
@@ -4039,7 +5466,7 @@ def _reconstruct_from_sage(
             invariants.append(Invariant(
                 id=inv_m.group(1),
                 concept=concept_id,
-                statement=inv_m.group(2).strip(),
+                statement=(inv_m.group(2) or "").strip(),
                 negation=inv_m.group(3).strip(),
                 confidence="traced",
             ))
@@ -4085,6 +5512,79 @@ def _reconstruct_from_sage(
     return [concept], invariants, contracts
 
 
+def _derived_attention_cap(batch_target: int) -> int:
+    """Joint ceiling on derived-attention entries for one study run.
+
+    Bridge seeds and SAGE seed blocks share this budget (the
+    fraction constant — with its trade-off note — lives with the
+    bridge: ``core.orchestration.binary_study_bridge``). The
+    denominator is the EFFECTIVE per-batch item budget: the caller's
+    ``batch_target`` clamped to the phase-2 output-budget ceiling,
+    exactly as ``run_phase2`` clamps its batches (the computed
+    default already arrives within the ceiling; only an explicit
+    over-ceiling value still needs the min here) — computed on a
+    raw over-ceiling target (an explicit 80 against a 32-item
+    ceiling) the
+    "fraction of a batch" was a fraction of a batch that never runs,
+    and derived attention could own an entire PAID batch outright.
+    Floor of 1 so a tiny operator batch target degrades to "one
+    derived entry", never to a silent all-or-nothing.
+    """
+    from core.orchestration.binary_study_bridge import (
+        DERIVED_ATTENTION_MAX_FRACTION,
+    )
+    effective = min(max(1, batch_target), _phase2_batch_ceiling())
+    return max(1, int(effective * DERIVED_ATTENTION_MAX_FRACTION))
+
+
+def _enforce_bridge_seed_cap(
+    items: list[StudyItem],
+    cap: int,
+    *,
+    on_progress: Any = None,
+) -> int:
+    """Strip the bridge's grant from bridge focus items beyond *cap*.
+
+    Only ``seed_source == "bridge_seed"`` items count and revert —
+    that stamp marks focus GRANTED by the bridge; operator-scoped
+    items the bridge merely corroborated carry
+    ``bridge_corroborated`` and are never touched (reverting them
+    would fight the operator's own scoping). Prep emits bridge items
+    in bridge-priority order, so trimming from the tail drops the
+    lowest-priority seeds first.
+
+    Overflow reverts to the PRE-STAMP default — tier ``None`` (still
+    focus under the default classification) with an annotation-grade
+    ``bridge_seed_overflow`` stamp — and NEVER sinks below that
+    baseline: demoting overflow to the context tier would let an
+    attacker make a function studied LESS than if the map had never
+    mentioned it, just by naming it in the map's tail. Returns the
+    number of bridge focus items kept (the bridge half of the joint
+    accounting).
+    """
+    bridge_focus = [
+        it for it in items
+        if getattr(it, "seed_source", "") == "bridge_seed"
+        and (it.relevance_tier or 0) <= 1
+    ]
+    overflow = bridge_focus[cap:]
+    for item in overflow:
+        item.relevance_tier = None
+        item.seed_source = "bridge_seed_overflow"
+    if overflow:
+        logger.info(
+            "derived-attention cap: reverted %d bridge seed(s) to "
+            "baseline treatment (cap %d)", len(overflow), cap,
+        )
+        if on_progress:
+            on_progress(
+                "bridge",
+                f"Reverted {len(overflow)} bridge seed(s) to baseline "
+                f"treatment (derived-attention cap {cap})",
+            )
+    return min(len(bridge_focus), cap)
+
+
 def _apply_sage_prior(
     items: list[StudyItem],
     sage_prior: dict[str, list],
@@ -4092,12 +5592,18 @@ def _apply_sage_prior(
     *,
     source_root: Path | None = None,
     on_progress: Any = None,
+    seed_block_cap: int | None = None,
 ) -> tuple[
     list[StudyItem],
     list[Concept], list[Invariant], list[Contract],
     str,
 ]:
     """Apply SAGE prior knowledge to filter and seed study items.
+
+    *seed_block_cap* bounds how many prior-context seed blocks are
+    emitted (the SAGE half of the joint derived-attention budget it
+    shares with the bridge's seeds); ``None`` means uncapped (legacy
+    callers/tests). Skips are never capped — they save attention.
 
     Returns:
         (remaining_items, skipped_concepts, skipped_invariants,
@@ -4106,9 +5612,11 @@ def _apply_sage_prior(
     # Try to load a local domain model for skip (concept reconstruction)
     local_model = None
     for candidate in _find_local_models(output_dir):
-        # DomainModel.load handles malformed JSON itself; only an
-        # unreadable candidate file is a legitimate skip here.
-        with contextlib.suppress(OSError):
+        # DomainModel.load degrades malformed JSON and drifted records
+        # itself; the suppress covers unreadable files plus any
+        # residual record shape the drift loader has not met yet —
+        # an opportunistic sibling read must never kill the study run.
+        with contextlib.suppress(OSError, TypeError, AttributeError):
             local_model = DomainModel.load(candidate)
             break
 
@@ -4119,6 +5627,7 @@ def _apply_sage_prior(
     seed_parts: list[str] = []
     skip_count = 0
     seed_count = 0
+    seed_trimmed = 0
 
     for item in items:
         rows = sage_prior.get(item.name)
@@ -4145,35 +5654,43 @@ def _apply_sage_prior(
             if local_model:
                 concept = local_model.get_concept(item.name)
                 if concept is None:
-                    norm = re.sub(r"[^a-z0-9]+", "_", item.name.lower()).strip("_")
-                    # Exact match always counts. Anything looser needs
-                    # segment boundaries AND a minimum length: a bare
-                    # substring test let a short item name ('walk')
-                    # claim an unrelated concept
-                    # ('scatter_walk_state_machine'), skipping the item
-                    # from study while injecting the wrong prior.
-                    seg_re = (
-                        re.compile(
-                            rf"(?:^|_){re.escape(norm)}(?:_|$)",
-                        )
-                        if len(norm) >= _SAGE_PRIOR_MIN_MATCH_LEN
-                        else None
-                    )
+                    # Match rule shared with the recall-side addressee
+                    # gate — see concept_matches_identifier.
                     for c in local_model.concepts:
-                        c_norm = re.sub(r"[^a-z0-9]+", "_", c.id.lower()).strip("_")
-                        if c_norm == norm or (
-                            seg_re is not None and seg_re.search(c_norm)
-                        ):
+                        if concept_matches_identifier(c.id, item.name):
                             concept = c
                             break
                 if concept is not None:
-                    skipped_concepts.append(concept)
                     concept_fns = {item.name} | {
                         ev.item for ev in concept.evidence if ev.item
                     }
-                    skipped_invariants.extend(inv for inv in local_model.invariants if inv.concept == concept.id)
-                    skipped_contracts.extend(ct for ct in local_model.contracts if ct.function in concept_fns)
-                    skipped = True
+                    attached_invs = [
+                        inv for inv in local_model.invariants
+                        if inv.concept == concept.id
+                    ]
+                    attached_cts = [
+                        ct for ct in local_model.contracts
+                        if ct.function in concept_fns
+                    ]
+                    # The hash gate above verified the SAGE row's OWN
+                    # evidence lines — but this fast path carries
+                    # forward a DIFFERENT artifact: a local-model
+                    # concept found by (possibly fuzzy) name match,
+                    # potentially from a sibling run dir. Its evidence
+                    # must verify on its own before it may cause a
+                    # mechanical skip of LLM study; stale or
+                    # uncheckable falls through to the SAGE-content
+                    # reconstruct path (whose hashes DID verify) or to
+                    # seeding — never a skip on another artifact's
+                    # hashes.
+                    if _local_prior_is_fresh(
+                        concept, attached_invs, attached_cts,
+                        Path(source_root),  # type: ignore[arg-type]
+                    ):
+                        skipped_concepts.append(concept)
+                        skipped_invariants.extend(attached_invs)
+                        skipped_contracts.extend(attached_cts)
+                        skipped = True
             # Slow path: reconstruct from SAGE text content
             if not skipped:
                 reconstructed = _reconstruct_from_sage(item, content)
@@ -4187,12 +5704,20 @@ def _apply_sage_prior(
                 skip_count += 1
                 continue
 
-        # Seed: include prior knowledge as context for the LLM
-        seed_parts.append(
-            f"## Prior study knowledge for `{item.name}` "
-            f"(verify against current source)\n{content}"
-        )
-        seed_count += 1
+        # Seed: include prior knowledge as context for the LLM —
+        # unless the joint derived-attention budget (shared with the
+        # bridge's seeds; see _derived_attention_cap) is spent. A
+        # trimmed item is still studied; it just arrives without the
+        # prior block. Skips above are unaffected: a hash-verified
+        # skip SAVES attention rather than spending it.
+        if seed_block_cap is None or seed_count < seed_block_cap:
+            seed_parts.append(
+                f"## Prior study knowledge for `{item.name}` "
+                f"(verify against current source)\n{content}"
+            )
+            seed_count += 1
+        else:
+            seed_trimmed += 1
         remaining.append(item)
 
     if on_progress:
@@ -4206,6 +5731,12 @@ def _apply_sage_prior(
             on_progress(
                 "sage",
                 f"Seeding {seed_count} items with prior study context",
+            )
+        if seed_trimmed:
+            on_progress(
+                "sage",
+                f"Trimmed {seed_trimmed} prior-context block(s) — "
+                f"joint derived-attention cap reached",
             )
 
     seed_context = ""
@@ -4222,8 +5753,61 @@ def _apply_sage_prior(
     )
 
 
+def _local_prior_is_fresh(
+    concept: Concept,
+    invariants: list[Invariant],
+    contracts: list[Contract],
+    source_root: Path,
+) -> bool:
+    """Whether a locally-recalled prior's OWN evidence still verifies.
+
+    Guards the SAGE-prior fast path: the concept (plus its attached
+    invariants/contracts) is about to be carried forward while its
+    study item is mechanically skipped from LLM analysis, so ITS
+    evidence — not the SAGE row's — must match the current source.
+
+    Fail closed: a concept with no checkable evidence hash, a claim
+    that cannot actually be verified (out-of-root path, unknown span
+    status — ``strict=True`` reports those as records instead of
+    dropping them), or a staleness-check error, refuses the fast path
+    (the caller falls back to reconstructing from the hash-verified
+    SAGE content, or to seeding). A wrong "fresh" verdict here
+    silently skips analysis — the false-suppression direction — so
+    "fresh" requires at least one hash-bearing evidence item AND
+    every checkability claim verifying as current.
+    """
+    if not any(
+        ev.hash and ev.file and ev.line is not None
+        for ev in concept.evidence
+    ):
+        return False
+    mini = DomainModel(
+        concepts=[concept],
+        invariants=invariants,
+        contracts=contracts,
+    )
+    try:
+        return not check_evidence_staleness(
+            mini, source_root, strict=True,
+        )
+    except Exception:
+        logger.debug(
+            "SAGE-prior fast path: staleness check on local concept "
+            "%s failed — not skipping", concept.id, exc_info=True,
+        )
+        return False
+
+
 def _find_local_models(output_dir: Path) -> list[Path]:
-    """Find domain-model.json candidates near the output directory."""
+    """Find domain-model.json candidates near the output directory.
+
+    Sibling run dirs are consulted newest-first by mtime (reverse
+    NAME sort only approximates recency for timestamped dirs and is
+    wrong for everything else), and symlinked siblings are skipped —
+    a symlink can point the walk at an out-of-project model (the
+    same-purpose walkers elsewhere skip symlinks; freshness gates
+    downstream bound, but must not be the only defence).
+    """
     candidates = []
     dm = output_dir / "domain-model.json"
     if dm.is_file():
@@ -4232,14 +5816,22 @@ def _find_local_models(output_dir: Path) -> list[Path]:
     # Sibling run directories (same project)
     parent = output_dir.parent
     if parent.is_dir():
-        for sibling in sorted(parent.iterdir(), reverse=True):
-            if sibling == output_dir or not sibling.is_dir():
+        siblings = []
+        for sibling in parent.iterdir():
+            if (sibling == output_dir or sibling.is_symlink()
+                    or not sibling.is_dir()):
                 continue
             sm = sibling / "domain-model.json"
             if sm.is_file():
-                candidates.append(sm)
-                if len(candidates) >= 3:
-                    break
+                try:
+                    mtime = sm.stat().st_mtime
+                except OSError:
+                    continue
+                siblings.append((mtime, sibling.name, sm))
+        for _, _, sm in sorted(siblings, reverse=True):
+            candidates.append(sm)
+            if len(candidates) >= 3:
+                break
 
     return candidates
 
@@ -4251,54 +5843,150 @@ def _find_local_models(output_dir: Path) -> list[Path]:
 def check_evidence_staleness(
     model: DomainModel,
     source_root: Path,
+    *,
+    strict: bool = False,
 ) -> list[dict[str, Any]]:
-    """Check all evidence hashes in *model* for staleness.
+    """Check evidence freshness for concepts, invariants, AND contracts.
+
+    - Concepts: per-evidence source-line hashes (``Evidence.hash``).
+    - Invariants: the verbatim receipt is re-verified — the quoted
+      source must still appear at the stated file/line
+      (``receipts.verify_receipt``).
+    - Contracts: ``Contract.hash`` is re-checked over the span it was
+      stamped from (``Contract.hash_span``).
 
     Returns a list of dicts describing stale evidence::
 
-        {"concept_id": "...", "evidence_file": "...",
-         "evidence_line": N, "status": "modified"|"deleted"|...}
+        {"kind": "concept"|"invariant"|"contract", "id": "...",
+         "evidence_file": "...", "evidence_line": N,
+         "status": "modified"|"deleted"|...}
 
-    Evidence without a stored hash is skipped (no baseline to check).
-    Uses ``core.staleness.check_batch`` for batched reads.
+    Concept records additionally carry the legacy ``concept_id`` key
+    (``study-stale.json`` consumers predate ``kind``/``id``).
+    Entries without a stored hash / receipt / span are skipped (no
+    baseline to check). Uses ``core.staleness.check_batch`` for
+    batched reads.
+
+    ``strict`` hardens the verdict for callers whose "no records"
+    result LICENSES an action (the SAGE-prior fast-path skip): an
+    entry that CLAIMS checkability (hash + file + line / span) but
+    cannot actually be verified — its path escapes ``source_root``
+    (status ``unconfined``) or the span check comes back ``unknown``
+    (invalid range, unreadable file, missing stored hash) — is
+    reported as a record instead of silently dropped. Without strict,
+    a forged prior whose evidence paths ALL point out of the root
+    would read as "fresh with zero checks". The default (lenient)
+    mode keeps the quarantine path's semantics: only positively
+    drifted evidence quarantines.
     """
     from core.staleness import CheckItem, check_batch
 
     items: list[CheckItem] = []
-    item_keys: list[tuple[str, int]] = []
+    item_keys: list[tuple[str, str, str, int | None]] = []
+    stale: list[dict[str, Any]] = []
+
+    def _unconfined(kind: str, entry_id: str, ev_file: str,
+                    ev_line: int | None) -> None:
+        record: dict[str, Any] = {
+            "kind": kind,
+            "id": entry_id,
+            "evidence_file": ev_file,
+            "evidence_line": ev_line,
+            "status": "unconfined",
+        }
+        if kind == "concept":
+            record["concept_id"] = entry_id
+        stale.append(record)
 
     for concept in model.concepts:
-        for ev_idx, ev in enumerate(concept.evidence):
+        for ev in concept.evidence:
             if not ev.hash or not ev.file or ev.line is None:
                 continue
             # Evidence paths originate from LLM output — confine to
-            # source_root; entries escaping it are dropped (not read).
+            # source_root; entries escaping it are dropped (not read;
+            # strict mode reports them as unverifiable instead).
             ev_path = _resolve_in_root(source_root, ev.file)
             if ev_path is None:
+                if strict:
+                    _unconfined("concept", concept.id, ev.file, ev.line)
                 continue
             items.append(CheckItem(
                 file=ev_path,
                 start_line=ev.line,
                 end_line=ev.line,
                 stored_hash=ev.hash,
-                label=f"{concept.id}:{ev_idx}",
+                label=f"concept:{concept.id}",
             ))
-            item_keys.append((concept.id, ev_idx))
+            item_keys.append(("concept", concept.id, ev.file, ev.line))
 
-    if not items:
-        return []
+    for ct in model.contracts:
+        span = ct.hash_span if isinstance(ct.hash_span, dict) else {}
+        span_file = span.get("file")
+        start, end = span.get("start"), span.get("end")
+        if (not ct.hash or not span_file
+                or not isinstance(start, int) or not isinstance(end, int)):
+            continue
+        ct_path = _resolve_in_root(source_root, str(span_file))
+        if ct_path is None:
+            if strict:
+                _unconfined("contract", ct.function, str(span_file), start)
+            continue
+        items.append(CheckItem(
+            file=ct_path,
+            start_line=start,
+            end_line=end,
+            stored_hash=ct.hash,
+            label=f"contract:{ct.function}",
+        ))
+        item_keys.append(("contract", ct.function, str(span_file), start))
 
-    results = check_batch(items, root=source_root)
-    stale: list[dict[str, Any]] = []
-    for (concept_id, ev_idx), result in zip(item_keys, results):
-        if result.status not in ("current", "unknown"):
-            concept = model.get_concept(concept_id)
-            ev = concept.evidence[ev_idx] if concept else None
-            stale.append({
-                "concept_id": concept_id,
-                "evidence_file": ev.file if ev else "",
-                "evidence_line": ev.line if ev else None,
+    # Lenient: "unknown" (invalid range, unreadable file, no stored
+    # hash) is not evidence of drift, so it never quarantines.
+    # Strict: unknown means the claim could not be verified — record.
+    fresh_statuses = ("current",) if strict else ("current", "unknown")
+    if items:
+        results = check_batch(items, root=source_root)
+        for (kind, entry_id, ev_file, ev_line), result in zip(
+                item_keys, results):
+            if result.status in fresh_statuses:
+                continue
+            record: dict[str, Any] = {
+                "kind": kind,
+                "id": entry_id,
+                "evidence_file": ev_file,
+                "evidence_line": ev_line,
                 "status": result.status,
+            }
+            if kind == "concept":
+                record["concept_id"] = entry_id
+            stale.append(record)
+
+    # Invariants carry a verbatim quote receipt, not a span hash —
+    # re-run the deterministic receipt check. verify_receipt reads
+    # the file per receipt (same shape as the _apply_receipts writer
+    # path); invariant counts are small enough that batching is not
+    # worth a second window-search implementation that could drift.
+    from .receipts import verify_receipt
+
+    for inv in model.invariants:
+        receipt = inv.receipt if isinstance(inv.receipt, dict) else {}
+        quote = receipt.get("quote") or ""
+        rc_file = receipt.get("file") or ""
+        if not quote or not rc_file:
+            continue
+        rc_line = receipt.get("line")
+        checked = verify_receipt(
+            source_root, str(rc_file),
+            rc_line if isinstance(rc_line, int) else None,
+            str(quote),
+        )
+        if not checked.verified:
+            stale.append({
+                "kind": "invariant",
+                "id": inv.id,
+                "evidence_file": str(rc_file),
+                "evidence_line": rc_line if isinstance(rc_line, int) else None,
+                "status": "modified",
             })
 
     return stale

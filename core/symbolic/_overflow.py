@@ -33,7 +33,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from core.symbolic._project import _open_project
+from core.symbolic import _engine
 from core.symbolic._budget import z3_call_budget
 from core.symbolic._types import SymbolicResult
 
@@ -52,18 +52,12 @@ def find_overflow_reaching_input(
     """Isolated entry point — semantics in
     :func:`_find_overflow_reaching_input_impl`.
 
-    Hard-budget process isolation; see :mod:`core.symbolic._isolate`.
-    When angr is unavailable the availability guard answers directly.
+    Hard-budget process isolation via
+    :func:`core.symbolic._engine.dispatch_isolated`; when angr is
+    unavailable the availability guard answers directly.
     """
-    from core.symbolic._availability import angr_available
-    from core.symbolic._isolate import run_isolated
-    if not angr_available():
-        return _find_overflow_reaching_input_impl(
-            binary_path, target_address, timeout=timeout,
-            max_input_bytes=max_input_bytes,
-            register_constraints=register_constraints)
-    return run_isolated(
-        "core.symbolic._overflow", "_find_overflow_reaching_input_impl",
+    return _engine.dispatch_isolated(
+        _find_overflow_reaching_input_impl,
         {"binary_path": binary_path, "target_address": target_address,
          "timeout": timeout, "max_input_bytes": max_input_bytes,
          "register_constraints": register_constraints},
@@ -120,56 +114,27 @@ def _find_overflow_reaching_input_impl(
         descriptive reason on timeout / no unconstrained state /
         unsolvable target address.
     """
-    from core.symbolic._availability import (
-        angr_available, unavailable_result,
-    )
-    if not angr_available():
-        return unavailable_result("angr", "find_overflow_reaching_input")
+    gate = _engine.availability_gate("find_overflow_reaching_input")
+    if gate is not None:
+        return gate
 
-    binary_path = Path(binary_path)
-    if not binary_path.is_file():
-        return SymbolicResult(
-            succeeded=False,
-            reason=f"binary not found: {binary_path}",
-            wall_seconds=0.0,
-        )
+    binary_path, missing = _engine.check_binary(binary_path)
+    if missing is not None:
+        return missing
 
     t0 = time.monotonic()
-    try:
-        project = _open_project(binary_path)
-        # Declared-length copies (symbolic size args) otherwise build
-        # per-byte conditional ASTs that wedge z3 at assert time —
-        # concretize adversarially (max satisfiable length) instead.
-        # Installed here, inside the isolated child: the per-process
-        # project cache never leaks hooks to other consumers.
-        from core.symbolic._concretize import install_adversarial_size_hooks
-        install_adversarial_size_hooks(project)
-    except Exception as exc:  # noqa: BLE001
-        return SymbolicResult(
-            succeeded=False,
-            reason=f"angr load failed: {type(exc).__name__}: {exc}",
-            wall_seconds=time.monotonic() - t0,
-        )
-
-    if not _is_mapped(project, target_address):
-        return SymbolicResult(
-            succeeded=False,
-            reason=(
-                f"target 0x{target_address:x} not in a mapped segment "
-                "(check base address / PIE offset)"
-            ),
-            wall_seconds=time.monotonic() - t0,
-            metadata={"target_address": target_address},
-        )
-
-    import angr
-
-    state = project.factory.entry_state(
-        stdin=angr.SimFileStream,
-        add_options={
-            angr.options.LAZY_SOLVES,
-        },
+    project, load_error = _engine.open_gated_project(
+        binary_path, t0,
+        install_hooks=_engine.size_concretization_hooks,
     )
+    if load_error is not None:
+        return load_error
+
+    unmapped = _engine.check_mapped(project, target_address, t0)
+    if unmapped is not None:
+        return unmapped
+
+    state = _engine.make_entry_state(project)
 
     # Entry stack pointer: the boundary between program-written stack
     # (below) and the loader model's argv/env layout (above). The
@@ -217,13 +182,15 @@ def _find_overflow_reaching_input_impl(
                             f"{len(simgr.unconstrained)} unconstrained "
                             "state(s), none satisfy pc == target under "
                             "the given constraints (unsatisfiable)"
+                            + _engine.errored_suffix(simgr)
                         )
                         if simgr.unconstrained else
                         "exhausted — no unconstrained state reached "
                         "(no overflow-to-PC path found)"
+                        + _engine.errored_suffix(simgr)
                     ),
                     wall_seconds=time.monotonic() - t0,
-                    states_explored=_count_states(simgr),
+                    states_explored=_engine.count_states(simgr),
                     metadata={
                         "target_address": target_address,
                         "steps": steps,
@@ -247,7 +214,7 @@ def _find_overflow_reaching_input_impl(
                     reason="found reaching input via unconstrained-PC solve",
                     wall_seconds=time.monotonic() - t0,
                     concrete_input=data,
-                    states_explored=_count_states(simgr),
+                    states_explored=_engine.count_states(simgr),
                     metadata={
                         "target_address": target_address,
                         "input_length": len(data),
@@ -263,8 +230,11 @@ def _find_overflow_reaching_input_impl(
                 )
             # Defensive cap: some pathological targets branch every
             # step without ever hitting a ret; the deadline check
-            # above bounds wall clock but this bounds RAM.
-            if len(simgr.active) > 512:
+            # above bounds wall clock but this bounds RAM. Same
+            # ceiling as the sibling engines' budget_step, but this
+            # loop REPORTS the explosion instead of silently pruning
+            # — the manual stepper owes the caller a diagnosis.
+            if len(simgr.active) > _engine.MAX_ACTIVE_STATES:
                 exploded = len(simgr.active)
                 simgr.stash(
                     filter_func=lambda s: True,
@@ -278,23 +248,20 @@ def _find_overflow_reaching_input_impl(
                         f"states after {steps} steps; aborting"
                     ),
                     wall_seconds=time.monotonic() - t0,
-                    states_explored=_count_states(simgr),
+                    states_explored=_engine.count_states(simgr),
                     metadata={
                         "target_address": target_address,
                         "steps": steps,
                     },
                 )
     except Exception as exc:  # noqa: BLE001
-        return SymbolicResult(
-            succeeded=False,
-            reason=f"angr step raised: {type(exc).__name__}: {exc}",
-            wall_seconds=time.monotonic() - t0,
-            states_explored=_count_states(simgr),
+        return _engine.raised_result(
+            exc, t0=t0, simgr=simgr, verb="step",
             metadata={"target_address": target_address, "steps": steps},
         )
 
     wall = time.monotonic() - t0
-    states = _count_states(simgr)
+    states = _engine.count_states(simgr)
     timed_out = time.monotonic() >= deadline
 
     # Final attempt on any lingering unconstrained states.
@@ -539,17 +506,3 @@ def _has_canary(project) -> bool:
         return project.loader.find_symbol("__stack_chk_fail") is not None
     except Exception:  # noqa: BLE001 — unknown loader state: no claim
         return False
-
-
-def _is_mapped(project, addr: int) -> bool:
-    try:
-        return project.loader.find_object_containing(addr) is not None
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def _count_states(simgr) -> int:
-    try:
-        return sum(1 for _ in simgr.stashes.values() for __ in _)
-    except Exception:  # noqa: BLE001
-        return 0

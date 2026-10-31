@@ -53,7 +53,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from core.json import dumps_artifact
+from core.json import save_json
+from core.source.lines import split_lines
 
 logger = logging.getLogger(__name__)
 
@@ -106,12 +107,21 @@ PREPASS_BUDGET_S = 20.0
 MAX_PREPASS_FINDINGS = 50
 
 # Hypothesis shapes asserting release-before-verify ordering.
+# ``stem\w*.{0,N}`` gaps are respelled in canonical-split form
+# ``stem(?:.{0,N}|\w{1,64}.{N})``: the suffix run and the gap both
+# consume word characters, so the unbounded ambiguous spelling
+# re-splits against every stem repeat inside one long word —
+# quadratic on hostile text. Same language (gap alone, or word run
+# plus exactly-N gap); only a stem buried more than 64
+# word-characters before the gap stops matching.
 _RELEASE_ORDER_HYPOTHESIS_RE = re.compile(
-    r"(?:(?:releas|output|write|writ|deliver|emit|flush)\w*.{0,60}"
+    r"(?:(?:releas|output|write|writ|deliver|emit|flush)"
+    r"(?:.{0,60}|\w{1,64}.{60})"
     r"(?:before|prior\s+to|without).{0,40}"
     r"(?:verif|authenticat|\btag\b|\bMAC\b|integrity|signature|"
     r"cipher\s*status)"
-    r"|(?:verif|authenticat|integrity|cipher\s*status)\w*.{0,40}"
+    r"|(?:verif|authenticat|integrity|cipher\s*status)"
+    r"(?:.{0,40}|\w{1,64}.{40})"
     r"(?:only\s+)?(?:after|at\s+EOF|at\s+the\s+end|at\s+end)"
     r"|\bEFAIL\b)",
     re.IGNORECASE | re.DOTALL,
@@ -201,6 +211,37 @@ def _inconclusive(reason: str, detail: str = "") -> OrderEvidence:
     )
 
 
+def _alias_unresolved_evidence(
+    unresolved_sites: list[dict[str, Any]],
+    fin_receipt: dict[str, Any],
+    file_path: str,
+    dominated_releases: list[dict[str, Any]] | None = None,
+) -> OrderEvidence:
+    """``sink-alias-unresolved`` inconclusive naming EVERY undecidable
+    write site. An unresolved alias is excluded from the dominance
+    test, so a refutation ("every release site is dominated") cannot
+    be claimed while one exists — undecidable evidence degrades to
+    inconclusive, never to refuted."""
+    first = unresolved_sites[0]
+    more = (
+        f" (+{len(unresolved_sites) - 1} more unresolved site(s))"
+        if len(unresolved_sites) > 1 else ""
+    )
+    return OrderEvidence(
+        outcome="inconclusive",
+        reason=(
+            f"{REASON_SINK_ALIAS_UNRESOLVED}: destination "
+            f"`{first['destination']}` of "
+            f"{first['callee']} at "
+            f"{file_path}:{first['line']} mixes "
+            "internal and escaping provenance — buffering vs "
+            f"release undecidable{more}"
+        ),
+        finalizer=fin_receipt,
+        releases=list(dominated_releases or []) + unresolved_sites,
+    )
+
+
 # ── vocabulary (seeds < learned) ────────────────────────────────────
 
 
@@ -264,13 +305,18 @@ def _call_re(names: tuple[str, ...] | list[str]) -> re.Pattern:
 
 
 def _read_source(target_path: Path, file_path: str) -> str | None:
-    try:
-        p = Path(target_path) / file_path
-        if p.is_file():
-            return p.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        pass
-    return None
+    """Containment-checked, size-capped read of a hypothesis file path.
+
+    ``file_path`` arrives from review-outcome / checklist artifacts
+    (LLM-writable): a bare join lets an absolute value discard
+    ``target_path`` under ``/`` semantics and a ``..`` segment escape
+    the analysed root, pulling arbitrary host files into adjudication.
+    Escaping, unreadable, and pathological paths all read as None —
+    the caller's hypothesis-unbindable inconclusive, never a verdict.
+    """
+    from core.source import read_contained
+
+    return read_contained(target_path, file_path)
 
 
 def _function_segment(
@@ -281,21 +327,67 @@ def _function_segment(
         span = c_function_span(source, function_name, language=language)
     except ImportError:
         span = None
-    lines = source.splitlines()
+    lines = split_lines(source)
     if span:
         return lines[span[0] - 1:span[1]], span[0]
     return lines, 1
 
 
-def _first_arg_base(code: str, callee: str) -> str:
-    """Base identifier of the callee's first argument
-    (``BIO_write(out, buf, n)`` → ``out``)."""
-    m = re.search(rf"\b{re.escape(callee)}\s*\(\s*([^,()]+)", code)
+# Destination argument position per release verb (1-based). fwrite's
+# destination stream is its 4th argument and fputs' its 2nd — the
+# first argument of both is the DATA buffer, and classifying that
+# buffer's provenance (``buf = malloc(len)`` → "internal") minted a
+# false buffered-then-flush refutation on genuine stdio releases.
+# Every other verb (BIO_write, write, send, learned verbs) writes to
+# its first argument.
+_DEST_ARG_POSITION = {"fwrite": 4, "fputs": 2}
+
+# Descriptor/stream constructors (POSIX seed set, <= 9 per the vocab
+# budget): a destination assigned from one of these is a live external
+# channel, never an internal buffered-then-flush buffer (contrast
+# BIO_new(BIO_s_mem())).
+_DESCRIPTOR_CONSTRUCTORS = frozenset({
+    "open", "openat", "creat", "fopen", "fdopen", "freopen",
+    "socket", "accept", "accept4",
+})
+
+
+def _dest_arg_base(code: str, callee: str) -> str:
+    """Base identifier of the callee's DESTINATION argument
+    (``BIO_write(out, buf, n)`` → ``out``;
+    ``fwrite(buf, 1, n, fp)`` → ``fp``)."""
+    m = re.search(rf"\b{re.escape(callee)}\s*\(", code)
     if not m:
         return ""
-    arg = m.group(1).strip()
-    m2 = re.match(r"[&*]*\s*([A-Za-z_]\w*)", arg)
+    args = _call_args(code, m.end())
+    pos = _DEST_ARG_POSITION.get(callee, 1)
+    if len(args) < pos:
+        return ""
+    m2 = re.match(r"[&*(]*\s*([A-Za-z_]\w*)", args[pos - 1].strip())
     return m2.group(1) if m2 else ""
+
+
+def _call_args(code: str, open_paren_end: int) -> list[str]:
+    """Top-level comma-split arguments of the call whose opening
+    paren just closed at ``open_paren_end`` (best-effort, single
+    line — the site regexes match line-locally)."""
+    depth = 1
+    args: list[str] = []
+    start = open_paren_end
+    for i in range(open_paren_end, len(code)):
+        ch = code[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+            if depth == 0:
+                if code[start:i].strip():
+                    args.append(code[start:i])
+                return args
+        elif ch == "," and depth == 1:
+            args.append(code[start:i])
+            start = i + 1
+    return args
 
 
 def _classify_destination(
@@ -319,14 +411,33 @@ def _classify_destination(
         if not m:
             continue
         rhs = m.group(1).strip()
-        cond = re.match(r".+\?\s*(.+?)\s*:\s*(.+)", rhs)
+        # Ternary-arm split. The true-arm group is delimited by
+        # non-whitespace-non-colon on both ends: the naive trim
+        # spelling ``\s*(.+?)\s*:`` overlaps three unbounded repeats
+        # on whitespace, and an assignment line with a ``?`` followed
+        # by a long whitespace run and no ``:`` makes the engine try
+        # every split of the run — cubic in the line length. For
+        # syntactically valid ternaries the split and both captures
+        # are unchanged; only invalid shapes (whitespace-only or
+        # colon-leading true-arm) no longer match, and those arms
+        # classified as garbage either way.
+        cond = re.match(
+            r".+\?\s*([^\s:](?:[^:\n]*[^\s:])?)\s*:\s*(.+)", rhs,
+        )
         arms = [cond.group(1), cond.group(2)] if cond else [rhs]
         for arm in arms:
             arm = arm.strip()
             base = re.match(r"[&*]*\s*([A-Za-z_]\w*)\s*$", arm)
+            call = re.match(r"([A-Za-z_]\w*)\s*\(", arm)
             if base and base.group(1) in params:
                 classes.add("escaping")
-            elif re.match(r"[A-Za-z_]\w*\s*\(", arm):
+            elif call and call.group(1) in _DESCRIPTOR_CONSTRUCTORS:
+                # A freshly-opened descriptor/stream is NOT an
+                # internal buffer: data handed to it leaves the
+                # process immediately, so the buffered-then-flush
+                # refutation shape does not apply.
+                classes.add("escaping")
+            elif call:
                 classes.add("internal")
             else:
                 classes.add("unknown")
@@ -521,13 +632,13 @@ def _adjudicate_function(
 
     release_sites: list[dict[str, Any]] = []
     internal_sites: list[dict[str, Any]] = []
-    alias_unresolved: dict[str, Any] | None = None
+    unresolved_sites: list[dict[str, Any]] = []
     for idx, code in enumerate(view_lines):
         m = rel_re.search(code)
         if not m:
             continue
         callee = m.group(1)
-        dest = _first_arg_base(code, callee)
+        dest = _dest_arg_base(code, callee)
         dest_class = _classify_destination(dest, view_lines, params)
         site = {
             "file": file_path,
@@ -542,7 +653,7 @@ def _adjudicate_function(
         if dest_class == "escaping":
             release_sites.append(site)
         elif dest_class == "unresolved":
-            alias_unresolved = site
+            unresolved_sites.append(site)
         else:
             internal_sites.append(site)
 
@@ -557,19 +668,9 @@ def _adjudicate_function(
     }
 
     if not release_sites:
-        if alias_unresolved is not None:
-            return OrderEvidence(
-                outcome="inconclusive",
-                reason=(
-                    f"{REASON_SINK_ALIAS_UNRESOLVED}: destination "
-                    f"`{alias_unresolved['destination']}` of "
-                    f"{alias_unresolved['callee']} at "
-                    f"{file_path}:{alias_unresolved['line']} mixes "
-                    "internal and escaping provenance — buffering vs "
-                    "release undecidable"
-                ),
-                finalizer=fin_receipt,
-                releases=[alias_unresolved],
+        if unresolved_sites:
+            return _alias_unresolved_evidence(
+                unresolved_sites, fin_receipt, file_path,
             )
         if internal_sites:
             # Buffered-then-flush architecture: every write targets an
@@ -627,7 +728,7 @@ def _adjudicate_function(
         engine, disagreement = _joern_cross_check(
             joern_server, target_path or Path("."), file_path,
             function_name,
-            fin_receipt["status_binding"].split(",")[0].strip(),
+            str(fin_receipt["status_binding"]).split(",")[0].strip(),
             site["callee"], cfg_dominated,
         )
         if disagreement:
@@ -646,6 +747,15 @@ def _adjudicate_function(
             undominated.append(entry)
 
     if not undominated:
+        if unresolved_sites:
+            # A write whose alias provenance is undecidable was
+            # excluded from the dominance test above — "every release
+            # site is dominated" would be claimed over evidence that
+            # never covered it. The dominated receipts stay attached.
+            return _alias_unresolved_evidence(
+                unresolved_sites, fin_receipt, file_path,
+                dominated_releases=releases,
+            )
         return OrderEvidence(
             outcome="refuted",
             reason=(
@@ -698,6 +808,15 @@ def run_release_order_check(
     """Adjudicate one release-order hypothesis. See module docstring
     for verdict semantics."""
     del budget_s  # phase-2 callee-expansion parameter
+    # Binary checklist rows carry no repo source path; gate before the
+    # suffix-based language lookup can leak a meaningless ".0" reason.
+    from .fail_open_lang import is_binary_row
+    if is_binary_row(file_path):
+        return _inconclusive(
+            REASON_LANGUAGE_UNSUPPORTED,
+            "binary checklist row — release-order reads repo source, "
+            "not decompiled output",
+        )
     try:
         from .fail_open_lang import language_for_path
         language = language_for_path(file_path)
@@ -764,7 +883,7 @@ def run_release_order_prepass(
             continue
         if not (fin_re.search(source) and rel_re.search(source)):
             continue
-        lines = source.splitlines()  # once per file, not per span
+        lines = split_lines(source)  # once per file, not per span
         for name, start, end in _c_function_spans(source):
             segment = "\n".join(lines[start - 1:end])
             if fin_re.search(segment) and rel_re.search(segment):
@@ -862,11 +981,14 @@ def run_release_order_prepass(
     telemetry["wall_time_s"] = round(time.monotonic() - t0, 3)
     if out_dir is not None and (findings or leads):
         try:
-            path = Path(out_dir) / "release-order.json"
-            path.write_text(dumps_artifact(
+            # Atomic write (tempfile + rename via save_json): a torn
+            # write here surfaces as "release-order.json exists but
+            # fails to parse" at /review time.
+            save_json(
+                Path(out_dir) / "release-order.json",
                 {"findings": findings, "leads": leads,
-                 "telemetry": telemetry}, indent=1,
-            ))
+                 "telemetry": telemetry},
+            )
         except Exception:
             logger.debug("release-order.json write failed", exc_info=True)
     return {

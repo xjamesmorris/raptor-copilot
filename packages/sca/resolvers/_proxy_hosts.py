@@ -33,15 +33,16 @@ config (or re-calibrate).
 
 from __future__ import annotations
 
-import json
 import logging
 import shutil
-import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+
+from core.config.hosts_override import load_hosts_override
+from core.sandbox import calibrated_hosts
 
 logger = logging.getLogger(__name__)
 
@@ -175,45 +176,31 @@ _YARN_ENV_KEYS: tuple[str, ...] = (
 )
 
 
-# Per-process memoisation. Calibration is sha-keyed on disk; without
-# this in-memory layer, every resolver subprocess in a scan would
-# stat the cache file independently. Keyed on the resolved binary
-# path.
-_CALIBRATED_CACHE: dict[str, object | None] = {}
+# Deny-all encoding: the sandbox requires a non-empty proxy
+# allowlist, and the CONNECT proxy rejects loopback targets by
+# design — so a loopback-only allowlist is an effective deny-all
+# chokepoint for every remote host (same encoding cc_proxy_hosts
+# uses for its credential-proxy and operator-deny-all modes).
+_LOOPBACK_ONLY_HOSTS: tuple[str, ...] = ("127.0.0.1", "localhost")
 
 
 def _load_override(tool: str) -> list | None:
     """Return the operator override list for ``tool`` or None when
-    no override is configured for it. Tolerant: malformed JSON or
-    unexpected types degrade silently to None (calibrate / default
-    layers carry the policy)."""
-    if not _OVERRIDE_CONFIG_PATH.exists():
-        return None
-    try:
-        data = json.loads(
-            _OVERRIDE_CONFIG_PATH.read_text(encoding="utf-8"),
-        )
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        # OSError: permission, vanished file, etc.
-        # UnicodeDecodeError: garbage bytes at the override path
-        #   (e.g. operator pointed at a binary file by mistake).
-        # JSONDecodeError: malformed JSON.
-        # All three degrade to "no override" rather than failing
-        # the scan — production failure mode is loud at the proxy,
-        # not silent at startup.
-        return None
-    if not isinstance(data, dict):
-        return None
-    hosts = data.get(tool)
-    if not isinstance(hosts, list):
-        return None
-    seen: set = set()
-    result: list = []
-    for h in hosts:
-        if isinstance(h, str) and h and h not in seen:
-            seen.add(h)
-            result.append(h)
-    return result or None
+    no override is configured for it. Delegates to the shared
+    ``core.config.hosts_override`` loader (tolerant: malformed JSON,
+    garbage bytes, or an unexpected schema degrade to None —
+    production failure mode is loud at the proxy, not silent at
+    startup). ``missing_key_ok``: per-tool files legitimately
+    configure a subset of tools, so an absent tool key is silent
+    fallthrough, not a schema warning.
+
+    A configured list is honoured, including when it sanitises to
+    empty: {"pip": []} is an explicit operator deny-all for that
+    tool (encoded loopback-only by ``_resolve``).
+    """
+    return load_hosts_override(
+        _OVERRIDE_CONFIG_PATH, key=tool, missing_key_ok=True,
+    )
 
 
 def _resolve_bin(name: str) -> str | None:
@@ -229,51 +216,21 @@ def _calibrated_profile(bin_path: str | None,
     ``bin_path``. Returns None on any failure — calibration is
     advisory; static layers carry the policy when it's unavailable.
 
-    Memoised per-process by resolved binary path; the cache key for
-    the on-disk profile already accounts for env_keys, so the memo
-    just avoids repeated file stats during a single scan.
+    Memoised (with stampede protection) by the shared layer,
+    ``core.sandbox.calibrated_hosts``, keyed on (binary path,
+    env-key set, probe args) — two tools sharing one binary with
+    different env-key sets must not serve each other's profile.
+    ``--version`` is the canonical low-cost probe: every tool in
+    scope supports it and the version handler exercises startup-time
+    filesystem reads; ``proxy_hosts`` will be empty (no network) and
+    falls through to the default layer until an operator runs a
+    network-engaging probe via the libexec CLI.
     """
-    if not bin_path:
-        return None
-    if bin_path in _CALIBRATED_CACHE:
-        return _CALIBRATED_CACHE[bin_path]
-
-    try:
-        from core.sandbox.calibrate import load_or_calibrate
-    except ImportError:
-        _CALIBRATED_CACHE[bin_path] = None
-        return None
-
-    try:
-        # ``--version`` is the canonical low-cost probe: every tool
-        # in scope supports it and the version handler exercises
-        # startup-time filesystem reads. ``proxy_hosts`` will be
-        # empty (no network) — the calibrated value contributes
-        # only when an operator runs a network-engaging probe via
-        # the libexec CLI. Empty values fall through here to the
-        # default layer.
-        profile = load_or_calibrate(
-            bin_path,
-            probe_args=("--version",),
-            env_keys=tuple(env_keys),
-            timeout=20,
-        )
-    except (FileNotFoundError, RuntimeError, OSError,
-            subprocess.TimeoutExpired) as exc:
-        # TimeoutExpired in particular: tools that take longer than
-        # 20s under sandbox to print their version (rare but
-        # observable for npm on cold systems) shouldn't break the
-        # resolver — fall through to defaults.
-        logger.debug(
-            "sca.proxy_hosts: calibration of %s failed (%s); "
-            "falling back to static policy",
-            bin_path, exc,
-        )
-        _CALIBRATED_CACHE[bin_path] = None
-        return None
-
-    _CALIBRATED_CACHE[bin_path] = profile
-    return profile
+    return calibrated_hosts.calibrated_profile(
+        bin_path,
+        env_keys,
+        tag="sca.proxy_hosts",
+    )
 
 
 def _calibrated_proxy_hosts(
@@ -284,10 +241,9 @@ def _calibrated_proxy_hosts(
     no profile exists OR the profile carries an empty ``proxy_hosts``
     list (the common case for ``--version`` probes — they don't
     network)."""
-    profile = _calibrated_profile(bin_path, env_keys)
-    if profile is None or not getattr(profile, "proxy_hosts", None):
-        return None
-    return list(profile.proxy_hosts)
+    return calibrated_hosts.hosts_from_profile(
+        _calibrated_profile(bin_path, env_keys),
+    )
 
 
 def _resolve(
@@ -308,6 +264,14 @@ def _resolve(
     """
     override = _load_override(tool)
     if override is not None:
+        if not override:
+            # Explicit operator deny-all ({"<tool>": []}). The
+            # sandbox rejects an empty proxy allowlist outright, so
+            # deny-all is encoded as loopback-only — the CONNECT
+            # proxy refuses loopback targets by design, leaving
+            # every remote registry denied at the chokepoint (same
+            # encoding cc_proxy_hosts uses).
+            return list(_LOOPBACK_ONLY_HOSTS)
         return override
 
     bin_path = _resolve_bin(bin_name)
@@ -425,7 +389,7 @@ def proxy_hosts_for_yarn() -> list:
 
 
 def _reset_calibrate_cache_for_tests() -> None:
-    """Clear the per-process calibrate memo. Test-only — production
-    code never invalidates manually; the cache is sha-keyed and
-    re-loads on binary self-update via the sha mismatch check."""
-    _CALIBRATED_CACHE.clear()
+    """Clear the shared per-process calibrate memo. Test-only —
+    production never invalidates manually; the cache is sha-keyed
+    and re-loads on binary self-update via the sha mismatch check."""
+    calibrated_hosts.reset_cache_for_tests()

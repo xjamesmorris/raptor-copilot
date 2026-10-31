@@ -12,6 +12,8 @@ import contextlib
 import logging
 import os
 from pathlib import Path
+
+from core.paths import confine
 from typing import Any
 
 from core.json import load_json
@@ -101,11 +103,26 @@ def load_exploit_feedback(out_dir: Path, load_feedback_state, FeedbackState):
 
 
 def load_fuzz_coverage(out_dir: Path) -> dict[str, Any] | None:
-    """Load fuzz coverage data if present."""
+    """Load fuzz coverage data if present.
+
+    Shape-gated: coverage-fuzz.json is a run-dir artifact, so a
+    malformed or tampered non-dict root must load as absent — one
+    list-shaped file made every review of the run raise at
+    per-function context assembly.
+    """
     path = out_dir / "coverage-fuzz.json"
     if not path.exists():
         return None
-    return load_json(path, max_bytes=64 * 1024 * 1024)
+    data = load_json(path, max_bytes=64 * 1024 * 1024)
+    if not isinstance(data, dict):
+        if data is not None:
+            logger.warning(
+                "coverage-fuzz.json in %s is %s-shaped, expected object "
+                "— ignoring the artifact",
+                out_dir, type(data).__name__,
+            )
+        return None
+    return data
 
 
 def load_fuzz_coverage_any(
@@ -145,15 +162,126 @@ def fuzz_coverage_for(
     file_path: str,
     function_name: str,
 ) -> dict[str, Any] | None:
-    """Extract fuzz coverage for a specific function."""
+    """Extract fuzz coverage for a specific function.
+
+    Tolerates non-dict roots and containers: the artifact may come
+    from an older producer or be tampered, and this runs inside every
+    review's context assembly.
+    """
+    if not isinstance(fuzz_data, dict):
+        return None
     flat_key = f"{file_path}:{function_name}"
     if flat_key in fuzz_data:
         return fuzz_data[flat_key]
-    file_data = fuzz_data.get("files", {}).get(file_path, {})
-    func_data = file_data.get("functions", {}).get(function_name)
+    files = fuzz_data.get("files")
+    if not isinstance(files, dict):
+        return None
+    file_data = files.get(file_path)
+    if not isinstance(file_data, dict):
+        return None
+    functions = file_data.get("functions")
+    if not isinstance(functions, dict):
+        return None
+    func_data = functions.get(function_name)
     if func_data:
         return func_data
     return None
+
+
+def _coerce_flow_index_keys(flows: Any) -> dict[int, list[Any]]:
+    """Coerce one flow map's parameter-index keys to int and validate
+    the flow shapes.
+
+    A key is accepted only as a non-negative integer in canonical
+    decimal form (``key == str(int(key))``, or an int already) — the
+    producer enumerates parameter positions through exactly that
+    spelling, so sign prefixes, whitespace, underscores, and non-ASCII
+    digits name no real position and are dropped, failing toward
+    claiming no flow. Values are filtered to ``(callee, arg_index)``
+    pairs of ``(str, int)``: consumers unpack, slice, and render these
+    pairs, so a malformed value must not reach them either.
+    """
+    coerced: dict[int, list[Any]] = {}
+    if not isinstance(flows, dict):
+        return coerced
+    for key, flow_list in flows.items():
+        if isinstance(key, int) and not isinstance(key, bool):
+            idx = key
+        else:
+            try:
+                idx = int(key)
+            except (TypeError, ValueError):
+                idx = -1
+            if key != str(idx):
+                idx = -1
+        if idx < 0:
+            logger.debug(
+                "taint_approx: dropped flow with non-canonical "
+                "parameter index %r", key,
+            )
+            continue
+        if not isinstance(flow_list, list):
+            logger.debug(
+                "taint_approx: dropped non-list flow value for "
+                "parameter %d: %r", idx, flow_list,
+            )
+            continue
+        kept = [
+            pair for pair in flow_list
+            if isinstance(pair, (list, tuple))
+            and len(pair) == 2
+            and isinstance(pair[0], str)
+            and isinstance(pair[1], int)
+            and not isinstance(pair[1], bool)
+        ]
+        if len(kept) != len(flow_list):
+            logger.debug(
+                "taint_approx: dropped %d malformed flow pair(s) for "
+                "parameter %d", len(flow_list) - len(kept), idx,
+            )
+        coerced[idx] = kept
+    return coerced
+
+
+def _rekey_cached_taint_approx(cached: dict[str, Any]) -> dict[str, Any]:
+    """Re-key cached flow maps to integer parameter indices and
+    shape-validate the fields consumers operate on.
+
+    The cache round-trips through JSON, whose object keys are always
+    strings, so ``direct_flows`` / ``dangerous_flows`` come back
+    str-keyed while consumers index ``params`` with the key and
+    compare it against ``len(params)`` — int operations. The typing
+    is in-band (index and shapes ride inside disk-sourced data), so
+    everything is normalised once here, where the cached shape enters
+    the run, instead of at every consumer: flow maps through
+    :func:`_coerce_flow_index_keys`, and a ``params`` that is not a
+    list of str is replaced with ``[]`` (consumers then fall back to
+    their legible ``arg<N>`` naming instead of ``len()``/indexing a
+    non-list).
+    """
+    for approx in cached.values():
+        if not isinstance(approx, dict):
+            continue
+        for flow_field in ("direct_flows", "dangerous_flows"):
+            if flow_field in approx:
+                approx[flow_field] = _coerce_flow_index_keys(
+                    approx[flow_field],
+                )
+        # Keyed on presence, not truthiness/None: an explicit null
+        # must be replaced like any other malformed shape (consumers
+        # iterate params without a None guard); only an absent key
+        # stays absent.
+        params = approx.get("params")
+        if "params" in approx and not (
+            isinstance(params, list)
+            and all(isinstance(p, str) for p in params)
+        ):
+            logger.debug(
+                "taint_approx: replaced malformed params with []: %r",
+                params,
+            )
+            approx["params"] = []
+    return cached
 
 
 def load_or_build_taint_approx(
@@ -170,11 +298,11 @@ def load_or_build_taint_approx(
             with contextlib.suppress(OSError):
                 from core.json import load_json
                 cached = load_json(cache_path)
-                if cached:
+                if isinstance(cached, dict) and cached:
                     logger.info(
                         "taint_approx: loaded %d cached results", len(cached),
                     )
-                    return cached
+                    return _rekey_cached_taint_approx(cached)
     results = _build_taint_approx(target_path, scope=scope)
     if results and out_dir:
         # Cache write is best-effort: IO failures and non-finite
@@ -197,6 +325,7 @@ def _build_taint_approx(
         from core.analysis.taint_approx import (
             extract_taint_approx_c,
             extract_taint_approx_cpp,
+            function_key,
         )
     except ImportError:
         return None
@@ -210,6 +339,7 @@ def _build_taint_approx(
     # generated/vendored source file costs seconds of parse time for
     # approximations nobody reads.
     from core.inventory.builder import MAX_FILE_BYTES
+    from core.source import read_text_capped
 
     results: dict[str, Any] = {}
     c_exts = {".c", ".h"}
@@ -225,12 +355,19 @@ def _build_taint_approx(
         if suffix not in c_exts and suffix not in cpp_exts:
             continue
 
-        try:
-            if path.stat().st_size > MAX_FILE_BYTES:
-                skipped_large += 1
-                continue
-            content = path.read_text(errors="replace")
-        except OSError:
+        # Capped fd read, not stat-then-read (target-writable files
+        # race a by-name size gate; FIFO plants block raw reads).
+        # Confine-resolve keeps in-tree symlinked sources readable
+        # and refuses links escaping the root.
+        resolved = confine(target_path, path)
+        if resolved is None:
+            continue
+        got = read_text_capped(resolved, MAX_FILE_BYTES)
+        if got is None:
+            continue
+        content, truncated = got
+        if truncated:
+            skipped_large += 1
             continue
 
         rel = str(path.relative_to(target_path))
@@ -249,8 +386,11 @@ def _build_taint_approx(
                 "(%s: %s)", rel, e.__class__.__name__, e)
             continue
 
+        # The shared constructor is the seam contract: the evidence
+        # index and compute_transitive_taint join on exactly this
+        # spelling.
         for func_name, approx in approxes.items():
-            results[f"{rel}:{func_name}"] = approx
+            results[function_key(rel, func_name)] = approx
 
     if skipped_large:
         logger.info(

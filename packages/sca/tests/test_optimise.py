@@ -964,6 +964,7 @@ class TestAnalyzeMajorBumps:
                    return_value=_SafeVerdict()):
             approved, verdicts = optimise._analyze_major_bumps(
                 major_blocked, vuln_plans, Path("/project"),
+                promote=True,       # the operator's --llm-approve-major
             )
 
         assert key in approved
@@ -1077,6 +1078,7 @@ class TestAnalyzeMajorBumps:
                    side_effect=_fake_assess):
             approved, verdicts = optimise._analyze_major_bumps(
                 major_blocked, vuln_plans, Path("/project"),
+                promote=True,       # the operator's --llm-approve-major
             )
 
         assert key_safe in approved
@@ -1126,6 +1128,7 @@ class TestAnalyzeMajorBumps:
                    side_effect=_fake_assess):
             approved, verdicts = optimise._analyze_major_bumps(
                 major_blocked, vuln_plans, Path("/project"),
+                promote=True,       # the operator's --llm-approve-major
             )
 
         # The successful dep should be approved despite the failure on the
@@ -1281,3 +1284,421 @@ class TestPinStagingAnchors:
         assert "requests==2.31.0" in final, (
             "CVE-phase rewrite lost — pin staging did not compose"
         )
+
+
+class TestDryRunTerminalEscaping:
+    """Default dry-run output interpolates manifest-, OSV-, and
+    LLM-derived strings: ANSI/OSC sequences in any of them must never
+    reach the operator's terminal raw."""
+
+    _ANSI = "\x1b]0;pwned\x07\x1b[31m"
+
+    def _plan(self, **kw):
+        base = dict(
+            ecosystem="PyPI", name=f"evil{self._ANSI}pkg",
+            installed="1.0.0", target=f"2.0.0{self._ANSI}",
+            manifest=Path("/p/requirements.txt"),
+            advisory_ids=[f"GHSA-{self._ANSI}x"],
+        )
+        base.update(kw)
+        return _PlanEntry(**base)
+
+    def test_plan_lines_escaped(self, capsys):
+        key = ("PyPI", f"evil{self._ANSI}pkg", "/p/requirements.txt")
+        optimise._print_dry_run({key: self._plan()}, {})
+        out = capsys.readouterr().out
+        assert "\x1b" not in out
+        assert "\x07" not in out
+
+    def test_llm_verdict_text_escaped(self, capsys):
+        from packages.sca.llm.schemas import BreakingChange, UpgradeImpactVerdict
+
+        key = ("PyPI", "flask", "/p/requirements.txt")
+        plan = self._plan(name="flask")
+        verdict = UpgradeImpactVerdict(
+            verdict="major_migration",
+            confidence="low",
+            breaking_changes=[BreakingChange(
+                site=f"src/x.py:1{self._ANSI}",
+                what_breaks=f"api gone{self._ANSI}",
+            )],
+            summary=f"looks fine{self._ANSI} ![b](https://evil.example/p)",
+        )
+        optimise._print_dry_run(
+            {}, {}, {key: plan}, llm_verdicts={key: verdict},
+        )
+        out = capsys.readouterr().out
+        assert "\x1b" not in out
+        assert "\x07" not in out
+        # LLM free text also gets the markdown/autofetch defang.
+        assert "![b](" not in out
+
+
+class TestMaterialiseSymlinkRefusal:
+    """The fix write path re-reads manifests AFTER the scan (TOCTOU
+    window; `--findings <file>` takes operator-era paths at face
+    value): a symlink swapped in must be refused, not followed —
+    following it routed host-file content into proposed/ and the
+    emitted patch context."""
+
+    def test_pin_changes_refuse_symlinked_manifest(self, tmp_path):
+        import os
+
+        real = tmp_path / "outside.txt"
+        real.write_text("flask==1.0.0\n")
+        manifest = tmp_path / "requirements.txt"
+        os.symlink(real, manifest)
+
+        plans = {
+            ("PyPI", "flask", str(manifest)): _PlanEntry(
+                ecosystem="PyPI", name="flask",
+                installed="1.0.0", target="1.0.0",
+                manifest=manifest,
+                advisory_ids=[],
+            ),
+        }
+        changes = optimise._materialise_pin_changes(
+            plans, tmp_path / "proposed",
+        )
+        assert len(changes) == 1
+        assert changes[0].skipped_reason is not None
+        assert "refused" in changes[0].skipped_reason
+
+    def test_cve_changes_refuse_symlinked_manifest(self, tmp_path):
+        import os
+
+        from packages.sca.update import _materialise_changes
+
+        real = tmp_path / "outside.txt"
+        real.write_text("flask==1.0.0\n")
+        manifest = tmp_path / "requirements.txt"
+        os.symlink(real, manifest)
+
+        plans = {
+            ("PyPI", "flask", str(manifest)): _PlanEntry(
+                ecosystem="PyPI", name="flask",
+                installed="1.0.0", target="2.0.0",
+                manifest=manifest,
+                advisory_ids=["GHSA-x"],
+            ),
+        }
+        changes = _materialise_changes(
+            plans, [], tmp_path / "proposed", pin_only=False,
+        )
+        assert len(changes) == 1
+        assert changes[0].skipped_reason is not None
+        assert "refused" in changes[0].skipped_reason
+
+
+class TestBarePinConfinement:
+    """The bare-name pinners run exactly when the hardened
+    (section-confined) rewriters declined — the fallback must carry
+    the same decoy-section resistance, never splicing pins into
+    non-dependency data."""
+
+    def test_package_json_scripts_decoy_untouched(self):
+        plan = _PlanEntry(
+            ecosystem="npm", name="jest",
+            installed="29.0.0", target="29.7.0",
+            manifest=Path("/p/package.json"), advisory_ids=[],
+        )
+        text = (
+            '{\n'
+            '  "scripts": {\n    "jest": ""\n  },\n'
+            '  "config": {\n    "jest": "*"\n  },\n'
+            '  "devDependencies": {\n    "jest": "*"\n  }\n'
+            '}'
+        )
+        new, applied, _ = optimise._pin_bare_package_json(text, plan)
+        assert applied
+        # Only the dependency-section entry is pinned.
+        assert new.count('"jest": "29.7.0"') == 1
+        assert '"scripts": {\n    "jest": ""\n  }' in new
+        assert '"config": {\n    "jest": "*"\n  }' in new
+
+    def test_package_json_no_dep_section_refuses(self):
+        plan = _PlanEntry(
+            ecosystem="npm", name="jest",
+            installed="29.0.0", target="29.7.0",
+            manifest=Path("/p/package.json"), advisory_ids=[],
+        )
+        text = '{"scripts": {"jest": "*"}}'
+        new, applied, reason = optimise._pin_bare_package_json(text, plan)
+        assert not applied
+        assert new == text
+
+    def test_pyproject_keywords_array_untouched(self):
+        plan = _PlanEntry(
+            ecosystem="PyPI", name="requests",
+            installed="2.28.0", target="2.31.0",
+            manifest=Path("/p/pyproject.toml"), advisory_ids=[],
+        )
+        text = (
+            '[project]\n'
+            'keywords = [\n    "requests",\n]\n'
+            'dependencies = [\n    "requests",\n]\n'
+        )
+        new, applied, _ = optimise._pin_bare_pyproject(text, plan)
+        assert applied
+        assert 'keywords = [\n    "requests",\n]' in new
+        assert '"requests==2.31.0",' in new
+
+    def test_pyproject_tool_config_array_untouched(self):
+        plan = _PlanEntry(
+            ecosystem="PyPI", name="requests",
+            installed="2.28.0", target="2.31.0",
+            manifest=Path("/p/pyproject.toml"), advisory_ids=[],
+        )
+        text = (
+            '[tool.mytool]\n'
+            'packages = [\n    "requests",\n]\n'
+        )
+        new, applied, _ = optimise._pin_bare_pyproject(text, plan)
+        assert not applied
+        assert new == text
+
+    def test_pyproject_optional_dependency_group_pinned(self):
+        plan = _PlanEntry(
+            ecosystem="PyPI", name="requests",
+            installed="2.28.0", target="2.31.0",
+            manifest=Path("/p/pyproject.toml"), advisory_ids=[],
+        )
+        text = (
+            '[project.optional-dependencies]\n'
+            'http = [\n    "requests",\n]\n'
+        )
+        new, applied, _ = optimise._pin_bare_pyproject(text, plan)
+        assert applied
+        assert '"requests==2.31.0",' in new
+
+    def test_pyproject_build_system_requires_pinned(self):
+        plan = _PlanEntry(
+            ecosystem="PyPI", name="setuptools",
+            installed="68.0.0", target="70.0.0",
+            manifest=Path("/p/pyproject.toml"), advisory_ids=[],
+        )
+        text = (
+            '[build-system]\n'
+            'requires = [\n    "setuptools",\n]\n'
+        )
+        new, applied, _ = optimise._pin_bare_pyproject(text, plan)
+        assert applied
+        assert '"setuptools==70.0.0",' in new
+
+    def test_pyproject_unbalanced_bracket_string_does_not_leak_context(self):
+        """A dependency string carrying a net-positive bracket
+        (``"foo[",``) must not keep the tracker "inside" the
+        dependencies array past its real ``]`` — the stale array
+        context silently rewrote a bare string in the FOLLOWING
+        ``keywords`` array in the same section."""
+        plan = _PlanEntry(
+            ecosystem="PyPI", name="requests",
+            installed="2.28.0", target="2.31.0",
+            manifest=Path("/p/pyproject.toml"), advisory_ids=[],
+        )
+        text = (
+            '[project]\n'
+            'name = "demo"\n'
+            'dependencies = [\n    "foo[",\n]\n'
+            'keywords = [\n    "requests",\n]\n'
+        )
+        new, applied, reason = optimise._pin_bare_pyproject(text, plan)
+        assert not applied
+        assert new == text
+        assert reason == "bare name not found in a dependency array"
+
+    def test_pyproject_bracketed_extras_string_keeps_array_live(self):
+        """Two-direction guard: brackets inside strings are ignored in
+        BOTH directions — a balanced extras entry (``"foo[bar]",``)
+        neither closes nor extends the array, so a real dependency
+        later in the SAME array is still pinned."""
+        plan = _PlanEntry(
+            ecosystem="PyPI", name="requests",
+            installed="2.28.0", target="2.31.0",
+            manifest=Path("/p/pyproject.toml"), advisory_ids=[],
+        )
+        text = (
+            '[project]\n'
+            'dependencies = [\n'
+            '    "foo[bar]",\n'
+            '    "requests",\n'
+            ']\n'
+        )
+        new, applied, _ = optimise._pin_bare_pyproject(text, plan)
+        assert applied
+        assert '"requests==2.31.0",' in new
+        assert '"foo[bar]",' in new
+
+    def test_pyproject_comment_brackets_ignored(self):
+        """A ``]`` inside a comment must not close the array early —
+        the real dependency below the comment is still in context."""
+        plan = _PlanEntry(
+            ecosystem="PyPI", name="requests",
+            installed="2.28.0", target="2.31.0",
+            manifest=Path("/p/pyproject.toml"), advisory_ids=[],
+        )
+        text = (
+            '[project]\n'
+            'dependencies = [\n'
+            '    # see matrix ]\n'
+            '    "requests",\n'
+            ']\n'
+        )
+        new, applied, _ = optimise._pin_bare_pyproject(text, plan)
+        assert applied
+        assert '"requests==2.31.0",' in new
+
+
+class TestSafeVerdictConfidenceFloor:
+    """Only a HIGH-confidence "safe" verdict auto-promotes a
+    mechanically-blocked major bump; a hedged "safe" stays in the
+    review bucket with the verdict attached (both directions of the
+    floor pinned)."""
+
+    def _blocked(self):
+        key = ("PyPI", "pytest", "/r.txt")
+        plan = _PlanEntry(
+            ecosystem="PyPI", name="pytest",
+            installed="7.0.0", target="9.0.3",
+            manifest=Path("/r.txt"),
+            advisory_ids=["GHSA-y"],
+        )
+        return key, {key: plan}
+
+    def _run(self, verdict):
+        key, major_blocked = self._blocked()
+        vuln_plans = {}
+        with patch("packages.sca.llm.get_llm_client",
+                   return_value=object()), \
+             patch("packages.sca.llm.upgrade_impact_review."
+                   "assess_upgrade_impact", return_value=verdict):
+            approved, verdicts = optimise._analyze_major_bumps(
+                major_blocked, vuln_plans, Path("/project"),
+                promote=True,       # the operator's --llm-approve-major
+            )
+        return key, major_blocked, vuln_plans, approved, verdicts
+
+    def test_low_confidence_safe_stays_blocked(self):
+        from pydantic import BaseModel
+
+        class _HedgedSafe(BaseModel):
+            verdict: str = "safe"
+            confidence: str = "low"
+            summary: str = "probably fine"
+            breaking_changes: list = []
+
+        key, blocked, plans, approved, verdicts = self._run(_HedgedSafe())
+        assert approved == set()
+        assert key in blocked
+        assert key not in plans
+        # The verdict is retained so dry-run shows it for review.
+        assert key in verdicts
+
+    def test_medium_confidence_safe_stays_blocked(self):
+        from pydantic import BaseModel
+
+        class _MediumSafe(BaseModel):
+            verdict: str = "safe"
+            confidence: str = "medium"
+            summary: str = "looks compatible"
+            breaking_changes: list = []
+
+        key, blocked, plans, approved, verdicts = self._run(_MediumSafe())
+        assert approved == set()
+        assert key in blocked
+        assert key in verdicts
+
+    def test_high_confidence_safe_promotes(self):
+        from pydantic import BaseModel
+
+        class _HighSafe(BaseModel):
+            verdict: str = "safe"
+            confidence: str = "high"
+            summary: str = "no call sites affected"
+            breaking_changes: list = []
+
+        key, blocked, plans, approved, verdicts = self._run(_HighSafe())
+        assert key in approved
+        assert key in plans
+        assert key not in blocked
+
+
+class TestLlmMajorApprovalGate:
+    def test_safe_verdict_is_annotation_only_without_opt_in(self):
+        """LLM output is not operator consent: the documented opt-in
+        for applying a major bump is --allow-major, and target-tree
+        content can steer the classification of its own bump. Without
+        the explicit --llm-approve-major opt-in a high-confidence
+        \"safe\" verdict stays an ANNOTATION — the bump remains
+        blocked."""
+        from pydantic import BaseModel
+
+        class _SafeVerdict(BaseModel):
+            verdict: str = "safe"
+            confidence: str = "high"
+            summary: str = "No breaking changes"
+            breaking_changes: list = []
+
+        key = ("PyPI", "pytest", "/r.txt")
+        plan = _PlanEntry(
+            ecosystem="PyPI", name="pytest",
+            installed="7.0.0", target="9.0.3",
+            manifest=Path("/r.txt"),
+            advisory_ids=["GHSA-y"],
+        )
+        major_blocked = {key: plan}
+        vuln_plans = {}
+
+        with patch("packages.sca.llm.get_llm_client",
+                   return_value=object()), \
+             patch("packages.sca.llm.upgrade_impact_review"
+                   ".assess_upgrade_impact",
+                   return_value=_SafeVerdict()):
+            approved, verdicts = optimise._analyze_major_bumps(
+                major_blocked, vuln_plans, Path("/project"),
+            )
+
+        assert approved == set()
+        assert vuln_plans == {}
+        assert key in major_blocked          # never applied
+        assert key in verdicts               # ...but the verdict shows
+        assert verdicts[key].verdict == "safe"
+
+    def test_llm_approve_major_flag_exists_and_defaults_off(self):
+        args = optimise._parse_args(["/x"])
+        assert args.llm_approve_major is False
+        args = optimise._parse_args(["/x", "--llm-approve-major"])
+        assert args.llm_approve_major is True
+
+
+class TestSectionHeaderWhitespaceRun:
+    def _plan(self):
+        return _PlanEntry(
+            ecosystem="PyPI", name="flask",
+            installed="2.3.0", target="2.3.0",
+            manifest=Path("/p/pyproject.toml"), advisory_ids=[],
+        )
+
+    def test_header_whitespace_run_is_fast(self):
+        """Hostile pyproject line opening '[' with a long interior
+        whitespace run and no ']': the previous trim spelling
+        overlapped three unbounded repeats on whitespace — cubic in
+        the line length. The \\S-delimited section name is linear."""
+        from core.testing.wallclock import cpu_budget
+
+        hostile = "[x" + " " * (1 << 16) + "y\n"
+        with cpu_budget(2.0, what="section-header whitespace run"):
+            _new, applied, _why = optimise._pin_bare_pyproject(
+                hostile, self._plan(),
+            )
+        # No dependency array in the hostile text: nothing pinned
+        # (same refusal as before the respelling), just fast now.
+        assert not applied
+
+    def test_padded_header_still_recognised(self):
+        text = ('[ project ]\ndependencies = [\n  "flask",\n]\n')
+        new, applied, _ = optimise._pin_bare_pyproject(
+            text, self._plan(),
+        )
+        assert applied
+        assert '"flask==2.3.0"' in new

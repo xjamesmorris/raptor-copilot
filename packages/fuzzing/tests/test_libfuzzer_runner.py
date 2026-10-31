@@ -1,12 +1,29 @@
 """Tests for the libFuzzer runner process contract."""
 
+import logging
 import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from packages.fuzzing.libfuzzer_runner import LibFuzzerRunner
+
+
+@pytest.fixture(autouse=True)
+def _raptor_logger_propagates():
+    """Let caplog see records from the 'raptor' logger.
+
+    RaptorLogger sets propagate=False on logging.getLogger('raptor'),
+    so records never reach root where pytest's caplog handler lives.
+    """
+    raptor = logging.getLogger("raptor")
+    orig = raptor.propagate
+    raptor.propagate = True
+    yield
+    raptor.propagate = orig
 
 
 class TestLibFuzzerRunner(unittest.TestCase):
@@ -165,6 +182,65 @@ class TestCampaignVerdictAndArtifacts(unittest.TestCase):
             # failed run.
             self.assertFalse(result.campaign_failed)
 
+    def _run_with_planted(self, tmp: Path, plant):
+        harness = tmp / "fuzz_target"
+        harness.write_text("#!/bin/sh\nexit 0\n")
+        harness.chmod(0o755)
+        out_dir = tmp / "out"
+
+        def fake_sandbox_run(cmd, **kwargs):
+            plant(out_dir / "crashes")
+
+            class Result:
+                returncode = 77
+
+            return Result()
+
+        with patch("packages.fuzzing.libfuzzer_runner._sandbox_run",
+                   side_effect=fake_sandbox_run):
+            runner = LibFuzzerRunner(
+                harness_path=harness, output_dir=out_dir,
+                max_total_time=1,
+            )
+            return runner.run()
+
+    def test_symlinked_crash_artifact_is_refused(self):
+        # A hostile harness can plant ``crash-<x> -> <host file>`` in
+        # its writable crashes dir; dereferencing it would launder the
+        # symlink into result listings that downstream stages read as
+        # regular crash inputs.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            victim = tmp / "victim"
+            victim.write_bytes(b"host secret")
+
+            def plant(crashes: Path) -> None:
+                (crashes / "crash-aaaa").symlink_to(victim)
+                (crashes / "crash-bbbb").write_bytes(b"real")
+
+            with self.assertLogs("raptor", level="WARNING") as logs:
+                result = self._run_with_planted(tmp, plant)
+            self.assertEqual(len(result.crashes), 1)
+            self.assertEqual(result.crashes[0].name, "crash-bbbb")
+            self.assertTrue(any(
+                "non-regular crash artifact" in r.getMessage()
+                for r in logs.records))
+
+    def test_non_regular_leak_artifact_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+
+            def plant(crashes: Path) -> None:
+                os.mkfifo(crashes / "leak-cafef00d")
+
+            with self.assertLogs("raptor", level="WARNING") as logs:
+                result = self._run_with_planted(tmp, plant)
+            self.assertEqual(len(result.leak_inputs), 0)
+            self.assertEqual(result.total_findings(), 0)
+            self.assertTrue(any(
+                "non-regular crash artifact" in r.getMessage()
+                for r in logs.records))
+
     def test_streams_are_file_backed_not_captured(self):
         # The harness's output must never be buffered unbounded in
         # this process — file-backed streams only, then a bounded
@@ -253,6 +329,90 @@ class TestSeedWorkingCorpusSymlinks(unittest.TestCase):
             self.assertEqual((dest / "seed0").read_bytes(), b"A")
             self.assertFalse((dest / "dirlink").exists())
 
+    def test_planted_intermediate_dir_symlink_at_destination(self):
+        """DESTINATION-side intermediate symlink: the staging dir is
+        reused and harness-writable, so a planted dest/sub aimed at
+        an operator dir plus a repo seed named sub/<victim-name>
+        would carry the mkdir and the seed write outside staging.
+        The chain is vetted (confine) before any mkdir or write."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            attacker_dir = tmp / "attacker_dir"
+            attacker_dir.mkdir()
+            operator_file = attacker_dir / "profile"
+            operator_file.write_text("operator content\n")
+
+            source = tmp / "corpus"
+            (source / "sub").mkdir(parents=True)
+            (source / "sub" / "profile").write_bytes(b"attacker bytes\n")
+            (source / "seed0").write_bytes(b"A")
+
+            dest = tmp / "staging"
+            dest.mkdir()
+            (dest / "sub").symlink_to(attacker_dir)
+
+            LibFuzzerRunner._seed_working_corpus(source, dest)
+
+            self.assertEqual(
+                operator_file.read_text(), "operator content\n")
+            # The vetted flat seed still staged.
+            self.assertEqual((dest / "seed0").read_bytes(), b"A")
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSeedCopyBounded:
+    def test_oversized_seed_skipped_with_warning(self, tmp_path, monkeypatch, caplog):
+        """A hostile in-repo corpus can plant a huge \"seed\" — the
+        stager must skip it (recorded, like symlinks), not copy
+        gigabytes into the run dir (corpus_manager's bounded-copy
+        idiom)."""
+        import packages.fuzzing.libfuzzer_runner as lf
+
+        monkeypatch.setattr(lf.LibFuzzerRunner, "_MAX_SEED_BYTES", 1024)
+        source = tmp_path / "src"
+        source.mkdir()
+        (source / "ok").write_bytes(b"A" * 100)
+        (source / "huge").write_bytes(b"B" * 4096)
+        dest = tmp_path / "work"
+        dest.mkdir()
+        with caplog.at_level("WARNING", logger="raptor"):
+            lf.LibFuzzerRunner._seed_working_corpus(source, dest)
+        assert (dest / "ok").read_bytes() == b"A" * 100
+        assert not (dest / "huge").exists()
+        assert any("skipped" in r.getMessage() for r in caplog.records)
+
+    def test_seed_growing_past_cap_between_stat_and_read_truncated_out(
+        self, tmp_path, monkeypatch,
+    ):
+        """The copy itself is a bounded read, so a file growing after
+        the stat can never land oversize in the working corpus."""
+        import packages.fuzzing.libfuzzer_runner as lf
+
+        monkeypatch.setattr(lf.LibFuzzerRunner, "_MAX_SEED_BYTES", 1024)
+        source = tmp_path / "src"
+        source.mkdir()
+        seed = source / "grower"
+        seed.write_bytes(b"A" * 100)
+
+        real_stat = type(seed).stat
+
+        def lying_stat(self, **kw):
+            st = real_stat(self, **kw)
+            if self.name == "grower" and st.st_size == 4096:
+                # pretend the pre-growth size was still visible
+                import os
+                vals = list(st)
+                vals[6] = 100
+                return os.stat_result(vals)
+            return st
+
+        seed.write_bytes(b"A" * 4096)  # "grew" after the stat
+        monkeypatch.setattr(type(seed), "stat", lying_stat)
+        dest = tmp_path / "work"
+        dest.mkdir()
+        lf.LibFuzzerRunner._seed_working_corpus(source, dest)
+        copied = dest / "grower"
+        assert not copied.exists() or copied.stat().st_size <= 1024

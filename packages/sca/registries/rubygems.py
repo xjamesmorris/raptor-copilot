@@ -19,7 +19,7 @@ from ._url import (
     quote_segment,
     registry_cache_key,
 )
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from core.http import HttpClient
@@ -110,7 +110,12 @@ class RubyGemsClient:
         # Adapt to a ``releases`` shape so _latest_stable_version
         # finds versions consistently across ecosystems.
         if isinstance(data, dict):
-            data = {**data, "releases": {data.get("version"): []}}
+            version = data.get("version")
+            # A missing/None version must not mint a ``None`` dict key:
+            # JSON round-trip turns it into "null", so the first call
+            # and the cached call returned different shapes.
+            releases: dict[str, list[Any]] = {version: []} if isinstance(version, str) else {}
+            data = {**data, "releases": releases}
         if self._cache is not None:
             self._cache.put(cache_key, data, ttl_seconds=self._ttl)
         return data

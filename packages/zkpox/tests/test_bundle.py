@@ -206,3 +206,38 @@ def test_assemble_rejects_non_hex_hash(tmp_path):
     with pytest.raises(ZKPoXBundleError) as e:
         assemble_bundle(w, store)
     assert "not a sha256 hex digest" in str(e.value)
+
+
+def test_write_bundle_witness_write_is_atomic(tmp_path):
+    """witness.bin goes through the atomic substrate.
+
+    A crash mid-write used to leave a truncated witness.bin inside an
+    otherwise-valid bundle; the hash mismatch surfaced only at
+    reproduce time. Pin the substrate adoption.
+    """
+    from unittest import mock
+
+    store, w = _store_with_witness(tmp_path, data=b"the-crash-bytes")
+    bundle = assemble_bundle(w, store)
+    with mock.patch(
+        "packages.zkpox.bundle.write_bytes_atomically",
+    ) as atomic:
+        bundle_dir = write_bundle(bundle, store, tmp_path / "out")
+    atomic.assert_called_once_with(
+        bundle_dir / "witness.bin", b"the-crash-bytes",
+    )
+
+
+def test_render_bundle_tolerates_sparse_attestation(tmp_path):
+    """attestation is optional (the CLI defaults it to {} and the
+    reproduce required-field gate does not include it) — a sparse
+    manifest must render, not KeyError past the exit-2 diagnostic
+    contract."""
+    store, w = _store_with_witness(tmp_path)
+    bundle = assemble_bundle(w, store)
+    bundle.attestation = {}
+    out = render_bundle(bundle)
+    assert "claim:    (none)" in out
+
+    bundle.attestation = "junk-shape"  # hand-rolled manifest
+    assert "(none)" in render_bundle(bundle)

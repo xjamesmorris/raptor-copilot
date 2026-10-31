@@ -442,8 +442,11 @@ class TestSeedPolicy:
         assert lr._STEM_LOCK_RE.match("foo_lock").group(1) == "foo"
         assert not lr._STEM_LOCK_RE.match("foo_unlock")
         assert not lr._STEM_LOCK_RE.match("unlock")
-        # Bare "lock" yields an empty stem — the scanner skips it.
-        assert lr._STEM_LOCK_RE.match("lock").group(1) == ""
+        # Bare "lock" has no stem — no longer a stem-pair candidate
+        # (the scanner skipped its empty stem anyway; the mandatory
+        # separator also drops clock/block/flock, see
+        # TestStemPairing).
+        assert not lr._STEM_LOCK_RE.match("lock")
 
 
 class TestSanitizedScan:
@@ -551,3 +554,130 @@ class TestRegisteredNamesBalancedExtraction:
         # calls and member expressions stay out of the set.
         src = "void f(void) { register_cb(make_cb(a, b), o->fn); }\n"
         assert lr._registered_callback_names(src, self._Vocab()) == set()
+
+
+SSL_SESS_RELEASE_LINE = """
+void SSL_CTX_sess_set_remove_cb(struct SSL_CTX *ctx, void (*cb)(int)) {
+    ctx->remove_cb = cb;
+}
+void flush_sessions(struct SSL_CTX *ctx) {
+    CRYPTO_THREAD_write_lock(ctx->lock);
+    ctx->remove_cb(1); CRYPTO_THREAD_unlock(ctx->lock);
+}
+"""
+
+SSL_SESS_ACQUIRE_LINE = """
+void SSL_CTX_sess_set_remove_cb(struct SSL_CTX *ctx, void (*cb)(int)) {
+    ctx->remove_cb = cb;
+}
+void flush_sessions(struct SSL_CTX *ctx) {
+    CRYPTO_THREAD_write_lock(ctx->lock); ctx->remove_cb(1);
+    CRYPTO_THREAD_unlock(ctx->lock);
+}
+"""
+
+
+class TestSameLineRegion:
+    """The scan range excluded the acquire/release LINES entirely, so
+    an invocation sharing either line produced a false affirmative
+    refutation ("release precedes every callback-shaped invocation").
+    The acquire line is scanned AFTER the acquire call and the
+    release line BEFORE the release call."""
+
+    def test_invocation_on_release_line_is_not_refuted(self):
+        res = run_lock_region_check(
+            Path("/nonexistent"), "ssl/s.c", "flush_sessions", HYP,
+            source_texts={"ssl/s.c": SSL_SESS_RELEASE_LINE},
+        )
+        assert res.outcome != "refuted"
+
+    def test_invocation_on_acquire_line_is_not_refuted(self):
+        res = run_lock_region_check(
+            Path("/nonexistent"), "ssl/s.c", "flush_sessions", HYP,
+            source_texts={"ssl/s.c": SSL_SESS_ACQUIRE_LINE},
+        )
+        assert res.outcome != "refuted"
+
+    def test_invocation_after_release_on_same_line_still_refutes(self):
+        src = SSL_SESS_RELEASE_LINE.replace(
+            "ctx->remove_cb(1); CRYPTO_THREAD_unlock(ctx->lock);",
+            "CRYPTO_THREAD_unlock(ctx->lock); ctx->remove_cb(1);",
+        )
+        res = run_lock_region_check(
+            Path("/nonexistent"), "ssl/s.c", "flush_sessions", HYP,
+            source_texts={"ssl/s.c": src},
+        )
+        assert res.outcome == "refuted"
+
+
+class TestStemPairing:
+    def test_common_words_are_not_stem_acquires(self):
+        # clock/block/flock matched the old stem regex and produced
+        # misattributed pair-unresolved inconclusives.
+        for name in ("clock", "block", "flock", "unlock"):
+            assert lr._STEM_LOCK_RE.match(name) is None, name
+
+    def test_underscored_stems_still_pair(self):
+        m = lr._STEM_LOCK_RE.match("foo_lock")
+        assert m and m.group(1) == "foo"
+        m = lr._STEM_LOCK_RE.match("spin_lock")
+        assert m and m.group(1) == "spin"
+        assert lr._STEM_LOCK_RE.match("foo_unlock") is None
+
+
+class TestSourceReadContainment:
+    """run_lock_region_check's own source read (source_texts=None)
+    is contained + capped: file_path arrives from gap records."""
+
+    def test_escaping_file_path_holds_unbindable(self, tmp_path):
+        import sys
+
+        target = tmp_path / "target"
+        target.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        secret = outside / "evil.c"
+        secret.write_text(
+            "void cb_under_lock(void) { }\n",
+        )
+        opened: list = []
+
+        def hook(event, args):
+            if event == "open" and args and str(secret) in str(args[0]):
+                opened.append(args)
+
+        sys.addaudithook(hook)
+        for fp in (str(secret), "../outside/evil.c"):
+            res = lr.run_lock_region_check(
+                target, fp, "cb_under_lock",
+                "callback invoked while lock is held",
+            )
+            assert res.outcome == "inconclusive"
+            assert res.reason.startswith(lr.REASON_HYPOTHESIS_UNBINDABLE)
+        assert opened == [], (
+            "out-of-root file was opened by the lock_region source read"
+        )
+
+    def test_in_tree_fifo_refuses_instead_of_wedging(self, tmp_path):
+        """A reader-less FIFO named like a C file passed the suffix
+        check and blocked the raw read forever. Bounded child so a
+        regression fails instead of hanging the suite."""
+        import multiprocessing
+        import os
+
+        fifo = tmp_path / "wedge.c"
+        os.mkfifo(fifo)
+        child = multiprocessing.Process(
+            target=lr.run_lock_region_check,
+            args=(tmp_path, "wedge.c", "f", "callback under lock"),
+        )
+        child.start()
+        child.join(timeout=20)
+        try:
+            assert not child.is_alive(), (
+                "run_lock_region_check blocked on an in-tree FIFO"
+            )
+        finally:
+            if child.is_alive():
+                child.kill()
+                child.join()

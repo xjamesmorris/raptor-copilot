@@ -229,3 +229,29 @@ class TestToolInvocation:
         d = inv.to_dict()
         assert d["tool"] == "cocci"
         assert d["args"] == {"x": 1}
+
+
+class TestHypothesisPolarity:
+    def test_roundtrip(self):
+        h = Hypothesis(claim="c", target=Path("/src"),
+                       polarity="infeasibility")
+        assert Hypothesis.from_dict(h.to_dict()).polarity == "infeasibility"
+
+    def test_omitted_from_dict_when_unset(self):
+        # Additive field: unset polarity must not change the to_dict
+        # shape (hash_hypothesis stability for existing producers).
+        h = Hypothesis(claim="c", target=Path("/src"))
+        assert "polarity" not in h.to_dict()
+
+    def test_invalid_values_coerce_to_undeclared(self):
+        for bad in ("reachable", 3, ["reachability"], None, "  "):
+            h = Hypothesis.from_dict(
+                {"claim": "c", "target": "/src", "polarity": bad},
+            )
+            assert h.polarity == ""
+
+    def test_case_and_whitespace_normalised(self):
+        h = Hypothesis.from_dict(
+            {"claim": "c", "target": "/src", "polarity": " Reachability "},
+        )
+        assert h.polarity == "reachability"

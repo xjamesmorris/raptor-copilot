@@ -76,7 +76,11 @@ def _resolve_active_project() -> tuple[str, str, str] | None:
     resolves as "no project" — then the ambient chokepoint
     (``ProjectManager.get_active()``: session binding, then the
     ``.active`` symlink). Returns (output_dir, name, target) or None.
-    An invalid override is a hard error, never a fallback.
+    An invalid override is a hard error, never a fallback — the
+    ``--project`` argv value (``ProjectArgvError``) and the
+    ``RAPTOR_REGISTRY_HOME`` env override (``RegistryHomeError``,
+    raised by the ``core.project.registry_home`` seam) both escalate;
+    any other resolution failure warns and proceeds projectless.
     """
     try:
         from core.run.pin import ARGV_NONE, get_process_project
@@ -102,8 +106,12 @@ def _resolve_active_project() -> tuple[str, str, str] | None:
             if project:
                 return project.output_dir, project.name, project.target
     except Exception as exc:  # noqa: BLE001 — fall back to the default out/ dir
+        from core.project.registry_home import RegistryHomeError
         from core.run.pin import ProjectArgvError
-        if isinstance(exc, ProjectArgvError):
+        if isinstance(exc, (ProjectArgvError, RegistryHomeError)):
+            # Operator-supplied overrides that could not be honoured:
+            # proceeding projectless would silently drop the placement
+            # the operator asked for. Hard error, never a fallback.
             raise
         logger.warning("active project resolution failed: %s", exc)
 
@@ -113,9 +121,9 @@ def _resolve_active_project() -> tuple[str, str, str] | None:
 def volatile_target_reason(target: str | None) -> str | None:
     """Reason string when *target* is a scratch/volatile path, else None.
 
-    Flags exactly three shapes (a stale machine-generated project once
-    left ``/tmp`` as the active default target, and only an interactive
-    ask caught it):
+    Flagged shapes (a stale machine-generated project once left
+    ``/tmp`` as the active default target, and only an interactive ask
+    caught it):
 
     * an empty/whitespace target string — ``Path("").resolve()`` is
       the CWD (always the RAPTOR repo dir for these callers), the
@@ -126,7 +134,10 @@ def volatile_target_reason(target: str | None) -> str | None:
       lexical normalisation, so a symlink alias of the temp root
       cannot slip past the equality check;
     * a nonexistent path;
-    * an empty directory.
+    * an empty directory;
+    * a URL (fine for /web, not a filesystem default for
+      code-scanning commands);
+    * a path that cannot be resolved or read.
     """
     if target is None:
         return None
@@ -157,6 +168,20 @@ def volatile_target_reason(target: str | None) -> str | None:
     return None
 
 
+def _warn_windows_interop(path: str | Path, role: str) -> None:
+    """Warn-only advisory when *path* is on a Windows-interop
+    (drvfs/9p) mount on a WSL host — perf and flock-semantics caveat
+    plus the docs/wsl.md pointer. Fires at the resolution chokepoints
+    only (default target, output root); never refuses, never raises,
+    and is free off WSL (the cached detection short-circuits).
+    """
+    try:
+        from core.startup.wsl import warn_windows_interop_mount
+        warn_windows_interop_mount(path, role)
+    except Exception:  # noqa: BLE001 — advisory must never break resolution
+        logger.debug("windows-interop advisory failed", exc_info=True)
+
+
 def resolve_default_target() -> str | None:
     """CLAUDE.md DEFAULT TARGET DIRECTORY resolution: (1) active project,
     (2) ``RAPTOR_CALLER_DIR``, (3) None (caller asks the user).
@@ -169,25 +194,36 @@ def resolve_default_target() -> str | None:
     resolved target path or None if neither signal is present — the
     caller is expected to error or prompt.
 
-    Sanity gate: when the active project's target is scratch/volatile
+    Sanity gate: when the resolved default — the active project's
+    target OR the ``RAPTOR_CALLER_DIR`` back-fill — is scratch/volatile
     (the system temp dir itself, nonexistent, or an empty directory —
-    e.g. a stale machine-generated corpus project pointing at /tmp),
-    the DEFAULT resolution refuses with a loud banner and returns None
-    instead of silently steering the run at scratch space. The caller
-    then asks the operator (interactive sessions confirm via the
-    documented structured prompt; non-interactive sessions stop). An
-    EXPLICIT target path always bypasses this gate — it only guards
-    the implicit default.
+    e.g. a stale machine-generated corpus project pointing at /tmp, or
+    a launcher started from /tmp), the DEFAULT resolution refuses with
+    a loud banner and returns None instead of silently steering the
+    run at scratch space. The caller then asks the operator
+    (interactive sessions confirm via the documented structured
+    prompt; non-interactive sessions stop). An EXPLICIT target path
+    always bypasses this gate — it only guards the implicit default;
+    the gate exists precisely for scratch/volatile targets steering
+    runs, whichever layer supplies them.
     """
+    from core.security.log_sanitisation import sanitise_for_terminal
+
     active = _resolve_active_project()
     if active is not None:
         _out, project_name, project_target = active
         reason = volatile_target_reason(project_target)
         if reason:
+            # Project name/target can be adopt-inferred from
+            # child-writable run metadata or import-restored — escape
+            # before the raw stderr print (the logger lane escapes at
+            # the console formatter; this bare print does not).
             banner = (
                 f"REFUSING default target: active project "
-                f"'{project_name}' points at {project_target}, which "
-                f"{reason}. Not steering a no-path command at scratch "
+                f"'{sanitise_for_terminal(str(project_name), max_len=120)}' "
+                f"points at "
+                f"{sanitise_for_terminal(str(project_target), max_len=256)}, "
+                f"which {reason}. Not steering a no-path command at scratch "
                 f"space.\n"
                 f"  To proceed anyway: pass the target path explicitly.\n"
                 f"  To fix the session: /project use <real-project> "
@@ -196,9 +232,30 @@ def resolve_default_target() -> str | None:
             logger.warning("%s", banner)
             print(banner, file=sys.stderr)
             return None
+        _warn_windows_interop(
+            project_target, "default target (active project)")
         return project_target
     env = os.environ.get("RAPTOR_CALLER_DIR")
-    return env or None
+    if not env:
+        return None
+    reason = volatile_target_reason(env)
+    if reason:
+        # Env-supplied path — same terminal-escape class as the
+        # project arm above.
+        banner = (
+            f"REFUSING default target: RAPTOR_CALLER_DIR points at "
+            f"{sanitise_for_terminal(env, max_len=256)}, which {reason}. "
+            f"Not steering a no-path command "
+            f"at scratch space.\n"
+            f"  To proceed anyway: pass the target path explicitly.\n"
+            f"  To fix the session: re-launch from the target "
+            f"directory, or /project use <project>"
+        )
+        logger.warning("%s", banner)
+        print(banner, file=sys.stderr)
+        return None
+    _warn_windows_interop(env, "default target (RAPTOR_CALLER_DIR)")
+    return env
 
 
 def get_output_dir(command: str, target_name: str = "",
@@ -248,7 +305,9 @@ def get_output_dir(command: str, target_name: str = "",
                         "trust markers do not apply",
                         effective_target, project_name, project_target,
                     )
-        return Path(explicit_out).resolve()
+        out_path = Path(explicit_out).resolve()
+        _warn_windows_interop(out_path, "output directory (--out)")
+        return out_path
 
     active = _resolve_active_project()
 
@@ -263,7 +322,9 @@ def get_output_dir(command: str, target_name: str = "",
 
         # Project mode: command-YYYYMMDD-HHMMSS-pidNNNNN (hyphens throughout).
         # See unique_run_suffix() for the collision-prevention rationale.
-        return Path(project_dir) / f"{command}-{unique_run_suffix('-')}"
+        run_dir = Path(project_dir) / f"{command}-{unique_run_suffix('-')}"
+        _warn_windows_interop(run_dir, "output directory")
+        return run_dir
 
     # Standalone mode: command_target_YYYYMMDD_HHMMSS_pidNNNNN (underscores,
     # backwards compatible with existing directories created before project
@@ -274,7 +335,9 @@ def get_output_dir(command: str, target_name: str = "",
     else:
         dirname = f"{command}_{suffix}"
 
-    return RaptorConfig.get_out_dir() / dirname
+    out_dir = RaptorConfig.get_out_dir() / dirname
+    _warn_windows_interop(out_dir, "output directory")
+    return out_dir
 
 
 _URL_SCHEME_RE = re.compile(r"\A[a-zA-Z][a-zA-Z0-9+.-]*://")
@@ -292,15 +355,42 @@ def _check_target_mismatch(target_path: str, project_name: str,
     project source tree (build dirs, installed paths, fuzzing
     harnesses); an out-of-tree binary warns instead of raising.
     """
+    from core.security.log_sanitisation import sanitise_for_terminal
+
     if _URL_SCHEME_RE.match(target_path):
         if _URL_SCHEME_RE.match(project_target):
             # Both sides are URLs: compare them (trailing-slash
-            # tolerant) instead of skipping — /web --url https://B
-            # must not silently land its run in project A.
-            if target_path.rstrip("/") != project_target.rstrip("/"):
+            # tolerant, scheme/host case-insensitive — DNS names and
+            # schemes are case-insensitive, so https://Example.com
+            # must not spuriously refuse project https://example.com;
+            # the path stays case-sensitive) instead of skipping —
+            # /web --url https://B must not silently land its run in
+            # project A.
+            def _url_norm(u: str) -> str:
+                from urllib.parse import urlsplit, urlunsplit
+                try:
+                    parts = urlsplit(u.rstrip("/"))
+                    port = parts.port
+                except ValueError:
+                    return u.rstrip("/")
+                host = (parts.hostname or "").casefold()
+                if port is not None:
+                    host = f"{host}:{port}"
+                if "@" in parts.netloc:  # userinfo stays case-sensitive
+                    host = parts.netloc.rsplit("@", 1)[0] + "@" + host
+                return urlunsplit((parts.scheme.casefold(), host,
+                                   parts.path, parts.query,
+                                   parts.fragment))
+
+            if _url_norm(target_path) != _url_norm(project_target):
+                # sanitise_for_terminal instead of !r: repr already
+                # escapes control bytes, but leaves length unbounded —
+                # a hostile project target can flood the terminal.
+                st = sanitise_for_terminal(str(target_path), max_len=256)
+                sp = sanitise_for_terminal(str(project_target), max_len=256)
                 raise TargetMismatchError(
-                    f"Run target {target_path!r} does not match the active "
-                    f"project's target {project_target!r}. Use --out to "
+                    f"Run target '{st}' does not match the active "
+                    f"project's target '{sp}'. Use --out to "
                     "direct the run elsewhere, or switch projects."
                 )
         return
@@ -340,11 +430,40 @@ def _check_target_mismatch(target_path: str, project_name: str,
     # Remediation: pre-fix the hint said create-then-'/project use
     # none', which leaves the just-created project inactive AND the
     # mismatching one active — following it verbatim changed nothing.
+    #
+    # Escape before interpolating: project name/target can be
+    # adopt-inferred from child-writable run metadata or
+    # import-restored (same class as the volatile-target banner in
+    # resolve_default_target), and every catcher prints this message
+    # raw to stderr (raptor.py, packages/binary_analysis/cli.py) —
+    # the bare print does not escape the way the logger lane does.
+    st = sanitise_for_terminal(str(target_path), max_len=256)
+    sn = sanitise_for_terminal(str(project_name), max_len=120)
+    sp = sanitise_for_terminal(str(project_target), max_len=256)
     msg = (
-        f"target {target_path} is outside project {project_name} ({project_target})\n"
+        f"target {st} is outside project {sn} ({sp})\n"
         f"  A project tracks one target. To analyze a different codebase:\n"
-        f"    /project create <name> --target {target_path}   (activates for this session)\n"
+        f"    /project create <name> --target {st}   (activates for this session)\n"
         f"  Or pin just this run: pass --project <name> (or --project - for no project)\n"
         f"  Or clear this session's project: /project none"
     )
     raise TargetMismatchError(msg)
+
+
+def target_matches_project(target_path: str, project_name: str,
+                           project_target: str, command: str = "") -> bool:
+    """Predicate form of the project target-match gate.
+
+    True when *target_path* would pass ``_check_target_mismatch`` for
+    the named project (inside/equal to the project target, a matching
+    URL pair, or one of the gate's documented warn-only shapes). For
+    callers that need to VET a candidate pin before threading it —
+    the gate itself refuses a start; this only answers whether it
+    would.
+    """
+    try:
+        _check_target_mismatch(target_path, project_name, project_target,
+                               command=command)
+    except TargetMismatchError:
+        return False
+    return True

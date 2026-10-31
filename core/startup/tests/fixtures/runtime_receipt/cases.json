@@ -1,0 +1,113 @@
+{
+  "fixture_schema": "raptor.runtime_receipt_test_cases/v1",
+  "session_id": "11111111-2222-4333-8444-555555555555",
+  "launch_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+  "other_session_id": "99999999-8888-4777-8666-555555555555",
+  "other_launch_id": "01234567-89ab-4cde-8f01-23456789abcd",
+  "boot_id": "12345678-1234-4234-8234-123456789abc",
+  "token_hex": "00112233445566778899aabbccddeeff",
+  "issued_at_utc": "2026-09-12T08:00:00Z",
+  "observed_at_utc": "2026-09-12T08:00:03Z",
+  "freshness_not_after_utc": "2026-09-12T09:00:00Z",
+  "verification_now_utc": "2026-09-12T08:30:00Z",
+  "stale_now_utc": "2026-09-12T10:00:00Z",
+  "paths": {
+    "launcher": "/opt/raptor/bin/raptor",
+    "frontend": "/opt/copilot/bin/copilot",
+    "interpreter": "/usr/lib64/ld-linux-x86-64.so.2",
+    "source_directory": "/opt/copilot/distributions/1.0.84-5",
+    "sealed_directory": "/var/lib/raptor/session/11111111-2222-4333-8444-555555555555/dist"
+  },
+  "identity": {
+    "launcher": {
+      "sha256": "66656f5cdcbb50885b928e579e744460af00b3744367ad431d6220d5729b49e4",
+      "size_bytes": 35426,
+      "format_id": "shell-script"
+    },
+    "frontend": {
+      "sha256": "7ca6ac516ce309e49e1003331caeed0df1551b0f3db74cc4ba90738e5eebeb3b",
+      "size_bytes": 165088064,
+      "format_id": "elf64-x86_64-exec",
+      "elf_build_id_sha1": "27c14e2bb00b7fb98fa5afa3c13243285e6ed981"
+    },
+    "interpreter": {
+      "sha256": "f0949392f14253241540dfeb152f5bd3cbd75f8a3e4f8d3fabc286a2daa27a68",
+      "size_bytes": 1002568,
+      "format_id": "elf64-x86_64-dyn",
+      "elf_build_id_sha1": "2db3b8c0a5637bdd1927501a4d3d0a9a91756d1a"
+    },
+    "package": {
+      "sha256": "fbc68130592ac9a1697e609c976ddf6962ae966d5721abbcdca5eed86c3b179c",
+      "size_bytes": 2206,
+      "format_id": "json-utf8"
+    }
+  },
+  "artifacts": [
+    [".extraction-complete", 0, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "empty"],
+    ["app.js", 7585604, "7f2ebb0a5d308f74112029a67c76bce6d3b5280c4d2cdf195c617d94ac8788b1", "javascript-utf8"],
+    ["changelog.json", 1007096, "1efc1db79661defa3d5ba3f3ca590a8c660bde9b4ad2daad5255b678fef234df", "json-utf8"],
+    ["index.js", 19101, "0631d4526d1492320478fc609d9fc1d06b0fcb0d4d6df2377c6a6b8dc2448c7e", "javascript-utf8"],
+    ["npm-loader.js", 1185, "0ea824a86be5757533fdb092eff7050871bd7a711a46babde0ffe0e44ac5ad88", "javascript-utf8"],
+    ["prebuilds/linux-x64/cli-native.node", 4483480, "c6fabd15761ae556cf5fd5a4ef45bbfc8cf574967f6c8540eab216238f79c04a", "elf64-x86_64-dyn"],
+    ["prebuilds/linux-x64/runtime.node", 94590664, "db6e691277b20c0b54fca483021c543f8db78d6764505e14837d0a4967269891", "elf64-x86_64-dyn"],
+    ["schemas/api.schema.json", 1696258, "5835517c600d1661bb857aa74deeb2abd2cfb9ed1e69cdedd1402181ea9eca98", "json-utf8"],
+    ["schemas/session-events.schema.json", 831441, "fded8ae9faa212cc84adae273c8b107a450b90ab66a723ee03e9057d41f8e4c5", "json-utf8"],
+    ["sdk/index.js", 1127594, "746688b8c406f8cd4f0bebbcf6ca167b33c3a3e2be5094de430378a5220a8341", "opaque"],
+    ["sea-loader.js", 94947, "992e4936d12004d2cc5285ce6b1e0115adaf37c976185e3aa9580fbdf24aaa0e", "javascript-utf8"]
+  ],
+  "mutations": {
+    "stale_receipt": {"verify_at": "2026-09-12T10:00:00Z"},
+    "missing_artifact": {"remove_artifact": "app.js"},
+    "loader_mismatch": {"replace": "stable_identity.frontend_executable.sha256"},
+    "distribution_mismatch": {"replace": "stable_identity.distribution.content_manifest.sha256"},
+    "runtime_node_mismatch": {"replace_artifact": "prebuilds/linux-x64/runtime.node"},
+    "cli_native_node_mismatch": {"replace_artifact": "prebuilds/linux-x64/cli-native.node"},
+    "schema_drift": {"replace_schema": "session-events"},
+    "grammar_drift": {"replace": "stable_identity.contract.cli_grammar.sha256"},
+    "copied_session_binding": {"replace_with": "other_session_id"},
+    "copied_launch_binding": {"replace_with": "other_launch_id"},
+    "mapped_vs_disk_disagreement": {"replace": "process_corroboration.mapped_executable.current_disk_file.inode"},
+    "unsupported_evidence": {"replace_with": "weak"},
+    "unsupported_profile": {"replace": "stable_identity.profile_id"},
+    "unsupported_version": {"replace": "schema_version"},
+    "unsupported_platform": {"replace": "stable_identity.platform.system"},
+    "unknown_field": {"add": "effects_enabled"},
+    "symlink_field": {"replace": "launch_instance.frontend_executable.is_symlink"},
+    "relative_path": {"fixture": "raw_cases.relative_path"},
+    "control_character_path": {"fixture": "raw_cases.control_character_path"},
+    "mutation_isolation": {"operation": "mutate_source_after_parse"}
+  },
+  "deterministic_cases": [
+    "valid_static_candidate",
+    "stale_receipt",
+    "missing_artifact",
+    "loader_mismatch",
+    "distribution_mismatch",
+    "runtime_node_mismatch",
+    "cli_native_node_mismatch",
+    "schema_drift",
+    "grammar_drift",
+    "copied_session_binding",
+    "copied_launch_binding",
+    "mapped_vs_disk_disagreement",
+    "unsupported_evidence",
+    "unsupported_profile",
+    "unsupported_version",
+    "unsupported_platform",
+    "unknown_field",
+    "duplicate_key",
+    "deep_json",
+    "oversize_json",
+    "symlink_field",
+    "relative_path",
+    "control_character_path",
+    "mutation_isolation"
+  ],
+  "raw_cases": {
+    "duplicate_key": "{\"schema\":\"raptor.runtime_receipt/v1\",\"schema\":\"raptor.runtime_receipt/v1\"}",
+    "deep_json": "[[[[[[[[[[[[[0]]]]]]]]]]]]]",
+    "oversize_padding_bytes": 65537,
+    "relative_path": "relative/copilot",
+    "control_character_path": "/opt/copilot/\u0001bad"
+  }
+}

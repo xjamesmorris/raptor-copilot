@@ -28,8 +28,9 @@ env:
   VENV_PATH: .venv
   # CI-only hang net: dump every worker's Python stack if any single
   # test runs >120s, then let it continue (the dump is the signal, not
-  # a failure). The slowest legit default-tier test is a few seconds —
-  # slow/integration tests are gated out of these runs — so 120s only
+  # a failure). The slowest legit default-tier test is a few seconds,
+  # and the one slow/integration invocation here (the sandbox job's
+  # second step) completes in ~90s serial END TO END — so 120s only
   # fires on a genuine hang, surfacing the stuck call in ~2 min instead
   # of waiting out the job timeout. Set via PYTEST_ADDOPTS (not
   # pytest.ini) so it covers every tier here but NOT local `pytest`,
@@ -51,11 +52,13 @@ env:
   # Opt the runner into Node.js 24 for JavaScript actions.
   # GitHub deprecated Node.js 20 on 2025-09-19; runners enforce
   # Node 24 by default from 2026-06-02 and remove Node 20 on
-  # 2026-09-16. astral-sh/setup-uv@v8.1.0 (and several others
-  # pinned in this workflow) still declares ``runs.using: node20``
-  # in its action.yml, so without this opt-in the runner emits a
-  # deprecation warning for every JS-action step. Lift this once
-  # all pinned JS actions ship a Node 24 release.
+  # 2026-09-16. Every JS action pinned in this workflow now
+  # declares ``runs.using: node24`` in its action.yml, so this
+  # opt-in is a no-op here; it stays as a guard against a pin
+  # regressing while the repo still carries one node20 action
+  # (actions/delete-package-versions in the image workflows —
+  # upstream has no Node 24 release yet). Lift this everywhere
+  # once that action ships Node 24.
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 permissions:
@@ -82,8 +85,10 @@ jobs:
       should_skip: ${{ steps.dup.outputs.should_skip }}
       # true for same-repo events (push / merge_group / schedule / dispatch
       # / branch PRs); false only for fork PRs, whose read-only token can't
-      # pull the private GHCR deps image. Tiers pass this to _tier.yml to
-      # choose the image (fast) vs runner (fallback) path.
+      # pull the private GHCR images. Tiers pass this to _tier.yml to
+      # choose the image (fast) vs runner (fallback) path; the
+      # sandbox-feature-matrix job uses it the same way to pick pull vs
+      # build-on-runner for the matrix image.
       pkg_access: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     steps:
       - id: dup
@@ -115,6 +120,13 @@ jobs:
             # 2. Squash-merge fallback — the push-to-main SHA is brand
             #    new, but GitHub links it to the source PR. Look up the
             #    PR's head SHA and check whether *that* already passed.
+            #    Push-only effect here: NONE — every job this
+            #    workflow runs on push also ran on the PR head, so the
+            #    dedup loses no coverage. Contrast codeql.yml, whose
+            #    push-run upload is the only feed of main's
+            #    code-scanning baseline and so carries no such arm
+            #    (and lint.yml, whose ruff-tree job is push-only and
+            #    exempts itself from the dedup).
             if [[ "$should_skip" == "false" && "$EVENT" == "push" ]]; then
               pr_head=$(gh api "repos/${REPO}/commits/${SHA}/pulls" \
                           --jq '[.[] | select(.merged_at != null)][0].head.sha // empty' || true)
@@ -144,7 +156,10 @@ jobs:
   # file list is populated from disk.
   changes:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    # 5 rather than 2: the best-effort durations step downloads the
+    # shuffled-nightly junit artifacts, and a job-level timeout kill
+    # would override that step's continue-on-error.
+    timeout-minutes: 5
     outputs:
       # Per-tier gates (true/false).
       python: ${{ steps.scope.outputs.python }}
@@ -160,6 +175,7 @@ jobs:
       orchestration: ${{ steps.scope.outputs.orchestration }}
       sca: ${{ steps.scope.outputs.sca }}
       source_intel: ${{ steps.scope.outputs.source_intel }}
+      engine: ${{ steps.scope.outputs.engine }}
       # Dynamic batch matrix for the fast tier (JSON for fromJSON()).
       python_matrix: ${{ steps.scope.outputs.python_matrix }}
       # Per-tier affected file lists (space-separated paths).
@@ -173,6 +189,7 @@ jobs:
       orchestration_files: ${{ steps.scope.outputs.orchestration_files }}
       sca_files: ${{ steps.scope.outputs.sca_files }}
       source_intel_files: ${{ steps.scope.outputs.source_intel_files }}
+      engine_files: ${{ steps.scope.outputs.engine_files }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -203,19 +220,22 @@ jobs:
           out=/tmp/changed_files.txt
           : > "$out"
           # ``--jq`` expressions use ``?`` + ``// []`` to suppress jq's
-          # ``cannot iterate over: null`` error on diffs the API
-          # truncates or returns as an error object:
-          #   * compare API caps at 300 files; past that ``.files`` is
-          #     omitted entirely (null on access).
-          #   * pulls/{n}/files can return an error object (non-array)
-          #     for very large PRs or transient API failures.
-          # We treat "no list" the same as the first-push case: fall
-          # through to compute_filters and force all filters true.
+          # ``cannot iterate over: null`` error on responses that are
+          # an error object (non-array) — very large PRs or transient
+          # API failures. We treat "no list" the same as the
+          # first-push case: fall through to compute_filters and
+          # force all filters true.
+          #
+          # Renames also emit ``previous_filename``: the OLD path of a
+          # renamed module is what other files still import, and
+          # test_scope.py resolves dependents from the changed paths —
+          # with only the new name in the list, the broken importers
+          # were never seeded and the PR dispatched zero tiers.
           case "$EVENT" in
             pull_request|pull_request_target)
               gh api --paginate \
                 "repos/${REPO}/pulls/${PR_NUMBER}/files" \
-                --jq '(. // [])[]?.filename' >> "$out"
+                --jq '(. // [])[]? | .filename, (.previous_filename // empty)' >> "$out"
               ;;
             push)
               if [[ "$BEFORE" == "0000000000000000000000000000000000000000" ]]; then
@@ -223,9 +243,26 @@ jobs:
                 # to the no-list path so compute_filters forces all true.
                 rm -f "$out"
               else
+                # The compare API caps ``files`` at 300 entries and
+                # silently returns the FIRST 300 for a bigger diff —
+                # the key stays present, so the "no list" fail-open
+                # path never fires on truncation and every file past
+                # #300 would lose its dispatch (this repo lands
+                # multi-hundred-file patch trains as direct pushes).
+                # At the cap we cannot know what fell off: discard
+                # the list and fall through to full dispatch. Only
+                # ``.filename`` entries count toward the cap check —
+                # ``previous_filename`` rename companions don't.
+                resp=/tmp/compare_response.json
                 gh api --paginate \
-                  "repos/${REPO}/compare/${BEFORE}...${AFTER}" \
-                  --jq '(.files // [])[]?.filename' >> "$out"
+                  "repos/${REPO}/compare/${BEFORE}...${AFTER}" > "$resp"
+                jq -r '(.files // [])[]? | .filename, (.previous_filename // empty)' \
+                  "$resp" >> "$out"
+                files_n=$(jq -r '(.files // [])[]?.filename' "$resp" | wc -l)
+                if (( files_n >= 300 )); then
+                  echo "::notice::compare listed ${files_n} files — at the API's 300-file cap, list may be truncated; forcing full dispatch"
+                  rm -f "$out"
+                fi
               fi
               ;;
             *)
@@ -241,6 +278,42 @@ jobs:
             cat "$out"
           fi
 
+      # Best-effort per-test durations for the batch partitioner: pull
+      # the latest successful shuffled-nightly junit artifacts and
+      # convert them to a durations file so test_scope.py can balance
+      # batches by measured runtime instead of file count. Everything
+      # here is optional-quality-signal, never a gate: the step
+      # no-ops when the converter script is absent, when no successful
+      # nightly run exists yet, or when the artifacts have expired —
+      # and continue-on-error keeps any surprise failure from blocking
+      # dispatch (scope falls back to its no-durations behaviour on an
+      # empty path).
+      - id: durations
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [ -f .github/scripts/junit_durations.py ] || exit 0
+          run_id=$(gh api \
+            "repos/${REPO}/actions/workflows/nightly_shuffled.yml/runs?status=success&per_page=1" \
+            --jq '(.workflow_runs // [])[0].id // empty')
+          [ -n "$run_id" ] || exit 0
+          dl_dir="${RUNNER_TEMP}/shuffled-junit"
+          mkdir -p "$dl_dir"
+          gh run download "$run_id" --repo "$REPO" \
+            --pattern 'nightly-shuffled-fast-iter-*' --dir "$dl_dir" || exit 0
+          xmls=$(find "$dl_dir" -name '*.xml' -type f)
+          [ -n "$xmls" ] || exit 0
+          durations_path="${RUNNER_TEMP}/test_durations.json"
+          # shellcheck disable=SC2086 — the xml paths are runner-local
+          # artifact files, one per matrix iteration; word-splitting is
+          # the intended argv shape.
+          python3 .github/scripts/junit_durations.py \
+            "$durations_path" $xmls
+          echo "path=$durations_path" >> "$GITHUB_OUTPUT"
+
       # Import-graph-based test dispatch. Builds the reverse import
       # graph with stdlib ast, walks outward from changed files, and
       # maps affected test files to their CI tier. Falls back to full
@@ -254,6 +327,9 @@ jobs:
             --repo .
         env:
           CHANGED_FILES_LIST: ${{ steps.changed_files.outputs.list }}
+          # Empty when the durations step skipped or failed — the
+          # partitioner treats an unset/empty path as "no durations".
+          RAPTOR_TEST_DURATIONS: ${{ steps.durations.outputs.path }}
 
   deps:
     needs: [pre_check, changes]
@@ -277,49 +353,53 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
         with:
           enable-cache: true
-          cache-dependency-glob: "requirements*.txt"
+          cache-dependency-glob: "uv.lock"
 
       - name: Restore venv from cache
         id: venv-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # was v6.1.0
         with:
           path: ${{ env.VENV_PATH }}
-          key: venv-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('requirements.txt', 'requirements-dev.txt') }}
+          key: venv-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('uv.lock') }}
 
       - name: Create venv and install deps
         if: steps.venv-cache.outputs.cache-hit != 'true'
+        shell: bash
         run: |
           uv venv $VENV_PATH
           source $VENV_PATH/bin/activate
-          uv pip install -r requirements-dev.txt
+          uv export --locked --no-hashes | uv pip install -r -
 
       - name: Verify venv exists
         run: test -d "$VENV_PATH" || (echo "venv missing at $VENV_PATH" && exit 1)
 
       - name: Save venv to cache
+        continue-on-error: true
         if: steps.venv-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # was v6.1.0
         with:
           path: ${{ env.VENV_PATH }}
-          key: venv-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('requirements.txt', 'requirements-dev.txt') }}
+          key: venv-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('uv.lock') }}
 
-  # Fast tier: everything under core/ and packages/ except the two
-  # heavyweight subdirs that get their own jobs (sandbox, exploit_feasibility).
-  # Split 2-way via pytest-split so the slowest CI job runs in parallel.
-  # No .test_durations file is committed: pytest-split falls back to random
-  # distribution on first run and converges over subsequent runs. The
-  # max(group1, group2) wallclock is still well below the unsplit total
-  # even when unbalanced, so the saving is meaningful from day one.
+  # Fast tier: everything under core/ and packages/ except the heavyweight
+  # subdirs that get their own jobs (sandbox, exploit_feasibility, sca, and
+  # the container tiers). Batching is dynamic, not pytest-split: the
+  # ``changes`` job's test_scope.py partitions the affected test files into
+  # 1-8 balanced batches (the strategy matrix below), so a single-file PR
+  # gets one runner and a broad refactor fans out.
   python-unit-tests-fast:
     name: python-unit-tests-fast (${{ matrix.batch }})
     needs: [pre_check, changes, deps]
     if: |
       needs.pre_check.outputs.should_skip != 'true' &&
       needs.changes.outputs.python == 'true'
-    runs-on: ubuntu-latest
+    # Repo variable RAPTOR_FAST_RUNNER (Settings → Variables) upsizes
+    # the fast-tier batch runners, e.g. a larger hosted-runner label.
+    # Unset or empty, the expression falls back to ubuntu-latest.
+    runs-on: ${{ vars.RAPTOR_FAST_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -334,93 +414,40 @@ jobs:
         with:
           persist-credentials: false
 
+      # AppArmor blocks unprivileged userns on Ubuntu 24.04 runners;
+      # the sandbox's mount-ns backend needs them (full rationale in
+      # the composite).
       - name: Enable unprivileged user namespaces
-        # Ubuntu 24.04 runners block unprivileged user namespaces via
-        # AppArmor by default; the sandbox's mount-ns backend needs them
-        # (plus newuidmap/newgidmap from uidmap). Without this, the
-        # untrusted-run fresh-procfs contract correctly refuses the
-        # host-procfs-visible fallback and every untrusted-target test
-        # fails at setup.
-        run: |
-          sudo apt-get install -y --no-install-recommends uidmap
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        uses: ./.github/actions/enable-userns
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      # actions/cache@v6.1.x does not retry 429s from the cache backend
-      # (see v5.0.2 changelog: "429s returned from the cache service
-      # will not be retried"); under matrix-parallel restore load some
-      # jobs intermittently see "Failed to restore cache entry" even
-      # when the cache exists.  Three layers of mitigation, fastest-to-
-      # slowest:
-      #   1. Stagger -- random 0-7s sleep spreads concurrent restores
-      #      across time so the backend serialises reads instead of
-      #      rate-limiting them.  Common path: this prevents the 429
-      #      and attempt 1 succeeds.
-      #   2. Retry with restore-keys -- 30s backoff + prefix-match
-      #      fallback so a transient 429 OR an evicted exact-key
-      #      both recover by reusing a slightly older venv.
-      #   3. Rebuild -- install uv + ``uv pip install``.  Last-resort
-      #      backstop; runs only if all restore attempts failed.
-      - name: Stagger cache restore (avoid 429 thundering herd)
-        run: sleep $((RANDOM % 8))
-
-      - name: Restore venv from cache (attempt 1, exact key)
-        id: cache-1
-        continue-on-error: true
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # was v6.1.0
-        with:
-          path: ${{ env.VENV_PATH }}
-          key: venv-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('requirements.txt', 'requirements-dev.txt') }}
-          fail-on-cache-miss: true
-
-      - name: Backoff before retry
-        if: steps.cache-1.outcome == 'failure'
-        run: sleep 30
-
-      - name: Restore venv from cache (attempt 2, exact-or-prefix key)
-        id: cache-2
-        if: steps.cache-1.outcome == 'failure'
-        continue-on-error: true
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # was v6.1.0
-        with:
-          path: ${{ env.VENV_PATH }}
-          key: venv-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('requirements.txt', 'requirements-dev.txt') }}
-          restore-keys: |
-            venv-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-
-
-      - name: Install uv (rebuild fallback when both restore attempts failed)
-        if: steps.cache-1.outcome == 'failure' && steps.cache-2.outputs.cache-matched-key == ''
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
-
-      - name: Rebuild venv (rebuild fallback when both restore attempts failed)
-        if: steps.cache-1.outcome == 'failure' && steps.cache-2.outputs.cache-matched-key == ''
-        run: |
-          uv venv $VENV_PATH
-          source $VENV_PATH/bin/activate
-          uv pip install -r requirements-dev.txt
-
-      - name: Restore venv permissions and fix symlinks
-        run: |
-          # Re-point python symlinks at the current setup-python binary
-          # so shebangs in pip-installed scripts (pytest, etc.) resolve.
-          REAL_PYTHON=$(python3 -c "import sys; print(sys.executable)")
-          ln -sf "$REAL_PYTHON" "$VENV_PATH/bin/python"
-          ln -sf "$REAL_PYTHON" "$VENV_PATH/bin/python3"
-          PYMINOR=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-          ln -sf "$REAL_PYTHON" "$VENV_PATH/bin/python${PYMINOR}"
-          find $VENV_PATH/bin -maxdepth 1 -type f -exec chmod +x {} +
+      # Retry ladder + rebuild backstop + symlink fix-up live in the
+      # composite (rationale documented there); the key matches what
+      # the deps job saves.
+      - name: Restore or rebuild venv
+        uses: ./.github/actions/setup-venv
 
       - name: Cache Python bytecode
+        id: pycache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # was v6.1.0
         with:
           # __pycache__ contents are deterministic per (Python version,
-          # source contents). Caching by source-tree hash recovers the
-          # ~10–30s `compileall` adds per runner. Cache miss is a no-op
-          # — `compileall` regenerates from scratch.
+          # source contents). An EXACT-key hit means the sources are
+          # byte-identical to the tree that built the cache, so the
+          # compile step below is skipped outright — that skip is what
+          # recovers the compile cost, and it is sound only because
+          # the pycs are checked-hash (PEP 552): import validates them
+          # by SOURCE CONTENT, so fresh-checkout mtime churn cannot
+          # stale them. Running compileall over restored pycs would
+          # recompile everything regardless of mode (its up-to-date
+          # probe compares a timestamp-shaped header), which is why
+          # the gate is on the cache step, not inside compileall.
+          # Miss or restore-keys prefix hit (cache-hit != 'true'):
+          # compile from scratch.
           path: |
             core/**/__pycache__
             packages/**/__pycache__
@@ -429,9 +456,13 @@ jobs:
             pycache-${{ env.PYTHON_VERSION }}-
 
       - name: Compile Python sources
+        # Skipped on an exact cache hit — see the cache step comment.
+        if: steps.pycache.outputs.cache-hit != 'true'
         run: |
           source $VENV_PATH/bin/activate
-          python -m compileall -q core packages *.py
+          # checked-hash: import validates by content, so the cached
+          # pycs stay valid across checkout mtime churn.
+          python -m compileall -q --invalidation-mode checked-hash core packages *.py
 
       - name: Run unit tests (batch ${{ matrix.batch }})
         env:
@@ -441,8 +472,15 @@ jobs:
           # File list comes from test_scope.py's import-graph analysis.
           # No --ignore or --splits needed — the list is already the
           # precise set of affected test files for this batch.
+          # --dist worksteal: idle workers steal from stragglers, so a
+          # tail of slow tests on one worker no longer sets the batch
+          # wallclock (measured 20-26% faster than the default load
+          # mode on a mixed-duration suite, identical pass/fail set).
+          # The shuffled nightly deliberately keeps --dist loadfile —
+          # its file-per-worker grouping is what bounds module/class
+          # fixture instantiation under the seeded shuffle.
           set -f  # word-split $TEST_FILES without glob expansion
-          pytest -n auto $TEST_FILES
+          pytest -n auto --dist worksteal $TEST_FILES
 
       # Note: the CLI smoke tests for raptor.py used to live at
       # test/test_cli_smoke.py with a dedicated group-1 step (to dodge
@@ -480,85 +518,22 @@ jobs:
         with:
           persist-credentials: false
 
+      # AppArmor blocks unprivileged userns on Ubuntu 24.04 runners;
+      # the sandbox's mount-ns backend needs them (full rationale in
+      # the composite).
       - name: Enable unprivileged user namespaces
-        # Ubuntu 24.04 runners block unprivileged user namespaces via
-        # AppArmor by default; the sandbox's mount-ns backend needs them
-        # (plus newuidmap/newgidmap from uidmap). Without this, the
-        # untrusted-run fresh-procfs contract correctly refuses the
-        # host-procfs-visible fallback and every untrusted-target test
-        # fails at setup.
-        run: |
-          sudo apt-get install -y --no-install-recommends uidmap
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        uses: ./.github/actions/enable-userns
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      # actions/cache@v6.1.x does not retry 429s from the cache backend
-      # (see v5.0.2 changelog: "429s returned from the cache service
-      # will not be retried"); under matrix-parallel restore load some
-      # jobs intermittently see "Failed to restore cache entry" even
-      # when the cache exists.  Three layers of mitigation, fastest-to-
-      # slowest:
-      #   1. Stagger -- random 0-7s sleep spreads concurrent restores
-      #      across time so the backend serialises reads instead of
-      #      rate-limiting them.  Common path: this prevents the 429
-      #      and attempt 1 succeeds.
-      #   2. Retry with restore-keys -- 30s backoff + prefix-match
-      #      fallback so a transient 429 OR an evicted exact-key
-      #      both recover by reusing a slightly older venv.
-      #   3. Rebuild -- install uv + ``uv pip install``.  Last-resort
-      #      backstop; runs only if all restore attempts failed.
-      - name: Stagger cache restore (avoid 429 thundering herd)
-        run: sleep $((RANDOM % 8))
-
-      - name: Restore venv from cache (attempt 1, exact key)
-        id: cache-1
-        continue-on-error: true
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # was v6.1.0
-        with:
-          path: ${{ env.VENV_PATH }}
-          key: venv-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('requirements.txt', 'requirements-dev.txt') }}
-          fail-on-cache-miss: true
-
-      - name: Backoff before retry
-        if: steps.cache-1.outcome == 'failure'
-        run: sleep 30
-
-      - name: Restore venv from cache (attempt 2, exact-or-prefix key)
-        id: cache-2
-        if: steps.cache-1.outcome == 'failure'
-        continue-on-error: true
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # was v6.1.0
-        with:
-          path: ${{ env.VENV_PATH }}
-          key: venv-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('requirements.txt', 'requirements-dev.txt') }}
-          restore-keys: |
-            venv-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-
-
-      - name: Install uv (rebuild fallback when both restore attempts failed)
-        if: steps.cache-1.outcome == 'failure' && steps.cache-2.outputs.cache-matched-key == ''
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
-
-      - name: Rebuild venv (rebuild fallback when both restore attempts failed)
-        if: steps.cache-1.outcome == 'failure' && steps.cache-2.outputs.cache-matched-key == ''
-        run: |
-          uv venv $VENV_PATH
-          source $VENV_PATH/bin/activate
-          uv pip install -r requirements-dev.txt
-
-      - name: Restore venv permissions and fix symlinks
-        run: |
-          # Re-point python symlinks at the current setup-python binary
-          # so shebangs in pip-installed scripts (pytest, etc.) resolve.
-          REAL_PYTHON=$(python3 -c "import sys; print(sys.executable)")
-          ln -sf "$REAL_PYTHON" "$VENV_PATH/bin/python"
-          ln -sf "$REAL_PYTHON" "$VENV_PATH/bin/python3"
-          PYMINOR=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-          ln -sf "$REAL_PYTHON" "$VENV_PATH/bin/python${PYMINOR}"
-          find $VENV_PATH/bin -maxdepth 1 -type f -exec chmod +x {} +
+      # Retry ladder + rebuild backstop + symlink fix-up live in the
+      # composite (rationale documented there); the key matches what
+      # the deps job saves.
+      - name: Restore or rebuild venv
+        uses: ./.github/actions/setup-venv
 
       - name: Run SCA tests (group ${{ matrix.group }} of 4)
         env:
@@ -590,85 +565,22 @@ jobs:
         with:
           persist-credentials: false
 
+      # AppArmor blocks unprivileged userns on Ubuntu 24.04 runners;
+      # the sandbox's mount-ns backend needs them (full rationale in
+      # the composite).
       - name: Enable unprivileged user namespaces
-        # Ubuntu 24.04 runners block unprivileged user namespaces via
-        # AppArmor by default; the sandbox's mount-ns backend needs them
-        # (plus newuidmap/newgidmap from uidmap). Without this, the
-        # untrusted-run fresh-procfs contract correctly refuses the
-        # host-procfs-visible fallback and every untrusted-target test
-        # fails at setup.
-        run: |
-          sudo apt-get install -y --no-install-recommends uidmap
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        uses: ./.github/actions/enable-userns
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      # actions/cache@v6.1.x does not retry 429s from the cache backend
-      # (see v5.0.2 changelog: "429s returned from the cache service
-      # will not be retried"); under matrix-parallel restore load some
-      # jobs intermittently see "Failed to restore cache entry" even
-      # when the cache exists.  Three layers of mitigation, fastest-to-
-      # slowest:
-      #   1. Stagger -- random 0-7s sleep spreads concurrent restores
-      #      across time so the backend serialises reads instead of
-      #      rate-limiting them.  Common path: this prevents the 429
-      #      and attempt 1 succeeds.
-      #   2. Retry with restore-keys -- 30s backoff + prefix-match
-      #      fallback so a transient 429 OR an evicted exact-key
-      #      both recover by reusing a slightly older venv.
-      #   3. Rebuild -- install uv + ``uv pip install``.  Last-resort
-      #      backstop; runs only if all restore attempts failed.
-      - name: Stagger cache restore (avoid 429 thundering herd)
-        run: sleep $((RANDOM % 8))
-
-      - name: Restore venv from cache (attempt 1, exact key)
-        id: cache-1
-        continue-on-error: true
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # was v6.1.0
-        with:
-          path: ${{ env.VENV_PATH }}
-          key: venv-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('requirements.txt', 'requirements-dev.txt') }}
-          fail-on-cache-miss: true
-
-      - name: Backoff before retry
-        if: steps.cache-1.outcome == 'failure'
-        run: sleep 30
-
-      - name: Restore venv from cache (attempt 2, exact-or-prefix key)
-        id: cache-2
-        if: steps.cache-1.outcome == 'failure'
-        continue-on-error: true
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # was v6.1.0
-        with:
-          path: ${{ env.VENV_PATH }}
-          key: venv-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('requirements.txt', 'requirements-dev.txt') }}
-          restore-keys: |
-            venv-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-
-
-      - name: Install uv (rebuild fallback when both restore attempts failed)
-        if: steps.cache-1.outcome == 'failure' && steps.cache-2.outputs.cache-matched-key == ''
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
-
-      - name: Rebuild venv (rebuild fallback when both restore attempts failed)
-        if: steps.cache-1.outcome == 'failure' && steps.cache-2.outputs.cache-matched-key == ''
-        run: |
-          uv venv $VENV_PATH
-          source $VENV_PATH/bin/activate
-          uv pip install -r requirements-dev.txt
-
-      - name: Restore venv permissions and fix symlinks
-        run: |
-          # Re-point python symlinks at the current setup-python binary
-          # so shebangs in pip-installed scripts (pytest, etc.) resolve.
-          REAL_PYTHON=$(python3 -c "import sys; print(sys.executable)")
-          ln -sf "$REAL_PYTHON" "$VENV_PATH/bin/python"
-          ln -sf "$REAL_PYTHON" "$VENV_PATH/bin/python3"
-          PYMINOR=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-          ln -sf "$REAL_PYTHON" "$VENV_PATH/bin/python${PYMINOR}"
-          find $VENV_PATH/bin -maxdepth 1 -type f -exec chmod +x {} +
+      # Retry ladder + rebuild backstop + symlink fix-up live in the
+      # composite (rationale documented there); the key matches what
+      # the deps job saves.
+      - name: Restore or rebuild venv
+        uses: ./.github/actions/setup-venv
 
       - name: Run sandbox tests
         run: |
@@ -681,6 +593,70 @@ jobs:
           python -m pytest $SANDBOX_FILES
         env:
           SANDBOX_FILES: ${{ needs.changes.outputs.sandbox_files }}
+
+      # Darwin-emulation gate: the same sandbox files again with
+      # RAPTOR_TEST_EMULATE_PLATFORM=darwin (root conftest):
+      # sys.platform is patched to "darwin" PRE-collection, pytest's
+      # basetemp is relocated under a darwin-shaped
+      # /private/var/folders path, and every *_native-marked test is
+      # deselected (emulation never stacks on real kernel behaviour).
+      # Linux-authored assertions against platform-resolved values or
+      # the Linux tmp layout fail HERE, in the cheap Linux lane,
+      # instead of on the macOS runner — which keeps catching what
+      # only a real Darwin kernel can: the darwin_native tests
+      # themselves. Budget: ~45s serial measured all-green over the
+      # full sandbox file list (including the gate's own nested-pytest
+      # contract tests), so it rides in this job like the
+      # slow/integration step below.
+      - name: Run sandbox tests (emulated darwin platform)
+        env:
+          SANDBOX_FILES: ${{ needs.changes.outputs.sandbox_files }}
+          RAPTOR_TEST_EMULATE_PLATFORM: darwin
+        run: |
+          source $VENV_PATH/bin/activate
+          set -f
+          rc=0
+          python -m pytest $SANDBOX_FILES || rc=$?
+          # Exit 5 = "no tests collected" — legitimate when path
+          # filtering narrows SANDBOX_FILES to files that are entirely
+          # *_native-marked (all deselected under emulation).
+          if [ "$rc" -eq 5 ]; then exit 0; fi
+          exit "$rc"
+
+      # Second invocation: the sandbox/exploit-feasibility slow +
+      # integration tier. The root pytest.ini addopts deselect these
+      # markers, so before this step the tier's only CI execution was
+      # nightly.yml — a PR could merge a sandbox regression that sat
+      # invisible until (and unless) the next nightly was triaged.
+      # Budget: 185 tests (22 slow + 163 integration across 22 files),
+      # ~90s serial measured all-green — well inside this job's 30-min
+      # timeout, so it rides here rather than earning a separate job
+      # (and, like the job itself, also runs on force_full events:
+      # merge queue, the twice-weekly cron, dispatch).
+      #
+      # The exploit-feasibility job carries a mirrored step gated on
+      # its own filter, covering exploit-feasibility-only PRs that do
+      # not fire the sandbox gate.
+      #
+      # Fixed directories, NOT $SANDBOX_FILES: this is a regression
+      # safety net over the whole heavyweight surface, not an
+      # import-scoped tier — file-list narrowing could drop exactly the
+      # test that would have caught the regression. Not routed through
+      # _tier.yml: both its paths hardcode RAPTOR_MAX_TEST_SECONDS=10
+      # (which fails every slow-marked test by design) and its image
+      # path runs in the slim deps container that cannot host the
+      # namespace/mount work these tests do.
+      - name: Run sandbox slow/integration tier
+        env:
+          # Blank out the workflow-level 10s per-test guard for this
+          # step only — slow-marked tests legitimately exceed it, same
+          # rationale as nightly.yml not setting it. Empty string
+          # disables (root conftest treats unset and empty alike).
+          RAPTOR_MAX_TEST_SECONDS: ""
+        run: |
+          source $VENV_PATH/bin/activate
+          python -m pytest -m "slow or integration" \
+            core/sandbox packages/exploit_feasibility
 
   # macOS sandbox tier: runs the same core/sandbox/tests on a real Darwin
   # host so the darwin_only enforcement tests (sandbox-exec write-blocking,
@@ -707,31 +683,33 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
         with:
           enable-cache: true
-          cache-dependency-glob: "requirements*.txt"
+          cache-dependency-glob: "uv.lock"
 
       - name: Restore venv from cache
         id: venv-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # was v6.1.0
         with:
           path: ${{ env.VENV_PATH }}
-          key: venv-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('requirements.txt', 'requirements-dev.txt') }}
+          key: venv-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('uv.lock') }}
 
       - name: Create venv and install deps
         if: steps.venv-cache.outputs.cache-hit != 'true'
+        shell: bash
         run: |
           uv venv $VENV_PATH
           source $VENV_PATH/bin/activate
-          uv pip install -r requirements-dev.txt
+          uv export --locked --no-hashes | uv pip install -r -
 
       - name: Save venv to cache
+        continue-on-error: true
         if: steps.venv-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # was v6.1.0
         with:
           path: ${{ env.VENV_PATH }}
-          key: venv-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('requirements.txt', 'requirements-dev.txt') }}
+          key: venv-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('uv.lock') }}
 
       - name: Run sandbox tests (macOS)
         env:
@@ -740,6 +718,132 @@ jobs:
           source $VENV_PATH/bin/activate
           set -f
           python -m pytest $SANDBOX_FILES -v
+
+  # PR-time sandbox feature-matrix subset: the u24 image x the {full,
+  # default} lanes of the weekly sandbox-matrix.yml, run against the
+  # prebuilt GHCR image published by sandbox-matrix-image.yml
+  # (--skip-build). The degradation lattice's end-to-end signal was
+  # weekly-only, so a real lattice regression could sit invisible for
+  # days until the Saturday run (or a manual dispatch) surfaced it;
+  # these two lanes are the cheap high-yield subset — `default` is
+  # stock docker confinement, the lane that catches the userns-denied
+  # class, `full` is the all-features lane. Measured warm cost is
+  # ~37s per lane cell plus the image pull.
+  #
+  # The weekly full matrix stays untouched as the unfiltered backstop:
+  # both images, all five lanes, fresh image builds. Fork PRs cannot
+  # pull the private GHCR image (restricted read-only token), so they
+  # take the build-fallback path: run-matrix.sh without --skip-build
+  # builds the u24 image on the runner first — slower, never blocked,
+  # the same two-path story as _tier.yml's image/runner split for
+  # raptor-ci-deps. Like every gated tier, force_full events also run
+  # it — each merge-queue entry and the twice-weekly full-suite cron pay the
+  # ~1-2 min pull + two lanes; accepted, a red matrix SHOULD block a
+  # merge. Known residual: the sandbox gate is import-graph-computed,
+  # so a PR touching only the matrix harness scripts under
+  # core/sandbox/scripts/feature-matrix does not fire this job —
+  # harness changes keep their weekly/dispatch coverage.
+  #
+  # Failure ergonomics: run-matrix.sh ends by printing report.py's lane
+  # matrix to the job log and exits with its verdict — nothing is
+  # swallowed. The failure step additionally lifts matrix.md +
+  # failures.txt into the step summary, and the artifact upload carries
+  # the same evidence shape as the weekly run.
+  sandbox-feature-matrix:
+    needs: [pre_check, changes]
+    if: |
+      needs.pre_check.outputs.should_skip != 'true' &&
+      needs.changes.outputs.sandbox == 'true'
+    runs-on: ubuntu-latest
+    # 45: the warm path is ~5 (pull + two lanes); a requirements change
+    # invalidates the image's baked venv (sxv.reqhash mismatch) and each
+    # lane pip-installs fresh; the fork-PR build-fallback path pays a
+    # full u24 image build on top before any lane runs.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: read              # pull the private GHCR matrix image
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Fast path (same-repo events): GITHUB_TOKEN can read the repo-
+      # linked private package — the same actor/token login _tier.yml's
+      # container credentials use for raptor-ci-deps. A pull failure
+      # here is NOT downgraded to the build fallback: for a same-repo
+      # event it means the image was never published or the package's
+      # access broke, and that should be fixed once, loudly, not paid
+      # as a silent multi-minute build on every PR.
+      - name: Pull the prebuilt matrix image
+        if: needs.pre_check.outputs.pkg_access == 'true'
+        # GHA expressions via env:, never interpolated into the script
+        # body — the canonical hardening pattern this repo documents in
+        # refit-sca-calibration.yml.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          echo "$GH_TOKEN" \
+            | docker login ghcr.io -u "$ACTOR" --password-stdin
+          owner="$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')"
+          if ! docker pull "ghcr.io/${owner}/raptor-sandbox-matrix:u24"; then
+            echo "::error::ghcr.io/${owner}/raptor-sandbox-matrix:u24 is not available — dispatch the 'Sandbox matrix image' workflow once to publish it (and check the package still grants this repo access and is Private, not deleted), then re-run this job."
+            exit 1
+          fi
+          # run-matrix.sh --skip-build looks for the local build tag.
+          docker tag "ghcr.io/${owner}/raptor-sandbox-matrix:u24" \
+            raptor-sandbox-matrix:u24
+
+      - name: Run the matrix subset (u24 x full,default, prebuilt image)
+        if: needs.pre_check.outputs.pkg_access == 'true'
+        run: core/sandbox/scripts/feature-matrix/run-matrix.sh --image 24 --lanes full,default --skip-build
+
+      # Fork-PR fallback: the restricted token cannot pull the private
+      # package, so build the u24 image on the runner and run the same
+      # two lanes — slower but never blocked, replicating _tier.yml's
+      # runner fallback for raptor-ci-deps rather than skipping fork
+      # PRs out of the lattice signal.
+      - name: Run the matrix subset (u24 x full,default, fork build fallback)
+        if: needs.pre_check.outputs.pkg_access != 'true'
+        run: core/sandbox/scripts/feature-matrix/run-matrix.sh --image 24 --lanes full,default
+
+      - name: Surface the matrix report in the step summary
+        if: failure()
+        # RUNNER_TEMP is fresh per job on hosted runners, so the glob
+        # matches exactly the one run this job executed. failures.txt
+        # always exists but holds only a newline when the failure had no
+        # per-test lines (e.g. a stray-lane harness error) — the grep
+        # skips whitespace-only files; matrix.md always carries the lane
+        # verdicts, and the full detail is in the job log either way.
+        run: |
+          base="${RUNNER_TEMP}/raptor-sandbox-matrix"
+          for f in "$base"/*/matrix.md; do
+            [ -f "$f" ] && cat "$f" >> "$GITHUB_STEP_SUMMARY"
+          done
+          for f in "$base"/*/failures.txt; do
+            if [ -f "$f" ] && grep -q '[^[:space:]]' "$f"; then
+              { echo; echo '```'; cat "$f"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+          true
+
+      - name: Upload matrix results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: sandbox-feature-matrix-pr-results
+          path: |
+            ${{ runner.temp }}/raptor-sandbox-matrix/*/matrix.md
+            ${{ runner.temp }}/raptor-sandbox-matrix/*/matrix.json
+            ${{ runner.temp }}/raptor-sandbox-matrix/*/failures.txt
+            ${{ runner.temp }}/raptor-sandbox-matrix/*/*/*/probe.json
+            ${{ runner.temp }}/raptor-sandbox-matrix/*/*/*/pytest-*.out
+          retention-days: 14
+          if-no-files-found: warn
 
   # Exploit-feasibility integration tier: 11 × ~15 s tests calling
   # analyze_binary against real binaries. Gated on the package's real
@@ -757,85 +861,22 @@ jobs:
         with:
           persist-credentials: false
 
+      # AppArmor blocks unprivileged userns on Ubuntu 24.04 runners;
+      # the sandbox's mount-ns backend needs them (full rationale in
+      # the composite).
       - name: Enable unprivileged user namespaces
-        # Ubuntu 24.04 runners block unprivileged user namespaces via
-        # AppArmor by default; the sandbox's mount-ns backend needs them
-        # (plus newuidmap/newgidmap from uidmap). Without this, the
-        # untrusted-run fresh-procfs contract correctly refuses the
-        # host-procfs-visible fallback and every untrusted-target test
-        # fails at setup.
-        run: |
-          sudo apt-get install -y --no-install-recommends uidmap
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        uses: ./.github/actions/enable-userns
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      # actions/cache@v6.1.x does not retry 429s from the cache backend
-      # (see v5.0.2 changelog: "429s returned from the cache service
-      # will not be retried"); under matrix-parallel restore load some
-      # jobs intermittently see "Failed to restore cache entry" even
-      # when the cache exists.  Three layers of mitigation, fastest-to-
-      # slowest:
-      #   1. Stagger -- random 0-7s sleep spreads concurrent restores
-      #      across time so the backend serialises reads instead of
-      #      rate-limiting them.  Common path: this prevents the 429
-      #      and attempt 1 succeeds.
-      #   2. Retry with restore-keys -- 30s backoff + prefix-match
-      #      fallback so a transient 429 OR an evicted exact-key
-      #      both recover by reusing a slightly older venv.
-      #   3. Rebuild -- install uv + ``uv pip install``.  Last-resort
-      #      backstop; runs only if all restore attempts failed.
-      - name: Stagger cache restore (avoid 429 thundering herd)
-        run: sleep $((RANDOM % 8))
-
-      - name: Restore venv from cache (attempt 1, exact key)
-        id: cache-1
-        continue-on-error: true
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # was v6.1.0
-        with:
-          path: ${{ env.VENV_PATH }}
-          key: venv-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('requirements.txt', 'requirements-dev.txt') }}
-          fail-on-cache-miss: true
-
-      - name: Backoff before retry
-        if: steps.cache-1.outcome == 'failure'
-        run: sleep 30
-
-      - name: Restore venv from cache (attempt 2, exact-or-prefix key)
-        id: cache-2
-        if: steps.cache-1.outcome == 'failure'
-        continue-on-error: true
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # was v6.1.0
-        with:
-          path: ${{ env.VENV_PATH }}
-          key: venv-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('requirements.txt', 'requirements-dev.txt') }}
-          restore-keys: |
-            venv-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-
-
-      - name: Install uv (rebuild fallback when both restore attempts failed)
-        if: steps.cache-1.outcome == 'failure' && steps.cache-2.outputs.cache-matched-key == ''
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
-
-      - name: Rebuild venv (rebuild fallback when both restore attempts failed)
-        if: steps.cache-1.outcome == 'failure' && steps.cache-2.outputs.cache-matched-key == ''
-        run: |
-          uv venv $VENV_PATH
-          source $VENV_PATH/bin/activate
-          uv pip install -r requirements-dev.txt
-
-      - name: Restore venv permissions and fix symlinks
-        run: |
-          # Re-point python symlinks at the current setup-python binary
-          # so shebangs in pip-installed scripts (pytest, etc.) resolve.
-          REAL_PYTHON=$(python3 -c "import sys; print(sys.executable)")
-          ln -sf "$REAL_PYTHON" "$VENV_PATH/bin/python"
-          ln -sf "$REAL_PYTHON" "$VENV_PATH/bin/python3"
-          PYMINOR=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-          ln -sf "$REAL_PYTHON" "$VENV_PATH/bin/python${PYMINOR}"
-          find $VENV_PATH/bin -maxdepth 1 -type f -exec chmod +x {} +
+      # Retry ladder + rebuild backstop + symlink fix-up live in the
+      # composite (rationale documented there); the key matches what
+      # the deps job saves.
+      - name: Restore or rebuild venv
+        uses: ./.github/actions/setup-venv
 
       - name: Run exploit_feasibility integration tests
         env:
@@ -844,6 +885,22 @@ jobs:
           source $VENV_PATH/bin/activate
           set -f
           python -m pytest $EXPLOIT_FILES
+
+      # Second invocation, mirroring the sandbox job's slow/integration
+      # step for THIS package's gate: an exploit-feasibility-only PR
+      # does not fire the sandbox gate, so without this step the
+      # package's slow/integration-marked tests (15 tests, ~30s serial
+      # measured all-green) would still run only in nightly.yml on such
+      # PRs. When a PR fires both gates the package subset runs in both
+      # jobs — ~30s of overlap, taken deliberately over a coverage hole.
+      # Same guard rationale as the sandbox step: blank the 10s per-test
+      # guard, slow-marked tests legitimately exceed it.
+      - name: Run exploit_feasibility slow/integration tier
+        env:
+          RAPTOR_MAX_TEST_SECONDS: ""
+        run: |
+          source $VENV_PATH/bin/activate
+          python -m pytest -m "slow or integration" packages/exploit_feasibility
 
   # source_intel tier: Coccinelle-driven memory-corruption evidence.
   # The real-spatch E2E (test_e2e_real_spatch_* etc.) are
@@ -872,6 +929,33 @@ jobs:
       pytest_args: ""
       use_container: ${{ needs.pre_check.outputs.pkg_access == 'true' }}
 
+  # engine tier: the semgrep/coccinelle rule engines' own precision
+  # and regression suites (ReDoS gate, per-rule coccinelle tests,
+  # vocab/api-pack renderers). Same container story as source_intel:
+  # the CI deps image bakes in coccinelle so the spatch-driven rule
+  # tests execute for real on the image path; the runner fallback
+  # (fork PRs) skips them via their shutil.which guards while the
+  # hermetic renderer/pack suites still run.
+  python-unit-tests-engine:
+    needs: [pre_check, changes]
+    if: |
+      needs.pre_check.outputs.should_skip != 'true' &&
+      needs.changes.outputs.engine == 'true'
+    permissions:
+      contents: read
+      packages: read              # pull the private GHCR deps image (image path)
+    uses: ./.github/workflows/_tier.yml
+    with:
+      tier: engine
+      test_path: ${{ needs.changes.outputs.engine_files }}
+      # Serial pytest, deliberately (no -n): the rule tests are
+      # spatch/semgrep subprocess drivers whose wall-clock is the
+      # external tool, not collection — xdist worker startup would buy
+      # little and the source_intel precedent (same spatch profile)
+      # runs serial. Revisit only with a measured win.
+      pytest_args: ""
+      use_container: ${{ needs.pre_check.outputs.pkg_access == 'true' }}
+
   # Prompt-envelope audit: AST-based heuristic over the registered
   # prompt-construction files. The test only needs stdlib + pytest
   # (no project deps), so it skips the venv artefact entirely and
@@ -897,13 +981,21 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install pytest
-        run: pip install pytest==9.0.3
+        # grep + pip install keeps pyproject.toml the single source
+        # of truth for the pytest pin (lint.yml's ruff idiom).
+        run: pip install "$(grep -oE 'pytest==[0-9.]+' pyproject.toml)"
 
       - name: Run prompt-envelope audit
         run: |
           # `python -m pytest` so `from core.security...` resolves
           # without needing the repo on PYTHONPATH.
           python -m pytest core/security/tests/test_prompt_envelope_audit.py -q
+
+  # The ReDoS idiom census now rides lint.yml's repo-invariants job
+  # (same whole-repo-invariant shape, shared checkout, and lint's
+  # no-paths-filter trigger is a superset of the old import-graph
+  # gate). test_scope.py still computes the redos_census tier; its
+  # output is simply unconsumed here.
 
   # CI lint / filter-coverage tests. Validates that compute_filters.py's
   # globs cover the actual import dependencies of subsystem-scoped jobs.
@@ -927,14 +1019,40 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install pytest
-        run: pip install pytest==9.0.3
+        # grep + pip install keeps pyproject.toml the single source
+        # of truth for the pytest pin (lint.yml's ruff idiom).
+        run: pip install "$(grep -oE 'pytest==[0-9.]+' pyproject.toml)"
 
       - name: Run CI filter-coverage tests
         # Both dirs: filter-coverage tests AND the checker-script
         # detector tests (check_vocab_lists, check_env_docs,
         # check_miswiring_detector, check_optional_dep_imports) —
         # stdlib+pytest only, ~20s.
-        run: pytest .github/tests .github/scripts/tests
+        #
+        # NOTE: these are the detectors' UNIT TESTS (does the detector
+        # logic work), not the detectors themselves (is the repo clean).
+        # The detectors run against the tree in lint.yml's
+        # ``repo-invariants`` job on every PR and in the daily
+        # miswiring-scan.yml sweep.
+        run: pytest .github/tests .github/scripts/tests --junitxml="$RUNNER_TEMP/ci-lint.xml"
+
+      # Self-censusing: this lane is the skip-budget gate's own home
+      # suite (and its simulations skip when bash/jq vanish from the
+      # runner), so it checks its own count. Fixed full collection of
+      # both dirs on every run, hence --full.
+      - name: Check skip count against the lane's recorded budget
+        run: |
+          python3 .github/scripts/check_skip_budget.py \
+            --lane ci-lint --full \
+            --junit-xml "$RUNNER_TEMP/ci-lint.xml"
+
+      - name: Run release-workflow simulation
+        # Bash test (pytest doesn't collect .sh): simulates the release
+        # workflow's tag/changelog/stamping steps against a disposable
+        # git fixture. Without an explicit step it ran in NO CI lane
+        # and its assertions (tag-move refusal, changelog injection
+        # defences) rotted silently.
+        run: bash .github/tests/test_release_workflow.sh
 
   # Heavy-subdir Python tiers — each gated on its own filter so a PR
   # touching only one package skips the others. Filters live in
@@ -1058,6 +1176,7 @@ jobs:
       - python-unit-tests-sca
       - python-unit-tests-sandbox
       - python-unit-tests-sandbox-macos
+      - sandbox-feature-matrix
       - python-unit-tests-exploit-feasibility
       - python-prompt-audit
       - ci-lint-tests
@@ -1065,6 +1184,7 @@ jobs:
       - python-unit-tests-llm-analysis
       - python-unit-tests-cve-diff
       - python-unit-tests-source-intel
+      - python-unit-tests-engine
       - python-unit-tests-fuzzing
       - python-unit-tests-sage
       - python-unit-tests-orchestration

@@ -1,10 +1,8 @@
 """Hypothesis-driven, tool-grounded security review of coverage gaps.
 
-Modules:
-    gaps        Gap computation from inventory + coverage records
-    context     Context-slice assembly (source + callers/callees)
-    strategy    Adaptive strategy selection from function metadata
-    record      Source-hash + audit-log helpers for the review loop
-    report      Final summary report generation
-    findings    Findings emission in standard RAPTOR format
+Core flow (a small slice of the package — see docs/audit.md for the
+full pipeline): ``gaps`` computes what to review from inventory +
+coverage records, ``context`` assembles the per-function slice,
+``strategy`` picks review strategies, ``record`` tracks source hashes
+and the audit log, and ``report``/``findings`` emit the results.
 """

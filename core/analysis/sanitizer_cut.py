@@ -59,6 +59,7 @@ from core.dataflow.sanitizer_catalog import (
     SanitizerBinding,
     match_sanitizers_in_cfg,
     nodes_of,
+    repo_shadows_module_root,
     sanitizer_callables_for_cwe,
 )
 from core.analysis.dataflow import (
@@ -252,8 +253,10 @@ def _may_escape_on_path(
 
     Cheap: O(V + E) per call (one forward BFS + one reverse BFS).
     Pure function. Uses ``getattr(node, "may_escape", False)`` so
-    PyCFGNode (which lacks the attribute) always returns False — the
-    Python evaluate_finding paths stay bit-identical.
+    node types without the attribute always read False. All three
+    language builders now stamp the flag (Python sets it on stores
+    to ``global`` / ``nonlocal`` names — a non-local binding a callee
+    can rewrite behind the gate's back).
     """
     return bool(_may_escape_nodes_on_path(graph, sources, sink, excluded))
 
@@ -510,7 +513,6 @@ def _fold_stack(graph, java_source_text: str,
             from core.analysis.java_collection_index import (
                 CollectionFoldResolver,
                 build_local_collection_index,
-                compose_invocation_hooks,
             )
             coll_index = build_local_collection_index(
                 java_source_text, span,
@@ -854,6 +856,12 @@ def _element_exclusive_reason(
     source_symbols,
     candidate_callables,
     array_index,
+    *,
+    java_source_text=None,
+    java_file_path=None,
+    repo_root=None,
+    ban_tf_system_reads: bool = False,
+    union_member_check=None,
 ) -> str | None:
     """Reason string when the value the sink consumes is an element of
     a tracked local array whose every write is a catalog-sanitizer
@@ -910,6 +918,20 @@ def _element_exclusive_reason(
                 return None
     if _sibling_args_tainted(
             graph, sources_set, sink, sink_arg, source_symbols):
+        return None
+    # The front check above is necessary but NOT sufficient: a
+    # sibling tainted through a helper call is invisible to it
+    # (observed live — see _siblings_fold_or_refuse). Every sibling
+    # must additionally fold or be a catalog-sanitizer output.
+    if not _vertex_cut_siblings_clean(
+            graph, reaching_defs(graph), sink, sink_arg,
+            (), candidate_callables,
+            java_source_text=java_source_text,
+            java_file_path=java_file_path,
+            repo_root=repo_root,
+            ban_tf_system_reads=ban_tf_system_reads,
+            union_member_check=union_member_check,
+    ):
         return None
     return (
         f"element-exclusive sanitizer definitions: every write to the "
@@ -1025,8 +1047,12 @@ def _siblings_fold_or_refuse(
 
 
 def _rhs_is_catalog_call(rhs, candidate_callables) -> bool:
-    """Best-effort: the rhs expression is a single call whose text
-    ends with a catalog callable name."""
+    """Best-effort: the rhs expression is a single call whose callee
+    text IS a catalog callable name — exact, or reached through a
+    ``.``-separated receiver chain. A bare suffix match (no separator)
+    would let a lookalike helper (``myencodeForHTML(...)``,
+    ``unescape(...)``) pass as a catalog sanitizer on the enforced
+    suppress path; fold-or-refuse polarity forbids that."""
     try:
         node = rhs
         if node.type == "cast_expression":
@@ -1035,7 +1061,7 @@ def _rhs_is_catalog_call(rhs, candidate_callables) -> bool:
             return False
         txt = node.text.decode("utf-8", "replace").split("(", 1)[0]
         return any(
-            txt == c or txt.endswith("." + c) or txt.endswith(c)
+            txt == c or txt.endswith("." + c)
             for c in candidate_callables
         )
     except Exception:  # noqa: BLE001
@@ -1084,10 +1110,7 @@ def _whole_array_taint_free_reason(
         )
         if arr is None or not arr.ok or not arr.whole_pass_ok(sink_arg):
             return None
-        writes = [
-            w for (name, _i), ws in arr._writes.items()
-            if name == sink_arg for w in ws
-        ]
+        writes = arr.writes_of(sink_arg)
         if not writes:
             return None
         stack = _fold_stack(graph, java_source_text,
@@ -1174,6 +1197,12 @@ def _collection_exclusive_reason(
     source_symbols,
     candidate_callables,
     collection_index,
+    *,
+    java_source_text=None,
+    java_file_path=None,
+    repo_root=None,
+    ban_tf_system_reads: bool = False,
+    union_member_check=None,
 ) -> str | None:
     """Reason string when the value the sink consumes is an element of
     a tracked local collection whose every write to the consumed key
@@ -1225,6 +1254,19 @@ def _collection_exclusive_reason(
                 return None
     if _sibling_args_tainted(
             graph, sources_set, sink, sink_arg, source_symbols):
+        return None
+    # Same second gate as the element pre-check: the front check is
+    # blind to helper-fed sibling taint, so every sibling must
+    # additionally fold or be a catalog-sanitizer output.
+    if not _vertex_cut_siblings_clean(
+            graph, reaching_defs(graph), sink, sink_arg,
+            (), candidate_callables,
+            java_source_text=java_source_text,
+            java_file_path=java_file_path,
+            repo_root=repo_root,
+            ban_tf_system_reads=ban_tf_system_reads,
+            union_member_check=union_member_check,
+    ):
         return None
     return (
         f"element-exclusive sanitizer definitions: every write to the "
@@ -1546,7 +1588,11 @@ def evaluate_finding(
     # when every reaching definition of the sink argument folds to the
     # same compile-time constant, the consumed value cannot carry
     # taint — a suppression that needs no sanitizer at all, so it runs
-    # before the catalog gates. Java locals are unaliasable, so the
+    # before the catalog gates. Java LOCALS are unaliasable, and the
+    # premise is enforced, not assumed: JavaConstIndex serves only
+    # identifier-LHS definitions whose name is a declared local/param
+    # of the enclosing method (a bare-name FIELD store — same syntax,
+    # rewritable by any interleaved call — refuses), so the
     # reaching-defs argument is airtight for the shapes the folder
     # accepts (see core/analysis/const_fold_java's refusal list).
     if (
@@ -1660,6 +1706,11 @@ def evaluate_finding(
             elem_reason = _element_exclusive_reason(
                 graph, sources_set, sink, sink_arg, source_symbols,
                 candidate_callables, array_index,
+                java_source_text=java_source_text,
+                java_file_path=java_file_path,
+                repo_root=repo_root,
+                ban_tf_system_reads=ban_tf_system_reads,
+                union_member_check=_union_member_check(cwe),
             )
             if elem_reason is not None:
                 return SanitizerCutResult(
@@ -1682,6 +1733,11 @@ def evaluate_finding(
                 coll_reason = _collection_exclusive_reason(
                     graph, sources_set, sink, sink_arg, source_symbols,
                     candidate_callables, collection_index,
+                    java_source_text=java_source_text,
+                    java_file_path=java_file_path,
+                    repo_root=repo_root,
+                    ban_tf_system_reads=ban_tf_system_reads,
+                    union_member_check=_union_member_check(cwe),
                 )
                 if coll_reason is not None:
                     return SanitizerCutResult(
@@ -1694,10 +1750,75 @@ def evaluate_finding(
                     )
 
     matched_bindings = match_sanitizers_in_cfg(graph, cwe, language)
+    # Whole-module namespace distrust: a dynamic rebinding route in
+    # the module (star-import, exec/eval, sys.modules, escaping
+    # globals()/vars()) means NO written identity in this function is
+    # provable — every catalog match degrades (see
+    # PythonCFG.namespace_unprovable; absent on other CFG types).
+    if matched_bindings and getattr(graph, "namespace_unprovable", False):
+        matched_bindings = frozenset()
+    # Shadow guard on the catalog join: matching is by the WRITTEN
+    # dotted name, but when the analysed function itself binds the
+    # chain's root (``html = FakeNs`` / a parameter named ``html``
+    # before ``html.escape(x)``), the runtime callee is the local
+    # object, not the catalog sanitizer — a hostile repo collides the
+    # name and the forged binding drives an enforced suppression.
+    # Any local definition of the root degrades the binding
+    # (refusal direction; a function-local ``import html`` also
+    # degrades — rare, and the module it binds may itself be a
+    # repo-local shadow). Flow-insensitive by design: an ambiguous
+    # identity can only lose suppression power, never gain it.
+    if matched_bindings:
+        local_roots: set = set(getattr(graph, "params", ()) or ())
+        for _n in graph.nodes():
+            local_roots.update(getattr(_n, "defs", ()) or ())
+        # The python builder additionally stamps the full
+        # untrusted-identity set (local imports the CFG defs miss,
+        # module-scope rebinds/import-aliases of the root, global
+        # declarations) — CFG defs alone missed ``import fakelib as
+        # html`` in both local and module positions.
+        local_roots.update(
+            getattr(graph, "shadowed_roots", None) or (),
+        )
+        if local_roots:
+            matched_bindings = frozenset(
+                b for b in matched_bindings
+                if b.callable.split(".", 1)[0] not in local_roots
+            )
+        # UNBOUND roots refuse too: a dotted identity whose root has
+        # no module-scope self-import resolves through builtins at
+        # runtime, and builtins are writable by any module in the
+        # repo (``builtins.html = FakeNs`` in a package __init__
+        # forged an enforced drop with no binding for the walkers to
+        # see). Legitimate code imports its sanitizer. ``None`` =
+        # roots not computed (hand-built / non-python CFGs) — the
+        # check does not apply. And a SELF-IMPORT is only trustworthy
+        # when the repo does not itself ship an import-resolvable
+        # shadow for the root (``html.py`` / ``html/__init__.py`` at
+        # the scanned root — ``import html`` then resolves to the
+        # REPO's file at runtime): origin resolution, the python
+        # member of the same class as Java's classpath-origin
+        # identity checks.
+        trusted_roots = getattr(graph, "trusted_import_roots", None)
+        if matched_bindings and trusted_roots is not None:
+            def _root_trusted(callable_name: str) -> bool:
+                if "." not in callable_name:
+                    return True
+                root = callable_name.split(".", 1)[0]
+                if root not in trusted_roots:
+                    return False
+                return not (repo_root and repo_shadows_module_root(
+                    repo_root, root,
+                ))
+            matched_bindings = frozenset(
+                b for b in matched_bindings if _root_trusted(b.callable)
+            )
     # Phase 14 — fold in inter-procedural synthetic bindings. A
     # finding whose enclosing function has NO direct catalog
     # sanitizer but DOES call an in-module helper that sanitizes
-    # reaches the gate only because of these.
+    # reaches the gate only because of these. (Their own shadow guard
+    # lives at the AST layer in interproc.synthetic_sanitizer_bindings,
+    # which sees the full local-binding vocabulary.)
     if extra_bindings:
         matched_bindings = matched_bindings | frozenset(extra_bindings)
     if not matched_bindings:
@@ -1718,10 +1839,28 @@ def evaluate_finding(
         graph, sources_set, sink, full_cf_nodes,
     )
 
-    # Legacy control-flow-only path. Suppression bit-identical to
-    # Phase 7 behaviour — Phase 5 wrapper code or older callers
-    # that haven't been taught about value binding land here.
+    # Legacy control-flow-only path — Phase 5 wrapper code or older
+    # callers that haven't been taught about value binding land here.
+    # (No production caller reaches it today: the postpass/smt_barrier
+    # paths always pass source_symbols + sink_arg via ResolvedFinding,
+    # which refuses findings whose sink_arg can't resolve. Enforcement
+    # never consumes a legacy verdict — it requires the full
+    # value-bound proof.)
+    #
+    # One divergence from raw Phase 7: a sanitizer ON the sink node
+    # itself is NOT a cut here. Without value binding, "the sink node
+    # is in the cut set" proves only that some sanitizer call shares
+    # the sink's statement — ``sink(escape(other), tainted)`` — so
+    # the shared helper's sink-in-cut convenience arm would suppress
+    # a finding whose flagged argument was never cleaned. The cut is
+    # re-asked over the non-sink sanitizer nodes; on-path sanitizers
+    # still suppress exactly as before.
     if source_symbols is None or sink_arg is None:
+        if sink in full_cf_nodes:
+            reduced_nodes = full_cf_nodes - {sink}
+            full_cf_cut = sanitizer_cuts_source_to_sink(
+                graph, sources_set, sink, reduced_nodes,
+            )
         if full_cf_cut:
             return SanitizerCutResult(
                 suppress=True,
@@ -1781,6 +1920,47 @@ def evaluate_finding(
             candidate_callables, array_index,
         )
         if transparent is not None:
+            # Sibling-argument guard on the conduit door — the same
+            # fold-or-refuse polarity the flat value-bound path
+            # applies below (b41): proving the picked argument
+            # constant or sanitizer-fed through conduit hops says
+            # nothing about taint riding a SIBLING argument of the
+            # sink call, and the conduit helper's own front-only
+            # check is blind to helper-fed siblings. Downgrade,
+            # never drop: the conduit value binding held, only the
+            # sibling proof is missing.
+            if (
+                transparent.verdict == VERDICT_SUPPRESS
+                and not _vertex_cut_siblings_clean(
+                    graph, rd, sink, sink_arg,
+                    matched_bindings, candidate_callables,
+                    java_source_text=java_source_text,
+                    java_file_path=java_file_path,
+                    repo_root=repo_root,
+                    ban_tf_system_reads=ban_tf_system_reads,
+                    union_member_check=_union_member_check(cwe),
+                )
+            ):
+                return SanitizerCutResult(
+                    suppress=False,
+                    reason=(
+                        "candidate_only: conduit-transparent value "
+                        "binding held but a sibling argument of the "
+                        "sink call is neither constant-foldable nor "
+                        "a catalog-sanitizer output; taint could "
+                        "ride it past the proven argument"
+                    ),
+                    cut_set=frozenset(),
+                    candidate_callables=frozenset(candidate_callables),
+                    verdict=VERDICT_CANDIDATE_ONLY,
+                    value_bound_bindings=(
+                        transparent.value_bound_bindings
+                    ),
+                    all_matched_bindings=(
+                        transparent.all_matched_bindings
+                    ),
+                    sink_arg=sink_arg,
+                )
             return transparent
 
     if value_bound_cut:
@@ -1938,6 +2118,7 @@ def record_sanitizer_cut_suppression(
     result: SanitizerCutResult,
     *,
     enforce: bool = False,
+    extra_fields: Mapping[str, Any] | None = None,
 ) -> None:
     """Write a sanitizer-cut record to ``suppressions.jsonl``.
 
@@ -2055,6 +2236,11 @@ def record_sanitizer_cut_suppression(
             finding.get("cwe") or finding.get("cwe_id") or ""
         ),
     }
+    if extra_fields:
+        # Caller-supplied audit fields (the postpass's per-candidate
+        # aggregation rides here). Merged LAST deliberately — the
+        # caller owns the keys it adds.
+        extra.update(extra_fields)
 
     record_suppression(
         out_dir,

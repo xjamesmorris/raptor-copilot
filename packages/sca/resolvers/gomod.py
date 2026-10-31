@@ -17,14 +17,55 @@ copy by skipping known-large vendored / build-output paths.
 from __future__ import annotations
 
 import logging
-import shutil
+import os
 import subprocess
 import tempfile
 from pathlib import Path
 
 from . import ResolverResult, _check_tool, _run
+from ._safe_io import copy_regular_file
 
 logger = logging.getLogger(__name__)
+
+_SKIP_DIRS = {"vendor", "node_modules", ".git", "testdata"}
+_MAX_FILES = 10_000
+
+
+def _copy_go_sources(project_dir: Path, tmp_path: Path) -> None:
+    """Copy the target's ``.go`` files into the temp resolve dir.
+
+    Walks with ``os.walk(..., followlinks=False)`` — NOT ``rglob``:
+    before Python 3.13 ``Path.rglob`` recurses THROUGH directory
+    symlinks, so a hostile ``dir -> /`` link walked the whole host
+    filesystem (regular .go files reached via the link pass the
+    per-file gate and get copied into the resolve input), and a
+    symlink cycle recursed unboundedly. The in-place prune also makes
+    ``_SKIP_DIRS`` apply to TRAVERSAL, not just to copied paths. Same
+    shape as ``verify._copy_target``.
+    """
+    copied = 0
+    walk_root = project_dir.resolve()
+    for dirpath, dirnames, filenames in os.walk(
+        walk_root, followlinks=False,
+    ):
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+        cur = Path(dirpath)
+        for fname in filenames:
+            if not fname.endswith(".go"):
+                continue
+            go_file = cur / fname
+            # Cheap pre-filter keeps hostile symlink farms from
+            # producing one refusal warning per entry; the copy
+            # itself re-checks under O_NOFOLLOW (no TOCTOU).
+            if go_file.is_symlink():
+                continue
+            copied += 1
+            if copied > _MAX_FILES:
+                return
+            rel = go_file.relative_to(walk_root)
+            dest = tmp_path / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            copy_regular_file(go_file, dest)
 
 
 class GoResolver:
@@ -74,26 +115,12 @@ class GoResolver:
         # dir so the user's checkout is untouched.
         with tempfile.TemporaryDirectory(prefix="raptor-sca-go-") as tmp:
             tmp_path = Path(tmp)
+            # lstat-gated, size-bounded copies — a symlinked or
+            # special-file manifest in the scanned (hostile) tree is
+            # refused instead of followed / opened.
             for fname in ("go.mod", "go.sum"):
-                src = project_dir / fname
-                if src.exists():
-                    shutil.copy2(src, tmp_path / fname)
-            _SKIP_DIRS = {"vendor", "node_modules", ".git", "testdata"}
-            _MAX_FILES = 10_000
-            _copied = 0
-            for go_file in project_dir.rglob("*.go"):
-                if go_file.is_symlink():
-                    continue
-                parts = go_file.relative_to(project_dir).parts
-                if _SKIP_DIRS.intersection(parts):
-                    continue
-                _copied += 1
-                if _copied > _MAX_FILES:
-                    break
-                rel = go_file.relative_to(project_dir)
-                dest = tmp_path / rel
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(go_file, dest)
+                copy_regular_file(project_dir / fname, tmp_path / fname)
+            _copy_go_sources(project_dir, tmp_path)
 
             try:
                 proc = _run(

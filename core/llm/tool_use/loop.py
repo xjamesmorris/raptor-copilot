@@ -55,7 +55,28 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from core.llm.providers import LLMProvider
 
-from core.security.prompt_envelope import wrap_tool_result
+from core.llm.accounting import (
+    AccountingCapability,
+    AccountingMode,
+    AccountingSummary,
+    AttemptLedger,
+    CostBasis,
+    CostObservation,
+    LLMAccountingUnavailableError,
+    LLMHardLimitUnsupportedError,
+    LLMPolicyError,
+    PinnedRouteSnapshot,
+    PinnedRouteViolation,
+    RouteIdentity,
+    TrustedUsdRoute,
+    UsdBudgetContract,
+    cost_observation_from_exception,
+    is_basis_authorized,
+    is_observation_authorized,
+    normalize_budget_contract,
+    normalize_trusted_routes,
+)
+from core.security.prompt_envelope import unwrap_untrusted, wrap_tool_result
 from core.security.prompt_input_preflight import preflight
 
 from .types import (
@@ -213,6 +234,10 @@ class ToolUseLoop:
         terminal_tool: str | None = None,
         max_iterations: int = 50,
         max_cost_usd: float | None = None,
+        usd_budget_contract: UsdBudgetContract | str = (
+            UsdBudgetContract.ADVISORY
+        ),
+        trusted_usd_routes: Sequence[TrustedUsdRoute] = (),
         max_seconds: float | None = None,
         max_total_tokens: int | None = None,
         tool_timeout_s: float | None = None,
@@ -249,6 +274,11 @@ class ToolUseLoop:
             raise ValueError(msg)
         self._provider = provider
         self._tools = list(tools)
+        # Daemon threads whose handler outlived its timeout — kept for
+        # operator introspection (see _dispatch_tool). Initialised
+        # here, not lazily at first strand, so the attribute is always
+        # present for diagnostics readers.
+        self._stranded_tool_threads: list[threading.Thread] = []
         self._tools_by_name: dict[str, ToolDef] = {t.name: t for t in tools}
         if len(self._tools_by_name) != len(self._tools):
             msg = (
@@ -295,6 +325,26 @@ class ToolUseLoop:
         self._terminal_tool = terminal_tool
         self._max_iterations = max_iterations
         self._max_cost_usd = max_cost_usd
+        self._usd_budget_contract = normalize_budget_contract(
+            usd_budget_contract,
+        )
+        self._trusted_usd_routes = normalize_trusted_routes(
+            trusted_usd_routes,
+        )
+        if (
+            self._usd_budget_contract is not UsdBudgetContract.ADVISORY
+            and (max_cost_usd is None or max_cost_usd <= 0)
+        ):
+            raise ValueError(
+                "non-advisory usd_budget_contract requires a positive "
+                "max_cost_usd",
+            )
+        self._accounting_summary = AccountingSummary()
+        self._accounting_terminal_error: (
+            LLMAccountingUnavailableError | None
+        ) = None
+        self._accounting_legacy_total_usd = 0.0
+        self._active_run_cost_start = 0.0
         self._max_seconds = max_seconds
         self._max_total_tokens = max_total_tokens
         self._tool_timeout_s = tool_timeout_s
@@ -388,6 +438,8 @@ class ToolUseLoop:
         total_input_tokens = 0
         total_output_tokens = 0
         total_cost_usd = 0.0
+        run_cost_start = self._accounting_legacy_total_usd
+        self._active_run_cost_start = run_cost_start
         tool_calls_made = 0
         terminal_tool_input: dict[str, Any] | None = None
         # Per-turn token accounting — one (input, output) tuple appended
@@ -399,17 +451,92 @@ class ToolUseLoop:
         # ``max_tokens_nudges`` constructor docstring.
         mt_nudges_left = self._max_tokens_nudges
         wall_start = time.monotonic()
+        # Effective cache opt-ins for THIS run. ``history_through_index``
+        # is a message index; context truncation pops head messages, so
+        # the frozen constructor value must be remapped as messages
+        # drop — otherwise the cache breakpoint silently lands on an
+        # unintended message (cache-efficiency loss, misleading
+        # TurnStarted telemetry; the bounds check prevents a crash).
+        # A local copy: the caller's CacheControl is never mutated.
+        cache_control = self._cache_control
 
-        # x-source: seed known_values from prompt + history
+        # x-source: seed known_values from prompt + history. History
+        # seeding applies the SAME trust rule as in-run discovery:
+        # user-authored text and successful tool results only (both
+        # live in user-role messages — the loop itself persists tool
+        # results that way, and the wire protocol allows them nowhere
+        # else). Assistant prose must NOT seed: in-run it never enters
+        # known_values, so seeding it here let a persisted trajectory
+        # containing hallucinated or injected assistant text launder
+        # undiscovered values past the pre-dispatch ToolCallBlocked
+        # gate on resume. The loop's OWN user-role injections
+        # (nudges, submission warnings, in-fire steering) never seed
+        # in-run either — on resume they are recognised by the
+        # ``loop_injected`` tag stamped at append time, with an
+        # exact-text fallback for the static nudges so histories
+        # rebuilt without the tag stay covered. Residual: dynamic
+        # warning/steering text in a tag-stripped rebuilt history
+        # cannot be told apart from user text.
         known_values: set[str] = set()
+        # Every union below routes through the shared-cap merge; warn
+        # once per run when the cap clips (past it, x-source gated
+        # fields false-block newly discovered values — safe direction,
+        # but the operator should see why).
+        _cap_warned = [False]
+
+        def _absorb(new_values: set[str]) -> None:
+            if _merge_known_values(known_values, new_values) and not _cap_warned[0]:
+                _cap_warned[0] = True
+                logger.warning(
+                    "x-source: known_values cap (%d) reached — further "
+                    "discovered values will not register and gated "
+                    "fields may block them",
+                    _MAX_KNOWN_VALUES,
+                )
+
         if next_message:
-            known_values |= _extract_tokens_from_text(next_message)
+            _absorb(_extract_tokens_from_text(next_message))
         for msg in history:
+            if msg.role != "user":
+                continue
             for block in msg.content:
                 if isinstance(block, TextBlock):
-                    known_values |= _extract_tokens_from_text(block.text)
+                    if (getattr(block, "loop_injected", False)
+                            or block.text == _MAX_TOKENS_NUDGE
+                            or (self._nudge_on_no_tool_call is not None
+                                and block.text
+                                == self._nudge_on_no_tool_call)):
+                        continue
+                    _absorb(_extract_tokens_from_text(block.text))
                 elif isinstance(block, ToolResult) and not block.is_error:
-                    known_values |= _extract_values_from_json(block.content)
+                    # The loop persists the messages-bound tool-result
+                    # copy envelope-WRAPPED (wrap_tool_result below)
+                    # and records the raw bytes on ``raw_content`` —
+                    # in-run discovery extracted from those exact
+                    # bytes, so resume must too (extracting from the
+                    # wrapped string made json.loads fail and fall
+                    # back to tokenisation, which both seeded tokens
+                    # the in-run gate refuses and dropped multi-word
+                    # leaf values the run legitimately discovered).
+                    #
+                    # Without ``raw_content`` the shapes are
+                    # ambiguous: a textual unwrap heuristic cannot
+                    # distinguish a loop-wrapped result from attacker
+                    # output that ARRIVED envelope-shaped, and
+                    # unwrapping the latter would seed inner values
+                    # (whitespace-containing JSON leaves) the in-run
+                    # tokenisation rule refused — laundering. So:
+                    # envelope-shaped content with no raw provenance
+                    # seeds NOTHING (fail closed — only the safe
+                    # false-block direction, and only for histories
+                    # that violated the persistence contract); plain
+                    # raw content seeds under the in-run rule
+                    # unchanged.
+                    raw = getattr(block, "raw_content", None)
+                    if raw is not None:
+                        _absorb(_extract_values_from_json(raw))
+                    elif unwrap_untrusted(block.content) == block.content:
+                        _absorb(_extract_values_from_json(block.content))
 
         for iteration in range(self._max_iterations):
             # ---- pre-flight: caller-supplied give-up predicate ---------
@@ -435,6 +562,7 @@ class ToolUseLoop:
                         reason="give_up",
                         iterations=iteration,
                         total_cost_usd=total_cost_usd,
+                        accounting=self._accounting_summary,
                     ))
                     return ToolLoopResult(
                         final_text="",
@@ -447,6 +575,7 @@ class ToolUseLoop:
                         total_cost_usd=total_cost_usd,
                         terminated_by="give_up",
                         per_turn_tokens=tuple(per_turn_tokens),
+                        accounting=self._accounting_summary,
                     )
 
             # ---- pre-flight: cost budget --------------------------------
@@ -458,6 +587,7 @@ class ToolUseLoop:
                     reason="max_cost_usd",
                     iterations=iteration,
                     total_cost_usd=total_cost_usd,
+                    accounting=self._accounting_summary,
                 ))
                 msg_0 = (
                     f"cost budget ${self._max_cost_usd:.4f} reached "
@@ -468,6 +598,7 @@ class ToolUseLoop:
                     msg_0,
                     messages=messages,
                     tool_calls_made=tool_calls_made,
+                    accounting=self._accounting_summary,
                 )
 
             # ---- pre-flight: wall-clock budget --------------------------
@@ -485,6 +616,7 @@ class ToolUseLoop:
                     reason="max_seconds",
                     iterations=iteration,
                     total_cost_usd=total_cost_usd,
+                    accounting=self._accounting_summary,
                 ))
                 return ToolLoopResult(
                     final_text="",
@@ -497,6 +629,7 @@ class ToolUseLoop:
                     total_cost_usd=total_cost_usd,
                     terminated_by="max_seconds",
                     per_turn_tokens=tuple(per_turn_tokens),
+                    accounting=self._accounting_summary,
                 )
 
             # ---- pre-flight: total-tokens budget ------------------------
@@ -514,6 +647,7 @@ class ToolUseLoop:
                     reason="max_total_tokens",
                     iterations=iteration,
                     total_cost_usd=total_cost_usd,
+                    accounting=self._accounting_summary,
                 ))
                 return ToolLoopResult(
                     final_text="",
@@ -526,6 +660,7 @@ class ToolUseLoop:
                     total_cost_usd=total_cost_usd,
                     terminated_by="max_total_tokens",
                     per_turn_tokens=tuple(per_turn_tokens),
+                    accounting=self._accounting_summary,
                 )
 
             # ---- pre-flight: context window -----------------------------
@@ -537,6 +672,7 @@ class ToolUseLoop:
                         reason="context_overflow",
                         iterations=iteration,
                         total_cost_usd=total_cost_usd,
+                        accounting=self._accounting_summary,
                     ))
                     msg_0 = (
                         f"request estimate ~{request_estimate} tokens "
@@ -548,6 +684,7 @@ class ToolUseLoop:
                         msg_0,
                         messages=messages,
                         tool_calls_made=tool_calls_made,
+                        accounting=self._accounting_summary,
                     )
                 # TRUNCATE_OLDEST: drop oldest user/assistant pair until
                 # estimate fits. Pairing-aware so tool_use/tool_result
@@ -555,11 +692,28 @@ class ToolUseLoop:
                 # so a ContextOverflow raised from inside truncation
                 # carries the same partial-state count as the other
                 # raise sites in this loop.
+                before = len(messages)
                 messages = self._truncate_oldest(
                     messages, window, tool_calls_made=tool_calls_made,
                 )
+                # _truncate_oldest pops from the HEAD only, so the
+                # index shifts down by exactly the drop count; a
+                # breakpoint whose message was itself dropped is gone.
+                dropped = before - len(messages)
+                idx = cache_control.history_through_index
+                if dropped and idx is not None:
+                    from dataclasses import replace as _dc_replace
+                    new_idx = idx - dropped
+                    cache_control = _dc_replace(
+                        cache_control,
+                        history_through_index=(
+                            new_idx if new_idx >= 0 else None
+                        ),
+                    )
 
-            cache_breakpoints = self._count_cache_breakpoints(messages)
+            cache_breakpoints = self._count_cache_breakpoints(
+                messages, cache_control,
+            )
             self._emit(TurnStarted(
                 iteration=iteration,
                 input_token_estimate=request_estimate,
@@ -570,18 +724,26 @@ class ToolUseLoop:
             try:
                 if self._stream:
                     response = self._consume_stream(
-                        iteration, messages,
+                        iteration, messages, cache_control,
                     )
                 else:
-                    response = self._provider.turn(
+                    response = self._execute_turn_attempt(
                         messages,
-                        self._tools,
-                        system=self._system,
-                        max_tokens=self._max_tokens_per_turn,
-                        cache_control=self._cache_control,
-                        **self._provider_specific,
+                        lambda: self._provider.turn(
+                            messages,
+                            self._tools,
+                            system=self._system,
+                            max_tokens=self._max_tokens_per_turn,
+                            cache_control=cache_control,
+                            **self._provider_attempt_kwargs(),
+                        ),
                     )
-            except Exception as exc:
+            except BaseException as exc:
+                total_cost_usd = (
+                    self._accounting_legacy_total_usd - run_cost_start
+                )
+                if isinstance(exc, LLMPolicyError):
+                    raise
                 from core.llm.providers import is_credit_exhausted
                 reason = (
                     "credit_exhausted"
@@ -589,15 +751,18 @@ class ToolUseLoop:
                     else "provider_error"
                 )
                 self._emit(LoopTerminated(
-                    reason=reason,
+                    reason=reason,  # type: ignore[arg-type]
                     iterations=iteration,
                     total_cost_usd=total_cost_usd,
                     error_message=str(exc),
+                    accounting=self._accounting_summary,
                 ))
                 raise
 
-            cost = self._provider.compute_cost(response)
-            total_cost_usd += cost
+            cost = response.cost_observation.legacy_cost_usd
+            total_cost_usd = (
+                self._accounting_legacy_total_usd - run_cost_start
+            )
             total_input_tokens += response.input_tokens
             total_output_tokens += response.output_tokens
             self._emit(TurnCompleted(
@@ -638,7 +803,8 @@ class ToolUseLoop:
                 if self._nudge_on_no_tool_call is not None:
                     messages.append(Message(
                         role="user",
-                        content=[TextBlock(text=self._nudge_on_no_tool_call)],
+                        content=[TextBlock(text=self._nudge_on_no_tool_call,
+                                           loop_injected=True)],
                     ))
                     continue
                 final_text = _join_text(response.content)
@@ -646,6 +812,7 @@ class ToolUseLoop:
                     reason="complete",
                     iterations=iteration + 1,
                     total_cost_usd=total_cost_usd,
+                    accounting=self._accounting_summary,
                 ))
                 return ToolLoopResult(
                     final_text=final_text,
@@ -658,6 +825,7 @@ class ToolUseLoop:
                     total_cost_usd=total_cost_usd,
                     terminated_by="complete",
                     per_turn_tokens=tuple(per_turn_tokens),
+                    accounting=self._accounting_summary,
                 )
 
             # ---- PAUSE_TURN: model pause-resumed extended thinking ----
@@ -702,7 +870,8 @@ class ToolUseLoop:
                         per_turn_tokens.pop()
                     messages.append(Message(
                         role="user",
-                        content=[TextBlock(text=_MAX_TOKENS_NUDGE)],
+                        content=[TextBlock(text=_MAX_TOKENS_NUDGE,
+                                           loop_injected=True)],
                     ))
                     logger.warning(
                         "turn cut off by max_tokens_per_turn — "
@@ -717,10 +886,11 @@ class ToolUseLoop:
                 # only seeing it in warning logs.
                 err = response.error_message
                 self._emit(LoopTerminated(
-                    reason=term_reason,
+                    reason=term_reason,  # type: ignore[arg-type]
                     iterations=iteration + 1,
                     total_cost_usd=total_cost_usd,
                     error_message=err,
+                    accounting=self._accounting_summary,
                 ))
                 return ToolLoopResult(
                     final_text=_join_text(response.content),
@@ -734,6 +904,7 @@ class ToolUseLoop:
                     terminated_by=term_reason,    # type: ignore[arg-type]
                     error_message=err,
                     per_turn_tokens=tuple(per_turn_tokens),
+                    accounting=self._accounting_summary,
                 )
 
             # ---- dispatch tools -----------------------------------------
@@ -747,6 +918,42 @@ class ToolUseLoop:
             for call in tool_calls:
                 tool_calls_made += 1
                 self._emit(ToolCallDispatched(iteration=iteration, call=call))
+
+                # ---- parse-failed call containment ----
+                # A truncated/unparseable streaming call carries a
+                # placeholder {} input, not model-authored arguments.
+                # Never dispatch it (and, via is_error below, never
+                # let it set terminal_tool_input) — synthesise the
+                # re-issue error the model can act on next turn.
+                if getattr(call, "input_parse_error", False):
+                    result = ToolResult(
+                        tool_use_id=call.id,
+                        content=(
+                            f"tool call {call.name!r} was truncated — "
+                            "its JSON arguments did not parse and the "
+                            "call was NOT executed. Re-issue the call "
+                            "with complete arguments (keep them "
+                            "concise if the turn ran out of output "
+                            "tokens)."
+                        ),
+                        is_error=True,
+                    )
+                    duration = 0.0
+                    # Skip x-source validation and dispatch entirely.
+                    raw_content = result.content
+                    self._emit(ToolCallReturned(
+                        iteration=iteration,
+                        call_id=call.id,
+                        result=result,
+                        duration_s=duration,
+                    ))
+                    tool_results.append(ToolResult(
+                        tool_use_id=result.tool_use_id,
+                        content=wrap_tool_result(raw_content, call.name),
+                        is_error=True,
+                        raw_content=raw_content,
+                    ))
+                    continue
 
                 # ---- x-source pre-dispatch validation ----
                 discovered = _get_discovered_fields(
@@ -790,6 +997,7 @@ class ToolUseLoop:
                                 reason="tool_timeout",
                                 iterations=iteration + 1,
                                 total_cost_usd=total_cost_usd,
+                                accounting=self._accounting_summary,
                             ))
                             raise
                         result = ToolResult(
@@ -803,6 +1011,7 @@ class ToolUseLoop:
                                 reason="tool_error",
                                 iterations=iteration + 1,
                                 total_cost_usd=total_cost_usd,
+                                accounting=self._accounting_summary,
                             ))
                             raise
                         result = ToolResult(
@@ -836,8 +1045,10 @@ class ToolUseLoop:
                 #   1. Preflight on RAW content (event always fires
                 #      so operators see indicators regardless of
                 #      whether refuse is opted-in).
-                #   2. Extract x-source values from RAW (envelope
-                #      tags would pollute the discovered-values set).
+                #   2. Decide refuse-on-injection, then extract
+                #      x-source values from RAW (envelope tags would
+                #      pollute the discovered-values set; refused
+                #      content never seeds).
                 #   3. Emit ToolCallReturned with the RAW result.
                 #   4. Wrap (or refuse) for the message copy.
                 raw_content = result.content
@@ -850,10 +1061,28 @@ class ToolUseLoop:
                         indicators=pf.indicators,
                     ))
 
+                # Refuse-on-injection decision (applied to the
+                # message copy below): any indicator from the
+                # consumer's opt-in list fired. Computed BEFORE
+                # x-source discovery so refused content contributes
+                # nothing.
+                refuse_hit = (
+                    self._refuse_on_indicators
+                    and pf.has_injection_indicators
+                    and any(
+                        ind in self._refuse_on_indicators
+                        for ind in pf.indicators
+                    )
+                )
+
                 # x-source value discovery: only on successful raw
-                # results (errors don't carry tool-output values).
-                if not result.is_error:
-                    known_values |= _extract_values_from_json(raw_content)
+                # results (errors don't carry tool-output values),
+                # and never from injection-refused content — the
+                # refusal's intent is "this content contributes
+                # nothing", so its leaf strings must not become
+                # dispatchable through discovered fields either.
+                if not result.is_error and not refuse_hit:
+                    _absorb(_extract_values_from_json(raw_content))
 
                 self._emit(ToolCallReturned(
                     iteration=iteration,
@@ -863,19 +1092,11 @@ class ToolUseLoop:
                 ))
 
                 # Refuse-on-injection: replace the message copy with
-                # a synthetic error if any indicator from the
-                # consumer's opt-in list fired. The original content
-                # never reaches the LLM but consumers/operators saw
-                # it via the ToolCallReturned event above and the
-                # ToolResultPreflight event further above.
-                refuse_hit = (
-                    self._refuse_on_indicators
-                    and pf.has_injection_indicators
-                    and any(
-                        ind in self._refuse_on_indicators
-                        for ind in pf.indicators
-                    )
-                )
+                # a synthetic error when the opt-in indicator fired.
+                # The original content never reaches the LLM but
+                # consumers/operators saw it via the ToolCallReturned
+                # event above and the ToolResultPreflight event
+                # further above.
                 if refuse_hit:
                     matched = sorted(
                         ind for ind in pf.indicators
@@ -898,6 +1119,10 @@ class ToolUseLoop:
                         tool_use_id=result.tool_use_id,
                         content=wrap_tool_result(raw_content, call.name),
                         is_error=result.is_error,
+                        # Provenance for resume-time x-source seeding:
+                        # the exact raw bytes in-run discovery
+                        # extracted from (see run_with_history).
+                        raw_content=raw_content,
                     )
 
                 tool_results.append(message_result)
@@ -952,7 +1177,9 @@ class ToolUseLoop:
                     )
                     warning = None
                 if warning:
-                    user_content.append(TextBlock(text=warning))
+                    user_content.append(
+                        TextBlock(text=warning, loop_injected=True),
+                    )
             # In-fire mutator hook: same injection pattern as
             # submission_warning but purpose is technique-steering,
             # not budget nudging. Skipped when the terminal tool
@@ -981,7 +1208,9 @@ class ToolUseLoop:
                     )
                     steering = None
                 if steering:
-                    user_content.append(TextBlock(text=steering))
+                    user_content.append(
+                        TextBlock(text=steering, loop_injected=True),
+                    )
             messages.append(Message(role="user", content=user_content))
 
             # ---- post-dispatch termination checks -----------------------
@@ -990,6 +1219,7 @@ class ToolUseLoop:
                     reason="terminal_tool",
                     iterations=iteration + 1,
                     total_cost_usd=total_cost_usd,
+                    accounting=self._accounting_summary,
                 ))
                 return ToolLoopResult(
                     final_text=_join_text(response.content),
@@ -1002,6 +1232,7 @@ class ToolUseLoop:
                     total_cost_usd=total_cost_usd,
                     terminated_by="terminal_tool",
                     per_turn_tokens=tuple(per_turn_tokens),
+                    accounting=self._accounting_summary,
                 )
 
         # ---- max_iterations hit -----------------------------------------
@@ -1009,6 +1240,7 @@ class ToolUseLoop:
             reason="max_iterations",
             iterations=self._max_iterations,
             total_cost_usd=total_cost_usd,
+            accounting=self._accounting_summary,
         ))
         return ToolLoopResult(
             final_text="",
@@ -1021,6 +1253,7 @@ class ToolUseLoop:
             total_cost_usd=total_cost_usd,
             terminated_by="max_iterations",
             per_turn_tokens=tuple(per_turn_tokens),
+            accounting=self._accounting_summary,
         )
 
     # ------------------------------------------------------------------
@@ -1031,10 +1264,316 @@ class ToolUseLoop:
         if self._events is not None:
             self._events(event)
 
+    @property
+    def accounting_summary(self) -> AccountingSummary:
+        return self._accounting_summary
+
+    def _route(self) -> RouteIdentity:
+        config = getattr(self._provider, "config", None)
+        provider_name = getattr(config, "provider", None)
+        model_name = getattr(config, "model_name", None)
+        fallback_model_name = getattr(self._provider, "model_name", None)
+        return RouteIdentity(
+            (
+                provider_name
+                if isinstance(provider_name, str) and provider_name.strip()
+                else type(self._provider).__name__
+            ),
+            (
+                model_name
+                if isinstance(model_name, str) and model_name.strip()
+                else (
+                    fallback_model_name
+                    if (
+                        isinstance(fallback_model_name, str)
+                        and fallback_model_name.strip()
+                    )
+                    else type(self._provider).__name__
+                )
+            ),
+        )
+
+    def _capability(self) -> AccountingCapability:
+        method = getattr(self._provider, "accounting_capability", None)
+        if not callable(method):
+            return AccountingCapability()
+        try:
+            capability = method()
+        except Exception:
+            logger.debug(
+                "tool-loop provider accounting capability failed",
+                exc_info=True,
+            )
+            return AccountingCapability()
+        return (
+            capability
+            if isinstance(capability, AccountingCapability)
+            else AccountingCapability()
+        )
+
+    def _expected_basis(self) -> CostBasis:
+        method = getattr(self._provider, "expected_cost_basis", None)
+        if not callable(method):
+            return CostBasis.UNKNOWN
+        try:
+            return CostBasis(method())
+        except (TypeError, ValueError):
+            return CostBasis.UNKNOWN
+
+    def _raise_accounting_latch(self) -> None:
+        if self._accounting_terminal_error is not None:
+            raise self._accounting_terminal_error
+
+    def _validate_pinned_route(self) -> None:
+        validator = getattr(self._provider, "validate_pinned_route", None)
+        if callable(validator):
+            validator()
+            return
+        snapshot = getattr(
+            self._provider, "_raptor_pinned_route_snapshot", None,
+        )
+        if not isinstance(snapshot, PinnedRouteSnapshot):
+            return
+        config = getattr(self._provider, "config", None)
+        current = (
+            PinnedRouteSnapshot.from_model_config(config)
+            if config is not None
+            else None
+        )
+        if current != snapshot:
+            raise PinnedRouteViolation(
+                "Pinned route violation before tool turn: expected "
+                f"{snapshot.provider}/{snapshot.model}; effective route "
+                "or configuration changed",
+            )
+
+    def _ensure_fresh_attempt_allowed(self) -> None:
+        self._validate_pinned_route()
+        self._raise_accounting_latch()
+        if self._usd_budget_contract is UsdBudgetContract.ADVISORY:
+            return
+        route = self._route()
+        if self._usd_budget_contract is UsdBudgetContract.HARD_LIMIT_REQUIRED:
+            raise LLMHardLimitUnsupportedError(
+                "hard_limit_required is unsupported for current route "
+                f"{route.provider}/{route.model}",
+                accounting=self._accounting_summary,
+            )
+        capability = self._capability()
+        basis = self._expected_basis()
+        if (
+            capability.mode is not AccountingMode.AUTHORITATIVE
+            or not is_basis_authorized(
+                basis=basis,
+                route=route,
+                trusted_routes=self._trusted_usd_routes,
+            )
+        ):
+            raise LLMAccountingUnavailableError(
+                "authoritative_required cannot dispatch route "
+                f"{route.provider}/{route.model}: basis={basis.value} "
+                "is not provider_billed or explicitly trusted for this "
+                "exact route",
+                accounting=self._accounting_summary,
+            )
+
+    def _provider_attempt_kwargs(self) -> dict[str, Any]:
+        kwargs = dict(self._provider_specific)
+        if self._usd_budget_contract is not UsdBudgetContract.ADVISORY:
+            # A strict loop settles one transport request per ledger entry.
+            # Provider-internal retries would hide separately billable
+            # attempts behind a single settlement.
+            kwargs["max_retries"] = 0
+        return kwargs
+
+    def _reservation_estimate(
+        self,
+        messages: Sequence[Message],
+    ) -> float:
+        if self._usd_budget_contract is UsdBudgetContract.ADVISORY:
+            return 0.0
+        estimate = 0.0
+        try:
+            response = TurnResponse(
+                content=[],
+                stop_reason=StopReason.COMPLETE,
+                input_tokens=self._estimate_request_tokens(messages),
+                output_tokens=self._max_tokens_per_turn,
+            )
+            estimate = float(self._provider.compute_cost(response) or 0.0)
+        except Exception:
+            estimate = 0.0
+        if estimate <= 0.0:
+            estimate = 0.10
+        return estimate
+
+    def _turn_observation(
+        self,
+        response: TurnResponse,
+    ) -> CostObservation:
+        method = getattr(self._provider, "turn_cost_observation", None)
+        if callable(method):
+            try:
+                observation = method(response)
+            except Exception:
+                logger.debug(
+                    "tool-loop cost observation failed", exc_info=True,
+                )
+            else:
+                if isinstance(observation, CostObservation):
+                    return observation
+        try:
+            legacy_cost = float(self._provider.compute_cost(response) or 0.0)
+        except Exception:
+            legacy_cost = 0.0
+        if legacy_cost > 0.0:
+            try:
+                return CostObservation.configured_rate(
+                    legacy_cost, route=self._route(),
+                )
+            except (TypeError, ValueError):
+                pass
+        return CostObservation.unknown(route=self._route())
+
+    def _latch_accounting_error(
+        self,
+        *,
+        reason: str,
+    ) -> LLMAccountingUnavailableError:
+        if self._accounting_terminal_error is None:
+            route = self._route()
+            self._accounting_terminal_error = (
+                LLMAccountingUnavailableError(
+                    "authoritative USD accounting became unavailable for "
+                    f"{route.provider}/{route.model}: {reason}; no later "
+                    "fresh turn is permitted on this loop",
+                    accounting=self._accounting_summary,
+                )
+            )
+        return self._accounting_terminal_error
+
+    def _settle_turn_observation(
+        self,
+        attempt: AttemptLedger,
+        observation: CostObservation,
+    ) -> CostObservation:
+        settlement = attempt.settle_observation(observation)
+        settled = settlement.observation
+        if settled is None:
+            raise RuntimeError("observed turn settled without observation")
+        self._accounting_summary = self._accounting_summary.add(settled)
+        self._accounting_legacy_total_usd += settled.legacy_cost_usd
+        if (
+            self._usd_budget_contract
+            is UsdBudgetContract.AUTHORITATIVE_REQUIRED
+            and not is_observation_authorized(
+                settled, self._trusted_usd_routes,
+            )
+        ):
+            raise self._latch_accounting_error(
+                reason=f"observed basis {settled.basis.value} is not trusted",
+            )
+        return settled
+
+    def _settle_turn_failure(
+        self,
+        attempt: AttemptLedger,
+        error: BaseException,
+    ) -> LLMAccountingUnavailableError | None:
+        observation = cost_observation_from_exception(error)
+        if observation is not None:
+            try:
+                self._settle_turn_observation(attempt, observation)
+            except LLMAccountingUnavailableError as policy_error:
+                return policy_error
+            return None
+        attempt.settle_unknown_failed()
+        retained = (
+            attempt.reservation_usd
+            if self._usd_budget_contract
+            is UsdBudgetContract.AUTHORITATIVE_REQUIRED
+            else 0.0
+        )
+        self._accounting_summary = (
+            self._accounting_summary.add_unknown_failure(
+                retained_reservation_estimate_usd=retained,
+            )
+        )
+        self._accounting_legacy_total_usd += retained
+        if retained:
+            return self._latch_accounting_error(
+                reason="failed turn returned no authoritative cost",
+            )
+        return None
+
+    def _execute_turn_attempt(
+        self,
+        messages: Sequence[Message],
+        call: Callable[[], TurnResponse],
+    ) -> TurnResponse:
+        self._ensure_fresh_attempt_allowed()
+        reservation = self._reservation_estimate(messages)
+        if (
+            self._usd_budget_contract is not UsdBudgetContract.ADVISORY
+            and self._max_cost_usd is not None
+            and (
+                self._accounting_legacy_total_usd
+                - self._active_run_cost_start
+                + reservation
+            ) > self._max_cost_usd
+        ):
+            raise CostBudgetExceeded(
+                "cost budget cannot admit the next strictly-accounted "
+                f"turn: ${self._accounting_legacy_total_usd - self._active_run_cost_start:.4f} "
+                f"observed + ${reservation:.4f} reservation estimate > "
+                f"${self._max_cost_usd:.4f}",
+                messages=list(messages),
+                accounting=self._accounting_summary,
+            )
+        attempt = AttemptLedger(
+            route=self._route(),
+            reservation_usd=reservation,
+        )
+        try:
+            response = call()
+            observation = self._turn_observation(response)
+            if (
+                response.stop_reason
+                in (StopReason.ERROR, StopReason.REFUSED)
+                and observation.basis is CostBasis.UNKNOWN
+            ):
+                error = RuntimeError(
+                    response.error_message
+                    or f"provider turn ended with {response.stop_reason.value}",
+                )
+                policy_error = self._settle_turn_failure(attempt, error)
+                object.__setattr__(
+                    response, "cost_observation", observation,
+                )
+                if policy_error is not None:
+                    raise policy_error from error
+                return response
+            observation = self._settle_turn_observation(
+                attempt, observation,
+            )
+            object.__setattr__(
+                response, "cost_observation", observation,
+            )
+            return response
+        except BaseException as error:
+            if not attempt.settled:
+                policy_error = self._settle_turn_failure(attempt, error)
+                if policy_error is not None:
+                    raise policy_error from error
+            raise
+        finally:
+            attempt.require_settled()
+
     def _consume_stream(
         self,
         iteration: int,
         messages: list[Message],
+        cache_control: CacheControl | None = None,
     ) -> TurnResponse:
         """Call ``turn_stream()`` and accumulate chunks into a
         :class:`TurnResponse`, with bounded pre-content retry.
@@ -1046,13 +1585,20 @@ class ToolUseLoop:
         covers the reconnect). Once partial content was consumed, a
         retry could double-execute the turn, so the failure propagates
         as the provider's converted typed error instead."""
+        if cache_control is None:
+            cache_control = self._cache_control
         for attempt in range(_STREAM_PRE_CONTENT_RETRIES + 1):
             content_seen = [False]
             try:
-                return self._consume_stream_once(
-                    iteration, messages, content_seen,
+                return self._execute_turn_attempt(
+                    messages,
+                    lambda: self._consume_stream_once(
+                        iteration, messages, content_seen, cache_control,
+                    ),
                 )
-            except Exception as exc:
+            except BaseException as exc:
+                if isinstance(exc, LLMPolicyError):
+                    raise
                 from core.llm.providers import is_credit_exhausted
                 if (
                     content_seen[0]
@@ -1074,6 +1620,7 @@ class ToolUseLoop:
         iteration: int,
         messages: list[Message],
         content_seen: list[bool],
+        cache_control: CacheControl,
     ) -> TurnResponse:
         """One ``turn_stream()`` pass. ``content_seen[0]`` flips to
         True as soon as a content-bearing chunk arrives, so the caller
@@ -1092,12 +1639,23 @@ class ToolUseLoop:
             self._tools,
             system=self._system,
             max_tokens=self._max_tokens_per_turn,
-            cache_control=self._cache_control,
-            **self._provider_specific,
+            cache_control=cache_control,
+            **self._provider_attempt_kwargs(),
         ):
             if chunk.type in (
                 "text_delta", "tool_call_start",
                 "tool_call_delta", "tool_call_end",
+                # ``usage`` counts as consumed too: its StreamDelta
+                # has already reached subscribers, so a silent retry
+                # would double-emit it and a delta-summing subscriber
+                # would double-count tokens against the loop's own
+                # accounting. Forfeits pre-content retries only for a
+                # provider that emits usage BEFORE content — all
+                # three in-repo providers accumulate usage and emit
+                # it after the content loop, so this costs nothing
+                # today; it is the loop-contract guard for any future
+                # provider ordering.
+                "usage",
             ):
                 content_seen[0] = True
             self._emit(StreamDelta(iteration=iteration, chunk=chunk))
@@ -1129,6 +1687,7 @@ class ToolUseLoop:
                 tc = tool_calls.get(chunk.tool_call_id)
                 if tc:
                     raw = "".join(tc["input_parts"])
+                    parse_error = False
                     try:
                         args = json.loads(raw) if raw else {}
                         if not isinstance(args, dict):
@@ -1142,15 +1701,27 @@ class ToolUseLoop:
                             )
                             raise ValueError(msg)
                     except (ValueError, TypeError):
+                        # Routine per-turn max_tokens truncation cuts
+                        # tool-call JSON mid-argument. The call block
+                        # must still be accumulated (the next turn's
+                        # tool_result needs a matching tool_use), but
+                        # flagged so the dispatch path NEVER invokes
+                        # the handler — dispatching with a synthetic
+                        # {} executes side effects, or 'submits' the
+                        # terminal tool, with arguments the model
+                        # never authored.
                         logger.warning(
                             "stream: unparseable tool-call JSON for "
-                            "%r: %r", tc["name"], raw[:400],
+                            "%r: %r — the call will not be dispatched",
+                            tc["name"], raw[:400],
                         )
                         args = {}
+                        parse_error = True
                     content_blocks.append(ToolCall(
                         id=chunk.tool_call_id,
                         name=tc["name"],
                         input=args,
+                        input_parse_error=parse_error,
                     ))
 
             elif chunk.type == "usage":
@@ -1196,7 +1767,9 @@ class ToolUseLoop:
             )
 
         if self._tool_timeout_s is None:
-            content = tool.handler(call.input)
+            content = _validated_handler_content(
+                call.name, tool.handler(call.input),
+            )
             return ToolResult(tool_use_id=call.id, content=content)
 
         # Best-effort timeout: run the handler on a thread; the parent
@@ -1219,8 +1792,6 @@ class ToolUseLoop:
         # all references after `_dispatch_tool` returned —
         # impossible to introspect even when the operator KNEW
         # they had timeouts.
-        if not hasattr(self, "_stranded_tool_threads"):
-            self._stranded_tool_threads: list[threading.Thread] = []
         result_holder: dict[str, Any] = {}
         exc_holder: dict[str, BaseException] = {}
 
@@ -1281,7 +1852,12 @@ class ToolUseLoop:
                 f"{type(captured).__name__} (non-Exception BaseException)"
             )
             raise RuntimeError(msg) from captured
-        return ToolResult(tool_use_id=call.id, content=result_holder["text"])
+        return ToolResult(
+            tool_use_id=call.id,
+            content=_validated_handler_content(
+                call.name, result_holder["text"],
+            ),
+        )
 
     def _estimate_static_tokens(self) -> int:
         """System + tools cost. Doesn't change across iterations of a
@@ -1328,20 +1904,27 @@ class ToolUseLoop:
             self._estimate_message_tokens(m) for m in messages
         )
 
-    def _count_cache_breakpoints(self, messages: Sequence[Message]) -> int:
+    def _count_cache_breakpoints(
+        self,
+        messages: Sequence[Message],
+        cache_control: CacheControl | None = None,
+    ) -> int:
         """How many regions opted in for caching this turn. Reported in
         :class:`TurnStarted` events for telemetry; doesn't drive
-        behaviour."""
+        behaviour. ``cache_control`` is the run's EFFECTIVE (possibly
+        truncation-remapped) opt-ins; defaults to the constructor
+        value for direct callers."""
+        cc = cache_control if cache_control is not None else self._cache_control
         if not self._provider.supports_prompt_caching():
             return 0
         n = 0
-        if self._cache_control.system and self._system:
+        if cc.system and self._system:
             n += 1
-        if self._cache_control.tools and self._tools:
+        if cc.tools and self._tools:
             n += 1
         if (
-            self._cache_control.history_through_index is not None
-            and 0 <= self._cache_control.history_through_index < len(messages)
+            cc.history_through_index is not None
+            and 0 <= cc.history_through_index < len(messages)
         ):
             n += 1
         return n
@@ -1419,6 +2002,27 @@ class ToolUseLoop:
                 msg,
                 messages=messages,
                 tool_calls_made=tool_calls_made,
+                accounting=self._accounting_summary,
+            )
+        # The head-cleanup loop stops at one message, so a pathological
+        # history can end as a SINGLE leading assistant turn or
+        # orphaned tool-result — a shape every provider rejects.
+        # Raise the typed truncation error instead of shipping a
+        # guaranteed 400.
+        if messages and (
+            messages[0].role == "assistant"
+            or any(isinstance(b, ToolResult) for b in messages[0].content)
+        ):
+            msg = (
+                "truncation reduced the conversation to a single "
+                f"{messages[0].role} message that cannot open a "
+                "conversation (assistant turn or orphaned tool_result) "
+                "— resume with a fresh user prompt or a bigger context"
+            )
+            raise ContextOverflow(
+                msg,
+                messages=messages,
+                tool_calls_made=tool_calls_made,
             )
         return messages
 
@@ -1426,6 +2030,26 @@ class ToolUseLoop:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _validated_handler_content(tool_name: str, content: Any) -> str:
+    """Type-check a handler's return value at the dispatch site.
+
+    A handler returning non-str (None, dict, ...) used to sail into
+    ``ToolResult`` and explode later in ``preflight``/
+    ``wrap_tool_result`` — OUTSIDE the per-tool error containment, so
+    the whole run died with an unattributed traceback instead of an
+    ``is_error`` result. Raising here makes the wrong-return-type
+    member of the handler-failure enumeration flow through the same
+    ``terminate_on_handler_error`` policy as exceptions and timeouts.
+    """
+    if not isinstance(content, str):
+        msg = (
+            f"tool {tool_name!r} handler returned "
+            f"{type(content).__name__}, expected str"
+        )
+        raise TypeError(msg)
+    return content
 
 
 def _join_text(content: Sequence[Any]) -> str:
@@ -1464,7 +2088,48 @@ def _stop_reason_to_term(reason: StopReason) -> str:
 
 _TOKEN_SPLIT = re.compile(r"[\s,;|\"'`(){}\[\]]+")
 _MIN_TOKEN_LEN = 3
+# Hard bound on the per-run discovered-values set — enforced at every
+# extraction lane AND at the shared-union merge (it was previously a
+# walk-local check only, so the non-JSON token fallback and the per-run
+# union escaped it: one hostile 24 MB tool result retained a
+# multi-million-entry set in the orchestration process for the whole
+# run). Trade-off, both directions: LARGER retains more legitimately
+# discovered values on very chatty runs (past the cap, new discoveries
+# stop registering and x-source gated fields start false-blocking —
+# the safe direction, loudly warned once); SMALLER bounds memory
+# tighter but false-blocks earlier. 50k values at the length ceiling
+# below is a few tens of MB worst-case — small next to message
+# history, large next to any honest run's discovery volume.
 _MAX_KNOWN_VALUES = 50_000
+# Per-value length ceiling. The pre-dispatch gate compares EXACT
+# strings, so a multi-KB "value" has no legitimate x-source use (no
+# model echoes a 6 MB blob byte-exactly into a tool argument) — but an
+# unbounded leaf let a single JSON string retain megabytes. Trade-off,
+# both directions: LARGER admits longer genuine values (full URLs with
+# long query strings, deep paths) at more retained bytes per entry;
+# SMALLER bounds memory but false-blocks any gated field whose genuine
+# value exceeds it. 1024 covers observed URL/path/id shapes with wide
+# margin. Oversized leaves are SKIPPED, not truncated — a truncated
+# entry could never match the exact-string gate anyway.
+_MAX_KNOWN_VALUE_LEN = 1024
+
+
+def _merge_known_values(dest: set[str], src: set[str]) -> bool:
+    """Merge newly extracted values into the run's shared set,
+    enforcing ``_MAX_KNOWN_VALUES`` on the UNION (the extraction-lane
+    budgets bound each result; without this, repeated near-cap results
+    still grew the run set monotonically across up to 50 iterations).
+    Already-known members are free. Returns True when the cap clipped
+    at least one new value — the caller warns once per run."""
+    clipped = False
+    for v in src:
+        if v in dest:
+            continue
+        if len(dest) >= _MAX_KNOWN_VALUES:
+            clipped = True
+            break
+        dest.add(v)
+    return clipped
 
 
 def _extract_tokens_from_text(text: str) -> set[str]:
@@ -1472,23 +2137,37 @@ def _extract_tokens_from_text(text: str) -> set[str]:
 
     Splits on whitespace/punctuation, strips edge junk, includes
     slash-split components (``"owner/repo"`` yields both the whole
-    string and ``"owner"``, ``"repo"``).
+    string and ``"owner"``, ``"repo"``). Budgeted: stops collecting at
+    ``_MAX_KNOWN_VALUES`` and skips tokens over the per-value length
+    ceiling — this is the lane hostile non-JSON blobs (file contents,
+    command output) hit.
     """
     values: set[str] = set()
     for raw in _TOKEN_SPLIT.split(text):
+        if len(values) >= _MAX_KNOWN_VALUES:
+            break
         token = raw.strip(".,;:!?()[]{}\"'<>")
-        if len(token) < _MIN_TOKEN_LEN:
+        if not (_MIN_TOKEN_LEN <= len(token) <= _MAX_KNOWN_VALUE_LEN):
             continue
         values.add(token)
         if "/" in token:
             for part in token.split("/"):
-                if len(part) >= _MIN_TOKEN_LEN:
+                # Strict accounting: a top-of-token check alone lets
+                # the boundary token's slash-parts finish over the
+                # cap — the constant advertises a bound the lane
+                # itself must honour exactly.
+                if len(values) >= _MAX_KNOWN_VALUES:
+                    break
+                if _MIN_TOKEN_LEN <= len(part) <= _MAX_KNOWN_VALUE_LEN:
                     values.add(part)
     return values
 
 
 def _extract_values_from_json(text: str) -> set[str]:
-    """Walk a JSON tool result and collect leaf strings."""
+    """Walk a JSON tool result and collect leaf strings. Budgeted like
+    the token fallback: at most ``_MAX_KNOWN_VALUES`` entries, each at
+    most ``_MAX_KNOWN_VALUE_LEN`` chars (oversized leaves are skipped
+    whole — see the constant's rationale)."""
     try:
         obj = json.loads(text)
     except (json.JSONDecodeError, TypeError):
@@ -1505,12 +2184,33 @@ def _extract_values_from_json(text: str) -> set[str]:
         elif isinstance(node, list):
             for v in node:
                 _walk(v, depth + 1)
-        elif isinstance(node, str) and len(node) >= _MIN_TOKEN_LEN:
+        elif isinstance(node, str):
+            if not (_MIN_TOKEN_LEN <= len(node) <= _MAX_KNOWN_VALUE_LEN):
+                return
             values.add(node)
             if "/" in node:
                 for part in node.split("/"):
-                    if len(part) >= _MIN_TOKEN_LEN:
+                    # Strict accounting — same boundary rule as the
+                    # token lane: the walk-entry check alone lets a
+                    # boundary leaf's slash-parts finish over the cap.
+                    if len(values) >= _MAX_KNOWN_VALUES:
+                        break
+                    if _MIN_TOKEN_LEN <= len(part) <= _MAX_KNOWN_VALUE_LEN:
                         values.add(part)
+        elif isinstance(node, (int, float)) and not isinstance(node, bool):
+            # Numeric leaves register their str() form: the
+            # pre-dispatch gate requires numbers to have been
+            # "discovered in string form" (str(val) membership), and
+            # str leaves were the only shape collected — a
+            # numerically-typed discovered value (pid, port, count)
+            # was permanently blocked with a misleading
+            # "discover these values first" error. bool stays
+            # excluded (structural; the gate passes it
+            # unconditionally); the min-token-length rule applies to
+            # the rendered form like any other value.
+            rendered = str(node)
+            if _MIN_TOKEN_LEN <= len(rendered) <= _MAX_KNOWN_VALUE_LEN:
+                values.add(rendered)
 
     _walk(obj)
     return values

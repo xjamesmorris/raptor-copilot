@@ -11,10 +11,10 @@ import sys as _sys
 import pytest as _pytest
 
 pytestmark = [
-    _pytest.mark.skipif(
-        _sys.platform != "linux",
-        reason="Linux-only sandbox internals (mount-ns / Landlock / seccomp / ptrace tracer / pid1 shim) — see core/sandbox/_macos_spawn.py for the macOS path",
-    ),
+    # Linux-only sandbox internals (mount-ns / Landlock / seccomp /
+    # ptrace tracer) on real subprocesses — see core/sandbox/
+    # _macos_spawn.py for the macOS path. Real-kernel binding.
+    _pytest.mark.linux_native,
     # Every test in this file exercises real sandbox primitives
     # (namespaces, Landlock, seccomp, ptrace) on real subprocesses.
     # Opt-in via ``pytest -m integration``.
@@ -40,6 +40,21 @@ from core.sandbox import (  # noqa: E402
 from core.sandbox import (  # noqa: E402
     run as sandbox_run,
 )
+from core.sandbox.tests.capability import (  # noqa: E402
+    own_pid_collides_with_sandbox_pidns,
+    pidns_isolation_available,
+)
+
+
+import pytest
+
+@pytest.fixture(autouse=True)
+def _user_state_in_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """User registries stay out of the real home: the root-conftest
+    layer doing this is stripped from release extracts (conftest.py
+    is export-ignore), so the pin must travel in-file."""
+    from core.testing.state_isolation import pin_user_state_dirs
+    pin_user_state_dirs(monkeypatch, tmp_path)
 
 
 class TestE2ENetworkBlocking(unittest.TestCase):
@@ -328,7 +343,17 @@ class TestE2EGccCompilation(unittest.TestCase):
 
 
 class TestE2ECrashObservability(unittest.TestCase):
-    """Verify sandbox captures crash evidence."""
+    """Verify sandbox captures crash evidence.
+
+    Wall budgets here are deliberately generous (60s): the run()
+    deadline starts at the go-signal, BEFORE the child builds its
+    namespaces, so the budget covers the spawn backend's whole setup
+    (userns maps, pivot_root, pid-ns fork, fresh /proc, Landlock,
+    seccomp) — measured at 5-7s on a loaded CI worker running the
+    suite in parallel, where a 5s budget timed out healthy runs. The
+    crash assertions carry these tests; the timeout only bounds a
+    genuine hang. Tightening it back re-races the nightly tier's
+    spawn latency."""
 
     def setUp(self):
         if not check_net_available():
@@ -348,26 +373,26 @@ class TestE2ECrashObservability(unittest.TestCase):
 
             result = sandbox_run(
                 [str(binary)], block_network=True,
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, timeout=60,
             )
             self.assertTrue(result.sandbox_info["crashed"])
             self.assertEqual(result.sandbox_info["signal"], "SIGSEGV")
             self.assertIn("SIGSEGV", result.sandbox_info["evidence"])
 
     def test_sigabrt_detected(self):
-        """abort() captured — THE shim regression test.
+        """abort() captured — THE pid-1 signal-filter regression test.
 
-        abort() self-sends SIGABRT via `raise(SIGABRT)`. Without the
-        pid-1 shim, the target is pid-1 of the new pid-ns and the
-        kernel silently drops raise() from pid-1 (no default handler
-        → pid-ns init-signal filter applies). Result: target exits
-        rc=0 and observability loses the crash entirely.
+        abort() self-sends SIGABRT via `raise(SIGABRT)`. If the target
+        ran as pid-1 of the new pid-ns, the kernel would silently drop
+        the raise (no default handler → pid-ns init-signal filter) and
+        glibc's fallback would misreport the death as SIGSEGV — the
+        crash identity every downstream oracle keys on.
 
-        With the shim (`libexec/raptor-pid1-shim`), the target runs
-        as pid-3 so raise() goes through normally. The intermediate
-        process encodes signal-death as rc=128+6=134 (can't re-raise
-        on pid-1 either), and observe._interpret_result decodes both
-        rc<0 and 128+sig to the same crashed=True state.
+        The spawn backend's in-ns init split keeps the target at PID 2
+        so raise() goes through normally; the trusted waiter reports
+        the raw wait status over its side channel, so the parent sees
+        WIFSIGNALED (rc<0) and observe._interpret_result decodes it
+        with the mechanical waitstatus grade.
 
         Unlike SIGFPE (x86-only synchronous trap), SIGABRT is
         portable, so this test runs everywhere.
@@ -381,7 +406,7 @@ class TestE2ECrashObservability(unittest.TestCase):
 
             result = sandbox_run(
                 [str(binary)], block_network=True,
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, timeout=60,
             )
             self.assertTrue(result.sandbox_info["crashed"],
                             f"abort() should be detected as a crash; "
@@ -392,7 +417,7 @@ class TestE2ECrashObservability(unittest.TestCase):
         """Clean exit has no crash evidence."""
         result = sandbox_run(
             ["true"], block_network=True,
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=60,
         )
         self.assertFalse(result.sandbox_info["crashed"])
 
@@ -431,16 +456,17 @@ class TestE2EResourceLimits(unittest.TestCase):
 
 
 class TestE2EPathHijackDefeated(unittest.TestCase):
-    """Verify that PATH pollution can't hijack unshare/prlimit.
+    """Verify that PATH pollution can't hijack the sandbox's own
+    setup binaries.
 
-    The sandbox invokes `unshare` and `prlimit` to set up namespaces and
-    apply RLIMIT_NPROC. If a polluted PATH (malicious .envrc, direnv,
-    compromised shell rc) placed a fake `unshare` ahead of the real one,
-    the fake would run WITHIN Landlock+seccomp (applied in preexec) but
-    would skip the actual namespace creation — leaving the child in the
-    host's net/pid/ipc namespaces with full outbound network.
-    Fixed by resolving these binaries against a hardcoded safe bin-dir
-    list instead of PATH.
+    The sandbox invokes `unshare` for its namespace ENGAGEMENT PROBE
+    (and newuidmap/newgidmap for the uid-mapping step). If a polluted
+    PATH (malicious .envrc, direnv, compromised shell rc) placed a
+    fake `unshare` ahead of the real one, the probe would consult an
+    attacker binary to decide whether namespaces engage. Fixed by
+    resolving these binaries against a hardcoded safe bin-dir list
+    instead of PATH; the target command itself still resolves via
+    PATH as documented.
     """
 
     def setUp(self):
@@ -453,7 +479,6 @@ class TestE2EPathHijackDefeated(unittest.TestCase):
 
         from core.sandbox import state as s
         saved_unshare = s._unshare_path_cache
-        saved_prlimit = s._prlimit_path_cache
         saved_net = s._net_available_cache
         saved_path = os.environ.get("PATH", "")
 
@@ -466,7 +491,6 @@ class TestE2EPathHijackDefeated(unittest.TestCase):
 
             # Clear caches and poison PATH
             s._unshare_path_cache = None
-            s._prlimit_path_cache = None
             s._net_available_cache = None
             os.environ["PATH"] = d + ":" + saved_path
 
@@ -487,7 +511,6 @@ class TestE2EPathHijackDefeated(unittest.TestCase):
                 )
             finally:
                 s._unshare_path_cache = saved_unshare
-                s._prlimit_path_cache = saved_prlimit
                 s._net_available_cache = saved_net
                 os.environ["PATH"] = saved_path
 
@@ -705,15 +728,23 @@ class TestE2ELibexecScript(unittest.TestCase):
         self.assertIn("Usage", result.stderr)
 
     def test_missing_output_dir_fails_closed(self):
-        """No OUTPUT_DIR must fail with a clear error, not silently default."""
-        env_no_output = {k: v for k, v in os.environ.items() if k != "OUTPUT_DIR"}
-        result = subprocess.run(
-            ["libexec/raptor-run-sandboxed", "echo", "hi"],
-            capture_output=True, text=True, timeout=5, env=env_no_output,
-            check=False,
-        )
+        """No output dir resolvable must fail with a clear error that
+        names the flag, not silently default. HOME points at an empty
+        dir so the session-run-ledger fallback finds nothing — the
+        test must not pass or fail based on the invoking session's
+        live runs."""
+        with TemporaryDirectory() as empty_home:
+            env_no_output = {
+                k: v for k, v in os.environ.items() if k != "OUTPUT_DIR"}
+            env_no_output["HOME"] = empty_home
+            result = subprocess.run(
+                ["libexec/raptor-run-sandboxed", "echo", "hi"],
+                capture_output=True, text=True, timeout=5,
+                env=env_no_output, check=False,
+            )
         self.assertEqual(result.returncode, 1)
         self.assertIn("OUTPUT_DIR", result.stderr)
+        self.assertIn("--output-dir", result.stderr)
         self.assertIn("[sandbox] ERROR", result.stderr)
 
     def test_help_flag_exits_zero(self):
@@ -965,6 +996,26 @@ class TestE2EEgressProxy(unittest.TestCase):
             self.assertIn("GIT_CONFIG_GLOBAL=/dev/null", r.stdout)
             self.assertIn("GIT_CONFIG_SYSTEM=/dev/null", r.stdout)
             self.assertIn("MY_LEGITIMATE_VAR=kept", r.stdout)
+
+    def test_strict_env_keeps_only_exact_git_neutralisers(self):
+        """Strict filtering keeps /dev/null pins but rejects overrides."""
+        with TemporaryDirectory() as out:
+            r = sandbox_run(
+                ["env"], target=out, output=out,
+                env={
+                    "PATH": "/usr/bin",
+                    "HOME": out,
+                    "GIT_CONFIG_GLOBAL": "/dev/null",
+                    "GIT_CONFIG_SYSTEM": "/tmp/attacker-config",
+                    "LD_PRELOAD": "/tmp/attacker.so",
+                },
+                strict_env=True,
+                capture_output=True, text=True, timeout=5,
+            )
+            self.assertEqual(r.returncode, 0)
+            self.assertIn("GIT_CONFIG_GLOBAL=/dev/null", r.stdout)
+            self.assertNotIn("GIT_CONFIG_SYSTEM=", r.stdout)
+            self.assertNotIn("LD_PRELOAD=", r.stdout)
 
     def test_run_untrusted_detaches_controlling_tty(self):
         """run_untrusted must put the child in a new session (setsid) so
@@ -1594,19 +1645,62 @@ class TestE2ELandlockReadRestriction(unittest.TestCase):
     def test_proc_host_pid_environ_blocked_under_restrict_reads(self):
         """Host-PID /proc/<pid>/environ must not be readable from sandbox.
 
-        In Landlock-only mode (no block_network, no mount-ns), the child
-        shares the host PID namespace by default, so /proc/<host_pid>/
-        environ of any same-UID host process is readable — including the
-        parent RAPTOR process's env (ANTHROPIC_API_KEY, SSH creds, etc).
+        Without a PID-namespace unshare (no block_network, no mount-ns)
+        the child shares the host PID namespace, so host pids stay
+        visible and /proc/<host_pid>/environ of any same-UID host
+        process — the parent RAPTOR process's env (ANTHROPIC_API_KEY,
+        SSH creds, etc) included — is one read away. On Landlock-capable
+        kernels the sandbox's own Landlock ptrace scoping still denies
+        that read (the target is outside the sandbox domain), but on a
+        Landlock-less kernel nothing does: Yama gates only ptrace
+        ATTACH-mode checks, never the READ check environ opens use.
 
         The fix: restrict_reads=True triggers a PID-namespace unshare,
-        so the kernel's ns-level /proc access check denies reads to any
-        host-pid /proc/<pid>/environ even though /proc is wholesale
-        allowlisted at the Landlock layer.
+        so the probed host pid does not EXIST inside the sandbox — the
+        read gets ENOENT from pid hiding, independent of any LSM, even
+        though /proc is wholesale allowlisted at the Landlock layer.
 
         Uses sandbox() with block_network=False so only the PID-ns path
         is exercised (not the net-ns fallback).
+
+        Two truthful gates guard the oracle (both from
+        core.sandbox.tests.capability):
+
+        * When the namespace backend cannot engage at all, the sandbox
+          runs Landlock-only and there is no PID-namespace hiding to
+          guard — host pids stay visible, and the environ denial that
+          remains comes from the sandbox's Landlock ptrace scoping
+          (pinned separately by
+          test_environ_confidentiality_under_landlock_only_demotion),
+          not from the mechanism this test regresses. Skip with the
+          posture named.
+        * When this test itself runs inside a nested pid namespace
+          (an unshare-wrapped battery), its own pid can be small
+          enough to be RE-ALLOCATED inside the sandbox's fresh pid
+          namespace — /proc/<own-pid> then names the sandbox's own
+          init shim, whose environ image mirrors the parent's (with
+          credential values zeroed), so the read "succeeding" is a
+          pid collision, not a host leak, and the oracle is
+          unfalsifiable. Skip with the collision named.
         """
+        if not pidns_isolation_available():
+            self.skipTest(
+                "environment demotes the sandbox to Landlock-only "
+                "(no unprivileged user namespaces): the PID-namespace "
+                "hiding this test guards cannot engage — host pids "
+                "stay visible in /proc; out-of-domain environ reads "
+                "remain denied by the sandbox's Landlock ptrace "
+                "scoping (pinned by test_environ_confidentiality_"
+                "under_landlock_only_demotion); see docs/sandbox.md "
+                "OS-capability degradation map")
+        if own_pid_collides_with_sandbox_pidns():
+            self.skipTest(
+                f"test process pid {os.getpid()} can be re-allocated "
+                "inside the sandbox's fresh PID namespace (the test "
+                "itself runs inside a nested pid namespace): "
+                "/proc/<pid> may name the sandbox's own init shim, so "
+                "the denial oracle cannot distinguish isolation from "
+                "pid collision")
         host_pid = os.getpid()
         with TemporaryDirectory() as out:
             r = sandbox_run(
@@ -1619,37 +1713,152 @@ class TestE2ELandlockReadRestriction(unittest.TestCase):
                                 "host /proc/<pid>/environ should have been "
                                 "denied by PID-ns isolation")
             # PID-ns hides host pids: /proc/<host_pid> does not exist
-            # inside the sandbox, so cat gets ENOENT rather than the
-            # EACCES returned by Landlock alone. Either = defense worked.
-            denied = ("Permission denied" in r.stderr
-                      or "No such file" in r.stderr)
-            self.assertTrue(denied,
-                            f"expected EACCES or ENOENT; got stderr="
-                            f"{r.stderr[:200]!r}")
+            # inside the sandbox, so the ONLY signature of the guarded
+            # mechanism is ENOENT. A "Permission denied" here would
+            # come from a host-side LSM check (the sandbox's own
+            # Landlock domain scoping gates out-of-domain environ
+            # reads even without a PID namespace) — accepting it would
+            # let the oracle pass with the PID-namespace unshare
+            # silently regressed.
+            self.assertIn("No such file", r.stderr,
+                          f"expected ENOENT (pid hidden by the PID "
+                          f"namespace); got stderr={r.stderr[:200]!r}")
+
+    def test_environ_confidentiality_under_landlock_only_demotion(self):
+        """Pin what the Landlock-only posture actually guarantees for
+        host /proc/<pid>/environ reads — and attribute the denial to
+        the sandbox, not to host configuration.
+
+        Forces the demotion through the same probe seam production
+        keys the namespace backend on (check_net_available → False),
+        then reads a live same-UID host process's environ from inside
+        the sandbox. With no PID namespace the host pid stays VISIBLE
+        (world-readable /proc entries like cmdline are served), but
+        the environ read is DENIED: /proc/<pid>/environ opens require
+        a kernel ptrace-mode READ access check, and the sandbox's
+        Landlock domain scopes that check — an in-domain process may
+        not read the environ of an out-of-domain process, on any Yama
+        setting.
+
+        The unsandboxed control read discriminates the attribution:
+        Yama's ptrace hook gates only ATTACH-mode checks (it never
+        gates the READ check environ opens use), so a bare same-UID
+        non-descendant read of the same file must SUCCEED. If the
+        control is ever denied, some other host-side mechanism is
+        gating environ reads and the sandbox attribution no longer
+        holds — the pin reds rather than passing for the wrong
+        reason. (/proc/<pid>/mem differs: its opens are ATTACH-gated,
+        so Yama does apply there; this pin deliberately covers only
+        environ.)
+
+        Landlock-less hosts skip via this class's setUp gate.
+        """
+        from unittest import mock
+
+        import core.sandbox.context as context_mod
+
+        sentinel = "RAPTOR-E2E-LLONLY-ENVIRON-SENTINEL"
+        env = dict(os.environ)
+        env["RAPTOR_E2E_LLONLY_SENTINEL"] = sentinel
+        helper = subprocess.Popen(["sleep", "30"], env=env)
+        try:
+            # Control (no sandbox): the reading cat is a SIBLING of
+            # the helper — same UID, not an ancestor — so success here
+            # proves no host-side mechanism (Yama included) is denying
+            # bare environ reads: any denial inside the sandbox below
+            # is then the sandbox's own doing.
+            control = subprocess.run(
+                ["cat", f"/proc/{helper.pid}/environ"],
+                capture_output=True, text=True, timeout=5,
+            )
+            self.assertEqual(
+                control.returncode, 0,
+                "bare same-UID non-descendant environ read was denied "
+                f"(stderr={control.stderr[:200]!r}) — a host-side "
+                "mechanism is gating environ reads, so the sandboxed "
+                "denial below can no longer be attributed to Landlock "
+                "domain scoping; re-adjudicate this pin and the "
+                "docs/sandbox.md degradation map")
+            self.assertIn(
+                sentinel, control.stdout,
+                "control read succeeded but the sentinel is missing — "
+                "the helper's environ was not what this pin planted")
+            with mock.patch.object(context_mod, "check_net_available",
+                                   return_value=False):
+                with TemporaryDirectory() as out:
+                    r = sandbox_run(
+                        ["cat", f"/proc/{helper.pid}/environ"],
+                        target=out, output=out,
+                        restrict_reads=True,
+                        capture_output=True, text=True, timeout=5,
+                    )
+                with TemporaryDirectory() as out:
+                    r_cmdline = sandbox_run(
+                        ["cat", f"/proc/{helper.pid}/cmdline"],
+                        target=out, output=out,
+                        restrict_reads=True,
+                        capture_output=True, text=True, timeout=5,
+                    )
+            self.assertEqual(
+                r.sandbox_info.get("containment_tier"), "landlock",
+                "forcing the userns probe False must demote the run "
+                f"to the Landlock-only tier; got {r.sandbox_info!r}")
+            self.assertNotEqual(
+                r.returncode, 0,
+                "the Landlock-only posture must deny out-of-domain "
+                "/proc/<pid>/environ reads (Landlock ptrace scoping) "
+                "— the docs/sandbox.md degradation map claims this "
+                "guarantee; if it no longer holds, that is a real "
+                "confidentiality regression")
+            self.assertNotIn(
+                sentinel, r.stdout,
+                "sentinel leaked through the Landlock-only sandbox")
+            # The genuine loss in this posture is VISIBILITY, not
+            # environ confidentiality: the host pid exists inside the
+            # sandbox and its world-readable (fs-only, no ptrace gate)
+            # entries are served.
+            self.assertEqual(
+                r_cmdline.returncode, 0,
+                "host /proc/<pid>/cmdline should be readable in the "
+                "Landlock-only posture (no PID namespace to hide the "
+                f"pid); stderr={r_cmdline.stderr[:200]!r}")
+            self.assertIn(
+                "sleep", r_cmdline.stdout,
+                "cmdline read succeeded but does not show the helper")
+        finally:
+            helper.kill()
+            helper.wait()
 
     def test_fake_home_isolates_child_from_real_home(self):
         """run_untrusted defaults fake_home=True. The child's HOME
-        points at an empty per-sandbox dir inside output, NOT the real
-        user's home. Secrets planted in the real home are not readable
-        (restrict_reads blocks them even by absolute path), and tools
-        expanding `~` land inside the fake home.
+        points at a per-sandbox dir, NOT the real user's home: the
+        private /tmp/.home on the mount-ns lane (the ``<output>/.home``
+        intake is copied there so the child's home never names the run
+        directory), ``{output}/.home`` on mountless lanes (no private
+        /tmp to relocate into). Secrets planted in the real home are
+        not readable (restrict_reads blocks them even by absolute
+        path), and tools expanding `~` land inside the fake home.
         """
         from core.sandbox import run_untrusted
         restricted_file = Path.home() / ".raptor_fake_home_regression.txt"
         restricted_file.write_text("REAL-HOME-SECRET\n")
         try:
             with TemporaryDirectory() as out:
-                # 1. Child's HOME points at {output}/.home
+                # 1. Child's HOME points at a fake home — the private
+                # /tmp/.home (mount lane) or {output}/.home (mountless)
                 r = run_untrusted(
                     ["sh", "-c", "echo $HOME"],
                     target=out, output=out,
                     capture_output=True, text=True, timeout=5,
                 )
                 self.assertEqual(r.returncode, 0)
-                self.assertTrue(r.stdout.strip().startswith(out),
-                                f"HOME should be under {out!r}, "
-                                f"got {r.stdout!r}")
-                self.assertTrue(r.stdout.strip().endswith(".home"))
+                child_home = r.stdout.strip()
+                self.assertTrue(
+                    child_home == "/tmp/.home"
+                    or child_home.startswith(out),
+                    f"HOME should be /tmp/.home or under {out!r}, "
+                    f"got {r.stdout!r}")
+                self.assertTrue(child_home.endswith(".home"))
 
                 # 2. Real HOME secret not readable (absolute path)
                 r = run_untrusted(
@@ -1788,17 +1997,24 @@ class TestE2EHomeToolchainSeam(unittest.TestCase):
             self.assertIn("abs-ok", r.stdout)
 
     def test_nowhere_resolvable_tool_keeps_errno_diagnostic(self):
-        """A name the CALLER cannot resolve either skips the gate
-        (nothing to diverge from) and fails at exec with the named
-        pid1-shim errno line — not silently."""
+        """A name that resolves NOWHERE (caller PATH, child PATH,
+        filesystem) raises the subprocess-parity FileNotFoundError
+        BEFORE any lane dispatch — the same exception the plain
+        subprocess lane raises natively and the exception every
+        tool-missing arm (`except FileNotFoundError: <tool> not
+        installed`) is written against. A missing binary is not a
+        containment failure: it must not enter the demotion ladder,
+        burn spawn attempts, pollute the speculative-failure cache,
+        or surface as a BaseException-grade sandbox refusal."""
         with TemporaryDirectory() as out:
-            r = sandbox_run(
-                ["seamtool-missing-everywhere", "hi"],
-                block_network=True, target=out, output=out,
-                capture_output=True, text=True, timeout=30,
-            )
-            self.assertNotEqual(r.returncode, 0)
-            self.assertIn("exec of target failed", r.stderr)
+            with self.assertRaises(FileNotFoundError) as ctx:
+                sandbox_run(
+                    ["seamtool-missing-everywhere", "hi"],
+                    block_network=True, target=out, output=out,
+                    capture_output=True, text=True, timeout=30,
+                )
+            self.assertIn("seamtool-missing-everywhere",
+                          str(ctx.exception))
 
     def test_declared_tool_paths_resolve_home_toolchain(self):
         """Declaring BOTH hop dirs makes the toolchain work under
@@ -3190,9 +3406,9 @@ class TestNetnsLoopbackUp(unittest.TestCase):
         )
         with TemporaryDirectory() as out:
             # /usr/bin/python3 explicitly: a $PATH interpreter outside
-            # the mount tree would fall back to the subprocess path,
-            # where the loopback bringup is best-effort only (see
-            # raptor-pid1-shim._ensure_loopback_up).
+            # the mount tree would route through the mountless retry;
+            # keep this test pinned on the mount lane's unconditional
+            # loopback bringup.
             r = sandbox_run(
                 ["/usr/bin/python3", "-c", code],
                 block_network=True, target=out, output=out,

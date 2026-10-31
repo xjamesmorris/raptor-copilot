@@ -1414,3 +1414,136 @@ class TestStructuralCheckersRejectRenderedSource:
             "line_start": 1, "line_end": raw_lines,
         }
         assert check_auth_mode_registration(gap, target_path=tmp_path)
+
+
+class TestContextManagerLockScoping:
+    def _gap(self, source):
+        return [{"file": "a.py", "name": "f", "source": source}]
+
+    def test_with_open_does_not_suppress_missing_unlock(self):
+        # An unrelated context manager in the function must not hide a
+        # bare acquire with no visible release.
+        source = (
+            "def f(self):\n"
+            "    self.mu.acquire()\n"
+            "    with open(self.path) as fh:\n"
+            "        data = fh.read()\n"
+            "    if not data:\n"
+            "        raise ValueError('empty')\n"
+        )
+        titles = [x.title for x in check_lock_ordering(self._gap(source))]
+        assert "Missing unlock in error path" in titles
+
+    def test_lockish_context_manager_still_suppresses(self):
+        source = (
+            "def f(self):\n"
+            "    self.io_mutex.acquire()\n"
+            "    with self._lock:\n"
+            "        pass\n"
+            "    if err:\n"
+            "        raise ValueError('x')\n"
+        )
+        titles = [x.title for x in check_lock_ordering(self._gap(source))]
+        assert "Missing unlock in error path" not in titles
+
+
+class TestConventionCountsPerPattern:
+    def test_gap_counts_under_every_matching_pattern(self):
+        # Three gaps match both check_auth and require_role; a fourth
+        # matches require_role only. First-match-wins counting used to
+        # award check_auth the majority (3 vs 1) even though
+        # require_role appears in all four functions.
+        both = "check_auth(u)\nrequire_role(u, 'admin')\n"
+        only_role = "require_role(u, 'admin')\n"
+        gaps = [
+            {"file": "a.py", "name": f"f{i}", "source": both}
+            for i in range(3)
+        ] + [{"file": "a.py", "name": "f3", "source": only_role}]
+        convs = discover_conventions(gaps, framework="")
+        auth = [c for c in convs if c.concern == "auth"]
+        assert len(auth) == 1
+        assert auth[0].pattern == r"require_role"
+        assert auth[0].occurrences == 4
+
+
+class TestOrderedWalkMembers:
+    """Two checks used to carry unbounded regex spans, quadratic on
+    hostile source (the union type-punning pattern's `[^}]*` runs and
+    the recursion pattern's DOTALL `.*?` backreference span — and the
+    recursion spelling's `[^)]*` parameter body re-scanned the tail
+    from every planted `def name(`). Both are ordered walks now:
+    linear on hostile input while keeping the ORIGINAL gap-exact
+    language, so a construct larger than any fixed window is still
+    detected instead of silently sliding past a bound."""
+
+    def test_union_walk_matches_near_and_large_bodies(self):
+        from core.audit import negative_space as ns
+        check = next(
+            entry for entry, _title, _cwe in ns._UB_PATTERNS
+            if isinstance(entry, ns._OrderedTokenCheck)
+        )
+        near = "union u { int x; float y; }"
+        assert check.search(near)
+        # Gap-exact original language: a large multi-line union body
+        # still matches (a window bound would drop it), while a `}`
+        # inside the gap correctly breaks the construct.
+        big = "union u {" + ("a" * 500) + "\nint x;" + ("b" * 500) + "}"
+        assert check.search(big)
+        broken = "union u {}" + ("a" * 500) + " int x; }"
+        assert not check.search(broken)
+
+    def test_union_walk_is_fast_on_hostile_source(self):
+        from core.audit import negative_space as ns
+        from core.testing.wallclock import cpu_budget
+        check = next(
+            entry for entry, _title, _cwe in ns._UB_PATTERNS
+            if isinstance(entry, ns._OrderedTokenCheck)
+        )
+        hostile = "union u {" * 4000 + "int" * 4000
+        with cpu_budget(1.0, what="union ordered-token walk"):
+            check.search(hostile)
+
+    def test_recursive_call_walk(self):
+        from core.audit import negative_space as ns
+        near = "def walk(n):\n    return walk(n.child)\n"
+        assert ns._has_recursive_call(near)
+        # Original language preserved: a later same-named call still
+        # pairs with the def wherever it sits (the walk fixes the
+        # scan cost, not the match set).
+        far = "def walk(n):\n    pass\n" + ("x = 1\n" * 1200) + "walk(2)\n"
+        assert ns._has_recursive_call(far)
+        # The name only reappearing before the parameter list closes
+        # is not a recursive call.
+        params_only = "def walk(walk):\n    pass\n"
+        assert not ns._has_recursive_call(params_only)
+
+    def test_recursive_call_walk_is_fast_on_hostile_source(self):
+        from core.audit import negative_space as ns
+        from core.testing.wallclock import cpu_budget
+        hostile = "def a(" * 3000 + "\n" + "a " * 3000
+        with cpu_budget(1.0, what="recursive-call walk"):
+            ns._has_recursive_call(hostile)
+
+
+class TestMemcpyOverlapWhitespaceRun:
+    def test_memcpy_whitespace_run_is_fast(self):
+        """Hostile 'memcpy('-opening line with a long whitespace run
+        and no +/- operator: the previous ``,\\s*[^,]+\\s*(?:\\+|-)``
+        spelling overlapped three unbounded repeats on whitespace —
+        cubic in the line length. The \\S-delimited second argument
+        is linear."""
+        import re
+
+        from core.audit import negative_space as ns
+        from core.testing.wallclock import cpu_budget
+
+        pat = next(
+            p for p, msg, _cwe in ns._UB_PATTERNS
+            if "memmove" in msg
+        )
+        assert isinstance(pat, re.Pattern)
+        hostile = "memcpy(dst, s" + " " * (1 << 16) + "x"
+        with cpu_budget(1.0, what="memcpy whitespace-run scan"):
+            assert pat.search(hostile) is None
+        assert pat.search("memcpy(dst, src + off, n);")
+        assert pat.search("memcpy(p, q - 4, len);")

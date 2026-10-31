@@ -32,13 +32,18 @@ pytestmark = _pytest.mark.skipif(
     reason="Linux-only sandbox internals (mount-ns rootfs pivot)",
 )
 
+import functools  # noqa: E402
 import os  # noqa: E402
 import shutil  # noqa: E402
 import subprocess  # noqa: E402
 import tempfile  # noqa: E402
 import unittest  # noqa: E402
 from pathlib import Path  # noqa: E402
-from core.sandbox.tests.capability import requires_landlock, requires_userns
+from core.sandbox.tests.capability import (
+    requires_landlock,
+    requires_mount,
+    requires_userns,
+)
 
 
 def _mount_ns_usable() -> bool:
@@ -49,6 +54,93 @@ def _mount_ns_usable() -> bool:
     if sysctl.exists() and sysctl.read_text().strip() == "1":
         return False
     return True
+
+
+_CLONE_NEWUSER = 0x10000000
+
+
+@functools.cache
+def _rootfs_uidmap_step_usable() -> tuple[bool, str]:
+    """Truthful probe for the one rootfs prerequisite the static
+    ``_mount_ns_usable`` checks cannot see: can ``newuidmap`` actually
+    apply the uid map the rootfs spawn would choose in THIS
+    environment?
+
+    Rootfs mode maps the operator's /etc/subuid+/etc/subgid allotment
+    (a RANGE map) when one exists — and inside an unprivileged NESTED
+    user namespace that range is unmapped in the writer's namespace,
+    so the kernel refuses the uid_map write with EPERM regardless of
+    binary presence, sysctls, or the on-disk allotment. Only
+    attempting the exact operation answers truthfully: this probe
+    unshares a scratch child userns and runs ``newuidmap`` with the
+    same mapping lines ``core.sandbox._spawn`` would use (single-id
+    when no allotment exists — the shape that DOES work nested, which
+    is why the plain mount-ns suites keep running there).
+
+    Returns ``(usable, reason)``; ``reason`` names the missing OS
+    capability when ``usable`` is False. Cached per process — one
+    subprocess pair, ~100 ms, paid only when an E2E test's static
+    gates already passed.
+    """
+    from core.sandbox._spawn import _subid_range
+    from core.sandbox.probes import _find_sandbox_binary
+
+    newuidmap = _find_sandbox_binary("newuidmap")
+    if newuidmap is None:
+        return (False, "newuidmap not present in the trusted system "
+                       "dirs (uidmap package)")
+    host_uid = os.getuid()
+    try:
+        import pwd
+        user = pwd.getpwuid(host_uid).pw_name
+    except (KeyError, OSError):
+        user = str(host_uid)
+    uid_lines = ["0", str(host_uid), "1"]
+    urange = _subid_range("/etc/subuid", user, str(host_uid))
+    grange = _subid_range("/etc/subgid", user, str(os.getgid()))
+    # Mirror the spawn's choice exactly: the range map is taken only
+    # when BOTH allotments (and plain newgidmap) exist.
+    if urange and grange and _find_sandbox_binary("newgidmap"):
+        count = max(1, min(urange[1], 65535))
+        uid_lines += ["1", str(urange[0]), str(count)]
+    holder_code = (
+        "import ctypes, sys, time\n"
+        "libc = ctypes.CDLL(None, use_errno=True)\n"
+        f"if libc.unshare({_CLONE_NEWUSER}) != 0:\n"
+        "    sys.exit(42)\n"
+        "print('ready', flush=True)\n"
+        "time.sleep(30)\n"
+    )
+    import sys
+    holder = subprocess.Popen(
+        [sys.executable, "-c", holder_code],
+        stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        line = holder.stdout.readline()
+        if "ready" not in line:
+            return (False, "cannot create an unprivileged user "
+                           "namespace here (unshare(CLONE_NEWUSER) "
+                           "refused)")
+        try:
+            r = subprocess.run(
+                [newuidmap, str(holder.pid), *uid_lines],
+                capture_output=True, text=True, timeout=10,
+                check=False,
+                env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return (False, f"newuidmap probe could not run: {e}")
+        if r.returncode != 0:
+            return (False,
+                    "newuidmap cannot write the uid map the rootfs "
+                    f"spawn would choose (rc={r.returncode}: "
+                    f"{r.stderr.strip()!r}) — an unprivileged nested "
+                    "user namespace cannot apply subuid-range maps")
+        return (True, "")
+    finally:
+        holder.kill()
+        holder.wait(timeout=10)
 
 
 # ── static-binary image builder ───────────────────────────────────────
@@ -240,25 +332,36 @@ class TestSubidRangeParser(unittest.TestCase):
         from core.sandbox._spawn import _subid_range
         self._write("alice:100000:65536\nbob:200000:65536\n")
         self.assertEqual(_subid_range(self.path, "bob", "1001"),
-                         (200000, 65536))
+                         (200000, 65535))
 
     def test_match_by_numeric_id(self):
         from core.sandbox._spawn import _subid_range
         self._write("1001:300000:65536\n")
         self.assertEqual(_subid_range(self.path, "bob", "1001"),
-                         (300000, 65536))
+                         (300000, 65535))
 
     def test_first_entry_wins(self):
         from core.sandbox._spawn import _subid_range
         self._write("bob:100000:65536\nbob:900000:65536\n")
         self.assertEqual(_subid_range(self.path, "bob", "1001"),
-                         (100000, 65536))
+                         (100000, 65535))
 
     def test_count_capped(self):
         from core.sandbox._spawn import _subid_range
         self._write("bob:100000:10000000\n")
         self.assertEqual(_subid_range(self.path, "bob", "1001"),
-                         (100000, 65536))
+                         (100000, 65535))
+
+    def test_count_below_cap_untouched(self):
+        # Two-direction pin for the churn-prone cap: values under it
+        # must pass through unclamped, and the cap value itself must
+        # equal the rootfs consumer's clamp (one 2^16 child id space
+        # including the root mapping) — see _subid_range's docstring
+        # for the both-directions trade-off.
+        from core.sandbox._spawn import _subid_range
+        self._write("bob:100000:65535\n")
+        self.assertEqual(_subid_range(self.path, "bob", "1001"),
+                         (100000, 65535))
 
     def test_malformed_lines_skipped(self):
         from core.sandbox._spawn import _subid_range
@@ -289,6 +392,15 @@ class _RootfsE2EBase(unittest.TestCase):
             )
         if _static_init_binary() is None:
             self.skipTest("no working `cc -static` on this host")
+        usable, why = _rootfs_uidmap_step_usable()
+        if not usable:
+            # Truthful skip, not a vacuous run: with the uid-map step
+            # unavailable EVERY rootfs spawn dies in setup, so even the
+            # refusal-shape tests in these classes would "pass" without
+            # exercising the code path they pin.
+            self.skipTest(
+                f"rootfs mount-ns uid-map step unavailable: {why}"
+            )
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.rootfs = _build_rootfs(self.tmp.name)
@@ -307,6 +419,8 @@ class TestRootfsPivotE2E(_RootfsE2EBase):
 
     @requires_landlock
     @requires_userns
+    # Exercises mount-delivered capability; hosts with userns but no mount capability degrade by design -> named SKIP. Class siblings that validate arguments or parse files stay ungated: they run on any host.
+    @requires_mount
     def test_image_view_pids_and_upper_layer(self):
         """One pivoted run proves the core contract: the child sees the
         image filesystem (sentinel present, host /etc/passwd absent),
@@ -332,19 +446,36 @@ class TestRootfsPivotE2E(_RootfsE2EBase):
 
     @requires_landlock
     @requires_userns
+    # Exercises mount-delivered capability; hosts with userns but no mount capability degrade by design -> named SKIP. Class siblings that validate arguments or parse files stay ungated: they run on any host.
+    @requires_mount
     def test_exit_status_mirrored_through_waiter(self):
         r = self._run(["/bin/init", "exit7"])
         self.assertEqual(r.returncode, 7, f"stderr: {r.stderr!r}")
 
     @requires_landlock
     @requires_userns
+    # Exercises mount-delivered capability; hosts with userns but no mount capability degrade by design -> named SKIP. Class siblings that validate arguments or parse files stay ungated: they run on any host.
+    @requires_mount
+    # Full namespace + pivot_root + PID-1 waiter setup around a real
+    # crash — measured multi-second on loaded runners; over the fast
+    # tier's budget. The exit-status sibling keeps the E2E path in the
+    # default tier.
+    @_pytest.mark.slow
     def test_signal_death_mirrored_as_128_plus_n(self):
         """abort()-class deaths are the raison d'être of the PID-1
         waiter: a PID-1 target would have the self-signal filtered by
-        the kernel and hang; as PID 2 it dies and the waiter mirrors
-        the shim convention observe._interpret_result decodes."""
+        the kernel and hang; as PID 2 it dies, the waiter mirrors
+        128+sig, and the raw-wait-status side channel upgrades the
+        parent's view back to WIFSIGNALED (rc < 0, mechanical
+        waitstatus grade) — observe._interpret_result decodes both
+        shapes to the same crash identity."""
         r = self._run(["/bin/init", "die6"])  # SIGABRT
-        self.assertEqual(r.returncode, 128 + 6, f"stderr: {r.stderr!r}")
+        self.assertEqual(r.returncode, -6, f"stderr: {r.stderr!r}")
+        self.assertTrue(r.sandbox_info.get("crashed"),
+                        r.sandbox_info)
+        self.assertEqual(r.sandbox_info.get("signal"), "SIGABRT")
+        self.assertEqual(r.sandbox_info.get("signal_provenance"),
+                         "waitstatus")
 
     def test_missing_cmd_in_image_fails_closed(self):
         """cmd[0] absent from the image → exec fails inside the mount
@@ -356,6 +487,8 @@ class TestRootfsPivotE2E(_RootfsE2EBase):
 
     @requires_landlock
     @requires_userns
+    # Exercises mount-delivered capability; hosts with userns but no mount capability degrade by design -> named SKIP. Class siblings that validate arguments or parse files stay ungated: they run on any host.
+    @requires_mount
     def test_input_kwarg_rides_the_image(self):
         """input= no longer demotes (stdin spool on the fork backend):
         a rootfs run with witness bytes executes INSIDE the image —
@@ -369,6 +502,8 @@ class TestRootfsPivotE2E(_RootfsE2EBase):
 
 
 @requires_userns
+# Exercises mount-delivered capability; hosts with userns but no mount capability degrade by design -> named SKIP. Class siblings that validate arguments or parse files stay ungated: they run on any host.
+@requires_mount
 class TestRootfsHostDeviceContainment(_RootfsE2EBase):
     """rootfs mode rbinds host /dev and /sys. The Landlock write grant
     must NOT cover them — otherwise same-UID host device nodes (the
@@ -421,6 +556,8 @@ class TestRootfsHostDeviceContainment(_RootfsE2EBase):
 
 @requires_landlock
 @requires_userns
+# Exercises mount-delivered capability; hosts with userns but no mount capability degrade by design -> named SKIP. Class siblings that validate arguments or parse files stay ungated: they run on any host.
+@requires_mount
 class TestRootfsEtcOverlayReadOnly(_RootfsE2EBase):
     """Overlay entries are configuration views, never write surfaces.
     In rootfs mode the Landlock grant covers the image's /etc, so a
@@ -476,6 +613,8 @@ class TestRootfsSymlinkedMountpointRefused(_RootfsE2EBase):
 
 
 @requires_userns
+# Exercises mount-delivered capability; hosts with userns but no mount capability degrade by design -> named SKIP. Class siblings that validate arguments or parse files stay ungated: they run on any host.
+@requires_mount
 class TestRootfsGate5LoadBearing(unittest.TestCase):
     """Rootfs fail-closed gate #5 is LOAD-BEARING for the loader-var
     posture: a rootfs run whose mount-ns spawn setup fails mid-flight

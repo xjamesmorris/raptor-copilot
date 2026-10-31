@@ -486,6 +486,40 @@ class TestCrossCancelQueryError:
         assert r.violations[0].free_func == "release_b"
 
 
+class TestCrossFreeFuncEscaping:
+    """free_func comes out of a prior Joern query — a method name of
+    the scanned repo's CPG, i.e. attacker-influenced text. It must
+    never be interpolated into the cancel query unvalidated: a quote
+    in the name would break out of the Scala string literal and run
+    attacker Scala in the unsandboxed JVM."""
+
+    def test_hostile_free_func_never_reaches_query(self):
+        from core.audit.callback_lifetime import (
+            check_callback_lifetime_cross,
+        )
+        hostile = 'f"); System.exit(0); cpg.method.name("'
+        joern = _ScriptedJoern([_REG, [(hostile, 42)], []])
+        r = check_callback_lifetime_cross(joern, "drv.c", "init_foo")
+        # reg + free queries only — the cancel query for the hostile
+        # pair was refused, and the hostile text never left the module.
+        assert len(joern.queries) == 2
+        assert all("System.exit" not in q for q in joern.queries)
+        # Fail direction: refusing the cancel check is a degraded
+        # (inconclusive) result, never a violation and never clean.
+        assert r.violation_found is False
+        assert "inconclusive" in r.reasoning
+
+    def test_valid_free_func_still_queried(self):
+        from core.audit.callback_lifetime import (
+            check_callback_lifetime_cross,
+        )
+        joern = _ScriptedJoern([_REG, _FREE, []])
+        r = check_callback_lifetime_cross(joern, "drv.c", "init_foo")
+        assert len(joern.queries) == 3
+        assert 'cpg.method.name("release_foo")' in joern.queries[2]
+        assert r.violation_found is True
+
+
 class TestSafeTeardownOrdering:
     def test_free_then_sync_cancel_is_not_safe(self):
         # Regression PoC: the free-then-cancel UAF — exactly the shape
@@ -552,6 +586,67 @@ class TestSafeTeardownSameLineAsync:
         )
         assert r.safe is False
         assert "async" in r.reason
+
+    def test_same_line_sync_sibling_does_not_drop_real_async(self):
+        # The async pattern requires `(` right after the name, so it
+        # can never match inside `..._sync(` — the old same-line
+        # "contains _sync(" disambiguator could only ever fire on the
+        # two-call-one-line shape, where it dropped a REAL async
+        # cancel and certified async-cancel-then-free safe.
+        from core.audit.callback_lifetime import check_safe_teardown
+        r = check_safe_teardown(
+            "void teardown(struct A *a, struct B *b)\n{\n"
+            "    del_timer(&a->timer); del_timer_sync(&b->timer);\n"
+            "    kfree(a);\n"
+            "}\n",
+        )
+        assert r.safe is False
+        assert "async" in r.reason
+
+    def test_own_line_async_control_still_flags(self):
+        from core.audit.callback_lifetime import check_safe_teardown
+        r = check_safe_teardown(
+            "void teardown(struct A *a, struct B *b)\n{\n"
+            "    del_timer(&a->timer);\n"
+            "    del_timer_sync(&b->timer);\n"
+            "    kfree(a);\n"
+            "}\n",
+        )
+        assert r.safe is False
+
+    def test_multiple_async_cancels_on_one_line_all_count(self):
+        # First-match-only under-counted the same direction: the
+        # SECOND async cancel on the line precedes the free too.
+        from core.audit.callback_lifetime import check_safe_teardown
+        r = check_safe_teardown(
+            "void t(struct dev *d)\n{\n"
+            "  cancel_work_sync(&d->work);\n"
+            "  kfree(d); del_timer(&d->t1); del_timer(&d->t2);\n"
+            "}\n",
+        )
+        # free precedes both async cancels on the line — the async
+        # arm must not fire; but a free AFTER them must.
+        assert "async cancel" not in (r.reason or "")
+        r2 = check_safe_teardown(
+            "void t(struct dev *d)\n{\n"
+            "  cancel_work_sync(&d->work);\n"
+            "  del_timer(&d->t1); del_timer(&d->t2); kfree(d);\n"
+            "}\n",
+        )
+        assert r2.safe is False
+        assert "async" in r2.reason
+
+    def test_waiting_variant_alone_stays_safe(self):
+        # Two-direction pin: only-waiting teardown keeps its safe
+        # verdict (the _sync spelling never counts as async).
+        from core.audit.callback_lifetime import check_safe_teardown
+        r = check_safe_teardown(
+            "void t(struct dev *d)\n{\n"
+            "  del_timer_sync(&d->timer);\n"
+            "  kfree(d);\n"
+            "}\n",
+        )
+        assert r.safe is True
 
     def test_same_line_free_then_async_cancel_not_flagged_by_async_arm(
         self,

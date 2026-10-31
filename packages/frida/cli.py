@@ -9,9 +9,13 @@ treats it as a required input rather than constructing one itself.
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sys
 from pathlib import Path
+
+from core.logging import configure_cli_logging
+from core.security.log_sanitisation import sanitise_for_terminal as _sft
 
 from .runner import (
     RunConfig,
@@ -78,6 +82,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # This process is a libexec dispatch target and previously
+    # configured no logging at all, so WARNING+ records (e.g.
+    # sink_watch's dropped-step-name warning, which interpolates
+    # attack-paths.json content) reached the TTY through logging's
+    # raw lastResort handler. Wire the escaping-formatter chokepoint
+    # before any work.
+    configure_cli_logging(logging.WARNING)
     parser = _build_parser()
     # --list-templates is a query mode; skip the required flags by
     # short-circuiting before parse_args's required-arg check.
@@ -93,7 +104,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         target = parse_target(args.target)
     except ValueError as e:
-        print(f"frida: invalid --target: {e}", file=sys.stderr)
+        print(f"frida: invalid --target: {_sft(str(e))}", file=sys.stderr)
         return 2
 
     # A PID identifies an already-running process; you cannot spawn it.
@@ -121,7 +132,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             source, origin = load_script_source(args.template, args.script)
     except (FileNotFoundError, ValueError) as e:
-        print(f"frida: {e}", file=sys.stderr)
+        print(f"frida: {_sft(str(e))}", file=sys.stderr)
         return 2
 
     cfg = RunConfig(
@@ -145,7 +156,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             fd = os.open(args.stdin_file, os.O_RDONLY)
         except OSError as e:
-            print(f"frida: unreadable --stdin file: {e}", file=sys.stderr)
+            print(f"frida: unreadable --stdin file: {_sft(str(e))}", file=sys.stderr)
             return 2
         os.dup2(fd, 0)
         if fd != 0:
@@ -154,14 +165,18 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = run(cfg)
     except FridaUnavailable as e:
-        print(f"frida: {e}", file=sys.stderr)
+        print(f"frida: {_sft(str(e))}", file=sys.stderr)
         return 3
 
     if not result.ok:
         # Detail already in metadata.json + frida-report.md; the CLI
         # prints a one-liner so a caller wrapping us in a shell knows
         # what happened without parsing JSON.
-        print(f"frida: run failed: {result.error}", file=sys.stderr)
+        # Frida error strings can embed target-process/device text.
+        from core.security.log_sanitisation import sanitise_for_terminal
+        print("frida: run failed: "
+              f"{sanitise_for_terminal(str(result.error), max_len=500)}",
+              file=sys.stderr)
         return 1
 
     print(f"frida: ok - {result.events_captured} events captured in "
@@ -183,7 +198,9 @@ def _maybe_correlate_io(out_dir: Path) -> None:
 
         manifest = correlate_run(out_dir)
     except Exception as e:  # noqa: BLE001 — correlation is additive
-        print(f"frida: io-correlation skipped: {e}", file=sys.stderr)
+        # The correlate/harvest parsers read target-controlled
+        # events.jsonl — the exception text can quote hostile bytes.
+        print(f"frida: io-correlation skipped: {_sft(str(e))}", file=sys.stderr)
         return
     if manifest["match_count"]:
         print(f"frida: {manifest['match_count']} I/O correlation(s) — "
@@ -204,7 +221,7 @@ def _maybe_harvest_seeds(out_dir: Path) -> None:
 
         manifest = extract_seeds(out_dir)
     except Exception as e:  # noqa: BLE001 — harvest is additive
-        print(f"frida: seed harvest skipped: {e}", file=sys.stderr)
+        print(f"frida: seed harvest skipped: {_sft(str(e))}", file=sys.stderr)
         return
     if manifest["seed_count"]:
         print(f"frida: {manifest['seed_count']} unique seeds harvested → "

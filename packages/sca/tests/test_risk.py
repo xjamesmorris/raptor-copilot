@@ -79,6 +79,29 @@ def _finding(
     )
 
 
+@pytest.fixture(autouse=True)
+def _flushed_calibration_cache():
+    """Flush the per-process calibration-status cache before AND after
+    every test in this module.
+
+    The pre-flush isolates a test from whatever an earlier test in the
+    same worker process left cached. The post-flush is the important
+    half: the calibration-status tests monkeypatch
+    ``_load_latest_validation_verdict`` and compute a risk estimate,
+    which refills the cache THROUGH the patched loader — monkeypatch
+    restores the loader at teardown, but the cache still holds the
+    patched verdict, and every later ``compute_risk_estimate`` in the
+    worker inherited it. Under pytest-xdist that made any downstream
+    test reading ``risk_components["calibration_status"]`` (the golden
+    byte-pins) order-dependent: green or red depending on which worker
+    the poisoning test landed on first.
+    """
+    from packages.sca import risk
+    risk._reset_calibration_cache_for_tests()
+    yield
+    risk._reset_calibration_cache_for_tests()
+
+
 # ---------------------------------------------------------------------------
 # Worked examples from design §1316
 # ---------------------------------------------------------------------------
@@ -240,16 +263,48 @@ def test_missing_epss_uses_neutral_default():
     assert comps["epss_multiplier"] == pytest.approx(expected, abs=1e-6)
 
 
+def test_verdict_reader_ignores_non_snapshot_files(tmp_path):
+    """The verdict reader honours the same strictly-date-shaped
+    pattern the writer / pruner apply — a stray late-sorting .json
+    (operator scratch, tooling artifact) that parses as a dict with
+    a verdict key must not shadow every dated snapshot."""
+    import json as _json
+
+    from packages.sca.risk import _load_latest_validation_verdict
+
+    vdir = tmp_path / "validation"
+    vdir.mkdir()
+    (vdir / "2026-01-05.json").write_text(
+        _json.dumps({"verdict": "needs_retune"}),
+    )
+    (vdir / "zz-scratch.json").write_text(
+        _json.dumps({"verdict": "validated_v1"}),
+    )
+    assert _load_latest_validation_verdict(vdir) == "needs_retune"
+
+
+def test_verdict_reader_empty_when_only_strays(tmp_path):
+    import json as _json
+
+    from packages.sca.risk import _load_latest_validation_verdict
+
+    vdir = tmp_path / "validation"
+    vdir.mkdir()
+    (vdir / "notes.json").write_text(_json.dumps({"verdict": "x"}))
+    assert _load_latest_validation_verdict(vdir) == "unverified"
+
+
 def test_calibration_status_in_components(tmp_path, monkeypatch):
     """Every breakdown carries a ``calibration_status`` key so
     consumers can show a UI hint or refuse to ship the score.
 
     Hermetic: redirects the validation-report lookup at a tmp
     dir so this test's assertion is stable regardless of what's
-    under the in-tree ``data/calibration/validation/`` directory.
+    under the in-tree ``data/calibration/validation/`` directory
+    (the autouse ``_flushed_calibration_cache`` fixture owns the
+    cache flush on both sides).
     """
     from packages.sca import risk
-    risk._reset_calibration_cache_for_tests()
     monkeypatch.setattr(
         risk, "_load_latest_validation_verdict",
         lambda: "unverified",
@@ -340,14 +395,14 @@ class TestCalibrationStatusFromValidation:
     ``validation/<date>.json`` and surfaces its verdict in the
     components breakdown.
 
-    Tests use the test helper to flush the cache; in production the
-    verdict is read once per process.
+    The autouse ``_flushed_calibration_cache`` fixture flushes the
+    cache around every test; in production the verdict is read once
+    per process.
     """
 
     def _patch_validation_dir(self, monkeypatch, tmp_path):
         """Redirect the validation-reports lookup to a tmp dir."""
         from packages.sca import risk
-        risk._reset_calibration_cache_for_tests()
 
         # The lookup uses ``Path(__file__).resolve().parent /
         # "data" / "calibration" / "validation"``. Monkey-patch

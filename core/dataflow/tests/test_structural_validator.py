@@ -549,3 +549,325 @@ class TestSameFunctionSteps:
         # No call edge, no import link: anything but a confident
         # same-function confirmation.
         assert result.verdict != "confirmed" or result.confidence != "high"
+
+
+class TestReturnFlowLink:
+    """Return-flow hops: source inside a callee, next step in the
+    caller — the data comes BACK over the call's return value. The
+    reverse edge (caller → callee) is in the graph and must rescue
+    the link instead of refuting the path with high confidence."""
+
+    def test_reverse_edge_rescues_return_hop(self):
+        graph = FileCallGraph(
+            calls=[CallSite(line=6, chain=["get_input"], caller="handler")],
+        )
+        found, indirect = _check_call_link("get_input", "handler", graph)
+        assert found is True
+        assert indirect is False
+
+    def test_reverse_edge_not_used_cross_file(self):
+        # Cross-file stays inconclusive (never a confirm from a
+        # same-name edge in another file's graph).
+        graph = FileCallGraph(
+            calls=[CallSite(line=6, chain=["get_input"], caller="handler")],
+        )
+        found, _ = _check_call_link(
+            "get_input", "handler", graph, cross_file=True,
+        )
+        assert found is None
+
+    def test_no_edge_either_direction_still_refutes(self):
+        graph = FileCallGraph(
+            calls=[CallSite(line=5, chain=["other"], caller="handler")],
+        )
+        found, indirect = _check_call_link("get_input", "handler", graph)
+        assert found is False
+        assert indirect is False
+
+    def test_same_file_return_flow_not_refuted(self, tmp_path):
+        pytest.importorskip("tree_sitter")
+        pytest.importorskip("tree_sitter_python")
+        _write_py(tmp_path, "flow.py", """\
+            def get_input():
+                x = input()
+                return x
+
+
+            def handler():
+                x = get_input()
+                eval(x)
+        """)
+        path = _make_path(
+            _make_step("flow.py", 2),
+            _make_step("flow.py", 8),
+        )
+        result = validate_structurally(path, tmp_path, language="python")
+        assert result.verdict == "confirmed"
+
+    def test_forward_hop_control_still_confirms(self, tmp_path):
+        pytest.importorskip("tree_sitter")
+        pytest.importorskip("tree_sitter_python")
+        _write_py(tmp_path, "fwd.py", """\
+            def handler():
+                x = input()
+                process(x)
+
+
+            def process(x):
+                eval(x)
+        """)
+        path = _make_path(
+            _make_step("fwd.py", 2),
+            _make_step("fwd.py", 7),
+        )
+        result = validate_structurally(path, tmp_path, language="python")
+        assert result.verdict == "confirmed"
+
+
+# ── attribution divergence must abstain, never refute ───────────
+
+
+class TestAttributionDivergence:
+    """The span extractor and the call-graph extractor are two
+    attribution sources; when they diverge (JS arrow functions: span
+    says ``run``, the graph tags the calls ``caller=None``) the link
+    check filters on a name the graph never uses and finds vacuous
+    emptiness. That must land as inconclusive — a high-confidence
+    refutation feeds recommends_downgrade on an exploitable finding."""
+
+    HELPER_TAIL = "function helper(y) {\n  sink(y);\n}\n"
+
+    # Every fixture genuinely calls helper → sink, so "refuted" is
+    # always wrong; well-attributed shapes should stay confirmed.
+    LINKED_SHAPES = {
+        "arrow.js": (
+            "const run = (x) => {\n  helper(x);\n};\n", 2, 5),
+        "asyncarrow.js": (
+            "const run = async (x) => {\n  await helper(x);\n};\n", 2, 5),
+        "classmethod.js": (
+            "class App {\n  run(x) {\n    helper(x);\n  }\n}\n", 3, 7),
+        "iife.js": (
+            "const api = (function () {\n  function run(x) {\n"
+            "    helper(x);\n  }\n  return { run };\n})();\n", 3, 8),
+        "generator.js": (
+            "function* run(x) {\n  helper(x);\n  yield x;\n}\n", 2, 6),
+        "objmethod.js": (
+            "const app = {\n  run(x) {\n    helper(x);\n  },\n};\n", 3, 7),
+    }
+
+    @pytest.fixture(autouse=True)
+    def _need_js_grammar(self):
+        pytest.importorskip("tree_sitter")
+        pytest.importorskip("tree_sitter_javascript")
+
+    @pytest.mark.parametrize("name", sorted(LINKED_SHAPES))
+    def test_linked_js_shapes_are_never_refuted(self, tmp_path, name):
+        head, call_line, sink_line = self.LINKED_SHAPES[name]
+        (tmp_path / name).write_text(head + self.HELPER_TAIL)
+        path = _make_path(
+            _make_step(name, call_line), _make_step(name, sink_line),
+        )
+        result = validate_structurally(path, tmp_path)
+        assert result.verdict != "refuted", result.reasoning
+
+    def test_plain_function_control_still_confirms_high(self, tmp_path):
+        (tmp_path / "plain.js").write_text(
+            "function run(x) {\n  helper(x);\n}\n" + self.HELPER_TAIL,
+        )
+        path = _make_path(_make_step("plain.js", 2), _make_step("plain.js", 5))
+        result = validate_structurally(path, tmp_path)
+        assert result.verdict == "confirmed"
+        assert result.confidence == "high"
+
+    def test_truly_absent_edge_still_refutes(self, tmp_path):
+        """Two-direction: with clean attribution and a genuinely
+        missing edge, the refutation lane stays live."""
+        (tmp_path / "broken.js").write_text(
+            "function run(x) {\n  other(x);\n}\n" + self.HELPER_TAIL,
+        )
+        path = _make_path(
+            _make_step("broken.js", 2), _make_step("broken.js", 5),
+        )
+        result = validate_structurally(path, tmp_path)
+        assert result.verdict == "refuted"
+
+    def test_unresolved_attribution_downgrades_refutation_unit(self):
+        graph = FileCallGraph(
+            calls=[CallSite(chain=("helper",), line=2, caller=None)],
+            imports={}, indirection=False,
+        )
+        assert _check_call_link(
+            "run", "helper", graph, attribution_resolved=True,
+        ) == (False, False)
+        assert _check_call_link(
+            "run", "helper", graph, attribution_resolved=False,
+        ) == (None, False)
+
+    def test_extraction_failure_reads_as_unresolved(self, monkeypatch):
+        """from_func=None from a FAILED span extraction must not be
+        conflated with genuine module level."""
+        from core.dataflow.structural_validator import (
+            _enclosing_function_state,
+        )
+        import core.inventory.extractors as ex
+
+        def boom(*a, **k):
+            raise RuntimeError("grammar exploded")
+
+        monkeypatch.setattr(ex, "extract_functions", boom)
+        graph = FileCallGraph(calls=[], imports={}, indirection=False)
+        name, resolved = _enclosing_function_state(
+            1, graph, "function f() {}\n", "javascript",
+        )
+        assert name is None
+        assert resolved is False
+
+
+# ── sanitizer collection: window-bounded, deduped ────────────────
+
+
+class TestSanitizerWindow:
+    APP = (
+        "def handler(req):\n"
+        '    x = req.args["q"]\n'      # line 2 = source
+        '    y = x + "!"\n'            # line 3
+        "    render(y)\n"              # line 4 = sink
+        "    if False:\n"
+        "        z = escape_html(x)\n"     # line 6 — after the sink
+        "        validate_input(z)\n"      # line 7 — untaken branch
+        "    return y\n"
+    )
+
+    def _path(self):
+        return _make_path(
+            _make_step("app.py", 2, "req.args"),
+            _make_step("app.py", 4, "render"),
+            steps=[_make_step("app.py", 3)],
+        )
+
+    def test_calls_outside_source_sink_window_not_reported(self, tmp_path):
+        """Sanitizer-NAMED calls after the sink / on untaken branches
+        are not \"between source and sink\" — reporting them (and
+        multiplying them per step) steers the downstream LLM toward
+        not-exploitable on a hostile repo's planted names."""
+        (tmp_path / "app.py").write_text(self.APP)
+        result = validate_structurally(self._path(), tmp_path,
+                                       language="python")
+        assert result.verdict == "confirmed"
+        assert result.sanitizers == []
+        assert "sanitizer" not in result.reasoning
+
+    def test_in_window_sanitizer_reported_once(self, tmp_path):
+        """Two-direction: a sanitizer call inside the window is still
+        reported — exactly once, not once per step."""
+        app = self.APP.replace('y = x + "!"', "y = escape_html(x)")
+        (tmp_path / "app.py").write_text(app)
+        result = validate_structurally(self._path(), tmp_path,
+                                       language="python")
+        assert result.sanitizers == ["escape_html"]
+
+
+class TestCappedReads:
+    def test_read_file_content_routes_through_capped_reader(
+            self, tmp_path, monkeypatch):
+        """Step files are target-controlled; the read must pay the
+        shared size budget rather than materialise a planted
+        multi-hundred-MB file per finding."""
+        import core.dataflow.structural_validator as sv
+        seen: dict = {}
+
+        def fake_capped(path, *a, **k):
+            seen["path"] = Path(path)
+            return ("capped-content", False)
+
+        monkeypatch.setattr(sv, "read_text_capped", fake_capped)
+        p = tmp_path / "f.py"
+        p.write_text("x = 1\n")
+        assert sv._read_file_content(p) == "capped-content"
+        assert seen["path"] == p
+
+    def test_read_file_content_none_on_unreadable(self, tmp_path):
+        assert _read_file_content_missing(tmp_path) is None
+
+
+def _read_file_content_missing(tmp_path):
+    from core.dataflow.structural_validator import _read_file_content
+    return _read_file_content(tmp_path / "does-not-exist.py")
+
+
+# ── step cap + parse memoization (hostile-SARIF work bound) ─────
+
+
+class TestStepCap:
+    def _capped_path(self, nsteps: int) -> dict:
+        steps = [_make_step("big.py", 2 + k) for k in range(nsteps)]
+        return {
+            "source": _make_step("big.py", 2, "source"),
+            "sink": _make_step("big.py", 500, "sink"),
+            "steps": steps,
+        }
+
+    def test_over_cap_degrades_to_inconclusive(self, tmp_path):
+        from core.dataflow.structural_validator import MAX_STRUCTURAL_STEPS
+        _write_py(tmp_path, "big.py",
+                  "def f(x):\n" + "\n".join(
+                      f"    v{i} = x" for i in range(600)) + "\n")
+        res = validate_structurally(
+            self._capped_path(MAX_STRUCTURAL_STEPS + 10), tmp_path,
+            language="python")
+        assert res.verdict == "inconclusive"
+        assert str(MAX_STRUCTURAL_STEPS) in res.reasoning
+        assert "step" in res.reasoning.lower()
+        # No per-step evidence was built — the walk never started.
+        assert res.evidence == []
+
+    def test_at_cap_still_validates(self, tmp_path):
+        from core.dataflow.structural_validator import MAX_STRUCTURAL_STEPS
+        _write_py(tmp_path, "big.py",
+                  "def f(x):\n" + "\n".join(
+                      f"    v{i} = x" for i in range(600)) + "\n")
+        res = validate_structurally(
+            self._capped_path(MAX_STRUCTURAL_STEPS - 2), tmp_path,
+            language="python")
+        assert res.evidence  # the walk ran
+
+    def test_cap_matches_prescreen_convention(self):
+        from core.dataflow.injection_prescreen import MAX_PRESCREEN_STEPS
+        from core.dataflow.structural_validator import MAX_STRUCTURAL_STEPS
+        # Both SARIF-path consumers refuse pathological paths at the
+        # same size, so a path accepted by one is never silently
+        # rejected by the other.
+        assert MAX_STRUCTURAL_STEPS == MAX_PRESCREEN_STEPS
+
+
+class TestEnclosingFunctionMemo:
+    def test_span_extraction_parses_each_file_once(
+            self, tmp_path, monkeypatch):
+        """Module-level steps take the extract_functions span path;
+        pre-memo every step re-parsed the whole file (O(steps × parse)
+        — 256 steps on a 20k-line file cost minutes of wall time)."""
+        import core.dataflow.structural_validator as sv
+        import core.inventory.extractors as ex
+
+        real = ex.extract_functions
+        calls: list[str] = []
+
+        def counting(filepath, language, content):
+            calls.append(filepath)
+            return real(filepath, language, content)
+
+        monkeypatch.setattr(ex, "extract_functions", counting)
+        sv._extract_functions_cached.cache_clear()
+
+        # Module-level calls: the call graph attributes them to no
+        # caller, forcing the span lookup on every step.
+        _write_py(tmp_path, "mod.py",
+                  "\n".join(f"print({i})" for i in range(1, 30)) + "\n")
+        path = {
+            "source": _make_step("mod.py", 1, "source"),
+            "sink": _make_step("mod.py", 29, "sink"),
+            "steps": [_make_step("mod.py", 2 + k) for k in range(10)],
+        }
+        res = validate_structurally(path, tmp_path, language="python")
+        assert res.evidence  # the walk ran and hit the span path
+        assert len(calls) == 1

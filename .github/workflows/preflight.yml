@@ -11,9 +11,9 @@ name: PR preflight
 #                           (.github/scripts/hide_modules.py). A changed
 #                           test touching them must SKIP, not fail.
 #   hidden-tree-sitter    — tree-sitter core + every grammar wheel
-#                           pinned in requirements-grammars.txt, same
-#                           mechanism (the set derives from the pin
-#                           file, so new wheels are hidden
+#                           pinned in pyproject.toml, same mechanism
+#                           (the set derives from the dependency group,
+#                           so new wheels are hidden
 #                           automatically).
 #   duration-guard        — RAPTOR_MAX_TEST_SECONDS over the changed
 #                           files (root conftest.py flag-not-kill
@@ -46,7 +46,9 @@ env:
   # Same CI hang net as tests.yml: dump every Python stack if a single
   # test runs >120s, then let it continue.
   PYTEST_ADDOPTS: "-o faulthandler_timeout=120"
-  # See tests.yml: several pinned JS actions still declare node20.
+  # See tests.yml: every JS action pinned here declares node24 now;
+  # kept as a regression guard until the repo's last node20 action
+  # (actions/delete-package-versions) ships a Node 24 release.
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 permissions:
@@ -76,14 +78,31 @@ jobs:
           out=/tmp/changed_files.txt
           # ``?`` + ``// []`` suppress jq's null-iteration error on
           # truncated or error-object responses (same defence as
-          # tests.yml). "No list" leaves the file empty and the scope
-          # step reports run=false: unlike the main suite there is no
-          # full-dispatch fallback, because running the entire suite
-          # under six simulations is exactly the latency this
-          # workflow's changed-file bound exists to avoid.
-          gh api --paginate \
-            "repos/${REPO}/pulls/${PR_NUMBER}/files" \
-            --jq '(. // [])[]?.filename' > "$out" || : > "$out"
+          # tests.yml). A TRUNCATED list still degrades to skip: unlike
+          # the main suite there is no full-dispatch fallback, because
+          # running the entire suite under six simulations is exactly
+          # the latency this workflow's changed-file bound exists to
+          # avoid. A hard ``gh api`` failure is different — an empty
+          # file would silently skip every simulation leg and let
+          # preflight-passed go green (skipped-is-pass), so retry it and
+          # then fail the step loudly instead of passing on no data.
+          ok=false
+          for attempt in 1 2 3; do
+            if gh api --paginate \
+                 "repos/${REPO}/pulls/${PR_NUMBER}/files" \
+                 --jq '(. // [])[]?.filename' > "$out"; then
+              ok=true
+              break
+            fi
+            echo "::warning::gh api attempt ${attempt} failed; retrying"
+            sleep $(( attempt * 10 ))
+          done
+          if [ "$ok" != "true" ]; then
+            echo "::error::could not list the PR's changed files" \
+              "(GitHub API failure) — refusing to skip the preflight" \
+              "simulations on missing data; re-run this job."
+            exit 1
+          fi
           echo "Changed files ($(wc -l < "$out")):"
           cat "$out"
 
@@ -133,15 +152,13 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
         with:
           enable-cache: true
-          cache-dependency-glob: "requirements*.txt"
+          cache-dependency-glob: "uv.lock"
 
       - name: Install deps
-        # --system matches _tier.yml's runner path: deps land in the
-        # setup-python interpreter, no venv activation needed.
-        run: uv pip install --system -r requirements-dev.txt
+        run: uv sync --locked
 
       - name: Run changed tests under simulation
         env:
@@ -172,7 +189,7 @@ jobs:
           # Single process (no -n auto): honest per-test durations for
           # the duration-guard leg and one deterministic order for the
           # shuffle legs; the changed-file bound keeps this cheap.
-          python -m pytest $TEST_FILES || rc=$?
+          uv run --locked python -m pytest $TEST_FILES || rc=$?
           # Exit 5 = "no tests collected" — legitimate when every
           # changed test file is deselected by the default markers
           # (slow / integration).

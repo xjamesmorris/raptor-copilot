@@ -71,8 +71,14 @@ _REFUSAL_PATTERNS: tuple[re.Pattern[str], ...] = (
         r"(guidelines|policy|policies|usage\s+policy)\b",
         re.IGNORECASE,
     ),
+    # The gap between the persona phrase and the refusal keyword is
+    # bounded: with an unbounded gap, response text repeating the
+    # persona phrase makes every occurrence re-scan the rest of the
+    # line — quadratic. Real refusals keep the keyword nearby; 200
+    # chars is generous (beyond it the refusal is not classified).
     re.compile(
-        r"\b(as\s+an\s+AI|as\s+a\s+language\s+model)\b.*?\b(cannot|can'?t|won'?t)\b",
+        r"\b(as\s+an\s+AI|as\s+a\s+language\s+model)\b"
+        r".{0,200}?\b(cannot|can'?t|won'?t)\b",
         re.IGNORECASE,
     ),
     re.compile(r"\bI\s+don'?t\s+feel\s+comfortable\b", re.IGNORECASE),
@@ -100,7 +106,10 @@ _REFUSAL_PATTERNS: tuple[re.Pattern[str], ...] = (
     # "unable to help|assist") and "violate our Usage Policy" (not "violate
     # the/my/Anthropic's policy"), so the patterns above don't match. These two
     # patterns close that gap.
-    re.compile(r"\bAPI\s+Error:.*?\bunable\s+to\s+respond\b", re.IGNORECASE),
+    # Bounded gap: same scan-restart rationale as the persona
+    # pattern above.
+    re.compile(r"\bAPI\s+Error:.{0,200}?\bunable\s+to\s+respond\b",
+               re.IGNORECASE),
     re.compile(r"\bviolat(?:e|es)\s+(?:our|the)\s+Usage\s+Policy\b", re.IGNORECASE),
 )
 
@@ -270,26 +279,46 @@ def _classify_retry(event: RefusalEvent, followups: list[dict[str, Any]]) -> str
     return "no_followup"
 
 
+def _defuse_fences(s: str) -> str:
+    """ZWSP inside 3+ backtick runs so LLM-derived text can neither
+    CLOSE the surrounding fenced block nor OPEN a new fence in the
+    rendered log (same technique as sanitise_code / cve_diff's
+    _neutralize_diff_fence)."""
+    return re.sub(
+        r"`{3,}",
+        lambda m: "``\u200b" + "`" * (len(m.group(0)) - 2),
+        s,
+    )
+
+
 def _render_turn_line(rec: dict[str, Any]) -> str:
-    """One compact line summarizing a turn event for the markdown log."""
+    """One compact line summarizing a turn event for the markdown log.
+
+    ``repr()`` escapes control bytes in the LLM-derived fields but NOT
+    backticks — a 3+ backtick run inside the repr'd text can still open
+    a fence in the rendered log, so the whole line goes through the
+    fence defuser (refusal_text's own block has the same treatment).
+    """
     kind = rec.get("kind", "?")
     turn = rec.get("turn", "?")
     if kind == "assistant_tool_use":
         tn = rec.get("tool_name", "?")
         inp = rec.get("input")
-        return f"  - turn {turn}: assistant tool_use `{tn}` input={inp!r}"
-    if kind == "tool_result":
+        line = f"  - turn {turn}: assistant tool_use `{tn}` input={inp!r}"
+    elif kind == "tool_result":
         tn = rec.get("tool_name", "?")
         preview = str(rec.get("result_preview", ""))[:240]
-        return f"  - turn {turn}: tool_result `{tn}` -> {preview!r}"
-    if kind == "assistant_text":
+        line = f"  - turn {turn}: tool_result `{tn}` -> {preview!r}"
+    elif kind == "assistant_text":
         text = str(rec.get("text", ""))[:240]
-        return f"  - turn {turn}: assistant_text {text!r}"
-    if kind == "result":
+        line = f"  - turn {turn}: assistant_text {text!r}"
+    elif kind == "result":
         stop = rec.get("stop_reason", "")
         cost = rec.get("total_cost_usd", 0.0)
-        return f"  - turn {turn}: RESULT stop={stop!r} cost_usd={cost}"
-    return f"  - turn {turn}: {kind} {rec!r}"
+        line = f"  - turn {turn}: RESULT stop={stop!r} cost_usd={cost}"
+    else:
+        line = f"  - turn {turn}: {kind} {rec!r}"
+    return _defuse_fences(line)
 
 
 def _escape_terminal_codes(s: str) -> str:
@@ -320,6 +349,12 @@ def _escape_terminal_codes(s: str) -> str:
 def _render_event(event: RefusalEvent, recovery: str | None = None) -> str:
     """Render one event as a markdown section for refusals-log.md."""
     safe_refusal_text = _escape_terminal_codes(event.refusal_text)
+    # Fence-break defence: a 3+ backtick run in the refusal text would
+    # close the surrounding ``` block and spill the rest of the log
+    # entry as live markdown. ZWSP after the second backtick defangs
+    # the fence token without changing the monospace render (same
+    # technique as sanitise_code / cve_diff's _neutralize_diff_fence).
+    safe_refusal_text = _defuse_fences(safe_refusal_text)
     label = f"{event.cve_id}@{event.run_id}:turn{event.turn}"
     tool_block = (
         f"\n**Tool call in scope:** `{event.tool_call.get('name', '<unknown>')}` "

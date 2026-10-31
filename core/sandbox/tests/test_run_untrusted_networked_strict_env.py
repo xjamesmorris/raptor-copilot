@@ -27,6 +27,10 @@ def test_run_untrusted_networked_forwards_strict_env(monkeypatch, tmp_path):
         return _Stub()
 
     monkeypatch.setattr(_ctx, "run", fake_run)
+    # The darwin arm of run_untrusted's entry gate smoke-tests the REAL
+    # host's sandbox-exec; pretend it holds so the forwarding under test
+    # is reached on every platform (including emulated-darwin runs).
+    monkeypatch.setattr(_ctx, "check_seatbelt_available", lambda: True)
 
     _ctx.run_untrusted_networked(
         ["echo", "ok"],
@@ -53,7 +57,7 @@ def test_run_untrusted_networked_forwards_strict_env(monkeypatch, tmp_path):
 
 
 @requires_userns
-def test_run_untrusted_rejects_caller_strict_env(tmp_path):
+def test_run_untrusted_rejects_caller_strict_env(tmp_path, monkeypatch):
     """Caller passing strict_env= must get the clean guard message, not
     a confusing "multiple values for keyword argument" TypeError.
 
@@ -62,6 +66,8 @@ def test_run_untrusted_rejects_caller_strict_env(tmp_path):
     misuse) or collide with the wire (TypeError that doesn't name the
     real problem). The forbidden-kwargs guard surfaces the misuse.
     """
+    # Entry-gate stub, same rationale as the forwarding test above.
+    monkeypatch.setattr(_ctx, "check_seatbelt_available", lambda: True)
     with pytest.raises(TypeError, match="strict_env"):
         _ctx.run_untrusted(
             ["echo", "ok"],
@@ -72,8 +78,10 @@ def test_run_untrusted_rejects_caller_strict_env(tmp_path):
 
 
 @requires_userns
-def test_run_untrusted_networked_rejects_caller_strict_env(tmp_path):
+def test_run_untrusted_networked_rejects_caller_strict_env(tmp_path, monkeypatch):
     """Same defensive parity for the networked variant."""
+    # Entry-gate stub, same rationale as the forwarding test above.
+    monkeypatch.setattr(_ctx, "check_seatbelt_available", lambda: True)
     with pytest.raises(TypeError, match="strict_env"):
         _ctx.run_untrusted_networked(
             ["echo", "ok"],

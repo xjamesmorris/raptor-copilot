@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import logging
 
+import pytest
+
 from core.analysis.test_discovery import _find_test_files, discover_tests
 
 
@@ -135,6 +137,179 @@ class TestCFamilySupport:
         assert "buf_grow" in result
         for noise in ("if", "for", "memset", "sizeof", "return"):
             assert noise not in result
+
+
+class TestPhpSupport:
+    def test_phpunit_class_convention(self, tmp_path):
+        """tests/<Name>Test.php with camelCase test methods and
+        $this->assert* assertions."""
+        tests = tmp_path / "tests"
+        tests.mkdir()
+        (tests / "UserStoreTest.php").write_text(
+            "<?php\n"
+            "class UserStoreTest extends TestCase {\n"
+            "    public function testFindUser(): void {\n"
+            "        $store = new UserStore();\n"
+            "        $user = $store->findUser(7);\n"
+            "        $this->assertSame(7, $user['id']);\n"
+            "    }\n"
+            "}\n",
+        )
+        files, skipped = _find_test_files(tmp_path)
+        assert len(files) == 1
+        assert skipped == 0
+
+        result = discover_tests(tmp_path)
+        assert "findUser" in result
+        tc = result["findUser"][0]
+        assert tc.test_function == "testFindUser"
+        assert any("assertSame" in a for a in tc.assertions)
+
+    def test_suffix_convention_outside_test_dirs(self, tmp_path):
+        """A *Test.php beside the source it tests (no tests/ dir) is
+        still discovered via the file-name convention."""
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "ValidatorTest.php").write_text(
+            "<?php\n"
+            "class ValidatorTest extends TestCase {\n"
+            "    public function testSanitize(): void {\n"
+            "        static::assertTrue(sanitize('<b>x</b>') === 'x');\n"
+            "    }\n"
+            "}\n",
+        )
+        result = discover_tests(tmp_path)
+        assert "sanitize" in result
+        assert any(
+            "assertTrue" in a for a in result["sanitize"][0].assertions
+        )
+
+    def test_snake_case_function_and_bare_assert(self, tmp_path):
+        tests = tmp_path / "tests"
+        tests.mkdir()
+        (tests / "helpers.php").write_text(
+            "<?php\n"
+            "function test_render_widget() {\n"
+            "    $out = render_widget(['id' => 3]);\n"
+            "    assert($out !== '');\n"
+            "}\n",
+        )
+        result = discover_tests(tmp_path)
+        assert "render_widget" in result
+        assert any(
+            "assert(" in a for a in result["render_widget"][0].assertions
+        )
+
+    def test_php_constructs_not_inferred_as_targets(self, tmp_path):
+        tests = tmp_path / "tests"
+        tests.mkdir()
+        (tests / "EdgeTest.php").write_text(
+            "<?php\n"
+            "class EdgeTest extends TestCase {\n"
+            "    public function testParseHeader(): void {\n"
+            "        $h = parse_header($raw);\n"
+            "        if (isset($h['len']) && !empty($h)) {\n"
+            "            $n = count($h);\n"
+            "        }\n"
+            "        $this->assertGreaterThan(0, count($h));\n"
+            "    }\n"
+            "}\n",
+        )
+        result = discover_tests(tmp_path)
+        assert "parse_header" in result
+        for noise in ("isset", "empty", "count"):
+            assert noise not in result
+
+    def test_helper_named_tester_is_not_a_test(self, tmp_path):
+        """Only test_ / test[A-Z] openers count — a lowercase
+        continuation (tester, testify) is a helper, not a test."""
+        tests = tmp_path / "tests"
+        tests.mkdir()
+        (tests / "MiscTest.php").write_text(
+            "<?php\n"
+            "function tester($x) {\n"
+            "    return frobnicate($x);\n"
+            "}\n",
+        )
+        result = discover_tests(tmp_path)
+        assert result == {}
+
+    def test_expectation_setup_not_a_target(self, tmp_path):
+        tests = tmp_path / "tests"
+        tests.mkdir()
+        (tests / "FailTest.php").write_text(
+            "<?php\n"
+            "class FailTest extends TestCase {\n"
+            "    public function testRejectsBadKey(): void {\n"
+            "        $this->expectException(ValueError::class);\n"
+            "        decode_key('bogus');\n"
+            "    }\n"
+            "}\n",
+        )
+        result = discover_tests(tmp_path)
+        assert "decode_key" in result
+        assert "expectException" not in result
+
+    def test_php_files_not_counted_as_skipped(self, tmp_path):
+        tests = _make_unsupported_suite(tmp_path, 2)
+        (tests / "AlphaTest.php").write_text(
+            "<?php\n"
+            "class AlphaTest extends TestCase {\n"
+            "    public function testAlpha(): void {\n"
+            "        $this->assertSame(2, alpha(1));\n"
+            "    }\n"
+            "}\n",
+        )
+        files, skipped = _find_test_files(tmp_path)
+        assert [f.name for f in files] == ["AlphaTest.php"]
+        assert skipped == 2
+
+
+class TestCamelAndNoiseAreSuffixScoped:
+    """The PHPUnit camel opener and the PHP builtin stoplist apply to
+    .php files only — other ecosystems use lowercase-test camel names
+    for HELPERS (Go acceptance testAccCheck*, JS testSetup), and the
+    PHP builtin names are legitimate project functions elsewhere."""
+
+    def test_go_acceptance_helper_is_not_a_test(self, tmp_path):
+        tests = tmp_path / "tests"
+        tests.mkdir()
+        (tests / "widget_test.go").write_text(
+            "package widget\n"
+            "\n"
+            "func testAccCheckWidgetExists(n string) error {\n"
+            "\treturn errors.New(n)\n"
+            "}\n",
+        )
+        result = discover_tests(tmp_path)
+        assert result == {}
+
+    def test_python_project_count_function_kept(self, tmp_path):
+        tests = tmp_path / "tests"
+        tests.mkdir()
+        (tests / "test_stats.py").write_text(
+            "def test_totals():\n"
+            "    assert count(items) == 3\n"
+            "    assert sprintf(fmt, 1) == 'x'\n",
+        )
+        result = discover_tests(tmp_path)
+        assert "count" in result
+        assert "sprintf" in result
+
+    def test_php_still_gets_camel_and_noise_scoping(self, tmp_path):
+        tests = tmp_path / "tests"
+        tests.mkdir()
+        (tests / "SumTest.php").write_text(
+            "<?php\n"
+            "class SumTest extends TestCase {\n"
+            "    public function testSumRows(): void {\n"
+            "        $this->assertSame(3, sum_rows(count($rows)));\n"
+            "    }\n"
+            "}\n",
+        )
+        result = discover_tests(tmp_path)
+        assert "sum_rows" in result
+        assert "count" not in result
 
 
 class TestSummaryMessage:
@@ -313,3 +488,244 @@ class TestTestDiscoveryPrepCache:
         result = td.discover_tests_cached(target, out)
         assert "alpha" in result
         assert result["alpha"][0].assertions
+
+
+class TestHostileTreeRobustness:
+    def test_dangling_symlink_does_not_abort_discovery(self, tmp_path):
+        """os.walk lists a dangling symlink as a file; the unguarded
+        stat() used to raise OSError and abort the whole discovery
+        pass — ALL test evidence for the target lost over one entry."""
+        tests = tmp_path / "tests"
+        tests.mkdir()
+        (tests / "test_real.py").write_text(
+            "def test_alpha():\n    assert alpha(1) == 2\n",
+        )
+        (tests / "test_dangling.py").symlink_to(tmp_path / "nowhere.py")
+        files, _skipped = _find_test_files(tmp_path)
+        assert [f.name for f in files] == ["test_real.py"]
+
+    def test_vendored_trees_are_pruned_not_walked(self, tmp_path, monkeypatch):
+        """node_modules/.git subtrees must be pruned in place — the
+        old `continue` still descended them."""
+        import os as _os
+
+        deep = tmp_path / "node_modules" / "a" / "b" / "c"
+        deep.mkdir(parents=True)
+        (deep / "test_x.py").write_text("def test_x():\n    pass\n")
+        visited = []
+        real_walk = _os.walk
+
+        def spy_walk(top, *a, **k):
+            for root, dirs, files in real_walk(top, *a, **k):
+                visited.append(root)
+                yield root, dirs, files
+
+        monkeypatch.setattr(_os, "walk", spy_walk)
+        files, _ = _find_test_files(tmp_path)
+        assert files == []
+        assert not any("node_modules" in v and v != str(tmp_path)
+                       for v in visited if "node_modules" in v.split(_os.sep)[1:])
+
+
+# One direction pair per language family discovery reads: the same
+# test body placed loose (src/) and under tests/ must both be admitted
+# (the file is still code under review) with opposite location
+# provenance. File names follow each family's loose-file convention so
+# the _TEST_FILE_PATTERNS admission path is the one exercised.
+_FAMILY_FIXTURES = [
+    ("test_target.py",
+     "def test_target():\n    assert target() == 1\n"),
+    ("test_target.js",
+     "function test_target() {\n  expect(target()).toBe(1)\n}\n"),
+    ("test_target.ts",
+     "function test_target() {\n  expect(target()).toBe(1)\n}\n"),
+    ("target_test.go",
+     "func test_target(t *testing.T) {\n"
+     "\tassert.Equal(t, 1, target())\n}\n"),
+    ("target_test.rs",
+     "fn test_target() {\n    assert!(target() == 1);\n}\n"),
+    ("test_target.rb",
+     "def test_target\n  assert_equal 1, target()\nend\n"),
+    ("test_target.java",
+     "static void test_target() {\n    assertEquals(1, target());\n}\n"),
+    ("target_test.c",
+     "static void test_target(void) {\n\tassert(target() == 1);\n}\n"),
+    ("PayloadTest.php",
+     "<?php\n"
+     "class PayloadTest extends TestCase {\n"
+     "    public function testTarget(): void {\n"
+     "        $this->assertSame(1, target());\n"
+     "    }\n"
+     "}\n"),
+]
+
+
+class TestLocationProvenance:
+    """A hostile repo can plant a loose test_* / *_test file next to
+    production code; the defining file's location is the only
+    mechanical provenance signal, so every discovered case carries
+    ``in_test_tree``. Discovery admission itself is unchanged — the
+    demotion happens downstream in spec inference."""
+
+    @pytest.mark.parametrize("fname,body", _FAMILY_FIXTURES)
+    def test_loose_vs_intree_direction_pair(self, tmp_path, fname, body):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / fname).write_text(body)
+        tests = tmp_path / "tests"
+        tests.mkdir()
+        (tests / fname).write_text(body)
+
+        result = discover_tests(tmp_path)
+        assert "target" in result
+        by_location = {tc.test_file: tc.in_test_tree
+                       for tc in result["target"]}
+        assert by_location[f"src/{fname}"] is False
+        assert by_location[f"tests/{fname}"] is True
+
+    def test_provenance_survives_the_prep_cache(self, tmp_path, monkeypatch):
+        import core.analysis.test_discovery as td
+
+        target = tmp_path / "target"
+        (target / "tests").mkdir(parents=True)
+        (target / "tests" / "test_mod.py").write_text(
+            "def test_alpha():\n    assert alpha(1) == 2\n",
+        )
+        (target / "src").mkdir()
+        (target / "src" / "test_loose.py").write_text(
+            "def test_beta():\n    assert beta(0) == 1\n",
+        )
+        out = tmp_path / "out"
+        out.mkdir()
+        first = td.discover_tests_cached(target, out)
+        assert first["alpha"][0].in_test_tree is True
+        assert first["beta"][0].in_test_tree is False
+
+        monkeypatch.setattr(
+            td, "discover_tests",
+            lambda *a, **kw: pytest.fail("cache hit must skip the scan"),
+        )
+        second = td.discover_tests_cached(target, out)
+        assert second["alpha"][0].in_test_tree is True
+        assert second["beta"][0].in_test_tree is False
+
+    def test_t_dir_is_a_recognized_test_tree(self, tmp_path):
+        # Perl / git convention: the suite lives under t/. Without the
+        # exact-name pattern, those ecosystems' entire curated suites
+        # would carry loose-file provenance.
+        t = tmp_path / "t"
+        t.mkdir()
+        (t / "0001-basic.py").write_text(
+            "def test_target():\n    assert target() == 1\n",
+        )
+        result = discover_tests(tmp_path)
+        assert result["target"][0].in_test_tree is True
+
+    def test_symlink_escaping_the_root_loses_intree_provenance(
+        self, tmp_path,
+    ):
+        # A tests/-dir symlink whose target resolves outside the repo
+        # root serves content the repo's test tree does not contain:
+        # discovery still reads it, but it must not inherit in-tree
+        # trust from the symlink's location.
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "real_test.py").write_text(
+            "def test_alpha():\n    assert alpha(1) == 2\n",
+        )
+        repo = tmp_path / "repo"
+        tests = repo / "tests"
+        tests.mkdir(parents=True)
+        (tests / "test_link.py").symlink_to(outside / "real_test.py")
+        (tests / "test_real.py").write_text(
+            "def test_beta():\n    assert beta(0) == 1\n",
+        )
+
+        result = discover_tests(repo)
+        assert result["alpha"][0].in_test_tree is False
+        assert result["beta"][0].in_test_tree is True
+
+    def test_pre_provenance_cache_rescans_not_guesses(self, tmp_path):
+        import json as _json
+
+        import core.analysis.test_discovery as td
+
+        target = tmp_path / "target"
+        (target / "tests").mkdir(parents=True)
+        (target / "tests" / "test_mod.py").write_text(
+            "def test_alpha():\n    assert alpha(1) == 2\n",
+        )
+        out = tmp_path / "out"
+        (out / "prep-cache").mkdir(parents=True)
+        fp = td._test_tree_fingerprint(target.resolve())
+        # Fingerprint-matching cache written before the provenance
+        # field existed: no location trust grade to reload, so the
+        # mapping must be recomputed from disk — never guessed.
+        (out / "prep-cache" / "test-discovery-cache.json").write_text(
+            _json.dumps({
+                "fingerprint": fp,
+                "payload": {"alpha": [{
+                    "test_file": "tests/test_mod.py",
+                    "test_function": "test_alpha",
+                    "target_function": "alpha",
+                    "assertions": ["assert alpha(1) == 2"],
+                }]},
+            }),
+        )
+        result = td.discover_tests_cached(target, out)
+        assert result["alpha"][0].in_test_tree is True
+
+
+class TestFileCapOrdering:
+    """The 500-file result cap used to be walk-ordered: a flood of
+    planted loose test files that the walk visits before tests/ would
+    evict the entire curated suite from the capped set — defeating any
+    downstream trust grading at the file level. In-tree files take the
+    cap first."""
+
+    def test_loose_flood_cannot_evict_the_curated_suite(self, tmp_path):
+        src = tmp_path / "aaa_src"  # sorts (and walks) before tests/
+        src.mkdir()
+        for i in range(600):
+            (src / f"test_planted_{i:03d}.py").write_text(
+                f"def test_planted_{i:03d}():\n    assert True\n",
+            )
+        tests = tmp_path / "tests"
+        tests.mkdir()
+        (tests / "test_real.py").write_text(
+            "def test_alpha():\n    assert alpha(1) == 2\n",
+        )
+
+        files, _skipped = _find_test_files(tmp_path)
+        assert len(files) == 500
+        assert files[0].name == "test_real.py"
+
+        result = discover_tests(tmp_path)
+        assert result["alpha"][0].in_test_tree is True
+
+    def test_loose_files_still_fill_the_cap_when_alone(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        for i in range(3):
+            (src / f"test_loose_{i}.py").write_text(
+                f"def test_loose_{i}():\n    assert True\n",
+            )
+        files, _skipped = _find_test_files(tmp_path)
+        assert len(files) == 3
+
+
+class TestDirPatternBoundaries:
+    def test_lookalike_dirs_are_not_test_trees(self):
+        from core.analysis.test_discovery import _dir_matches_test_pattern
+        # `t` matches by exact name only — its separator variants
+        # would claim far too much.
+        for part in ("special", "testimonials", "spectrum",
+                     "testament", "tt", "t2", "t_shirt", "t-mobile"):
+            assert not _dir_matches_test_pattern(part), part
+
+    def test_real_test_dirs_still_match(self):
+        from core.analysis.test_discovery import _dir_matches_test_pattern
+        for part in ("tests", "test", "testing", "test_unit",
+                     "tests-integration", "spec", "specs", "regress",
+                     "t"):
+            assert _dir_matches_test_pattern(part), part

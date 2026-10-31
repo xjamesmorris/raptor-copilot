@@ -265,6 +265,50 @@ Run tokens accept any unique substring of a run id (`v4` matches
 `corpus-full-v4`). Corrupt store lines are skipped with a warning —
 one bad line never kills reads over the rest of the store.
 
+## Baseline runs before detection-affecting changes
+
+Before landing a change that can move detection results (rules,
+gates, thresholds, prompts, channel logic), freeze a baseline so the
+after-the-change delta is attributable to the change:
+
+1. **Pick the milestone measurement set** — the calibration corpus
+   (`run_corpus`, cold profile is the default) and/or the relevant
+   recall manifests (`core/recall/scripts/recall-measure run`). Use
+   the same pinned fixtures and manifests on both sides. Held-out
+   manifests keep their doctrine: a baseline run there is a
+   first-contact datapoint, never a tuning input.
+2. **Record the run's LLM traffic with the transcript recorder** —
+   `RAPTOR_LLM_TRANSCRIPT=record:<out>/llm-transcript.jsonl` (see
+   docs/llm.md) — so the run's model behaviour is frozen alongside
+   its results and pipeline-side changes can later be re-run against
+   it hermetically (`replay:` mode). Verify the recorder is present
+   in the running checkout first (the variable appears in
+   docs/environment.md when it is) — an unknown variable is silently
+   ignored, and a baseline believed recorded but not is
+   unreproducible. The corpus runner's own LLM passes (probe,
+   phase 2 / 2b) and the audit pipeline construct their clients
+   through the transcript seam, so record mode covers the whole run;
+   a `constructs a plain LLMClient outside the transcript seam`
+   warning in the run log means some surface under-recorded — treat
+   the transcript as incomplete. After the run, confirm the
+   transcript is non-empty (`wc -l <out>/llm-transcript.jsonl`)
+   before freezing it. Scan-profile recall runs are LLM-free and
+   need no transcript.
+3. **Freeze the artifacts**: `results.json` / `report.json`, the
+   transcript, and the run-history record, together with the
+   identity stamps that make them comparable — the pipeline tree
+   sha, `label_files_sha256`, and the profile/selection stamps in
+   the history header. Archive to a durable location (never a
+   scratch dir).
+4. **After the change lands**, re-run the same set at the same pins
+   and read the deltas through the comparison tools:
+   `recall-measure compare <base-report> <new-report>` and
+   `python3 -m core.audit.corpus.history compare <base> <new>`.
+
+The baseline is an operator action at a run boundary — record it
+before the first detection-affecting change of a series, not
+mid-series.
+
 ## Rule verification (mechanical, no LLM)
 
 `rule_eval` runs the deterministic rule inventories — the shipped
@@ -325,6 +369,46 @@ Skips are never failures: missing fixtures, absent engines
 (`semgrep` / `spatch` / `codeql` not installed), and per-repo
 infeasibility all land in the skip taxonomy, mirroring `run_corpus`.
 
+## Per-channel micro-corpora (`channels/`)
+
+Each audit channel (an orchestrator channel, refutation gate, or
+mechanical detector — the same mechanism-token vocabulary
+`expected_mechanism` draws from) can carry its own local
+micro-corpus: a handful of labels that exercise exactly that
+channel, refired after every change to it without a full corpus run.
+
+Layout mirrors the main labels dir; content is local, exactly like
+`labels/` — the tree ships machinery only:
+
+```
+core/audit/corpus/channels/<channel>/<bug_class>/<name>.label.json
+```
+
+`<channel>` is a mechanism token (`[a-z0-9_]+`). Labels may carry an
+explicit `channel` field; when present it must agree with the
+directory the label lives under (the loader refuses a mismatch,
+never reconciles it), and when absent the directory is the channel.
+The same `function_id` may appear in different channels'
+micro-corpora — per-channel loads are isolated; only loading one
+dir with a duplicate inside it fails.
+
+Consumption:
+
+- `core.audit.corpus.channels.load_channel_labels("<channel>")` —
+  programmatic load (fails closed on a missing channel dir, listing
+  the available ones);
+- `python3 -m core.audit.corpus.lint channels/<channel>` — the
+  linter takes explicit paths, so channel corpora get the same
+  schema/pin checks as the packaged labels;
+- `group_labels_by_channel(...)` — field-based grouping of an
+  already-loaded mixed set (`""` is the unchanneled bucket, never
+  defaulted into a named channel).
+
+The corpus runner keeps reading the packaged `labels/` dir; channel
+dirs never join a full-corpus run implicitly. Any tool that re-wraps
+channel labels or results meta must carry kind/tag fields verbatim
+and refuse on mismatch — never default them.
+
 ## Adding a label
 
 1. Write the `.label.json` under `labels/<bug_class>/` (see
@@ -334,6 +418,68 @@ infeasibility all land in the skip taxonomy, mirroring `run_corpus`.
 3. `python3 -m core.audit.corpus.run_corpus --dry-run` — per-label
    source status is printed inline; a file found under a known prefix
    (e.g. `src/`) suggests the corrected path.
+
+## Synthetic mutants (regression floors, never recall estimates)
+
+`python3 -m core.audit.corpus.mutate` generates labels by applying
+ONE mechanical mutation to ONE member of a peer family the
+consistency census scores consistent at a pinned clean upstream ref.
+Operators, each mapped to a census dimension: `drop-guard`
+(guard-presence), `swap-order` (ordering), `remove-pair-release`
+(cleanup), `drop-return-check` (return-usage census), `flip-bound`
+(guard-predicate), `drop-slot-guard` (interface — the guard drop
+exercised through an interface-slot peer family), and
+`drop-case-arm` (enum-switch completeness; `--callee` names the case
+label).
+
+**Honesty framing (binding).** Mutant numbers are mutation-operator
+regression floors conditioned on family-found — an end-to-end
+plumbing harness (family formation → census → thresholds → lead),
+NOT a real-bug recall estimate. Dimension gates on mutants alone
+certify self-consistency only. The circularity breaker is the
+complementary REAL label set (incomplete-fix / missed-variant CVEs
+labelled at the pre-fix ref with `cve`/`fix_commit` + `peer_set`,
+plus intentional-divergence `clean` labels for the FP side) — those
+are ordinary `consistency`-class labels, not mutants. No-op specs
+(the applied result hashes identical to the parent pin) are refused
+at schema, generation, and application — a no-op label could
+re-declare pristine upstream code carrying a real bug as
+"synthetic"; the residual that survives is inherent: a COSMETIC edit
+adjacent to a real upstream bug cannot be excluded mechanically, so
+mutant curation stays an operator responsibility.
+
+Mechanics: a mutant label carries `provenance_kind:
+"synthetic_mutant"` plus a `mutation` spec (operator, site, drop-in
+line edits, and the content hash of the applied result). The
+`SourcePin` stays the UNMUTATED parent ref, so pin lint and the
+spend gate keep verifying against the real tree; the runner applies
+the spec to its run-private excerpt copy post-fetch, verifying both
+the parent span and the applied result (`--scope excerpt` required;
+`--probe` refuses mutants). Mutant labels never carry
+`cve`/`fix_commit` (declared, never laundered — the provenance-lint
+warning is carved out on the kind alone), and they never enter
+`core/recall` (its manifest hard-rejects non-benchmark|cve
+provenance by design). One mutant per file per run for
+negative-delta operators: after the first applied deletion shifts
+the lines below it, a second label pinned below that span fails
+parent verification (the correct, fail-closed direction) — split
+such mutants across runs or files.
+
+Separation is structural, not advisory: mutant overlays live
+OUTSIDE the packaged `labels/` dir and run via
+`--labels-dir <overlay>`; a run refuses a label set that mixes
+kinds; `--splice` refuses across kinds; and the history store
+stamps `label_kind` on every record — `compare` refuses cross-kind,
+`stability` partitions on the kind, `trend` renders per-kind
+sections, and the post-run delta reports only consider same-kind
+priors.
+
+The in-tree baseline floors live in the fixture package
+(`tests/fixtures/mutcorpus/`) with the current per-operator floor
+values pinned by `tests/test_mutation_floors.py` — update an
+operator's expected value there when its consuming dimension lands.
+Floors against real pinned fixture repos are generated per
+engagement with `mutate --check` and recorded alongside the run.
 
 ## Content-addressed pins (`source.span_sha`)
 

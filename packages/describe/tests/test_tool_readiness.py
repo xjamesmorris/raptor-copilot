@@ -65,6 +65,26 @@ class TestCheckCodeql:
         assert result.version == "2.18.4"
         assert "build deps ok" in result.detail
 
+    def test_rust_cargo_metadata_does_not_require_a_build_tool(self):
+        with patch(
+            "shutil.which",
+            side_effect=lambda cmd: "/usr/bin/codeql" if cmd == "codeql" else None,
+        ) as which, patch(
+            "packages.describe.tool_readiness._bin_version",
+            return_value="2.27.2",
+        ):
+            result = _check_codeql(_shape(
+                primary_language="rust",
+                languages={"rust": 100},
+                language_breakdown={"rust": 100.0},
+                build_systems={"rust": "cargo"},
+            ))
+
+        assert result.status == "ok"
+        assert "no-build" in result.detail
+        assert result.hint is None
+        which.assert_called_once_with("codeql")
+
     def test_present_binary_missing_autoreconf_warns(self):
         def _which(cmd):
             if cmd == "autoreconf":
@@ -114,6 +134,66 @@ class TestCheckCodeql:
         assert adv.pm_packages.get("apt") == "libtool"
         assert adv.pm_packages.get("dnf") == "libtool"
         assert adv.pm_packages.get("brew") == "libtool"
+
+
+class TestBuildDepUniverse:
+    """The dep table's key universe derives from the detector's emit
+    vocabulary — a hand-typed list drifted to 8 missing systems (false
+    '✓ build deps ok' for each) and 2 rows the detector never emits."""
+
+    def test_universe_matches_detector_emit_vocabulary(self):
+        from core.build.build_detector import BuildDetector
+        from packages.describe.tool_readiness import _BUILD_SYSTEM_DEPS
+        emit = {
+            bs_type
+            for per_lang in BuildDetector.BUILD_SYSTEMS.values()
+            for bs_type in per_lang
+        }
+        assert set(_BUILD_SYSTEM_DEPS) == emit
+
+    def test_gomod_missing_go_warns_not_ok(self):
+        # The confirmed false signal: detector emits `gomod`, the
+        # table had no row, so `go` absent from PATH still rendered
+        # "✓ build deps ok for gomod".
+        def _which(cmd):
+            return None if cmd == "go" else "/usr/bin/" + cmd
+        with patch("shutil.which", side_effect=_which):
+            with patch(
+                "packages.describe.tool_readiness._bin_version",
+                return_value="2.18.4",
+            ):
+                result = _check_codeql(_shape(
+                    primary_language="go",
+                    languages={"go": 100},
+                    language_breakdown={"go": 100.0},
+                    build_systems={"go": "gomod"},
+                ))
+        assert result.status == "warn"
+        assert "go" in result.detail
+
+    def test_unknown_build_system_reports_no_data_not_ok(self):
+        # Honest "?" when there is no dep data — never "deps verified".
+        with patch("shutil.which", return_value="/usr/bin/x"):
+            with patch(
+                "packages.describe.tool_readiness._bin_version",
+                return_value="2.18.4",
+            ):
+                result = _check_codeql(_shape(
+                    build_systems={"cpp": "not-a-real-system"},
+                ))
+        assert result.status == "unknown"
+        assert "no dependency data" in result.detail
+
+    def test_no_detected_build_system_is_honest(self):
+        with patch("shutil.which", return_value="/usr/bin/x"):
+            with patch(
+                "packages.describe.tool_readiness._bin_version",
+                return_value="2.18.4",
+            ):
+                result = _check_codeql(_shape(build_systems={}))
+        assert result.status == "ok"
+        assert "build deps ok" not in result.detail
+        assert "no build system detected" in result.detail
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +283,37 @@ class TestCheckBinaryOracle:
 # (host-level — /doctor's domain). Test that the helper is gone
 # so a future drift back into this scope fails loudly.
 # ---------------------------------------------------------------------------
+
+
+class TestBinaryOracleDirUniverse:
+    """The readiness probe keys off the oracle's own detection
+    universe — a hand-typed 6-dir subset said "will activate after
+    build" for targets the oracle WOULD activate on."""
+
+    def _check(self, tmp_path):
+        return _check_binary_oracle(_shape(target_path=tmp_path))
+
+    def test_meson_builddir_counts_as_artefacts(self, tmp_path):
+        (tmp_path / "builddir").mkdir()
+        assert self._check(tmp_path).status == "ok"
+
+    def test_rust_cross_target_counts_as_artefacts(self, tmp_path):
+        (tmp_path / "target" / "x86_64-unknown-linux-gnu"
+         / "release").mkdir(parents=True)
+        assert self._check(tmp_path).status == "ok"
+
+    def test_in_source_elf_counts_as_artefacts(self, tmp_path):
+        binary = tmp_path / "zpipe"
+        binary.write_bytes(b"\x7fELF" + b"\x00" * 12)
+        binary.chmod(0o755)
+        assert self._check(tmp_path).status == "ok"
+
+    def test_clean_source_tree_still_warns(self, tmp_path):
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "main.c").write_text("int main(){}\n")
+        result = self._check(tmp_path)
+        assert result.status == "warn"
+        assert "will activate after build" in result.detail
 
 
 class TestNoLlmCheckByDesign:

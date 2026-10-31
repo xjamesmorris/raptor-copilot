@@ -40,7 +40,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any, TYPE_CHECKING
+from typing import Any
 
 from core.hash import sha256_file
 from core.function_taxonomy import (
@@ -62,9 +62,6 @@ from core.function_taxonomy import (
 )
 from pathlib import Path
 
-if TYPE_CHECKING:
-    from pathlib import Path
-
 logger = logging.getLogger(__name__)
 
 
@@ -79,6 +76,13 @@ logger = logging.getLogger(__name__)
 # v3: added runtime_privilege / kernel_trace buckets — supply-chain
 # forensic surface (setuid / bpf / ptrace / perf_event_open et al.).
 # Same re-fingerprint guidance as v1→v2.
+# v4: tier-1 (radare2) imports are normalised through
+# ``strip_import_prefix`` before bucketing, matching the manifest
+# path. A Mach-O / PE binary fingerprinted under v3 could carry
+# systematically EMPTY buckets (``_strcpy`` never matched the bare
+# ``strcpy`` taxonomy) — diffing v3 against v4 would surface every
+# real capability as a spurious high-severity addition, so
+# re-fingerprint instead.
 #
 # Migration is operator-transparent: ``fingerprint_store._load_fingerprint``
 # treats any stored fingerprint whose ``schema_version`` doesn't equal
@@ -86,7 +90,7 @@ logger = logging.getLogger(__name__)
 # the next scan re-fingerprints from bytes.  No manual cache flush
 # needed; the first scan after the bump pays the re-fingerprint cost
 # (sub-millisecond per binary via :mod:`core.binary.elf`).
-FINGERPRINT_SCHEMA_VERSION = 3
+FINGERPRINT_SCHEMA_VERSION = 4
 
 
 # Per-bucket capability classification. Single source of truth —
@@ -316,6 +320,7 @@ def _fingerprint_via_radare2(
     meaningful signal from the file (empty bytes, unrecognised
     format, etc.)."""
     try:
+        from packages.binary_analysis._symbols import strip_import_prefix
         from packages.binary_analysis.radare2_understand import (
             analyse_binary_context,
             probe_capability,
@@ -352,11 +357,11 @@ def _fingerprint_via_radare2(
         return None
 
     # Empty file, unrecognised format, or anything radare2 opened
-    # but couldn't classify yields a fully-empty context. Reject
-    # — a fingerprint of "I have nothing to say about this file"
-    # only pollutes the fingerprint store (drift detection would
-    # match every unparseable file to every other one via the
-    # empty-string SHA isn't even unique once the file is empty).
+    # but couldn't classify yields a fully-empty context. Reject —
+    # a fingerprint of "I have nothing to say about this file"
+    # only pollutes the fingerprint store: drift detection would
+    # match every unparseable file to every other one, since the
+    # empty capability shape is shared by all of them.
     if (not ctx.binary_format and not ctx.arch
             and not ctx.imports):
         logger.debug(
@@ -366,7 +371,16 @@ def _fingerprint_via_radare2(
         )
         return None
 
-    buckets = bucket_imports(set(ctx.imports))
+    # Normalise import names the same way the manifest path does
+    # (manifest._normalise_symbol → strip_import_prefix): r2 emits
+    # Mach-O imports with a leading ``_`` (``_strcpy``) and PE ones
+    # can carry ``__imp_`` / ``sym.imp.`` prefixes, while the bucket
+    # taxonomy holds bare names. Without this, tier-1 fingerprints
+    # (the only tier PE / Mach-O reach) report systematically empty
+    # buckets for binaries that clearly import dangerous functions.
+    buckets = bucket_imports({
+        strip_import_prefix(item) for item in ctx.imports
+    })
     return CapabilityFingerprint(
         schema_version=FINGERPRINT_SCHEMA_VERSION,
         binary_path=str(binary_path),

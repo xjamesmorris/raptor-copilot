@@ -4,11 +4,23 @@ import json
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 # packages/llm_analysis/tests/test_orchestrator.py -> repo root
 sys.path.insert(0, str(Path(__file__).parents[3]))
 
+from core.llm.accounting import (  # noqa: E402
+    AccountingSummary,
+    CostObservation,
+    LLMAccountingUnavailableError,
+    ModelKeyAggregation,
+    RouteIdentity,
+    UsdBudgetContract,
+)
+from core.llm.providers import StructuredResponse  # noqa: E402
 from packages.llm_analysis.cc_dispatch import (
     build_schema,
 )
@@ -18,8 +30,10 @@ from packages.llm_analysis.orchestrator import (
     _check_self_contradiction,
     _merge_results,
     _structural_grouping,
+    _summarize_dispatch_batch,
     orchestrate,
 )
+from packages.llm_analysis.dispatch import DispatchResult  # noqa: E402
 from packages.llm_analysis.prompts.schemas import FINDING_RESULT_SCHEMA
 from packages.llm_analysis.tasks import (
     AggregationTask,
@@ -170,8 +184,136 @@ def _mock_subprocess_ok(results_by_call):
     return mock_run
 
 
+@pytest.fixture(autouse=True)
+def _clear_prep_caches():
+    """orchestrate() drives the real prepare_source_intel /
+    prepare_flow_context, which populate process-global caches keyed by
+    repo path — clear around every test (matching
+    test_source_intel_inject) so entries neither accumulate for process
+    life nor cross-pollinate same-path tests."""
+    from packages.llm_analysis.flow_context_inject import (
+        clear_flow_context_cache,
+    )
+    from packages.llm_analysis.source_intel_inject import (
+        clear_si_result_cache,
+    )
+    clear_si_result_cache()
+    clear_flow_context_cache()
+    yield
+    clear_si_result_cache()
+    clear_flow_context_cache()
+
+
 class TestOrchestrate:
     """Test the main orchestrate() function routing."""
+
+    @pytest.mark.parametrize(
+        ("provider", "expected_aggregation"),
+        [
+            ("anthropic", ModelKeyAggregation.LEGACY_MODEL_NAME),
+            ("future", ModelKeyAggregation.REFUSE),
+        ],
+    )
+    def test_scorecard_estimate_uses_selected_route_policy(
+        self, tmp_path, provider, expected_aggregation,
+    ):
+        report_path = tmp_path / "report.json"
+        report_path.write_text(json.dumps(_make_prep_report()))
+        model = SimpleNamespace(
+            model_name="model-a",
+            provider=provider,
+        )
+        contract = UsdBudgetContract.AUTHORITATIVE_REQUIRED
+        llm_config = SimpleNamespace(
+            primary_model=model,
+            fallback_models=[],
+            max_cost_per_scan=0.0,
+            usd_budget_contract=contract,
+        )
+        role_resolution = {
+            "analysis_model": model,
+            "analysis_models": [model],
+            "code_model": None,
+            "consensus_models": [],
+            "judge_models": [],
+            "aggregate_models": [],
+            "fallback_models": [],
+        }
+        estimate = MagicMock(side_effect=RuntimeError("estimate reached"))
+
+        with patch(
+            "core.llm.config.resolve_model_roles",
+            return_value=role_resolution,
+        ), patch(
+            "core.run.estimator.estimate_from_scorecard",
+            estimate,
+        ), pytest.raises(RuntimeError, match="estimate reached"):
+            orchestrate(
+                prep_report_path=report_path,
+                repo_path=tmp_path,
+                out_dir=tmp_path / "orch",
+                llm_config=llm_config,
+                max_findings=1,
+                max_parallel=1,
+            )
+
+        estimate.assert_called_once_with(
+            "model-a",
+            1,
+            max_parallel=1,
+            model_key_aggregation=expected_aggregation,
+            usd_budget_contract=contract,
+        )
+
+    def test_scorecard_estimate_refuses_panel_identity(
+        self, tmp_path,
+    ):
+        report_path = tmp_path / "report.json"
+        report_path.write_text(json.dumps(_make_prep_report()))
+        models = [
+            SimpleNamespace(model_name="model-a", provider="anthropic"),
+            SimpleNamespace(model_name="model-b", provider="openai"),
+        ]
+        llm_config = SimpleNamespace(
+            primary_model=models[0],
+            fallback_models=[models[1]],
+            max_cost_per_scan=0.0,
+            usd_budget_contract=UsdBudgetContract.ADVISORY,
+        )
+        role_resolution = {
+            "analysis_model": models[0],
+            "analysis_models": models,
+            "code_model": None,
+            "consensus_models": [],
+            "judge_models": [],
+            "aggregate_models": [],
+            "fallback_models": [],
+        }
+        estimate = MagicMock(side_effect=RuntimeError("estimate reached"))
+
+        with patch(
+            "core.llm.config.resolve_model_roles",
+            return_value=role_resolution,
+        ), patch(
+            "core.run.estimator.estimate_from_scorecard",
+            estimate,
+        ), pytest.raises(RuntimeError, match="estimate reached"):
+            orchestrate(
+                prep_report_path=report_path,
+                repo_path=tmp_path,
+                out_dir=tmp_path / "orch",
+                llm_config=llm_config,
+                max_findings=1,
+                max_parallel=1,
+            )
+
+        estimate.assert_called_once_with(
+            "",
+            1,
+            max_parallel=1,
+            model_key_aggregation=ModelKeyAggregation.REFUSE,
+            usd_budget_contract=UsdBudgetContract.ADVISORY,
+        )
 
     def test_full_report_passthrough(self, tmp_path):
         """mode:'full' returns None (Phase 3 already did analysis)."""
@@ -295,10 +437,370 @@ class TestOrchestrate:
         assert result["orchestration"]["findings_analysed"] == 2
         assert result["orchestration"]["findings_failed"] == 0
         assert result["exploitable"] == 1
+        assert all(
+            finding["analysed_by_provider"] == "claudecode"
+            for finding in result["results"]
+        )
+        cost = result["orchestration"]["cost"]
+        assert cost["unknown_calls"] >= 2
+        assert cost["usd_total_complete"] is False
 
         # Verify merged report was written
         out_file = tmp_path / "orch" / "orchestrated_report.json"
         assert out_file.exists()
+
+    def test_external_dispatch_reconciles_core_snapshot_once(
+        self, tmp_path,
+    ):
+        findings = [
+            _make_finding("f-001", "py/sql-injection", "db.py", 42),
+            _make_finding("f-002", "js/xss", "template.js", 18),
+        ]
+        report_path = tmp_path / "report.json"
+        report_path.write_text(json.dumps(_make_prep_report(findings)))
+        out_dir = tmp_path / "orch"
+
+        model = SimpleNamespace(
+            model_name="model-a",
+            provider="anthropic",
+        )
+        llm_config = SimpleNamespace(
+            primary_model=model,
+            fallback_models=[],
+            max_cost_per_scan=10.0,
+        )
+        role_resolution = {
+            "analysis_model": model,
+            "analysis_models": [model],
+            "code_model": None,
+            "consensus_models": [],
+            "judge_models": [],
+            "aggregate_models": [],
+            "fallback_models": [],
+        }
+        response_payload = {
+            key: value
+            for key, value in _make_cc_result(
+                "ignored", exploitable=False, score=0.1,
+            ).items()
+            if key in FINDING_RESULT_SCHEMA["properties"]
+        }
+        route = RouteIdentity("anthropic", "model-a")
+        responses = iter([
+            StructuredResponse(
+                result=dict(response_payload),
+                raw="{}",
+                cost=0.2,
+                tokens_used=20,
+                model="model-a",
+                provider="anthropic",
+                cost_observation=CostObservation.catalog_priced(
+                    0.2, route=route,
+                ),
+            ),
+            StructuredResponse(
+                result=dict(response_payload),
+                raw="{}",
+                cost=0.0,
+                tokens_used=0,
+                model="model-a",
+                provider="anthropic",
+                cached=True,
+            ),
+        ])
+        core_accounting = (
+            AccountingSummary()
+            .add(CostObservation.catalog_priced(0.2, route=route))
+            .add(CostObservation.catalog_priced(0.3, route=route))
+        )
+
+        class _Client:
+            def __init__(self):
+                self.total_cost = 0.0
+                self.short_circuits = 0
+                self.scorecard = None
+                self.calls = 0
+
+            def generate_structured(self, **kwargs):
+                self.calls += 1
+                return next(responses)
+
+            def get_stats(self):
+                assert self.total_cost == 0.1
+                return {
+                    "total_cost": 0.6,
+                    "cache_hits": 1,
+                    "accounting": core_accounting.as_dict(),
+                    "providers": {
+                        "anthropic:model-a": {
+                            "total_cost": 0.5,
+                            "total_tokens": 50,
+                            "accounting": core_accounting.as_dict(),
+                        },
+                    },
+                }
+
+            def get_fired_models(self):
+                return []
+
+        client = _Client()
+        compatible = SimpleNamespace(compatible=True, error=None)
+
+        with patch(
+            "core.llm.config.resolve_model_roles",
+            return_value=role_resolution,
+        ), patch(
+            "core.llm.client.LLMClient",
+            return_value=client,
+        ), patch(
+            "core.security.envelope_probe.probe_envelope_compatibility",
+            return_value=compatible,
+        ), patch(
+            "packages.llm_analysis.prefilter.make_prefilter_fn",
+            return_value=None,
+        ), patch(
+            "packages.llm_analysis.rank_stage.rank_findings_for_analysis",
+            return_value=(findings, 0.1, "ranker"),
+        ), patch(
+            "packages.llm_analysis.orchestrator._structural_grouping",
+            return_value=[],
+        ), patch(
+            "packages.llm_analysis.orchestrator."
+            "_attach_calibrated_aggregation",
+            return_value={"failed": False, "total": 0},
+        ):
+            result = orchestrate(
+                prep_report_path=report_path,
+                repo_path=tmp_path,
+                out_dir=out_dir,
+                max_parallel=1,
+                no_exploits=True,
+                no_patches=True,
+                llm_config=llm_config,
+                dataflow_validation_enabled=False,
+                rank_findings=True,
+            )
+
+        assert client.calls == 2
+        cost = result["orchestration"]["cost"]
+        assert cost["total_cost"] == 0.6
+        assert cost["catalog_priced_usd"] == 0.5
+        assert cost["catalog_priced_calls"] == 2
+        assert cost["cache_hits"] == 1
+        assert cost["unclassified_legacy_events"] == 1
+        assert cost["usd_total_complete"] is False
+        assert cost["authoritative_remaining_usd"] is None
+        assert cost["cost_by_model"] == {
+            "model-a": 0.5,
+            "ranker": 0.1,
+        }
+        assert (
+            cost["accounting_by_route"]["anthropic/model-a"][
+                "catalog_priced_calls"
+            ]
+            == 2
+        )
+        by_id = {row["finding_id"]: row for row in result["results"]}
+        assert by_id["f-001"]["analysed_by_provider"] == "anthropic"
+        assert by_id["f-001"]["cost_observation"]["basis"] == (
+            "catalog_priced"
+        )
+        assert by_id["f-002"]["cache_hit"] is True
+        assert "cost_observation" not in by_id["f-002"]
+
+    def test_successful_fallback_retains_failed_primary_batch(
+        self, tmp_path,
+    ):
+        finding = _make_finding(
+            "f-001", "py/sql-injection", "db.py", 42,
+        )
+        report_path = tmp_path / "report.json"
+        report_path.write_text(json.dumps(_make_prep_report([finding])))
+        out_dir = tmp_path / "orch"
+        model = SimpleNamespace(
+            model_name="session-default",
+            provider="claudecode",
+        )
+        llm_config = SimpleNamespace(
+            primary_model=model,
+            fallback_models=[],
+            max_cost_per_scan=10.0,
+        )
+        role_resolution = {
+            "analysis_model": model,
+            "analysis_models": [model],
+            "code_model": None,
+            "exploit_model": None,
+            "consensus_models": [],
+            "judge_models": [],
+            "aggregate_models": [],
+            "fallback_models": [],
+        }
+
+        class _Client:
+            total_cost = 0.0
+            short_circuits = 0
+            scorecard = None
+
+            def generate_structured(self, **kwargs):
+                raise RuntimeError(
+                    "claude -p exited 1: strict mode: unknown keyword: "
+                    '"reasoning"',
+                )
+
+            def get_stats(self):
+                return {
+                    "total_cost": 0.0,
+                    "accounting": AccountingSummary().as_dict(),
+                    "providers": {},
+                }
+
+            def get_fired_models(self):
+                return []
+
+        fallback_payload = _make_cc_result(
+            "f-001", exploitable=False, score=0.1,
+        )
+        fallback_result = DispatchResult(
+            result=fallback_payload,
+            cost=0.0,
+            model="claude-opus-5-5",
+            provider="claudecode",
+            no_spend=True,
+        )
+        compatible = SimpleNamespace(compatible=True, error=None)
+
+        with patch(
+            "core.llm.config.resolve_model_roles",
+            return_value=role_resolution,
+        ), patch(
+            "core.llm.client.LLMClient",
+            return_value=_Client(),
+        ), patch(
+            "core.security.envelope_probe.probe_envelope_compatibility",
+            return_value=compatible,
+        ), patch(
+            "packages.llm_analysis.prefilter.make_prefilter_fn",
+            return_value=None,
+        ), patch(
+            "core.llm.cc_adapter.resolve_claude_cli",
+            return_value="/fake/claude",
+        ), patch(
+            "packages.llm_analysis.orchestrator.invoke_cc_simple",
+            return_value=fallback_result,
+        ), patch(
+            "packages.llm_analysis.orchestrator._structural_grouping",
+            return_value=[],
+        ), patch(
+            "packages.llm_analysis.orchestrator."
+            "_attach_calibrated_aggregation",
+            return_value={"failed": False, "total": 1},
+        ):
+            result = orchestrate(
+                prep_report_path=report_path,
+                repo_path=tmp_path,
+                out_dir=out_dir,
+                max_parallel=1,
+                no_exploits=True,
+                no_patches=True,
+                llm_config=llm_config,
+                dataflow_validation_enabled=False,
+            )
+
+        assert result["orchestration"]["mode"] == "cc_fallback"
+        assert result["orchestration"]["findings_analysed"] == 1
+        assert result["orchestration"]["findings_failed"] == 0
+        assert "error" not in result["results"][0]
+        batches = {
+            batch["phase"]: batch
+            for batch in result["orchestration"]["dispatch_batches"]
+        }
+        assert batches["analysis_primary"]["failed"] == 1
+        assert batches["analysis_primary"]["succeeded"] == 0
+        assert batches["analysis_claude_fallback"]["succeeded"] == 1
+        assert batches["analysis_claude_fallback"]["failed"] == 0
+        assert result["orchestration"]["dispatch_failures"] == 1
+        assert result["orchestration"]["failed_by_model"] == {
+            "session-default": {
+                "count": 1,
+                "first_error": (
+                    "claude -p exited 1: strict mode: unknown keyword: "
+                    '"reasoning"'
+                ),
+            },
+        }
+
+    def test_external_policy_refusal_never_invokes_cc_fallback(
+        self, tmp_path,
+    ):
+        report_path = tmp_path / "report.json"
+        report_path.write_text(json.dumps(_make_prep_report()))
+        out_dir = tmp_path / "orch"
+        model = SimpleNamespace(
+            model_name="model-a",
+            provider="anthropic",
+        )
+        llm_config = SimpleNamespace(
+            primary_model=model,
+            fallback_models=[],
+            max_cost_per_scan=10.0,
+        )
+        role_resolution = {
+            "analysis_model": model,
+            "analysis_models": [model],
+            "code_model": None,
+            "consensus_models": [],
+            "judge_models": [],
+            "aggregate_models": [],
+            "fallback_models": [],
+        }
+
+        class _Client:
+            total_cost = 0.0
+            short_circuits = 0
+            scorecard = None
+
+            def generate_structured(self, **kwargs):
+                raise LLMAccountingUnavailableError("strict refusal")
+
+        invoke_cc = MagicMock()
+        compatible = SimpleNamespace(compatible=True, error=None)
+        with patch(
+            "core.llm.config.resolve_model_roles",
+            return_value=role_resolution,
+        ), patch(
+            "core.llm.client.LLMClient",
+            return_value=_Client(),
+        ), patch(
+            "core.security.envelope_probe.probe_envelope_compatibility",
+            return_value=compatible,
+        ), patch(
+            "packages.llm_analysis.prefilter.make_prefilter_fn",
+            return_value=None,
+        ), patch(
+            "core.llm.cc_adapter.resolve_claude_cli",
+            return_value="/fake/claude",
+        ), patch(
+            "packages.llm_analysis.orchestrator.invoke_cc_simple",
+            invoke_cc,
+        ):
+            with pytest.raises(
+                LLMAccountingUnavailableError,
+                match="strict refusal",
+            ):
+                orchestrate(
+                    prep_report_path=report_path,
+                    repo_path=tmp_path,
+                    out_dir=out_dir,
+                    max_parallel=1,
+                    no_exploits=True,
+                    no_patches=True,
+                    llm_config=llm_config,
+                    dataflow_validation_enabled=False,
+                )
+
+        invoke_cc.assert_not_called()
+        assert not (out_dir / "orchestrated_report.json").exists()
 
     def test_sloppy_response_normalised_through_pipeline(self, tmp_path):
         """Sloppy LLM output is normalised by response validation in cc_dispatch."""
@@ -746,7 +1248,50 @@ class TestStructuralGrouping:
 
 # ── CostTracker ──────────────────────────────────────────────────────
 
+def test_dispatch_batch_summary_keeps_mixed_success_failure_and_skip():
+    summary = _summarize_dispatch_batch(
+        "group_analysis",
+        [
+            {"finding_id": "g1", "content": "ok"},
+            {
+                "finding_id": "g2",
+                "analysed_by": "claude",
+                "error": "review failed",
+                "error_type": "request_schema",
+                "diagnostic_artifact": "diagnostics/failure.json",
+            },
+            {
+                "finding_id": "g3",
+                "analysed_by": "claude",
+                "error": "skipped (model circuit-broken)",
+                "error_type": "circuit_breaker",
+            },
+        ],
+        input_items=3,
+        phase="group_enrichment",
+    )
+
+    assert summary["status"] == "partial"
+    assert summary["succeeded"] == 1
+    assert summary["failed"] == 1
+    assert summary["not_run"] == 1
+    assert summary["complete"] is False
+    assert summary["error_types"] == {"request_schema": 1}
+    assert summary["failed_by_model"]["claude"]["count"] == 1
+    assert summary["artifacts"] == ["diagnostics/failure.json"]
+
+
 class TestCostTracker:
+    @pytest.mark.parametrize("ceiling,serialized", [(float("inf"), None), (10.0, 10.0), (0.0, 0.0)])
+    def test_cost_summary_is_strict_json_and_preserves_enforcement(self, ceiling, serialized):
+        tracker = CostTracker(max_cost=ceiling)
+        tracker.add_cost("fixture-model", 0.25, tokens=100)
+        summary = json.loads(json.dumps(tracker.get_summary(), allow_nan=False))
+        assert summary["max_cost"] == serialized
+        assert summary["total_cost"] == 0.25
+        assert summary["total_tokens"] == 100
+        assert tracker._max_cost == ceiling
+
     def test_basic_tracking(self):
         ct = CostTracker(max_cost=10.0)
         ct.add_cost("opus", 3.0)
@@ -939,6 +1484,7 @@ class TestWeakenedDefenses:
         role_resolution = {
             "analysis_model": mock_model,
             "code_model": None,
+            "exploit_model": None,
             "consensus_models": [],
             "fallback_models": [],
         }
@@ -1089,3 +1635,132 @@ class TestWeakenedDefenses:
         assert result is not None
         assert result["orchestration"]["defense_profile"] == "passthrough"
         assert result["orchestration"]["weakened_defenses"] is True
+
+
+class TestDataflowValidationGate:
+    """``dataflow_validation_enabled`` routes the REAL orchestrate()
+    around run_validation_pass. The previous coverage asserted mocks
+    stayed uncalled after a test-local dead branch — the production
+    gate could regress without a failure."""
+
+    def _drive(self, tmp_path, **kw):
+        import packages.llm_analysis.dataflow_validation as dv_mod
+
+        report = _make_prep_report()
+        report_path = tmp_path / "report.json"
+        report_path.write_text(json.dumps(report))
+        cc_result = json.dumps(_make_cc_result("finding-001"))
+        with patch.dict(os.environ, {"CLAUDECODE": "1"}), \
+             patch("core.llm.cc_adapter.resolve_claude_cli",
+                   return_value="/usr/bin/claude"), \
+             patch("core.sandbox.run_untrusted_networked",
+                   side_effect=_mock_subprocess_ok([cc_result])), \
+             patch.object(dv_mod, "run_validation_pass",
+                          return_value=None) as mock_run:
+            result = orchestrate(
+                prep_report_path=report_path,
+                repo_path=tmp_path,
+                out_dir=tmp_path / "orch",
+                **kw,
+            )
+        assert result is not None
+        return mock_run
+
+    def test_disabled_skips_validation_pass(self, tmp_path):
+        mock_run = self._drive(tmp_path, dataflow_validation_enabled=False)
+        mock_run.assert_not_called()
+
+    def test_enabled_by_default_runs_validation_pass(self, tmp_path):
+        mock_run = self._drive(tmp_path)
+        mock_run.assert_called_once()
+
+
+class TestDefenseTelemetryKey:
+    """The orchestration dict carries ``defense_telemetry`` iff
+    warnings fired — driven through the REAL orchestrate() attach site
+    (the previous coverage re-implemented the conditional inline in
+    the test and asserted on the copy)."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_telemetry(self):
+        from core.security.prompt_telemetry import defense_telemetry
+        defense_telemetry.reset()
+        yield
+        defense_telemetry.reset()
+
+    def _orchestration(self, tmp_path, during_dispatch=None):
+        report = _make_prep_report()
+        report_path = tmp_path / "report.json"
+        report_path.write_text(json.dumps(report))
+        cc_result = json.dumps(_make_cc_result("finding-001"))
+        inner = _mock_subprocess_ok([cc_result])
+
+        def _side(cmd, **kw):
+            # orchestrate() resets the telemetry singleton at entry,
+            # so warnings must fire DURING the run (as real weakened
+            # overrides do — mid-dispatch).
+            if during_dispatch is not None:
+                during_dispatch()
+            return inner(cmd, **kw)
+
+        with patch.dict(os.environ, {"CLAUDECODE": "1"}), \
+             patch("core.llm.cc_adapter.resolve_claude_cli",
+                   return_value="/usr/bin/claude"), \
+             patch("core.sandbox.run_untrusted_networked",
+                   side_effect=_side):
+            # The session conftest sets the CC transport kill switch;
+            # this harness needs the (mocked) dispatch to actually
+            # run. patch.dict restores the pre-patch environ on exit.
+            os.environ.pop("RAPTOR_CC_TRANSPORT_DISABLED", None)
+            result = orchestrate(
+                prep_report_path=report_path,
+                repo_path=tmp_path,
+                out_dir=tmp_path / "orch",
+            )
+        assert result is not None
+        return result["orchestration"]
+
+    def test_no_telemetry_key_when_clean(self, tmp_path):
+        orch = self._orchestration(tmp_path)
+        assert "defense_telemetry" not in orch
+
+    def test_telemetry_key_present_on_warning(self, tmp_path):
+        from core.security.prompt_telemetry import defense_telemetry
+
+        orch = self._orchestration(
+            tmp_path,
+            during_dispatch=lambda: defense_telemetry.record_weakened_override(
+                "test-model", "profile downgraded for test",
+            ),
+        )
+        assert "defense_telemetry" in orch
+        # summary() nests its payload under its own top-level key.
+        payload = orch["defense_telemetry"]["defense_telemetry"]
+        assert any(
+            w["type"] == "weakened_defenses"
+            for w in payload["warnings"]
+        )
+
+
+class TestSnapshotVerdicts:
+    """The reliability-producer snapshot preserves abstention: a
+    missing/None is_exploitable stays None — bool()-coercing at
+    snapshot time wrote abstained primaries into the JUDGE_REVIEW /
+    SELF_CONSISTENCY ledgers as "not exploitable" votes."""
+
+    def test_abstained_verdict_snapshots_as_none(self):
+        from packages.llm_analysis.orchestrator import _snapshot_verdicts
+        snap = _snapshot_verdicts({
+            "f-null": {"is_exploitable": None},
+            "f-missing": {"reasoning": "no verdict field"},
+            "f-true": {"is_exploitable": True},
+            "f-false": {"is_exploitable": False},
+            "f-err": {"error": "timeout", "is_exploitable": True},
+            "f-junk": "not a dict",
+        })
+        assert snap == {
+            "f-null": None,
+            "f-missing": None,
+            "f-true": True,
+            "f-false": False,
+        }

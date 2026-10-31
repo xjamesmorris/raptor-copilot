@@ -110,14 +110,14 @@ def _interpret_result(result: subprocess.CompletedProcess, cmd_display: str) -> 
     #      Happens when the direct child of Popen dies by signal and
     #      the parent's waitpid sees WIFSIGNALED.
     #   2. 128+sig convention: rc in [129, 128 + NSIG). Used when
-    #      something between Popen and the target (e.g. the pid-1
-    #      shim at libexec/raptor-pid1-shim) caught the signal via
-    #      waitpid + WIFSIGNALED and exited with 128+WTERMSIG because
-    #      it couldn't re-raise the signal on itself (the pid-ns
-    #      filter blocks pid-1 from raise()ing signals without an
-    #      installed handler — the very filter the shim exists to
-    #      keep AWAY from the target). Standard unix shell
-    #      convention; bash's $? uses it too. Decode identically.
+    #      something between Popen and the target (the spawn
+    #      backend's in-ns init on the rootfs lane; historically the
+    #      deleted pid-1 shim) caught the signal via waitpid +
+    #      WIFSIGNALED and exited with 128+WTERMSIG because it
+    #      couldn't re-raise the signal on itself (the pid-ns filter
+    #      blocks pid-1 from raise()ing signals without an installed
+    #      handler). Standard unix shell convention; bash's $? uses
+    #      it too. Decode identically.
     # SIGKILL (9) via 128+9=137 is a genuine ambiguity vs. a program
     # that legitimately exits 137 — accepted as a negligible risk,
     # the 128+sig range is almost never an honest exit code.
@@ -280,6 +280,12 @@ def _interpret_result(result: subprocess.CompletedProcess, cmd_display: str) -> 
 
     # Attach to result for consumers to read
     result.sandbox_info = info  # type: ignore[attr-defined]
+
+
+# Public alias: the module docstring names this function as one of the
+# module's two entry points, and cross-package consumers (dark_verify's
+# capped-stderr re-classification) call it — give them a public name.
+interpret_result = _interpret_result
 
 
 def _path_within(path: str, allowed: list) -> bool:

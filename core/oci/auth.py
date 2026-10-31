@@ -1,17 +1,20 @@
 """Auth chain for OCI / Docker registries.
 
-Three sources, tried in order:
+Three sources. ``lookup_credentials`` tries env vars FIRST, then
+``config.json``; anonymous is what remains when neither yields
+credentials — matching the README's env → config → anonymous order
+(an earlier revision of this docstring listed anonymous first,
+which was never what the code did):
 
-  1. **Anonymous bearer token** — for public images when NO
-     credentials are configured. The registry's ``WWW-Authenticate``
-     header on a 401 response carries a ``realm`` / ``service`` /
-     ``scope`` triple; we request a token from that realm without
-     credentials. Works for everything on ``docker.io/library/*``,
-     public ``ghcr.io``, ``public.ecr.aws``, ``quay.io`` (mostly).
-     When credentials ARE configured for the registry, the token
-     exchange sends them from the first attempt (they are needed for
-     private scopes and harmless for public ones); the realm has
-     already passed the HTTPS + allowlist gate at that point.
+  1. **Per-registry env vars** — ``RAPTOR_OCI_<HOST_UPPER>_USER`` and
+     ``RAPTOR_OCI_<HOST_UPPER>_PASSWORD``, with ``.`` and ``-``
+     replaced by ``_`` in the host. So ``ghcr.io`` →
+     ``RAPTOR_OCI_GHCR_IO_USER`` / ``RAPTOR_OCI_GHCR_IO_PASSWORD``.
+     Catches CI / ad-hoc cases where ``docker login`` hasn't been
+     run. Because that encoding collapses ``.`` and ``-`` to the
+     same character, hostnames containing a dash (or underscore)
+     additionally require ``RAPTOR_OCI_<HOST_UPPER>_HOST`` set to
+     the exact hostname — see :func:`_from_env`.
 
   2. **``~/.docker/config.json`` inline ``auths``** — the standard
      artefact ``docker login`` produces. We read ONLY the inline
@@ -21,15 +24,16 @@ Three sources, tried in order:
      is a much larger trust surface than reading a file. Operators
      using credential helpers fall back to the env-var path.
 
-  3. **Per-registry env vars** — ``RAPTOR_OCI_<HOST_UPPER>_USER`` and
-     ``RAPTOR_OCI_<HOST_UPPER>_PASSWORD``, with ``.`` and ``-``
-     replaced by ``_`` in the host. So ``ghcr.io`` →
-     ``RAPTOR_OCI_GHCR_IO_USER`` / ``RAPTOR_OCI_GHCR_IO_PASSWORD``.
-     Catches CI / ad-hoc cases where ``docker login`` hasn't been
-     run. Because that encoding collapses ``.`` and ``-`` to the
-     same character, hostnames containing a dash (or underscore)
-     additionally require ``RAPTOR_OCI_<HOST_UPPER>_HOST`` set to
-     the exact hostname — see :func:`_from_env`.
+  3. **Anonymous bearer token** — for public images when NO
+     credentials are configured. The registry's ``WWW-Authenticate``
+     header on a 401 response carries a ``realm`` / ``service`` /
+     ``scope`` triple; we request a token from that realm without
+     credentials. Works for everything on ``docker.io/library/*``,
+     public ``ghcr.io``, ``public.ecr.aws``, ``quay.io`` (mostly).
+     When credentials ARE configured for the registry, the token
+     exchange sends them from the first attempt (they are needed for
+     private scopes and harmless for public ones); the realm has
+     already passed the HTTPS + allowlist gate at that point.
 
 The chain is consulted lazily: the first REQUEST goes out without
 auth (the challenge triple is only discoverable from the 401);
@@ -247,11 +251,11 @@ def _entry_to_credentials(entry: dict) -> BasicCredentials | None:
         user, _, password = decoded.partition(":")
         if user:
             return BasicCredentials(user, password)
-    user = entry.get("username")
-    password = entry.get("password")
-    if isinstance(user, str) and isinstance(password, str) \
-            and user and password:
-        return BasicCredentials(user, password)
+    entry_user: str | None = entry.get("username")  # type: ignore[assignment]
+    entry_password: str | None = entry.get("password")  # type: ignore[assignment]
+    if isinstance(entry_user, str) and isinstance(entry_password, str) \
+            and entry_user and entry_password:
+        return BasicCredentials(entry_user, entry_password)
     return None
 
 
@@ -269,8 +273,12 @@ def _entry_to_credentials(entry: dict) -> BasicCredentials | None:
 #
 # token = 1*<any CHAR except CTL or "()<>@,;:\\\"/[]?={} \t">
 # quoted-string = literal "" with optional backslash escapes.
+# The key is pinned to the start of its token run ((?<![...])): an
+# unanchored scan otherwise restarts inside every key suffix —
+# quadratic on a hostile header — and a mid-token start is never a
+# real parameter name.
 _WWW_AUTH_PARAM_RE = re.compile(
-    r'(?P<key>[a-zA-Z][a-zA-Z0-9_-]*)\s*=\s*'
+    r'(?<![a-zA-Z0-9_-])(?P<key>[a-zA-Z][a-zA-Z0-9_-]*)\s*=\s*'
     r'(?:"(?P<qval>[^"]*)"|(?P<tval>[^\s",]+))'
 )
 
@@ -282,8 +290,13 @@ _WWW_AUTH_PARAM_RE = re.compile(
 # permits multiple challenges per header). The scheme names are the
 # ones registries actually emit; a scheme token inside a QUOTED param
 # value would falsely split, which no real realm URL contains.
+# The whitespace after a boundary is bounded: unbounded, every
+# newline/comma in a hostile header re-scans the remaining
+# whitespace run — quadratic. Real header folding uses a few chars
+# of whitespace; 64 is generous (beyond it the challenge is not
+# split there, versus an unbounded scan).
 _CHALLENGE_BOUNDARY_RE = re.compile(
-    r"(?:^|[\n,]\s*)(?P<scheme>Bearer|Basic|Digest|Negotiate)(?=\s|$)",
+    r"(?:^|[\n,]\s{0,64})(?P<scheme>Bearer|Basic|Digest|Negotiate)(?=\s|$)",
     re.IGNORECASE,
 )
 

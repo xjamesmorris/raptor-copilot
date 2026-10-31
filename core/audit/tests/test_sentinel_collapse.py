@@ -8,7 +8,10 @@ try:
     _HAS_TS = True
 except ImportError:
     _HAS_TS = False
-pytestmark = pytest.mark.skipif(not _HAS_TS, reason="tree-sitter not installed")
+# Scoped, not module-wide: only the Go/JS sub-detectors go through
+# ts_extract — the Python sub-detectors are pure-ast and must keep
+# their coverage on tree-sitter-less runners.
+_needs_ts = pytest.mark.skipif(not _HAS_TS, reason="tree-sitter not installed")
 
 from core.audit.sentinel_collapse import detect_sentinel_collapses  # noqa: E402
 
@@ -207,6 +210,45 @@ def lookup(key):
         ]
         assert len(cache_findings) == 1
 
+    def test_non_cache_subscript_write_not_flagged(self):
+        # results[i] = None is ordinary bookkeeping, not a cache
+        # sentinel — a bare \w+ subscript pattern flagged any such
+        # function that also coerced any read.
+        src = """\
+def tally(rows):
+    results = {}
+    for i, row in enumerate(rows):
+        results[i] = None
+    label = rows and rows[0]
+    text = label or ""
+    return text
+"""
+        findings = detect_sentinel_collapses({"tally.py": src})
+        cache_findings = [
+            f for f in findings if "cache" in f.write_value.lower()
+        ]
+        assert cache_findings == []
+
+    def test_memo_named_write_still_flagged(self):
+        # Other direction: cache-ish names (memo, lru, cached) keep
+        # the detection.
+        src = """\
+def get_memo(key):
+    try:
+        val = fetch(key)
+    except FetchError:
+        memo_table[key] = None
+        return []
+    cached = memo_table.get(key)
+    result = cached or []
+    return result
+"""
+        findings = detect_sentinel_collapses({"memo.py": src})
+        cache_findings = [
+            f for f in findings if "cache" in f.write_value.lower()
+        ]
+        assert len(cache_findings) == 1
+
 
 class TestEdgeCases:
     """Boundary conditions and false-positive suppression."""
@@ -256,6 +298,7 @@ async def fetch_items(key):
         assert findings[0].function == "fetch_items"
 
 
+@_needs_ts
 class TestGoSentinel:
     """Sub-detector (d): Go sentinel confusion."""
 
@@ -302,6 +345,7 @@ def lookup(key):
         assert len(go_findings) == 0
 
 
+@_needs_ts
 class TestJsSentinel:
     """Sub-detector (e): JS/TS sentinel confusion."""
 

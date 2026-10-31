@@ -46,13 +46,12 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
+from core.symbolic import _engine
 from core.symbolic._budget import z3_call_budget
-from core.symbolic._project import _open_project
 from core.symbolic._types import SymbolicResult
 
 _DEFAULT_TIMEOUT_SECONDS = 60.0
 _DEFAULT_MAX_INPUT_BYTES = 4096
-_MAX_STATES = 512
 
 
 def find_heap_mismatch_witness(
@@ -62,15 +61,28 @@ def find_heap_mismatch_witness(
     timeout: float = _DEFAULT_TIMEOUT_SECONDS,
     max_input_bytes: int = _DEFAULT_MAX_INPUT_BYTES,
 ) -> SymbolicResult:
-    """Isolated entry point — runs in a spawned child with hard-kill."""
-    from core.symbolic._availability import angr_available
-    from core.symbolic._isolate import run_isolated
-    if not angr_available():
-        return _find_heap_mismatch_impl(
-            binary_path, target_address, timeout=timeout,
-            max_input_bytes=max_input_bytes)
-    return run_isolated(
-        "core.symbolic._heap_mismatch", "_find_heap_mismatch_impl",
+    """Isolated entry point — runs in a spawned child with hard-kill
+    via :func:`core.symbolic._engine.dispatch_isolated`; when angr is
+    unavailable the availability guard answers directly.
+
+    SUCCESS CONTRACT — read before treating a witness as proof of a
+    specific finding: ``target_address`` steers only the mapped-check
+    and the result metadata. Exploration accepts the FIRST state
+    whose copy hook recorded ANY satisfiable ``count > alloc_size``,
+    at ANY call site — a binary with a second symbolically
+    overflowable copy can return ``succeeded=True`` whose
+    ``metadata.call_addr`` points somewhere other than the
+    hypothesised site. Success therefore proves "SOME heap-copy
+    mismatch is reachable", and a consumer certifying a specific
+    static candidate MUST join ``metadata.call_addr`` against the
+    hypothesised site before attributing the witness to it.
+
+    Wiring status: not exported from ``core.symbolic`` — consumers
+    import this module directly; the package ``__all__`` surface
+    lists only the general-purpose solvers.
+    """
+    return _engine.dispatch_isolated(
+        _find_heap_mismatch_impl,
         {"binary_path": binary_path, "target_address": target_address,
          "timeout": timeout, "max_input_bytes": max_input_bytes},
         timeout=timeout,
@@ -192,6 +204,23 @@ def _install_heap_hooks(project) -> int:
                 if not overflow_feasible:
                     continue
 
+                # PIN the overflow condition into the path constraints.
+                # The satisfiable() call above used TEMPORARY
+                # extra_constraints; without solver.add the stdin
+                # witness dumped from the found state concretises under
+                # the bare path constraints, where a benign count (0)
+                # is an equally valid model — and the result would
+                # still claim "concrete stdin witness triggers
+                # heap-copy overflow". If pinning fails, skip the
+                # allocation rather than record an unpinned mismatch:
+                # never mint witness-grade evidence the solve doesn't
+                # actually constrain.
+                try:
+                    self.state.solver.add(dst == alloc_ptr)
+                    self.state.solver.add(claripy.UGT(count, alloc_size))
+                except Exception:  # noqa: BLE001
+                    continue
+
                 # Record the mismatch — exploration will pick it up
                 self.state.globals[_MISMATCH_KEY] = {
                     "copy_fn": self._base_name,
@@ -258,47 +287,26 @@ def _find_heap_mismatch_impl(
     count > alloc_size is satisfiable on any reachable path, extracts
     a concrete stdin witness.
     """
-    from core.symbolic._availability import angr_available, unavailable_result
-    if not angr_available():
-        return unavailable_result("angr", "find_heap_mismatch_witness")
+    gate = _engine.availability_gate("find_heap_mismatch_witness")
+    if gate is not None:
+        return gate
 
-    binary_path = Path(binary_path)
-    if not binary_path.is_file():
-        return SymbolicResult(
-            succeeded=False,
-            reason=f"binary not found: {binary_path}",
-            wall_seconds=0.0,
-        )
+    binary_path, missing = _engine.check_binary(binary_path)
+    if missing is not None:
+        return missing
 
     t0 = time.monotonic()
-
-    try:
-        project = _open_project(binary_path)
-        _install_heap_hooks(project)
-    except Exception as exc:  # noqa: BLE001
-        return SymbolicResult(
-            succeeded=False,
-            reason=f"angr load failed: {type(exc).__name__}: {exc}",
-            wall_seconds=time.monotonic() - t0,
-        )
-
-    if not _is_mapped(project, target_address):
-        return SymbolicResult(
-            succeeded=False,
-            reason=(
-                f"target 0x{target_address:x} not in a mapped segment "
-                "(check base address / PIE offset)"
-            ),
-            wall_seconds=time.monotonic() - t0,
-            metadata={"target_address": target_address},
-        )
-
-    import angr
-
-    state = project.factory.entry_state(
-        stdin=angr.SimFileStream,
-        add_options={angr.options.LAZY_SOLVES},
+    project, load_error = _engine.open_gated_project(
+        binary_path, t0, install_hooks=_install_heap_hooks,
     )
+    if load_error is not None:
+        return load_error
+
+    unmapped = _engine.check_mapped(project, target_address, t0)
+    if unmapped is not None:
+        return unmapped
+
+    state = _engine.make_entry_state(project)
     simgr = project.factory.simulation_manager(state)
 
     deadline = t0 + timeout
@@ -306,12 +314,7 @@ def _find_heap_mismatch_impl(
     def _has_mismatch(st) -> bool:
         return _MISMATCH_KEY in st.globals
 
-    def _step(sg):
-        if time.monotonic() >= deadline:
-            return sg.move(from_stash="active", to_stash="deadended")
-        if len(sg.active) > _MAX_STATES:
-            return sg.move(from_stash="active", to_stash="deadended")
-
+    def _scan_for_mismatch(sg):
         # Check active states for mismatch findings
         for st in list(sg.active):
             if _has_mismatch(st):
@@ -322,67 +325,41 @@ def _find_heap_mismatch_impl(
                 break
         return sg
 
+    step = _engine.budget_step(deadline, on_continue=_scan_for_mismatch)
     try:
         with z3_call_budget(deadline):
             simgr.explore(
                 find=lambda s: _has_mismatch(s),
                 num_find=1,
-                step_func=_step,
+                step_func=step,
             )
     except Exception as exc:  # noqa: BLE001
-        return SymbolicResult(
-            succeeded=False,
-            reason=f"angr explore raised: {type(exc).__name__}: {exc}",
-            wall_seconds=time.monotonic() - t0,
-            states_explored=_count_states(simgr),
+        return _engine.raised_result(
+            exc, t0=t0, simgr=simgr,
             metadata={"target_address": target_address},
         )
 
     wall = time.monotonic() - t0
-    states = _count_states(simgr)
+    states = _engine.count_states(simgr)
 
     if not simgr.found:
-        timed_out = time.monotonic() >= deadline
-        return SymbolicResult(
-            succeeded=False,
-            reason=(
-                f"timeout after {wall:.1f}s"
-                if timed_out
-                else "no heap-copy mismatch on any explored path"
-            ),
-            wall_seconds=wall,
-            states_explored=states,
+        return _engine.unfound_result(
+            deadline=deadline, wall=wall, states=states,
+            timeout_reason=f"timeout after {wall:.1f}s",
+            no_path_reason="no heap-copy mismatch on any explored path",
             metadata={"target_address": target_address},
+            step=step, simgr=simgr,
         )
 
     found = simgr.found[0]
     mismatch_info = found.globals.get(_MISMATCH_KEY, {})
 
-    try:
-        with z3_call_budget(time.monotonic() + 30.0):
-            concrete = bytes(found.posix.dumps(0))
-        if len(concrete) > max_input_bytes:
-            return SymbolicResult(
-                succeeded=False,
-                reason=(
-                    f"witness needs {len(concrete)} stdin bytes — over "
-                    f"the max_input_bytes cap ({max_input_bytes})"
-                ),
-                wall_seconds=wall,
-                states_explored=states,
-                metadata={
-                    "target_address": target_address,
-                    "witness_length": len(concrete),
-                },
-            )
-    except Exception as exc:  # noqa: BLE001
-        return SymbolicResult(
-            succeeded=False,
-            reason=f"solver failed to concretise: {type(exc).__name__}",
-            wall_seconds=wall,
-            states_explored=states,
-            metadata={"target_address": target_address},
-        )
+    concrete = _engine.dump_stdin_witness(
+        found, max_input_bytes=max_input_bytes, wall=wall, states=states,
+        metadata={"target_address": target_address},
+    )
+    if isinstance(concrete, SymbolicResult):
+        return concrete
 
     return SymbolicResult(
         succeeded=True,
@@ -398,16 +375,3 @@ def _find_heap_mismatch_impl(
         },
     )
 
-
-def _is_mapped(project, addr: int) -> bool:
-    try:
-        return project.loader.find_object_containing(addr) is not None
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def _count_states(simgr) -> int:
-    total = 0
-    for stash in simgr.stashes.values():
-        total += len(stash)
-    return total

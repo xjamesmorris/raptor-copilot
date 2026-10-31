@@ -94,6 +94,62 @@ _FINDING_SCHEMA = {
         "rule_id": {"type": "string"},
         "severity": {"type": "string"},
         "vuln_type": {"type": "string"},
+        "analysed_by": {"type": "string"},
+        "analysed_by_provider": {"type": "string"},
+        "analysis_route": {
+            "type": "object",
+            "properties": {
+                "provider": {"type": "string"},
+                "model": {"type": "string"},
+            },
+            "description": (
+                "Logical transport-owned provider/model route; not an "
+                "endpoint identity or served-model attestation."
+            ),
+            "additionalProperties": True,
+        },
+        "resolved_model": {
+            "type": "string",
+            "description": "Provider-reported observation, not authorization.",
+        },
+        "analysis_provenance": {
+            "type": "object",
+            "description": (
+                "Transport-owned provenance, separate from model-generated "
+                "analysis content."
+            ),
+            "additionalProperties": True,
+        },
+        "cost_observation": {
+            "type": "object",
+            "description": (
+                "Typed transport cost observation serialized by core/llm; "
+                "its basis distinguishes billed, estimated, subscription, "
+                "and unknown amounts."
+            ),
+            "additionalProperties": True,
+        },
+        "accounting": {
+            "type": "object",
+            "description": (
+                "Accounting summary for this emitted response record, "
+                "not the run-wide or internal-retry total."
+            ),
+            "additionalProperties": True,
+        },
+        "accounting_complete": {
+            "type": "boolean",
+            "description": (
+                "This response record has a numeric USD figure, billed or "
+                "estimated, or explicit no-spend evidence such as a cache "
+                "hit. Not invoice authority or run-wide/internal-retry "
+                "completeness."
+            ),
+        },
+        "cache_hit": {
+            "type": "boolean",
+            "description": "Core cache evidence; no new provider spend.",
+        },
 
         # LLM-emitted prose / structured data.
         "reasoning": {"type": "string"},
@@ -106,6 +162,11 @@ _FINDING_SCHEMA = {
         "error": {"type": "string"},
         "cc_error": {"type": "string"},
         "cc_debug_file": {"type": "string"},
+        "diagnostic_artifact": {"type": "string"},
+        "artifacts": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
         "skip_reason": {"type": "string"},
     },
     "required": ["finding_id", "status"],
@@ -123,12 +184,132 @@ _ORCHESTRATION_SCHEMA = {
         "findings_analysed": {"type": "integer", "minimum": 0},
         "findings_skipped": {"type": "integer", "minimum": 0},
         "findings_total": {"type": "integer", "minimum": 0},
+        "assessment": {"$ref": "#/definitions/assessment"},
+        "dispatch_failures": {"type": "integer", "minimum": 0},
+        "dispatch_incomplete_tasks": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "dispatch_batches": {
+            "type": "array",
+            "description": (
+                "Per-task dispatch outcomes, including failed primary, "
+                "review, enrichment, and fallback batches. Successful "
+                "fallback output does not erase an earlier failed batch."
+            ),
+            "items": {
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string"},
+                    "phase": {"type": "string"},
+                    "status": {"type": "string"},
+                    "input_items": {"type": "integer", "minimum": 0},
+                    "result_records": {"type": "integer", "minimum": 0},
+                    "succeeded": {"type": "integer", "minimum": 0},
+                    "failed": {"type": "integer", "minimum": 0},
+                    "not_run": {"type": "integer", "minimum": 0},
+                    "complete": {"type": "boolean"},
+                    "error_types": {"type": "object"},
+                    "failed_by_model": {"type": "object"},
+                    "first_error": {"type": "string"},
+                    "artifact": {"type": "string"},
+                    "artifacts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "additionalProperties": True,
+            },
+        },
 
         "cost": {
             "type": "object",
             "properties": {
                 "total_cost": {"type": "number", "minimum": 0},
+                "total_tokens": {"type": "integer", "minimum": 0},
                 "by_model": {"type": "object"},
+                "cost_by_model": {
+                    "type": "object",
+                    "description": "Legacy numeric subtotals, not invoice proof.",
+                    "additionalProperties": {"type": "number", "minimum": 0},
+                },
+                "accounting_by_route": {
+                    "type": "object",
+                    "description": (
+                        "Logical provider/model-keyed accounting summaries. "
+                        "Each entry contains its route and per-basis totals."
+                    ),
+                    "additionalProperties": {
+                        "type": "object",
+                        "additionalProperties": True,
+                    },
+                },
+                "cache_hits": {"type": "integer", "minimum": 0},
+                "failed_dispatches": {
+                    "type": "integer", "minimum": 0,
+                    "description": (
+                        "Error-shaped package dispatches; not proof of "
+                        "provider usage or spend."
+                    ),
+                },
+                "unclassified_legacy_events": {
+                    "type": "integer", "minimum": 0,
+                    "description": (
+                        "Legacy aggregates without per-attempt cost basis. "
+                        "They make totals incomplete without fabricating "
+                        "an unknown provider-call count."
+                    ),
+                },
+                "provider_billed_usd": {
+                    "type": "number", "minimum": 0,
+                },
+                "catalog_priced_usd": {
+                    "type": "number", "minimum": 0,
+                },
+                "configured_rate_usd": {
+                    "type": "number", "minimum": 0,
+                },
+                "cli_reported_usd": {
+                    "type": "number", "minimum": 0,
+                },
+                "estimated_usd": {"type": "number", "minimum": 0},
+                "provider_billed_calls": {
+                    "type": "integer", "minimum": 0,
+                },
+                "catalog_priced_calls": {
+                    "type": "integer", "minimum": 0,
+                },
+                "configured_rate_calls": {
+                    "type": "integer", "minimum": 0,
+                },
+                "cli_reported_calls": {
+                    "type": "integer", "minimum": 0,
+                },
+                "subscription_calls": {
+                    "type": "integer", "minimum": 0,
+                },
+                "unknown_calls": {
+                    "type": "integer", "minimum": 0,
+                },
+                "unknown_failed_attempts": {
+                    "type": "integer", "minimum": 0,
+                },
+                "retained_reservation_estimate_usd": {
+                    "type": "number", "minimum": 0,
+                },
+                "exposure_unresolved": {"type": "boolean"},
+                "usd_total_complete": {
+                    "type": "boolean",
+                    "description": (
+                        "Run-wide numeric USD coverage after reconciliation "
+                        "with the core snapshot. Figures may be estimates; "
+                        "this is not invoice authority."
+                    ),
+                },
+                "authoritative_remaining_usd": {
+                    "type": ["number", "null"],
+                    "minimum": 0,
+                },
             },
             "additionalProperties": True,
         },
@@ -173,6 +354,7 @@ SCHEMA = {
             "items": _FINDING_SCHEMA,
         },
         "orchestration": _ORCHESTRATION_SCHEMA,
+        "assessment": {"$ref": "#/definitions/assessment"},
 
         # Aggregate counters — recomputable from ``results``, kept
         # at the top level for cheap-read summary consumers.
@@ -190,6 +372,38 @@ SCHEMA = {
         "aggregation": {"type": "object"},
     },
     "required": ["mode", "results"],
+    "definitions": {
+        "assessment": {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "enum": ["complete", "partial"]},
+                "requested": {"type": "integer", "minimum": 0},
+                "eligible": {"type": "integer", "minimum": 0},
+                "selected": {"type": "integer", "minimum": 0},
+                "analyzed": {"type": "integer", "minimum": 0},
+                "unreviewed": {"type": "integer", "minimum": 0},
+                "unselected": {"type": "integer", "minimum": 0},
+                "analysis_failures": {"type": "integer", "minimum": 0},
+                "not_eligible": {"type": "integer", "minimum": 0},
+                "cap": {"type": "integer", "minimum": 0},
+                "cap_applied": {"type": "boolean"},
+                "cap_source": {"type": "string"},
+                "cap_reason": {"type": ["string", "null"]},
+                "reason": {"type": ["string", "null"]},
+            },
+            "required": [
+                "status",
+                "requested",
+                "eligible",
+                "selected",
+                "analyzed",
+                "unreviewed",
+                "cap",
+                "cap_applied",
+            ],
+            "additionalProperties": True,
+        },
+    },
     "additionalProperties": True,
 }
 

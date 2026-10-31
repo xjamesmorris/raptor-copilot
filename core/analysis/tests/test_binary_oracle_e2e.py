@@ -11,6 +11,7 @@ in isolation. These prove the layers compose correctly.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -28,6 +29,16 @@ from core.analysis.reach_witness import (
 from core.analysis.reachability import binary_oracle_absent
 
 _GC_SECTIONS = "-Wl,-dead_strip" if sys.platform == "darwin" else "-Wl,--gc-sections"
+
+# Skip-or-hermetic: the module-scoped fixture gcc-compiles a real
+# target and the classifier shells out to binutils. Without this gate
+# a toolchain-less runner ERRORS every test in the module from the
+# fixture (FileNotFoundError) instead of skipping — same gate shape as
+# the sibling test_binary_oracle.py toolchain skip.
+pytestmark = pytest.mark.skipif(
+    not all(shutil.which(t) for t in ("gcc", "nm", "objdump", "readelf")),
+    reason="toolchain (gcc/nm/objdump/readelf) not available",
+)
 
 
 @pytest.fixture(scope="module")
@@ -227,7 +238,7 @@ def test_e2e_chokepoint_helper_full_flow(_synthetic_target_built) -> None:
     assert decision is None
 
 
-@pytest.mark.slow 
+@pytest.mark.slow
 def test_e2e_hostile_planted_binary_is_dropped(tmp_path: Path) -> None:
     """The hostile-ELF attack shape: a binary with completely
     unrelated symbols (planted in the target tree by an attacker)
@@ -245,7 +256,7 @@ def test_e2e_hostile_planted_binary_is_dropped(tmp_path: Path) -> None:
                     "-o", str(planted_bin)], check=True)
 
     # Enrich with ONLY the planted binary. Defense must fire: the
-    # planted binary names alpha/beta/main from the source, none of
+    # source inventory names alive_helper_*/dead_helper, none of
     # which the planted binary's DWARF knows about → drop with
     # warning, no inventory items annotated.
     counts = enrich_inventory_with_binary_oracle(inv, (planted_bin,))

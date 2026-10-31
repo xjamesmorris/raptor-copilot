@@ -1,8 +1,10 @@
 """Patch localization: rank changed functions against an advisory,
 expand to call chains, cluster the survivors.
 
-The end-to-end recipe from the SiftRank paper's security evaluation
-(arXiv:2512.06155 §4; see docs/references.md), for the situation
+The end-to-end recipe from the security evaluation in the SiftRank
+paper (Gross, "Sift or Get Off the PoC: Applying Information
+Retrieval to Vulnerability Research with SiftRank",
+arXiv:2512.06155 §4), for the situation
 /cve-diff's discovery agent cannot solve: no published fix commit,
 but a vendor patch is in hand and the changed functions are known
 (from a source diff, or BinDiff + decompilation for binary patches).
@@ -161,16 +163,20 @@ def localize(
             )
     chains = build_chains(candidates, edges)
     chains_truncated = 0
-    if len(chains) > max(1, max_chains):
+    # The floor and the slice must agree: guarding with max(1, ...)
+    # but slicing with the raw value emptied the chain list for
+    # max_chains=0 instead of keeping one chain.
+    chain_cap = max(1, max_chains)
+    if len(chains) > chain_cap:
         # Singles come first from build_chains, so every candidate
         # stays represented; excess pair chains are dropped loudly.
-        chains_truncated = len(chains) - max_chains
+        chains_truncated = len(chains) - chain_cap
         logger.warning(
             "localize: %d chains exceed the %d-chain cap; dropping %d "
             "pair chains (pass max_chains to raise)",
-            len(chains), max_chains, chains_truncated,
+            len(chains), chain_cap, chains_truncated,
         )
-        chains = chains[:max_chains]
+        chains = chains[:chain_cap]
     query = DEFAULT_QUERY_PREFIX + advisory
 
     result = rank_items(

@@ -11,6 +11,7 @@ now stat the file first and skip (with a warning) anything over
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -20,10 +21,25 @@ from core.project.findings_utils import (
     MAX_FINDINGS_JSON_BYTES,
     load_findings_from_dir,
     load_sca_findings_from_dir,
+    oversized_findings_files,
 )
 
 _FINDING = {"id": "f1", "file": "a.c", "function": "p", "line": 1,
             "status": "confirmed"}
+
+
+@pytest.fixture(autouse=True)
+def _raptor_logger_propagates():
+    """Let caplog see records from the 'raptor' logger.
+
+    RaptorLogger sets propagate=False on logging.getLogger('raptor'),
+    so records never reach root where pytest's caplog handler lives.
+    """
+    raptor = logging.getLogger("raptor")
+    orig = raptor.propagate
+    raptor.propagate = True
+    yield
+    raptor.propagate = orig
 
 
 def _write_findings(path: Path, pad: int = 0) -> None:
@@ -46,7 +62,7 @@ def test_over_gate_skipped_before_parse(tmp_path: Path, monkeypatch,
     _write_findings(tmp_path / "findings.json", pad=4096)
     monkeypatch.setattr(findings_utils, "MAX_FINDINGS_JSON_BYTES", 1024,
                         raising=False)
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("WARNING", logger="raptor"):
         assert load_findings_from_dir(tmp_path) == []
     assert any("gate" in r.message for r in caplog.records)
 
@@ -57,7 +73,7 @@ def test_sca_loader_shares_the_gate(tmp_path: Path, monkeypatch, caplog):
     sca.write_text(json.dumps([_FINDING]) + " " * 4096)
     monkeypatch.setattr(findings_utils, "MAX_FINDINGS_JSON_BYTES", 1024,
                         raising=False)
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("WARNING", logger="raptor"):
         assert load_sca_findings_from_dir(tmp_path) == []
     assert any("gate" in r.message for r in caplog.records)
 
@@ -69,7 +85,7 @@ def test_real_gate_bound_via_sparse_file(tmp_path: Path, caplog):
     with p.open("wb") as fh:
         fh.seek(MAX_FINDINGS_JSON_BYTES)
         fh.write(b"x")
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("WARNING", logger="raptor"):
         assert load_findings_from_dir(tmp_path) == []
     assert any("gate" in r.message for r in caplog.records), (
         "the skip must cite the byte gate, not a parse failure")
@@ -84,6 +100,79 @@ def test_merge_and_report_paths_are_gated(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(findings_utils, "MAX_FINDINGS_JSON_BYTES", 1024,
                         raising=False)
     assert merge_findings([run]) == []
+
+
+def test_skip_warning_names_file_consequence_and_remedy(
+        tmp_path: Path, monkeypatch, caplog):
+    """The over-gate skip must be actionable: name the skipped FILE,
+    the merged-view consequence, and a remedy — a kernel-scale run's
+    findings vanishing from /project views must never be a mystery."""
+    _write_findings(tmp_path / "findings.json", pad=4096)
+    monkeypatch.setattr(findings_utils, "MAX_FINDINGS_JSON_BYTES", 1024,
+                        raising=False)
+    with caplog.at_level("WARNING", logger="raptor"):
+        load_findings_from_dir(tmp_path)
+    msg = "\n".join(r.getMessage() for r in caplog.records)
+    assert str(tmp_path / "findings.json") in msg
+    assert "EXCLUDED" in msg
+    assert "/project findings" in msg
+    assert "jq" in msg
+
+
+def _sparse_over_gate(path: Path) -> None:
+    """st_size one byte over the gate; sparse — never read or parsed."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as fh:
+        fh.seek(MAX_FINDINGS_JSON_BYTES)
+        fh.write(b"x")
+
+
+class TestOversizedFindingsFiles:
+    """Stat-only preview of the gate along the loader's exact fallback
+    chain — recompute-and-replace callers (the completion-time
+    re-adjudication sweep) refuse to replace derived artifacts when
+    the recompute would run over a gate-excluded view."""
+
+    def test_oversized_primary_reported(self, tmp_path: Path):
+        _sparse_over_gate(tmp_path / "findings.json")
+        assert oversized_findings_files(tmp_path) == [
+            tmp_path / "findings.json"]
+
+    def test_fallback_checked_when_primary_missing(self, tmp_path: Path):
+        _sparse_over_gate(tmp_path / "openant_findings.json")
+        assert oversized_findings_files(tmp_path) == [
+            tmp_path / "openant_findings.json"]
+
+    def test_fallback_checked_when_primary_oversized(self, tmp_path: Path):
+        # An over-gate primary makes the loader consult the fallback,
+        # so an over-gate fallback fires a second gate — both report.
+        _sparse_over_gate(tmp_path / "findings.json")
+        _sparse_over_gate(tmp_path / "openant_findings.json")
+        assert oversized_findings_files(tmp_path) == [
+            tmp_path / "findings.json",
+            tmp_path / "openant_findings.json"]
+
+    def test_readable_primary_shadows_oversized_fallback(
+            self, tmp_path: Path):
+        # The loader never consults the fallback past a readable
+        # primary — previewing it anyway would report a gate the
+        # loader cannot fire (a phantom deferral trigger).
+        _write_findings(tmp_path / "findings.json")
+        _sparse_over_gate(tmp_path / "openant_findings.json")
+        assert oversized_findings_files(tmp_path) == []
+
+    def test_no_files_no_gates(self, tmp_path: Path):
+        assert oversized_findings_files(tmp_path) == []
+
+    def test_at_bound_is_not_over(self, tmp_path: Path):
+        # The gate is strictly greater-than: st_size == the bound
+        # loads, and the preview must agree with the loader's own
+        # comparison in both directions.
+        p = tmp_path / "findings.json"
+        with p.open("wb") as fh:
+            fh.seek(MAX_FINDINGS_JSON_BYTES - 1)
+            fh.write(b"x")
+        assert oversized_findings_files(tmp_path) == []
 
 
 if __name__ == "__main__":

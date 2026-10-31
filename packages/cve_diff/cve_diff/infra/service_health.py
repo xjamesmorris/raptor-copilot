@@ -1,5 +1,10 @@
 """Service health probes.
 
+SIBLING MODULE: ``cve_env/infra/service_health.py`` — same
+``HealthResult``/``as_row``/``render_table`` substrate over a
+different probe set. A substrate fix here usually applies there
+(``tests/unit/infra/test_service_health.py`` pins the shared shapes).
+
 For each external service the pipeline depends on, a fast (≤ 10s)
 probe that:
   - Confirms the service is reachable
@@ -28,6 +33,7 @@ import time
 from dataclasses import dataclass
 
 from core.http import HttpError
+from core.security.log_sanitisation import sanitise_for_terminal
 from core.http.urllib_backend import UrllibClient
 
 
@@ -42,8 +48,16 @@ class HealthResult:
     def as_row(self) -> str:
         status = "✓" if self.ok else "✗"
         latency = f"{self.latency_ms:>6.0f} ms" if self.latency_ms < 99999 else "  --"
-        rl = f" [{self.rate_limit}]" if self.rate_limit else ""
-        return f"  {status}  {self.name:<22} {latency}  {self.detail[:60]}{rl}"
+        # ``detail`` / ``rate_limit`` carry live-network error text
+        # (HttpError bodies, response header hints): a proxied or
+        # MITM'd endpoint can put ANSI/OSC bytes there, and this row
+        # reaches the operator TTY through the registered CLI writers.
+        # Escape + bound at the render (the old bare [:60] slice
+        # bounded length but relayed escape bytes verbatim).
+        detail = sanitise_for_terminal(self.detail, max_len=60)
+        rl = (f" [{sanitise_for_terminal(self.rate_limit, max_len=40)}]"
+              if self.rate_limit else "")
+        return f"  {status}  {self.name:<22} {latency}  {detail}{rl}"
 
 
 _TIMEOUT_S = 10
@@ -117,8 +131,13 @@ def probe_anthropic() -> HealthResult:
         )
 
     api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    # Both first-party spellings authenticate the SDK route (member
+    # sites of core.security.credential_env.ANTHROPIC_FIRST_PARTY_AUTH_VARS;
+    # CLAUDE_CODE_OAUTH_TOKEN is excluded — the SDK does not read it).
+    # A bearer-token-only operator must not see a false "not set".
+    auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN", "").strip()
     via_dispatcher = bool(os.environ.get("RAPTOR_LLM_SOCKET"))
-    if not api_key and not via_dispatcher:
+    if not api_key and not auth_token and not via_dispatcher:
         # Phrasing keeps the historical "ANTHROPIC_API_KEY not set"
         # substring so existing test fixtures + scripts grepping for
         # it still match; the credential-isolation hint is appended
@@ -129,6 +148,14 @@ def probe_anthropic() -> HealthResult:
                 "ANTHROPIC_API_KEY not set (or run with "
                 "RAPTOR_LLM_SOCKET for credential-isolation dispatcher)"
             ),
+        )
+    if not api_key and auth_token:
+        # Bearer-token auth uses a different header scheme than the
+        # x-api-key ping below; report configured-but-unprobed rather
+        # than a false "not set".
+        return HealthResult(
+            "Anthropic API", True, 0,
+            detail="auth via ANTHROPIC_AUTH_TOKEN (bearer; not pinged)",
         )
     if not api_key:
         # Dispatcher route — the API call would succeed via
@@ -198,6 +225,10 @@ def probe_osv() -> HealthResult:
 
 
 def probe_github() -> HealthResult:
+    # SIBLINGS (a fix here usually applies there):
+    # cve_env/tools/github_fetch.py::resolve_github_token and
+    # cve_env/infra/service_health.py::_resolve_github_token_for_probe —
+    # all three fork `gh auth token` with a sanitised env.
     # `gh auth token` returns non-zero with an empty stdout when the user
     # isn't logged in (no exception raised). The previous code only fell
     # back to $GITHUB_TOKEN on exec failure (TimeoutExpired/FileNotFoundError),
@@ -325,6 +356,17 @@ def render_table(results: list[HealthResult]) -> str:
     lines.extend(r.as_row() for r in results)
     lines.append("")
     failing_critical = [r.name for r in results if not r.ok and r.name in CRITICAL_NAMES]
+    # NVD/OSV grounding-pair rule (ported from the cve-env sibling):
+    # either source suffices to ground a CVE, so the pair-level outage
+    # deserves its own warning — the agent has no working grounding
+    # source at all when BOTH are down.
+    nvd_ok = any(r.ok and r.name == "NVD API" for r in results)
+    osv_ok = any(r.ok and r.name == "OSV API" for r in results)
+    if not nvd_ok and not osv_ok:
+        lines.append(
+            "⚠ Both NVD and OSV are unhealthy. Agent has no working "
+            "CVE-grounding source."
+        )
     if failing_critical:
         lines.append(
             f"⚠ {len(failing_critical)} CRITICAL service(s) unhealthy: "

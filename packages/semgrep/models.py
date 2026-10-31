@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from core.json.bounded import loads_bounded
+from core.security.log_sanitisation import escape_nonprintable
 
 # Byte ceiling for semgrep tool output (SARIF on stdout and the
 # --json-output file). Both are produced over a scanned — possibly
@@ -12,6 +13,29 @@ from core.json.bounded import loads_bounded
 # scans reach tens of MB; 128 MiB matches the cap used for SARIF
 # artifacts elsewhere while refusing DoS-scale payloads.
 _MAX_TOOL_OUTPUT_BYTES = 128 * 1024 * 1024
+
+# Bounds for the skipped-path summary built from ``paths.skipped``.
+# On a large monorepo that list can carry hundreds of thousands of
+# entries (node_modules, build trees), and both the paths and the
+# entry count are driven by the scanned — possibly hostile — tree,
+# so the summary must stay bounded regardless of input. The caps cut
+# both ways:
+#   * higher = more of the excluded scope visible on the result, at
+#     the cost of result-size / serialised-artifact bloat that the
+#     target's file count and path lengths control;
+#   * lower = cheaper results, but the operator loses the ability to
+#     see WHICH subtree a skip reason is eating.
+# 5 sample paths per reason is enough to recognise the affected
+# subtree without retaining the whole list; 12 distinct reasons
+# covers semgrep's skip-reason enum (~10 values on 1.172.0) with
+# headroom while refusing an unbounded set of fabricated reason
+# strings from a damaged payload.
+_SKIPPED_SAMPLE_CAP = 5
+_SKIPPED_REASON_CAP = 12
+# Per-string caps for the same reason: a single entry must not carry
+# an unbounded target-chosen payload into the retained summary.
+_SKIPPED_PATH_MAXLEN = 300
+_SKIPPED_REASON_MAXLEN = 100
 
 
 def _coerce_int(value: Any) -> int:
@@ -36,8 +60,20 @@ class SemgrepFinding:
     level: str = "warning"
 
     @classmethod
-    def from_sarif_result(cls, result: dict) -> "SemgrepFinding":
-        """Build from a single SARIF runs[].results[] entry."""
+    def from_sarif_result(
+        cls,
+        result: dict,
+        rule_levels: dict[str, str] | None = None,
+    ) -> "SemgrepFinding":
+        """Build from a single SARIF runs[].results[] entry.
+
+        ``rule_levels`` maps rule id → the rule's
+        ``defaultConfiguration.level`` from the run's rules table.
+        Semgrep's SARIF emitter never sets ``result.level`` (SARIF
+        severity inheritance; verified against semgrep 1.172.0), so
+        without the table every rule-declared severity — including
+        error-severity rules — flattens to "warning".
+        """
         if not result or not isinstance(result, dict):
             return cls(file="", line=0)
 
@@ -49,7 +85,9 @@ class SemgrepFinding:
         elif isinstance(msg, str):
             message = msg
 
-        level = result.get("level", "warning")
+        level = result.get("level")
+        if not isinstance(level, str) or not level:
+            level = (rule_levels or {}).get(rule_id) or "warning"
 
         file = ""
         line = 0
@@ -110,6 +148,12 @@ class SemgrepResult:
     findings: list[SemgrepFinding] = field(default_factory=list)
     files_examined: list[str] = field(default_factory=list)
     files_failed: list[dict[str, str]] = field(default_factory=list)
+    # Bounded per-reason summary of the paths semgrep did NOT scan
+    # (``paths.skipped`` — only populated at --verbose). Shape:
+    # ``{"total": int, "reasons": {reason: {"count": int,
+    # "sample": [path, ...]}}, "reasons_truncated": int}``; empty dict
+    # when nothing was skipped. See ``_summarise_skipped``.
+    skipped_summary: dict[str, Any] = field(default_factory=dict)
     semgrep_version: str = ""
     returncode: int = 0
     stderr: str = ""
@@ -136,6 +180,7 @@ class SemgrepResult:
             "findings": [f.to_dict() for f in self.findings],
             "files_examined": self.files_examined,
             "files_failed": self.files_failed,
+            "skipped_summary": self.skipped_summary,
             "semgrep_version": self.semgrep_version,
             "returncode": self.returncode,
             "elapsed_ms": self.elapsed_ms,
@@ -161,29 +206,96 @@ def parse_sarif(text: str) -> list[SemgrepFinding]:
     if not isinstance(data, dict):
         return []
 
+    from core.sarif.parser import get_rules, rule_default_level
+
     findings: list[SemgrepFinding] = []
     runs = data.get("runs") or []
     for run in runs:
         if not isinstance(run, dict):
             continue
+        # Rule-declared severities from the run's rules table — the
+        # only place semgrep's SARIF carries them (results omit level).
+        rule_levels = {
+            rid: level
+            for rid, rule in get_rules(run).items()
+            if (level := rule_default_level(rule))
+        }
         results = run.get("results") or []
         # Skip non-dict / empty entries outright: converting them
         # produced phantom SemgrepFinding(file='', line=0) records that
         # inflated finding_count downstream.
         findings.extend(
-            SemgrepFinding.from_sarif_result(result)
+            SemgrepFinding.from_sarif_result(result, rule_levels)
             for result in results
             if result and isinstance(result, dict)
         )
     return findings
 
 
+def _summarise_skipped(raw: Any) -> dict[str, Any]:
+    """Bounded per-reason summary of semgrep's ``paths.skipped`` list.
+
+    Returns ``{}`` when nothing usable was skipped, else::
+
+        {"total": <all skipped entries>,
+         "reasons": {reason: {"count": n, "sample": [path, ...]}},
+         "reasons_truncated": <distinct reasons dropped by the cap>}
+
+    Reasons are ordered by descending count (ties by name) and capped
+    at ``_SKIPPED_REASON_CAP``; each keeps the first
+    ``_SKIPPED_SAMPLE_CAP`` paths in semgrep's own output order.
+    ``total`` always counts EVERY entry, so truncation never hides the
+    magnitude of what went unscanned. Non-dict entries are ignored;
+    a missing reason buckets as ``"unspecified"``.
+
+    Path and reason strings are rendered inert at ingestion
+    (``escape_nonprintable``) BEFORE the length caps — paths are
+    target-chosen file names, and escaping after truncation would let
+    hostile bytes ride inside the kept prefix while the cap hides the
+    evidence.
+    """
+    if not isinstance(raw, list):
+        return {}
+    counts: dict[str, int] = {}
+    samples: dict[str, list[str]] = {}
+    total = 0
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        total += 1
+        reason = escape_nonprintable(
+            str(entry.get("reason") or "unspecified"),
+        )[:_SKIPPED_REASON_MAXLEN]
+        counts[reason] = counts.get(reason, 0) + 1
+        bucket = samples.setdefault(reason, [])
+        path = escape_nonprintable(str(entry.get("path") or ""))
+        if path and len(bucket) < _SKIPPED_SAMPLE_CAP:
+            bucket.append(path[:_SKIPPED_PATH_MAXLEN])
+    if not total:
+        return {}
+    ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    return {
+        "total": total,
+        "reasons": {
+            reason: {"count": count, "sample": samples.get(reason, [])}
+            for reason, count in ordered[:_SKIPPED_REASON_CAP]
+        },
+        "reasons_truncated": max(0, len(ordered) - _SKIPPED_REASON_CAP),
+    }
+
+
 def parse_json_output(text: str) -> dict[str, Any]:
     """Parse Semgrep's --json-output content for paths.scanned, errors, version.
 
     Returns a dict with keys: files_examined, files_failed,
-    semgrep_version, errors. Empty/malformed input returns empty values
-    rather than raising.
+    semgrep_version, errors, skipped_summary. Empty/malformed input
+    returns empty values rather than raising.
+
+    ``skipped_summary`` is the bounded per-reason digest of
+    ``paths.skipped`` (see :func:`_summarise_skipped`) — the record of
+    what the scan did NOT examine and why. Semgrep only populates the
+    underlying list at --verbose; under quieter verbosity levels the
+    summary is simply empty.
 
     ``errors`` carries the rendered error-level entries of semgrep's
     real ``errors`` array (InvalidRuleSchemaError, SemgrepError, fatal
@@ -199,6 +311,7 @@ def parse_json_output(text: str) -> dict[str, Any]:
         "files_failed": [],
         "semgrep_version": "",
         "errors": [],
+        "skipped_summary": {},
     }
     if not text:
         return out
@@ -213,6 +326,7 @@ def parse_json_output(text: str) -> dict[str, Any]:
     paths = data.get("paths") or {}
     scanned = paths.get("scanned") or []
     out["files_examined"] = sorted(str(p) for p in scanned if p)
+    out["skipped_summary"] = _summarise_skipped(paths.get("skipped"))
 
     errors = data.get("errors") or []
     out["files_failed"] = [

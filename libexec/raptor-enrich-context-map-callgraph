@@ -34,9 +34,9 @@ if not (os.environ.get("CLAUDECODE")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import core.startup.process_init  # noqa: E402,F401
 from core.artifacts.context_map_budget import (  # noqa: E402
-    enforce_context_map_budget,
+    save_context_map,
 )
-from core.json import load_json, save_json  # noqa: E402
+from core.json import load_json  # noqa: E402
 from core.orchestration.context_map_callgraph import (  # noqa: E402
     DEFAULT_MAX_DEPTH,
     enrich_with_call_edges,
@@ -86,10 +86,9 @@ def main() -> int:
         )
         return 1
 
-    checklist = load_json(understand_dir / "checklist.json") or {}
-    target_path = (
-        checklist.get("target_path") if isinstance(checklist, dict) else None
-    )
+    from core.inventory import read_checklist
+    checklist = read_checklist(understand_dir)
+    target_path = checklist.get("target_path")
     if not target_path:
         print(
             "raptor-enrich-context-map-callgraph: checklist missing "
@@ -108,9 +107,23 @@ def main() -> int:
         )
         return 1
 
-    checklist_path = understand_dir / "checklist.json"
+    # Project mode: route the FULL (uncapped) mechanical edge set into
+    # the project graph store alongside the capped in-artifact list. A
+    # project-owned store resolves OUTSIDE the run dir; a run-local
+    # graph path means no project — storeless compatibility path.
+    graph_store = None
+    try:
+        from core.understand_graph.store import graph_path_for_run
+        candidate = graph_path_for_run(understand_dir, str(target_path))
+        if not candidate.resolve().is_relative_to(understand_dir):
+            graph_store = candidate
+    except Exception:  # noqa: BLE001 — routing is additive; enrichment must survive resolution failure
+        graph_store = None
+
     edge_count = enrich_with_call_edges(
-        context_map, checklist_path, checklist=checklist,
+        context_map, checklist=checklist,
+        graph_store=graph_store, run_dir=understand_dir,
+        target_path=str(target_path),
     )
 
     # Reuse the checklist as the inventory — no re-parse of the
@@ -126,8 +139,7 @@ def main() -> int:
     )
 
     if enriched or edge_count:
-        enforce_context_map_budget(context_map)
-        save_json(context_map_path, context_map)
+        save_context_map(context_map_path, context_map)
         parts = []
         if enriched:
             parts.append(f"{enriched} entry point(s)")

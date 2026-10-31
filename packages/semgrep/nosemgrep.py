@@ -24,7 +24,8 @@ import logging
 import re
 from pathlib import Path
 
-from core.paths import strip_file_uri
+from core.paths import confine, strip_file_uri
+from core.source import read_text_capped, split_lines
 
 logger = logging.getLogger(__name__)
 
@@ -65,11 +66,13 @@ class _FileCache:
         if len(self._store) >= _MAX_CACHE_FILES:
             # Evict oldest entry (insertion-order dict).
             self._store.pop(next(iter(self._store)))
-        try:
-            text = Path(path).read_text(encoding="utf-8", errors="replace")
-            result = text.splitlines()
-        except OSError:
-            result = None
+        # Capped read (shared 10 MB default): a pathological
+        # generated/planted file yields its truncated prefix instead
+        # of loading whole per annotation pass.
+        got = read_text_capped(path, newline="")
+        # \n-model split: the indexing line numbers are
+        # semgrep's, which count \n only (see extract_nosemgrep).
+        result = None if got is None else split_lines(got[0])
         self._store[path] = result
         return result
 
@@ -89,10 +92,18 @@ def extract_nosemgrep(
     if found, ``None`` otherwise.
     """
     if _lines is None:
-        try:
-            _lines = Path(file_path).read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError:
+        # Same capped read as the annotate_sarif path's _FileCache —
+        # the standalone entry point read files unbounded, the
+        # uncapped-read shape the shared reader exists to close.
+        got = read_text_capped(file_path, newline="")
+        if got is None:
             return None
+        # \n-model split (core.source.lines contract): *line* is the
+        # semgrep-reported line number, which counts \n only. A
+        # splitlines() view let one string-literal form feed shift the
+        # index so a standalone nosemgrep comment two physical lines
+        # above the finding forged a developer-suppression annotation.
+        _lines = split_lines(got[0])
 
     for offset in (0, -1):
         idx = line - 1 + offset  # 1-indexed → 0-indexed
@@ -139,33 +150,60 @@ def annotate_sarif(sarif_data: dict, repo_root: str) -> int:
     cache = _FileCache()
     annotated = 0
 
-    for run in sarif_data.get("runs", []):
+    def _dget(container: object, key: str) -> dict:
+        """Nested SARIF lookup tolerating explicit nulls / wrong types.
+
+        The SARIF is tool-written but merge inputs vary; one result
+        carrying ``"physicalLocation": null`` used to raise
+        AttributeError out of the whole merge (the caller then fell
+        back to per-file annotation). Malformed nodes read as empty.
+        """
+        v = container.get(key) if isinstance(container, dict) else None
+        return v if isinstance(v, dict) else {}
+
+    runs = sarif_data.get("runs", [])
+    if not isinstance(runs, list):
+        runs = []
+    for run in runs:
         if not isinstance(run, dict):
             continue
         # nosemgrep is Semgrep-specific — skip CodeQL/Coccinelle runs.
-        tool_name = (
-            run.get("tool", {}).get("driver", {}).get("name", "")
+        tool_name = str(
+            _dget(_dget(run, "tool"), "driver").get("name", "") or ""
         ).lower()
         if tool_name and "semgrep" not in tool_name:
             continue
-        for result in run.get("results", []):
+        results = run.get("results", [])
+        if not isinstance(results, list):
+            continue
+        for result in results:
             if not isinstance(result, dict):
                 continue
             locations = result.get("locations", [])
-            if not locations:
+            if not isinstance(locations, list) or not locations:
                 continue
             loc = locations[0]
             if not isinstance(loc, dict):
                 continue
-            phys = loc.get("physicalLocation", {})
-            uri = phys.get("artifactLocation", {}).get("uri", "")
-            line = phys.get("region", {}).get("startLine", 0)
-            if not uri or not line:
+            phys = _dget(loc, "physicalLocation")
+            uri = _dget(phys, "artifactLocation").get("uri", "")
+            line = _dget(phys, "region").get("startLine", 0)
+            if not isinstance(uri, str) or not uri:
+                continue
+            if not isinstance(line, int) or isinstance(line, bool) or not line:
                 continue
 
-            # Resolve the file path against repo root.
-            stripped = strip_file_uri(uri)
-            abs_path = stripped if stripped != uri else str(root / uri)
+            # Resolve the file path against the repo root,
+            # containment-checked: the URI comes from SARIF produced
+            # over an untrusted repo, so a file:// / absolute URI or
+            # traversal shape would otherwise read arbitrary host
+            # files and quote them into properties.nosemgrep (the
+            # codeql siblings' read_source_context /
+            # read_vulnerable_code enforce the same root).
+            resolved = confine(root, strip_file_uri(uri))
+            if resolved is None:
+                continue
+            abs_path = str(resolved)
 
             lines = cache.lines(abs_path)
             if lines is None:
@@ -173,7 +211,11 @@ def annotate_sarif(sarif_data: dict, repo_root: str) -> int:
 
             info = extract_nosemgrep(Path(abs_path), line, _lines=lines)
             if info:
+                # A non-dict properties value can't take the
+                # annotation; skip rather than clobber or crash.
                 props = result.setdefault("properties", {})
+                if not isinstance(props, dict):
+                    continue
                 props["nosemgrep"] = info
                 annotated += 1
 

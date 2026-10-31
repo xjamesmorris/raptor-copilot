@@ -38,7 +38,11 @@ def run_is_imported(run_dir: Path) -> bool:
     marker = Path(run_dir) / IMPORTED_RUN_MARKER_FILE
     if not marker.is_file():
         return False
-    data = load_json(marker)
+    # Budgeted: a legitimate marker is ~100 bytes, the run dir is
+    # child-writable, and this predicate runs per sibling in merge /
+    # report / gate loops — an oversize plant reads as "not imported"
+    # (planting one only DEMOTES a run's standing anyway).
+    data = load_json(marker, max_bytes=1024 * 1024)
     return bool(isinstance(data, dict) and data.get("imported"))
 
 
@@ -83,13 +87,50 @@ def finding_file(finding: dict[str, Any]) -> str:
     return str(PurePosixPath(fp))
 
 
+def _key_str(value: Any) -> str:
+    """Coerce a key component to str.
+
+    Finding rows are LLM-authored and import-restored — a hostile row
+    carrying a dict/list in ``function``/``vuln_type`` produced an
+    UNHASHABLE key tuple, and one such row TypeError'd every consumer
+    that indexes by key (/project findings, report, merge, diff,
+    correlate all wedge; main() does not catch TypeError). Non-str
+    scalars stringify; unhashable containers collapse to a stable
+    repr-ish string so the row still participates in dedup.
+    """
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    try:
+        return str(value)
+    except Exception:  # noqa: BLE001 — a __str__ bomb must not wedge views
+        return "?"
+
+
+def _key_line(value: Any) -> int:
+    """Coerce a line component to int-or-0 (same hostile-row rationale
+    as :func:`_key_str` — a list-valued ``line`` made the tuple
+    unhashable)."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
 def dedup_key(finding: dict[str, Any]) -> tuple[str, str, int]:
     """Dedup key for a finding: (file, function, line). More stable than ID.
 
     Uses :func:`finding_file` so scan-shaped (``file``) and orchestrated
-    (``file_path``) findings at the same location share a key.
+    (``file_path``) findings at the same location share a key. Every
+    component is coerced hashable — see :func:`_key_str`.
     """
-    return (finding_file(finding), finding.get("function", ""), finding.get("line") or 0)
+    return (finding_file(finding), _key_str(finding.get("function", "")),
+            _key_line(finding.get("line") or 0))
 
 
 def group_key(finding: dict[str, Any]) -> tuple[str, str, str]:
@@ -97,11 +138,17 @@ def group_key(finding: dict[str, Any]) -> tuple[str, str, str]:
 
     Findings with the same group key are likely the same logical bug
     (e.g. TOCTOU check at line 7 and use at line 10).
+
+    Uses :func:`finding_file` for the same reason as ``dedup_key``:
+    orchestrated /agentic findings carry ``file_path``, not ``file``,
+    and keying them all under file ``""`` collapsed same-function /
+    same-type findings in DIFFERENT files into one "vuln" across
+    `/project findings`, run summaries, and merge stats.
     """
     return (
-        finding.get("file", ""),
-        finding.get("function", ""),
-        finding.get("vuln_type", ""),
+        finding_file(finding),
+        _key_str(finding.get("function", "")),
+        _key_str(finding.get("vuln_type", "")),
     )
 
 
@@ -137,12 +184,16 @@ MAX_FINDINGS_JSON_BYTES = 64 * 1024 * 1024
 
 
 def _load_size_gated_json(path: Path) -> Any | None:
-    """``load_json`` with a pre-parse ``st_size`` gate.
+    """``load_json`` under the findings-file byte budget.
 
     Returns ``None`` for missing files (matching ``load_json``) and
     for files over :data:`MAX_FINDINGS_JSON_BYTES` — the skip is
-    logged at warning so an operator investigating a missing run in
-    a report sees why.
+    logged at warning citing the gate so an operator investigating a
+    missing run in a report sees why. The budget is ALSO passed as
+    ``max_bytes`` — load_json re-checks it on the OPEN fd and after a
+    capped read, so a file that grows between the advisory ``stat()``
+    and the read is refused instead of buffered unbounded (the
+    previous name-based pre-gate alone left exactly that window).
     """
     try:
         size = path.stat().st_size
@@ -151,20 +202,38 @@ def _load_size_gated_json(path: Path) -> Any | None:
     if size > MAX_FINDINGS_JSON_BYTES:
         logger.warning(
             "skipping %s: %d bytes exceeds the %d-byte findings-file "
-            "gate — not parsing (oversized/hostile artifact?)",
+            "gate — this run's findings are EXCLUDED from every "
+            "merged project view (/project findings, report, "
+            "correlate, diff) until the file shrinks. If the file is "
+            "RAPTOR's own oversized artifact (kernel-scale runs), "
+            "inspect it directly (jq streams it) or split/trim it; "
+            "if its origin is unknown, treat it as hostile and do "
+            "not parse it wholesale.",
             path, size, MAX_FINDINGS_JSON_BYTES,
         )
         return None
-    return load_json(path)
+    return load_json(path, max_bytes=MAX_FINDINGS_JSON_BYTES)
 
 
 def load_findings_from_dir(run_dir: Path) -> list[dict[str, Any]]:
     """Load findings list from a run directory's findings.json.
 
+    Standalone ``/openant`` runs write their translated findings to
+    ``openant_findings.json`` and no top-level ``findings.json``, so the
+    unified project views (findings / report / correlate / diff) never
+    saw them. Fall back to that file when ``findings.json`` is absent —
+    fallback-only, because ``/agentic`` runs write BOTH and their
+    ``findings.json`` already contains the merged OpenAnt rows (reading
+    both would double-count). The rows are already normalised to the
+    common finding shape by the translator, so they group, dedup, and
+    render through the same machinery.
+
     Oversized files (see :data:`MAX_FINDINGS_JSON_BYTES`) are skipped
     with a warning rather than parsed wholesale into memory.
     """
     data = _load_size_gated_json(run_dir / "findings.json")
+    if data is None:
+        data = _load_size_gated_json(run_dir / "openant_findings.json")
     if data is None:
         logger.debug("No findings.json in %s", run_dir)
         return []
@@ -173,6 +242,38 @@ def load_findings_from_dir(run_dir: Path) -> list[dict[str, Any]]:
     if isinstance(data, dict):
         return data.get("findings") or data.get("results") or []
     return []
+
+
+def oversized_findings_files(run_dir: Path) -> list[Path]:
+    """The findings artifacts :func:`load_findings_from_dir` would skip
+    for size in *run_dir* — a stat-only preview of the byte gate.
+
+    Follows the loader's fallback chain exactly: ``findings.json``
+    first; ``openant_findings.json`` is consulted only when the primary
+    is missing or itself over the gate. A readable primary therefore
+    shadows an oversized fallback file — the loader never reads it, so
+    no gate would fire and previewing it anyway would report a
+    phantom. Size is the only axis previewed: a parse failure on an
+    under-gate primary (a different, pre-existing exclusion channel)
+    still falls back inside the loader without registering here.
+
+    Callers that recompute-and-REPLACE artifacts derived from a whole
+    project's findings (the completion-time re-adjudication sweep) use
+    this to refuse the replace when the recomputation would silently
+    exclude a run's rows.
+    """
+    out: list[Path] = []
+    for name in ("findings.json", "openant_findings.json"):
+        path = run_dir / name
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue  # missing — the loader falls through to the next name
+        if size > MAX_FINDINGS_JSON_BYTES:
+            out.append(path)
+            continue  # skipped by the gate — the next name IS consulted
+        break  # this is the file the loader reads; later names never are
+    return out
 
 
 def load_sca_findings_from_dir(run_dir: Path) -> list[dict[str, Any]]:

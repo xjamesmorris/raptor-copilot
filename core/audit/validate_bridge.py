@@ -10,11 +10,13 @@ Search order for sibling output (similar to understand_bridge):
   2. Project siblings (same project, different run type)
   3. Global out/ by target path match (newest name first)
 
-Unlike understand_bridge there is NO freshness check: candidates
-match purely on target path, so a run against an older checkout of
-the same path is imported as current evidence. A build-ID keyed
-cache exists (core/audit/build_id_cache.py) but is not wired into
-this flow — binaries may be re-analysed across commands.
+Freshness: verdict HISTORY is freshness-gated per file (SHA-256 via
+``_stale_history_files``); feasibility verdicts, runtime evidence and
+mitigation profiles remain freshness-blind — candidates match purely
+on target path, so a run against an older checkout of the same path
+still contributes those as current evidence. A build-ID keyed cache
+exists (core/audit/build_id_cache.py) but is not wired into this
+flow — binaries may be re-analysed across commands.
 """
 
 from __future__ import annotations
@@ -281,7 +283,8 @@ def _stale_history_files(
     — freshness unknown, callers must treat every record as stale for
     suppressive decisions.
     """
-    checklist = _load_json(candidate_dir / "checklist.json")
+    from core.inventory import read_checklist
+    checklist = read_checklist(candidate_dir)
     if not checklist:
         return None
     hashes: dict[str, str] = {}
@@ -575,7 +578,8 @@ def _check_target_match(
     target_path: Path,
 ) -> bool:
     """Check if a candidate output dir is for the same target."""
-    checklist = _load_json(candidate_dir / "checklist.json")
+    from core.inventory import read_checklist
+    checklist = read_checklist(candidate_dir)
     # A checklist without a target (e.g. /validate writes its stage
     # checklist with target=None) must not veto the match — fall back
     # to the run manifest instead of comparing None to the path.
@@ -595,22 +599,22 @@ def _check_target_match(
                 return False
         return False
 
-    return checklist.get("target", "") == str(target_path)
+    # Resolve both sides like the manifest branch above: symlinked or
+    # relative spellings of the same target must still match.
+    try:
+        return Path(checklist["target"]).resolve() == target_path.resolve()
+    except OSError:
+        return False
 
 
 def _run_in_flight(candidate: Path) -> bool:
     """True when the candidate run is still status=running — a
     NEIGHBOUR session's in-flight validate run has a partial
     findings.json that must never be imported as evidence (the target
-    gate alone admitted it)."""
-    try:
-        from core.json import load_json
-        meta = load_json(candidate / ".raptor-run.json",
-                         max_bytes=1024 * 1024)
-        return bool(isinstance(meta, dict)
-                    and meta.get("status") == "running")
-    except Exception:  # noqa: BLE001 — unreadable metadata: not in flight
-        return False
+    gate alone admitted it). Unreadable metadata reads as not in
+    flight (_load_json's warn+None contract)."""
+    meta = _load_json(candidate / ".raptor-run.json")
+    return bool(isinstance(meta, dict) and meta.get("status") == "running")
 
 
 def import_validate_evidence(
@@ -671,8 +675,16 @@ def import_validate_evidence(
     if findings_path.is_file():
         data = _normalised_findings(_load_json(findings_path))
         if data and data.get("findings"):
-            first = data["findings"][0]
-            if first.get("feasibility") or first.get("ruling"):
+            # Probe a bounded prefix, not only findings[0]: a genuine
+            # /validate dir whose first finding happens to lack both
+            # keys (e.g. an unruled record prepended by a post-pass)
+            # must still read as validate output. Bounded because the
+            # gate decides provenance, not content — scanning a huge
+            # list buys nothing.
+            if any(
+                f.get("feasibility") or f.get("ruling")
+                for f in data["findings"][:20]
+            ):
                 own_command = _run_command(audit_output_dir)
                 if own_command not in ("", "validate", "exploitability-validation"):
                     # This dir is an audit (or other non-validate) run
@@ -829,6 +841,13 @@ def import_audit_evidence(
         search_dirs.extend(candidate for candidate in sorted(out_dir.iterdir(), reverse=True) if candidate.is_dir() and candidate.name.startswith("audit_"))
 
     for candidate in search_dirs:
+        # A neighbour session's still-running audit sibling has a
+        # PARTIAL findings.json / layer0-findings.json that must never
+        # be imported as evidence (same guard as the validate
+        # direction). The co-located dir is exempt: a shared --out
+        # handoff carries THIS run's own status=running manifest.
+        if candidate != validate_output_dir and _run_in_flight(candidate):
+            continue
         if not _check_target_match(candidate, target_path):
             continue
 

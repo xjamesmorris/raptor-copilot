@@ -30,17 +30,14 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import shlex
-import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
+from core.security.capped_read import read_capped_text
 
-_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
-_O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+logger = logging.getLogger(__name__)
 
 # Byte budgets for the target-controlled build artifacts read below.
 # These files live inside the scanned repo, so they are read hardened
@@ -55,31 +52,17 @@ _MAX_KCONFIG_BYTES = 8 * 1024 * 1024
 def _read_bounded(path: Path, max_bytes: int) -> str:
     """Hardened read of a target-controlled config file.
 
-    ``O_NOFOLLOW`` refuses a symlink at the final component (ELOOP →
-    ``OSError``), the ``fstat`` gate refuses non-regular files and
-    enforces the byte budget BEFORE any read, and the bounded read
-    re-checks the cap in case the file grew in between. Raises
-    ``OSError`` or ``ValueError`` on violation — every caller already
-    degrades on those.
+    Delegates the open-flags dance (O_NOFOLLOW refusing a symlink at
+    the final component with ELOOP → ``OSError``; O_NONBLOCK keeping
+    a writer-less FIFO from hanging the unsandboxed parent at
+    ``open``; the fstat gate refusing non-regular files and enforcing
+    the byte budget BEFORE any read; the bounded read re-checking the
+    cap in case the file grew in between) plus the
+    ``errors="replace"`` decode to ``core.security.capped_read``.
+    Raises ``OSError`` or ``ValueError`` (``CappedReadRefused``) on
+    violation — every caller already degrades on those.
     """
-    fd = os.open(str(path), os.O_RDONLY | _O_NOFOLLOW | _O_CLOEXEC)
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            raise ValueError(f"not a regular file: {path}")
-        if st.st_size > max_bytes:
-            raise ValueError(
-                f"file size {st.st_size} exceeds {max_bytes} byte cap: "
-                f"{path}"
-            )
-    except BaseException:
-        os.close(fd)
-        raise
-    with os.fdopen(fd, "rb") as f:
-        raw = f.read(max_bytes + 1)
-    if len(raw) > max_bytes:
-        raise ValueError(f"file grew past {max_bytes} byte cap: {path}")
-    return raw.decode("utf-8", errors="replace")
+    return read_capped_text(path, max_bytes, raise_on_refusal=True)
 
 
 @dataclass(frozen=True)
@@ -126,8 +109,11 @@ class MacroConfig:
 
 # A -D token: ``-DNAME`` | ``-DNAME=value``. Space-separated ``-D NAME`` is
 # handled by the tokenizer (a lone ``-D`` consumes the next token).
-_D_INLINE = re.compile(r"^-D(\w+)(?:=(.*))?$")
-_U_INLINE = re.compile(r"^-U(\w+)$")
+# ASCII identifier class: C preprocessor macro names are ASCII; a
+# Unicode-wide \w accumulated spellings the preprocessor never joins
+# on (fail-safe direction, but noise in the allowlist).
+_D_INLINE = re.compile(r"^-D(\w+)(?:=(.*))?$", re.ASCII)
+_U_INLINE = re.compile(r"^-U(\w+)$", re.ASCII)
 
 
 def _tokens(entry: dict) -> list[str]:
@@ -157,12 +143,12 @@ def _scan_tokens(tokens: list[str], defined: dict[str, str],
         is_undef = False
         if tok == "-D" and i + 1 < n:
             i += 1
-            m = re.match(r"^(\w+)(?:=(.*))?$", tokens[i])
+            m = re.match(r"^(\w+)(?:=(.*))?$", tokens[i], re.ASCII)
             if m:
                 name, val = m.group(1), m.group(2)
         elif tok == "-U" and i + 1 < n:
             i += 1
-            if re.match(r"^\w+$", tokens[i]):
+            if re.match(r"^\w+$", tokens[i], re.ASCII):
                 name, is_undef = tokens[i], True
         else:
             md = _D_INLINE.match(tok)
@@ -179,15 +165,25 @@ def _scan_tokens(tokens: list[str], defined: dict[str, str],
             else:
                 if name in undefined:
                     conflict.add(name)
-                defined[name] = "1" if val is None or val == "" else val
+                # -DNAME → "1" (C semantics); -DNAME= → the EMPTY
+                # string — recording "1" made value_of() misread an
+                # explicitly-empty macro as truthy.
+                defined[name] = "1" if val is None else val
         i += 1
 
 
 def _from_compile_commands(path: Path) -> MacroConfig:
     raw = _read_bounded(path, _MAX_COMPILE_COMMANDS_BYTES)
+    if _nests_like_a_bomb(raw):
+        logger.warning("deeply nested compile_commands.json at %s — "
+                       "refused before parse", path)
+        return MacroConfig(source="compile_commands.json")
     try:
         entries = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError, RecursionError):
+        # RecursionError: a nesting bomb past the pre-gate's scan
+        # window — same degradation as malformed JSON (the module's
+        # never-raises contract; the consumer is the inventory stage).
         logger.warning("malformed compile_commands.json at %s", path)
         return MacroConfig(source="compile_commands.json")
     if not isinstance(entries, list) or not entries:
@@ -209,11 +205,20 @@ def _from_compile_commands(path: Path) -> MacroConfig:
                        source="compile_commands.json")
 
 
+# Kconfig line grammar — ONE home for the pair (build_flags carried a
+# byte-identical copy; duplicated grammar is the drift substrate this
+# unit's adoption gaps grew from).
+_KCONFIG_SET_RE = re.compile(r"^(CONFIG_[A-Z0-9_]+)=([ym])\s*$",
+                             re.MULTILINE)
+_KCONFIG_NOT_SET_RE = re.compile(
+    r"^#\s*(CONFIG_[A-Z0-9_]+)\s+is\s+not\s+set\s*$", re.MULTILINE)
+
+
 def _from_kconfig(path: Path) -> MacroConfig:
     text = _read_bounded(path, _MAX_KCONFIG_BYTES)
     defined: dict[str, str] = {}
     undefined: set = set()
-    for m in re.finditer(r"^(CONFIG_[A-Z0-9_]+)=([ym])\s*$", text, re.MULTILINE):
+    for m in _KCONFIG_SET_RE.finditer(text):
         name = m.group(1)
         if m.group(2) == "y":
             defined[name] = "1"
@@ -226,8 +231,7 @@ def _from_kconfig(path: Path) -> MacroConfig:
             # this module's allowlist design exists to prevent.
             defined[name + "_MODULE"] = "1"
             undefined.add(name)
-    for m in re.finditer(r"^#\s*(CONFIG_[A-Z0-9_]+)\s+is\s+not\s+set\s*$",
-                         text, re.MULTILINE):
+    for m in _KCONFIG_NOT_SET_RE.finditer(text):
         undefined.add(m.group(1))
     # A CONFIG_X seen both defined (=y) and undefined (=m duplicate or
     # "is not set" line) shouldn't happen in a real .config, but be
@@ -239,12 +243,90 @@ def _from_kconfig(path: Path) -> MacroConfig:
                        source="kconfig")
 
 
-def _find_compile_commands(target: Path) -> Path | None:
+# Nesting pre-gate for compile_commands.json. A legitimate manifest is
+# a flat array of flat dicts (strings / arguments arrays — depth ~3);
+# a planted nesting bomb ("[" * 200k) drives the JSON parser into
+# RecursionError before any shape check while materialising a
+# container per bracket. The gate scans a bounded document prefix so
+# its own cost stays linear and small; a bomb buried past the window
+# is caught by the RecursionError rows in the parse catch tuples —
+# the gate is an early refusal for the common shape, the catch tuple
+# is the never-raises guarantee.
+_NESTING_SCAN_CHARS = 1_000_000
+# Far above any legitimate compile_commands nesting (depth ~3) and far
+# below the interpreter recursion limit the parser would otherwise hit.
+_MAX_NESTING_DEPTH = 64
+_ESCAPE_PAIR_RE = re.compile(r"\\.", re.DOTALL)
+_NON_STRUCTURAL_RE = re.compile(r'[^\[\]{}"]+')
+
+
+def _nests_like_a_bomb(raw: str) -> bool:
+    """True when the leading structure nests past ``_MAX_NESTING_DEPTH``.
+
+    C-speed reduction first (drop escape pairs, then every
+    non-structural character), then one pass over the surviving
+    bracket/quote skeleton with in-string tracking. Correct on
+    well-formed JSON; on malformed input either answer is fine —
+    the parser's own error (or RecursionError) is caught downstream.
+    """
+    skeleton = _NON_STRUCTURAL_RE.sub(
+        "", _ESCAPE_PAIR_RE.sub("", raw[:_NESTING_SCAN_CHARS]))
+    depth = 0
+    in_string = False
+    for ch in skeleton:
+        if ch == '"':
+            in_string = not in_string
+        elif not in_string:
+            if ch in "[{":
+                depth += 1
+                if depth > _MAX_NESTING_DEPTH:
+                    return True
+            else:
+                depth -= 1
+    return False
+
+
+def _compile_commands_candidates(target: Path) -> list[Path]:
+    """Readable ``compile_commands.json`` candidates, priority order.
+
+    CMake convention puts the manifest under ``build/``; bear and
+    Bazel at the project root — and the standard clangd layout
+    SYMLINKS the root name at the build-dir copy
+    (``ln -s build/compile_commands.json .``). The hardened reader
+    refuses symlinks at the final component, so a root symlink used
+    to zero all three extractors silently: candidate iteration
+    stopped at the first ``is_file()`` hit, the O_NOFOLLOW open
+    failed with ELOOP, and the fallback candidate was never tried.
+
+    A candidate whose RESOLVED path leaves the (resolved) target tree
+    is skipped with an operator-visible INFO — the symlink acceptance
+    is an in-tree layout convenience, never a portal to host files.
+    Accepted candidates contribute their resolved path, which the
+    hardened reader then opens with O_NOFOLLOW intact. Callers
+    ITERATE: one candidate failing to read or parse must not veto the
+    next (this helper is the one home for the candidate list — it was
+    previously duplicated byte-similar in build_flags).
+    """
+    out: list[Path] = []
+    try:
+        resolved_target = target.resolve()
+    except OSError:
+        return out
     for c in (target / "compile_commands.json",
               target / "build" / "compile_commands.json"):
-        if c.is_file():
-            return c
-    return None
+        if not c.is_file():  # follows symlinks; FIFOs/dirs excluded
+            continue
+        try:
+            resolved = c.resolve()
+        except OSError:
+            continue
+        if resolved != c and not resolved.is_relative_to(resolved_target):
+            logger.info(
+                "compile_commands.json at %s resolves outside the "
+                "target (%s) — skipped", c, resolved)
+            continue
+        out.append(resolved if resolved != c else c)
+    return out
 
 
 def extract_macro_config(target: Path) -> MacroConfig:
@@ -258,13 +340,13 @@ def extract_macro_config(target: Path) -> MacroConfig:
     if not target.is_dir():
         return MacroConfig()
 
-    cc = _find_compile_commands(target)
-    if cc is not None:
+    for cc in _compile_commands_candidates(target):
         try:
             mc = _from_compile_commands(cc)
             if mc:
                 return mc
-        except (OSError, json.JSONDecodeError, ValueError) as exc:
+        except (OSError, json.JSONDecodeError, ValueError,
+                RecursionError) as exc:
             logger.debug("compile_commands.json macro parse failed: %s", exc)
 
     kconfig = target / ".config"
@@ -294,14 +376,20 @@ def extract_build_tus(target: Path) -> frozenset | None:
     target = Path(target)
     if not target.is_dir():
         return None
-    cc = _find_compile_commands(target)
-    if cc is None:
-        return None
-    try:
-        entries = json.loads(_read_bounded(cc, _MAX_COMPILE_COMMANDS_BYTES))
-    except (OSError, json.JSONDecodeError, ValueError) as exc:
-        logger.debug("compile_commands.json TU-set parse failed: %s", exc)
-        return None
+    entries = None
+    for cc in _compile_commands_candidates(target):
+        try:
+            raw = _read_bounded(cc, _MAX_COMPILE_COMMANDS_BYTES)
+            if _nests_like_a_bomb(raw):
+                logger.warning("deeply nested compile_commands.json at %s "
+                               "— refused before parse", cc)
+                continue
+            entries = json.loads(raw)
+            break
+        except (OSError, json.JSONDecodeError, ValueError,
+                RecursionError) as exc:
+            logger.debug("compile_commands.json TU-set parse failed: %s",
+                         exc)
     if not isinstance(entries, list):
         return None
     tus = set()

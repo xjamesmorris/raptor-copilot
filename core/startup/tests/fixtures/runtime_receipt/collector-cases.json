@@ -1,0 +1,25 @@
+{
+  "collector_schema": "raptor.runtime_receipt_collector/v1",
+  "expected_artifacts": [
+    ".extraction-complete",
+    "app.js",
+    "changelog.json",
+    "index.js",
+    "npm-loader.js",
+    "prebuilds/linux-x64/cli-native.node",
+    "prebuilds/linux-x64/runtime.node",
+    "schemas/api.schema.json",
+    "schemas/session-events.schema.json",
+    "sdk/index.js",
+    "sea-loader.js"
+  ],
+  "limits": {
+    "elf_program_headers": 1024,
+    "hash_chunk_bytes": 1048576,
+    "interpreter_symlink_hops": 40,
+    "maps_bytes": 8388608,
+    "maps_lines": 8192,
+    "mountinfo_bytes": 4194304,
+    "tree_entries": 4096
+  }
+}

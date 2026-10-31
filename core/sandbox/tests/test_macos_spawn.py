@@ -12,19 +12,100 @@ breakage at every PR even before the macOS runner is wired up.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import re
+import signal
+import subprocess
 import sys
 import time
+import uuid
 
 import pytest
 
 from core.sandbox import _macos_spawn
 
-darwin_only = pytest.mark.skipif(
-    sys.platform != "darwin",
-    reason="macOS-only — sandbox-exec is Apple-specific",
-)
+# macOS-only — sandbox-exec is Apple-specific: real-kernel tests carry
+# the darwin_native marker (pytest.ini) instead of an ad hoc skipif, so
+# the darwin-emulation gate deselects them and native non-darwin hosts
+# skip them.
+
+
+def _unique_sleep_marker(prefix: str) -> str:
+    """Per-invocation-unique sleep duration for target discovery.
+
+    A FIXED marker collides across concurrent pytest sessions on one
+    host: session A's live in-test target matched session B's probe
+    (false-failing B's no-survivors assertion) and B's cleanup killed
+    A's target mid-test. The random suffix makes the target's full
+    argv unique to this invocation, so an exact-argv match is an
+    identity proof (same defence as the sandbox teardown's random
+    ``_SBX_RUN_ID`` environ token).
+
+    The randomness lives in the FRACTIONAL digits, keeping the total
+    duration a few days: an earlier spelling appended them to the
+    integer part, and the resulting ~1e17-second duration made
+    darwin's ``/bin/sleep`` exit immediately (past the platform's
+    representable sleep deadline — an unsigned 64-bit NANOSECOND
+    count, ~584 years), so the "hung" target was gone before the
+    timeout under test and TimeoutExpired never raised — while the
+    orphan test silently took its target-never-started skip lane on
+    the same hosts. coreutils and BSD ``sleep`` both accept
+    fractional durations.
+    """
+    return f"{prefix}.{uuid.uuid4().int % 10**12:012d}"
+
+
+def _exact_sleep_pids(marker: str) -> list[int]:
+    """PIDs whose FULL argv is exactly ``/bin/sleep <marker>``.
+
+    Never widen this to a substring/regex probe (the old ``pgrep -f
+    "sleep <marker>"``): ``-f`` matches anywhere in ANY process's
+    cmdline, and agent-harness wrapper shells carry their whole
+    eval'd command text in argv — a foreign wrapper that merely
+    MENTIONED the marker matched (and the old ``pkill -9 -f`` cleanup
+    killed it), unrelated sleeps with superstring durations
+    (``sleep <marker>2``) matched too, and any foreign match
+    false-failed the no-survivors assertion. The narrow match cannot
+    miss the real target: the trampoline ``exec``s
+    ``/bin/sleep <marker>`` verbatim, so the survivor these tests
+    hunt always has exactly this argv.
+    """
+    # check=True: a broken/unspawnable ps must fail the test loudly —
+    # a silently-empty probe would let the no-survivors assertion (and
+    # the decoy directions) pass vacuously.
+    out = subprocess.run(
+        ["ps", "-axwwo", "pid=,args="],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    want = f"/bin/sleep {marker}"
+    pids = []
+    for line in out.splitlines():
+        pid_s, _, args = line.strip().partition(" ")
+        if args.strip() == want:
+            with contextlib.suppress(ValueError):
+                pids.append(int(pid_s))
+    return pids
+
+
+def _kill_exact_sleepers(marker: str) -> None:
+    """Cleanup: SIGKILL only identity-verified targets of THIS run.
+
+    Kills by verified pid, never by pattern: each pid's argv is
+    re-read immediately before signalling, so the signal is anchored
+    to current evidence rather than a stale integer (the pid can exit
+    between discovery and kill; the re-check plus the per-run random
+    marker closes the wrong-process window).
+    """
+    for pid in _exact_sleep_pids(marker):
+        args = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "args="],
+            capture_output=True, text=True, check=False,
+        ).stdout.strip()
+        if args == f"/bin/sleep {marker}":
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
 
 
 # --- Cross-platform sanity tests (signature parity, no exec) ----------
@@ -35,8 +116,8 @@ def test_run_sandboxed_signature_matches_linux_spawn():
     _spawn.run_sandboxed but absent on _macos_spawn.run_sandboxed
     becomes an unexpected-keyword TypeError on macOS at runtime.
     Inspect both signatures and assert _macos_spawn accepts every
-    Linux kwarg (extra Linux-only kwargs are accepted-and-ignored,
-    which the explicit `noqa: ARG001` annotations document)."""
+    Linux kwarg. Unsupported execution capabilities accept their neutral
+    defaults but must refuse non-default values before any spawn."""
     import inspect
 
     from core.sandbox import _spawn as linux_spawn
@@ -51,6 +132,50 @@ def test_run_sandboxed_signature_matches_linux_spawn():
         f"_macos_spawn.run_sandboxed missing kwargs from Linux "
         f"_spawn.run_sandboxed: {missing}"
     )
+    for name in ("cancel_fd", "bind_source_identities"):
+        assert inspect.signature(
+            _macos_spawn.run_sandboxed
+        ).parameters[name].default is None
+        assert inspect.signature(
+            linux_spawn.run_sandboxed
+        ).parameters[name].default is None
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"cancel_fd": 7},
+        {"bind_source_identities": {"/owned/fixture": (1, 2)}},
+        {"bind_source_identities": {}},
+    ],
+)
+def test_linux_execution_contracts_refused_before_macos_setup(monkeypatch, kwargs):
+    from core.sandbox.errors import SandboxSetupError
+
+    def unexpected(*args, **kw):
+        pytest.fail("unsupported capability reached macOS setup or spawn")
+
+    monkeypatch.setattr(_macos_spawn.os, "pipe", unexpected)
+    monkeypatch.setattr(_macos_spawn.seatbelt, "build_profile", unexpected)
+    monkeypatch.setattr(_macos_spawn.subprocess, "Popen", unexpected)
+    with pytest.raises(SandboxSetupError, match="require the Linux"):
+        _macos_spawn.run_sandboxed(["/bin/true"], **kwargs)
+
+
+def test_neutral_linux_execution_contracts_keep_macos_path(monkeypatch):
+    class ReachedExistingProfilePath(Exception):
+        pass
+
+    def profile(**kwargs):
+        raise ReachedExistingProfilePath()
+
+    monkeypatch.setattr(_macos_spawn.seatbelt, "build_profile", profile)
+    with pytest.raises(ReachedExistingProfilePath):
+        _macos_spawn.run_sandboxed(
+            ["/bin/true"],
+            cancel_fd=None,
+            bind_source_identities=None,
+        )
 
 
 def test_is_available_returns_bool():
@@ -76,17 +201,7 @@ def test_timeout_kills_whole_sandbox_tree(tmp_path, monkeypatch):
     the layering (shim → fake sandbox-exec → /bin/sh trampoline →
     target) matches production, including the separate process group.
     """
-    import subprocess as _subprocess
-    import time as _time
-
-    marker = "424271"  # unique sleep duration for pgrep
-
-    def sleepers():
-        out = _subprocess.run(
-            ["pgrep", "-f", f"sleep {marker}"],
-            capture_output=True, text=True, check=False,
-        ).stdout
-        return [ln for ln in out.split() if ln.strip()]
+    marker = _unique_sleep_marker("424271")
 
     fake = tmp_path / "fake-sandbox-exec"
     fake.write_text('#!/bin/sh\nshift 3\nexec "$@"\n')  # drop -p <profile> --
@@ -95,25 +210,73 @@ def test_timeout_kills_whole_sandbox_tree(tmp_path, monkeypatch):
     out_dir = tmp_path / "out"
     out_dir.mkdir()
 
+    # Foreign-process decoys (own children, own session so the group
+    # is ours to sweep): a sleep whose duration merely CONTAINS the
+    # marker as a prefix, and a wrapper shell whose argv TEXT mentions
+    # the marker while it waits on an unrelated child — exactly the
+    # agent-harness ``bash -c ... eval`` shape the old ``pkill -f``
+    # killed. The trailing ``:`` no-op is load-bearing: without it,
+    # bash-as-/bin/sh (macOS, Fedora) tail-execs the final command
+    # and the wrapper's argv — marker text included — is replaced by
+    # ``/bin/sleep``'s within milliseconds, leaving the survival
+    # assertion vacuously green. Direction two of the kill
+    # discipline: the teardown under test and this test's own cleanup
+    # must leave both decoys alone.
+    decoys: list[subprocess.Popen] = []
     try:
-        with pytest.raises(_subprocess.TimeoutExpired):
-            _macos_spawn.run_sandboxed(
-                ["/bin/sleep", marker],
-                output=str(out_dir),
-                capture_output=True, text=True, timeout=1.5,
+        decoys.append(subprocess.Popen(
+            ["/bin/sleep", marker + "2"],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ))
+        decoys.append(subprocess.Popen(
+            ["/bin/sh", "-c", f"true sleep {marker}; /bin/sleep 3600; :"],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ))
+        try:
+            with pytest.raises(subprocess.TimeoutExpired):
+                _macos_spawn.run_sandboxed(
+                    ["/bin/sleep", marker],
+                    output=str(out_dir),
+                    capture_output=True, text=True, timeout=1.5,
+                )
+            # Teardown runs synchronously before the raise; poll
+            # briefly for the process table to reflect it.
+            deadline = time.monotonic() + 5
+            while (time.monotonic() < deadline
+                   and _exact_sleep_pids(marker)):
+                time.sleep(0.1)
+            assert _exact_sleep_pids(marker) == [], (
+                "sandboxed target survived run_sandboxed timeout — "
+                "the shim tree was not torn down"
             )
-        # Teardown runs synchronously before the raise; poll briefly
-        # for the process table to reflect it.
-        deadline = _time.monotonic() + 5
-        while _time.monotonic() < deadline and sleepers():
-            _time.sleep(0.1)
-        assert sleepers() == [], (
-            "sandboxed target survived run_sandboxed timeout — the "
-            "shim tree was not torn down"
-        )
+        finally:
+            _kill_exact_sleepers(marker)
+            # Liveness sampled AFTER the cleanup above (so the
+            # asserts below cover it too) but BEFORE reaping.
+            survived = [d.poll() is None for d in decoys]
     finally:
-        _subprocess.run(["pkill", "-9", "-f", f"sleep {marker}"],
-                        capture_output=True, check=False)
+        for decoy in decoys:
+            # Own child + own session: group-kill by direct-child pid
+            # is identity-safe (unreaped children cannot be
+            # pid-recycled), and it takes the text decoy's sleep
+            # child down with its shell.
+            with contextlib.suppress(OSError):
+                os.killpg(decoy.pid, signal.SIGKILL)
+            decoy.wait(timeout=10)
+    # Decoys must have survived BOTH the teardown under test and the
+    # cleanup above (a pattern-shaped kill would have taken either).
+    assert survived[0], (
+        "teardown/cleanup killed an unrelated sleep whose duration "
+        "merely starts with the marker — kill went by pattern, not "
+        "verified identity"
+    )
+    assert survived[1], (
+        "teardown/cleanup killed an unrelated wrapper shell whose "
+        "argv text merely mentions the marker — kill went by "
+        "pattern, not verified identity"
+    )
 
 
 def test_is_available_false_on_non_darwin():
@@ -196,9 +359,102 @@ def test_audit_streamer_scoped_to_run_process_tree(tmp_path, monkeypatch):
     )
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only")
+def test_tmpdir_steered_into_output_scratch_under_write_isolation(
+        tmp_path, monkeypatch):
+    """Whenever the profile engages write isolation and an output dir
+    exists, the child's TMPDIR must be steered into {output}/.tmp.
+    Pre-fix, only the untrusted lane (exclude_tmp_baseline=True) was
+    steered: every trusted-lane write-isolated macOS run kept the
+    host-default per-user /var/folders TMPDIR, which sits OUTSIDE the
+    write exceptions — python's tempfile silently fell back to /tmp,
+    but tools that honour TMPDIR directly (clang intermediates, git,
+    tar) got EPERM (confirmed on current macOS). The steer must ride
+    the EXISTING output write exception, never widen the profile.
+
+    Cross-platform: SANDBOX_EXEC is swapped for a script that records
+    the SBPL profile text it was handed, then execs the target (the
+    real shim + trampoline layering runs on Linux too).
+    """
+    capture = tmp_path / "profile.sb"
+    fake = tmp_path / "fake-sandbox-exec"
+    fake.write_text(
+        f'#!/bin/sh\nprintf %s "$2" > "{capture}"\nshift 3\nexec "$@"\n'
+    )
+    fake.chmod(0o755)
+    monkeypatch.setattr(_macos_spawn, "SANDBOX_EXEC", str(fake))
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    r = _macos_spawn.run_sandboxed(
+        ["/bin/sh", "-c", 'printf %s "$TMPDIR"'],
+        output=str(out_dir),
+        # A host-default-style TMPDIR rides the safe-env allowlist
+        # into every child env — the steer must override it, not
+        # merely fill an absent value.
+        env={"PATH": "/usr/bin:/bin",
+             "TMPDIR": "/var/folders/zz/host-default/T/"},
+        capture_output=True, text=True, timeout=15,
+    )
+    assert r.returncode == 0
+    expected_tmp = os.path.join(str(out_dir), ".tmp")
+    assert r.stdout == expected_tmp
+    assert os.path.isdir(expected_tmp)
+
+    # The steered TMPDIR must be covered by the OUTPUT write
+    # exception already in the profile — no new write-exception
+    # entry, and in particular no widening to the host-shared
+    # per-user temp dir. Scope the assertions to the file-write*
+    # exception clauses: on a darwin host the output dir itself
+    # (pytest tmp_path) legitimately lives UNDER /var/folders, so a
+    # whole-profile substring check false-positives on the output
+    # subpath.
+    profile = capture.read_text()
+    out_real = os.path.realpath(str(out_dir))
+    write_denies = [line for line in profile.splitlines()
+                    if line.startswith("(deny file-write*")]
+    assert len(write_denies) == 1, profile
+    subpaths = re.findall(r'\(subpath "([^"]*)"\)', write_denies[0])
+    # Exactly the /private/tmp baseline seed + the output dir — the
+    # steer rides the existing output exception and adds nothing.
+    assert sorted(subpaths) == sorted(["/private/tmp", out_real]), (
+        subpaths
+    )
+    # The steered value resolves to a path under that output
+    # exception, and the host-default temp dir the child arrived
+    # with is NOT among the write exceptions.
+    assert os.path.realpath(expected_tmp) == os.path.join(out_real,
+                                                          ".tmp")
+    assert not any(p.startswith("/var/folders/zz/host-default")
+                   or p.startswith("/private/var/folders/zz/host-default")
+                   for p in subpaths), subpaths
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only")
+def test_tmpdir_not_steered_without_write_isolation(tmp_path,
+                                                    monkeypatch):
+    """No write isolation (network-only-equivalent kwargs) → the
+    child keeps its inherited TMPDIR: nothing is unwritable, so the
+    steer must not engage (behaviour-budget: non-write-isolated runs
+    are byte-identical)."""
+    fake = tmp_path / "fake-sandbox-exec"
+    fake.write_text('#!/bin/sh\nshift 3\nexec "$@"\n')
+    fake.chmod(0o755)
+    monkeypatch.setattr(_macos_spawn, "SANDBOX_EXEC", str(fake))
+
+    r = _macos_spawn.run_sandboxed(
+        ["/bin/sh", "-c", 'printf %s "${TMPDIR-unset}"'],
+        block_network=True,
+        env={"PATH": "/usr/bin:/bin", "SENTINEL": "1"},
+        capture_output=True, text=True, timeout=15,
+    )
+    assert r.returncode == 0
+    assert r.stdout == "unset"
+
+
 # --- Darwin-only behavioural tests ------------------------------------
 
-@darwin_only
+@pytest.mark.darwin_native
 def test_smoke_test_invocation_succeeds(tmp_path):
     """Most basic smoke test: run /usr/bin/true under the sandbox.
     Confirms sandbox-exec invocation works AND our kwarg threading
@@ -213,7 +469,7 @@ def test_smoke_test_invocation_succeeds(tmp_path):
     assert r.sandbox_info["backend"] == "macos-seatbelt"
 
 
-@darwin_only
+@pytest.mark.darwin_native
 def test_write_outside_output_blocked(tmp_path):
     """Enforcement: write to a path OUTSIDE the writable allowlist
     must fail (sandbox-exec returns the kernel sandbox error)."""
@@ -244,7 +500,7 @@ def test_write_outside_output_blocked(tmp_path):
     assert not target_file.exists()
 
 
-@darwin_only
+@pytest.mark.darwin_native
 def test_write_inside_output_allowed(tmp_path):
     """Inverse of the above: writes INSIDE output= must succeed.
     Catches over-restrictive profile generation."""
@@ -262,7 +518,7 @@ def test_write_inside_output_allowed(tmp_path):
     assert target_file.read_text() == "ok"
 
 
-@darwin_only
+@pytest.mark.darwin_native
 def test_write_to_private_tmp_allowed():
     """The default exception list always includes /private/tmp so
     standard temp-file APIs keep working. Regression catch: if we
@@ -283,7 +539,7 @@ def test_write_to_private_tmp_allowed():
     assert "OK" in r.stdout
 
 
-@darwin_only
+@pytest.mark.darwin_native
 def test_block_network_actually_blocks(tmp_path):
     """block_network=True must cause network connect to fail. Use a
     non-routable address with a short timeout to keep the test fast
@@ -308,7 +564,7 @@ def test_block_network_actually_blocks(tmp_path):
     assert "LEAK" not in r.stdout
 
 
-@darwin_only
+@pytest.mark.darwin_native
 def test_audit_mode_writes_jsonl(tmp_path):
     """End-to-end: with audit_mode=True the LogStreamer must
     capture sandbox kext entries and append them as JSONL records
@@ -361,7 +617,7 @@ def test_audit_mode_writes_jsonl(tmp_path):
     )
 
 
-@darwin_only
+@pytest.mark.darwin_native
 def test_fake_home_redirects_HOME(tmp_path):
     """fake_home=True must override HOME inside the child. The
     profile itself doesn't restrict HOME (env-side concern); the
@@ -381,7 +637,7 @@ def test_fake_home_redirects_HOME(tmp_path):
     assert actual == expected
 
 
-@darwin_only
+@pytest.mark.darwin_native
 def test_rlimits_applied(tmp_path):
     """Resource limits must apply via the preexec_fn pattern. Test
     with a small max_file_mb (file size cap)."""
@@ -402,7 +658,7 @@ def test_rlimits_applied(tmp_path):
     assert soft == 10 * 1024 * 1024
 
 
-@darwin_only
+@pytest.mark.darwin_native
 def test_audit_verbose_records_extended_categories(tmp_path):
     """End-to-end: with audit_verbose=True, the SBPL profile gets
     `(allow X (with report))` for an extended set of categories
@@ -471,7 +727,7 @@ def test_audit_verbose_records_extended_categories(tmp_path):
     )
 
 
-@darwin_only
+@pytest.mark.darwin_native
 def test_audit_summary_record_emitted(tmp_path):
     """LogStreamer.stop() must always emit an audit_summary record
     so the sandbox-summary aggregator can distinguish "audit ran
@@ -514,7 +770,7 @@ def test_audit_summary_record_emitted(tmp_path):
     assert "global_cap" in s
 
 
-@darwin_only
+@pytest.mark.darwin_native
 def test_audit_budget_drops_when_cap_hit(tmp_path):
     """End-to-end budget enforcement: pass a tiny global cap and
     verify the JSONL contains a budget_exceeded marker. Uses the
@@ -573,7 +829,7 @@ def test_audit_budget_drops_when_cap_hit(tmp_path):
     assert summary["dropped_by_category"]["file-write"] == 5
 
 
-@darwin_only
+@pytest.mark.darwin_native
 def test_seccomp_kwargs_silently_ignored(tmp_path):
     """seccomp_profile= and seccomp_block_udp= are Linux-only;
     accepted on macOS for signature parity but must NOT raise.
@@ -595,7 +851,7 @@ def test_seccomp_kwargs_silently_ignored(tmp_path):
 # and killpg teardown when the orchestrator dies. They can only run on a
 # macOS host — smoke-test here before relying on the macOS sandbox.
 
-@darwin_only
+@pytest.mark.darwin_native
 def test_setup_status_none_on_successful_engage(tmp_path):
     """A normal run must come back with result._setup_status is None — i.e.
     the in-sandbox readiness byte arrived, proving the inner shim ran INSIDE
@@ -610,7 +866,7 @@ def test_setup_status_none_on_successful_engage(tmp_path):
     assert getattr(r, "_setup_status", "missing") is None
 
 
-@darwin_only
+@pytest.mark.darwin_native
 def test_exit_code_mirrored_through_shim(tmp_path):
     """The outer+inner shim layering must mirror the target's exit code
     unchanged (regression guard on status propagation)."""
@@ -623,7 +879,7 @@ def test_exit_code_mirrored_through_shim(tmp_path):
     assert getattr(r, "_setup_status", "missing") is None
 
 
-@darwin_only
+@pytest.mark.darwin_native
 def test_fail_loud_via_context_when_profile_cannot_apply(tmp_path):
     """End-to-end fail-loud: when the sandbox cannot engage, sandbox().run
     must raise SandboxSetupError rather than silently returning a result.
@@ -645,20 +901,18 @@ def test_fail_loud_via_context_when_profile_cannot_apply(tmp_path):
     assert SandboxSetupError is not None
 
 
-@darwin_only
+@pytest.mark.darwin_native
 def test_orphan_teardown_on_orchestrator_kill():
     """Integration: an orchestrator running a long target via the seatbelt
     backend, SIGKILLed mid-run, must leave NO lingering sandbox process —
-    the outer shim reads death-pipe EOF and SIGKILLs the sandbox group."""
-    import signal
-    import subprocess
-    marker = "417239"  # unique sleep duration; cmdline = "sleep 417239"
+    the outer shim reads death-pipe EOF and SIGKILLs the sandbox group.
 
-    def sleepers():
-        out = subprocess.run(["pgrep", "-f", f"sleep {marker}"],
-                             capture_output=True, text=True,
-                             check=False).stdout
-        return [ln for ln in out.split() if ln.strip()]
+    Target discovery and cleanup go through the exact-argv helpers
+    (per-run unique marker, identity-verified kill) — the fixed-marker
+    ``pgrep -f``/``pkill -9 -f`` this replaces matched (and killed)
+    unrelated processes whose cmdline merely contained the pattern.
+    """
+    marker = _unique_sleep_marker("417239")
 
     orch_code = (
         "from core.sandbox import sandbox\n"
@@ -673,7 +927,7 @@ def test_orphan_teardown_on_orchestrator_kill():
     try:
         for _ in range(150):
             time.sleep(0.1)
-            if sleepers():
+            if _exact_sleep_pids(marker):
                 break
         else:
             pytest.skip("seatbelt sandbox did not start the target here")
@@ -681,12 +935,13 @@ def test_orphan_teardown_on_orchestrator_kill():
         orch.wait()
         for _ in range(50):
             time.sleep(0.1)
-            if not sleepers():
+            if not _exact_sleep_pids(marker):
                 break
-        assert sleepers() == [], "sandbox target leaked after orchestrator kill"
+        assert _exact_sleep_pids(marker) == [], (
+            "sandbox target leaked after orchestrator kill"
+        )
     finally:
         if orch.poll() is None:
             orch.kill()
             orch.wait()
-        subprocess.run(["pkill", "-9", "-f", f"sleep {marker}"],
-                       capture_output=True, check=False)
+        _kill_exact_sleepers(marker)

@@ -55,6 +55,13 @@ TRAJECTORY_FILENAME = "trajectory.json"
 # reader knows.
 _MAX_TEXT_LEN = 64 * 1024
 
+# Read budget for one persisted trajectory file. The writer's own
+# per-payload caps keep legitimate trajectories to a few MB even for
+# long sessions; 64 MiB is generous headroom while keeping a planted
+# run-dir file (the read path is the distiller's iteration over
+# every run's trajectories) from being buffered whole.
+_MAX_TRAJECTORY_BYTES = 64 * 1024 * 1024
+
 
 def _truncate(text: str) -> str:
     """Cap a single text payload at _MAX_TEXT_LEN with a marker."""
@@ -91,10 +98,17 @@ def serialize_messages(
     iteration = 0
     for msg in messages:
         text_blocks: list[str] = []
+        loop_injected_blocks: list[int] = []
         tool_calls: list[dict[str, Any]] = []
         tool_results: list[dict[str, Any]] = []
         for block in msg.content:
             if isinstance(block, TextBlock):
+                # Persist loop-injection provenance (see
+                # TrajectoryStep.loop_injected_blocks): a rebuilt
+                # history must be able to tell loop-authored text from
+                # user-authored text.
+                if getattr(block, "loop_injected", False):
+                    loop_injected_blocks.append(len(text_blocks))
                 text_blocks.append(_truncate(block.text))
             elif isinstance(block, ToolCall):
                 tool_calls.append({
@@ -123,6 +137,7 @@ def serialize_messages(
             tool_results=tool_results,
             input_tokens=int(in_tokens),
             output_tokens=int(out_tokens),
+            loop_injected_blocks=loop_injected_blocks,
         ))
         # Count iterations on assistant turns — that's "model turn N".
         if msg.role == "assistant":
@@ -276,10 +291,27 @@ def iter_trajectory_json(
         for candidate in candidates:
             if not candidate.is_file():
                 continue
+            # Budgeted read: trajectory files sit in the run dir
+            # (sandbox write grant), so their SIZE is as untrusted as
+            # their content — an unbounded read_text buffered a
+            # sparse multi-GiB plant whole into the distillation
+            # process. Over-budget or non-regular files skip like
+            # unreadable ones (best-effort contract above).
+            from core.source import read_bytes_capped
+            got = read_bytes_capped(candidate, _MAX_TRAJECTORY_BYTES)
+            if got is None:
+                _log.warning(f"skipping unreadable trajectory {candidate}")
+                continue
+            raw, truncated = got
+            if truncated:
+                _log.warning(
+                    f"skipping trajectory {candidate}: exceeds "
+                    f"{_MAX_TRAJECTORY_BYTES} bytes",
+                )
+                continue
             try:
-                raw = candidate.read_text(encoding="utf-8")
                 parsed = json.loads(raw)
-            except (OSError, json.JSONDecodeError) as e:
+            except (json.JSONDecodeError, ValueError, RecursionError) as e:
                 _log.warning(
                     f"skipping unreadable trajectory {candidate}: "
                     f"{type(e).__name__}: {e}",

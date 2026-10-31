@@ -140,9 +140,9 @@ def _load_user_limits() -> dict:
             return state._user_limits_cache
 
         if not _CONFIG_PATH.exists():
-            state._user_limits_cache = {}
+            state._user_limits_cache = {}  # type: ignore[assignment]
             state._user_limits_cache_decided_at = time.time()
-            return state._user_limits_cache
+            return state._user_limits_cache  # type: ignore[return-value]
         try:
             # `is_file()` check before read_text. Pre-fix
             # `_CONFIG_PATH.exists()` returned True for FIFO,
@@ -154,9 +154,9 @@ def _load_user_limits() -> dict:
             # `mkfifo` would cause every RAPTOR process to hang
             # at startup. Treat non-regular files as missing.
             if not _CONFIG_PATH.is_file():
-                state._user_limits_cache = {}
+                state._user_limits_cache = {}  # type: ignore[assignment]
                 state._user_limits_cache_decided_at = time.time()
-                return state._user_limits_cache
+                return state._user_limits_cache  # type: ignore[return-value]
             # Size cap before read — config is JSON metadata (key/int
             # pairs); 64 KiB is generous and catches a hostile or
             # mis-edited file ballooning to multi-MiB at module-load
@@ -164,17 +164,17 @@ def _load_user_limits() -> dict:
             _CONFIG_MAX_BYTES = 64 * 1024
             try:
                 if _CONFIG_PATH.stat().st_size > _CONFIG_MAX_BYTES:
-                    state._user_limits_cache = {}
+                    state._user_limits_cache = {}  # type: ignore[assignment]
                     state._user_limits_cache_decided_at = time.time()
-                    return state._user_limits_cache
+                    return state._user_limits_cache  # type: ignore[return-value]
             except OSError:
-                state._user_limits_cache = {}
+                state._user_limits_cache = {}  # type: ignore[assignment]
                 state._user_limits_cache_decided_at = time.time()
-                return state._user_limits_cache
+                return state._user_limits_cache  # type: ignore[return-value]
             # UnicodeDecodeError is possible if config isn't valid UTF-8 —
             # catching it alongside JSON/OS errors keeps module import safe
             # against a malformed config file.
-            data = json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
+            data = json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))  # raw-open: operator config under the user config dir; is_file + size gates above
             if isinstance(data, dict):
                 # Accept non-negative ints; 0 is a valid "skip this rlimit"
                 # sentinel (see _set_limits guards: `if mem > 0:` etc.).
@@ -195,19 +195,38 @@ def _load_user_limits() -> dict:
                         )
                         continue
                     cleaned[k] = v
-                state._user_limits_cache = cleaned
+                state._user_limits_cache = cleaned  # type: ignore[assignment]
                 # +inf: successful parses never expire (session
                 # cache), including a valid config that yields no
                 # recognised keys — cleaned == {} must not be
                 # mistaken for the failure sentinel above.
                 state._user_limits_cache_decided_at = float("inf")
-                return state._user_limits_cache
+                return state._user_limits_cache  # type: ignore[return-value]
         except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
             logger.warning(
                 "Sandbox: could not parse %s: %s — using default limits.", _CONFIG_PATH, e.__class__.__name__)
-        state._user_limits_cache = {}
+        state._user_limits_cache = {}  # type: ignore[assignment]
         state._user_limits_cache_decided_at = time.time()
-        return state._user_limits_cache
+        return state._user_limits_cache  # type: ignore[return-value]
+
+
+def standing_cpu_seconds() -> int:
+    """The effective standing RLIMIT_CPU budget (default + user config).
+
+    The merged value a sandboxed spawn gets when its caller passes no
+    ``limits`` override — the same DEFAULT + ~/.config/raptor/
+    sandbox.json composition ``context.sandbox()`` applies. Callers
+    that derive a larger per-spawn CPU budget from a wall timeout
+    (e.g. the Joern CPG build) use this as their floor so a derived
+    override can only RAISE the standing posture, never tighten a
+    default or a user-raised value behind the operator's back. A
+    user-configured 0 (explicit "no CPU rlimit" — see _set_limits'
+    ``if cpu > 0`` guard) is returned as-is so the caller can decline
+    to resurrect a limit the operator disabled.
+    """
+    merged = dict(_DEFAULT_LIMITS)
+    merged.update(_load_user_limits())
+    return int(merged["cpu_seconds"])
 
 
 def _make_preexec_fn(limits: dict, writable_paths: list | None = None,
@@ -217,7 +236,9 @@ def _make_preexec_fn(limits: dict, writable_paths: list | None = None,
                      readable_paths: list | None = None,
                      deny_all_tcp_connect: bool = False,
                      host_nproc_cap: int | None = None,
-                     reaper_cell: dict | None = None):
+                     reaper_cell: dict | None = None,
+                     seccomp_block_ns_creation: bool = False,
+                     seccomp_deny_fd_exec: bool = False):
     """Create a preexec_fn that sets resource limits, Landlock, and seccomp.
 
     Resource limits (rlimit) apply for memory / CPU / file-size.
@@ -274,6 +295,27 @@ def _make_preexec_fn(limits: dict, writable_paths: list | None = None,
     growth to the configured headroom instead of leaving it unbounded.
     None (or 0) skips it — the namespace paths keep their stronger
     ns-local accounting.
+
+    `seccomp_block_ns_creation=True` adds the namespace-creation deny
+    rules (unshare/clone CLONE_NEW*, setns, clone3→ENOSYS) to the
+    seccomp filter — the same set the fork-backend grandchild always
+    gets. ONLY safe for the PLAIN subprocess lane, where the payload
+    execs directly under this preexec: the unshare-CLI lane installs
+    this filter BEFORE exec'ing its own `unshare` bootstrap, which the
+    rules would refuse. Nothing a plain-lane payload legitimately
+    runs creates namespaces, and namespace creation is kernel attack
+    surface (copy_namespaces / nested-userns paths) reachable with no
+    capability — so the plain lane closes it too instead of leaving
+    it the one lane where unshare(2) still lands in the kernel.
+
+    `seccomp_deny_fd_exec=True` adds the fileless-exec deny rules
+    (memfd_create wholesale + execveat AT_EMPTY_PATH — see
+    seccomp.py's deny_fd_exec docstring). Threaded by context.py from
+    the restrict_reads posture, matching Landlock's EXECUTE
+    engagement: the two layers split the class — Landlock scopes
+    on-filesystem exec to the read allowlist + writable grants, and
+    seccomp refuses the anonymous-inode spellings that Landlock's
+    SB_NOUSER exemption can never see.
     """
     landlock_fn = None
     # `readable_paths is not None` (not truthiness): an empty list means
@@ -307,7 +349,9 @@ def _make_preexec_fn(limits: dict, writable_paths: list | None = None,
             landlock_fn is not None and _get_landlock_abi() >= 6)
 
     seccomp_fn = (
-        _make_seccomp_preexec(seccomp_profile, block_udp=seccomp_block_udp)
+        _make_seccomp_preexec(seccomp_profile, block_udp=seccomp_block_udp,
+                              block_ns_creation=seccomp_block_ns_creation,
+                              deny_fd_exec=seccomp_deny_fd_exec)
         if seccomp_profile else None
     )
 
@@ -465,7 +509,7 @@ _PR_SET_CHILD_SUBREAPER = 36
 # Grace budget for the kill loop: re-enumerate and re-kill until no
 # children remain (a dying daemon may orphan ITS children onto us).
 _SWEEP_DEADLINE_S = 3.0
-_DEATH_TEARDOWN_EXIT = 137  # parity with the pid1 shim convention
+_DEATH_TEARDOWN_EXIT = 137  # 128+SIGKILL shell convention
 
 
 def _reaper_split(reaper_cell: dict) -> None:
@@ -666,6 +710,12 @@ def _reaper_children() -> list:
 
 _PR_SET_PDEATHSIG = 1
 _libc = None
+# Cached resolution failure: _get_libc's consumers run POST-FORK
+# (set_pdeathsig's preexec, _reaper_split), where a re-probe via
+# find_library("c") — which can shell out to /sbin/ldconfig — is the
+# banned fork-storm pattern. A failed parent-side resolve must
+# therefore stick, never retry in a child.
+_LIBC_UNAVAILABLE = object()
 
 # ── OOM child scoring ───────────────────────────────────────────────
 #
@@ -713,12 +763,48 @@ def raise_oom_score_adj() -> None:
         os.close(fd)
 
 
-def _get_libc():
+def _get_libc() -> ctypes.CDLL | None:
+    """Resolve libc once, caching failure as well as success.
+
+    Resolution must happen PARENT-SIDE (the ``set_pdeathsig`` factory
+    primes it): the consumers run in forked children, where
+    ``find_library("c")``'s possible ldconfig shell-out is the banned
+    fork-storm pattern. Post-fork calls are pure cache reads.
+
+    ``find_library("c")`` legitimately returns None on hosts without
+    ldconfig (musl-shaped); ``dlopen(NULL)`` then exposes the
+    already-loaded libc through the process's own namespace — the
+    same fallback the probe lanes use. Only when THAT also fails (or
+    lacks ``prctl``) is failure cached, and loudly: a silent None
+    would disable pdeathsig AND the reaper/subreaper split for every
+    subsequent spawn.
+    """
     global _libc
+    if _libc is _LIBC_UNAVAILABLE:
+        return None
     if _libc is None:
+        handle: ctypes.CDLL | None = None
         name = ctypes.util.find_library("c")
         if name:
-            _libc = ctypes.CDLL(name, use_errno=True)
+            try:
+                handle = ctypes.CDLL(name, use_errno=True)
+            except OSError:
+                handle = None
+        if handle is None:
+            try:
+                handle = ctypes.CDLL(None, use_errno=True)
+                handle.prctl  # noqa: B018 — dlsym check, AttributeError if absent
+            except (OSError, AttributeError):
+                handle = None
+        if handle is None:
+            _libc = _LIBC_UNAVAILABLE
+            logger.warning(
+                "libc unavailable (find_library and dlopen(NULL) both "
+                "failed): child pdeathsig and the reaper/subreaper "
+                "split are disabled for every spawn in this process"
+            )
+            return None
+        _libc = handle
     return _libc
 
 
@@ -738,6 +824,13 @@ def set_pdeathsig(sig=signal.SIGKILL):
     """
     if sys.platform != "linux":
         return lambda: None
+
+    # Prime the libc cache HERE, in the parent: _apply (and
+    # _reaper_split, whose preexec chain is built through this
+    # factory) runs post-fork, where a first-time find_library
+    # resolution would be the banned fork-storm pattern. After this,
+    # every post-fork _get_libc is a cache read.
+    _get_libc()
 
     def _apply() -> None:
         libc = _get_libc()

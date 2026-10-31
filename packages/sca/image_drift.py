@@ -33,8 +33,12 @@ from core.binary import (
     load_fingerprint,
     save_fingerprint,
 )
-from .bump.image_binary_extract import fetch_image_binary
+from .bump.image_binary_extract import (
+    cleanup_extracted_binary,
+    fetch_image_binary,
+)
 from .dockerfile_from import find_all_image_refs
+from .kinds import SCAN_ID_PREFIX
 from .models import (
     Confidence,
     Dependency,
@@ -131,7 +135,10 @@ def _drift_for_ref(
     Outcomes:
       * (None, fp)      — first-ever scan; baseline saved
       * (None, fp)      — no drift; baseline refreshed
-      * (Finding, fp)   — drift detected; baseline replaced
+      * (Finding, fp)   — drift detected; baseline RETAINED (the
+                           finding re-fires every scan until the
+                           operator re-baselines via
+                           ``fingerprint --save``)
       * (None, None)    — extract / fingerprint failed
     """
     binary = fetch_image_binary(ref, client=oci_client)
@@ -143,21 +150,23 @@ def _drift_for_ref(
     try:
         current = capability_fingerprint(binary)
     finally:
-        # The extracted binary is in a tempdir; clean up so a
-        # full scan doesn't accumulate gigabytes.
-        try:
-            binary.unlink()
-        except OSError:
-            pass
+        # The extracted binary is in a per-extraction tempdir; clean
+        # up (file + owned dir) so a full scan doesn't accumulate
+        # gigabytes.
+        cleanup_extracted_binary(binary)
     if current is None:
         logger.debug(
             "sca.image_drift: could not fingerprint %s", ref,
         )
         return None, None
 
-    # Always save the new fingerprint AFTER computing the drift
-    # — the previous baseline is what we compare against, then
-    # the current fingerprint becomes the next-scan baseline.
+    # Baselines advance only on CLEAN comparisons (and first scan).
+    # A drifted — possibly malicious — fingerprint must not absorb
+    # into the baseline: that made drift a one-shot signal, with the
+    # next scan comparing malicious-to-malicious and going quiet. The
+    # operator's explicit re-baseline is ``fingerprint --save`` (the
+    # compare-without-save posture ``fingerprint_cli --check``
+    # documents).
     baseline = load_fingerprint(fingerprint_store_dir, ref)
     if baseline is None:
         # First scan of this ref — no baseline, no signal yet.
@@ -176,7 +185,6 @@ def _drift_for_ref(
     finding = _drift_finding(
         ref=ref, drift=drift, declared_in=declared_in,
     )
-    save_fingerprint(fingerprint_store_dir, ref, current)
     return finding, current
 
 
@@ -241,7 +249,7 @@ def _drift_finding(
     import hashlib
     ref_hash = hashlib.sha256(ref.encode("utf-8")).hexdigest()[:16]
     return SupplyChainFinding(
-        finding_id=f"sca:scan:image_capability_drift:{ref_hash}",
+        finding_id=f"{SCAN_ID_PREFIX}image_capability_drift:{ref_hash}",
         kind="image_capability_drift",
         dependency=placeholder_dep,
         detail=detail,

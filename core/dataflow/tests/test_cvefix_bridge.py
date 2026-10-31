@@ -112,6 +112,35 @@ def test_extract_proposal_in_repo_uri_still_extracts(repo, tmp_path):
     assert "open(name)" in proposal.source_context
 
 
+def test_extract_proposal_source_read_is_capped(monkeypatch, tmp_path):
+    """The post-fix source read routes through the shared capped
+    reader — a huge repo file truncates, and content past the cap
+    never reaches the proposal's prompt context."""
+    monkeypatch.setattr(cvefix_bridge, "_git_diff", lambda *a, **k: "")
+    monkeypatch.setattr(
+        cvefix_bridge, "_git_diff_other_files", lambda *a, **k: "")
+    real = cvefix_bridge.read_text_capped
+
+    def tiny_cap(path, max_chars=None, **kw):
+        return real(path, 256, **kw)
+
+    monkeypatch.setattr(cvefix_bridge, "read_text_capped", tiny_cap)
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "app.py").write_text(
+        "name = input()\nopen(name)\n"
+        + "pad = 0\n" * 200
+        + "TAIL_SENTINEL = 1\n"
+    )
+    sarif = tmp_path / "res.sarif"
+    sarif.write_text(json.dumps(_sarif_for("app.py", line=2)))
+    extracted = cvefix_bridge._extract_proposal(
+        sarif, root, _pair(cwe="CWE-22"))
+    assert extracted is not None
+    proposal, _, _ = extracted
+    assert "TAIL_SENTINEL" not in proposal.source_context
+
+
 def test_extract_proposal_traversal_content_never_reaches_prompt(repo, tmp_path):
     secret = tmp_path / "secret.txt"
     secret.write_text("HOSTSECRET")
@@ -654,3 +683,17 @@ def test_run_synthesis_loop_diag_captures_last_error(tmp_path: Path):
                              work_dir=tmp_path / "s", max_attempts=2, diag=diag)
     assert res is None
     assert "proposedGuard" in diag["last_error"] and diag["attempts"] == 2
+
+
+def test_resolve_in_repo_uses_shared_confine_chokepoint(tmp_path, monkeypatch):
+    """Wiring pin: _resolve_in_repo must delegate to core.paths.confine."""
+    from core.dataflow import cvefix_bridge as cb
+    seen: dict = {}
+
+    def fake_confine(base, candidate):
+        seen["args"] = (base, candidate)
+        return None
+
+    monkeypatch.setattr(cb, "confine", fake_confine)
+    assert cb._resolve_in_repo(tmp_path, "src/a.c") is None
+    assert seen["args"] == (tmp_path, "src/a.c")

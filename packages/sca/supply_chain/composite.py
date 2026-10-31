@@ -22,7 +22,25 @@ What this layer must defend against:
     ``(ecosystem, name, version)`` — different versions are different
     groups.  An attacker still gains nothing because any single
     malicious version still trips the per-detector signals; we just
-    don't help them by combining unrelated versions.
+    don't help them by combining unrelated versions.  (Placeholder-
+    hosted findings from tree-walking detectors key on their
+    anchoring manifest instead — see :func:`_dep_key`.)
+
+  * **Composite-evasion by MANIFEST fragmentation** — placeholder-
+    hosted findings from tree-walking detectors key on their
+    anchoring manifest, so an attacker can commit a nested decoy
+    manifest (``bin/package.json`` with a different name) next to
+    the binary / egress payload while the hook stays declared in the
+    root manifest: the two legs anchor to different manifests and
+    the HOOK+BINARY / HOOK+EGRESS pair never co-fires.  Partial
+    defence: every anchor consumer resolves through ONE shared
+    dominance-based, lockfile-skipping resolver
+    (``_closest_manifest``), so at least identical paths can never
+    split keys via resolver drift.  RESIDUAL (documented): the decoy
+    re-anchor itself still works when the flagged files genuinely
+    live under different manifest directories; the standalone
+    per-detector findings (e.g. ``intree_has_binary``'s medium)
+    still fire, so the signal degrades rather than disappears.
 
   * **Family-map gaps used to slip findings past the chokepoint** —
     a finding kind we don't classify gets no family and no
@@ -164,19 +182,34 @@ _SEVERITY_ORDER: tuple[Severity, ...] = (
 _RANK: Mapping[Severity, int] = {s: i for i, s in enumerate(_SEVERITY_ORDER)}
 
 
-def _dep_key(dep: Dependency) -> tuple[str, str, str]:
+def _dep_key(dep: Dependency) -> tuple[str, str, str | None]:
     """Per-version grouping key.  An attacker who spreads payload
     across multiple versions deliberately fragments the composite
     signal; that's their choice — we don't help them combine across
-    versions either."""
+    versions either.
+
+    Placeholder hosts (``<``-prefixed names, which no ecosystem's
+    name grammar can produce) come from tree-walking detectors whose
+    subject is the scanned package itself and whose manifest carries
+    no own name.  They key on the anchoring manifest instead: the
+    per-detector placeholder NAMES legitimately differ, and keying
+    on the name would both fragment same-manifest conjunctions
+    (killing the HOOK+BINARY / HOOK+EGRESS hard pairs) and spuriously
+    merge unrelated manifests that share a placeholder spelling."""
+    if dep.name.startswith("<"):
+        # Ecosystem deliberately excluded: detectors disagree on the
+        # placeholder's ecosystem for the same manifest (fallbacks
+        # range over the manifest's ecosystem, "Project", "unknown"),
+        # and the manifest path alone already identifies the subject.
+        return ("", f"declared-in:{dep.declared_in}", None)
     return (dep.ecosystem, dep.name, dep.version)
 
 
 def _families_per_dep(
     findings: list[SupplyChainFinding],
-) -> dict[tuple[str, str, str], frozenset[str]]:
+) -> dict[tuple[str, str, str | None], frozenset[str]]:
     """Bucket findings by per-version dep key, project to family set."""
-    by_dep: dict[tuple[str, str, str], set] = defaultdict(set)
+    by_dep: dict[tuple[str, str, str | None], set[str]] = defaultdict(set)
     for f in findings:
         family = _FAMILY.get(f.kind)
         if family is None:

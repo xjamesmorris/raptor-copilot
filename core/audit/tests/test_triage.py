@@ -376,6 +376,57 @@ class TestStackBufferSkipVeto:
         (only,) = results.values()
         assert only.bucket == TriageBucket.INVESTIGATE
 
+    def test_negative_sloc_gap_still_reads_source_for_veto(
+        self, tmp_path,
+    ):
+        """A gap carrying an explicit negative sloc (malformed
+        inventory record) classifies as small (clamped to 0, so
+        skip-eligible) — its source must still be read so the
+        stack-buffer veto can fire; the unclamped negative used to
+        bypass the read while the function went on to SKIP."""
+        src_file = tmp_path / "t.c"
+        src_file.write_text(_TRACE_STRING_SHAPE)
+        gaps = [{
+            "name": "trace_string", "file": "t.c",
+            "line_start": 1, "line_end": 21, "sloc": -3,
+        }]
+        results = classify_all(
+            gaps,
+            sink_unreachable_keys=frozenset({"t.c:trace_string"}),
+            target_path=tmp_path,
+        )
+        (only,) = results.values()
+        assert only.bucket == TriageBucket.INVESTIGATE
+
+
+class TestReadFunctionSource:
+    """Behavior pins across the capped-read migration: the veto read
+    slices the exact line range, and every refusal (traversal,
+    unreadable) degrades to "" — veto doesn't fire, SKIP stands."""
+
+    def test_slices_exact_line_range(self, tmp_path):
+        from core.audit.triage import _read_function_source
+
+        (tmp_path / "a.c").write_text("l1\nl2\nl3\nl4\nl5\n")
+        gap = {"file": "a.c", "line_start": 2, "line_end": 4}
+        # \n-model join: the slice carries no trailing newline
+        assert _read_function_source(gap, tmp_path) == "l2\nl3\nl4"
+
+    def test_traversal_path_reads_empty(self, tmp_path):
+        from core.audit.triage import _read_function_source
+
+        target = tmp_path / "target"
+        target.mkdir()
+        (tmp_path / "outside.c").write_text("l1\nl2\n")
+        gap = {"file": "../outside.c", "line_start": 1, "line_end": 2}
+        assert _read_function_source(gap, target) == ""
+
+    def test_missing_file_reads_empty(self, tmp_path):
+        from core.audit.triage import _read_function_source
+
+        gap = {"file": "absent.c", "line_start": 1, "line_end": 2}
+        assert _read_function_source(gap, tmp_path) == ""
+
     def test_classify_all_without_target_path_unchanged(self):
         gaps = [{
             "name": "trace_string", "file": "t.c",

@@ -170,7 +170,7 @@ class TestUpstreamPathGate2:
         assert fake_upstream.requests == []
 
     def test_unresolvable_hostname_proceeds_to_upstream(
-            self, reset_proxy, fake_upstream):
+            self, reset_proxy, fake_upstream, hermetic_invalid_dns):
         # Local NXDOMAIN (RFC 6761 .invalid) must NOT deny: corporate
         # networks often resolve external names only at the upstream.
         # The fake upstream answers 200, proving the CONNECT was

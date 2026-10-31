@@ -2,20 +2,25 @@
 
 Covers admin panels, config files, debug endpoints, backup files,
 API docs, framework-specific paths, and version control exposure.
-Returns URLs that respond with 200, 301, 302, or 403 (forbidden
-is itself a signal that something exists there).
+Returns URLs whose FINAL response status is in ``_INTERESTING_STATUS``
+-- e.g. 200/201/204/403/405; a 403 is itself a signal that something
+exists there. The scan client follows same-origin redirects (and
+refuses off-origin ones), so raw 3xx statuses are effectively never
+observed here; the 3xx entries in the set are inert through this
+client and kept only for direct callers.
 """
 
 from __future__ import annotations
 
-import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from core.logging import get_logger
+
 from typing import TYPE_CHECKING, List
 
 if TYPE_CHECKING:
     from packages.web.client import WebClient
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 _INTERESTING_STATUS = {200, 201, 204, 301, 302, 307, 308, 403, 405}
 

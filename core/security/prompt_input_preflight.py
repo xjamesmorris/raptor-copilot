@@ -30,6 +30,7 @@ finding has injection-shaped strings inside the code under review.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -66,11 +67,25 @@ class PreflightResult:
 _REDOS_SHAPES = (
     re.compile(r'[+*]\)[+*]'),       # (...+)+ , (...*)* , (...+)* , (...*)+
     re.compile(r'\)\?\)\?\)'),        # deeply nested optional groups
-    re.compile(r'\([^()]*\|[^()]*\)\+'),  # (a|aa)+ alternation overlap
+    # (a|aa)+ AND (a|aa)* alternation overlap — the starred twin
+    # backtracks just as exponentially as the plus form.
+    # The first span excludes '|' (anchors on the FIRST separator —
+    # same alternation shapes flagged, identical spans): with '|'
+    # inside it, a pipe-storm pattern made every split explorable,
+    # quadratic in the scanned pattern text.
+    re.compile(r'\([^()|]*\|[^()]*\)[+*]'),
 )
 
 
-def _looks_redos(pattern: str) -> bool:
+def looks_redos(pattern: str) -> bool:
+    """Whether *pattern* carries a catastrophic-backtracking shape.
+
+    Heuristic (see ``_REDOS_SHAPES``) — it catches the classic nested
+    unbounded quantifiers, not every super-linear pattern, so callers
+    compiling less-trusted patterns should pair it with a length cap
+    and keep a non-regex fallback. Shared with consumers that compile
+    LLM-derived patterns (e.g. domain-model grep hints).
+    """
     return any(s.search(pattern) for s in _REDOS_SHAPES)
 
 
@@ -95,7 +110,7 @@ def _load_patterns() -> dict[str, tuple[re.Pattern[str], ...]]:
             # super-linear matcher into a hot path. Drop the
             # offender with a clear log line so the pattern author
             # sees it on first run.
-            if _looks_redos(stripped):
+            if looks_redos(stripped):
                 # No `logger` import in this module — use stdlib
                 # logging at module scope to avoid the import.
                 import logging
@@ -183,6 +198,15 @@ def preflight(
                 f"Loaded corpora: {sorted(loaded)!r}"
             )
             raise ValueError(msg)
+    # NFKC-fold before matching: fullwidth Latin
+    # (``ｉｇｎｏｒｅ ｐｒｅｖｉｏｕｓ ...``) and the other Unicode
+    # compatibility forms read as the ordinary words to every
+    # tokenizer while matching NONE of the ASCII corpora — the
+    # cheapest deliberate evasion of this layer. One normalize call
+    # closes the whole compatibility-form respelling class and keeps
+    # the corpora ASCII; the caller's content is never mutated (this
+    # layer only reports indicators).
+    content = unicodedata.normalize("NFKC", content)
     indicators: list[str] = []
     for name, patterns in _PATTERNS.items():
         if corpora is not None and name not in corpora:
@@ -200,6 +224,57 @@ def preflight(
         indicators=(),
         confidence_haircut=_NO_HIT_HAIRCUT,
     )
+
+
+def preflight_excerpts(
+    content: str,
+    *,
+    corpora: tuple[str, ...] | None = None,
+    context: int = 30,
+    max_matches: int = 8,
+) -> tuple[tuple[str, str], ...]:
+    """``(corpus_stem, excerpt)`` pairs for human review displays.
+
+    :func:`preflight` reports only which corpora fired — the right
+    signal for mechanical confidence haircuts, but an operator asked to
+    approve flagged content needs to SEE what matched. Each pair
+    carries the first match of one pattern with ``context`` characters
+    either side, capped at ``max_matches`` total so a hostile input
+    stuffed with matches cannot flood the consumer's display.
+
+    Excerpts are RAW slices of the (untrusted) input: display consumers
+    MUST route them through their escaped rendering lane — an excerpt
+    is exactly the part of the content most likely to carry terminal
+    escapes or bidi controls.
+
+    Same *corpora* validation as :func:`preflight` (``ValueError`` on
+    an unknown stem — a typo must never silently scan nothing). An
+    empty corpus yields no excerpts; consumers that need loudness on
+    that state should check :func:`loaded_corpora` first.
+    """
+    if corpora is not None:
+        loaded = set(_PATTERNS)
+        unknown = [c for c in corpora if c not in loaded]
+        if unknown:
+            msg = (
+                f"preflight: unknown corpora {unknown!r}. "
+                f"Loaded corpora: {sorted(loaded)!r}"
+            )
+            raise ValueError(msg)
+    out: list[tuple[str, str]] = []
+    for name, patterns in _PATTERNS.items():
+        if corpora is not None and name not in corpora:
+            continue
+        for pattern in patterns:
+            match = pattern.search(content)
+            if not match:
+                continue
+            start = max(0, match.start() - context)
+            end = min(len(content), match.end() + context)
+            out.append((name, content[start:end]))
+            if len(out) >= max_matches:
+                return tuple(out)
+    return tuple(out)
 
 
 def loaded_corpora() -> tuple[str, ...]:

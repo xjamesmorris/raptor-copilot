@@ -384,6 +384,153 @@ class TestDispatchValidate:
         assert "RuntimeError" in postpass.skipped_reason
 
 
+class TestSandboxSetupRetry:
+    """Sandbox-setup dispatch skips get exactly ONE bounded retry (the
+    child never launched, so a re-attempt cannot double-run the pass);
+    a second refusal — and every other skip shape — dispatches once
+    and surfaces its reason."""
+
+    _SETUP_SKIP = "sandbox setup failed: mount namespace could not engage"
+
+    @pytest.fixture(autouse=True)
+    def _open_cc_trust(self, monkeypatch):
+        monkeypatch.setattr(
+            "core.security.cc_trust.check_repo_claude_trust",
+            lambda repo_path, trust_override=None: False,
+        )
+
+    def _patch_dispatch(self, monkeypatch, results):
+        calls: list[dict] = []
+
+        def fake(**kwargs):
+            calls.append(kwargs)
+            return results[min(len(calls), len(results)) - 1]
+
+        monkeypatch.setattr("core.audit.validate.run_skill_dispatch", fake)
+        return calls
+
+    def test_retry_once_then_succeed(self, tmp_path, monkeypatch):
+        from core.orchestration.skill_dispatch import SkillDispatchResult
+        run_dir = tmp_path / "validate-run"
+        calls = self._patch_dispatch(monkeypatch, [
+            SkillDispatchResult(ran=False, skipped_reason=self._SETUP_SKIP),
+            SkillDispatchResult(ran=True, run_dir=run_dir, duration_s=1.0),
+        ])
+        postpass = _dispatch_validate(
+            target_path=tmp_path, audit_out_dir=tmp_path,
+            findings_path=tmp_path / "findings.json", findings_count=2,
+        )
+        assert len(calls) == 2
+        assert postpass.ran
+        assert postpass.validate_dir == str(run_dir)
+        assert postpass.skipped_reason == ""
+
+    def test_retry_exhausted_surfaces_reason(self, tmp_path, monkeypatch):
+        from core.orchestration.skill_dispatch import SkillDispatchResult
+        calls = self._patch_dispatch(monkeypatch, [
+            SkillDispatchResult(ran=False, skipped_reason=self._SETUP_SKIP),
+            SkillDispatchResult(ran=False, skipped_reason=self._SETUP_SKIP),
+        ])
+        postpass = _dispatch_validate(
+            target_path=tmp_path, audit_out_dir=tmp_path,
+            findings_path=tmp_path / "findings.json", findings_count=2,
+        )
+        assert len(calls) == 2
+        assert not postpass.ran
+        assert postpass.skipped_reason == self._SETUP_SKIP
+
+    def test_non_sandbox_skip_not_retried(self, tmp_path, monkeypatch):
+        from core.orchestration.skill_dispatch import SkillDispatchResult
+        calls = self._patch_dispatch(monkeypatch, [
+            SkillDispatchResult(ran=False,
+                                skipped_reason="claude not on PATH"),
+        ])
+        postpass = _dispatch_validate(
+            target_path=tmp_path, audit_out_dir=tmp_path,
+            findings_path=tmp_path / "findings.json", findings_count=2,
+        )
+        assert len(calls) == 1
+        assert not postpass.ran
+        assert postpass.skipped_reason == "claude not on PATH"
+
+    def test_success_dispatches_once(self, tmp_path, monkeypatch):
+        from core.orchestration.skill_dispatch import SkillDispatchResult
+        calls = self._patch_dispatch(monkeypatch, [
+            SkillDispatchResult(ran=True, run_dir=tmp_path / "v",
+                                duration_s=1.0),
+        ])
+        postpass = _dispatch_validate(
+            target_path=tmp_path, audit_out_dir=tmp_path,
+            findings_path=tmp_path / "findings.json", findings_count=2,
+        )
+        assert len(calls) == 1
+        assert postpass.ran
+
+
+class TestZeroVerdictOutcome:
+    """The postpass's success determination consults the pipeline's
+    actual outcome, not the CC child's exit status: the dispatch wires
+    the missing_validation_report probe, and a zero-verdict pass
+    (child exited 0, no validation-report.md) fails honestly and is
+    NEVER retried — unlike a sandbox-setup skip, its LLM budget is
+    already spent, and an in-child pipeline crash is a property of the
+    run's inputs or host configuration, not transient launch state."""
+
+    @pytest.fixture(autouse=True)
+    def _open_cc_trust(self, monkeypatch):
+        monkeypatch.setattr(
+            "core.security.cc_trust.check_repo_claude_trust",
+            lambda repo_path, trust_override=None: False,
+        )
+
+    def _patch_dispatch(self, monkeypatch, results):
+        calls: list[dict] = []
+
+        def fake(**kwargs):
+            calls.append(kwargs)
+            return results[min(len(calls), len(results)) - 1]
+
+        monkeypatch.setattr("core.audit.validate.run_skill_dispatch", fake)
+        return calls
+
+    def test_outcome_probe_is_wired(self, tmp_path, monkeypatch):
+        from core.orchestration.skill_dispatch import (
+            SkillDispatchResult,
+            missing_validation_report,
+        )
+        calls = self._patch_dispatch(monkeypatch, [
+            SkillDispatchResult(ran=True, run_dir=tmp_path / "v",
+                                duration_s=1.0),
+        ])
+        _dispatch_validate(
+            target_path=tmp_path, audit_out_dir=tmp_path,
+            findings_path=tmp_path / "findings.json", findings_count=2,
+        )
+        assert calls[0]["validate_outputs"] is missing_validation_report
+
+    def test_zero_verdict_failure_not_retried(self, tmp_path, monkeypatch):
+        from core.orchestration.skill_dispatch import (
+            SkillDispatchResult,
+            missing_validation_report,
+        )
+        # The real reason string the probe emits for an empty run dir.
+        reason = missing_validation_report(tmp_path)
+        assert reason is not None
+        run_dir = tmp_path / "validate-run"
+        calls = self._patch_dispatch(monkeypatch, [
+            SkillDispatchResult(ran=False, skipped_reason=reason,
+                                run_dir=run_dir, duration_s=300.0),
+        ])
+        postpass = _dispatch_validate(
+            target_path=tmp_path, audit_out_dir=tmp_path,
+            findings_path=tmp_path / "findings.json", findings_count=2,
+        )
+        assert len(calls) == 1, "zero-verdict crash must not be retried"
+        assert not postpass.ran
+        assert postpass.skipped_reason == reason
+        assert postpass.validate_dir == str(run_dir)
+
+
 @pytest.mark.usefixtures("cc_spawn_machinery_enabled")
 class TestDispatchGates:
     """Consolidation fixes: the audit handoff shares /agentic's gate
@@ -480,7 +627,9 @@ class TestDispatchGates:
         with patch("core.orchestration.skill_dispatch.subprocess.run",
                    side_effect=_lifecycle), \
              patch("core.orchestration.skill_dispatch."
-                   "run_untrusted_networked", side_effect=_sandbox):
+                   "run_untrusted_networked", side_effect=_sandbox), \
+             patch("core.llm.cc_probe.probe_cc_session_model",
+                   return_value="fake-model"):
             postpass = _dispatch_validate(
                 target_path=tmp_path,
                 audit_out_dir=tmp_path,
@@ -545,18 +694,35 @@ class TestValidateDefault:
 
 
 class TestAutoFeedback:
-    def test_resolve_annotations_dir_exists(self, tmp_path):
-        from core.audit.validate import _resolve_annotations_dir
-        ann = tmp_path / "annotations"
-        ann.mkdir()
-        assert _resolve_annotations_dir(tmp_path) == ann
+    def test_resolver_is_records_pin_aware_resolver(self):
+        # One resolver, used by writer (orchestrator via record) and
+        # this reader alike — a local twin here resolved --out and
+        # standalone runs to a different level than the writer.
+        from core.audit import record, validate
+        assert (
+            validate._resolve_annotations_dir
+            is record._resolve_annotations_dir
+        )
 
-    def test_resolve_annotations_dir_fallback(self, tmp_path):
+    def test_unpinned_standalone_run_stays_run_local(self, tmp_path):
+        # Pre-fix the local twin fell back to bare out_dir.parent:
+        # standalone runs of unrelated targets shared a pseudo-project
+        # annotations dir and the Reflexion feedback never reached the
+        # run's real annotations.
         from core.audit.validate import _resolve_annotations_dir
         run_dir = tmp_path / "run1"
         run_dir.mkdir()
-        result = _resolve_annotations_dir(run_dir)
-        assert result == tmp_path / "annotations"
+        assert (
+            _resolve_annotations_dir(run_dir) == run_dir / "annotations"
+        )
+
+    def test_project_run_marker_resolves_to_project_level(self, tmp_path):
+        from core.audit.validate import _resolve_annotations_dir
+        project = tmp_path / "project"
+        run = project / "run_20260914"
+        run.mkdir(parents=True)
+        (run / ".raptor-run.json").write_text("{}")
+        assert _resolve_annotations_dir(run) == project / "annotations"
 
     def test_auto_feedback_no_findings_json(self, tmp_path):
         from core.audit.validate import _auto_feedback

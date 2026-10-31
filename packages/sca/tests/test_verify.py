@@ -144,6 +144,7 @@ def test_verdict_persistent_outside_patched_files_is_clean() -> None:
     )
     summary, exit_code = verify._verdict(
         delta, severity_floor="low", applied=[Path("package.json")],
+        overlay_root=Path("/overlay"),
     )
     assert exit_code == 0
     assert summary["persistent_above_threshold"] == 1
@@ -164,6 +165,7 @@ def test_verdict_persistent_in_patched_file_exits_nonzero() -> None:
     )
     summary, exit_code = verify._verdict(
         delta, severity_floor="high", applied=[Path("requirements.txt")],
+        overlay_root=Path("/overlay"),
     )
     assert exit_code == 1
     assert summary["not_cleared_above_threshold"] == 1
@@ -298,3 +300,171 @@ def test_delta_json_records_applied_files(tmp_path: Path) -> None:
     data = json.loads((out / "delta.json").read_text())
     assert "requirements.txt" in data["applied"]
     assert data["summary"]["resolved"] == 1
+
+
+# ---------------------------------------------------------------------------
+# delta.md row rendering — untrusted findings fields are neutralised
+# ---------------------------------------------------------------------------
+
+def test_row_line_neutralises_hostile_findings_fields() -> None:
+    """Package name / advisory id flow from findings.json (registry /
+    manifest content) into delta.md tables and stdout — pipes must
+    not split the row, newlines must not terminate it, and ANSI
+    bytes must be defanged."""
+    row = {
+        "severity": "high",
+        "sca": {
+            "ecosystem": "npm",
+            "name": "evil|pkg\n</details>",
+            "version": "1.0.0\x1b[31m",
+            "advisory": {"id": "GHSA-x | forged | yes | 0.99"},
+            "in_kev": False,
+            "epss": 0.5,
+        },
+    }
+    line = verify._row_line(row)
+    assert "\n" not in line
+    assert "\x1b" not in line
+    assert "</details>" not in line
+    # Un-escaped pipes would forge extra table cells: exactly the
+    # four data columns plus delimiters survive (hostile pipes are
+    # backslash-escaped).
+    import re
+    assert len(re.findall(r"(?<!\\)\|", line)) == 5
+
+
+# ---------------------------------------------------------------------------
+# _not_cleared_in_applied — exact join, no suffix false positives
+# ---------------------------------------------------------------------------
+
+def test_verdict_suffix_sharing_manifest_does_not_false_fail() -> None:
+    """A monorepo manifest whose overlay path merely ENDS with a
+    patched file's relative path must not read as 'not cleared' — the
+    old suffix match false-failed targeted fix --fix=<adv> runs."""
+    from types import SimpleNamespace
+    delta = SimpleNamespace(
+        new=[],
+        resolved=[],
+        persistent=[
+            # Untouched sibling: other/sub/package.json — suffix of
+            # the applied rel path 'sub/package.json'.
+            {"severity": "high", "id": "OLD-001",
+             "file": "/overlay/other/sub/package.json"},
+        ],
+        suppression_added=[],
+        suppression_lifted=[],
+    )
+    summary, exit_code = verify._verdict(
+        delta, severity_floor="high",
+        applied=[Path("sub/package.json")],
+        overlay_root=Path("/overlay"),
+    )
+    assert exit_code == 0
+    assert summary["not_cleared_above_threshold"] == 0
+    # The genuinely patched manifest still gates.
+    delta.persistent = [{"severity": "high", "id": "OLD-001",
+                         "file": "/overlay/sub/package.json"}]
+    summary, exit_code = verify._verdict(
+        delta, severity_floor="high",
+        applied=[Path("sub/package.json")],
+        overlay_root=Path("/overlay"),
+    )
+    assert exit_code == 1
+    assert summary["not_cleared_above_threshold"] == 1
+
+
+# ---------------------------------------------------------------------------
+# _copy_target — never follows symlinks (directory or file)
+# ---------------------------------------------------------------------------
+
+def test_copy_target_does_not_follow_directory_symlinks(
+    tmp_path: Path,
+) -> None:
+    """A hostile repo's symlinked directory must not pull outside
+    files into the overlay (pre-3.13 Path.rglob recursed THROUGH
+    directory symlinks; os.walk(followlinks=False) never does)."""
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "id_ed25519").write_text("SECRET", encoding="utf-8")
+    target = tmp_path / "repo"
+    target.mkdir()
+    (target / "requirements.txt").write_text("requests==2.0.0\n",
+                                             encoding="utf-8")
+    (target / "docs").symlink_to(victim, target_is_directory=True)
+    (target / "link.txt").symlink_to(victim / "id_ed25519")
+
+    dst = tmp_path / "overlay"
+    verify._copy_target(target, dst)
+
+    copied = {str(p.relative_to(dst)) for p in dst.rglob("*")}
+    assert "requirements.txt" in copied
+    assert not any("id_ed25519" in c for c in copied), copied
+    assert "docs" not in copied and "link.txt" not in copied
+
+
+def test_copy_target_survives_cyclic_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "repo"
+    target.mkdir()
+    (target / "loop").symlink_to(target, target_is_directory=True)
+    (target / "package.json").write_text("{}", encoding="utf-8")
+    dst = tmp_path / "overlay"
+    verify._copy_target(target, dst)          # must terminate
+    assert (dst / "package.json").exists()
+    assert not (dst / "loop").exists()
+
+
+def test_overlay_skip_list_cannot_drift_from_discovery(
+    tmp_path: Path,
+) -> None:
+    """The overlay skip list is derived from discovery's exclusions —
+    a hand-mirrored copy drifted (no .out / .claude / codeql_dbs), so
+    every verify run copied CodeQL DB caches and agent state into the
+    scratch overlay."""
+    from packages.sca.discovery import EXCLUDED_DIR_NAMES
+
+    assert verify._SKIP_DIR_NAMES == set(EXCLUDED_DIR_NAMES)
+
+    target = tmp_path / "repo"
+    (target / "codeql_dbs").mkdir(parents=True)
+    (target / "codeql_dbs" / "huge.idx").write_text("x", encoding="utf-8")
+    (target / ".claude").mkdir()
+    (target / ".claude" / "state.json").write_text("{}", encoding="utf-8")
+    (target / "requirements.txt").write_text("requests==2.0.0\n",
+                                             encoding="utf-8")
+    dst = tmp_path / "overlay"
+    verify._copy_target(target, dst)
+    assert (dst / "requirements.txt").exists()
+    assert not (dst / "codeql_dbs").exists()
+    assert not (dst / ".claude").exists()
+
+
+# ---------------------------------------------------------------------------
+# OSV degradation — verdict availability
+# ---------------------------------------------------------------------------
+
+def test_osv_degraded_run_exits_4_not_clean(tmp_path: Path) -> None:
+    """An OSV outage during the analyse runs makes every advisory
+    invisible, so the delta reads "clean" while the vulnerable pin is
+    untouched — the patch-safety gate must refuse to conclude (distinct
+    exit 4 + explicit degraded section), never report resolution."""
+    from core.http import HttpError
+
+    class OutageHttp(StubHttp):
+        def post_json(self, url, body, timeout=30):
+            raise HttpError(f"simulated OSV outage: {url}")
+
+    target = _build_target(tmp_path)
+    proposed = _build_proposed(tmp_path, "2.0.0")
+    out = tmp_path / "out"
+    rc = verify.main(
+        [str(target), "--proposed", str(proposed), "--out", str(out)],
+        http=OutageHttp(), cache=JsonCache(root=tmp_path / "cache"),
+    )
+    assert rc == 4
+    delta_md = (out / "delta.md").read_text()
+    assert "OSV lookups degraded" in delta_md
+    assert "verdict unavailable" in delta_md
+    # The verdict line itself reflects the degradation — no
+    # "Verdict: clean" above the refusal section.
+    assert "**Verdict: unavailable**" in delta_md
+    assert "Verdict: clean" not in delta_md

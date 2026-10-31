@@ -50,12 +50,12 @@
 **Critical registers (x86-64):**
 
 **RIP (Instruction Pointer):**
-- Contains 0x4141414141: Fully controlled ✅ Exploitable
+- Contains 0x4141414141: Fully controlled — Exploitable
 - Contains valid address: May be partially controlled
 - Corrupted but not controlled: Likely just crash
 
 **RSP (Stack Pointer):**
-- Points to attacker data: Stack pivot possible ✅
+- Points to attacker data: Stack pivot possible
 - Normal stack range: Standard stack overflow
 - Corrupted: Check if controllable
 
@@ -214,6 +214,17 @@
 #include <string.h>
 #include <unistd.h>
 
+// Vulnerable code path ported from the target source — the PoC
+// triggers the bug INLINE. Never execve()/system() the target
+// binary: RAPTOR runs PoCs under Landlock / seccomp / namespace
+// isolation where cross-binary execution is blocked, and inlining
+// lets the sandbox observer surface sanitizer reports (ASAN etc.)
+// on the PoC's own stderr.
+void vulnerable_parse(const char *input) {
+    char buf[264];
+    strcpy(buf, input);  // the target's missing bounds check, verbatim
+}
+
 int main(int argc, char *argv[]) {
     printf("[*] Exploit PoC for [Vulnerability]\n");
 
@@ -224,13 +235,8 @@ int main(int argc, char *argv[]) {
     // Step 2: [Description]
     *(long*)(payload + 264) = 0xdeadbeef;  // Overwrite RIP
 
-    // Step 3: Execute target with payload
-    FILE *f = fopen("/tmp/exploit_input", "wb");
-    fwrite(payload, 1, 264 + 8, f);
-    fclose(f);
-
-    // Step 4: Trigger vulnerability
-    system("./vulnerable_binary < /tmp/exploit_input");
+    // Step 3: Trigger vulnerability inline
+    vulnerable_parse(payload);
 
     printf("[+] Exploit complete\n");
     return 0;
@@ -243,7 +249,7 @@ int main(int argc, char *argv[]) {
 
 **Python already generates exploits with these standards. This persona ensures they're met:**
 
-✅ **DO:**
+**DO:**
 - Generate compilable code (test syntax)
 - Include complete imports and error handling
 - Document each step with comments
@@ -251,7 +257,7 @@ int main(int argc, char *argv[]) {
 - State prerequisites and limitations
 - Demonstrate actual impact (not theoretical)
 
-❌ **DON'T:**
+**DON'T:**
 - Include TODO comments (code must be complete)
 - Generate template/placeholder code
 - Skip error handling

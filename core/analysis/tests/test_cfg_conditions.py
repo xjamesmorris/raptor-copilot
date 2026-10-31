@@ -72,6 +72,19 @@ class TestExtractReferences:
         refs = extract_references("a > b + c")
         assert refs == frozenset({"a", "b", "c"})
 
+    def test_dot_access_includes_base_variable(self):
+        # A method/field access constrains its base: guard classifiers
+        # query by variable name, so "user_input.isalnum()" must
+        # reference "user_input" too, not only the dotted token.
+        refs = extract_references("user_input.isalnum()")
+        assert "user_input" in refs
+        assert "user_input.isalnum" in refs
+
+    def test_arrow_access_includes_base_variable(self):
+        refs = extract_references("task->mm != NULL")
+        assert "task" in refs
+        assert "task->mm" in refs
+
 
 class TestConditionEdge:
     def test_to_dict_no_condition(self):
@@ -165,3 +178,68 @@ class TestExtractConditions:
         edges = extract_conditions_from_cfg(cfg)
         cond_edges = [e for e in edges if e.condition is not None]
         assert not any(e.condition.smt_parseable for e in cond_edges)
+
+
+class TestConditionLabelShapes:
+    def test_bare_c_for_label_extracts_condition(self):
+        # The C/C++ builder's for labels carry a BARE condition
+        # ("for x < n" — its condition field excludes parens); the
+        # paren-only regex never extracted a C for-loop guard.
+        from core.analysis.cfg_conditions import _CONDITION_LABEL_RE
+        m = _CONDITION_LABEL_RE.match("for x < n")
+        assert m is not None
+        assert (m.group(1) or m.group(2)) == "x < n"
+
+    def test_join_and_case_labels_do_not_match(self):
+        from core.analysis.cfg_conditions import _CONDITION_LABEL_RE
+        for label in ("for-exit (line 3)", "case (line 5)",
+                      "format(x)"):
+            assert _CONDITION_LABEL_RE.match(label) is None, label
+
+    def test_paren_forms_still_match(self):
+        from core.analysis.cfg_conditions import _CONDITION_LABEL_RE
+        m = _CONDITION_LABEL_RE.match("If (x > 0)")
+        assert m is not None and m.group(1) == "x > 0"
+
+
+class TestLoopHeaderPolarity:
+    """Python while/for headers: the TRUE-polarity edge must reach the
+    BODY, the negated edge the loop exit. The exit join shares the
+    header's line, so the proximity swap (distance 0) used to hand
+    TRUE to the exit — an inverted guard for every Python loop, which
+    the first polarity-trusting consumer (SMT path feasibility) would
+    inherit."""
+
+    def test_while_true_edge_reaches_body(self):
+        from core.analysis.cfg_builder import build_python_cfg
+        src = (
+            "def handle(x):\n"
+            "    while x < 10:\n"
+            "        body(x)\n"
+            "    after(x)\n"
+        )
+        cfg = build_python_cfg(src, "handle")
+        edges = extract_conditions_from_cfg(cfg)
+        cond_edges = [e for e in edges if e.condition is not None
+                      and e.condition.text == "x < 10"]
+        assert cond_edges
+        body_line = 3
+        true_edges = [e for e in cond_edges if e.condition.polarity]
+        false_edges = [e for e in cond_edges if not e.condition.polarity]
+        assert any(e.dst_line == body_line for e in true_edges)
+        assert all(e.dst_line != body_line for e in false_edges)
+
+    def test_if_then_still_true_polarity(self):
+        from core.analysis.cfg_builder import build_python_cfg
+        src = (
+            "def handle(x):\n"
+            "    if x > 0:\n"
+            "        body(x)\n"
+            "    else:\n"
+            "        other(x)\n"
+        )
+        cfg = build_python_cfg(src, "handle")
+        edges = extract_conditions_from_cfg(cfg)
+        true_edges = [e for e in edges if e.condition is not None
+                      and e.condition.polarity]
+        assert any(e.dst_line == 3 for e in true_edges)

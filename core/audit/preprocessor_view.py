@@ -54,9 +54,11 @@ from pathlib import Path
 from typing import Any
 
 from core.run.scratch import scratch_dir
+from core.source import read_text_capped
 
 from ._util import safe_join
 from .compiler_sweep import _derive_include_dirs
+from core.security.env_sanitisation import safe_subprocess_env
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +108,7 @@ class ExpandedView:
     errors: list = field(default_factory=list)
 
     def lines(self) -> list:
-        return self.text.split("\n") if self.text else []
+        return self.text.split("\n") if self.text else []  # line-model: cpp-emitted text is \n-model (the lexer consumes \r\n)
 
     def origin_of(self, expanded_line: int) -> tuple | None:
         """(original_file_rel, original_line) for a 1-indexed expanded
@@ -179,14 +181,6 @@ def _reset_probe_cache() -> None:
         _PROBE_CACHE.clear()
 
 
-def _safe_env() -> dict | None:
-    try:
-        from core.config import RaptorConfig
-        return RaptorConfig.get_safe_env()
-    except ImportError:
-        return None
-
-
 def _probe_ok(argv: list) -> bool:
     """Check the preprocessor accepts ``-E`` on RAPTOR-chosen input.
 
@@ -197,7 +191,7 @@ def _probe_ok(argv: list) -> bool:
     try:
         proc = subprocess.run(
             argv, capture_output=True, text=True, check=False,
-            timeout=_PROBE_TIMEOUT_S, env=_safe_env(),
+            timeout=_PROBE_TIMEOUT_S, env=safe_subprocess_env(),
         )
     except (OSError, subprocess.SubprocessError):
         return False
@@ -390,7 +384,7 @@ def _parse_linemarked_output(
     line_map: list = []
     cur_file: str | None = None
     cur_line = 0
-    for raw in output.split("\n"):
+    for raw in output.split("\n"):  # line-model: cpp-emitted text is \n-model (the lexer consumes \r\n)
         m = _LINEMARKER_RE.match(raw)
         if m:
             cur_line = int(m.group(1))
@@ -447,7 +441,7 @@ def expand_translation_unit(
 
     suffix = full_path.suffix
     is_c = suffix in _C_SUFFIXES
-    is_cxx = suffix in _CXX_SUFFIXES or suffix == ".C"
+    is_cxx = suffix in _CXX_SUFFIXES
     if not (is_c or is_cxx):
         return _degraded(
             file_path, f"not a C/C++ translation unit: {suffix or '<no suffix>'}",
@@ -526,7 +520,7 @@ def expand_translation_unit(
                     f"expanded output exceeds {_MAX_EXPANDED_BYTES} bytes",
                     tool=Path(pre[0]).name,
                 )
-            output = out_file.read_text(errors="replace")
+            output = out_file.read_text(errors="replace")  # raw-open: cpp output written by this module into run scratch
         except OSError as exc:
             return _degraded(
                 file_path,
@@ -581,6 +575,9 @@ def expand_function(
 
     tu_rel = file_path.replace(os.sep, "/")
     selected: list = []
+    # Hoisted: lines() re-splits the whole expanded text (up to 16MB)
+    # on every call.
+    view_lines = view.lines()
     for idx, entry in enumerate(view.line_map):
         if entry is None:
             continue
@@ -591,7 +588,7 @@ def expand_function(
             continue
         if line_end and origin_line > line_end:
             continue
-        selected.append((origin_line, view.lines()[idx]))
+        selected.append((origin_line, view_lines[idx]))
 
     return FunctionExpansion(
         ok=True, file_path=file_path,
@@ -652,7 +649,7 @@ def recover_macro_defined_functions(
 
     # Precompute expanded-line offsets for offset → line lookup.
     line_offsets: list = [0]
-    for line in view.text.split("\n"):
+    for line in view.text.split("\n"):  # line-model: offset arithmetic over cpp-emitted \n-model text
         line_offsets.append(line_offsets[-1] + len(line) + 1)
 
     import bisect
@@ -662,16 +659,18 @@ def recover_macro_defined_functions(
     def _original_text(rel: str) -> str:
         if rel not in original_cache:
             resolved = safe_join(target_path, rel)
-            try:
-                original_cache[rel] = (
-                    resolved.read_text(errors="replace") if resolved else ""
-                )
-            except OSError:
-                original_cache[rel] = ""
+            got = (
+                read_text_capped(resolved)
+                if resolved is not None else None
+            )
+            original_cache[rel] = "" if got is None else got[0]
         return original_cache[rel]
 
     recovered: list = []
     seen: set = set()
+    # Hoisted: lines() re-splits the whole expanded text (up to 16MB)
+    # on every call.
+    view_lines = view.lines()
     for m in _FUNC_DEF_RE.finditer(view.text):
         name = m.group(1)
         if name in _C_KEYWORDS or name.lower() in _C_KEYWORDS:
@@ -692,7 +691,7 @@ def recover_macro_defined_functions(
         if key in seen:
             continue
         seen.add(key)
-        sig = view.lines()[name_line].strip()
+        sig = view_lines[name_line].strip()
         recovered.append(MacroDefinedFunction(
             name=name,
             file=origin_file,
@@ -757,13 +756,12 @@ def augment_checklist_with_macro_functions(
         if Path(path).suffix not in tu_suffixes:
             continue
         resolved = safe_join(target_path, path)
-        if resolved is None or not resolved.is_file():
+        if resolved is None:
             continue
-        try:
-            raw = resolved.read_text(errors="replace")
-        except OSError:
+        got = read_text_capped(resolved)
+        if got is None:
             continue
-        if not _MACRO_INVOCATION_RE.search(raw):
+        if not _MACRO_INVOCATION_RE.search(got[0]):
             continue
         budget -= 1
         try:

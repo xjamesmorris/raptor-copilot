@@ -35,12 +35,25 @@ import unittest
 from pathlib import Path
 
 import pytest
-from core.sandbox.tests.capability import requires_landlock, requires_userns
+from core.sandbox.tests.capability import (
+    requires_landlock,
+    requires_mount,
+    requires_userns,
+)
+
 
 pytestmark = pytest.mark.skipif(
     sys.platform != "linux",
     reason="adversarial fingerprint tests are Linux-only",
 )
+
+# Whole-module capability gate: everything here exercises persona fingerprinting (etc-overlay mounts),
+# which the sandbox only delivers when mount-namespace isolation is
+# available. On hosts where user namespaces work but mount capability
+# is denied (AppArmor-restricted runners, outer seccomp filters) the
+# sandbox degrades by design — the honest outcome for these tests
+# there is a named SKIP, not a mid-flight mount failure.
+pytestmark = [pytestmark, requires_mount]
 
 
 def _mount_ns_usable() -> bool:

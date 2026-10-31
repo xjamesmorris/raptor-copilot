@@ -33,12 +33,14 @@ from core.testing.treesitter import requires_ts
 
 
 WRONG_VARIABLE_SRC = (
+    "import html\n"
     "def handle(user, other):\n"
     "    safe_other = html.escape(other)\n"
     "    render(user.name)\n"
 )
 
 STRAIGHT_LINE_SAFE_SRC = (
+    "import html\n"
     "def handle(x):\n"
     "    y = html.escape(x)\n"
     "    render(y)\n"
@@ -133,7 +135,7 @@ def _raptor_native(file_path: str, source_line: int, sink_line: int, **extra):
 class TestSARIFHappyPath:
     def test_sarif_wrong_variable_resolves_to_full_finding(self, tmp_path):
         src_file = _write(tmp_path, "app.py", WRONG_VARIABLE_SRC)
-        finding = _sarif_result(str(src_file), source_line=1, sink_line=3)
+        finding = _sarif_result(str(src_file), source_line=2, sink_line=4)
         result = resolve_finding(finding)
         assert isinstance(result, ResolvedFinding)
         assert result.cwe == "CWE-79"
@@ -151,7 +153,7 @@ class TestSARIFHappyPath:
 class TestSemgrepHappyPath:
     def test_semgrep_wrong_variable_resolves(self, tmp_path):
         src_file = _write(tmp_path, "app.py", WRONG_VARIABLE_SRC)
-        finding = _semgrep_finding(str(src_file), source_line=1, sink_line=3)
+        finding = _semgrep_finding(str(src_file), source_line=2, sink_line=4)
         result = resolve_finding(finding)
         assert isinstance(result, ResolvedFinding)
         assert result.cwe == "CWE-79"
@@ -162,7 +164,7 @@ class TestSemgrepHappyPath:
 class TestRaptorNativeHappyPath:
     def test_raptor_native_wrong_variable_resolves(self, tmp_path):
         src_file = _write(tmp_path, "app.py", WRONG_VARIABLE_SRC)
-        finding = _raptor_native(str(src_file), source_line=1, sink_line=3)
+        finding = _raptor_native(str(src_file), source_line=2, sink_line=4)
         result = resolve_finding(finding)
         assert isinstance(result, ResolvedFinding)
         assert result.cwe == "CWE-79"
@@ -196,7 +198,7 @@ class TestSourceResolution:
         """source_line == FunctionDef.lineno → cfg.entry as the
         source node and cfg.params as the source symbols."""
         src_file = _write(tmp_path, "app.py", WRONG_VARIABLE_SRC)
-        finding = _raptor_native(str(src_file), source_line=1, sink_line=3)
+        finding = _raptor_native(str(src_file), source_line=2, sink_line=4)
         result = resolve_finding(finding)
         assert isinstance(result, ResolvedFinding)
         assert result.source_node is result.cfg.entry_node
@@ -206,13 +208,14 @@ class TestSourceResolution:
         """source_line is a body assignment → source_symbols are the
         LHS names of that assignment."""
         src = (
+            "import html\n"
             "def handle(request):\n"
             "    user_input = request.body\n"
             "    y = html.escape(user_input)\n"
             "    render(y)\n"
         )
         src_file = _write(tmp_path, "app.py", src)
-        finding = _raptor_native(str(src_file), source_line=2, sink_line=4)
+        finding = _raptor_native(str(src_file), source_line=3, sink_line=5)
         result = resolve_finding(finding)
         assert isinstance(result, ResolvedFinding)
         assert result.source_symbols == frozenset({"user_input"})
@@ -247,7 +250,7 @@ class TestEndToEnd:
 
     def test_wrong_variable_resolves_then_gate_emits_candidate_only(self, tmp_path):
         src_file = _write(tmp_path, "app.py", WRONG_VARIABLE_SRC)
-        finding = _raptor_native(str(src_file), source_line=1, sink_line=3)
+        finding = _raptor_native(str(src_file), source_line=2, sink_line=4)
         resolved = resolve_finding(finding)
         assert isinstance(resolved, ResolvedFinding)
         # The whole arc's payoff: feed the resolved finding straight
@@ -263,7 +266,7 @@ class TestEndToEnd:
 
     def test_safe_straight_line_gate_emits_suppress(self, tmp_path):
         src_file = _write(tmp_path, "app.py", STRAIGHT_LINE_SAFE_SRC)
-        finding = _raptor_native(str(src_file), source_line=1, sink_line=3)
+        finding = _raptor_native(str(src_file), source_line=2, sink_line=4)
         resolved = resolve_finding(finding)
         assert isinstance(resolved, ResolvedFinding)
         result = evaluate_finding(
@@ -413,7 +416,7 @@ class TestTraversalGuard:
 
     def test_absolute_path_still_allowed(self, tmp_path):
         src = _write(tmp_path, "app.py", STRAIGHT_LINE_SAFE_SRC)
-        result = resolve_finding(_raptor_native(str(src), 1, 3))
+        result = resolve_finding(_raptor_native(str(src), 2, 4))
         assert isinstance(result, ResolvedFinding)
         assert result.enclosing_function == "handle"
 
@@ -437,7 +440,7 @@ class TestTargetRootConfinement:
     def test_absolute_path_inside_root_resolves(self, tmp_path):
         src = _write(tmp_path, "app.py", STRAIGHT_LINE_SAFE_SRC)
         result = resolve_finding(
-            _raptor_native(str(src), 1, 3), target_root=tmp_path,
+            _raptor_native(str(src), 2, 4), target_root=tmp_path,
         )
         assert isinstance(result, ResolvedFinding)
         assert result.enclosing_function == "handle"
@@ -445,7 +448,7 @@ class TestTargetRootConfinement:
     def test_relative_path_joins_root(self, tmp_path):
         _write(tmp_path, "app.py", STRAIGHT_LINE_SAFE_SRC)
         result = resolve_finding(
-            _raptor_native("app.py", 1, 3), target_root=tmp_path,
+            _raptor_native("app.py", 2, 4), target_root=tmp_path,
         )
         assert isinstance(result, ResolvedFinding)
 
@@ -478,7 +481,7 @@ class TestTargetRootConfinement:
         # the scanned tree, so an absolute path is still read (legacy
         # contract for callers that predate the parameter).
         src = _write(tmp_path, "app.py", STRAIGHT_LINE_SAFE_SRC)
-        result = resolve_finding(_raptor_native(str(src), 1, 3))
+        result = resolve_finding(_raptor_native(str(src), 2, 4))
         assert isinstance(result, ResolvedFinding)
 
 
@@ -494,6 +497,7 @@ class TestNestedFunctions:
         innermost — that's where the value-binding logic should
         run."""
         src = (
+            "import html\n"
             "def outer(req):\n"
             "    def inner(x):\n"
             "        y = html.escape(x)\n"
@@ -517,14 +521,14 @@ class TestNestedFunctions:
 class TestFormatDetection:
     def test_sarif_shape_dispatched(self, tmp_path):
         src_file = _write(tmp_path, "app.py", WRONG_VARIABLE_SRC)
-        finding = _sarif_result(str(src_file), 1, 3)
+        finding = _sarif_result(str(src_file), 2, 4)
         # SARIF has ruleId + codeFlows — distinct from other shapes.
         result = resolve_finding(finding)
         assert isinstance(result, ResolvedFinding)
 
     def test_semgrep_shape_dispatched(self, tmp_path):
         src_file = _write(tmp_path, "app.py", WRONG_VARIABLE_SRC)
-        finding = _semgrep_finding(str(src_file), 1, 3)
+        finding = _semgrep_finding(str(src_file), 2, 4)
         # Semgrep has check_id + extra.
         result = resolve_finding(finding)
         assert isinstance(result, ResolvedFinding)
@@ -543,7 +547,7 @@ class TestDeadColumnPlumbingRemoved:
 
     def test_native_finding_with_legacy_col_keys_still_resolves(self, tmp_path):
         src = _write(tmp_path, "app.py", STRAIGHT_LINE_SAFE_SRC)
-        finding = _raptor_native(str(src), 1, 3, source_col=5, sink_col=11)
+        finding = _raptor_native(str(src), 2, 4, source_col=5, sink_col=11)
         result = resolve_finding(finding)
         assert isinstance(result, ResolvedFinding)
 
@@ -714,3 +718,154 @@ class TestJavaB41SinkShapes:
         assert _pick_value_name({"x", "pre"}, cfg) == "pre"
         # All-namespace surfaces fall back to plain lexicographic.
         assert _pick_value_name({"java", "javax"}, cfg) == "java"
+
+
+class TestInterProcBindingsBestEffort:
+    """The docstring contract — empty frozenset on ANY failure — must
+    be structural: the summary walks recurse on target-controlled AST
+    depth, and an escaping RecursionError aborted the whole gate
+    evaluation instead of degrading to the intra-procedural verdict
+    (the Java analog already had the blanket catch)."""
+
+    def test_summary_failure_degrades_to_empty(self, monkeypatch):
+        import ast as _ast
+
+        import core.analysis.taint_summaries as ts
+        from core.analysis.cfg_builder import build_python_cfg
+        from core.analysis.finding_resolver import (
+            _inter_proc_bindings_python,
+        )
+
+        src = (
+            "import html\n"
+            "def handle(x):\n"
+            "    y = html.escape(x)\n"
+            "    render(y)\n"
+        )
+        cfg = build_python_cfg(src, "handle")
+        fn = next(
+            n for n in _ast.walk(_ast.parse(src))
+            if isinstance(n, _ast.FunctionDef)
+        )
+
+        calls = []
+
+        def _boom(*_a, **_k):
+            calls.append(1)
+            raise RecursionError("maximum recursion depth exceeded")
+
+        monkeypatch.setattr(ts, "build_taint_summaries", _boom)
+        out = _inter_proc_bindings_python(src, fn, cfg, "CWE-79")
+        assert calls, "patched summary builder was never reached"
+        assert out == frozenset()
+
+
+class TestSameLineSinkAmbiguity:
+    """First-node binding on a multi-statement sink line hands the
+    gate a sanitizer-bearing statement instead of the real sink — an
+    evasion-shaped wrong-sink adjudication. Two or more call-bearing
+    nodes on the flagged line refuse; single-statement lines keep
+    resolving (that control is the whole happy-path battery above)."""
+
+    def test_python_one_liner_sink_line_refuses(self, tmp_path):
+        src = (
+            "import html, os\n"
+            "def handle(x):\n"
+            "    y = log(html.escape(x)); os.system(x)\n"
+        )
+        src_file = _write(tmp_path, "app.py", src)
+        finding = _raptor_native(
+            str(src_file), source_line=2, sink_line=3)
+        result = resolve_finding(finding)
+        assert isinstance(result, ResolutionFailure), result
+
+    def test_java_one_liner_sink_line_refuses(self, tmp_path):
+        src = (
+            "import org.owasp.encoder.Encode;\n"
+            "public class T {\n"
+            "    public void handle(String x, "
+            "java.io.PrintWriter out) {\n"
+            "        String y = Encode.forHtml(x); out.println(x);\n"
+            "    }\n"
+            "}\n"
+        )
+        src_file = _write(tmp_path, "T.java", src)
+        finding = _raptor_native(
+            str(src_file), source_line=3, sink_line=4,
+            language="java")
+        result = resolve_finding(finding)
+        assert isinstance(result, ResolutionFailure), result
+
+    def test_c_one_liner_sink_line_refuses(self, tmp_path):
+        src = (
+            "void handle(char *x) {\n"
+            "    log(sanitize(x)); system(x);\n"
+            "}\n"
+        )
+        src_file = _write(tmp_path, "app.c", src)
+        finding = _raptor_native(
+            str(src_file), source_line=1, sink_line=2,
+            language="c", cwe="CWE-78")
+        result = resolve_finding(finding)
+        assert isinstance(result, ResolutionFailure), result
+
+
+class TestSummaryMemo:
+    """resolve_finding(summary_memo=…) caches the per-file Phase
+    12+13 build across calls — the postpass otherwise rebuilds the
+    summary fixed point once per finding × source candidate."""
+
+    _SRC = (
+        "import html\n"
+        "def _clean(s):\n"
+        "    return html.escape(s)\n"
+        "def handle(x):\n"
+        "    y = _clean(x)\n"
+        "    render(y)\n"
+    )
+
+    def _native(self, path):
+        return {
+            "cwe": "CWE-79", "file_path": str(path),
+            "source_line": 4, "sink_line": 6, "language": "python",
+        }
+
+    def test_memo_reused_across_calls(self, tmp_path, monkeypatch):
+        import core.analysis.finding_resolver as fr
+        import core.analysis.taint_summaries as ts_mod
+        p = tmp_path / "app.py"
+        p.write_text(self._SRC)
+        calls = {"n": 0}
+        real = ts_mod.build_taint_summaries
+
+        def counting(cg, source):
+            calls["n"] += 1
+            return real(cg, source)
+
+        monkeypatch.setattr(ts_mod, "build_taint_summaries", counting)
+        memo: dict = {}
+        r1 = fr.resolve_finding(self._native(p), summary_memo=memo)
+        r2 = fr.resolve_finding(self._native(p), summary_memo=memo)
+        assert isinstance(r1, fr.ResolvedFinding)
+        assert isinstance(r2, fr.ResolvedFinding)
+        assert calls["n"] == 1
+        assert len(memo) == 1
+        # The memoised path still yields the synthetic binding.
+        assert r2.inter_proc_bindings
+
+    def test_no_memo_keeps_per_call_build(self, tmp_path, monkeypatch):
+        import core.analysis.finding_resolver as fr
+        import core.analysis.taint_summaries as ts_mod
+        p = tmp_path / "app.py"
+        p.write_text(self._SRC)
+        calls = {"n": 0}
+        real = ts_mod.build_taint_summaries
+
+        def counting(cg, source):
+            calls["n"] += 1
+            return real(cg, source)
+
+        monkeypatch.setattr(ts_mod, "build_taint_summaries", counting)
+        fr.resolve_finding(self._native(p))
+        fr.resolve_finding(self._native(p))
+        assert calls["n"] == 2

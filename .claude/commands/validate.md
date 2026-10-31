@@ -11,7 +11,7 @@ Validates that vulnerability findings are real, reachable, and exploitable befor
 
 **You (Claude) ARE the LLM for this pipeline.** You perform the analysis work in LLM stages (A-D, F). Mechanical stages (0, E, 1) run via Python/libexec scripts.
 
-**Data flow:** Each stage writes a small `stage-X.json` file with only its own output. The prep script merges it into the cumulative `findings.json` and deletes the stage file. Claude never reads or writes findings.json directly.
+**Data flow:** Each stage writes a small `stage-X.json` file with only its own output. The prep script merges it into the cumulative `findings.json` and records a consumption receipt (`stage-receipts.json`, content hash + timestamp) plus a byte-identical archive copy under `stage-inputs/`. Stage inputs are immutable: the stage file stays in place — delegated agents may re-read it, and post-hoc audits see exactly what each merge consumed. Already-consumed content never merges twice (the receipt hash gates re-application); a rewritten stage file re-merges. Stage A is a container reset, so its skip also requires findings.json to still match the receipted build — a shared-out-dir re-run rebuilds clean rather than keeping stale later-stage fields. Claude never reads or writes findings.json directly.
 
 **Prep script:** Before each LLM stage, run the prep script which merges the previous stage's output, validates, and sets up the current stage:
 
@@ -21,6 +21,82 @@ libexec/raptor-validation-helper <A|B|C|D|E|F> "$OUTPUT_DIR" [--target "$TARGET_
 
 **All stages are mandatory. Execute in sequence: 0 → A → B → C → D → E → F → 1.**
 Stage E only applies to memory corruption vulnerabilities. All others are mandatory.
+
+### Sharding a stage across sub-agents (optional)
+
+A single-session run writes each `stage-X.json` itself and none of this
+subsection applies — the stage instructions below are unchanged. The parts
+flow engages ONLY when you split one stage's work across parallel
+sub-agents instead of doing it in-session. It adds no pipeline stage; it
+changes only who writes the stage output and how the pieces are merged.
+
+1. **Partition by key up front** (subsystem file-sets, finding-id ranges)
+   so no two sub-agents can legally produce the same finding id or update
+   key — a collision quarantines the later part.
+2. **Each sub-agent writes ONE part file** into
+   `$OUTPUT_DIR/stage-<x>-parts/` (e.g. `stage-b-parts/window.json`) —
+   never the canonical `stage-<x>.json`; `parts` is the only writer while
+   parts are in play. Part shapes (from "Sharding a stage across agents
+   (parts)" in SKILL.md — do not invent shapes):
+   - **Stage A**: full finding rows — a findings array (bare `[...]` or
+     `{"findings": [...]}`).
+   - **Stage B**: full rows for its collections — any subset of
+     `hypotheses`, `attack_tree_nodes`, `attack_paths`, `disproven`,
+     `attack_surface`, plus a partial `updates{}` map.
+   - **Stages C–F**: `{"updates": {"FIND-XXXX": {...}, ...}}` only.
+
+   Before hand-back, each sub-agent lints its own part:
+
+   ```bash
+   libexec/raptor-validate-schema --lint part-<x> <part-file>
+   ```
+
+3. **Assemble (orchestrating session):**
+
+   ```bash
+   libexec/raptor-validation-helper parts <A|B|C|D|E|F> "$OUTPUT_DIR"
+   ```
+
+   This merges the parts per the per-stage rules, quarantines any bad
+   part under `stage-<x>-parts/quarantine/` with a named
+   `<part>.reason.json` and proceeds with the rest, validates every
+   assembled output, then atomically writes the canonical stage
+   output(s) plus `stage-<x>-assembly-receipt.json` attributing every
+   merged element to its producing part.
+4. **Quarantine → re-dispatch (at most once per producer):** when the
+   assembly reports a quarantined part, re-dispatch THAT producer once,
+   briefing it with the reason text from its
+   `stage-<x>-parts/quarantine/<part>.reason.json` record (the latest
+   assembly receipt's `quarantined[]` list is the authoritative index).
+   Reason text quotes producer/LLM-derived content: render it inert —
+   escape non-printable characters and bound long excerpts with an
+   explicit elision marker — and never paste raw part bytes into the
+   brief; the reason records and the receipt are the source. The
+   producer overwrites its own part file and lints it again; then
+   re-run the assembly in step 3 (part files are never
+   modified by assembly and re-assembly is byte-stable). If the SAME
+   producer's part is quarantined a second time, do not retry again —
+   surface the part name and its reasons in the run summary and
+   continue with the successfully merged parts
+   (quarantine-and-proceed). If every part was quarantined, the
+   assembly exits non-zero ("every part was quarantined") — report
+   that and stop the stage instead of looping.
+5. **Lint before promote:** after the final assembly, lint the
+   assembled stage file, then promote it with the standard post-Write
+   validation (SKILL.md rule 5):
+
+   ```bash
+   libexec/raptor-validate-schema --lint stage "$OUTPUT_DIR/stage-<x>.json"
+   libexec/raptor-validate-schema stage "$OUTPUT_DIR/stage-<x>.json"
+   ```
+
+   For Stage B, do the same for each assembled working doc with its
+   matching type (`hypotheses`, `attack-tree`, `attack-paths`,
+   `attack-surface`, `disproven`).
+
+From here the pipeline is unchanged: the next stage's prep merges the
+assembled `stage-<x>.json` into findings.json exactly as if the stage
+had written it directly.
 
 ### Stage 0 (Python): Inventory
 
@@ -36,22 +112,32 @@ claude-code-only installs the ranking runs through the session
 transport inline in stage 0 — expect extra minutes on large lists;
 any failure keeps the bridge order.
 
-This starts the run lifecycle, builds the checklist, and imports any /understand output. The last line of output is `OUTPUT_DIR=<path>` — use that path for all subsequent stages.
+This starts the run lifecycle, builds the checklist, and imports any /understand output. Use the first `OUTPUT_DIR=<path>` line printed by the lifecycle stub for all subsequent stages.
+
+`--findings <file>` imports pre-existing findings. Two import-time behaviours to know:
+
+- **Dark rows** (audit's "no tool could adjudicate" grade) are routed to a
+  witness-acquisition backlog (`witness-backlog.json`, clustered per CWE class)
+  instead of stage-A candidacy — the import prints the honest count
+  ("N dark items routed to the witness backlog — not validated"). Pass
+  `--include-dark` to validate them anyway (calibration sampling, or an audit
+  follow-up that deliberately selected them). Suspicious rows stay eligible
+  like any scanner finding.
+- **Re-adjudication queue**: when an incoming finding matches a site this run
+  dir already recorded as disproven/ruled out, the import additionally writes a
+  `readjudication-queue.jsonl` record (site, new claim, matched disproof and its
+  `would_reconsider_if` condition). Nothing is auto-overturned — the queue is
+  input for a scoped follow-up validate on those sites.
 
 ### Threat Model Context (before any LLM stage)
 
 If the target has a project threat model, load it before starting Stage A:
 
 ```bash
-python3 -c "
-import sys, os; sys.path.insert(0, os.environ['RAPTOR_DIR'])
-from pathlib import Path
-from core.threat_model import threat_model_prompt_block
-block = threat_model_prompt_block(Path('$TARGET_PATH'))
-if block: print(block)
-else: print('No project threat model found.')
-"
+libexec/raptor-threat-model prompt-block "$TARGET_PATH"
 ```
+
+The target path rides as argv data — never paste it into a `python3 -c` program (the shell expands `$(...)` inside a double-quoted block before python runs). It prints the prompt block, or `No project threat model found.`
 
 When present, use it as operator-owned context throughout all LLM stages (A-D, F):
 - Prioritise focus areas and verification expectations
@@ -174,6 +260,9 @@ M confirmed. What next?" — options:
    (`python3 raptor.py agentic --repo <path> --no-exploits`, see `.claude/commands/patch.md`).
 4. **Stop here** — the validation report stands; finish.
 
+Finding ids, file paths, and titles quoted into options are target/LLM-derived:
+render them with non-printables escaped.
+
 **Non-interactive fallback:** current behavior — display the verbatim summary and
 stop (option 4).
 
@@ -190,6 +279,10 @@ stop (option 4).
 
 # Validate pre-existing scanner findings (skips Stage A discovery)
 /validate ./src --findings scanner-results.json
+
+# Include audit dark-grade rows in candidacy (default routes them to
+# the witness backlog)
+/validate ./src --findings findings-graded.json --include-dark
 
 # Validate memory corruption with binary path for Stage E
 /validate ./vuln_app --vuln-type format_string --binary ./build/vuln

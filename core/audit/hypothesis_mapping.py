@@ -64,17 +64,29 @@ _ESCAPE_INJECTION_PATTERN = (
     "\\s*,\\s*[\\w.>\\[\\]-]+\\s*[,)]"
 )
 
+# Same-line gaps and the snprintf argument span are bounded: these
+# strings run as semgrep pattern-regex over the hostile target file,
+# and an unbounded gap re-scans the rest of a planted line from
+# every keyword occurrence — quadratic there and at this table's
+# worst-case census judgment alike.  Real co-occurrences sit well
+# inside 200 chars (500 for an argument list); longer spans stop
+# matching.
+_XSS_WRITE_PATTERN = (
+    "(snprintf|sprintf)\\s*\\([^)]{0,500}\"%s|write\\s*\\(.{0,200}\\+|"
+    "response\\.write|res\\.send"
+)
+
 _HYPOTHESIS_SEMGREP_PATTERNS: dict[str, str] = {
     "buffer overflow": "strcpy|sprintf|gets\\s*\\(|strcat",
-    "sql injection": "SELECT.*%|INSERT.*%|UPDATE.*%|DELETE.*%",
+    "sql injection": "SELECT.{0,200}%|INSERT.{0,200}%|UPDATE.{0,200}%|DELETE.{0,200}%",
     "command injection": "system\\s*\\(|popen\\s*\\(|exec[lv]p?e?\\s*\\(",
     "path traversal": "os\\.path\\.join|open\\s*\\(",
-    "format string": "%s.*printf|printf\\s*\\(\\s*[a-zA-Z_]",
+    "format string": "%s.{0,200}printf|printf\\s*\\(\\s*[a-zA-Z_]",
     "use after free": "free\\s*\\(",
     "double free": "free\\s*\\(",
-    "xss": "(snprintf|sprintf)\\s*\\([^)]*\"%s|write\\s*\\(.*\\+|response\\.write|res\\.send",
-    "reflected": "(snprintf|sprintf)\\s*\\([^)]*\"%s|write\\s*\\(.*\\+|response\\.write|res\\.send",
-    "cross-site": "(snprintf|sprintf)\\s*\\([^)]*\"%s|write\\s*\\(.*\\+|response\\.write|res\\.send",
+    "xss": _XSS_WRITE_PATTERN,
+    "reflected": _XSS_WRITE_PATTERN,
+    "cross-site": _XSS_WRITE_PATTERN,
     "deserialization": _DESERIALIZATION_PATTERN,
     "deserialisation": _DESERIALIZATION_PATTERN,
     "unpickle": _DESERIALIZATION_PATTERN,
@@ -113,6 +125,18 @@ _SEMGREP_LANG_BY_EXT: dict[str, str] = {
     ".go": "go",
     ".rs": "rust",
     ".php": "php",
+    # .phtml is in semgrep's own target selection for language:php —
+    # without this row the CWE-dispatch semgrep leg dropped on
+    # templating trees. The other legacy suffixes (.php5/.php4/.php3)
+    # are deliberately ABSENT: semgrep skips them for php-language
+    # rules (paths.scanned stays empty), so mapping them here would
+    # (a) regress the dynamic per-hypothesis rules, whose generic key
+    # DOES scan those files today, and (b) record a semgrep dispatch
+    # for a scan that examined nothing — which the pre-existing
+    # CWE-88/327 coverage rows would convert to clean-when-silent.
+    # A live test pins semgrep's actual selection; re-add a suffix
+    # only when that pin shows the engine scanning it.
+    ".phtml": "php",
     ".rb": "ruby",
     ".cs": "csharp",
     ".kt": "kotlin",
@@ -136,6 +160,47 @@ def semgrep_language_for(file_path: str) -> str:
     ``file_path``. ``generic`` for unmapped extensions."""
     ext = Path(file_path).suffix.lower()
     return _SEMGREP_LANG_BY_EXT.get(ext, "generic")
+
+
+# Every semgrep language key the extension table can emit — the
+# universe a content-probed language hint may resolve into.
+_SEMGREP_PROBEABLE_LANGS = frozenset(_SEMGREP_LANG_BY_EXT.values())
+
+
+def semgrep_probed_language(
+    file_path: str, language: str | None,
+) -> str | None:
+    """Semgrep language key licensed by an inventory content probe for
+    a file whose extension the table cannot map, or None.
+
+    ``language`` is the inventory's recorded language for the file —
+    content-probed when the extension says nothing (PHP plugin
+    "module" files lead with their open tag, extensionless scripts
+    carry a shebang). The probe only speaks for files the extension
+    table does NOT map: for mapped extensions the table stays
+    authoritative, so behaviour on ordinary targets cannot change.
+    Languages outside the table's value set (perl, shell, asm, ...)
+    yield None — there is no semgrep language key to scan them as.
+
+    Consumers pair a non-None answer with semgrep's
+    ``--scan-unknown-extensions`` flag: without it the engine's own
+    extension-based target selection silently SKIPS such a file
+    (``paths.scanned`` stays empty), so a language-keyed rule could
+    never produce a scanned-target witness there in either direction.
+    """
+    if not language:
+        return None
+    if Path(file_path).suffix.lower() in _SEMGREP_LANG_BY_EXT:
+        return None
+    lang = language.lower()
+    return lang if lang in _SEMGREP_PROBEABLE_LANGS else None
+
+
+def semgrep_extension_mapped(file_path: str) -> bool:
+    """True when semgrep's own extension-based target selection maps
+    this file — i.e. the ordinary scan path applies and no probe /
+    ``--scan-unknown-extensions`` licensing is involved."""
+    return Path(file_path).suffix.lower() in _SEMGREP_LANG_BY_EXT
 
 
 def hypothesis_to_semgrep_rule(hypothesis: str, file_path: str) -> str | None:
@@ -273,7 +338,17 @@ def hypothesis_to_smt_verb(hypothesis: str) -> str | None:
     for keyword, verb in _SMT_HYPOTHESIS_VERBS:
         if keyword in hyp_lower:
             return verb
-    if re.search(r"negative.*bypass|bypass.*negative|signed.*unsigned", hyp_lower):
+    # Keyword-pair gaps here (and in the cocci mapping below) are
+    # bounded ({0,200}): an unbounded `.*` gap makes every occurrence
+    # of the first keyword re-scan the rest of the hypothesis text
+    # for the second — quadratic on hostile-shaped text. Real
+    # hypothesis prose keeps the pair within a phrase; beyond the
+    # bound the mapping simply does not attach.
+    if re.search(
+        r"negative.{0,200}bypass|bypass.{0,200}negative|"
+        r"signed.{0,200}unsigned",
+        hyp_lower,
+    ):
         return "check-negative-bypass"
     return None
 
@@ -371,7 +446,7 @@ def hypothesis_to_cocci_check(hypothesis: str) -> str | None:
     if any(kw in hyp_lower for kw in (
         "toctou", "time-of-check", "time of check",
         "check-then-use", "check-use",
-    )) or re.search(r"check.*then.*use", hyp_lower):
+    )) or re.search(r"check.{0,200}then.{0,200}use", hyp_lower):
         rule = _COCCI_RULES_DIR / "toctou_check_use.cocci"
         if rule.exists():
             return str(rule)
@@ -404,12 +479,12 @@ def hypothesis_to_cocci_check(hypothesis: str) -> str | None:
         "memory barrier", "smp_wmb",
         "smp_rmb", "smp_mb", "write ordering",
         "missing barrier", "reorder",
-    )) or re.search(r"store.*load", hyp_lower):
+    )) or re.search(r"store.{0,200}load", hyp_lower):
         rule = _COCCI_RULES_DIR / "missing_memory_barrier.cocci"
         if rule.exists():
             return str(rule)
 
-    if re.search(r"atomic.*race|check.*then.*act|atomic_read", hyp_lower):
+    if re.search(r"atomic.{0,200}race|check.{0,200}then.{0,200}act|atomic_read", hyp_lower):
         rule = _COCCI_RULES_DIR / "atomic_check_then_act.cocci"
         if rule.exists():
             return str(rule)
@@ -418,7 +493,7 @@ def hypothesis_to_cocci_check(hypothesis: str) -> str | None:
         "race condition", "use-after-free", "use after free",
         "after unlock", "freed while",
         "concurrent", "non-atomic",
-    )) or re.search(r"after.*lock.*released", hyp_lower):
+    )) or re.search(r"after.{0,200}lock.{0,200}released", hyp_lower):
         rule = _COCCI_RULES_DIR / "use_after_unlock.cocci"
         if rule.exists():
             return str(rule)

@@ -14,6 +14,8 @@ import shutil
 import stat
 from pathlib import Path
 
+from core.atomic_fs import open_exclusive_artifact
+
 from .detect import get_project_name
 
 logger = logging.getLogger(__name__)
@@ -25,7 +27,10 @@ def _get_xml_parser():
         import defusedxml.ElementTree as ET
         return ET
     except ImportError:
-        logger.debug(
+        # WARNING, not debug: entity-expansion protection for hostile
+        # .gpr/.prp XML then depends entirely on the host expat — the
+        # operator should see the degradation, not discover it.
+        logger.warning(
             "defusedxml not installed — falling back to stdlib XML "
             "(install defusedxml for XXE-safe parsing of .gpr projects)"
         )
@@ -58,8 +63,8 @@ def fix_owner(prp_path: Path) -> bool:
                         "patched project owner: %s -> %s", old, current
                     )
                     return True
-    except Exception:
-        pass
+    except Exception:  # noqa: BLE001 — best-effort patch; a corrupt prp surfaces later as the JVM's NotOwnerException, so name the real cause here
+        logger.debug("owner patch failed for %s", prp_path, exc_info=True)
     return False
 
 
@@ -95,10 +100,30 @@ def prepare_working_copy(gpr_path: Path, work_dir: Path) -> Path:
     # deliverable).
     if dst_rep.exists():
         shutil.rmtree(dst_rep)
-    if dst_gpr.exists():
-        dst_gpr.unlink()
+    # missing_ok unlink, not exists()-gated: a DANGLING symlink at
+    # the destination passes exists() == False and survived, and the
+    # copy below then created the symlink's target.
+    dst_gpr.unlink(missing_ok=True)
 
-    shutil.copy2(gpr_path, dst_gpr)
+    # The .gpr rides the same byte ceiling as the .rep tree: it is a
+    # small XML pointer file in any real project, and a hostile
+    # multi-GB one would otherwise bypass the tempdir-fill defence the
+    # .rep copy already has.
+    gpr_size = gpr_path.stat().st_size
+    if gpr_size > MAX_REP_COPY_BYTES:
+        msg = (
+            f"refusing to copy {gpr_path.name}: {gpr_size} bytes "
+            f"exceeds the {MAX_REP_COPY_BYTES}-byte project-copy ceiling"
+        )
+        raise ValueError(msg)
+    # Exclusive-create copy: copy2 opens the DESTINATION with O_TRUNC
+    # and follows whatever occupies it (the source side was symlink-
+    # vetted above; the destination side was not) — a fresh O_EXCL |
+    # O_NOFOLLOW inode closes the unlink→copy window.
+    with open(gpr_path, "rb") as src_fh, os.fdopen(
+        open_exclusive_artifact(dst_gpr), "wb",
+    ) as dst_fh:
+        shutil.copyfileobj(src_fh, dst_fh)
     if src_rep.is_dir() and not src_rep.is_symlink():
         _copy_rep_tree(src_rep, dst_rep)
 

@@ -363,3 +363,37 @@ def test_image_source_hosts_unifies_three_sources(tmp_path):
 
 def test_image_source_hosts_empty_for_empty_target(tmp_path):
     assert image_source_registry_hosts(tmp_path) == []
+
+
+def test_scan_contains_any_per_image_failure(tmp_path, monkeypatch):
+    """One pathological image ref must not abort the whole SBOM batch.
+
+    The worker's comment promises per-image containment, but the
+    handler only caught ValueError — a TypeError (hostile cached dict,
+    platform-select crash) or OSError escaped through pool.map, the
+    stage degraded wholesale, and every OTHER image's base-image
+    dependencies (and their CVEs) were silently dropped.
+    """
+    import packages.sca.dockerfile_from as dfmod
+
+    (tmp_path / "Dockerfile").write_text("FROM broken:1\n")
+    (tmp_path / "docker-compose.yml").write_text(
+        "services:\n  db:\n    image: healthy:1\n"
+    )
+
+    healthy_sbom = dfmod.ImageSbom(
+        image_ref="healthy:1", digest="sha256:" + "b" * 64, packages=(),
+    )
+
+    def fake_fetch(image, **kwargs):
+        if image == "broken:1":
+            raise TypeError("hostile cached dict shape")
+        return healthy_sbom
+
+    monkeypatch.setattr(dfmod, "fetch_image_sbom", fake_fetch)
+
+    # Must not raise: the broken image degrades to a logged skip and
+    # the healthy image's SBOM survives (empty package set here, so no
+    # Dependency rows — the property under test is batch survival).
+    deps = scan_image_sources(tmp_path, client=object())
+    assert deps == []

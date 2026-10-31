@@ -24,6 +24,8 @@ binary IS, not what we asked for).
 from __future__ import annotations
 
 import logging
+import os
+import re
 import shutil
 import tempfile
 import uuid
@@ -114,8 +116,9 @@ class BuildProduct:
     """Outcome of one containerized build."""
 
     ok: bool
-    reason: str = ""                 # "" | copy_failed | build_failed |
-    #                                  export_failed | no_artifacts
+    reason: str = ""                 # "" | rejected_input | copy_failed |
+    #                                  build_failed | export_failed |
+    #                                  no_artifacts
     detail: str = ""
     artifacts: dict[str, Path] = field(default_factory=dict)
     #: relative-in-repo name -> extracted host path
@@ -124,6 +127,8 @@ class BuildProduct:
     toolchain: ToolchainSpec | None = None
     base_image: str = DEFAULT_BUILD_IMAGE
     build_command: str = ""
+    build_subdir: str = ""
+    #: working dir of the build relative to the repo root ("" = root)
     rootfs: Path | None = None
     #: populated only when the caller passed ``keep_rootfs``: the
     #: exported image filesystem (repo at ``/src``, built artifacts in
@@ -142,9 +147,18 @@ def containerized_build(
     keep_rootfs: Path | str | None = None,
     run_env: dict[str, str] | None = None,
     aux_builds: dict[str, dict[str, str]] | None = None,
+    subdir: str = "",
 ) -> BuildProduct:
     """Build *repo_dir* with *command* in a container; extract ELF
     executables produced under the repo tree into ``out_dir``.
+
+    ``subdir``: working directory for the build RELATIVE to the repo
+    root ("" = the root). Thread it from
+    :func:`core.build.resolve.resolve_build_command` — a detector-
+    synthesized command for a build system living in a subdirectory
+    (GNU screen's autotools live in src/) fails at the root. It cannot
+    be folded into *command* as ``cd <subdir> && `` because the
+    toolchain/env prefix would then apply to the ``cd`` only.
 
     ``run_env``: extra KEY=VALUE pairs prefixed to the build RUN line
     (e.g. AFL_USE_ASAN=1 — instrumentation toggles the wrapper compiler
@@ -176,7 +190,7 @@ def containerized_build(
             repo_dir, command, out_dir=out_dir, toolchain=toolchain,
             base_image=base_image, timeout_seconds=timeout_seconds,
             keep_rootfs=keep_rootfs, run_env=run_env,
-            aux_builds=aux_builds,
+            aux_builds=aux_builds, subdir=subdir,
         )
     except BaseException:
         if keep_rootfs:
@@ -203,6 +217,7 @@ def _containerized_build(
     keep_rootfs: Path | str | None,
     run_env: dict[str, str] | None = None,
     aux_builds: dict[str, dict[str, str]] | None = None,
+    subdir: str = "",
 ) -> BuildProduct:
     from core.container.build import build_image
     from core.container.export import export_rootfs
@@ -216,7 +231,25 @@ def _containerized_build(
     build_id = uuid.uuid4().hex[:12]
     tag = f"raptor-env-build:{build_id}"
     product = BuildProduct(ok=False, toolchain=toolchain,
-                           base_image=base_image, build_command=command)
+                           base_image=base_image, build_command=command,
+                           build_subdir=subdir)
+
+    # Refuse untrusted Dockerfile-bound values BEFORE any work. The
+    # build command reaches this seam from detector/LLM synthesis over
+    # repo content and toolchains/base images can arrive from on-disk
+    # specs, so a hostile value is an EXPECTED input, not a programmer
+    # error: it gets the structured-failure path (module contract:
+    # build-class failures never raise). run_env keys/values and aux
+    # stage names come from RAPTOR constants — their validators keep
+    # raising ValueError (programmer error), unchanged.
+    try:
+        _validate_build_command(command)
+        _validate_base_image(base_image)
+        _validate_subdir(subdir)
+        _flag_prefix(toolchain)  # validates every toolchain field
+    except ValueError as exc:
+        product.reason, product.detail = "rejected_input", str(exc)[:500]
+        return product
 
     with tempfile.TemporaryDirectory(prefix="raptor-env-build-") as tmp:
         ctx = Path(tmp) / "context"
@@ -245,9 +278,13 @@ def _containerized_build(
         for aux_name in (aux_builds or {}):
             _validate_aux_name(aux_name)
             dockerfile += f"COPY src /{aux_name}\n"
+        # A validated subdir extends WORKDIR rather than folding a
+        # `cd` into the command: the RUN line must stay a plain
+        # command so the exported assignments below govern all of it.
+        wd_suffix = f"/{subdir}" if subdir else ""
         dockerfile += (
-            f"WORKDIR /src\n"
-            f"RUN {env_prefix}{_flag_prefix(toolchain)}{command}\n"
+            f"WORKDIR /src{wd_suffix}\n"
+            + _run_line(env_prefix, _flag_prefix(toolchain), command)
         )
         for aux_name, aux_env in (aux_builds or {}).items():
             # aux stages do NOT inherit run_env: the canonical use is
@@ -259,9 +296,9 @@ def _containerized_build(
             # this wrong (silent sanitizer-crash false negatives,
             # found empirically; see the pin comment).
             dockerfile += (
-                f"WORKDIR /{aux_name}\n"
-                f"RUN {_env_prefix(aux_env)}"
-                f"{_flag_prefix(toolchain)}{command}\n"
+                f"WORKDIR /{aux_name}{wd_suffix}\n"
+                + _run_line(_env_prefix(aux_env),
+                            _flag_prefix(toolchain), command)
             )
         try:
             built = build_image(
@@ -278,7 +315,14 @@ def _containerized_build(
             )
             if not built.ok:
                 product.reason = "build_failed"
-                product.detail = (built.stderr_tail or "")[-1000:]
+                # Both streams: under the legacy builder the failing
+                # step's output (`configure: error: ...`) is on STDOUT
+                # — a stderr-only detail showed just the deprecation
+                # banner and hid the real error.
+                product.detail = "\n".join(
+                    tail for tail in ((built.stderr_tail or "")[-1000:],
+                                      (built.logs_tail or "")[-1000:])
+                    if tail.strip())
                 return product
 
             rootfs = Path(keep_rootfs) if keep_rootfs else Path(tmp) / "rootfs"
@@ -369,6 +413,104 @@ def _validate_aux_name(name: str) -> None:
             f"an image system directory")
 
 
+#: Toolchain values are single-quote-wrapped on the generated RUN line;
+#: shape-allowlists (not blocklists) keep every quote/escape/whitespace
+#: class out by construction. Compiler names may carry a wrapper path
+#: (``/usr/lib/ccache/gcc``); flag tokens cover the real mitigation /
+#: instrumentation vocabulary (``-Wl,-z,relro,-z,now``,
+#: ``-D_FORTIFY_SOURCE=2``, ``-I/opt/include``, ``-std=c++17``).
+_TOOL_NAME_RE = re.compile(r"[A-Za-z0-9._+/-]+")
+_FLAG_TOKEN_RE = re.compile(r"[A-Za-z0-9._+/=,:-]+")
+#: Image references as the Dockerfile FROM line accepts them
+#: (registry/repo:tag@digest); anything else — whitespace, newlines,
+#: quotes — cannot start a well-formed reference.
+_IMAGE_REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@-]*")
+
+
+def _validate_build_command(command: str) -> None:
+    """Refuse build commands that can escape their Dockerfile RUN line.
+
+    The command is UNTRUSTED (detector/LLM synthesis over repo content,
+    on-disk specs) and is interpolated raw into the generated
+    Dockerfile, so anything that terminates or extends the RUN line is
+    an instruction-injection primitive:
+
+    * newline / CR — starts a NEW Dockerfile instruction. ``COPY
+      --from=attacker/image`` makes the daemon pull an attacker image
+      (host-side egress) and BuildKit ``RUN --network=default``
+      restores exactly the egress the ``network="none"`` build
+      containment exists to deny.
+    * a leading dash — parsed as a RUN flag (``--network``,
+      ``--mount``) by BuildKit when no env/flag prefix precedes the
+      command.
+    * a trailing backslash — Dockerfile line continuation absorbs the
+      NEXT generated instruction into this RUN's shell text.
+
+    A legitimate build command has no use for any of these shapes.
+    """
+    if any(ch in command for ch in "\n\r\x00"):
+        raise ValueError(
+            "build command contains a line break or NUL — refusing "
+            "(Dockerfile instruction injection)")
+    if command.lstrip().startswith("-"):
+        raise ValueError(
+            "build command starts with '-' — refusing (would parse as "
+            "a Dockerfile RUN flag such as --network)")
+    if command.rstrip().endswith("\\"):
+        raise ValueError(
+            "build command ends with '\\' — refusing (Dockerfile line "
+            "continuation would absorb the next generated instruction)")
+
+
+def _validate_base_image(base_image: str) -> None:
+    """Base images enter the generated FROM line; enforce reference
+    shape so a value can never smuggle additional instructions."""
+    if not _IMAGE_REF_RE.fullmatch(base_image):
+        raise ValueError(f"invalid base image reference: {base_image!r}")
+
+
+#: Segments of a build subdir as the WORKDIR line accepts them. Same
+#: threat model as the build command: the value comes from detector
+#: synthesis over repo content (directory NAMES in the scanned tree),
+#: so it is UNTRUSTED and interpolated raw into the Dockerfile.
+_SUBDIR_SEGMENT_RE = re.compile(r"[A-Za-z0-9._+-]+")
+
+
+def _validate_subdir(subdir: str) -> None:
+    """Refuse build subdirs that can escape their WORKDIR line or the
+    /src tree. Empty string ("" = build at the repo root) is valid."""
+    if not subdir:
+        return
+    if any(ch in subdir for ch in "\n\r\x00\\ \t'\""):
+        raise ValueError(
+            "build subdir contains whitespace, a quote, or a line "
+            "break — refusing (Dockerfile instruction injection)")
+    if subdir.startswith(("/", "-")):
+        raise ValueError(f"build subdir must be relative: {subdir!r}")
+    segments = subdir.split("/")
+    if any(seg in ("", ".", "..") for seg in segments):
+        raise ValueError(f"build subdir escapes the repo tree: {subdir!r}")
+    for seg in segments:
+        if not _SUBDIR_SEGMENT_RE.fullmatch(seg):
+            raise ValueError(f"invalid build subdir segment: {seg!r}")
+
+
+def _run_line(env_prefix: str, flag_prefix: str, command: str) -> str:
+    """The Dockerfile RUN line, with all assignments EXPORTED.
+
+    A bare ``KEY=V command`` prefix binds to the first simple command
+    only: for a chained build (``autoreconf -fi && ./configure &&
+    make``) the toolchain flags silently never reached configure or
+    make — a "hardened" mitigation-matrix posture compiled with no
+    hardening at all. ``export A=..; command`` governs every command
+    in the chain (including an operator-embedded ``cd``).
+    """
+    assignments = f"{env_prefix}{flag_prefix}".strip()
+    if not assignments:
+        return f"RUN {command}\n"
+    return f"RUN export {assignments}; {command}\n"
+
+
 def _env_prefix(run_env: dict[str, str] | None) -> str:
     """KEY='VALUE' prefix for the RUN line (empty when None).
 
@@ -391,9 +533,24 @@ def _env_prefix(run_env: dict[str, str] | None) -> str:
 
 
 def _flag_prefix(toolchain: ToolchainSpec | None) -> str:
-    """Ambient-flag env prefix for the RUN line (empty when None)."""
+    """Ambient-flag env prefix for the RUN line (empty when None).
+
+    Every field is shape-validated at this chokepoint — toolchains can
+    arrive from on-disk specs, not only the module constants, and each
+    value lands single-quoted on the generated Dockerfile RUN line
+    (see :func:`_validate_build_command` for the injection shapes).
+    """
     if toolchain is None:
         return ""
+    for label, value in (("cc", toolchain.cc), ("cxx", toolchain.cxx)):
+        if value and not _TOOL_NAME_RE.fullmatch(value):
+            raise ValueError(f"invalid toolchain {label}: {value!r}")
+    for label, tokens in (("cflags", toolchain.cflags),
+                          ("ldflags", toolchain.ldflags)):
+        for token in tokens:
+            if not _FLAG_TOKEN_RE.fullmatch(token):
+                raise ValueError(
+                    f"invalid toolchain {label} token: {token!r}")
     cflag_list = list(toolchain.cflags)
     if toolchain.debug and "-g" not in cflag_list:
         cflag_list.append("-g")
@@ -412,20 +569,39 @@ def _flag_prefix(toolchain: ToolchainSpec | None) -> str:
 
 
 def _elf_executables(root: Path) -> dict[str, Path]:
-    """ELF executables under *root*, keyed by repo-relative path."""
+    """ELF executables under *root*, keyed by repo-relative path.
+
+    Walks with ``os.walk(followlinks=False)``: the rootfs comes out
+    of an attacker-influenced containerized build, so directory-
+    symlink recursion must stay off explicitly (``pathlib``'s ``**``
+    recurses into directory symlinks only via 3.13's
+    ``recurse_symlinks=True`` opt-in; it's
+    ``glob.glob(recursive=True)`` that followed them by default) —
+    a followed pair of in-tree self-links (``loop -> .`` +
+    ``up -> ..``, both of which survive tar extraction under
+    ``filter="data"``) would give combinatorial path expansion
+    materialised eagerly in the TRUSTED parent, and a followed link
+    into the toolchain rootfs would misattribute image binaries as
+    repo build artifacts. The per-entry file checks below already
+    skip symlinked FILES; never ENTERING symlinked directories closes
+    the traversal too (same idiom as the codeql_trust pack walk).
+    """
     found: dict[str, Path] = {}
     if not root.is_dir():
         return found
-    for path in sorted(root.rglob("*")):
-        try:
-            if not path.is_file() or path.is_symlink():
-                continue
-            if not path.stat().st_mode & 0o111:
-                continue
-            with path.open("rb") as fh:
-                if fh.read(4) != _ELF_MAGIC:
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames.sort()
+        for name in sorted(filenames):
+            path = Path(dirpath) / name
+            try:
+                if not path.is_file() or path.is_symlink():
                     continue
-        except OSError:
-            continue
-        found[str(path.relative_to(root))] = path
+                if not path.stat().st_mode & 0o111:
+                    continue
+                with path.open("rb") as fh:
+                    if fh.read(4) != _ELF_MAGIC:
+                        continue
+            except OSError:
+                continue
+            found[str(path.relative_to(root))] = path
     return found

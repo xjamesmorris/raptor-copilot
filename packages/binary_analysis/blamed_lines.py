@@ -25,10 +25,14 @@ from __future__ import annotations
 import logging
 import re
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from core.atomic_fs import write_text_atomically
 from core.json import save_json
+from core.security.env_sanitisation import safe_subprocess_env
+from core.security.markdown_render import md_inline
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +49,9 @@ _SAFE_FILE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./+-]{0,255}$")
 _MAX_BLAMED_LINES = 100
 _CHECKER_TIMEOUT_S = 60
 _SECTION_MARKER = "## Blamed-line execution check (mechanical)"
+_SECTION_FOOTER = ("_Generated mechanically from gcov data by "
+                   "packages.binary_analysis.blamed_lines; evidence, "
+                   "not a verdict._")
 
 _SKILL_CPP = Path(".claude/skills/crash-analysis/line-execution-checker/"
                   "line_checker.cpp")
@@ -105,41 +112,41 @@ def _has_coverage_data(coverage_dir: Path) -> bool:
     return False
 
 
-def _safe_env() -> dict:
-    try:
-        from core.config import RaptorConfig
-        return RaptorConfig.get_safe_env()
-    except Exception:  # noqa: BLE001 — checker must run in degraded envs
-        import os
-        return {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
-
-
 def _resolve_checker(
-    coverage_dir: Path,
+    build_dir: Path,
     checker_path: str | Path | None,
     raptor_dir: Path | None,
 ) -> Path | None:
     """Locate or build the line-checker binary.
 
-    Order: explicit path → ``line-checker`` in the coverage dir →
-    build from the skill's line_checker.cpp into the coverage dir
-    (g++, list argv, safe env). Returns None when unavailable.
+    Order: explicit path (a caller/operator trust assertion, used
+    as-is) → build from the repo-pinned skill line_checker.cpp into
+    ``build_dir`` (g++, list argv, safe env). Returns None when
+    unavailable.
+
+    Never picks up a pre-existing ``line-checker`` from the coverage
+    dir: that directory is written by the instrumented target's own
+    build and execution, so anything found there is target-suppliable
+    (provenance doctrine: target-writable ⇒ untrusted). Executing a
+    planted checker would hand the analysed program host code
+    execution AND let it forge the mechanical blamed-line verdicts
+    this module exists to make trustworthy. ``build_dir`` is a
+    RAPTOR-owned scratch directory for the same reason — the built
+    binary must never live where the target can swap it.
     """
     if checker_path:
         p = Path(checker_path)
         return p if p.is_file() else None
-    local = coverage_dir / "line-checker"
-    if local.is_file():
-        return local
     root = raptor_dir or _default_raptor_dir()
     cpp = root / _SKILL_CPP
     if not cpp.is_file():
         return None
+    built = Path(build_dir) / "line-checker"
     try:
         proc = subprocess.run(
-            ["g++", "-O3", "-std=c++17", str(cpp), "-o", str(local)],
+            ["g++", "-O3", "-std=c++17", str(cpp), "-o", str(built)],
             capture_output=True, text=True, timeout=120, check=False,
-            env=_safe_env(),
+            env=safe_subprocess_env(),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         logger.warning("blamed_lines: line-checker build failed: %s", exc)
@@ -149,7 +156,7 @@ def _resolve_checker(
             "blamed_lines: line-checker build failed: %s",
             (proc.stderr or "")[:500])
         return None
-    return local
+    return built
 
 
 def _default_raptor_dir() -> Path:
@@ -160,6 +167,34 @@ _OUTPUT_RE = re.compile(
     r"^(?P<file>\S+):(?P<line>\d+)\s+"
     r"(?:EXECUTED \((?P<count>\d+) times?\)|(?P<not>NOT EXECUTED))\s*$"
 )
+
+
+def _run_checker(
+    argv: list[str], coverage_dir: Path,
+) -> subprocess.CompletedProcess:
+    """Run the line-checker under the full sandbox.
+
+    The checker parses hostile bytes either way — the ``.gcov`` /
+    ``.gcda`` files in the coverage dir were emitted while the
+    instrumented (untrusted) target executed — so it gets the same
+    posture as every other our-tool-over-hostile-data invocation in
+    this package (network blocked, Landlock scoped to the coverage
+    dir, seccomp, rlimits). ``tool_paths`` grants read/exec on the
+    RAPTOR-owned scratch dir holding the freshly built checker.
+    """
+    # Lazy import — keeps this module importable in unit tests that
+    # stub the sandbox (same convention as core.binary.inspect).
+    from core.sandbox import run as _sandbox_run
+    return _sandbox_run(
+        argv,
+        block_network=True,
+        target=str(coverage_dir),
+        tool_paths=[str(Path(argv[0]).resolve().parent)],
+        cwd=str(coverage_dir),
+        capture_output=True,
+        text=True,
+        timeout=_CHECKER_TIMEOUT_S,
+    )
 
 
 def check_blamed_lines(
@@ -181,12 +216,21 @@ def check_blamed_lines(
     if not coverage_dir.is_dir() or not _has_coverage_data(coverage_dir):
         return [BlamedLineResult(f, ln, "unknown", reason="no coverage data")
                 for f, ln in pairs]
-    checker = _resolve_checker(coverage_dir, checker_path, raptor_dir)
-    if checker is None:
-        return [BlamedLineResult(f, ln, "unknown",
-                                 reason="line-checker unavailable")
-                for f, ln in pairs]
+    with tempfile.TemporaryDirectory(
+            prefix="raptor-line-checker-") as build_dir:
+        checker = _resolve_checker(Path(build_dir), checker_path, raptor_dir)
+        if checker is None:
+            return [BlamedLineResult(f, ln, "unknown",
+                                     reason="line-checker unavailable")
+                    for f, ln in pairs]
+        return _check_with_checker(pairs, coverage_dir, checker)
 
+
+def _check_with_checker(
+    pairs: list[tuple[str, int]],
+    coverage_dir: Path,
+    checker: Path,
+) -> list[BlamedLineResult]:
     by_file: dict[str, list[int]] = {}
     for f, ln in pairs:
         by_file.setdefault(f, []).append(ln)
@@ -195,15 +239,26 @@ def check_blamed_lines(
     for file, lines in by_file.items():
         argv = [str(checker)] + [f"{file}:{ln}" for ln in lines]
         try:
-            proc = subprocess.run(
-                argv, capture_output=True, text=True,
-                timeout=_CHECKER_TIMEOUT_S, check=False,
-                cwd=str(coverage_dir), env=_safe_env(),
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
+            proc = _run_checker(argv, coverage_dir)
+        except (OSError, subprocess.SubprocessError) as exc:
             for ln in lines:
                 results[(file, ln)] = BlamedLineResult(
                     file, ln, "unknown", reason=f"checker failed: {exc}")
+            continue
+        except BaseException as exc:
+            # SandboxSetupError is a BaseException by design (fail-
+            # loud). Here the documented degrade contract wins — the
+            # crash pipeline must survive — but the checker NEVER
+            # runs unsandboxed as a fallback: no isolation, no
+            # verdict. KeyboardInterrupt/SystemExit still propagate.
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            logger.warning(
+                "blamed_lines: sandbox unavailable for checker: %s", exc)
+            for ln in lines:
+                results[(file, ln)] = BlamedLineResult(
+                    file, ln, "unknown",
+                    reason=f"sandbox unavailable: {exc}")
             continue
         if proc.returncode == 2:
             reason = (proc.stderr or "checker error").strip()[:200]
@@ -249,12 +304,16 @@ def render_section(results: list[BlamedLineResult]) -> str:
         elif r.status == "not_executed":
             cell = "**NOT EXECUTED**"
         else:
-            cell = f"Unknown — {r.reason}" if r.reason else "Unknown"
-        lines.append(f"| `{r.file}:{r.line}` | {cell} |")
+            # The reason cell carries up to 200 chars of checker
+            # stderr — hostile-gcov-derived bytes. md_inline keeps a
+            # raw pipe from breaking the table row, an embedded
+            # newline from splitting the line, and image/autofetch
+            # markup from going live in the report.
+            reason = md_inline(r.reason) if r.reason else ""
+            cell = f"Unknown — {reason}" if reason else "Unknown"
+        lines.append(f"| `{md_inline(f'{r.file}:{r.line}')}` | {cell} |")
     lines.append("")
-    lines.append(
-        "_Generated mechanically from gcov data by "
-        "packages.binary_analysis.blamed_lines; evidence, not a verdict._")
+    lines.append(_SECTION_FOOTER)
     return "\n".join(lines) + "\n"
 
 
@@ -291,11 +350,25 @@ def check_report(
     except OSError as exc:
         logger.warning("blamed_lines: sidecar write failed: %s", exc)
     if stamp and results:
-        base = text.split("\n---\n\n" + _SECTION_MARKER)[0]
+        # Replace only a section WE previously stamped: strip from the
+        # LAST delimiter occurrence, and only when the tail carries the
+        # mechanical footer. Splitting on the first occurrence
+        # truncated a report whose agent prose legitimately contained
+        # the delimiter byte sequence.
+        delim = "\n---\n\n" + _SECTION_MARKER
+        idx = text.rfind(delim)
+        if idx != -1 and _SECTION_FOOTER in text[idx:]:
+            base = text[:idx]
+        else:
+            base = text
         try:
-            report_path.write_text(
+            # Atomic read-modify-write commit: the report lives in
+            # the reused run dir — a plain write_text follows a
+            # planted symlink at the name; os.replace replaces it.
+            write_text_atomically(
+                report_path,
                 base.rstrip("\n") + "\n" + render_section(results),
-                encoding="utf-8")
+            )
         except OSError as exc:
             logger.warning("blamed_lines: report stamp failed: %s", exc)
     if summary["not_executed"]:

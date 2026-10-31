@@ -72,7 +72,8 @@ RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
 # SEMGREP (static-analysis, scan, raptor-scan, agentic commands)
 # ============================================================================
 
-RUN pip install --no-cache-dir semgrep==1.172.0
+COPY --from=ghcr.io/astral-sh/uv:0.7 /uv /usr/local/bin/uv
+RUN uv tool install semgrep==1.177.0
 
 # ============================================================================
 # RR DEBUGGER (rr-debugger skill, crash-analysis agents)
@@ -105,7 +106,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Downloaded from GitHub releases
 # ============================================================================
 
-ARG CODEQL_VERSION=2.26.4
+ARG CODEQL_VERSION=2.27.2
 RUN mkdir -p /opt/codeql \
     && curl -L "https://github.com/github/codeql-cli-binaries/releases/download/v${CODEQL_VERSION}/codeql-linux64.zip" -o /tmp/codeql.zip \
     && unzip /tmp/codeql.zip -d /opt \
@@ -116,14 +117,11 @@ RUN mkdir -p /opt/codeql \
 # PYTHON DEPENDENCIES
 # ============================================================================
 
-COPY requirements.txt requirements-dev.txt /tmp/
-# Also copy package-specific requirements so they can be installed explicitly if desired
-COPY packages/web/requirements.txt /tmp/packages-web-requirements.txt
+COPY pyproject.toml uv.lock /tmp/
 
-RUN pip install --no-cache-dir -r /tmp/requirements-dev.txt
-
-# Install web package dependencies (includes playwright)
-RUN pip install --no-cache-dir -r /tmp/packages-web-requirements.txt
+RUN bash -eo pipefail -c \
+    'uv export --locked --no-hashes --project /tmp --extra web \
+     | uv pip install --system --no-cache -r -'
 
 # Install Playwright browser + system deps via Playwright's own dep installer.
 # Replaces a hand-rolled apt list that drifted out of sync with upstream Chromium deps.
@@ -142,15 +140,15 @@ RUN apt-get update \
 RUN curl -fsSL https://deb.nodesource.com/setup_24.x -o /tmp/nodesource_setup.sh \
     && bash /tmp/nodesource_setup.sh \
     && rm /tmp/nodesource_setup.sh \
-    && apt-get install -y --no-install-recommends nodejs=24.20.0-1nodesource1 \
+    && apt-get install -y --no-install-recommends nodejs=24.21.0-1nodesource1 \
     && apt-get clean && rm -rf /var/lib/apt/lists/* \
-    && npm install -g @anthropic-ai/claude-code@2.1.163
+    && npm install -g @anthropic-ai/claude-code@2.1.269
 
 # ============================================================================
 # JS PACKAGE MANAGERS (npm-managed yarn — apt source + package removed above)
 # ============================================================================
 
-RUN npm install -g yarn@1.22.22 pnpm@11.8.0
+RUN npm install -g yarn@1.22.22 pnpm@11.11.0
 
 # ============================================================================
 # ENVIRONMENT CONFIGURATION

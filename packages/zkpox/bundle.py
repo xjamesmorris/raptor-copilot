@@ -31,6 +31,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
+from core.atomic_fs import write_bytes_atomically
 from core.json import save_json
 from packages.zkpox.eligibility import is_zkpox_eligible
 
@@ -196,8 +197,11 @@ def write_bundle(
     bundle_dir.mkdir(parents=True, exist_ok=True)
 
     # Copy the witness bytes into the bundle (self-contained).
+    # Atomic: a crash mid-write left a truncated witness.bin inside an
+    # otherwise-valid bundle — the hash mismatch surfaced only at
+    # reproduce time, far from the cause.
     data = store.get_bytes(bundle.witness_hash)
-    (bundle_dir / "witness.bin").write_bytes(data)
+    write_bytes_atomically(bundle_dir / "witness.bin", data)
 
     manifest_path = bundle_dir / "manifest.json"
     save_json(manifest_path, bundle.as_dict())
@@ -218,7 +222,15 @@ def render_bundle(bundle: ZKPoXBundle) -> str:
             else f"source {bundle.target_source_hash[:16]}..."
             if bundle.target_source_hash else "none"
         ),
-        f"   claim:    {bundle.attestation['claim']}",
+        # attestation is optional on the reproduce path (the CLI
+        # defaults it to {} and it is not a required manifest field)
+        # — a sparse manifest renders "(none)", never a KeyError
+        # traceback in place of the exit-2 diagnostic contract.
+        "   claim:    "
+        + str(
+            (bundle.attestation or {}).get("claim", "(none)")
+            if isinstance(bundle.attestation, dict) else "(none)"
+        ),
     ]
     if bundle.reproduction is not None:
         rep = bundle.reproduction

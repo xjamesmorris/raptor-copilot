@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from core.atomic_fs import write_text_atomically
+from core.artifacts.context_map_budget import save_context_map
 from core.artifacts.provenance import (
     CONTEXT_MAP_TEXT_SCHEMA,
     sanitise_free_text,
@@ -24,7 +26,9 @@ from core.artifacts.provenance import (
 from core.evidence import BinaryEvidenceRecord, EvidenceTier, make_evidence
 from core.hash import sha256_file
 from core.json import load_json, save_json
+from core.security.markdown_render import md_inline
 
+from ._artifact_lock import with_run_artifacts_lock
 from ._symbols import symbol_base_name
 from .constraints import validate_constraint_file
 from .diff import diff_manifests
@@ -52,6 +56,18 @@ from .topology import build_component_topology
 from .validation_handoff import build_validation_handoff
 
 logger = logging.getLogger(__name__)
+
+#: Read budget for binary-decompilations.json — the one run artifact
+#: this pipeline both writes and re-reads whose legitimate size can
+#: exceed the loader's 256 MiB default: --decompile-all lifts
+#: max_decompile to 1M functions, and a very large binary's full
+#: decompilation corpus scales with code size. 1 GiB keeps the
+#: reader's memory bounded (a sparse plant in the run dir still
+#: refuses at the fstat gate) while covering the decompile-all
+#: extreme; LOWER silently drops the run's own decompilations from
+#: the report/handoff (degrade-to-{} below), HIGHER stops bounding
+#: the reader in any useful way.
+_DECOMPILATIONS_MAX_BYTES = 1024 * 1024 * 1024
 
 
 def _stamp_context_map(context_map: dict) -> None:
@@ -135,6 +151,48 @@ def _address(value: Any) -> str:
         return hex(int(value))
     except (TypeError, ValueError):
         return ""
+
+
+def _align_context_anchor(context: Any, manifest: BinaryManifest) -> None:
+    """One module, one anchor: overwrite the context's path-probed
+    anchor with the manifest's kind-aware identity anchor.
+
+    The context probes its anchor from the bare binary path, which
+    cannot see the analysed-slice selection — on a fat Mach-O the
+    path probe is the whole-file hash while the manifest carries the
+    analysed slice's LC_UUID. Left unaligned, the map records and
+    fid stamps (context anchor) and the manifest-minted fids (kind-
+    aware anchor) would disagree and every fid join for that module
+    would miss. For ELF and the hash fallback the two derivations
+    are byte-identical, so this is a no-op there. Best-effort: a
+    manifest without identity leaves the probe result alone.
+    """
+    if not manifest.identity_kind or not manifest.build_id:
+        return
+    from core.binary.identity import identity_anchor
+    aligned = identity_anchor(manifest.identity_kind, manifest.build_id)
+    if aligned and hasattr(context, "content_anchor"):
+        context.content_anchor = aligned
+
+
+def _fid_fragment(manifest: BinaryManifest, address: Any) -> dict[str, str]:
+    """Additive ``{"fid": ...}`` fragment for a function record.
+
+    Empty when the identity cannot be minted honestly — no recorded
+    image base on the manifest, no module anchor, junk address
+    (fail-closed per core.binary.addrmap; consumers fall back to
+    name matching).
+    """
+    if manifest.image_base is None:
+        return {}
+    from core.binary.addrmap import make_fid
+    from core.binary.identity import manifest_anchor
+    # Kind-aware anchor: a PE manifest's build_id carries the
+    # canonical GUID+age, which anchors HASHED — a raw value-prefix
+    # would mint identities no other consumer mints.
+    anchor = manifest_anchor(manifest)
+    fid = make_fid(anchor, address, manifest.image_base)
+    return {"fid": fid} if fid else {}
 
 
 def _fn_id(prefix: str, fn: Any) -> str:
@@ -667,6 +725,7 @@ def _build_entry_points(
             "entry": fn.name,
             "file": manifest.binary_path,
             "address": _address(fn.address),
+            **_fid_fragment(manifest, fn.address),
             "size": fn.size,
             "type": "binary_entry_point_candidate",
             "auth_required": None,
@@ -709,6 +768,7 @@ def _build_surfaces_and_sinks(
             "operation": fn.name,
             "file": manifest.binary_path,
             "address": _address(fn.address),
+            **_fid_fragment(manifest, fn.address),
             "size": fn.size,
             "type": "binary_sink_candidate" if classification.is_sink else "binary_surface_candidate",
             "confidence": "candidate",
@@ -844,6 +904,81 @@ def _build_candidate_flows(
     return candidate_flows, evidence
 
 
+def _build_string_anchors(
+    manifest: BinaryManifest,
+    context: BinaryContextMap,
+) -> tuple[list[dict[str, Any]], list[BinaryEvidenceRecord]]:
+    """Project the r2 string-anchor pass into structural review leads.
+
+    An anchor-dense function (many diagnostic-shaped strings
+    referenced) is a likely parser or handler — valuable on stripped
+    binaries where nothing else is format-aware. It is NOT a finding
+    and not taint proof; every emitted record says so.
+    """
+    entries: list[dict[str, Any]] = []
+    evidence: list[BinaryEvidenceRecord] = []
+    functions_by_addr = {
+        int(fn.address): fn
+        for fn in context.interesting_functions
+        if fn.address is not None
+    }
+    for item in getattr(context, "string_anchor_functions", []) or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "")
+        try:
+            addr = int(item.get("address") or 0)
+        except (TypeError, ValueError):
+            addr = 0
+        count = int(item.get("anchor_string_count") or 0)
+        if not name or count <= 0 or _is_runtime_support_name(name):
+            continue
+        # Sample strings were escaped at capture (hostile binary
+        # bytes); pass them through untouched.
+        samples = [str(s) for s in (item.get("sample_strings") or [])]
+        bound = functions_by_addr.get(addr)
+        record = make_evidence(
+            manifest.binary_sha256,
+            kind="string_anchor_candidate",
+            source="radare2_axtj",
+            summary=(
+                f"{count} diagnostic-shaped string(s) referenced "
+                f"from {name!r}"
+            ),
+            tier=EvidenceTier.XREF_BACKED,
+            confidence="candidate",
+            reproducible=True,
+            tool="radare2",
+            location=f"{manifest.binary_path}@{_address(addr)}",
+            data={
+                "function": name,
+                "address": _address(addr),
+                "anchor_string_count": count,
+                "sample_strings": samples,
+            },
+        )
+        evidence.append(record)
+        entries.append({
+            "id": _metadata_item_id("BANCHOR", name, addr),
+            "kind": "string_anchor",
+            "name": name,
+            "address": _address(addr),
+            **_fid_fragment(manifest, addr),
+            "anchor_string_count": count,
+            "sample_strings": samples,
+            "bound_function_id": _fn_id("BFN", bound) if bound is not None else "",
+            "confidence": "candidate",
+            "evidence_tier": EvidenceTier.XREF_BACKED.value,
+            "evidence_note": (
+                "Anchor-dense functions are likely parsers or handlers; "
+                "this is a structural review lead, not a finding and not "
+                "taint proof."
+            ),
+            "evidence_ids": [record.id],
+        })
+    return entries, evidence
+
+
 def _context_map(
     manifest: BinaryManifest,
     context: BinaryContextMap,
@@ -871,6 +1006,9 @@ def _context_map(
 
     candidate_flows, flow_evidence = _build_candidate_flows(manifest, context, sink_details)
     generated_evidence.extend(flow_evidence)
+
+    string_anchor_leads, anchor_evidence = _build_string_anchors(manifest, context)
+    generated_evidence.extend(anchor_evidence)
 
     class_inventory: list[dict[str, Any]] = []
     framework_callback_candidates: list[dict[str, Any]] = []
@@ -987,6 +1125,16 @@ def _context_map(
         "binary": manifest.binary_path,
         "target_path": manifest.binary_path,
         "image_base": _address(context.image_base),
+        "image_base_recorded": bool(
+            getattr(context, "image_base_recorded", False),
+        ),
+        "content_anchor": str(
+            getattr(context, "content_anchor", "") or "",
+        ),
+        # The anchor's declared identity kind (additive): joiners
+        # comparing anchors can witness cross-format kind mismatches
+        # (core.binary.addrmap.record_join_anomalies).
+        "identity_kind": manifest.identity_kind,
         "binary_slices": [item.to_dict() for item in manifest.slices],
         "analysis_scope": {
             "selected_arch": manifest.analysed_slice.arch if manifest.analysed_slice else manifest.arch,
@@ -1038,6 +1186,7 @@ def _context_map(
                 "name": fn.name,
                 "file": manifest.binary_path,
                 "address": _address(fn.address),
+                **_fid_fragment(manifest, fn.address),
                 "size": fn.size,
                 "calls_dangerous": list(fn.calls_dangerous),
                 "transitively_reaches_dangerous": list(fn.transitively_reaches_dangerous),
@@ -1058,6 +1207,7 @@ def _context_map(
                 "name": fn.name,
                 "file": manifest.binary_path,
                 "address": _address(fn.address),
+                **_fid_fragment(manifest, fn.address),
                 "size": fn.size,
                 "evidence_tier": EvidenceTier.XREF_BACKED.value,
             }
@@ -1065,6 +1215,7 @@ def _context_map(
             if _is_runtime_support_name(fn.name)
         ],
         "candidate_flows": candidate_flows,
+        "string_anchor_functions": string_anchor_leads,
         "unchecked_flows": [],
         "runtime_signals": [signal.to_dict() for signal in manifest.runtime_signals],
         "runtime_observations": _runtime_observation_summary(
@@ -1093,11 +1244,25 @@ def _context_map(
             "No trust boundary or unchecked flow is emitted without runtime or trace evidence.",
             "Name-based entry points are candidates until a runtime observation or format-specific contract confirms them.",
             "Framework callback selectors are metadata-backed candidates until a runtime observation proves they fire.",
+            "A string-anchor lead marks a likely parser or handler; it is not a finding and not taint proof.",
             "Only the selected Mach-O slice receives deep analysis; other slices remain header-backed inventory until separately mapped.",
             "Decompiler output is persisted for operator review but remains decompiler-inferred evidence.",
         ],
         "evidence": [record.to_dict() for record in [*static_records, *generated_evidence]],
     }, generated_evidence
+
+
+def _esc(value: Any) -> str:
+    """Defang binary-derived strings bound for the operator-facing
+    report — a thin projection of the core.security.markdown_render
+    one-home. A hostile binary controls names and Info.plist strings
+    end-to-end (plistlib and r2's iij preserve raw ESC/BEL); the
+    report is catted to terminals AND read by LLM agents in later
+    passes, so md_inline's control/bidi escaping, newline flattening,
+    in-slot structure entity-escaping (| and backtick — a raw
+    backtick closed the wrapping code span and let markdown/autofetch
+    payloads go live), and autofetch stripping all apply here."""
+    return md_inline(value)
 
 
 def _write_report(result: BinaryAnalysisResult, out_dir: Path) -> None:
@@ -1108,9 +1273,15 @@ def _write_report(result: BinaryAnalysisResult, out_dir: Path) -> None:
     lines = [
         "# RAPTOR Black-box Binary Understanding",
         "",
-        f"Target: `{result.manifest.binary_path}`",
-        f"SHA-256: `{result.manifest.binary_sha256}`",
-        f"Format: `{result.manifest.binary_format}`  Arch: `{result.manifest.arch}`  Bits: `{result.manifest.bits}`",
+        # The filename component of binary_path is attacker-chosen for
+        # extracted bundles/downloads; format/arch strings derive from
+        # parsing the hostile binary — same _esc chokepoint as every
+        # other name-bearing interpolation in this report.
+        f"Target: `{_esc(str(result.manifest.binary_path))}`",
+        f"SHA-256: `{_esc(str(result.manifest.binary_sha256))}`",
+        f"Format: `{_esc(str(result.manifest.binary_format))}`  "
+        f"Arch: `{_esc(str(result.manifest.arch))}`  "
+        f"Bits: `{result.manifest.bits}`",
         "",
         "## Evidence Summary",
         "",
@@ -1119,6 +1290,13 @@ def _write_report(result: BinaryAnalysisResult, out_dir: Path) -> None:
         f"- Security-relevant imported primitive candidates: {len(context.get('sink_details') or [])}",
         f"- Security-relevant non-sink surfaces: {len(context.get('surface_details') or []) - len(context.get('sink_details') or [])}",
         f"- Candidate call-graph flows: {len(context.get('candidate_flows') or [])}",
+        # A skipped anchor pass must not read as "ran and found
+        # nothing" — the two are different operator facts.
+        (
+            "- String-anchor function leads: (skipped)"
+            if scope.get("string_anchor_pass") == "skipped"
+            else f"- String-anchor function leads: {len(context.get('string_anchor_functions') or [])}"
+        ),
         f"- Decompiled functions persisted: {coverage.get('decompiled_functions') or 0} / {coverage.get('recovered_functions') or 0}",
         f"- Runtime observation summaries: {len(context.get('runtime_observations') or [])}",
         f"- Runtime input callsites bound to recovered functions: {len(context.get('runtime_input_flows') or [])}",
@@ -1129,16 +1307,25 @@ def _write_report(result: BinaryAnalysisResult, out_dir: Path) -> None:
         f"- Recovered class methods: {class_summary.get('method_count') or 0}",
         f"- Framework callback candidates: {len(context.get('framework_callback_candidates') or [])}",
         f"- External ingress candidates: {len(context.get('external_ingress_candidates') or [])}",
+        # Demotions must stay operator-visible: the type byte driving
+        # them is attacker-controlled, so a silent demotion would be a
+        # surface-hiding lever.
+        f"- Exported data symbols demoted below API exports: "
+        f"{sum(1 for item in (context.get('external_ingress_candidates') or []) if isinstance(item, dict) and item.get('kind') == 'exported_data')}",
         f"- Parser boundary candidates: {len(context.get('parser_boundary_candidates') or [])}",
         "",
         "## Analysis Scope",
         "",
-        f"- Selected architecture: {scope.get('selected_arch', result.manifest.arch)}",
-        f"- Analysis depth: {scope.get('analysis_depth', result.manifest.analysis_depth)}",
-        f"- Deep-analysis architecture: {scope.get('deep_analysis_arch') or 'not run'}",
-        f"- Mach-O slices inventoried: {scope.get('slice_count', 0)}",
+        # Same derivation as the escaped header lanes: arch/depth/
+        # decompiler strings come from parsing the hostile binary (or
+        # from run-dir JSON via Manifest.from_dict) — same _esc
+        # chokepoint.
+        f"- Selected architecture: {_esc(scope.get('selected_arch', result.manifest.arch))}",
+        f"- Analysis depth: {_esc(scope.get('analysis_depth', result.manifest.analysis_depth))}",
+        f"- Deep-analysis architecture: {_esc(scope.get('deep_analysis_arch') or 'not run')}",
+        f"- Mach-O slices inventoried: {_esc(scope.get('slice_count', 0))}",
         f"- All slices deeply analysed: {'yes' if scope.get('all_slices_analysed') else 'no'}",
-        f"- Decompiler: {coverage.get('decompiler') or 'none'}",
+        f"- Decompiler: {_esc(coverage.get('decompiler') or 'none')}",
     ]
     if result.manifest.app_bundle:
         bundle = result.manifest.app_bundle
@@ -1146,11 +1333,11 @@ def _write_report(result: BinaryAnalysisResult, out_dir: Path) -> None:
             "",
             "## App Bundle",
             "",
-            f"- Identifier: `{bundle.identifier or 'unknown'}`",
-            f"- Version: `{bundle.short_version or 'unknown'}` build `{bundle.build_version or 'unknown'}`",
-            f"- Privileged executables: {', '.join(bundle.privileged_executables) or 'none declared'}",
-            f"- XPC services: {', '.join(bundle.xpc_services) or 'none declared'}",
-            f"- ATS exception domains: {', '.join(bundle.ats_exception_domains) or 'none declared'}",
+            f"- Identifier: `{_esc(bundle.identifier or 'unknown')}`",
+            f"- Version: `{_esc(bundle.short_version or 'unknown')}` build `{_esc(bundle.build_version or 'unknown')}`",
+            f"- Privileged executables: {_esc(', '.join(bundle.privileged_executables)) or 'none declared'}",
+            f"- XPC services: {_esc(', '.join(bundle.xpc_services)) or 'none declared'}",
+            f"- ATS exception domains: {_esc(', '.join(bundle.ats_exception_domains)) or 'none declared'}",
         ])
     if context.get("notes"):
         lines.extend([
@@ -1158,7 +1345,7 @@ def _write_report(result: BinaryAnalysisResult, out_dir: Path) -> None:
             "## Analysis Notes",
             "",
         ])
-        lines.extend(f"- {note}" for note in context["notes"])
+        lines.extend(f"- {_esc(note)}" for note in context["notes"])
     callbacks = context.get("framework_callback_candidates", [])
     if callbacks:
         lines.extend([
@@ -1167,7 +1354,7 @@ def _write_report(result: BinaryAnalysisResult, out_dir: Path) -> None:
             "",
         ])
         lines.extend(
-            f"- `{item['class_name']}.{item['method_name']}` @ `{item['address']}`"
+            f"- `{_esc(item['class_name'])}.{_esc(item['method_name'])}` @ `{_esc(item['address'])}`"
             for item in callbacks[:10]
         )
         lines.append("")
@@ -1180,8 +1367,8 @@ def _write_report(result: BinaryAnalysisResult, out_dir: Path) -> None:
             "",
         ])
         lines.extend(
-            f"- `{item['kind']}` `{item['name']}` via `{item['boundary']}` "
-            f"(control: `{item['external_control']}`)"
+            f"- `{_esc(item['kind'])}` `{_esc(item['name'])}` via `{_esc(item['boundary'])}` "
+            f"(control: `{_esc(item['external_control'])}`)"
             for item in ingress[:10]
         )
         lines.append("")
@@ -1194,8 +1381,8 @@ def _write_report(result: BinaryAnalysisResult, out_dir: Path) -> None:
             "",
         ])
         lines.extend(
-            f"- `{item['boundary_function_name']}` behind `{item['ingress_name']}` calls "
-            f"`{item['parser_surface_name']}` (depth {item['path']['depth']}, tier `{item['evidence_tier']}`)"
+            f"- `{_esc(item['boundary_function_name'])}` behind `{_esc(item['ingress_name'])}` calls "
+            f"`{_esc(item['parser_surface_name'])}` (depth {item['path']['depth']}, tier `{_esc(item['evidence_tier'])}`)"
             for item in parser_boundaries[:10]
         )
         lines.append("")
@@ -1206,12 +1393,12 @@ def _write_report(result: BinaryAnalysisResult, out_dir: Path) -> None:
             "",
             "## Fuzz Strategy",
             "",
-            f"- Strategy: `{suitability.get('strategy')}`",
+            f"- Strategy: `{_esc(suitability.get('strategy'))}`",
             f"- Direct campaign recommended: {'yes' if suitability.get('direct_campaign_recommended') else 'no'}",
-            f"- Runtime collection: `{suitability.get('runtime_strategy', 'direct_process')}`",
-            f"- Runtime reason: {suitability.get('runtime_reason')}",
-            f"- Reason: {suitability.get('reason')}",
-            f"- Next step: {suitability.get('next_step')}",
+            f"- Runtime collection: `{_esc(suitability.get('runtime_strategy', 'direct_process'))}`",
+            f"- Runtime reason: {_esc(suitability.get('runtime_reason'))}",
+            f"- Reason: {_esc(suitability.get('reason'))}",
+            f"- Next step: {_esc(suitability.get('next_step'))}",
         ])
     lines.extend([
         "",
@@ -1224,7 +1411,14 @@ def _write_report(result: BinaryAnalysisResult, out_dir: Path) -> None:
         f"Validation handoff: `{Path(out_dir) / 'binary-validation-handoff.json'}`",
         f"Graph: `{result.graph_path}`",
     ])
-    (Path(out_dir) / "binary-analysis-report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # Atomic write: the run dir is reused and inside sandboxed
+    # children's write grants — a planted symlink at the predictable
+    # report name must never route the write (os.replace replaces the
+    # symlink itself, mirroring the save_json artifacts beside it).
+    write_text_atomically(
+        Path(out_dir) / "binary-analysis-report.md",
+        "\n".join(lines) + "\n",
+    )
 
 
 def _ingest_graph(result: BinaryAnalysisResult, out_dir: Path) -> None:
@@ -1761,6 +1955,34 @@ def _ingest_graph_body(store: BinaryGraphStore, result: BinaryAnalysisResult, ou
             store.add_artifact(snapshot_id, kind, path)
 
 
+def _resolve_requested_slice_arch(binary: Path, slice_arch: str) -> str:
+    """Validate an explicit ``--slice-arch`` against the binary's real
+    slices and return the canonical (alias-normalised) arch name.
+
+    Raises ``ValueError`` when the binary carries no matching slice —
+    including the non-Mach-O case, where forcing r2's ``-a``/``-b``
+    would decode the binary's bytes as the wrong ISA and stamp the
+    garbage output ``full``-depth.
+    """
+    from .macho import inspect_macho_slices, resolve_requested_slice
+    slices, _ = inspect_macho_slices(binary, "")
+    if not slices:
+        msg = (
+            f"--slice-arch {slice_arch!r} requested but {binary} is not "
+            "a Mach-O binary with architecture slices; drop --slice-arch"
+        )
+        raise ValueError(msg)
+    resolved = resolve_requested_slice(slices, slice_arch)
+    if resolved is None:
+        available = sorted({item.arch for item in slices})
+        msg = (
+            f"--slice-arch {slice_arch!r} matches no slice in {binary} "
+            f"(available: {available})"
+        )
+        raise ValueError(msg)
+    return resolved.arch
+
+
 def analyse_blackbox_binary(
     binary_path: Path,
     *,
@@ -1769,6 +1991,7 @@ def analyse_blackbox_binary(
     quick: bool = False,
     max_decompile: int = 20,
     slice_arch: str | None = None,
+    string_anchors: bool = True,
     runtime_dir: Path | None = None,
     fuzz_dir: Path | None = None,
     constraint_file: Path | None = None,
@@ -1777,6 +2000,13 @@ def analyse_blackbox_binary(
     binary = Path(binary_path).resolve()
     out_dir = Path(out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    if slice_arch is not None:
+        # One shared slice decision, made BEFORE any analysis: the r2
+        # lane maps a requested arch to -a/-b unconditionally, so an
+        # arch the binary cannot satisfy must refuse here — never
+        # decode the fallback slice's bytes as the wrong ISA while
+        # the manifest reports the fallback's arch as analysed.
+        slice_arch = _resolve_requested_slice_arch(binary, slice_arch)
     try:
         context = analyse_binary_context(
             binary,
@@ -1790,6 +2020,10 @@ def analyse_blackbox_binary(
             # extraction — as does the compare-binary pass below.
             extract_cfgs=not quick,
             slice_arch=slice_arch,
+            # Bounded diagnostic-string anchor pass (see
+            # radare2_understand._extract_string_anchors). Default on;
+            # operators skip it via --no-string-anchors.
+            string_anchors=string_anchors,
         )
     except Exception as exc:
         logger.warning("radare2 analysis failed for %s: %s", binary, exc, exc_info=True)
@@ -1798,6 +2032,7 @@ def analyse_blackbox_binary(
         context.notes.append(f"radare2 analysis unavailable: {exc}")
 
     manifest = build_manifest(binary, context, requested_slice_arch=slice_arch)
+    _align_context_anchor(context, manifest)
     evidence = list(manifest.evidence)
     static_records = _static_evidence(manifest, context)
     evidence.extend(static_records)
@@ -1892,6 +2127,15 @@ def analyse_blackbox_binary(
         runtime_input_flows,
     )
     evidence.extend(context_evidence)
+    # Stamp whether the string-anchor pass actually ran: the report
+    # must distinguish "skipped" (flag off, quick mode, or no deep r2
+    # analysis at all) from "ran and found nothing".
+    context_map["analysis_scope"]["string_anchor_pass"] = (
+        "skipped"
+        if (quick or not string_anchors
+            or manifest.analysis_depth in {"metadata_only", "unavailable"})
+        else "ran"
+    )
     external_ingress, ingress_evidence = recover_external_ingress(manifest, context_map)
     evidence.extend(ingress_evidence)
     context_map["external_ingress_candidates"] = external_ingress
@@ -1958,9 +2202,15 @@ def analyse_blackbox_binary(
 
     save_json(out_dir / "binary-manifest.json", manifest.to_dict())
     save_json(out_dir / "binary-evidence.json", {"evidence": [record.to_dict() for record in evidence]})
+    # The map embeds its own evidence array for self-containment —
+    # refresh it with the records minted AFTER _context_map built the
+    # initial list (external ingress, runtime-parser flows, parser
+    # boundaries), or the map's *_candidates[].evidence_ids dangle
+    # within the same document until a later append rewrites it.
+    context_map["evidence"] = [record.to_dict() for record in evidence]
     _stamp_context_map(context_map)
-    save_json(out_dir / "binary-context-map.json", context_map)
-    save_json(out_dir / "context-map.json", context_map)
+    save_context_map(out_dir / "binary-context-map.json", context_map)
+    save_context_map(out_dir / "context-map.json", context_map)
     save_json(out_dir / "binary-decompilations.json", decompilations)
     save_json(out_dir / "binary-validation-handoff.json", validation_handoff)
     save_json(out_dir / "binary-checklist.json", {
@@ -2017,6 +2267,7 @@ def analyse_blackbox_binary(
     return result
 
 
+@with_run_artifacts_lock
 def append_fuzz_evidence_to_run(
     binary_path: Path,
     *,
@@ -2024,6 +2275,10 @@ def append_fuzz_evidence_to_run(
     fuzz_dir: Path | None = None,
 ) -> FuzzEvidenceBundle | None:
     """Append completed fuzz evidence to an existing binary run.
+
+    Runs under the per-run artifacts lock: the load → mutate → save
+    window over binary-evidence.json / context map / checklist
+    otherwise loses a concurrent writer's records silently.
 
     The fuzz orchestrator uses this after the campaign finishes so the pre-fuzz
     static map does not need to be recomputed. If no binary manifest exists, the
@@ -2067,10 +2322,11 @@ def append_fuzz_evidence_to_run(
             seen.add(record.id)
     context_map["evidence"] = existing
     _stamp_context_map(context_map)
-    save_json(out_dir / "binary-context-map.json", context_map)
-    save_json(out_dir / "context-map.json", context_map)
+    save_context_map(out_dir / "binary-context-map.json", context_map)
+    save_context_map(out_dir / "context-map.json", context_map)
     save_json(out_dir / "binary-evidence.json", {"evidence": existing})
-    decompilations = load_json(out_dir / "binary-decompilations.json")
+    decompilations = load_json(out_dir / "binary-decompilations.json",
+                               max_bytes=_DECOMPILATIONS_MAX_BYTES)
     if not isinstance(decompilations, dict):
         decompilations = {}
     all_evidence = _evidence_records_from_payload(existing)
@@ -2217,6 +2473,10 @@ def _saved_context_for_runtime(manifest: BinaryManifest, context_map: dict[str, 
         bits=manifest.bits,
         binary_format=manifest.binary_format,
         image_base=image_base,
+        # Restored, not re-derived: old maps without the flag stay
+        # unrecorded (fail-closed — no fid minting from a reload).
+        image_base_recorded=bool(context_map.get("image_base_recorded")),
+        content_anchor=str(context_map.get("content_anchor") or ""),
         analysis_depth=str((context_map.get("analysis_scope") or {}).get("analysis_depth") or "full"),
     )
     for item in context_map.get("interesting_functions", []):
@@ -2251,6 +2511,7 @@ def _channels_from_checklist(checklist: dict[str, Any]) -> list[InputChannel]:
     return channels
 
 
+@with_run_artifacts_lock
 def append_runtime_evidence_to_run(
     binary_path: Path,
     *,
@@ -2261,7 +2522,8 @@ def append_runtime_evidence_to_run(
 
     This is used by `/binary trace-parser`: it preserves the original static
     map, adds new Frida observations, refreshes parser-boundary candidates and
-    updates the graph/handoff in place.
+    updates the graph/handoff in place. Runs under the per-run
+    artifacts lock (see append_fuzz_evidence_to_run).
     """
     out_dir = Path(out_dir).resolve()
     manifest_data = load_json(out_dir / "binary-manifest.json")
@@ -2344,7 +2606,8 @@ def append_runtime_evidence_to_run(
             existing.append(record.to_dict())
             seen.add(record.id)
     all_evidence = _evidence_records_from_payload(existing)
-    decompilations = load_json(out_dir / "binary-decompilations.json")
+    decompilations = load_json(out_dir / "binary-decompilations.json",
+                               max_bytes=_DECOMPILATIONS_MAX_BYTES)
     if not isinstance(decompilations, dict):
         decompilations = {}
     fuzz = _fuzz_bundle_from_payload(load_json(out_dir / "binary-fuzz-evidence.json"))
@@ -2363,8 +2626,8 @@ def append_runtime_evidence_to_run(
     )
     context_map["evidence"] = existing
     _stamp_context_map(context_map)
-    save_json(out_dir / "binary-context-map.json", context_map)
-    save_json(out_dir / "context-map.json", context_map)
+    save_context_map(out_dir / "binary-context-map.json", context_map)
+    save_context_map(out_dir / "context-map.json", context_map)
     save_json(out_dir / "binary-evidence.json", {"evidence": existing})
     save_json(out_dir / "binary-validation-handoff.json", validation_handoff)
     checklist["input_channels"] = [channel.to_dict() for channel in channels]

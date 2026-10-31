@@ -9,6 +9,8 @@ from ..attack_tree import generate as gen_attack_tree
 from ..context_map import generate as gen_context_map
 from ..findings_summary import generate_type_pie, generate_verdict_pie
 from ..flow_trace import generate as gen_flow_trace
+from ..graph_memory import generate_diff as gen_graph_diff
+from ..graph_memory import generate_priority_paths as gen_graph_paths
 from ..hypotheses import generate as gen_hypotheses
 from ..renderer import render_and_write, render_directory
 from ..sanitize import sanitize, sanitize_id
@@ -1447,6 +1449,50 @@ class TestAttackPaths:
 
 
 # ---------------------------------------------------------------------------
+# graph memory tests
+# ---------------------------------------------------------------------------
+
+class TestGraphMemory:
+    def test_graph_priority_paths_render_risk_flow(self):
+        out = gen_graph_paths([{
+            "id": "graph-path-EP-001-SINK-001",
+            "entry": {"id": "EP-001", "label": "GET /search", "location": "routes.py:10"},
+            "sink": {"id": "SINK-001", "label": "template render", "location": "views.py:20"},
+            "risk_score": 80,
+            "confidence": "high",
+            "missing_boundary": "No output encoding",
+        }])
+        assert "flowchart LR" in out
+        assert "GET /search" in out
+        assert "template render" in out
+        assert "risk 80" in out
+        assert_no_mermaid_directive_injection(out)
+
+    def test_graph_diff_renders_new_risks(self):
+        out = gen_graph_diff({
+            "is_diffable": True,
+            "base_snapshot": {"id": "snap:old"},
+            "head_snapshot": {"id": "snap:new"},
+            "new_risks": [{
+                "source": "GET /upload",
+                "sink": "filesystem write",
+                "confidence": "high",
+            }],
+            "reachability": {"added": [], "removed": []},
+            "nodes": {"sink": {"added": [{"id": "SINK-2"}], "removed": []}},
+        })
+        assert "flowchart TD" in out
+        assert "New risk" in out
+        assert "GET /upload" in out
+        assert "filesystem write" in out
+        assert_no_mermaid_directive_injection(out)
+
+    def test_graph_diff_not_diffable_renders_reason(self):
+        out = gen_graph_diff({"is_diffable": False, "reason": "need at least two snapshots"})
+        assert "need at least two snapshots" in out
+
+
+# ---------------------------------------------------------------------------
 # renderer tests
 # ---------------------------------------------------------------------------
 
@@ -1462,6 +1508,69 @@ class TestRenderer:
         assert "Context Map" in out
         assert "testapp" in out
         assert "```mermaid" in out
+
+    def test_graph_context_map_is_rendered_before_flat_attack_surface(self, tmp_path):
+        attack_surface = {
+            "sources": [{"type": "http_route", "entry": "GET /flat"}],
+            "sinks": [{"type": "db_query", "location": "src/db.py:10"}],
+            "trust_boundaries": [],
+        }
+        graph_map = {
+            "entry_points": [{"id": "EP-001", "name": "ap_read_request"}],
+            "sink_details": [{"id": "SINK-001", "operation": "cgi_environment"}],
+        }
+        self._make_out_dir(tmp_path, {
+            "attack-surface.json": attack_surface,
+            "context-map.graph.json": graph_map,
+        })
+        out = render_directory(tmp_path)
+        assert out.index("Context Map from Graph Memory") < out.index("Attack Surface (Stage B)")
+        assert "_Source: `context-map.graph.json`_" in out
+
+    def test_renderer_target_metadata_filters_support_tools(self, tmp_path):
+        attack_surface = {
+            "sources": [{"type": "http_route", "entry": "GET /"}],
+            "sinks": [
+                {"type": "unsafe_c_string_copy", "location": "support/ab.c:1124 strcpy(connecthost, proxyhost)"},
+                {"type": "cgi_environment", "location": "server/util_script.c:369 QUERY_STRING from r->args"},
+            ],
+            "trust_boundaries": [],
+        }
+        self._make_out_dir(tmp_path, {"attack-surface.json": attack_surface})
+        out = render_directory(tmp_path, target="httpd-2.0.35")
+        assert "support/ab.c" not in out
+        assert "server/util_script.c" in out
+
+    def test_render_directory_with_graph_priority_paths(self, tmp_path):
+        self._make_out_dir(tmp_path, {
+            "graph-priority-paths.json": [{
+                "id": "graph-path-EP-001-SINK-001",
+                "entry": {"id": "EP-001", "label": "GET /search"},
+                "sink": {"id": "SINK-001", "label": "template render"},
+                "risk_score": 80,
+                "confidence": "high",
+                "missing_boundary": "No output encoding",
+            }]
+        })
+        out = render_directory(tmp_path)
+        assert "Graph Priority Paths" in out
+        assert "GET /search" in out
+        assert "template render" in out
+
+    def test_render_directory_with_graph_diff(self, tmp_path):
+        self._make_out_dir(tmp_path, {
+            "graph-diff.json": {
+                "is_diffable": True,
+                "base_snapshot": {"id": "snap:old"},
+                "head_snapshot": {"id": "snap:new"},
+                "new_risks": [{"source": "GET /upload", "sink": "filesystem write"}],
+                "reachability": {"added": [], "removed": []},
+                "nodes": {},
+            }
+        })
+        out = render_directory(tmp_path)
+        assert "Graph Snapshot Diff" in out
+        assert "GET /upload" in out
 
     def test_render_directory_with_flow_traces(self, tmp_path):
         self._make_out_dir(tmp_path, {"flow-trace-EP-001.json": FLOW_TRACE_DATA})
@@ -1732,6 +1841,22 @@ class TestContextMapScalarIdFields:
         assert "EP-001 --> TB-001" in out
         assert "\n    E --> TB-001" not in out
 
+    def test_non_list_id_field_shapes_contribute_nothing(self):
+        # LLM-shaped maps can carry an int/dict where the schema says
+        # array; those shapes must contribute no edges rather than
+        # raising out of generate().
+        data = {
+            "entry_points": [{"id": "EP-001", "path": "/api"}],
+            "boundary_details": [{"id": "TB-001", "covers": 42}],
+            "sink_details": [{"id": "SINK-1", "operation": "exec",
+                              "reaches_from": {"bad": "shape"}}],
+            "unchecked_flows": [],
+        }
+        out = gen_context_map(data)
+        assert "TB-001" in out
+        assert "SINK-1" in out
+        assert "--> TB-001" not in out
+
 
 class TestContextMapCandidateFlows:
     def test_non_blackbox_candidate_flow_not_drawn_from_undeclared_node(self):
@@ -1836,3 +1961,42 @@ class TestRendererRobustness:
         p = tmp_path / "wrapped.json"
         p.write_text(json.dumps({"items": [1, 2]}))
         assert _load_optional_list(p) == [1, 2]
+
+
+class TestControlBytesAtChokepoint:
+    """sanitize() is the label chokepoint for all six generators —
+    control/bidi bytes must become inert escapes there, because the
+    attack-paths section builds its own fences and never passes the
+    renderer's last-hop _fence."""
+
+    HOSTILE = "step \x1b]0;pwned\x07\x9b2J‮evil end"
+
+    def test_sanitize_escapes_control_and_bidi(self):
+        from packages.diagram.sanitize import sanitize
+        out = sanitize(self.HOSTILE)
+        for raw in ("\x1b", "\x07", "\x9b", "‮"):
+            assert raw not in out
+        assert out.startswith("step ") and out.endswith(" end")
+
+    def test_fence_break_zwsp_survives_escaping(self):
+        from packages.diagram.sanitize import sanitize
+        out = sanitize("a```b")
+        # The ZWSP fence-break stays a real (invisible) ZWSP — it must
+        # be inserted AFTER the escape pass or it renders literally.
+        assert "``​`" in out
+
+    def test_attack_paths_section_carries_no_raw_controls(self):
+        from packages.diagram.attack_paths import generate
+        data = [{
+            "path_id": "AP-1",
+            "steps": [
+                {"function": f"parse{self.HOSTILE}", "technique": self.HOSTILE},
+                {"function": "sink", "technique": "overflow"},
+            ],
+            "blockers": [{"description": f"guard {self.HOSTILE}"}],
+            "proximity": 0.9,
+        }]
+        out = generate(data)
+        assert out  # section rendered
+        for raw in ("\x1b", "\x07", "\x9b", "‮"):
+            assert raw not in out

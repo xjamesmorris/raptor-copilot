@@ -22,33 +22,15 @@ from __future__ import annotations
 import logging
 import re
 
-from core.atomic_fs import write_text_atomically as _atomic_write
-
-from . import RewriteEdit, RewriteResult, register
+from . import RewriteEdit, RewriteResult, register, rewrite_file_with
 from typing import TYPE_CHECKING
+from ..file_shapes import is_compose_file as _is_compose_file
+from ..file_shapes import is_gitlab_ci_file as _is_gitlab_ci_file
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 logger = logging.getLogger(__name__)
-
-
-def _is_compose_file(path: Path) -> bool:
-    """Match compose / docker-compose YAML files. Mirrors the
-    discovery predicate in ``parsers/compose.py``."""
-    if path.suffix.lower() not in (".yml", ".yaml"):
-        return False
-    name = path.name.lower()
-    if name.startswith("docker-compose"):
-        return True
-    if name in ("compose.yml", "compose.yaml"):
-        return True
-    return bool(name.startswith("compose.") and name.endswith((".yml", ".yaml")))
-
-
-def _is_gitlab_ci_file(path: Path) -> bool:
-    """Match ``.gitlab-ci.yml`` / ``.gitlab-ci.yaml``."""
-    return path.name in (".gitlab-ci.yml", ".gitlab-ci.yaml")
 
 
 def _is_k8s_manifest(path: Path) -> bool:
@@ -95,28 +77,7 @@ def rewrite_yaml_image(
     match both canonical and short forms (Docker's
     ``library/python`` ↔ ``python`` shorthand) the same way
     ``dockerfile_from`` does."""
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as e:
-        return [RewriteResult(edit=e2, applied=False,
-                              reason=f"error: read failed: {e}")
-                for e2 in edits]
-
-    new_text = text
-    results: list[RewriteResult] = []
-    for edit in edits:
-        new_text, result = _apply_one_image(new_text, edit)
-        results.append(result)
-
-    if any(r.applied for r in results):
-        try:
-            _atomic_write(path, new_text)
-        except OSError as e:
-            return [RewriteResult(edit=r.edit, applied=False,
-                                  reason=f"error: write failed: {e}")
-                    if r.applied else r
-                    for r in results]
-    return results
+    return rewrite_file_with(path, edits, _apply_one_image)
 
 
 def _apply_one_image(
@@ -150,8 +111,13 @@ def _apply_one_image(
     #   * Bare: ``    image: foo/bar:tag``
     #   * Quoted: ``    image: "foo/bar:tag"``
     #   * After list marker: ``    - image: foo/bar:tag``
+    # Leading indent is HORIZONTAL-only ([^\S\n]): under the
+    # MULTILINE ^ anchor a \s* matched at every line start inside a
+    # blank-line run and backtracked per character — quadratic on
+    # hostile YAML made of newlines (same class as the helm rewriter's
+    # fixed anchor; sibling of the same idiom).
     pattern = re.compile(
-        rf"^(\s*(?:-\s+)?image:\s*[\"']?(?:{image_alternates}):)"
+        rf"^([^\S\n]*(?:-\s+)?image:\s*[\"']?(?:{image_alternates}):)"
         rf"([^\s\"'#]+)"                  # tag (non-greedy, stops at qt/ws/#)
         rf"([\"'\s#]|$)",                  # boundary
         re.MULTILINE,

@@ -65,6 +65,7 @@ import tempfile
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
+from core.security.env_sanitisation import safe_subprocess_env
 
 logger = logging.getLogger(__name__)
 
@@ -98,14 +99,6 @@ _TOOLCHAIN_LOCK = threading.Lock()
 _TOOLCHAIN_CACHE: dict[str, tuple[str, str] | None] = {}
 
 
-def _safe_env() -> dict | None:
-    try:
-        from core.config import RaptorConfig
-        return RaptorConfig.get_safe_env()
-    except ImportError:
-        return None
-
-
 def _reset_toolchain_cache() -> None:
     """Test hook."""
     with _TOOLCHAIN_LOCK:
@@ -131,14 +124,14 @@ def _find_toolchain(lang: str) -> tuple[str, str] | None:
             ok = subprocess.run(
                 [path, "-fsyntax-only", "-x", lang, os.devnull],
                 capture_output=True, text=True, check=False,
-                timeout=_PROBE_COMPILE_TIMEOUT_S, env=_safe_env(),
+                timeout=_PROBE_COMPILE_TIMEOUT_S, env=safe_subprocess_env(),
             )
             if ok.returncode != 0:
                 continue
             ver = subprocess.run(
                 [path, "--version"],
                 capture_output=True, text=True, check=False,
-                timeout=_PROBE_COMPILE_TIMEOUT_S, env=_safe_env(),
+                timeout=_PROBE_COMPILE_TIMEOUT_S, env=safe_subprocess_env(),
             )
             version = (ver.stdout or "").splitlines()[0].strip() if (
                 ver.stdout
@@ -159,17 +152,26 @@ def _find_toolchain(lang: str) -> tuple[str, str] | None:
 _VALUE = r"([-+]?0[xX][0-9a-fA-F]+|[-+]?\d+)"
 
 # sizeof(struct foo) / alignof(x) / offsetof(struct s, m) claims
+# The optional verb gates its own trailing whitespace: the naive
+# ``\s*(?:VERB)?\s*`` put two unbounded whitespace spans around it —
+# quadratic on a sizeof-claim ending in a whitespace run.
 _BUILTIN_EXPR_RE = re.compile(
     r"((?:sizeof|_Alignof|alignof|offsetof)\s*\(\s*[^()]{1,80}\))\s*"
-    r"(?:is|==|equals?|equal to|set to)?\s*"
+    r"(?:(?:is|==|equals?|equal to|set to)\s*)?"
     rf"[`'\"]?{_VALUE}[`'\"]?",
     re.IGNORECASE,
 )
 
 # plain identifier claim: "Is STATE_DONE 3?" / "MAX_BUF == 4096"
+# Same gated-verb respelling as _BUILTIN_EXPR_RE above.
+# The \b pins the identifier to a word start (a consumed opening
+# quote is a boundary too, so quoted spellings are unaffected):
+# unanchored, every position inside a long identifier run starts a
+# fresh scan of the rest of the run — quadratic on hostile question
+# text. A mid-word start is a false token either way.
 _IDENT_EXPR_RE = re.compile(
-    r"[`'\"]?([A-Za-z_]\w*)[`'\"]?\s*"
-    r"(?:is|==|equals?|equal to|set to|defined as)?\s*"
+    r"[`'\"]?\b([A-Za-z_]\w*)[`'\"]?\s*"
+    r"(?:(?:is|==|equals?|equal to|set to|defined as)\s*)?"
     rf"[`'\"]?{_VALUE}[`'\"]?",
 )
 
@@ -698,9 +700,12 @@ def determine_probe_question(
         if non_negative is None or negative is None:
             return _unavailable("sandboxed compile invocation failed")
         if non_negative == negative:
+            # Both held or neither held — the probes must be mutually
+            # exclusive and exhaustive for an integer constant.
             return _unavailable(
-                "sign probes disagree — expression does not behave "
-                "as an integer constant under comparison",
+                "sign probes did not resolve to exactly one of "
+                ">= 0 / < 0 — expression does not behave as an "
+                "integer constant under comparison",
             )
 
         # Bisection: find the least K with (expr) <= K.  The literal

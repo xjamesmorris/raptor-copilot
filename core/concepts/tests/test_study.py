@@ -655,8 +655,11 @@ class TestRunPhase2:
             for i in range(10)
         ]
         mock_client = MagicMock()
+        # A transport-shaped error: budget exhaustion has its own
+        # terminal lane now (TestPhase2BudgetStop) and never feeds
+        # this breaker.
         mock_client.generate_structured.side_effect = RuntimeError(
-            "budget exceeded",
+            "connection reset by peer",
         )
         with pytest.raises(_BatchLLMError, match="refusing"):
             run_phase2(items, "t/", mock_client)
@@ -990,6 +993,65 @@ class TestQueueUnresolved:
         queued = _queue_unresolved(None, {"concepts": []}, [])
         assert queued == 0
 
+    def test_null_file_hint_and_kind_route_like_absent(self) -> None:
+        # unresolved_references is LLM output: keys arrive PRESENT
+        # but null, so .get(key, default) never fires. A null
+        # file_hint persisted into reading-list.json as source_file
+        # poisons every later reader that trusts the str schema —
+        # the writer must normalise it to "" exactly like an absent
+        # key.
+        from core.concepts.reading_list import ReadingList
+        rl = ReadingList()
+        result = {
+            "concepts": [],
+            "unresolved_references": [{
+                "name": "task_struct",
+                "kind": None,
+                "question": "What is task_struct's lifecycle?",
+                "file_hint": None,
+            }],
+        }
+        queued = _queue_unresolved(rl, result, [])
+        assert queued == 1
+        item = rl.pending()[0]
+        assert item.source_file == ""
+        assert item.context == "Unresolved type: task_struct"
+
+    def test_non_str_shapes_route_like_absent_or_skip(self) -> None:
+        # The same LLM drift one step past null: non-str leaves.
+        # kind/file_hint degrade to their defaults; a ref whose
+        # name/question is not a str cannot form an id (the id
+        # helpers .encode/regex a str) and is skipped, costing only
+        # itself. The array itself and its rows also arrive
+        # malformed — never a crash, never a poisoned persist.
+        from core.concepts.reading_list import ReadingList
+        rl = ReadingList()
+        result = {
+            "concepts": [],
+            "unresolved_references": [
+                "stray",
+                None,
+                {"name": ["a"], "question": "q?"},
+                {"name": "b", "question": 42},
+                {"name": "task_struct",
+                 "question": "What is task_struct's lifecycle?",
+                 "kind": ["k"], "file_hint": 9},
+            ],
+        }
+        queued = _queue_unresolved(rl, result, [])
+        assert queued == 1
+        item = rl.pending()[0]
+        assert item.source_file == ""
+        assert item.context == "Unresolved type: task_struct"
+
+    def test_non_list_refs_array_queues_nothing(self) -> None:
+        from core.concepts.reading_list import ReadingList
+        for refs in (None, "stray", {"name": "x"}, 42):
+            rl = ReadingList()
+            assert _queue_unresolved(
+                rl, {"unresolved_references": refs}, []) == 0
+            assert len(rl) == 0
+
 
 # ------------------------------------------------------------------
 # Evidence staleness hashing
@@ -1249,6 +1311,166 @@ class TestCheckEvidenceStaleness:
         assert len(stale) == 1
         assert stale[0]["status"] == "deleted"
 
+    # ----- invariants (verbatim receipts) -------------------------
+
+    @staticmethod
+    def _invariant(receipt: dict | None) -> Invariant:
+        return Invariant(
+            id="inv1", concept="c1",
+            statement="offset must be validated",
+            negation="unvalidated offset overflows",
+            provenance="verbatim",
+            receipt=receipt,
+        )
+
+    def test_invariant_receipt_drift_detected(self, tmp_path: Path) -> None:
+        src = tmp_path / "a.c"
+        src.write_text("check_offset(off, len);\nint y = 2;\n",
+                       encoding="utf-8")
+        model = DomainModel(invariants=[self._invariant({
+            "file": "a.c", "line": 1,
+            "quote": "check_offset(off, len);", "verified": True,
+        })])
+        # The quoted check is removed by a refactor — the invariant's
+        # "the API validates offset" claim is now unverifiable.
+        src.write_text("int y = 2;\n", encoding="utf-8")
+        stale = check_evidence_staleness(model, tmp_path)
+        assert len(stale) == 1
+        assert stale[0]["kind"] == "invariant"
+        assert stale[0]["id"] == "inv1"
+
+    def test_invariant_receipt_fresh_not_stale(self, tmp_path: Path) -> None:
+        src = tmp_path / "a.c"
+        src.write_text("check_offset(off, len);\n", encoding="utf-8")
+        model = DomainModel(invariants=[self._invariant({
+            "file": "a.c", "line": 1,
+            "quote": "check_offset(off, len);", "verified": True,
+        })])
+        assert check_evidence_staleness(model, tmp_path) == []
+
+    def test_invariant_without_receipt_skipped(self, tmp_path: Path) -> None:
+        model = DomainModel(invariants=[self._invariant(None)])
+        assert check_evidence_staleness(model, tmp_path) == []
+
+    # ----- contracts (span hashes) --------------------------------
+
+    def test_contract_hash_drift_detected(self, tmp_path: Path) -> None:
+        from core.staleness import hash_span
+
+        src = tmp_path / "a.c"
+        src.write_text("int f(void) {\n  return g(x);\n}\n",
+                       encoding="utf-8")
+        model = DomainModel(contracts=[Contract(
+            function="f", file="a.c",
+            hash=hash_span(src, 1, 3),
+            hash_span={"file": "a.c", "start": 1, "end": 3},
+        )])
+        src.write_text("int f(void) {\n  return g(x + 1);\n}\n",
+                       encoding="utf-8")
+        stale = check_evidence_staleness(model, tmp_path)
+        assert len(stale) == 1
+        assert stale[0]["kind"] == "contract"
+        assert stale[0]["id"] == "f"
+        assert stale[0]["status"] == "modified"
+
+    def test_contract_hash_fresh_not_stale(self, tmp_path: Path) -> None:
+        from core.staleness import hash_span
+
+        src = tmp_path / "a.c"
+        src.write_text("int f(void) {\n  return 0;\n}\n", encoding="utf-8")
+        model = DomainModel(contracts=[Contract(
+            function="f", file="a.c",
+            hash=hash_span(src, 1, 3),
+            hash_span={"file": "a.c", "start": 1, "end": 3},
+        )])
+        assert check_evidence_staleness(model, tmp_path) == []
+
+    def test_contract_without_span_skipped(self, tmp_path: Path) -> None:
+        # Legacy models carry Contract.hash without the stamped span —
+        # no baseline to re-hash, so the check skips them (same rule
+        # as unhashed concept evidence).
+        (tmp_path / "a.c").write_text("int f(void) { return 0; }\n")
+        model = DomainModel(contracts=[Contract(
+            function="f", file="a.c", hash="abcdef012345",
+        )])
+        assert check_evidence_staleness(model, tmp_path) == []
+
+    # ----- strict mode (skip-licensing callers) -------------------
+
+    def test_strict_reports_unconfined_concept_evidence(
+        self, tmp_path: Path,
+    ) -> None:
+        """An out-of-root evidence path is silently dropped in lenient
+        mode but must surface in strict mode — otherwise a forged
+        prior whose paths ALL escape the root reads as fresh with
+        zero checks."""
+        (tmp_path / "a.c").write_text("int x;\n", encoding="utf-8")
+        model = DomainModel(concepts=[Concept(
+            id="c1", description="d",
+            evidence=[Evidence(
+                type="code_path", file="../outside/secret.c",
+                observation="forged", line=1, hash="beefbeefbeef",
+            )],
+        )])
+        assert check_evidence_staleness(model, tmp_path) == []
+        strict = check_evidence_staleness(model, tmp_path, strict=True)
+        assert len(strict) == 1
+        assert strict[0]["status"] == "unconfined"
+        assert strict[0]["concept_id"] == "c1"
+
+    def test_span_past_eof_is_stale_in_both_modes(
+        self, tmp_path: Path,
+    ) -> None:
+        # A hashed evidence line wholly past EOF means the file was
+        # rewritten shorter than the quote — positive drift evidence.
+        # check_batch reports it "modified", so BOTH modes flag it:
+        # pre-fix it read "unknown" and the lenient quarantine kept
+        # the [verbatim] entry fresh.
+        (tmp_path / "a.c").write_text("int x;\n", encoding="utf-8")
+        model = DomainModel(concepts=[Concept(
+            id="c1", description="d",
+            evidence=[Evidence(
+                type="code_path", file="a.c",
+                observation="obs", line=999, hash="beefbeefbeef",
+            )],
+        )])
+        lenient = check_evidence_staleness(model, tmp_path)
+        assert len(lenient) == 1
+        assert lenient[0]["status"] == "modified"
+        strict = check_evidence_staleness(model, tmp_path, strict=True)
+        assert len(strict) == 1
+        assert strict[0]["status"] == "modified"
+
+    def test_strict_reports_unconfined_contract_span(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "a.c").write_text("int x;\n", encoding="utf-8")
+        model = DomainModel(contracts=[Contract(
+            function="f", file="a.c", hash="beefbeefbeef",
+            hash_span={"file": "/outside/f.c", "start": 1, "end": 3},
+        )])
+        assert check_evidence_staleness(model, tmp_path) == []
+        strict = check_evidence_staleness(model, tmp_path, strict=True)
+        assert len(strict) == 1
+        assert strict[0]["kind"] == "contract"
+        assert strict[0]["status"] == "unconfined"
+
+    def test_strict_fresh_evidence_still_passes(
+        self, tmp_path: Path,
+    ) -> None:
+        from core.staleness import hash_span
+
+        src = tmp_path / "a.c"
+        src.write_text("int x = 1;\n", encoding="utf-8")
+        model = DomainModel(concepts=[Concept(
+            id="c1", description="d",
+            evidence=[Evidence(
+                type="code_path", file="a.c",
+                observation="obs", line=1, hash=hash_span(src, 1, 1),
+            )],
+        )])
+        assert check_evidence_staleness(model, tmp_path, strict=True) == []
+
 
 # ------------------------------------------------------------------
 # Multi-identifier correlation
@@ -1352,6 +1574,44 @@ class TestCorrelation:
         assert "Correlation request" not in prompts_seen[0]
 
 
+class TestConceptMatchesIdentifier:
+    """The prior-matching rule shared by _apply_sage_prior and the
+    recall-side addressee gate in core.sage.hooks."""
+
+    def test_exact_and_normalised_match(self):
+        from core.concepts.study import concept_matches_identifier
+        assert concept_matches_identifier("get_page", "get_page")
+        assert concept_matches_identifier("Get-Page", "get_page")
+
+    def test_semantic_name_segment_containment(self):
+        # Concept ids come from the LLM's semantic naming; the study
+        # identifier must still claim its own concept.
+        from core.concepts.study import concept_matches_identifier
+        assert concept_matches_identifier(
+            "scatter_walk_state_machine", "scatter_walk",
+        )
+
+    def test_cross_identifier_never_matches(self):
+        from core.concepts.study import concept_matches_identifier
+        assert not concept_matches_identifier("get_page", "put_page")
+
+    def test_short_identifier_below_floor_refused(self):
+        # 'walk' segment-matches inside many unrelated ids — the
+        # length floor refuses it (both directions: raising the floor
+        # orphans real short identifiers, lowering it re-opens the
+        # wrong-prior injection).
+        from core.concepts.study import concept_matches_identifier
+        assert not concept_matches_identifier(
+            "scatter_walk_state_machine", "walk",
+        )
+
+    def test_non_segment_substring_refused(self):
+        from core.concepts.study import concept_matches_identifier
+        assert not concept_matches_identifier(
+            "scatter_walkers", "ter_walk",
+        )
+
+
 class TestApplySagePrior:
     """Tests for _apply_sage_prior (N1 skip/seed/cross-pollinate)."""
 
@@ -1434,6 +1694,240 @@ class TestApplySagePrior:
         assert len(remaining) == 0
         assert len(sc) == 1
         assert sc[0].id == "page"
+
+    @staticmethod
+    def _fresh_src(tmp_path):
+        src_dir = tmp_path / "src"
+        src_dir.mkdir()
+        src_file = src_dir / "mm.c"
+        src_file.write_text(
+            "int page_alloc(void) { return 0; }\n"
+            "int page_free(void) { return 1; }\n",
+        )
+        return src_dir, src_file
+
+    def test_stale_local_concept_not_fast_path_skipped(self, tmp_path):
+        """The skip gate verifies the SAGE row's hashes — but the fast
+        path carries forward a DIFFERENT artifact (a name-matched
+        local-model concept). If THAT concept's own evidence drifted,
+        it must not be carried forward as fresh; the item falls to the
+        seed path."""
+        from core.concepts.model import Concept, DomainModel, Evidence
+        from core.concepts.study import StudyItem, _apply_sage_prior
+        from core.staleness import hash_span
+
+        src_dir, src_file = self._fresh_src(tmp_path)
+        fresh_h = hash_span(src_file, 1, 1)
+
+        model = DomainModel(
+            source_root=str(src_dir),
+            concepts=[Concept(
+                id="page", description="Page ownership",
+                # Drifted: stored hash does not match line 2 any more.
+                evidence=[Evidence(
+                    type="code_path", file="mm.c",
+                    observation="free", line=2, hash="deadbeef0000",
+                )],
+                confidence="traced",
+            )],
+        )
+        model.save(tmp_path / "domain-model.json")
+
+        items = [StudyItem(id="s1", kind="struct", name="page",
+                           file="mm.c", line=1)]
+        sage_prior = {
+            "page": [{
+                # Row's own evidence line IS fresh — the gate passes;
+                # the content is not reconstructable (no " in scope:"),
+                # so without the local fast path the item seeds.
+                "content": (
+                    f"Concept [page]: ownership\n"
+                    f"  Evidence (code_path): mm.c:1 [h={fresh_h}] — alloc"
+                ),
+                "confidence": 0.85,
+            }],
+        }
+        remaining, sc, _si, _sct, seed = _apply_sage_prior(
+            items, sage_prior, tmp_path, source_root=src_dir,
+        )
+        assert len(remaining) == 1
+        assert sc == []
+        assert "Prior study knowledge" in seed
+
+    def test_unhashed_local_concept_not_fast_path_skipped(self, tmp_path):
+        """A local concept with no checkable evidence hash cannot vouch
+        for its own freshness — fail closed to the seed path."""
+        from core.concepts.model import Concept, DomainModel, Evidence
+        from core.concepts.study import StudyItem, _apply_sage_prior
+        from core.staleness import hash_span
+
+        src_dir, src_file = self._fresh_src(tmp_path)
+        fresh_h = hash_span(src_file, 1, 1)
+
+        model = DomainModel(
+            source_root=str(src_dir),
+            concepts=[Concept(
+                id="page", description="Page ownership",
+                evidence=[Evidence(
+                    type="code_path", file="mm.c",
+                    observation="alloc", line=1,  # no hash
+                )],
+                confidence="traced",
+            )],
+        )
+        model.save(tmp_path / "domain-model.json")
+
+        items = [StudyItem(id="s1", kind="struct", name="page",
+                           file="mm.c", line=1)]
+        sage_prior = {
+            "page": [{
+                "content": (
+                    f"Concept [page]: ownership\n"
+                    f"  Evidence (code_path): mm.c:1 [h={fresh_h}] — alloc"
+                ),
+                "confidence": 0.85,
+            }],
+        }
+        remaining, sc, _si, _sct, _seed = _apply_sage_prior(
+            items, sage_prior, tmp_path, source_root=src_dir,
+        )
+        assert len(remaining) == 1
+        assert sc == []
+
+    def test_out_of_root_local_evidence_refuses_fast_path(self, tmp_path):
+        """A forged local concept whose evidence paths ALL escape the
+        root claims checkability but can verify nothing — it must not
+        vouch 'fresh with zero checks' and skip the item from study."""
+        from core.concepts.model import (
+            Concept,
+            Contract,
+            DomainModel,
+            Evidence,
+        )
+        from core.concepts.study import StudyItem, _apply_sage_prior
+        from core.staleness import hash_span
+
+        src_dir, src_file = self._fresh_src(tmp_path)
+        fresh_h = hash_span(src_file, 1, 1)
+
+        model = DomainModel(
+            source_root=str(src_dir),
+            concepts=[Concept(
+                id="page", description="forged prior",
+                evidence=[Evidence(
+                    type="code_path", file="../outside/secret.c",
+                    observation="forged", line=1, hash="beefbeefbeef",
+                )],
+                confidence="traced",
+            )],
+            contracts=[Contract(
+                function="page", file="../outside/secret.c",
+                hash="beefbeefbeef",
+                hash_span={"file": "../outside/secret.c",
+                           "start": 1, "end": 3},
+            )],
+        )
+        model.save(tmp_path / "domain-model.json")
+
+        items = [StudyItem(id="s1", kind="struct", name="page",
+                           file="mm.c", line=1)]
+        sage_prior = {
+            "page": [{
+                "content": (
+                    f"Concept [page]: ownership\n"
+                    f"  Evidence (code_path): mm.c:1 [h={fresh_h}] — alloc"
+                ),
+                "confidence": 0.85,
+            }],
+        }
+        remaining, sc, _si, sct, _seed = _apply_sage_prior(
+            items, sage_prior, tmp_path, source_root=src_dir,
+        )
+        assert len(remaining) == 1
+        assert sc == []
+        assert sct == []
+
+    def test_unknown_line_local_evidence_refuses_fast_path(self, tmp_path):
+        """An in-root path with an unverifiable line range (past EOF)
+        is 'unknown', not 'fresh' — the fast path must refuse."""
+        from core.concepts.model import Concept, DomainModel, Evidence
+        from core.concepts.study import StudyItem, _apply_sage_prior
+        from core.staleness import hash_span
+
+        src_dir, src_file = self._fresh_src(tmp_path)
+        fresh_h = hash_span(src_file, 1, 1)
+
+        model = DomainModel(
+            source_root=str(src_dir),
+            concepts=[Concept(
+                id="page", description="unverifiable prior",
+                evidence=[Evidence(
+                    type="code_path", file="mm.c",
+                    observation="obs", line=999, hash="beefbeefbeef",
+                )],
+                confidence="traced",
+            )],
+        )
+        model.save(tmp_path / "domain-model.json")
+
+        items = [StudyItem(id="s1", kind="struct", name="page",
+                           file="mm.c", line=1)]
+        sage_prior = {
+            "page": [{
+                "content": (
+                    f"Concept [page]: ownership\n"
+                    f"  Evidence (code_path): mm.c:1 [h={fresh_h}] — alloc"
+                ),
+                "confidence": 0.85,
+            }],
+        }
+        remaining, sc, _si, _sct, _seed = _apply_sage_prior(
+            items, sage_prior, tmp_path, source_root=src_dir,
+        )
+        assert len(remaining) == 1
+        assert sc == []
+
+    def test_stale_local_falls_back_to_verified_reconstruct(self, tmp_path):
+        """When the local concept is stale but the SAGE content (whose
+        hashes DID verify) is reconstructable, the skip still happens —
+        from the verified artifact, not the stale one."""
+        from core.concepts.model import Concept, DomainModel, Evidence
+        from core.concepts.study import StudyItem, _apply_sage_prior
+        from core.staleness import hash_span
+
+        src_dir, src_file = self._fresh_src(tmp_path)
+        fresh_h = hash_span(src_file, 1, 1)
+
+        model = DomainModel(
+            source_root=str(src_dir),
+            concepts=[Concept(
+                id="page", description="STALE local description",
+                evidence=[Evidence(
+                    type="code_path", file="mm.c",
+                    observation="free", line=2, hash="deadbeef0000",
+                )],
+                confidence="traced",
+            )],
+        )
+        model.save(tmp_path / "domain-model.json")
+
+        items = [StudyItem(id="s1", kind="struct", name="page",
+                           file="mm.c", line=1)]
+        sage_prior = {
+            "page": [{
+                "content": (
+                    f"Concept [page] in scope: verified ownership\n"
+                    f"  Evidence (code_path): mm.c:1 [h={fresh_h}] — alloc"
+                ),
+                "confidence": 0.85,
+            }],
+        }
+        remaining, sc, _si, _sct, _seed = _apply_sage_prior(
+            items, sage_prior, tmp_path, source_root=src_dir,
+        )
+        assert len(remaining) == 0
+        assert len(sc) == 1
+        assert sc[0].description == "verified ownership"
 
     def test_mixed_skip_and_seed(self, tmp_path):
         from core.concepts.study import StudyItem, _apply_sage_prior
@@ -2007,6 +2501,135 @@ class TestQuarantineStalePrior:
         _quarantine_stale_prior(prior, None, tmp_path)
         assert prior.concepts[0].state == "validated"
 
+    def test_stale_invariant_quarantined(self, tmp_path: Path) -> None:
+        """A [verbatim] invariant whose quoted source drifted must not
+        be served as receipt-backed ground truth on the next run."""
+        from core.concepts.study import _quarantine_stale_prior
+
+        src = tmp_path / "a.c"
+        src.write_text("validate_len(buf, n);\n", encoding="utf-8")
+        prior = DomainModel(invariants=[Invariant(
+            id="inv1", concept="c1",
+            statement="length is validated before copy",
+            negation="unvalidated length overflows",
+            provenance="verbatim",
+            receipt={"file": "a.c", "line": 1,
+                     "quote": "validate_len(buf, n);", "verified": True},
+        )])
+        src.write_text("memcpy(buf, src, n);\n", encoding="utf-8")
+
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        from core.concepts.reading_list import ReadingList
+        rl = ReadingList()
+        _quarantine_stale_prior(prior, tmp_path, out_dir, reading_list=rl)
+
+        inv = prior.invariants[0]
+        assert inv.state == "stale"
+        assert inv.provenance == "llm_summarized"
+        assert inv.receipt["verified"] is False
+        data = json.loads(
+            (out_dir / "study-stale.json").read_text(encoding="utf-8"))
+        assert data["stale_evidence"][0]["kind"] == "invariant"
+        pending = rl.pending()
+        assert len(pending) == 1
+        assert "re-derive invariant inv1" in pending[0].question
+
+    def test_fresh_invariant_untouched(self, tmp_path: Path) -> None:
+        from core.concepts.study import _quarantine_stale_prior
+
+        src = tmp_path / "a.c"
+        src.write_text("validate_len(buf, n);\n", encoding="utf-8")
+        prior = DomainModel(invariants=[Invariant(
+            id="inv1", concept="c1", statement="s", negation="n",
+            provenance="verbatim",
+            receipt={"file": "a.c", "line": 1,
+                     "quote": "validate_len(buf, n);", "verified": True},
+        )])
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        _quarantine_stale_prior(prior, tmp_path, out_dir)
+        assert prior.invariants[0].state == ""
+        assert prior.invariants[0].provenance == "verbatim"
+        assert prior.invariants[0].receipt["verified"] is True
+
+    def test_stale_contract_quarantined(self, tmp_path: Path) -> None:
+        from core.concepts.study import _quarantine_stale_prior
+        from core.staleness import hash_span
+
+        src = tmp_path / "a.c"
+        src.write_text("int f(void) {\n  return 0;\n}\n", encoding="utf-8")
+        prior = DomainModel(contracts=[Contract(
+            function="f", file="a.c",
+            output_semantics="returns zero on success",
+            hash=hash_span(src, 1, 3),
+            hash_span={"file": "a.c", "start": 1, "end": 3},
+            provenance="llm_summarized",
+        )])
+        src.write_text("int f(void) {\n  return -1;\n}\n", encoding="utf-8")
+
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        _quarantine_stale_prior(prior, tmp_path, out_dir)
+        assert prior.contracts[0].state == "stale"
+
+
+class TestCollectSecurityContextTexts:
+    """Recursive, capped source collection for the security-context
+    marker scan — the top-level-only iterdir() shape silently lost
+    the context on every target that keeps sources in subdirs."""
+
+    def test_nested_sources_collected(self, tmp_path: Path) -> None:
+        from core.concepts.study import (
+            _collect_security_context_texts,
+            infer_security_context,
+        )
+
+        sub = tmp_path / "src" / "net"
+        sub.mkdir(parents=True)
+        (sub / "server.c").write_text(
+            "s = accept(fd, NULL, NULL);\nrecv(s, buf, n, 0);\n",
+            encoding="utf-8",
+        )
+        texts = _collect_security_context_texts(tmp_path)
+        assert "src/net/server.c" in texts
+        sc = infer_security_context(texts)
+        assert sc is not None
+        assert sc.attack_surface == "network"
+
+    def test_same_basename_does_not_collapse(self, tmp_path: Path) -> None:
+        from core.concepts.study import _collect_security_context_texts
+
+        for d in ("a", "b"):
+            (tmp_path / d).mkdir()
+            (tmp_path / d / "util.c").write_text(f"int {d};\n")
+        texts = _collect_security_context_texts(tmp_path)
+        assert set(texts) == {"a/util.c", "b/util.c"}
+
+    def test_cap_bounds_the_scan(self, tmp_path: Path, monkeypatch) -> None:
+        import core.concepts.study as study_mod
+
+        monkeypatch.setattr(
+            study_mod, "_SECURITY_CONTEXT_MAX_FILES", 3)
+        for i in range(6):
+            (tmp_path / f"f{i}.c").write_text(f"int x{i};\n")
+        texts = study_mod._collect_security_context_texts(tmp_path)
+        assert len(texts) == 3
+        # Deterministic sample: sorted order, not directory order.
+        assert set(texts) == {"f0.c", "f1.c", "f2.c"}
+
+    def test_under_cap_reads_everything(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        import core.concepts.study as study_mod
+
+        monkeypatch.setattr(
+            study_mod, "_SECURITY_CONTEXT_MAX_FILES", 10)
+        for i in range(4):
+            (tmp_path / f"f{i}.c").write_text(f"int x{i};\n")
+        texts = study_mod._collect_security_context_texts(tmp_path)
+        assert len(texts) == 4
+
 
 class TestStampRelatedStrategies:
     def test_stamps_unstamped_concepts_from_text(self):
@@ -2061,6 +2684,990 @@ class TestPhase2FailureHonesty:
         assert len(big) == 1
 
 
+class TestPhase2TruncationRecovery:
+    """Output-truncated batches split-retry instead of failing whole."""
+
+    _TRUNC_MSG = (
+        "Structured response truncated (output token limit reached, "
+        "stop_reason=max_tokens, instructor tool-use leg)"
+    )
+
+    def _items(self, n: int) -> list[StudyItem]:
+        return [StudyItem(id=f"i{k}", kind="function", name=f"fn{k}",
+                          file="x.c") for k in range(n)]
+
+    class _FakeClient:
+        """Truncates when a batch carries more items than ``fits``,
+        or any ``poison`` item at all — mirrors the provider guard's
+        RuntimeError chain. ``marker_only=True`` raises with the
+        typed ``llm_truncation`` marker and NO legacy phrasing (the
+        Gemini-shaped case)."""
+
+        def __init__(self, fits: int,
+                     poison: "set[str] | None" = None,
+                     marker_only: bool = False) -> None:
+            self.fits = fits
+            self.poison = poison or set()
+            self.marker_only = marker_only
+            self.batch_sizes: list[int] = []
+
+        def generate_structured(self, prompt: str, schema, **kw):
+            import re as _re
+            names = set(_re.findall(r"\bfn\d+\b", prompt))
+            self.batch_sizes.append(len(names))
+            if len(names) > self.fits or names & self.poison:
+                if self.marker_only:
+                    err = RuntimeError(
+                        "model stopped early (finish_reason=cap)")
+                    err.llm_truncation = True
+                    raise err
+                raise RuntimeError(
+                    TestPhase2TruncationRecovery._TRUNC_MSG)
+            return ({"concepts": [
+                {"id": n, "description": f"desc {n}",
+                 "evidence": [{"type": "doc", "file": "x.c",
+                               "observation": "obs"}],
+                 "confidence": "inferred"} for n in sorted(names)],
+                "invariants": [], "contracts": []}, "raw")
+
+    def test_truncated_batch_splits_and_recovers(self):
+        items = self._items(8)
+        client = self._FakeClient(fits=2)
+        concepts, *_ = run_phase2(items, "t/", client, batch_target=8)
+        assert sorted(c.id for c in concepts) == sorted(
+            f"fn{k}" for k in range(8))
+        # First attempt was the oversized batch; recovery worked down
+        # to half-sizes that fit.
+        assert client.batch_sizes[0] == 8
+        assert [s for s in client.batch_sizes if s <= 2]
+
+    def test_single_poison_item_recorded_failed_phase_succeeds(self):
+        items = self._items(3)
+        client = self._FakeClient(fits=8, poison={"fn0"})
+        discards: list[dict] = []
+        concepts, *_ = run_phase2(
+            items, "t/", client, batch_target=8,
+            discard_sink=discards,
+        )
+        assert sorted(c.id for c in concepts) == ["fn1", "fn2"]
+        assert any(
+            d.get("id") == "fn0" and "truncated" in d.get("reason", "")
+            for d in discards
+        )
+
+    def test_all_items_truncating_still_refuses_empty_model(self):
+        import pytest
+
+        from core.concepts.study import _BatchLLMError
+        items = self._items(2)
+        client = self._FakeClient(fits=0)
+        with pytest.raises(_BatchLLMError, match="refusing"):
+            run_phase2(items, "t/", client, batch_target=8)
+
+    def test_initial_batch_size_clamped_to_output_budget(
+        self, monkeypatch,
+    ):
+        # ceiling = 1024 // _PHASE2_ITEM_OUTPUT_TOKENS_EST(512) = 2
+        monkeypatch.setenv("RAPTOR_STUDY_MAX_OUTPUT_TOKENS", "1024")
+        items = self._items(6)
+        client = self._FakeClient(fits=6)
+        concepts, *_ = run_phase2(items, "t/", client, batch_target=80)
+        assert client.batch_sizes
+        assert all(s <= 2 for s in client.batch_sizes)
+        assert len(concepts) == 6
+
+    def test_typed_marker_engages_without_legacy_phrasing(self):
+        """The Gemini-shaped regression: a truncation error carrying
+        ONLY the typed marker (no legacy phrase) must still trigger
+        the split retry."""
+        items = self._items(4)
+        client = self._FakeClient(fits=2, marker_only=True)
+        concepts, *_ = run_phase2(items, "t/", client, batch_target=4)
+        assert sorted(c.id for c in concepts) == sorted(
+            f"fn{k}" for k in range(4))
+
+    def test_truncation_failures_do_not_feed_the_breaker_serial(self):
+        """_CONSECUTIVE_FAIL_LIMIT truncation-failed batches in a row
+        must not abort the loop — a later healthy batch still runs."""
+        # One poison single-item batch per file, then a clean batch;
+        # the poison batches each fail truncation-flagged. `calls`
+        # boosts the poison items' priority score so they batch
+        # FIRST — the clean batch must come after the streak.
+        items = [StudyItem(id=f"p{k}", kind="function", name=f"fn{k}",
+                           file=f"p{k}/f.c", calls=["a", "b", "c"])
+                 for k in range(_CONSECUTIVE_FAIL_LIMIT)]
+        items.append(StudyItem(id="ok", kind="function", name="fn9",
+                               file="ok/f.c"))
+        client = self._FakeClient(
+            fits=8,
+            poison={f"fn{k}" for k in range(_CONSECUTIVE_FAIL_LIMIT)},
+        )
+        concepts, *_ = run_phase2(items, "t/", client, batch_target=1)
+        assert [c.id for c in concepts] == ["fn9"]
+
+    def test_truncation_failures_do_not_feed_the_breaker_parallel(
+        self, monkeypatch,
+    ):
+        """Parallel twin: five truncating single-item batches (past
+        the consecutive-failure limit, under the cumulative
+        truncation cap) must not trip the abort event — the sixth,
+        healthy batch still dispatches."""
+        monkeypatch.setattr(
+            "core.llm.concurrency.derive_max_workers", lambda _m: 2)
+        items = [StudyItem(id=f"p{k}", kind="function", name=f"fn{k}",
+                           file=f"p{k}/f.c", calls=["a", "b", "c"])
+                 for k in range(5)]
+        items.append(StudyItem(id="ok", kind="function", name="fn9",
+                               file="ok/f.c"))
+        client = self._FakeClient(
+            fits=8, poison={f"fn{k}" for k in range(5)})
+        client.model = "gemini-2.5-flash"
+        concepts, *_ = run_phase2(items, "t/", client, batch_target=1)
+        assert [c.id for c in concepts] == ["fn9"]
+
+    def test_cumulative_truncation_cap_halts_the_phase_serial(self):
+        """Truncations are exempt from the consecutive-failure abort
+        but NOT unlimited: each is a full-price call with zero yield,
+        and past _TRUNCATION_FAIL_LIMIT the cause is config-shaped
+        (output budget vs model) — the phase halts instead of buying
+        the rest of the queue (observed live pre-cap: hours of
+        identical paid failures)."""
+        import pytest
+
+        from core.concepts.study import (
+            _TRUNCATION_FAIL_LIMIT,
+            _BatchLLMError,
+        )
+        n = _TRUNCATION_FAIL_LIMIT + 3
+        items = [StudyItem(id=f"p{k}", kind="function", name=f"fn{k}",
+                           file=f"p{k}/f.c", calls=["a", "b", "c"])
+                 for k in range(n)]
+        items.append(StudyItem(id="ok", kind="function", name="fn99",
+                               file="ok/f.c"))
+        client = self._FakeClient(
+            fits=8, poison={f"fn{k}" for k in range(n)})
+        stats: dict = {}
+        with pytest.raises(_BatchLLMError) as e:
+            run_phase2(items, "t/", client, batch_target=1,
+                       phase_stats=stats)
+        # halted at the cap — the surplus poison batches (and the
+        # healthy tail batch) were never bought
+        assert stats["truncation_failures"] == _TRUNCATION_FAIL_LIMIT
+        assert stats["truncation_capped"] is True
+        # deterministic-config marker for the consumer's breaker
+        assert getattr(e.value, "config_shaped", False) is True
+
+    def test_should_stop_halts_dispatch_between_batches(self):
+        """A cooperative stop arriving mid-phase stops NEW paid calls
+        at the next batch boundary and keeps results already earned —
+        pre-fix a drain-abandoned study thread kept buying batches
+        until process exit."""
+        calls = {"n": 0}
+
+        class _CountingClient(self._FakeClient):
+            def generate_structured(inner, prompt, schema, **kw):
+                calls["n"] += 1
+                return super().generate_structured(prompt, schema, **kw)
+
+        items = self._items(4)
+        client = _CountingClient(fits=8)
+        concepts, *_ = run_phase2(
+            items, "t/", client, batch_target=1,
+            should_stop=lambda: calls["n"] >= 2,
+        )
+        assert calls["n"] == 2
+        assert len(concepts) == 2
+
+
+class TestPhase2TruncationEscalation:
+    """One-shot output-cap escalation before the split ladder."""
+
+    _TRUNC_MSG = TestPhase2TruncationRecovery._TRUNC_MSG
+
+    class _CapSensitiveClient:
+        """Truncates whenever the batch's simulated output outgrows
+        the ``max_tokens`` the call requested; records
+        ``(n_items, max_tokens)`` per call. ``tokens_per_item`` is a
+        uniform int or a per-item-name mapping (unlisted names cost
+        1000 tokens). ``sse_ok`` (when not None) attaches a
+        ``primary_provider`` stub declaring the surface's stream
+        capability, as the provider layer does via ``_stream_sse_ok``.
+        ``claude-sonnet-5``: 128000 max_output, thinking shares the
+        output budget (so the standard study ceiling is 2x the text
+        budget)."""
+
+        model = "claude-sonnet-5"
+
+        def __init__(
+            self,
+            tokens_per_item: int | dict[str, int],
+            *,
+            sse_ok: bool | None = None,
+        ) -> None:
+            self.tokens_per_item = tokens_per_item
+            self.calls: list[tuple[int, int]] = []
+            if sse_ok is not None:
+                import types as _types
+                self.primary_provider = _types.SimpleNamespace(
+                    _stream_sse_ok=sse_ok,
+                )
+
+        def _output_tokens(self, names: set[str]) -> int:
+            if isinstance(self.tokens_per_item, dict):
+                return sum(
+                    self.tokens_per_item.get(n, 1000) for n in names
+                )
+            return len(names) * self.tokens_per_item
+
+        def generate_structured(self, prompt: str, schema, **kw):
+            import re as _re
+            names = set(_re.findall(r"\bfn\d+\b", prompt))
+            cap = kw["max_tokens"]
+            self.calls.append((len(names), cap))
+            if self._output_tokens(names) > cap:
+                raise RuntimeError(
+                    TestPhase2TruncationEscalation._TRUNC_MSG)
+            return ({"concepts": [
+                {"id": n, "description": f"desc {n}",
+                 "evidence": [{"type": "doc", "file": "x.c",
+                               "observation": "obs"}],
+                 "confidence": "inferred"} for n in sorted(names)],
+                "invariants": [], "contracts": []}, "raw")
+
+    def _items(self, n: int) -> list[StudyItem]:
+        return [StudyItem(id=f"i{k}", kind="function", name=f"fn{k}",
+                          file="x.c") for k in range(n)]
+
+    def _serial(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "core.llm.concurrency.derive_max_workers", lambda _m: 1)
+        monkeypatch.setenv("RAPTOR_STUDY_MAX_OUTPUT_TOKENS", "16384")
+
+    def test_escalated_retry_short_circuits_the_split(
+        self, monkeypatch,
+    ):
+        """A batch that fits one escalation step up is retried once at
+        the escalated cap and never split — no half-size calls."""
+        self._serial(monkeypatch)
+        items = self._items(2)
+        # 2 x 20000 = 40000: over the 32768 standard ceiling, under
+        # the 49152 escalated one.
+        client = self._CapSensitiveClient(tokens_per_item=20000)
+        concepts, *_ = run_phase2(items, "t/", client, batch_target=2)
+        assert sorted(c.id for c in concepts) == ["fn0", "fn1"]
+        assert client.calls == [(2, 32768), (2, 49152)]
+
+    def test_escalated_retry_truncation_falls_through_to_halving(
+        self, monkeypatch,
+    ):
+        """When the escalated retry ALSO truncates, the split ladder
+        engages exactly as before."""
+        self._serial(monkeypatch)
+        items = self._items(2)
+        # 2 x 30000 = 60000: over both ceilings; halves (30000) fit
+        # the standard one.
+        client = self._CapSensitiveClient(tokens_per_item=30000)
+        concepts, *_ = run_phase2(items, "t/", client, batch_target=2)
+        assert sorted(c.id for c in concepts) == ["fn0", "fn1"]
+        assert client.calls == [
+            (2, 32768), (2, 49152), (1, 32768), (1, 32768),
+        ]
+
+    def test_no_escalation_when_cap_already_at_model_ceiling(
+        self, monkeypatch,
+    ):
+        """No escalated retry when the standard cap already sits at
+        the model's max_output — the split engages directly."""
+        monkeypatch.setattr(
+            "core.llm.concurrency.derive_max_workers", lambda _m: 1)
+        # claude-sonnet-4-6: 64000 max_output, non-thinking tier —
+        # with a 64000 text budget the standard cap IS the ceiling.
+        monkeypatch.setenv("RAPTOR_STUDY_MAX_OUTPUT_TOKENS", "64000")
+        items = self._items(2)
+        client = self._CapSensitiveClient(tokens_per_item=40000)
+        client.model = "claude-sonnet-4-6"
+        concepts, *_ = run_phase2(items, "t/", client, batch_target=2)
+        assert sorted(c.id for c in concepts) == ["fn0", "fn1"]
+        assert client.calls == [(2, 64000), (1, 64000), (1, 64000)]
+
+    def test_no_escalation_for_unknown_model(self, monkeypatch):
+        """Without a catalog max_output an over-ceiling request would
+        be rejected, not truncated — escalation stands down and the
+        pre-existing split path runs byte-for-byte."""
+        self._serial(monkeypatch)
+        items = self._items(2)
+        client = self._CapSensitiveClient(tokens_per_item=10000)
+        client.model = ""
+        # Unknown model: standard cap is the bare text budget.
+        concepts, *_ = run_phase2(items, "t/", client, batch_target=2)
+        assert sorted(c.id for c in concepts) == ["fn0", "fn1"]
+        assert client.calls == [(2, 16384), (1, 16384), (1, 16384)]
+
+    def test_no_escalation_on_non_sse_surface(self, monkeypatch):
+        """A provider surface with no SSE support downgrades the
+        batch call to plain create, where an escalated generation
+        cannot finish inside the provider's non-streaming abort —
+        escalation stands down and the split engages directly, buying
+        no deterministic dead call at the escalated cap."""
+        self._serial(monkeypatch)
+        items = self._items(2)
+        client = self._CapSensitiveClient(
+            tokens_per_item=20000, sse_ok=False,
+        )
+        concepts, *_ = run_phase2(items, "t/", client, batch_target=2)
+        assert sorted(c.id for c in concepts) == ["fn0", "fn1"]
+        # No (2, 49152) call: straight to the halves.
+        assert client.calls == [(2, 32768), (1, 32768), (1, 32768)]
+
+    def test_escalation_on_declared_sse_surface(self, monkeypatch):
+        """Capability twin: a surface explicitly declaring SSE keeps
+        the escalated short-circuit byte-for-byte."""
+        self._serial(monkeypatch)
+        items = self._items(2)
+        client = self._CapSensitiveClient(
+            tokens_per_item=20000, sse_ok=True,
+        )
+        concepts, *_ = run_phase2(items, "t/", client, batch_target=2)
+        assert sorted(c.id for c in concepts) == ["fn0", "fn1"]
+        assert client.calls == [(2, 32768), (2, 49152)]
+
+    def test_stream_predicate_resolves_surface_capability(
+        self, monkeypatch,
+    ):
+        """``_batch_call_streams`` = module opt-in AND provider
+        ``_stream_sse_ok`` (fail-open like the provider layer when
+        the capability is undeclared or unresolvable)."""
+        import types as _types
+
+        from core.concepts import study
+        from core.concepts.study import _batch_call_streams
+        assert _batch_call_streams(None) is True
+        # No primary_provider on the client: opt-in stands.
+        assert _batch_call_streams(object()) is True
+        assert _batch_call_streams(_types.SimpleNamespace(
+            primary_provider=_types.SimpleNamespace(
+                _stream_sse_ok=False),
+        )) is False
+        sse_client = _types.SimpleNamespace(
+            primary_provider=_types.SimpleNamespace(
+                _stream_sse_ok=True),
+        )
+        assert _batch_call_streams(sse_client) is True
+        # Opt-in off wins over any capability.
+        monkeypatch.setattr(study, "_BATCH_CALLS_STREAM", False)
+        assert _batch_call_streams(sse_client) is False
+        assert _batch_call_streams(None) is False
+
+    def test_escalated_retry_transport_failure_keeps_split_path(
+        self, monkeypatch,
+    ):
+        """A non-truncation death of the opportunistic escalated retry
+        must not re-classify the batch: the first-hand truncation
+        stands and the split ladder still salvages the items."""
+        self._serial(monkeypatch)
+        items = self._items(2)
+
+        outer = self
+
+        class _TransportOnEscalation(self._CapSensitiveClient):
+            def generate_structured(self, prompt: str, schema, **kw):
+                if kw["max_tokens"] > 32768:
+                    self.calls.append((0, kw["max_tokens"]))
+                    raise RuntimeError("connection reset by peer")
+                return outer._CapSensitiveClient.generate_structured(
+                    self, prompt, schema, **kw)
+
+        client = _TransportOnEscalation(tokens_per_item=20000)
+        concepts, *_ = run_phase2(items, "t/", client, batch_target=2)
+        assert sorted(c.id for c in concepts) == ["fn0", "fn1"]
+        assert client.calls == [
+            (2, 32768), (0, 49152), (1, 32768), (1, 32768),
+        ]
+
+    def test_budget_stop_during_escalated_retry_propagates(
+        self, monkeypatch,
+    ):
+        """A spend-cap trip DURING the escalated retry is phase-
+        terminal: it propagates out of the ladder untouched — never
+        absorbed into the split path (which would keep buying halves
+        after the budget is gone)."""
+        import pytest
+
+        from core.concepts.study import (
+            _PhaseBudgetExhausted,
+            _run_batch_splitting_on_truncation,
+        )
+        monkeypatch.setenv("RAPTOR_STUDY_MAX_OUTPUT_TOKENS", "16384")
+        items = self._items(2)
+        outer = self
+
+        class _BudgetOnEscalation(self._CapSensitiveClient):
+            def generate_structured(self, prompt: str, schema, **kw):
+                if kw["max_tokens"] > 32768:
+                    from core.llm.client import LLMBudgetExceededError
+                    self.calls.append((0, kw["max_tokens"]))
+                    raise LLMBudgetExceededError("budget exceeded")
+                return outer._CapSensitiveClient.generate_structured(
+                    self, prompt, schema, **kw)
+
+        client = _BudgetOnEscalation(tokens_per_item=20000)
+        with pytest.raises(_PhaseBudgetExhausted):
+            _run_batch_splitting_on_truncation(
+                0, 1, items, [], "t/", "", client, None, None,
+            )
+        # Truncated initial call, budget-tripped escalation, and NOT
+        # one half-size call after the trip.
+        assert client.calls == [(2, 32768), (0, 49152)]
+
+    def test_escalated_wall_timeout_scales_with_the_ceiling(
+        self, monkeypatch,
+    ):
+        """The wall stretches proportionally past the standard 2x
+        ceiling (a healthy escalated retry must not be abandoned
+        mid-generation after billing) and never shrinks below the
+        standard wall."""
+        from core.concepts.study import _escalated_wall_timeout
+        monkeypatch.setenv("RAPTOR_STUDY_MAX_OUTPUT_TOKENS", "16384")
+        assert _escalated_wall_timeout(49152) == 990  # 660 * 1.5
+        assert _escalated_wall_timeout(32768) == 660.0
+        assert _escalated_wall_timeout(1024) == 660.0
+
+    def test_max_batch_wall_bounds_every_attempt(self, monkeypatch):
+        """``_max_batch_wall_timeout`` is the escalated wall at the
+        multiplier's full stretch — no larger ceiling is ever
+        requested — and is text-budget-independent (the
+        multiplier-to-2x ratio cancels the budget)."""
+        from core.concepts.study import (
+            _escalated_wall_timeout,
+            _max_batch_wall_timeout,
+        )
+        monkeypatch.setenv("RAPTOR_STUDY_MAX_OUTPUT_TOKENS", "16384")
+        assert _max_batch_wall_timeout() == 990
+        assert _max_batch_wall_timeout() >= _escalated_wall_timeout(
+            49152,
+        )
+        monkeypatch.setenv("RAPTOR_STUDY_MAX_OUTPUT_TOKENS", "8192")
+        assert _max_batch_wall_timeout() == 990
+        # A zero text budget disables escalation; the standard wall
+        # is then the bound (and the ratio math is never divided by
+        # zero).
+        monkeypatch.setenv("RAPTOR_STUDY_MAX_OUTPUT_TOKENS", "0")
+        assert _max_batch_wall_timeout() == 660.0
+
+    def test_escalation_multiplier_floor(self):
+        """< 3 makes escalation permanently dead on the tier it exists
+        for: the thinking tier's standard request ceiling is already
+        2x the text budget, so a 2x escalated cap sits AT the
+        standard ceiling and the stand-down guard suppresses every
+        retry — truncated batches on that tier go straight to the
+        costlier split ladder, always."""
+        from core.concepts.study import _TRUNCATION_ESCALATION_MULTIPLIER
+        assert _TRUNCATION_ESCALATION_MULTIPLIER >= 3
+
+    def test_escalation_multiplier_ceiling(self):
+        """> 4 reintroduces the abandoned-worker hazard: the escalated
+        wall scales with the ceiling, so past 4x a single hung retry
+        holds its slot for 20+ minutes — and a retry that still
+        truncates wastes that much more billed generation."""
+        from core.concepts.study import _TRUNCATION_ESCALATION_MULTIPLIER
+        assert _TRUNCATION_ESCALATION_MULTIPLIER <= 4
+
+
+class TestPhase2SalvagedTruncationAccounting:
+    """phase_stats["truncation_failures"] must surface the items the
+    split ladder terminally discarded inside batches it salvaged —
+    one count per discarded item, never per ladder level, and never
+    counting a truncation twice."""
+
+    _Client = TestPhase2TruncationEscalation._CapSensitiveClient
+
+    def _items(self, n: int, file: str = "x.c") -> list[StudyItem]:
+        return [StudyItem(id=f"i{k}", kind="function", name=f"fn{k}",
+                          file=file) for k in range(n)]
+
+    def _serial(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "core.llm.concurrency.derive_max_workers", lambda _m: 1)
+        monkeypatch.setenv("RAPTOR_STUDY_MAX_OUTPUT_TOKENS", "16384")
+
+    def test_escalation_cured_truncation_adds_nothing(
+        self, monkeypatch,
+    ):
+        """A truncation the escalated retry cured is not churn the
+        lane budget should see — it cost one extra call and bought
+        the whole batch."""
+        self._serial(monkeypatch)
+        stats: dict = {}
+        client = self._Client(tokens_per_item=20000)
+        concepts, *_ = run_phase2(
+            self._items(2), "t/", client, batch_target=2,
+            phase_stats=stats,
+        )
+        assert len(concepts) == 2
+        assert stats["truncation_failures"] == 0
+        assert stats["truncation_capped"] is False
+        assert stats["batches_failed"] == 0
+
+    def test_split_cured_truncation_adds_nothing(self, monkeypatch):
+        """A truncation the SPLIT cured (escalation also truncated,
+        but every half fit and survived) discards no item — nothing
+        reaches the per-item stat."""
+        self._serial(monkeypatch)
+        stats: dict = {}
+        client = self._Client(tokens_per_item=30000)
+        concepts, *_ = run_phase2(
+            self._items(2), "t/", client, batch_target=2,
+            phase_stats=stats,
+        )
+        assert len(concepts) == 2
+        assert stats["truncation_failures"] == 0
+        assert stats["batches_failed"] == 0
+        assert stats["truncation_capped"] is False
+
+    def test_discarded_item_adds_exactly_one(self, monkeypatch):
+        """One item over even the escalated cap: the ladder discards
+        it at its terminal leaf and salvages the sibling — exactly
+        one count reaches the stats."""
+        self._serial(monkeypatch)
+        stats: dict = {}
+        client = self._Client(tokens_per_item={"fn0": 60000})
+        concepts, *_ = run_phase2(
+            self._items(2), "t/", client, batch_target=2,
+            phase_stats=stats,
+        )
+        assert [c.id for c in concepts] == ["fn1"]
+        assert stats["truncation_failures"] == 1
+        assert stats["batches_failed"] == 0
+        # Salvaged churn is budget-relevant but never the
+        # config-shaped phase-halt signal.
+        assert stats["truncation_capped"] is False
+
+    def test_discard_count_is_depth_independent(self, monkeypatch):
+        """The lane budget's unit: ONE oversized item costs ONE count
+        whatever batch size it rode in — the ladder walks one uncured
+        level per halving, but only the discarding leaf records."""
+        self._serial(monkeypatch)
+        for n in (2, 8, 32):
+            stats: dict = {}
+            client = self._Client(tokens_per_item={"fn0": 60000})
+            concepts, *_ = run_phase2(
+                self._items(n), "t/", client, batch_target=n,
+                phase_stats=stats,
+            )
+            assert len(concepts) == n - 1, n
+            assert stats["truncation_failures"] == 1, n
+            assert stats["batches_failed"] == 0, n
+            assert stats["truncation_capped"] is False, n
+
+    def test_two_discarded_items_count_two(self, monkeypatch):
+        """Per-item, not per-batch either: two oversized items in one
+        salvaged batch are two counts."""
+        self._serial(monkeypatch)
+        stats: dict = {}
+        client = self._Client(
+            tokens_per_item={"fn0": 60000, "fn1": 60000},
+        )
+        concepts, *_ = run_phase2(
+            self._items(4), "t/", client, batch_target=4,
+            phase_stats=stats,
+        )
+        assert sorted(c.id for c in concepts) == ["fn2", "fn3"]
+        assert stats["truncation_failures"] == 2
+        assert stats["batches_failed"] == 0
+        assert stats["truncation_capped"] is False
+
+    def test_terminal_ladder_failure_counts_exactly_once(
+        self, monkeypatch,
+    ):
+        """A batch whose ladder fails terminally already increments
+        the terminal counter — its leaf discard records must be
+        discarded, never stacked on top."""
+        import pytest
+
+        from core.concepts.study import _BatchLLMError
+        self._serial(monkeypatch)
+        stats: dict = {}
+        # A single item over even the escalated cap: leaf discard
+        # record AND terminal failure on the same truncation.
+        client = self._Client(tokens_per_item=60000)
+        with pytest.raises(_BatchLLMError, match="refusing"):
+            run_phase2(
+                self._items(1), "t/", client, batch_target=1,
+                phase_stats=stats,
+            )
+        assert stats["truncation_failures"] == 1
+        assert stats["batches_failed"] == 1
+        assert stats["truncation_capped"] is False
+
+    def test_salvaged_churn_counted_in_parallel(self, monkeypatch):
+        """Parallel twin: each batch salvages around one terminally
+        discarded item — both counts reach the stats."""
+        monkeypatch.setattr(
+            "core.llm.concurrency.derive_max_workers", lambda _m: 2)
+        monkeypatch.setenv("RAPTOR_STUDY_MAX_OUTPUT_TOKENS", "16384")
+        items = (self._items(2, file="a/f.c")
+                 + [StudyItem(id=f"i{k}", kind="function",
+                              name=f"fn{k}", file="b/f.c")
+                    for k in range(2, 4)])
+        stats: dict = {}
+        # gemini-2.5-flash: non-thinking, so the standard cap is the
+        # bare 16384 text budget and the escalated one is 49152. The
+        # 60000-token item overflows both alone (discarded at its
+        # leaf); its 1000-token sibling survives.
+        client = self._Client(
+            tokens_per_item={"fn0": 60000, "fn2": 60000},
+        )
+        client.model = "gemini-2.5-flash"
+        concepts, *_ = run_phase2(
+            items, "t/", client, batch_target=2, phase_stats=stats,
+        )
+        assert sorted(c.id for c in concepts) == ["fn1", "fn3"]
+        assert stats["truncation_failures"] == 2
+        assert stats["batches_failed"] == 0
+        assert stats["truncation_capped"] is False
+
+    def _churn_weights(self, n_batches: int) -> dict[str, int]:
+        """One 60000-token item per batch: over the escalated cap on
+        its own, so each batch terminally discards it and salvages
+        the 1000-token sibling."""
+        return {f"fn{2 * k}": 60000 for k in range(n_batches)}
+
+    def _churn_items(self, n_batches: int) -> list[StudyItem]:
+        """2 items per file — with batch_target=2 each file is its
+        own batch."""
+        return [
+            StudyItem(id=f"i{k}", kind="function", name=f"fn{k}",
+                      file=f"f{k // 2}/f.c")
+            for k in range(2 * n_batches)
+        ]
+
+    def test_heavy_salvaged_churn_never_flips_capped_serial(
+        self, monkeypatch,
+    ):
+        """Salvaged per-item discards at/above _TRUNCATION_FAIL_LIMIT
+        with ZERO terminal batch failures must NOT flip
+        truncation_capped (the config-shaped phase-halt marker) or
+        halt the phase — capped keys on TERMINAL truncations only,
+        however loud the salvaged count in truncation_failures
+        gets."""
+        from core.concepts.study import _TRUNCATION_FAIL_LIMIT
+        self._serial(monkeypatch)
+        stats: dict = {}
+        items = self._churn_items(_TRUNCATION_FAIL_LIMIT)
+        client = self._Client(
+            tokens_per_item=self._churn_weights(_TRUNCATION_FAIL_LIMIT),
+        )
+        concepts, *_ = run_phase2(
+            items, "t/", client, batch_target=2, phase_stats=stats,
+        )
+        # Every batch was bought and salvaged — the phase never halted.
+        assert len(concepts) == _TRUNCATION_FAIL_LIMIT
+        assert stats["truncation_failures"] == _TRUNCATION_FAIL_LIMIT
+        assert stats["batches_failed"] == 0
+        assert stats["truncation_capped"] is False
+
+    def test_heavy_salvaged_churn_never_flips_capped_parallel(
+        self, monkeypatch,
+    ):
+        """Parallel twin of the serial capped-marker pin."""
+        from core.concepts.study import _TRUNCATION_FAIL_LIMIT
+        monkeypatch.setattr(
+            "core.llm.concurrency.derive_max_workers", lambda _m: 2)
+        monkeypatch.setenv("RAPTOR_STUDY_MAX_OUTPUT_TOKENS", "16384")
+        stats: dict = {}
+        items = self._churn_items(_TRUNCATION_FAIL_LIMIT)
+        client = self._Client(
+            tokens_per_item=self._churn_weights(_TRUNCATION_FAIL_LIMIT),
+        )
+        client.model = "gemini-2.5-flash"
+        concepts, *_ = run_phase2(
+            items, "t/", client, batch_target=2, phase_stats=stats,
+        )
+        assert len(concepts) == _TRUNCATION_FAIL_LIMIT
+        assert stats["truncation_failures"] == _TRUNCATION_FAIL_LIMIT
+        assert stats["batches_failed"] == 0
+        assert stats["truncation_capped"] is False
+
+
+class TestPhase2TruncationHonesty:
+    """Split subtrees must not launder non-truncation failures."""
+
+    _TRUNC_MSG = TestPhase2TruncationRecovery._TRUNC_MSG
+
+    class _HalfTransportClient:
+        """Truncates the full batch; then one named item's half fails
+        with a transport error while the sibling half succeeds."""
+
+        def __init__(self, fits: int, transport: str) -> None:
+            self.fits = fits
+            self.transport = transport
+
+        def generate_structured(self, prompt: str, schema, **kw):
+            import re as _re
+            names = set(_re.findall(r"\bfn\d+\b", prompt))
+            if len(names) > self.fits:
+                raise RuntimeError(
+                    TestPhase2TruncationHonesty._TRUNC_MSG)
+            if self.transport in names:
+                raise RuntimeError("connection reset by peer")
+            return ({"concepts": [
+                {"id": n, "description": f"desc {n}",
+                 "evidence": [{"type": "doc", "file": "x.c",
+                               "observation": "obs"}],
+                 "confidence": "inferred"} for n in sorted(names)],
+                "invariants": [], "contracts": []}, "raw")
+
+    def _items(self, n: int) -> list[StudyItem]:
+        return [StudyItem(id=f"i{k}", kind="function", name=f"fn{k}",
+                          file="x.c") for k in range(n)]
+
+    def test_transport_failure_in_split_fails_batch_honestly(self):
+        """A half dying on transport while its sibling succeeds must
+        fail the whole batch (breaker-visible), not vanish into a
+        silent partial success — and must NOT be classified as
+        truncation via __context__ inherited from the handled
+        truncation error."""
+        import pytest
+
+        from core.concepts.study import _BatchLLMError
+        items = self._items(2)
+        client = self._HalfTransportClient(fits=1, transport="fn1")
+        discards: list[dict] = []
+        with pytest.raises(_BatchLLMError) as excinfo:
+            run_phase2(items, "t/", client, batch_target=2,
+                       discard_sink=discards)
+        # The phase-level refusal fires because the sole batch failed
+        # with a NON-truncation error (zero successes).
+        assert "refusing" in str(excinfo.value)
+        # No item was mislabelled as a truncation discard.
+        assert discards == []
+
+    def test_transport_failure_counts_toward_the_breaker(self):
+        """The laundering corollary: transport failures surfacing
+        through split subtrees still feed the consecutive-failure
+        abort (a truncation-flagged raise would starve it)."""
+        import pytest
+
+        from core.concepts.study import _BatchLLMError
+        # Enough two-item batches that a mislabelled (truncation-
+        # flagged) failure would keep the loop churning through all
+        # of them; correct labelling aborts at the limit.
+        items = []
+        for k in range(0, 2 * (_CONSECUTIVE_FAIL_LIMIT + 2), 2):
+            items.append(StudyItem(
+                id=f"i{k}", kind="function", name=f"fn{k}",
+                file=f"d{k}/f.c"))
+            items.append(StudyItem(
+                id=f"i{k + 1}", kind="function", name=f"fn{k + 1}",
+                file=f"d{k}/f.c"))
+        transport_names = {f"fn{k}" for k in range(1, 99, 2)}
+
+        class _AllTransportHalves(self._HalfTransportClient):
+            def generate_structured(self, prompt, schema, **kw):
+                import re as _re
+                names = set(_re.findall(r"\bfn\d+\b", prompt))
+                if len(names) > 1:
+                    raise RuntimeError(
+                        TestPhase2TruncationHonesty._TRUNC_MSG)
+                if names & transport_names:
+                    raise RuntimeError("connection reset by peer")
+                return ({"concepts": [], "invariants": [],
+                         "contracts": []}, "raw")
+
+        client = _AllTransportHalves(fits=1, transport="")
+        calls: list[int] = []
+        orig = client.generate_structured
+
+        def _counting(prompt, schema, **kw):
+            calls.append(1)
+            return orig(prompt, schema, **kw)
+        client.generate_structured = _counting
+        with pytest.raises(_BatchLLMError, match="refusing"):
+            run_phase2(items, "t/", client, batch_target=2)
+        # Each failed batch costs 3 calls (full, half, half); the
+        # breaker stops the loop at the limit instead of churning
+        # every batch.
+        assert len(calls) <= 3 * _CONSECUTIVE_FAIL_LIMIT
+
+
+class TestTruncationMatcher:
+    def test_attribute_first(self):
+        from core.concepts.study import _is_truncation_error
+        err = RuntimeError("model stopped early (finish_reason=cap)")
+        err.llm_truncation = True
+        assert _is_truncation_error(err)
+
+    def test_provider_guard_constructor_is_matched(self):
+        from core.concepts.study import _is_truncation_error
+        from core.llm.providers import _llm_truncation_error
+        assert _is_truncation_error(
+            _llm_truncation_error("anything at all"))
+
+    def test_legacy_phrases_still_match(self):
+        from core.concepts.study import _is_truncation_error
+        for msg in (
+            "Structured response truncated (output token limit "
+            "reached, stop_reason=max_tokens, instructor tool-use "
+            "leg)",
+            "Gemini native structured response truncated "
+            "(finish_reason=max_tokens, output_tokens=4096)",
+            "Response truncated (output token limit reached, "
+            "finish_reason=length)",
+        ):
+            assert _is_truncation_error(RuntimeError(msg)), msg
+
+    def test_chain_walked_through_wrappers(self):
+        from core.concepts.study import _is_truncation_error
+        from core.llm.providers import _llm_truncation_error
+        inner = _llm_truncation_error("cut")
+        try:
+            raise RuntimeError("wrapped") from inner
+        except RuntimeError as outer:
+            assert _is_truncation_error(outer)
+
+    def test_unrelated_errors_do_not_match(self):
+        from core.concepts.study import _is_truncation_error
+        assert not _is_truncation_error(
+            RuntimeError("connection reset by peer"))
+
+
+class TestPhase2BudgetStop:
+    """Budget exhaustion is terminal — stop cleanly, keep partials,
+    never burn the provider-health breaker on it."""
+
+    _OK = ({"concepts": [{
+        "id": "c", "description": "desc",
+        "evidence": [{"type": "doc", "file": "x.c",
+                      "observation": "obs"}],
+        "confidence": "inferred"}],
+        "invariants": [], "contracts": []}, "raw")
+
+    def _items(self, n: int) -> list[StudyItem]:
+        # One file per item so batch_target=1 yields one batch each.
+        return [StudyItem(id=f"i{k}", kind="function", name=f"fn{k}",
+                          file=f"d{k}/f.c") for k in range(n)]
+
+    def test_midrun_trip_stops_cleanly_with_partials(self, caplog):
+        import logging
+
+        from core.llm.client import LLMBudgetExceededError
+        client = MagicMock()
+        client.generate_structured.side_effect = [
+            self._OK, self._OK,
+            LLMBudgetExceededError(
+                "LLM budget exceeded: $10.0010 spent > $10.0000 "
+                "limit"),
+        ]
+        with caplog.at_level(logging.ERROR, logger="core.concepts.study"):
+            concepts, *_ = run_phase2(
+                self._items(4), "t/", client, batch_target=1)
+        # Two completed batches survive; the remaining batch is never
+        # dispatched (a budget trip is deterministic).
+        assert len(concepts) == 2
+        assert client.generate_structured.call_count == 3
+        messages = [r.getMessage() for r in caplog.records]
+        assert any(
+            "LLM budget exhausted" in m and "2 completed batch(es)" in m
+            for m in messages
+        )
+        assert not any("provider may be down" in m for m in messages)
+
+    def test_trip_before_any_success_refuses_empty_model(self):
+        import pytest
+
+        from core.concepts.study import _BatchLLMError
+        from core.llm.client import LLMBudgetExceededError
+        client = MagicMock()
+        client.generate_structured.side_effect = LLMBudgetExceededError(
+            "LLM budget exceeded: $10.0010 spent > $10.0000 limit")
+        with pytest.raises(_BatchLLMError, match="refusing"):
+            run_phase2(self._items(3), "t/", client, batch_target=1)
+        assert client.generate_structured.call_count == 1
+
+    class _SplitThenBudgetClient:
+        """One two-item batch: together truncates; the fn0 half
+        succeeds, the fn1 half trips the spend cap."""
+
+        def generate_structured(self, prompt: str, schema, **kw):
+            import re as _re
+
+            from core.llm.client import LLMBudgetExceededError
+            names = set(_re.findall(r"\bfn\d+\b", prompt))
+            if len(names) > 1:
+                raise RuntimeError(
+                    "Structured response truncated (output token "
+                    "limit reached, stop_reason=max_tokens, "
+                    "instructor tool-use leg)")
+            if "fn1" in names:
+                raise LLMBudgetExceededError(
+                    "LLM budget exceeded: $10.0010 spent > "
+                    "$10.0000 limit")
+            return ({"concepts": [
+                {"id": n, "description": f"desc {n}",
+                 "evidence": [{"type": "doc", "file": "x.c",
+                               "observation": "obs"}],
+                 "confidence": "inferred"} for n in sorted(names)],
+                "invariants": [], "contracts": []}, "raw")
+
+    def test_midcascade_trip_salvages_paid_sibling_serial(self):
+        """Budget trip inside a split cascade must keep the sibling
+        half's PAID results — a first-batch trip previously converted
+        them into a hard refusing failure."""
+        # `calls` boosts fn0's priority so the succeeding half runs
+        # (and is paid for) BEFORE the budget-tripping half.
+        items = [StudyItem(id="i0", kind="function", name="fn0",
+                           file="x.c", calls=["a", "b"]),
+                 StudyItem(id="i1", kind="function", name="fn1",
+                           file="x.c")]
+        client = self._SplitThenBudgetClient()
+        concepts, *_ = run_phase2(items, "t/", client, batch_target=2)
+        assert [c.id for c in concepts] == ["fn0"]
+
+    def test_midcascade_trip_salvages_paid_sibling_parallel(
+        self, monkeypatch,
+    ):
+        monkeypatch.setattr(
+            "core.llm.concurrency.derive_max_workers", lambda _m: 2)
+        items = [StudyItem(id="i0", kind="function", name="fn0",
+                           file="x.c", calls=["a", "b"]),
+                 StudyItem(id="i1", kind="function", name="fn1",
+                           file="x.c"),
+                 StudyItem(id="i2", kind="function", name="fn2",
+                           file="y.c"),
+                 StudyItem(id="i3", kind="function", name="fn3",
+                           file="y.c")]
+        client = self._SplitThenBudgetClient()
+        client.model = "gemini-2.5-flash"
+        concepts, *_ = run_phase2(items, "t/", client, batch_target=2)
+        # Both batches split; each salvages its fn0/fn2-style half…
+        # except the fn2/fn3 batch has no budget item — fn1 is the
+        # only tripping name — so it recovers fully.
+        ids = sorted(c.id for c in concepts)
+        assert "fn0" in ids
+        assert "fn1" not in ids
+
+    def test_hostile_echo_does_not_end_the_phase(self):
+        """Model-authored text quoting 'budget exceeded' inside a
+        response-shape failure must stay an ordinary batch failure —
+        never the terminal budget stop."""
+        import json as _json
+
+        ok = self._OK
+        shape_err = _json.JSONDecodeError(
+            "Expecting value: budget exceeded is not valid JSON",
+            '{"note": "budget exceeded"}', 1)
+        wrapped = RuntimeError(
+            "structured parse failed: budget exceeded echo")
+        wrapped.__cause__ = shape_err
+        client = MagicMock()
+        client.generate_structured.side_effect = [wrapped, ok, ok, ok]
+        concepts, *_ = run_phase2(
+            self._items(4), "t/", client, batch_target=1)
+        # All remaining batches still dispatched (no terminal stop).
+        assert client.generate_structured.call_count == 4
+        assert len(concepts) == 3
+
+
 class TestStudyOutputCap:
     def test_batch_call_carries_capped_max_tokens(self, monkeypatch):
         from unittest.mock import MagicMock
@@ -2080,6 +3687,56 @@ class TestStudyOutputCap:
         monkeypatch.setenv("RAPTOR_STUDY_MAX_OUTPUT_TOKENS", "8000")
         from core.concepts.study import _study_max_output_tokens
         assert _study_max_output_tokens() == 8000
+
+    def test_always_thinking_models_get_thinking_headroom(self):
+        """On models whose always-on reasoning bills inside max_tokens
+        (and cannot be capped per request), a ceiling sized for the
+        text alone is consumed by thinking on large prompts — the
+        request budget doubles so the text floor survives."""
+        from core.concepts.study import _study_max_output_tokens
+        assert _study_max_output_tokens("claude-fable-5") == 32768
+        assert _study_max_output_tokens("anthropic.claude-fable-5") == 32768
+
+    def test_pre_thinking_tier_keeps_text_budget(self):
+        from core.concepts.study import _study_max_output_tokens
+        assert _study_max_output_tokens("claude-opus-4-6") == 16384
+        assert _study_max_output_tokens("") == 16384
+        assert _study_max_output_tokens(None) == 16384
+
+    def test_env_override_scales_thinking_headroom(self, monkeypatch):
+        """The env knob sets the TEXT budget; the thinking headroom
+        scales with it in both directions."""
+        monkeypatch.setenv("RAPTOR_STUDY_MAX_OUTPUT_TOKENS", "8000")
+        from core.concepts.study import _study_max_output_tokens
+        assert _study_max_output_tokens("claude-fable-5") == 16000
+
+    def test_batch_ceiling_derives_from_text_budget_only(self):
+        """Thinking headroom must not admit more items per batch: the
+        per-item output estimate covers TEXT, and a batch sized to the
+        doubled request ceiling would need text past its share."""
+        from core.concepts.study import (
+            _PHASE2_ITEM_OUTPUT_TOKENS_EST,
+            _phase2_batch_ceiling,
+            _study_text_output_tokens,
+        )
+        assert _phase2_batch_ceiling() == (
+            _study_text_output_tokens() // _PHASE2_ITEM_OUTPUT_TOKENS_EST
+        )
+
+    def test_batch_call_carries_thinking_headroom_for_client_model(self):
+        from unittest.mock import MagicMock
+
+        from core.concepts.model import StudyItem
+        from core.concepts.study import run_phase2
+        client = MagicMock()
+        client.model = "claude-fable-5"
+        client.generate_structured.return_value = (
+            {"concepts": [], "invariants": [], "contracts": [],
+             "bug_patterns": []}, "raw")
+        run_phase2([StudyItem(id="i", kind="function", name="f",
+                              file="a.c")], "t", client)
+        kwargs = client.generate_structured.call_args.kwargs
+        assert kwargs.get("max_tokens") == 32768
 
 
 class TestThreatFrameDerivation:
@@ -2349,8 +4006,17 @@ class TestSagePriorConceptMatching:
         content = content.replace("[walk]", "[scatter_walk]")
         out = tmp_path / "run" / "out"
         out.mkdir(parents=True)
+        # The matched local concept needs fresh, checkable evidence of
+        # its own — the fast path no longer skips on the SAGE row's
+        # hashes alone.
+        from core.staleness import hash_span
+        local_h = hash_span(src_dir / "mm.c", 1, 1)
         DomainModel(concepts=[Concept(
             id="scatter_walk_state_machine", description="related",
+            evidence=[Evidence(
+                type="code_path", file="mm.c",
+                observation="walker", line=1, hash=local_h,
+            )],
         )]).save(out / "domain-model.json")
 
         items = [StudyItem(id="s1", kind="function",
@@ -2396,6 +4062,10 @@ class TestStampContractHashes:
         _stamp_contract_hashes(contracts, items, tmp_path)
         assert contracts[0].hash == hash_span(f, 1, 3)
         assert contracts[1].hash == hash_span(f, 4, 6)
+        # The stamped span rides along so the staleness check can
+        # re-verify the hash later.
+        assert contracts[0].hash_span == {"file": "a.c", "start": 1, "end": 3}
+        assert contracts[1].hash_span == {"file": "a.c", "start": 4, "end": 6}
 
     def test_unknown_function_left_unstamped(
         self, tmp_path: Path,
@@ -2454,3 +4124,312 @@ class TestVerifyEvidenceHashes:
         assert _verify_evidence_hashes(
             self._content(["aaaaaaaaaaaa"]), tmp_path,
         ) is False
+
+
+class TestSecurityContextReadsCapped:
+    def test_reads_route_through_capped_reader(
+        self, tmp_path, monkeypatch,
+    ):
+        import core.source as core_source
+        from core.concepts.study import _collect_security_context_texts
+
+        (tmp_path / "a.c").write_text("int main(void){}\n",
+                                      encoding="utf-8")
+        calls = {"n": 0}
+        orig = core_source.read_text_capped
+
+        def spy(path, *a, **kw):
+            calls["n"] += 1
+            return orig(path, *a, **kw)
+
+        monkeypatch.setattr(core_source, "read_text_capped", spy)
+        texts = _collect_security_context_texts(tmp_path)
+        assert "a.c" in texts
+        assert calls["n"] > 0
+
+
+class TestOrphanInvariantDropRecorded:
+    """A receipt-verified invariant dying on an orphan concept ref is
+    recorded to the discard sink — the accounting contract is total
+    over discards, never a debug log alone."""
+
+    def test_dedup_records_orphan_drop(self):
+        from core.concepts.study import _dedup_invariants
+
+        inv = Invariant(
+            id="crc_checked", concept="frame_layout",
+            statement="s", negation="n", provenance="verbatim",
+            receipt={"file": "a.c", "quote": "q", "verified": True},
+        )
+        sink: list[dict] = []
+        kept = _dedup_invariants([inv], set(), sink)
+        assert kept == []
+        assert sink == [{
+            "kind": "invariant", "id": "crc_checked",
+            "reason": "orphan concept reference",
+            "names": ["frame_layout"],
+        }]
+
+    def test_semantic_dedup_records_orphan_drop(self):
+        from core.concepts.study import _semantic_dedup_invariants
+
+        invs = [
+            Invariant(id="a", concept="gone",
+                      statement="frame length checked before use",
+                      negation="n"),
+            Invariant(id="b", concept="gone",
+                      statement="frame length checked before use "
+                                "always", negation="n"),
+        ]
+        sink: list[dict] = []
+        kept = _semantic_dedup_invariants(invs, set(), sink)
+        assert kept == []
+        assert len(sink) == 1
+        assert sink[0]["reason"] == "orphan concept reference"
+
+    def test_run_phase3_threads_the_sink(self):
+        from core.concepts.study import run_phase3
+
+        sink: list[dict] = []
+        model = run_phase3(
+            [], [Invariant(id="i", concept="missing",
+                           statement="s", negation="n")], [],
+            discard_sink=sink,
+        )
+        assert model.invariants == []
+        assert [d["id"] for d in sink] == ["i"]
+
+
+class TestFindLocalModelsSiblingWalk:
+    """Sibling model discovery skips symlinked run dirs and orders by
+    mtime, not reverse name sort (aligned with the stricter twin)."""
+
+    def test_symlinked_sibling_skipped(self, tmp_path):
+        from core.concepts.study import _find_local_models
+
+        out = tmp_path / "run_b"
+        out.mkdir()
+        real = tmp_path / "run_a"
+        real.mkdir()
+        (real / "domain-model.json").write_text("{}")
+        foreign = tmp_path.parent / f"{tmp_path.name}-foreign"
+        foreign.mkdir()
+        (foreign / "domain-model.json").write_text("{}")
+        (tmp_path / "zz_link").symlink_to(foreign)
+
+        got = _find_local_models(out)
+        assert real / "domain-model.json" in got
+        assert foreign / "domain-model.json" not in got, (
+            "symlinked sibling pointed the walk at an out-of-project "
+            "model"
+        )
+
+    def test_mtime_orders_newest_first(self, tmp_path):
+        import os
+
+        from core.concepts.study import _find_local_models
+
+        out = tmp_path / "run_current"
+        out.mkdir()
+        # Reverse NAME sort would pick zz_old first; mtime must win.
+        old_dir = tmp_path / "zz_old"
+        new_dir = tmp_path / "aa_new"
+        for d, age in ((old_dir, 1000), (new_dir, 10)):
+            d.mkdir()
+            m = d / "domain-model.json"
+            m.write_text("{}")
+            now = m.stat().st_mtime
+            os.utime(m, (now - age, now - age))
+
+        got = _find_local_models(out)
+        assert got[0] == new_dir / "domain-model.json"
+
+
+class TestBatchWorkerNeverBlocksExit:
+    """A wall-timed-out batch's stray LLM call must not hold the
+    process hostage: the worker is a daemon thread (non-daemon
+    executor threads are joined at interpreter exit, so one hung API
+    call per timed-out batch blocked study process exit)."""
+
+    def test_timeout_leaves_only_daemon_worker(self, monkeypatch):
+        import threading
+        import time as _time
+
+        import pytest
+
+        from core.concepts import study as study_mod
+
+        release = threading.Event()
+        seen = {}
+
+        class _Client:
+            def generate_structured(self, *a, **kw):
+                seen["daemon"] = threading.current_thread().daemon
+                release.wait(10)
+                return {}
+
+        monkeypatch.setattr(study_mod, "_BATCH_WALL_TIMEOUT", 0.2)
+        with pytest.raises(study_mod._BatchLLMError,
+                           match="wall-timeout"):
+            study_mod._run_one_batch(
+                0, 1, [], [], "t", "", _Client(), None,
+                on_batch=None,
+            )
+        try:
+            deadline = _time.monotonic() + 5
+            while "daemon" not in seen:
+                assert _time.monotonic() < deadline
+                _time.sleep(0.01)
+            assert seen["daemon"] is True, (
+                "stray batch worker is non-daemon — a hung call "
+                "blocks interpreter exit"
+            )
+        finally:
+            release.set()
+
+    def test_worker_exception_surfaces_as_batch_error(self):
+        import pytest
+
+        from core.concepts import study as study_mod
+
+        class _Client:
+            def generate_structured(self, *a, **kw):
+                raise RuntimeError("boom")
+
+        with pytest.raises(study_mod._BatchLLMError, match="boom"):
+            study_mod._run_one_batch(
+                0, 1, [], [], "t", "", _Client(), None,
+                on_batch=None,
+            )
+
+
+class TestDerivedConfidenceDeliberatelyUncompiled:
+    def test_derived_not_a_grade_and_not_compiled(self, tmp_path):
+        """Threat-frame invariants carry confidence='derived' — kept
+        OUTSIDE CONFIDENCE_GRADES on purpose so rule compilation never
+        turns LLM inference into a mechanical checker. This pins the
+        exclusion as deliberate."""
+        from core.concepts.compiler import compile_model
+        from core.concepts.model import (
+            CONFIDENCE_GRADES,
+            DomainModel,
+        )
+
+        assert "derived" not in CONFIDENCE_GRADES
+
+        class _NeverCalled:
+            def __getattr__(self, name):
+                raise AssertionError(
+                    "derived invariant reached the compiler LLM")
+
+        model = DomainModel(invariants=[Invariant(
+            id="tf", concept="c", statement="s", negation="n",
+            confidence="derived",
+        )])
+        assert compile_model(model, tmp_path, _NeverCalled(),
+                             min_confidence="inferred") == []
+
+
+class TestBatchTargetWithinCeiling:
+    """The DEFAULT Phase 2 batch target is computed WITHIN the
+    output-budget ceiling — ``min(heuristic, ceiling)`` at computation
+    time, derivation visible in one place — so the default path never
+    trips a dispatch-time clamp warning. Only an EXPLICIT operator
+    target above the ceiling still clamps, with disclosure."""
+
+    def _items(self, n: int) -> list[StudyItem]:
+        return [StudyItem(id=f"i{k}", kind="function", name=f"fn{k}",
+                          file=f"f{k}.c") for k in range(n)]
+
+    class _CountingClient:
+        """Answers every batch; records how many items each carried."""
+
+        def __init__(self) -> None:
+            self.batch_sizes: list[int] = []
+
+        def generate_structured(self, prompt: str, schema, **kw):
+            import re as _re
+            names = set(_re.findall(r"\bfn\d+\b", prompt))
+            self.batch_sizes.append(len(names))
+            return ({"concepts": [
+                {"id": n, "description": f"desc {n}",
+                 "evidence": [{"type": "doc", "file": "x.c",
+                               "observation": "obs"}],
+                 "confidence": "inferred"} for n in sorted(names)],
+                "invariants": [], "contracts": []}, "raw")
+
+    def test_target_derivation_ceiling_binds(self, monkeypatch) -> None:
+        # Budget 1024 → ceiling 1024//512 = 2 < heuristic → ceiling wins.
+        import core.concepts.study as study
+        monkeypatch.setenv("RAPTOR_STUDY_MAX_OUTPUT_TOKENS", "1024")
+        assert study._phase2_batch_target() == 2
+
+    def test_target_derivation_heuristic_binds(self, monkeypatch) -> None:
+        # Budget 131072 → ceiling 256 > heuristic → heuristic wins:
+        # a lifted output budget must not balloon batches past the
+        # clustering-granularity heuristic.
+        import core.concepts.study as study
+        monkeypatch.setenv("RAPTOR_STUDY_MAX_OUTPUT_TOKENS", "131072")
+        assert (study._phase2_batch_target()
+                == study._PHASE2_BATCH_TARGET_HEURISTIC)
+
+    def test_defaults_arithmetic_pinned(self, monkeypatch) -> None:
+        # At the shipped defaults (16384-token budget / ~512 tokens
+        # per item) the computed target IS the 32-item ceiling.
+        import core.concepts.study as study
+        monkeypatch.delenv("RAPTOR_STUDY_MAX_OUTPUT_TOKENS",
+                           raising=False)
+        assert study._phase2_batch_target() == 32
+
+    def test_default_path_computes_within_ceiling_no_warning(
+        self, monkeypatch, caplog,
+    ) -> None:
+        """No batch_target passed → target computed within the
+        ceiling; the dispatch-time clamp disclosure must NOT fire."""
+        import logging as _logging
+        monkeypatch.setenv("RAPTOR_STUDY_MAX_OUTPUT_TOKENS", "1024")
+        items = self._items(4)
+        client = self._CountingClient()
+        with caplog.at_level(_logging.DEBUG,
+                             logger="core.concepts.study"):
+            concepts, *_ = run_phase2(items, "t/", client)
+        assert client.batch_sizes
+        assert all(s <= 2 for s in client.batch_sizes)
+        assert len(concepts) == 4
+        clamp_records = [
+            r for r in caplog.records
+            if "exceeds the output-budget ceiling" in r.getMessage()
+        ]
+        assert clamp_records == []
+
+    def test_explicit_over_ceiling_still_clamps_with_disclosure(
+        self, monkeypatch, caplog,
+    ) -> None:
+        """An operator-passed target above the ceiling keeps the
+        existing contract: clamped, and disclosed at INFO."""
+        import logging as _logging
+        monkeypatch.setenv("RAPTOR_STUDY_MAX_OUTPUT_TOKENS", "1024")
+        items = self._items(4)
+        client = self._CountingClient()
+        with caplog.at_level(_logging.INFO,
+                             logger="core.concepts.study"):
+            concepts, *_ = run_phase2(items, "t/", client,
+                                      batch_target=80)
+        assert all(s <= 2 for s in client.batch_sizes)
+        assert len(concepts) == 4
+        assert any(
+            "exceeds the output-budget ceiling" in r.getMessage()
+            and r.levelno == _logging.INFO
+            for r in caplog.records
+        )
+
+    def test_run_study_default_is_computed_not_eighty(self) -> None:
+        # run_study resolves its default through the same one-place
+        # derivation (None sentinel), so the derived-attention cap
+        # sees the effective target, never a raw over-ceiling 80.
+        import inspect
+
+        sig = inspect.signature(run_study)
+        assert sig.parameters["batch_target"].default is None
+        sig2 = inspect.signature(run_phase2)
+        assert sig2.parameters["batch_target"].default is None

@@ -40,7 +40,12 @@ def parse_major_minor(raw: str | None) -> tuple[int, int] | None:
     return (major, minor)
 
 
-_SEARCH_RE = re.compile(r"(\d+)\.(\d+)", re.ASCII)
+# (?<!\d) pins the match to the start of its digit run: a bare
+# leading \d+ re-consumes a digit run from every scan position —
+# quadratic on tool output stuffed with digits. The earliest match
+# always starts at the run start, so the extracted pair is
+# unchanged.
+_SEARCH_RE = re.compile(r"(?<!\d)(\d+)\.(\d+)", re.ASCII)
 
 
 def search_major_minor(text: str | None) -> tuple[int, int] | None:
@@ -135,8 +140,34 @@ def resolve_greatest_leq(
     return best
 
 
+def float_encoding_to_tuple(version: float) -> tuple[int, int]:
+    """Decode the legacy ``major + minor/100`` float encoding to
+    ``(major, minor)``.
+
+    Several consumers persist glibc versions in a float encoding
+    (glibc 2.38 → ``2.38``, glibc 2.4 → ``2.04``). ORDER COMPARISONS
+    on that encoding are unsound at some boundaries: the computed
+    ``2 + 47/100.0`` is ``2.4699999999999998``, strictly BELOW a
+    literal ``2.47`` — a threshold at minor 47, 72, or 97 would
+    silently never fire for a target at exactly that version.
+    Decoding both comparands to integer tuples makes the ordering
+    exact for every minor 0..99: ``round()`` absorbs the ~1e-15
+    representation error, six orders of magnitude below the 0.005
+    decision boundary.
+
+    Values outside the encoding's domain degrade safely: 0.0 (the
+    "unknown" sentinel several report fields default to) decodes to
+    ``(0, 0)``, which orders below every real threshold exactly as
+    the raw float did.
+    """
+    major = int(version)
+    minor = round((version - major) * 100)
+    return (major, minor)
+
+
 __all__ = [
     "compare_versions",
+    "float_encoding_to_tuple",
     "parse_major_minor",
     "parse_version",
     "resolve_greatest_leq",

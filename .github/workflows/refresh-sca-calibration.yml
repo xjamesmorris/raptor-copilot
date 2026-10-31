@@ -45,9 +45,19 @@ jobs:
     if: github.repository == 'gadievron/raptor' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      RAPTOR_DIR: ${{ github.workspace }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # The refresh step below runs repo code over untrusted internet
+          # data with a contents:write token in scope; keep that token out
+          # of .git/config so the fetch/parse path can't reach it (same
+          # hardening as refresh-sca-data.yml / sca-self-bump.yml). The
+          # push authenticates explicitly via the gh credential helper
+          # (see Commit + push).
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -56,7 +66,7 @@ jobs:
 
       - name: Install minimal deps
         run: |
-          python -m pip install --upgrade pip==26.1.1
+          python -m pip install --upgrade pip==26.2.1
           # The build script needs only urllib3 (the core.http
           # backend). The validate step runs on the stdlib + the
           # bundled corpus — no pytest required. Keep this fast.
@@ -69,8 +79,11 @@ jobs:
         # Exit 0 = at least one source produced output; exit 1 = every
         # source failed (a global outage, retried next schedule). A
         # single source drifting does NOT fail the run or discard the
-        # rest. (GHA's default shell sets pipefail, so the script's
-        # exit code propagates through the ``tee``.)
+        # rest. (``shell: bash`` sets pipefail so the script's exit
+        # code propagates through the ``tee``; GHA's DEFAULT shell is
+        # ``bash -e`` only, which would let tee swallow it and leave a
+        # global source outage green indefinitely.)
+        shell: bash
         run: |
           # Log to $RUNNER_TEMP (persists across steps, outside the
           # worktree) so it can't be swept into the commit if the scoped
@@ -100,10 +113,44 @@ jobs:
         # enough samples yet for a verdict. Either way we want the
         # PR to land carrying the report, so we don't gate on the
         # exit. Operators read the report directly.
+        # --update-snapshot: this workflow's whole job is to commit
+        # the refreshed corpus + its dated validation snapshot, so it
+        # is the one caller that writes (and retention-prunes) the
+        # committed validation/ dir. Local verification runs omit the
+        # flag and stay metrics-only.
         run: |
           set +e
-          packages/sca/scripts/raptor-sca-validate-corpus
+          packages/sca/scripts/raptor-sca-validate-corpus --update-snapshot
           echo "validate exit: $?"
+          # Distil the verdict line the PR body embeds: the verdict
+          # is the oracle this refresh feeds (risk.py stamps
+          # calibration_status from the newest snapshot), so a
+          # regression must be visible in the PR body itself, not
+          # only inside the JSON diff.
+          python <<'PYEOF' > "$RUNNER_TEMP/validate-verdict.txt"
+          import glob, json, os, re
+          dated = re.compile(r"^\d{4}-\d{2}-\d{2}\.json$")
+          paths = sorted(
+              (p for p in
+               glob.glob('packages/sca/data/calibration/validation/*.json')
+               if dated.match(os.path.basename(p))),
+              reverse=True,
+          )
+          def line(path):
+              with open(path) as fh:
+                  d = json.load(fh)
+              rho = d.get("spearman_rho")
+              rho_s = f"{rho:.4f}" if isinstance(rho, (int, float)) else "undefined"
+              return (f"{d.get('verdict', 'unknown')} "
+                      f"(rho={rho_s}, P20={d.get('top_20_precision', 0):.3f}, "
+                      f"with_signal={d.get('findings_with_signal', 0)})")
+          if paths:
+              print(f"verdict: {line(paths[0])}")
+          if len(paths) > 1:
+              prior = os.path.basename(paths[1])[:-5]
+              print(f"prior ({prior}): {line(paths[1])}")
+          PYEOF
+          cat "$RUNNER_TEMP/validate-verdict.txt"
 
       - name: Diff?
         # ``git diff --quiet`` exits non-zero iff there are changes
@@ -129,6 +176,11 @@ jobs:
         run: |
           set -eu
           BRANCH="auto/sca-calibration-refresh"
+          # persist-credentials:false (see Checkout) kept the token out of
+          # .git/config for the refresh step. Install gh CLI's credential
+          # helper, which reads the token from env at push time without
+          # ever embedding it in any URL stored in .git/config.
+          gh auth setup-git
           # Configure the bot identity. Using the GitHub-Actions
           # service account so the auto-commit is clearly machine-
           # generated; per-step ``GITHUB_TOKEN`` carries
@@ -201,6 +253,14 @@ jobs:
             echo '```'
             cat <<'EOF'
 
+          ## Validation verdict
+
+          EOF
+            echo '```'
+            cat "$RUNNER_TEMP/validate-verdict.txt" 2>/dev/null || echo '(validation verdict unavailable)'
+            echo '```'
+            cat <<'EOF'
+
           ## License compliance
 
           All Tier 1 sources (KEV, EPSS) are MIT-redistribution compatible and ship verbatim with per-file `_source` attribution blocks. The license-compliance check runs in CI and rejects any forbidden field names that would indicate license-restricted content.
@@ -211,6 +271,7 @@ jobs:
           - [ ] No source shows FAILED above (or it's a known transient)
           - [ ] No license-restricted content in the diff
           - [ ] `ATTRIBUTION.md` still covers every JSON file
+          - [ ] Validation verdict above did not regress vs the prior snapshot (a validated_v1 -> needs_retune flip is exactly what this review exists to catch)
           EOF
           } > "$RUNNER_TEMP/pr-body.md"
           # Idempotent create-or-update: ``gh pr create`` exits non-zero

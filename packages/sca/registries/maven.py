@@ -268,8 +268,19 @@ def _add_pom_methods():
                 self._cache.put(cache_key, None, ttl_seconds=self._ttl)
             return None
         if resp.status_code != 200:
+            # raise_on_status=False means a 404 arrives as a response,
+            # not an exception — negative-cache the authoritative miss
+            # here too, or every detector re-fetches the same dead POM
+            # (the exact duplicate-404 traffic the negative cache was
+            # built for). Other statuses (5xx) stay uncached.
+            if (self._cache is not None
+                    and resp.status_code in (404, 410)):
+                self._cache.put(cache_key, None, ttl_seconds=self._ttl)
             return None
         if not _DEFUSEDXML_AVAILABLE:
+            # Environment-caused miss (local defusedxml absent) — never
+            # cache it as registry truth; installing the dependency must
+            # take effect immediately.
             return None
         try:
             root = _safe_xml_fromstring(resp.content)

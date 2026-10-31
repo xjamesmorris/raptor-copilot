@@ -89,18 +89,30 @@ class TestCodeqlDegradedDispatch:
                 hypothesis="h",
                 tier_counters=_counters(),
             )
-        loud = [m for m in infos if "degraded at startup" in m]
+        loud = [m for m in infos if "codeql chain steps skipped" in m]
         assert len(loud) == 1, (
             f"degradation skip must announce exactly once, got {len(loud)}"
         )
+        # With NO database at all, the banner must name that case —
+        # not the router-miss wording.
+        assert "no CodeQL database" in loud[0]
 
 
 class TestCodeqlUnsupportedQueryId:
-    """A codeql chain step naming a query ID (not an on-disk query
-    file) must skip loudly, not error on every dispatch — and the
-    producers must not emit ID-shaped entries at all."""
+    """A codeql chain step naming a query ID the pack-index resolver
+    cannot map to an installed query file must skip loudly, not error
+    on every dispatch — and the producers must not emit unresolvable
+    ID-shaped entries at all. The resolver is stubbed unresolvable so
+    the contract holds on hosts with the packs installed (resolvable
+    IDs are covered in test_codeql_query_resolver)."""
 
-    def test_query_id_with_database_skips_not_errors(self, tmp_path):
+    def test_query_id_with_database_skips_not_errors(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setattr(
+            "core.audit.codeql_query_resolver.resolve_query_id",
+            lambda qid: None,
+        )
         db = tmp_path / "codeql-db"
         db.mkdir()
         config = OrchestratorConfig(
@@ -123,13 +135,38 @@ class TestCodeqlUnsupportedQueryId:
             "unsupported query id must not surface as a channel error"
         )
 
-    def test_fallback_chain_omits_query_id_entries(self):
+    def test_fallback_chain_omits_unresolvable_query_ids(
+        self, monkeypatch,
+    ):
         from core.audit.orchestrator import _cwe_fallback_chain
 
         # CWE-78's dispatch value is "cpp/command-line-injection" — a
-        # pack query ID with no on-disk file.
+        # pack query ID. When the id resolver finds no installed pack
+        # query (stubbed here so the assertion holds on hosts WITH
+        # the packs installed), the chain's codeql slot stays empty.
+        monkeypatch.setattr(
+            "core.audit.codeql_query_resolver.resolve_query_id",
+            lambda qid: None,
+        )
         types = {e["type"] for e in _cwe_fallback_chain("CWE-78")}
         assert "codeql" not in types
+
+    def test_fallback_chain_keeps_resolved_query_id(
+        self, tmp_path, monkeypatch,
+    ):
+        from core.audit.orchestrator import _cwe_fallback_chain
+
+        ql = tmp_path / "CommandLineInjection.ql"
+        ql.write_text("select 1")
+        monkeypatch.setattr(
+            "core.audit.codeql_query_resolver.resolve_query_id",
+            lambda qid: str(ql),
+        )
+        entries = [
+            e for e in _cwe_fallback_chain("CWE-78")
+            if e["type"] == "codeql"
+        ]
+        assert entries and entries[0]["config"]["query"] == str(ql)
 
     def test_fallback_chain_keeps_on_disk_query_file(
         self, tmp_path, monkeypatch,
@@ -149,9 +186,15 @@ class TestCodeqlUnsupportedQueryId:
             codeql_entries[0]["config"]["query"] == str(qfile)
         )
 
-    def test_hypothesis_chain_omits_query_id_entries(self):
+    def test_hypothesis_chain_omits_unresolvable_query_ids(
+        self, monkeypatch,
+    ):
         from core.audit.orchestrator import _hypothesis_to_tool_chain
 
+        monkeypatch.setattr(
+            "core.audit.codeql_query_resolver.resolve_query_id",
+            lambda qid: None,
+        )
         chain = _hypothesis_to_tool_chain(
             "os command injection via system()", "a.c", cwe="CWE-78",
         )
@@ -245,3 +288,173 @@ def _cleanup_chain_rules(chain):
         if isinstance(rule, str) and os.path.basename(rule).startswith(
                 "audit_sweep_"):
             _P(rule).unlink(missing_ok=True)
+
+
+class TestDegradedBannerThreadSafety:
+    """The once-per-process banner flag is shared by parallel review
+    workers: the naked check-then-set double-logged under contention
+    and raced the reset tests rely on."""
+
+    def _capture_infos(self, monkeypatch):
+        import core.audit.orchestrator as _orch
+
+        infos: list[str] = []
+
+        def _info(msg, *args, **kwargs):
+            infos.append(str(msg) % args if args else str(msg))
+
+        monkeypatch.setattr(_orch.logger, "info", _info)
+        return infos
+
+    def test_parallel_first_skips_announce_once(self, monkeypatch):
+        import threading
+
+        import core.audit.orchestrator as _orch
+
+        monkeypatch.setattr(_orch, "_CODEQL_DEGRADED_LOGGED", [False])
+        infos = self._capture_infos(monkeypatch)
+
+        n_threads = 8
+        barrier = threading.Barrier(n_threads)
+
+        def hammer() -> None:
+            barrier.wait()
+            for _ in range(50):
+                _orch._note_codeql_degraded_skip("a.c", "f")
+
+        threads = [
+            threading.Thread(target=hammer) for _ in range(n_threads)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        loud = [m for m in infos if "codeql chain steps skipped" in m]
+        assert len(loud) == 1, (
+            f"concurrent first skips must announce exactly once, "
+            f"got {len(loud)}"
+        )
+
+    def test_reset_by_swapping_flag_still_rearms(self, monkeypatch):
+        # The reset unit stays the module-level list: tests monkeypatch
+        # a fresh [False] and the banner must fire again.
+        import core.audit.orchestrator as _orch
+
+        infos = self._capture_infos(monkeypatch)
+
+        monkeypatch.setattr(_orch, "_CODEQL_DEGRADED_LOGGED", [False])
+        _orch._note_codeql_degraded_skip("a.c", "f")
+        _orch._note_codeql_degraded_skip("a.c", "g")
+        monkeypatch.setattr(_orch, "_CODEQL_DEGRADED_LOGGED", [False])
+        _orch._note_codeql_degraded_skip("b.c", "h")
+
+        loud = [m for m in infos if "codeql chain steps skipped" in m]
+        assert len(loud) == 2, (
+            f"one announcement per reset epoch expected, got {len(loud)}"
+        )
+
+
+class TestUnsupportedIdThreadSafety:
+    """Same shared-flag shape as the degraded banner, keyed per query
+    id: the naked check-then-add double-logged an id when parallel
+    workers dispatching a hot CWE class hit its first miss together."""
+
+    def _capture_infos(self, monkeypatch):
+        import core.audit.orchestrator as _orch
+
+        infos: list[str] = []
+
+        def _info(msg, *args, **kwargs):
+            infos.append(str(msg) % args if args else str(msg))
+
+        monkeypatch.setattr(_orch.logger, "info", _info)
+        return infos
+
+    def test_parallel_first_misses_announce_once_per_id(self, monkeypatch):
+        import threading
+
+        import core.audit.orchestrator as _orch
+
+        monkeypatch.setattr(_orch, "_CODEQL_UNSUPPORTED_IDS_LOGGED", set())
+        infos = self._capture_infos(monkeypatch)
+
+        n_threads = 8
+        barrier = threading.Barrier(n_threads)
+
+        def hammer() -> None:
+            barrier.wait()
+            for _ in range(50):
+                _orch._note_codeql_unsupported_query_id("cpp/x", "a.c", "f")
+                _orch._note_codeql_unsupported_query_id("cpp/y", "a.c", "f")
+
+        threads = [
+            threading.Thread(target=hammer) for _ in range(n_threads)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        loud = [m for m in infos if "unsupported" in m]
+        assert len(loud) == 2, (
+            f"concurrent first misses must announce once per unique "
+            f"query id, got {len(loud)}"
+        )
+        assert len([m for m in loud if "'cpp/x'" in m]) == 1
+        assert len([m for m in loud if "'cpp/y'" in m]) == 1
+
+    def test_reset_by_swapping_set_still_rearms(self, monkeypatch):
+        # The reset unit stays the module-level set: tests monkeypatch
+        # a fresh set() and an already-seen id must announce again.
+        import core.audit.orchestrator as _orch
+
+        infos = self._capture_infos(monkeypatch)
+
+        monkeypatch.setattr(_orch, "_CODEQL_UNSUPPORTED_IDS_LOGGED", set())
+        _orch._note_codeql_unsupported_query_id("cpp/x", "a.c", "f")
+        _orch._note_codeql_unsupported_query_id("cpp/x", "a.c", "g")
+        monkeypatch.setattr(_orch, "_CODEQL_UNSUPPORTED_IDS_LOGGED", set())
+        _orch._note_codeql_unsupported_query_id("cpp/x", "b.c", "h")
+
+        loud = [m for m in infos if "unsupported" in m]
+        assert len(loud) == 2, (
+            f"one announcement per id per reset epoch expected, "
+            f"got {len(loud)}"
+        )
+
+
+class TestRouterMissBannerWording:
+    def test_language_miss_names_the_real_reason(self, tmp_path, monkeypatch):
+        """A database EXISTS but does not cover this file's language —
+        the banner must not blame startup degradation."""
+        import core.audit.orchestrator as _orch
+        from core.audit.codeql_dbs import CodeqlDbRouter
+
+        monkeypatch.setattr(_orch, "_CODEQL_DEGRADED_LOGGED", [False])
+        infos: list[str] = []
+
+        def _info(msg, *args, **kwargs):
+            infos.append(str(msg) % args if args else str(msg))
+
+        monkeypatch.setattr(_orch.logger, "info", _info)
+
+        db = tmp_path / "cpp-db"
+        db.mkdir()
+        (db / "codeql-database.yml").write_text("primaryLanguage: cpp\n")
+        config = OrchestratorConfig(
+            target_path=tmp_path, out_dir=None, codeql_db_path=None,
+        )
+        config.codeql_db_router = CodeqlDbRouter([str(db)])
+        _run_tool_chain(
+            [{"type": "codeql", "config": {"query": "cpp/x"}}],
+            config=config,
+            file_path="src/index.php",
+            function_name="f",
+            source="",
+            hypothesis="h",
+            tier_counters=_counters(),
+        )
+        loud = [m for m in infos if "codeql chain steps skipped" in m]
+        assert len(loud) == 1
+        assert "no database for this file's language" in loud[0]

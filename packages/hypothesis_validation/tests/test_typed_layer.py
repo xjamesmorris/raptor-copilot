@@ -421,25 +421,66 @@ class TestVerdictFrom:
         ev = self._ev(success=True, matches=[])
         assert verdict_from(ev) == "inconclusive"
 
-    # Rule 2 exception: the adapter marked the empty-match outcome as a
-    # definitive tool result (SMT unsat proving infeasibility). The
-    # LLM's phrasing-aware "confirmed" must survive — inverting it to
-    # refuted would report the opposite of what the tool proved.
-    def test_conclusive_empty_matches_lets_confirmed_stand(self):
+    # Rule 2 exception: the adapter marked the empty-match outcome as
+    # a definitive tool result (SMT unsat). The verdict DIRECTION is
+    # mechanical — derived from the hypothesis's declared polarity,
+    # never from the LLM's phrasing-aware claim after seeing the tool
+    # output (the one seam where LLM prose could mint "confirmed"
+    # with zero matches).
+    def test_conclusive_empty_confirms_infeasibility_polarity(self):
         ev = ToolEvidence(
             tool="smt", rule="r", success=True, matches=[],
             empty_matches_conclusive=True,
         )
-        assert verdict_from(ev, "confirmed") == "confirmed"
+        # Direction is mechanical: the LLM claim does not matter.
+        for claim in ("confirmed", "refuted", "inconclusive"):
+            assert verdict_from(
+                ev, claim, polarity="infeasibility",
+            ) == "confirmed"
+
+    def test_conclusive_empty_refutes_reachability_polarity(self):
+        ev = ToolEvidence(
+            tool="smt", rule="r", success=True, matches=[],
+            empty_matches_conclusive=True,
+        )
+        for claim in ("confirmed", "refuted", "inconclusive"):
+            assert verdict_from(
+                ev, claim, polarity="reachability",
+            ) == "refuted"
+
+    def test_conclusive_empty_without_polarity_fails_closed(self):
+        # Undeclared polarity: the unsat proof is sound but its
+        # direction is mechanically unknowable — an LLM "confirmed"
+        # is hint-tier and downgrades to inconclusive instead of
+        # minting a confirmed finding from zero matches.
+        ev = ToolEvidence(
+            tool="smt", rule="r", success=True, matches=[],
+            empty_matches_conclusive=True,
+        )
+        assert verdict_from(ev, "confirmed") == "inconclusive"
 
     def test_conclusive_empty_matches_still_allows_refuted(self):
-        # Reachability-phrased hypotheses keep their reading: unsat
-        # refutes them, and the ladder passes that through.
+        # Without a declared polarity, non-confirming claims keep
+        # their pre-existing pass-through (refuted mints nothing).
         ev = ToolEvidence(
             tool="smt", rule="r", success=True, matches=[],
             empty_matches_conclusive=True,
         )
         assert verdict_from(ev, "refuted") == "refuted"
+
+    def test_polarity_ignored_when_matches_present(self):
+        # Polarity only steers the conclusive-EMPTY outcome; with
+        # matches the normal ladder applies.
+        ev = ToolEvidence(
+            tool="smt", rule="r", success=True,
+            matches=[{"file": "a", "line": 1}],
+        )
+        assert verdict_from(
+            ev, "confirmed", polarity="infeasibility",
+        ) == "confirmed"
+        assert verdict_from(
+            ev, "refuted", polarity="reachability",
+        ) == "inconclusive"
 
     def test_unflagged_empty_matches_still_downgrade_confirmed(self):
         # Direction guard: without the adapter's assertion, confirmed

@@ -82,13 +82,25 @@ def extract_references(text: str) -> frozenset[str]:
     refs: set[str] = set()
     for m in _IDENT_RE.finditer(text):
         name = m.group(1)
-        if name not in keywords and not name.isdigit():
-            refs.add(name)
+        if name in keywords or name.isdigit():
+            continue
+        refs.add(name)
+        # A field/method access constrains its BASE variable too:
+        # ``user_input.isalnum()`` guards ``user_input``, and guard
+        # classifiers match on the queried variable name — without the
+        # base, dotted/arrow conditions constrain nothing.
+        base = re.split(r"->|\.", name, maxsplit=1)[0]
+        if base != name and base not in keywords:
+            refs.add(base)
     return frozenset(refs)
 
 
+# ``For`` labels from the C/C++ builder carry a BARE condition
+# ("for x < n" — the tree-sitter condition field excludes parens,
+# unlike if/while whose condition node includes them), so the paren
+# form alone never extracted a C for-loop guard.
 _CONDITION_LABEL_RE = re.compile(
-    r"^(?:If|While|ElIf|For)\s*\((.+)\)$",
+    r"^(?:If|While|ElIf|For)(?:\s*\((.+)\)|\s+(\S.*))$",
     re.IGNORECASE,
 )
 
@@ -115,7 +127,7 @@ def extract_conditions_from_cfg(cfg) -> list[ConditionEdge]:
         m = _CONDITION_LABEL_RE.match(node.label.strip())
 
         if m and len(successors) >= 2:
-            cond_text = m.group(1).strip()
+            cond_text = (m.group(1) or m.group(2) or "").strip()
             refs = extract_references(cond_text)
             smt = _is_smt_parseable(cond_text)
 
@@ -128,11 +140,16 @@ def extract_conditions_from_cfg(cfg) -> list[ConditionEdge]:
             # Determine true/false successor.  CFG builders link the
             # then-body first (closest line to the condition node) and
             # the else/fallthrough second.  Verify by line proximity;
-            # if the second successor is closer, swap.
+            # if the second successor is closer, swap. Same-line
+            # successors never justify a swap: the Python builder's
+            # while/for exit JOIN carries the header's own lineno
+            # (distance 0), so the proximity test would hand the
+            # TRUE-polarity edge to the loop EXIT and the negated
+            # edge to the body — inverted for every Python loop.
             true_succ, false_succ = successors[0], successors[1]
             d_false = abs(false_succ.lineno - node.lineno)
             d_true = abs(true_succ.lineno - node.lineno)
-            if d_false < d_true:
+            if d_false < d_true and false_succ.lineno != node.lineno:
                 true_succ, false_succ = false_succ, true_succ
 
             edges.append(ConditionEdge(

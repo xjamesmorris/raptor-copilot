@@ -23,12 +23,12 @@ to api.nuget.org + nuget.org, $HOME hidden, FS confined.
 from __future__ import annotations
 
 import logging
-import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 
 from . import ResolverResult, _check_tool, _run
+from ._safe_io import copy_regular_file
 
 logger = logging.getLogger(__name__)
 
@@ -85,12 +85,14 @@ class NugetResolver:
         # only allows writes to the output dir and /tmp, not cwd.
         with tempfile.TemporaryDirectory(prefix="raptor-sca-nuget-") as tmp:
             tmp_path = Path(tmp)
+            # lstat-gated, size-bounded copies — a symlinked or
+            # special-file project file in the scanned (hostile)
+            # tree is refused instead of followed / opened.
             for pattern in ("*.csproj", "*.fsproj", "*.sln"):
                 for src in project_dir.glob(pattern):
-                    shutil.copy2(src, tmp_path / src.name)
+                    copy_regular_file(src, tmp_path / src.name)
             lock_src = project_dir / "packages.lock.json"
-            if lock_src.exists():
-                shutil.copy2(lock_src, tmp_path / lock_src.name)
+            copy_regular_file(lock_src, tmp_path / lock_src.name)
 
             try:
                 proc = _run(

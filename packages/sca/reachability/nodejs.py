@@ -42,17 +42,50 @@ logger = logging.getLogger(__name__)
 
 # Match imports with single, double, or backtick quoted strings (no
 # interpolation handled). A capturing group on the specifier is enough.
+#
+# The re-export branch is statement-local: the previous ``.+?`` with
+# re.DOTALL never stopped at ``;`` / quotes, so on from-less
+# export-heavy code (minified / codegen ``export const`` runs) every
+# ``export`` token rescanned to the next quote in the FILE —
+# measured quadratic (3000 lines → 1.03s, 6000 → 4.11s) — and a
+# match could span unrelated statements, mis-attributing the
+# evidence line.  ``[^'";]*?`` stops at the first quote or statement
+# terminator while still allowing multi-line ``export { a,\n b }
+# from 'x'`` shapes.
 _REQUIRE_RE = re.compile(
     r"""
     (?:                                       # match either:
         \brequire\s*\(\s*['"`]([^'"`]+)['"`]\s*\)         # require(...)
       | \bimport\s*\(\s*['"`]([^'"`]+)['"`]\s*\)          # import(...)
-      | \bimport\s+(?:[^'";]+?\bfrom\s+)?['"`]([^'"`]+)['"`]
-                                                          # static import
-      | \bexport\s+(?:.+?\s+from\s+)['"`]([^'"`]+)['"`]   # re-export
+      # (?=\S) pins the whitespace run before the lazy specifier
+      # clause (same language — the clause or the quote absorbed any
+      # remainder); the naive ``\s+[^'";]+?`` overlapped the run and
+      # the clause — quadratic on an import ending in a whitespace
+      # run.
+      # Both clause fillers are tempered against a bare
+      # ``import``/``export`` keyword: with an untempered loop,
+      # every planted keyword inside an unterminated clause
+      # re-scanned the rest of the clause — quadratic on hostile
+      # source. Real clauses never carry the bare reserved word
+      # (identifiers like ``exports`` still pass the \b fence), so
+      # the language over real code is unchanged.
+      | \bimport\s+(?=\S)
+            (?:(?:(?!\b(?:import|export)\b)[^'";])+?\bfrom\s+)?
+            ['"`]([^'"`]+)['"`]                               # static import
+      # (?=\S) pins the keyword gap here too — the lazy token loop
+      # admits whitespace, so an unpinned run split against it.
+      | \bexport\s+(?=\S)
+            (?:(?:"[^"\n;]*"|'[^'\n;]*'|(?!\b(?:import|export)\b)[^'";])*?
+               \bfrom\s+)
+            ['"`]([^'"`]+)['"`]                               # re-export
+            # The quoted-string alternatives keep ES2022 string-named
+            # re-exports (``export { a as "x y" } from 'm'``) matched
+            # without re-admitting cross-statement scans: a complete
+            # single-line quoted token is consumed atomically, and
+            # everything else still stops at quotes / ``;``.
     )
     """,
-    re.VERBOSE | re.MULTILINE | re.DOTALL,
+    re.VERBOSE | re.MULTILINE,
 )
 
 # Directory exclusions live in ``_walker.py`` now — sourced from
@@ -64,6 +97,8 @@ _REQUIRE_RE = re.compile(
 # ``packages.sca._test_paths`` (which covers the ``.mts``/``.cts``
 # TS variants this module previously matched with a private regex).
 from .._test_paths import is_test_path as _is_test_file  # noqa: E402
+from ..parsers import _safe_read
+from ._shared import iter_matches_with_lines as _iter_matches_with_lines  # noqa: E402
 
 _JS_SUFFIXES = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}
 
@@ -88,10 +123,8 @@ def scan_imports(
     out: dict[str, list[tuple[Path, int, bool]]] = {}
     for js_file in _walk_js_sources(target, max_depth=max_depth):
         is_test = _is_test_file(js_file, target)
-        try:
-            text = js_file.read_text(encoding="utf-8", errors="replace")
-        except OSError as e:
-            logger.debug("sca.reachability.nodejs: skip %s (%s)", js_file, e)
+        text = _safe_read.read_bounded(js_file, follow_symlinks=False)
+        if text is None:
             continue
         for specifier, line in _imports_in(text):
             pkg = _specifier_to_package(specifier)
@@ -144,11 +177,13 @@ def resolve_dep(
 # ---------------------------------------------------------------------------
 
 def _imports_in(text: str) -> Iterable[tuple[str, int]]:
-    for m in _REQUIRE_RE.finditer(text):
+    # Rolling-cursor line numbers — the naive full-prefix count is
+    # quadratic on dense require/import files.
+    for m, line in _iter_matches_with_lines(
+            text, _REQUIRE_RE.finditer(text)):
         spec = next((g for g in m.groups() if g is not None), None)
         if not spec:
             continue
-        line = text.count("\n", 0, m.start()) + 1
         yield spec, line
 
 

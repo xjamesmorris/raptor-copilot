@@ -40,9 +40,11 @@ import logging
 
 from core.oci.image_ref import split_image_ref as _split_image_ref
 
+from ..kinds import RAPTOR_CONFIG_FILENAMES
 from ..models import Confidence, Dependency, PinStyle
 from ..models import classify_pin_style as _classify_pin_style
 from . import _safe_read, register
+from ._base import PARSE_ESCAPE_ERRORS
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -88,7 +90,7 @@ def parse(path: Path) -> list[Dependency]:
     try:
         # Multi-document YAML — common for ``manifests/`` bundles.
         documents = list(safe_load_all(text))
-    except yaml.YAMLError as e:
+    except (yaml.YAMLError, *PARSE_ESCAPE_ERRORS) as e:  # hostile-input escape classes
         # DEBUG, not WARNING: the kubernetes parser is content-sniffing
         # every ``.yml`` / ``.yaml`` in the tree, since file extension
         # alone can't distinguish K8s manifests from arbitrary YAML
@@ -149,6 +151,11 @@ def _is_k8s_manifest(path: Path) -> bool:
         return False
     if name in (".pre-commit-config.yaml", ".pre-commit-config.yml"):
         return False
+    # RAPTOR's own per-repo config files are not manifests; routing
+    # them here meant an "ignored when untrusted" suppression overlay
+    # was still read (bounded, no-follow) as a k8s candidate.
+    if name in RAPTOR_CONFIG_FILENAMES:
+        return False
     # GHA workflows are handled by ``inline_installs.parse_gha_workflow``.
     parts = path.parts
     for j in range(len(parts) - 2):
@@ -156,6 +163,38 @@ def _is_k8s_manifest(path: Path) -> bool:
             return False
     # Composite-action manifests handled by GHA parser.
     return name not in ("action.yml", "action.yaml")
+
+
+def resolve_workload_pod_spec(spec: dict, kind: str) -> dict:
+    """Return the pod-level spec that carries ``containers`` for this
+    workload ``kind``.
+
+    ``Pod`` carries containers at ``spec`` directly; ``Deployment`` /
+    ``StatefulSet`` / etc. wrap them in ``spec.template.spec``;
+    ``CronJob`` nests one level deeper:
+    ``spec.jobTemplate.spec.template.spec``. This kind-nesting rule is
+    THE drift-prone enumeration boundary, so it has exactly one owner —
+    the image-source walker (``dockerfile_from``) consumes it too; a
+    re-implemented walk silently dropped every CronJob container.
+    Falls back to ``spec`` when the expected nesting is absent.
+    """
+    if kind == "CronJob":
+        jt = spec.get("jobTemplate")
+        if isinstance(jt, dict):
+            jt_spec = jt.get("spec")
+            if isinstance(jt_spec, dict):
+                jt_template = jt_spec.get("template")
+                if isinstance(jt_template, dict):
+                    ts = jt_template.get("spec")
+                    if isinstance(ts, dict):
+                        return ts
+        return spec
+    template = spec.get("template")
+    if isinstance(template, dict):
+        ts = template.get("spec")
+        if isinstance(ts, dict):
+            return ts
+    return spec
 
 
 def _extract_images(
@@ -171,25 +210,7 @@ def _extract_images(
     spec = doc.get("spec")
     if not isinstance(spec, dict):
         return
-    # Higher-level workload wrappers nest under ``template.spec``.
-    # CronJob nests one level deeper: ``spec.jobTemplate.spec.template.spec``.
-    template_spec = spec
-    if kind == "CronJob":
-        jt = spec.get("jobTemplate")
-        if isinstance(jt, dict):
-            jt_spec = jt.get("spec")
-            if isinstance(jt_spec, dict):
-                jt_template = jt_spec.get("template")
-                if isinstance(jt_template, dict):
-                    ts = jt_template.get("spec")
-                    if isinstance(ts, dict):
-                        template_spec = ts
-    else:
-        template = spec.get("template")
-        if isinstance(template, dict):
-            ts = template.get("spec")
-            if isinstance(ts, dict):
-                template_spec = ts
+    template_spec = resolve_workload_pod_spec(spec, kind)
 
     metadata = doc.get("metadata") or {}
     workload_name = (

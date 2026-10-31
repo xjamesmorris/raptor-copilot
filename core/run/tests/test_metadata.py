@@ -22,6 +22,36 @@ from core.run import (
 )
 
 
+import pytest
+
+@pytest.fixture(autouse=True)
+def _user_state_in_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """User registries stay out of the real home: the root-conftest
+    layer doing this is stripped from release extracts (conftest.py
+    is export-ignore), so the pin must travel in-file."""
+    from core.testing.state_isolation import pin_user_state_dirs
+    pin_user_state_dirs(monkeypatch, tmp_path)
+
+
+def _session_resolvable() -> bool:
+    """Whether the real session resolver can identify an owning
+    Claude session from THIS process.
+
+    The two integration tests below exercise the real resolver →
+    ``start_run`` recording/sweep path (the hermetic recording tests
+    live in ``TestFindClaudeAncestor``). Their premise fails where no
+    session identity is establishable at all — no validated session
+    env credential, and no claude ancestor visible from this
+    process's /proc ancestry (a test harness inside its own pid
+    namespace cannot see the session process even when one exists).
+    Probing the resolver itself makes the skip fire exactly when that
+    premise is false, so the tests still run and bite in any harness
+    that CAN see its session.
+    """
+    from core.run.metadata import _get_session_pid
+    return _get_session_pid() is not None
+
+
 def _age_run_tree(d, seconds=7200.0):
     """Back-date a run dir and everything inside it.
 
@@ -43,6 +73,77 @@ def _age_run_tree(d, seconds=7200.0):
 
 
 class TestRunLifecycle(unittest.TestCase):
+
+    def test_legacy_start_golden_bytes_without_receipt(self):
+        import os
+        from datetime import datetime, timezone
+        from unittest.mock import patch
+
+        from core.json import dumps_artifact
+        from core.project.sessions import SessionHostV2CredentialState
+
+        fixed = datetime(2026, 9, 12, 19, 0, tzinfo=timezone.utc)
+
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed if tz is None else fixed.astimezone(tz)
+
+        with TemporaryDirectory() as d, (
+            patch(
+                "core.project.sessions.session_host_v2_credential_state",
+                return_value=SessionHostV2CredentialState.ABSENT,
+            )
+        ), patch("core.run.metadata._get_session_pid", return_value=None), patch(
+            "core.run.metadata.datetime",
+            FixedDateTime,
+        ), patch(
+            "core.run.provenance.build_start_manifest",
+            return_value={"provenance": "golden"},
+        ), patch(
+            "core.run.tmp_reaper.reap_stale_tmp",
+            return_value=None,
+        ), patch(
+            "core.run.tmp_reaper.reap_stale_logs",
+            return_value=None,
+        ), patch(
+            "core.run.tmp_reaper.reap_stale_runs",
+            return_value=[],
+        ), patch(
+            "core.run.pin.resolve_pin_for_start",
+            return_value=(None, "none"),
+        ), patch(
+            "core.run.pin.freeze_run_pin",
+            return_value=None,
+        ), patch(
+            "core.sandbox.summary.set_active_run_dir",
+            return_value=None,
+        ), patch(
+            "core.run.metadata._setup_checklist_symlink",
+            return_value=None,
+        ):
+            os.environ.pop("CLAUDECODE", None)
+            out = Path(d) / "run"
+            start_run(out, "scan", extra={"legacy": True}, target="/target")
+            expected = {
+                "version": 2,
+                "command": "scan",
+                "timestamp": fixed.isoformat(),
+                "status": "running",
+                "manifest": {"provenance": "golden"},
+                "extra": {"legacy": True},
+                "target_path": "/target",
+                "project": None,
+                "project_source": "none",
+            }
+            self.assertEqual(
+                (out / RUN_METADATA_FILE).read_bytes(),
+                (dumps_artifact(expected, indent=2) + "\n").encode("utf-8"),
+            )
+            self.assertNotIn(
+                "session_runtime_receipt",
+                (out / RUN_METADATA_FILE).read_text(encoding="utf-8"),
+            )
 
     def test_start_creates_metadata(self):
         with TemporaryDirectory() as d:
@@ -138,6 +239,11 @@ class TestRunLifecycle(unittest.TestCase):
     def test_start_records_session_pid(self):
         """start_run records session_pid when CLAUDECODE is set."""
         import os
+        if os.environ.get("CLAUDECODE") and not _session_resolvable():
+            self.skipTest("CLAUDECODE is set but no Claude session is "
+                          "resolvable from this process (no session env "
+                          "credential, no claude ancestor in /proc, and "
+                          "the getppid fallback refuses an init parent)")
         with TemporaryDirectory() as d:
             out = Path(d) / "project" / "scan-20260406"
             # CLAUDECODE is set in our test env (running inside CC)
@@ -160,6 +266,12 @@ class TestRunLifecycle(unittest.TestCase):
             self.skipTest("Requires CLAUDECODE environment")
         if not Path("/proc").is_dir():
             self.skipTest("_find_claude_ancestor walks /proc — Linux only")
+        if not _session_resolvable():
+            self.skipTest("CLAUDECODE is set but no Claude session is "
+                          "resolvable from this process (no session env "
+                          "credential, no claude ancestor in /proc, and "
+                          "the getppid fallback refuses an init parent) "
+                          "— the sweep only runs for session-owned starts")
         from core.json import save_json
         with TemporaryDirectory() as d:
             project = Path(d) / "project"
@@ -465,6 +577,12 @@ class TestInferCommandType(unittest.TestCase):
             out = Path(d) / "exploitability-validation-20260406"
             out.mkdir()
             self.assertEqual(infer_command_type(out), "validate")
+
+    def test_from_openant_prefix(self):
+        with TemporaryDirectory() as d:
+            out = Path(d) / "openant_20260504_abc"
+            out.mkdir()
+            self.assertEqual(infer_command_type(out), "openant")
 
     def test_unknown(self):
         with TemporaryDirectory() as d:
@@ -849,6 +967,59 @@ class TestCleanupAbandonedDeadSession(unittest.TestCase):
             self._cleanup(project, alive_pids=set())
             self.assertEqual(self._status(unowned), "running")
 
+    def test_t33_receipt_sibling_with_planted_pid_is_skipped_unchanged(self):
+        from core.json import save_json
+        from core.run import metadata as md
+        from unittest.mock import patch
+
+        with TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            siblings = []
+            for name, extra, top_level in (
+                ("receipt-sibling", {}, True),
+                (
+                    "receipt-extra-sibling",
+                    {md.RUN_RUNTIME_RECEIPT_KEY: {}},
+                    False,
+                ),
+            ):
+                sibling = project / name
+                sibling.mkdir()
+                metadata = {
+                    "version": 2,
+                    "command": "codeql",
+                    "timestamp": "2020-01-01T00:00:00+00:00",
+                    "status": "running",
+                    "session_pid": 40_004,
+                    "extra": extra,
+                }
+                if top_level:
+                    metadata[md.RUN_RUNTIME_RECEIPT_KEY] = {}
+                save_json(
+                    sibling / RUN_METADATA_FILE,
+                    metadata,
+                    mode=0o600,
+                )
+                siblings.append(
+                    (sibling, (sibling / RUN_METADATA_FILE).read_bytes())
+                )
+            with patch(
+                "core.run.metadata.fail_run",
+                side_effect=AssertionError(
+                    "receipt siblings must not reach legacy fail_run"
+                ),
+            ):
+                md._cleanup_abandoned(
+                    project,
+                    "scan",
+                    self.CURRENT_SESSION,
+                )
+            for sibling, before in siblings:
+                self.assertEqual(
+                    (sibling / RUN_METADATA_FILE).read_bytes(),
+                    before,
+                )
+
 
 class TestCleanupAbandonedLiveWorker(unittest.TestCase):
     """Worker-liveness gate on the same-session-retry branch of
@@ -1015,6 +1186,60 @@ class TestAbandonSweepRecovery(unittest.TestCase):
             meta = load_json(out / RUN_METADATA_FILE)
             self.assertEqual(meta["status"], "completed")
 
+    def test_sweep_after_real_failure_is_noop(self):
+        # Race ordering: the run's REAL failure lands first; a sweep
+        # that read status=running moments earlier then delivers its
+        # marker-carrying failed write. The failed→failed merge used
+        # to overwrite the real error with the sweep's message and
+        # plant the marker — a later stray complete_run then took the
+        # recovery branch and laundered the genuine failure green.
+        # The sweep lost the race: its write must be a no-op.
+        with TemporaryDirectory() as d:
+            out = Path(d) / "scan-001"
+            start_run(out, "scan")
+            fail_run(out, "tool crashed with OOM")  # REAL failure first
+            fail_run(out, "session ended without explicit completion",
+                     extra={"abandon_sweep": True}, record_timing=False)
+            meta = load_json(out / RUN_METADATA_FILE)
+            self.assertEqual(meta["status"], "failed")
+            self.assertNotIn("abandon_sweep", meta["extra"])
+            self.assertEqual(meta["extra"]["error"], "tool crashed with OOM")
+            complete_run(out)  # stray finaliser must find no marker
+            meta = load_json(out / RUN_METADATA_FILE)
+            self.assertEqual(meta["status"], "failed")
+            self.assertEqual(meta["extra"]["error"], "tool crashed with OOM")
+
+    def test_sweep_onto_completed_is_noop(self):
+        # Same guard, other terminal state: a marker-carrying failed
+        # write onto completed changes nothing (exercised via
+        # _update_status directly — fail_run's own pre-check already
+        # refuses non-failed terminal states before any side effect).
+        from core.run.metadata import _update_status
+        with TemporaryDirectory() as d:
+            out = Path(d) / "scan-001"
+            start_run(out, "scan")
+            complete_run(out)
+            _update_status(out, "failed",
+                           extra={"abandon_sweep": True,
+                                  "error": "session ended"},
+                           record_timing=False)
+            meta = load_json(out / RUN_METADATA_FILE)
+            self.assertEqual(meta["status"], "completed")
+            self.assertNotIn("abandon_sweep", meta.get("extra") or {})
+
+    def test_genuine_refail_without_marker_still_restamps(self):
+        # Idempotent re-stamp: a second REAL failed write (no marker)
+        # keeps merging — only sweep-stamped writes are dropped.
+        with TemporaryDirectory() as d:
+            out = Path(d) / "scan-001"
+            start_run(out, "scan")
+            fail_run(out, "tool crashed")
+            fail_run(out, "tool crashed (retry also failed)")
+            meta = load_json(out / RUN_METADATA_FILE)
+            self.assertEqual(meta["status"], "failed")
+            self.assertEqual(meta["extra"]["error"],
+                             "tool crashed (retry also failed)")
+
     def test_real_failure_still_refuses_completion(self):
         # Two-direction guard: only sweep-stamped abandons may be
         # overridden — a real failure stays terminal.
@@ -1155,6 +1380,24 @@ class TestCorroborateTargetPath(unittest.TestCase):
             self.assertIn(RUN_METADATA_FILE, msg)
             self.assertIn(str(target), msg)
 
+    def test_mismatch_text_escapes_hostile_candidate(self):
+        """The mismatch description is printed verbatim by every
+        consumer shim, and the candidate is the LLM-writable checklist
+        value — it fires exactly in the tamper-detected case, so the
+        text must be terminal-safe at this chokepoint."""
+        from core.run.metadata import corroborate_target_path
+        with TemporaryDirectory() as d:
+            target = Path(d) / "repo"
+            target.mkdir()
+            run_dir = Path(d) / "run"
+            start_run(run_dir, "audit", target=target)
+            msg = corroborate_target_path(
+                run_dir, f"{d}/evil\x1b[2J\x9bpath")
+            self.assertIsNotNone(msg)
+            self.assertNotIn("\x1b", msg)
+            self.assertNotIn("\x9b", msg)
+            self.assertIn("evil", msg)
+
     def test_symlinked_equivalent_ok(self):
         from core.run.metadata import corroborate_target_path
         with TemporaryDirectory() as d:
@@ -1259,6 +1502,42 @@ class TestSessionIdentityStamp(unittest.TestCase):
             self.assertEqual(meta["session_boot_id"], "boot-x")
             self.assertEqual(meta["session_pidns"], "42")
 
+    def test_start_run_records_verified_host_claim(self):
+        import os
+        from unittest import mock
+
+        from core.project import sessions
+        from core.run.metadata import RUN_METADATA_FILE, start_run
+        from core.startup.host import Frontend, SessionHostClaim
+
+        claim = SessionHostClaim(
+            frontend=Frontend.COPILOT,
+            uid=os.geteuid(),
+            executable=Path("/opt/raptor-test/copilot"),
+            executable_device=10,
+            executable_inode=20,
+        )
+        with TemporaryDirectory() as d, \
+                mock.patch(
+                    "core.run.metadata._get_session_pid",
+                    return_value=12345,
+                ), \
+                mock.patch.object(sessions, "proc_starttime",
+                                  lambda _pid: "1234"), \
+                mock.patch.object(sessions, "boot_id",
+                                  lambda: "boot-x"), \
+                mock.patch.object(sessions, "pidns_id",
+                                  lambda: "42"), \
+                mock.patch.object(sessions, "session_host_claim",
+                                  lambda _pid: claim):
+            out = Path(d) / "run"
+            start_run(out, "scan")
+            meta = load_json(out / RUN_METADATA_FILE)
+            self.assertEqual(meta["session_host"], "copilot")
+            self.assertEqual(meta["session_host_uid"], os.geteuid())
+            self.assertEqual(meta["session_host_exe_dev"], 10)
+            self.assertEqual(meta["session_host_exe_ino"], 20)
+
     def test_stamp_mismatch_reads_dead(self):
         """Live claude process at the pid, WRONG starttime — a recycled
         pid; the owner is dead (closes forever-contention)."""
@@ -1289,6 +1568,222 @@ class TestSessionIdentityStamp(unittest.TestCase):
         with mock.patch.object(sessions, "boot_id", lambda: "b"):
             self.assertTrue(_session_alive_for_meta(meta))
 
+    def test_prior_boot_of_same_machine_reads_dead(self):
+        """A stamp carrying THIS machine's identity but another boot_id
+        was written during a prior boot — provably dead: sweeps may
+        reap it and it releases run contention (no permanent
+        status=running zombies after a reboot)."""
+        from unittest import mock
+
+        from core.project import sessions
+        from core.run.metadata import _session_alive_for_meta
+        meta = self._stamped_meta(1, boot="prior-boot")
+        meta["session_machine_id"] = "same-machine-hash"
+        with mock.patch.object(sessions, "boot_id", lambda: "b"), \
+                mock.patch.object(sessions, "machine_id",
+                                  lambda: "same-machine-hash"):
+            self.assertFalse(_session_alive_for_meta(meta))
+
+    def test_other_machine_stamp_reads_alive(self):
+        """A doctored/foreign machine identity with a foreign boot is
+        NOT provably dead — could be a live run on another machine
+        sharing the filesystem: fail open."""
+        from unittest import mock
+
+        from core.project import sessions
+        from core.run.metadata import _session_alive_for_meta
+        meta = self._stamped_meta(1, boot="prior-boot")
+        meta["session_machine_id"] = "some-other-machine-hash"
+        with mock.patch.object(sessions, "boot_id", lambda: "b"), \
+                mock.patch.object(sessions, "machine_id",
+                                  lambda: "same-machine-hash"):
+            self.assertTrue(_session_alive_for_meta(meta))
+
+    def test_absent_machine_id_keeps_fail_open(self):
+        """Legacy stamp (no machine identity) with a foreign boot keeps
+        today's fail-open alive verdict."""
+        from unittest import mock
+
+        from core.project import sessions
+        from core.run.metadata import _session_alive_for_meta
+        meta = self._stamped_meta(1, boot="prior-boot")
+        with mock.patch.object(sessions, "boot_id", lambda: "b"), \
+                mock.patch.object(sessions, "machine_id",
+                                  lambda: "same-machine-hash"):
+            self.assertTrue(_session_alive_for_meta(meta))
+
+    def test_local_machine_id_unreadable_keeps_fail_open(self):
+        """No local machine identity to compare against — the stamp is
+        unverifiable: fail open."""
+        from unittest import mock
+
+        from core.project import sessions
+        from core.run.metadata import _session_alive_for_meta
+        meta = self._stamped_meta(1, boot="prior-boot")
+        meta["session_machine_id"] = "same-machine-hash"
+        with mock.patch.object(sessions, "boot_id", lambda: "b"), \
+                mock.patch.object(sessions, "machine_id", lambda: None):
+            self.assertTrue(_session_alive_for_meta(meta))
+
+    def test_start_run_records_machine_id(self):
+        import os
+        from unittest import mock
+
+        from core.project import sessions
+        from core.run.metadata import RUN_METADATA_FILE, start_run
+        with TemporaryDirectory() as d, \
+                mock.patch(
+                    "core.run.metadata._get_session_pid",
+                    return_value=os.getpid()), \
+                mock.patch.object(sessions, "proc_starttime",
+                                  lambda pid: "1234"), \
+                mock.patch.object(sessions, "boot_id", lambda: "boot-x"), \
+                mock.patch.object(sessions, "pidns_id", lambda: "42"), \
+                mock.patch.object(sessions, "machine_id",
+                                  lambda: "machine-hash-x"):
+            out = Path(d) / "run"
+            start_run(out, "scan")
+            meta = load_json(out / RUN_METADATA_FILE)
+            self.assertEqual(meta["session_machine_id"], "machine-hash-x")
+
+    def test_start_run_records_harness_session_id(self):
+        import os
+        from unittest import mock
+
+        from core.run.metadata import RUN_METADATA_FILE, start_run
+        sid = "aaaaaaaa-1111-2222-3333-444444444444"
+        with TemporaryDirectory() as d, \
+                mock.patch("core.run.metadata._get_session_pid",
+                           return_value=os.getpid()), \
+                mock.patch.dict(os.environ,
+                                {"CLAUDE_CODE_SESSION_ID": sid}):
+            out = Path(d) / "run"
+            start_run(out, "scan")
+            meta = load_json(out / RUN_METADATA_FILE)
+            self.assertEqual(meta["session_id"], sid)
+
+    def test_start_run_records_copilot_session_id_without_claude_fallback(self):
+        import os
+        from unittest import mock
+
+        from core.run.metadata import RUN_METADATA_FILE, start_run
+        copilot_sid = "bbbbbbbb-1111-2222-3333-444444444444"
+        stale_claude_sid = "aaaaaaaa-1111-2222-3333-444444444444"
+        with TemporaryDirectory() as d, \
+                mock.patch("core.run.metadata._get_session_pid",
+                           return_value=os.getpid()), \
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "RAPTOR_FRONTEND": "copilot",
+                        "COPILOT_AGENT_SESSION_ID": copilot_sid,
+                        "CLAUDE_CODE_SESSION_ID": stale_claude_sid,
+                    },
+                ):
+            out = Path(d) / "run"
+            start_run(out, "scan")
+            meta = load_json(out / RUN_METADATA_FILE)
+            self.assertEqual(meta["session_id"], copilot_sid)
+
+    def test_start_run_ignores_malformed_copilot_session_id(self):
+        import os
+        from unittest import mock
+
+        from core.run.metadata import RUN_METADATA_FILE, start_run
+        with TemporaryDirectory() as d, \
+                mock.patch("core.run.metadata._get_session_pid",
+                           return_value=os.getpid()), \
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "RAPTOR_FRONTEND": "copilot",
+                        "COPILOT_AGENT_SESSION_ID": "hostile\nsession",
+                    },
+                ):
+            out = Path(d) / "run"
+            start_run(out, "scan")
+            meta = load_json(out / RUN_METADATA_FILE)
+            self.assertNotIn("session_id", meta)
+
+    def test_start_run_ignores_malformed_session_id(self):
+        import os
+        from unittest import mock
+
+        from core.run.metadata import RUN_METADATA_FILE, start_run
+        with TemporaryDirectory() as d, \
+                mock.patch("core.run.metadata._get_session_pid",
+                           return_value=os.getpid()), \
+                mock.patch.dict(os.environ,
+                                {"CLAUDE_CODE_SESSION_ID": "no spaces;$(",
+                                 "CLAUDE_SESSION_ID": ""}):
+            out = Path(d) / "run"
+            start_run(out, "scan")
+            meta = load_json(out / RUN_METADATA_FILE)
+            self.assertNotIn("session_id", meta)
+
+    def test_resume_refreshes_session_id(self):
+        import os
+        from unittest import mock
+
+        from core.run.metadata import (
+            RUN_METADATA_FILE,
+            fail_run,
+            resume_run,
+            start_run,
+        )
+        first = "aaaaaaaa-1111-2222-3333-444444444444"
+        second = "bbbbbbbb-5555-6666-7777-888888888888"
+        with TemporaryDirectory() as d:
+            out = Path(d) / "run"
+            with mock.patch("core.run.metadata._get_session_pid",
+                            return_value=11111), \
+                    mock.patch.dict(os.environ,
+                                    {"CLAUDE_CODE_SESSION_ID": first}):
+                start_run(out, "scan")
+            fail_run(out, "interrupted for test", record_timing=False)
+            with mock.patch("core.run.metadata._get_session_pid",
+                            return_value=22222), \
+                    mock.patch.dict(os.environ,
+                                    {"CLAUDE_CODE_SESSION_ID": second}):
+                resume_run(out)
+            meta = load_json(out / RUN_METADATA_FILE)
+            self.assertEqual(meta["session_id"], second)
+
+    def test_cleanup_abandoned_sweeps_prior_boot_zombie(self):
+        """End-to-end: the dead-session sweep branch reaps a run whose
+        stamp is from a prior boot of this machine — the exact
+        post-reboot zombie shape."""
+        from unittest import mock
+
+        from core.project import sessions
+        from core.run import metadata as md
+        from core.run.metadata import RUN_METADATA_FILE, start_run
+        with TemporaryDirectory() as d:
+            out = Path(d) / "old-run"
+            with mock.patch("core.run.metadata._get_session_pid",
+                            return_value=33333), \
+                    mock.patch.object(sessions, "proc_starttime",
+                                      lambda pid: "7"), \
+                    mock.patch.object(sessions, "boot_id",
+                                      lambda: "prior-boot"), \
+                    mock.patch.object(sessions, "pidns_id", lambda: "1"), \
+                    mock.patch.object(sessions, "machine_id",
+                                      lambda: "same-machine-hash"):
+                start_run(out, "scan")
+            # Age it past the freshness gate.
+            meta = load_json(out / RUN_METADATA_FILE)
+            meta["timestamp"] = "2020-01-01T00:00:00+00:00"
+            from core.json import save_json
+            save_json(out / RUN_METADATA_FILE, meta)
+            # Rebooted: same machine, new boot id.
+            with mock.patch.object(sessions, "boot_id", lambda: "b"), \
+                    mock.patch.object(sessions, "pidns_id", lambda: "1"), \
+                    mock.patch.object(sessions, "machine_id",
+                                      lambda: "same-machine-hash"):
+                md._cleanup_abandoned(Path(d), "scan", 44444)
+            meta = load_json(out / RUN_METADATA_FILE)
+            self.assertEqual(meta["status"], "failed")
+
     def test_unstamped_uses_legacy_comm_check(self):
         import os
         from unittest import mock
@@ -1314,6 +1809,21 @@ class TestSessionIdentityStamp(unittest.TestCase):
             resume_run,
             start_run,
         )
+        from core.startup.host import Frontend, SessionHostClaim
+        old_claim = SessionHostClaim(
+            frontend=Frontend.CLAUDE,
+            uid=1000,
+            executable=Path("/opt/old/claude"),
+            executable_device=10,
+            executable_inode=20,
+        )
+        new_claim = SessionHostClaim(
+            frontend=Frontend.COPILOT,
+            uid=1000,
+            executable=Path("/opt/new/copilot"),
+            executable_device=30,
+            executable_inode=40,
+        )
         with TemporaryDirectory() as d:
             out = Path(d) / "run"
             with mock.patch("core.run.metadata._get_session_pid",
@@ -1322,18 +1832,29 @@ class TestSessionIdentityStamp(unittest.TestCase):
                                       lambda pid: "old-start"), \
                     mock.patch.object(sessions, "boot_id", lambda: "b"), \
                     mock.patch.object(sessions, "pidns_id", lambda: "1"):
-                start_run(out, "scan")
+                with mock.patch.object(
+                    sessions, "session_host_claim",
+                    lambda _pid: old_claim,
+                ):
+                    start_run(out, "scan")
             fail_run(out, "interrupted for test", record_timing=False)
             with mock.patch("core.run.metadata._get_session_pid",
                             return_value=22222), \
                     mock.patch.object(sessions, "proc_starttime",
                                       lambda pid: "new-start"), \
                     mock.patch.object(sessions, "boot_id", lambda: "b"), \
-                    mock.patch.object(sessions, "pidns_id", lambda: "1"):
+                    mock.patch.object(sessions, "pidns_id", lambda: "1"), \
+                    mock.patch.object(
+                        sessions, "session_host_claim",
+                        lambda _pid: new_claim,
+                    ):
                 resume_run(out)
             meta = load_json(out / RUN_METADATA_FILE)
             self.assertEqual(meta["session_pid"], 22222)
             self.assertEqual(meta["session_start"], "new-start")
+            self.assertEqual(meta["session_host"], "copilot")
+            self.assertEqual(meta["session_host_exe_dev"], 30)
+            self.assertEqual(meta["session_host_exe_ino"], 40)
 
     def test_cleanup_abandoned_sweeps_recycled_claude_pid(self):
         """The dead-session branch fires on a stamped mismatch even when
@@ -1369,3 +1890,1022 @@ class TestSessionIdentityStamp(unittest.TestCase):
                 md._cleanup_abandoned(Path(d), "scan", 44444)
             meta = load_json(out / RUN_METADATA_FILE)
             self.assertEqual(meta["status"], "failed")
+
+    def test_malformed_host_metadata_is_not_live(self):
+        import os
+
+        from core.run.metadata import _session_alive_for_meta
+
+        meta = self._stamped_meta(os.getpid())
+        meta["session_host"] = "copilot"
+        with self.assertLogs(
+            "core.run.metadata", level="WARNING"
+        ) as captured:
+            self.assertFalse(_session_alive_for_meta(meta))
+        self.assertIn(
+            "malformed session host claim",
+            "\n".join(captured.output),
+        )
+
+    def test_strong_host_metadata_requires_registry_corroboration(self):
+        import os
+        from unittest import mock
+
+        from core.project import sessions
+        from core.run.metadata import _session_alive_for_meta
+        from core.startup.host import Frontend, SessionHostClaim
+
+        claim = SessionHostClaim(
+            frontend=Frontend.COPILOT,
+            uid=os.geteuid(),
+            executable=Path("/opt/raptor-test/copilot"),
+            executable_device=10,
+            executable_inode=20,
+        )
+        meta = {
+            **self._stamped_meta(
+                12345,
+                start="same-start",
+                boot="same-boot",
+                pidns="same-ns",
+            ),
+            **claim.metadata_fields(),
+        }
+        with TemporaryDirectory() as d, \
+                mock.patch.object(
+                    sessions, "SESSIONS_DIR", Path(d) / "sessions.d"
+                ), \
+                mock.patch.object(sessions, "_pid_running",
+                                  lambda pid: pid == 12345), \
+                mock.patch.object(sessions, "proc_starttime",
+                                  lambda _pid: "same-start"), \
+                mock.patch.object(sessions, "boot_id",
+                                  lambda: "same-boot"), \
+                mock.patch.object(sessions, "pidns_id",
+                                  lambda: "same-ns"), \
+                mock.patch.object(sessions, "_comm",
+                                  lambda _pid: "copilot"), \
+                mock.patch.object(sessions, "_process_uid",
+                                  lambda _pid: os.geteuid()), \
+                mock.patch.object(
+                    sessions,
+                    "_process_executable_identity",
+                    lambda _pid: (10, 20),
+                ):
+            self.assertFalse(_session_alive_for_meta(meta))
+            sessions.SESSIONS_DIR.mkdir(parents=True)
+            entry = {
+                "v": "2",
+                "project": "-",
+                "since": "2026-09-11T00:00:00+00:00",
+                "starttime": "same-start",
+                "boot_id": "same-boot",
+                "pidns": "same-ns",
+                "token": "ab" * 16,
+                **claim.session_fields(),
+            }
+            (sessions.SESSIONS_DIR / "12345").write_text(
+                "".join(f"{key}={value}\n"
+                        for key, value in entry.items()),
+                encoding="utf-8",
+            )
+            self.assertTrue(_session_alive_for_meta(meta))
+            without_namespace = dict(meta)
+            without_namespace.pop("session_pidns")
+            self.assertFalse(_session_alive_for_meta(without_namespace))
+            entry["token"] = ""
+            (sessions.SESSIONS_DIR / "12345").write_text(
+                "".join(f"{key}={value}\n"
+                        for key, value in entry.items()),
+                encoding="utf-8",
+            )
+            self.assertFalse(_session_alive_for_meta(meta))
+
+
+
+class TestMetadataReadBudget(unittest.TestCase):
+    """Every reader of the sandbox-writable ``.raptor-run.json`` pays
+    the shared byte budget: an oversize plant costs no disk (sparse)
+    and OOM-killed the uncapped readers — including the contention
+    gate every future start in the project runs, the victim run's own
+    finalisers, and resume."""
+
+    def _sparse_meta(self, run_dir: Path) -> None:
+        from core.run.metadata import RUN_METADATA_MAX_BYTES
+        with (run_dir / RUN_METADATA_FILE).open("wb") as f:
+            f.truncate(RUN_METADATA_MAX_BYTES + 1)
+
+    def test_load_meta_refuses_oversize(self):
+        from core.run.metadata import _load_meta
+        with TemporaryDirectory() as d:
+            run = Path(d)
+            self._sparse_meta(run)
+            self.assertIsNone(_load_meta(run / RUN_METADATA_FILE))
+
+    def test_oversize_sibling_never_blocks_contention_gate(self):
+        # The gate loads EVERY sibling's metadata inside start_run —
+        # one planted sparse file must degrade to "no conflict", not
+        # buffer the payload or block the start.
+        from core.run.metadata import _live_conflicting_run
+        with TemporaryDirectory() as d:
+            project = Path(d)
+            me = project / "run_me"
+            me.mkdir()
+            sibling = project / "run_other"
+            sibling.mkdir()
+            self._sparse_meta(sibling)
+            self.assertIsNone(
+                _live_conflicting_run(project, me, None))
+
+    def test_oversize_meta_fails_resume_closed(self):
+        from core.run.metadata import resume_run
+        with TemporaryDirectory() as d:
+            run = Path(d)
+            self._sparse_meta(run)
+            # Over-budget follows the malformed/missing contract:
+            # refuse the resume, never materialise the payload.
+            with self.assertRaises((FileNotFoundError, ValueError)):
+                resume_run(run)
+
+    def test_every_metadata_read_routes_through_the_budget(self):
+        # Closure oracle (the intake-bounds commit's own pattern):
+        # no bare load_json may target the metadata file — readers
+        # go through _load_meta / load_run_metadata, so the budget
+        # is single-homed in fact, not just in the comment.
+        import ast
+        import inspect
+
+        from core.run import metadata as md
+        src = inspect.getsource(md)
+        tree = ast.parse(src)
+        offenders: list[int] = []
+        funcs = [
+            n for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+
+        def _enclosing(lineno: int) -> str:
+            best, span = "<module>", None
+            for f in funcs:
+                if f.lineno <= lineno <= (f.end_lineno or f.lineno):
+                    s = (f.end_lineno or f.lineno) - f.lineno
+                    if span is None or s < span:
+                        best, span = f.name, s
+            return best
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = ""
+            if isinstance(node.func, ast.Name):
+                name = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                name = node.func.attr
+            if name != "load_json":
+                continue
+            if _enclosing(node.lineno) in ("_load_meta",):
+                continue  # the budgeted loader's own body
+            arg_src = (ast.get_source_segment(src, node.args[0])
+                       if node.args else "") or ""
+            has_cap = any(k.arg == "max_bytes" for k in node.keywords)
+            if has_cap:
+                continue
+            if "checklist" in arg_src:
+                # checklist.json readers carry the run-artifact
+                # budget class; the coverage/run closure test owns
+                # their cap spelling.
+                continue
+            offenders.append(f"{node.lineno}: load_json({arg_src})")
+        self.assertEqual(
+            offenders, [],
+            "bare load_json in metadata.py — metadata readers route "
+            "through _load_meta/load_run_metadata; other artifacts "
+            f"pass max_bytes: {offenders}")
+
+
+class MetadataLockTamperTest(unittest.TestCase):
+    """The `.lock` sibling lives inside the sandbox child's write
+    grant (the metadata FILE is namespace-masked; the sibling is not)
+    — the lock open must not follow a planted symlink, must not block
+    on a planted FIFO, and must degrade LOUDLY, never silently."""
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.run_dir = Path(self._tmp.name)
+        self.meta_path = self.run_dir / ".raptor-run.json"
+        self.lock_path = self.run_dir / ".raptor-run.json.lock"
+
+    def test_planted_symlink_not_followed(self):
+        import os
+
+        from core.run.metadata import _metadata_lock
+        victim = self.run_dir / "attacker-chosen-path"
+        os.symlink(victim, self.lock_path)
+        with self.assertLogs("core.run.metadata", level="WARNING") as logs:
+            with _metadata_lock(self.meta_path):
+                pass
+        self.assertFalse(victim.exists(),
+                         "symlink was followed — file created at the "
+                         "attacker-chosen path")
+        self.assertTrue(any("UNSERIALISED" in m for m in logs.output))
+
+    def test_planted_fifo_does_not_wedge(self):
+        import os
+        import time
+
+        from core.run.metadata import _metadata_lock
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("no mkfifo on this platform")
+        os.mkfifo(self.lock_path)
+        start = time.monotonic()
+        with self.assertLogs("core.run.metadata", level="WARNING"):
+            with _metadata_lock(self.meta_path):
+                pass
+        self.assertLess(time.monotonic() - start, 2.0,
+                        "FIFO open blocked the lifecycle finaliser")
+
+    def test_planted_fifo_with_reader_refused(self):
+        import os
+        import time
+
+        from core.run.metadata import _metadata_lock
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("no mkfifo on this platform")
+        os.mkfifo(self.lock_path)
+        rfd = os.open(self.lock_path, os.O_RDONLY | os.O_NONBLOCK)
+        self.addCleanup(os.close, rfd)
+        start = time.monotonic()
+        with self.assertLogs("core.run.metadata", level="WARNING") as logs:
+            with _metadata_lock(self.meta_path):
+                pass
+        self.assertLess(time.monotonic() - start, 2.0)
+        self.assertTrue(any("not a regular file" in m for m in logs.output))
+
+    def test_regular_lock_flow_stays_silent_and_locks(self):
+        import fcntl
+        import os
+
+        from core.run.metadata import _metadata_lock
+        with _metadata_lock(self.meta_path):
+            self.assertTrue(self.lock_path.is_file())
+            # A second would-be locker cannot take the flock while the
+            # window is held.
+            fd = os.open(self.lock_path, os.O_WRONLY)
+            try:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd)
+
+
+class MetadataReaderTreeClosureTest(unittest.TestCase):
+    """Tree-wide widening of the module-scoped budget oracle above.
+
+    The module-scoped oracle (`inspect.getsource(core.run.metadata)`)
+    structurally cannot see readers of the SAME sandbox-writable file
+    in sibling packages — and they re-grew: sweep, CLI, sessions, and
+    rename readers all loaded `.raptor-run.json` bare. Derive the
+    reader set mechanically instead: every function in core/project +
+    core/run + core/coverage whose source names the metadata file
+    (RUN_METADATA_FILE or the literal) must pass ``max_bytes=`` on
+    each load_json call inside it, or route through
+    _load_meta/load_run_metadata. Heuristic residual (documented): a
+    reader that builds the path in one function and loads it in
+    another, or reads via read_text, is outside this derivation —
+    the per-member behaviour tests carry those.
+    """
+
+    def test_metadata_file_readers_carry_a_budget(self):
+        import ast
+
+        repo = Path(__file__).resolve().parents[3]
+        markers = ("RUN_METADATA_FILE", ".raptor-run.json")
+        offenders: list[str] = []
+        for pkg in ("core/project", "core/run", "core/coverage"):
+            for py in sorted((repo / pkg).rglob("*.py")):
+                if "tests" in py.parts or py.name.startswith("test_"):
+                    continue
+                src = py.read_text(encoding="utf-8")
+                if not any(m in src for m in markers):
+                    continue
+                tree = ast.parse(src)
+                for fn in ast.walk(tree):
+                    if not isinstance(fn, (ast.FunctionDef,
+                                           ast.AsyncFunctionDef)):
+                        continue
+                    if fn.name in ("_load_meta", "load_run_metadata"):
+                        continue  # the budgeted loaders themselves
+                    fsrc = ast.get_source_segment(src, fn) or ""
+                    if not any(m in fsrc for m in markers):
+                        continue
+                    for node in ast.walk(fn):
+                        if not isinstance(node, ast.Call):
+                            continue
+                        name = ""
+                        if isinstance(node.func, ast.Name):
+                            name = node.func.id
+                        elif isinstance(node.func, ast.Attribute):
+                            name = node.func.attr
+                        if name not in ("load_json", "_lj"):
+                            continue
+                        if any(k.arg == "max_bytes"
+                               for k in node.keywords):
+                            continue
+                        arg = (ast.get_source_segment(src, node.args[0])
+                               if node.args else "") or ""
+                        offenders.append(
+                            f"{py.relative_to(repo)}:{node.lineno} "
+                            f"{fn.name}() load_json({arg[:60]})")
+        self.assertEqual(
+            offenders, [],
+            "bare load_json inside a metadata-file-reading function — "
+            "route through _load_meta/load_run_metadata or pass "
+            f"max_bytes: {offenders}")
+
+    def test_oracle_is_not_vacuous(self):
+        # Two-direction guard: the derivation must actually see the
+        # known reader set (sweep + gate homes at minimum).
+        import ast
+
+        repo = Path(__file__).resolve().parents[3]
+        seen = set()
+        markers = ("RUN_METADATA_FILE", ".raptor-run.json")
+        for pkg in ("core/project", "core/run", "core/coverage"):
+            for py in sorted((repo / pkg).rglob("*.py")):
+                if "tests" in py.parts or py.name.startswith("test_"):
+                    continue
+                src = py.read_text(encoding="utf-8")
+                if not any(m in src for m in markers):
+                    continue
+                tree = ast.parse(src)
+                for fn in ast.walk(tree):
+                    if isinstance(fn, (ast.FunctionDef,
+                                       ast.AsyncFunctionDef)):
+                        fsrc = ast.get_source_segment(src, fn) or ""
+                        if any(m in fsrc for m in markers):
+                            seen.add((py.name, fn.name))
+        self.assertIn(("project.py", "_sweep_stale"), seen)
+        self.assertIn(("metadata.py", "_live_conflicting_run"), seen)
+        self.assertGreater(len(seen), 10)
+
+
+class UpdateStatusUnreadableMarkerTest(unittest.TestCase):
+    """A marker that EXISTS but fails the budgeted read must refuse
+    with the malformed-on-disk contract (ValueError), not claim the
+    file is missing — the FileNotFoundError misled callers that had
+    just enumerated it."""
+
+    def test_oversize_marker_raises_value_error(self):
+        import json as _json
+
+        from core.run.metadata import _update_status
+        with TemporaryDirectory() as d:
+            run = Path(d)
+            (run / RUN_METADATA_FILE).write_text(_json.dumps({
+                "status": "running",
+                "pad": "A" * (2 * 1024 * 1024),
+            }), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                _update_status(run, "failed")
+
+    def test_missing_marker_still_file_not_found(self):
+        from core.run.metadata import _update_status
+        with TemporaryDirectory() as d:
+            with self.assertRaises(FileNotFoundError):
+                _update_status(Path(d), "failed")
+
+
+class TerminalFinaliserPreCheckTest(unittest.TestCase):
+    """fail_run's already-terminal pre-check, hoisted so ALL the
+    non-complete finalisers share it: a supervisor SIGTERM drain (or
+    sweep) racing a just-completed run must not re-run sandbox
+    summary/triage, manifest conversion, or journal merge against the
+    terminal run dir — and a failed->failed repeat is the same shape."""
+
+    _SIDE_EFFECTS = (
+        "_finalize_sandbox_summary",
+        "_finalize_sandbox_triage",
+        "_convert_reads_manifest",
+        "_merge_run_journal",
+    )
+
+    def _run_dir(self, tmp: Path, status: str) -> Path:
+        import json as _json
+        (tmp / RUN_METADATA_FILE).write_text(_json.dumps({
+            "version": 2, "command": "scan",
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "status": status,
+        }), encoding="utf-8")
+        return tmp
+
+    def _record_side_effects(self, stack):
+        from unittest.mock import patch as _patch
+        calls: list[str] = []
+        for name in self._SIDE_EFFECTS:
+            def _mk(n):
+                return lambda *a, **k: calls.append(n) or None
+            stack.enter_context(_patch(
+                f"core.run.metadata.{name}", _mk(name)))
+        return calls
+
+    def test_finalisers_refuse_completed_run_without_side_effects(self):
+        import contextlib as _ctx
+
+        from core.run.metadata import cancel_run, fail_run, interrupt_run
+        for finaliser in (fail_run, cancel_run, interrupt_run):
+            with TemporaryDirectory() as d:
+                run = self._run_dir(Path(d), "completed")
+                with _ctx.ExitStack() as stack:
+                    calls = self._record_side_effects(stack)
+                    finaliser(run)
+                self.assertEqual(
+                    calls, [],
+                    f"{finaliser.__name__} ran side effects against a "
+                    f"completed run")
+                self.assertEqual(
+                    load_json(run / RUN_METADATA_FILE)["status"],
+                    "completed")
+
+    def test_cancel_and_interrupt_refuse_failed_run(self):
+        # Only fail_run keeps the failed->failed lane (the pinned
+        # sweep-consume / idempotent-re-stamp contracts); the other
+        # finalisers refuse every terminal state.
+        import contextlib as _ctx
+
+        from core.run.metadata import cancel_run, interrupt_run
+        for finaliser in (cancel_run, interrupt_run):
+            with TemporaryDirectory() as d:
+                run = self._run_dir(Path(d), "failed")
+                with _ctx.ExitStack() as stack:
+                    calls = self._record_side_effects(stack)
+                    finaliser(run)
+                self.assertEqual(calls, [], finaliser.__name__)
+
+    def test_fail_run_keeps_the_refail_merge_lane(self):
+        # Two-direction: a genuine failed->failed re-stamp still
+        # lands (abandon-marker consumption + error refresh depend
+        # on it — pinned by the abandon-sweep recovery tests).
+        from core.run.metadata import fail_run
+        with TemporaryDirectory() as d:
+            run = self._run_dir(Path(d), "failed")
+            fail_run(run, "retry also failed")
+            meta = load_json(run / RUN_METADATA_FILE)
+            self.assertEqual(meta["extra"]["error"], "retry also failed")
+
+    def test_running_run_still_finalises(self):
+        # Two-direction: the pre-check must not turn the finalisers off.
+        import contextlib as _ctx
+
+        from core.run.metadata import interrupt_run
+        with TemporaryDirectory() as d:
+            run = self._run_dir(Path(d), "running")
+            with _ctx.ExitStack() as stack:
+                calls = self._record_side_effects(stack)
+                interrupt_run(run, "drain")
+            self.assertIn("_finalize_sandbox_summary", calls)
+            self.assertEqual(
+                load_json(run / RUN_METADATA_FILE)["status"],
+                "interrupted")
+
+
+class BudgetConstantSingleHomeTest(unittest.TestCase):
+    """metadata.py declares the run-metadata read budget
+    "single-homed" — but pin.py, tmp_reaper.py, and sessions.py carry
+    deliberate import-light mirrors (metadata imports them at run
+    time, so they cannot import it back at module init). The mirrors'
+    VALUES agreed only by coincidence; this pins them, so a budget or
+    filename change fails here until every spelling moves together."""
+
+    def test_budget_mirrors_agree(self):
+        from core.project import sessions
+        from core.run import pin, tmp_reaper
+        from core.run.metadata import RUN_METADATA_MAX_BYTES
+        self.assertEqual(pin._MAX_RUN_META_BYTES, RUN_METADATA_MAX_BYTES)
+        self.assertEqual(tmp_reaper._RUN_METADATA_MAX_BYTES,
+                         RUN_METADATA_MAX_BYTES)
+        self.assertEqual(sessions._MAX_ENTRY_BYTES * 16,
+                         RUN_METADATA_MAX_BYTES)
+
+    def test_filename_mirrors_agree(self):
+        from core.run import pin, tmp_reaper
+        self.assertEqual(pin.RUN_METADATA_FILE, RUN_METADATA_FILE)
+        self.assertEqual(tmp_reaper._RUN_METADATA_FILE,
+                         RUN_METADATA_FILE)
+
+
+class PromoteChecklistStreamingTest(unittest.TestCase):
+    """Promotion folds older checklists one at a time (newest is the
+    base) instead of accumulating every sibling in memory; the merged
+    result is unchanged."""
+
+    def test_checked_by_carries_forward_across_three_runs(self):
+        import json as _json
+
+        from core.run.metadata import _promote_checklist
+        with TemporaryDirectory() as d:
+            proj = Path(d)
+            base_cl = {"files": [{"path": "a.c", "lines": 9, "items": [
+                {"name": "f1", "line_start": 1, "line_end": 9}]}]}
+            for i, checked in enumerate((["semgrep"], ["llm"], [])):
+                run = proj / f"scan-2026010{i + 1}_000000"
+                run.mkdir()
+                cl = _json.loads(_json.dumps(base_cl))
+                if checked:
+                    cl["files"][0]["items"][0]["checked_by"] = checked
+                (run / "checklist.json").write_text(_json.dumps(cl))
+                stamp = 1_700_000_000 + i
+                import os as _os
+                _os.utime(run, (stamp, stamp))
+            _promote_checklist(proj)
+            promoted = _json.loads(
+                (proj / "checklist.json").read_text())
+            got = set(promoted["files"][0]["items"][0].get(
+                "checked_by", []))
+            self.assertEqual(got, {"semgrep", "llm"})
+
+
+class PromoteChecklistFrameGateTest(unittest.TestCase):
+    """Run-local promotion candidates pass the checklist frame gate.
+
+    ``save_checklist`` RE-STAMPS the promoted document at project
+    level, so an ungated tampered run-local candidate would launder a
+    frame every direct read refuses into a freshly-verified project
+    checklist. Tampered candidates are skipped (loud warning naming
+    the file); unstamped legacy candidates keep promoting at the
+    legacy tier; verified candidates promote as before.
+    """
+
+    def _doc(self, name="f1"):
+        return {"files": [{"path": "a.c", "lines": 9, "items": [
+            {"name": name, "line_start": 1, "line_end": 9}]}]}
+
+    def test_tampered_candidate_refused(self):
+        import json as _json
+        import logging
+
+        from core.inventory import read_checklist, save_checklist
+        from core.run.metadata import _promote_checklist
+        with TemporaryDirectory() as d:
+            proj = Path(d)
+            run = proj / "run_001"
+            run.mkdir()
+            save_checklist(run, self._doc())
+            cl = run / "checklist.json"
+            on_disk = _json.loads(cl.read_text())
+            on_disk["files"][0]["items"][0]["name"] = "backdoor"
+            cl.write_text(_json.dumps(on_disk))  # valid-stamp-then-edited
+
+            records = []
+            handler = logging.Handler()
+            handler.emit = records.append
+            logging.getLogger("core.inventory").addHandler(handler)
+            try:
+                _promote_checklist(proj)
+            finally:
+                logging.getLogger("core.inventory").removeHandler(handler)
+
+            # Fail-closed: the only candidate was refused — nothing
+            # promoted, the planted content never reaches the project
+            # checklist.
+            self.assertFalse((proj / "checklist.json").exists())
+            self.assertEqual(read_checklist(proj), {})
+            warned = " ".join(r.getMessage() for r in records)
+            self.assertIn("FAILED frame authentication", warned)
+            self.assertIn(str(cl), warned)  # names the refused file
+
+    def test_tampered_candidate_skipped_to_next_newest(self):
+        import json as _json
+
+        from core.inventory import read_checklist, save_checklist
+        from core.run.metadata import _promote_checklist
+        with TemporaryDirectory() as d:
+            import os as _os
+            proj = Path(d)
+            old_run = proj / "run_001"
+            old_run.mkdir()
+            save_checklist(old_run, self._doc("honest"))
+            new_run = proj / "run_002"
+            new_run.mkdir()
+            save_checklist(new_run, self._doc("victim"))
+            cl = new_run / "checklist.json"
+            on_disk = _json.loads(cl.read_text())
+            on_disk["files"][0]["items"][0]["name"] = "backdoor"
+            cl.write_text(_json.dumps(on_disk))
+            # Pin the ordering AFTER all writes: the tampered run is
+            # the newest candidate, the honest one next.
+            _os.utime(old_run, (1_700_000_000, 1_700_000_000))
+            _os.utime(new_run, (1_700_000_100, 1_700_000_100))
+
+            _promote_checklist(proj)
+
+            promoted = read_checklist(proj)
+            names = [i["name"] for f in promoted["files"]
+                     for i in f["items"]]
+            self.assertEqual(names, ["honest"])  # next-newest won
+            self.assertNotIn(
+                "backdoor", (proj / "checklist.json").read_text())
+
+    def test_unstamped_candidate_still_promotes(self):
+        import json as _json
+
+        from core.inventory import checklist_frame_mac, read_checklist
+        from core.run.metadata import _promote_checklist
+        with TemporaryDirectory() as d:
+            proj = Path(d)
+            run = proj / "run_001"
+            run.mkdir()
+            # Token-less pre-MAC legacy candidate: never refused.
+            (run / "checklist.json").write_text(_json.dumps(self._doc()))
+
+            _promote_checklist(proj)
+
+            promoted = read_checklist(proj)
+            names = [i["name"] for f in promoted["files"]
+                     for i in f["items"]]
+            self.assertEqual(names, ["f1"])
+            # The project copy is freshly stamped by save_checklist.
+            on_disk = _json.loads((proj / "checklist.json").read_text())
+            self.assertIn(checklist_frame_mac.FRAME_TOKEN_KEY, on_disk)
+
+    def test_verified_candidate_promotes(self):
+        from core.inventory import read_checklist, save_checklist
+        from core.run.metadata import _promote_checklist
+        with TemporaryDirectory() as d:
+            proj = Path(d)
+            run = proj / "run_001"
+            run.mkdir()
+            save_checklist(run, self._doc())
+
+            _promote_checklist(proj)
+
+            promoted = read_checklist(proj)
+            names = [i["name"] for f in promoted["files"]
+                     for i in f["items"]]
+            self.assertEqual(names, ["f1"])
+
+
+class ChecklistInheritanceTargetMatchTest(_ProjectRunCase):
+    """A run only inherits the project-level checklist when the
+    checklist's recorded ``target_path`` matches the run's target —
+    inheriting an inventory built for a different tree silently audits
+    target B against target A's items. Unknowns (target-less starts,
+    legacy checklists without ``target_path``) preserve the historical
+    inheritance: the guard acts only on a positive mismatch."""
+
+    def _project_with_checklist(self, proj, target_path=None):
+        import json as _json
+        proj = Path(proj)
+        proj.mkdir(parents=True, exist_ok=True)
+        cl = {"files": [{"path": "a.c", "lines": 9, "items": [
+            {"name": "f1", "line_start": 1, "line_end": 9}]}]}
+        if target_path is not None:
+            cl["target_path"] = str(target_path)
+        (proj / "checklist.json").write_text(_json.dumps(cl))
+        return proj
+
+    def test_mismatched_target_refuses_symlink_with_warning(self):
+        with TemporaryDirectory() as d:
+            target_a = Path(d) / "target-a"
+            target_b = Path(d) / "target-b"
+            target_a.mkdir()
+            target_b.mkdir()
+            proj = self._project_with_checklist(
+                Path(d) / "proj", target_path=target_a)
+            proj_cl = (proj / "checklist.json").read_bytes()
+            run = proj / "audit-20260923_000000"
+            with self._as_project(proj), \
+                    self.assertLogs("raptor.core.run.metadata",
+                                    level="WARNING") as logs:
+                start_run(run, "audit", target=str(target_b))
+            self.assertFalse((run / "checklist.json").exists(),
+                             "mismatched checklist must not be inherited")
+            joined = "\n".join(logs.output)
+            self.assertIn(str(target_a), joined)
+            self.assertIn(str(target_b), joined)
+            # The project-level original is untouched — it belongs to
+            # target A's runs.
+            self.assertEqual((proj / "checklist.json").read_bytes(),
+                             proj_cl)
+
+    def test_file_target_inside_recorded_tree_is_a_mismatch(self):
+        # The inventory's items describe the TREE, not the file — a
+        # narrower target still gets its own inventory.
+        with TemporaryDirectory() as d:
+            target_a = Path(d) / "target-a"
+            target_a.mkdir()
+            inner = target_a / "a.c"
+            inner.write_text("int f1(void) { return 0; }\n")
+            proj = self._project_with_checklist(
+                Path(d) / "proj", target_path=target_a)
+            run = proj / "audit-20260923_000001"
+            with self._as_project(proj), \
+                    self.assertLogs("raptor.core.run.metadata",
+                                    level="WARNING"):
+                start_run(run, "audit", target=str(inner))
+            self.assertFalse((run / "checklist.json").exists())
+
+    def test_matching_target_inherits_as_before(self):
+        with TemporaryDirectory() as d:
+            target_a = Path(d) / "target-a"
+            target_a.mkdir()
+            proj = self._project_with_checklist(
+                Path(d) / "proj", target_path=target_a)
+            run = proj / "audit-20260923_000002"
+            with self._as_project(proj):
+                start_run(run, "audit", target=str(target_a))
+            self.assertTrue((run / "checklist.json").is_symlink())
+
+    def test_no_recorded_target_inherits_as_before(self):
+        with TemporaryDirectory() as d:
+            target_b = Path(d) / "target-b"
+            target_b.mkdir()
+            proj = self._project_with_checklist(Path(d) / "proj")
+            run = proj / "audit-20260923_000003"
+            with self._as_project(proj):
+                start_run(run, "audit", target=str(target_b))
+            self.assertTrue((run / "checklist.json").is_symlink())
+
+    def test_relative_recorded_target_fails_open(self):
+        # A relative recorded path lost its anchor — it cannot be
+        # compared, so the guard must not fire on it.
+        with TemporaryDirectory() as d:
+            target_b = Path(d) / "target-b"
+            target_b.mkdir()
+            proj = self._project_with_checklist(
+                Path(d) / "proj", target_path="src/tree")
+            run = proj / "audit-20260923_000005"
+            with self._as_project(proj):
+                start_run(run, "audit", target=str(target_b))
+            self.assertTrue((run / "checklist.json").is_symlink())
+
+    def test_symlink_alias_spelling_of_same_target_inherits(self):
+        # resolve() equality is the comparison contract: a checklist
+        # recorded under an ALIAS spelling (symlink) of the run's
+        # target is the SAME tree and must keep inheriting — the
+        # accumulation contract (checked_by carry-forward across
+        # runs) lives on this symlink.
+        import os
+        with TemporaryDirectory() as d:
+            target_a = Path(d) / "target-a"
+            target_a.mkdir()
+            alias = Path(d) / "alias"
+            os.symlink(target_a, alias)
+            proj = self._project_with_checklist(
+                Path(d) / "proj", target_path=alias)
+            run = proj / "audit-20260923_000006"
+            with self._as_project(proj):
+                start_run(run, "audit", target=str(target_a))
+            self.assertTrue((run / "checklist.json").is_symlink())
+
+    def test_trailing_slash_spelling_inherits(self):
+        with TemporaryDirectory() as d:
+            target_a = Path(d) / "target-a"
+            target_a.mkdir()
+            proj = self._project_with_checklist(
+                Path(d) / "proj", target_path=str(target_a) + "/")
+            run = proj / "audit-20260923_000007"
+            with self._as_project(proj):
+                start_run(run, "audit", target=str(target_a))
+            self.assertTrue((run / "checklist.json").is_symlink())
+
+    def test_resolve_runtimeerror_fails_open_no_lifecycle_damage(self):
+        # Python 3.10-3.12 raise RuntimeError from Path.resolve() on
+        # symlink loops (this host resolves loops quietly, so the
+        # error is injected). A planted loop must fail OPEN: the
+        # inheritance is kept, and start_run completes normally — it
+        # must never fail the whole lifecycle start over an
+        # uncomparable path.
+        from unittest import mock
+        sentinel = "/loop-sentinel-recorded"
+        real_resolve = Path.resolve
+
+        def _looping_resolve(self, *a, **k):
+            if str(self) == sentinel:
+                raise RuntimeError(f"Symlink loop from {sentinel!r}")
+            return real_resolve(self, *a, **k)
+
+        with TemporaryDirectory() as d:
+            target_b = Path(d) / "target-b"
+            target_b.mkdir()
+            proj = self._project_with_checklist(
+                Path(d) / "proj", target_path=sentinel)
+            run = proj / "audit-20260923_000008"
+            with self._as_project(proj), \
+                    mock.patch.object(Path, "resolve", _looping_resolve):
+                start_run(run, "audit", target=str(target_b))
+            # Fail-open: inheritance preserved, run metadata intact.
+            self.assertTrue((run / "checklist.json").is_symlink())
+            meta = load_json(run / RUN_METADATA_FILE)
+            self.assertEqual(meta["status"], "running")
+
+class TestStrongHostMetadataConditions(unittest.TestCase):
+    """A4: strong metadata never reaches the foreign-stamp fail-open
+    path without a valid registry claim and token-shaped witness."""
+
+    PID = 42430
+
+    def setUp(self):
+        from unittest import mock
+
+        from core.project import sessions
+
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.sessions_dir = Path(self._tmp.name) / "sessions.d"
+        patcher = mock.patch.object(
+            sessions, "SESSIONS_DIR", self.sessions_dir
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _claim(*, inode: int = 20):
+        import os
+
+        from core.startup.host import Frontend, SessionHostClaim
+
+        return SessionHostClaim(
+            frontend=Frontend.COPILOT,
+            uid=os.geteuid(),
+            executable=Path("/owned/copilot"),
+            executable_device=10,
+            executable_inode=inode,
+        )
+
+    def _metadata(self, claim=None):
+        claim = claim or self._claim()
+        return {
+            "session_pid": self.PID,
+            "session_start": "same-start",
+            "session_boot_id": "same-boot",
+            "session_pidns": "same-ns",
+            **claim.metadata_fields(),
+        }
+
+    def _entry(self, claim=None):
+        claim = claim or self._claim()
+        return {
+            "v": "2",
+            "project": "-",
+            "since": "2026-09-11T00:00:00+00:00",
+            "starttime": "same-start",
+            "boot_id": "same-boot",
+            "pidns": "same-ns",
+            "token": "ab" * 16,
+            **claim.session_fields(),
+        }
+
+    def _write_entry(self, fields):
+        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        path = self.sessions_dir / str(self.PID)
+        path.write_text(
+            "".join(f"{key}={value}\n" for key, value in fields.items()),
+            encoding="utf-8",
+        )
+        return path
+
+    def test_a4_malformed_registry_refuses_liveness_before_foreign(self):
+        from unittest import mock
+
+        from core.project import sessions
+        from core.run.metadata import _session_alive_for_meta
+
+        entry = self._entry()
+        entry.pop("host_exe_ino")
+        self._write_entry(entry)
+        with mock.patch.object(
+            sessions, "_foreign_entry", return_value=True
+        ) as foreign, self.assertLogs(
+            "core.run.metadata", level="WARNING"
+        ):
+            self.assertFalse(_session_alive_for_meta(self._metadata()))
+        foreign.assert_not_called()
+
+    def test_a4_claim_mismatch_refuses_liveness_before_foreign(self):
+        from unittest import mock
+
+        from core.project import sessions
+        from core.run.metadata import _session_alive_for_meta
+
+        self._write_entry(self._entry(self._claim(inode=21)))
+        with mock.patch.object(
+            sessions, "_foreign_entry", return_value=True
+        ) as foreign:
+            self.assertFalse(_session_alive_for_meta(self._metadata()))
+        foreign.assert_not_called()
+
+    def test_a4_missing_token_refuses_liveness_before_foreign(self):
+        from unittest import mock
+
+        from core.project import sessions
+        from core.run.metadata import _session_alive_for_meta
+
+        entry = self._entry()
+        entry.pop("token")
+        self._write_entry(entry)
+        with mock.patch.object(
+            sessions, "_foreign_entry", return_value=True
+        ) as foreign:
+            self.assertFalse(_session_alive_for_meta(self._metadata()))
+        foreign.assert_not_called()
+
+    def test_a4_bad_token_refuses_liveness_before_foreign(self):
+        from unittest import mock
+
+        from core.project import sessions
+        from core.run.metadata import _session_alive_for_meta
+
+        entry = self._entry()
+        entry["token"] = "not-hex"
+        self._write_entry(entry)
+        with mock.patch.object(
+            sessions, "_foreign_entry", return_value=True
+        ) as foreign:
+            self.assertFalse(_session_alive_for_meta(self._metadata()))
+        foreign.assert_not_called()
+
+    def test_a4_malformed_registry_refuses_owner_before_foreign(self):
+        from unittest import mock
+
+        from core.project import sessions
+        from core.run.metadata import _metadata_owned_by_session
+
+        entry = self._entry()
+        entry.pop("host_exe_ino")
+        self._write_entry(entry)
+        with mock.patch.object(
+            sessions, "_foreign_entry", return_value=True
+        ) as foreign, self.assertLogs(
+            "core.project.sessions", level="WARNING"
+        ):
+            self.assertFalse(
+                _metadata_owned_by_session(self._metadata(), self.PID)
+            )
+        foreign.assert_not_called()
+
+    def test_supplemental_a4_host_metadata_needs_complete_stamp(self):
+        from unittest import mock
+
+        from core.project import sessions
+        from core.run.metadata import _session_alive_for_meta
+
+        for missing in ("session_start", "session_boot_id"):
+            with self.subTest(missing=missing):
+                meta = self._metadata()
+                meta.pop(missing)
+                with mock.patch.object(
+                    sessions, "_foreign_entry", return_value=True
+                ) as foreign, self.assertLogs(
+                    "core.run.metadata", level="WARNING"
+                ):
+                    self.assertFalse(_session_alive_for_meta(meta))
+                foreign.assert_not_called()
+
+    def test_supplemental_a4_current_registry_identity_failure_denies_owner(
+        self,
+    ):
+        from unittest import mock
+
+        from core.project import sessions
+        from core.run.metadata import _metadata_owned_by_session
+
+        self._write_entry(self._entry())
+        with mock.patch.object(
+            sessions, "_identity_matches", return_value=False
+        ) as identity, mock.patch.object(
+            sessions, "_foreign_entry", return_value=True
+        ) as foreign:
+            self.assertFalse(
+                _metadata_owned_by_session(self._metadata(), self.PID)
+            )
+        identity.assert_called_once()
+        foreign.assert_not_called()
+
+    def test_supplemental_a4_strong_meta_rejects_legacy_and_other_claims(
+        self,
+    ):
+        from unittest import mock
+
+        from core.project import sessions
+        from core.run.metadata import _metadata_owned_by_session
+
+        legacy = self._entry()
+        for key in tuple(legacy):
+            if key == "host" or key.startswith("host_"):
+                legacy.pop(key)
+        different = self._entry(self._claim(inode=21))
+        for label, entry in (("legacy", legacy), ("different", different)):
+            with self.subTest(entry=label):
+                self._write_entry(entry)
+                with mock.patch.object(
+                    sessions, "_identity_matches", return_value=True
+                ), mock.patch.object(
+                    sessions, "_foreign_entry", return_value=True
+                ) as foreign:
+                    self.assertFalse(
+                        _metadata_owned_by_session(
+                            self._metadata(), self.PID
+                        )
+                    )
+                foreign.assert_not_called()

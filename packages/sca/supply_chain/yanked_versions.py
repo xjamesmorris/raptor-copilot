@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 
+from ..kinds import HYGIENE_PREFIX
 from ..models import (
     Confidence, Dependency, HygieneFinding,
 )
@@ -72,6 +73,22 @@ def scan_pinned_versions(
         unique.append(dep)
 
     def _scan_one(dep: Dependency) -> HygieneFinding | None:
+        # Fault isolation (mirrors registry_metadata.scan_deps): one
+        # registry document with an unexpected shape — e.g. a non-dict
+        # ``releases`` — must not abort the whole batch out of
+        # ``pool.map`` and take the supply-chain stage down with it.
+        # Log the package and skip it, keeping every other dep's
+        # findings intact.
+        try:
+            return _scan_one_unguarded(dep)
+        except Exception:
+            logger.warning(
+                "yanked_versions: scan failed for %s:%s — skipping",
+                dep.ecosystem, dep.name, exc_info=True,
+            )
+            return None
+
+    def _scan_one_unguarded(dep: Dependency) -> HygieneFinding | None:
         reason = _check_yanked(
             dep, pypi_client=pypi_client, npm_client=npm_client,
             cargo_client=cargo_client, rubygems_client=rubygems_client,
@@ -81,7 +98,7 @@ def scan_pinned_versions(
             return None
         return HygieneFinding(
             finding_id=(
-                f"sca:hygiene:yanked_version:{dep.ecosystem}:"
+                f"{HYGIENE_PREFIX}yanked_version:{dep.ecosystem}:"
                 f"{dep.name}:{dep.version}"
             ),
             kind="yanked_version",
@@ -124,7 +141,7 @@ def _check_yanked(
 
     Per-ecosystem dispatch."""
     if dep.ecosystem == "PyPI" and pypi_client is not None:
-        return _yanked_pypi(pypi_client, dep.name, dep.version)
+        return _yanked_pypi(pypi_client, dep.name, dep.version)  # type: ignore[arg-type]
     if dep.ecosystem == "npm" and npm_client is not None:
         return _yanked_npm(npm_client, dep.name, dep.version)
     if dep.ecosystem == "Cargo" and cargo_client is not None:

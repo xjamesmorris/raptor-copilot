@@ -8,7 +8,9 @@ including validation, deduplication, and merging.
 import hashlib
 import json
 import math
+import os
 import re
+import stat as stat_mod
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
@@ -19,6 +21,17 @@ from core.logging import get_logger
 from core.security.log_sanitisation import escape_nonprintable
 
 logger = get_logger()
+
+# One SARIF read cap for every consumer that loads a whole SARIF
+# document into memory (this parser plus the core/dataflow corpus /
+# bridge / diff loaders alias it). Trade-off, both directions:
+# raising it admits bigger artifacts at proportional memory cost
+# (documents are parsed whole, so the cap is effectively a per-load
+# RSS budget); lowering it starts refusing legitimate large
+# combined.sarif files from full CodeQL+semgrep runs on big targets.
+# 100 MiB has held for real combined runs — move it only against a
+# corpus of observed artifact sizes.
+SARIF_MAX_BYTES = 100 * 1024 * 1024
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -49,12 +62,66 @@ def _coerce_line(value: Any) -> int | None:
     return None
 
 
+# Per-step ``properties`` sanitisation bounds. SARIF threadFlow
+# location properties are producer-supplied (the cross-file taint
+# engine serializes per-hop tier/kind/tags there) but arrive from an
+# UNTRUSTED file, so the carry is allowlisted-by-type and bounded.
+# Raising the caps admits more attacker-shaped bytes into every
+# downstream consumer of dataflow_path (prompts, reports); lowering
+# them truncates legitimate producer vocabulary (tag lists, sanitizer
+# name lists) and consumers lose tier evidence.
+_STEP_PROPS_MAX_KEYS = 16
+_STEP_PROPS_MAX_STRING = 256
+_STEP_PROPS_MAX_LIST = 16
+
+
+def _sanitize_step_properties(props: Any) -> dict[str, Any]:
+    """Bounded, display-inert copy of a threadFlow location's
+    ``properties`` bag.
+
+    Keeps only value shapes the step contract uses — strings
+    (escaped + capped), bools, ints, and lists of strings (each
+    escaped + capped, list capped) — under capped, escaped string
+    keys. Everything else is dropped: an unexpected nested object or
+    float in an untrusted SARIF earns no ride into ``dataflow_path``.
+    Returns ``{}`` (caller omits the key) for non-dict input.
+    """
+    if not isinstance(props, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key, value in props.items():
+        if len(out) >= _STEP_PROPS_MAX_KEYS:
+            break
+        if not isinstance(key, str):
+            continue
+        safe_key = escape_nonprintable(key)[:_STEP_PROPS_MAX_STRING]
+        if isinstance(value, bool):
+            out[safe_key] = value
+        elif isinstance(value, int):
+            out[safe_key] = value
+        elif isinstance(value, str):
+            out[safe_key] = escape_nonprintable(
+                value)[:_STEP_PROPS_MAX_STRING]
+        elif isinstance(value, list):
+            out[safe_key] = [
+                escape_nonprintable(item)[:_STEP_PROPS_MAX_STRING]
+                for item in value[:_STEP_PROPS_MAX_LIST]
+                if isinstance(item, str)
+            ]
+    return out
+
+
 def _path_from_locations(
     locations: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
     """Build a {source, sink, steps, total_steps} dict from one
     SARIF threadFlow's locations array. Returns None if there are
-    fewer than 2 locations (no source-to-sink path)."""
+    fewer than 2 locations (no source-to-sink path).
+
+    Each step carries a sanitized copy of the threadFlow location's
+    ``properties`` bag when one is present (the cross-file taint
+    engine's per-hop tier/kind/tags surface); locations without
+    properties produce the exact pre-existing step shape."""
     if len(locations) < 2:
         return None
     path: dict[str, Any] = {
@@ -88,6 +155,9 @@ def _path_from_locations(
             "label": message,
             "snippet": snippet,
         }
+        step_props = _sanitize_step_properties(loc_wrapper.get("properties"))
+        if step_props:
+            step_info["properties"] = step_props
         if idx == 0:
             path["source"] = step_info
         elif idx == len(locations) - 1:
@@ -440,12 +510,41 @@ def _extract_cwe_from_rule(rule: dict[str, Any]) -> str | None:
     return None
 
 
+def count_results(sarif_data: Any) -> int:
+    """Total number of results across all runs of a parsed SARIF dict.
+
+    Shape-tolerant by contract: this is a provenance/summary signal,
+    not a validator, and its inputs include SARIF files found on disk
+    in run directories (operator-editable, tool-emitted, or hostile).
+    A non-dict document, a non-list ``runs``, a non-dict run entry, or
+    a non-list ``results`` each count as zero instead of raising —
+    per-module copies of this loop drifted exactly on that tolerance
+    (one raised ``AttributeError`` on a non-dict run entry and took
+    the whole rendering path down with it).
+    """
+    if not isinstance(sarif_data, dict):
+        return 0
+    runs = sarif_data.get("runs")
+    if not isinstance(runs, list):
+        return 0
+    total = 0
+    for run_obj in runs:
+        if not isinstance(run_obj, dict):
+            continue
+        results = run_obj.get("results")
+        if isinstance(results, list):
+            total += len(results)
+    return total
+
+
 def load_sarif(sarif_path: Path) -> dict[str, Any] | None:
     """
     Load a SARIF file with safety guards.
 
-    Handles existence check, size guard (100 MiB), and JSON decode errors.
-    All SARIF file I/O should go through this function.
+    Handles existence check, regular-file gate (a planted FIFO or
+    device node is refused instead of blocking the reader), size
+    guard (100 MiB, enforced on the fd actually read), and JSON
+    decode errors. All SARIF file I/O should go through this function.
 
     Args:
         sarif_path: Path to SARIF file
@@ -457,32 +556,55 @@ def load_sarif(sarif_path: Path) -> dict[str, Any] | None:
         logger.error("SARIF: file does not exist: %s", sarif_path)
         return None
 
-    max_size = 100 * 1024 * 1024  # 100 MiB
+    max_size = SARIF_MAX_BYTES  # trade-off comment at the constant
 
-    # Stat-then-bounded-read. Pre-fix the function used
+    # Gated read on the OPEN fd. Pre-fix the function used
     # `sarif_path.read_text()` followed by `if len(content) > max_size`
     # — the WHOLE file was loaded into memory BEFORE the size check,
     # so a 10 GB malformed/hostile SARIF file OOM-killed the process
-    # instead of being rejected. The "avoids TOCTOU" comment was
-    # technically true but irrelevant: the real risk here is memory
-    # exhaustion, not stat/read size-skew (a few KB drift between
-    # stat and read doesn't matter for the cap decision).
-    #
-    # Bounded read of `max_size + 1` bytes lets us detect "too large"
-    # without ever loading more than the cap into memory. Reading
-    # one extra byte is the standard "did we hit the limit" sentinel.
+    # instead of being rejected. A later revision stat'ed BY NAME and
+    # opened BY NAME with a bounded read — but the size gate never
+    # checked the file TYPE, so a FIFO planted at the SARIF path
+    # (stats as 0 bytes, passing any cap) blocked the reader forever
+    # at the open; no swap race needed. SARIF paths include run-dir
+    # artifacts producible under another principal's write grant —
+    # the exact plantable-hang class core.json's gated read closes,
+    # so the same fd discipline applies here: O_NONBLOCK makes a
+    # FIFO/device open return instead of blocking (no effect on
+    # regular-file reads), fstat the fd actually being read, require
+    # a regular file, and bound the read at `max_size + 1` bytes (the
+    # standard one-extra-byte "did we hit the limit" sentinel) with a
+    # post-read re-check so growth during the read is refused too.
+    # Symlink-to-regular still resolves; symlink-to-FIFO is refused
+    # with the FIFO.
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
     try:
-        st = sarif_path.stat()
+        fd = os.open(str(sarif_path), flags)
+    except OSError as e:
+        logger.warning("SARIF: could not read %s: %s", sarif_path, e)
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat_mod.S_ISREG(st.st_mode):
+            logger.error(
+                "SARIF: not a regular file: %s", sarif_path,
+            )
+            return None
         if st.st_size > max_size:
             logger.error(
                 "SARIF: file too large (%.0f MiB): %s",
                 st.st_size / 1024 / 1024, sarif_path,
             )
             return None
-        with sarif_path.open("rb") as f:
+        with os.fdopen(fd, "rb") as f:
+            fd = -1  # fdopen owns it now
             raw = f.read(max_size + 1)
         if len(raw) > max_size:
-            # Race: file grew between stat and read.
+            # Race: file grew between fstat and read.
             logger.error(
                 "SARIF: file grew past %.0f MiB during read: %s",
                 max_size / 1024 / 1024, sarif_path,
@@ -492,6 +614,12 @@ def load_sarif(sarif_path: Path) -> dict[str, Any] | None:
     except OSError as e:
         logger.warning("SARIF: could not read %s: %s", sarif_path, e)
         return None
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
     try:
         # core.json.loads: shared backend (orjson when installed) —
@@ -535,17 +663,55 @@ def get_tool_name(run: dict[str, Any]) -> str:
 def get_rules(run: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """Extract rules from a SARIF run, keyed by rule ID.
 
+    Rules are collected from ``tool.driver.rules`` AND every
+    ``tool.extensions[*].rules`` array: SARIF places pack-/plugin-
+    provided rules on extension toolComponents (CodeQL's pack-based
+    runs emit that layout), and a driver-only read silently dropped
+    their severity defaults and CWE tags — every such result flattened
+    to "warning" with no CWE mapping. On an id collision the driver's
+    definition wins (extensions are secondary components). Results
+    that reference extension rules by ``ruleIndex``/
+    ``rule.toolComponent.index`` WITHOUT a ``ruleId`` string still
+    don't join (the result-side lookup is keyed on ruleId only).
+
     Non-object rules and non-string rule ids (spec violations in
     untrusted SARIF) are dropped rather than crashing the parse."""
-    driver = _as_dict(_as_dict(run.get("tool")).get("driver"))
-    rules = driver.get("rules")
-    if not isinstance(rules, list):
-        return {}
-    return {
-        r["id"]: r
-        for r in rules
-        if isinstance(r, dict) and isinstance(r.get("id"), str) and r["id"]
-    }
+    tool = _as_dict(run.get("tool"))
+
+    def _component_rules(component: Any) -> dict[str, dict[str, Any]]:
+        rules = _as_dict(component).get("rules")
+        if not isinstance(rules, list):
+            return {}
+        return {
+            r["id"]: r
+            for r in rules
+            if isinstance(r, dict) and isinstance(r.get("id"), str) and r["id"]
+        }
+
+    out: dict[str, dict[str, Any]] = {}
+    extensions = tool.get("extensions")
+    if isinstance(extensions, list):
+        for ext in extensions:
+            out.update(_component_rules(ext))
+    out.update(_component_rules(tool.get("driver")))
+    return out
+
+
+def rule_default_level(rule: dict[str, Any]) -> str | None:
+    """The rule's ``defaultConfiguration.level``, or None.
+
+    Per the SARIF spec, a result without an explicit ``level`` inherits
+    it from its rule's defaultConfiguration. Semgrep's SARIF emitter
+    relies on this — results never carry ``level`` (verified against
+    semgrep 1.172.0) — so a parser that defaults straight to "warning"
+    flattens every rule-declared severity, including error-severity
+    rules, to warning.
+    """
+    cfg = rule.get("defaultConfiguration")
+    level = cfg.get("level") if isinstance(cfg, dict) else None
+    if isinstance(level, str) and level:
+        return level
+    return None
 
 
 def _uri_escapes_root(uri: str, source_root: Path) -> bool:
@@ -625,7 +791,10 @@ def parse_sarif_findings(
         for rid, rule in get_rules(run).items():
             cwe_id = _extract_cwe_from_rule(rule)
             if rid:
-                rules_by_id[rid] = {"cwe_id": cwe_id}
+                rules_by_id[rid] = {
+                    "cwe_id": cwe_id,
+                    "default_level": rule_default_level(rule),
+                }
 
         # Per-run originalUriBaseIds for relative-URI resolution.
         # SARIF emitters commonly emit `result.locations[*].artifactLocation
@@ -740,7 +909,7 @@ def parse_sarif_findings(
             code_flows = result.get("codeFlows") or []
             dataflow_path = extract_dataflow_path(code_flows) if code_flows else None
 
-            rule_meta = rules_by_id.get(rule_id, {})
+            rule_meta = rules_by_id.get(rule_id or "", {})
 
             file_uri = _resolve_uri(artifact)
             # Containment gate at the parse boundary (opt-in via
@@ -762,9 +931,12 @@ def parse_sarif_findings(
             message_text = _as_dict(result.get("message")).get("text")
             if not isinstance(message_text, str):
                 message_text = None
-            level = result.get("level", "warning")
-            if not isinstance(level, str):
-                level = "warning"
+            level = result.get("level")
+            if not isinstance(level, str) or not level:
+                # SARIF severity inheritance: absent result.level means
+                # the rule's defaultConfiguration.level (semgrep never
+                # emits result.level).
+                level = rule_meta.get("default_level") or "warning"
 
             findings.append(
                 {
@@ -940,12 +1112,25 @@ def generate_scan_metrics(sarif_paths: list[str]) -> dict[str, Any]:
                 metrics["findings_by_tool"].get(tool_key, 0) + len(results)
             )
 
+            # SARIF severity inheritance for results without an
+            # explicit level (semgrep never emits result.level).
+            default_levels = {
+                rid: rule_default_level(rule)
+                for rid, rule in get_rules(run).items()
+            }
+
             for result in results:
                 if not isinstance(result, dict):
                     continue
                 # Count by severity
-                level = result.get("level", "warning")
-                if isinstance(level, str) and level in metrics["findings_by_severity"]:
+                level = result.get("level")
+                if not isinstance(level, str) or not level:
+                    rid = result.get("ruleId")
+                    level = (
+                        default_levels.get(rid)
+                        if isinstance(rid, str) else None
+                    ) or "warning"
+                if level in metrics["findings_by_severity"]:
                     metrics["findings_by_severity"][level] += 1
 
                 # Count by rule

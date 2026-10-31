@@ -8,9 +8,13 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+
+from core.hash import sha256_string
 
 
 def _filter_fields(cls: type, raw: dict) -> dict:
@@ -36,11 +40,142 @@ class Evidence:
     quote: str | None = None
 
 
+def fold_ws(value: object) -> str:
+    """Collapse whitespace runs — including every line-boundary
+    character — to a single space, trimmed.
+
+    THE writer-side normalisation for every free-text field value
+    rendered into a SAGE concept-row line (evidence fields here;
+    descriptions, invariants, contracts in
+    ``core.sage.hooks.store_study_concepts``). A raw line boundary
+    inside a value would let the remainder of the value stand as a row
+    line of its own — e.g. an invariant statement containing
+    ``\\nSource hash: x`` mints a line-start mention that shadows the
+    genuine field for concepts that store no composite.
+    """
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def sage_evidence_row(ev: Evidence) -> str:
+    """Render one evidence line of a SAGE study-concept row.
+
+    THE writer half of the SAGE evidence grammar. The parsers in
+    ``core.concepts.study`` (the shared per-line extraction over
+    ``_SAGE_EVIDENCE_RE`` and the staleness verifier / reconstruction
+    parser built on it) re-derive ``(type, file, line, hash,
+    observation)`` from exactly this shape, so the writer
+    (``core.sage.hooks.store_study_concepts``) must render through
+    here: a writer/parser drift silently disables the cross-run study
+    skip optimisation (the parse fails closed to the seed path).
+    Round-trip covered by
+    ``core/concepts/tests/test_sage_row_grammar.py``.
+
+    Field values come from an LLM and are not grammar-aware, so they
+    are normalised until the rendered text re-parses as ONE evidence
+    line whose parsed hash is this evidence's hash (or none — a value
+    the grammar cannot carry, e.g. a file path containing the spaced
+    dash separator, degrades to a hashless parse rather than a
+    divergent one):
+
+    - the type collapses to the grammar's ``\\w+`` token (a free-typed
+      ``code-path`` otherwise shifts the whole parse);
+    - newlines and other whitespace runs in file/observation fold to a
+      single space (a raw line boundary splits the line, and the
+      remainder of the value then reads as further row lines);
+    - a hex hash is lowercased to the tag alphabet; a hash containing
+      whitespace is dropped entirely (rendered verbatim it would
+      smuggle a line boundary into the row), and any other non-hex
+      value renders as given and simply never parses as a hash tag;
+    - an empty observation becomes ``(none)`` — a line ending at its
+      dash does not re-parse, silently dropping its hash from the
+      verifiable set.
+    """
+    kind = re.sub(r"\W", "_", str(ev.type or "")) or "unknown"
+    file = fold_ws(ev.file)
+    obs = fold_ws(ev.observation) or "(none)"
+    raw_hash = str(ev.hash or "")
+    if not re.fullmatch(r"\S+", raw_hash):
+        # A hash containing whitespace (or empty) can never parse as a
+        # tag, and folding it would render junk; rendering it verbatim
+        # would smuggle a line boundary into the row. Dropped — the
+        # evidence line stays, hashless.
+        raw_hash = ""
+    elif re.fullmatch(r"[0-9a-fA-F]+", raw_hash):
+        raw_hash = raw_hash.lower()
+    # `is not None`, not truthiness: line 0 is a real anchor for
+    # whole-file evidence, and dropping it desyncs the writer/parser
+    # round trip (the hash tag would re-parse with no line).
+    loc = f"{file}:{ev.line}" if ev.line is not None else file
+    h_tag = f" [h={raw_hash}]" if raw_hash else ""
+    return f"  Evidence ({kind}): {loc}{h_tag} — {obs}"
+
+
+def evidence_hash_composite(hashes: Iterable[str]) -> str:
+    """Fold per-evidence hashes into a row's composite source hash.
+
+    THE single formula behind the ``Source hash:`` value of a SAGE
+    study-concept row: order-independent (sorted), duplicate-preserving
+    (one entry per evidence line, so two evidence lines sharing a hash
+    fold differently from one), full SHA-256 hex. No hashes → ``""``
+    (a concept whose evidence carries no parseable hashes stores an
+    empty composite).
+
+    Two callers, one formula: the writer
+    (``core.sage.hooks.store_study_concepts``) folds the hashes parsed
+    back out of the row content it is about to store and binds the
+    result into the row MAC; the recall-side verifier
+    (``core.concepts.study.stamped_evidence_composite``) re-folds the
+    same extraction and requires equality with the MAC-bound value. A
+    formula drift between the two would silently demote every stored
+    concept row from the mechanical skip/seed path, so both sides must
+    compute through here.
+
+    Rows minted before this formula existed carry a 12-hex-char prefix
+    of the same fold; the recall gate prefix-compares for exactly that
+    src length so they keep verifying (the length is trustworthy there
+    because src is MAC-bound).
+    """
+    hash_list = sorted(hashes)
+    if not hash_list:
+        return ""
+    return sha256_string("|".join(hash_list))
+
+
 # ------------------------------------------------------------------
 # Concept
 # ------------------------------------------------------------------
 
 CONFIDENCE_GRADES = ("inferred", "observed", "traced", "corroborated", "documented", "tested")
+
+#: Decompiled-evidence grading ceiling — the ONE spelling shared by
+#: every consumer that grades decomp-derived evidence (binary --study's
+#: domain-model clamp, the audit's tree-wide decomp sweep records).
+#: Decompilation is derived evidence about a binary, not ground truth:
+#: nothing whose evidence is decompilation-only may grade above this
+#: ceiling, and it always carries :data:`DECOMP_EVIDENCE_TAG` so
+#: downstream weight policies can see the provenance.
+DECOMP_EVIDENCE_MAX_CONFIDENCE = "traced"
+DECOMP_EVIDENCE_TAG = "decompiled-evidence"
+
+
+def clamp_decomp_confidence(confidence: object) -> str:
+    """Clamp *confidence* to the decompiled-evidence ceiling.
+
+    Grades above :data:`DECOMP_EVIDENCE_MAX_CONFIDENCE` come back as
+    the ceiling; legal below-ceiling grades pass through unchanged so
+    an honestly lower grade ("observed") is never inflated. Unknown
+    grades floor to ``"inferred"`` — the unknown-grade fallback must
+    never LIFT a grade.
+    """
+    c = str(confidence or "inferred")
+    try:
+        if (CONFIDENCE_GRADES.index(c)
+                > CONFIDENCE_GRADES.index(DECOMP_EVIDENCE_MAX_CONFIDENCE)):
+            return DECOMP_EVIDENCE_MAX_CONFIDENCE
+    except ValueError:
+        return "inferred"
+    return c
+
 
 LIFECYCLE_STATES = (
     "discovered",
@@ -98,6 +233,12 @@ class Invariant:
     mechanism_tags: list[str] = field(default_factory=list)
     provenance: str = ""
     receipt: dict[str, Any] | None = None
+    # Staleness marker: "" (fresh/unchecked) or "stale" — set by the
+    # prior-model quarantine when the verbatim receipt no longer
+    # verifies against the current source. Tier-gated consumers
+    # (audit_bridge._tier_tag) render stale entries as
+    # [stale-unverified] hints, never as receipt-backed facts.
+    state: str = ""
 
 
 # ------------------------------------------------------------------
@@ -115,8 +256,20 @@ class Contract:
     implication: str = ""
     security_note: str = ""
     hash: str | None = None
+    # Span the hash was computed over (``_stamp_contract_hashes``):
+    # {"file": <study-item file>, "start": N, "end": M}. Recorded so
+    # the staleness check can re-hash the same span later; ``hash``
+    # alone is unverifiable without it. None on pre-span legacy
+    # models — those contracts are skipped by the staleness check
+    # (no baseline), same as unhashed concept evidence.
+    hash_span: dict[str, Any] | None = None
     provenance: str = ""
     receipt: dict[str, Any] | None = None
+    # Staleness marker: "" (fresh/unchecked) or "stale" — set when the
+    # stamped span hash no longer matches the source. Stale contracts
+    # are dropped from the authority-toned review primers and render
+    # as [stale-unverified] in context blocks.
+    state: str = ""
 
 
 # ------------------------------------------------------------------
@@ -159,6 +312,16 @@ class StudyItem:
     validation_bounds: list[str] = field(default_factory=list)
     relevance_tier: int | None = None
     usage_class: str | None = None  # writer | reader | passthru
+    # Why this item holds a seed/focus slot — "" (autonomous
+    # selection), "operator" (operator-asked identifier),
+    # "bridge_seed" (map→study bridge granted focus; counts against
+    # the joint derived-attention cap), "bridge_seed_overflow" (a
+    # bridge lead the cap reverted to baseline treatment — tier
+    # cleared, annotation only, never sunk below the bridge-less
+    # default), or "bridge_corroborated" (operator-scoped item the
+    # bridge also flagged; annotation only, never counted or
+    # reverted). Surfaced in the study report's seed table.
+    seed_source: str = ""
     # Mechanically detected doc/code disagreement (code wins) — see
     # core.concepts.receipts.detect_stale_doc.
     stale_doc: str = ""
@@ -218,9 +381,14 @@ class DomainModel:
     #   resource_limits:   {field_or_macro, applies_to[, provenance]}
     #   state_fields:      {field[, struct, authority, monotonic,
     #                        invariant_refs, provenance, receipt]}
-    # resource_limits / state_fields are parsed channel-locally
-    # (resource_bounds / protocol_state) — deliberately NOT surfaced
-    # through DomainVocabulary.
+    #   token_checks:      {name[, kind, when, provenance]} — the
+    #       target's LEARNED anti-request-forgery (CSRF/nonce) check
+    #       functions (kind: csrf | nonce | other). Consumed by
+    #       core.concepts.token_map for the per-entry enforcement
+    #       projection.
+    # resource_limits / state_fields / token_checks are parsed
+    # channel-locally — deliberately NOT surfaced through
+    # DomainVocabulary.
     paired_operations: list[dict[str, Any]] = field(default_factory=list)
     nullable_returns: list[Any] = field(default_factory=list)
     auth_predicates: list[Any] = field(default_factory=list)
@@ -230,6 +398,7 @@ class DomainModel:
     )
     resource_limits: list[Any] = field(default_factory=list)
     state_fields: list[Any] = field(default_factory=list)
+    token_checks: list[dict[str, Any]] = field(default_factory=list)
 
     # ----- persistence -------------------------------------------
 
@@ -246,10 +415,15 @@ class DomainModel:
 
     @classmethod
     def load(cls, path: Path) -> DomainModel:
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            return cls()
+        # Bounded, fd-gated read: domain models sit in run output
+        # directories whose write grant sandboxed code holds, so the
+        # loader must refuse FIFOs and oversize plants rather than
+        # buffer them. A missing, oversize, or malformed file loads
+        # as an empty model — the same degrade-never-crash contract
+        # the drift loader below applies to record shapes.
+        from core.json import load_json
+
+        raw = load_json(path, max_bytes=64 * 1024 * 1024)
         if not isinstance(raw, dict):
             return cls()
         # Tolerate schema drift in on-disk models: any record written by
@@ -268,32 +442,47 @@ class DomainModel:
             }
             return {**defaults, **_filter_fields(dc_type, record)}
 
+        def _dict_records(container: Any) -> list[dict]:
+            """Dict-shaped records of a list-shaped container.
+
+            Non-dict records (a bare-string evidence entry — a shape
+            the study pipeline itself accepts from the LLM) and
+            non-list containers (a dict where a list was expected)
+            must degrade to skipped records / an empty list, never
+            crash the loader: sibling-run and canonical models are
+            consulted opportunistically and may carry any older
+            writer's shape.
+            """
+            if not isinstance(container, list):
+                return []
+            return [r for r in container if isinstance(r, dict)]
+
         concepts = [
             Concept(**{
                 **_drift_load(Concept, c),
                 "evidence": [
                     Evidence(**_drift_load(Evidence, e))
-                    for e in c.get("evidence", [])
+                    for e in _dict_records(c.get("evidence", []))
                 ],
             })
-            for c in raw.get("concepts", [])
+            for c in _dict_records(raw.get("concepts", []))
         ]
         invariants = [
             Invariant(**_drift_load(Invariant, i))
-            for i in raw.get("invariants", [])
+            for i in _dict_records(raw.get("invariants", []))
         ]
         contracts = [
             Contract(**_drift_load(Contract, c))
-            for c in raw.get("contracts", [])
+            for c in _dict_records(raw.get("contracts", []))
         ]
         sc_raw = raw.get("security_context")
         security_context = (
             SecurityContext(**_drift_load(SecurityContext, sc_raw))
-            if sc_raw else None
+            if isinstance(sc_raw, dict) else None
         )
         bug_patterns = [
             BugPattern(**_drift_load(BugPattern, bp))
-            for bp in raw.get("bug_patterns", [])
+            for bp in _dict_records(raw.get("bug_patterns", []))
         ]
         def _vocab_list(key: str) -> list:
             value = raw.get(key, [])
@@ -330,6 +519,10 @@ class DomainModel:
                 s for s in _vocab_list("state_fields")
                 if isinstance(s, dict)
             ],
+            token_checks=[
+                t for t in _vocab_list("token_checks")
+                if isinstance(t, dict)
+            ],
         )
 
     # ----- query helpers -----------------------------------------
@@ -340,8 +533,22 @@ class DomainModel:
                 return c
         return None
 
-    def get_contracts_for(self, function: str) -> list[Contract]:
-        return [c for c in self.contracts if c.function == function]
+    def get_contracts_for(
+        self, function: str, file: str | None = None,
+    ) -> list[Contract]:
+        """Contracts for *function*, optionally narrowed to *file*.
+
+        Contracts are keyed by (function, file) — same-named functions
+        in different files carry different contracts, so a name-only
+        lookup returns every file's contract for that name. Callers
+        that know the file should pass it; contracts recording no file
+        always pass the narrowing.
+        """
+        return [
+            c for c in self.contracts
+            if c.function == function
+            and (file is None or not c.file or c.file == file)
+        ]
 
     def concepts_at_confidence(self, min_grade: str) -> list[Concept]:
         try:

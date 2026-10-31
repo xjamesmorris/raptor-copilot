@@ -12,10 +12,18 @@ Gate ordering (cost order, short-circuit on first hit):
 4. Input-bound Tier 0        — known-return-type table
 5. Anti-self-refutation      — rescue self-refuted concurrency/lifecycle hyps
 6. Callee-inheritance        — demote thin wrappers flagged for callee's bug
+7. Disassembly cross-check   — binary items whose claim cites
+   argument/register/sibling-differential/operand-width facts the
+   decoded instructions can adjudicate (decompilation-artifact
+   verdicts); resolves its own claim text (hypothesis → hypotheses →
+   body), so it also runs when the hypothesis field is empty
 
 Gates 1-4 are demotion gates (finding/suspicious → clean).
 Gate 5 is a promotion gate (clean → suspicious) for self-refuted hypotheses.
 Gate 6 is a demotion gate (finding/suspicious → clean) for callee attribution.
+Gate 7 is a demotion gate (binary items only) — the one gate that may run a
+sandboxed subprocess, so it is ordered last; its corroborated/inconclusive
+outcomes never change a verdict.
 
 """
 
@@ -23,9 +31,13 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
+from pathlib import Path
+
+from core.source import open_regular
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -66,8 +78,16 @@ def refute_hypothesis(
     checklist: dict[str, Any] | None,
     config,  # OrchestratorConfig
     joern_server=None,
+    tier_counters: dict[str, Any] | None = None,
 ) -> RefutationVerdict | None:
-    """Run refutation gates in cost order.  Return verdict or None."""
+    """Run refutation gates in cost order.  Return verdict or None.
+
+    ``tier_counters`` (when the caller holds the run's TierCounters
+    dict) receives the disasm cross-check gate's per-outcome tallies
+    under the ``disasm_xcheck`` tier — the only gate here that runs a
+    (sandboxed) subprocess and therefore reports like the mechanical
+    verification tiers.
+    """
     # Never refute a finding with mechanical tool confirmation.
     from .evidence_grade import is_tool_evidence
 
@@ -77,7 +97,14 @@ def refute_hypothesis(
 
     hyp = outcome.hypothesis or ""
     if not hyp:
-        return None
+        # Gates 1-6 bind on hypothesis text and have nothing to do.
+        # Binary rows, however, can carry their claim only in
+        # ``hypotheses``/``body`` (observed live: suspicious binary
+        # verdicts journaled with hypothesis empty) — gate 7 resolves
+        # its own claim text, so it still gets its turn.
+        return _refute_by_disasm_xcheck(
+            outcome, checklist, config, tier_counters=tier_counters,
+        )
 
     # Gate 1: Architecture model
     v = _refute_by_architecture(outcome, domain_model, checklist, config)
@@ -106,7 +133,193 @@ def refute_hypothesis(
         if v is not None:
             return v
 
+    # Gate 7: Disassembly cross-check (binary items only; the one
+    # gate that may spawn a sandboxed subprocess, so it runs last)
+    v = _refute_by_disasm_xcheck(
+        outcome, checklist, config, tier_counters=tier_counters,
+    )
+    if v is not None:
+        return v
+
     return None
+
+
+# ---------------------------------------------------------------------------
+# Gate 7: Disassembly cross-check (binary items)
+# ---------------------------------------------------------------------------
+
+# Leading bracketed pipeline markers ("[gate violation: ...]",
+# "[hypothesis-consistency: ...]") stripped before the body-text
+# fallback scans for a claim. Window, both directions: it must cover
+# the LONGEST real pipeline prefix — a demotion prefix
+# "[architecture: <reason>]" carrying the partial-scan marker measures
+# ~300 chars, which a 200-char window silently stopped stripping
+# (the stale prefix then fed the claim scan). WIDER than 400 starts
+# treating arbitrarily large bracketed blocks as pipeline markers when
+# they are more plausibly quoted body prose, and buys backtracking
+# work on hostile bodies. The close is a SHORT RUN (`\]{1,3}`): the
+# partial-scan marker nests one bracket level inside the demotion
+# prefix ("[architecture: ... [veto scan partial: ...]]"), and a
+# single-`]` close left the outer bracket dangling at the head of the
+# claim text; longer runs than 3 have no pipeline producer.
+_BODY_PREFIX_RE = re.compile(r"\A(?:\[[^\]\n]{0,400}\]{1,3}\s{0,4})+")
+
+
+def _disasm_claim_text(outcome) -> tuple[str, str]:
+    """(claim text, source) for the disasm gate.
+
+    Resolution order mirrors where binary reviews actually record
+    their claim: ``hypothesis``, then the first ``hypotheses`` entry,
+    then the outcome body with bracketed pipeline prefixes stripped.
+    The body leg exists because live binary rows journal suspicious
+    verdicts with an empty hypothesis and the claim in prose; the
+    binding discipline in ``classify_trigger`` (refuse on ambiguity,
+    quoted-prose steering defences) is what makes the wider net safe.
+    """
+    text = getattr(outcome, "hypothesis", "") or ""
+    if text:
+        return text, "hypothesis"
+    for entry in getattr(outcome, "hypotheses", None) or []:
+        if isinstance(entry, dict):
+            etext = entry.get("hypothesis") or entry.get("text") or ""
+        else:
+            etext = str(entry or "")
+        if etext:
+            return etext, "hypotheses"
+    body = getattr(outcome, "body", "") or ""
+    body = _BODY_PREFIX_RE.sub("", body)
+    return body, "body"
+
+
+def _refute_by_disasm_xcheck(
+    outcome,
+    checklist: dict[str, Any] | None,
+    config,
+    tier_counters: dict[str, Any] | None = None,
+) -> RefutationVerdict | None:
+    """Verdict-time instruction cross-check of decompilation-derived
+    ARGUMENT / REGISTER / IMMEDIATE-WIDTH claims on binary items.
+
+    Trigger: the item is binary-sourced (``binary:`` file sentinel)
+    AND the hypothesis matches the bounded trigger taxonomy in
+    :func:`core.audit.disasm_xcheck.classify_trigger` (keyword +
+    structure, never free LLM classification). Verdict-status gating
+    (suspicious+) is the caller's existing contract — every
+    ``refute_hypothesis`` call site already fires only on
+    finding/suspicious outcomes.
+
+    Semantics: ``refuted`` demotes like the other gates (heuristic
+    refuter grade — the refuting instructions are mechanical, but
+    binding the claim text to a register/call site rests on keyword
+    matching), and only on refute-grade evidence (unconditional
+    32/64-bit writes that provably reach the call — see the module
+    docstring's grade rules). ``corroborated`` NEVER promotes: the receipt
+    is attached to the outcome (pipeline-controlled attribute, so a
+    model cannot forge it through review_result) and journaled;
+    corroborate-absence never suppresses anything. Every invocation
+    journals an ``action=disasm_xcheck`` receipt row with the bounded
+    escaped excerpt.
+    """
+    from core.inventory.binary_builder import BINARY_PATH_PREFIX
+
+    if not str(getattr(outcome, "file", "") or "").startswith(
+            BINARY_PATH_PREFIX):
+        return None
+    try:
+        from .disasm_xcheck import classify_trigger, run_disasm_xcheck
+    except ImportError:
+        return None
+    claim, claim_source = _disasm_claim_text(outcome)
+    trigger = classify_trigger(
+        claim,
+        function_name=getattr(outcome, "function", "") or "",
+    )
+
+    from .diagnostics import increment_tier_dict
+
+    if trigger is None:
+        # Outside the taxonomy: the tier is never invoked — no
+        # subprocess, no journal row. The decline is still COUNTED
+        # (no_trigger), so a binary run whose claims all speak an
+        # unmatched vocabulary shows an engaged-but-not-matching
+        # tier instead of an all-zero stanza indistinguishable from
+        # "never ran".
+        if tier_counters is not None:
+            increment_tier_dict(
+                tier_counters, "disasm_xcheck", "no_trigger",
+            )
+        return None
+
+    def _tally(outcome_str: str) -> None:
+        if tier_counters is None:
+            return
+        field = {
+            "refuted": "refuted",
+            "corroborated": "confirmed",
+            "inconclusive": "inconclusive",
+            "skipped": "skipped",
+        }.get(outcome_str, "errors")
+        increment_tier_dict(tier_counters, "disasm_xcheck", field)
+
+    try:
+        res = run_disasm_xcheck(
+            getattr(config, "target_path", None),
+            outcome.file,
+            outcome.function,
+            claim,
+            checklist=checklist,
+            out_dir=getattr(config, "out_dir", None),
+            trigger=trigger,
+        )
+    except Exception:  # noqa: BLE001 — a channel fault never blocks review
+        logger.debug(
+            "disasm_xcheck failed for %s:%s",
+            outcome.file, outcome.function, exc_info=True,
+        )
+        _tally("error")
+        return None
+
+    _tally(res.outcome)
+
+    # Receipt row — the fail_open/_record_channel_receipt shape, one
+    # per invocation regardless of outcome (honest inconclusives).
+    try:
+        out_dir = getattr(config, "out_dir", None)
+        if out_dir:
+            from .record import append_audit_log
+
+            record = {
+                "action": "disasm_xcheck",
+                "file": outcome.file,
+                "function": outcome.function,
+                "claim_source": claim_source,
+            }
+            record.update(res.to_dict())
+            append_audit_log(out_dir, record)
+    except Exception:  # noqa: BLE001 — records-only failure
+        logger.debug("disasm_xcheck receipt write failed", exc_info=True)
+
+    if res.outcome == "corroborated":
+        # Pipeline-controlled attachment (NOT review_result: parsed
+        # model JSON lands there, and a fabricated key would mint a
+        # mechanical-looking chain entry — the typestate lesson).
+        try:
+            outcome.disasm_xcheck = res.receipt_summary()
+        except Exception:  # noqa: BLE001 — slotted stand-ins in tests
+            logger.debug("disasm_xcheck receipt attach failed",
+                         exc_info=True)
+        return None
+    if res.outcome != "refuted":
+        return None
+    return RefutationVerdict(
+        gate="disasm_xcheck",
+        reason=(
+            f"{res.rule_id}: {res.reason} (decoded-instruction "
+            f"receipt in .audit-log.jsonl)"
+        ),
+        demote_to="clean",
+        refuter_grade="heuristic",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -119,64 +332,153 @@ _RACE_CWES = frozenset({"CWE-362", "CWE-364", "CWE-366", "CWE-367"})
 # Thread-spawn primitives across the supported languages. Seed set,
 # deliberately small: this drives a one-way VETO (see below) where a
 # miss only means the veto doesn't fire — never new suppression.
+#
+# The kernel-space group keeps the same seed discipline as the
+# userspace one: execution-context CREATION / deferral idioms only
+# (kthreads, workqueues, tasklets, timers, IRQ handlers, softirqs,
+# RCU callbacks, SMP cross-calls). Bare synchronisation primitives
+# (spin_lock, atomic_*, rcu_read_lock) are deliberately EXCLUDED:
+# they mark shared-state discipline rather than concurrent execution,
+# and they appear verbatim in vendored kernel-style headers and
+# lock-shim libraries of genuinely single-threaded userspace projects
+# — matching them would fire false vetoes exactly where the
+# single-threaded demotion is correct. The same rule drops bare
+# ``add_timer``: it is a generic English name userspace event loops
+# define for same-thread callbacks, and kernel timer users are
+# reached through ``timer_setup`` / ``mod_timer`` regardless (the
+# init and canonical arming calls).
 _THREADING_PRIMITIVE_RE = re.compile(
     rb"pthread_create|std::j?thread|std::async"
     rb"|CreateThread|_beginthread"
     rb"|threading\.Thread|multiprocessing\.|concurrent\.futures"
     rb"|\bgo\s+func\b|thread::spawn|tokio::spawn"
     rb"|new\s+Thread\s*\(|ExecutorService"
+    # ── kernel-space concurrency contexts ──
+    rb"|\bkthread_(?:create|run)\b|\bkernel_thread\b"
+    rb"|\bqueue_(?:delayed_)?work\b|\bschedule_(?:delayed_)?work\b"
+    rb"|\bINIT_(?:DELAYED_)?WORK\b|\bDECLARE_(?:DELAYED_)?WORK\b"
+    rb"|\btasklet_(?:init|setup|schedule)\b"
+    rb"|\btimer_setup\b|\bmod_timer\b"
+    rb"|\brequest_(?:threaded_)?irq\b"
+    rb"|\bopen_softirq\b|\bsmp_call_function"
+    rb"|\bcall_rcu\b"
 )
 _SOURCE_EXTS = frozenset({
     ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp",
     ".py", ".go", ".rs", ".java", ".kt", ".cs",
 })
 _SKIP_DIRS = frozenset({".git", "node_modules", "vendor", "third_party"})
-_VETO_SCAN_MAX_FILES = 2000
+
+# Veto-scan file budget: floor (small/unknown runs — the previous
+# fixed cap), a per-checklist-file multiplier, and an absolute
+# ceiling. The scan walks the WHOLE target tree while the checklist
+# is the scoped subset, so the budget scales at 4x the checklist
+# file count (measured trees run ~3-8x their scoped checklist; a
+# kernel-scale 6,000-file checklist derives 24,000 — most of a ~50k
+# file tree, and any shortfall now degrades loudly instead of
+# silently). Both directions: LOWER re-opens the defect this
+# derivation fixes — thread primitives outside the scanned slice
+# never veto, so a wrong single_threaded claim demotes race findings
+# unvetoed on exactly the most concurrency-rich target class; HIGHER
+# buys wall time — the walk reads up to _VETO_SCAN_MAX_BYTES per file
+# once per (run, target), so the ceiling bounds the worst case at
+# ~7.5 GiB of reads on a degenerately fat tree (typical source files
+# keep it far smaller, and the scan short-circuits on the first
+# primitive hit).
+_VETO_SCAN_FLOOR_FILES = 2000
+_VETO_SCAN_FILES_PER_CHECKLIST_FILE = 4
+_VETO_SCAN_CEILING_FILES = 30_000
 _VETO_SCAN_MAX_BYTES = 256 * 1024
 
-_threading_seen_cache: dict[str, bool] = {}
+
+class _VetoScan(NamedTuple):
+    """Result of one thread-primitive veto scan.
+
+    ``partial`` is True only when the file budget stopped the walk
+    before the tree was covered AND no primitive was found — a
+    decisive hit (``seen=True``) needs no completeness claim.
+    """
+
+    seen: bool
+    partial: bool
 
 
-def _threading_primitives_seen(target_path) -> bool:
+_threading_seen_cache: dict[tuple[str, int], _VetoScan] = {}
+
+
+def _veto_scan_budget(checklist: dict[str, Any] | None) -> int:
+    """File budget for the veto scan, derived from checklist size."""
+    files = (checklist or {}).get("files")
+    n_files = len(files) if isinstance(files, list) else 0
+    return max(
+        _VETO_SCAN_FLOOR_FILES,
+        min(n_files * _VETO_SCAN_FILES_PER_CHECKLIST_FILE,
+            _VETO_SCAN_CEILING_FILES),
+    )
+
+
+def _threading_primitives_seen(
+    target_path: Path | str,
+    max_files: int = _VETO_SCAN_FLOOR_FILES,
+) -> _VetoScan:
     """Bounded scan: does the target visibly spawn threads anywhere?
 
-    Cached per target path. Read errors and the file/byte caps fail
-    toward False — i.e. toward NOT vetoing — so a partial scan can
-    only under-veto, never over-suppress.
+    Cached per (target path, file budget). Read errors and the
+    file/byte caps fail toward ``seen=False`` — i.e. toward NOT
+    vetoing — so a partial scan can only under-veto, never
+    over-suppress. When the file budget binds without a hit the
+    result is marked ``partial`` and logged loudly (once per cache
+    key): the single_threaded claim was only partially vetted, and
+    demotions made under it must say so.
     """
-    key = str(target_path)
+    key = (str(target_path), max_files)
     cached = _threading_seen_cache.get(key)
     if cached is not None:
         return cached
     import os as _os
     seen = False
+    cap_hit = False
     scanned = 0
-    for root, dirnames, filenames in _os.walk(key):
+    for root, dirnames, filenames in _os.walk(key[0]):
         dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
         for fn in filenames:
             if _os.path.splitext(fn)[1] not in _SOURCE_EXTS:
                 continue
             scanned += 1
-            if scanned > _VETO_SCAN_MAX_FILES:
+            if scanned > max_files:
+                cap_hit = True
                 break
             try:
-                with open(_os.path.join(root, fn), "rb") as f:
+                f = open_regular(_os.path.join(root, fn), "rb")
+                if f is None:
+                    continue
+                with f:
                     if _THREADING_PRIMITIVE_RE.search(
                             f.read(_VETO_SCAN_MAX_BYTES)):
                         seen = True
                         break
             except OSError:
                 continue
-        if seen or scanned > _VETO_SCAN_MAX_FILES:
+        if seen or cap_hit:
             break
-    _threading_seen_cache[key] = seen
-    return seen
+    result = _VetoScan(seen=seen, partial=(cap_hit and not seen))
+    if result.partial:
+        logger.warning(
+            "architecture gate: thread-primitive veto scan PARTIAL — "
+            "file budget (%d) reached before the tree at %s was "
+            "covered and no primitive was found; single_threaded race "
+            "demotions from this run carry a partial-scan marker",
+            max_files, key[0],
+        )
+    _threading_seen_cache[key] = result
+    return result
 
 
 def _is_single_threaded(
     domain_model: dict[str, Any] | None,
     config,
-) -> bool:
+    checklist: dict[str, Any] | None = None,
+) -> tuple[bool, bool]:
     """Determine if the target is single-threaded.
 
     Only the domain model's ``architecture.threading_model`` field
@@ -192,20 +494,32 @@ def _is_single_threaded(
     spawns threads, the single-threaded claim is provably wrong and
     must not demote race findings. The veto can only prevent wrong
     suppression, never add it.
+
+    Returns ``(single_threaded, veto_scan_partial)``: the second
+    element is True when the claim stood but the veto scan's file
+    budget bound before the tree was covered — the claim was only
+    partially vetted and demotions made under it must carry that.
+    ``checklist`` (when the caller holds it) sizes the scan budget.
     """
     if not domain_model:
-        return False
+        return (False, False)
     arch = domain_model.get("architecture", {})
     if arch.get("threading_model", "") != "single_threaded":
-        return False
+        return (False, False)
     target = getattr(config, "target_path", None) if config else None
-    if target and _threading_primitives_seen(target):
-        logger.info(
-            "architecture gate: single_threaded claim vetoed — thread "
-            "primitives visible in %s; race findings NOT demoted", target,
+    if target:
+        scan = _threading_primitives_seen(
+            target, _veto_scan_budget(checklist),
         )
-        return False
-    return True
+        if scan.seen:
+            logger.info(
+                "architecture gate: single_threaded claim vetoed — "
+                "thread primitives visible in %s; race findings NOT "
+                "demoted", target,
+            )
+            return (False, False)
+        return (True, scan.partial)
+    return (True, False)
 
 
 # Per-checklist memoisation for the call-graph structures the gates
@@ -241,9 +555,16 @@ def _signal_reachable_set(
     Walks the call graph from any function registered via signal() or
     sigaction().  Returns frozenset of ``"file:function"`` keys.
 
-    Falls back to empty set if signal handlers can't be identified
-    (safe: gate won't suppress).  Memoised per checklist identity —
-    the gate runs once per outcome on the same checklist.
+    Discovery is deliberately shallow: direct ``signal``/``sigaction``
+    call chains plus a handler-name heuristic. Handlers registered
+    through dispatch tables, wrapper functions, or stored function
+    pointers are MISSED — and a missed handler means the empty/partial
+    set fails toward the architecture gate DEMOTING its race findings
+    (the signal-reachability exception never fires for it), not toward
+    keeping them. The gate's heuristic refuter grade is what bounds
+    that direction; broader discovery would need real pointer analysis.
+    Memoised per checklist identity — the gate runs once per outcome
+    on the same checklist.
     """
     if not checklist:
         return frozenset()
@@ -340,10 +661,17 @@ def _refute_by_architecture(
     if not matched:
         return None
 
-    if not _is_single_threaded(domain_model, config):
+    single_threaded, scan_partial = _is_single_threaded(
+        domain_model, config, checklist,
+    )
+    if not single_threaded:
         return None
 
-    # Exception: functions reachable from signal handlers can race
+    # Exception: functions reachable from signal handlers can race.
+    # Discovery misses table/wrapper-registered handlers (see
+    # _signal_reachable_set) — a miss demotes that handler's race
+    # findings rather than sparing them, bounded only by this gate's
+    # heuristic grade.
     sig_set = _signal_reachable_set(checklist)
     func_key = f"{outcome.file}:{outcome.function}"
     bare_key = f":{outcome.function}"
@@ -356,12 +684,25 @@ def _refute_by_architecture(
     # unverified LLM output derived from the untrusted target. The
     # thread-primitive veto only bounds the failure direction; it
     # cannot make the claim mechanically true.
+    reason = (
+        f"single-threaded target, function {outcome.function} not "
+        f"reachable from signal handlers — {cwe_label} impossible"
+    )
+    if scan_partial:
+        # The veto scan's file budget bound before the tree was
+        # covered: the claim was only partially vetted. The marker
+        # rides the reason text so it lands everywhere the demotion
+        # is recorded (the journal row via _demote_outcome and the
+        # .audit-log.jsonl refutation_gate record) with no reader
+        # changes.
+        reason += (
+            " [thread-primitive veto scan partial: file budget "
+            "reached before the tree was covered — the "
+            "single_threaded claim was only partially vetted]"
+        )
     return RefutationVerdict(
         gate="architecture",
-        reason=(
-            f"single-threaded target, function {outcome.function} not "
-            f"reachable from signal handlers — {cwe_label} impossible"
-        ),
+        reason=reason,
         demote_to="clean",
         refuter_grade="heuristic",
     )
@@ -688,7 +1029,9 @@ _WRAP_CAPABLE_OP_KW = re.compile(
     r"|multipl|\bproduct\b|\btimes\b|\bscal(?:e|ed|es|ing)\b"
     r"|\bdoubl|\bsquar"
     # shift: "left shift", "left-shifted", "shifted (to the) left", <<
-    r"|left[- ]shift|shift\w*\s+(?:\S+\s+){0,2}left|<<"
+    # shift\w run bounded: unbounded, every "shift" planted inside
+    # one hostile word re-scans the word's remainder — quadratic.
+    r"|left[- ]shift|shift\w{0,64}\s+(?:\S+\s+){0,2}left|<<"
     # truncation / cast narrowing
     r"|truncat|narrow(?:ed|ing)?|\bcast(?:s|ed|ing)?\b|\bdowncast"
     r"|\bmodulo\b"
@@ -703,6 +1046,97 @@ _WRAP_CAPABLE_OP_KW = re.compile(
     r"|\*\s*[(\d]",
     re.IGNORECASE,
 )
+
+
+# Narrowing-DESTINATION net: a hypothesis that names a destination
+# type too small for the table entry's return range describes a
+# narrowing store ("stored into a uint8_t field", "assigned to an
+# unsigned char member", "written into a u8 length field") — the
+# same wrap class as an explicit truncate/cast spelling, but carrying
+# none of the _WRAP_CAPABLE_OP_KW vocabulary.  The range table
+# precludes nothing about a store into a narrower type, so the gate
+# must stand down on these spellings rather than proof-refute.
+# Matched: fixed-width C/Rust/kernel spellings (uint8_t, int16_t, u8,
+# i16, __le16, u_int8_t), char/short families, ``byte``, and plain
+# "8-bit"/"16-bit" width prose (treated as unsigned — the generous
+# direction for keeping sound refutations is taken only where the
+# spelling itself pins signedness).  Over-matching is safe: the gate
+# only stands down.
+_NARROW_DEST_RE = re.compile(
+    r"\b(?:"
+    r"(?:__)?(?P<fixsign>u|s|i|le|be)(?P<fixbits>8|16|32|64)\b"
+    r"|u?_?int(?P<stdbits>8|16|32|64)_t\b"
+    r"|(?P<uchar>unsigned\s+char)\b"
+    r"|(?P<char>(?:signed\s+)?char)\b"
+    r"|(?P<ushort>unsigned\s+short)\b"
+    r"|(?P<short>short)\b"
+    # ``byte`` as a TYPE name only — "2-byte"/"2 byte" width prose
+    # describes the source value, not a destination.
+    r"|(?P<byte>(?<![\d-])(?<!\d )byte)\b"
+    r"|(?P<prosebits>8|16|32|64)[- ]bit"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _dest_type_max(m: re.Match) -> int:
+    """Largest value the matched destination-type spelling can hold."""
+    text = m.group(0).lower()
+    if m.group("uchar"):
+        return 0xFF
+    if m.group("char"):
+        return 0x7F  # plain char signedness is implementation-defined
+        # — judge it signed, the stand-down direction.
+    if m.group("ushort"):
+        return 0xFFFF
+    if m.group("short"):
+        return 0x7FFF
+    if m.group("byte"):
+        return 0xFF
+    bits = int(
+        m.group("fixbits") or m.group("stdbits") or m.group("prosebits"),
+    )
+    if m.group("fixsign"):
+        signed = m.group("fixsign").lower() in ("s", "i")
+    elif m.group("stdbits"):
+        signed = not text.lstrip("_").startswith("u")
+    else:
+        signed = False  # "N-bit" prose: judged unsigned (see net note)
+    return (1 << (bits - 1)) - 1 if signed else (1 << bits) - 1
+
+
+def _narrowest_named_dest_max(text: str) -> int | None:
+    """The smallest max-value among destination-type spellings named
+    in *text*, or None when no such type is named."""
+    best: int | None = None
+    for m in _NARROW_DEST_RE.finditer(text):
+        cap = _dest_type_max(m)
+        if best is None or cap < best:
+            best = cap
+    return best
+
+
+def _find_bounded_name_token(text: str, func_name: str) -> int:
+    """Position of *func_name* as a standalone token in *text*, or -1.
+
+    A plain substring search matched the libc name INSIDE a custom
+    identifier ("utf8_tolower", "net_ntohs_unaligned") and applied the
+    libc return-range guarantee — a proof-grade, clean-demoting fact —
+    to a function it says nothing about. Word-boundary matching keeps
+    the guarantee scoped to the named libc function ("ntohs(x)",
+    "the ntohs value" still match); an embedding identifier reads as an
+    unknown function and the gate stands down — inconclusive, never
+    refuted.
+    """
+    return next(_iter_bounded_name_tokens(text, func_name), -1)
+
+
+def _iter_bounded_name_tokens(text: str, func_name: str) -> Iterator[int]:
+    """Every standalone-token position of *func_name* in *text*, under
+    the same word-boundary discipline as :func:`_find_bounded_name_token`
+    (an embedding identifier never matches)."""
+    for m in re.finditer(rf"\b{re.escape(func_name)}\b", text):
+        yield m.start()
 
 
 def _refute_by_known_return_type(
@@ -764,7 +1198,7 @@ def _refute_by_known_return_type(
     best: tuple[str, str, int, int] | None = None  # (name, type, max, dist)
     for func_name, (ret_type, _min_val, max_val) in \
             _KNOWN_RETURN_BOUNDS.items():
-        func_pos = hyp_lower.find(func_name)
+        func_pos = _find_bounded_name_token(hyp_lower, func_name)
         if func_pos < 0:
             continue
 
@@ -788,12 +1222,25 @@ def _refute_by_known_return_type(
 
     if best is not None:
         func_name, ret_type, max_val, _ = best
+        # Narrowing-store stand-down: the hypothesis names a
+        # destination type that cannot hold the entry's maximum
+        # ("stored into a uint8_t field" against ntohs's 0xffff).
+        # That is truncation spelled with a store verb — no
+        # truncate/cast/operator vocabulary required — and the
+        # return range precludes nothing about it, so the gate
+        # abstains.  A destination wide enough for the range
+        # ("stored into a uint32_t counter") keeps the refutation:
+        # the cited range argument still holds there.
+        dest_max = _narrowest_named_dest_max(hyp_lower)
+        if dest_max is not None and dest_max < max_val:
+            return None
         # Grade: PROOF. The refuting fact is the named function's
         # return range — an ISO C / POSIX guarantee that is
         # mechanically true regardless of how the hypothesis text is
         # interpreted; the table admits only ranges that fit signed
         # int, and the underflow / buffer-overflow / wrap-capable-op
-        # bail-outs above keep the range argument applicable to what
+        # / narrowing-destination bail-outs above keep the range
+        # argument applicable to what
         # remains (the raw value in int-width use). Known residual: a target
         # that shadows the libc name (macro or local redefinition)
         # breaks the premise — the gate matches the NAME in the
@@ -819,6 +1266,43 @@ _SELF_REFUTATION_CWES = frozenset({
     "CWE-362", "CWE-364", "CWE-366",
     "CWE-416", "CWE-415",
 })
+
+_EXTERNAL_PREMISE_WORDS = (
+    "caller", "callers", "call site", "call sites", "callee",
+    "callees", "upstream", "api contract", "api guarantees",
+    "contract guarantees", "before this function", "before calling",
+    "grace period", "pre-validate", "pre-validates",
+)
+_GUARANTEE_VERBS = (
+    "caps", "clamps", "pins", "pinned", "validates", "ensures",
+    "guarantees", "prevents", "serialises", "serializes",
+    "serialised", "serialized", "protected by", "held across",
+    "bounded by", "never returns", "never exceeds", "cannot exceed",
+    "re-points", "repoints",
+)
+_EXTERNAL_SYMBOL_RE = re.compile(r"\b[a-z][a-z0-9]*_[a-z0-9_]+\b")
+
+
+def _counter_scope_cross_function(h: dict[str, Any]) -> bool:
+    """Does this hypothesis's refutation rest on a cross-function premise?
+
+    Prefers the structured ``counter_scope`` field; falls back to
+    keyword matching on counter text for older responses that omit it.
+    """
+    scope = str(h.get("counter_scope") or "").strip().lower()
+    if scope == "cross_function":
+        return True
+    if scope == "local":
+        return False
+    counter = (h.get("counter") or "").strip().lower()
+    if len(counter) < 20:
+        return False
+    if any(w in counter for w in _EXTERNAL_PREMISE_WORDS):
+        return True
+    return (
+        bool(_EXTERNAL_SYMBOL_RE.search(counter))
+        and any(v in counter for v in _GUARANTEE_VERBS)
+    )
 
 
 def _receipt_matches_mechanism(check_type: str, mechanism: str) -> bool:
@@ -851,8 +1335,6 @@ _TEARDOWN_DISCHARGEABLE_CWES = frozenset({
     "CWE-415", "CWE-416",
 })
 
-from pathlib import Path
-
 # Go internal-concurrency witness (goconc): the Go analog of the
 # race-protection discharge.  The C witness bails on Go sources, so a
 # race-family self-refutation on a Go function always floored even
@@ -884,8 +1366,11 @@ _GOCONC_INTERNAL_HYP_RE = re.compile(
     r"|(?:package|library)\s+spawns?\b"
     r"|spawns?\s+no\s+goroutines?"
     r"|no\s+goroutines?\s+(?:in|inside|within)\b"
-    r"|concurrent\w*\s+(?:\w+\s+){0,2}?\w*opt(?:s|ions?)?\b"
-    r"|\w*opt(?:s|ions?)\b[^.;]{0,80}?concurrent",
+    # Word runs bounded (and the bare-prefix branch \b-pinned):
+    # unbounded, every keyword planted inside one hostile word
+    # re-scans the word's remainder — quadratic on hypothesis text.
+    r"|concurrent\w{0,64}\s+(?:\w+\s+){0,2}?\w{0,64}opt(?:s|ions?)?\b"
+    r"|\b\w{0,64}opt(?:s|ions?)\b[^.;]{0,80}?concurrent",
     re.IGNORECASE,
 )
 
@@ -1073,6 +1558,119 @@ def _record_goconc_discharge(
         return False
 
 
+def _record_witness_discharge(
+    outcome,
+    out_dir,
+    *,
+    mechanism: str,
+    corroboration: list[str],
+) -> bool:
+    """Accept-with-record: persist an in-function-witness discharge.
+
+    The race-protection / safe-teardown witnesses override the
+    receipt-free CWE-allowlist floor exactly like the goconc witness
+    does, so the same doctrine applies: the discharged dismissal goes
+    through the suppressions.jsonl single-writer chokepoint with
+    ``dropped: false`` and a verdict naming the witness, so operators
+    can grep every function these witnesses kept clean.  Returns True
+    only when the row VERIFIABLY landed; the caller refuses the
+    discharge on False — an unrecordable discharge must not happen at
+    all.
+
+    ``record_suppression`` is best-effort BY CONTRACT — it swallows
+    ``OSError``/``TypeError``/``ValueError`` and logs at debug — so a
+    clean return from it is not evidence the row was written (an
+    unwritable out_dir returns cleanly with nothing on disk).
+    Record-or-refuse needs proof: capture the trail size before the
+    call, read back the appended region after it, and accept only
+    when THIS discharge's row is in it.
+    """
+    if not out_dir:
+        logger.debug(
+            "in-function witness discharge for %s:%s refused "
+            "(no out_dir to record)",
+            getattr(outcome, "file", "?"),
+            getattr(outcome, "function", "?"),
+        )
+        return False
+    try:
+        import json as _json
+
+        from core.analysis.reach_chokepoint import record_suppression
+
+        line = getattr(outcome, "line", 0) or 0
+        fpath = getattr(outcome, "file", "")
+        func = getattr(outcome, "function", "")
+        finding_id = f"audit-refutation:{fpath}:{func}:{line}"
+        verdict = "in_function_witness_corroborates_dismissal"
+        trail = Path(out_dir) / "suppressions.jsonl"
+        try:
+            offset = trail.stat().st_size
+        except OSError:
+            offset = 0
+        record_suppression(
+            Path(out_dir),
+            finding={
+                "finding_id": finding_id,
+                "rule_id": "audit:in-function-witness",
+                "file_path": fpath,
+                "line": line,
+                "function": func,
+            },
+            verdict=verdict,
+            reason=(
+                f"self-refutation accepted: the dismissal is "
+                f"mechanically corroborated by the in-function "
+                f"witness ({'; '.join(corroboration)})"
+            ),
+            dropped=False,
+            extra={
+                "stage": "anti-self-refutation",
+                "witness": "in_function",
+                "floor_gate": "cwe_allowlist",
+                "corroboration": list(corroboration),
+                "hypothesis": (mechanism or "")[:160],
+            },
+        )
+        # Durability verification: only the appended region is read
+        # (the trail is append-only with a single writer), and only a
+        # parseable row carrying this discharge's identity counts.
+        # open_regular returns None for a missing, irregular, or
+        # symlinked trail — all mean the row verifiably did not land
+        # in a legitimate trail, so refuse exactly like an absent row.
+        fh = open_regular(trail, "rb")
+        if fh is None:
+            logger.debug(
+                "in-function witness discharge record for %s:%s did "
+                "not land in %s — refusing the discharge (trail "
+                "missing or not a regular file)",
+                fpath, func, trail,
+            )
+            return False
+        with fh:
+            fh.seek(offset)
+            appended = fh.read()
+        for raw in appended.splitlines():
+            try:
+                row = _json.loads(raw)
+            except ValueError:
+                continue
+            if (row.get("verdict") == verdict
+                    and row.get("finding_id") == finding_id):
+                return True
+        logger.debug(
+            "in-function witness discharge record for %s:%s did not "
+            "land in %s — refusing the discharge",
+            fpath, func, trail,
+        )
+        return False
+    except Exception:
+        logger.debug(
+            "in-function witness discharge record failed", exc_info=True,
+        )
+        return False
+
+
 # TU-local caller-held-lock witness (caller_lock): the caller-context
 # analog of the race-protection discharge.  The in-function C witness
 # only sees lexical lock scopes inside the reviewed function, so a
@@ -1117,7 +1715,8 @@ _CALLERLOCK_HELD_BY_CALLER_RE = re.compile(
     r"|\bcalled\s+(?:with|under|while)\b[^.;]{0,80}?\b(?:held"
     r"|locked)\b"
     r"|\b(?:under|with)\b[^.;]{0,60}?\bheld\s+by\b"
-    r"|serial\w*\s+(?:by|via|through|at)\s+(?:the\s+|its\s+|each\s+"
+    # serial\w run bounded (same rationale as the goconc word runs).
+    r"|serial\w{0,64}\s+(?:by|via|through|at)\s+(?:the\s+|its\s+|each\s+"
     r"|every\s+)?call(?:er|ers|ing)?\b",
     re.IGNORECASE,
 )
@@ -1240,19 +1839,24 @@ _DETECTOR_FAMILY_HYP_RES: dict[str, re.Pattern] = {
         # undersiz* only next to a table/segment-shaped object — a
         # ring/allocation "undersized" by a race or an integer wrap
         # is another family's lane.
-        r"undersiz\w*[^.;]{0,80}?(?:scatterlist|"
+        # Keyword \w runs bounded to real English-suffix length:
+        # unbounded, every keyword planted inside one hostile word
+        # re-scans the word's remainder — quadratic on hypothesis
+        # text — and a wide bound still multiplies against the
+        # adjacent bounded span (the two overlap on word chars).
+        r"undersiz\w{0,12}[^.;]{0,80}?(?:scatterlist|"
         r"sg (?:table|list|array|vec|entr\w*)|entr\w*|segments?|"
         r"fragments?|frag_list|mapping|\btable\b)|"
         r"(?:scatterlist|sg (?:table|list|array|vec|entr\w*)|"
         r"frag_list|fragmented|non.linear|\btable\b|mapping)"
         r"[^.;]{0,80}?undersiz|"
-        r"undercount\w*[^.;]{0,80}?(?:entr\w*|segments?|fragments?|"
+        r"undercount\w{0,12}[^.;]{0,80}?(?:entr\w*|segments?|fragments?|"
         r"scatterlist|sg |slots?)|"
         r"(?:scatterlist|sg (?:table|list|array|vec|entr\w*))"
         r"[^.;]{0,80}?(?:overflow|overrun|too small|too few|short|"
         r"exceed|past the end|beyond)|"
         r"(?:overflow|overrun|writes? past|walks? (?:beyond|past)|"
-        r"exceed\w*)[^.;]{0,80}?(?:scatterlist|"
+        r"exceed\w{0,12})[^.;]{0,80}?(?:scatterlist|"
         r"sg (?:table|list|array|vec|entr\w*)|allocated entr\w*|"
         r"the table)|"
         r"too few (?:sg )?(?:slots?|entr\w*|elements?)|"
@@ -1275,7 +1879,8 @@ _DETECTOR_FAMILY_HYP_RES: dict[str, re.Pattern] = {
         r"(?:failure|error) (?:return|signal|code|value)"
         r"[^.;]{0,80}?(?:not fail.closed|fail.open)|"
         r"tri-?state[^.;]{0,80}?binary|"
-        r"bypass\w*[^.;]{0,80}?(?:==\s*-1|-1 (?:check|comparison|"
+        # bypass\w run bounded to suffix length (see the runs above).
+        r"bypass\w{0,12}[^.;]{0,80}?(?:==\s*-1|-1 (?:check|comparison|"
         r"test))|"
         r"(?:==\s*-1|-1 (?:check|comparison))[^.;]{0,80}?"
         r"(?:bypass|miss|escape|fall)",
@@ -1332,12 +1937,13 @@ def _bounded_name_near_overflow_claim(mechanism_lower: str) -> bool:
     mention of ntohs() three sentences away from an unrelated
     overflow claim must not read as a range proof for that claim."""
     for func_name in _KNOWN_RETURN_BOUNDS:
-        pos = mechanism_lower.find(func_name)
-        if pos < 0:
-            continue
-        window = mechanism_lower[max(0, pos - 100):pos + 100]
-        if _OVERFLOW_KW.search(window):
-            return True
+        # Every occurrence gets the window, not just the first — a
+        # name mentioned early in passing must not mask its later
+        # mention right next to the overflow claim.
+        for pos in _iter_bounded_name_tokens(mechanism_lower, func_name):
+            window = mechanism_lower[max(0, pos - 100):pos + 100]
+            if _OVERFLOW_KW.search(window):
+                return True
     return False
 
 
@@ -1624,8 +2230,6 @@ def _record_floor_dominance(
         )
         return False
     try:
-        from pathlib import Path
-
         from core.analysis.reach_chokepoint import record_suppression
 
         line = getattr(outcome, "line", 0) or 0
@@ -2024,18 +2628,34 @@ def rescue_self_refuted(
             # floored.
             discharged |= _TEARDOWN_DISCHARGEABLE_CWES
         if cwes and cwes <= discharged:
-            logger.info(
-                "anti-self-refutation: accepting self-refutation for "
-                "%s — mechanically corroborated (%s)",
-                getattr(outcome, "function", "?"),
-                "; ".join(
-                    ([("race: full lock protection")] if race_protected
-                     and cwes & _LOCK_DISCHARGEABLE_RACE_CWES else [])
-                    + ([f"lifetime: {teardown_reason}"] if teardown_safe
-                       and cwes & _TEARDOWN_DISCHARGEABLE_CWES else [])
-                ),
+            corroboration = (
+                (["race: full lock protection"] if race_protected
+                 and cwes & _LOCK_DISCHARGEABLE_RACE_CWES else [])
+                + ([f"lifetime: {teardown_reason}"] if teardown_safe
+                   and cwes & _TEARDOWN_DISCHARGEABLE_CWES else [])
             )
-            continue
+            # Same record-or-refuse doctrine as the goconc / caller-
+            # lock lanes: the discharge overrides the CWE-allowlist
+            # floor, so it must land as a durable dropped:false row —
+            # an unrecordable discharge does not happen, and the
+            # floor logic below decides instead.
+            if _record_witness_discharge(
+                outcome, _witness_out,
+                mechanism=mechanism, corroboration=corroboration,
+            ):
+                logger.info(
+                    "anti-self-refutation: accepting self-refutation "
+                    "for %s — mechanically corroborated (%s)",
+                    getattr(outcome, "function", "?"),
+                    "; ".join(corroboration),
+                )
+                continue
+            logger.info(
+                "anti-self-refutation: in-function witness discharge "
+                "for %s refused — accept-with-record could not write "
+                "its record",
+                getattr(outcome, "function", "?"),
+            )
         # Go internal-concurrency discharge: race-family only, Go
         # sources only, in-family claims only, only under the
         # operator's repo-trust assertion, and NEVER on a function
@@ -2234,6 +2854,23 @@ def rescue_self_refuted(
                 ),
                 demote_to="suspicious",
             )
+        # Cross-function scope: the refutation cites a guarantee
+        # from code outside the reviewed function ("the caller
+        # validates the format", "that helper caps the length").
+        # The reviewer never examined that code, so the claim is
+        # unverifiable from the local review alone — promote to
+        # suspicious so the sweep can dispatch a cross-function
+        # tool (Joern/CodeQL dataflow).
+        if _counter_scope_cross_function(h):
+            return RefutationVerdict(
+                gate="anti_self_refutation",
+                reason=(
+                    f"hypothesis '{mechanism[:80]}' refuted by "
+                    f"citing a cross-function guarantee the "
+                    f"review did not verify"
+                ),
+                demote_to="suspicious",
+            )
 
     return None
 
@@ -2328,6 +2965,8 @@ def diagnose_rescue(
                     **base,
                 }
             return None
+        if _counter_scope_cross_function(h):
+            return None
     return {"blocked_on": "no_matching_receipt_or_cwe", **base}
 
 
@@ -2350,7 +2989,11 @@ _CALLEE_NAME_IN_HYPO = re.compile(
 )
 
 _WRAPPER_EXCLUSION_RE = re.compile(
-    r"\*\s*\(|\([^)]*\*\s*\)"
+    # The cast-shaped paren span is bounded: unbounded, every "("
+    # planted inside the span makes each occurrence re-scan the rest
+    # of the (hostile) function body — quadratic. A real cast operand
+    # sits far inside 256 chars.
+    r"\*\s*\(|\([^)]{0,256}\*\s*\)"
     r"|\b(?:memcpy|memset|memmove|copy_from_user|copy_to_user)\b"
     r"|\b(?:k?m?alloc|calloc|realloc|kzalloc|kmalloc|vmalloc)\b",
 )

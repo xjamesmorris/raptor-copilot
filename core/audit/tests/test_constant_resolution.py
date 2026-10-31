@@ -10,10 +10,10 @@ Adversarial tests from the safety contract's documented blind spots:
 
 from __future__ import annotations
 
-import time
-
 import pytest
 from pathlib import Path
+
+from core.testing.wallclock import cpu_budget
 
 from core.audit.constant_resolution import (
     build_unique_constants,
@@ -139,9 +139,10 @@ class TestEvaluationCaps:
     quickly instead of forcing a huge bigint."""
 
     def test_huge_shift_returns_none_quickly(self):
-        t0 = time.monotonic()
-        assert _try_evaluate("(1<<999999999999)") is None
-        assert time.monotonic() - t0 < 1.0
+        # CPU budget, not wall clock: the pin is "no bigint work",
+        # which burns CPU; a loaded runner stalls wall time only.
+        with cpu_budget(1.0, what="huge-shift evaluation"):
+            assert _try_evaluate("(1<<999999999999)") is None
 
     def test_shift_past_cap(self):
         assert _try_evaluate("1 << 257") is None
@@ -182,10 +183,10 @@ class TestTryEvaluateBounds:
     resolve truth values as constants."""
 
     def test_hex_shift_bomb_returns_none_quickly(self):
-        import time
-        start = time.monotonic()
-        assert _try_evaluate("1<<0x7fffffff") is None
-        assert time.monotonic() - start < 1.0
+        # CPU budget, not wall clock — see
+        # test_huge_shift_returns_none_quickly.
+        with cpu_budget(1.0, what="hex-shift-bomb evaluation"):
+            assert _try_evaluate("1<<0x7fffffff") is None
 
     def test_decimal_shift_bomb(self):
         assert _try_evaluate("(1<<999999999999)") is None
@@ -354,6 +355,58 @@ class TestMultiDefinition:
         _write_file(tmp_path, "b.h", "#define FOO(x) (x)\n")
         table = build_unique_constants(tmp_path)
         assert "FOO" not in table.unique
+
+
+class TestScanComplexity:
+    """The per-definition line mapping must be a bisect over
+    precomputed offsets, not a prefix rescan — O(file × definitions)
+    stalled minutes-scale on honest 80k-define generated headers and
+    is trivially hostile-triggerable, uninterruptible by the prepass
+    budget (checked before the scan, not during)."""
+
+    def test_many_definition_header_scans_within_budget(self, tmp_path):
+        from core.audit.constant_resolution import _scan_definitions
+
+        n = 20000
+        body = "".join(
+            f"#define K_{i} {i}\n/* {'x' * 80} */\n" for i in range(n)
+        )
+        _write_file(tmp_path, "big.h", body)
+        with cpu_budget(2.5, what="20k-define header scan"):
+            defs = _scan_definitions(tmp_path)
+        assert len(defs) == n
+
+    def test_over_cap_file_is_skipped_not_buffered(
+        self, tmp_path, monkeypatch,
+    ):
+        # House 64 MiB budget (cap monkeypatched small): a planted
+        # blob is refused; other files still scan.
+        import core.audit.constant_resolution as cr
+
+        monkeypatch.setattr(cr, "_MAX_SOURCE_FILE_BYTES", 64)
+        _write_file(tmp_path, "big.h", "#define HUGE 1\n" + "x" * 200)
+        _write_file(tmp_path, "ok.h", "#define OK 2\n")
+        defs = cr._scan_definitions(tmp_path)
+        assert "OK" in defs
+        assert "HUGE" not in defs
+
+    def test_line_mapping_survives_continuations(self, tmp_path):
+        # Line numbers must stay correct through the "\\\n" joining
+        # the mapping exists for — including a definition whose OWN
+        # body is continued.
+        from core.audit.constant_resolution import _scan_definitions
+
+        _write_file(
+            tmp_path, "a.h",
+            "#define FIRST 1\n"          # line 1
+            "#define LONG_ONE \\\n"      # line 2 (body continues)
+            "    2\n"                    # line 3
+            "#define AFTER 3\n",         # line 4
+        )
+        defs = _scan_definitions(tmp_path)
+        assert defs["FIRST"][0].line == 1
+        assert defs["LONG_ONE"][0].line == 2
+        assert defs["AFTER"][0].line == 4
 
 
 class TestMacroComposition:

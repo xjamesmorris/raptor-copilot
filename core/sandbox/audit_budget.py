@@ -707,4 +707,14 @@ def from_cli_state() -> AuditBudget:
     """
     from . import state
     cli_cap = getattr(state, "_cli_sandbox_audit_budget", None)
-    return AuditBudget(global_cap=cli_cap or None)
+    # is-None check, never `or None`. NOT because 0 is a reachable
+    # value — both parse sites (cli.py and observe_cli.py) refuse
+    # `--audit-budget 0` with "must be a positive integer" — but as
+    # defensive is-None discipline: truthiness (`or`) conflates every
+    # falsy value with "unset", and if a future surface ever did
+    # deliver 0 here, `or` would silently rewrite it into
+    # DEFAULT_GLOBAL_CAP instead of letting AuditBudget.__init__ see
+    # what was asked.
+    return AuditBudget(
+        global_cap=None if cli_cap is None else int(cli_cap),
+    )

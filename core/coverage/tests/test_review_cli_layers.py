@@ -250,6 +250,120 @@ def test_show_run_entry_wins_over_index(tmp_path, capsys):
     assert "finding" not in out
 
 
+# ── show: re-adjudication queue records ──────────────────────────────
+
+def test_show_renders_readjudication_queue_records(tmp_path, capsys):
+    """A queued contradiction (recorded disproof vs later signal) at
+    this function surfaces in the unified view — with hostile record
+    bytes escaped before the terminal."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_journal(run_dir, [_entry("src/a.c", "foo", verdict="clean")])
+    (run_dir / "readjudication-queue.jsonl").write_text(
+        json.dumps({
+            "kind": "readjudication",
+            "action": "queued",
+            "site": {"file": "src/a.c", "function": "foo", "line": 3},
+            "new_claim": {"source": "scan-run", "mechanism": ["CWE-787"],
+                          "status": "not_disproven"},
+            "disproof": {
+                "source": "audit-run",
+                "status": "disproven",
+                "would_reconsider_if": "a caller\x1b[31m passes raw input",
+            },
+            "mechanism_match": True,
+        }) + "\n"
+        # Truncation markers surface as a count; junk lines skipped.
+        + json.dumps({"action": "truncated", "suppressed": 4,
+                      "note": "caps"}) + "\n"
+        + "not json\n",
+        encoding="utf-8",
+    )
+    _cli.cmd_show(_ns(file="src/a.c", function="foo", out=str(run_dir)))
+    out = capsys.readouterr().out
+    assert "Re-adjudication queued" in out
+    assert "nothing auto-overturned" in out
+    assert "scan-run" in out and "audit-run" in out
+    assert "would reconsider if" in out
+    # The queue's global truncation is restated wherever counts render.
+    assert "4 further contradiction(s) not recorded" in out
+    assert "\x1b" not in out  # record bytes escaped at render
+
+
+def test_show_surfaces_truncation_even_without_records(tmp_path, capsys):
+    """The caps are global — a truncated queue may have refused THIS
+    function's contradiction, so the marker shows even when the
+    function has no queued records."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_journal(run_dir, [_entry("src/a.c", "foo", verdict="clean")])
+    (run_dir / "readjudication-queue.jsonl").write_text(
+        json.dumps({"action": "queued",
+                    "site": {"file": "other.c", "function": "bar"},
+                    "new_claim": {}, "disproof": {}}) + "\n"
+        + json.dumps({"action": "truncated", "suppressed": 9}) + "\n",
+        encoding="utf-8",
+    )
+    _cli.cmd_show(_ns(file="src/a.c", function="foo", out=str(run_dir)))
+    out = capsys.readouterr().out
+    assert "Re-adjudication queued" not in out  # other.c's record
+    assert "9 further contradiction(s) not recorded" in out
+    assert "may have unrecorded contradictions" in out
+
+
+def test_show_no_readjudication_section_without_records(tmp_path, capsys):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_journal(run_dir, [_entry("src/a.c", "foo", verdict="clean")])
+    _cli.cmd_show(_ns(file="src/a.c", function="foo", out=str(run_dir)))
+    out = capsys.readouterr().out
+    assert "Re-adjudication" not in out
+
+
+# ── show: offload-marker attribution ─────────────────────────────────
+
+def _offload_pointer(sidecar: str) -> dict:
+    return {
+        "sidecar": sidecar, "offset": 0, "bytes": 0,
+        "sha256": "0" * 64, "fields": ["body", "hypotheses"],
+    }
+
+
+def test_show_index_stub_points_at_the_producing_run(tmp_path, capsys):
+    """An index write-boundary stub has an EMPTY sidecar name and NO
+    sidecar file on disk — the marker must send the operator to the
+    producing run's journal, never to review-journal-bodies.jsonl."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    row = _entry("src/a.c", "foo", verdict="clean")
+    row["body_offload"] = _offload_pointer("")
+    _write_index(project, {"k1": row})
+
+    _cli.cmd_show(_ns(
+        file="src/a.c", function="foo", project=str(project),
+    ))
+    out = capsys.readouterr().out
+    assert "index write-boundary slim" in out
+    assert "run r1's journal" in out
+    assert "review-journal-bodies.jsonl" not in out
+
+
+def test_show_compact_stub_wording_unchanged(tmp_path, capsys):
+    """A run-side slim stub (journal compact --slim-clean) has a real
+    sidecar file; the established marker keeps naming it."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    row = _entry("src/a.c", "foo", verdict="clean")
+    row["body_offload"] = _offload_pointer("review-journal-bodies.jsonl")
+    _write_journal(run_dir, [row])
+
+    _cli.cmd_show(_ns(file="src/a.c", function="foo", out=str(run_dir)))
+    out = capsys.readouterr().out
+    assert "review-journal-bodies.jsonl" in out
+    assert "journal compact --slim-clean" in out
+    assert "index write-boundary slim" not in out
+
+
 # ── compact: legacy-key re-homing ────────────────────────────────────
 
 def test_compact_rehomes_legacy_keys(tmp_path, capsys):
@@ -312,6 +426,109 @@ def test_compact_merges_legacy_duplicate_latest_wins(tmp_path, capsys):
 
     data = json.loads(index_path.read_text(encoding="utf-8"))
     assert data["entries"] == {proper_key: newer}
+
+
+def test_compact_leaves_non_dict_entry_values_in_place(tmp_path, capsys):
+    """A planted non-dict entry VALUE has no .get — AttributeError is
+    outside the quarantine tuple, so pre-fix the re-home loop crashed
+    with a raw traceback. Same disposition as merge_into_index's walk:
+    leave in place, never drop, keep compacting the rest."""
+    from core.coverage.journal import _entry_from_dict
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    row = _entry("src/a.c", "foo")
+    index_path = _write_index(project, {
+        "legacy-key": row,
+        "bad1": None,
+        "bad2": 7,
+    })
+
+    _cli.cmd_compact(_ns(project=str(project)))
+    out = capsys.readouterr().out
+    assert "1 legacy key(s) re-homed" in out
+
+    entries = json.loads(index_path.read_text(encoding="utf-8"))["entries"]
+    assert entries[_entry_from_dict(row).index_key] == row
+    assert entries["bad1"] is None
+    assert entries["bad2"] == 7
+
+
+def test_compact_occupied_home_with_garbage_ts_no_crash(tmp_path, capsys):
+    """A dict row with a non-str ts at the re-home destination crashed
+    the `>` compare pre-fix; garbage ts reads as "" (older than every
+    real stamp), so the genuine legacy row wins the home."""
+    from core.coverage.journal import _entry_from_dict
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    legacy = _entry("src/a.c", "foo", ts=TS_NEW)
+    proper_key = _entry_from_dict(legacy).index_key
+    occupant = dict(_entry("src/a.c", "foo"))
+    occupant["ts"] = 7
+    index_path = _write_index(project, {
+        "legacy-key": legacy,
+        proper_key: occupant,
+    })
+
+    _cli.cmd_compact(_ns(project=str(project)))
+    out = capsys.readouterr().out
+    assert "re-homed" in out
+
+    entries = json.loads(index_path.read_text(encoding="utf-8"))["entries"]
+    assert entries[proper_key] == legacy
+
+
+def test_compact_refuses_hostile_entries_container(tmp_path, capsys):
+    """Compaction is a writer: the journal module's writer gates
+    (IndexUnreadable) apply, and the file is never rewritten."""
+    import pytest
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    index_path = project / "review-journal-index.json"
+    index_path.write_text('{"entries": [1, 2]}', encoding="utf-8")
+
+    with pytest.raises(SystemExit) as exc:
+        _cli.cmd_compact(_ns(project=str(project)))
+    assert exc.value.code == 1
+    assert "Corrupt index" in capsys.readouterr().err
+    assert index_path.read_text(encoding="utf-8") == '{"entries": [1, 2]}'
+
+
+def test_compact_refuses_non_serializable_preserved_row(
+    tmp_path, capsys, monkeypatch,
+):
+    """Write-boundary inheritance: a preserved row the serializer
+    refuses (lone surrogate — parses on stdlib json) must refuse the
+    rewrite loudly instead of crashing save_json mid-compaction."""
+    import pytest
+
+    import core.coverage.journal as journal_mod
+    import core.json.utils as json_utils
+
+    # Dual-namespace stdlib-arm forcing: the setattr covers journal's
+    # function-local (call-time) imports; the setitem covers its
+    # module-level ``loads`` / ``load_json`` bindings, which after a
+    # sibling suite purges core.json.* from sys.modules read a
+    # detached module the sys.modules-only patch misses.
+    monkeypatch.setattr(json_utils, "_orjson", None)
+    monkeypatch.setitem(journal_mod.loads.__globals__, "_orjson", None)
+    project = tmp_path / "proj"
+    project.mkdir()
+    planted = (
+        '{"entries": {"legacy-key": '
+        + json.dumps(_entry("src/a.c", "foo"))
+        + ', "bad": {"body": "\\ud800evil"}}}'
+    )
+    index_path = project / "review-journal-index.json"
+    index_path.write_text(planted, encoding="ascii")
+
+    with pytest.raises(SystemExit) as exc:
+        _cli.cmd_compact(_ns(project=str(project)))
+    assert exc.value.code == 1
+    assert "Corrupt index" in capsys.readouterr().err
+    assert index_path.read_text(encoding="ascii") == planted
 
 
 # ── gaps: malformed run artifacts degrade, never traceback ───────────
@@ -410,3 +627,61 @@ def test_live_skips_line_larger_than_budget(tmp_path, capsys, monkeypatch):
     out = capsys.readouterr().out
     assert "yyyy" not in out
     assert "run completed." in out
+
+
+# ── Annotation base resolution (reads and note-writes) ──────────────
+
+
+def test_annotations_dir_uses_pin_aware_resolver(tmp_path):
+    """Reader and note-writer resolve the annotation base through
+    record.py's pin-aware resolver — the same one the orchestrator
+    and validate writers use. A local marker+parent probe here read
+    (and `note` wrote) annotations at a different level than the
+    writers for --out and standalone runs."""
+    sentinel = tmp_path / "resolved" / "annotations"
+    sentinel.mkdir(parents=True)
+    run = tmp_path / "run"
+    run.mkdir()
+    with patch(
+        "core.audit.record._resolve_annotations_dir",
+        return_value=sentinel,
+    ) as resolver:
+        assert _cli._annotations_dir(run) == sentinel
+    resolver.assert_called_once_with(run)
+
+
+def test_write_base_uses_pin_aware_resolver(tmp_path):
+    sentinel = tmp_path / "resolved" / "annotations"
+    run = tmp_path / "run"
+    run.mkdir()
+    with patch(
+        "core.audit.record._resolve_annotations_dir",
+        return_value=sentinel,
+    ) as resolver:
+        base = _cli._write_base(_ns(out=str(run), project=None))
+    assert base == str(sentinel)
+    resolver.assert_called_once_with(run)
+
+
+def test_annotations_dir_marker_and_standalone_levels(tmp_path):
+    """Pin-less legacy shapes keep their levels: a marker run reads
+    the project level, a bare standalone dir stays run-local."""
+    project = tmp_path / "project"
+    run = project / "run_1"
+    run.mkdir(parents=True)
+    (run / ".raptor-run.json").write_text("{}", encoding="utf-8")
+    (project / "annotations").mkdir()
+    assert _cli._annotations_dir(run) == project / "annotations"
+
+    standalone = tmp_path / "solo"
+    (standalone / "annotations").mkdir(parents=True)
+    assert (
+        _cli._annotations_dir(standalone) == standalone / "annotations"
+    )
+
+
+def test_annotations_dir_missing_dir_is_none(tmp_path):
+    run = tmp_path / "run"
+    run.mkdir()
+    assert _cli._annotations_dir(run) is None
+    assert _cli._annotations_dir(None) is None

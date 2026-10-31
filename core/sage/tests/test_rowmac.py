@@ -249,38 +249,64 @@ class TestShortOrEmptyKeyRefused(RowMacKeyTmpDirCase):
         rowmac._warned_paths.clear()
         self.key_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
 
+    def _torn_key(self, data: bytes) -> None:
+        """A torn key from a PAST crash: written, then aged past the
+        freshness window (explicit utime — a fresh wrong-length file
+        legitimately reads as a concurrent creator mid-write and
+        takes the race-tolerant poll instead)."""
+        self.key_path.write_bytes(data)
+        self.key_path.chmod(0o600)
+        old = os.stat(self.key_path).st_mtime - 60
+        os.utime(self.key_path, (old, old))
+
     def test_empty_key_file_refused(self):
-        self.key_path.touch(mode=0o600)
+        self._torn_key(b"")
         self.assertIsNone(rowmac._load_or_create_key())
 
     def test_short_key_file_refused(self):
-        self.key_path.write_bytes(b"short")
-        self.key_path.chmod(0o600)
+        self._torn_key(b"short")
         self.assertIsNone(rowmac._load_or_create_key())
 
     def test_mint_refuses_on_short_key(self):
-        self.key_path.write_bytes(b"\x00" * 8)
-        self.key_path.chmod(0o600)
+        self._torn_key(b"\x00" * 8)
         with self.assertRaises(RuntimeError):
             rowmac.mint({"a": "1"})
 
     def test_verify_demotes_on_short_key(self):
-        self.key_path.write_bytes(b"\x00" * 8)
-        self.key_path.chmod(0o600)
+        self._torn_key(b"\x00" * 8)
         self.assertFalse(rowmac.verify({"a": "1"}, "deadbeef" * 8))
 
     def test_short_key_never_used_never_replaced(self):
-        self.key_path.write_bytes(b"short")
-        self.key_path.chmod(0o600)
+        self._torn_key(b"short")
         with self.assertRaises(RuntimeError):
             rowmac.mint({"a": "1"})
         # The suspect key is left in place for investigation.
         self.assertEqual(self.key_path.read_bytes(), b"short")
 
     def test_refusal_is_loud(self):
-        self.key_path.touch(mode=0o600)
+        self._torn_key(b"")
         with self.assertLogs("raptor.core.sage.rowmac",
                              level="WARNING") as cm:
             rowmac._load_or_create_key()
         joined = " ".join(cm.output)
         self.assertIn("refusing key", joined)
+
+    def test_empty_key_refused_immediately_without_retry_stall(self):
+        """A stale 0-byte key must refuse through the wrong-length
+        path, not the creation-race path: pre-fix every mint/verify
+        spun the full race-retry budget (~200 ms) and warned about a
+        creation-race window, when the content is a torn write whose
+        only remedy is removing the file."""
+        self._torn_key(b"")
+        sleeps = []
+        with patch(
+            "core.security.mac_key.time.sleep", side_effect=sleeps.append,
+        ):
+            with self.assertLogs("raptor.core.sage.rowmac",
+                                 level="WARNING") as cm:
+                self.assertIsNone(rowmac._load_or_create_key())
+        self.assertEqual(sleeps, [])
+        joined = " ".join(cm.output)
+        self.assertIn("wrong length (0 bytes", joined)
+        # Never replaced: the torn key is left for investigation.
+        self.assertEqual(self.key_path.read_bytes(), b"")

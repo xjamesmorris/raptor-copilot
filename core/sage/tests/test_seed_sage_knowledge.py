@@ -11,6 +11,8 @@ Pins:
 - REPO_ROOT resolves to the repo root.
 """
 
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -142,6 +144,136 @@ class TestRepoRoot(unittest.TestCase):
         # REPO_ROOT is derived via parents[...] from the script's own
         # location; pin the level so it cannot silently drift.
         self.assertTrue((ssk.REPO_ROOT / "core" / "sage" / "scripts").is_dir())
+
+
+class TestSeedOneMemoryType(unittest.TestCase):
+    """_seed_one routes memory_type through the shared allowlist —
+    never getattr on the enum (dunder acceptance / silent-typo
+    default)."""
+
+    def _seed(self, memory_type: str):
+        import asyncio
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        mem = {"label": "x", "domain": "d", "content": "c",
+               "memory_type": memory_type, "confidence": 0.9}
+        client = AsyncMock()
+        client.embed.return_value = [0.1]
+        enum = SimpleNamespace(fact="fact", observation="observation",
+                               inference="inference", task="task")
+        with mock.patch.object(ssk, "MemoryType", enum):
+            label, status = asyncio.run(ssk._seed_one(
+                client, mem, force=True, sem=asyncio.Semaphore(1)))
+        self.assertEqual(status, "stored")
+        return client.propose.call_args.kwargs["memory_type"]
+
+    def test_fact_maps_to_enum_member(self):
+        self.assertEqual(self._seed("fact"), "fact")
+
+    def test_dunder_name_falls_back_to_observation(self):
+        # getattr(MemoryType, "__class__", ...) resolved to the class
+        # object and shipped it as the memory type.
+        self.assertEqual(self._seed("__class__"), "observation")
+
+
+class TestScriptModePathSetup(unittest.TestCase):
+    """Script-mode sys.path setup comes from RAPTOR_DIR (the
+    path-safety rule), never from __file__; without RAPTOR_DIR the
+    scripts refuse loudly instead of importing a guessed tree."""
+
+    _SCRIPTS = (
+        "core/sage/scripts/seed_sage_knowledge.py",
+        "core/sage/scripts/register_agents.py",
+    )
+
+    def _run(
+        self, script: str, with_raptor_dir: bool
+    ) -> subprocess.CompletedProcess[str]:
+        import sys as _sys
+        repo_root = ssk.REPO_ROOT
+        env = {k: v for k, v in os.environ.items() if k != "RAPTOR_DIR"}
+        if with_raptor_dir:
+            env["RAPTOR_DIR"] = str(repo_root)
+        return subprocess.run(
+            [_sys.executable, str(repo_root / script), "--help"],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+
+    def test_refuses_without_raptor_dir(self):
+        for script in self._SCRIPTS:
+            with self.subTest(script=script):
+                r = self._run(script, with_raptor_dir=False)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("RAPTOR_DIR", r.stderr + r.stdout)
+
+    def test_runs_with_raptor_dir(self):
+        for script in self._SCRIPTS:
+            with self.subTest(script=script):
+                r = self._run(script, with_raptor_dir=True)
+                # Both streams, repr'd: a script that dies with its
+                # error on stdout (the pre-fix missing-SDK gate did
+                # exactly that) otherwise yields an empty-looking
+                # diagnostic that hides the actual cause.
+                self.assertEqual(
+                    r.returncode, 0,
+                    f"--help failed: stderr={r.stderr[:500]!r} "
+                    f"stdout={r.stdout[:500]!r}",
+                )
+
+
+class TestMissingSdkGating(unittest.TestCase):
+    """The deferred sage-agent-sdk import error gates work, not usage:
+    `--help` succeeds without the SDK (environments without the
+    optional dep still get usage), while a real invocation refuses
+    with the install hint on stderr."""
+
+    _SCRIPTS = (
+        "core/sage/scripts/seed_sage_knowledge.py",
+        "core/sage/scripts/register_agents.py",
+    )
+
+    def _run_without_sdk(self, script: str, arg: str) -> subprocess.CompletedProcess[str]:
+        import sys as _sys
+        repo_root = ssk.REPO_ROOT
+        # Shadow sage_sdk with a package that raises ImportError so the
+        # test behaves identically whether or not the SDK is installed
+        # on the host. The shadow sits on PYTHONPATH, ahead of
+        # site-packages but behind RAPTOR_DIR (which has no sage_sdk).
+        with tempfile.TemporaryDirectory() as shadow:
+            pkg = Path(shadow) / "sage_sdk"
+            pkg.mkdir()
+            (pkg / "__init__.py").write_text(
+                'raise ImportError("sage-agent-sdk absent (test shadow)")\n'
+            )
+            env = dict(os.environ)
+            env["RAPTOR_DIR"] = str(repo_root)
+            prior = env.get("PYTHONPATH")
+            env["PYTHONPATH"] = shadow + (os.pathsep + prior if prior else "")
+            return subprocess.run(
+                [_sys.executable, str(repo_root / script), arg],
+                capture_output=True, text=True, env=env, timeout=60,
+            )
+
+    def test_help_works_without_sdk(self):
+        for script in self._SCRIPTS:
+            with self.subTest(script=script):
+                r = self._run_without_sdk(script, "--help")
+                # Both streams, repr'd — same rationale as
+                # test_runs_with_raptor_dir.
+                self.assertEqual(
+                    r.returncode, 0,
+                    f"--help failed: stderr={r.stderr[:500]!r} "
+                    f"stdout={r.stdout[:500]!r}",
+                )
+                self.assertIn("usage:", r.stdout)
+
+    def test_work_refuses_without_sdk_on_stderr(self):
+        for script in self._SCRIPTS:
+            with self.subTest(script=script):
+                r = self._run_without_sdk(script, "--dry-run")
+                self.assertEqual(r.returncode, 1)
+                self.assertIn("sage-agent-sdk", r.stderr)
 
 
 if __name__ == "__main__":

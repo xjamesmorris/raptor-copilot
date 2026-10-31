@@ -4,6 +4,7 @@ Exports a project output directory as a zip archive and imports
 zip archives back, with path traversal and symlink validation.
 """
 
+import fnmatch
 import os
 import shutil
 import zipfile
@@ -257,6 +258,13 @@ def export_project(project_output_dir: Path, dest_path: Path,
     with zipfile.ZipFile(dest_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for dirpath, dirnames, filenames in os.walk(project_output_dir, followlinks=False):
             dirnames[:] = [d for d in dirnames if not Path(dirpath, d).is_symlink()]
+            # The OpenAnt scanner's staged config view (any depth) can
+            # carry operator-authored LLM provider api_keys merged from
+            # ~/.config/openant/config.json. The scanner scrubs it the
+            # moment its subprocess exits; this exclusion is
+            # defense-in-depth for a stage a crashed run left behind —
+            # zip transport strips the 0600 that protects it on disk.
+            dirnames[:] = [d for d in dirnames if d != "openant-xdg"]
             if Path(dirpath) == project_output_dir:
                 # Ghidra attach/import caches never ship: the cached
                 # re-database.json is the trust-bearing artifact
@@ -398,9 +406,12 @@ def _demote_imported_annotations(output_dir: Path) -> None:
 
 
 # Findings files (relative to a run dir) whose provenance refs get
-# namespaced on import. Mirrors core/run/findings.py's _STAMP_PATHS —
-# the same files the lifecycle stamper writes canonical refs into.
-_IMPORTED_REF_REWRITE_PATHS = ("findings.json", "sca/findings.json")
+# namespaced on import: exactly the files the lifecycle stamper
+# writes canonical refs into — ONE constant, consumed from its owner,
+# so a stamp-path addition cannot leave imported refs of that file
+# un-namespaced (the pre-shared-constant mirror drifted exactly that
+# way when the openant lane landed without the ride-along).
+from core.run.findings import _STAMP_PATHS as _IMPORTED_REF_REWRITE_PATHS
 
 # Prefix stamped onto every imported provenance ref's run_id. An
 # imported archive cannot own ANY run id on this install: a
@@ -492,7 +503,48 @@ def _mark_imported_runs(output_dir: Path, archive_sha256: str) -> None:
                 or child.name in GENERATED_PROJECT_DIRS):
             continue
         save_json(child / IMPORTED_RUN_MARKER_FILE, payload)
+        _neutralise_imported_liveness(child)
         _namespace_imported_provenance_refs(child)
+
+
+def _neutralise_imported_liveness(run_dir: Path) -> None:
+    """Rewrite a restored ``status=running`` run marker to
+    ``interrupted`` and strip its session/tool identity stamps.
+
+    A restored ``.raptor-run.json`` claiming ``running`` describes a
+    session on the EXPORTING machine at export time (or a forged claim
+    from an unsigned archive) — never a process this machine's
+    lifecycle owns. Left verbatim, its foreign session stamp reads as
+    unverifiable-alive forever: every future ``start_run`` in the
+    project hits the contention gate, clean/merge/delete refuse, and
+    the abandon sweep (correctly fail-open on foreign stamps) never
+    clears it. ``interrupted`` is honest — the run did not complete
+    inside THIS project — and non-terminal state is exactly what an
+    unsigned archive must not mint. Best-effort: an unreadable or
+    oversized marker is left for the size-gated consumers to refuse.
+    """
+    from core.run.metadata import RUN_METADATA_FILE, STATUS_RUNNING, _load_meta
+    marker = run_dir / RUN_METADATA_FILE
+    if not marker.is_file():
+        return
+    try:
+        meta = _load_meta(marker)
+    except OSError:
+        return
+    if not isinstance(meta, dict) or meta.get("status") != STATUS_RUNNING:
+        return
+    meta["status"] = "interrupted"
+    meta["import_liveness_neutralised"] = True
+    for stamp in ("session_pid", "tool_pid", "tool_pid_start",
+                  "session_start", "session_boot_id", "session_pidns",
+                  "session_machine_id", "session_id"):
+        meta.pop(stamp, None)
+    save_json(marker, meta)
+    logger.info(
+        "import: neutralised restored running marker in %s "
+        "(status=running -> interrupted; session stamps stripped)",
+        run_dir.name,
+    )
 
 
 # --- Privileged-artifact quarantine ---------------------------------
@@ -534,7 +586,27 @@ _PRIVILEGED_FILE_NAMES = frozenset({
     # Derived + recomputable by re-attach, so quarantining costs
     # nothing.
     "re-database.json",
+    # Validation checklist: run-level copies are what
+    # _promote_checklist elects "newest" and copies to the project
+    # level (merging checked_by credit) — a forged archive would
+    # mint reviewed/verified checklist state the next start_run
+    # promotes into authority. Same false-suppression direction as
+    # the coverage records.
+    "checklist.json",
 })
+
+# Glob-shaped privileged families. Per-run coverage records are
+# per-tool files (``coverage-semgrep.json`` / ``coverage-read.json``
+# / legacy ``coverage-record.json``) discovered by consumers via a
+# ``coverage-*.json`` glob (core/coverage/record.py) — a fixed-name
+# set can never cover a producer-named family, which is exactly how
+# the records escaped the first quarantine cut while the project-root
+# store (``coverage.json``) was caught: a forged record minted
+# examined-coverage that shrank the gap-audit residual and passed
+# ``/project coverage --fail-under``.
+_PRIVILEGED_FILE_GLOBS = (
+    "coverage-*.json",
+)
 
 _PRIVILEGED_DIR_NAMES = frozenset({
     "witnesses",          # WitnessStore roots (manifests + blobs)
@@ -586,7 +658,9 @@ def _quarantine_imported_privileged_artifacts(output_dir: Path) -> list[str]:
             # later attach (cache mkdir hits the name collision) —
             # the export-side skip does not bind an archive author.
             if (name in _PRIVILEGED_FILE_NAMES
-                    or name in _PRIVILEGED_DIR_NAMES):
+                    or name in _PRIVILEGED_DIR_NAMES
+                    or any(fnmatch.fnmatch(name, pat)
+                           for pat in _PRIVILEGED_FILE_GLOBS)):
                 src = dp / name
                 rel = src.relative_to(root)
                 dest = _quarantine_dest(qroot, rel)
@@ -978,6 +1052,26 @@ def import_project(zip_path: Path, projects_dir: Path,
     # and demoted; the pre-existing tree (registered project with
     # --force, or an unregistered orphan the operator --force'd over)
     # is removed at the last moment before the atomic rename.
+    #
+    # Refusal must PRECEDE destruction: create()'s shared-dir refusal
+    # fires only after the old tree is rmtree'd and the staging
+    # renamed in — reaching it then has already destroyed ANOTHER
+    # project's registered output and left the registry inconsistent
+    # (import name unregistered, dir holding the imported tree). Check
+    # ownership up front and fail closed while nothing has been
+    # touched.
+    other_owner = mgr._output_dir_owner(
+        str(output_dir), exclude=project_name,
+    )
+    if other_owner:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise ValueError(
+            f"Refusing import: output dir {output_dir} already belongs "
+            f"to project '{other_owner}' — two projects must never "
+            f"share an output directory (clean/purge on one would "
+            f"delete the other's runs). Import under a different name "
+            f"or move that project first."
+        )
     orphaned_output = None
     try:
         if existing and force:

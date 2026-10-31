@@ -25,11 +25,13 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
+import re
+import tempfile
 import zipfile
 import zlib
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 SEMGREP_ENGINE_DIR = Path(__file__).resolve().parents[1]
@@ -45,9 +47,14 @@ MAX_PACK_BYTES = 32 * 1024 * 1024
 
 # Every pack RAPTOR may request at scan time.  Derived from
 # RaptorConfig.BASELINE_SEMGREP_PACKS + POLICY_GROUP_TO_SEMGREP_PACK
-# + target-type catalog entries.  Keep in sync manually — the list
-# is intentionally duplicated here so the script is standalone
-# (no RAPTOR imports needed on the connected side).
+# + the target-type catalog's semgrep_packs lists
+# (core/run/target_types/*.yml — the scanner's baseline resolver takes
+# a matched catalog entry's default packs over the config baseline).
+# The list is intentionally duplicated here so the script is
+# standalone (no RAPTOR imports needed on the connected side);
+# tests/test_cache_packs.py holds it in sync against all three
+# sources so drift fails CI instead of shipping an airgap bundle
+# missing a pack the scanner requests.
 DEFAULT_PACKS = [
     "security-audit",
     "owasp-top-ten",
@@ -58,11 +65,58 @@ DEFAULT_PACKS = [
     "xss",
     "0xdea",
     "trailofbits",
+    "django",
+    "flask",
 ]
+
+# Registry pack ids are flat lowercase names. The id is spliced into
+# both the registry URL path and the cache filename, so anything with
+# a separator (or any other unexpected character) is rejected at
+# parse — a pid like `../../x` must never reach
+# `CACHE_DIR / cache_filename(pid)` or the URL.
+_PACK_ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")
+
+
+def parse_pack_ids(packs_arg: str) -> list[str]:
+    """Split and validate a ``--packs`` argument."""
+    pack_ids = []
+    for raw in packs_arg.split(","):
+        pid = raw.strip().removeprefix("p/")
+        if not _PACK_ID_RE.fullmatch(pid):
+            msg = (
+                f"invalid pack id {pid!r} — expected a flat lowercase "
+                f"registry name ([a-z0-9][a-z0-9._-]*)"
+            )
+            raise SystemExit(msg)
+        pack_ids.append(pid)
+    return pack_ids
 
 
 def cache_filename(pack_id: str) -> str:
     return f"c.p.{pack_id}.json"
+
+
+def _write_atomic(dest: Path, data: bytes) -> None:
+    """Write a cache file via tempfile + rename (repo idiom).
+
+    The cache is read by concurrent scans; an in-place write_bytes
+    leaves a torn half-written pack visible during the write. The
+    rename is atomic on the same filesystem, and a failed write never
+    replaces the previous content or leaks the temp file.
+    """
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(dest.parent), prefix=dest.name + ".", suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp_name, dest)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def fetch_pack(pack_id: str) -> bytes:
@@ -71,10 +125,18 @@ def fetch_pack(pack_id: str) -> bytes:
     req = Request(url, headers={"Accept": "application/json"})
     try:
         resp = urlopen(req, timeout=FETCH_TIMEOUT)
-        # Bounded read: one extra byte past the cap detects "too
-        # large" without ever buffering an unbounded response.
-        data = resp.read(MAX_PACK_BYTES + 1)
-    except URLError as exc:
+        try:
+            # Bounded read: one extra byte past the cap detects "too
+            # large" without ever buffering an unbounded response.
+            data = resp.read(MAX_PACK_BYTES + 1)
+        finally:
+            resp.close()
+    except OSError as exc:
+        # OSError covers URLError/HTTPError plus the socket-level
+        # timeouts and resets that resp.read() raises directly —
+        # all of them are one pack's fetch failing, reported the
+        # same way (callers print the per-pack FAILED line and
+        # continue with the remaining packs).
         msg = f"  FAILED: {pack_id} — {exc}"
         raise SystemExit(msg) from exc
     if len(data) > MAX_PACK_BYTES:
@@ -101,7 +163,23 @@ def fetch_pack(pack_id: str) -> bytes:
             msg = f"  FAILED: {pack_id} — could not parse response: {exc}"
             raise SystemExit(msg) from exc
 
-    return json.dumps(parsed, separators=(",", ":")).encode()
+    # YAML scalars with no JSON twin (unquoted ISO dates in rule
+    # metadata: parse as datetime.date) render as strings — the shape
+    # a JSON registry response carries. Anything default=str cannot
+    # rescue (e.g. a non-string mapping key) is that one pack's
+    # failure, reported inside the per-pack contract like every other
+    # arm above — never an escaping traceback that aborts the whole
+    # fetch/update on pack 1 of N.
+    try:
+        return json.dumps(
+            parsed, separators=(",", ":"), default=str,
+        ).encode()
+    except (TypeError, ValueError) as exc:
+        msg = (
+            f"  FAILED: {pack_id} — response not JSON-serialisable: "
+            f"{exc}"
+        )
+        raise SystemExit(msg) from exc
 
 
 def cmd_list(args: argparse.Namespace) -> None:
@@ -113,7 +191,17 @@ def cmd_list(args: argparse.Namespace) -> None:
         cached_path = CACHE_DIR / cache_filename(pid)
         if cached_path.exists():
             try:
-                d = json.loads(cached_path.read_bytes())
+                # Bounded read, mirroring the fetch/import caps — the
+                # listing must not buffer an unbounded cache file.
+                with cached_path.open("rb") as fh:
+                    raw = fh.read(MAX_PACK_BYTES + 1)
+                if len(raw) > MAX_PACK_BYTES:
+                    print(
+                        f"  p/{pid:<23} {'yes':<10} {'?':<8} "
+                        f"oversize (exceeds pack cap)"
+                    )
+                    continue
+                d = json.loads(raw)
                 rules = d.get("rules", d) if isinstance(d, dict) else d
                 count = len(rules) if isinstance(rules, list) else "?"
                 lics = set()
@@ -150,7 +238,7 @@ def cmd_list(args: argparse.Namespace) -> None:
 def cmd_fetch(args: argparse.Namespace) -> None:
     """Fetch packs and bundle into a zip."""
     if args.packs:
-        pack_ids = [p.strip().removeprefix("p/") for p in args.packs.split(",")]
+        pack_ids = parse_pack_ids(args.packs)
     else:
         pack_ids = list(DEFAULT_PACKS)
 
@@ -197,6 +285,17 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     print(f"\n  {fetched}/{len(pack_ids)} packs → {zip_name} ({size_kb:.0f} KB)")
     print("  Transfer this file to the airgapped machine and run:")
     print(f"    python3 engine/semgrep/tools/cache-packs.py import {zip_name}")
+    if fetched < len(pack_ids):
+        # The partial bundle is still written (the fetched packs are
+        # useful) but the build must not report success: an airgap
+        # bundle silently missing packs is a coverage loss on exactly
+        # the machine that cannot fetch them later.
+        print(
+            f"  WARNING: bundle is INCOMPLETE — "
+            f"{len(pack_ids) - fetched} pack(s) failed (see FAILED "
+            f"lines above)"
+        )
+        raise SystemExit(1)
 
 
 def _read_member_bounded(zf: zipfile.ZipFile, name: str) -> bytes | None:
@@ -268,7 +367,7 @@ def cmd_import(args: argparse.Namespace) -> None:
                 skipped += 1
                 continue
             existed = dest.exists()
-            dest.write_bytes(data)
+            _write_atomic(dest, data)
             status = "updated" if existed else "added"
             print(f"  {status}: {name}")
             imported += 1
@@ -295,7 +394,7 @@ def cmd_import(args: argparse.Namespace) -> None:
 def cmd_update(args: argparse.Namespace) -> None:
     """Fetch packs and write directly to the local cache (requires connectivity)."""
     if args.packs:
-        pack_ids = [p.strip().removeprefix("p/") for p in args.packs.split(",")]
+        pack_ids = parse_pack_ids(args.packs)
     else:
         pack_ids = list(DEFAULT_PACKS)
 
@@ -311,7 +410,7 @@ def cmd_update(args: argparse.Namespace) -> None:
             continue
         dest = CACHE_DIR / cache_filename(pid)
         existed = dest.exists()
-        dest.write_bytes(data)
+        _write_atomic(dest, data)
         try:
             parsed = json.loads(data)
             rules = parsed.get("rules", parsed) if isinstance(parsed, dict) else parsed
@@ -324,6 +423,10 @@ def cmd_update(args: argparse.Namespace) -> None:
         updated += 1
 
     print(f"\n  {updated}/{len(pack_ids)} packs written to {CACHE_DIR}")
+    if updated < len(pack_ids):
+        # Operators and CI key off the exit code; a silent 0/N (or
+        # k/N) success code leaves the cache stale with no signal.
+        raise SystemExit(1)
 
 
 def main() -> None:

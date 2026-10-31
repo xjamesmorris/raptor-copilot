@@ -44,24 +44,54 @@ _CORRECTION_PATTERNS = [
 _LINE_REF_RE = re.compile(r"\blines?\s+(\d+)\b", re.IGNORECASE)
 
 
+# Characters that glue into multi-character operators: a claimed
+# wrong value that starts/ends with one of these only counts when the
+# neighbouring character is NOT another operator character ("=" must
+# not match inside "!=", "+=", "==", "<=", ...).
+_OP_CHARS = "=!<>+-*/&|^%~"
+_OP_CLASS = r"[=!<>+\-*/&|^%~]"
+
+
+def _standalone_re(token: str) -> re.Pattern[str]:
+    """Regex matching ``token`` only at token boundaries.
+
+    Word-shaped ends get ``\\b``-style guards; operator-shaped ends
+    get a negative lookaround against the operator character class.
+    The old substring test ("remove ``correct``, then ``wrong in
+    line``") confirmed a nonexistent symptom whenever ANY other
+    operator containing the wrong value survived — ``if (x != 0)``
+    validated a claimed ``=``-for-``==``.
+    """
+    esc = re.escape(token)
+    first, last = token[0], token[-1]
+    if first.isalnum() or first == "_":
+        prefix = r"(?<!\w)"
+    elif first in _OP_CHARS:
+        prefix = rf"(?<!{_OP_CLASS})"
+    else:
+        prefix = ""
+    if last.isalnum() or last == "_":
+        suffix = r"(?!\w)"
+    elif last in _OP_CHARS:
+        suffix = rf"(?!{_OP_CLASS})"
+    else:
+        suffix = ""
+    return re.compile(prefix + esc + suffix)
+
+
 def _value_present_not_as_correct(
     wrong: str, correct: str, lines: list[str],
 ) -> bool:
-    """Check that ``wrong`` appears in at least one line but is NOT
-    just a substring of ``correct`` at every occurrence.
+    """Check that ``wrong`` appears standalone in at least one line —
+    never as a fragment of another token or operator.
 
     Example: wrong="=", correct="==" — a line containing only "=="
-    has no standalone "=", so returns False.  A line with "x = 0"
-    has a standalone "=", so returns True.
+    (or "!=", "+=") has no standalone "=", so returns False.  A line
+    with "x = 0" has a standalone "=", so returns True.
     """
-    correct_esc = re.escape(correct)
-    for line in lines:
-        if wrong not in line:
-            continue
-        stripped = re.sub(correct_esc, "", line)
-        if wrong in stripped:
-            return True
-    return False
+    del correct  # boundary guards subsume the old removal trick
+    pattern = _standalone_re(wrong)
+    return any(pattern.search(line) for line in lines)
 
 
 def classify_semantic_confidence(

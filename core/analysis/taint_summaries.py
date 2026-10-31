@@ -25,10 +25,11 @@ Computation:
 * Per-function fixed-point inside the function's intra-procedural
   CFG (reaching-defs lifted to track param origin + sanitizer
   effect chain).
-* Outer fixed-point over the call graph for mutual recursion.
-  Cycle bail at ``max(10, 3 × N)`` iterations, where ``N`` is the
-  number of in-module functions; survivors get
-  ``summary_unconverged=True``.
+* Outer fixed-point over the call graph for mutual recursion —
+  reverse-dependency worklist (recompute a function only when a
+  summary it joins changed), pop budget ``N + max(10, 3 × N)`` for
+  ``N`` in-module functions. Budget exhaustion marks EVERY
+  non-unknown summary ``summary_unconverged=True``.
 * Dynamic dispatch (``getattr`` / ``setattr`` / ``eval`` / ``exec``
   / ``globals`` / ``locals`` / ``__import__`` / ``importlib.*`` /
   ``**kwargs`` forwarding) marks the function as
@@ -46,6 +47,7 @@ Public surface:
 from __future__ import annotations
 
 import ast
+from collections import deque
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -56,6 +58,7 @@ from core.analysis.cfg_builder import (
 from core.analysis.dataflow import reaching_defs
 from core.analysis.python_module_callgraph import (
     PyModuleCallGraph,
+    local_binding_names,
 )
 
 # ---------------------------------------------------------------------------
@@ -119,6 +122,22 @@ class TaintSummary:
     summary_unknown: bool = False
     summary_unknown_reason: str = ""
     summary_unconverged: bool = False
+    # Positional-binding boundary: how many leading ``params`` slots a
+    # call can fill BY POSITION (posonly + positional-or-keyword).
+    # ``params`` lists the ``*vararg``, keyword-only, and ``**kwarg``
+    # names as ordinary entries, so a positional arg at index >= this
+    # boundary lands in the vararg tuple (or nowhere) — index-based
+    # mapping through those slots mis-attributed flows (an
+    # exact-params-length call to ``def h(a, *rest, key=...)`` mapped
+    # its third arg onto ``key``). None = not computed (hand-built /
+    # seed summaries): consumers fall back to the legacy full-length
+    # mapping.
+    positional_limit: int | None = None
+    # Names a call can bind BY KEYWORD (positional-or-keyword +
+    # keyword-only). Excludes posonly names and the vararg/kwarg slot
+    # names — ``h(kw=1)`` against ``def h(**kw)`` lands INSIDE the kw
+    # dict, not on the ``kw`` params slot. None = not computed.
+    keyword_params: frozenset[str] | None = None
 
     # ----- query helpers -----
 
@@ -253,12 +272,34 @@ def _detect_summary_unknown(fn_ast: ast.AST) -> str | None:
     * ``**kwargs`` forwarding — any call whose keyword args list
       contains a ``**`` expansion (``g(**kwargs)``). The expanded
       content can't be statically resolved.
+    * A ``global`` / ``nonlocal`` declaration — a name bound outside
+      the local frame is not a local: any call between the tracked
+      assignment and the return can rewrite it (module slot /
+      enclosing closure), so the straight-line-locals premise the
+      propagation runs on is void for the whole function.
 
     Only the FUNCTION's own body is checked — nested function
     definitions are summarised separately so their dynamic dispatch
     doesn't poison the outer summary.
     """
     for node in ast.walk(fn_ast):
+        if isinstance(node, ast.Nonlocal):
+            # A nested def's ``nonlocal`` rebinds an ENCLOSING frame —
+            # possibly this function's locals — behind the
+            # straight-line-locals premise's back (``t = escape(s);
+            # def f(): nonlocal t; t = s; f(); return t``), so it
+            # poisons the summary from ANY nesting depth. The
+            # function's own declaration poisons as before.
+            kind = "nonlocal"
+            return f"declares {kind} {', '.join(node.names)}"
+        if isinstance(node, ast.Global):
+            if _inside_nested_function(node, fn_ast):
+                # A nested def's ``global`` binds the MODULE frame —
+                # it cannot rewrite this function's locals (module
+                # identities are poisoned separately via
+                # rebound_names / distrusted_roots).
+                continue
+            return f"declares global {', '.join(node.names)}"
         if not isinstance(node, ast.Call):
             continue
         # Skip calls inside nested function definitions — those will
@@ -272,6 +313,62 @@ def _detect_summary_unknown(fn_ast: ast.AST) -> str | None:
             if kw.arg is None:
                 # ``**expr`` — opaque expansion
                 return "forwards **kwargs"
+    return None
+
+
+# Decorators that provably preserve the decorated function's
+# call/return semantics for the taint questions the summary answers.
+# EVERY other decorator replaces the module-table binding with an
+# arbitrary wrapper object (``@nullify`` returning ``str`` swaps a
+# clean sanitizer for a raw pass-through at import time), so a
+# decorated def's summary must degrade to unknown — the name-keyed
+# joins would otherwise certify the BODY of a function the runtime
+# name no longer points at. Seed set only (<= 9 names per the vocab
+# doctrine); kept deliberately small because an over-wide allowlist
+# reopens the forge. ``@property`` is deliberately absent: a property
+# is consumed as an attribute read, never as a call-shaped join, so
+# degrading it costs nothing. Entries are TRUSTED IDENTITIES, not
+# spellings: bare ``staticmethod`` / ``classmethod`` are builtins;
+# everything else is checked AFTER resolving the written name through
+# the module's import map (``from functools import lru_cache`` →
+# ``functools.lru_cache``), and a root the module itself rebinds
+# (``def staticmethod``, ``import evil as functools``) never matches.
+_SEMANTICS_PRESERVING_DECORATORS = frozenset({
+    "staticmethod", "classmethod",
+    "abc.abstractmethod",
+    "functools.wraps", "functools.lru_cache", "functools.cache",
+    "typing.override",
+})
+
+
+def _poisoning_decorator(
+    fn_ast: ast.AST,
+    import_map: dict[str, str],
+    distrusted_roots: frozenset[str],
+) -> str | None:
+    """Name of the first decorator that voids the summary's identity
+    premise, or None when every decorator is a trusted
+    semantics-preserving identity.
+
+    The written name only counts when its root is not repo-rebound
+    (``distrusted_roots``) and its import-resolved form is in the
+    allowlist — trusting spellings let a repo define its own
+    ``staticmethod`` (or ``import evil as functools``) and keep a
+    swapped-out def certified."""
+    for dec in getattr(fn_ast, "decorator_list", ()) or ():
+        target = dec.func if isinstance(dec, ast.Call) else dec
+        name = _attribute_chain_str(target)
+        if name is None:
+            return "<complex decorator>"
+        root = name.split(".", 1)[0]
+        if root in distrusted_roots:
+            return name
+        resolved = name
+        mapped = import_map.get(root)
+        if mapped is not None:
+            resolved = mapped + name[len(root):]
+        if resolved not in _SEMANTICS_PRESERVING_DECORATORS:
+            return name
     return None
 
 
@@ -391,9 +488,23 @@ def _expr_taint(
     cfg_node: PyCFGNode,
     in_state_fn,
     summaries: dict[str, TaintSummary],
+    local_bindings: frozenset[str] = frozenset(),
+    distrusted_roots: frozenset[str] = frozenset(),
 ) -> TaintState:
     """Compute the :data:`TaintState` produced by evaluating an
     arbitrary expression at ``cfg_node``'s IN.
+
+    ``local_bindings`` is the enclosing function's own bound-name set
+    (:func:`core.analysis.python_module_callgraph.local_binding_names`).
+    The Call arm refuses the name-keyed summary join whenever the
+    callable's root name has ANY local definition — ``esc = str``
+    before (or after: flow-insensitive) ``y = esc(x)`` makes the
+    runtime callee the local binding, not the module table's ``esc``,
+    so joining would copy a summary the call provably may not reach
+    (a hostile repo mints a clean-sanitizer wrapper from exactly this
+    collision). Refused joins stamp a ``<shadowed:…>`` callable at
+    :data:`_OPAQUE_ARG`: the marker can never match a catalog
+    sanitizer name, so the consumer refuses rather than suppresses.
 
     AST shapes handled:
 
@@ -414,16 +525,28 @@ def _expr_taint(
       taint survives with the callable on its chain instead of
       silently vanishing — a dropped atom reads as "param does not
       flow", which the sanitizer-cut consumer can turn into a false
-      clean-wrapper binding that suppresses a real finding.
+      clean-wrapper binding that suppresses a real finding. A
+      method call's RECEIVER (``recv.m(...)``) contributes its own
+      taint the same way, stamped at :data:`_OPAQUE_ARG` — the
+      receiver's value feeds the result exactly like an argument
+      (``a.strip()`` carries ``a``'s taint), and the stamped
+      callable is never a catalog sanitizer, so the consumer
+      refuses rather than suppresses.
     * ``JoinedStr`` / ``FormattedValue`` — union of the interpolated
       expressions' taint (an f-string carries its inputs' taint).
     * ``BinOp`` / ``BoolOp`` / ``IfExp`` / ``UnaryOp`` —
       element-wise union (taint flows through arithmetic / boolean
       composition into the result).
-    * Literals, comprehensions, lambdas, subscripts — return empty
-      (conservative under-approximation: their taint contribution
-      is unknown; Phase 14 will refuse to suppress when this
-      matters).
+    * ``Subscript`` / ``Starred`` / container literals (``List`` /
+      ``Tuple`` / ``Set`` / ``Dict``) / comprehensions — union of
+      the contained expressions' taint. Returning empty here erased
+      real flows: ``return escape(a) + a[0]`` read as "a only
+      reaches the return through escape", minting a false
+      clean-sanitizer binding the enforced sanitizer-cut consumed
+      to suppress real findings (the JoinedStr hazard restated on
+      the element/container shapes).
+    * Literals, lambdas — return empty (a literal carries no param
+      taint; a lambda OBJECT doesn't evaluate its body here).
     """
     if expr is None:
         return _empty_state()
@@ -432,11 +555,35 @@ def _expr_taint(
     if isinstance(expr, ast.Attribute):
         chain = _attribute_chain_str(expr)
         if chain is None:
-            return _empty_state()
+            # Non-Name-rooted chain (``a[0].b``, ``f().b``): the base
+            # expression's taint still flows into the attribute read —
+            # returning empty dropped it (false clean-wrapper hazard).
+            return _expr_taint(expr.value, cfg_node, in_state_fn,
+                               summaries)
         base = chain.split(".", 1)[0]
         return in_state_fn(cfg_node, base)
     if isinstance(expr, ast.Call):
         callable_name = _attribute_chain_str(expr.func) or ""
+        # Shadow guard: a local binding of the chain's ROOT name means
+        # the runtime callee is the local object, not the module-table
+        # (or catalog) entry the dotted name suggests. The summary
+        # join below is refused and every stamp carries a
+        # ``<shadowed:…>`` marker instead of the written name — a
+        # marker can never match a catalog sanitizer, so downstream
+        # certification refuses rather than suppresses.
+        base_name = callable_name.split(".", 1)[0] if callable_name else ""
+        shadowed = bool(base_name) and base_name in local_bindings
+        # Module-scope distrust poisons the STAMP only (the written
+        # name must never match a catalog identity — ``import fakelib
+        # as html`` makes ``html.escape`` the repo's callable), never
+        # the summary JOIN: an in-module helper's own def name is
+        # distrusted by definition, and its join is guarded by the
+        # rebound/unknown poisons instead.
+        distrusted = bool(base_name) and base_name in distrusted_roots
+        stamp_name = (
+            f"<shadowed:{callable_name}>" if (shadowed or distrusted)
+            else callable_name
+        )
         # ``g(*xs)`` makes every later positional index unknowable —
         # taint still flows, but positions can't be trusted.
         has_starred = any(isinstance(a, ast.Starred) for a in expr.args)
@@ -445,26 +592,86 @@ def _expr_taint(
         arg_states: list[TaintState] = [
             _expr_taint(
                 a.value if isinstance(a, ast.Starred) else a,
-                cfg_node, in_state_fn, summaries,
+                cfg_node, in_state_fn, summaries, local_bindings, distrusted_roots,
             )
             for a in expr.args
         ]
         # Keyword args (``**expr`` expansion never reaches here — it
         # marks the whole function ``summary_unknown`` upstream).
         kw_states: list[tuple[str | None, TaintState]] = [
-            (kw.arg, _expr_taint(kw.value, cfg_node, in_state_fn, summaries))
+            (kw.arg, _expr_taint(kw.value, cfg_node, in_state_fn,
+                                 summaries, local_bindings, distrusted_roots))
             for kw in expr.keywords
         ]
-        callee = summaries.get(callable_name)
+        # Method-call receiver: ``recv.m(...)`` evaluates ``recv`` and
+        # its value feeds the result exactly like an argument.
+        # Dropping it read ``return escape(a) + a.strip()`` as "a only
+        # reaches the return through escape" — a false clean-sanitizer
+        # binding on the enforced path. Stamp at _OPAQUE_ARG: the
+        # stamped callable (``a.strip``, or the bare method name when
+        # the chain doesn't bottom out at a Name) is never a catalog
+        # sanitizer, so the consumer refuses rather than suppresses.
+        recv_state = _empty_state()
+        recv_stamp = stamp_name
+        if isinstance(expr.func, ast.Lambda):
+            # IIFE: the lambda body evaluates NOW over enclosing-scope
+            # names (``(lambda: a)()``), and parameter DEFAULTS
+            # evaluate in the enclosing scope too (``(lambda z=a:
+            # z)()`` carries a's taint through z). Unstamped direct
+            # atoms — the consumer refuses, never suppresses.
+            recv_state = _contained_name_states(
+                expr.func.body, cfg_node, in_state_fn,
+            )
+            for dflt in (*expr.func.args.defaults,
+                         *expr.func.args.kw_defaults):
+                if dflt is not None:
+                    recv_state = _merge_states(
+                        recv_state, _contained_name_states(
+                            dflt, cfg_node, in_state_fn,
+                        ),
+                    )
+            recv_stamp = "<lambda>"
+        if isinstance(expr.func, ast.Attribute):
+            recv_state = _expr_taint(
+                expr.func.value, cfg_node, in_state_fn, summaries, local_bindings, distrusted_roots,
+            )
+            recv_stamp = stamp_name or expr.func.attr
+
+        def _with_receiver(state: TaintState) -> TaintState:
+            if not recv_state:
+                return state
+            return _merge_states(
+                state, _add_effect(recv_state, recv_stamp, _OPAQUE_ARG),
+            )
+
+        callee = None if shadowed else summaries.get(callable_name)
         if (callee is not None and not callee.summary_unknown
                 and not has_starred):
             # In-module callee with a known summary. Positional args
-            # map by index; keyword args map to the callee param of
-            # the same name.
-            indexed: dict[int, TaintState] = dict(enumerate(arg_states))
-            opaque: list[TaintState] = []
+            # map by index — but only below the callee's
+            # positional-binding boundary: at or past the ``*vararg``
+            # slot the index no longer names the receiving parameter
+            # (the arg lands in the tuple; the NEXT index would name a
+            # keyword-only param a positional can never reach), so
+            # those args go opaque instead. Keyword args map to the
+            # callee param of the same name when that name is
+            # keyword-bindable.
+            pos_limit = callee.positional_limit
+            if pos_limit is None:
+                pos_limit = len(callee.params)
+            indexed: dict[int, TaintState] = {
+                i: st for i, st in enumerate(arg_states) if i < pos_limit
+            }
+            opaque: list[TaintState] = [
+                st for i, st in enumerate(arg_states) if i >= pos_limit
+            ]
             for kw_name, kw_state in kw_states:
-                if kw_name is not None and kw_name in callee.params:
+                kw_bindable = (
+                    kw_name in callee.keyword_params
+                    if callee.keyword_params is not None
+                    else kw_name in callee.params
+                )
+                if kw_name is not None and kw_bindable:
                     idx = callee.params.index(kw_name)
                     indexed[idx] = _merge_states(
                         indexed.get(idx, _empty_state()), kw_state,
@@ -482,18 +689,19 @@ def _expr_taint(
                 else:
                     stamped = _add_effect(arg_state, c_callee, a_callee)
                     result = _merge_states(result, stamped)
-            # A keyword with no matching callee param: the summary
-            # can't say whether it reaches the return, so keep the
-            # taint alive with the callee on its chain (an in-module
-            # name is never a catalog sanitizer — the consumer
-            # refuses rather than suppresses).
+            # A keyword with no matching (keyword-bindable) callee
+            # param, or a positional at/past the vararg boundary: the
+            # summary can't say whether it reaches the return, so keep
+            # the taint alive with the callee on its chain (an
+            # in-module name is never a catalog sanitizer — the
+            # consumer refuses rather than suppresses).
             for kw_state in opaque:
                 if kw_state:
                     result = _merge_states(
                         result,
                         _add_effect(kw_state, callable_name, _OPAQUE_ARG),
                     )
-            return result
+            return _with_receiver(result)
         # External or unknown callee (or unknowable positions after
         # ``*`` unpacking). Each tainted arg contributes via the call
         # with its position stamped — opaque when unknowable.
@@ -501,15 +709,18 @@ def _expr_taint(
         for arg_idx, arg_state in enumerate(arg_states):
             if not arg_state:
                 continue
-            idx = _OPAQUE_ARG if has_starred else arg_idx
-            stamped = _add_effect(arg_state, callable_name, idx)
+            idx = (
+                _OPAQUE_ARG if (has_starred or shadowed or distrusted)
+                else arg_idx
+            )
+            stamped = _add_effect(arg_state, stamp_name, idx)
             result = _merge_states(result, stamped)
         for _kw_name, kw_state in kw_states:
             if not kw_state:
                 continue
-            stamped = _add_effect(kw_state, callable_name, _OPAQUE_ARG)
+            stamped = _add_effect(kw_state, stamp_name, _OPAQUE_ARG)
             result = _merge_states(result, stamped)
-        return result
+        return _with_receiver(result)
     if isinstance(expr, ast.JoinedStr):
         # f-string: taint flows from every interpolated expression
         # into the result. Returning empty here erased the flow — a
@@ -519,32 +730,120 @@ def _expr_taint(
         out = _empty_state()
         for v in expr.values:
             if isinstance(v, ast.FormattedValue):
+                # Recurse on the FormattedValue NODE (not just its
+                # value) so nested format specs contribute too.
                 out = _merge_states(
-                    out, _expr_taint(v.value, cfg_node, in_state_fn, summaries),
+                    out, _expr_taint(v, cfg_node, in_state_fn, summaries, local_bindings, distrusted_roots),
                 )
         return out
     if isinstance(expr, ast.FormattedValue):
-        return _expr_taint(expr.value, cfg_node, in_state_fn, summaries)
+        out = _expr_taint(expr.value, cfg_node, in_state_fn, summaries, local_bindings, distrusted_roots)
+        if expr.format_spec is not None:
+            # ``f"{v:{width}}"`` — the format spec's interpolations
+            # carry their inputs' taint into the rendered result.
+            out = _merge_states(out, _expr_taint(
+                expr.format_spec, cfg_node, in_state_fn, summaries, local_bindings, distrusted_roots,
+            ))
+        return out
     if isinstance(expr, ast.BinOp):
         return _merge_states(
-            _expr_taint(expr.left, cfg_node, in_state_fn, summaries),
-            _expr_taint(expr.right, cfg_node, in_state_fn, summaries),
+            _expr_taint(expr.left, cfg_node, in_state_fn, summaries, local_bindings, distrusted_roots),
+            _expr_taint(expr.right, cfg_node, in_state_fn, summaries, local_bindings, distrusted_roots),
         )
     if isinstance(expr, ast.BoolOp):
         out = _empty_state()
         for v in expr.values:
             out = _merge_states(
-                out, _expr_taint(v, cfg_node, in_state_fn, summaries),
+                out, _expr_taint(v, cfg_node, in_state_fn, summaries, local_bindings, distrusted_roots),
             )
         return out
     if isinstance(expr, ast.IfExp):
         return _merge_states(
-            _expr_taint(expr.body, cfg_node, in_state_fn, summaries),
-            _expr_taint(expr.orelse, cfg_node, in_state_fn, summaries),
+            _expr_taint(expr.body, cfg_node, in_state_fn, summaries, local_bindings, distrusted_roots),
+            _expr_taint(expr.orelse, cfg_node, in_state_fn, summaries, local_bindings, distrusted_roots),
         )
     if isinstance(expr, ast.UnaryOp):
-        return _expr_taint(expr.operand, cfg_node, in_state_fn, summaries)
-    return _empty_state()
+        return _expr_taint(expr.operand, cfg_node, in_state_fn, summaries, local_bindings, distrusted_roots)
+    # Element/container shapes: the contained expressions' taint flows
+    # into the result (an element carries its container's taint, a
+    # container carries its elements'). Unstamped — same
+    # over-approximation as the Attribute case above; a surviving
+    # direct atom makes the consumer refuse, never suppress.
+    if isinstance(expr, ast.Subscript):
+        return _merge_states(
+            _expr_taint(expr.value, cfg_node, in_state_fn, summaries, local_bindings, distrusted_roots),
+            _expr_taint(expr.slice, cfg_node, in_state_fn, summaries, local_bindings, distrusted_roots),
+        )
+    if isinstance(expr, ast.Starred):
+        return _expr_taint(expr.value, cfg_node, in_state_fn, summaries, local_bindings, distrusted_roots)
+    if isinstance(expr, (ast.List, ast.Tuple, ast.Set)):
+        out = _empty_state()
+        for e in expr.elts:
+            out = _merge_states(
+                out, _expr_taint(e, cfg_node, in_state_fn, summaries, local_bindings, distrusted_roots),
+            )
+        return out
+    if isinstance(expr, ast.Dict):
+        out = _empty_state()
+        for e in (*expr.keys, *expr.values):  # type: ignore[assignment]
+            if e is not None:  # None key = ``**expr`` expansion's slot
+                out = _merge_states(
+                    out, _expr_taint(e, cfg_node, in_state_fn, summaries, local_bindings, distrusted_roots),
+                )
+        return out
+    if isinstance(expr, ast.NamedExpr):
+        # ``(t := v)`` evaluates to v — keep v's chains intact so a
+        # walrus-wrapped sanitizer stays clean.
+        return _expr_taint(expr.value, cfg_node, in_state_fn, summaries, local_bindings, distrusted_roots)
+    if isinstance(expr, ast.Await):
+        return _expr_taint(expr.value, cfg_node, in_state_fn, summaries, local_bindings, distrusted_roots)
+    if isinstance(
+        expr, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp),
+    ):
+        # Union over the element expression(s), every generator's
+        # iterable, and the filter conditions. Comprehension targets
+        # are locals with empty in-state; their taint arrives through
+        # the iterables, which are included directly.
+        parts: list[ast.AST] = (
+            [expr.key, expr.value] if isinstance(expr, ast.DictComp)
+            else [expr.elt]
+        )
+        for gen in expr.generators:
+            parts.append(gen.iter)
+            parts.extend(gen.ifs)
+        out = _empty_state()
+        for e in parts:  # type: ignore[assignment]
+            out = _merge_states(
+                out, _expr_taint(e, cfg_node, in_state_fn, summaries, local_bindings, distrusted_roots),
+            )
+        return out
+    if isinstance(expr, (ast.Constant, ast.Lambda)):
+        # A literal carries no param taint; a lambda OBJECT does not
+        # evaluate its body here (calling it does — see the IIFE arm).
+        return _empty_state()
+    # Conservative fallback for every OTHER expression kind (Compare,
+    # Slice bounds, and any future node): union the in-states of all
+    # contained Names, unstamped. Returning empty here DROPS real
+    # flows — the dirty atom vanishes and _param_cleanly_sanitized
+    # mints a false clean-sanitizer binding the enforced
+    # sanitizer-cut consumes (the JoinedStr hazard, generalised).
+    # Unstamped direct atoms only ever make the consumer refuse.
+    return _contained_name_states(expr, cfg_node, in_state_fn)
+
+
+def _contained_name_states(
+    expr: ast.AST,
+    cfg_node: PyCFGNode,
+    in_state_fn,
+) -> TaintState:
+    """Union of the in-states of every ``ast.Name`` under ``expr`` —
+    the refusal-direction over-approximation for expression shapes
+    :func:`_expr_taint` has no structural model for."""
+    out = _empty_state()
+    for sub in ast.walk(expr):
+        if isinstance(sub, ast.Name):
+            out = _merge_states(out, in_state_fn(cfg_node, sub.id))
+    return out
 
 
 def _find_assignment_value_at(
@@ -585,18 +884,29 @@ def _find_assignment_value_at(
 
 def _build_assignment_value_map(
     fn_ast: ast.AST,
-) -> dict[tuple[int, str], tuple[ast.AST, bool]]:
-    """One-shot ``(lineno, target_name) → (value_expr, is_augmented)``
-    map over the whole function AST.
+) -> dict[tuple[int, str], list[tuple[ast.AST, bool]]]:
+    """One-shot ``(lineno, target_name) → [(value_expr, is_augmented),
+    …]`` map over the whole function AST, EVERY match in
+    ``ast.walk`` order.
 
-    Same node shapes and same first-match-in-``ast.walk``-order
-    semantics as :func:`_find_assignment_value_at` (``setdefault``
-    keeps the first hit), but built ONCE — the per-function taint
-    fixed-point queries an assignment per (node, symbol) per
+    Same node shapes as :func:`_find_assignment_value_at` (which
+    returns the first match only), but built ONCE — the per-function
+    taint fixed-point queries an assignment per (node, symbol) per
     iteration, and a full ``ast.walk`` per query made the loop
     O(iterations × nodes × defs × AST-size).
+
+    ALL matches are kept, not just the first: two writes to one name
+    on ONE physical line (``t = html.escape(s); t = s``, ``t =
+    html.escape(s); t += s``) collide on the ``(lineno, name)`` key,
+    and a first-match map resolved BOTH CFG defs to the first RHS —
+    the killing raw rebind became invisible, the direct-return atom
+    never entered ``return_effects``, and the enforced sanitizer-cut
+    consumed the minted clean-sanitizer wrapper to drop a real
+    finding from the SARIF. The consumer merges every colliding
+    candidate conservatively (see :func:`_compute_one_summary`) so an
+    ambiguous binding can only LOSE suppression power, never gain it.
     """
-    out: dict[tuple[int, str], tuple[ast.AST, bool]] = {}
+    out: dict[tuple[int, str], list[tuple[ast.AST, bool]]] = {}
     for node in ast.walk(fn_ast):
         lineno = getattr(node, "lineno", None)
         if lineno is None:
@@ -604,21 +914,23 @@ def _build_assignment_value_map(
         if isinstance(node, ast.Assign):
             for tgt in node.targets:
                 if isinstance(tgt, ast.Name):
-                    out.setdefault((lineno, tgt.id), (node.value, False))
+                    out.setdefault((lineno, tgt.id), []).append(
+                        (node.value, False),
+                    )
         elif isinstance(node, ast.AugAssign):
             if isinstance(node.target, ast.Name):
-                out.setdefault(
-                    (lineno, node.target.id), (node.value, True),
+                out.setdefault((lineno, node.target.id), []).append(
+                    (node.value, True),
                 )
         elif isinstance(node, ast.AnnAssign):
             if isinstance(node.target, ast.Name) and node.value is not None:
-                out.setdefault(
-                    (lineno, node.target.id), (node.value, False),
+                out.setdefault((lineno, node.target.id), []).append(
+                    (node.value, False),
                 )
         elif (isinstance(node, ast.NamedExpr)
                 and isinstance(node.target, ast.Name)):
-            out.setdefault(
-                (lineno, node.target.id), (node.value, False),
+            out.setdefault((lineno, node.target.id), []).append(
+                (node.value, False),
             )
     return out
 
@@ -651,6 +963,20 @@ def _compute_one_summary(
     node = cg.find(qualified_name)
     if node is None:
         return TaintSummary(function=qualified_name, params=())
+    # Dynamic namespace routes (star-import, exec/eval, sys.modules,
+    # escaping globals()/vars()) void EVERY name's resolution in this
+    # module — no summary may certify anything (the name-keyed joins
+    # would trust identities the runtime namespace no longer proves).
+    if cg.namespace_unprovable:
+        return TaintSummary(
+            function=qualified_name,
+            params=node.params,
+            summary_unknown=True,
+            summary_unknown_reason=(
+                "module namespace dynamically rebindable "
+                "(star-import / exec / sys.modules / globals write)"
+            ),
+        )
     # Conditional redefinition: which body runs depends on
     # module-import-time state, and summaries are name-keyed — a
     # single-variant summary would silently stand in for both bodies
@@ -669,6 +995,23 @@ def _compute_one_summary(
                 " — behaviour is variant-dependent"
             ),
         )
+    # Rebound module identity: a non-def module-scope assignment to
+    # this name's root (``esc = str`` beside ``def esc``), or a
+    # ``global`` declaration of it anywhere in the module, means the
+    # runtime binding may not be this body at all. The name-keyed
+    # joins would certify a body the call provably may not reach —
+    # degrade to unknown (refusal direction).
+    root = qualified_name.split(".", 1)[0]
+    if root in cg.rebound_names:
+        return TaintSummary(
+            function=qualified_name,
+            params=node.params,
+            summary_unknown=True,
+            summary_unknown_reason=(
+                f"module-scope rebind of {root!r} — runtime identity "
+                "unprovable"
+            ),
+        )
     fn_ast = cg.function_ast(qualified_name)
     if fn_ast is None:
         return TaintSummary(
@@ -676,6 +1019,23 @@ def _compute_one_summary(
             params=node.params,
             summary_unknown=True,
             summary_unknown_reason="no AST available",
+        )
+    # Decorated def: the decorator replaces the module binding with
+    # an arbitrary wrapper at import time — certifying the BODY would
+    # forge a clean-sanitizer wrapper for a callable the name no
+    # longer points at. Semantics-preserving decorators are exempt.
+    poisoning = _poisoning_decorator(
+        fn_ast, cg.import_map, cg.nonimport_distrusted_roots,
+    )
+    if poisoning is not None:
+        return TaintSummary(
+            function=qualified_name,
+            params=node.params,
+            summary_unknown=True,
+            summary_unknown_reason=(
+                f"decorated with @{poisoning} — runtime identity "
+                "unprovable"
+            ),
         )
 
     # Dynamic-dispatch check is one-shot per AST — re-checking each
@@ -733,6 +1093,12 @@ def _compute_one_summary(
     # the loop reads it per (node, symbol) — same lineno-map approach
     # the post-fixed-point collection loop below already uses.
     _assign_map = _build_assignment_value_map(fn_ast)
+    # Locally bound names — the shadow guard for _expr_taint's
+    # name-keyed callee join (see local_binding_names) — plus the
+    # module-scope distrusted roots that poison external-identity
+    # stamps (see module_distrusted_roots).
+    _local_bindings = local_binding_names(fn_ast)
+    _distrusted_roots = cg.distrusted_roots
     max_inner = 4 * max(1, len(list(cfg.nodes())))
     for _ in range(max_inner):
         changed = False
@@ -742,17 +1108,31 @@ def _compute_one_summary(
             for sym in n.defs:
                 found = _assign_map.get((n.lineno, sym))
                 if found is not None:
-                    value_ast, is_augmented = found
-                    new_state = _expr_taint(
-                        value_ast, n, _in_state_for, summaries_so_far,
-                    )
-                    if is_augmented:
-                        # ``q += rhs`` is ``q = q ⊕ rhs`` — the
-                        # target's pre-assignment state carries into
-                        # the result alongside the RHS taint.
-                        new_state = _merge_states(
-                            new_state, _in_state_for(n, sym),
+                    # EVERY assignment to ``sym`` at this line
+                    # contributes. When the line carries more than one
+                    # (``t = html.escape(s); t = s``), the CFG def
+                    # cannot be matched to its own RHS — merge every
+                    # candidate's taint conservatively instead of
+                    # letting the first RHS stand in for all of them.
+                    # ``_merge_states`` keeps the direct-return atom
+                    # absorbing, so the raw rebind's empty chain
+                    # survives the union and the consumer refuses the
+                    # clean-sanitizer certification (an ambiguous
+                    # binding can only lose suppression power).
+                    new_state = _empty_state()
+                    for value_ast, is_augmented in found:
+                        rhs_state = _expr_taint(
+                            value_ast, n, _in_state_for, summaries_so_far, _local_bindings,
+                            _distrusted_roots,
                         )
+                        if is_augmented:
+                            # ``q += rhs`` is ``q = q ⊕ rhs`` — the
+                            # target's pre-assignment state carries
+                            # into the result alongside the RHS taint.
+                            rhs_state = _merge_states(
+                                rhs_state, _in_state_for(n, sym),
+                            )
+                        new_state = _merge_states(new_state, rhs_state)
                 else:
                     # No explicit assignment AST found — fall back to
                     # merging the uses' states. Covers cases like
@@ -797,7 +1177,8 @@ def _compute_one_summary(
                 pass
             else:
                 state = _expr_taint(
-                    return_value, n, _in_state_for, summaries_so_far,
+                    return_value, n, _in_state_for, summaries_so_far, _local_bindings,
+                            _distrusted_roots,
                 )
                 for pi, effects in state:
                     if not effects:
@@ -814,21 +1195,32 @@ def _compute_one_summary(
         # positional args' contributions.
         if n.call_sites:
             for ast_n in _calls_by_line.get(n.lineno, ()):
-                callable_name = _attribute_chain_str(ast_n.func)
+                callable_name = _attribute_chain_str(ast_n.func)  # type: ignore[no-redef,assignment]
                 if callable_name is None:
                     continue
                 for arg_idx, arg_ast in enumerate(ast_n.args):
                     arg_state = _expr_taint(
-                        arg_ast, n, _in_state_for, summaries_so_far,
+                        arg_ast, n, _in_state_for, summaries_so_far, _local_bindings,
+                            _distrusted_roots,
                     )
                     for pi, _ in arg_state:
                         call_arg_taint.add((callable_name, arg_idx, pi))
+
+    # Binding-shape facts for callers' positional/keyword mapping
+    # (params lists vararg/kwonly/kwarg names as ordinary entries).
+    fn_args = fn_ast.args
+    positional_limit = len(fn_args.posonlyargs) + len(fn_args.args)
+    keyword_params = frozenset(
+        a.arg for a in (*fn_args.args, *fn_args.kwonlyargs)
+    )
 
     return TaintSummary(
         function=qualified_name,
         params=params,
         return_effects=frozenset(return_effects),
         call_arg_taint=frozenset(call_arg_taint),
+        positional_limit=positional_limit,
+        keyword_params=keyword_params,
     )
 
 
@@ -836,13 +1228,17 @@ def _compute_one_summary(
 # Outer fixed-point — call-graph iteration
 # ---------------------------------------------------------------------------
 
-# Outer fixed-point iteration budget = max(FLOOR, PER_FN * N), N being
-# the number of in-module functions. The 3*N term bounds worst-case
-# taint propagation depth through the call graph; the floor keeps tiny
-# modules from under-converging. Review #5: a bare 3*N starves small
-# modules — N=2 mutually recursive functions get only 6 passes, not
-# enough to settle a real sanitizer chain, so the summaries bail as
-# `summary_unconverged` and a genuine suppression is lost. Floor at 10.
+# Outer fixed-point recomputation budget = N seeding computations +
+# max(FLOOR, PER_FN * N) change-driven ones, N being the number of
+# in-module functions. The worklist below recomputes a function ONLY
+# when a summary it joins has changed, so a dependency chain of depth
+# d costs ~2d pops instead of the old Jacobi sweep's d full passes ×
+# N computations (O(N²) full CFG rebuilds — a planted file of ~3000
+# chained one-line defs wedged the default-on postpass for
+# minutes per finding × candidate). The floor keeps tiny modules from
+# under-converging (N=2 mutual recursion needs more than 6 pops to
+# settle a real sanitizer chain — Review #5's hazard restated for the
+# worklist form).
 _TAINT_SUMMARY_OUTER_ITER_FLOOR = 10
 _TAINT_SUMMARY_OUTER_ITER_PER_FN = 3
 
@@ -861,13 +1257,19 @@ def build_taint_summaries(
     ``params`` matches the corresponding CFG's ``params`` — both
     derive from the same AST.
 
-    Convergence: outer fixed-point bails after
-    ``max(10, 3 × N)`` iterations where ``N`` is the number of
-    in-module functions (see
-    :data:`_TAINT_SUMMARY_OUTER_ITER_FLOOR`). Unconverged summaries
-    get ``summary_unconverged=True``
-    so Phase 14 can downgrade. In practice non-pathological codebases
-    converge in 2–3 passes.
+    Convergence: reverse-dependency worklist. Every function is
+    computed once, then re-computed only when a summary its body
+    joins (a call chain naming another summary key — exactly
+    ``_expr_taint``'s join criterion, over-approximated by walking
+    the whole function AST) has changed. When the recomputation
+    budget (see :data:`_TAINT_SUMMARY_OUTER_ITER_FLOOR`) is exhausted
+    before the queue drains, EVERY non-unknown summary is marked
+    ``summary_unconverged`` — an under-iterated summary can be
+    missing the direct-return atoms whose absence certifies a clean
+    wrapper, so a partial result must degrade wholesale rather than
+    stand (Phase 14 refuses unconverged summaries). In practice
+    non-pathological codebases drain the queue with ~2 pops per
+    function.
     """
     target_nodes = [
         n for n in cg.nodes()
@@ -880,28 +1282,55 @@ def build_taint_summaries(
         node.name: TaintSummary(function=node.name, params=node.params)
         for node in target_nodes
     }
-    max_iters = max(
+    all_names = set(summaries)
+
+    # name → summary keys whose change requires recomputing name.
+    # Derived from the written call chains in the function's AST —
+    # the same name vocabulary ``_expr_taint`` joins on (walking
+    # nested defs' bodies too only over-approximates: extra deps cost
+    # pops, never correctness).
+    dependents: dict[str, set[str]] = {}
+    for node in target_nodes:
+        fn_ast = cg.function_ast(node.name)
+        if fn_ast is None:
+            continue
+        for sub in ast.walk(fn_ast):
+            if not isinstance(sub, ast.Call):
+                continue
+            callee_name = _attribute_chain_str(sub.func)
+            if callee_name and callee_name in all_names:
+                dependents.setdefault(callee_name, set()).add(node.name)
+
+    queue: deque[str] = deque(node.name for node in target_nodes)
+    queued: set[str] = set(queue)
+    pop_budget = len(target_nodes) + max(
         _TAINT_SUMMARY_OUTER_ITER_FLOOR,
         _TAINT_SUMMARY_OUTER_ITER_PER_FN * len(target_nodes),
     )
-    for _ in range(max_iters):
-        changed = False
-        for node in target_nodes:
-            if summaries[node.name].summary_unknown:
-                # Compute once to detect dynamic-dispatch even on the
-                # first pass; after that, leave it alone.
-                continue
-            new_summary = _compute_one_summary(
-                cg, node.name, summaries,
-            )
-            old = summaries[node.name]
-            if new_summary != old:
-                summaries[node.name] = new_summary
-                changed = True
-        if not changed:
-            return summaries
+    pops = 0
+    while queue and pops < pop_budget:
+        name = queue.popleft()
+        queued.discard(name)
+        pops += 1
+        if summaries[name].summary_unknown:
+            # Computed once already (dynamic dispatch / poisoned
+            # identity) — never revisited.
+            continue
+        new_summary = _compute_one_summary(cg, name, summaries)
+        if new_summary != summaries[name]:
+            summaries[name] = new_summary
+            for dep in dependents.get(name, ()):
+                if dep not in queued:
+                    queue.append(dep)
+                    queued.add(dep)
+    if not queue:
+        return summaries
 
-    # Bail out — mark unconverged.
+    # Budget exhausted with recomputations pending — mark EVERY
+    # non-unknown summary unconverged (a stale summary may certify a
+    # clean wrapper the fixed point would refuse; degrading only the
+    # queued names would let its already-computed consumers stand on
+    # the stale input).
     for name in list(summaries.keys()):
         s = summaries[name]
         if not s.summary_unknown:

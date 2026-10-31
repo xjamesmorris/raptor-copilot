@@ -81,106 +81,6 @@ class TestStudyLoopConvergence:
         assert "no study items" in result.stderr.lower() or result.returncode == 0
 
 
-class TestReadingListDrain:
-    """Test reading-list integration in the loop."""
-
-    def test_reading_list_items_extracted(self):
-        """Verify the helper that extracts identifiers from reading list."""
-        import importlib.util
-        import os
-        os.environ["_RAPTOR_TRUSTED"] = "1"
-        sys.path.insert(0, str(RAPTOR_DIR))
-
-        spec = importlib.util.spec_from_file_location(
-            "study_loop", STUDY_LOOP,
-            submodule_search_locations=[],
-        )
-        if spec is None or spec.loader is None:
-            # Fallback: exec the file directly and grab the function
-            import types
-            mod = types.ModuleType("study_loop")
-            mod.__file__ = STUDY_LOOP
-            exec(  # noqa: S102 - loads the libexec script under test
-                compile(
-                    Path(STUDY_LOOP).read_text(encoding="utf-8"),
-                    STUDY_LOOP, "exec",
-                ),
-                mod.__dict__,
-            )
-        else:
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-
-        pending = [
-            {"question": "struct page ownership", "resolution": "identifier",
-             "context": "Need to understand `page` lifecycle"},
-            {"question": "memory aliasing semantics", "resolution": "concept",
-             "context": ""},
-        ]
-        idents, concepts = mod._extract_rl_identifiers(pending)
-        assert "page" in idents
-        assert "memory aliasing semantics" in concepts
-
-
-class TestMarkItemsResolved:
-    def _write_rl(self, out_dir, items):
-        rl_path = out_dir / "reading-list.json"
-        rl_path.write_text(json.dumps({"items": items}), encoding="utf-8")
-
-    def test_marks_backtick_ident_in_question(self, tmp_path):
-        self._write_rl(tmp_path, [
-            {"question": "What is `crypto_type`?", "resolved": False},
-            {"question": "What is `crypto_alg`?", "resolved": False},
-        ])
-        count = _loop._mark_items_resolved(
-            tmp_path, ["crypto_type"], [])
-        assert count == 1
-        data = json.loads((tmp_path / "reading-list.json").read_text())
-        assert data["items"][0]["resolved"] is True
-        assert data["items"][0]["resolved_concept_id"] == "studied"
-        assert not data["items"][1].get("resolved")
-
-    def test_marks_backtick_ident_in_context(self, tmp_path):
-        self._write_rl(tmp_path, [
-            {"question": "What role does this play?",
-             "context": "See `crypto_chain` in algapi.c",
-             "resolved": False},
-        ])
-        count = _loop._mark_items_resolved(
-            tmp_path, ["crypto_chain"], [])
-        assert count == 1
-
-    def test_marks_struct_pattern(self, tmp_path):
-        self._write_rl(tmp_path, [
-            {"question": "What is struct crypto_type?", "resolved": False},
-        ])
-        count = _loop._mark_items_resolved(
-            tmp_path, ["struct crypto_type"], [])
-        assert count == 1
-
-    def test_marks_concept_by_question_text(self, tmp_path):
-        self._write_rl(tmp_path, [
-            {"question": "How does algorithm chaining work?",
-             "resolution": "concept", "resolved": False},
-        ])
-        count = _loop._mark_items_resolved(
-            tmp_path, [], ["How does algorithm chaining work?"])
-        assert count == 1
-
-    def test_skips_already_resolved(self, tmp_path):
-        self._write_rl(tmp_path, [
-            {"question": "What is `crypto_type`?", "resolved": True},
-        ])
-        count = _loop._mark_items_resolved(
-            tmp_path, ["crypto_type"], [])
-        assert count == 0
-
-    def test_no_file_returns_zero(self, tmp_path):
-        count = _loop._mark_items_resolved(
-            tmp_path, ["crypto_type"], [])
-        assert count == 0
-
-
 class TestDetectConceptsDir:
     def test_existing_concepts_dir(self, tmp_path):
         project_root = tmp_path / "projects" / "myproj"
@@ -258,12 +158,23 @@ class TestPromoteToProject:
             (concepts_dir / "domain-model.json").read_text())
         assert promoted["concepts"][0]["id"] == "c1"
 
+    @staticmethod
+    def _rl_item(item_id: str, **overrides) -> dict:
+        item = {
+            "id": item_id,
+            "question": f"question {item_id}",
+            "source_command": "audit",
+            "resolved": False,
+        }
+        item.update(overrides)
+        return item
+
     def test_promotes_reading_list(self, tmp_path):
         concepts_dir = tmp_path / "concepts"
         concepts_dir.mkdir()
         run_dir = tmp_path / "run_001"
         run_dir.mkdir()
-        rl = {"items": [{"question": "q1", "resolved": True}]}
+        rl = {"items": [self._rl_item("rl-1", resolved=True)]}
         (run_dir / "reading-list.json").write_text(
             json.dumps(rl), encoding="utf-8")
 
@@ -272,6 +183,90 @@ class TestPromoteToProject:
         promoted = json.loads(
             (concepts_dir / "reading-list.json").read_text())
         assert promoted["items"][0]["resolved"] is True
+
+    def test_reading_list_promotion_merges(self, tmp_path):
+        """Promotion folds the run's items into the canonical list —
+        a byte-copy would erase items a concurrent run queued after
+        this run seeded (lost update)."""
+        concepts_dir = tmp_path / "concepts"
+        concepts_dir.mkdir()
+        run_dir = tmp_path / "run_001"
+        run_dir.mkdir()
+        # Canonical has an item this run never saw (concurrent writer)
+        # plus one the run resolves.
+        canonical = {"items": [
+            self._rl_item("rl-concurrent"),
+            self._rl_item("rl-shared"),
+        ]}
+        (concepts_dir / "reading-list.json").write_text(
+            json.dumps(canonical), encoding="utf-8")
+        run = {"items": [self._rl_item("rl-shared", resolved=True)]}
+        (run_dir / "reading-list.json").write_text(
+            json.dumps(run), encoding="utf-8")
+
+        _loop._promote_to_project(run_dir, concepts_dir)
+
+        promoted = json.loads(
+            (concepts_dir / "reading-list.json").read_text())
+        by_id = {i["id"]: i for i in promoted["items"]}
+        assert set(by_id) == {"rl-concurrent", "rl-shared"}
+        assert by_id["rl-shared"]["resolved"] is True
+
+    def test_domain_model_promotion_merges(self, tmp_path):
+        """The domain model merges into the canonical copy (run wins
+        per id, everything else accumulates) and dict-level extras
+        like subject_title survive."""
+        concepts_dir = tmp_path / "concepts"
+        concepts_dir.mkdir()
+        run_dir = tmp_path / "run_001"
+        run_dir.mkdir()
+        canonical = {
+            "concepts": [
+                {"id": "other-run", "name": "B", "description": "d"},
+            ],
+            "invariants": [], "contracts": [],
+            "architecture": {"style": "pipeline"},
+        }
+        (concepts_dir / "domain-model.json").write_text(
+            json.dumps(canonical), encoding="utf-8")
+        run = {
+            "concepts": [
+                {"id": "this-run", "name": "A", "description": "d"},
+            ],
+            "invariants": [], "contracts": [],
+            "subject_title": "My Target",
+        }
+        (run_dir / "domain-model.json").write_text(
+            json.dumps(run), encoding="utf-8")
+
+        _loop._promote_to_project(run_dir, concepts_dir)
+
+        promoted = json.loads(
+            (concepts_dir / "domain-model.json").read_text())
+        ids = {c["id"] for c in promoted["concepts"]}
+        assert ids == {"other-run", "this-run"}
+        assert promoted["subject_title"] == "My Target"
+        assert promoted["architecture"] == {"style": "pipeline"}
+
+    def test_patterns_promotion_merges(self, tmp_path):
+        """A narrowly scoped run's patterns.json must never replace
+        the whole-tree accumulation — merge keyed by pattern name."""
+        concepts_dir = tmp_path / "concepts"
+        concepts_dir.mkdir()
+        run_dir = tmp_path / "run_001"
+        run_dir.mkdir()
+        (concepts_dir / "patterns.json").write_text(json.dumps({
+            "patterns": {"old_fn": {"role": "allocator"}},
+        }), encoding="utf-8")
+        (run_dir / "patterns.json").write_text(json.dumps({
+            "patterns": {"new_fn": {"role": "validator"}},
+        }), encoding="utf-8")
+
+        _loop._promote_to_project(run_dir, concepts_dir)
+
+        promoted = json.loads(
+            (concepts_dir / "patterns.json").read_text())
+        assert set(promoted["patterns"]) == {"old_fn", "new_fn"}
 
     def test_none_concepts_dir_is_noop(self, tmp_path):
         run_dir = tmp_path / "run_001"
@@ -333,18 +328,6 @@ class TestUnresolvableExcludedFromDrain:
         pending = _loop._load_pending_reading_list(tmp_path)
         assert [i["id"] for i in pending] == ["rl-1"]
 
-    def test_mark_resolved_skips_unresolvable(self, tmp_path):
-        self._write_rl(tmp_path)
-        n = _loop._mark_items_resolved(
-            tmp_path, ["alive_fn", "dead_fn"], [],
-        )
-        assert n == 1
-        data = json.loads((tmp_path / "reading-list.json").read_text())
-        by_id = {i["id"]: i for i in data["items"]}
-        assert by_id["rl-1"]["resolved"]
-        assert not by_id["rl-2"].get("resolved")
-        assert by_id["rl-2"]["unresolvable"]
-
 
 class TestCompileInvariantsExitCode:
     """A compile-invariants failure must propagate into the loop's exit
@@ -385,3 +368,270 @@ class TestCompileInvariantsExitCode:
 
     def test_compile_success_exits_zero(self, tmp_path):
         assert self._run_main(tmp_path, compile_rc=0) == 0
+
+
+class TestFailedRunDoesNotPromote:
+    """A failed run must not promote its domain model (possibly the
+    PRIOR canonical copied in by _load_prior_knowledge) over the
+    project store, nor store it in SAGE, nor pay the attach/synthesis
+    pass."""
+
+    def _run_main(self, tmp_path, prep_rc: int) -> tuple[int, Path]:
+        target = tmp_path / "src"
+        target.mkdir()
+        project = tmp_path / "proj"
+        out = project / "run_001"
+        out.mkdir(parents=True)
+        concepts = project / "concepts"
+        concepts.mkdir()
+        # Prior canonical model — _load_prior_knowledge copies it into
+        # the run dir, so a failed run HAS a domain-model.json.
+        (concepts / "domain-model.json").write_text(
+            json.dumps({"concepts": [{"id": "prior"}],
+                        "invariants": [], "contracts": []}),
+            encoding="utf-8",
+        )
+        (out / "study-list.json").write_text(
+            json.dumps({"items": []}), encoding="utf-8",
+        )
+
+        def fake_run(cmd, *, verbose=False):
+            if "raptor-study-prep" in cmd[1]:
+                return prep_rc
+            return 0
+
+        argv = ["raptor-study-loop", str(target), str(out),
+                "--identifier", "some_func"]
+        with patch.object(_loop, "_run", side_effect=fake_run), \
+                patch.object(_loop, "_store_in_sage") as sage, \
+                patch.object(_loop, "_promote_to_project") as promote, \
+                patch.object(sys, "argv", argv):
+            rc = _loop.main()
+        self._sage_called = sage.called
+        self._promote_called = promote.called
+        return rc, concepts
+
+    def test_failed_run_skips_promotion_and_sage(self, tmp_path):
+        rc, _concepts = self._run_main(tmp_path, prep_rc=7)
+        assert rc == 7
+        assert not self._promote_called
+        assert not self._sage_called
+
+    def test_successful_run_still_promotes(self, tmp_path):
+        rc, _concepts = self._run_main(tmp_path, prep_rc=0)
+        assert rc == 0
+        assert self._promote_called
+        assert self._sage_called
+
+
+class TestPriorKnowledgeAtomicity:
+    def test_prior_copy_routes_through_atomic_writer(self, tmp_path,
+                                                     monkeypatch):
+        """A torn prior copy (crash mid-write) leaves a malformed
+        reading-list that silently de-scopes the next prep to a
+        full-tree scan — the copy must go through the shared atomic
+        writer."""
+        import core.atomic_fs as atomic_fs
+        calls = []
+        real = atomic_fs.write_text_atomically
+
+        def recording(path, content, **kw):
+            calls.append(Path(path))
+            return real(path, content, **kw)
+
+        monkeypatch.setattr(atomic_fs, "write_text_atomically", recording)
+        concepts = tmp_path / "concepts"
+        concepts.mkdir()
+        (concepts / "reading-list.json").write_text(
+            json.dumps({"items": []}), encoding="utf-8")
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        _loop._load_prior_knowledge(run_dir, concepts)
+        assert run_dir / "reading-list.json" in calls
+        assert json.loads(
+            (run_dir / "reading-list.json").read_text()) == {"items": []}
+
+
+class TestOverviewSymlinkExclusion:
+    def test_symlinked_sources_not_inventoried(self, tmp_path):
+        """A hostile tree's out-pointing symlink must not feed host
+        file content into the overview prompt (the prep scan already
+        excludes symlinks)."""
+        outside = tmp_path / "outside.c"
+        outside.write_text("int secret(void){return 0;}\n",
+                           encoding="utf-8")
+        target = tmp_path / "tree"
+        target.mkdir()
+        (target / "linked.c").symlink_to(outside)
+        idents, concepts, summary, title = (
+            _loop._overview_from_directory(target)
+        )
+        # Only a symlink in the tree → nothing inventoried, no LLM
+        # call attempted.
+        assert (idents, concepts, summary, title) == ([], [], "", "")
+
+
+class TestRunEnvCuration:
+    """_run hands children the curated LLM env, not a full environ copy."""
+
+    def test_env_scrubbed_keys_forwarded_marker_set(self, monkeypatch):
+        mod = _loop
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured.update(kwargs)
+
+            class R:
+                returncode = 0
+
+            return R()
+
+        monkeypatch.setattr(mod.subprocess, "run", fake_run)
+        monkeypatch.setenv("EDITOR", "evil-editor")
+        monkeypatch.setenv("SOME_RANDOM_SHELL_VAR", "leak-me")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-123")
+        monkeypatch.setenv("RAPTOR_STUDY_MAX_OUTPUT_TOKENS", "9000")
+        rc = mod._run([sys.executable, "-c", "pass"])
+        assert rc == 0
+        env = captured["env"]
+        # Ambient shell state no longer flows to children...
+        assert "EDITOR" not in env
+        assert "SOME_RANDOM_SHELL_VAR" not in env
+        # ...but what the LLM children consume does.
+        assert env.get("ANTHROPIC_API_KEY") == "test-key-123"
+        assert env.get("RAPTOR_STUDY_MAX_OUTPUT_TOKENS") == "9000"
+        assert env.get("_RAPTOR_TRUSTED") == "1"
+
+    def test_study_knob_absent_stays_absent(self, monkeypatch):
+        mod = _loop
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured.update(kwargs)
+
+            class R:
+                returncode = 0
+
+            return R()
+
+        monkeypatch.setattr(mod.subprocess, "run", fake_run)
+        monkeypatch.delenv("RAPTOR_STUDY_MAX_OUTPUT_TOKENS", raising=False)
+        mod._run([sys.executable, "-c", "pass"])
+        assert "RAPTOR_STUDY_MAX_OUTPUT_TOKENS" not in captured["env"]
+
+
+class TestStudyReportSanitised:
+    """domain-model.json fields are LLM-authored plus target-source
+    bytes — study-report.md must carry no live markdown structure,
+    fence escapes, or control bytes."""
+
+    HOSTILE = "\x1b]0;pwned\x07\x9b2J‮evil"
+
+    def test_hostile_domain_model_rendered_inert(self, tmp_path):
+        dm = {
+            "target": "/t",
+            "subject_title": f"lib{self.HOSTILE}",
+            "overview_summary": (
+                f"# forged heading\n{self.HOSTILE}\n"
+                "![exfil](//evil.example/x)"
+            ),
+            "key_files": [{"file": f"src/{self.HOSTILE}.c",
+                           "role": "header",
+                           "description": f"desc {self.HOSTILE}"}],
+            "concepts": [],
+            "struct_definitions": [{
+                "name": f"s{self.HOSTILE}",
+                "definition": "struct s {\n int x;\n};\n```\n# spilled",
+                "doc_comment": f"doc {self.HOSTILE}",
+            }],
+            "struct_annotations": [],
+            "contracts": [{"function": f"fn{self.HOSTILE}", "file": "a.h",
+                           "when": f"when {self.HOSTILE}",
+                           "security_note": f"sec {self.HOSTILE}"}],
+            "invariants": [{"id": "INV-1",
+                            "statement": f"stmt {self.HOSTILE}",
+                            "negation": f"neg {self.HOSTILE}",
+                            "relevant_cwes": ["CWE-787"]}],
+            "bug_patterns": [{"description": f"bug {self.HOSTILE}. More."}],
+            "state_machines": [{"name": f"sm{self.HOSTILE}",
+                                "description": f"d {self.HOSTILE}",
+                                "states": [{"name": "S|0",
+                                            "description": f"x {self.HOSTILE}"}]}],
+            "security_context": {"privilege_level": f"root {self.HOSTILE}",
+                                 "trust_summary": f"t {self.HOSTILE}"},
+        }
+        (tmp_path / "domain-model.json").write_text(json.dumps(dm))
+        _loop._render_study_report(tmp_path)
+        report = (tmp_path / "study-report.md").read_text()
+        for raw in ("\x1b", "\x07", "\x9b", "‮"):
+            assert raw not in report
+        # No forged heading from LLM prose (line-leading # defanged).
+        assert "\n# forged heading" not in report
+        # The struct definition's embedded fence cannot terminate the
+        # wrapping ```c block: no bare ``` line between the wrappers.
+        body = report.split("```c", 1)[1]
+        inner = body.split("\n```\n", 1)[0]
+        assert "# spilled" in inner  # stayed INSIDE the fence
+        # Autofetch markup is stripped from prose.
+        assert "//evil.example" not in report
+
+
+class TestStructDefinitionsTolerateMalformedItems:
+    """Report attachment of struct definitions runs AFTER the paid
+    study completed; a malformed study-list item (LLM-adjacent
+    artifact) must be skipped, never raise past the block's
+    (OSError, ValueError) handlers and throw away the report,
+    project promotion, and SAGE storage."""
+
+    def test_nameless_item_is_skipped_not_keyerror(self) -> None:
+        sl = {"items": [
+            {"kind": "struct", "relevance_tier": 1},          # no name
+            {"kind": "struct", "name": "", "relevance_tier": 1},
+            {"kind": "struct", "name": "good", "relevance_tier": 2,
+             "file": "a.h"},
+        ]}
+        defs = _loop._struct_definitions(sl)
+        assert [d["name"] for d in defs] == ["good"]
+
+    def test_junk_tier_keeps_item(self) -> None:
+        # Fail toward review: an unparseable tier must neither crash
+        # (TypeError on the > comparison) nor silently drop the item.
+        sl = {"items": [
+            {"kind": "struct", "name": "s1", "relevance_tier": "3"},
+            {"kind": "struct", "name": "s2", "relevance_tier": None},
+            {"kind": "struct", "name": "deep", "relevance_tier": 3},
+            {"kind": "other", "name": "not-a-struct"},
+            "not-a-dict",
+        ]}
+        defs = _loop._struct_definitions(sl)
+        assert [d["name"] for d in defs] == ["s1", "s2"]
+
+
+class TestPendingItemsShapeTolerance:
+    """``_pending_items`` is a raw reader of the multi-writer
+    reading-list.json: a legacy or externally-edited artifact can
+    carry a present-but-null ``items`` array or non-dict rows — the
+    exact shapes the load-warning treats as evidence.  They must cost
+    the bad rows only, never crash the count (both call sites feed
+    run-start and end-of-run summary lines)."""
+
+    def test_malformed_shapes_never_crash(self, tmp_path):
+        for i, doc in enumerate((
+            {"items": None},
+            {"items": [None]},
+            {"items": ["stray", 42]},
+            {"items": {"not": "a list"}},
+        )):
+            p = tmp_path / f"rl{i}.json"
+            p.write_text(json.dumps(doc))
+            assert _loop._pending_items(p) == []
+
+    def test_bad_rows_cost_only_themselves(self, tmp_path):
+        p = tmp_path / "reading-list.json"
+        p.write_text(json.dumps({"items": [
+            None, "stray",
+            {"id": "rl-1", "question": "q?", "resolved": False},
+            {"id": "rl-2", "question": "q2?", "resolved": True},
+        ]}))
+        pending = _loop._pending_items(p)
+        assert [i["id"] for i in pending] == ["rl-1"]

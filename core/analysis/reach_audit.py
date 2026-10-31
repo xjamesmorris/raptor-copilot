@@ -38,9 +38,30 @@ _DEAD_VERDICTS = frozenset({
 # Verdicts that mean "reachable / has a live path".
 _LIVE_VERDICTS = frozenset({
     "reachable", "framework_callable", "registered_via_call", "called",
-    "frida_runtime_trace", "frida_call_edge",
+    "frida_runtime_trace", "frida_call_edge", "binary_call_edge",
 })
 # "uncertain" is neither — the substrate declines to claim.
+
+# Every string a PRECEDENCE stage can return. Keep in lockstep with
+# the stage functions above. The drift guard in test_reach_witness
+# asserts this literal is fully partitioned into _DEAD_VERDICTS /
+# _LIVE_VERDICTS / {"uncertain"} AND fully mapped in
+# reach_witness.VERDICTS — a new stage verdict added without both
+# entries fails the guard instead of silently falling to the
+# uncertain fail-safe (binary_call_edge already slipped through once
+# when the guard derived the emitted set from the _DEAD/_LIVE sets
+# themselves, making its premise circular).
+_STAGE_VERDICTS = frozenset({
+    "module_aborts", "lexical_dead", "frida_runtime_trace",
+    "frida_call_edge", "binary_oracle_absent", "build_excluded",
+    "framework_callable", "registered_via_call", "binary_call_edge",
+    "reachable", "no_path_from_entry", "called", "not_called",
+    # The interstitial vacuity stage returns "uncertain" EXPLICITLY (a
+    # terminal stop, not a fall-through): interstitial spans must never
+    # reach the graph stages below it. Deliberately outside the
+    # dead/live partition — uncertain is the neither-claim bucket.
+    "uncertain",
+})
 
 # NOTE: single-threaded use assumed — no synchronisation on this global.
 _joern_server = None
@@ -155,6 +176,44 @@ def _stage_registered(ctx: _ClassifyCtx, R) -> str | None:
     return None
 
 
+def _stage_interstitial_vacuous(ctx: _ClassifyCtx, R) -> str | None:
+    """Interstitial spans never enter a call graph — stop at uncertain.
+
+    An ``interstitial`` checklist item is a synthetic file-scope span
+    (name ``interstitial:<start>-<end>``), not a callable symbol: no
+    extractor emits call edges into or out of that NAME, so the graph
+    stages below (entry-reachability, 1-hop) can only ever manufacture
+    ``no_path_from_entry`` / ``not_called`` for it — a vacuous verdict,
+    not evidence. Reachable for script-per-file handler spans is not
+    claimed either (whether the file is request-addressable is
+    deployment knowledge the graph doesn't have); ``uncertain`` keeps
+    every consumer's behavior at "analyse it". The sound line-based
+    witnesses above (module_aborts, lexical_dead) still apply — a
+    handler span below an unconditional module abort is dead
+    regardless of kind.
+
+    Sites resolve to interstitial items only via
+    ``core.inventory.lookup.lookup_function``'s stamp-gated handler
+    enclosure; the guard keys on item kind, so an unstamped
+    interstitial reaching here (a direct caller) gets the same
+    vacuity treatment.
+    """
+    items = _candidate_items(ctx.inventory, ctx.file_path, ctx.name)
+    for it in items:
+        if isinstance(it, dict) and it.get("kind") == "interstitial":
+            return "uncertain"
+    # Name-shape fallback for spans the item index cannot resolve
+    # (span boundaries drift between checklist vintages, so a caller
+    # holding an older span name misses the index): the ``:`` makes
+    # the prefix impossible as a real identifier in any inventoried
+    # language, and the 1-hop stage below returns NOT_CALLED even for
+    # names with no inventory item at all — exactly the manufactured
+    # verdict this stage exists to stop.
+    if not items and ctx.name.startswith("interstitial:"):
+        return "uncertain"
+    return None
+
+
 def _stage_entry(ctx: _ClassifyCtx, R) -> str | None:
     er = R.entry_reachability(ctx.inventory, ctx.target)
     if er == "reachable":
@@ -248,11 +307,21 @@ PRECEDENCE = (
     # binary_oracle absent is mechanically derivable from nm + DWARF —
     # stronger than build_excluded (build-config parsing heuristic), so
     # checked first among C/C++/Rust/Go dead witnesses. SOUND +
-    # corpus-earned (Inc 3d: 841/841 absent verdicts correct).
+    # corpus-earned; current attestation figures live on the
+    # ``binary_oracle_absent`` VerdictSpec in reach_witness (and the
+    # design memo) — re-measure with
+    # core/analysis/scripts/binary-oracle-precision.
     _stage_binary_oracle_absent,
     _stage_build_excluded,
     _stage_framework,
     _stage_registered,
+    # Interstitial spans stop here: their synthetic names never enter
+    # a call graph, so the graph stages below could only manufacture
+    # vacuous dead verdicts for them (see the stage docstring). MUST
+    # precede _stage_entry / _stage_one_hop; sits after the sound
+    # line-based dead witnesses and the runtime promotes above, which
+    # all remain valid for a file-scope span.
+    _stage_interstitial_vacuous,
     # Binary direct-call-edge promote (Inc 2b Tier 1). Affirmative
     # reachability evidence: if the binary shows an incoming direct
     # call to this function, it's reachable in this build — even when
@@ -307,10 +376,19 @@ def _lookup_class_name(
     inventory: dict[str, object], file_path: str, name: str, line: int,
 ) -> str | None:
     """The enclosing class of the ``(file_path, name)`` item, if any — used to
-    build a method's class-qualified name for the 1-hop check."""
-    for it in _candidate_items(inventory, file_path, name):
-        if line and int(it.get("line_start") or 0) != line:
-            continue
+    build a method's class-qualified name for the 1-hop check.
+
+    Line disambiguation goes through the shared
+    ``_select_item_by_line`` heuristic: production callers (the
+    /agentic chokepoint via ``_finding_coords``) pass the line OF THE
+    FINDING, which is typically INSIDE the function — the previous
+    exact ``line_start`` equality never matched those, so
+    ``class_name`` resolved to None and the method lost its
+    class-qualified 1-hop resolution and the CHA fallthrough.
+    """
+    from core.analysis.reachability import _select_item_by_line
+    for it in _select_item_by_line(
+            _candidate_items(inventory, file_path, name), line):
         return (it.get("metadata") or {}).get("class_name")
     return None
 
@@ -392,23 +470,36 @@ def audit_corpus(
         with tempfile.TemporaryDirectory() as td:
             inventory = build_inventory(target_dir, td)
 
-    # Index items by (rel_path, name) → line, for label lookup.
-    line_of: dict[tuple[str, str], int] = {}
-    for f in inventory.get("files", []):
+    # Index items by (rel_path, name) → EVERY line, for label lookup.
+    # Same-name items in one file (overloads, #if/#else branches,
+    # nested defs) each keep their line — measuring only the
+    # last-seen variant's line scored a duplicated name at an
+    # arbitrary variant.
+    lines_of: dict[tuple[str, str], list[int]] = {}
+    for f in inventory.get("files", []):  # type: ignore[union-attr,attr-defined]
         if not isinstance(f, dict):
             continue
         rel = f.get("path") or ""
         for it in f.get("items", []):
             if isinstance(it, dict) and it.get("kind", "function") == "function":
-                line_of[(rel, it.get("name") or "")] = int(
-                    it.get("line_start") or 0)
+                lines_of.setdefault(
+                    (rel, it.get("name") or ""), [],
+                ).append(int(it.get("line_start") or 0))
 
     report = AuditReport()
     for (rel, name), label in labels.items():
         module = path_to_module(rel)
         if not module:
+            # No module derivable from the path (extension-less
+            # scripts, exotic layouts) — an extraction/derivation
+            # gap, NOT a reachability verdict. Silently skipping
+            # shrank the total, the coverage AND the false-suppress
+            # denominators without trace, refuting the "bucketed
+            # separately so it can't masquerade" promise.
+            report.not_found += 1
+            report.not_found_detail.append((rel, name))
             continue
-        if (rel, name) not in line_of:
+        if (rel, name) not in lines_of:
             # The labelled function isn't in the inventory at all — an
             # extraction gap, not a reachability verdict. Bucket it
             # separately so it can't masquerade as a false-suppress (which
@@ -416,8 +507,24 @@ def audit_corpus(
             report.not_found += 1
             report.not_found_detail.append((rel, name))
             continue
-        line = line_of[(rel, name)]
-        verdict = classify_reachability(inventory, rel, name, line, module)
+        # Classify EVERY same-name variant and score the worst
+        # verdict for the label: a live-labelled row false-suppresses
+        # if ANY variant classifies dead; a dead-labelled row is
+        # caught only when EVERY variant classifies dead.
+        verdicts = [
+            classify_reachability(inventory, rel, name, line, module)
+            for line in lines_of[(rel, name)]
+        ]
+        dead_flags = [v in _DEAD_VERDICTS for v in verdicts]
+        if label == "dead":
+            # Worst for a dead label = a live-reading variant.
+            worst_idx = (
+                dead_flags.index(False) if not all(dead_flags) else 0
+            )
+        else:
+            # Worst for a live label = a dead-reading variant.
+            worst_idx = dead_flags.index(True) if any(dead_flags) else 0
+        verdict = verdicts[worst_idx]
         report.total += 1
         report.per_verdict[verdict] = report.per_verdict.get(verdict, 0) + 1
         is_dead = verdict in _DEAD_VERDICTS

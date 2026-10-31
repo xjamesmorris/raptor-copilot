@@ -46,6 +46,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -186,27 +187,50 @@ def default_cache_dir() -> Path:
     return Path(RaptorConfig.REPO_ROOT) / ".cache" / "perlasm"
 
 
-def _resolve_driver_sha(gen: PerlasmGenerator) -> str:
+def _resolve_driver_sha(gen: PerlasmGenerator,
+                        target: Path | None = None) -> str:
     """Hash the xlate driver the generator will load, when locatable.
 
     The emitted asm is a function of generator + driver + flavour, so
     the driver content belongs in the cache key. Mirrors the
     generator's own lookup: alongside it, then ``../../perlasm/``.
+
+    Containment: candidates are resolved and clamped inside ``target``
+    when given — for a generator near the target root the ``../..``
+    hop otherwise walks OUT of the analysed tree and hashes an
+    unrelated host file into the key. The read itself goes through
+    O_NOFOLLOW (single syscall — no is_symlink()-then-read window).
     """
     for cand in (
         gen.path.parent / f"{gen.driver}.pl",
         gen.path.parent / ".." / ".." / "perlasm" / f"{gen.driver}.pl",
     ):
         try:
-            if cand.is_file() and not cand.is_symlink():
-                return hashlib.sha256(cand.read_bytes()).hexdigest()
+            resolved = cand.resolve()
+            if target is not None and not resolved.is_relative_to(
+                    target.resolve()):
+                continue
+            fd = os.open(str(resolved), os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode):
+                    continue
+                data = b""
+                while chunk := os.read(fd, 1 << 20):
+                    data += chunk
+                    if len(data) > 64 * 1024 * 1024:
+                        break
+            finally:
+                os.close(fd)
+            return hashlib.sha256(data).hexdigest()
         except OSError:
             continue
     return "driver-unresolved"
 
 
-def _cache_key(gen: PerlasmGenerator, flavour: str) -> str:
-    driver_sha = _resolve_driver_sha(gen)
+def _cache_key(gen: PerlasmGenerator, flavour: str,
+               target: Path | None = None) -> str:
+    driver_sha = _resolve_driver_sha(gen, target)
     return hashlib.sha256(
         f"{gen.sha256}\0{driver_sha}\0{flavour}".encode()
     ).hexdigest()[:24]
@@ -221,7 +245,7 @@ def generate_asm(gen: PerlasmGenerator, flavour: str, target: Path,
     sandbox profile (namespace + Landlock + network deny) or nothing.
     """
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cached = cache_dir / f"{_cache_key(gen, flavour)}.S"
+    cached = cache_dir / f"{_cache_key(gen, flavour, target)}.S"
     if cached.is_file():
         return cached, None
 
@@ -335,7 +359,7 @@ def generate_asm(gen: PerlasmGenerator, flavour: str, target: Path,
 
 def _sloc(text: str) -> int:
     return sum(
-        1 for line in text.split("\n")
+        1 for line in text.split("\n")  # line-model: generated-asm decode; SLOC count over strip()-normalised lines
         if line.strip() and not line.strip().startswith(("//", "#", "/*", "*"))
     )
 
@@ -376,8 +400,10 @@ def _build_file_record(gen: PerlasmGenerator, flavour: str,
 # (``$prefix="aes_v8";`` / ``my $foo = 'bar';``). Only literal
 # word-ish values interpolate — anything computed stays unresolved
 # and the label definition using it is skipped (best-effort).
+# Horizontal-only indent — the MULTILINE ^\s* idiom is quadratic
+# on blank-line runs in scanned perlasm.
 _PL_SCALAR_ASSIGN_RE = re.compile(
-    r'(?m)^\s*(?:my\s+)?\$(\w+)\s*=\s*(["\'])([\w.$-]*)\2\s*;'
+    r'(?m)^[^\S\n]*(?:my\s+)?\$(\w+)\s*=\s*(["\'])([\w.$-]*)\2\s*;'
 )
 # Column-0 asm label DEFINITION inside a heredoc, possibly spelled
 # with perl interpolation (``${prefix}_encrypt_kernel:``).
@@ -412,7 +438,7 @@ def pl_kernel_items(pl_text: str, kernel_names: set[str]) -> list:
         m.group(1): m.group(3)
         for m in _PL_SCALAR_ASSIGN_RE.finditer(pl_text)
     }
-    lines = pl_text.split("\n")
+    lines = pl_text.split("\n")  # line-model: universal-newline read_text upstream
     defs: list[tuple[int, str, str]] = []
     for i, line in enumerate(lines, 1):
         m = _PL_LABEL_DEF_RE.match(line)
@@ -530,11 +556,12 @@ def enrich_inventory_with_perlasm(inventory: dict, target_path: str | Path,
 
     files = inventory.setdefault("files", [])
     existing = {f.get("path") for f in files}
-    added_items = added_functions = added_sloc = 0
+    added_files = added_items = added_functions = added_sloc = 0
     for record in result.file_records:
         if record["path"] in existing:
             continue
         files.append(record)
+        added_files += 1
         added_items += len(record["items"])
         added_functions += len(record["items"])
         added_sloc += record["sloc"]
@@ -553,7 +580,7 @@ def enrich_inventory_with_perlasm(inventory: dict, target_path: str | Path,
             it.get("name", "") for it in record.get("items", [])
         }
         try:
-            pl_text = (Path(target_path) / gen_rel).read_text(
+            pl_text = (Path(target_path) / gen_rel).read_text(  # type: ignore[operator]
                 errors="replace",
             )
         except OSError:
@@ -572,9 +599,11 @@ def enrich_inventory_with_perlasm(inventory: dict, target_path: str | Path,
                 len(new_items), gen_rel,
             )
     if result.file_records:
-        inventory["total_files"] = inventory.get("total_files", 0) + len(
-            result.file_records
-        )
+        # Count APPENDED records, not everything the pass produced — a
+        # record whose path already exists is skipped above (repeat
+        # enrichment of the same inventory dict), and counting the
+        # unfiltered list drifted total_files away from len(files).
+        inventory["total_files"] = inventory.get("total_files", 0) + added_files
         inventory["total_items"] = inventory.get("total_items", 0) + added_items
         inventory["total_functions"] = (
             inventory.get("total_functions", 0) + added_functions

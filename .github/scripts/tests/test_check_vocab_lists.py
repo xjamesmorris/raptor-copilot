@@ -154,6 +154,34 @@ class TestBaselineSemantics:
         assert rc == 0
         assert "WARN grown" in out
 
+    def test_shrink_warns_but_passes(self, det, tmp_path, capsys):
+        """A baseline count above the measured count is silent growth
+        headroom (the list can grow back to the recorded count with no
+        tripwire) — the shrunk lane makes it warn, exit 0."""
+        root = _tree(tmp_path, "core/foo.py", BIG_LIST)
+        baseline = tmp_path / "baseline.json"
+        baseline.write_text(json.dumps({
+            "core/foo.py::_SINKS": {"kind": "literal", "count": 35},
+        }), encoding="utf-8")
+        rc, out = self._run(det, root, baseline, capsys)
+        assert rc == 0
+        assert "WARN shrunk" in out
+        assert "35 -> 12" in out
+
+    def test_exact_count_is_silent(self, det, tmp_path, capsys):
+        """The other direction of the shrunk lane: a count-accurate
+        baseline row emits neither grown nor shrunk warnings."""
+        root = _tree(tmp_path, "core/foo.py", BIG_LIST)
+        baseline = tmp_path / "baseline.json"
+        baseline.write_text(json.dumps({
+            "core/foo.py::_SINKS": {"kind": "literal", "count": 12},
+        }), encoding="utf-8")
+        rc, out = self._run(det, root, baseline, capsys)
+        assert rc == 0
+        assert "WARN shrunk" not in out
+        assert "WARN grown" not in out
+        assert "0 grown, 0 shrunk" in out
+
     def test_stale_entry_warns_but_passes(self, det, tmp_path, capsys):
         root = _tree(tmp_path, "core/foo.py", SEED_LIST)
         baseline = tmp_path / "baseline.json"
@@ -163,6 +191,97 @@ class TestBaselineSemantics:
         rc, out = self._run(det, root, baseline, capsys)
         assert rc == 0
         assert "WARN stale" in out
+
+    @staticmethod
+    def _many_lists(n: int) -> str:
+        """n distinct 12-name lists (each over MAX_SEED_NAMES)."""
+        return "".join(
+            f"_S{i} = ["
+            + ", ".join(f'"api_fn_{j}"' for j in range(12))
+            + "]\n"
+            for i in range(n)
+        )
+
+    def test_grown_within_budget_warns_but_passes(self, det, tmp_path,
+                                                  capsys):
+        """Exactly AT the drift budget (floor 10): warn-only, exit 0 —
+        the lower direction of the threshold (see the trade-off comment
+        at the check site: a tighter budget re-arms refresh churn)."""
+        root = _tree(tmp_path, "core/foo.py", self._many_lists(11))
+        entries = {f"core/foo.py::_S{i}": {"kind": "literal", "count": 10}
+                   for i in range(10)}
+        entries["core/foo.py::_S10"] = {"kind": "literal", "count": 12}
+        baseline = tmp_path / "baseline.json"
+        baseline.write_text(json.dumps(entries), encoding="utf-8")
+        rc, out = self._run(det, root, baseline, capsys)
+        assert rc == 0
+        assert out.count("WARN grown") == 10
+        assert "drift budget" not in out
+
+    def test_grown_over_budget_fails(self, det, tmp_path, capsys):
+        """One past the budget: fail, pointing at the note-preserving
+        refresh — the upper direction of the threshold (unreviewed
+        additions must not pool under baselined keys indefinitely)."""
+        root = _tree(tmp_path, "core/foo.py", self._many_lists(11))
+        entries = {f"core/foo.py::_S{i}": {"kind": "literal", "count": 10}
+                   for i in range(11)}
+        baseline = tmp_path / "baseline.json"
+        baseline.write_text(json.dumps(entries), encoding="utf-8")
+        rc, out = self._run(det, root, baseline, capsys)
+        assert rc == 1
+        assert "drift budget" in out
+
+
+class TestWriteBaselineRoundTrip:
+    def test_notes_survive_regeneration(self, det, tmp_path):
+        """A count refresh must round-trip review provenance: the
+        surviving key keeps its note (and any unrecognized field),
+        only kind/count regenerate, and rows that no longer fire
+        drop. The grown-count case IS the refresh invitation, so it
+        is the case pinned here."""
+        root = _tree(tmp_path, "core/foo.py", BIG_LIST)
+        baseline = tmp_path / "baseline.json"
+        baseline.write_text(json.dumps({
+            "core/foo.py::_SINKS": {
+                "kind": "literal",
+                "count": 10,
+                "note": "reviewed: closed API manifest",
+                "reviewed_by": "ops",
+            },
+            "core/gone.py::_OLD": {
+                "kind": "literal", "count": 4, "note": "stale, drops",
+            },
+        }), encoding="utf-8")
+        det.write_baseline(baseline, det.scan_tree(root))
+        data = json.loads(baseline.read_text(encoding="utf-8"))
+        row = data["core/foo.py::_SINKS"]
+        assert row["note"] == "reviewed: closed API manifest"
+        assert row["reviewed_by"] == "ops"   # unrecognized fields ride
+        assert row["count"] == 12            # the count itself refreshes
+        assert row["kind"] == "literal"
+        assert "core/gone.py::_OLD" not in data
+
+    def test_missing_baseline_writes_bare_rows(self, det, tmp_path):
+        root = _tree(tmp_path, "core/foo.py", BIG_LIST)
+        baseline = tmp_path / "baseline.json"
+        det.write_baseline(baseline, det.scan_tree(root))
+        data = json.loads(baseline.read_text(encoding="utf-8"))
+        assert data == {
+            "core/foo.py::_SINKS": {"kind": "literal", "count": 12},
+        }
+
+    def test_unparseable_baseline_refuses(self, det, tmp_path, capsys):
+        """A corrupt existing baseline must refuse the rewrite, not be
+        treated as empty — that would be the same note erasure through
+        a different door."""
+        root = _tree(tmp_path, "core/foo.py", BIG_LIST)
+        baseline = tmp_path / "baseline.json"
+        baseline.write_text('{"broken":', encoding="utf-8")
+        with pytest.raises(SystemExit) as exc:
+            det.write_baseline(baseline, det.scan_tree(root))
+        assert exc.value.code == 2
+        assert baseline.read_text(encoding="utf-8") == '{"broken":'
+        assert "refusing" in capsys.readouterr().err
 
 
 class TestRepoBaseline:

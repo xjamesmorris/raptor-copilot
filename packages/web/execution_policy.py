@@ -7,6 +7,7 @@ guardrail as the built-in HTTP client.
 
 from __future__ import annotations
 
+import threading
 from collections import Counter, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -14,6 +15,7 @@ from typing import Iterable
 from urllib.parse import urlparse
 from uuid import uuid4
 
+from packages.web.origin import origin_of
 
 _RISK_ORDER = {"passive": 0, "active": 1, "intrusive": 2}
 
@@ -26,21 +28,18 @@ def _origin(url: str) -> tuple[str, str, int]:
     parsed = urlparse(url)
     if not parsed.scheme or not parsed.hostname:
         raise WebPolicyError(f"Web scope target must be an absolute URL: {url}")
-    default_port = 443 if parsed.scheme.lower() == "https" else 80
     try:
-        port = parsed.port
+        parsed.port
     except ValueError as exc:
         # urlparse defers port validation to attribute access: an
         # out-of-range or non-numeric port (a hostile crawled anchor
         # like http://h:99999/x) raises a plain ValueError that would
         # sail past every 'except WebPolicyError' handler and kill the
-        # calling phase. Classify it as a policy denial instead.
+        # calling phase. Classify it as a policy denial instead (the
+        # policy's contract is a LOUD denial, not origin_of's silent
+        # never-matches sentinel).
         raise WebPolicyError(f"Invalid port in web target URL: {url}") from exc
-    return (
-        parsed.scheme.lower(),
-        parsed.hostname.lower(),
-        port or default_port,
-    )
+    return origin_of(url)
 
 
 def _origin_text(origin: tuple[str, str, int]) -> str:
@@ -94,6 +93,10 @@ class WebExecutionPolicy:
         self._approved_tools = set(receipt.approved_tools)
         self._audit: deque[dict[str, str]] = deque(maxlen=audit_limit)
         self._counts: Counter[str] = Counter()
+        # _record mutates counter + audit deque from whatever thread
+        # authorizes (the common-paths pool authorizes concurrently);
+        # unlocked mutation lost audit-telemetry counts.
+        self._record_lock = threading.Lock()
 
     @classmethod
     def for_target(
@@ -159,16 +162,17 @@ class WebExecutionPolicy:
             logged_target = _origin_text(_origin(url))
         except WebPolicyError:
             logged_target = "<invalid-url>"
-        self._counts[f"{decision}:{tool_id}"] += 1
-        self._audit.append({
-            "at": datetime.now(timezone.utc).isoformat(),
-            "tool_id": tool_id,
-            "target_origin": logged_target,
-            "risk": risk,
-            "action": action,
-            "decision": decision,
-            "reason": reason,
-        })
+        with self._record_lock:
+            self._counts[f"{decision}:{tool_id}"] += 1
+            self._audit.append({
+                "at": datetime.now(timezone.utc).isoformat(),
+                "tool_id": tool_id,
+                "target_origin": logged_target,
+                "risk": risk,
+                "action": action,
+                "decision": decision,
+                "reason": reason,
+            })
 
     def report(self) -> dict:
         return {

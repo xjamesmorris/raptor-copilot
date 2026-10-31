@@ -257,3 +257,22 @@ class TestCheckFlowTraceFeasibility:
         }
         result = check_flow_trace_feasibility(trace)
         assert result.feasible is True
+
+
+class TestNonDictStepTolerated:
+    def test_non_dict_step_skipped(self):
+        from core.audit.path_feasibility import (
+            extract_conditions_from_flow_trace,
+        )
+
+        # LLM-authored traces can carry malformed steps; a bare string
+        # must not raise, and the well-formed steps still extract.
+        trace = {
+            "steps": [
+                "malformed step",
+                None,
+                {"path_conditions": ["size > 0"], "file": "a.c"},
+            ],
+        }
+        conds = extract_conditions_from_flow_trace(trace)
+        assert [c.text for c in conds] == ["size > 0"]

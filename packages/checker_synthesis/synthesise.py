@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from core.atomic_fs import write_text_atomically
-from packages.coccinelle.runner import contains_script_block
+from packages.coccinelle.runner import RESULT_PREFIX, contains_script_block
 
 from .languages import detect_engine, fallback_engine
 from .models import (
@@ -86,7 +86,7 @@ def _validate_rule_body(body: str) -> str | None:
     Returns an error string on rejection, or None if OK."""
     if "\x00" in body:
         return "rule body contains null byte"
-    for i, line in enumerate(body.split("\n"), 1):
+    for i, line in enumerate(body.split("\n"), 1):  # line-model: LLM-generated rule body
         if len(line) > _RULE_BODY_MAX_LINE:
             return (
                 f"rule body line {i} exceeds {_RULE_BODY_MAX_LINE} chars "
@@ -99,8 +99,13 @@ def _validate_rule_body(body: str) -> str | None:
 # same-line ``... when != if (E)`` form. The optional dots group is
 # preserved on substitution so the ellipsis (valid SmPL on its own)
 # survives the strip.
+# The dots group's leading whitespace is horizontal ([^\S\n]*):
+# newline-capable, every line anchor re-scanned a shared blank run
+# hunting the ellipsis — quadratic. A cross-line ellipsis re-anchors
+# at its own line start, and the substitution keeps the same output
+# either way (the clause line is what gets stripped).
 _INVALID_WHEN_RE = re.compile(
-    r"^(?P<dots>\s*\.\.\.)?[ \t]*when\s*!=\s*(?:if|assert|while|for|switch)"
+    r"^(?P<dots>[^\S\n]*\.\.\.)?[ \t]*when\s*!=\s*(?:if|assert|while|for|switch)"
     r"\s*\(.*$",
     re.MULTILINE,
 )
@@ -139,6 +144,19 @@ def _reject_cocci_scripting(body: str) -> str | None:
             "@initialize:/@finalize:) — LLM-synthesised rules must be "
             "declarative SmPL only; RAPTOR injects the reporting "
             "harness itself"
+        )
+    # Belt: a rule-supplied COCCIRESULT emit marker is an evidence-
+    # forgery vector — the runner nonce-rewrites every marker in the
+    # text it executes, so a rule carrying its own would have its emit
+    # site minted into accepted match evidence. The runner refuses such
+    # rules at run time too; rejecting here keeps them out of the
+    # checkers library entirely. Case-folded: wider than the runner's
+    # exact rewrite trigger, and the extra width only refuses more.
+    if RESULT_PREFIX.lower() in body.lower():
+        return (
+            "rule body contains the COCCIRESULT result-marker text — "
+            "LLM-synthesised rules must not carry their own emit "
+            "sites; RAPTOR injects the reporting harness itself"
         )
     return None
 
@@ -331,10 +349,11 @@ def _propose_rule(
     fix_patch = data.get("fix_patch", "") or ""
     if not isinstance(body, str) or not body.strip():
         return None, "llm response missing 'rule_body'"
-    if len(body.encode("utf-8")) > _RULE_BODY_MAX_BYTES:
+    body_bytes = len(body.encode("utf-8"))
+    if body_bytes > _RULE_BODY_MAX_BYTES:
         return None, (
             f"rule body too large "
-            f"({len(body)} chars > {_RULE_BODY_MAX_BYTES})"
+            f"({body_bytes} bytes > {_RULE_BODY_MAX_BYTES})"
         )
     body_err = _validate_rule_body(body)
     if body_err:
@@ -544,7 +563,7 @@ def _fix_mutant_control(
     except OSError as e:
         return None, [f"fix-mutant: cannot read seed file: {e}"]
 
-    lines = original.split("\n")
+    lines = original.split("\n")  # line-model: universal-newline read_text above
     line_start, line_end = seed.line_start, seed.line_end
     if not (1 <= line_start <= line_end <= len(lines)):
         return None, [
@@ -552,7 +571,7 @@ def _fix_mutant_control(
              f"outside file ({len(lines)} lines) — patch not applicable"),
         ]
 
-    patch_lines = rule.fix_patch.split("\n")
+    patch_lines = rule.fix_patch.split("\n")  # line-model: LLM-generated patch text
     # Trim one trailing empty line from the patch — LLMs habitually
     # end strings with "\n", which would otherwise insert a blank.
     if patch_lines and patch_lines[-1] == "":
@@ -752,7 +771,7 @@ def synthesise_and_run(
                 feedback = err
                 continue
 
-            rule_path = _write_rule(out_dir, rule)
+            rule_path = _write_rule(out_dir, rule)  # type: ignore[arg-type]
             gt_negative_ok: bool | None = None
             if ground_truth_fixtures is not None:
                 ok, gt_negative_ok, run_errors = _ground_truth_control(
@@ -785,9 +804,9 @@ def synthesise_and_run(
             result.errors.extend(f"{tag}: {e}" for e in run_errors)
             if ok:
                 ext = _fixture_ext(seed, engine)
-                if rule.test_positive and rule.test_negative:
+                if rule.test_positive and rule.test_negative:  # type: ignore[union-attr]
                     dc_ok, dc_errors = _dual_control(
-                        rule, rule_path, engine, ext,
+                        rule, rule_path, engine, ext,  # type: ignore[arg-type]
                     )
                     result.errors.extend(
                         f"{tag}: {e}" for e in dc_errors

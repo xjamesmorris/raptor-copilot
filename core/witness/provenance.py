@@ -72,13 +72,14 @@ import hashlib
 import hmac
 import os
 import secrets
-import stat
-import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from core.logging import get_logger
+from core.run.finding_status import read_verdict
+from core.security import mac_key
+from core.status import normalize_status
 
 logger = get_logger(__name__)
 
@@ -87,7 +88,7 @@ _KEY_LEN = 32
 # Sentinel: a key file EXISTS but is unusable (symlink, foreign owner,
 # group/other-readable). Distinct from "absent" — an unusable key must
 # never be silently replaced and must never mint or verify.
-_REFUSED = object()
+_REFUSED = mac_key.REFUSED
 
 _warned_paths: set = set()
 
@@ -120,113 +121,28 @@ def _warn_once_suspect_key(path: Path, reason: str, remedy: str) -> None:
     )
 
 
-def _read_existing_key(path: Path):
-    """Read an EXISTING key with rowmac's fd-fstat discipline: refuse
-    symlinks (O_NOFOLLOW + fstat on the opened inode), foreign owners,
-    and any group/other permission bits."""
-    try:
-        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        _warn_once_suspect_key(
-            path, f"open refused ({exc})",
-            "if the key is a symlink, remove it and investigate how it "
-            "got there; a fresh key is created on the next stamp",
-        )
-        return _REFUSED
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            _warn_once_suspect_key(
-                path, "not a regular file",
-                "remove the object at that path and investigate",
-            )
-            return _REFUSED
-        if st.st_uid != os.geteuid():
-            _warn_once_suspect_key(
-                path,
-                f"owned by uid={st.st_uid}, expected uid={os.geteuid()}",
-                "investigate the foreign-owned key; restore your own "
-                "0600 key file",
-            )
-            return _REFUSED
-        if st.st_mode & 0o077:
-            _warn_once_suspect_key(
-                path,
-                f"mode {stat.S_IMODE(st.st_mode):04o} grants group/other "
-                "access",
-                f"chmod 600 {path}",
-            )
-            return _REFUSED
-        # A single os.read may return fewer bytes than requested
-        # (network filesystems); a short read would land a healthy key
-        # in the wrong-length refusal, so loop to EOF. The cap stays at
-        # _KEY_LEN * 4 — genuinely oversized files still fail-close in
-        # the caller's length check.
-        chunks: list[bytes] = []
-        remaining = _KEY_LEN * 4
-        while remaining > 0:
-            chunk = os.read(fd, remaining)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        return b"".join(chunks)
-    except OSError:
-        return None
-    finally:
-        os.close(fd)
+def _read_existing_key(path: Path) -> bytes | mac_key.Refused | None:
+    """Read an EXISTING key with the shared fd-fstat discipline
+    (:func:`core.security.mac_key.read_existing_key`): refuse symlinks
+    (O_NOFOLLOW + fstat on the opened inode), foreign owners, and any
+    group/other permission bits."""
+    return mac_key.read_existing_key(
+        path, key_len=_KEY_LEN, warn=_warn_once_suspect_key)
 
 
 def _load_or_create_key() -> bytes | None:
     """Read the key, lazily creating it (0700 dir, 0600 file, O_EXCL)
-    if absent. Returns None when a key file exists but is unusable —
-    the suspect key is never used, never replaced."""
-    path = _key_path()
-    data = _read_existing_key(path)
-    if data is _REFUSED:
-        return None
-    if data is not None and len(data) == _KEY_LEN:
-        return data
-    if data is not None:
-        _warn_once_suspect_key(
-            path,
-            f"wrong length ({len(data)} bytes, expected {_KEY_LEN})",
-            "remove the suspect key and investigate; a fresh key is "
-            "created on the next stamp",
-        )
-        return None
-
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    key = secrets.token_bytes(_KEY_LEN)
-    try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        # Lost the creation race — re-read the winner's key (an
-        # attacker pre-placing a symlink also lands here: O_EXCL
-        # refuses to create through one, and the re-read refuses it).
-        for _ in range(20):
-            raced = _read_existing_key(path)
-            if raced is _REFUSED:
-                return None
-            if raced is not None and len(raced) == _KEY_LEN:
-                return raced
-            if raced is not None:
-                _warn_once_suspect_key(
-                    path,
-                    f"wrong length ({len(raced)} bytes, expected {_KEY_LEN})",
-                    "remove the suspect key and investigate; a fresh key "
-                    "is created on the next stamp",
-                )
-                return None
-            time.sleep(0.01)
-        return None
-    try:
-        os.write(fd, key)
-    finally:
-        os.close(fd)
-    return key
+    if absent — the shared hardened discipline in
+    :func:`core.security.mac_key.load_or_create_key`. Returns None
+    when a key file exists but is unusable — the suspect key is never
+    used, never replaced. The creation-race loser polls through the
+    winner's create-to-write window instead of mis-flagging the
+    mid-write key as suspect (which persisted the loser's evidence
+    records unstamped — demoted to LLM-tier and re-derived — under a
+    false suspect-key warning)."""
+    return mac_key.load_or_create_key(
+        _key_path(), key_len=_KEY_LEN, warn=_warn_once_suspect_key,
+        read_existing=_read_existing_key)
 
 
 def _canonical(fields: Mapping[str, object]) -> bytes:
@@ -303,6 +219,25 @@ _BINDING_FILE = ".witness-binding"
 BINDING_GRADE_KEY = "provenance_binding"
 
 #: Binding grades, as reported by the graded verifiers.
+#:
+#: What each grade DOES and DOES NOT prove — consumers weighting
+#: GRADE_RUN_NONCE above GRADE_BASENAME should know both rest on
+#: same-user-readable material:
+#:
+#: * GRADE_RUN_NONCE defeats replay of stamped records ACROSS run
+#:   directories (a record minted under run A's nonce never verifies
+#:   in run B). It does NOT defeat directory staging by a same-user
+#:   reader: verification recomputes the binding from the
+#:   ``.witness-binding`` file INSIDE the directory under
+#:   verification, so an actor who can read a donor run's nonce file
+#:   can stage a directory (donor basename + copied nonce +
+#:   selectively copied validly-stamped records) that verifies at
+#:   this grade — a PARTIAL clone is indistinguishable from the
+#:   documented whole-directory archive/move, and that equivalence is
+#:   inherent to the portability property, not a defect a stronger
+#:   nonce could remove.
+#: * GRADE_BASENAME proves only that the record was minted by this
+#:   install for a directory of the same resolved basename.
 GRADE_RUN_NONCE = "run-nonce"
 GRADE_BASENAME = "basename"
 
@@ -317,12 +252,43 @@ def _valid_nonce(text: str) -> bool:
 
 
 def _read_run_nonce(run_dir: Path | str) -> str | None:
-    """The run's persisted binding nonce, or None (absent/malformed)."""
+    """The run's persisted binding nonce, or None (absent/malformed).
+
+    Gated read on the OPEN fd: the binding file lives in the
+    directory UNDER VERIFICATION — exactly the surface a stager
+    controls — so a planted FIFO must be refused (O_NONBLOCK +
+    S_ISREG) instead of hanging every graded verifier, and the read
+    is capped (a nonce is 32 hex characters; anything bigger is
+    malformed by construction).
+    """
+    import stat as _stat_mod
+
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
     try:
-        text = (
-            Path(run_dir) / _BINDING_FILE
-        ).read_text(encoding="utf-8").strip()
+        fd = os.open(str(Path(run_dir) / _BINDING_FILE), flags)
     except OSError:
+        return None
+    try:
+        if not _stat_mod.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1  # fdopen owns it now
+            raw = fh.read(_NONCE_HEX_LEN + 16)
+    except OSError:
+        return None
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    try:
+        text = raw.decode("utf-8").strip()
+    except UnicodeDecodeError:
         return None
     return text if _valid_nonce(text) else None
 
@@ -368,6 +334,13 @@ def _binding_for_verify(
     The marker cannot be stripped to demote the check: a token minted
     over the nonced binding never verifies against the basename-only
     field set, and vice versa.
+
+    The nonce is read FROM the directory under verification (the
+    archive/move portability property), so a fully STAGED directory —
+    donor basename, copied nonce file, selectively copied stamped
+    records — verifies at GRADE_RUN_NONCE for a same-user reader; see
+    the partial-clone note at the grade constants before weighting
+    the grade as more than cross-run replay defence.
     """
     if record.get(BINDING_GRADE_KEY) == GRADE_RUN_NONCE:
         nonce = _read_run_nonce(run_dir)
@@ -465,14 +438,23 @@ def smt_conditions_hash(conditions: Any) -> str:
     if not isinstance(conditions, list) or not conditions:
         # No conditions → the sweep never produced a record for this
         # path; any record present is foreign. A non-matchable
-        # sentinel (not a hex prefix) guarantees inequality.
+        # sentinel (not a hex digest) guarantees inequality.
         return "<no-conditions>"
     import json as _json
     try:
         payload = _json.dumps(conditions, sort_keys=True, default=str)
     except (TypeError, ValueError):
         payload = repr(conditions)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    # Full digest, deliberately: this equality is the verifier's
+    # suppression-direction path binding, and BOTH condition sets in
+    # a transplant are attacker-influenceable (path_conditions are
+    # LLM-extracted over a hostile target). A truncated 64-bit prefix
+    # left a ~2^32-work offline birthday collision as the transplant
+    # margin; 48 extra JSON bytes buy the full 256-bit margin.
+    # Records stamped under the old truncated form fail the equality
+    # against a full recompute — fail CLOSED: the refutation demotes
+    # to unverified, never verifies wrongly.
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def smt_feasibility_fields(
@@ -670,6 +652,31 @@ FEASIBILITY_TIER_STATUSES = frozenset({
     "confirmed_constrained", "confirmed_blocked",
 })
 
+#: Feasibility verdicts whose Stage-F mapping (validation-helper
+#: VERDICT_MAP / orchestrator verdict_to_status) reaches the
+#: exploitable family — the only verdicts that legitimately derive
+#: ``is_exploitable=True``. "likely" is the raw analyzer spelling;
+#: the status normalisers rewrite only the Title-Case variant, so
+#: both spellings appear in stamped records.
+_EXPLOITABLE_VERDICTS = frozenset({
+    "exploitable", "likely", "likely_exploitable",
+})
+
+#: Feasibility verdict → the tier status its Stage-F mapping
+#: (validation-helper VERDICT_MAP / orchestrator verdict_to_status)
+#: legitimately produces. A verified record supports ONLY its own
+#: tier: a genuine "unlikely" record beside a claimed "exploitable"
+#: is a borrowed receipt, not support. Verdicts absent here
+#: (unknown / error) map to confirmed_unverified, which is not a
+#: tier status — they support no tier claim.
+_VERDICT_TIER_STATUS = {
+    "exploitable": "exploitable",
+    "likely": "likely_exploitable",
+    "likely_exploitable": "likely_exploitable",
+    "difficult": "confirmed_constrained",
+    "unlikely": "confirmed_blocked",
+}
+
 
 def _strip_witness_claim(finding: dict) -> None:
     """Remove an unverified witness_execution record AND every ruling
@@ -714,16 +721,17 @@ def sanitise_findings_evidence(
 
     Mutates the findings in place. Returns
     ``{"witness_stripped": n, "feasibility_demoted": n,
-    "final_status_demoted": n}`` so callers can log what was refused.
-    Verified records are left untouched (including their ruling /
-    final_status consequences); unverified ones lose the mechanical
-    claim and keep only their LLM-tier content (source-analysis
-    fields survive for re-derivation).
+    "final_status_demoted": n, "exploitable_demoted": n}`` so callers
+    can log what was refused. Verified records are left untouched
+    (including their ruling / final_status consequences); unverified
+    ones lose the mechanical claim and keep only their LLM-tier
+    content (source-analysis fields survive for re-derivation).
     """
     stats = {
         "witness_stripped": 0,
         "feasibility_demoted": 0,
         "final_status_demoted": 0,
+        "exploitable_demoted": 0,
     }
     if not isinstance(findings_data, Mapping):
         return stats
@@ -795,32 +803,102 @@ def sanitise_findings_evidence(
         # Verdict-tier clamp: exploitable-family final statuses are
         # only ever produced by mapping a feasibility verdict (Stage E
         # / validation-helper VERDICT_MAP / the E-5 skill table), so
-        # they require a VERIFIED analyzed feasibility record. A
-        # pre-set "exploitable" with no (or a forged) record is
-        # quarantined until a mechanical stage re-derives it.
-        if finding.get("final_status") in FEASIBILITY_TIER_STATUSES:
+        # they require a VERIFIED analyzed feasibility record WHOSE
+        # OWN VERDICT maps to the claimed tier — any verified record
+        # supporting any tier claim lets a forged "exploitable" ride
+        # a genuine "unlikely" stamp. Claims are normalised BEFORE the
+        # membership test (the display fallback title-cases anything,
+        # so an unnormalised "EXPLOITABLE" renders identically to the
+        # canonical value), and both string channels — final_status
+        # AND top-level status — are clamped: each one reaches
+        # get_display_status on its own. Unsupported claims are
+        # quarantined until a mechanical stage re-derives them;
+        # supported ones are rewritten to the canonical spelling.
+        claimed_final = normalize_status(finding.get("final_status"))
+        claimed_status = normalize_status(finding.get("status"))
+        if (claimed_final in FEASIBILITY_TIER_STATUSES
+                or claimed_status in FEASIBILITY_TIER_STATUSES):
             feasibility = finding.get("feasibility")
-            supported = (
+            verified = (
                 isinstance(feasibility, dict)
                 and feasibility.get("status") == "analyzed"
                 and verify_feasibility(finding, run_dir)
             )
-            if not supported:
-                finding["final_status"] = "confirmed_unverified"
-                if finding.get("status") in FEASIBILITY_TIER_STATUSES:
+            if verified:
+                assert isinstance(feasibility, dict)
+                verdict_tier = _VERDICT_TIER_STATUS.get(
+                    str(feasibility.get("verdict") or "").strip().lower()
+                )
+            else:
+                verdict_tier = None
+            demoted = False
+            if claimed_final in FEASIBILITY_TIER_STATUSES:
+                if verdict_tier == claimed_final:
+                    finding["final_status"] = claimed_final
+                else:
+                    finding["final_status"] = "confirmed_unverified"
+                    demoted = True
+            if claimed_status in FEASIBILITY_TIER_STATUSES:
+                if verdict_tier == claimed_status:
+                    finding["status"] = claimed_status
+                else:
                     finding["status"] = "confirmed_unverified"
-                if finding.get("is_exploitable"):
-                    finding["is_exploitable"] = False
+                    demoted = True
+            if demoted:
                 stats["final_status_demoted"] += 1
+
+        # Boolean-verdict clamp — runs on EVERY finding, deliberately
+        # NOT nested inside the final_status gate above:
+        # get_display_status gives a truthy ``is_exploitable`` display
+        # priority over every status string, so a forged True beside a
+        # non-feasibility-tier final_status ("confirmed") rendered
+        # Exploitable without ever meeting that gate. The boolean is
+        # only legitimately derived (Stage F) from a verified analyzed
+        # feasibility record whose verdict is in the exploitable
+        # family — any other truthy claim is demoted here.
+        #
+        # Demote only a genuine True claim: an abstention is not a
+        # positive claim to overwrite with a fabricated explicit
+        # False. A junk shape is normalised to the explicit abstention
+        # instead — this is a sanitisation chokepoint, and leaving
+        # junk in place would hand downstream/external truthy readers
+        # a value the tri-state accessor refuses.
+        _claim = read_verdict(finding, "is_exploitable")
+        # Shape check, never a value read: on abstention the key
+        # holds either the explicit None (left alone) or a junk
+        # shape (normalised); an absent key stays absent (its read
+        # binds None, which the isinstance arm excludes). The bound
+        # raw value is inspected only for its type — the spelling
+        # the tri-state accessor itself uses — so it is never
+        # truth-tested or identity-compared as a verdict.
+        _stored = finding.get("is_exploitable")
+        _junk = (
+            _claim is None
+            and not isinstance(_stored, (bool, type(None)))
+        )
+        if _claim is True or _junk:
+            feasibility = finding.get("feasibility")
+            supported = (
+                isinstance(feasibility, dict)
+                and feasibility.get("status") == "analyzed"
+                and str(feasibility.get("verdict") or "")
+                in _EXPLOITABLE_VERDICTS
+                and verify_feasibility(finding, run_dir)
+            )
+            if not supported:
+                finding["is_exploitable"] = False if _claim is True else None
+                stats["exploitable_demoted"] += 1
 
     if any(stats.values()):
         logger.warning(
             "witness provenance: demoted unverified evidence claims "
             "(witness_execution stripped: %d, feasibility demoted: %d, "
-            "final_status demoted: %d) — records lacked a valid "
-            "mechanical-provenance stamp for run %r",
+            "final_status demoted: %d, is_exploitable demoted: %d) — "
+            "records lacked a valid mechanical-provenance stamp for "
+            "run %r",
             stats["witness_stripped"], stats["feasibility_demoted"],
-            stats["final_status_demoted"], run_binding(run_dir),
+            stats["final_status_demoted"], stats["exploitable_demoted"],
+            run_binding(run_dir),
         )
     return stats
 

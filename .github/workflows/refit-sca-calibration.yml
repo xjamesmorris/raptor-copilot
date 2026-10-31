@@ -55,6 +55,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # The validate/refit steps run repo code over the fetched
+          # calibration corpus with a contents:write token in scope; keep
+          # that token out of .git/config so those steps can't reach it
+          # (same hardening as refresh-sca-data.yml / sca-self-bump.yml).
+          # The push authenticates explicitly via the gh credential
+          # helper (see Commit + push).
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -65,7 +73,7 @@ jobs:
         # Pure-Python refit — no numpy / sklearn. Just whatever
         # the SCA package itself needs to import (urllib3 etc.).
         run: |
-          python -m pip install --upgrade pip==26.1.2
+          python -m pip install --upgrade pip==26.2.1
           pip install 'urllib3==2.7.0,<3.0'
 
       - name: Validate corpus
@@ -76,14 +84,25 @@ jobs:
         id: validate
         env:
           _RAPTOR_TRUSTED: '1'
+        # Metrics-only by design: the gate below reads the verdict
+        # from the committed weekly snapshot (same corpus state this
+        # run fetched, so the fresh metrics are identical), and this
+        # workflow must not write into the committed validation/ dir
+        # it doesn't commit.
         run: |
           set +e
           packages/sca/scripts/raptor-sca-validate-corpus
-          # Re-read the report to extract the verdict for gating.
+          # Re-read the committed report to extract the verdict for gating.
           python <<'EOF' >> "$GITHUB_OUTPUT"
-          import json, glob, os, sys
+          import glob, json, os, re, sys
+          # Strictly date-shaped snapshots only — a stray
+          # late-sorting .json must not shadow the dated history
+          # (same shape the writer/pruner and risk.py apply).
+          dated = re.compile(r"^\d{4}-\d{2}-\d{2}\.json$")
           paths = sorted(
-              glob.glob('packages/sca/data/calibration/validation/*.json'),
+              (p for p in
+               glob.glob('packages/sca/data/calibration/validation/*.json')
+               if dated.match(os.path.basename(p))),
               reverse=True,
           )
           verdict = "unverified"
@@ -141,7 +160,7 @@ jobs:
         # the report still ships.
         run: |
           set +e
-          packages/sca/scripts/refit-calibration --apply
+          packages/sca/scripts/refit-calibration --apply --update-snapshot
           rc=$?
           echo "refit exit: $rc"
           # Only exit 3 (genuine error) should fail the workflow.
@@ -168,6 +187,11 @@ jobs:
         run: |
           set -eu
           BRANCH="auto/sca-calibration-refit"
+          # persist-credentials:false (see Checkout) kept the token out of
+          # .git/config for the refit steps. Install gh CLI's credential
+          # helper, which reads the token from env at push time without
+          # ever embedding it in any URL stored in .git/config.
+          gh auth setup-git
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -B "$BRANCH"
@@ -181,6 +205,17 @@ jobs:
           if joint top-20 precision improvement clears 5 percentage
           points. See packages/sca/data/calibration/refit/<date>.json
           for per-constant deltas."
+          # Replay the refit commit onto current main before opening
+          # the PR — a branch cut from the dispatch-time checkout can
+          # be stale when auto-PR workflows run back-to-back, and a
+          # stale base turns any file overlap into a PR merge
+          # conflict. This workflow writes packages/sca/risk.py, a
+          # human-edited CODE file — the most conflict-prone write in
+          # the auto-PR family — so a genuine overlap must fail HERE,
+          # loudly, instead of opening a conflicted PR. Same block as
+          # the five sibling publish workflows.
+          git fetch origin main
+          git rebase origin/main
           # --force-with-lease (not --force): refuses the push if the
           # remote branch moved since our fetch — e.g. an operator amended
           # the open auto-PR — rather than clobbering it. Fetch first to

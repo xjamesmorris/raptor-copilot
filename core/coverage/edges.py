@@ -86,7 +86,11 @@ def containing_item(
     return best[2] if best else None
 
 
-def normalise_trace_path(raw: str, inv_paths: set[str]) -> str | None:
+def normalise_trace_path(
+    raw: str,
+    inv_paths: set[str],
+    name_index: dict[str, list] | None = None,
+) -> str | None:
     """Map a trace path (possibly absolute / ``./``-prefixed) onto its
     inventory key. Exact match first; else a unique suffix match.
 
@@ -95,6 +99,15 @@ def normalise_trace_path(raw: str, inv_paths: set[str]) -> str | None:
     the shared matcher fixed — so ``../shared/util.c`` (out of tree)
     became ``shared/util.c`` (an inventory key) and ``.hidden.c`` /
     dot-dir prefixes got mangled.
+
+    ``name_index`` (from ``summary._inventory_name_index``): the
+    suffix relation ``raw.endswith("/" + p)`` implies equal final
+    components, so the basename index is the COMPLETE candidate
+    space — callers looping many trace steps over one inventory
+    (``collect_touched_edges``) pass it to make the per-step cost
+    O(candidates) instead of an O(inventory) scan with a string
+    allocation per pair (budget-max hostile traces bought hours of
+    CPU per render through that scan).
     """
     if raw in inv_paths:
         return raw
@@ -106,7 +119,11 @@ def normalise_trace_path(raw: str, inv_paths: set[str]) -> str | None:
     # out-of-tree file onto an unrelated inventory key.
     if ".." in raw.split("/"):
         return None
-    hits = [p for p in inv_paths if raw.endswith("/" + p)]
+    if name_index is not None:
+        candidates: Any = name_index.get(Path(raw).name, [])
+    else:
+        candidates = inv_paths
+    hits = [p for p in candidates if raw.endswith("/" + p)]
     if len(hits) == 1:
         return hits[0]
     return None
@@ -144,6 +161,11 @@ def collect_touched_edges(
     """
     spans = item_spans(checklist)
     inv_paths = set(spans)
+    # Built once per capture (not per step): the shared basename
+    # index that keeps the suffix strategy O(candidates) — see
+    # normalise_trace_path.
+    from .summary import _inventory_name_index
+    name_index = _inventory_name_index(inv_paths)
     defs = _name_definitions(checklist)
     edges: list[dict[str, Any]] = []
     seen: set[tuple] = set()
@@ -159,8 +181,19 @@ def collect_touched_edges(
             "call_line": call_line, "source": source,
         })
 
-    for tf in sorted(Path(run_dir).glob("flow-trace-*.json")):
-        trace = load_json(tf)
+    # Same intake bounds as the importer's walk of the SAME artifacts:
+    # per-file byte budget plus a glob-count cap (both size and count
+    # are run-dir-writable; an unbounded glob of tiny traces is the
+    # same memory lever as one huge trace).
+    from .record import MAX_FLOW_TRACE_FILES, RUN_ARTIFACT_MAX_BYTES
+    traces = sorted(Path(run_dir).glob("flow-trace-*.json"))
+    if len(traces) > MAX_FLOW_TRACE_FILES:
+        logger.warning(
+            "edge capture: %d flow-trace files in %s; reading the "
+            "first %d", len(traces), run_dir, MAX_FLOW_TRACE_FILES)
+        traces = traces[:MAX_FLOW_TRACE_FILES]
+    for tf in traces:
+        trace = load_json(tf, max_bytes=RUN_ARTIFACT_MAX_BYTES)
         if not isinstance(trace, dict):
             continue
         for step in trace.get("steps") or []:
@@ -172,24 +205,24 @@ def collect_touched_edges(
             df = parse_loc(step.get("definition"))
             caller_file = caller = None
             if cs:
-                caller_file = normalise_trace_path(cs[0], inv_paths)
+                caller_file = normalise_trace_path(cs[0], inv_paths, name_index)
                 if caller_file:
                     caller = containing_item(spans, caller_file, cs[1])
             if caller_file and caller and df:
-                callee_file = normalise_trace_path(df[0], inv_paths)
+                callee_file = normalise_trace_path(df[0], inv_paths, name_index)
                 callee = (
                     containing_item(spans, callee_file, df[1])
                     if callee_file else None
                 )
                 if callee_file and callee:
                     _add(caller_file, caller, callee_file, callee,
-                         cs[1], tf.name)
+                         cs[1], tf.name)  # type: ignore[index]
             # Body-level evidence for the stepped-into function.
             av = step.get("ast_view")
             if not (isinstance(av, dict) and df):
                 continue
             av_caller = av.get("function")
-            av_file = normalise_trace_path(df[0], inv_paths)
+            av_file = normalise_trace_path(df[0], inv_paths, name_index)
             if not (av_caller and av_file):
                 continue
             for call in av.get("calls_made") or []:
@@ -214,8 +247,12 @@ def write_touched(run_dir: Path, edges: list[dict[str, Any]]) -> None:
 
 
 def load_touched(run_dir: Path) -> list[dict[str, Any]]:
-    """Read a run's touched edges; ``[]`` when absent/malformed."""
-    raw = load_json(Path(run_dir) / EDGES_TOUCHED_FILENAME)
+    """Read a run's touched edges; ``[]`` when absent/malformed
+    (over-budget included — the file is run-dir-writable, so its
+    size is attacker-writable like every other property)."""
+    from .record import RUN_ARTIFACT_MAX_BYTES
+    raw = load_json(Path(run_dir) / EDGES_TOUCHED_FILENAME,
+                    max_bytes=RUN_ARTIFACT_MAX_BYTES)
     if not isinstance(raw, dict):
         return []
     return [e for e in raw.get("edges") or [] if isinstance(e, dict)]

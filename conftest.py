@@ -12,7 +12,7 @@ the subprocess env when they spawn the wrapper.
 
 `RAPTOR_DIR` is also set here. Modules that follow the project's
 "hard lookup, no fallbacks" path-safety rule (CLAUDE.md, e.g.
-packages/recon/agent.py) read `os.environ["RAPTOR_DIR"]` at
+packages/llm_analysis/agent.py) read `os.environ["RAPTOR_DIR"]` at
 import time and KeyError if unset. CI runners and developer
 shells that don't pre-export RAPTOR_DIR would otherwise fail
 test collection. Set it here to the project root (the directory
@@ -23,9 +23,36 @@ require operators to set it explicitly per the launcher rule.
 
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
+
+# Test scenarios supply their own session identity, just as they supply
+# fake provider credentials. Never turn a Copilot-origin test into live use.
+_session_service_test_env = (
+    "RAPTOR_FRONTEND", "COPILOT_CLI", "COPILOT_AGENT_SESSION_ID",
+    "RAPTOR_SESSION_SERVICE_POLICY",
+)
+_copilot_test_origin = (
+    os.environ.get("RAPTOR_FRONTEND") == "copilot"
+    or any(os.environ.get(name) for name in _session_service_test_env[1:])
+)
+if _copilot_test_origin and os.environ.get("RAPTOR_TEST_LIVE_LLM") == "1":
+    raise pytest.UsageError("Live LLM tests are not authorized by a Copilot session")
+for _session_service_name in _session_service_test_env:
+    os.environ.pop(_session_service_name, None)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_session_service_policy(monkeypatch):
+    from core.security import session_services
+
+    for name in _session_service_test_env:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(session_services, "_restricted", False)
+    monkeypatch.setattr(session_services, "_notice_shown", False)
+
 
 os.environ.setdefault("_RAPTOR_TRUSTED", "1")
 
@@ -36,6 +63,25 @@ os.environ.setdefault("_RAPTOR_TRUSTED", "1")
 # exercise the log directly opt back in via ``RAPTOR_REACH_VERDICT_LOG``
 # pointing at a tmp file (see core/analysis/tests/test_reach_verdict_log.py).
 os.environ.setdefault("RAPTOR_REACH_VERDICT_LOG_DISABLED", "1")
+
+# Same class of sidecar, same rule: the per-model reliability ledger
+# (``core.llm.scorecard``) is operator telemetry — real runs grading
+# real models. Any test that reaches a scorecard flush WITHOUT its
+# suite's isolation fixture (a producer exercised from another tree,
+# or a producer that lands before its fixture does) would fall
+# through to the DEFAULT ledger path under RAPTOR_DIR and write
+# fabricated cells (test models, synthetic decision classes) into
+# production telemetry. Point the default at a session-scoped scratch
+# file so that fallback is harmless everywhere; per-suite fixtures
+# that pin their own tmp path run later and win, and a deliberately
+# exported RAPTOR_SCORECARD_PATH survives (``setdefault``).
+os.environ.setdefault(
+    "RAPTOR_SCORECARD_PATH",
+    os.path.join(
+        tempfile.gettempdir(),
+        f"raptor-pytest-scorecard-{os.getpid()}.json",
+    ),
+)
 
 # Force RAPTOR_DIR to point at THIS worktree, not whatever the
 # developer's login shell exports. ``setdefault`` is a no-op when the
@@ -84,18 +130,20 @@ os.environ.setdefault(
 # live CLI and spends real model budget as a side effect of running a
 # tier. Live-LLM invocation from tests is explicit opt-in: export
 # RAPTOR_TEST_LIVE_LLM=1 to run deliberately-live tests; everything
-# else gets the spawn-time kill switch (billed claude spawns raise a
-# named error; detection, selection and mock-driven transport-shape
-# tests are unaffected). Subprocesses inherit the switch, so
+# else gets both spawn-time kill switches (billed claude spawns and
+# the synthetic Copilot probe raise named errors; detection, selection,
+# planning, and mock-driven transport-shape tests are unaffected).
+# Subprocesses inherit the switches, so
 # CLI-invoking e2e tests are covered without per-file plumbing.
 # Force-assigned, not setdefault: an ambient RAPTOR_CC_TRANSPORT_
-# DISABLED=0 (the documented spelling for keeping the transport live
+# DISABLED=0 (the documented spelling for keeping that transport live
 # in production) would otherwise defeat the hermetic default silently.
 # RAPTOR_TEST_LIVE_LLM=1 is the ONE spelling that makes test sessions
 # live; per-module spawn-machinery opt-outs go through the
 # cc_spawn_machinery_enabled fixture below.
 if os.environ.get("RAPTOR_TEST_LIVE_LLM") != "1":
     os.environ["RAPTOR_CC_TRANSPORT_DISABLED"] = "1"
+    os.environ["RAPTOR_COPILOT_TRANSPORT_DISABLED"] = "1"
 
 # Semgrep phones home on any invocation (semgrep.dev version check,
 # anonymous metrics) unless suppressed; tests that shell out to a real
@@ -117,6 +165,89 @@ os.environ.setdefault("SEMGREP_SEND_METRICS", "off")
 # is the source of truth per the RAPTOR_DIR block above.
 if _conftest_dir not in sys.path:
     sys.path.insert(0, _conftest_dir)
+
+
+# ---------------------------------------------------------------------------
+# Darwin-emulation standing gate
+# ---------------------------------------------------------------------------
+#
+# ``RAPTOR_TEST_EMULATE_PLATFORM=darwin`` runs the session with
+# ``sys.platform`` patched to "darwin" BEFORE collection, so every
+# platform-dispatching path — production dispatch, module-level skipif
+# conditions, platform-resolved vocabularies — takes its darwin branch
+# on a Linux host. That catches the Linux-authored-assertion class (a
+# test that encodes the Linux answer for a platform-resolved value) in
+# the cheap Linux lane instead of on a macOS runner.
+#
+# Three effects, all scoped to sessions with the env var set:
+#
+#  * ``sys.platform`` is patched in pytest_configure — pre-collection,
+#    so test modules import after the patch and import-time gates see
+#    the emulated platform.
+#  * pytest's basetemp is relocated under a darwin-shaped tmp path
+#    (…/private/var/folders/…): assertions that substring-match the
+#    Linux tmp layout against ``tmp_path``-derived paths fail here
+#    instead of on a real mac, where the per-user temp tree
+#    legitimately contains "/var/folders". An explicit ``--basetemp``
+#    still wins (per-run flags beat the gate). The relocation root
+#    carries the reaper-listed ``raptor-pytest-`` prefix so a killed
+#    session's leak is reclaimed like any other pytest scratch.
+#  * every test marked ``darwin_native`` or ``linux_native``
+#    (pytest.ini) is DESELECTED: the markers declare a binding to the
+#    real kernel, and emulation must never stack on real kernel
+#    behaviour — a monkeypatched darwin shape with the real kernel's
+#    own clamp applying underneath measures neither platform.
+#
+# On native (un-emulated) runs the markers skip honestly instead: an
+# item's native markers name the real platforms it can bind to, and a
+# host outside that set skips it (a test carrying both markers runs on
+# both). Emulation is in-process only — subprocess children observe
+# the real platform — which is one more reason real-child tests carry
+# a native marker.
+
+_EMULATE_PLATFORM_ENV = "RAPTOR_TEST_EMULATE_PLATFORM"
+_EMULATED_PLATFORM = os.environ.get(_EMULATE_PLATFORM_ENV) or None
+_REAL_PLATFORM = sys.platform  # captured before the configure-time patch
+
+_NATIVE_MARKERS = {"darwin_native": "darwin", "linux_native": "linux"}
+
+
+def _apply_platform_emulation(config):
+    if _EMULATED_PLATFORM is None:
+        return
+    if _EMULATED_PLATFORM != "darwin":
+        raise pytest.UsageError(
+            f"{_EMULATE_PLATFORM_ENV}={_EMULATED_PLATFORM!r} is not a "
+            "supported emulation target (only 'darwin' is)"
+        )
+    sys.platform = _EMULATED_PLATFORM
+    if not config.option.basetemp:
+        # xdist workers arrive here with basetemp already set (the
+        # controller hands each one <controller-basetemp>/gwN), so
+        # only the controller mints an emu root — and only the
+        # controller runs the sibling sweep below.
+        tmp_root = Path(_tempfile.gettempdir())
+        # Reclaim prior sessions' emu roots before minting ours: the
+        # per-pid root defeats pytest's keep-last-3 retention (it
+        # prunes numbered runs under one SHARED basetemp, never
+        # sibling per-pid roots) and, under the launcher, sits outside
+        # the session-TMPDIR the stale-tmp sweep covers — dead emu
+        # roots accreted ~25k inodes each. A dead owning pid marks
+        # the session gone (the reaper gates the verdict: root pid
+        # namespace only, mtime age floor); keep=3 preserves pytest's
+        # post-mortem retention semantics at the root level.
+        from core.run.tmp_reaper import reap_dead_pid_dirs
+        reap_dead_pid_dirs(tmp_root, "raptor-pytest-emu-", keep=3)
+        basetemp = (
+            tmp_root
+            / f"raptor-pytest-emu-{os.getpid()}"
+            / "private" / "var" / "folders" / "zz" / "raptor-emu" / "T"
+            / "pytest"
+        )
+        # pytest mkdirs only the LEAF of an explicit basetemp — the
+        # darwin-shaped intermediate dirs are ours to create.
+        basetemp.parent.mkdir(parents=True, exist_ok=True)
+        config.option.basetemp = basetemp
 
 
 # ---------------------------------------------------------------------------
@@ -238,12 +369,18 @@ def _contained_system_tmp(tmp_path_factory: pytest.TempPathFactory):
     # redirect below can capture it.
     tmp_path_factory.getbasetemp()
     # Reclaim orphans of earlier killed sessions (age-gated, liveness-
-    # probed, own-prefixes-only, never raises).
+    # probed, own-prefixes-only, never raises). The dead-owner sweep
+    # for pid-keyed session scratch runs in pytest_configure — a
+    # session FIXTURE never executes on an xdist controller, so a
+    # sweep here would be inert in exactly the -n runs that leak
+    # biggest (each worker minting its own pid-keyed dir below).
     tmp_reaper.reap_stale_tmp()
 
     prior_env = os.environ.get("TMPDIR")
     prior_cached = tempfile.tempdir
-    with scratch_dir("raptor-pytest-", env=os.environ) as session_tmp:
+    with scratch_dir(
+        f"raptor-pytest-{os.getpid()}-", env=os.environ,
+    ) as session_tmp:
         tempfile.tempdir = str(session_tmp)
         try:
             yield
@@ -299,6 +436,16 @@ def _binary_cache_in_tmp(tmp_path_factory):
     os.environ["RAPTOR_BINARY_CACHE_DIR"] = str(cache_dir)
     yield
     os.environ.pop("RAPTOR_BINARY_CACHE_DIR", None)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _raptor_logger_propagates():
+    """Let caplog capture records from RaptorLogger-using modules."""
+    import logging
+    raptor = logging.getLogger("raptor")
+    raptor.propagate = True
+    yield
+    raptor.propagate = False
 
 
 # The session registry (~/.local/share/raptor/sessions.d) is REAL user
@@ -357,6 +504,28 @@ def cc_spawn_machinery_enabled(monkeypatch):
     monkeypatch.delenv("RAPTOR_CC_TRANSPORT_DISABLED", raising=False)
 
 
+@pytest.fixture
+def copilot_synthetic_transport_enabled(monkeypatch):
+    """Enable only the verified repository fake for one Level-A test.
+
+    The shared ``RAPTOR_TEST_LIVE_LLM`` convention remains the sole
+    session-level live opt-in. This fixture does not enable a real path:
+    it verifies the opaque fake capability before clearing the pure-denial
+    switch, and the execution chokepoint independently requires the same
+    capability.
+    """
+
+    def enable(capability) -> None:
+        from core.security.fake_executable import (
+            verify_owned_fake_executable,
+        )
+
+        verify_owned_fake_executable(capability)
+        monkeypatch.setenv("RAPTOR_COPILOT_TRANSPORT_DISABLED", "0")
+
+    return enable
+
+
 _SESSIONS_DIR_SEQ = _itertools.count()
 
 
@@ -388,6 +557,31 @@ def _sessions_registry_in_tmp(monkeypatch):
     # next test's resolution — clear it per test.
     from core.run import pin as _pin
     _pin._frozen_pins.clear()
+    # Same doctrine for the process-scoped --project override: entry
+    # points (raptor.py, raptor_agentic.py, the scanner mains) set it
+    # once for the process lifetime because in production they own the
+    # process. A test that drives such a main() in-process inherits
+    # that lifetime — every later test on the worker then resolves its
+    # ambient project through the leaked override (a leaked ``-`` reads
+    # as authoritatively projectless, silently dropping project-setting
+    # consumption in victim tests). Reset per test; tests that need an
+    # override set it in their own bodies, after this fixture runs.
+    _pin._process_project = None
+    _pin._process_project_set = False
+    # Sibling in the same process-global class: the operator sandbox
+    # disable (--sandbox none / --no-sandbox) and its profile twin,
+    # set process-wide by core.sandbox.cli for the same
+    # entry-point-owns-the-process reason. A leaked disable makes
+    # consent chokepoints (apply_project_sandbox_floor and every
+    # sandbox construction) silently skip in victim tests. Reset the
+    # TRIPLE coherently — cli._set_cli_state keeps them in lockstep, so
+    # resetting one alone would leave an incoherent combination no
+    # real process can reach (the disable-consent stamp is non-None
+    # only while the disable flag is True).
+    from core.sandbox import state as _sbx_state
+    _sbx_state._cli_sandbox_disabled = False
+    _sbx_state._cli_sandbox_profile = None
+    _sbx_state._cli_sandbox_disable_consent = None
 
 
 @pytest.fixture(autouse=True)
@@ -449,7 +643,10 @@ def _projects_registry_in_tmp(monkeypatch):
 # offenders, so the signal is "this test got slow", not "killed mid-run".
 #
 # A genuinely-heavy test is not a bug — mark it @pytest.mark.slow (moves
-# it to the nightly tier, out of this guard's scope).
+# it to the nightly tier, out of this guard's scope). A deliberate
+# default-tier SENTINEL that must keep running every PR can instead
+# carry @pytest.mark.wall_budget(seconds) — a raise-only per-test
+# widening of this guard's budget (see the marker block below).
 
 # ---------------------------------------------------------------------------
 # Randomised test order
@@ -482,7 +679,29 @@ def _projects_registry_in_tmp(monkeypatch):
 _RANDOMISE_SEED_RAW = os.environ.get("RAPTOR_RANDOMISE_TESTS")
 
 
-def pytest_collection_modifyitems(items):
+def pytest_collection_modifyitems(config, items):
+    # Native-kernel markers: deselect under emulation, honest skip on
+    # native runs (see the darwin-emulation gate block above).
+    if _EMULATED_PLATFORM is not None:
+        kept, deselected = [], []
+        for item in items:
+            if any(item.get_closest_marker(m) for m in _NATIVE_MARKERS):
+                deselected.append(item)
+            else:
+                kept.append(item)
+        if deselected:
+            config.hook.pytest_deselected(items=deselected)
+            items[:] = kept
+    else:
+        for item in items:
+            allowed = {plat for mark, plat in _NATIVE_MARKERS.items()
+                       if item.get_closest_marker(mark)}
+            if allowed and _REAL_PLATFORM not in allowed:
+                item.add_marker(pytest.mark.skip(
+                    reason="requires the real "
+                           f"{'/'.join(sorted(allowed))} kernel"))
+    for item in items:
+        _validate_wall_budget_marker(item)
     if _RANDOMISE_SEED_RAW is None:
         return
     import random as _random
@@ -523,9 +742,17 @@ def pytest_collection_modifyitems(items):
 
 
 def pytest_report_header():
-    if _RANDOMISE_SEED_RAW is None:
-        return []
-    return [f"raptor: randomised test order (seed={_RANDOMISE_SEED_RAW})"]
+    lines = []
+    if _EMULATED_PLATFORM is not None:
+        lines.append(
+            f"raptor: emulating sys.platform={_EMULATED_PLATFORM!r} on a "
+            f"real {_REAL_PLATFORM!r} host ({_EMULATE_PLATFORM_ENV}) — "
+            "*_native tests deselected, basetemp darwin-shaped"
+        )
+    if _RANDOMISE_SEED_RAW is not None:
+        lines.append(
+            f"raptor: randomised test order (seed={_RANDOMISE_SEED_RAW})")
+    return lines
 
 
 _MAX_TEST_SECONDS = os.environ.get("RAPTOR_MAX_TEST_SECONDS")
@@ -538,6 +765,124 @@ _slow_test_overruns: "list[tuple[str, str, float]]" = []
 # approaching it. Overruns of the warn band get a loud terminal
 # listing (never a failure) so the drift is visible run-over-run.
 _slow_test_warnings: "list[tuple[str, str, float]]" = []
+
+# Per-test wall-budget override: a deliberate default-tier SENTINEL —
+# a pin that must run on every PR, so @pytest.mark.slow (which moves
+# it to the nightly tier) is not an option — whose honest schedule
+# costs more wall on a slow runner than the global budget allows can
+# carry ``@pytest.mark.wall_budget(seconds)``. Raise-only: the
+# effective budget is max(global, marker) — the marker widens the net
+# for its own declared cost, never tightens it (a tighter bound is
+# the test's own assert's job) and never disables it (a marked test
+# that overruns ITS budget still flags, and because the override can
+# only exceed the global budget the FAILED summary's "exceeded
+# RAPTOR_MAX_TEST_SECONDS" line stays literally true for marked
+# offenders too). The warn band scales with the effective budget
+# (half of it), so a correctly sized override also stops the
+# run-over-run half-band warning noise for the sentinel's known
+# cost. The budget rides to ``pytest_runtest_logreport`` inside
+# ``report.user_properties`` — the documented per-report channel
+# xdist serialises — because that hook sees only the report, never
+# the item. Use sites must justify their figure both directions
+# (churn-prone-limits doctrine), same as any other bound.
+_WALL_BUDGET_MARK = "wall_budget"
+_WALL_BUDGET_PROP = "raptor-wall-budget"
+
+
+def _wall_budget_seconds(item) -> "float | None":
+    """The item's wall_budget override in seconds, or None.
+
+    Assumes the marker already passed collection-time validation
+    (``_validate_wall_budget_marker``), which is what guarantees the
+    single positive finite numeric argument read here.
+    """
+    marker = item.get_closest_marker(_WALL_BUDGET_MARK)
+    if marker is None:
+        return None
+    return float(marker.args[0])
+
+
+def _validate_wall_budget_marker(item) -> None:
+    """Fail collection loudly on a malformed wall_budget marker.
+
+    Validated for every collected item in every tier — not just when
+    RAPTOR_MAX_TEST_SECONDS is set — so a bad marker is caught by the
+    author's local run, not first by CI.
+    """
+    marker = item.get_closest_marker(_WALL_BUDGET_MARK)
+    if marker is None:
+        return
+    import math
+    usage = (
+        f"{item.nodeid}: @pytest.mark.wall_budget takes exactly one "
+        "positional argument — the per-test wall budget as a positive "
+        "finite number of seconds, e.g. @pytest.mark.wall_budget(20.0)"
+    )
+    if len(marker.args) != 1 or marker.kwargs:
+        raise pytest.UsageError(usage)
+    seconds = marker.args[0]
+    if (
+        isinstance(seconds, bool)
+        or not isinstance(seconds, (int, float))
+        or not math.isfinite(seconds)
+        or seconds <= 0
+    ):
+        raise pytest.UsageError(usage)
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Stamp a wall_budget item's override onto its phase reports.
+
+    ``TestReport.__init__`` COPIES ``item.user_properties`` into each
+    phase report, so the setup and call reports are stamped
+    independently, each on its own list. The stamp is appended
+    UNCONDITIONALLY: a duplicate or a colliding entry under the same
+    key (``record_property`` writes to ``item.user_properties``, which
+    the call report's copy already carries) is harmless because the
+    reader below takes the max of every valid entry — whereas a
+    presence check here would let a colliding entry suppress the
+    genuine stamp and spuriously flag the marked test. junitxml
+    renders testcase properties from the teardown report, which is
+    never stamped; only its call-report fallback for a test that
+    fails in BOTH call and teardown would show the stamp, as one
+    inert extra property. The guard below reads only setup/call
+    reports.
+    """
+    report = yield
+    if _slow_test_threshold is None or report is None:
+        return report
+    if report.when not in ("setup", "call"):
+        return report
+    budget = _wall_budget_seconds(item)
+    if budget is None:
+        return report
+    report.user_properties.append((_WALL_BUDGET_PROP, budget))
+    return report
+
+
+def _effective_wall_budget(report) -> float:
+    """The report's guard threshold: the global budget, raised (never
+    lowered) by the item's wall_budget stamp when one rode along.
+
+    Transport-hardened to mirror the marker validation: only finite
+    positive numbers raise the threshold, and every matching entry is
+    considered (max, not first-match), so a colliding entry written
+    under the same key via ``record_property`` can neither disable
+    the guard (inf/NaN) nor shadow the real stamp.
+    """
+    import math
+    threshold = _slow_test_threshold
+    for key, value in getattr(report, "user_properties", []):
+        if (
+            key == _WALL_BUDGET_PROP
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            and value > 0
+        ):
+            threshold = max(threshold, float(value))
+    return threshold
 
 # Per-TIER wallclock tripwire, companion to the per-test guard above:
 # RAPTOR_MAX_TEST_SECONDS catches one slow test; this catches the
@@ -568,10 +913,11 @@ def pytest_runtest_logreport(report):
         return
     if report.when not in ("setup", "call"):
         return
-    if report.duration > _slow_test_threshold:
+    threshold = _effective_wall_budget(report)
+    if report.duration > threshold:
         _slow_test_overruns.append(
             (report.nodeid, report.when, report.duration))
-    elif report.duration > _slow_test_threshold / 2:
+    elif report.duration > threshold / 2:
         _slow_test_warnings.append(
             (report.nodeid, report.when, report.duration))
 
@@ -745,6 +1091,8 @@ def pytest_configure(config):
     controller's. The reaper-listed raptor-pytest- prefix covers the
     SIGKILL-leak case (normal exits remove it in sessionfinish).
     """
+    _apply_platform_emulation(config)
+    _sweep_dead_session_scratch(config)
     global _egress_leak_dir, _egress_leak_dir_owner
     if getattr(config, "workerinput", None) is not None:
         _egress_leak_dir = os.environ.get(_EGRESS_LEAK_DIR_ENV)
@@ -753,6 +1101,44 @@ def pytest_configure(config):
         _egress_leak_dir = _tempfile.mkdtemp(prefix="raptor-pytest-egress-")
         os.environ[_EGRESS_LEAK_DIR_ENV] = _egress_leak_dir
         _egress_leak_dir_owner = True
+
+
+def _sweep_dead_session_scratch(config) -> None:
+    """Dead-owner sweep for pid-keyed session scratch dirs
+    (``raptor-pytest-<pid>-<rand>``, minted per PROCESS by the
+    ``_contained_system_tmp`` fixture — under xdist every worker mints
+    its own; the controller mints none).
+
+    The emu-root sweep's sibling, same rationale: a KILLED session (or
+    worker) never runs the fixture's teardown, and the age-gated
+    stale-tmp sweep's 24h floor is far too slow for the worst leaks —
+    one killed session left a multi-million-inode build tree that
+    exhausted the tmp filesystem's inode table before the gate could
+    fire. A dead owning pid marks the session gone; the reaper itself
+    gates the verdict (root pid namespace only, mtime age floor — a
+    namespaced session's kill() probes call every outer session's
+    LIVE pid dead, and this sweep once deleted their scratch under
+    the shared /tmp mid-run).
+
+    Runs from ``pytest_configure`` on the CONTROLLER only —
+    worker-ness decided from ``config.workerinput`` per this file's
+    standing doctrine (a session fixture never executes on an xdist
+    controller, and the PYTEST_XDIST_WORKER env var is inheritable by
+    nested sessions), and swept over every distinct system tmp root
+    (the launcher points tempfile.gettempdir() at a per-session
+    TMPDIR, but bare-session leaks live in the real /tmp)."""
+    if getattr(config, "workerinput", None) is not None:
+        return
+    from core.run.tmp_reaper import reap_dead_pid_dirs
+    for root in _scratch_sweep_roots():
+        if root.is_dir():
+            reap_dead_pid_dirs(root, "raptor-pytest-", pid_suffix=True)
+
+
+def _scratch_sweep_roots() -> "set[Path]":
+    """Roots the dead-session scratch sweep covers. A seam so tests
+    can pin the sweep to private roots instead of the real /tmp."""
+    return {Path(tempfile.gettempdir()), Path("/tmp")}
 
 
 def _check_egress_leak(session):
@@ -857,7 +1243,10 @@ def pytest_terminal_summary(terminalreporter):
         "A default-tier test this slow is almost always real I/O that "
         "should be mocked (subprocess / network / time.sleep / sandbox "
         "setup). Fix it — or, if the cost is genuine, mark it "
-        "@pytest.mark.slow so it runs in the nightly tier instead.",
+        "@pytest.mark.slow so it runs in the nightly tier instead. A "
+        "deliberate default-tier sentinel can raise its own budget "
+        "with @pytest.mark.wall_budget(seconds) — raise-only, so a "
+        "marked test in this list exceeded its own higher budget.",
     )
     for nodeid, phase, dur in sorted(
             _slow_test_overruns, key=lambda x: -x[2]):

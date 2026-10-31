@@ -1,0 +1,156 @@
+{
+  "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Documents/CommitteeSpecifications/2.1.0/sarif-schema-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "coccinelle",
+          "fullName": "Coccinelle (spatch)",
+          "informationUri": "https://coccinelle.gitlabpages.inria.fr/website/",
+          "rules": [
+            {
+              "id": "null_check",
+              "name": "null_check",
+              "shortDescription": {
+                "text": "null_check"
+              },
+              "fullDescription": {
+                "text": "Coccinelle rule emitted from rules/null_check.cocci"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "helpUri": "https://coccinelle.gitlabpages.inria.fr/website/"
+            },
+            {
+              "id": "(unnamed)",
+              "name": "(unnamed)",
+              "shortDescription": {
+                "text": "(unnamed)"
+              },
+              "fullDescription": {
+                "text": "Coccinelle rule (unnamed)"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "helpUri": "https://coccinelle.gitlabpages.inria.fr/website/"
+            },
+            {
+              "id": "clean_rule",
+              "name": "clean_rule",
+              "shortDescription": {
+                "text": "clean_rule"
+              },
+              "fullDescription": {
+                "text": "Coccinelle rule emitted from rules/clean_rule.cocci"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "helpUri": "https://coccinelle.gitlabpages.inria.fr/website/"
+            }
+          ]
+        }
+      },
+      "results": [
+        {
+          "ruleId": "null_check",
+          "level": "warning",
+          "message": {
+            "text": "deref before check"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/a.c"
+                },
+                "region": {
+                  "startLine": 10,
+                  "endLine": 12,
+                  "startColumn": 4,
+                  "endColumn": 9
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "null_check",
+          "level": "warning",
+          "message": {
+            "text": "null_check matched"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/b.c"
+                },
+                "region": {
+                  "startLine": 7
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "null_check",
+          "level": "warning",
+          "message": {
+            "text": "dup rule id"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/c.c"
+                },
+                "region": {
+                  "startLine": 1
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "(unnamed)",
+          "level": "warning",
+          "message": {
+            "text": "(unnamed) matched"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "/elsewhere/d.c"
+                },
+                "region": {
+                  "startLine": 3
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "invocations": [
+        {
+          "executionSuccessful": false,
+          "toolExecutionNotifications": [
+            {
+              "level": "error",
+              "message": {
+                "text": "spatch: parse error in a.cxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+              },
+              "associatedRule": {
+                "id": "null_check"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

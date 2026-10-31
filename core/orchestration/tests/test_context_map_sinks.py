@@ -77,6 +77,14 @@ class TestMergeDiscoveredSinks:
         added = _merge_discovered_sinks(context_map, result)
         assert added == 1  # Only io.popen added, os.execute deduplicated
 
+    def test_scalar_sink_details_section_is_replaced(self):
+        # A shape-drifted (non-list) sink_details must not crash the
+        # append-style merge; it is normalised to a fresh list.
+        context_map = {"sink_details": "memcpy everywhere"}
+        added = _merge_discovered_sinks(context_map, _sample_result())
+        assert added == 2
+        assert isinstance(context_map["sink_details"], list)
+
     def test_creates_sink_details_if_missing(self):
         context_map = {}
         result = _sample_result()
@@ -119,6 +127,26 @@ class TestAnnotateEntryPoints:
 
         ep2 = context_map["entry_points"][2]
         assert "reachable_sinks" not in ep2
+
+    def test_string_entry_points_do_not_kill_the_stage(self):
+        """LLM output routinely renders entry_points as strings; one
+        malformed element must not abort the whole annotation pass."""
+        result = _sample_result()
+        context_map = {
+            "entry_points": [
+                "handler.lua: run_cmd",  # shape-drifted row
+                {"file": "src/handler.lua", "name": "run_cmd"},
+            ],
+        }
+        enriched = _annotate_entry_points(context_map, result)
+        assert enriched == 1
+        assert context_map["entry_points"][1]["reachable_sinks"] == [
+            "os.execute"]
+
+    def test_scalar_entry_points_section_is_skipped(self):
+        result = _sample_result()
+        context_map = {"entry_points": "run_cmd"}
+        assert _annotate_entry_points(context_map, result) == 0
 
     def test_no_entry_points(self):
         context_map = {}
@@ -719,3 +747,146 @@ class TestMergeIrisSinks:
             context_map, target, extra_sinks=frozenset({"safe_copy"}),
         )
         assert len(context_map["sink_details"]) == n
+
+
+class TestExpandedViewWalkSafety:
+    """The expanded-view candidate walk runs over the UNTRUSTED target
+    in the unsandboxed parent: a hostile directory symlink must not
+    steer it out of the tree (rglob follows dir symlinks on py<=3.12),
+    and a planted huge .c file must not be read whole."""
+
+    def test_dir_symlink_not_followed(self, tmp_path: Path, monkeypatch):
+        import core.audit.preprocessor_view as pv
+        from core.orchestration.context_map_sinks import (
+            _merge_expanded_view_sinks,
+        )
+
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "evil.c").write_text("#define M(x) strcpy(x, x)\nM(d);\n")
+        target = tmp_path / "cproj"
+        target.mkdir()
+        (target / "link").symlink_to(outside)
+
+        seen: list[str] = []
+
+        def _expand(**kw):
+            seen.append(kw.get("file_path"))
+            return None
+
+        monkeypatch.setattr(pv, "expand_translation_unit", _expand)
+        context_map = {"entry_points": [], "sink_details": [], "meta": {}}
+        added = _merge_expanded_view_sinks(context_map, target)
+        assert added == 0
+        assert seen == []  # nothing outside the tree was even considered
+
+    def test_candidate_reads_are_capped(self, tmp_path: Path, monkeypatch):
+        import core.orchestration.context_map_sinks as mod
+
+        target = tmp_path / "cproj"
+        target.mkdir()
+        # A file over the cap: read must be truncated, not loaded whole.
+        (target / "big.c").write_text("#define M(x) x\n" + "y" * 4096)
+
+        captured: dict = {}
+        real = mod.__dict__.get("_merge_expanded_view_sinks")
+        assert real is not None
+
+        from core import source as src_mod
+
+        real_read = src_mod.read_text_capped
+
+        def _capped(path, max_chars=None, **kw):
+            captured["max_chars"] = max_chars
+            return real_read(path) if max_chars is None else real_read(
+                path, max_chars, **kw)
+
+        monkeypatch.setattr(src_mod, "read_text_capped", _capped)
+        context_map = {"entry_points": [], "sink_details": [], "meta": {}}
+        mod._merge_expanded_view_sinks(context_map, target)
+        # The read went through the capped chokepoint.
+        assert "max_chars" in captured
+
+
+class TestRawLinesForContainment:
+    """#line-marker-derived paths are attacker-shaped: containment must
+    be real (confine), not a string prefix, and the read must go
+    through the capped chokepoint — the same hardening as the
+    candidate walk."""
+
+    def test_sibling_prefix_escape_refused(self, tmp_path: Path):
+        from core.orchestration.context_map_sinks import _raw_lines_for
+
+        target = tmp_path / "proj"
+        target.mkdir()
+        sibling = tmp_path / "proj-evil"
+        sibling.mkdir()
+        (sibling / "secret.c").write_text("secret();\n")
+        # ../proj-evil/secret.c resolves to a SIBLING whose string
+        # form starts with the target's — startswith passed it.
+        cache: dict = {}
+        lines = _raw_lines_for("../proj-evil/secret.c", target, cache)
+        assert lines is None
+
+    def test_in_tree_file_read_capped(self, tmp_path: Path, monkeypatch):
+        from core import source as src_mod
+        from core.orchestration.context_map_sinks import _raw_lines_for
+
+        target = tmp_path / "proj"
+        target.mkdir()
+        (target / "a.c").write_text("one\ntwo\n")
+        captured: dict = {}
+        real_read = src_mod.read_text_capped
+
+        def _spy(path, *a, **kw):
+            captured["path"] = str(path)
+            return real_read(path, *a, **kw)
+
+        monkeypatch.setattr(src_mod, "read_text_capped", _spy)
+        cache: dict = {}
+        lines = _raw_lines_for("a.c", target, cache)
+        assert lines == ["one", "two"]
+        assert captured, "read bypassed the capped chokepoint"
+        # Cache round-trip (including the negative entry).
+        assert _raw_lines_for("a.c", target, cache) == ["one", "two"]
+
+    def test_out_of_tree_absolute_refused(self, tmp_path: Path):
+        from core.orchestration.context_map_sinks import _raw_lines_for
+
+        target = tmp_path / "proj"
+        target.mkdir()
+        outside = tmp_path / "outside.c"
+        outside.write_text("x\n")
+        cache: dict = {}
+        assert _raw_lines_for(str(outside), target, cache) is None
+
+
+class TestSiblingDiscoveryRecency:
+    """Sibling scan order is NEWEST FIRST by mtime — a name sort only
+    matches recency for timestamp-named dirs, and project-mode run
+    dirs carry arbitrary names."""
+
+    def test_newer_sibling_wins_regardless_of_name(self, tmp_path: Path):
+        import os
+
+        from core.orchestration.context_map_sinks import (
+            _find_discovered_sinks,
+        )
+
+        run_dir = tmp_path / "current"
+        run_dir.mkdir()
+        # "zzz-old" sorts LAST lexicographically-descending-first but
+        # is the OLDER run; "aaa-new" is the newest.
+        old = tmp_path / "zzz-old"
+        new = tmp_path / "aaa-new"
+        for d, tag, age in ((old, "old", 2_000), (new, "new", 0)):
+            d.mkdir()
+            (d / "discovered-sinks.json").write_text(json.dumps(
+                {"discovered_sinks": [{"file": f"{tag}.c", "line": 1}],
+                 "tag": tag}))
+            stamp = 1_700_000_000 - age
+            os.utime(d, (stamp, stamp))
+
+        found = _find_discovered_sinks(run_dir)
+        assert found is not None
+        assert found["tag"] == "new"

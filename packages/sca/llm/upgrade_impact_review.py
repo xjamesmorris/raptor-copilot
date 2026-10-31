@@ -32,9 +32,11 @@ from . import (
     UntrustedBlock,
     run_stage,
 )
+from ..kinds import MAJOR_BUMP_DECISION_CLASS_PREFIX
 from .prompts import UPGRADE_IMPACT_PREFILTER_SYSTEM, UPGRADE_IMPACT_SYSTEM
 from .schemas import UpgradeImpactPrefilter, UpgradeImpactVerdict
 from typing import TYPE_CHECKING
+from core.source.lines import split_lines
 
 if TYPE_CHECKING:
     from ..models import Dependency
@@ -44,15 +46,28 @@ logger = logging.getLogger(__name__)
 _MAX_CHANGELOG_CHARS = 10_000
 _MAX_CALLSITE_CHARS = 30_000
 
+# Per-file read budget for the call-site grep — 8 MiB, mirroring
+# the inventory builder's source-file bound (SCA manifests run
+# larger, source files don't).
+_MAX_SOURCE_FILE_BYTES = 8 * 1024 * 1024
+
 
 def _cheap_safe_check(
     client, dep: Dependency, new_version: str, changelog: str,
-) -> UpgradeImpactPrefilter | None:
+) -> StageResult | None:
     """Ask the fast-tier model whether this upgrade is clearly safe.
     Returns ``None`` on call failure (caller treats as "no signal"
     and runs full analysis). The prompt deliberately under-specifies
     the call-site list — the cheap model decides on changelog and
-    semver alone, leaving call-site reasoning to the full review."""
+    semver alone, leaving call-site reasoning to the full review.
+
+    Returns the whole :class:`StageResult` — not just the parsed
+    model — because the caller must consult ``preflight_hit``: the
+    changelog is attacker-controlled in this threat model, and a
+    cheap ``clear_safe`` produced alongside injection indicators must
+    never be allowed to short-circuit a major bump to auto-approved
+    "safe" (every sibling stage applies the preflight haircut; the
+    short-circuit path used to discard it)."""
     blocks: list[UntrustedBlock] = []
     if changelog:
         blocks.append(UntrustedBlock(
@@ -78,7 +93,7 @@ def _cheap_safe_check(
             "sca.llm.upgrade_impact: prefilter failed: %s", result.error,
         )
         return None
-    return result.model  # type: ignore[return-value]
+    return result
 
 
 def _short_circuit_safe_result(
@@ -144,9 +159,13 @@ def assess_upgrade_impact(
     # the cheap verdict. Decision class is keyed by ecosystem since
     # changelog conventions and stability profiles differ
     # significantly between (e.g.) PyPI and npm.
-    decision_class = f"sca:major_bump:{dep.ecosystem}"
+    decision_class = f"{MAJOR_BUMP_DECISION_CLASS_PREFIX}{dep.ecosystem}"
     fast_model_name = fast_tier_model_name(client.config)
-    cheap = _cheap_safe_check(client, dep, new_version, changelog)
+    cheap_result = _cheap_safe_check(client, dep, new_version, changelog)
+    cheap = cheap_result.model if cheap_result is not None else None
+    cheap_preflight_hit = bool(
+        getattr(cheap_result, "preflight_hit", False),
+    )
     # Defensive: tests sometimes stub ``run_stage`` to return the same
     # MagicMock for both the cheap and full calls, so ``cheap`` may
     # not actually be an :class:`UpgradeImpactPrefilter`. ``getattr``
@@ -165,13 +184,27 @@ def assess_upgrade_impact(
         decision_class=decision_class,
         model=fast_model_name,
         cheap_says_fp=cheap_says_safe,    # "FP" for our gate = "safe" here
+        repo=target,                      # diversity gate: the project under review
     )
     if decision.short_circuit:
-        logger.info(
-            "sca.llm.upgrade_impact: fast-tier short-circuit on %s "
-            "(cheap verdict trusted by scorecard)", decision_class,
-        )
-        return _short_circuit_safe_result(dep, cheap_reasoning)
+        if cheap_preflight_hit:
+            # The cheap stage's untrusted blocks carried injection
+            # indicators — a changelog steering the cheap model to
+            # clear_safe is exactly the fail-open this gate exists
+            # to stop. Fail closed: no auto-approve, run the full
+            # analysis (whose own preflight haircut then applies).
+            logger.info(
+                "sca.llm.upgrade_impact: refusing fast-tier "
+                "short-circuit on %s — preflight flagged injection "
+                "indicators in the untrusted input; running full "
+                "analysis", decision_class,
+            )
+        else:
+            logger.info(
+                "sca.llm.upgrade_impact: fast-tier short-circuit on %s "
+                "(cheap verdict trusted by scorecard)", decision_class,
+            )
+            return _short_circuit_safe_result(dep, cheap_reasoning)
 
     # Run full review.
     blocks: list[UntrustedBlock] = []
@@ -225,6 +258,7 @@ def assess_upgrade_impact(
         full_says_fp=full_says_safe,
         cheap_reasoning=cheap_reasoning,
         full_reasoning=verdict.summary,
+        repo=target,
     )
     return verdict
 
@@ -233,38 +267,54 @@ def _grep_call_sites(target: Path, dep: Dependency) -> list[str]:
     """Find call sites for a dependency in the project source.
 
     Returns lines in 'file:line: content' format.
+
+    The walked tree is an UNTRUSTED repo and matched lines land in
+    the LLM prompt, so files are read through the package's bounded
+    no-follow chokepoint under ``scan_root_context(target)``: a
+    repo-planted ``app.py -> /etc/...`` symlink is refused (in-root
+    symlinks keep working), and a planted multi-GB source file is
+    refused instead of buffered.
     """
     import_patterns = _import_patterns(dep)
     if not import_patterns:
         return []
 
     from ..discovery import EXCLUDED_DIR_NAMES
+    from ..parsers._safe_read import read_bounded, scan_root_context
     results: list[str] = []
     extensions = {".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go",
                   ".rs", ".rb", ".php", ".cs"}
     skip_dirs = EXCLUDED_DIR_NAMES
 
-    for root, dirs, files in os.walk(target, onerror=lambda _e: None):
-        dirs[:] = [d for d in dirs if d not in skip_dirs]
-        root_path = Path(root)
-        for fname in files:
-            if Path(fname).suffix not in extensions:
-                continue
-            fpath = root_path / fname
-            try:
-                text = fpath.read_text(encoding="utf-8", errors="replace")
-            except Exception:  # noqa: BLE001, S112 — unreadable file: skip, grep is best-effort
-                continue
-            for i, line in enumerate(text.splitlines(), 1):
-                for pat in import_patterns:
-                    if pat.search(line):
-                        rel = fpath.relative_to(target)
-                        results.append(f"{rel}:{i}: {line.rstrip()[:200]}")
-                        break
+    with scan_root_context(target):
+        for root, dirs, files in os.walk(target, onerror=lambda _e: None):
+            dirs[:] = [d for d in dirs if d not in skip_dirs]
+            root_path = Path(root)
+            for fname in files:
+                if Path(fname).suffix not in extensions:
+                    continue
+                fpath = root_path / fname
+                # Mirrors core.inventory.builder.MAX_FILE_BYTES'
+                # source-file budget; refusal (None) skips the file —
+                # the grep is best-effort.
+                text = read_bounded(
+                    fpath, max_bytes=_MAX_SOURCE_FILE_BYTES,
+                    follow_symlinks=False,
+                )
+                if text is None:
+                    continue
+                for i, line in enumerate(split_lines(text), 1):
+                    for pat in import_patterns:
+                        if pat.search(line):
+                            rel = fpath.relative_to(target)
+                            results.append(
+                                f"{rel}:{i}: {line.rstrip()[:200]}",
+                            )
+                            break
+                if len(results) > 500:
+                    break
             if len(results) > 500:
                 break
-        if len(results) > 500:
-            break
 
     return results
 

@@ -120,6 +120,57 @@ def _use_direct_embed() -> bool:
     return _direct_embed
 
 
+def resolve_memory_type(memory_type: str, enum: Any) -> Any:
+    """Resolve a memory-type NAME onto the SAGE ``MemoryType`` enum.
+
+    Explicit allowlist via dict membership rather than
+    ``getattr(enum, memory_type, default)``: ``getattr`` accepted
+    *any* attribute on the enum — including dunder methods
+    (``__init__``, ``__class__``, ``__hash__``) which would either
+    break the propose call downstream with a cryptic type error or
+    silently succeed with the wrong type. A typo (``observatoin``)
+    also fell through to the ``observation`` default silently, hiding
+    the bug from the operator. Here a typo surfaces as an explicit
+    "unknown memory_type ..." log and the call falls back
+    deliberately, not by accident.
+
+    SAGE MemoryType enum = {fact, observation, inference, task}
+    (docs/reference/python-sdk.md). The 6.6.x extras RAPTOR used to
+    reference (hypothesis, evidence, decision, lesson) no longer
+    exist on the enum. Legacy names stay accepted as inputs, folded
+    onto the nearest surviving member so any caller still passing
+    them degrades sensibly instead of silently collapsing to
+    "observation":
+      hypothesis -> inference (a drawn conclusion)
+      evidence/decision/lesson -> observation (recorded fact about
+        what happened)
+
+    ``enum`` is passed by the caller (the lazily-bound ``_MemoryType``
+    here; ``sage_sdk.models.MemoryType`` in the seeding scripts) so
+    every propose path shares this one allowlist.
+    """
+    allowed = {
+        "fact": enum.fact,
+        "observation": enum.observation,
+        "inference": enum.inference,
+        "task": enum.task,
+        # Legacy 6.6.x aliases, mapped onto the current enum.
+        "hypothesis": enum.inference,
+        "evidence": enum.observation,
+        "decision": enum.observation,
+        "lesson": enum.observation,
+    }
+    mt = allowed.get(memory_type)
+    if mt is None:
+        if memory_type != "observation":
+            logger.warning(
+                "SAGE propose: unknown memory_type=%r, "
+                "falling back to observation", memory_type,
+            )
+        mt = enum.observation
+    return mt
+
+
 def _embed_via_ollama(text: str) -> list[float] | None:
     """Call Ollama's /api/embed directly with a 60s timeout.
 
@@ -186,10 +237,18 @@ class SageClient:
     """
 
     def __init__(self, config: SageConfig | None = None) -> None:
-        ensure_loopback_no_proxy()
         self._config = config or SageConfig.from_env()
+        if self._config.enabled:
+            from core.security.session_services import require_service_authorization
+            require_service_authorization("the SAGE service")
+        ensure_loopback_no_proxy()
         self._client = None
         self._query_cache: dict[tuple[str, str, int, float | None], tuple[tuple[str, float, str], ...]] = {}
+        # Guards the eviction+insert pair: hook consumers query this
+        # client from ThreadPoolExecutor workers (e.g.
+        # recall_concepts_for_study), and two racing evictions of the
+        # same oldest key would KeyError out of query().
+        self._query_cache_lock = threading.Lock()
         self._register_with_egress_proxy()
 
     def _register_with_egress_proxy(self) -> None:
@@ -248,6 +307,8 @@ class SageClient:
         """
         if not self._config.enabled:
             return False
+        from core.security.session_services import require_service_authorization
+        require_service_authorization("a SAGE health request")
         if not _ensure_sdk():
             return False
         try:
@@ -266,6 +327,8 @@ class SageClient:
         """Get or create the underlying sync SDK client."""
         if not self._config.enabled:
             return None
+        from core.security.session_services import require_service_authorization
+        require_service_authorization("the SAGE service")
         if not _ensure_sdk():
             return None
         if self._client is None:
@@ -322,50 +385,7 @@ class SageClient:
             if embedding is None:
                 embedding = self.embed(content)
 
-            # Explicit allowlist via dict membership rather than
-            # `getattr(_MemoryType, memory_type, default)`. Pre-fix
-            # `getattr` accepted *any* attribute on the enum
-            # — including dunder methods (`__init__`, `__class__`,
-            # `__hash__`) which would either break the propose call
-            # downstream with a cryptic type error or silently
-            # succeed with the wrong type. A typo (`observatoin`)
-            # also fell through to the `observation` default
-            # silently, hiding the bug from the operator.
-            #
-            # Dict-keyed by the canonical lower-case name so a typo
-            # surfaces as an explicit "unknown memory_type ..." log
-            # and the call falls back deliberately, not by accident.
-            #
-            # SAGE MemoryType enum = {fact, observation,
-            # inference, task} (docs/reference/python-sdk.md). The
-            # 6.6.x extras RAPTOR used to reference (hypothesis,
-            # evidence, decision, lesson) no longer exist on the
-            # enum. We keep accepting those legacy names as inputs
-            # and fold them onto the nearest surviving member so any
-            # caller still passing them degrades sensibly instead of
-            # silently collapsing to "observation":
-            #   hypothesis -> inference (a drawn conclusion)
-            #   evidence/decision/lesson -> observation (recorded fact
-            #     about what happened)
-            allowed = {
-                "fact": _MemoryType.fact,
-                "observation": _MemoryType.observation,
-                "inference": _MemoryType.inference,
-                "task": _MemoryType.task,
-                # Legacy 6.6.x aliases, mapped onto the current enum.
-                "hypothesis": _MemoryType.inference,
-                "evidence": _MemoryType.observation,
-                "decision": _MemoryType.observation,
-                "lesson": _MemoryType.observation,
-            }
-            mt = allowed.get(memory_type)
-            if mt is None:
-                if memory_type != "observation":
-                    logger.warning(
-                        "SAGE propose: unknown memory_type=%r, "
-                        "falling back to observation", memory_type,
-                    )
-                mt = _MemoryType.observation
+            mt = resolve_memory_type(memory_type, _MemoryType)
             propose_kwargs: dict[str, Any] = dict(
                 content=content,
                 memory_type=mt,
@@ -392,7 +412,8 @@ class SageClient:
         Query SAGE for semantically similar memories.
         Returns a list of dicts with content, confidence, and domain keys.
 
-        Results are LRU-cached (256 entries) keyed on
+        Results are FIFO-bounded-cached (256 entries, insertion-order
+        eviction — no recency update) keyed on
         (text, domain_tag, top_k, min_confidence) so repeated queries
         for the same identifier skip both embedding and vector search.
         """
@@ -434,12 +455,73 @@ class SageClient:
         except Exception as e:
             logger.warning("SAGE query failed: %s", e)
             return ()
-        if len(self._query_cache) >= 256:
-            # Evict oldest entry (first inserted) to bound memory.
-            try:
-                self._query_cache.pop(next(iter(self._query_cache)))
-            except StopIteration:
-                pass
-        self._query_cache[key] = result
+        with self._query_cache_lock:
+            if len(self._query_cache) >= 256:
+                # Evict oldest entry (first inserted) to bound memory
+                # (FIFO, not LRU). KeyError joins StopIteration: two
+                # threads racing past the lock-free .get() above can
+                # both reach here, and without the guard the loser's
+                # pop of the already-evicted key escaped query() and
+                # silently dropped that recall in the caller's broad
+                # except.
+                try:
+                    self._query_cache.pop(next(iter(self._query_cache)))
+                except (StopIteration, KeyError):
+                    pass
+            self._query_cache[key] = result
         return result
 
+    def list_memories(
+        self,
+        limit: int = 200,
+        offset: int = 0,
+        domain: str | None = None,
+    ) -> Any | None:
+        """One page of the server's memory listing (SDK passthrough).
+
+        Returns the raw SDK response (``.memories`` = memory objects
+        carrying ``memory_id`` / ``content`` / ``domain_tag``,
+        ``.has_more`` / ``.total`` where the server provides them) or
+        ``None`` when SAGE is unavailable or the call fails. Needed by
+        id-bearing operator operations (forget a specific row) — the
+        semantic :meth:`query` deliberately drops ids.
+
+        ``domain`` (when given) asks the server to page only that
+        domain's rows. A legacy SDK without the parameter gets one
+        retry without it — callers filter client-side on
+        ``domain_tag`` anyway, so they still see every row they asked
+        about, just across more pages.
+        """
+        client = self._get_client()
+        if client is None:
+            return None
+        try:
+            if domain is not None:
+                try:
+                    return client.list_memories(
+                        limit=limit, offset=offset, domain=domain)
+                except TypeError:
+                    # Legacy SDK signature — page unfiltered; the
+                    # caller's client-side domain check still applies.
+                    pass
+            return client.list_memories(limit=limit, offset=offset)
+        except Exception as e:  # noqa: BLE001 — degrade, never raise into hooks
+            logger.warning("SAGE list_memories failed: %s", e)
+            return None
+
+    def forget(self, memory_id: str, reason: str = "") -> bool:
+        """Deprecate one memory by full id (SDK passthrough).
+
+        Returns True on success, False when SAGE is unavailable or the
+        server refuses. Deprecation is the server's own soft-delete —
+        committed-status queries stop returning the row.
+        """
+        client = self._get_client()
+        if client is None:
+            return False
+        try:
+            client.forget(memory_id, reason=reason)
+            return True
+        except Exception as e:  # noqa: BLE001 — degrade, never raise into hooks
+            logger.warning("SAGE forget failed: %s", e)
+            return False

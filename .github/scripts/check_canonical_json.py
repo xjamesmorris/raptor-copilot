@@ -68,13 +68,15 @@ import sys
 from collections.abc import Iterator
 from pathlib import Path
 
-PY_ROOTS = ["core", "packages", "plugins", "libexec", "engine"]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-SKIP_DIR_NAMES = {
-    ".git", "__pycache__", "node_modules", "out", ".out", ".tox", ".venv",
-    "venv", "build", "dist", ".claude", "worktrees",
-    "tests", "fixtures", "seeds", "corpus", "data",
-}
+from runtime_universe import runtime_file_universe  # noqa: E402
+
+# Universe: the shared runtime-source derivation (see
+# runtime_universe.py — its root-anchored walk is what keeps runtime
+# packages like core/build from being dropped by a bare artifact-dir
+# name). Only this gate's data-pack homes stay declared here.
+DATA_PACK_HOMES = ("seeds", "corpus", "data")
 
 # Modules owning canonical byte forms (MAC-verified canonicalisation,
 # persisted sha256 identities, digest-keyed caches, prompt-embedded
@@ -122,25 +124,15 @@ HASH_MODULE_NAMES = {"hashlib", "hmac"}
 
 
 def iter_python_files(root: Path) -> Iterator[Path]:
-    for sub in PY_ROOTS:
-        base = root / sub
-        if not base.is_dir():
-            continue
-        for p in sorted(base.rglob("*")):
-            if not p.is_file():
-                continue
-            rel_parts = p.relative_to(root).parts
-            if any(part in SKIP_DIR_NAMES for part in rel_parts):
-                continue
-            if p.suffix == ".py":
-                yield p
-            elif p.suffix == "" and p.parent.name == "libexec":
-                try:
-                    head = p.open("rb").read(64)
-                except OSError:
-                    continue
-                if b"python" in head.split(b"\n", 1)[0]:
-                    yield p
+    # Shared runtime-source derivation (roots, entry modules, libexec
+    # shebang detection, test exclusions). Dev scripts/ dirs stay in
+    # this gate's universe — a dumps-into-hash flow in a verification
+    # harness forks canonical bytes the same way one under core/ does.
+    yield from runtime_file_universe(
+        root,
+        include_dev_scripts=True,
+        extra_excluded_parts=DATA_PACK_HOMES,
+    )
 
 
 def _callee_parts(node: ast.expr) -> tuple[str, ...]:
@@ -439,10 +431,22 @@ def write_baseline(path: Path, findings: list[dict]) -> None:
                     encoding="utf-8")
 
 
+def _default_root() -> Path:
+    """Script-anchored repo root (.github/scripts/<this> -> parents[2]).
+
+    Anchoring to the script keeps a wrong-cwd invocation (a workflow
+    step with ``working-directory``, a local runner) from silently
+    scanning an empty tree and passing vacuously — same pattern as
+    check_vocab_lists.py / check_env_docs.py.
+    """
+    return Path(__file__).resolve().parents[2]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--root", type=Path, default=Path.cwd(),
-                    help="repo root to scan (default: cwd)")
+    ap.add_argument("--root", type=Path, default=_default_root(),
+                    help="repo root to scan (default: the repo containing "
+                         "this script)")
     ap.add_argument("--baseline", type=Path, default=DEFAULT_BASELINE)
     ap.add_argument("--write-baseline", action="store_true",
                     help="write the current findings as the new baseline "

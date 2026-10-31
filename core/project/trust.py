@@ -32,21 +32,140 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
+from typing import TYPE_CHECKING, NamedTuple
 
 from core.project.project import VALID_TRUST_MARKERS
+
+if TYPE_CHECKING:
+    from core.run.pin import RunPin
 
 logger = logging.getLogger(__name__)
 
 
+class TrustResolution(NamedTuple):
+    """One marker-consent resolution, with its provenance.
+
+    ``granted`` is the verdict the plain bool resolvers return.
+    ``source`` names WHICH rule decided: ``"explicit"`` (per-run flag,
+    either direction), ``"marker"`` (project trust marker applied),
+    ``"marker-target-mismatch"`` (marker present but ignored by the
+    one-target rule), or ``"default"`` (no flag, no marker — off).
+    ``project`` is the consulted project's name (``None`` when no
+    project governs the context, or when an explicit flag decided
+    before any project was loaded). ``layer`` names the resolution
+    layer consulted: ``"run-pin"`` when the caller supplied a run
+    directory (the run's frozen project governs), ``"ambient"``
+    otherwise (argv override > session binding > symlink default).
+    Refusal messages built from these fields let an operator see at a
+    glance whether the WRONG project answered — the failure mode that
+    motivated the detail API.
+    """
+
+    granted: bool
+    source: str
+    project: str | None
+    layer: str
+
+
+def _resolve_marker_consent(
+    marker: str, explicit: bool | None, *, banner: bool,
+    target_path: str | Path | None, run_dir: str | Path | None,
+) -> TrustResolution:
+    """Shared precedence body for the single-marker consent resolvers:
+    explicit per-run choice (either direction) > project *marker*
+    (one-target rule applied) > default off. The explicit branch
+    short-circuits before any project load, exactly as the resolvers
+    always did."""
+    layer = "run-pin" if run_dir is not None else "ambient"
+    if explicit is not None:
+        return TrustResolution(bool(explicit), "explicit", None, layer)
+    markers, name = active_project_trust(run_dir)
+    if marker in markers:
+        run_target = target_path or os.environ.get("RAPTOR_CALLER_DIR")
+        if not run_target_matches_project(run_target, run_dir):
+            _emit_marker_target_mismatch(
+                [marker], run_target and str(run_target))
+            return TrustResolution(
+                False, "marker-target-mismatch", name, layer)
+        if banner:
+            emit_trust_banner([marker])
+        return TrustResolution(True, "marker", name, layer)
+    return TrustResolution(False, "default", name, layer)
+
+
+#: First-consult pin memo for run-dir trust resolution, keyed by the
+#: resolved run-dir path. The run marker (.raptor-run.json) sits inside
+#: the sandbox/target write grant, so target code executed in a consent
+#: window this process already opened (env-build, witness execution)
+#: can rewrite it between two gate consults — re-reading it per gate
+#: converts a build grant into whatever project the rewrite names.
+#: Freezing the FIRST resolution per run dir makes every later gate in
+#: this process answer from the pre-window pin (consent-window hosts
+#: prime it explicitly via :func:`freeze_gate_context` before running
+#: any target code). Cross-process rewrites are the session ledger
+#: witness's job (see :func:`core.run.pin.resolve_witnessed_run_pin`:
+#: a witness that disagrees wins outright). Unlike core.run.pin's
+#: freeze cache this never promotes the pin to ambient/process state —
+#: it only stabilises repeated run-dir TRUST reads.
+_gate_pin_memo: dict[str, "RunPin"] = {}
+
+
+def _gate_pin(run_dir: str | Path) -> "RunPin":
+    """The run pin trust resolution consumes for *run_dir*:
+    ledger-witness cross-checked (a rewritten/deleted marker loses to
+    the out-of-grant witness where a session ledger exists) and frozen
+    at first consult per process (see ``_gate_pin_memo``).
+
+    Adjudicated fail direction where NO witness exists (sessionless
+    contexts — CI, bare subprocesses, pre-witness runs): the marker as
+    read at first consult stands, grants and refusals alike. Refusing
+    unwitnessed markers outright would strip every legitimate
+    sessionless run of its project trust; the residual — a marker
+    rewritten by an EARLIER process's consent window against a
+    sessionless run — is accepted and documented, because only the
+    witness can see across processes."""
+    try:
+        key = str(Path(run_dir).resolve())
+    except OSError:
+        key = str(run_dir)
+    pin = _gate_pin_memo.get(key)
+    if pin is None:
+        from core.run.pin import resolve_witnessed_run_pin
+        pin, _witnessed = resolve_witnessed_run_pin(run_dir)
+        _gate_pin_memo[key] = pin
+    return pin
+
+
+def freeze_gate_context(run_dir: str | Path | None) -> None:
+    """Prime the gate-pin freeze for *run_dir* NOW.
+
+    Consent-window hosts (the /validate stage-E helper, the validation
+    orchestrator's stage E) call this BEFORE any target code runs in
+    their process, so the pin every later gate consults is the one
+    read before the first build/witness window opened — not whatever a
+    sandboxed child rewrote the marker to in between. Best-effort:
+    resolution failures leave the gates to resolve (and freeze) at
+    first consult, exactly as before."""
+    if run_dir is None:
+        return
+    try:
+        _gate_pin(run_dir)
+    except Exception:  # noqa: BLE001 — priming is best-effort by contract
+        logger.debug("trust: gate-pin freeze failed for %s", run_dir,
+                     exc_info=True)
+
+
 def _context_project_name(run_dir: str | Path | None = None) -> str | None:
     """The project whose state governs THIS context:
-    inside a run, the RUN PIN (resolved by walking up from *run_dir*)
-    — a mid-session /project switch must never move an in-flight
-    run's trust posture; outside a run, the layered ambient
-    resolution (argv override > session binding > symlink)."""
+    inside a run, the RUN PIN (resolved by walking up from *run_dir*,
+    cross-checked against the session ledger's pin witness and frozen
+    at first consult — see :func:`_gate_pin`) — a mid-session /project
+    switch must never move an in-flight run's trust posture, and a run
+    marker rewritten inside a consent window must never steer a later
+    gate; outside a run, the layered ambient resolution (argv override
+    > session binding > symlink)."""
     if run_dir is not None:
-        from core.run.pin import resolve_run_pin
-        return resolve_run_pin(run_dir).project
+        return _gate_pin(run_dir).project
     try:
         from core.run.pin import (
             ARGV_NONE,
@@ -128,7 +247,9 @@ def active_project_target(run_dir: str | Path | None = None) -> str | None:
 def run_target_matches_project(target_path: str | Path | None,
                                run_dir: str | Path | None = None) -> bool:
     """True when the run's target IS the governing project's target or
-    lives inside it (resolved-path comparison).
+    lives inside it (resolved-path comparison), or — for a project
+    whose target is an ARCHIVE — when the run's target is that
+    archive's extraction (see :func:`_archive_target_equivalent`).
 
     Fail-closed: an unknown run target, an unknown project target, or
     an unresolvable path all return ``False`` — a trust marker is an
@@ -156,7 +277,146 @@ def run_target_matches_project(target_path: str | Path | None,
         proj_res = Path(project_target).resolve()
     except OSError:
         return False
-    return run_res == proj_res or proj_res in run_res.parents
+    if run_res == proj_res or proj_res in run_res.parents:
+        return True
+    return _archive_target_equivalent(run_res, proj_res, run_dir)
+
+
+#: Content-identity memo for project ARCHIVE targets: resolved path ->
+#: ((st_mtime_ns, st_ctime_ns, st_size), snapshot). The one-target
+#: gate fires on every pin-keyed privileged write (findings merge,
+#: coverage snapshot, journal-index merge — several per run
+#: completion) and each check would otherwise re-hash the whole
+#: archive — that cost is why the memo exists. The validity key is why
+#: it is safe ENOUGH, not absolutely safe: an ordinary replacement
+#: (new bytes written to the path) changes mtime/ctime/size and
+#: re-hashes; a deliberate same-size content swap with a forged
+#: utime() mtime still misses because unprivileged utime() cannot set
+#: ctime. An actor who controls the clock or rewrites filesystem
+#: metadata outright can still serve a stale identity — the memo
+#: accepts that residual in exchange for not re-hashing per
+#: privileged write (tests clear the dict for forced re-reads).
+_ARCHIVE_SNAP_MEMO: dict[str, tuple[tuple[int, int, int], dict]] = {}
+
+
+def _archive_snapshot_memoised(archive_path: Path) -> dict | None:
+    """``core.run.provenance.archive_snapshot`` behind the
+    mtime/ctime/size memo above. None when the file is not a
+    recognised archive or is unreadable (callers fail closed on
+    None)."""
+    from core.run.provenance import archive_snapshot
+    key = str(archive_path)
+    try:
+        st = archive_path.stat()
+        validity = (st.st_mtime_ns, st.st_ctime_ns, st.st_size)
+    except OSError:
+        return None
+    cached = _ARCHIVE_SNAP_MEMO.get(key)
+    if cached is not None and cached[0] == validity:
+        return cached[1]
+    snap = archive_snapshot(archive_path)
+    if snap is not None:
+        _ARCHIVE_SNAP_MEMO[key] = (validity, snap)
+    return snap
+
+
+def _run_archive_identity(
+    run_dir: str | Path,
+) -> tuple[dict | None, str | None]:
+    """The run's sealed acquisition stamp (``manifest.target`` from the
+    run marker the pin resolver answers with) plus the marker's
+    recorded ``target_path``, when the stamp records an archive
+    acquisition. ``(None, None)`` otherwise — absence fails closed."""
+    from core.run.metadata import load_run_metadata
+    from core.run.pin import resolve_run_pin
+    from core.run.provenance import run_target
+    marker_dir = resolve_run_pin(run_dir).run_dir
+    if marker_dir is None:
+        return None, None
+    meta = load_run_metadata(Path(marker_dir))
+    stamp = run_target(meta)
+    if isinstance(stamp, dict) and stamp.get("source") == "archive":
+        recorded = meta.get("target_path") if isinstance(meta, dict) else None
+        if isinstance(recorded, str) and recorded:
+            return stamp, recorded
+        return stamp, None
+    return None, None
+
+
+def _archive_target_equivalent(run_res: Path, proj_res: Path,
+                               run_dir: str | Path | None) -> bool:
+    """Archive equivalence for the one-target gate: a project whose
+    target is an archive is an assertion about the archive's CONTENT,
+    and runs against it record — and scan — the content-addressed
+    extraction (``_sources/<name>-<sha>/``), never the archive file
+    itself. A pure resolved-path compare therefore mismatched every
+    such run, silently suppressing all its project-store writes and
+    dropping its trust markers.
+
+    Two witnesses, both bound to the archive's CURRENT bytes (sha256),
+    both fail-closed on any missing/unreadable identity:
+
+    1. The run's sealed acquisition stamp: ``manifest.target`` in the
+       run marker records ``{source: "archive", archive_sha256}`` at
+       start — equal shas mean the run extracted exactly the bytes the
+       project target holds now, AND the vetted target must be (or
+       live inside) the marker's recorded ``target_path``, so the
+       predicate answers the caller's question about THIS path rather
+       than "this run had a matching stamp". (A replaced archive
+       yields a different sha and the gate stays closed — as it must:
+       the run's verdicts describe the OLD bytes.)
+    2. The project's own extraction cache: the run target is (or lives
+       inside) ``<project output dir>/_sources/<name>-<sha>/`` for the
+       archive's current sha — the dir name is content-addressed by
+       construction (``core.archive.safe_cache_name``), covering runs
+       whose marker is unavailable to the caller.
+    """
+    try:
+        from core.archive import is_archive, safe_cache_name
+        if not proj_res.is_file() or not is_archive(proj_res):
+            return False
+        snap = _archive_snapshot_memoised(proj_res)
+        if snap is None:
+            return False
+        sha = snap["archive_sha256"]
+        if run_dir is not None:
+            stamp, recorded = _run_archive_identity(run_dir)
+            if stamp is not None and stamp.get("archive_sha256") == sha:
+                # The stamp witnesses the RUN; bind the answer to the
+                # CALLER's question too: the target being vetted must
+                # be (or live inside) the marker's recorded
+                # target_path. Without this the arm answered True for
+                # ANY path once the run carried a matching stamp — a
+                # silent contract broadening no current caller relied
+                # on. No/unresolvable recorded target: this witness
+                # abstains (fall through to the cache-dir witness).
+                if recorded is not None:
+                    try:
+                        rec_res = Path(recorded).resolve()
+                        if run_res == rec_res or rec_res in run_res.parents:
+                            return True
+                    except OSError:
+                        pass
+        from core.project.project import ProjectManager
+        active = _context_project_name(run_dir)
+        if not active:
+            return False
+        proj = ProjectManager().load(active)
+        out_dir = getattr(proj, "output_dir", None) if proj else None
+        if not out_dir:
+            return False
+        canonical = (Path(out_dir) / "_sources"
+                     / safe_cache_name(snap["archive_name"], sha)).resolve()
+        return run_res == canonical or canonical in run_res.parents
+    except Exception as exc:  # noqa: BLE001 — equivalence is a widening; fail closed
+        # The argv hard-error contract still propagates (same posture
+        # as active_project_trust).
+        from core.run.pin import ProjectArgvError
+        if isinstance(exc, ProjectArgvError):
+            raise
+        logger.debug("trust: archive equivalence probe failed",
+                     exc_info=True)
+        return False
 
 
 def _derive_run_target(args) -> str | None:
@@ -275,19 +535,29 @@ def resolve_dynamic_validation(
     project's target (same one-target rule as
     :func:`apply_project_trust_flags`; ``RAPTOR_CALLER_DIR`` is the
     fallback signal when the caller passes none).
+
+    Callers WITH a run directory in hand must pass *run_dir* — it
+    routes the marker lookup to the RUN PIN's project. Without it the
+    ambient session project answers, which is wrong in both
+    directions once a run exists (a pinned grant goes missing; an
+    unrelated ambient grant leaks in).
     """
-    if explicit is not None:
-        return bool(explicit)
-    markers, _name = active_project_trust(run_dir)
-    if "dynamic" in markers:
-        run_target = target_path or os.environ.get("RAPTOR_CALLER_DIR")
-        if not run_target_matches_project(run_target, run_dir):
-            _emit_marker_target_mismatch(["dynamic"], run_target and str(run_target))
-            return False
-        if banner:
-            emit_trust_banner(["dynamic"])
-        return True
-    return False
+    return resolve_dynamic_validation_detail(
+        explicit, banner=banner, target_path=target_path,
+        run_dir=run_dir).granted
+
+
+def resolve_dynamic_validation_detail(
+    explicit: bool | None, *, banner: bool = True,
+    target_path: str | Path | None = None,
+    run_dir: str | Path | None = None,
+) -> TrustResolution:
+    """:func:`resolve_dynamic_validation` returning the full
+    :class:`TrustResolution` — for consumers whose refusal messages
+    must name the consulted project and resolution layer."""
+    return _resolve_marker_consent(
+        "dynamic", explicit, banner=banner, target_path=target_path,
+        run_dir=run_dir)
 
 
 def resolve_repo_trust(
@@ -301,20 +571,180 @@ def resolve_repo_trust(
     /agentic and /codeql entry points consume; else off.
 
     Same one-target rule as :func:`resolve_dynamic_validation`: the
-    marker asserts trust for the active project's target only.
+    marker asserts trust for the active project's target only. Same
+    *run_dir* contract too: pass it whenever a run directory exists.
     """
-    if explicit is not None:
-        return bool(explicit)
-    markers, _name = active_project_trust(run_dir)
-    if "config" in markers:
-        run_target = target_path or os.environ.get("RAPTOR_CALLER_DIR")
-        if not run_target_matches_project(run_target, run_dir):
-            _emit_marker_target_mismatch(["config"], run_target and str(run_target))
-            return False
+    return resolve_repo_trust_detail(
+        explicit, banner=banner, target_path=target_path,
+        run_dir=run_dir).granted
+
+
+def resolve_repo_trust_detail(
+    explicit: bool | None, *, banner: bool = True,
+    target_path: str | Path | None = None,
+    run_dir: str | Path | None = None,
+) -> TrustResolution:
+    """:func:`resolve_repo_trust` returning the full
+    :class:`TrustResolution`."""
+    return _resolve_marker_consent(
+        "config", explicit, banner=banner, target_path=target_path,
+        run_dir=run_dir)
+
+
+def active_project_sandbox_floor(
+    run_dir: str | Path | None = None,
+) -> str | None:
+    """The governing project's ``sandbox-floor`` setting (tier label
+    string), or ``None``. Best-effort, same failure posture as
+    :func:`active_project_trust` — a missing project or schema
+    mismatch resolves to no consent (the fail-closed default floor),
+    never a crash."""
+    try:
+        from core.project.project import ProjectManager
+        mgr = ProjectManager()
+        active = _context_project_name(run_dir)
+        if not active:
+            return None
+        proj = mgr.load(active)
+        if not proj:
+            return None
+        label = proj.get_setting("sandbox-floor")
+        return label if isinstance(label, str) and label else None
+    except Exception as exc:  # noqa: BLE001 — consent loading must never break a run
+        from core.run.pin import ProjectArgvError
+        if isinstance(exc, ProjectArgvError):
+            raise
+        logger.warning(
+            "sandbox-floor: project setting resolution failed (%s) — "
+            "proceeding with the default untrusted floor", exc)
+        return None
+
+
+def active_project_journal_checkpoint(
+    run_dir: str | Path | None = None,
+) -> str | None:
+    """The governing project's ``journal-checkpoint`` setting
+    (``on`` / ``off``), or ``None``. Best-effort, same failure
+    posture as :func:`active_project_sandbox_floor` — a missing
+    project or schema mismatch resolves to no setting (the caller's
+    default-ON stands), never a crash. Unlike the trust markers this
+    is plain configuration, not a trust grant: the automatic
+    checkpoint tiers are spend-safe by the compactor's loss contract
+    either way."""
+    try:
+        from core.project.project import ProjectManager
+        mgr = ProjectManager()
+        active = _context_project_name(run_dir)
+        if not active:
+            return None
+        proj = mgr.load(active)
+        if not proj:
+            return None
+        label = proj.get_setting("journal-checkpoint")
+        return label if isinstance(label, str) and label else None
+    except Exception as exc:  # noqa: BLE001 — settings read must never break a run
+        from core.run.pin import ProjectArgvError
+        if isinstance(exc, ProjectArgvError):
+            raise
+        logger.warning(
+            "journal-checkpoint: project setting resolution failed "
+            "(%s) — proceeding with the default", exc)
+        return None
+
+
+def apply_project_sandbox_floor(
+    args=None, *, banner: bool = True,
+    target_path: str | Path | None = None,
+    run_dir: str | Path | None = None,
+) -> str | None:
+    """Consume the active project's ``sandbox-floor`` setting at run
+    start — the project surface of the untrusted containment-floor
+    consent chain (per-run ``--sandbox-floor`` flag > this setting >
+    the legacy env var > default-refuse).
+
+    Mirrors :func:`apply_project_trust_flags`: the setting is an
+    operator assertion persisted in the project JSON under the RAPTOR
+    projects dir — never read from the scanned repo, never from cwd —
+    and it only applies when the run's target matches the project's
+    target (a consent to weaker containment is a statement about ONE
+    target's work). A mismatch drops it with a loud notice.
+
+    Plumbs the validated label into ``core.sandbox`` state
+    (``set_project_sandbox_floor``); precedence against the per-run
+    flag and the env var is resolved per call inside the sandbox
+    (context.resolve_untrusted_floor), so the flag wins in both
+    directions and disagreements banner there. Returns the applied
+    label, or ``None`` when no setting applies.
+
+    Consent state must never be invisible: prints one banner line
+    when the setting is loaded and no per-run flag was passed (the
+    flag case banners from the sandbox side, naming both surfaces on
+    disagreement).
+    """
+    try:
+        from core.sandbox import state as _sandbox_state
+        if _sandbox_state._cli_sandbox_disabled:
+            # Operator-explicit sandbox-off (--sandbox none /
+            # --no-sandbox) is globally authoritative — a floor
+            # consent is moot, and printing the floor banner would
+            # claim a consent the disable overrides. But a bare run
+            # must never be INVISIBLE at the consent seam either:
+            # name the disable and the consent source that admitted
+            # it (the disable gate stamps it at acceptance;
+            # "unrecorded" marks state set outside the gate).
+            consent = (_sandbox_state._cli_sandbox_disable_consent
+                       or "unrecorded")
+            notice = (
+                f"[*] sandbox DISABLED for this run (--sandbox none / "
+                f"--no-sandbox; consent: {consent}) — project "
+                f"sandbox-floor not consulted"
+            )
+            if banner:
+                print(notice)
+            else:
+                # banner=False callers have machine-parsed stdout
+                # (libexec dispatch helpers) — keep the disable
+                # visible on the log stream instead.
+                logger.warning("%s", notice)
+            return None
+    except Exception:  # noqa: BLE001 — consent loading must never break a run
+        pass
+    label = active_project_sandbox_floor(run_dir)
+    if not label:
+        return None
+    run_target = target_path or (
+        _derive_run_target(args) if args is not None
+        else os.environ.get("RAPTOR_CALLER_DIR") or None)
+    if not run_target_matches_project(run_target, run_dir):
+        notice = (
+            f"[*] project sandbox-floor: '{label}' IGNORED — run "
+            f"target {run_target or '<unknown>'} is not the active "
+            f"project's target (floor consent is asserted for one "
+            f"target only)"
+        )
         if banner:
-            emit_trust_banner(["config"])
-        return True
-    return False
+            print(notice)
+        else:
+            # banner=False callers have machine-parsed stdout
+            # (libexec dispatch helpers) — keep the drop visible on
+            # the log stream instead.
+            logger.warning("%s", notice)
+        return None
+    try:
+        from core.sandbox.cli import set_project_sandbox_floor
+        set_project_sandbox_floor(label)
+    except ValueError as exc:
+        # Invalid label on disk (schema drift, hand-edited project
+        # file) or a Linux tier on macOS: fail CLOSED to the default
+        # floor, loudly — never guess a consent.
+        logger.warning(
+            "sandbox-floor: project setting not applied (%s) — "
+            "proceeding with the default untrusted floor", exc)
+        return None
+    if banner and getattr(args, "sandbox_floor", None) is None:
+        print(f"[*] project sandbox-floor: {label} "
+              f"(per-run --sandbox-floor overrides)")
+    return label
 
 
 def resolve_build_execution(
@@ -329,30 +759,42 @@ def resolve_build_execution(
     Building a repo executes repo-influenced code, so this rides the
     same operator assertion traced-build extraction uses — including
     the one-target rule (the marker never authorises building a tree
-    that is not the active project's target).
+    that is not the active project's target). Same *run_dir* contract
+    as :func:`resolve_dynamic_validation`: pass it whenever a run
+    directory exists.
     """
-    if explicit is not None:
-        return bool(explicit)
-    markers, _name = active_project_trust(run_dir)
-    if "build" in markers:
-        run_target = target_path or os.environ.get("RAPTOR_CALLER_DIR")
-        if not run_target_matches_project(run_target, run_dir):
-            _emit_marker_target_mismatch(["build"], run_target and str(run_target))
-            return False
-        if banner:
-            emit_trust_banner(["build"])
-        return True
-    return False
+    return resolve_build_execution_detail(
+        explicit, banner=banner, target_path=target_path,
+        run_dir=run_dir).granted
+
+
+def resolve_build_execution_detail(
+    explicit: bool | None, *, banner: bool = True,
+    target_path: str | Path | None = None,
+    run_dir: str | Path | None = None,
+) -> TrustResolution:
+    """:func:`resolve_build_execution` returning the full
+    :class:`TrustResolution`."""
+    return _resolve_marker_consent(
+        "build", explicit, banner=banner, target_path=target_path,
+        run_dir=run_dir)
 
 
 __all__ = [
+    "TrustResolution",
+    "active_project_sandbox_floor",
     "active_project_target",
     "active_project_trust",
+    "apply_project_sandbox_floor",
     "apply_project_trust_flags",
     "emit_trust_banner",
+    "freeze_gate_context",
     "resolve_build_execution",
+    "resolve_build_execution_detail",
     "resolve_dynamic_validation",
+    "resolve_dynamic_validation_detail",
     "resolve_repo_trust",
+    "resolve_repo_trust_detail",
     "resolve_trust_flag",
     "run_target_matches_project",
 ]

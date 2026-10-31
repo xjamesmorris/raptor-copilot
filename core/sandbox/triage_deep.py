@@ -45,6 +45,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from core.atomic_fs import write_text_atomically
+from core.orchestration.llm_json import strip_json_fences
 from core.json import dumps_artifact
 from core.sandbox import telemetry_mac
 from core.sandbox.triage import TRIAGE_FILE, verify_triage_report
@@ -78,7 +79,10 @@ _SYSTEM_PROMPT = (
     "needing something the sandbox profile denies (build tools probe "
     "sockets, package managers touch many hosts, test suites read "
     "dotfiles). Weigh the combination of signals, not each in "
-    "isolation.\n\n"
+    "isolation. When timestamps are present in the denial lines "
+    "(prefixed [t=...]), consider temporal patterns: a burst of "
+    "escape-primitive denials in seconds suggests scripted probing; "
+    "denials spread over minutes suggest tool noise.\n\n"
     "Return ONLY a JSON object:\n"
     "{\"assessments\": [{\"signal_type\": <type string copied from the "
     "report>, \"judgement\": \"attack_attempt\"|\"tool_noise\"|"
@@ -149,8 +153,11 @@ def _denial_context(run_dir: Path, *, allow_legacy: bool = False) -> list:
     lines = []
     for d in summary.get("denials", [])[:_MAX_DENIAL_CONTEXT_LINES]:
         cmd = d.get("cmd")
-        if isinstance(cmd, str) and cmd:
-            lines.append(escape_nonprintable(cmd)[:300])
+        if not isinstance(cmd, str) or not cmd:
+            continue
+        ts = d.get("ts")
+        prefix = f"[t={ts}] " if ts is not None else ""
+        lines.append(prefix + escape_nonprintable(cmd)[:300])
     return lines
 
 
@@ -165,10 +172,7 @@ def _parse_assessments(text: str, report: dict) -> tuple:
     ``(assessments, overall_note, dropped)`` — unknown signal types
     are dropped (a model must not invent findings), judgements are
     coerced to the enum, rationales sanitised and capped."""
-    raw = text.strip()
-    if raw.startswith("```"):
-        raw = raw.strip("`")
-        raw = raw.partition("\n")[2] if "\n" in raw else raw
+    raw = strip_json_fences(text)
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
@@ -197,7 +201,7 @@ def _parse_assessments(text: str, report: dict) -> tuple:
         if judgement not in _JUDGEMENTS:
             judgement = JUDGEMENT_UNCLEAR
         try:
-            confidence = min(1.0, max(0.0, float(item.get("confidence"))))
+            confidence = min(1.0, max(0.0, float(item.get("confidence"))))  # type: ignore[arg-type]
         except (TypeError, ValueError):
             confidence = 0.0
         rationale = item.get("rationale")

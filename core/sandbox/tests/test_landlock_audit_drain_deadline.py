@@ -21,6 +21,7 @@ import time
 import pytest
 
 from core.sandbox import _landlock_audit as mod
+from core.testing.wallclock import wall_deadline
 
 
 @pytest.fixture
@@ -29,6 +30,11 @@ def saturated_pipe(monkeypatch):
     and os.read always returns data (never EOF)."""
     monkeypatch.setattr(mod.select, "select", lambda r, w, x, t: (list(r), [], []))
     monkeypatch.setattr(os, "read", lambda fd, n: b"x" * n)
+    # Pin the target ALIVE: the liveness probe runs on every wake
+    # (waitid WNOWAIT), and the fake target_pid=1 would probe as
+    # "exited" (ECHILD), routing the loop into the bounded final
+    # sweep instead of the deadline path these tests exist to pin.
+    monkeypatch.setattr(os, "waitid", lambda *a, **k: None)
     # A large per-fd cap would still be hit, but the loop keeps draining
     # past it ("still draining to keep the child unblocked") — that is the
     # unbounded path the deadline must cut.
@@ -36,13 +42,14 @@ def saturated_pipe(monkeypatch):
 
 def test_read_branch_honors_deadline_on_saturated_pipe(saturated_pipe):
     deadline = time.monotonic() + 0.3
-    start = time.monotonic()
-    # target_pid is never probed because select never returns idle.
-    mod._drain_pipes_until_eof((999,), 1, deadline=deadline)
-    elapsed = time.monotonic() - start
-    # Pre-fix this never returns (unbounded read loop); post-fix it returns
-    # at the deadline. Generous ceiling to stay non-flaky under load.
-    assert elapsed < 2.0, f"drain ran {elapsed:.2f}s past a 0.3s deadline"
+    # Pre-fix this never returns (unbounded read loop); post-fix it
+    # returns at the deadline. The regression is therefore "does not
+    # return at all" — a generous wall ceiling keeps full detection
+    # power while shrugging off scheduler stalls on a loaded runner.
+    with wall_deadline(10.0, code_bound_s=float("inf"),
+                       what="drain past a 0.3s deadline"):
+        # target_pid is never probed because select never returns idle.
+        mod._drain_pipes_until_eof((999,), 1, deadline=deadline)
 
 
 def test_no_deadline_saturated_pipe_is_still_bounded_by_a_short_run(saturated_pipe):
@@ -50,6 +57,7 @@ def test_no_deadline_saturated_pipe_is_still_bounded_by_a_short_run(saturated_pi
     confirm the deadline path is what bounds it (a set deadline returns,
     proving the new top-of-loop check, not some other exit, is responsible)."""
     deadline = time.monotonic() + 0.1
-    start = time.monotonic()
-    mod._drain_pipes_until_eof((999,), 1, deadline=deadline)
-    assert time.monotonic() - start < 1.0
+    # Same regression shape as above: returning AT ALL is the pin.
+    with wall_deadline(10.0, code_bound_s=float("inf"),
+                       what="drain past a 0.1s deadline"):
+        mod._drain_pipes_until_eof((999,), 1, deadline=deadline)

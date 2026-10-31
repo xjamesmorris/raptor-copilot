@@ -26,6 +26,18 @@ Architecture:
   fully synchronous — callers just see `get_proxy().port` as an int.
 - HTTP CONNECT method only. Proxy tunnels raw TLS bytes between child
   and backend; it does NOT terminate TLS (no MITM, no cert forging).
+- Confined request-line parsing: the raw CONNECT request-line bytes —
+  the one place hostile bytes from the sandboxed client are
+  interpreted — are parsed in a separate, self-confined worker process
+  (see parser_jail.py: Landlock read-only-on-own-code, no network,
+  rlimits, sanitised environment), never in this process. The worker's
+  verdict is re-validated field-by-field before use. If the worker
+  cannot be spawned and confined, EgressProxy construction raises and
+  mid-life unavailability answers 503 — there is no inline-parse
+  fallback. On kernels without Landlock the worker runs on a degraded
+  floor (rlimits + fd hygiene + process isolation only); that is made
+  loud via a startup warning and a `parser_jail_degraded` audit marker
+  in every registration's event buffer.
 - Hostname allowlist is UNION across all callers: if cc_dispatch asks
   for {api.anthropic.com} and a later caller asks for {ghcr.io}, both
   hosts are allowed globally. Trust model: RAPTOR's own code is the
@@ -79,18 +91,23 @@ Error responses:
     403 Forbidden         — host not in allowlist OR resolved to blocked IP
     408 Request Timeout   — handshake (request line + headers) exceeded
                             the absolute deadline
+    429 Too Many Tunnels  — aggregate tunnel-slot cap reached
     502 Bad Gateway       — backend refused / unreachable
+    503 Service Unavailable — confined request-line parser worker
+                            unavailable (respawn failing/backing off)
     504 Gateway Timeout   — backend didn't respond within timeout
 """
 
 import asyncio
 import atexit
 import contextlib
+import errno
 import ipaddress
 import itertools
 import logging
 import os
 import socket
+import struct
 import sys
 import threading
 import time
@@ -98,14 +115,10 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Optional
 
-# Module-top so the import doesn't run on every CONNECT — the proxy
-# tunnel handler used to do `from core.security.log_sanitisation
-# import has_nonprintable` inline on the hot path. Cached after the
-# first call but still a dict lookup + module attribute access per
-# request.
-from core.security.log_sanitisation import has_nonprintable, sanitise_for_terminal
+from core.security.log_sanitisation import sanitise_for_terminal
 
-from . import audit_budget, escalation_signatures
+from . import audit_budget, escalation_signatures, parser_jail
+from ._request_head import CENSUS_CONNECT, CENSUS_NON_CONNECT, ParseRefusal
 
 # Process-unique lane ids. Labels are NOT unique (two concurrent
 # contexts may share caller_label="sandbox"), so event->buffer
@@ -340,6 +353,23 @@ _PROXY_HANDSHAKE_MAX_HEADERS = 100
 _TLS_PEEK_MAX_BYTES = 2 ** 14 + 5
 _TLS_PEEK_TIMEOUT_S = 3.0
 
+# Capacity-refusal request drain. A 429 is decided at accept time,
+# before the CONNECT request is read; the refusing handler consumes
+# what the client has already sent (bounded, never parsed) so the
+# refusal line lands as a clean request/response exchange instead of
+# racing the close against the client's send — an unread request makes
+# a mid-``sendall`` client see EPIPE on unix lanes, and a TCP close
+# with unread inbound data may RST the queued 429 off the wire. Bounds
+# trade both directions: larger/longer tolerates slower clients but
+# hands a CONNECT flooder a longer slotless hold per refused
+# connection; smaller/shorter frees the handler sooner but re-opens
+# the send/close race for a client that had not written yet. 1 KiB /
+# 250 ms covers a one-burst CONNECT handshake (well under 1 KiB — see
+# the handshake budgets above) at negligible hold cost; the refused
+# socket never occupies a tunnel slot either way.
+_REFUSAL_DRAIN_MAX_BYTES = 1024
+_REFUSAL_DRAIN_TIMEOUT_S = 0.25
+
 # TCP keepalive for established tunnel legs. Corporate proxies, NAT
 # gateways, and stateful firewalls drop connection state for tunnels
 # that go quiet — a thinking model can be silent for minutes while
@@ -408,6 +438,12 @@ _PROXY_EVENT_RESULTS = frozenset({
     "bad_request",
     # Unhandled exception in tunnel handler
     "handler_error",
+    # Tunnel-slot cap reached — the CONNECT was refused with 429
+    # before the handshake. Slot exhaustion is attacker-forceable
+    # (one hostile run flooding CONNECTs starves sibling runs
+    # process-wide), so the refusal must land in the audit trail,
+    # not only the process log.
+    "refused_capacity",
     # Control-plane marker, one per overflowed registration buffer:
     # the per-registration event cap was reached and subsequent
     # events were trimmed (see _append_bounded_locked). Carries
@@ -415,6 +451,17 @@ _PROXY_EVENT_RESULTS = frozenset({
     # counters so consumers of the persisted event list can see the
     # truncation — a capped buffer is never silent.
     "buffer_overflow",
+    # Confined request-line parser worker unavailable (respawn
+    # failing/backing off) — the CONNECT was refused with 503. Fail
+    # closed: hostile request-line bytes are NEVER parsed in-process
+    # as a fallback (see parser_jail.py).
+    "parser_unavailable",
+    # Control-plane marker, one per registration made while the
+    # parser worker runs WITHOUT Landlock confinement (kernel lacks
+    # Landlock): the degraded floor (rlimits + fd hygiene + process
+    # isolation only) must be visible in every run's audit trail,
+    # not only the process log. Appended by register_sandbox.
+    "parser_jail_degraded",
 })
 
 # Per-registration event-buffer bounds. The per-sandbox buffers exist
@@ -443,6 +490,140 @@ _DENIAL_EVENT_RESULTS = frozenset({
     "denied_sni",
     "denied_port",
 })
+
+_KNOWN_DOH_PROVIDERS: frozenset[str] = frozenset({
+    "dns.google",
+    "dns.google.com",
+    "cloudflare-dns.com",
+    "1dot1dot1dot1.cloudflare-dns.com",
+    "one.one.one.one",
+    "mozilla.cloudflare-dns.com",
+    "dns.quad9.net",
+    "dns9.quad9.net",
+    "dns10.quad9.net",
+    "dns11.quad9.net",
+    "doh.opendns.com",
+    "dns.adguard.com",
+    "dns.nextdns.io",
+    "doh.cleanbrowsing.org",
+    "dns.mullvad.net",
+})
+
+
+def _warn_doh_hosts(hosts: "set[str] | frozenset[str]") -> None:
+    """Emit a warning if any hosts in the set are known DoH providers."""
+    matched = hosts & _KNOWN_DOH_PROVIDERS
+    if matched:
+        logger.warning(
+            "egress proxy: allowlisted host(s) serve DNS-over-HTTPS: "
+            "%s — a sandboxed child can use them to bypass DNS controls. "
+            "Remove from the allowlist unless the workflow requires them, "
+            "or block at the upstream proxy.",
+            ", ".join(sorted(matched)),
+        )
+
+# Verdict groupings for snapshot()'s derived headline numbers. These
+# classify RECORD-TIME verdicts (what _record saw), so the groups
+# partition cleanly:
+#   * denied — the CONNECT was actually refused by a policy gate.
+#     `would_deny_host` is deliberately absent: audit mode allows the
+#     connection (log-and-allow), so counting it as denied would
+#     misstate what the proxy did — it stays visible in the per-result
+#     `events` map.
+#   * failed — the CONNECT never became a working tunnel for a
+#     non-policy reason. `timed_out` is absent because it is a
+#     CLOSE-TIME reclassification of an event recorded as `allowed`
+#     (it never passes through _record); the scalar
+#     `tunnels_timed_out` counter carries it instead.
+#     `parser_unavailable` is failed, not denied: the confined
+#     request-line parser worker could not serve (respawn failing or
+#     backing off), so the CONNECT was refused 503 without any policy
+#     gate seeing it.
+#   * `parser_jail_degraded` is documented-neither: a per-registration
+#     control-plane marker (the parser worker runs without Landlock),
+#     never a CONNECT verdict — it is appended directly by
+#     register_sandbox, counted into the event census there (the
+#     buffer_overflow precedent), and has no connection to headline.
+_STATS_DENIED_RESULTS = frozenset({
+    "denied_host",
+    "denied_resolved_ip",
+    "denied_sni",
+    "denied_port",
+})
+_STATS_FAILED_RESULTS = frozenset({
+    "dns_failed",
+    "upstream_failed",
+    "bad_request",
+    "handler_error",
+    "refused_capacity",
+    "parser_unavailable",
+})
+
+# Cadence of the proxy's structured stats heartbeat line (INFO; see
+# _stats_heartbeat). Emitted at most once per interval and ONLY when
+# the counters moved since the previous beat, so an idle proxy is
+# silent. Lower values make a mid-run degradation (e.g. the netlink
+# latch tripping) visible sooner but add log-noise lines to every
+# long busy run; higher values save log lines but can leave a
+# degradation invisible for the whole gap — 5 minutes bounds the
+# blind window while keeping a 12h audit run to at most ~144 lines.
+_STATS_HEARTBEAT_INTERVAL_S = 300.0
+
+
+def _stats_emit_would_hit_closed_stream(
+        log: logging.Logger, levelno: int = logging.INFO) -> bool:
+    """True when emitting a *levelno* record on *log* would reach a
+    handler whose stream is already closed.
+
+    At interpreter/test-harness teardown the stats emitters (summary in
+    ``stop()``, heartbeat task) can fire after logging's underlying
+    stream (captured stderr, a closed log file) is gone. The
+    ``ValueError`` that raises happens INSIDE ``Handler.emit`` — logging
+    swallows it via ``Handler.handleError`` and prints a
+    "--- Logging error ---" traceback to stderr, so the callers'
+    ``contextlib.suppress`` never sees it and the noise lands in test
+    output anyway.
+
+    Chosen semantics, on the record:
+
+    - The walk covers the same parent chain ``Logger.callHandlers``
+      covers (stopping at ``propagate=False``) and honours per-handler
+      LEVEL, so a stale closed handler that would never service the
+      record (a CRITICAL-only debug tap left behind by a harness)
+      cannot silence INFO stats. Handler FILTERS are deliberately NOT
+      consulted — evaluating them needs a built record, and the cost
+      of ignoring them is one skipped stats line, never emit noise.
+    - A closed handler that WOULD service the record skips the WHOLE
+      emit, live sibling handlers included: logging fans one record
+      out to every servicing handler under logging's own locks, and
+      there is no supported per-handler bypass. A long-lived closed
+      handler next to a live one therefore silences the stats trail —
+      accepted: losing observability lines beats un-catchable
+      "--- Logging error ---" tracebacks in operator/test output, and
+      a process in that state has a logging-hygiene bug this guard
+      cannot fix.
+    - Any exception from a hostile ``stream``/``closed`` attribute
+      (real shape: a detached ``TextIOWrapper`` raises ``ValueError``
+      on ``.closed``) counts as closed — fail toward skip. The guard
+      exists to keep emit-time surprises out of ``stop()``'s callers,
+      so it must not raise its own.
+    """
+    try:
+        node: "logging.Logger | None" = log
+        while node is not None:
+            for handler in node.handlers:
+                if handler.level > levelno:
+                    continue
+                stream = getattr(handler, "stream", None)
+                if stream is not None and getattr(stream, "closed", False):
+                    return True
+            if not node.propagate:
+                break
+            node = node.parent
+    except Exception:  # noqa: BLE001 — hostile stream/.closed properties; fail toward skip, never raise out of a teardown path
+        return True
+    return False
+
 
 # Live-escalation: default distinct-denied-host threshold before the
 # proxy prints an immediate stderr recon-pattern banner. Shared with
@@ -749,13 +930,23 @@ def _hex_v6(ip: str) -> str:
     return b"".join(raw[i:i + 4][::-1] for i in range(0, 16, 4)).hex().upper()
 
 
-def _loopback_peer_uid(peer, sockname) -> "int | None":
-    """Best-effort UID of a connected loopback TCP peer.
+# Whether this host HAS the kernel socket table the peer-uid lookup
+# reads. Distinguishes "lookup unavailable on this platform" (macOS —
+# every peer resolves None; the gate stays advisory) from "lookup
+# failed for THIS peer" (Linux — fail closed after one retry).
+# Computed once: platform capability, not per-connection state.
+_PEER_UID_TABLE_AVAILABLE = os.path.exists("/proc/net/tcp")
 
-    TCP sockets have no SO_PEERCRED, so the equivalent is the kernel's
-    per-socket table: find the peer's socket row in /proc/net/tcp{,6}
-    (its local_address == the peer's addr:port, its rem_address == our
-    listener-side addr:port) and read the uid column.
+
+def _peer_uid_via_proc_scan(peer, sockname) -> "int | None":
+    """UID of a connected loopback TCP peer via the /proc socket table.
+
+    Fallback path (and netlink-miss second opinion) behind the
+    _loopback_peer_uid dispatcher below: find the peer's socket row in
+    /proc/net/tcp{,6} (its local_address == the peer's addr:port, its
+    rem_address == our listener-side addr:port) and read the uid
+    column. Same owner field the kernel serves over NETLINK_SOCK_DIAG
+    (both render sock_i_uid of the same struct sock).
 
     Only ESTABLISHED rows (st == 01) are matched: TIME_WAIT rows
     report uid 0 regardless of who created the socket, and a peer we
@@ -763,16 +954,13 @@ def _loopback_peer_uid(peer, sockname) -> "int | None":
 
     Returns None when the UID cannot be determined — non-Linux hosts
     (no /proc/net), malformed peername tuples, or a row that vanished
-    because the peer closed mid-lookup. Callers treat None as
-    "unknown, allow": this is a defense-in-depth gate layered on the
-    loopback-only bind + hostname allowlist, and failing closed on a
-    lookup miss would break macOS and add a kernel-race denial mode.
-    Residual: a same-UID process can still hand its connected fd to
-    another principal (SCM_RIGHTS); no /proc view defends that.
+    because the peer closed mid-lookup.
 
-    Cost: one bounded /proc read per inbound loopback TCP connection
-    (unix-socket lanes never reach this). The scan stops at the first
-    matching established row.
+    Cost: an O(host-sockets) linear read of the table (the scan stops
+    at the first matching established row, but a miss walks the whole
+    table). That is why this is NOT the primary path: when it must
+    run per-connection (netlink structurally unavailable) the caller
+    offloads it to an executor instead of blocking the event loop.
     """
     try:
         peer_ip, peer_port = peer[0], peer[1]
@@ -805,6 +993,244 @@ def _loopback_peer_uid(peer, sockname) -> "int | None":
     except OSError:
         return None
     return None
+
+
+# --- NETLINK_SOCK_DIAG exact-match peer-uid lookup -------------------
+#
+# The primary peer-uid primitive. Instead of linearly scanning the
+# rendered /proc/net/tcp{,6} text (O(host-sockets) per connection, on
+# the event-loop thread), ask the kernel for exactly one socket by its
+# 4-tuple: SOCK_DIAG_BY_FAMILY without NLM_F_DUMP is a hash-table
+# lookup (inet_diag_find_one_icsk) that returns a single
+# inet_diag_msg. The idiag_uid field it carries is sock_i_uid() of the
+# same struct sock whose uid the /proc row prints — the same owner
+# fact, fetched in O(1).
+_NETLINK_SOCK_DIAG = 4        # linux/netlink.h NETLINK_SOCK_DIAG
+_SOCK_DIAG_BY_FAMILY = 20     # linux/sock_diag.h
+_NLM_F_REQUEST = 0x1
+_NLMSG_ERROR = 0x2
+_NLMSG_HDRLEN = 16            # sizeof(struct nlmsghdr)
+_TCP_ESTABLISHED = 1          # linux/tcp_states.h TCP_ESTABLISHED
+_INET_DIAG_NOCOOKIE = 0xFFFFFFFF
+_INET_DIAG_MSG_LEN = 72       # sizeof(struct inet_diag_msg)
+_INET_DIAG_UID_OFFSET = 64    # offsetof(struct inet_diag_msg, idiag_uid)
+
+
+class _SockDiagUnavailableError(Exception):
+    """The NETLINK_SOCK_DIAG lookup is structurally unusable here.
+
+    Raised for socket()/send/recv failures (kernel without inet_diag,
+    seccomp/LSM denying AF_NETLINK), unexpected netlink errnos, and
+    unparseable replies. Distinct from a plain miss (None): a miss is
+    an answer about ONE peer; this says the primitive itself does not
+    work, so the dispatcher latches it off and uses the /proc scan
+    from then on.
+    """
+
+
+def _sock_diag_peer_uid(peer, sockname) -> "int | None":
+    """UID of a connected loopback TCP peer via NETLINK_SOCK_DIAG.
+
+    Exact-match query for the PEER'S socket: its local end is the
+    peer's (addr, port), its remote end is our listener-side
+    (addr, port). Returns the owning UID, or None when the kernel has
+    no such established socket (ENOENT, or a non-ESTABLISHED state —
+    TIME_WAIT reports uid 0 regardless of who created the socket, so
+    it must never satisfy the gate). Raises
+    _SockDiagUnavailableError when the primitive itself fails.
+
+    Runs synchronously on the event-loop thread by design: one
+    AF_NETLINK socket + one request/reply round-trip against a kernel
+    hash lookup is microseconds, with no dependency on host socket
+    count — unlike the /proc scan it replaces.
+    """
+    try:
+        peer_ip, peer_port = peer[0], peer[1]
+        local_ip, local_port = sockname[0], sockname[1]
+    except (TypeError, IndexError):
+        return None
+    family = socket.AF_INET6 if ":" in peer_ip else socket.AF_INET
+    try:
+        src_raw = socket.inet_pton(family, peer_ip)
+        dst_raw = socket.inet_pton(family, local_ip)
+    except OSError:
+        return None
+    # struct inet_diag_sockid: sport/dport are big-endian, addresses
+    # occupy 16 bytes each (IPv4 in the first 4), idiag_if = 0 (the
+    # loopback peer's socket is not device-bound; if it somehow is,
+    # the lookup misses and the dispatcher's scan fallback answers),
+    # cookie = INET_DIAG_NOCOOKIE ("match any").
+    sockid = (
+        struct.pack("!HH", peer_port, local_port)
+        + src_raw.ljust(16, b"\x00")
+        + dst_raw.ljust(16, b"\x00")
+        + struct.pack("=III", 0, _INET_DIAG_NOCOOKIE, _INET_DIAG_NOCOOKIE)
+    )
+    # struct inet_diag_req_v2 + nlmsghdr. idiag_states = ESTABLISHED
+    # only, mirroring the scan's `st == 01` filter.
+    req = struct.pack(
+        "=BBBBI", family, socket.IPPROTO_TCP, 0, 0, 1 << _TCP_ESTABLISHED,
+    ) + sockid
+    msg = struct.pack(
+        "=IHHII", _NLMSG_HDRLEN + len(req), _SOCK_DIAG_BY_FAMILY,
+        _NLM_F_REQUEST, 1, 0,
+    ) + req
+    try:
+        nl = socket.socket(
+            socket.AF_NETLINK, socket.SOCK_RAW, _NETLINK_SOCK_DIAG,
+        )
+    except (AttributeError, OSError) as exc:
+        raise _SockDiagUnavailableError(f"socket: {exc}") from exc
+    try:
+        # Belt-and-braces bound: the kernel answers an exact-match
+        # request immediately; the timeout only guards against a
+        # pathological filter swallowing the reply.
+        nl.settimeout(1.0)
+        try:
+            nl.sendto(msg, (0, 0))
+            # Only the KERNEL's answer counts: netlink permits
+            # user-to-user unicast, so a local process that guessed
+            # this socket's autobound portid could inject a forged
+            # "uid = proxy uid" reply. Kernel-origin datagrams carry
+            # sender pid 0 — drain anything else. Bound iterations
+            # (plus the 1s timeout) so a spoof flood degrades to the
+            # scan fallback instead of blocking the lookup; the /proc
+            # scan has no such injection channel, so verdicts stay
+            # trustworthy either way.
+            for _ in range(32):
+                resp, sender = nl.recvfrom(4096)
+                if sender and sender[0] == 0:
+                    break
+            else:
+                raise _SockDiagUnavailableError(
+                    "no kernel-origin reply (spoofed datagrams only)")
+        except OSError as exc:
+            raise _SockDiagUnavailableError(f"query: {exc}") from exc
+    finally:
+        nl.close()
+    off = 0
+    while off + _NLMSG_HDRLEN <= len(resp):
+        nl_len, nl_type = struct.unpack_from("=IH", resp, off)
+        if nl_len < _NLMSG_HDRLEN or off + nl_len > len(resp):
+            raise _SockDiagUnavailableError("truncated netlink reply")
+        payload = resp[off + _NLMSG_HDRLEN:off + nl_len]
+        if nl_type == _NLMSG_ERROR:
+            if len(payload) < 4:
+                raise _SockDiagUnavailableError("short NLMSG_ERROR")
+            err = -struct.unpack_from("=i", payload, 0)[0]
+            if err == errno.ENOENT:
+                return None  # no such established socket — a miss
+            raise _SockDiagUnavailableError(f"netlink errno {err}")
+        if nl_type == _SOCK_DIAG_BY_FAMILY:
+            if len(payload) < _INET_DIAG_MSG_LEN:
+                raise _SockDiagUnavailableError("short inet_diag_msg")
+            if payload[1] != _TCP_ESTABLISHED:  # idiag_state
+                return None
+            return struct.unpack_from(
+                "=I", payload, _INET_DIAG_UID_OFFSET,
+            )[0]
+        off += (nl_len + 3) & ~3
+    raise _SockDiagUnavailableError("no inet_diag message in reply")
+
+
+# Whether NETLINK_SOCK_DIAG is worth attempting at all. Starts from
+# platform capability (AF_NETLINK exists = Linux) and is latched False
+# by the dispatcher on the first structural failure so a kernel/LSM
+# that refuses inet_diag costs one failed attempt, not one per
+# connection. Module-level (not per-proxy): the capability is a host
+# fact, like _PEER_UID_TABLE_AVAILABLE above.
+_SOCK_DIAG_USABLE = hasattr(socket, "AF_NETLINK")
+
+# Executor slots for /proc-scan peer-uid lookups when the scan IS the
+# per-connection path (netlink latched off). Lower values serialise
+# accept-time gating under connection bursts (peers queue behind the
+# semaphore before their CONNECT is even read); higher values just
+# multiply concurrent full-table /proc reads that contend on the same
+# kernel seq_file iteration without any of them finishing sooner —
+# the scan is kernel-CPU-bound, not blocked on I/O worth overlapping.
+_PEER_SCAN_MAX_CONCURRENCY = 4
+
+# Signal channel between EgressProxy._lookup_peer_uid and the real
+# dispatcher below. Armed on the event-loop thread around the INLINE
+# dispatcher call, it tells the dispatcher to report "scan still owed"
+# (pending=True, verdict None) instead of walking /proc on the loop —
+# a peer doing connect-then-reset churn can force a netlink miss on
+# every CONNECT, and the miss-path scan must go to the same bounded
+# executor as the latched-off fallback. Thread-local because the same
+# dispatcher also runs, unarmed, inside executor workers, where the
+# scan is exactly what should happen. Monkeypatched seam fakes never
+# touch it: pending stays False and their verdict is final, preserving
+# the seam contract (one two-argument call, return value = verdict).
+_INLINE_SCAN_DEFER = threading.local()
+
+
+def _loopback_peer_uid(peer, sockname) -> "int | None":
+    """Best-effort UID of a connected loopback TCP peer.
+
+    TCP sockets have no SO_PEERCRED, so the equivalent is asking the
+    kernel who owns the peer's socket. Two primitives answer that,
+    both reading the same struct-sock owner field (sock_i_uid):
+
+    1. NETLINK_SOCK_DIAG exact-match lookup (primary) — O(1) kernel
+       hash lookup by 4-tuple; microseconds, host-socket-count
+       independent.
+    2. /proc/net/tcp{,6} row scan (fallback, and second opinion on a
+       netlink miss) — O(host-sockets); also covers the edge where
+       the peer's socket is device-bound and the idiag_if=0 lookup
+       misses it. The union keeps this dispatcher a strict semantic
+       superset of the historical scan-only behaviour: it can only
+       resolve MORE peers, never fewer, so every None still means
+       "the kernel shows no established socket for this 4-tuple".
+
+    Returns None when the UID cannot be determined — non-Linux hosts,
+    malformed peername tuples, or a socket that vanished because the
+    peer closed mid-lookup. The caller's policy on None is
+    capability-scoped: on hosts WITH the socket table
+    (_PEER_UID_TABLE_AVAILABLE) an undetermined UID is retried once
+    and then REFUSED — allowing it let a different-uid local process
+    race connect-vs-row-visibility (or exhaust the row scan) to ride
+    the proxy's allowlisted egress. On hosts without the table
+    (macOS) None is the permanent answer for every peer, honest or
+    not, and the gate stays layered defense only (loopback-only bind
+    + hostname allowlist). Residual: a same-UID process can still
+    hand its connected fd to another principal (SCM_RIGHTS); no
+    kernel socket-owner view defends that.
+
+    Synchronous. EgressProxy._lookup_peer_uid is the event-loop-side
+    wrapper that decides where this runs: inline while the verdict
+    comes from netlink alone (cheap), in a bounded executor whenever
+    the /proc scan owes the verdict — scan-only hosts, and the
+    netlink-miss / just-latched cases, which the wrapper detects via
+    the _INLINE_SCAN_DEFER signal above (the linear read must never
+    block the loop, and a hostile peer can force the miss case on
+    every connection).
+    """
+    global _SOCK_DIAG_USABLE
+    if _SOCK_DIAG_USABLE:
+        try:
+            uid = _sock_diag_peer_uid(peer, sockname)
+        except _SockDiagUnavailableError as exc:
+            _SOCK_DIAG_USABLE = False
+            logger.info(
+                "egress proxy: NETLINK_SOCK_DIAG unusable (%s) — peer-uid "
+                "lookups fall back to the /proc/net/tcp scan", exc,
+            )
+        else:
+            if uid is not None:
+                return uid
+            # Netlink says "no such socket": rare organically (row-lag
+            # race, device-bound peer socket) but forcible on demand
+            # (connect-then-reset churn). Give the scan the last word
+            # so a miss here never refuses a peer the historical
+            # behaviour would have identified.
+        if getattr(_INLINE_SCAN_DEFER, "armed", False):
+            # Inline on the event loop: the scan verdict is still owed,
+            # but the O(host-sockets) walk must not run here.
+            # _lookup_peer_uid re-runs this dispatcher in the bounded
+            # executor (where this branch is unarmed) for the verdict.
+            _INLINE_SCAN_DEFER.pending = True
+            return None
+    return _peer_uid_via_proc_scan(peer, sockname)
 
 
 class _Gate2BlockedError(OSError):
@@ -1186,8 +1612,11 @@ class EgressProxy:
                  no_proxy: str | None = None,
                  audit_log_only: bool = False,
                  audit_enforce: bool = False) -> None:
+        from core.security.session_services import require_service_authorization
+        require_service_authorization("an outbound service proxy")
         self._hosts_lock = threading.Lock()
         self._allowed_hosts: set[str] = {h.lower() for h in allowed_hosts}
+        _warn_doh_hosts(self._allowed_hosts)
         # When True, gate 1 (hostname allowlist) emits a `would_deny_host`
         # event AND a record_denial entry, then falls through to the
         # connect path — operator workflows that hit gate 1 keep working
@@ -1249,6 +1678,12 @@ class EgressProxy:
         self._buffer_size = buffer_size
         self._active_tunnels = 0
         self._active_lock = threading.Lock()
+        # Bounds concurrent executor-offloaded /proc peer-uid scans
+        # (only used when NETLINK_SOCK_DIAG is unusable). Created
+        # lazily by _lookup_peer_uid so it binds to the proxy's own
+        # event loop, not whichever loop (if any) is current in the
+        # constructing thread.
+        self._peer_scan_sem: "asyncio.Semaphore | None" = None
         # Upstream proxy support — for corporate environments where the
         # user's HTTPS_PROXY env var points at an outbound HTTP proxy
         # that must be traversed to reach any external host. Parsed URL
@@ -1277,8 +1712,18 @@ class EgressProxy:
         # asyncio is single-threaded and reads/writes serialise on the
         # loop.
         self._dns_cache: dict = {}
+        # Per-proxy event sequence. Stamped on every event at record
+        # time so downstream de-dup (context.py's cm-block drain
+        # persists only block events not already persisted per-spawn)
+        # can tell "the same event fanned into two buffers" (same
+        # seq) from two genuinely distinct events that happen to
+        # share (t, host, port) — time.monotonic() ties are rare but
+        # real under bursty tunnels.
+        self._event_seq = itertools.count(1)
         # Event ring buffer for observability. Each entry is a dict:
-        #   {"t": monotonic_seconds, "host": str, "port": int,
+        #   {"proxy_seq": int (unique per proxy instance; distinct from
+        #    the persisted stream "seq" the JSONL writer stamps),
+        #    "t": monotonic_seconds, "host": str, "port": int,
         #    "result": one of _PROXY_EVENT_RESULTS (see module-level
         #              constant — pinned by structural test so any
         #              new result string fires the test until added),
@@ -1347,6 +1792,96 @@ class EgressProxy:
         # as a cheap pre-computed view (and for introspection/tests).
         self._sandbox_buffers_snapshot: tuple = ()
 
+        # ----- observability counters (read via snapshot()) -----
+        # Race-freedom contract: both dicts are FIXED-KEY — every key
+        # is inserted here and none is ever added or removed later, so
+        # a cross-thread `dict(...)` copy can never observe a resize
+        # in progress. Mutation sites:
+        #   * _stats_events (per-result verdict counts): incremented
+        #     inside _record()'s / _append_bounded_locked()'s existing
+        #     _buffer_lock critical sections — _record is the one
+        #     counter seam that is exercised off the event-loop thread
+        #     (tests hammer it cross-thread), and it already holds the
+        #     lock;
+        #   * _stats (scalar counters): incremented only on the
+        #     proxy's own event-loop thread (handshake parse, uid
+        #     lookup, relay, tunnel close), where the single loop
+        #     serialises every read-modify-write — no lock needed and
+        #     none taken, so the hot path pays nothing;
+        #   * _peak_tunnels: updated inside the existing _active_lock
+        #     critical section, beside the _active_tunnels increment
+        #     it tracks.
+        # Readers (snapshot(), the heartbeat, stop()'s summary) take
+        # GIL-atomic per-key reads; a reader racing a loop-thread
+        # increment sees a value at most one event stale, never torn.
+        self._started_at: float = time.monotonic()
+        self._peak_tunnels: int = 0
+        # Record-time verdict counts, one bucket per known result
+        # string plus a pre-declared "other" fallback (never add keys
+        # at runtime — see the fixed-key contract above).
+        self._stats_events: dict[str, int] = {
+            r: 0 for r in sorted(_PROXY_EVENT_RESULTS)}
+        self._stats_events["other"] = 0
+        self._stats: dict[str, int] = {
+            # Handshake parse outcomes: well-formed CONNECT request
+            # lines vs request lines whose method is not CONNECT
+            # (malformed-but-CONNECT lines are neither — they show up
+            # as bad_request in _stats_events). The classification is
+            # computed by the confined parser worker and rides the
+            # verdict's census field (see _request_head.CENSUS_*):
+            # this process never splits the hostile bytes itself.
+            # Requests the jail could not classify stay uncounted —
+            # parser_unavailable refusals (nothing parsed the bytes)
+            # and worker-crash refusals (census defaults to neither).
+            "requests_connect": 0,
+            "requests_non_connect": 0,
+            # Established tunnels that reached close, and the subset
+            # severed by the progress-aware total cap.
+            "tunnels_closed": 0,
+            "tunnels_timed_out": 0,
+            # Bytes relayed per direction, folded once per tunnel at
+            # close from the tunnel's own counters (never per chunk).
+            "bytes_c2u": 0,
+            "bytes_u2c": 0,
+            # Relay termination contract: EOFs propagated as
+            # write_eof() vs full pair teardowns (reset, failed
+            # half-close, dead destination).
+            "relay_eof_propagated": 0,
+            "relay_pair_teardowns": 0,
+            # Peer-uid resolution outcomes (see _lookup_peer_uid):
+            # inline netlink answer / inline None verdict (final, no
+            # scan owed) / executor scan hit and miss (miss-path and
+            # latch-path alike) / lookups routed straight to the
+            # executor because netlink was latched off or unsupported
+            # at entry / CONNECTs refused fail-closed because the uid
+            # never resolved (see _handle_client).
+            "uid_netlink_hit": 0,
+            "uid_inline_none": 0,
+            "uid_scan_hit": 0,
+            "uid_scan_miss": 0,
+            "uid_latch_fallback": 0,
+            "uid_unresolvable_failclosed": 0,
+            # Executor-scan permit contention: lookups that arrived
+            # while every _PEER_SCAN_MAX_CONCURRENCY permit was held
+            # (they queued), current holders, and the peak holders
+            # ever observed.
+            "scan_permits_deferred": 0,
+            "scan_concurrency_cur": 0,
+            "scan_concurrency_peak": 0,
+        }
+        # Heartbeat change token (monotonic totals at the last emitted
+        # line); (0, 0) so an idle proxy never emits. Written by
+        # _log_stats_line from its two callers — the heartbeat task
+        # (loop thread) and stop()'s one-shot summary (arbitrary
+        # caller thread). Those callers are NOT mutually serialised:
+        # the write is a single reference swap of an immutable tuple,
+        # so a stop() racing an in-flight heartbeat can at worst
+        # duplicate one aggregate line — never tear the token or
+        # corrupt a counter.
+        self._stats_last_beat: "tuple[int, int]" = (0, 0)
+        self._summary_emitted = False
+        self._heartbeat_task: "asyncio.Task | None" = None
+
         # Synchronise startup: the thread runs the asyncio loop and signals
         # `_ready` once the server is bound and port is known. The calling
         # thread blocks on _ready before returning from __init__, so
@@ -1361,6 +1896,15 @@ class EgressProxy:
         self._unix_tasks: set = set()
         self._client_tasks: set = set()
         self._stopping = False
+
+        # Request-line parsing is delegated to the confined parser
+        # worker — this process never interprets raw CONNECT
+        # request-line bytes (see parser_jail.py for the trust model).
+        # Eager, BEFORE the listener thread starts: if the worker
+        # cannot be spawned and confined, this raises and no proxy
+        # comes up at all (fail-closed — there is no inline-parse
+        # fallback anywhere in this module).
+        self._parser_jail: parser_jail.ParserJail = parser_jail.get_parser_jail()
 
         self._thread = threading.Thread(
             target=self._run_loop,
@@ -1410,7 +1954,9 @@ class EgressProxy:
     def add_hosts(self, hosts: Iterable[str]) -> None:
         """Extend the allowlist. Idempotent. Thread-safe."""
         with self._hosts_lock:
-            self._allowed_hosts.update(h.lower() for h in hosts)
+            new = {h.lower() for h in hosts}
+            self._allowed_hosts.update(new)
+            _warn_doh_hosts(new)
 
     def update_idle_timeout(self, seconds: float) -> None:
         """Raise the idle timeout if *seconds* exceeds the current value.
@@ -1631,22 +2177,34 @@ class EgressProxy:
         unix socket for the duration of a run.
 
         Called by the spawn layer right after forking the sandbox
-        setup child. Returns False when no such lane exists (callers
-        treat that as "gate stays closed", mirroring set_lane_audit).
+        setup child. Returns False when no such lane exists OR when
+        *key* names a TCP lane (callers treat False as "gate stays
+        closed", mirroring set_lane_audit).
+
+        UNIX lanes only, by honest refusal: the peer-root ancestry
+        gate is enforced with SO_PEERCRED at the unix-lane accept
+        path; TCP lanes have no equivalent enforcement point (their
+        controls are the same-UID loopback gate and the
+        Landlock/SBPL port pin), so accepting a TCP-lane
+        registration and returning True sold a cross-context-refusal
+        property nothing delivered — silently dead policy.
         """
+        if not isinstance(key, str):
+            return False
         with self._lanes_lock:
-            lane = (self._unix_lanes.get(key) if isinstance(key, str)
-                    else self._tcp_lanes.get(key))
+            lane = self._unix_lanes.get(key)
             if lane is None:
                 return False
             lane.allowed_peer_roots.add(int(pid))
         return True
 
     def discard_lane_peer_root(self, key: "str | int", pid: int) -> None:
-        """Withdraw a per-run peer-root authorisation. Idempotent."""
+        """Withdraw a per-run peer-root authorisation. Idempotent (a
+        TCP-lane key was never registrable — nothing to discard)."""
+        if not isinstance(key, str):
+            return
         with self._lanes_lock:
-            lane = (self._unix_lanes.get(key) if isinstance(key, str)
-                    else self._tcp_lanes.get(key))
+            lane = self._unix_lanes.get(key)
             if lane is not None:
                 lane.allowed_peer_roots.discard(int(pid))
 
@@ -1784,8 +2342,11 @@ class EgressProxy:
         With ``lane_key=None`` (default) the buffer is run-global and
         receives every event — the pre-lane behaviour, and the home
         for events that carry no lane attribution (main-listener
-        traffic, handler errors): un-laned events are never dropped
-        from the global view, and never leak into lane-scoped views.
+        traffic): un-laned events are never dropped from the global
+        view, and never leak into lane-scoped views. Handler errors
+        and capacity refusals are lane-attributed whenever the
+        accepting transport was a lane, so a run's own mid-tunnel
+        handler crashes land in its scoped buffer too.
 
         Fail-open on lookup miss BY DESIGN for the audit trail: a
         ``lane_key`` that matches no live lane degrades to the
@@ -1828,6 +2389,36 @@ class EgressProxy:
             self._next_token += 1
             token = self._next_token
             self._sandbox_buffers[token] = []
+            if self._parser_jail.landlocked is False:
+                # Degraded-floor audit marker: the parser worker runs
+                # WITHOUT Landlock confinement (kernel lacks Landlock).
+                # One marker per registration so every run's audit
+                # trail states its floor. Appended directly (not via
+                # _record): the marker is registration-scoped, not a
+                # tunnel event, and _record's lane fan-out would not
+                # deliver a lane_id=None marker to lane-subscribed
+                # buffers — exactly the registrations that must see it.
+                self._sandbox_buffers[token].append({
+                    "proxy_seq": next(self._event_seq),
+                    "t": time.monotonic(),
+                    "host": None, "port": None,
+                    "result": "parser_jail_degraded",
+                    "reason": (
+                        "request-line parser worker is running "
+                        "without Landlock confinement (kernel lacks "
+                        "Landlock) — degraded floor: rlimits, fd "
+                        "hygiene, sanitised environment, and process "
+                        "isolation only"),
+                    "resolved_ip": None,
+                    "lane": None, "lane_id": None,
+                    "bytes_c2u": 0, "bytes_u2c": 0, "duration": 0.0,
+                })
+                # Marker events bypass _record (appended directly, one
+                # per degraded registration) — fold them into the
+                # per-result event census here, under the same
+                # _buffer_lock, exactly like the buffer_overflow
+                # marker in _append_bounded_locked.
+                self._stats_events["parser_jail_degraded"] += 1
             self._sandbox_labels[token] = caller_label
             self._sandbox_lane_subs[token] = lane_sub
             self._sandbox_buffers_snapshot = tuple(
@@ -1937,9 +2528,12 @@ class EgressProxy:
             ``lane_id`` matches their subscription, so concurrent
             runs' events segregate;
           - an event with no lane attribution (``lane_id`` absent or
-            None: main-listener traffic, handler errors) goes to the
+            None: main-listener traffic, including main-listener
+            handler errors and capacity refusals) goes to the
             run-global buffers only — never dropped from the global
-            view, never leaked into another run's lane view.
+            view, never leaked into another run's lane view. Handler
+            errors and capacity refusals on a LANED transport carry
+            that lane's attribution and reach its scoped buffers.
 
         Each buffer holds a REFERENCE to the same event dict, NOT a
         copy. That's deliberate: the tunnel handler records at CONNECT
@@ -1971,7 +2565,19 @@ class EgressProxy:
         outside the lock.
         """
         lane_id = event.get("lane_id")
+        # Identity stamp (see __init__): every recorded event carries
+        # a unique seq; the same dict fanned into several buffers
+        # keeps the one seq through the unregister copies.
+        event.setdefault("proxy_seq", next(self._event_seq))
         with self._buffer_lock:
+            # Verdict counter fold (see the fixed-key contract in
+            # __init__). Inside the existing critical section because
+            # _record is the one counter seam callers may drive off
+            # the event-loop thread; the "other" bucket is
+            # pre-declared, so no key is ever added here.
+            result = event.get("result")
+            self._stats_events[
+                result if result in self._stats_events else "other"] += 1
             for tok, buf, sub in self._sandbox_buffers_snapshot:
                 if sub is None or (lane_id is not None and sub == lane_id):
                     self._append_bounded_locked(tok, buf, event)
@@ -2011,6 +2617,7 @@ class EgressProxy:
                 buf.append(event)
                 return
             marker = {
+                "proxy_seq": next(self._event_seq),
                 "t": time.monotonic(),
                 "host": None, "port": None,
                 "result": "buffer_overflow",
@@ -2032,6 +2639,10 @@ class EgressProxy:
             overflow = {"marker": marker, "denials_kept": 0}
             self._sandbox_buffer_overflow[token] = overflow
             buf.append(marker)
+            # Marker events bypass _record (appended directly, once
+            # per overflowed registration) — count them here, under
+            # the same _buffer_lock the caller already holds.
+            self._stats_events["buffer_overflow"] += 1
             logger.warning(
                 "egress proxy: per-registration event buffer cap "
                 "(%d) reached — further events trimmed (denials keep "
@@ -2204,7 +2815,7 @@ class EgressProxy:
         if cached is not None and cached[0] > now:
             return cached[1]
         addrinfo = await asyncio.wait_for(
-            self._loop.getaddrinfo(host, port, type=socket.SOCK_STREAM),
+            self._loop.getaddrinfo(host, port, type=socket.SOCK_STREAM),  # type: ignore[union-attr]
             timeout=_PROXY_READ_TIMEOUT_S,
         )
         # Insert-time hygiene (single-threaded on the event loop; no
@@ -2269,7 +2880,12 @@ class EgressProxy:
             return host if _ip_is_blocked(host) else None
         try:
             addrinfo = await self._cached_getaddrinfo(host, port)
-        except (asyncio.TimeoutError, socket.gaierror) as e:
+        except (asyncio.TimeoutError, OSError, UnicodeError) as e:
+            # OSError covers socket.gaierror plus the rarer plain-
+            # OSError resolver shapes; UnicodeError is the IDNA-
+            # encoding failure raised from inside getaddrinfo. All are
+            # local-resolution failures, so all take the same
+            # documented fail-open forward below.
             logger.warning(
                 "egress proxy: could not resolve %s locally to vet the "
                 "upstream-path CONNECT (%s) — forwarding; the upstream "
@@ -2429,7 +3045,7 @@ class EgressProxy:
             # Best-effort: ensure no task is left dangling. Tasks that
             # already returned a result are no-op'd on cancel; in-flight
             # tasks get torn down so we don't leak a half-open socket.
-            for t in (v6_task, v4_task):
+            for t in (v6_task, v4_task):  # type: ignore[assignment]
                 if t is not None and not t.done():
                     t.cancel()
 
@@ -2471,9 +3087,9 @@ class EgressProxy:
         if drain_timeout > 0 and self._server is not None and self._loop.is_running():
             async def _graceful() -> None:
                 try:
-                    self._server.close()
+                    self._server.close()  # type: ignore[union-attr]
                     await asyncio.wait_for(
-                        self._server.wait_closed(),
+                        self._server.wait_closed(),  # type: ignore[union-attr]
                         timeout=drain_timeout,
                     )
                 except (asyncio.TimeoutError, RuntimeError):
@@ -2489,7 +3105,7 @@ class EgressProxy:
                 if stale_clients:
                     await asyncio.gather(*stale_clients, return_exceptions=True)
                 self._client_tasks.clear()
-                self._loop.stop()
+                self._loop.stop()  # type: ignore[union-attr]
             try:
                 asyncio.run_coroutine_threadsafe(_graceful(), self._loop)
             except RuntimeError:
@@ -2501,7 +3117,7 @@ class EgressProxy:
                     t.cancel()
                 if stale:
                     await asyncio.gather(*stale, return_exceptions=True)
-                self._loop.stop()
+                self._loop.stop()  # type: ignore[union-attr]
             try:
                 asyncio.run_coroutine_threadsafe(_cancel_unix(), self._loop)
             except RuntimeError:
@@ -2517,6 +3133,24 @@ class EgressProxy:
         # that belong to the caller's next subprocess.run pipes.
         if self._thread is not None:
             self._thread.join(timeout=drain_timeout + 2.0)
+        # One-shot teardown summary — the single proxy-summary line a
+        # run ends with. Emitted AFTER the drain and thread join so
+        # tunnels that complete during the drain window are already
+        # folded into the counters (a pre-drain summary under-reported
+        # their closes and bytes). Needs no loop: snapshot() and the
+        # log call read plain dicts, so a stopped loop is fine.
+        # force=True so an all-zero lifetime still reports. The
+        # _summary_emitted check-then-set keeps repeated sequential
+        # stop() calls to exactly one line; it is NOT atomic, so two
+        # threads calling stop() concurrently could each emit (benign:
+        # one duplicate aggregate line, no counter is written) —
+        # in-repo callers stop a proxy from one place. Logging can hit
+        # an already-closed stream at interpreter exit (atexit path) —
+        # suppressed, never raised.
+        if not self._summary_emitted:
+            self._summary_emitted = True
+            with contextlib.suppress(OSError, ValueError):
+                self._log_stats_line("summary", force=True)
 
     def _stop_thread_best_effort(self) -> None:
         """Defensive cleanup helper called from ``__init__`` when the
@@ -2545,6 +3179,124 @@ class EgressProxy:
         """
         return self._thread is not None and self._thread.is_alive()
 
+    # ----- observability -----
+
+    def snapshot(self) -> dict:
+        """One-call health snapshot: counters, gauges, latch state,
+        uptime. Thread-safe from any thread; read-only (no counter is
+        reset). Numbers only — no hostnames, no peer-derived strings —
+        so renderers need no further sanitisation.
+
+        Keys:
+          * ``uptime_s`` — seconds since construction (monotonic).
+          * ``peer_uid_netlink_latched`` — True when this host HAS
+            netlink support but the process-lifetime transient-failure
+            latch has switched peer-uid lookups to the bounded /proc
+            scan (the un-retried degradation the hotpath series
+            documents; silent throughput loss without this flag).
+            False on hosts without netlink at all — that is the
+            platform's permanent shape, not a degradation.
+          * ``tunnels_active`` / ``tunnels_peak`` — gauge + high-water
+            mark of concurrently open tunnels.
+          * ``connections_accepted`` / ``_denied`` / ``_failed`` —
+            headline groupings of the record-time verdicts (see
+            _STATS_DENIED_RESULTS / _STATS_FAILED_RESULTS for what
+            counts where and why ``would_deny_host`` / ``timed_out``
+            are in neither).
+          * ``events`` — the full per-result verdict map.
+          * ``counters`` — the scalar counters declared in __init__
+            (parse outcomes, byte totals, relay termination, uid
+            resolution outcomes, scan-permit contention).
+        """
+        with self._active_lock:
+            active = self._active_tunnels
+            peak = self._peak_tunnels
+        with self._buffer_lock:
+            events = dict(self._stats_events)
+        counters = dict(self._stats)
+        return {
+            "uptime_s": round(time.monotonic() - self._started_at, 3),
+            "peer_uid_netlink_latched": (
+                hasattr(socket, "AF_NETLINK") and not _SOCK_DIAG_USABLE),
+            "tunnels_active": active,
+            "tunnels_peak": peak,
+            "connections_accepted": events["allowed"],
+            "connections_denied": sum(
+                events[r] for r in _STATS_DENIED_RESULTS),
+            "connections_failed": sum(
+                events[r] for r in _STATS_FAILED_RESULTS),
+            "events": events,
+            "counters": counters,
+        }
+
+    def _log_stats_line(self, kind: str, *, force: bool = False) -> bool:
+        """Emit one structured INFO stats line; True when emitted.
+
+        Change-gated unless *force*: the monotonic totals (verdict
+        counts + scalar counters, excluding the transient
+        ``scan_concurrency_cur`` gauge) are compared against the last
+        emitted beat, so an idle proxy adds no log lines. Content is
+        aggregate numbers plus operator-authored constants only —
+        nothing peer- or target-derived — so the line satisfies the
+        log-sanitisation posture by construction.
+
+        Emits nothing when a handler that would service this INFO
+        record sits on an already-closed stream (interpreter/harness
+        teardown): the write error would surface as logging's internal
+        "--- Logging error ---" stderr noise, not as a catchable
+        exception at this call site. Semantics and trade-offs:
+        ``_stats_emit_would_hit_closed_stream``.
+        """
+        if _stats_emit_would_hit_closed_stream(logger, logging.INFO):
+            return False
+        snap = self.snapshot()
+        c = snap["counters"]
+        token = (
+            sum(snap["events"].values()),
+            sum(v for k, v in c.items() if k != "scan_concurrency_cur"),
+        )
+        if not force and token == self._stats_last_beat:
+            return False
+        self._stats_last_beat = token
+        latch_note = (
+            " DEGRADED: netlink sock_diag latched off — peer-uid "
+            "lookups ride the bounded /proc scan"
+            if snap["peer_uid_netlink_latched"] else "")
+        logger.info(
+            "egress proxy %s: uptime=%.0fs accepted=%d denied=%d "
+            "failed=%d tunnels=%d active/%d peak "
+            "bytes[c2u=%d u2c=%d] "
+            "uid[netlink=%d scan=%d miss=%d latch_fallback=%d "
+            "failclosed=%d] scan_permits[deferred=%d peak=%d] "
+            "relay[eof=%d teardown=%d timed_out=%d]%s",
+            kind, snap["uptime_s"], snap["connections_accepted"],
+            snap["connections_denied"], snap["connections_failed"],
+            snap["tunnels_active"], snap["tunnels_peak"],
+            c["bytes_c2u"], c["bytes_u2c"],
+            c["uid_netlink_hit"], c["uid_scan_hit"], c["uid_scan_miss"],
+            c["uid_latch_fallback"], c["uid_unresolvable_failclosed"],
+            c["scan_permits_deferred"], c["scan_concurrency_peak"],
+            c["relay_eof_propagated"], c["relay_pair_teardowns"],
+            c["tunnels_timed_out"], latch_note,
+        )
+        return True
+
+    async def _stats_heartbeat(self) -> None:
+        """Low-frequency stats heartbeat on the proxy's own loop.
+
+        Sleeps _STATS_HEARTBEAT_INTERVAL_S between beats and delegates
+        to _log_stats_line, which suppresses no-change beats — so this
+        costs one timer per interval and NOTHING per connection.
+        Cancelled by _run_loop's finally (and retired there so no
+        pending-task finalizer outlives the loop). Logging failures
+        (stream closed during interpreter teardown) must not kill the
+        task's parent loop.
+        """
+        while True:
+            await asyncio.sleep(_STATS_HEARTBEAT_INTERVAL_S)
+            with contextlib.suppress(OSError, ValueError):
+                self._log_stats_line("heartbeat")
+
     # ----- thread entry -----
 
     def _run_loop(self) -> None:
@@ -2572,6 +3324,8 @@ class EgressProxy:
                 "egress proxy listening on 127.0.0.1:%s (allowlist: %s)", self.port, sorted(self._allowed_hosts)
             )
             self._ready.set()
+            self._heartbeat_task = self._loop.create_task(
+                self._stats_heartbeat())
             self._loop.run_forever()
         except BaseException as e:  # noqa: BLE001
             self._start_error = e
@@ -2581,6 +3335,15 @@ class EgressProxy:
             for task in list(self._client_tasks):
                 task.cancel()
             self._client_tasks.clear()
+            if self._heartbeat_task is not None:
+                self._heartbeat_task.cancel()
+                # Retire the cancelled task on the still-open loop so
+                # its finalizer never logs "Task was destroyed but it
+                # is pending!" after the loop (and, under pytest, the
+                # capture stream) is gone.
+                with contextlib.suppress(RuntimeError, OSError,
+                                         asyncio.CancelledError):
+                    self._loop.run_until_complete(self._heartbeat_task)  # type: ignore[union-attr]
             if self._server is not None and self._loop is not None:
                 self._server.close()
                 # run_until_complete on a loop that crashed or was
@@ -2600,6 +3363,86 @@ class EgressProxy:
         self._client_tasks.add(task)
         task.add_done_callback(self._client_tasks.discard)
 
+    async def _lookup_peer_uid(self, peer, sockname) -> "int | None":
+        """Event-loop-side peer-uid lookup with hot-path protection.
+
+        While NETLINK_SOCK_DIAG is usable the module-level
+        _loopback_peer_uid runs inline: the exact-match query is an
+        O(1) kernel lookup, cheaper than an executor hop. The inline
+        call is armed via _INLINE_SCAN_DEFER, so on a netlink miss
+        (or a structural failure that just latched netlink off) the
+        dispatcher reports "scan still owed" instead of walking /proc
+        on the loop — a peer doing connect-then-reset churn can force
+        that miss on every CONNECT, and the O(host-sockets) walk
+        must never be loop-blocking on demand.
+
+        Whenever the scan owes the verdict — scan-only hosts, and the
+        miss/just-latched cases above — the full dispatcher runs in
+        the default executor, bounded by _PEER_SCAN_MAX_CONCURRENCY
+        so a connection burst cannot occupy every executor worker
+        with table scans. (The executor re-runs the whole dispatcher,
+        so a socket whose row appears late still gets the cheap
+        netlink answer there before the scan.)
+
+        Every branch resolves the verdict through the module-global
+        _loopback_peer_uid name (tests monkeypatch that seam; the
+        verdict policy in _handle_client must see the patched answers
+        either way). A patched fake never arms the defer signal's
+        pending flag, so its answer — including None — is final and
+        never triggers the executor re-run.
+
+        Observability: outcomes and permit contention fold into the
+        _stats counters (see __init__). Every increment below runs on
+        the event-loop thread — the executor scan's RESULT is consumed
+        here, after the await — so no locking is needed. `stats` is
+        looked up defensively because tests exercise this method as an
+        unbound function against a minimal namespace carrying only
+        `_peer_scan_sem`; counting is best-effort observability and
+        must never change the verdict path.
+        """
+        stats = getattr(self, "_stats", None)
+        if _SOCK_DIAG_USABLE:
+            _INLINE_SCAN_DEFER.armed = True
+            _INLINE_SCAN_DEFER.pending = False
+            try:
+                uid = _loopback_peer_uid(peer, sockname)
+            finally:
+                _INLINE_SCAN_DEFER.armed = False
+            if uid is not None or not _INLINE_SCAN_DEFER.pending:
+                if stats is not None:
+                    stats["uid_netlink_hit" if uid is not None
+                          else "uid_inline_none"] += 1
+                return uid
+        elif stats is not None:
+            # Netlink latched off (or absent): every lookup rides the
+            # bounded executor scan. Counted at entry so the latch's
+            # ongoing cost stays visible, independent of scan outcome.
+            stats["uid_latch_fallback"] += 1
+        if self._peer_scan_sem is None:
+            self._peer_scan_sem = asyncio.Semaphore(
+                _PEER_SCAN_MAX_CONCURRENCY)
+        if stats is not None and self._peer_scan_sem.locked():
+            # All permits held at arrival: this lookup queues.
+            stats["scan_permits_deferred"] += 1
+        async with self._peer_scan_sem:
+            if stats is not None:
+                stats["scan_concurrency_cur"] += 1
+                if (stats["scan_concurrency_cur"]
+                        > stats["scan_concurrency_peak"]):
+                    stats["scan_concurrency_peak"] = (
+                        stats["scan_concurrency_cur"])
+            try:
+                uid = await asyncio.get_running_loop().run_in_executor(
+                    None, _loopback_peer_uid, peer, sockname,
+                )
+            finally:
+                if stats is not None:
+                    stats["scan_concurrency_cur"] -= 1
+        if stats is not None:
+            stats["uid_scan_hit" if uid is not None
+                  else "uid_scan_miss"] += 1
+        return uid
+
     async def _handle_client(self, reader: asyncio.StreamReader,
                              writer: asyncio.StreamWriter,
                              lane: "_Lane | None" = None) -> None:
@@ -2614,8 +3457,11 @@ class EgressProxy:
 
         # Belt-and-braces: reject any inbound connection that isn't
         # from loopback or a unix socket. Unix socket connections have
-        # no peer IP — they're trusted because bind_unix() restricts
-        # the socket file to mode 0600.
+        # no peer IP — they're admitted here because their real gates
+        # live elsewhere: the socket sits in a random 0700
+        # make_lane_dir() directory (bind_unix binds under umask
+        # 0o077), and _handle_unix_client enforces the
+        # SO_PEERCRED + ancestry check per connection.
         if client_ip not in ("127.0.0.1", "::1", "unix"):
             logger.warning("egress proxy: rejecting non-loopback peer %s", client_ip)
             writer.close()
@@ -2623,16 +3469,37 @@ class EgressProxy:
 
         # Same-UID gate for loopback TCP peers (main listener AND TCP
         # lanes; unix lanes are already mode-0600 via bind_unix's
-        # umask). Loopback is shared with EVERY local user — without
-        # this, any other account on the host could ride the proxy's
-        # allowlisted egress. TCP has no SO_PEERCRED, so the peer's
-        # UID comes from its /proc/net/tcp{,6} socket row; an
-        # undeterminable UID (None) is allowed by design — see
-        # _loopback_peer_uid for the fail-open rationale + residuals.
+        # umask AND carry the SO_PEERCRED+ancestry gate). Loopback is
+        # shared with EVERY local user — without this, any other
+        # account on the host could ride the proxy's allowlisted
+        # egress. TCP has no SO_PEERCRED, so the peer's UID comes from
+        # the kernel socket table (NETLINK_SOCK_DIAG exact-match, with
+        # the /proc/net/tcp{,6} row scan as fallback). On hosts that
+        # HAVE the table, an undeterminable UID is retried once (the
+        # peer's row can lag its connect by a beat) and then REFUSED:
+        # the old unconditional allow-on-None handed a different-uid
+        # local process a deterministic ride — race the connect
+        # against row visibility, or pad the table past the scan.
+        # Hosts without the table (macOS) keep the advisory behaviour;
+        # None there is the permanent answer for every honest peer.
         if client_ip != "unix" and isinstance(peer, tuple) and len(peer) >= 2:
-            peer_uid = _loopback_peer_uid(
-                peer, writer.get_extra_info("sockname"),
-            )
+            sockname = writer.get_extra_info("sockname")
+            peer_uid = await self._lookup_peer_uid(peer, sockname)
+            if peer_uid is None and _PEER_UID_TABLE_AVAILABLE:
+                await asyncio.sleep(0.01)
+                peer_uid = await self._lookup_peer_uid(peer, sockname)
+                if peer_uid is None:
+                    logger.warning(
+                        "egress proxy: rejecting loopback peer %s:%s — "
+                        "its socket row never appeared in the kernel "
+                        "table, so its uid cannot be verified "
+                        "(fail-closed; same-uid callers should not "
+                        "hit this — retry, or use the unix lane)",
+                        client_ip, peer[1],
+                    )
+                    self._stats["uid_unresolvable_failclosed"] += 1
+                    writer.close()
+                    return
             if peer_uid is not None and peer_uid != os.geteuid():
                 logger.warning(
                     "egress proxy: rejecting loopback peer %s:%s owned "
@@ -2643,9 +3510,8 @@ class EgressProxy:
                 writer.close()
                 return
 
-        # Aggregate tunnel cap. Enforced best-effort — a race between
-        # check and increment can let 65+ through momentarily, but the
-        # bound holds to ~max.
+        # Aggregate tunnel cap. Check-and-increment is atomic under
+        # _active_lock, so the bound holds exactly.
         #
         # Must NOT `await` while holding a threading.Lock — the lock is
         # sync, so a second _handle_client task hitting `with
@@ -2660,10 +3526,43 @@ class EgressProxy:
                 full = True
             else:
                 self._active_tunnels += 1
+                # High-water mark rides the same critical section as
+                # the gauge it tracks — no extra locking.
+                if self._active_tunnels > self._peak_tunnels:
+                    self._peak_tunnels = self._active_tunnels
         if full:
             logger.warning(
                 "egress proxy: max tunnels (%s) reached — refusing new connection", self._max_tunnels
             )
+            # Slot exhaustion is attacker-forceable, so the refusal
+            # must be visible in proxy-events.jsonl / triage, not
+            # only the process log — same "capped is never silent"
+            # property the buffer-overflow marker guarantees. No
+            # host/port: the handshake is never PARSED on this path
+            # (the bounded drain below reads bytes for delivery
+            # semantics only — parsing a CONNECT line for a slotless
+            # connection would defeat the cap).
+            event = {
+                "t": time.monotonic(),
+                "host": None, "port": None,
+                "result": "refused_capacity",
+                "reason": f"tunnel cap {self._max_tunnels} reached",
+                "resolved_ip": None,
+                "lane": lane.label if lane is not None else "main",
+                "lane_id": lane.lane_id if lane is not None else None,
+                "bytes_c2u": 0, "bytes_u2c": 0, "duration": 0.0,
+            }
+            self._record(event)
+            # Bounded request drain before the refusal line — rationale
+            # and both-direction bound trade-offs at the constants
+            # (_REFUSAL_DRAIN_*). Timeout → the client hadn't written
+            # yet; proceed to the write, today's race window returns
+            # but the 429 stays queued for a client that reads.
+            with contextlib.suppress(OSError, RuntimeError,
+                                     asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    reader.read(_REFUSAL_DRAIN_MAX_BYTES),
+                    timeout=_REFUSAL_DRAIN_TIMEOUT_S)
             try:
                 await self._write_error(writer, 429, "Too Many Tunnels")
             finally:
@@ -2692,14 +3591,22 @@ class EgressProxy:
                 "egress proxy: unhandled exception in tunnel handler — "
                 "connection aborted, proxy stays up"
             )
-            self._record({
+            event = {
                 "t": time.monotonic(),
                 "host": None, "port": None,
                 "result": "handler_error",
                 "reason": f"{exc.__class__.__name__}: {exc}",
                 "resolved_ip": None,
+                # Lane attribution: production registrations are
+                # lane-scoped, so an un-laned handler_error from a
+                # laned transport landed only in run-global buffers —
+                # i.e. nowhere, for exactly the runs using lane
+                # isolation. The lane is in scope here; stamp it.
+                "lane": lane.label if lane is not None else "main",
+                "lane_id": lane.lane_id if lane is not None else None,
                 "bytes_c2u": 0, "bytes_u2c": 0, "duration": 0.0,
-            })
+            }
+            self._record(event)
         finally:
             with self._active_lock:
                 self._active_tunnels -= 1
@@ -2733,74 +3640,69 @@ class EgressProxy:
         # below gets only the remaining slice of the deadline, not a
         # fresh full timeout.
         handshake_deadline = t_start + _PROXY_HANDSHAKE_DEADLINE_S
-        request_line = await _read_line(
+        raw_line = await _read_raw_line(
             reader, max_len=4096,
             timeout=max(0.0, handshake_deadline - time.monotonic()))
-        if request_line is None:
+        if raw_line is None:
             event.update(result="bad_request", reason="empty/overlong CONNECT line",
                          duration=time.monotonic() - t_start)
             self._record(event)
             await self._write_error(writer, 400, "Bad Request")
             return
 
-        parts = request_line.split()
-        if len(parts) != 3 or parts[0] != "CONNECT" or not parts[2].startswith("HTTP/"):
-            event.update(result="bad_request", reason=f"malformed: {request_line[:80]!r}",
-                         duration=time.monotonic() - t_start)
-            self._record(event)
-            await self._write_error(writer, 400, "Bad Request")
-            return
-
-        target = parts[1]
-        # Reject non-printable characters in the CONNECT target. A
-        # sandboxed client that includes ESC (0x1b) / CR / NUL / C1
-        # controls / Unicode line separators in the host field would
-        # otherwise have those bytes echoed verbatim into the proxy's
-        # log output — terminal escape injection (change colours, set
-        # window title, overwrite prior lines to spoof "all clear"
-        # entries). JSON logging (proxy-events.jsonl) is safe because
-        # json.dumps escapes control chars, but the logger.warning/info
-        # calls below interpolate the host into human-readable messages
-        # that may reach a live terminal. See
-        # core.security.log_sanitisation.has_nonprintable. Imported at
-        # module top to avoid a per-CONNECT dict-lookup + module-attr
-        # access on the hot path.
-        if has_nonprintable(target):
-            event.update(result="bad_request",
-                         reason="non-printable characters in CONNECT target",
-                         duration=time.monotonic() - t_start)
-            self._record(event)
-            await self._write_error(writer, 400, "Bad Request")
-            return
-        if ":" not in target:
-            event.update(result="bad_request", reason="no port in target",
-                         duration=time.monotonic() - t_start)
-            self._record(event)
-            await self._write_error(writer, 400, "Bad Request")
-            return
-        host, _, port_str = target.rpartition(":")
-        # Strip IPv6 brackets if present: [::1]:443.
-        # `str.strip("[]")` strips ANY leading/trailing `[` or `]`
-        # regardless of pairing, so `]example.com[` would also collapse
-        # to `example.com` — which doesn't match the IPv6-bracket
-        # intent. Only strip when both bookends are present together.
-        if host.startswith("[") and host.endswith("]"):
-            host = host[1:-1]
+        # Interpretation of the hostile request-line bytes happens in
+        # the confined parser worker, never in this process: the raw
+        # bytes go to the jail, a re-validated verdict comes back (see
+        # parser_jail.py for the trust model; _request_head.py for the
+        # parse itself — the former inline parse, extracted verbatim,
+        # so refusal reasons and per-case host/port attribution on the
+        # events below are unchanged). asyncio.to_thread because the
+        # round-trip is blocking (mutex-serialised) — the event loop
+        # stays free for other tunnels.
         try:
-            port = int(port_str)
-        except ValueError:
-            event.update(host=host, result="bad_request", reason="non-numeric port",
+            verdict = await asyncio.to_thread(
+                self._parser_jail.parse, raw_line)
+        except parser_jail.ParserJailUnavailable as exc:
+            # No confined worker and respawn is failing / backing off.
+            # Fail closed: refuse the request — hostile bytes are NEVER
+            # parsed in-process as a fallback. No method census either:
+            # nothing parsed the bytes, so neither counter can honestly
+            # move (the parser_unavailable event census carries the
+            # incident instead).
+            event.update(result="parser_unavailable", reason=str(exc),
+                         duration=time.monotonic() - t_start)
+            self._record(event)
+            await self._write_error(writer, 503, "Service Unavailable")
+            return
+        # Method census (see the _stats comment in __init__): the
+        # classification rides the verdict — only the confined parser
+        # sees the split method, and re-splitting here would move
+        # hostile-byte interpretation back in-process. Same conditions
+        # and counters as the former inline counting; increments run on
+        # the event-loop thread (this coroutine resumed after the
+        # await), per the _stats thread contract.
+        if isinstance(verdict, ParseRefusal):
+            if verdict.census == CENSUS_CONNECT:
+                self._stats["requests_connect"] += 1
+            elif verdict.census == CENSUS_NON_CONNECT:
+                self._stats["requests_non_connect"] += 1
+            # Worker death on this input surfaces as a refusal too
+            # (its reason string says so): poison input costs the
+            # client its request and the jail one respawn — nothing
+            # else. Attribution fields are per-refusal-class, set only
+            # when the parser stamped them.
+            if verdict.host is not None:
+                event["host"] = verdict.host
+            if verdict.port is not None:
+                event["port"] = verdict.port
+            event.update(result="bad_request", reason=verdict.reason,
                          duration=time.monotonic() - t_start)
             self._record(event)
             await self._write_error(writer, 400, "Bad Request")
             return
-        if not (0 < port < 65536):
-            event.update(host=host, port=port, result="bad_request",
-                         reason="port out of range",
-                         duration=time.monotonic() - t_start)
-            self._record(event)
-            await self._write_error(writer, 400, "Bad Request")
-            return
+        self._stats["requests_connect"] += 1
+        host = verdict.host
+        port = verdict.port
         event["host"] = host
         event["port"] = port
 
@@ -2970,7 +3872,7 @@ class EgressProxy:
                                          "resolved_ip_blocked")
                 await self._write_error(writer, 403, "Forbidden")
                 return
-            up_host, up_port = self._upstream
+            up_host, up_port = self._upstream  # type: ignore[misc]
             event["resolved_ip"] = f"{up_host}:{up_port} (upstream)"
             try:
                 up_reader, up_writer = await asyncio.wait_for(
@@ -3004,7 +3906,11 @@ class EgressProxy:
                     timeout=self._upstream_handshake_timeout,
                 )
             except (asyncio.TimeoutError, asyncio.IncompleteReadError,
-                    ConnectionError) as e:
+                    OSError) as e:
+                # OSError (ConnectionError's superclass) so the rarer
+                # socket-failure shapes take this branch's close+502
+                # instead of escaping to the handler-error path, which
+                # writes no status line and strands up_writer.
                 logger.warning("egress proxy: upstream CONNECT failed: %s", e)
                 up_writer.close()
                 event.update(result="upstream_failed",
@@ -3029,13 +3935,34 @@ class EgressProxy:
                 return
 
             # Drain remaining upstream headers up to blank line.
+            # Timeout/EOF keep the historical best-effort break (the
+            # relay loop surfaces a dead upstream immediately); a
+            # socket error (upstream RST mid-drain) means the tunnel
+            # is already dead — close the backend leg and give the
+            # client the documented 502 instead of letting the error
+            # escape to the handler-error path (no status line, and
+            # up_writer stranded until proxy stop).
             while True:
                 try:
                     hdr = await asyncio.wait_for(
-                        up_reader.readuntil(b"\r\n"), timeout=5.0,
+                        up_reader.readuntil(b"\r\n"), timeout=5.0,  # type: ignore[arg-type]
                     )
                 except (asyncio.TimeoutError, asyncio.IncompleteReadError):
                     break
+                except OSError as e:
+                    logger.warning(
+                        "egress proxy: upstream reset during header "
+                        "drain: %s", e)
+                    with contextlib.suppress(OSError, RuntimeError):
+                        up_writer.close()
+                    event.update(
+                        result="upstream_failed",
+                        reason=("upstream header drain: "
+                                f"{e.__class__.__name__}"),
+                        duration=time.monotonic() - t_start)
+                    self._record(event)
+                    await self._write_error(writer, 502, "Bad Gateway")
+                    return
                 if hdr == b"\r\n":
                     break
         else:
@@ -3051,7 +3978,16 @@ class EgressProxy:
                 self._record(event)
                 await self._write_error(writer, 504, "Gateway Timeout")
                 return
-            except socket.gaierror as e:
+            except (OSError, UnicodeError) as e:
+                # Resolver-failure shapes vary by platform and input:
+                # socket.gaierror (an OSError subclass) is the common
+                # case, but a hostname that fails IDNA encoding raises
+                # UnicodeError from inside getaddrinfo, and resolver
+                # backends can surface plain OSError. Every shape must
+                # produce the 502 response line — falling through to
+                # the generic handler-error path closes the client
+                # socket without any status line, so the child sees an
+                # opaque hang/EOF instead of the documented failure.
                 logger.warning("egress proxy: DNS failure for %s:%s: %s",
                                 host, port, e)
                 event.update(result="dns_failed", reason=f"DNS: {e}",
@@ -3081,6 +4017,12 @@ class EgressProxy:
             _family, _socktype, _proto, _, sockaddr = addrinfo[0]
             resolved_ip = sockaddr[0]
             event["resolved_ip"] = resolved_ip
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "egress proxy: DNS %s -> %s",
+                    host,
+                    ", ".join(sorted({e[4][0] for e in addrinfo})),
+                )
             for _entry in addrinfo:
                 _candidate = _entry[4][0]
                 if _ip_is_blocked(_candidate):
@@ -3174,89 +4116,105 @@ class EgressProxy:
                 event["resolved_ip"] = dialed_ip
 
         # Acknowledge tunnel established, then relay bytes both ways.
-        writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
-        await writer.drain()
-        # Both legs get TCP keepalive so middlebox/NAT state survives
-        # long silent stretches (thinking models). The client leg is
-        # a no-op when the child rides a unix-socket lane.
-        _enable_tcp_keepalive(writer)
-        _enable_tcp_keepalive(up_writer)
-        # Pull resolved_ip from the event dict — the direct path sets it
-        # as a local variable, but the upstream-proxy branch only populates
-        # event["resolved_ip"]. Referencing a bare `resolved_ip` here would
-        # NameError on every upstream-proxy CONNECT, crashing the tunnel
-        # handler mid-request. Read through the event dict so both paths
-        # produce a valid log line.
-        # Lazy %-style format so the string isn't built when INFO is
-        # below the logger threshold — every CONNECT used to pay the
-        # f-string formatting cost regardless of whether anything
-        # consumed the line.
-        logger.debug(
-            "egress proxy: OPEN %s:%s -> %s",
-            host, port, event.get("resolved_ip", "?"),
-        )
-
-        # CONNECT TLS-identity check. Everything up to here authorised
-        # the PLAINTEXT CONNECT authority and dialled its vetted IP —
-        # nothing ties the TLS session INSIDE the tunnel to that
-        # authorised name, so a child could CONNECT to an allowlisted
-        # host and send a ClientHello bearing a different SNI to reach
-        # another tenant behind the same shared front end (domain
-        # fronting). Peek the client's first TLS record: iff it parses
-        # as a complete ClientHello carrying an SNI, require the SNI
-        # to equal the authorised CONNECT hostname (case-insensitive).
-        # This is HONESTLY a best-effort hardening layer, not a
-        # guarantee: non-TLS first bytes, SNI-less hellos, records
-        # fragmented across TLS records, malformed structure, and a
-        # peek deadline expiry all pass through unchanged, and
-        # Encrypted ClientHello hides the name entirely — the layer
-        # only removes the cheapest fronting path. Peeked bytes are
-        # forwarded upstream below, so passing tunnels stay
-        # byte-identical to a non-peeking proxy.
-        peeked, client_sni = await self._peek_tls_identity(reader)
-        if client_sni is not None and client_sni.lower() != host.lower():
-            # The SNI is attacker-controlled — sanitise before it can
-            # reach a live terminal (same rationale as the CONNECT
-            # target check above).
-            _safe_sni = sanitise_for_terminal(client_sni)
-            logger.warning(
-                "egress proxy: DENY %s:%s — TLS ClientHello SNI %r "
-                "does not match the authorised CONNECT host "
-                "(domain-fronting attempt); tunnel closed",
-                host, port, _safe_sni,
+        # Between here and the relay pair taking ownership (its
+        # try/finally below closes up_writer on every exit), any
+        # escaping exception — client gone at the 200 ack, an
+        # unexpected error out of the TLS peek — used to strand the
+        # freshly-dialed upstream leg until proxy stop. No status
+        # line is possible on these paths (the 200 is already
+        # committed / the client is gone), so cleanup + re-raise is
+        # the whole contract; the handler-error catch upstream keeps
+        # the event accounting. Sync close only: awaiting
+        # wait_closed() during a CancelledError unwind could swallow
+        # the cancellation.
+        try:
+            writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            await writer.drain()
+            # Both legs get TCP keepalive so middlebox/NAT state survives
+            # long silent stretches (thinking models). The client leg is
+            # a no-op when the child rides a unix-socket lane.
+            _enable_tcp_keepalive(writer)
+            _enable_tcp_keepalive(up_writer)
+            # Pull resolved_ip from the event dict — the direct path sets it
+            # as a local variable, but the upstream-proxy branch only populates
+            # event["resolved_ip"]. Referencing a bare `resolved_ip` here would
+            # NameError on every upstream-proxy CONNECT, crashing the tunnel
+            # handler mid-request. Read through the event dict so both paths
+            # produce a valid log line.
+            # Lazy %-style format so the string isn't built when INFO is
+            # below the logger threshold — every CONNECT used to pay the
+            # f-string formatting cost regardless of whether anything
+            # consumed the line.
+            logger.debug(
+                "egress proxy: OPEN %s:%s -> %s",
+                host, port, event.get("resolved_ip", "?"),
             )
-            event.update(result="denied_sni",
-                         reason=f"TLS SNI {_safe_sni!r} != CONNECT host",
-                         duration=time.monotonic() - t_start)
+
+            # CONNECT TLS-identity check. Everything up to here authorised
+            # the PLAINTEXT CONNECT authority and dialled its vetted IP —
+            # nothing ties the TLS session INSIDE the tunnel to that
+            # authorised name, so a child could CONNECT to an allowlisted
+            # host and send a ClientHello bearing a different SNI to reach
+            # another tenant behind the same shared front end (domain
+            # fronting). Peek the client's first TLS record: iff it parses
+            # as a complete ClientHello carrying an SNI, require the SNI
+            # to equal the authorised CONNECT hostname (case-insensitive).
+            # This is HONESTLY a best-effort hardening layer, not a
+            # guarantee: non-TLS first bytes, SNI-less hellos, records
+            # fragmented across TLS records, malformed structure, and a
+            # peek deadline expiry all pass through unchanged, and
+            # Encrypted ClientHello hides the name entirely — the layer
+            # only removes the cheapest fronting path. Peeked bytes are
+            # forwarded upstream below, so passing tunnels stay
+            # byte-identical to a non-peeking proxy.
+            peeked, client_sni = await self._peek_tls_identity(reader)
+            if client_sni is not None and client_sni.lower() != host.lower():
+                # The SNI is attacker-controlled — sanitise before it can
+                # reach a live terminal (same rationale as the CONNECT
+                # target check above).
+                _safe_sni = sanitise_for_terminal(client_sni)
+                logger.warning(
+                    "egress proxy: DENY %s:%s — TLS ClientHello SNI %r "
+                    "does not match the authorised CONNECT host "
+                    "(domain-fronting attempt); tunnel closed",
+                    host, port, _safe_sni,
+                )
+                event.update(result="denied_sni",
+                             reason=f"TLS SNI {_safe_sni!r} != CONNECT host",
+                             duration=time.monotonic() - t_start)
+                self._record(event)
+                # 200 already went out — the deny is the close itself.
+                # The peeked bytes are dropped: nothing reaches upstream.
+                with contextlib.suppress(OSError, RuntimeError):
+                    up_writer.close()
+                    await up_writer.wait_closed()
+                return
+
+            # Record the event NOW (not at close) so short tunnels that
+            # complete right around when the caller's subprocess.run returns
+            # still show up in events_since(). The event dict is mutable and
+            # shared with the ring buffer — we update bytes_c2u/bytes_u2c/
+            # duration in place when the tunnel closes.
+            event.update(result="allowed", reason=None)
             self._record(event)
-            # 200 already went out — the deny is the close itself.
-            # The peeked bytes are dropped: nothing reaches upstream.
+
+            total = {"c2u": 0, "u2c": 0}  # byte counters
+            result = "allowed"
+            reason: str | None = None
+            # Forward the peeked first bytes so the upstream sees the
+            # byte stream a non-peeking proxy would have relayed. A dead
+            # upstream here surfaces immediately in the relay loop below,
+            # so the failure is only suppressed, never lost.
+            if peeked:
+                with contextlib.suppress(ConnectionResetError,
+                                         BrokenPipeError):
+                    up_writer.write(peeked)
+                    await up_writer.drain()
+                    total["c2u"] += len(peeked)
+        except BaseException:
             with contextlib.suppress(OSError, RuntimeError):
                 up_writer.close()
-                await up_writer.wait_closed()
-            return
-
-        # Record the event NOW (not at close) so short tunnels that
-        # complete right around when the caller's subprocess.run returns
-        # still show up in events_since(). The event dict is mutable and
-        # shared with the ring buffer — we update bytes_c2u/bytes_u2c/
-        # duration in place when the tunnel closes.
-        event.update(result="allowed", reason=None)
-        self._record(event)
-
-        total = {"c2u": 0, "u2c": 0}  # byte counters
-        result = "allowed"
-        reason: str | None = None
-        # Forward the peeked first bytes so the upstream sees the
-        # byte stream a non-peeking proxy would have relayed. A dead
-        # upstream here surfaces immediately in the relay loop below,
-        # so the failure is only suppressed, never lost.
-        if peeked:
-            with contextlib.suppress(ConnectionResetError,
-                                     BrokenPipeError):
-                up_writer.write(peeked)
-                await up_writer.drain()
-                total["c2u"] += len(peeked)
+            raise
         # The relay pair runs under `_supervise_relay` rather than a
         # bare `asyncio.wait_for(..., timeout=self._total_timeout)`.
         # The historical wait_for severed EVERY tunnel at the absolute
@@ -3274,8 +4232,10 @@ class EgressProxy:
         # task.cancel))` design raised CancelledError, escaped `except
         # Exception` on Python 3.11+, and left timeouts unaccounted.
         relay = asyncio.gather(
-            self._relay(reader, up_writer, "c2u", total),
-            self._relay(up_reader, writer, "u2c", total),
+            self._relay(reader, up_writer, "c2u", total,
+                        src_writer=writer),
+            self._relay(up_reader, writer, "u2c", total,
+                        src_writer=up_writer),
         )
         try:
             sever_reason = await self._supervise_relay(relay, total)
@@ -3307,6 +4267,13 @@ class EgressProxy:
                 event, result=result, reason=reason,
                 bytes_c2u=total["c2u"], bytes_u2c=total["u2c"],
                 duration=time.monotonic() - t_start)
+            # Global byte/close fold: once per tunnel at close (never
+            # per relayed chunk), on the event-loop thread.
+            self._stats["tunnels_closed"] += 1
+            if result == "timed_out":
+                self._stats["tunnels_timed_out"] += 1
+            self._stats["bytes_c2u"] += total["c2u"]
+            self._stats["bytes_u2c"] += total["u2c"]
             if not self._stopping:
                 logger.debug(
                     "egress proxy: CLOSE %s:%s (c2u=%s u2c=%s)",
@@ -3348,9 +4315,64 @@ class EgressProxy:
             buf += chunk
         return buf, None
 
+    @staticmethod
+    def _close_tunnel_pair(a: asyncio.StreamWriter,
+                           b: asyncio.StreamWriter) -> None:
+        """Close both legs of a tunnel, idempotently.
+
+        Called from either relay direction when its connection is
+        unusable (reset, or a failed half-close): closing both
+        transports makes the sibling relay's pending ``read()``
+        complete immediately (EOF / connection error) instead of
+        waiting out its own idle timeout. ``StreamWriter.close()`` on
+        an already-closing transport is a no-op, so every EOF/RST
+        interleaving — including both directions tearing down
+        concurrently — may call this without double-close effects.
+        The tunnel SLOT is untouched here: it is released exactly once
+        in ``_handle_client``'s ``finally`` after both relay
+        directions have returned.
+        """
+        for w in (a, b):
+            # Peer may already be gone (OSError); transport may be
+            # detached during loop shutdown (RuntimeError).
+            with contextlib.suppress(OSError, RuntimeError):
+                w.close()
+
     async def _relay(self, src: asyncio.StreamReader,
                      dst: asyncio.StreamWriter,
-                     counter_key: str, counters: dict) -> None:
+                     counter_key: str, counters: dict,
+                     src_writer: asyncio.StreamWriter) -> None:
+        """One direction of an established tunnel.
+
+        *src_writer* is the writer paired with *src* (the same
+        connection), needed so a dead source connection can tear down
+        BOTH legs promptly (see termination contract below).
+
+        Termination contract — the guarantee is that a closed client
+        (or backend) propagates across the relay instead of parking
+        the tunnel until an idle timeout reaps it:
+
+        * src EOF → half-close *dst* (``write_eof``): the far side
+          sees FIN and can finish/close, while the opposite direction
+          keeps relaying — protocols that signal end-of-request by
+          ``shutdown(SHUT_WR)`` still receive their response. A peer
+          that fully closed converges the same way: the far side
+          answers/closes, the sibling direction sees EOF or a write
+          error, and the tunnel completes.
+        * src reset (RST) → nothing can flow in either direction
+          through that connection; close both legs so the sibling
+          relay unblocks now.
+        * dst write failure (reset/broken pipe on drain) → same full
+          teardown: the destination is gone, and bytes the sibling
+          would relay back have nowhere to land.
+        * src idle (no bytes within the idle window) → return WITHOUT
+          touching *dst*: one-direction silence is legitimate (a
+          client is silent for the whole server-push phase of a
+          pooled LLM stream), so idling out one direction must not
+          half-close a healthy tunnel. Idle-parked tunnels are still
+          bounded by the sibling's own idle window and the
+          progress-aware total cap (``_supervise_relay``).
+        """
         while True:
             try:
                 chunk = await asyncio.wait_for(
@@ -3360,7 +4382,27 @@ class EgressProxy:
             except asyncio.TimeoutError:
                 # Idle → let the other direction notice and close.
                 return
+            except (ConnectionResetError, BrokenPipeError):
+                self._stats["relay_pair_teardowns"] += 1
+                self._close_tunnel_pair(src_writer, dst)
+                return
             if not chunk:
+                # src EOF — relay the half-close. ``write_eof`` can
+                # legitimately fail or be unsupported (transport
+                # already closing after a concurrent sibling teardown;
+                # TLS-wrapping transports report can_write_eof() ==
+                # False); the fallback is full teardown, never a
+                # silent park.
+                try:
+                    if dst.can_write_eof():
+                        dst.write_eof()
+                        self._stats["relay_eof_propagated"] += 1
+                    else:
+                        self._stats["relay_pair_teardowns"] += 1
+                        self._close_tunnel_pair(src_writer, dst)
+                except (OSError, RuntimeError, NotImplementedError):
+                    self._stats["relay_pair_teardowns"] += 1
+                    self._close_tunnel_pair(src_writer, dst)
                 return
             # Pre-fix the counter was bumped BEFORE `dst.drain()`. If
             # drain raised (peer reset, broken pipe), the counter
@@ -3378,6 +4420,8 @@ class EgressProxy:
             try:
                 await dst.drain()
             except (ConnectionResetError, BrokenPipeError):
+                self._stats["relay_pair_teardowns"] += 1
+                self._close_tunnel_pair(src_writer, dst)
                 return
             counters[counter_key] += len(chunk)
 
@@ -3499,9 +4543,15 @@ def _consume_abandoned_relay(fut: asyncio.Future) -> None:
         fut.exception()
 
 
-async def _read_line(reader: asyncio.StreamReader, max_len: int,
-                     timeout: float | None = None) -> str | None:
-    """Read one CRLF-terminated line, max_len bytes. None on error/EOF.
+async def _read_raw_line(reader: asyncio.StreamReader, max_len: int,
+                         timeout: float | None = None) -> bytes | None:
+    """Read one CRLF-terminated line, max_len bytes (counting the
+    CRLF); return the raw bytes WITHOUT the CRLF. None on
+    error/EOF/overlong.
+
+    The request-line caller ships these bytes to the confined parser
+    worker UNDECODED — this process's handling of them is the CRLF
+    delimiter and the length cap, nothing more.
 
     *timeout* is the read budget for THIS line; handshake callers pass
     the remaining slice of their absolute deadline so successive lines
@@ -3517,7 +4567,22 @@ async def _read_line(reader: asyncio.StreamReader, max_len: int,
         return None
     if len(data) > max_len:
         return None
-    return data[:-2].decode("latin-1")  # latin-1 never fails on bytes
+    return data[:-2]
+
+
+async def _read_line(reader: asyncio.StreamReader, max_len: int,
+                     timeout: float | None = None) -> str | None:
+    """Read one CRLF-terminated line, decoded. None on error/EOF.
+
+    Header-drain variant of _read_raw_line: the drain loop only counts
+    ``len(line)`` and checks for the empty terminator line — the
+    decoded content is never otherwise interpreted (latin-1 is a
+    byte-length-preserving bijection, so the count is the byte count).
+    """
+    raw = await _read_raw_line(reader, max_len, timeout)
+    if raw is None:
+        return None
+    return raw.decode("latin-1")  # latin-1 never fails on bytes
 
 
 # ----- module-level singleton API -----

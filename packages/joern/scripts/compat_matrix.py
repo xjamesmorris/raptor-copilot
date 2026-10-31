@@ -52,6 +52,7 @@ import contextlib
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -76,6 +77,8 @@ sys.path.insert(0, str(REPO))
 from core.config import pin_raptor_dir_in_environ  # noqa: E402
 from core.json import load_json, save_json  # noqa: E402
 from core.run.scratch import scratch_dir  # noqa: E402
+
+from core.security.log_sanitisation import sanitise_for_terminal as _sft
 
 pin_raptor_dir_in_environ()
 
@@ -133,6 +136,52 @@ int main(int argc, char **argv) {
 def _arch() -> str:
     m = platform.machine()
     return {"x86_64": "x86_64", "aarch64": "arm64", "arm64": "arm64"}.get(m, m)
+
+
+#: Version-shaped release tags only (ASCII, no separators, bounded).
+#: Tags come from the LIVE releases API and become URL components, pin
+#: keys, and path components under the workdir — the shape gate is the
+#: derivation chokepoint that keeps a separator-bearing tag
+#: ("../victim") out of every later path arithmetic, including the
+#: per-tag cleanup that runs even on refusal branches. First char is
+#: alphanumeric (an optional leading "v" aside), so "." / ".." can
+#: never match; the class has no "/", "\\", NUL, or whitespace.
+_TAG_RE = re.compile(r"v?[A-Za-z0-9][A-Za-z0-9._+-]{0,63}")
+
+
+def _tag_refusal_row(tag: str) -> dict:
+    """Result row for a tag that failed the shape gate."""
+    return {
+        "pass": False,
+        "exception": "refused hostile release tag "
+                     "(not a version-shaped token)",
+    }
+
+
+def _contained_cleanup(workdir: Path, archive: Path, tree: Path) -> None:
+    """Delete one tag's artifacts, refusing anything that resolves
+    outside *workdir*.
+
+    Belt-and-braces beneath the ``_TAG_RE`` derivation gate: even a
+    validated-then-tampered path (a tree swapped for a symlink out of
+    the workdir mid-run) must never aim ``unlink``/``rmtree`` outside
+    the matrix's own scratch. Resolve-and-contain, then delete the
+    RESOLVED path only when it sits strictly inside the workdir.
+    """
+    root = workdir.resolve()
+    for path, is_tree in ((archive, False), (tree, True)):
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if root not in resolved.parents:
+            print("refusing cleanup outside the workdir: "
+                  f"{_sft(str(path))}", flush=True)
+            continue
+        if is_tree:
+            shutil.rmtree(resolved, ignore_errors=True)
+        else:
+            resolved.unlink(missing_ok=True)
 
 
 def _newest_tags(count: int) -> list[str]:
@@ -374,13 +423,51 @@ def _run_e2e_subprocess(joern_dir: Path) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _progress_line(tag: str, msg: str) -> str:
+    """Loop progress line ([tag] downloading... / running E2E...);
+    the tag derives from the GitHub releases API — escaped here so
+    every loop print site is safe by construction, like the row/pin/
+    summary lines."""
+    return f"[{_sft(tag, max_len=32)}] {msg}"
+
+
+def _unpinned_warning(tag: str, asset_name: str, digest: str) -> str:
+    """Unpinned-asset WARNING; tag/asset derive from the releases
+    API + download — same escape discipline as _pin_line (digest is
+    our own hex)."""
+    return (f"[{_sft(tag, max_len=32)}] WARNING: "
+            f"{_sft(asset_name, max_len=120)} is not sha256-pinned — "
+            f"downloaded digest {digest}. Re-run with --update-pins "
+            f"to record it, or add it to {_PINS_FILE.name}.")
+
+
+def _pin_line(tag: str, asset_name: str, digest: str) -> str:
+    """Pin-confirmation line; tag/asset derive from the GitHub
+    releases API — escaped here so the print site is safe by
+    construction."""
+    return (f"[{_sft(tag, max_len=32)}] pinned "
+            f"{_sft(asset_name, max_len=120)} sha256={digest}")
+
+
+def _summary_line(rows: list) -> str:
+    """Matrix summary; failure TAGS derive from the releases API."""
+    failed = [tag for tag, r in rows if not r.get("pass")]
+    return (f"\n{len(rows) - len(failed)}/{len(rows)} versions pass"
+            + (f" — FAILURES: {_sft(', '.join(failed), max_len=300)}"
+               if failed else ""))
+
+
 def _format_row(tag: str, r: dict) -> str:
+    # tag and step values derive from the GitHub releases API /
+    # downloaded artifacts — escape control bytes before the terminal.
+    from core.security.log_sanitisation import sanitise_for_terminal
     verdict = "PASS" if r.get("pass") else "FAIL"
     steps = " ".join(
-        f"{k}={v}" for k, v in r.items()
+        f"{k}={sanitise_for_terminal(str(v), max_len=120)}"
+        for k, v in r.items()
         if k not in ("pass", "joern_version")
     )
-    return f"{tag:<12} {verdict:<5} {steps}"
+    return f"{sanitise_for_terminal(tag, max_len=32):<12} {verdict:<5} {steps}"
 
 
 def main() -> int:
@@ -430,8 +517,22 @@ def main() -> int:
     workdir.mkdir(parents=True, exist_ok=True)
 
     pins = _load_pins()
+    if args.require_pinned and not pins:
+        print(
+            "WARNING: --require-pinned with an empty pins file — every "
+            "tag will be refused. Record pins with --update-pins after "
+            "verifying a download out-of-band.", flush=True,
+        )
     rows: list[tuple[str, dict]] = []
     for tag in tags:
+        # Shape gate BEFORE any path arithmetic (see _TAG_RE): a
+        # hostile tag must never become an archive/tree path — the
+        # per-tag cleanup below fires on every branch, refusals
+        # included.
+        if not _TAG_RE.fullmatch(tag):
+            rows.append((tag, _tag_refusal_row(tag)))
+            print(_format_row(tag, rows[-1][1]), flush=True)
+            continue
         archive = workdir / f"{tag}.zip"
         tree = workdir / tag
         try:
@@ -443,7 +544,7 @@ def main() -> int:
                 }))
                 print(_format_row(tag, rows[-1][1]), flush=True)
                 continue
-            print(f"[{tag}] downloading...", flush=True)
+            print(_progress_line(tag, "downloading..."), flush=True)
             asset_name, digest = _download(tag, archive)
             pinned = _verify_pin(pins, tag, asset_name, digest)
             if args.require_pinned and not pinned:
@@ -458,26 +559,20 @@ def main() -> int:
                 if args.update_pins:
                     pins[_pin_key(tag, asset_name)] = digest
                     _save_pins(pins)
-                    print(f"[{tag}] pinned {asset_name} "
-                          f"sha256={digest}", flush=True)
+                    print(_pin_line(tag, asset_name, digest),
+                          flush=True)
                 else:
-                    print(
-                        f"[{tag}] WARNING: {asset_name} is not sha256-"
-                        f"pinned — downloaded digest {digest}. Re-run "
-                        f"with --update-pins to record it, or add it "
-                        f"to {_PINS_FILE.name}.",
-                        flush=True,
-                    )
+                    print(_unpinned_warning(tag, asset_name, digest),
+                          flush=True)
             joern_dir = _extract(archive, tree)
-            print(f"[{tag}] running E2E...", flush=True)
+            print(_progress_line(tag, "running E2E..."), flush=True)
             result = _run_e2e_subprocess(joern_dir)
         except Exception as e:  # noqa: BLE001 — one bad tag shouldn't stop the matrix
             result = {"pass": False,
                       "exception": f"{type(e).__name__}: {e}"[:200]}
         finally:
             if not args.keep:
-                archive.unlink(missing_ok=True)
-                shutil.rmtree(tree, ignore_errors=True)
+                _contained_cleanup(workdir, archive, tree)
         rows.append((tag, result))
         print(_format_row(tag, result), flush=True)
 
@@ -488,8 +583,7 @@ def main() -> int:
     for tag, result in rows:
         print(_format_row(tag, result))
     failed = [tag for tag, r in rows if not r.get("pass")]
-    print(f"\n{len(rows) - len(failed)}/{len(rows)} versions pass"
-          + (f" — FAILURES: {', '.join(failed)}" if failed else ""))
+    print(_summary_line(rows))
     return 1 if failed else 0
 
 

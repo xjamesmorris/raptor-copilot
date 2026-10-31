@@ -31,6 +31,22 @@ _SENSITIVE_HIDDEN_INPUT_NAMES = {"csrf", "nonce", "state"}
 # (multi-GiB documents, billion-nested-<div>) that OOM bs4.
 _BS4_MAX_BYTES = 16 * 1024 * 1024
 
+# Caps on RETAINED discovery state. `max_pages` bounds visits and
+# `_BS4_MAX_BYTES` bounds one parse, but neither bounds what a single
+# hostile/pathological page (500k anchors fits in 16 MiB) inflates
+# into discovered_urls / discovered_parameters / parameter_urls —
+# state that consumers then re-materialise (crawl artifacts, research-
+# landscape stringification). Raising a cap admits more of a huge site
+# into fuzz-cell candidacy at a memory/artifact cost; lowering it
+# starves discovery on legitimately large sites — these values keep
+# multi-GB inflation out while staying far above what the downstream
+# fuzz budgets can consume. Truncation warns once per kind per crawl.
+_MAX_DISCOVERED_URLS = 10_000
+_MAX_DISCOVERED_PARAMS = 2_000
+_MAX_PARAM_URL_FANOUT = 200
+_MAX_LINKS_PER_PAGE = 2_000
+_MAX_LOG_PAGE_IDS = 10_000
+
 
 class WebCrawler:
     """Intelligent web crawler with LLM-guided discovery."""
@@ -44,6 +60,12 @@ class WebCrawler:
         self.visited_urls: set[str] = set()
         self.discovered_urls: set[str] = set()
         self.discovered_forms: list[dict] = []
+        # Shape keys of already-recorded forms. A site-wide nav/search/
+        # login form repeats on every crawled page; without dedup those
+        # byte-identical duplicates fill the scanner's fixed Phase 6
+        # form budget and every OTHER form on the site is silently
+        # never fuzzed.
+        self._seen_form_keys: set[tuple] = set()
         self.discovered_apis: list[dict] = []
         self.discovered_parameters: set[str] = set()
         # param name -> set of (unredacted) URLs whose query string
@@ -53,6 +75,13 @@ class WebCrawler:
         # scanner's form loop fuzzes those against their form action.
         self.parameter_urls: dict[str, set[str]] = {}
         self._log_page_ids: dict[str, str] = {}
+        # URLs already placed on the BFS queue: the enqueue check used
+        # to dedup only against visited_urls, so a page linking one URL
+        # many times (or many pages linking the same URL) grew the
+        # queue without bound before any of them was popped.
+        self._enqueued_urls: set[str] = set()
+        # Once-per-kind truncation warnings — loud, but not per-item.
+        self._truncation_warned: set[str] = set()
 
         logger.info(
             "Web crawler initialized (max_depth=%s, max_pages=%s)", max_depth, max_pages
@@ -83,9 +112,66 @@ class WebCrawler:
         raw_url = str(url)
         page_id = self._log_page_ids.get(raw_url)
         if page_id is None:
+            if len(self._log_page_ids) >= _MAX_LOG_PAGE_IDS:
+                # The label map is log furniture; a hostile URL flood
+                # must not grow it without bound.
+                return f"{self._target_log_label()} page_id=page-overflow"
             page_id = f"page-{len(self._log_page_ids) + 1:04d}"
             self._log_page_ids[raw_url] = page_id
         return f"{self._target_log_label()} page_id={page_id}"
+
+    def _warn_truncation(self, kind: str, cap: int) -> None:
+        """One loud warning per truncated discovery structure per crawl."""
+        if kind in self._truncation_warned:
+            return
+        self._truncation_warned.add(kind)
+        logger.warning(
+            "WebCrawler: %s reached its retention cap (%d) — further "
+            "discoveries of this kind are dropped for this crawl",
+            kind, cap,
+        )
+
+    def _record_discovered_url(self, absolute_url: str) -> bool:
+        """Record a discovered URL under the retention cap.
+
+        Returns whether the URL is retained (already known counts)."""
+        if absolute_url in self.discovered_urls:
+            return True
+        if len(self.discovered_urls) >= _MAX_DISCOVERED_URLS:
+            self._warn_truncation("discovered_urls", _MAX_DISCOVERED_URLS)
+            return False
+        self.discovered_urls.add(absolute_url)
+        return True
+
+    def _record_parameter(self, name: str, url: str | None = None) -> None:
+        """Record a discovered parameter (and its carrying URL) capped."""
+        if name not in self.discovered_parameters:
+            if len(self.discovered_parameters) >= _MAX_DISCOVERED_PARAMS:
+                self._warn_truncation(
+                    "discovered_parameters", _MAX_DISCOVERED_PARAMS,
+                )
+                return
+            self.discovered_parameters.add(name)
+        if url is None:
+            return
+        urls = self.parameter_urls.setdefault(name, set())
+        if url in urls:
+            return
+        if len(urls) >= _MAX_PARAM_URL_FANOUT:
+            self._warn_truncation(
+                "parameter_urls fanout", _MAX_PARAM_URL_FANOUT,
+            )
+            return
+        urls.add(url)
+
+    def _enqueue(self, queue, url: str, depth: int) -> None:
+        """Queue a URL for the BFS exactly once per crawl."""
+        if queue is None:
+            return
+        if url in self.visited_urls or url in self._enqueued_urls:
+            return
+        self._enqueued_urls.add(url)
+        queue.append((url, depth))
 
     def _redacted_url_list(self, urls: set[str]) -> list[str]:
         """Return a deterministic, redacted URL list for persisted crawl artifacts."""
@@ -195,8 +281,8 @@ class WebCrawler:
             except Exception:
                 in_scope = False
             if in_scope:
-                self.discovered_urls.add(seed_url)
-                queue.append((seed_url, 1))
+                self._record_discovered_url(seed_url)
+                self._enqueue(queue, seed_url, 1)
         while queue:
             if len(self.visited_urls) >= self.max_pages:
                 logger.info("Max pages limit reached (%d)", self.max_pages)
@@ -245,14 +331,12 @@ class WebCrawler:
             # That LOST the original host/scheme. WebClient._build_url
             # then `urljoin(base_url + '/', path)` re-anchored every
             # discovered URL onto base_url's host. Concrete failure
-            # mode: a discovered link
-            # `https://api.example.com/v1/users` (a sub-host the
-            # operator wanted in scope, e.g. assets.example.com or
-            # api.example.com under the same TARGET) was crawled as
-            # `<base_url>/v1/users` — wrong host, hits the wrong
-            # service, gets a 404 or worse cross-host data, and the
-            # actual sub-host endpoint is NEVER fetched even though
-            # the crawler thinks it covered it.
+            # mode: any absolute discovered link was silently refetched
+            # as `<base_url>/<its path>` — wrong resource on the wrong
+            # origin — while the client's scope check (strict
+            # scheme+host+port equality; sub-hosts are ALWAYS out of
+            # scope) never got to see, and reject, the real off-origin
+            # URL.
             #
             # Pass the full URL. `WebClient._build_url(url)` does
             # `urljoin(base_url+'/', url)` which preserves the
@@ -315,8 +399,17 @@ class WebCrawler:
                 body = body[:_BS4_MAX_BYTES]
             soup = BeautifulSoup(body, "html.parser")
 
-            # Discover links
+            # Discover links. Per-page cap: one hostile page can carry
+            # hundreds of thousands of anchors inside the 16 MiB parse
+            # cap; nothing downstream can consume more than this many
+            # from a single page.
+            page_links = 0
             for link in soup.find_all("a", href=True):
+                if page_links >= _MAX_LINKS_PER_PAGE:
+                    self._warn_truncation(
+                        "per-page links", _MAX_LINKS_PER_PAGE,
+                    )
+                    break
                 href = link["href"]
                 if not isinstance(href, str):
                     continue
@@ -351,29 +444,46 @@ class WebCrawler:
                 # and silently passes ``http://base.com`` JS-
                 # discovered downgrades when base is ``https://``.
                 if self.client._is_in_scope(absolute_url):
-                    self.discovered_urls.add(absolute_url)
+                    page_links += 1
+                    if not self._record_discovered_url(absolute_url):
+                        continue
 
                     # Extract parameters from URL
                     parsed = urlparse(absolute_url)
                     if parsed.query:
-                        params = parse_qs(parsed.query)
-                        self.discovered_parameters.update(params.keys())
-                        for param_name in params:
-                            self.parameter_urls.setdefault(
-                                param_name, set(),
-                            ).add(absolute_url)
+                        for param_name in parse_qs(parsed.query):
+                            self._record_parameter(
+                                param_name, absolute_url,
+                            )
 
                     # Enqueue for the BFS loop (or fall through
                     # if no queue — legacy single-page caller).
-                    if _queue is not None and absolute_url not in self.visited_urls:
-                        _queue.append((absolute_url, depth + 1))
+                    self._enqueue(_queue, absolute_url, depth + 1)
 
-            # Discover forms
+            # Discover forms — dedup by (action, method, field names,
+            # hidden-value fingerprint): the same form rendered on many
+            # pages is ONE fuzz target, but two forms distinguished only
+            # by hidden VALUES (mode=delete vs mode=upload) are distinct
+            # handlers and must both survive. Visible-field values stay
+            # out of the key (user-fillable variance must not defeat the
+            # dedup), and so do anti-forgery hidden values (csrf/nonce/
+            # state and secret-named fields rotate per page — keying on
+            # them would reopen the budget exhaustion on exactly the
+            # site-wide CSRF-protected form the dedup exists for).
             for form in soup.find_all("form"):
                 form_data = self._parse_form(form, url)
                 if form_data:
-                    self.discovered_forms.append(form_data)
-                    self.discovered_parameters.update(form_data["inputs"].keys())
+                    key = (
+                        form_data["action"],
+                        form_data["method"],
+                        tuple(sorted(form_data["inputs"])),
+                        self._hidden_value_fingerprint(form_data["inputs"]),
+                    )
+                    if key not in self._seen_form_keys:
+                        self._seen_form_keys.add(key)
+                        self.discovered_forms.append(form_data)
+                    for input_name in form_data["inputs"]:
+                        self._record_parameter(input_name)
 
             # Discover API endpoints from JavaScript
             for script in soup.find_all("script"):
@@ -407,11 +517,42 @@ class WebCrawler:
                 self._crawl_log_label(url), type(e).__name__
             )
 
+    def _hidden_value_fingerprint(
+        self, inputs: dict,
+    ) -> tuple[tuple[str, str], ...]:
+        """Sorted (name, value) pairs of the DISCRIMINATING hidden inputs.
+
+        Hidden values are the only place two same-shaped forms can
+        differ in what handler they reach (mode=delete vs mode=upload),
+        so they join the dedup key — except anti-forgery material
+        (csrf/nonce/state and secret-named fields, via the same
+        classifier the artifact redaction uses): those rotate per page
+        and would make every copy of a CSRF-protected form look unique.
+        """
+        pairs = []
+        for name, metadata in inputs.items():
+            meta = metadata if isinstance(metadata, dict) else {}
+            if str(meta.get("type", "")).strip().lower() != "hidden":
+                continue
+            if self._is_sensitive_form_input(name, meta):
+                continue
+            pairs.append((str(name), str(meta.get("value", ""))))
+        return tuple(sorted(pairs))
+
+    # The only methods an HTML form can submit with; anything else in
+    # the attribute (per the HTML spec, and per hostile pages — bs4
+    # entity-decodes `&#10;` into a live newline that would ride the
+    # discovered method into downstream artifacts) is invalid and
+    # defaults to GET.
+    _FORM_METHODS = frozenset({"GET", "POST"})
+
     def _parse_form(self, form_element, page_url: str) -> dict | None:
         """Parse HTML form to extract inputs and action."""
         try:
             action = form_element.get("action", "")
-            method = form_element.get("method", "GET").upper()
+            method = str(form_element.get("method", "GET") or "GET").strip().upper()
+            if method not in self._FORM_METHODS:
+                method = "GET"
             absolute_action = urljoin(page_url, action)
 
             inputs = {}
@@ -490,7 +631,8 @@ class WebCrawler:
                     # ignores scheme. _is_in_scope compares the
                     # (scheme, hostname, port) triple.
                     if self.client._is_in_scope(absolute_url):
-                        self.discovered_urls.add(absolute_url)
+                        if not self._record_discovered_url(absolute_url):
+                            continue
                         # Classify as an API candidate now (static
                         # discovery — no response shape yet; crawling
                         # the URL refines it via
@@ -503,9 +645,7 @@ class WebCrawler:
                                 "response_keys": [],
                                 "source": "js-static",
                             })
-                        if (_queue is not None
-                                and absolute_url not in self.visited_urls):
-                            _queue.append((absolute_url, depth + 1))
+                        self._enqueue(_queue, absolute_url, depth + 1)
                         logger.debug(
                             "Found API endpoint in JS: %s", self._crawl_log_label(absolute_url)
                         )

@@ -1,0 +1,626 @@
+#!/usr/bin/env python3
+"""Tests for the operator verbs over the finding-verdict store."""
+
+import tempfile
+import time
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+from core.sage import rowmac
+
+# Point the row-MAC key at a module-scoped temp directory so tests
+# never touch the checkout's .sage/ state (same pattern as
+# test_sage_hooks.py).
+_key_tmp = None
+_key_patch = None
+
+
+def setUpModule():
+    global _key_tmp, _key_patch
+    _key_tmp = tempfile.TemporaryDirectory()
+    key_path = Path(_key_tmp.name) / "rowmac.key"
+    _key_patch = patch("core.sage.rowmac._key_path", return_value=key_path)
+    _key_patch.start()
+
+
+def tearDownModule():
+    _key_patch.stop()
+    _key_tmp.cleanup()
+
+
+REPO = "/repo/x"
+RULE = "py/sql-injection"
+FILE = "src/db.py"
+FN = "run_query"
+
+
+class _Memory:
+    def __init__(self, memory_id, content, domain_tag, status=None):
+        self.memory_id = memory_id
+        self.content = content
+        self.domain_tag = domain_tag
+        if status is not None:
+            self.status = status
+
+
+class FakeOperatorClient:
+    """Fake of the SageClient wrapper surface the operator verbs use:
+    ``list_memories(limit, offset)`` pages + ``forget(id, reason)`` +
+    ``propose(...)`` (via store_finding_verdict)."""
+
+    def __init__(self, memories):
+        self.memories = list(memories)
+        self.forgotten = []
+        self.proposed = []
+        self.domain_requests = []
+
+    def list_memories(self, limit=200, offset=0, domain=None):
+        self.domain_requests.append(domain)
+        rows = self.memories
+        if domain is not None:
+            rows = [m for m in rows
+                    if getattr(m, "domain_tag", None) == domain]
+        page = rows[offset:offset + limit]
+        return types.SimpleNamespace(memories=page)
+
+    def forget(self, memory_id, reason=""):
+        self.forgotten.append((memory_id, reason))
+        return True
+
+    def propose(self, **kwargs):
+        self.proposed.append(kwargs)
+        return True
+
+
+def _stored_row(memory_id, verdict, src="abc123def456", note="", tool="smt"):
+    """Build a verdict row byte-identical to what the store hook
+    writes (content grammar + MAC over the decision fields).
+    ``tool`` mirrors the store's ``evidence_tool`` receipt (default a
+    verification-grade one so recall's skip gate passes; pass ``""``
+    for an unreceipted row)."""
+    from core.sage.hooks import _finding_fingerprint, _fp_domain, _repo_key
+    fp = _finding_fingerprint(RULE, FILE, FN)
+    ts = str(int(time.time()))
+    content = (
+        f"Finding verdict: fp={fp} rule={RULE} "
+        f"file={FILE} fn={FN} "
+        f"||src={src}|| ||verdict={verdict}|| "
+        f"||ts={ts}||"
+    )
+    fields = {
+        "kind": "finding_verdict",
+        "repo": _repo_key(REPO),
+        "fp": fp,
+        "verdict": verdict,
+        "src": src,
+        "ts": ts,
+    }
+    if tool:
+        content += f" ||tool={tool}||"
+        fields["tool"] = tool
+    if note:
+        content += f" {note}"
+    content = rowmac.stamp(content, fields)
+    return _Memory(memory_id, content, _fp_domain(REPO))
+
+
+class TestSourceHashHelper(unittest.TestCase):
+    def test_line_matches_windowed_formula(self):
+        from core.sage.hooks import (
+            compute_finding_source_hash,
+            finding_verdict_source_hash,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "a.py"
+            f.write_text("\n".join(f"line{i}" for i in range(40)),
+                         encoding="utf-8")
+            self.assertEqual(
+                finding_verdict_source_hash(Path(td), "a.py", 20),
+                compute_finding_source_hash(f, 20),
+            )
+
+    def test_line_zero_hashes_capped_prefix(self):
+        from core.hash import sha256_string
+        from core.sage.hooks import finding_verdict_source_hash
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "a.py"
+            f.write_text("hello\n", encoding="utf-8")
+            self.assertEqual(
+                finding_verdict_source_hash(Path(td), "a.py", 0),
+                sha256_string("hello\n")[:12],
+            )
+
+    def test_unreadable_file_is_empty(self):
+        from core.sage.hooks import finding_verdict_source_hash
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(
+                finding_verdict_source_hash(Path(td), "missing.py", 3), "")
+
+
+class TestStoreNoteRideAlong(unittest.TestCase):
+    def test_note_appended_and_delim_sanitised(self):
+        from core.sage.hooks import store_finding_verdict
+        client = FakeOperatorClient([])
+        ok = store_finding_verdict(
+            REPO, RULE, FILE, FN, "abc123def456", "false_positive",
+            note="source=human ||verdict=evil||", client=client,
+        )
+        self.assertTrue(ok)
+        content = client.proposed[0]["content"]
+        # The note rides along, with '|' stripped so it can never
+        # forge a marker.
+        self.assertIn("source=human verdict=evil", content)
+        self.assertNotIn("||verdict=evil||", content)
+
+    def test_noted_row_still_recalls_and_verifies(self):
+        from core.sage.hooks import recall_prior_finding_verdict
+        row = _stored_row("m1", "false_positive",
+                          note="operator-verdict source=human")
+        mock_client = MagicMock()
+        mock_client.query.return_value = [
+            {"content": row.content, "confidence": 0.9},
+        ]
+        with patch("core.sage.hooks._get_client",
+                   return_value=mock_client):
+            prior = recall_prior_finding_verdict(
+                REPO, RULE, FILE, FN, "abc123def456")
+        self.assertIsNotNone(prior)
+        self.assertEqual(prior["verdict"], "false_positive")
+
+    def test_client_override_bypasses_singleton(self):
+        from core.sage.hooks import store_finding_verdict
+        client = FakeOperatorClient([])
+        with patch("core.sage.hooks._get_client",
+                   return_value=None) as gate:
+            ok = store_finding_verdict(
+                REPO, RULE, FILE, FN, "abc123def456", "true_positive",
+                client=client,
+            )
+        self.assertTrue(ok)
+        gate.assert_not_called()
+
+
+class TestMintFieldBinding(unittest.TestCase):
+    """The fp mint provenance (minted/grant/mintctx) is MAC-bound.
+
+    Adversarial review confirmed the pre-binding residual: the mint
+    markers lived in free note text, so a stored row's authority
+    could be EDITED after the fact (ceremony → grant) without failing
+    verification. The markers now join the rowmac'd decision-field
+    set on rows that carry them — self-describing versioning, so
+    pre-mint rows (and every pipeline row) keep verifying — and any
+    post-hoc edit, strip, or graft fails MAC and demotes to hint
+    (fail direction: re-test). Honest bound: a same-user process that
+    can read rowmac.key re-mints at will; the binding raises forgery
+    from text-editing to key compromise, it is not unforgeability.
+    """
+
+    SRC = "abc123def456"
+    MINT = {"minted": "ceremony", "grant": "refused",
+            "mintctx": "tty=stdin,stdout,stderr;sid=inherited;"
+                       "envm=trusted;parents=bash,sshd"}
+
+    def _store(self, mint):
+        from core.sage.hooks import store_finding_verdict
+        client = FakeOperatorClient([])
+        ok = store_finding_verdict(
+            REPO, RULE, FILE, FN, self.SRC, "false_positive",
+            note="operator-verdict source=human", mint=mint,
+            client=client)
+        return ok, client
+
+    def _recall(self, content):
+        from core.sage.hooks import recall_prior_finding_verdict
+        mock_client = MagicMock()
+        mock_client.query.return_value = [
+            {"content": content, "confidence": 0.9},
+        ]
+        with patch("core.sage.hooks._get_client",
+                   return_value=mock_client):
+            return recall_prior_finding_verdict(
+                REPO, RULE, FILE, FN, self.SRC)
+
+    def test_mint_markers_stored_and_row_verifies(self):
+        ok, client = self._store(self.MINT)
+        self.assertTrue(ok)
+        content = client.proposed[0]["content"]
+        self.assertIn("||minted=ceremony||", content)
+        self.assertIn("||grant=refused||", content)
+        self.assertIn("||mintctx=", content)
+        self.assertIsNotNone(self._recall(content))
+
+    def test_posthoc_authority_edit_fails_mac(self):
+        # The confirmed tamper residual: rewrite a ceremony row as a
+        # grant row (or flip the recorded grant result). Both now
+        # fail verification.
+        _, client = self._store(self.MINT)
+        content = client.proposed[0]["content"]
+        self.assertIsNone(self._recall(
+            content.replace("||minted=ceremony||", "||minted=grant||")))
+        self.assertIsNone(self._recall(
+            content.replace("||grant=refused||", "||grant=granted||")))
+        self.assertIsNone(self._recall(
+            content.replace("envm=trusted", "envm=ssh")))
+
+    def test_stripping_the_markers_fails_mac(self):
+        # Downgrade attempt: remove the markers so the verifier
+        # rebuilds the ORIGINAL field set — the token was minted over
+        # more fields, so verification still fails.
+        _, client = self._store(self.MINT)
+        content = client.proposed[0]["content"]
+        stripped = content
+        for key in ("minted", "grant", "mintctx"):
+            import re as _re
+            stripped = _re.sub(
+                r" \|\|" + key + r"=[^|]+\|\|", "", stripped)
+        self.assertNotIn("||minted=", stripped)
+        self.assertIsNone(self._recall(stripped))
+
+    def test_duplicate_marker_append_fails_mac(self):
+        # The r2 re-verify shape: append a SECOND, contradictory
+        # marker after the legit row body, keeping the legit token.
+        # A first-match rebuild verified it while the row displayed
+        # both markers; duplicates are now tamper evidence.
+        _, client = self._store(self.MINT)
+        content = client.proposed[0]["content"]
+        clean, token = rowmac.strip(content)
+        appended = f"{clean} ||minted=grant|| [mac:{token}]"
+        self.assertIsNone(self._recall(appended))
+        # Same for the other two keys.
+        self.assertIsNone(self._recall(
+            f"{clean} ||grant=granted|| [mac:{token}]"))
+        self.assertIsNone(self._recall(
+            f"{clean} ||mintctx=envm=ssh|| [mac:{token}]"))
+        # Prepend variant stays failing too.
+        prepended = clean.replace(
+            "||minted=ceremony||",
+            "||minted=grant|| ||minted=ceremony||")
+        self.assertIsNone(self._recall(f"{prepended} [mac:{token}]"))
+
+    def test_duplicate_marker_row_flagged_in_listing(self):
+        from core.sage.hooks import list_finding_verdict_rows
+        _, store_client = self._store(self.MINT)
+        content = store_client.proposed[0]["content"]
+        clean, token = rowmac.strip(content)
+        dup = f"{clean} ||minted=grant|| [mac:{token}]"
+        client = FakeOperatorClient([_Memory("m-dup", dup, _domain())])
+        rows = list_finding_verdict_rows(
+            REPO, RULE, FILE, FN, client=client)
+        self.assertFalse(rows[0]["mac_verified"])
+
+    def test_grafting_markers_onto_premint_row_fails_mac(self):
+        row = _stored_row("m1", "false_positive", src=self.SRC)
+        clean, token = rowmac.strip(row.content)
+        grafted = (clean + " ||minted=ceremony|| ||grant=granted||"
+                   + f" [mac:{token}]")
+        self.assertIsNone(self._recall(grafted))
+
+    def test_premint_rows_still_verify(self):
+        # Versioning: rows without mint markers reconstruct the
+        # original field set — existing stores keep their effect.
+        row = _stored_row("m1", "false_positive", src=self.SRC)
+        self.assertIsNotNone(self._recall(row.content))
+
+    def test_malformed_mint_refuses_store(self):
+        from core.sage.hooks import store_finding_verdict
+        client = FakeOperatorClient([])
+        for bad in ({}, {"minted": ""}, {"bogus": "x"},
+                    {"minted": "ceremony", "bogus": "x"}):
+            ok = store_finding_verdict(
+                REPO, RULE, FILE, FN, self.SRC, "false_positive",
+                mint=bad, client=client)
+            self.assertFalse(ok, f"mint={bad!r} must refuse")
+        self.assertEqual(client.proposed, [])
+
+    def test_mint_values_delim_sanitised(self):
+        ok, client = self._store(
+            {"minted": "cere||mony", "grant": "refused"})
+        self.assertTrue(ok)
+        content = client.proposed[0]["content"]
+        self.assertIn("||minted=ceremony||", content)
+        self.assertIsNotNone(self._recall(content))
+
+    def test_listing_flags_tampered_mint_row(self):
+        from core.sage.hooks import list_finding_verdict_rows
+        _, store_client = self._store(self.MINT)
+        content = store_client.proposed[0]["content"]
+        tampered = content.replace(
+            "||minted=ceremony||", "||minted=grant||")
+        client = FakeOperatorClient([
+            _Memory("m-ok", content, _domain()),
+            _Memory("m-bad", tampered, _domain()),
+        ])
+        rows = list_finding_verdict_rows(
+            REPO, RULE, FILE, FN, client=client)
+        by_id = {r["memory_id"]: r for r in rows}
+        self.assertTrue(by_id["m-ok"]["mac_verified"])
+        self.assertFalse(by_id["m-bad"]["mac_verified"])
+
+
+def _domain():
+    from core.sage.hooks import _fp_domain
+    return _fp_domain(REPO)
+
+
+class TestListAndForget(unittest.TestCase):
+    def test_list_returns_rows_with_ids(self):
+        from core.sage.hooks import list_finding_verdict_rows
+        rows = [
+            _stored_row("m1", "false_positive"),
+            _stored_row("m2", "true_positive"),
+            _Memory("m3", "unrelated", "raptor-methodology"),
+        ]
+        client = FakeOperatorClient(rows)
+        got = list_finding_verdict_rows(
+            REPO, RULE, FILE, FN, client=client)
+        self.assertEqual(
+            {(r["memory_id"], r["verdict"]) for r in got},
+            {("m1", "false_positive"), ("m2", "true_positive")},
+        )
+        self.assertTrue(all(r["mac_verified"] for r in got))
+
+    def test_other_finding_rows_excluded(self):
+        from core.sage.hooks import (
+            _finding_fingerprint,
+            _fp_domain,
+            list_finding_verdict_rows,
+        )
+        # Same domain, different finding fingerprint.
+        other = _stored_row("m9", "false_positive")
+        other.content = other.content.replace(
+            f"fp={_finding_fingerprint(RULE, FILE, FN)}",
+            "fp=0000000000000000",
+        )
+        self.assertEqual(other.domain_tag, _fp_domain(REPO))
+        client = FakeOperatorClient([other])
+        self.assertEqual(
+            list_finding_verdict_rows(REPO, RULE, FILE, FN,
+                                      client=client),
+            [],
+        )
+
+    def test_tampered_row_listed_but_not_verified(self):
+        from core.sage.hooks import list_finding_verdict_rows
+        row = _stored_row("m1", "false_positive")
+        row.content = row.content.replace(
+            "||verdict=false_positive||", "||verdict=not_exploitable||")
+        client = FakeOperatorClient([row])
+        got = list_finding_verdict_rows(
+            REPO, RULE, FILE, FN, client=client)
+        self.assertEqual(len(got), 1)
+        self.assertFalse(got[0]["mac_verified"])
+
+    def test_note_text_is_inspectable(self):
+        from core.sage.hooks import list_finding_verdict_rows
+        row = _stored_row("m1", "false_positive",
+                          note="operator-verdict source=human "
+                               "provenance=interactive-tty")
+        client = FakeOperatorClient([row])
+        (got,) = list_finding_verdict_rows(
+            REPO, RULE, FILE, FN, client=client)
+        self.assertIn("source=human", got["note"])
+        self.assertIn("provenance=interactive-tty", got["note"])
+
+    def test_forget_suppressing_only(self):
+        from core.sage.hooks import (
+            SUPPRESS_VERDICTS,
+            forget_finding_verdicts,
+        )
+        client = FakeOperatorClient([
+            _stored_row("m1", "false_positive"),
+            _stored_row("m2", "not_exploitable"),
+            _stored_row("m3", "true_positive"),
+        ])
+        result = forget_finding_verdicts(
+            REPO, RULE, FILE, FN,
+            verdicts=SUPPRESS_VERDICTS, reason="tp", client=client)
+        self.assertEqual(result, (2, 0))
+        self.assertEqual({m for m, _ in client.forgotten}, {"m1", "m2"})
+
+    def test_forget_all_for_retest(self):
+        from core.sage.hooks import forget_finding_verdicts
+        client = FakeOperatorClient([
+            _stored_row("m1", "false_positive"),
+            _stored_row("m3", "exploitable"),
+        ])
+        result = forget_finding_verdicts(
+            REPO, RULE, FILE, FN, reason="retest", client=client)
+        self.assertEqual(result, (2, 0))
+
+    def test_refused_deprecations_are_counted(self):
+        # A server that refuses some deprecations must surface them —
+        # a surviving suppressing row reported as cleared is the
+        # false-success the fail-closed walk exists to prevent.
+        from core.sage.hooks import forget_finding_verdicts
+
+        class RefusingClient(FakeOperatorClient):
+            def forget(self, memory_id, reason=""):
+                if memory_id == "m2":
+                    return False
+                return super().forget(memory_id, reason=reason)
+
+        client = RefusingClient([
+            _stored_row("m1", "false_positive"),
+            _stored_row("m2", "not_exploitable"),
+        ])
+        result = forget_finding_verdicts(
+            REPO, RULE, FILE, FN, reason="retest", client=client)
+        self.assertEqual(result, (1, 1))
+
+    def test_unavailable_client_returns_none(self):
+        from core.sage.hooks import (
+            forget_finding_verdicts,
+            list_finding_verdict_rows,
+        )
+        with patch("core.sage.hooks.operator_client",
+                   return_value=None):
+            self.assertIsNone(
+                list_finding_verdict_rows(REPO, RULE, FILE, FN))
+            self.assertIsNone(
+                forget_finding_verdicts(REPO, RULE, FILE, FN))
+
+    def test_deprecated_rows_neither_list_nor_reclear(self):
+        # Deprecation is the server's soft-delete (what the forget
+        # verb performs): a cleared row must not re-list as live, and
+        # a retest must not count re-deprecating it as new work.
+        from core.sage.hooks import (
+            forget_finding_verdicts,
+            list_finding_verdict_rows,
+        )
+        def rows():
+            gone = _stored_row("m2", "false_positive")
+            gone.status = "deprecated"
+            return [_stored_row("m1", "false_positive"), gone]
+        got = list_finding_verdict_rows(
+            REPO, RULE, FILE, FN, client=FakeOperatorClient(rows()))
+        self.assertEqual([r["memory_id"] for r in got], ["m1"])
+        client = FakeOperatorClient(rows())
+        result = forget_finding_verdicts(
+            REPO, RULE, FILE, FN, reason="retest", client=client)
+        self.assertEqual(result, (1, 0))
+        self.assertEqual([m for m, _ in client.forgotten], ["m1"])
+
+    def test_enum_shaped_status_is_folded(self):
+        # SDK statuses arrive as enum members carrying .value.
+        import enum
+
+        class _St(enum.Enum):
+            DEPRECATED = "deprecated"
+
+        from core.sage.hooks import list_finding_verdict_rows
+        row = _stored_row("m1", "false_positive")
+        row.status = _St.DEPRECATED
+        self.assertEqual(
+            list_finding_verdict_rows(
+                REPO, RULE, FILE, FN, client=FakeOperatorClient([row])),
+            [])
+
+    def test_status_rides_in_listed_rows(self):
+        from core.sage.hooks import list_finding_verdict_rows
+        row = _stored_row("m1", "false_positive")
+        row.status = "committed"
+        (got,) = list_finding_verdict_rows(
+            REPO, RULE, FILE, FN, client=FakeOperatorClient([row]))
+        self.assertEqual(got["status"], "committed")
+
+    def test_walk_requests_the_fp_domain_server_side(self):
+        # The store can hold far more rows than the walk's page cap;
+        # asking the server to filter on the fp domain keeps the walk
+        # paging the repo's rows, not the whole store.
+        from core.sage.hooks import _fp_domain, list_finding_verdict_rows
+        client = FakeOperatorClient([_stored_row("m1", "false_positive")])
+        list_finding_verdict_rows(REPO, RULE, FILE, FN, client=client)
+        self.assertEqual(client.domain_requests, [_fp_domain(REPO)])
+
+    def test_multi_page_walk_collects_all_rows(self):
+        from core.sage.hooks import list_finding_verdict_rows
+        rows = [_stored_row(f"m{i}", "false_positive")
+                for i in range(250)]
+        client = FakeOperatorClient(rows)
+        got = list_finding_verdict_rows(
+            REPO, RULE, FILE, FN, client=client)
+        self.assertEqual(len(got), 250)
+
+    def test_stalled_pagination_terminates_on_legacy_server(self):
+        from core.sage.hooks import list_finding_verdict_rows
+
+        class StallingClient(FakeOperatorClient):
+            def list_memories(self, limit=200, offset=0,
+                              domain=None):
+                # Server ignores offset — always the same full page;
+                # no has_more (legacy shape).
+                return types.SimpleNamespace(
+                    memories=self.memories[:limit])
+
+        rows = [_stored_row(f"m{i}", "false_positive")
+                for i in range(250)]
+        client = StallingClient(rows)
+        got = list_finding_verdict_rows(
+            REPO, RULE, FILE, FN, client=client)
+        # READ path: first page yields; the repeated page has zero
+        # NEW rows and the server claims no more, so the walk ends
+        # without looping (raptor-sage's own fetch convention).
+        self.assertEqual(len(got), 200)
+        # CLEARING verbs: the same legacy full-page stall is
+        # indistinguishable from truncation — a verb that then
+        # reports "cleared" must fail closed instead. Nothing is
+        # deprecated.
+        from core.sage.hooks import (
+            VerdictWalkTruncated,
+            forget_finding_verdicts,
+        )
+        client2 = StallingClient(rows)
+        with self.assertRaises(VerdictWalkTruncated):
+            forget_finding_verdicts(REPO, RULE, FILE, FN,
+                                    client=client2)
+        self.assertEqual(client2.forgotten, [])
+
+    def test_server_capped_pages_with_has_more_walk_to_the_end(self):
+        # A server that caps pages BELOW our limit must not end the
+        # walk on the short page while has_more says keep going.
+        from core.sage.hooks import list_finding_verdict_rows
+
+        class CappedClient(FakeOperatorClient):
+            def list_memories(self, limit=200, offset=0,
+                              domain=None):
+                page = self.memories[offset:offset + 100]
+                return types.SimpleNamespace(
+                    memories=page,
+                    has_more=(offset + 100) < len(self.memories),
+                )
+
+        rows = [_stored_row(f"m{i}", "false_positive")
+                for i in range(250)]
+        client = CappedClient(rows)
+        got = list_finding_verdict_rows(
+            REPO, RULE, FILE, FN, client=client)
+        self.assertEqual(len(got), 250)
+
+    def test_stall_with_has_more_fails_closed(self):
+        # A walk that cannot cover the store must raise, never hand
+        # back a partial view — the consumers CLEAR rows based on it.
+        from core.sage.hooks import (
+            VerdictWalkTruncated,
+            forget_finding_verdicts,
+            list_finding_verdict_rows,
+        )
+
+        class BrokenClient(FakeOperatorClient):
+            def list_memories(self, limit=200, offset=0,
+                              domain=None):
+                return types.SimpleNamespace(
+                    memories=self.memories[:limit], has_more=True)
+
+        rows = [_stored_row(f"m{i}", "false_positive")
+                for i in range(10)]
+        client = BrokenClient(rows)
+        with self.assertRaises(VerdictWalkTruncated):
+            list_finding_verdict_rows(REPO, RULE, FILE, FN,
+                                      client=client)
+        # forget enumerates BEFORE clearing: nothing was deprecated.
+        client2 = BrokenClient(rows)
+        with self.assertRaises(VerdictWalkTruncated):
+            forget_finding_verdicts(REPO, RULE, FILE, FN,
+                                    client=client2)
+        self.assertEqual(client2.forgotten, [])
+
+    def test_listing_failure_mid_walk_fails_closed(self):
+        from core.sage.hooks import (
+            VerdictWalkTruncated,
+            list_finding_verdict_rows,
+        )
+
+        class FailingClient(FakeOperatorClient):
+            def list_memories(self, limit=200, offset=0,
+                              domain=None):
+                return None  # wrapper's degradation shape
+
+        with self.assertRaises(VerdictWalkTruncated):
+            list_finding_verdict_rows(REPO, RULE, FILE, FN,
+                                      client=FailingClient([]))
+
+
+if __name__ == "__main__":
+    unittest.main()

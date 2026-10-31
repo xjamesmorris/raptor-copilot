@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from core.analysis.lifecycle_field_discovery import (
     _extract_class_fields_java,
     _extract_class_fields_python,
@@ -292,7 +294,8 @@ int check(struct big *b) {
         fields = discover_state_fields(checklist, tmp_path, top_n=3, min_score=0.1)
         assert len(fields) <= 3
 
-    def test_deduplicates_across_files(self, tmp_path):
+    def test_same_named_structs_in_different_files_stay_distinct(
+            self, tmp_path):
         src = """\
 struct ctx {
     int refcount;
@@ -311,7 +314,12 @@ int ctx_get(struct ctx *c) {
         checklist = {"files": [{"path": "a.c"}, {"path": "b.c"}]}
         fields = discover_state_fields(checklist, tmp_path, min_score=0.1)
         refcount_fields = [f for f in fields if f.name == "refcount"]
-        assert len(refcount_fields) == 1
+        # Same-named structs in different files are DIFFERENT types;
+        # collapsing them dropped one file's read/write sites. Within
+        # one file the (file, struct, name) key still deduplicates.
+        assert len(refcount_fields) == 2
+        assert {f.read_sites[0].file for f in refcount_fields} \
+            == {"a.c", "b.c"}
 
     def test_write_sites_populated(self, tmp_path):
         src = """\
@@ -336,3 +344,132 @@ int get(struct s *p) {
             assert len(f.write_sites) >= 1
             assert len(f.read_sites) >= 1
             assert f.write_sites[0].file == "s.c"
+
+
+class TestHostileSourceScale:
+    @pytest.mark.slow
+    def test_unclosed_struct_heads_are_not_quadratic(self):
+        # N unclosed 'struct a{' heads made the per-struct forward
+        # scan re-walk to EOF each time (~78s at n=8000 pre-fix).
+        import time
+        from core.analysis.lifecycle_field_discovery import (
+            _extract_struct_fields_c,
+        )
+        n = 8000
+        src = "struct a{ " * n
+        t0 = time.monotonic()
+        _extract_struct_fields_c(src)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 3.0, f"{elapsed:.1f}s at n={n}"
+
+    @pytest.mark.slow
+    def test_many_python_classes_are_not_quadratic(self):
+        import time
+        from core.analysis.lifecycle_field_discovery import (
+            _extract_class_fields_python,
+        )
+        n = 16000
+        src = "".join(
+            f"class C{i}:\n    def __init__(self):\n"
+            f"        self.x{i} = 1\n" for i in range(n))
+        t0 = time.monotonic()
+        out = _extract_class_fields_python(src)
+        elapsed = time.monotonic() - t0
+        assert len(out) == n
+        assert elapsed < 3.0, f"{elapsed:.1f}s at n={n}"
+
+    def test_closed_struct_extraction_unchanged(self):
+        # Behavior equivalence for the one-pass brace matcher.
+        from core.analysis.lifecycle_field_discovery import (
+            _extract_struct_fields_c,
+        )
+        src = (
+            "struct outer {\n"
+            "    int a;\n"
+            "    struct inner { int b; } nested;\n"
+            "};\n"
+            "struct second { char *name; };\n"
+        )
+        out = _extract_struct_fields_c(src)
+        assert "a" in out.get("outer", [])
+        assert out.get("second") == ["name"]
+
+    def test_unclosed_struct_is_skipped(self):
+        # Malformed head: no body attribution (refusal direction) —
+        # attributing a to-EOF body was also the quadratic driver.
+        from core.analysis.lifecycle_field_discovery import (
+            _extract_struct_fields_c,
+        )
+        out = _extract_struct_fields_c("struct t {\n    int a;\n")
+        assert out == {}
+
+    def test_oversized_file_is_skipped(self, tmp_path):
+        from core.analysis import lifecycle_field_discovery as lfd
+        big = tmp_path / "big.c"
+        big.write_text(
+            "struct s { int val; };\n" + "x" * (lfd._MAX_SOURCE_BYTES + 1),
+            encoding="utf-8")
+        checklist = {"files": [{"path": "big.c"}]}
+        assert lfd.discover_state_fields(
+            checklist, tmp_path, min_score=0.0) == []
+
+
+class TestCFieldWhitespaceRun:
+    def test_field_token_run_is_fast(self):
+        """Hostile struct body of field-shaped tokens with no ';':
+        the previous spelling chained overlapping whitespace-capable
+        spans around optional atoms — cubic in the body length. The
+        bounded type window with gated atoms is linear."""
+        from core.analysis.lifecycle_field_discovery import _C_FIELD_RE
+        from core.testing.wallclock import cpu_budget
+
+        hostile = "unsigned x" + " " * (1 << 16) + "!"
+        with cpu_budget(1.0, what="field token-run scan"):
+            assert _C_FIELD_RE.search(hostile) is None
+
+    def test_field_forms_still_match(self):
+        from core.analysis.lifecycle_field_discovery import _C_FIELD_RE
+
+        for decl, name in (
+            ("unsigned long flags;", "flags"),
+            ("struct page *first_page;", "first_page"),
+            ("const char * name ;", "name"),
+            ("atomic_t _refcount;", "_refcount"),
+            ("int arr[MAX] ;", "arr"),
+        ):
+            m = _C_FIELD_RE.search(decl)
+            assert m is not None, decl
+            assert m.group(2) == name, (decl, m.groups())
+
+
+class TestQuadraticRunFixtures:
+    def test_class_line_and_java_field_runs_are_fast(self):
+        """Hostile shapes for the remaining discovery patterns: a
+        'class'-opening line with a long word run and no colon, and a
+        modifier-led token run with no terminator. Both quadratic
+        with the previous spellings; linear now."""
+        from core.analysis.lifecycle_field_discovery import (
+            _JAVA_FIELD_RE,
+            _PY_CLASS_RE,
+        )
+        from core.testing.wallclock import cpu_budget
+
+        with cpu_budget(1.0, what="class-line word run"):
+            assert _PY_CLASS_RE.search(
+                "class A" + "a" * 200000,
+            ) is None
+        with cpu_budget(1.0, what="java-field token run"):
+            assert _JAVA_FIELD_RE.search(
+                "private x" + " " * (1 << 16) + "!",
+            ) is None
+
+    def test_discovery_forms_still_match(self):
+        from core.analysis.lifecycle_field_discovery import (
+            _JAVA_FIELD_RE,
+            _PY_CLASS_RE,
+        )
+
+        m = _PY_CLASS_RE.search("class Conn(Base):  \nx = 1\n")
+        assert m is not None and m.group(1) == "Conn"
+        m = _JAVA_FIELD_RE.search("private static final Map<K, V> cache;")
+        assert m is not None and m.group(2) == "cache"

@@ -9,6 +9,18 @@ documents WHY the call is safe (per library docs / known semantics) so
 reviewers can sanity-check the claim.  Keep the table small and well-
 justified; growth should be driven by concrete corpus cases.
 
+Immutable-return invariant: every transform entry's return value must
+be an IMMUTABLE value (str / str subclass; for C, a newly-allocated
+string the callee never retains).  The chain trackers and the
+sanitizer-cut value gate reason about NAME bindings only — they cannot
+see mutation through an alias.  A sanitizer returning a mutable
+container would let ``alias = clean_list; alias += [tainted]``
+re-taint the "sanitized" value while every name-level check still
+holds (the exclusivity condition would certify over the alias
+mutation).  Every current entry satisfies the invariant; reviewers
+must reject mutable-container-returning candidates or land
+alias-aware tracking first.
+
 Lookup contract:
   ``find(library_call: str, sink_class: str, language: str)`` returns
   the matching :class:`KnownSafeCall` entry or ``None``.  Matching is by
@@ -30,17 +42,24 @@ class KnownSafeCall:
 
     ``input_arg_kind`` distinguishes:
 
-      * ``"transform"`` — the call takes user input and returns the
-        sanitized value (e.g. ``html.escape(x)``).  The CHAIN must show
-        the return value (or a name assigned from it) reaching the sink.
-      * ``"validate"`` — the call validates user input and raises /
-        returns sentinel on bad input (e.g. ``werkzeug.security.safe_join``
-        raises ``NotFound`` on traversal).  Same chain requirement
-        applies to the return value.
+      * ``"transform"`` — the call's RETURN VALUE is the safe value
+        (e.g. ``html.escape(x)``).  The CHAIN must show the return
+        value (or a name assigned from it) reaching the sink; the
+        input variable itself is never constrained.
+      * ``"validate"`` — the call RAISES on bad input, so after it
+        returns the INPUT variable itself is constrained and stays the
+        chain start.  Raising is load-bearing: a validator that merely
+        returns a sentinel (``None``, ``False``) on bad input does NOT
+        constrain the input — control continues with the raw value
+        live — and MUST be classed ``"transform"`` instead (its safety
+        lives in the return value).  ``werkzeug.security.safe_join``
+        is the precedent: it returns ``None`` on traversal (only
+        Flask's ``flask.helpers.safe_join`` wrapper raises), so it is
+        a transform entry despite its validating flavour.
 
-    Both kinds are treated identically for chain checking — the
-    distinction is documented so reviewers can verify the semantic
-    claim matches the library's actual behaviour.
+    The chain-check consequences of the two kinds differ (input-start
+    vs binding-target-start) — reviewers must verify the raise/return
+    claim against the library's actual behaviour before picking a kind.
     """
     library_call: str
     sink_class: str
@@ -57,10 +76,16 @@ _TABLE: tuple[KnownSafeCall, ...] = (
         library_call="werkzeug.security.safe_join",
         sink_class="pathtrav",
         languages=("python",),
-        input_arg_kind="validate",
+        # transform, NOT validate: werkzeug's safe_join returns None on
+        # traversal — it does not raise (raising NotFound is Flask's
+        # flask.helpers.safe_join WRAPPER).  With no raise the input
+        # variable is unconstrained after the call, so only the RETURN
+        # value may start the chain; the None return cannot traverse (a
+        # path sink consuming None fails with TypeError, not escape).
+        input_arg_kind="transform",
         soundness_note=(
-            "werkzeug.security.safe_join (since werkzeug 0.5) raises "
-            "NotFound if the joined path escapes the base directory or "
+            "werkzeug.security.safe_join (since werkzeug 0.5) returns "
+            "None if the joined path escapes the base directory or "
             "contains traversal sequences.  Return value, when not None, "
             "is provably inside the base directory."
         ),
@@ -137,7 +162,12 @@ _TABLE: tuple[KnownSafeCall, ...] = (
             "shlex.quote returns a shell-escaped string safe to "
             "interpolate into a shell command (single-quoted, with "
             "embedded single quotes escaped).  Sound for shell=True "
-            "subprocess invocations."
+            "subprocess invocations ONLY — quoting does not neutralize "
+            "argument-position injection (CWE-88): a quoted value used "
+            "as one argv element still parses as an option "
+            "(quote('-rf') == '-rf'), so this entry belongs to the "
+            "cmdi (shell-string) sink class and must never be "
+            "catalogued for the argv-context class (cmdi_argv)."
         ),
     ),
     # ------------------------------------------------------------------
@@ -326,18 +356,16 @@ _TABLE: tuple[KnownSafeCall, ...] = (
             "(by extension) HTML-safe for text content."
         ),
     ),
-    KnownSafeCall(
-        library_call="g_uri_escape_string",
-        sink_class="pathtrav",
-        languages=("c", "cpp"),
-        input_arg_kind="transform",
-        soundness_note=(
-            "GLib g_uri_escape_string (since GLib 2.16) percent-encodes "
-            "every byte that isn't in the user-supplied reserved set, "
-            "by default escaping path separators and traversal sequences. "
-            "Returns a newly-allocated URI-safe string."
-        ),
-    ),
+    # NB: g_uri_escape_string is DELIBERATELY absent from pathtrav:
+    # per RFC 3986 (and GLib's implementation) '.' is UNRESERVED and
+    # never percent-encoded, so the traversal sequence ".." passes
+    # through verbatim — joined under a base directory it escapes one
+    # level. The call does escape '/' (unless caller-allowed), but the
+    # pathtrav danger model includes '.' for exactly this dot-segment
+    # reason, so a separator-only claim cannot certify the sink class.
+    # Same precedent as the FilenameUtils.getName exclusion above: a
+    # sound pathtrav transform needs dot-segment stripping, which no
+    # percent-encoder provides.
     KnownSafeCall(
         library_call="g_shell_quote",
         sink_class="cmdi",

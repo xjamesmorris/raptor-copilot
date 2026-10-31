@@ -8,9 +8,49 @@ repo. Returns True if the caller should refuse to dispatch.
 
 **Distinct from cc_trust.** Claude Code config files
 (``.claude/settings.json``, ``.mcp.json``) go through ``cc_trust``;
-CodeQL pack files are loaded by the ``codeql`` binary itself during
-``codeql database create``, bypassing the CC trust path entirely.
-This module is the parallel check for the codeql side.
+this module is the parallel check for the codeql side.
+
+**Defense-in-depth, not an active channel.** Verified against CLI
+2.26.3 under RAPTOR's exact invocation (``database create
+--language=<lang> --source-root=<repo> --build-mode=none``, no pack
+search flags): the CLI does NOT consume repo-tree pack config at
+create time — planted ``qlpack.yml`` files (root, nested, dotted-dir)
+are read only as ordinary source data (TRAP/YAML extraction, source
+archive, line count); a bogus ``extractor:`` and a ``buildCommand:``
+canary produce no resolution, no execution, no log mention; directory
+symlinks are never traversed at all; ``.github/codeql/
+codeql-config.yml`` is consumed by the GitHub Action (or an explicit
+``--codescanning-config``), not by this invocation; caller cwd
+placement changes nothing (codeql launches its own children with
+cwd=source-root regardless). The gate stays because pack semantics
+are version-mobile and the scan is cheap. It becomes load-bearing
+again if ANY of these change:
+  - a target-repo-derived value reaches any codeql flag that steers
+    extractor/pack/config resolution — ``--search-path`` /
+    ``--additional-packs`` / ``--codescanning-config`` (every quoted
+    runtime site is pinned with value provenance by
+    ``.github/tests/test_codeql_pack_resolution_pins.py``), and the
+    same class includes ``--extractor-option(-file)`` and
+    ``--extra-tracing-config`` (unused anywhere today);
+  - a codeql CLI upgrade adds create-time workspace/pack discovery —
+    mechanically reminded: the version-anchor test fails once the
+    host CLI outruns ``PACK_PROBE_VERIFIED_CLI``; re-run
+    ``core/security/scripts/codeql-pack-probe`` and bump the anchor
+    on a clean pass;
+  - RAPTOR ever writes per-user codeql config (``~/.config/codeql/
+    config`` or ``CODEQL_CONFIG_FILE``): it injects default flags —
+    including the class above — into EVERY invocation. The env route
+    is already stripped by ``get_safe_env``; the file route needs a
+    HOME write, which an untrusted repo cannot do;
+  - traced builds are a DIFFERENT channel: build execution is either
+    operator-consented (the ``build`` trust marker / traced-build
+    flag) or loudly disclosed for languages with no buildless mode —
+    and a running build system subsumes anything a pack file could
+    add.
+For the same reason the walk's documented boundaries (directory
+symlinks listed-never-entered; dotted dirs pruned except
+``.github``) are accepted blind spots, not bypasses: codeql itself
+resolves nothing through them at create time.
 
 Files inspected:
     codeql-pack.yml         (recursive walk, capped)
@@ -42,20 +82,130 @@ system; trust must come from explicit operator intent).
 
 from __future__ import annotations
 
+import errno
 import logging
+import os
 import re
-import unicodedata
-from dataclasses import dataclass, field
 from pathlib import Path
 
-from core.security.capped_read import read_capped
+from core.security._trust_common import (
+    GIT_LINK_MAX_BYTES,
+    RAPTOR_DIR as _RAPTOR_DIR,
+    FileScan,
+    Finding,
+    is_registered_worktree_of_self as _is_registered_worktree_of_self,
+    mask as _mask,
+    read_git_link,
+    read_trust_config as _read_capped,
+    render_scan_report,
+    resolve_supplied_target,
+    safe_text as _safe,
+    truncate as _truncate,
+)
 
 try:
     import yaml
 except ImportError:  # pragma: no cover — yaml is a hard dep elsewhere
     yaml = None
 
+try:
+    # Shared hostile-YAML mechanisms (one home, not re-derived here):
+    # the quote-blind flow-depth pre-bound refuses loader-stack
+    # overflow BEFORE the parser sees the text, and
+    # PARSE_ESCAPE_ERRORS names the exception classes that escape
+    # PyYAML's own error type on hostile input (RecursionError from
+    # deep nesting, ValueError from CPython digit limits).
+    from packages.sca._yaml_fast import MAX_FLOW_DEPTH as _MAX_FLOW_DEPTH
+    from packages.sca._yaml_fast import _flow_depth_exceeded
+    from packages.sca.parsers._base import PARSE_ESCAPE_ERRORS as _YAML_ESCAPE_ERRORS
+except ImportError:  # pragma: no cover — packages/ ships beside core/
+    # Partial install: the load sites fail CLOSED (uninspectable →
+    # blocking finding), never open and never a crash.
+    _MAX_FLOW_DEPTH = 0
+    _flow_depth_exceeded = None  # type: ignore[assignment]
+    _YAML_ESCAPE_ERRORS = (RecursionError, ValueError)
+
 _logger = logging.getLogger(__name__)
+
+
+if yaml is not None:
+    class _AliasRefusingSafeLoader(yaml.SafeLoader):
+        """SafeLoader that refuses aliases (and with them merge keys).
+
+        Pack files have no legitimate use for anchors/aliases, and an
+        alias chain (``aN: &aN [*a(N-1),*a(N-1)]``) amplifies a
+        ~600-byte file into a 2^depth-node graph: ``safe_load`` shares
+        the aliased nodes cheaply, and the scanner's later ``str()``
+        on an aliased value materialises the full expansion —
+        OOM-killing the trust gate in the operator's process BEFORE
+        the verdict the gate exists to produce. Refusal surfaces as a
+        ``YAMLError``, which the load sites already treat as the
+        malformed-YAML blocking finding (fail closed, loud reason).
+
+        Pure-Python ``SafeLoader`` base deliberately: ``CSafeLoader``
+        composes in C where this hook never runs, and the pure loader
+        turns deep-nesting stack abuse into a catchable
+        ``RecursionError`` instead of a native stack overflow.
+        """
+
+        def compose_node(self, parent, index):  # type: ignore[no-untyped-def]
+            if self.check_event(yaml.events.AliasEvent):
+                raise yaml.YAMLError(
+                    "YAML alias refused (anchor/alias amplification — "
+                    "pack files have no legitimate use for aliases)"
+                )
+            return super().compose_node(parent, index)
+
+
+def _load_untrusted_yaml(raw: bytes):  # type: ignore[no-untyped-def]
+    """Bounded ``safe_load`` for attacker-supplied pack/config YAML.
+
+    Returns the loaded document; raises ``yaml.YAMLError`` on every
+    refusal (flow depth, aliases) so call sites keep their single
+    malformed-YAML fail-closed path. Callers must also catch
+    ``_YAML_ESCAPE_ERRORS`` — deep-nesting shapes below the pre-bound
+    can still surface as ``RecursionError`` from the pure-Python
+    loader.
+    """
+    if _flow_depth_exceeded is None:  # pragma: no cover — partial install
+        raise yaml.YAMLError(
+            "yaml hostile-input guards unavailable (partial install) — "
+            "refusing to inspect"
+        )
+    # Pre-scan on a lenient decode; the PARSE feed stays the original
+    # bytes so encoding strictness (ReaderError on bad UTF-8 → the
+    # blocking malformed-YAML path) is unchanged.
+    if _flow_depth_exceeded(raw.decode("utf-8", errors="replace")):
+        raise yaml.YAMLError(
+            f"flow nesting deeper than {_MAX_FLOW_DEPTH} — refusing to "
+            "load (deep flow nesting overflows the YAML loader stack)"
+        )
+    return yaml.load(raw, Loader=_AliasRefusingSafeLoader)
+
+
+def _scalar_or_shape_finding(
+    fs: FileScan, label: str, val: object,
+) -> str | None:
+    """Type gate before any ``str()`` on an attacker-chosen value.
+
+    Returns the value as ``str`` when it is a plain scalar; otherwise
+    appends a blocking ``(unrecognised shape)`` finding WITHOUT
+    stringifying the container (belt beside the alias refusal: no
+    code path materialises an attacker-shaped graph into a string)
+    and returns None.
+    """
+    if val is None:
+        # A null slot (``codeql/cpp-all:`` — dep with no version) is a
+        # legitimate scalar absence, not an attacker container.
+        return ""
+    if isinstance(val, (str, int, float, bool)):
+        return str(val)
+    fs.findings.append(Finding(
+        f"{label} (unrecognised shape)",
+        f"({type(val).__name__} value)",
+        True,
+    ))
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -72,55 +222,30 @@ def set_trust_override(val: bool) -> None:
     _trust_override_set = bool(val)
 
 
-# ---------------------------------------------------------------------------
-# Finding / FileScan dataclasses (parallel to cc_trust)
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class Finding:
-    """One labelled row in the per-file findings table."""
-    label: str
-    value: str
-    blocking: bool
-
-
-@dataclass
-class FileScan:
-    """Findings for one inspected file."""
-    path: Path
-    findings: list[Finding] = field(default_factory=list)
-
-    def has_blocking(self) -> bool:
-        return any(f.blocking for f in self.findings)
+# Finding / FileScan result shapes ship from the shared trust-gate
+# helper layer (core/security/_trust_common.py), re-exported here for
+# this gate's callers (see __all__).
 
 
 # ---------------------------------------------------------------------------
 # Constants + helpers
 # ---------------------------------------------------------------------------
 
-# packages/codeql/.. — three levels up from this file.
-_RAPTOR_DIR = Path(__file__).resolve().parents[2]
-
-# 1 MiB cap on pack files. Real codeql-pack.yml files are <10 KiB; the
-# cap exists to bound the YAML parser's memory exposure.
-_MAX_CONFIG_BYTES = 1_048_576
+# The newest codeql CLI release on which core/security/scripts/
+# codeql-pack-probe verified that `database create` consumes no
+# repo-tree pack config (the module docstring's defense-in-depth
+# premise). The version-anchor test
+# (.github/tests/test_codeql_cli_version_anchor.py) fails when the
+# host CLI is newer at major.minor granularity: re-run the probe;
+# bump this on exit 0; a probe exit 1 means the gate became
+# load-bearing — revisit the docstring and walk boundaries instead.
+PACK_PROBE_VERIFIED_CLI = "2.26.3"
 
 # Bound the recursive walk on pathological repos (vendored monorepos
 # with thousands of nested pack files). 200 hits + early break is
 # enough to catch any realistic pack layout while keeping the walk
 # bounded.
 _MAX_PACK_FILES = 200
-
-# U+2028/U+2029 line-separators slip past Cc/Cf categories but
-# render as newlines in terminals — strip them so output can't be
-# split by an attacker-supplied label.
-# Escaped spellings (matching cc_trust._EXTRA_STRIP): the literal
-# characters are invisible in an editor, so a reviewer cannot tell
-# the set from a pair of ordinary quoted blanks — and an accidental
-# "cleanup" to real spaces would silently disable the defence while
-# corrupting every space in sanitised output.
-_EXTRA_STRIP = frozenset({"\u2028", "\u2029"})
 
 # CodeQL's canonical (Microsoft-authored) pack namespace. Anything
 # outside this namespace is third-party and may carry custom
@@ -159,52 +284,51 @@ def _is_canonical_pack_ref(ref: str) -> bool:
     return True
 
 
-def _safe(s: str) -> str:
-    """Strip Unicode control/format chars and line/paragraph separators.
-    Same defence as cc_trust._safe — see that docstring for the threat
-    model (ANSI escapes, Trojan Source bidi, zero-width chars)."""
-    return "".join(
-        c if c == "\t" or (
-            c not in _EXTRA_STRIP
-            and unicodedata.category(c) not in ("Cc", "Cf")
-        ) else "?"
-        for c in s
-    )
+# _safe / _truncate / _mask (sanitise, bound, redact — the display
+# path every attacker-influencable value rides through), the U+2028/
+# U+2029 strip set, and _RAPTOR_DIR (repo-root self-scan skip) live in
+# the shared trust-gate helper layer; see core/security/
+# _trust_common.py for the threat model.
 
-
-def _truncate(s: str, limit: int = 80) -> str:
-    safe = _safe(s)
-    return safe[:limit] + "..." if len(safe) > limit else safe
-
-
-def _mask(s: str, keep: int = 8) -> str:
-    """Render a command-bearing config value without echoing it.
-
-    Scan output lands on stdout and from there in retained CI logs;
-    extractor / build-hook command lines can embed credentials in
-    their arguments. Keep a short identifying prefix, redact the
-    tail, show the length. Mirrors cc_trust._mask.
-    """
-    safe = _safe(s)
-    if not safe:
-        return "(empty)"
-    # A prefix of a value no longer than ``keep`` IS the value —
-    # fully redact rather than echo it whole.
-    prefix = safe[:keep] if 0 < keep < len(safe) else ""
-    return f"{prefix}*** ({len(safe)} chars)"
+# Operator-facing subject for this gate's shared renderer / resolve
+# gate — names what was scanned.
+_SCAN_SUBJECT = "CodeQL pack config"
 
 
 def _path_present(p: Path) -> bool:
+    # os.lstat, not pathlib exists()/is_symlink(): their OSError
+    # behavior is version-dependent (≤3.12 raises, 3.13+ swallows to
+    # False), and False on a probe error waved an uninspectable
+    # config file through as absent.
     try:
-        return p.is_symlink() or p.exists()
-    except OSError:
-        return False
+        os.lstat(p)
+        return True
+    except OSError as e:
+        if e.errno in (errno.ENOENT, errno.ENOTDIR):
+            return False
+        # EACCES/EIO/...: something is there in a form the probe
+        # cannot see. Report present — the per-file scanner then
+        # reads it, and an unreadable file is a blocking
+        # "oversized/unreadable" finding.
+        return True
 
 
-def _read_capped(path: Path) -> bytes | None:
-    """Read up to ``_MAX_CONFIG_BYTES``; delegates the hardened
-    open/read to :func:`core.security.capped_read.read_capped`."""
-    return read_capped(path, _MAX_CONFIG_BYTES)
+# ---------------------------------------------------------------------------
+# Self-recognition: registered worktrees of RAPTOR's own repo
+# ---------------------------------------------------------------------------
+
+# The recognition proof (trusted-side registry enumeration + the
+# bidirectional link check, fail closed everywhere) lives in the shared
+# trust-gate helper layer — core/security/_trust_common.py,
+# ``is_registered_worktree_of_self`` — so BOTH gates (this one and
+# cc_trust) run the SAME code and a fix lands once; the divergence
+# tripwire (test_trust_gate_crosspin.py) pins the identity. The gate's
+# own module-level ``_RAPTOR_DIR`` is passed at each call site, so the
+# existing monkeypatch seam keeps working. The aliases below keep the
+# historical names importable from this module
+# (test_codeql_trust_self_worktree.py imports _GIT_LINK_MAX_BYTES).
+_GIT_LINK_MAX_BYTES = GIT_LINK_MAX_BYTES
+_read_git_link = read_git_link
 
 
 # ---------------------------------------------------------------------------
@@ -227,8 +351,8 @@ def _scan_pack_file(path: Path) -> FileScan:
         )
         return fs
     try:
-        doc = yaml.safe_load(raw)
-    except yaml.YAMLError as e:
+        doc = _load_untrusted_yaml(raw)
+    except (yaml.YAMLError, *_YAML_ESCAPE_ERRORS) as e:
         fs.findings.append(
             Finding("malformed YAML", _truncate(str(e), 120), True)
         )
@@ -244,9 +368,11 @@ def _scan_pack_file(path: Path) -> FileScan:
     # an attacker-supplied repo could point it anywhere inside the
     # source root.
     if doc.get("extractor"):
-        fs.findings.append(
-            Finding("extractor", _mask(str(doc["extractor"])), True)
-        )
+        extractor = _scalar_or_shape_finding(fs, "extractor", doc["extractor"])
+        if extractor is not None:
+            fs.findings.append(
+                Finding("extractor", _mask(extractor), True)
+            )
 
     # dependencies: only the canonical ``codeql/`` namespace is allowed
     # without manual review. Third-party packs may bring their own
@@ -259,12 +385,21 @@ def _scan_pack_file(path: Path) -> FileScan:
     # walk every entry. An attacker who can write the pack chooses the
     # form, so we have to inspect both.
     deps = doc.get("dependencies")
+    dep_specs: list[tuple[str, str]] = []
     if isinstance(deps, dict):
-        dep_specs = [(str(n), str(v)) for n, v in deps.items()]
+        for n, v in deps.items():
+            name = _scalar_or_shape_finding(fs, "dependency name", n)
+            if name is None:
+                continue
+            ver = _scalar_or_shape_finding(fs, f"dependency {_truncate(name, 60)}", v)
+            dep_specs.append((name, ver if ver is not None else ""))
     elif isinstance(deps, list):
-        dep_specs = [(str(item), "") for item in deps]
-    else:
-        dep_specs = []
+        for item in deps:
+            name = _scalar_or_shape_finding(fs, "dependency entry", item)
+            if name is not None:
+                dep_specs.append((name, ""))
+    elif deps not in (None, {}, []):
+        _scalar_or_shape_finding(fs, "dependencies", deps)
     for n, v in dep_specs:
         if not _is_canonical_pack_ref(n):
             label = f"{n}: {v}" if v else n
@@ -279,8 +414,8 @@ def _scan_pack_file(path: Path) -> FileScan:
     # via ``../`` could also reference suites outside the pack.
     suite = doc.get("defaultSuiteFile")
     if suite:
-        s = str(suite)
-        if ".." in s or s.startswith("/"):
+        s = _scalar_or_shape_finding(fs, "defaultSuiteFile", suite)
+        if s is not None and (".." in s or s.startswith("/")):
             fs.findings.append(
                 Finding("defaultSuiteFile (escapes pack)",
                         _truncate(s, 120), True)
@@ -293,9 +428,9 @@ def _scan_pack_file(path: Path) -> FileScan:
     for key in ("buildCommand", "setup",
                 "preCompileScript", "postCompileScript"):
         if doc.get(key):
-            fs.findings.append(
-                Finding(key, _mask(str(doc[key])), True)
-            )
+            val = _scalar_or_shape_finding(fs, key, doc[key])
+            if val is not None:
+                fs.findings.append(Finding(key, _mask(val), True))
 
     return fs
 
@@ -315,8 +450,8 @@ def _scan_codeql_config(path: Path) -> FileScan:
         )
         return fs
     try:
-        doc = yaml.safe_load(raw)
-    except yaml.YAMLError as e:
+        doc = _load_untrusted_yaml(raw)
+    except (yaml.YAMLError, *_YAML_ESCAPE_ERRORS) as e:
         fs.findings.append(
             Finding("malformed YAML", _truncate(str(e), 120), True)
         )
@@ -349,11 +484,23 @@ def _scan_codeql_config(path: Path) -> FileScan:
     # queries: list of {uses: ...} OR string entries. External repo
     # references (``owner/repo`` or URL) bring in arbitrary queries
     # that can abuse extension functions during analysis.
+    #
+    # Accepted asymmetry, recorded: ``./local`` and single-segment
+    # in-repo suite refs pass while external refs block, though an
+    # in-repo suite wields the same arbitrary-QL power. Latent by
+    # construction — RAPTOR only ever runs ``database create``, which
+    # does not execute the config's query suites; the packs/extractor
+    # arms above cover what CREATE does consult. If a consumer ever
+    # runs ``database analyze`` with a repo config, in-repo query
+    # refs must start blocking too.
     queries = doc.get("queries")
     if queries:
         entries = queries if isinstance(queries, list) else [queries]
-        for e in entries:
-            uses = str(e.get("uses", "")) if isinstance(e, dict) else str(e)
+        for e in entries:  # type: ignore[misc]
+            raw_uses = e.get("uses", "") if isinstance(e, dict) else e
+            uses = _scalar_or_shape_finding(fs, "queries entry", raw_uses)
+            if uses is None:
+                continue
             # External: any path containing ``/`` that isn't a relative
             # local reference (``./`` or ``../``).
             if "/" in uses and not uses.startswith(("./", "../")):
@@ -364,9 +511,9 @@ def _scan_codeql_config(path: Path) -> FileScan:
     # manualBuildSteps / setup — subprocess invocation directives.
     for key in ("manualBuildSteps", "setup"):
         if doc.get(key):
-            fs.findings.append(
-                Finding(key, _mask(str(doc[key])), True)
-            )
+            val = _scalar_or_shape_finding(fs, key, doc[key])
+            if val is not None:
+                fs.findings.append(Finding(key, _mask(val), True))
 
     # pack-cache: redirects codeql's pack download cache to a custom
     # location. Used legitimately for offline / air-gapped builds, but
@@ -375,9 +522,11 @@ def _scan_codeql_config(path: Path) -> FileScan:
     # "downloads" (i.e. reads) packs from there. Block any value —
     # operator must opt in via --trust-repo if they need it.
     if doc.get("pack-cache"):
-        fs.findings.append(
-            Finding("pack-cache", _truncate(str(doc["pack-cache"]), 120), True)
-        )
+        val = _scalar_or_shape_finding(fs, "pack-cache", doc["pack-cache"])
+        if val is not None:
+            fs.findings.append(
+                Finding("pack-cache", _truncate(val, 120), True)
+            )
 
     return fs
 
@@ -404,33 +553,76 @@ def _scan_repo(resolved_path: str) -> tuple[tuple[FileScan, ...], bool]:
     # Skip RAPTOR's own repo — RAPTOR ships codeql packs under
     # packages/llm_analysis/codeql_packs/ that would always flag
     # if scanned. Operator running RAPTOR against itself is
-    # implicitly trusted.
-    if target == _RAPTOR_DIR:
+    # implicitly trusted. A git worktree of RAPTOR itself (e.g. a
+    # pristine source-only checkout used as an audit target) is the
+    # same trust domain — recognised strictly from RAPTOR's OWN
+    # worktree registry plus a bidirectional link check, fail closed
+    # (_is_registered_worktree_of_self).
+    if (target == _RAPTOR_DIR
+            or _is_registered_worktree_of_self(target, _RAPTOR_DIR)):
         return ((), False)
 
-    # Walk for pack files. Skip dotted dirs (e.g. ``.git``,
-    # ``.claude/worktrees``) except ``.github`` which holds
-    # codeql-config.yml legitimately. The cap is applied PER PATTERN so
-    # a flood of one filename cannot starve enumeration of the other.
+    # Walk for pack files. This pre-CodeQL trust gate faces hostile
+    # repos: one shipping ``dir -> /`` (or a symlink loop) must never
+    # steer the walk across the HOST filesystem — unbounded wall
+    # time, and out-of-repo qlpack.yml files surfacing as "repo"
+    # findings. ``pathlib``'s ``**`` recurses into directory symlinks
+    # only via 3.13's ``recurse_symlinks=True`` opt-in (it's
+    # ``glob.glob(recursive=True)`` that followed them by default);
+    # walking with ``os.walk(followlinks=False)`` keeps that refusal
+    # explicit: symlinked directories are listed but never entered.
+    # Dotted dirs (``.git``, ``.claude/worktrees``) are pruned at
+    # walk time except ``.github``, which holds codeql-config.yml
+    # legitimately — the same set the old post-match filter skipped
+    # (and pruned matches never counted toward the cap). Entries
+    # NAMED like a pack file that are symlinks or directories stay
+    # in the match set: the
+    # per-file scan below marks them blocking (symlink / unreadable),
+    # exactly as before. The cap is applied PER PATTERN so a flood of
+    # one filename cannot starve enumeration of the other.
     pack_files: list[Path] = []
     capped = False
+    # Walk errors are collected, never swallowed: os.walk's default is
+    # to skip an unlistable directory silently, so an unreadable (or
+    # mid-walk vanishing) subtree yielded a verdict computed from a
+    # knowably-incomplete enumeration — the same shape the pack-file
+    # cap already treats as blocking below.
+    walk_errors = 0
+
+    def _on_walk_error(e: OSError) -> None:
+        nonlocal walk_errors
+        walk_errors += 1
+        # Debug-tier locator (first few only): helps an operator find
+        # root-owned or damaged leftovers without a manual find. The
+        # blocking finding itself stays a count + fixed text — dir
+        # names from the walk are repo-controlled bytes.
+        if walk_errors <= 5:
+            _logger.debug(
+                "codeql trust: pack enumeration error: %s",
+                _safe(_truncate(str(getattr(e, "filename", None) or e),
+                                200)))
+
+    pattern_names = ("codeql-pack.yml", "qlpack.yml")
+    counts = dict.fromkeys(pattern_names, 0)
     try:
-        for name in ("codeql-pack.yml", "qlpack.yml"):
-            found_for_name = 0
-            for p in target.rglob(name):
-                if found_for_name >= _MAX_PACK_FILES:
-                    capped = True
-                    break
-                rel_parts = p.relative_to(target).parts
-                if any(
-                    part.startswith(".") and part != ".github"
-                    for part in rel_parts[:-1]
-                ):
+        for dirpath, dirnames, filenames in os.walk(
+            target, followlinks=False, onerror=_on_walk_error,
+        ):
+            dirnames[:] = sorted(
+                d for d in dirnames
+                if not d.startswith(".") or d == ".github"
+            )
+            entries = set(filenames).union(dirnames)
+            for name in pattern_names:
+                if name not in entries:
                     continue
-                pack_files.append(p)
-                found_for_name += 1
+                if counts[name] >= _MAX_PACK_FILES:
+                    capped = True
+                    continue
+                pack_files.append(Path(dirpath) / name)
+                counts[name] += 1
     except OSError:
-        pass
+        walk_errors += 1
 
     if capped:
         _logger.warning(
@@ -444,12 +636,19 @@ def _scan_repo(resolved_path: str) -> tuple[tuple[FileScan, ...], bool]:
     if _path_present(config_path):
         pack_files.append(config_path)
 
-    if not pack_files and not capped:
+    if not pack_files and not capped and not walk_errors:
         return ((), False)
 
     scans: list[FileScan] = []
     for path in pack_files:
-        if path.is_symlink():
+        # Guarded: pathlib is_symlink() raises on probe errors on
+        # ≤3.12. Unprobeable → not a symlink here; the per-file scan
+        # below then blocks on the unreadable content.
+        try:
+            _is_link = path.is_symlink()
+        except OSError:
+            _is_link = False
+        if _is_link:
             fs = FileScan(path=path)
             try:
                 tgt = str(path.readlink())
@@ -484,6 +683,22 @@ def _scan_repo(resolved_path: str) -> tuple[tuple[FileScan, ...], bool]:
         ))
         scans.append(capped_scan)
 
+    if walk_errors:
+        # Same fail-closed shape as scan_capped: an enumeration that
+        # skipped subtrees is not a verdict. Unreadable dirs can flip
+        # readable between this check and `codeql database create`
+        # (the mode-flip variant of the TOCTOU the no-cache docstring
+        # describes), so "couldn't look" must not read as "clean".
+        err_scan = FileScan(path=target)
+        err_scan.findings.append(Finding(
+            "scan_incomplete",
+            f"{walk_errors} directory error(s) during pack-file "
+            "enumeration (unreadable or vanished dirs) — uninspected "
+            "subtrees remain",
+            True,
+        ))
+        scans.append(err_scan)
+
     any_blocking = any(s.has_blocking() for s in scans)
     return (tuple(scans), any_blocking)
 
@@ -504,48 +719,26 @@ def check_repo_codeql_trust(
     """
     if not repo_path:
         return False
-    try:
-        resolved = str(Path(repo_path).resolve())
-    except (ValueError, OSError):
-        return False
     if trust_override is None:
         trust_override = _trust_override_set
+    # Fail-closed resolve+stat gate (shared helper layer): a SUPPLIED
+    # repo the checker cannot resolve or stat is refused, not waved
+    # through — the caller would otherwise go on to run `codeql
+    # database create` against the same spelling. The trust override
+    # downgrades to warn-and-proceed.
+    resolved, refuse = resolve_supplied_target(
+        repo_path, trust_override, subject=_SCAN_SUBJECT)
+    if resolved is None:
+        return refuse
     scans, any_blocking = _scan_repo(resolved)
     if scans:
         target = Path(resolved)
-        _render_scan_report(target, scans, any_blocking, trust_override)
+        # Rendering (core.security._trust_common.render_scan_report)
+        # stays separated from ``_scan_repo`` so the scan stays
+        # side-effect free.
+        render_scan_report(target, scans, any_blocking, trust_override,
+                           subject=_SCAN_SUBJECT)
     return any_blocking and not trust_override
-
-
-def _render_scan_report(
-    target: Path,
-    scans: tuple[FileScan, ...],
-    any_blocking: bool,
-    trust_override: bool,
-) -> None:
-    """Pure rendering — separated from ``_scan_repo`` so the scan stays
-    side-effect free."""
-    safe_target = _safe(str(target))
-    if any_blocking:
-        if trust_override:
-            print(f"raptor: {safe_target} has dangerous CodeQL pack config "
-                  f"(trust override active):")
-        else:
-            print(f"raptor: {safe_target} has dangerous CodeQL pack config:")
-    else:
-        print(f"raptor: {safe_target} has CodeQL pack config:")
-
-    for fs in scans:
-        try:
-            rel = fs.path.relative_to(target)
-        except ValueError:
-            rel = fs.path
-        print(f"  {_safe(str(rel))}")
-        if not fs.findings:
-            continue
-        label_w = max(len(f.label) for f in fs.findings) + 2
-        for f in fs.findings:
-            print(f"    {f.label:<{label_w}}{f.value}")
 
 
 __all__ = [

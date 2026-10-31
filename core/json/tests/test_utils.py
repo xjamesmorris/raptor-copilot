@@ -2,6 +2,7 @@
 
 import json
 import os
+import signal
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -647,9 +648,12 @@ class TestLoadJsonMaxBytes(unittest.TestCase):
 
 class TestLoadJsonWithCommentsHardening(unittest.TestCase):
     """Refusal semantics mirror ``load_json`` (non-strict): regular
-    files only, optional byte budget — both checked before any read,
-    so a planted FIFO (stats 0 bytes, then blocks the reader forever)
-    or an oversize file can never hang or bloat a config consumer."""
+    files only, optional byte budget — enforced on the OPEN fd via the
+    shared gated read, so a planted FIFO (stats 0 bytes, then blocks
+    the reader forever) or an oversize file can never hang or bloat a
+    config consumer, INCLUDING when the file is swapped or grown
+    between the existence check and the read (a by-name
+    stat-then-read gate loses exactly that race)."""
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "platform lacks mkfifo")
     def test_fifo_refused_without_reading(self):
@@ -680,6 +684,146 @@ class TestLoadJsonWithCommentsHardening(unittest.TestCase):
             p.write_text(json.dumps({"k": "v" * 100_000}))
             self.assertEqual(
                 load_json_with_comments(p)["k"], "v" * 100_000)
+
+
+# One process-wide audit hook, armed per test via _SWAP_HOOK. Audit
+# hooks cannot be unregistered, so a single shared hook is installed
+# once and stays disarmed (path=None → immediate return, no per-event
+# work beyond one dict lookup) outside the swap-window tests below.
+_SWAP_HOOK: dict = {"installed": False, "path": None, "action": None}
+
+
+def _arm_swap_hook(path: Path, action) -> None:
+    """Run *action* when the file at *path* is next opened.
+
+    This deterministically compresses the check-to-read race: the
+    "open" audit event fires after every BY-NAME pre-check has already
+    passed and before the open itself proceeds, exactly where a
+    concurrent writer would swap the file. The hook disarms itself
+    before running the action so the action's own file operations
+    cannot recurse."""
+    import sys as _sys
+
+    if not _SWAP_HOOK["installed"]:
+        def _hook(event: str, args: tuple) -> None:
+            if event != "open" or _SWAP_HOOK["path"] is None:
+                return
+            target = args[0]
+            if isinstance(target, bytes):
+                try:
+                    target = os.fsdecode(target)
+                except (UnicodeDecodeError, ValueError):
+                    return
+            if not isinstance(target, str) or target != _SWAP_HOOK["path"]:
+                return
+            hook_action = _SWAP_HOOK["action"]
+            _SWAP_HOOK["path"] = None
+            _SWAP_HOOK["action"] = None
+            if hook_action is not None:
+                hook_action()
+
+        _sys.addaudithook(_hook)
+        _SWAP_HOOK["installed"] = True
+    _SWAP_HOOK["path"] = str(path)
+    _SWAP_HOOK["action"] = action
+
+
+class TestLoadJsonWithCommentsSwapWindow(unittest.TestCase):
+    """The by-name gate's lost race, made deterministic: the file is
+    swapped at the moment of the open, after any by-name check has
+    passed. Both failure modes of the old window are pinned refused:
+    grow-past-budget (was: parsed whole, budget bypassed) and
+    swap-to-FIFO (was: reader blocked forever)."""
+
+    def tearDown(self):
+        _SWAP_HOOK["path"] = None
+        _SWAP_HOOK["action"] = None
+
+    def test_grow_after_check_refused(self):
+        with TemporaryDirectory() as d:
+            p = Path(d) / "cfg.json"
+            p.write_text('{"k": 1}')
+
+            def _grow() -> None:
+                p.write_text('{"k": "' + "x" * 100_000 + '"}')
+
+            _arm_swap_hook(p, _grow)
+            self.assertIsNone(load_json_with_comments(p, max_bytes=64))
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "platform lacks mkfifo")
+    @unittest.skipUnless(hasattr(signal, "SIGALRM"), "platform lacks SIGALRM")
+    def test_swap_to_fifo_refused_not_hung(self):
+        def _on_alarm(signum: int, frame) -> None:
+            msg = "load_json_with_comments blocked on a swapped-in FIFO"
+            raise AssertionError(msg)
+
+        with TemporaryDirectory() as d:
+            p = Path(d) / "cfg.json"
+            p.write_text('{"k": 1}')
+
+            def _swap_to_fifo() -> None:
+                p.unlink()
+                os.mkfifo(p)
+
+            _arm_swap_hook(p, _swap_to_fifo)
+            old = signal.signal(signal.SIGALRM, _on_alarm)
+            signal.alarm(30)
+            try:
+                self.assertIsNone(load_json_with_comments(p))
+            finally:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old)
+
+
+class TestReDatabaseMaxBytes(unittest.TestCase):
+    """RAPTOR_REDB_MAX_BYTES resolution: strict, warn-and-default on
+    garbage, never unlimited."""
+
+    def _resolve(self):
+        from core.json.utils import _resolve_re_database_max_bytes
+        return _resolve_re_database_max_bytes()
+
+    def test_default_when_unset(self):
+        from unittest.mock import patch
+        from core.json.utils import RE_DATABASE_MAX_BYTES_DEFAULT
+        with patch.dict(os.environ):
+            os.environ.pop("RAPTOR_REDB_MAX_BYTES", None)
+            self.assertEqual(self._resolve(), RE_DATABASE_MAX_BYTES_DEFAULT)
+        self.assertEqual(RE_DATABASE_MAX_BYTES_DEFAULT, 512 * 1024 * 1024)
+
+    def test_override_honored(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ,
+                        {"RAPTOR_REDB_MAX_BYTES": "1048576"}):
+            self.assertEqual(self._resolve(), 1048576)
+
+    def test_garbage_warns_and_falls_back(self):
+        from unittest.mock import patch
+        from core.json.utils import RE_DATABASE_MAX_BYTES_DEFAULT
+        # Zero and negatives are garbage too — they must never read
+        # as "unlimited".
+        for bad in ("lots", "1.5", "0", "-5", " "):
+            with patch.dict(os.environ,
+                            {"RAPTOR_REDB_MAX_BYTES": bad}):
+                with self.assertLogs("core.json.utils",
+                                     level="WARNING") as cm:
+                    value = self._resolve()
+            self.assertEqual(value, RE_DATABASE_MAX_BYTES_DEFAULT)
+            self.assertIn("RAPTOR_REDB_MAX_BYTES", "\n".join(cm.output))
+
+    def test_absurd_override_accepted_with_loud_warning(self):
+        """The override is the sanctioned large-memory escape hatch —
+        an absurd value is accepted, but loudly (a typo'd unit must
+        not pass silently)."""
+        from unittest.mock import patch
+        absurd = 65 * 1024 * 1024 * 1024
+        with patch.dict(os.environ,
+                        {"RAPTOR_REDB_MAX_BYTES": str(absurd)}):
+            with self.assertLogs("core.json.utils",
+                                 level="WARNING") as cm:
+                value = self._resolve()
+        self.assertEqual(value, absurd)
+        self.assertIn("64GiB", "\n".join(cm.output))
 
 
 if __name__ == "__main__":

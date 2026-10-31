@@ -25,19 +25,24 @@ matches the inline step comments in the function body):
     4. Bind-mounts system dirs (/usr, /lib, /lib64, /etc, /bin, /sbin)
        read-only into the new root. When an etc_overlay targets paths
        missing on the host, /etc becomes a tmpfs populated by a
-       breadth-first, budgeted copy of host /etc — /etc/skel (new-user
-       home templates; CI runner images stuff whole toolchains into
-       it) is never copied, and the copy stops at a total
-       bytes/entry budget rather than crawling a pathological host
-       /etc (see _copy_etc_tree).
-    5. rbind-mounts /dev and /sys from the host.
+       breadth-first, budgeted copy of host /etc — non-config
+       directories (skel, alternatives) are never copied, and the
+       copy stops at a total bytes/entry/wall-clock budget rather
+       than crawling a pathological host /etc (see _copy_etc_tree).
+    5. builds a minimal per-sandbox /dev (fresh tmpfs, per-node binds,
+       fresh devpts — never the host's pty slaves) and rbinds /sys.
     6. Bind-mounts host /proc (a fresh procfs would need a pid-ns first).
     7. Mounts fresh tmpfs at /run and /tmp for per-sandbox isolation
        (7b: re-creates inherited temp-dir env paths inside it).
     8. Bind-mounts target (read-only) and output (writable) at their
        ORIGINAL absolute paths (no caller argv rewriting needed);
        sub-steps 8a-8d: evidence-dir shadow, caller extra read-only
-       binds, host-fingerprint overlay, etc_overlay.
+       binds, host-fingerprint overlay, etc_overlay. Binds are
+       ordered ancestors-first across target/output/extra paths: a
+       mount attached later covers earlier mounts below it, so an
+       extra read-only bind naming an ancestor of the output dir
+       must mount BEFORE the rw output bind (see the ordering
+       invariant comment in the function body).
     9. pivot_root onto the new tmpfs.
 
 Shadow-paths that collide with per-ns mounts (/tmp, /dev, etc.) are
@@ -53,10 +58,111 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING, Optional
 
 from ._fork_safe_warn import warn_post_fork
-from .exit_codes import SANDBOX_EXIT_MOUNT_NS_BIND_FAIL
+from ._pathpin import canonical_bind_path, is_per_process_procfs
+from .preexec import _install_jitter
 
 # See core/sandbox/context.py (_BRANDED_TMP_RE) — same shape.
 _BRANDED_TMP_RE = re.compile(r"/[^/]*raptor[^/]*(/|$)", re.IGNORECASE)
+
+# Per-mount size caps for the sandbox's fresh tmpfs instances. A tmpfs
+# mounted without ``size=`` defaults to 50% of physical RAM — PER
+# MOUNT, pages charged to RAM+swap — so the previously uncapped
+# instances (/tmp, /run, /dev, /dev/shm, the pivot root) let confined
+# code drive the HOST into memory exhaustion from inside a "contained"
+# run: no escape needed, just writes. Together with the inode budgets
+# below, the caps turn any overrun into an early, attributable ENOSPC
+# inside the sandbox.
+#
+# Each cap carries the same deterministic per-install jitter as the
+# rlimit defaults (preexec._DEFAULT_LIMITS): the exact size tuple is a
+# statfs(2)-cheap fingerprint of this framework if published as a
+# constant. Jitter is surplus-only — never below the engineered floor.
+#
+# Sizing rationale (both directions, per mount):
+#  - too LOW breaks legitimate tooling loudly mid-run (ENOSPC from
+#    compilers/extractors spilling scratch, shm_open failures in
+#    multiprocessing/sanitizer runtimes);
+#  - too HIGH re-opens the RAM/swap-fill DoS the cap exists to close
+#    (the sum of all five caps bounds a sandbox's worst-case tmpfs
+#    footprint — keep it well under small-host RAM+swap).
+_TMPFS_SIZES_MB = {
+    # /tmp: the main scratch surface — builds, archive extraction,
+    # fuzzer corpora spill here. 4 GiB clears every observed tool's
+    # need while bounding the fill well under host RAM.
+    "tmp": _install_jitter("tmpfs_tmp_mb", 4096, 512),
+    # /dev/shm: POSIX shm / named semaphores (Python multiprocessing
+    # SemLock, sanitizer runtimes). 1 GiB is generous for tooling;
+    # host-default 50% RAM is fingerprintable and DoS-able.
+    "shm": _install_jitter("tmpfs_shm_mb", 1024, 128),
+    # /run: sockets and pidfiles only — small by contract.
+    "run": _install_jitter("tmpfs_run_mb", 64, 16),
+    # /dev: device-node stubs and symlinks only (see
+    # _mount_minimal_dev); nothing legitimate writes bulk data here.
+    "dev": _install_jitter("tmpfs_dev_mb", 8, 4),
+    # pivot root: holds mount-point directories — every real path is
+    # a stacked mount, so writes landing IN the root tmpfs itself are
+    # incidental droppings, not workloads.
+    "root": _install_jitter("tmpfs_root_mb", 64, 16),
+}
+
+# Per-mount inode budgets (``nr_inodes=``) for the same five mounts.
+# The kernel's inode limit is INDEPENDENT of ``size=`` and defaults to
+# half the physical RAM pages — PER MOUNT — so a size-capped tmpfs
+# still lets confined code create tens of millions of empty files,
+# each pinning on the order of 1 KB of UNSWAPPABLE kernel slab
+# (inode + dentry): empty-file spam pins gigabytes of host kernel
+# memory while df reports the mount at 0%. The budgets close that
+# hole; overrun is the same early, attributable ENOSPC as the size
+# caps. Same surplus-only per-install jitter (statfs f_files is as
+# fingerprint-cheap as f_blocks).
+#
+# Budget rationale (both directions, per mount):
+#  - too LOW breaks file-heavy legitimate workloads (AFL queue/.state
+#    dirs hold one file per interesting input — tens to hundreds of
+#    thousands; archive/corpus extraction similar) — budget /tmp, the
+#    scratch surface, generously;
+#  - too HIGH re-opens the slab-pinning DoS the budget exists to
+#    close (~1 KB of unswappable slab per inode: the sum of all five
+#    budgets bounds worst-case pinned slab at ~1 GiB).
+_TMPFS_INODES = {
+    # /tmp: the only file-COUNT-heavy surface (fuzzer queues, corpus
+    # and archive extraction). 1 Mi inodes ≈ ~1 GiB slab worst case —
+    # in line with its 4 GiB byte cap.
+    "tmp": _install_jitter("tmpfs_tmp_inodes", 1048576, 65536),
+    # /dev/shm: shm segments and named semaphores — hundreds at most
+    # in real tooling; 64 Ki is orders of magnitude of headroom.
+    "shm": _install_jitter("tmpfs_shm_inodes", 65536, 8192),
+    # /run, /dev, pivot root: sockets/pidfiles, node stubs, and
+    # mount-point skeleton — file counts in the dozens; 16 Ki keeps
+    # the failure mode unreachable for legitimate use while bounding
+    # slab at ~16 MiB each.
+    "run": _install_jitter("tmpfs_run_inodes", 16384, 2048),
+    "dev": _install_jitter("tmpfs_dev_inodes", 16384, 2048),
+    "root": _install_jitter("tmpfs_root_inodes", 16384, 2048),
+}
+
+
+def _tmpfs_data(name: str, mode: str | None = None) -> str:
+    """mount(2) data string for a capped sandbox tmpfs."""
+    caps = (f"size={_TMPFS_SIZES_MB[name]}m,"
+            f"nr_inodes={_TMPFS_INODES[name]}")
+    return f"{mode},{caps}" if mode else caps
+
+
+class ExtraRoBindError(OSError):
+    """A caller-named ``readable_paths`` entry failed its read-only
+    bind inside the mount namespace — fail-closed by contract (the
+    path would be missing from the sandbox, or worse, still writable
+    when the caller asked for read-only).
+
+    Typed so ``_spawn``'s setup handler can report the fail-closed
+    category ('C') on the exec-status pipe before the child exits:
+    the old direct ``os._exit`` emitted no status byte, so the parent
+    read EOF-no-byte as "the target execed" and returned the aborted
+    setup as a genuine CompletedProcess. ``errno`` is preserved from
+    the underlying mount failure so the bind-source pin tamper check
+    (ESTALE → category 'P') still outranks the fail-closed category.
+    """
 
 if TYPE_CHECKING:
     # Avoid runtime circular import: fingerprint.apply_overlay imports
@@ -142,6 +248,83 @@ _SHADOW_PATHS = frozenset((
     "/", "/dev", "/proc", "/sys", "/run", "/tmp",
     *(f"/{d}" for d in _SYSTEM_RO_DIRS),
 ))
+
+# WSL-host mask set (engaged only when the running kernel identifies
+# as WSL — inert everywhere else). These are the Windows-interop and
+# driver surfaces a WSL host leaks into an otherwise-Linux-shaped
+# sandbox view; interop in particular lets code spawn WINDOWS-side
+# processes that no Linux containment layer (namespaces, Landlock,
+# seccomp) governs:
+#   /run/WSL                  — the WSL_INTEROP socket dir (the
+#                               channel /init uses to launch Windows
+#                               processes). Structurally invisible
+#                               already: step 7's fresh /run tmpfs is
+#                               fail-closed (a mount failure aborts
+#                               setup), and get_safe_env() drops
+#                               WSL_INTEROP/WSLENV (allowlist scrub).
+#                               Listed here so a readable/tool-path
+#                               bind can never re-grant the live host
+#                               socket dir into the fresh tmpfs.
+#   /proc/sys/fs/binfmt_misc  — the interop exec plumbing's
+#                               registration view (WSL registers the
+#                               PE interpreter here). Rides into the
+#                               sandbox on step 6's recursive /proc
+#                               bind; masked in step 8f. The mask is
+#                               a visibility control: binfmt dispatch
+#                               happens in the kernel regardless of
+#                               the mount view — what the masked
+#                               interpreter cannot do is REACH
+#                               Windows, because the socket dir and
+#                               env vars above are withheld.
+#   /usr/lib/wsl              — the Windows-driver/GPU library mounts
+#                               (lib/, drivers/) host-bound under the
+#                               step 4 /usr bind; masked in step 8f.
+#   /dev/dxg                  — the GPU-paravirtualisation device.
+#                               Structurally invisible already: step
+#                               5's minimal /dev never creates it,
+#                               and the extra-bind plan skips device
+#                               nodes (neither dir nor regular file),
+#                               so it cannot be re-granted either.
+# Membership in the plan loop's masked-path refusal keeps every
+# entry authoritative against caller-supplied readable binds — on
+# the caller's spelling AND on the bind's resolved destination (a
+# symlink to a masked path is refused too); the two step 8f mask
+# mounts follow the 8a evidence-dir shadow convention (O_PATH-pinned
+# mount point, empty read-only tmpfs, warn-not-abort —
+# deny-direction hardening whose primary closures are the
+# structural ones named above).
+_WSL_MASKED_PATHS: tuple[str, ...] = (
+    "/run/WSL",
+    "/proc/sys/fs/binfmt_misc",
+    "/usr/lib/wsl",
+    "/dev/dxg",
+)
+
+#: The step 8f mask-mount subset of ``_WSL_MASKED_PATHS`` (the other
+#: entries are structurally absent from the sandbox view — see above).
+_WSL_MASK_MOUNT_DIRS: tuple[str, ...] = (
+    "/proc/sys/fs/binfmt_misc",
+    "/usr/lib/wsl",
+)
+
+
+def _is_wsl_host() -> bool:
+    """WSL detection for the mask set, fail-toward-False.
+
+    Lazy import: core.sandbox must stay importable without pulling
+    core.startup in at module-import time, and by the time this runs
+    the parent's own WSL consumers (context.py's dispatch gate) have
+    already imported and cached the answer in the normal spawn flow,
+    so the post-fork call is a sys.modules + cache lookup. A failure
+    here reads as plain Linux — the detection contract every
+    core.startup.wsl consumer keeps (the masks are deny-direction
+    defence-in-depth; the load-bearing closures are structural).
+    """
+    try:
+        from core.startup import wsl as _startup_wsl
+        return bool(_startup_wsl.is_wsl())
+    except Exception:  # noqa: BLE001 — detection must never break setup
+        return False
 
 # Resolve libc via ctypes.util.find_library so we cope with glibc's
 # "libc.so.6" soname on Debian/Ubuntu AND musl's "libc.musl-*.so.1" on
@@ -286,7 +469,55 @@ def _umount(target: str, flags: int = 0) -> None:
 def _shadows_per_ns(path: str) -> bool:
     """Return True if `path` is served by one of our per-ns mounts."""
     norm = path.rstrip("/") or "/"
+    if norm.startswith("//"):
+        # POSIX preserves an exactly-two-slash prefix through abspath
+        # and normpath, so "//tmp" names the same file as "/tmp" while
+        # evading this exact-string check — the bind would then stack
+        # HOST /tmp read-only OVER the fresh per-sandbox tmpfs.
+        # Callers canonicalise via _canonical_bind_path already; the
+        # collapse here is belt-and-braces for any other caller.
+        norm = "/" + norm.lstrip("/")
     return norm in _SHADOW_PATHS
+
+
+# Shared per-reader procfs classifier (also consumed by the parent-
+# side pin skip and the Landlock grant resolution) — see
+# _pathpin.is_per_process_procfs for the volatility contract. Bound
+# at module import: the extra_ro loop runs post-fork in the mount-ns
+# child, where imports are forbidden.
+_is_per_process_procfs = is_per_process_procfs
+# Same import-time binding for the bind-path canonicaliser (abspath +
+# leading-double-slash collapse — see _pathpin.canonical_bind_path for
+# why the two-slash spelling must never reach a policy comparison).
+_canonical_bind_path = canonical_bind_path
+
+
+def _required_pin_fd(
+    src_fds: dict[str, int] | None, path: str,
+) -> int | None:
+    """Pin lookup for a REQUIRED bind source (target/output/rootfs).
+
+    When the parent supplied pins at all, every required bind was
+    pinned (``_pin_bind_sources`` raises otherwise), so a lookup miss
+    here is always a JOIN BUG (parent/child key-spelling drift) or
+    tampering — and ``_bind_pinned_source`` with ``pinned_fd=None``
+    silently downgrades to mount-time window-narrowing, losing the
+    validation→mount containment on exactly the surfaces the pin was
+    built for. Refuse with the tamper convention (ESTALE) instead:
+    a produced-but-unconsumed pin must fail the spawn loudly, never
+    weaken it silently.
+    """
+    if src_fds is None:
+        return None
+    fd = src_fds.get(path)
+    if fd is None:
+        msg = (
+            f"mount_ns: no validation pin under key {path!r} — "
+            "required bind would silently lose its inode pin "
+            "(parent/child key drift or tampering)"
+        )
+        raise OSError(_ESTALE, msg)
+    return fd
 
 
 def _refuse_image_symlink_components(root: str, abs_path: str) -> None:
@@ -333,13 +564,15 @@ _PHASE_TRACE_ENV = "RAPTOR_SANDBOX_PHASE_TRACE"
 _PHASE_TRACE_MAX_ENTRIES = 4096
 
 # Top-level host-/etc directories the overlay copy never descends
-# into. /etc/skel is the new-user home-directory TEMPLATE tree — no
-# sandboxed target consumes it, and CI runner images stuff whole
-# toolchains into it (rustup under .cargo/bin, nvm test corpora,
-# dotnet tool stores: tens of thousands of entries, hundreds of MB)
-# which the pre-fix linear copy crawled until the caller's timeout.
-# Each skip emits a loud named phase-trace marker.
-_ETC_COPY_SKIP_TOP_DIRS = frozenset({"skel"})
+# into.  Each skip emits a loud named phase-trace marker.
+#
+#   skel — new-user home-directory TEMPLATE tree; CI runner images stuff
+#          whole toolchains into it (100k+ entries, hundreds of MB).
+#   alternatives — Debian/Ubuntu alternatives symlinks; one per binary
+#          variant per package (PostgreSQL alone plants 60+); no sandbox
+#          target reads /etc/alternatives directly, and the originals
+#          live under /usr which is already bind-mounted.
+_ETC_COPY_SKIP_TOP_DIRS = frozenset({"skel", "alternatives"})
 
 # Total copy budget (belt-and-braces behind the skel skip). The copy
 # exists to carry config files — passwd, group, hosts, resolv.conf,
@@ -354,6 +587,13 @@ _ETC_COPY_SKIP_TOP_DIRS = frozenset({"skel"})
 # so passwd/hosts/ssl are never the casualties.
 _ETC_COPY_MAX_BYTES = 64 * 1024 * 1024
 _ETC_COPY_MAX_ENTRIES = 8192
+# Wall-clock deadline (seconds) for the entire copy.  BFS ordering
+# guarantees root-level config files copy before any directory descent,
+# so the deadline only trims deep service-manager trees (apparmor.d,
+# systemd, init.d, …) that no sandbox target consumes.  The skip-set
+# above handles the known-large directories; this catches the long tail
+# on CI runners whose /etc we cannot predict.
+_ETC_COPY_MAX_SECONDS = 3.0
 
 
 def _phase_trace(marker: bytes) -> None:
@@ -406,16 +646,19 @@ def _copy_etc_tree(src: str, dst: str) -> None:
     Bounds (all loud, named in the phase trace; none may wedge or fail
     the setup):
 
-    * ``/etc/skel`` (any name in ``_ETC_COPY_SKIP_TOP_DIRS`` at the
-      TOP level of *src*) is never copied — new-user home templates
-      that no sandboxed target consumes; CI runner images stuff whole
-      toolchains into it (100k+ entries, hundreds of MB).
+    * ``_ETC_COPY_SKIP_TOP_DIRS`` (top-level directories: skel,
+      alternatives) are never entered — non-config payload the sandbox
+      doesn't need; CI runner images stuff whole toolchains / hundreds
+      of package-manager symlinks into them.
     * ``_ETC_COPY_MAX_ENTRIES`` total entries (files, dirs, symlinks,
       FIFOs): reaching it stops the copy with a marker + post-fork
       warning; the sandbox proceeds with what was copied.
     * ``_ETC_COPY_MAX_BYTES`` total bytes byte-copied: a file larger
       than the remaining byte budget is skipped individually (marker)
       while smaller entries keep copying.
+    * ``_ETC_COPY_MAX_SECONDS`` wall-clock deadline: stops the copy if
+      the host /etc is large enough that even the entry/byte budgets
+      can't prevent the copy from exceeding the caller's timeout.
 
     Files are hard-linked when possible (same filesystem — preserves
     the source inode's mode/owner exactly), otherwise copied
@@ -438,6 +681,7 @@ def _copy_etc_tree(src: str, dst: str) -> None:
     _trace_capped = False
     entries = 0
     copied_bytes = 0
+    deadline = time.monotonic() + _ETC_COPY_MAX_SECONDS
     # BFS queue of (src_dir, dst_dir); list-with-cursor instead of
     # collections.deque to keep the post-fork path on plain builtins.
     queue: list[tuple[str, str]] = [(src, dst)]
@@ -445,6 +689,24 @@ def _copy_etc_tree(src: str, dst: str) -> None:
     while qi < len(queue):
         dirpath, dst_dir = queue[qi]
         qi += 1
+        # Wall-clock deadline — checked per-directory, not per-entry,
+        # so a complete directory level always finishes.  qi > 1 skips
+        # the root level: BFS guarantees root-level config files (the
+        # ones the sandbox needs) are in the first directory processed.
+        if qi > 1 and time.monotonic() > deadline:
+            _phase_trace(
+                b"etc copy deadline exceeded (%.1fs): stopping "
+                b"with %d entries copied"
+                % (_ETC_COPY_MAX_SECONDS, entries)
+            )
+            warn_post_fork(
+                b"sandbox: mount_ns: /etc overlay copy stopped at "
+                b"the wall-clock deadline -- host /etc is "
+                b"pathologically large; the sandbox keeps the "
+                b"entries copied so far (root-level config files "
+                b"copy first)\n"
+            )
+            return
         try:
             names = sorted(os.listdir(dirpath))
         except OSError:
@@ -458,11 +720,9 @@ def _copy_etc_tree(src: str, dst: str) -> None:
                 continue
             if stat_module.S_ISDIR(st.st_mode):
                 if dirpath == src and name in _ETC_COPY_SKIP_TOP_DIRS:
-                    # Loud named skip — always emitted, never counted
-                    # against the per-entry trace cap.
                     _phase_trace(
                         b"etc copy skip: " + os.fsencode(src_entry)
-                        + b" (new-user home templates; never copied)"
+                        + b" (non-config payload; never copied)"
                     )
                     continue
                 subdirs.append(name)
@@ -635,7 +895,32 @@ def _mount_etc_tmpfs_copy(root: str, host_dir: str, inside: str,
                 or os.path.normpath(ns_target) != ns_target):
             continue
         stub = f"{root}{ns_target}"
-        if not os.path.exists(stub):
+        # lstat, not exists(): _copy_etc_tree recreates host symlinks
+        # verbatim, and the stock /etc/resolv.conf ->
+        # /run/systemd/resolve/stub-resolv.conf shape resolves in the
+        # PRE-pivot namespace — exists() follows it off-path (to the
+        # HOST /run), the stub step skips, and the 8d bind then lands
+        # at the link's host-side destination instead of
+        # {root}/etc/<name>, leaving the post-pivot view dangling and
+        # the overlay silently absent. The private tmpfs copy is
+        # still RW here: drop the link and let the stub creation
+        # below give the bind a real mount point.
+        try:
+            _stub_st = os.lstat(stub)
+        except OSError:
+            _stub_st = None
+        if (_stub_st is not None
+                and stat_module.S_ISLNK(_stub_st.st_mode)):
+            try:
+                os.unlink(stub)
+                _stub_st = None
+            except OSError as exc:
+                warn_post_fork(
+                    b"sandbox: mount_ns: etc_overlay pre-create "
+                    b"failed (errno=%d)\n" % (exc.errno or 0,)
+                )
+                continue
+        if _stub_st is None:
             try:
                 host_source = etc_overlay[ns_target]
                 if isinstance(host_source, str) and os.path.isdir(host_source):
@@ -725,17 +1010,153 @@ def _ro_remount_flags(path: str) -> int:
     return flags
 
 
+# The device nodes a per-sandbox /dev carries. Everything real tools
+# need to START (glibc, ld.so, ASAN, curl, gcc, interpreters): the
+# bit-bucket/entropy/discard set plus /dev/tty (a per-process virtual
+# device — it resolves to the OPENER's controlling terminal, and the
+# sandboxed child is setsid'd with no ctty, so opening it is ENXIO at
+# the VFS layer, never the operator's terminal). Deliberately absent:
+# host /dev/pts/* (the operator's pty slaves — a fresh devpts instance
+# below serves openpty()), block devices, /dev/kvm, /dev/fuse,
+# hugepages/mqueue, and every other host node the former recursive
+# bind dragged in.
+_MINIMAL_DEV_NODES = ("null", "zero", "full", "random", "urandom", "tty")
+
+
+def _mount_minimal_dev(root: str) -> None:
+    """Build a minimal per-sandbox /dev instead of recursively binding
+    the host's.
+
+    The recursive host bind carried ALL host nodes — including
+    /dev/pts/* — into the sandbox, and the default posture
+    (``restrict_reads=False``) leaves reads unrestricted, so a hostile
+    build script or fuzz target in the default lane could read-open
+    the operator's same-uid pty slave and compete for keystrokes.
+    Landlock narrowing never covered this lane. A fresh tmpfs with
+    per-node binds (the rootless-container construction: mknod needs
+    CAP_MKNOD in the INIT userns, but bind-mounting an existing host
+    node re-uses the host devtmpfs superblock, which the userns
+    SB_I_NODEV restriction does not apply to) provides exactly the
+    nodes tools need and nothing else.
+
+    Failure policy: a missing ESSENTIAL node (null/zero/urandom —
+    everything from shell redirection to glibc startup assumes them)
+    raises (OSError → the spawn child's setup handler; a host without
+    a bindable /dev/null is broken, and continuing would produce
+    subtly-wrong tool behaviour). The optional nodes (full, random,
+    tty) and the fresh devpts instance degrade with a warning — their
+    absence costs capability but exposes nothing, the correct failure
+    direction for this control. A host /dev entry that is not a char
+    device refuses setup outright (tampered/exotic host).
+    """
+    dev = f"{root}/dev"
+    _mount("tmpfs", dev, "tmpfs", 0, _tmpfs_data("dev", "mode=755"))
+    _essential = ("null", "zero", "urandom")
+    for name in _MINIMAL_DEV_NODES:
+        host_node = f"/dev/{name}"
+        try:
+            st = os.lstat(host_node)
+        except OSError as exc:
+            if name in _essential:
+                # See the failure policy in the docstring: a host
+                # without /dev/null (or zero/urandom) is broken, and
+                # a sandbox silently missing it produces subtly-wrong
+                # tool behaviour downstream.
+                raise OSError(
+                    exc.errno or _ELOOP,
+                    f"mount_ns: essential host node {host_node} is "
+                    f"missing; refusing a degraded /dev",
+                ) from exc
+            # Optional node absent (containers sometimes lack
+            # /dev/full): nothing to expose, nothing to bind.
+            warn_post_fork(
+                b"mount_ns: host /dev/" + name.encode()
+                + b" missing; sandbox /dev goes without it\n")
+            continue
+        if not stat_module.S_ISCHR(st.st_mode):
+            # A host /dev entry that is not a character device is a
+            # tampered or exotic host; refuse to carry it in. NOTE:
+            # this raise surfaces as an 'M' setup status, whose
+            # degrade path retries MOUNTLESS — where the host's whole
+            # /dev is visible again. Acceptable: triggering this
+            # requires a root-tampered host /dev, and the mountless
+            # lane's posture is stamped/warned on its own terms.
+            raise OSError(
+                _ELOOP,
+                f"mount_ns: host {host_node} is not a character "
+                f"device; refusing to bind it into the sandbox",
+            )
+        stub = f"{dev}/{name}"
+        os.close(os.open(stub, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                         0o600))
+        _mount(host_node, stub, None, MS_BIND)
+    # Self-referential conveniences every /dev ships (bash process
+    # substitution reads /dev/fd; tools open /dev/std*). Symlinks into
+    # the (per-pid-ns, freshly remounted) procfs.
+    os.symlink("/proc/self/fd", f"{dev}/fd")
+    os.symlink("/proc/self/fd/0", f"{dev}/stdin")
+    os.symlink("/proc/self/fd/1", f"{dev}/stdout")
+    os.symlink("/proc/self/fd/2", f"{dev}/stderr")
+    # /dev/shm: fresh tmpfs so POSIX shared memory / named semaphores
+    # (shm_open, sem_open — Python multiprocessing's SemLock) work
+    # WITHOUT exposing the host's shm segments. Mode 1777 matches the
+    # host convention (sticky world-writable scratch).
+    os.makedirs(f"{dev}/shm", exist_ok=True)
+    _mount("tmpfs", f"{dev}/shm", "tmpfs", 0, _tmpfs_data("shm", "mode=1777"))
+    # Fresh devpts instance: serves openpty()/script/expect INSIDE the
+    # sandbox with pty pairs that exist only in this namespace — the
+    # host's pts nodes are simply not present. ptmxmode=0666 lets the
+    # (non-root-mapped) child open the multiplexor; the ptmx symlink
+    # is the modern layout glibc's openpty resolves.
+    pts = f"{dev}/pts"
+    os.makedirs(pts, exist_ok=True)
+    try:
+        _mount("devpts", pts, "devpts", 0,
+               "newinstance,ptmxmode=0666,mode=0620")
+    except OSError:
+        # Capability degrade, not exposure: no ptys inside the
+        # sandbox. Kernels that refuse a userns devpts mount are the
+        # only known shape.
+        warn_post_fork(
+            b"mount_ns: fresh devpts mount failed; openpty() will not "
+            b"work inside this sandbox (host ptys stay hidden)\n")
+    else:
+        os.symlink("pts/ptmx", f"{dev}/ptmx")
+
+
 def setup_mount_ns(target: str | None, output: str | None,
                    extra_ro_paths: Iterable[str] | None = None,
+                   extra_rw_paths: Iterable[str] | None = None,
                    root_path: str | None = None,
                    persona: Optional["Persona"] = None,
                    etc_overlay: dict | None = None,
                    stage_files: dict | None = None,
+                   stage_dirs: Iterable[str] | None = None,
                    rw_submounts_ok: bool = False,
                    rootfs: str | None = None,
                    require_target_ro: bool = False,
-                   src_fds: dict[str, int] | None = None) -> None:
+                   src_fds: dict[str, int] | None = None,
+                   fresh_netns: bool = False) -> None:
     """Establish pivot_root'd tmpfs sandbox root.
+
+    `fresh_netns`: the caller unshared a NEW network namespace for
+    this child. Enables the fresh per-namespace sysfs at /sys (only
+    mountable when the userns owns the netns), which hides host NIC
+    names/MACs; False keeps the host /sys rbind.
+
+    `extra_rw_paths`: caller-granted WRITABLE roots that live outside
+    every tree this view otherwise carries, bound READ-WRITE at their
+    original paths (the deliberate view extension for legitimate
+    cross-lane write grants — e.g. a shared log directory that is
+    live policy on the host-view lanes). Same normalisation, shadow /
+    masked-path and pinning rules as `extra_ro_paths`; the only
+    difference is that no read-only remount follows the bind. When
+    pinning is engaged (`src_fds`), every entry here MUST carry a pin
+    — the parent takes them as REQUIRED pins
+    (`_spawn._pin_bind_sources`), so an unpinned entry means a direct
+    caller skipped that step and the entry is skipped fail-closed
+    like an unpinned read-only extra (the write grant stays dead
+    rather than re-opening the mount-time-resolution window).
 
     Must be called AFTER the child has entered the new user-ns and acquired
     CAP_SYS_ADMIN (via the parent's newuidmap setup), and BEFORE
@@ -783,9 +1204,18 @@ def setup_mount_ns(target: str | None, output: str | None,
     ``warn_post_fork`` and continues — partial staging is better than
     an aborted sandbox setup.
 
+    `stage_dirs` (Optional[Iterable[str]]): absolute in-sandbox paths
+    materialised as EMPTY directories (mode 0o700) in the tmpfs root
+    before pivot_root, ahead of `stage_files` so staged files can land
+    inside them. Lets callers stage directory SKELETONS whose empty
+    members matter (a private in-sandbox $HOME needs its XDG subdirs
+    to exist even when no file rides them). Same failure contract as
+    `stage_files`: warn via ``warn_post_fork`` and continue.
+
     `src_fds` (Optional[dict[str, int]]): validation-time O_PATH pins
-    for the bind SOURCES, keyed by ``os.path.abspath`` of the caller
-    path (target / output / rootfs / each extra_ro_paths entry). The
+    for the bind SOURCES, keyed by ``_pathpin.canonical_bind_path`` of
+    the caller path (target / output / rootfs / each extra_ro_paths
+    entry). The
     parent opens these via a symlink-refusing walk BEFORE forking this
     child (fds survive fork), and every bind here refuses to mount
     unless its freshly-walked source inode is IDENTICAL to the
@@ -817,10 +1247,17 @@ def setup_mount_ns(target: str | None, output: str | None,
     # writable path could not be opened" + the child can't write to
     # output even via fallback. Discovered by E2E scan against
     # /tmp/vulns where output= was passed relative.
+    # Canonicalise, not just absolutize: POSIX preserves an exactly-
+    # two-slash prefix through abspath, so a "//"-spelled path names
+    # the same file under a spelling every exact-string policy check
+    # in this function (shadow-path refusal, ancestor classification,
+    # masked-path refusal, target/output identity, pin lookup) would
+    # miss. _canonical_bind_path collapses it; the parent-side pin
+    # keys use the same helper.
     if target:
-        target = os.path.abspath(target)
+        target = _canonical_bind_path(target)
     if output:
-        output = os.path.abspath(output)
+        output = _canonical_bind_path(output)
     # 1. Make propagation private — our mounts do not leak back.
     _mount(None, "/", None, MS_REC | MS_PRIVATE)
 
@@ -854,9 +1291,14 @@ def setup_mount_ns(target: str | None, output: str | None,
         # the environment's upper layer (_spawn grants the post-pivot
         # "/" to Landlock when a write mask engages; the namespace
         # itself is the write boundary in this mode).
-        rootfs = os.path.abspath(rootfs)
+        # Canonicalise with the SAME helper the parent keys pins
+        # with — plain abspath preserves an exactly-two-slash prefix,
+        # so a "//"-spelled rootfs looked its pin up under the wrong
+        # key, missed, and downgraded to mount-time window-narrowing
+        # on the environment's ROOT (bound writable).
+        rootfs = _canonical_bind_path(rootfs)
         _bind_pinned_source(rootfs, root, MS_BIND,
-                            pinned_fd=_src_fd(rootfs))
+                            pinned_fd=_required_pin_fd(src_fds, rootfs))
         # Exported image tarballs routinely lack /run, ship an empty
         # /dev, etc. — create the per-namespace mount points inside
         # the (writable) rootfs so steps 5-7 can stack their mounts.
@@ -881,7 +1323,7 @@ def setup_mount_ns(target: str | None, output: str | None,
                     f"setup",
                 )
     else:
-        _mount("tmpfs", root, "tmpfs", 0, "mode=755")
+        _mount("tmpfs", root, "tmpfs", 0, _tmpfs_data("root", "mode=755"))
 
         # 3. Create standard-dir mount points in the new tmpfs root. We
         # own the tmpfs inodes here so mkdir is not blocked by host-/
@@ -920,21 +1362,35 @@ def setup_mount_ns(target: str | None, output: str | None,
         _bind_system_ro_dir(d, root, host_dir, inside, etc_overlay,
                             _etc_has_missing_targets)
 
-    # 5. /dev and /sys: recursive bind from host. A minimal /dev would
-    # be more conservative but real tools (ASAN, glibc, curl) need
-    # /dev/null, /dev/urandom, /dev/tty, /dev/pts etc.; narrowing breaks
-    # in subtle ways. rbind + Landlock narrowing is the practical
-    # compromise.
-    _mount("/dev", f"{root}/dev", None, MS_BIND | MS_REC)
-    # /dev/shm: fresh tmpfs stacked over the rbind so POSIX shared
-    # memory / named semaphores (shm_open, sem_open — Python
-    # multiprocessing's SemLock lives here) work inside the sandbox
-    # WITHOUT exposing the host's shm segments. Same per-sandbox
-    # isolation rationale as /tmp below; mode 1777 matches the
-    # host convention (sticky world-writable scratch).
-    if os.path.isdir("/dev/shm"):
-        _mount("tmpfs", f"{root}/dev/shm", "tmpfs", 0, "mode=1777")
-    _mount("/sys", f"{root}/sys", None, MS_BIND | MS_REC)
+    # 5. /dev: minimal per-sandbox device set (see _mount_minimal_dev
+    # — the former recursive host bind carried EVERY host node,
+    # including /dev/pts/*, into the sandbox, and the default
+    # read-unrestricted posture let the child read-open the operator's
+    # pty slave). /sys: a FRESH sysfs instance when the caller created
+    # a fresh network namespace — sysfs's net class is netns-tagged,
+    # so the fresh instance shows only ns-local devices, while the
+    # host rbind exposed every host NIC name and MAC address
+    # (/sys/class/net/*/address) inside "network-blocked" runs — a
+    # host fingerprint the anti-fingerprint posture is supposed to
+    # withhold. (The kernel permits the sysfs mount exactly when the
+    # mounting userns owns the netns.) Without a fresh netns the
+    # kernel refuses the sysfs mount, so the host rbind remains the
+    # only option there; a refusal on the fresh-netns lane degrades
+    # the same way, warned (fingerprint residual, not a containment
+    # loss).
+    _mount_minimal_dev(root)
+    _fresh_sys = False
+    if fresh_netns:
+        try:
+            _mount("sysfs", f"{root}/sys", "sysfs")
+            _fresh_sys = True
+        except OSError:
+            warn_post_fork(
+                b"mount_ns: fresh sysfs mount failed; host /sys "
+                b"(incl. NIC names/MACs) stays visible in the "
+                b"sandbox\n")
+    if not _fresh_sys:
+        _mount("/sys", f"{root}/sys", None, MS_BIND | MS_REC)
 
     # 6. /proc: bind host /proc. Fresh procfs would require a pid-ns
     # which we haven't entered yet at this point. Host pids remain
@@ -945,8 +1401,10 @@ def setup_mount_ns(target: str | None, output: str | None,
     # 7. /tmp and /run: fresh tmpfs per sandbox. This is the main
     # isolation win over Landlock-only — per-sandbox /tmp closes the
     # cross-sandbox symlink-race class.
-    _mount("tmpfs", f"{root}/tmp", "tmpfs")
-    _mount("tmpfs", f"{root}/run", "tmpfs")
+    # Default tmpfs root mode (1777) is what /tmp callers expect —
+    # only the size cap is added here.
+    _mount("tmpfs", f"{root}/tmp", "tmpfs", 0, _tmpfs_data("tmp"))
+    _mount("tmpfs", f"{root}/run", "tmpfs", 0, _tmpfs_data("run"))
 
     # 7b. Re-create inherited temp-dir env paths inside the fresh
     # tmpfs. The child inherits TMPDIR/TEMP/TMP from the host; a value
@@ -984,30 +1442,444 @@ def setup_mount_ns(target: str | None, output: str | None,
                 b"(errno=%d)\n" % (exc.errno or 0)
             )
 
+    # Mount-ordering invariant (steps 8 / 8b): a mount attached at a
+    # path COVERS (shadows) every earlier mount attached at or below
+    # that path — path resolution always enters the topmost (most
+    # recently attached) mount on a dentry. So for any two binds where
+    # one path is a proper ancestor of the other, the ANCESTOR must
+    # mount first; the descendant then stacks on top of the ancestor's
+    # mount and keeps its own semantics (rw output visible over an ro
+    # ancestor, ro file visible over the rw output). The pre-fix code
+    # ordered by CLASS — target/output in step 8, every extra_ro_paths
+    # entry in step 8b — so an extra read-only bind naming an ancestor
+    # of the output dir (an output dir living inside a readable tree,
+    # e.g. a run dir under a repo checkout that is itself in
+    # readable_paths) mounted AFTER the rw output bind and shadowed
+    # it: the child's own output dir went read-only and every write
+    # crashed, while a sibling extra_ro entry under the same ancestor
+    # stayed visible only because the caller happened to list the
+    # ancestor first. Fix: classify the extra binds up front, mount
+    # the proper ancestors of target/output BEFORE step 8 (so the
+    # target/output binds — and the 8a/8a2 shadows stacked on them —
+    # always end up on top), keep the rest after 8a/8a2, and process
+    # the whole list ancestors-first (stable component-count sort)
+    # so intra-list nesting never depends on caller order.
+    #
+    # ``_bound_dirs``: directories already bind-mounted into the
+    # namespace — step 4's system dirs plus target/output plus any
+    # directory the extra loop binds. When an extra FILE path falls
+    # under a bound directory, its mount point already exists
+    # (populated by the covering bind) so stub creation is skipped:
+    # the O_CREAT|O_EXCL stub open would otherwise fail EEXIST and
+    # abort the whole spawn (exit 126) — observed as flaky sandboxed
+    # runs whenever the scanned tree names its own files in
+    # readable_paths. This is a precise predicate: creation is only
+    # skipped when *we* know the parent was bound, not for arbitrary
+    # pre-existing paths. NOT the full _SHADOW_PATHS set: /tmp and
+    # /run are fresh EMPTY tmpfs (step 7), not host binds — nothing
+    # populated their subtrees, so mount-point stubs beneath them must
+    # still be created. "/" is harmless either way (the `d + "/"`
+    # prefix test never matches it) but excluded for accuracy.
+    _bound_dirs: set = {
+        "/dev", "/proc", "/sys",
+        *(f"/{d}" for d in _SYSTEM_RO_DIRS),
+    }
+
+    # Normalise + classify the caller's extra read-only paths into an
+    # ordered mount plan (path, pinned_fd, is_dir, is_file). Each check
+    # keeps its pre-existing semantics; only the TIME of classification
+    # moves (a few syscalls earlier in the same child — the pinned-fd
+    # lane was race-free either way, and the legacy no-pin lane keeps
+    # its documented window-narrowing-only contract).
+    # 8a/8a2 masked views inside the target/output binds: the
+    # evidence dir and the run-marker content are deliberately hidden
+    # from the child. An extra bind at or below a masked path would
+    # mount in the post pass — AFTER the masks — and stack a live
+    # host view over them, unmasking the finder dossier / evidence
+    # dir through the child's own readable_paths. Refused loudly in
+    # the plan loop below; dropping the bind NARROWS the child's view
+    # and keeps the mask — the correct failure direction for a
+    # masking control. On a WSL host the Windows-interop/driver mask
+    # set (see _WSL_MASKED_PATHS) joins the same policy: the 8f mask
+    # mounts and the per-ns tmpfs/minimal-dev structural absences
+    # must stay authoritative against caller-supplied readable binds.
+    # Off-WSL the tuple is byte-identical to the pre-WSL shape.
+    _wsl_host = _is_wsl_host()
+    _masked_paths: tuple = tuple(
+        {f"{p}/.audit" for p in (target, output) if p}
+        | ({f"{output}/.raptor-run.json"} if output else set())
+        | (set(_WSL_MASKED_PATHS) if _wsl_host else set())
+    )
+    # Resolved twins of the masked paths, for the DESTINATION leg of
+    # the refusal below: the lexical check compares the caller's
+    # spelling, but the bind machinery mounts the RESOLVED source
+    # (inode-pinned), so a symlink whose destination sits at/below a
+    # masked path would bind the live host view at an off-mask
+    # spelling. realpath never raises and normalises nonexistent
+    # tails component-wise (the .audit dir may not exist yet).
+    _masked_paths_resolved: tuple = tuple(dict.fromkeys(
+        os.path.realpath(m) for m in _masked_paths))
+
+    _extra_entries: list[tuple[str, int | None, bool, bool, bool]] = []
+    _seen_extra_ro: set = set()
+    # Read-write extras first: a path arriving through BOTH lists gets
+    # ONE bind and it must be the read-write one (the rw grant is the
+    # caller's stronger declared intent; an ro bind stacked instead
+    # would kill every child write with EROFS).
+    for path, _extra_rw in (
+            *((p, True) for p in (extra_rw_paths or ())),
+            *((p, False) for p in (extra_ro_paths or ())),
+    ):
+        if not path:
+            continue
+        # Canonicalise like target/output above — a relative or
+        # non-normalized entry ("etc", "/tmp/../etc") would evade
+        # the exact-string shadow check and produce a malformed
+        # bind target ("{root}etc") that diverges from the path
+        # the caller's Landlock read rule references; a "//"-spelled
+        # entry ("//tmp") would evade the shadow check outright and
+        # bind HOST /tmp over the fresh per-ns tmpfs, or miss the
+        # ancestor classification and re-shadow the rw output.
+        path = _canonical_bind_path(path)
+        # Duplicate entries (the same path arriving via both
+        # readable_paths and tool_paths, or repeated caller
+        # entries) would hit the O_CREAT|O_EXCL stub open twice —
+        # the second pass fails EEXIST on the stub the first pass
+        # created and aborts the spawn. One bind per path.
+        if path in _seen_extra_ro:
+            continue
+        _seen_extra_ro.add(path)
+        if _shadows_per_ns(path):
+            continue
+        # Per-process procfs magic links (/proc/self/*,
+        # /proc/thread-self/*) resolve to a DIFFERENT file for
+        # every walking process, so a validation-time pin taken
+        # in the parent can never match this child's mount-time
+        # walk — an identity mismatch here is inherent volatility,
+        # never a replaced source, and must not trip the tamper
+        # refusal below. There is also nothing to bind: the /proc
+        # mount already serves these paths per-reader, and
+        # freezing one process's view over the magic link would
+        # hand every sandboxed process the binder's own
+        # per-process files (e.g. a host-layout cgroup path the
+        # fresh cgroup namespace exists to hide). Skip the bind.
+        # Every other source class names one stable filesystem
+        # object, where an identity change can only mean the
+        # object was swapped after validation — the tamper
+        # refusal stays authoritative there.
+        if _is_per_process_procfs(path):
+            continue
+        # Paths already served by the step-8 target/output binds
+        # keep their step-8 rw/ro semantics. Without this skip, a
+        # target that is ALSO the output (writable clone/build
+        # destinations — restrict_reads callers put target in the
+        # read allowlist, which forwards here) gets an ro bind
+        # stacked ON TOP of its rw bind and every child write
+        # fails with EROFS.
+        if path in (target, output):
+            continue
+        if any(path == m or path.startswith(m + "/")
+               for m in _masked_paths):
+            # Masked-view policy (see _masked_paths above): never
+            # bind a readable view at or below the evidence dir or
+            # the run marker — the mask must stay on top.
+            try:
+                _path_b = path.encode("utf-8", errors="replace")
+            except Exception:  # noqa: BLE001
+                _path_b = b"<unencodable>"
+            warn_post_fork(
+                b"mount_ns: refusing readable bind at masked path "
+                + _path_b
+                + b" (evidence-dir shadow / run-marker mask stays "
+                b"authoritative)\n"
+            )
+            continue
+        # Dir-vs-file decides stub creation below; derive it from
+        # the PINNED inode when a validation-time fd exists — the
+        # pathname isdir/isfile pair follows symlinks and is
+        # swappable between here and the bind. With pinning
+        # engaged (src_fds is not None), an entry the parent could
+        # not pin is skipped outright: it did not exist at
+        # validation, and falling back to mount-time resolution
+        # would hand a concurrent writer a downgrade lever (plant
+        # the path after validation, get it bound).
+        _extra_fd = _src_fd(path)
+        if _extra_fd is not None:
+            _pin_mode = os.fstat(_extra_fd).st_mode
+            _extra_is_dir = stat_module.S_ISDIR(_pin_mode)
+            _extra_is_file = stat_module.S_ISREG(_pin_mode)
+        elif src_fds is not None:
+            continue
+        else:
+            _extra_is_dir = os.path.isdir(path)
+            _extra_is_file = os.path.isfile(path)
+        if not _extra_is_dir and not _extra_is_file:
+            continue
+        # Masked-path refusal, DESTINATION leg: the lexical check
+        # above compares the caller's spelling, but what a bind
+        # mounts is the RESOLVED source — a symlink at an off-mask
+        # spelling whose destination sits at/below a masked path
+        # would stack the live host view of the masked content into
+        # the child at the link path. Refuse on the destination too:
+        # the pinned lane reads the PIN's own resolution (the exact
+        # inode path the bind would mount, immune to a post-pin
+        # re-point of the link); the legacy lane realpaths the
+        # entry. Same failure direction as the lexical leg —
+        # dropping the bind narrows the view and keeps the mask.
+        if _masked_paths:
+            _dest = None
+            if _extra_fd is not None:
+                try:
+                    _dest = os.readlink(f"/proc/self/fd/{_extra_fd}")
+                except OSError:
+                    _dest = None
+            if _dest is None:
+                _dest = os.path.realpath(path)
+            if any(_dest == m or _dest.startswith(m + "/")
+                   for m in _masked_paths_resolved):
+                try:
+                    _dest_b = _dest.encode("utf-8", errors="replace")
+                except Exception:  # noqa: BLE001
+                    _dest_b = b"<unencodable>"
+                warn_post_fork(
+                    b"mount_ns: refusing readable bind at masked path "
+                    + _dest_b
+                    + b" (resolved destination of a caller entry; "
+                    b"evidence-dir shadow / run-marker mask / WSL "
+                    b"interop mask stays authoritative)\n"
+                )
+                continue
+        _extra_entries.append(
+            (path, _extra_fd, _extra_is_dir, _extra_is_file,
+             _extra_rw))
+    # Ancestors before descendants: component count orders any
+    # ancestor strictly before its descendants; the sort is stable,
+    # so unrelated entries keep caller order.
+    _extra_entries.sort(key=lambda entry: entry[0].count("/"))
+
+    def _bind_one_extra_ro(path: str, _extra_fd: int | None,
+                           _extra_is_dir: bool,
+                           _extra_is_file: bool,
+                           _extra_rw: bool = False) -> None:
+        """Bind one extra path (step 8b unit). Read-only entries get
+        the same two-step bind+remount-ro as target; read-write
+        entries (`extra_rw_paths` — the deliberate out-of-view grant
+        carry) keep the bind writable, exactly like the output bind.
+        Shadow-skip rules already applied by the mount-plan
+        normalisation above."""
+        _label = b"extra_rw_paths" if _extra_rw else b"extra_ro_paths"
+        inside = f"{root}{path}"
+        # _step names which sub-operation is running so the outer
+        # OSError handler can report the actual failing step
+        # ("makedirs" / "open mount-point" / "bind") instead of
+        # always saying "bind failed" — pre-fix `os.makedirs` /
+        # `os.open` failures (e.g. ENOENT on a malformed path)
+        # were reported as "bind failed (errno=2)", which an
+        # operator inspecting the kernel log could not match
+        # against the actual syscall that errored.
+        #
+        # ASCII-only short labels so the bytes concat in the
+        # except clause stays fork-safe + allocation-bounded.
+        _step = b"setup"
+        try:
+            if rootfs:
+                _refuse_image_symlink_components(root, path)
+            if _extra_is_dir:
+                _step = b"makedirs"
+                os.makedirs(inside, exist_ok=True)
+                _bound_dirs.add(path)
+            elif any(path.startswith(d + "/") for d in _bound_dirs):
+                # Mount point already exists — a parent directory
+                # (e.g. /etc from step 4, the step-8 target/output
+                # bind, or an earlier extra_ro_paths entry) was
+                # bind-mounted into the namespace, which populated
+                # this path.  Skip creation and proceed to the
+                # overlay bind.
+                pass
+            elif rootfs and os.path.lexists(inside):
+                # Rootfs mode: the whole root came from the image
+                # bind, so an existing path here is image content —
+                # binding over it is exactly the caller's intent
+                # (the host-mode O_EXCL planted-state defence guards
+                # a fresh private tmpfs, which doesn't apply).
+                pass
+            else:
+                # File bind-mount: create an empty regular file to
+                # serve as the mount point.
+                #
+                # Use os.open with O_NOFOLLOW + 0o600 instead of
+                # `open(inside, "a")`:
+                #   * O_NOFOLLOW refuses to follow a symlink at
+                #     `inside` — defence-in-depth even though our
+                #     tmpfs root was freshly mkdir'd.
+                #   * O_CREAT | O_EXCL refuses to reuse a pre-existing
+                #     mount-point (which would also indicate something
+                #     planted state we don't expect).
+                #   * mode 0o600 — the mount-point itself shouldn't
+                #     be world-readable (was 0o644 default via umask).
+                _step = b"makedirs (parent)"
+                os.makedirs(os.path.dirname(inside), exist_ok=True)
+                _step = b"open mount-point"
+                fd = os.open(
+                    inside,
+                    os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW | os.O_EXCL,
+                    0o600,
+                )
+                os.close(fd)
+            _step = b"bind"
+            try:
+                _bind_pinned_source(path, inside, MS_BIND,
+                                    pinned_fd=_extra_fd)
+            except OSError as bind_exc:
+                # EINVAL: a NON-recursive bind of a tree containing
+                # locked submounts (mounts created by a more-
+                # privileged namespace — e.g. Docker's overlays
+                # under /var/lib/docker) is refused by the kernel
+                # in a user namespace, because it would expose the
+                # paths hidden underneath them. A RECURSIVE bind
+                # carries the submounts along instead — legal, and
+                # it never reveals anything the host didn't already
+                # show. But the remount-ro below covers the top
+                # mount only, so the carried submounts stay rw at
+                # the mount layer; that is acceptable ONLY when
+                # Landlock is active as the write-enforcement
+                # backstop (its write mask is unconditional and
+                # covers these paths). Without Landlock, keep the
+                # original fail-closed behaviour — a degraded
+                # sandbox masquerading as the requested one is
+                # worse than a loud setup failure.
+                # Read-write entries may recurse unconditionally: the
+                # whole bind is writable by declaration, so carried
+                # submounts staying rw claims nothing the top mount
+                # doesn't already.
+                if bind_exc.errno != _EINVAL or not (rw_submounts_ok
+                                                     or _extra_rw):
+                    raise
+                _bind_pinned_source(path, inside, MS_BIND | MS_REC,
+                                    pinned_fd=_extra_fd)
+                try:
+                    _path_b = path.encode("utf-8", errors="replace")
+                except Exception:  # noqa: BLE001
+                    _path_b = b"<unencodable>"
+                warn_post_fork(
+                    b"mount_ns: " + _label + b" recursive bind for "
+                    + _path_b
+                    + (b" (locked submounts)\n" if _extra_rw else
+                       b" (locked submounts); submount ro relies on"
+                       b" Landlock\n")
+                )
+            if _extra_rw:
+                # Read-write carry: no ro remount — the bind stays
+                # writable like the output bind; Landlock's write
+                # rule (view-anchored to this path) scopes it.
+                return
+            try:
+                _mount(path, inside, None, _ro_remount_flags(inside))
+            except OSError as exc:
+                # bytes(path) keeps the message fork-safe (no f-string
+                # allocation pulling locks); fallback to a placeholder
+                # if encoding ever fails. errno also encoded as integer.
+                try:
+                    _path_b = path.encode("utf-8", errors="replace")
+                except Exception:  # noqa: BLE001
+                    _path_b = b"<unencodable>"
+                warn_post_fork(
+                    b"mount_ns: extra_ro_paths remount-ro failed for "
+                    + _path_b
+                    + b" (errno=%d); relying on Landlock\n"
+                    % (exc.errno or 0)
+                )
+        except OSError as exc:
+            # Caller explicitly named this path via readable_paths
+            # in the public sandbox API — silently dropping it
+            # leaves a hole the caller did not authorise (the path
+            # is either missing from the sandbox, or worse, still
+            # writable when the caller asked for read-only). Fail-
+            # closed so the parent observes the failed setup
+            # instead of getting a degraded sandbox masquerading
+            # as the requested one.
+            #
+            # The stderr line stays the human-readable diagnostic;
+            # the typed raise (instead of the old direct
+            # os._exit, which emitted NO status byte and let the
+            # parent misread the aborted setup as a genuine
+            # rc=126 target result) reaches _spawn's setup
+            # handler, which reports fail-closed category 'C' on
+            # the exec-status pipe and exits — same fail-closed
+            # outcome, now observable and unspoofable.
+            try:
+                _path_b = path.encode("utf-8", errors="replace")
+            except Exception:  # noqa: BLE001
+                _path_b = b"<unencodable>"
+            try:
+                os.write(
+                    2,
+                    b"sandbox: mount_ns: " + _label + b" "
+                    + _step
+                    + b" failed for "
+                    + _path_b
+                    + b" (errno=%d), exiting\n" % (exc.errno or 0),
+                )
+            except OSError:
+                pass
+            _step_s = _step.decode("ascii", "replace")
+            _label_s = _label.decode("ascii", "replace")
+            raise ExtraRoBindError(
+                exc.errno or 0,
+                f"{_label_s} {_step_s} failed for {path!r}",
+            ) from exc
+
+    # Split the plan: DIRECTORY entries that are proper ancestors of
+    # the step-8 target/output paths mount NOW, before step 8, so the
+    # rw output bind (and the ro target bind with its 8a evidence
+    # shadow and 8a2 marker mask) stacks on top of them and stays the
+    # child-visible view; everything else keeps its step-8b slot. A
+    # regular-file entry can never be a path ancestor of a directory,
+    # so file entries always stay in the 8b pass.
+    _step8_paths = tuple(
+        p for p in (target, output) if p and not _shadows_per_ns(p))
+    _extra_pre = [
+        entry for entry in _extra_entries
+        if entry[2] and any(p.startswith(entry[0] + "/")
+                            for p in _step8_paths)
+    ]
+    _extra_post = [e for e in _extra_entries if e not in _extra_pre]
+    for _entry in _extra_pre:
+        _bind_one_extra_ro(*_entry)
+
     # 8. Bind target and output at their ORIGINAL absolute paths.
     # After pivot_root, the child still refers to /tmp/vulns (or whatever
     # the caller passed) — no argv rewriting needed. If the caller's
     # path is one we've already served via a per-ns mount, skip so we
     # don't fight our own stack.
-    # ``_step8_bound_dirs``: the target/output directories this step
-    # actually bind-mounts. Step 8b seeds its ``_bound_dirs`` predicate
-    # with them so an extra_ro_paths FILE living under the target or
-    # output bind (readable_paths naming files inside the scanned tree —
-    # the normal shape when the target contains the orchestrator's own
-    # helper scripts) skips placeholder creation: its mount point
-    # already exists, populated by the parent bind, and the
-    # O_CREAT|O_EXCL stub open would otherwise fail EEXIST and abort
-    # the whole spawn (exit 126) — observed as flaky sandboxed runs
-    # whenever the scanned tree names its own files in readable_paths.
-    _step8_bound_dirs: set = set()
-    if target and not _shadows_per_ns(target):
+    def _step8_refuse_symlink_walk(path: str) -> None:
+        """Refuse symlink components under {root}{path} for a step-8
+        bind whose mount point lies BELOW a pre-mounted readable
+        ancestor (and in rootfs mode, unconditionally — the original
+        contract). With an ancestor bind in place, the makedirs and
+        the mount(2) pathname below walk THROUGH that bind's
+        (potentially hostile) repo content pre-pivot: a symlink
+        component would divert inode creation or the mount TARGET
+        onto host paths. The lstat walk refuses that shape. On a live
+        host tree this is window-narrowing (the bind source can
+        change between walk and mount, unlike the static rootfs
+        image); the residual is contained regardless: the bind
+        SOURCE is inode-pinned (cannot be steered), the mount lands
+        only in this PRIVATE namespace (step 1 rprivate — never the
+        host's view), and any diverted makedirs runs as the caller's
+        own uid (no privilege gained), with Landlock's write mask as
+        the backstop."""
+        if rootfs or any(path.startswith(e[0] + "/")
+                         for e in _extra_pre):
+            _refuse_image_symlink_components(root, path)
+
+    def _bind_target_step8() -> None:
         inside = f"{root}{target}"
-        if rootfs:
-            _refuse_image_symlink_components(root, target)
+        _step8_refuse_symlink_walk(target)  # type: ignore[arg-type]
         os.makedirs(inside, exist_ok=True)
-        _bind_pinned_source(target, inside, MS_BIND,
-                            pinned_fd=_src_fd(target))
-        _step8_bound_dirs.add(target)
+        _bind_pinned_source(target, inside, MS_BIND,  # type: ignore[arg-type]
+                            pinned_fd=_required_pin_fd(src_fds, target))  # type: ignore[arg-type]
+        _bound_dirs.add(target)
         # Remount-bind-ro is best-effort. Skip when output == target
         # since output must remain writable. Landlock enforces
         # read-only on target at the filesystem-access layer
@@ -1031,14 +1903,32 @@ def setup_mount_ns(target: str | None, output: str | None,
                     b"relying on Landlock for read-only enforcement\n"
                     % (exc.errno or 0)
                 )
-    if output and output != target and not _shadows_per_ns(output):
+
+    def _bind_output_step8() -> None:
         inside = f"{root}{output}"
-        if rootfs:
-            _refuse_image_symlink_components(root, output)
+        _step8_refuse_symlink_walk(output)  # type: ignore[arg-type]
         os.makedirs(inside, exist_ok=True)
-        _bind_pinned_source(output, inside, MS_BIND,
-                            pinned_fd=_src_fd(output))
-        _step8_bound_dirs.add(output)
+        _bind_pinned_source(output, inside, MS_BIND,  # type: ignore[arg-type]
+                            pinned_fd=_required_pin_fd(src_fds, output))  # type: ignore[arg-type]
+        _bound_dirs.add(output)
+
+    _do_target = bool(target and not _shadows_per_ns(target))
+    _do_output = bool(output and output != target
+                      and not _shadows_per_ns(output))
+    if (_do_target and _do_output
+            and target.startswith(output + "/")):  # type: ignore[union-attr,operator]
+        # Output is a proper ancestor of target: same ancestors-first
+        # invariant as above — the output bind mounts first so the ro
+        # target bind stacks on top of it and the target stays
+        # read-only through the child's view (target-then-output
+        # order would shadow the ro target under the rw output bind).
+        _bind_output_step8()
+        _bind_target_step8()
+    else:
+        if _do_target:
+            _bind_target_step8()
+        if _do_output:
+            _bind_output_step8()
 
     # 8a. Shadow the evidence directory (<dir>/.audit — see
     # core/sandbox/evidence.py) inside the rw-bound target/output
@@ -1137,230 +2027,21 @@ def setup_mount_ns(target: str | None, output: str | None,
                 finally:
                     os.close(_mfd)
 
-    # 8b. Bind any extra read-only paths the caller requested (via
-    # readable_paths in the public sandbox API). Each is bind-mounted
-    # at its original absolute path, so the child sees it exactly where
-    # the caller expects. Same two-step bind+remount-ro, and same
-    # shadow-skip rule.
-    #
-    # ``_bound_dirs``: directories already bind-mounted into the
-    # namespace — step 4's system dirs plus any directories this loop
-    # binds. When a file path falls under a bound directory, its
-    # mount point already exists (populated by the parent bind) so we
-    # skip the O_CREAT | O_EXCL creation step and go straight to the
-    # overlay bind. This is a precise predicate: we only skip
-    # creation when *we* know the parent was bound, not for arbitrary
-    # pre-existing paths.
-    #
-    # NOT the full _SHADOW_PATHS set: /tmp and /run are fresh EMPTY
-    # tmpfs (step 7), not host binds — nothing populated their
-    # subtrees, so mount-point stubs beneath them must still be
-    # created. Pre-fix, seeding with _SHADOW_PATHS made a FILE bind
-    # under /tmp (e.g. a repo checkout under /tmp naming its own
-    # libexec helpers via readable_paths) skip stub creation and fail
-    # with ENOENT at mount(2). "/" is harmless either way (the
-    # `d + "/"` prefix test never matches it) but excluded for
-    # accuracy.
-    #
-    # Seeded with the step-8 target/output binds: file paths beneath
-    # them are already visible through the parent bind, so the
-    # O_CREAT|O_EXCL stub open would fail EEXIST (fail-closed exit
-    # 126) for a path that needs no stub at all.
-    _bound_dirs: set = {
-        "/dev", "/proc", "/sys",
-        *(f"/{d}" for d in _SYSTEM_RO_DIRS),
-        *_step8_bound_dirs,
-    }
-    _seen_extra_ro: set = set()
-    if extra_ro_paths:
-        for path in extra_ro_paths:
-            if not path:
-                continue
-            # Normalize like target/output above — a relative or
-            # non-normalized entry ("etc", "/tmp/../etc") would evade
-            # the exact-string shadow check and produce a malformed
-            # bind target ("{root}etc") that diverges from the path
-            # the caller's Landlock read rule references.
-            path = os.path.abspath(path)
-            # Duplicate entries (the same path arriving via both
-            # readable_paths and tool_paths, or repeated caller
-            # entries) would hit the O_CREAT|O_EXCL stub open twice —
-            # the second pass fails EEXIST on the stub the first pass
-            # created and aborts the spawn. One bind per path.
-            if path in _seen_extra_ro:
-                continue
-            _seen_extra_ro.add(path)
-            if _shadows_per_ns(path):
-                continue
-            # Paths already served by the step-8 target/output binds
-            # keep their step-8 rw/ro semantics. Without this skip, a
-            # target that is ALSO the output (writable clone/build
-            # destinations — restrict_reads callers put target in the
-            # read allowlist, which forwards here) gets an ro bind
-            # stacked ON TOP of its rw bind and every child write
-            # fails with EROFS.
-            if path in (target, output):
-                continue
-            # Dir-vs-file decides stub creation below; derive it from
-            # the PINNED inode when a validation-time fd exists — the
-            # pathname isdir/isfile pair follows symlinks and is
-            # swappable between here and the bind. With pinning
-            # engaged (src_fds is not None), an entry the parent could
-            # not pin is skipped outright: it did not exist at
-            # validation, and falling back to mount-time resolution
-            # would hand a concurrent writer a downgrade lever (plant
-            # the path after validation, get it bound).
-            _extra_fd = _src_fd(path)
-            if _extra_fd is not None:
-                _pin_mode = os.fstat(_extra_fd).st_mode
-                _extra_is_dir = stat_module.S_ISDIR(_pin_mode)
-                _extra_is_file = stat_module.S_ISREG(_pin_mode)
-            elif src_fds is not None:
-                continue
-            else:
-                _extra_is_dir = os.path.isdir(path)
-                _extra_is_file = os.path.isfile(path)
-            if not _extra_is_dir and not _extra_is_file:
-                continue
-            inside = f"{root}{path}"
-            # _step names which sub-operation is running so the outer
-            # OSError handler can report the actual failing step
-            # ("makedirs" / "open mount-point" / "bind") instead of
-            # always saying "bind failed" — pre-fix `os.makedirs` /
-            # `os.open` failures (e.g. ENOENT on a malformed path)
-            # were reported as "bind failed (errno=2)", which an
-            # operator inspecting the kernel log could not match
-            # against the actual syscall that errored.
-            #
-            # ASCII-only short labels so the bytes concat in the
-            # except clause stays fork-safe + allocation-bounded.
-            _step = b"setup"
-            try:
-                if rootfs:
-                    _refuse_image_symlink_components(root, path)
-                if _extra_is_dir:
-                    _step = b"makedirs"
-                    os.makedirs(inside, exist_ok=True)
-                    _bound_dirs.add(path)
-                elif any(path.startswith(d + "/") for d in _bound_dirs):
-                    # Mount point already exists — a parent directory
-                    # (e.g. /etc from step 4, or an earlier
-                    # extra_ro_paths entry) was bind-mounted into the
-                    # namespace, which populated this path.  Skip
-                    # creation and proceed to the overlay bind.
-                    pass
-                elif rootfs and os.path.lexists(inside):
-                    # Rootfs mode: the whole root came from the image
-                    # bind, so an existing path here is image content —
-                    # binding over it is exactly the caller's intent
-                    # (the host-mode O_EXCL planted-state defence guards
-                    # a fresh private tmpfs, which doesn't apply).
-                    pass
-                else:
-                    # File bind-mount: create an empty regular file to
-                    # serve as the mount point.
-                    #
-                    # Use os.open with O_NOFOLLOW + 0o600 instead of
-                    # `open(inside, "a")`:
-                    #   * O_NOFOLLOW refuses to follow a symlink at
-                    #     `inside` — defence-in-depth even though our
-                    #     tmpfs root was freshly mkdir'd.
-                    #   * O_CREAT | O_EXCL refuses to reuse a pre-existing
-                    #     mount-point (which would also indicate something
-                    #     planted state we don't expect).
-                    #   * mode 0o600 — the mount-point itself shouldn't
-                    #     be world-readable (was 0o644 default via umask).
-                    _step = b"makedirs (parent)"
-                    os.makedirs(os.path.dirname(inside), exist_ok=True)
-                    _step = b"open mount-point"
-                    fd = os.open(
-                        inside,
-                        os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW | os.O_EXCL,
-                        0o600,
-                    )
-                    os.close(fd)
-                _step = b"bind"
-                try:
-                    _bind_pinned_source(path, inside, MS_BIND,
-                                        pinned_fd=_extra_fd)
-                except OSError as bind_exc:
-                    # EINVAL: a NON-recursive bind of a tree containing
-                    # locked submounts (mounts created by a more-
-                    # privileged namespace — e.g. Docker's overlays
-                    # under /var/lib/docker) is refused by the kernel
-                    # in a user namespace, because it would expose the
-                    # paths hidden underneath them. A RECURSIVE bind
-                    # carries the submounts along instead — legal, and
-                    # it never reveals anything the host didn't already
-                    # show. But the remount-ro below covers the top
-                    # mount only, so the carried submounts stay rw at
-                    # the mount layer; that is acceptable ONLY when
-                    # Landlock is active as the write-enforcement
-                    # backstop (its write mask is unconditional and
-                    # covers these paths). Without Landlock, keep the
-                    # original fail-closed behaviour — a degraded
-                    # sandbox masquerading as the requested one is
-                    # worse than a loud setup failure.
-                    if bind_exc.errno != _EINVAL or not rw_submounts_ok:
-                        raise
-                    _bind_pinned_source(path, inside, MS_BIND | MS_REC,
-                                        pinned_fd=_extra_fd)
-                    try:
-                        _path_b = path.encode("utf-8", errors="replace")
-                    except Exception:  # noqa: BLE001
-                        _path_b = b"<unencodable>"
-                    warn_post_fork(
-                        b"mount_ns: extra_ro_paths recursive bind for "
-                        + _path_b
-                        + b" (locked submounts); submount ro relies on"
-                        b" Landlock\n"
-                    )
-                try:
-                    _mount(path, inside, None, _ro_remount_flags(inside))
-                except OSError as exc:
-                    # bytes(path) keeps the message fork-safe (no f-string
-                    # allocation pulling locks); fallback to a placeholder
-                    # if encoding ever fails. errno also encoded as integer.
-                    try:
-                        _path_b = path.encode("utf-8", errors="replace")
-                    except Exception:  # noqa: BLE001
-                        _path_b = b"<unencodable>"
-                    warn_post_fork(
-                        b"mount_ns: extra_ro_paths remount-ro failed for "
-                        + _path_b
-                        + b" (errno=%d); relying on Landlock\n"
-                        % (exc.errno or 0)
-                    )
-            except OSError as exc:
-                # Caller explicitly named this path via readable_paths
-                # in the public sandbox API — silently dropping it
-                # leaves a hole the caller did not authorise (the path
-                # is either missing from the sandbox, or worse, still
-                # writable when the caller asked for read-only). Fail-
-                # closed so the parent observes the failed setup
-                # instead of getting a degraded sandbox masquerading
-                # as the requested one.
-                #
-                # Per W35.C convention, fail-CLOSED sites use direct
-                # os.write(2, ...) + os._exit(N) rather than the
-                # warn_post_fork helper (helper is reserved for
-                # DiD warn-only sites).
-                try:
-                    _path_b = path.encode("utf-8", errors="replace")
-                except Exception:  # noqa: BLE001
-                    _path_b = b"<unencodable>"
-                try:
-                    os.write(
-                        2,
-                        b"sandbox: mount_ns: extra_ro_paths "
-                        + _step
-                        + b" failed for "
-                        + _path_b
-                        + b" (errno=%d), exiting\n" % (exc.errno or 0),
-                    )
-                except OSError:
-                    pass
-                os._exit(SANDBOX_EXIT_MOUNT_NS_BIND_FAIL)
+    # 8b. Bind the remaining extra read-only paths the caller
+    # requested (via readable_paths in the public sandbox API). Each
+    # is bind-mounted at its original absolute path, so the child sees
+    # it exactly where the caller expects. The mount plan was
+    # normalised, classified, and ancestor-sorted before step 8;
+    # proper ancestors of target/output already mounted there — these
+    # entries are the rest (files under the target/output binds,
+    # unrelated trees, nested entries in ancestor-first order). Safe
+    # to stack after the 8a/8a2 shadows: none of them covers the
+    # output or the target (ancestors were hoisted, exact matches
+    # skipped), and entries at or below the two MASKED paths were
+    # refused in the plan loop — a later bind there would land on top
+    # of the mask and unmask it.
+    for _entry in _extra_post:
+        _bind_one_extra_ro(*_entry)
 
     # 8c. Host-fingerprint overlay (opt-in via sanitise_host_fingerprint).
     # MUST happen BEFORE pivot_root — the persona's source files live
@@ -1404,7 +2085,13 @@ def setup_mount_ns(target: str | None, output: str | None,
             # O_CREAT / mount(2) OUTSIDE the staging root on the host
             # (today's producers are internal, but image-derived
             # values will flow here; fail safe now).
+            # normpath PRESERVES the POSIX two-slash prefix, so a
+            # "//etc/x" key would pass as normalized; the {root}
+            # concat stays in-tree (an empty path component), but the
+            # "/etc/"-prefix stub logic and every exact-string
+            # comparison would misclassify the spelling — reject it.
             if (not ns_target.startswith("/")
+                    or ns_target.startswith("//")
                     or os.path.normpath(ns_target) != ns_target
                     or ns_target == "/"):
                 warn_post_fork(
@@ -1443,6 +2130,28 @@ def setup_mount_ns(target: str | None, output: str | None,
                         b"create in-sandbox target; skipping bind\n"
                     )
                     continue
+            # Refuse to bind onto a symlink: mount(2) takes a
+            # pathname and resolves it in the PRE-pivot namespace, so
+            # a symlinked target (the host /etc plain-bind lane
+            # serving the stock resolv.conf link) lands the overlay
+            # at the link's HOST-side destination — silently
+            # off-path, with the post-pivot view dangling. The
+            # tmpfs-copy lane replaces such links with stubs before
+            # this loop; anything still a symlink here sits on a
+            # read-only view this code must not follow (fail closed:
+            # same honest un-overlaid outcome as a failed bind).
+            try:
+                if stat_module.S_ISLNK(os.lstat(inside).st_mode):
+                    warn_post_fork(
+                        b"sandbox: mount_ns: etc_overlay target is a "
+                        b"symlink in the sandbox view; refusing to "
+                        b"follow it - overlay entry absent, target "
+                        b"sees the un-overlaid view of this path\n"
+                    )
+                    continue
+            except OSError:
+                # Missing/vanished: the bind below reports it.
+                pass
             try:
                 _bind_pinned_source(host_source, inside, MS_BIND)
             except OSError:
@@ -1477,8 +2186,28 @@ def setup_mount_ns(target: str | None, output: str | None,
                 )
         _phase_trace(b"etc_overlay binds: done")
 
-    # 8e. Caller-supplied stage_files — materialise arbitrary files in
-    # the tmpfs root so they appear at their namespace path post-pivot.
+    # 8e. Caller-supplied stage_dirs / stage_files — materialise
+    # directories then files in the tmpfs root so they appear at their
+    # namespace paths post-pivot. Dirs first: staged files may land
+    # inside staged dirs, and empty members of a staged skeleton
+    # (XDG subdirs of a private $HOME) must exist regardless.
+    if stage_dirs:
+        for stage_dir in stage_dirs:
+            if not isinstance(stage_dir, str) or not stage_dir.startswith("/"):
+                warn_post_fork(
+                    b"sandbox: mount_ns: stage_dirs entry must be an "
+                    b"absolute path str; skipping\n"
+                )
+                continue
+            try:
+                os.makedirs(f"{root}{stage_dir}", mode=0o700,
+                            exist_ok=True)
+            except OSError as exc:
+                warn_post_fork(
+                    b"sandbox: mount_ns: stage_dirs failed "
+                    b"(errno=%d); target will not see this directory\n"
+                    % (exc.errno or 0)
+                )
     if stage_files:
         for stage_target, stage_content in stage_files.items():
             if not isinstance(stage_target, str) or not stage_target.startswith("/"):
@@ -1516,6 +2245,50 @@ def setup_mount_ns(target: str | None, output: str | None,
                     + b" (errno=%d); target will not see this file\n"
                     % (exc.errno or 0)
                 )
+
+    # 8f. WSL host: mask the Windows-interop/driver directories that
+    # ride the host binds into the view (the binfmt_misc registration
+    # mount under the step 6 /proc bind; /usr/lib/wsl under the step 4
+    # /usr bind — host-root mode; in rootfs mode the path exists only
+    # if the image ships it, and masking an image copy is harmless in
+    # the deny direction). Placed LAST among the mount steps so no
+    # extra bind, persona overlay, or etc_overlay entry can stack a
+    # live view back on top; the plan loop's masked-path refusal
+    # already rejects binds at or below each entry. Same convention
+    # as the 8a evidence-dir shadow: O_PATH-pinned mount point (never
+    # a twice-resolved pathname), a single empty read-only tmpfs, and
+    # a warn-not-abort failure direction — these masks are
+    # deny-direction hardening; the interop ESCAPE channel is closed
+    # structurally (fresh /run tmpfs is fail-closed, WSL_INTEROP /
+    # WSLENV are dropped by the env allowlist scrub). Inert off-WSL:
+    # _wsl_host is False and no mount is attempted.
+    if _wsl_host:
+        for _wsl_dir in _WSL_MASK_MOUNT_DIRS:
+            _wsl_mp = f"{root}{_wsl_dir}"
+            try:
+                _wfd = os.open(_wsl_mp, os.O_PATH | os.O_NOFOLLOW
+                               | os.O_DIRECTORY | os.O_CLOEXEC)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                warn_post_fork(
+                    b"sandbox: mount_ns: WSL mask target "
+                    + _wsl_dir.encode("ascii")
+                    + b" is not an openable directory; mask skipped\n"
+                )
+                continue
+            try:
+                _mount("tmpfs", f"/proc/self/fd/{_wfd}", "tmpfs",
+                       MS_RDONLY, "mode=700")
+            except OSError as exc:
+                warn_post_fork(
+                    b"sandbox: mount_ns: WSL interop mask failed for "
+                    + _wsl_dir.encode("ascii")
+                    + b" (errno=%d); the host view of this path stays "
+                    b"readable in the sandbox\n" % (exc.errno or 0)
+                )
+            finally:
+                os.close(_wfd)
 
     # 9. pivot_root. put_old must be a directory INSIDE new_root.
     # Last pre-pivot marker: the trace file lives on a HOST path, so

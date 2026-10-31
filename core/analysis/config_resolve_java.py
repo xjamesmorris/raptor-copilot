@@ -25,7 +25,18 @@ Resolver contract (every refusal is named and counted):
   resource, and ``recv.getProperty(...)`` reads; anything else —
   aliasing, call arguments, returns, field stores — refuses
   (``receiver_escapes``);
-* the load must precede the read (``load_after_get``);
+* the load must precede the read on a STRICTLY earlier row
+  (``load_after_get``) and DOMINATE it — the upward walk from the load
+  must pass through execution-transparent statement containers ONLY
+  (an allowlist: block, constructor body, expression statement,
+  labeled statement, synchronized statement) until it reaches a block
+  enclosing the get; any other ancestor refuses
+  (``conditional_load``). A load and get inside the SAME try block
+  qualify (a throwing load exits the block past the get); a load
+  whose failure a handler swallows before the get, a load in a
+  different arm of an if/switch, and every deferred or conditionally
+  evaluated vehicle (lambda, class initializer, short-circuit
+  operand, assert) do not;
 * the resource literal's basename must end ``.properties`` and match
   at most ``_CANDIDATE_CAP`` files under the search root; the key must
   appear exactly once across every matching file (``file_ambiguous``,
@@ -37,7 +48,8 @@ Resolver contract (every refusal is named and counted):
 Refusal taxonomy: ``parser_unavailable``, ``not_getproperty``,
 ``dynamic_key``, ``default_present``, ``no_receiver``,
 ``receiver_not_local``, ``multiple_loads``, ``load_not_found``,
-``load_after_get``, ``receiver_escapes``, ``dynamic_resource``,
+``load_after_get``, ``conditional_load``, ``receiver_escapes``,
+``dynamic_resource``,
 ``not_properties_file``, ``candidate_cap``, ``file_not_found``,
 ``file_ambiguous``, ``key_missing``, ``key_duplicated``,
 ``grammar_unsupported``, ``no_enclosing_method``.
@@ -66,7 +78,9 @@ def _parser():
     except Exception:  # noqa: BLE001 — optional dependency
         return None
     try:
-        return Parser(Language(tree_sitter_java.language()))
+        from core.inventory._ts_cache import bounded
+        return bounded(Parser(Language(tree_sitter_java.language())),
+                       label="java")
     except Exception:  # noqa: BLE001
         return None
 
@@ -135,7 +149,14 @@ class _FileIndex:
         capped = False
         try:
             for p in self._root.rglob(basename):
-                if any(part in _SKIP_DIR_PARTS for part in p.parts):
+                # Relative to the search root: the root's own parent
+                # dirs (a checkout under out/, build/, ...) must not
+                # hide every candidate file.
+                try:
+                    rel_parts = p.relative_to(self._root).parts
+                except ValueError:
+                    rel_parts = p.parts
+                if any(part in _SKIP_DIR_PARTS for part in rel_parts):
                     continue
                 if not p.is_file():
                     continue
@@ -206,13 +227,86 @@ def _string_literals_within(node) -> list[str]:
     return out
 
 
+# Ancestor node types that are execution-TRANSPARENT: when every
+# node between a load and an enclosing block is one of these,
+# executing that block's statement sequence executes the load. The
+# dominance walk ACCEPTS only these and refuses on anything else —
+# fail-closed, per the module's refusal-first contract. A blocklist
+# here was the unsound shape: every deferred or conditionally
+# evaluated construct it omitted (class bodies — instance
+# initializers run at instantiation, not declaration; short-circuit
+# ``&&``/``||`` operands; assert statements, disabled by default)
+# made the walk resolve a load that never or only conditionally
+# executes. Conditionals, loops, try, lambdas, and every
+# never-adjudicated construct now all refuse by absence.
+# synchronized blocks execute unconditionally once reached and are
+# members; labeled statements are plain wrappers.
+_EXECUTION_TRANSPARENT_PARENTS = frozenset({
+    "block", "constructor_body", "expression_statement",
+    "labeled_statement", "synchronized_statement",
+})
+
+# Statement-list node types that scope the dominance walk. Only these
+# count as a shared region: multi-arm constructs (if/else, switch
+# groups) share a non-block ancestor, so an arm-to-arm pair never
+# meets a shared BLOCK before the construct node refuses it.
+_BLOCK_TYPES = frozenset({"block", "constructor_body"})
+
+_METHOD_TYPES = ("method_declaration", "constructor_declaration")
+
+
+def _load_dominates_get(load_node, get_node) -> bool:
+    """True when every execution path that reaches the get has already
+    executed the load.
+
+    The load dominates the get iff the walk UP from the load reaches a
+    block that also encloses the get while crossing ONLY
+    execution-transparent ancestors (``_EXECUTION_TRANSPARENT_PARENTS``
+    — an allowlist; anything else refuses, fail-closed). A load and
+    get in the SAME try block qualify: if the load throws, control
+    leaves the block past the get — no path reads an unloaded
+    receiver. A load whose failure a handler swallows
+    (``try { load } catch {}`` with the get after the try) does not:
+    the try_statement is not transparent. Mutually exclusive arms
+    (if/else, switch groups) share only the construct node, never a
+    block. Deferred vehicles (a lambda body or class initializer with
+    the get OUTSIDE it) and conditionally evaluated positions
+    (short-circuit operands, asserts) are not transparent either — a
+    load+get pair inside the SAME lambda body still resolves, because
+    the shared block is met before the lambda node. Statement ORDER
+    within the shared block is the caller's row check, not this
+    walk's job.
+    """
+    # Node identity via ``Node.id`` (the underlying parse-tree node):
+    # the Python bindings hand out a FRESH wrapper object per
+    # ``.parent`` access, so ``id(node)`` is unstable across walks.
+    get_blocks: set[int] = set()
+    cur = get_node.parent
+    while cur is not None:
+        if cur.type in _BLOCK_TYPES:
+            get_blocks.add(cur.id)
+        if cur.type in _METHOD_TYPES:
+            break
+        cur = cur.parent
+    cur = load_node.parent
+    while cur is not None:
+        if cur.id in get_blocks:
+            return True
+        if cur.type not in _EXECUTION_TRANSPARENT_PARENTS:
+            return False
+        cur = cur.parent
+    return False
+
+
 def _receiver_discipline(method_node, receiver: str,
-                         get_row: int) -> tuple[str | None, str]:
+                         get_node: Node) -> tuple[str | None, str]:
     """(resource_basename, refusal). Walks the enclosing method once:
     classifies every appearance of ``receiver`` and extracts the single
     load resource literal. Any unclassified appearance refuses."""
+    get_row = get_node.start_point[0] + 1
     new_props = 0
     load_rows: list[int] = []
+    load_node: Node | None = None
     resource: str | None = None
     dynamic_resource = False
     other_appearance = False
@@ -242,6 +336,7 @@ def _receiver_discipline(method_node, receiver: str,
                 mname = _text(meth)
                 if mname == "load":
                     load_rows.append(n.start_point[0] + 1)
+                    load_node = n
                     literals = _string_literals_within(n)
                     if len(literals) == 1:
                         resource = literals[0]
@@ -273,7 +368,12 @@ def _receiver_discipline(method_node, receiver: str,
         return None, "receiver_escapes"
     if dynamic_resource or resource is None:
         return None, "dynamic_resource"
-    if load_rows[0] > get_row:
+    if load_node is None or not _load_dominates_get(load_node, get_node):
+        return None, "conditional_load"
+    # >=: a load sharing the get's row could execute AFTER it (the
+    # one-liner 'get(...); load(...)' spelling) — row order cannot
+    # prove load-before-read there, refuse.
+    if load_rows[0] >= get_row:
         return None, "load_after_get"
     basename = resource.rsplit("/", 1)[-1]
     if not basename.endswith(".properties"):
@@ -340,10 +440,11 @@ class ConfigResolver:
         if method_node is None:
             return self._refuse("no_enclosing_method")
         basename, refusal = _receiver_discipline(
-            method_node, _text(obj), node.start_point[0] + 1)
+            method_node, _text(obj), node)
         if refusal:
             return self._refuse(refusal)
 
+        assert basename is not None
         matches, capped = self._index.locate(basename)
         if capped:
             return self._refuse("candidate_cap")

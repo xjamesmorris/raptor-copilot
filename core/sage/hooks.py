@@ -5,9 +5,14 @@ Mechanical hooks that make hard decisions (skip, suppress, reorder,
 set flags) based on SAGE recall. Every hook is a no-op when SAGE is
 unavailable.
 
-Prompt-injection hooks (recalled text dropped into LLM prompts) were
-removed — they had no measurable effect and no guarantee the LLM
-weighed them correctly.
+Two hint-tier recall surfaces DO feed recalled rows into prompt/
+report context — ``recall_context_for_validation`` and
+``recall_context_for_web_scan``. They carry hint authority only
+(rows are ``mac_verified``-annotated so consumers can distinguish
+rows minted by this install from arbitrary recall text) and must
+never suppress or hard-decide anything. The earlier generation of
+prompt-injection hooks beyond those two was removed — no measurable
+effect and no guarantee the LLM weighed them correctly.
 """
 
 import math
@@ -15,6 +20,7 @@ import os
 import re
 import threading
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +70,13 @@ def _ollama_gpu_available() -> bool:
     ``SAGE_OLLAMA_URL`` (same knob the direct-embed path in
     core/sage/client.py reads); default is the compose-mapped port.
     """
+    from core.security.session_services import (
+        report_session_service_policy,
+        session_services_restricted,
+    )
+    if session_services_restricted():
+        report_session_service_policy()
+        return False
     global _ollama_has_gpu, _ollama_gpu_checked_at
     if _ollama_has_gpu:
         return True
@@ -165,6 +178,13 @@ def _get_client() -> SageClient | None:
     only on the negative-cache side where the cost of being
     wrong is "all SAGE features disabled for the rest of the run".
     """
+    from core.security.session_services import (
+        report_session_service_policy,
+        session_services_restricted,
+    )
+    if session_services_restricted():
+        report_session_service_policy()
+        return None
     global _client, _client_initialised, _client_none_decided_at
     with _client_lock:
         needs_init = not _client_initialised
@@ -371,7 +391,13 @@ def infer_afl_fuzz_flags_from_sage_recall_row(
     flags = _afl_flags_from_text(clean)
     if not flags:
         return []
-    match = re.search(r": strategy (.+?), binary fingerprint (.+?), duration", clean)
+    # Gaps bounded: unbounded, every planted head phrase re-scans the
+    # rest of a hostile row — quadratic (two gaps: cubic). Writer
+    # values sit far below the bounds.
+    match = re.search(
+        r": strategy (.{1,500}?), binary fingerprint (.{1,500}?), duration",
+        clean,
+    )
     fields = {
         "kind": "afl_flags",
         "strategy": match.group(1) if match else "",
@@ -576,11 +602,15 @@ def infer_codeql_build_from_sage_recall_row(
     if m_outcome:
         out["outcome"] = m_outcome.group(1)
 
-    m_lang = re.search(r"languages ([^,]+(?:, [^,]+)*), outcome", text)
+    # List bounded (element length and count): unbounded, every
+    # planted "languages " head re-scans the rest of a hostile row —
+    # quadratic. Writer rows hold a handful of short names.
+    m_lang = re.search(
+        r"languages ([^,]{1,100}(?:, [^,]{1,100}){0,32}), outcome", text)
     if m_lang:
         out["languages"] = m_lang.group(1).strip()
 
-    m_cmd = re.search(r"build command (.+?), analyses completed", text)
+    m_cmd = re.search(r"build command (.{1,1000}?), analyses completed", text)
     if m_cmd and out.get("outcome") == "success":
         cmd = m_cmd.group(1).strip()
         if cmd and cmd != "auto":
@@ -751,6 +781,79 @@ def compute_finding_source_hash(
     return sha256_string(f"{span_hash}:{file_hash}")[:12]
 
 
+def finding_verdict_source_hash(
+    repo_root: Path,
+    rel_path: str,
+    line: int,
+) -> str:
+    """Source-identity hash for a finding-verdict store row.
+
+    One formula shared by every verdict WRITER (the /agentic analysis
+    loop and the operator verdict CLI): a finding with a known line
+    (``line > 0``) hashes the window around it via
+    :func:`compute_finding_source_hash` — the exact hash the recall
+    side recomputes before suppressing. A line-less finding
+    (``line == 0``) hashes the capped file prefix instead: recall
+    gates on ``line > 0``, so such a row never mechanically
+    suppresses, but the stored identity stays stable for the
+    knowledge base. The capped read matters — the path points into a
+    scanned repo, so an uncapped read of a hostile giant file is an
+    OOM lever; a >cap file changes hash iff its capped prefix does.
+
+    Returns ``""`` when the file is unreadable (callers must not
+    store a verdict row without a source identity).
+    """
+    fpath = Path(repo_root) / rel_path
+    if line > 0:
+        return compute_finding_source_hash(fpath, line)
+    from core.source import read_text_capped
+    got = read_text_capped(fpath)
+    if got is None:
+        return ""
+    return sha256_string(got[0])[:12]
+
+
+def finding_source_hashes(
+    file_path: Path,
+    line_start: int,
+    line_end: int,
+    window: int = 10,
+) -> dict[str, int]:
+    """Store-format window hashes for a range of candidate finding lines.
+
+    Same formula as :func:`compute_finding_source_hash` in its
+    window form (``line`` ± ``window`` span hash folded with the
+    full-file hash), for callers that must match a STORED finding
+    hash against a span whose exact finding line is unknown (the
+    /audit function-grade primer). The loop-invariant full-file hash
+    is computed ONCE and the span hashes batch over a single file
+    read — per-line calls to ``compute_finding_source_hash`` re-read
+    and re-hash the whole file every iteration (measured near a
+    second per no-match scan on real files).
+
+    Returns ``{hash: line}`` for every computable candidate; ``{}``
+    when the file is unreadable or the range is empty. Later lines
+    overwrite on the (theoretical) collision — callers only test
+    membership.
+    """
+    if line_start <= 0 or line_end < line_start:
+        return {}
+    from core.staleness import hash_spans
+    try:
+        file_text = file_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    file_hash = sha256_string(file_text)[:12]
+    lines = list(range(line_start, line_end + 1))
+    spans = [(max(1, ln - window), ln + window) for ln in lines]
+    span_hashes = hash_spans(file_path, spans)
+    return {
+        sha256_string(f"{sh}:{file_hash}")[:12]: ln
+        for ln, sh in zip(lines, span_hashes)
+        if sh
+    }
+
+
 # Client-side lifetime bound on suppressible verdicts. Even a verdict
 # whose source hash still matches goes stale eventually (build flags,
 # dependencies, and reachability drift without touching the file);
@@ -834,6 +937,7 @@ def recall_prior_finding_verdict(
             ts = ts_match.group(1)
             for v in _SUPPRESS_VERDICTS:
                 if f"||verdict={v}||" in content:
+                    tool_fields = _tool_fields_from_content(content)
                     fields = {
                         "kind": "finding_verdict",
                         "repo": _repo_key(repo_path),
@@ -841,21 +945,129 @@ def recall_prior_finding_verdict(
                         "verdict": v,
                         "src": source_hash,
                         "ts": ts,
+                        **tool_fields,
+                        **_mint_fields_from_content(content),
                     }
                     if not _row_mac_ok("finding_verdict", fields, token):
                         break
                     if not _row_ts_fresh("finding_verdict", ts):
                         break
+                    if not _skip_receipt_ok(
+                        "finding_verdict",
+                        tool_fields.get("tool", ""),
+                        fields,
+                    ):
+                        break
                     _metric_inc("recall_hits")
                     return {
                         "verdict": v,
                         "source_hash": source_hash,
+                        "tool": tool_fields.get("tool", ""),
                         "confidence": recall_row_confidence(row),
                     }
         return None
     except Exception as e:  # noqa: BLE001 — SAGE is best-effort; a hook failure must never break the pipeline
         logger.debug("SAGE FP recall failed: %s", e)
         return None
+
+
+def recall_prior_fp_verdicts(
+    repo_path: str,
+    file_path: str,
+    function: str,
+    top_k: int = 3,
+) -> list[dict[str, Any]]:
+    """MAC-verified suppressible finding verdicts for one function.
+
+    Rule-agnostic companion to :func:`recall_prior_finding_verdict`
+    for callers that review whole FUNCTIONS rather than one scanner
+    finding (the /audit loop): they know ``file:function`` but not
+    which rule produced the prior finding, and the stored source hash
+    is windowed around the FINDING line, which they also do not know.
+    Returns every suppressible (``false_positive`` /
+    ``not_exploitable``) verdict row stored for the function — MAC
+    verified against the rule the row itself names, TTL-fresh — each
+    carrying the ``source_hash`` the CALLER must still match against
+    the current source (scan the function's lines with
+    :func:`compute_finding_source_hash`; no match ⇒ stale ⇒ re-test).
+
+    The rule id is recovered from the row content; the MAC fingerprint
+    is recomputed from it, so a forged or delimiter-mangled rule value
+    fails verification and the row is dropped (fail direction:
+    re-test). Honours ``RAPTOR_SAGE_FP_SUPPRESS`` like the rule-keyed
+    recall. Returns ``[]`` on any failure or when SAGE is absent.
+    """
+    if not env_flag("RAPTOR_SAGE_FP_SUPPRESS", default=True):
+        logger.debug(
+            "SAGE finding_verdict: suppression disabled via "
+            "RAPTOR_SAGE_FP_SUPPRESS=0 — re-testing",
+        )
+        return []
+    client = _get_client()
+    if client is None:
+        return []
+    try:
+        _metric_inc("recall_attempted")
+        results = client.query(
+            text=f"Finding verdict: file={file_path} fn={function}",
+            domain_tag=_fp_domain(repo_path),
+            top_k=top_k,
+            min_confidence=0.7,
+        )
+        _s = _sanitise_delim
+        # Semantic retrieval can return neighbours — bind to THIS
+        # function before anything else.
+        binding = f" file={_s(file_path)} fn={_s(function)} ||src="
+        rows: list[dict[str, Any]] = []
+        for row in results:
+            content, token = rowmac.strip(str(row.get("content") or ""))
+            if binding not in content:
+                continue
+            src_match = re.search(r"\|\|src=([^|]+)\|\|", content)
+            rule_match = re.search(r" rule=(.{0,500}?) file=", content)
+            ts_match = re.search(r"\|\|ts=(\d+)\|\|", content)
+            if not src_match or rule_match is None or not ts_match:
+                # Pre-TTL / malformed rows demote to hint — re-test.
+                continue
+            src = src_match.group(1)
+            rule = rule_match.group(1)
+            ts = ts_match.group(1)
+            for v in _SUPPRESS_VERDICTS:
+                if f"||verdict={v}||" not in content:
+                    continue
+                tool_fields = _tool_fields_from_content(content)
+                fields = {
+                    "kind": "finding_verdict",
+                    "repo": _repo_key(repo_path),
+                    "fp": _finding_fingerprint(rule, file_path, function),
+                    "verdict": v,
+                    "src": src,
+                    "ts": ts,
+                    **tool_fields,
+                    **_mint_fields_from_content(content),
+                }
+                if not _row_mac_ok("finding_verdict", fields, token):
+                    break
+                if not _row_ts_fresh("finding_verdict", ts):
+                    break
+                # No receipt gate here: this recall feeds hint-tier FP
+                # primers by contract (the caller never skips on it),
+                # so unreceipted rows stay recallable. The rebuild
+                # keeps receipted rows MAC-verifiable and the returned
+                # tool honest.
+                _metric_inc("recall_hits")
+                rows.append({
+                    "verdict": v,
+                    "rule": rule,
+                    "source_hash": src,
+                    "tool": tool_fields.get("tool", ""),
+                    "confidence": recall_row_confidence(row),
+                })
+                break
+        return rows
+    except Exception as e:  # noqa: BLE001 — SAGE is best-effort; a hook failure must never break the pipeline
+        logger.debug("SAGE FP recall (function-grade) failed: %s", e)
+        return []
 
 
 def store_finding_verdict(
@@ -865,17 +1077,69 @@ def store_finding_verdict(
     function: str,
     source_hash: str,
     verdict: str,
+    *,
+    note: str = "",
+    evidence_tool: str = "",
+    mint: Mapping[str, str] | None = None,
+    client: SageClient | None = None,
 ) -> bool:
     """Store a finding verdict to SAGE for cross-run FP suppression.
 
     All verdicts are stored (building the knowledge base), but only
     ``false_positive`` and ``not_exploitable`` trigger suppression on
-    future recall.
+    future recall — and only when the row carries a mechanical
+    receipt or operator mint provenance (the recall side's
+    ``_skip_receipt_ok`` gate); unreceipted rows stay recallable as
+    hint tier and the finding re-tests.
+
+    ``evidence_tool`` is the mechanical receipt backing the verdict
+    (empty when the verdict rests on LLM say-so alone). Non-empty
+    values land as an explicit ``||tool=...||`` marker AND join the
+    MAC'd decision-field set (self-describing versioning, same as
+    ``mint``), so a receipt cannot be grafted onto or stripped from a
+    stored row after the fact.
+
+    ``note`` is free-form audit text appended AFTER the marker fields
+    (the operator verdict CLI records its provenance stamp there).
+    Delimiter-sanitised so it can never forge a ``||key=value||``
+    marker; deliberately OUTSIDE the MAC'd decision-field set — the
+    recall side's mechanical decision never reads it, so it carries
+    hint/audit authority only and pipeline-minted rows verify
+    unchanged.
+
+    ``mint`` (operator CLI fp verb only) carries the mint-provenance
+    facts — the restricted key set :data:`_MINT_FIELD_KEYS`
+    (``minted``/``grant``/``mintctx``) — which land as explicit
+    ``||key=value||`` markers AND join the MAC'd decision-field set,
+    so a stored row's mint authority cannot be silently edited after
+    the fact: readers rebuild the field set from the row's own
+    markers (self-describing versioning — rows without mint markers
+    verify over the original field set, so existing rows keep
+    verifying), and any post-hoc marker edit, strip, or graft changes
+    the reconstructed field set and fails MAC verification. Honest
+    bound, same as the rest of the row MAC: the binding is only as
+    strong as the key file — a same-user process that can read
+    ``rowmac.key`` can re-mint whatever fields it likes (that trust
+    tier is bounded by the rowmac module's own documentation).
+
+    ``client`` overrides the pipeline singleton — the operator CLI
+    passes :func:`operator_client` (no GPU gate; a one-off verdict on
+    a CPU-only box is fine), the pipeline keeps the gated default.
     """
     if not source_hash:
         return False
-    client = _get_client()
     if client is None:
+        client = _get_client()
+    if client is None:
+        return False
+    if mint is not None and (
+        not mint
+        or any(k not in _MINT_FIELD_KEYS or not str(v)
+               for k, v in mint.items())
+    ):
+        # Fail closed on a malformed mint set: silently dropping the
+        # keys would store an unmarked row that reads as pre-mint.
+        logger.debug("SAGE finding_verdict: malformed mint fields %r", mint)
         return False
     try:
         fp = _finding_fingerprint(rule_id, file_path, function)
@@ -887,18 +1151,29 @@ def store_finding_verdict(
             f"||src={_s(source_hash)}|| ||verdict={_s(verdict)}|| "
             f"||ts={ts}||"
         )
-        content = _stamp_row(
-            "finding_verdict",
-            content,
-            {
-                "kind": "finding_verdict",
-                "repo": _repo_key(repo_path),
-                "fp": fp,
-                "verdict": verdict,
-                "src": source_hash,
-                "ts": ts,
-            },
-        )
+        fields = {
+            "kind": "finding_verdict",
+            "repo": _repo_key(repo_path),
+            "fp": fp,
+            "verdict": verdict,
+            "src": source_hash,
+            "ts": ts,
+        }
+        if evidence_tool:
+            clean_tool = _s(evidence_tool)
+            content += f" ||tool={clean_tool}||"
+            fields["tool"] = clean_tool
+        if mint:
+            for key in _MINT_FIELD_KEYS:
+                value = mint.get(key)
+                if value is None:
+                    continue
+                clean = _s(str(value))
+                content += f" ||{key}={clean}||"
+                fields[key] = clean
+        if note:
+            content += f" {_s(note)}"
+        content = _stamp_row("finding_verdict", content, fields)
         return _propose_redacted(
             client=client,
             content=content,
@@ -913,13 +1188,422 @@ def store_finding_verdict(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Finding verdict — operator verbs (the /review verdict CLI)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# The pipeline hooks above are write-once/recall-only: they have no way
+# to CLEAR a wrong prior verdict (the semantic query deliberately drops
+# memory ids). The operator verbs below enumerate the repo's fp domain
+# through the id-bearing listing so a human can overturn a stored
+# verdict. They live beside the store/recall pair because the row
+# shape (content grammar + MAC field set) is owned by this section —
+# a second module parsing it would drift.
+
+_OPERATOR_LIST_PAGE = 200
+_OPERATOR_LIST_MAX_PAGES = 200
+
+_VERDICT_ROW_RE = re.compile(
+    r"\|\|src=([^|]+)\|\| \|\|verdict=([^|]+)\|\| \|\|ts=(\d+)\|\|")
+
+# Mint-provenance markers the operator CLI's fp verb stores (HOW the
+# standing suppression was authorised): ``minted`` (grant | ceremony),
+# ``grant`` (the operator-grant result at mint time), ``mintctx``
+# (compact invocation-context stamp). Fixed order, restricted set —
+# they join the MAC'd decision-field set on rows that carry them, so
+# they are tamper-evident, never free audit text.
+_MINT_FIELD_KEYS = ("minted", "grant", "mintctx")
+_MINT_FIELD_RES = {
+    key: re.compile(r"\|\|" + key + r"=([^|]+)\|\|")
+    for key in _MINT_FIELD_KEYS
+}
+# Reserved field injected by the reader when a row carries a mint
+# marker key MORE THAN ONCE. Never a member of _MINT_FIELD_KEYS, so
+# no store can ever mint a token covering it — verification of a
+# duplicate-marker row necessarily fails (demote to hint).
+_MINT_DUP_SENTINEL = "mintdup"
+
+
+def _mint_fields_from_content(content: str) -> dict[str, str]:
+    """Mint-provenance fields a stored row itself declares.
+
+    Self-describing versioning for the row MAC: the store side puts
+    each mint fact in the content as an explicit ``||key=value||``
+    marker AND in the MAC'd field set, so the verifier rebuilds the
+    field set from the markers the row carries. Rows without markers
+    (every pre-mint row, and every pipeline row) reconstruct the
+    original field set and keep verifying. Any edit is caught by the
+    MAC: stripping a marker (the token was minted over more fields),
+    grafting one onto an old row (the token was minted over fewer),
+    changing a value (field mismatch), or DUPLICATING a marker all
+    fail verification and demote the row to hint tier — the fail
+    direction is re-test.
+
+    The duplicate rule closes the append shape adversarial re-verify
+    found: a first-match rebuild let ``<legit row> ||minted=grant||``
+    verify under the legit token while displaying two contradictory
+    markers. No store writes a mint key twice
+    (:data:`_MINT_FIELD_KEYS` is validated unique at store time), so
+    any repeated key is tamper evidence — the rebuild then injects
+    the reserved :data:`_MINT_DUP_SENTINEL` field, which no minted
+    token ever covers, and verification fails.
+    """
+    fields: dict[str, str] = {}
+    for key in _MINT_FIELD_KEYS:
+        values = _MINT_FIELD_RES[key].findall(content)
+        if len(values) > 1:
+            return {_MINT_DUP_SENTINEL: "duplicate-markers"}
+        if values:
+            fields[key] = values[0]
+    return fields
+
+
+_TOOL_MARKER_RE = re.compile(r"\|\|tool=([^|]*)\|\|")
+
+
+def _tool_fields_from_content(content: str) -> dict[str, str]:
+    """Receipt field a stored verdict row itself declares.
+
+    Same self-describing-versioning discipline as
+    :func:`_mint_fields_from_content`: the store side puts the
+    verdict's backing tool receipt in the content as an explicit
+    ``||tool=...||`` marker AND in the MAC'd decision-field set, so
+    the verifier rebuilds the field set from the marker the row
+    carries. Finding-verdict rows without the marker (every
+    pre-receipt row, and rows whose analysis carried no mechanical
+    receipt) reconstruct the original field set and keep verifying —
+    they simply carry no receipt, so the skip gate withholds the
+    mechanical suppression and the finding re-tests.
+    Audit-hypothesis rows have always carried the marker OUTSIDE the
+    MAC'd set, so pre-receipt rows there fail verification and demote
+    to hint — a one-time recall-skip drop; re-review re-earns a
+    receipted row. A duplicated marker is tamper evidence (no store
+    writes the key twice) and injects the reserved duplicate
+    sentinel, which no minted token covers, so verification fails —
+    the fail direction is re-test.
+    """
+    values = _TOOL_MARKER_RE.findall(content)
+    if len(values) > 1:
+        return {_MINT_DUP_SENTINEL: "duplicate-markers"}
+    if values:
+        return {"tool": values[0]}
+    return {}
+
+
+def _skip_receipt_ok(hook: str, tool: str, fields: Mapping[str, str]) -> bool:
+    """Whether a MAC-verified verdict row carries mechanical-skip
+    authority.
+
+    The recall side's receipt gate: a recalled prior verdict may skip
+    analysis only when the row's MAC'd ``tool`` field passes the
+    evidence-grade firewall (``is_tool_evidence`` — a receipt from a
+    tool run the pipeline made), or the row carries MAC-verified
+    operator mint provenance (the /review fp ceremony/grant — the
+    sanctioned standing-suppression route, human authority). A bare
+    LLM verdict earns storage, confidence, and hint tier, never the
+    skip: one steered model verdict must not become a standing
+    TTL-length suppression. Withholding the skip never flips the
+    stored verdict and never drops the row — the item re-tests
+    through the ordinary analysis path.
+
+    Callers gate AFTER ``_row_mac_ok``: both the receipt and the mint
+    markers consulted here are already tamper-checked members of the
+    row's reconstructed field set.
+    """
+    if any(key in fields for key in _MINT_FIELD_KEYS):
+        return True
+    if not tool:
+        logger.debug(
+            "SAGE %s: prior verdict carries no tool receipt — "
+            "hint tier only, re-testing", hook,
+        )
+        return False
+    from core.audit.evidence_grade import is_tool_evidence
+    if is_tool_evidence(tool):
+        return True
+    logger.debug(
+        "SAGE %s: prior verdict tool %r is not verification-grade — "
+        "hint tier only, re-testing", hook, tool,
+    )
+    return False
+
+
+class VerdictWalkTruncated(RuntimeError):
+    """The verdict-row enumeration could not cover the whole store.
+
+    Raised — never swallowed into a partial result — because the
+    operator verbs act on the enumeration: a ``retest`` that clears
+    only the rows a truncated walk happened to see would report
+    success while a suppressing row survives. Fail closed; the caller
+    reports and clears nothing.
+    """
+
+
+def operator_client() -> SageClient | None:
+    """A SAGE client for one-off operator verbs, or ``None``.
+
+    Unlike :func:`_get_client` this skips the GPU probe — the gate
+    exists because pipeline hooks fire per-finding inside automated
+    runs where CPU embedding latency is prohibitive; a single
+    operator-invoked verdict is fine on CPU. No singleton either:
+    operator CLIs are short-lived processes and a fresh client avoids
+    the pipeline cache's staleness after a forget.
+    """
+    try:
+        config = SageConfig.from_env()
+        candidate = SageClient(config)
+        if candidate.is_available():
+            return candidate
+    except Exception as exc:  # noqa: BLE001 — absence is a normal state
+        logger.debug("SAGE operator client init failed: %s", exc)
+    return None
+
+
+def _iter_verdict_rows(
+    client: SageClient,
+    repo_path: str,
+    rule_id: str,
+    file_path: str,
+    function: str,
+    *,
+    strict: bool = False,
+):
+    """Yield ``(memory_id, verdict, source_hash, ts, mac_verified,
+    note, status)`` for every finding-verdict row stored for one
+    finding (``note`` = the free-form audit text after the marker
+    fields — the operator provenance stamp; ``status`` = the server's
+    lifecycle status string, ``""`` when the server reports none).
+    Rows the server has DEPRECATED (its reversible soft-delete — what
+    :func:`forget_finding_verdicts` performs) are skipped: a cleared
+    row must neither re-list as live nor be re-cleared.
+
+    Deterministic enumeration (bounded id-bearing listing filtered on
+    the repo's fp domain + the finding fingerprint — the domain is
+    also requested server-side, so the walk pages the repo's rows
+    rather than the whole store; the client-side domain check stays
+    as belt-and-braces for servers that ignore it), NOT semantic
+    recall — an operator clearing a verdict must see every row, not
+    the top-k nearest. Bounded like raptor-sage's memory walk (page
+    cap plus per-id dedupe), but incompleteness raises
+    :class:`VerdictWalkTruncated` instead of ending quietly: the
+    walk's consumers CLEAR rows, and a partial enumeration reported
+    as success would leave a suppressing row alive. The server's
+    ``has_more`` drives continuation when present (a server-capped
+    page smaller than our limit must not end the walk); on servers
+    that predate it, a short page ends the walk — the same
+    convention raptor-sage's fetch applies. ``strict=True`` (the
+    CLEARING verbs) additionally raises on a legacy full-page stall
+    instead of returning the partial view.
+    """
+    domain = _fp_domain(repo_path)
+    fp = _finding_fingerprint(rule_id, file_path, function)
+    binding = f"Finding verdict: fp={fp} "
+    seen: set[str] = set()
+    offset = 0
+    for _ in range(_OPERATOR_LIST_MAX_PAGES):
+        resp = client.list_memories(
+            limit=_OPERATOR_LIST_PAGE, offset=offset, domain=domain)
+        if resp is None:
+            raise VerdictWalkTruncated(
+                "SAGE memory listing failed mid-walk")
+        memories = getattr(resp, "memories", None) or []
+        has_more = bool(getattr(resp, "has_more", False))
+        if not memories:
+            if has_more:
+                raise VerdictWalkTruncated(
+                    "server returned an empty page with has_more set")
+            return
+        new_rows = 0
+        for m in memories:
+            mid = getattr(m, "memory_id", None)
+            if not isinstance(mid, str) or mid in seen:
+                continue
+            seen.add(mid)
+            new_rows += 1
+            status = getattr(m, "status", None)
+            status_str = str(getattr(status, "value", status) or "")
+            if status_str.lower() == "deprecated":
+                # The server's soft-delete: a cleared row must
+                # neither re-list as live nor be re-cleared.
+                continue
+            if getattr(m, "domain_tag", None) != domain:
+                continue
+            text, token = rowmac.strip(str(getattr(m, "content", "") or ""))
+            if not text.startswith(binding):
+                continue
+            match = _VERDICT_ROW_RE.search(text)
+            if not match:
+                continue
+            src, verdict, ts = match.groups()
+            fields = {
+                "kind": "finding_verdict",
+                "repo": _repo_key(repo_path),
+                "fp": fp,
+                "verdict": verdict,
+                "src": src,
+                "ts": ts,
+                **_tool_fields_from_content(text),
+                **_mint_fields_from_content(text),
+            }
+            mac_ok = _row_mac_ok("finding_verdict", fields, token)
+            note = text[match.end():].strip()
+            yield (mid, verdict, src, ts, mac_ok, note, status_str)
+        offset += len(memories)
+        if new_rows == 0:
+            if has_more:
+                raise VerdictWalkTruncated(
+                    "pagination stalled (pages of only already-seen "
+                    "rows with has_more set)")
+            if strict and len(memories) >= _OPERATOR_LIST_PAGE:
+                # A FULL page of only already-seen rows from a server
+                # that does not report has_more: indistinguishable
+                # from a broken/legacy pager repeating itself. The
+                # read path tolerates the partial view (raptor-sage's
+                # own fetch convention); a CLEARING verb must not —
+                # it would then report "cleared" while unseen rows
+                # survive.
+                raise VerdictWalkTruncated(
+                    "pagination stalled on a full page (legacy server "
+                    "without has_more)")
+            return
+        if not has_more and len(memories) < _OPERATOR_LIST_PAGE:
+            return
+    raise VerdictWalkTruncated(
+        f"page cap reached ({_OPERATOR_LIST_MAX_PAGES} pages) before "
+        "the server said stop")
+
+
+def list_finding_verdict_rows(
+    repo_path: str,
+    rule_id: str,
+    file_path: str,
+    function: str,
+    *,
+    client: SageClient | None = None,
+) -> list[dict[str, Any]] | None:
+    """Every stored verdict row for one finding, with memory ids.
+
+    Returns ``None`` when SAGE is unavailable (distinct from ``[]`` =
+    reachable but no rows). Each row: ``{memory_id, verdict,
+    source_hash, ts, mac_verified, note, status}`` — ``note`` carries
+    the row's free-form audit text (the operator provenance stamp),
+    so where a verdict came from is inspectable; ``status`` is the
+    server's lifecycle status (``""`` when unreported). Deprecated
+    rows are excluded (see :func:`_iter_verdict_rows`).
+    Raises :class:`VerdictWalkTruncated` when the enumeration could
+    not cover the store — callers must report, never treat the
+    partial view as the store's contents. (Read path: a legacy
+    server's full-page stall ends the walk quietly, like
+    raptor-sage's own fetch — the clearing verbs use the strict
+    walk.)
+    """
+    if client is None:
+        client = operator_client()
+    if client is None:
+        return None
+    try:
+        return [
+            {
+                "memory_id": mid,
+                "verdict": verdict,
+                "source_hash": src,
+                "ts": ts,
+                "mac_verified": mac_ok,
+                "note": note,
+                "status": status,
+            }
+            for mid, verdict, src, ts, mac_ok, note, status
+            in _iter_verdict_rows(
+                client, repo_path, rule_id, file_path, function)
+        ]
+    except VerdictWalkTruncated:
+        raise
+    except Exception as e:  # noqa: BLE001 — operator verbs degrade, never crash the CLI
+        logger.debug("SAGE verdict listing failed: %s", e)
+        return None
+
+
+def forget_finding_verdicts(
+    repo_path: str,
+    rule_id: str,
+    file_path: str,
+    function: str,
+    *,
+    verdicts: frozenset[str] | set[str] | None = None,
+    reason: str = "",
+    client: SageClient | None = None,
+) -> tuple[int, int] | None:
+    """Deprecate stored verdict rows for one finding.
+
+    ``verdicts`` restricts which verdict values are cleared (pass
+    :data:`_SUPPRESS_VERDICTS` for the tp verb — clear only the rows
+    that would suppress); ``None`` clears every verdict row (the
+    retest verb). MAC-unverified rows are cleared too: they never
+    mechanically suppress, but "clear the stored verdict" means the
+    whole record, and deprecation is the server's reversible
+    soft-delete.
+
+    Returns ``(cleared, failed)`` — rows deprecated, and rows the
+    server REFUSED to deprecate. Callers must fail loudly on any
+    ``failed``: a surviving suppressing row reported as cleared is
+    exactly the false-success the fail-closed walk exists to prevent.
+    Returns ``None`` when SAGE is unavailable. Raises
+    :class:`VerdictWalkTruncated` when the store could not be fully
+    enumerated — a STRICT walk (a legacy server's full-page stall
+    truncates too) that completes BEFORE any forget call, so nothing
+    is cleared on that path.
+    """
+    if client is None:
+        client = operator_client()
+    if client is None:
+        return None
+    try:
+        rows = list(_iter_verdict_rows(
+            client, repo_path, rule_id, file_path, function,
+            strict=True))
+    except VerdictWalkTruncated:
+        raise
+    except Exception as e:  # noqa: BLE001 — operator verbs degrade, never crash the CLI
+        logger.debug("SAGE verdict enumeration failed: %s", e)
+        return None
+    cleared = 0
+    failed = 0
+    for mid, verdict, _src, _ts, _mac_ok, _note, _status in rows:
+        if verdicts is not None and verdict not in verdicts:
+            continue
+        if client.forget(mid, reason=reason):
+            cleared += 1
+        else:
+            failed += 1
+    return cleared, failed
+
+
+# Public aliases — CLI consumers name the suppressing set and the
+# TTL without reaching into privately-named constants.
+SUPPRESS_VERDICTS = _SUPPRESS_VERDICTS
+SUPPRESS_TTL_DAYS = _SUPPRESS_TTL_DAYS
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Rule library — proven checker accumulation across runs
 # ─────────────────────────────────────────────────────────────────────────────
 
 _RULE_LIBRARY_DOMAIN = "raptor-rule-library"
 
 _RULE_REPLAY_MIN_TP_RATE = 0.8
-_RULE_REPLAY_MIN_TARGETS = 3
+
+# The ONE replay floor: a proven rule replays mechanically (skipping
+# synthesis) only after it has been tested on this many distinct
+# targets. Public because the disk rule library
+# (packages.checker_synthesis.library) sources its replay gate from
+# the same constant — two independently-tuned floors let the weaker
+# lane accumulate ``targets`` records that clear the stronger lane's
+# gate. LOWER (1-2) replays rules whose precision was only ever
+# demonstrated on the target that minted them — single-repo TP rates
+# routinely collapse on the next codebase; HIGHER delays legitimate
+# reuse of rules that already generalised, costing a synthesis run
+# per target with no added evidence quality.
+RULE_REPLAY_MIN_TARGETS = 3
+_RULE_REPLAY_MIN_TARGETS = RULE_REPLAY_MIN_TARGETS
 
 
 def store_proven_rule_metadata(
@@ -1171,6 +1855,13 @@ def store_audit_hypothesis_verdict(
                 "hyp": hyp_hash,
                 "src": source_hash,
                 "status": status,
+                # The receipt joins the MAC'd set (recall rebuilds it
+                # from the row's own ||tool=...|| marker), so a graft
+                # or strip of the marker fails verification. Rows
+                # stored before the tool joined the set fail MAC once
+                # on recall and re-review — a one-time recall-skip
+                # drop that re-earns a receipted row.
+                "tool": _s(evidence_tool),
                 "ts": ts,
             },
         )
@@ -1241,6 +1932,7 @@ def recall_audit_hypothesis_verdict(
             for s in _AUDIT_SKIP_STATUSES:
                 if f"||status={s}||" in content:
                     row_hyp = re.search(r"\|\|hyp=([^|]*)\|\|", content)
+                    tool_fields = _tool_fields_from_content(content)
                     fields = {
                         "kind": "audit_hypothesis",
                         "repo": _repo_key(repo_path),
@@ -1249,16 +1941,16 @@ def recall_audit_hypothesis_verdict(
                         "hyp": row_hyp.group(1) if row_hyp else "",
                         "src": source_hash,
                         "status": s,
+                        **tool_fields,
                         "ts": ts,
                     }
                     if not _row_mac_ok("audit_hypothesis", fields, token):
                         break
                     if not _row_ts_fresh("audit_hypothesis", ts):
                         break
-                    tool = ""
-                    tool_match = re.search(r"\|\|tool=([^|]*)\|\|", content)
-                    if tool_match:
-                        tool = tool_match.group(1)
+                    tool = tool_fields.get("tool", "")
+                    if not _skip_receipt_ok("audit_hypothesis", tool, fields):
+                        break
                     _metric_inc("recall_hits")
                     return {
                         "status": s,
@@ -1577,9 +2269,16 @@ def _concepts_domain(repo_path: str) -> str:
     return f"raptor-concepts-{_repo_key(repo_path)}"
 
 
+# Line-anchored (the horizontal-only ``[ \t]*`` form — ``^\s*`` with
+# re.M compounds across blank lines): the genuine 'Source hash:' line
+# always starts its line; see _verified_concept_rows.
+_CONCEPT_SRC_RE = re.compile(r"^[ \t]*Source hash: (\S+)", re.MULTILINE)
+
+
 def _verified_concept_rows(
     rows: list[dict[str, Any]],
     hook: str,
+    expected_concept: str | None = None,
 ) -> list[dict[str, Any]]:
     """Keep only concept rows whose MAC verifies (recall side).
 
@@ -1588,19 +2287,102 @@ def _verified_concept_rows(
     authorship — both are required before a row has mechanical effect.
     Rows without a valid token (legacy, foreign, tampered) are dropped
     from the mechanical path, exactly as if no memory existed.
+
+    The MAC proves AUTHORSHIP, not ADDRESSEE: a validly stamped row for
+    a semantic neighbor (get_page returned for a put_page query) still
+    verifies. When the caller keys results per identifier, it must pass
+    *expected_concept* so rows the consumer's matching rule would not
+    associate with that identifier are dropped before they drive its
+    skip/seed decision. The gate applies the consumer's own rule
+    (core.concepts.study.concept_matches_identifier) — stored concept
+    ids are routinely semantic names ('scatter_walk_state_machine' for
+    identifier 'scatter_walk'), so anything stricter drops legitimate
+    self rows.
+
+    The MAC also covers only the header fields {kind, concept, src},
+    never the row body, so the third check binds the body's evidence
+    lines to the token: the composite re-folded from the row's
+    evidence-line hashes (the same per-line extraction and fold the
+    store side minted src with) must equal the MAC-bound ``src`` —
+    both-empty passes (a concept stored without parseable evidence
+    hashes). Without it, a hostile store holding a previously-issued
+    genuine header+token could splice forged evidence lines into the
+    body whose hashes match CURRENT source; the freshness verifier
+    downstream re-hashes whatever locations those lines claim, so such
+    a row would sail into the mechanical skip path. The composite
+    binds the evidence-hash multiset only — see the scope note at the
+    check site.
     """
+    # Lazy: core.concepts.study imports this module back (call-time in
+    # both directions, so neither import can cycle at load).
+    from core.concepts.study import (
+        concept_matches_identifier,
+        stamped_evidence_composite,
+    )
     out: list[dict[str, Any]] = []
     for row in rows or []:
         clean, token = rowmac.strip(str(row.get("content") or ""))
-        m_id = re.search(r"Concept \[([^\]]+)\]", clean)
-        m_src = re.search(r"Source hash: (\S+)", clean)
+        # Bounded id: an unbounded bracket body re-scans a hostile row
+        # from every planted head — quadratic; writer ids are short.
+        m_id = re.search(r"Concept \[([^\]]{1,500})\]", clean)
+        # The genuine 'Source hash:' line is the LAST one the writer
+        # emits, and it starts its line; take the last line-anchored
+        # occurrence so a row whose earlier prose merely mentions
+        # 'Source hash: ...' at a line start cannot shadow it (an
+        # unanchored first-occurrence search let exactly that break MAC
+        # verification of a legitimate row). Inline mentions never
+        # start a line: the writer folds newlines out of field values.
+        src_matches = _CONCEPT_SRC_RE.findall(clean)
+        concept = m_id.group(1) if m_id else ""
         fields = {
             "kind": "study_concept",
-            "concept": m_id.group(1) if m_id else "",
-            "src": m_src.group(1) if m_src else "",
+            "concept": concept,
+            "src": src_matches[-1] if src_matches else "",
         }
-        if _row_mac_ok(hook, fields, token):
-            out.append(row)
+        # Gate order: MAC first (authorship — everything after trusts
+        # the header fields only once the token verifies), then
+        # addressee (is this row for the querying identifier), then
+        # evidence composite (is the body's evidence what the token
+        # was minted for).
+        if not _row_mac_ok(hook, fields, token):
+            continue
+        if expected_concept is not None and not concept_matches_identifier(
+            concept, expected_concept,
+        ):
+            logger.debug(
+                "SAGE %s: recall row is for concept %r, not %r — dropped from mechanical path",
+                hook, concept, expected_concept,
+            )
+            continue
+        # Evidence-composite binding. Scope: this binds WHICH evidence
+        # hashes the row carries (as a multiset), not the surrounding
+        # text — observation prose, invariants, contracts, and
+        # HASHLESS evidence lines stay outside both the MAC and the
+        # composite. A hashless forged evidence line is not mere seed
+        # prose: reconstruction still mints it as an Evidence object
+        # (file:line + observation) inside a skipped concept; only the
+        # hashed lines are pinned, and the freshness verifier
+        # separately constrains each hashed line's file:line to a
+        # location whose current content matches its hash. Recall-side
+        # recomputation rather than a body hash in the MAC fields, so
+        # every already-stored stamped row keeps its mechanical effect.
+        recomputed = stamped_evidence_composite(clean)
+        src = fields["src"]
+        # Rows minted before the composite went full-length carry a
+        # 12-hex prefix of the same fold; prefix-compare for exactly
+        # that src length keeps them verifying. No downgrade surface:
+        # src is MAC-bound, so an attacker cannot shorten a full-length
+        # row's src without breaking the MAC.
+        expected = recomputed[:12] if len(src) == 12 else recomputed
+        if expected != src:
+            logger.debug(
+                "SAGE %s: recall row evidence composite %.16s does not "
+                "match MAC-bound source hash %.16s (concept %.80r) — "
+                "mechanical use demoted to hint",
+                hook, recomputed, src, concept,
+            )
+            continue
+        out.append(row)
     return out
 
 
@@ -1638,9 +2420,17 @@ def store_study_concepts(
     if client is None:
         return 0
 
+    # Shared evidence-row grammar: the core.concepts.study parsers
+    # re-derive file/line/hash from this exact shape (drift = silent
+    # loss of the cross-run study skip). The composite src is minted
+    # by the parser side itself (see below), so the two can never
+    # disagree. Call-time imports in both directions — no load cycle.
+    from core.concepts.model import fold_ws, sage_evidence_row
+    from core.concepts.study import stamped_evidence_composite
+
     stored = 0
     repo_name = Path(repo_path).name
-    scope_label = study_scope or repo_name
+    scope_label = fold_ws(study_scope or repo_name)
 
     concept_invariants: dict[str, list] = {}
     for inv in domain_model.invariants:
@@ -1663,53 +2453,68 @@ def store_study_concepts(
             continue
 
         try:
+            # Every free-text field value folds its whitespace before
+            # rendering (fold_ws — sage_evidence_row applies the same
+            # rule to its own fields): a raw line boundary inside any
+            # value would let the remainder stand as a row line of its
+            # own — an invariant statement containing "\nSource hash:
+            # x" mints a line-start mention that shadows the genuine
+            # field for concepts that store no composite. The concept
+            # id folds ONCE and that folded form is used both in the
+            # rendered header and in the MAC fields, so the recall
+            # side's header extraction re-derives exactly the minted
+            # value.
+            cid = fold_ws(concept.id)
             parts = [
                 (
-                    f"Concept [{concept.id}] in {scope_label}: "
-                    f"{concept.description}"
+                    f"Concept [{cid}] in {scope_label}: "
+                    f"{fold_ws(concept.description)}"
                 )
             ]
 
             evidence_files = set()
-            evidence_hashes = []
             for ev in concept.evidence:
-                loc = f"{ev.file}:{ev.line}" if ev.line else ev.file
-                h_tag = f" [h={ev.hash}]" if getattr(ev, "hash", None) else ""
-                parts.append(f"  Evidence ({ev.type}): {loc}{h_tag} — {ev.observation}")
+                parts.append(sage_evidence_row(ev))
                 if ev.file:
-                    evidence_files.add(ev.file)
-                if getattr(ev, "hash", None):
-                    evidence_hashes.append(ev.hash)
+                    evidence_files.add(fold_ws(ev.file))
 
             invs = concept_invariants.get(concept.id, [])
             for inv in invs:
                 parts.append(
-                    f"  Invariant [{inv.id}]: {inv.statement} "
-                    f"(negation: {inv.negation})"
+                    f"  Invariant [{fold_ws(inv.id)}]: "
+                    f"{fold_ws(inv.statement)} "
+                    f"(negation: {fold_ws(inv.negation)})"
                 )
                 if inv.relevant_cwes:
-                    parts.append(f"    CWEs: {', '.join(inv.relevant_cwes)}")
+                    cwes = ", ".join(fold_ws(c) for c in inv.relevant_cwes)
+                    parts.append(f"    CWEs: {cwes}")
 
             contracts = concept_contracts.get(concept.id, [])
             for ct in contracts:
-                ct_parts = [f"  Contract [{ct.function}]"]
+                ct_parts = [f"  Contract [{fold_ws(ct.function)}]"]
                 if ct.when:
-                    ct_parts.append(f"when: {ct.when}")
+                    ct_parts.append(f"when: {fold_ws(ct.when)}")
                 if ct.ownership_transfer:
-                    ct_parts.append(f"ownership: {ct.ownership_transfer}")
+                    ct_parts.append(
+                        f"ownership: {fold_ws(ct.ownership_transfer)}"
+                    )
                 parts.append(" ".join(ct_parts))
 
             parts.append(f"  Study scope: {scope_label}")
-            parts.append(f"  Confidence: {concept.confidence}")
+            parts.append(f"  Confidence: {fold_ws(concept.confidence)}")
             if evidence_files:
                 parts.append(
                     f"  Evidence files: {', '.join(sorted(evidence_files))}"
                 )
-            composite = ""
-            if evidence_hashes:
-                composite = sha256_string(
-                    "|".join(sorted(evidence_hashes))
-                )[:12]
+            # Mint src THROUGH THE PARSER: fold the hashes as the
+            # grammar's own extraction reads them back from the
+            # rendered content, not from the Evidence objects. Whatever
+            # the recall-side recomputation will extract from this row
+            # is by construction what gets MAC-bound here — a rendering
+            # a parser reads differently can shift WHICH hashes fold,
+            # but never make writer and verifier fold different sets.
+            composite = stamped_evidence_composite("\n".join(parts))
+            if composite:
                 parts.append(f"  Source hash: {composite}")
 
             content = "\n".join(parts)
@@ -1718,7 +2523,7 @@ def store_study_concepts(
                 content,
                 {
                     "kind": "study_concept",
-                    "concept": concept.id,
+                    "concept": cid,
                     "src": composite,
                 },
             )
@@ -1952,7 +2757,12 @@ def recall_concepts_for_study(
                 top_k=3,
                 min_confidence=min_confidence,
             )
-            return (name, _verified_concept_rows(rows, "concepts_for_study"))
+            return (
+                name,
+                _verified_concept_rows(
+                    rows, "concepts_for_study", expected_concept=name
+                ),
+            )
         except Exception as e:  # noqa: BLE001 — SAGE is best-effort; a hook failure must never break the pipeline
             logger.debug("SAGE study recall failed for %s: %s", name, e)
             return (name, None)
@@ -2034,8 +2844,11 @@ def _apply_relevance_gate(
             score += 0.2
 
         if "Study scope:" in content:
+            # Shared row-line iteration (hint-tier scoring only, but
+            # no consumer keeps a private splitter over row content).
+            from core.concepts.study import _iter_row_lines
             scope_line = [
-                ln for ln in content.split("\n")
+                ln for ln, _m in _iter_row_lines(content)
                 if ln.strip().startswith("Study scope:")
             ]
             if scope_line:
@@ -2252,10 +3065,16 @@ def store_validation_verdicts(
             verdict = _s(
                 finding.get("status") or finding.get("verdict") or "unknown",
             )
-            title = _clip(
+            # Sanitised like every other prose component (the SCA
+            # writer's counterfeit-marker rationale): the title is
+            # LLM/finding-derived and renders BEFORE the ||key=value||
+            # markers, so a '|' smuggled into it could plant
+            # counterfeit markers ahead of the genuine ones for any
+            # first-match parser of the same grammar.
+            title = _s(_clip(
                 str(finding.get("title") or finding.get("rule_id")
                     or finding.get("type") or "finding"), 120,
-            )
+            ))
             content = (
                 f"Validation verdict: {title} "
                 f"||file={file_path}|| ||fn={fn}|| ||verdict={verdict}||"
@@ -2325,10 +3144,12 @@ def store_validation_disproven(
             reason = _s(_clip(
                 str(item.get("reason") or item.get("why") or "disproven"),
             ))
-            desc = _clip(
+            # Same counterfeit-marker defence as the verdict writer:
+            # prose ahead of the markers must never carry '|'.
+            desc = _s(_clip(
                 str(item.get("hypothesis") or item.get("title")
                     or item.get("description") or "hypothesis"), 120,
-            )
+            ))
             content = (
                 f"Validation disproven: {desc} "
                 f"||file={file_path}|| ||fn={fn}|| ||reason={reason}||"

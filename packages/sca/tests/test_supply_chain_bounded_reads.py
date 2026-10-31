@@ -119,15 +119,19 @@ class TestComposerLifecycleHooksBound:
         with _expect_refusal(caplog):
             assert composer_lifecycle_hooks._scan_one(path, host) == []
 
-    def test_oversize_manifest_host_dep_none(
+    def test_oversize_manifest_host_dep_placeholder(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ) -> None:
         path = _sparse_oversize(tmp_path / "composer.json")
         manifest = Manifest(
-            path=path, ecosystem="Composer", is_lockfile=False,
+            path=path, ecosystem="Packagist", is_lockfile=False,
         )
         with _expect_refusal(caplog):
-            assert composer_lifecycle_hooks._host_dep([], manifest) is None
+            host = composer_lifecycle_hooks._host_dep([], manifest)
+        # Own-name resolution refuses the oversize read and falls
+        # back to the placeholder host anchored at the manifest.
+        assert host.name == "<composer.json>"
+        assert host.declared_in == path
 
 
 class TestBinaryInPackageBound:

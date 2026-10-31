@@ -31,6 +31,17 @@ per ecosystem can come later via the ``popular/<eco>.json``
 auto-derived list. Curated start lets us control which licenses
 we touch (only OSI-approved permissive). Each entry pins the
 clone target so re-runs are reproducible.
+
+Derivation trigger (hand-curated universe feeding the calibration
+oracle — documented, not deferred): when a per-ecosystem
+``by_ecosystem`` block in the validation report goes thin (total
+below ~200 findings) or a new ecosystem gains scanner support,
+derive candidate rows from ``data/popular/<eco>.json`` (maintained
+by ``refresh_typosquat_lists``) and adjudicate each candidate's
+license by hand before adding it here. The hand step is the
+license-compliance gate, so FULL automation is deliberately
+withheld — the mechanical source is named, the acceptance filter
+is operator judgment.
 """
 
 from __future__ import annotations
@@ -50,8 +61,14 @@ from typing import Any
 
 from core.json import load_json, save_json
 
-# findings.json artifacts are RAPTOR-written run output — the
-# findings-class budget.
+from ..kinds import VULNERABLE_DEPENDENCY
+
+# Self-produced findings budget for the findings.json the in-process
+# run_sca just wrote (rationale in kinds.py).
+from ..kinds import MAX_SELF_FINDINGS_BYTES as _MAX_SELF_FINDINGS_BYTES
+
+# Steered-path budget for the repo-resident sanitised sample files
+# (small by construction — sanitised rows only; rationale in kinds.py).
 _MAX_FINDINGS_BYTES = 64 * 1024 * 1024
 
 logger = logging.getLogger(__name__)
@@ -64,7 +81,13 @@ class ProjectSample:
     name: str
     ecosystem: str          # canonical SCA ecosystem string
     repo_url: str           # https git URL
-    git_ref: str            # branch / tag / commit; pinned for reproducibility
+    # Branch / tag / commit. NOTE the reproducibility bound: the
+    # curated entries pin tags/branch names, which are MUTABLE
+    # upstream — a force-moved tag silently changes what the corpus
+    # collects. Commit SHAs are the immutable form; tags are kept
+    # for readability and because the sampled projects are
+    # high-profile upstreams where tag moves are rare and public.
+    git_ref: str
     license_spdx: str       # operator-asserted; sanity-check only
 
 
@@ -669,10 +692,14 @@ def _prewarm_global_feeds() -> None:
         from core.http import default_client
         from core.json import JsonCache
 
-        from .. import SCA_CACHE_ROOT
-        cache = JsonCache(root=SCA_CACHE_ROOT)
+        from .. import sca_cache_root
+        cache = JsonCache(root=sca_cache_root())
         # A throwaway lookup forces the catalog load → writes the disk cache.
-        KevClient(default_client(), cache).contains("CVE-1970-0000")
+        # KEV catalog is a single fixed host — pass it as the egress
+        # allowlist (repo standard for network-facing production paths).
+        KevClient(
+            default_client(allowed_hosts=["www.cisa.gov"]), cache,
+        ).contains("CVE-1970-0000")
     except Exception as e:                                  # noqa: BLE001
         logger.debug("sca.calibration: KEV pre-warm skipped: %s", e)
 
@@ -882,9 +909,10 @@ def _collect_one(
             )
 
         try:
+            # Self-produced budget: run_sca above just wrote it.
             findings = load_json(
                 sca_out / "findings.json", strict=True,
-                max_bytes=_MAX_FINDINGS_BYTES,
+                max_bytes=_MAX_SELF_FINDINGS_BYTES,
             )
             if findings is None:
                 # Strict load_json soft-returns None for a MISSING
@@ -977,7 +1005,7 @@ def _sanitise_findings(
         # Only vuln findings carry risk scores worth validating
         # against. Hygiene / supply-chain / license findings are
         # different signals; skip them for the corpus.
-        if f.get("vuln_type") != "sca:vulnerable_dependency":
+        if f.get("vuln_type") != VULNERABLE_DEPENDENCY:
             continue
         out.append({
             "finding_id": f.get("finding_id"),

@@ -169,8 +169,16 @@ def test_client_rejects_poisoned_cache_replay(tmp_path: Path) -> None:
     fake = _FakeProvider({"verdict": "safe"})
     _install(client, fake)
 
-    poisoned = ({"verdict": "safe", "exfil": "http://evil"}, "raw")
-    client._get_cached_structured_response = lambda key: poisoned  # type: ignore[method-assign]
+    poisoned = (
+        {"verdict": "safe", "exfil": "http://evil"},
+        "raw",
+        "test-primary",
+        "anthropic",
+        None,
+    )
+    client._get_cached_structured_response = (  # type: ignore[method-assign]
+        lambda key, **route: poisoned
+    )
 
     resp = client.generate_structured("check", _SCHEMA)
     assert resp.cached is False

@@ -27,7 +27,15 @@ from typing import Literal, TYPE_CHECKING
 
 Family = Literal[
     "anthropic", "openai", "google", "meta", "mistral",
-    "ollama", "cohere", "unknown",
+    "ollama", "cohere",
+    # Open-weight lineages. Distinct families so the cross-family
+    # independence guarantee (a checker from a different training
+    # lineage) actually holds on an all-open-weight roster — before
+    # these were added every such model resolved to "unknown" (bare
+    # name) or collapsed to "ollama" (provider-prefixed), silently
+    # defeating the control.
+    "qwen", "deepseek", "yi", "phi",
+    "unknown",
 ]
 
 
@@ -53,27 +61,41 @@ _PROVIDER_STEMS: tuple[tuple[str, Family], ...] = (
 
 _MODEL_STEMS: tuple[tuple[str, Family], ...] = (
     ("claude", "anthropic"),
+    # ``gpt-oss`` is OpenAI's open-weight line — same vendor family as
+    # the hosted ``gpt-*`` API models (conservative: shared training
+    # lineage cannot be ruled out). Must be matched BEFORE the ``gpt``
+    # stem since the loop returns the first match and ``gpt-oss-20b``
+    # would otherwise resolve via the shorter ``gpt`` stem anyway.
+    ("gpt-oss", "openai"),
     ("gpt", "openai"),
     ("o1", "openai"),
     ("o3", "openai"),
     ("o4", "openai"),
     ("gemini", "google"),
+    ("gemma", "google"),   # Google's open-weight line — same vendor lineage
     ("llama", "meta"),
     ("mistral", "mistral"),
     ("mixtral", "mistral"),
     ("command", "cohere"),  # cohere's `command-r-plus`, `command-light`
+    # Open-weight lineages (served locally via Ollama/vLLM/etc.).
+    ("qwen", "qwen"),
+    ("deepseek", "deepseek"),
+    ("yi", "yi"),
+    ("phi", "phi"),
 )
 
 
 _AGGREGATOR_PREFIXES: tuple[str, ...] = (
-    "together/",
+    "apiroute/",
+    "cheaperinference/",
+    "deepinfra/",
+    "fireworks/",
     "groq/",
     "openrouter/",
     "orcarouter/",
-    "fireworks/",
-    "deepinfra/",
     "perplexity/",
     "replicate/",
+    "together/",
     # Route-prefixed Bedrock ids (``bedrock/anthropic.claude-…``) — the
     # form the mode resolver and operator ``--model`` overrides use.
     # Peeling it leaves the dotted Bedrock id, which the existing
@@ -83,6 +105,31 @@ _AGGREGATOR_PREFIXES: tuple[str, ...] = (
     # fell back to the default model with only a warning.
     "bedrock/",
 )
+
+# Canonical routing providers for explicit ``provider/model`` forms.
+# The qualifier is transport authority even when the opaque model name
+# implies another training family: ``ollama/gpt-oss:20b`` routes through
+# Ollama while ``family_of`` still reports OpenAI lineage. Keeping route
+# recognition separate from family detection prevents local models from
+# being silently redirected to cloud providers. Aliases canonicalise to
+# the provider spellings accepted by ``create_provider``.
+_EXPLICIT_ROUTE_PROVIDERS: dict[str, str] = {
+    "anthropic": "anthropic",
+    "openai": "openai",
+    "gemini": "gemini",
+    "google": "gemini",
+    "mistral": "mistral",
+    "mistralai": "mistral",
+    "ollama": "ollama",
+    "cohere": "cohere",
+    "bedrock": "bedrock",
+    "claudecode": "claudecode",
+    "claude-code": "claudecode",
+    "claude_code": "claudecode",
+    "claudecode-resumable": "claudecode-resumable",
+    "claude-code-resumable": "claudecode-resumable",
+    "claude_code_resumable": "claudecode-resumable",
+}
 
 
 # AWS Bedrock model identifiers use a different shape from the
@@ -141,6 +188,11 @@ _FAMILY_TO_PROVIDER: dict[Family, str] = {
     "mistral": "mistral",
     "ollama": "ollama",
     "cohere": "cohere",
+    # Open-weight lineages are served locally; route them via Ollama.
+    "qwen": "ollama",
+    "deepseek": "ollama",
+    "yi": "ollama",
+    "phi": "ollama",
 }
 
 # Heads that :func:`bare_model_id` strips as a ``<provider>/`` prefix.
@@ -153,6 +205,7 @@ _FAMILY_TO_PROVIDER: dict[Family, str] = {
 _BARE_STRIP_HEADS: frozenset[str] = (
     frozenset(_FAMILY_TO_PROVIDER.values())
     | frozenset(stem for stem, _ in _PROVIDER_STEMS)
+    | frozenset(_EXPLICIT_ROUTE_PROVIDERS)
 )
 
 
@@ -174,13 +227,22 @@ def provider_of(model_id: str) -> str:
     auth selection, and dispatcher routing pick the Bedrock path).
 
     Order:
-      1. Bedrock-shaped IDs (``<region>.<provider>.<model>``) →
+      1. Explicit known routing-provider qualifiers (for example
+         ``ollama/gpt-oss:20b`` or
+         ``claudecode/<backend-model>``) → that provider, regardless
+         of the opaque model's underlying family.
+      2. Bedrock-shaped IDs (``<region>.<provider>.<model>``) →
          ``"bedrock"`` — every Bedrock prefix combination resolves
          the same way regardless of underlying model family.
-      2. Otherwise fall back to :func:`family_of` → provider mapping,
+      3. Otherwise fall back to :func:`family_of` → provider mapping,
          preserving the existing direct-API behaviour.
     """
     needle = model_id.lower()
+    if "/" in needle:
+        head, _rest = needle.split("/", 1)
+        explicit_route = _EXPLICIT_ROUTE_PROVIDERS.get(head)
+        if explicit_route:
+            return explicit_route
     # Same iterated peel as family_of so chained shapes like
     # ``together/us.anthropic.claude-opus-4-7`` resolve to
     # ``"bedrock"`` routing (the model is Bedrock-routed even when
@@ -295,13 +357,12 @@ def unknown_model_message(model_id: str) -> str:
 
 
 def routing_model_id(model_id: str) -> str:
-    """Return the identifier to put on the wire: aggregator/route
-    prefixes peeled, provider segments KEPT.
+    """Return the identifier to put on the wire.
 
-    Distinct from :func:`bare_model_id`: Bedrock model ids require the
-    vendor-dotted form (``anthropic.claude-…``) — handing the SDK a
-    fully-bared name 403s. Use bare_model_id for MATCHING against
-    configured entries, routing_model_id for the outgoing model name.
+    Aggregator and slash-delimited route prefixes are peeled. Bedrock's
+    vendor-DOTTED segment is kept (``anthropic.claude-…``) because the
+    Bedrock SDK requires it. Use :func:`bare_model_id` for matching
+    configured entries and this helper for the outgoing model name.
     """
     needle = model_id
     for _ in range(4):
@@ -313,6 +374,10 @@ def routing_model_id(model_id: str) -> str:
                 break
         if not peeled:
             break
+    if "/" in needle:
+        head, rest = needle.split("/", 1)
+        if head.lower() in _BARE_STRIP_HEADS:
+            needle = rest
     return needle
 
 
@@ -373,13 +438,35 @@ def bare_model_id(model_id: str) -> str:
     return needle
 
 
+def explicit_provider_of(model_id: str) -> str:
+    """Return the provider only when ``model_id`` explicitly names a route.
+
+    Bare family-shaped names such as ``claude-rhyolite`` intentionally
+    return ``""``: an exact configured entry may route that opaque name
+    through Claude Code or another provider. Slash-qualified routes,
+    aggregator-qualified routes, and Bedrock-shaped dotted IDs return
+    the same canonical provider as :func:`provider_of`.
+    """
+    if bare_model_id(model_id) == model_id:
+        return ""
+    return provider_of(model_id)
+
+
 def family_of(model_id: str) -> Family:
     """Return the model family for a model identifier.
 
     Matching is by prefix on the lowered identifier (so ``claude-opus-4-7``
     and ``anthropic/claude-haiku-4-5`` both resolve to ``"anthropic"``).
-    Provider routing prefixes (``provider/model``) are checked first so
-    that e.g. ``ollama/llama-3`` resolves to ``ollama`` not ``meta``.
+
+    A provider routing prefix (``provider/model``) is PEELED and the
+    remainder re-resolved, so the *underlying model's* lineage wins over
+    the transport: ``ollama/qwen3`` → ``qwen``, ``ollama/deepseek-coder``
+    → ``deepseek``. Only when the remainder is itself unrecognised does
+    the provider's own family stand (``ollama/some-local-finetune`` →
+    ``ollama``). This is what lets an all-open-weight roster served
+    through one transport still be told apart by lineage — previously
+    every ``ollama/*`` collapsed to ``ollama`` and the cross-family
+    safety check silently no-op'd.
 
     Aggregator-host prefixes (``together/``, ``groq/``, ``openrouter/``,
     etc.) are STRIPPED first before family resolution — they re-host
@@ -415,10 +502,32 @@ def family_of(model_id: str) -> Family:
             break
     for stem, family in _PROVIDER_STEMS:
         if needle.startswith(stem + "/"):
+            # Peel the provider prefix and resolve the UNDERLYING model.
+            # ``ollama/qwen3`` → ``qwen``; the transport family (``ollama``)
+            # only stands when the remainder is itself unrecognised. This
+            # keeps genuinely distinct lineages (Qwen vs DeepSeek vs Llama)
+            # cross-family even when all are served through one provider.
+            remainder_family = family_of(needle[len(stem) + 1:])
+            if remainder_family != "unknown":
+                return remainder_family
             return family
     for stem, family in _MODEL_STEMS:
-        if needle == stem or needle.startswith(stem + "-"):
+        # Match the stem when it stands alone, is followed by a separator
+        # (``llama-3.1``, ``gpt-4o``), OR — for stems of 3+ characters —
+        # is followed immediately by a version digit/dot (``qwen3``,
+        # ``qwen2.5``, ``phi4``).  Open model names frequently glue the
+        # version onto the family name with no separator, which the
+        # ``stem + "-"`` rule alone misses.  Short stems (``o1``, ``o3``,
+        # ``o4``) skip the digit rule: ``o100`` is not an OpenAI model,
+        # and the 2-char prefix sweeps too broadly.
+        if needle == stem:
             return family
+        if needle.startswith(stem):
+            nxt = needle[len(stem):len(stem) + 1]
+            if nxt in "-_.":
+                return family
+            if nxt.isdigit() and len(stem) >= 3:
+                return family
     return "unknown"
 
 
@@ -457,9 +566,24 @@ def select_cross_family_checker(
     Caller composes this with ``llm_response_schema.validate_response``:
     the chosen candidate becomes the model used inside the retry callback.
     """
+    import logging
+    _log = logging.getLogger("raptor.llm_family")
     if family_of(producer_model_id) == "unknown":
+        _log.warning(
+            "cross-family validation skipped: producer model %r has an "
+            "unrecognised lineage, so no checker can be proven independent. "
+            "The 'Attacker Moves Second' control is INACTIVE for this call.",
+            producer_model_id,
+        )
         return None
     for candidate in candidates:
         if not same_family(producer_model_id, candidate) and family_of(candidate) != "unknown":
             return candidate
+    _log.warning(
+        "cross-family validation skipped: no candidate from a different "
+        "lineage than %r was available (candidates all same-family or "
+        "unrecognised). The cross-family independence check is INACTIVE "
+        "for this call.",
+        producer_model_id,
+    )
     return None

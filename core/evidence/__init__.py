@@ -8,6 +8,10 @@ Tier ordering (strongest to weakest):
     OBSERVED_RUNTIME  — Frida/runtime instrumentation saw it happen
     REPLAYED_CRASH    — ASan/fuzz witness reproduced the bug
     SMT_PROVED        — Z3/SMT solver proved the constraint (un)satisfiable
+    CORPUS_CORROBORATED — two independent witnesses agree (e.g. static
+                        structure and sample-corpus statistics)
+    DECODED_INSTRUCTION — a decoded instruction at a concrete address
+                        (e.g. a cmp check-site with its operand)
     XREF_BACKED       — CPG/dataflow/call-graph structural guarantee
     HEADER_BACKED     — ELF/Mach-O headers, symbol tables, AST extraction
     DECOMPILER_INFERRED — decompiled pseudo-code (approximate)
@@ -27,6 +31,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from core.analysis.taint_approx import function_key
 from core.json.utils import dumps_canonical
 
 # ---------------------------------------------------------------------------
@@ -39,17 +44,41 @@ class EvidenceTier(str, Enum):
     OBSERVED_RUNTIME = "observed_runtime"
     REPLAYED_CRASH = "replayed_crash"
     SMT_PROVED = "smt_proved"
+    CORPUS_CORROBORATED = "corpus_corroborated"
+    DECODED_INSTRUCTION = "decoded_instruction"
     XREF_BACKED = "xref_backed"
     HEADER_BACKED = "header_backed"
     DECOMPILER_INFERRED = "decompiler_inferred"
     HEURISTIC = "heuristic"
 
 
-# Ordered strongest-to-weakest for comparison.
+# Ordered strongest-to-weakest for comparison. Ranks are relative
+# positions only — every reader compares TIER_RANK entries against
+# each other; the integers are never serialised (artifacts carry the
+# tier VALUE strings), so inserting members renumbers safely.
+#
+# DECODED_INSTRUCTION sits directly ABOVE XREF_BACKED: a decoded
+# instruction (a real cmp with its operand at a concrete address) is
+# byte-level ground truth of the analysed artifact, while xref/CPG/
+# call-graph edges are tool-RECONSTRUCTED structure (indirect-call
+# resolution, dataflow approximation) one step further from the
+# bytes. Ranking it below XREF_BACKED would let a reconstructed edge
+# outrank a deterministically decoded check-site; ranking it above
+# CORPUS_CORROBORATED would let a single witness outrank two
+# independent witnesses agreeing.
+#
+# CORPUS_CORROBORATED sits below SMT_PROVED: two independent
+# observational witnesses agreeing (e.g. a decoded parser check-site
+# and sample-corpus field statistics describing the same format) beat
+# either witness alone, but agreement is still observation, not a
+# solver proof — above SMT_PROVED it would launder correlation into
+# proof tier.
 TIER_RANK: dict[EvidenceTier, int] = {
-    EvidenceTier.OBSERVED_RUNTIME: 6,
-    EvidenceTier.REPLAYED_CRASH: 5,
-    EvidenceTier.SMT_PROVED: 4,
+    EvidenceTier.OBSERVED_RUNTIME: 8,
+    EvidenceTier.REPLAYED_CRASH: 7,
+    EvidenceTier.SMT_PROVED: 6,
+    EvidenceTier.CORPUS_CORROBORATED: 5,
+    EvidenceTier.DECODED_INSTRUCTION: 4,
     EvidenceTier.XREF_BACKED: 3,
     EvidenceTier.HEADER_BACKED: 2,
     EvidenceTier.DECOMPILER_INFERRED: 1,
@@ -185,6 +214,22 @@ def _safe_text(text: str, max_len: int = 120) -> str:
     return sanitized[:max_len]
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    """Integer-coerce a numeric-typed field for prompt interpolation.
+
+    ``codeql_alerts`` / ``semgrep_hits`` / Joern records are populated
+    from prior-run artifacts on disk — the same pre-stageable class the
+    provenance gates defend against. String fields route through
+    ``_safe_name`` / ``_safe_text``; a STRING smuggled into a numeric
+    slot (``line``, ``arg_index``) was the one raw interpolation lane,
+    injecting forged prompt structure past both sanitisers.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 # ---------------------------------------------------------------------------
 # Per-function evidence record (used by /audit pre-sweep)
 # ---------------------------------------------------------------------------
@@ -269,6 +314,15 @@ class EvidenceRecord:
 
     binary_layer0_findings: list[Any] = field(default_factory=list)
 
+    # Typestate violations the mechanical checker found for this
+    # function (populated at review-context build time, like
+    # negative_space). Pipeline-authored — the export layer uses it to
+    # decide whether a model's typestate_violation claim was
+    # corroborated by actually-injected context. Deliberately NOT part
+    # of has_any_evidence(): it is computed mid-loop, after the
+    # evidence-driven prioritisation has already run.
+    typestate_violations: list[Any] = field(default_factory=list)
+
     def has_any_evidence(self) -> bool:
         return bool(
             self.taint_approx
@@ -305,9 +359,12 @@ def format_evidence_prose(
 ) -> str:
     """Format an EvidenceRecord as prose for the LLM prompt.
 
-    Uses only structural fields (function, param, sink, line) — never
-    FlowStep.code snippets. See design §"Prompt injection defense for
-    pre-evidence".
+    Prompt-injection defense: every interpolated field is sanitised —
+    identifiers through ``_safe_name``, text excerpts (Joern code
+    snippets, CodeQL messages, context-map notes) through ``_safe_text``
+    with tight caps, numeric-typed fields (``line``, ``arg_index``)
+    integer-coerced via ``_safe_int``. Nothing from a disk-sourced
+    record reaches the prompt raw.
     """
     lines: list[str] = []
 
@@ -411,7 +468,7 @@ def format_evidence_prose(
 
     for ug in record.joern_unguarded_sinks:
         ug_sink = _safe_name(ug.get("sink", ""))
-        ug_line = ug.get("line", 0)
+        ug_line = _safe_int(ug.get("line", 0))
         ug_code = _safe_text(ug.get("code", ""), 120)
         lines.append(
             f"- UNGUARDED sink: `{ug_sink}` at line {ug_line} has no "
@@ -420,7 +477,7 @@ def format_evidence_prose(
 
     for sa in record.joern_sink_args:
         sa_sink = _safe_name(sa.get("sink", ""))
-        arg_idx = sa.get("arg_index", -1)
+        arg_idx = _safe_int(sa.get("arg_index", -1), -1)
         src_param = _safe_name(sa.get("source_param", ""))
         lines.append(
             f"- tainted arg: param `{src_param}` reaches `{sa_sink}` "
@@ -430,7 +487,7 @@ def format_evidence_prose(
     for alert in record.codeql_alerts:
         rule_id = _safe_name(alert.get("rule_id", "unknown"))
         message = _safe_text(alert.get("message", ""), 200)
-        line = alert.get("line", 0)
+        line = _safe_int(alert.get("line", 0))
         provenance = " (prior scan run)" if alert.get("_sarif_sibling") else ""
         cwe = _safe_cwe(alert.get("_sarif_cwe", ""))
         cwe_note = f" [{cwe}]" if cwe else ""
@@ -441,7 +498,7 @@ def format_evidence_prose(
 
     for hit in record.semgrep_hits:
         rule_id = _safe_name(hit.get("rule_id", "unknown"))
-        line = hit.get("line", 0)
+        line = _safe_int(hit.get("line", 0))
         provenance = " (prior scan run)" if hit.get("_sarif_sibling") else ""
         cwe = _safe_cwe(hit.get("_sarif_cwe", ""))
         cwe_note = f" [{cwe}]" if cwe else ""
@@ -503,10 +560,17 @@ def format_evidence_prose(
     if not lines:
         return ""
 
-    header = "## Mechanical pre-sweep results\n\n"
+    # "Mechanical unless noted": the context_map_sink line is
+    # LLM-derived and says so inline — the header must not launder it
+    # into tool-evidence tier.
+    header = "## Pre-sweep results (mechanical unless noted)\n\n"
     return header + "\n".join(lines)
 
 
+#: tier -> evidence_tier for every structured-entry producer in
+#: format_evidence_structured. THE single home for the mapping — the
+#: producers below read it, so a tier cannot carry one evidence_tier
+#: in this table and a different one inline.
 _TOOL_TIER_MAP: dict[str, str] = {
     "taint_approx": "xref_backed",
     "taint_summary": "xref_backed",
@@ -540,7 +604,7 @@ def format_evidence_structured(
             for callee, arg_idx in flows:
                 entries.append({
                     "tier": "taint_approx",
-                    "evidence_tier": "xref_backed",
+                    "evidence_tier": _TOOL_TIER_MAP["taint_approx"],
                     "param": pname,
                     "param_idx": pidx,
                     "sink": callee,
@@ -555,7 +619,7 @@ def format_evidence_structured(
                 pname = ts.params[pidx] if pidx < len(ts.params) else f"param_{pidx}"
                 entries.append({
                     "tier": "taint_summary",
-                    "evidence_tier": "xref_backed",
+                    "evidence_tier": _TOOL_TIER_MAP["taint_summary"],
                     "param": pname,
                     "param_idx": pidx,
                     "sink": callee,
@@ -565,7 +629,7 @@ def format_evidence_structured(
 
     entries.extend({
             "tier": "joern",
-            "evidence_tier": "xref_backed",
+            "evidence_tier": _TOOL_TIER_MAP["joern"],
             "source_method": getattr(flow, "source_method", ""),
             "source_param": getattr(flow, "source_param", ""),
             "sink_call": getattr(flow, "sink_call", ""),
@@ -575,7 +639,7 @@ def format_evidence_structured(
 
     entries.extend({
             "tier": "joern",
-            "evidence_tier": "xref_backed",
+            "evidence_tier": _TOOL_TIER_MAP["joern"],
             "source_method": getattr(flow, "source_method", ""),
             "source_param": getattr(flow, "source_param", ""),
             "sink_call": getattr(flow, "sink_call", ""),
@@ -585,7 +649,7 @@ def format_evidence_structured(
 
     entries.extend({
             "tier": "joern_unguarded",
-            "evidence_tier": "xref_backed",
+            "evidence_tier": _TOOL_TIER_MAP["joern_unguarded"],
             "sink": ug.get("sink", ""),
             "line": ug.get("line", 0),
             "code": ug.get("code", ""),
@@ -594,7 +658,7 @@ def format_evidence_structured(
 
     entries.extend({
             "tier": "joern_sink_arg",
-            "evidence_tier": "xref_backed",
+            "evidence_tier": _TOOL_TIER_MAP["joern_sink_arg"],
             "sink": sa.get("sink", ""),
             "arg_index": sa.get("arg_index", -1),
             "source_param": sa.get("source_param", ""),
@@ -604,7 +668,7 @@ def format_evidence_structured(
     for alert in record.codeql_alerts:
         entry = {
             "tier": "codeql",
-            "evidence_tier": "xref_backed",
+            "evidence_tier": _TOOL_TIER_MAP["codeql"],
             "rule_id": alert.get("rule_id", ""),
             "line": alert.get("line", 0),
             "source": (
@@ -618,7 +682,7 @@ def format_evidence_structured(
     for hit in record.semgrep_hits:
         entry = {
             "tier": "semgrep",
-            "evidence_tier": "header_backed",
+            "evidence_tier": _TOOL_TIER_MAP["semgrep"],
             "rule_id": hit.get("rule_id", ""),
             "line": hit.get("line", 0),
             "source": (
@@ -631,10 +695,10 @@ def format_evidence_structured(
 
     if record.context_map_sink is not None:
         cms = record.context_map_sink
-        entry: dict[str, Any] = {
+        entry = {
             "tier": "context_map_sink",
             # LLM-derived, not mechanical — see _TOOL_TIER_MAP note.
-            "evidence_tier": "llm_claimed",
+            "evidence_tier": _TOOL_TIER_MAP["context_map_sink"],
             "sink_type": cms.sink_type,
             "source": "understand",
         }
@@ -788,7 +852,7 @@ def build_evidence_index(
             func_name = item.get("name", "")
             if not func_name:
                 continue
-            key = f"{file_path}:{func_name}"
+            key = function_key(file_path, func_name)
             ls = item.get("line_start", 0)
             le = item.get("line_end", 0)
             index[key] = EvidenceRecord(
@@ -801,13 +865,13 @@ def build_evidence_index(
         _reachable = set()
         if hasattr(sink_results, "transitive_reach"):
             for t in sink_results.transitive_reach:
-                _reachable.add(f"{t.file}:{t.function}")
+                _reachable.add(function_key(t.file, t.function))
         if hasattr(sink_results, "direct_sinks"):
             for s in sink_results.direct_sinks:
-                _reachable.add(f"{s.file}:{s.function}")
+                _reachable.add(function_key(s.file, s.function))
             direct_sink_index: dict[str, list[str]] = {}
             for s in sink_results.direct_sinks:
-                key = f"{s.file}:{s.function}"
+                key = function_key(s.file, s.function)
                 direct_sink_index.setdefault(key, []).append(s.target)
             for key, targets in direct_sink_index.items():
                 if key in index:
@@ -916,7 +980,7 @@ def _attach_context_map_sinks(
         if not sink_file or not sink_func:
             continue
 
-        key = f"{sink_file}:{sink_func}"
+        key = function_key(sink_file, sink_func)
         rec = index.get(key)
         if rec is None:
             continue
@@ -936,7 +1000,15 @@ def _attach_binary_bridge(
     """Enrich evidence records with binary analysis data."""
     func_to_keys: dict[str, list[str]] = {}
     for key in index:
-        func_name = key.split(":")[-1]
+        # Keys are function_key() products — "<rel_path>:<func_name>".
+        # Split on the FIRST colon: qualified native names (Foo::bar,
+        # crate::mod::fn) contain colons themselves, and a last-colon
+        # split truncated them to the trailing segment, silently
+        # dropping ALL binary enrichment for exactly the C++/Rust
+        # symbols the bridge exists for. Checklist relpaths are
+        # target-relative POSIX paths, which do not carry colons.
+        parts = key.split(":", 1)
+        func_name = parts[1] if len(parts) == 2 else key
         func_to_keys.setdefault(func_name, []).append(key)
 
     for edge in bridge.sink_edges:

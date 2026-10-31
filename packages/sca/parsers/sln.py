@@ -45,9 +45,14 @@ logger = logging.getLogger(__name__)
 # The relative-path is what matters; everything else is incidental.
 # Match permissively (don't require matched quote style) so we
 # tolerate operator hand-edits.
+# Bounded quoted/braced bodies: unbounded ``[^}]+``/``[^"]*`` let
+# every line anchor re-scan a close-less tail — quadratic over
+# planted Project-shaped lines. Bounds sit far above real solution
+# rows (trade-off both directions: larger admits absurd rows but
+# raises per-anchor reach, smaller drops them).
 _PROJECT_LINE_RE = re.compile(
-    r"""^Project\("\{[^}]+\}"\)\s*=\s*"""
-    r""""[^"]*"\s*,\s*"(?P<path>[^"]+)"\s*,\s*"\{[^}]+\}"\s*$""",
+    r"""^Project\("\{[^}]{1,256}\}"\)\s*=\s*"""
+    r""""[^"]{0,512}"\s*,\s*"(?P<path>[^"]{1,512})"\s*,\s*"\{[^}]{1,256}\}"\s*$""",
     re.MULTILINE,
 )
 
@@ -56,6 +61,28 @@ _PROJECT_LINE_RE = re.compile(
 # Folders, .deployproj, .sqlproj, …) — we filter to the suffixes
 # SCA's NuGet parser handles.
 _PROJECT_SUFFIXES = {".csproj", ".fsproj", ".vbproj"}
+
+
+def _lexical_fold(
+    base: Path, rel_parts: tuple[str, ...],
+) -> Path | None:
+    """Fold ``rel_parts`` onto absolute ``base`` textually: ``.`` is
+    dropped, ``..`` pops one component, everything else appends.
+    Returns ``None`` when a ``..`` pops past the filesystem root.
+    Symlinks are deliberately NOT consulted — this is the up-front
+    lexical view the traversal bound is checked against before any
+    real-path resolution happens."""
+    stack = list(base.parts)
+    for part in rel_parts:
+        if part == ".":
+            continue
+        if part == "..":
+            if len(stack) <= 1:
+                return None
+            stack.pop()
+            continue
+        stack.append(part)
+    return Path(*stack)
 
 
 def find_sln_referenced_csprojs(
@@ -86,10 +113,12 @@ def find_sln_referenced_csprojs(
         line carrying ``%2e%2e/etc/passwd`` survives the
         ``.replace("\", "/")`` normalisation but is caught
         here.
-      * Literal ``..`` segments are rejected up-front BEFORE
-        the ``(parent / rel).resolve()`` call, so a .sln cannot
-        use ``..`` to escape ``repo_root`` even when symlinks
-        are present in the resolution path.
+      * ``.`` / ``..`` segments are folded LEXICALLY (symlinks not
+        consulted) and containment-checked up-front BEFORE the
+        ``(parent / rel).resolve()`` call, so a .sln cannot use
+        ``..`` to escape ``repo_root`` even when symlinks are
+        present in the resolution path; in-bound ``..`` references
+        (``..\shared\lib.csproj``) still work.
       * Resolved paths that escape the bound (``repo_root`` if
         given, else .sln's grandparent) are rejected.
       * Paths that don't EXIST are silently dropped (no error;
@@ -154,6 +183,26 @@ def find_sln_referenced_csprojs(
                 escape_nonprintable(str(sln_path)),
             )
             continue
+        # Lexical containment BEFORE the resolve — the up-front
+        # ``..`` defence the resolution contract documents: fold
+        # ``.`` / ``..`` segments textually (symlinks deliberately
+        # NOT consulted) and require the folded path under the
+        # traversal bound. The post-resolve check below re-verifies
+        # on the REAL path; this pass stops the lexical escapes the
+        # real-path check launders — a path that wanders outside the
+        # bound and re-enters through an out-of-tree symlink resolves
+        # inside the bound while routing through attacker-reachable
+        # territory.
+        bound = repo_root if repo_root is not None else parent.parent
+        lexical = _lexical_fold(parent, rel_parts)
+        if lexical is None or not lexical.is_relative_to(bound):
+            logger.debug(
+                "sca.parsers.sln: %r escapes the traversal bound %s "
+                "lexically; skipping (up-front .. defence)",
+                escape_nonprintable(rel),
+                escape_nonprintable(str(bound)),
+            )
+            continue
         unresolved = parent / rel
         # Reject symlinked final candidates BEFORE resolving — a
         # target with ``X.csproj -> /etc/passwd`` would leak the
@@ -169,11 +218,10 @@ def find_sln_referenced_csprojs(
         except OSError:
             continue
         candidate = unresolved.resolve()
-        # Path-traversal defence: ``repo_root`` is preferred when
-        # the caller supplies it (discovery does). Fall back to
-        # the .sln's grandparent for legacy callers — strictly
-        # weaker but maintains backward compatibility.
-        bound = repo_root if repo_root is not None else parent.parent
+        # Path-traversal defence on the RESOLVED path: ``repo_root``
+        # is preferred when the caller supplies it (discovery does).
+        # Fall back to the .sln's grandparent for legacy callers —
+        # strictly weaker but maintains backward compatibility.
         try:
             candidate.relative_to(bound)
         except ValueError:

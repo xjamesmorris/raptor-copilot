@@ -119,3 +119,101 @@ class TestSinkStageSignatureCompat:
         data = json.loads(
             (understand_dir / "context-map.json").read_text(encoding="utf-8"))
         assert {"id": "legacy"} in data["sinks"]
+
+
+class TestStageFailureDiagnostics:
+    """A raising substrate must leave one stderr line per failed
+    stage. The script configures no logging, so the previous bare
+    logger.debug records vanished — a run whose stages all raised
+    reported "no enrichments applied" with zero diagnostic."""
+
+    def test_failed_sites_stage_prints_stderr_line(
+        self, understand_dir, monkeypatch, capsys,
+    ):
+        def sink_zero(context_map, target_path, **kw):
+            return 0
+
+        rc = _run(understand_dir, monkeypatch, sink_zero)
+        assert rc == 0
+        err = capsys.readouterr().err
+        # _stub_heavy_stages makes source_intel.analyze raise.
+        assert "sites enrichment failed" in err
+        assert "stubbed out in test" in err
+
+    def test_failed_callgraph_stage_prints_stderr_line(
+        self, understand_dir, monkeypatch, capsys,
+    ):
+        import core.iris.api as iris_api
+        import core.orchestration.context_map_callgraph as cg
+        import core.orchestration.context_map_sinks as sinks_mod
+        import packages.source_intel as si
+
+        def _zero(*a, **kw):
+            return 0
+
+        def _raise(*a, **kw):
+            raise RuntimeError("callgraph substrate broke")
+
+        monkeypatch.setattr(cg, "enrich_with_call_edges", _raise)
+        monkeypatch.setattr(cg, "enrich_with_forward_reachable", _zero)
+        monkeypatch.setattr(si, "analyze", _zero)
+        monkeypatch.setattr(
+            sinks_mod, "enrich_with_sink_discovery",
+            lambda context_map, target_path, **kw: 0,
+        )
+        monkeypatch.setattr(
+            iris_api, "get_project_sinks", lambda out_dir=None: [],
+        )
+        monkeypatch.setenv("_RAPTOR_TRUSTED", "1")
+        monkeypatch.setattr(
+            sys, "argv", [str(SCRIPT), str(understand_dir)],
+        )
+        try:
+            runpy.run_path(str(SCRIPT), run_name="__main__")
+        except SystemExit as e:
+            assert (e.code or 0) == 0
+        err = capsys.readouterr().err
+        assert "callgraph enrichment failed" in err
+        assert "callgraph substrate broke" in err
+
+
+class TestSinkStageUsesStageFailedChokepoint:
+    """Stage 6's failure lane must go through _stage_failed like
+    stages 1-5: the previous bare logger.warning relay was escaped
+    only by a console formatter installed as an import side effect —
+    an escape that any import-graph refactor silently drops — and it
+    bypassed the file's own diagnostic chokepoint."""
+
+    def test_sink_failure_prints_escaped_stage_line(
+        self, understand_dir, monkeypatch, capsys,
+    ):
+        hostile = "boom \x1b]0;PWNED\x07\x1b[2J end"
+
+        def raising_sink(context_map, target_path, **kw):
+            raise RuntimeError(hostile)
+
+        rc = _run(understand_dir, monkeypatch, raising_sink)
+        assert rc == 0
+        err = capsys.readouterr().err
+        assert ("raptor-enrich-context-map: sink enrichment failed: "
+                "RuntimeError") in err
+        # The escape is owned in-file: hostile bytes never reach the
+        # stream raw, regardless of what logging happens to have
+        # installed.
+        assert "\x1b" not in err
+        assert "\x07" not in err
+
+
+def test_combined_shim_routes_call_edges_to_store():
+    """Sibling-drift pin: the combined shim must pass the same store
+    args its per-stage sibling passes — an unrouted combined shim was
+    the producer whose maps never ingested."""
+    from pathlib import Path
+    shim = Path(__file__).resolve().parents[3] / (
+        "libexec/raptor-enrich-context-map")
+    src = shim.read_text()
+    call = src[src.find("n_edges = enrich_with_call_edges"):]
+    call = call[:call.find(")")]
+    assert "graph_store=graph_store" in call
+    assert "run_dir=understand_dir" in call
+    assert "target_path=" in call

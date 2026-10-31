@@ -9,11 +9,24 @@ from __future__ import annotations
 
 import textwrap
 
+import pytest
+
 from core.inventory.module_load_abort import (
     ModuleLoadAbort,
     _go_panic_is_unconditional,
     detect_module_load_abort,
 )
+
+
+def _requires_lexical_grammar(language: str) -> None:
+    """Positive-detection tests need the tokenizer-grade blanker's
+    grammar; without it the detector fails closed (no abort), which
+    the degradation tests pin separately."""
+    from core.inventory import lexical_view
+
+    if lexical_view._language_for(language) is None:
+        pytest.skip(f"{language} tree-sitter grammar not installed")
+
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +121,7 @@ def test_python_dotted_exception_name_fires():
 
 
 def test_js_top_level_throw_fires():
+    _requires_lexical_grammar("javascript")
     src = (
         "const x = 1;\n"
         "throw new Error('module disabled');\n"
@@ -120,10 +134,27 @@ def test_js_top_level_throw_fires():
 
 
 def test_js_typescript_alias_fires():
+    _requires_lexical_grammar("typescript")
     src = "throw new TypeError('disabled');\n"
     abort = detect_module_load_abort("typescript", src)
     assert abort is not None
     assert abort.summary == "throw new TypeError"
+
+
+@pytest.mark.parametrize("language", ["typescript", "tsx"])
+def test_ts_template_literal_type_throw_does_not_fire(language):
+    # Type-level template literal: its text is erased at compile time,
+    # but the node sits at depth 0 like a value template. Hostile (or
+    # merely string-typed) literal content must not mint a whole-file
+    # abort on a clean-parsing, live TypeScript file.
+    _requires_lexical_grammar(language)
+    src = (
+        "type T = `\n"
+        'x;throw new Error("q");\n'
+        "`;\n"
+        "function live() { return 1; }\n"
+    )
+    assert detect_module_load_abort(language, src) is None
 
 
 def test_js_throw_inside_function_does_not_fire():
@@ -169,6 +200,7 @@ def test_js_throw_in_fn_with_string_brace_does_not_fire():
 
 
 def test_js_template_literal_braces_do_not_break_detection():
+    _requires_lexical_grammar("javascript")
     # A template literal with ``${…}`` braces before a real top-level
     # throw must not desync the walker — the throw still fires.
     src = (
@@ -378,6 +410,7 @@ def test_go_panic_walker_top_level_still_true():
 
 
 def test_rust_compile_error_fires():
+    _requires_lexical_grammar("rust")
     src = (
         "compile_error!(\"this module is disabled\");\n"
         "pub fn vuln() {}\n"
@@ -400,17 +433,20 @@ def test_rust_cfg_gated_compile_error_does_not_fire():
 
 
 def test_php_top_level_die_fires():
+    _requires_lexical_grammar("php")
     r = detect_module_load_abort("php", "<?php\ndie('disabled');\nfunction f(){}\n")
     assert r is not None and r.line == 2 and r.summary == "die"
 
 
 def test_php_top_level_throw_new_fires():
+    _requires_lexical_grammar("php")
     r = detect_module_load_abort(
         "php", "<?php\nthrow new \\App\\DisabledException();\nclass C{}\n")
     assert r is not None and r.summary == "throw new DisabledException"
 
 
 def test_php_exit_after_function_fires():
+    _requires_lexical_grammar("php")
     # The function binds, then an unconditional exit aborts the rest.
     r = detect_module_load_abort("php", "<?php\nfunction g(){}\nexit;\n")
     assert r is not None and r.line == 3
@@ -439,17 +475,278 @@ def test_php_exit_method_call_does_not_fire():
     assert detect_module_load_abort("php", "<?php\n$o->exit();\nfunction f(){}\n") is None
 
 
+def test_php_terminal_exit_on_live_page_does_not_fire():
+    # The live-page shape: top-level dispatch CALLS the file's
+    # functions, then ends in a file-scope ``exit()``. PHP hoists the
+    # declarations (they bind at compile time, before any statement),
+    # so the terminal exit proves nothing — gating here suppressed
+    # review of live entry-point code.
+    _requires_lexical_grammar("php")
+    src = (
+        "<?php\n"
+        "if (isset($send)) {\n"
+        "    showForm($session);\n"
+        "} else {\n"
+        "    showForm($session, true);\n"
+        "}\n"
+        "exit();\n"
+        "function showForm($s, $v = false) { echo $s; }\n"
+    )
+    assert detect_module_load_abort("php", src) is None
+
+
+def test_php_call_before_abort_does_not_fire():
+    _requires_lexical_grammar("php")
+    assert detect_module_load_abort(
+        "php", "<?php\nsetup();\ndie('done');\nfunction setup(){}\n") is None
+
+
+def test_php_include_before_abort_does_not_fire():
+    # An included file executes arbitrary code and can call back into
+    # this file's hoisted functions.
+    _requires_lexical_grammar("php")
+    assert detect_module_load_abort(
+        "php", "<?php\nrequire_once('init.php');\ndie('x');\n") is None
+    assert detect_module_load_abort(
+        "php", "<?php\ninclude 'init.php';\ndie('x');\n") is None
+
+
+def test_php_new_before_abort_does_not_fire():
+    # A constructor is user code executing before the abort.
+    _requires_lexical_grammar("php")
+    assert detect_module_load_abort(
+        "php", "<?php\n$o = new App();\nexit;\n") is None
+    assert detect_module_load_abort(
+        "php", "<?php\n$o = new App;\nexit;\n") is None
+
+
+def test_php_dynamic_call_shapes_before_abort_do_not_fire():
+    _requires_lexical_grammar("php")
+    assert detect_module_load_abort(
+        "php", "<?php\n$f = 'x';\n$f();\ndie();\n") is None
+    assert detect_module_load_abort(
+        "php", "<?php\n$h['k']();\ndie();\n") is None
+
+
+def test_php_goto_before_abort_does_not_fire():
+    # A goto can jump PAST the abort — the top-to-bottom model the
+    # witness relies on no longer holds.
+    _requires_lexical_grammar("php")
+    assert detect_module_load_abort(
+        "php", "<?php\ngoto skip;\ndie();\nskip:\n$x = 1;\n") is None
+
+
+def test_php_alternative_syntax_abstains():
+    # ``if (...): ... endif;`` opens no brace, so the depth model
+    # would read the body as file scope — the end keyword anywhere
+    # abstains the whole file.
+    _requires_lexical_grammar("php")
+    src = "<?php\nif ($x):\n$y = 1;\ndie();\nendif;\n"
+    assert detect_module_load_abort("php", src) is None
+
+
+def test_php_declarations_before_abort_still_fire():
+    # The other direction: declarations are not execution. A file
+    # whose only top-level statements are declarations followed by an
+    # unconditional abort is genuinely dead-on-include — every include
+    # kills the request before anything can call the functions.
+    _requires_lexical_grammar("php")
+    src = (
+        "<?php\n"
+        "function helper($x) { return other($x); }\n"
+        "class C { function m() { helper(1); } }\n"
+        "die('this file is disabled');\n"
+        "function other($x) { return $x; }\n"
+    )
+    abort = detect_module_load_abort("php", src)
+    assert abort is not None
+    assert abort.line == 4
+    assert abort.summary == "die"
+
+
+def test_php_calless_assignments_before_abort_still_fire():
+    # Plain assignments cannot invoke the file's functions — the
+    # witness survives them (pins the existing calibration).
+    _requires_lexical_grammar("php")
+    src = "<?php\n$a = 1;\n$b = $a + 2;\nexit;\nfunction f(){}\n"
+    abort = detect_module_load_abort("php", src)
+    assert abort is not None
+    assert abort.line == 4
+
+
+def test_php_string_callable_before_abort_does_not_fire():
+    # ``'name'();`` / ``"name"();`` invokes the named function — user
+    # code executing before the abort. The blanked view spaces string
+    # INTERIORS but keeps the quotes, so the surviving quote before
+    # ``(`` is the call witness (same branch as ``)``/``]`` dynamic
+    # calls).
+    _requires_lexical_grammar("php")
+    assert detect_module_load_abort(
+        "php",
+        "<?php\n'setup'();\ndie('x');\nfunction setup(){}\n") is None
+    assert detect_module_load_abort(
+        "php",
+        '<?php\n"setup"();\ndie(\'x\');\nfunction setup(){}\n') is None
+
+
+def test_php_string_data_before_abort_still_fires():
+    # Control: plain string DATA (a quote not followed by ``(``)
+    # proves no execution — the witness survives it.
+    _requires_lexical_grammar("php")
+    src = "<?php\n$a = 'setup';\ndie('x');\nfunction setup(){}\n"
+    abort = detect_module_load_abort("php", src)
+    assert abort is not None
+    assert abort.line == 3
+
+
+def test_php_namespaced_define_before_abort_does_not_fire():
+    # Inside a namespace an unqualified function name resolves
+    # namespace-first: a hoisted ``function define(...)`` shadow makes
+    # the unqualified ``define(`` a call into user code, so the bare
+    # ``define`` construct exemption must not apply.
+    _requires_lexical_grammar("php")
+    src = (
+        "<?php\nnamespace n;\ndefine('x', 1);\ndie();\n"
+        "function define($a, $b) { work($a, $b); }\n"
+    )
+    assert detect_module_load_abort("php", src) is None
+
+
+def test_php_qualified_define_before_abort_does_not_fire():
+    # ``a\define(...)`` names a user function in namespace ``a`` —
+    # constructs cannot be namespace-qualified, so any qualified
+    # spelling bypasses the bare-word exemption even without a
+    # namespace declaration in this file.
+    _requires_lexical_grammar("php")
+    src = "<?php\nmyns\\define('x', 1);\ndie();\nfunction f(){}\n"
+    assert detect_module_load_abort("php", src) is None
+
+
+def test_php_global_define_prelude_still_fires():
+    # Control both spellings of the genuine maintenance-page prelude:
+    # unqualified ``define`` in the GLOBAL scope binds to the builtin,
+    # and ``\define`` names it explicitly even inside a namespace.
+    _requires_lexical_grammar("php")
+    src = "<?php\ndefine('OFF', 1);\ndie('x');\nfunction f(){}\n"
+    abort = detect_module_load_abort("php", src)
+    assert abort is not None
+    assert abort.line == 3
+    src2 = (
+        "<?php\nnamespace n;\n\\define('OFF', 1);\ndie('x');\n"
+        "function f(){}\n"
+    )
+    abort2 = detect_module_load_abort("php", src2)
+    assert abort2 is not None
+    assert abort2.line == 4
+
+
+def test_php_uppercase_exec_words_before_abort_do_not_fire():
+    # PHP keywords fold case, and these are DISQUALIFIERS: a
+    # case-sensitive miss keeps a wrong witness on a live file
+    # (worst: an upper-cased goto jumps PAST the abort and the whole
+    # file executes).
+    _requires_lexical_grammar("php")
+    prefixes = [
+        "$o = New App;",
+        "Include 'x.php';",
+        "REQUIRE_ONCE 'x.php';",
+        "Goto skip;",
+    ]
+    for prefix in prefixes:
+        src = f"<?php\n{prefix}\ndie();\nskip:\n$x = 1;\n"
+        assert detect_module_load_abort("php", src) is None, prefix
+
+
+def test_php_uppercase_return_before_abort_does_not_fire():
+    # A file-scope ``Return;`` ends the include exactly like
+    # ``return;`` — the later abort never runs.
+    _requires_lexical_grammar("php")
+    src = "<?php\nReturn;\ndie('x');\nfunction f(){}\n"
+    assert detect_module_load_abort("php", src) is None
+
+
+def test_php_uppercase_alt_syntax_end_abstains():
+    # Colon-syntax end keywords fold case too; an upper-cased ENDIF
+    # marks the same brace-less block form the depth model cannot
+    # follow. ``enddeclare`` completes the keyword set.
+    _requires_lexical_grammar("php")
+    assert detect_module_load_abort(
+        "php", "<?php\nIf ($x):\ndie();\nENDIF;\n") is None
+    assert detect_module_load_abort(
+        "php",
+        "<?php\ndeclare(ticks=1):\ndie();\nenddeclare;\n") is None
+
+
+def test_php_uppercase_function_body_still_classified():
+    # The trigger side of the case fold: an upper-cased FUNCTION
+    # header must classify its brace as a function body, so the
+    # ``return`` inside it stays a body statement and the witness
+    # survives (a miss here loses the witness, but a miss on the
+    # RETURN disqualifier in the mirrored spelling keeps a wrong
+    # one — both directions pinned).
+    _requires_lexical_grammar("php")
+    src = "<?php\nFUNCTION f($x) { return $x; }\ndie('off');\n"
+    abort = detect_module_load_abort("php", src)
+    assert abort is not None
+    assert abort.line == 3
+
+
+def test_php_construct_named_method_call_before_abort_does_not_fire():
+    # ``$o->exit()`` / ``C::exit()`` are user calls whatever the
+    # method is named: semi-reserved words are legal method names, so
+    # the construct-word exemption must not apply after ``->``/``::``.
+    _requires_lexical_grammar("php")
+    assert detect_module_load_abort(
+        "php", "<?php\n$o->exit();\ndie('x');\nfunction f(){}\n") is None
+    assert detect_module_load_abort(
+        "php", "<?php\nApp::exit();\ndie('x');\nfunction f(){}\n") is None
+
+
+# ---------------------------------------------------------------------------
+# PHP linear-model boundary pins. The call-free walk models the
+# EXPLICIT execution statements of top-level code: call shapes, new,
+# include/require, goto, return. Execution reached through object
+# protocol dispatch (magic methods run by clone / property access /
+# string conversion / string interpolation) follows those surfaces'
+# own shapes; these fixtures pin where the current model stands on
+# them so any change to that boundary is a deliberate, visible one.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("label,src", [
+    ("clone runs __clone",
+     "<?php\n$b = $GLOBALS['o'];\n$a = clone $b;\ndie();\n"
+     "class C { function __clone() { work(); } }\n"),
+    ("property read runs __get",
+     "<?php\n$o = $GLOBALS['o'];\n$x = $o->p;\ndie();\n"
+     "class C { function __get($n) { return work($n); } }\n"),
+    ("string cast runs __toString",
+     "<?php\n$o = $GLOBALS['o'];\n$x = (string)$o;\ndie();\n"
+     "class C { function __toString() { return work(); } }\n"),
+    ("interpolated method call (interior blanked as string data)",
+     "<?php\n$o = $GLOBALS['o'];\necho \"hi {$o->check()}\";\nexit;\n"
+     "class U { function check() { return work(); } }\n"),
+    ("backtick shell string (blanked as string data)",
+     "<?php\n`ls`;\ndie();\nfunction f(){}\n"),
+])
+def test_php_object_protocol_shape_pins(label, src):
+    _requires_lexical_grammar("php")
+    assert detect_module_load_abort("php", src) is not None, label
+
+
 # ---------------------------------------------------------------------------
 # Ruby — column-0 unconditional raise / abort / exit / fail aborts require.
 # ---------------------------------------------------------------------------
 
 
 def test_ruby_top_level_raise_fires():
+    _requires_lexical_grammar("ruby")
     r = detect_module_load_abort("ruby", "raise 'disabled'\nclass C\n  def m; end\nend\n")
     assert r is not None and r.line == 1 and r.summary == "raise"
 
 
 def test_ruby_abort_after_oneliner_def_fires():
+    _requires_lexical_grammar("ruby")
     # A one-liner ``def`` before the abort must not leave nesting stuck at 1.
     r = detect_module_load_abort("ruby", "def early; 1; end\nabort 'no'\ndef late; end\n")
     assert r is not None and r.line == 2 and r.summary == "abort"
@@ -478,6 +775,7 @@ def test_ruby_bare_raise_does_not_fire():
 
 
 def test_ruby_exit_bang_detected():
+    _requires_lexical_grammar("ruby")
     abort = detect_module_load_abort("ruby", "exit!\n")
     assert isinstance(abort, ModuleLoadAbort)
     assert abort.line == 1
@@ -489,6 +787,7 @@ def test_ruby_exit_bang_with_modifier_not_detected():
 
 
 def test_ruby_plain_exit_still_detected():
+    _requires_lexical_grammar("ruby")
     abort = detect_module_load_abort("ruby", "exit\n")
     assert abort is not None
     assert abort.summary == "exit"
@@ -581,6 +880,7 @@ def test_js_conditional_throw_multiline_not_detected():
 
 
 def test_js_bare_throw_still_detected():
+    _requires_lexical_grammar("javascript")
     code = "throw new Error('module not supported')"
     result = detect_module_load_abort("javascript", code)
     assert result is not None
@@ -588,6 +888,7 @@ def test_js_bare_throw_still_detected():
 
 
 def test_js_throw_after_semicolon_detected():
+    _requires_lexical_grammar("javascript")
     code = "const ver = process.version;\nthrow new RangeError('bad version')"
     result = detect_module_load_abort("javascript", code)
     assert result is not None
@@ -595,6 +896,7 @@ def test_js_throw_after_semicolon_detected():
 
 
 def test_js_throw_after_block_detected():
+    _requires_lexical_grammar("javascript")
     code = textwrap.dedent("""\
         if (false) {
             console.log('skip');
@@ -643,6 +945,7 @@ def test_ruby_inline_rescue_modifier_not_an_abort():
 
 
 def test_ruby_plain_raise_still_detected():
+    _requires_lexical_grammar("ruby")
     code = 'raise "boom"\ndef live\n  1\nend\n'
     result = detect_module_load_abort("ruby", code)
     assert result is not None
@@ -661,6 +964,7 @@ def test_php_prose_outside_tags_is_output_not_code():
 
 
 def test_php_abort_in_second_region_still_detected():
+    _requires_lexical_grammar("php")
     code = (
         "<?php $x = 1; ?>\n"
         "prose with exit words;\n"
@@ -674,6 +978,7 @@ def test_php_abort_in_second_region_still_detected():
 
 
 def test_php_close_tag_inside_string_stays_in_php_mode():
+    _requires_lexical_grammar("php")
     # A `?>` inside a string does not leave PHP mode — the `die` that
     # follows in real code must still be seen.
     code = "<?php\n$s = 'not a close ?> tag';\ndie('nope');\n"
@@ -706,6 +1011,7 @@ def test_js_string_unbalanced_brace_does_not_fake_module_scope():
 
 
 def test_js_module_scope_throw_after_regex_still_detected():
+    _requires_lexical_grammar("javascript")
     code = (
         "var r = /}{/;\n"
         'throw new Error("nope");\n'
@@ -714,3 +1020,670 @@ def test_js_module_scope_throw_after_regex_still_detected():
     result = detect_module_load_abort("javascript", code)
     assert result is not None
     assert result.line == 2
+# ---------------------------------------------------------------------------
+# JS hostile-shape fixtures: string/template data must never fabricate
+# a whole-file abort, in either regex-vs-division direction. All
+# fixtures are valid, node-verified JavaScript.
+# ---------------------------------------------------------------------------
+
+
+def test_js_real_regex_after_unbraced_if_header_no_fabricated_abort():
+    # `/x`y/` after the `)` of an unbraced if header is a REAL regex;
+    # a division read lets its backtick open a phantom template and the
+    # later template's `; throw new Error(...)` data lex as code.
+    src = (
+        "if (a) /x`y/.test(b);\n"
+        "function live() { return 2; }\n"
+        "const t = `x;\n"
+        'throw new Error("nope");\n'
+        "`;\n"
+    )
+    assert detect_module_load_abort("javascript", src) is None
+
+
+def test_js_division_terminating_at_comment_opener_no_fabricated_abort():
+    # `{a:1} /2; // don`t` — a fake-regex read ending at the comment
+    # opener's first slash exposes the comment tail as code; its
+    # backtick flips template parity file-wide and the later template's
+    # abort-shaped data lexes as code.
+    src = (
+        "x = {a:1} /2; // don`t\n"
+        "function live() { return 1; }\n"
+        "const t = `x;\n"
+        'throw new Error("nope");\n'
+        "`;\n"
+    )
+    assert detect_module_load_abort("javascript", src) is None
+
+
+def test_js_no_fabricated_abort_from_template_data():
+    # `a` is the string "}"; `b` holds STRING DATA that merely looks
+    # like a top-level throw. The module loads fine under node.
+    src = (
+        "const a = `${`}`}`;\n"
+        "const b = `\n"
+        "; throw new Boom();\n"
+        "`;\n"
+        "function live(req) { return req.q; }\n"
+    )
+    assert detect_module_load_abort("javascript", src) is None
+
+
+def test_js_backtick_after_division_no_fabricated_abort():
+    # `x = {a:1} /`/;` is real division by a template literal; the
+    # throw on line 2 is template DATA. node: prints LOADED OK 42.
+    src = (
+        "x = {a:1} /`/;\n"
+        "throw new Boom();\n"
+        "`;\n"
+        "function live() { return 42; }\n"
+        'console.log("LOADED OK", live());\n'
+    )
+    assert detect_module_load_abort("javascript", src) is None
+
+
+def test_js_postfix_increment_division_no_fabricated_abort():
+    # Same class through the `++` preceder: `i++ /`/;` is division by
+    # a template.
+    src = (
+        "let i = 2;\n"
+        "let n = i++ /`/;\n"
+        "throw new Boom();\n"
+        "`;\n"
+        "function live() { return 1; }\n"
+    )
+    assert detect_module_load_abort("javascript", src) is None
+
+
+def test_js_parse_error_bails_whole_file():
+    src = "function f( {\nthrow new Error('x');\n"
+    assert detect_module_load_abort("javascript", src) is None
+
+
+def test_js_grammar_absent_fails_closed(monkeypatch):
+    # Without the grammar the detector must report nothing (bail),
+    # never fall back to a guessed lexical view.
+    from core.inventory import lexical_view
+
+    monkeypatch.setattr(
+        lexical_view._ts_cache, "import_grammar", lambda name: None,
+    )
+    monkeypatch.setattr(lexical_view, "_VALIDATED", {})
+    src = "throw new Error('module disabled');\n"
+    assert detect_module_load_abort("javascript", src) is None
+# ---------------------------------------------------------------------------
+# Rust hostile-shape fixtures: comment / string data must never
+# fabricate a whole-file abort. All fixtures are valid, compiling Rust.
+# ---------------------------------------------------------------------------
+
+
+def test_rust_compile_error_in_block_comment_no_fabricated_abort():
+    src = (
+        "/* examples:\n"
+        ' compile_error!("do not use on wasm")\n'
+        "*/\n"
+        "fn live() { target(); }\n"
+    )
+    assert detect_module_load_abort("rust", src) is None
+
+
+def test_rust_compile_error_in_string_no_fabricated_abort():
+    src = (
+        "fn f() -> &'static str {\n"
+        '    "usage:\n'
+        "compile_error!(x)\n"
+        '"\n'
+        "}\n"
+    )
+    assert detect_module_load_abort("rust", src) is None
+
+
+def test_rust_compile_error_in_line_comment_no_fabricated_abort():
+    src = (
+        "// compile_error!(\"never\")\n"
+        "fn live() { target(); }\n"
+    )
+    assert detect_module_load_abort("rust", src) is None
+
+
+def test_rust_real_compile_error_after_comment_decoy_still_detected():
+    _requires_lexical_grammar("rust")
+    src = (
+        "// docs mention compile_error! here\n"
+        'compile_error!("unsupported target");\n'
+        "fn never() {}\n"
+    )
+    result = detect_module_load_abort("rust", src)
+    assert result is not None
+    assert result.line == 2
+
+
+def test_rust_parse_error_bails_whole_file():
+    src = 'fn f( { let = ;\ncompile_error!("x");\n'
+    assert detect_module_load_abort("rust", src) is None
+
+
+def test_rust_grammar_absent_fails_closed(monkeypatch):
+    from core.inventory import lexical_view
+
+    monkeypatch.setattr(
+        lexical_view._ts_cache, "import_grammar", lambda name: None,
+    )
+    monkeypatch.setattr(lexical_view, "_VALIDATED", {})
+    src = 'compile_error!("unsupported");\n'
+    assert detect_module_load_abort("rust", src) is None
+# ---------------------------------------------------------------------------
+# Ruby hostile-shape fixtures: heredoc / multi-line-string data must
+# never fabricate a whole-file abort. All fixtures are valid Ruby.
+# ---------------------------------------------------------------------------
+
+
+def test_ruby_raise_in_heredoc_no_fabricated_abort():
+    src = (
+        "banner = <<~EOT\n"
+        "raise the alarm when ready\n"
+        "EOT\n"
+        "def live\n"
+        "  1\n"
+        "end\n"
+    )
+    assert detect_module_load_abort("ruby", src) is None
+
+
+def test_ruby_exit_in_multiline_string_no_fabricated_abort():
+    src = (
+        's = "line one\n'
+        'exit\n'
+        'line three"\n'
+        "def live\n"
+        "  1\n"
+        "end\n"
+    )
+    assert detect_module_load_abort("ruby", src) is None
+
+
+def test_ruby_abort_in_end_data_section_no_fabricated_abort():
+    src = (
+        "x = 1\n"
+        "__END__\n"
+        "abort\n"
+    )
+    assert detect_module_load_abort("ruby", src) is None
+
+
+def test_ruby_real_raise_after_heredoc_still_detected():
+    _requires_lexical_grammar("ruby")
+    src = (
+        "banner = <<~EOT\n"
+        "raise decoy\n"
+        "EOT\n"
+        'raise "real abort"\n'
+        "def never\n"
+        "  1\n"
+        "end\n"
+    )
+    result = detect_module_load_abort("ruby", src)
+    assert result is not None
+    assert result.line == 4
+    assert result.summary == "raise"
+
+
+def test_ruby_raise_with_heredoc_argument_still_detected():
+    # The heredoc OPENER survives blanking, so raise-with-argument is
+    # still recognised when the message itself is a heredoc.
+    _requires_lexical_grammar("ruby")
+    src = (
+        "raise <<~ERR\n"
+        "  unsupported platform\n"
+        "ERR\n"
+    )
+    result = detect_module_load_abort("ruby", src)
+    assert result is not None
+    assert result.line == 1
+
+
+def test_ruby_grammar_absent_fails_closed(monkeypatch):
+    from core.inventory import lexical_view
+
+    monkeypatch.setattr(
+        lexical_view._ts_cache, "import_grammar", lambda name: None,
+    )
+    monkeypatch.setattr(lexical_view, "_VALIDATED", {})
+    src = 'raise "boom"\n'
+    assert detect_module_load_abort("ruby", src) is None
+# ---------------------------------------------------------------------------
+# PHP hostile-shape fixtures: heredoc / nowdoc string data must never
+# fabricate a whole-file abort (the dead_scope sibling already modelled
+# heredocs; this detector did not). All fixtures are valid PHP.
+# ---------------------------------------------------------------------------
+
+
+def test_php_die_in_heredoc_no_fabricated_abort():
+    src = (
+        "<?php\n"
+        "$msg = <<<EOT\n"
+        "something;\n"
+        "die\n"
+        "EOT;\n"
+        "function live() { return 1; }\n"
+    )
+    assert detect_module_load_abort("php", src) is None
+
+
+def test_php_throw_in_heredoc_no_fabricated_abort():
+    src = (
+        "<?php\n"
+        "$msg = <<<EOT\n"
+        "x;\n"
+        "throw new Boom();\n"
+        "EOT;\n"
+        "function live() { return 1; }\n"
+    )
+    assert detect_module_load_abort("php", src) is None
+
+
+def test_php_exit_in_nowdoc_no_fabricated_abort():
+    src = (
+        "<?php\n"
+        "$msg = <<<'NOW'\n"
+        "usage;\n"
+        "exit\n"
+        "NOW;\n"
+        "function live() { return 1; }\n"
+    )
+    assert detect_module_load_abort("php", src) is None
+
+
+def test_php_real_die_after_heredoc_still_detected():
+    _requires_lexical_grammar("php")
+    src = (
+        "<?php\n"
+        "$msg = <<<EOT\n"
+        "die decoy\n"
+        "EOT;\n"
+        "die('real');\n"
+    )
+    result = detect_module_load_abort("php", src)
+    assert result is not None
+    assert result.line == 5
+    assert result.summary == "die"
+
+
+def test_php_parse_error_bails_whole_file():
+    src = "<?php\nfunction f( {\ndie('x');\n"
+    assert detect_module_load_abort("php", src) is None
+
+
+def test_php_grammar_absent_fails_closed(monkeypatch):
+    from core.inventory import lexical_view
+
+    monkeypatch.setattr(
+        lexical_view._ts_cache, "import_grammar", lambda name: None,
+    )
+    monkeypatch.setattr(lexical_view, "_VALIDATED", {})
+    src = "<?php\ndie('disabled');\n"
+    assert detect_module_load_abort("php", src) is None
+def test_rust_compile_error_in_macro_rules_arm_no_fabricated_abort():
+    # A compile_error! inside a macro_rules! arm is the ubiquitous
+    # "bad invocation" guard — it fires only on a caller's mistake,
+    # never at module load. Flagging it hard-suppressed live files.
+    src = (
+        "macro_rules! sel {\n"
+        "    ($x:expr) => { $x };\n"
+        "    () => {\n"
+        '        compile_error!("requires at least one branch")\n'
+        "    };\n"
+        "}\n"
+        "fn live() {}\n"
+    )
+    assert detect_module_load_abort("rust", src) is None
+
+
+def test_rust_compile_error_in_fn_body_no_fabricated_abort():
+    src = (
+        "fn f() {\n"
+        'compile_error!("x");\n'
+        "}\n"
+    )
+    assert detect_module_load_abort("rust", src) is None
+
+
+def test_rust_compile_error_in_paren_macro_token_tree_no_fabricated_abort():
+    # Macro invocations take any token-tree delimiter: a compile_error!
+    # inside ``ignore_it!( ... )`` never expands (the file compiles —
+    # rustc-verified) yet leaves the prefix BRACE-balanced; only the
+    # dangling ``(`` betrays the token tree.
+    src = (
+        "macro_rules! ignore_it { ($($t:tt)*) => {}; }\n"
+        "ignore_it!(\n"
+        'compile_error!("never expands")\n'
+        ");\n"
+        "pub fn live() {}\n"
+    )
+    assert detect_module_load_abort("rust", src) is None
+
+
+def test_rust_compile_error_in_bracket_macro_token_tree_no_fabricated_abort():
+    # Same shape with the ``[`` token-tree delimiter (rustc-verified
+    # to compile).
+    src = (
+        "macro_rules! ignore_it { ($($t:tt)*) => {}; }\n"
+        "ignore_it![\n"
+        'compile_error!("never expands")\n'
+        "];\n"
+        "pub fn live() {}\n"
+    )
+    assert detect_module_load_abort("rust", src) is None
+
+
+def test_php_prefixed_literals_do_not_fabricate_abort():
+    # ``b'…'`` spans start at the prefix byte: an edges blanking that
+    # keeps the raw first byte leaves the closing quote unpaired, the
+    # depth walker's string skip swallows ``function f() {``'s brace,
+    # and the die() INSIDE the function reads as a depth-0
+    # statement-initial abort — a whole-file dead gate fabricated on
+    # a live file.
+    _requires_lexical_grammar("php")
+    src = (
+        "<?php\n"
+        "$a = b'x';\n"
+        "function f() {\n"
+        "    $b = b'y';\n"
+        '    die("nope");\n'
+        "}\n"
+    )
+    assert detect_module_load_abort("php", src) is None
+
+
+def test_php_real_abort_after_prefixed_literal_still_detected():
+    _requires_lexical_grammar("php")
+    src = (
+        "<?php\n"
+        "$a = b'x';\n"
+        "die('real');\n"
+        "function f() { work(); }\n"
+    )
+    result = detect_module_load_abort("php", src)
+    assert result is not None
+    assert result.line == 3
+    assert result.summary == "die"
+
+
+@pytest.mark.parametrize("language", ["javascript", "typescript", "tsx"])
+def test_js_family_hashbang_does_not_fabricate_abort(language):
+    # ``hash_bang_line`` parses clean and used to survive blanking:
+    # abort-looking text in a one-line hashbang read as a depth-0
+    # statement-initial throw — a whole-file dead gate fabricated on
+    # a file whose every function is live.
+    _requires_lexical_grammar(language)
+    src = (
+        "#!/usr/bin/env node; throw new Boom(1)\n"
+        "function live() { work(); }\n"
+    )
+    assert detect_module_load_abort(language, src) is None
+
+
+def test_js_real_abort_below_hashbang_still_detected():
+    _requires_lexical_grammar("javascript")
+    src = (
+        "#!/usr/bin/env node\n"
+        "throw new Boom(1);\n"
+        "function live() { work(); }\n"
+    )
+    result = detect_module_load_abort("javascript", src)
+    assert result is not None
+    assert result.line == 2
+    assert result.summary == "throw new Boom"
+
+
+# ---------------------------------------------------------------------------
+# Recovery / early-exit constructs — an unconditional-looking abort is
+# not proven to terminate loading when the language offers a way to
+# survive it (defer-recover) or to end top-level execution before it
+# (module-/file-scope return, indented Ruby nesting). Every ambiguity
+# must abstain: these witnesses hard-suppress findings downstream.
+# ---------------------------------------------------------------------------
+
+
+def test_go_defer_before_panic_abstains():
+    # A defer registered before the panic may recover() it — the file
+    # then loads and every function below is live (go-run verified).
+    src = textwrap.dedent(
+        """\
+        package main
+
+        import "fmt"
+
+        func init() {
+        \tdefer func() { recover() }()
+        \tpanic("integrity check")
+        }
+
+        func Vuln() {
+        \tfmt.Println("VULN:live")
+        }
+
+        func main() { Vuln() }
+        """
+    )
+    assert detect_module_load_abort("go", src) is None
+
+
+def test_go_defer_in_comment_before_panic_still_fires():
+    src = (
+        "package main\n"
+        "func init() {\n"
+        "\t// defer is only mentioned here\n"
+        "\tpanic(\"disabled\")\n"
+        "}\n"
+    )
+    result = detect_module_load_abort("go", src)
+    assert result is not None
+    assert result.line == 4
+
+
+def test_go_return_before_panic_abstains():
+    # A return before the panic ends init first — conditional shapes
+    # (return inside a nested block) skip the panic on that branch.
+    src = (
+        "package main\n"
+        "func init() {\n"
+        "\tif ok() {\n"
+        "\t\treturn\n"
+        "\t}\n"
+        "\tpanic(\"disabled\")\n"
+        "}\n"
+    )
+    assert detect_module_load_abort("go", src) is None
+
+
+def test_go_defer_after_panic_still_fires():
+    # A defer AFTER the panic never registers — cannot recover it.
+    src = (
+        "package main\n"
+        "func init() {\n"
+        "\tpanic(\"disabled\")\n"
+        "\tdefer cleanup()\n"
+        "}\n"
+    )
+    result = detect_module_load_abort("go", src)
+    assert result is not None
+    assert result.line == 3
+
+
+def test_js_module_level_return_in_executed_block_abstains():
+    # CommonJS top-level return inside an executed conditional ends the
+    # module before the throw; `below` is hoisted, exported, callable
+    # (node-run verified).
+    _requires_lexical_grammar("javascript")
+    src = (
+        "exports.below = below;\n"
+        "if (true) { return; }\n"
+        "throw new Error(\"unreachable\");\n"
+        "function below(x){ console.log(x); }\n"
+    )
+    assert detect_module_load_abort("javascript", src) is None
+
+
+def test_js_bare_module_level_return_abstains():
+    _requires_lexical_grammar("javascript")
+    src = "return;\nthrow new Error(\"unreachable\");\n"
+    assert detect_module_load_abort("javascript", src) is None
+
+
+def test_js_return_inside_function_before_throw_still_fires():
+    _requires_lexical_grammar("javascript")
+    src = (
+        "function helper(x) { return x + 1; }\n"
+        "const f = (a) => { return a; };\n"
+        "throw new Error(\"disabled\");\n"
+    )
+    result = detect_module_load_abort("javascript", src)
+    assert result is not None
+    assert result.line == 3
+
+
+def test_js_return_in_class_method_abstains():
+    # A class-method brace is not PROVEN to be a function body by the
+    # matcher — the return abstains (cheap under-detect direction; the
+    # dangerous direction would be classifying a bare block as a
+    # function and keeping a false witness).
+    _requires_lexical_grammar("javascript")
+    src = (
+        "class A { m() { return 1; } }\n"
+        "throw new Error(\"disabled\");\n"
+    )
+    assert detect_module_load_abort("javascript", src) is None
+
+
+def test_js_return_after_throw_still_fires():
+    _requires_lexical_grammar("javascript")
+    src = (
+        "throw new Error(\"disabled\");\n"
+        "if (x) { return; }\n"
+    )
+    result = detect_module_load_abort("javascript", src)
+    assert result is not None
+    assert result.line == 1
+
+
+def test_php_file_scope_return_in_executed_block_abstains():
+    # PHP binds unconditional top-level functions at compile time; a
+    # file-scope return ends the include before the die() runs.
+    _requires_lexical_grammar("php")
+    src = (
+        "<?php\n"
+        "if (true) { return; }\n"
+        "die('never runs');\n"
+        "function vuln($x){ echo $x; }\n"
+    )
+    assert detect_module_load_abort("php", src) is None
+
+
+def test_php_return_inside_function_before_die_still_fires():
+    _requires_lexical_grammar("php")
+    src = (
+        "<?php\n"
+        "function f($x) { return $x; }\n"
+        "die('disabled');\n"
+    )
+    result = detect_module_load_abort("php", src)
+    assert result is not None
+    assert result.line == 3
+
+
+def test_php_return_variable_name_does_not_abstain():
+    _requires_lexical_grammar("php")
+    src = (
+        "<?php\n"
+        "$returnCode = 1;\n"
+        "die('disabled');\n"
+    )
+    result = detect_module_load_abort("php", src)
+    assert result is not None
+    assert result.line == 3
+
+
+def test_ruby_indented_opener_at_top_level_abstains():
+    # A one-space-indented `if` never increments the column-0 depth
+    # counter, so the conditional raise below it read unconditional
+    # (tree-sitter ground truth: the raise sits inside the if node).
+    _requires_lexical_grammar("ruby")
+    src = " if ENV['X']\nraise 'conditional'\n end\ndef vuln; end\n"
+    assert detect_module_load_abort("ruby", src) is None
+
+
+def test_ruby_top_level_return_abstains():
+    # `return` is valid at Ruby file scope and ends execution — a
+    # later abort line never runs.
+    _requires_lexical_grammar("ruby")
+    src = "return if ENV['SKIP']\nraise 'disabled'\n"
+    assert detect_module_load_abort("ruby", src) is None
+
+
+def test_ruby_endless_def_does_not_wedge_depth():
+    # `def foo = 42` opens no body and has no `end`; counting it as an
+    # opener left depth stuck at 1, silently disabling detection for
+    # the rest of the file.
+    _requires_lexical_grammar("ruby")
+    result = detect_module_load_abort("ruby", "def foo = 42\nraise 'disabled'\n")
+    assert result is not None
+    assert result.line == 2
+
+
+def test_ruby_setter_def_still_counts_as_opener():
+    # `def foo=(v)` is a setter (regular def with an `end`), not an
+    # endless def — the raise inside its body must not fire.
+    _requires_lexical_grammar("ruby")
+    src = "def foo=(v)\nraise 'inside setter'\nend\n"
+    assert detect_module_load_abort("ruby", src) is None
+
+
+def test_ruby_indented_body_inside_col0_opener_still_fires_below():
+    # Ordinary layout — indented openers at depth > 0 are the norm and
+    # must not trigger the depth-0 indented-opener bail.
+    _requires_lexical_grammar("ruby")
+    src = (
+        "class C\n"
+        "  if x\n"
+        "    y = 1\n"
+        "  end\n"
+        "end\n"
+        "raise 'disabled'\n"
+    )
+    result = detect_module_load_abort("ruby", src)
+    assert result is not None
+    assert result.line == 6
+
+
+def test_check_suppress_not_earned_on_recoverable_go_panic(tmp_path):
+    # End-to-end over the real chain: build_inventory ->
+    # classify_reachability -> check_suppress must NOT return a
+    # hard-suppress verdict for a function in a file whose init panic
+    # is recovered by a defer (`go run` executes the function).
+    import json
+    import tempfile
+
+    from core.analysis.reach_chokepoint import check_suppress
+    from core.inventory.builder import build_inventory
+
+    (tmp_path / "main.go").write_text(
+        "package main\n\n"
+        "import \"fmt\"\n\n"
+        "func init() {\n"
+        "\tdefer func() { recover() }()\n"
+        "\tpanic(\"integrity check\")\n"
+        "}\n\n"
+        "func Vuln() {\n"
+        "\tfmt.Println(\"VULN:live\")\n"
+        "}\n\n"
+        "func main() { Vuln() }\n"
+    )
+    with tempfile.TemporaryDirectory() as td:
+        build_inventory(str(tmp_path), td, parallel=False)
+        checklist = json.loads(
+            (__import__("pathlib").Path(td) / "checklist.json").read_text())
+    decision = check_suppress(
+        checklist=checklist, file_path="main.go", function_name="Vuln",
+        line=11, repo_root=tmp_path)
+    assert decision is None

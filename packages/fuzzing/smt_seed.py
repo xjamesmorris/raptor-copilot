@@ -30,19 +30,38 @@ offsets, so a value-at-offset splice has no mechanical basis today.
 Every artifact carries a manifest entry naming the producing finding /
 attack path, the variable, and the witness value, so a crash found
 from one is traceable back to the finding that predicted it.
+
+Plant containment: every filesystem touch this flow makes under the
+run dir goes through a predictable name the previous campaign's
+sandboxed target could occupy, and this module runs in the
+UNSANDBOXED parent. Containment sits at the flow entry —
+:func:`ensure_real_seed_dir` vets the seed-dir name itself before any
+write (a plant there redirects or kills EVERY artifact at once) — and
+per name behind it: seeds are O_EXCL/O_NOFOLLOW exclusive creates,
+the dictionary writes and the manifest write refuse a plant loudly
+and skip. On every plant shape the posture is the same: warn (escaped,
+bounded rendering), skip the touch, leave the plant in place —
+removing a target-planted object is a destructive step this flow
+never takes — and never crash the /fuzz run.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import re
+import stat
 import struct
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from core.atomic_fs import write_new_bytes, write_text_atomically
 from core.json import load_json, save_json
+from core.run.safe_io import safe_run_mkdir
+from core.security.log_sanitisation import sanitise_for_terminal
+from core.source import read_text_capped
 
 # Analysis-report / attack-path artifacts are RAPTOR-written run
 # output — the audit-artifact budget class.
@@ -59,6 +78,17 @@ SEED_LEN_CAP = 1024 * 1024
 MAX_WITNESSES = 200
 MAX_SEEDS = 512
 MAX_DICT_ENTRIES = 1024
+
+# Read bound for the two dictionary files ``merge_witness_dict``
+# consumes out of the reused run dir. Downward pressure: both names
+# are predictable and the dir was writable by the previous campaign's
+# sandboxed target, so an unbounded read of a planted file is a
+# parent-process memory lever — past the cap the merge refuses.
+# Upward pressure: AFL-style dictionaries are one short token per
+# line (MAX_DICT_ENTRIES witness tokens render well under 256 KiB),
+# and audit-mined operator dictionaries stay orders of magnitude
+# under 4 MiB — a legitimate dict must never hit the refusal.
+MAX_DICT_FILE_CHARS = 4 * 1024 * 1024
 
 SEED_DIR_NAME = "smt-seeds"
 MANIFEST_NAME = "smt-seeds-manifest.json"
@@ -144,6 +174,76 @@ def _sanitize_token_name(label: str) -> str:
     return name[:64]
 
 
+def _write_seed_exclusive(seed_path: Path, data: bytes) -> str | None:
+    """Exclusive, symlink-refusing seed write. Returns a skip reason
+    for the manifest on refusal, None on success.
+
+    O_CREAT|O_EXCL|O_NOFOLLOW via the shared helper: the seed dir is
+    inside the (reused, target-writable) run dir, so anything already
+    occupying a deterministic seed name — including a dangling
+    symlink, which passes ``exists() == False`` — fails closed with a
+    manifest record instead of being followed or overwritten.
+    """
+    try:
+        write_new_bytes(seed_path, data)
+    except FileExistsError:
+        return "seed filename collision"
+    except OSError as exc:
+        return f"seed write refused: {type(exc).__name__}"
+    return None
+
+
+def ensure_real_seed_dir(seed_dir: str | Path) -> str | None:
+    """Entry containment for the seed dir: create it, or accept only a
+    pre-existing REAL directory. Returns a refusal reason on any plant
+    shape, ``None`` when the directory is safe to use.
+
+    The seed dir sits at a predictable name (``SEED_DIR_NAME``) inside
+    the reused run dir the previous campaign's sandboxed target could
+    write, and every artifact of the ``--from-smt-witness`` flow —
+    built-in corpus seeds, witness seeds, ``smt-witness.dict``, the
+    manifest — is written through this name by the unsandboxed parent,
+    which then reads the campaign corpus back through it. The old
+    ``mkdir(parents=True, exist_ok=True)`` was the wrong gate twice
+    over:
+
+    * a planted regular FILE or DANGLING SYMLINK raised
+      ``FileExistsError`` (``exist_ok`` tolerates only a real
+      directory) — uncaught through the bare /fuzz CLI handler, the
+      whole run died before any campaign;
+    * a planted SYMLINK to an attacker-chosen DIRECTORY passed
+      silently (CPython's ``exist_ok`` re-check is ``is_dir()``, which
+      FOLLOWS symlinks), so the parent wrote all seeds, the
+      dictionary, and the manifest into the attacker's directory —
+      ``save_json``'s ``os.replace`` CLOBBERING anything there named
+      like the manifest — and the campaign corpus was read back
+      through the attacker's directory.
+
+    Delegates to :func:`core.run.safe_io.safe_run_mkdir` — the same
+    O_NOFOLLOW-honest create-or-verify the run dir itself gets one
+    level up: absent → created ``0o700`` (fchmod through an
+    ``O_DIRECTORY | O_NOFOLLOW`` handle, never by name); pre-existing
+    real directory owned by the current user and not world-writable →
+    accepted; ANY other occupant of the name (regular file, dangling
+    symlink, symlink to a directory, FIFO, foreign or world-writable
+    dir) → refused. Callers refuse loudly and skip every write AND
+    read under the name — ``read_text_capped`` hardens only the final
+    component, so a symlinked seed dir would still redirect the
+    dictionary read-back through its parent — and leave the plant in
+    place.
+    """
+    seed_dir = Path(seed_dir)
+    try:
+        seed_dir.parent.mkdir(parents=True, exist_ok=True)
+        safe_run_mkdir(seed_dir)
+    except OSError as exc:
+        # UnsafeRunDirError is a PermissionError → OSError; a failed
+        # parent mkdir (planted file on the parent path) lands here
+        # too. The reason feeds the manifest and the log site.
+        return f"{type(exc).__name__}: {exc}"
+    return None
+
+
 def collect_witnesses(source_dir: Path) -> tuple[list[WitnessRecord], list[dict]]:
     """Scan a run output dir for witness records from both producers.
 
@@ -159,7 +259,13 @@ def collect_witnesses(source_dir: Path) -> tuple[list[WitnessRecord], list[dict]
         try:
             data = load_json(
                 report, strict=True, max_bytes=_MAX_ARTIFACT_BYTES,
-            ) or {}
+            )
+            if not isinstance(data, dict):
+                # List-shaped (or otherwise non-object) report: the
+                # .get() walk below would raise — record the drop like
+                # any other unreadable file.
+                msg = f"non-object JSON ({type(data).__name__})"
+                raise ValueError(msg)
             for result in data.get("results") or []:
                 if not isinstance(result, dict):
                     continue
@@ -222,9 +328,49 @@ def synthesize_seeds(
 
     Returns the manifest dict. ``skipped`` entries from collection are
     carried into the manifest so the audit trail is complete.
+
+    Plant containment (the run dir is reused and was writable by the
+    previous campaign's sandboxed target):
+
+    * ``out_dir`` itself is vetted by :func:`ensure_real_seed_dir`
+      before ANY write. On refusal (file / dangling symlink /
+      symlink-to-directory / any non-real-dir occupant of the name)
+      NOTHING is written — the returned manifest carries the reason
+      under ``seed_dir_refused`` plus a ``skipped`` record, and the
+      plant is left in place.
+    * A directory planted at the MANIFEST name inside a real seed dir
+      is refused loudly and the manifest file is skipped —
+      ``os.replace`` cannot swap a directory and this writer never
+      removes a target-planted tree. Seeds and the dictionary are
+      unaffected by that shape, and the returned in-memory manifest
+      still drives the run (the earlier claim that seeds AND the
+      manifest always survive a plant was wrong for exactly this
+      shape: the ``IsADirectoryError`` used to crash the whole run).
     """
     out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    refusal = ensure_real_seed_dir(out_dir)
+    if refusal is not None:
+        logger.warning(
+            "refusing SMT witness synthesis: %s is not usable as the "
+            "seed dir (%s) — a planted object in the reused run dir? "
+            "left in place; nothing written",
+            sanitise_for_terminal(str(out_dir)),
+            sanitise_for_terminal(refusal, max_len=200))
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "witnesses": len(records),
+            "seed_count": 0,
+            "dict_entries": 0,
+            "dict_file": None,
+            "caps_hit": [],
+            "seeds": [],
+            "skipped": [
+                *(skipped or []),
+                {"file": str(out_dir),
+                 "reason": f"seed dir refused: {refusal}"},
+            ],
+            "seed_dir_refused": refusal,
+        }
 
     seeds: list[dict] = []
     dict_entries: dict[str, str] = {}  # token name -> escaped value
@@ -255,14 +401,30 @@ def synthesize_seeds(
                     clamped = value > SEED_LEN_CAP
                     length = min(value, SEED_LEN_CAP)
                     name = f"smt_{idx:03d}_{token_base}_len{value}"[:120]
-                    (out_dir / name).write_bytes(_FILL_BYTE * length)
-                    seeds.append({
-                        **provenance,
-                        "seed": name,
-                        "rule": "length",
-                        "bytes": length,
-                        "clamped": clamped,
-                    })
+                    seed_path = out_dir / name
+                    # Exclusive create, not exists()-then-write: a
+                    # pre-existing file must never be silently
+                    # overwritten and then listed in the manifest —
+                    # and a planted DANGLING symlink passes
+                    # exists() == False, making the plain write_bytes
+                    # create the attacker-chosen target. Anything
+                    # occupying the name refuses with a skip record.
+                    skip_reason = _write_seed_exclusive(
+                        seed_path, _FILL_BYTE * length)
+                    if skip_reason is not None:
+                        all_skipped.append({
+                            **provenance,
+                            "reason": skip_reason,
+                            "seed": name,
+                        })
+                    else:
+                        seeds.append({
+                            **provenance,
+                            "seed": name,
+                            "rule": "length",
+                            "bytes": length,
+                            "clamped": clamped,
+                        })
             elif _is_length_like(label) and value <= 0:
                 all_skipped.append({
                     **provenance,
@@ -287,8 +449,12 @@ def synthesize_seeds(
             else:
                 name = f"smt_{idx:03d}_{token_base}_raw"[:120]
                 seed_path = out_dir / name
-                if not seed_path.exists():
-                    seed_path.write_bytes(encoded)
+                # Exclusive create (see the length rule above): every
+                # dropped artifact is recorded — the manifest promises
+                # no silent truncation — and a planted dangling
+                # symlink can never route the write elsewhere.
+                skip_reason = _write_seed_exclusive(seed_path, encoded)
+                if skip_reason is None:
                     seeds.append({
                         **provenance,
                         "seed": name,
@@ -297,13 +463,9 @@ def synthesize_seeds(
                         "clamped": False,
                     })
                 else:
-                    # Filename collision (two variables sanitizing to
-                    # the same token in one record, or a pre-existing
-                    # file): every dropped artifact is recorded — the
-                    # manifest promises no silent truncation.
                     all_skipped.append({
                         **provenance,
-                        "reason": "seed filename collision",
+                        "reason": skip_reason,
                         "seed": name,
                     })
 
@@ -311,7 +473,25 @@ def synthesize_seeds(
     if dict_entries:
         dict_path = out_dir / "smt-witness.dict"
         lines = [f'{name}="{value}"' for name, value in sorted(dict_entries.items())]
-        dict_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        # Atomic write: the run dir is reused and target-writable —
+        # os.replace over a planted symlink replaces the symlink
+        # itself, never follows it. Same write containment as the
+        # merge in merge_witness_dict: os.replace cannot swap a
+        # planted DIRECTORY (and removing a target-planted tree is a
+        # destructive step never taken here) — warn once and ship the
+        # manifest without a dictionary file rather than crash the
+        # /fuzz run.
+        try:
+            write_text_atomically(dict_path, "\n".join(lines) + "\n")
+        except OSError as exc:
+            logger.warning(
+                "witness dictionary not written (%s: %s) — a planted "
+                "object at %s? left in place; seeds are unaffected and "
+                "the manifest write is guarded on its own",
+                type(exc).__name__,
+                sanitise_for_terminal(str(exc), max_len=200),
+                sanitise_for_terminal(str(dict_path)))
+            dict_path = None
 
     manifest = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -322,8 +502,24 @@ def synthesize_seeds(
         "caps_hit": sorted(set(caps_hit)),
         "seeds": seeds,
         "skipped": all_skipped,
+        "seed_dir_refused": None,
     }
-    save_json(out_dir / MANIFEST_NAME, manifest, sort_keys=True)
+    # Same containment as the dictionary write above, for the same
+    # reason: the manifest name is exactly as predictable, and
+    # save_json's os.replace cannot swap a planted DIRECTORY
+    # (IsADirectoryError used to propagate up through the bare /fuzz
+    # CLI handler and kill the run before any campaign). Warn and
+    # skip; the in-memory manifest still drives the run.
+    try:
+        save_json(out_dir / MANIFEST_NAME, manifest, sort_keys=True)
+    except OSError as exc:
+        logger.warning(
+            "witness manifest not written (%s: %s) — a planted object "
+            "at %s? left in place; seeds and dictionary are unaffected "
+            "and the in-memory manifest still drives the run",
+            type(exc).__name__,
+            sanitise_for_terminal(str(exc), max_len=200),
+            sanitise_for_terminal(str(out_dir / MANIFEST_NAME)))
     return manifest
 
 
@@ -334,22 +530,106 @@ def merge_witness_dict(seed_dir: Path, run_out_dir: Path) -> Path | None:
     did not pass ``--dict`` (see ``audit_dict``), so appending here
     needs no new runner plumbing. Existing lines (e.g. audit-mined
     tokens) are preserved; duplicates are dropped.
+
+    Both files sit at predictable names inside the reused run dir the
+    previous campaign's sandboxed target could write, and this runs in
+    the unsandboxed parent — so the reads are hardened
+    (``read_text_capped``: O_NOFOLLOW + fstat-S_ISREG, bounded).
+    ``Path.read_text`` followed a planted symlink here, copying
+    operator-readable file content into the merged ``fuzz.dict`` the
+    NEXT campaign's sandboxed target can read; an unbounded read of a
+    planted multi-GB file was a parent memory lever. A planted
+    non-regular ``fuzz.dict`` is refused loudly (its content is never
+    read) and handled per shape: a symlink or FIFO is REPLACED by the
+    atomic write (``os.replace`` swaps the plant's inode itself), a
+    DIRECTORY skips the merge — ``os.replace`` cannot swap a
+    directory, and removing a target-planted tree from the
+    unsandboxed parent is a destructive step this merge never takes.
+    A hostile witness dict or an over-``MAX_DICT_FILE_CHARS`` file on
+    either side refuses the whole merge loudly. Any write failure is
+    contained here (warn + skip), never propagated to the CLI.
     """
     witness_dict = Path(seed_dir) / "smt-witness.dict"
-    if not witness_dict.is_file():
+    witness_got = read_text_capped(witness_dict, MAX_DICT_FILE_CHARS)
+    if witness_got is None:
+        if os.path.lexists(witness_dict):
+            logger.warning(
+                "refusing witness-dict merge: %s is not a readable "
+                "regular file (planted symlink/FIFO in the reused "
+                "run dir?)", witness_dict)
         return None
+    witness_text, witness_truncated = witness_got
+    if witness_truncated:
+        logger.warning(
+            "refusing witness-dict merge: %s exceeds the %d-char "
+            "dictionary bound", witness_dict, MAX_DICT_FILE_CHARS)
+        return None
+
     target = Path(run_out_dir) / "fuzz.dict"
     existing: list[str] = []
-    if target.is_file():
-        existing = target.read_text(encoding="utf-8").splitlines()
+    target_got = read_text_capped(target, MAX_DICT_FILE_CHARS)
+    if target_got is not None:
+        target_text, target_truncated = target_got
+        if target_truncated:
+            logger.warning(
+                "refusing witness-dict merge: %s exceeds the %d-char "
+                "dictionary bound — left untouched", target,
+                MAX_DICT_FILE_CHARS)
+            return None
+        existing = target_text.splitlines()
+    elif os.path.lexists(target):
+        # Present but not a readable regular file: a planted symlink
+        # (dangling ones pass exists()==False), FIFO, or directory.
+        # Never read through any of them; the shapes then diverge at
+        # the write. A DIRECTORY is refused outright: os.replace
+        # cannot swap one (the atomic write raised IsADirectoryError
+        # up through the /fuzz CLI), and removing a target-planted
+        # tree from the unsandboxed parent is a destructive step this
+        # merge never takes (same contract as open_exclusive_artifact
+        # replace=True: a directory at the name still raises).
+        try:
+            plant_is_dir = stat.S_ISDIR(os.lstat(target).st_mode)
+        except OSError:
+            plant_is_dir = False  # vanished/unreadable: let the
+            # hardened write below decide loudly.
+        if plant_is_dir:
+            logger.warning(
+                "refusing witness-dict merge: %s is a directory "
+                "(planted in the reused run dir?) — merge skipped, "
+                "directory left in place",
+                sanitise_for_terminal(str(target)))
+            return None
+        # Symlink/FIFO: merge from empty; the atomic write below
+        # replaces the plant itself, never what it points at.
+        logger.warning(
+            "%s is not a readable regular file (planted symlink/FIFO "
+            "in the reused run dir?) — its content is NOT merged; "
+            "the witness dict replaces it", target)
     seen = set(existing)
     added = [
-        line for line in witness_dict.read_text(encoding="utf-8").splitlines()
+        line for line in witness_text.splitlines()
         if line and line not in seen
     ]
     if not added:
         return target if target.is_file() else None
-    target.write_text("\n".join([*existing, *added]) + "\n", encoding="utf-8")
+    # Atomic read-merge-write commit (same rationale as the witness
+    # dict write above — the plain write_text followed planted
+    # symlinks in the reused run dir). Contained: a plant re-appearing
+    # in the check→write window (or any other write failure) must
+    # cost only the merge, never the fuzz run — the caller
+    # (synthesize_from_run_dir → the bare /fuzz CLI handler) has no
+    # handler of its own. The atomic writer already unlinked its
+    # tempfile on the failure path.
+    try:
+        write_text_atomically(target, "\n".join([*existing, *added]) + "\n")
+    except OSError as exc:
+        logger.warning(
+            "witness-dict merge not written (%s: %s) — merge skipped; "
+            "the dictionary at %s is a planted or hostile object?",
+            type(exc).__name__,
+            sanitise_for_terminal(str(exc), max_len=200),
+            sanitise_for_terminal(str(target)))
+        return None
     return target
 
 
@@ -358,11 +638,21 @@ def synthesize_from_run_dir(source_dir: Path, run_out_dir: Path) -> dict:
 
     Returns the manifest augmented with ``seed_dir`` and
     ``merged_dict`` keys. Logs the one-line operator summary.
+
+    When the seed-dir name itself is planted (``seed_dir_refused`` set
+    by :func:`synthesize_seeds`), the dictionary merge is skipped too:
+    nothing was written, and reading ``smt-witness.dict`` back would
+    traverse the planted name — ``read_text_capped`` refuses a symlink
+    only at the FINAL component, so a symlinked seed dir would still
+    route the read through the attacker-chosen directory.
     """
     records, skipped = collect_witnesses(Path(source_dir))
     seed_dir = Path(run_out_dir) / SEED_DIR_NAME
     manifest = synthesize_seeds(records, seed_dir, skipped=skipped)
-    merged = merge_witness_dict(seed_dir, run_out_dir)
+    if manifest.get("seed_dir_refused"):
+        merged = None
+    else:
+        merged = merge_witness_dict(seed_dir, run_out_dir)
     manifest["seed_dir"] = str(seed_dir)
     manifest["merged_dict"] = str(merged) if merged else None
     logger.info(

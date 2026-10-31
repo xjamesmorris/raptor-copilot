@@ -77,9 +77,13 @@ def find_stale_annotations(
             ))
             continue
 
+        # The annotation writer (raptor-annotate) stamps the span as
+        # start_line/end_line — NOT the checklist's line_start/line_end
+        # spelling. Reading the wrong keys resolved both to 0, so
+        # modified-source annotations never surfaced as stale.
         try:
-            line_start = int(ann.metadata.get("line_start", "0") or "0")
-            line_end = int(ann.metadata.get("line_end", "0") or "0")
+            line_start = int(ann.metadata.get("start_line", "0") or "0")
+            line_end = int(ann.metadata.get("end_line", "0") or "0")
         except (ValueError, TypeError):
             continue
         if not (line_start and line_end):

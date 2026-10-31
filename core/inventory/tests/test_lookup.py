@@ -177,5 +177,149 @@ class TestMetadataInVulnerabilityContext(unittest.TestCase):
         self.assertNotIn("metadata", result)
 
 
+class TestFileIndexCache(unittest.TestCase):
+    """The per-checklist path index behind lookup_function.
+
+    Both directions of the bounded LRU are pinned: a repeat lookup on
+    the same checklist must SERVE the cached index (no re-normalise of
+    every entry path), and filling the cache past its bound must EVICT
+    the oldest entry while lookups stay correct (rebuild on miss).
+    """
+
+    def setUp(self):
+        from core.inventory import lookup as lookup_mod
+        self.lookup_mod = lookup_mod
+        lookup_mod._INDEX_CACHE.clear()
+        self.addCleanup(lookup_mod._INDEX_CACHE.clear)
+
+    @staticmethod
+    def _checklist(tag):
+        return {
+            "files": [
+                {
+                    "path": f"src/{tag}.py",
+                    "items": [
+                        {"name": f"fn_{tag}", "kind": "function",
+                         "line_start": 1, "line_end": 10},
+                    ],
+                },
+            ],
+        }
+
+    def test_hit_serves_cached_index_without_renormalising(self):
+        checklist = self._checklist("a")
+        self.assertEqual(
+            lookup_function(checklist, "src/a.py", 5, "/repo")["name"],
+            "fn_a")
+        index_first = self.lookup_mod._file_index(checklist, "/repo")
+
+        calls = []
+        original = self.lookup_mod.normalise_path
+
+        def counting(path, repo_root):
+            calls.append(path)
+            return original(path, repo_root)
+
+        self.lookup_mod.normalise_path = counting
+        try:
+            result = lookup_function(checklist, "src/a.py", 5, "/repo")
+        finally:
+            self.lookup_mod.normalise_path = original
+
+        self.assertEqual(result["name"], "fn_a")
+        # Only the QUERY path is normalised on a hit — never the
+        # checklist entries again.
+        self.assertEqual(calls, ["src/a.py"])
+        self.assertIs(
+            self.lookup_mod._file_index(checklist, "/repo"), index_first)
+
+    def test_eviction_at_bound_and_correct_after_rebuild(self):
+        bound = self.lookup_mod._INDEX_CACHE_MAX
+        checklists = [self._checklist(f"c{i}") for i in range(bound + 1)]
+        for i, checklist in enumerate(checklists):
+            fn = lookup_function(checklist, f"src/c{i}.py", 5, "/repo")
+            self.assertEqual(fn["name"], f"fn_c{i}")
+
+        cache = self.lookup_mod._INDEX_CACHE
+        self.assertEqual(len(cache), bound)
+        evicted_key = (id(checklists[0]["files"]), "/repo")
+        self.assertNotIn(evicted_key, cache)
+
+        # The evicted checklist still resolves — the index rebuilds.
+        fn = lookup_function(checklists[0], "src/c0.py", 5, "/repo")
+        self.assertEqual(fn["name"], "fn_c0")
+        self.assertEqual(len(cache), bound)
+
+    def test_append_after_caching_is_visible(self):
+        checklist = self._checklist("a")
+        self.assertIsNotNone(
+            lookup_function(checklist, "src/a.py", 5, "/repo"))
+        checklist["files"].append(self._checklist("b")["files"][0])
+        fn = lookup_function(checklist, "src/b.py", 5, "/repo")
+        self.assertIsNotNone(fn)
+        self.assertEqual(fn["name"], "fn_b")
+
+    def test_duplicate_paths_keep_cross_entry_fuzzy_semantics(self):
+        # Two entries share a path; the first has only a fuzzy
+        # candidate, the second the exact match — the exact match from
+        # the LATER entry must win (pre-index behavior).
+        checklist = {
+            "files": [
+                {"path": "src/dup.py",
+                 "items": [{"name": "fuzzy_only", "kind": "function",
+                            "line_start": 1}]},
+                {"path": "src/dup.py",
+                 "items": [{"name": "exact", "kind": "function",
+                            "line_start": 3, "line_end": 9}]},
+            ],
+        }
+        fn = lookup_function(checklist, "src/dup.py", 5, "/repo")
+        self.assertEqual(fn["name"], "exact")
+
+
+class TestLookupFileLanguage(unittest.TestCase):
+    """File-level language lookup (hint tier for consumers)."""
+
+    CHECKLIST = {
+        "files": [
+            {"path": "src/table.inc", "language": "c", "items": []},
+            {"path": "web/header.inc", "language": "php", "items": []},
+            {"path": "src/untagged.x", "items": []},
+            {"path": "src/mangled.y", "language": {"x": 1}, "items": []},
+        ],
+    }
+
+    def test_returns_recorded_language(self):
+        from core.inventory.lookup import lookup_file_language
+        self.assertEqual(
+            lookup_file_language(self.CHECKLIST, "src/table.inc", "/repo"),
+            "c")
+        self.assertEqual(
+            lookup_file_language(self.CHECKLIST, "web/header.inc", "/repo"),
+            "php")
+
+    def test_absent_path_or_language_is_none(self):
+        from core.inventory.lookup import lookup_file_language
+        self.assertIsNone(
+            lookup_file_language(self.CHECKLIST, "src/missing.inc", "/repo"))
+        self.assertIsNone(
+            lookup_file_language(self.CHECKLIST, "src/untagged.x", "/repo"))
+
+    def test_non_string_language_value_is_none_not_repr(self):
+        # A malformed row must yield a clean None, never a stringified
+        # repr masquerading as a language tag.
+        from core.inventory.lookup import lookup_file_language
+        self.assertIsNone(
+            lookup_file_language(self.CHECKLIST, "src/mangled.y", "/repo"))
+
+    def test_absolute_path_without_root_is_none_not_error(self):
+        # Best-effort contract: consumers use this as a hint, so an
+        # unresolvable query yields no hint instead of raising (unlike
+        # lookup_function, whose callers must not silently lose data).
+        from core.inventory.lookup import lookup_file_language
+        self.assertIsNone(
+            lookup_file_language(self.CHECKLIST, "/abs/src/table.inc"))
+
+
 if __name__ == "__main__":
     unittest.main()

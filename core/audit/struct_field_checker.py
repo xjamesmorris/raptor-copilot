@@ -91,8 +91,13 @@ _TYPE_SIZES: Dict[str, int] = {
     "pointer": 8, "void *": 8, "addr": 8,
 }
 
+# The struct body span is bounded: unbounded, a body that repeats
+# `struct x{` inside it re-scans the remainder from every occurrence
+# — quadratic in hostile source length. 6000 chars covers even
+# generated/decompiled struct bodies (hundreds of fields); beyond
+# that the definition is skipped rather than scanned without bound.
 _STRUCT_DEF_RE = re.compile(
-    r'struct\s+(\w+)\s*\{([^}]+)\}',
+    r'struct\s+(\w+)\s*\{([^}]{1,6000})\}',
     re.DOTALL,
 )
 
@@ -100,8 +105,19 @@ _STRUCT_DEF_RE = re.compile(
 # to either side — ``char *name;`` used to be skipped because the
 # star was only accepted as part of the TYPE token, leaving every
 # later offset 8 bytes short), field name, optional array dims.
+# Type and name must be separated by whitespace or a star run
+# ((?:\s|(?=\*))): the previous ``(\w+)\s*(\*+\s*)?(\w+)`` let the
+# two word groups sit ADJACENT, so a long identifier run with no
+# ``;`` made the engine try every split of the run between them —
+# cubic in the line length. The only dropped shape is a single
+# unseparated word splitting into type+name (``ab;`` as type ``a``
+# name ``b``), which is not a C field declaration. The array tail
+# folds its trailing whitespace into the gated group.
+# The leading \b keeps an unanchored scan from restarting inside an
+# identifier run (every interior position was a fresh match start,
+# each rescanning the rest of the run — the residual quadratic).
 _STRUCT_FIELD_RE = re.compile(
-    r'(\w+)\s*(\*+\s*)?(\w+)'
+    r'\b(\w+)(?:\s|(?=\*))\s*(\*+\s*)?(\w+)'
     r'(?:\[(\d+)\])?\s*;',
 )
 
@@ -117,8 +133,10 @@ _COPY_INTO_OFFSET_RE = re.compile(
     r'(?:\((?:long|ulong|char\s*\*)\)\s*)?'
     r'(\w+)\s*\+\s*(0x[0-9a-fA-F]+|\d+)'
     r'\s*,'
-    r'([^,]+),'
-    r'([^)]+)\)',
+    # Argument spans bounded — same rationale as _STRUCT_DEF_RE
+    # (4000 chars is far above a real argument).
+    r'([^,]{1,4000}),'
+    r'([^)]{1,4000})\)',
 )
 
 
@@ -177,6 +195,19 @@ def _extract_struct_layouts(
             else:
                 elem_size = _TYPE_SIZES.get(base_type, 4)
 
+            # Natural alignment (LP64 System V assumption): each field
+            # aligns to min(element size, 8); an array aligns to its
+            # element. Without this, {int; char *; char[8]} placed the
+            # pointer at 4 and the array at 12 instead of the ABI's
+            # 8/16 — offsets consumed downstream as tool evidence
+            # attributed copies to the wrong field. No #pragma pack /
+            # __attribute__((packed)) handling: explicitly packed
+            # structs will still be laid out natural here. Struct tail
+            # padding is irrelevant to this path (only per-field
+            # offsets are consumed, never the struct's total size).
+            align = min(elem_size, 8) or 1
+            offset = -(-offset // align) * align
+
             total_size = elem_size * array_size if array_size else elem_size
 
             fields.append({
@@ -212,7 +243,7 @@ def _extract_offset_accesses(
         if is_pointer:
             elem_size = 8
         else:
-            elem_size = _TYPE_SIZES.get(base_type, None)
+            elem_size = _TYPE_SIZES.get(base_type)  # type: ignore[assignment]
 
         if base_ptr not in accesses:
             accesses[base_ptr] = []
@@ -286,6 +317,28 @@ def _load_re_type_fields(
                     "struct": struct_name,
                 }
     return known
+
+
+def struct_sites_present(
+    source: str,
+    re_types: Optional[List[Dict[str, Any]]] = None,
+    xref_source: Optional[str] = None,
+) -> bool:
+    """Whether any struct layout, offset-shaped access, or bound
+    RE-typed field appears in the checker's search space — the
+    structural precondition ``check_struct_field_copy`` requires
+    before it can test anything. Consulted by the sweep wrapper so a
+    model miss maps to inconclusive, never refuted."""
+    search_source = source
+    if xref_source:
+        search_source = source + "\n" + xref_source
+    if _extract_struct_layouts(search_source):
+        return True
+    if _extract_offset_accesses(search_source):
+        return True
+    if re_types:
+        return bool(_load_re_type_fields(re_types, search_source))
+    return False
 
 
 def check_struct_field_copy(
@@ -364,7 +417,7 @@ def check_struct_field_copy(
         offset_str = m.group(3)
         copy_len = m.group(5).strip()
 
-        offset = _parse_int(offset_str)
+        offset = _parse_int(offset_str)  # type: ignore[assignment]
         if offset is None:
             continue
 

@@ -1,13 +1,14 @@
 """Loader-variable quarantine for launcher-carrying sandbox paths.
 
-The unshare/pid1-shim chain on Linux and the seatbelt shim on macOS
-are trusted bootstrap processes that exec BEFORE the sandboxed target:
-they run with the trust marker present and (on the map-root path) with
-namespace capabilities not yet dropped. Handing them the caller's
-``env=`` dict verbatim means dynamic-loader variables in that dict
-(``LD_PRELOAD``, ``LD_LIBRARY_PATH``, ``LD_AUDIT``,
-``DYLD_INSERT_LIBRARIES``, ...) inject code into the bootstrap chain
-itself, not just the target.
+The seatbelt watcher shim on macOS is a trusted bootstrap process
+that execs BEFORE the sandboxed target: it runs with the trust marker
+present. Handing it the caller's ``env=`` dict verbatim means
+dynamic-loader variables in that dict (``LD_PRELOAD``,
+``LD_LIBRARY_PATH``, ``LD_AUDIT``, ``DYLD_INSERT_LIBRARIES``, ...)
+inject code into the bootstrap chain itself, not just the target.
+(The Linux unshare/pid1-shim chain was this module's other consumer
+until that lane was deleted — every Linux lane now execs the target
+directly.)
 
 ``quarantine_loader_env`` moves every ``LD_*`` / ``DYLD_*`` variable
 out of the live environment into a JSON payload under

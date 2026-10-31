@@ -16,7 +16,12 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
+from core.llm.accounting import LLMPolicyError
 from core.llm.coerce import structured_result
+from packages.llm_analysis.dispatch import (
+    record_dispatch_accounting,
+    record_exception_accounting,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -91,37 +96,52 @@ class DispatchClient:
         the model is fixed at construction time per the orchestrator's
         role resolution. `kwargs` are also ignored.
 
-        Returns the result dict on success, or None on any failure
-        (exception, missing result attribute, error in payload). Never
-        raises — hypothesis_validation's runner.validate is documented
-        to handle None as "LLM did not return a usable response."
+        Returns the result dict on success, or None for an ordinary unusable
+        response. Explicit policy refusals remain typed errors and are never
+        converted into a success-shaped value.
         """
         try:
             response = self._dispatch_fn(
                 prompt, schema, system_prompt, self._temperature, self._model,
             )
-        except Exception as e:  # noqa: BLE001 — fail-open: any dispatch failure means "no verdict"
+        except Exception as e:  # noqa: BLE001 — classify before fail-open
+            record_exception_accounting(
+                self._cost_tracker,
+                e,
+                model_name=_cost_model_key(self._model),
+            )
             logger.warning("dispatch_fn raised during dataflow validation: %s", e)
+            if isinstance(e, LLMPolicyError):
+                raise
             return None
-
-        cost = getattr(response, "cost", 0.0) or 0.0
-        if cost and self._cost_tracker is not None:
-            try:
-                self._cost_tracker.add_cost(_cost_model_key(self._model), cost)
-            except Exception as e:  # noqa: BLE001 — cost accounting must never sink the validation
-                logger.debug(
-                    "cost_tracker.add_cost failed: %s", e,
-                )
 
         result = structured_result(response)
         if not isinstance(result, dict):
+            record_dispatch_accounting(
+                self._cost_tracker,
+                response,
+                failed=True,
+                model_name=_cost_model_key(self._model),
+            )
             return None
         if "error" in result:
+            record_dispatch_accounting(
+                self._cost_tracker,
+                response,
+                failed=True,
+                model_name=_cost_model_key(self._model),
+            )
             logger.warning(
                 "dispatch_fn returned error during dataflow validation: %s",
                 result.get("error"),
             )
             return None
+        record_dispatch_accounting(
+            self._cost_tracker,
+            response,
+            failed=False,
+            model_name=_cost_model_key(self._model),
+        )
         return result
 
 

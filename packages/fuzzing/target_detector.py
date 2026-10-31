@@ -12,6 +12,9 @@ Supported target kinds:
   - pe-exe         : Windows PE executable
   - pe-dll         : Windows DLL
   - pe-sys         : Windows kernel driver (.sys)
+  - te             : TE (Terse Executable) UEFI image — classified,
+                     deliberately not analysed
+
   - java-class     : Java class file
   - java-archive   : Java JAR archive
   - apk            : Android APK archive
@@ -19,6 +22,7 @@ Supported target kinds:
   - source-cpp     : C++ source files (need harness)
   - rust-crate     : Rust crate (Cargo.toml present)
   - python-pkg     : Python package (setup.py / pyproject.toml)
+  - java-project   : Java/Kotlin project (Maven / Gradle / bare sources)
   - unknown        : Unrecognised
 """
 
@@ -27,12 +31,13 @@ from __future__ import annotations
 import logging
 import os
 import platform
+import re
 import shutil
 import struct
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Literal, NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +61,15 @@ _KNOWN_MACHO_CPU_TYPES = {
     0x0100000C,
     0x01000012,
 }
+
+
+# C-family source extensions — ONE set consumed by BOTH the file-mode
+# branches and the directory walk. These were hand-copied per mode and
+# drifted: the directory set lacked .cxx/.hh/.hxx, so a pure-.cxx tree
+# detected `unknown` while any single such file detected `source-cpp`.
+_C_SOURCE_EXTS = frozenset({".c", ".h"})
+_CPP_SOURCE_EXTS = frozenset({".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx"})
+_C_FAMILY_EXTS = _C_SOURCE_EXTS | _CPP_SOURCE_EXTS
 
 
 @dataclass
@@ -130,13 +144,28 @@ def _detect_file(path: Path) -> TargetInfo:
     if magic[:2] == b"MZ":
         return _detect_pe(path, magic, suffix, sys_platform)
 
+    # TE (Terse Executable, UEFI PI firmware): "VZ" at offset 0 — a
+    # stripped-down PE relative with NO DOS stub and NO COFF header,
+    # so nothing on the MZ path above ever sees one and the PE facts
+    # extractor does not parse it. The kind is "te", deliberately
+    # NOT a "pe-" kind: downstream consumers key Windows behavior
+    # off the "pe-" prefix (the target_kind -> OS platform label,
+    # the Windows driver-symbol ingress probing), and a UEFI image
+    # must inherit neither.
+    if magic[:2] == b"VZ":
+        return _detect_te(path, magic)
+
     if magic[:4] == b"\xca\xfe\xba\xbe":
         return TargetInfo(
             path=path,
             kind="java-class",
             description="Java class file",
             can_fuzz_here=False,
-            hints=["Use /binary or /understand --map for intake; JVM harnessing is not orchestrated yet."],
+            hints=[
+                "Use /binary or /understand --map for intake; compiled "
+                "JVM artifacts are not orchestrated. Point /fuzz at the "
+                "project SOURCE tree to run a Jazzer campaign instead.",
+            ],
         )
 
     if magic[:4] == b"PK\x03\x04":
@@ -145,7 +174,7 @@ def _detect_file(path: Path) -> TargetInfo:
             return archive
 
     # Source code by extension
-    if suffix in (".c", ".h"):
+    if suffix in _C_SOURCE_EXTS:
         return TargetInfo(
             path=path, kind="source-c",
             description="C source/header file",
@@ -155,7 +184,7 @@ def _detect_file(path: Path) -> TargetInfo:
                 "Or pass the directory containing this file to fuzz the whole library.",
             ],
         )
-    if suffix in (".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx"):
+    if suffix in _CPP_SOURCE_EXTS:
         return TargetInfo(
             path=path, kind="source-cpp",
             description="C++ source/header file",
@@ -168,6 +197,8 @@ def _detect_file(path: Path) -> TargetInfo:
         return _detect_rust_crate(path.parent)
     if path.name in ("pyproject.toml", "setup.py"):
         return _detect_python_pkg(path.parent)
+    if path.name in _JAVA_BUILD_MARKERS:
+        return _detect_java_project(path.parent)
 
     return TargetInfo(
         path=path, kind="unknown",
@@ -211,7 +242,11 @@ def _looks_like_fat_macho(path: Path, magic: bytes) -> bool:
 def _detect_zip_artifact(path: Path) -> TargetInfo | None:
     try:
         with zipfile.ZipFile(path) as zf:
-            members = set(zf.namelist()[:10000])
+            # Slice the (already-parsed) infolist rather than calling
+            # namelist(), which materialises a name list for EVERY
+            # entry before the slice — a zip with millions of entries
+            # is attacker-supplied input here.
+            members = {zi.filename for zi in zf.infolist()[:10000]}
     except (OSError, zipfile.BadZipFile, RuntimeError):
         return None
     if "AndroidManifest.xml" in members and any(name.endswith(".dex") for name in members):
@@ -228,12 +263,16 @@ def _detect_zip_artifact(path: Path) -> TargetInfo | None:
             kind="java-archive",
             description="Java JAR archive",
             can_fuzz_here=False,
-            hints=["Use /binary or /understand --map for intake; JVM harnessing is not orchestrated yet."],
+            hints=[
+                "Use /binary or /understand --map for intake; compiled "
+                "JVM artifacts are not orchestrated. Point /fuzz at the "
+                "project SOURCE tree to run a Jazzer campaign instead.",
+            ],
         )
     return None
 
 
-def _tree_has_extension(root: Path, extensions: set[str]) -> bool:
+def _tree_has_extension(root: Path, extensions: frozenset[str]) -> bool:
     """Single recursive walk with early exit on the first match.
 
     One ``glob('**/pat')`` per extension meant up to five COMPLETE
@@ -254,7 +293,9 @@ def _detect_directory(path: Path) -> TargetInfo:
         return _detect_rust_crate(path)
     if (path / "pyproject.toml").exists() or (path / "setup.py").exists():
         return _detect_python_pkg(path)
-    if _tree_has_extension(path, {".h", ".c", ".cc", ".cpp", ".hpp"}):
+    if any((path / marker).exists() for marker in _JAVA_BUILD_MARKERS):
+        return _detect_java_project(path)
+    if _tree_has_extension(path, _C_FAMILY_EXTS):
         return TargetInfo(
             path=path, kind="source-c",
             description="Directory containing C/C++ sources",
@@ -264,6 +305,12 @@ def _detect_directory(path: Path) -> TargetInfo:
                 "specific functions in this library.",
             ],
         )
+    # Bare JVM source trees (no build marker) come AFTER the C-family
+    # walk so mixed C+Java trees keep their pre-existing source-c
+    # detection; a pure Java/Kotlin tree previously detected `unknown`,
+    # so this branch is purely additive.
+    if _tree_has_extension(path, _JVM_SOURCE_EXTS):
+        return _detect_java_project(path)
     return TargetInfo(
         path=path, kind="unknown",
         description="Directory with no recognised project marker",
@@ -452,6 +499,55 @@ def _detect_pe(
     return info
 
 
+# COFF machine value -> arch label, shared by the PE header probe
+# and the TE header probe (TE reuses the COFF machine vocabulary at
+# its own fixed offset).
+_COFF_MACHINE_ARCH = {
+    0x014C: "i386",
+    0x8664: "x86_64",
+    0x01C0: "arm",
+    0x01C4: "armv7",
+    0xAA64: "arm64",
+    0x0200: "ia64",
+}
+
+
+def _detect_te(path: Path, magic: bytes) -> TargetInfo:
+    """TE (Terse Executable) UEFI image: classify and decline.
+
+    The machine field sits at offset 2, directly behind the "VZ"
+    signature — already inside the magic bytes read, so
+    classification costs no further IO. Nothing else is parsed:
+    there is no DOS/COFF header for the PE facts path, and
+    radare2's te loader is deliberately not engaged either — a
+    low-mileage parser pointed at hostile firmware images is a poor
+    trade for facts nothing downstream consumes yet; revisit with a
+    dedicated firmware lane.
+    """
+    arch = "unknown"
+    if len(magic) >= 4:
+        machine = int.from_bytes(magic[2:4], "little")
+        arch = _COFF_MACHINE_ARCH.get(machine,
+                                      f"machine_{machine:#x}")
+    return TargetInfo(
+        path=path,
+        kind="te",
+        arch=arch,
+        description=f"TE (Terse Executable) UEFI image ({arch})",
+        can_fuzz_here=False,
+        blockers=[
+            "te_not_analysed: TE images are classified but not "
+            "analysed — no DOS/COFF header for the PE facts path, "
+            "and the radare2 te loader is deliberately not engaged "
+            "against hostile firmware images.",
+        ],
+        hints=[
+            "Use a firmware analysis toolchain (e.g. UEFITool) to "
+            "unpack and inspect the image.",
+        ],
+    )
+
+
 def _pe_arch(path: Path) -> str:
     """Read the PE COFF machine field rather than guessing x86_64."""
     try:
@@ -467,14 +563,101 @@ def _pe_arch(path: Path) -> str:
     if len(header) < 6 or header[:4] != b"PE\x00\x00":
         return "unknown"
     machine = int.from_bytes(header[4:6], "little")
-    return {
-        0x014C: "i386",
-        0x8664: "x86_64",
-        0x01C0: "arm",
-        0x01C4: "armv7",
-        0xAA64: "arm64",
-        0x0200: "ia64",
-    }.get(machine, f"machine_{machine:#x}")
+    return _COFF_MACHINE_ARCH.get(machine, f"machine_{machine:#x}")
+
+
+# cargo-fuzz layout detection ------------------------------------------
+
+# Fuzz-target names double as cargo bin names and path components on
+# the run side; the enumeration vets them to this charset so a scanned
+# repo's file names stay inert in hints, globs, and command lines.
+_CARGO_FUZZ_TARGET_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+# Enumeration bound — fuzz_targets/ is scanned-repo content, so a
+# planted directory with millions of entries must not balloon hints or
+# plan output. Real projects carry a handful of targets.
+_MAX_CARGO_FUZZ_TARGETS = 256
+
+
+def find_cargo_fuzz_dir(crate_dir: Path) -> Path | None:
+    """Locate the cargo-fuzz workspace for *crate_dir*.
+
+    The conventional layout is a ``fuzz/`` child holding its own
+    ``Cargo.toml`` plus a ``fuzz_targets/`` directory (what
+    ``cargo fuzz init`` scaffolds). The crate directory itself also
+    qualifies, so an operator can point /fuzz straight at the fuzz
+    workspace. Returns the RESOLVED path, or None when neither
+    matches.
+
+    Containment: a candidate — or its ``fuzz_targets`` directory —
+    that resolves OUTSIDE the resolved crate directory is refused with
+    a logged reason. The fuzz workspace receives a build-phase write
+    grant downstream and the target enumeration walks ``fuzz_targets``,
+    so a repo-planted symlink at either level would otherwise steer
+    the grant or the enumeration at an arbitrary tree elsewhere on the
+    host.
+    """
+    base = Path(crate_dir)
+    try:
+        base_resolved = base.resolve()
+    except OSError:
+        return None
+
+    def _escapes(path: Path) -> Path | None:
+        """The resolved path when it escapes the crate, else None."""
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return path
+        if resolved != base_resolved and \
+                base_resolved not in resolved.parents:
+            return resolved
+        return None
+
+    for candidate in (base / "fuzz", base):
+        if not ((candidate / "Cargo.toml").is_file()
+                and (candidate / "fuzz_targets").is_dir()):
+            continue
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        for level, escaped_to in (
+            (candidate, _escapes(candidate)),
+            (candidate / "fuzz_targets",
+             _escapes(candidate / "fuzz_targets")),
+        ):
+            if escaped_to is not None:
+                logger.warning(
+                    "cargo-fuzz layout at %s refused: %s resolves to "
+                    "%s, outside the crate %s — a symlinked workspace "
+                    "or fuzz_targets dir would steer the build's "
+                    "write grant or the target enumeration off the "
+                    "crate",
+                    candidate, level, escaped_to, base_resolved,
+                )
+                break
+        else:
+            return resolved
+    return None
+
+
+def list_cargo_fuzz_targets(fuzz_dir: Path) -> list[str]:
+    """Fuzz-target names under ``<fuzz_dir>/fuzz_targets`` (``.rs``
+    stems), sorted, charset-vetted, symlink-refusing, and bounded —
+    the tree is the scanned repo's own content."""
+    targets: list[str] = []
+    try:
+        entries = sorted((Path(fuzz_dir) / "fuzz_targets").iterdir())
+    except OSError:
+        return []
+    for entry in entries:
+        if len(targets) >= _MAX_CARGO_FUZZ_TARGETS:
+            break
+        if entry.suffix != ".rs" or entry.is_symlink() or not entry.is_file():
+            continue
+        if _CARGO_FUZZ_TARGET_NAME_RE.fullmatch(entry.stem):
+            targets.append(entry.stem)
+    return targets
 
 
 def _detect_rust_crate(crate_dir: Path) -> TargetInfo:
@@ -494,10 +677,21 @@ def _detect_rust_crate(crate_dir: Path) -> TargetInfo:
         info.blockers.append(
             "cargo-fuzz not installed. Install with: cargo install cargo-fuzz"
         )
-    info.hints.append(
-        "cargo-fuzz scaffolds harnesses in fuzz/fuzz_targets/. "
-        "Use 'cargo fuzz init' if not already set up."
-    )
+    fuzz_dir = find_cargo_fuzz_dir(crate_dir)
+    targets = list_cargo_fuzz_targets(fuzz_dir) if fuzz_dir else []
+    if targets:
+        shown = ", ".join(targets[:8]) + (", ..." if len(targets) > 8 else "")
+        info.hints.append(
+            f"cargo-fuzz layout detected ({len(targets)} fuzz "
+            f"target(s)): {shown}. Select one with --fuzz-target "
+            "<name>; a single target is auto-selected."
+        )
+    else:
+        info.hints.append(
+            "No fuzz targets found. cargo-fuzz scaffolds harnesses in "
+            "fuzz/fuzz_targets/ — use 'cargo fuzz init' (and "
+            "'cargo fuzz add <name>') if not already set up."
+        )
     return info
 
 
@@ -519,7 +713,188 @@ def _detect_python_pkg(pkg_dir: Path) -> TargetInfo:
         info.blockers.append("atheris not installed. Install with: pip install atheris")
     info.hints.append(
         "Atheris fuzzes Python code (and Python C extensions) using libFuzzer. "
-        "RAPTOR's harness generator can scaffold an atheris harness from a "
-        "function name."
+        "Pass --py-harness <file> for an operator-written TestOneInput "
+        "harness, or --py-entry module:function to scaffold the simple "
+        "bytes/str case."
     )
+    return info
+
+
+# jazzer (JVM) layout detection ----------------------------------------
+
+# Build-system markers that make a directory a java-project. The
+# repo's own mvnw/gradlew wrapper scripts are NOT markers and are
+# never executed — they are target code.
+_JAVA_BUILD_MARKERS = (
+    "pom.xml",
+    "build.gradle", "build.gradle.kts",
+    "settings.gradle", "settings.gradle.kts",
+)
+_JVM_SOURCE_EXTS = frozenset({".java", ".kt"})
+
+# Target class names double as a jazzer --target_class argument and a
+# resource-path component on the run side; the enumeration vets them
+# to the Java identifier charset so a scanned repo's file names and
+# package lines stay inert in hints, arguments, and paths.
+_JAZZER_IDENT = r"[A-Za-z_$][A-Za-z0-9_$]{0,127}"
+_JAZZER_TARGET_CLASS_RE = re.compile(
+    rf"{_JAZZER_IDENT}(?:\.{_JAZZER_IDENT}){{0,31}}"
+)
+# `package com.example;` (Java) / `package com.example` (Kotlin) —
+# matched per line, every repeat bounded.
+_JAVA_PACKAGE_RE = re.compile(
+    rf"^\s{{0,64}}package\s{{1,64}}({_JAZZER_IDENT}"
+    rf"(?:\.{_JAZZER_IDENT}){{0,31}})\s{{0,64}};?\s{{0,64}}$"
+)
+# Enumeration bounds — the source tree is scanned-repo content, so a
+# planted tree with millions of entries must not balloon hints, plan
+# output, or the scan itself. Real projects carry a handful of
+# harnesses; the file-scan bound keeps the walk linear in tree size
+# with an early exit.
+_MAX_JAZZER_TARGETS = 256
+_MAX_JAZZER_SCAN_FILES = 20000
+# Bounded read per candidate source file (the harness marker sits in
+# the class body; real fuzz harnesses are small files).
+_MAX_JAZZER_SOURCE_BYTES = 256 * 1024
+# Package declarations sit at the top of the file.
+_MAX_PACKAGE_SCAN_LINES = 100
+# Directories never walked for harness enumeration: VCS state and
+# build outputs (compiled trees can carry copies of the sources).
+_JAZZER_SKIP_DIRS = frozenset({
+    ".git", ".hg", ".svn", ".gradle", ".idea", ".mvn",
+    "target", "build", "out", "node_modules",
+})
+
+
+class JazzerTarget(NamedTuple):
+    """One enumerated Jazzer fuzz target."""
+
+    #: Fully-qualified class name (charset-vetted), the value handed
+    #: to jazzer as --target_class.
+    class_name: str
+    #: The source file that declares it — resolved, inside the
+    #: project; binds witnesses and locates the corpus convention.
+    source: Path
+
+
+def _jazzer_package_of(text: str) -> str:
+    """The `package` declaration in *text*, or empty. Only the top of
+    the file is scanned; every line is length-bounded before match."""
+    for raw in text.splitlines()[:_MAX_PACKAGE_SCAN_LINES]:
+        match = _JAVA_PACKAGE_RE.match(raw[:512])
+        if match:
+            return match.group(1)
+    return ""
+
+
+def list_jazzer_targets(project_dir: Path) -> list[JazzerTarget]:
+    """Enumerate Jazzer fuzz targets under *project_dir*.
+
+    A target is a Java/Kotlin source file that carries a
+    ``fuzzerTestOneInput`` method (jazzer's standalone entry point) or
+    a ``@FuzzTest`` annotation (its JUnit integration). The
+    fully-qualified class name is derived from the file's ``package``
+    declaration plus the file stem — both charset-vetted, because the
+    names become command arguments and path components downstream.
+
+    Containment and bounds: the tree is the scanned repo's own
+    content. The walk starts from the RESOLVED project directory and
+    never follows directory symlinks (a repo-planted symlink must not
+    steer the enumeration — or the build write grants derived from
+    the same tree downstream — at an arbitrary host path); symlinked
+    files are skipped; per-file reads, the file-scan count, and the
+    target count are all bounded. Sorted by class name, first source
+    wins on a duplicate class name.
+    """
+    try:
+        base = Path(project_dir).resolve()
+    except OSError:
+        return []
+    if not base.is_dir():
+        return []
+    found: dict[str, Path] = {}
+    scanned = 0
+    for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if d not in _JAZZER_SKIP_DIRS and not d.startswith(".")
+        )
+        for name in sorted(filenames):
+            if scanned >= _MAX_JAZZER_SCAN_FILES \
+                    or len(found) >= _MAX_JAZZER_TARGETS:
+                return _sorted_jazzer_targets(found)
+            if os.path.splitext(name)[1].lower() not in _JVM_SOURCE_EXTS:
+                continue
+            scanned += 1
+            entry = Path(dirpath) / name
+            try:
+                if entry.is_symlink() or not entry.is_file():
+                    continue
+                with entry.open("rb") as fh:
+                    text = fh.read(_MAX_JAZZER_SOURCE_BYTES).decode(
+                        "utf-8", errors="replace")
+            except OSError:
+                continue
+            if "fuzzerTestOneInput" not in text and "@FuzzTest" not in text:
+                continue
+            stem = entry.stem
+            if not re.fullmatch(_JAZZER_IDENT, stem):
+                continue
+            package = _jazzer_package_of(text)
+            class_name = f"{package}.{stem}" if package else stem
+            if not _JAZZER_TARGET_CLASS_RE.fullmatch(class_name):
+                continue
+            found.setdefault(class_name, entry)
+    return _sorted_jazzer_targets(found)
+
+
+def _sorted_jazzer_targets(found: dict[str, Path]) -> list[JazzerTarget]:
+    return [JazzerTarget(class_name=name, source=source)
+            for name, source in sorted(found.items())]
+
+
+def _detect_java_project(project_dir: Path) -> TargetInfo:
+    has_jazzer = shutil.which("jazzer") is not None
+    has_java = shutil.which("java") is not None
+    can_fuzz = has_jazzer and has_java
+    if (project_dir / "pom.xml").exists():
+        layout = "Maven"
+    elif any((project_dir / marker).exists()
+             for marker in _JAVA_BUILD_MARKERS[1:]):
+        layout = "Gradle"
+    else:
+        layout = "bare-source"
+    info = TargetInfo(
+        path=project_dir,
+        kind="java-project",
+        description=f"Java/Kotlin project ({layout} layout)",
+        can_fuzz_here=can_fuzz,
+        recommended_fuzzer="jazzer" if can_fuzz else None,
+    )
+    if not has_jazzer:
+        info.blockers.append(
+            "jazzer not installed. Download the standalone release from "
+            "https://github.com/CodeIntelligenceTesting/jazzer/releases "
+            "and put the `jazzer` binary on PATH."
+        )
+    if not has_java:
+        info.blockers.append(
+            "java not installed. Install a JRE/JDK (e.g. OpenJDK) and "
+            "put `java` on PATH."
+        )
+    targets = list_jazzer_targets(project_dir)
+    if targets:
+        names = [t.class_name for t in targets]
+        shown = ", ".join(names[:8]) + (", ..." if len(names) > 8 else "")
+        info.hints.append(
+            f"Jazzer fuzz target(s) detected ({len(names)}): {shown}. "
+            "Select one with --fuzz-target <class>; a single target is "
+            "auto-selected."
+        )
+    else:
+        info.hints.append(
+            "No Jazzer fuzz targets found. Write a class with `public "
+            "static void fuzzerTestOneInput(byte[] data)` (or a "
+            "@FuzzTest JUnit method) in the source tree, then re-run."
+        )
     return info

@@ -1,0 +1,143 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "raptor-srcwrap",
+          "informationUri": "https://github.com/anthropics",
+          "rules": [
+            {
+              "id": "srcwrap:wrap-src-1",
+              "name": "srcwrap:wrap-src-1",
+              "shortDescription": {
+                "text": "srcwrap:wrap-src-1"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "srcwrap:other:wrap-sink-2.sink",
+              "name": "srcwrap:other:wrap-sink-2.sink",
+              "shortDescription": {
+                "text": "srcwrap:other:wrap-sink-2.sink"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "properties": {
+                "cwe": "CWE-89"
+              }
+            },
+            {
+              "id": "srcwrap:bare",
+              "name": "srcwrap:bare",
+              "shortDescription": {
+                "text": "srcwrap:bare"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            }
+          ]
+        }
+      },
+      "results": [
+        {
+          "ruleId": "srcwrap:wrap-src-1",
+          "level": "warning",
+          "message": {
+            "text": "wrapper taints return"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/a.java"
+                },
+                "region": {
+                  "startLine": 3,
+                  "endLine": 9
+                }
+              }
+            }
+          ],
+          "properties": {
+            "provenance": "mechanical-source-summary"
+          }
+        },
+        {
+          "ruleId": "srcwrap:wrap-src-1",
+          "level": "warning",
+          "message": {
+            "text": "srcwrap rule matched"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/b.java"
+                },
+                "region": {
+                  "startLine": 5,
+                  "endLine": 6
+                }
+              }
+            }
+          ],
+          "properties": {
+            "provenance": "mechanical-source-summary"
+          }
+        },
+        {
+          "ruleId": "srcwrap:other:wrap-sink-2.sink",
+          "level": "error",
+          "message": {
+            "text": "sink hit"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/c.java"
+                },
+                "region": {
+                  "startLine": 1,
+                  "endLine": 1
+                }
+              }
+            }
+          ],
+          "properties": {
+            "provenance": "mechanical-source-summary"
+          }
+        },
+        {
+          "ruleId": "srcwrap:bare",
+          "level": "warning",
+          "message": {
+            "text": "srcwrap rule matched"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": ""
+                },
+                "region": {
+                  "startLine": 1,
+                  "endLine": 1
+                }
+              }
+            }
+          ],
+          "properties": {
+            "provenance": "mechanical-source-summary"
+          }
+        }
+      ]
+    }
+  ]
+}

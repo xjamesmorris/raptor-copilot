@@ -154,6 +154,77 @@ class TestAssembleBinaryContext:
         assert "strcpy" in prompt
 
 
+class TestXrefAdjacencyEquivalence:
+    """The indexed caller/callee renderers must reproduce the old
+    full-scan semantics exactly (order, dedup, kind filter, caps)."""
+
+    def _fixture(self):
+        fns = [
+            _make_func("a", 0x1000, size=0x100, decomp="A"),
+            _make_func("b", 0x2000, size=0x100, decomp="B"),
+            _make_func("c", 0x3000, size=0x100),
+            _make_func("d", 0x4000, size=0x100, decomp="D"),
+        ]
+        xrefs = [
+            REXref(from_addr=0x2010, to_addr=0x1000, kind="call"),
+            REXref(from_addr=0x3020, to_addr=0x1000, kind="call"),
+            REXref(from_addr=0x2030, to_addr=0x1000, kind="call"),  # dup caller
+            REXref(from_addr=0x2040, to_addr=0x1000, kind="data"),  # not a call
+            REXref(from_addr=0x1010, to_addr=0x2000, kind="call"),
+            REXref(from_addr=0x1020, to_addr=0x4000, kind="call"),
+            REXref(from_addr=0x1030, to_addr=0x2000, kind="call"),  # dup callee
+            REXref(from_addr=0x1040, to_addr=0x9999, kind="call"),  # no callee fn
+            REXref(from_addr=0x8888, to_addr=0x2000, kind="call"),  # no caller fn
+        ]
+        return _make_db(functions=fns, xrefs=xrefs)
+
+    @staticmethod
+    def _naive_callers(db, func):
+        out, seen = [], set()
+        for xref in db.xrefs:
+            if xref.to_addr != func.address or xref.kind != "call":
+                continue
+            caller = db.function_containing_address(xref.from_addr)
+            if caller and caller.address not in seen:
+                seen.add(caller.address)
+                out.append(caller.name)
+        return out[:15]
+
+    @staticmethod
+    def _naive_callees(db, func):
+        out, seen = [], set()
+        for xref in db.xrefs:
+            if xref.kind != "call":
+                continue
+            caller = db.function_containing_address(xref.from_addr)
+            if caller is None or caller.address != func.address:
+                continue
+            callee = db.function_by_address(xref.to_addr)
+            if callee and callee.address not in seen:
+                seen.add(callee.address)
+                out.append(callee.name)
+        return out[:15]
+
+    def test_matches_full_scan_for_every_function(self):
+        from core.audit.binary_context import _binary_callees, _binary_callers
+        db = self._fixture()
+        for func in db.functions:
+            assert [c["name"] for c in _binary_callers(db, func)] == \
+                self._naive_callers(db, func), func.name
+            assert [c["name"] for c in _binary_callees(db, func)] == \
+                self._naive_callees(db, func), func.name
+
+    def test_memo_invalidated_when_xrefs_appended(self):
+        from core.audit.binary_context import _binary_callers
+        db = self._fixture()
+        target = db.functions[0]
+        before = [c["name"] for c in _binary_callers(db, target)]
+        assert before == ["b", "c"]
+        db.xrefs.append(REXref(from_addr=0x4010, to_addr=0x1000, kind="call"))
+        after = [c["name"] for c in _binary_callers(db, target)]
+        assert after == ["b", "c", "d"]
+
+
 class TestAssembleContextDispatch:
     def test_binary_sentinel_routes_to_binary_assembler(self, tmp_path):
         from core.audit.context import assemble_context
@@ -239,6 +310,50 @@ class TestRealRedbDispatch:
         assert ctx["is_binary"] is True
         assert "strcpy" in ctx["source"]
         assert ctx["representation"] == "decompilation"
+
+
+class TestRedbLoadBounded:
+    """re-database.json is size-gated: over-budget refuses (raise from
+    load_redb, degrade in assemble), never buffers the whole file."""
+
+    def _write_redb(self, tmp_path):
+        import json as _json
+        func = _make_func("vuln", 0x1000, decomp="void vuln(void){}")
+        db = _make_db(functions=[func])
+        p = tmp_path / "re-database.json"
+        p.write_text(_json.dumps(db.to_dict()))
+        return p
+
+    def test_over_budget_refused(self, tmp_path, monkeypatch):
+        import core.audit.binary_context as bc
+        from core.json.utils import JsonBudgetExceededError
+        p = self._write_redb(tmp_path)
+        monkeypatch.setattr(bc, "_MAX_REDB_BYTES", 16)
+        import pytest
+        with pytest.raises(JsonBudgetExceededError):
+            bc.load_redb(p)
+
+    def test_over_budget_assemble_degrades_not_crashes(
+        self, tmp_path, monkeypatch,
+    ):
+        import core.audit.binary_context as bc
+        self._write_redb(tmp_path)
+        monkeypatch.setattr(bc, "_MAX_REDB_BYTES", 16)
+        ctx = bc.assemble_binary_context(
+            target_path=tmp_path,
+            file_path="binary:target",
+            function_name="vuln",
+            out_dir=tmp_path,
+        )
+        assert ctx["representation"] == "unknown"
+        assert "not found" in ctx["source"]
+
+    def test_under_budget_loads_and_caches(self, tmp_path):
+        import core.audit.binary_context as bc
+        p = self._write_redb(tmp_path)
+        db1 = bc.load_redb(p)
+        assert [f.name for f in db1.functions] == ["vuln"]
+        assert bc.load_redb(p) is db1  # (path, mtime) cache intact
 
 
 class TestCollisionSuffix:
@@ -340,3 +455,66 @@ class TestBinaryStaleness:
         (tmp_path / "checklist.json").write_text(json.dumps(cl2))
         gaps2 = compute_gaps(cl2, [], out_dir=run, project_dir=project)
         assert any(g["name"] == "f" for g in gaps2)
+
+
+class TestServerBootSingleFlight:
+    def test_concurrent_first_calls_boot_once(self, tmp_path, monkeypatch):
+        # Check-then-set on the server cache double-booted the ~4s
+        # sandboxed JVM under concurrent review workers (the loser
+        # leaked until atexit) — boots must single-flight per binary.
+        import threading
+
+        import core.audit.binary_context as bc
+
+        boots = []
+        boot_gate = threading.Event()
+
+        class FakeServer:
+            def __init__(self, gpr):
+                boots.append(gpr)
+
+            def start(self):
+                boot_gate.wait(5)
+
+            def open(self):
+                pass
+
+            def stop(self):
+                pass
+
+            def decompile(self, target):
+                return f"decompiled {target}"
+
+        import packages.ghidra.detect as det
+        import packages.ghidra.server as srv_mod
+        monkeypatch.setattr(det, "pyghidra_available", lambda: True)
+        monkeypatch.setattr(srv_mod, "GhidraServer", FakeServer)
+        gpr = tmp_path / "p.gpr"
+        gpr.write_text("project")
+        monkeypatch.setattr(
+            bc, "_project_for_binary", lambda *_a, **_k: gpr,
+        )
+        binary = tmp_path / "app.gpr"
+        binary.write_text("x")
+
+        results = []
+
+        def worker():
+            results.append(
+                bc._lazy_decompile(str(binary), "main", None),
+            )
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        boot_gate.set()
+        for t in threads:
+            t.join(10)
+        try:
+            assert len(boots) == 1, boots
+            assert results == ["decompiled main"] * 4
+        finally:
+            key = str(binary.resolve())
+            with bc._SERVER_CACHE_LOCK:
+                bc._SERVER_CACHE.pop(key, None)
+                bc._SERVER_BOOT_LOCKS.pop(key, None)

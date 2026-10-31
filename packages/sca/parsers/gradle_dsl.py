@@ -21,7 +21,13 @@ Configurations recognised: ``implementation``, ``api``, ``compileOnly``,
 Confidence is ``medium`` because:
   - String interpolation values (``$version``) we leave as-is in the
     version field — they're not real versions but we can't resolve
-    them without executing the script.
+    them without executing the script. NOTE this diverges from the
+    Maven posture, which refuses unresolved ``${...}`` at apply
+    (nothing reference-shaped reaches dep.version/purl there): a
+    ``$var`` version here IS recorded verbatim and can't OSV-match.
+    Documented divergence — Gradle interpolation has no effective-POM
+    equivalent to resolve against; changing to refusal would drop the
+    dep row entirely rather than surface it unpinnable.
   - Conditional ``if`` / ``when`` branches mean we may emit deps that
     aren't actually included (or miss ones that are).
 
@@ -40,6 +46,7 @@ import logging
 import re
 
 from ..models import Confidence, Dependency, PinStyle
+from ._base import build_purl, iter_walk_up
 from . import _safe_read, register
 from typing import TYPE_CHECKING
 
@@ -267,51 +274,27 @@ def parse(path: Path) -> list[Dependency]:
     return out
 
 
-_MAX_CATALOG_WALK_UP_DEPTH = 12
-
-
 def _resolve_catalog(build_script_path: Path):
     """Find + parse the Gradle version catalog for a given
     build.gradle(.kts) file.
 
     Walks UP from the script's directory looking for
-    ``gradle/libs.versions.toml`` (the documented default). Stops
-    at the .git repo boundary so a nested project doesn't pick up
-    a parent repo's catalog. Returns ``None`` when no catalog is
-    found in the chain.
-
-    Walk depth is capped at ``_MAX_CATALOG_WALK_UP_DEPTH`` as a
-    defence-in-depth bound — same reasoning as
-    ``parsers/directory_packages_props._find_msbuild_chain``: a
-    target scanned without a ``.git`` directory (CI artefact,
-    extracted tarball) would otherwise walk to ``/``.
+    ``gradle/libs.versions.toml`` (the documented default). Bounds
+    come from the shared :func:`iter_walk_up` walker — the active
+    scan root (a catalog above the scanned target must not steer
+    version resolution), the nearest ``.git`` boundary (a nested
+    project must not pick up a parent repo's catalog), and the
+    defence-in-depth depth cap for boundary-less scans. Returns
+    ``None`` when no catalog is found in the chain.
     """
     from .gradle_version_catalog import (
         find_default_catalog, parse_libs_versions_toml,
     )
 
-    try:
-        current = build_script_path.parent.resolve()
-    except OSError:
-        return None
-    visited: set = set()
-    depth = 0
-    while True:
-        if current in visited:
-            break
-        visited.add(current)
+    for current in iter_walk_up(build_script_path.parent):
         candidate = find_default_catalog(current)
         if candidate is not None:
             return parse_libs_versions_toml(candidate)
-        if (current / ".git").exists():
-            break
-        depth += 1
-        if depth >= _MAX_CATALOG_WALK_UP_DEPTH:
-            break
-        parent = current.parent
-        if parent == current:
-            break
-        current = parent
     return None
 
 
@@ -347,9 +330,15 @@ def _build_dep(
     only the inline DSL forms keep the ``medium`` confidence
     from the regex-parse heuristic.
     """
-    coord = f"{group}/{name}"
+    # Maven combined name is ``groupId:artifactId`` — the shape every
+    # consumer joins on: OSV names Maven packages that way, the Maven
+    # registry client requires it (``list_versions("group:artifact")``),
+    # pom.py / gradle_lockfile.py emit it, and the manifest↔lockfile
+    # join keys on ``(ecosystem, name)``. A ``group/artifact`` name
+    # matches none of them and silently loses all advisory coverage.
+    coord = f"{group}:{name}"
     pin_style = _classify_version(version)
-    purl = _build_purl(group, name, version)
+    purl = build_purl(_PURL_TYPE, name, version, namespace=group)
     is_catalog = source_origin.startswith("gradle_catalog")
     confidence_level = "high" if is_catalog else "medium"
     confidence_reason = (
@@ -377,7 +366,7 @@ def _build_dep(
         direct=True,
         purl=purl,
         parser_confidence=Confidence(
-            confidence_level, reason=confidence_reason,
+            confidence_level, reason=confidence_reason,  # type: ignore[arg-type]
         ),
         source_kind="manifest",
         source_extra=source_extra,
@@ -401,12 +390,6 @@ def _classify_version(version: str | None) -> PinStyle:
         return PinStyle.RANGE
     return PinStyle.EXACT
 
-
-def _build_purl(group: str, name: str, version: str | None) -> str:
-    base = f"pkg:{_PURL_TYPE}/{group}/{name}"
-    if version:
-        return f"{base}@{version}"
-    return base
 
 
 __all__ = ["parse"]

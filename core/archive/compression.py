@@ -9,6 +9,7 @@ import bz2
 import gzip
 import lzma
 from pathlib import Path
+from typing import Any
 
 from .errors import ArchiveError, DecompressionLimitExceeded, UnsupportedArchive
 
@@ -31,7 +32,7 @@ def _zstd_open(path, mode="rb"):
         return zstandard.open(path, mode)
 
 
-_OPENERS = {
+_OPENERS: dict[str, Any] = {
     "gz": gzip.open,
     "bz2": bz2.open,
     "xz": lzma.open,
@@ -74,7 +75,8 @@ def iter_decompressed(path, fmt: str,
                 if total > max_bytes:
                     raise DecompressionLimitExceeded(
                         f"{fmt} stream exceeds {max_bytes} bytes "
-                        f"decompressed — refusing as bomb")
+                        f"decompressed — refusing as bomb",
+                        cap="total_bytes")
                 yield chunk
     except (DecompressionLimitExceeded, UnsupportedArchive):
         raise

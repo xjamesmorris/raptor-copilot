@@ -37,9 +37,9 @@ if not (os.environ.get("CLAUDECODE")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import core.startup.process_init  # noqa: E402,F401
 from core.artifacts.context_map_budget import (  # noqa: E402
-    enforce_context_map_budget,
+    save_context_map,
 )
-from core.json import load_json, save_json  # noqa: E402
+from core.json import load_json  # noqa: E402
 from core.orchestration.context_map_sinks import (  # noqa: E402
     DEFAULT_MAX_DEPTH,
     enrich_with_sink_discovery,
@@ -88,10 +88,9 @@ def main() -> int:
         )
         return 1
 
-    checklist = load_json(understand_dir / "checklist.json") or {}
-    target_path = (
-        checklist.get("target_path") if isinstance(checklist, dict) else None
-    )
+    from core.inventory import read_checklist
+    checklist = read_checklist(understand_dir)
+    target_path = checklist.get("target_path")
     if not target_path:
         print(
             "raptor-enrich-context-map-sinks: checklist missing "
@@ -128,8 +127,7 @@ def main() -> int:
         run_dir=understand_dir, extra_sinks=extra_sinks,
     )
     if enriched:
-        enforce_context_map_budget(context_map)
-        save_json(context_map_path, context_map)
+        save_context_map(context_map_path, context_map)
         print(
             f"raptor-enrich-context-map-sinks: enriched {enriched} "
             f"entries in {context_map_path}"

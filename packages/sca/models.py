@@ -11,6 +11,7 @@ findings.json layers handle that wrapping.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Literal, TYPE_CHECKING
@@ -107,7 +108,15 @@ class Dependency:
 
     ecosystem: str               # "Maven", "PyPI", "npm", "Cargo", "Go",
                                  # "RubyGems", "NuGet", "Packagist"
-    name: str                    # canonical (purl-ready), case-normalised
+    name: str                    # canonical (purl-ready), case-normalised.
+                                 # ALWAYS the real (installed) package: an
+                                 # npm alias (``<alias>@npm:<real>@<range>``)
+                                 # records the alias TARGET here so advisory
+                                 # lookups, purls, and cross-run identity
+                                 # key on what actually ships — recording
+                                 # the alias spelling hid the installed
+                                 # package's advisories. The manifest's
+                                 # literal spelling lives in ``alias_name``.
     version: str | None       # None = unpinned manifest entry
     declared_in: Path            # which manifest/lockfile observed it
     scope: str                   # "main" | "dev" | "test" | "peer" |
@@ -163,6 +172,21 @@ class Dependency:
                                             # use this as the cluster
                                             # key.
 
+    alias_name: str | None = None        # manifest-declared alias
+                                            # spelling when the dep was
+                                            # installed via an npm alias
+                                            # (``"my-lodash": "npm:lodash@
+                                            # ^4.17.21"`` → name="lodash",
+                                            # alias_name="my-lodash").
+                                            # Display and fix-
+                                            # materialisation consult this
+                                            # so reports show what the
+                                            # manifest literally declares
+                                            # and rewrites land under the
+                                            # alias key; everything else
+                                            # (OSV, purl, dedup, diff)
+                                            # keys on ``name``. ``None``
+                                            # for non-aliased deps.
     inline_comment: str | None = None    # trailing ``# note`` text
                                             # from the raw line, preserved
                                             # for round-trip rewriting
@@ -218,7 +242,10 @@ class Advisory:
     osv_id: str                  # "GHSA-jfh8-c2jp-5v3q" or "PYSEC-2024-..."
     aliases: list[str]           # ["CVE-2021-44228", ...]
     summary: str                 # one-line summary
-    details: str                 # full markdown details (length-bounded)
+    details: str                 # full markdown details — registry-
+                                 # supplied, NOT length-bounded at
+                                 # parse (packages/osv/parser applies
+                                 # no cap); renderers sanitise/trim
     affected: list[AffectedRange]
     severity: CVSSScore | None
     fixed_versions: list[str]    # extracted from affected.ranges.events.fixed
@@ -251,6 +278,74 @@ class Advisory:
     # layer consults this before its blanket medium degrade. Values:
     # "none" / "low" / "medium" / "high" / "critical".
     severity_fallback: str | None = None
+
+
+# Distro-namespaced CVE-primary ids: Debian / Ubuntu / Alpine secdb
+# OSV records ship ``<DISTRO>-CVE-<year>-<number>`` as the PRIMARY id
+# with an EMPTY alias list — the CVE is embedded in the id, never
+# aliased. Anchored both ends: exactly one uppercase prefix token,
+# then a spec-shaped CVE tail (4-digit year, ≥4-digit number), and
+# nothing after it — ``DEBIAN-CVE-2026-1234-1`` or a multi-segment
+# prefix does NOT match. Prefix-stripping grants no authority the
+# alias list doesn't already grant: any advisory can list arbitrary
+# CVE aliases, so a hostile ``EVIL-CVE-…`` primary can only point at
+# a real CVE's public enrichment the same way a planted alias could.
+# ASCII digits only (``\d`` would admit Unicode digits) and ``\Z``
+# (``$`` tolerates a trailing newline) — the id must be exactly the
+# canonical shape, byte for byte.
+_DISTRO_CVE_PRIMARY_RE = re.compile(r"^[A-Z]+-(CVE-[0-9]{4}-[0-9]{4,})\Z")
+
+
+def canonical_cve_id(candidate: object) -> str | None:
+    """Normalise one advisory id to its canonical CVE id, or ``None``
+    when the id carries no CVE.
+
+    Uppercases first (the KEV / EPSS / SSVC enrichment maps are keyed
+    uppercase), passes ``CVE-*`` ids through, and resolves the
+    distro-namespaced ``<DISTRO>-CVE-*`` primary-id family to its
+    embedded CVE. The distro id itself stays untouched on the advisory
+    (``osv_id`` is the provenance record); only the JOIN key is
+    canonicalised.
+    """
+    if not isinstance(candidate, str):
+        return None
+    # ``.strip()`` before the fold: a whitespace-padded feed spelling
+    # was otherwise admitted verbatim (trailing ws — failing every
+    # uppercase-keyed join) or dropped entirely (leading ws).
+    candidate = candidate.strip().upper()
+    if candidate.startswith("CVE-"):
+        return candidate
+    m = _DISTRO_CVE_PRIMARY_RE.match(candidate)
+    if m:
+        return m.group(1)
+    return None
+
+
+def cve_ids(advisory: Advisory) -> list[str]:
+    """All CVE-shaped ids for ``advisory`` — primary ``osv_id`` first,
+    then aliases, first-seen order, deduplicated.
+
+    OSV serves records whose PRIMARY id carries the CVE with no
+    self-alias — either the CVE itself (kernel-CNA records) or a
+    distro-namespaced ``<DISTRO>-CVE-*`` id (Debian / Ubuntu / Alpine
+    secdb — exactly the rows image-source scans inject). A consumer
+    that keys KEV / EPSS / SSVC enrichment off the alias list alone
+    silently loses those signals for CVE-primary advisories, so every
+    CVE-list consumer routes through here, and every id resolves
+    through :func:`canonical_cve_id` so the distro family joins too.
+
+    Ids are normalised to UPPERCASE: the EPSS / SSVC enrichment maps
+    are keyed uppercase, so a lowercase feed spelling appended raw
+    would be admitted here yet silently lose its join downstream
+    (epss/ssvc null while the case-folding KEV join says listed).
+    Dedup is case-insensitive for the same reason.
+    """
+    out: list[str] = []
+    for cand in (advisory.osv_id, *(advisory.aliases or [])):
+        canonical = canonical_cve_id(cand)
+        if canonical is not None and canonical not in out:
+            out.append(canonical)
+    return out
 
 
 # ---------------------------------------------------------------------------

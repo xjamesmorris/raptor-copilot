@@ -81,6 +81,21 @@ def test_classify_is_read_only_then_apply_mutates(tmp_path):
     assert s.function_verdict("a.c", 30, 60) == "found_then_lost"
 
 
+def test_mixed_lost_and_held_findings_get_per_finding_flags(tmp_path):
+    # One victim holds a survivor-held finding AND a sole-source one:
+    # the batched retained/lost import must flag each independently
+    # (F1 stays open, F2 flips found_then_lost).
+    s = _store(tmp_path)
+    shared = {"id": "F1", "file": "a.c", "line": 10}    # in f1
+    unique = {"id": "F2", "file": "a.c", "line": 42}    # in f2
+    victim = _run(tmp_path, "old", ["a.c"], findings=[shared, unique])
+    survivor = _run(tmp_path, "new", ["a.c"], findings=[shared])
+    c = clean_run(s, victim, [survivor], _CHECKLIST)
+    assert len(c.findings_lost) == 1
+    assert s.function_verdict("a.c", 0, 20) == "open"
+    assert s.function_verdict("a.c", 30, 60) == "found_then_lost"
+
+
 def test_finding_also_in_survivor_stays_open(tmp_path):
     s = _store(tmp_path)
     finding = [{"id": "F1", "file": "a.c", "line": 42}]
@@ -134,6 +149,31 @@ def test_dedup_single_run_kept(tmp_path):
     assert dedup_runs([a]) == ([], [])
 
 
+def test_dedup_reads_each_run_from_disk_once(tmp_path, monkeypatch):
+    # The per-victim classification works over precomputed summaries;
+    # the classify_removal-per-victim shape re-parsed every survivor's
+    # records and findings for every victim (quadratic disk loads on
+    # /project clean --keep over a mature project).
+    from core.coverage import clean as clean_mod
+
+    runs = [
+        _run(tmp_path, f"run-{i:02d}", ["a.c"],
+             findings=[{"id": f"F{i}", "file": "a.c", "line": i}])
+        for i in range(1, 6)
+    ]
+    loads: list[str] = []
+    orig = clean_mod._summarise_run
+
+    def _spy(run_dir):
+        loads.append(run_dir.name)
+        return orig(run_dir)
+    monkeypatch.setattr(clean_mod, "_summarise_run", _spy)
+    dedup_runs(runs)
+    assert sorted(loads) == sorted(r.name for r in runs), (
+        "each run must be summarised from disk exactly once"
+    )
+
+
 def test_distinct_findings_same_line_not_collapsed(tmp_path):
     # Two different issues at a.c:42; the survivor holds only one. Without an
     # issue discriminator both key as (a.c, L42), so xss would look "covered"
@@ -163,3 +203,79 @@ def test_idless_finding_flip_targets_same_entry(tmp_path):
     clean_run(s, victim, [], _CHECKLIST)                 # apply: flip to retained=False
     assert s.function_verdict("a.c", 0, 20) == "found_then_lost"
     assert s.function_verdict("a.c", 30, 60) == "found_then_lost"
+
+
+# ── Hostile run-dir intake containment (the clean consumers) ───────
+#
+# classify_removal / dedup_runs / apply_removal read the same run-dir
+# JSON (coverage records, findings) as the importer's contained
+# consumers; one hostile or legacy run dir must not wedge every
+# subsequent `/project clean` (crash) or corrupt the survivor set
+# (silent mis-classification).
+
+def test_legacy_list_shaped_record_contained(tmp_path):
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "coverage-record.json").write_text('[{"tool": "x"}]')
+    c = classify_removal(victim, [])
+    assert c.coverage_files == []
+
+
+def test_unhashable_finding_fields_contained(tmp_path):
+    victim = _run(tmp_path, "victim", ["a.c"], findings=[
+        {"file": "a.c", "line": [1], "rule_id": {}},
+        {"file": {"k": 1}, "id": ["x"]},
+        {"file": "b.c", "line": 5, "rule_id": "R1"},
+    ])
+    survivor = _run(tmp_path, "survivor", ["a.c"], findings=[
+        {"file": "b.c", "line": 5, "rule_id": "R1"},
+    ])
+    c = classify_removal(victim, [survivor])
+    # The well-formed finding still joins the classification: it is
+    # held by the survivor, so only the hostile rows read as lost.
+    assert all(k[0] != "b.c" for k in c.findings_lost)
+    assert len(c.findings_lost) == 2
+
+
+def test_unhashable_files_examined_members_contained(tmp_path):
+    victim = _run(tmp_path, "victim", [{"a": 1}, ["b"], "ok.c", 7])
+    c = classify_removal(victim, [])
+    assert c.coverage_files == ["ok.c"]
+
+
+def test_string_files_examined_does_not_leak_characters(tmp_path):
+    # "abcd" iterated as characters unioned {'a','b','c','d'} into the
+    # survivor FILE set — a victim run could be silently mis-classed
+    # as duplicate against phantom one-letter files.
+    victim = _run(tmp_path, "victim", "abcd")
+    c = classify_removal(victim, [])
+    assert c.coverage_files == []
+    survivor = _run(tmp_path, "survivor", "abcd")
+    real = _run(tmp_path, "real", ["a"])
+    c2 = classify_removal(real, [survivor])
+    assert not c2.duplicate
+
+
+def test_apply_removal_hostile_checklist_contained(tmp_path):
+    store = _store(tmp_path)
+    victim = _run(tmp_path, "victim", ["a.c"], findings=[
+        {"file": "a.c", "line": 3, "rule_id": "R1"},
+    ])
+    hostile_checklist = {"files": [
+        "not-an-object",
+        {"path": 7},
+        {"path": "a.c", "lines": 100, "items": []},
+    ]}
+    c = classify_removal(victim, [])
+    apply_removal(store, victim, hostile_checklist, c)  # must not raise
+
+
+def test_dedup_runs_survives_hostile_neighbour(tmp_path):
+    hostile = tmp_path / "hostile"
+    hostile.mkdir()
+    (hostile / "coverage-record.json").write_text('["x"]')
+    (hostile / "findings.json").write_text('[{"line": [1], "id": {}}]')
+    a = _run(tmp_path, "run-a", ["a.c"])
+    b = _run(tmp_path, "run-b", ["a.c"])
+    droppable, _reasons = dedup_runs([hostile, a, b])
+    assert a in droppable or b in droppable

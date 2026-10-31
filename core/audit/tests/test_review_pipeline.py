@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 # ── Feature 1: Wrapper auto-clean ─────────────────────────────────
 
 class TestWrapperAutoClean:
@@ -185,6 +187,1452 @@ void *alloc_obj(size_t n) {
             line_start=1,
         )
         assert not result.skip_llm
+
+    def _py_wrapper(self, body: str):
+        from core.audit.prefilter import run_prefilter
+        return run_prefilter(
+            target_path=Path("/tmp"),
+            file_path="wrap.py",
+            function_name="f",
+            source=f"def f(arg):\n    return {body}\n",
+            line_start=1,
+        )
+
+    def test_shell_true_wrapper_keeps_its_hit_and_review(self):
+        # A one-line delegate to subprocess.run(cmd, shell=True) fires
+        # an error-grade hit on its own line; the wrapper skip must
+        # not resolve the function mechanically clean over it.
+        result = self._py_wrapper("subprocess.run(arg, shell=True)")
+        assert any(
+            h.rule_id == "subprocess-shell-true" for h in result.hits
+        )
+        assert not result.skip_llm
+
+    def test_pickle_loads_wrapper_not_skipped(self):
+        result = self._py_wrapper("pickle.loads(arg)")
+        assert any(h.rule_id == "pickle-untrusted" for h in result.hits)
+        assert not result.skip_llm
+
+    def test_yaml_load_wrapper_not_skipped(self):
+        result = self._py_wrapper("yaml.load(arg)")
+        assert any(h.rule_id == "yaml-unsafe-load" for h in result.hits)
+        assert not result.skip_llm
+
+    def test_dotted_dangerous_delegate_not_skipped(self):
+        # No hit fires for shell-less subprocess.run, so this pins the
+        # DOTTED callee match: the bare-word capture compared "run"
+        # against the dotted _DANGEROUS_PY_APIS entries and never
+        # excluded it.
+        result = self._py_wrapper("subprocess.run(arg)")
+        assert not result.hits
+        assert not result.skip_llm
+
+    def test_bare_imported_dangerous_tail_not_skipped(self):
+        # `from pickle import loads` — the bare tail of a dotted
+        # dangerous entry must exclude too.
+        result = self._py_wrapper("loads(arg)")
+        assert not result.skip_llm
+
+    def test_getattr_literal_dangerous_delegate_not_skipped(self):
+        # Reflection indirection: the captured callee is `getattr`,
+        # which the dangerous-callee exclusion never matched — the
+        # literal attribute name must resolve to subprocess.run and
+        # refuse the skip.
+        result = self._py_wrapper(
+            'getattr(subprocess, "run")(arg, shell=True)'
+        )
+        assert not result.skip_llm
+
+    def test_getattr_dynamic_name_not_skipped(self):
+        # A dynamic attribute name is unresolvable mechanically: the
+        # delegate's real target is unknown, so it must never be
+        # journalled mechanically clean.
+        result = self._py_wrapper("getattr(subprocess, arg)(arg)")
+        assert not result.skip_llm
+
+    def test_getattr_default_arg_form_not_skipped(self):
+        # The three-argument getattr stays unresolved (conservative):
+        # no skip.
+        result = self._py_wrapper('getattr(subprocess, "run", None)(arg)')
+        assert not result.skip_llm
+
+    def test_getattr_literal_benign_target_still_skips(self):
+        # Both directions: a literal-name getattr RESOLVES and
+        # re-enters the exclusion checks — a benign resolved target
+        # keeps the trivial-wrapper skip.
+        result = self._py_wrapper('getattr(math, "sqrt")(arg)')
+        assert result.skip_llm
+        assert "math.sqrt" in result.skip_reason
+
+    def test_import_module_delegate_not_skipped(self):
+        result = self._py_wrapper("importlib.import_module(arg)")
+        assert not result.skip_llm
+
+    def test_dunder_import_delegate_not_skipped(self):
+        result = self._py_wrapper('__import__("os")')
+        assert not result.skip_llm
+
+    def test_attrgetter_literal_dangerous_not_skipped(self):
+        # The wider indirection family: the captured callee is the
+        # helper, so the literal name must resolve into the
+        # exclusion checks.
+        result = self._py_wrapper('operator.attrgetter("run")(sp)(arg)')
+        assert not result.skip_llm
+
+    def test_methodcaller_literal_dangerous_not_skipped(self):
+        result = self._py_wrapper('operator.methodcaller("run", arg)(sp)')
+        assert not result.skip_llm
+
+    def test_partial_reference_dangerous_not_skipped(self):
+        # partial's wrapped callable is a REFERENCE, not a call — the
+        # first-argument identifier is the resolvable name.
+        result = self._py_wrapper("functools.partial(sp.run)(arg)")
+        assert not result.skip_llm
+
+    def test_partial_of_getattr_not_skipped(self):
+        # Nested indirection resolves to another indirection helper —
+        # refuse, never chase.
+        result = self._py_wrapper('partial(getattr, sp, "run")(arg)')
+        assert not result.skip_llm
+
+    def test_vars_subscript_dangerous_not_skipped(self):
+        result = self._py_wrapper('vars(sp)["run"](arg)')
+        assert not result.skip_llm
+
+    def test_globals_subscript_dangerous_not_skipped(self):
+        result = self._py_wrapper('globals()["system"](arg)')
+        assert not result.skip_llm
+
+    def test_vars_dynamic_name_not_skipped(self):
+        result = self._py_wrapper("vars(sp)[arg](arg)")
+        assert not result.skip_llm
+
+    def test_unknown_factory_result_call_not_skipped(self):
+        # A factory outside the family whose RESULT is called: the
+        # executed target is unknown — never mechanically clean.
+        result = self._py_wrapper("make_fn()(arg)")
+        assert not result.skip_llm
+
+    def test_attrgetter_literal_benign_still_skips(self):
+        # Both directions: family shapes with a resolvable benign
+        # literal keep the skip.
+        result = self._py_wrapper('operator.attrgetter("total")(box)')
+        assert result.skip_llm
+
+    def test_two_line_method_value_not_skipped(self):
+        # The local name captures as the callee while the real target
+        # sits surface-spelled on the assignment line — resolve the
+        # one-hop alias before the exclusion checks.
+        from core.audit.prefilter import _is_trivial_wrapper
+        is_wrapper, _ = _is_trivial_wrapper(
+            "def f(a):\n    f2 = subprocess.run\n    return f2(a)\n",
+            "python", None,
+        )
+        assert not is_wrapper
+
+    def test_two_line_method_value_benign_still_skips(self):
+        from core.audit.prefilter import _is_trivial_wrapper
+        is_wrapper, _ = _is_trivial_wrapper(
+            "def f(a):\n    f2 = helper\n    return f2(a)\n",
+            "python", None,
+        )
+        assert is_wrapper
+
+    def test_c_dlsym_literal_dangerous_not_skipped(self):
+        from core.audit.prefilter import _is_trivial_wrapper
+        is_wrapper, _ = _is_trivial_wrapper(
+            'void *f(void *h) {\n    return dlsym(h, "system");\n}\n',
+            "c", None,
+        )
+        assert not is_wrapper
+
+    def test_other_language_callee_sets_excluded(self):
+        # The wrapper exclusion must not be narrower than
+        # _is_trivially_clean's per-language dangerous-callee sets
+        # (body-only shape: the signature line usually saves these by
+        # accident, which is no contract).
+        from core.audit.prefilter import _is_trivial_wrapper
+        is_wrapper, _ = _is_trivial_wrapper(
+            "\treturn exec.Command(c)\n", "go", None,
+        )
+        assert not is_wrapper
+
+    def test_dunder_call_dangerous_not_skipped(self):
+        # Object-protocol executor: `sink.__call__(...)` executes the
+        # base object with no helper at all — the captured callee's
+        # tail is `__call__`, which matched neither the dotted
+        # dangerous entries nor their bare tails, so the delegate
+        # journalled mechanically clean.
+        for body in (
+            "os.system.__call__(arg)",
+            "subprocess.run.__call__(arg)",
+            "pickle.loads.__call__(arg)",
+        ):
+            result = self._py_wrapper(body)
+            assert not result.skip_llm, body
+
+    def test_dunder_call_chain_not_skipped(self):
+        # Stacked executor segments still resolve to the base object.
+        result = self._py_wrapper("os.system.__call__.__call__(arg)")
+        assert not result.skip_llm
+
+    def test_wrapped_dunder_chain_not_skipped(self):
+        # `.__wrapped__` / `.__func__` unwrap chains execute the
+        # underlying callable too.
+        for body in (
+            "subprocess.run.__wrapped__(arg)",
+            "sp.run.__func__(sp, arg)",
+        ):
+            result = self._py_wrapper(body)
+            assert not result.skip_llm, body
+
+    def test_dunder_call_alias_not_skipped(self):
+        # The executor chain on a LOCAL alias: strip before the alias
+        # walk so `f2.__call__` resolves as `f2` -> os.system.
+        from core.audit.prefilter import _is_trivial_wrapper
+        is_wrapper, _ = _is_trivial_wrapper(
+            "def f(a):\n    f2 = os.system\n    return f2.__call__(a)\n",
+            "python", None,
+        )
+        assert not is_wrapper
+
+    def test_object_protocol_dunder_refused(self):
+        # Any other dunder segment routes through the object protocol
+        # — the executed target is not the spelled name, so the
+        # delegate is unresolvable and never mechanically clean.
+        for body in (
+            "obj.__class__(arg)",
+            "obj.__self__.helper(arg)",
+        ):
+            result = self._py_wrapper(body)
+            assert not result.skip_llm, body
+
+    def test_mid_chain_dangerous_attribute_not_skipped(self):
+        # The dangerous target buried mid-chain behind a non-dunder
+        # attribute: every segment joins the tail exclusion.
+        result = self._py_wrapper("subprocess.run.retry(arg)")
+        assert not result.skip_llm
+
+    def test_dunder_call_benign_still_skips(self):
+        # Both directions: the executor chain resolves and re-enters
+        # the exclusion checks — a benign base object keeps the skip.
+        result = self._py_wrapper("helper.compute.__call__(arg)")
+        assert result.skip_llm
+        assert "helper.compute" in result.skip_reason
+
+    def test_sink_callable_argument_not_skipped(self):
+        # The sink escapes as a VALUE: passed as a callable-reference
+        # argument, it never appears in call position, so the
+        # captured-callee exclusion cannot see it. The executor is
+        # deliberately not enumerated — any call taking a sink-name
+        # reference refuses the skip.
+        for body in (
+            "pool.submit(os.system, arg)",
+            "asyncio.to_thread(os.system, arg)",
+            "map(os.system, arg)",
+            "filter(os.system, arg)",
+            "itertools.starmap(os.system, arg)",
+            "apply(os.system, arg)",
+        ):
+            result = self._py_wrapper(body)
+            assert not result.skip_llm, body
+
+    def test_sink_bare_reference_argument_not_skipped(self):
+        # `from os import system` — the escaping reference is the
+        # bare name, matched against the bare tails exactly like the
+        # bare-callee case.
+        result = self._py_wrapper("pool.submit(system, arg)")
+        assert not result.skip_llm
+
+    def test_sink_reference_executor_dunder_not_skipped(self):
+        # The reference can carry the executor-dunder chain too.
+        result = self._py_wrapper("pool.submit(os.system.__call__, arg)")
+        assert not result.skip_llm
+
+    def test_sink_reference_alias_not_skipped(self):
+        # The argument spells a LOCAL alias; the sink sits on the
+        # assignment line outside any argument list — one-hop alias
+        # resolution mirrors the callee walk.
+        from core.audit.prefilter import _is_trivial_wrapper
+        is_wrapper, _ = _is_trivial_wrapper(
+            "def f(a):\n    f2 = os.system\n    return pool.submit(f2, a)\n",
+            "python", None,
+        )
+        assert not is_wrapper
+
+    def test_sink_reference_keyword_argument_not_skipped(self):
+        result = self._py_wrapper("pool.submit(fn=os.system)")
+        assert not result.skip_llm
+
+    def test_c_sink_function_pointer_argument_not_skipped(self):
+        from core.audit.prefilter import _is_trivial_wrapper
+        is_wrapper, _ = _is_trivial_wrapper(
+            "int f(char *cmd) {\n    return dispatch(system, cmd);\n}\n",
+            "c", None,
+        )
+        assert not is_wrapper
+
+    def test_benign_reference_argument_still_skips(self):
+        # Both directions: benign callable references keep the skip.
+        result = self._py_wrapper("dispatch(helper.compute, arg)")
+        assert result.skip_llm
+
+    def test_reference_scan_ignores_strings_and_comments(self):
+        # Prose naming a sink in a string or trailing comment must
+        # not flip a benign wrapper — strings/comments are cut from
+        # the reference view only.
+        for body in (
+            "helper.process(arg, mode='run the system fast')",
+            "helper.process(arg)  # runs the query via os.system",
+        ):
+            result = self._py_wrapper(body)
+            assert result.skip_llm, body
+
+    def test_reference_scan_is_argument_position_only(self):
+        # A tail-colliding name OUTSIDE any argument list (a plain
+        # data read) keeps the skip: the position gate is what holds
+        # the legitimate-corpus flip rate at ~0.
+        result = self._py_wrapper("helper.process(arg) == request.param")
+        assert result.skip_llm
+
+    # ── Whole-value escape analysis (Python AST leg) ──────────────
+    # A sink value escaping through ANY binding/argument/return shape
+    # must refuse the skip; the benign twins pin the other direction.
+
+    def _py_fn(self, source: str):
+        from core.audit.prefilter import _is_trivial_wrapper
+        is_wrapper, _ = _is_trivial_wrapper(source, "python", None)
+        return is_wrapper
+
+    def test_two_hop_alias_not_skipped(self):
+        assert not self._py_fn(
+            "def f(cmd):\n    f1 = os.system\n    f2 = f1\n"
+            "    return f2(cmd)\n"
+        )
+
+    def test_tuple_unpack_alias_not_skipped(self):
+        assert not self._py_fn(
+            "def f(cmd):\n    g, h = os.system, len\n    return g(cmd)\n"
+        )
+
+    def test_chained_assign_alias_not_skipped(self):
+        assert not self._py_fn(
+            "def f(cmd):\n    g = h = os.system\n    return g(cmd)\n"
+        )
+
+    def test_annotated_assign_alias_not_skipped(self):
+        assert not self._py_fn(
+            "def f(cmd):\n    g: object = os.system\n    return g(cmd)\n"
+        )
+
+    def test_conditional_rhs_alias_not_skipped(self):
+        assert not self._py_fn(
+            "def f(cmd, x):\n    g = os.system if x else print\n"
+            "    return g(cmd)\n"
+        )
+
+    def test_spaced_dots_alias_not_skipped(self):
+        assert not self._py_fn(
+            "def f(cmd):\n    g = os . system\n    return g(cmd)\n"
+        )
+
+    def test_default_parameter_sink_not_skipped(self):
+        assert not self._py_fn(
+            "def f(cmd, g=os.system):\n    return g(cmd)\n"
+        )
+
+    def test_kwonly_default_sink_not_skipped(self):
+        assert not self._py_fn(
+            "def f(cmd, *, g=os.system):\n    return g(cmd)\n"
+        )
+
+    def test_two_hop_value_escape_not_skipped(self):
+        assert not self._py_fn(
+            "def f(cmd):\n    f1 = os.system\n    f2 = f1\n"
+            "    return pool.submit(f2, cmd)\n"
+        )
+
+    def test_tuple_unpack_value_escape_not_skipped(self):
+        assert not self._py_fn(
+            "def f(cmd):\n    g, h = os.system, len\n"
+            "    return pool.submit(g, cmd)\n"
+        )
+
+    def test_return_position_sink_escape_not_skipped(self):
+        # The sink escapes as the RETURN VALUE while the single call
+        # is benign — no binding, no argument position.
+        assert not self._py_fn(
+            "def f(x):\n    log(x)\n    return os.system\n"
+        )
+
+    def test_yield_position_sink_escape_not_skipped(self):
+        assert not self._py_fn(
+            "def f(x):\n    log(x)\n    yield os.system\n"
+        )
+
+    def test_comprehension_value_escape_not_skipped(self):
+        # A sink spelled in a comprehension's element/key/value
+        # position escapes by value exactly like a display element.
+        for body in (
+            "def f(c, y):\n    log(c)\n"
+            "    return (subprocess.run for _ in y)\n",
+            "def f(c, y):\n    log(c)\n"
+            "    return {k: os.system for k in y}\n",
+            "def f(c, y):\n    log(c)\n"
+            "    return [os.system for _ in y]\n",
+        ):
+            assert not self._py_fn(body), body
+
+    def test_comprehension_loop_var_tail_collision_still_skips(self):
+        # The other direction: a comprehension-scoped loop variable
+        # that merely tail-collides with a sink name is the
+        # construct's own binder, not a body value — the wrapper
+        # stays trivially skippable.
+        assert self._py_fn(
+            "def f(tool_call_log):\n"
+            "    return any(call in TOOLS for call in tool_call_log)\n"
+        )
+
+    def test_subscripted_display_value_escape_not_skipped(self):
+        # Subscripting a display still yields a body-spelled element.
+        for body in (
+            "def f(c):\n    log(c)\n    return {1: os.system}[1]\n",
+            "def f(c):\n    log(c)\n    return [os.system][0]\n",
+        ):
+            assert not self._py_fn(body), body
+
+    def test_opaque_value_view_carries_spelled_refs(self):
+        # The conservative arm itself must carry body-spelled
+        # references out of opaque expressions — pinned at the
+        # value-view level so the refusal never depends on an
+        # unrelated downstream text heuristic.
+        import ast as ast_mod
+
+        from core.audit.prefilter import _py_value_refs
+        for expr in (
+            "[os.system for _ in y]",
+            "(subprocess.run for _ in y)",
+            "{k: os.system for k in y}",
+            "[os.system][0]",
+            "{1: os.system}[1]",
+        ):
+            refs, resolved = _py_value_refs(
+                ast_mod.parse(expr, mode="eval").body,
+            )
+            assert not resolved, expr
+            assert refs & {"os.system", "subprocess.run"}, expr
+
+    def test_bare_decorator_reference_judged(self):
+        # A bare decorator executes the referenced callable at
+        # definition time; a benign decorator keeps the skip.
+        assert not self._py_fn(
+            "@os.system\ndef f(c):\n    return log(c)\n"
+        )
+        assert self._py_fn(
+            "@functools.lru_cache\ndef f(c):\n    return helper(c)\n"
+        )
+
+    def test_walrus_alias_not_skipped(self):
+        assert not self._py_fn(
+            "def f(cmd):\n    return (g := os.system)(cmd)\n"
+        )
+
+    def test_container_display_sink_not_skipped(self):
+        for body in (
+            "def f(cmd):\n    fns = [os.system]\n    return apply(fns, cmd)\n",
+            "def f(cmd):\n    d = {'k': os.system}\n    return apply(d, cmd)\n",
+        ):
+            assert not self._py_fn(body), body
+
+    def test_lambda_carried_sink_not_skipped(self):
+        assert not self._py_fn(
+            "def f(cmd):\n    g = lambda: os.system\n    return apply(g, cmd)\n"
+        )
+
+    def test_import_alias_sink_not_skipped(self):
+        for body in (
+            "def f(cmd):\n    import os as o\n    return o.system(cmd)\n",
+            "def f(cmd):\n    from os import system as s\n    return s(cmd)\n",
+        ):
+            assert not self._py_fn(body), body
+
+    def test_augassign_carried_sink_not_skipped(self):
+        assert not self._py_fn(
+            "def f(cmd, g):\n    g += [os.system]\n    return apply(g, cmd)\n"
+        )
+
+    def test_subscript_store_sink_not_skipped(self):
+        # Store into a container: no local name is bound, but the
+        # stored value carries the sink out of the wrapper.
+        assert not self._py_fn(
+            "def f(cmd, d):\n    d['k'] = os.system\n    return helper(cmd)\n"
+        )
+
+    def test_unresolvable_bound_callee_not_skipped(self):
+        # The delegate's value comes from a container the body never
+        # spells — an unresolvable delegate is never mechanically
+        # clean.
+        assert not self._py_fn(
+            "def f(cmd):\n    g = TABLE[0]\n    return g(cmd)\n"
+        )
+
+    def test_global_rebindable_callee_not_skipped(self):
+        assert not self._py_fn(
+            "def f(cmd):\n    global g\n    return g(cmd)\n"
+        )
+
+    def test_unparseable_python_source_not_skipped(self):
+        assert not self._py_fn(
+            "def f(cmd:\n    return helper(cmd)\n"
+        )
+
+    def test_star_import_not_skipped(self):
+        assert not self._py_fn(
+            "def f(cmd):\n    from os import *\n    return helper(cmd)\n"
+        )
+
+    def test_literal_default_parameter_stays_caller_data(self):
+        # A pure-literal default leaves the parameter as plain caller
+        # data: forwarding it (even under a tail-colliding name) or
+        # calling through it keeps the skip.
+        for body in (
+            "def f(x, out=None):\n    return out.append(x)\n",
+            "def f(x, timeout=30):\n    return helper(x, timeout)\n",
+            "def f(self, *, write=True):\n"
+            "    return self._lock(write=write)\n",
+        ):
+            assert self._py_fn(body), body
+
+    def test_parameter_forward_under_sink_tail_name_skips(self):
+        # A BARE parameter reference is caller data even under a
+        # tail-colliding name — the local binding shadows any module
+        # of the same spelling.
+        assert self._py_fn(
+            "def f(request):\n    return helper(request)\n"
+        )
+
+    def test_attribute_chain_on_parameter_still_judged(self):
+        # The attribute segments name the API reached through the
+        # caller's object — only the parameter ROOT is exempt.
+        assert not self._py_fn(
+            "def f(sp, arg):\n    return pool.submit(sp.run, arg)\n"
+        )
+
+    def test_rebound_parameter_loses_caller_data_exemption(self):
+        assert not self._py_fn(
+            "def f(system, c):\n    system = os.system\n"
+            "    return dispatch(system, c)\n"
+        )
+
+    def test_reference_default_parameter_still_resolves(self):
+        # Both directions: a reference-carrying default joins the
+        # parameter's value domain — sink defaults refuse, benign
+        # ones resolve and skip.
+        assert not self._py_fn(
+            "def f(cmd, g=os.system):\n    return g(cmd)\n"
+        )
+        assert self._py_fn(
+            "def f(a, g=math.sqrt):\n    return g(a)\n"
+        )
+
+    def test_lambda_param_does_not_exempt_outer_name(self):
+        # A lambda parameter shadows only inside the lambda — outside
+        # it the same spelling is the module/import, so it must never
+        # join the caller-data exemption (the bare sink call below
+        # would be journalled mechanically clean).
+        assert not self._py_fn(
+            "def f(c):\n    g = lambda system: 0\n    return system(c)\n"
+        )
+
+    def test_nested_def_param_does_not_exempt_outer_name(self):
+        assert not self._py_fn(
+            "def f(c):\n    def g(system):\n        pass\n"
+            "    return system(c)\n"
+        )
+
+    def test_lambda_param_project_sink_not_laundered(self):
+        from core.audit.prefilter import _is_trivial_wrapper
+        skip, _ = _is_trivial_wrapper(
+            "def f(c):\n    g = lambda utilmod: 0\n"
+            "    return utilmod.launch(c)\n",
+            "python", None,
+            project_sinks=frozenset({"utilmod.launch"}),
+        )
+        assert not skip
+
+    def test_project_sink_root_survives_param_collision(self):
+        # The operator's dotted sink declaration names the module —
+        # a parameter sharing that root keeps the reference judged
+        # (dotted project sinks derive no bare-tail set, so the root
+        # is their only surface).
+        from core.audit.prefilter import _is_trivial_wrapper
+        skip, _ = _is_trivial_wrapper(
+            "def f(c, utilmod=None):\n    return utilmod.launch(c)\n",
+            "python", None,
+            project_sinks=frozenset({"utilmod.launch"}),
+        )
+        assert not skip
+
+    def test_lambda_with_benign_params_keeps_skip(self):
+        # The other direction: lambda parameters colliding with
+        # nothing keep the wrapper trivially skippable.
+        assert self._py_fn(
+            "def f(x):\n    g = lambda k: k\n    return helper(x, g)\n"
+        )
+
+    def test_relative_import_delegate_still_skips(self):
+        # A relative import spells its delegate fully — the wrapper
+        # stays trivially skippable; only the ref parts are judged.
+        for body in (
+            "def f(cfg, line):\n"
+            "    from .cfg_utils import find_node\n"
+            "    return find_node(cfg, line)\n",
+            "def f(x):\n    from . import helpers\n"
+            "    return helpers.compute(x)\n",
+        ):
+            assert self._py_fn(body), body
+
+    def test_relative_import_sink_tail_not_skipped(self):
+        assert not self._py_fn(
+            "def f(c):\n    from .proc_utils import run\n"
+            "    return run(c)\n"
+        )
+
+    def test_benign_alias_chain_still_skips(self):
+        # Both directions: benign values flowing through the same
+        # shapes keep the skip.
+        for body in (
+            "def f(a):\n    g = math.sqrt\n    return g(a)\n",
+            "def f(a, g=math.sqrt):\n    return g(a)\n",
+            "def f(a, x):\n    g = math.sqrt if x else math.floor\n"
+            "    return g(a)\n",
+            "def f(x):\n    limit = 30\n    return helper(x, limit)\n",
+        ):
+            assert self._py_fn(body), body
+
+    # ── Whole-value escape analysis (C/C++ text-grammar leg) ──────
+
+    def _c_fn(self, source: str, lang: str = "c"):
+        from core.audit.prefilter import _is_trivial_wrapper
+        is_wrapper, _ = _is_trivial_wrapper(source, lang, None)
+        return is_wrapper
+
+    def test_c_typedef_fn_pointer_alias_not_skipped(self):
+        # A leading type token defeated the anchored alias regex; the
+        # declaration grammar must see through the declarator.
+        assert not self._c_fn(
+            "sighandler_t f(char *c) {\n"
+            "    sighandler_t fp = system;\n    return fp(c);\n}\n"
+        )
+
+    def test_cpp_auto_alias_not_skipped(self):
+        assert not self._c_fn(
+            "int f(char *c) {\n    auto fp = system;\n"
+            "    return fp(c);\n}\n",
+            "cpp",
+        )
+
+    def test_c_fn_pointer_declarator_alias_not_skipped(self):
+        assert not self._c_fn(
+            "int f(char *c) {\n"
+            "    int (*fp)(const char *) = system;\n"
+            "    return fp(c);\n}\n"
+        )
+
+    def test_c_brace_initializer_sink_not_skipped(self):
+        # Refusal here comes from the body-view truncation at the
+        # initializer's `}` and the tail gates — the statement
+        # splitter consumes brace groups before value classification,
+        # so no value-level judgment of brace elements is claimed
+        # (both directions pinned: aggregate and C++ brace
+        # declarator).
+        for body in (
+            "int f(char *c) {\n    handler_t t[] = {system};\n"
+            "    return helper(c);\n}\n",
+            "void f(char *c) {\n    fn_t fp{system};\n"
+            "    fp(c);\n}\n",
+        ):
+            assert not self._c_fn(body), body
+
+    def test_c_ternary_sink_not_skipped(self):
+        assert not self._c_fn(
+            "int f(char *c, int x) {\n"
+            "    fn_t fp = x ? system : safe_fn;\n"
+            "    return fp(c);\n}\n"
+        )
+
+    def test_c_chained_assign_sink_not_skipped(self):
+        assert not self._c_fn(
+            "int f(char *c) {\n    fn_t g = h = system;\n"
+            "    return g(c);\n}\n"
+        )
+
+    def test_c_compound_assign_sink_not_skipped(self):
+        assert not self._c_fn(
+            "int f(char *c) {\n    a |= (uintptr_t)system;\n"
+            "    return helper(c);\n}\n"
+        )
+
+    def test_c_member_and_array_store_sink_not_skipped(self):
+        for body in (
+            "void f(struct ops *o, char *c) {\n"
+            "    o->exec_fn = system;\n    helper(c);\n}\n",
+            "void f(fn_t *t, char *c) {\n"
+            "    t[0] = system;\n    helper(c);\n}\n",
+        ):
+            assert not self._c_fn(body), body
+
+    def test_c_return_position_cast_sink_not_skipped(self):
+        assert not self._c_fn(
+            "void *f(char *c) {\n    log_it(c);\n"
+            "    return (void *)system;\n}\n"
+        )
+
+    def test_c_subscript_bound_callee_not_skipped(self):
+        # The delegate's value comes out of a container — an
+        # unresolvable delegate is never mechanically clean.
+        assert not self._c_fn(
+            "int f(char *c) {\n    fn_t fp = handlers[0];\n"
+            "    return fp(c);\n}\n"
+        )
+
+    def test_c_pointer_store_line_not_treated_as_comment(self):
+        # A leading `*` is a block-comment continuation only inside
+        # an open `/* ... */`; a pointer store must stay in the
+        # judged view.
+        assert not self._c_fn(
+            "void f(fn_t *slot, char *c) {\n"
+            "    *slot = system;\n    helper(c);\n}\n"
+        )
+
+    def test_c_block_comment_continuation_still_dropped(self):
+        # Both directions: prose continuation lines (even ones
+        # spelling sinks) stay out of the judged view.
+        assert self._c_fn(
+            "/* setkey wrapper\n * forwards; system = crypto layer\n"
+            " */\nint setkey(struct aead *a, const u8 *k) {\n"
+            "    return aead_setkey(a, k);\n}\n"
+        )
+
+    def test_c_code_after_inline_block_comment_judged(self):
+        assert not self._c_fn(
+            "int f(char *c) {\n"
+            "    /* nothing */ dispatch(system, c);\n    return 0;\n}\n"
+        )
+
+    def test_c_string_spelling_comment_opener_does_not_swallow(self):
+        # `/*` inside a C string literal is data — treating it as an
+        # opener dropped every following line from the judged view,
+        # hiding a live sink call behind a glob pattern.
+        assert not self._c_fn(
+            'int glob_run(const char *d) {\n'
+            '    log_msg("scan /* pattern");\n'
+            '    return system(d);\n}\n'
+        )
+
+    def test_c_line_comment_opener_does_not_swallow(self):
+        # A `/*` after `//` is line-comment prose, not an opener —
+        # the phantom state swallowed the sink line below.
+        assert not self._c_fn(
+            "int f(char *c) {\n"
+            "    return log(c); // note /*\n"
+            "    system(c);\n}\n"
+        )
+
+    def test_c_string_comment_closer_does_not_end_state(self):
+        # The mirror direction: `*/` inside a string while no comment
+        # is open is data; the sink call stays judged either way.
+        assert not self._c_fn(
+            'int f(char *c) {\n'
+            '    log_msg("end */ marker");\n'
+            '    return system(c);\n}\n'
+        )
+
+    def test_c_quotes_inside_open_comment_are_prose(self):
+        # Inside an open block comment there are no strings — the
+        # first `*/` closes even when quoted, so following code stays
+        # in the judged view (over-inclusion at worst, never a
+        # swallow).
+        assert not self._c_fn(
+            "int f(char *c) {\n"
+            '    /* doc " */ dispatch(system, c);\n'
+            "    return 0;\n}\n"
+        )
+
+    def test_python_block_comment_string_does_not_hide_code(self):
+        # `/*` in a Python string is data, not a comment opener — a
+        # sink call between `"/*"` and `"*/"` strings must stay
+        # visible to the call gate / AST judgment.
+        assert not self._py_fn(
+            'def f(c):\n    s = "/*"\n    os.system(c)\n'
+            '    t = "*/"\n    return s + t\n'
+        )
+
+    def test_c_benign_declarations_still_skip(self):
+        for body in (
+            "int f(int x) {\n    int limit = 30;\n"
+            "    return check_limit(x, limit);\n}\n",
+            "int f(int x, int y) {\n"
+            "    fn_t g = y ? do_a : do_b;\n    return g(x);\n}\n",
+        ):
+            assert self._c_fn(body), body
+
+    def test_cpp_benign_auto_alias_still_skips(self):
+        assert self._c_fn(
+            "int f(int x) {\n    auto g = my_helper;\n"
+            "    return g(x);\n}\n",
+            "cpp",
+        )
+
+    # ── Whole-value escape analysis (remaining language legs) ─────
+    # Body-only shapes: with a signature line present these languages
+    # never reach the skip (the signature's own `name(` counts as a
+    # call), so the binding grammar is exercised on bodies.
+
+    def test_go_declaration_alias_sink_not_skipped(self):
+        from core.audit.prefilter import _is_trivial_wrapper
+        for body in (
+            "g := exec.Command\nreturn g(c)\n",
+            "g := exec.Command\nh := g\nreturn dispatch(h, c)\n",
+        ):
+            is_wrapper, _ = _is_trivial_wrapper(body, "go", None)
+            assert not is_wrapper, body
+
+    def test_js_const_alias_sink_not_skipped(self):
+        from core.audit.prefilter import _is_trivial_wrapper
+        for body in (
+            "const g = eval;\nreturn g(c);\n",
+            "let a = eval;\nlet b = a;\nreturn b(c);\n",
+        ):
+            is_wrapper, _ = _is_trivial_wrapper(body, "javascript", None)
+            assert not is_wrapper, body
+
+    def test_lua_local_alias_sink_not_skipped(self):
+        from core.audit.prefilter import _is_trivial_wrapper
+        is_wrapper, _ = _is_trivial_wrapper(
+            "local g = os.execute\nreturn g(c)\n", "lua", None,
+        )
+        assert not is_wrapper
+
+    def test_perl_coderef_value_escape_not_skipped(self):
+        from core.audit.prefilter import _is_trivial_wrapper
+        is_wrapper, _ = _is_trivial_wrapper(
+            "my $g = \\&system;\nreturn dispatch($g, $x);\n",
+            "perl", None,
+        )
+        assert not is_wrapper
+
+    def test_php_string_callable_binding_not_skipped(self):
+        # `$g = 'system'; $g($c)` — the delegate's value is a string
+        # the noise strip cut, so the bound callee resolves to
+        # nothing nameable: never mechanically clean.
+        from core.audit.prefilter import _is_trivial_wrapper
+        is_wrapper, _ = _is_trivial_wrapper(
+            "$g = 'system';\nreturn $g($c);\n", "php", None,
+        )
+        assert not is_wrapper
+
+    def test_other_language_benign_aliases_still_skip(self):
+        from core.audit.prefilter import _is_trivial_wrapper
+        for body, lg in (
+            ("g := compute\nreturn g(x)\n", "go"),
+            ("const g = myHelper;\nreturn g(x);\n", "javascript"),
+            ("local g = fmt_helper\nreturn g(x)\n", "lua"),
+        ):
+            is_wrapper, _ = _is_trivial_wrapper(body, lg, None)
+            assert is_wrapper, (body, lg)
+
+    def test_callgraph_resolved_dangerous_callee_not_skipped(self):
+        # The extraction pipeline resolved the delegate to a dangerous
+        # callee the body text does not spell (macro indirection) —
+        # the call-graph veto must refuse the skip.
+        from core.audit.prefilter import _is_trivial_wrapper
+        is_wrapper, _ = _is_trivial_wrapper(
+            "int f(int x) {\n    return DO_OP(x);\n}\n",
+            "c", [{"name": "system"}],
+        )
+        assert not is_wrapper
+
+    def test_callgraph_resolved_project_sink_callee_not_skipped(self):
+        from core.audit.prefilter import _is_trivial_wrapper
+        is_wrapper, _ = _is_trivial_wrapper(
+            "def f(x):\n    return do_op(x)\n",
+            "python", [{"name": "render_query"}],
+            project_sinks=frozenset({"render_query"}),
+        )
+        assert not is_wrapper
+
+    def test_callgraph_benign_callee_still_skips(self):
+        # Exact-name match only: a benign resolved callee (even one
+        # sharing no name with the body spelling) keeps the skip.
+        from core.audit.prefilter import _is_trivial_wrapper
+        is_wrapper, _ = _is_trivial_wrapper(
+            "def f(x):\n    return do_op(x)\n",
+            "python", [{"name": "compute_value"}],
+        )
+        assert is_wrapper
+
+
+class TestBinderConstructClosure:
+    """Mechanical closure over the installed Python grammar: every
+    ast node type that introduces or receives a name binding must be
+    either handled by the wrapper escape collector or covered by its
+    conservative runtime default (refuse the skip). The enumeration
+    is derived from the ast module itself, so a new grammar release
+    adding a binder construct fails here until it is classified —
+    while the runtime default already refuses it."""
+
+    def test_installed_binder_grammar_totally_classified(self):
+        import ast as ast_mod
+
+        from core.audit.prefilter import (
+            _PY_BINDER_FIELDS,
+            _PY_HANDLED_BINDERS,
+        )
+        binder_classes = {
+            obj for obj in vars(ast_mod).values()
+            if isinstance(obj, type)
+            and issubclass(obj, ast_mod.AST)
+            and set(getattr(obj, "_fields", ())) & _PY_BINDER_FIELDS
+        }
+        assert binder_classes, "binder-field enumeration went empty"
+        # Constructs deliberately left to the conservative runtime
+        # default: match patterns and type-parameter declarations
+        # refuse the skip instead of modelling their bindings.
+        conservatively_refused = {
+            getattr(ast_mod, name)
+            for name in (
+                "MatchAs", "MatchStar", "MatchMapping",
+                "TypeAlias", "TypeVar", "ParamSpec", "TypeVarTuple",
+            )
+            if hasattr(ast_mod, name)
+        }
+        unclassified = (
+            binder_classes
+            - set(_PY_HANDLED_BINDERS)
+            - conservatively_refused
+        )
+        assert not unclassified, (
+            "new binder constructs need classification in the "
+            f"wrapper escape collector: {sorted(c.__name__ for c in unclassified)}"
+        )
+
+    def test_unhandled_binder_construct_refuses_analysis(self):
+        # A match capture pattern binds through a construct the
+        # collector does not model — the conservative default must
+        # refuse the analysis (and therefore the skip).
+        from core.audit.prefilter import (
+            _is_trivial_wrapper,
+            _py_wrapper_escape,
+        )
+        src = (
+            "def f(c, x):\n"
+            "    match x:\n"
+            "        case g:\n"
+            "            return helper(c)\n"
+        )
+        assert _py_wrapper_escape(src) is None
+        assert not _is_trivial_wrapper(src, "python", None)[0]
+
+    def test_store_sweep_refuses_unaccounted_name(self, monkeypatch):
+        # Belt-and-braces behind the binder-field check: a
+        # Store-context Name the collector did not bind or account
+        # for refuses the analysis. Exercised by planting a synthetic
+        # binder whose holder type carries no binder-shaped field.
+        import ast as ast_mod
+
+        from core.audit.prefilter import _py_wrapper_escape
+        src = "def f(c):\n    return helper(c)\n"
+        tree = ast_mod.parse(src)
+
+        def planted_parse(_source: str) -> ast_mod.Module:
+            # graft a bare Store name under an expression statement
+            planted = ast_mod.Name(id="ghost", ctx=ast_mod.Store())
+            tree.body[0].body.insert(0, ast_mod.Expr(value=planted))
+            return tree
+
+        monkeypatch.setattr(ast_mod, "parse", planted_parse)
+        assert _py_wrapper_escape(src) is None
+
+
+
+#: Adversarial shape battery rows: (case id, language, source,
+#: expected skip verdict, project sinks, resolved callees).
+#: Historical escape shapes re-spelled independently of the pinned
+#: member tests, benign controls, and hostile candidates across
+#: every language leg.
+_ADVERSARIAL_CASES: list[tuple] = [
+    (
+        'H01-tuple-unpack', 'python',
+        'def f(c):\n    a, b = os.system, 1\n    return a(c)\n',
+        False, None, None,
+    ),
+    (
+        'H02-chained', 'python',
+        'def f(c):\n    a = b = os.system\n    return a(c)\n',
+        False, None, None,
+    ),
+    (
+        'H03-annotated', 'python',
+        'def f(c):\n    a: object = subprocess.run\n    return a(c)\n',
+        False, None, None,
+    ),
+    (
+        'H04-conditional-rhs', 'python',
+        'def f(c, z):\n    a = os.system if z else print\n    return a(c)\n',
+        False, None, None,
+    ),
+    (
+        'H05-spaced-attr', 'python',
+        'def f(c):\n    a = os . system\n    return a(c)\n',
+        False, None, None,
+    ),
+    (
+        'H06-default-arg', 'python',
+        'def f(c, run=subprocess.run):\n    return run(c)\n',
+        False, None, None,
+    ),
+    (
+        'H07-kwonly-default', 'python',
+        'def f(c, *, run=os.system):\n    return run(c)\n',
+        False, None, None,
+    ),
+    (
+        'H08-two-hop', 'python',
+        'def f(c):\n    a = os.system\n    b = a\n    return b(c)\n',
+        False, None, None,
+    ),
+    (
+        'H09-return-value-escape', 'python',
+        'def f(c):\n    log(c)\n    return os.system\n',
+        False, None, None,
+    ),
+    (
+        'H10-yield-escape', 'python',
+        'def f(c):\n    log(c)\n    yield subprocess.run\n',
+        False, None, None,
+    ),
+    (
+        'H11-walrus', 'python',
+        'def f(c):\n    return (a := os.system)(c)\n',
+        False, None, None,
+    ),
+    (
+        'H12-arg-value-escape', 'python',
+        'def f(c):\n    return pool.submit(os.system, c)\n',
+        False, None, None,
+    ),
+    (
+        'H13-container-store', 'python',
+        "def f(c, d):\n    d['k'] = os.system\n    return log(c)\n",
+        False, None, None,
+    ),
+    (
+        'H14-attr-store', 'python',
+        'def f(self, c):\n    self.h = os.system\n    return log(c)\n',
+        False, None, None,
+    ),
+    (
+        'H15-augassign', 'python',
+        'def f(c, acc):\n    acc += [os.system]\n    return log(c)\n',
+        False, None, None,
+    ),
+    (
+        'H16-import-alias', 'python',
+        'def f(c):\n    import os as o\n    return o.system(c)\n',
+        False, None, None,
+    ),
+    (
+        'H17-from-import', 'python',
+        'def f(c):\n    from os import system as s\n    return s(c)\n',
+        False, None, None,
+    ),
+    (
+        'H18-star-import', 'python',
+        'def f(c):\n    from os import *\n    return system(c)\n',
+        False, None, None,
+    ),
+    (
+        'H19-lambda-carry', 'python',
+        'def f(c):\n    g = lambda: os.system\n    return g(c)\n',
+        False, None, None,
+    ),
+    (
+        'H20-subscript-store', 'python',
+        'def f(c, tbl):\n    tbl[0] = subprocess.run\n    return log(c)\n',
+        False, None, None,
+    ),
+    (
+        'HC1-typedef-fnptr', 'c',
+        'void w(char *c) {\n    sighandler_t fp = system;\n    fp(c);\n}\n',
+        False, None, None,
+    ),
+    (
+        'HC2-auto', 'cpp',
+        'void w(char *c) {\n    auto fp = system;\n    fp(c);\n}\n',
+        False, None, None,
+    ),
+    (
+        'HC3-fnptr-declarator', 'c',
+        'void w(char *c) {\n    int (*fp)(const char*) = system;\n    fp(c);\n}\n',
+        False, None, None,
+    ),
+    (
+        'HC4-brace-init', 'cpp',
+        'void w(char *c) {\n    fn_t fp{system};\n    fp(c);\n}\n',
+        False, None, None,
+    ),
+    (
+        'HC5-ternary', 'c',
+        'void w(char *c, int z) {\n    fn_t fp = z ? system : puts;\n    fp(c);\n}\n',
+        False, None, None,
+    ),
+    (
+        'HC6-chained', 'c',
+        'void w(char *c) {\n    a = b = system;\n    a(c);\n}\n',
+        False, None, None,
+    ),
+    (
+        'HC7-ptr-store', 'c',
+        'void w(char *c, fn_t *slot) {\n    *slot = system;\n    log(c);\n}\n',
+        False, None, None,
+    ),
+    (
+        'HC8-return-cast', 'c',
+        'void *w(char *c) {\n    log(c);\n    return (void *)system;\n}\n',
+        False, None, None,
+    ),
+    (
+        'HC9-member-store', 'c',
+        'void w(struct ops *o, char *c) {\n    o->run = system;\n    log(c);\n}\n',
+        False, None, None,
+    ),
+    (
+        'HC10-compound', 'c',
+        'void w(char *c) {\n    fp += system;\n    fp(c);\n}\n',
+        False, None, None,
+    ),
+    (
+        'HG1-go-decl', 'go',
+        'func w(c string) {\n    h := system\n    h(c)\n}\n',
+        False, None, None,
+    ),
+    (
+        'HG2-go-two-hop', 'go',
+        'func w(c string) {\n    h := system\n    g := h\n    g(c)\n}\n',
+        False, None, None,
+    ),
+    (
+        'HJ1-js-const', 'js',
+        'function w(c) {\n    const h = eval;\n    return h(c);\n}\n',
+        False, None, None,
+    ),
+    (
+        'HJ2-js-arrow-carry', 'js',
+        'function w(c) {\n    const h = () => eval;\n    return h(c);\n}\n',
+        False, None, None,
+    ),
+    (
+        'HR1-getattr', 'python',
+        "def f(c):\n    return getattr(os, 'system')(c)\n",
+        False, None, None,
+    ),
+    (
+        'HR2-partial', 'python',
+        'def f(c):\n    return partial(sp.run)(c)\n',
+        False, None, None,
+    ),
+    (
+        'HR3-dunder-call', 'python',
+        'def f(c):\n    return os.system.__call__(c)\n',
+        False, None, None,
+    ),
+    (
+        'HR4-vars', 'python',
+        "def f(c):\n    return vars(os)['system'](c)\n",
+        False, None, None,
+    ),
+    (
+        'HR5-factory-result', 'python',
+        'def f(c):\n    return make()(c)\n',
+        False, None, None,
+    ),
+    (
+        'HR6-dlsym', 'c',
+        'void w(char *c) {\n    fn = dlsym(h, "system");\n}\n',
+        False, None, None,
+    ),
+    (
+        'B01-benign-delegate', 'python',
+        'def f(x):\n    return helper.compute(x)\n',
+        True, None, None,
+    ),
+    (
+        'B02-math-alias', 'python',
+        'def f(x):\n    s = math.sqrt\n    return s(x)\n',
+        True, None, None,
+    ),
+    (
+        'B03-bare-param-forward', 'python',
+        'def f(g, x):\n    return g(x)\n',
+        True, None, None,
+    ),
+    (
+        'B04-c-benign', 'c',
+        'int w(int x) {\n    return helper(x);\n}\n',
+        True, None, None,
+    ),
+    (
+        'B05-literal-default', 'python',
+        'def f(x, out=None):\n    return helper(x, out)\n',
+        True, None, None,
+    ),
+    (
+        # Caller-data exemption: a param-rooted method call carries
+        # no sink identity of its own.
+        'B06-param-method', 'python',
+        'def f(request):\n    return request.get_host()\n',
+        True, None, None,
+    ),
+    (
+        'G01-nonlocal-cell', 'python',
+        'def f(c):\n    h = None\n    def s():\n        nonlocal h\n        h = os.system\n    return h(c)\n',
+        False, None, None,
+    ),
+    (
+        'G02-closure-return', 'python',
+        'def f(c):\n    def g():\n        return os.system\n    return g()(c)\n',
+        False, None, None,
+    ),
+    (
+        'G03-lambda-closure-smuggle', 'python',
+        'def f(c):\n    g = lambda: os.system\n    return apply_(g, c)\n',
+        False, None, None,
+    ),
+    (
+        'G04-class-attr-store', 'python',
+        'def f(c):\n    class C:\n        run = os.system\n    return C.run(c)\n',
+        False, None, None,
+    ),
+    (
+        'G05-class-attr-two-step', 'python',
+        'def f(c, C):\n    C.run = os.system\n    return log(c)\n',
+        False, None, None,
+    ),
+    (
+        'G06-comp-elt-leak', 'python',
+        'def f(c, y):\n    log(c)\n    return [os.system for _ in y]\n',
+        False, None, None,
+    ),
+    (
+        'G07-comp-iter', 'python',
+        'def f(c):\n    return [g for g in [os.system]]\n',
+        False, None, None,
+    ),
+    (
+        'G08-genexp-elt', 'python',
+        'def f(c, y):\n    log(c)\n    return (subprocess.run for _ in y)\n',
+        False, None, None,
+    ),
+    (
+        'G09-dictcomp-value', 'python',
+        'def f(c, y):\n    log(c)\n    return {k: os.system for k in y}\n',
+        False, None, None,
+    ),
+    (
+        'G10-subscript-display', 'python',
+        'def f(c):\n    log(c)\n    return [os.system][0]\n',
+        False, None, None,
+    ),
+    (
+        'G11-dict-subscript-display', 'python',
+        'def f(c):\n    log(c)\n    return {1: os.system}[1]\n',
+        False, None, None,
+    ),
+    (
+        'G12-slice-display', 'python',
+        'def f(c):\n    log(c)\n    return (os.system, print)[:1]\n',
+        False, None, None,
+    ),
+    (
+        'G13-bare-decorator', 'python',
+        '@os.system\ndef f(c):\n    return log(c)\n',
+        False, None, None,
+    ),
+    (
+        'G14-decorator-call', 'python',
+        '@wraps(os.system)\ndef f(c):\n    return log(c)\n',
+        False, None, None,
+    ),
+    (
+        'G15-reduce', 'python',
+        'def f(c, fns):\n    return reduce(chain_, [os.system], c)\n',
+        False, None, None,
+    ),
+    (
+        'G16-partialmethod', 'python',
+        'def f(c):\n    run = partialmethod(os.system)\n    return log(c)\n',
+        False, None, None,
+    ),
+    (
+        'G17-dict-dispatch', 'python',
+        "def f(c):\n    d = {'a': os.system}\n    return d['a'](c)\n",
+        False, None, None,
+    ),
+    (
+        'G18-inline-dict-dispatch', 'python',
+        "def f(c):\n    return {'a': os.system}['a'](c)\n",
+        False, None, None,
+    ),
+    (
+        'G19-eval-callee', 'python',
+        "def f(c):\n    return eval('os.system')(c)\n",
+        False, None, None,
+    ),
+    (
+        'G20-exec-bind', 'python',
+        "def f(c):\n    exec('h = os.system')\n    return h(c)\n",
+        False, None, None,
+    ),
+    (
+        'G21-eval-bind', 'python',
+        "def f(c):\n    h = eval('os.sys' + 'tem')\n    return h(c)\n",
+        False, None, None,
+    ),
+    (
+        'G22-sysmodules', 'python',
+        "def f(c, evil):\n    sys.modules['os'] = evil\n    return log(c)\n",
+        False, None, None,
+    ),
+    (
+        'G23-lambda-param-shadow-bare', 'python',
+        'def f(c):\n    g = lambda system: 0\n    return system(c)\n',
+        False, None, None,
+    ),
+    (
+        'G24-lambda-param-shadow-proj', 'python',
+        'def f(c):\n    g = lambda utilmod: 0\n    return utilmod.launch(c)\n',
+        False, frozenset({'utilmod.launch'}), None,
+    ),
+    (
+        'G25-own-param-shadow-proj', 'python',
+        'def f(c, utilmod=None):\n    return utilmod.launch(c)\n',
+        False, frozenset({'utilmod.launch'}), None,
+    ),
+    (
+        'G26-nesteddef-param-shadow', 'python',
+        'def f(c):\n    def g(system): pass\n    return system(c)\n',
+        False, None, None,
+    ),
+    (
+        'G27-global-store', 'python',
+        'def f(c):\n    global h\n    h = os.system\n    return log(c)\n',
+        False, None, None,
+    ),
+    (
+        'G28-callees-veto', 'c',
+        'void w(char *c) {\n    DOIT(c);\n}\n',
+        False, None, [{'name': 'system'}],
+    ),
+    (
+        'G29-callees-benign', 'c',
+        'void w(char *c) {\n    DOIT(c);\n}\n',
+        True, None, [{'name': 'project_helper'}],
+    ),
+    (
+        'G30-callees-proj-sink', 'c',
+        'void w(char *c) {\n    DOIT(c);\n}\n',
+        False, frozenset({'proj_sink'}), [{'name': 'proj_sink'}],
+    ),
+    (
+        'G31-rust-lifetime-swallow', 'rust',
+        "fn w(c: &str) {\n    let x: &'a str = y; let h = system; let z: &'b str = q;\n    h(c);\n}\n",
+        False, None, None,
+    ),
+    (
+        'G32-cpp-digit-sep', 'cpp',
+        "void w(char *c) {\n    int x = 1'000; fp = system; int y = 5'6;\n    fp(c);\n}\n",
+        False, None, None,
+    ),
+    (
+        # Known residual, pinned: `#`-leading lines are dropped from
+        # the C line view, so a same-body macro hiding the sink call
+        # skips as a benign delegate. The call-graph callee veto
+        # compensates when the extraction pipeline resolves the macro
+        # (the callees row below); lexer-grade preprocessor handling
+        # is out of this analysis' scope.
+        'G33-c-macro-hidden', 'c',
+        '#define FWD(x) system(x)\nvoid w(char *c) {\n    FWD(c);\n}\n',
+        True, None, None,
+    ),
+    (
+        'G33b-c-macro-hidden-callees-veto', 'c',
+        '#define FWD(x) system(x)\nvoid w(char *c) {\n    FWD(c);\n}\n',
+        False, None, [{'name': 'system'}],
+    ),
+    (
+        'G34-go-closure-capture', 'go',
+        'func w(c string) {\n    h := func() { system(c) }\n    h()\n}\n',
+        False, None, None,
+    ),
+    (
+        'G35-js-template-swallow', 'js',
+        'function w(c) {\n    const h = system;\n    return sh(c);\n}\n',
+        False, None, None,
+    ),
+    (
+        'G36-c-block-comment-ptr', 'c',
+        'void w(fn_t *s, char *c) {\n    /* doc\n     * more doc\n     */\n    *s = system;\n    log(c);\n}\n',
+        False, None, None,
+    ),
+    (
+        'G37-c-fake-block-close', 'c',
+        'void w(fn_t *s, char *c) {\n    *s = system; /* set\n     * handler */\n    log(c);\n}\n',
+        False, None, None,
+    ),
+    (
+        'G38-c-string-quote-swallow', 'c',
+        'void w(char *c) {\n    p = "a; q = \\"b"; fp = system; r = "c";\n    fp(c);\n}\n',
+        False, None, None,
+    ),
+    (
+        'G39-unresolved-delegate', 'python',
+        "def f(c, d):\n    h = d['k']\n    return h(c)\n",
+        False, None, None,
+    ),
+    (
+        'G40-cycle', 'python',
+        'def f(c):\n    a = b\n    b = a\n    return a(c)\n',
+        False, None, None,
+    ),
+]
+
+
+class TestWrapperAdversarialShapes:
+    """Each battery row pins today's verdict (skip or review) so a
+    grammar change that re-opens an escape shape — or starts
+    refusing a pinned benign control — fails loudly with its case
+    id."""
+
+    @pytest.mark.parametrize(
+        ("cid", "lang", "src", "expect_skip", "sinks", "callees"),
+        _ADVERSARIAL_CASES,
+        ids=[c[0] for c in _ADVERSARIAL_CASES],
+    )
+    def test_adversarial_shape(
+        self,
+        cid: str,
+        lang: str,
+        src: str,
+        expect_skip: bool,
+        sinks: frozenset | None,
+        callees: list[dict[str, Any]] | None,
+    ) -> None:
+        from core.audit.prefilter import _is_trivial_wrapper
+        skip, _reason = _is_trivial_wrapper(
+            src, lang, callees, project_sinks=sinks,
+        )
+        assert skip == expect_skip, cid
 
 
 # ── Multi-language prefilter patterns ─────────────────────────────
@@ -633,6 +2081,60 @@ class TestConfidencePropagation:
         demotions = propagate_confidence(outcomes, edge_index)
         assert len(demotions) == 0
 
+    def test_same_name_other_file_callers_not_matched(self):
+        """Callers of a same-named function in a DIFFERENT file must not
+        stand in for the flagged function's callers.
+
+        C statics make duplicate function names routine; a bare-name
+        match on a file-qualified edge collects the wrong function's
+        callers, and an all-clean wrong-caller set silently demotes a
+        suspicious outcome to clean.
+        """
+        from core.audit.propagation import propagate_confidence
+
+        outcomes = [
+            _MockOutcome("a.c", "caller1", "clean", "tool_backed"),
+            _MockOutcome("a.c", "caller2", "clean", "confirmed"),
+            _MockOutcome("b.c", "target", "suspicious", hypotheses=[
+                {"mechanism": "if the caller passes invalid length",
+                 "confidence": "medium", "counter": "trusts its caller"},
+            ]),
+        ]
+        # Both edges carry a callee_file that names OTHER.c — a
+        # different function that merely shares the name "target".
+        edge_index = {
+            "a.c:caller1": [{"caller_file": "a.c", "caller": "caller1",
+                             "callee_file": "other.c", "callee": "target"}],
+            "a.c:caller2": [{"caller_file": "a.c", "caller": "caller2",
+                             "callee_file": "other.c", "callee": "target"}],
+        }
+        demotions = propagate_confidence(outcomes, edge_index)
+        assert demotions == []
+
+    def test_fileless_edge_still_matches_bare_name(self):
+        """An edge with no callee_file keeps matching by bare name —
+        the file-less shape has no full key to require."""
+        from core.audit.propagation import propagate_confidence
+
+        outcomes = [
+            _MockOutcome("a.c", "caller1", "clean", "tool_backed"),
+            _MockOutcome("a.c", "caller2", "clean", "confirmed"),
+            _MockOutcome("b.c", "target", "suspicious", hypotheses=[
+                {"mechanism": "if the caller passes invalid length",
+                 "confidence": "medium", "counter": "trusts its caller"},
+            ]),
+        ]
+        edge_index = {
+            "a.c:caller1": [{"caller_file": "a.c", "caller": "caller1",
+                             "callee": "target"}],
+            "a.c:caller2": [{"caller_file": "a.c", "caller": "caller2",
+                             "callee": "target"}],
+        }
+        demotions = propagate_confidence(outcomes, edge_index)
+        assert len(demotions) == 1
+        assert demotions[0].file == "b.c"
+        assert demotions[0].function == "target"
+
 
 # ── Feature 4: Coccinelle concurrency rules ───────────────────────
 
@@ -794,7 +2296,10 @@ class TestPreconditionVerification:
         assert len(results) == 1
         assert not results[0].is_universally_satisfied
 
-    def test_format_verification_context(self):
+    def test_format_verification_observation_grade(self):
+        # The scan is lexical, position-insensitive and
+        # name-collision-prone: the rendering must report the
+        # observation, never claim a violation hypothesis is refuted.
         from core.audit.spec_inference import (
             PreconditionVerification,
             format_precondition_verification,
@@ -803,17 +2308,15 @@ class TestPreconditionVerification:
             precondition="ptr != NULL",
             total_call_sites=3,
             verified_sites=3,
-            violated_sites=0,
             unknown_sites=0,
             is_universally_satisfied=True,
         )
         text = format_precondition_verification([v])
-        assert "UNIVERSALLY SATISFIED" in text
-        assert "mechanically refuted" in text
+        assert "all 3 caller(s) contain a matching check" in text
+        assert "refuted" not in text
+        assert "SATISFIED" not in text  # no ALL_CAPS status values
 
-    def test_format_verification_splits_violated_and_unknown(self):
-        """'2/5 verified' is ambiguous — 3 violated is a live lead,
-        3 unknown is benign. The split must be rendered."""
+    def test_format_verification_partial_split(self):
         from core.audit.spec_inference import (
             PreconditionVerification,
             format_precondition_verification,
@@ -822,31 +2325,42 @@ class TestPreconditionVerification:
             precondition="len <= BUF_SIZE",
             total_call_sites=5,
             verified_sites=2,
-            violated_sites=2,
-            unknown_sites=1,
-            is_universally_satisfied=False,
-        )
-        text = format_precondition_verification([v])
-        assert "2/5 callers verified" in text
-        assert "(2 violated, 1 unknown)" in text
-        assert "chase the violating call site(s)" in text
-
-    def test_format_verification_no_violations_no_callout(self):
-        from core.audit.spec_inference import (
-            PreconditionVerification,
-            format_precondition_verification,
-        )
-        v = PreconditionVerification(
-            precondition="ptr != NULL",
-            total_call_sites=4,
-            verified_sites=1,
-            violated_sites=0,
             unknown_sites=3,
             is_universally_satisfied=False,
         )
         text = format_precondition_verification([v])
-        assert "(0 violated, 3 unknown)" in text
-        assert "chase the violating" not in text
+        assert "2/5 caller(s) contain a matching check" in text
+        assert "3 with none observed" in text
+        assert "refuted" not in text
+
+    def test_same_named_collision_does_not_mint_refuted_wording(self):
+        # A caller whose ONLY matching text is an unrelated
+        # same-named check (a different `ptr`, checked nowhere near
+        # the call) still counts as an observation — the rendering
+        # must not escalate it to refute-grade steering.
+        from core.audit.spec_inference import (
+            InferredSpec,
+            format_precondition_verification,
+            verify_preconditions_at_call_sites,
+        )
+        spec = InferredSpec(
+            function="process",
+            file="f.c",
+            preconditions=["ptr != NULL"],
+        )
+        callers = [
+            {"file": "a.c", "name": "collide",
+             "source": ("void collide(void) {\n"
+                        "  char *ptr = other();\n"
+                        "  if (!ptr) return;\n"
+                        "  free(ptr);\n"
+                        "  process(global_ptr);\n"
+                        "}\n")},
+        ]
+        results = verify_preconditions_at_call_sites(spec, callers)
+        text = format_precondition_verification(results)
+        assert "refuted" not in text
+        assert "lexical observation" in text
 
 
 # ── Feature 6: Convergence loop ───────────────────────────────────
@@ -1500,8 +3014,14 @@ class TestSelfContradictionDemotion:
             _demote_self_contradictions,
         )
         outcome = self._make_outcome("suspicious", [
-            {"mechanism": "overflow", "confidence": "refuted"},
-            {"mechanism": "oob", "confidence": "refuted"},
+            {"mechanism": "overflow", "confidence": "refuted",
+             "counter": "the length is clamped to sizeof(buf) on the "
+                        "line above the copy",
+             "counter_scope": "local"},
+            {"mechanism": "oob", "confidence": "refuted",
+             "counter": "the index is bounds-checked against len "
+                        "inside this function",
+             "counter_scope": "local"},
         ])
         result = OrchestratorResult()
         result.outcomes = [outcome]
@@ -1511,6 +3031,99 @@ class TestSelfContradictionDemotion:
         assert result.suspicious == 0
         assert result.clean == 1
         assert "[self-contradiction:" in result.outcomes[0].body
+
+    def test_ungrounded_all_refuted_not_demoted(self):
+        # Refutations with no counter (or a non-local / delegated one)
+        # are unverified claims — the post-loop net must not erase the
+        # suspicion the in-review gate deliberately kept alive.
+        from core.audit.orchestrator import (
+            OrchestratorResult,
+            _demote_self_contradictions,
+        )
+        outcome = self._make_outcome("suspicious", [
+            {"mechanism": "overflow", "confidence": "refuted"},
+            {"mechanism": "oob", "confidence": "refuted"},
+        ])
+        result = OrchestratorResult()
+        result.outcomes = [outcome]
+        result.suspicious = 1
+        _demote_self_contradictions(result)
+        assert result.outcomes[0].status == "suspicious"
+        assert result.suspicious == 1
+
+    def test_cross_function_counter_not_demoted(self):
+        from core.audit.orchestrator import (
+            OrchestratorResult,
+            _demote_self_contradictions,
+        )
+        outcome = self._make_outcome("suspicious", [
+            {"mechanism": "overflow", "confidence": "refuted",
+             "counter": "every caller clamps the length first",
+             "counter_scope": "cross_function"},
+        ])
+        result = OrchestratorResult()
+        result.outcomes = [outcome]
+        result.suspicious = 1
+        _demote_self_contradictions(result)
+        assert result.outcomes[0].status == "suspicious"
+
+    def test_withheld_marker_not_demoted(self):
+        # The review path already adjudicated withholding — the net
+        # respects its decision even when the hypotheses look grounded.
+        from core.audit.orchestrator import (
+            OrchestratorResult,
+            ReviewOutcome,
+            _demote_self_contradictions,
+        )
+        outcome = ReviewOutcome(
+            file="test.c", function="func",
+            status="suspicious", body="test body",
+            hypotheses=[
+                {"mechanism": "overflow", "confidence": "refuted",
+                 "counter": "the length is clamped on the line above",
+                 "counter_scope": "local"},
+            ],
+            evidence_tool="",
+            review_result={
+                "all_refuted_demotion_withheld": "counter-escalation-floor",
+            },
+        )
+        result = OrchestratorResult()
+        result.outcomes = [outcome]
+        result.suspicious = 1
+        _demote_self_contradictions(result)
+        assert result.outcomes[0].status == "suspicious"
+
+    def test_counter_escalated_not_demoted(self):
+        # Machine-raised suspicious: only a verification-grade receipt
+        # un-raises it, never the model's own refutation record. The
+        # body prefix is the provenance surviving journal rebuilds.
+        from core.audit.orchestrator import (
+            OrchestratorResult,
+            ReviewOutcome,
+            _demote_self_contradictions,
+        )
+        outcome = ReviewOutcome(
+            file="test.c", function="func",
+            status="suspicious",
+            body=(
+                "[counter-hypothesis escalation: the review rationale "
+                "below concludes clean, but a compelling "
+                "counter-hypothesis kept this verdict suspicious — "
+                "overflow via tainted n]\n\nlooks clean"
+            ),
+            hypotheses=[
+                {"mechanism": "overflow", "confidence": "refuted",
+                 "counter": "the length is clamped on the line above",
+                 "counter_scope": "local"},
+            ],
+            evidence_tool="",
+        )
+        result = OrchestratorResult()
+        result.outcomes = [outcome]
+        result.suspicious = 1
+        _demote_self_contradictions(result)
+        assert result.outcomes[0].status == "suspicious"
 
     def test_mixed_confidence_not_demoted(self):
         from core.audit.orchestrator import (

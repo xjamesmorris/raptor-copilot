@@ -11,12 +11,16 @@ wishful thinking.
 
 from __future__ import annotations
 
+import re
 import shlex
 from collections import defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from core.atomic_fs import write_text_atomically
+from core.binary.addrmap import passthrough_fid
 from core.json import save_json
+from core.security.markdown_render import md_inline
 
 if TYPE_CHECKING:
     from .pipeline import BinaryAnalysisResult
@@ -124,6 +128,10 @@ def _rank_surfaces(context: dict[str, Any], graph: dict[str, Any]) -> list[dict[
         ranked.append({
             "id": surface_id,
             "name": surface.get("name"),
+            # Additive passthrough of the normalized function
+            # identity through the strict parser — the context map
+            # is disk-loadable, junk collapses to absent.
+            **passthrough_fid(surface),
             "category": surface.get("category"),
             "role": surface.get("role"),
             "is_sink": bool(surface.get("is_sink")),
@@ -225,6 +233,48 @@ def _rank_ingress(context: dict[str, Any]) -> list[dict[str, Any]]:
             "linked_sinks": sorted({str(flow.get("sink") or "") for flow in linked_flows if flow.get("sink")}),
         })
     return sorted(ranked, key=lambda item: (-item["score"], str(item.get("name") or "")))
+
+
+# Link-form breaker for _md_neutral: "](" is the load-bearing
+# adjacency of a markdown link; a backslash between the halves renders
+# literally and kills the link.
+_MD_LINK_RE = re.compile(r"\]\s*\(")
+
+
+def _md_neutral(value: Any) -> str:
+    """Render-site hardening for the string-anchor surfaces.
+
+    Sample strings and anchor function names are hostile-binary
+    content that STRUCTURALLY qualifies for selection, so printable
+    markdown metacharacters survive the capture-time
+    escape_nonprintable: a backtick breaks out of the wrapping
+    ``code-span`` table cells, and a ``[text](url)`` form renders a
+    live link in the prose inference slot. Neutralise both here.
+    Deliberately NOT folded into ``_md_escape``: that helper is a
+    one-home rewrite surface — a local helper composes with either
+    implementation.
+    """
+    text = _md_escape(value).replace("`", "'")
+    return _MD_LINK_RE.sub("]\\(", text)
+
+
+def _rank_string_anchors(context: dict[str, Any]) -> list[dict[str, Any]]:
+    """Order string-anchor leads by anchor density.
+
+    Anchor-dense functions (many diagnostic-shaped strings referenced)
+    are likely parsers/handlers — the only format-aware review signal
+    available on stripped binaries. Structure only; never a finding.
+    """
+    return sorted(
+        [
+            item for item in context.get("string_anchor_functions", [])
+            if isinstance(item, dict)
+        ],
+        key=lambda item: (
+            -int(item.get("anchor_string_count") or 0),
+            str(item.get("name") or ""),
+        ),
+    )
 
 
 def _rank_parser_boundaries(context: dict[str, Any]) -> list[dict[str, Any]]:
@@ -386,6 +436,7 @@ def build_investigation(
     ranked_classes = _rank_classes(context, graph)
     ranked_ingress = _rank_ingress(context)
     ranked_parser_boundaries = _rank_parser_boundaries(context)
+    ranked_string_anchors = _rank_string_anchors(context)
     facts: list[dict[str, Any]] = []
     inferences: list[dict[str, Any]] = []
     hypotheses: list[dict[str, Any]] = []
@@ -462,6 +513,13 @@ def build_investigation(
             tier="xref_backed",
             source="context-map.json",
         )
+    if ranked_string_anchors:
+        _fact(
+            facts,
+            f"Recovered {len(ranked_string_anchors)} anchor-dense function(s) referencing diagnostic-shaped strings.",
+            tier="xref_backed",
+            source="context-map.json",
+        )
     if context.get("fuzz_witnesses"):
         _fact(
             facts,
@@ -509,6 +567,27 @@ def build_investigation(
             "basis": ["class metadata inventory", "method-to-function bindings", "binary graph CALLS query"],
             "confidence": "candidate",
             "not_a_claim": "Class names and method bindings are structure, not a vulnerability verdict.",
+        })
+    if ranked_string_anchors:
+        lead = ranked_string_anchors[0]
+        inferences.append({
+            "id": f"INF-{len(inferences) + 1:03d}",
+            # The name is hostile-binary content embedded in a prose
+            # slot (rendered WITHOUT a wrapping code span) — neutralise
+            # markdown metacharacters here, at composition time.
+            "statement": (
+                f"{_md_neutral(lead.get('name'))} is a likely "
+                f"parser/handler lead: it references "
+                f"{int(lead.get('anchor_string_count') or 0)} "
+                "diagnostic-shaped string(s) — the densest string-anchor "
+                "concentration recovered."
+            ),
+            "basis": ["diagnostic-string selection (structural)", "radare2 string xrefs"],
+            "confidence": "candidate",
+            "not_a_claim": (
+                "Anchor density is structure, not a finding — it does not "
+                "prove attacker-controlled bytes reach the function."
+            ),
         })
     if ranked_parser_boundaries:
         lead = ranked_parser_boundaries[0]
@@ -598,6 +677,7 @@ def build_investigation(
             "ranked_classes": len(ranked_classes),
             "ranked_ingress": len(ranked_ingress),
             "parser_boundary_candidates": len(ranked_parser_boundaries),
+            "string_anchor_leads": len(ranked_string_anchors),
             "discovered_artifacts": len(artifacts),
         },
         "facts": facts,
@@ -607,6 +687,7 @@ def build_investigation(
         "ranked_classes": ranked_classes[:10],
         "ranked_ingress": ranked_ingress[:10],
         "ranked_parser_boundaries": ranked_parser_boundaries[:10],
+        "ranked_string_anchors": ranked_string_anchors[:10],
         "discovered_artifacts": artifacts,
         "component_topology": context.get("component_topology") or {},
         "fuzz_suitability": context.get("fuzz_suitability") or {},
@@ -617,13 +698,22 @@ def build_investigation(
             "A surface ranking is not a finding.",
             "A class name or selector is not proof of reachability.",
             "An xref-backed caller is not taint proof.",
+            "A string-anchor lead marks a likely parser or handler; it is not a finding and not taint proof.",
             "A sibling or helper declaration is not proof of a broken trust boundary.",
         ],
     }
 
 
 def _md_escape(value: Any) -> str:
-    return str(value).replace("|", "\\|").replace("\n", " ")
+    # Thin projection of the core.security.markdown_render one-home:
+    # a hostile binary controls symbol/import names end-to-end (r2's
+    # iij preserves raw ESC/BEL bytes from ELF dynstr) and this report
+    # is catted to operator terminals AND read by LLM agents in later
+    # passes. md_inline escapes control/bidi bytes, flattens newlines,
+    # entity-escapes in-slot structure (| and backtick — a raw
+    # backtick closed the wrapping code span and let **[..](..)**
+    # payloads go live), and strips autofetch markup.
+    return md_inline(value)
 
 
 def render_investigation_report(investigation: dict[str, Any]) -> str:
@@ -631,7 +721,7 @@ def render_investigation_report(investigation: dict[str, Any]) -> str:
     lines = [
         "# RAPTOR Binary Investigation",
         "",
-        f"Target: `{investigation['target_path']}`",
+        f"Target: `{_md_escape(str(investigation['target_path']))}`",
         f"SHA-256: `{investigation['binary_sha256']}`",
         f"Status: `{investigation['status']}`",
         "",
@@ -697,14 +787,43 @@ def render_investigation_report(investigation: dict[str, Any]) -> str:
     if not investigation["ranked_surfaces"]:
         lines.append("| - | none | - | 0 | No ranked surfaces recovered. |")
 
+    string_anchors = investigation.get("ranked_string_anchors") or []
+    if string_anchors:
+        lines.extend([
+            "",
+            "## String-anchor Leads (Not Findings)",
+            "",
+            "| Rank | Function | Anchor strings | Sample |",
+            "|---|---|---:|---|",
+        ])
+        for index, item in enumerate(string_anchors[:5], start=1):
+            samples = item.get("sample_strings") or []
+            sample = samples[0] if samples else ""
+            # _md_neutral, not _md_escape: names and samples are
+            # hostile content whose backticks would break out of the
+            # wrapping code-span cells (see the helper's docstring).
+            lines.append(
+                f"| {index} | `{_md_neutral(item.get('name'))}` | "
+                f"{int(item.get('anchor_string_count') or 0)} | "
+                f"`{_md_neutral(sample)}` |"
+            )
+        lines.append("")
+        lines.append(
+            "Anchor-dense functions are likely parsers or handlers; "
+            "this is structural evidence, not a finding and not taint proof."
+        )
+
     lines.extend(["", "## Facts", ""])
     lines.extend(
-        f"- [{item['evidence_tier']}] {item['statement']}"
+        f"- [{_md_escape(item['evidence_tier'])}] {_md_escape(item['statement'])}"
         for item in investigation["facts"]
     )
     lines.extend(["", "## Structural Inferences (Not Findings)", ""])
     if investigation["structural_inferences"]:
-        lines.extend(f"- {item['statement']} {item['not_a_claim']}" for item in investigation["structural_inferences"])
+        lines.extend(
+            f"- {_md_escape(item['statement'])} {_md_escape(item['not_a_claim'])}"
+            for item in investigation["structural_inferences"]
+        )
     else:
         lines.append("- No structural inferences were strong enough to surface.")
 
@@ -739,23 +858,32 @@ def render_investigation_report(investigation: dict[str, Any]) -> str:
             )
 
     lines.extend(["", "## Automatic Graph Queries", ""])
-    lines.extend(f"- `{item['kind']}`: {item['edge_count']} edge(s). {item['description']}" for item in investigation["automatic_graph_queries"])
+    lines.extend(
+        f"- `{_md_escape(item['kind'])}`: {item['edge_count']} edge(s). "
+        f"{_md_escape(item['description'])}"
+        for item in investigation["automatic_graph_queries"]
+    )
 
     lines.extend(["", "## Hypotheses Requiring Evidence", ""])
     if investigation["hypotheses"]:
         for item in investigation["hypotheses"]:
             missing = "; ".join(item["missing_evidence"])
-            lines.append(f"- `{item['id']}` {item['title']}. Missing: {missing}.")
+            lines.append(
+                f"- `{_md_escape(item['id'])}` {_md_escape(item['title'])}. "
+                f"Missing: {_md_escape(missing)}."
+            )
     else:
         lines.append("- No hypotheses generated from the current evidence.")
 
     if investigation.get("active_phases"):
         lines.extend(["", "## Active Phases", ""])
         for item in investigation["active_phases"]:
-            reason = f" Reason: {item['reason']}" if item.get("reason") else ""
+            reason = (f" Reason: {_md_escape(item['reason'])}"
+                      if item.get("reason") else "")
             lines.append(
-                f"- `{item['kind']}`: `{item['status']}`"
-                f" ({item.get('output_dir') or 'no output directory'}).{reason}"
+                f"- `{_md_escape(item['kind'])}`: `{_md_escape(item['status'])}`"
+                f" ({_md_escape(item.get('output_dir') or 'no output directory')})."
+                f"{reason}"
             )
 
     suitability = investigation.get("fuzz_suitability") or {}
@@ -764,12 +892,13 @@ def render_investigation_report(investigation: dict[str, Any]) -> str:
             "",
             "## Fuzz Strategy",
             "",
-            f"- Strategy: `{suitability.get('strategy')}`",
+            f"- Strategy: `{_md_escape(suitability.get('strategy'))}`",
             f"- Direct whole-target campaign recommended: {'yes' if suitability.get('direct_campaign_recommended') else 'no'}",
-            f"- Runtime collection: `{suitability.get('runtime_strategy', 'direct_process')}`",
-            f"- Runtime reason: {suitability.get('runtime_reason')}",
-            f"- Reason: {suitability.get('reason')}",
-            f"- Next step: {suitability.get('next_step')}",
+            f"- Runtime collection: "
+            f"`{_md_escape(suitability.get('runtime_strategy', 'direct_process'))}`",
+            f"- Runtime reason: {_md_escape(suitability.get('runtime_reason'))}",
+            f"- Reason: {_md_escape(suitability.get('reason'))}",
+            f"- Next step: {_md_escape(suitability.get('next_step'))}",
         ])
         candidates = suitability.get("harness_candidates") or []
         if candidates:
@@ -787,7 +916,7 @@ def render_investigation_report(investigation: dict[str, Any]) -> str:
             "| Priority | Action | Command | Why |",
             "|---:|---|---|---|",
         ])
-        lines.extend(f"| {item['priority']} | `{item['kind']}` | `{_md_escape(item['command'])}` | "
+        lines.extend(f"| {_md_escape(item['priority'])} | `{_md_escape(item['kind'])}` | `{_md_escape(item['command'])}` | "
                 f"{_md_escape(item['why'])} |" for item in investigation["priority_queue"])
     else:
         lines.append("- No follow-on actions queued.")
@@ -807,9 +936,11 @@ def write_investigation(
     out_dir = Path(out_dir).resolve()
     save_json(out_dir / "binary-investigation.json", investigation)
     report_path = out_dir / "binary-investigation-report.md"
-    report_path.write_text(
-        render_investigation_report(investigation),
-        encoding="utf-8",
+    # Atomic like the save_json above: a plain write_text at the
+    # predictable report name follows planted symlinks in the reused
+    # run dir.
+    write_text_atomically(
+        report_path, render_investigation_report(investigation),
     )
     with BinaryGraphStore(result.graph_path) as store:
         snapshot_id = store.latest_snapshot_id()

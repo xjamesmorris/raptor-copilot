@@ -122,7 +122,7 @@ def _write_refusal_log(
         logger.debug("refusal-log write failed", exc_info=True)
 
 
-def _resolve_provider(model: str):
+def _resolve_provider(model: str, run_dir: Path | None = None):
     """Provider resolution mirroring the cve-diff convention: family →
     provider, dispatcher when RAPTOR_LLM_SOCKET is up, Claude Code
     OAuth fallback for Anthropic-family models without an API key.
@@ -130,15 +130,24 @@ def _resolve_provider(model: str):
     Dispatcher-only families (Bedrock) self-serve an in-process
     dispatcher via the shared standalone-entry gate — pipeline runs get
     theirs from the launcher, but a bench/CLI invocation is its own
-    parent (the raptor-llm-ask precedent)."""
+    parent (the raptor-llm-ask precedent). ``run_dir`` (the run's audit
+    directory) places the dispatcher's L5 audit JSONL beside the run's
+    own traces; the gate keeps the in-memory fallback when the
+    directory does not exist yet."""
     from core.security.llm_family import provider_of
 
     provider_name = provider_of(model) or "anthropic"
     via_dispatcher = bool(os.environ.get("RAPTOR_LLM_SOCKET"))
+    # Direct SDK auth means EITHER first-party spelling (member sites
+    # of core.security.credential_env.ANTHROPIC_FIRST_PARTY_AUTH_VARS;
+    # CLAUDE_CODE_OAUTH_TOKEN excluded — the SDK does not read it): a
+    # bearer-token-only operator must not be demoted to the claudecode
+    # subprocess route.
     if (
         provider_name == "anthropic"
         and not via_dispatcher
         and not os.environ.get("ANTHROPIC_API_KEY")
+        and not os.environ.get("ANTHROPIC_AUTH_TOKEN")
     ):
         provider_name = "claudecode"
     mc = ModelConfig(provider=provider_name, model_name=model)
@@ -147,7 +156,8 @@ def _resolve_provider(model: str):
             ensure_route_for_model_configs,
         )
 
-        ensure_route_for_model_configs([mc], label="cve-env-core-backend")
+        ensure_route_for_model_configs(
+            [mc], label="cve-env-core-backend", run_dir=run_dir)
     except Exception as exc:  # noqa: BLE001 — create_provider surfaces it
         logger.warning("could not self-serve the LLM dispatcher: %s", exc)
     return create_provider(mc)
@@ -380,7 +390,7 @@ def build_core(
                 )
 
     try:
-        provider = _resolve_provider(model)
+        provider = _resolve_provider(model, run_dir=writer.ensure_run_root())
     except Exception as exc:  # noqa: BLE001 — surface as a typed outcome
         writer.write(
             cve_id=cve.cve_id,

@@ -94,10 +94,40 @@ def test_collect_addr2line_filters_no_line_info(monkeypatch):
     class _R:
         returncode = 0
         stdout = ("??:0\n/x/a.c:0\n/x/a.c:5\n"
-                  "/x/a.c:7 (discriminator 1)\n/x/b.c:?\n")
-    monkeypatch.setattr(collect_mod.subprocess, "run", lambda *a, **k: _R())
+                  "/x/a.c:7 (discriminator 1)\n/x/b.c:?\n").encode()
+    monkeypatch.setattr(collect_mod, "_sandboxed_run", lambda *a, **k: _R())
     out = collect_mod.collect_addr2line("bin", [1, 2, 3, 4, 5])
     assert out == {"/x/a.c": {5, 7}}
+
+
+def test_collectors_refuse_when_sandbox_cannot_engage(monkeypatch):
+    # SandboxSetupError = the tool NEVER ran; the collectors must fail
+    # closed to "no coverage" rather than degrade to an unsandboxed run.
+    from core.sandbox.errors import SandboxSetupError
+
+    def _refuse(*a, **k):
+        raise SandboxSetupError("no enforcing layer")
+    import core.sandbox
+    monkeypatch.setattr(core.sandbox, "run", _refuse)
+    assert collect_mod.collect_addr2line("bin", [1]) == {}
+    assert collect_mod.collect_llvm("bin", "prof") == {}
+
+
+def test_collect_gcov_oversize_report_skipped(tmp_path, monkeypatch):
+    # The size gate acts on the redirected FILE before it is read.
+    (tmp_path / "x.gcda").write_bytes(b"")
+    monkeypatch.setattr(collect_mod, "_MAX_GCOV_STDOUT", 8)
+
+    def _fake_run(argv, *, target, env, output=None, cwd=None,
+                  readable_paths=None):
+        Path(env["RAPTOR_GCOV_OUT"]).write_text(
+            "        -:    0:Source:big.c\n        1:    1:x\n")
+
+        class _R:
+            returncode = 0
+        return _R()
+    monkeypatch.setattr(collect_mod, "_sandboxed_run", _fake_run)
+    assert collect_mod.collect_gcov(tmp_path) == {}
 
 
 def _make_drcov(path, modpath, base, bbs):

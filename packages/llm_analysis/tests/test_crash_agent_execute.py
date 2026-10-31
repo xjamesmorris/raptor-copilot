@@ -286,3 +286,85 @@ def test_execute_sanitizers_flows_to_compile_and_execute(
     assert captured_kwargs.get("sanitizers") == ["address", "undefined"]
     assert crash.execute_outcome == WitnessOutcome.SANITIZER_REPORT.value
     assert crash.execute_detail["sanitizer"] == "asan"
+
+
+# ----------------------------------------------------------------------
+# Containment-floor refusal — record-then-raise on the crash record
+# ----------------------------------------------------------------------
+
+
+def _floor_error():
+    from core.sandbox.errors import SandboxFloorError
+    from core.sandbox.tiers import ContainmentTier
+
+    return SandboxFloorError(
+        "sandbox containment floor violated",
+        "install uidmap; re-run",
+        achievable=ContainmentTier.LANDLOCK_ONLY,
+        floor=ContainmentTier.MOUNT_NS,
+        setup_category="U",
+    )
+
+
+def _patch_raising_oracle(monkeypatch, exc):
+    import packages.llm_analysis.exploit_verify as ev_mod
+
+    def fake(*args, **kwargs):
+        raise exc
+
+    monkeypatch.setattr(ev_mod, "compile_and_execute", fake)
+
+
+def test_floor_refusal_stamps_crash_record_and_reraises(
+        tmp_path, monkeypatch):
+    import pytest
+
+    from core.sandbox.errors import SandboxFloorError
+
+    _patch_raising_oracle(monkeypatch, _floor_error())
+    binary = tmp_path / "target"
+    binary.write_bytes(b"ELF")
+    agent = _stub_agent(tmp_path, binary)
+    crash = _make_crash_context()
+    with pytest.raises(SandboxFloorError):
+        agent._compile_and_execute_exploit(crash, "// exploit\n")
+    assert crash.execute_outcome == WitnessOutcome.UNKNOWN.value
+    assert crash.execute_detail["status"] == "unverifiable_environment"
+    assert crash.execute_detail["floor"] == "mount-ns"
+    assert crash.execute_detail["achievable"] == "landlock"
+    assert crash.execute_detail["remedies"] == "install uidmap; re-run"
+    assert crash.execute_detail["failure_mode"] == "constrained_by_env"
+
+
+def test_plain_setup_error_propagates_unstamped(tmp_path, monkeypatch):
+    """Only the typed floor subtype maps — a generic SandboxSetupError
+    keeps its flight path and the crash record stays untouched."""
+    import pytest
+
+    from core.sandbox.errors import SandboxFloorError, SandboxSetupError
+
+    _patch_raising_oracle(
+        monkeypatch, SandboxSetupError("engage failed", "fix"))
+    binary = tmp_path / "target"
+    binary.write_bytes(b"ELF")
+    agent = _stub_agent(tmp_path, binary)
+    crash = _make_crash_context()
+    with pytest.raises(SandboxSetupError) as excinfo:
+        agent._compile_and_execute_exploit(crash, "// exploit\n")
+    assert not isinstance(excinfo.value, SandboxFloorError)
+    assert crash.execute_outcome is None
+    assert crash.execute_detail == {}
+
+
+def test_ordinary_exception_propagates_unstamped(tmp_path, monkeypatch):
+    import pytest
+
+    _patch_raising_oracle(monkeypatch, ValueError("boom"))
+    binary = tmp_path / "target"
+    binary.write_bytes(b"ELF")
+    agent = _stub_agent(tmp_path, binary)
+    crash = _make_crash_context()
+    with pytest.raises(ValueError):
+        agent._compile_and_execute_exploit(crash, "// exploit\n")
+    assert crash.execute_outcome is None
+    assert crash.execute_detail == {}

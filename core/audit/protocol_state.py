@@ -47,12 +47,14 @@ never the premise. Grade accordingly:
 
 The channel-local field index rides regex extraction (the
 ``lifecycle_collector.collect_field_sites_from_source`` shape) plus
-per-function attribution; when the shared field census
-(``core/audit/field_census.py``, phase A of this programme) lands, it
-supplies the same records with rhs-provenance tiers — fields only
-added, this module's consumers read dicts. Guard-dependent verdicts
-report ``census-degraded`` when the CFG leg is unavailable rather
-than guessing. No LLM calls, no subprocesses.
+per-function attribution. The shared field census
+(``core/audit/field_census.py``, used by ptr_lifecycle) exists and
+offers a tree-sitter tier plus alias-assignment contexts this
+regex-tier index lacks; migrating this module onto
+``build_field_census`` is future work — until then the two censuses
+are maintained separately. Guard-dependent verdicts report
+``census-degraded`` when the CFG leg is unavailable rather than
+guessing. No LLM calls, no subprocesses.
 """
 
 from __future__ import annotations
@@ -68,7 +70,8 @@ from dataclasses import field as dc_field
 from pathlib import Path
 from typing import Any
 
-from core.json import dumps_artifact
+from core.json import save_json
+from core.source.lines import split_lines
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +126,12 @@ _PROTOCOL_STATE_HYPOTHESIS_RE = re.compile(
     r"(?:(?:protocol|state)\s+(?:invariant|machine)"
     r"|never\s+sent|not\s+(?:previously\s+)?sent"
     r"|out.of.window|monoton"
-    r"|acknowledg\w+.{0,40}(?:unsent|never|higher\s+than)"
+    # Canonical-split gap (``\w+.{0,40}`` -> one bounded probe per
+    # split point): the ambiguous spelling re-splits against every
+    # stem repeat inside one long word — quadratic on hostile text.
+    # Same language; only a stem buried more than 64 word-characters
+    # before the gap stops matching.
+    r"|acknowledg(?:\w.{0,40}|\w{1,64}.{40})(?:unsent|never|higher\s+than)"
     r"|peer.{0,40}(?:controls?|sets?|poisons?).{0,30}"
     r"(?:state|counter|sequence|window))",
     re.IGNORECASE | re.DOTALL,
@@ -158,8 +166,24 @@ _FIELD_ACCESS_RE = re.compile(
 # a multi-level chain — the terminal field's write was censused as a
 # READ of the middle segment, leaving the written field with zero
 # write sites (vacuous preservation from census blindness).
+# (?<![\w.]) pins the scan to chain starts: an unpinned leading
+# identifier re-reads the same hostile run from every offset —
+# quadratic per line.  Mid-word starts only ever fabricated a token
+# (the "xff" tail of a hex literal); a post-dot start is a chain
+# tail the pinned match from the true head already covers.
 _FIELD_CHAIN_RE = re.compile(
-    r"([A-Za-z_]\w*)((?:\s*(?:->|\.)\s*[A-Za-z_]\w*)+)",
+    r"(?<![\w.])([A-Za-z_]\w*)((?:\s*(?:->|\.)\s*[A-Za-z_]\w*)+)",
+)
+# Companion for chains whose receiver ends in a subscript or call
+# (``arr[0].fld.sub``, ``bufs[i].hdr.len``): the pinned pattern cannot
+# span ``[...]``/``(...)``, so the chain AFTER the closing bracket
+# would go uncensused.  Dot connector only — after ``->`` the pin
+# above already admits the identifier (``>`` is outside its class),
+# so a wider companion would double-count.  The closer lookbehind
+# keeps attempts sparse and the bounded chain keeps each linear.
+_FIELD_CHAIN_AFTER_CLOSER_RE = re.compile(
+    r"(?<=[\])])\s*\.\s*([A-Za-z_]\w*)"
+    r"((?:\s*(?:->|\.)\s*[A-Za-z_]\w*){1,32})",
 )
 _CHAIN_IDENT_RE = re.compile(r"[A-Za-z_]\w*")
 # Write tails: simple/compound assignment (all C compound operators —
@@ -364,9 +388,10 @@ def build_state_field_index(
                     return name, ()
             return "", ()
 
-        for line_no, raw in enumerate(source.splitlines(), start=1):
+        for line_no, raw in enumerate(split_lines(source), start=1):
             code = raw.split("//", 1)[0]
-            for m in _FIELD_CHAIN_RE.finditer(code):
+            for m in (*_FIELD_CHAIN_RE.finditer(code),
+                      *_FIELD_CHAIN_AFTER_CLOSER_RE.finditer(code)):
                 idents = _CHAIN_IDENT_RE.findall(m.group(0))
                 tail = code[m.end():]
                 wm = _WRITE_TAIL_RE.match(tail)
@@ -437,9 +462,12 @@ def _classify_rhs(rhs: str) -> str:
     rhs = rhs.strip()
     if not rhs:
         return "unknown"
-    if rhs in ("NULL", "nullptr", "0", "NULL;"):
-        return "literal_null" if not rhs.rstrip(";").isdigit() \
-            else "literal_const"
+    # "0" deliberately absent: the numeric-literal fullmatch below
+    # already classifies it literal_const, which is what the old
+    # inline conditional here resolved to.  No semicolon variants:
+    # the sole producer splits the statement on ";" before calling.
+    if rhs in ("NULL", "nullptr"):
+        return "literal_null"
     if re.fullmatch(r"\d+[uUlL]*", rhs.rstrip(";")):
         return "literal_const"
     m = re.match(r"([A-Za-z_]\w*)\s*\(", rhs)
@@ -458,7 +486,7 @@ def _local_call_sources(source: str, span: tuple[int, int] | None,
                         ) -> dict[str, str]:
     """One-hop local provenance: ``v = decode_ack_largest(frame)``
     → ``{"v": "decode_ack_largest"}`` within the function span."""
-    lines = source.splitlines()
+    lines = split_lines(source)
     seg = lines[span[0] - 1:span[1]] if span else lines
     out: dict[str, str] = {}
     assign_re = re.compile(
@@ -1053,6 +1081,7 @@ def run_protocol_state_check(
     domain_model: dict[str, Any] | None = None,
     invariant: str | None = None,
     source_texts: dict[str, str] | None = None,
+    state_index: dict[str, Any] | None = None,
     budget_s: float = INVARIANT_BUDGET_S,
 ) -> StateEvidence:
     """Adjudicate one protocol-state hypothesis.
@@ -1078,7 +1107,13 @@ def run_protocol_state_check(
             REASON_HYPOTHESIS_UNBINDABLE,
             f"no sources readable under {target_path}",
         )
-    index = build_state_field_index(source_texts)
+    # *state_index* threads the orchestrator's per-run memo — the
+    # index is a pure function of the source texts and was rebuilt on
+    # every hypothesis dispatch before.
+    index = (
+        state_index if state_index is not None
+        else build_state_field_index(source_texts)
+    )
     state_vocab = learned_state_fields(domain_model)
 
     if invariant is None:
@@ -1351,7 +1386,7 @@ def run_protocol_state_prepass(
     try:
         from .invariant_smt import extract_invariants
     except ImportError:
-        extract_invariants = None
+        extract_invariants = None  # type: ignore[assignment]
     if extract_invariants is not None:
         for entry in (domain_model or {}).get("invariants") or []:
             if telemetry["budget_exceeded"]:
@@ -1417,11 +1452,15 @@ def run_protocol_state_prepass(
     telemetry["wall_time_s"] = round(time.monotonic() - t0, 3)
     if out_dir is not None and (findings or leads):
         try:
-            path = Path(out_dir) / "protocol-state.json"
-            path.write_text(dumps_artifact(
+            # Atomic write (tempfile + rename via save_json), like the
+            # sibling prepasses: a torn write here surfaces as
+            # "protocol-state.json exists but fails to parse" at
+            # /review time.
+            save_json(
+                Path(out_dir) / "protocol-state.json",
                 {"findings": findings, "leads": leads,
-                 "telemetry": telemetry}, indent=1,
-            ))
+                 "telemetry": telemetry},
+            )
         except Exception:
             logger.debug("protocol-state.json write failed",
                          exc_info=True)

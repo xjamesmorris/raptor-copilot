@@ -120,6 +120,18 @@ class TestDeepAnalyse:
         assert "\x1b" not in a["rationale"]
         assert len(a["rationale"]) <= deep_mod._MAX_RATIONALE_CHARS
 
+    def test_fenced_model_reply_parses(self, tmp_path):
+        # Models fence their JSON even when told not to; the parse
+        # must see the payload, not the backticks.
+        report = _suspicious_run(tmp_path)
+        fenced = "```json\n" + _reply() + "\n```"
+        assessments, note, dropped = deep_mod._parse_assessments(
+            fenced, report,
+        )
+        assert len(assessments) == 1
+        assert dropped == 0
+        assert note == "looks deliberate"
+
     def test_garbage_model_output_yields_empty_assessments(self, tmp_path):
         _suspicious_run(tmp_path)
         client = _FakeClient("I cannot help with that.")
@@ -258,3 +270,41 @@ class TestDenialContextProvenance:
         }))
         lines = deep_mod._denial_context(tmp_path, allow_legacy=True)
         assert lines and "make -j4" in lines[0]
+
+
+class TestDeepCliTerminalScrub:
+    """--deep prints LLM-authored free text; ESC/OSC/C1/bidi bytes in
+    it must be escaped at the emission site regardless of what the
+    producer guaranteed."""
+
+    HOSTILE = "\x1b]0;pwned\x07\x9b2J‮evil"
+
+    def test_hostile_deep_fields_escaped(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(
+            triage_mod, "triage_run",
+            lambda target, allow_legacy=False: {
+                "verdict": triage_mod.VERDICT_NOTABLE,
+                "signals": [], "caveats": [],
+            },
+        )
+        hostile = self.HOSTILE
+        monkeypatch.setattr(
+            deep_mod, "deep_analyse",
+            lambda target: {
+                "model": "m",
+                "assessments": [{
+                    "signal_type": f"sig{hostile}",
+                    "judgement": f"judge{hostile}",
+                    "confidence": 0.5,
+                    "rationale": f"because {hostile}",
+                }],
+                "overall_note": f"note {hostile}",
+            },
+        )
+        rc = triage_mod._cli_main([str(tmp_path), "--deep"])
+        out = capsys.readouterr().out
+        assert rc == 3  # notable — deep never changes the exit code
+        assert "Deep assessment" in out
+        assert "because" in out and "note" in out
+        for raw in ("\x1b", "\x07", "\x9b", "‮"):
+            assert raw not in out

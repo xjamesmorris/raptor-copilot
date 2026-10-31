@@ -4,10 +4,77 @@ Git Client for local forensic analysis.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from typing import Any
 
 from ..schema.common import EvidenceSource
+
+# SHAs and refs reaching this client are harvested from
+# attacker-authored sources (GH Archive payloads, vendor reports,
+# archived pages), and git treats a leading-dash positional as an
+# option — e.g. a "sha" of `--output=/path` makes `git show` write an
+# arbitrary file. Two layers, both required: validate the value shape
+# here, and pass `--end-of-options` before every positional revision
+# in the callers so git never option-parses one (supported since git
+# 2.24).
+
+# Full or abbreviated hex object name; 64 covers SHA-256 repos.
+_HEX_SHA_RE = re.compile(r"^[0-9a-fA-F]{4,64}$")
+
+# Characters git check-ref-format forbids anywhere in a refname.
+_REF_FORBIDDEN_CHARS = set(' ~^:?*[\\')
+
+
+def _validate_sha(sha: str) -> str:
+    if not _HEX_SHA_RE.fullmatch(sha):
+        msg = f"invalid git object name (expected 4-64 hex chars): {sha!r}"
+        raise ValueError(msg)
+    return sha
+
+
+def _validate_ref(ref: str) -> str:
+    """Refuse refs that violate git check-ref-format rules (plus the
+    option-shape leading dash). Conservative: symbolic names like HEAD
+    and one-level branch names pass; revision operators (~, ^, :) and
+    anything option- or traversal-shaped fail closed."""
+    ok = (
+        bool(ref)
+        and not ref.startswith(("-", "/"))
+        and not ref.endswith(("/", "."))
+        and ref != "@"
+        and "@{" not in ref
+        and ".." not in ref
+        and "//" not in ref
+    )
+    if ok:
+        for ch in ref:
+            if ord(ch) < 0x20 or ord(ch) == 0x7F or ch in _REF_FORBIDDEN_CHARS:
+                ok = False
+                break
+    if ok:
+        for component in ref.split("/"):
+            if component.startswith(".") or component.endswith(".lock"):
+                ok = False
+                break
+    if not ok:
+        msg = f"invalid git ref: {ref!r}"
+        raise ValueError(msg)
+    return ref
+
+
+def _validate_revision(rev: str) -> str:
+    """A commit-ish argument: a hex object name or a symbolic name
+    (``HEAD``, a branch/tag) that passes the ref rules. Existing
+    callers pass either, so both stay accepted; option-shaped and
+    otherwise hostile values fail closed."""
+    if _HEX_SHA_RE.fullmatch(rev):
+        return rev
+    try:
+        return _validate_ref(rev)
+    except ValueError:
+        msg = f"invalid git revision (not a hex object name or ref): {rev!r}"
+        raise ValueError(msg) from None
 
 # Per-invocation `-c` overrides that defang malicious settings the
 # investigated REPO can plant in its own .git/config — env vars alone
@@ -126,7 +193,10 @@ class GitClient:
         # %P: parent hashes
         # %B: raw body (unwrapped subject and body)
         format_str = "%H%n%an%n%ae%n%aI%n%cn%n%ce%n%cI%n%P%n%B"
-        output = self._run("show", "-s", f"--format={format_str}", sha)
+        output = self._run(
+            "show", "-s", f"--format={format_str}",
+            "--end-of-options", _validate_revision(sha),
+        )
         lines = output.split("\n")
 
         return {
@@ -146,7 +216,10 @@ class GitClient:
         # --no-commit-id: output only the changes
         # --name-status: show only names and status of changed files
         # -r: recursive
-        output = self._run("diff-tree", "--no-commit-id", "--name-status", "-r", sha)
+        output = self._run(
+            "diff-tree", "--no-commit-id", "--name-status", "-r",
+            "--end-of-options", _validate_revision(sha),
+        )
         files = []
         for line in output.split("\n"):
             if line:
@@ -163,11 +236,12 @@ class GitClient:
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         """Get commit log."""
-        args = ["log", f"--max-count={limit}", "--format=%H|%an|%ae|%aI|%s", ref]
+        args = ["log", f"--max-count={limit}", "--format=%H|%an|%ae|%aI|%s"]
         if since:
             args.append(f"--since={since}")
         if until:
             args.append(f"--until={until}")
+        args.extend(["--end-of-options", _validate_ref(ref)])
 
         output = self._run(*args)
         commits = []
@@ -202,4 +276,6 @@ class GitClient:
 
     def cat_file(self, object_sha: str) -> str:
         """Get raw content of an object."""
-        return self._run("cat-file", "-p", object_sha)
+        return self._run(
+            "cat-file", "-p", "--end-of-options", _validate_revision(object_sha),
+        )

@@ -84,13 +84,28 @@ def _items_by_key(file_info: dict[str, Any]) -> dict[tuple, str | None]:
     """``(name, kind) → span_hash`` for a file record's items.
 
     First occurrence wins for duplicate names (overloads); interstitial
-    residue is skipped — it is synthetic, not a reviewable unit.
+    residue is skipped — it is synthetic, not a reviewable unit — EXCEPT
+    spans stamped ``script_handler: true``: those are the reviewable
+    units of script-per-file files (classic PHP request handlers), so
+    the new-code / carry-forward diff must track them like functions.
+    A missing stamp keeps the old skip on that SIDE only. OLD side
+    unstamped (the normal pre-stamp-inventory case): the stamped new
+    side's span has no old key and reports as added — the over-boost
+    direction. NEW side unstamped is the one direction that hides a
+    changed span from this diff entirely (neither added nor changed);
+    it is reachable only by downgrading the builder or hand-editing
+    the run-dir JSON — every forward build stamps — and this diff
+    feeds a priority signal, not a verdict gate, so the residual is
+    accepted and named rather than guarded.
     """
+    from .script_handler import script_handler_stamp
+
     out: dict[tuple, str | None] = {}
     for item in file_info.get('items', file_info.get('functions', [])) or []:
         name = item.get('name')
         kind = item.get('kind', 'function')
-        if not name or kind == 'interstitial':
+        if not name or (kind == 'interstitial'
+                        and script_handler_stamp(item) is not True):
             continue
         out.setdefault((name, kind), item.get('span_hash') or None)
     return out
@@ -106,7 +121,12 @@ def function_level_diff(
     only when its hash differs. Items missing a hash on either side
     (pre-hash inventories) degrade conservatively to *changed* — this
     feeds a priority signal, so over-boosting beats silently missing
-    new code.
+    new code. The same FN-safe direction absorbs extractor-path span
+    drift: for a split return type (``static char *\\nfoo(...)``) the
+    C regex path stamps ``line_start`` at the name line while
+    tree-sitter stamps the type line, so a file flipping between
+    grammar-present and grammar-absent environments reports such
+    functions as changed — over-boost, never suppression.
 
     Only files reported added/modified by :func:`compare_inventories`
     are examined. Returns ``{"functions_added": [...],

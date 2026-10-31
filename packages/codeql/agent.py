@@ -27,7 +27,12 @@ from core.config import RaptorConfig
 from core.json import load_json_bounded, save_json
 from core.logging import get_logger
 from core.run.output import unique_run_suffix as _unique_run_suffix
-from core.run.safe_io import safe_run_mkdir
+from core.run.safe_io import (
+    bound_artifact_references_in_record,
+    bounded_artifact_reference_fields,
+    safe_run_mkdir,
+    sanitise_artifact_reference,
+)
 from core.sandbox import SANDBOX_ENGAGE_EXIT_CODE, SandboxSetupError
 from packages.codeql.database_manager import (
     AUTOBUILD_LANGUAGES,
@@ -36,7 +41,11 @@ from packages.codeql.database_manager import (
     DatabaseResult,
 )
 from packages.codeql.language_detector import LanguageDetector, LanguageInfo
-from packages.codeql.query_runner import QueryResult, QueryRunner
+from packages.codeql.query_runner import (
+    QueryResult,
+    QueryRunner,
+    summarize_iris_enrichment_health,
+)
 
 logger = get_logger()
 
@@ -62,6 +71,13 @@ _LANGUAGE_ALIASES = {
     "kt": "kotlin",
     "py": "python",
 }
+
+# These languages are extracted directly by CodeQL. BuildDetector still
+# records npm/yarn/pnpm/Cargo for its other consumers, but CodeQL must
+# not turn a package manifest into an
+# implicit dependency install. A non-empty operator-supplied build command
+# is the only opt-in to traced repository build logic for these languages.
+_NO_BUILD_LANGUAGES = frozenset({"javascript", "typescript", "rust"})
 
 
 def _normalise_language(name: str) -> str:
@@ -128,6 +144,10 @@ class CodeQLWorkflowResult:
     total_findings: int
     sarif_files: list[str]
     errors: list[str]
+    # IRIS LocalFlowSource is additive enrichment. Its health is
+    # reported separately so an install warning or enrichment query
+    # failure cannot rewrite a successful standard-CodeQL result.
+    enrichment_health: dict | None = None
     # Per-(language, CWE) standard-vs-IRIS finding counts, present only
     # when the standard pass ran with threat models AND the IRIS pass
     # produced a SARIF — data for deciding whether IRIS queries are
@@ -142,6 +162,13 @@ class CodeQLWorkflowResult:
     #: Source-wrapper summaries staged for the standard suite
     #: (wrappers found, rows emitted, refusal counts).
     source_summaries: dict | None = None
+
+    #: Taint-pack models-as-data augmentation record: the per-language
+    #: cells of taint-mad-augmentation.json (which sink kinds/classes/
+    #: CWEs the standard suites were given rows for). Present only
+    #: when the --taint-crossfile flag family enabled the pass.
+    #: Additive; consumers tolerate its absence.
+    taint_mad: dict | None = None
 
     # Languages whose database creation executed repo build logic
     # (explicit command or CodeQL autobuild) WITHOUT the operator's
@@ -189,21 +216,74 @@ class CodeQLWorkflowResult:
             lang: {
                 'success': result.success,
                 'language': result.language,
-                'database_path': str(result.database_path),
-                'sarif_path': str(result.sarif_path) if result.sarif_path else None,
+                'database_path': sanitise_artifact_reference(
+                    result.database_path,
+                ),
+                'sarif_path': (
+                    sanitise_artifact_reference(result.sarif_path)
+                    if result.sarif_path else None
+                ),
                 'findings_count': result.findings_count,
                 'duration_seconds': result.duration_seconds,
                 'errors': result.errors,
                 'suite_name': result.suite_name,
                 'queries_executed': result.queries_executed,
+                'enrichment_health': bound_artifact_references_in_record(
+                    result.enrichment_health,
+                ),
             }
             for lang, result in self.analyses_completed.items()
         }
 
-        # CRITICAL: Convert sarif_files (type annotation says List[str], but agent.py:485 creates List[Path])
-        data['sarif_files'] = [str(p) if isinstance(p, Path) else p for p in self.sarif_files]
+        # CRITICAL: Convert sarif_files — the type annotation says
+        # List[str], but the workflow appends Path objects.
+        sarif_fields = bounded_artifact_reference_fields(self.sarif_files)
+        data['sarif_files'] = sarif_fields["artifacts"]
+        if sarif_fields.get("artifact_references_truncated"):
+            data["sarif_file_references_truncated"] = True
+            data["sarif_file_references_omitted"] = sarif_fields[
+                "artifact_references_omitted"
+            ]
+        data["enrichment_health"] = bound_artifact_references_in_record(
+            self.enrichment_health,
+        )
 
         return data
+
+
+def _collapse_shared_extractor_languages(
+    detected: dict[str, "LanguageInfo"],
+) -> None:
+    """Collapse detected languages that share one extractor AND one
+    query pack into a single database build.
+
+    javascript + typescript both resolve to the javascript extractor
+    and codeql/javascript-queries: keeping both built two databases
+    over the same tree and duplicated every finding in the merged
+    SARIF set. The typescript entry's evidence folds into the
+    javascript one so reporting still reflects both. (kotlin/java is
+    NOT collapsed here: detection never emits kotlin and java for
+    the same files, so the duplicate-DB shape cannot arise.)
+    """
+    if "javascript" in detected and "typescript" in detected:
+        logger.info(
+            "javascript + typescript detected — one javascript "
+            "database covers both (same extractor and query pack); "
+            "collapsing to a single build",
+        )
+        ts_info = detected.pop("typescript")
+        js_info = detected["javascript"]
+        js_info.file_count += ts_info.file_count
+        js_info.extensions_found |= ts_info.extensions_found
+        js_info.confidence = max(js_info.confidence, ts_info.confidence)
+
+
+def _workflow_success(analysis_results: dict[str, QueryResult]) -> bool:
+    """Workflow success means at least one language's ANALYSIS
+    succeeded. The previous any-SARIF rule let additive lanes (IRIS,
+    curated packs, learned models) turn a run whose every analyze
+    failed into success=True / exit 0."""
+    return any(r.success for r in analysis_results.values())
 
 
 class CodeQLAgent:
@@ -300,6 +380,18 @@ class CodeQLAgent:
         """
         errors = []
 
+        # Normalise build-command keys at the same boundary as explicit
+        # language names. raptor_codeql passes the spelling the operator
+        # supplied (for example "js"), while the routing loop below only
+        # sees canonical names ("javascript"). Without this, an explicit
+        # --build-command could be mistaken for an implicit build and the
+        # JavaScript no-build route would silently discard the opt-in.
+        if build_commands:
+            build_commands = {
+                _normalise_language(language): command
+                for language, command in build_commands.items()
+            }
+
         sage_build_cmd: str | None = None
         sage_build_langs: str | None = None
         try:
@@ -372,43 +464,11 @@ class CodeQLAgent:
                     )
             else:
                 logger.info("Auto-detecting languages...")
-                detected = self.language_detector.detect_languages(min_files=min_files)
-                detected = self.language_detector.filter_codeql_supported(detected)
+                detected = self.language_detector.detect_languages_tiered(
+                    min_files=min_files, codeql_filter=True,
+                )
 
-                # Small-target retry. The default min_files=3 is a
-                # noise floor for monorepos but a footgun on tiny
-                # targets (single-file fixtures, minimal repros) —
-                # the detector sees the file, classifies it, then
-                # silently filters it out. If the first pass
-                # returns empty, drop the floor to 1 and warn so
-                # the operator knows we widened the criterion.
-                if not detected and min_files > 1:
-                    logger.warning(
-                        "No languages met min_files=%s threshold; retrying with min_files=1 (small target — single-file fixtures and minimal repros land here)",
-                        min_files
-                    )
-                    detected = self.language_detector.detect_languages(min_files=1)
-                    detected = self.language_detector.filter_codeql_supported(detected)
-
-                # Confidence-gate fallback. The min_confidence threshold
-                # in detect_languages defends against stray manifests
-                # (e.g. a `pom.xml` in a docs example dir) but is also
-                # tripped by trees with real source code and zero build
-                # files — multi-language minimal repros, fixture trees,
-                # vendored reference snapshots. The two retry
-                # tiers above both gate on confidence; if both returned
-                # empty, fall back to a file-count-only floor and log
-                # loud per-language WARNINGs so the operator knows the
-                # scan is running on low-confidence detection. Better
-                # than the silent-skip footgun of the pre-fix path.
-                if not detected:
-                    logger.warning(
-                        "No languages cleared the confidence gate after "
-                        "two retries; falling back to file-count floor "
-                        "(low-confidence detection — verify results)"
-                    )
-                    detected = self.language_detector.detect_languages_floor(floor=2)
-                    detected = self.language_detector.filter_codeql_supported(detected)
+            _collapse_shared_extractor_languages(detected)
 
             if not detected:
                 error = "No CodeQL-supported languages detected"
@@ -445,6 +505,21 @@ class CodeQLAgent:
                     # Operator explicitly opted this language into a
                     # traced build (asserts trust in the repo).
                     traced_languages.add(lang)
+                if (
+                    lang in _NO_BUILD_LANGUAGES
+                    and not (build_commands and lang in build_commands)
+                ):
+                    # Preserve descriptive build evidence without turning
+                    # it into an implicit package install or lifecycle script.
+                    logger.info(
+                        "%s: CodeQL no-build extraction — package managers "
+                        "and repository lifecycle scripts will not execute",
+                        lang,
+                    )
+                    language_build_map[lang] = (
+                        self.build_detector.generate_no_build_config(lang)
+                    )
+                    continue
                 if (
                     lang in BUILDLESS_DEFAULT_LANGUAGES
                     and lang not in traced_languages
@@ -567,39 +642,47 @@ class CodeQLAgent:
             logger.info("PHASE 3: DATABASE CREATION")
             logger.info("%s", '=' * 70)
 
-            db_results = self.database_manager.create_databases_parallel(
-                self.repo_path,
-                language_build_map,
-                force=force_db_creation,
-                audit_run_dir=self.out_dir,
-                traced_languages=traced_languages,
-            )
-
-            # Clean up synthesised build artifacts. Per-path try
-            # / except so one cleanup failure doesn't abort the
-            # whole sweep, and `is_dir()` / `is_file()` short-
-            # circuit if the path was already removed (idempotent
-            # under retry). `is_*` follows symlinks by default —
-            # use `follow_symlinks=False`-equivalent behaviour
-            # via `is_symlink()` short-circuit so we DELETE the
-            # symlink itself rather than its target (which could
-            # be in the user's repo or somewhere else entirely
-            # that we never put data into).
-            import shutil
-            for bs in language_build_map.values():
-                for p in getattr(bs, 'cleanup_paths', None) or []:
-                    try:
-                        # Symlink → unlink the link, never follow.
-                        if p.is_symlink():
-                            p.unlink()
-                        elif p.is_dir():
-                            shutil.rmtree(p)
-                        elif p.is_file():
-                            p.unlink()
-                    except OSError as e:
-                        logger.debug(
-                            "cleanup of %s failed: %s — continuing", p, e,
-                        )
+            try:
+                db_results = self.database_manager.create_databases_parallel(
+                    self.repo_path,
+                    language_build_map,  # type: ignore[arg-type]
+                    force=force_db_creation,
+                    audit_run_dir=self.out_dir,
+                    traced_languages=traced_languages,
+                )
+            finally:
+                # Clean up synthesised build artifacts. In a `finally`
+                # because the cleanup paths live UNDER the scanned
+                # repo (.raptor_build_* script + build dir): an
+                # exception escaping database creation would otherwise
+                # leak them into the target tree, and the next scan
+                # inventories RAPTOR's own build script as project
+                # source. Per-path try / except so one cleanup failure
+                # doesn't abort the whole sweep, and `is_dir()` /
+                # `is_file()` short-circuit if the path was already
+                # removed (idempotent under retry). `is_*` follows
+                # symlinks by default — use
+                # `follow_symlinks=False`-equivalent behaviour via
+                # `is_symlink()` short-circuit so we DELETE the
+                # symlink itself rather than its target (which could
+                # be in the user's repo or somewhere else entirely
+                # that we never put data into).
+                import shutil
+                for bs in language_build_map.values():
+                    for p in getattr(bs, 'cleanup_paths', None) or []:
+                        try:
+                            # Symlink → unlink the link, never follow.
+                            if p.is_symlink():
+                                p.unlink()
+                            elif p.is_dir():
+                                shutil.rmtree(p)
+                            elif p.is_file():
+                                p.unlink()
+                        except OSError as e:
+                            logger.debug(
+                                "cleanup of %s failed: %s — continuing",
+                                p, e,
+                            )
 
             # Check for failures
             successful_dbs = {
@@ -657,6 +740,15 @@ class CodeQLAgent:
             source_summaries_cell = self._run_source_summaries_pass(
                 successful_dbs)
 
+            # Taint-pack models-as-data augmentation (default off; the
+            # --taint-crossfile flag family enables it): the shipped
+            # taint seed packs plus the project's operator-grade IRIS
+            # rows are staged into the standard python/javascript
+            # suites, and the run records exactly which sink surfaces
+            # were augmented. Additive detection only.
+            taint_mad_cell = self._run_taint_pack_models_pass(
+                successful_dbs)
+
             analysis_results = self.query_runner.analyze_all_databases(
                 successful_dbs,
                 self.out_dir,
@@ -687,35 +779,35 @@ class CodeQLAgent:
             sarif_files = []
             total_findings = 0
 
-            for lang, result in analysis_results.items():
-                if result.success and result.sarif_path:
-                    sarif_files.append(str(result.sarif_path))
-                    total_findings += result.findings_count
-                    logger.info("  - %s: %s findings", lang, result.findings_count)
+            for lang, result in analysis_results.items():  # type: ignore[assignment]
+                if result.success and result.sarif_path:  # type: ignore[attr-defined]
+                    sarif_files.append(str(result.sarif_path))  # type: ignore[attr-defined]
+                    total_findings += result.findings_count  # type: ignore[attr-defined]
+                    logger.info("  - %s: %s findings", lang, result.findings_count)  # type: ignore[attr-defined]
                 else:
                     logger.error("  - %s: Analysis failed", lang)
                     errors.extend(result.errors)
 
-            for lang, result in iris_results.items():
-                if result.success and result.sarif_path:
-                    sarif_files.append(str(result.sarif_path))
-                    total_findings += result.findings_count
-                    if result.findings_count:
+            for lang, result in iris_results.items():  # type: ignore[assignment]
+                if result.success and result.sarif_path:  # type: ignore[attr-defined]
+                    sarif_files.append(str(result.sarif_path))  # type: ignore[attr-defined]
+                    total_findings += result.findings_count  # type: ignore[attr-defined]
+                    if result.findings_count:  # type: ignore[attr-defined]
                         logger.info(
                             "  - %s IRIS LocalFlowSource: %s extra findings",
                             lang,
-                            result.findings_count
+                            result.findings_count  # type: ignore[attr-defined]
                         )
 
-            for lang, result in curated_results.items():
-                if result.success and result.sarif_path:
-                    sarif_files.append(str(result.sarif_path))
-                    total_findings += result.findings_count
-                    if result.findings_count:
+            for lang, result in curated_results.items():  # type: ignore[assignment]
+                if result.success and result.sarif_path:  # type: ignore[attr-defined]
+                    sarif_files.append(str(result.sarif_path))  # type: ignore[attr-defined]
+                    total_findings += result.findings_count  # type: ignore[attr-defined]
+                    if result.findings_count:  # type: ignore[attr-defined]
                         logger.info(
                             "  - %s curated queries: %s extra findings",
                             lang,
-                            result.findings_count
+                            result.findings_count  # type: ignore[attr-defined]
                         )
 
             # Standard-vs-IRIS overlap: when the standard suite ran
@@ -767,7 +859,7 @@ class CodeQLAgent:
             logger.info("%s", '=' * 70)
 
             workflow_result = CodeQLWorkflowResult(
-                success=len(sarif_files) > 0,
+                success=_workflow_success(analysis_results),
                 repo_path=str(self.repo_path),
                 timestamp=datetime.now(timezone.utc).isoformat(),
                 duration_seconds=time.time() - self.start_time,
@@ -777,9 +869,13 @@ class CodeQLAgent:
                 total_findings=total_findings,
                 sarif_files=sarif_files,
                 errors=errors,
+                enrichment_health=summarize_iris_enrichment_health(
+                    iris_results,
+                ),
                 threat_model_overlap=threat_model_overlap,
                 learned_models=learned_models,
                 source_summaries=source_summaries_cell,
+                taint_mad=taint_mad_cell,
                 untrusted_build_languages=untrusted_build_languages,
             )
 
@@ -852,6 +948,159 @@ class CodeQLAgent:
         except Exception as exc:  # noqa: BLE001 — never kill the scan
             logger.warning("source-summaries pass failed: %s", exc)
             return None
+
+    def _run_taint_pack_models_pass(self, successful_dbs) -> dict | None:
+        """Stage the taint seed packs as models-as-data for the
+        standard suites, and record what was augmented.
+
+        Per augmentable language (python, javascript) with a
+        successful DB: convert the shipped taint packs
+        (:func:`core.taint.mad_rows.rows_from_pack_set`) plus the
+        project's IRIS taint specs — the IRIS batch passes through
+        :func:`~core.taint.mad_rows.enforce_mad_provenance`, so
+        learned rows may only widen (source/sink) while summary rows
+        require operator-grade provenance and barrier rows never
+        emit. The emitted pack is staged into
+        ``query_runner.additional_model_packs`` so the STANDARD suite
+        run consumes it via ``--additional-packs``, and the run
+        writes ``taint-mad-augmentation.json`` naming exactly which
+        sink kinds/classes/CWEs got rows — the record a consumer
+        needs before treating an augmented no-flow result as
+        informative for a given sink surface.
+
+        Default off (``RaptorConfig.CODEQL_TAINT_MAD_ENABLED``) —
+        zero cost when disabled. Returns the per-language record
+        cells, or None when disabled / no language qualifies / no
+        rows survived. Failures degrade to a warning; they never
+        kill the scan.
+        """
+        if not getattr(RaptorConfig, "CODEQL_TAINT_MAD_ENABLED", False):
+            return None
+        langs = [lang for lang in ("python", "javascript")
+                 if lang in successful_dbs]
+        if not langs:
+            return None
+        try:
+            from core.dataflow.extension_pack import (
+                ROLE_SINK,
+                rows_from_taint_specs,
+                write_extension_pack,
+            )
+            from core.taint.mad_rows import (
+                AugmentationCell,
+                augmented_surfaces,
+                enforce_mad_provenance,
+                rows_from_pack_set,
+                write_augmentation_record,
+            )
+            from core.taint.packs import default_pack_names, load_packs
+        except ImportError:
+            logger.debug("taint-mad pass unavailable", exc_info=True)
+            return None
+
+        specs: list = []
+        try:
+            from core.iris.api import load_project_specs
+            specs = load_project_specs(
+                out_dir=self.out_dir, target_path=self.repo_path,
+            ) or []
+        except Exception:  # noqa: BLE001 — the pack channel still runs
+            logger.debug("taint-mad: IRIS spec load failed", exc_info=True)
+
+        cells = []
+        for lang in langs:
+            try:
+                names = default_pack_names(lang)
+                pack_set = load_packs(names, target_root=self.repo_path)
+                conv = rows_from_pack_set(pack_set, language=lang)
+                rows = list(conv.rows)
+                rejected = list(conv.rejected)
+                iris_rows = 0
+                tier_counts: dict[str, int] = {}
+                if specs:
+                    iris_conv = rows_from_taint_specs(specs, language=lang)
+                    seam = enforce_mad_provenance(
+                        iris_conv.rows, language=lang)
+                    rows.extend(seam.rows)
+                    rejected.extend(iris_conv.rejected)
+                    rejected.extend(seam.rejected)
+                    iris_rows = len(seam.rows)
+                    for spec in specs:
+                        tier = getattr(
+                            spec.evidence_tier, "value",
+                            str(spec.evidence_tier))
+                        tier_counts[tier] = tier_counts.get(tier, 0) + 1
+                if not rows:
+                    logger.info(
+                        "taint-mad: %s produced no rows "
+                        "(%d refusal(s))", lang, len(rejected))
+                    continue
+                out = self.out_dir / "taint-mad" / lang
+                result = write_extension_pack(
+                    rows, language=lang, out_dir=out,
+                    pack_name=f"raptor/taint-mad-{lang}",
+                )
+                rejected.extend(result.rejected)
+                if result.rows_written == 0:
+                    logger.warning(
+                        "taint-mad: every %s row was rejected at "
+                        "emission (%d rejection(s))",
+                        lang, len(result.rejected))
+                    continue
+                packs_cfg = dict(
+                    self.query_runner.additional_model_packs or {})
+                packs_cfg.setdefault(lang, []).append(
+                    (str(out), result.pack_name))
+                self.query_runner.additional_model_packs = packs_cfg
+                classes, cwes, source_kinds = augmented_surfaces(
+                    pack_set, rows)
+                provenance_counts: dict[str, int] = {}
+                for row in rows:
+                    provenance_counts[row.provenance] = (
+                        provenance_counts.get(row.provenance, 0) + 1)
+                cells.append(AugmentationCell(
+                    language=lang,
+                    pack_name=result.pack_name,
+                    pack_dir=str(result.pack_dir),
+                    model_file=str(result.model_file),
+                    packs=tuple(names),
+                    rows_written=result.rows_written,
+                    counts=tuple(sorted(result.counts.items())),
+                    augmented_sink_kinds=tuple(sorted({
+                        r.model_kind for r in rows
+                        if r.role == ROLE_SINK
+                    })),
+                    augmented_sink_classes=classes,
+                    augmented_cwes=cwes,
+                    augmented_source_kinds=source_kinds,
+                    summary_rows=int(
+                        result.counts.get("summaryModel", 0)),
+                    row_provenance=tuple(
+                        sorted(provenance_counts.items())),
+                    iris_specs=len(specs),
+                    iris_rows=iris_rows,
+                    iris_evidence_tiers=tuple(
+                        sorted(tier_counts.items())),
+                    rejected=tuple(rejected),
+                ))
+                logger.info(
+                    "taint-mad: %s pack staged for the standard suite "
+                    "(%d row(s): %s; %d refusal(s))",
+                    lang, result.rows_written,
+                    ", ".join(f"{k}={v}"
+                              for k, v in sorted(result.counts.items())),
+                    len(rejected),
+                )
+            except Exception as exc:  # noqa: BLE001 — never kill the scan
+                logger.warning("taint-mad pass failed for %s: %s",
+                               lang, exc)
+        if not cells:
+            return None
+        try:
+            write_augmentation_record(self.out_dir, cells)
+        except Exception as exc:  # noqa: BLE001 — record is best-effort
+            logger.warning("taint-mad: record write failed: %s", exc)
+        return {c.language: c.to_dict() for c in cells}
 
     def _run_learned_models_pass(self, successful_dbs) -> dict | None:
         """Emit learned taint specs as a model pack and measure the diff.
@@ -1064,7 +1313,18 @@ class CodeQLAgent:
         if result.errors:
             print(f"\nErrors encountered: {len(result.errors)}")
             for error in result.errors[:5]:  # Show first 5 errors
-                print(f"  - {error[:100]}")
+                # result.errors carry codeql/build stderr — output of
+                # the scanned repo's build scripts on traced builds and
+                # extractor diagnostics quoting hostile source. Escape
+                # before it reaches the operator's terminal (ANSI/OSC/
+                # bidi injection): this is a bare print(), which
+                # bypasses core.logging's console chokepoint
+                # (EscapingConsoleFormatter escapes logger-routed
+                # lines only), so the per-site escape is load-bearing.
+                from core.security.log_sanitisation import (
+                    sanitise_for_terminal,
+                )
+                print(f"  - {sanitise_for_terminal(error, max_len=100)}")
 
         print(f"\nOutput directory: {self.out_dir}")
         print(f"{'=' * 70}\n")
@@ -1142,11 +1402,31 @@ class CodeQLAgent:
                         if not p:
                             return ""
                         return p.replace("\\", "/").rsplit("/", 1)[-1]
+
+                    # Rule ids, messages, and file paths come from
+                    # SARIF over the untrusted repo and are printed to
+                    # the operator's terminal by _print_dataflow_table
+                    # — escape control/bidi characters at extraction so
+                    # every consumer of the example dicts gets inert
+                    # text.
+                    from core.security.log_sanitisation import (
+                        sanitise_for_terminal as _term,
+                    )
                     examples.append({
-                        "rule": rule_id.split("/")[-1] if "/" in rule_id else rule_id,
-                        "message": message[:60] + "..." if len(message) > 60 else message,
-                        "source": f"{_basename(source_file)}:{source_line}",
-                        "sink": f"{_basename(sink_file)}:{sink_line}",
+                        "rule": _term(
+                            rule_id.split("/")[-1] if "/" in rule_id
+                            else rule_id,
+                            max_len=64,
+                        ),
+                        "message": _term(message, max_len=60),
+                        "source": _term(
+                            f"{_basename(source_file)}:{source_line}",
+                            max_len=80,
+                        ),
+                        "sink": _term(
+                            f"{_basename(sink_file)}:{sink_line}",
+                            max_len=80,
+                        ),
                         "steps": len(locations)
                     })
 
@@ -1174,7 +1454,7 @@ class CodeQLAgent:
             table = tabulate(table_data, headers=headers, tablefmt="simple", maxcolwidths=[20, 25, 10, 25, 5])
 
             # Indent the table
-            for line in table.split('\n'):
+            for line in table.split('\n'):  # line-model: tabulate-generated display text
                 print(f"  {line}")
 
         except ImportError:
@@ -1253,6 +1533,15 @@ Examples:
              "add noise on a specific target.",
     )
     parser.add_argument(
+        "--taint-crossfile-mad", action="store_true",
+        help="Stage the taint seed packs (plus the project's "
+             "operator-grade IRIS taint specs) as models-as-data "
+             "extension packs on the standard python/javascript "
+             "suites, and write taint-mad-augmentation.json naming "
+             "the augmented sink surfaces. Additive detection only; "
+             "default off.",
+    )
+    parser.add_argument(
         "--threat-models",
         help="Comma-separated CodeQL threat models to enable on the "
              "standard suite (default: local). Passed as repeated "
@@ -1275,12 +1564,29 @@ Examples:
     args = parser.parse_args()
     apply_cli_args(args, parser=parser)
 
+    # Orphan containment: when the spawner opted this agent in (the
+    # agentic pipeline and the scanner's codeql stage pair the env var
+    # with start_new_session), a dead parent takes this whole process
+    # group down instead of stranding codeql children holding cache
+    # locks and gigabytes of memory. Direct operator invocations (no
+    # env var) are untouched.
+    from core.run.parent_liveness import maybe_start_orphan_watchdog
+    maybe_start_orphan_watchdog("codeql-agent")
+
     if getattr(args, "out", None):
         # Child of a run: adopt the owning run's pin as the process
         # override so ambient consumers (IRIS store, trust) follow it
         #.
         from core.run.pin import bootstrap_process_pin
         bootstrap_process_pin(args.out)
+
+    # Project sandbox-floor consent: workers re-read the on-disk
+    # setting at their own run start (the run-pin bootstrap above
+    # resolves the owning project) — the per-run --sandbox-floor
+    # flag, forwarded on this worker's command line by the /agentic
+    # passthrough, wins in both directions at floor resolution.
+    from core.project.trust import apply_project_sandbox_floor
+    apply_project_sandbox_floor(args)
 
     # Explicit negative beats positive (per-run escape hatch; no
     # project-marker consumption here — the /agentic and /codeql
@@ -1305,6 +1611,16 @@ Examples:
         from core.config import RaptorConfig
         RaptorConfig.CODEQL_LEARNED_MODELS_ENABLED = False
 
+    # Positive opt-in (default-off direction) for the taint-pack
+    # models-as-data augmentation. The tolerant read of the wider
+    # flag-family member lets a spawner that only knows
+    # --taint-crossfile enable this pass too, without an argparse
+    # dependency between the two flags.
+    if (getattr(args, "taint_crossfile_mad", False)
+            or getattr(args, "taint_crossfile", False)):
+        from core.config import RaptorConfig
+        RaptorConfig.CODEQL_TAINT_MAD_ENABLED = True
+
     # Same process-scoped pattern for threat models. Explicit negative
     # beats positive when both are passed.
     if args.threat_models:
@@ -1325,7 +1641,11 @@ Examples:
     build_commands = None
     if args.build_command:
         if not languages or len(languages) != 1:
-            print("✗ --build-command requires exactly one language specified with --languages", file=sys.stderr)
+            print(
+                "✗ --build-command requires exactly one language — pass "
+                "--languages <lang> to pin the traced language",
+                file=sys.stderr,
+            )
             sys.exit(1)
         build_commands = {_normalise_language(languages[0]): args.build_command}
 

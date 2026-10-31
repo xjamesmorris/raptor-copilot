@@ -10,7 +10,23 @@
 #   APT_MIRROR when set, replaces the apt sources with this mirror
 #              (for build environments that cannot reach the default
 #              archives; read from the caller's environment)
-FROM ubuntu:26.10
+# Runner-model pin, not a floatable dependency: this tag is the OS half
+# of the u24 matrix lane (the ubuntu-24.04 GitHub runner shape) and must
+# only move together with the lane definitions and the APT_MIRROR dist
+# names below. An automated base-image bump once moved both matrix
+# Dockerfiles to the same newer tag, silently collapsing the u24/u26
+# image axis into one substrate.
+FROM ubuntu:24.04
+
+# OCI labels, mirroring .github/docker/ci-deps.Dockerfile: `source` is
+# the linked-repo label that ties the GHCR package to this repository
+# (sandbox-matrix-image.yml publishes the u24 build), and `description`
+# is the only per-package text GHCR renders — use it to make clear this
+# image is internal CI plumbing, not a RAPTOR distributable.
+LABEL org.opencontainers.image.source="https://github.com/gadievron/raptor" \
+      org.opencontainers.image.title="raptor-sandbox-matrix" \
+      org.opencontainers.image.description="RAPTOR INTERNAL CI image (sandbox feature-matrix lanes, ubuntu-24.04 runner shape). NOT a RAPTOR distributable or end-user artifact — do not pull or depend on this image."
+
 ARG http_proxy
 ARG https_proxy
 ARG APT_MIRROR=
@@ -59,7 +75,7 @@ USER runner
 ENV HOME=/home/runner
 ENV PATH="/home/runner/.local/bin:/opt/pipx_bin:/home/runner/.cargo/bin:/home/runner/.config/composer/vendor/bin:/usr/local/.ghcup/bin:/home/runner/.dotnet/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin"
 RUN mkdir -p /home/runner/work/raptor/raptor
-COPY --chown=runner:runner requirements.txt requirements-dev.txt /home/runner/work/raptor/raptor/
+COPY --chown=runner:runner pyproject.toml uv.lock /home/runner/work/raptor/raptor/
 WORKDIR /home/runner/work/raptor/raptor
-RUN "$MATRIX_PY" -m venv .venv \
-    && .venv/bin/pip install --no-cache-dir -r requirements-dev.txt
+RUN "$MATRIX_PY" -m pip install --no-cache-dir uv==0.12.6 \
+    && "$MATRIX_PY" -m uv sync --locked --python "$MATRIX_PY"

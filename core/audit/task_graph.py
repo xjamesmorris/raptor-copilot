@@ -48,9 +48,13 @@ def _break_cycles(
     """
     from .topo_order import detect_sccs
 
+    # Sorted iteration everywhere a set feeds traversal order: the
+    # spanning tree (and therefore WHICH back-edges get dropped) must
+    # not vary with PYTHONHASHSEED — nondeterministic drops churned
+    # artifacts across otherwise-identical runs.
     adj_lists: dict[str, list[str]] = {}
     for caller, callees in caller_to_callees.items():
-        adj_lists.setdefault(caller, []).extend(callees)
+        adj_lists.setdefault(caller, []).extend(sorted(callees))
 
     sccs = detect_sccs(adj_lists)
     edges_to_drop: set[tuple[str, str]] = set()
@@ -59,7 +63,8 @@ def _break_cycles(
         if not scc.is_cycle:
             continue
         members = scc.members
-        root = min(members, key=lambda k: scores.get(k, 0.0))
+        # Key tie-break so equal scores pick a stable root.
+        root = min(members, key=lambda k: (scores.get(k, 0.0), k))
         tree_edges: set[tuple[str, str]] = set()
         visited: set[str] = set()
 
@@ -69,7 +74,7 @@ def _break_cycles(
             if node in visited:
                 continue
             visited.add(node)
-            for callee in caller_to_callees.get(node, set()):
+            for callee in sorted(caller_to_callees.get(node, ())):
                 if callee in members and callee not in visited:
                     tree_edges.add((node, callee))
                     stack.append(callee)

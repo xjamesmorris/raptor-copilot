@@ -35,10 +35,10 @@ import pytest
 # "BUG: preexec returned instead of exiting" with returncode 0.
 _REPO_ROOT = str(Path(__file__).resolve().parents[3])
 
-linux_only = pytest.mark.skipif(
-    sys.platform != "linux",
-    reason="post-fork sandbox setup paths are Linux-only",
-)
+# post-fork sandbox setup paths are Linux-only
+# Real-Linux-kernel binding: these tests carry the linux_native
+# marker (pytest.ini) instead of an ad hoc skipif — honest skip on
+# other native platforms, deselected under the darwin-emulation gate.
 
 
 def _run_child(body: str) -> subprocess.CompletedProcess:
@@ -56,7 +56,7 @@ def _run_child(body: str) -> subprocess.CompletedProcess:
     )
 
 
-@linux_only
+@pytest.mark.linux_native
 def test_landlock_sys_create_failure_exits_126():
     """When SYS_landlock_create_ruleset returns fd<0 post-fork, the child
     must emit a fork-safe diagnostic and exit 126.
@@ -88,7 +88,7 @@ def test_landlock_sys_create_failure_exits_126():
     assert b"sandbox: landlock: SYS_landlock_create_ruleset" in proc.stderr
 
 
-@linux_only
+@pytest.mark.linux_native
 def test_mount_ns_extra_ro_paths_bind_failure_exits_126():
     """When extra_ro_paths bind-mount fails post-fork, the child must
     emit a fork-safe diagnostic and exit 126.
@@ -152,7 +152,7 @@ def test_mount_ns_extra_ro_paths_bind_failure_exits_126():
     assert b"sandbox: mount_ns: extra_ro_paths bind failed" in proc.stderr
 
 
-@linux_only
+@pytest.mark.linux_native
 def test_preexec_rlimit_core_failure_exits_99():
     """When ``resource.setrlimit(RLIMIT_CORE, ...)`` raises post-fork,
     the child must emit a fork-safe diagnostic and exit 99 (skip atexit).

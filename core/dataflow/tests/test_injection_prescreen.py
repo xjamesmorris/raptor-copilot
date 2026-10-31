@@ -9,6 +9,7 @@ refute, and only when every path is neutralised.
 
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -119,7 +120,10 @@ def _write_app(tmp_path, body: str, name: str = "app.py"):
 class TestSinkClassMapping:
     @pytest.mark.parametrize("rule_id,expected", [
         ("py/path-injection", {"pathtrav"}),
-        ("py/command-line-injection", {"cmdi"}),
+        # command-LINE-injection families flag argv-element sinks too,
+        # so the argv-context danger model joins the shell model.
+        ("py/command-line-injection", {"cmdi", "cmdi_argv"}),
+        ("py/command-injection", {"cmdi"}),
         ("js/xss", {"xss"}),
         ("js/reflected-xss", {"xss"}),
         ("java/sql-injection", {"sqli"}),
@@ -193,9 +197,12 @@ class TestGuardFormRefutation:
     def test_fullmatch_refutes_cmdi(self, tmp_path):
         # fullmatch has no trailing-newline quirk, so a charset
         # excluding every cmdi danger char may refute a cmdi finding.
+        # Dotted, dash-free: the command-line-injection rule family
+        # also puts the argv-context model in play, and '-' is an argv
+        # danger char (option injection).
         app = GUARD_APP.replace(
             "re.match(r'^[A-Za-z0-9_+-]+$', name)",
-            "re.fullmatch(r'[A-Za-z0-9_+-]+', name)",
+            "re.fullmatch(r'[A-Za-z0-9_.]+', name)",
         ).replace("os.path.join('/etc/app', name)", "'ls ' + name")
         repo = _write_app(tmp_path, app)
         verdict = prescreen_finding(
@@ -460,3 +467,529 @@ class TestNonPythonRebindKill:
         refuted, reason, _conf = self._refute(src, 3, 5)
         assert refuted is False
         assert "value chain" in reason
+
+
+# ---------------------------------------------------------------------------
+# Branch-wrapped validators must never refute a live finding.
+# ---------------------------------------------------------------------------
+
+BRANCH_GUARD_APP = """\
+import os
+import re
+
+
+def handler(request):
+    name = request.args.get('name')
+    if request.strict:
+        if not re.match(r'^[A-Za-z0-9_+-]+$', name):
+            return None
+    cfg = os.path.join('/etc/app', name)
+    open(cfg)
+"""
+BRANCH_GUARD_VALIDATOR_LINE = 8
+BRANCH_GUARD_SINK_LINE = 11
+
+BRANCH_SUB_APP = """\
+import os
+import re
+
+
+def handler(request):
+    name = request.args.get('name')
+    if request.clean:
+        name = re.sub(r'[/\\\\.]+', '', name)
+    open('/etc/app/' + name)
+"""
+BRANCH_SUB_VALIDATOR_LINE = 8
+BRANCH_SUB_SINK_LINE = 9
+
+
+class TestBranchWrappedValidatorNeverRefutes:
+    """`if cond: <sanitizer>` sanitizes only on some paths — the sink
+    stays live whenever the branch is skipped, so the prescreen must
+    yield NO signal (a refutation here suppresses a real finding)."""
+
+    def test_branch_wrapped_guard_no_signal(self, tmp_path):
+        repo = _write_app(tmp_path, BRANCH_GUARD_APP)
+        path = _path("app.py", 6, [BRANCH_GUARD_VALIDATOR_LINE],
+                     BRANCH_GUARD_SINK_LINE)
+        assert prescreen_finding(
+            paths=[path], repo_root=repo,
+            rule_id="py/path-injection",
+        ) is None
+
+    def test_branch_wrapped_sub_no_signal(self, tmp_path):
+        repo = _write_app(tmp_path, BRANCH_SUB_APP)
+        path = _path("app.py", 6, [BRANCH_SUB_VALIDATOR_LINE],
+                     BRANCH_SUB_SINK_LINE)
+        assert prescreen_finding(
+            paths=[path], repo_root=repo,
+            rule_id="py/path-injection",
+        ) is None
+
+
+# ---------------------------------------------------------------------------
+# _read_source containment (shared contained/capped helper)
+# ---------------------------------------------------------------------------
+
+
+class TestReadSourceContainment:
+    def test_relative_path_reads(self, tmp_path):
+        (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+        assert ip._read_source(tmp_path, "a.py") == "x = 1\n"
+
+    def test_traversal_refused(self, tmp_path):
+        (tmp_path / "outside.py").write_text("secret", encoding="utf-8")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        assert ip._read_source(repo, "../outside.py") is None
+
+    def test_symlink_escape_refused(self, tmp_path):
+        outside = tmp_path / "outside.py"
+        outside.write_text("secret", encoding="utf-8")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        os.symlink(outside, repo / "link.py")
+        assert ip._read_source(repo, "link.py") is None
+
+
+# ---------------------------------------------------------------------------
+# Comment / string decoys must never certify — the lift and the
+# dominance layers both require the validator span to be executable
+# code, not prose (comment-stripped/string-blanked view anchoring).
+# ---------------------------------------------------------------------------
+
+
+class TestDecoyValidatorsNeverRefute:
+    def test_python_comment_sub_decoy_no_refutation(self, tmp_path):
+        # The sanitizer exists only inside a trailing comment on a
+        # real code line — the flow is live and must reach the LLM.
+        app = (
+            "import os\n"
+            "import re\n"
+            "\n"
+            "\n"
+            "def handler(request):\n"
+            "    name = request.args.get('name')\n"
+            "    p = str(name)  # name = re.sub(r'[/\\\\.]+', '', name)\n"
+            "    open('/etc/app/' + name)\n"
+        )
+        repo = _write_app(tmp_path, app)
+        assert prescreen_finding(
+            paths=[_path("app.py", 6, [7], 8)], repo_root=repo,
+            rule_id="py/path-injection",
+        ) is None
+
+    def test_python_docstring_guard_decoy_no_refutation(self, tmp_path):
+        # Validator text inside a (multi-line) string literal: the
+        # line-level view alone cannot see the enclosing quotes, so
+        # the anchor must come from the whole-file view.
+        app = (
+            "import os\n"
+            "import re\n"
+            "\n"
+            "\n"
+            "def handler(request):\n"
+            "    name = request.args.get('name')\n"
+            "    doc = '''example:\n"
+            "    if not re.match(r'^[A-Za-z0-9_+-]+$', name): return\n"
+            "    '''\n"
+            "    open('/etc/app/' + name)\n"
+        )
+        repo = _write_app(tmp_path, app)
+        assert prescreen_finding(
+            paths=[_path("app.py", 6, [8], 10)], repo_root=repo,
+            rule_id="py/path-injection",
+        ) is None
+
+    def test_js_comment_guard_decoy_no_refutation(self, tmp_path):
+        app = (
+            "function h(req){\n"
+            "  let name = req.query.name;\n"
+            "  // if (!/^[a-z0-9]+$/.test(name)) { return; }\n"
+            "  exec('ls ' + name);\n"
+            "}\n"
+        )
+        repo = _write_app(tmp_path, app, name="app.js")
+        assert prescreen_finding(
+            paths=[_path("app.js", 2, [3], 4)], repo_root=repo,
+            rule_id="js/command-line-injection",
+        ) is None
+
+    def test_js_block_comment_guard_decoy_no_refutation(self, tmp_path):
+        app = (
+            "function h(req){\n"
+            "  let name = req.query.name;\n"
+            "  /*\n"
+            "  if (!/^[a-z0-9]+$/.test(name)) { return; }\n"
+            "  */\n"
+            "  exec('ls ' + name);\n"
+            "}\n"
+        )
+        repo = _write_app(tmp_path, app, name="app.js")
+        assert prescreen_finding(
+            paths=[_path("app.js", 2, [4], 6)], repo_root=repo,
+            rule_id="js/command-line-injection",
+        ) is None
+
+    def test_js_string_guard_decoy_no_refutation(self, tmp_path):
+        app = (
+            "function h(req){\n"
+            "  let name = req.query.name;\n"
+            "  let doc = \"if (!/^[a-z0-9]+$/.test(name)) { return; }\";\n"
+            "  exec('ls ' + name);\n"
+            "}\n"
+        )
+        repo = _write_app(tmp_path, app, name="app.js")
+        assert prescreen_finding(
+            paths=[_path("app.js", 2, [3], 4)], repo_root=repo,
+            rule_id="js/command-line-injection",
+        ) is None
+
+    def test_real_validator_control_still_refutes(self, guard_repo):
+        # Two-direction guard: the anchored lift must keep certifying
+        # the genuine guard shape.
+        verdict = prescreen_finding(
+            paths=[_guard_path()], repo_root=guard_repo,
+            rule_id="py/path-injection",
+        )
+        assert verdict is not None and verdict.refuted is True
+
+
+class TestNestedScopeRebindKill:
+    """A nested function rebinding an enclosing-scope name via
+    nonlocal/global executes on any call between validator and sink —
+    the chain must drop such names (kill-only, mirroring the
+    class-body arm)."""
+
+    def test_nonlocal_rebind_never_refutes(self, tmp_path):
+        app = (
+            "import os\n"
+            "import re\n"
+            "\n"
+            "\n"
+            "def handler(request):\n"
+            "    raw = request.args.get('name')\n"
+            "    if not re.fullmatch(r'[A-Za-z0-9_+-]+', raw):\n"
+            "        return None\n"
+            "    y = raw\n"
+            "    def taint():\n"
+            "        nonlocal y\n"
+            "        y = request.environ['EVIL']\n"
+            "    taint()\n"
+            "    os.system('ls ' + y)\n"
+        )
+        repo = _write_app(tmp_path, app)
+        assert prescreen_finding(
+            paths=[_path("app.py", 6, [7], 14)], repo_root=repo,
+            rule_id="py/command-line-injection",
+        ) is None
+
+    def test_global_rebind_never_refutes(self, tmp_path):
+        app = (
+            "import os\n"
+            "import re\n"
+            "\n"
+            "\n"
+            "def handler(request):\n"
+            "    global g\n"
+            "    g = request.args.get('name')\n"
+            "    if not re.fullmatch(r'[A-Za-z0-9_+-]+', g):\n"
+            "        return None\n"
+            "    def taint():\n"
+            "        global g\n"
+            "        g = 'evil; rm -rf /'\n"
+            "    taint()\n"
+            "    os.system('ls ' + g)\n"
+        )
+        repo = _write_app(tmp_path, app)
+        assert prescreen_finding(
+            paths=[_path("app.py", 7, [8], 14)], repo_root=repo,
+            rule_id="py/command-line-injection",
+        ) is None
+
+    def test_inline_rebind_control_still_kills(self, tmp_path):
+        # Control from the finding: the same rebind inline (not
+        # nested) was already killed pre-fix.
+        app = (
+            "import os\n"
+            "import re\n"
+            "\n"
+            "\n"
+            "def handler(request):\n"
+            "    raw = request.args.get('name')\n"
+            "    if not re.fullmatch(r'[A-Za-z0-9_+-]+', raw):\n"
+            "        return None\n"
+            "    y = raw\n"
+            "    y = request.environ['EVIL']\n"
+            "    os.system('ls ' + y)\n"
+        )
+        repo = _write_app(tmp_path, app)
+        assert prescreen_finding(
+            paths=[_path("app.py", 6, [7], 11)], repo_root=repo,
+            rule_id="py/command-line-injection",
+        ) is None
+
+    def test_nested_fn_without_escape_still_refutes(self, tmp_path):
+        # Two-direction guard: a nested function binding only its OWN
+        # local (no nonlocal/global) must not kill the chain.
+        app = (
+            "import os\n"
+            "import re\n"
+            "\n"
+            "\n"
+            "def handler(request):\n"
+            "    y = request.args.get('name')\n"
+            # Dash-free: the rule family puts the argv model in play.
+            "    if not re.fullmatch(r'[A-Za-z0-9_.]+', y):\n"
+            "        return None\n"
+            "    def helper():\n"
+            "        y = 'local-only'\n"
+            "        return y\n"
+            "    helper()\n"
+            "    os.system('ls ' + y)\n"
+        )
+        repo = _write_app(tmp_path, app)
+        verdict = prescreen_finding(
+            paths=[_path("app.py", 6, [7], 13)], repo_root=repo,
+            rule_id="py/command-line-injection",
+        )
+        assert verdict is not None and verdict.refuted is True
+
+
+class TestBranchWrappedLexicalGuards:
+    """A JS/Java guard whose enclosing conditional is hidden by a '{'
+    inside a multi-line comment / template literal must yield NO
+    signal — the sink runs on paths that skipped the guard."""
+
+    HOSTILE_JS = (
+        "function run(x) {\n"
+        "  if (opts.paranoid) {\n"
+        "    /*\n"
+        "      {\n"
+        "    */\n"
+        "    if (!/^[a-z0-9]+$/.test(x)) return;\n"  # line 6 = guard
+        "  }\n"
+        "  exec(x);\n"                               # line 8 = sink
+        "}\n"
+    )
+    HONEST_JS = (
+        "function run(x) {\n"
+        "  if (!/^[a-z0-9]+$/.test(x)) return;\n"    # line 2 = guard
+        "  exec(x);\n"                               # line 3 = sink
+        "}\n"
+    )
+
+    def test_comment_hidden_branch_wrap_yields_no_signal(self, tmp_path):
+        (tmp_path / "hostile.js").write_text(self.HOSTILE_JS)
+        verdict = prescreen_finding(
+            paths=[_path("hostile.js", 1, [6], 8)], repo_root=tmp_path,
+            rule_id="js/command-line-injection", cwe="CWE-78",
+        )
+        assert verdict is None
+
+    def test_unconditional_guard_still_refutes(self, tmp_path):
+        """Two-direction control: the same guard NOT branch-wrapped
+        keeps refuting."""
+        (tmp_path / "honest.js").write_text(self.HONEST_JS)
+        verdict = prescreen_finding(
+            paths=[_path("honest.js", 1, [2], 3)], repo_root=tmp_path,
+            rule_id="js/command-line-injection", cwe="CWE-78",
+        )
+        assert verdict is not None and verdict.refuted is True
+
+
+class TestBalancedPhantomPairE2E:
+    ATTACK = (
+        "function run(x) {\n"
+        "  if (opts.paranoid) {\n"
+        "    if (!/^[a-z0-9]+$/.test(x)) return;\n"   # line 3 = guard
+        "    if (a) /{/.test(x);\n"                   # phantom '{'
+        "  }\n"
+        "  exec(x);\n"                                 # line 6 = sink
+        "}\n"
+        "if (b) /}/.test(y);\n"                        # rebalancing '}'
+    )
+    KEYWORD_SWALLOW = (
+        "function run(x) {\n"
+        "  q = a / 1; if (opts.paranoid && c / 2 > 0) {\n"
+        "    if (!/^[a-z0-9]+$/.test(x)) return;\n"   # line 3 = guard
+        "  }\n"
+        "  exec(x);\n"                                 # line 5 = sink
+        "}\n"
+    )
+
+    def test_balanced_phantom_pair_yields_no_signal(self, tmp_path):
+        """Statement-position regex literals carrying a balanced
+        phantom brace pair must not certify the branch-wrapped guard
+        as dominating (valid JS; the wrap is real)."""
+        (tmp_path / "a.js").write_text(self.ATTACK)
+        verdict = prescreen_finding(
+            paths=[_path("a.js", 1, [3], 6)], repo_root=tmp_path,
+            rule_id="js/command-line-injection", cwe="CWE-78",
+        )
+        assert verdict is None
+
+    def test_division_swallowed_keyword_yields_no_signal(self, tmp_path):
+        """Two genuine divisions around the wrap's 'if': the greedy
+        tracker blanking must not reach the conditional classifier —
+        the wrap is real and the finding stays live."""
+        (tmp_path / "b.js").write_text(self.KEYWORD_SWALLOW)
+        verdict = prescreen_finding(
+            paths=[_path("b.js", 1, [3], 5)], repo_root=tmp_path,
+            rule_id="js/command-line-injection", cwe="CWE-78",
+        )
+        assert verdict is None
+class TestArgvContextDangerModel:
+    """Argument-position command sinks (CWE-88 / *-command-line-
+    injection rules): a charset admitting space/dash/quote blocks none
+    of the argv attack characters, so it must never refute such a
+    finding — even though it excludes every shell metachar."""
+
+    ARGV_JAVA = (
+        "class R {\n"
+        "  void run(String x) throws Exception {\n"
+        '    if (!x.matches("[A-Za-z0-9 ._\'-]+")) return;\n'  # line 3
+        '    new ProcessBuilder("tool", x).start();\n'          # line 4
+        "  }\n"
+        "}\n"
+    )
+    CLEAN_JAVA = (
+        "class R {\n"
+        "  void run(String x) throws Exception {\n"
+        '    if (!x.matches("[A-Za-z0-9_.]+")) return;\n'       # line 3
+        '    new ProcessBuilder("tool", x).start();\n'          # line 4
+        "  }\n"
+        "}\n"
+    )
+
+    def test_rule_and_cwe_put_argv_class_in_play(self):
+        classes = sink_classes_for_rule(
+            "java/command-line-injection", "CWE-88",
+        )
+        assert "cmdi_argv" in classes
+        assert "cmdi_argv" in sink_classes_for_rule(
+            "js/command-line-injection",
+        )
+
+    def test_space_dash_quote_charset_yields_no_signal(self, tmp_path):
+        (tmp_path / "R.java").write_text(self.ARGV_JAVA)
+        verdict = prescreen_finding(
+            paths=[_path("R.java", 2, [3], 4)], repo_root=tmp_path,
+            rule_id="java/command-line-injection", cwe="CWE-88",
+        )
+        assert verdict is None
+
+    def test_argv_clean_charset_still_refutes(self, tmp_path):
+        """Two-direction control: a charset clean of BOTH the shell
+        and the argv danger sets keeps refuting."""
+        (tmp_path / "R.java").write_text(self.CLEAN_JAVA)
+        verdict = prescreen_finding(
+            paths=[_path("R.java", 2, [3], 4)], repo_root=tmp_path,
+            rule_id="java/command-line-injection", cwe="CWE-88",
+        )
+        assert verdict is not None and verdict.refuted is True
+
+
+class TestExoticLineTerminators:
+    """Producers count lines by \\n; str.splitlines() also breaks on
+    U+2028 etc., so one exotic terminator planted in a line-1 comment
+    shifted every line-keyed judgment and the guard became unfindable
+    (signal loss on attacker-chosen input)."""
+
+    def test_u2028_in_comment_does_not_shift_line_judgments(self, tmp_path):
+        js = (
+            "function run(x) {\n"
+            "  // prose\u2028still line two\n"
+            "  if (!/^[a-z0-9]+$/.test(x)) return;\n"   # line 3 = guard
+            "  exec(x);\n"                               # line 4 = sink
+            "}\n"
+        )
+        (tmp_path / "shift.js").write_text(js)
+        verdict = prescreen_finding(
+            paths=[_path("shift.js", 2, [3], 4)], repo_root=tmp_path,
+            rule_id="js/command-injection", cwe="CWE-78",
+        )
+        assert verdict is not None and verdict.refuted is True
+
+    def test_split_source_lines_is_newline_only(self):
+        from core.dataflow.smt_barrier import split_source_lines
+        text = "a\u2028bc\n2nd\r\n3rd\n"
+        lines = split_source_lines(text)
+        assert lines[0] == "a\u2028bc"
+        assert lines[1] == "2nd\r"
+        assert lines[2] == "3rd"
+
+
+class TestResourceBounds:
+    def test_step_cap_declines(self, guard_repo):
+        path = _path(
+            "app.py", GUARD_SOURCE_LINE,
+            [GUARD_VALIDATOR_LINE] * (ip.MAX_PRESCREEN_STEPS + 1),
+            GUARD_SINK_LINE,
+        )
+        assert prescreen_finding(
+            paths=[path], repo_root=guard_repo,
+            rule_id="py/path-injection",
+        ) is None
+
+    def test_step_at_cap_still_refutes(self, guard_repo):
+        path = _path(
+            "app.py", GUARD_SOURCE_LINE,
+            [GUARD_VALIDATOR_LINE] * ip.MAX_PRESCREEN_STEPS,
+            GUARD_SINK_LINE,
+        )
+        verdict = prescreen_finding(
+            paths=[path], repo_root=guard_repo,
+            rule_id="py/path-injection",
+        )
+        assert verdict is not None and verdict.refuted is True
+
+    def test_file_read_and_view_computed_once_per_file(
+            self, guard_repo, monkeypatch):
+        """The whole-file blanked view used to be recomputed per STEP
+        (O(steps x file) on hostile many-step paths); it must be
+        cached per (file, language) within one finding."""
+        reads: list = []
+        views: list = []
+        real_read = ip._read_source
+        real_view = ip.code_view_lines
+
+        def counting_read(root, rel):
+            reads.append(rel)
+            return real_read(root, rel)
+
+        def counting_view(text, lang):
+            views.append(lang)
+            return real_view(text, lang)
+
+        monkeypatch.setattr(ip, "_read_source", counting_read)
+        monkeypatch.setattr(ip, "code_view_lines", counting_view)
+        path = _path(
+            "app.py", GUARD_SOURCE_LINE,
+            [GUARD_VALIDATOR_LINE, GUARD_VALIDATOR_LINE,
+             GUARD_VALIDATOR_LINE],
+            GUARD_SINK_LINE,
+        )
+        verdict = prescreen_finding(
+            paths=[path], repo_root=guard_repo,
+            rule_id="py/path-injection",
+        )
+        assert verdict is not None and verdict.refuted is True
+        assert len(reads) == 1
+        assert len(views) == 1
+
+    def test_mixed_language_paths_yield_no_signal(self, guard_repo):
+        """A finding whose paths cross differently-typed files must
+        not be judged under one path's grammar."""
+        (guard_repo / "other.c").write_text("int main() {}\n")
+        good = _guard_path()
+        alien = _path("other.c", 1, [1], 1)
+        assert prescreen_finding(
+            paths=[good, alien], repo_root=guard_repo,
+            rule_id="py/path-injection",
+        ) is None
+
+    def test_stats_snapshot_is_lock_guarded(self):
+        # Mechanical pin: the counters and snapshot share one lock.
+        assert isinstance(ip._STATS_LOCK, type(ip.threading.Lock()))

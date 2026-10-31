@@ -1,0 +1,229 @@
+name: Sandbox matrix image
+
+# Builds + pushes the u24 sandbox feature-matrix image to GHCR so the
+# PR-time matrix subset in tests.yml can `docker pull` a warm image and
+# run with --skip-build, instead of paying the multi-minute
+# runner-shaped image build on every sandbox-gated PR. Same idiom as
+# ci-deps-image.yml: plain `docker` CLI, moving tag + content tag,
+# untagged-version pruning.
+#
+# The build itself is delegated to run-matrix.sh --build-only so the
+# published image can never drift from what a full matrix run would
+# build locally: one recipe (python-artifact resolution, sxv.reqhash
+# label, build args), two consumers.
+#
+# Tags pushed:
+#   :u24             — moving tag the PR-time subset pulls.
+#   :u24-<hash>      — content tag (first 12 hex of sha256 over the u24
+#                      Dockerfile, rustup-proxy.c, pyproject.toml and uv.lock)
+#                      for traceability + rollback. Soft anchor, same as
+#                      ci-deps-image's req-<hash>: the weekly rebuild and
+#                      a python-version bump refresh the image under an
+#                      unchanged tag, so it names the newest build of
+#                      that input set, not one immutable digest.
+#
+# Only u24 is published. The PR subset runs u24 x {full, default} only,
+# and the weekly full matrix (sandbox-matrix.yml) deliberately keeps
+# building its own images fresh — it is the unfiltered backstop that
+# exercises the real build path and the u26 axis; publishing an image
+# with no PR-time consumer would be pure registry cost.
+#
+# OWNERSHIP SPLIT: the GHCR package is USER-OWNED by the repository
+# owner, so package-LIFECYCLE operations (visibility changes, package
+# deletion) are the owner's, done in the package settings — the
+# workflow token holds no authority over them and the CI deliberately
+# carries no machinery for them. What the CI owns: publishing, and
+# VERSION-level retention (the untagged prune and the tagged-anchor
+# cap below — version deletion is within the workflow token's grant
+# and proven working). The package should be PRIVATE, like
+# raptor-ci-deps — this repo is public and the image is internal CI
+# plumbing, not a distributable; visibility persists across pushes.
+# The job CHECKS visibility after every push and emits a ::warning
+# when it is not private or cannot be read — a warning, not a
+# failure, because a hard gate on an owner-only property would block
+# publishes on the owner's schedule. Owner action when it fires:
+# package settings -> Danger Zone -> Change visibility -> Private.
+#
+# Staleness ("rebirth") trade-off, accepted: a PR that changes
+# dependencies or the matrix Dockerfile still runs the subset against
+# the image built from main — the new image is only born when this
+# workflow fires on the merge. run-matrix.sh degrades correctly in the
+# gap: the sxv.reqhash label mismatch makes lanes build fresh venvs
+# (slower, still sound), and a Dockerfile change is only fully
+# exercised by the post-merge publish + the weekly matrix. One-time
+# per change, self-healing — the same accepted trade-off as
+# ci-deps-image.yml and the source_intel tier.
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'core/sandbox/scripts/feature-matrix/images/**'
+      - 'core/sandbox/scripts/feature-matrix/run-matrix.sh'
+      - '.github/workflows/sandbox-matrix-image.yml'
+  workflow_dispatch:
+  schedule:
+    # Weekly rebuild (Wed 04:00 UTC) so the ubuntu:24.04 base picks up
+    # security patches even when the inputs don't change. One hour
+    # after ci-deps-image.yml's cron (03:00), clear of the nightlies.
+    - cron: '0 4 * * 3'
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build the u24 matrix image
+        # Single-sourced recipe: builds local tag raptor-sandbox-matrix:u24
+        # with the sxv.reqhash label a matrix run keys its venv reuse on.
+        run: core/sandbox/scripts/feature-matrix/run-matrix.sh --build-only --image 24
+
+      - name: Log in to GHCR
+        # GHA expressions via env:, never interpolated into the script
+        # body — the canonical hardening pattern this repo documents in
+        # refit-sca-calibration.yml (and it keeps the token out of the
+        # shell source text).
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          echo "$GH_TOKEN" \
+            | docker login ghcr.io -u "$ACTOR" --password-stdin
+
+      - name: Tag and push
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          # Lowercase the owner — GHCR repository paths must be lowercase
+          # and the repository_owner context can carry mixed case.
+          owner="$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')"
+          image="ghcr.io/${owner}/raptor-sandbox-matrix"
+          # Content tag over the inputs that define the u24 image (fixed
+          # order — the hash must be reproducible from a checkout).
+          cthash="$(cat core/sandbox/scripts/feature-matrix/images/Dockerfile \
+                        core/sandbox/scripts/feature-matrix/images/rustup-proxy.c \
+                        pyproject.toml uv.lock \
+                    | sha256sum | cut -c1-12)"
+          docker tag raptor-sandbox-matrix:u24 "${image}:u24"
+          docker tag raptor-sandbox-matrix:u24 "${image}:u24-${cthash}"
+          docker push "${image}:u24"
+          docker push "${image}:u24-${cthash}"
+          echo "Pushed ${image}:u24 and ${image}:u24-${cthash}"
+
+      # Visibility check (see OWNERSHIP SPLIT in the header): a
+      # ::warning, never a job failure — visibility is an owner-only
+      # property of the user-owned package (no REST endpoint changes
+      # container-package visibility, and the workflow token could not
+      # authorize one anyway), and a hard gate here would hold every
+      # publish hostage to the owner's schedule. Both owner-type
+      # endpoints are tried because the repo owner may be a user or an
+      # organisation; an unreadable package warns too, never silently
+      # passes. The check is post-push only: on first publish there is
+      # nothing to query beforehand, and the image contents are
+      # derivable from public inputs.
+      #
+      # stderr: discarded on the org attempt (an expected 404 on every
+      # user-owned repo would cry wolf in each green run), kept on the
+      # user fallback so a real double-failure leaves its diagnosis
+      # (403 vs 404 vs rate-limit) in the job log.
+      - name: Check the package is private (owner-managed)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          vis="$(gh api "orgs/${OWNER}/packages/container/raptor-sandbox-matrix" --jq .visibility 2>/dev/null)" \
+            || vis="$(gh api "users/${OWNER}/packages/container/raptor-sandbox-matrix" --jq .visibility)" \
+            || vis=""
+          if [ -z "${vis}" ]; then
+            echo "::warning::could not read GHCR visibility for raptor-sandbox-matrix with the workflow token — the owner should verify the ghcr.io/${OWNER}/raptor-sandbox-matrix package is Private (package settings -> Danger Zone -> Change visibility)."
+          elif [ "${vis}" != "private" ]; then
+            echo "::warning::ghcr.io/${OWNER}/raptor-sandbox-matrix is '${vis}' but should be private (internal CI image, public repo). Owner action: package settings -> Danger Zone -> Change visibility -> Private. Visibility persists across pushes, so one flip settles it."
+          else
+            echo "package visibility: private"
+          fi
+
+      # Prune the untagged digests left behind when :u24 moves to this
+      # build. Tagged versions (current :u24 + every :u24-<hash> rollback
+      # anchor) are untouched here; bounded anchor retention is the next
+      # step. GHCR has no auto-retention, so without this the weekly
+      # rebuild alone accrues ~52 dangling versions/year.
+      - name: Prune superseded (untagged) image versions
+        uses: actions/delete-package-versions@e5bc658cc4c965c472efe991f8beea3981499c55  # was v5.0.0
+        with:
+          package-name: raptor-sandbox-matrix
+          package-type: container
+          delete-only-untagged-versions: true
+          min-versions-to-keep: 5
+
+      # Tagged-anchor retention: keep the newest 10 tagged versions.
+      # Bounded both ways deliberately (churn-prone limit): pruning an
+      # old anchor costs only a rebuild-on-rollback — every :u24-<hash>
+      # is reproducible from its git-pinned inputs — while unbounded
+      # anchors cost storage, package-page noise, and an operator
+      # reasonably reading the ever-growing pile as broken cleanup
+      # (raptor-ci-deps reached 28 tagged versions this way). 10 ≈
+      # months of requirements churn of rollback headroom. Scripted via
+      # the REST API because delete-package-versions cannot express
+      # "newest N TAGGED + always keep the moving tag" (its keep-count
+      # mixes tagged and untagged): tagged versions are sorted
+      # newest-first by created_at explicitly, the plan is logged
+      # before any deletion, and any version carrying the moving :u24
+      # tag is skipped belt-and-braces even though it is always among
+      # the newest.
+      - name: Prune old tagged anchors (keep newest 10)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+          PKG: raptor-sandbox-matrix
+          MOVING: u24
+          KEEP: "10"
+        run: |
+          set -euo pipefail
+          base="orgs/${OWNER}/packages/container/${PKG}"
+          gh api "${base}" >/dev/null 2>&1 \
+            || base="users/${OWNER}/packages/container/${PKG}"
+          gh api --paginate "${base}/versions?per_page=100" \
+            --jq '.[] | [(.id|tostring), .created_at, (.metadata.container.tags | join(","))] | @tsv' \
+            > /tmp/versions.tsv \
+            || { echo "::error::could not enumerate ${PKG} versions for tagged-anchor retention — inspect the package manually."; exit 1; }
+          awk -F'\t' '$3 != ""' /tmp/versions.tsv | sort -t$'\t' -k2,2r > /tmp/tagged.tsv
+          total="$(wc -l < /tmp/tagged.tsv)"
+          echo "== tagged versions: ${total}; keeping the newest ${KEEP} (any '${MOVING}' carrier always kept)"
+          tail -n +"$((KEEP + 1))" /tmp/tagged.tsv > /tmp/prune.tsv
+          if [ ! -s /tmp/prune.tsv ]; then
+            echo "== nothing to prune"
+            exit 0
+          fi
+          echo "== retention plan (logged before any deletion):"
+          while IFS=$'\t' read -r id created tags; do
+            case ",${tags}," in
+              *",${MOVING},"*) echo "   keep    ${id}  ${created}  ${tags}  (carries the moving tag)" ;;
+              *)               echo "   delete  ${id}  ${created}  ${tags}" ;;
+            esac
+          done < /tmp/prune.tsv
+          while IFS=$'\t' read -r id created tags; do
+            case ",${tags}," in *",${MOVING},"*) continue ;; esac
+            gh api -X DELETE "${base}/versions/${id}" \
+              || { echo "::error::failed to delete tagged version ${id} of ${PKG} — token grant or a GHCR refusal; prune manually in the package settings."; exit 1; }
+            echo "== deleted ${id} (${tags})"
+          done < /tmp/prune.tsv

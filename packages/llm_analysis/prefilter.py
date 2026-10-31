@@ -25,9 +25,11 @@ cold-start trust accumulation.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 from core.llm.task_types import TaskType
+from core.run.finding_status import read_verdict
 from core.security.prompt_defense_profiles import CONSERVATIVE
 from core.security.prompt_envelope import (
     TaintedString,
@@ -85,7 +87,10 @@ def _fast_tier_model_name(client) -> str:
 
 
 def _cheap_fp_check(
-    client, item: dict[str, Any],
+    client,
+    item: dict[str, Any],
+    *,
+    dispatch_recorder=None,
 ) -> tuple[str, str] | None:
     """Ask the fast-tier model whether this finding is a clear false
     positive. Returns ``(verdict, reasoning)`` on success, ``None`` on
@@ -144,12 +149,20 @@ def _cheap_fp_check(
         logger.debug(
             "Cheap FP check failed (falling through to full): %s", e,
         )
+        if dispatch_recorder is not None:
+            dispatch_recorder(item, e, True)
         return None
     # Shared unwrap: handles both the StructuredResponse shape and the
     # legacy (dict, raw) tuple some test stubs return.
     from core.llm.structured_call import unwrap_structured_response
     result = unwrap_structured_response(response).result
     if not isinstance(result, dict):
+        if dispatch_recorder is not None:
+            dispatch_recorder(
+                item,
+                RuntimeError("cheap FP check returned a non-object response"),
+                False,
+            )
         return None
     verdict = str(result.get("verdict") or "").strip().lower()
     reasoning = str(result.get("reasoning") or "")
@@ -158,7 +171,17 @@ def _cheap_fp_check(
             "Cheap FP check returned unexpected verdict %r — falling through",
             verdict,
         )
+        if dispatch_recorder is not None:
+            dispatch_recorder(
+                item,
+                RuntimeError(
+                    f"cheap FP check returned unexpected verdict {verdict!r}",
+                ),
+                False,
+            )
         return None
+    if dispatch_recorder is not None:
+        dispatch_recorder(item, None, False)
     return verdict, reasoning
 
 
@@ -201,6 +224,9 @@ def agentic_fp_analysis(reasoning: str) -> dict[str, Any]:
 def prefilter_for_finding(
     client, item: dict[str, Any],
     pending_claims: dict[str, dict[str, Any]] | None = None,
+    repo: str | Path | None = None,
+    *,
+    dispatch_recorder=None,
 ) -> dict[str, Any] | None:
     """Return a short-circuit analysis dict if the scorecard trusts a
     cheap-tier ``clear_fp`` verdict for this finding, or ``None`` to
@@ -217,6 +243,12 @@ def prefilter_for_finding(
     ``agentic:<rule_id>`` scorecard cells never accumulate events and
     ``should_short_circuit`` stays in learning mode forever — the
     calibration loop is silently open.
+
+    ``repo``: the analysis target, threaded to the scorecard's
+    target-diversity gate. Callers pass the ORCHESTRATOR-resolved
+    repo path — deliberately not ``item["repo_path"]``, which comes
+    from the prep report (``setdefault``-stamped, so a prep-report-
+    carried value wins) and could mint fake target diversity.
     """
     from core.llm.scorecard import prefilter_decision
 
@@ -224,7 +256,11 @@ def prefilter_for_finding(
     decision_class = f"agentic:{rule_id}"
     fast_model_name = _fast_tier_model_name(client)
 
-    cheap = _cheap_fp_check(client, item)
+    cheap = _cheap_fp_check(
+        client,
+        item,
+        dispatch_recorder=dispatch_recorder,
+    )
     cheap_says_fp = cheap is not None and cheap[0] == "clear_fp"
     cheap_reasoning = cheap[1] if cheap is not None else ""
 
@@ -233,6 +269,7 @@ def prefilter_for_finding(
         decision_class=decision_class,
         model=fast_model_name,
         cheap_says_fp=cheap_says_fp,
+        repo=repo,
     )
     if decision.short_circuit:
         logger.info(
@@ -259,6 +296,9 @@ def prefilter_for_finding(
 
 def make_prefilter_fn(
     client, pending_claims: dict[str, dict[str, Any]] | None = None,
+    repo: str | Path | None = None,
+    *,
+    cost_tracker=None,
 ):
     """Per-finding-memoized prefilter hook for ``dispatch_task``.
 
@@ -280,6 +320,48 @@ def make_prefilter_fn(
     cache: dict[str, dict[str, Any] | None] = {}
     locks: dict[str, threading.Lock] = {}
     master = threading.Lock()
+    dispatch_records: list[dict[str, Any]] = []
+    dispatch_records_lock = threading.Lock()
+
+    def _record_dispatch(
+        item: dict[str, Any],
+        error: BaseException | None,
+        transport_failed: bool,
+    ) -> None:
+        finding_id = str(
+            item.get("finding_id") or item.get("group_id") or "unknown",
+        )
+        model_name = _fast_tier_model_name(client) or "?"
+        record: dict[str, Any] = {
+            "finding_id": finding_id,
+            "analysed_by": model_name,
+        }
+        if error is not None:
+            from packages.llm_analysis.dispatch import (
+                classify_dispatch_exception,
+                persist_dispatch_diagnostic,
+                record_exception_accounting,
+            )
+
+            if transport_failed:
+                record_exception_accounting(
+                    cost_tracker,
+                    error,
+                    model_name=model_name,
+                )
+            record.update({
+                "error": str(error),
+                "error_type": classify_dispatch_exception(error),
+            })
+            record.update(persist_dispatch_diagnostic(
+                cost_tracker,
+                task_name="fast_tier_prefilter",
+                item_id=finding_id,
+                model_name=model_name,
+                error=error,
+            ))
+        with dispatch_records_lock:
+            dispatch_records.append(record)
 
     def prefilter_fn(item: dict[str, Any]) -> dict[str, Any] | None:
         fid = str(
@@ -291,9 +373,15 @@ def make_prefilter_fn(
             if fid not in cache:
                 cache[fid] = prefilter_for_finding(
                     client, item, pending_claims=pending_claims,
+                    repo=repo, dispatch_recorder=_record_dispatch,
                 )
             return cache[fid]
 
+    def _dispatch_results() -> list[dict[str, Any]]:
+        with dispatch_records_lock:
+            return [dict(record) for record in dispatch_records]
+
+    prefilter_fn.dispatch_results = _dispatch_results  # type: ignore[attr-defined]
     return prefilter_fn
 
 
@@ -301,6 +389,7 @@ def record_prefilter_outcomes(
     client,
     pending_claims: dict[str, dict[str, Any]],
     results: list[dict[str, Any]],
+    repo: str | Path | None = None,
 ) -> int:
     """Adjudicate stashed cheap ``clear_fp`` claims against the full
     ANALYSE verdicts and record them to the scorecard.
@@ -309,6 +398,10 @@ def record_prefilter_outcomes(
     inline after their full analysis; /agentic's split hook/dispatch
     structure needs it as a post-batch pass. Returns the number of
     events recorded. Best-effort — never raises.
+
+    ``repo``: the orchestrator-resolved analysis target for the
+    scorecard's diversity ledger (same provenance rule as
+    :func:`prefilter_for_finding` — never a finding-dict field).
     """
     if not pending_claims:
         return 0
@@ -324,10 +417,11 @@ def record_prefilter_outcomes(
         claim = pending_claims.get(str(result.get("finding_id") or ""))
         if claim is None:
             continue
-        full_verdict = result.get("is_true_positive")
+        full_verdict = read_verdict(result, "is_true_positive")
         if full_verdict is None:
             # The full analysis abstained (quality-degraded response
-            # with no verdict field). An abstention is not a
+            # with no verdict field, or a malformed shape that is a
+            # non-verdict either way). An abstention is not a
             # disagreement — recording it as "incorrect" would erode
             # fast-tier trust on zero evidence, the same
             # abstention-as-vote miscount the correlation engine
@@ -342,6 +436,7 @@ def record_prefilter_outcomes(
                 full_says_fp=(full_verdict is False),
                 cheap_reasoning=claim.get("cheap_reasoning", ""),
                 full_reasoning=str(result.get("reasoning") or ""),
+                repo=repo,
             )
             n += 1
         except Exception:

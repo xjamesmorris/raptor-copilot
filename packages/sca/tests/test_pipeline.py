@@ -7,6 +7,7 @@ runs offline and is deterministic.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import List
 
@@ -385,6 +386,8 @@ def test_run_sca_warm_cache_avoids_network_on_second_run(tmp_path: Path) -> None
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(os.geteuid() == 0,
+                    reason="chmod 000 does not block reads for root")
 def test_find_previous_deps_skips_unreadable_sibling(tmp_path: Path) -> None:
     """When ``output_dir`` lives under a shared root like /tmp/, the
     parent contains other operators' / system dirs that the SCA
@@ -408,6 +411,8 @@ def test_find_previous_deps_skips_unreadable_sibling(tmp_path: Path) -> None:
         sibling_blocked.chmod(0o755)
 
 
+@pytest.mark.skipif(os.geteuid() == 0,
+                    reason="chmod 000 does not block reads for root")
 def test_find_previous_deps_unreadable_parent_returns_none(
     tmp_path: Path,
 ) -> None:
@@ -437,10 +442,15 @@ def test_find_previous_deps_returns_most_recent_by_mtime(
     older = tmp_path / "older"
     older.mkdir()
     (older / "findings.json").write_text("[]")
-    time.sleep(0.05)
     newer = tmp_path / "newer"
     newer.mkdir()
     (newer / "findings.json").write_text("[]")
+    # Explicit day-scale mtime offsets, not a sleep — a sleep-based
+    # ordering flakes when a loaded runner writes both files within
+    # one timestamp granule (same class as the cache-eviction tests).
+    now = time.time()
+    os.utime(older / "findings.json", (now - 86400, now - 86400))
+    os.utime(newer / "findings.json", (now, now))
     result = _find_previous_deps(out_dir)
     assert result == newer / "findings.json"
 
@@ -515,4 +525,79 @@ def test_run_sca_scan_reports_fixture_tree_manifests(tmp_path: Path) -> None:
     all_files = {r["file"] for r in rows}
     assert any("testdata/pom.xml" in f for f in all_files), (
         "testdata/-tree manifest must appear in scan findings"
+    )
+
+
+def test_canonical_merges_alias_name_regardless_of_order() -> None:
+    """A manifest declaring the package both plain and aliased at the
+    same version collapses to one row — the alias spelling must
+    survive first-seen order, or fix-materialisation can't rewrite
+    the aliased declaration."""
+    plain = _dep("lodash", "4.17.4")
+    aliased = _dep("lodash", "4.17.4")
+    aliased.alias_name = "my-lodash"
+    for order in ([plain, aliased], [aliased, plain]):
+        # Fresh copies per direction — the merge mutates the kept row.
+        a, b = order[0], order[1]
+        canonical = select_canonical_for_osv([a, b])
+        assert len(canonical) == 1
+        assert canonical[0].alias_name == "my-lodash", (
+            f"alias lost for order {[d.alias_name for d in order]}"
+        )
+        # reset for the second iteration
+        plain.alias_name = None
+        aliased.alias_name = "my-lodash"
+
+
+# ---------------------------------------------------------------------------
+# --no-cache must reach every registry-metadata client
+# ---------------------------------------------------------------------------
+
+
+def test_no_cache_zeroes_registry_metadata_ttl() -> None:
+    """The single-owner constructor zeroes the TTL under --no-cache
+    and keeps each client's own default otherwise — freshness is these
+    clients' whole reason to exist (recent_publish, maintainer_change,
+    yanked_version, transitive-drop, LLM registry views)."""
+    from packages.sca.pipeline import RunOptions, _registry_metadata_client
+    from packages.sca.registries.pypi import PyPIClient
+
+    fresh = _registry_metadata_client(
+        PyPIClient, http=None, cache=None,
+        options=RunOptions(no_cache=True))
+    assert fresh._ttl == 0
+    default = _registry_metadata_client(
+        PyPIClient, http=None, cache=None, options=RunOptions())
+    assert default._ttl > 0
+
+
+def test_registry_metadata_clients_route_through_single_owner() -> None:
+    """Closure over pipeline.py: no registry client may be constructed
+    directly — every construction routes through
+    _registry_metadata_client, so a new call site cannot silently
+    serve day-old registry metadata to a --no-cache run (the exact
+    drift the harden entry point documents and defends against)."""
+    import ast
+    import inspect
+
+    from packages.sca import pipeline as pipeline_mod
+
+    tree = ast.parse(inspect.getsource(pipeline_mod))
+    registry_names: set[str] = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.ImportFrom) and node.module
+                and node.module.split(".")[0] == "registries"):
+            for alias in node.names:
+                registry_names.add(alias.asname or alias.name)
+    assert registry_names, "universe empty — import shape changed?"
+    offenders = [
+        (node.func.id, node.lineno)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in registry_names
+    ]
+    assert offenders == [], (
+        f"registry client(s) constructed outside "
+        f"_registry_metadata_client: {offenders}"
     )

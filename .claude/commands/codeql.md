@@ -58,7 +58,8 @@ unblocks better results. After the run completes (never mid-pipeline), offer the
 decision as a structured choice (see CLAUDE.md § INTERACTIVE PROMPTS). Run
 `libexec/raptor-may-ask` first; only if it prints `interactive` AND the
 AskUserQuestion tool is available, ask. Quote the actual hint text from the run
-output in the question.
+output in the question — with non-printables escaped (the hint may embed
+target-derived file names).
 
 **Trigger A — buildless extraction hit unresolved includes** (output contains
 "build-generated headers are invisible without a traced build (opt in via
@@ -71,7 +72,10 @@ output in the question.
    extract with full build context.
 3. **Persist `/project trust build`** — grants: every future `/codeql` and `/agentic`
    run on this project does traced-build extraction (per-run `--no-traced-build`
-   still overrides). `build` does NOT imply `config`.
+   still overrides), AND repo-declared build-flags evidence (fortify /
+   stack-protector) becomes suppression-grade in source-intel's verdict policy on
+   the corpus Validator lane (no per-run flag pair; the marker is the only
+   control). `build` does NOT imply `config`.
 
 **Trigger B — strict trust checks skipped an LLM-assisted step** (output warns the
 target repo has dangerous Claude Code config and says "Pass --trust-repo to

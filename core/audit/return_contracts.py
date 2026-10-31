@@ -31,10 +31,16 @@ target-specific name with no learned input resolves to *no* contract
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+
+from core.paths import confine
+from core.source import read_text_capped
 from typing import Any
+
+from core.source.lines import split_lines
 
 from .fail_open_roles import (
     _CORROBORATED_SPEC_TIERS,
@@ -112,7 +118,7 @@ def harvest_wur_declarations(
     for source in source_texts.values():
         if not wur_alias_in(source):
             continue
-        lines = source.splitlines()
+        lines = split_lines(source)
         for idx, line in enumerate(lines):
             if not wur_alias_in(line):
                 continue
@@ -126,8 +132,13 @@ def harvest_wur_declarations(
             # sits on this or a preceding line); a bare attribute line
             # is the attribute-first style (name follows). Never more
             # than one declaration per alias occurrence.
+            # The attribute body is bounded: unbounded, a line that
+            # repeats ``__attribute__((`` without the closer re-scans
+            # the rest of the line per occurrence — quadratic on
+            # hostile source; real attribute lists sit far inside
+            # 1000 chars.
             declarator_tail = re.sub(
-                r"__attribute__\s*\(\(.*?\)\)", "", line,
+                r"__attribute__\s*\(\(.{0,1000}?\)\)", "", line,
             )
             if ")" in declarator_tail:
                 nearby = (
@@ -153,6 +164,16 @@ def harvest_wur_declarations(
 
 
 _WUR_SCAN_SUFFIXES = (".h", ".hpp", ".hh", ".hxx")
+# Header-count budget, both directions: RAISING it reads more headers
+# per run (each is a capped read + regex sweep — I/O-bound, and header
+# count is target-derived, so an unbounded sweep on a hostile or
+# kernel-scale tree is a time sink). LOWERING it drops wur coverage on
+# ordinary trees that fit comfortably today. When it binds, the budget
+# is spread EVENLY across the sorted tree — index-based even selection
+# that fills the budget EXACTLY — rather than taking the alphabetical
+# prefix (a kernel tree sorts arch/alpha/... first, so a prefix slice
+# reads one corner of the tree), and the selection ratio is disclosed
+# with a warning.
 _MAX_WUR_SCAN_FILES = 400
 _MAX_WUR_FILE_BYTES = 400_000
 
@@ -169,15 +190,34 @@ def harvest_wur_from_target(target_path: Path) -> frozenset[str]:
         )
     except OSError:
         return frozenset()
-    for p in paths[:_MAX_WUR_SCAN_FILES]:
-        try:
-            if p.stat().st_size > _MAX_WUR_FILE_BYTES:
-                continue
-            texts[str(p)] = p.read_text(
-                encoding="utf-8", errors="replace",
-            )
-        except OSError:
+    if len(paths) > _MAX_WUR_SCAN_FILES:
+        n = len(paths)
+        # Index-based even selection: exactly the budget, spread over
+        # the whole sorted list, first file always included. (NOT a
+        # stride slice — xs[::ceil(n/cap)] under-fills at non-divisible
+        # boundaries: n = cap + 1 selects only ~half the budget. Here
+        # the exact steps are n/cap > 1 apart, so rounding — which
+        # moves each index by < 0.5 — keeps them strictly increasing:
+        # cap distinct indices, always.)
+        sampled = [
+            paths[round(i * n / _MAX_WUR_SCAN_FILES)]
+            for i in range(_MAX_WUR_SCAN_FILES)
+        ]
+        logger.warning(
+            "warn_unused_result harvest capped: scanning %d of %d "
+            "headers (sampled evenly across the sorted tree) — wur "
+            "attributes in unsampled headers are not harvested",
+            len(sampled), n,
+        )
+        paths = sampled
+    for p in paths:
+        resolved = confine(target_path, p)
+        if resolved is None:
             continue
+        got = read_text_capped(resolved, _MAX_WUR_FILE_BYTES)
+        if got is None or got[1]:
+            continue
+        texts[str(p)] = got[0]
     return harvest_wur_declarations(texts)
 
 
@@ -195,6 +235,47 @@ def _wur_contract(callee: str, ctx: RoleContext) -> ContractEvidence | None:
 # ── operator annotations ────────────────────────────────────────────
 
 
+def _annotation_entries(base: Path) -> list[Any]:
+    """The first ``_MAX_ANNOTATION_SCAN`` annotations under *base*,
+    memoised on a stat fingerprint of the tree — the per-callee
+    rescan re-parsed every annotation file on every lookup. An edited
+    or added note changes the fingerprint and reloads."""
+    fp_items: list[tuple[str, int, int]] = []
+    try:
+        for root, _dirs, files in os.walk(base):
+            for name in files:
+                if not name.endswith(".md"):
+                    continue
+                full = os.path.join(root, name)
+                try:
+                    st = os.stat(full)
+                except OSError:
+                    continue
+                fp_items.append(
+                    (os.path.relpath(full, base),
+                     st.st_mtime_ns, st.st_size),
+                )
+    except OSError:
+        return []
+    fingerprint = tuple(sorted(fp_items))
+    key = str(base)
+    with _CONTRACT_CACHE_LOCK:
+        cached = _ANNOTATION_SCAN_CACHE.get(key)
+        if cached is not None and cached[0] == fingerprint:
+            return cached[1]
+    from core.annotations.storage import iter_all_annotations
+    entries: list[Any] = []
+    for ann in iter_all_annotations(base):
+        if len(entries) >= _MAX_ANNOTATION_SCAN:
+            break
+        entries.append(ann)
+    with _CONTRACT_CACHE_LOCK:
+        if len(_ANNOTATION_SCAN_CACHE) >= _CONTRACT_CACHE_MAX:
+            _ANNOTATION_SCAN_CACHE.clear()
+        _ANNOTATION_SCAN_CACHE[key] = (fingerprint, entries)
+    return entries
+
+
 def _annotation_contract(
     callee: str, ctx: RoleContext,
 ) -> ContractEvidence | None:
@@ -206,22 +287,29 @@ def _annotation_contract(
         return None
     tail = callee.rsplit(".", 1)[-1]
     try:
-        from core.annotations.storage import iter_all_annotations
-        scanned = 0
-        for ann in iter_all_annotations(Path(base)):
-            scanned += 1
-            if scanned > _MAX_ANNOTATION_SCAN:
-                break
+        from core.annotations.provenance import is_human_grade
+        from core.annotations.storage import annotation_file_mtime
+        for ann in _annotation_entries(Path(base)):
             fn_tail = (ann.function or "").rsplit(".", 1)[-1]
             if fn_tail != tail:
                 continue
             prose = ann.body or ""
             if _RETURN_SIGNAL_PROSE_RE.search(prose) \
                     or _MUST_CHECK_PROSE_RE.search(prose):
+                # Registry grade is human-grade-gated (the
+                # consistency_prepass sibling gate): agent-written
+                # prose is hint-tier by the annotation doctrine, so
+                # it binds the contract at detection grade only.
+                human = is_human_grade(
+                    ann.metadata or {},
+                    note_mtime=annotation_file_mtime(
+                        Path(base), ann.file or "",
+                    ),
+                )
                 return ContractEvidence(
                     source="annotation",
                     provenance="annotation",
-                    grade=GRADE_REGISTRY,
+                    grade=GRADE_REGISTRY if human else GRADE_DETECTION,
                     detail=_contract_from_prose(prose),
                 )
     except Exception:
@@ -333,6 +421,47 @@ def _tier_a_contract(
 # ── IRIS/taint specs ────────────────────────────────────────────────
 
 
+#: Stat-stamped reload caches for the per-callee contract sources:
+#: both the IRIS spec file and the annotation tree were re-read and
+#: re-parsed on EVERY callee lookup. Keyed on (path, mtime, size) —
+#: an edited file reloads, an unchanged one is served. Small and
+#: process-scoped; cleared wholesale at the tiny cap.
+_IRIS_SPEC_CACHE: dict[str, tuple[tuple[int, int], list[Any]]] = {}
+_ANNOTATION_SCAN_CACHE: dict[
+    str, tuple[tuple[tuple[str, int, int], ...], list[Any]],
+] = {}
+_CONTRACT_CACHE_LOCK = __import__("threading").Lock()
+_CONTRACT_CACHE_MAX = 8
+
+
+def _iris_specs_cached(spec_path: Path) -> list[Any] | None:
+    """Parsed IRIS specs for *spec_path*, memoised per stat stamp."""
+    try:
+        st = os.stat(spec_path)
+    except OSError:
+        return None
+    stamp = (st.st_mtime_ns, st.st_size)
+    key = str(spec_path)
+    with _CONTRACT_CACHE_LOCK:
+        cached = _IRIS_SPEC_CACHE.get(key)
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+    try:
+        from core.audit.iris_specs import specs_from_json
+        specs = list(
+            specs_from_json(spec_path.read_text(encoding="utf-8")),  # raw-open: RAPTOR-written IRIS spec artifact in the run out dir
+        )
+    except Exception:
+        logger.debug("return contract: iris spec load failed",
+                     exc_info=True)
+        return None
+    with _CONTRACT_CACHE_LOCK:
+        if len(_IRIS_SPEC_CACHE) >= _CONTRACT_CACHE_MAX:
+            _IRIS_SPEC_CACHE.clear()
+        _IRIS_SPEC_CACHE[key] = (stamp, specs)
+    return specs
+
+
 def _iris_contract(
     callee: str, ctx: RoleContext,
 ) -> ContractEvidence | None:
@@ -341,12 +470,8 @@ def _iris_contract(
     spec_path = Path(ctx.out_dir) / "iris-taint-specs.json"
     if not spec_path.is_file():
         return None
-    try:
-        from core.audit.iris_specs import specs_from_json
-        specs = specs_from_json(spec_path.read_text(encoding="utf-8"))
-    except Exception:
-        logger.debug("return contract: iris spec load failed",
-                     exc_info=True)
+    specs = _iris_specs_cached(spec_path)
+    if specs is None:
         return None
     tail = callee.rsplit(".", 1)[-1]
     for spec in specs:

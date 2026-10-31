@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from core.symbolic._project import _open_project
+from core.symbolic import _engine
 from core.symbolic._budget import z3_call_budget
 from core.symbolic._types import SymbolicResult
 
@@ -38,22 +38,12 @@ def find_reaching_input(
 ) -> SymbolicResult:
     """Isolated entry point — semantics in :func:`_find_reaching_input_impl`.
 
-    The implementation runs in a spawned child with a hard kill at
-    ``timeout`` plus a grace window: hostile targets can drive one
-    native solver call past every cooperative bound (verified live),
-    so the budget is enforced by process isolation, not cooperation.
-    When angr is unavailable the availability guard answers directly
-    (no child is spawned).
+    Hard-budget process isolation via
+    :func:`core.symbolic._engine.dispatch_isolated`; when angr is
+    unavailable the availability guard answers directly.
     """
-    from core.symbolic._availability import angr_available
-    from core.symbolic._isolate import run_isolated
-    if not angr_available():
-        return _find_reaching_input_impl(
-            binary_path, target_address, timeout=timeout,
-            max_input_bytes=max_input_bytes,
-            avoid_addresses=avoid_addresses)
-    return run_isolated(
-        "core.symbolic._reach", "_find_reaching_input_impl",
+    return _engine.dispatch_isolated(
+        _find_reaching_input_impl,
         {"binary_path": binary_path, "target_address": target_address,
          "timeout": timeout, "max_input_bytes": max_input_bytes,
          "avoid_addresses": avoid_addresses},
@@ -90,148 +80,66 @@ def _find_reaching_input_impl(
         find; ``succeeded=False`` with ``reason`` describing the
         failure mode on miss / timeout / error.
     """
-    from core.symbolic._availability import (
-        angr_available, unavailable_result,
-    )
-    if not angr_available():
-        return unavailable_result("angr", "find_reaching_input")
+    gate = _engine.availability_gate("find_reaching_input")
+    if gate is not None:
+        return gate
 
-    binary_path = Path(binary_path)
-    if not binary_path.is_file():
-        return SymbolicResult(
-            succeeded=False,
-            reason=f"binary not found: {binary_path}",
-            wall_seconds=0.0,
-        )
+    binary_path, missing = _engine.check_binary(binary_path)
+    if missing is not None:
+        return missing
 
     t0 = time.monotonic()
-    try:
-        project = _open_project(binary_path)
-        # Declared-length copies (symbolic size args) otherwise build
-        # per-byte conditional ASTs that wedge z3 at assert time —
-        # concretize adversarially (max satisfiable length) instead.
-        # Installed here, inside the isolated child: the per-process
-        # project cache never leaks hooks to other consumers.
-        from core.symbolic._concretize import install_adversarial_size_hooks
-        install_adversarial_size_hooks(project)
-    except Exception as exc:  # noqa: BLE001
-        return SymbolicResult(
-            succeeded=False,
-            reason=f"angr load failed: {type(exc).__name__}: {exc}",
-            wall_seconds=time.monotonic() - t0,
-        )
-
-    # Bounds check: target must fall inside a mapped segment. Cheap
-    # sanity — an out-of-range target guarantees exploration failure.
-    if not _is_mapped(project, target_address):
-        return SymbolicResult(
-            succeeded=False,
-            reason=(
-                f"target 0x{target_address:x} not in a mapped segment "
-                "(check base address / PIE offset)"
-            ),
-            wall_seconds=time.monotonic() - t0,
-            metadata={"target_address": target_address},
-        )
-
-    # Deferred import to keep the module-load path light for consumers
-    # that only touch the types.
-    import angr
-
-    # SimFileStream models stdin as a stream of symbolic bytes. Callers
-    # who need a fixed-size read model would use SimFile instead.
-    state = project.factory.entry_state(
-        stdin=angr.SimFileStream,
-        add_options={angr.options.LAZY_SOLVES},
+    project, load_error = _engine.open_gated_project(
+        binary_path, t0,
+        install_hooks=_engine.size_concretization_hooks,
     )
+    if load_error is not None:
+        return load_error
 
+    unmapped = _engine.check_mapped(project, target_address, t0)
+    if unmapped is not None:
+        return unmapped
+
+    state = _engine.make_entry_state(project)
     simgr = project.factory.simulation_manager(state)
 
-    # Explore with a timeout callback — angr's ``explore`` polls this
-    # between step batches so we bail cleanly rather than mid-state.
     deadline = t0 + timeout
 
-    def _stop_predicate(_simgr) -> bool:
-        return time.monotonic() >= deadline
-
-    def _step(sg):
-        if _stop_predicate(sg):
-            return sg.move(from_stash="active", to_stash="deadended")
-        if len(sg.active) > 512:
-            # RAM bound (mirrors _overflow): a branch-per-byte target
-            # allocates heavyweight states freely inside the timeout
-            # window otherwise.
-            return sg.move(from_stash="active", to_stash="deadended")
-        return sg
-
+    step = _engine.budget_step(deadline)
     try:
         with z3_call_budget(deadline):
             simgr.explore(
                 find=target_address,
                 avoid=avoid_addresses or [],
                 num_find=1,
-                step_func=_step,
+                step_func=step,
             )
     except Exception as exc:  # noqa: BLE001 — angr's exploration may raise
-        return SymbolicResult(
-            succeeded=False,
-            reason=f"angr explore raised: {type(exc).__name__}: {exc}",
-            wall_seconds=time.monotonic() - t0,
-            states_explored=_count_states(simgr),
+        return _engine.raised_result(
+            exc, t0=t0, simgr=simgr,
             metadata={"target_address": target_address},
         )
 
     wall = time.monotonic() - t0
-    states = _count_states(simgr)
+    states = _engine.count_states(simgr)
 
     if not simgr.found:
-        # Distinguish "timed out with active states remaining" from
-        # "explored fully and found nothing".
-        timed_out = time.monotonic() >= deadline
-        return SymbolicResult(
-            succeeded=False,
-            reason=(
-                f"timeout after {wall:.1f}s"
-                if timed_out
-                else "no path to target"
-            ),
-            wall_seconds=wall,
-            states_explored=states,
+        return _engine.unfound_result(
+            deadline=deadline, wall=wall, states=states,
+            timeout_reason=f"timeout after {wall:.1f}s",
+            no_path_reason="no path to target",
             metadata={"target_address": target_address},
+            step=step, simgr=simgr,
         )
 
     found = simgr.found[0]
-    # Extract concrete stdin bytes. ``posix.dumps(0)`` gives the
-    # full stdin content the state consumed.
-    try:
-        with z3_call_budget(time.monotonic() + 30.0):
-            concrete = bytes(found.posix.dumps(0))
-        if len(concrete) > max_input_bytes:
-            # NEVER truncate: a shortened witness will not replay and
-            # a false success is the one thing a verification
-            # substrate must not emit.
-            return SymbolicResult(
-                succeeded=False,
-                reason=(
-                    f"witness needs {len(concrete)} stdin bytes — over "
-                    f"the max_input_bytes cap ({max_input_bytes}); "
-                    f"raise the cap to accept it"
-                ),
-                wall_seconds=wall,
-                states_explored=states,
-                metadata={
-                    "target_address": target_address,
-                    "witness_length": len(concrete),
-                },
-            )
-    except Exception as exc:  # noqa: BLE001 — solver can fail
-        return SymbolicResult(
-            succeeded=False,
-            reason=f"solver failed to concretise: {type(exc).__name__}",
-            wall_seconds=wall,
-            states_explored=states,
-            metadata={"target_address": target_address},
-        )
+    concrete = _engine.dump_stdin_witness(
+        found, max_input_bytes=max_input_bytes, wall=wall, states=states,
+        metadata={"target_address": target_address},
+        overcap_hint="; raise the cap to accept it",
+    )
+    if isinstance(concrete, SymbolicResult):
+        return concrete
 
     return SymbolicResult(
         succeeded=True,
@@ -244,22 +152,3 @@ def _find_reaching_input_impl(
             "input_length": len(concrete),
         },
     )
-
-
-def _is_mapped(project, addr: int) -> bool:
-    """Return True if ``addr`` falls inside one of the loader's mapped
-    segments. Angr's ``project.loader.find_object_containing(addr)``
-    returns None for unmapped addresses; use that as the check."""
-    try:
-        return project.loader.find_object_containing(addr) is not None
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def _count_states(simgr) -> int:
-    """Sum states across all stashes as a diagnostic. simgr may
-    have stashes we don't know about; use the ``all_states`` view."""
-    try:
-        return sum(1 for _ in simgr.stashes.values() for __ in _)
-    except Exception:  # noqa: BLE001
-        return 0

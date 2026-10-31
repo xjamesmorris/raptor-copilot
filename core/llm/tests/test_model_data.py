@@ -270,3 +270,27 @@ class TestCanonicalResolvers:
         from core.llm.model_data import resolve_model_costs, resolve_model_limits
         assert resolve_model_limits("no-such-model-xyz") is None
         assert resolve_model_costs("no-such-model-xyz") is None
+
+
+# --- canonical resolution chain adoption ---------------------------------
+
+
+def test_limit_and_price_helpers_resolve_bedrock_dated_ids() -> None:
+    """context_window_for / max_output_for / rpm_for / price_for must
+    resolve through the canonical exact → dated-alias → bedrock-strip
+    chain (_resolve_model_entry). Two independently re-inlined lookup
+    ladders have each caused a production failure ($0 Bedrock cost
+    booking; a 4096-token completion ceiling), so every helper must
+    give the dated Bedrock form the same answer as the bare name."""
+    bare = "claude-opus-4-6"
+    dated_bedrock = "us.anthropic.claude-opus-4-6-20251101"
+    assert context_window_for(dated_bedrock) == context_window_for(bare)
+    assert max_output_for(dated_bedrock) == max_output_for(bare)
+    assert rpm_for(dated_bedrock) == rpm_for(bare)
+    bare_price = price_for(bare)
+    bedrock_price = price_for(dated_bedrock)
+    # Prices match up to the regional-CRIS multiplier the canonical
+    # chain applies for regional Bedrock ids with a global SKU.
+    ratio = bedrock_price[0] / bare_price[0]
+    assert ratio in (1.0, 1.10)
+    assert bedrock_price[1] / bare_price[1] == ratio

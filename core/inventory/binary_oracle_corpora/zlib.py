@@ -100,8 +100,9 @@ def _build_fresh(sha_dir: Path, build_o0: Path, build_o2: Path) -> None:
     sha_dir.mkdir(parents=True, exist_ok=True)
     src = sha_dir / "src"
 
-    # Centralised safe-clone API (no direct ``git clone``); depth=None
-    # gives us full history so the SHA checkout can resolve.
+    # Centralised safe-clone API (no direct ``git clone``). Shallow
+    # throughout: depth=1 clone, then a depth-1 fetch of the pinned SHA
+    # so the checkout resolves without pulling full history.
     from core.git import clone_repository, get_safe_git_env
     from core.git.clone import safe_git_command
 

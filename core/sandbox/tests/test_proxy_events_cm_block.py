@@ -10,9 +10,12 @@ events from HTTPClient calls inside the with-block went unrecorded.
 Post-fix: ``sandbox()`` registers a block-scoped proxy token at
 ``__enter__`` (gated on ``use_egress_proxy and _will_engage_audit and
 output``) and drains + persists its events at ``__exit__``. Per-spawn
-events that ALSO fanned into the block buffer get de-duped against the
-cumulative ``_sandbox_events`` accumulator on ``(t, host, port)`` so
-the single ``proxy-events.jsonl`` doesn't carry duplicates.
+events that ALSO fanned into the block buffer get de-duped against
+the cumulative ``_sandbox_events`` accumulator on
+``(proxy_seq, t, host, port)`` so the single
+``proxy-events.jsonl`` doesn't carry duplicates — the proxy-stamped
+per-event ``proxy_seq`` keeps genuinely distinct events apart when
+they tie on the timestamp key.
 
 These tests pin the new behaviour without spinning up live network:
 the proxy register/unregister API is exercised directly, and the
@@ -39,7 +42,10 @@ pytestmark = pytest.mark.skipif(
 
 from core.sandbox import context as ctx                   # noqa: E402
 from core.sandbox import proxy as proxy_mod               # noqa: E402
-from core.sandbox.tests.capability import requires_landlock
+from core.sandbox.tests.capability import (
+    requires_landlock,
+    requires_network_block_backend,
+)
 
 
 class TestPersistProxyEventsHelper(unittest.TestCase):
@@ -284,6 +290,136 @@ class TestSandboxContextBlockEventCapture(unittest.TestCase):
             register_calls, [],
             "block token registered despite audit=False",
         )
+
+
+# Same gate as TestSandboxContextBlockEventCapture above: the dedup is
+# driven through a real ``ctx.sandbox`` engagement, whose target/output
+# confinement needs a Landlock layer when the host refuses mount(2) at
+# runtime — on the feature-matrix no-landlock/no-both lanes that shape
+# hits the sandbox's designed fail-closed SandboxSetupError, which is
+# the refusal contract working, not a dedup regression.
+@requires_landlock
+class TestBlockDrainDedupIdentity(unittest.TestCase):
+    """The de-dup key is event IDENTITY (the proxy-stamped
+    ``proxy_seq``), not the (t, host, port) coincidence key: two
+    distinct events can tie on time.monotonic() + destination, and
+    the old key silently dropped the second one from the persisted
+    JSONL."""
+
+    def _fake_proxy(self, block_events):
+        outer = self
+
+        class _Fake:
+            port = 18080
+
+            def __init__(self):
+                self.calls: list = []
+                self._next_token = 0
+
+            def register_sandbox(self, caller_label=None,
+                                 lane_key=None,
+                                 host_recon_threshold=None):
+                self._next_token += 1
+                return self._next_token
+
+            def unregister_sandbox(self, token):
+                return [dict(e) for e in block_events]
+
+            def acquire_audit_log_only(self):
+                pass
+
+            def release_audit_log_only(self):
+                pass
+
+            def add_hosts(self, hosts):
+                pass
+
+            def bind_tcp_lane(self, *, label="sandbox",
+                              allowed_hosts=None, allowed_ports=None):
+                return 18081
+
+            def close_tcp_lane(self, port):
+                pass
+
+            def set_lane_audit(self, key, value):
+                return True
+
+            def update_idle_timeout(self, seconds):
+                pass
+
+        del outer
+        return _Fake()
+
+    def test_distinct_event_with_colliding_timestamp_key_persists(self):
+        spawn_evt = {"proxy_seq": 1, "t": 5.0,
+                     "host": "api.osv.dev",
+                     "port": 443, "result": "allowed"}
+        true_dup = dict(spawn_evt)
+        distinct = {"proxy_seq": 2, "t": 5.0, "host": "api.osv.dev",
+                    "port": 443, "result": "denied_host"}
+        fake = self._fake_proxy([true_dup, distinct])
+        with TemporaryDirectory() as td_target, \
+                TemporaryDirectory() as td_out:
+            with patch.object(proxy_mod, "get_proxy",
+                              return_value=fake):
+                with ctx.sandbox(
+                    target=td_target, output=td_out,
+                    use_egress_proxy=True, proxy_hosts=["api.osv.dev"],
+                    audit=True, audit_run_dir=td_out,
+                    caller_label="dedup-test",
+                ) as run:
+                    # Stand-in for a per-spawn drain: _run() extends
+                    # the cumulative accumulator (exposed as
+                    # run.events) with events it already persisted.
+                    run.events.append(spawn_evt)
+
+            log = Path(td_out) / proxy_mod.PROXY_EVENTS_FILENAME
+            self.assertTrue(log.exists(), "block-only event not persisted")
+            lines = [json.loads(x) for x in
+                     log.read_text().splitlines()]
+            # The true duplicate (same proxy_seq) is de-duped; the
+            # distinct event with the colliding (t, host, port)
+            # survives.
+            self.assertEqual(
+                [(e["proxy_seq"], e["result"]) for e in lines],
+                [(2, "denied_host")],
+            )
+
+
+@requires_network_block_backend
+class TestProxyEventSeqStamp(unittest.TestCase):
+    """The real proxy stamps a unique ``proxy_seq`` on every
+    recorded event, and the SAME event fanned into several buffers
+    keeps its one stamp through the unregister copies."""
+
+    def test_distinct_events_get_distinct_seq_same_event_same_seq(self):
+        proxy = proxy_mod.EgressProxy(allowed_hosts=set())
+        try:
+            tok_a = proxy.register_sandbox(caller_label="a")
+            tok_b = proxy.register_sandbox(caller_label="b")
+            shape = {"host": "h", "port": 443, "result": "allowed",
+                     "reason": None, "resolved_ip": None,
+                     "bytes_c2u": 0, "bytes_u2c": 0, "duration": 0.0}
+            e1 = {"t": 5.0, **shape}
+            e2 = {"t": 5.0, **shape}   # identical timestamp key
+            proxy._record(e1)
+            proxy._record(e2)
+            ev_a = proxy.unregister_sandbox(tok_a)
+            ev_b = proxy.unregister_sandbox(tok_b)
+        finally:
+            proxy.stop()
+        # Filter to the test's synthetic events — infrastructure events
+        # (parser_jail_degraded when Landlock is absent) are unrelated
+        # to proxy_seq stamping.
+        ev_a = [e for e in ev_a if e.get("host") == "h"]
+        ev_b = [e for e in ev_b if e.get("host") == "h"]
+        seqs_a = [e["proxy_seq"] for e in ev_a]
+        seqs_b = [e["proxy_seq"] for e in ev_b]
+        self.assertEqual(len(set(seqs_a)), 2,
+                         f"distinct events share a proxy_seq: {ev_a}")
+        # Fan-out identity: each event carries the SAME seq in every
+        # buffer copy.
+        self.assertEqual(seqs_a, seqs_b)
 
 
 if __name__ == "__main__":

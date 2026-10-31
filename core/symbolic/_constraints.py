@@ -39,7 +39,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from core.symbolic._project import _open_project
+from core.symbolic import _engine
 from core.symbolic._budget import z3_call_budget
 from core.symbolic._types import SymbolicResult
 
@@ -64,17 +64,12 @@ def extract_path_constraints(
     """Isolated entry point — semantics in
     :func:`_extract_path_constraints_impl`.
 
-    Hard-budget process isolation; see :mod:`core.symbolic._isolate`.
-    When angr is unavailable the availability guard answers directly.
+    Hard-budget process isolation via
+    :func:`core.symbolic._engine.dispatch_isolated`; when angr is
+    unavailable the availability guard answers directly.
     """
-    from core.symbolic._availability import angr_available
-    from core.symbolic._isolate import run_isolated
-    if not angr_available():
-        return _extract_path_constraints_impl(
-            binary_path, target_address, max_paths=max_paths,
-            timeout=timeout, max_input_bytes=max_input_bytes)
-    return run_isolated(
-        "core.symbolic._constraints", "_extract_path_constraints_impl",
+    return _engine.dispatch_isolated(
+        _extract_path_constraints_impl,
         {"binary_path": binary_path, "target_address": target_address,
          "max_paths": max_paths, "timeout": timeout,
          "max_input_bytes": max_input_bytes},
@@ -109,47 +104,27 @@ def _extract_path_constraints_impl(
         a list of per-path dicts (see module docstring). Empty list
         + ``succeeded=False`` when no path was found in budget.
     """
-    from core.symbolic._availability import (
-        angr_available, unavailable_result,
-    )
-    if not angr_available():
-        return unavailable_result("angr", "extract_path_constraints")
+    gate = _engine.availability_gate("extract_path_constraints")
+    if gate is not None:
+        return gate
 
-    binary_path = Path(binary_path)
-    if not binary_path.is_file():
-        return SymbolicResult(
-            succeeded=False,
-            reason=f"binary not found: {binary_path}",
-            wall_seconds=0.0,
-        )
+    binary_path, missing = _engine.check_binary(binary_path)
+    if missing is not None:
+        return missing
 
     t0 = time.monotonic()
-    try:
-        project = _open_project(binary_path)
-    except Exception as exc:  # noqa: BLE001
-        return SymbolicResult(
-            succeeded=False,
-            reason=f"angr load failed: {type(exc).__name__}: {exc}",
-            wall_seconds=time.monotonic() - t0,
-        )
+    # No size-concretization hooks here (unlike _reach/_overflow):
+    # pinning symbolic lengths would narrow the very constraint sets
+    # this primitive exists to report.
+    project, load_error = _engine.open_gated_project(binary_path, t0)
+    if load_error is not None:
+        return load_error
 
-    if not _is_mapped(project, target_address):
-        return SymbolicResult(
-            succeeded=False,
-            reason=(
-                f"target 0x{target_address:x} not in a mapped segment "
-                "(check base address / PIE offset)"
-            ),
-            wall_seconds=time.monotonic() - t0,
-            metadata={"target_address": target_address},
-        )
+    unmapped = _engine.check_mapped(project, target_address, t0)
+    if unmapped is not None:
+        return unmapped
 
-    import angr
-
-    state = project.factory.entry_state(
-        stdin=angr.SimFileStream,
-        add_options={angr.options.LAZY_SOLVES},
-    )
+    state = _engine.make_entry_state(project)
     # save_unconstrained=True: capture states whose PC becomes symbolic
     # (typical of stack-overflow-to-PC paths). Post-explore we
     # constrain each unconstrained state's PC to target_address; when
@@ -164,35 +139,22 @@ def _extract_path_constraints_impl(
 
     deadline = t0 + timeout
 
-    def _stop(_simgr) -> bool:
-        return time.monotonic() >= deadline
-
-    def _step(sg):
-        if _stop(sg):
-            return sg.move(from_stash="active", to_stash="deadended")
-        if len(sg.active) > 512:
-            # RAM bound (mirrors _overflow).
-            return sg.move(from_stash="active", to_stash="deadended")
-        return sg
-
+    step = _engine.budget_step(deadline)
     try:
         with z3_call_budget(deadline):
             simgr.explore(
                 find=target_address,
                 num_find=max_paths,
-                step_func=_step,
+                step_func=step,
             )
     except Exception as exc:  # noqa: BLE001
-        return SymbolicResult(
-            succeeded=False,
-            reason=f"angr explore raised: {type(exc).__name__}: {exc}",
-            wall_seconds=time.monotonic() - t0,
-            states_explored=_count_states(simgr),
+        return _engine.raised_result(
+            exc, t0=t0, simgr=simgr,
             metadata={"target_address": target_address},
         )
 
     wall = time.monotonic() - t0
-    states = _count_states(simgr)
+    states = _engine.count_states(simgr)
 
     # Second pass: unconstrained states are overflow-hijack candidates.
     # Constrain each state's PC to target_address; when satisfiable,
@@ -204,17 +166,12 @@ def _extract_path_constraints_impl(
     )
 
     if not simgr.found and not hijack_states:
-        timed_out = time.monotonic() >= deadline
-        return SymbolicResult(
-            succeeded=False,
-            reason=(
-                f"timeout after {wall:.1f}s with no path found"
-                if timed_out
-                else "explored fully; no path reaches target"
-            ),
-            wall_seconds=wall,
-            states_explored=states,
+        return _engine.unfound_result(
+            deadline=deadline, wall=wall, states=states,
+            timeout_reason=f"timeout after {wall:.1f}s with no path found",
+            no_path_reason="explored fully; no path reaches target",
             metadata={"target_address": target_address, "paths": []},
+            step=step, simgr=simgr,
         )
 
     paths: list[dict[str, Any]] = []
@@ -288,7 +245,7 @@ def _promote_unconstrained_to_target(
     """
     if want <= 0:
         return []
-    out = []
+    out: list[Any] = []
     for state in simgr.unconstrained:
         if len(out) >= want:
             break
@@ -382,7 +339,7 @@ def _collect_stdin_byte_indices(ast, out: set) -> None:
             inner = ast.args[2]
         except Exception:  # noqa: BLE001
             return
-        inner_vars = getattr(inner, "variables", frozenset())
+        inner_vars: frozenset[str] = getattr(inner, "variables", frozenset())
         stdin_vars = [v for v in inner_vars if _STDIN_VAR_RE.match(v)]
         if stdin_vars:
             total_bits = getattr(inner, "size", lambda: None)()
@@ -411,16 +368,3 @@ def _collect_stdin_byte_indices(ast, out: set) -> None:
         if hasattr(a, "op"):
             _collect_stdin_byte_indices(a, out)
 
-
-def _is_mapped(project, addr: int) -> bool:
-    try:
-        return project.loader.find_object_containing(addr) is not None
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def _count_states(simgr) -> int:
-    try:
-        return sum(1 for _ in simgr.stashes.values() for __ in _)
-    except Exception:  # noqa: BLE001
-        return 0

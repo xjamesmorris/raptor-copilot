@@ -122,7 +122,7 @@ def _extract_versions(data: dict) -> list[str]:
 def _semver_key(v: str):
     """Best-effort semver tuple."""
     parts = v.split(".")
-    out = []
+    out: list[tuple[int, int | str]] = []
     for p in parts:
         try:
             out.append((0, int(p)))
@@ -177,10 +177,18 @@ def _add_nuspec_methods():
                 self._cache.put(cache_key, None, ttl_seconds=self._ttl)
             return None
         if resp.status_code != 200:
+            # raise_on_status=False means a 404 arrives as a response,
+            # not an exception — negative-cache the authoritative miss
+            # here too, or every detector re-fetches the same dead
+            # nuspec. Other statuses (5xx) stay uncached.
+            if (self._cache is not None
+                    and resp.status_code in (404, 410)):
+                self._cache.put(cache_key, None, ttl_seconds=self._ttl)
             return None
         if not _DEFUSEDXML_AVAILABLE:
-            if self._cache is not None:
-                self._cache.put(cache_key, None, ttl_seconds=self._ttl)
+            # Environment-caused miss (local defusedxml absent) — never
+            # cache it as registry truth: after installing defusedxml
+            # the client kept serving "no nuspec" for up to a full TTL.
             return None
         try:
             root = _safe_xml_fromstring(resp.content)

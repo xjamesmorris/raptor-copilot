@@ -110,6 +110,22 @@ def _run_sandboxed(request: dict, args, creds_value: str) -> int:
     env = RaptorConfig.get_safe_env()
     env["GOOGLE_APPLICATION_CREDENTIALS"] = creds_value
 
+    # An empty operator override means "allow nothing" — honour it as
+    # an explicit POLICY refusal here. Passing the empty allowlist
+    # down would trip the sandbox's caller-bug-shaped ValueError,
+    # which misreads an operator decision as a programming error
+    # (fail-closed either way; the error shape is what changes).
+    proxy_hosts = bq.proxy_hosts_for_bq()
+    if not proxy_hosts:
+        return bq.write_error_json(
+            sys.stderr, "policy",
+            "operator proxy-hosts override allows no hosts "
+            "(~/.config/raptor/bq-proxy-hosts.json) — BigQuery egress "
+            "denied by policy; add the required Google hosts to the "
+            "override or remove it to restore the defaults",
+            bq.EXIT_USAGE,
+        )
+
     readable = python_runtime_tool_paths() + [str(_CHILD_SCRIPT.parent)]
     if not creds_value.lstrip().startswith("{"):
         creds_path = Path(creds_value)
@@ -121,7 +137,7 @@ def _run_sandboxed(request: dict, args, creds_value: str) -> int:
             proc = run_untrusted_networked(
                 [sys.executable, str(_CHILD_SCRIPT)],
                 output=scratch,
-                proxy_hosts=bq.proxy_hosts_for_bq(),
+                proxy_hosts=proxy_hosts,
                 readable_paths=readable,
                 env=env,
                 input=json.dumps(request),
@@ -182,6 +198,12 @@ def main() -> int:
              f"more (default: {bq.DEFAULT_MAX_BYTES_BILLED})",
     )
     parser.add_argument(
+        "--max-rows", type=int, default=bq.DEFAULT_MAX_ROWS,
+        help="Cap on result rows materialised into the envelope; "
+             "truncation is flagged via \"truncated\": true "
+             f"(default: {bq.DEFAULT_MAX_ROWS})",
+    )
+    parser.add_argument(
         "--timeout", type=float, default=bq.DEFAULT_TIMEOUT_S,
         help=f"Query timeout in seconds (default: {bq.DEFAULT_TIMEOUT_S:g})",
     )
@@ -207,6 +229,8 @@ def main() -> int:
 
     if args.max_bytes_billed <= 0:
         parser.error("--max-bytes-billed must be a positive integer")
+    if args.max_rows <= 0:
+        parser.error("--max-rows must be a positive integer")
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
 
@@ -222,6 +246,7 @@ def main() -> int:
         "max_bytes_billed": args.max_bytes_billed,
         "timeout_s": args.timeout,
         "dry_run": args.dry_run,
+        "max_rows": args.max_rows,
     }
 
     if not args.no_sandbox:
@@ -246,6 +271,7 @@ def main() -> int:
             max_bytes_billed=args.max_bytes_billed,
             timeout_s=args.timeout,
             dry_run=args.dry_run,
+            max_rows=args.max_rows,
         )
     except bq.BQQueryError as exc:
         return bq.write_error_json(sys.stderr, exc)

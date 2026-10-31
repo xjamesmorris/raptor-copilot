@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from core.atomic_fs import write_text_atomically
 from core.logging import get_logger
 from core.sandbox import run_untrusted_networked
 from core.security.redaction import redact_secrets
@@ -140,9 +141,15 @@ class ExternalValidatorRunner:
         # excluded from the batch — never silently dropped.
         results: list[dict[str, Any]] = []
         targets: dict[str, set[str]] = {}
+        # Remember denials: without this, every further finding on an
+        # already-denied target re-authorized and appended a duplicate
+        # "denied" row per finding.
+        denied: set[str] = set()
         for finding in findings:
             target_url = finding.target_url or finding.url
             tags = TAGS_BY_VULN_TYPE.get(finding.vuln_type or "", "")
+            if target_url in denied:
+                continue
             if target_url in targets:
                 if tags:
                     targets[target_url].update(tags.split(","))
@@ -155,6 +162,7 @@ class ExternalValidatorRunner:
                     action="external_validator",
                 )
             except WebPolicyError as exc:
+                denied.add(target_url)
                 results.append({
                     "tool": "nuclei",
                     "target_url": self._redact(target_url),
@@ -307,7 +315,9 @@ class ExternalValidatorRunner:
                 self._scrub_response_store(responses_dir)
 
         output_file = run_dir / f"nuclei-results{suffix}.jsonl"
-        output_file.write_text(self._redact(stdout), encoding="utf-8")
+        # Atomic write (planted-symlink defence at the predictable
+        # artifact name in the reused, child-writable run dir).
+        write_text_atomically(output_file, self._redact(stdout))
 
         matches_by_target: dict[str, list[dict[str, Any]]] = {u: [] for u in targets}
         for line in stdout.splitlines():
@@ -364,7 +374,14 @@ class ExternalValidatorRunner:
         for target_url in targets:
             if matched_at.startswith(target_url):
                 return target_url
-        matched_host = (urlparse(matched_at).hostname or "").lower()
+        # nuclei's matched-at is often a bare "host:port" — urlparse
+        # reads that as scheme "host" with no hostname, so host-based
+        # attribution silently failed and the match survived only in
+        # the raw jsonl while the target row read "no_match"
+        # (evidence-loss direction). Prefix // so urlparse treats it
+        # as a netloc.
+        candidate = matched_at if "//" in matched_at else f"//{matched_at}"
+        matched_host = (urlparse(candidate).hostname or "").lower()
         for target_url in targets:
             if (urlparse(target_url).hostname or "").lower() == matched_host:
                 return target_url
@@ -399,6 +416,12 @@ class ExternalValidatorRunner:
             logger.debug("could not restrict response store dir", exc_info=True)
         for entry in entries:
             try:
+                # Skip symlinks outright: the store was written by
+                # the (network-facing) child — following a planted
+                # link here would chmod/read/REWRITE whatever it
+                # points at outside the store.
+                if entry.is_symlink():
+                    continue
                 if entry.is_dir():
                     entry.chmod(0o700)
                     continue
@@ -410,7 +433,7 @@ class ExternalValidatorRunner:
                 text = entry.read_text(encoding="utf-8", errors="replace")
                 redacted = redact_secrets(text)
                 if redacted != text:
-                    entry.write_text(redacted, encoding="utf-8")
+                    write_text_atomically(entry, redacted)
             except OSError:
                 logger.debug(
                     "could not scrub transcript %s", entry, exc_info=True,

@@ -502,11 +502,17 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 2
 
+    # Anchor to RAPTOR's out dir like binary_oracle_edges does — the
+    # old cwd-relative paths dropped reports/caches into whatever tree
+    # main() ran from, and the edges cache resolved differently.
+    from core.config import RaptorConfig
     if args.out is None:
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        args.out = Path("out/binary-oracle-precision/runs") / ts
+        args.out = (Path(RaptorConfig.BASE_OUT_DIR)
+                    / "binary-oracle-precision" / "runs" / ts)
 
-    cache_root = Path("out/binary-oracle-precision/cache")
+    cache_root = (Path(RaptorConfig.BASE_OUT_DIR)
+                  / "binary-oracle-precision" / "cache")
     reports: list[CorpusReport] = []
     for name in names:
         logger.info("measuring corpus %s ...", name)

@@ -26,12 +26,17 @@ import logging
 import re
 from typing import Any
 
+from core.orchestration.llm_json import dict_rows
+
 logger = logging.getLogger(__name__)
 
 MAX_PAIRS = 500
 
 _CALL_NAME_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
-_SOURCE_LOC_RE = re.compile(r"@\s*(\S+?):(\d+)\s*$")
+# Path span bounded: unbounded, every planted "@" re-scans the rest
+# of a hostile line — quadratic. Real source paths sit far below
+# 300 chars (beyond it the location is unparsed).
+_SOURCE_LOC_RE = re.compile(r"@\s*(\S{1,300}?):(\d+)\s*$")
 
 _EP_KEYS = ("has_taint_flow", "taint_reaches_sinks")
 _SINK_KEYS = ("taint_reached_from",)
@@ -68,6 +73,7 @@ def build_taint_pairs(
     checklist: dict[str, Any] | None = None,
     *,
     iris_sinks: frozenset[str] = frozenset(),
+    max_pairs: int | None = None,
 ) -> list[tuple[dict[str, Any], dict[str, Any], str, str]]:
     """Enumerate (entry_point, sink_detail, source_method, sink_call).
 
@@ -77,37 +83,78 @@ def build_taint_pairs(
     still pairs when its ``name`` is a known IRIS sink — the wrapper
     function itself is the callee. Such sinks are stamped
     ``taint_spec_source: "iris"`` for provenance.
+
+    ``max_pairs`` bounds MATERIALISATION, not just downstream use: the
+    sections are LLM-authored, so an n-entries-per-section map must
+    cost O(cap), never O(n^2) (a 10k x 10k map would otherwise
+    materialise 10^8 tuples before any later slice could act).
     """
-    calls = _call_index(checklist)
-    pairs = []
-    for ep in context_map.get("entry_points") or []:
-        source_method = ep.get("name")
-        if not source_method or not ep.get("id"):
-            continue
-        for sink in context_map.get("sink_details") or []:
-            if not sink.get("id"):
-                continue
-            sink_call = _sink_call_name(sink, calls)
-            if not sink_call:
-                name = sink.get("name") or ""
-                if name and name in iris_sinks:
-                    sink_call = name
-                    sink.setdefault("taint_spec_source", "iris")
-                else:
-                    continue
-            pairs.append((ep, sink, source_method, sink_call))
+    pairs, _dropped = _enumerate_taint_pairs(
+        context_map, checklist, iris_sinks=iris_sinks, max_pairs=max_pairs)
     return pairs
 
 
+def _enumerate_taint_pairs(
+    context_map: dict[str, Any],
+    checklist: dict[str, Any] | None,
+    *,
+    iris_sinks: frozenset[str] = frozenset(),
+    max_pairs: int | None = None,
+) -> tuple[list[tuple[dict[str, Any], dict[str, Any], str, str]], int]:
+    """Worker for :func:`build_taint_pairs`; also returns the drop count.
+
+    Sink resolution is entry-independent, so the overflow is counted
+    from the resolved-section product and logged without building the
+    excess tuples.
+    """
+    calls = _call_index(checklist)
+    entry_rows = [
+        (ep, ep["name"])
+        for ep in dict_rows(context_map, "entry_points")
+        if ep.get("name") and ep.get("id")
+    ]
+    if not entry_rows:
+        return [], 0
+    resolved_sinks: list[tuple[dict[str, Any], str]] = []
+    for sink in dict_rows(context_map, "sink_details"):
+        if not sink.get("id"):
+            continue
+        sink_call = _sink_call_name(sink, calls)
+        if not sink_call:
+            name = sink.get("name") or ""
+            if name and name in iris_sinks:
+                sink_call = name
+                sink.setdefault("taint_spec_source", "iris")
+            else:
+                continue
+        resolved_sinks.append((sink, sink_call))
+
+    total = len(entry_rows) * len(resolved_sinks)
+    dropped = 0
+    if max_pairs is not None and total > max_pairs:
+        dropped = total - max_pairs
+        logger.warning(
+            "taint enrichment: %d pairs exceed cap of %d — "
+            "dropping the excess", total, max_pairs,
+        )
+    pairs: list[tuple[dict[str, Any], dict[str, Any], str, str]] = []
+    for ep, source_method in entry_rows:
+        for sink, sink_call in resolved_sinks:
+            if max_pairs is not None and len(pairs) >= max_pairs:
+                return pairs, dropped
+            pairs.append((ep, sink, source_method, sink_call))
+    return pairs, dropped
+
+
 def _clear_prior_annotations(context_map: dict[str, Any]) -> None:
-    for ep in context_map.get("entry_points") or []:
+    for ep in dict_rows(context_map, "entry_points"):
         for key in _EP_KEYS:
             ep.pop(key, None)
-    for sink in list(context_map.get("sink_details") or []) + list(
-            context_map.get("sinks") or []):
+    for sink in (dict_rows(context_map, "sink_details")
+                 + dict_rows(context_map, "sinks")):
         for key in _SINK_KEYS:
             sink.pop(key, None)
-    for src in context_map.get("sources") or []:
+    for src in dict_rows(context_map, "sources"):
         src.pop("has_taint_flow", None)
     context_map.pop("taint_summary", None)
 
@@ -118,7 +165,7 @@ def _mirror_to_sources(context_map: dict[str, Any], ep: dict[str, Any]) -> None:
     The understand bridge reads ``has_taint_flow`` from the top-level
     ``sources`` array (the attack-surface schema), not entry_points.
     """
-    for src in context_map.get("sources") or []:
+    for src in dict_rows(context_map, "sources"):
         m = _SOURCE_LOC_RE.search(src.get("entry") or "")
         if not m:
             continue
@@ -129,7 +176,7 @@ def _mirror_to_sources(context_map: dict[str, Any], ep: dict[str, Any]) -> None:
 def _mirror_to_sinks(context_map: dict[str, Any], sink: dict[str, Any]) -> None:
     """Copy taint_reached_from to the matching top-level sinks entry."""
     location = f"{sink.get('file')}:{sink.get('line')}"
-    for s in context_map.get("sinks") or []:
+    for s in dict_rows(context_map, "sinks"):
         if s.get("location") == location:
             s["taint_reached_from"] = list(sink.get("taint_reached_from") or [])
 
@@ -162,14 +209,10 @@ def enrich_with_taint_flows(
         except Exception:
             logger.debug("IRIS sink load failed", exc_info=True)
 
-    pairs = build_taint_pairs(context_map, checklist, iris_sinks=iris_sinks)
-    dropped = max(0, len(pairs) - max_pairs)
-    if dropped:
-        logger.warning(
-            "taint enrichment: %d pairs exceed cap of %d — "
-            "dropping the excess", len(pairs), max_pairs,
-        )
-        pairs = pairs[:max_pairs]
+    # Cap enforced inside the enumeration (bounded materialisation);
+    # the overflow warning is logged there from the section product.
+    pairs, dropped = _enumerate_taint_pairs(
+        context_map, checklist, iris_sinks=iris_sinks, max_pairs=max_pairs)
 
     # Existence queries are per unique (source_method, sink_call);
     # multiple map pairs can share one query.
@@ -202,11 +245,11 @@ def enrich_with_taint_flows(
         _mirror_to_sinks(context_map, sink)
 
     eps_confirmed = [
-        ep["id"] for ep in context_map.get("entry_points") or []
+        ep["id"] for ep in dict_rows(context_map, "entry_points")
         if ep.get("has_taint_flow")
     ]
     sinks_confirmed = [
-        s["id"] for s in context_map.get("sink_details") or []
+        s["id"] for s in dict_rows(context_map, "sink_details")
         if s.get("taint_reached_from")
     ]
     context_map["taint_summary"] = {

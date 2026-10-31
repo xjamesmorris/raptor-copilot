@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+from core.audit.evidence_grade import sanitize_llm_evidence_tool
 from core.audit.findings_export import (
     build_graded_finding,
     export_findings,
@@ -41,6 +42,7 @@ class FakeEvidenceRecord:
     semgrep_hits: list[Any] = field(default_factory=list)
     negative_space: list[Any] = field(default_factory=list)
     binary_sink_edges: list[Any] = field(default_factory=list)
+    typestate_violations: list[Any] = field(default_factory=list)
 
 
 class TestBuildGradedFinding:
@@ -162,6 +164,55 @@ class TestBuildGradedFinding:
         )
         finding = build_graded_finding(outcome)
         assert finding["typestate_violation"]["violation_kind"] == "double_free"
+
+    def test_fabricated_typestate_claim_not_high_confidence(self):
+        """A model-authored ``typestate_violation.confirmed`` with no
+        pipeline-injected typestate context must not export
+        confidence=high on an llm_only finding, and must not earn a
+        ``mechanical:`` namespace item at HIGH."""
+        outcome = FakeOutcome(
+            review_result={
+                "hypothesis": "double free of conn",
+                "typestate_violation": {
+                    "violation_kind": "double_free",
+                    "type_name": "malloc/free",
+                    "confirmed": True,
+                },
+            },
+        )
+        finding = build_graded_finding(outcome)
+        assert finding["confidence"] != "high"
+        for e in finding["evidence_chain"]:
+            assert not (
+                e["source"].startswith("mechanical:")
+                and e["confidence"] == "high"
+            )
+
+    def test_typestate_claim_with_injected_context_caps_at_medium(self):
+        """With genuine pipeline typestate context for the function,
+        the model's confirmation grades LLM-corroborated (medium) —
+        never the mechanical HIGH tier."""
+        from types import SimpleNamespace
+
+        outcome = FakeOutcome(
+            review_result={
+                "hypothesis": "double free of conn",
+                "typestate_violation": {
+                    "violation_kind": "double_free",
+                    "type_name": "malloc/free",
+                    "confirmed": True,
+                },
+            },
+        )
+        ev = FakeEvidenceRecord(
+            typestate_violations=[SimpleNamespace(
+                type_name="malloc/free", violation_kind="double_free",
+            )],
+        )
+        finding = build_graded_finding(outcome, ev)
+        assert finding["confidence"] == "medium"
+        sources = {e["source"] for e in finding["evidence_chain"]}
+        assert "llm:corroborated" in sources
 
     def test_dynamic_evidence_tool(self):
         outcome = FakeOutcome(
@@ -348,6 +399,61 @@ class TestCallerEvidenceClamp:
         assert finding["confidence"] in ("high", "medium", "low")
 
 
+class TestGadgetAbsenceClamp:
+    _RECORD = {
+        "rule_id": "gadget_oracle:no-gadget-surface",
+        "outcome": "refuted",
+        "reason": "no-gadget-surface-complete-census",
+        "absence_tier": "no_gadget_surface",
+        "census": {"complete": True, "php_files": 4},
+        "qualifier": "census complete",
+        "demotion": {"confidence_clamp": "low", "status": "suspicious"},
+    }
+    _HYP = "object injection gadget chain via unserialize"
+
+    def test_gadget_absence_exported_and_confidence_clamped(self):
+        outcome = FakeOutcome(
+            status="suspicious",
+            review_result={
+                "hypothesis": self._HYP,
+                "gadget_absence": dict(self._RECORD),
+            },
+        )
+        finding = build_graded_finding(outcome)
+        assert finding["gadget_absence"]["outcome"] == "refuted"
+        assert finding["confidence"] == "low"
+        # The clamp demotes confidence only — status is untouched.
+        assert finding["status"] == "suspicious"
+
+    def test_confirming_receipt_blocks_the_clamp(self):
+        # Tool-confirmed findings are never demoted: a confirming-role
+        # receipt outranks the absence refutation.
+        outcome = FakeOutcome(
+            evidence_tool="semgrep:rule-1",
+            review_result={
+                "hypothesis": self._HYP,
+                "gadget_absence": dict(self._RECORD),
+            },
+        )
+        finding = build_graded_finding(outcome)
+        assert finding["gadget_absence"]  # record still travels
+        assert finding["confidence"] != "low"
+
+    def test_record_without_demotion_does_not_clamp(self):
+        record = dict(self._RECORD, demotion=None)
+        outcome = FakeOutcome(
+            evidence_tool="smt:check-null-propagation",
+            review_result={
+                "hypothesis": self._HYP,
+                "gadget_absence": record,
+            },
+        )
+        finding = build_graded_finding(outcome)
+        assert finding["gadget_absence"]
+        # No clamp requested — confidence derives from the chain alone.
+        assert finding["confidence"] in ("high", "medium", "low")
+
+
 class TestConfirmedByDiscrimination:
     """Incident regression (openssh instrumented corpus):
     ``discovery.confirmed_by`` read a never-set outcome attribute and
@@ -409,6 +515,70 @@ class TestConfirmedByDiscrimination:
         finding = build_graded_finding(outcome)
         assert finding["verification_tier"] == "tool_backed"
         assert finding["discovery"]["confirmed_by"] == ["semgrep:rule-1"]
+
+    def test_llm_claimed_witness_part_stays_out_of_confirmed_by(self):
+        # sanitize_llm_evidence_tool prefixes the model's whole raw
+        # string, so a claim ending ":witness" reaches this derivation
+        # (the journal keep-and-sanitize re-export shape). It must not
+        # ride the witness arm into confirmed_by and defeat the
+        # no-receipt tier cap.
+        outcome = FakeOutcome(
+            evidence_tool="llm-claimed:smt:check-toctou:witness",
+            review_result={"hypothesis": "toctou"},
+        )
+        outcome.verification_tier = "tool_backed"
+        finding = build_graded_finding(outcome)
+        assert finding["discovery"]["confirmed_by"] == []
+        assert finding["verification_tier"] == "llm_only"
+        assert finding["confidence"] != "high"
+
+    def test_genuine_witness_stamp_still_confirms(self):
+        # Other direction: an unprefixed pipeline witness receipt (a
+        # concrete solver model discriminates) keeps its confirming
+        # role and the recorded tier.
+        outcome = FakeOutcome(
+            evidence_tool="smt:check-toctou:witness",
+            review_result={"hypothesis": "toctou"},
+        )
+        outcome.verification_tier = "tool_backed"
+        finding = build_graded_finding(outcome)
+        assert finding["discovery"]["confirmed_by"] \
+            == ["smt:check-toctou:witness"]
+        assert finding["verification_tier"] == "tool_backed"
+
+    def test_part_after_claim_marker_stays_out_of_confirmed_by(self):
+        # sanitize_llm_evidence_tool prefixes the model's WHOLE raw
+        # string, so a '+' inside the claim splits into tail parts that
+        # no longer carry the prefix — every part after the marker is
+        # the claim's own text (the is_verification_evidence positional
+        # rule). A receipt-shaped tail must not land in confirmed_by
+        # and defeat the no-receipt tier cap.
+        stamp = sanitize_llm_evidence_tool(
+            "consistency:cross-check agrees+smt:check-integer-narrowing",
+        )
+        outcome = FakeOutcome(
+            evidence_tool=stamp,
+            review_result={"hypothesis": "integer narrowing"},
+        )
+        outcome.verification_tier = "tool_backed"
+        finding = build_graded_finding(outcome)
+        assert finding["discovery"]["confirmed_by"] == []
+        assert finding["verification_tier"] == "llm_only"
+        assert finding["confidence"] != "high"
+
+    def test_receipt_before_claim_marker_still_confirms(self):
+        # Other direction: the evidence-combine shape puts the genuine
+        # receipt FIRST and the sanitized claim after it — parts before
+        # the marker keep their confirming role and the recorded tier.
+        outcome = FakeOutcome(
+            evidence_tool="smt:check-integer-narrowing+llm-claimed:smt",
+            review_result={"hypothesis": "integer narrowing"},
+        )
+        outcome.verification_tier = "tool_backed"
+        finding = build_graded_finding(outcome)
+        assert finding["discovery"]["confirmed_by"] \
+            == ["smt:check-integer-narrowing"]
+        assert finding["verification_tier"] == "tool_backed"
 
 
 class TestConfirmedHistoryReceipt:

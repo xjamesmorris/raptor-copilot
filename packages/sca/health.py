@@ -20,6 +20,7 @@ import time
 from dataclasses import dataclass
 
 from core.json import JsonCache
+from core.logging import configure_cli_logging
 
 from . import default_client
 from .registries.crates import CratesClient
@@ -71,6 +72,21 @@ def main(argv: Sequence[str]) -> int:
     args = _parse_args(argv)
     _configure_logging(args.verbose)
 
+    if args.offline:
+        # health is a live reachability check that deliberately probes
+        # against a throwaway scratch cache (see below) — under
+        # --offline every probe misses by construction, so the flag
+        # produced a vacuous all-fail table that read like a total
+        # registry outage. Refuse loudly instead.
+        print(
+            "raptor-sca health: --offline is incompatible with a "
+            "live reachability check — probes deliberately bypass "
+            "the shared cache, so offline mode fails every probe by "
+            "construction. Run without --offline.",
+            file=sys.stderr,
+        )
+        return 2
+
     # Throwaway cache: this is a LIVE reachability check. Reading
     # the shared cache would report stale verdicts (an earlier run
     # against a blocked registry caches an empty version list, and
@@ -108,7 +124,7 @@ def main(argv: Sequence[str]) -> int:
                                 thread_name_prefix="sca-health") as pool:
             futs = [
                 pool.submit(_run_probe,
-                            factory(http, cache, offline=args.offline),
+                            factory(http, cache, offline=args.offline),  # type: ignore[arg-type]
                             eco, probe, capture)
                 for eco, factory, probe in _PROBES
             ]
@@ -149,6 +165,15 @@ class _ProbeBudgetClient:
         return self._inner.get_bytes(
             url, timeout=timeout or self._TIMEOUT, **kw)
 
+    def request(self, method, url, *, timeout=None, **kw):
+        # The budget must clamp the generic surface too — pre-fix a
+        # probe using .request directly rode the inner client's full
+        # 600s retry schedule via __getattr__.
+        kw.setdefault("total_timeout", self._TOTAL_TIMEOUT)
+        kw.setdefault("retries", self._RETRIES)
+        return self._inner.request(
+            method, url, timeout=timeout or self._TIMEOUT, **kw)
+
     def __getattr__(self, name):
         return getattr(self._inner, name)
 
@@ -173,7 +198,7 @@ class _ThreadLogCapture(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         with self._lock2:
-            self._by_thread.setdefault(record.thread, []).append(
+            self._by_thread.setdefault(record.thread, []).append(  # type: ignore[arg-type]
                 record.getMessage())
 
     def last_for_current_thread(self) -> str | None:
@@ -224,7 +249,10 @@ def _print_table(results: list[_ProbeResult]) -> None:
         print(f"{r.ecosystem:<12} {r.probe:<40} {status:<10} "
               f"{r.elapsed_ms:<8} {r.versions_returned:<10}")
         if r.error and not r.ok:
-            print(f"             error: {r.error}")
+            # Exception text can quote registry-response bytes —
+            # neutralise before it reaches the operator's terminal.
+            from core.security.prompt_output_sanitise import sanitise_string
+            print(f"             error: {sanitise_string(r.error, max_chars=240)}")
     n_ok = sum(1 for r in results if r.ok)
     print(f"\n{n_ok}/{len(results)} registries healthy")
 
@@ -237,15 +265,18 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
                     "any registry fails.",
     )
     p.add_argument("--offline", action="store_true",
-                   help="probe cache only (skip network)")
+                   help="refused: health is a live reachability "
+                        "check and probes deliberately bypass the "
+                        "shared cache, so offline mode would fail "
+                        "every probe by construction")
     p.add_argument("-v", "--verbose", action="count", default=0)
     return p.parse_args(argv)
 
 
 def _configure_logging(verbose: int) -> None:
     level = logging.WARNING - 10 * min(verbose, 2)
-    logging.basicConfig(
-        level=level, format="%(levelname)s %(name)s: %(message)s")
+    # Escaping console formatter — see core.logging.configure_cli_logging.
+    configure_cli_logging(level)
 
 
 if __name__ == "__main__":

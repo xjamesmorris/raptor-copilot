@@ -331,6 +331,33 @@ ruled `false_positive` or `not_exploitable` are suppressed on later runs
 as long as the surrounding source is unchanged (hash-checked) and the row
 verifies.
 
+Operators record or overturn verdicts by hand with
+`raptor-review verdict <finding-id> fp|tp|retest [-m reason]`:
+`fp` stores a suppressing false-positive row, `tp` clears prior
+suppressing rows and sets `manual_override` on the stored finding
+records so future passes force the finding through, `retest` clears
+the stored verdict entirely so the next run re-analyzes.  `fp` is
+gated on the live-context operator grant (its row suppresses with
+pipeline-grade authority, so it is reserved for human judgment) —
+and the grant refuses the dispatch trust markers every shipped
+launcher route carries, so a plain `fp` does not mint in
+production.  The sanctioned production route is the typed-consent
+ceremony at the operator's own terminal,
+`raptor review verdict <finding-id> fp --ceremony`: every standard
+fd must be a terminal, the CLI shows what is being suppressed
+(finding, effect, TTL, the recorded invocation context), and the
+mint happens only after the operator types the confirmation phrase
+naming that finding id.  Ceremony-minted rows are stamped
+`minted=ceremony` with the operator-grant result and invocation
+context recorded alongside — MAC-bound into the row's verified
+decision fields, so the mint authority cannot be silently edited
+after the fact (rows stored before the mint markers existed keep
+verifying) — and they stay distinguishable from grant-minted rows;
+`retest` revokes them at any time.  Record operator FP assertions
+without a standing suppression with `/annotate` (human grade,
+production-reachable); `tp`/`retest` work non-interactively — they
+only cause re-analysis.
+
 ### CodeQL build reliability
 
 Successful build commands and failure modes are remembered per repo;
@@ -476,11 +503,27 @@ The wrapper runs the boot-payload guard shim
 (`libexec/raptor-sage-mcp-guard`) between Claude Code and
 `docker compose exec -T sage /usr/local/bin/sage-gui mcp` inside the
 container.  The guard verifies every instruction surface the server
-emits (initialize instructions, the whole `sage_inception` content, and
-instruction-shaped preambles in the session's first tool result) against
-the operator-authorized record in `.sage/boot-payload.authorized`;
+emits (initialize instructions, the whole `sage_inception` content,
+instruction-shaped preambles in the session's first tool result, and
+every `tools/list` response — tool names, descriptions, and schemas
+load into the session at definition tier, so each tool object is
+compared whole, on every fetch and refetch) against the
+operator-authorized record in `.sage/boot-payload.authorized`;
 mismatched or undecodable content is stripped/dropped fail-closed with a
 `[raptor-sage-mcp] WARNING:` marker.  No SSE, no HTTP, no OAuth.
+
+Stamps recorded before the tools baseline existed have no `tools.list`
+section: the guard then forwards `tools/list` unmodified but appends an
+in-band unverified notice (plus a stderr note) until the operator
+baselines the surface — run `libexec/raptor-sage-setup review` at your
+own terminal.  A first baseline renders as a single digest (tool count,
+sorted names, per-tool description length, schema size+hash, and a
+red-flag scan over all description text) with a `d <tool>` drill-down
+for any full definition; approving it baselines the current live
+surface (trust-on-first-use).  Sidecar upgrades that change tool
+definitions are handled the same way: the changed tools are stubbed
+with the warning until reviewed, and the review shows only the changed
+definitions, each diffed against the baselined entry of that name.
 
 The setup script replaces `.mcpServers.sage` entirely on each run (stale
 `type`/`url` fields from an old SSE config are removed).  Other MCP

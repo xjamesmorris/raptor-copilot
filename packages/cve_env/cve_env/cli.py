@@ -1,7 +1,7 @@
 """Command-line entry point: ``cve-env build CVE-YYYY-NNNN``.
 
 Minimal CLI that renders + runs the agent. Intended for ad-hoc build
-requests and smokes; the parallel bench runner lives in ``scripts/bench_parallel.sh``.
+requests and smokes; the bench runner lives in ``scripts/raptor-cve-env-bench``.
 """
 
 from __future__ import annotations
@@ -21,7 +21,10 @@ from cve_env.config import AGENTIC_AUDIT_ROOT, VERSION_ASSERTION_CMD_PATTERN
 from cve_env.models import CveRecord, HostInfo, derive_build_method
 from cve_env.tools.arch import detect_host_arch
 
-from core.json import dumps_artifact, dumps_display, save_json
+from core.json import dumps_artifact, save_json
+from core.security.log_sanitisation import (
+    sanitise_for_terminal as _sft,
+)
 
 # Validate CVE-ID format BEFORE invoking build()/LLM. Stops bogus IDs
 # (lowercase, missing dash, wrong year width, etc.) at argparse time
@@ -48,8 +51,11 @@ def _attempt_replay(cve: CveRecord, prefill_from: str | None):
             return None
         source_run = (spec.markers.get("origin") or {}).get(
             "source_run", "(unknown run)")
+        # Markers are a recorded artifact — escape like the sibling
+        # replay/up lanes that print the same semantic (`_sft(str(
+        # pointer.source_run))` in _cmd_up).
         print(
-            f"replay: found verified spec from {source_run} — "
+            f"replay: found verified spec from {_sft(str(source_run))} — "
             f"provisioning without the agent",
             file=sys.stderr,
         )
@@ -101,8 +107,8 @@ def _attempt_replay(cve: CveRecord, prefill_from: str | None):
                   f"{getattr(env, 'provision_id', '?')}`",
                   file=sys.stderr)
     print(
-        f"replay: {result.reason or 'verify failed'} — falling through "
-        f"to the agent build",
+        f"replay: {_sft(result.reason or 'verify failed')} — falling "
+        f"through to the agent build",
         file=sys.stderr,
     )
     return None
@@ -145,7 +151,9 @@ def _cmd_up(args: argparse.Namespace) -> int:
     if getattr(getattr(spec, "network", None), "mode", "") == "unrestricted":
         print("up: egress ALLOWED for this instance (default docker "
               "bridge, full outbound)", file=sys.stderr)
-    print(f"up: provisioning recorded spec from {source_run}",
+    # Markers are a recorded artifact — same _sft discipline as the
+    # replay banner and _cmd_build's pointer lane.
+    print(f"up: provisioning recorded spec from {_sft(str(source_run))}",
           file=sys.stderr)
     from core.env.provision import provision
 
@@ -153,8 +161,8 @@ def _cmd_up(args: argparse.Namespace) -> int:
                        fail_on_verify=True)
     env = result.environment
     if not result.ok or env is None:
-        print(f"up: {result.reason or 'provision failed'}"
-              f"{': ' + result.detail if result.detail else ''}",
+        print(f"up: {_sft(result.reason or 'provision failed')}"
+              f"{': ' + _sft(result.detail) if result.detail else ''}",
               file=sys.stderr)
         if (result.reason == "verify_failed"
                 and getattr(getattr(spec, "network", None), "mode",
@@ -179,7 +187,10 @@ def _cmd_up(args: argparse.Namespace) -> int:
         # this provision created (label-scoped).
         "down_token": env.provision_id,
     }
-    print(dumps_display(payload, indent=2))
+    # ensure_ascii: JSON escapes C0 but passes C1 terminal controls
+    # raw when off — dumps_display is exactly that, and image_ref /
+    # endpoint values are container-derived. Still valid JSON.
+    print(json.dumps(payload, indent=2, ensure_ascii=True, default=str))
     if endpoint:
         print(f"up: environment running at {endpoint[0]}:{endpoint[1]} — "
               f"tear down with: cve-env down {env.provision_id}",
@@ -203,25 +214,32 @@ def _cmd_ps(args: argparse.Namespace) -> int:
     res = run_cli(["docker", "ps", "--filter", f"label={OWNER_LABEL}",
                    "--format", fmt], timeout=30)
     if res.returncode != 0:
-        print(f"ps: docker ps failed: {(res.stderr or '').strip()[:300]}",
+        from core.security.log_sanitisation import sanitise_for_terminal
+        print("ps: docker ps failed: "
+              f"{sanitise_for_terminal((res.stderr or '').strip(), max_len=300)}",
               file=sys.stderr)
         return 1
-    rows = []
+    provisions = []
     for line in (res.stdout or "").splitlines():
         parts = line.split("\t")
         if len(parts) != 5 or not parts[0]:
             continue
         token, name, ports, image, age = parts
         endpoint = None
-        m = re.search(r"(\d+\.\d+\.\d+\.\d+):(\d+)->", ports)
+        # (?<!\d) pins the scan to digit-run starts (scan-restart
+        # hardening; first-match spans unchanged).
+        m = re.search(r"(?<!\d)(\d+\.\d+\.\d+\.\d+):(\d+)->", ports)
         if m:
             endpoint = {"host": m.group(1), "port": int(m.group(2))}
-        rows.append({"down_token": token, "name": name,
-                     "endpoint": endpoint, "image": image,
-                     "running_for": age.strip()})
-    print(dumps_display(rows, indent=2))
-    print(f"ps: {len(rows)} live provision(s)"
-          + (" — tear down with: cve-env down <down_token>" if rows
+        provisions.append({"down_token": token, "name": name,
+                           "endpoint": endpoint, "image": image,
+                           "running_for": age.strip()})
+    # ensure_ascii: container names/images are docker-derived; bare
+    # non-ASCII JSON passes C1 terminal controls through raw.
+    import json as _json
+    print(_json.dumps(provisions, indent=2, ensure_ascii=True))
+    print(f"ps: {len(provisions)} live provision(s)"
+          + (" — tear down with: cve-env down <down_token>" if provisions
              else ""), file=sys.stderr)
     return 0
 
@@ -238,8 +256,9 @@ def _cmd_down(args: argparse.Namespace) -> int:
 
     removed = remove_labeled_containers(OWNER_LABEL, args.token)
     remove_labeled_images(OWNER_LABEL, args.token)
-    print(dumps_display({"token": args.token,
-                      "removed_containers": removed}))
+    print(json.dumps({"token": args.token,
+                      "removed_containers": removed},
+                     ensure_ascii=True, default=str))
     return 0
 
 
@@ -375,9 +394,12 @@ def _cmd_build(args: argparse.Namespace) -> int:
             )
             if pointer is not None:
                 prefill = pointer.to_dict()
+                from core.security.log_sanitisation import (
+                    sanitise_for_terminal as _sft,
+                )
                 print(
                     f"prefill: using /cve-diff discovery from "
-                    f"{pointer.source_run}",
+                    f"{_sft(str(pointer.source_run), max_len=200)}",
                     file=sys.stderr,
                 )
             else:
@@ -432,7 +454,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
             "reason": outcome.reason,
             "tool_names_called": outcome.tool_names_called,
             # Derived build-method label(s) for post-bench analysis.
-            # Taxonomy mirrors scripts/heartbeat_status.sh.
+            # Taxonomy defined by derive_build_method (cve_env/models.py).
             "method": derive_build_method(outcome.tool_names_called),
             "final_text": outcome.final_text,
             "audit_path": str(outcome.audit_path) if outcome.audit_path else None,
@@ -458,9 +480,10 @@ def _cmd_build(args: argparse.Namespace) -> int:
         }
         # Write sidecar before stdout so the result survives a SIGKILL that
         # fires after build() returns but before the stdout pipe flushes.
-        # bench50.sh recovers from this file when $OUTDIR/$cve.json is empty.
+        # scripts/raptor-cve-env-bench recovers from this file when the
+        # stdout capture is empty.
         sidecar = audit_root / f"{cve.cve_id}.outcome.json"
-        # Sidecar and stdout must carry the same document: bench50.sh
+        # Sidecar and stdout must carry the same document: the bench
         # falls back to the sidecar when the stdout capture is empty.
         outcome_json = dumps_artifact(outcome_dict)
         with contextlib.suppress(OSError):
@@ -528,18 +551,15 @@ def _cmd_build(args: argparse.Namespace) -> int:
 # they belong to. Stage order = pipeline order.
 #
 # Schema: lowercase keys ("research", "acquire") for end-of-run human report.
-# Three sibling tables exist with intentionally-different value schemas
+# A sibling table exists with an intentionally-different value schema
 # (kept apart because each serves a different consumer):
-#   - scripts/cve_evidence.py::_STAGE_BY_TOOL — 3-letter codes ("RES", "ACQ")
-#     for compact per-tool evidence JSONL rendering
-#   - scripts/heartbeat_status.sh::STAGE_BY_TOOL — long names ("RESEARCH",
-#     "ACQUIRE") for live human-readable heartbeat output
-#   - src/cve_env/config.py::TOOL_TO_STAGE — uppercase names
+#   - cve_env/config.py::TOOL_TO_STAGE — uppercase names
 #     for budget-engine per-stage cost attribution
-# When adding a new tool, update all four. Drift across the first three is
-# blocked by refactor/tests/unit/test_stage_table_sync.py; drift between
-# the first three and config.py is allowed only via the _KNOWN_DIVERGENCE
-# allowlist in that test.
+# When adding a new tool, update both. Drift between the two is allowed
+# only via the _KNOWN_DIVERGENCE allowlist in
+# tests/unit/test_stage_table_sync.py. (The upstream cve-env repo
+# carries two further script-side siblings; they are not vendored into
+# this tree.)
 _STAGE_BY_TOOL: dict[str, str] = {
     "nvd_lookup": "research",
     "github_fetch": "research",
@@ -556,11 +576,11 @@ _STAGE_BY_TOOL: dict[str, str] = {
     "run_in_container": "launch",
     "verify": "verify",
     "log_check": "verify",
-    # Non-pipeline tools — kept here so the sibling tables in
-    # scripts/cve_evidence.py and scripts/heartbeat_status.sh stay in sync
-    # (test_stage_table_sync.py enforces this). _STAGE_ORDER below limits
-    # the human report to the 5 pipeline stages, so these don't appear in
-    # the end-of-run summary even though they're tracked.
+    # Non-pipeline tools — kept here so the config.py sibling table
+    # stays in sync (test_stage_table_sync.py enforces this).
+    # _STAGE_ORDER below limits the human report to the 5 pipeline
+    # stages, so these don't appear in the end-of-run summary even
+    # though they're tracked.
     "give_up": "give_up",
     "ToolSearch": "meta",
     "Bash": "meta",
@@ -814,9 +834,9 @@ def _stage_grouped_calls(
     for call in calls:
         stage = _STAGE_BY_TOOL.get(call["tool"])
         # Skip unknown tools AND tools whose stage is outside _STAGE_ORDER
-        # ('meta' / 'give_up' map there — present in _STAGE_BY_TOOL so the
-        # cve_evidence.py + heartbeat_status.sh sibling tables stay in sync,
-        # but not part of the human pipeline report).
+        # ('meta' / 'give_up' map there — kept in _STAGE_BY_TOOL so every
+        # tool has a stage for cost attribution, but not part of the
+        # human pipeline report).
         if stage is None or stage not in out:
             continue
         ti = call["input"] if isinstance(call["input"], dict) else {}
@@ -1032,7 +1052,16 @@ def _print_human_report(outcome: Any) -> None:  # noqa: ANN401
     pressure = _audit_pressure_summary(outcome.audit_path)
 
     def _e(msg: str) -> None:
-        print(msg, file=sys.stderr)  # noqa: T201 -- intentional CLI output
+        # Single funnel for the whole report: summaries, receipts, and
+        # warnings carry container-/LLM-derived fragments — escape
+        # control bytes AND bound length here so every line inherits
+        # the scrub (several row builders interpolate unbounded
+        # foreign fields; the terminal doctrine is escape + bound).
+        # 512 leaves ample headroom over the longest legitimate row
+        # (~200 chars of receipt text) while stopping a hostile field
+        # from flooding the terminal.
+        from core.security.log_sanitisation import sanitise_for_terminal
+        print(sanitise_for_terminal(msg, max_len=512), file=sys.stderr)  # noqa: T201 -- intentional CLI output
 
     _e("")
     _e("=" * 72)

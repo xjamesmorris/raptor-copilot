@@ -261,6 +261,75 @@ int unsigned_source(void) {
         assert files == {"user.c"}
 
 
+def _overlong_call(callee: str) -> str:
+    # One call whose argument list overflows the _balanced_span
+    # window — trivially plantable in a hostile repo.
+    args = ", ".join(f"arg_{i:04d}" for i in range(600))
+    return (
+        f"void evil_caller(void) {{\n    {callee}(NULL, {args});\n}}\n"
+    )
+
+
+class TestSpanBoundHonesty:
+    """A truncated enumeration must never claim completeness.
+
+    The span bound drops call-shaped matches whose argument list
+    stays unbalanced within the window; that drop is an honesty
+    event, never silent — a refutation over the surviving sites is a
+    hint, not a receipt.
+    """
+
+    GUARDED = """
+int b(void) {
+    return bio_lookup_ex("localhost", 80, 0);
+}
+"""
+
+    def test_span_capped_site_vetoes_enumeration_complete(
+        self, tmp_path,
+    ):
+        target = _write_target(
+            tmp_path, self.GUARDED + _overlong_call("bio_lookup_ex"),
+        )
+        res = run_api_boundary_check(
+            target, "lookup.c", "bio_lookup_ex", HYP_NULL,
+        )
+        # The surviving sites are guarded, so the outcome may refute —
+        # but never with a completeness stamp over a dropped match.
+        assert not res.enumeration_complete, res.to_dict()
+        assert any(
+            "span bound" in n for n in res.enumeration_notes
+        ), res.enumeration_notes
+
+    def test_control_without_overlong_call_earns_completeness(
+        self, tmp_path,
+    ):
+        # Two-direction pin: the honesty flag fires only on a bound
+        # hit — the clean shape still earns its completeness receipt.
+        target = _write_target(tmp_path, self.GUARDED)
+        res = run_api_boundary_check(
+            target, "lookup.c", "bio_lookup_ex", HYP_NULL,
+        )
+        assert res.outcome == "refuted", res.to_dict()
+        assert res.enumeration_complete, res.to_dict()
+
+    def test_overlong_call_cannot_blind_param_parsing(self):
+        # A planted over-long CALL before the definition must not
+        # stop the parser from reaching the real definition.
+        src = _overlong_call("bio_lookup_ex") + DEFINITION
+        assert parse_param_names(src, "bio_lookup_ex") == [
+            "host", "port", "family",
+        ]
+
+    def test_overlong_definition_params_bind_nothing(self):
+        # A definition whose own parameter list overflows the span
+        # binds no parameters (the check abstains downstream) —
+        # never a wrong binding.
+        params = ", ".join(f"int arg_{i:04d}" for i in range(600))
+        src = f"int f({params})\n{{\n    return 0;\n}}\n"
+        assert parse_param_names(src, "f") == []
+
+
 # Field exemplar (caller-proof FP family): the review asserts a
 # misuse contract that every actual call site upholds.
 HYP_SINGLE_CALL = (
@@ -794,3 +863,170 @@ int careless(void) {
         )
         assert confirmed == ["api_boundary:caller-contract"]
         assert counters["api_boundary"].confirmed == 1
+
+
+class TestDeclaredLocallyDerefStore:
+    """A deref-store (`*g = x;` — assignment THROUGH g) is not a
+    declaration OF g: the old bare-star alternative read it as a
+    local declaration, so a single-call contract over a global
+    pointer whose pointee is stored pre-call could be graded guarded
+    and feed a refuted aggregate."""
+
+    @staticmethod
+    def _risk(before: str):
+        from core.audit.api_boundary import _single_call_precall_risk
+        return _single_call_precall_risk(
+            {"before_body": before, "after_window": ""}, "g",
+        )
+
+    def test_deref_store_is_not_a_local_declaration(self):
+        risk = self._risk("int f(int x) { *g = x; f2(g); ")
+        assert risk is not None
+        assert "not provably local" in risk
+
+    def test_pointer_parameter_still_counts(self):
+        assert self._risk("int f(char *g) { ") is None
+
+    def test_local_pointer_declaration_still_counts(self):
+        assert self._risk("int f(void) { struct buf *g; ") is None
+
+    def test_multi_declarator_star_still_counts(self):
+        assert self._risk("int f(void) { int a, *g; ") is None
+
+
+class TestTreeWalk:
+    """_walk_tree_entries streams the tree; it must visit exactly
+    rglob("*")'s entry set (symlinked dirs yielded, never descended)
+    and survive hostile nesting depth without recursion."""
+
+    def test_visitation_set_matches_rglob(self, tmp_path):
+        from core.audit.api_boundary import _walk_tree_entries
+
+        (tmp_path / "a").mkdir()
+        (tmp_path / "a" / "x.c").write_text("int x;\n")
+        (tmp_path / "a.c").write_text("int a;\n")
+        (tmp_path / "b" / "c").mkdir(parents=True)
+        (tmp_path / "b" / "c" / "y.h").write_text("int y;\n")
+        outside = tmp_path.parent / f"{tmp_path.name}-outside"
+        outside.mkdir()
+        (outside / "hidden.c").write_text("int h;\n")
+        (tmp_path / "link").symlink_to(outside)
+        walked = set(_walk_tree_entries(tmp_path))
+        assert walked == set(tmp_path.rglob("*"))
+        # the symlinked dir itself is an entry; its contents are not
+        assert (tmp_path / "link") in walked
+        assert not any(p.name == "hidden.c" for p in walked)
+
+    def test_deep_nesting_does_not_recurse(self, tmp_path):
+        from core.audit.api_boundary import _walk_tree_entries
+
+        d = tmp_path
+        for _ in range(600):
+            d = d / "d"
+        d.mkdir(parents=True)
+        (d / "leaf.c").write_text("int z;\n")
+        names = [p.name for p in _walk_tree_entries(tmp_path)]
+        assert names.count("leaf.c") == 1
+
+    def test_name_sorted_within_directory(self, tmp_path):
+        from core.audit.api_boundary import _walk_tree_entries
+
+        for name in ("b.c", "a.c", "c.c"):
+            (tmp_path / name).write_text("x\n")
+        assert [p.name for p in _walk_tree_entries(tmp_path)] == [
+            "a.c", "b.c", "c.c",
+        ]
+
+
+class TestDefiningSourceContainment:
+    """run_api_boundary_check's defining-source read is contained:
+    file_path arrives from finding/gap records (LLM-writable)."""
+
+    def test_escaping_file_path_never_read(self, tmp_path):
+        import sys
+
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "use.c").write_text(
+            "int use_a(void) { return bio_lookup_ex(0, 80, 0); }\n",
+        )
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        # The out-of-root path variable is deliberately NOT named after
+        # credential material: CodeQL's sensitive-name source heuristic
+        # keys on the identifier alone and would flag every diagnostic
+        # logger this path string reaches in production code.
+        outside_c = outside / "lookup.c"
+        outside_c.write_text(
+            "int bio_lookup_ex(const char *name, int port, int f)"
+            " { return f; }\n",
+        )
+        opened: list = []
+
+        def hook(event, args):
+            if event == "open" and args and str(outside_c) in str(args[0]):
+                opened.append(args)
+
+        sys.addaudithook(hook)
+        for fp in (str(outside_c), "../outside/lookup.c"):
+            run_api_boundary_check(
+                target, fp, "bio_lookup_ex", HYP_NULL,
+            )
+        assert opened == [], (
+            "out-of-root defining file was opened by the api_boundary "
+            "check"
+        )
+
+
+class TestSymlinkedSourceParity:
+    """In-tree symlinked sources (bazel-style link forests) keep
+    contributing call sites — the walk confine-resolves them — while
+    a link escaping the root refuses instead of being read."""
+
+    def test_in_tree_symlinked_caller_still_enumerated(self, tmp_path):
+        target = tmp_path / "target"
+        (target / "real").mkdir(parents=True)
+        # The caller exists ONLY behind the symlink: the real copy
+        # carries a non-source suffix the walk filters out, so the
+        # sites can come solely from reading through linked.c.
+        (target / "real" / "use.c.real").write_text(
+            "int use_a(const char *host)"
+            " { return bio_lookup_ex(host, 80, 0); }\n",
+        )
+        (target / "lookup.c").write_text(
+            "int bio_lookup_ex(const char *host, int p, int f)"
+            " { return host[0] + f; }\n",
+        )
+        (target / "linked.c").symlink_to(
+            target / "real" / "use.c.real")
+        res = run_api_boundary_check(
+            target, "lookup.c", "bio_lookup_ex", HYP_NULL,
+        )
+        files = {s.file for s in res.sites}
+        assert any("linked.c" in f for f in files), res.to_dict()
+
+    def test_escaping_symlink_not_read(self, tmp_path):
+        import sys
+
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "lookup.c").write_text(
+            "int bio_lookup_ex(const char *n, int p, int f)"
+            " { return f; }\n",
+        )
+        outside = tmp_path / "outside.c"
+        outside.write_text(
+            "int esc(void) { return bio_lookup_ex(0, 80, 0); }\n",
+        )
+        (target / "esc.c").symlink_to(outside)
+        opened: list = []
+
+        def hook(event, args):
+            if event == "open" and args and str(outside) in str(args[0]):
+                opened.append(args)
+
+        sys.addaudithook(hook)
+        run_api_boundary_check(
+            target, "lookup.c", "bio_lookup_ex", HYP_NULL,
+        )
+        assert opened == []

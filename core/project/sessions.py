@@ -1,6 +1,6 @@
-"""Session registry — which sessions have which project active.
+"""Session registry — which frontend sessions have which project active.
 
-``~/.local/share/raptor/sessions.d/<pid>`` maps a live Claude Code
+``~/.local/share/raptor/sessions.d/<pid>`` maps a live RAPTOR frontend
 session to its project state, written by the launcher at exec time
 (bash — see bin/raptor) and by ``/project use`` (here). Each entry is
 KEY=VALUE lines so both writers speak the same format.
@@ -20,19 +20,26 @@ Two entry generations coexist:
   symlink. (``-`` can never pass project-name validation, so a torn or
   legacy empty value stays *invalid* rather than becoming a meaningful
   state.)
+  A separate internal/test-only ``host_v=2`` receipt form also uses the
+  base ``v=2`` envelope, but is deliberately non-authorizing: its fixed
+  ``project=-`` value fences ancestry/bookmark fallback and it never
+  produces a :class:`SessionOwner`.
 
 Authority demands what the advisory registry never needed:
 
 * **Identity, not just liveness.** A recycled PID backed by another
-  *claude* process passes any comm check by construction. v2 reads
+  host process passes a process-name check by construction. v2 reads
   require the live process's starttime + boot_id to match the stamp,
   and the reader's pid namespace to match ``pidns`` — a reader inside a
   same-kernel container (shared ``$HOME``, shared boot_id, host pids
   invisible) treats host entries as FOREIGN: never authoritative,
-  never pruned. Off-Linux there is no procfs identity: entries carry
-  platform sentinels (``starttime=0``, ``boot_id=none-<platform>``) and
-  are accepted on comm-checked liveness alone — a documented weaker
-  residual.
+  never pruned. New launcher records additionally bind a known
+  ``host`` to the process uid and executable inode. Records without
+  those optional fields keep their historical Claude-only strength;
+  malformed or unknown host claims never downgrade to that legacy
+  path. Off-Linux there is no procfs identity: entries carry platform
+  sentinels and retain the documented legacy Claude residual until a
+  native executable-evidence implementation is validated there.
 * **Atomic, lock-disciplined writes.** Entry writes are tmp+rename;
   ledger read-modify-writes additionally hold a sibling ``.run.lock``
   flock (rename atomicity protects readers, not concurrent writers).
@@ -42,6 +49,17 @@ Authority demands what the advisory registry never needed:
   unreachable: ``resolve_session_pid()`` only returns claude-shaped or
   token-verified pids. Explicit-pid callers are trusted internal
   surfaces.
+
+Registry-resolution invariant (uncached seam): lock acquisition and
+the locked mutation each resolve the registry base independently at
+call time — ``_ledger_lock`` and the read-modify-write it protects
+both call ``_sessions_dir()`` afresh, as do the pre-lock gates. So
+``RAPTOR_REGISTRY_HOME`` must not change while a ledger or entry
+operation is in flight: the lock would be held in one registry while
+the mutation lands, unlocked, in the other. Today the only writer of
+that variable is the test substrate (``core.testing.state_isolation``),
+which flips it at fixture boundaries only — never mid-operation. Any
+future runtime setter must preserve this invariant.
 
 A sibling file ``sessions.d/<pid>.run`` is the session's RUN LEDGER:
 one line per run — ``<status> <epoch> <run-id> <abs-run-dir>`` with
@@ -58,19 +76,86 @@ second, clean-looking record.
 from __future__ import annotations
 
 import contextlib
+import errno
 import functools
+import hashlib
 import logging
 import os
 import re
 import secrets
+import stat
 import sys
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
-from typing import Iterator
+from typing import TYPE_CHECKING, Iterator, Literal
+
+from core.startup.host import (
+    SESSION_HOST_KEYS,
+    Frontend,
+    HostClaimError,
+    SessionHostClaim,
+    SessionOwner,
+    host_process_matches,
+    parse_session_host_claim,
+    process_executable_identity,
+    process_uid,
+)
+
+if TYPE_CHECKING:
+    SESSIONS_DIR: Path
+
+    from core.startup.runtime_receipt.issuance import PendingReceiptIssued
+    from core.startup.runtime_receipt.plumbing_types import (
+        CasApplied,
+        CleanupApplied,
+        PlumbingFailure,
+        ReceiptReference,
+        RuntimeReceiptSnapshot,
+        StoredReceipt,
+    )
+    from core.startup.runtime_receipt.profile import ProfileStore
+    from core.startup.runtime_receipt.schema import RuntimeReceipt
+
+from . import registry_home as _registry_home
 
 logger = logging.getLogger(__name__)
 
-SESSIONS_DIR = Path.home() / ".local" / "share" / "raptor" / "sessions.d"
+
+def _sessions_dir() -> Path:
+    """The sessions registry directory for THIS call.
+
+    Historically a module-level ``SESSIONS_DIR`` constant computed at
+    import time — which resolved the REAL home with no override seam
+    (env-less product misuse; conftest-less test extracts). Now every
+    in-module consumer resolves at call time through the shared
+    operator-registry seam (``core.project.registry_home`` — one
+    resolution for the projects registry, the ``.active`` bookmark and
+    this directory, honouring ``RAPTOR_REGISTRY_HOME``).
+
+    Test-estate compatibility: a module-dict entry named
+    ``SESSIONS_DIR`` (the suite-wide ``monkeypatch.setattr`` /
+    ``mock.patch`` pin spelling) takes precedence over the seam, so
+    every existing per-test registry pin keeps working unchanged.
+    """
+    try:
+        return Path(SESSIONS_DIR)
+    except NameError:
+        return _registry_home.sessions_dir()
+
+
+def __getattr__(name: str) -> Path:
+    # PEP 562: the historical constant name stays importable
+    # (``from core.project.sessions import SESSIONS_DIR`` and the
+    # attribute spelling both work) but now resolves at ACCESS time
+    # through the seam. Only reached when no module-dict override
+    # exists — a test's setattr wins by construction.
+    if name == "SESSIONS_DIR":
+        return _registry_home.sessions_dir()
+    raise AttributeError(
+        f"module {__name__!r} has no attribute {name!r}")
+
 
 #: Bound-to-none sentinel — rejected by _NAME_RE, so it can never
 #: collide with a real project name.
@@ -80,7 +165,7 @@ ENTRY_VERSION = "2"
 
 #: Env vars exported by the launcher. The PID names the session; the
 #: token must match the entry's ``token`` field for the env path to be
-#: believed (an attacker guessing a live claude PID gains nothing
+#: believed (an attacker guessing a live frontend PID gains nothing
 #: without the token, which lives in a 0700 directory).
 ENV_SESSION_PID = "RAPTOR_SESSION_PID"
 ENV_SESSION_TOKEN = "RAPTOR_SESSION_TOKEN"
@@ -89,15 +174,67 @@ ENV_SESSION_TOKEN = "RAPTOR_SESSION_TOKEN"
 #: local so this module stays importable without core.project.project
 #: (core.startup consults it at banner time).
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_HOST_V2_SINCE_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+    r"(?:\.\d{1,6})?\+00:00$"
+)
 
 #: The full v2 key list, shared by both writers (the bash seeder in
 #: bin/raptor mirrors this order). Unknown keys are dropped on rewrite
 #: BY DESIGN — the list is the schema.
-ENTRY_KEYS = ("v", "project", "since", "starttime", "boot_id", "pidns",
-              "token", "seeded_by")
+ENTRY_KEYS = (
+    "v",
+    "project",
+    "since",
+    "starttime",
+    "boot_id",
+    "pidns",
+    *SESSION_HOST_KEYS,
+    "token",
+    "seeded_by",
+)
+
+_HOST_V2_ENTRY_PREFIX_KEYS = (
+    "v",
+    "project",
+    "since",
+    "starttime",
+    "boot_id",
+    "pidns",
+    "host_v",
+    "host",
+    "host_uid",
+)
+_HOST_V2_ENTRY_SUFFIX_KEYS = (
+    "host_exe",
+    "host_exe_dev",
+    "host_exe_ino",
+    "host_receipt_v",
+    "host_receipt_state",
+    "host_receipt_sha256",
+    "host_receipt_reference",
+    "token",
+    "seeded_by",
+)
+_HOST_V2_ENTRY_KEYS = _HOST_V2_ENTRY_PREFIX_KEYS + _HOST_V2_ENTRY_SUFFIX_KEYS
+_HOST_V2_KEY_SET = frozenset(_HOST_V2_ENTRY_KEYS)
+_HOST_RECEIPT_PREFIX = "host_receipt_"
+_HOST_V2_ENTRY_MAX_BYTES = 16_384
+_HOST_V2_LINE_MAX_BYTES = 8_192
+_HOST_V2_ENTRY_TEMP_RE = re.compile(
+    r"^\.(?P<pid>[1-9][0-9]{0,19})\.receipt-entry\.tmp$"
+)
+_HOST_V2_SIDECAR_RE = re.compile(
+    r"^(?P<pid>[1-9][0-9]{0,19})\.receipt\."
+    r"(?P<digest>[0-9a-f]{64})\.json(?P<temporary>\.tmp)?$"
+)
+_HOST_V2_MAX_SIDECARS = 4
+_HOST_V2_MAX_TEMPORARIES = 2
 
 #: Identity keys preserved/refreshed on rewrite (subset of ENTRY_KEYS).
-_IDENTITY_KEYS = ("starttime", "boot_id", "pidns")
+_IDENTITY_KEYS = ("starttime", "boot_id", "pidns", *SESSION_HOST_KEYS)
 
 #: Off-Linux sentinel stamps — platform-tagged so the foreign rule can
 #: distinguish "no identity available" from "identity from elsewhere".
@@ -109,11 +246,11 @@ _LEDGER_CAP = 32
 
 _MAX_ENTRY_BYTES = 64 * 1024  # defensive read bound
 
-_RUN_STATUSES = ("running", "completed", "failed", "cancelled",
-                 "interrupted")
+_RUN_STATUSES = ("running", "completed", "failed", "cancelled", "interrupted")
 
 _RUN_LINE_RE = re.compile(
-    r"^(running|completed|failed|cancelled|interrupted) (\d+) (\S+) (/.+)$")
+    r"^(running|completed|failed|cancelled|interrupted) (\d+) (\S+) (/.+)$"
+)
 
 #: Pin-witness record: ``pin <epoch> <run-id> <project|-> <abs-dir>``.
 #: Written beside the running record at start. sessions.d sits OUTSIDE
@@ -123,10 +260,122 @@ _RUN_LINE_RE = re.compile(
 #: python twin) skip these lines by their status filter.
 _PIN_LINE_RE = re.compile(r"^pin (\d+) (\S+) (\S+) (/.+)$")
 
+#: Drain-request record: ``drain <epoch> <run-id> <abs-dir>`` — a
+#: cooperative ask that the named run pause at its next safe boundary
+#: (the engagement supervisor's fleet-citizenship contract). NOT
+#: parsed by ``_read_ledger_full``: drain lines deliberately ride the
+#: unknown-lines channel, so every existing reader/rewriter carries
+#: them verbatim (evicted last under byte pressure) and the
+#: ``(records, pins, unknown)`` tuple contract never changes. Only
+#: the drain helpers below parse them.
+_DRAIN_LINE_RE = re.compile(r"^drain (\d+) (\S+) (/.+)$")
+
+
+@dataclass(frozen=True, slots=True)
+class _SessionReceiptEntry:
+    reference: ReceiptReference
+    since: str
+    host: SessionHostClaim
+    token_hex: str
+    raw: bytes
+
+
+class SessionHostV2CredentialState(str, Enum):
+    """Whether the caller presents this process's host-v2 credential.
+
+    This is only an env-token discriminator. It exposes no PID, receipt,
+    project binding, or owner and performs no receipt validation.
+    """
+
+    ABSENT = "absent"
+    MATCHING_HOST_V2 = "matching_host_v2"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class SessionRuntimeReceiptCapture:
+    """Operation-scoped, non-authorizing snapshot plus fence witnesses."""
+
+    snapshot: RuntimeReceiptSnapshot
+    session_pid: int
+    reference: ReceiptReference
+    _entry_sha256: bytes = field(repr=False)
+    _sidecar_sha256: bytes = field(repr=False)
+    _host_uid: int = field(repr=False)
+    _host_executable_device: int = field(repr=False)
+    _host_executable_inode: int = field(repr=False)
+    authoritative: Literal[False] = field(default=False, init=False)
+
+    def __post_init__(self) -> None:
+        from core.startup.runtime_receipt.plumbing_types import (
+            ReceiptReference,
+            RuntimeReceiptSnapshot,
+            authority_invariant_failure,
+        )
+
+        if type(self.snapshot) is not RuntimeReceiptSnapshot:
+            raise TypeError("snapshot must be RuntimeReceiptSnapshot")
+        if type(self.reference) is not ReceiptReference:
+            raise TypeError("reference must be ReceiptReference")
+        if authority_invariant_failure(
+            self.snapshot,
+            RuntimeReceiptSnapshot,
+        ) is not None:
+            raise ValueError("snapshot authority invariant violated")
+        if self.snapshot.reference != self.reference:
+            raise ValueError("capture snapshot and reference disagree")
+        if (
+            type(self.session_pid) is not int
+            or self.session_pid <= 0
+            or self.reference.session_pid.value != self.session_pid
+        ):
+            raise ValueError("capture session pid is invalid")
+        if (
+            type(self._entry_sha256) is not bytes
+            or len(self._entry_sha256) != 32
+            or type(self._sidecar_sha256) is not bytes
+            or len(self._sidecar_sha256) != 32
+        ):
+            raise ValueError("capture fence digest is invalid")
+        if any(
+            type(value) is not int or value < 0
+            for value in (
+                self._host_uid,
+                self._host_executable_device,
+                self._host_executable_inode,
+            )
+        ):
+            raise ValueError("capture host identity is invalid")
+
+    def __repr__(self) -> str:
+        return "SessionRuntimeReceiptCapture(<redacted>)"
+
+    def __reduce__(self):
+        raise TypeError("SessionRuntimeReceiptCapture cannot be pickled")
+
+    def __init_subclass__(cls) -> None:
+        raise TypeError("SessionRuntimeReceiptCapture cannot be subclassed")
+
+
+class _SessionReceiptAbort(Exception):
+    def __init__(self, failure: PlumbingFailure) -> None:
+        super().__init__(failure.reason_codes[0].value)
+        self.failure = failure
+
+
+def _host_v2_marker(fields: dict[str, str]) -> bool:
+    return fields.get("host_v") == "2" or any(
+        key.startswith(_HOST_RECEIPT_PREFIX) for key in fields
+    )
+
+
+def _host_v2_shape_complete(fields: dict[str, str]) -> bool:
+    return set(fields) == _HOST_V2_KEY_SET
+
 
 # ---------------------------------------------------------------------------
 # process identity
 # ---------------------------------------------------------------------------
+
 
 def _pid_running(pid: int) -> bool:
     if pid <= 0:
@@ -156,20 +405,39 @@ def _comm(pid: int) -> str | None:
             # UnicodeDecodeError out of every identity check, letting
             # one hostile process name poison the whole registry
             # (read_sessions, session_binding, resolve_session_pid).
-            return Path(f"/proc/{pid}/comm").read_text(
-                encoding="utf-8", errors="replace").strip()
+            return (
+                Path(f"/proc/{pid}/comm")
+                .read_text(encoding="utf-8", errors="replace")
+                .strip()
+            )
         except OSError:
             return None
     try:
         from core.run.metadata import _read_comm_ps
+
         return _read_comm_ps(pid)
     except Exception:  # noqa: BLE001 — identity probe, never fatal
         return None
 
 
 def _claude_shaped(comm: str | None) -> bool:
-    """ONE comm predicate for walker, liveness, and readers."""
+    """Legacy Claude comm predicate retained for old records."""
     return comm is not None and comm.startswith("claude")
+
+
+def _process_uid(pid: int) -> int | None:
+    """Compatibility seam for tests and platform-specific probes."""
+    return process_uid(pid)
+
+
+def _current_euid() -> int:
+    """Compatibility seam for receipt-binding tests."""
+    return os.geteuid()
+
+
+def _process_executable_identity(pid: int) -> tuple[int, int] | None:
+    """Compatibility seam for tests and platform-specific probes."""
+    return process_executable_identity(pid)
 
 
 def proc_starttime(pid: int) -> str | None:
@@ -180,14 +448,13 @@ def proc_starttime(pid: int) -> str | None:
     try:
         # errors="replace": the comm field embedded in stat is
         # attacker-arbitrary bytes — see _comm.
-        stat = Path(f"/proc/{pid}/stat").read_text(
-            encoding="utf-8", errors="replace")
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
     close_paren = stat.rfind(")")
     if close_paren < 0:
         return None
-    fields = stat[close_paren + 2:].split()
+    fields = stat[close_paren + 2 :].split()
     idx = 22 - 3  # fields[0] is stat field 3
     if len(fields) <= idx:
         return None
@@ -204,8 +471,9 @@ def boot_id() -> str | None:
     if sys.platform != "linux":
         return None
     try:
-        return Path("/proc/sys/kernel/random/boot_id").read_text(
-            encoding="utf-8").strip()
+        return (
+            Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+        )
     except OSError:
         return None
 
@@ -228,13 +496,67 @@ def pidns_id() -> str | None:
     return str(st.st_ino)
 
 
+@functools.lru_cache(maxsize=1)
+def machine_id() -> str | None:
+    """Hash of ``/etc/machine-id`` — a per-INSTALL identity that, unlike
+    ``boot_id``, survives reboots. None when unreadable (off-Linux, or
+    a container image without one).
+
+    Hashed at the read so the raw machine-id never lands in run
+    metadata or session entries (it is a stable host identifier);
+    consumers compare hashes only and must never log the value.
+    Domain-separated (purpose-prefixed) so the recorded digest is not
+    the bare sha256 of the machine-id — run metas must not carry a
+    value linkable to other applications' machine-id hashes.
+    """
+    import hashlib
+    try:
+        raw = Path("/etc/machine-id").read_bytes().strip()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    return hashlib.sha256(b"raptor-run-machine-id:" + raw).hexdigest()
+
+
+def _prior_boot_entry(fields: dict[str, str]) -> bool:
+    """Foreign entry PROVABLY written during a prior boot of THIS
+    machine — the one foreignness shape that is decidably DEAD.
+
+    ``_foreign_entry`` fails open (alive) because a foreign stamp could
+    be a live run on another machine sharing the filesystem. The
+    deliberate cost was that after a REBOOT of the same machine every
+    crashed run's stamp read foreign→alive forever. A stamp whose
+    machine identity MATCHES the local machine but whose boot_id
+    differs cannot be a live process anywhere: its boot no longer
+    exists here, and no other machine can carry this machine's
+    identity. Absent machine identity (legacy stamps) or a mismatch
+    keeps the fail-open path; a same-boot different-pidns entry stays
+    fail-open too (the boot is still live — the process may be).
+    """
+    stamp_machine = fields.get("machine_id", "")
+    if not stamp_machine:
+        return False  # legacy stamp — unverifiable, keep fail-open
+    local = machine_id()
+    if local is None or stamp_machine != local:
+        return False  # other machine (or unverifiable here) — fail open
+    stamp_boot = fields.get("boot_id", "")
+    if not stamp_boot or _sentinel_stamp(fields):
+        return False
+    live_boot = boot_id()
+    if live_boot is None:
+        return False
+    return stamp_boot != live_boot
+
+
 def _platform_boot_sentinel() -> str:
     return f"none-{sys.platform}"
 
 
 def _sentinel_stamp(fields: dict[str, str]) -> bool:
-    return (fields.get("starttime") == _STARTTIME_SENTINEL
-            and str(fields.get("boot_id", "")).startswith("none-"))
+    return fields.get("starttime") == _STARTTIME_SENTINEL and str(
+        fields.get("boot_id", "")
+    ).startswith("none-")
 
 
 def _foreign_entry(fields: dict[str, str]) -> bool:
@@ -264,6 +586,65 @@ def _foreign_entry(fields: dict[str, str]) -> bool:
     return False
 
 
+def _host_claim_state(
+    fields: dict[str, str],
+    *,
+    pid: int | None = None,
+) -> tuple[str, SessionHostClaim | None]:
+    """Return ``legacy|valid|invalid`` plus the parsed optional claim."""
+    if _host_v2_marker(fields):
+        from core.startup.runtime_receipt.plumbing_types import PlumbingFailure
+
+        valid_receipt_shape = _host_v2_shape_complete(fields)
+        if pid is not None and valid_receipt_shape:
+            raw = _read_session_entry_raw(pid)
+            valid_receipt_shape = isinstance(raw, bytes) and isinstance(
+                _parse_session_receipt_entry(raw, pid=pid),
+                _SessionReceiptEntry,
+            )
+            if isinstance(raw, PlumbingFailure):
+                valid_receipt_shape = False
+        if valid_receipt_shape:
+            logger.debug(
+                "sessions: receipt-backed host record for pid %s is non-authorizing",
+                pid if pid is not None else "unknown",
+            )
+        else:
+            logger.warning(
+                "sessions: malformed receipt-backed host record%s — refusing authority",
+                f" for pid {pid}" if pid is not None else "",
+            )
+        return "invalid", None
+    try:
+        claim = parse_session_host_claim(fields)
+    except HostClaimError as exc:
+        logger.warning(
+            "sessions: malformed host claim%s — refusing authority: %s",
+            f" for pid {pid}" if pid is not None else "",
+            exc,
+        )
+        return "invalid", None
+    if claim is None:
+        return "legacy", None
+    return "valid", claim
+
+
+def _stamp_matches(pid: int, fields: dict[str, str]) -> bool:
+    """Match the process start/boot/namespace stamp without host checks."""
+    stamp_start = fields.get("starttime")
+    stamp_boot = fields.get("boot_id")
+    if not stamp_start or not stamp_boot or _foreign_entry(fields):
+        return False
+    if not _pid_running(pid):
+        return False
+    if _sentinel_stamp(fields):
+        return True
+    live_start = proc_starttime(pid)
+    if live_start is None:
+        return False
+    return stamp_start == live_start
+
+
 def _identity_matches(pid: int, fields: dict[str, str]) -> bool:
     """Does the LIVE process at *pid* match the entry's identity stamp?
 
@@ -271,20 +652,23 @@ def _identity_matches(pid: int, fields: dict[str, str]) -> bool:
     entries (off-Linux writers, read on their own platform) are accepted
     on comm-checked liveness alone — the documented weaker residual.
     """
-    stamp_start = fields.get("starttime")
-    stamp_boot = fields.get("boot_id")
-    if not stamp_start or not stamp_boot:
+    host_state, claim = _host_claim_state(fields, pid=pid)
+    if host_state == "invalid" or not _stamp_matches(pid, fields):
         return False
-    if _foreign_entry(fields):
+    if claim is None:
+        return _claude_shaped(_comm(pid)) and _stamp_matches(pid, fields)
+    if not host_process_matches(
+        pid,
+        claim,
+        pid_running=_pid_running,
+        comm_reader=_comm,
+        uid_reader=_process_uid,
+        executable_identity_reader=_process_executable_identity,
+    ):
         return False
-    if not _pid_running(pid) or not _claude_shaped(_comm(pid)):
-        return False
-    if _sentinel_stamp(fields):
-        return True  # off-Linux: liveness-strength
-    live_start = proc_starttime(pid)
-    if live_start is None:
-        return False  # identity unknown on a Linux reader → not proven
-    return stamp_start == live_start
+    # Close the probe-window PID-reuse race: the process must still carry
+    # the same start stamp after uid/comm/executable validation.
+    return _stamp_matches(pid, fields)
 
 
 def mint_token() -> str:
@@ -295,10 +679,75 @@ def mint_token() -> str:
 # session resolution (ONE shared resolver — env first, then tree walk)
 # ---------------------------------------------------------------------------
 
+
 def _env_session_pid() -> int | None:
     """Validated env-credential path: pid digits AND entry token match
     AND identity stamp matches the live process. Anything less returns
     None (the tree walk may still succeed)."""
+    candidate = _env_session_record()
+    if candidate is None:
+        return None
+    pid, fields = candidate
+    if _host_v2_marker(fields):
+        return None
+    host_state, claim = _host_claim_state(fields, pid=pid)
+    if host_state == "invalid" or (
+        claim is not None and not _TOKEN_RE.fullmatch(fields.get("token", ""))
+    ):
+        return None
+    if not _identity_matches(pid, fields):
+        return None
+    return pid
+
+
+def _credential_fields_from_raw(path: Path) -> dict[str, str]:
+    """Recover only credential/discriminator fields from bounded raw bytes."""
+
+    fields: dict[str, str] = {}
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return fields
+    try:
+        try:
+            file_stat = os.fstat(fd)
+        except OSError:
+            return fields
+        if not stat.S_ISREG(file_stat.st_mode):
+            return fields
+        raw = os.read(fd, _MAX_ENTRY_BYTES + 1)
+    except OSError:
+        return fields
+    finally:
+        os.close(fd)
+    for line in raw.split(b"\n"):
+        key, sep, raw_value = line.partition(b"=")
+        if not sep or key in {b"", b"\xef\xbb\xbfv"}:
+            continue
+        try:
+            key_text = key.decode("ascii")
+            value_text = raw_value.decode("ascii")
+        except UnicodeDecodeError:
+            continue
+        if (
+            key_text in {"v", "host_v", "token"}
+            or key_text.startswith(_HOST_RECEIPT_PREFIX)
+        ) and key_text not in fields:
+            fields[key_text] = value_text
+    return fields
+
+
+def _env_session_record() -> tuple[int, dict[str, str]] | None:
+    """Token-authenticated env record before process-evidence validation.
+
+    This is not session authority. It exists so ``session_binding`` can
+    distinguish a caller-controlled wrong token (ignored) from this session's
+    own matching-token record whose new host fields were corrupted. The
+    latter fails toward authoritative projectless instead of silently falling
+    through to the machine-wide bookmark.
+    """
     raw = os.environ.get(ENV_SESSION_PID, "")
     token = os.environ.get(ENV_SESSION_TOKEN, "")
     # isascii() first: str.isdigit accepts Unicode digits ("²") that
@@ -310,31 +759,67 @@ def _env_session_pid() -> int | None:
         return None
     try:
         pid = int(raw)
-        fields = _parse_entry(SESSIONS_DIR / str(pid))
+        entry = _sessions_dir() / str(pid)
+        fields = _parse_entry(entry)
+        if not fields.get("token") or not _host_v2_marker(fields):
+            recovered = _credential_fields_from_raw(entry)
+            for key, value in recovered.items():
+                fields.setdefault(key, value)
         if not fields:
             return None
         entry_token = fields.get("token", "")
-        if not entry_token or not secrets.compare_digest(
-                entry_token, token):
+        if not entry_token or not secrets.compare_digest(entry_token, token):
             return None
-        if not _identity_matches(pid, fields):
-            return None
-        return pid
+        return pid, fields
     except (ValueError, TypeError, OSError):
         return None
 
 
+def session_host_v2_credential_state() -> SessionHostV2CredentialState:
+    """Classify only a matching-token host-v2 env credential."""
+
+    candidate = _env_session_record()
+    if candidate is not None and _host_v2_marker(candidate[1]):
+        return SessionHostV2CredentialState.MATCHING_HOST_V2
+    return SessionHostV2CredentialState.ABSENT
+
+
+def _owner_for_pid(pid: int) -> SessionOwner | None:
+    """Build the typed owner after the caller established pid authority."""
+    fields = _parse_entry(_sessions_dir() / str(pid))
+    host_state, claim = _host_claim_state(fields, pid=pid)
+    if host_state == "invalid":
+        return None
+    if claim is not None:
+        return SessionOwner(
+            pid=pid,
+            frontend=claim.frontend,
+            host_verified=True,
+            host_claim=claim,
+        )
+    return SessionOwner(
+        pid=pid,
+        frontend=Frontend.CLAUDE,
+        host_verified=False,
+    )
+
+
 def _walk_session_pid() -> int | None:
-    """Tree walk: collect ALL claude-shaped ancestors; prefer the one
-    whose entry PASSES IDENTITY MATCHING (a merely entry-bearing
-    recycled pid must not win), else the outermost.
+    """Legacy tree walk for Claude-shaped ancestors.
 
     RAPTOR dispatches nested ``claude -p`` skill children; the nearest
     claude ancestor of a helper under one of those is the *subagent*,
     which owns no entry. Preferring the identity-verified entry-bearing
     (else outermost) ancestor keeps one logical session = one identity.
+
+    Strong host records are deliberately NOT ancestry-authorized. They
+    require the launcher-minted pid+token credential; otherwise an
+    arbitrary process named ``copilot`` (or a nested process beneath it)
+    could become authority merely by appearing in the tree. Legacy records
+    remain Claude-only and keep their previous behavior.
     """
     from core.run.metadata import _read_ppid
+
     candidates: list[int] = []
     pid = os.getpid()
     for hop in range(20):
@@ -344,10 +829,18 @@ def _walk_session_pid() -> int | None:
             break
         if pid <= 1:
             break
-        if _claude_shaped(_comm(pid)):
-            candidates.append(pid)
+        comm = _comm(pid)
+        if not _claude_shaped(comm):
+            continue
+        fields = _parse_entry(_sessions_dir() / str(pid))
+        host_state, _claim = _host_claim_state(fields, pid=pid)
+        if host_state == "invalid":
+            continue
+        if host_state == "valid":
+            continue  # token path only for strong host records
+        candidates.append(pid)
     for cand in candidates:  # nearest-first: first with a VALID entry wins
-        fields = _parse_entry(SESSIONS_DIR / str(cand))
+        fields = _parse_entry(_sessions_dir() / str(cand))
         if fields and _identity_matches(cand, fields):
             return cand
     if candidates:
@@ -357,16 +850,44 @@ def _walk_session_pid() -> int | None:
 
 def resolve_session_pid() -> int | None:
     """The owning session's pid: validated env credential first (works
-    across PID namespaces and beneath nested claude processes), tree
-    walk second, None outside any session."""
+    across PID namespaces and beneath nested host processes), legacy
+    Claude tree walk second, None outside any session."""
     pid = _env_session_pid()
     if pid is not None:
         return pid
+    candidate = _env_session_record()
+    if candidate is not None and _host_v2_marker(candidate[1]):
+        return None
     try:
         return _walk_session_pid()
     except Exception:  # noqa: BLE001 — resolution is best-effort by contract
         logger.debug("session pid walk failed", exc_info=True)
         return None
+
+
+def resolve_session_owner() -> SessionOwner | None:
+    """Resolve the current session and report its host-evidence strength."""
+    pid = _env_session_pid()
+    if pid is not None:
+        return _owner_for_pid(pid)
+    candidate = _env_session_record()
+    if candidate is not None and _host_v2_marker(candidate[1]):
+        return None
+    try:
+        pid = _walk_session_pid()
+    except Exception:  # noqa: BLE001 — resolution is best-effort by contract
+        logger.debug("session owner walk failed", exc_info=True)
+        return None
+    return _owner_for_pid(pid) if pid is not None else None
+
+
+def session_host_claim(pid: int) -> SessionHostClaim | None:
+    """Return a verified strong claim for *pid*, never a legacy guess."""
+    fields = _parse_entry(_sessions_dir() / str(pid))
+    host_state, claim = _host_claim_state(fields, pid=pid)
+    if host_state != "valid" or claim is None:
+        return None
+    return claim if _identity_matches(pid, fields) else None
 
 
 def session_pid() -> int | None:
@@ -377,6 +898,7 @@ def session_pid() -> int | None:
 # ---------------------------------------------------------------------------
 # entry IO
 # ---------------------------------------------------------------------------
+
 
 def _parse_entry(path: Path) -> dict[str, str]:
     fields: dict[str, str] = {}
@@ -401,8 +923,8 @@ def _atomic_write(path: Path, content: str) -> None:
     """tmp+rename in the entry's directory (the set_active pattern);
     pid+tid suffix so concurrent writers get distinct slots."""
     import threading
-    tmp = path.with_name(
-        f".{path.name}.tmp.{os.getpid()}.{threading.get_ident()}")
+
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{threading.get_ident()}")
     tmp.write_text(content, encoding="utf-8")
     with contextlib.suppress(OSError):
         tmp.chmod(0o600)
@@ -414,8 +936,8 @@ def _ensure_dir() -> bool:
         # 0700: which project each session works on is operator
         # telemetry — not for other local users. chmod covers a dir
         # created looser by an older writer.
-        SESSIONS_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-        SESSIONS_DIR.chmod(0o700)
+        _sessions_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
+        _sessions_dir().chmod(0o700)
     except OSError:
         return False
     return True
@@ -445,6 +967,1466 @@ def _entry_content(project: str, fields: dict[str, str]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _receipt_entry_failure(
+    *,
+    stage: str,
+    reason: str = "session_entry_invalid",
+    disposition: str = "persistence_failed",
+) -> PlumbingFailure:
+    from core.startup.runtime_receipt.plumbing_types import (
+        PlumbingDisposition,
+        PlumbingReason,
+        plumbing_failure,
+    )
+
+    return plumbing_failure(
+        PlumbingDisposition(disposition),
+        PlumbingReason(reason),
+        details={"stage": stage},
+    )
+
+
+def _canonical_u64(value: str, *, positive: bool) -> int:
+    if (
+        not value
+        or not value.isascii()
+        or not value.isdecimal()
+        or (len(value) > 1 and value.startswith("0"))
+        or len(value) > 20
+    ):
+        raise ValueError("invalid canonical decimal")
+    number = int(value)
+    if number > 2**64 - 1 or (positive and number == 0):
+        raise ValueError("decimal outside range")
+    return number
+
+
+def _serialize_session_receipt_entry(
+    reference: ReceiptReference,
+    *,
+    since: str,
+    host: SessionHostClaim,
+    token_hex: str,
+) -> bytes:
+    from core.startup.runtime_receipt.plumbing_types import (
+        ReceiptReference,
+        ReceiptState,
+        serialize_reference,
+        token_commitment_matches,
+    )
+    from core.startup.runtime_receipt.schema import AbsolutePath
+
+    if type(reference) is not ReceiptReference:
+        raise TypeError("reference must be ReceiptReference")
+    if type(host) is not SessionHostClaim or host.frontend is not Frontend.COPILOT:
+        raise ValueError("host observation must be an exact Copilot claim")
+    if _HOST_V2_SINCE_RE.fullmatch(since) is None:
+        raise ValueError("since timestamp is not canonical UTC")
+    parsed_since = datetime.fromisoformat(since)
+    if parsed_since.utcoffset() != timezone.utc.utcoffset(parsed_since):
+        raise ValueError("since timestamp is not UTC")
+    if _TOKEN_RE.fullmatch(token_hex) is None:
+        raise ValueError("session token is not canonical")
+    token = bytes.fromhex(token_hex)
+    if not token_commitment_matches(
+        token,
+        reference.session_token_commitment_sha256,
+    ):
+        raise ValueError("session token commitment mismatch")
+    AbsolutePath(str(host.executable))
+    _canonical_u64(str(host.uid), positive=False)
+    _canonical_u64(str(host.executable_device), positive=False)
+    _canonical_u64(str(host.executable_inode), positive=True)
+    if host.uid != reference.launcher_euid.value or reference.state not in {
+        ReceiptState.PENDING,
+        ReceiptState.VERIFIED,
+        ReceiptState.REJECTED,
+    }:
+        raise ValueError("host observation and receipt reference disagree")
+    values = {
+        "v": ENTRY_VERSION,
+        "project": NONE_SENTINEL,
+        "since": since,
+        "starttime": reference.session_starttime_ticks.text,
+        "boot_id": reference.boot_id.value,
+        "pidns": reference.pid_namespace_inode.text,
+        "host_v": "2",
+        "host": Frontend.COPILOT.value,
+        "host_uid": str(host.uid),
+    }
+    values.update(
+        {
+            "host_exe": str(host.executable),
+            "host_exe_dev": str(host.executable_device),
+            "host_exe_ino": str(host.executable_inode),
+            "host_receipt_v": "1",
+            "host_receipt_state": reference.state.value,
+            "host_receipt_sha256": reference.receipt_sha256.value,
+            "host_receipt_reference": serialize_reference(reference).decode("ascii"),
+            "token": token_hex,
+            "seeded_by": "owned_fake",
+        }
+    )
+    raw = "".join(f"{key}={values[key]}\n" for key in _HOST_V2_ENTRY_KEYS).encode(
+        "utf-8"
+    )
+    if len(raw) > _HOST_V2_ENTRY_MAX_BYTES or any(
+        len(line) > _HOST_V2_LINE_MAX_BYTES for line in raw[:-1].split(b"\n")
+    ):
+        raise ValueError("session receipt entry exceeds its byte bound")
+    return raw
+
+
+def _parse_session_receipt_entry(
+    raw: bytes,
+    *,
+    pid: int,
+) -> _SessionReceiptEntry | PlumbingFailure:
+    from core.startup.runtime_receipt.plumbing_types import (
+        CanonicalPid,
+        PlumbingFailure,
+        ReceiptState,
+        parse_reference,
+        serialize_reference,
+        token_commitment_matches,
+    )
+    from core.startup.runtime_receipt.schema import AbsolutePath, UuidText
+
+    try:
+        canonical_pid = CanonicalPid(pid)
+        if (
+            type(raw) is not bytes
+            or not raw
+            or len(raw) > _HOST_V2_ENTRY_MAX_BYTES
+            or raw.startswith(b"\xef\xbb\xbf")
+            or b"\r" in raw
+            or not raw.endswith(b"\n")
+            or raw.endswith(b"\n\n")
+        ):
+            raise ValueError("invalid entry envelope")
+        raw_lines = raw[:-1].split(b"\n")
+        if len(raw_lines) != len(_HOST_V2_ENTRY_KEYS) or any(
+            not line or len(line) > _HOST_V2_LINE_MAX_BYTES for line in raw_lines
+        ):
+            raise ValueError("invalid entry line count")
+        lines = tuple(line.decode("utf-8") for line in raw_lines)
+        pairs: list[tuple[str, str]] = []
+        for line in lines:
+            key, separator, value = line.partition("=")
+            if (
+                separator != "="
+                or not key
+                or not value
+                or not key.isascii()
+                or not value.isprintable()
+            ):
+                raise ValueError("invalid entry line")
+            pairs.append((key, value))
+        if tuple(key for key, _value in pairs) != _HOST_V2_ENTRY_KEYS:
+            raise ValueError("entry keys are not exact")
+        fields = dict(pairs)
+        if len(fields) != len(_HOST_V2_ENTRY_KEYS):
+            raise ValueError("duplicate entry key")
+        if (
+            fields["v"] != ENTRY_VERSION
+            or fields["project"] != NONE_SENTINEL
+            or fields["host_v"] != "2"
+            or fields["host"] != Frontend.COPILOT.value
+            or fields["host_receipt_v"] != "1"
+            or fields["seeded_by"] != "owned_fake"
+        ):
+            raise ValueError("fixed entry value mismatch")
+        since = fields["since"]
+        if _HOST_V2_SINCE_RE.fullmatch(since) is None:
+            raise ValueError("invalid since timestamp")
+        parsed_since = datetime.fromisoformat(since)
+        if parsed_since.utcoffset() != timezone.utc.utcoffset(parsed_since):
+            raise ValueError("since timestamp is not UTC")
+        starttime = _canonical_u64(fields["starttime"], positive=True)
+        boot = UuidText(fields["boot_id"])
+        pidns = _canonical_u64(fields["pidns"], positive=True)
+        uid = _canonical_u64(fields["host_uid"], positive=False)
+        device = _canonical_u64(fields["host_exe_dev"], positive=False)
+        inode = _canonical_u64(fields["host_exe_ino"], positive=True)
+        executable = AbsolutePath(fields["host_exe"])
+        state = ReceiptState(fields["host_receipt_state"])
+        if _SHA256_RE.fullmatch(fields["host_receipt_sha256"]) is None:
+            raise ValueError("invalid receipt digest")
+        reference_raw = fields["host_receipt_reference"].encode("ascii")
+        reference = parse_reference(reference_raw)
+        if isinstance(reference, PlumbingFailure):
+            return _receipt_entry_failure(stage="entry_reference")
+        if not secrets.compare_digest(
+            serialize_reference(reference),
+            reference_raw,
+        ):
+            raise ValueError("reference is not canonical")
+        if (
+            reference.session_pid != canonical_pid
+            or reference.session_starttime_ticks.value != starttime
+            or reference.boot_id != boot
+            or reference.pid_namespace_inode.value != pidns
+            or reference.launcher_euid.value != uid
+            or reference.state is not state
+            or not secrets.compare_digest(
+                reference.receipt_sha256.value,
+                fields["host_receipt_sha256"],
+            )
+        ):
+            raise ValueError("entry and reference disagree")
+        token_hex = fields["token"]
+        if _TOKEN_RE.fullmatch(token_hex) is None or not token_commitment_matches(
+            bytes.fromhex(token_hex),
+            reference.session_token_commitment_sha256,
+        ):
+            raise ValueError("token commitment mismatch")
+        host = SessionHostClaim(
+            frontend=Frontend.COPILOT,
+            uid=uid,
+            executable=Path(executable.value),
+            executable_device=device,
+            executable_inode=inode,
+        )
+        canonical = _serialize_session_receipt_entry(
+            reference,
+            since=since,
+            host=host,
+            token_hex=token_hex,
+        )
+        if not secrets.compare_digest(canonical, raw):
+            raise ValueError("entry is not canonical")
+        return _SessionReceiptEntry(
+            reference=reference,
+            since=since,
+            host=host,
+            token_hex=token_hex,
+            raw=raw,
+        )
+    except (UnicodeError, ValueError):
+        return _receipt_entry_failure(stage="entry_parse")
+
+
+def _after_session_lock_open(pid: int, lock_fd: int) -> None:
+    """Test seam after strict session-lock acquisition."""
+
+
+def _session_lock_stat_valid(value: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(value.st_mode)
+        and value.st_uid == os.geteuid()
+        and value.st_nlink == 1
+        and value.st_size == 0
+        and stat.S_IMODE(value.st_mode) & 0o022 == 0
+    )
+
+
+@contextlib.contextmanager
+def _strict_session_lock(
+    pid: int,
+    *,
+    attempts: int = 20,
+    interval: float = 0.01,
+) -> Iterator[None]:
+    from core.startup.runtime_receipt.plumbing_types import (
+        PlumbingDisposition,
+        PlumbingReason,
+        plumbing_failure,
+    )
+
+    try:
+        import fcntl
+        import time
+    except ImportError:
+        raise _SessionReceiptAbort(
+            plumbing_failure(
+                PlumbingDisposition.UNSUPPORTED_PLATFORM,
+                PlumbingReason.STRICT_LOCK_UNAVAILABLE,
+                details={"stage": "session_lock_import"},
+            )
+        )
+    if not _ensure_dir():
+        raise _SessionReceiptAbort(
+            plumbing_failure(
+                PlumbingDisposition.PERSISTENCE_FAILED,
+                PlumbingReason.ROOT_UNAVAILABLE,
+                details={"stage": "session_lock_root"},
+            )
+        )
+    required_flags = ("O_CLOEXEC", "O_NOFOLLOW", "O_NONBLOCK")
+    if any(type(getattr(os, name, None)) is not int for name in required_flags):
+        raise _SessionReceiptAbort(
+            plumbing_failure(
+                PlumbingDisposition.UNSUPPORTED_PLATFORM,
+                PlumbingReason.REQUIRED_OS_PRIMITIVE_MISSING,
+                details={"stage": "session_lock_flags"},
+            )
+        )
+    lock_path = _sessions_dir() / f"{pid}.run.lock"
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    for attempt in range(attempts):
+        try:
+            fd = os.open(lock_path, flags, 0o600)
+        except OSError as exc:
+            raise _SessionReceiptAbort(
+                plumbing_failure(
+                    PlumbingDisposition.PERSISTENCE_FAILED,
+                    PlumbingReason.LOCK_POLICY_VIOLATION,
+                    details={
+                        "stage": "session_lock_open",
+                        "errno_class": (
+                            "loop"
+                            if exc.errno == errno.ELOOP
+                            else "permission_denied"
+                            if exc.errno in {errno.EACCES, errno.EPERM}
+                            else "other"
+                        ),
+                    },
+                )
+            )
+        locked = False
+        try:
+            value = os.fstat(fd)
+            if not _session_lock_stat_valid(value):
+                raise _SessionReceiptAbort(
+                    plumbing_failure(
+                        PlumbingDisposition.PERSISTENCE_FAILED,
+                        PlumbingReason.LOCK_POLICY_VIOLATION,
+                        details={"stage": "session_lock_policy"},
+                    )
+                )
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+            except OSError as exc:
+                if exc.errno not in {errno.EAGAIN, errno.EWOULDBLOCK}:
+                    raise _SessionReceiptAbort(
+                        plumbing_failure(
+                            PlumbingDisposition.UNSUPPORTED_PLATFORM,
+                            PlumbingReason.STRICT_LOCK_UNAVAILABLE,
+                            details={"stage": "session_lock_acquire"},
+                        )
+                    )
+            if not locked:
+                continue
+            _after_session_lock_open(pid, fd)
+            try:
+                current: os.stat_result | None = os.stat(
+                    lock_path,
+                    follow_symlinks=False,
+                )
+            except OSError:
+                current = None
+            held = os.fstat(fd)
+            if (
+                current is None
+                or current.st_dev != held.st_dev
+                or current.st_ino != held.st_ino
+                or not _session_lock_stat_valid(current)
+            ):
+                continue
+            try:
+                yield
+            finally:
+                try:
+                    final: os.stat_result | None = os.stat(
+                        lock_path,
+                        follow_symlinks=False,
+                    )
+                except OSError:
+                    final = None
+                if (
+                    final is None
+                    or final.st_dev != held.st_dev
+                    or final.st_ino != held.st_ino
+                    or not _session_lock_stat_valid(final)
+                ):
+                    raise _SessionReceiptAbort(
+                        plumbing_failure(
+                            PlumbingDisposition.PERSISTENCE_FAILED,
+                            PlumbingReason.LOCK_REPLACED,
+                            details={"stage": "session_lock_release"},
+                        )
+                    )
+            return
+        finally:
+            if locked:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+            if not locked and attempt + 1 < attempts:
+                time.sleep(interval)
+    raise _SessionReceiptAbort(
+        plumbing_failure(
+            PlumbingDisposition.STATE_CONFLICT,
+            PlumbingReason.CONCURRENT_FINALIZER,
+            details={"stage": "session_lock_busy"},
+        )
+    )
+
+
+def _live_receipt_binding(
+    entry: _SessionReceiptEntry,
+) -> tuple[int, str, int, int] | None:
+    reference = entry.reference
+    pid = reference.session_pid.value
+    if not _pid_running(pid):
+        return None
+    live_start = proc_starttime(pid)
+    live_boot = boot_id()
+    live_pidns = pidns_id()
+    live_euid = _current_euid()
+    if (
+        live_start is None
+        or live_boot is None
+        or live_pidns is None
+        or live_start != reference.session_starttime_ticks.text
+        or live_boot != reference.boot_id.value
+        or live_pidns != reference.pid_namespace_inode.text
+        or live_euid != reference.launcher_euid.value
+    ):
+        return None
+    if _process_uid(pid) != entry.host.uid:
+        return None
+    if _process_executable_identity(pid) != (
+        entry.host.executable_device,
+        entry.host.executable_inode,
+    ):
+        return None
+    return int(live_start), live_boot, int(live_pidns), live_euid
+
+
+def _receipt_entry_live(entry: _SessionReceiptEntry) -> bool:
+    return _live_receipt_binding(entry) is not None
+
+
+def _positive_stale_entry(pid: int, fields: dict[str, str]) -> bool:
+    if _foreign_entry(fields):
+        return False
+    if not _pid_running(pid):
+        return True
+    if fields.get("v") != ENTRY_VERSION:
+        return False
+    stamped = fields.get("starttime", "")
+    if not stamped:
+        return False
+    live = proc_starttime(pid)
+    return live is not None and live != stamped
+
+
+def _legacy_fields_from_raw(raw: bytes) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return fields
+    for line in text.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            fields.setdefault(key.strip(), value.strip())
+    return fields
+
+
+def _read_session_entry_raw(
+    pid: int,
+) -> bytes | None | PlumbingFailure:
+    from core.startup.runtime_receipt.persistence import read_session_entry_bytes
+    from core.startup.runtime_receipt.plumbing_types import CanonicalPid
+
+    if not _sessions_dir().exists():
+        return None
+    return read_session_entry_bytes(
+        _sessions_dir(),
+        CanonicalPid(pid),
+        missing_ok=True,
+    )
+
+
+def _receipt_sidecar_name_from_fields(
+    pid: int,
+    fields: dict[str, str],
+) -> str | None:
+    digest = fields.get("host_receipt_sha256", "")
+    if fields.get("host_v") != "2" or _SHA256_RE.fullmatch(digest) is None:
+        return None
+    return f"{pid}.receipt.{digest}.json"
+
+
+def _receipt_artifact_counts(
+    pid: int,
+    *,
+    selected_name: str,
+) -> tuple[int, int] | PlumbingFailure:
+    from core.startup.runtime_receipt.plumbing_types import (
+        PlumbingDisposition,
+        PlumbingReason,
+        plumbing_failure,
+    )
+
+    immutable = 0
+    temporary = 0
+    try:
+        children = tuple(_sessions_dir().iterdir())
+    except OSError:
+        return plumbing_failure(
+            PlumbingDisposition.PERSISTENCE_FAILED,
+            PlumbingReason.ROOT_UNAVAILABLE,
+            details={"stage": "receipt_count"},
+        )
+    for child in children:
+        match = _HOST_V2_SIDECAR_RE.fullmatch(child.name)
+        if match is not None:
+            try:
+                named_pid = int(match.group("pid"))
+            except ValueError:
+                continue
+            if str(named_pid) != match.group("pid") or named_pid != pid:
+                continue
+            if match.group("temporary"):
+                temporary += 1
+            else:
+                immutable += 1
+            continue
+        entry_temp = _HOST_V2_ENTRY_TEMP_RE.fullmatch(child.name)
+        if entry_temp is not None and int(entry_temp.group("pid")) == pid:
+            temporary += 1
+    selected_exists = (_sessions_dir() / selected_name).exists()
+    if (
+        immutable > _HOST_V2_MAX_SIDECARS
+        or temporary > _HOST_V2_MAX_TEMPORARIES
+        or (immutable == _HOST_V2_MAX_SIDECARS and not selected_exists)
+        or (temporary >= _HOST_V2_MAX_TEMPORARIES and not selected_exists)
+    ):
+        return plumbing_failure(
+            PlumbingDisposition.PERSISTENCE_FAILED,
+            PlumbingReason.SIDECAR_LIMIT_EXCEEDED,
+            details={"stage": "receipt_count", "pid": str(pid)},
+        )
+    return immutable, temporary
+
+
+def _entry_reference_matches(
+    entry: _SessionReceiptEntry,
+    reference: ReceiptReference,
+) -> bool:
+    from core.startup.runtime_receipt.plumbing_types import serialize_reference
+
+    return secrets.compare_digest(
+        serialize_reference(entry.reference),
+        serialize_reference(reference),
+    )
+
+
+def _cleanup_exact_receipt_file(
+    pid: int,
+    file_name: str,
+    *,
+    temporary: bool = False,
+) -> bool | PlumbingFailure:
+    import time
+
+    from core.startup.runtime_receipt.persistence import unlink_receipt_file_exact
+    from core.startup.runtime_receipt.plumbing_types import (
+        CanonicalPid,
+        PlumbingDisposition,
+        PlumbingFailure,
+        PlumbingReason,
+    )
+
+    for attempt in range(20):
+        result = unlink_receipt_file_exact(
+            _sessions_dir(),
+            CanonicalPid(pid),
+            file_name,
+            temporary=temporary,
+        )
+        if not isinstance(result, PlumbingFailure):
+            return result
+        if (
+            result.disposition is not PlumbingDisposition.STATE_CONFLICT
+            or result.reason_codes != (PlumbingReason.CONCURRENT_FINALIZER,)
+            or attempt == 19
+        ):
+            return result
+        time.sleep(0.01)
+    raise AssertionError("bounded receipt cleanup loop did not return")
+
+
+def _cleanup_failure(
+    failure: PlumbingFailure,
+    *,
+    stage: str,
+) -> PlumbingFailure:
+    from core.startup.runtime_receipt.plumbing_types import (
+        PlumbingDisposition,
+        PlumbingReason,
+        plumbing_failure,
+    )
+
+    if failure.disposition is PlumbingDisposition.CLEANUP_FAILED:
+        return failure
+    return plumbing_failure(
+        PlumbingDisposition.CLEANUP_FAILED,
+        PlumbingReason.SIDECAR_CLEANUP_INCOMPLETE,
+        details={"stage": stage},
+        source_reason_codes=tuple(reason.value for reason in failure.reason_codes),
+    )
+
+
+def _cleanup_owned_sidecar_if_unselected(
+    reference: ReceiptReference,
+) -> PlumbingFailure | None:
+    from core.startup.runtime_receipt.plumbing_types import PlumbingFailure
+
+    pid = reference.session_pid.value
+    before = _read_session_entry_raw(pid)
+    if isinstance(before, PlumbingFailure):
+        return before
+    if before is not None:
+        parsed = _parse_session_receipt_entry(before, pid=pid)
+        if (
+            not isinstance(parsed, PlumbingFailure)
+            and parsed.reference.receipt_sha256 == reference.receipt_sha256
+        ):
+            return None
+    try:
+        with _strict_session_lock(pid):
+            current = _read_session_entry_raw(pid)
+            if isinstance(current, PlumbingFailure):
+                return current
+            if before is None:
+                if current is not None:
+                    return None
+            elif current is None or not secrets.compare_digest(current, before):
+                return None
+    except _SessionReceiptAbort as exc:
+        return exc.failure
+    cleaned = _cleanup_exact_receipt_file(pid, reference.sidecar_name)
+    return cleaned if isinstance(cleaned, PlumbingFailure) else None
+
+
+def _remove_entry_and_ledger_locked(
+    pid: int,
+    expected_raw: bytes,
+) -> PlumbingFailure | None:
+    from core.startup.runtime_receipt.persistence import unlink_session_entry_if_bytes
+    from core.startup.runtime_receipt.plumbing_types import (
+        CanonicalPid,
+        PlumbingFailure,
+    )
+
+    removed = unlink_session_entry_if_bytes(
+        _sessions_dir(),
+        CanonicalPid(pid),
+        expected_raw,
+    )
+    if isinstance(removed, PlumbingFailure):
+        return removed
+    try:
+        (_sessions_dir() / f"{pid}.run").unlink(missing_ok=True)
+    except OSError:
+        return _receipt_entry_failure(
+            stage="ledger_unlink",
+            reason="session_entry_cleanup_incomplete",
+            disposition="cleanup_failed",
+        )
+    return None
+
+
+def _remove_run_lock_after_strict_operation(pid: int) -> None:
+    with contextlib.suppress(OSError):
+        (_sessions_dir() / f"{pid}.run.lock").unlink(missing_ok=True)
+
+
+def install_pending_session_receipt(
+    pending: PendingReceiptIssued,
+    *,
+    token_hex: str,
+    expected_host: SessionHostClaim,
+) -> StoredReceipt | PlumbingFailure:
+    """Install one non-authorizing pending receipt in the real registry."""
+    from core.startup.runtime_receipt.issuance import PendingReceiptIssued
+    from core.startup.runtime_receipt.persistence import (
+        read_receipt_sidecar_bytes_for_registry,
+        write_receipt_sidecar,
+        write_session_entry_bytes,
+    )
+    from core.startup.runtime_receipt.plumbing_types import (
+        PlumbingDisposition,
+        PlumbingFailure,
+        PlumbingReason,
+        ReceiptState,
+        StoredReceipt,
+        authority_invariant_failure,
+        plumbing_failure,
+        reference_receipt_mismatch,
+    )
+    from core.startup.runtime_receipt.verify import serialize_receipt
+
+    invariant = authority_invariant_failure(
+        pending,
+        PendingReceiptIssued,
+    )
+    if invariant is not None:
+        return invariant
+    if (
+        pending.reference.state is not ReceiptState.PENDING
+        or reference_receipt_mismatch(
+            pending.reference,
+            pending.receipt,
+        )
+        is not None
+    ):
+        return plumbing_failure(
+            PlumbingDisposition.INVALID_REQUEST,
+            PlumbingReason.INVALID_RECEIPT_REFERENCE,
+        )
+    try:
+        since = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+        desired_raw = _serialize_session_receipt_entry(
+            pending.reference,
+            since=since,
+            host=expected_host,
+            token_hex=token_hex,
+        )
+    except (TypeError, ValueError):
+        return plumbing_failure(
+            PlumbingDisposition.INVALID_REQUEST,
+            PlumbingReason.SESSION_ENTRY_INVALID,
+        )
+    if not _ensure_dir():
+        return plumbing_failure(
+            PlumbingDisposition.PERSISTENCE_FAILED,
+            PlumbingReason.ROOT_UNAVAILABLE,
+            details={"stage": "receipt_install_root"},
+        )
+    counts = _receipt_artifact_counts(
+        pending.reference.session_pid.value,
+        selected_name=pending.reference.sidecar_name,
+    )
+    if isinstance(counts, PlumbingFailure):
+        return counts
+    stored = write_receipt_sidecar(
+        _sessions_dir(),
+        pending.reference,
+        pending.receipt,
+    )
+    if isinstance(stored, PlumbingFailure):
+        return stored
+    invariant = authority_invariant_failure(
+        stored,
+        StoredReceipt,
+        disposition=PlumbingDisposition.PERSISTENCE_FAILED,
+        details={"stage": "receipt_install_sidecar"},
+    )
+    if invariant is not None:
+        return invariant
+    sidecar_raw = serialize_receipt(stored.receipt)
+    pid = pending.reference.session_pid.value
+    before = _read_session_entry_raw(pid)
+    if isinstance(before, PlumbingFailure):
+        if stored.created:
+            _cleanup_owned_sidecar_if_unselected(pending.reference)
+        return before
+    before_fields = _legacy_fields_from_raw(before) if before is not None else {}
+    if before is not None:
+        before_entry = _parse_session_receipt_entry(before, pid=pid)
+        if (
+            isinstance(before_entry, _SessionReceiptEntry)
+            and _entry_reference_matches(
+                before_entry,
+                pending.reference,
+            )
+            and secrets.compare_digest(before_entry.token_hex, token_hex)
+            and before_entry.host == expected_host
+        ):
+            return plumbing_failure(
+                PlumbingDisposition.INVALID_REQUEST,
+                PlumbingReason.REPLAYED_TRANSITION,
+                details={"state": ReceiptState.PENDING.value},
+            )
+        if not _positive_stale_entry(pid, before_fields):
+            if stored.created:
+                _cleanup_owned_sidecar_if_unselected(pending.reference)
+            return plumbing_failure(
+                PlumbingDisposition.STATE_CONFLICT,
+                PlumbingReason.CAS_CONFLICT,
+                details={"state": ReceiptState.PENDING.value},
+            )
+    predecessor_name = (
+        _receipt_sidecar_name_from_fields(pid, before_fields)
+        if before is not None
+        else None
+    )
+    try:
+        with _strict_session_lock(pid):
+            current = _read_session_entry_raw(pid)
+            if isinstance(current, PlumbingFailure):
+                raise _SessionReceiptAbort(current)
+            if before is None:
+                if current is not None:
+                    raise _SessionReceiptAbort(
+                        plumbing_failure(
+                            PlumbingDisposition.STATE_CONFLICT,
+                            PlumbingReason.SESSION_REPLACED,
+                        )
+                    )
+            elif current is None or not secrets.compare_digest(current, before):
+                raise _SessionReceiptAbort(
+                    plumbing_failure(
+                        PlumbingDisposition.STATE_CONFLICT,
+                        PlumbingReason.SESSION_REPLACED,
+                    )
+                )
+            elif not _positive_stale_entry(pid, before_fields):
+                raise _SessionReceiptAbort(
+                    plumbing_failure(
+                        PlumbingDisposition.STATE_CONFLICT,
+                        PlumbingReason.CAS_CONFLICT,
+                    )
+                )
+            if not _receipt_entry_live(
+                _SessionReceiptEntry(
+                    reference=pending.reference,
+                    since=since,
+                    host=expected_host,
+                    token_hex=token_hex,
+                    raw=desired_raw,
+                )
+            ):
+                raise _SessionReceiptAbort(
+                    plumbing_failure(
+                        PlumbingDisposition.BINDING_FAILED,
+                        PlumbingReason.PROCESS_BINDING_MISMATCH,
+                    )
+                )
+            observed_sidecar = read_receipt_sidecar_bytes_for_registry(
+                _sessions_dir(),
+                pending.reference,
+            )
+            if isinstance(observed_sidecar, PlumbingFailure):
+                raise _SessionReceiptAbort(observed_sidecar)
+            if not secrets.compare_digest(observed_sidecar, sidecar_raw):
+                raise _SessionReceiptAbort(
+                    plumbing_failure(
+                        PlumbingDisposition.PERSISTENCE_FAILED,
+                        PlumbingReason.SIDECAR_DIGEST_MISMATCH,
+                    )
+                )
+            if not _receipt_entry_live(
+                _SessionReceiptEntry(
+                    reference=pending.reference,
+                    since=since,
+                    host=expected_host,
+                    token_hex=token_hex,
+                    raw=desired_raw,
+                )
+            ):
+                raise _SessionReceiptAbort(
+                    plumbing_failure(
+                        PlumbingDisposition.BINDING_FAILED,
+                        PlumbingReason.PROCESS_BINDING_MISMATCH,
+                    )
+                )
+            if before is not None:
+                removed = _remove_entry_and_ledger_locked(pid, before)
+                if removed is not None:
+                    raise _SessionReceiptAbort(removed)
+            written = write_session_entry_bytes(
+                _sessions_dir(),
+                pending.reference.session_pid,
+                desired_raw,
+            )
+            if isinstance(written, PlumbingFailure):
+                raise _SessionReceiptAbort(written)
+            if not secrets.compare_digest(written, desired_raw):
+                raise _SessionReceiptAbort(
+                    plumbing_failure(
+                        PlumbingDisposition.PERSISTENCE_FAILED,
+                        PlumbingReason.SESSION_ENTRY_WRITE_FAILED,
+                    )
+                )
+    except _SessionReceiptAbort as exc:
+        if stored.created:
+            _cleanup_owned_sidecar_if_unselected(pending.reference)
+        return exc.failure
+    if before is not None:
+        _remove_run_lock_after_strict_operation(pid)
+    if predecessor_name and predecessor_name != pending.reference.sidecar_name:
+        cleaned = _cleanup_exact_receipt_file(pid, predecessor_name)
+        if isinstance(cleaned, PlumbingFailure):
+            return _cleanup_failure(
+                cleaned,
+                stage="receipt_install_predecessor_cleanup",
+            )
+    invariant = authority_invariant_failure(
+        stored,
+        StoredReceipt,
+        disposition=PlumbingDisposition.PERSISTENCE_FAILED,
+        details={"stage": "receipt_install_result"},
+    )
+    return invariant or stored
+
+
+def compare_and_swap_session_receipt(
+    expected: ReceiptReference,
+    replacement: ReceiptReference,
+    receipt: RuntimeReceipt,
+    *,
+    token_hex: str,
+) -> CasApplied | PlumbingFailure:
+    """Swing one host-v2 entry by full-byte compare-and-swap."""
+    from core.startup.runtime_receipt.persistence import (
+        read_receipt_sidecar_bytes_for_registry,
+        write_receipt_sidecar,
+        write_session_entry_bytes,
+    )
+    from core.startup.runtime_receipt.plumbing_types import (
+        CasApplied,
+        PlumbingDisposition,
+        PlumbingFailure,
+        PlumbingReason,
+        ReceiptReference,
+        ReceiptState,
+        StoredReceipt,
+        authority_invariant_failure,
+        plumbing_failure,
+        reference_receipt_mismatch,
+        reference_transition_mismatch,
+        token_commitment_matches,
+    )
+    from core.startup.runtime_receipt.schema import RuntimeReceipt
+    from core.startup.runtime_receipt.verify import serialize_receipt
+
+    if (
+        type(expected) is not ReceiptReference
+        or type(replacement) is not ReceiptReference
+    ):
+        raise TypeError("expected and replacement must be ReceiptReference")
+    if type(receipt) is not RuntimeReceipt:
+        raise TypeError("receipt must be RuntimeReceipt")
+    mismatch = reference_transition_mismatch(expected, replacement)
+    if mismatch is not None:
+        return mismatch
+    mismatch = reference_receipt_mismatch(replacement, receipt)
+    if mismatch is not None:
+        return mismatch
+    if _TOKEN_RE.fullmatch(token_hex) is None or not secrets.compare_digest(
+        expected.session_token_commitment_sha256.value,
+        replacement.session_token_commitment_sha256.value,
+    ):
+        return plumbing_failure(
+            PlumbingDisposition.BINDING_FAILED,
+            PlumbingReason.TOKEN_MISMATCH,
+        )
+
+    if not token_commitment_matches(
+        bytes.fromhex(token_hex),
+        expected.session_token_commitment_sha256,
+    ):
+        return plumbing_failure(
+            PlumbingDisposition.BINDING_FAILED,
+            PlumbingReason.TOKEN_MISMATCH,
+        )
+    pid = expected.session_pid.value
+    before = _read_session_entry_raw(pid)
+    if isinstance(before, PlumbingFailure):
+        return before
+    if before is None:
+        return plumbing_failure(
+            PlumbingDisposition.PERSISTENCE_FAILED,
+            PlumbingReason.SESSION_ENTRY_MISSING,
+        )
+    current = _parse_session_receipt_entry(before, pid=pid)
+    if isinstance(current, PlumbingFailure):
+        return current
+    if not _entry_reference_matches(current, expected):
+        if _entry_reference_matches(current, replacement):
+            return plumbing_failure(
+                PlumbingDisposition.STATE_CONFLICT,
+                PlumbingReason.CONCURRENT_FINALIZER,
+                details={"state": current.reference.state.value},
+            )
+        return plumbing_failure(
+            PlumbingDisposition.STATE_CONFLICT,
+            PlumbingReason.CAS_CONFLICT,
+            details={"state": current.reference.state.value},
+        )
+    if not secrets.compare_digest(current.token_hex, token_hex):
+        return plumbing_failure(
+            PlumbingDisposition.BINDING_FAILED,
+            PlumbingReason.TOKEN_MISMATCH,
+        )
+    desired_raw = _serialize_session_receipt_entry(
+        replacement,
+        since=current.since,
+        host=current.host,
+        token_hex=token_hex,
+    )
+    stored = write_receipt_sidecar(_sessions_dir(), replacement, receipt)
+    if isinstance(stored, PlumbingFailure):
+        return stored
+    invariant = authority_invariant_failure(
+        stored,
+        StoredReceipt,
+        disposition=PlumbingDisposition.PERSISTENCE_FAILED,
+        details={"stage": "receipt_cas_sidecar"},
+    )
+    if invariant is not None:
+        return invariant
+    sidecar_raw = serialize_receipt(stored.receipt)
+    succeeded = False
+    try:
+        with _strict_session_lock(pid):
+            observed = _read_session_entry_raw(pid)
+            if isinstance(observed, PlumbingFailure):
+                return observed
+            if observed is None or not secrets.compare_digest(observed, before):
+                return plumbing_failure(
+                    PlumbingDisposition.STATE_CONFLICT,
+                    PlumbingReason.SESSION_REPLACED,
+                )
+            if replacement.state is ReceiptState.VERIFIED and not _receipt_entry_live(
+                current
+            ):
+                return plumbing_failure(
+                    PlumbingDisposition.BINDING_FAILED,
+                    PlumbingReason.PROCESS_BINDING_MISMATCH,
+                )
+            observed_sidecar = read_receipt_sidecar_bytes_for_registry(
+                _sessions_dir(),
+                replacement,
+            )
+            if isinstance(observed_sidecar, PlumbingFailure):
+                return observed_sidecar
+            if not secrets.compare_digest(observed_sidecar, sidecar_raw):
+                return plumbing_failure(
+                    PlumbingDisposition.PERSISTENCE_FAILED,
+                    PlumbingReason.SIDECAR_DIGEST_MISMATCH,
+                )
+            if replacement.state is ReceiptState.VERIFIED and not _receipt_entry_live(
+                current
+            ):
+                return plumbing_failure(
+                    PlumbingDisposition.BINDING_FAILED,
+                    PlumbingReason.PROCESS_BINDING_MISMATCH,
+                )
+            written = write_session_entry_bytes(
+                _sessions_dir(),
+                replacement.session_pid,
+                desired_raw,
+            )
+            if isinstance(written, PlumbingFailure):
+                return written
+            if not secrets.compare_digest(written, desired_raw):
+                return plumbing_failure(
+                    PlumbingDisposition.PERSISTENCE_FAILED,
+                    PlumbingReason.SESSION_ENTRY_WRITE_FAILED,
+                )
+            succeeded = True
+    except _SessionReceiptAbort as exc:
+        return exc.failure
+    finally:
+        if not succeeded and stored.created:
+            _cleanup_owned_sidecar_if_unselected(replacement)
+    cleaned = _cleanup_exact_receipt_file(pid, expected.sidecar_name)
+    if isinstance(cleaned, PlumbingFailure):
+        return _cleanup_failure(
+            cleaned,
+            stage="receipt_cas_predecessor_cleanup",
+        )
+    result = CasApplied(prior=expected, current=replacement)
+    invariant = authority_invariant_failure(
+        result,
+        CasApplied,
+        disposition=PlumbingDisposition.PERSISTENCE_FAILED,
+        details={"stage": "receipt_cas_result"},
+    )
+    return invariant or result
+
+
+def _capture_live_receipt_binding(
+    capture: SessionRuntimeReceiptCapture,
+) -> tuple[int, str, int, int] | None:
+    reference = capture.reference
+    pid = capture.session_pid
+    if not _pid_running(pid):
+        return None
+    live_start = proc_starttime(pid)
+    live_boot = boot_id()
+    live_pidns = pidns_id()
+    live_euid = _current_euid()
+    if (
+        live_start is None
+        or live_boot is None
+        or live_pidns is None
+        or live_start != reference.session_starttime_ticks.text
+        or live_boot != reference.boot_id.value
+        or live_pidns != reference.pid_namespace_inode.text
+        or live_euid != reference.launcher_euid.value
+        or _process_uid(pid) != capture._host_uid
+        or _process_executable_identity(pid)
+        != (
+            capture._host_executable_device,
+            capture._host_executable_inode,
+        )
+    ):
+        return None
+    return int(live_start), live_boot, int(live_pidns), live_euid
+
+
+def capture_current_session_runtime_receipt(
+    *,
+    profiles: ProfileStore,
+    now: datetime,
+) -> SessionRuntimeReceiptCapture | PlumbingFailure | None:
+    """Capture a verified host-v2 receipt without minting session authority."""
+    from core.startup.runtime_receipt.persistence import (
+        read_receipt_sidecar,
+        read_receipt_sidecar_bytes_for_registry,
+    )
+    from core.startup.runtime_receipt.plumbing_types import (
+        PlumbingDisposition,
+        PlumbingFailure,
+        PlumbingReason,
+        ReceiptState,
+        RuntimeReceiptSnapshot,
+        authority_invariant_failure,
+        plumbing_failure,
+        snapshot_from_static_verification,
+    )
+    from core.startup.runtime_receipt.profile import ProfileStore
+    from core.startup.runtime_receipt.reasons import ReceiptRejection
+    from core.startup.runtime_receipt.schema import ExpectedBinding
+    from core.startup.runtime_receipt.verify import (
+        serialize_receipt,
+        verify_receipt_static,
+    )
+
+    if type(profiles) is not ProfileStore:
+        raise TypeError("profiles must be ProfileStore")
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    candidate = _env_session_record()
+    if candidate is None:
+        return None
+    pid, legacy_fields = candidate
+    if not _host_v2_marker(legacy_fields):
+        return None
+    before = _read_session_entry_raw(pid)
+    if isinstance(before, PlumbingFailure):
+        return before
+    if before is None:
+        return plumbing_failure(
+            PlumbingDisposition.PERSISTENCE_FAILED,
+            PlumbingReason.SESSION_ENTRY_MISSING,
+        )
+    entry = _parse_session_receipt_entry(before, pid=pid)
+    if isinstance(entry, PlumbingFailure):
+        return entry
+    env_token = os.environ.get(ENV_SESSION_TOKEN, "")
+    if not secrets.compare_digest(entry.token_hex, env_token):
+        return None
+    stored = read_receipt_sidecar(_sessions_dir(), entry.reference)
+    if isinstance(stored, PlumbingFailure):
+        return stored
+    sidecar_raw = serialize_receipt(stored.receipt)
+    if _live_receipt_binding(entry) is None:
+        return plumbing_failure(
+            PlumbingDisposition.BINDING_FAILED,
+            PlumbingReason.PROCESS_BINDING_MISMATCH,
+        )
+    live_binding: tuple[int, str, int, int] | None = None
+    try:
+        with _strict_session_lock(pid):
+            observed_entry = _read_session_entry_raw(pid)
+            if (
+                isinstance(observed_entry, PlumbingFailure)
+                or observed_entry is None
+                or not secrets.compare_digest(observed_entry, before)
+            ):
+                return (
+                    observed_entry
+                    if isinstance(observed_entry, PlumbingFailure)
+                    else plumbing_failure(
+                        PlumbingDisposition.STATE_CONFLICT,
+                        PlumbingReason.SESSION_REPLACED,
+                    )
+                )
+            if _live_receipt_binding(entry) is None:
+                return plumbing_failure(
+                    PlumbingDisposition.BINDING_FAILED,
+                    PlumbingReason.PROCESS_BINDING_MISMATCH,
+                )
+            observed_sidecar = read_receipt_sidecar_bytes_for_registry(
+                _sessions_dir(),
+                entry.reference,
+            )
+            if isinstance(observed_sidecar, PlumbingFailure):
+                return observed_sidecar
+            if not secrets.compare_digest(observed_sidecar, sidecar_raw):
+                return plumbing_failure(
+                    PlumbingDisposition.PERSISTENCE_FAILED,
+                    PlumbingReason.SIDECAR_DIGEST_MISMATCH,
+                )
+            live_binding = _live_receipt_binding(entry)
+            if live_binding is None:
+                return plumbing_failure(
+                    PlumbingDisposition.BINDING_FAILED,
+                    PlumbingReason.PROCESS_BINDING_MISMATCH,
+                )
+    except _SessionReceiptAbort as exc:
+        return exc.failure
+    if entry.reference.state is ReceiptState.PENDING:
+        return plumbing_failure(
+            PlumbingDisposition.BINDING_FAILED,
+            PlumbingReason.STATE_NOT_FINAL,
+            details={"state": ReceiptState.PENDING.value},
+        )
+    if entry.reference.state is ReceiptState.REJECTED:
+        return plumbing_failure(
+            PlumbingDisposition.RECEIPT_REJECTED,
+            PlumbingReason.RECEIPT_STATE_REJECTED,
+            details={"state": ReceiptState.REJECTED.value},
+        )
+    reference = entry.reference
+    assert live_binding is not None
+    live_start, live_boot, live_pidns, live_euid = live_binding
+    expected = ExpectedBinding(
+        session_id=reference.session_id.value,
+        launch_id=reference.launch_id.value,
+        session_pid=pid,
+        session_starttime_ticks=live_start,
+        boot_id=live_boot,
+        pid_namespace_inode=live_pidns,
+        launcher_euid=live_euid,
+        token_hex=env_token,
+    )
+    verified = verify_receipt_static(
+        stored.receipt,
+        profiles=profiles,
+        expected=expected,
+        now=now,
+    )
+    if isinstance(verified, ReceiptRejection):
+        return plumbing_failure(
+            PlumbingDisposition.RECEIPT_REJECTED,
+            PlumbingReason.STATIC_VERIFICATION_FAILED,
+            source_reason_codes=tuple(reason.value for reason in verified.reason_codes),
+        )
+    snapshot = snapshot_from_static_verification(verified)
+    invariant = authority_invariant_failure(
+        snapshot,
+        RuntimeReceiptSnapshot,
+        details={"stage": "receipt_read_result"},
+    )
+    if invariant is not None:
+        return invariant
+    return SessionRuntimeReceiptCapture(
+        snapshot=snapshot,
+        session_pid=pid,
+        reference=reference,
+        _entry_sha256=hashlib.sha256(before).digest(),
+        _sidecar_sha256=hashlib.sha256(sidecar_raw).digest(),
+        _host_uid=entry.host.uid,
+        _host_executable_device=entry.host.executable_device,
+        _host_executable_inode=entry.host.executable_inode,
+    )
+
+
+def read_current_session_runtime_receipt(
+    *,
+    profiles: ProfileStore,
+    now: datetime,
+) -> RuntimeReceiptSnapshot | PlumbingFailure | None:
+    """Read the matching env credential as a verified non-authorizing snapshot."""
+
+    captured = capture_current_session_runtime_receipt(
+        profiles=profiles,
+        now=now,
+    )
+    if isinstance(captured, SessionRuntimeReceiptCapture):
+        return captured.snapshot
+    return captured
+
+
+@contextlib.contextmanager
+def session_runtime_receipt_fence(
+    capture: SessionRuntimeReceiptCapture,
+) -> Iterator[None]:
+    """Hold the strict session lock while rechecking one trusted capture."""
+    from core.startup.runtime_receipt.persistence import (
+        read_receipt_sidecar_bytes_for_registry,
+    )
+    from core.startup.runtime_receipt.plumbing_types import (
+        PlumbingDisposition,
+        PlumbingFailure,
+        PlumbingReason,
+        plumbing_failure,
+    )
+
+    if type(capture) is not SessionRuntimeReceiptCapture:
+        raise TypeError("capture must be SessionRuntimeReceiptCapture")
+    try:
+        capture.__post_init__()
+    except (TypeError, ValueError):
+        raise _SessionReceiptAbort(
+            plumbing_failure(
+                PlumbingDisposition.INVALID_REQUEST,
+                PlumbingReason.AUTHORITY_INVARIANT_VIOLATION,
+                details={"stage": "receipt_fence_capture"},
+            )
+        )
+    try:
+        with _strict_session_lock(capture.session_pid):
+            observed_entry = _read_session_entry_raw(capture.session_pid)
+            if isinstance(observed_entry, PlumbingFailure):
+                raise _SessionReceiptAbort(observed_entry)
+            if observed_entry is None or not secrets.compare_digest(
+                hashlib.sha256(observed_entry).digest(),
+                capture._entry_sha256,
+            ):
+                raise _SessionReceiptAbort(
+                    plumbing_failure(
+                        PlumbingDisposition.STATE_CONFLICT,
+                        PlumbingReason.SESSION_REPLACED,
+                        details={"stage": "receipt_fence_entry"},
+                    )
+                )
+            if _capture_live_receipt_binding(capture) is None:
+                raise _SessionReceiptAbort(
+                    plumbing_failure(
+                        PlumbingDisposition.BINDING_FAILED,
+                        PlumbingReason.PROCESS_BINDING_MISMATCH,
+                        details={"stage": "receipt_fence_binding"},
+                    )
+                )
+            observed_sidecar = read_receipt_sidecar_bytes_for_registry(
+                _sessions_dir(),
+                capture.reference,
+            )
+            if isinstance(observed_sidecar, PlumbingFailure):
+                raise _SessionReceiptAbort(observed_sidecar)
+            if not secrets.compare_digest(
+                hashlib.sha256(observed_sidecar).digest(),
+                capture._sidecar_sha256,
+            ):
+                raise _SessionReceiptAbort(
+                    plumbing_failure(
+                        PlumbingDisposition.PERSISTENCE_FAILED,
+                        PlumbingReason.SIDECAR_DIGEST_MISMATCH,
+                        details={"stage": "receipt_fence_sidecar"},
+                    )
+                )
+            if _capture_live_receipt_binding(capture) is None:
+                raise _SessionReceiptAbort(
+                    plumbing_failure(
+                        PlumbingDisposition.BINDING_FAILED,
+                        PlumbingReason.PROCESS_BINDING_MISMATCH,
+                        details={"stage": "receipt_fence_binding"},
+                    )
+                )
+            yield
+    except _SessionReceiptAbort:
+        raise
+
+
+def remove_session_receipt(
+    expected: ReceiptReference,
+    *,
+    token_hex: str,
+) -> CleanupApplied | PlumbingFailure:
+    """Revoke one exact host-v2 entry, then remove its selected sidecar."""
+    from core.startup.runtime_receipt.plumbing_types import (
+        CleanupApplied,
+        PlumbingDisposition,
+        PlumbingFailure,
+        PlumbingReason,
+        ReceiptReference,
+        ReceiptState,
+        ReceiptStateRecord,
+        authority_invariant_failure,
+        plumbing_failure,
+        token_commitment_matches,
+        transition_state,
+    )
+
+    if type(expected) is not ReceiptReference:
+        raise TypeError("expected must be ReceiptReference")
+    if _TOKEN_RE.fullmatch(token_hex) is None or not token_commitment_matches(
+        bytes.fromhex(token_hex),
+        expected.session_token_commitment_sha256,
+    ):
+        return plumbing_failure(
+            PlumbingDisposition.BINDING_FAILED,
+            PlumbingReason.TOKEN_MISMATCH,
+        )
+    transition = transition_state(
+        ReceiptStateRecord(expected.state, expected),
+        ReceiptState.CLEANED,
+    )
+    if isinstance(transition, PlumbingFailure):
+        return transition
+    pid = expected.session_pid.value
+    before = _read_session_entry_raw(pid)
+    if isinstance(before, PlumbingFailure):
+        return before
+    if before is None:
+        return plumbing_failure(
+            PlumbingDisposition.PERSISTENCE_FAILED,
+            PlumbingReason.SESSION_ENTRY_MISSING,
+        )
+    entry = _parse_session_receipt_entry(before, pid=pid)
+    if isinstance(entry, PlumbingFailure):
+        return entry
+    if not _entry_reference_matches(entry, expected) or not secrets.compare_digest(
+        entry.token_hex, token_hex
+    ):
+        return plumbing_failure(
+            PlumbingDisposition.STATE_CONFLICT,
+            PlumbingReason.SESSION_REPLACED,
+        )
+    try:
+        with _strict_session_lock(pid):
+            observed = _read_session_entry_raw(pid)
+            if (
+                isinstance(observed, PlumbingFailure)
+                or observed is None
+                or not secrets.compare_digest(observed, before)
+            ):
+                return (
+                    observed
+                    if isinstance(observed, PlumbingFailure)
+                    else plumbing_failure(
+                        PlumbingDisposition.STATE_CONFLICT,
+                        PlumbingReason.SESSION_REPLACED,
+                    )
+                )
+            removed = _remove_entry_and_ledger_locked(pid, before)
+            if removed is not None:
+                return removed
+    except _SessionReceiptAbort as exc:
+        return exc.failure
+    _remove_run_lock_after_strict_operation(pid)
+    sidecar = _cleanup_exact_receipt_file(pid, expected.sidecar_name)
+    if isinstance(sidecar, PlumbingFailure):
+        return _cleanup_failure(
+            sidecar,
+            stage="receipt_remove_sidecar",
+        )
+    result = CleanupApplied(
+        reference=expected,
+        pointer_removed=True,
+        sidecar_removed=True,
+    )
+    invariant = authority_invariant_failure(
+        result,
+        CleanupApplied,
+        disposition=PlumbingDisposition.PERSISTENCE_FAILED,
+        details={"stage": "receipt_remove_result"},
+    )
+    return invariant or result
+
+
 def _identity_for(pid: int) -> dict[str, str] | None:
     """The identity stamp for *pid*, with off-Linux sentinels.
 
@@ -471,9 +2453,52 @@ def _identity_for(pid: int) -> dict[str, str] | None:
     return fields
 
 
-def record_session(project: str | None, pid: int | None = None,
-                   token: str | None = None,
-                   seeded_by: str | None = None) -> int | None:
+def _remove_host_v2_for_generic_writer(pid: int) -> int | None:
+    from core.startup.runtime_receipt.plumbing_types import PlumbingFailure
+
+    before = _read_session_entry_raw(pid)
+    if isinstance(before, PlumbingFailure):
+        return None
+    if before is None:
+        return pid
+    fields = _legacy_fields_from_raw(before)
+    if not _host_v2_marker(fields):
+        recovered = _credential_fields_from_raw(_sessions_dir() / str(pid))
+        fields.update(
+            {key: value for key, value in recovered.items() if key not in fields}
+        )
+    if not _host_v2_marker(fields):
+        return None
+    sidecar_name = _receipt_sidecar_name_from_fields(pid, fields)
+    try:
+        with _strict_session_lock(pid):
+            current = _read_session_entry_raw(pid)
+            if (
+                isinstance(current, PlumbingFailure)
+                or current is None
+                or not secrets.compare_digest(current, before)
+            ):
+                return None
+            failure = _remove_entry_and_ledger_locked(pid, before)
+            if failure is not None:
+                return None
+    except _SessionReceiptAbort:
+        return None
+    _remove_run_lock_after_strict_operation(pid)
+    if sidecar_name is not None:
+        cleaned = _cleanup_exact_receipt_file(pid, sidecar_name)
+        if isinstance(cleaned, PlumbingFailure):
+            return None
+    return pid
+
+
+def record_session(
+    project: str | None,
+    pid: int | None = None,
+    token: str | None = None,
+    seeded_by: str | None = None,
+    host_claim: SessionHostClaim | None = None,
+) -> int | None:
     """Bind this session to *project* (None REMOVES the entry — the
     launcher seed-cleanup path; in-session ``/project none`` binds the
     NONE_SENTINEL instead, see :func:`bind_session`).
@@ -490,6 +2515,14 @@ def record_session(project: str | None, pid: int | None = None,
     if pid is None:
         return None
     if project is None:
+        current_path = _sessions_dir() / str(pid)
+        current_fields = _parse_entry(current_path)
+        if not _host_v2_marker(current_fields):
+            recovered = _credential_fields_from_raw(current_path)
+            for key, value in recovered.items():
+                current_fields.setdefault(key, value)
+        if _host_v2_marker(current_fields):
+            return _remove_host_v2_for_generic_writer(pid)
         try:
             # Entry first: ledger writers gate on it, so once it is
             # gone no new append can resurrect the ledger. The ledger
@@ -498,42 +2531,86 @@ def record_session(project: str | None, pid: int | None = None,
             # across, the removal. Unlinking the lock file last is
             # safe: writers verify their fd still names the path
             # after acquiring and retry when it doesn't.
-            (SESSIONS_DIR / str(pid)).unlink(missing_ok=True)
+            (_sessions_dir() / str(pid)).unlink(missing_ok=True)
             with _ledger_lock(pid):
-                (SESSIONS_DIR / f"{pid}.run").unlink(missing_ok=True)
-            (SESSIONS_DIR / f"{pid}.run.lock").unlink(missing_ok=True)
+                (_sessions_dir() / f"{pid}.run").unlink(missing_ok=True)
+            (_sessions_dir() / f"{pid}.run.lock").unlink(missing_ok=True)
         except OSError:
             return None
         return pid
     if project != NONE_SENTINEL and not _NAME_RE.match(project):
-        logger.warning(
-            "sessions: refusing to bind invalid project name %r", project)
+        logger.warning("sessions: refusing to bind invalid project name %r", project)
         return None
     if not _ensure_dir():
         return None
-    entry = SESSIONS_DIR / str(pid)
+    entry = _sessions_dir() / str(pid)
     # The per-pid ledger lock doubles as the ENTRY RMW lock: without
     # it, delete/rename's binding rewrites and a concurrent
     # /project use are a lost-update race (both read, both write,
     # last-writer-wins with a stale decision).
     with _ledger_lock(pid):
-        return _record_session_locked(project, pid, token, seeded_by,
-                                      entry)
+        return _record_session_locked(project, pid, token, seeded_by, entry, host_claim)
 
 
-def _record_session_locked(project: str, pid: int,
-                           token: str | None, seeded_by: str | None,
-                           entry: Path) -> int | None:
+def _record_session_locked(
+    project: str,
+    pid: int,
+    token: str | None,
+    seeded_by: str | None,
+    entry: Path,
+    host_claim: SessionHostClaim | None = None,
+) -> int | None:
     """The under-lock half of record_session — *project* is never None
     here (the removal path returns before the lock)."""
     fields = _parse_entry(entry)
+    if not _host_v2_marker(fields):
+        recovered = _credential_fields_from_raw(entry)
+        for key, value in recovered.items():
+            fields.setdefault(key, value)
+    if _host_v2_marker(fields):
+        logger.warning(
+            "sessions: refusing generic rewrite of receipt-backed pid %d",
+            pid,
+        )
+        return None
+    host_state, existing_claim = _host_claim_state(fields, pid=pid)
+    if host_state == "invalid":
+        logger.warning(
+            "sessions: refusing to rewrite pid %d with a malformed host claim", pid
+        )
+        return None
+    if host_claim is not None and not host_process_matches(
+        pid,
+        host_claim,
+        pid_running=_pid_running,
+        comm_reader=_comm,
+        uid_reader=_process_uid,
+        executable_identity_reader=_process_executable_identity,
+    ):
+        logger.warning(
+            "sessions: refusing host claim for pid %d — live process "
+            "evidence does not match",
+            pid,
+        )
+        return None
+    if host_claim is not None:
+        effective_token = token or fields.get("token", "")
+        if not _TOKEN_RE.fullmatch(effective_token):
+            logger.warning(
+                "sessions: refusing host claim for pid %d — a strong "
+                "record requires a launcher-minted token",
+                pid,
+            )
+            return None
     have_valid_stamp = bool(fields) and _identity_matches(pid, fields)
     if not have_valid_stamp:
         identity = _identity_for(pid)
         if identity is None:
             logger.warning(
                 "sessions: refusing to bind pid %d — identity "
-                "unreadable, the entry could never verify", pid)
+                "unreadable, the entry could never verify",
+                pid,
+            )
             return None
         # A stale stamp means the old entry belonged to a DIFFERENT
         # process (recycled pid): its token and seeded_by are that
@@ -544,11 +2621,36 @@ def _record_session_locked(project: str, pid: int,
         env_tok = os.environ.get(ENV_SESSION_TOKEN, "")
         # Computed BEFORE the pops below — the token comparison needs
         # the old entry's value.
-        _own_repair = (env_tok and env_pid.isascii() and env_pid.isdigit()
-                       and int(env_pid) == pid
-                       and fields.get("token") == env_tok)
+        _own_repair = bool(
+            env_tok
+            and env_pid.isascii()
+            and env_pid.isdigit()
+            and int(env_pid) == pid
+            and fields.get("token") == env_tok
+        )
+        if (
+            _own_repair
+            and existing_claim is not None
+            and not host_process_matches(
+                pid,
+                existing_claim,
+                pid_running=_pid_running,
+                comm_reader=_comm,
+                uid_reader=_process_uid,
+                executable_identity_reader=(_process_executable_identity),
+            )
+        ):
+            logger.warning(
+                "sessions: refusing own-session repair for pid %d — "
+                "the recorded host executable no longer matches",
+                pid,
+            )
+            return None
         fields.pop("token", None)
         fields.pop("seeded_by", None)
+        if not _own_repair:
+            for key in SESSION_HOST_KEYS:
+                fields.pop(key, None)
         # The token match is the discriminator: a dead predecessor's
         # entry carries a DIFFERENT token than this session's env
         # credential, so a recycled pid can never keep the
@@ -574,19 +2676,19 @@ def _record_session_locked(project: str, pid: int,
         # stays — unlinking a held lock splits it.
         if (not _own_repair
                 and fields.get("v") == ENTRY_VERSION
-                and (SESSIONS_DIR / f"{pid}.run").exists()):
+                and (_sessions_dir() / f"{pid}.run").exists()):
             # Caller already holds this pid's ledger lock.
             with contextlib.suppress(OSError):
-                (SESSIONS_DIR / f"{pid}.run").unlink(missing_ok=True)
+                (_sessions_dir() / f"{pid}.run").unlink(missing_ok=True)
+    if host_claim is not None:
+        fields.update(host_claim.session_fields())
     if token:
         fields["token"] = token
     if seeded_by:
-        if seeded_by in ("flag", "auto", "bookmark", "use", "create",
-                         "adopt"):
+        if seeded_by in ("flag", "auto", "bookmark", "use", "create", "adopt"):
             fields["seeded_by"] = seeded_by
         else:
-            logger.warning(
-                "sessions: dropping unknown seeded_by %r", seeded_by)
+            logger.warning("sessions: dropping unknown seeded_by %r", seeded_by)
     try:
         _atomic_write(entry, _entry_content(project, fields))
     except OSError:
@@ -594,38 +2696,57 @@ def _record_session_locked(project: str, pid: int,
     return pid
 
 
-def rebind_session_if(pid: int, expected: str,
-                      new_project: str | None) -> bool:
+def rebind_session_if(pid: int, expected: str, new_project: str | None) -> bool:
     """Atomically re-point *pid*'s binding to *new_project* ONLY if it
     still names *expected* — the delete/rename rewrite primitive. The
     snapshot-then-write shape it replaces was a lost-update race: a
     session that switched projects between the snapshot and the write
     was clobbered with a decision made against its old binding.
     ``new_project=None`` binds the none sentinel."""
-    entry = SESSIONS_DIR / str(pid)
+    entry = _sessions_dir() / str(pid)
     with _ledger_lock_nb(pid) as held:
         if not held:
             logger.warning(
                 "sessions: pid %d's ledger lock is held — skipping "
                 "its binding rewrite (%r); re-bind it with "
-                "'/project use' from that session", pid, expected)
+                "'/project use' from that session",
+                pid,
+                expected,
+            )
             return False
         fields = _parse_entry(entry)
-        if (fields.get("v") != ENTRY_VERSION
-                or fields.get("project") != expected):
+        if not _host_v2_marker(fields):
+            recovered = _credential_fields_from_raw(entry)
+            for key, value in recovered.items():
+                fields.setdefault(key, value)
+        if _host_v2_marker(fields):
+            logger.warning(
+                "sessions: refusing generic rebind of receipt-backed pid %d",
+                pid,
+            )
             return False
-        return _record_session_locked(
-            NONE_SENTINEL if new_project is None else new_project,
-            pid, None, None, entry) is not None
+        if fields.get("v") != ENTRY_VERSION or fields.get("project") != expected:
+            return False
+        return (
+            _record_session_locked(
+                NONE_SENTINEL if new_project is None else new_project,
+                pid,
+                None,
+                None,
+                entry,
+            )
+            is not None
+        )
 
 
-def bind_session(project: str | None, pid: int | None = None,
-                 seeded_by: str | None = None) -> int | None:
+def bind_session(
+    project: str | None, pid: int | None = None, seeded_by: str | None = None
+) -> int | None:
     """In-session binding write: ``None`` means bound-to-none (sentinel
     ``-``), NOT entry removal. This is what ``/project none`` calls."""
     return record_session(
-        NONE_SENTINEL if project is None else project, pid=pid,
-        seeded_by=seeded_by)
+        NONE_SENTINEL if project is None else project, pid=pid, seeded_by=seeded_by
+    )
 
 
 def session_binding(pid: int | None = None) -> tuple[str | None, str]:
@@ -646,9 +2767,53 @@ def session_binding(pid: int | None = None) -> tuple[str | None, str]:
     """
     if pid is None:
         pid = resolve_session_pid()
+        if pid is None:
+            candidate = _env_session_record()
+            if candidate is not None:
+                candidate_pid, fields = candidate
+                host_state, _claim = _host_claim_state(fields, pid=candidate_pid)
+                if _host_v2_marker(fields):
+                    from core.startup.runtime_receipt.plumbing_types import (
+                        PlumbingFailure,
+                    )
+
+                    raw = _read_session_entry_raw(candidate_pid)
+                    parsed = (
+                        _parse_session_receipt_entry(
+                            raw,
+                            pid=candidate_pid,
+                        )
+                        if isinstance(raw, bytes)
+                        else raw
+                    )
+                    if isinstance(parsed, _SessionReceiptEntry):
+                        logger.debug(
+                            "sessions: matching-token receipt-backed pid %d "
+                            "is authoritatively projectless",
+                            candidate_pid,
+                        )
+                    elif isinstance(parsed, PlumbingFailure):
+                        logger.warning(
+                            "sessions: matching-token receipt-backed pid %d "
+                            "is invalid — treating this session as "
+                            "authoritatively projectless",
+                            candidate_pid,
+                        )
+                    return None, "none"
+                if fields.get("v") == ENTRY_VERSION and host_state in (
+                    "valid",
+                    "invalid",
+                ):
+                    logger.warning(
+                        "sessions: matching-token host record for pid %d "
+                        "failed process verification — treating this "
+                        "session as authoritatively projectless",
+                        candidate_pid,
+                    )
+                    return None, "none"
     if pid is None:
         return None, "absent"
-    entry_path = SESSIONS_DIR / str(pid)
+    entry_path = _sessions_dir() / str(pid)
     fields = _parse_entry(entry_path)
     if not fields:
         # Distinguish "no entry" (symlink layer applies) from "entry
@@ -663,6 +2828,9 @@ def session_binding(pid: int | None = None) -> tuple[str | None, str]:
         return None, "absent"
     if fields.get("v") != ENTRY_VERSION:
         return None, "advisory"
+    host_state, _claim = _host_claim_state(fields, pid=pid)
+    if host_state == "invalid":
+        return None, "none"
     if not _identity_matches(pid, fields):
         return None, "absent"
     name = fields.get("project")
@@ -671,7 +2839,10 @@ def session_binding(pid: int | None = None) -> tuple[str | None, str]:
     if not name or not _NAME_RE.match(name):
         logger.warning(
             "sessions: corrupt binding for pid %d (%r) — treating as "
-            "authoritatively projectless", pid, name)
+            "authoritatively projectless",
+            pid,
+            name,
+        )
         return None, "none"
     return name, "bound"
 
@@ -701,6 +2872,271 @@ def _pid_from_name(name: str) -> int | None:
     return pid
 
 
+def _host_v2_entry_state(pid: int, fields: dict[str, str]) -> str:
+    from core.startup.runtime_receipt.plumbing_types import PlumbingFailure
+
+    if _foreign_entry(fields):
+        return "receipt-foreign"
+    if _positive_stale_entry(pid, fields):
+        return "receipt-stale"
+    if sys.platform == "linux" and _pid_running(pid) and proc_starttime(pid) is None:
+        return "receipt-unknown"
+    raw = _read_session_entry_raw(pid)
+    if isinstance(raw, PlumbingFailure) or raw is None:
+        logger.warning(
+            "sessions: invalid receipt-backed entry for pid %d "
+            "(reason=session_entry_invalid)",
+            pid,
+        )
+        return "receipt-invalid"
+    entry = _parse_session_receipt_entry(raw, pid=pid)
+    if isinstance(entry, PlumbingFailure):
+        logger.warning(
+            "sessions: invalid receipt-backed entry for pid %d "
+            "(reason=session_entry_invalid)",
+            pid,
+        )
+        return "receipt-invalid"
+    if not _receipt_entry_live(entry):
+        return "receipt-invalid"
+    logger.debug(
+        "sessions: live receipt-backed pid %d remains non-authorizing",
+        pid,
+    )
+    return f"receipt-{entry.reference.state.value}"
+
+
+def _prune_stale_host_v2(
+    pid: int,
+    entry_path: Path,
+) -> bool:
+    from core.startup.runtime_receipt.plumbing_types import PlumbingFailure
+
+    before = _read_session_entry_raw(pid)
+    if isinstance(before, PlumbingFailure) or before is None:
+        return False
+    fields = _legacy_fields_from_raw(before)
+    if not _host_v2_marker(fields) or not _positive_stale_entry(pid, fields):
+        return False
+    sidecar_name = _receipt_sidecar_name_from_fields(pid, fields)
+    try:
+        with _strict_session_lock(pid):
+            current = _read_session_entry_raw(pid)
+            if (
+                isinstance(current, PlumbingFailure)
+                or current is None
+                or not secrets.compare_digest(current, before)
+                or not _positive_stale_entry(
+                    pid,
+                    _legacy_fields_from_raw(current),
+                )
+            ):
+                return False
+            failure = _remove_entry_and_ledger_locked(pid, before)
+            if failure is not None:
+                return False
+    except _SessionReceiptAbort:
+        return False
+    _remove_run_lock_after_strict_operation(pid)
+    if sidecar_name is not None:
+        cleaned = _cleanup_exact_receipt_file(pid, sidecar_name)
+        if isinstance(cleaned, PlumbingFailure):
+            logger.warning(
+                "sessions: receipt companion cleanup failed for pid %d (reason=%s)",
+                pid,
+                cleaned.reason_codes[0].value,
+            )
+    return not entry_path.exists()
+
+
+def _sidecar_reference_for_sweep(
+    pid: int,
+    file_name: str,
+) -> ReceiptReference | None:
+    from core.startup.runtime_receipt.persistence import read_receipt_file_bytes
+    from core.startup.runtime_receipt.plumbing_types import (
+        CanonicalPid,
+        PlumbingFailure,
+        reference_from_receipt,
+    )
+    from core.startup.runtime_receipt.reasons import ReceiptRejection
+    from core.startup.runtime_receipt.verify import parse_receipt
+
+    raw = read_receipt_file_bytes(
+        _sessions_dir(),
+        CanonicalPid(pid),
+        file_name,
+    )
+    if isinstance(raw, PlumbingFailure):
+        return None
+    receipt = parse_receipt(raw)
+    if isinstance(receipt, ReceiptRejection):
+        return None
+    reference = reference_from_receipt(receipt)
+    if isinstance(reference, PlumbingFailure):
+        return None
+    if reference.session_pid.value != pid or reference.sidecar_name != file_name:
+        return None
+    return reference
+
+
+def _orphan_candidate_stale(
+    pid: int,
+    reference: ReceiptReference | None,
+) -> bool:
+    if reference is not None:
+        if boot_id() != reference.boot_id.value:
+            return False
+        live_ns = pidns_id()
+        if live_ns is None or live_ns != reference.pid_namespace_inode.text:
+            return False
+    if not _pid_running(pid):
+        return True
+    if reference is None:
+        return False
+    live_start = proc_starttime(pid)
+    return (
+        live_start is not None and live_start != reference.session_starttime_ticks.text
+    )
+
+
+def sweep_session_receipt_sidecars() -> tuple[CleanupApplied | PlumbingFailure, ...]:
+    """Bounded exact-name cleanup for dead/recycled host-v2 artifacts."""
+
+    try:
+        children = tuple(_sessions_dir().iterdir())
+    except OSError:
+        return ()
+    sidecars: dict[int, list[Path]] = {}
+    temporaries: dict[int, list[Path]] = {}
+    for child in children:
+        match = _HOST_V2_SIDECAR_RE.fullmatch(child.name)
+        if match is not None:
+            pid = _pid_from_name(match.group("pid"))
+            if pid is None:
+                continue
+            target = temporaries if match.group("temporary") else sidecars
+            target.setdefault(pid, []).append(child)
+            continue
+        match = _HOST_V2_ENTRY_TEMP_RE.fullmatch(child.name)
+        if match is not None:
+            pid = _pid_from_name(match.group("pid"))
+            if pid is not None:
+                temporaries.setdefault(pid, []).append(child)
+    if not sidecars and not temporaries:
+        return ()
+    from core.startup.runtime_receipt.persistence import (
+        unlink_session_entry_temporary,
+    )
+    from core.startup.runtime_receipt.plumbing_types import (
+        CanonicalPid,
+        CleanupApplied,
+        PlumbingDisposition,
+        PlumbingFailure,
+        authority_invariant_failure,
+    )
+
+    outcomes: list[CleanupApplied | PlumbingFailure] = []
+    for pid in sorted(set(sidecars) | set(temporaries)):
+        immutable = sorted(sidecars.get(pid, ()), key=lambda path: path.name)[
+            :_HOST_V2_MAX_SIDECARS
+        ]
+        temporary = sorted(
+            temporaries.get(pid, ()),
+            key=lambda path: path.name,
+        )[:_HOST_V2_MAX_TEMPORARIES]
+        candidates: list[tuple[Path, ReceiptReference | None, bool]] = []
+        for path in immutable:
+            candidates.append(
+                (path, _sidecar_reference_for_sweep(pid, path.name), False)
+            )
+        candidates.extend((path, None, True) for path in temporary)
+        for path, reference, is_temporary in candidates:
+            if not _orphan_candidate_stale(pid, reference):
+                continue
+            is_entry_temporary = _HOST_V2_ENTRY_TEMP_RE.fullmatch(path.name) is not None
+            before = _read_session_entry_raw(pid)
+            if isinstance(before, PlumbingFailure):
+                continue
+            fields = _legacy_fields_from_raw(before) if before is not None else {}
+            if before is not None and _foreign_entry(fields):
+                continue
+            selected_name = (
+                _receipt_sidecar_name_from_fields(pid, fields)
+                if before is not None
+                else None
+            )
+            if selected_name == path.name:
+                continue
+            locked_cleanup: bool | PlumbingFailure | None = None
+            try:
+                with _strict_session_lock(pid):
+                    current = _read_session_entry_raw(pid)
+                    if isinstance(current, PlumbingFailure):
+                        continue
+                    if before is None:
+                        if current is not None:
+                            continue
+                    elif current is None or not secrets.compare_digest(current, before):
+                        continue
+                    current_fields = (
+                        _legacy_fields_from_raw(current) if current is not None else {}
+                    )
+                    if current is not None and _foreign_entry(current_fields):
+                        continue
+                    current_selected = (
+                        _receipt_sidecar_name_from_fields(
+                            pid,
+                            current_fields,
+                        )
+                        if current is not None
+                        else None
+                    )
+                    if current_selected == path.name:
+                        continue
+                    if not _orphan_candidate_stale(pid, reference):
+                        continue
+                    if is_entry_temporary:
+                        locked_cleanup = unlink_session_entry_temporary(
+                            _sessions_dir(),
+                            CanonicalPid(pid),
+                        )
+            except _SessionReceiptAbort as exc:
+                outcomes.append(exc.failure)
+                continue
+            if is_entry_temporary:
+                assert locked_cleanup is not None
+                cleaned = locked_cleanup
+            else:
+                cleaned = _cleanup_exact_receipt_file(
+                    pid,
+                    path.name,
+                    temporary=is_temporary,
+                )
+            if isinstance(cleaned, PlumbingFailure):
+                outcomes.append(cleaned)
+            elif reference is not None:
+                result = CleanupApplied(
+                    reference=reference,
+                    pointer_removed=False,
+                    sidecar_removed=not is_temporary,
+                    temporary_removed=is_temporary,
+                )
+                invariant = authority_invariant_failure(
+                    result,
+                    CleanupApplied,
+                    disposition=PlumbingDisposition.INVALID_REQUEST,
+                    details={"stage": "receipt_sweep_result"},
+                )
+                outcomes.append(invariant or result)
+            if (
+                not (_sessions_dir() / str(pid)).exists()
+                and not (_sessions_dir() / f"{pid}.run").exists()
+            ):
+                _remove_run_lock_after_strict_operation(pid)
+    return tuple(outcomes)
+
+
 def _entry_state(pid: int, fields: dict[str, str]) -> str:
     """Classification for enumeration surfaces: live | stale | foreign
     | advisory | unknown.
@@ -718,18 +3154,27 @@ def _entry_state(pid: int, fields: dict[str, str]) -> str:
     """
     if _foreign_entry(fields):
         return "foreign"
+    if _host_v2_marker(fields):
+        return _host_v2_entry_state(pid, fields)
     if fields.get("v") != ENTRY_VERSION:
         return "advisory" if _pid_running(pid) else "v1-stale"
+    host_state, _claim = _host_claim_state(fields, pid=pid)
+    if host_state == "invalid":
+        return "invalid"
     if _identity_matches(pid, fields):
         return "live"
-    if (sys.platform == "linux" and _pid_running(pid)
-            and proc_starttime(pid) is None):
+    if host_state == "valid" and _stamp_matches(pid, fields):
+        # The launcher writes the record immediately before exec, so a
+        # concurrent reader can briefly see the still-running shell. Keep
+        # that unverified record (never authoritative) rather than pruning
+        # the session during its exec transition.
+        return "host-mismatch"
+    if sys.platform == "linux" and _pid_running(pid) and proc_starttime(pid) is None:
         return "unknown"
     return "stale"
 
 
-def read_sessions(prune: bool = True,
-                  include_stale: bool = False) -> dict[int, dict]:
+def read_sessions(prune: bool = True, include_stale: bool = False) -> dict[int, dict]:
     """Registered sessions, pruning dead entries on the way.
 
     Prune predicate: a v2 entry is pruned only
@@ -746,7 +3191,7 @@ def read_sessions(prune: bool = True,
     """
     sessions: dict[int, dict] = {}
     try:
-        children = list(SESSIONS_DIR.iterdir())
+        children = list(_sessions_dir().iterdir())
     except OSError:
         return sessions
     for f in children:
@@ -758,27 +3203,29 @@ def read_sessions(prune: bool = True,
             # a non-ASCII digit crashes int()) — not ours here
         fields = _parse_entry(f)
         state = _entry_state(pid, fields)
-        prunable = state == "stale"
+        receipt_prunable = state == "receipt-stale"
+        prunable = state == "stale" or receipt_prunable
         if prunable and prune:
-            # Same ordering discipline as entry removal in
-            # record_session: entry first (kills the writers' gate),
-            # ledger under its lock, lock file last (writers
-            # verify-after-lock, so this unlink cannot split it).
-            # The whole removal runs UNDER the ledger lock with a
-            # re-check: a recycled pid can re-register (fresh entry +
-            # ledger) between the state probe above and the unlinks —
-            # the fresh session's files must survive.
-            with contextlib.suppress(OSError):
-                removed = False
-                with _ledger_lock(pid):
-                    if _entry_state(pid, _parse_entry(f)) == "stale":
-                        f.unlink(missing_ok=True)
-                        (SESSIONS_DIR / f"{pid}.run").unlink(
-                            missing_ok=True)
-                        removed = True
-                if removed:
-                    (SESSIONS_DIR / f"{pid}.run.lock").unlink(
-                        missing_ok=True)
+            if receipt_prunable:
+                _prune_stale_host_v2(pid, f)
+            else:
+                # Same ordering discipline as entry removal in
+                # record_session: entry first (kills the writers' gate),
+                # ledger under its lock, lock file last (writers
+                # verify-after-lock, so this unlink cannot split it).
+                # The whole removal runs UNDER the ledger lock with a
+                # re-check: a recycled pid can re-register (fresh entry +
+                # ledger) between the state probe above and the unlinks —
+                # the fresh session's files must survive.
+                with contextlib.suppress(OSError):
+                    removed = False
+                    with _ledger_lock(pid):
+                        if _entry_state(pid, _parse_entry(f)) == "stale":
+                            f.unlink(missing_ok=True)
+                            (_sessions_dir() / f"{pid}.run").unlink(missing_ok=True)
+                            removed = True
+                    if removed:
+                        (_sessions_dir() / f"{pid}.run.lock").unlink(missing_ok=True)
         if state in ("live", "advisory") or include_stale:
             if include_stale:
                 fields = dict(fields)
@@ -795,11 +3242,11 @@ def read_sessions(prune: bool = True,
         for f in children:
             if not f.name.endswith(".run"):
                 continue
-            stem = f.name[:-len(".run")]
+            stem = f.name[: -len(".run")]
             # stem must round-trip through int: a planted '007.run'
             # would otherwise lock/unlink pid 7's files.
             if (_pid_from_name(stem) is None
-                    or (SESSIONS_DIR / stem).exists()):
+                    or (_sessions_dir() / stem).exists()):
                 continue
             with contextlib.suppress(OSError):
                 with _ledger_lock(int(stem)):
@@ -807,10 +3254,11 @@ def read_sessions(prune: bool = True,
                     # re-register (entry + fresh ledger) between the
                     # orphan check above and this acquisition — the
                     # fresh session's first records must survive.
-                    if (SESSIONS_DIR / stem).exists():
+                    if (_sessions_dir() / stem).exists():
                         continue
                     f.unlink(missing_ok=True)
-                (SESSIONS_DIR / f"{stem}.run.lock").unlink(missing_ok=True)
+                (_sessions_dir() / f"{stem}.run.lock").unlink(missing_ok=True)
+        sweep_session_receipt_sidecars()
         # Lone lock files (entry AND ledger gone — a crash between the
         # three-file removal's unlinks) are never reaped by the passes
         # above, which key on entries and ledgers.
@@ -819,13 +3267,13 @@ def read_sessions(prune: bool = True,
                 continue
             stem = f.name[:-len(".run.lock")]
             if (_pid_from_name(stem) is None
-                    or (SESSIONS_DIR / stem).exists()
-                    or (SESSIONS_DIR / f"{stem}.run").exists()):
+                    or (_sessions_dir() / stem).exists()
+                    or (_sessions_dir() / f"{stem}.run").exists()):
                 continue
             with contextlib.suppress(OSError):
                 with _ledger_lock_nb(int(stem)) as held:
-                    if held and not (SESSIONS_DIR / stem).exists() \
-                            and not (SESSIONS_DIR / f"{stem}.run").exists():
+                    if held and not (_sessions_dir() / stem).exists() \
+                            and not (_sessions_dir() / f"{stem}.run").exists():
                         f.unlink(missing_ok=True)
     return sessions
 
@@ -834,9 +3282,11 @@ def read_sessions(prune: bool = True,
 # advisory surfaces (unchanged semantics)
 # ---------------------------------------------------------------------------
 
+
 def other_sessions(project: str, exclude_pid: int | None = None) -> list[dict]:
     """Live sessions (other than *exclude_pid*) with *project* active."""
     from core.security.log_sanitisation import sanitise_for_terminal
+
     out = []
     for pid, fields in sorted(read_sessions().items()):
         if exclude_pid is not None and pid == exclude_pid:
@@ -845,11 +3295,14 @@ def other_sessions(project: str, exclude_pid: int | None = None) -> list[dict]:
             # Entry fields are FILE CONTENT — sanitise anything that
             # can reach the awareness line (`project` matched a
             # validated name exactly, so it is already clean).
-            out.append({
-                "pid": pid,
-                "since": sanitise_for_terminal(
-                    str(fields.get("since") or "unknown"), max_len=64),
-            })
+            out.append(
+                {
+                    "pid": pid,
+                    "since": sanitise_for_terminal(
+                        str(fields.get("since") or "unknown"), max_len=64
+                    ),
+                }
+            )
     return out
 
 
@@ -866,14 +3319,15 @@ def awareness_lines(project: str, exclude_pid: int | None = None) -> list[str]:
 # run ledger
 # ---------------------------------------------------------------------------
 
+
 def _ledger_path(pid: int) -> Path:
-    return SESSIONS_DIR / f"{pid}.run"
+    return _sessions_dir() / f"{pid}.run"
 
 
 @contextlib.contextmanager
-def _ledger_lock_nb(pid: int,
-                    attempts: int = 20,
-                    interval: float = 0.05) -> Iterator[bool]:
+def _ledger_lock_nb(
+    pid: int, attempts: int = 20, interval: float = 0.05
+) -> Iterator[bool]:
     """Bounded, non-blocking variant for BEST-EFFORT sweeps
     (witness rewrites, CAS rebinds): yields True holding the lock, or
     False after ~attempts*interval seconds — a single wedged holder
@@ -890,15 +3344,17 @@ def _ledger_lock_nb(pid: int,
     if not _ensure_dir():
         yield True
         return
-    lock_path = SESSIONS_DIR / f"{pid}.run.lock"
+    lock_path = _sessions_dir() / f"{pid}.run.lock"
     for _ in range(attempts):
         try:
             fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT, 0o600)
         except OSError:
             logger.warning(
                 "sessions: ledger lock open failed for pid %d — "
-                "proceeding UNLOCKED (best-effort data)", pid,
-                exc_info=True)
+                "proceeding UNLOCKED (best-effort data)",
+                pid,
+                exc_info=True,
+            )
             yield True
             return
         try:
@@ -910,8 +3366,7 @@ def _ledger_lock_nb(pid: int,
         try:
             held = os.fstat(fd)
             current = os.stat(str(lock_path))
-            same = (held.st_ino == current.st_ino
-                    and held.st_dev == current.st_dev)
+            same = held.st_ino == current.st_ino and held.st_dev == current.st_dev
         except OSError:
             same = False
         if same:
@@ -946,7 +3401,7 @@ def _ledger_lock(pid: int) -> Iterator[None]:
     # the NFS implementation — same posture as the metadata/project
     # file locks. Any OSError below degrades to an UNLOCKED
     # read-modify-write; that is logged, never silent.
-    lock_path = SESSIONS_DIR / f"{pid}.run.lock"
+    lock_path = _sessions_dir() / f"{pid}.run.lock"
     # Verify-after-lock: the prune paths (read_sessions, the launcher
     # sweep, record_session removal) UNLINK lock files of sessions they
     # can prove dead — but a finishing run of that session may hold the
@@ -961,20 +3416,32 @@ def _ledger_lock(pid: int) -> Iterator[None]:
             yield
             return
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            from core.atomic_fs.fs_lock import acquire_flock_bounded
+            acquired = acquire_flock_bounded(
+                fd, lock_path, subject="session ledger",
+                expiry_note=(
+                    "proceeding WITHOUT lock — ledger is "
+                    "best-effort data, never critical"
+                ),
+            )
         except OSError:
             os.close(fd)
             logger.warning(
                 "sessions: ledger lock acquisition failed for pid %d "
-                "— proceeding UNLOCKED (best-effort data)", pid,
-                exc_info=True)
+                "— proceeding UNLOCKED (best-effort data)",
+                pid,
+                exc_info=True,
+            )
+            yield
+            return
+        if not acquired:
+            os.close(fd)
             yield
             return
         try:
             held = os.fstat(fd)
             current = os.stat(str(lock_path))
-            same = (held.st_ino == current.st_ino
-                    and held.st_dev == current.st_dev)
+            same = held.st_ino == current.st_ino and held.st_dev == current.st_dev
         except OSError:
             same = False  # path unlinked under us — retry
         if same:
@@ -988,8 +3455,9 @@ def _ledger_lock(pid: int) -> Iterator[None]:
         os.close(fd)
     # Persistent swapping (hostile or pathological): proceed unlocked
     # rather than deadlock — the ledger is an aid, never critical.
-    logger.debug("sessions: ledger lock for pid %d kept vanishing — "
-                 "proceeding without it", pid)
+    logger.debug(
+        "sessions: ledger lock for pid %d kept vanishing — proceeding without it", pid
+    )
     yield
 
 
@@ -1003,8 +3471,7 @@ def _read_ledger(pid: int) -> list[dict]:
 _MAX_LEDGER_BYTES = 512 * 1024
 
 
-def _read_ledger_full(
-        pid: int) -> tuple[list[dict], list[dict], list[str]]:
+def _read_ledger_full(pid: int) -> tuple[list[dict], list[dict], list[str]]:
     """(run records, pin-witness records, unknown lines) for *pid*.
 
     Unknown line types are carried verbatim so a FUTURE format's
@@ -1025,7 +3492,9 @@ def _read_ledger_full(
             logger.warning(
                 "sessions: ledger for pid %d exceeds %d bytes — "
                 "treating as empty (records preserved on disk)",
-                pid, _MAX_LEDGER_BYTES)
+                pid,
+                _MAX_LEDGER_BYTES,
+            )
             return records, pins, unknown
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
@@ -1035,21 +3504,25 @@ def _read_ledger_full(
             continue
         m = _RUN_LINE_RE.match(line)
         if m:
-            records.append({
-                "status": m.group(1),
-                "epoch": int(m.group(2)),
-                "run_id": m.group(3),
-                "run_dir": m.group(4),
-            })
+            records.append(
+                {
+                    "status": m.group(1),
+                    "epoch": int(m.group(2)),
+                    "run_id": m.group(3),
+                    "run_dir": m.group(4),
+                }
+            )
             continue
         m = _PIN_LINE_RE.match(line)
         if m:
-            pins.append({
-                "epoch": int(m.group(1)),
-                "run_id": m.group(2),
-                "project": m.group(3),
-                "run_dir": m.group(4),
-            })
+            pins.append(
+                {
+                    "epoch": int(m.group(1)),
+                    "run_id": m.group(2),
+                    "project": m.group(3),
+                    "run_dir": m.group(4),
+                }
+            )
             continue
         unknown.append(line)
     return records, pins, unknown
@@ -1062,6 +3535,7 @@ def _zombie_correct(records: list[dict]) -> None:
     evicts all real history, and the 64KB read bound eventually zeroes
     the ledger."""
     import time as _time
+
     _now = int(_time.time())
     for r in records:
         # A record stamped under a skewed-ahead clock out-competes
@@ -1077,10 +3551,13 @@ def _zombie_correct(records: list[dict]) -> None:
             r["status"] = "failed"
             continue
         try:
-            if meta.stat().st_size > _MAX_ENTRY_BYTES * 16:
-                continue  # attacker-influenced file — never slurp GBs
+            # max_bytes, not a name-based stat pre-gate: load_json
+            # checks the budget on the OPEN fd and re-checks after a
+            # capped read, so an attacker-influenced file that grows
+            # between the check and the read is refused, never
+            # slurped (the previous stat-then-load left that window).
             from core.json import load_json
-            data = load_json(meta)
+            data = load_json(meta, max_bytes=_MAX_ENTRY_BYTES * 16)
             status = (data or {}).get("status", "")
         except Exception:  # noqa: BLE001 — correction is best-effort
             continue
@@ -1088,24 +3565,26 @@ def _zombie_correct(records: list[dict]) -> None:
             r["status"] = status if status in _RUN_STATUSES else "failed"
 
 
-def _write_ledger(pid: int, records: list[dict],
-                  pins: list[dict] | None = None,
-                  unknown: list[str] | None = None) -> bool:
+def _write_ledger(
+    pid: int,
+    records: list[dict],
+    pins: list[dict] | None = None,
+    unknown: list[str] | None = None,
+) -> bool:
     # Entry gate UNDER the caller's lock: once the entry file is gone
     # (session removal, prune — both remove the entry FIRST), no writer
     # may recreate or rewrite the ledger. This closes the resurrection
     # window where a straggling finisher that passed the pre-lock gate
     # rewrites a just-removed ledger under a recycled pid's fresh
     # session — foreign history and foreign pin witnesses included.
-    if not (SESSIONS_DIR / str(pid)).exists():
+    if not (_sessions_dir() / str(pid)).exists():
         return False
     _zombie_correct(records)
     finished = [r for r in records if r["status"] != "running"]
     if len(records) > _LEDGER_CAP and finished:
         drop = min(len(records) - _LEDGER_CAP, len(finished))
         keep_finished = finished[drop:]
-        records = [r for r in records
-                   if r["status"] == "running" or r in keep_finished]
+        records = [r for r in records if r["status"] == "running" or r in keep_finished]
 
     pins = list(pins or [])
     if pins:
@@ -1114,9 +3593,11 @@ def _write_ledger(pid: int, records: list[dict],
         # still exists: in-grant metadata can zombie-flip a LIVE
         # run's record to finished and cap-evict it — the witness
         # (the tamper defense) must not die with that trick.
-        pins = [p for p in pins
-                if (p["run_id"], p["run_dir"]) in alive
-                or Path(p["run_dir"]).exists()]
+        pins = [
+            p
+            for p in pins
+            if (p["run_id"], p["run_dir"]) in alive or Path(p["run_dir"]).exists()
+        ]
     # Unknown (future-format) lines survive rewrites; order preserved,
     # appended after the pins. They are evicted only under BYTE
     # PRESSURE (below, last in the eviction order) — an unconditional
@@ -1124,19 +3605,22 @@ def _write_ledger(pid: int, records: list[dict],
     unknown = list(unknown or [])
 
     def _render() -> list[str]:
+        # Ordering contract: run records BEFORE pin witnesses (then
+        # unknown lines). The hook readers (raptor-hook-read and
+        # core/coverage/track_read.py) early-stop their run-record
+        # scan at the first pin line on this invariant.
         out = [
-            f"{r['status']} {r['epoch']} {r['run_id']} {r['run_dir']}"
-            for r in records
+            f"{r['status']} {r['epoch']} {r['run_id']} {r['run_dir']}" for r in records
         ]
         out.extend(
-            f"pin {p['epoch']} {p['run_id']} "
-            f"{p['project']} {p['run_dir']}"
+            f"pin {p['epoch']} {p['run_id']} {p['project']} {p['run_dir']}"
             for p in pins
         )
         out.extend(unknown)
         return out
 
     lines = _render()
+
     # Byte budget — the writer GUARANTEES an under-budget file (an
     # over-budget ledger reads as EMPTY and the next RMW would wipe
     # every record AND every witness). Eviction order: oldest
@@ -1160,8 +3644,9 @@ def _write_ledger(pid: int, records: list[dict],
     # demote a live run's witness into the evict-first class, but the
     # BYTE PRESSURE itself cannot be attacker-created: the ledger is
     # outside the write grant.)
-    _running = {(r["run_id"], r["run_dir"]) for r in records
-                if r["status"] == "running"}
+    _running = {
+        (r["run_id"], r["run_dir"]) for r in records if r["status"] == "running"
+    }
     while _over() and pins:
         for i, pn in enumerate(pins):
             if (pn["run_id"], pn["run_dir"]) not in _running:
@@ -1176,24 +3661,21 @@ def _write_ledger(pid: int, records: list[dict],
     # Belt-and-braces: the format must stay one-line. A bad line is
     # SKIPPED, not fatal — one unprintable future-format line must not
     # freeze every finish CAS forever.
-    _bad = [ln for ln in lines
-            if "\n" in ln or not ln.isprintable()]
+    _bad = [ln for ln in lines if "\n" in ln or not ln.isprintable()]
     if _bad:
-        logger.warning("sessions: dropping %d unprintable ledger "
-                       "line(s)", len(_bad))
+        logger.warning("sessions: dropping %d unprintable ledger line(s)", len(_bad))
         lines = [ln for ln in lines if ln not in _bad]
     try:
         if not _ensure_dir():
             return False
-        _atomic_write(_ledger_path(pid),
-                      "\n".join(lines) + ("\n" if lines else ""))
+        _atomic_write(_ledger_path(pid), "\n".join(lines) + ("\n" if lines else ""))
     except OSError:
         return False
     return True
 
 
-def _valid_run_dir(run_dir: str) -> bool:
-    """Vet a resolved run dir for the one-line ledger grammar.
+def _valid_run_dir(resolved: str) -> bool:
+    """Vet an already-RESOLVED run dir for the one-line ledger grammar.
 
     Non-printables are rejected everywhere (``str.splitlines`` splits
     on the U+2028 class, so a crafted component could forge a second
@@ -1204,21 +3686,23 @@ def _valid_run_dir(run_dir: str) -> bool:
     ``/home/u/My Projects/...`` tree must not silently lose ledger
     attribution — but never in the basename, which doubles as the
     space-delimited run-id field."""
-    if not run_dir.startswith("/") or not run_dir.isprintable():
+    if not resolved.startswith("/") or not resolved.isprintable():
         return False
-    if any(c.isspace() and c != " " for c in run_dir):
+    if any(c.isspace() and c != " " for c in resolved):
         return False
-    name = Path(run_dir).name
+    name = Path(resolved).name
     if not name:
         return False  # '/' — empty basename cannot be a run-id field
     return " " not in name
 
 
-def ledger_record_start(run_dir: str | os.PathLike[str],
-                        pid: int | None = None,
-                        pin_project: str | None = None,
-                        record_pin: bool = False,
-                        pin_source: str | None = None) -> None:
+def ledger_record_start(
+    run_dir: str | os.PathLike[str],
+    pid: int | None = None,
+    pin_project: str | None = None,
+    record_pin: bool = False,
+    pin_source: str | None = None,
+) -> None:
     """Append a running record for *run_dir* (basename = run id) and,
     when ``record_pin`` is set, the pin-witness line the privileged
     project-store writers verify the run marker against
@@ -1228,6 +3712,7 @@ def ledger_record_start(run_dir: str | os.PathLike[str],
     ledger is an attribution/discovery aid, never lifecycle-critical.
     """
     import time
+
     if pid is None:
         pid = resolve_session_pid()
     if pid is None:
@@ -1245,60 +3730,72 @@ def ledger_record_start(run_dir: str | os.PathLike[str],
     # too — records written over it would be wiped by the next
     # identity refresh anyway, taking this run's attribution with
     # them.
-    _entry_fields = _parse_entry(SESSIONS_DIR / str(pid))
+    _entry_fields = _parse_entry(_sessions_dir() / str(pid))
     if not _entry_fields:
-        logger.debug("sessions: no registry entry for pid %d — "
-                     "ledger skipped", pid)
+        logger.debug("sessions: no registry entry for pid %d — ledger skipped", pid)
         return
-    if (_entry_fields.get("v") == ENTRY_VERSION
-            and not _identity_matches(pid, _entry_fields)):
-        logger.debug("sessions: stale entry stamp for pid %d — "
-                     "ledger skipped", pid)
+    if _entry_fields.get("v") == ENTRY_VERSION and not _identity_matches(
+        pid, _entry_fields
+    ):
+        logger.debug("sessions: stale entry stamp for pid %d — ledger skipped", pid)
         return
-    run_id = Path(resolved).name
+    from core.coverage.journal import resolved_run_id
+
+    # Resolved basename, never the raw spelling: the finish CAS
+    # matches on run_id, so start and finish must derive the SAME
+    # identity however either end spells the dir (see
+    # resolved_run_id).
+    run_id = resolved_run_id(Path(run_dir))
     pin_value = NONE_SENTINEL if pin_project is None else pin_project
-    if record_pin and pin_value != NONE_SENTINEL \
-            and not _NAME_RE.match(pin_value):
+    if record_pin and pin_value != NONE_SENTINEL and not _NAME_RE.match(pin_value):
         record_pin = False  # never write a witness readers reject
     if pin_source and pin_source.isalpha():
         pin_value = f"{pin_value}:{pin_source}"
     with _ledger_lock(pid):
-        if not _parse_entry(SESSIONS_DIR / str(pid)):
+        if not _parse_entry(_sessions_dir() / str(pid)):
             return  # entry pruned since the pre-lock gate — no orphan
         # Dedup requires run-id AND dir (the finish CAS doctrine): two
         # live runs whose dirs share a basename must not erase each
         # other's records.
         epoch = int(time.time())
         records, pins, unknown = _read_ledger_full(pid)
-        records = [r for r in records
-                   if not (r["run_id"] == run_id
-                           and r["run_dir"] == resolved)]
-        records.append({
-            "status": "running",
-            "epoch": epoch,
-            "run_id": run_id,
-            "run_dir": resolved,
-        })
+        records = [
+            r
+            for r in records
+            if not (r["run_id"] == run_id and r["run_dir"] == resolved)
+        ]
+        records.append(
+            {
+                "status": "running",
+                "epoch": epoch,
+                "run_id": run_id,
+                "run_dir": resolved,
+            }
+        )
         if record_pin:
             # Replace this run's witness only when we carry a new pin
             # — a resume/re-append (record_pin=False) must PRESERVE the
             # original start's witness, not strip it.
-            pins = [p for p in pins
-                    if not (p["run_id"] == run_id
-                            and p["run_dir"] == resolved)]
-            pins.append({
-                "epoch": epoch,
-                "run_id": run_id,
-                "project": pin_value,
-                "run_dir": resolved,
-            })
+            pins = [
+                p
+                for p in pins
+                if not (p["run_id"] == run_id and p["run_dir"] == resolved)
+            ]
+            pins.append(
+                {
+                    "epoch": epoch,
+                    "run_id": run_id,
+                    "project": pin_value,
+                    "run_dir": resolved,
+                }
+            )
         if not _write_ledger(pid, records, pins, unknown):
-            logger.debug("sessions: ledger start write failed for %s",
-                         resolved)
+            logger.debug("sessions: ledger start write failed for %s", resolved)
 
 
-def ledger_record_finish(run_dir: str | os.PathLike[str], status: str,
-                         pid: int | None = None) -> None:
+def ledger_record_finish(
+    run_dir: str | os.PathLike[str], status: str, pid: int | None = None
+) -> None:
     """CAS-mark *run_dir*'s record with its TRUE terminal status — only
     a running line matching BOTH the run id and the recorded absolute
     dir changes; a concurrent sibling run's record is never touched
@@ -1318,13 +3815,21 @@ def ledger_record_finish(run_dir: str | os.PathLike[str], status: str,
     # lock, so an unregistered context never even creates a lock file.
     # A v2 entry with a stale stamp is a recycled pid's leftover:
     # refuse, like the start writer does.
-    _fin_fields = _parse_entry(SESSIONS_DIR / str(pid))
+    _fin_fields = _parse_entry(_sessions_dir() / str(pid))
     if not _fin_fields:
         return
-    if (_fin_fields.get("v") == ENTRY_VERSION
-            and not _identity_matches(pid, _fin_fields)):
+    if _fin_fields.get("v") == ENTRY_VERSION and not _identity_matches(
+        pid, _fin_fields
+    ):
         return
-    run_id = Path(str(run_dir)).name
+    from core.coverage.journal import resolved_run_id
+
+    # Resolved basename, never the raw spelling: a relative finish
+    # spelling ("." from inside the run dir) has raw name == "" — it
+    # could never match the start-side record's resolved run_id and
+    # the record would silently stay "running" forever (see
+    # resolved_run_id).
+    run_id = resolved_run_id(Path(run_dir))
     try:
         resolved = str(Path(run_dir).resolve())
     except OSError:
@@ -1333,28 +3838,37 @@ def ledger_record_finish(run_dir: str | os.PathLike[str], status: str,
         records, pins, unknown = _read_ledger_full(pid)
         hit = False
         for r in records:
-            if (r["run_id"] == run_id and r["status"] == "running"
-                    and r["run_dir"] == resolved):
+            if (
+                r["run_id"] == run_id
+                and r["status"] == "running"
+                and r["run_dir"] == resolved
+            ):
                 r["status"] = status
                 hit = True
         if hit and not _write_ledger(pid, records, pins, unknown):
-            logger.debug("sessions: ledger finish write failed for %s",
-                         run_dir)
+            logger.debug("sessions: ledger finish write failed for %s", run_dir)
 
 
-def ledger_record_resume(run_dir: str | os.PathLike[str],
-                         prior_session_pid: int | None = None,
-                         pid: int | None = None,
-                         pin_project: str | None = None,
-                         pin_source: str | None = None,
-                         record_pin: bool = False) -> None:
+def ledger_record_resume(
+    run_dir: str | os.PathLike[str],
+    prior_session_pid: int | None = None,
+    pid: int | None = None,
+    pin_project: str | None = None,
+    pin_source: str | None = None,
+    record_pin: bool = False,
+) -> None:
     """Resume wiring: append a running record to the
     RESUMING session's ledger — carrying the (verified) pin as this
     session's witness for segment 2+ when ``record_pin`` — and
     CAS-mark the original owner's line ``interrupted`` so its
     session's hook stops attributing to a run it no longer owns."""
-    ledger_record_start(run_dir, pid=pid, pin_project=pin_project,
-                        pin_source=pin_source, record_pin=record_pin)
+    ledger_record_start(
+        run_dir,
+        pid=pid,
+        pin_project=pin_project,
+        pin_source=pin_source,
+        record_pin=record_pin,
+    )
     if prior_session_pid is None:
         return
     resolved_own = pid if pid is not None else resolve_session_pid()
@@ -1364,8 +3878,8 @@ def ledger_record_resume(run_dir: str | os.PathLike[str],
 
 
 def ledger_pin_witness(
-        run_dir: str | os.PathLike[str],
-        pid: int | None = None,
+    run_dir: str | os.PathLike[str],
+    pid: int | None = None,
 ) -> tuple[bool, str | None, str | None]:
     """The session ledger's pin witness for *run_dir*:
     ``(found, project_or_None, source_or_None)``.
@@ -1389,11 +3903,10 @@ def ledger_pin_witness(
         # session whose identity verifies — otherwise a forged pid
         # points the lookup at an arbitrary stale/orphan ledger and
         # its pins would read as authority.
-        fields = _parse_entry(SESSIONS_DIR / str(pid))
+        fields = _parse_entry(_sessions_dir() / str(pid))
         if not fields:
             return False, None, None
-        if (fields.get("v") == ENTRY_VERSION
-                and not _identity_matches(pid, fields)):
+        if fields.get("v") == ENTRY_VERSION and not _identity_matches(pid, fields):
             return False, None, None
     try:
         resolved = str(Path(run_dir).resolve())
@@ -1406,9 +3919,7 @@ def ledger_pin_witness(
     for p in reversed(pins):
         if p["run_dir"] == resolved:
             project, _, source = p["project"].partition(":")
-            return (True,
-                    None if project == NONE_SENTINEL else project,
-                    source or None)
+            return (True, None if project == NONE_SENTINEL else project, source or None)
     return False, None, None
 
 
@@ -1423,13 +3934,13 @@ def ledger_rewrite_pin_project(old_name: str, new_name: str) -> None:
     Best-effort per ledger; same-uid files only (0600 under our own
     sessions.d)."""
     try:
-        children = list(SESSIONS_DIR.iterdir())
+        children = list(_sessions_dir().iterdir())
     except OSError:
         return
     for f in children:
         if not f.name.endswith(".run"):
             continue
-        stem = f.name[:-len(".run")]
+        stem = f.name[: -len(".run")]
         if _pid_from_name(stem) is None:
             continue
         pid = int(stem)
@@ -1440,7 +3951,11 @@ def ledger_rewrite_pin_project(old_name: str, new_name: str) -> None:
                         "sessions: pid %d's ledger lock is held — "
                         "skipping its witness rewrite (%r→%r); its "
                         "runs may log witness-disagreement warnings "
-                        "until re-pointed", pid, old_name, new_name)
+                        "until re-pointed",
+                        pid,
+                        old_name,
+                        new_name,
+                    )
                     continue
                 records, pins, unknown = _read_ledger_full(pid)
                 hit = False
@@ -1452,8 +3967,9 @@ def ledger_rewrite_pin_project(old_name: str, new_name: str) -> None:
                 if hit:
                     _write_ledger(pid, records, pins, unknown)
         except Exception:  # noqa: BLE001 — per-ledger best-effort
-            logger.debug("sessions: witness rewrite failed for pid %s",
-                         stem, exc_info=True)
+            logger.debug(
+                "sessions: witness rewrite failed for pid %s", stem, exc_info=True
+            )
 
 
 def ledger_pinned_dirs(project: str) -> list[dict]:
@@ -1468,16 +3984,16 @@ def ledger_pinned_dirs(project: str) -> list[dict]:
     """
     out: list[dict] = []
     try:
-        children = list(SESSIONS_DIR.iterdir())
+        children = list(_sessions_dir().iterdir())
     except OSError:
         return out
     for f in children:
         if not f.name.endswith(".run"):
             continue
-        stem = f.name[:-len(".run")]
+        stem = f.name[: -len(".run")]
         if _pid_from_name(stem) is None:
             continue
-        if not (SESSIONS_DIR / stem).exists():
+        if not (_sessions_dir() / stem).exists():
             continue  # orphan ledger — never steers discovery
         try:
             _records, pins, _unknown = _read_ledger_full(int(stem))
@@ -1486,14 +4002,17 @@ def ledger_pinned_dirs(project: str) -> list[dict]:
         for p in pins:
             name, _, source = p["project"].partition(":")
             if name == project:
-                out.append({"run_dir": p["run_dir"],
-                            "run_id": p["run_id"],
-                            "source": source or None})
+                out.append(
+                    {
+                        "run_dir": p["run_dir"],
+                        "run_id": p["run_id"],
+                        "source": source or None,
+                    }
+                )
     return out
 
 
-def ledger_repair_witnesses_for_dir(run_dir, new_project: str,
-                                    missing) -> None:
+def ledger_repair_witnesses_for_dir(run_dir, new_project: str, missing) -> None:
     """Re-point pin witnesses for *run_dir* whose project name is
     MISSING (per the *missing* predicate) to *new_project* — the
     repair half of ``project add`` for rename crashes and skipped
@@ -1502,13 +4021,13 @@ def ledger_repair_witnesses_for_dir(run_dir, new_project: str,
     """
     try:
         resolved = str(Path(run_dir).resolve())
-        children = list(SESSIONS_DIR.iterdir())
+        children = list(_sessions_dir().iterdir())
     except OSError:
         return
     for f in children:
         if not f.name.endswith(".run"):
             continue
-        stem = f.name[:-len(".run")]
+        stem = f.name[: -len(".run")]
         if _pid_from_name(stem) is None:
             continue
         pid = int(stem)
@@ -1520,20 +4039,25 @@ def ledger_repair_witnesses_for_dir(run_dir, new_project: str,
                 hit = False
                 for pn in pins:
                     name, sep, source = pn["project"].partition(":")
-                    if (pn["run_dir"] == resolved
-                            and name not in (new_project, NONE_SENTINEL)
-                            and _NAME_RE.match(name)
-                            and missing(name)):
+                    if (
+                        pn["run_dir"] == resolved
+                        and name not in (new_project, NONE_SENTINEL)
+                        and _NAME_RE.match(name)
+                        and missing(name)
+                    ):
                         pn["project"] = f"{new_project}{sep}{source}"
                         hit = True
                 if hit:
                     _write_ledger(pid, records, pins, unknown)
                     logger.info(
-                        "sessions: repaired stale witness(es) for "
-                        "%s (now %r)", resolved, new_project)
+                        "sessions: repaired stale witness(es) for %s (now %r)",
+                        resolved,
+                        new_project,
+                    )
         except Exception:  # noqa: BLE001 — per-ledger best-effort
-            logger.debug("sessions: witness repair failed for pid %s",
-                         stem, exc_info=True)
+            logger.debug(
+                "sessions: witness repair failed for pid %s", stem, exc_info=True
+            )
 
 
 def ledger_runs_pinned_to(project: str) -> list[dict]:
@@ -1544,27 +4068,229 @@ def ledger_runs_pinned_to(project: str) -> list[dict]:
     """
     out: list[dict] = []
     try:
-        children = list(SESSIONS_DIR.iterdir())
+        children = list(_sessions_dir().iterdir())
+    except OSError:
+        return out
+    for f in children:
+        if not f.name.endswith(".run"):
+            continue
+        stem = f.name[: -len(".run")]
+        if _pid_from_name(stem) is None:
+            continue
+        if not (_sessions_dir() / stem).exists():
+            continue  # orphan ledger — never steers discovery
+        try:
+            records, pins, _unknown = _read_ledger_full(int(stem))
+        except Exception:  # noqa: BLE001
+            continue
+        witnessed = {
+            (p["run_id"], p["run_dir"])
+            for p in pins
+            if p["project"].partition(":")[0] == project
+        }
+        out.extend(r for r in records if (r["run_id"], r["run_dir"]) in witnessed)
+    return out
+
+
+def ledger_running_runs_all_sessions() -> list[dict]:
+    """Every ``running`` run record across ALL registered live
+    sessions — the box-wide observation surface for "what else is
+    running right now" heuristics (the LLM sibling-contention banner).
+
+    Liveness gate mirrors the ledger writers' registered-session
+    doctrine — and is STRICTER than ``ledger_runs_pinned_to``'s
+    entry-existence check: a ledger only counts while its session
+    entry still exists AND its pid verifies — the identity stamp for
+    v2 entries (a recycled pid's leftover reads as dead), plain
+    kill-0 for pre-stamp entries. Staleness: records are returned as
+    recorded; callers needing run-level truth must vet the run dir's
+    own metadata (``_zombie_correct`` fixes a running line only when
+    that metadata already went terminal — a crash that leaves
+    ``status=running`` in the metadata is corrected by
+    ``core.run.metadata._cleanup_abandoned`` or bounded by this gate
+    when the owning session dies). Best-effort: unreadable ledgers
+    are skipped, never raised. Each dict carries ``session_pid`` plus
+    the record fields.
+    """
+    out: list[dict] = []
+    try:
+        children = list(_sessions_dir().iterdir())
     except OSError:
         return out
     for f in children:
         if not f.name.endswith(".run"):
             continue
         stem = f.name[:-len(".run")]
-        if _pid_from_name(stem) is None:
+        pid = _pid_from_name(stem)
+        if pid is None:
             continue
-        if not (SESSIONS_DIR / stem).exists():
-            continue  # orphan ledger — never steers discovery
+        entry = _parse_entry(_sessions_dir() / stem)
+        if not entry:
+            continue  # orphan ledger — never steers observation
+        if entry.get("v") == ENTRY_VERSION:
+            if not _identity_matches(pid, entry):
+                continue  # recycled pid / dead session — records stale
+        elif not _pid_running(pid):
+            continue
         try:
-            records, pins, _unknown = _read_ledger_full(int(stem))
-        except Exception:  # noqa: BLE001
+            records, _pins, _unknown = _read_ledger_full(pid)
+        except Exception:  # noqa: BLE001 — observation is best-effort
             continue
-        witnessed = {(p["run_id"], p["run_dir"])
-                     for p in pins
-                     if p["project"].partition(":")[0] == project}
-        out.extend(r for r in records
-                   if (r["run_id"], r["run_dir"]) in witnessed)
+        out.extend(dict(r, session_pid=pid) for r in records
+                   if r["status"] == "running")
     return out
+
+
+def _drain_parse(line: str) -> dict | None:
+    m = _DRAIN_LINE_RE.match(line)
+    if not m:
+        return None
+    return {"epoch": int(m.group(1)), "run_id": m.group(2),
+            "run_dir": m.group(3)}
+
+
+def _drain_owner_pid(resolved: str) -> int | None:
+    """The session pid whose ledger carries a RUNNING record for
+    *resolved* — the natural home for that run's drain requests (the
+    supervisor scans every ledger, but co-locating request and record
+    lets the record's lifecycle bound the request's)."""
+    for r in ledger_running_runs_all_sessions():
+        if r["run_dir"] == resolved:
+            return r["session_pid"]
+    return None
+
+
+def ledger_record_drain_request(run_dir: str | os.PathLike[str],
+                                pid: int | None = None) -> bool:
+    """Durably ask the run at *run_dir* to pause at its next safe
+    boundary: one ``drain`` line on a session ledger, deduplicated per
+    run dir. Target ledger: the session holding the run's running
+    record when one exists, else the caller's own session (a
+    cron-launched supervisor has no running record here). Same
+    registered-session + identity gates as the record writers; riding
+    the unknown-lines channel means every other writer preserves the
+    line verbatim. Returns True when the request is durably recorded.
+    """
+    import time
+    try:
+        resolved = str(Path(run_dir).resolve())
+    except OSError:
+        return False
+    if not _valid_run_dir(resolved):
+        logger.debug("sessions: drain request refused run dir %r",
+                     resolved)
+        return False
+    if pid is None:
+        pid = _drain_owner_pid(resolved)
+    if pid is None:
+        pid = resolve_session_pid()
+    if pid is None:
+        return False
+    fields = _parse_entry(_sessions_dir() / str(pid))
+    if not fields:
+        return False
+    if (fields.get("v") == ENTRY_VERSION
+            and not _identity_matches(pid, fields)):
+        return False
+    run_id = Path(resolved).name
+    with _ledger_lock(pid):
+        if not _parse_entry(_sessions_dir() / str(pid)):
+            return False  # entry pruned since the pre-lock gate
+        records, pins, unknown = _read_ledger_full(pid)
+        kept: list[str] = []
+        for line in unknown:
+            drain = _drain_parse(line)
+            if drain is None:
+                kept.append(line)  # foreign future-format line
+                continue
+            if drain["run_dir"] == resolved:
+                continue  # replaced below (dedup per run dir)
+            if not Path(drain["run_dir"]).is_dir():
+                continue  # request for a vanished run dir — prune
+            kept.append(line)
+        kept.append(f"drain {int(time.time())} {run_id} {resolved}")
+        return _write_ledger(pid, records, pins, kept)
+
+
+def ledger_drain_requests(
+        run_dir: str | os.PathLike[str]) -> list[dict]:
+    """Every recorded drain request naming *run_dir*, across all
+    session ledgers whose registry entry still exists (orphan ledgers
+    never steer — same gate as ``ledger_pinned_dirs``; the REQUESTER's
+    later death does not withdraw a durable request). Each dict
+    carries ``epoch``/``run_id``/``run_dir``/``session_pid``.
+    Best-effort: unreadable ledgers are skipped, never raised."""
+    out: list[dict] = []
+    try:
+        resolved = str(Path(run_dir).resolve())
+        children = list(_sessions_dir().iterdir())
+    except OSError:
+        return out
+    for f in children:
+        if not f.name.endswith(".run"):
+            continue
+        stem = f.name[:-len(".run")]
+        pid = _pid_from_name(stem)
+        if pid is None:
+            continue
+        if not (_sessions_dir() / stem).exists():
+            continue  # orphan ledger — never steers
+        try:
+            _records, _pins, unknown = _read_ledger_full(pid)
+        except Exception:  # noqa: BLE001 — observation is best-effort
+            continue
+        for line in unknown:
+            drain = _drain_parse(line)
+            if drain is not None and drain["run_dir"] == resolved:
+                out.append(dict(drain, session_pid=pid))
+    return out
+
+
+def ledger_clear_drain_requests(
+        run_dir: str | os.PathLike[str]) -> int:
+    """Remove every drain request naming *run_dir* (the honoring run
+    calls this AT the pause — without the clear, the stale request
+    would re-drain every later resume). Non-blocking per ledger: a
+    held lock is skipped with a debug log (the next boundary check
+    re-clears). Returns the number of requests removed."""
+    cleared = 0
+    try:
+        resolved = str(Path(run_dir).resolve())
+        children = list(_sessions_dir().iterdir())
+    except OSError:
+        return 0
+    for f in children:
+        if not f.name.endswith(".run"):
+            continue
+        stem = f.name[:-len(".run")]
+        pid = _pid_from_name(stem)
+        if pid is None:
+            continue
+        if not (_sessions_dir() / stem).exists():
+            continue
+        try:
+            with _ledger_lock_nb(pid) as held:
+                if not held:
+                    logger.debug(
+                        "sessions: pid %d's ledger lock is held — "
+                        "drain clear for %s deferred", pid, resolved)
+                    continue
+                records, pins, unknown = _read_ledger_full(pid)
+                kept = []
+                hit = 0
+                for line in unknown:
+                    drain = _drain_parse(line)
+                    if drain is not None \
+                            and drain["run_dir"] == resolved:
+                        hit += 1
+                        continue
+                    kept.append(line)
+                if hit and _write_ledger(pid, records, pins, kept):
+                    cleared += hit
+        except Exception:  # noqa: BLE001 — per-ledger best-effort
+            logger.debug("sessions: drain clear failed for pid %s",
+                         stem, exc_info=True)
+    return cleared
 
 
 def ledger_runs(pid: int | None = None,

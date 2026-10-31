@@ -1586,6 +1586,27 @@ class TestLoadReadingList:
         idents, _ = prep._load_reading_list(rl_path)
         assert idents.count("do_thing") == 1
 
+    def test_null_fields_route_like_absent(self, tmp_path) -> None:
+        # reading-list.json is an LLM-authored artifact: rows arrive
+        # with these keys PRESENT but null, so .get(key, "") defaults
+        # never fire. A null must route exactly like an absent value
+        # — never reach .strip()/regex as None.
+        rl = {"items": [
+            {"id": "rl-1", "question": None, "source_function": None,
+             "context": None, "resolved": False,
+             "resolution": "identifier"},
+            {"id": "rl-2", "question": None, "resolved": False,
+             "resolution": "concept"},
+            {"id": "rl-3", "question": "ownership of `pool_alloc`?",
+             "source_function": "pool_alloc", "resolved": False,
+             "resolution": "identifier"},
+        ]}
+        rl_path = tmp_path / "reading-list.json"
+        rl_path.write_text(json.dumps(rl))
+        idents, concepts = prep._load_reading_list(rl_path)
+        assert "pool_alloc" in idents
+        assert concepts == []
+
 
 class TestReadingListAnchors:
     def test_name_match(self) -> None:
@@ -1848,6 +1869,80 @@ class TestChaseReadingListDefinitions:
         names = {p.name for p in result}
         assert "local_lock.h" in names
 
+    def _mirror_victim(self, repo: Path, victim: Path, content: str) -> Path:
+        """Recreate ``victim``'s absolute path inside ``repo`` under a
+        directory whose name ends with a newline. find/grep then print
+        the mirror's path as ``<repo>/lib/evil\\n<victim>`` — so
+        newline-split output parsing yields ``str(victim)`` as its own
+        line, smuggling an outside-the-tree path into the study set."""
+        mirror_dir = repo / "lib" / "evil\n"
+        for part in victim.parent.parts[1:]:
+            mirror_dir = mirror_dir / part
+        mirror_dir.mkdir(parents=True)
+        mirror = mirror_dir / victim.name
+        mirror.write_text(content, encoding="utf-8")
+        return mirror
+
+    def test_newline_filename_cannot_smuggle_outside_path_find(
+        self, tmp_path,
+    ) -> None:
+        """A repo filename embedding a newline must not add an
+        outside-the-tree path to the chase results (find lane)."""
+        repo = tmp_path / "repo"
+        target = repo / "crypto"
+        target.mkdir(parents=True)
+        (target / "main.c").write_text("int main(void) {}", encoding="utf-8")
+
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        victim = outside / "scatterlist.h"
+        victim.write_text("OUTSIDE THE SCANNED TREE", encoding="utf-8")
+
+        mirror = self._mirror_victim(repo, victim, "void sg(void) {}")
+
+        rl = self._write_rl(tmp_path, [
+            {"question": "What is struct scatterlist?",
+             "context": "Unresolved type: struct scatterlist",
+             "resolved": False, "resolution": "identifier"},
+        ])
+
+        result = prep._chase_reading_list_definitions(rl, repo, target)
+        resolved = {p.resolve() for p in result}
+        assert victim.resolve() not in resolved
+        # The mirror file itself is a real repo file — still studied.
+        assert mirror.resolve() in resolved
+
+    def test_newline_filename_cannot_smuggle_outside_path_grep(
+        self, tmp_path,
+    ) -> None:
+        """Same smuggle via the grep lane: the mirror file's CONTENT
+        matches the definition pattern, so grep prints its
+        newline-embedding path."""
+        repo = tmp_path / "repo"
+        target = repo / "crypto"
+        target.mkdir(parents=True)
+        (target / "main.c").write_text("int main(void) {}", encoding="utf-8")
+
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        victim = outside / "types.h"
+        victim.write_text("OUTSIDE THE SCANNED TREE", encoding="utf-8")
+
+        mirror = self._mirror_victim(
+            repo, victim, "struct crypto_spawn {\n    int dummy;\n};\n",
+        )
+
+        rl = self._write_rl(tmp_path, [
+            {"question": "What is `crypto_spawn`?",
+             "context": "Unresolved type: crypto_spawn",
+             "resolved": False, "resolution": "identifier"},
+        ])
+
+        result = prep._chase_reading_list_definitions(rl, repo, target)
+        resolved = {p.resolve() for p in result}
+        assert victim.resolve() not in resolved
+        assert mirror.resolve() in resolved
+
 
 # ------------------------------------------------------------------
 # Type reinjection
@@ -2050,3 +2145,346 @@ class TestMultilangPass:
             tmp_path, tmp_path, None, ["main"], [], c_files_in_scope=True,
         )
         assert (items, docs, unresolved) == ([], [], [])
+
+    def test_null_source_file_routes_like_absent(self, tmp_path) -> None:
+        # The study loop's unresolved-refs writer persisted rows with
+        # source_file/context PRESENT but null; .get("source_file", "")
+        # never fires on present-null, and this pass crashed in
+        # Path(None) reading the run's OWN prior output — every later
+        # study prep on the run died on the same rows. A null must
+        # route like the absent-source_file case: row skipped, healthy
+        # rows still resolve.
+        self._tree(tmp_path)
+        rl = self._reading_list(tmp_path, [
+            {"id": "study_unresolved_apr_pool.deadbeef1234",
+             "question": "What does `apr_pool_cleanup` guarantee?",
+             "source_command": "/understand --study",
+             "source_file": None, "context": None,
+             "resolved": False, "resolution": "identifier"},
+            {"id": "rl-2",
+             "question": "Does `ParseHeader` bound the length?",
+             "source_file": "server/header.go",
+             "resolved": False, "resolution": "identifier"},
+        ])
+        items, _docs, _unresolved = prep._multilang_pass(
+            tmp_path, tmp_path, rl, [], [], c_files_in_scope=False,
+        )
+        assert any(it.name == "ParseHeader" for it in items)
+
+
+class TestScopeFromReadingListNullSeeds:
+    def test_null_source_file_seeds_ignored(self, tmp_path) -> None:
+        # Include-chase seeding reads the same LLM-authored rows: a
+        # present-but-null source_file must be ignored, and a list
+        # with ONLY null seeds must fall back to full-rglob (None) —
+        # same contract as no seeds at all.
+        rl_path = tmp_path / "reading-list.json"
+        rl_path.write_text(json.dumps({"items": [
+            {"id": "rl-1", "question": "q?", "source_file": None,
+             "resolved": False, "resolution": "identifier"},
+        ]}))
+        assert prep._scope_from_reading_list(
+            rl_path, tmp_path, [tmp_path],
+        ) is None
+
+    def test_null_seed_beside_real_seed(self, tmp_path) -> None:
+        (tmp_path / "a.h").write_text("int x;\n")
+        rl_path = tmp_path / "reading-list.json"
+        rl_path.write_text(json.dumps({"items": [
+            {"id": "rl-1", "question": "q?", "source_file": None,
+             "resolved": False, "resolution": "identifier"},
+            {"id": "rl-2", "question": "q2?", "source_file": "a.h",
+             "resolved": False, "resolution": "identifier"},
+        ]}))
+        scoped = prep._scope_from_reading_list(
+            rl_path, tmp_path, [tmp_path],
+        )
+        assert scoped is not None
+        assert any(p.name == "a.h" for p in scoped)
+
+
+class TestMalformedReadingListShapes:
+    """``items`` itself and its rows are LLM output too: a
+    present-but-null items array, non-dict rows, and non-str leaves
+    must cost the bad rows only — a prep crash on any of them exits
+    non-zero and disables the domain-model subsystem for the whole
+    run."""
+
+    _SHAPES = (
+        {"items": None},
+        {"items": [None]},
+        {"items": ["stray", 42]},
+        {"items": {"not": "a list"}},
+    )
+
+    def test_items_shapes_never_crash_readers(self, tmp_path) -> None:
+        # A study-supported source keeps the multilang gate OPEN so
+        # the _multilang_pass leg exercises the reader itself, not
+        # the has_study_sources short-circuit.
+        (tmp_path / "m.py").write_text("x = 1\n")
+        for i, doc in enumerate(self._SHAPES):
+            rl_path = tmp_path / f"rl{i}.json"
+            rl_path.write_text(json.dumps(doc))
+            idents, concepts = prep._load_reading_list(rl_path)
+            assert (idents, concepts) == ([], [])
+            assert prep._scope_from_reading_list(
+                rl_path, tmp_path, [tmp_path]) is None
+            items, docs, unresolved = prep._multilang_pass(
+                tmp_path, tmp_path, rl_path, [], [],
+                c_files_in_scope=True)
+            assert (items, docs, unresolved) == ([], [], [])
+
+    def test_reading_items_helper(self) -> None:
+        assert prep._reading_items(None) == []
+        assert prep._reading_items({"items": None}) == []
+        assert prep._reading_items(
+            {"items": [1, "x", {"a": 1}]}) == [{"a": 1}]
+
+    def test_bad_rows_cost_only_themselves(self, tmp_path) -> None:
+        rl_path = tmp_path / "reading-list.json"
+        rl_path.write_text(json.dumps({"items": [
+            None, "stray",
+            {"id": "rl-1", "question": "ownership of `pool_alloc`?",
+             "source_function": "pool_alloc", "resolved": False,
+             "resolution": "identifier"},
+        ]}))
+        idents, _ = prep._load_reading_list(rl_path)
+        assert "pool_alloc" in idents
+
+    def test_non_str_leaves_route_like_absent(self, tmp_path) -> None:
+        # int/list/dict leaves are the observed LLM drift one step
+        # past null — same class, same contract: route like absent,
+        # never reach Path()/regex/.strip() as the wrong type (a
+        # list source_file crashed set.add, an int crashed confine).
+        (tmp_path / "a.h").write_text("int x;\n")
+        # Keep the multilang gate OPEN (see above) so the pass reads
+        # the hostile rows instead of short-circuiting.
+        (tmp_path / "m.py").write_text("x = 1\n")
+        rl_path = tmp_path / "reading-list.json"
+        rl_path.write_text(json.dumps({"items": [
+            {"id": "rl-1", "question": 42, "source_file": 9,
+             "source_function": ["f"], "context": {"k": 1},
+             "resolved": False, "resolution": "identifier"},
+            {"id": "rl-2", "question": 7, "resolved": False,
+             "resolution": "concept"},
+            {"id": "rl-3", "question": "q3?", "source_file": ["a.c"],
+             "resolved": False, "resolution": "identifier"},
+            {"id": "rl-4", "question": "q4?", "source_file": "a.h",
+             "resolved": False, "resolution": "identifier"},
+        ]}))
+        idents, concepts = prep._load_reading_list(rl_path)
+        assert concepts == []
+        scoped = prep._scope_from_reading_list(
+            rl_path, tmp_path, [tmp_path])
+        assert scoped is not None
+        assert any(p.name == "a.h" for p in scoped)
+        prep._multilang_pass(
+            tmp_path, tmp_path, rl_path, [], [],
+            c_files_in_scope=True)
+
+
+# ------------------------------------------------------------------
+# Project promotion
+# ------------------------------------------------------------------
+
+class TestPromoteToProjectConcepts:
+    def test_patterns_merge_not_clobber(self, tmp_path) -> None:
+        """A scoped run's patterns.json merges into the project copy —
+        an unconditional replace erased the whole-tree accumulation
+        (last writer wins)."""
+        project = tmp_path / "proj"
+        out = project / "run_001"
+        out.mkdir(parents=True)
+        (project / "project.json").write_text("{}", encoding="utf-8")
+        concepts = project / "concepts"
+        concepts.mkdir()
+        (concepts / "patterns.json").write_text(json.dumps({
+            "patterns": {"whole_tree_fn": {"role": "allocator"}},
+        }), encoding="utf-8")
+        src = out / "patterns.json"
+        src.write_text(json.dumps({
+            "patterns": {"scoped_fn": {"role": "validator"}},
+        }), encoding="utf-8")
+
+        prep._promote_to_project_concepts(src, out)
+
+        promoted = json.loads((concepts / "patterns.json").read_text())
+        assert set(promoted["patterns"]) == {"whole_tree_fn", "scoped_fn"}
+
+    def test_first_promotion_creates_canonical(self, tmp_path) -> None:
+        project = tmp_path / "proj"
+        out = project / "run_001"
+        out.mkdir(parents=True)
+        (project / "project.json").write_text("{}", encoding="utf-8")
+        src = out / "patterns.json"
+        src.write_text(json.dumps({
+            "patterns": {"fn": {"role": "parser"}},
+        }), encoding="utf-8")
+
+        prep._promote_to_project_concepts(src, out)
+
+        promoted = json.loads(
+            (project / "concepts" / "patterns.json").read_text())
+        assert promoted["patterns"] == {"fn": {"role": "parser"}}
+
+    def test_non_project_dir_is_noop(self, tmp_path) -> None:
+        out = tmp_path / "run_001"
+        out.mkdir()
+        src = out / "patterns.json"
+        src.write_text(json.dumps({"patterns": {}}), encoding="utf-8")
+        prep._promote_to_project_concepts(src, out)
+        assert not (tmp_path / "concepts").exists()
+
+
+# ------------------------------------------------------------------
+# Hostile-input complexity pins for the C declaration matcher
+# ------------------------------------------------------------------
+
+class TestCFuncMatcherHostileAttribute:
+    """The __attribute__ body must match with a single-character base.
+
+    A starred base inside the repeated attribute group ((?:[^()]*|...)*)
+    is the ambiguous (a*)* shape: an unterminated "__attribute__(("
+    line makes the engine try every split of the body between the two
+    stars — exponential in the token count, so ~100 bytes of scanned
+    content pin a CPU for hours. The single-character spelling matches
+    the same strings with one parse per input.
+    """
+
+    # 102 bytes, the observed run-killer shape: an UNTERMINATED
+    # attribute line (30 body tokens) followed by a real function.
+    HOSTILE = (
+        "__attribute__((" + " a" * 30 + "\n"
+        "int f(void) { return 0; }\n"
+    )
+
+    def test_unterminated_attribute_scan_is_linear(self) -> None:
+        from core.testing.wallclock import cpu_budget
+
+        # Growth-shaped pin first (12 tokens ≈ 10s CPU on the
+        # ambiguous spelling — fails the budget without hanging the
+        # run); then the full hostile file at 30 tokens, which only a
+        # linear matcher survives.
+        with cpu_budget(1.0, what="12-token unterminated attribute"):
+            list(prep._C_FUNC_RE.finditer(
+                "__attribute__((" + " a" * 12 + "\nx\n"))
+        with cpu_budget(1.0, what="102-byte hostile C file"):
+            results = prep._extract_functions(self.HOSTILE, "evil.c")
+        # The hostile line must not block extraction of the code
+        # after it.
+        assert any(f["name"] == "f" for f in results)
+
+    def test_attribute_forms_still_match(self) -> None:
+        for src, name in (
+            ('__attribute__((visibility("default"))) int f(void) {\n', "f"),
+            ("__attribute__((format(printf, 1, 2))) static int "
+             "log2f(const char *fmt, ...) {\n", "log2f"),
+            ("__attribute__((noreturn)) __attribute__((cold)) "
+             "void die(int c) {\n", "die"),
+            ("__attribute__((aligned(16), packed)) struct x *mk(void) {\n",
+             "mk"),
+            ("__declspec(dllexport) unsigned long g(int x) {\n", "g"),
+            ("extern int h(void);\n", "h"),
+        ):
+            m = prep._C_FUNC_RE.search(src)
+            assert m is not None, src
+            assert m.group(1) == name, src
+
+
+class TestExtractFieldsWhitespaceRun:
+    def test_field_line_whitespace_run_is_fast(self) -> None:
+        """Hostile struct-body line: a field-shaped token followed by
+        a long whitespace run with no ';'. The previous spelling
+        stacked three unbounded whitespace spans around the optional
+        array/bitfield atoms and tried every split of the run between
+        them — cubic in the line length. Folding each span behind its
+        gating atom is linear. Both-direction bound: fast AND real
+        fields still extracted."""
+        from core.testing.wallclock import cpu_budget
+
+        block = "myfield" + " " * (1 << 16) + "x\n"
+        with cpu_budget(1.0, what="field-line whitespace-run scan"):
+            assert prep._extract_fields(block) == []
+
+    def test_field_forms_still_extracted(self) -> None:
+        block = (
+            "unsigned long flags;\n"
+            "char name[MAX_LEN];\n"
+            "u32 bits : 4;\n"
+            "int arr [ 8 ] ;\n"
+        )
+        assert prep._extract_fields(block) == [
+            "flags", "name", "bits", "arr",
+        ]
+
+
+class TestCFuncExtractionHostileRuns:
+    def test_unclosed_attribute_run_is_fast(self) -> None:
+        """Hostile '__attribute__((' followed by a long run with no
+        closing paren: the previous interior (?:[^()]*|\\([^()]*\\))*
+        nested an unbounded branch inside an unbounded loop and tried
+        every split of the run across iterations — exponential. The
+        first-rest normal form is deterministic."""
+        from core.testing.wallclock import cpu_budget
+
+        hostile = "__attribute__((" + "a" * 4000 + "\nint f(void);\n"
+        with cpu_budget(1.0, what="unclosed-attribute scan"):
+            results = prep._extract_functions(hostile, "x.c")
+        # The real declaration after the hostile line still extracts.
+        assert [f["name"] for f in results] == ["f"]
+
+    def test_attribute_declaration_lines_are_fast(self) -> None:
+        """A planted file of attribute-shaped lines: the unbounded
+        attribute loop let every MULTILINE anchor consume arbitrarily
+        many following lines before failing — quadratic. Bounded
+        loops cap per-anchor reach."""
+        from core.testing.wallclock import cpu_budget
+
+        hostile = '__attribute__((visibility("default"))) \n' * 4000
+        with cpu_budget(2.0, what="attribute-line run scan"):
+            prep._extract_functions(hostile, "x.c")
+
+    def test_declaration_forms_still_extracted(self) -> None:
+        src = (
+            '__attribute__((visibility("default")))\n'
+            "__attribute__((format(printf, 1, 2)))\n"
+            "static inline const struct foo *lookup_foo(int id);\n"
+            "extern unsigned long sum_all(void);\n"
+            "int plain(void);\n"
+        )
+        names = {f["name"] for f in prep._extract_functions(src, "x.h")}
+        assert {"lookup_foo", "sum_all", "plain"} <= names
+
+
+class TestCappedSourceReads:
+    """Target-tree reads route through the shared capped reader — a
+    planted huge file yields its prefix (extraction is additive:
+    items past the cap are simply not extracted), never a whole-file
+    buffer."""
+
+    def test_scan_read_is_capped(self, tmp_path: Path, monkeypatch) -> None:
+        real = prep.read_text_capped
+
+        def tiny_cap(path, max_chars=None, **kw):
+            return real(path, 256, **kw)
+
+        monkeypatch.setattr(prep, "read_text_capped", tiny_cap)
+        sf = tmp_path / "big.c"
+        sf.write_text(
+            "struct early { int a; };\n"
+            + "/* pad */\n" * 100
+            + "struct tail_sentinel { int z; };\n",
+        )
+        structs, _funcs, _protos, _incs = prep._scan_file_result(
+            sf, tmp_path, False, None,
+        )
+        names = {s["name"] for s in structs}
+        assert "early" in names
+        assert "tail_sentinel" not in names
+
+    def test_no_unbounded_target_reads_remain(self) -> None:
+        # Wiring pin: every target-tree read in the script routes
+        # through the capped reader — a bare ``.read_text(`` re-grown
+        # on a Path would reopen the whole-file-buffer class.
+        src = _PREP_PATH.read_text(encoding="utf-8")
+        assert ".read_text(" not in src

@@ -683,3 +683,35 @@ class TestCensusPrepCache:
         (out / "prep-cache" / "return-census-cache.json").write_text("{nope")
         res = cp.run_consistency_prepass(dict(self._SRC), out_dir=out)
         assert "setuid" in res["census"]
+
+
+class TestCensusArtifactAtomicWrite:
+    """return-census.json is parsed back by resume paths and operator
+    tooling, so the write must be atomic (tempfile + rename via
+    core.json.save_json) — a crash mid-write must leave the previous
+    artifact or none, never truncated JSON."""
+
+    def test_census_write_goes_through_save_json(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import core.audit.consistency_prepass as cp
+        from core.json import save_json as real_save_json
+
+        out = tmp_path / "out"
+        out.mkdir()
+        written: list[Path] = []
+
+        def spy(path, data, *args, **kwargs):
+            written.append(Path(path))
+            real_save_json(path, data, *args, **kwargs)
+
+        # raising=True (the default): if the census writer stops
+        # routing through save_json, this setattr fails loudly.
+        monkeypatch.setattr(cp, "save_json", spy)
+        cp.run_consistency_prepass(
+            dict(TestCensusPrepCache._SRC), out_dir=out,
+        )
+        assert out / "return-census.json" in written
+        # And the artifact on disk round-trips as valid JSON.
+        data = json.loads((out / "return-census.json").read_text())
+        assert "setuid" in data

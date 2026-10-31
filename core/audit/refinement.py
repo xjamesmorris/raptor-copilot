@@ -149,8 +149,17 @@ def merge_outcomes(original: Any, refined: Any) -> Any:
     cost / duration / token usage of both rounds. The merge picks a
     verdict, not a bill — replacing the ledger fields silently dropped
     every earlier refinement round's spend from the journal and
-    cost-breakdown (one measured run under-reported by $5.27, which
+    cost-breakdown (one measured run under-reported its spend, which
     then surfaced as an unexplained budget death).
+
+    The mechanical dispatch record (tools_dispatched / tools_errored /
+    tools_skipped) survives the merge the same way: both rounds
+    describe the SAME function, so the union is true whichever verdict
+    wins. Dropping it made gate resolution read "no covering channel
+    ever ran" (dark) for a function whose tools demonstrably looked —
+    and erased the did-not-look skips that keep phantom coverage out
+    of class-coverage credit. A channel dispatched in either round did
+    look, so it leaves the merged skip set.
     """
     from .evidence_grade import is_tool_evidence
     refined_tool = getattr(refined, "evidence_tool", "") or ""
@@ -169,6 +178,31 @@ def merge_outcomes(original: Any, refined: Any) -> Any:
                 setattr(winner, attr, total)
             except AttributeError:
                 pass  # duck-typed outcome without the field
+        merged: dict[str, set] = {}
+        for attr in ("tools_dispatched", "tools_errored", "tools_skipped"):
+            merged[attr] = (
+                set(getattr(original, attr, None) or set())
+                | set(getattr(refined, attr, None) or set())
+            )
+        merged["tools_skipped"] -= merged["tools_dispatched"]
+        for attr in ("tools_dispatched", "tools_errored"):
+            if merged[attr]:
+                try:
+                    setattr(winner, attr, merged[attr])
+                except AttributeError:
+                    pass  # duck-typed outcome without the field
+        # tools_skipped is corrected in BOTH directions: a channel the
+        # union shows dispatched must also leave the WINNER'S own
+        # stale skip set (a channel left in both sets reads as looked
+        # AND did-not-look in the journal), so the subtracted set is
+        # written whenever either side disagrees — an empty result
+        # clears to None, keeping the no-records shape.
+        skipped = merged["tools_skipped"]
+        if skipped or getattr(winner, "tools_skipped", None):
+            try:
+                winner.tools_skipped = skipped or None
+            except AttributeError:
+                pass  # duck-typed outcome without the field
         return winner
 
     if is_tool_evidence(refined_tool):
@@ -180,10 +214,44 @@ def merge_outcomes(original: Any, refined: Any) -> Any:
     if orig_status == "finding" and ref_status == "clean":
         return _summed(original)
 
-    if ref_status == "finding" and not refined_tool and original_tool:
+    # Carry the original round's evidence stamp forward only when that
+    # round's own verdict backed the finding (finding/suspicious). In
+    # the clean-check rescue path the original outcome is CLEAN — its
+    # tool stamp confirmed nothing, and copying it would let an
+    # LLM-only rescue grade as tool-confirmed downstream. The rescue
+    # survives either way; only the evidence grade degrades.
+    if (
+        ref_status == "finding"
+        and orig_status in ("finding", "suspicious")
+        and not refined_tool
+        and original_tool
+    ):
         refined.evidence_tool = original_tool
 
     return _summed(refined)
+
+
+def clean_check_applicable(
+    triage_bucket: str,
+    is_entry_point: bool,
+    is_sink: bool,
+    sloc: int = 0,
+) -> bool:
+    """The verdict-independent half of the clean-check gate.
+
+    True when the function is in the clean-check population: triage
+    bucket deep_dive OR entry point / sink, with sufficient SLOC.
+    Shared by the post-verdict rescue (which additionally requires a
+    clean status) and the pre-review flow sweep (which runs before
+    any verdict exists).
+    """
+    if sloc > 0 and sloc < MIN_SLOC_CLEAN_CHECK:
+        return False
+
+    if triage_bucket == "deep_dive":
+        return True
+
+    return bool(is_entry_point or is_sink)
 
 
 def should_clean_check(
@@ -204,13 +272,9 @@ def should_clean_check(
     if status != "clean":
         return False
 
-    if sloc > 0 and sloc < MIN_SLOC_CLEAN_CHECK:
-        return False
-
-    if triage_bucket == "deep_dive":
-        return True
-
-    return bool(is_entry_point or is_sink)
+    return clean_check_applicable(
+        triage_bucket, is_entry_point, is_sink, sloc=sloc,
+    )
 
 
 def build_clean_check_prompt(
@@ -245,6 +309,35 @@ def build_clean_check_prompt(
     return "\n".join(lines)
 
 
+def build_flow_preview_prompt(tool_flows: str) -> str:
+    """Build the pre-review flow-preview section.
+
+    Same mechanical sweep output the post-verdict clean-check rescue
+    presents, surfaced in the FIRST review prompt instead — the model
+    must address the flows up front rather than being re-asked after a
+    clean verdict.  The flow text quotes target identifiers via the
+    tool output, so it is defanged with ``neutralize_tag_forgery``
+    before interpolation.
+    """
+    from core.security.prompt_envelope import neutralize_tag_forgery
+
+    lines = [
+        "## Mechanical flow sweep",
+        "",
+        "The mechanical tools found these flows in this function:",
+        "",
+        neutralize_tag_forgery(tool_flows),
+        "",
+        ("Address each flow explicitly in your review. If a flow is "
+         "benign (e.g. sanitized before the sink, bounds-checked, or "
+         "not reachable from untrusted input), say why. If it "
+         "represents a real issue, factor it into your hypotheses and "
+         "verdict."),
+    ]
+
+    return "\n".join(lines)
+
+
 def collect_tool_results(
     outcome: Any,
     evidence_index: Any = None,
@@ -260,7 +353,9 @@ def collect_tool_results(
     key = f"{getattr(outcome, 'file', '')}:{getattr(outcome, 'function', '')}"
 
     for tool in sorted(dispatched):
-        result_text = _describe_tool_result(tool, key, evidence_index)
+        result_text = _describe_tool_result(
+            tool, key, evidence_index, outcome=outcome,
+        )
         results.append({"tool": tool, "result": result_text})
 
     return results
@@ -270,8 +365,24 @@ def _describe_tool_result(
     tool: str,
     key: str,
     evidence_index: Any = None,
+    outcome: Any = None,
 ) -> str:
-    """Describe what a specific tool found for a function."""
+    """Describe what a specific tool found for a function.
+
+    The description must reflect the outcome's ACTUAL evidence: a
+    hardcoded negative ("no matches") that contradicts the confirming
+    receipt the verdict carries steers the refinement LLM to walk back
+    a tool-confirmed hypothesis.
+    """
+    # The confirming receipt on the outcome is authoritative — it is
+    # the only per-function record for channels the evidence index
+    # does not carry (coccinelle, smt).
+    receipt = str(getattr(outcome, "evidence_tool", "") or "")
+    if receipt == tool or receipt.startswith(f"{tool}:"):
+        return f"confirmed the hypothesis ({receipt})"
+    if tool in (getattr(outcome, "tools_errored", None) or set()):
+        return "errored or timed out — did not meaningfully run"
+
     if evidence_index is None:
         return "dispatched but no result captured"
 
@@ -286,8 +397,11 @@ def _describe_tool_result(
             return f"matched {len(hits)} rule(s): {', '.join(rules)}"
         return "no matches"
 
-    if tool == "coccinelle":
-        return "no matches"
+    if tool in ("coccinelle", "smt"):
+        # No per-function record in the evidence index for these
+        # channels — "ran and found nothing" cannot be claimed, only
+        # the absence of a confirming receipt.
+        return "dispatched; no confirming output recorded"
 
     if tool == "codeql":
         alerts = getattr(rec, "codeql_alerts", None)
@@ -295,9 +409,6 @@ def _describe_tool_result(
             rules = [a.get("rule_id", "?") for a in alerts[:3]]
             return f"found {len(alerts)} alert(s): {', '.join(rules)}"
         return "no alerts for this function"
-
-    if tool == "smt":
-        return "dispatched, no confirmation"
 
     if tool == "joern":
         flows = rec.all_joern_flows() if hasattr(rec, "all_joern_flows") else []
@@ -329,7 +440,7 @@ def dispatch_suggestion(
     try:
         from .hypothesis_mapping import (
             hypothesis_to_cocci_check,
-            hypothesis_to_semgrep_rule,
+            hypothesis_to_semgrep_rule_keyed,
             hypothesis_to_smt_verb,
         )
 
@@ -354,13 +465,15 @@ def dispatch_suggestion(
         if any(kw in suggestion_lower for kw in (
             "semgrep", "pattern", "rule", "regex",
         )):
-            rule_path = hypothesis_to_semgrep_rule(
+            keyed = hypothesis_to_semgrep_rule_keyed(
                 suggestion, ctx.get("file", ""),
             )
-            if rule_path:
+            if keyed:
+                rule_path, rule_keyword = keyed
                 try:
                     result = _dispatch_semgrep(
                         rule_path, outcome, ctx, config,
+                        rule_keyword=rule_keyword,
                     )
                     if result:
                         results.append(result)
@@ -400,7 +513,7 @@ def _dispatch_smt(
             target_path=str(target) if target else None,
         )
         if result:
-            status = "confirmed" if result.outcome == "confirmed" else result.outcome
+            status = result.outcome
             return {
                 "tool": f"smt:{smt_verb}",
                 "result": f"{status}: {result.raw_output[:200] if result.raw_output else 'no detail'}",
@@ -451,11 +564,20 @@ def _dispatch_coccinelle(
 
 def _dispatch_semgrep(
     rule_path: str,
-    _outcome: Any,
+    outcome: Any,
     ctx: dict[str, Any],
     config: Any,
+    *,
+    rule_keyword: str = "",
 ) -> dict[str, str] | None:
-    """Run a Semgrep rule based on the suggestion."""
+    """Run a Semgrep rule based on the suggestion.
+
+    ``rule_keyword`` and the outcome's hypothesis thread the sweep's
+    per-rule caps: without them the negative-control (presence
+    detector) and identifier-window checks keyed on them were
+    disarmed for every refinement dispatch — a dynamic rule that also
+    matches the guarded fixture could 'confirm' here.
+    """
     try:
         from pathlib import Path
 
@@ -470,6 +592,13 @@ def _dispatch_semgrep(
         line_start = ctx.get("line_start", 0)
         line_end = ctx.get("line_end", 0)
 
+        # Same inventory language hint as the main tool-chain lane:
+        # without it the suggested-rule re-run silently skipped
+        # content-probed unknown-extension files (inconclusive) while
+        # the main lane confirmed/refuted them.
+        from .orchestrator import _inventory_language_hint
+        language = _inventory_language_hint(config, file_path)
+
         result = run_semgrep_sweep(
             rule_config=rule_path,
             target_path=target,
@@ -477,6 +606,9 @@ def _dispatch_semgrep(
             function_name=func_name,
             line_start=line_start,
             line_end=line_end,
+            language=language,
+            hypothesis=getattr(outcome, "hypothesis", "") or "",
+            rule_keyword=rule_keyword,
         )
         if result:
             return {

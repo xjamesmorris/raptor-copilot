@@ -7,14 +7,20 @@ producing findings in the same internal dict shape that
 :func:`core.sarif.parser.parse_sarif_findings` returns.
 """
 
+import os
 import re
+import stat as _stat_mod
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
 from core.logging import get_logger
+from core.sarif import emit
 from core.sarif.parser import _coerce_line
+from core.security.log_sanitisation import escape_nonprintable
+from core.source.lines import split_lines
 
 logger = get_logger()
 
@@ -175,51 +181,238 @@ def _is_under_root(source_root: Path, candidate: str) -> bool:
         return False
 
 
+#: See the rejection comment in _resolve_uri.
+_MAX_URI_COMPONENTS = 256
+
+#: Aggregate budget for FAILED full depth-loop scans per import. The
+#: per-URI component cap bounds one resolution at sub-second cost, but
+#: the document cap admits ~147k cap-sized findings, so per-URI
+#: soundness still summed to hours across the import loop — the
+#: aggregate axis of the same wedge. Legitimate imports do not carry
+#: thousands of unmappable URIs (a real path mismatch resolves via the
+#: strip-depth cache after the first success), so after this many
+#: full scans that found nothing, unknown URIs stop paying for the
+#: depth loop and resolve only through the cheap cached-depth path.
+#: Trade-off, both directions: too low turns a genuinely mixed-root
+#: import into silent unresolved skips after few failures; too high
+#: re-opens the hours-scale aggregate wedge (64 × ~60 ms cap-sized
+#: scans ≈ 4 s worst case).
+_MAX_FAILED_URI_SCANS = 64
+
+#: Negative-memo ceiling: entries are attacker-chosen URI strings, so
+#: the memo itself must not become the memory wedge (~147k cap-sized
+#: URIs ≈ 100 MB). Past the cap, repeats of NEW failed URIs fall back
+#: to the scan budget above.
+_MAX_FAILED_URI_MEMO = 4096
+
+#: Positive-memo ceiling — same attacker-chosen-string reasoning as
+#: the negative memo (values are bounded resolved paths, keys are the
+#: URIs). Past the cap, repeats of NEW successful URIs re-resolve via
+#: the depth cache / basename index (cheap paths).
+_MAX_RESOLVED_URI_MEMO = 4096
+
+#: Aggregate wall budget for FULL depth-loop scans per import —
+#: successes included. The failed-scan count budget above cannot see
+#: a wedge built from RESOLVING URIs: alternating deep URIs whose
+#: strip depths differ (~253 junk components ending in a real in-repo
+#: filename) each succeed, so nothing was memoised or charged and the
+#: quadratic loop ran per finding (~66 ms × 147k admitted findings ≈
+#: hours). Once spent, unknown URIs resolve only through the cached
+#: depths and the O(1) basename index. Trade-off, both directions:
+#: too low degrades genuinely many-rooted imports to basename-only
+#: resolution (ambiguous basenames then skip, loudly); too high
+#: re-opens the hours-scale wedge (20 s ≈ 300 cap-sized scans —
+#: two orders of magnitude above the handful of distinct scanner
+#: roots real imports carry).
+_MAX_FULL_SCAN_SECONDS = 20.0
+
+
+#: Ceiling on remembered strip depths. The cached-depth loop runs
+#: BEFORE every budget gate and pays one ``_is_under_root`` resolve
+#: per entry per unresolved URI, so the cache length is a per-URI
+#: cost multiplier the DOCUMENT controls: a handful of cheap resolving
+#: URIs (each caching one distinct depth) used to grow it to the
+#: component cap (256), making every later unmappable URI pay 256
+#: unbudgeted resolves — the same hours-scale wedge the scan budgets
+#: close, re-opened through the one unbudgeted lane. Capping the
+#: cache (LRU eviction, most-recent-first order) makes the lane's
+#: worst case a small input-independent constant. Trade-off, both
+#: directions: too low thrashes genuinely multi-shape imports (each
+#: shape re-pays a budgeted full scan when its depth is evicted —
+#: real imports carry a handful of scanner shapes, mixed-root CI
+#: aggregates maybe a few more); too high re-opens the seeded wedge
+#: (cost scales linearly with the cap). 8 covers every observed
+#: legitimate shape count with headroom.
+_MAX_DEPTH_CACHE = 8
+
+
+def _remember_depth(depth_cache: list, depth: int) -> None:
+    """Record a successful strip depth, most-recent-first, capped at
+    ``_MAX_DEPTH_CACHE`` entries (LRU eviction — see the constant's
+    trade-off note). A single-slot cache thrashed when two scanner
+    shapes alternated, re-paying the full scan per finding; an
+    unbounded cache let the document itself inflate the per-URI cost
+    of the pre-budget cached-depth loop."""
+    if depth in depth_cache:
+        depth_cache.remove(depth)
+    depth_cache.insert(0, depth)
+    while None in depth_cache:
+        depth_cache.remove(None)
+    del depth_cache[_MAX_DEPTH_CACHE:]
+
+
 def _resolve_uri(
     uri: str,
     source_root: Path,
     file_index: dict[str, list[Path]],
     depth_cache: list[int | None],
+    *,
+    failed_memo: set[str] | None = None,
+    scan_budget: list[int] | None = None,
+    resolved_memo: dict[str, str] | None = None,
+    scan_clock: list[float] | None = None,
 ) -> str | None:
     """Resolve a SARIF URI to a relative path under *source_root*.
 
     Tries progressively shorter prefixes until a match is found.
-    Caches the successful strip-depth so subsequent findings from the
-    same scanner resolve in O(1).
+    Caches successful strip-depths (``depth_cache``, most-recent-first,
+    capped at ``_MAX_DEPTH_CACHE``) so subsequent findings from the
+    same scanner shape(s) resolve in O(1) — a single-slot cache
+    thrashed on two alternating shapes and re-paid the quadratic scan
+    per finding; an uncapped cache let the document seed one entry per
+    depth and multiply every unresolved URI's pre-budget cost by 256.
 
     Rejects any resolved path that escapes *source_root* (traversal
     defence for untrusted SARIF).
 
+    Per-import state, all optional:
+
+    - ``failed_memo`` short-circuits URIs that already failed — the
+      depth loop memoised only SUCCESSFUL strip depths, so 147k
+      findings carrying the SAME unresolvable URI each re-paid the
+      full quadratic scan.
+    - ``scan_budget`` (mutable cell) bounds the number of FAILED full
+      scans (see ``_MAX_FAILED_URI_SCANS``).
+    - ``resolved_memo`` short-circuits repeat SUCCESSFUL URIs.
+    - ``scan_clock`` (mutable cell, accumulated seconds) bounds the
+      aggregate wall time of full scans, successes included (see
+      ``_MAX_FULL_SCAN_SECONDS``) — resolving-URI wedges never touch
+      the failure budget.
+
+    Once either budget is spent, unknown URIs resolve only through
+    the cached-depth fast path and the O(1) basename index — the
+    basename match is NOT part of the quadratic wedge and is never
+    budgeted (skipping it dropped every legitimate finding whose
+    unmappable siblings arrived first).
+
     Returns a POSIX-style relative path string, or None.
     """
+    if resolved_memo is not None and uri in resolved_memo:
+        return resolved_memo[uri]
+    if failed_memo is not None and uri in failed_memo:
+        return None
+
+    def _fail() -> None:
+        if (failed_memo is not None
+                and len(failed_memo) < _MAX_FAILED_URI_MEMO):
+            failed_memo.add(uri)
+        return None
+
+    def _ok(resolved: str) -> str:
+        if (resolved_memo is not None
+                and len(resolved_memo) < _MAX_RESOLVED_URI_MEMO):
+            resolved_memo[uri] = resolved
+        return resolved
+
     clean = unquote(_strip_file_scheme(uri))
     if clean.startswith("/"):
         clean = clean.lstrip("/")
 
     parts = Path(clean).parts
     if not parts:
-        return None
+        return _fail()  # type: ignore[func-returns-value]
+    # Component cap before the depth loop: each iteration resolves a
+    # path of O(N) components, so an N-component URI costs O(N²) —
+    # measured 62s at 8000 components (~16 KB of SARIF text), and the
+    # 100 MiB document cap admits URIs thousands of times larger. No
+    # legitimate source tree approaches this depth; a hostile imported
+    # SARIF must not wedge /agentic --sarif for hours. Trade-off, both
+    # directions: too low rejects deep-but-real vendored trees (Linux
+    # peaks around depth ~20); too high re-opens the quadratic wedge.
+    # 256 sits an order of magnitude above real trees while bounding
+    # the loop at sub-second cost.
+    if len(parts) > _MAX_URI_COMPONENTS:
+        logger.debug(
+            "URI rejected: %d path components exceeds the %d cap",
+            len(parts), _MAX_URI_COMPONENTS,
+        )
+        return _fail()  # type: ignore[func-returns-value]
 
-    if depth_cache[0] is not None:
-        candidate = str(Path(*parts[depth_cache[0]:])) if depth_cache[0] < len(parts) else None
-        if candidate and _is_under_root(source_root, candidate):
-            return candidate
-
-    for depth in range(len(parts)):
-        candidate = str(Path(*parts[depth:]))
+    for i, cached_depth in enumerate(depth_cache):
+        if cached_depth is None or cached_depth >= len(parts):
+            continue
+        candidate = str(Path(*parts[cached_depth:]))
         if _is_under_root(source_root, candidate):
-            depth_cache[0] = depth
-            return candidate
+            if i != 0:
+                # Most-recent-first so alternating shapes stay O(1).
+                depth_cache.insert(0, depth_cache.pop(i))
+            return _ok(candidate)
 
+    scans_allowed = not (
+        (scan_budget is not None and scan_budget[0] <= 0)
+        or (scan_clock is not None
+            and scan_clock[0] >= _MAX_FULL_SCAN_SECONDS)
+    )
+    if scans_allowed:
+        scan_start = time.monotonic()
+        try:
+            for depth in range(len(parts)):
+                candidate = str(Path(*parts[depth:]))
+                if _is_under_root(source_root, candidate):
+                    _remember_depth(depth_cache, depth)
+                    return _ok(candidate)
+        finally:
+            if scan_clock is not None:
+                before = scan_clock[0]
+                scan_clock[0] += time.monotonic() - scan_start
+                if (before < _MAX_FULL_SCAN_SECONDS
+                        <= scan_clock[0]):
+                    logger.warning(
+                        "SARIF import: full URI scans exceeded the "
+                        "%.0f s aggregate wall budget — further "
+                        "unknown URIs resolve only via cached depths "
+                        "and unique basenames (hostile or deeply "
+                        "prefixed SARIF)",
+                        _MAX_FULL_SCAN_SECONDS,
+                    )
+
+    # Basename index: O(1), NOT part of the quadratic wedge — always
+    # consulted, budgets or not (budget exhaustion used to skip it and
+    # dropped every legitimate finding whose unmappable siblings came
+    # first in the document).
     basename = parts[-1]
     matches = file_index.get(basename, [])
     if len(matches) == 1:
         resolved = str(matches[0])
         if _is_under_root(source_root, resolved):
-            logger.debug("URI %s: basename-only match → %s", uri, resolved)
-            return resolved
+            logger.debug(
+                "URI %s: basename-only match → %s",
+                escape_nonprintable(uri), resolved,
+            )
+            return _ok(resolved)
 
-    return None
+    if scans_allowed and scan_budget is not None:
+        scan_budget[0] -= 1
+        if scan_budget[0] == 0:
+            logger.warning(
+                "SARIF import: %d full URI scans found nothing — "
+                "further unknown URIs skip full-scan resolution "
+                "(hostile or wrong-root SARIF; resolved shapes keep "
+                "the cached-depth fast path, unique basenames keep "
+                "the index match)",
+                _MAX_FAILED_URI_SCANS,
+            )
+    return _fail()  # type: ignore[func-returns-value]
 
 
 # ---------------------------------------------------------------------------
@@ -248,21 +441,61 @@ def _synthesize_snippet(
     Files larger than ``_SNIPPET_SOURCE_MAX_BYTES`` are skipped (the
     finding keeps flowing, just without a synthesized snippet).
     """
+    # Gated read on the OPEN fd: the file lives in the UNTRUSTED
+    # scanned tree and the (also untrusted) SARIF picks which path is
+    # read, so both the size gate and the file-type gate must hold on
+    # the fd actually read — a stat-by-name gate misses a FIFO
+    # planted in the tree (stats 0 bytes, then blocks the import
+    # stage forever at the open) and a swap-after-stat grow.
+    full = source_root / rel_path
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
     try:
-        full = source_root / rel_path
-        if full.stat().st_size > _SNIPPET_SOURCE_MAX_BYTES:
+        fd = os.open(str(full), flags)
+    except OSError:
+        return ""
+    try:
+        st = os.fstat(fd)
+        if not _stat_mod.S_ISREG(st.st_mode):
+            # rel_path is a filename from the UNTRUSTED scanned tree
+            # (archives/git admit control bytes in names) and these
+            # WARNINGs reach the operator terminal raw through the
+            # console handler — escape at creation, like the module's
+            # ImportWarning messages and parser.py's out-of-root twin.
+            logger.warning(
+                "SARIF import: skipping snippet synthesis for "
+                "non-regular file: %s",
+                escape_nonprintable(rel_path),
+            )
+            return ""
+        if st.st_size > _SNIPPET_SOURCE_MAX_BYTES:
             logger.warning(
                 "SARIF import: skipping snippet synthesis for oversized "
                 "file (>%d MiB): %s",
-                _SNIPPET_SOURCE_MAX_BYTES // (1024 * 1024), rel_path,
+                _SNIPPET_SOURCE_MAX_BYTES // (1024 * 1024),
+                escape_nonprintable(rel_path),
             )
             return ""
-        lines = full.read_text(encoding="utf-8", errors="replace").splitlines()
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1  # fdopen owns it now
+            raw = fh.read(_SNIPPET_SOURCE_MAX_BYTES + 1)
+        if len(raw) > _SNIPPET_SOURCE_MAX_BYTES:
+            return ""  # grew past the cap during the read
+        lines = split_lines(raw.decode("utf-8", errors="replace"))
         s = max(0, start_line - 1)
         e = min(len(lines), (end_line or start_line) + _SNIPPET_CONTEXT_LINES)
         return "\n".join(lines[s:e])
     except OSError:
         return ""
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +551,10 @@ def normalize_imported_findings(
 
     file_index = _build_file_index(source_root)
     depth_cache: list[int | None] = [None]
+    failed_memo: set[str] = set()
+    scan_budget: list[int] = [_MAX_FAILED_URI_SCANS]
+    resolved_memo: dict[str, str] = {}
+    scan_clock: list[float] = [0.0]
 
     for idx, finding in enumerate(findings):
         uri = finding.get("file") or ""
@@ -335,18 +572,28 @@ def normalize_imported_findings(
             result.warnings.append(ImportWarning(
                 idx, "file/startLine",
                 f"Skipped: missing or invalid file/startLine "
-                f"(rule_id={finding.get('rule_id')})",
+                f"(rule_id={escape_nonprintable(str(finding.get('rule_id')))})",
             ))
             result.stats.findings_skipped += 1
             continue
         finding["startLine"] = start_line
 
         # --- URI rebasing ---
-        resolved = _resolve_uri(uri, source_root, file_index, depth_cache)
+        resolved = _resolve_uri(
+            uri, source_root, file_index, depth_cache,
+            failed_memo=failed_memo, scan_budget=scan_budget,
+            resolved_memo=resolved_memo, scan_clock=scan_clock,
+        )
         if resolved is None:
             result.warnings.append(ImportWarning(
                 idx, "file",
-                f"Skipped: cannot map URI to source: {uri}",
+                # Imported SARIF is untrusted; the message is printed
+                # to the operator terminal by the /agentic import
+                # summary, so hostile URI bytes are escaped at
+                # creation (sibling parser.py escapes the identical
+                # warning).
+                f"Skipped: cannot map URI to source: "
+                f"{escape_nonprintable(uri)}",
             ))
             result.stats.findings_skipped += 1
             result.stats.uri_unresolved += 1
@@ -420,7 +667,11 @@ def format_import_summary(result: ImportResult, sarif_files: list[str]) -> str:
     if s.findings_skipped:
         unmapped = [w for w in result.warnings if w.field == "file"]
         if unmapped:
-            examples = "; ".join(w.message.split(": ", 1)[-1] for w in unmapped[:3])
+            # Belt for records built before message-side escaping.
+            examples = "; ".join(
+                escape_nonprintable(w.message.split(": ", 1)[-1])
+                for w in unmapped[:3]
+            )
             lines.append(f"  → {s.findings_skipped} findings skipped ({examples})")
         else:
             lines.append(f"  → {s.findings_skipped} findings skipped")
@@ -547,17 +798,12 @@ def findings_to_sarif(findings: list[dict[str, Any]]) -> dict[str, Any]:
         if f.get("snippet"):
             region["snippet"] = {"text": f["snippet"]}
 
-        result: dict[str, Any] = {
-            "ruleId": rule_id,
-            "level": f.get("level") or "warning",
-            "message": {"text": f.get("message") or ""},
-            "locations": [{
-                "physicalLocation": {
-                    "artifactLocation": {"uri": f.get("file") or ""},
-                    "region": region,
-                }
-            }],
-        }
+        result: dict[str, Any] = emit.result(
+            rule_id,
+            f.get("message") or "",
+            [emit.location(f.get("file") or "", region)],
+            level=f.get("level") or "warning",
+        )
 
         if f.get("has_dataflow") and f.get("dataflow_path"):
             code_flows = _dataflow_to_codeflows(f["dataflow_path"])
@@ -582,23 +828,16 @@ def findings_to_sarif(findings: list[dict[str, Any]]) -> dict[str, Any]:
                 rule_entry["properties"] = {"cwe": [cwe]}
             rules_by_tool[tool][rule_id] = rule_entry
 
-    sarif: dict[str, Any] = {
-        "version": "2.1.0",
-        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
-        "runs": [],
-    }
-    for tool_name, results in runs_by_tool.items():
-        sarif["runs"].append({
-            "tool": {
-                "driver": {
-                    "name": tool_name,
-                    "rules": list(rules_by_tool[tool_name].values()),
-                }
-            },
-            "results": results,
-        })
-
-    return sarif
+    return emit.document(
+        [
+            emit.run(
+                tool_name, list(rules_by_tool[tool_name].values()), results,
+            )
+            for tool_name, results in runs_by_tool.items()
+        ],
+        schema_uri=emit.SCHEMA_URI_SCHEMASTORE,
+        version_first=True,
+    )
 
 
 def import_provenance_block(

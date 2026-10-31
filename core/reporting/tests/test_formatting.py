@@ -137,6 +137,143 @@ class TestGetDisplayStatus(unittest.TestCase):
             {"is_true_positive": True, "is_exploitable": False, "ruling": "test_code"}
         ), "Confirmed")
 
+    def test_agentic_true_positive_unreachable_is_not_confirmed(self):
+        self.assertEqual(get_display_status({
+            "is_true_positive": True,
+            "is_exploitable": False,
+            "ruling": "unreachable",
+        }), "Unreachable")
+
+    def test_true_positive_with_ruled_out_ruling_renders_ruled_out(self):
+        # A real bug whose Stage-D security ruling rules it out (D-4
+        # no security impact, D-2 unreachable) must not render as
+        # Confirmed — the ruling decides the display status.
+        self.assertEqual(get_display_status({
+            "is_true_positive": True,
+            "ruling": {"status": "ruled_out", "disqualifier": "D-4",
+                       "reason": "real bug, no security impact"},
+        }), "Ruled Out")
+
+    def test_true_positive_with_blocked_final_status(self):
+        self.assertEqual(get_display_status({
+            "is_true_positive": True,
+            "is_exploitable": False,
+            "final_status": "confirmed_blocked",
+        }), "Confirmed (Blocked)")
+
+    def test_true_positive_with_confirmed_ruling_stays_confirmed(self):
+        self.assertEqual(get_display_status({
+            "is_true_positive": True,
+            "ruling": {"status": "confirmed"},
+        }), "Confirmed")
+
+    def test_true_positive_provenance_dict_ruling_keeps_boolean(self):
+        # The agentic→validate bridge wraps string rulings into dicts;
+        # a provenance status (test_code / dead_code / validated) is
+        # not a security ruling and still defers to the boolean
+        # verdict fields.
+        self.assertEqual(get_display_status({
+            "is_true_positive": True,
+            "ruling": {"status": "test_code",
+                       "agentic_ruling": "test_code"},
+        }), "Confirmed")
+
+    def test_false_positive_boolean_still_wins_over_ruling(self):
+        self.assertEqual(get_display_status({
+            "is_true_positive": False,
+            "ruling": {"status": "confirmed"},
+        }), "False Positive")
+
+    def test_true_positive_with_top_level_disproven_renders_ruled_out(self):
+        # IRIS Tier-1 refutation sets top-level status only (no ruling
+        # object); an agentic-imported is_true_positive=True must not
+        # override the refutation.
+        self.assertEqual(get_display_status({
+            "is_true_positive": True,
+            "status": "disproven",
+        }), "Ruled Out")
+
+    def test_true_positive_with_disproven_dict_ruling_renders_ruled_out(self):
+        self.assertEqual(get_display_status({
+            "is_true_positive": True,
+            "ruling": {"status": "disproven"},
+        }), "Ruled Out")
+
+
+class TestRuledOutUnverifiedDisplay(unittest.TestCase):
+    """ruled_out_unverified is the quarantine tier for rule-outs that
+    carry no mechanical refutation receipt. The title-case fallback
+    would render it "Ruled Out Unverified", which the counting code's
+    exact "Ruled Out" match misses — it needs the same explicit
+    parenthesised treatment as confirmed_unverified."""
+
+    def test_ruling_status_renders_parenthesised(self):
+        self.assertEqual(get_display_status({
+            "ruling": {"status": "ruled_out_unverified",
+                       "disqualifier": "D-2"},
+        }), "Ruled Out (Unverified)")
+
+    def test_top_level_status_renders_parenthesised(self):
+        self.assertEqual(get_display_status(
+            {"status": "ruled_out_unverified"}), "Ruled Out (Unverified)")
+
+    def test_final_status_renders_parenthesised(self):
+        self.assertEqual(get_display_status(
+            {"final_status": "ruled_out_unverified"}), "Ruled Out (Unverified)")
+
+    def test_outranks_bare_true_positive_boolean(self):
+        # Same doctrine as ruled_out: a security ruling (even the
+        # unverified tier) decides display over the bare
+        # is_true_positive stand-in.
+        self.assertEqual(get_display_status({
+            "is_true_positive": True,
+            "ruling": {"status": "ruled_out_unverified"},
+        }), "Ruled Out (Unverified)")
+
+
+class TestDisplayVocabularyClosure(unittest.TestCase):
+    """The title-case fallback for unknown statuses is an open channel
+    into the counting vocabulary: "EXPLOITABLE" misses every exact
+    status_map key, title-cases to "Exploitable", and counts as a full
+    exploitable verdict without any pipeline stage having issued one.
+    Unknown statuses may still render as prose, but never as (or
+    prefixed by) verdict vocabulary."""
+
+    def test_all_caps_status_never_renders_exploitable(self):
+        self.assertEqual(get_display_status({"status": "EXPLOITABLE"}),
+                         "Unknown")
+
+    def test_all_caps_final_status_never_renders_exploitable(self):
+        self.assertEqual(
+            get_display_status({"final_status": "EXPLOITABLE"}), "Unknown")
+
+    def test_title_case_ruling_never_renders_ruled_out(self):
+        self.assertEqual(get_display_status(
+            {"ruling": {"status": "Ruled Out"}}), "Unknown")
+
+    def test_confirmed_prefix_never_counts(self):
+        # build_findings_summary buckets startswith("Confirmed") into
+        # confirmed_unrestricted — the fallback must not mint that
+        # prefix from an unknown status.
+        self.assertEqual(get_display_status({"status": "confirmed maybe"}),
+                         "Unknown")
+
+    def test_error_prefix_never_counts(self):
+        self.assertEqual(get_display_status({"status": "error_ish"}),
+                         "Unknown")
+
+    def test_disproven_variant_never_renders(self):
+        self.assertEqual(get_display_status({"status": "DISPROVEN"}),
+                         "Unknown")
+
+    def test_non_verdict_unknown_status_still_renders(self):
+        # The open fallback stays open for genuinely new NON-verdict
+        # statuses — producers aren't blocked on a table update.
+        self.assertEqual(get_display_status({"status": "pending"}),
+                         "Pending")
+        self.assertEqual(get_display_status({"status": "needs_rebuild"}),
+                         "Needs Rebuild")
+
 
 class TestTitleCaseType(unittest.TestCase):
 
@@ -170,6 +307,21 @@ class TestTruncatePath(unittest.TestCase):
         result = truncate_path("/very/long/path/to/some/deeply/nested/file.py")
         self.assertTrue(result.startswith("..."))
         self.assertEqual(len(result), 40)
+
+    def test_zero_width_flood_bounded(self):
+        # Combining marks report zero display width, so the
+        # width-based walk alone kept a flooded path essentially
+        # whole (thousands of code points into a 40-column slot).
+        # The code-point ceiling must cut it.
+        flooded = "src/" + "à" + "̀" * 5000 + ".c"
+        result = truncate_path(flooded, max_len=40)
+        self.assertLessEqual(len(result), 4 * 40 + 8 + 3)
+
+    def test_non_ascii_within_budget_unchanged(self):
+        # Keep-direction: ordinary non-ASCII paths under both the
+        # display-width and code-point budgets pass through whole.
+        path = "src/héllo/wörld.c"
+        self.assertEqual(truncate_path(path, max_len=40), path)
 
 
 class TestFormatElapsed(unittest.TestCase):

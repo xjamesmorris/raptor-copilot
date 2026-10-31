@@ -14,6 +14,7 @@ suppress allowlist.  Resolved constants feed INTO the proof chain
 from __future__ import annotations
 
 import ast
+import bisect
 import logging
 import operator
 import re
@@ -22,12 +23,13 @@ from dataclasses import dataclass, field
 
 from core.inventory.macro_resolve import (
     _C_EXTENSIONS,
-    _ENUM_BLOCK_RE,
     _ENUMERATOR_NAME_RE,
     _MACRO_DEF_RE,
     _SKIP_IDENTS_C,
+    _iter_enum_bodies,
     _parse_enumerator_value,
 )
+from core.source.lines import split_lines
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -35,8 +37,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_IF_RE = re.compile(r"^\s*#\s*(?:if|ifdef|ifndef)\b", re.MULTILINE)
-_ENDIF_RE = re.compile(r"^\s*#\s*endif\b", re.MULTILINE)
+# Horizontal-only indent — the MULTILINE ^\s* idiom is quadratic
+# on blank-line runs (identical match set per line).
+_IF_RE = re.compile(r"^[^\S\n]*#\s*(?:if|ifdef|ifndef)\b", re.MULTILINE)
+_ENDIF_RE = re.compile(r"^[^\S\n]*#\s*endif\b", re.MULTILINE)
 
 _IDENT_RE = re.compile(r"[a-zA-Z_]")
 _SAFE_ARITH_RE = re.compile(
@@ -51,6 +55,11 @@ _MAX_BODY_LEN = 512
 _MAX_LITERAL_MAGNITUDE = 1 << 64
 _MAX_SHIFT_BITS = 256
 _MAX_RESULT_MAGNITUDE = 1 << 128
+
+# House target-source read budget (matches
+# core/audit/context._MAX_SOURCE_FILE_BYTES): anything past it is a
+# planted blob whose only effect is memory exhaustion.
+_MAX_SOURCE_FILE_BYTES = 64 * 1024 * 1024
 
 _ARITH_BINOPS: dict[type[ast.operator], object] = {
     ast.Add: operator.add,
@@ -193,10 +202,31 @@ def _scan_definitions(target_path: Path) -> dict[str, list[_RawDefinition]]:
         return defs
 
     for p in paths:
-        try:
-            text = p.read_text(errors="replace", encoding="utf-8")
-        except OSError:
+        # House-capped read (64 MiB budget, cap+1 probe): every
+        # C/C++ file in the tree is read here on the default prep
+        # path — a planted blob must be refused, not buffered.
+        from core.source import read_bytes_capped
+
+        got = read_bytes_capped(p, _MAX_SOURCE_FILE_BYTES)
+        if got is None:
             continue
+        raw, truncated = got
+        if truncated:
+            logger.warning(
+                "constant scan: %s exceeds the %d MiB source cap — "
+                "skipped", p, _MAX_SOURCE_FILE_BYTES // (1024 * 1024),
+            )
+            continue
+        raw_text = raw.decode("utf-8", errors="replace")
+        # Comments and string literals are blanked (offsets and
+        # newlines preserved) BEFORE matching: a #define living only
+        # in a comment otherwise resolved as a "provably-unique"
+        # constant and fed SMT guard-equivalence with a value the
+        # compiler never saw. The whole module previously ran its
+        # regexes on raw text.
+        from .source_view import sanitized_view
+
+        text = sanitized_view(raw_text, str(p))
 
         text_joined = text.replace("\\\n", " ")
         cond_depth = _compute_conditional_depths(text)
@@ -214,23 +244,34 @@ def _scan_definitions(target_path: Path) -> dict[str, list[_RawDefinition]]:
             _cont_offsets.append(_idx)
             _search_pos = _idx + 2
 
+        # Both mappings are precomputed once per file and bisected per
+        # match. The previous per-match prefix rescan
+        # (text[:orig_pos].count("\n")) made definition mapping
+        # O(file_size × definitions) — quadratic, minutes-scale on
+        # honest 80k-define generated headers (SDK register maps,
+        # unicode tables) and trivially triggerable by a hostile
+        # repo, uninterruptible by the prepass budget which is
+        # checked before the scan, not during.
+        #
+        # The k-th removed continuation (2-char "\\\n" → 1-char " ")
+        # sits at joined-text offset `off_k - k`; the count of those
+        # at or before joined_pos is the shift back to the original
+        # offset. Original line-start offsets then give the 1-based
+        # line by bisection (in-unit exemplar: api_boundary
+        # line_starts).
+        _joined_cont_offsets = [
+            off - k for k, off in enumerate(_cont_offsets)
+        ]
+        _line_starts = [0]
+        _nl = text.find("\n")
+        while _nl >= 0:
+            _line_starts.append(_nl + 1)
+            _nl = text.find("\n", _nl + 1)
+
         def _original_line(joined_pos: int) -> int:
             """Map a position in text_joined to a 1-based line in text."""
-            # Each continuation before joined_pos added one extra newline
-            # that is absent in text_joined.
-            extra = 0
-            orig_pos = joined_pos
-            for off in _cont_offsets:  # noqa: B023 — closure used only within this file's iteration
-                # In the joined text the continuation at original offset
-                # `off` becomes offset `off - extra` (each prior removal
-                # shifted by 1). If joined_pos is past that point, the
-                # original position is one further ahead.
-                if off - extra <= joined_pos:
-                    extra += 1
-                    orig_pos += 1
-                else:
-                    break
-            return text[:orig_pos].count("\n") + 1  # noqa: B023 — closure used only within this file's iteration
+            extra = bisect.bisect_right(_joined_cont_offsets, joined_pos)  # noqa: B023 — closure used only within this file's iteration
+            return bisect.bisect_right(_line_starts, joined_pos + extra)  # noqa: B023 — closure used only within this file's iteration
 
         rel = str(p.relative_to(target_path)) if p.is_relative_to(target_path) else str(p)
 
@@ -248,10 +289,9 @@ def _scan_definitions(target_path: Path) -> dict[str, list[_RawDefinition]]:
                 _RawDefinition(name, params, body, rel, line, depth)
             )
 
-        for em in _ENUM_BLOCK_RE.finditer(text_joined):
-            block_line = _original_line(em.start())
+        for block_start, body in _iter_enum_bodies(text_joined):
+            block_line = _original_line(block_start)
             block_depth = cond_depth.get(block_line, 0)
-            body = em.group(1)
             for ev in _ENUMERATOR_NAME_RE.finditer(body):
                 ename = ev.group(1).strip()
                 evalue = _parse_enumerator_value(body, ev.end())
@@ -275,7 +315,7 @@ def _compute_conditional_depths(text: str) -> dict[int, int]:
     """
     depths: dict[int, int] = {}
     depth = 0
-    for i, raw_line in enumerate(text.splitlines(), 1):
+    for i, raw_line in enumerate(split_lines(text), 1):
         stripped = raw_line.lstrip()
         if stripped.startswith("#"):
             if _IF_RE.match(raw_line):

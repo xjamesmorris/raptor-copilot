@@ -69,6 +69,8 @@ import shlex
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..parsers import _safe_read
+
 logger = logging.getLogger(__name__)
 
 
@@ -102,6 +104,18 @@ _COMPOUND_RE = re.compile(r"(?:&&|\|\||\||;|&(?!\&))")
 # Strip these prefixes from a token before treating it as a path —
 # they're shell idioms for "this path, here, now".
 _PATH_PREFIXES_TO_STRIP: tuple = ("./", "$PWD/", "${PWD}/", "$(pwd)/")
+
+# Input bound for :func:`resolve_intree_targets`. Its callers pass
+# hook BODIES that can be as large as the manifest read bound
+# (megabytes) — compound splitting + shlex over an unbounded body is
+# linear but with a constant large enough that a planted
+# multi-megabyte scripts string dominates the scan stage. Real hook
+# bodies referencing in-tree files are tiny; content beyond the
+# bound is ignored for INTREE-EVIDENCE purposes only (the evidence
+# can only PROMOTE a finding — the hook analysis itself scans the
+# full body elsewhere), cut at a whitespace boundary so a token is
+# never half-read.
+_MAX_RESOLVE_BODY_BYTES = 256 * 1024
 
 
 @dataclass(frozen=True)
@@ -182,10 +196,8 @@ def _safe_resolve_intree(
 def _classify_first_bytes(path: Path) -> str:
     """Return ``binary``, ``script``, ``source``, or ``unknown`` based
     on the first 256 bytes of ``path``."""
-    try:
-        with Path(path).open("rb") as f:
-            head = f.read(256)
-    except OSError:
+    head = _safe_read.read_head_bytes(Path(path), max_bytes=256)
+    if head is None:
         return "unknown"
     if not head:
         return "source"          # empty file — uninteresting
@@ -202,7 +214,14 @@ def _classify_first_bytes(path: Path) -> str:
     try:
         head.decode("utf-8")
         return "source"
-    except UnicodeDecodeError:
+    except UnicodeDecodeError as e:
+        # The fixed-size head read can split a multibyte UTF-8
+        # character at the boundary — an invalid sequence STARTING
+        # in the last 3 bytes is truncation, not binary content
+        # (misclassifying it as binary minted a false
+        # ``intree_has_binary`` promotion on plain text).
+        if e.start >= len(head) - 3:
+            return "source"
         return "binary"
 
 
@@ -219,6 +238,11 @@ def resolve_intree_targets(
     Defensive against shell quoting, compound commands, path
     traversal, symlinks; see module docstring.
     """
+    if len(body) > _MAX_RESOLVE_BODY_BYTES:
+        cut = body.rfind("\n", 0, _MAX_RESOLVE_BODY_BYTES)
+        if cut <= 0:
+            cut = _MAX_RESOLVE_BODY_BYTES
+        body = body[:cut]
     seen: set = set()
     out: list[IntreeTarget] = []
     for sub in _split_compound(body):

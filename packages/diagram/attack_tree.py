@@ -17,7 +17,12 @@ from __future__ import annotations
 from typing import Any, TYPE_CHECKING
 
 from core.json import load_json
+from .caps import DEFAULT_CAP, cap_elements, truncation_marker_lines
 from .sanitize import sanitize as _sanitize, sanitize_id as _sid
+
+# Shared flow_trace rationale (see packages.diagram.caps): tree nodes
+# come from an LLM-written artifact with no upstream bound.
+_MAX_NODES = DEFAULT_CAP
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -49,6 +54,8 @@ def _build_proximity_index(attack_paths: list[dict]) -> dict[str, int]:
     """
     index: dict[str, int] = {}
     for path in attack_paths:
+        if not isinstance(path, dict):
+            continue  # malformed companion element — drop, keep the rest
         fid = path.get("finding") or path.get("finding_id", "")
         score = path.get("proximity", 0)
         try:
@@ -66,6 +73,8 @@ def _build_disproven_index(disproven_list: list[dict]) -> dict[str, str]:
     """Return finding_id → why_wrong (first entry wins)."""
     index: dict[str, str] = {}
     for entry in disproven_list:
+        if not isinstance(entry, dict):
+            continue  # malformed companion element — drop, keep the rest
         fid = entry.get("finding", "")
         if fid:
             fid = _sid(str(fid))  # match sanitized node ids (see above)
@@ -79,11 +88,15 @@ def _build_hypothesis_index(hypotheses: list[dict]) -> dict[str, str]:
     """Return finding_id → hypothesis status summary."""
     index: dict[str, str] = {}
     for h in hypotheses:
+        if not isinstance(h, dict):
+            continue  # malformed companion element — drop, keep the rest
         fid = h.get("finding") or h.get("finding_id", "")
         if fid:
             fid = _sid(str(fid))  # match sanitized node ids (see above)
         status = _sanitize(h.get("status", ""))
-        claim = h.get("claim") or h.get("hypothesis", "")
+        # str-coerce BEFORE slicing: a dict claim raised KeyError on
+        # the slice and lost the whole Attack Tree section.
+        claim = str(h.get("claim") or h.get("hypothesis", "") or "")
         if fid and fid not in index:
             index[fid] = f"{status}: {_sanitize(claim[:60])}" if claim else status
     return index
@@ -102,7 +115,7 @@ def _node_label(node: dict, proximity_idx: dict, disproven_idx: dict) -> str:
     if status == "confirmed" and nid in proximity_idx:
         score = proximity_idx[nid]
         desc = _proximity_desc(score)
-        parts.append(f"proximity {score}/10,{desc}" if desc else f"proximity {score}/10")
+        parts.append(f"proximity {score}/10 — {desc}" if desc else f"proximity {score}/10")
 
     # Why-wrong annotation on disproven nodes
     if status == "disproven" and nid in disproven_idx:
@@ -184,7 +197,7 @@ def _find_subgraph_groups(
         if desc:
             groups[child] = desc
         else:
-            # Leaf child,keep ungrouped by putting it in its own single-item group
+            # Leaf child — keep ungrouped by putting it in its own single-item group
             groups[child] = []
 
     return groups if len(groups) >= 2 else None
@@ -198,6 +211,12 @@ def generate(
 ) -> str:
     root_id = _sid(data.get("root", "ROOT"))
     raw_nodes: list[dict] = data.get("nodes", [])
+    if not isinstance(raw_nodes, list):
+        raw_nodes = []
+    # flow_trace's ingestion idiom: malformed elements drop, the rest
+    # still renders (dict(n) below raised on a non-dict node and lost
+    # the whole section).
+    raw_nodes = [n for n in raw_nodes if isinstance(n, dict)]
 
     if not raw_nodes:
         return 'flowchart TD\n    EMPTY["No attack tree nodes"]'
@@ -222,6 +241,7 @@ def generate(
     # Shallow-copy each node before assigning the sanitized id, so
     # the caller's dict is untouched. The new list still references
     # the same shape information, just with id rewritten on a copy.
+    raw_nodes, dropped_nodes = cap_elements(raw_nodes, _MAX_NODES)
     nodes = [dict(n) for n in raw_nodes]
     for n in nodes:
         n["id"] = _sid(n.get("id", "?"))
@@ -254,7 +274,7 @@ def generate(
             prox_suffix = ""
             if group_id in proximity_idx:
                 score = proximity_idx[group_id]
-                prox_suffix = f",proximity {score}/10"
+                prox_suffix = f" — proximity {score}/10"
             hyp_suffix = ""
             if group_id in hyp_idx:
                 hyp_suffix = f",{hyp_idx[group_id]}"
@@ -379,6 +399,9 @@ def generate(
             "    %% note: companion finding ids matched no tree node id"
             " — proximity/ruled-out annotations not shown"
         )
+
+    lines.extend(truncation_marker_lines(
+        "TRUNC", dropped_nodes, "nodes", _MAX_NODES))
 
     return "\n".join(lines)
 

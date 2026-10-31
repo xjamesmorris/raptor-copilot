@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json as _json
 import logging
+import re
 from collections.abc import Iterable, Sequence
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
@@ -34,9 +35,17 @@ from pathlib import Path
 from typing import Any
 
 from core.cve import EpssClient, KevClient
-from core.cve.vulnrichment import VulnrichmentClient
+from core.cve.vulnrichment import SSVCDecision, VulnrichmentClient
 
 from ._atomic import atomic_write_text
+from .kinds import (
+    HYGIENE_PREFIX,
+    LICENSE_PREFIX,
+    SCAN_HEALTH_PREFIX,
+    SUPPLY_CHAIN_PREFIX,
+    VULN_ID_PREFIX,
+    VULNERABLE_DEPENDENCY,
+)
 from .models import (
     Advisory,
     Confidence,
@@ -46,9 +55,10 @@ from .models import (
     Severity,
     SupplyChainFinding,
     VulnFinding,
+    cve_ids,
 )
 from .osv import OsvResult
-from .versions import VersionError
+from .versions import VersionError, _canonical_ecosystem
 from .versions import compare as version_compare
 
 logger = logging.getLogger(__name__)
@@ -71,6 +81,24 @@ _DEFAULT_REACHABILITY = Reachability(
 # bounded navigational sample (deterministic: group order).
 _MAX_RELATED_FINDINGS = 25
 
+# Per-scan cap on UNCACHED Vulnrichment SSVC fetches (cache hits are
+# free and never count — repeat scans progressively warm past the
+# line). Trade-off, both directions:
+#   * Higher: more SSVC coverage per cold scan on container-image
+#     targets (10^4+ distro CVE findings), at the cost of wall-clock
+#     and load on raw.githubusercontent.com — each uncached CVE is
+#     one ~50 ms GET, so 1000 across the 8-worker pool is ~10 s cold.
+#   * Lower: faster cold scans, but the SSVC signal degrades to
+#     no-signal on exactly the large scans where per-CVE triage help
+#     matters most, and cache warm-up across runs takes more scans.
+# 1000 keeps non-container scans (typically well under a thousand
+# unique CVEs) fully enriched while bounding a 40k-CVE distro scan's
+# cold cost to seconds instead of hours.
+_SSVC_FETCH_BUDGET = 1000
+# Same worker count as the license-enrichment / registry-metadata
+# scan-wide passes — HTTP-bound, independent GETs.
+_SSVC_FETCH_WORKERS = 8
+
 
 # ---------------------------------------------------------------------------
 # Building VulnFindings
@@ -83,6 +111,8 @@ def build_vuln_findings(
     epss: EpssClient | None = None,
     reachability: dict[str, Reachability] | None = None,
     vulnrichment: VulnrichmentClient | None = None,
+    *,
+    ssvc_fetch_budget: int | None = _SSVC_FETCH_BUDGET,
 ) -> list[VulnFinding]:
     """Combine signal layers into one ``VulnFinding`` per (dep, advisory).
 
@@ -98,6 +128,20 @@ def build_vuln_findings(
             the cold-start eco gap (Cargo / NuGet / Packagist) where
             KEV / EPSS / EDB / MSF / PoC return nothing for the
             majority of advisories. ``None`` skips the SSVC layer.
+        ssvc_fetch_budget: per-scan cap on UNCACHED Vulnrichment
+            fetches (see ``_SSVC_FETCH_BUDGET``); ``None`` = unbounded.
+
+    EPSS and SSVC are fetched in ONE scan-wide pre-pass over the
+    unique CVE ids and only then joined per finding. Container-image
+    scans carry 10^4+ distro CVE findings, each with a CVE-shaped id
+    — fetching inside the per-finding assembly loop issued one EPSS
+    request per finding (the client's 100-id batching never engaged
+    across findings) plus one raw.githubusercontent.com GET per
+    uncached CVE, serially: hours of HTTPS round-trips on a cold
+    cache, and a hammering of two external services. The pre-pass
+    costs ceil(unique/100) EPSS requests and at most
+    ``ssvc_fetch_budget`` parallel Vulnrichment GETs, with identical
+    enrichment data on every finding that gets enriched.
     """
     out: list[VulnFinding] = []
 
@@ -117,6 +161,15 @@ def build_vuln_findings(
     # positive class.  Re-validate API-returned advisories here so
     # both the offline-DB and live-API paths get the same result.
     deduped_results = _filter_fork_tag_false_positives(deps, deduped_results)
+
+    # Scan-wide enrichment pre-pass (post-filter, so dropped groups
+    # cost nothing): collect the unique CVE ids once, fetch EPSS in
+    # batched calls and SSVC on a budgeted parallel pool, then let the
+    # per-finding assembly below join against the in-memory maps.
+    epss_scores, ssvc_map = _prefetch_enrichment(
+        deps, deduped_results, kev=kev, epss=epss,
+        vulnrichment=vulnrichment, ssvc_fetch_budget=ssvc_fetch_budget,
+    )
 
     # First pass: compute related-finding IDs per dep so each finding can
     # carry the cross-references in one shot.
@@ -154,11 +207,114 @@ def build_vuln_findings(
                 this_id=this_id,
                 related_ids=related,
                 kev=kev,
-                epss=epss,
+                epss_scores=epss_scores,
                 reachability=reachability,
-                vulnrichment=vulnrichment,
+                ssvc=ssvc_map,
             ))
     return out
+
+
+def _group_cve_union(group: list[Advisory]) -> list[str]:
+    """Union of CVE-shaped ids across an alias-merged advisory group,
+    first-seen order. The alias-graph grouping merges members whose
+    CVE sets intersect without being identical, so the union (not the
+    representative's own list) is what keeps KEV / EPSS / SSVC
+    enrichment complete. ``cve_ids`` folds in each member's PRIMARY id
+    too — OSV serves CVE-primary records with no self-alias (distro
+    secdb / kernel-CNA), and keying enrichment off aliases alone
+    rendered those ``in_kev=false`` while the exploit-evidence
+    annotation on the same finding (which does read ``osv_id``) said
+    KEV-listed.
+    """
+    union: list[str] = []
+    for a in group:
+        for alias in cve_ids(a):
+            if alias not in union:
+                union.append(alias)
+    return union
+
+
+def _prefetch_enrichment(
+    deps: Sequence[Dependency],
+    deduped_results: dict[str, list[list[Advisory]]],
+    *,
+    kev: KevClient | None,
+    epss: EpssClient | None,
+    vulnrichment: VulnrichmentClient | None,
+    ssvc_fetch_budget: int | None,
+) -> tuple[dict[str, float], dict[str, SSVCDecision]]:
+    """One scan-wide fetch pass over the unique CVE ids.
+
+    Returns ``(epss_scores, ssvc_decisions)`` keyed by CVE id; absent
+    keys mean "no signal" and the per-finding join degrades to the
+    same ``None`` the per-finding fetch produced on a miss.
+
+    EPSS goes through ``EpssClient.scores`` once, so its within-call
+    100-id batching finally engages across findings (a finding carries
+    1-2 CVEs — per-finding calls made every request a singleton).
+
+    SSVC fetches are budget-capped, so the CVE order handed to
+    ``lookup_many`` decides who gets enriched on a cold cache.
+    Priority follows the signal's consumer (``packages/sca/risk.py``
+    applies the SSVC tier only when ``not finding.in_kev`` — for
+    KEV-listed findings the KEV multiplier already dominates and the
+    decision is display-only):
+
+      1. CVEs seen on at least one non-KEV-listed advisory group —
+         where SSVC can change the risk verdict — before KEV-only
+         CVEs. KEV membership comes from the budget-independent KEV
+         catalog, so this band split is not steerable by advisory
+         content, and "skipping" a KEV CVE hides nothing: ``in_kev``
+         is computed regardless.
+      2. Within a band: highest group-maximum severity first. The
+         group combine is conservative (a crafted advisory can only
+         RAISE its own group's severity, promoting scrutiny of its
+         own CVEs — it cannot demote a victim group).
+      3. Tie-breaks: higher EPSS first (external FIRST.org signal),
+         then lexicographic CVE id for determinism.
+    """
+    unique_cves: list[str] = []
+    # cve -> (kev_band, severity_rank); band 0 = seen on a non-KEV
+    # group, band 1 = KEV-listed groups only.
+    priority: dict[str, tuple[int, int]] = {}
+    for d in deps:
+        for group in deduped_results.get(d.key()) or []:
+            cves = _group_cve_union(group)
+            if not cves:
+                continue
+            sev = max(
+                _SEVERITY_RANK[_severity_for_advisory(a)] for a in group
+            )
+            band = 1 if (kev and any(kev.contains(c) for c in cves)) else 0
+            for c in cves:
+                known = priority.get(c)
+                if known is None:
+                    unique_cves.append(c)
+                    priority[c] = (band, sev)
+                else:
+                    priority[c] = (min(known[0], band), max(known[1], sev))
+
+    epss_scores: dict[str, float] = {}
+    if epss and unique_cves:
+        epss_scores = epss.scores(unique_cves)
+
+    ssvc_map: dict[str, SSVCDecision] = {}
+    if vulnrichment is not None and unique_cves:
+        ordered = sorted(
+            unique_cves,
+            key=lambda c: (
+                priority[c][0],
+                -priority[c][1],
+                -epss_scores.get(c, 0.0),
+                c,
+            ),
+        )
+        ssvc_map = vulnrichment.lookup_many(
+            ordered,
+            fetch_budget=ssvc_fetch_budget,
+            max_workers=_SSVC_FETCH_WORKERS,
+        )
+    return epss_scores, ssvc_map
 
 
 def _filter_fork_tag_false_positives(
@@ -192,28 +348,16 @@ def _filter_fork_tag_false_positives(
     return out
 
 
-# Upstream branch / channel names that show up as prerelease tokens on
-# branch-snapshot builds of the SAME project (``1.0.0-master``). These
-# are NOT fork indicators: a branch snapshot builds the upstream
-# codebase, so a server-confirmed vulnerability match must stay
-# reported. Only genuine org/fork tags (``0.4.3-succinct``,
-# ``1.0.0-fork.mycorp``) qualify for the false-positive prune below.
-_UPSTREAM_BRANCH_TOKENS = frozenset({
-    "master", "main", "trunk", "head", "default",
-    "develop", "development", "staging",
-    "stable", "latest", "release",
-})
-
-
 def _version_has_fork_tag(version: str | None) -> bool:
     """Strict fork-tag classification for the post-filter.
 
     True only when *version* carries a semver prerelease whose tokens
-    are an org/fork tag (per ``is_fork_tag``) AND none of them is a
-    known upstream branch/channel name. Without the branch check, any
-    digit-free prerelease qualified — so a vulnerable ``1.0.0-master``
-    pin (an upstream branch snapshot, not a fork) was silently pruned
-    even though the server confirmed the match.
+    are an org/fork tag per ``is_fork_tag`` — which itself excludes
+    known upstream branch/channel names (``UPSTREAM_BRANCH_TOKENS``):
+    a vulnerable ``1.0.0-master`` pin is an upstream branch snapshot,
+    not a fork, and must never be pruned. The token set lives in
+    ``versions.semver`` so the offline ``in_range`` path shares the
+    identical guard.
     """
     if not version:
         return False
@@ -224,8 +368,6 @@ def _version_has_fork_tag(version: str | None) -> bool:
     except ValueError:
         return False
     if not pre:
-        return False
-    if any(token.lower() in _UPSTREAM_BRANCH_TOKENS for token in pre):
         return False
     return is_fork_tag(pre)
 
@@ -401,9 +543,9 @@ def _assemble_finding(
     this_id: str,
     related_ids: list[str],
     kev: KevClient | None,
-    epss: EpssClient | None,
+    epss_scores: dict[str, float],
     reachability: dict[str, Reachability] | None,
-    vulnrichment: VulnrichmentClient | None = None,
+    ssvc: dict[str, SSVCDecision],
 ) -> VulnFinding:
     """Assemble one finding from an alias-merged advisory ``group``.
 
@@ -415,30 +557,27 @@ def _assemble_finding(
     smallest-applicable fix. A crafted advisory sharing a real CVE
     alias can therefore add scrutiny but never defang the genuine
     record's severity, fix version, or summary.
+
+    ``epss_scores`` and ``ssvc`` are the scan-wide prefetched maps
+    from ``_prefetch_enrichment`` — assembly never fetches; a CVE
+    absent from a map is "no signal" for that layer.
     """
-    # Union of CVE aliases across the group, first-seen order. The
-    # alias-graph grouping merges members whose CVE sets intersect
-    # without being identical, so the union (not the representative's
-    # own list) is what keeps KEV / EPSS / SSVC enrichment complete.
-    cve_aliases: list[str] = []
-    for a in group:
-        for alias in a.aliases:
-            if alias.upper().startswith("CVE-") and alias not in cve_aliases:
-                cve_aliases.append(alias)
+    cve_aliases = _group_cve_union(group)
     in_kev = bool(kev and any(kev.contains(c) for c in cve_aliases))
     epss_score: float | None = None
-    if epss and cve_aliases:
-        scores = epss.scores(cve_aliases)
-        if scores:
-            epss_score = max(scores.values())
+    finding_scores = [
+        epss_scores[c] for c in cve_aliases if c in epss_scores
+    ]
+    if finding_scores:
+        epss_score = max(finding_scores)
     # CISA Vulnrichment SSVC — broadest cross-eco exploitation
     # signal, covering the ~60% of cold-start eco CVEs (Cargo /
     # NuGet / Packagist) that KEV / EPSS / EDB / MSF / PoC skip.
     # Pick the strongest signal across the advisory's CVE aliases:
     # ``active`` > ``poc`` > ``none``. Any miss (CISA hasn't
-    # enriched, or no CVE aliases at all) leaves
-    # ``ssvc_exploitation`` as ``None`` so the risk formula's
-    # "no signal" branch fires.
+    # enriched, over the scan's fetch budget, or no CVE aliases at
+    # all) leaves ``ssvc_exploitation`` as ``None`` so the risk
+    # formula's "no signal" branch fires.
     #
     # ``Automatable`` is captured independently. ``yes`` from
     # ANY alias attributes to the finding — a CVE chain where
@@ -448,11 +587,8 @@ def _assemble_finding(
     # SSVC tier when Exploitation>=poc.
     ssvc_exploitation: str | None = None
     ssvc_automatable: str | None = None
-    if vulnrichment is not None and cve_aliases:
-        decisions = [
-            vulnrichment.lookup(c) for c in cve_aliases
-        ]
-        decisions = [d for d in decisions if d is not None]
+    if cve_aliases:
+        decisions = [ssvc[c] for c in cve_aliases if c in ssvc]
         if any(d.is_active for d in decisions):
             ssvc_exploitation = "active"
         elif any(d.has_exploit for d in decisions):
@@ -475,8 +611,22 @@ def _assemble_finding(
             for a in group
         ) if f
     ]
+    # An unparseable candidate must never outrank a parseable one:
+    # ``_Sortable``'s fallback ordering sorts unparseable strings
+    # HIGH (so that ``min()`` in ``_smallest_applicable_fix`` prefers
+    # parseable fixes), which would make ``max()`` here adopt a
+    # GIT-commit ``fixed`` event (routine in OSS-Fuzz-sourced OSV
+    # records) — or a crafted garbage string from a hostile advisory
+    # — as the finding's fixed_version, defeating the conservative
+    # combine documented above and steering the fix planner at a
+    # non-version. Prefer the parseable pool whenever it is
+    # non-empty; all-unparseable groups still surface something.
+    parseable = [
+        f for f in fix_candidates
+        if _is_parseable_version(dep.ecosystem, f)
+    ]
     fixed = (
-        max(fix_candidates, key=_VersionKey(dep.ecosystem))
+        max(parseable or fix_candidates, key=_VersionKey(dep.ecosystem))
         if fix_candidates else None
     )
     # Group-maximum severity — the representative achieves it by
@@ -618,6 +768,87 @@ def _smallest_applicable_fix(
         return target_pool[0]
 
 
+# Comparators that by design order ANY string without raising (dpkg /
+# rpm / ComparableVersion semantics genuinely define a total order over
+# arbitrary text). The exception probe below is blind for them, so the
+# parseable-preference gets a probe-only plausibility floor instead.
+# RubyGems and NuGet are NOT here: their real ecosystems reject
+# non-version strings, and the comparators now raise accordingly.
+_LENIENT_COMPARATOR_ECOSYSTEMS = frozenset(
+    {"Maven", "Packagist", "Debian", "Red Hat"},
+)
+
+# Probe-only plausibility floor for the lenient comparators: an
+# optional Debian/RPM epoch, an optional ``v``, then a digit-led tail
+# drawn from ordinary version characters. Deliberately generous — it
+# only steers a PREFERENCE (all-implausible candidate groups still
+# fall back to surfacing something), so a rare letter-led real version
+# (Maven ``Hoxton.SR12``) merely loses preference against a digit-led
+# sibling, never disappears.
+_PLAUSIBLE_VERSION_RE = re.compile(r"(?:\d+:)?[vV]?\d[A-Za-z0-9.+~_-]{0,127}")
+
+# An undelimited hex run of ≥7 chars is a commit hash (git's default
+# abbreviation is 7–12 chars; full is 40), not a version — even when
+# it leads with a digit (≈62% of SHAs do, so the digit-led rule alone
+# cannot catch them). The lookahead requires at least one [a-f]:
+# enumerating the lenient set's real grammars, PURE-DECIMAL
+# undelimited tokens are legitimate versions (Debian datestamps like
+# ca-certificates ``20230311``; Maven ``20040616`` era artifacts),
+# while none of Maven / Packagist / Debian / Red Hat ever version
+# with an undelimited letter-bearing hex token — dotted, hyphenated,
+# tilde or epoch-delimited segments only.
+_HEX_BLOB_RE = re.compile(
+    r"(?:\d+:)?(?=[0-9a-f]*[a-f])[0-9a-fA-F]{7,}", re.IGNORECASE,
+)
+
+
+def _is_parseable_version(ecosystem: str, value: str) -> bool:
+    """True when ``value`` parses under the ecosystem's comparator.
+
+    Probes with a comparison against the universally-parseable
+    sentinel ``"0"`` — NOT against ``value`` itself: most comparators
+    short-circuit ``a == b`` BEFORE parsing (semver, rpm,
+    debian, alpine, conan, vcpkg), so a self-comparison probe
+    vacuously succeeds on any string for those ecosystems and the
+    parseable-preference becomes a no-op exactly where it matters
+    (npm / crates.io / Go). ``value == "0"`` still hits that
+    short-circuit, but ``"0"`` is genuinely parseable everywhere.
+
+    Comparators that never raise on garbage (Maven, Packagist, Debian,
+    Red Hat — they order arbitrary strings by design) would report
+    everything parseable, so a git-SHA ``fixed`` event from an
+    alias-merged advisory could outrank a real fix for exactly those
+    ecosystems. They get a probe-only plausibility floor instead —
+    the comparator semantics used for range matching are untouched.
+
+    Range expressions (``"9.9.9 || <garbage>"``) decompose to their
+    atoms and EVERY atom must probe: a comparator that tolerates a
+    parseable prefix must not let a range-shaped value ride its first
+    atom past the probe (no single version contains whitespace in any
+    ecosystem, so a multi-atom value is only as plausible as its
+    worst atom).
+    """
+    atoms = [a for a in re.split(r"\s+|\|\|", value) if a]
+    if not atoms:
+        return False
+    if len(atoms) > 1:
+        return all(_is_parseable_atom(ecosystem, a) for a in atoms)
+    return _is_parseable_atom(ecosystem, atoms[0])
+
+
+def _is_parseable_atom(ecosystem: str, value: str) -> bool:
+    if _canonical_ecosystem(ecosystem) in _LENIENT_COMPARATOR_ECOSYSTEMS:
+        return (
+            _PLAUSIBLE_VERSION_RE.fullmatch(value) is not None
+            and _HEX_BLOB_RE.fullmatch(value) is None
+        )
+    try:
+        version_compare(ecosystem, value, "0")
+    except VersionError:
+        return False
+    return True
+
+
 class _VersionKey:
     """Functor that wraps the per-ecosystem version comparator into a
     sortable key. Avoids repeatedly capturing ``ecosystem`` in lambdas."""
@@ -643,18 +874,17 @@ class _Sortable:
         self.v = value
 
     def __lt__(self, other: _Sortable) -> bool:
-        self_ok = other_ok = True
         try:
             return version_compare(self.eco, self.v, other.v) < 0
         except VersionError:
-            try:
-                version_compare(self.eco, self.v, self.v)
-            except VersionError:
-                self_ok = False
-            try:
-                version_compare(other.eco, other.v, other.v)
-            except VersionError:
-                other_ok = False
+            # Parseability probe — sentinel-based (see
+            # ``_is_parseable_version``): a self-comparison probe is
+            # vacuous on the comparators that short-circuit equal
+            # strings before parsing. A parseable version sorts LOW
+            # relative to an unparseable one so ``min()`` (smallest
+            # applicable fix) prefers real versions.
+            self_ok = _is_parseable_version(self.eco, self.v)
+            other_ok = _is_parseable_version(other.eco, other.v)
             if self_ok != other_ok:
                 return self_ok
             return self.v < other.v
@@ -662,7 +892,7 @@ class _Sortable:
 
 def _vuln_finding_id(dep: Dependency, advisory: Advisory) -> str:
     return (
-        f"sca:vuln:{dep.ecosystem}:{dep.name}:{dep.version or '*'}:"
+        f"{VULN_ID_PREFIX}{dep.ecosystem}:{dep.name}:{dep.version or '*'}:"
         f"{advisory.osv_id}"
     )
 
@@ -707,31 +937,79 @@ def write_findings_json(
     # Shared atomic-write primitive: random-suffix tempfile opened
     # O_EXCL|O_NOFOLLOW then renamed — a predictable ``<name>.json.tmp``
     # sibling is squattable / symlinkable in shared output dirs.
-    atomic_write_text(path, _json.dumps(rows, indent=2, default=_json_default))
+    # ``allow_nan=False``: a ``nan`` / ``inf`` float anywhere in a row
+    # would serialise as a bare non-JSON token (``NaN``) that strict
+    # consumers reject — invalidating the WHOLE document, not one row.
+    # Enrichment ingest validates scores upstream (core.cve.epss); this
+    # is the belt-and-braces refusal at the write chokepoint.
+    atomic_write_text(
+        path,
+        _json.dumps(rows, indent=2, default=_json_default, allow_nan=False),
+    )
     return len(rows)
+
+
+def _row_envelope(
+    *,
+    finding_id: str,
+    vuln_type: str,
+    file: str,
+    function: str,
+    severity: str,
+    suppressed: bool,
+    suppression_reason: str | None,
+    title: str,
+    description: str,
+    sca: dict[str, Any],
+) -> dict[str, Any]:
+    """The shared findings.json row envelope.
+
+    Every row builder emits this exact key set in this exact order —
+    the serialised shape is an on-disk contract (pinned byte-for-byte
+    by the golden fixtures), so the envelope lives in one place. The
+    per-kind payload stays in each builder's ``sca`` block: those
+    blocks deliberately differ per kind and are NOT unified here.
+
+    ``id`` duplicates ``finding_id`` for consumers of the generic
+    findings.json convention; ``line`` is fixed at 0 because SCA
+    findings attach to a manifest, not a source line.
+    """
+    return {
+        "id": finding_id,
+        "finding_id": finding_id,
+        "vuln_type": vuln_type,
+        "tool": "sca",
+        "file": file,
+        "function": function,
+        "line": 0,
+        "severity": severity,
+        "suppressed": suppressed,
+        "suppression_reason": suppression_reason,
+        "title": title,
+        "description": description,
+        # SCA-specific extension fields. Consumers that don't know about
+        # them ignore them; the schema explicitly allows extras.
+        "sca": sca,
+    }
 
 
 def _vuln_finding_to_row(f: VulnFinding) -> dict[str, Any]:
     primary = f.advisories[0] if f.advisories else None
     title = _vuln_title(f, primary)
-    return {
-        "id": f.finding_id,
-        "finding_id": f.finding_id,
-        "vuln_type": "sca:vulnerable_dependency",
-        "tool": "sca",
-        "file": str(f.dependency.declared_in),
-        "function": f.dependency.name,
-        "line": 0,
-        "severity": f.severity,
-        "suppressed": f.suppressed,
-        "suppression_reason": f.suppression_reason,
-        "title": title,
-        "description": _describe_vuln(f),
-        # SCA-specific extension fields. Consumers that don't know about
-        # them ignore them; the schema explicitly allows extras.
-        "sca": {
+    return _row_envelope(
+        finding_id=f.finding_id,
+        vuln_type=VULNERABLE_DEPENDENCY,
+        file=str(f.dependency.declared_in),
+        function=f.dependency.name,
+        severity=f.severity,
+        suppressed=f.suppressed,
+        suppression_reason=f.suppression_reason,
+        title=title,
+        description=_describe_vuln(f),
+        sca={
             "ecosystem": f.dependency.ecosystem,
             "name": f.dependency.name,
+            "alias_name": f.dependency.alias_name,
             "version": f.dependency.version,
             "purl": f.dependency.purl,
             "scope": f.dependency.scope,
@@ -763,7 +1041,7 @@ def _vuln_finding_to_row(f: VulnFinding) -> dict[str, Any]:
             "exploit_evidence": _exploit_evidence_summary(f.exploit_evidence),
             "related_findings": list(f.related_findings),
         },
-    }
+    )
 
 
 def _exploit_evidence_summary(ev) -> dict[str, Any] | None:
@@ -798,24 +1076,21 @@ def _commented_severity(dep: Dependency, severity: str) -> str:
 
 
 def _hygiene_finding_to_row(f: HygieneFinding) -> dict[str, Any]:
-    severity = _commented_severity(f.dependency, f.severity)
-    return {
-        "id": f.finding_id,
-        "finding_id": f.finding_id,
-        "vuln_type": f"sca:hygiene:{f.kind}",
-        "tool": "sca",
-        "file": str(f.dependency.declared_in),
-        "function": f.dependency.name,
-        "line": 0,
-        "severity": severity,
-        "suppressed": f.suppressed,
-        "suppression_reason": f.suppression_reason,
-        "title": _kind_title(f.kind, f.dependency.name),
-        "description": f.detail,
-        "sca": {
+    return _row_envelope(
+        finding_id=f.finding_id,
+        vuln_type=f"{HYGIENE_PREFIX}{f.kind}",
+        file=str(f.dependency.declared_in),
+        function=f.dependency.name,
+        severity=_commented_severity(f.dependency, f.severity),
+        suppressed=f.suppressed,
+        suppression_reason=f.suppression_reason,
+        title=_kind_title(f.kind, f.dependency.name),
+        description=f.detail,
+        sca={
             "kind": f.kind,
             "ecosystem": f.dependency.ecosystem,
             "name": f.dependency.name,
+            "alias_name": f.dependency.alias_name,
             "version": f.dependency.version,
             "purl": f.dependency.purl,
             "scope": f.dependency.scope,
@@ -824,63 +1099,57 @@ def _hygiene_finding_to_row(f: HygieneFinding) -> dict[str, Any]:
             "commented_out": f.dependency.commented_out,
             "confidence": _confidence_summary(f.confidence),
         },
-    }
+    )
 
 
 def _supply_chain_finding_to_row(f: SupplyChainFinding) -> dict[str, Any]:
-    severity = _commented_severity(f.dependency, f.severity)
-    return {
-        "id": f.finding_id,
-        "finding_id": f.finding_id,
-        "vuln_type": f"sca:supply_chain:{f.kind}",
-        "tool": "sca",
-        "file": str(f.dependency.declared_in),
-        "function": f.dependency.name,
-        "line": 0,
-        "severity": severity,
-        "suppressed": f.suppressed,
-        "suppression_reason": f.suppression_reason,
-        "title": _kind_title(f.kind, f.dependency.name),
-        "description": f.detail,
-        "sca": {
+    return _row_envelope(
+        finding_id=f.finding_id,
+        vuln_type=f"{SUPPLY_CHAIN_PREFIX}{f.kind}",
+        file=str(f.dependency.declared_in),
+        function=f.dependency.name,
+        severity=_commented_severity(f.dependency, f.severity),
+        suppressed=f.suppressed,
+        suppression_reason=f.suppression_reason,
+        title=_kind_title(f.kind, f.dependency.name),
+        description=f.detail,
+        sca={
             "kind": f.kind,
             "ecosystem": f.dependency.ecosystem,
             "name": f.dependency.name,
+            "alias_name": f.dependency.alias_name,
             "version": f.dependency.version,
             "commented_out": f.dependency.commented_out,
             "evidence": dict(f.evidence),
             "confidence": _confidence_summary(f.confidence),
         },
-    }
+    )
 
 
 def _license_finding_to_row(f: Any) -> dict[str, Any]:
     kind_short = f.kind.replace('license_', '')
-    severity = _commented_severity(f.dependency, f.severity)
-    return {
-        "id": f.finding_id,
-        "finding_id": f.finding_id,
-        "vuln_type": f"sca:license:{kind_short}",
-        "tool": "sca",
-        "file": str(f.dependency.declared_in),
-        "function": f.dependency.name,
-        "line": 0,
-        "severity": severity,
-        "suppressed": f.suppressed,
-        "suppression_reason": f.suppression_reason,
-        "title": _kind_title(kind_short, f.dependency.name),
-        "description": f.detail,
-        "sca": {
+    return _row_envelope(
+        finding_id=f.finding_id,
+        vuln_type=f"{LICENSE_PREFIX}{kind_short}",
+        file=str(f.dependency.declared_in),
+        function=f.dependency.name,
+        severity=_commented_severity(f.dependency, f.severity),
+        suppressed=f.suppressed,
+        suppression_reason=f.suppression_reason,
+        title=_kind_title(kind_short, f.dependency.name),
+        description=f.detail,
+        sca={
             "kind": f.kind,
             "ecosystem": f.dependency.ecosystem,
             "name": f.dependency.name,
+            "alias_name": f.dependency.alias_name,
             "version": f.dependency.version,
             "spdx": f.spdx,
             "purl": f.dependency.purl,
             "commented_out": f.dependency.commented_out,
             "confidence": _confidence_summary(f.confidence),
         },
-    }
+    )
 
 
 def _scan_health_to_row(h: dict[str, Any]) -> dict[str, Any]:
@@ -893,25 +1162,25 @@ def _scan_health_to_row(h: dict[str, Any]) -> dict[str, Any]:
     kind = str(h.get("kind") or "unknown")
     detail = str(h.get("detail") or "")
     evidence = h.get("evidence")
-    sca_block: dict[str, Any] = {"kind": kind}
-    if isinstance(evidence, dict):
-        sca_block.update(evidence)
-    finding_id = f"sca:scan_health:{kind}"
-    return {
-        "id": finding_id,
-        "finding_id": finding_id,
-        "vuln_type": f"sca:scan_health:{kind}",
-        "tool": "sca",
-        "file": "",
-        "function": "",
-        "line": 0,
-        "severity": "info",
-        "suppressed": False,
-        "suppression_reason": None,
-        "title": kind.replace("_", " ").capitalize(),
-        "description": detail,
-        "sca": sca_block,
-    }
+    # ``kind`` is written LAST: evidence is producer-supplied and an
+    # evidence dict carrying its own ``kind`` key used to shadow the
+    # row's real kind (vuln_type said one thing, sca.kind another).
+    sca_block: dict[str, Any] = (
+        dict(evidence) if isinstance(evidence, dict) else {}
+    )
+    sca_block["kind"] = kind
+    return _row_envelope(
+        finding_id=f"{SCAN_HEALTH_PREFIX}{kind}",
+        vuln_type=f"{SCAN_HEALTH_PREFIX}{kind}",
+        file="",
+        function="",
+        severity="info",
+        suppressed=False,
+        suppression_reason=None,
+        title=kind.replace("_", " ").capitalize(),
+        description=detail,
+        sca=sca_block,
+    )
 
 
 def _vuln_title(f: VulnFinding, primary: Advisory | None) -> str:
@@ -1022,7 +1291,7 @@ def _json_default(obj: Any) -> Any:
     if isinstance(obj, datetime):
         return obj.isoformat()
     if is_dataclass(obj):
-        return asdict(obj)
+        return asdict(obj)  # type: ignore[arg-type]
     msg = f"Cannot serialise {type(obj).__name__}: {obj!r}"
     raise TypeError(msg)
 
@@ -1031,11 +1300,13 @@ def _json_default(obj: Any) -> Any:
 # Severity helpers (re-exported for the report layer)
 # ---------------------------------------------------------------------------
 
-def severity_rank(severity: Severity) -> int:
+def severity_rank(severity: str) -> int:
     """Return the rank for a severity string. Case-insensitive — LLM
     verdicts and hand-edited findings frequently capitalise (``Critical``,
     ``HIGH``); a case-sensitive lookup would silently treat them as 0
-    and let CI gates pass when they shouldn't.
+    and let CI gates pass when they shouldn't. Typed ``str`` (not the
+    ``Severity`` literal) for the same reason: read-side values are
+    untrusted row content, and unknown labels rank 0.
     """
     if not severity:
         return 0

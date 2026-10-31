@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -287,9 +288,9 @@ class TestCli:
 
 
 class TestRunSideEnvHygiene:
-    """The spawned target inherits _run_side's subprocess env and runs
-    unsandboxed — operator credentials must never be readable via
-    getenv from target code, 'built yourself' notwithstanding."""
+    """The spawned target inherits _run_side's subprocess env — even
+    inside the sandbox, operator credentials must never be readable
+    via getenv from target code, 'built yourself' notwithstanding."""
 
     def _capture_env(self, tmp_path: Path, monkeypatch) -> dict:
         import subprocess as sp
@@ -327,3 +328,178 @@ class TestRunSideEnvHygiene:
         env = seen["env"]
         assert env["RAPTOR_DIR"]
         assert env["PYTHONPATH"] == env["RAPTOR_DIR"]
+
+
+class TestRunSideSandboxDispatch:
+    """The suspected-exploitable target must never spawn raw on the
+    host: _run_side must dispatch through libexec/raptor-frida (the
+    sandboxed route every other programmatic frida launch uses)."""
+
+    def _capture_cmd(self, tmp_path: Path, monkeypatch,
+                     *, poc: Path | None) -> dict:
+        import subprocess as sp
+
+        monkeypatch.setenv(
+            "RAPTOR_DIR", str(Path(__file__).resolve().parents[3]))
+        seen: dict = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["cmd"] = cmd
+            seen.update(kwargs)
+            return sp.CompletedProcess(cmd, 0)
+
+        monkeypatch.setattr(patch_oracle.subprocess, "run", fake_run)
+        binary = tmp_path / "vuln"
+        binary.write_bytes(b"\x7fELF")
+        script = tmp_path / "watch.js"
+        script.write_text("// noop")
+        side = tmp_path / "side"
+        side.mkdir()
+        patch_oracle._run_side(binary, script, side,
+                               poc=poc, duration=1.0)
+        return seen
+
+    def test_spawn_routes_through_sandboxed_wrapper(self, tmp_path,
+                                                    monkeypatch):
+        seen = self._capture_cmd(tmp_path, monkeypatch, poc=None)
+        cmd = seen["cmd"]
+        # argv[0] is the sandboxing wrapper, never a bare python
+        # running packages.frida.cli on the host.
+        assert cmd[0].endswith(os.path.join("libexec", "raptor-frida"))
+        assert "packages.frida.cli" not in cmd
+        assert "--spawn" in cmd
+        # Explicit out dir: the wrapper must not mint a lifecycle dir.
+        assert "--out" in cmd
+        assert cmd[cmd.index("--out") + 1] == str(
+            (tmp_path / "side").resolve())
+
+    def test_poc_rides_stdin_flag_not_oracle_stdin(self, tmp_path,
+                                                   monkeypatch):
+        import subprocess as sp
+
+        poc = tmp_path / "poc.bin"
+        poc.write_bytes(b"AAAA")
+        seen = self._capture_cmd(tmp_path, monkeypatch, poc=poc)
+        cmd = seen["cmd"]
+        # The PoC reaches the target via the CLI's --stdin rebind
+        # INSIDE the sandbox (the wrapper grants the file's parent to
+        # the read set) — not by piping the file into the wrapper.
+        assert "--stdin" in cmd
+        assert cmd[cmd.index("--stdin") + 1] == str(poc.resolve())
+        assert seen["stdin"] is sp.DEVNULL
+
+    def test_no_poc_means_no_stdin_flag(self, tmp_path, monkeypatch):
+        seen = self._capture_cmd(tmp_path, monkeypatch, poc=None)
+        assert "--stdin" not in seen["cmd"]
+
+
+class TestTerminalEscapeScrub:
+    """Captured target stdio rides RuntimeError text onto the operator
+    terminal — both the construction site and the CLI print must
+    escape hostile bytes."""
+
+    def test_failed_session_tail_is_escaped(self, tmp_path, monkeypatch):
+        import subprocess as sp
+
+        monkeypatch.setenv(
+            "RAPTOR_DIR", str(Path(__file__).resolve().parents[3]))
+
+        def fake_run(cmd, **kwargs):
+            # Capture is file-redirected (bounded tail read-back) —
+            # emit hostile bytes the way the target would.
+            kwargs["stderr"].write(b"boom \x1b[2J\x9bpwned")
+            return sp.CompletedProcess(cmd, 1)
+
+        monkeypatch.setattr(patch_oracle.subprocess, "run", fake_run)
+        binary = tmp_path / "vuln"
+        binary.write_bytes(b"\x7fELF")
+        script = tmp_path / "watch.js"
+        script.write_text("// noop")
+        with pytest.raises(RuntimeError) as exc_info:
+            patch_oracle._run_side(binary, script, tmp_path / "side",
+                                   poc=None, duration=1.0)
+        msg = str(exc_info.value)
+        assert "\x1b" not in msg
+        assert "\x9b" not in msg
+        assert "boom" in msg and "pwned" in msg
+
+    def test_main_error_print_is_escaped(self, tmp_path, monkeypatch,
+                                         capsys):
+        monkeypatch.setenv(
+            "RAPTOR_DIR", str(Path(__file__).resolve().parents[3]))
+
+        def raise_hostile(*a, **kw):
+            raise RuntimeError("fail \x1b]0;evil\x07\x9b31m")
+
+        monkeypatch.setattr(patch_oracle, "verify_patch", raise_hostile)
+        before = tmp_path / "before"
+        after = tmp_path / "after"
+        for b in (before, after):
+            b.write_bytes(b"\x7fELF")
+        rc = patch_oracle.main([
+            "--before", str(before), "--after", str(after),
+            "--sink", "system", "--out", str(tmp_path / "out"),
+        ])
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "\x1b" not in err
+        assert "\x9b" not in err
+        assert "\x07" not in err
+
+
+class TestRunSideBoundedCapture:
+    """The spawned target inherits the frida CLI's stdio — capture
+    must not buffer unbounded in memory (the E24 active.py class);
+    only a bounded tail is ever needed for the failure message."""
+
+    def _invoke(self, tmp_path, monkeypatch, *, rc: int, flood: bytes):
+        import subprocess as sp
+
+        from packages.frida import patch_oracle as po
+
+        seen = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["kwargs"] = kwargs
+            assert not kwargs.get("capture_output"), (
+                "unbounded in-memory capture of target-inherited stdio"
+            )
+            err = kwargs.get("stderr")
+            assert err is not None and hasattr(err, "write"), (
+                "stderr must be file-redirected"
+            )
+            err.write(flood)
+            return sp.CompletedProcess(cmd, rc)
+
+        monkeypatch.setattr(po.subprocess, "run", fake_run)
+        monkeypatch.setenv(
+            "RAPTOR_DIR", str(Path(__file__).resolve().parents[3]))
+        binary = tmp_path / "target"
+        binary.write_bytes(b"\x7fELF")
+        script = tmp_path / "hook.js"
+        script.write_text("// hook\n")
+        side = tmp_path / "side"
+        side.mkdir()
+        return po, binary, script, side
+
+    def test_failure_tail_is_bounded_and_escaped(
+        self, tmp_path, monkeypatch,
+    ):
+        import pytest as _pytest
+
+        flood = b"\x1b[31mX" * 200_000 + b" FINAL-ERROR"
+        po, binary, script, side = self._invoke(
+            tmp_path, monkeypatch, rc=1, flood=flood,
+        )
+        with _pytest.raises(RuntimeError) as exc:
+            po._run_side(binary, script, side, None, duration=1.0)
+        msg = str(exc.value)
+        assert "FINAL-ERROR" in msg
+        assert "\x1b" not in msg
+        assert len(msg) < 2000
+
+    def test_success_ignores_flood(self, tmp_path, monkeypatch):
+        po, binary, script, side = self._invoke(
+            tmp_path, monkeypatch, rc=0, flood=b"y" * 100_000,
+        )
+        po._run_side(binary, script, side, None, duration=1.0)

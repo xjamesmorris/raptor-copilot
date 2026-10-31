@@ -4,7 +4,7 @@ run_multi_model() is the only function consumers call. Everything else
 in this module is private machinery.
 
 Pipeline:
-    1. Validate inputs (non-empty models, no duplicate model_name).
+    1. Validate inputs (non-empty models, no duplicate or route-aliased model).
     2. Run task(model) in parallel via ThreadPoolExecutor.
     3. Collect raw outputs; classify model failures.
     4. Filter error entries (dicts with "error" key) before adapter sees them.
@@ -111,9 +111,9 @@ def run_multi_model(
         aggregation, raw per-model outputs, and any failed model names.
 
     Raises:
-        ValueError: empty models list; duplicate model_name; empty
-            model_name on any model; or adapter returned items with
-            duplicate item_id.
+        ValueError: empty models list; duplicate model_name; route-qualified
+            names declaring the same model; empty model_name on any model; or
+            adapter returned items with duplicate item_id.
         TypeError: task is not callable; adapter, any reviewer, the
             aggregator, or cost_gate doesn't implement its protocol;
             any model element doesn't implement ModelHandle; any
@@ -145,7 +145,9 @@ def run_multi_model(
     # Sort for deterministic adapter input regardless of completion order.
     per_model_raw = dict(sorted(per_model_raw.items()))
     failed_models = sorted(failed_models)
-    per_model_filtered = _filter_errors(per_model_raw)
+    per_model_filtered = _filter_errors(
+        per_model_raw, exclude=frozenset(failed_models),
+    )
 
     if failed_models and len(failed_models) == len(models):
         logger.warning(
@@ -277,8 +279,8 @@ def run_multi_model(
 # ---------------------------------------------------------------------------
 
 
-def _warn_same_weights(names: Sequence[str]) -> None:
-    """Warn when two panel entries peel to the same underlying model.
+def _reject_same_declared_model(names: Sequence[str]) -> None:
+    """Reject route-distinct entries for the same declared model.
 
     Distinct model_name values can be the SAME weights reached over
     two transports — a bare Bedrock id (``anthropic.claude-x``), its
@@ -286,29 +288,25 @@ def _warn_same_weights(names: Sequence[str]) -> None:
     direct-API name (``claude-x``) all resolve to one model.  The
     duplicate-name check above can't see that, and treating the pair
     as independent opinions silently inflates consensus confidence.
-    Warning, not error: same-weights panels are legitimate for
-    transport A/B comparisons — the operator just shouldn't read the
-    agreement as diversity.
+
+    Self-consistency handles remain distinct because their ``#scN`` suffixes
+    survive :func:`bare_model_id`. Same-family but differently named models
+    remain valid; this is declared-identity comparison, not a claim that two
+    related models share weights.
     """
-    try:
-        from core.security.llm_family import bare_model_id
-    except Exception:  # noqa: BLE001 — advisory only
-        return
+    from core.security.llm_family import bare_model_id
+
     peeled: dict[str, list[str]] = {}
     for name in names:
-        try:
-            bare = bare_model_id(name)
-        except Exception:  # noqa: BLE001 — advisory only
-            continue
+        bare = bare_model_id(name.strip()).strip().lower()
         if bare:
             peeled.setdefault(bare, []).append(name)
     for bare, group in sorted(peeled.items()):
         if len(group) > 1:
-            logger.warning(
-                "multi-model panel: %s all resolve to the same "
-                "underlying model (%s) — their agreement is transport "
-                "consistency, not independent consensus",
-                group, bare,
+            raise ValueError(
+                "multi-model panel declared same model via different "
+                "routes is not independent consensus: "
+                f"{group} -> {bare}",
             )
 
 
@@ -348,7 +346,7 @@ def _validate_inputs(
     if dupes:
         msg = f"duplicate model_name(s): {dupes}"
         raise ValueError(msg)
-    _warn_same_weights(names)
+    _reject_same_declared_model(names)
     for i, r in enumerate(reviewers):
         if not isinstance(r, Reviewer):
             msg = (
@@ -437,6 +435,45 @@ def _dispatch_parallel(
     per_model_raw: dict[str, list[dict[str, Any]]] = {}
     failed: list[str] = []
 
+    def _ingest_done_future(name: str, future: Any) -> None:
+        """Record one COMPLETED future's outcome (the future must be
+        done — ``result(timeout=0)`` never blocks). Shared by the
+        happy-path yield loop and the timeout branch's harvest."""
+        try:
+            results = future.result(timeout=0)
+        except Exception as exc:
+            logger.warning(
+                "Model %r task raised: %s", name, exc,
+                exc_info=True,
+            )
+            per_model_raw[name] = []
+            failed.append(name)
+            return
+
+        if not isinstance(results, list):
+            logger.warning(
+                "Model %r task returned %s, expected list — treating as failure", name, type(results).__name__)
+            per_model_raw[name] = []
+            failed.append(name)
+            return
+
+        non_dict = [
+            type(r).__name__
+            for r in results
+            if not isinstance(r, dict)
+        ]
+        if non_dict:
+            logger.warning(
+                "Model %r task returned non-dict items (%s%s) — treating as failure. Item contract is List[Dict[str, Any]].", name, non_dict[:3], ('...' if len(non_dict) > 3 else '')
+            )
+            per_model_raw[name] = []
+            failed.append(name)
+            return
+
+        per_model_raw[name] = results
+        if results and all(_is_error(r) for r in results):
+            failed.append(name)
+
     workers = max(1, min(max_parallel, len(models)))
     ex = ThreadPoolExecutor(max_workers=workers)
     try:
@@ -444,57 +481,32 @@ def _dispatch_parallel(
         try:
             completed = as_completed(futures, timeout=timeout)
             for future in completed:
-                model = futures[future]
-                name = model.model_name
-                try:
-                    results = future.result(timeout=timeout)
-                except Exception as exc:
-                    logger.warning(
-                        "Model %r task raised: %s", name, exc,
-                        exc_info=True,
-                    )
-                    per_model_raw[name] = []
-                    failed.append(name)
-                    continue
-
-                if not isinstance(results, list):
-                    logger.warning(
-                        "Model %r task returned %s, expected list — treating as failure", name, type(results).__name__)
-                    per_model_raw[name] = []
-                    failed.append(name)
-                    continue
-
-                non_dict = [
-                    type(r).__name__
-                    for r in results
-                    if not isinstance(r, dict)
-                ]
-                if non_dict:
-                    logger.warning(
-                        "Model %r task returned non-dict items (%s%s) — treating as failure. Item contract is List[Dict[str, Any]].", name, non_dict[:3], ('...' if len(non_dict) > 3 else '')
-                    )
-                    per_model_raw[name] = []
-                    failed.append(name)
-                    continue
-
-                per_model_raw[name] = results
-                if results and all(_is_error(r) for r in results):
-                    failed.append(name)
+                _ingest_done_future(futures[future].model_name, future)
         except (TimeoutError, FuturesTimeoutError):
             # Both classes: ``as_completed`` raises
             # ``concurrent.futures.TimeoutError``, which only became an
             # alias of the builtin in Python 3.11 — on the 3.10 floor a
             # bare ``except TimeoutError`` misses it and the whole panel
             # crashes instead of isolating the straggler.
-            # Mark models that didn't complete as failed.
-            for model in futures.values():
-                if model.model_name not in per_model_raw:
-                    logger.warning(
-                        "Model %r timed out after %.0fs",
-                        model.model_name, timeout,
-                    )
-                    per_model_raw[model.model_name] = []
-                    failed.append(model.model_name)
+            #
+            # Harvest first, then mark: a future that COMPLETED
+            # between as_completed's last yield and the expiry is a
+            # paid-for result — discarding it both lost the result
+            # and mis-labelled a healthy member failed. Only models
+            # whose future is genuinely not done (the hung workers
+            # the documented abandonment targets) are marked failed.
+            for future, model in futures.items():
+                name = model.model_name
+                if name in per_model_raw:
+                    continue
+                if future.done():
+                    _ingest_done_future(name, future)
+                    continue
+                logger.warning(
+                    "Model %r timed out after %.0fs", name, timeout,
+                )
+                per_model_raw[name] = []
+                failed.append(name)
     finally:
         # Never wait on hung workers (see docstring) — cancel what's
         # still queued and return; on the happy path everything has
@@ -506,11 +518,25 @@ def _dispatch_parallel(
 
 def _filter_errors(
     per_model_raw: dict[str, list[dict[str, Any]]],
+    *,
+    exclude: frozenset[str] = frozenset(),
 ) -> dict[str, list[dict[str, Any]]]:
-    """Strip error entries before passing to adapter.merge / .correlate."""
+    """Strip error entries — and drop ``exclude``d (failed) models
+    entirely — before passing to adapter.merge / .correlate.
+
+    Dispatch is the one layer that can tell a FAILED member (task
+    raised / timed out / returned garbage) from a live member that
+    legitimately returned an empty list ("looked, found nothing").
+    Keeping failed members as empty-list keys made set-style
+    correlate count them in its recall denominator — a dead member
+    silently demoted every item one bucket (``all_models`` became
+    unreachable for the whole run) and the summary listed it as a
+    looker. Failed members stay visible via ``per_model_raw`` and
+    ``failed_models`` on the result."""
     return {
         name: [r for r in results if not _is_error(r)]
         for name, results in per_model_raw.items()
+        if name not in exclude
     }
 
 

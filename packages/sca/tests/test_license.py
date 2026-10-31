@@ -1053,3 +1053,119 @@ def test_detect_project_license_malformed_manifest_is_skipped(tmp_path: Path):
         '[project]\nlicense = "ISC"\n', encoding="utf-8",
     )
     assert detect_project_license(tmp_path) == "ISC"
+
+
+def test_policy_matching_is_case_insensitive() -> None:
+    """SPDX ids are case-insensitive by spec and registries report
+    every casing — 'agpl-3.0' must not bypass a deny list that spells
+    it 'AGPL-3.0' (it previously fell through to the default)."""
+    from packages.sca.license import DEFAULT_POLICY, _classify
+    from packages.sca.models import Confidence, Dependency, PinStyle
+    from pathlib import Path
+
+    dep = Dependency(
+        ecosystem="PyPI", name="x", version="1.0",
+        declared_in=Path("/r/req.txt"), scope="main",
+        is_lockfile=False, pin_style=PinStyle.EXACT, direct=True,
+        purl="pkg:pypi/x@1.0",
+        parser_confidence=Confidence("high", reason="t"),
+    )
+    for spelling in ("agpl-3.0", "AGPL-3.0", "Agpl-3.0"):
+        f = _classify(dep, spelling, DEFAULT_POLICY)
+        assert f is not None and f.kind == "license_denied", spelling
+    # Warn list, both casings.
+    f = _classify(dep, "gpl-2.0", DEFAULT_POLICY)
+    assert f is not None and f.kind == "license_warned"
+    # Allow list respects folding too (no spurious default-verdicts).
+    from packages.sca.license import LicensePolicy
+    pol = LicensePolicy(allow={"MIT"}, deny=set(), warn=set(),
+                        default="deny")
+    assert _classify(dep, "mit", pol) is None
+
+
+# ---------------------------------------------------------------------------
+# Negative caching: transient fetch failures must not read as
+# authoritative "no license" for a full TTL
+# ---------------------------------------------------------------------------
+
+class _RecordingCache:
+    def __init__(self) -> None:
+        self.store: dict = {}
+
+    def get(self, key, ttl_seconds):
+        return self.store.get(key)
+
+    def put(self, key, value, ttl_seconds):
+        self.store[key] = value
+
+
+class _TransientFailureHttp:
+    """Timeout shape: exception with NO ``status`` attribute."""
+
+    def get_bytes(self, url, **kw):
+        raise RuntimeError("connection timed out")
+
+    def get_json(self, url, **kw):
+        raise RuntimeError("connection timed out")
+
+
+class _NotFoundHttp:
+    """Authoritative 404 shape (``status`` attribute set)."""
+
+    def get_bytes(self, url, **kw):
+        from core.http import HttpError
+        raise HttpError("404", status=404)
+
+    def get_json(self, url, **kw):
+        from core.http import HttpError
+        raise HttpError("404", status=404)
+
+
+class _BoomHttp:
+    def get_bytes(self, url, **kw):
+        raise AssertionError("should not refetch — served from cache")
+
+    def get_json(self, url, **kw):
+        raise AssertionError("should not refetch — served from cache")
+
+
+import pytest as _pytest
+
+
+@_pytest.mark.parametrize("fetch,args", [
+    ("_fetch_maven_license", ("org.example:art", "1.0")),
+    ("_fetch_nuget_license", ("Foo.Bar", "1.0")),
+    ("_fetch_packagist_license", ("vendor/pkg", "1.0")),
+])
+def test_transient_failure_is_not_negative_cached(fetch, args):
+    """A timeout/5xx says nothing about the package's license: caching
+    it as "" serves license_unknown (info under the default policy) for
+    24h, so a --fail-on-license high gate passes an AGPL dep on one
+    blip. The next call must retry instead."""
+    from packages.sca import license as license_mod
+
+    fn = getattr(license_mod, fetch)
+    cache = _RecordingCache()
+    assert fn(*args, http=_TransientFailureHttp(), cache=cache) is None
+    assert cache.store == {}
+    # Second call retries (would return None again) rather than being
+    # served a poisoned negative entry.
+    assert fn(*args, http=_TransientFailureHttp(), cache=cache) is None
+
+
+@_pytest.mark.parametrize("fetch,args", [
+    ("_fetch_maven_license", ("org.example:art", "1.0")),
+    ("_fetch_nuget_license", ("Foo.Bar", "1.0")),
+    ("_fetch_packagist_license", ("vendor/pkg", "1.0")),
+])
+def test_authoritative_404_stays_negative_cached(fetch, args):
+    """A real 404 IS an authoritative "not in the registry" — keep the
+    24h negative entry so re-scans don't hammer the registry."""
+    from packages.sca import license as license_mod
+
+    fn = getattr(license_mod, fetch)
+    cache = _RecordingCache()
+    assert fn(*args, http=_NotFoundHttp(), cache=cache) is None
+    assert list(cache.store.values()) == [""]
+    # Second call is served from the cached negative — no refetch.
+    assert fn(*args, http=_BoomHttp(), cache=cache) is None

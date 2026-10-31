@@ -17,6 +17,11 @@ Verdicts are ordered by *confidence that we got the right answer*:
                            be stale. Needs human triage.
     ORPHAN               — oracle has no commit data for this CVE.
                            Unverifiable; don't penalize.
+    UNKNOWN              — the oracle lookup itself failed (network,
+                           non-404 HTTP error, offline). Unverifiable
+                           THIS RUN; retry later. Distinct from ORPHAN
+                           so an OSV outage can't masquerade as a batch
+                           of don't-penalize answers.
     LIKELY_HALLUCINATION — oracle has commits, ours isn't among them.
                            Strong signal that we picked a plausible-
                            looking-but-wrong SHA.
@@ -38,6 +43,7 @@ class Verdict(str, Enum):
     MIRROR_DIFFERENT_SLUG = "mirror_different_slug"
     DISPUTE = "dispute"
     ORPHAN = "orphan"
+    UNKNOWN = "unknown"
     LIKELY_HALLUCINATION = "likely_hallucination"
 
     @property

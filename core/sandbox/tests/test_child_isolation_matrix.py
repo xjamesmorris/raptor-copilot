@@ -219,6 +219,9 @@ class TestLiveIsolationMatrix:
             "print('MP-OK')\n"
         )
         r = self._run(tmp_path, code)
+        if not r.sandbox_info.get("mount_ns_active"):
+            pytest.skip(
+                "AF_UNIX scoping needs the bind-tree backend on this host")
         assert r.returncode == 0, r.stderr[-500:] if r.stderr else r
         assert "MP-OK" in (r.stdout or "")
 

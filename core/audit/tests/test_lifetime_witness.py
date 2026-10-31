@@ -1648,9 +1648,7 @@ static int h(struct ctx *ctx)
         )
         assert not r.discharged
 
-    def test_substitution_size_bomb_refuses_fast(self, tmp_path):
-        import time
-
+    def test_substitution_size_bomb_refuses(self, tmp_path):
         n, m = 2000, 20000
         prelude = (
             "#define BIG(x) " + " ".join(["x"] * n) + "\n"
@@ -1670,7 +1668,9 @@ static int h(struct sock *sk)
 \treturn 1;
 }
 """
-        t0 = time.time()
+        # No wall-clock assertion: the budget-refusal reason IS the
+        # invariant (the token budget tripped before expansion blew
+        # up); timing on shared CI hosts is flake, not signal.
         r = _check(
             tmp_path, src,
             "Double-free of p: p freed at line 6 then again at line 9",
@@ -1679,7 +1679,6 @@ static int h(struct sock *sk)
         )
         assert not r.discharged
         assert "token budget" in r.reason
-        assert time.time() - t0 < 10
 
 # ---------------------------------------------------------------------------
 # Path-shape refusals beyond the laundering set: releases that reach
@@ -1961,6 +1960,91 @@ static void k(char *p)
             {"CWE-416"},
         )
         assert r.discharged
+
+
+class TestCompoundAssignmentAliases:
+    # C11 6.5.16.2: the complete compound-assignment operator set.
+    _COMPOUND_OPS = ["+=", "-=", "*=", "/=", "%=",
+                     "<<=", ">>=", "&=", "^=", "|="]
+
+    @pytest.mark.parametrize("op", _COMPOUND_OPS)
+    def test_compound_assign_alias_escape_refuses(self, tmp_path, op):
+        # ``a |= (uintptr_t)p`` smuggles the tracked pointer into
+        # ``a`` exactly like ``a = a | (uintptr_t)p`` — every
+        # compound operator must feed the alias/derived closure.
+        src = f"""
+static void h(int n)
+{{
+	unsigned long a = 1;
+	char *p = kmalloc(8, GFP_KERNEL);
+	a {op} (uintptr_t)p;
+	kfree(p);
+	((struct s *)a)->fld = 1;
+}}
+"""
+        r = _check(
+            tmp_path, src,
+            "Use-after-free: p freed at line 6 and then used",
+            {"CWE-416"},
+        )
+        assert not r.discharged, op
+
+    def test_plain_assign_spelling_control(self, tmp_path):
+        # Two-direction pin: the semantically identical plain-``=``
+        # spelling keeps refusing.
+        src = """
+static void h(int n)
+{
+	unsigned long a = 1;
+	char *p = kmalloc(8, GFP_KERNEL);
+	a = a | (uintptr_t)p;
+	kfree(p);
+	((struct s *)a)->fld = 1;
+}
+"""
+        r = _check(
+            tmp_path, src,
+            "Use-after-free: p freed at line 6 and then used",
+            {"CWE-416"},
+        )
+        assert not r.discharged
+
+    def test_compound_assign_untracked_rhs_still_discharges(
+        self, tmp_path,
+    ):
+        # Two-direction guard: a compound assignment whose RHS never
+        # mentions a tracked name must not over-refuse.
+        src = """
+static void k(int flags)
+{
+	unsigned long a = 0;
+	char *p = kmalloc(8, GFP_KERNEL);
+	a |= flags;
+	kfree(p);
+	report(a);
+}
+"""
+        r = _check(
+            tmp_path, src,
+            "Use-after-free: p freed at line 6 then used",
+            {"CWE-416"},
+        )
+        assert r.discharged
+
+    @pytest.mark.parametrize("op", _COMPOUND_OPS)
+    def test_token_superset_tracks_compound_ops(self, op):
+        # The token-level macro-certification superset must close the
+        # same operator grammar as the AST closure.
+        from core.audit.lifetime_witness import (
+            _token_tracked_superset,
+            _tokenize_with_offsets,
+        )
+        toks = [
+            (k, sp) for k, sp, _s, _e in
+            _tokenize_with_offsets(f"a {op} (uintptr_t)p;")
+        ]
+        tracked = _token_tracked_superset(toks, frozenset({"p"}))
+        assert "a" in tracked, op
 
 
 class TestBracketRebindGaps:

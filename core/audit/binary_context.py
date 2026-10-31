@@ -15,29 +15,52 @@ from a scanned repo.
 
 from __future__ import annotations
 
-import json
 import logging
+import threading
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from core.inventory.binary_builder import BINARY_PATH_PREFIX
+
+from .run_memo import BoundedMemo
 
 logger = logging.getLogger(__name__)
 
 #: Cached (path, mtime) → REDatabase so a gap loop over hundreds of
-#: functions parses the JSON once.
-_REDB_CACHE: Dict[str, Any] = {}
+#: functions parses the JSON once. Bounded + thread-safe with
+#: per-key in-flight collapse — concurrent review workers raced the
+#: previous bare dict's check-then-set into duplicate parses.
+_REDB_MEMO: "BoundedMemo[Any]" = BoundedMemo(32)
+
+#: Target-binary content hashes, keyed on (resolved path, mtime_ns,
+#: size). :func:`find_redb` runs once per reviewed function (via
+#: assemble_context and the deepen loop), and hashing a large target
+#: on every accept-path call re-paid the full read each time. The
+#: stat stamp in the key preserves the TOCTOU-at-find property: a
+#: binary swapped between calls (different mtime or size) misses the
+#: memo and re-hashes fresh. Residual (documented): a swap that
+#: preserves BOTH mtime_ns and size serves the stale hash for the
+#: rest of the run — that takes a deliberate timestamp-forging,
+#: size-preserving writer; the per-call rehash this memo retires
+#: (~one full target read per reviewed function) is the trade.
+_TARGET_SHA_MEMO: "BoundedMemo[str]" = BoundedMemo(32)
 
 #: One sandboxed GhidraServer per analysed binary, booted lazily the
 #: first time a checklist function has no cached decompilation and
 #: reused for the rest of the run (JVM boot ~4s once vs per call).
-_SERVER_CACHE: Dict[str, Any] = {}
+#: The per-key boot lock keeps concurrent workers from double-booting
+#: the ~4s JVM (the loser leaked until atexit); the cache lock guards
+#: dict operations only.
+_SERVER_CACHE: dict[str, Any] = {}
+_SERVER_CACHE_LOCK = threading.Lock()
+_SERVER_BOOT_LOCKS: dict[str, threading.Lock] = {}
 
 
 def _lazy_decompile(
     binary_path: str, function_name: str, address,
-    out_dir: Optional[Path] = None,
-) -> Optional[str]:
+    out_dir: Path | None = None,
+) -> str | None:
     """On-demand decompilation through the persistent sandboxed
     server. Availability-gated (pyghidra + a real project source);
     any failure degrades to None and the stub text stands."""
@@ -49,28 +72,37 @@ def _lazy_decompile(
     except ImportError:
         return None
     key = str(Path(binary_path).resolve())
-    srv = _SERVER_CACHE.get(key)
+    with _SERVER_CACHE_LOCK:
+        srv = _SERVER_CACHE.get(key)
+        boot_lock = _SERVER_BOOT_LOCKS.setdefault(key, threading.Lock())
+    if srv is None:
+        with boot_lock:
+            with _SERVER_CACHE_LOCK:
+                srv = _SERVER_CACHE.get(key)
+            if srv is None:
+                try:
+                    gpr = _project_for_binary(Path(binary_path), out_dir)
+                    if gpr is None:
+                        with _SERVER_CACHE_LOCK:
+                            _SERVER_CACHE[key] = False
+                        return None
+                    srv = GhidraServer(gpr)
+                    srv.start()
+                    import atexit
+                    atexit.register(srv.stop)
+                    srv.open()  # raw-open: not a filesystem open — Ghidra bridge server session
+                    with _SERVER_CACHE_LOCK:
+                        _SERVER_CACHE[key] = srv
+                except Exception:  # noqa: BLE001 — boot failure poisons the cache
+                    logger.debug(
+                        "lazy decompile server boot failed for %s",
+                        binary_path, exc_info=True,
+                    )
+                    with _SERVER_CACHE_LOCK:
+                        _SERVER_CACHE[key] = False
+                    return None
     if srv is False:
         return None  # previous BOOT failed — don't retry every call
-    if srv is None:
-        try:
-            gpr = _project_for_binary(Path(binary_path), out_dir)
-            if gpr is None:
-                _SERVER_CACHE[key] = False
-                return None
-            srv = GhidraServer(gpr)
-            srv.start()
-            import atexit
-            atexit.register(srv.stop)
-            srv.open()
-            _SERVER_CACHE[key] = srv
-        except Exception:  # noqa: BLE001 — boot failure poisons the cache
-            logger.debug(
-                "lazy decompile server boot failed for %s",
-                binary_path, exc_info=True,
-            )
-            _SERVER_CACHE[key] = False
-            return None
     target = address if address is not None else function_name
     try:
         return srv.decompile(target)
@@ -99,13 +131,14 @@ def _lazy_decompile(
                     "lazy decompile server restart failed",
                     exc_info=True,
                 )
-                _SERVER_CACHE[key] = False
+                with _SERVER_CACHE_LOCK:
+                    _SERVER_CACHE[key] = False
         return None
 
 
 def _project_for_binary(
-    binary_path: Path, out_dir: Optional[Path] = None,
-) -> Optional[Path]:
+    binary_path: Path, out_dir: Path | None = None,
+) -> Path | None:
     """A Ghidra project for the binary — RAPTOR-owned locations ONLY.
 
     The binary's own directory is attacker territory: a planted
@@ -132,19 +165,41 @@ def _project_for_binary(
     return None
 
 
-def find_redb(out_dir: Optional[Path], target_path: Optional[Path]) -> Optional[Path]:
+def find_redb(
+    out_dir: Path | None,
+    target_path: Path | None,
+    *,
+    validate: bool = True,
+) -> Path | None:
     """Locate the run's re-database.json.
 
     Search order: the run output directory, its parent (shared
     pipeline dirs), then the import cache convention for the target
     binary. Only RAPTOR-owned locations — never the scanned target's
     own directory.
+
+    Every existing candidate is identity-checked against
+    ``target_path`` before it is accepted (:func:`_accept_redb`):
+    the parent slot is SHARED by every run of a multi-binary
+    project, so the first existing file can be a database built for
+    a different binary, and accepting it builds the run's checklist
+    from the wrong function set. A wrong-binary or content-stale
+    candidate is skipped with a loud warning and the search
+    continues — fail toward rebuild, never a hard error.
+
+    ``validate=False`` keeps the historical existence-probe-only
+    behaviour (no content reads) for callers that only need a size
+    estimate and never authorize cache use (the checklist-build
+    timeout scaler).
     """
     import os
-    candidates: List[Path] = []
+    candidates: list[tuple[Path, str]] = []
     if out_dir:
-        candidates.append(Path(out_dir) / "re-database.json")
-        candidates.append(Path(out_dir).parent / "re-database.json")
+        # The run's own output dir is single-target by construction;
+        # its parent is the shared multi-binary project slot.
+        candidates.append((Path(out_dir) / "re-database.json", "run"))
+        candidates.append(
+            (Path(out_dir).parent / "re-database.json", "shared"))
     if target_path:
         # Anchor to the RAPTOR repo's out/ — a cwd-relative path
         # would resolve inside the scanned target's own directory
@@ -152,29 +207,260 @@ def find_redb(out_dir: Optional[Path], target_path: Optional[Path]) -> Optional[
         # entire derived database.
         raptor_dir = os.environ.get("RAPTOR_DIR")
         if raptor_dir:
-            candidates.append(
+            # Location derived from THIS target's stem — stem-keyed
+            # by construction.
+            candidates.append((
                 Path(raptor_dir) / "out"
                 / f"ghidra-import-{Path(target_path).stem}"
-                / "re-database.json"
-            )
-    for cand in candidates:
-        if cand.is_file():
+                / "re-database.json",
+                "stem-keyed",
+            ))
+
+    # The target's content hash is computed at most once per call,
+    # only when some candidate actually carries a stamp, and served
+    # from the stat-stamped memo across calls (find_redb runs per
+    # reviewed function).
+    sha_cell: list[str | None] = []
+
+    def _target_sha() -> str | None:
+        if not sha_cell:
+            sha_cell.append(_target_content_sha(Path(target_path)))  # type: ignore[arg-type]
+        return sha_cell[0]
+
+    for cand, kind in candidates:
+        if not cand.is_file():
+            continue
+        if not validate or target_path is None:
+            return cand
+        if _accept_redb(cand, Path(target_path), kind, _target_sha):
             return cand
     return None
 
 
+def _target_content_sha(target: Path) -> str | None:
+    """The target binary's sha256, memoized on (resolved path,
+    mtime_ns, size).
+
+    ``None`` when the target cannot be statted or read — the caller
+    falls through to path/slot evidence. Failures are never memoized
+    (a transient read error must not poison later calls); see
+    :data:`_TARGET_SHA_MEMO` for the same-mtime+same-size residual.
+    """
+    try:
+        st = target.stat()
+        key = (str(target.resolve()), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+    try:
+        from core.hash import sha256_file
+        sha, _cached = _TARGET_SHA_MEMO.get_or_compute(
+            key, lambda: sha256_file(target),
+        )
+    except OSError:
+        return None
+    return sha
+
+
+def _accept_redb(
+    cand: Path,
+    target: Path,
+    kind: str,
+    target_sha: Callable[[], str | None],
+) -> bool:
+    """Identity gate for one existing re-database.json candidate.
+
+    Evidence order:
+
+    1. **Content hash** — a recorded ``metadata.binary_sha256``
+       compared against the target file's current hash decides in
+       both directions: match accepts (regardless of recorded path
+       spelling — the binary merely moved), mismatch skips (binary
+       rebuilt in place, or a foreign cache).
+    2. **Path identity** — the recorded ``binary_path`` versus the
+       target (:func:`_same_recorded_binary`).
+    3. **Identity unknown** — the run's own dir (``kind="run"``) and
+       the ghidra-import cache (``kind="stem-keyed"``, its location
+       is derived from this target's stem) keep their historical
+       acceptance; the shared parent slot (``kind="shared"``) is
+       exactly where a foreign binary's cache lives and is never
+       accepted without verifiable identity.
+
+    An UNREADABLE candidate (malformed/oversized) is accepted:
+    identity is unknowable here and every consumer already owns a
+    load-error path for this exact file — the pre-validation
+    contract (hand the path back, let the caller's handling fire)
+    is the least surprising behaviour.
+    """
+    try:
+        db = load_redb(cand)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        # TypeError/AttributeError: a planted cache with wrong-TYPED
+        # fields (functions: 5, functions: [3], ...) raises these out
+        # of REDatabase.from_dict — the same unknowable-identity
+        # class as malformed JSON, and letting them escape violated
+        # the never-a-hard-error contract on every consumer path.
+        return True
+
+    def _skip(why: str) -> bool:
+        from core.security.log_sanitisation import escape_nonprintable
+        logger.warning(
+            "binary-cache: SKIPPING stale/foreign %s — %s (run target: "
+            "%s); falling through toward re-import",
+            # The candidate path is escaped too: the stem-keyed slot
+            # embeds the target-repo-chosen binary stem, so raw
+            # control bytes would ride into the operator's terminal.
+            escape_nonprintable(str(cand)[:300]), why,
+            escape_nonprintable(str(target)[:300]),
+        )
+        return False
+
+    # Type-gated (belt and braces with REDatabase.from_dict's own
+    # gate): a wrong-typed binary_path in a planted cache must fall
+    # to the identity-unknown slot rule, never into Path().
+    recorded = (
+        db.binary_path
+        if isinstance(db.binary_path, str) and db.binary_path
+        else None
+    )
+    meta = db.metadata if isinstance(db.metadata, dict) else {}
+    stamp = meta.get("binary_sha256")
+    if not (isinstance(stamp, str) and stamp):
+        stamp = None
+
+    if stamp and target.suffix != ".gpr" and target.is_file():
+        actual = target_sha()
+        if actual is not None:
+            if actual == stamp:
+                return True
+            return _skip(
+                "recorded binary_sha256 does not match the target's "
+                "current content (rebuilt or different binary)")
+
+    if recorded:
+        from core.security.log_sanitisation import escape_nonprintable
+        verdict = _same_recorded_binary(Path(recorded), target)
+        if verdict is True:
+            return True
+        if verdict is False:
+            return _skip(
+                "database records a different binary "
+                f"({escape_nonprintable(str(recorded)[:300])})")
+
+    if kind in ("run", "stem-keyed"):
+        return True
+    return _skip(
+        "no verifiable binary identity in a shared cache location")
+
+
+def _same_recorded_binary(recorded: Path, target: Path) -> bool | None:
+    """Is the database's recorded binary the run's target?
+
+    ``True``/``False`` when decidable; ``None`` when identity is
+    unknown — the target is not a regular file (run-dir spelling),
+    a ``.gpr`` whose recorded binary cannot be tied to an arbitrary
+    foreign name (an operator-named project legitimately differs
+    from its binary's name), or a recorded path that no longer
+    exists but shares the target's stem (moved binary and same-stem
+    foreign binary are indistinguishable by name alone).
+    """
+    import os
+    if target.suffix == ".gpr":
+        # Ghidra records executablePath = the ORIGINAL import source
+        # (never a path inside the project's .rep payload), so a
+        # recorded path merely contained under the .gpr's parent is
+        # NOT identity: that directory is routinely shared by several
+        # projects and their bundled binaries, and containment
+        # accepted a sibling project's binary. A stem match (raptor-
+        # created projects are named after their binary) is the only
+        # affirmative signal; anything else is UNKNOWN — the slot
+        # rule decides (an operator-named project legitimately
+        # differs from its binary's name, so unknown, not foreign).
+        return True if recorded.stem == target.stem else None
+    if not target.is_file():
+        return None
+    try:
+        if recorded.exists() and os.path.samefile(recorded, target):
+            return True
+    except OSError:
+        pass
+    try:
+        if recorded.resolve() == target.resolve():
+            return True
+    except OSError:
+        return None
+    if not recorded.exists():
+        # Recorded binary moved or deleted and no hash decided above:
+        # the name is the only signal left, and an equal name is NOT
+        # proof — a same-stem foreign binary's cache (built for a
+        # deleted /elsewhere/<stem>) is indistinguishable from the
+        # documented moved-binary case. Identity-UNKNOWN: the slot
+        # rule decides, so the run-local and stem-keyed slots keep
+        # the moved-binary acceptance while the shared slot refuses.
+        # A different stem is affirmatively foreign.
+        return None if recorded.stem == target.stem else False
+    return False
+
+
+def stamp_binary_sha256(doc: dict, binary_path: Path) -> None:
+    """Stamp the analysed binary's content hash into a re-database
+    document about to be written, so later cache hits on it are
+    hash-validatable (:func:`_accept_redb`). Best-effort: a missing
+    or unreadable binary, or a foreign metadata shape, leaves the
+    document unchanged.
+
+    Residual (documented): the hash is captured AFTER the import
+    that derived *doc* — a binary swapped mid-import gets the new
+    build's hash stamped over the old build's database, and a later
+    lookup of the swapped binary would accept it. Closing the window
+    means capturing the hash before the importer's first read and
+    threading it through every import lane (including the Ghidra
+    bridge, which is outside this helper); until then the stamp
+    narrows staleness to that import-duration window, it does not
+    eliminate it."""
+    try:
+        if not Path(binary_path).is_file():
+            return
+        meta = doc.setdefault("metadata", {})
+        if not isinstance(meta, dict):
+            return
+        from core.hash import sha256_file
+        meta["binary_sha256"] = sha256_file(Path(binary_path))
+    except OSError:
+        logger.debug("could not hash %s", binary_path, exc_info=True)
+
+
+#: re-database.json read ceiling. RAPTOR-written, but derived from a
+#: hostile binary's decompilation/symbols — a pathological import can
+#: balloon it. Bound to the ONE shared RE-database constant (never a
+#: value copy): a private 64MiB cap here refused the legitimate
+#: --decompile-all artifact the importer itself recommends creating,
+#: erroring the build-checklist lane on it. Imported at the
+#: definition site so the binding and its rationale read as one unit.
+from core.json.utils import (  # noqa: E402
+    RE_DATABASE_MAX_BYTES as _MAX_REDB_BYTES,
+)
+
+
 def load_redb(redb_path: Path):
-    """Load an REDatabase from disk, cached on (path, mtime)."""
+    """Load an REDatabase from disk, cached on (path, mtime).
+
+    Size-gated (:data:`_MAX_REDB_BYTES`): an over-budget file raises
+    :class:`~core.json.utils.JsonBudgetExceededError` (a ``ValueError``,
+    so existing malformed-input handlers degrade the same way).
+    """
+    from core.json import load_json_bounded
     from packages.ghidra.model import REDatabase
 
-    key = str(Path(redb_path).resolve())
-    mtime = Path(redb_path).stat().st_mtime_ns
-    cached = _REDB_CACHE.get(key)
-    if cached and cached[0] == mtime:
-        return cached[1]
-    with open(redb_path) as f:
-        db = REDatabase.from_dict(json.load(f))
-    _REDB_CACHE[key] = (mtime, db)
+    key = (
+        str(Path(redb_path).resolve()),
+        Path(redb_path).stat().st_mtime_ns,
+    )
+    db, _cached = _REDB_MEMO.get_or_compute(
+        key,
+        lambda: REDatabase.from_dict(
+            load_json_bounded(redb_path, max_bytes=_MAX_REDB_BYTES)
+        ),
+    )
     return db
 
 
@@ -183,12 +469,12 @@ def assemble_binary_context(
     target_path: Path,
     file_path: str,
     function_name: str,
-    checklist: Optional[Dict[str, Any]] = None,
-    context_map: Optional[Dict[str, Any]] = None,
-    annotations_dir: Optional[Path] = None,
-    out_dir: Optional[Path] = None,
+    checklist: dict[str, Any] | None = None,
+    context_map: dict[str, Any] | None = None,
+    annotations_dir: Path | None = None,
+    out_dir: Path | None = None,
     db=None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Assemble a context slice for one binary function.
 
     Mirrors :func:`core.audit.context.assemble_context`'s return
@@ -232,7 +518,7 @@ def assemble_binary_context(
             if func is not None:
                 address = func.address
 
-    ctx: Dict[str, Any] = {
+    ctx: dict[str, Any] = {
         "file": file_path,
         "function": function_name,
         "line_start": 0,
@@ -331,6 +617,16 @@ def assemble_binary_context(
                     callee["source_snippet"], content_type="source",
                     location=location,
                 )
+        # Recovered type bodies are DWARF/Ghidra-derived (type and
+        # field names come from the hostile binary) — same trust
+        # footing as the decompilation above.
+        for td in ctx.get("type_definitions", []):
+            if td.get("source"):
+                td["source"] = sanitise_for_prompt(
+                    td["source"], content_type="source",
+                    location=f"{location} (recovered type "
+                             f"{td.get('name', '?')})",
+                )
     except Exception:
         logger.warning("prompt defence failed", exc_info=True)
 
@@ -369,18 +665,44 @@ def _read_binary_source(func, target_path=None, out_dir=None):
     )
 
 
-def _binary_callers(db, func) -> List[Dict[str, Any]]:
+def _xref_call_adjacency(db) -> tuple[dict[Any, list], dict[Any, list]]:
+    """Call-edge adjacency: (to_addr -> [xref], caller_addr -> [xref]).
+
+    Both renderers below used to walk ``db.xrefs`` in full for EVERY
+    reviewed function — N functions x X xrefs per gap loop.  Built
+    once per database object and memoised on it (same count-based
+    invalidation discipline as the model's ``_addr_index``: the
+    enrich path appends xrefs).  The memo dies with the db object,
+    so the (path, mtime)-keyed ``_REDB_MEMO`` carries it across the
+    whole run and a changed re-database.json starts fresh.
+    """
+    cached = getattr(db, "_audit_xref_adjacency", None)
+    if cached is not None and cached[0] == len(db.xrefs):
+        return cached[1], cached[2]
+    by_callee: dict[Any, list] = {}
+    by_caller: dict[Any, list] = {}
+    for xref in db.xrefs:
+        if xref.kind != "call":
+            continue
+        by_callee.setdefault(xref.to_addr, []).append(xref)
+        caller = db.function_containing_address(xref.from_addr)
+        if caller is not None:
+            by_caller.setdefault(caller.address, []).append(xref)
+    db._audit_xref_adjacency = (len(db.xrefs), by_callee, by_caller)
+    return by_callee, by_caller
+
+
+def _binary_callers(db, func) -> list[dict[str, Any]]:
     if db is None or func is None:
         return []
     callers = []
     seen = set()
-    for xref in db.xrefs:
-        if xref.to_addr != func.address or xref.kind != "call":
-            continue
+    by_callee, _ = _xref_call_adjacency(db)
+    for xref in by_callee.get(func.address, []):
         caller = db.function_containing_address(xref.from_addr)
         if caller and caller.address not in seen:
             seen.add(caller.address)
-            entry: Dict[str, Any] = {
+            entry: dict[str, Any] = {
                 "name": caller.name,
                 "file": BINARY_PATH_PREFIX + Path(
                     db.binary_path or "unknown").stem,
@@ -393,21 +715,17 @@ def _binary_callers(db, func) -> List[Dict[str, Any]]:
     return callers[:15]
 
 
-def _binary_callees(db, func) -> List[Dict[str, Any]]:
+def _binary_callees(db, func) -> list[dict[str, Any]]:
     if db is None or func is None:
         return []
     callees = []
     seen = set()
-    for xref in db.xrefs:
-        if xref.kind != "call":
-            continue
-        caller = db.function_containing_address(xref.from_addr)
-        if caller is None or caller.address != func.address:
-            continue
+    _, by_caller = _xref_call_adjacency(db)
+    for xref in by_caller.get(func.address, []):
         callee = db.function_by_address(xref.to_addr)
         if callee and callee.address not in seen:
             seen.add(callee.address)
-            entry: Dict[str, Any] = {
+            entry: dict[str, Any] = {
                 "name": callee.name,
                 "file": BINARY_PATH_PREFIX + Path(
                     db.binary_path or "unknown").stem,
@@ -424,7 +742,7 @@ def _binary_callees(db, func) -> List[Dict[str, Any]]:
     return callees[:15]
 
 
-def _binary_sinks(context_map, function_name, address, func=None) -> List[str]:
+def _binary_sinks(context_map, function_name, address, func=None) -> list[str]:
     """Sinks reachable from THIS function, as prompt-ready strings.
 
     Matches the source path's contract (strings, per-function): map
@@ -483,7 +801,7 @@ def _load_annotation(annotations_dir, file_path, function_name, out_dir):
         return None
 
 
-def _related_types(func, db) -> List[Dict[str, Any]]:
+def _related_types(func, db) -> list[dict[str, Any]]:
     """Types referenced by the function, in the formatter's shape.
 
     ``format_context_for_prompt`` renders type_definitions entries as
@@ -521,7 +839,7 @@ def _related_types(func, db) -> List[Dict[str, Any]]:
     return out
 
 
-def _function_comments(db, func) -> List[Dict[str, str]]:
+def _function_comments(db, func) -> list[dict[str, str]]:
     if db is None or func is None:
         return []
     return [

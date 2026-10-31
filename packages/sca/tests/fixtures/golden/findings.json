@@ -1,0 +1,414 @@
+[
+  {
+    "id": "sca:vuln:npm:lodash:4.17.20:GHSA-aaaa-bbbb-cccc",
+    "finding_id": "sca:vuln:npm:lodash:4.17.20:GHSA-aaaa-bbbb-cccc",
+    "vuln_type": "sca:vulnerable_dependency",
+    "tool": "sca",
+    "file": "/repo/package.json",
+    "function": "lodash",
+    "line": 0,
+    "severity": "critical",
+    "suppressed": false,
+    "suppression_reason": null,
+    "title": "lodash@4.17.20 \u2014 Command injection in template",
+    "description": "lodash@4.17.20: Command injection in template (CVE-2021-23337) [KEV] [EPSS 0.97]",
+    "sca": {
+      "ecosystem": "npm",
+      "name": "lodash",
+      "alias_name": "my-lodash",
+      "version": "4.17.20",
+      "purl": "pkg:npm/lodash@4.17.20",
+      "scope": "main",
+      "is_lockfile": false,
+      "direct": true,
+      "pin_style": "exact",
+      "commented_out": false,
+      "declared_in": "/repo/package.json",
+      "source_kind": "manifest",
+      "advisory": {
+        "id": "GHSA-aaaa-bbbb-cccc",
+        "aliases": [
+          "CVE-2021-23337"
+        ],
+        "summary": "Command injection in template",
+        "fixed_versions": [
+          "4.17.21"
+        ],
+        "references": [
+          "https://example.invalid/advisory"
+        ],
+        "severity": {
+          "score": 9.8,
+          "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+          "severity": "critical"
+        },
+        "published": "2024-01-15T12:00:00+00:00",
+        "modified": "2024-02-01T08:30:00+00:00",
+        "cwe_ids": [
+          "CWE-94"
+        ]
+      },
+      "all_advisories": [
+        {
+          "id": "GHSA-aaaa-bbbb-cccc",
+          "aliases": [
+            "CVE-2021-23337"
+          ],
+          "summary": "Command injection in template",
+          "fixed_versions": [
+            "4.17.21"
+          ],
+          "references": [
+            "https://example.invalid/advisory"
+          ],
+          "severity": {
+            "score": 9.8,
+            "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+            "severity": "critical"
+          },
+          "published": "2024-01-15T12:00:00+00:00",
+          "modified": "2024-02-01T08:30:00+00:00",
+          "cwe_ids": [
+            "CWE-94"
+          ]
+        },
+        {
+          "id": "PYSEC-2021-0001",
+          "aliases": [
+            "CVE-2021-23337"
+          ],
+          "summary": "Duplicate record for the same CVE",
+          "fixed_versions": [
+            "4.17.21"
+          ],
+          "references": [
+            "https://example.invalid/advisory"
+          ],
+          "severity": {
+            "score": 7.2,
+            "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+            "severity": "high"
+          },
+          "published": "2024-01-15T12:00:00+00:00",
+          "modified": "2024-02-01T08:30:00+00:00"
+        }
+      ],
+      "in_kev": true,
+      "epss": 0.97,
+      "fixed_version": "4.17.21",
+      "reachability": {
+        "verdict": "likely_called",
+        "confidence": {
+          "level": "high",
+          "numeric": 0.95,
+          "reason": "call site found"
+        },
+        "evidence": [
+          "src/app.js:42"
+        ]
+      },
+      "cvss_score": 9.8,
+      "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95,
+        "reason": "exact manifest pin"
+      },
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95,
+        "reason": "exact manifest pin"
+      },
+      "exposure_factor": 0.0,
+      "transitive_depth": 0,
+      "raptor_risk_estimate": 68.05093727603116,
+      "risk_components": {
+        "cvss_source": "numeric",
+        "cvss_base": 98.00000000000001,
+        "kev_multiplier": 1.9326,
+        "exploit_evidence_multiplier": 1.0,
+        "ssvc_automatable_multiplier": 1.0,
+        "epss_multiplier": 0.884721,
+        "reachability_multiplier": 1.0,
+        "exposure_multiplier": 0.45,
+        "depth_multiplier": 1.0,
+        "parser_confidence": 0.95,
+        "version_match_confidence": 0.95,
+        "final": 68.05093727603116,
+        "calibration_status": "unverified"
+      },
+      "exploit_evidence": {
+        "kev_listed": true,
+        "edb_ids": [
+          50001
+        ],
+        "msf_modules": [
+          "exploit/multi/http/lodash_template"
+        ],
+        "github_poc_urls": [
+          "https://example.invalid/poc"
+        ],
+        "has_any": true
+      },
+      "related_findings": []
+    }
+  },
+  {
+    "id": "sca:vuln:PyPI:requests:2.19.0:GHSA-dddd-eeee-ffff",
+    "finding_id": "sca:vuln:PyPI:requests:2.19.0:GHSA-dddd-eeee-ffff",
+    "vuln_type": "sca:vulnerable_dependency",
+    "tool": "sca",
+    "file": "/repo/requirements.txt",
+    "function": "requests",
+    "line": 0,
+    "severity": "medium",
+    "suppressed": true,
+    "suppression_reason": "accepted: internal-only service",
+    "title": "requests@2.19.0 \u2014 Credentials leak on redirect",
+    "description": "requests@2.19.0: Credentials leak on redirect (CVE-2018-18074) [EPSS 0.12]",
+    "sca": {
+      "ecosystem": "PyPI",
+      "name": "requests",
+      "alias_name": null,
+      "version": "2.19.0",
+      "purl": "pkg:pypi/requests@2.19.0",
+      "scope": "main",
+      "is_lockfile": false,
+      "direct": true,
+      "pin_style": "exact",
+      "commented_out": false,
+      "declared_in": "/repo/requirements.txt",
+      "source_kind": "manifest",
+      "advisory": {
+        "id": "GHSA-dddd-eeee-ffff",
+        "aliases": [
+          "CVE-2018-18074"
+        ],
+        "summary": "Credentials leak on redirect",
+        "fixed_versions": [
+          "2.20.0"
+        ],
+        "references": [
+          "https://example.invalid/advisory"
+        ],
+        "severity": {
+          "score": 5.0,
+          "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+          "severity": "medium"
+        },
+        "published": "2024-01-15T12:00:00+00:00",
+        "modified": "2024-02-01T08:30:00+00:00"
+      },
+      "all_advisories": [
+        {
+          "id": "GHSA-dddd-eeee-ffff",
+          "aliases": [
+            "CVE-2018-18074"
+          ],
+          "summary": "Credentials leak on redirect",
+          "fixed_versions": [
+            "2.20.0"
+          ],
+          "references": [
+            "https://example.invalid/advisory"
+          ],
+          "severity": {
+            "score": 5.0,
+            "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+            "severity": "medium"
+          },
+          "published": "2024-01-15T12:00:00+00:00",
+          "modified": "2024-02-01T08:30:00+00:00"
+        }
+      ],
+      "in_kev": false,
+      "epss": 0.12,
+      "fixed_version": "2.20.0",
+      "reachability": {
+        "verdict": "not_evaluated",
+        "confidence": {
+          "level": "low",
+          "numeric": 0.3,
+          "reason": "reachability stage skipped for this ecosystem"
+        },
+        "evidence": []
+      },
+      "cvss_score": 5.0,
+      "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+      "version_match_confidence": {
+        "level": "high",
+        "numeric": 0.95,
+        "reason": "exact manifest pin"
+      },
+      "parser_confidence": {
+        "level": "high",
+        "numeric": 0.95,
+        "reason": "exact manifest pin"
+      },
+      "exposure_factor": 0.0,
+      "transitive_depth": 0,
+      "raptor_risk_estimate": 6.158131572712499,
+      "risk_components": {
+        "cvss_source": "numeric",
+        "cvss_base": 50.0,
+        "kev_multiplier": 1.0,
+        "exploit_evidence_multiplier": 1.0,
+        "ssvc_automatable_multiplier": 1.0,
+        "epss_multiplier": 0.494316,
+        "reachability_multiplier": 0.6135,
+        "exposure_multiplier": 0.45,
+        "depth_multiplier": 1.0,
+        "parser_confidence": 0.95,
+        "version_match_confidence": 0.95,
+        "final": 6.158131572712499,
+        "calibration_status": "unverified"
+      },
+      "exploit_evidence": null,
+      "related_findings": []
+    }
+  },
+  {
+    "id": "sca:hygiene:loose_pin:npm:express",
+    "finding_id": "sca:hygiene:loose_pin:npm:express",
+    "vuln_type": "sca:hygiene:loose_pin",
+    "tool": "sca",
+    "file": "/repo/package.json",
+    "function": "express",
+    "line": 0,
+    "severity": "low",
+    "suppressed": false,
+    "suppression_reason": null,
+    "title": "Loose pin: express",
+    "description": "express uses a caret range; patch releases land silently",
+    "sca": {
+      "kind": "loose_pin",
+      "ecosystem": "npm",
+      "name": "express",
+      "alias_name": null,
+      "version": "4.0.0",
+      "purl": "pkg:npm/express@4.0.0",
+      "scope": "main",
+      "is_lockfile": false,
+      "pin_style": "caret",
+      "commented_out": false,
+      "confidence": {
+        "level": "high",
+        "numeric": 0.95,
+        "reason": "manifest says ^4.0.0"
+      }
+    }
+  },
+  {
+    "id": "sca:supplychain:typosquat_candidate:PyPI:reqeusts",
+    "finding_id": "sca:supplychain:typosquat_candidate:PyPI:reqeusts",
+    "vuln_type": "sca:supply_chain:typosquat_candidate",
+    "tool": "sca",
+    "file": "/repo/requirements.txt",
+    "function": "reqeusts",
+    "line": 0,
+    "severity": "high",
+    "suppressed": false,
+    "suppression_reason": null,
+    "title": "Typosquat candidate: reqeusts",
+    "description": "reqeusts is 1 edit from requests (top-1k package)",
+    "sca": {
+      "kind": "typosquat_candidate",
+      "ecosystem": "PyPI",
+      "name": "reqeusts",
+      "alias_name": null,
+      "version": "1.0.0",
+      "commented_out": false,
+      "evidence": {
+        "target": "requests",
+        "edit_distance": 1
+      },
+      "confidence": {
+        "level": "medium",
+        "numeric": 0.7,
+        "reason": "edit-distance heuristic"
+      }
+    }
+  },
+  {
+    "id": "sca:supplychain:image_capability_drift:sha256-abc",
+    "finding_id": "sca:supplychain:image_capability_drift:sha256-abc",
+    "vuln_type": "sca:supply_chain:image_capability_drift",
+    "tool": "sca",
+    "file": "/repo/Dockerfile",
+    "function": "alpine",
+    "line": 0,
+    "severity": "medium",
+    "suppressed": false,
+    "suppression_reason": null,
+    "title": "Image capability drift: alpine",
+    "description": "rebuilt image gained network capability",
+    "sca": {
+      "kind": "image_capability_drift",
+      "ecosystem": "OCI",
+      "name": "alpine",
+      "alias_name": null,
+      "version": "3.19",
+      "commented_out": false,
+      "evidence": {
+        "added_buckets": [
+          "network"
+        ],
+        "removed_buckets": []
+      },
+      "confidence": {
+        "level": "high",
+        "numeric": 0.95,
+        "reason": "capability diff"
+      }
+    }
+  },
+  {
+    "id": "sca:license_denied:npm:left-pad@1.3.0",
+    "finding_id": "sca:license_denied:npm:left-pad@1.3.0",
+    "vuln_type": "sca:license:denied",
+    "tool": "sca",
+    "file": "/repo/package.json",
+    "function": "left-pad",
+    "line": 0,
+    "severity": "high",
+    "suppressed": false,
+    "suppression_reason": null,
+    "title": "Denied: left-pad",
+    "description": "left-pad is AGPL-3.0-only; policy denies AGPL",
+    "sca": {
+      "kind": "license_denied",
+      "ecosystem": "npm",
+      "name": "left-pad",
+      "alias_name": null,
+      "version": "1.3.0",
+      "spdx": "AGPL-3.0-only",
+      "purl": "pkg:npm/left-pad@1.3.0",
+      "commented_out": false,
+      "confidence": {
+        "level": "high",
+        "numeric": 0.95,
+        "reason": "registry-declared license"
+      }
+    }
+  },
+  {
+    "id": "sca:scan_health:osv_lookup_failed",
+    "finding_id": "sca:scan_health:osv_lookup_failed",
+    "vuln_type": "sca:scan_health:osv_lookup_failed",
+    "tool": "sca",
+    "file": "",
+    "function": "",
+    "line": 0,
+    "severity": "info",
+    "suppressed": false,
+    "suppression_reason": null,
+    "title": "Osv lookup failed",
+    "description": "OSV lookups failed transiently for 1 ecosystem",
+    "sca": {
+      "failed_ecosystems": [
+        "Cargo"
+      ],
+      "kind": "osv_lookup_failed"
+    }
+  }
+]

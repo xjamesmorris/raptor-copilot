@@ -12,7 +12,10 @@ at the cost of non-deterministic observation ordering.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import functools
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
@@ -21,9 +24,56 @@ from core.llm.client import is_budget_exceeded_error
 from core.llm.concurrency import read_throttle_cooldown_s
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
 logger = logging.getLogger(__name__)
+
+
+# ── Review-work inflight accounting ──────────────────────────────────
+#
+# Process-global count of review tasks EXECUTING right now (an LLM
+# review, a glance batch, a re-review phase item) across the serial
+# loop, the async workers, and the orchestrator's phase pools. The
+# journal checkpoint's precondition guard reads it
+# (core.coverage.journal_checkpoint._assert_quiesced): the checkpoint
+# must be impossible to enter while review work is in flight — an
+# enforced assertion, not a call-site convention. Counting the WORK
+# (not executor entry) is what lets the quiesced mid-pass checkpoint
+# run inside run_executor_sync's own dispatch loop: the executor is
+# on the stack, but its workers are provably drained.
+
+_review_work_lock = threading.Lock()
+_review_work_count = 0
+
+
+@contextlib.contextmanager
+def review_work_active() -> Iterator[None]:
+    """Scope one executing review-work item (see the section note)."""
+    global _review_work_count
+    with _review_work_lock:
+        _review_work_count += 1
+    try:
+        yield
+    finally:
+        with _review_work_lock:
+            _review_work_count -= 1
+
+
+def review_work_inflight() -> int:
+    """Review-work items executing in this process right now."""
+    with _review_work_lock:
+        return _review_work_count
+
+
+def counted_review_call(fn: Callable) -> Callable:
+    """Wrap *fn* so every call scopes :func:`review_work_active` —
+    the one seam the executor paths and the orchestrator's phase
+    pools share for inflight accounting."""
+    @functools.wraps(fn)
+    def inner(*args: Any, **kwargs: Any) -> Any:
+        with review_work_active():
+            return fn(*args, **kwargs)
+    return inner
 
 
 @dataclass
@@ -32,6 +82,24 @@ class ExecutorConfig:
 
 
 _PROGRESS_CHECKPOINT_INTERVAL = 60.0
+
+#: How long the async executor's all-work-held branch waits for a
+#: study-progress wakeup before re-evaluating the held set. Module
+#: constant (was an inline literal) so the stall watchdog's tests can
+#: shrink the cycle instead of sleeping wall-clock seconds.
+_ALL_HELD_WAIT_S = 30.0
+
+#: Consecutive all-work-held wait cycles with an UNCHANGED held set
+#: and an idle/finished study consumer before the stall watchdog
+#: force-releases the held tasks. Trade-off, both directions: too low
+#: and a slow-but-live consumer wakeup (mark_studied racing the cycle
+#: boundary) gets force-released a cycle early — harmless, the tasks
+#: just review without the study context, but it forfeits enrichment;
+#: too high and a genuine hold/release livelock (the wedge this
+#: breaker exists for) burns that many more silent 30s cycles before
+#: the run makes progress again. Three cycles ≈ 90s of provable
+#: no-progress is decisive either way.
+_ALL_HELD_STALL_CYCLES = 3
 
 
 @dataclass
@@ -78,21 +146,38 @@ def _commit_error_outcome(
     so without a committed outcome the failure left no trace in the
     journal, tallies, or error stats).
     """
+    from .environment import note_dispatch_failure
     from .orchestrator import ReviewOutcome, _commit_outcome, _tally_outcome
 
     file = task.gap.get("file", "")
     function = task.gap.get("name", "")
+    # Terminal for this function — let the breaker correlate it with
+    # other functions' failures.
+    note_dispatch_failure(config, f"{file}:{function}", exc)
+    # Both classes are deliberately NOT in the end-of-run recoverable
+    # set: a deterministic bug in the review path would re-fail on
+    # immediate re-dispatch, and an environmental failure would
+    # re-dispatch into the same faulted environment. The next run
+    # (which excludes error verdicts from its reviewed set) retries
+    # the function. ``environment`` is machine-readably distinct so
+    # journal readers can tell the environment failed, not the review
+    # — marked only for disk/fd/memory errnos, or any systemic class
+    # once the breaker has concluded (sub-threshold network/auth
+    # blips keep the per-function class; they fed the window above).
+    from .environment import marks_row_environment
+    error_class = (
+        "environment" if marks_row_environment(
+            exc, getattr(config, "environment_guard_state", None),
+        )
+        else "task_exception"
+    )
     outcome = ReviewOutcome(
         file=file,
         function=function,
         status="error",
         body=f"review failed: {type(exc).__name__}: {exc}",
         line=task.gap.get("line_start", 0),
-        # Distinct class, deliberately NOT in the end-of-run
-        # recoverable set: a deterministic bug in the review path
-        # would re-fail on immediate re-dispatch; the next run (which
-        # excludes error verdicts from its reviewed set) retries it.
-        error_class="task_exception",
+        error_class=error_class,
     )
     try:
         if collector is not None:
@@ -183,6 +268,7 @@ def run_executor_sync(
     throttle: Any | None = None,
     study_queue: Any | None = None,
     concept_index_ref: list | None = None,
+    quiescer: Any | None = None,
 ) -> ExecutorStats:
     """Executor entry point — drop-in replacement for the old ``for gap`` loop.
 
@@ -195,10 +281,21 @@ def run_executor_sync(
     *on_tick* is called once per iteration with the current gap, before
     the review function runs.  The orchestrator uses it for Joern
     future draining and ``reviewed_before_joern`` bookkeeping.
+
+    *quiescer* (``core.audit.journal_quiesce``) adds mid-pass journal
+    checkpoint quiesce points: the trigger is polled at dispatch
+    points, and when it fires the loop stops issuing reviews, drains
+    inflight work (bounded), runs the checkpoint synchronously on
+    THIS thread, and resumes dispatch — the run pauses instead of
+    paying a drain/resume cycle. ``None`` keeps the loops
+    byte-equivalent to the pre-quiesce behaviour.
     """
     if review_one_fn is None:
         from .orchestrator import review_one_function
         review_one_fn = review_one_function
+    # One wrap covers the serial loop, the repass, and every async
+    # worker: review_one_fn is the single entry all of them call.
+    review_one_fn = counted_review_call(review_one_fn)
 
     ec = executor_config or ExecutorConfig()
     stats = ExecutorStats()
@@ -232,6 +329,7 @@ def run_executor_sync(
                     throttle=throttle,
                     study_queue=study_queue,
                     concept_index_ref=concept_index_ref,
+                    quiescer=quiescer,
                 ),
             )
         finally:
@@ -249,6 +347,19 @@ def run_executor_sync(
         nonlocal review_idx
         if not glance_batch or batch_review_fn is None:
             return False
+        # The flush is a dispatch site like any other: tick once per
+        # batch (the batch is one LLM call) so a glance-heavy serial
+        # run still drives the environment guard's pause/probe, then
+        # re-check the stop rails — a tick that concluded the run must
+        # not pay for the batch dispatch. Dropped tasks were never
+        # marked complete, so they stay unreviewed gaps.
+        if on_tick:
+            on_tick(glance_batch[0].gap)
+            if budget_check and budget_check():
+                stats.budget_stopped = True
+                glance_batch.clear()
+                return True
+        committed: set = set()
         try:
             _process_glance_batch(
                 glance_batch, batch_review_fn, shared, config,
@@ -265,14 +376,34 @@ def run_executor_sync(
                 collector=collector,
                 graph=graph,
                 reviewed_outcomes=reviewed_outcomes,
+                committed_keys=committed,
             )
-        except RuntimeError as exc:
-            if not is_budget_exceeded_error(exc):
-                raise
-            stats.budget_stopped = True
-            result.terminated_by = "llm_budget_exceeded"
+        except Exception as exc:  # noqa: BLE001 — budget stop or per-task error record
+            if _is_budget_stop(exc):
+                stats.budget_stopped = True
+                result.terminated_by = "llm_budget_exceeded"
+                glance_batch.clear()
+                return True
+            # Unexpected batch failure (e.g. a raise from
+            # _build_context before the per-item guards): record the
+            # uncommitted members as per-task error outcomes exactly
+            # like the async path — pre-fix the raise propagated out
+            # of the serial loop and one malformed entry cost the
+            # whole run's remaining reviews. Members committed before
+            # a mid-batch raise only need completion bookkeeping
+            # (error-recording them again would double-commit).
+            for t in glance_batch:
+                if t.key in committed:
+                    graph.mark_complete(t.key)
+                    stats.completed += 1
+                    review_idx += 1
+                    continue
+                _record_task_failure(
+                    t, exc, config, result, collector, graph, stats,
+                )
+                review_idx += 1
             glance_batch.clear()
-            return True
+            return False
         for t in glance_batch:
             graph.mark_complete(t.key)
             stats.completed += 1
@@ -297,6 +428,14 @@ def run_executor_sync(
             glance_batch.clear()
             stats.budget_stopped = True
             break
+
+        if quiescer is not None:
+            # Serial loop = permanently quiesced between reviews:
+            # inflight is zero right here, so the checkpoint (rate-
+            # limited trigger poll inside) runs synchronously on this
+            # thread with no drain step. Queued glance tasks are not
+            # inflight work — they hold no fds and no locks.
+            quiescer.maybe_run_quiesced()
 
         tasks = graph.pop_ready(1)
         if not tasks:
@@ -339,6 +478,14 @@ def run_executor_sync(
 
         if on_tick:
             on_tick(task.gap)
+            # The tick can pause for a long time and may conclude the
+            # run (resource watchdog / systemic-fault breaker) — re-
+            # check the stop rails before paying for a dispatch into a
+            # faulted environment. The popped task stays incomplete,
+            # i.e. an unreviewed gap.
+            if budget_check and budget_check():
+                stats.budget_stopped = True
+                break
 
         try:
             review_one_fn(
@@ -399,6 +546,11 @@ def run_executor_sync(
                 break
             if on_tick:
                 on_tick(task.gap)
+                # Same post-tick re-check as the main loop: the tick
+                # may have concluded the run while it paused.
+                if budget_check and budget_check():
+                    stats.budget_stopped = True
+                    break
             try:
                 review_one_fn(
                     task.gap, shared, config, review_fn, result,
@@ -461,6 +613,7 @@ async def _run_async(
     throttle: Any | None = None,
     study_queue: Any | None = None,
     concept_index_ref: list | None = None,
+    quiescer: Any | None = None,
 ) -> ExecutorStats:
     """Async executor with bounded concurrency via throttle.
 
@@ -500,15 +653,16 @@ async def _run_async(
             reviewed_outcomes=reviewed_outcomes,
             study_queue=study_queue,
             concept_index_ref=concept_index_ref,
+            quiescer=quiescer,
         )
     finally:
-        if throttle.signal_count:
+        if throttle is not None and throttle.signal_count:
             logger.info(
                 "throttle stats: %d 429 signals, final effective=%d/%d",
                 throttle.signal_count, throttle.effective_workers,
                 throttle.max_workers,
             )
-        if owns_throttle:
+        if owns_throttle and throttle is not None:
             throttle.close()
 
 
@@ -535,6 +689,7 @@ async def _run_async_body(
     reviewed_outcomes: dict[str, Any] | None = None,
     study_queue: Any | None = None,
     concept_index_ref: list | None = None,
+    quiescer: Any | None = None,
 ) -> ExecutorStats:
     """Inner body of the async executor, separated so _run_async can
     wrap it in try/finally for throttle cleanup."""
@@ -548,6 +703,12 @@ async def _run_async_body(
     review_idx_box = [0]
     inflight: set[asyncio.Task] = set()
     stopping = False
+    # Journal-checkpoint quiesce state: while a quiesce drain is in
+    # progress, completions must NOT dispatch new work — the drain is
+    # waiting for inflight to reach zero, and _after_completion is the
+    # only post-completion dispatcher. The loop re-primes from the
+    # graph after the checkpoint.
+    quiesce_state = {"draining": False}
 
     batch_review_fn = _get_batch_review_fn(shared, config)
     glance_pending: list[Any] = []
@@ -578,6 +739,18 @@ async def _run_async_body(
     def _check_suppression(task: Any) -> bool:
         """Return True if task should be held (suppressed)."""
         if study_queue is None or concept_index_ref is None:
+            return False
+        if getattr(study_queue, "consumer_done", False):
+            # The study consumer has exited — no pending concept can
+            # ever be studied again, so holding work for one is a
+            # provable no-progress state. Pre-fix, a review completing
+            # AFTER the consumer's exit could re-populate the pending
+            # set (a reading-list re-ask nobody would ever consume) and
+            # this check then re-held every task `_release_held`'s
+            # consumer-done branch had just released — a silent
+            # release/re-hold livelock at the all-work-held wait
+            # (observed live: zero CPU, one coroutine ticking every
+            # wait interval, forever).
             return False
         ci = concept_index_ref[0] if concept_index_ref else None
         if ci is None:
@@ -618,10 +791,15 @@ async def _run_async_body(
                 released.append(held_tasks.pop(key))
         return released
 
-    def _dispatch_ready(tasks: list[Any]) -> None:
-        """Route ready tasks: glance-tier into batch queue, others individual."""
+    def _dispatch_ready(tasks: list[Any], *, suppress: bool = True) -> None:
+        """Route ready tasks: glance-tier into batch queue, others individual.
+
+        ``suppress=False`` skips the study-suppression hold — the
+        stall watchdog's force-release path, where holding again is
+        exactly the failure being broken.
+        """
         for task in tasks:
-            if _check_suppression(task):
+            if suppress and _check_suppression(task):
                 continue
             if (
                 batch_review_fn
@@ -647,6 +825,12 @@ async def _run_async_body(
         if now - last_checkpoint >= _PROGRESS_CHECKPOINT_INTERVAL:
             _update_run_progress(config.out_dir, result)
             last_checkpoint = now
+        if quiesce_state["draining"]:
+            # Journal-checkpoint quiesce: no new dispatch while the
+            # drain waits for inflight → 0. Newly-ready tasks stay in
+            # the graph; the loop re-primes after the checkpoint (or
+            # after a drain timeout).
+            return
         if _should_stop():
             return
         newly_ready = graph.pop_ready(ec.max_workers)
@@ -662,6 +846,10 @@ async def _run_async_body(
             for task in batch_tasks:
                 if on_tick:
                     on_tick(task.gap)
+            # The tick can pause and may conclude the run — re-check
+            # before dispatching the batch into a faulted environment.
+            if on_tick and _should_stop():
+                return
             async with review_idx_lock:
                 idx = review_idx_box[0]
                 review_idx_box[0] += len(batch_tasks)
@@ -670,9 +858,9 @@ async def _run_async_body(
             try:
                 await loop.run_in_executor(
                     None,
-                    lambda bt=batch_tasks, ri=idx: _process_glance_batch(
+                    lambda bt=batch_tasks, ri=idx: _process_glance_batch(  # type: ignore[misc]
                         bt, batch_review_fn, shared, config,
-                        result, review_one_fn, review_fn,
+                        result, review_one_fn, review_fn,  # type: ignore[arg-type]
                         joern_server=joern_server,
                         audit_log=audit_log,
                         workqueue=workqueue,
@@ -727,6 +915,10 @@ async def _run_async_body(
 
             if on_tick:
                 on_tick(task.gap)
+                # The tick can pause and may conclude the run — re-
+                # check before dispatching into a faulted environment.
+                if _should_stop():
+                    return
 
             async with review_idx_lock:
                 idx = review_idx_box[0]
@@ -736,7 +928,7 @@ async def _run_async_body(
             try:
                 await loop.run_in_executor(
                     None,
-                    lambda t=task, i=idx: review_one_fn(
+                    lambda t=task, i=idx: review_one_fn(  # type: ignore[misc]
                         t.gap, shared, config, review_fn, result,
                         joern_server=joern_server,
                         audit_log=audit_log,
@@ -768,10 +960,136 @@ async def _run_async_body(
                 stats.completed += 1
             await _after_completion()
 
+    # ── All-work-held stall watchdog ─────────────────────────────────
+    # Livelock breaker for the hold/release cycle: when every wait
+    # cycle re-evaluates an IDENTICAL held set while the study
+    # consumer is provably making no progress (exited, or idle on an
+    # empty queue), waiting longer cannot change anything — after
+    # _ALL_HELD_STALL_CYCLES such cycles the held tasks are
+    # force-released past the suppression gate (fail toward progress:
+    # they review without the study context, exactly what an
+    # unsuppressed task does). One loud line when it fires; with the
+    # consumer-done guards upstream it should never fire — it exists
+    # for the livelock variants those guards don't know about yet.
+    held_stall = {"snap": None, "count": 0}
+
+    def _consumer_stall_fingerprint() -> tuple | None:
+        """A hashable "the consumer cannot make progress" state, or
+        None while progress is still possible (mid-batch, queued work,
+        or a queue implementation this cannot introspect)."""
+        if study_queue is None:
+            return ("no-consumer",)
+        if getattr(study_queue, "consumer_done", False):
+            return ("done",)
+        drain_state = getattr(study_queue, "drain_state", None)
+        if drain_state is None:
+            return None
+        try:
+            progress, queue_empty, working = drain_state()
+        except Exception:  # noqa: BLE001 — watchdog must never break the loop
+            return None
+        if working or not queue_empty:
+            return None
+        return ("idle", progress)
+
+    def _held_stall_tick() -> bool:
+        """Count consecutive no-progress wait cycles; True = break the
+        stall now."""
+        consumer = _consumer_stall_fingerprint()
+        if consumer is None:
+            held_stall["snap"] = None
+            held_stall["count"] = 0
+            return False
+        snap = (
+            tuple(sorted(
+                (key, frozenset(blocked))
+                for key, blocked in hold_set.items()
+            )),
+            consumer,
+        )
+        if snap == held_stall["snap"]:
+            held_stall["count"] += 1  # type: ignore[operator]
+        else:
+            held_stall["snap"] = snap  # type: ignore[assignment]
+            held_stall["count"] = 0
+        return held_stall["count"] >= _ALL_HELD_STALL_CYCLES  # type: ignore[operator]
+
+    def _force_release_held() -> None:
+        blocking = sorted({c for s in hold_set.values() for c in s})
+        logger.error(
+            "executor: %d task(s) held for study of concept(s) %s "
+            "across %d wait cycles with no study progress possible "
+            "(consumer %s) — force-releasing them for review without "
+            "the study context",
+            len(held_tasks), ", ".join(blocking) or "?",
+            held_stall["count"],
+            "exited" if getattr(study_queue, "consumer_done", False)
+            else "idle",
+        )
+        released = list(held_tasks.values())
+        hold_set.clear()
+        held_tasks.clear()
+        held_stall["snap"] = None
+        held_stall["count"] = 0
+        _dispatch_ready(released, suppress=False)
+
+    async def _quiesce_checkpoint() -> None:
+        """Journal-checkpoint quiesce: stop issuing reviews, wait for
+        inflight → 0 (bounded by the quiescer's drain bound), run the
+        checkpoint SYNCHRONOUSLY on this thread, resume dispatch.
+
+        Blocking the event loop for the checkpoint is the design: the
+        loop has nothing inflight by construction when the call runs,
+        and the checkpoint must never be submitted to the executor or
+        wait on executor-produced state (the studywedge self-deadlock
+        class). A drain that cannot reach zero within the bound
+        aborts the attempt — the quiescer notes a retry cooldown and
+        dispatch resumes immediately.
+        """
+        if quiescer is None:  # loop-head guard already excludes this
+            return
+        quiesce_state["draining"] = True
+        try:
+            deadline = time.monotonic() + quiescer.drain_bound_s
+            while inflight:
+                timeout = deadline - time.monotonic()
+                if timeout <= 0:
+                    quiescer.note_drain_timeout(len(inflight))
+                    return
+                done, _p = await asyncio.wait(
+                    inflight,
+                    return_when=asyncio.FIRST_COMPLETED,
+                    timeout=timeout,
+                )
+                inflight.difference_update(done)
+                for t in done:
+                    if not t.cancelled() and t.exception() is not None:
+                        logger.warning(
+                            "unhandled task exception: %s",
+                            t.exception(), exc_info=t.exception(),
+                        )
+                if _should_stop():
+                    return  # the loop head's stop path takes over
+            # inflight is empty; queued glance tasks are not running
+            # work (no fds, no locks). The quiescer parks the study
+            # consumer itself before the checkpoint core runs.
+            quiescer.run_quiesced()
+        finally:
+            quiesce_state["draining"] = False
+
     initial = graph.pop_ready(ec.max_workers)
     _dispatch_ready(initial)
 
     while inflight or glance_pending or hold_set:
+        if (quiescer is not None and not _should_stop()
+                and quiescer.should_attempt()):
+            await _quiesce_checkpoint()
+            if not _should_stop():
+                # Re-prime: completions during the drain deliberately
+                # skipped dispatch, so newly-ready work sits in the
+                # graph.
+                _dispatch_ready(graph.pop_ready(ec.max_workers))
+
         if _should_stop():
             # Stop requested: drop queued glance batches and held
             # tasks — they stay unreviewed gaps.  Without this the
@@ -805,11 +1123,19 @@ async def _run_async_body(
             # above, or cleared by the stop path).
             if not hold_set:
                 break
-            # All work is held — wait for study to complete
+            # All work is held — wait for study to complete. The
+            # stall watchdog bounds this: an unchanged held set with a
+            # consumer that can no longer make progress force-releases
+            # instead of waiting forever (see _held_stall_tick).
+            if _held_stall_tick():
+                _force_release_held()
+                continue
             if study_event is not None:
                 study_event.clear()
                 try:
-                    await asyncio.wait_for(study_event.wait(), timeout=30.0)
+                    await asyncio.wait_for(
+                        study_event.wait(), timeout=_ALL_HELD_WAIT_S,
+                    )
                 except asyncio.TimeoutError:
                     pass
                 continue
@@ -846,6 +1172,9 @@ async def _run_async_body(
                     return
                 if on_tick:
                     on_tick(task.gap)
+                    # Post-tick stop re-check (see _run_task).
+                    if _should_stop():
+                        return
                 async with review_idx_lock:
                     idx = review_idx_box[0]
                     review_idx_box[0] += 1
@@ -853,7 +1182,7 @@ async def _run_async_body(
                 try:
                     await loop.run_in_executor(
                         None,
-                        lambda t=task, i=idx: review_one_fn(
+                        lambda t=task, i=idx: review_one_fn(  # type: ignore[misc]
                             t.gap, shared, config, review_fn, result,
                             joern_server=joern_server,
                             audit_log=audit_log,
@@ -913,10 +1242,74 @@ async def _run_async_body(
 _GLANCE_BATCH_SIZE = 10
 
 # Per-run cap on glance-suspicious escalations to full individual
-# review. The glance prompt biases toward clean, so suspicious rates
-# are low — the cap bounds the worst case (a model that flags
-# everything) without starving the common one.
-_MAX_GLANCE_ESCALATIONS_PER_RUN = 20
+# review, derived from run size:
+#
+#   cap = clamp(_GLANCE_ESCALATION_FLOOR,
+#               checklist_functions // _GLANCE_ESCALATION_DIVISOR,
+#               _GLANCE_ESCALATION_CEILING)
+#
+# Cost model: every escalation converts a ~500-token glance guess into
+# one full-priced individual review (full context budget — orders of
+# magnitude more tokens than the glance itself), so the cap defends
+# real dollars. The glance prompt biases toward clean, so honest
+# suspicious rates are low; the divisor (1 escalation per 50 checklist
+# functions, 2%) sits above the observed honest rate while bounding a
+# model that flags everything. Both directions: LOWER (the old fixed
+# 20) silently commits the cheap glance guess as the FINAL verdict for
+# ≥99.8% of glance-suspicious functions on a kernel-scale checklist
+# (~125k functions) — a silent depth downgrade on a verdict-carrying
+# path; HIGHER buys full reviews with real money on a signal the
+# glance tier exists to keep cheap, and the checklist size that drives
+# the derivation is TARGET-derived — a hostile tree inflating its
+# function count must not be able to buy unbounded escalation spend,
+# hence the absolute ceiling (2,000 full reviews is already a large
+# spend at typical per-review cost, itself still inside the run's LLM
+# budget guard, which remains
+# the hard backstop). Exhaustion is disclosed loudly: one warning plus
+# a per-function suppressions.jsonl record (dropped=false) so coverage
+# accounting can see which verdicts committed at glance depth.
+_GLANCE_ESCALATION_FLOOR = 20
+_GLANCE_ESCALATION_DIVISOR = 50
+_GLANCE_ESCALATION_CEILING = 2000
+
+# Derived-cap memo: (checklist-object, cap) pairs keyed on object
+# identity (the stored strong reference pins the id) — same discipline
+# as refutation.py's checklist caches. Small FIFO bound so long-lived
+# processes don't accumulate dead checklists.
+_GLANCE_CAP_MEMO_MAX = 4
+_glance_cap_memo: list[tuple[Any, int]] = []
+
+
+def _glance_escalation_cap(shared: Any) -> int:
+    """Per-run glance-escalation cap for this run's checklist size.
+
+    Falls back to the floor when the shared state carries no usable
+    checklist (tests, degraded runs) — the pre-derivation behaviour.
+    """
+    checklist = getattr(shared, "checklist", None)
+    if not isinstance(checklist, dict):
+        return _GLANCE_ESCALATION_FLOOR
+    files = checklist.get("files")
+    if not isinstance(files, list) or not files:
+        return _GLANCE_ESCALATION_FLOOR
+    for obj, cap in _glance_cap_memo:
+        if obj is checklist:
+            return cap
+    n_functions = 0
+    for fentry in files:
+        if isinstance(fentry, dict):
+            items = fentry.get("items")
+            if isinstance(items, list):
+                n_functions += len(items)
+    cap = max(
+        _GLANCE_ESCALATION_FLOOR,
+        min(n_functions // _GLANCE_ESCALATION_DIVISOR,
+            _GLANCE_ESCALATION_CEILING),
+    )
+    _glance_cap_memo.append((checklist, cap))
+    if len(_glance_cap_memo) > _GLANCE_CAP_MEMO_MAX:
+        _glance_cap_memo.pop(0)
+    return cap
 
 
 def _escalate_glance_suspicious(task: Any, shared: Any, result: Any) -> bool:
@@ -931,10 +1324,29 @@ def _escalate_glance_suspicious(task: Any, shared: Any, result: Any) -> bool:
 
     Returns True when the caller should run the full review instead of
     committing the glance outcome; False when the cap is exhausted
-    (the glance outcome then commits as before — nothing is lost).
+    (the glance outcome then commits as before — but the depth
+    downgrade is DISCLOSED: one warning on first exhaustion here, and
+    a per-function suppressions.jsonl record written by the caller).
     """
+    cap = _glance_escalation_cap(shared)
     with result._lock:
-        if result.glance_escalated >= _MAX_GLANCE_ESCALATIONS_PER_RUN:
+        if result.glance_escalated >= cap:
+            result.glance_escalation_capped += 1
+            first_denial = result.glance_escalation_capped == 1
+            if first_denial:
+                # Once per run, not per function: at kernel scale the
+                # denials number in the thousands and a per-function
+                # warning would bury the log. Per-function records go
+                # to suppressions.jsonl via the caller.
+                logger.warning(
+                    "glance escalation cap exhausted (%d escalations, "
+                    "cap derived from checklist size): further "
+                    "glance-suspicious functions commit their ~500-token "
+                    "glance verdict WITHOUT a full individual review — "
+                    "per-function records in suppressions.jsonl "
+                    "(verdict=glance_escalation_capped)",
+                    cap,
+                )
             return False
         result.glance_escalated += 1
 
@@ -959,6 +1371,126 @@ def _escalate_glance_suspicious(task: Any, shared: Any, result: Any) -> bool:
         )
     task.gap["force_review"] = True
     return True
+
+
+def _record_glance_cap_disclosure(
+    config: Any, task: Any, outcome: Any,
+) -> None:
+    """suppressions.jsonl record for a glance verdict that would have
+    escalated to a full review but hit the per-run cap.
+
+    Coverage-visible disclosure through the house single-writer
+    chokepoint (``core.analysis.reach_chokepoint.record_suppression``,
+    same channel as the vendored/oracle triage decisions).
+    ``dropped=False`` — nothing was suppressed; the record marks a
+    review-DEPTH downgrade so downstream readers can distinguish
+    "reviewed in full" from "committed at glance depth because the
+    escalation budget ran out". Best-effort like every suppressions
+    write — a failure here never blocks the commit path.
+    """
+    out_dir = getattr(config, "out_dir", None)
+    if not out_dir:
+        return
+    try:
+        from pathlib import Path
+
+        from core.analysis.reach_chokepoint import record_suppression
+    except ImportError:
+        return
+    file_path = task.gap.get("file", "") or ""
+    function = task.gap.get("name", "") or ""
+    line = task.gap.get("line_start", 0) or 0
+    record_suppression(
+        Path(out_dir),
+        finding={
+            "finding_id": f"audit-glance-cap:{file_path}:{function}:{line}",
+            "rule_id": "audit:glance-escalation-cap",
+            "file_path": file_path,
+            "line": line,
+            "function": function,
+        },
+        verdict="glance_escalation_capped",
+        reason=(
+            "glance flagged suspicious but the per-run escalation cap "
+            "was exhausted — the ~500-token glance verdict committed "
+            "without a full individual review"
+        ),
+        dropped=False,
+        extra={"stage": "glance-escalation",
+               "glance_status": str(outcome.status)},
+    )
+
+
+def _toolchain_screened(task: Any, shared: Any) -> bool:
+    """True when triage routed this task on a TOOLCHAIN verdict —
+    statically-linked C++ stdlib/runtime code identified by name
+    provenance (core.audit.vendored_detector.SIGNAL_TOOLCHAIN).
+
+    Keys on the structured ``vendor_signal`` field, never prose.
+    Pinned / force-review rows never carry a vendor verdict (the
+    triage lookup is gated), so an operator pin always keeps its
+    escalation. Fail direction: no triage state, no verdict, or any
+    other signal → False — the row competes for escalation as before.
+    """
+    triage_results = getattr(shared, "triage_results", None)
+    if not triage_results:
+        return False
+    tr = triage_results.get(task.key)
+    if tr is None:
+        return False
+    try:
+        from .vendored_detector import SIGNAL_TOOLCHAIN
+    except ImportError:
+        return False
+    return getattr(tr, "vendor_signal", None) == SIGNAL_TOOLCHAIN
+
+
+def _record_toolchain_screen_disclosure(
+    config: Any, task: Any, outcome: Any,
+) -> None:
+    """suppressions.jsonl record for a glance-suspicious verdict that
+    committed WITHOUT competing for an escalation because the row is
+    toolchain-screened.
+
+    Same channel and shape as the cap disclosure: ``dropped=False``
+    (nothing suppressed — the glance verdict committed, and a finding
+    still passes the refutation gates); the record marks that the
+    depth stopped at glance BY DESIGN so downstream readers can
+    distinguish it from a cap exhaustion. Best-effort — a failure
+    here never blocks the commit path.
+    """
+    out_dir = getattr(config, "out_dir", None)
+    if not out_dir:
+        return
+    try:
+        from pathlib import Path
+
+        from core.analysis.reach_chokepoint import record_suppression
+    except ImportError:
+        return
+    file_path = task.gap.get("file", "") or ""
+    function = task.gap.get("name", "") or ""
+    line = task.gap.get("line_start", 0) or 0
+    record_suppression(
+        Path(out_dir),
+        finding={
+            "finding_id": f"audit-toolchain-screen:{file_path}:{function}:{line}",
+            "rule_id": "audit:toolchain-screen",
+            "file_path": file_path,
+            "line": line,
+            "function": function,
+        },
+        verdict="toolchain_glance_screened",
+        reason=(
+            "glance flagged suspicious but the function is "
+            "toolchain-screened (statically-linked C++ stdlib/runtime "
+            "code, name-provenance gated) — the glance verdict "
+            "committed without burning a paid escalation"
+        ),
+        dropped=False,
+        extra={"stage": "glance-escalation",
+               "glance_status": str(outcome.status)},
+    )
 
 
 def _is_glance(task: Any, shared: Any) -> bool:
@@ -1024,7 +1556,52 @@ def _process_glance_batch(
     raise. The async caller's except path consults it so already-
     committed members are not error-recorded a second time
     (double-commit + double-tally).
+
+    The whole batch scopes :func:`review_work_active` — a glance
+    batch is review work for the journal checkpoint's inflight guard
+    exactly like an individual review (its escalation/fallback calls
+    nest their own scopes harmlessly; the guard reads a count).
     """
+    with review_work_active():
+        _process_glance_batch_inner(
+            tasks, batch_review_fn, shared, config, result,
+            review_one_fn, review_fn,
+            joern_server=joern_server, audit_log=audit_log,
+            workqueue=workqueue, reviewed_set=reviewed_set,
+            start_time=start_time,
+            layer_disagreements=layer_disagreements,
+            on_progress=on_progress, review_idx=review_idx,
+            total=total, collector=collector, graph=graph,
+            reviewed_outcomes=reviewed_outcomes,
+            committed_keys=committed_keys,
+        )
+
+
+def _process_glance_batch_inner(
+    tasks: list[Any],
+    batch_review_fn: Callable,
+    shared: Any,
+    config: Any,
+    result: Any,
+    review_one_fn: Callable,
+    review_fn: Callable,
+    *,
+    joern_server: Any = None,
+    audit_log: list | None = None,
+    workqueue: list | None = None,
+    reviewed_set: set | None = None,
+    start_time: float = 0.0,
+    layer_disagreements: list | None = None,
+    on_progress: Callable | None = None,
+    review_idx: int = 0,
+    total: int = 0,
+    collector: Any = None,
+    graph: Any = None,
+    reviewed_outcomes: dict[str, Any] | None = None,
+    committed_keys: set | None = None,
+) -> None:
+    """Body of :func:`_process_glance_batch` (split so the inflight
+    scope wraps it without re-indenting the batch logic)."""
     from .orchestrator import _build_context, _commit_outcome, _tally_outcome
 
     if committed_keys is None:
@@ -1056,10 +1633,26 @@ def _process_glance_batch(
             # individual review instead of committing the guess. The
             # glance outcome is discarded (its verdict is replaced by
             # the full review) but its LLM spend stays on the ledger.
-            if (
-                outcome.status == "suspicious"
-                and _escalate_glance_suspicious(task, shared, result)
-            ):
+            # Past the cap the guess commits as before, but never
+            # silently: the depth downgrade is disclosed per function.
+            # Toolchain-screened rows (triage's structured toolchain
+            # verdict: statically-linked stdlib/runtime code) never
+            # enter the cap race — their suspicious guesses commit at
+            # glance depth by design, disclosed per function, so
+            # first-party rows keep the paid escalations.
+            glance_escalates = False
+            if outcome.status == "suspicious":
+                if _toolchain_screened(task, shared):
+                    _record_toolchain_screen_disclosure(
+                        config, task, outcome,
+                    )
+                else:
+                    glance_escalates = _escalate_glance_suspicious(
+                        task, shared, result,
+                    )
+                    if not glance_escalates:
+                        _record_glance_cap_disclosure(config, task, outcome)
+            if glance_escalates:
                 if outcome.cost_usd:
                     with result._lock:
                         result.total_cost_usd += outcome.cost_usd
@@ -1113,6 +1706,12 @@ def _process_glance_batch(
                         domain_model=getattr(shared, "domain_model", None),
                         checklist=shared.checklist,
                         config=config,
+                        # Glance-batch refutations tally into the same
+                        # run-level tier counters as the main review
+                        # loop — omitting this left the disasm_xcheck
+                        # stanza all-zero on runs whose only binary
+                        # verdicts came through the glance batch.
+                        tier_counters=result.tier_counters,
                     )
                     if rv is not None:
                         from .orchestrator import append_audit_log

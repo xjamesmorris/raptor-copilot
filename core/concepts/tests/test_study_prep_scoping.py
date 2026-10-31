@@ -416,3 +416,163 @@ class TestScopeFromReadingListContainment:
         (root / "link.c").symlink_to(outside)
         rl = self._write_rl(tmp_path, ["link.c"])
         assert prep._scope_from_reading_list(rl, root, [root]) is None
+
+
+# ------------------------------------------------------------------
+# Pass 1.5: external-header include containment
+# ------------------------------------------------------------------
+
+
+class TestExternalHeaderContainment:
+    """Pass 1.5 resolves #include paths from the scanned repo without
+    the target-dir constraint — but confined to the search dirs: a
+    hostile repo's traversal include or out-pointing symlink must not
+    pull host files into study-list.json (and from there into LLM
+    prompts)."""
+
+    def _tree(self, tmp_path: Path) -> tuple[Path, Path]:
+        secret = tmp_path / "secret"
+        secret.mkdir()
+        (secret / "creds.h").write_text(
+            "/* alpha_ctx helper */\n"
+            "struct alpha_secret {\n    int key;\n};\n",
+            encoding="utf-8",
+        )
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "alpha.c").write_text(
+            '#include "../secret/creds.h"\n'
+            "struct alpha_ctx {\n    int a;\n};\n"
+            "int alpha_ctx_new(void) { return 0; }\n",
+            encoding="utf-8",
+        )
+        return repo, secret
+
+    def test_traversal_include_not_read(self, tmp_path) -> None:
+        # The pass-1.5 stderr line is the faithful observable: it
+        # prints only when at least one external header was actually
+        # read and struct-extracted.
+        repo, _secret = self._tree(tmp_path)
+        out = tmp_path / "out"
+        result = _run_prep([
+            str(repo), str(out), "--root", str(repo),
+            "--identifier", "alpha_ctx",
+        ])
+        assert result.returncode == 0, result.stderr
+        assert "pass 1.5" not in result.stderr
+        assert "alpha_ctx" in _item_names(out)
+
+    def test_symlink_escape_not_read(self, tmp_path) -> None:
+        repo, secret = self._tree(tmp_path)
+        # In-tree include path, but the directory is a symlink out.
+        (repo / "vaulted").symlink_to(secret, target_is_directory=True)
+        (repo / "alpha.c").write_text(
+            '#include "vaulted/creds.h"\n'
+            "struct alpha_ctx {\n    int a;\n};\n"
+            "int alpha_ctx_new(void) { return 0; }\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "out"
+        result = _run_prep([
+            str(repo), str(out), "--root", str(repo),
+            "--identifier", "alpha_ctx",
+        ])
+        assert result.returncode == 0, result.stderr
+        assert "pass 1.5" not in result.stderr
+
+    def test_in_tree_include_still_extracted(self, tmp_path) -> None:
+        """The legitimate pass-1.5 case keeps working: a header under
+        the source root but outside the target subdir."""
+        root = tmp_path / "repo"
+        (root / "crypto").mkdir(parents=True)
+        (root / "include").mkdir()
+        (root / "include" / "helper.h").write_text(
+            "/* alpha_ctx support */\n"
+            "struct alpha_helper {\n    int h;\n};\n",
+            encoding="utf-8",
+        )
+        (root / "crypto" / "alpha.c").write_text(
+            '#include "include/helper.h"\n'
+            "struct alpha_ctx {\n    int a;\n};\n"
+            "int alpha_ctx_new(void) { return 0; }\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "out"
+        result = _run_prep([
+            str(root / "crypto"), str(out), "--root", str(root),
+            "--identifier", "alpha_ctx",
+        ])
+        assert result.returncode == 0, result.stderr
+        assert "pass 1.5: 1 external headers scanned" in result.stderr
+
+
+# ------------------------------------------------------------------
+# study-list.json cache: scope-keyed reuse
+# ------------------------------------------------------------------
+
+
+class TestStudyListCacheScope:
+    """The cache short-circuit must key on the SCOPE, not bare file
+    existence — re-running in the same output dir with a different
+    --identifier (or with newly queued reading-list items) previously
+    reused the stale batch, so the reading-list queue never drained."""
+
+    def test_same_scope_reuses_cache(self, tmp_path) -> None:
+        repo = _make_correlate_tree(tmp_path)
+        out = tmp_path / "out"
+        args = [str(repo), str(out), "--root", str(repo),
+                "--identifier", "alpha_ctx"]
+        first = _run_prep(args)
+        assert first.returncode == 0, first.stderr
+        second = _run_prep(args)
+        assert second.returncode == 0, second.stderr
+        assert "reusing cached study-list.json" in second.stderr
+
+    def test_scope_change_regenerates(self, tmp_path) -> None:
+        repo = _make_correlate_tree(tmp_path)
+        out = tmp_path / "out"
+        first = _run_prep([str(repo), str(out), "--root", str(repo),
+                           "--identifier", "alpha_ctx"])
+        assert first.returncode == 0, first.stderr
+        assert "beta_ops_run" not in _item_names(out)
+        second = _run_prep([str(repo), str(out), "--root", str(repo),
+                            "--identifier", "beta_ops_run"])
+        assert second.returncode == 0, second.stderr
+        assert "reusing cached" not in second.stderr
+        assert "beta_ops_run" in _item_names(out)
+
+    def test_new_reading_list_items_regenerate(self, tmp_path) -> None:
+        repo = _make_correlate_tree(tmp_path)
+        out = tmp_path / "out"
+        rl = tmp_path / "reading-list.json"
+        rl.write_text(json.dumps({"items": [{
+            "id": "rl-1", "question": "How does `alpha_ctx` work?",
+            "source_command": "audit", "resolved": False,
+        }]}), encoding="utf-8")
+        args = [str(repo), str(out), "--root", str(repo),
+                "--reading-list", str(rl)]
+        first = _run_prep(args)
+        assert first.returncode == 0, first.stderr
+        # A new pending item lands on the queue between runs.
+        rl.write_text(json.dumps({"items": [
+            {"id": "rl-1", "question": "How does `alpha_ctx` work?",
+             "source_command": "audit", "resolved": False},
+            {"id": "rl-2", "question": "What does `beta_ops_run` do?",
+             "source_command": "audit", "resolved": False},
+        ]}), encoding="utf-8")
+        second = _run_prep(args)
+        assert second.returncode == 0, second.stderr
+        assert "reusing cached" not in second.stderr
+        assert "beta_ops_run" in _item_names(out)
+
+    def test_legacy_cache_without_scope_regenerates(self, tmp_path) -> None:
+        repo = _make_correlate_tree(tmp_path)
+        out = tmp_path / "out"
+        out.mkdir()
+        (out / "study-list.json").write_text(
+            json.dumps({"items": []}), encoding="utf-8")
+        result = _run_prep([str(repo), str(out), "--root", str(repo),
+                            "--identifier", "alpha_ctx"])
+        assert result.returncode == 0, result.stderr
+        assert "reusing cached" not in result.stderr
+        assert "alpha_ctx" in _item_names(out)

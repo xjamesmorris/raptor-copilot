@@ -11,6 +11,7 @@ import re
 from typing import Any, TYPE_CHECKING
 
 from core.paths import confine
+from core.security.log_sanitisation import sanitise_for_terminal
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -273,7 +274,7 @@ def extract_functions_from_source(source: str) -> list:
     per-function source slices without a full AST parse.
     """
     funcs: list = []
-    lines = source.split("\n")
+    lines = source.split("\n")  # line-model: callers deliver \n-model text (universal-newline reads / split_lines span joins)
     for m in _FUNC_DEF_RE.finditer(source):
         name = m.group("name")
         indent = len(m.group("indent"))
@@ -315,13 +316,21 @@ def format_progress_line(idx: int, total: int, outcome: Any) -> str:
 
     ``idx < 0`` is the protocol's "print body verbatim" channel used
     for loop-level announcements (e.g. the budget-exhaustion stop).
+
+    Foreign-derived fields are escaped per-field before interpolation:
+    ``outcome.file``/``outcome.function`` are scanned-repo names
+    (attacker-chosen bytes on Linux), ``outcome.body`` can relay tool
+    output — a name carrying ESC/OSC must not drive the operator's
+    terminal. RAPTOR's own framing (counter, arrow, glyph) stays raw.
     """
     if idx < 0:
-        return f"  {outcome.body}"
+        return f"  {sanitise_for_terminal(outcome.body, max_len=512)}"
     glyph = STATUS_GLYPHS.get(outcome.status, "·")
     return (
-        f"  [{idx + 1}/{total}] {outcome.file}:{outcome.function} "
-        f"→ {outcome.status} {glyph}"
+        f"  [{idx + 1}/{total}] "
+        f"{sanitise_for_terminal(outcome.file)}:"
+        f"{sanitise_for_terminal(outcome.function)} "
+        f"→ {sanitise_for_terminal(outcome.status, max_len=32)} {glyph}"
     )
 
 

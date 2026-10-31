@@ -20,13 +20,24 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from core.security.env_sanitisation import safe_subprocess_env
 
 logger = logging.getLogger(__name__)
 
 _OBSERVE_TIMEOUT_S = 30
 _ATTACH_TIMEOUT_S = 10
 _MAX_HOOKS = 64
-_MAX_LOG_BYTES = 8192
+# Session-log parse budget. Too small and observations from late in the
+# window are silently dropped — a busy process fills a few KiB in the
+# first fraction of a second, so a target function first hit late in
+# the 30s session would read as unobserved and worsen the
+# observation-window bias documented above. Unbounded and a hostile or
+# log-spamming target blows up parser memory. A few MiB covers a full
+# session of send() traffic while keeping the read bounded.
+_MAX_LOG_BYTES = 4 * 1024 * 1024
+# Independent line-count bound so a flood of tiny lines cannot pin the
+# JSON parser even inside the byte budget.
+_MAX_LOG_LINES = 100_000
 
 
 @dataclass
@@ -102,16 +113,22 @@ def run_frida_observation(
     script_source = _generate_frida_script(hook_targets)
 
     log_file = None
+    log_fd = None
     try:
-        fd, log_path = tempfile.mkstemp(suffix=".frida.jsonl", prefix="raptor_")
-        os.close(fd)
+        # The fd stays open for the whole session: /tmp is shared
+        # with the observed same-UID target, so every write/read of
+        # the log goes through this fd (original inode), never a
+        # reopen of the swappable path.
+        log_fd, log_path = tempfile.mkstemp(suffix=".frida.jsonl", prefix="raptor_")
         log_file = Path(log_path)
 
         success = _run_frida_session(
-            target_pid, script_source, log_file, config,
+            target_pid, script_source, log_fd, config,
         )
 
-        observations = _parse_observations(log_file) if success else []
+        observations = (
+            _parse_observations(log_file, log_fd=log_fd) if success else []
+        )
         observed_set: set[str] = set()
         target_observed = False
 
@@ -142,6 +159,11 @@ def run_frida_observation(
             error=str(exc),
         )
     finally:
+        if log_fd is not None:
+            try:
+                os.close(log_fd)
+            except OSError:
+                pass
         if log_file and log_file.exists():
             try:
                 log_file.unlink()
@@ -181,16 +203,17 @@ def collect_observed_functions(
     script_source = _generate_frida_script(hook_targets)
 
     log_file = None
+    log_fd = None
     try:
-        fd, log_path = tempfile.mkstemp(suffix=".frida.jsonl", prefix="raptor_")
-        os.close(fd)
+        # Kept-fd discipline — see run_frida_observation above.
+        log_fd, log_path = tempfile.mkstemp(suffix=".frida.jsonl", prefix="raptor_")
         log_file = Path(log_path)
 
-        success = _run_frida_session(target_pid, script_source, log_file, config)
+        success = _run_frida_session(target_pid, script_source, log_fd, config)
         if not success:
             return frozenset()
 
-        observations = _parse_observations(log_file)
+        observations = _parse_observations(log_file, log_fd=log_fd)
         return frozenset(
             obs.function for obs in observations
         )
@@ -198,6 +221,11 @@ def collect_observed_functions(
         logger.debug("broad Frida observation failed", exc_info=True)
         return frozenset()
     finally:
+        if log_fd is not None:
+            try:
+                os.close(log_fd)
+            except OSError:
+                pass
         if log_file and log_file.exists():
             try:
                 log_file.unlink()
@@ -365,21 +393,38 @@ send(JSON.stringify({{'type': 'ready', 'hooked': hooked}}));
 def _run_frida_session(
     pid: int,
     script_source: str,
-    log_file: Path,
+    log_fd: int,
     config: Any,
 ) -> bool:
-    """Run a Frida session, writing observations to log_file.
+    """Run a Frida session, writing observations through *log_fd*.
 
     Uses the frida CLI tool (``frida -p PID -l script.js``) rather
     than the Python API to stay within the sandbox policy (subprocess
     with timeout rather than in-process attachment).
+
+    *log_fd* is the fd the caller's ``mkstemp`` returned, kept open:
+    the log lives in shared /tmp while the observed SAME-UID target
+    runs, so a close-then-reopen-by-path write would follow a
+    symlink/hardlink swapped in at the tempfile name. Every write and
+    size check here goes through the fd — bound to the original
+    inode, race-free.
+
+    Honest limit: a same-UID target that can reach host /tmp can also
+    open the 0600 stub BY PATH and forge records into the original
+    inode — inherent to same-UID observation, no fd discipline stops
+    it. The fd binding defeats path swaps (write laundering /
+    read-side substitution), not writes to the inode itself;
+    observation evidence stays "the process looked live", never
+    stronger.
     """
     script_file = None
     try:
         fd, script_path = tempfile.mkstemp(suffix=".js", prefix="raptor_frida_")
-        os.close(fd)
         script_file = Path(script_path)
-        script_file.write_text(script_source)
+        # Same kept-fd rule as the log: write the script through the
+        # fd mkstemp returned, never by reopening the /tmp path.
+        with os.fdopen(fd, "w", encoding="utf-8") as script_fh:
+            script_fh.write(script_source)
 
         timeout = getattr(config, "frida_timeout_s", _OBSERVE_TIMEOUT_S)
         # frida exits on its own after the -t window (quiet mode);
@@ -402,7 +447,13 @@ def _run_frida_session(
             "-t", str(session_s),
         ]
 
-        env = _safe_env()
+        # Sanitised + target-marker-stripped env (shared fail-closed
+        # helper): this is a RAW spawn (no core.sandbox chokepoint)
+        # and frida spawn-mode TARGETS inherit the CLI's environ, so
+        # every RAPTOR-identifying name must go. The helper's
+        # fallback is a minimal allowlist carrying no markers and no
+        # credentials.
+        env = safe_subprocess_env(strip_target_markers=True)
 
         result = subprocess.run(
             cmd,
@@ -413,20 +464,20 @@ def _run_frida_session(
             check=False,
         )
 
-        _write_session_log(log_file, result.stdout)
-        return result.returncode == 0 or log_file.stat().st_size > 0
+        _write_session_log(log_fd, result.stdout)
+        return result.returncode == 0 or _fd_size(log_fd) > 0
 
     except subprocess.TimeoutExpired as exc:
         logger.debug("Frida session timed out after %ds", timeout)
         partial = exc.stdout
         if isinstance(partial, bytes):
-            partial = partial.decode("utf-8", errors="replace")
+            partial = partial.decode("utf-8", errors="replace")  # type: ignore[assignment]
         if partial:
             # Keep whatever the killed CLI managed to emit; when the
             # exception carries nothing, leave any existing log
             # content untouched rather than clobbering it with "".
-            _write_session_log(log_file, partial)
-        return log_file.exists() and log_file.stat().st_size > 0
+            _write_session_log(log_fd, partial)  # type: ignore[arg-type]
+        return _fd_size(log_fd) > 0
     except FileNotFoundError:
         logger.debug("frida CLI not found")
         return False
@@ -441,15 +492,41 @@ def _run_frida_session(
                 pass
 
 
-def _write_session_log(log_file: Path, content: str | None) -> None:
-    """Persist a Frida session's captured stdout for parsing."""
+def _fd_size(log_fd: int) -> int:
+    """Size of the log via the kept fd; 0 when unstattable."""
     try:
-        log_file.write_text(content or "")
+        return os.fstat(log_fd).st_size
+    except OSError:
+        return 0
+
+
+def _write_session_log(log_fd: int, content: str | None) -> None:
+    """Persist a Frida session's captured stdout for parsing.
+
+    Writes through the caller's kept ``mkstemp`` fd (truncate +
+    rewrite of the original inode) — never by reopening the shared
+    /tmp path, which the observed same-UID target can swap.
+    """
+    try:
+        os.lseek(log_fd, 0, os.SEEK_SET)
+        os.ftruncate(log_fd, 0)
+        data = (content or "").encode("utf-8", errors="replace")
+        view = memoryview(data)
+        written = 0
+        while written < len(view):
+            n = os.write(log_fd, view[written:])
+            if n <= 0:
+                raise OSError(f"short write to session log fd: {n}")
+            written += n
     except OSError:
         logger.debug("could not persist frida session log", exc_info=True)
 
 
-def _parse_observations(log_file: Path) -> list[FridaObservation]:
+def _parse_observations(
+    log_file: Path,
+    *,
+    log_fd: int | None = None,
+) -> list[FridaObservation]:
     """Parse observations from a Frida session log.
 
     Accepts both raw JSONL and the frida CLI's stdout framing, where
@@ -460,83 +537,89 @@ def _parse_observations(log_file: Path) -> list[FridaObservation]:
     The wrapper is single-quoted (not JSON), so the payload — the
     first ``{"``-opening object on the line — is decoded with
     ``raw_decode``, which tolerates the trailing wrapper text.
+
+    The log is streamed line by line under ``_MAX_LOG_BYTES`` /
+    ``_MAX_LOG_LINES`` bounds — never slurped whole — so late
+    observations are counted while memory stays bounded.  Each
+    ``readline`` is capped to the remaining byte budget, so an
+    oversized line comes back as a fragment that simply fails to
+    parse instead of ballooning memory.
     """
     observations: list[FridaObservation] = []
-
-    if not log_file.exists():
-        return observations
-
-    try:
-        content = log_file.read_text(errors="replace")[:_MAX_LOG_BYTES]
-    except OSError:
-        return observations
 
     call_stack: dict[str, FridaObservation] = {}
     decoder = json.JSONDecoder()
 
-    for line in content.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            data = json.loads(line)
-        except json.JSONDecodeError:
-            msg_start = line.find('{"')
-            if msg_start < 0:
-                msg_start = line.find("{")
-            if msg_start >= 0:
-                try:
-                    data, _end = decoder.raw_decode(line[msg_start:])
-                except json.JSONDecodeError:
+    try:
+        if log_fd is not None:
+            # Kept-fd read: the session's writes went through this fd
+            # (original mkstemp inode), so the read binds to the same
+            # inode — never a by-path reopen of shared /tmp, which the
+            # observed same-UID target can swap to forge observations.
+            dup_fd = os.dup(log_fd)
+            try:
+                os.lseek(dup_fd, 0, os.SEEK_SET)
+                log_fh = os.fdopen(dup_fd, "rb")
+            except OSError:
+                os.close(dup_fd)
+                raise
+        else:
+            if not log_file.exists():
+                return observations
+            log_fh = log_file.open("rb")  # raw-open: RAPTOR-written frida event log in the run dir
+    except OSError:
+        return observations
+
+    read_bytes = 0
+    lines_seen = 0
+    with log_fh:
+        while read_bytes < _MAX_LOG_BYTES and lines_seen < _MAX_LOG_LINES:
+            try:
+                raw = log_fh.readline(_MAX_LOG_BYTES - read_bytes)
+            except OSError:
+                break
+            if not raw:
+                break
+            read_bytes += len(raw)
+            lines_seen += 1
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                msg_start = line.find('{"')
+                if msg_start < 0:
+                    msg_start = line.find("{")
+                if msg_start >= 0:
+                    try:
+                        data, _end = decoder.raw_decode(line[msg_start:])
+                    except json.JSONDecodeError:
+                        continue
+                else:
                     continue
-            else:
+
+            if not isinstance(data, dict):
                 continue
 
-        if not isinstance(data, dict):
-            continue
+            msg_type = data.get("type", "")
 
-        msg_type = data.get("type", "")
+            if msg_type == "call":
+                func_name = data.get("function", "")
+                if not func_name:
+                    continue
+                obs = FridaObservation(
+                    function=func_name,
+                    file="",
+                    args=data.get("args", []),
+                )
+                call_stack[func_name] = obs
+                observations.append(obs)
 
-        if msg_type == "call":
-            func_name = data.get("function", "")
-            if not func_name:
-                continue
-            obs = FridaObservation(
-                function=func_name,
-                file="",
-                args=data.get("args", []),
-            )
-            call_stack[func_name] = obs
-            observations.append(obs)
-
-        elif msg_type == "return":
-            func_name = data.get("function", "")
-            pending = call_stack.pop(func_name, None)
-            if pending is not None:
-                pending.retval = data.get("retval")
+            elif msg_type == "return":
+                func_name = data.get("function", "")
+                pending = call_stack.pop(func_name, None)
+                if pending is not None:
+                    pending.retval = data.get("retval")
 
     return observations
-
-
-def _safe_env() -> dict[str, str]:
-    """Build a sanitised environment for the Frida subprocess.
-
-    This is a RAW spawn (no core.sandbox chokepoint), and frida
-    spawn-mode TARGETS inherit the CLI's environ — so the
-    target-strip set (trust markers + session credential) must be
-    removed here explicitly; the frida CLI needs none of them.
-    """
-    try:
-        from core.config import RaptorConfig
-        env = RaptorConfig.get_safe_env()
-        for key in RaptorConfig.TARGET_ENV_STRIP_SET:
-            env.pop(key, None)
-        return env
-    except Exception:  # noqa: BLE001 — config unavailable: fall back to manual scrub
-        env = dict(os.environ)
-        for key in ("CLAUDECODE", "_RAPTOR_TRUSTED",
-                    "RAPTOR_SESSION_PID", "RAPTOR_SESSION_TOKEN"):
-            env.pop(key, None)
-        for key in ("TERMINAL", "EDITOR", "VISUAL", "BROWSER", "PAGER"):
-            env.pop(key, None)
-        return env

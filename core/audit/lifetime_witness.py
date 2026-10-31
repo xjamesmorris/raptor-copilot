@@ -315,13 +315,18 @@ _LT_TWO_SITE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Verb suffixes are bounded (\w{1,32}): unbounded, a claim text
+# made of repeated verb stems inside one word run re-scans the run
+# from every stem — quadratic. No English inflection needs more
+# than 32 chars; mid-word stem hits ('reused', 'misused') still
+# match exactly as before.
 _LT_UAF_RE = re.compile(
     r"use[\s-]?after[\s-]?free|\buaf\b|dangling|"
     r"use\s+of\s+freed|"
-    r"(?:used?|dereferenc\w+|read|accessed)\s[^.;]{0,120}?"
+    r"(?:used?|dereferenc\w{1,32}|read|accessed)\s[^.;]{0,120}?"
     r"\bafter\b[^.;]{0,120}?(?:free|releas|drop|put|deactivat)|"
-    r"(?:free[ds]?|freed|releas\w+|drop\w+)\b[^.;]{0,120}?"
-    r"(?:then|and|later)\s+(?:used?|dereferenc\w+|accessed|read)|"
+    r"(?:free[ds]?|freed|releas\w{1,32}|drop\w{1,32})\b[^.;]{0,120}?"
+    r"(?:then|and|later)\s+(?:used?|dereferenc\w{1,32}|accessed|read)|"
     r"freed?\s+at\s[^.;]{0,80}?used?\s+at",
     re.IGNORECASE,
 )
@@ -345,8 +350,10 @@ _LT_CONCURRENT_ACTOR_RE = re.compile(
 
 # W-DELEG: the double invocation is attributed to the caller /
 # framework — the exactly-once discipline of whoever calls us.
+# Verb suffixes bounded for the same reason as _LT_UAF_RE above.
 _LT_CALLER_TWICE_RE = re.compile(
-    r"(?:call(?:ed|s)?|invok\w+|releas\w+|dispatch\w+|run[s]?)"
+    r"(?:call(?:ed|s)?|invok\w{1,16}|releas\w{1,16}|dispatch\w{1,16}"
+    r"|run[s]?)"
     r"[^.;]{0,80}?\btwice\b|"
     r"\btwice\b[^.;]{0,80}?(?:same|by\s+the|framework|caller|core)|"
     r"(?:framework|caller|upper\s+layer|core)[^.;]{0,80}?"
@@ -420,6 +427,15 @@ def _trim_to_function(text: str) -> str:
     return text[:cut]
 
 
+# C11 6.5.16: the complete assignment-operator grammar.  Both alias
+# closures (AST and token level) must accept every member — a compound
+# assignment smuggles a tracked value into its LHS exactly like the
+# plain spelling (``a |= (uintptr_t)p`` == ``a = a | (uintptr_t)p``).
+_ASSIGN_OPS = frozenset({
+    "=", "+=", "-=", "*=", "/=", "%=", "<<=", ">>=", "&=", "^=", "|=",
+})
+
+
 def _tokenize_with_offsets(text: str) -> list[tuple[str, str, int, int]]:
     """(kind, spelling, start, end) tokens; refuses on unknown bytes."""
     out: list[tuple[str, str, int, int]] = []
@@ -471,7 +487,7 @@ def _token_tracked_superset(
             if (
                 kind == "ident"
                 and i + 1 < n
-                and tokens[i + 1][1] == "="
+                and tokens[i + 1][1] in _ASSIGN_OPS
                 and (i + 2 >= n or tokens[i + 2][1] != "=")
                 and (i == 0 or spellings[i - 1] not in ("=", "!", "<",
                                                         ">", "+", "-",
@@ -602,6 +618,7 @@ _NAMED_VA_PARAMS_RE = re.compile(
 )
 
 _LT_TABLE_CACHE: dict[tuple[str, str], MacroTable] = {}
+_LT_TABLE_CACHE_LOCK = __import__("threading").Lock()
 _LT_TABLE_CACHE_MAX = 8
 
 
@@ -648,9 +665,10 @@ def _lifetime_macro_table(
     table's closure-visible function-name set is reused.
     """
     key = (str(target_path), rel_file)
-    cached = _LT_TABLE_CACHE.get(key)
-    if cached is not None:
-        return cached
+    with _LT_TABLE_CACHE_LOCK:
+        cached = _LT_TABLE_CACHE.get(key)
+        if cached is not None:
+            return cached
     base = _macro_table_for(target_path, rel_file)
     from .defassign import (
         _DIRECTIVE_RE,
@@ -664,11 +682,13 @@ def _lifetime_macro_table(
     defs: dict[str, list[MacroDef]] = {}
     poisoned: set[str] = set()
     scanned = 0
+    from core.source import read_text_capped
+
     for path in files:
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        got = read_text_capped(path)
+        if got is None:
             continue
+        text = got[0]
         scanned += 1
         for line in _join_continuations(_strip_comments(text)):
             dm = _DIRECTIVE_RE.match(line)
@@ -691,9 +711,10 @@ def _lifetime_macro_table(
         unresolved_includes=tuple(unresolved),
         files_scanned=scanned,
     )
-    if len(_LT_TABLE_CACHE) >= _LT_TABLE_CACHE_MAX:
-        _LT_TABLE_CACHE.pop(next(iter(_LT_TABLE_CACHE)))
-    _LT_TABLE_CACHE[key] = table
+    with _LT_TABLE_CACHE_LOCK:
+        if len(_LT_TABLE_CACHE) >= _LT_TABLE_CACHE_MAX:
+            _LT_TABLE_CACHE.pop(next(iter(_LT_TABLE_CACHE)))
+        _LT_TABLE_CACHE[key] = table
     return table
 
 
@@ -1618,7 +1639,7 @@ class _Analysis:
         if not func_source or len(func_source) > _MAX_SOURCE_BYTES:
             raise ProofRefusal("function source empty or too large")
         func_source = _trim_to_function(func_source)
-        if re.search(r"^\s*#", func_source, re.MULTILINE):
+        if re.search(r"^[^\S\n]*#", func_source, re.MULTILINE):
             raise ProofRefusal(
                 "preprocessor directive inside the function source"
             )
@@ -1702,15 +1723,18 @@ class _Analysis:
             for n in _walk_nodes(body):
                 lhs_name: str | None = None
                 rhs: Any = None
+                compound = False
                 if n.type == "assignment_expression":
                     left = n.child_by_field_name("left")
                     op = n.child_by_field_name("operator")
                     if (
                         left is not None and left.type == "identifier"
-                        and op is not None and _node_text(op) == "="
+                        and op is not None
+                        and _node_text(op) in _ASSIGN_OPS
                     ):
                         lhs_name = _node_text(left)
                         rhs = n.child_by_field_name("right")
+                        compound = _node_text(op) != "="
                 elif n.type == "init_declarator":
                     decl = n.child_by_field_name("declarator")
                     d = decl
@@ -1745,12 +1769,19 @@ class _Analysis:
                 rhs_idents = {
                     _node_text(x) for x in _idents(rhs)
                 }
-                if stripped is not None and stripped.type == "identifier" \
-                        and _node_text(stripped) in aliases:
+                if (
+                    not compound
+                    and stripped is not None
+                    and stripped.type == "identifier"
+                    and _node_text(stripped) in aliases
+                ):
                     if lhs_name not in aliases:
                         aliases.add(lhs_name)
                         grew = True
                 elif rhs_idents & (aliases | derived):
+                    # Compound spellings land here by construction:
+                    # ``a |= p`` mixes p into a's prior value — a
+                    # derived carrier, not a pure alias.
                     if lhs_name not in derived and lhs_name not in aliases:
                         derived.add(lhs_name)
                         grew = True
@@ -1926,7 +1957,10 @@ class _Analysis:
                         _node_text(left) in self.locals
                     ):
                         # Local alias propagation — _compute_sets
-                        # tracks it.  A file-scope global is an
+                        # tracks it for every C11 6.5.16 assignment
+                        # operator (_ASSIGN_OPS; pinned by the
+                        # compound-operator closure tests).  A
+                        # file-scope global is an
                         # identifier too (``g_saved = p;`` is a store
                         # into memory a callee or the caller reads
                         # after the free), so only names this function

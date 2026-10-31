@@ -36,9 +36,15 @@ def note_transport_error(client: object, count: int = 1) -> None:
     of silently reading as clean. No-op for client doubles without the
     integer counter.
     """
+    recorder = getattr(client, "note_transport_error", None)
+    if callable(recorder):
+        # Real WebClient: lock-guarded increment (concurrent bare
+        # read-modify-write from pool threads lost counts).
+        recorder(count)
+        return
     counter = getattr(client, "transport_errors", None)
     if isinstance(counter, int) and not isinstance(counter, bool):
-        client.transport_errors = counter + count
+        setattr(client, "transport_errors", counter + count)
 
 
 class CheckCategory(str, Enum):

@@ -10,11 +10,12 @@ Instead of hardcoded seeds, this module:
 """
 
 import re
-from core.sandbox import run_trusted as _run_trusted, SandboxSetupError  # read-only tools only (strings)
 from pathlib import Path
 from typing import Any
 
+from core.binary.inspect import inspect_binary as _inspect_binary
 from core.logging import get_logger
+from core.sandbox.errors import SandboxSetupError
 
 logger = get_logger()
 
@@ -66,13 +67,11 @@ class CorpusGenerator:
         }
 
         try:
-            # Extract strings from binary
-            result = _run_trusted(
-                ["strings", str(self.binary_path)],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
+            # Extract strings from the binary — full sandbox via
+            # core.binary.inspect (the bytes strings parses are the
+            # target's).
+            result = _inspect_binary(
+                "strings", (), self.binary_path, timeout=10)
 
             if result.returncode == 0:
                 strings = result.stdout.lower().split('\n')
@@ -175,12 +174,19 @@ class CorpusGenerator:
         if not self.source_dir:
             return analysis
 
+        from itertools import islice
+
         candidate_suffixes = {".c", ".cc", ".cpp", ".h", ".hpp", ".md", ".txt", ".rst"}
         try:
-            files = [
-                p for p in self.source_dir.rglob("*")
-                if p.is_file() and p.suffix.lower() in candidate_suffixes
-            ][:200]
+            # islice, not list-then-slice: the old form materialised
+            # every matching path in the tree before keeping 200 —
+            # pure walk/allocation cost on big source dirs. The walk
+            # now stops at the 200th match.
+            files = list(islice(
+                (p for p in self.source_dir.rglob("*")
+                 if p.is_file() and p.suffix.lower() in candidate_suffixes),
+                200,
+            ))
         except OSError:
             files = []
 
@@ -190,7 +196,10 @@ class CorpusGenerator:
             except OSError:
                 continue
 
-            for match in re.finditer(r'\bstrcmp\s*\([^,]+,\s*"([A-Z][A-Z0-9_-]{1,20})"\s*\)', text):
+            # First-argument span bounded: unbounded, source that
+            # repeats "strcmp(" re-scans the rest of the file from
+            # every occurrence — quadratic on hostile input.
+            for match in re.finditer(r'\bstrcmp\s*\([^,]{1,500},\s*"([A-Z][A-Z0-9_-]{1,20})"\s*\)', text):
                 commands.add(match.group(1))
             for match in re.finditer(r'\b([A-Z][A-Z0-9_-]{1,20}):(?:data|[A-Za-z0-9_{"<%])', text):
                 commands.add(match.group(1))
@@ -558,65 +567,6 @@ class CorpusGenerator:
         # caller falls back to the content-hash dedupe path above.
         return 0
 
-    def learn_from_crash(self, crash_input: Path, crash_type: str) -> None:
-        """
-        Learn from a crash to improve future corpus generation.
-
-        Args:
-            crash_input: Input that caused crash
-            crash_type: Type of crash
-        """
-        if not self.memory:
-            return
-
-        logger.info("Learning from %s crash: %s", crash_type, crash_input.name)
-
-        # Extract patterns from crashing input.
-        #
-        # Pre-fix `crash_input.read_bytes()` had no size cap. AFL
-        # crash inputs are USUALLY tiny (KB) but no upper bound
-        # is enforced at the AFL layer either — a fuzzer that
-        # mutates large initial seeds, or a target that crashes
-        # only on multi-MB inputs (image/video parsers, archive
-        # extractors), produces multi-GB crash files. Reading
-        # them entirely into memory just to compute size +
-        # null-byte + high-byte stats is wasteful and OOM-prone.
-        #
-        # Cap the read at 1 MB (more than enough for the trio of
-        # cheap stats below). For oversized files, use the file
-        # size from stat() and stream-scan the first 1 MB for
-        # the byte-class checks. The "has_nulls" and
-        # "has_high_bytes" answers are stable: if the first 1 MB
-        # contains them, the answer is True; if it doesn't,
-        # there's only a tiny chance the rest does (and even if
-        # missed, the heuristic still works for corpus-learning).
-        _CRASH_READ_CAP = 1 * 1024 * 1024
-        try:
-            try:
-                file_size = crash_input.stat().st_size
-            except OSError:
-                file_size = 0
-            with Path(crash_input).open("rb") as fh:
-                content = fh.read(_CRASH_READ_CAP)
-
-            # Record characteristics. `size` reflects the actual
-            # file size (not the truncated read length).
-            knowledge = {
-                "size": file_size or len(content),
-                "has_nulls": b"\x00" in content,
-                "has_high_bytes": any(b > 127 for b in content),
-                "crash_type": crash_type,
-                # Flag truncated reads so future model consumers
-                # know the byte-class stats reflect a sample.
-                "truncated_read": file_size > _CRASH_READ_CAP,
-            }
-
-            # In future: use memory to store successful patterns
-            logger.debug("Crash pattern: %s", knowledge)
-
-        except Exception as e:
-            logger.warning("Failed to learn from crash: %s", e)
-
     def generate_mutated_seed(self, base_seed: bytes, mutation_type: str = "havoc") -> bytes:
         """
         Generate a mutated version of a seed.
@@ -667,8 +617,8 @@ class CorpusGenerator:
             return base_seed + (base_seed * random.randint(1, 10))  # nosemgrep: crypto.prng.random-module.python
 
         # havoc - combine multiple mutations
-        seed = base_seed
+        seed = base_seed  # type: ignore[assignment]
         for _ in range(random.randint(1, 5)):  # nosemgrep: crypto.prng.random-module.python
             mutation = random.choice(["bit_flip", "byte_insert", "byte_delete", "expand"])  # nosemgrep: crypto.prng.random-module.python
-            seed = self.generate_mutated_seed(seed, mutation)
-        return seed
+            seed = self.generate_mutated_seed(seed, mutation)  # type: ignore[assignment,arg-type]
+        return seed  # type: ignore[return-value]

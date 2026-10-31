@@ -36,6 +36,7 @@ if __name__ == "__main__":
     # fall back to a positional walk.
     sys.path.insert(0, os.environ["RAPTOR_DIR"])
 
+from core.artifacts.context_map_budget import save_context_map
 from core.context_guard import build_web_context_guard_report
 from core.json import append_jsonl, save_json
 from core.logging import get_logger
@@ -43,7 +44,7 @@ from core.run.safe_io import safe_run_mkdir
 from core.sandbox import SANDBOX_ENGAGE_EXIT_CODE, SandboxSetupError
 from packages.web.auth import AuthenticationError, make_auth_manager
 from packages.web.checks import registry
-from packages.web.client import WebClient
+from packages.web.client import ScopeRedirectBlockedError, WebClient
 from packages.web.crawler import WebCrawler
 from packages.web.discovery import Discoverer, DiscoveryResult
 from packages.web.evidence import build_web_evidence_ledger
@@ -249,6 +250,9 @@ class WebScanner:
 
         self.session: AuthSession | None = None
         self._phases_completed: list[str] = []
+        # Actionable preflight failure text (e.g. the target lives on
+        # https); scan() surfaces it as the top-level error reason.
+        self._preflight_failure: str | None = None
         self._finding_counter = 0
         self._external_tool_results: list[dict] = []
         self._ffuf_wordlist_used: str | None = None
@@ -281,7 +285,10 @@ class WebScanner:
         all_findings: list[WebFinding] = []
 
         if not self._phase_preflight():
-            return self._empty_result("Preflight failed -- target unreachable")
+            return self._empty_result(
+                self._preflight_failure
+                or "Preflight failed -- target unreachable",
+            )
 
         self._phase_auth()
         discovery = self._phase_discovery()
@@ -377,6 +384,28 @@ class WebScanner:
             )
             self._phases_completed.append("preflight")
             return True
+        except ScopeRedirectBlockedError as e:
+            # Scope stays strict (scheme+host+port), but the single most
+            # common redirect shape on the web — http -> https on the
+            # same host — deserves an actionable error, not a generic
+            # "unreachable". The scan still stops; the operator is told
+            # which origin to scan instead.
+            base = urlparse(self.base_url)
+            nxt = urlparse(e.next_url)
+            if (
+                base.scheme == "http" and nxt.scheme == "https"
+                and (nxt.hostname or "").lower()
+                == (base.hostname or "").lower()
+            ):
+                self._preflight_failure = (
+                    "Preflight failed -- target redirects to "
+                    f"{self._redact(e.next_url)}; re-run the scan against "
+                    "that https origin"
+                )
+                logger.error("%s", self._preflight_failure)
+            else:
+                logger.error("Preflight failed: %s", self._redact(str(e)))
+            return False
         except Exception as e:
             logger.error("Preflight failed: %s", self._redact(str(e)))
             return False
@@ -671,20 +700,46 @@ class WebScanner:
         logger.info("Running %d unauthenticated checks", len(check_classes))
         discovery_ctx = self._merged_discovery_ctx(discovery, crawl_data)
 
-        for cls in check_classes:
-            errors_before = getattr(self.client, "transport_errors", 0)
-            try:
-                results = self._instantiate_check(cls).run(
-                    self.client, self.base_url, session=None, discovery=discovery_ctx,
+        # Unauthenticated posture must be measured unauthenticated, and
+        # the SHARED client's principal must survive this phase — in
+        # BOTH auth arms. When Phase 1 authenticated the scan,
+        # self.client's cookie jar holds the operator session and the
+        # login-probing checks can clobber it (cookie rotation on a
+        # login POST logs the scan out mid-phase; a default-credential
+        # success replaces the operator's principal). On UNAUTHENTICATED
+        # scans the hazard runs the other way: a successful
+        # DefaultCredentialsCheck login GRANTS a session cookie into the
+        # shared jar (the grant is exactly the signal the check keys
+        # on), silently swapping the scan principal to the discovered
+        # admin for phases 6/6v/6o while findings stay stamped
+        # auth_context="unauthenticated" — mislabeled evidence and
+        # unconsented intrusiveness escalation. A fresh client (separate
+        # cookie jar, same scope/policy/rate limit) isolates the phase
+        # unconditionally; one extra Session per run is the whole cost.
+        unauth_client: WebClient = self._make_principal_client()
+        probe_client = unauth_client
+
+        try:
+            for cls in check_classes:
+                errors_before = getattr(probe_client, "transport_errors", 0)
+                try:
+                    results = self._instantiate_check(cls).run(
+                        probe_client, self.base_url,
+                        session=None, discovery=discovery_ctx,
+                    )
+                    for r in results:
+                        if not r.passed:
+                            findings.append(
+                                self._to_finding(r, "unauthenticated"),
+                            )
+                except Exception as e:
+                    self._record_check_failure("passive_checks", cls.__name__, e)
+                self._record_check_degradation(
+                    "passive_checks", cls.__name__, errors_before,
+                    client=probe_client,
                 )
-                for r in results:
-                    if not r.passed:
-                        findings.append(self._to_finding(r, "unauthenticated"))
-            except Exception as e:
-                self._record_check_failure("passive_checks", cls.__name__, e)
-            self._record_check_degradation(
-                "passive_checks", cls.__name__, errors_before,
-            )
+        finally:
+            unauth_client.close()
         self._log_check_failures("Phase 4", "passive_checks")
         logger.info("Phase 4 complete: %d findings", len(findings))
         self._phases_completed.append("passive_checks")
@@ -704,14 +759,19 @@ class WebScanner:
 
     def _record_check_degradation(
         self, phase: str, check_name: str, errors_before: int,
+        client: WebClient | None = None,
     ) -> None:
         """Individual checks swallow their own probe exceptions by
         design, so a check that returns [] because the target died,
         rate-limited, or WAF-banned mid-scan is indistinguishable from
         one that ran clean. The client counts transport failures; a
         per-check delta means the check's coverage is degraded — the
-        report must say so instead of presenting a clean pass."""
-        errors_now = getattr(self.client, "transport_errors", 0)
+        report must say so instead of presenting a clean pass.
+
+        ``client`` selects which client's counter to diff (phases that
+        probe through a phase-scoped client pass it); default is the
+        shared scan client."""
+        errors_now = getattr(client or self.client, "transport_errors", 0)
         if not isinstance(errors_now, int) or not isinstance(errors_before, int):
             return  # client double without the counter
         errors = errors_now - errors_before
@@ -785,14 +845,17 @@ class WebScanner:
         self.oob_listener.start()
         return self.oob_listener.mint(context)
 
-    def _authorized_checks(self, check_classes: list) -> list:
+    def _authorized_checks(
+        self, check_classes: list, *, log_skips: bool = True,
+    ) -> list:
         """Checks the run's scope receipt covers, by declared risk tier.
 
         Every check declares the tier its REQUESTS need (passive =
         benign observation, active = crafted probe values, intrusive =
         may change target state). The receipt is consulted per check;
         what the operator's approval level does not cover is skipped
-        loudly, never silently.
+        loudly, never silently. ``log_skips=False`` is for coverage
+        projections re-deriving the same set outside a check phase.
         """
         allowed = []
         skipped: dict[str, list[str]] = {}
@@ -812,12 +875,50 @@ class WebScanner:
                 skipped.setdefault(risk, []).append(cls.__name__)
                 continue
             allowed.append(cls)
-        for risk, names in sorted(skipped.items()):
-            logger.info(
-                "Scope receipt excludes %d %s check(s): %s",
-                len(names), risk, ", ".join(sorted(names)),
-            )
+        if log_skips:
+            for risk, names in sorted(skipped.items()):
+                logger.info(
+                    "Scope receipt excludes %d %s check(s): %s",
+                    len(names), risk, ", ".join(sorted(names)),
+                )
         return allowed
+
+    def _runnable_check_ids(self) -> list[str]:
+        """Check ids THIS run can actually execute.
+
+        Feeds the research-landscape coverage verdict. Registration
+        alone is not coverage: a check the pipeline structurally cannot
+        fire — requires_auth with no session, or a risk tier the scope
+        receipt excludes — must read as not-covered instead of quietly
+        counting a capability that never runs (the self-skip-counts-as-
+        covered shape).
+        """
+        runnable = self._authorized_checks(
+            registry.unauthenticated(), log_skips=False,
+        )
+        if self.session is not None:
+            runnable += self._authorized_checks(
+                registry.authenticated(), log_skips=False,
+            )
+        # getattr: registry doubles without an id must not break the
+        # projection (the same tolerance _authorized_checks extends).
+        ids = [
+            check_id
+            for cls in runnable
+            if (check_id := getattr(cls, "check_id", ""))
+        ]
+        # The fuzzer's confirmed-injection findings are minted under
+        # check_id V5.2.1 (see the fuzz-hit finding builder) without a
+        # registry entry. Count it only when Phase 6 can run under this
+        # receipt (anything above the passive level, or the oracle tool
+        # individually approved); policy doubles without a real receipt
+        # keep it.
+        receipt = getattr(self.execution_policy, "receipt", None)
+        approval = getattr(receipt, "approval_level", None)
+        approved_tools = getattr(receipt, "approved_tools", ()) or ()
+        if approval != "passive" or "raptor-web-oracle" in approved_tools:
+            ids.append("V5.2.1")
+        return ids
 
     def _phase_auth_checks(
         self, discovery: DiscoveryResult, crawl_data: dict | None = None,
@@ -826,8 +927,30 @@ class WebScanner:
         if not self.session:
             return []
         if self.auth_manager and not self.auth_manager.verify(self.client, self.session):
-            logger.warning("Session expired before authenticated checks -- skipping")
-            return []
+            # Session-integrity assertion: earlier phases must not have
+            # cost the scan its principal. If the session died anyway
+            # (server-side timeout, global invalidation), losing the
+            # whole authenticated tier silently is the worst outcome —
+            # try one re-authentication before giving up, and say
+            # loudly which way it went.
+            logger.warning(
+                "Session expired before authenticated checks -- "
+                "re-authenticating",
+            )
+            try:
+                self.session = self.auth_manager.authenticate(self.client)
+                logger.info(
+                    "Re-authentication succeeded (mode: %s) -- "
+                    "authenticated checks proceed", self.session.mode,
+                )
+            except AuthenticationError as e:
+                logger.warning(
+                    "Re-authentication failed -- skipping ALL "
+                    "authenticated checks (coverage loss): %s",
+                    self._redact(str(e)),
+                )
+                self.session = None
+                return []
         findings = []
         check_classes = self._authorized_checks(registry.authenticated())
         logger.info("Running %d authenticated checks", len(check_classes))
@@ -1105,6 +1228,14 @@ class WebScanner:
                     seen_cells.add(cell)
                     cells.append(cell)
 
+        # Form budget trade-off (default 5) — applies to DISTINCT forms:
+        # the crawler dedupes by (action, method, field names), so a
+        # site-wide nav/search form repeated on every page consumes ONE
+        # slot, not all of them. Raising the cap fuzzes more distinct
+        # forms per run but each form costs fields x vuln-classes x
+        # payloads in live requests; lowering it starves multi-form
+        # sites — silent false negatives, the direction that pre-dedup
+        # duplicate exhaustion already demonstrated.
         forms = crawl_data.get("discovered_forms", [])[:self.max_fuzz_forms]
         logger.info(
             "Phase 6 budget: fuzzing %d URL(s), %d cell(s), %d form(s)",
@@ -1284,9 +1415,17 @@ class WebScanner:
             if raw is None:
                 continue
             request_file = self.out_dir / f"api-sweep-{index:02d}.request"
+            # out_dir is the sandbox's WRITABLE scope, so a hostile
+            # child from a previous run could have left this
+            # predictable path behind as a symlink aimed anywhere on
+            # disk; O_EXCL after the unlink refuses to follow
+            # anything and guarantees a fresh 0600 inode (same
+            # threat + flags as the ffuf config-file writer one
+            # module over).
+            request_file.unlink(missing_ok=True)
             fd = os.open(
                 request_file,
-                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                 0o600,
             )
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -1372,6 +1511,7 @@ class WebScanner:
         if self.oob_listener is None:
             return
         from packages.web.oob import OobContext
+        from packages.web.oracle import _strip_query_params
         try:
             self.oob_listener.start()
         except OSError as e:
@@ -1387,7 +1527,19 @@ class WebScanner:
                 canary = self.oob_listener.mint(
                     OobContext(url=url, param=param),
                 )
-                self.client.get(url, params={param: canary})
+                # REPLACE the parameter, never append: the cell URL
+                # normally already carries it (`?u=orig`), and requests
+                # APPENDS `params=` to an existing query — first-
+                # occurrence-wins backends (Werkzeug, servlet
+                # getParameter, Go FormValue) would then never see the
+                # canary, leaving the whole blind-SSRF pipeline dark on
+                # the dominant URL shape while coverage reports the leg
+                # ran. Same strip-then-set the oracle's replay/control
+                # legs use.
+                self.client.get(
+                    _strip_query_params(url, {param: canary}),
+                    params={param: canary},
+                )
                 injected += 1
             except Exception:
                 logger.debug("OOB canary injection failed", exc_info=True)
@@ -1415,7 +1567,7 @@ class WebScanner:
             write_web_attempts,
         )
         from packages.web.oob import OobContext, OobHit, token_of
-        from packages.web.oracle import VerificationResult
+        from packages.web.oracle import VerificationResult, _strip_query_params
         findings: list[WebFinding] = []
         attempts = []
         try:
@@ -1439,8 +1591,17 @@ class WebScanner:
                             context.url, headers={context.param: fresh},
                         )
                     else:
+                        # Replace-not-append, mirroring the injection
+                        # leg: an appended fresh token is invisible to
+                        # first-occurrence-wins backends, permanently
+                        # demoting reproducible blind SSRF to
+                        # needs_review ("initial callback not
+                        # reproduced").
                         self.client.get(
-                            context.url, params={context.param: fresh},
+                            _strip_query_params(
+                                context.url, {context.param: fresh},
+                            ),
+                            params={context.param: fresh},
                         )
                     replay_hit = listener.wait_for(
                         token_of(fresh),
@@ -2136,6 +2297,7 @@ class WebScanner:
             result = oracle.verify(
                 url, param, finding.get('payload', ''),
                 finding.get('vulnerability_type', ''), method,
+                base_data=finding.get('base_data') or None,
             )
             finding['verification'] = {
                 'status': result.status,
@@ -2159,13 +2321,18 @@ class WebScanner:
         # Self-labeling: the oracle verdicts double as ground truth for
         # the payload model's scorecard cells — no human labels needed.
         try:
+            from core.coverage.journal import resolved_run_id
             from packages.web.scorecard_bridge import (
                 record_web_oracle_outcomes,
             )
             record_web_oracle_outcomes(
                 self.llm,
                 [context[0] for context in probe_contexts],
-                run_id=self.out_dir.name,
+                # Resolved basename, never the raw spelling: a relative
+                # out_dir ("." from inside the run dir) has name == ""
+                # — the scorecard cells would lose their run scope
+                # (see resolved_run_id).
+                run_id=resolved_run_id(self.out_dir),
             )
         except Exception:
             logger.debug("web scorecard bridge failed", exc_info=True)
@@ -2235,8 +2402,13 @@ class WebScanner:
         """Build a URL-native context map for the discovered attack surface."""
         logger.info("Phase 6a: Building web context map")
         context_map = self._build_web_context_map(crawl_data, discovery)
-        self._save_artifact(self.out_dir / "context-map.json", context_map)
-        self._save_artifact(self.out_dir / "web-context-map.json", context_map)
+        # Through the context-map producer chokepoint (compact encoding
+        # + size budget), not the pretty-printing artifact writer —
+        # bounded context-map readers cap on file bytes. Redaction view
+        # first, matching _save_artifact.
+        view = self._artifact_view(context_map)
+        save_context_map(self.out_dir / "context-map.json", view)
+        save_context_map(self.out_dir / "web-context-map.json", view)
         self._phases_completed.append("understand")
         return context_map
 
@@ -2291,7 +2463,15 @@ class WebScanner:
                 logger.info("Phase 7a: /validate complete")
                 self._phases_completed.append("validate")
         except Exception as e:
-            logger.debug("Phase 7a: /validate failed: %s", self._redact(str(e)))
+            # The operator explicitly opted into --validate: a crash of
+            # the post-pass is coverage loss, surfaced at WARNING and in
+            # the report's phase list (same doctrine as check failures),
+            # never a debug-only detail.
+            self._phases_completed.append("validate_failed")
+            logger.warning(
+                "Phase 7a: /validate failed -- findings keep their "
+                "pre-validation status: %s", self._redact(str(e)),
+            )
 
         return findings
 
@@ -2329,7 +2509,13 @@ class WebScanner:
         research_landscape = assess_research_landscape(
             discovery=discovery,
             crawl_data=crawl_data,
-            registered_check_ids=(check.check_id for check in registry.all()),
+            # Only checks THIS run can actually execute count toward
+            # coverage — registration alone let self-skipping checks
+            # (requires_auth with no session, receipt-excluded tiers)
+            # read as covered while never firing. Includes the
+            # registry-less V5.2.1 fuzzing capability when Phase 6 can
+            # run.
+            registered_check_ids=self._runnable_check_ids(),
         )
         urls = list(dict.fromkeys(
             crawl_data.get("discovered_urls")
@@ -2632,7 +2818,13 @@ class WebScanner:
         research_landscape = assess_research_landscape(
             discovery=discovery,
             crawl_data=crawl_data,
-            registered_check_ids=(check.check_id for check in registry.all()),
+            # Only checks THIS run can actually execute count toward
+            # coverage — registration alone let self-skipping checks
+            # (requires_auth with no session, receipt-excluded tiers)
+            # read as covered while never firing. Includes the
+            # registry-less V5.2.1 fuzzing capability when Phase 6 can
+            # run.
+            registered_check_ids=self._runnable_check_ids(),
         )
         self._save_artifact(self.out_dir / "research_landscape.json", research_landscape)
 

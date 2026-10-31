@@ -23,7 +23,8 @@ import threading
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import NoReturn
+from collections.abc import Callable
+from typing import Any, NoReturn
 
 # Add the repo root to sys.path. resolve() first: invoked through a
 # symlink (or relatively on interpreters that don't absolutise
@@ -34,12 +35,140 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from core.config import RaptorConfig
 from core.json import load_json, save_json
 from core.logging import CONSOLE_LOG_LEVELS, configure_run_logging, get_logger
-from core.run.safe_io import safe_run_mkdir
-from core.sandbox import SANDBOX_ENGAGE_EXIT_CODE, SandboxSetupError
+from core.run.safe_io import (
+    PRIVATE_TEXT_MAX_BYTES,
+    bound_artifact_references_in_record,
+    bounded_artifact_reference_fields,
+    safe_run_mkdir,
+    write_private_json,
+    write_private_text,
+)
+from core.sandbox import SANDBOX_ENGAGE_EXIT_CODE, SandboxSetupError, set_pdeathsig
+from core.sandbox.disable_consent import (
+    export_disable_consent as _export_disable_consent,
+)
 from core.schema_constants import VULN_TYPE_TO_CWE as _CWE_FROM_VULN_TYPE
 from core.security.cc_trust import check_repo_claude_trust, set_trust_override
+# Module-level on purpose: main()'s error/degrade handlers relay
+# exception text through this helper. A branch-local import makes the
+# name function-local for ALL of main() (the binding only arms on the
+# branch that executed it), so every other handler's relay raises
+# UnboundLocalError exactly when its error path fires.
+from core.security.log_sanitisation import sanitise_for_terminal
 
 logger = get_logger()
+
+
+def _parent_death_preexec() -> Callable[[], None] | None:
+    """Guarded PR_SET_PDEATHSIG preexec for the detached child spawns.
+
+    PDEATHSIG binds to the SPAWNING THREAD, not the process: armed
+    from a worker thread, the kernel SIGKILLs the child when THAT
+    THREAD exits — a healthy child shot mid-run while this process
+    lives on (empirically reproduced). Every current spawn site runs
+    on main()'s thread, where thread death IS process death; this
+    guard is the tripwire for a future non-main-thread caller. On
+    violation it refuses the preexec (child spawns without PDEATHSIG)
+    with a loud warning instead of arming a mis-scoped kill: the
+    RAPTOR_PARENT_WATCHDOG opt-in the scanner/codeql envs carry is
+    thread-independent and keeps covering parent death for those
+    children, so the fallback degrades to watchdog-only — never to a
+    spurious SIGKILL, and never silently (the warning names the
+    thread and the fix).
+    """
+    if threading.current_thread() is not threading.main_thread():
+        logger.warning(
+            "parent-death preexec requested from non-main thread %r: "
+            "PR_SET_PDEATHSIG would bind to that thread's lifetime and "
+            "SIGKILL a healthy child when it exits — refusing the "
+            "preexec (child falls back to the RAPTOR_PARENT_WATCHDOG "
+            "layer where opted in). Move the spawn to the main thread "
+            "to restore the instant parent-death layer.",
+            threading.current_thread().name,
+        )
+        return None
+    return set_pdeathsig()
+
+
+def _format_report_accounting(
+    cost_summary: dict,
+    child_costs: list[tuple[str, float]] | None = None,
+) -> str:
+    """Shared honest accounting text for console and Markdown reports."""
+    from packages.llm_analysis.orchestrator import format_cost_summary
+    rendered = format_cost_summary(cost_summary)
+    costs = child_costs or []
+    child_total = sum(spend for _label, spend in costs)
+    if child_total <= 0:
+        return rendered
+    details = ", ".join(
+        f"{label} ${spend:.2f}" for label, spend in costs
+    )
+    analysis_total = float(cost_summary.get("total_cost", 0.0) or 0.0)
+    child_text = (
+        f"Known child-pass USD ${child_total:.2f} ({details}); "
+        f"combined numeric spend ${analysis_total + child_total:.2f}"
+    )
+    return f"{rendered}; {child_text}" if rendered else child_text
+
+
+def _accounting_console_lines(
+    cost_summary: dict,
+    child_costs: list[tuple[str, float]] | None = None,
+) -> list[str]:
+    """Render the final workflow's accounting block."""
+    lines: list[str] = []
+    accounting_text = _format_report_accounting(
+        cost_summary, child_costs,
+    )
+    thinking = cost_summary.get("thinking_tokens", 0)
+    if accounting_text:
+        line = f"   Accounting: {accounting_text}"
+        if thinking > 0:
+            line += f" ({thinking:,} thinking tokens)"
+        lines.append(line)
+    elif thinking > 0:
+        lines.append(f"   Thinking tokens: {thinking:,}")
+    cost = cost_summary.get("total_cost", 0)
+    if cost > 0:
+        by_model = cost_summary.get("cost_by_model", {})
+        if len(by_model) > 1:
+            lines.extend(
+                f"     {model}: ${model_cost:.2f}"
+                for model, model_cost in by_model.items()
+            )
+    if child_costs:
+        lines.extend(
+            f"     {label}: ${spend:.2f}"
+            for label, spend in child_costs
+        )
+    return lines
+
+
+def _dispatch_failure_summary(orchestration: dict) -> dict[str, object]:
+    """Summarize incomplete LLM task batches for console/report warnings."""
+    batches = orchestration.get("dispatch_batches", [])
+    if not isinstance(batches, list):
+        return {"failed": 0, "not_run": 0, "details": []}
+    failed = 0
+    not_run = 0
+    details: list[str] = []
+    for batch in batches:
+        if not isinstance(batch, dict):
+            continue
+        batch_failed = int(batch.get("failed", 0) or 0)
+        batch_not_run = int(batch.get("not_run", 0) or 0)
+        failed += max(batch_failed, 0)
+        not_run += max(batch_not_run, 0)
+        if batch_failed or batch_not_run:
+            label = str(batch.get("phase") or batch.get("task") or "unknown")
+            pieces = []
+            if batch_failed:
+                pieces.append(f"{batch_failed} failed")
+            if batch_not_run:
+                pieces.append(f"{batch_not_run} not run")
+            details.append(f"{label}: {', '.join(pieces)}")
+    return {"failed": failed, "not_run": not_run, "details": details}
 
 
 def _kill_process_tree(process: "subprocess.Popen") -> None:
@@ -62,6 +191,56 @@ def _kill_process_tree(process: "subprocess.Popen") -> None:
         pass
     with contextlib.suppress(OSError):
         process.kill()
+
+
+#: Filename of the cross-file taint engine's SARIF artifact
+#: (== core.taint.run.SARIF_FILENAME, pinned by test; the constant is
+#: local so argument parsing never imports the engine). Excluded from
+#: the --reanalyze fallback glob by EXACT name: widening this to a
+#: pattern would silently drop operator-imported artifacts, while a
+#: rename on the emission side without this constant re-opens the
+#: import-lane pull.
+_TAINT_SARIF_FILENAME = "crossfile-taint.sarif"
+
+
+def _reanalyze_sarif_selection(
+    reanalyze_dir: Path, prev_meta: dict,
+) -> list[str]:
+    """SARIF files a --reanalyze run re-imports from a previous run
+    directory: the run-recorded ``extra.sarif_files`` when present,
+    else a ``*.sarif`` directory glob.
+
+    The fallback glob excludes the taint engine's own artifact —
+    ``crossfile-taint.sarif`` is a producer channel consumed by the
+    post-scan merge (a rerun with --taint-crossfile regenerates it),
+    not an external scanner result; pulling it into the import lane
+    would re-ingest engine findings as imported scanner findings.
+    Exclusions are logged, never silent. A metadata-recorded list is
+    the original run's explicit statement of its scanner outputs and
+    is honoured verbatim.
+    """
+    prev_sarif: list[str] = []
+    for s in prev_meta.get("extra", {}).get("sarif_files", []):
+        candidate = reanalyze_dir / Path(s).name
+        if candidate.exists():
+            prev_sarif.append(str(candidate))
+        else:
+            logger.warning("--reanalyze: SARIF file missing: %s", candidate)
+    if not prev_sarif:
+        excluded = 0
+        for f in sorted(reanalyze_dir.glob("*.sarif")):
+            if f.name == _TAINT_SARIF_FILENAME:
+                excluded += 1
+                continue
+            prev_sarif.append(str(f))
+        if excluded:
+            logger.info(
+                "--reanalyze: excluded %s (cross-file taint artifact — "
+                "rerun with --taint-crossfile to regenerate it; the "
+                "import lane is for scanner SARIF)",
+                _TAINT_SARIF_FILENAME,
+            )
+    return prev_sarif
 
 
 def _count_dropped_suppressions(path: Path) -> int:
@@ -94,6 +273,13 @@ def _count_dropped_suppressions(path: Path) -> int:
     return count
 
 
+#: Run dir of THIS process's lifecycle-stamped run, set right after
+#: ``start_run`` succeeds. The ``_cli_entry`` backstop uses it to close
+#: the lifecycle on uncaught exceptions / Ctrl-C — direct
+#: ``python3 raptor_agentic.py`` invocations have no wrapper to do it.
+_LIFECYCLE_OUT_DIR: Path | None = None
+
+
 def _fail_run_and_exit(out_dir: Path, reason: str) -> NoReturn:
     """Stamp the run failed, then hard-exit.
 
@@ -110,6 +296,626 @@ def _fail_run_and_exit(out_dir: Path, reason: str) -> NoReturn:
         from core.run import fail_run
         fail_run(out_dir, reason)
     sys.exit(1)
+
+
+def _run_validation_phase_checked(
+        run_dir: Path, /, **phase_kwargs) -> tuple[dict, int]:
+    """Phase 2 (dedup/exploitability validation) with lifecycle capture.
+
+    Pre-fix the call site had no error handling: an exception inside
+    the phase crash-aborted the whole pipeline as an unhandled
+    traceback, leaving the run marker at "running" and no failure
+    record. Fail the run with the error recorded instead.
+    SandboxSetupError keeps propagating to the entry-point handler —
+    its actionable message and exit-code contract must survive.
+    """
+    from packages.exploitability_validation import run_validation_phase
+    try:
+        return run_validation_phase(**phase_kwargs)
+    except SandboxSetupError:
+        raise
+    except Exception as e:
+        logger.exception("exploitability validation phase crashed")
+        _fail_run_and_exit(
+            run_dir,
+            f"exploitability validation phase crashed: "
+            f"{type(e).__name__}: {e}",
+        )
+
+
+def _fail_or_warn_missing_analysis(out_dir: Path, rc: int,
+                                   stderr: str) -> None:
+    """Phase 3 finished without an analysis report.
+
+    A nonzero analysis subprocess is a failed phase: fail the run and
+    exit nonzero. Pre-fix the pipeline degraded to a stderr warning
+    and still completed "successfully" (exit 0, empty analysis
+    section), so orchestration layers treated a substantively failed
+    run as complete. rc == 0 with no report keeps the established
+    warn-and-degrade (nothing to analyse is not an error).
+    """
+    if rc != 0:
+        print(f"✗ Analysis subprocess failed (exit code {rc})",
+              file=sys.stderr)
+        if stderr:
+            print(f"    Error: {stderr[:500]}", file=sys.stderr)
+        logger.error("Phase 3 failed - rc=%d, stderr=%s", rc, stderr[:200])
+        _fail_run_and_exit(
+            out_dir,
+            f"analysis subprocess exited {rc} with no analysis report",
+        )
+    print("⚠️  Analysis produced no output", file=sys.stderr)
+    if stderr:
+        print(f"    Error: {stderr[:500]}", file=sys.stderr)
+    logger.warning("Phase 3 produced no report - rc=%d, stderr=%s",
+                   rc, stderr[:200])
+
+
+def _warn_analysis_rc_with_report(rc: int) -> None:
+    """Phase 3 wrote its report but the subprocess exited nonzero.
+
+    The report existing means the failure hit AFTER the results were
+    persisted (post-report teardown), so the run deliberately proceeds
+    on the written report and still exits 0 — but the child's rc must
+    be visible, not silently absorbed into "Analysis complete".
+    """
+    if rc == 0:
+        return
+    print(f"⚠️  Analysis subprocess exited {rc} after writing its "
+          "report — continuing on the written report",
+          file=sys.stderr)
+    logger.warning(
+        "Phase 3 subprocess exited %d after writing the analysis "
+        "report — proceeding on the written report", rc,
+    )
+
+
+def _print_codeql_stderr_tail(codeql_stderr: str) -> None:
+    """Relay the tail of a failed CodeQL run's stderr to the operator.
+
+    CodeQL error lines quote target file paths, and file names may
+    legally carry ESC/C1 bytes — escape each relayed line like every
+    other child-output relay here. The language-detection hint keys
+    off the raw lines (the escape never rewrites plain ASCII, but
+    matching pre-escape keeps the two concerns independent).
+    """
+    stderr_tail = (codeql_stderr or "").rstrip().splitlines()[-15:]
+    if stderr_tail:
+        print("   CodeQL stderr (last 15 lines):")
+        for line in stderr_tail:
+            print(f"     {sanitise_for_terminal(line, max_len=300)}")
+    if any("No CodeQL-supported languages detected" in line
+           for line in stderr_tail):
+        print(
+            "   Hint: language auto-detection rejected every candidate "
+            "(typically because the target has no build files — go.mod, "
+            "package.json, pyproject.toml, CMakeLists.txt, etc.). "
+            "Pass --languages cpp,python,javascript,go (or a subset) "
+            "to bypass auto-detection."
+        )
+
+
+_TOOL_STATUS_VALUES = frozenset({"completed", "failed", "skipped"})
+
+
+def _bounded_tool_reason(reason: object, *, max_len: int = 300) -> str:
+    """Return a single bounded, terminal-safe diagnostic string."""
+    from core.security.redaction import redact_secrets
+
+    text = str(reason or "").strip()
+    if not text:
+        return ""
+    text = redact_secrets(text)
+    safe = sanitise_for_terminal(text, max_len=max_len)
+    if len(safe) > max_len:
+        safe = safe[:max(0, max_len - 3)] + "..."
+    return safe
+
+
+def _tool_state(
+    status: str,
+    *,
+    requested: bool,
+    reason: object = "",
+    artifacts: (
+        list[Path | str | None] | tuple[Path | str | None, ...]
+    ) = (),
+    **details: Any,
+) -> dict[str, Any]:
+    """Build the compatible per-tool execution-status contract."""
+    if status not in _TOOL_STATUS_VALUES:
+        raise ValueError(f"unsupported tool status: {status}")
+
+    state: dict[str, Any] = {
+        "status": status,
+        "enabled": bool(requested),
+        "requested": bool(requested),
+        "attempted": status in {"completed", "failed"},
+        "completed": status == "completed",
+        "failed": status == "failed",
+        "skipped": status == "skipped",
+    }
+
+    safe_reason = _bounded_tool_reason(reason)
+    if safe_reason:
+        state["reason"] = safe_reason
+        if status == "failed":
+            state["failure_reason"] = safe_reason
+        elif status == "skipped":
+            state["skip_reason"] = safe_reason
+    health = details.get("enrichment_health")
+    if isinstance(health, dict):
+        details["enrichment_health"] = bound_artifact_references_in_record(
+            health,
+        )
+    state.update(details)
+    state.update(bounded_artifact_reference_fields(artifacts))
+    return state
+
+
+def _codeql_enrichment_tool_fields(
+    codeql_metrics: dict[str, Any],
+) -> dict[str, Any]:
+    """Project additive IRIS health into the per-tool report contract.
+
+    Standard CodeQL remains ``completed`` when its own analysis succeeded.
+    Enrichment failure/degradation is nested and operator-visible instead of
+    being misreported as a scanner failure.
+    """
+    health = codeql_metrics.get("enrichment_health")
+    if not isinstance(health, dict):
+        return {}
+    health = bound_artifact_references_in_record(health) or {}
+
+    ref_fields = bounded_artifact_reference_fields(
+        health.get("artifacts", []),
+    )
+    refs = list(ref_fields["artifacts"])
+    status = str(health.get("status", ""))
+    degraded = bool(health.get("degraded"))
+    reason = ""
+    if status == "failed":
+        reason = (
+            "standard CodeQL completed; IRIS LocalFlowSource "
+            "enrichment failed"
+        )
+    elif status == "completed" and degraded:
+        reason = (
+            "standard CodeQL completed; IRIS LocalFlowSource queries "
+            "completed with install diagnostic warnings"
+        )
+
+    fields: dict[str, Any] = {
+        "enrichment_health": health,
+        "enrichment_status": status or None,
+        "enrichment_degraded": degraded,
+        "artifacts": refs,
+    }
+    if ref_fields.get("artifact_references_truncated"):
+        fields["enrichment_artifact_references_truncated"] = True
+        fields["enrichment_artifact_references_omitted"] = ref_fields[
+            "artifact_references_omitted"
+        ]
+    if refs:
+        fields["enrichment_artifact"] = refs[0]
+    if reason:
+        fields["reason"] = reason
+    return fields
+
+
+def _record_tool_failure(
+    output_dir: Path,
+    tool: str,
+    reason: object,
+    *,
+    exit_code: int | None = None,
+    timed_out: bool = False,
+) -> Path | None:
+    """Persist a bounded failure receipt and return its path."""
+    safe_reason = _bounded_tool_reason(reason)
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        failure_path = output_dir / "failure.json"
+        payload: dict[str, Any] = {
+            "tool": tool,
+            "status": "failed",
+            "reason": safe_reason or "unknown failure",
+            "timed_out": bool(timed_out),
+        }
+        if exit_code is not None:
+            payload["exit_code"] = exit_code
+        return write_private_json(failure_path, payload)
+    except (OSError, TypeError, ValueError) as exc:
+        logger.warning(
+            "failed to persist %s failure receipt in %s: %s",
+            tool,
+            sanitise_for_terminal(str(output_dir), max_len=240),
+            _bounded_tool_reason(exc),
+        )
+        return None
+
+
+def _last_diagnostic_line(stderr: str) -> str:
+    """Last non-empty diagnostic line, bounded and safe for reporting."""
+    for line in reversed((stderr or "").splitlines()):
+        if line.strip():
+            return _bounded_tool_reason(line)
+    return ""
+
+
+def _assessment_from_reports(
+    *,
+    validated_findings: int,
+    analysis: dict,
+    orchestration_result: dict | None,
+    max_findings: int | None,
+    llm_available: bool,
+) -> dict[str, Any]:
+    """Resolve assessment completeness for orchestrated and sequential runs."""
+    exact = (orchestration_result or {}).get("assessment")
+    if not isinstance(exact, dict):
+        exact = (
+            (orchestration_result or {}).get("orchestration", {})
+            .get("assessment")
+        )
+    if isinstance(exact, dict):
+        return dict(exact)
+
+    from packages.llm_analysis.orchestrator import _build_assessment_summary
+
+    requested = max(int(validated_findings or 0), 0)
+    eligible = requested
+    mode = analysis.get("mode") if isinstance(analysis, dict) else None
+    if mode == "prep_only":
+        prepared = analysis.get("results")
+        if isinstance(prepared, list):
+            try:
+                processed = max(
+                    int(analysis.get("processed", 0) or 0), 0,
+                )
+            except (TypeError, ValueError):
+                processed = 0
+            prepared_count = max(processed, len(prepared))
+            if prepared_count or requested == 0:
+                requested = prepared_count
+
+            # Match orchestrate()'s eligibility gate exactly: only an
+            # explicit canonical skipped status is mechanically
+            # ineligible. Bare prep records intentionally do not flow
+            # through derive_status(), which would classify every
+            # not-yet-analysed record as skipped.
+            from core.run.finding_status import ALL_STATUSES, is_skipped
+            mechanically_ineligible = sum(
+                1
+                for finding in prepared
+                if isinstance(finding, dict)
+                and finding.get("status") in ALL_STATUSES
+                and is_skipped(finding)
+            )
+            eligible = max(requested - mechanically_ineligible, 0)
+        selected = 0
+        analyzed = 0
+    else:
+        selected = max(int(analysis.get("processed", 0) or 0), 0)
+        analyzed = max(int(analysis.get("analyzed", 0) or 0), 0)
+        if selected == 0 and analyzed:
+            selected = analyzed
+
+    cap_source = "explicit" if max_findings is not None else "provider_default"
+    if max_findings is not None:
+        cap = max(int(max_findings), 0)
+    elif selected and selected < requested:
+        # Sequential provider-default runs only persist the resolved selected
+        # count. Recording that concrete cap is more truthful than claiming
+        # the outer process knows the child's provider configuration.
+        cap = selected
+    else:
+        cap = 0
+
+    summary = _build_assessment_summary(
+        requested=requested,
+        eligible=eligible,
+        selected=selected,
+        analyzed=analyzed,
+        cap=cap,
+        cap_source=cap_source,
+    )
+    if summary["unreviewed"] and not llm_available:
+        summary["reason"] = "autonomous analysis did not run: no LLM available"
+    elif summary["unreviewed"] and mode == "prep_only":
+        summary["reason"] = "orchestration did not complete"
+    return summary
+
+
+def _build_run_result(
+    tool_states: dict[str, dict[str, Any]],
+    assessment: dict[str, Any],
+    *,
+    extra_failures: list[str] | tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Build the aggregate result/exit contract.
+
+    Exit convention:
+
+    * 0 — aggregate output is usable. It may be ``complete`` or ``partial``;
+      at least one required scanner completed, or no tracked scanner was
+      required (for example imported-SARIF-only / OpenAnt-only mode).
+    * 1 — required scanners produced no usable output. The persisted report
+      is diagnostic evidence, not a successful partial scan.
+    * 2 — remains reserved by ``main`` for CLI/configuration misuse before an
+      aggregate report is produced.
+    """
+    display_names = {
+        "semgrep": "Semgrep",
+        "codeql": "CodeQL",
+        "sca": "SCA",
+    }
+    requested_scanners = [
+        name for name, state in tool_states.items()
+        if state.get("requested")
+    ]
+    required_scanners = [
+        name for name in requested_scanners
+        if tool_states[name].get("required_for_success", True)
+    ]
+    usable_scanners = [
+        name for name in requested_scanners
+        if tool_states[name].get("completed")
+    ]
+    failed_scanners = [
+        name for name in requested_scanners
+        if tool_states[name].get("failed")
+    ]
+    skipped_scanners = [
+        name for name in requested_scanners
+        if tool_states[name].get("skipped")
+    ]
+    not_requested = [
+        name for name, state in tool_states.items()
+        if not state.get("requested")
+    ]
+    all_requested_failed = (
+        bool(required_scanners)
+        and all(tool_states[name].get("failed") for name in required_scanners)
+    )
+    no_usable_scanner_output = (
+        bool(required_scanners)
+        and not any(
+            tool_states[name].get("completed")
+            for name in required_scanners
+        )
+    )
+
+    reasons: list[str] = []
+    for name, state in tool_states.items():
+        if state.get("failed"):
+            reason = state.get("failure_reason") or state.get("reason")
+            suffix = f": {reason}" if reason else ""
+            reasons.append(f"{display_names.get(name, name)} failed{suffix}")
+        elif state.get("requested") and state.get("skipped"):
+            reason = state.get("skip_reason") or state.get("reason")
+            suffix = f": {reason}" if reason else ""
+            reasons.append(f"{display_names.get(name, name)} skipped{suffix}")
+        elif state.get("requested") and state.get("degraded"):
+            reason = state.get("reason")
+            suffix = f": {reason}" if reason else ""
+            reasons.append(f"{display_names.get(name, name)} degraded{suffix}")
+
+    unreviewed = int(assessment.get("unreviewed", 0) or 0)
+    if assessment.get("status") != "complete" and unreviewed:
+        analyzed = int(assessment.get("analyzed", 0) or 0)
+        eligible = int(assessment.get("eligible", 0) or 0)
+        reason = assessment.get("reason")
+        suffix = f" ({reason})" if reason else ""
+        reasons.append(
+            f"assessment incomplete: {analyzed} of {eligible} eligible "
+            f"findings analyzed; {unreviewed} unreviewed{suffix}"
+        )
+    elif assessment.get("status") != "complete":
+        reason = assessment.get("reason") or "assessment did not complete"
+        reasons.append(str(reason))
+
+    for reason in extra_failures:
+        safe_reason = _bounded_tool_reason(reason)
+        if safe_reason:
+            reasons.append(safe_reason)
+
+    failure_reason = None
+    if no_usable_scanner_output:
+        failure_reason = (
+            "all requested scanners failed"
+            if all_requested_failed
+            else "no requested scanner produced usable output"
+        )
+        reasons.insert(0, failure_reason)
+
+    failed = failure_reason is not None
+    partial = bool(reasons) and not failed
+    status = "failed" if failed else "partial" if partial else "complete"
+    exit_code = 1 if failed else 0
+    return {
+        "status": status,
+        "partial": partial,
+        "failed": failed,
+        "usable_output": not failed,
+        "pipeline_execution": "failed" if failed else "completed",
+        "assessment_completeness": assessment.get("status", "partial"),
+        "reasons": reasons,
+        "partial_reasons": reasons if partial else [],
+        "failure_reasons": reasons if failed else [],
+        "failure_reason": failure_reason,
+        "scanners": {
+            "requested": requested_scanners,
+            "required_for_success": required_scanners,
+            "usable": usable_scanners,
+            "failed": failed_scanners,
+            "skipped": skipped_scanners,
+            "not_requested": not_requested,
+            "all_requested_failed": all_requested_failed,
+            "no_usable_output": no_usable_scanner_output,
+        },
+        "exit_code": exit_code,
+        "exit_code_contract": (
+            "0 = usable aggregate output (complete or partial; at least one "
+            "required scanner completed, or no tracked scanner was "
+            "required). 1 = required scanners produced no usable output. "
+            "2 = CLI/configuration error before aggregate output."
+        ),
+    }
+
+
+def _result_contract_fields(
+    run_result: dict[str, Any],
+    assessment: dict[str, Any],
+) -> dict[str, Any]:
+    """Additive top-level fields for the persisted aggregate report."""
+    return {
+        "result": dict(run_result),
+        "assessment": dict(assessment),
+    }
+
+
+def _completion_partial_metadata(
+    run_result: dict[str, Any],
+    assessment: dict[str, Any],
+    tool_states: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Concise lifecycle metadata for complete versus partial output."""
+    failures = {
+        name: {
+            "reason": state.get("failure_reason") or state.get("reason"),
+            "artifact": state.get("artifact"),
+        }
+        for name, state in tool_states.items()
+        if state.get("failed")
+    }
+    return {
+        "result_status": run_result.get("status", "partial"),
+        "partial": bool(run_result.get("partial")),
+        "failed": bool(run_result.get("failed")),
+        "exit_code": int(run_result.get("exit_code", 1)),
+        "pipeline_execution": run_result.get("pipeline_execution", "failed"),
+        "usable_output": bool(run_result.get("usable_output")),
+        "reasons": list(run_result.get("reasons", [])),
+        "partial_reasons": list(run_result.get("partial_reasons", [])),
+        "failure_reasons": list(run_result.get("failure_reasons", [])),
+        "scanners": dict(run_result.get("scanners", {})),
+        "assessment": assessment,
+        "tool_failures": failures,
+    }
+
+
+def _finalize_run_lifecycle(
+    out_dir: Path,
+    run_result: dict[str, Any],
+    *,
+    extra: dict[str, Any],
+    manifest: dict[str, Any],
+) -> str:
+    """Persist completed/partial output as completed, all-failed as failed."""
+    if int(run_result.get("exit_code", 1)) == 0:
+        from core.run import complete_run
+
+        complete_run(out_dir, extra=extra, manifest=manifest)
+        return "completed"
+
+    from core.run import fail_run
+
+    fail_run(
+        out_dir,
+        run_result.get("failure_reason")
+        or "requested scanners produced no usable output",
+        extra=dict(extra),
+    )
+    return "failed"
+
+
+def _build_tool_execution_report_section(
+    tool_states: dict[str, dict[str, Any]],
+):
+    """Render per-tool completion/failure/skip truth into Markdown."""
+    from core.reporting import ReportSection
+    from core.security.prompt_output_sanitise import sanitise_string
+
+    display_names = {
+        "semgrep": "Semgrep",
+        "codeql": "CodeQL",
+        "sca": "SCA",
+    }
+
+    def _cell(value: object, cap: int = 180) -> str:
+        return sanitise_string(
+            str(value or "").strip(), max_chars=cap,
+        ).replace("|", "\\|").replace("\n", " ")
+
+    lines = [
+        "| Tool | State | Attempted | Findings | Reason | Artifact |",
+        "|---|---|---:|---:|---|---|",
+    ]
+    for name in ("semgrep", "codeql", "sca"):
+        state = tool_states.get(name) or _tool_state(
+            "skipped", requested=False, reason="not requested",
+        )
+        artifact = state.get("artifact") or ""
+        findings = state.get("findings")
+        if findings is None:
+            findings = "unknown"
+        lines.append(
+            f"| {_cell(display_names[name], 40)} "
+            f"| {_cell(str(state.get('status', 'skipped')).title(), 40)} "
+            f"| {'yes' if state.get('attempted') else 'no'} "
+            f"| {_cell(findings, 30)} "
+            f"| {_cell(state.get('reason', ''), 180)} "
+            f"| {_cell(artifact, 240)} |"
+        )
+    return ReportSection(title="Tool Execution", content="\n".join(lines))
+
+
+def _collect_child_pass_costs(prepass_result, postpass_result,
+                              audit_postpass) -> list[tuple[str, float]]:
+    """(label, spend_usd) per opt-in pass subprocess that recorded spend.
+
+    The headline run cost otherwise counts only the orchestration
+    phase; --understand / --validate passes settle their
+    credential-proxy ledger into ``cc-proxy-spend.json`` in their own
+    run dirs, and --gap-audit writes ``cost-breakdown.json`` with the
+    authoritative ``totals.total_spend_usd``. Best-effort join: passes
+    that recorded nothing (skipped, or non-proxy dispatch, which has
+    no spend ledger) contribute nothing.
+    """
+    def _proxy_spend(run_dir) -> float:
+        data = load_json(Path(run_dir) / "cc-proxy-spend.json")
+        if not isinstance(data, dict):
+            return 0.0
+        try:
+            return max(float(data.get("reconciled_usd") or 0.0), 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    costs: list[tuple[str, float]] = []
+    understand_dir = getattr(prepass_result, "understand_dir", None)
+    if getattr(prepass_result, "ran", False) and understand_dir:
+        spend = _proxy_spend(understand_dir)
+        if spend > 0:
+            costs.append(("understand pre-pass", spend))
+    audit_dir = (audit_postpass or {}).get("audit_dir")
+    if audit_dir:
+        data = load_json(Path(audit_dir) / "cost-breakdown.json")
+        totals = data.get("totals") if isinstance(data, dict) else None
+        if not isinstance(totals, dict):
+            totals = {}
+        try:
+            spend = float(totals.get("total_spend_usd") or 0.0)
+        except (TypeError, ValueError):
+            spend = 0.0
+        if spend > 0:
+            costs.append(("gap-audit", spend))
+    validate_dir = getattr(postpass_result, "validate_dir", None)
+    if getattr(postpass_result, "ran", False) and validate_dir:
+        spend = _proxy_spend(validate_dir)
+        if spend > 0:
+            costs.append(("validate post-pass", spend))
+    return costs
 
 
 def _materialise_threat_model_phase(
@@ -168,8 +974,30 @@ def _materialise_threat_model_phase(
                         understand_dir, len(stale),
                     )
             else:
-                summary["skipped_reason"] = reason or "understand pre-pass did not produce context-map.json"
-                return summary
+                try:
+                    from core.understand_graph import build_context_map, graph_path_for_run
+                    graph_path = graph_path_for_run(out_dir, str(target))
+                    graph_context, graph_stale = build_context_map(graph_path, str(target))
+                    if graph_context:
+                        context_map_path = out_dir / "context-map.graph.json"
+                        save_json(context_map_path, graph_context, mode=0o600)
+                        summary["reused_context_map"] = True
+                        summary["reused_graph"] = str(graph_path)
+                        if graph_stale:
+                            summary["stale_files"] = sorted(graph_stale)
+                            if not allow_stale:
+                                summary["skipped_reason"] = (
+                                    "reused /understand graph is stale; rerun "
+                                    "with --threat-model-use-stale to accept it"
+                                )
+                                return summary
+                    else:
+                        summary["skipped_reason"] = reason or "understand pre-pass did not produce context-map.json"
+                        return summary
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("Threat model graph fallback failed: %s", e)
+                    summary["skipped_reason"] = reason or "understand pre-pass did not produce context-map.json"
+                    return summary
         except Exception as e:  # noqa: BLE001
             logger.debug("Threat model fallback lookup failed: %s", e)
             summary["skipped_reason"] = reason or "understand pre-pass did not produce context-map.json"
@@ -304,9 +1132,15 @@ def _materialise_threat_model_phase(
 
     if mgr is not None and hasattr(project, "name") and hasattr(project, "to_dict"):
         try:
-            project.threat_model_path = str(json_path)
-            project.threat_model_updated = model.updated_at
-            save_json(mgr.projects_dir / f"{project.name}.json", project.to_dict())
+            # RMW mutator, never a full-dict save of a stale snapshot:
+            # this pass runs AFTER long context-map work, and a bare
+            # save_json here resurrected trust markers removed (and
+            # dropped settings written) in the meantime.
+            mgr.update_threat_model_stamp(
+                project.name,
+                updated_at=model.updated_at,
+                path=str(json_path),
+            )
         except Exception as e:  # noqa: BLE001
             logger.debug("Threat model project metadata update skipped: %s", e)
 
@@ -627,6 +1461,16 @@ def run_command_streaming(
             # the parent's handler could log a meaningful
             # message.
             start_new_session=True,
+            # Parent-death signaling: the detachment above also means
+            # a SIGKILLed/OOM-killed orchestrator strands the child
+            # tree forever. PR_SET_PDEATHSIG (plus the sacrificial
+            # oom_score_adj the shared preexec sets) closes that; the
+            # child's own sandboxed grandchildren carry their own
+            # death-pipe/pdeathsig against the child, so the kill
+            # cascades. PDEATHSIG binds to the spawning THREAD — the
+            # guarded helper refuses (watchdog-only fallback, loud)
+            # if a future caller ever spawns off the main thread.
+            preexec_fn=_parent_death_preexec(),
         )
         # The child has inherited the FD; close our copy so the
         # pipe's EOF tracks the child's lifetime, not ours. Clear the
@@ -780,7 +1624,7 @@ def _prepare_fuzz_crashes_for_validate(
         context = analyser.analyse_crash(crash_id, crash_file, signal)
         context.crash_type = analyser.classify_crash_type(context)
         context_dict = asdict(context)
-        context_dict["replay"] = replay_outputs.get(str(crash_file), [])
+        context_dict["replay"] = replay_outputs.get(crash_file.name, [])
         contexts.append(context_dict)
 
         root_key = (
@@ -908,7 +1752,10 @@ def _replay_fuzz_crashes(*, binary_path: Path, crash_files: list[Path], out_dir:
     for crash_file in crash_files:
         entries = []
         if not crash_file.is_file():
-            results[str(crash_file)] = entries
+            # Same basename key as the replayed path below — a mixed
+            # absolute-path/basename summary would silently detach
+            # this entry from every basename-joining consumer.
+            results[crash_file.name] = entries
             continue
         for candidate in candidates:
             label = f"{crash_file.name}__{candidate.name}".replace("/", "_")
@@ -976,7 +1823,14 @@ def _replay_fuzz_crashes(*, binary_path: Path, crash_files: list[Path], out_dir:
                     "error": str(e),
                     "reproduced": False,
                 })
-        results[str(crash_file)] = entries
+        # Keyed by BASENAME (unique within one crashes dir), not the
+        # absolute path: replay-summary.json outlives this process and
+        # its consumer (fuzz_evidence) re-enumerates crash files at
+        # load time — an absolute-path key broke the join on any
+        # spelling drift (run dir moved/adopted, crashes-dir fallback
+        # resolution, a symlinked tmp component) and every
+        # REPLAYED_CRASH tier silently detached.
+        results[crash_file.name] = entries
     save_json(out_dir / "replay-summary.json", results)
     return results
 
@@ -1258,6 +2112,138 @@ def _should_run_mechanical_sca(sca_agent, deep_sca_requested: bool) -> bool:
     return bool(sca_agent) and not deep_sca_requested
 
 
+def _sca_subprocess_timeout(
+    phase_timeout: int | None,
+    *,
+    explicitly_set: bool,
+) -> int | None:
+    """Resolve the SCA parent's wall timeout.
+
+    SCA keeps its historical bounded default unless the operator explicitly
+    supplied the repository-wide --phase-timeout flag. An explicit zero is
+    the unbounded sentinel and passes through unchanged.
+    """
+    if explicitly_set:
+        return phase_timeout
+    from packages.sca.agent import DEFAULT_SCA_SUBPROCESS_TIMEOUT
+    return DEFAULT_SCA_SUBPROCESS_TIMEOUT
+
+
+def _sca_required_for_success(
+    *,
+    run_semgrep: bool,
+    run_codeql: bool,
+    deep_sca_requested: bool,
+) -> bool:
+    """Whether SCA participates in the aggregate hard-failure gate."""
+    return bool(run_semgrep or run_codeql or deep_sca_requested)
+
+
+def _sandbox_worker_passthrough(args) -> list[str]:
+    """Sandbox argv forwarded to scanner workers.
+
+    ``--no-sandbox`` is the compatibility override for a wrapper-created
+    Namespace that also carries a profile value. Child parsers make the two
+    spellings mutually exclusive, so forwarding both would turn an accepted
+    parent choice into a child argparse failure.
+    """
+    passthrough: list[str] = []
+    if getattr(args, "no_sandbox", False):
+        passthrough.append("--no-sandbox")
+    elif getattr(args, "sandbox", None) is not None:
+        passthrough.extend(["--sandbox", args.sandbox])
+    if getattr(args, "audit", False):
+        passthrough.append("--audit")
+    if getattr(args, "audit_verbose", False):
+        passthrough.append("--audit-verbose")
+    if getattr(args, "sandbox_floor", None) is not None:
+        passthrough.extend(["--sandbox-floor", args.sandbox_floor])
+    return passthrough
+
+
+def _persist_redacted_sca_stderr(stderr: str, output_dir: Path) -> str:
+    """Persist and return the same redacted SCA diagnostic text."""
+    from core.security.log_sanitisation import escape_nonprintable
+    from core.security.redaction import redact_secrets
+
+    safe_stderr = escape_nonprintable(
+        redact_secrets(stderr),
+        preserve_newlines=True,
+    )
+    encoded = safe_stderr.encode("utf-8")
+    marker = b"[earlier SCA stderr truncated]\n"
+    if len(encoded) > PRIVATE_TEXT_MAX_BYTES:
+        retained_stderr = (
+            marker
+            + encoded[-(PRIVATE_TEXT_MAX_BYTES - len(marker)):]
+        ).decode("utf-8", errors="ignore")
+    else:
+        retained_stderr = safe_stderr
+    stderr_path = output_dir / "stderr.log"
+    write_private_text(stderr_path, retained_stderr)
+    return safe_stderr
+
+
+def _sca_diagnostic_tool_fields(
+    diagnostic: dict[str, Any],
+    *,
+    default_disposition: str,
+) -> dict[str, Any]:
+    """Project the private SCA receipt into bounded report metadata."""
+    disposition = str(
+        diagnostic.get("disposition") or default_disposition
+    )
+    if disposition not in {"success", "failed", "skipped", "unsupported"}:
+        disposition = default_disposition
+    fields: dict[str, Any] = {"disposition": disposition}
+    status = diagnostic.get("status")
+    if isinstance(status, str) and status in {
+        "running", "completed", "failed", "timed_out",
+        "cancelled", "interrupted", "skipped", "unsupported",
+    }:
+        fields["diagnostic_status"] = status
+    mode = diagnostic.get("mode")
+    if isinstance(mode, str) and mode in {"mechanical", "deep"}:
+        fields["analysis_mode"] = mode
+    phase = diagnostic.get("phase")
+    if isinstance(phase, dict):
+        name = phase.get("name")
+        description = phase.get("description")
+        if isinstance(name, str) and name:
+            fields["phase"] = _bounded_tool_reason(name, max_len=64)
+        if isinstance(description, str) and description:
+            fields["phase_description"] = _bounded_tool_reason(
+                description,
+                max_len=160,
+            )
+    return fields
+
+
+def _sca_failure_reason(
+    returncode: int,
+    safe_stderr: str,
+    diagnostic: dict[str, Any],
+) -> str:
+    """Build an actionable failure reason from child-owned evidence."""
+    detail = diagnostic.get("reason")
+    if not isinstance(detail, str) or not detail.strip():
+        detail = (
+            safe_stderr.strip().splitlines()[-1]
+            if safe_stderr.strip()
+            else "no stderr"
+        )
+    phase = diagnostic.get("phase")
+    if isinstance(phase, dict):
+        name = phase.get("name")
+        description = phase.get("description")
+        if isinstance(name, str) and name and name not in detail:
+            phase_text = name
+            if isinstance(description, str) and description:
+                phase_text += f" ({description})"
+            detail = f"{detail} during {phase_text}"
+    return f"exit code {returncode}: {detail}"
+
+
 def _build_completion_manifest(orch_meta, import_result, import_sarif_files,
                                reanalyze_dir=None):
     manifest = {
@@ -1474,23 +2460,37 @@ def run_audit_postpass(args: argparse.Namespace, target: Path, out_dir: Path) ->
     phase: dict = {"enabled": True, "completed": False}
     t0 = time.time()
     try:
-        audit_dir = start_lifecycle("audit", target)
+        # Child phase of the agentic run: thread its project pin so
+        # the audit run lands in the same project (the child stub
+        # otherwise re-resolves ambiently and races mid-run switches
+        # of the machine-wide default).
+        started = start_lifecycle("audit", target,
+                                  parent_run_dir=out_dir)
+        audit_dir = started.run_dir
         if audit_dir is None:
-            phase["skipped_reason"] = "lifecycle start failed"
+            reason = "lifecycle start failed"
+            if started.error:
+                reason = f"{reason}: {started.error}"
+            phase["skipped_reason"] = reason
             return phase
         phase["audit_dir"] = str(audit_dir)
 
         # Reuse the agentic checklist — same target, same parser;
         # skips a full re-parse of the repo. raptor-audit builds a
-        # fresh one when the copy is missing.
-        agentic_checklist = out_dir / "checklist.json"
-        if agentic_checklist.is_file():
-            import shutil
+        # fresh one when the copy is missing. Accessor round-trip
+        # (not a byte copy): reads either on-disk form (single-file
+        # or sharded) and re-emits the right form in the audit dir.
+        from core.inventory import (
+            checklist_exists,
+            read_checklist,
+            save_checklist,
+        )
+        if checklist_exists(out_dir):
             try:
-                shutil.copyfile(
-                    agentic_checklist, audit_dir / "checklist.json",
-                )
-            except OSError as e:
+                _data = read_checklist(out_dir)
+                if _data:
+                    save_checklist(audit_dir, _data)
+            except (OSError, RuntimeError) as e:
                 logger.warning(
                     "audit post-pass: checklist copy failed (%s); "
                     "raptor-audit will rebuild it", e,
@@ -1571,13 +2571,21 @@ def run_audit_postpass(args: argparse.Namespace, target: Path, out_dir: Path) ->
         return phase
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """Build the /agentic CLI parser.
+
+    Factored out of main() so tests exercise the REAL flag
+    declarations (defaults, store_true wiring, the
+    --deep-validate/--no-deep-validate mutex) instead of
+    re-declaring look-alike parsers.
+    """
     parser = argparse.ArgumentParser(
         description="RAPTOR Agentic Security Testing - Scan, Analyse, Exploit, Patch",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Full autonomous workflow (Semgrep + LLM analysis; CodeQL is opt-in via --codeql)
+  # Full autonomous workflow (Semgrep + CodeQL + LLM analysis;
+  # raptor.py enables CodeQL by default — --no-codeql skips it)
   python3 raptor.py agentic --repo /path/to/code
 
   # Semgrep only
@@ -1671,7 +2679,7 @@ Examples:
         ),
     )
     parser.add_argument("--policy-groups", default="all", help="Comma-separated policy groups (default: all)")
-    parser.add_argument("--max-findings", type=int, default=10, help="Maximum findings to process (default: 10; codeql-only default is 20, agentic is lower because each finding runs the full multi-pass LLM analysis chain at ~3-5x the per-finding cost)")
+    parser.add_argument("--max-findings", type=int, default=None, help="Maximum findings to process. Unset = provider-aware default: a LOCAL primary (ollama / loopback endpoint — free inference) analyses ALL findings (bound by --max-seconds / --max-calls), a cloud primary defaults to 10 (each finding runs the full multi-pass LLM chain at ~3-5x per-finding cost). Pass an explicit value to override either way; 0 = no cap.")
     parser.add_argument(
         "--prefer", action="append", default=None, metavar="GLOB",
         help=(
@@ -1700,13 +2708,16 @@ Examples:
     )
     parser.add_argument(
         "--phase-timeout", type=int,
-        default=RaptorConfig.DEFAULT_TIMEOUT, metavar="SECONDS",
+        default=None, metavar="SECONDS",
         help=(
             "Per-phase wall-clock timeout in seconds for the three "
             "long-running subprocess calls (Semgrep scan, CodeQL scan, "
-            "analysis subprocess). Default: %(default)s (sourced from "
-            "RaptorConfig.DEFAULT_TIMEOUT). Set to 0 to disable the "
-            "timeout entirely — useful for kernel-scale targets where "
+            f"analysis subprocess). Default: {RaptorConfig.DEFAULT_TIMEOUT} "
+            "(sourced from RaptorConfig.DEFAULT_TIMEOUT). SCA keeps its "
+            "own 600s default unless this flag is explicitly supplied. "
+            "Set to 0 to disable parent and child timeouts entirely — "
+            "no internal SCA deadline is installed. Useful for kernel-scale "
+            "targets where "
             "source_intel spatch + LLM analysis can take hours. "
             "Operator is responsible for Ctrl-C when unbounded."
         ),
@@ -1732,9 +2743,39 @@ Examples:
         help="Skip per-finding journal emission (default: emit)",
     )
     parser.add_argument(
+        "--copilot-native",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--copilot-native-batch-size",
+        type=int,
+        default=8,
+        metavar="N",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--max-cost-usd", dest="max_cost_usd", type=float, default=None,
         help="Per-run USD budget cap; overrides LLMConfig.max_cost_per_scan "
              "so CostTracker enforces the cap during LLM calls",
+    )
+    # Non-dollar resource governor — the backstop for free/local runs,
+    # where the USD cap is inert ($0 cost). Each is off by default.
+    parser.add_argument(
+        "--max-seconds", dest="max_seconds", type=float, default=None,
+        help="Per-run wall-clock cap (seconds). Stops dispatching LLM "
+             "calls once reached. Works regardless of model cost — the "
+             "backstop for free/local runs the USD cap can't bound.",
+    )
+    parser.add_argument(
+        "--max-calls", dest="max_calls", type=int, default=None,
+        help="Per-run cap on total LLM provider calls. Off by default; "
+             "bounds a runaway/looping local run.",
+    )
+    parser.add_argument(
+        "--max-tokens", dest="max_tokens", type=int, default=None,
+        help="Per-run cap on aggregate LLM tokens (input+output). Off by "
+             "default.",
     )
     parser.add_argument("--out", help="Output directory")
     parser.add_argument(
@@ -1780,6 +2821,16 @@ Examples:
              "marker (raptor project trust build).",
     )
     parser.add_argument("--no-visualizations", action="store_true", help="Disable dataflow visualizations for CodeQL findings")
+    parser.add_argument(
+        "--taint-crossfile-mad", action="store_true",
+        help="Stage the taint seed packs (plus the project's "
+             "operator-grade IRIS taint specs) as CodeQL "
+             "models-as-data extension packs on the standard "
+             "python/javascript suites (forwarded to the CodeQL "
+             "agent, which writes taint-mad-augmentation.json naming "
+             "the augmented sink surfaces). Additive detection only; "
+             "default off.",
+    )
 
     # Compiler-analyzer scan channel (forwarded to the scanner subprocess
     # like --traced-build is forwarded to the codeql agent).
@@ -2000,6 +3051,101 @@ Examples:
     )
     parser.add_argument("--sequential", action="store_true",
                        help="Sequential analysis in Phase 3 instead of parallel Phase 4 orchestration")
+
+    # OpenAnt integration
+    parser.add_argument("--openant", action="store_true",
+                        help="Run OpenAnt LLM semantic scan in addition to Semgrep/CodeQL")
+    parser.add_argument("--openant-only", action="store_true",
+                        help="Run OpenAnt only (skip Semgrep/CodeQL)")
+    # default=None, NOT the env value: the flag is the consent-gated
+    # surface (pre-approved argv), the env var is the operator-owned
+    # default. main() back-fills $OPENANT_CORE after the gate has seen
+    # whether the flag was explicit.
+    parser.add_argument("--openant-core", default=None,
+                        help="Path to openant-core directory (default: $OPENANT_CORE). "
+                             "A core that is not a clean checkout of the pinned "
+                             "commit refuses at startup unless consented (see "
+                             "--openant-core-unpinned)")
+    parser.add_argument("--openant-core-unpinned", action="store_true",
+                        help="Consent to run a --openant-core checkout that is not a "
+                             "clean checkout of the pinned commit — wrong commit, "
+                             "modified/untracked files at the pin, or unverifiable "
+                             "provenance (unverified external code executes with "
+                             "network access); the project 'config' trust marker "
+                             "grants the same standing consent")
+    from packages.openant.config import (
+        OPENANT_LEVEL_CHOICES,
+        OPENANT_LEVEL_DEFAULT,
+        OPENANT_MODEL_CHOICES,
+        OPENANT_MODEL_DEFAULT,
+        env_choice,
+        gateway_budget_arg,
+        timeout_seconds_arg,
+    )
+    parser.add_argument("--openant-model",
+                        default=env_choice("OPENANT_MODEL",
+                                           OPENANT_MODEL_CHOICES,
+                                           OPENANT_MODEL_DEFAULT),
+                        choices=list(OPENANT_MODEL_CHOICES),
+                        help="OpenAnt LLM model (default: $OPENANT_MODEL or sonnet)")
+    parser.add_argument("--openant-level",
+                        default=env_choice("OPENANT_LEVEL",
+                                           OPENANT_LEVEL_CHOICES,
+                                           OPENANT_LEVEL_DEFAULT),
+                        choices=list(OPENANT_LEVEL_CHOICES),
+                        help="OpenAnt analysis depth (default: $OPENANT_LEVEL or reachable)")
+    parser.add_argument("--openant-gateway-budget",
+                        type=gateway_budget_arg, metavar="USD",
+                        # Flag-only like /openant's --gateway-budget:
+                        # a spend authority is an operator argv
+                        # decision, never env-seeded.
+                        default=None,
+                        help="Per-run raise of the OpenAnt dispatcher-"
+                             "gateway spend cap for gateway-minted "
+                             "runs (default: $25; the anti-runaway "
+                             "request cap scales with it, never below "
+                             "10k). Any positive finite USD amount — "
+                             "no uncapped spelling: dispatcher child "
+                             "tokens carry a finite budget by "
+                             "contract. No effect on direct-credential "
+                             "runs (noted loudly)")
+    parser.add_argument("--openant-expose-api-key-to-child",
+                        action="store_true",
+                        # Flag-only like /openant's
+                        # --expose-api-key-to-child: credential-
+                        # exposure consent is an operator argv
+                        # decision, never env-seeded.
+                        help="Consent to inject the raw Anthropic API "
+                             "key into the network-enabled OpenAnt "
+                             "child's environment (direct mode). "
+                             "Default posture routes the child's LLM "
+                             "calls through the credential-isolating "
+                             "dispatcher gateway (scoped, budget-"
+                             "capped, revocable token) whenever a "
+                             "dispatcher route exists; a direct-"
+                             "credential run with no dispatcher route "
+                             "refuses without this flag")
+    parser.add_argument("--openant-timeout-seconds",
+                        type=timeout_seconds_arg, metavar="N",
+                        default=None,
+                        help="Wall-clock deadline for the OpenAnt "
+                             "child in seconds (default: 1800). The "
+                             "child is hard-killed at it in every "
+                             "credential posture; on gateway-minted "
+                             "runs the token TTL follows it (timeout "
+                             "+ 600s slack). Positive integer, no "
+                             "ceiling")
+
+    # Cross-file taint engine (opt-in; the mechanical native lane)
+    parser.add_argument(
+        "--taint-crossfile", action="store_true",
+        help="Run the cross-file taint engine (spec packs -> per-"
+             "function summaries -> interprocedural propagation -> "
+             "SARIF-with-codeFlows emission) and merge its candidate "
+             "findings after the scan phase. Mechanical, no LLM "
+             "calls; findings enter the same dedup/classifier/"
+             "validation pipeline as every producer")
+
     parser.add_argument(
         "--rank", action="store_true",
         help=(
@@ -2083,6 +3229,12 @@ Examples:
              "two --model values; without --aggregate you still get the "
              "correlation results.",
     )
+    model_group.add_argument(
+        "--exploit-model",
+        metavar="MODEL",
+        help="Model for PoC/patch generation. Falls back to code model, "
+             "then analysis model if not set.",
+    )
     parser.add_argument(
         "--no-validate-dataflow",
         action="store_true",
@@ -2131,6 +3283,30 @@ Examples:
              "this budget never gates it. Default 0.60.",
     )
     parser.add_argument(
+        "--context-expansion",
+        action="store_true",
+        help="Sequential-path classifier only: re-run each explicitly "
+             "uncertain verdict (confidence=low or a full abstention) "
+             "once with a doubled context window plus 1-hop "
+             "caller/callee context; the re-run replaces the verdict "
+             "only when strictly more confident. Bounded per run — "
+             "each expansion is one extra analysis call. Requires "
+             "--sequential (ignored with a warning otherwise). "
+             "Default off.",
+    )
+    parser.add_argument(
+        "--context-toolloop",
+        action="store_true",
+        help="Sequential-path classifier only: bounded read-only "
+             "retrieval tool loop for explicitly uncertain verdicts — "
+             "the model may request specific extra context "
+             "(read_span / list_callers / list_callees, repo-confined, "
+             "hard turn/byte caps) then must verdict on what it has. "
+             "Shares the per-run budget with --context-expansion and "
+             "supersedes it when both are on. Requires --sequential "
+             "(ignored with a warning otherwise). Default off.",
+    )
+    parser.add_argument(
         "--trust-repo",
         action="store_true",
         help="Trust the target repo's config and skip safety checks. Covers the "
@@ -2154,11 +3330,170 @@ Examples:
     parser.add_argument("--skip-sca-triage", action="store_true",
                         help="Skip LLM triage stage in /sca")
 
-    from core.sandbox import add_cli_args, apply_cli_args
+    from core.sandbox import add_cli_args
     add_cli_args(parser)
+    return parser
+
+
+def _openant_coverage_paths(
+    pipeline_output: dict,
+    original_repo_path: Path,
+) -> list[str]:
+    """Resolve OpenAnt-reported finding paths for the reads-manifest.
+
+    ``location.file`` values are derived from the scanned (untrusted)
+    repo: an absolute or ``..``-bearing entry would otherwise register
+    out-of-repo paths as this run's read coverage. Containment: only
+    resolved paths inside the resolved repo root are kept; everything
+    else is dropped with a debug note. Tolerance is per-entry — one
+    malformed entry (non-dict shapes, a null-byte path the OS refuses
+    to resolve) is skipped without voiding the rest of the batch.
+    """
+    oa_files: set[str] = set()
+    for entry in pipeline_output.get("findings") or []:
+        if not isinstance(entry, dict):
+            continue
+        loc = entry.get("location")
+        rel = loc.get("file") if isinstance(loc, dict) else None
+        if isinstance(rel, str) and rel:
+            oa_files.add(rel)
+    repo_root = original_repo_path.resolve()
+    resolved: list[str] = []
+    for rel in sorted(oa_files):
+        try:
+            fp = (original_repo_path / rel).resolve()
+            contained = fp.is_relative_to(repo_root)
+            keep = contained and fp.is_file()
+        except (OSError, ValueError):
+            logger.debug(
+                "Coverage: dropped malformed OpenAnt-reported path: %r", rel,
+            )
+            continue
+        if not contained:
+            logger.debug(
+                "Coverage: dropped OpenAnt-reported path outside the "
+                "repo root: %r", rel,
+            )
+            continue
+        if keep:
+            resolved.append(str(fp))
+    return resolved
+
+
+def _copilot_native_incompatible_flags(args) -> list[str]:
+    """Return native-mode flags that still lack managed-session adapters."""
+    return [
+        flag
+        for enabled, flag in (
+            (args.threat_model_only, "--threat-model-only"),
+        )
+        if enabled
+    ]
+
+
+def _copilot_native_model_plan(args) -> dict | None:
+    analysis_models = list(args.model or [])
+    consensus_model = getattr(args, "consensus", None)
+    judge_model = getattr(args, "judge", None)
+    aggregate_model = getattr(args, "aggregate", None)
+    if not (
+        analysis_models
+        or consensus_model
+        or judge_model
+        or aggregate_model
+    ):
+        return None
+    if not analysis_models:
+        analysis_models = ["session"]
+    if aggregate_model and len(analysis_models) < 2:
+        raise ValueError(
+            "--aggregate requires at least two --model values "
+            "in Copilot-native mode",
+        )
+    return {
+        "enabled": True,
+        "analysis_models": analysis_models,
+        "consensus_model": consensus_model,
+        "judge_model": judge_model,
+        "aggregate_model": aggregate_model,
+        "canonical_model": (
+            aggregate_model
+            or judge_model
+            or "session"
+        ),
+    }
+
+
+def _copilot_native_audit_policy(
+    args,
+    agentic_out_dir: Path,
+) -> dict | None:
+    if not args.gap_audit:
+        return None
+    return {
+        "enabled": True,
+        "validate_after": bool(args.validate),
+        "budget": args.gap_audit_budget,
+        "strategy": args.gap_audit_strategy,
+        "scopes": list(args.gap_audit_scope or []),
+        "schedule": "priority",
+        "no_adversarial": bool(args.gap_audit_no_adversarial),
+        "reserved_cost_usd": args.gap_audit_reserved_cost,
+        "parent_max_cost_usd": args.max_cost_usd,
+        "binary": [str(path) for path in (args.binary or [])],
+        "binary_auto": bool(args.binary_auto),
+        "no_binary_oracle": bool(args.no_binary_oracle),
+        "codeql_dbs": _discover_codeql_dbs(agentic_out_dir),
+        "prior_journals": [
+            str(agentic_out_dir),
+            str(agentic_out_dir / "autonomous"),
+        ],
+        "coverage_policy": "map_grade_is_not_review",
+    }
+
+
+def main() -> int:
+    from core.dataflow import sanitizer_cut_config
+    from core.sandbox import apply_cli_args
+
+    parser = build_parser()
     args = parser.parse_args()
+    args.phase_timeout_explicit = args.phase_timeout is not None
+    if not args.phase_timeout_explicit:
+        args.phase_timeout = RaptorConfig.DEFAULT_TIMEOUT
 
     apply_cli_args(args, parser=parser)
+
+    copilot_native_model_plan = None
+    if args.copilot_native:
+        incompatible = _copilot_native_incompatible_flags(args)
+        if incompatible:
+            parser.error(
+                "--copilot-native cannot currently combine with "
+                + ", ".join(incompatible)
+                + "; the host-managed workflow owns model dispatch and "
+                "post-analysis passes",
+            )
+        if not 1 <= args.copilot_native_batch_size <= 50:
+            parser.error("--copilot-native-batch-size must be between 1 and 50")
+        try:
+            copilot_native_model_plan = _copilot_native_model_plan(args)
+        except ValueError as exc:
+            parser.error(str(exc))
+
+    # --openant-only replaces the pattern scanners entirely, so pairing
+    # it with an explicit CodeQL request is contradictory. Refuse at
+    # parse time (before any run directory or phase work) rather than
+    # silently ignoring one of the two flags.
+    if getattr(args, "openant_only", False) and (args.codeql or args.codeql_only):
+        _codeql_flag = "--codeql-only" if args.codeql_only else "--codeql"
+        parser.error(
+            f"--openant-only cannot be combined with {_codeql_flag}: "
+            "--openant-only disables the pattern scanners while "
+            f"{_codeql_flag} requests CodeQL. Drop --openant-only to "
+            f"keep CodeQL, drop {_codeql_flag} to run OpenAnt alone, "
+            "or use --openant --codeql to run both."
+        )
 
     if args.project is not None:
         from core.run.pin import set_process_project
@@ -2172,6 +3507,35 @@ Examples:
         args.threat_model = True
     if args.threat_model:
         args.understand = True
+
+    # ------------------------------------------------------------------
+    # --openant-core consent gate (flag surface only): refuse a
+    # non-pinned core named on argv unless consented, BEFORE any phase
+    # or lifecycle starts. The env / auto-detect default keeps
+    # warn-not-refuse.
+    # ------------------------------------------------------------------
+    _openant_core_explicit = args.openant_core is not None
+    if args.openant_core is None:
+        args.openant_core = os.environ.get("OPENANT_CORE") or None
+    args.openant_gate_provenance = None
+    if _openant_core_explicit and (args.openant or args.openant_only):
+        from packages.openant.scanner import (
+            OpenAntCoreConsentError,
+            enforce_core_consent,
+        )
+        # Resolve ONCE, before the gate: the gate's verdict and the
+        # Phase 1b spawn (an entire pattern-scan phase later) must
+        # name the same directory.
+        args.openant_core = str(Path(args.openant_core).resolve())
+        try:
+            args.openant_gate_provenance = enforce_core_consent(
+                Path(args.openant_core),
+                consented=args.openant_core_unpinned,
+                target_path=str(args.repo) if args.repo else None,
+            )
+        except OpenAntCoreConsentError as e:
+            print(f"\n✗ {e}", file=sys.stderr)
+            return 2
 
     # --gap-audit budget reserve: carve the audit share out of
     # --max-cost-usd UP FRONT so an analysis-phase overrun can't starve
@@ -2194,8 +3558,10 @@ Examples:
     # (or that read ``args.phase_timeout or None``) all see the
     # operator's choice. Same pattern as raptor_codeql.py for
     # cross-command consistency.
-    if args.phase_timeout != RaptorConfig.DEFAULT_TIMEOUT:
-        RaptorConfig.DEFAULT_TIMEOUT = args.phase_timeout if args.phase_timeout > 0 else None
+    if args.phase_timeout_explicit:
+        RaptorConfig.DEFAULT_TIMEOUT = (
+            args.phase_timeout if args.phase_timeout > 0 else None
+        )
 
     # Run-level console verbosity. File audit logging remains DEBUG;
     # this only controls what the operator sees on stderr.
@@ -2225,15 +3591,7 @@ Examples:
             )
         if not args.repo:
             args.repo = prev_target
-        prev_sarif = []
-        for s in prev_meta.get("extra", {}).get("sarif_files", []):
-            candidate = reanalyze_dir / Path(s).name
-            if candidate.exists():
-                prev_sarif.append(str(candidate))
-            else:
-                logger.warning("--reanalyze: SARIF file missing: %s", candidate)
-        if not prev_sarif:
-            prev_sarif.extend(str(f) for f in sorted(reanalyze_dir.glob("*.sarif")))
+        prev_sarif = _reanalyze_sarif_selection(reanalyze_dir, prev_meta)
         if not prev_sarif:
             parser.error(f"--reanalyze: no SARIF files found in {reanalyze_dir}")
         args.sarif = (args.sarif or []) + prev_sarif
@@ -2282,8 +3640,17 @@ Examples:
     # Per-run flags always win (negative > positive > marker > off);
     # a banner line prints when a marker affects this run. Mirrors the
     # persisted-binaries loading path (binary_oracle_cli).
-    from core.project.trust import apply_project_trust_flags
+    from core.project.trust import (
+        apply_project_sandbox_floor,
+        apply_project_trust_flags,
+    )
     apply_project_trust_flags(args)
+    # Project sandbox-floor consent (schema v4 setting): consumed at
+    # run start like the trust markers — plumbed into core.sandbox
+    # state; the per-run --sandbox-floor flag wins in both directions
+    # at floor resolution, and disagreements banner from the sandbox
+    # side. Same one-target rule as the markers.
+    apply_project_sandbox_floor(args)
 
     # Propagate --trust-repo to every target-repo trust check so each
     # in-process consumer (cc_trust, codeql_trust, build_detector, ...)
@@ -2361,6 +3728,21 @@ Examples:
                 # operator even on Ctrl-C.
                 try:
                     shutil.rmtree(str(p))
+                except FileNotFoundError as e:
+                    # Root already gone: this run's own late-path
+                    # rmtree, an outer cleaner (a containing test
+                    # harness's scratch sweep, tmpfiles reaping)...
+                    # Nothing leaked, so warning would be a false
+                    # alarm — but only when the tree really is gone:
+                    # pre-3.13 rmtree can propagate a mid-walk child
+                    # ENOENT with siblings still on disk, so re-check
+                    # before staying quiet.
+                    if os.path.lexists(str(p)):
+                        with contextlib.suppress(OSError, ValueError):
+                            sys.stderr.write(
+                                f"[atexit] git_temp_dir cleanup "
+                                f"failed for {p}: {e}\n",
+                            )
                 except OSError as e:
                     # At interpreter teardown stderr can be a closed
                     # stream (ValueError) or broken fd (OSError).
@@ -2439,7 +3821,9 @@ Examples:
                 print("  Temporary git repo created for scanning")
                 logger.debug("Using temp git repo: %s", temp_repo)
             else:
-                print(f"  ✗ Failed to initialize git repository: {result.stderr}", file=sys.stderr)
+                print("  ✗ Failed to initialize git repository: "
+                      f"{sanitise_for_terminal(str(result.stderr), max_len=300)}",
+                      file=sys.stderr)
                 logger.error("Git init failed: %s", result.stderr)
                 sys.exit(1)
 
@@ -2456,7 +3840,7 @@ Examples:
             logger.error("Git not found in PATH")
             sys.exit(1)
         except Exception as e:  # noqa: BLE001
-            print(f"  ✗ Error initializing git: {e}", file=sys.stderr)
+            print(f"  ✗ Error initializing git: {sanitise_for_terminal(str(e), max_len=300)}", file=sys.stderr)
             logger.error("Git init error: %s", e)
             sys.exit(1)
 
@@ -2513,9 +3897,14 @@ Examples:
             import contextlib as _ctx
             with _ctx.suppress(OSError):
                 out_dir.rmdir()
-            print(f"✗ {e}", file=sys.stderr)
+            print(f"✗ {sanitise_for_terminal(str(e), max_len=300)}", file=sys.stderr)
             sys.exit(1)
         logger.debug("Run metadata: %s", e)  # Optional — don't fail the pipeline
+    # Arm the entry-point backstop: from here on an uncaught exception
+    # or Ctrl-C must close the lifecycle instead of leaving the marker
+    # at "running" forever (see _cli_entry).
+    global _LIFECYCLE_OUT_DIR
+    _LIFECYCLE_OUT_DIR = out_dir
 
     logger.info("=" * 70)
     logger.info("RAPTOR AGENTIC WORKFLOW STARTED")
@@ -2524,7 +3913,11 @@ Examples:
     logger.info("Full path: %s", original_repo_path)
     logger.info("Output: %s", out_dir)
     logger.info("Policy groups: %s", args.policy_groups)
-    logger.info("Max findings: %s", args.max_findings)
+    logger.info(
+        "Max findings: %s",
+        args.max_findings if args.max_findings is not None
+        else "provider default (local=all, cloud=10)",
+    )
     if args.binary:
         logger.info("Target binary(s): %s", args.binary)
     # All ``--binary`` / ``--binary-auto`` / ``--binary-edges`` plumbing
@@ -2616,7 +4009,7 @@ Examples:
         except ImportError:
             print("Mitigation analysis module not available")
         except Exception as e:  # noqa: BLE001
-            print(f"⚠️  Mitigation check failed: {e}", file=sys.stderr)
+            print(f"⚠️  Mitigation check failed: {sanitise_for_terminal(str(e), max_len=300)}", file=sys.stderr)
             logger.error("Mitigation check error: %s", e)
 
     # ========================================================================
@@ -2639,8 +4032,8 @@ Examples:
 
     # Build inventory checklist (independent of scanning, available to all phases)
     try:
-        from core.inventory import build_inventory
-        if not (out_dir / "checklist.json").exists():
+        from core.inventory import build_inventory, checklist_exists
+        if not checklist_exists(out_dir):
             build_inventory(str(original_repo_path), str(out_dir))
             logger.debug("Inventory checklist built: %s", out_dir / "checklist.json")
     except Exception as e:  # noqa: BLE001
@@ -2658,7 +4051,9 @@ Examples:
     # global out/ with hash-freshness ranking) — only enable the
     # understand pre-pass when nothing usable exists, so projects that
     # already carry a map don't pay for a re-map.
-    if args.gap_audit and not args.understand:
+    if args.copilot_native and args.gap_audit:
+        args.understand = True
+    elif args.gap_audit and not args.understand:
         _map_dir = None
         try:
             from core.orchestration.understand_bridge import (
@@ -2676,7 +4071,7 @@ Examples:
 
     prepass_result = None
     threat_model_phase = {"enabled": bool(args.threat_model), "completed": False}
-    if args.understand:
+    if args.understand and not args.copilot_native:
         from core.orchestration import run_understand_prepass
         print("\n" + "=" * 70)
         print("UNDERSTAND PRE-PASS")
@@ -2698,7 +4093,7 @@ Examples:
         else:
             logger.warning("Pre-pass skipped: %s", prepass_result.skipped_reason)
 
-    if args.threat_model:
+    if args.threat_model and not args.copilot_native:
         try:
             threat_model_phase = _materialise_threat_model_phase(
                 target=original_repo_path,
@@ -2772,11 +4167,12 @@ Examples:
     # ========================================================================
     reachability_prepass_result = None
     scan_inventory = None
-    _checklist_path = out_dir / "checklist.json"
-    if _checklist_path.exists():
-        # load_json is non-strict: returns None on unreadable/corrupt
-        # input and logs a warning naming the file — nothing to suppress.
-        scan_inventory = load_json(_checklist_path)
+    from core.inventory import checklist_exists as _checklist_exists
+    from core.inventory import read_checklist as _read_checklist
+    if _checklist_exists(out_dir):
+        # Accessor read (either on-disk form): unreadable/corrupt
+        # input reads as {} → normalised to None below.
+        scan_inventory = _read_checklist(out_dir) or None
     def _try_cached_joern(target: Path, run_out_dir: Path):
         """Start a Joern server only if a cached CPG exists for this project."""
         try:
@@ -2793,7 +4189,20 @@ Examples:
             from packages.joern.server import JoernServer
             srv = JoernServer()
             srv.start()
-            srv.import_cpg(cpg.path)
+            # Checked contract: import_cpg returns False on handled
+            # failures — an unchecked call here handed the prepass a
+            # CPG-less server that read as loaded (same class as the
+            # audit-path fix in core/audit/joern_backend).
+            if not srv.import_cpg(cpg.path):
+                logger.warning(
+                    "Joern cached-CPG import failed for prepass — "
+                    "running without the joern reachability channel")
+                try:
+                    srv.stop()
+                except Exception:
+                    logger.debug("prepass server stop failed",
+                                 exc_info=True)
+                return None
             logger.info("Joern server started with cached CPG for prepass")
             return srv
         except Exception:
@@ -2850,15 +4259,48 @@ Examples:
     skip_scan = bool(import_sarif_files) and not args.also_scan
 
     # Launch scanners in parallel when both are enabled
-    run_semgrep = not args.codeql_only and not skip_scan
-    run_codeql = (args.codeql or args.codeql_only) and not args.no_codeql and not skip_scan
+    # --openant-only skips Semgrep/CodeQL entirely
+    _openant_only = getattr(args, "openant_only", False)
+    _openant_enabled = getattr(args, "openant", False) or _openant_only
+    run_semgrep = not args.codeql_only and not skip_scan and not _openant_only
+    run_codeql = (args.codeql or args.codeql_only) and not args.no_codeql and not skip_scan and not _openant_only
 
-    # Defensive guard for the "no scanners enabled" case.
-    if not skip_scan and not (run_semgrep or run_codeql):
+    if skip_scan:
+        semgrep_skip_reason = "replaced by imported SARIF"
+        codeql_skip_reason = "replaced by imported SARIF"
+    elif _openant_only:
+        semgrep_skip_reason = "--openant-only"
+        codeql_skip_reason = "--openant-only"
+    else:
+        semgrep_skip_reason = "--codeql-only" if args.codeql_only else "not requested"
+        if args.no_codeql:
+            codeql_skip_reason = "--no-codeql"
+        else:
+            codeql_skip_reason = "not requested"
+
+    semgrep_tool_state = _tool_state(
+        "skipped",
+        requested=run_semgrep,
+        reason=semgrep_skip_reason,
+    )
+    codeql_tool_state = _tool_state(
+        "skipped",
+        requested=run_codeql,
+        reason=codeql_skip_reason,
+    )
+
+    # Defensive guard for the "no scanners enabled" case. OpenAnt
+    # (--openant or --openant-only) IS an enabled scanner — the Phase
+    # 1b semantic scan — so the guard fires only when truly nothing
+    # will run: no SARIF import replacing the scan step, no OpenAnt
+    # phase, and both pattern scanners disabled.
+    if not skip_scan and not _openant_enabled and not (run_semgrep or run_codeql):
         print(
             "\n✗ Both Semgrep and CodeQL are disabled — nothing to scan.\n"
-            "  Re-run without --codeql-only / --no-codeql, or pass only one "
-            "of those flags.",
+            "  Re-run without --codeql-only / --no-codeql, pass only one "
+            "of those flags,\n"
+            "  or enable the OpenAnt semantic scan (--openant / "
+            "--openant-only).",
             file=sys.stderr,
         )
         return 2
@@ -2878,15 +4320,11 @@ Examples:
     # Discovered by E2E against /tmp/vulns: the outer process logged
     # "audit engaged" but no sandbox-summary.json appeared in any
     # subprocess's run dir.
-    sandbox_passthrough = []
-    if getattr(args, "sandbox", None) is not None:
-        sandbox_passthrough.extend(["--sandbox", args.sandbox])
-    if getattr(args, "no_sandbox", False):
-        sandbox_passthrough.append("--no-sandbox")
-    if getattr(args, "audit", False):
-        sandbox_passthrough.append("--audit")
-    if getattr(args, "audit_verbose", False):
-        sandbox_passthrough.append("--audit-verbose")
+    # Worker-inherit invariant for profile/audit/floor choices. The
+    # per-run floor rides the worker command line (never a target-visible
+    # env var); explicit sandbox disable consent rides separately as a
+    # backed nonce in each child's safe environment.
+    sandbox_passthrough = _sandbox_worker_passthrough(args)
 
     if run_semgrep:
         print("\n[*] Running Semgrep analysis...")
@@ -2924,23 +4362,42 @@ Examples:
         # env inherits from RAPTOR's own process (the operator's
         # env). PYTHONUSERBASE inheritance is intentional — see
         # F102 comment below.
+        # F102: semgrep is typically installed via
+        # ``pip install --user``; without PYTHONUSERBASE flowing
+        # through, an operator with a non-default user-base sees
+        # ``ModuleNotFoundError: No module named 'semgrep'`` here.
+        # PYTHONUSERBASE remains stripped by default (it is a real
+        # RCE vector via .pth files); the opt-in restores it only
+        # for this scanner spawn.
+        # preserve_proxy: the scanner fetches registry packs via
+        # its own egress proxy, whose upstream autodetect reads
+        # this child's env.
+        scanner_env = RaptorConfig.get_safe_env(
+            preserve_proxy=True, include_python_user_base=True,
+        )
+        # Orphan opt-in (core.run.parent_liveness): paired with the
+        # start_new_session detachment below by contract — the scanner
+        # leads its own group and must never outlive this process.
+        # Our pid as the value lets the scanner detect a parent lost
+        # inside the spawn window.
+        scanner_env["RAPTOR_PARENT_WATCHDOG"] = str(os.getpid())
+        # Disable-consent extension: the scanner child re-runs the
+        # sandbox CLI gate on the forwarded flags with PIPE stdio and
+        # a scrubbed env, so a disable THIS process already holds an
+        # accepted consent for must ride along as a backed nonce or
+        # the child refuses. No-op unless this process is in the
+        # accepted-disable state (it can never create a grant).
+        _export_disable_consent(scanner_env)
         semgrep_proc = subprocess.Popen(
             semgrep_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             bufsize=1,  # Line-buffered, see main-Popen comment.
-            # F102: semgrep is typically installed via
-            # ``pip install --user``; without PYTHONUSERBASE flowing
-            # through, an operator with a non-default user-base sees
-            # ``ModuleNotFoundError: No module named 'semgrep'`` here.
-            # PYTHONUSERBASE remains stripped by default (it is a real
-            # RCE vector via .pth files); the opt-in restores it only
-            # for this scanner spawn.
-            # preserve_proxy: the scanner fetches registry packs via
-            # its own egress proxy, whose upstream autodetect reads
-            # this child's env.
-            env=RaptorConfig.get_safe_env(
-                preserve_proxy=True, include_python_user_base=True,
-            ),
+            env=scanner_env,
             start_new_session=True,  # See main-Popen comment.
+            # Parent-death signaling — see the main-Popen comment in
+            # run_command_streaming (the guarded helper enforces the
+            # main-thread constraint; the watchdog env above covers
+            # the cases PDEATHSIG misses).
+            preexec_fn=_parent_death_preexec(),
         )
         # Drain immediately — see _PipeDrainer: without concurrent
         # readers the sibling child deadlocks on a full pipe.
@@ -2989,6 +4446,13 @@ Examples:
             codeql_cmd.append("--extended")
         if args.codeql_cli:
             codeql_cmd.extend(["--codeql-cli", args.codeql_cli])
+        # Taint-pack models-as-data augmentation: the tolerant read
+        # of the wider flag-family member means enabling cross-file
+        # taint as a whole also augments the CodeQL suites, without
+        # an argparse dependency between the two flags.
+        if (getattr(args, "taint_crossfile_mad", False)
+                or getattr(args, "taint_crossfile", False)):
+            codeql_cmd.append("--taint-crossfile-mad")
         logger.debug("Running: Scanning code with CodeQL")
         # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args
         # Explicit ``env=RaptorConfig.get_safe_env()`` — strips
@@ -2997,11 +4461,20 @@ Examples:
         # can't infer that the helper is safety-strip-aware.
         # preserve_proxy: pack downloads inside the CodeQL agent
         # chain through an egress proxy fed from this child's env.
+        codeql_env = RaptorConfig.get_safe_env(preserve_proxy=True)
+        # Orphan opt-in — same contract as the scanner spawn above.
+        codeql_env["RAPTOR_PARENT_WATCHDOG"] = str(os.getpid())
+        # Disable-consent extension — same contract as the scanner
+        # spawn above.
+        _export_disable_consent(codeql_env)
         codeql_proc = subprocess.Popen(
             codeql_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             bufsize=1,  # Line-buffered, see main-Popen comment.
-            env=RaptorConfig.get_safe_env(preserve_proxy=True),
+            env=codeql_env,
             start_new_session=True,  # See main-Popen comment.
+            # Parent-death signaling — see run_command_streaming's
+            # Popen (same guarded helper).
+            preexec_fn=_parent_death_preexec(),
         )
         codeql_drain = _PipeDrainer(codeql_proc)
 
@@ -3059,6 +4532,22 @@ Examples:
                 )
             except Exception as e:  # noqa: BLE001
                 logger.warning("failed to write semgrep timeout marker: %s", e)
+            semgrep_failure = _record_tool_failure(
+                out_dir / "scan",
+                "semgrep",
+                f"timed out after {args.phase_timeout}s",
+                timed_out=True,
+            )
+            semgrep_tool_state = _tool_state(
+                "failed",
+                requested=True,
+                reason=f"timed out after {args.phase_timeout}s",
+                artifacts=[
+                    semgrep_failure,
+                    out_dir / ".semgrep_timeout",
+                ],
+                timed_out=True,
+            )
             if not run_codeql:
                 _fail_run_and_exit(
                     out_dir,
@@ -3112,8 +4601,68 @@ Examples:
             else:
                 semgrep_sarifs = list(actual_scan_dir.glob("semgrep_*.sarif"))
                 all_sarif_files.extend(semgrep_sarifs)
+            semgrep_artifacts: list[Path] = []
+            if scan_metrics_file.exists():
+                semgrep_artifacts.append(scan_metrics_file)
+            semgrep_result_artifacts: list[Path] = []
+            if sarif_file.exists():
+                semgrep_artifacts.append(sarif_file)
+                semgrep_result_artifacts.append(sarif_file)
+            else:
+                semgrep_artifacts.extend(semgrep_sarifs)
+                semgrep_result_artifacts.extend(semgrep_sarifs)
+            if semgrep_result_artifacts:
+                dropped_packs = semgrep_metrics.get("dropped_registry_packs")
+                dropped_count = len(dropped_packs) if isinstance(dropped_packs, list) else 0
+                semgrep_tool_state = _tool_state(
+                    "completed",
+                    requested=True,
+                    artifacts=semgrep_artifacts,
+                    reason=(
+                        f"{dropped_count} uncached registry pack(s) dropped; "
+                        "rule coverage reduced"
+                        if dropped_count else ""
+                    ),
+                    degraded=bool(dropped_count),
+                )
+            else:
+                reason = (
+                    f"exit code {rc} but no Semgrep scan artifacts "
+                    "were produced"
+                )
+                semgrep_failure = _record_tool_failure(
+                    actual_scan_dir,
+                    "semgrep",
+                    reason,
+                    exit_code=rc,
+                )
+                semgrep_tool_state = _tool_state(
+                    "failed",
+                    requested=True,
+                    reason=reason,
+                    artifacts=[semgrep_failure],
+                    exit_code=rc,
+                )
+                print(
+                    "⚠️  Semgrep exited without scan artifacts — treating "
+                    "the scanner result as failed",
+                    file=sys.stderr,
+                )
         elif rc != -1:  # -1 is timeout, already reported
             print(f"✗ Semgrep scan failed (exit code {rc})", file=sys.stderr)
+            semgrep_failure = _record_tool_failure(
+                out_dir / "scan",
+                "semgrep",
+                f"exit code {rc}",
+                exit_code=rc,
+            )
+            semgrep_tool_state = _tool_state(
+                "failed",
+                requested=True,
+                reason=f"exit code {rc}",
+                artifacts=[semgrep_failure],
+                exit_code=rc,
+            )
             if not run_codeql:
                 _fail_run_and_exit(out_dir, f"Semgrep scan failed (exit code {rc})")
 
@@ -3142,6 +4691,19 @@ Examples:
                 file=sys.stderr,
             )
             logger.error("CodeQL scan timed out")
+            codeql_failure = _record_tool_failure(
+                out_dir / "codeql",
+                "codeql",
+                f"timed out after {args.phase_timeout}s",
+                timed_out=True,
+            )
+            codeql_tool_state = _tool_state(
+                "failed",
+                requested=True,
+                reason=f"timed out after {args.phase_timeout}s",
+                artifacts=[codeql_failure],
+                timed_out=True,
+            )
 
         if rc == SANDBOX_ENGAGE_EXIT_CODE:
             # CodeQL subprocess reported the sandbox could not engage —
@@ -3157,6 +4719,24 @@ Examples:
             )
 
         if rc != 0:
+            if rc != -1:
+                detail = _last_diagnostic_line(codeql_stderr)
+                reason = f"exit code {rc}"
+                if detail:
+                    reason += f": {detail}"
+                codeql_failure = _record_tool_failure(
+                    out_dir / "codeql",
+                    "codeql",
+                    reason,
+                    exit_code=rc,
+                )
+                codeql_tool_state = _tool_state(
+                    "failed",
+                    requested=True,
+                    reason=reason,
+                    artifacts=[codeql_failure],
+                    exit_code=rc,
+                )
             if all_sarif_files:
                 print("⚠️  CodeQL scan failed — continuing with existing findings", file=sys.stderr)
             else:
@@ -3167,19 +4747,7 @@ Examples:
             # to spelunk through out/codeql_*/ to find the actual reason
             # (often empty on early failure — language detector returns
             # before writing any report).
-            stderr_tail = (codeql_stderr or "").rstrip().splitlines()[-15:]
-            if stderr_tail:
-                print("   CodeQL stderr (last 15 lines):")
-                for line in stderr_tail:
-                    print(f"     {line}")
-            if any("No CodeQL-supported languages detected" in line for line in stderr_tail):
-                print(
-                    "   Hint: language auto-detection rejected every candidate "
-                    "(typically because the target has no build files — go.mod, "
-                    "package.json, pyproject.toml, CMakeLists.txt, etc.). "
-                    "Pass --languages cpp,python,javascript,go (or a subset) "
-                    "to bypass auto-detection."
-                )
+            _print_codeql_stderr_tail(codeql_stderr)
             logger.warning("CodeQL scan failed - rc=%d", rc)
             if args.codeql_only:
                 print("✗ CodeQL-only mode failed", file=sys.stderr)
@@ -3194,7 +4762,10 @@ Examples:
                     codeql_metrics = {}
 
                 total_findings = codeql_metrics.get('total_findings', 0)
-                sarif_files = codeql_metrics.get('sarif_files', [])
+                sarif_fields = bounded_artifact_reference_fields(
+                    codeql_metrics.get('sarif_files', []),
+                )
+                sarif_files = sarif_fields["artifacts"]
 
                 print("\n✓ CodeQL scan complete:")
                 print(f"  - Languages: {', '.join(codeql_metrics.get('languages_detected', {}).keys())}")
@@ -3202,6 +4773,57 @@ Examples:
                 print(f"  - SARIF files: {len(sarif_files)}")
 
                 all_sarif_files.extend(Path(sarif) for sarif in sarif_files)
+                codeql_artifacts = [codeql_report]
+                codeql_artifacts.extend(
+                    Path(sarif) for sarif in sarif_files
+                )
+                enrichment_fields = _codeql_enrichment_tool_fields(
+                    codeql_metrics,
+                )
+                for artifact in enrichment_fields.pop("artifacts", []):
+                    if str(artifact) not in {
+                        str(existing) for existing in codeql_artifacts
+                    }:
+                        codeql_artifacts.append(artifact)
+                enrichment_reason = enrichment_fields.pop("reason", "")
+                codeql_tool_state = _tool_state(
+                    "completed",
+                    requested=True,
+                    reason=enrichment_reason,
+                    degraded=(
+                        enrichment_fields.get("enrichment_status") == "failed"
+                    ),
+                    artifacts=codeql_artifacts,
+                    sarif_file_references_truncated=bool(
+                        sarif_fields.get("artifact_references_truncated")
+                    ),
+                    sarif_file_references_omitted=int(
+                        sarif_fields.get("artifact_references_omitted", 0)
+                    ),
+                    **enrichment_fields,
+                )
+                if enrichment_reason:
+                    print(f"  - Enrichment: {enrichment_reason}")
+            else:
+                reason = "exit code 0 but codeql_report.json was not produced"
+                codeql_failure = _record_tool_failure(
+                    codeql_out_dir,
+                    "codeql",
+                    reason,
+                    exit_code=0,
+                )
+                codeql_tool_state = _tool_state(
+                    "failed",
+                    requested=True,
+                    reason=reason,
+                    artifacts=[codeql_failure],
+                    exit_code=0,
+                )
+                print(
+                    "⚠️  CodeQL exited 0 without a report — treating the "
+                    "scanner result as failed",
+                    file=sys.stderr,
+                )
 
     # Check if we have any findings from source-code scanners.
     # SCA may still contribute findings even when Semgrep/CodeQL found nothing,
@@ -3215,11 +4837,44 @@ Examples:
     sca_out = out_dir / "sca"
     try:
         from packages.sca.agent import _find_sca_agent, run_sca_subprocess
+        from packages.sca.diagnostics import (
+            diagnostic_path as _sca_diagnostic_path,
+            read_sca_diagnostic,
+        )
         sca_agent = _find_sca_agent()
     except ImportError:
         sca_agent = None
+        _sca_diagnostic_path = None
+        read_sca_diagnostic = None
 
     run_mechanical_sca = _should_run_mechanical_sca(sca_agent, args.sca)
+    from core.security.session_services import session_services_restricted
+    sca_offline = run_mechanical_sca and session_services_restricted()
+    sca_host_refresh = None
+    if sca_offline:
+        from packages.sca import sca_cache_root
+        from packages.sca.host_refresh import fresh_receipt
+        sca_host_refresh = fresh_receipt(
+            original_repo_path,
+            cache_root=sca_cache_root(),
+        )
+    sca_requested = bool(args.sca or sca_agent)
+    if args.sca:
+        sca_skip_reason = "deferred to deep SCA"
+    elif sca_agent:
+        sca_skip_reason = "pending mechanical SCA"
+    else:
+        sca_skip_reason = "SCA agent not available"
+    sca_tool_state = _tool_state(
+        "skipped",
+        requested=sca_requested,
+        reason=sca_skip_reason,
+        disposition=(
+            "skipped"
+            if args.sca or sca_agent
+            else "unsupported"
+        ),
+    )
     if sca_agent and not run_mechanical_sca:
         # Deferred: the opt-in deep SCA phase (PHASE 1b below) analyses
         # the same dependency set with LLM review + triage. Running the
@@ -3232,20 +4887,48 @@ Examples:
         print("SOFTWARE COMPOSITION ANALYSIS")
         print("=" * 70)
         print("\n[*] Running SCA (dependencies, supply chain, reachability)...")
+        if sca_offline:
+            if sca_host_refresh:
+                print(
+                    "✓ Copilot session: SCA uses anonymously host-refreshed "
+                    "OSV/KEV/EPSS/Vulnrichment data; repository networking "
+                    "remains disabled.",
+                )
+            else:
+                print("⚠️  Copilot session: SCA uses cached advisories only; "
+                      "fresh OSV/KEV/EPSS and registry lookups are unavailable.")
         try:
             # Route via sandbox egress proxy so SCA's HTTP calls are
             # hostname-allowlisted when --sandbox is active. The allowlist
             # is SCA_ALLOWED_HOSTS (vuln feeds + registries + archives).
-            rc, sca_stdout, _sca_stderr = run_sca_subprocess(
+            rc, sca_stdout, sca_stderr = run_sca_subprocess(
                 sca_agent,
                 original_repo_path,
                 sca_out,
                 sandbox_args=sandbox_passthrough,
+                offline=sca_offline,
+                timeout=_sca_subprocess_timeout(
+                    args.phase_timeout,
+                    explicitly_set=args.phase_timeout_explicit,
+                ),
             )
+            sca_diagnostic = (
+                read_sca_diagnostic(sca_out)
+                if read_sca_diagnostic is not None
+                else {}
+            )
+            sca_diagnostic_file = (
+                _sca_diagnostic_path(sca_out)
+                if _sca_diagnostic_path is not None
+                else sca_out / "diagnostics.json"
+            )
+            safe_stderr = ""
+            if sca_stderr:
+                safe_stderr = _persist_redacted_sca_stderr(
+                    sca_stderr, sca_out,
+                )
             if rc == 0:
                 sca_sarif = sca_out / "findings.sarif"
-                if sca_sarif.exists():
-                    all_sarif_files.append(sca_sarif)
                 # Parse the one-line JSON summary from stdout
                 import json as _json
                 for line in reversed(sca_stdout.strip().splitlines()):
@@ -3258,6 +4941,54 @@ Examples:
                         break
                 sca_findings_count = sca_metrics.get("vuln_findings", 0) + \
                                      sca_metrics.get("supply_chain_findings", 0)
+                # Only register the SARIF when it carries findings —
+                # an empty SARIF must not suppress the sole-scanner
+                # hard-failure gate downstream.
+                if sca_sarif.exists() and sca_findings_count:
+                    all_sarif_files.append(sca_sarif)
+                sca_artifacts = [
+                    path for path in (
+                        sca_out / "findings.json",
+                        sca_sarif,
+                        sca_out / "report.md",
+                        sca_out / "stderr.log",
+                        sca_diagnostic_file,
+                    )
+                    if path.exists()
+                ]
+                sca_tool_state = _tool_state(
+                    "completed",
+                    requested=True,
+                    reason=(
+                        (
+                            "host-refreshed public vulnerability feeds; "
+                            "repository networking disabled"
+                        )
+                        if sca_host_refresh
+                        else (
+                            "offline cache-only advisory coverage; "
+                            "fresh vulnerability feeds unavailable"
+                            if sca_offline else ""
+                        )
+                    ),
+                    degraded=bool(sca_offline and not sca_host_refresh),
+                    offline=sca_offline,
+                    host_refresh=(
+                        {
+                            "schema": sca_host_refresh.get("schema"),
+                            "refreshed_at": sca_host_refresh.get(
+                                "refreshed_at",
+                            ),
+                            "sources": sca_host_refresh.get("sources"),
+                        }
+                        if sca_host_refresh else None
+                    ),
+                    artifacts=sca_artifacts,
+                    **_sca_diagnostic_tool_fields(
+                        sca_diagnostic,
+                        default_disposition="success",
+                    ),
+                )
                 print("\n✓ SCA complete:")
                 print(f"  - Dependencies: {sca_metrics.get('deps_analysed', 0)}")
                 print(f"  - Vulnerability findings: {sca_metrics.get('vuln_findings', 0)}")
@@ -3269,10 +5000,10 @@ Examples:
                     from core.sage.hooks import store_sca_outcomes
                     sca_findings_path = sca_out / "findings.json"
                     if sca_findings_path.exists():
-                        import json as _sca_json
-                        sca_data = _sca_json.loads(
-                            sca_findings_path.read_text(encoding="utf-8")
-                        )
+                        # Bounded loader: the findings file sits in a
+                        # run directory whose write grant sandboxed
+                        # code holds — never slurp it unbounded.
+                        sca_data = load_json(sca_findings_path)
                         sca_sage_outcomes = []
                         for row in (sca_data if isinstance(sca_data, list) else []):
                             sca_info = row.get("sca") or {}
@@ -3301,16 +5032,355 @@ Examples:
                 except Exception:
                     logger.debug("SAGE SCA store skipped", exc_info=True)
             else:
+                reason = _sca_failure_reason(
+                    rc,
+                    safe_stderr,
+                    sca_diagnostic,
+                )
+                logger.warning("SCA stderr: %s", reason)
                 logger.warning("SCA failed (rc=%d) — continuing without dep findings", rc)
+                diagnostic_fields = _sca_diagnostic_tool_fields(
+                    sca_diagnostic,
+                    default_disposition="failed",
+                )
+                sca_failure = _record_tool_failure(
+                    sca_out,
+                    "sca",
+                    reason,
+                    exit_code=rc,
+                    timed_out=(
+                        diagnostic_fields.get("diagnostic_status")
+                        == "timed_out"
+                        or "timed out" in reason.lower()
+                    ),
+                )
+                sca_artifacts = [sca_failure]
+                sca_artifacts.extend(
+                    path for path in (
+                        sca_out / "stderr.log",
+                        sca_out / "findings.json",
+                        sca_out / "findings.sarif",
+                        sca_out / "report.md",
+                        sca_diagnostic_file,
+                    )
+                    if path.exists()
+                )
+                sca_tool_state = _tool_state(
+                    "failed",
+                    requested=True,
+                    reason=reason,
+                    artifacts=sca_artifacts,
+                    exit_code=rc,
+                    timed_out=(
+                        diagnostic_fields.get("diagnostic_status")
+                        == "timed_out"
+                        or "timed out" in reason.lower()
+                    ),
+                    **diagnostic_fields,
+                )
                 sca_findings_count = 0
         except Exception as e:  # noqa: BLE001
-            print(f"⚠️  SCA failed: {e}", file=sys.stderr)
+            print(f"⚠️  SCA failed: {sanitise_for_terminal(str(e), max_len=300)}", file=sys.stderr)
             logger.warning("SCA failed — continuing without dep findings: %s", e)
+            sca_diagnostic = (
+                read_sca_diagnostic(sca_out)
+                if read_sca_diagnostic is not None
+                else {}
+            )
+            reason = f"{type(e).__name__}: {e}"
+            phase = sca_diagnostic.get("phase")
+            if isinstance(phase, dict) and phase.get("name"):
+                reason += f" during {phase['name']}"
+            diagnostic_fields = _sca_diagnostic_tool_fields(
+                sca_diagnostic,
+                default_disposition="failed",
+            )
+            sca_failure = _record_tool_failure(
+                sca_out,
+                "sca",
+                reason,
+            )
+            sca_tool_state = _tool_state(
+                "failed",
+                requested=True,
+                reason=reason,
+                artifacts=[
+                    sca_failure,
+                    *(
+                        path for path in (
+                            sca_out / "stderr.log",
+                            sca_out / "findings.json",
+                            sca_out / "findings.sarif",
+                            sca_out / "report.md",
+                            sca_out / "diagnostics.json",
+                        )
+                        if path.exists()
+                    ),
+                ],
+                **diagnostic_fields,
+            )
             sca_findings_count = 0
     else:
         sca_findings_count = 0
         if not source_scan_empty:
             logger.info("raptor-sca not installed — skipping SCA phase")
+
+    # ========================================================================
+    # PHASE 1b: OPENANT SEMANTIC SCAN (opt-in via --openant / --openant-only)
+    # ========================================================================
+    openant_findings = []
+    openant_findings_count = 0
+    openant_metrics = {}
+    # Set when the OpenAnt scan was attempted and hard-failed (timeout,
+    # launch failure, exit >= 2, missing output) — distinct from a
+    # not-configured skip. Consulted at the no-results gates below so a
+    # run whose only possible finding source was OpenAnt cannot end as
+    # if the target scanned clean.
+    openant_hard_error = ""
+    if _openant_enabled:
+        try:
+            from packages.openant import get_config, run_openant_scan, translate_pipeline_output, deduplicate_with_sarif
+            from packages.openant.config import OpenAntConfig
+
+            if getattr(args, "openant_core", None):
+                _gate_prov = getattr(args, "openant_gate_provenance", None)
+                oa_config = OpenAntConfig(
+                    core_path=Path(args.openant_core),
+                    gate_provenance=_gate_prov,
+                    expect_clean_pinned=(
+                        (_gate_prov or {}).get("consent")
+                        == "clean-pinned"),
+                )
+            else:
+                oa_config = get_config(raptor_dir=script_root)
+            oa_config.model = getattr(args, "openant_model", "sonnet")
+            oa_config.level = getattr(args, "openant_level", "reachable")
+            oa_config.gateway_budget_usd = getattr(
+                args, "openant_gateway_budget", None)
+            oa_config.direct_credential_consent = bool(getattr(
+                args, "openant_expose_api_key_to_child", False))
+            _oa_timeout = getattr(args, "openant_timeout_seconds", None)
+            if _oa_timeout is not None:
+                oa_config.timeout_seconds = _oa_timeout
+
+            print("\n" + "=" * 70)
+            print("OPENANT SEMANTIC SCAN")
+            print("=" * 70)
+
+            oa_out = out_dir / "openant_scan"
+            oa_out.mkdir(exist_ok=True)
+            oa_result = run_openant_scan(
+                repo_path=str(original_repo_path),
+                out_dir=str(oa_out),
+                config=oa_config,
+            )
+            # Provenance travels to THIS run's report too — the
+            # standalone workflow already records it, and dropping it
+            # here left /agentic output with no record of which
+            # OpenAnt core produced the findings.
+            openant_metrics["core_provenance"] = (
+                oa_result.get("core_provenance") or {}
+            )
+
+            if oa_result.get("skipped"):
+                # The error text can quote the subprocess's stderr
+                # (target-influenced) — escape before the terminal.
+                _oa_err = sanitise_for_terminal(
+                    str(oa_result.get("error") or "unknown"), max_len=600)
+                # The failure is PERSISTED, not just printed: a hard
+                # failure beside a successful Semgrep/CodeQL scan let
+                # the run complete with scan_metrics.openant carrying
+                # only core_provenance — post-run consumers could not
+                # distinguish "OpenAnt failed" from "found nothing".
+                openant_metrics["error"] = _oa_err
+                if oa_result.get("hard_error"):
+                    openant_hard_error = _oa_err
+                    openant_metrics["hard_error"] = True
+                    print(f"✗ OpenAnt scan failed: {_oa_err}", file=sys.stderr)
+                    # Coverage overlay, best-effort even on the failed
+                    # scan: units analysed BEFORE the failure are paid
+                    # work sitting in the scan artifacts (a truncated
+                    # results.json, or the per-unit checkpoints — the
+                    # fallback lane's shipped consumer). A projection
+                    # failure never changes how this phase already
+                    # failed.
+                    try:
+                        from packages.openant.coverage import (
+                            project_scan_coverage,
+                        )
+                        _overlay = project_scan_coverage(
+                            out_dir, oa_out, level=oa_config.level,
+                            repo_path=original_repo_path)
+                        if _overlay:
+                            print(f"  {_overlay} (partial scan)")
+                    except Exception as _cov_exc:  # noqa: BLE001 — overlay is additive; the failure outcome stands
+                        print(f"⚠️  OpenAnt coverage overlay failed: "
+                              f"{sanitise_for_terminal(str(_cov_exc), max_len=300)}",
+                              file=sys.stderr)
+                else:
+                    # stderr like its hard-error twin and every other
+                    # degrade lane — a piped stdout consumer must not
+                    # swallow the skip notice.
+                    print(f"⚠️  OpenAnt unavailable: {_oa_err}",
+                          file=sys.stderr)
+            else:
+                raw = translate_pipeline_output(
+                    oa_result.get("pipeline_output") or {},
+                )
+                # Checkpoint-verdict recovery: hint-tier candidates for
+                # unit verdicts the scanner's own report dropped
+                # (caller/callee dedup — see packages/openant/recovery).
+                # They join the SARIF dedup like any OpenAnt finding
+                # (a SARIF record covering the same file+CWE makes the
+                # recovered candidate redundant) but are counted
+                # separately everywhere — never blended into the
+                # scanner-stood-behind findings count.
+                from packages.openant import (
+                    RECOVERED_TIER,
+                    recover_dropped_verdicts,
+                )
+                raw += recover_dropped_verdicts(
+                    oa_out, oa_result.get("pipeline_output") or {})
+                if raw and not _openant_only and all_sarif_files:
+                    from core.sarif.parser import parse_sarif_findings
+                    sarif_flist = []
+                    for sf in all_sarif_files:
+                        sarif_flist.extend(parse_sarif_findings(str(sf)))
+                    merged, dropped = deduplicate_with_sarif(
+                        raw, sarif_flist, repo_path=original_repo_path)
+                    openant_findings = [f for f in merged if f.get("tool") == "openant"]
+                    if dropped:
+                        print(f"  Deduped {dropped} OpenAnt finding(s) already in SARIF")
+                else:
+                    openant_findings = raw
+                openant_findings_count = len(openant_findings)
+                save_json(out_dir / "openant_findings.json", openant_findings)
+                _oa_recovered = sum(
+                    1 for f in openant_findings
+                    if (f.get("metadata") or {}).get("provenance_tier")
+                    == RECOVERED_TIER)
+                if _oa_recovered:
+                    print(f"✓ OpenAnt: "
+                          f"{openant_findings_count - _oa_recovered} unique "
+                          f"finding(s) + {_oa_recovered} recovered "
+                          f"checkpoint verdict(s)")
+                else:
+                    print(f"✓ OpenAnt: {openant_findings_count} unique finding(s)")
+                openant_metrics.update({
+                    # Scanner-stood-behind findings ONLY — recovered
+                    # checkpoint verdicts ride their own present-only
+                    # key below (never blended; the artifact total is
+                    # the sum of the two).
+                    "total_findings": openant_findings_count - _oa_recovered,
+                    # The row count of openant_findings.json as written
+                    # for this run (scanner findings + recovered
+                    # verdicts, post-dedup) — for consumers reconciling
+                    # the metrics against the artifact file.
+                    "artifact_findings_total": openant_findings_count,
+                    "model": oa_config.model,
+                    "level": oa_config.level,
+                    # Present-only: zero recovered adds no key (no noise
+                    # on healthy runs).
+                    **({"recovered_checkpoint_verdicts": _oa_recovered}
+                       if _oa_recovered else {}),
+                })
+                token_usage = oa_result.get("token_usage") or {}
+                if token_usage:
+                    openant_metrics["token_usage"] = token_usage
+
+                # Coverage: register files OpenAnt analysed.
+                # The PostToolUse Read hook can't see subprocess reads,
+                # so extract file paths from pipeline_output findings
+                # and append to the run's .reads-manifest.
+                try:
+                    resolved = _openant_coverage_paths(
+                        oa_result.get("pipeline_output") or {},
+                        original_repo_path,
+                    )
+                    if resolved:
+                        manifest = out_dir / ".reads-manifest"
+                        with open(manifest, "a", encoding="utf-8") as mf:
+                            mf.write("\n".join(resolved) + "\n")
+                        logger.debug(
+                            "Coverage: registered %d OpenAnt-analysed files",
+                            len(resolved),
+                        )
+                except Exception:
+                    logger.debug("Coverage tracking for OpenAnt failed", exc_info=True)
+
+                # Coverage overlay (best-effort): project the scan's
+                # analyzed UNITS into a scanner-grade coverage record
+                # (coverage-openant.json; packages/openant/coverage.py)
+                # — function-precise, unlike the finding-file manifest
+                # append above, and the source of the --scanners /
+                # residual views. Fail-open by contract: a projection
+                # failure prints loudly and never fails the phase.
+                try:
+                    from packages.openant.coverage import (
+                        project_scan_coverage,
+                    )
+                    _overlay = project_scan_coverage(
+                        out_dir, oa_out, level=oa_config.level,
+                        repo_path=original_repo_path)
+                    if _overlay:
+                        # Count-only summary (nothing artifact-derived).
+                        print(f"  {_overlay}")
+                except Exception as _cov_exc:  # noqa: BLE001 — overlay is additive; the scan result stands
+                    print(f"⚠️  OpenAnt coverage overlay failed (scan "
+                          f"results unaffected): "
+                          f"{sanitise_for_terminal(str(_cov_exc), max_len=300)}",
+                          file=sys.stderr)
+                    logger.debug("OpenAnt coverage overlay failed",
+                                 exc_info=True)
+        except RuntimeError as e:
+            openant_metrics["error"] = f"not configured: {e}"
+            logger.warning("OpenAnt not configured (continuing without it): %s", e)
+        except Exception as e:
+            # In-process failure AFTER the subprocess (translate,
+            # dedup, save): this is a hard failure of the OpenAnt
+            # phase — record it and set openant_hard_error so a
+            # sole-scanner run fails with the REAL reason at the gate
+            # below, not "no SARIF files generated from scanning".
+            openant_hard_error = sanitise_for_terminal(str(e), max_len=600)
+            openant_metrics["error"] = openant_hard_error
+            openant_metrics["hard_error"] = True
+            logger.warning("OpenAnt scan failed (continuing): %s", e)
+
+    # ========================================================================
+    # PHASE 1c: CROSS-FILE TAINT (opt-in via --taint-crossfile)
+    # ========================================================================
+    # Post-scan producer: findings merge into the validation phase's
+    # findings set AFTER the scanner SARIF conversion (the OpenAnt
+    # channel) — the engine writes nothing into all_sarif_files, so
+    # scanner-side postpasses never see its cross-file paths in their
+    # input set.
+    taint_findings_count = 0
+    taint_metrics = {}
+    taint_findings_file = None
+    if getattr(args, "taint_crossfile", False):
+        print("\n" + "=" * 70)
+        print("CROSS-FILE TAINT")
+        print("=" * 70)
+        try:
+            from core.taint.run import run_crossfile_taint
+            taint_report = run_crossfile_taint(
+                original_repo_path, out_dir)
+            taint_findings_count = taint_report.emitted
+            taint_metrics = taint_report.metrics()
+            if taint_report.emitted:
+                taint_findings_file = taint_report.findings_path
+            # Counts + frontier + caps only — no target text.
+            print(f"✓ {taint_report.summary_line()}")
+        except Exception as e:
+            # Infrastructure failure (packs, inventory) — recorded
+            # loudly; target content never raises out of the engine,
+            # and the other producers' results still stand.
+            _taint_err = sanitise_for_terminal(str(e), max_len=600)
+            taint_metrics = {"error": _taint_err, "hard_error": True}
+            print(f"✗ Cross-file taint phase failed: {_taint_err}",
+                  file=sys.stderr)
+            logger.warning(
+                "Cross-file taint phase failed (continuing): %s", e)
 
     # ---- External SARIF import ----
     import_result = None
@@ -3349,13 +5419,24 @@ Examples:
             normalized_path = out_dir / "imported-normalized.sarif"
             save_json(normalized_path, normalized_sarif)
             all_sarif_files.append(normalized_path)
-        elif not all_sarif_files:
+        elif (not all_sarif_files and not openant_findings_count
+                and not taint_findings_count):
+            reason = "no findings in imported SARIF and no scan results"
+            if openant_hard_error:
+                reason += f"; OpenAnt scan failed: {openant_hard_error}"
             print("\n✗ No findings in imported SARIF and no scan results", file=sys.stderr)
-            _fail_run_and_exit(
-                out_dir, "no findings in imported SARIF and no scan results",
-            )
+            _fail_run_and_exit(out_dir, reason)
 
-    if not all_sarif_files:
+    if (not all_sarif_files and not openant_findings_count
+            and not taint_findings_count):
+        if openant_hard_error:
+            # OpenAnt was the only scanner that could have produced
+            # results and it hard-failed — that failure IS the run's
+            # failure, not a clean scan with nothing to report.
+            print("\n✗ OpenAnt scan failed and no other scan results exist",
+                  file=sys.stderr)
+            _fail_run_and_exit(
+                out_dir, f"OpenAnt scan failed: {openant_hard_error}")
         print("\n✗ No SARIF files generated from scanning", file=sys.stderr)
         _fail_run_and_exit(out_dir, "no SARIF files generated from scanning")
 
@@ -3368,6 +5449,8 @@ Examples:
     total_findings = (semgrep_metrics.get('total_findings', 0)
                       + codeql_metrics.get('total_findings', 0)
                       + sca_findings_count
+                      + openant_findings_count
+                      + taint_findings_count
                       + threat_model_findings_count
                       + imported_findings_count)
     scan_metrics = {
@@ -3377,6 +5460,8 @@ Examples:
         'semgrep': semgrep_metrics,
         'codeql': codeql_metrics,
         'sca': sca_metrics,
+        'openant': openant_metrics,
+        'taint_crossfile': taint_metrics,
         'threat_model': threat_model_phase,
     }
     if import_result:
@@ -3395,6 +5480,10 @@ Examples:
         print(f"  CodeQL: {codeql_metrics.get('total_findings', 0)} findings")
     if sca_findings_count:
         print(f"  SCA: {sca_findings_count} findings")
+    if openant_findings_count:
+        print(f"  OpenAnt: {openant_findings_count} findings")
+    if taint_findings_count:
+        print(f"  Cross-file taint: {taint_findings_count} findings")
     if threat_model_findings_count:
         print(f"  Threat model: {threat_model_findings_count} candidates")
     if imported_findings_count:
@@ -3420,6 +5509,8 @@ Examples:
             sca_options = ScaRunOptions(
                 enable_llm_review=not args.skip_sca_review,
                 enable_triage=not args.skip_sca_triage,
+                diagnostics_path=sca_deep_out / "diagnostics.json",
+                analysis_mode="deep",
             )
             sca_result = run_sca(
                 target=original_repo_path,
@@ -3441,21 +5532,101 @@ Examples:
                         sca_result.vuln_findings, sca_result.hygiene_findings,
                         sca_result.supply_chain_findings)
             sca_deep_count = sca_result.vuln_findings + sca_result.supply_chain_findings
+            sca_findings_count = sca_deep_count
             total_findings += sca_deep_count
+            scan_metrics["total_findings"] = total_findings
+            sca_tool_state = _tool_state(
+                "completed",
+                requested=True,
+                artifacts=[
+                    sca_result.findings_path,
+                    sca_result.report_path,
+                    sca_result.sarif_path,
+                    sca_result.sbom_path,
+                    sca_deep_out / "diagnostics.json",
+                ],
+                disposition="success",
+                analysis_mode="deep",
+            )
         except ImportError:
             print("⚠️  SCA package not available — skipping dependency analysis", file=sys.stderr)
             logger.warning("SCA import failed — packages/sca not installed")
+            reason = "SCA package not available"
+            sca_failure = _record_tool_failure(
+                out_dir / "sca_deep",
+                "sca",
+                reason,
+            )
+            sca_tool_state = _tool_state(
+                "skipped",
+                requested=True,
+                reason=reason,
+                artifacts=[
+                    sca_failure,
+                    *(
+                        path for path in (
+                            out_dir / "sca_deep" / "findings.json",
+                            out_dir / "sca_deep" / "findings.sarif",
+                            out_dir / "sca_deep" / "report.md",
+                            out_dir / "sca_deep" / "diagnostics.json",
+                        )
+                        if path.exists()
+                    ),
+                ],
+                disposition="unsupported",
+                analysis_mode="deep",
+            )
         except Exception as e:
-            print(f"⚠️  SCA failed: {e}", file=sys.stderr)
+            print(f"⚠️  SCA failed: {sanitise_for_terminal(str(e), max_len=300)}", file=sys.stderr)
             logger.exception("SCA phase failed: %s", e)  # noqa: TRY401
+            reason = f"{type(e).__name__}: {e}"
+            try:
+                from packages.sca.diagnostics import finalize_sca_diagnostic
+                finalize_sca_diagnostic(
+                    out_dir / "sca_deep",
+                    disposition="failed",
+                    reason=reason,
+                    mode="deep",
+                )
+            except Exception:
+                logger.debug(
+                    "failed to persist deep-SCA diagnostics",
+                    exc_info=True,
+                )
+            sca_failure = _record_tool_failure(
+                out_dir / "sca_deep",
+                "sca",
+                reason,
+            )
+            sca_tool_state = _tool_state(
+                "failed",
+                requested=True,
+                reason=reason,
+                artifacts=[
+                    sca_failure,
+                    *(
+                        path for path in (
+                            out_dir / "sca_deep" / "findings.json",
+                            out_dir / "sca_deep" / "findings.sarif",
+                            out_dir / "sca_deep" / "report.md",
+                            out_dir / "sca_deep" / "diagnostics.json",
+                        )
+                        if path.exists()
+                    ),
+                ],
+                disposition="failed",
+                analysis_mode="deep",
+            )
+
 
     # ========================================================================
     # PHASE 2: EXPLOITABILITY VALIDATION
     # ========================================================================
-    # Run validation phase (handles all modes: skip, dedup-only, full validation)
-    from packages.exploitability_validation import run_validation_phase
-
-    validation_result, validated_findings = run_validation_phase(
+    # Run validation phase (handles all modes: skip, dedup-only, full
+    # validation). Checked wrapper: a crash inside the phase fails the
+    # run's lifecycle instead of crash-aborting the pipeline.
+    validation_result, validated_findings = _run_validation_phase_checked(
+        out_dir,
         repo_path=str(original_repo_path),
         out_dir=out_dir,
         sarif_files=sarif_files,
@@ -3469,6 +5640,10 @@ Examples:
         skip_feasibility=not (args.binary or args.check_mitigations),
         external_llm=llm_env.external_llm,
         sca_findings_path=sca_findings_path,
+        openant_findings_path=(
+            out_dir / "openant_findings.json" if openant_findings_count else None
+        ),
+        taint_findings_path=taint_findings_file,
     )
 
     # Enrichment summary — pre-LLM visibility of mechanical enrichments
@@ -3480,6 +5655,13 @@ Examples:
         sca_m = validation_result.get("sca_merged", 0)
         if sca_m > 0:
             _enrichment_lines.append(f"  SCA: {sca_m} dependency findings merged")
+        openant_m = validation_result.get("openant_merged", 0)
+        if openant_m > 0:
+            _enrichment_lines.append(f"  OpenAnt: {openant_m} semantic findings merged")
+        taint_m = validation_result.get("taint_merged", 0)
+        if taint_m > 0:
+            _enrichment_lines.append(
+                f"  Cross-file taint: {taint_m} findings merged")
     if import_result and import_result.stats.total_imported > 0:
         stats = import_result.stats
         _enrichment_lines.append(
@@ -3524,6 +5706,7 @@ Examples:
     if not getattr(args, "binary", None) and not getattr(args, "no_binary_oracle", False):
         apply_to_config(args, repo_path)
 
+
     # ========================================================================
     # PHASE 3: AUTONOMOUS ANALYSIS
     # ========================================================================
@@ -3534,20 +5717,39 @@ Examples:
     analysis = {}
     autonomous_out = None
     analysis_report = None
-    if not llm_env.llm_available:
-        print("\n⚠️  Phase 3 skipped - No LLM provider available")
-        print("    To enable autonomous analysis, either:")
-        print("    1. Set ANTHROPIC_API_KEY environment variable, OR")
-        print("    2. Set OPENAI_API_KEY / GEMINI_API_KEY / MISTRAL_API_KEY, OR")
-        print("    3. Run Ollama locally (https://ollama.ai), OR")
-        print("    4. Run inside Claude Code (claude)")
-        logger.warning("Phase 3 skipped - No LLM provider configured")
+    if not llm_env.llm_available and not args.copilot_native:
+        if session_services_restricted():
+            print("\n⚠️  Phase 3 skipped - Copilot session service policy "
+                  "blocks standalone LLM transports.")
+            print("    RAPTOR has no verified bridge to this session's "
+                  "authenticated model service.")
+            print("    Saved API keys, another CLI, or a local sidecar "
+                  "cannot enable analysis in this session.")
+            logger.warning(
+                "Phase 3 skipped - authenticated Copilot model transport "
+                "unavailable to RAPTOR",
+            )
+        else:
+            print("\n⚠️  Phase 3 skipped - No LLM provider available")
+            print("    To enable autonomous analysis, either:")
+            print("    1. Set ANTHROPIC_API_KEY environment variable, OR")
+            print("    2. Set OPENAI_API_KEY / GEMINI_API_KEY / MISTRAL_API_KEY, OR")
+            print("    3. Run Ollama locally (https://ollama.ai), OR")
+            print("    4. Run inside Claude Code (claude)")
+            logger.warning("Phase 3 skipped - No LLM provider configured")
     else:
         autonomous_out = out_dir / "autonomous"
         autonomous_out.mkdir(exist_ok=True)
 
         # Check if validation produced enriched findings
         validated_findings_path = out_dir / "validation" / "findings.json"
+        # Only forward --max-findings when the operator set it; otherwise
+        # let the child resolve its own provider-aware default (local →
+        # unlimited, cloud → 10). str(None) would be a bug.
+        _mf_flag = (
+            ["--max-findings", str(args.max_findings)]
+            if args.max_findings is not None else []
+        )
         if validated_findings_path.exists():
             logger.info("Using findings from Phase 2 for analysis")
             analysis_cmd = [
@@ -3556,8 +5758,7 @@ Examples:
                 "--repo", str(repo_path),
                 "--findings", str(validated_findings_path),
                 "--out", str(autonomous_out),
-                "--max-findings", str(args.max_findings)
-            ]
+            ] + _mf_flag
         else:
             analysis_cmd = [
                 "python3",
@@ -3566,8 +5767,7 @@ Examples:
                 "--sarif"
             ] + [str(f) for f in sarif_files] + [
                 "--out", str(autonomous_out),
-                "--max-findings", str(args.max_findings)
-            ]
+            ] + _mf_flag
 
         # Forward --prefer GLOB(s) so the agent re-orders findings
         # before applying --max-findings. Each --prefer becomes a
@@ -3579,8 +5779,10 @@ Examples:
         for excl in (args.exclude_dir or []):
             analysis_cmd += ["--exclude-dir", excl]
 
-        # Attach checklist for metadata lookup
-        if (out_dir / "checklist.json").exists():
+        # Attach checklist for metadata lookup. The flag names the
+        # SLOT path; the analysis agent resolves single-file vs
+        # sharded through the accessor.
+        if _checklist_exists(out_dir):
             analysis_cmd.extend(["--checklist", str(out_dir / "checklist.json")])
 
         # Forward --no-journal opt-out so operators who don't
@@ -3605,9 +5807,40 @@ Examples:
             analysis_cmd.append("--execute-exploits")
         if args.no_execute_exploits:
             analysis_cmd.append("--no-execute-exploits")
+        # Verdict-triggered context expansion rides the SEQUENTIAL
+        # analysis child only — the orchestrated Phase 4 path has its
+        # own per-finding dispatch and does not consume the flag. On
+        # a non-sequential run the child is prep-only (no LLM path),
+        # so forwarding would be a silent no-op: warn instead.
+        if getattr(args, "context_expansion", False):
+            if args.sequential:
+                analysis_cmd.append("--context-expansion")
+            else:
+                print(
+                    "⚠️  --context-expansion applies to the sequential "
+                    "classifier only — ignored on this run "
+                    "(add --sequential)",
+                    file=sys.stderr,
+                )
+        # The context tool loop rides the same sequential-only seam,
+        # for the same reason: the orchestrated Phase 4 path never
+        # consumes the flag, so forwarding it there would be a silent
+        # no-op.
+        if getattr(args, "context_toolloop", False):
+            if args.sequential:
+                analysis_cmd.append("--context-toolloop")
+            else:
+                print(
+                    "⚠️  --context-toolloop applies to the sequential "
+                    "classifier only — ignored on this run "
+                    "(add --sequential)",
+                    file=sys.stderr,
+                )
 
         # Phase 3 preps data; Phase 4 handles LLM work (unless --sequential)
-        if (llm_env.claude_code or llm_env.external_llm) and not args.sequential:
+        if args.copilot_native:
+            analysis_cmd.append("--prep-only")
+        elif (llm_env.claude_code or llm_env.external_llm) and not args.sequential:
             analysis_cmd.append("--prep-only")
 
         rc, _stdout, stderr = run_command_streaming(
@@ -3632,6 +5865,7 @@ Examples:
         # Parse analysis results
         analysis_report = autonomous_out / "autonomous_analysis_report.json"
         if analysis_report.exists():
+            _warn_analysis_rc_with_report(rc)
             analysis = load_json(analysis_report)
             if not isinstance(analysis, dict):
                 analysis = {}
@@ -3673,10 +5907,9 @@ Examples:
                     for line in elig_block.splitlines():
                         print(f"  {line}")
         else:
-            print("⚠️  Analysis failed or produced no output", file=sys.stderr)
-            if stderr:
-                print(f"    Error: {stderr[:500]}", file=sys.stderr)
-            logger.warning("Phase 3 failed - rc=%d, stderr=%s", rc, stderr[:200])
+            # rc != 0 → failed phase: run marked failed, nonzero exit.
+            # rc == 0 with no report keeps the warn-and-degrade path.
+            _fail_or_warn_missing_analysis(out_dir, rc, stderr or "")
             analysis = {}
 
     # ========================================================================
@@ -3710,10 +5943,19 @@ Examples:
                 consensus=getattr(args, "consensus", None),
                 judge=getattr(args, "judge", None),
                 aggregate=getattr(args, "aggregate", None),
+                exploit=getattr(args, "exploit_model", None),
                 auto_detect=llm_env.external_llm,
             )
             if llm_config and getattr(args, "max_cost_usd", None) is not None:
                 llm_config.max_cost_per_scan = args.max_cost_usd
+            # Non-dollar governor caps (off unless set). Independent of
+            # the USD cap so they bound free/local runs too.
+            if llm_config and getattr(args, "max_seconds", None) is not None:
+                llm_config.max_seconds_per_scan = args.max_seconds
+            if llm_config and getattr(args, "max_calls", None) is not None:
+                llm_config.max_calls_per_scan = args.max_calls
+            if llm_config and getattr(args, "max_tokens", None) is not None:
+                llm_config.max_tokens_per_scan = args.max_tokens
             # Dataflow validation is on by default when CodeQL ran;
             # `--no-validate-dataflow` opts out entirely. `--deep-validate`
             # opts into LLM-backed Tier 2/3 on top of the always-free Tier 1.
@@ -3760,9 +6002,83 @@ Examples:
                     )
         else:
             print("\n  No analysis report from Phase 3 — skipping orchestration")
+    elif args.copilot_native:
+        print(
+            "\n  Findings prepared for host-managed Copilot subagents. "
+            "Repository LLM transports remain disabled.",
+        )
     elif not llm_env.llm_available:
-        print("\n  No LLM available. Findings prepared for manual review.")
-        print("  For automated analysis, set an API key or install Claude Code.")
+        if session_services_restricted():
+            print("\n  Findings retained without autonomous analysis. "
+                  "No provider or prep-only report was run.")
+        else:
+            print("\n  No LLM available. Findings retained for manual review.")
+            print("  For automated analysis, configure an LLM provider.")
+
+    copilot_native_manifest = None
+    copilot_native_context = None
+    if args.copilot_native:
+        if (
+            analysis_report is None
+            or not analysis_report.exists()
+            or analysis.get("mode") != "prep_only"
+        ):
+            raise RuntimeError(
+                "Copilot-native handoff requires a prep_only analysis report",
+            )
+        if args.understand:
+            from core.orchestration import prepare_native_context_prepass
+            copilot_native_context = prepare_native_context_prepass(
+                target=original_repo_path,
+                agentic_out_dir=out_dir,
+                threat_model_requested=bool(args.threat_model),
+                threat_model_refresh=bool(args.threat_model_refresh),
+                threat_model_use_stale=bool(
+                    args.threat_model_use_stale,
+                ),
+            )
+        from packages.llm_analysis.copilot_native import prepare_handoff
+        copilot_native_manifest = prepare_handoff(
+            run_dir=out_dir,
+            repo_path=original_repo_path,
+            prep_report_path=analysis_report,
+            max_findings=args.max_findings,
+            batch_size=args.copilot_native_batch_size,
+            no_exploits=args.no_exploits,
+            no_patches=args.no_patches,
+            no_journal=args.no_journal,
+            max_parallel=(
+                1 if args.sequential else args.max_parallel
+            ),
+            max_cost_usd=args.max_cost_usd,
+            sequential=bool(args.sequential),
+            validate_postpass=bool(args.validate),
+            allow_unreachable=bool(
+                getattr(args, "allow_unreachable", False),
+            ),
+            context_handoff=(
+                copilot_native_context.to_dict()
+                if copilot_native_context is not None
+                else None
+            ),
+            audit_policy=_copilot_native_audit_policy(
+                args,
+                out_dir,
+            ),
+            model_plan=copilot_native_model_plan,
+        )
+        print(f"\nCOPILOT_NATIVE_MANIFEST={copilot_native_manifest}")
+        if copilot_native_context is not None:
+            print(
+                "COPILOT_NATIVE_CONTEXT_REQUEST="
+                f"{copilot_native_context.request_path}"
+            )
+        if args.max_cost_usd is not None:
+            print(
+                "⚠️  --max-cost-usd cannot meter host-managed Copilot AI "
+                "credits; use the Copilot session's /limits controls.",
+                file=sys.stderr,
+            )
 
     # ========================================================================
     # POST-PASS: /audit (opt-in via --gap-audit)
@@ -3774,7 +6090,7 @@ Examples:
     # ========================================================================
     audit_postpass: dict = {"enabled": bool(args.gap_audit), "completed": False}
     audit_dir = None
-    if args.gap_audit:
+    if args.gap_audit and not args.copilot_native:
         print("\n" + "=" * 70)
         print("AUDIT POST-PASS")
         print("=" * 70)
@@ -3813,7 +6129,7 @@ Examples:
     # validate pipeline against them.
     # ========================================================================
     postpass_result = None
-    if args.validate:
+    if args.validate and not args.copilot_native:
         from core.orchestration import run_validate_postpass
         print("\n" + "=" * 70)
         print("VALIDATE POST-PASS")
@@ -3861,9 +6177,139 @@ Examples:
     # ========================================================================
     workflow_duration = time.time() - workflow_start
 
+    assessment = _assessment_from_reports(
+        validated_findings=validated_findings,
+        analysis=analysis,
+        orchestration_result=orchestration_result,
+        max_findings=args.max_findings,
+        llm_available=llm_env.llm_available,
+    )
+
+    if sca_result:
+        sca_counts = {
+            "deps_analysed": sca_result.deps_analysed,
+            "vuln_findings": sca_result.vuln_findings,
+            "hygiene_findings": sca_result.hygiene_findings,
+            "supply_chain_findings": sca_result.supply_chain_findings,
+            "llm_reviews": sca_result.llm_reviews_run,
+            "triage_run": sca_result.triage_run,
+        }
+    elif sca_tool_state.get("failed"):
+        sca_counts = {
+            "deps_analysed": None,
+            "vuln_findings": None,
+            "hygiene_findings": None,
+            "supply_chain_findings": None,
+            "llm_reviews": None,
+            "triage_run": False,
+        }
+    else:
+        sca_counts = {
+            "deps_analysed": sca_metrics.get("deps_analysed", 0),
+            "vuln_findings": sca_metrics.get("vuln_findings", 0),
+            "hygiene_findings": sca_metrics.get("hygiene_findings", 0),
+            "supply_chain_findings": sca_metrics.get(
+                "supply_chain_findings", 0
+            ),
+            "llm_reviews": 0,
+            "triage_run": False,
+        }
+
+    tool_states = {
+        "semgrep": {
+            **semgrep_tool_state,
+            "findings": (
+                semgrep_metrics.get("total_findings", 0)
+                if semgrep_tool_state.get("completed")
+                else None if semgrep_tool_state.get("failed") else 0
+            ),
+        },
+        "codeql": {
+            **codeql_tool_state,
+            "findings": (
+                codeql_metrics.get("total_findings", 0)
+                if codeql_tool_state.get("completed")
+                else None if codeql_tool_state.get("failed") else 0
+            ),
+            "languages": (
+                list(codeql_metrics.get("languages_detected", {}).keys())
+                if codeql_tool_state.get("completed")
+                else None if codeql_tool_state.get("failed") else []
+            ),
+        },
+        "sca": {
+            **sca_tool_state,
+            # Always-on SCA is additive in import-only and OpenAnt-only
+            # modes. Its failure remains visible/partial but cannot be the
+            # sole reason those non-primary workflows exit 1. Explicit
+            # --sca, Semgrep, or CodeQL makes dependency analysis part of
+            # the required scanner set again.
+            "required_for_success": _sca_required_for_success(
+                run_semgrep=run_semgrep,
+                run_codeql=run_codeql,
+                deep_sca_requested=args.sca,
+            ),
+            "findings": (
+                None
+                if sca_tool_state.get("failed")
+                else (
+                    sca_counts["vuln_findings"]
+                    + sca_counts["hygiene_findings"]
+                    + sca_counts["supply_chain_findings"]
+                )
+            ),
+        },
+    }
+    extra_partial_failures = []
+    if openant_hard_error:
+        extra_partial_failures.append(
+            f"OpenAnt failed: {openant_hard_error}"
+        )
+    if taint_metrics.get("hard_error"):
+        extra_partial_failures.append(
+            f"Cross-file taint failed: {taint_metrics.get('error', 'unknown')}"
+        )
+    run_result = _build_run_result(
+        tool_states,
+        assessment,
+        extra_failures=extra_partial_failures,
+    )
+
+    scanner_incomplete = any(
+        tool_states[name].get("failed") or tool_states[name].get("degraded")
+        for name in ("semgrep", "codeql")
+    ) or bool(openant_hard_error) or bool(taint_metrics.get("hard_error"))
+    if run_result.get("failed"):
+        scan_phase_status = "failed"
+    elif skip_scan:
+        scan_phase_status = "skipped"
+    elif scanner_incomplete:
+        scan_phase_status = "partial"
+    else:
+        scan_phase_status = "completed"
+
     print("\n" + "=" * 70)
-    print("🎉 RAPTOR AGENTIC WORKFLOW COMPLETE")
+    print(
+        "RAPTOR AGENTIC PIPELINE EXECUTION "
+        f"{'FAILED' if run_result.get('failed') else 'COMPLETE'}"
+    )
     print("=" * 70)
+    if run_result.get("failed"):
+        print(
+            "\n✗ Result: FAILED — requested scanners produced no usable "
+            "output. Diagnostic reports were persisted."
+        )
+        for reason in run_result["failure_reasons"]:
+            print(f"   - {reason}")
+    elif run_result["partial"]:
+        print(
+            "\n⚠️  Result: PARTIAL — usable output was generated, but this "
+            "is not a clean full assessment."
+        )
+        for reason in run_result["partial_reasons"]:
+            print(f"   - {reason}")
+    else:
+        print("\nResult: COMPLETE — all eligible findings were assessed.")
 
     # Coverage nudge: /agentic reviews what the scanners flag; make the
     # size of what it DIDN'T review visible instead of implying
@@ -3885,36 +6331,34 @@ Examples:
         "repository": str(original_repo_path),
         "duration_seconds": workflow_duration,
         "tools_used": {
-            "semgrep": not args.codeql_only,
-            "codeql": args.codeql or args.codeql_only,
-            "sca": bool(sca_agent and sca_metrics),
+            "semgrep": tool_states["semgrep"]["attempted"],
+            "codeql": tool_states["codeql"]["attempted"],
+            "sca": tool_states["sca"]["attempted"],
         },
         "phases": {
             "scanning": {
-                "completed": not skip_scan,
+                "status": scan_phase_status,
+                "execution_completed": True,
+                "completed": scan_phase_status == "completed",
+                "partial": scan_phase_status == "partial",
+                "failed": scan_phase_status == "failed",
                 "total_findings": scan_metrics.get('total_findings', 0),
                 "files_scanned": scan_metrics.get('total_files_scanned', 0),
                 "threat_model_candidates": threat_model_findings_count,
                 "semgrep": {
-                    "enabled": not args.codeql_only,
-                    "findings": semgrep_metrics.get('total_findings', 0) if semgrep_metrics else 0,
+                    "enabled": tool_states["semgrep"]["requested"],
+                    **tool_states["semgrep"],
                 },
                 "codeql": {
-                    "enabled": args.codeql or args.codeql_only,
-                    "findings": codeql_metrics.get('total_findings', 0) if codeql_metrics else 0,
-                    "languages": list(codeql_metrics.get('languages_detected', {}).keys()) if codeql_metrics else [],
+                    "enabled": tool_states["codeql"]["requested"],
+                    **tool_states["codeql"],
                 },
             },
             "threat_model": threat_model_phase,
             "sca": {
-                "enabled": args.sca,
-                "completed": sca_result is not None,
-                "deps_analysed": sca_result.deps_analysed if sca_result else 0,
-                "vuln_findings": sca_result.vuln_findings if sca_result else 0,
-                "hygiene_findings": sca_result.hygiene_findings if sca_result else 0,
-                "supply_chain_findings": sca_result.supply_chain_findings if sca_result else 0,
-                "llm_reviews": sca_result.llm_reviews_run if sca_result else 0,
-                "triage_run": sca_result.triage_run if sca_result else False,
+                "enabled": tool_states["sca"]["requested"],
+                **tool_states["sca"],
+                **sca_counts,
             },
             "exploitability_validation": {
                 "completed": bool(validation_result),
@@ -3924,17 +6368,29 @@ Examples:
                 "noise_reduction_percent": ((total_findings - validated_findings) / total_findings * 100) if total_findings > 0 else 0,
             },
             "autonomous_analysis": {
-                "completed": bool(analysis),
-                "skipped": not llm_env.llm_available,
+                "completed": bool(analysis)
+                and analysis.get("mode") != "prep_only",
+                "prepared": analysis.get("mode") == "prep_only",
+                "mode": analysis.get("mode"),
+                "skipped": not llm_env.llm_available
+                and not args.copilot_native,
                 "exploitable": analysis.get('exploitable', 0),
                 "exploits_generated": analysis.get('exploits_generated', 0),
                 "patches_generated": analysis.get('patches_generated', 0),
                 "dataflow_validated": analysis.get('dataflow_validated', 0) if (args.codeql or args.codeql_only) else 0,
+                "assessment": assessment,
             },
-            "orchestration": orchestration_result.get("orchestration", {}) if orchestration_result else {
-                "completed": False,
-                "mode": "none",
-            },
+            "orchestration": (
+                orchestration_result.get("orchestration", {})
+                if orchestration_result
+                else {
+                    "completed": False,
+                    "mode": (
+                        "copilot_native_pending"
+                        if args.copilot_native else "none"
+                    ),
+                }
+            ),
             "audit": audit_postpass,
         },
         "outputs": {
@@ -3947,11 +6403,36 @@ Examples:
             "threats": threat_model_phase.get("threats"),
             "threat_model_summary": str(out_dir / "threat-model-summary.json") if threat_model_phase.get("completed") else None,
             "threat_model_candidates": threat_model_phase.get("candidate_sarif"),
-            "sca_findings": str(sca_findings_path) if sca_findings_path and sca_findings_path.exists() else None,
-            "sca_report": str(out_dir / "sca" / "report.md") if sca_result else None,
+            "sca_findings": (
+                str(sca_result.findings_path)
+                if sca_result
+                else (
+                    str(sca_out / "findings.json")
+                    if (sca_out / "findings.json").exists()
+                    else None
+                )
+            ),
+            "sca_report": (
+                str(sca_result.report_path)
+                if sca_result
+                else (
+                    str(sca_out / "report.md")
+                    if (sca_out / "report.md").exists()
+                    else None
+                )
+            ),
             "validation_report": str(out_dir / "validation" / "findings.json") if validation_result else None,
             "autonomous_report": str(analysis_report) if analysis_report and analysis_report.exists() else None,
             "orchestrated_report": str(out_dir / "orchestrated_report.json") if orchestration_result else None,
+            "copilot_native_manifest": (
+                str(copilot_native_manifest)
+                if copilot_native_manifest else None
+            ),
+            "copilot_native_context_request": (
+                str(copilot_native_context.request_path)
+                if copilot_native_context is not None
+                else None
+            ),
             "aggregation_report": str(out_dir / "aggregation.json") if orchestration_result and orchestration_result.get("aggregation") else None,
             "exploits_directory": str(autonomous_out / "exploits") if autonomous_out else None,
             "patches_directory": str(autonomous_out / "patches") if autonomous_out else None,
@@ -3969,6 +6450,7 @@ Examples:
             "enriched_sarif": None,  # populated after --sarif-out write
         }
     }
+    final_report.update(_result_contract_fields(run_result, assessment))
 
     report_file = out_dir / "raptor_agentic_report.json"
     save_json(report_file, final_report)
@@ -4054,7 +6536,9 @@ Examples:
                                 binary_path=Path(args.binary[0]),
                                 fuzzing_result=fuzzing_result,
                                 fuzz_out=fuzz_out,
-                                limit=args.max_findings,
+                                # None (unspecified) → unlimited crash triage;
+                                # an explicit --max-findings still caps.
+                                limit=args.max_findings if args.max_findings is not None else 0,
                             )
                             final_report["outputs"]["fuzzing_crash_analysis"] = str(
                                 crash_outputs["contexts"]
@@ -4099,25 +6583,67 @@ Examples:
                             )
                             print(
                                 f"\n  ✗ Crash triage / validation handoff "
-                                f"failed: {e}",
+                                f"failed: {sanitise_for_terminal(str(e), max_len=300)}",
                                 file=sys.stderr,
                             )
             except Exception as e:
                 logger.exception("Fuzz phase failed: %s", e)  # noqa: TRY401
-                print(f"\n  ✗ Fuzz phase error: {e}", file=sys.stderr)
+                print(f"\n  ✗ Fuzz phase error: {sanitise_for_terminal(str(e), max_len=300)}", file=sys.stderr)
 
     print("\n📊 Summary:")
     print(f"   Total findings: {scan_metrics.get('total_findings', 0)}")
     if threat_model_findings_count:
         print(f"     Threat model candidates: {threat_model_findings_count}")
-    if semgrep_metrics:
-        print(f"     Semgrep: {semgrep_metrics.get('total_findings', 0)}")
-    if codeql_metrics:
-        print(f"     CodeQL: {codeql_metrics.get('total_findings', 0)}")
+    print("   Tool execution:")
+    for tool_name, label in (
+        ("semgrep", "Semgrep"),
+        ("codeql", "CodeQL"),
+        ("sca", "SCA"),
+    ):
+        state = tool_states[tool_name]
+        if state.get("completed"):
+            print(
+                f"     {label}: Completed "
+                f"({state.get('findings', 0)} findings)"
+            )
+        elif state.get("failed"):
+            artifact = state.get("artifact")
+            failure_reason = sanitise_for_terminal(
+                str(state.get("failure_reason", "unknown failure")),
+                max_len=300,
+            )
+            artifact_note = (
+                f"; artifact: "
+                f"{sanitise_for_terminal(str(artifact), max_len=300)}"
+                if artifact else ""
+            )
+            print(
+                f"     ⚠️  {label}: Failed (findings unknown) — "
+                f"{failure_reason}"
+                f"{artifact_note}"
+            )
+        else:
+            skip_reason = sanitise_for_terminal(
+                str(state.get("skip_reason", "not requested")),
+                max_len=300,
+            )
+            print(
+                f"     {label}: Skipped — "
+                f"{skip_reason}"
+            )
+    assessment_status = sanitise_for_terminal(
+        str(assessment.get("status", "partial")),
+        max_len=80,
+    ).title()
+    print(
+        f"   Assessment completeness: "
+        f"{assessment_status} — "
+        f"{assessment.get('analyzed', 0)} of "
+        f"{assessment.get('eligible', 0)} eligible findings analyzed; "
+        f"{assessment.get('unreviewed', 0)} unreviewed"
+    )
     # Build findings funnel from orchestration results
     analysed_count = 0
-    true_positives = 0
-    false_positives = 0
     unverdicted = 0
     exploitable_count = 0
     inconsistent_count = 0
@@ -4138,8 +6664,6 @@ Examples:
         # dispatch failure looks like a successful run.
         from core.orchestration.funnel import bucket_orchestration_results
         _buckets = bucket_orchestration_results(orchestration_result.get("results", []))
-        true_positives = _buckets["true_positives"]
-        false_positives = _buckets["false_positives"]
         unverdicted = _buckets["unverdicted"]
         exploitable_count = _buckets["exploitable"]
         inconsistent_count = _buckets["inconsistent"]
@@ -4163,15 +6687,15 @@ Examples:
     sarif_out_path = getattr(args, "sarif_out", None)
     if sarif_out_path:
         from core.sarif.enriched_writer import write_enriched_sarif
-        analysed_results = (
+        sarif_results = (
             orchestration_result.get("results", [])
             if orchestration_result else []
         )
-        if analysed_results:
+        if sarif_results:
             sarif_out_resolved = Path(sarif_out_path)
             if not sarif_out_resolved.is_absolute():
                 sarif_out_resolved = out_dir / sarif_out_resolved
-            n = write_enriched_sarif(analysed_results, sarif_out_resolved)
+            n = write_enriched_sarif(sarif_results, sarif_out_resolved)
             print(f"\n✓ Enriched SARIF written: {sarif_out_resolved} ({n} findings)")
             final_report["outputs"]["enriched_sarif"] = str(sarif_out_resolved)
             save_json(report_file, final_report)
@@ -4184,10 +6708,17 @@ Examples:
         if total_findings > validated_findings:
             reduction = ((total_findings - validated_findings) / total_findings) * 100
             print(f"   Duplicates removed: {reduction:.0f}%")
-    if analysed_count > 0 and analysed_count < validated_findings:
-        skipped = validated_findings - analysed_count
-        print(f"   Analysed: {analysed_count} of {validated_findings}")
-        print(f"   ⚠️  {skipped} finding{'s' if skipped != 1 else ''} skipped (--max-findings {args.max_findings})")
+    if assessment.get("unreviewed", 0) > 0:
+        skipped = int(assessment["unreviewed"])
+        eligible = int(assessment.get("eligible", validated_findings) or 0)
+        print(f"   Analysed: {analysed_count} of {eligible}")
+        _cap_note = assessment.get("cap_reason") or assessment.get("reason")
+        if not _cap_note:
+            _cap_note = "assessment incomplete"
+        print(
+            f"   ⚠️  {skipped} finding{'s' if skipped != 1 else ''} "
+            f"unreviewed ({_cap_note})"
+        )
     elif analysed_count > 0:
         print(f"   Analysed: {analysed_count}")
     if failed_count > 0 or blocked_count > 0:
@@ -4209,10 +6740,51 @@ Examples:
                 err_snippet = (first_err[:120] + "...") if len(first_err) > 120 else first_err
                 print(f"     {model}: {info.get('count', 0)} error{'s' if info.get('count') != 1 else ''}"
                       + (f" — {err_snippet}" if err_snippet else ""))
-    if true_positives > 0 or false_positives > 0:
-        print(f"   True positives: {true_positives}")
-        if false_positives > 0:
-            print(f"   False positives: {false_positives}")
+    results = (
+        orchestration_result.get("results", [])
+        if orchestration_result else []
+    )
+    analysed_results = [
+        r for r in results
+        if isinstance(r, dict)
+        and ("is_true_positive" in r or "error" in r)
+    ]
+    from core.reporting import build_findings_summary as _build_verdict_summary
+    verdict_counts = _build_verdict_summary(analysed_results)
+    final_report["verdicts"] = verdict_counts
+    save_json(report_file, final_report)
+    if analysed_results:
+        from core.reporting.formatting import get_display_status
+        verdict_distribution: dict[str, int] = {}
+        for result in analysed_results:
+            status = get_display_status(result)
+            verdict_distribution[status] = (
+                verdict_distribution.get(status, 0) + 1
+            )
+        ordered_statuses = (
+            "Exploitable",
+            "Confirmed",
+            "Confirmed (Constrained)",
+            "Confirmed (Blocked)",
+            "False Positive",
+            "Mitigated",
+            "Test Code",
+            "Dead Code",
+            "Unreachable",
+            "Ruled Out",
+            "Unconfirmed",
+        )
+        verdict_parts = [
+            f"{verdict_distribution.pop(status)} {status}"
+            for status in ordered_statuses
+            if verdict_distribution.get(status)
+        ]
+        verdict_parts.extend(
+            f"{count} {status}"
+            for status, count in sorted(verdict_distribution.items())
+        )
+        if verdict_parts:
+            print(f"   Verdicts: {', '.join(verdict_parts)}")
     if unverdicted > 0:
         # Per-finding LLM dispatch returned empty / low-quality response
         # (q<0.5 from cc_dispatch leaves verdict fields as None). Pre-fix
@@ -4260,6 +6832,21 @@ Examples:
                     f"{_candidates} candidates ({_pct:.0f}%, see "
                     f"suppressions.jsonl)"
                 )
+    # Analysis gaps: files a parser abandoned (budget exceeded,
+    # stalled worker, escaped parse error). Loud by contract — a
+    # crafted file that defeats a parser must be visible in the run
+    # summary, never a silent skip.
+    from core.run.gaps import gap_summary as _gap_summary
+    _gap_counts = _gap_summary(out_dir)
+    if _gap_counts:
+        _gap_total = sum(_gap_counts.values())
+        _gap_desc = ", ".join(
+            f"{n} {reason}" for reason, n in sorted(_gap_counts.items())
+        )
+        print(
+            f"   ⚠️  Analysis gaps: {_gap_total} record(s) — files NOT "
+            f"analysed ({_gap_desc}); see analysis-gaps.jsonl"
+        )
     print(f"   Exploitable: {exploitable_count}")
     if inconsistent_count > 0:
         # Findings the LLM marked exploitable but whose own reasoning
@@ -4299,9 +6886,13 @@ Examples:
         print(line)
     aggregation = orchestration_result.get("aggregation", {}) if orchestration_result else {}
     if aggregation:
-        summary = str(aggregation.get("summary") or "").strip()
+        # Free-text output of the aggregate model — the report leg
+        # (_build_aggregation_report_section) sanitises the same
+        # field; the terminal leg must too (escape + 120-char bound).
+        summary = sanitise_for_terminal(
+            str(aggregation.get("summary") or "").strip(), max_len=120)
         if summary:
-            print(f"   Aggregate synthesis: {summary[:120]}{'...' if len(summary) > 120 else ''}")
+            print(f"   Aggregate synthesis: {summary}")
     from core.reporting import (
         FINDINGS_COLUMNS,
         build_findings_rows,
@@ -4313,20 +6904,27 @@ Examples:
     )
     from core.reporting.formatting import format_elapsed
     print(f"   Duration: {format_elapsed(workflow_duration)}")
+    # Headline cost = orchestration spend + the opt-in pass
+    # subprocesses' recorded spend (--understand / --validate /
+    # --gap-audit each spend real money in their own run dirs; the
+    # headline under-reported by their whole share when used).
+    cost_summary = (orchestration_result or {}).get(
+        "orchestration", {}).get("cost", {})
+    child_costs = _collect_child_pass_costs(
+        prepass_result, postpass_result, audit_postpass)
+    for line in _accounting_console_lines(cost_summary, child_costs):
+        print(sanitise_for_terminal(line))
     if orchestration_result:
-        cost_summary = orchestration_result.get("orchestration", {}).get("cost", {})
-        cost = cost_summary.get("total_cost", 0)
-        if cost > 0:
-            thinking = cost_summary.get("thinking_tokens", 0)
-            cost_str = f"   Cost: ${cost:.2f}"
-            if thinking > 0:
-                cost_str += f" ({thinking:,} thinking tokens)"
-            print(cost_str)
-            # Per-model breakdown if multiple models used
-            by_model = cost_summary.get("cost_by_model", {})
-            if len(by_model) > 1:
-                for model, mcost in by_model.items():
-                    print(f"     {model}: ${mcost:.2f}")
+        dispatch_health = _dispatch_failure_summary(
+            orchestration_result.get("orchestration", {}),
+        )
+        if dispatch_health["failed"] or dispatch_health["not_run"]:
+            details = "; ".join(dispatch_health["details"])
+            print(sanitise_for_terminal(
+                "   ⚠️  Incomplete LLM task work retained alongside "
+                f"successful results — {details}",
+                max_len=500,
+            ))
         # Fast-tier scorecard savings — surface concrete behaviour
         # of the prefilter (full ANALYSE calls skipped on findings
         # the cheap tier confidently classified as FPs and the
@@ -4349,10 +6947,6 @@ Examples:
         print(f"   Exploits: {autonomous_out / 'exploits'}/")
     if patches_count > 0 and autonomous_out:
         print(f"   Patches: {autonomous_out / 'patches'}/")
-
-    # Filter to analysed results (used by both console table and report)
-    results = orchestration_result.get("results", []) if orchestration_result else []
-    analysed_results = [r for r in results if "is_true_positive" in r or "error" in r]
 
     # Results at a Glance table (matches /validate console output)
     if orchestration_result:  # noqa: SIM102
@@ -4383,15 +6977,43 @@ Examples:
     # reason. Mirror that asymmetry away.
     if not args.codeql_only and semgrep_metrics:
         print("   ✓ Scanned with Semgrep")
+    elif tool_states["semgrep"].get("failed"):
+        print(
+            "   ⚠️  Semgrep failed — "
+            f"{tool_states['semgrep'].get('failure_reason', 'unknown failure')}"
+        )
     if codeql_metrics:
         print("   ✓ Scanned with CodeQL")
-        if codeql_metrics.get('total_findings', 0) > 0:
+        if analysis.get("dataflow_validated", 0) > 0:
             print("   ✓ Validated dataflow paths")
+    elif tool_states["codeql"].get("failed"):
+        print(
+            "   ⚠️  CodeQL failed — "
+            f"{tool_states['codeql'].get('failure_reason', 'unknown failure')}"
+        )
     if sca_metrics:
         print(f"   ✓ Analysed {sca_metrics.get('deps_analysed', 0)} dependencies (SCA)")
+    elif sca_result:
+        print(f"   ✓ Analysed {sca_result.deps_analysed} dependencies (SCA)")
+    elif tool_states["sca"].get("failed"):
+        print(
+            "   ⚠️  SCA failed — "
+            f"{tool_states['sca'].get('failure_reason', 'unknown failure')}"
+        )
     if validation_result:
         print("   ✓ Deduplicated findings")
-    print("   ✓ Analysed vulnerabilities")
+    if assessment.get("status") == "complete":
+        print(
+            f"   ✓ Assessed all {assessment.get('eligible', 0)} eligible "
+            "findings"
+        )
+    else:
+        print(
+            f"   ⚠️  Assessment partial — "
+            f"{assessment.get('analyzed', 0)} of "
+            f"{assessment.get('eligible', 0)} eligible findings analyzed; "
+            f"{assessment.get('unreviewed', 0)} unreviewed"
+        )
     if exploits_count > 0:
         print(f"   ✓ Generated {exploits_count} exploit{'s' if exploits_count != 1 else ''}")
     if patches_count > 0:
@@ -4433,9 +7055,16 @@ Examples:
         via = None
 
     pipeline_parts = ["Threat Model"] if threat_model_phase.get("completed") else []
-    pipeline_parts.append("Scan")
-    if sca_metrics:
+    scan_label = {
+        "failed": "Scan (failed)",
+        "partial": "Scan (partial)",
+        "skipped": "Scan (skipped)",
+    }.get(scan_phase_status, "Scan")
+    pipeline_parts.append(scan_label)
+    if tool_states["sca"].get("completed"):
         pipeline_parts.append("SCA")
+    elif tool_states["sca"].get("failed"):
+        pipeline_parts.append("SCA (failed)")
     if validation.get("completed"):
         pipeline_parts.append("Dedup")
     if analysed_count > 0:
@@ -4449,6 +7078,15 @@ Examples:
         "Target": f"`{final_report.get('repository', 'unknown')}`",
         "Date": final_report.get("timestamp", "unknown")[:10],
         "Pipeline": f"{' → '.join(pipeline_parts)} ({format_elapsed(duration)})",
+        "Execution": str(
+            run_result.get("pipeline_execution", "failed")
+        ).title(),
+        "Assessment": (
+            f"{str(assessment.get('status', 'partial')).title()} — "
+            f"{assessment.get('analyzed', 0)}/"
+            f"{assessment.get('eligible', 0)} eligible findings analyzed; "
+            f"{assessment.get('unreviewed', 0)} unreviewed"
+        ),
     }
     if via:
         metadata["Model"] = via
@@ -4460,17 +7098,38 @@ Examples:
         extra_summary["Unchecked flows"] = threat_model_phase.get("unchecked_flows", 0)
     extra_summary["Total findings"] = scanning.get("total_findings", 0)
     semgrep = scanning.get("semgrep", {})
-    if semgrep.get("enabled"):
+    if semgrep.get("completed"):
         extra_summary["Semgrep"] = semgrep.get("findings", 0)
+    elif semgrep.get("failed"):
+        extra_summary["Semgrep"] = (
+            f"Failed — {semgrep.get('failure_reason', 'unknown failure')}"
+        )
     codeql = scanning.get("codeql", {})
-    if codeql.get("enabled"):
+    if codeql.get("completed"):
         extra_summary["CodeQL"] = codeql.get("findings", 0)
-    if sca_findings_count:
-        extra_summary["SCA"] = sca_findings_count
+    elif codeql.get("failed"):
+        extra_summary["CodeQL"] = (
+            f"Failed — {codeql.get('failure_reason', 'unknown failure')}"
+        )
+    if tool_states["sca"].get("completed"):
+        extra_summary["SCA"] = tool_states["sca"].get("findings", 0)
+    elif tool_states["sca"].get("failed"):
+        extra_summary["SCA"] = (
+            "Failed — "
+            f"{tool_states['sca'].get('failure_reason', 'unknown failure')}"
+        )
     if validation.get("completed"):
         extra_summary["After deduplication"] = validation.get("validated_findings", 0)
-    if analysed_count > 0:
-        extra_summary["Analysed"] = analysed_count
+    extra_summary["Assessment requested"] = assessment.get("requested", 0)
+    extra_summary["Assessment eligible"] = assessment.get("eligible", 0)
+    extra_summary["Selected for analysis"] = assessment.get("selected", 0)
+    extra_summary["Analysed"] = assessment.get("analyzed", 0)
+    extra_summary["Unreviewed"] = assessment.get("unreviewed", 0)
+    if assessment.get("cap_applied"):
+        extra_summary["Analysis cap"] = (
+            f"{assessment.get('cap')} "
+            f"({assessment.get('cap_reason', 'cap applied')})"
+        )
     if failed_count > 0:
         extra_summary["Failed"] = failed_count
     if blocked_count > 0:
@@ -4479,25 +7138,64 @@ Examples:
         extra_summary["Exploits generated"] = exploits_count
     if patches_count > 0:
         extra_summary["Patches generated"] = patches_count
+    # Same aggregation as the console headline: pass-subprocess spend
+    # joins the route-aware report accounting, with the split stated.
     cost_summary = orch_phase.get("cost", {})
-    cost = cost_summary.get("total_cost", 0)
-    if cost > 0:
-        extra_summary["Cost"] = f"${cost:.2f}"
+    accounting_text = _format_report_accounting(
+        cost_summary, child_costs,
+    )
+    if accounting_text:
+        extra_summary["Cost"] = accounting_text
     if aggregation:
         aggregate_model = aggregation.get("analysed_by")
         extra_summary["Aggregate synthesis"] = aggregate_model or "completed"
+    dispatch_health = _dispatch_failure_summary(orch_phase)
+    if dispatch_health["failed"] or dispatch_health["not_run"]:
+        extra_summary["Incomplete LLM task work"] = (
+            f"{dispatch_health['failed']} failed, "
+            f"{dispatch_health['not_run']} not run"
+        )
 
     # Warnings
     warnings = []
+    if run_result.get("failed"):
+        warnings.extend(
+            f"Failed result: {reason}"
+            for reason in run_result.get("failure_reasons", [])
+        )
+    elif run_result.get("partial"):
+        warnings.extend(
+            f"Partial result: {reason}"
+            for reason in run_result.get("partial_reasons", [])
+        )
     if severity_mismatches:
         warnings.append(f"{len(severity_mismatches)} high-severity finding(s) ruled as false positive — review recommended")
     if contradictions > 0:
         warnings.append(f"{contradictions} self-contradictory verdict(s) — reasoning conflicts with conclusion")
+    from core.run.gaps import gap_summary as _report_gap_summary
+    _report_gaps = _report_gap_summary(out_dir)
+    if _report_gaps:
+        _rg_total = sum(_report_gaps.values())
+        _rg_desc = ", ".join(
+            f"{n} {reason}"
+            for reason, n in sorted(_report_gaps.items())
+        )
+        warnings.append(
+            f"{_rg_total} analysis-gap record(s) — files NOT analysed "
+            f"({_rg_desc}); see analysis-gaps.jsonl"
+        )
     if orch_phase.get("weakened_defenses"):
         warnings.append(
             "Model-dependent defenses disabled (--accept-weakened-defenses). "
             "Envelope tags, datamarking, and base64 wrapping were not applied. "
             "Findings may be influenced by adversarial content in the target."
+        )
+    if dispatch_health["failed"] or dispatch_health["not_run"]:
+        details = "; ".join(dispatch_health["details"])
+        warnings.append(
+            "Incomplete LLM review/enrichment work was retained despite "
+            f"successful final findings: {details}. See "
+            "orchestrated_report.json::orchestration.dispatch_batches."
         )
 
     # Output files — significant outputs only, not per-category SARIF
@@ -4533,7 +7231,7 @@ Examples:
         output_files.append(sarif_files[0])
     output_files.append("agentic-report.md")
 
-    extra_sections = []
+    extra_sections = [_build_tool_execution_report_section(tool_states)]
     if audit_postpass.get("enabled"):
         extra_sections.append(_build_audit_report_section(
             audit_postpass,
@@ -4576,11 +7274,10 @@ Examples:
     except Exception:
         logger.debug("diagram rendering failed", exc_info=True)
 
-    # Mark run as completed
+    # Persist lifecycle state according to the aggregate exit contract.
     try:
-        from core.run import complete_run
         orch_meta = (orchestration_result or {}).get("orchestration", {})
-        complete_run(out_dir, extra={
+        lifecycle_extra = {
             "findings_count": analysed_count,
             "exploitable_count": exploitable_count,
             "duration_seconds": round(workflow_duration, 1),
@@ -4588,12 +7285,56 @@ Examples:
             "analysis_models": orch_meta.get("analysis_models", []),
             "aggregate_models": orch_meta.get("aggregate_models", []),
             "aggregated": orch_meta.get("aggregated", False),
-        }, manifest=_build_completion_manifest(
-            orch_meta, import_result, import_sarif_files,
-            reanalyze_dir=getattr(args, "reanalyze", None),
-        ))
+            **_completion_partial_metadata(
+                run_result,
+                assessment,
+                tool_states,
+            ),
+        }
+        if copilot_native_manifest is not None:
+            from core.run.metadata import interrupt_run
+            interrupt_run(
+                out_dir,
+                reason="awaiting host-managed Copilot analysis",
+                extra={
+                    **lifecycle_extra,
+                    "copilot_native_manifest": str(
+                        copilot_native_manifest,
+                    ),
+                    "copilot_native_context_request": (
+                        str(copilot_native_context.request_path)
+                        if copilot_native_context is not None
+                        else None
+                    ),
+                    "result_status": "prepared",
+                },
+                expected_command="agentic",
+            )
+        else:
+            _finalize_run_lifecycle(
+                out_dir,
+                run_result,
+                extra=lifecycle_extra,
+                manifest=_build_completion_manifest(
+                    orch_meta, import_result, import_sarif_files,
+                    reanalyze_dir=getattr(args, "reanalyze", None),
+                ),
+            )
     except Exception as e:  # noqa: BLE001
         logger.debug("Run metadata: %s", e)  # Optional — don't fail the pipeline
+
+    # End-of-run digest — the ranked "what matters" view over the
+    # completed run's artifacts (verified first, then
+    # exploitable-unverified, suppressions, coverage, next steps).
+    # One call site; the reader/renderer live in core/run/digest.py
+    # (shared with raptor-run-status and `raptor-review digest`).
+    # Renderer output is already escaped at render.
+    try:
+        from core.run.digest import read_run_digest, render_run_digest
+        print()
+        print(render_run_digest(read_run_digest(out_dir)))
+    except Exception:  # noqa: BLE001 — a digest failure must not fail the pipeline
+        logger.debug("end-of-run digest failed", exc_info=True)
 
     # Clean up temporary git copy (if we created one for a non-git target)
     if _git_temp_dir and _git_temp_dir.exists():
@@ -4604,11 +7345,10 @@ Examples:
         except Exception as e:  # noqa: BLE001
             logger.debug("Failed to clean temp git dir: %s", e)
 
-    # Successful end of the full pipeline: the run was marked complete
-    # above, in-band hard failures already called sys.exit(1)/return 2.
-    # ``main`` feeds ``sys.exit(main())`` — the exit code must be an
-    # explicit int, not an implicit-None fallthrough.
-    return 0
+    # Complete and usable-partial reports exit 0. An all-requested-scanners
+    # failure persists its diagnostic report + failed lifecycle and exits 1.
+    # CLI/configuration misuse remains exit 2 at the earlier guards.
+    return int(run_result.get("exit_code", 1))
 
 
 #: Cap on gap-audit finding rows inlined into the agentic report —
@@ -4741,8 +7481,9 @@ def _estimate_review_residual(out_dir: Path) -> tuple | None:
     subdirs). An estimate, not the audit's gap computation — good
     enough to say "most of the inventory was never reviewed".
     """
-    checklist = load_json(out_dir / "checklist.json")
-    if not isinstance(checklist, dict):
+    from core.inventory import read_checklist
+    checklist = read_checklist(out_dir)
+    if not checklist:
         return None
     total = 0
     for file_info in checklist.get("files", []) or []:
@@ -5024,7 +7765,56 @@ def _postprocess_findings(results) -> None:
     check_self_contradiction(by_id)
 
 
-if __name__ == "__main__":
+def _safe_exc_detail(e: BaseException) -> str:
+    """Reason string for the backstop.
+
+    A raising ``__str__`` on the escaping exception must not defeat
+    the marker write — fall back to the bare type name.
+    """
+    try:
+        return f"uncaught {type(e).__name__}: {e}"
+    except Exception:  # noqa: BLE001 — hostile/broken __str__
+        return f"uncaught {type(e).__name__}"
+
+
+def _backstop_lifecycle(kind: str, detail: str) -> None:
+    """Close this process's lifecycle marker from the entry point.
+
+    Only fires when ``main`` armed ``_LIFECYCLE_OUT_DIR`` (start_run
+    succeeded) AND the marker still reads "running" — a phase that
+    already closed the run with a specific reason (e.g.
+    ``_fail_run_and_exit`` before its ``sys.exit(1)``) must not have
+    it clobbered by the generic backstop text. Best-effort — a marker
+    failure must never mask the original exception.
+    """
+    if _LIFECYCLE_OUT_DIR is None:
+        return
+    with contextlib.suppress(Exception):
+        from core.run.metadata import RUN_METADATA_FILE, STATUS_RUNNING
+        meta = load_json(Path(_LIFECYCLE_OUT_DIR) / RUN_METADATA_FILE)
+        if (isinstance(meta, dict)
+                and meta.get("status") not in (None, STATUS_RUNNING)):
+            return
+        if kind == "cancelled":
+            from core.run import cancel_run
+            cancel_run(_LIFECYCLE_OUT_DIR)
+        else:
+            from core.run import fail_run
+            fail_run(_LIFECYCLE_OUT_DIR, detail)
+
+
+def _cli_entry() -> NoReturn:
+    """Entry point with the lifecycle backstop.
+
+    Pre-fix only SandboxSetupError was handled: any other uncaught
+    exception (a phase raising), a bare ``sys.exit(N)``, a
+    non-Exception ``BaseException``, or a Ctrl-C propagated out with
+    the run marker still at "running" — /project status, the live-run
+    contention gate, and stale-run tooling then treated the dir as a
+    live run forever. Mirror raptor.py's wrapper: fail_run on crash
+    or nonzero exit, cancel_run on interrupt (the lifecycle vocabulary
+    for an operator-stopped run), keeping the established exit codes.
+    """
     try:
         sys.exit(main())
     except SandboxSetupError as e:
@@ -5034,4 +7824,29 @@ if __name__ == "__main__":
             f"\nRAPTOR: run aborted — sandbox isolation could not engage.\n{e}",
             file=sys.stderr,
         )
+        _backstop_lifecycle(
+            "failed", "sandbox isolation could not engage")
         sys.exit(SANDBOX_ENGAGE_EXIT_CODE)
+    except KeyboardInterrupt:
+        print("\n\nInterrupted by user", file=sys.stderr)
+        _backstop_lifecycle("cancelled", "")
+        sys.exit(130)
+    except SystemExit as e:
+        # A bare sys.exit(N) deep in a phase (ours or a library's)
+        # otherwise sailed through this handler chain with the marker
+        # still "running". SystemExit(0)/None is the success path —
+        # untouched; the running-only guard in the backstop keeps
+        # already-stamped specific reasons (e.g. _fail_run_and_exit)
+        # from being overwritten by this generic one.
+        if e.code is not None and e.code != 0:
+            _backstop_lifecycle("failed", f"exited with code {e.code!r}")
+        raise
+    except BaseException as e:
+        # Exception AND the non-Exception BaseExceptions (GeneratorExit,
+        # BaseExceptionGroup, ...) — anything escaping closes the marker.
+        _backstop_lifecycle("failed", _safe_exc_detail(e))
+        raise
+
+
+if __name__ == "__main__":
+    _cli_entry()

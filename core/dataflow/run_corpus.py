@@ -25,6 +25,7 @@ from core.dataflow.label import (
     VERDICT_TRUE_POSITIVE,
 )
 from core.dataflow.validator import TrivialValidator, Validator, ValidatorVerdict
+from core.source import read_text_capped
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -46,14 +47,32 @@ CSV_HEADER: list[str] = [
 ]
 
 
+def _read_corpus_json(path: Path) -> str:
+    """Capped read of one corpus record; loud failure.
+
+    Corpus rows are measurement input — a silently skipped or
+    truncated row skews every rate computed downstream, so unreadable
+    and over-cap both refuse instead of degrading.
+    """
+    got = read_text_capped(path)
+    if got is None:
+        msg = f"corpus record unreadable: {path}"
+        raise OSError(msg)
+    text, truncated = got
+    if truncated:
+        msg = f"corpus record over the read cap: {path}"
+        raise OSError(msg)
+    return text
+
+
 def iter_corpus(corpus_dir: Path) -> Iterable[tuple[Finding, GroundTruth]]:
     """Yield ``(finding, label)`` for every paired entry in the corpus dir."""
     for fp in sorted(corpus_dir.glob("*.json")):
         if fp.name.endswith(".label.json"):
             continue
-        finding = Finding.from_json(fp.read_text(encoding="utf-8"))
+        finding = Finding.from_json(_read_corpus_json(fp))
         label_path = fp.with_suffix(".label.json")
-        label = GroundTruth.from_json(label_path.read_text(encoding="utf-8"))
+        label = GroundTruth.from_json(_read_corpus_json(label_path))
         yield finding, label
 
 
@@ -151,6 +170,25 @@ def main(argv: list[str] | None = None) -> int:
     if not args.corpus_dir.is_dir():
         print(f"corpus dir not found: {args.corpus_dir}", file=sys.stderr)
         return 2
+
+    # Labels are written against exact upstream commits: any pinned
+    # fixture clone that IS present must sit at its SOURCES.md pin
+    # before the runner proceeds (absent clones are fine — in-tree
+    # fixtures need none). A drifted clone silently mis-scores every
+    # validator measured against the corpus.
+    from core.dataflow.corpus_sources import (
+        CorpusPinError,
+        verify_present_pinned_clones,
+    )
+    try:
+        verified = verify_present_pinned_clones()
+    except CorpusPinError as exc:
+        print(f"corpus fixture pin verification failed: {exc}",
+              file=sys.stderr)
+        return 2
+    for src_name in verified:
+        print(f"fixture clone verified at pin: {src_name}",
+              file=sys.stderr)
 
     validator: Validator = (
         load_validator(args.validator) if args.validator else TrivialValidator()

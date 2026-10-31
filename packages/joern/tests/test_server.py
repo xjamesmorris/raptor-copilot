@@ -5,17 +5,37 @@ from __future__ import annotations
 import base64
 import gc
 import sys
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from packages.joern.server import (
+    _LEASE_MISMATCH,
+    _LEASE_VAL,
+    _LEASE_CONFLICT_ERROR,
     JoernServer,
     _find_free_port,
     _repl_bridge_path,
     _server_auth_supported,
 )
 from packages.joern.tunables import JoernTunables
+
+
+@pytest.fixture(autouse=True)
+def _heap_ledger_in_tmp(tmp_path: Path,
+                        monkeypatch: pytest.MonkeyPatch) -> None:
+    """In-file twin of the suite conftest's _isolated_heap_ledger:
+    release archives strip conftest.py (export-ignore), and a start()
+    with an explicit heap_mb then reserves against — rewrites and
+    evicts rows in — the operator's real
+    ~/.local/share/raptor/joern-heap-ledger.json, the live host-wide
+    heap arbitration state. The pin must travel with the file."""
+    from packages.joern import heap_ledger
+    monkeypatch.setattr(
+        heap_ledger, "_LEDGER_PATH", tmp_path / "heap-ledger.json",
+    )
+    monkeypatch.setattr(heap_ledger, "_host_budget_mb", lambda: 1 << 24)
 
 
 class TestFindFreePort:
@@ -141,6 +161,10 @@ class TestJoernServerQuery:
 
         mock_proc = MagicMock()
         mock_proc.poll.return_value = 1  # process exited
+        # A real (but inert, beyond pid_max) pid: the handle is GC'd
+        # after the test and __del__ → stop() → group verification
+        # would otherwise walk a MagicMock pgid into the kill ladder.
+        mock_proc.pid = 2_000_000_000
         srv._proc = mock_proc
 
         result = srv.query("cpg.method.l")
@@ -329,6 +353,46 @@ class TestJoernServerRunTaintQuery:
         assert flows == []
 
 
+class TestRunTaintQueriesBatchErrorsOut:
+    """The batch API honours run_taint_query's errors_out contract."""
+
+    def _server(self, result):
+        srv = JoernServer()
+        srv._cpg_loaded = True
+        srv.query = lambda q, **kw: result  # instance seam
+        return srv
+
+    def test_errors_forwarded_to_errors_out(self):
+        from packages.joern.models import JoernResult
+
+        srv = self._server(
+            JoernResult(query="q", errors=["timeout (async poll)"]),
+        )
+        errors_out: list[str] = []
+        flows = srv.run_taint_queries_batch(
+            [("src_fn", "sink_fn")], errors_out=errors_out,
+        )
+        assert flows == []
+        assert errors_out == ["timeout (async poll)"]
+
+    def test_clean_batch_leaves_errors_out_empty(self):
+        from packages.joern.models import JoernResult, TaintFlow
+
+        flow = TaintFlow(
+            source_method="src_fn", source_param="p0",
+            sink_call="sink_fn", sink_arg_idx=0,
+        )
+        srv = self._server(
+            JoernResult(query="q", flows=[flow], raw_output="ok"),
+        )
+        errors_out: list[str] = []
+        flows = srv.run_taint_queries_batch(
+            [("src_fn", "sink_fn")], errors_out=errors_out,
+        )
+        assert len(flows) == 1
+        assert errors_out == []
+
+
 class TestJoernServerContextManager:
     @patch.object(JoernServer, "start")
     @patch.object(JoernServer, "stop")
@@ -422,7 +486,7 @@ class TestJoernServerZGCFlags:
         def fake_popen(cmd, **kwargs):
             captured_cmd.extend(cmd)
             mock_proc = MagicMock()
-            mock_proc.pid = 12345
+            mock_proc.pid = 2_000_000_000  # inert: beyond pid_max
             mock_proc.poll.return_value = None
             mock_proc.stderr = MagicMock()
             mock_proc.wait = MagicMock()
@@ -473,7 +537,7 @@ class TestJoernServerZGCFlags:
         def fake_popen(cmd, **kwargs):
             captured_env.update(kwargs.get("env") or {})
             mock_proc = MagicMock()
-            mock_proc.pid = 12345
+            mock_proc.pid = 2_000_000_000  # inert: beyond pid_max
             mock_proc.poll.return_value = None
             mock_proc.stderr = MagicMock()
             mock_proc.wait = MagicMock()
@@ -522,7 +586,7 @@ class TestJoernServerZGCFlags:
         def fake_popen(cmd, **kwargs):
             launches.append(list(cmd))
             mock_proc = MagicMock()
-            mock_proc.pid = 12345
+            mock_proc.pid = 2_000_000_000  # inert: beyond pid_max
             # First launch: dead process; second: alive.
             mock_proc.poll.return_value = 1 if len(launches) == 1 else None
             mock_proc.stderr = MagicMock()
@@ -828,7 +892,7 @@ class TestJoernServerIsolatedWorkspace:
         def fake_popen(cmd, **kwargs):
             captured.update(kwargs)
             mock_proc = MagicMock()
-            mock_proc.pid = 12345
+            mock_proc.pid = 2_000_000_000  # inert: beyond pid_max
             mock_proc.poll.return_value = None
             mock_proc.stderr = MagicMock()
             mock_proc.wait = MagicMock()
@@ -908,7 +972,7 @@ class TestJoernServerAuth:
         def fake_popen(cmd, **kwargs):
             captured_cmd.extend(cmd)
             mock_proc = MagicMock()
-            mock_proc.pid = 12345
+            mock_proc.pid = 2_000_000_000  # inert: beyond pid_max
             mock_proc.poll.return_value = None
             mock_proc.stderr = MagicMock()
             mock_proc.wait = MagicMock()
@@ -1009,11 +1073,12 @@ class TestJoernServerAuth:
         srv = self._authed_server()
         stub_httpx = MagicMock()
         client = stub_httpx.Client.return_value
-        client.post.return_value.json.return_value = {"success": True}
+        stream_resp = client.stream.return_value.__enter__.return_value
+        stream_resp.iter_bytes.return_value = iter([b'{"success": true}'])
         with patch("packages.joern.server._httpx", stub_httpx):
             data = srv._post_sync("1+1", timeout=5)
         assert data == {"success": True}
-        headers = client.post.call_args.kwargs["headers"]
+        headers = client.stream.call_args.kwargs["headers"]
         assert headers["Authorization"] == self._expected_header(srv)
 
     def test_post_async_sends_authorization_header(self):
@@ -1108,3 +1173,272 @@ class TestHasScalaError:
         assert not _has_scala_error(
             'res1: String = "handler for error: timeout"'
         )
+
+
+class TestTieredSweepSinkEscaping:
+    def test_profile_sinks_escaped_into_the_list_literal(self):
+        from types import SimpleNamespace
+
+        from packages.joern.models import JoernResult
+        srv = JoernServer()
+        srv._cpg_loaded = True
+        captured: dict = {}
+        profile = SimpleNamespace(
+            sinks=('bad"sink',), max_call_depth=2,
+            max_args_to_allow=8, max_output_args_expansion=4,
+        )
+        with patch.object(
+            srv, "_submit_query",
+            side_effect=lambda content, **kw: captured.update(
+                content=content) or JoernResult(query="q"),
+        ):
+            srv.run_tiered_sweep(lang_profile=profile)
+        assert '"bad\\"sink"' in captured["content"]
+        assert 'bad"sink' not in captured["content"].replace(
+            'bad\\"sink', "")
+
+
+class TestTaintExistsErrorsChannel:
+    def test_degraded_query_reports_errors(self):
+        from packages.joern.models import JoernResult
+        srv = JoernServer()
+        srv._cpg_loaded = True
+        errors: list = []
+        with patch.object(
+            srv, "query",
+            return_value=JoernResult(query="q", errors=["query failed: x"]),
+        ):
+            assert srv.run_taint_exists_query(
+                "src_fn", "sink_fn", errors_out=errors) is False
+        assert errors == ["query failed: x"]
+
+    def test_true_flow_stays_true_with_channel(self):
+        from packages.joern.models import JoernResult
+        srv = JoernServer()
+        srv._cpg_loaded = True
+        errors: list = []
+        with patch.object(
+            srv, "query",
+            return_value=JoernResult(query="q",
+                                     raw_output="JOERN_EXISTS:true"),
+        ):
+            assert srv.run_taint_exists_query(
+                "src_fn", "sink_fn", errors_out=errors) is True
+        assert errors == []
+
+
+class TestGraphIdentityLease:
+    """Shared-server graph-swap defence: every import declares a
+    per-import lease val in the same compilation unit, every query
+    prepends a require on this handle's nonce, and a detected swap
+    pays one bounded re-import instead of returning evidence about a
+    sibling session's graph."""
+
+    def _cpg_file(self, tmp_path):
+        p = tmp_path / "cpg.bin"
+        p.write_bytes(b"stub")
+        return p
+
+    def _recording_post(self, responses):
+        posted = []
+
+        def fake(self_srv, query_str, *, timeout=30):
+            posted.append(query_str)
+            return responses.pop(0)
+
+        return posted, fake
+
+    # import_cpg consumes exactly three posts: the import+lease
+    # compilation unit, the cpg-binding probe, and the dataflow
+    # warmup (the second warmup in TestJoernServerImportCpg's
+    # fixtures belongs to start()'s _warmup_imports, never reached
+    # through import_cpg).
+    _IMPORT_OK = [
+        {"success": True, "stdout": "workspace..."},   # import unit
+        {"success": True, "stdout": 'val res0: String = "42"'},
+        {"success": True, "stdout": "warmup"},
+    ]
+
+    def test_import_declares_lease_in_import_unit(self, tmp_path):
+        srv = JoernServer()
+        srv._base_url = "http://127.0.0.1:9999"
+        posted, fake = self._recording_post(list(self._IMPORT_OK))
+        with patch.object(JoernServer, "_post_sync", fake):
+            assert srv.import_cpg(self._cpg_file(tmp_path)) is True
+        assert 'importCpg("' in posted[0]
+        assert f'val {_LEASE_VAL} = "' in posted[0]
+        assert srv._graph_lease is not None
+        # The nonce the handle remembers is the one the unit declared.
+        assert f'val {_LEASE_VAL} = "{srv._graph_lease}"' in posted[0]
+
+    def test_query_prepends_guard_and_keeps_original_query(self):
+        srv = JoernServer()
+        srv._base_url = "http://127.0.0.1:9999"
+        srv._cpg_loaded = True
+        srv._graph_lease = "aa" * 16
+        posted, fake = self._recording_post(
+            [{"success": True, "stdout": "val res0: Int = 1"}])
+        with patch.object(JoernServer, "_post_sync", fake):
+            result = srv.query("cpg.method.name.l")
+        assert posted[0].startswith(
+            f'require({_LEASE_VAL} == "{"aa" * 16}", "{_LEASE_MISMATCH}")\n')
+        assert posted[0].endswith("cpg.method.name.l")
+        assert result.query == "cpg.method.name.l"
+        assert not result.errors
+
+    def test_query_without_lease_runs_unguarded(self):
+        # Pre-lease compatibility (direction two): a handle that never
+        # imported (or a lifecycle-reused server loaded by an old
+        # RAPTOR) posts the query verbatim, exactly as before.
+        srv = JoernServer()
+        srv._base_url = "http://127.0.0.1:9999"
+        srv._cpg_loaded = True
+        posted, fake = self._recording_post(
+            [{"success": True, "stdout": "val res0: Int = 1"}])
+        with patch.object(JoernServer, "_post_sync", fake):
+            srv.query("cpg.method.name.l")
+        assert posted[0] == "cpg.method.name.l"
+
+    def test_swap_classifier_matches_thrown_forms_only(self):
+        thrown = ("java.lang.IllegalArgumentException: requirement "
+                  f"failed: {_LEASE_MISMATCH}")
+        assert JoernServer._lease_swapped(thrown, "") is True
+        assert JoernServer._lease_swapped("", thrown) is True
+        # A sibling running a pre-lease RAPTOR imported without
+        # declaring the val at all.
+        assert JoernServer._lease_swapped(
+            f"-- [E006] Not Found Error: Not found: {_LEASE_VAL}", "",
+        ) is True
+        # An ordinary compile error can ECHO the guard line; the bare
+        # marker must not classify as a swap or every such error pays
+        # a re-import.
+        echo = (f'require({_LEASE_VAL} == "ab", "{_LEASE_MISMATCH}")\n'
+                "-- [E006] Not Found Error: Not found: cpgg")
+        assert JoernServer._lease_swapped(echo, "") is False
+        assert JoernServer._lease_swapped("val res0: Int = 1", "") is False
+
+    def test_swap_classifier_ignores_record_line_payloads(self):
+        # Record/sentinel lines carry the SCANNED repo's own text: a
+        # target file containing the thrown-form string verbatim must
+        # not classify every query on it as a swap (each false swap
+        # costs a full re-import, and the cap then kills the tier).
+        payload = (
+            "JOERN_FLOW:src/evil.c:12:parse|"
+            "log(\"requirement failed: "
+            f"{_LEASE_MISMATCH}\")"
+        )
+        assert JoernServer._lease_swapped(payload, "") is False
+        assert JoernServer._lease_swapped(
+            f"METHOD_SUMMARY:handler|Not found: {_LEASE_VAL}", "",
+        ) is False
+        # ...while a genuine thrown form alongside record output
+        # still classifies.
+        mixed = (
+            "JOERN_FLOW:src/ok.c:3:f|snippet\n"
+            "java.lang.IllegalArgumentException: requirement "
+            f"failed: {_LEASE_MISMATCH}"
+        )
+        assert JoernServer._lease_swapped(mixed, "") is True
+
+    def test_swap_recovers_reimports_and_retries_once(self, tmp_path):
+        srv = JoernServer()
+        srv._base_url = "http://127.0.0.1:9999"
+        posted, fake = self._recording_post(list(self._IMPORT_OK) + [
+            # attempt 0: sibling swapped the graph — guard fired
+            {"success": False,
+             "stderr": ("java.lang.IllegalArgumentException: "
+                        f"requirement failed: {_LEASE_MISMATCH}")},
+        ] + list(self._IMPORT_OK) + [
+            # attempt 1 under the fresh lease
+            {"success": True, "stdout": "val res0: Int = 7"},
+        ])
+        with patch.object(JoernServer, "_post_sync", fake):
+            assert srv.import_cpg(self._cpg_file(tmp_path)) is True
+            first_lease = srv._graph_lease
+            result = srv.query("cpg.method.name.l")
+        assert not result.errors
+        assert srv._lease_reimports == 1
+        assert srv._graph_lease != first_lease
+        # The retry was guarded with the NEW nonce.
+        assert posted[-1].startswith(
+            f'require({_LEASE_VAL} == "{srv._graph_lease}"')
+
+    def test_reimport_cap_degrades_loudly_then_fails_fast(self, tmp_path):
+        from packages.joern.server import _LEASE_REIMPORT_CAP
+
+        srv = JoernServer()
+        srv._base_url = "http://127.0.0.1:9999"
+        posted, fake = self._recording_post(list(self._IMPORT_OK) + [
+            {"success": False,
+             "stderr": ("java.lang.IllegalArgumentException: "
+                        f"requirement failed: {_LEASE_MISMATCH}")},
+        ])
+        with patch.object(JoernServer, "_post_sync", fake):
+            assert srv.import_cpg(self._cpg_file(tmp_path)) is True
+            srv._lease_reimports = _LEASE_REIMPORT_CAP  # cap consumed
+            result = srv.query("cpg.method.name.l")
+            n_posted = len(posted)
+            # Degraded: later queries fail fast without posting.
+            result2 = srv.query("cpg.method.name.l")
+        assert result.errors == [_LEASE_CONFLICT_ERROR]
+        assert srv._lease_exhausted is True
+        assert result2.errors == [_LEASE_CONFLICT_ERROR]
+        assert len(posted) == n_posted
+
+    def test_ordinary_failure_does_not_reimport(self, tmp_path):
+        srv = JoernServer()
+        srv._base_url = "http://127.0.0.1:9999"
+        posted, fake = self._recording_post(list(self._IMPORT_OK) + [
+            {"success": False, "stderr": "value foo is not a member"},
+        ])
+        with patch.object(JoernServer, "_post_sync", fake):
+            assert srv.import_cpg(self._cpg_file(tmp_path)) is True
+            result = srv.query("cpg.method.foo.l")
+        assert result.errors
+        assert srv._lease_reimports == 0
+
+    def test_close_workspace_clears_lease(self):
+        srv = JoernServer()
+        srv._cpg_loaded = True
+        srv._graph_lease = "bb" * 16
+        with patch.object(JoernServer, "_post_sync",
+                          return_value={"success": True}):
+            srv.close_workspace()
+        assert srv._graph_lease is None
+
+
+class TestImportRetryAfterServerReplacement:
+    """A sibling session's restart replaces the shared JVM while THIS
+    handle's import is in flight: the import's post dies mid-flight
+    (dead old JVM / new credential on the replacement). The failed
+    import must leave the handle cleanly retryable — no fabricated
+    loaded state, no stale lease — so the caller's ordinary retry
+    against the replacement server succeeds with a fresh lease."""
+
+    def test_failed_import_leaves_handle_cleanly_retryable(
+            self, tmp_path):
+        p = tmp_path / "cpg.bin"
+        p.write_bytes(b"stub")
+        srv = JoernServer()
+        srv._base_url = "http://127.0.0.1:9999"
+
+        responses = [
+            None,  # import unit: transport died under the replacement
+            {"success": True, "stdout": "workspace..."},   # retry unit
+            {"success": True, "stdout": 'val res0: String = "42"'},
+            {"success": True, "stdout": "warmup"},
+        ]
+
+        def fake(self_srv, query_str, *, timeout=30):
+            return responses.pop(0)
+
+        with patch.object(JoernServer, "_post_sync", fake):
+            assert srv.import_cpg(p) is False
+            assert srv._cpg_loaded is False
+            assert srv._graph_lease is None
+            epoch = srv._cpg_load_epoch
+
+            assert srv.import_cpg(p) is True
+        assert srv._cpg_loaded is True
+        assert srv._graph_lease is not None
+        assert srv._cpg_load_epoch == epoch + 1

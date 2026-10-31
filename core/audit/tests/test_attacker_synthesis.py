@@ -124,9 +124,14 @@ class TestGroupByReachability:
             "entry_points": [
                 {"file": "main.c", "name": "handle_request"},
             ],
-            "call_edges": {
-                "main.c:handle_request": ["a.c:parse", "a.c:validate"],
-            },
+            # Real producer shape (enrich_with_call_edges): a LIST of
+            # edge dicts, composite-keyed at the consumer.
+            "call_edges": [
+                {"caller_file": "main.c", "caller": "handle_request",
+                 "callee": "parse", "callee_file": "a.c"},
+                {"caller_file": "main.c", "caller": "handle_request",
+                 "callee": "validate", "callee_file": "a.c"},
+            ],
         }
         outcomes = [
             FakeOutcome(file="a.c", function="parse", status="finding"),
@@ -495,3 +500,152 @@ class TestFormatChainsSummary:
         assert "CHAIN-001" in text
         assert "CHAIN-002" in text
         assert "auth required" in text
+
+
+class TestCrossGroupDedup:
+    """A finding reachable from two entry points lands in both groups
+    — the same (A,B) composition must not mint two chains with fresh
+    CHAIN-nnn ids (attack-chains.json and the report totals
+    double-counted)."""
+
+    _CONTEXT_MAP = {
+        "entry_points": [
+            {"file": "main.c", "name": "handle_request"},
+            {"file": "main.c", "name": "handle_upload"},
+        ],
+        "call_edges": [
+            {"caller_file": "main.c", "caller": "handle_request",
+             "callee": "leak", "callee_file": "a.c"},
+            {"caller_file": "main.c", "caller": "handle_request",
+             "callee": "overflow", "callee_file": "a.c"},
+            {"caller_file": "main.c", "caller": "handle_upload",
+             "callee": "leak", "callee_file": "a.c"},
+            {"caller_file": "main.c", "caller": "handle_upload",
+             "callee": "overflow", "callee_file": "a.c"},
+        ],
+    }
+
+    _OUTCOMES = [
+        FakeOutcome(
+            file="a.c", function="leak", status="finding",
+            review_result={"cwe_class": "CWE-200"},
+        ),
+        FakeOutcome(
+            file="a.c", function="overflow", status="finding",
+            review_result={"cwe_class": "CWE-120"},
+        ),
+    ]
+
+    def test_pair_reachable_from_two_entries_chains_once(self):
+        chains = synthesize_chains(
+            list(self._OUTCOMES), self._CONTEXT_MAP,
+        )
+        pair_chains = [
+            c for c in chains
+            if set(c.finding_keys) == {"a.c:leak", "a.c:overflow"}
+        ]
+        assert len(pair_chains) == 1, [c.chain_id for c in pair_chains]
+
+    def test_single_entry_still_chains(self):
+        # Both directions: dedup must not eat the one legitimate chain.
+        cm = {
+            "entry_points": [{"file": "main.c", "name": "handle_request"}],
+            "call_edges": [
+                {"caller_file": "main.c", "caller": "handle_request",
+                 "callee": "leak", "callee_file": "a.c"},
+                {"caller_file": "main.c", "caller": "handle_request",
+                 "callee": "overflow", "callee_file": "a.c"},
+            ],
+        }
+        chains = synthesize_chains(list(self._OUTCOMES), cm)
+        assert len([
+            c for c in chains
+            if set(c.finding_keys) == {"a.c:leak", "a.c:overflow"}
+        ]) == 1
+
+
+class TestRealProducerContract:
+    """Consumer tests must consume the producer's actual output shape:
+    build call_edges through enrich_with_call_edges over a real
+    checklist and assert the reachability join actually hits."""
+
+    _CHECKLIST = {
+        "files": [
+            {
+                "path": "main.c",
+                "items": [{"name": "handle_request"}],
+                "call_graph": {
+                    "calls": [
+                        {"caller": "handle_request",
+                         "chain": ["parse"]},
+                        {"caller": "handle_request",
+                         "chain": ["validate"]},
+                    ],
+                },
+            },
+            {
+                "path": "a.c",
+                "items": [{"name": "parse"}, {"name": "validate"}],
+            },
+        ],
+    }
+
+    def _context_map(self):
+        from core.orchestration.context_map_callgraph import (
+            enrich_with_call_edges,
+        )
+        context_map = {
+            "entry_points": [
+                {"file": "main.c", "name": "handle_request"},
+            ],
+        }
+        added = enrich_with_call_edges(
+            context_map, checklist=self._CHECKLIST,
+        )
+        assert added == 2
+        return context_map
+
+    def test_group_join_hits_on_producer_edges(self):
+        context_map = self._context_map()
+        outcomes = [
+            FakeOutcome(file="a.c", function="parse", status="finding"),
+            FakeOutcome(file="a.c", function="validate",
+                        status="finding"),
+        ]
+        groups = group_by_reachability(outcomes, context_map)
+        assert any(0 in g and 1 in g for g in groups)
+
+    def test_synthesize_chains_alive_on_producer_edges(self):
+        # End-to-end: the exact call that raised AttributeError on the
+        # producer shape pre-fix (list has no .items) must synthesize.
+        context_map = self._context_map()
+        outcomes = [
+            FakeOutcome(
+                file="a.c", function="parse", status="finding",
+                review_result={"cwe_class": "CWE-200"},
+            ),
+            FakeOutcome(
+                file="a.c", function="validate", status="finding",
+                review_result={"cwe_class": "CWE-120"},
+            ),
+        ]
+        chains = synthesize_chains(outcomes, context_map)
+        assert chains, "chain synthesis dead on real producer edges"
+
+
+class TestReachabilityWalkBounds:
+    def test_deep_caller_chain_does_not_recurse(self):
+        # A hostile call graph can be arbitrarily deep; the walker
+        # must use an explicit stack (a 5000-deep chain blew the
+        # interpreter recursion limit and the consumer's blanket
+        # except turned it into a lost attack-chains.json).
+        from core.audit.attacker_synthesis import _find_reachable_entries
+
+        edges = [
+            {"caller_file": "a.c", "caller": f"f{i}",
+             "callee": f"f{i + 1}", "callee_file": "a.c"}
+            for i in range(5000)
+        ]
+        eps = [{"file": "a.c", "name": "f0"}]
+        out = _find_reachable_entries("a.c:f5000", eps, edges)
+        assert out == ["a.c:f0"]

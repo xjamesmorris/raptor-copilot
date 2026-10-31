@@ -77,9 +77,9 @@ _SANITIZER_FLAG = {
 }
 
 # Exit codes the spawn layers re-encode a failed exec of the TARGET as
-# (shell/util-linux convention, shared by the pid1-shim and the spawn
-# grandchild): 127 file not found, 126 found but not executable, 125
-# the pid1-shim's catch-all exec errno (ETXTBSY, ENOEXEC, ELOOP, ...).
+# (shell/util-linux convention, from the spawn grandchild's exec
+# lane): 127 file not found, 126 found but not executable, 125 the
+# catch-all exec errno (ETXTBSY, ENOEXEC, ELOOP, ...).
 # A run that exits with one of these MAY still be a genuine target
 # outcome — see _spawn_failure_reason for how the ambiguity is bounded.
 _EXEC_FAILURE_RETURNCODES = frozenset({125, 126, 127})
@@ -94,7 +94,7 @@ def _stderr_is_sandbox_diagnostic_only(stderr: object) -> bool:
     """True iff ``stderr`` is empty or carries only the sandbox layer's
     own pre-exec diagnostics: lines prefixed ``sandbox:`` (the
     convention of ``warn_post_fork``, the seccomp preexec, and the
-    pid1-shim's exec-failure line), or the spawn child's
+    spawn layers' exec-failure lines), or the spawn child's
     ``sandbox child failure:`` block (one marker line followed by the
     child's traceback — written before the target's first instruction,
     so the whole block is sandbox-layer by construction). A target
@@ -134,10 +134,10 @@ def _spawn_failure_reason(result: Any) -> str | None:
     "non-deterministic". Silence therefore never vetoes the bounded
     heuristic below — only a category tuple short-circuits.
 
-    The heuristic (status ``None`` or attribute absent — the pid1-shim
-    subprocess lane, the Landlock-only retry, plain subprocess
-    fallbacks — where exec failure is re-encoded as exit 125/126/127
-    with no side channel): a bare 125-127 exit is ambiguous with a
+    The heuristic (status ``None`` or attribute absent — the plain
+    subprocess fallbacks, where exec failure is re-encoded as exit
+    125/126/127 with no side channel): a bare 125-127 exit is
+    ambiguous with a
     target that chooses those codes, so the reclassification is
     bounded to the pre-first-output window. A failed exec happens
     before the target's first instruction, so the child writes NOTHING
@@ -264,7 +264,15 @@ def _finalize(
     """
     executed = len(observed)
     reproduced = executed > 0 and all(o == expected for o in observed)
-    deterministic = bool(observed) and len(set(observed)) == 1
+    # "error" entries are runs whose replay RAISED (infrastructure
+    # noise), not observed target behaviour. They still block
+    # ``reproduced`` (fail-safe: an errored run is not a match), but
+    # they must not read as witness NON-DETERMINISM — that word is
+    # reserved for clean executed runs that disagree — and an all-error
+    # set is not "deterministic" either.
+    non_error = [o for o in observed if o != "error"]
+    errors = executed - len(non_error)
+    deterministic = bool(non_error) and len(set(non_error)) == 1
     excluded_note = (
         f" ({executed}/{n} planned runs executed; the rest were "
         f"spawn-failure exclusions — infrastructure, not outcome "
@@ -280,6 +288,33 @@ def _finalize(
         elif reproduced:
             reason = (
                 f"all {executed} executed runs reproduced {expected!r}"
+                + excluded_note
+            )
+        elif errors and not non_error:
+            reason = (
+                f"inconclusive: every executed run raised an "
+                f"infrastructure error (not outcome evidence; see "
+                f"run_details)" + excluded_note
+            )
+        elif errors and all(o == expected for o in non_error):
+            reason = (
+                f"inconclusive: {len(non_error)} clean run(s) "
+                f"reproduced {expected!r} but {errors} run(s) raised "
+                f"infrastructure errors (see run_details)"
+                + excluded_note
+            )
+        elif errors and deterministic:
+            reason = (
+                f"deterministic but off-target: all clean runs "
+                f"produced {non_error[0]!r}, expected {expected!r}; "
+                f"{errors} infrastructure error(s) (see run_details)"
+                + excluded_note
+            )
+        elif errors:
+            reason = (
+                f"non-deterministic: clean-run outcomes varied "
+                f"({non_error}); {errors} infrastructure error(s) "
+                f"excluded from that judgement (see run_details)"
                 + excluded_note
             )
         elif deterministic:
@@ -539,6 +574,7 @@ def _reproduce_replay(
 
     try:
         from core.config import RaptorConfig
+        from core.sandbox import executable_stage as _executable_stage
         from core.sandbox import run_untrusted as sandbox_run_untrusted
         from core.witness import outcome_from_sandbox_info
     except ImportError as e:
@@ -560,16 +596,21 @@ def _reproduce_replay(
                 # (restrict_reads) with a credential-free fake $HOME —
                 # a compromised target can't read ~/.ssh or ~/.aws.
                 # block_network + strict_env are forced by the helper.
-                result = sandbox_run_untrusted(
-                    [str(binary_path)],
-                    target=str(binary_path.parent),
-                    output=str(binary_path.parent),
-                    capture_output=True,
-                    text=False,
-                    input=witness_bytes,
-                    timeout=sandbox_timeout,
-                    env=RaptorConfig.get_safe_env(),
-                )
+                # Consented-exec staging: an env-built binary_path
+                # is 0444 in the run dir (core/env/build.py); replay a
+                # private 0o500 copy. Per-attempt staging keeps the
+                # diff minimal — n is small here.
+                with _executable_stage(binary_path) as _staged:
+                    result = sandbox_run_untrusted(
+                        [str(_staged)],
+                        target=str(_staged.parent),
+                        output=str(_staged.parent),
+                        capture_output=True,
+                        text=False,
+                        input=witness_bytes,
+                        timeout=sandbox_timeout,
+                        env=RaptorConfig.get_safe_env(),
+                    )
             except SandboxSetupError as e:
                 # setup_category "X" = every isolation layer engaged
                 # and the TARGET's own exec failed inside the sandbox

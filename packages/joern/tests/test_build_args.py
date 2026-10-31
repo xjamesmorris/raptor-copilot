@@ -313,3 +313,94 @@ class TestCacheKey:
             target, cache,
             expected_frontend_fingerprint="different",
         ) is None
+
+
+class TestEntryBudgetStride:
+    """Two-direction pin on the entry budget (_CC_MAX_ENTRIES): an
+    under-budget database is scanned whole with no warning; an
+    over-budget one gets the budget spread EVENLY across the database
+    (never the first-N prefix — cmake emits entries in directory
+    order, so a prefix reads one subsystem's flags) plus a loud
+    selection-ratio disclosure."""
+
+    def test_under_budget_scans_all_no_warning(self, tmp_path, caplog):
+        import logging
+
+        _write_db(tmp_path, [
+            _entry(tmp_path, [f"-DF{i}=1"]) for i in range(5)
+        ])
+        with caplog.at_level(
+            logging.WARNING, logger="packages.joern.runner",
+        ):
+            fa = discover_frontend_args(tmp_path)
+        assert len(fa.defines) == 5
+        assert "sampling" not in caplog.text
+
+    def test_over_budget_strides_and_warns(
+        self, tmp_path, caplog, monkeypatch,
+    ):
+        import logging
+
+        # 12 entries, budget 4 → stride 3: the sample must reach the
+        # END of the database, not stop in the first third.
+        monkeypatch.setattr(runner_mod, "_CC_MAX_ENTRIES", 4)
+        _write_db(tmp_path, [
+            _entry(tmp_path, [f"-DF{i:02d}=1"]) for i in range(12)
+        ])
+        with caplog.at_level(
+            logging.WARNING, logger="packages.joern.runner",
+        ):
+            fa = discover_frontend_args(tmp_path)
+        assert len(fa.defines) == 4
+        # Strided, not prefix: a flag from the last third of the
+        # database made the sample.
+        assert any(d >= "F06" for d in fa.defines), fa.defines
+        hits = [r for r in caplog.records
+                if "sampling" in r.getMessage()]
+        assert len(hits) == 1
+        assert "12 entries" in hits[0].getMessage()
+
+    def _discover_n(self, tmp_path, caplog, monkeypatch, n, cap):
+        import logging
+
+        monkeypatch.setattr(runner_mod, "_CC_MAX_ENTRIES", cap)
+        _write_db(tmp_path, [
+            _entry(tmp_path, [f"-DF{i:03d}=1"]) for i in range(n)
+        ])
+        with caplog.at_level(
+            logging.WARNING, logger="packages.joern.runner",
+        ):
+            return discover_frontend_args(tmp_path)
+
+    def test_non_divisible_boundary_fills_budget(
+        self, tmp_path, caplog, monkeypatch,
+    ):
+        # n = cap + 1: a stride slice (stride 2) selects only about
+        # half the budget while the log claims the full cap. The
+        # sampler must fill the budget exactly and the log must report
+        # the actual sample size.
+        fa = self._discover_n(tmp_path, caplog, monkeypatch, 5, 4)
+        assert len(fa.defines) == 4, fa.defines
+        assert "F000=1" in fa.defines, "first entry always included"
+        assert max(fa.defines) >= "F003", "sample must reach the end"
+        hits = [r for r in caplog.records
+                if "sampling" in r.getMessage()]
+        assert len(hits) == 1
+        assert "sampling 4 evenly" in hits[0].getMessage()
+
+    def test_non_divisible_two_bands_fills_budget(
+        self, tmp_path, caplog, monkeypatch,
+    ):
+        # n = 2*cap + 1: the other non-divisible band.
+        fa = self._discover_n(tmp_path, caplog, monkeypatch, 9, 4)
+        assert len(fa.defines) == 4, fa.defines
+        assert "F000=1" in fa.defines
+        assert max(fa.defines) >= "F006", "sample must reach the end"
+
+    def test_exact_multiple_control(self, tmp_path, caplog, monkeypatch):
+        # Exact-multiple control: the divisible case keeps the same
+        # contract (budget filled, ends covered).
+        fa = self._discover_n(tmp_path, caplog, monkeypatch, 8, 4)
+        assert len(fa.defines) == 4, fa.defines
+        assert "F000=1" in fa.defines
+        assert max(fa.defines) >= "F006"

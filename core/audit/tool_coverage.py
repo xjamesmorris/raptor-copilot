@@ -24,6 +24,13 @@ import re
 #
 # A class is "covered" if at least one tool in the set is available.
 # Classes absent from this map are treated as uncovered (→ dark).
+#
+# dark_verify exception: for classes whose cwe_dispatch entry declares
+# ``dark_verify``, the SEMGREP channel is withheld from the
+# silence→clean direction (see _semgrep_silence_withheld) — witness
+# execution is those classes' primary grounding, and a clean-on-
+# silence resolution would disarm it. Their rows stay listed here for
+# every other channel.
 # ---------------------------------------------------------------------------
 
 _CWE_TOOL_MAP: dict[str, frozenset[str]] = {
@@ -76,6 +83,24 @@ _CWE_TOOL_MAP: dict[str, frozenset[str]] = {
     # ReDoS / prompt injection
     "CWE-1333": frozenset({"prefilter"}),                         # ReDoS
     "CWE-1336": frozenset({"prefilter"}),                         # prompt injection
+
+    # The web-audit families (CWE-93/470/88/116/327/338 dispatch
+    # entries in cwe_dispatch) are DELIBERATELY absent from this map:
+    # every one of their rules adjudicates a narrow sub-shape (socket
+    # writes but not header()/mail() response splitting for CWE-93,
+    # and on C targets the trailing-CRLF format template but not
+    # strcat assembly; membership checks with invisible
+    # haystack/polarity for CWE-470; the attribute-encoding residual
+    # for CWE-116 on PHP and the if-idiom quoted-string escape
+    # residual on C, but not switch/table-driven escapers), so rule
+    # silence must keep the class dark for human review — the
+    # race-condition/CWE-367 precedent above.
+    # Confirmed matches still stamp promotion-grade semgrep receipts
+    # through the chain; only the silence→clean direction is withheld.
+    # Re-earning coverage here means keying on the SPECIFIC rule
+    # receipt (the dispatched rule file adjudicated this exact claim)
+    # rather than the channel-granular "any semgrep ran" test — this
+    # map cannot express that today.
 }
 
 # Mechanism keywords → CWEs. Used when the LLM provides a mechanism
@@ -132,6 +157,29 @@ _MECHANISM_CWE_MAP: dict[str, list[str]] = {
     "prompt injection":    ["CWE-1336"],
     "indirect prompt injection": ["CWE-1336"],
     "llm injection":       ["CWE-1336"],
+    # Naming-only emissions (the CWE-480/481 pattern above): CWE-470
+    # is absent from _CWE_TOOL_MAP, so these keep the class named in
+    # coverage records while it classifies dark.
+    "unsafe reflection":   ["CWE-470"],
+    "variable function":   ["CWE-470"],
+    # Encoding families — naming-only too: CWE-93/116 stay out of
+    # _CWE_TOOL_MAP (their curated rules adjudicate narrow
+    # sub-shapes), so these rows feed coverage records while the
+    # classes classify dark, never clean-when-silent. "crlf
+    # injection" dual-maps honestly: CWE-93 is the canonical
+    # CRLF-neutralization class, CWE-116 the parent improper-encoding
+    # lens — reviews use both. Still no "header injection" row:
+    # response splitting has no dispatched rule on any language, so
+    # naming a class for it would put an untested name in records.
+    "improper encoding":   ["CWE-116"],
+    "output encoding":     ["CWE-116"],
+    "missing escaping":    ["CWE-116"],
+    "crlf injection":      ["CWE-93", "CWE-116"],
+    # CWE-480/481 are DELIBERATELY absent from _CWE_TOOL_MAP: no
+    # mechanical channel (cocci rule, semgrep rule, CodeQL query) in
+    # this repo detects operator confusion, so these classes must
+    # classify dark (human review), never clean-when-silent. The
+    # emissions stay so the class is still named in coverage records.
     "wrong operator":      ["CWE-480"],
     "assignment in conditional": ["CWE-480"],
     "use of incorrect operator": ["CWE-480"],
@@ -238,9 +286,54 @@ def is_class_covered(
     }
     ran -= unavailable
 
+    # The withholding operates on the claim's extracted class SET,
+    # not per row: a claim naming any dark_verify class must not
+    # resolve clean through a sibling row that happens to lack the
+    # key ("path traversal" extracts CWE-22 AND CWE-23; without the
+    # set semantics, CWE-23's row hands the CWE-22 claim a clean on
+    # semgrep silence and disarms the witness). Adjudication is
+    # claim-granular, so it must be at least as conservative as the
+    # most-protected class the claim names. Over-withholding on
+    # mixed-class claims errs dark — an attention cost, never a
+    # suppression.
+    withhold_semgrep = any(_semgrep_silence_withheld(c) for c in cwes)
+
     for cwe in cwes:
         tools_for_cwe = _CWE_TOOL_MAP.get(cwe)
-        if tools_for_cwe and tools_for_cwe & ran:
+        if not tools_for_cwe:
+            continue
+        if withhold_semgrep:
+            tools_for_cwe = tools_for_cwe - {"semgrep"}
+        if tools_for_cwe & ran:
             return True
 
     return False
+
+
+def _semgrep_silence_withheld(cwe: str) -> bool:
+    """Whether the semgrep channel is withheld from silence→clean.
+
+    For classes whose dispatch entry declares ``dark_verify``, witness
+    execution is the table's own primary grounding mechanism — but the
+    witness pass runs AFTER gate resolution and ``clean`` is outside
+    its status filter, so a clean-on-silence resolution permanently
+    disarms it. Curated semgrep legs made semgrep receipts systematic
+    on their languages; for these classes that silence therefore stays
+    DARK (the witness stays armed) instead of resolving clean. Only
+    the semgrep channel (including the sarif_cache alias) is withheld,
+    and only the silence direction: semgrep CONFIRMS still stamp
+    receipts through the chain, and every other channel's row
+    semantics are unchanged.
+
+    Granularity: receipts are function-granular and extraction is
+    claim-granular, so the caller applies this predicate to the
+    claim's whole extracted class SET — a claim that names any
+    dark_verify class alongside a sibling without the key (e.g.
+    "path traversal" naming CWE-22 and CWE-23) is withheld as a
+    whole and never resolves clean through the sibling's row.
+    """
+    try:
+        from .cwe_dispatch import dark_verify_applicable
+    except ImportError:  # pragma: no cover — first-party module
+        return False
+    return dark_verify_applicable(cwe)

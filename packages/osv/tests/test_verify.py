@@ -7,6 +7,7 @@ import pytest
 
 from packages.osv.parser import parse_record
 from packages.osv.types import OsvRecord
+from packages.osv.client import OsvLookupError
 from packages.osv.verify import verify
 from packages.osv.verdicts import Verdict
 
@@ -21,9 +22,12 @@ class _FakeOsvClient:
     def add(self, vuln_id: str, payload: dict[str, Any]) -> None:
         self._registry[vuln_id] = payload
 
-    def get_vuln(self, vuln_id: str) -> OsvRecord | None:
+    def get_vuln(
+        self, vuln_id: str, *, raise_on_transient: bool = False,
+    ) -> OsvRecord | None:
         raw = self._registry.get(vuln_id)
         if raw is None:
+            # Registry miss models a definitive 404.
             return None
         return parse_record(raw)
 
@@ -206,3 +210,78 @@ def test_lowercase_git_range_still_verifies(fake) -> None:
     ]))
     v = verify(_CVE, "curl/curl", _SHA, fake)  # type: ignore[arg-type]
     assert v.verdict == Verdict.MATCH_RANGE
+
+
+# ---------------------------------------------------------------------------
+# Transient-failure vs definitive-404 split
+# ---------------------------------------------------------------------------
+
+
+class _FlakyOsvClient(_FakeOsvClient):
+    """Fake whose lookups fail transiently for selected IDs."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.transient_ids: set[str] = set()
+
+    def get_vuln(
+        self, vuln_id: str, *, raise_on_transient: bool = False,
+    ) -> OsvRecord | None:
+        if vuln_id in self.transient_ids:
+            if raise_on_transient:
+                raise OsvLookupError(f"osv: get_vuln({vuln_id}) failed")
+            return None
+        return super().get_vuln(
+            vuln_id, raise_on_transient=raise_on_transient,
+        )
+
+
+def test_definitive_404_is_orphan(fake) -> None:
+    """Registry miss = OSV 404 → ORPHAN (don't penalize) with a note
+    that says 404, not 'network failure'."""
+    v = verify(_CVE, "curl/curl", _SHA, fake)  # type: ignore[arg-type]
+    assert v.verdict == Verdict.ORPHAN
+    assert "404" in v.notes
+    assert "network" not in v.notes
+
+
+def test_transient_failure_is_unknown_not_orphan() -> None:
+    """An OSV outage must surface as UNKNOWN (retry), never quietly
+    degrade a batch into don't-penalize ORPHANs."""
+    flaky = _FlakyOsvClient()
+    flaky.transient_ids.add(_CVE)
+    v = verify(_CVE, "curl/curl", _SHA, flaky)  # type: ignore[arg-type]
+    assert v.verdict == Verdict.UNKNOWN
+    assert not v.verdict.is_pass
+    assert "retry" in v.notes
+
+
+def test_alias_transient_failure_withholds_negative_verdict() -> None:
+    """Primary fetched but the GHSA alias lookup failed: the pair set
+    is incomplete, so a would-be LIKELY_HALLUCINATION is withheld as
+    UNKNOWN — incomplete evidence may confirm, never condemn."""
+    flaky = _FlakyOsvClient()
+    other_sha = "1234567890abcdef1234567890abcdef12345678"
+    flaky.add(_CVE, _payload(
+        references=[{"type": "FIX",
+                     "url": f"https://github.com/curl/curl/commit/{other_sha}"}],
+        aliases=["GHSA-xxxx-yyyy-zzzz"],
+    ))
+    flaky.transient_ids.add("GHSA-xxxx-yyyy-zzzz")
+    v = verify(_CVE, "curl/curl", _SHA, flaky)  # type: ignore[arg-type]
+    assert v.verdict == Verdict.UNKNOWN
+    assert "incomplete" in v.notes
+
+
+def test_alias_transient_failure_keeps_pass_verdict() -> None:
+    """A pass verdict from the primary record alone stands even when
+    an alias lookup failed — extra pairs could only re-confirm."""
+    flaky = _FlakyOsvClient()
+    flaky.add(_CVE, _payload(
+        references=[{"type": "FIX",
+                     "url": f"https://github.com/curl/curl/commit/{_SHA}"}],
+        aliases=["GHSA-xxxx-yyyy-zzzz"],
+    ))
+    flaky.transient_ids.add("GHSA-xxxx-yyyy-zzzz")
+    v = verify(_CVE, "curl/curl", _SHA, flaky)  # type: ignore[arg-type]
+    assert v.verdict == Verdict.MATCH_EXACT

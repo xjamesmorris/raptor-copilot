@@ -83,7 +83,7 @@ class TestCommandsDetectedOrdering(unittest.TestCase):
             root = Path(tmpdir)
             gen = self._make_generator(root)
             with patch(
-                "packages.autonomous.corpus_generator._run_trusted",
+                "packages.autonomous.corpus_generator._inspect_binary",
                 return_value=_FakeStrings(_BINARY_STDOUT),
             ):
                 analysis = gen.analyze_binary()
@@ -103,7 +103,7 @@ class TestCommandsDetectedOrdering(unittest.TestCase):
             (source_dir / "README.md").write_text("no grammar here\n", encoding="utf-8")
 
             with patch(
-                "packages.autonomous.corpus_generator._run_trusted",
+                "packages.autonomous.corpus_generator._inspect_binary",
                 return_value=_FakeStrings(_BINARY_STDOUT),
             ):
                 without_source = self._make_generator(root).analyze_binary()
@@ -138,7 +138,7 @@ class TestFormatDetectionBoundaries(unittest.TestCase):
             binary.write_bytes(b"dummy")
             generator = CorpusGenerator(binary)
             with patch(
-                "packages.autonomous.corpus_generator._run_trusted",
+                "packages.autonomous.corpus_generator._inspect_binary",
                 return_value=result,
             ):
                 generator.analyze_binary()
@@ -152,3 +152,35 @@ class TestFormatDetectionBoundaries(unittest.TestCase):
     def test_within_string_http_indicator_still_detected(self):
         generator = self._analyze_with_strings("get /index.html\nother\n")
         self.assertIn("http", generator.detected_formats)
+
+
+class TestSourceWalkBounded(unittest.TestCase):
+    def test_source_scan_stops_walk_at_cap(self):
+        """The candidate collection must stop the rglob at the 200th
+        match instead of materialising every matching path first
+        (walk/allocation cost only — the kept set is identical)."""
+        from pathlib import Path as _P
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = _P(tmpdir)
+            binary = root / "bin"
+            binary.write_bytes(b"dummy")
+            src = root / "src"
+            src.mkdir()
+            for i in range(250):
+                (src / f"f{i:03d}.txt").write_text("REPLY:data\n",
+                                                   encoding="utf-8")
+
+            consumed = {"n": 0}
+            real_rglob = _P.rglob
+
+            def counting_rglob(self, pattern):
+                for p in real_rglob(self, pattern):
+                    consumed["n"] += 1
+                    yield p
+
+            gen = CorpusGenerator(binary, source_dir=src)
+            with patch.object(_P, "rglob", counting_rglob):
+                gen._analyze_source_context()
+            assert consumed["n"] == 200

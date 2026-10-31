@@ -46,7 +46,11 @@ if not (os.environ.get("CLAUDECODE")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import core.startup.process_init  # noqa: E402,F401
-from core.json import dumps_display, load_json  # noqa: E402
+from core.json import load_json  # noqa: E402
+from core.security.log_sanitisation import (  # noqa: E402
+    escape_nonprintable,
+    sanitise_for_terminal as _sft,
+)
 
 # --json-schema files are small hand-written schemas.
 _MAX_SCHEMA_BYTES = 8 * 1024 * 1024
@@ -179,7 +183,8 @@ def main() -> int:
         else:
             client = LLMClient()
     except Exception as exc:
-        print(f"error: could not create LLM client: {exc}", file=sys.stderr)
+        print(f"error: could not create LLM client: {_sft(str(exc), max_len=300)}",
+              file=sys.stderr)
         return 1
 
     if args.model:
@@ -226,7 +231,7 @@ def main() -> int:
             [model_config], label="raptor-llm-ask",
         )
     except Exception as exc:  # noqa: BLE001 — provider errors below
-        print(f"warning: could not start LLM dispatcher: {exc}",
+        print(f"warning: could not start LLM dispatcher: {_sft(str(exc), max_len=300)}",
               file=sys.stderr)
 
     kwargs = {"model_config": model_config}
@@ -249,10 +254,18 @@ def main() -> int:
                 system_prompt=system_prompt,
                 **kwargs,
             )
+            # ensure_ascii: JSON escapes C0 but passes C1 controls
+            # (U+0080-U+009F, incl. single-byte CSI/OSC) through raw
+            # when ensure_ascii is off — dumps_display is exactly that.
+            # ASCII-encode so the structured lane cannot carry live
+            # terminal controls either.
+            import json as _json
             if args.raw:
-                print(dumps_display(response.result, indent=None))
+                print(_json.dumps(response.result, ensure_ascii=True,
+                                  default=str))
             else:
-                print(dumps_display(response.result, indent=2))
+                print(_json.dumps(response.result, indent=2,
+                                  ensure_ascii=True, default=str))
             if args.debug:
                 print(f"\n--- model={response.model} "
                       f"cost=${response.cost:.4f} ---",
@@ -263,7 +276,12 @@ def main() -> int:
                 system_prompt=system_prompt,
                 **kwargs,
             )
-            print(response.content)
+            # The model can be induced (e.g. by --file context it is
+            # asked to echo) to emit terminal escape sequences; both
+            # lanes scrub — the JSON lane via ensure_ascii above (bare
+            # dumps escapes C0 but NOT C1 controls), the free-text
+            # lane here.
+            print(escape_nonprintable(response.content, preserve_newlines=True))
             if args.debug:
                 print(f"\n--- model={response.model} "
                       f"provider={response.provider} "
@@ -271,7 +289,7 @@ def main() -> int:
                       f"tokens={response.tokens_used} ---",
                       file=sys.stderr)
     except Exception as exc:
-        print(f"error: LLM call failed: {exc}", file=sys.stderr)
+        print(f"error: LLM call failed: {_sft(str(exc), max_len=300)}", file=sys.stderr)
         return 1
 
     # An explicitly pinned --model that fails can be silently answered
@@ -287,8 +305,9 @@ def main() -> int:
                 and answered
                 and bare_model_id(answered) != bare_model_id(pinned)):
             print(
-                f"warning: --model {args.model} did not answer — this "
-                f"response came from fallback model {answered}",
+                f"warning: --model {_sft(str(args.model), max_len=120)} "
+                f"did not answer — this response came from fallback "
+                f"model {_sft(answered, max_len=120)}",
                 file=sys.stderr,
             )
 

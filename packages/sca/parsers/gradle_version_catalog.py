@@ -22,7 +22,7 @@ Without catalog support, ``parsers/gradle_dsl.py`` sees
 ``libs.spring.boot.starter`` as an unparseable accessor and skips
 the dep entirely — losing ~80-100% of dep coverage on any modern
 Gradle solution. This module is the read-side fix; the sibling
-rewriter in ``bump/rewriters/gradle_version_catalog`` handles the
+rewriter in ``packages/sca/rewriters/gradle_version_catalog`` handles the
 write-side for bumper / harden.
 
 Conventional location:
@@ -54,6 +54,7 @@ Skip cases (best-effort, never crash):
 from __future__ import annotations
 
 import logging
+from typing import Any
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -65,6 +66,7 @@ except ModuleNotFoundError:                     # pragma: no cover
 from core.security.log_sanitisation import escape_nonprintable
 
 from . import _safe_read
+from ._base import PARSE_ESCAPE_ERRORS
 
 logger = logging.getLogger(__name__)
 
@@ -173,7 +175,7 @@ def parse_libs_versions_toml(path: Path) -> VersionCatalog | None:
         return _PARSE_CACHE[resolved]
     try:
         data = tomllib.loads(text)
-    except tomllib.TOMLDecodeError as e:
+    except (tomllib.TOMLDecodeError, *PARSE_ESCAPE_ERRORS) as e:  # type: ignore[misc]  # hostile-input escape classes
         logger.warning(
             "sca.parsers.gradle_version_catalog: TOML parse failed "
             "for %s: %s",
@@ -372,6 +374,7 @@ def _parse_plugins(
             # String shorthand: ``"id:version"``.
             if ":" not in entry:
                 continue
+            plugin_id: Any
             plugin_id, version = entry.split(":", 1)
             out[alias] = CatalogPlugin(
                 alias=alias, plugin_id=plugin_id, version=version,
@@ -380,17 +383,17 @@ def _parse_plugins(
             plugin_id = entry.get("id")
             if not isinstance(plugin_id, str):
                 continue
-            version: str | None = None
+            version_: str | None = None
             via_ref = False
             ref_name = ""
             ver_field = entry.get("version")
             if isinstance(ver_field, str):
-                version = ver_field
+                version_ = ver_field
             elif isinstance(ver_field, dict):
                 ref = ver_field.get("ref")
                 if isinstance(ref, str):
                     if ref in versions:
-                        version = versions[ref]
+                        version_ = versions[ref]
                         via_ref = True
                         ref_name = ref
                     else:
@@ -407,10 +410,10 @@ def _parse_plugins(
                     for k in ("strictly", "require", "prefer"):
                         v = ver_field.get(k)
                         if isinstance(v, str) and v:
-                            version = v
+                            version_ = v
                             break
             out[alias] = CatalogPlugin(
-                alias=alias, plugin_id=plugin_id, version=version,
+                alias=alias, plugin_id=plugin_id, version=version_,
                 version_via_ref=via_ref, version_ref_name=ref_name,
             )
     return out
@@ -427,15 +430,15 @@ def _parse_bundles(raw: dict) -> dict[str, list[str]]:
     return out
 
 
-def _reset_cache_for_tests() -> None:
-    _PARSE_CACHE.clear()
-
-
 def reset_cache() -> None:
     """Drop the per-process parse cache. See the matching helper in
     ``parsers/directory_packages_props.py`` — same scan-boundary
     reasoning."""
     _PARSE_CACHE.clear()
+
+
+# Test-suite alias — was a byte-identical second implementation.
+_reset_cache_for_tests = reset_cache
 
 
 __all__ = [

@@ -19,9 +19,11 @@ witness. This is that witness: single-function, structural,
 detection-grade (@role detection — seeds the hypothesis and
 corroborates a matching claim; never promotes on its own).
 
-Scope: Go sources (sync.Mutex ``.Lock()``/``.Unlock()``/``.RLock()``
-method spellings and ``m[k] = v`` map writes are Go-stdlib ABI, not
-learned project vocabulary). Other languages spell the registry
+Scope: Go sources (sync.Mutex ``.Lock()``/``.Unlock()`` method
+spellings and ``m[k] = v`` map writes are Go-stdlib ABI, not learned
+project vocabulary; ``.RLock()`` regions are deliberately invisible —
+a read-lock does not serialise the create, so an RLock-guarded write
+region reads as unlocked and stays out of scope). Other languages spell the registry
 compound differently and get their own legs when a corpus shape
 demands them.
 
@@ -47,14 +49,17 @@ _MAP_WRITE_RE = re.compile(
 _LOCK_RE = re.compile(r"^\s*(?P<lk>[\w.]+)\.Lock\(\)")
 _UNLOCK_RE = re.compile(r"^\s*(?:defer\s+)?(?P<lk>[\w.]+)\.Unlock\(\)")
 _DEFER_UNLOCK_RE = re.compile(r"^\s*defer\s+(?P<lk>[\w.]+)\.Unlock\(\)")
-_RLOCK_RE = re.compile(r"^\s*(?P<lk>[\w.]+)\.RLock\(\)")
 
 # Early-return existence check: a keyed call or keyed map read whose
 # result short-circuits the function when present.
 #   if v, ok := m[key]; ok { return ... }
 #   x, err := recv.GetFoo(ctx, key) ... else if x != nil { return x... }
+# The lookbehind pins the map expression to the start of its
+# word/dotted run: unanchored, every position inside a long run is a
+# fresh scan attempt over the rest of the run — quadratic on hostile
+# source. The earliest match always starts at the run start.
 _KEYED_MAP_READ_RE = re.compile(
-    r"(?P<map>[\w.]+)\[(?P<key>\w+)\]",
+    r"(?<![\w.])(?P<map>[\w.]+)\[(?P<key>\w+)\]",
 )
 _RETURN_RE = re.compile(r"^\s*return\b")
 
@@ -119,7 +124,7 @@ def scan_function(
     file_path: str, function: str, source: str,
 ) -> list[CheckThenCreate]:
     """Scan one Go function body for the compound."""
-    lines = source.split("\n")
+    lines = source.split("\n")  # line-model: callers deliver \n-model text (universal-newline reads / split_lines span joins)
     findings: list[CheckThenCreate] = []
 
     for w_idx, line in enumerate(lines):
@@ -219,7 +224,7 @@ def scan_gaps(
         le = gap.get("line_end") or ls
         if not ls:
             continue
-        body = "\n".join(text.split("\n")[ls - 1:le])
+        body = "\n".join(text.split("\n")[ls - 1:le])  # line-model: source_texts reads are universal-newline (read_contained)
         try:
             for f in scan_function(fp, gap.get("name", ""), body):
                 f.check_line += ls - 1

@@ -6,8 +6,14 @@ then scores each field for lifecycle sensitivity based on:
 - Whether the field flows to known sinks
 - Whether writes occur inside lifecycle-critical functions
 
-This provides mechanical field discovery without an LLM pass,
-usable as a fallback when /understand --map hasn't been run.
+This provides mechanical field discovery without an LLM pass.
+
+WIRING STATUS: no pipeline currently calls :func:`discover_state_fields`
+or persists its output — the lane is EXPERIMENTAL/UNWIRED. The /audit
+orchestrator's ``check_lifecycle_at_function`` consumer stays a no-op
+until a producer writes ``state_fields`` into context-map.json (see
+``lifecycle_context_map``). A repository test pins this status in both
+directions: wiring a producer must update these docstrings.
 """
 
 from __future__ import annotations
@@ -22,49 +28,84 @@ from .lifecycle_model import ReadSite, StateField, WriteSite
 
 logger = logging.getLogger(__name__)
 
+# Per-file read cap for the regex extractors (hostile-source guard).
+_MAX_SOURCE_BYTES = 1_000_000
+
 # --- Struct/class field extraction (regex-based, multi-language) ---
 
 _C_STRUCT_KEYWORD_RE = re.compile(
     r"(?:struct|union)\s+(\w+)\s*\{",
 )
+# Bounded type window, gated optional atoms, and a leading \b so an
+# unanchored scan cannot restart inside an identifier run: the naive
+# ``(\w[\w\s*]*?)\s+\*?\s*(\w+)\s*(?:\[.*?\])?\s*;`` chained
+# overlapping whitespace-capable spans around optional atoms — a
+# field-shaped token run with no ``;`` cost every split of the run
+# between them, cubic in the struct-body length. Bound trade-off,
+# both directions: a larger window admits longer multi-token types
+# but raises the per-position backtracking ceiling. 256 chars sits
+# far above real C field types.
 _C_FIELD_RE = re.compile(
-    r"(?:const\s+)?(?:unsigned\s+|signed\s+)?(?:struct\s+)?"
-    r"(\w[\w\s*]*?)\s+\*?\s*(\w+)\s*(?:\[.*?\])?\s*;",
+    r"\b(?:const\s+)?(?:unsigned\s+|signed\s+)?(?:struct\s+)?"
+    r"(\w[\w\s*]{0,256}?)\s{1,256}(?:\*\s*)?(\w+)\s*(?:\[.{0,1000}?\]\s*)?;",
 )
 
+# \b pins the name group to the full word (identical capture — the
+# lazy tail accepted any split) and the trailing gap is horizontal:
+# the naive ``(\w+).*?:\s*$`` overlapped the name and the lazy tail
+# on word chars and let the tail's whitespace span cross newlines —
+# quadratic on class-shaped lines with no colon.
 _PY_CLASS_RE = re.compile(
-    r"^class\s+(\w+).*?:\s*$",
+    r"^class\s+(\w+)\b.*?:[^\S\n]*$",
     re.MULTILINE,
 )
+# Horizontal-only indent — the MULTILINE ^\s+ idiom is quadratic
+# on blank-line runs in scanned source.
 _PY_ATTR_ASSIGN_RE = re.compile(
-    r"^\s+self\.(\w+)\s*=",
+    r"^[^\S\n]+self\.(\w+)\s*=",
     re.MULTILINE,
 )
 
 _JAVA_CLASS_RE = re.compile(
     r"(?:class|interface)\s+(\w+)",
 )
+# Bounded type window and separator (same discipline as _C_FIELD_RE
+# above): the unbounded lazy window chained overlapping
+# whitespace-capable spans — quadratic on modifier-led token runs
+# with no terminator.
 _JAVA_FIELD_RE = re.compile(
     r"(?:private|public|protected)\s+(?:static\s+)?(?:final\s+)?"
-    r"(\w[\w<>,\s]*?)\s+(\w+)\s*[;=]",
+    r"(\w[\w<>,\s]{0,256}?)\s{1,256}(\w+)\s*[;=]",
 )
+
+
+def _match_braces(source: str) -> dict[int, int]:
+    """Open-brace position -> matching close position, one pass.
+    Unmatched opens are absent — callers SKIP such structs: malformed
+    heads get no body attribution (refusal direction), and running
+    each one's body to EOF made the field pass quadratic on hostile
+    sources full of unclosed 'struct x {' heads."""
+    match: dict[int, int] = {}
+    stack: list[int] = []
+    for i, ch in enumerate(source):
+        if ch == "{":
+            stack.append(i)
+        elif ch == "}" and stack:
+            match[stack.pop()] = i
+    return match
 
 
 def _extract_struct_fields_c(source: str) -> dict[str, list[str]]:
     """Extract struct/union definitions and their field names from C/C++ source."""
     result: dict[str, list[str]] = {}
+    braces = _match_braces(source)
     for m in _C_STRUCT_KEYWORD_RE.finditer(source):
         struct_name = m.group(1)
         brace_start = m.end() - 1  # position of the '{'
-        depth = 1
-        pos = brace_start + 1
-        while pos < len(source) and depth > 0:
-            if source[pos] == "{":
-                depth += 1
-            elif source[pos] == "}":
-                depth -= 1
-            pos += 1
-        body = source[brace_start + 1:pos - 1]
+        close = braces.get(brace_start)
+        if close is None:
+            continue
+        body = source[brace_start + 1:close]
         fields = [fm.group(2) for fm in _C_FIELD_RE.finditer(body)]
         if fields:
             result[struct_name] = fields
@@ -73,12 +114,21 @@ def _extract_struct_fields_c(source: str) -> dict[str, list[str]]:
 
 def _extract_class_fields_python(source: str) -> dict[str, list[str]]:
     """Extract class definitions and self.x assignments from Python source."""
+    import bisect
     result: dict[str, list[str]] = {}
     lines = source.splitlines(True)
+    # One cumulative newline-offset table shared by every class match
+    # — the per-class source[:pos].count("\n") recount was quadratic
+    # in class count on hostile sources.
+    nl_offsets = [i for i, ch in enumerate(source) if ch == "\n"]
+
+    def _line_index(pos: int) -> int:
+        return bisect.bisect_left(nl_offsets, pos)
+
     classes = list(_PY_CLASS_RE.finditer(source))
     for i, cm in enumerate(classes):
         class_name = cm.group(1)
-        class_line_start = source[:cm.start()].count("\n")
+        class_line_start = _line_index(cm.start())
         # Determine indent level of this class definition
         cls_line = lines[class_line_start]
         class_indent = len(cls_line) - len(cls_line.lstrip())
@@ -86,7 +136,7 @@ def _extract_class_fields_python(source: str) -> dict[str, list[str]]:
         # Find end: next class/def at same or lesser indentation
         end = len(source)
         for j in range(i + 1, len(classes)):
-            next_line_start = source[:classes[j].start()].count("\n")
+            next_line_start = _line_index(classes[j].start())
             nl = lines[next_line_start]
             next_indent = len(nl) - len(nl.lstrip())
             if next_indent <= class_indent:
@@ -218,10 +268,15 @@ def discover_state_fields(
         Minimum sensitivity score to include a field.
     """
     target = Path(target_path)
-    candidates: list[tuple[float, StateField]] = []
+    candidates: list[tuple[float, str, StateField]] = []
 
-    for fi in checklist.get("files", []):
-        file_path = fi.get("path", "")
+    for fi in checklist.get("files", []) or []:
+        if not isinstance(fi, dict):
+            continue
+        # Same path/file fallback as core.inventory.iter_checklist_items
+        # (older artifacts carry "file"); the walk stays file-level
+        # because extraction is per-source-file.
+        file_path = fi.get("path", fi.get("file", ""))
         if not file_path:
             continue
 
@@ -235,6 +290,14 @@ def discover_state_fields(
             continue
 
         try:
+            # Checklist-listed files are hostile input; the regex
+            # extractors run over the whole text, so cap the read
+            # (skip = fewer discovered fields, the refusal direction).
+            if full_path.stat().st_size > _MAX_SOURCE_BYTES:
+                logger.debug(
+                    "field discovery: skipping %s (> %d bytes)",
+                    file_path, _MAX_SOURCE_BYTES)
+                continue
             source = full_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
@@ -253,11 +316,22 @@ def discover_state_fields(
                 if score < min_score:
                     continue
 
+                # Populate the enclosing function from the checklist's
+                # own item spans — consumers join on
+                # ``site.function == function_name``, so an empty
+                # function makes every downstream lookup vacuous.
+                def _fn_at(line: int) -> str:
+                    from core.analysis.reachability import (
+                        enclosing_function,
+                    )
+                    host = enclosing_function(checklist, file_path, line)
+                    return host.name if host is not None else ""
+
                 write_sites = [
                     WriteSite(
                         file=file_path,
                         line=line,
-                        function="",
+                        function=_fn_at(line),
                         guards=frozenset(),
                     )
                     for line in sites.get("writes", [])
@@ -266,7 +340,7 @@ def discover_state_fields(
                     ReadSite(
                         file=file_path,
                         line=line,
-                        function="",
+                        function=_fn_at(line),
                         guards=frozenset(),
                     )
                     for line in sites.get("reads", [])
@@ -280,14 +354,16 @@ def discover_state_fields(
                     read_sites=read_sites,
                     notes="auto-discovered",
                 )
-                candidates.append((score, sf))
+                candidates.append((score, file_path, sf))
 
     candidates.sort(key=lambda x: x[0], reverse=True)
 
-    seen: set[tuple[str, str]] = set()
+    # Dedup key includes the FILE: same-named structs in different
+    # files are different types and must not collapse.
+    seen: set[tuple[str, str, str]] = set()
     result: list[StateField] = []
-    for score, sf in candidates:
-        key = (sf.struct_type, sf.name)
+    for score, fpath, sf in candidates:
+        key = (fpath, sf.struct_type, sf.name)
         if key in seen:
             continue
         seen.add(key)

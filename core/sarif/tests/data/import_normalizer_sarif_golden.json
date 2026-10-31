@@ -1,0 +1,225 @@
+{
+  "version": "2.1.0",
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "semgrep",
+          "rules": [
+            {
+              "id": "py.flask.xss",
+              "properties": {
+                "cwe": [
+                  "CWE-79"
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "results": [
+        {
+          "ruleId": "py.flask.xss",
+          "level": "error",
+          "message": {
+            "text": "reflected XSS"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/views.py"
+                },
+                "region": {
+                  "startLine": 10,
+                  "endLine": 12,
+                  "snippet": {
+                    "text": "return render(x)"
+                  }
+                }
+              }
+            }
+          ],
+          "codeFlows": [
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "app/views.py"
+                          },
+                          "region": {
+                            "startLine": 4,
+                            "startColumn": 2,
+                            "snippet": {
+                              "text": "x = request.args"
+                            }
+                          }
+                        },
+                        "message": {
+                          "text": "request.args"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "app/views.py"
+                          },
+                          "region": {
+                            "startLine": 7
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "app/views.py"
+                          },
+                          "region": {
+                            "startLine": 10,
+                            "snippet": {
+                              "text": "return render(x)"
+                            }
+                          }
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "app/other.py"
+                          },
+                          "region": {
+                            "startLine": 1
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "app/views.py"
+                          },
+                          "region": {
+                            "startLine": 10
+                          }
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "fingerprints": {
+            "matchBasedId/v1": "abc123"
+          }
+        },
+        {
+          "ruleId": "py.flask.xss",
+          "level": "warning",
+          "message": {
+            "text": "same rule, deduped"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/admin.py"
+                },
+                "region": {
+                  "startLine": 5
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "tool": {
+        "driver": {
+          "name": "external",
+          "rules": [
+            {
+              "id": "\u5916\u90e8-rule"
+            }
+          ]
+        }
+      },
+      "results": [
+        {
+          "ruleId": "\u5916\u90e8-rule",
+          "level": "warning",
+          "message": {
+            "text": "no tool -> external run"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": ""
+                },
+                "region": {}
+              }
+            }
+          ],
+          "codeFlows": [
+            {
+              "threadFlows": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "tool": {
+        "driver": {
+          "name": "codeql",
+          "rules": [
+            {
+              "id": "unknown"
+            }
+          ]
+        }
+      },
+      "results": [
+        {
+          "ruleId": "unknown",
+          "level": "warning",
+          "message": {
+            "text": ""
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": ""
+                },
+                "region": {}
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

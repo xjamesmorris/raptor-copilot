@@ -31,9 +31,12 @@ import re
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from core.source import open_regular
 from typing import Any
 
 from core.sarif.parser import load_sarif
+from core.source.lines import split_lines
 
 from ._util import is_valid_identifier
 
@@ -79,6 +82,12 @@ def _validate_identifier(name: str, label: str) -> None:
         raise ValueError(msg)
 
 
+def _codeql_base_name(name: str) -> str:
+    """The unqualified, template-arg-free form CodeQL's ``getName()``
+    reports (`ns::f<T>` -> `f`, `f<T>::g` -> `g`)."""
+    return name.rsplit("::", 1)[-1].split("<", 1)[0]
+
+
 def generate_taint_query(claim: DataflowClaim, *, language: str = "cpp") -> str:
     """Generate a targeted CodeQL taint-tracking query for a claim.
 
@@ -94,8 +103,12 @@ def generate_taint_query(claim: DataflowClaim, *, language: str = "cpp") -> str:
         msg = f"unsupported language for CodeQL validation: {language}"
         raise ValueError(msg)
 
-    source_fn = claim.source_function
-    sink_fn = claim.sink_function
+    # CodeQL's getName() is unqualified and template-arg-free: a
+    # qualified (`ns::f`) or template (`f<T>`) spelling interpolated
+    # verbatim can never equal it, so every such claim came back a
+    # vacuous confirmed=False.
+    source_fn = _codeql_base_name(claim.source_function)
+    sink_fn = _codeql_base_name(claim.sink_function)
 
     return f"""\
 /**
@@ -221,7 +234,7 @@ def validate_dataflow_claim(
                         ),
                         query_text=query_text,
                     )
-                match_count = _count_sarif_results(sarif_data)
+                match_count = _count_codeflow_results(sarif_data)
                 smt_pruned = 0
                 smt_receipts: list[dict[str, Any]] = []
                 if match_count > 0 and target_path is not None:
@@ -275,8 +288,13 @@ def validate_dataflow_claim(
         )
 
 
-def _count_sarif_results(sarif: dict[str, Any]) -> int:
-    """Count the number of results with codeFlows in SARIF output."""
+def _count_codeflow_results(sarif: dict[str, Any]) -> int:
+    """Count the number of results with codeFlows in SARIF output.
+
+    NOT a plain result count (that is core.sarif.parser.count_results)
+    — a result without a codeFlow proves nothing about dataflow here,
+    so only flow-carrying results count toward validation evidence.
+    """
     count = 0
     for run in sarif.get("runs", []):
         for result in run.get("results", []):
@@ -305,10 +323,42 @@ _GUARD_LOOKBACK_LINES = 3
 _GUARD_KW_RE = re.compile(r"\b(if|while|for)\s*\(")
 
 
-def _balanced_paren_group(text: str, open_idx: int) -> str | None:
-    """Content of the paren group opening at ``open_idx`` (single line)."""
+def _guard_condition_on_line(text: str) -> str | None:
+    """Branch condition on a source line, or None.
+
+    ``if (...)`` / ``while (...)`` take the whole (balanced) group;
+    ``for (init; cond; step)`` takes the middle clause. Purely
+    textual and single-line — multi-line conditions are skipped
+    rather than guessed.
+    """
+    _kind, group, _tail = _guard_on_line(text)
+    return group
+
+
+def _guard_on_line(text: str) -> tuple[str, str | None, str]:
+    """``(keyword, condition, tail-after-close-paren)`` for a guard
+    on one source line, or ``("", None, "")``.
+
+    Same extraction as :func:`_guard_condition_on_line` plus the
+    facts polarity analysis needs: which guard keyword matched, what
+    (if anything) follows the closing paren on the line, and whether
+    the guard is chained (``else if``) or a preprocessor directive —
+    both return no condition, since their truth cannot be tied to
+    the fall-through path textually.
+    """
+    m = _GUARD_KW_RE.search(text)
+    if not m:
+        return "", None, ""
+    prefix = text[:m.start()]
+    if prefix.lstrip().startswith("#") or re.search(r"\belse\s*$", prefix):
+        # `#if` conditions are compile-time, not path conditions;
+        # an `else if` arm's fall-through can come from an EARLIER
+        # taken arm, so neither polarity is assertable.
+        return "", None, ""
+    open_idx = m.end() - 1
     depth = 0
-    start = None
+    start: int | None = None
+    end: int | None = None
     for i in range(open_idx, len(text)):
         ch = text[i]
         if ch == "(":
@@ -318,29 +368,330 @@ def _balanced_paren_group(text: str, open_idx: int) -> str | None:
         elif ch == ")":
             depth -= 1
             if depth == 0 and start is not None:
-                return text[start:i]
-    return None
-
-
-def _guard_condition_on_line(text: str) -> str | None:
-    """Branch condition on a source line, or None.
-
-    ``if (...)`` / ``while (...)`` take the whole (balanced) group;
-    ``for (init; cond; step)`` takes the middle clause. Purely
-    textual and single-line — multi-line conditions are skipped
-    rather than guessed.
-    """
-    m = _GUARD_KW_RE.search(text)
-    if not m:
-        return None
-    group = _balanced_paren_group(text, m.end() - 1)
-    if group is None:
-        return None
+                end = i
+                break
+    if end is None or start is None:
+        return "", None, ""
+    group = text[start:end]
     if m.group(1) == "for":
         parts = group.split(";")
         group = parts[1] if len(parts) == 3 else ""
     group = group.strip()
-    return group or None
+    return m.group(1), (group or None), text[end + 1:]
+
+
+#: Statement shapes that leave the enclosing flow — a guard whose arm
+#: ENDS in one of these makes the fall-through path require the guard
+#: condition to be FALSE (the ubiquitous C early-exit idiom).
+# Seed set (<= 9 names, C control flow + libc noreturn): a missing
+# spelling only drops a negation opportunity — the condition is then
+# dropped entirely, which weakens the prune toward keep.
+_EXIT_STMT_RE = re.compile(
+    r"^(?:return\b|goto\s+\w|break$|continue$"
+    r"|(?:exit|abort|longjmp|panic)\s*\()"
+)
+
+
+#: Statement-leading label (goto target / case arm). `(?!:)` keeps
+#: C++ scope tokens (`std::x`) from matching.
+#: The case-arm expression is gated to end on non-whitespace
+#: ((?:[^:]*[^:\s])?) so the trailing ``\s*`` owns the whitespace run
+#: alone — ``[^:]*\s*`` overlapped on spaces: quadratic on a
+#: 'case'-opening line ending in a space run with no ':'.
+_LABEL_RE = re.compile(r"^\s*(?:case\b(?:[^:]*[^:\s])?|[A-Za-z_]\w*)\s*:(?!:)")
+
+
+#: Label recognition on the JOINED logical region (the tail+between
+#: window after splice normalisation and literal/comment blanking,
+#: line texts joined on spaces).  C allows the label identifier and
+#: its colon on separate lines — physical (``ok`` / ``:``) or
+#: splice-assembled (``ok\`` + ``:``) — which the per-line
+#: ``_LABEL_RE`` check cannot see; joined, the label is one
+#: ``identifier :`` at a statement boundary.  A boundary (region
+#: start, ``;``, ``{``, ``}``) must precede the identifier: a
+#: ternary's ``? a : b`` arm or a bitfield's ``x : 3`` width has no
+#: boundary before its colon-bearing token, so neither matches.
+#: The case-arm expression mirrors ``_LABEL_RE``'s gating (it must
+#: end on non-whitespace) so the trailing ``\s*`` owns the
+#: whitespace run alone — no quadratic overlap.
+_REGION_LABEL_RE = re.compile(
+    r"(?:^|[;{}])\s*(?:case\b(?:[^:;{}]*[^:;{}\s])?|[A-Za-z_]\w*)\s*:(?!:)"
+)
+
+
+#: Label split across the window seam: the region ENDS in a bare
+#: label head (identifier / case expression at a statement boundary)
+#: and the colon leads the STEP's own line — the label targets the
+#: step statement itself.
+_REGION_LABEL_HEAD_RE = re.compile(
+    r"(?:^|[;{}])\s*(?:case\b(?:[^:;{}]*[^:;{}\s])?|[A-Za-z_]\w*)\s*$"
+)
+_STEP_COLON_LEAD_RE = re.compile(r"^\s*:(?!:)")
+
+
+def _exit_only_body(body: str) -> bool:
+    """True when the guarded body's last statement leaves the flow."""
+    stmts = [s.strip() for s in body.split(";") if s.strip()]
+    if not stmts:
+        return False
+    return _EXIT_STMT_RE.match(stmts[-1]) is not None
+
+
+#: C/C++ raw-string opener: its delimiter grammar defeats a quote
+#: scanner, so a region carrying one is not brace-censusable.
+_RAW_STRING_RE = re.compile(r'\b(?:u8|[uUL])?R"')
+
+
+#: C line splice (translation phase 2): a backslash ending the
+#: physical line joins it with the next — BEFORE comments, literals,
+#: and tokens exist.  ``\r?`` covers CRLF sources (the \n-model
+#: split leaves the ``\r`` on the line); ``[ \t]*`` accepts blanks
+#: between the backslash and the newline — ISO C wants the backslash
+#: immediately before the newline, but GCC and Clang both splice the
+#: blank-padded form (with a warning), so the joined text is what
+#: the compiler actually built.  A trailing backslash has no other
+#: reading in C source, so joining never mis-reads well-formed code.
+_LINE_SPLICE_RE = re.compile(r"\\[ \t]*\r?$")
+
+
+def _splice_c_lines(parts: list[str]) -> list[str] | None:
+    """Join backslash-newline-spliced physical lines into the logical
+    lines the compiler parses (C translation phase 2): the splice is
+    removed and the texts concatenate DIRECTLY — a splice can split a
+    single token (``ret\\`` + ``urn;`` is one ``return;``) or carry a
+    ``//`` comment over the next physical line.
+
+    Returns ``None`` when the window's LAST physical line ends in a
+    splice: the next physical line — the step's own, which is not
+    part of this window — is then a mid-logical-line continuation,
+    and no faithful text for the arm/step judgement exists.
+    """
+    out: list[str] = []
+    carry = ""
+    open_splice = False
+    for text in parts:
+        m = _LINE_SPLICE_RE.search(text)
+        if m:
+            carry += text[:m.start()]
+            open_splice = True
+        else:
+            out.append(carry + text)
+            carry = ""
+            open_splice = False
+    if open_splice:
+        return None
+    return out
+
+
+def _blank_c_literals(parts: list[str]) -> tuple[list[str], bool]:
+    """Blank C string/char literals and comments out of source-line
+    texts (single linear pass, comment state carried across lines;
+    contents become spaces so brace and statement positions
+    survive).  The polarity census counts braces and reads exit
+    statements from these texts — a ``{`` inside ``log("{")`` or a
+    comment is DATA, and counting it flips the arm/step judgment
+    back to the inverted-polarity assertion this census exists to
+    prevent.
+
+    Returns ``(blanked, censusable)`` — ``censusable`` is False when
+    the text cannot be blanked faithfully: a raw string opens, a
+    string/char literal runs off its line (ill-formed C), or a block
+    comment is still open at the end.  Callers must abstain, never
+    census the raw text.
+    """
+    out: list[str] = []
+    state = ""  # "" | "str" | "chr" | "blk"
+    for text in parts:
+        if state != "blk" and _RAW_STRING_RE.search(text):
+            return parts, False
+        buf: list[str] = []
+        i = 0
+        n = len(text)
+        while i < n:
+            ch = text[i]
+            if state in ("str", "chr"):
+                if ch == "\\":
+                    buf.append("  ")
+                    i += 2
+                    continue
+                if ch == ('"' if state == "str" else "'"):
+                    state = ""
+                    buf.append(ch)
+                else:
+                    buf.append(" ")
+                i += 1
+                continue
+            if state == "blk":
+                if ch == "*" and i + 1 < n and text[i + 1] == "/":
+                    state = ""
+                    buf.append("  ")
+                    i += 2
+                    continue
+                buf.append(" ")
+                i += 1
+                continue
+            if ch in ('"', "'"):
+                state = "str" if ch == '"' else "chr"
+                buf.append(ch)
+                i += 1
+                continue
+            if ch == "/" and i + 1 < n:
+                if text[i + 1] == "/":
+                    break  # line comment: the rest of THIS line
+                if text[i + 1] == "*":
+                    state = "blk"
+                    buf.append("  ")
+                    i += 2
+                    continue
+            buf.append(ch)
+            i += 1
+        if state in ("str", "chr"):
+            # A literal cannot span source lines in well-formed C.
+            return parts, False
+        out.append("".join(buf))
+    return out, state == ""
+
+
+def _step_guard_polarity(
+    kind: str,
+    tail: str,
+    between: list[str],
+    step_line: str,
+) -> str | None:
+    """Polarity with which a guard binds the step that follows it.
+
+    ``"positive"`` — the step is provably inside the guarded arm;
+    ``"negated"`` — the arm is an exit-only ``if`` body, so the
+    fall-through step requires the condition FALSE (early-exit
+    guard); ``None`` — the arm/step relation is textually
+    undecidable, so the condition must not be asserted in either
+    direction (an unprovable polarity weakens the prune toward
+    keep — it never manufactures an infeasibility receipt).
+
+    ``step_line`` is the step's OWN source line: an arm can close on
+    it, BEFORE the step statement (``if (c) { return; } step;`` —
+    K&R-compact / minified / generated C).  That closure is invisible
+    to tail+between inspection, and judging the step "inside the
+    arm" asserts the guard with INVERTED polarity — the one shape
+    that lets a trivially-live path prove "mutually exclusive" and
+    mint a proof-grade infeasibility receipt.  Only the line's
+    leading close-braces are read; when they leave the arm/step
+    relation ambiguous the polarity is dropped, never guessed.
+
+    The brace census runs on literal/comment-blanked text (a ``{``
+    inside ``log("{")`` or a comment is data, and counting it
+    re-mints the inverted-polarity assertion); a region that cannot
+    be blanked faithfully is not censused — it abstains.
+
+    The tail+between window is first normalised for C line splices
+    (translation phase 2: backslash-newline joins physical lines
+    before comments, literals, or tokens exist), so a splice-hidden
+    ``{``, a ``//`` comment spliced over the next physical line, or
+    a splice-split token is judged from the joined text the compiler
+    actually parsed — unjoined, a spliced-out ``return;`` read as
+    code minted a false NEGATED assertion (the suppress direction).
+    A splice off the window's last line runs INTO the step line;
+    that window has no faithful text, so it abstains.
+
+    Goto-target labels are re-checked on the joined logical region
+    after normalisation and blanking: C allows the label identifier
+    and its colon on separate lines — plain two-line or
+    splice-assembled — and a colon can lead the step's own line
+    (window seam).  The per-line label check cannot see either form,
+    and the missed label minted a false POSITIVE assertion for a
+    step every goto path reaches with the guard false.
+    """
+    if any(_LABEL_RE.match(ln) for ln in between):
+        # A label between the guard and the step is a goto target:
+        # another path can reach the step without evaluating the
+        # guard, so neither polarity is assertable.
+        return None
+    lead_closers = 0
+    i = 0
+    while i < len(step_line) and step_line[i] in " \t}":
+        if step_line[i] == "}":
+            lead_closers += 1
+        i += 1
+    if lead_closers and _LABEL_RE.match(step_line[i:]):
+        # `} out: step;` — the brace prefix hides the label from a
+        # line-start label check, but it is still a goto target:
+        # another path reaches the step with the guard TRUE.
+        return None
+    window = _splice_c_lines([tail, *between])
+    if window is None:
+        # The window's last line splices into the step's physical
+        # line: the step line is a mid-logical-line continuation —
+        # neither its prefix nor this window is faithful text.
+        return None
+    blanked, censusable = _blank_c_literals(window)
+    if not censusable:
+        # Raw string / unterminated literal / comment running past
+        # the region: the brace census would count data as code.
+        return None
+    region = " ".join(
+        p.strip() for p in blanked if p.strip()
+    ).strip()
+    if _REGION_LABEL_RE.search(region) or (
+        _REGION_LABEL_HEAD_RE.search(region)
+        and _STEP_COLON_LEAD_RE.match(step_line)
+    ):
+        # Label recognised on the LOGICAL region: an identifier and
+        # its colon on separate physical lines (plain two-line label
+        # or splice-assembled), or a label head whose colon leads the
+        # step's own line (window seam), is invisible to the per-line
+        # between-check above — but it is still a goto target between
+        # the guard and the step (or on the step itself): another
+        # path reaches the step without evaluating the guard, so
+        # neither polarity is assertable.
+        return None
+    if re.search(r"\belse\b", region):
+        return None
+    if region.startswith("{"):
+        if "}" not in region:
+            depth = region.count("{")
+            if lead_closers < depth:
+                # Brace opened and never closed before the step;
+                # any step-line closers close NESTED opens — the
+                # guard's arm is still open at the step.
+                return "positive"
+            if (lead_closers == depth and kind == "if"
+                    and _exit_only_body(region[1:])):
+                # The arm closes on the step line before the step:
+                # the step is the fall-through of an exit-only arm,
+                # so the condition holds NEGATED.
+                return "negated"
+            # Arm closed at the step line with a non-exit body (the
+            # arm may or may not have run), or more closers than
+            # opens (the relation is not linear text): drop it.
+            return None
+        body, _, after = region[1:].partition("}")
+        if after.strip():
+            return None
+        if lead_closers:
+            # The guard's arm already closed inside *between*; the
+            # step line's leading `}` closes an OUTER scope opened
+            # before the guard — the guard→step relation is not a
+            # linear fall-through.
+            return None
+        if kind == "if" and _exit_only_body(body):
+            return "negated"
+        return None
+    if lead_closers:
+        # Braceless arm / bare fall-through with a `}` before the
+        # step: the brace closes a scope opened BEFORE the guard (a
+        # loop or switch body), so the step can be reached from
+        # iterations whose last guard evaluation is unknowable.
+        return None
+    if not region:
+        # Nothing between the guard and the step line: the step IS
+        # the (braceless) arm.
+        return "positive"
+    if kind == "if" and _exit_only_body(region):
+        # `if (err) return; …step` / `if (err)\n\treturn;\n…step` —
+        # only `if` earns the negation: falling out of a loop body
+        # via break does NOT falsify the loop condition.
+        return "negated"
+    return None
 
 
 def _sarif_result_paths(
@@ -395,7 +746,10 @@ def _load_source_lines(
                     "%s (> %d bytes)", candidate, _MAX_SOURCE_FILE_BYTES,
                 )
             else:
-                with candidate.open("rb") as fh:
+                fh = open_regular(candidate, "rb")
+                if fh is None:
+                    raise OSError(f"not a readable regular file: {candidate}")
+                with fh:
                     raw = fh.read(_MAX_SOURCE_FILE_BYTES + 1)
                 if len(raw) > _MAX_SOURCE_FILE_BYTES:
                     logger.warning(
@@ -404,7 +758,13 @@ def _load_source_lines(
                         candidate, _MAX_SOURCE_FILE_BYTES,
                     )
                 else:
-                    lines = raw.decode(errors="replace").splitlines()
+                    # \n-model split (core.source.lines contract):
+                    # the indexing line numbers are CodeQL SARIF's,
+                    # which count \n only — a splitlines() view let
+                    # one form feed inside a comment shift the
+                    # guard-harvest window onto attacker-chosen
+                    # lines.
+                    lines = split_lines(raw.decode(errors="replace"))
     except (OSError, ValueError):
         lines = None
     cache[uri] = lines
@@ -416,24 +776,50 @@ def _path_conditions(
     target_path: Path,
     cache: dict[str, list[str] | None],
 ) -> list[dict[str, Any]]:
-    """Harvest enclosing-guard conditions along one thread-flow path."""
+    """Harvest enclosing-guard conditions along one thread-flow path.
+
+    Polarity discipline: a condition is asserted positively only when
+    the step is provably inside the guarded arm; the early-exit guard
+    idiom (``if (err) return; …step``) asserts the NEGATION — the
+    real path condition of the fall-through; every other arm/step
+    relation drops the condition. A guard on the step line itself is
+    never harvested (the step may be the condition expression, not
+    the arm). Wrong-polarity assertion was the one shape that let a
+    trivially-live path prove "mutually exclusive" and mint a
+    refutation-grade receipt.
+    """
     conditions: list[dict[str, Any]] = []
-    seen: set = set()
+    seen: set[tuple[str, bool]] = set()
     for step_index, (uri, line) in enumerate(steps):
         lines = _load_source_lines(uri, target_path, cache)
         if not lines or line > len(lines):
             continue
-        for j in range(line, max(line - 1 - _GUARD_LOOKBACK_LINES, 0), -1):
-            cond = _guard_condition_on_line(lines[j - 1])
-            if cond:
-                if cond not in seen:
-                    seen.add(cond)
+        if _LABEL_RE.match(lines[line - 1]):
+            # A goto-target label on the step's OWN line: another
+            # path reaches the step without evaluating any guard
+            # above it — no polarity is assertable for this step.
+            continue
+        for j in range(line - 1, max(line - 1 - _GUARD_LOOKBACK_LINES, 0), -1):
+            kind, cond, tail = _guard_on_line(lines[j - 1])
+            if cond is None:
+                continue
+            between = lines[j:line - 1]
+            polarity = _step_guard_polarity(
+                kind, tail, between, lines[line - 1],
+            )
+            if polarity is not None:
+                negated = polarity == "negated"
+                if (cond, negated) not in seen:
+                    seen.add((cond, negated))
                     conditions.append({
                         "text": cond,
                         "step_index": step_index,
-                        "negated": False,
+                        "negated": negated,
                     })
-                break
+            # Nearest guard decides for this step — an undecidable
+            # one contributes nothing rather than letting a farther
+            # guard mis-bind.
+            break
         if len(conditions) >= _MAX_SMT_CONDITIONS:
             break
     return conditions
@@ -454,7 +840,7 @@ def _smt_prune_sarif_matches(
     try:
         from packages.exploit_feasibility.smt_path import validate_path
     except ImportError:
-        return _count_sarif_results(sarif), 0, []
+        return _count_codeflow_results(sarif), 0, []
 
     kept = 0
     pruned = 0
@@ -474,9 +860,18 @@ def _smt_prune_sarif_matches(
                     all_unsat = False
                     continue
                 try:
+                    # profile=None: the guards are raw source text
+                    # harvested with no type information, so their
+                    # signedness is a GUESS — validate_path then
+                    # reports infeasible only when BOTH signedness
+                    # profiles agree. A pinned "uint64" asserted
+                    # knowledge this harvester doesn't have: the
+                    # ubiquitous C signed error check (ret < 0)
+                    # encodes as ULT(ret, 0), unsat, and pruned a
+                    # live dataflow match outright.
                     res = validate_path(
                         conditions,
-                        profile="uint64",
+                        profile=None,
                         timeout_ms=_SMT_PRUNE_TIMEOUT_MS,
                     )
                 except Exception:

@@ -5,6 +5,14 @@ suspicious items) are emitted as findings.json and /validate is
 dispatched automatically to filter false positives via the full
 Stage A-F pipeline.
 
+Dark outcomes ("tool-blind, needs concrete verification") are NOT
+validate-eligible by default — the same policy as the /validate import
+chokepoint (``core.schema_constants.is_dark_row``), whose default
+routes dark rows to the witness backlog and reserves ``--include-dark``
+as the explicit operator opt-in. The post-pass records the dark
+remainder in ``validate-postpass.json`` (count, routing, follow-up
+command) instead of bulk-opting tool-blind rows into paid validation.
+
 Controlled by OrchestratorConfig.validate (default False).
 """
 
@@ -19,12 +27,20 @@ from typing import Any, TYPE_CHECKING
 from core.json import load_json, save_json
 from core.orchestration.skill_dispatch import (
     MAX_VALIDATE_FINDINGS,
+    SkillDispatchResult,
+    is_sandbox_setup_skip,
+    missing_validation_report,
     run_skill_dispatch,
     truncate_findings_by_signal,
 )
-from core.schema_constants import CWE_TO_VULN_TYPE, normalise_vuln_type
+from core.schema_constants import (
+    CWE_TO_VULN_TYPE,
+    is_dark_row,
+    normalise_vuln_type,
+)
 
-from .record import append_audit_log
+from .record import _resolve_annotations_dir, append_audit_log
+from .tree_class import classify_tree_class
 
 if TYPE_CHECKING:
     from .orchestrator import OrchestratorResult, ReviewOutcome
@@ -47,18 +63,10 @@ class ValidatePostpassResult:
     validate_dir: str | None = None
     skipped_reason: str = ""
     duration_s: float = 0.0
-
-
-# Review-confidence rank for dark-outcome selection ordering: dark
-# rows carry no exploitability signal (no tool ever confirmed them),
-# so the LLM review's own confidence is the only priority available.
-_DARK_CONFIDENCE_RANK = {"high": 0, "medium": 1, "low": 2}
-
-
-def _dark_priority(outcome: Any) -> int:
-    review_result = getattr(outcome, "review_result", None) or {}
-    conf = str(review_result.get("confidence", "")).lower()
-    return _DARK_CONFIDENCE_RANK.get(conf, 3)
+    #: Parent-observed child exit (numeric status or timeout label) —
+    #: the out-of-band authority for the tail artifact's line-1 label;
+    #: None when no child produced one (launch failure / crash).
+    child_exit: str | None = None
 
 
 def validate_findings(
@@ -76,13 +84,15 @@ def validate_findings(
     cheap wide net; /validate is the expensive filter that kills
     false promotions by tracing reachability.
 
-    Dark outcomes ("tool-blind, needs concrete verification") ride the
-    same selection: finding-status rows fill the cap first (they are
-    signal-sorted at copy time), dark rows take the remaining slots
-    ordered by review confidence. Dark rows that do not fit — or that
-    never dispatch because the post-pass is skipped — are recorded in
-    ``validate-postpass.json`` so the report's completeness block can
-    state exactly how many are awaiting validation and how to run it.
+    Dark outcomes ("tool-blind, needs concrete verification") are NOT
+    selected: dark is not validate-eligible by default — the same
+    eligibility test the /validate import chokepoint applies
+    (``is_dark_row``), whose default routes dark rows to the witness
+    backlog for standalone adjudication. Every dark row is recorded in
+    ``validate-postpass.json`` (count, witness-backlog routing, the
+    exact follow-up command) so the report's completeness block can
+    state how many await adjudication; ``--include-dark`` on the
+    follow-up import is the operator's explicit opt-in.
     """
     findings_outcomes = [
         (i, o) for i, o in enumerate(result.outcomes)
@@ -96,62 +106,54 @@ def validate_findings(
         logger.info("validate_findings: no findings to emit")
         return result
 
-    dark_slots = max(0, _MAX_VALIDATE_FINDINGS - len(findings_outcomes))
-    ordered_dark = sorted(dark_outcomes, key=lambda io: _dark_priority(io[1]))
-    selected_dark = ordered_dark[:dark_slots]
-    dark_deferred = len(dark_outcomes) - len(selected_dark)
-
-    selected = findings_outcomes + selected_dark
+    dark_total = len(dark_outcomes)
 
     logger.info(
-        "validate_findings: emitting %d finding(s) + %d dark for "
-        "/validate (%d dark deferred by cap)",
-        len(findings_outcomes), len(selected_dark), dark_deferred,
+        "validate_findings: emitting %d finding(s) for /validate "
+        "(%d dark row(s) not validate-eligible — witness backlog)",
+        len(findings_outcomes), dark_total,
     )
 
     # findings.json keeps its established contract — finding-status
     # rows only (the /project merged views read it with no status
     # filter, so dark rows there would render as ordinary findings).
-    # When dark rows are selected, the post-pass dispatches on a
-    # separate validate-selection.json carrying findings + dark.
     path = None
     if findings_outcomes:
         path = _emit_findings_json(findings_outcomes, out_dir, target_path)
-    if selected_dark:
-        path = _emit_findings_json(
-            selected, out_dir, target_path,
-            filename="validate-selection.json",
-        )
 
     append_audit_log(out_dir, {
         "action": "findings_emitted",
-        "count": len(selected),
-        "dark_selected": len(selected_dark),
-        "dark_deferred": dark_deferred,
-        "path": str(path),
+        "count": len(findings_outcomes),
+        "dark_selected": 0,
+        "dark_deferred": dark_total,
+        # Empty selection emits no file — record that as "", not the
+        # string "None".
+        "path": str(path) if path is not None else "",
     })
 
     if path is None:
-        # Degenerate cap (nothing selectable) — no dispatch, but the
-        # remainder is still recorded so the report states it.
+        # Dark-only run: nothing is validate-eligible — no dispatch,
+        # but the dark remainder is still recorded so the report
+        # states it with the follow-up command.
         postpass = ValidatePostpassResult(
-            ran=False, skipped_reason="empty selection (cap exhausted)",
+            ran=False,
+            skipped_reason=("no validate-eligible findings (dark rows "
+                            "await witness-backlog adjudication)"),
         )
     else:
         postpass = _dispatch_validate(
             target_path=target_path,
             audit_out_dir=out_dir,
             findings_path=path,
-            findings_count=len(selected),
-            dark_count=len(selected_dark),
+            findings_count=len(findings_outcomes),
         )
 
     append_audit_log(out_dir, {
         "action": "validate_postpass",
         "ran": postpass.ran,
         "selected_count": postpass.selected_count,
-        "dark_selected": len(selected_dark),
-        "dark_deferred": dark_deferred,
+        "dark_selected": 0,
+        "dark_deferred": dark_total,
         "validate_dir": postpass.validate_dir,
         "skipped_reason": postpass.skipped_reason,
         "duration_s": postpass.duration_s,
@@ -162,9 +164,7 @@ def validate_findings(
         target_path=target_path,
         postpass=postpass,
         findings_selected=len(findings_outcomes),
-        dark_total=len(dark_outcomes),
-        dark_selected=len(selected_dark),
-        dark_deferred=dark_deferred,
+        dark_total=dark_total,
     )
 
     if postpass.ran and postpass.validate_dir:
@@ -186,16 +186,121 @@ def validate_findings(
 
 
 def _followup_command(target_path: Path, out_dir: Path) -> str:
-    """The exact operator command that adjudicates deferred dark rows.
+    """The exact operator follow-up for the run's graded findings.
 
     ``/validate`` accepts ``--findings <file>`` imports (see
     ``.claude/commands/validate.md``; ``libexec/raptor-validation-helper``
-    stage 0 parses the flag), and findings-graded.json carries every
-    dark row with ``needs_validation: true``.
+    stage 0 parses the flag). The command deliberately carries NO
+    ``--include-dark``: the import chokepoint routes dark rows to the
+    witness backlog by default and that default IS the standing
+    design — bulk-piping tool-blind rows into paid validation defeats
+    the backlog's standalone adjudication role. The record's
+    ``dark_note`` names the flag so the explicit opt-in stays
+    discoverable.
     """
     return (
         f"/validate {target_path} "
         f"--findings {Path(out_dir) / 'findings-graded.json'}"
+    )
+
+
+#: Advisory that rides the post-pass record (and the report's
+#: completeness block) whenever dark rows exist: states the default
+#: routing and names the explicit opt-in flag for discoverability.
+DARK_ROUTING_NOTE = (
+    "dark rows are not validate-eligible by default — the follow-up "
+    "import routes them to the witness backlog (witness-backlog.json) "
+    "for standalone adjudication; pass --include-dark to spend "
+    "validation budget on them explicitly"
+)
+
+
+#: Bytes read from the end of the tail artifact before escaping.
+_CHILD_TAIL_READ_BYTES = 4096
+
+#: Bytes read from the start of the artifact for the head line.
+_CHILD_TAIL_HEAD_BYTES = 256
+
+#: Escaped-character window applied to the artifact tail.
+_CHILD_TAIL_WINDOW_CHARS = 2000
+
+
+def _read_child_tail_untrusted(path: Path) -> str | None:
+    """Bounded, symlink-refusing read of the dispatch tail artifact.
+
+    The artifact lives in a directory the CC child writes by design,
+    and on the launch-failure path the PARENT never wrote it (the
+    timeout arm persists the kill's partial capture, but the child
+    may still have replaced the name) — whatever sits here can be
+    child-controlled. Refuse
+    symlinks and specials (O_NOFOLLOW + fstat, the inventory probe's
+    discipline), read only the file's head line and last 4 KiB (a
+    planted sparse giant must not buffer), and escape control bytes
+    AT READ TIME — the writer's escape only covers the paths where
+    the parent wrote.
+
+    Label-preserving window (see the excerpting contract in
+    :mod:`core.security.log_sanitisation`): the excerpt re-attaches
+    the artifact's line 1 with an explicit elision marker whenever
+    the tail window cut anything. A bare tail slice dropped the
+    parent-authored ``exit=<label>`` authority line as soon as the
+    child padded its stdout past the window — the operator-facing
+    excerpt then LED with whatever narrative the child chose to end
+    its stream with. Exit AUTHORITY still never comes from these
+    bytes (``child_exit`` carries it out-of-band); the head line is
+    re-attached so the artifact's own account cannot be silently
+    beheaded.
+    """
+    import stat as _stat
+
+    from core.security.log_sanitisation import (
+        escape_nonprintable,
+        sanitise_for_terminal,
+    )
+
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not _stat.S_ISREG(st.st_mode):
+            return None
+        head = os.read(fd, _CHILD_TAIL_HEAD_BYTES)
+        if st.st_size > _CHILD_TAIL_READ_BYTES:
+            os.lseek(fd, st.st_size - _CHILD_TAIL_READ_BYTES, os.SEEK_SET)
+        else:
+            os.lseek(fd, 0, os.SEEK_SET)
+        data = os.read(fd, _CHILD_TAIL_READ_BYTES)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    text = data.decode("utf-8", errors="replace")
+    escaped = escape_nonprintable(text, preserve_newlines=True)
+    window = escaped[-_CHILD_TAIL_WINDOW_CHARS:]
+    skipped_bytes = max(0, st.st_size - len(data))
+    if skipped_bytes == 0 and len(window) == len(escaped):
+        return window
+    # The cut landed mid-document: resume at a true line boundary so
+    # a boundary-truncated quoted body line (``| XXexit=0`` cut right
+    # before the ``e``) cannot masquerade as a column-0 writer line.
+    # A window with no newline at all is kept whole — the writer's
+    # artifact format always carries newlines, so that case is a
+    # wholesale child-replaced artifact where quoting carries no
+    # authority anyway (``child_exit`` does).
+    nl = window.find("\n")
+    if nl >= 0:
+        window = window[nl + 1:]
+    cut_chars = len(escaped) - len(window)
+    head_line = sanitise_for_terminal(
+        head.split(b"\n", 1)[0].decode("utf-8", errors="replace"),
+        max_len=300,
+    )
+    return (
+        f"{head_line}\n"
+        f"[… ~{skipped_bytes + cut_chars} bytes elided …]\n"
+        f"{window}"
     )
 
 
@@ -206,30 +311,48 @@ def _write_postpass_record(
     postpass: ValidatePostpassResult,
     findings_selected: int,
     dark_total: int,
-    dark_selected: int,
-    dark_deferred: int,
 ) -> None:
     """Persist the post-pass selection record (validate-postpass.json).
 
-    The report's completeness block reads this to state honestly how
-    many dark findings never reached the post-pass — cap-deferred rows
-    when the dispatch ran, ALL dark rows when it did not — together
-    with the exact follow-up command. Best-effort: a write failure
+    The report's completeness block reads this to state honestly that
+    NO dark finding entered the post-pass (dark is not
+    validate-eligible), where those rows route (the witness backlog),
+    and the exact follow-up command. Best-effort: a write failure
     must not break the audit pipeline (the report then conservatively
     treats every dark row as awaiting).
     """
-    dark_awaiting = dark_total if not postpass.ran else dark_deferred
+    record: dict[str, object] = {
+        "ran": postpass.ran,
+        "skipped_reason": postpass.skipped_reason,
+        # Out-of-band exit authority: computed from the dispatch
+        # result the parent holds, never recovered from artifact
+        # bytes (the tail artifact is child-controllable).
+        "child_exit": postpass.child_exit,
+        "validate_dir": postpass.validate_dir,
+        "findings_selected": findings_selected,
+        "dark_total": dark_total,
+        "dark_selected": 0,
+        "dark_awaiting": dark_total,
+        "followup_command": _followup_command(target_path, out_dir),
+    }
+    if dark_total:
+        # State the routing IN the record: dark rows go to the witness
+        # backlog, never silently dropped — and the opt-in flag stays
+        # discoverable without riding the suggested command.
+        record["dark_routing"] = "witness_backlog"
+        record["dark_note"] = DARK_ROUTING_NOTE
+    if not postpass.ran and postpass.validate_dir:
+        # A failed dispatch usually leaves the child's narrative
+        # beside the pass (dispatch-child-tail.log); an excerpt in the
+        # record saves the operator a dig for the most common question
+        # — what did the child say.
+        tail = Path(postpass.validate_dir) / "dispatch-child-tail.log"
+        excerpt = _read_child_tail_untrusted(tail)
+        if excerpt is not None:
+            record["child_tail_path"] = str(tail)
+            record["child_tail_excerpt"] = excerpt
     try:
-        save_json(Path(out_dir) / "validate-postpass.json", {
-            "ran": postpass.ran,
-            "skipped_reason": postpass.skipped_reason,
-            "validate_dir": postpass.validate_dir,
-            "findings_selected": findings_selected,
-            "dark_total": dark_total,
-            "dark_selected": dark_selected,
-            "dark_awaiting": dark_awaiting,
-            "followup_command": _followup_command(target_path, out_dir),
-        })
+        save_json(Path(out_dir) / "validate-postpass.json", record)
     except Exception:
         logger.debug("validate-postpass.json write failed", exc_info=True)
 
@@ -240,7 +363,6 @@ def _dispatch_validate(
     audit_out_dir: Path,
     findings_path: Path,
     findings_count: int,
-    dark_count: int = 0,
 ) -> ValidatePostpassResult:
     """Launch /validate as a Claude Code subprocess.
 
@@ -255,7 +377,6 @@ def _dispatch_validate(
             audit_out_dir=audit_out_dir,
             findings_path=findings_path,
             findings_count=findings_count,
-            dark_count=dark_count,
         )
     except Exception as e:
         logger.exception("validate post-pass crashed unexpectedly")
@@ -271,7 +392,6 @@ def _dispatch_validate_unsafe(
     audit_out_dir: Path,
     findings_path: Path,
     findings_count: int,
-    dark_count: int = 0,
 ) -> ValidatePostpassResult:
     target_path = Path(target_path).resolve()
     audit_out_dir = Path(audit_out_dir).resolve()
@@ -287,8 +407,11 @@ def _dispatch_validate_unsafe(
         selection_file = validate_dir / "selected-findings.json"
         _copy_findings_for_validate(findings_path, selection_file)
 
+        from core.inventory import checklist_exists
         audit_checklist = audit_out_dir / "checklist.json"
-        if audit_checklist.is_file():
+        # Either on-disk form qualifies (the pointer names the SLOT
+        # path; the /validate reader resolves the form itself).
+        if checklist_exists(audit_out_dir):
             save_json(
                 validate_dir / "parent-checklist-pointer.json",
                 {
@@ -302,7 +425,6 @@ def _dispatch_validate_unsafe(
         return _build_audit_validate_prompt(
             target_path, audit_out_dir, validate_dir,
             validate_dir / "selected-findings.json", findings_count,
-            dark_count=dark_count,
         )
 
     # cc-trust gate: refuse to dispatch a Claude Code child against a
@@ -313,25 +435,65 @@ def _dispatch_validate_unsafe(
     # such gate — an untrusted repo's config reached the CC child.
     from core.security.cc_trust import check_repo_claude_trust
 
-    dispatch = run_skill_dispatch(
-        command="validate",
-        target=target_path,
-        tools=_VALIDATE_TOOLS,
-        budget_usd=_VALIDATE_BUDGET_USD,
-        timeout_s=_VALIDATE_TIMEOUT_S,
-        caller_label="audit-validate",
-        log_label="validate post-pass",
-        build_prompt=_prompt,
-        block_cc_dispatch=check_repo_claude_trust(str(target_path)),
-        context_dirs=(audit_out_dir,),
-        stage=_stage,
-    )
+    def _run_dispatch() -> SkillDispatchResult:
+        return run_skill_dispatch(
+            command="validate",
+            target=target_path,
+            tools=_VALIDATE_TOOLS,
+            budget_usd=_VALIDATE_BUDGET_USD,
+            timeout_s=_VALIDATE_TIMEOUT_S,
+            caller_label="audit-validate",
+            log_label="validate post-pass",
+            build_prompt=_prompt,
+            block_cc_dispatch=check_repo_claude_trust(str(target_path)),
+            context_dirs=(audit_out_dir,),
+            # The post-pass is a child phase of the audit run: its
+            # lifecycle start threads the audit run's project pin so
+            # the validate run lands in the same project (a mid-run
+            # switch of the machine-wide default otherwise re-points
+            # or refuses the child start).
+            parent_run_dir=audit_out_dir,
+            stage=_stage,
+            # Success = the pipeline's actual outcome, never the CC
+            # child's exit status alone: a child whose in-run pipeline
+            # crashed can still exit 0 (it narrates the failure and
+            # exits cleanly), which used to record the pass as
+            # ran/completed while every selected finding stayed
+            # pending. The probe requires the terminal artifact
+            # (validation-report.md, non-empty) before the pass may
+            # count as ran; otherwise the lifecycle is failed and the
+            # reason reaches validate-postpass.json + the run report.
+            validate_outputs=missing_validation_report,
+        )
+
+    dispatch = _run_dispatch()
+    if not dispatch.ran and is_sandbox_setup_skip(dispatch.skipped_reason):
+        # One bounded retry, sandbox-setup failures only: the child
+        # never launched (no billed work to double-run) and the
+        # refusal can be transient host state rather than a property
+        # of this pass. A second identical refusal is treated as real
+        # and surfaces through the postpass record and run report.
+        #
+        # A zero-verdict outcome (missing_validation_report) is
+        # deliberately NOT retried: the child ran to completion, so
+        # the pass's LLM budget is already spent (a retry doubles it),
+        # and an in-child pipeline crash is a property of the run's
+        # inputs or host configuration rather than transient launch
+        # state — the retry would spend the same budget to hit the
+        # same wall. It surfaces as a failed pass with the reason and
+        # the exact operator follow-up command instead.
+        logger.warning(
+            "validate post-pass: %s — retrying once",
+            dispatch.skipped_reason,
+        )
+        dispatch = _run_dispatch()
     return ValidatePostpassResult(
         ran=dispatch.ran,
         selected_count=findings_count,
         validate_dir=str(dispatch.run_dir) if dispatch.run_dir else None,
         skipped_reason=dispatch.skipped_reason or "",
         duration_s=dispatch.duration_s,
+        child_exit=dispatch.child_exit,
     )
 
 
@@ -351,6 +513,21 @@ def _copy_findings_for_validate(
     if container is None:
         return
     entries = container.get("findings", [])
+    if isinstance(entries, list):
+        # Dark-eligibility chokepoint (shared predicate — the same
+        # test the /validate import applies): dark rows are not
+        # validate-eligible, whatever file shape carried them here
+        # (a legacy selection file, a hand-edited findings.json).
+        kept = [e for e in entries
+                if not (isinstance(e, dict) and is_dark_row(e))]
+        if len(kept) != len(entries):
+            logger.info(
+                "validate post-pass: %d dark row(s) excluded from the "
+                "dispatch selection (not validate-eligible — witness "
+                "backlog)", len(entries) - len(kept),
+            )
+            entries = kept
+            container["findings"] = entries
     if isinstance(entries, list) and len(entries) > _MAX_VALIDATE_FINDINGS:
         if all(isinstance(e, dict) for e in entries):
             entries = truncate_findings_by_signal(
@@ -371,8 +548,6 @@ def _build_audit_validate_prompt(
     validate_dir: Path,
     selection_file: Path,
     findings_count: int,
-    *,
-    dark_count: int = 0,
 ) -> str:
     from core.security.log_sanitisation import escape_nonprintable
     safe_target = escape_nonprintable(str(target))
@@ -381,20 +556,11 @@ def _build_audit_validate_prompt(
     safe_selection = escape_nonprintable(str(selection_file))
     safe_raptor = escape_nonprintable(str(_RAPTOR_DIR))
     threat_model = _threat_model_prompt_block(target)
-    dark_block = ""
-    if dark_count:
-        dark_block = f"""
-{dark_count} of the findings carry audit_status "dark": the audit's
-mechanical tools had NO channel to confirm or refute them (tool-blind
-class). Treat them as unverified hypotheses — they need concrete
-reachability and impact verification from first principles, not tool
-corroboration.
-"""
     return f"""You are running the /validate post-pass for the /audit security
 review. The audit loop has finished and produced {findings_count} findings
 (including sweep-promoted suspicious items confirmed by mechanical tools).
 Your job is to run the full validation pipeline to filter false positives.
-{dark_block}
+
 Target repository:    {safe_target}
 Audit out_dir:        {safe_audit}
 Selection file:       {safe_selection}
@@ -471,6 +637,14 @@ def _emit_findings_json(
         FindingsContainer,
     )
 
+    from .findings import stamp_function_attribution
+    from .gaps import load_checklist
+
+    # Attribution chokepoint input (see resolve_function_attribution):
+    # outcome.function is the as-reviewed checklist-item name, which a
+    # phantom extractor item can set to a CALLEE at the finding line.
+    checklist = load_checklist(out_dir)
+
     findings: list[dict[str, Any]] = []
     for seq, (_, outcome) in enumerate(findings_outcomes, start=1):
         cwe = _extract_cwe(outcome)
@@ -489,9 +663,16 @@ def _emit_findings_json(
         if cwe:
             raw["cwe_id"] = cwe
         finding = Finding.from_dict(raw).to_dict()
+        stamp_function_attribution(
+            finding, checklist, target_path=target_path,
+        )
         # Audit-owned extras (not modelled by the canonical Finding).
+        # tree_class rides along so the budget-capped selection
+        # (truncate_findings_by_signal) can prefer production findings
+        # on signal ties — a tag, never a filter.
+        finding["tree_class"] = classify_tree_class(str(outcome.file or ""))
         finding["title"] = (outcome.hypothesis
-                            or f"Finding in {outcome.function}")
+                            or f"Finding in {finding.get('function') or outcome.function}")
         if outcome.hypothesis:
             finding["hypothesis"] = outcome.hypothesis
         if outcome.status == "dark":
@@ -536,12 +717,11 @@ def _extract_cwe(outcome: ReviewOutcome) -> str:
     return ""
 
 
-def _resolve_annotations_dir(out_dir: Path) -> Path:
-    """Resolve the annotations directory for this run."""
-    ann_dir = out_dir / "annotations"
-    if ann_dir.is_dir():
-        return ann_dir
-    return out_dir.parent / "annotations"
+# Annotations resolve through record._resolve_annotations_dir (run-pin
+# aware) — a local pre-pin twin here resolved --out and standalone
+# runs to a shared bare out_dir.parent pseudo-project dir, so the
+# Reflexion auto-feedback read/wrote annotations at a different level
+# than the orchestrator's writer.
 
 
 def _auto_feedback(
@@ -550,10 +730,11 @@ def _auto_feedback(
     annotations_dir: Path,
     audit_out_dir: Path,
 ) -> None:
-    """Import /validate results back into audit annotations.
+    """Import /validate results as review-journal corrections.
 
     Searches for findings.json in the validate output directory and
-    feeds verdicts back to update annotation statuses (Reflexion).
+    appends correction entries to the review journal (Reflexion);
+    annotations are consulted read-only, never written back.
     """
     validate_findings_path = validate_dir / "findings.json"
     if not validate_findings_path.is_file():
@@ -576,10 +757,12 @@ def _auto_feedback(
             audit_out_dir=audit_out_dir,
         )
         logger.info(
-            "auto-feedback: %d updated (%d downgraded, %d upgraded, "
+            "auto-feedback: %d updated (%d downgraded to clean, "
+            "%d demoted to suspicious, %d upgraded, "
             "%d corroborated, %d skipped)",
             counts.get("updated", 0),
-            counts.get("downgraded", 0),
+            counts.get("downgraded_clean", 0),
+            counts.get("downgraded_suspicious", 0),
             counts.get("upgraded", 0),
             counts.get("corroborated", 0),
             counts.get("skipped", 0),

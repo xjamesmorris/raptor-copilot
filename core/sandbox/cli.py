@@ -11,18 +11,43 @@ during parser construction and `apply_cli_args` right after `parse_args`.
 
 import argparse
 import logging
+import sys
 
 from . import state
+from . import tiers as _tiers
+from .errors import SandboxDisableRefusedError
 from .profiles import PROFILES
 
 logger = logging.getLogger(__name__)
 
+# The --sandbox-floor vocabulary: the consentable tier labels plus
+# "none". "none" parses so the misuse is refused LOUDLY at the point
+# it would matter (an untrusted-class call) with a message naming the
+# real surface (--sandbox none / --no-sandbox) — see
+# tiers.resolve_call_floor's never-BARE-by-consent arm.
+SANDBOX_FLOOR_CHOICES = (*_tiers.CONSENTABLE_FLOOR_LABELS, "none")
+
 
 def _set_cli_state(profile: str) -> None:
-    """Internal: update both CLI-state flags coherently. No logging.
+    """Internal: update the CLI-state flags coherently. No logging.
 
     Single source of truth for transitions so disable_from_cli() and
-    set_cli_profile() can't desync the two globals.
+    set_cli_profile() can't desync the globals.
+
+    ``profile == "none"`` is the consent chokepoint: the disable is a
+    REQUEST for tier NONE, honoured only when
+    ``disable_consent.resolve_disable_consent`` finds a consent of
+    matching authority (a validated minted nonce — the sole consent
+    source; terminal presence on the process fds carries no
+    authority). Without one the request
+    raises :class:`~core.sandbox.errors.SandboxDisableRefusedError` —
+    a refusal that stops the run, never a silent re-enable and never
+    a downgrade. Gating here (state-set time) covers every
+    argv-reachable route — ``--no-sandbox``, ``--sandbox none``, and
+    programmatic ``set_cli_profile("none")`` from argv-parsing entry
+    points — in one place; the per-call ``sandbox(disabled=True)``
+    kwarg is deliberately NOT gated (it is not argv-reachable, and
+    the threat is command-line composition).
     """
     if profile not in PROFILES:
         msg = (
@@ -30,7 +55,15 @@ def _set_cli_state(profile: str) -> None:
             f"Valid profiles: {sorted(PROFILES)}."
         )
         raise ValueError(msg)
-    state._cli_sandbox_profile = profile
+    if profile == "none":
+        from . import disable_consent as _dc
+        consent = _dc.resolve_disable_consent()
+        if consent is None:
+            raise SandboxDisableRefusedError(_dc.REFUSAL_MESSAGE)
+        state._cli_sandbox_disable_consent = consent
+    else:
+        state._cli_sandbox_disable_consent = None
+    state._cli_sandbox_profile = profile  # type: ignore[assignment]
     state._cli_sandbox_disabled = (profile == "none")
 
 
@@ -38,14 +71,20 @@ def disable_from_cli() -> None:
     """Called by command entry points when `--no-sandbox` is passed.
 
     Produces the same post-condition as `set_cli_profile('none')` — both
-    routes call `_set_cli_state('none')` under the hood. The difference
-    is the WARNING log line: this function logs "Sandboxing disabled by
-    --no-sandbox flag" naming the specific CLI flag the user passed, so
-    audit logs attribute the disable to `--no-sandbox` rather than
-    `--sandbox none`. Call sites should match the flag users typed.
+    routes call `_set_cli_state('none')` under the hood, including its
+    consent gate: an unconsented call raises
+    ``SandboxDisableRefusedError`` and leaves state untouched. The
+    difference is the WARNING log line: this function logs "Sandboxing
+    disabled by --no-sandbox flag" naming the specific CLI flag the user
+    passed, so audit logs attribute the disable to `--no-sandbox` rather
+    than `--sandbox none`. Call sites should match the flag users typed.
+    The warning fires AFTER the gate — a refused request never logs a
+    disable that did not happen — and names the consent source.
     """
-    logger.warning("Sandboxing disabled by --no-sandbox flag")
     _set_cli_state("none")
+    logger.warning(
+        "Sandboxing disabled by --no-sandbox flag (consent: %s)",
+        state._cli_sandbox_disable_consent)
 
 
 def set_cli_profile(profile: str) -> None:
@@ -54,14 +93,101 @@ def set_cli_profile(profile: str) -> None:
     Forces every subsequent `sandbox()` / `run()` invocation in the process
     to use the named profile regardless of what the code requests. This is
     the granular alternative to `--no-sandbox`: users can pick `full`,
-    `network-only`, or `none` instead of a binary on/off.
+    `network-only`, or `none` instead of a binary on/off. `none` goes
+    through the same consent gate as `--no-sandbox` (see
+    `_set_cli_state`); the WARNING fires after the gate so a refused
+    request never logs a disable that did not happen.
 
     Called only from CLI-parsed argparse values — never from env, config,
     or target repo content — to keep the sandbox unescapable by prompt
     injection.
     """
-    logger.warning("Sandbox profile forced to %r by CLI --sandbox flag", profile)
     _set_cli_state(profile)
+    if profile == "none":
+        logger.warning(
+            "Sandbox profile forced to 'none' by CLI --sandbox flag "
+            "(consent: %s)", state._cli_sandbox_disable_consent)
+    else:
+        logger.warning(
+            "Sandbox profile forced to %r by CLI --sandbox flag", profile)
+
+
+def _validate_floor_label(label: str, *, surface: str,
+                          allow_none: bool) -> None:
+    """Shared validation for the two floor-consent setters.
+
+    Linux tier labels are refused on macOS rather than mapped:
+    cross-platform tier comparability is refused by design (see
+    core/sandbox/tiers.py) — the untrusted contract on macOS is the
+    seatbelt tier, and RAPTOR_ALLOW_DEGRADED_UNTRUSTED remains the
+    only documented lowering surface there.
+    """
+    valid = (SANDBOX_FLOOR_CHOICES if allow_none
+             else _tiers.CONSENTABLE_FLOOR_LABELS)
+    if label not in valid:
+        msg = (
+            f"Unknown sandbox floor {label!r} for {surface}. "
+            f"Valid values: {', '.join(valid)}."
+        )
+        raise ValueError(msg)
+    if sys.platform == "darwin" and label != "none":
+        msg = (
+            f"{surface}={label!r} names a Linux containment tier — "
+            f"not applicable on macOS, where the untrusted contract "
+            f"is the seatbelt tier (cross-platform tier comparison "
+            f"is refused, not fudged). On macOS "
+            f"RAPTOR_ALLOW_DEGRADED_UNTRUSTED=1 remains the only "
+            f"lowering surface."
+        )
+        raise ValueError(msg)
+
+
+def set_cli_sandbox_floor(label: str) -> None:
+    """Called by entry points when `--sandbox-floor <tier>` is passed.
+
+    Sets the per-run untrusted containment floor — the highest-
+    precedence consent surface (flag > project setting > legacy env
+    var > default-refuse). Works in BOTH directions: lowering
+    (`landlock` accepts Landlock/seccomp-only containment for
+    untrusted work on this run) and raising (`mount-ns` pins the full
+    contract, overriding a project setting or the env waiver).
+
+    Same prompt-injection contract as set_cli_profile(): called only
+    from CLI-parsed argparse values — never from env, config, or
+    target repo content.
+    """
+    _validate_floor_label(label, surface="--sandbox-floor",
+                          allow_none=True)
+    logger.warning(
+        "Sandbox untrusted containment floor set to %r by CLI "
+        "--sandbox-floor flag", label,
+    )
+    state._cli_sandbox_floor = label
+
+
+def set_project_sandbox_floor(label: str) -> None:
+    """Project-surface twin of set_cli_sandbox_floor().
+
+    Called ONLY by the run-start project consumption path
+    (core.project.trust.apply_project_sandbox_floor) with the active
+    project's registry-validated ``sandbox-floor`` setting —
+    operator-written on-disk config under the RAPTOR projects dir,
+    never content from the scanned repo or the cwd. The per-run
+    ``--sandbox-floor`` flag beats it in both directions at floor
+    resolution (core.sandbox.context.resolve_untrusted_floor).
+
+    ``none`` is refused here outright: a standing bare floor is not a
+    project-consentable value (the registry never stores it either) —
+    untrusted work never runs bare by consent.
+    """
+    _validate_floor_label(label, surface="project setting sandbox-floor",
+                          allow_none=False)
+    logger.info(
+        "Sandbox untrusted containment floor set to %r by the active "
+        "project's sandbox-floor setting (per-run --sandbox-floor "
+        "overrides)", label,
+    )
+    state._project_sandbox_floor = label
 
 
 def set_cli_readable_paths(paths: list) -> None:
@@ -76,7 +202,7 @@ def set_cli_readable_paths(paths: list) -> None:
         "Sandbox read allowlist extended via --sandbox-readable-path: %s",
         ", ".join(paths),
     )
-    state._cli_sandbox_readable_paths = list(paths)
+    state._cli_sandbox_readable_paths = list(paths)  # type: ignore[assignment]
 
 
 def set_cli_tool_paths(paths: list) -> None:
@@ -90,7 +216,7 @@ def set_cli_tool_paths(paths: list) -> None:
         "Sandbox tool paths extended via --sandbox-tool-path: %s",
         ", ".join(paths),
     )
-    state._cli_sandbox_tool_paths = list(paths)
+    state._cli_sandbox_tool_paths = list(paths)  # type: ignore[assignment]
 
 
 def add_cli_args(parser: argparse.ArgumentParser) -> None:
@@ -157,6 +283,37 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
              "volume — expect thousands of records per run. Requires "
              "--audit. Distinct from any entry-point's own --verbose "
              "flag (which controls log level, not audit output).",
+    )
+    parser.add_argument(
+        "--sandbox-floor", choices=list(SANDBOX_FLOOR_CHOICES),
+        default=None, dest="sandbox_floor", metavar="TIER",
+        help="Per-run consent for the UNTRUSTED containment floor "
+             "(mount-ns | mountless-ns | ns-only | landlock | none). "
+             "Untrusted-class work (attacker-derived payloads, PoC "
+             "execution, target binaries) refuses to run below this "
+             "tier; lanes at or above it are admitted. Lowering "
+             "(e.g. 'landlock' on a host without user namespaces) "
+             "accepts exactly the named tier and nothing below it; "
+             "raising (e.g. 'mount-ns') pins the full contract, "
+             "overriding the project's sandbox-floor setting and "
+             "the RAPTOR_ALLOW_DEGRADED_UNTRUSTED env var "
+             "(precedence: this flag > project setting > env var > "
+             "default-refuse; a banner names both surfaces on "
+             "disagreement). 'none' is NOT a consentable untrusted "
+             "floor — untrusted work never runs bare by consent; "
+             "use the authoritative --sandbox none / --no-sandbox "
+             "for the global sandbox-off. Orthogonal to --sandbox "
+             "(profile = enforcement strictness; floor = minimum "
+             "delivered containment tier). The degraded-NETWORK "
+             "acceptance stays env-var-only (network is a separate "
+             "axis, not a tier); no tier waives a missing libseccomp "
+             "(every tier includes the filter), and an explicit "
+             "floor withdraws the env waiver's filterless "
+             "acceptance. The construction-time Landlock-"
+             "enforceability acceptance follows the same chain for "
+             "ALL calls (the env var's existing host-wide reach), so "
+             "a raised floor also refuses it for trusted "
+             "policy-bearing calls on Landlock-less kernels.",
     )
     parser.add_argument(
         "--sandbox-readable-path", action="append", default=None,
@@ -228,6 +385,7 @@ def apply_cli_args(
     profile = getattr(args, "sandbox", None)
     readable = getattr(args, "sandbox_readable_paths", None)
     tool_dirs = getattr(args, "sandbox_tool_paths", None)
+    floor = getattr(args, "sandbox_floor", None)
 
     def _fail(msg: str) -> None:
         if parser is not None:
@@ -276,6 +434,24 @@ def apply_cli_args(
             "compare against. Use --sandbox full --audit (default) "
             "to engage audit mode."
         )
+    if floor is not None:
+        if no_sandbox or profile == "none":
+            _fail(
+                "--sandbox-floor is incoherent with --sandbox none / "
+                "--no-sandbox: with the sandbox globally disabled "
+                "(the authoritative operator surface) there is no "
+                "containment floor to hold. Drop --sandbox-floor, or "
+                "drop the disable."
+            )
+        if sys.platform == "darwin" and floor != "none":
+            _fail(
+                f"--sandbox-floor {floor} names a Linux containment "
+                f"tier — not applicable on macOS, where the untrusted "
+                f"contract is the seatbelt tier (cross-platform tier "
+                f"comparison is refused, not fudged). On macOS "
+                f"RAPTOR_ALLOW_DEGRADED_UNTRUSTED=1 remains the only "
+                f"lowering surface."
+            )
     # Allowlist extensions: validate existence up-front (a typo'd path
     # would otherwise surface later as the very read-denial the flag
     # was meant to fix), and reject the incoherent no-sandbox combo.
@@ -310,20 +486,42 @@ def apply_cli_args(
                     )
                 _validated_tools.append(str(rp))
 
+    # Consent-gated disable: SandboxDisableRefusedError is a refusal,
+    # not a validation typo — but at a CLI boundary it gets the same
+    # clean parser.error UX as the incoherence checks above (single
+    # line, exit 2, no traceback). Library callers (parser=None) see
+    # the exception itself, NOT a ValueError downgrade: the refusal
+    # must keep its BaseException lineage so a broad `except
+    # Exception` between here and the run can never swallow it and
+    # proceed at a posture the gate refused to decide.
     if no_sandbox:
-        disable_from_cli()
+        try:
+            disable_from_cli()
+        except SandboxDisableRefusedError as exc:
+            if parser is not None:
+                parser.error(str(exc))
+            raise
     elif profile is not None:
-        set_cli_profile(profile)
+        try:
+            set_cli_profile(profile)
+        except SandboxDisableRefusedError as exc:
+            if parser is not None:
+                parser.error(str(exc))
+            raise
+    if floor is not None:
+        set_cli_sandbox_floor(floor)
     if audit:
         state._cli_sandbox_audit = True
         logger.warning(
-            "Sandbox audit mode engaged via --audit "
-            "(workflow runs but enforcement events are logged not blocked)"
+            "Sandbox audit mode engaged via --audit (seccomp denials "
+            "become trace-and-log except the escape-primitive set, "
+            "and the egress proxy logs instead of blocking; Landlock "
+            "filesystem rules stay ENFORCING on Linux)"
         )
     if verbose:
         state._cli_sandbox_audit_verbose = True
     if budget is not None:
-        state._cli_sandbox_audit_budget = int(budget)
+        state._cli_sandbox_audit_budget = int(budget)  # type: ignore[assignment]
     if _validated_readable:
         set_cli_readable_paths(_validated_readable)
     if _validated_tools:

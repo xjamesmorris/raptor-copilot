@@ -679,6 +679,10 @@ class TestAuditConfigWriteFailureHandling:
 
 
 @requires_landlock
+# Real sandbox() runs against the real kernel's lane — real-kernel
+# binding on both platforms (native markers, pytest.ini).
+@pytest.mark.linux_native
+@pytest.mark.darwin_native
 class TestAuditMissingOutputBehaviour:
     """Handling depends on origin of the audit signal:
       - Per-call kwarg `audit=True` + no output= → ValueError (caller
@@ -757,6 +761,9 @@ class TestAuditDegradationWarning:
     pointer to the correct fix."""
 
     @requires_landlock
+    # Real sandbox() run — real-kernel binding on both platforms.
+    @pytest.mark.linux_native
+    @pytest.mark.darwin_native
     def test_no_warning_for_demoted_internal_helper(self, monkeypatch, caplog):
         """CLI --audit + sandbox call with no target/output → audit is
         silently demoted, NO degradation warning fires. The call's
@@ -806,6 +813,9 @@ class TestAuditDegradationWarning:
             "input= degradation reason missing from context.py")
 
 
+# Real sandbox() runs — real-kernel binding on both platforms.
+@pytest.mark.linux_native
+@pytest.mark.darwin_native
 class TestAuditRunDirKwarg:
     """audit_run_dir= decouples 'where audit JSONL goes' from 'what
     Landlock restricts writes to'. Required for callers like the
@@ -1025,6 +1035,9 @@ class TestAuditAcquireOrdering:
 
 
 @requires_landlock
+# Real sandbox() runs — real-kernel binding on both platforms.
+@pytest.mark.linux_native
+@pytest.mark.darwin_native
 class TestAuditComposesWithDebugProfile:
     """The flag-based refactor's headline new capability:
     `--sandbox debug --audit` runs the target with debug-profile
@@ -1100,6 +1113,9 @@ class TestAuditWithExistingSandboxFlows:
         assert not jsonl.exists()
 
     @requires_landlock
+    # Real sandbox() run — real-kernel binding on both platforms.
+    @pytest.mark.linux_native
+    @pytest.mark.darwin_native
     def test_cli_audit_overrides_library(
             self, monkeypatch, tmp_path):
         # CLI's `--audit` flag must engage audit even if library
@@ -1176,6 +1192,9 @@ class TestAuditWithExistingSandboxFlows:
             proxy_mod._reset_for_tests()
 
     @requires_landlock
+    # Real sandbox() run — real-kernel binding on both platforms.
+    @pytest.mark.linux_native
+    @pytest.mark.darwin_native
     def test_audit_acquires_proxy_only_when_proxy_engaged(self):
         # use_egress_proxy=False → no proxy → no acquire on the
         # singleton. Verify ref-count stays zero across an audit

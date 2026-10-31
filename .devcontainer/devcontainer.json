@@ -16,7 +16,22 @@
       "NO_PROXY": "${localEnv:NO_PROXY}"
     }
   },
-  "runArgs": ["--privileged"],
+  // Default posture: UNPRIVILEGED. RAPTOR's threat model treats
+  // scanned repos as hostile — under --privileged + passwordless sudo
+  // + host-secret bind mounts, one in-container escalation was
+  // host-equivalent by configuration. SYS_PTRACE + seccomp=unconfined
+  // cover the standing needs (gdb/strace, rr REPLAY, the namespace +
+  // Landlock sandbox machinery) without all-capabilities and host
+  // device access.
+  //
+  // rr RECORDING profile (opt-in, local edit): recording needs
+  // hardware perf counters — replace the line below with
+  //   "runArgs": ["--privileged"],
+  // and rebuild; the postStartCommand's perf_event_paranoid write
+  // only succeeds under that profile (it degrades silently
+  // otherwise). Pinned by .github/tests/test_devcontainer_config.py:
+  // --privileged must never be the default again.
+  "runArgs": ["--cap-add=SYS_PTRACE", "--security-opt", "seccomp=unconfined"],
   "features": {
     "ghcr.io/devcontainers/features/git:1": {},
     "ghcr.io/devcontainers/features/github-cli:1": {}
@@ -32,7 +47,7 @@
         "GitHub.vscode-codeql"
       ],
       "settings": {
-        "python.defaultInterpreterPath": "/usr/bin/python3",
+        "python.defaultInterpreterPath": "/opt/raptor-venv/bin/python",
         "python.terminal.activateEnvironment": true,
         "editor.formatOnSave": true
       }
@@ -42,7 +57,7 @@
     "GIT_TERMINAL_PROMPT": "0",
     "PYTHONUNBUFFERED": "1",
     "PYTHONDONTWRITEBYTECODE": "1",
-    // Runtime proxy passthrough (postCreateCommand pip installs,
+    // Runtime proxy passthrough (postCreateCommand uv sync,
     // in-container scans). Loopback appended to NO_PROXY so
     // in-container sidecars (SAGE, Ollama) are never proxied.
     "http_proxy": "${localEnv:http_proxy}",
@@ -54,9 +69,16 @@
   },
   "mounts": [
     "source=${localWorkspaceFolder}/.env,target=/workspaces/raptor/.env,type=bind,consistency=cached",
-    "source=${localEnv:HOME}/.claude,target=/root/.claude,type=bind,consistency=cached"
+    // Target the REMOTE USER's home: the claude CLI runs as vscode
+    // (HOME=/home/vscode) and resolves ~/.claude there. A /root
+    // target was a dead credential mount — never read by the
+    // intended user (fresh unauthenticated state every container)
+    // while the operator's real credentials and cross-project
+    // history sat readable via sudo. Pinned by
+    // .github/tests/test_devcontainer_config.py.
+    "source=${localEnv:HOME}/.claude,target=/home/vscode/.claude,type=bind,consistency=cached"
   ],
-  "postCreateCommand": "pip install -r .devcontainer/requirements-all-optional.txt && pip install -r requirements-dev.txt",
+  "postCreateCommand": "uv sync --locked --extra llm --extra web --extra sage --extra binary --extra grammars --extra h2 --extra frida && uv tool install semgrep==1.177.0",
   "postStartCommand": "sudo sh -c 'echo 1 > /proc/sys/kernel/perf_event_paranoid 2>/dev/null || true'",
   "remoteUser": "vscode"
 }

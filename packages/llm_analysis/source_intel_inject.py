@@ -56,14 +56,14 @@ try:
         DEFAULT_SOURCE_INTEL_RULE_PREFIXES as _DEFAULT_RULE_PREFIXES,
     )
 except ImportError:
-    _analyze = None
-    _derive_evidence_strings = None
+    _analyze = None  # type: ignore[assignment]
+    _derive_evidence_strings = None  # type: ignore[assignment]
     _DEFAULT_RULE_PREFIXES = frozenset()
 
 try:
     from core.build.build_flags import extract_flags as _extract_flags
 except ImportError:
-    _extract_flags = None
+    _extract_flags = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -199,6 +199,35 @@ def prepare_source_intel(
         )
 
 
+# Short-TTL memo for the per-repo tree signature. The evidence lookup
+# runs once per finding per prompt builder (analysis/exploit/patch/
+# consensus/judge/retry): ~5-6·N filesystem-walking stamps per run for
+# a value that only changes when the tree does. TTL trade-off, both
+# directions: longer TTL = staler freshness check (an edit inside the
+# window serves pre-edit evidence for up to TTL seconds); shorter =
+# more redundant tree walks on memory-corruption-heavy C targets. The
+# tree is not expected to change mid-dispatch-batch, so 30s is safe.
+_SIG_MEMO_TTL_S = 30.0
+_SIG_MEMO: dict[str, tuple[float, object]] = {}
+_SIG_MEMO_LOCK = threading.Lock()
+
+
+def _target_signature_memoised(repo_key: str) -> object:
+    import time
+
+    from packages.source_intel.cache import compute_target_signature
+
+    now = time.monotonic()
+    with _SIG_MEMO_LOCK:
+        hit = _SIG_MEMO.get(repo_key)
+        if hit is not None and now - hit[0] < _SIG_MEMO_TTL_S:
+            return hit[1]
+    sig = compute_target_signature(Path(repo_key))
+    with _SIG_MEMO_LOCK:
+        _SIG_MEMO[repo_key] = (now, sig)
+    return sig
+
+
 def evidence_blocks_for_finding(
     finding: dict[str, Any],
 ) -> tuple[UntrustedBlock, ...]:
@@ -246,9 +275,8 @@ def evidence_blocks_for_finding(
         return ()
     # Validate freshness outside the lock — signature compute walks
     # the filesystem and would serialise unrelated lookups.
-    from packages.source_intel.cache import compute_target_signature
     cached_sig, result = entry
-    current_sig = compute_target_signature(Path(repo_key))
+    current_sig = _target_signature_memoised(repo_key)
     if cached_sig != current_sig:
         # Re-check under the lock that we're popping the same
         # entry we read; a concurrent prepare may have refreshed it.

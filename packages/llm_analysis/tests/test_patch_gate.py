@@ -26,8 +26,10 @@ semgrep is not installed — the pure-Python layers are always exercised.
 from __future__ import annotations
 
 import difflib
+import functools
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -106,12 +108,34 @@ def _fenced_response(diff: str) -> str:
     return f"Here is the fix.\n\n```diff\n{diff}```\n\nBounded copy now.\n"
 
 
+@functools.lru_cache(maxsize=None)
 def _sandbox_available() -> bool:
+    """Functional probe: can the gate's sandbox invocation run here?
+
+    Probes the same profile ``_make_runner`` uses for the real gate
+    commands (network blocked, target/output confinement, throwaway
+    HOME) — the guarded tests need exactly that shape to work, and a
+    bare ``run()`` would consume the once-per-process bare-run posture
+    advisory, leaving the first genuine bare-run caller unattributed.
+    Memoised: at most one sandboxed subprocess per process, and only
+    when a sandbox-marked test is actually about to run.
+    """
     run = patch_gate._import_sandbox_run()
     if run is None:
         return False
     try:
-        return run(["true"], capture_output=True, timeout=30).returncode == 0
+        with tempfile.TemporaryDirectory(prefix="raptor_pg_probe_") as td:
+            return run(
+                ["true"],
+                block_network=True,
+                target=td,
+                output=td,
+                fake_home=True,
+                caller_label="patch-gate-test-probe",
+                env_caller_filtered=True,
+                capture_output=True,
+                timeout=30,
+            ).returncode == 0
     except Exception:  # noqa: BLE001 — any sandbox failure means "not usable here"
         return False
 
@@ -120,9 +144,21 @@ def _semgrep_available() -> bool:
     return shutil.which("semgrep") is not None
 
 
-needs_sandbox = pytest.mark.skipif(
-    not _sandbox_available(), reason="core.sandbox not runnable on this host",
-)
+@pytest.fixture
+def _sandbox_or_skip() -> None:
+    """Skip sandbox-dependent tests lazily, at test-setup time.
+
+    A module-level ``skipif(not _sandbox_available(), ...)`` evaluates
+    its condition during import — i.e. at pytest COLLECTION — spawning
+    a sandboxed subprocess in every pytest invocation and every xdist
+    worker before a single test runs. The fixture defers the probe to
+    the first test that needs it.
+    """
+    if not _sandbox_available():
+        pytest.skip("core.sandbox not runnable on this host")
+
+
+needs_sandbox = pytest.mark.usefixtures("_sandbox_or_skip")
 needs_semgrep = pytest.mark.skipif(
     not _semgrep_available(), reason="semgrep not installed",
 )
@@ -940,6 +976,358 @@ class TestMultiFenceGating:
         assert not any("diff blocks" in n for n in result.notes)
 
 
+class TestFencelessSmuggling:
+    """The saved artifact is the WHOLE response, and ``git apply``
+    treats prose and code fences as junk between fragments — it acts
+    on every diff fragment anywhere in the text. Every spelling of
+    "benign gated content + un-inspected rider" must therefore either
+    be collected into the gated diff set or flagged as unparsed
+    apply-actionable content."""
+
+    def test_extract_collects_every_bare_diff(self):
+        response = (
+            _make_diff(VULN_C, FIXED_C)
+            + "\nSome explanation prose here.\n\n"
+            + PAYLOAD_DIFF
+        )
+        diffs = patch_gate.extract_unified_diffs(response)
+        assert len(diffs) == 2
+        assert diffs[0].files[0].new_path.endswith("vuln.c")
+        assert diffs[1].files[0].new_path.endswith("auth.c")
+
+    def test_decoy_first_bare_diff_does_not_shield_second(
+        self, fixture_repo, monkeypatch,
+    ):
+        """Fenceless twin of test_decoy_first_fence_does_not_shield_second:
+        an in-scope bare decoy diff, prose, then a second bare diff
+        touching other code must NOT earn ``scope: in-bounds``."""
+        monkeypatch.setattr(patch_gate, "_import_sandbox_run", lambda: None)
+        response = (
+            "Fix:\n\n" + _make_diff(VULN_C, FIXED_C)
+            + "\nAnd apply this too:\n\n" + PAYLOAD_DIFF
+        )
+        result = run_patch_gate(
+            response,
+            repo_path=fixture_repo, file_path="vuln.c",
+            start_line=FINDING_LINE, end_line=FINDING_LINE,
+        )
+        assert result.format == "unified-diff"
+        assert result.scope == "OUT-OF-SCOPE HUNKS"
+        assert any("auth.c" in hunk for hunk in result.out_of_scope_hunks)
+        assert any("diff blocks" in n for n in result.notes)
+
+    def test_bare_diff_outside_fences_still_gated(self):
+        """A fenced diff must not stop the scan: git apply reads the
+        fence lines as junk and applies the bare rider too."""
+        response = (
+            "```diff\n" + _make_diff(VULN_C, FIXED_C) + "```\n\n"
+            "Also needed:\n\n" + PAYLOAD_DIFF
+        )
+        diffs = patch_gate.extract_unified_diffs(response)
+        assert len(diffs) == 2
+        assert diffs[1].files[0].new_path.endswith("auth.c")
+
+    def test_bare_diff_after_trailing_junk_collected(self):
+        junk = "Notes:\n----\nnot a diff\n@@ misleading @@\n\n"
+        response = _make_diff(VULN_C, FIXED_C) + "\n" + junk + PAYLOAD_DIFF
+        diffs = patch_gate.extract_unified_diffs(response)
+        assert len(diffs) == 2
+
+    def test_bare_restatement_of_fenced_diff_dedupes(self):
+        diff = _make_diff(VULN_C, FIXED_C)
+        response = "```diff\n" + diff + "```\n\nThat is:\n\n" + diff
+        assert len(patch_gate.extract_unified_diffs(response)) == 1
+
+    def test_operator_git_apply_consumes_both_bare_diffs(self, tmp_path):
+        """The operator-applies half: ``git apply`` of the whole saved
+        two-diff artifact exits 0 and modifies BOTH files — the reason
+        the gate must inspect the full apply payload."""
+        import subprocess
+        git = shutil.which("git")
+        if git is None:
+            pytest.skip("git not installed")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "vuln.c").write_text(VULN_C, encoding="utf-8")
+        auth_before = "int check_password(const char *p);\n"
+        (repo / "auth.c").write_text(auth_before, encoding="utf-8")
+        artifact = (
+            _make_diff(VULN_C, FIXED_C)
+            + "\nSome explanation prose here.\n\n"
+            + PAYLOAD_DIFF
+        )
+        patch_file = tmp_path / "artifact.txt"
+        patch_file.write_text(artifact, encoding="utf-8")
+        proc = subprocess.run(
+            [git, "apply", "-p1", str(patch_file)],
+            cwd=repo, capture_output=True, text=True, timeout=60,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert (repo / "vuln.c").read_text(encoding="utf-8") == FIXED_C
+        assert "check_password_disabled" in (repo / "auth.c").read_text(
+            encoding="utf-8",
+        )
+        # ...and the gate's diff collection covers exactly that payload.
+        diffs = patch_gate.extract_unified_diffs(artifact)
+        assert {fd.new_path for d in diffs for fd in d.files} == {
+            "b/vuln.c", "b/auth.c",
+        }
+
+
+class TestUnparsedApplyActionableContent:
+    """Constructs ``git apply`` acts on WITHOUT any scope-checkable
+    ``@@`` hunk (mode-change / rename / copy headers, binary patch
+    blocks) and diff headers whose body fails the strict parse must
+    surface as residues — never ride an otherwise-clean gate block."""
+
+    def _gate(self, fixture_repo, monkeypatch, response):
+        monkeypatch.setattr(patch_gate, "_import_sandbox_run", lambda: None)
+        return run_patch_gate(
+            response,
+            repo_path=fixture_repo, file_path="vuln.c",
+            start_line=FINDING_LINE, end_line=FINDING_LINE,
+        )
+
+    def test_mode_change_only_section_flagged(self, fixture_repo, monkeypatch):
+        response = (
+            _make_diff(VULN_C, FIXED_C)
+            + "\ndiff --git a/runme.sh b/runme.sh\n"
+            "old mode 100644\n"
+            "new mode 100755\n"
+        )
+        result = self._gate(fixture_repo, monkeypatch, response)
+        assert result.format == "unified-diff+unparsed-diff-content"
+        assert result.scope == "OUT-OF-SCOPE HUNKS"
+        assert result.reliable is False
+        assert any("mode-change" in n for n in result.notes)
+
+    def test_rename_only_section_flagged(self, fixture_repo, monkeypatch):
+        response = (
+            _make_diff(VULN_C, FIXED_C)
+            + "\ndiff --git a/auth.c b/auth_disabled.c\n"
+            "similarity index 100%\n"
+            "rename from auth.c\n"
+            "rename to auth_disabled.c\n"
+        )
+        result = self._gate(fixture_repo, monkeypatch, response)
+        assert result.format == "unified-diff+unparsed-diff-content"
+        assert result.scope == "OUT-OF-SCOPE HUNKS"
+        assert any("rename" in n for n in result.notes)
+
+    def test_binary_patch_block_flagged(self, fixture_repo, monkeypatch):
+        response = (
+            _make_diff(VULN_C, FIXED_C)
+            + "\ndiff --git a/blob.bin b/blob.bin\n"
+            "GIT binary patch\n"
+            "literal 8\n"
+            "Pc%18D`zia&LxL2Yv\n\n"
+        )
+        result = self._gate(fixture_repo, monkeypatch, response)
+        assert result.format == "unified-diff+unparsed-diff-content"
+        assert result.scope == "OUT-OF-SCOPE HUNKS"
+        assert any("binary patch" in n for n in result.notes)
+
+    def test_unparsed_header_pair_flagged(self, fixture_repo, monkeypatch):
+        # A second ---/+++ header whose hunk is malformed: our strict
+        # parser can't inspect it, so it must be flagged rather than
+        # silently dropped.
+        response = (
+            _make_diff(VULN_C, FIXED_C)
+            + "\n--- a/auth.c\n"
+            "+++ b/auth.c\n"
+            "@@ -1,99 +1,1 @@\n"
+            "+int check_password_disabled(const char *p);\n"
+        )
+        result = self._gate(fixture_repo, monkeypatch, response)
+        assert result.format == "unified-diff+unparsed-diff-content"
+        assert any("does not parse" in n for n in result.notes)
+
+    def test_residues_without_any_diff_stay_not_a_unified_diff(
+        self, fixture_repo, monkeypatch,
+    ):
+        response = (
+            "diff --git a/runme.sh b/runme.sh\n"
+            "old mode 100644\n"
+            "new mode 100755\n"
+        )
+        result = self._gate(fixture_repo, monkeypatch, response)
+        assert result.format == "not-a-unified-diff"
+        assert result.reliable is False
+        assert any("mode-change" in n for n in result.notes)
+
+    def test_clean_single_diff_with_git_headers_not_flagged(
+        self, fixture_repo, monkeypatch,
+    ):
+        # Two-direction: ordinary git-style headers (diff --git, index,
+        # new/deleted file mode) on a hunked diff are NOT residues.
+        response = (
+            "diff --git a/vuln.c b/vuln.c\n"
+            "index 0000000..1111111 100644\n"
+            + _make_diff(VULN_C, FIXED_C)
+        )
+        result = self._gate(fixture_repo, monkeypatch, response)
+        assert result.format == "unified-diff"
+        assert result.scope == "in-bounds"
+        assert result.reliable is True
+        assert not any("apply-actionable" in n for n in result.notes)
+
+
+class TestLineSplitterSmuggling:
+    """git apply consumes \\n-delimited lines ONLY. str.splitlines()
+    additionally splits on \\x0b \\x0c \\x1c-\\x1e \\x85 U+2028 U+2029 —
+    a rider whose OLD header carries one of those mid-path fragments
+    into non-header parser lines and becomes invisible to a
+    splitlines()-based scanner while staying fully actionable by git
+    apply. The scanner must share git's line model."""
+
+    SPLITTERS = ("\x0b", "\x0c", "\x1c", "\x1d", "\x1e",
+                 "\x85", " ", " ")
+
+    def _artifact(self, ch: str) -> str:
+        rider = (
+            f"--- a/au{ch}th.c\n"
+            "+++ b/auth.c\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-int check_password(const char *p);\n"
+            "+int check_password_disabled(const char *p);\n"
+        )
+        return (
+            _make_diff(VULN_C, FIXED_C) + "\nAlso:\n\n" + rider
+        )
+
+    @pytest.mark.parametrize("ch", SPLITTERS)
+    def test_splitter_in_old_header_cannot_hide_the_rider(self, ch):
+        diffs, residues = patch_gate.scan_patch_response(self._artifact(ch))
+        files = {fd.new_path for d in diffs for fd in d.files}
+        assert "b/auth.c" in files or residues, (
+            f"rider hidden by splitter {ch!r}: files={files}, "
+            f"residues={residues}"
+        )
+
+    def test_splitter_rider_flags_the_gate(self, fixture_repo, monkeypatch):
+        monkeypatch.setattr(patch_gate, "_import_sandbox_run", lambda: None)
+        result = run_patch_gate(
+            self._artifact("\x0c"),
+            repo_path=fixture_repo, file_path="vuln.c",
+            start_line=FINDING_LINE, end_line=FINDING_LINE,
+        )
+        assert result.scope == "OUT-OF-SCOPE HUNKS"
+
+    def test_plain_newline_artifacts_scan_identically(self):
+        # Two-direction: ordinary \n responses are unaffected.
+        response = _make_diff(VULN_C, FIXED_C) + "\nprose\n\n" + PAYLOAD_DIFF
+        diffs, residues = patch_gate.scan_patch_response(response)
+        assert len(diffs) == 2
+        assert residues == []
+
+
+class TestHunklessFileModeSections:
+    """Empty-file creates/deletes carry NO hunks — `new file mode` /
+    `deleted file mode` sections without a ``--- /+++ `` pair are
+    applied by git apply with nothing for the scope check to see."""
+
+    def _gate(self, fixture_repo, monkeypatch, response):
+        monkeypatch.setattr(patch_gate, "_import_sandbox_run", lambda: None)
+        return run_patch_gate(
+            response,
+            repo_path=fixture_repo, file_path="vuln.c",
+            start_line=FINDING_LINE, end_line=FINDING_LINE,
+        )
+
+    def test_hunkless_delete_section_flagged(self, fixture_repo, monkeypatch):
+        response = (
+            _make_diff(VULN_C, FIXED_C)
+            + "\ndiff --git a/__init__.py b/__init__.py\n"
+            "deleted file mode 100644\n"
+            "index e69de29..0000000\n"
+        )
+        result = self._gate(fixture_repo, monkeypatch, response)
+        assert result.format == "unified-diff+unparsed-diff-content"
+        assert result.scope == "OUT-OF-SCOPE HUNKS"
+        assert result.reliable is False
+        assert any("hunkless" in n for n in result.notes)
+
+    def test_hunkless_new_file_section_flagged(self, fixture_repo, monkeypatch):
+        response = (
+            _make_diff(VULN_C, FIXED_C)
+            + "\ndiff --git a/runme b/runme\n"
+            "new file mode 100755\n"
+            "index 0000000..e69de29\n"
+        )
+        result = self._gate(fixture_repo, monkeypatch, response)
+        assert result.format == "unified-diff+unparsed-diff-content"
+        assert any("hunkless" in n for n in result.notes)
+
+    def test_hunked_new_and_deleted_file_diffs_not_flagged(
+        self, fixture_repo, monkeypatch,
+    ):
+        # Two-direction: ordinary hunked new/deleted-file diffs keep
+        # their headers as tolerated noise (their hunks are scope-
+        # checked like any other).
+        response = (
+            "diff --git a/new.c b/new.c\n"
+            "new file mode 100644\n"
+            "index 0000000..1111111\n"
+            "--- /dev/null\n"
+            "+++ b/new.c\n"
+            "@@ -0,0 +1,1 @@\n"
+            "+int x;\n"
+            "diff --git a/old.c b/old.c\n"
+            "deleted file mode 100644\n"
+            "index 2222222..0000000\n"
+            "--- a/old.c\n"
+            "+++ /dev/null\n"
+            "@@ -1,1 +0,0 @@\n"
+            "-int y;\n"
+        )
+        result = self._gate(fixture_repo, monkeypatch, response)
+        assert result.format == "unified-diff"
+        assert not any("hunkless" in n for n in result.notes)
+
+
+class TestContextFormatRiders:
+    """Context-format (``*** `` / ``--- `` / ``***************``)
+    sections are ignored by git apply but APPLIED by GNU ``patch -p1``
+    — an operator surface the artifact can plausibly meet. Flag them
+    fail-closed."""
+
+    CONTEXT_RIDER = (
+        "*** auth.c\t2026-01-01\n"
+        "--- auth.c\t2026-01-02\n"
+        "***************\n"
+        "*** 1 ****\n"
+        "! int check_password(const char *p);\n"
+        "--- 1 ----\n"
+        "! int check_password_disabled(const char *p);\n"
+    )
+
+    def test_context_format_rider_flagged(self, fixture_repo, monkeypatch):
+        monkeypatch.setattr(patch_gate, "_import_sandbox_run", lambda: None)
+        response = _make_diff(VULN_C, FIXED_C) + "\n" + self.CONTEXT_RIDER
+        result = run_patch_gate(
+            response,
+            repo_path=fixture_repo, file_path="vuln.c",
+            start_line=FINDING_LINE, end_line=FINDING_LINE,
+        )
+        assert result.format == "unified-diff+unparsed-diff-content"
+        assert result.reliable is False
+        assert any("context-format" in n for n in result.notes)
+
+    def test_lone_star_prose_not_flagged(self, fixture_repo, monkeypatch):
+        monkeypatch.setattr(patch_gate, "_import_sandbox_run", lambda: None)
+        response = (
+            _make_diff(VULN_C, FIXED_C)
+            + "\n*** Note: bounded copy now ***\nAll done.\n"
+        )
+        result = run_patch_gate(
+            response,
+            repo_path=fixture_repo, file_path="vuln.c",
+            start_line=FINDING_LINE, end_line=FINDING_LINE,
+        )
+        assert result.format == "unified-diff"
+        assert not any("context-format" in n for n in result.notes)
+
+
 # ---------------------------------------------------------------------------
 # Absolute finding paths — gate runs instead of crash-as-skip
 # ---------------------------------------------------------------------------
@@ -1013,3 +1401,181 @@ class TestAbsoluteFindingPaths:
         )
         assert result.gate == "skipped"
         assert any("escapes the repo" in n for n in result.notes)
+
+
+class TestSemgrepCacheMemo:
+    """Registry-pack resolution is memoised per process, stamped with
+    the pack files' signature — pre-memo, every gated patch re-read
+    and re-parsed every cache pack (up to 50 MB each)."""
+
+    def _setup(self, tmp_path, monkeypatch):
+        import json as _json
+
+        cache_dir = tmp_path / "packs"
+        cache_dir.mkdir()
+        (cache_dir / "c.a.json").write_text(
+            _json.dumps({"rules": [{"id": "pack.rule-one"}]}),
+        )
+        (cache_dir / "c.b.json").write_text(
+            _json.dumps({"rules": [{"id": "pack.rule-two"}]}),
+        )
+        from core.config import RaptorConfig
+        monkeypatch.setattr(
+            RaptorConfig, "SEMGREP_REGISTRY_CACHE_DIR", str(cache_dir),
+            raising=False,
+        )
+        monkeypatch.setattr(patch_gate, "_SEMGREP_RULE_CACHE", {})
+        monkeypatch.setattr(patch_gate, "_SEMGREP_RULE_CACHE_SIG", None)
+
+        counts = {"loads": 0}
+        real_loads = patch_gate.json.loads
+
+        def counting_loads(*a, **k):
+            counts["loads"] += 1
+            return real_loads(*a, **k)
+
+        monkeypatch.setattr(patch_gate.json, "loads", counting_loads)
+        return cache_dir, counts
+
+    def test_repeat_lookups_parse_packs_once(self, tmp_path, monkeypatch):
+        _cache_dir, counts = self._setup(tmp_path, monkeypatch)
+        first = patch_gate._find_cached_semgrep_rule("rule-two")
+        assert first is not None and first.name == "c.b.json"
+        n_first = counts["loads"]
+        assert n_first >= 1
+        for _ in range(3):
+            again = patch_gate._find_cached_semgrep_rule("rule-two")
+            assert again == first
+        assert counts["loads"] == n_first  # memo hit — no re-parses
+
+    def test_missing_rule_result_also_memoised(self, tmp_path, monkeypatch):
+        _cache_dir, counts = self._setup(tmp_path, monkeypatch)
+        assert patch_gate._find_cached_semgrep_rule("no-such-rule") is None
+        n_first = counts["loads"]
+        assert patch_gate._find_cached_semgrep_rule("no-such-rule") is None
+        assert counts["loads"] == n_first
+
+    def test_cache_refresh_invalidates_memo(self, tmp_path, monkeypatch):
+        import json as _json
+        import os as _os
+
+        cache_dir, _counts = self._setup(tmp_path, monkeypatch)
+        assert patch_gate._find_cached_semgrep_rule(
+            "rule-one",
+        ).name == "c.a.json"
+        # The pack no longer carries the rule; bump mtime so the
+        # signature stamp shifts.
+        pack = cache_dir / "c.a.json"
+        pack.write_text(_json.dumps({"rules": [{"id": "pack.other"}]}))
+        st = pack.stat()
+        _os.utime(pack, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+        assert patch_gate._find_cached_semgrep_rule("rule-one") is None
+
+
+class TestAppliedRegionVerification:
+    """git apply locates hunks by CONTEXT with an unbounded offset
+    search — a hunk declaring an in-span @@ line whose context only
+    matches far away is silently relocated there, so the claimed-
+    offset scope check alone can grade a relocated backdoor
+    in-bounds. The post-apply differential grades what actually
+    changed."""
+
+    BIG_C = "\n".join(
+        [f"int filler_{i};" for i in range(1, 150)]
+        + ["int admin_check_a;", "int admin_check_b;", "int admin_check_c;"]
+    ) + "\n"
+
+    # Claims lines 10-12 (inside the finding window) but its context
+    # only exists at lines 150-152.
+    LYING_DIFF = (
+        "--- a/big.c\n"
+        "+++ b/big.c\n"
+        "@@ -10,3 +10,3 @@\n"
+        " int admin_check_a;\n"
+        "-int admin_check_b;\n"
+        "+int admin_check_backdoored;\n"
+        " int admin_check_c;\n"
+    )
+
+    def test_drift_detected_in_baseline_coordinates(self, tmp_path):
+        baseline = tmp_path / "base.c"
+        patched = tmp_path / "patched.c"
+        baseline.write_text(self.BIG_C, encoding="utf-8")
+        patched.write_text(
+            self.BIG_C.replace("admin_check_b", "admin_check_backdoored"),
+            encoding="utf-8",
+        )
+        drift = patch_gate._applied_region_drift(
+            baseline, patched, start_line=10, end_line=12, slack=5,
+        )
+        assert drift
+        assert any("151" in d for d in drift)
+
+    def test_in_span_change_is_clean(self, tmp_path):
+        baseline = tmp_path / "base.c"
+        patched = tmp_path / "patched.c"
+        baseline.write_text(self.BIG_C, encoding="utf-8")
+        patched.write_text(
+            self.BIG_C.replace("int filler_10;", "int filler_10_fixed;"),
+            encoding="utf-8",
+        )
+        assert patch_gate._applied_region_drift(
+            baseline, patched, start_line=10, end_line=12, slack=5,
+        ) == []
+
+    @needs_sandbox
+    def test_context_relocated_hunk_flagged_by_gate(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "big.c").write_text(self.BIG_C, encoding="utf-8")
+        result = run_patch_gate(
+            "Fix:\n\n" + self.LYING_DIFF,
+            repo_path=repo, file_path="big.c",
+            start_line=10, end_line=12,
+        )
+        # The claimed offsets are in-span, the patch applies cleanly —
+        # only the post-apply differential sees the relocation.
+        assert result.apply == "ok"
+        assert result.scope == "OUT-OF-SCOPE HUNKS"
+        assert any("relocated" in h for h in result.out_of_scope_hunks)
+
+    @needs_sandbox
+    def test_honest_in_span_patch_stays_in_bounds(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "vuln.c").write_text(VULN_C, encoding="utf-8")
+        result = run_patch_gate(
+            _fenced_response(_make_diff(VULN_C, FIXED_C)),
+            repo_path=repo, file_path="vuln.c",
+            start_line=FINDING_LINE, end_line=FINDING_LINE,
+        )
+        assert result.apply == "ok"
+        assert result.scope == "in-bounds"
+
+
+class TestAppliedRegionLineDiscipline:
+    """The post-apply differential must count lines the way the file
+    (and git apply) does — \\n only. splitlines()' extra split points
+    inflate parser-line coordinates, so a target file salted with
+    \\x0c characters could relocate an out-of-window change INTO the
+    window's coordinate range and evade the drift flag."""
+
+    def test_splitter_salted_file_cannot_mislocate_drift(self, tmp_path):
+        # Real change at line 3; finding window is lines 100-140.
+        # 120 \x0c characters in line 1 push the change's
+        # splitlines() coordinate into the window.
+        salt = "// salt" + ("\x0c" * 120)
+        lines = [salt, "int keep;", "int target_line;"] + [
+            f"int filler_{i};" for i in range(4, 200)
+        ]
+        base = "\n".join(lines) + "\n"
+        patched = base.replace("int target_line;", "int backdoored;")
+        baseline_f = tmp_path / "base.c"
+        patched_f = tmp_path / "patched.c"
+        baseline_f.write_text(base, encoding="utf-8")
+        patched_f.write_text(patched, encoding="utf-8")
+        drift = patch_gate._applied_region_drift(
+            baseline_f, patched_f, start_line=120, end_line=120, slack=20,
+        )
+        assert drift, "out-of-window change hidden by splitter salting"
+        assert any("lines 3-3" in d for d in drift)

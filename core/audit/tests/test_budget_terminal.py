@@ -121,7 +121,7 @@ class TestBudgetExceededError:
     def test_typed_and_string_detection(self):
         assert is_budget_exceeded_error(LLMBudgetExceededError("nope"))
         assert is_budget_exceeded_error(
-            RuntimeError("LLM budget exceeded: $8.08 spent > $8.00 limit"),
+            RuntimeError("LLM budget exceeded: $6.25 spent > $6.00 limit"),
         )
         assert not is_budget_exceeded_error(RuntimeError("api timeout"))
         assert not is_budget_exceeded_error(ValueError("budget exceeded"))
@@ -143,7 +143,7 @@ class TestBudgetStopsReviewLoop:
             calls.append(ctx["function"])
             if len(calls) >= 2:
                 raise LLMBudgetExceededError(
-                    "LLM budget exceeded: $8.08 spent > $8.00 limit",
+                    "LLM budget exceeded: $6.25 spent > $6.00 limit",
                 )
             return ReviewOutcome(
                 file=ctx["file"], function=ctx["function"],
@@ -232,7 +232,7 @@ class TestBudgetStopsReviewLoop:
             client.exhausted = True  # spend lands on the client ledger
             return ReviewOutcome(
                 file=ctx["file"], function=ctx["function"],
-                status="clean", body="ok", cost_usd=8.0,
+                status="clean", body="ok", cost_usd=6.0,
             )
 
         cfg = _config(target, out, llm_budget_client=client)
@@ -253,22 +253,22 @@ class TestCheckBudgetConsultsClient:
         (its dispatch loops poll _check_budget per item)."""
         config = OrchestratorConfig(
             target_path=tmp_path, out_dir=tmp_path,
-            max_cost_usd=8.0,
+            max_cost_usd=6.0,
             llm_budget_client=_FakeBudgetClient(exhausted=True),
         )
         result = OrchestratorResult()
-        result.total_cost_usd = 2.82  # successful outcomes only
+        result.total_cost_usd = 3.75  # successful outcomes only
         assert _check_budget(config, 0.0, result) is True
         assert result.terminated_by == "llm_budget_exceeded"
 
     def test_not_exhausted_gate_stays_open(self, tmp_path: Path):
         config = OrchestratorConfig(
             target_path=tmp_path, out_dir=tmp_path,
-            max_cost_usd=8.0,
+            max_cost_usd=6.0,
             llm_budget_client=_FakeBudgetClient(exhausted=False),
         )
         result = OrchestratorResult()
-        result.total_cost_usd = 2.82
+        result.total_cost_usd = 3.75
         assert _check_budget(config, 0.0, result) is False
         assert result.terminated_by == "complete"
 
@@ -294,7 +294,7 @@ class TestErrorRetryStopsOnBudget:
         def review_fn(ctx, config):
             calls.append(ctx["function"])
             raise LLMBudgetExceededError(
-                "LLM budget exceeded: $8.08 spent > $8.00 limit",
+                "LLM budget exceeded: $6.25 spent > $6.00 limit",
             )
 
         result = _retry_error_outcomes(
@@ -308,24 +308,48 @@ class TestErrorRetryStopsOnBudget:
 
 
 class TestErrorVerdictsStayGapEligible:
-    def _entry(self, function: str, verdict: str) -> ReviewJournalEntry:
+    def _entry(self, function: str, verdict: str,
+               item: dict) -> ReviewJournalEntry:
+        # Journal writers record the reviewed checklist item's REAL
+        # span — the fold's per-site credits are span-bound, so a
+        # hashless verified row suppresses exactly the recorded site
+        # (a row claiming a span no checklist item occupies earns
+        # nothing; see test_hashless_row_at_unknown_site below).
         return ReviewJournalEntry(
             ts=now_iso(), run_id="run1", file="src/big.c",
             function=function, verdict=verdict, source_hash="",
-            line_start=1, line_end=10,
+            line_start=item["line_start"], line_end=item["line_end"],
         )
 
     def test_journal_error_verdict_still_a_gap(self, tmp_path: Path):
         _target, out, names = _setup_target(tmp_path, n_functions=2)
         checklist = json.loads((out / "checklist.json").read_text())
+        items = checklist["files"][0]["items"]
 
-        append_entry(out, self._entry(names[0], "error"))
-        append_entry(out, self._entry(names[1], "clean"))
+        append_entry(out, self._entry(names[0], "error", items[0]))
+        append_entry(out, self._entry(names[1], "clean", items[1]))
 
         gaps = compute_gaps(checklist, [], out_dir=out)
         gap_names = {g["name"] for g in gaps}
         assert names[0] in gap_names   # error → retry next run
         assert names[1] not in gap_names
+
+    def test_hashless_row_at_unknown_site_stays_a_gap(self, tmp_path: Path):
+        """A verified journal row with NO source hash suppresses only
+        the site it recorded. When the recorded span matches no
+        checklist item, the function re-reviews (over-review, the
+        safe direction) — a wildcard credit here would let a reviewed
+        1-line prototype suppress its unreviewed same-named body, the
+        documented missed-vulnerability failure the span-bound
+        credits exist to prevent."""
+        _target, out, names = _setup_target(tmp_path, n_functions=2)
+        checklist = json.loads((out / "checklist.json").read_text())
+
+        append_entry(out, self._entry(
+            names[1], "clean", {"line_start": 999, "line_end": 1010}))
+
+        gaps = compute_gaps(checklist, [], out_dir=out)
+        assert names[1] in {g["name"] for g in gaps}
 
     def test_coverage_import_skips_error_verdicts(self, tmp_path: Path):
         """The run-completion journal→coverage-store projection must not
@@ -337,11 +361,12 @@ class TestErrorVerdictsStayGapEligible:
 
         _target, out, names = _setup_target(tmp_path, n_functions=2)
         checklist = json.loads((out / "checklist.json").read_text())
+        items = checklist["files"][0]["items"]
         project_dir = tmp_path / "project"
         project_dir.mkdir()
 
-        append_entry(out, self._entry(names[0], "error"))
-        append_entry(out, self._entry(names[1], "clean"))
+        append_entry(out, self._entry(names[0], "error", items[0]))
+        append_entry(out, self._entry(names[1], "clean", items[1]))
         merge_into_index(project_dir, out)
 
         store = CoverageStore(tmp_path / "coverage.json")

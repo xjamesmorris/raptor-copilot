@@ -23,6 +23,7 @@ from typing import Any, TYPE_CHECKING
 
 from core.dataflow.adapters.codeql import from_sarif_result
 from core.json import loads
+from core.sarif.parser import SARIF_MAX_BYTES
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -98,11 +99,14 @@ def diff_sarif_files(
     """File-based wrapper for :func:`diff_sarif_data`. Reads both
     SARIF JSON files and forwards the parsed dicts.
 
-    Size-capped at ``_SARIF_MAX_BYTES`` per file. A hostile CodeQL
-    rule-pack could produce a multi-GiB SARIF; the cap matches
-    ``core/sarif/parser.py``'s policy (128 MiB).
+    Size-capped at ``SARIF_MAX_BYTES`` per file. A hostile CodeQL
+    rule-pack could produce a multi-GiB SARIF; the cap is
+    ``core/sarif/parser.py``'s policy constant (this docstring always
+    claimed to match that policy, but the hand-copied value had
+    drifted to 128 MiB — aliasing the constant makes the claim true
+    and keeps it true).
     """
-    _SARIF_MAX_BYTES = 128 * 1024 * 1024
+    _SARIF_MAX_BYTES = SARIF_MAX_BYTES
     for label, path in (("baseline", baseline_path), ("augmented", augmented_path)):
         try:
             sz = path.stat().st_size

@@ -53,6 +53,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # The collector clones and scans ~50 third-party OSS projects
+          # with a contents:write token in scope; keep that token out of
+          # .git/config so the scan path can't reach it (same hardening
+          # as refresh-sca-data.yml / sca-self-bump.yml). The push
+          # authenticates explicitly via the gh credential helper (see
+          # Commit + push).
+          persist-credentials: false
 
       - name: Enable the netns egress tier (unprivileged user namespaces)
         # The SCA resolvers dry-run untrusted manifests with egress
@@ -62,43 +70,53 @@ jobs:
         # allowlist). Ubuntu 24.04 runner images block unprivileged
         # user namespaces via AppArmor by default and the tier needs
         # newuidmap/newgidmap from the uidmap package.
-        run: |
-          sudo apt-get install -y --no-install-recommends uidmap
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        uses: ./.github/actions/enable-userns
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: '3.14'
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+
       - name: Install dependencies
+        shell: bash
         run: |
-          python -m pip install --upgrade pip==26.1.1
           # Full SCA dep set — the collector runs the SCA pipeline
           # against each cloned project, so it needs everything
           # SCA needs (urllib3 plus parsers' dependencies).
-          pip install -r requirements.txt
+          uv export --locked --no-hashes --no-dev | uv pip install --system -r -
           # CVSS v4 scoring — optional for end users (see the
-          # requirements.txt entry), required here so the corpus
+          # pyproject.toml entry), required here so the corpus
           # records numeric severities for v4-only advisories
           # instead of the degraded fallback label.
-          pip install cvss==3.6
+          uv pip install --system cvss==3.6
 
       - name: Collect samples
         # ``-v`` emits per-sample status lines so the PR body can
         # quote them. Exits 0 when all samples succeeded; 1 when at
-        # least one failed (others may still have written). Either
-        # way we proceed to the diff/PR step — partial refresh is
-        # better than no refresh.
+        # least one failed (others may still have written). PARTIAL
+        # failure proceeds to the diff/PR step — partial refresh is
+        # better than no refresh — but TOTAL failure (nonzero exit
+        # AND no sample file changed) must redden the run: a
+        # crash-at-import or all-samples-failed collector writes
+        # nothing, the diff is empty, and an unconditional ``true``
+        # here made a dead collector read green forever (the rot
+        # class the calibration sibling's refresh already guards).
         run: |
           set +e
           # ``--jobs 4`` matches the ubuntu-latest vCPU count. Each project
           # scans in its own process (full isolation; the egress proxy binds
           # an ephemeral per-process port) and they share the on-disk cache.
           packages/sca/scripts/raptor-sca-collect-samples -v --jobs 4
-          # Don't propagate the per-sample exit code — partial
-          # success still produces a useful diff.
-          true
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ] && \
+             git diff --quiet -- packages/sca/data/calibration/project_samples/; then
+            echo "::error::sample collector exited $rc and wrote no sample changes — total failure, not an empty refresh"
+            exit "$rc"
+          fi
 
       - name: License-compliance check
         # Same gate the calibration-corpus refresh uses — verifies
@@ -143,6 +161,11 @@ jobs:
         run: |
           set -eu
           BRANCH="auto/sca-project-samples-refresh"
+          # persist-credentials:false (see Checkout) kept the token out of
+          # .git/config for the collect step. Install gh CLI's credential
+          # helper, which reads the token from env at push time without
+          # ever embedding it in any URL stored in .git/config.
+          gh auth setup-git
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -B "$BRANCH"

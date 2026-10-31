@@ -1,0 +1,349 @@
+"""Doctrine fence for the ELF engagement chain.
+
+The chain sequences LLM-calling children (study, audit, seed
+re-review) but must never classify with one itself: its verdicts come
+from journal VERDICT rows and file existence alone. Five doctrine
+rows are pinned here, independent of the unit battery's placement:
+
+  1. **No LLM anywhere near classification** — the chain module never
+     imports an LLM/dispatch/prompt seam (the LLM work happens in
+     children behind their own gates).
+  2. **One subprocess seam** — every ``subprocess`` touch and every
+     env selection (``get_safe_env`` / ``get_llm_env``) lives inside
+     ``_run_child``; no ``shell=True``, no ``os.system``/``popen``/
+     ``exec*``/``spawn*`` anywhere. ``from subprocess import ...``
+     and ``from os import system/exec*/spawn*/popen`` are banned too
+     — bare names would evade the attribute census.
+  3. **No fence-evading calls** — no dynamic import or code
+     execution.
+  4. **Store writes stay atomic** — JSON artifacts leave through
+     ``save_json``; no hand ``open(..., "w")`` / ``write_text``
+     (``write_bytes`` never on a JSON store).
+  5. **Launcher preamble** — ``libexec/raptor-engage-chain`` carries
+     the trust-marker gate and the ``process_init`` import like every
+     other dispatch script.
+
+All rows are mechanical AST/source proofs — no repo imports, no
+toolchain; they run on any CI runner with the checkout alone.
+"""
+
+from __future__ import annotations
+
+import ast
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+CHAIN_PATH = REPO_ROOT / "core" / "engagement" / "chain_elf.py"
+LAUNCHER_PATH = REPO_ROOT / "libexec" / "raptor-engage-chain"
+
+#: Import prefixes that would put the LLM (or any dispatch seam that
+#: reaches one) inside the sequencing/verdict layer. Substring "llm"
+#: additionally catches renamed homes.
+_FORBIDDEN_IMPORT_PREFIXES = (
+    "core.llm", "core.dispatch", "packages.llm",
+    "core.security.prompt", "core.recall",
+)
+
+
+def _module_ast() -> ast.Module:
+    return ast.parse(CHAIN_PATH.read_text(encoding="utf-8"))
+
+
+def _all_imports(tree: ast.Module) -> list[str]:
+    """Every dotted name an import statement loads: each ``ast.Import``
+    alias, and for ``ast.ImportFrom`` both the source module AND each
+    ``module.name`` pair — ``from core import llm`` binds the
+    ``core.llm`` module OBJECT (whatever the alias), so recording the
+    bare source module ``core`` alone would let every guarded
+    submodule in through its from-parent spelling."""
+    names: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            names.append(node.module)
+            names.extend(
+                f"{node.module}.{alias.name}" for alias in node.names)
+    return names
+
+
+def test_no_llm_or_dispatch_import() -> None:
+    for name in _all_imports(_module_ast()):
+        assert not any(
+            name == p or name.startswith(p + ".")
+            for p in _FORBIDDEN_IMPORT_PREFIXES
+        ), f"chain imports a classification-forbidden seam: {name}"
+        assert "llm" not in name.lower(), (
+            f"chain imports an LLM-adjacent module: {name}")
+
+
+def test_llm_import_census_sees_from_parent_evasions() -> None:
+    """Probe pin: ``_all_imports`` records the ``module.name`` binding
+    for every ImportFrom alias, so module-object spellings of the
+    guarded submodules (``from core import llm`` — plain, aliased,
+    multi-name, parenthesized) reach the forbidden-prefix check
+    instead of hiding behind the bare source module ``core``."""
+    flagged: tuple[str, ...] = (
+        "from core import llm",
+        "from core import llm as _l",
+        "from core import dispatch",
+        "from core import config, llm",
+        "from core import (\n    llm,\n    dispatch,\n)",
+        "from core.security import prompt",
+        "from packages import llm",
+        "from core import recall",
+    )
+    for snippet in flagged:
+        names = _all_imports(ast.parse(snippet))
+        assert any(
+            name == p or name.startswith(p + ".")
+            for name in names
+            for p in _FORBIDDEN_IMPORT_PREFIXES
+        ), f"census missed a module-object evasion: {snippet}"
+    clear: tuple[str, ...] = (
+        "from core import config",
+        "from core.engagement.ledger import load_ledger",
+        "import subprocess",
+    )
+    for snippet in clear:
+        names = _all_imports(ast.parse(snippet))
+        assert not any(
+            name == p or name.startswith(p + ".")
+            for name in names
+            for p in _FORBIDDEN_IMPORT_PREFIXES
+        ), f"census over-matched a non-evasion: {snippet}"
+
+
+def _functions(tree: ast.Module) -> list[ast.FunctionDef]:
+    out: list[ast.FunctionDef] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            out.append(node)
+    return out
+
+
+def _owner_of(tree: ast.Module, target: ast.AST) -> str:
+    """Name of the innermost function containing ``target``."""
+    owner = "<module>"
+    for fn in _functions(tree):
+        for sub in ast.walk(fn):
+            if sub is target:
+                owner = fn.name  # innermost wins on later matches
+    return owner
+
+
+def test_subprocess_confined_to_the_single_seam() -> None:
+    """Every ``subprocess.*`` attribute use and every env selection
+    lives inside ``_run_child`` — the one place argv lists meet a
+    sanitised environment. ``shell=True`` is banned outright.
+    ``from subprocess import ...`` is banned too: a bare-name
+    ``Popen`` would evade the ``subprocess.<attr>`` census below, so
+    the module must import the module and dot into it."""
+    tree = _module_ast()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.ImportFrom) and node.module
+                and (node.module == "subprocess"
+                     or node.module.startswith("subprocess."))):
+            raise AssertionError(
+                "'from subprocess import ...' evades the seam census "
+                "— import the module and use subprocess.<attr> inside "
+                "_run_child")
+        if (isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "subprocess"):
+            owner = _owner_of(tree, node)
+            assert owner == "_run_child", (
+                f"subprocess.{node.attr} escaped the seam "
+                f"(in {owner})")
+        if (isinstance(node, ast.Attribute)
+                and node.attr in ("get_safe_env", "get_llm_env")):
+            owner = _owner_of(tree, node)
+            assert owner == "_run_child", (
+                f".{node.attr} escaped the seam (in {owner})")
+        if isinstance(node, ast.Call):
+            for kw in node.keywords:
+                if kw.arg == "shell":
+                    raise AssertionError(
+                        "chain must never pass shell= to a spawn")
+
+
+_FORBIDDEN_NAME_CALLS = {"__import__", "eval", "exec", "compile"}
+_FORBIDDEN_ATTR_CALLS = {"import_module", "system", "popen"}
+_FORBIDDEN_ATTR_PREFIXES = ("spawn",)
+
+
+def test_no_dynamic_import_exec_or_shell_call() -> None:
+    for node in ast.walk(_module_ast()):
+        if isinstance(node, ast.ImportFrom) and node.module == "os":
+            # ``from os import system/exec*/spawn*/popen`` would give
+            # the banned calls bare names the attribute census below
+            # cannot see.
+            for alias in node.names:
+                assert not (alias.name in ("system", "popen")
+                            or alias.name.startswith(
+                                ("exec", "spawn"))), (
+                    f"chain imports a process-spawning os name: "
+                    f"{alias.name}")
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name):
+            assert node.func.id not in _FORBIDDEN_NAME_CALLS, (
+                f"chain calls a fence-evading builtin: {node.func.id}")
+        if isinstance(node.func, ast.Attribute):
+            attr = node.func.attr
+            assert attr not in _FORBIDDEN_ATTR_CALLS, (
+                f"chain calls a fence-evading attribute: .{attr}(...)")
+            # ``os.exec*`` is banned; ``proc.wait``/``os.killpg`` are
+            # the seam's legitimate process management.
+            if (isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "os"):
+                assert not attr.startswith(
+                    ("exec",) + _FORBIDDEN_ATTR_PREFIXES), (
+                    f"chain calls a process-spawning os.{attr}(...)")
+
+
+def test_json_store_writes_are_atomic() -> None:
+    """Artifacts leave through ``save_json`` (atomic tempfile+rename);
+    never a hand text write. (``os.link``/``copy2`` move an EXISTING
+    completed artifact — they create no partially-written JSON.)"""
+    tree = _module_ast()
+    source = CHAIN_PATH.read_text(encoding="utf-8")
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "open"):
+            for arg in node.args[1:]:
+                if (isinstance(arg, ast.Constant)
+                        and "w" in str(arg.value)):
+                    raise AssertionError(
+                        "chain writes must go through save_json")
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in ("write_text", "write_bytes")):
+            raise AssertionError(
+                f"chain calls .{node.func.attr}(...) — store writes "
+                "go through save_json")
+    assert "save_json(" in source
+    assert "artifact_lock(" in source  # chain-state writes hold it
+
+
+#: Package prefix whose bare ``import ...`` forms are never
+#: allowlistable: a bare module import binds a module OBJECT, and
+#: attribute access on it (``ledger._private_seam(...)``) reaches
+#: every seam — public and private alike — without ever appearing in
+#: the ``ImportFrom`` verb census. The allowlist can only govern
+#: ``from ... import <verb>``; module-object imports defeat it, so
+#: they are refused outright rather than allowlisted.
+_ENGAGEMENT_PKG = "core.engagement"
+
+
+def _bare_engagement_imports(tree: ast.Module) -> list[str]:
+    """Spellings that bind an engagement module OBJECT (aliases do not
+    matter — the binding still hands back the module):
+
+    - ``import core.engagement[.anything]`` at any dotted depth;
+    - ``from core import engagement`` — the ImportFrom form whose
+      bound name IS the package root, not a verb inside it;
+    - any relative import — the chain lives in ``core.engagement``,
+      so ``from . import ledger`` binds the ledger module while the
+      absolute-prefix censuses here never see the package name.
+      The module must import absolutely so the fence can see it.
+    """
+    hits: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if (alias.name == _ENGAGEMENT_PKG
+                        or alias.name.startswith(_ENGAGEMENT_PKG + ".")):
+                    hits.append(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                dots = "." * node.level
+                for alias in node.names:
+                    hits.append(
+                        f"from {dots}{node.module or ''} "
+                        f"import {alias.name}")
+            elif node.module:
+                for alias in node.names:
+                    if f"{node.module}.{alias.name}" == _ENGAGEMENT_PKG:
+                        hits.append(f"{node.module}.{alias.name}")
+    return hits
+
+
+def test_ledger_import_census_sees_bare_import_evasions() -> None:
+    """Probe pin: the module-object census flags every evasion
+    spelling (bare import — plain, aliased, deeper submodule, package
+    root, multi-name statement — plus ``from core import engagement``
+    and the relative forms) and stays silent on the ImportFrom verbs
+    the allowlist already governs and on lookalike module names
+    outside the package."""
+    flagged: tuple[str, ...] = (
+        "import core.engagement.ledger",
+        "import core.engagement.ledger as _l",
+        "import core.engagement.ledger.frames",
+        "import core.engagement",
+        "import os, core.engagement.ledger",
+        "from core import engagement",
+        "from core import engagement as _e",
+        "from . import ledger",
+        "from .ledger import load_ledger",
+    )
+    for snippet in flagged:
+        assert _bare_engagement_imports(ast.parse(snippet)), (
+            f"census missed a bare-import evasion: {snippet}")
+    clear: tuple[str, ...] = (
+        "from core.engagement.ledger import load_ledger",
+        "from core import config",
+        "import core.engagements_other",
+        "import subprocess",
+    )
+    for snippet in clear:
+        assert not _bare_engagement_imports(ast.parse(snippet)), (
+            f"census over-matched a non-evasion: {snippet}")
+
+
+def test_ledger_writes_go_through_the_public_api() -> None:
+    """The chain touches the ledger only via its public verbs (read
+    and write) — never a private seam, never a direct rewrite of
+    ledger.json."""
+    tree = _module_ast()
+    # A module-object import — bare ``import core.engagement.ledger``
+    # (any alias, any dotted depth, or the package root), ``from core
+    # import engagement``, or a relative spelling — bypasses the verb
+    # allowlist below: the census there walks absolute ImportFrom
+    # verbs only, and attribute access on a module object defeats
+    # verb-level allowlisting. Refuse every such form — none is
+    # allowlistable.
+    bare = _bare_engagement_imports(tree)
+    assert not bare, (
+        f"chain binds engagement/ledger module objects (attribute "
+        f"access evades the verb allowlist): {bare}")
+    # read_artifact_checklist belongs here: it is the ledger's
+    # frame-authenticated read chokepoint — it verifies the checklist
+    # slot's integrity token, refuses tampered frames, and strips the
+    # token before returning. ``checklist_slot_path`` is deliberately
+    # NOT granted: the chain no longer imports it, and re-admitting it
+    # would reopen the bypass (checklist_slot_path + a raw json load)
+    # that skips the authenticated readers entirely. Do NOT admit
+    # private "_"-prefixed seams or raw-rewrite verbs.
+    allowed = {"STATUS_STATES", "load_ledger",
+               "read_artifact_checklist", "set_artifact_status",
+               "write_artifact_checklist"}
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.ImportFrom) and node.module
+                and node.module.startswith("core.engagement")):
+            for alias in node.names:
+                assert alias.name in allowed, (
+                    f"chain imports a non-public ledger seam: "
+                    f"{alias.name}")
+
+
+def test_launcher_preamble_present() -> None:
+    source = LAUNCHER_PATH.read_text(encoding="utf-8")
+    assert "CLAUDECODE" in source and "_RAPTOR_TRUSTED" in source, (
+        "launcher lost the trust-marker gate")
+    assert "import core.startup.process_init" in source, (
+        "launcher lost the process_init import")
+    assert LAUNCHER_PATH.stat().st_mode & 0o111, (
+        "launcher must be executable")

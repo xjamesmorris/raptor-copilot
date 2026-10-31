@@ -23,11 +23,13 @@ is injectable so the orchestration is unit-testable with no LLM and no CodeQL.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import sqlite3
 import subprocess
 import time
+import uuid
 from collections import Counter
 from pathlib import Path
 
@@ -45,12 +47,16 @@ from core.dataflow.barrier_synth import (
 )
 from core.dataflow.cvefix_loader import CveFixPair
 from core.git import safe_git_readonly_command
-from core.paths import strip_file_uri
+from core.sarif.parser import SARIF_MAX_BYTES
+from core.paths import confine, strip_file_uri
+from core.source import read_text_capped
 from typing import TYPE_CHECKING
+from core.source.lines import split_lines
 
 # CodeQL SARIF over corpus code — the SARIF budget class shared with
-# core.sarif.parser.load_sarif.
-_MAX_SARIF_BYTES = 100 * 1024 * 1024
+# core.sarif.parser.load_sarif (one constant, aliased for the local
+# call sites).
+_MAX_SARIF_BYTES = SARIF_MAX_BYTES
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -65,7 +71,7 @@ try:
     _TIER0_AVAILABLE = True
 except ImportError:                                  # pragma: no cover
     _TIER0_AVAILABLE = False
-    Tier0Status = None                                # type: ignore[assignment]
+    Tier0Status = None                                # type: ignore[misc,assignment]
     try_tier0 = None                                  # type: ignore[assignment]
 
 # Tier 1B (LLM-assisted) is the middle backend — cheap-model extraction +
@@ -200,15 +206,10 @@ def _resolve_in_repo(repo_root: Path, uri: str) -> Path | None:
     fetched (untrusted) repository, so a traversal-shaped uri
     (``../../etc/passwd``) or an in-repo symlink pointing outside the
     clone must not let the bridge read host files into an LLM prompt.
-    Returns None when the resolved path escapes ``repo_root``."""
-    try:
-        root = repo_root.resolve()
-        candidate = (repo_root / _norm_uri(uri)).resolve()
-    except OSError:
-        return None
-    if not candidate.is_relative_to(root):
-        return None
-    return candidate
+    Returns None when the resolved path escapes ``repo_root``.
+    Delegates to the shared :func:`core.paths.confine` chokepoint so
+    future containment hardening reaches this site too."""
+    return confine(repo_root, _norm_uri(uri))
 
 
 def _git_diff(repo: Path, parent: str, fix: str, uri: str,
@@ -365,7 +366,17 @@ def _extract_proposal(
                 src = _resolve_in_repo(repo_root, raw_uri)
                 if src is None or not src.is_file():
                     continue
-                lines = src.read_text(encoding="utf-8", errors="replace").splitlines()
+                # Capped read (shared default): the path is contained
+                # but the file is untrusted repo content — a
+                # multi-hundred-MB generated file must truncate, not
+                # buffer whole. A line past the cap just fails the
+                # bounds check below and the finding is skipped.
+                # newline="" + split_lines keep the \n-only line
+                # model the SARIF line numbers were counted in.
+                got = read_text_capped(src, errors="replace", newline="")
+                if got is None:
+                    continue
+                lines = split_lines(got[0])
                 snippet = lines[line - 1].strip() if 0 < line <= len(lines) else raw_uri
                 if len(lines) <= _SMALL_FILE:
                     body = "\n".join(lines)
@@ -590,8 +601,8 @@ def _aggregate(syn: sqlite3.Connection) -> tuple[CorpusSynthReport, dict]:
 
 def synthesize_from_results(
     results_db: Path, *,
-    synth_db: Path = Path("/data/corpus/synth-results.db"),
-    work_dir: Path = Path("/data/corpus/clones/bridge"),
+    synth_db: Path,
+    work_dir: Path,
     proposer=None,
     model: str | None = None,
     tier1b_model: str | None = None,
@@ -650,7 +661,13 @@ def synthesize_from_results(
             pair = CveFixPair(cve_id, cwe, repo_url, lang, fix_hash, parent_hash)
             try:
                 status, fid, backend, barrier_q, detail = synthesize_one(
-                    pair, work_dir=work_dir / "item", proposer=proposer, status=row_status,
+                    # Unique per-candidate scratch: the fixed "item"
+                    # subpath let two bridge processes sharing a work
+                    # dir interleave clone/build state (and each
+                    # other's finally-rmtree) mid-candidate.
+                    pair,
+                    work_dir=work_dir / f"item-{os.getpid()}-{uuid.uuid4().hex[:8]}",
+                    proposer=proposer, status=row_status,
                     codeql_bin=codeql_bin, search_path=search_path,
                     max_attempts=max_attempts,
                     max_refine_attempts=max_refine_attempts,
@@ -681,9 +698,12 @@ def main(argv=None) -> None:
 
 
     ap = argparse.ArgumentParser(description="Synthesize barriers over walker FP-candidates.")
-    ap.add_argument("--results", type=Path, default=Path("/data/corpus/walk-results.db"))
-    ap.add_argument("--synth-db", type=Path, default=Path("/data/corpus/synth-results.db"))
-    ap.add_argument("--work-dir", type=Path, default=Path("/data/corpus/clones/bridge"))
+    # Required: these used to default to one specific corpus host's
+    # /data/corpus layout — a machine detail that doesn't belong in the
+    # repo and misdirected every other host.
+    ap.add_argument("--results", type=Path, required=True)
+    ap.add_argument("--synth-db", type=Path, required=True)
+    ap.add_argument("--work-dir", type=Path, required=True)
     ap.add_argument("--search-path", default=None,
                     help="codeql query-pack search path (default: ~/.local/codeql-queries)")
     ap.add_argument("--model", default=None,

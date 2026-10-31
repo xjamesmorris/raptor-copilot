@@ -32,6 +32,40 @@ _RESERVED_LOGRECORD_NAMES = frozenset({
 
 CONSOLE_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
+# Third-party SDK loggers whose INFO output names infrastructure:
+# botocore's credential discovery logs the resolved IAM role ("Found
+# credentials from IAM Role: <name>"), urllib3 logs connection
+# endpoints. The root console handler deliberately surfaces
+# module-level INFO (see RaptorLogger.__init__), so without a cap
+# these lines interleave into run streams — and a report embedding
+# log excerpts would carry the identifiers out. The console escaping
+# chokepoint neutralises control bytes, not identifiers, so the cap
+# happens at the LOGGER: that way neither the console handlers nor
+# the JSONL audit trail record them. WARNING and above (auth
+# failures, retry exhaustion) still surface.
+NOISY_THIRD_PARTY_LOGGERS: tuple[str, ...] = (
+    "boto3",
+    "botocore",
+    # Child of "botocore", but pinned explicitly: it emits the
+    # credential-discovery line naming the IAM role, and an explicit
+    # level holds even if other code later reconfigures "botocore"
+    # itself to something looser.
+    "botocore.credentials",
+    "urllib3",
+)
+
+
+def quiet_third_party_loggers() -> None:
+    """Raise noisy third-party SDK loggers to WARNING.
+
+    Called by both logging-setup chokepoints (``RaptorLogger``
+    initialisation for run streams, :func:`configure_cli_logging` for
+    standalone CLIs). RAPTOR's own loggers — the ``raptor`` namespace
+    and stdlib-named project modules — are untouched. Idempotent.
+    """
+    for name in NOISY_THIRD_PARTY_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
 
 def _raptor_logger() -> logging.Logger:
     return logging.getLogger("raptor")
@@ -54,6 +88,33 @@ def _raptor_root_console_handlers() -> list[logging.Handler]:
         if _is_console_handler(handler)
         and getattr(handler, "_raptor_root_handler", False)
     ]
+
+
+class EscapingConsoleFormatter(logging.Formatter):
+    """Console formatter that escapes non-printable bytes in the
+    rendered line.
+
+    Log calls across the tree interpolate foreign-derived text —
+    scanned-repo file names, subprocess stderr, LLM response excerpts —
+    and per-site escaping has failed member-by-member (each campaign
+    re-finds unwrapped ``logger.*`` sites). The console handler is the
+    one point every logger-routed line passes on its way to the
+    operator's TTY, so escape here: ESC/BEL/C1/bidi become inert
+    ``\\xHH`` escapes, ``\\n``/``\\t`` stay structural (multi-line
+    messages and tracebacks keep their shape).
+
+    Console-only by design: the JSONL audit-trail formatter already
+    JSON-escapes control bytes, and RAPTOR's own deliberate terminal
+    styling (core/progress, direct prints) never routes through the
+    logger — nothing legitimate is lost. Per-site sanitisation remains
+    the right defence for length-bounding and secret redaction; this
+    chokepoint guarantees only that no control byte reaches the TTY.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        from core.security.log_sanitisation import escape_nonprintable
+        return escape_nonprintable(super().format(record),
+                                   preserve_newlines=True)
 
 
 class JSONFormatter(logging.Formatter):
@@ -182,7 +243,7 @@ class RaptorLogger:
             with cls._lock:
                 if cls._instance is None:
                     cls._instance = super().__new__(cls)
-        return cls._instance
+        return cls._instance  # type: ignore[return-value]
 
     def __init__(self) -> None:
         """Initialize the logger (only once)."""
@@ -196,13 +257,15 @@ class RaptorLogger:
             self.logger.setLevel(logging.DEBUG)
             self.logger.propagate = False
 
-            # Ensure log directory exists
-            RaptorConfig.ensure_directories()
+            # Logging must not create unrelated job/schema/database paths:
+            # sandboxed workers only grant this directory for writes.
+            RaptorConfig.LOG_DIR.mkdir(parents=True, exist_ok=True)
 
             # Console handler with standard formatting
             console_handler = logging.StreamHandler(sys.stderr)
             console_handler.setLevel(logging.INFO)
-            console_formatter = logging.Formatter(RaptorConfig.LOG_FORMAT_CONSOLE)
+            console_formatter = EscapingConsoleFormatter(
+                RaptorConfig.LOG_FORMAT_CONSOLE)
             console_handler.setFormatter(console_formatter)
             self.logger.addHandler(console_handler)
 
@@ -292,11 +355,17 @@ class RaptorLogger:
                 root_console = logging.StreamHandler(sys.stderr)
                 root_console.setLevel(logging.INFO)
                 root_console.setFormatter(console_formatter)
-                root_console._raptor_root_handler = True  # sentinel for the guard above
+                root_console._raptor_root_handler = True  # type: ignore[attr-defined]  # sentinel for the guard above
                 root_logger.addHandler(root_console)
                 # Ensure root accepts INFO-level records; default is WARNING.
                 if root_logger.level == logging.NOTSET or root_logger.level > logging.INFO:
                     root_logger.setLevel(logging.INFO)
+
+            # The root handler above surfaces third-party INFO too —
+            # cap the known-noisy SDK loggers so infrastructure
+            # identifiers (IAM role names, endpoints) stay out of run
+            # streams and the audit trail.
+            quiet_third_party_loggers()
 
             RaptorLogger._initialized = True
 
@@ -488,7 +557,7 @@ def get_logger(name: str | None = None) -> "logging.Logger":
     # creates a child logger that needs to inherit from it.
     base = RaptorLogger()
     if name is None:
-        return base
+        return base  # type: ignore[return-value]
     # Namespace under "raptor" so child propagation reaches the
     # audit handlers attached to the base "raptor" logger.
     safe_name = name if name.startswith("raptor.") else f"raptor.{name}"
@@ -512,9 +581,57 @@ def set_console_log_level(level: int, *, include_root: bool = False) -> None:
     root_logger.setLevel(level)
 
 
+def configure_cli_logging(
+    level: int,
+    fmt: str = "%(levelname)s %(name)s: %(message)s",
+) -> None:
+    """``logging.basicConfig`` for standalone CLIs, with the escaping
+    console formatter installed on the resulting console handler(s).
+
+    Bare ``basicConfig`` wires a PLAIN formatter to stderr, so every
+    logger-routed line in that process bypasses
+    :class:`EscapingConsoleFormatter` — a relay like
+    ``logger.error("...: %s", exc)`` then delivers raw control bytes
+    from foreign-derived exception text straight to the operator TTY.
+    Standalone CLI entry points must call this instead of
+    ``basicConfig`` so the console chokepoint holds for them too.
+
+    Idempotent in the ``basicConfig`` sense: if handlers are already
+    configured (e.g. the script was loaded in-process inside a
+    RAPTOR run whose bootstrap owns the console handlers),
+    ``basicConfig`` is a no-op and NOTHING is touched — the swap
+    applies only to handlers this call itself created, so a
+    pre-configured process keeps its own (already escaping)
+    formatters and formats.
+    """
+    root = logging.getLogger()
+    before = set(map(id, root.handlers))
+    logging.basicConfig(level=level, format=fmt)
+    for handler in root.handlers:
+        if id(handler) not in before and _is_console_handler(handler):
+            handler.setFormatter(EscapingConsoleFormatter(fmt))
+    # Standalone CLIs get the same third-party SDK cap as run streams
+    # (infrastructure identifiers in botocore/urllib3 INFO lines).
+    quiet_third_party_loggers()
+
+
 def configure_run_logging(log_level: str | None, verbose: bool) -> None:
-    """Apply run-level console logging flags."""
+    """Apply run-level console logging flags.
+
+    ``log_level`` must name a member of :data:`CONSOLE_LOG_LEVELS`
+    (case-insensitive). Validated HERE rather than getattr-resolved on
+    the logging module: an unknown name crashed with AttributeError,
+    and a colliding module attribute (``"basicConfig"``) resolved to a
+    callable that rode into ``setLevel``.
+    """
     if log_level:
-        set_console_log_level(getattr(logging, log_level.upper()), include_root=True)
+        name = log_level.upper()
+        if name not in CONSOLE_LOG_LEVELS:
+            msg = (
+                f"unknown log level {log_level!r} — expected one of "
+                f"{', '.join(CONSOLE_LOG_LEVELS)}"
+            )
+            raise ValueError(msg)
+        set_console_log_level(getattr(logging, name), include_root=True)
     elif verbose:
         set_console_log_level(logging.DEBUG, include_root=True)

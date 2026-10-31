@@ -457,8 +457,17 @@ def build_persona(tmpdir: Path, cpu_count: int,
     stat_lines.extend(f"cpu{i} {user_jiffies // cpu_count} 0 "
             f"{system_jiffies // cpu_count} "
             f"{idle_jiffies // cpu_count} 0 0 0 0 0 0\n" for i in range(cpu_count))
+    # intr/ctxt derive from the SAME fake-uptime arithmetic as the
+    # /proc/interrupts LOC row below (fake_uptime_s * 250 per CPU):
+    # "intr 0 / ctxt 0" on a box claiming days of uptime contradicted
+    # its own interrupts file in one read-pair — exactly the
+    # cross-checking-detector class this module's derivations exist
+    # to survive. intr tracks the summed timer interrupts; ctxt runs
+    # a small multiple of intr on a low-load box.
+    intr_total = fake_uptime_s * 250 * cpu_count
+    ctxt_total = intr_total * 3
     stat_lines.append(
-        f"intr 0\nctxt 0\nbtime {btime}\n"
+        f"intr {intr_total}\nctxt {ctxt_total}\nbtime {btime}\n"
         f"processes {fake_processes}\nprocs_running 1\n"
         f"procs_blocked 0\nsoftirq 0\n"
     )
@@ -669,6 +678,7 @@ def _trim_proc_version() -> str:
 # included in the unshare flags.
 
 _libc: ctypes.CDLL | None = None
+_libc_error: str | None = None
 _libc_lock = threading.Lock()
 
 
@@ -681,15 +691,32 @@ def _get_libc() -> ctypes.CDLL:
     referenced a now-orphaned handle. Practical impact small
     (CDLL is just a thin handle wrapper) but the race is real.
     Lock ensures exactly-once construction.
+
+    The consumer (``set_uts``) runs in _spawn's FORKED child, where
+    ``find_library("c")`` — which can shell out to /sbin/ldconfig —
+    is the banned fork-storm pattern, and taking ``_libc_lock``
+    risks a fork-copied-locked wedge. _spawn primes this cache in
+    the PARENT pre-fork; the failure is cached too (never
+    re-resolved) so the child path is always a lock-free cache read
+    or an immediate OSError, which set_uts's caller already handles
+    as a silent degrade.
     """
-    global _libc
+    global _libc, _libc_error
     if _libc is not None:
         return _libc
+    if _libc_error is not None:
+        raise OSError(_libc_error)
     with _libc_lock:
+        if _libc is None and _libc_error is None:
+            try:
+                _libc = ctypes.CDLL(
+                    _ctypes_util.find_library("c"), use_errno=True,
+                )
+            except OSError as e:
+                _libc_error = f"libc unavailable: {e}"
+                raise
         if _libc is None:
-            _libc = ctypes.CDLL(
-                _ctypes_util.find_library("c"), use_errno=True,
-            )
+            raise OSError(_libc_error or "libc unavailable")
         return _libc
 
 

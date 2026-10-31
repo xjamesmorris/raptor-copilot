@@ -37,7 +37,26 @@ Symlink handling at the destination path:
 The primitive is intended for durability-critical writers (state
 stores, sandbox files, credentials). Regeneratable outputs (scripts,
 one-shot corpus generators) shouldn't use it — the fsync overhead is
-unearned for outputs that just get re-run on failure.
+unearned for outputs that just get re-run on failure. Those writers
+use the EXCLUSIVE-create family below instead:
+
+  * ``open_exclusive_artifact`` / ``write_new_bytes`` /
+    ``write_new_text`` — ``O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC``
+    creation of a NEW artifact. The artifact's directory is (or was)
+    inside a sandboxed child's write grant, so anything already
+    occupying the destination name — a planted symlink aimed at a
+    victim file, a reader-less FIFO, a pre-created file — makes the
+    open fail closed instead of following/truncating/blocking.
+    ``replace=True`` adds an lstat-honest pre-unlink for writers that
+    own the name and legitimately re-emit it (campaign logs, staged
+    seeds): ``Path.unlink`` removes a planted symlink ITSELF (never
+    its target), and the O_EXCL create still fails loud if something
+    reappears in the unlink→open window.
+  * ``open_hardened_append`` — the trail-append open shape
+    (``O_APPEND | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK`` + post-open
+    fstat S_ISREG refusal) for callers that keep a long-lived append
+    handle and therefore cannot route through
+    ``core.json.append_jsonl``'s one-shot write.
 
 Consumers:
   * ``packages/sca`` fixer / rewriter modules — via the thin
@@ -50,15 +69,34 @@ Consumers:
   * Direct-call consumers: core annotations, labeled attempts, binary
     fingerprint store, witness store, coverage store, sandbox
     calibration cache, sandbox summary + audit-degraded markers.
+
+Client-locality caveat (WSL drvfs/9p, no behaviour change): on a
+Windows-interop mount the ``os.replace`` commit is executed by the
+9p server, and readers within the same distro (one client) keep the
+full old-bytes-or-new-bytes guarantee exactly as on a local
+filesystem — this covers every consumer above (annotation saves,
+``save_json`` metadata writes, the JSON cache's puts) when writer
+and reader share the distro. Readers on ANOTHER client (Windows
+side, another distro) go through their own attribute/dentry caches:
+they still never see a torn file, but can keep observing the
+pre-replace content for the cache window after the commit, and the
+fsync durability legs are delegated to the 9p server. Placement
+guidance lives in docs/wsl.md.
 """
 
 from __future__ import annotations
 
 import os
 import secrets
+import shutil
 import stat as _stat
 import threading
 from pathlib import Path
+
+
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 
 
 # Perm mask: only the low 9 bits are legal via ``mode=``. Rejects
@@ -270,4 +308,224 @@ def write_bytes_atomically(
         raise
 
 
-__all__ = ["write_bytes_atomically", "write_text_atomically"]
+def open_exclusive_artifact(
+    path: str | Path,
+    *,
+    mode: int | None = None,
+    replace: bool = False,
+) -> int:
+    """Exclusively create the NEW artifact at *path*; return the fd.
+
+    ``O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC``: anything
+    already occupying the destination — a planted symlink (even a
+    dangling one, which passes ``exists() == False``), a FIFO, a
+    pre-created file — fails the open with ``OSError``
+    (``FileExistsError`` for an occupied name) instead of being
+    followed or truncated. Generalises the seed-writer idiom the
+    corpus profiler carried locally.
+
+    ``replace=True``: for writers that OWN the name and legitimately
+    re-emit it (campaign logs, staged seeds, generated scripts) —
+    pre-unlink with lstat honesty (``Path.unlink`` removes a planted
+    symlink/FIFO ITSELF, never what it points at; a directory at the
+    name still raises), then the O_EXCL create fails loud if anything
+    reappears in the unlink→open window.
+
+    ``mode`` (optional) is validated like the atomic writers'
+    (0o000..0o777, no setuid/setgid/sticky). When SET, it is enforced
+    via best-effort ``fchmod`` so the caller-requested mode (0o600
+    secrets, 0o755 scripts) wins over the process umask. When ``None``
+    (default), the file is created with the conventional 0o644 masked
+    by the process umask — the behaviour of the plain ``open("w")``
+    these writers replaced, and of ``open_hardened_append`` /
+    ``core.json.append_jsonl`` in the same discipline. Both
+    directions matter: fchmod-forcing an unrequested default silently
+    WIDENED artifacts past a restrictive umask (0o600 under
+    ``umask 077`` became a world-readable 0o644 — target-derived
+    crash artifacts on multi-user hosts), while an explicit mode must
+    keep beating the umask (a 0o755 generated script must execute).
+
+    The caller owns the returned fd (``os.fdopen`` or ``os.close``).
+    """
+    _validate_mode(mode)
+    p = Path(path)
+    if replace:
+        p.unlink(missing_ok=True)
+    fd = os.open(
+        str(p),
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW | _O_CLOEXEC,
+        0o644 if mode is None else mode,
+    )
+    if mode is not None:
+        try:
+            os.fchmod(fd, mode)
+        except (OSError, AttributeError):
+            # Windows + some mounts don't honour fchmod — the O_CREAT
+            # mode argument was already best-effort.
+            pass
+    return fd
+
+
+def write_new_bytes(
+    path: str | Path,
+    content: bytes,
+    *,
+    mode: int | None = None,
+    replace: bool = False,
+) -> None:
+    """Write *content* to a NEW artifact at *path* via
+    :func:`open_exclusive_artifact` (see there for the refusal,
+    ``mode`` and ``replace`` semantics — an explicit ``mode`` beats
+    the umask, the default honours it). Raises ``OSError`` on refusal
+    or write failure; no tempfile, no fsync — for regeneratable
+    outputs where the atomic writers' durability cost is unearned."""
+    fd = open_exclusive_artifact(path, mode=mode, replace=replace)
+    try:
+        view = memoryview(content)
+        written = 0
+        while written < len(view):
+            n = os.write(fd, view[written:])
+            if n <= 0:
+                raise OSError(
+                    f"short write to {path}: os.write returned {n}",
+                )
+            written += n
+    finally:
+        os.close(fd)
+
+
+def write_new_text(
+    path: str | Path,
+    content: str,
+    *,
+    encoding: str = "utf-8",
+    mode: int | None = None,
+    replace: bool = False,
+) -> None:
+    """Text variant of :func:`write_new_bytes`."""
+    write_new_bytes(
+        path, content.encode(encoding), mode=mode, replace=replace,
+    )
+
+
+def open_hardened_append(path: str | Path, *, mode: int = 0o644) -> int:
+    """Open *path* for appending with the hardened trail shape; return
+    the fd.
+
+    ``O_NOFOLLOW`` refuses a planted symlink (ELOOP); ``O_NONBLOCK``
+    makes a planted reader-less FIFO fail fast (ENXIO) instead of
+    blocking the writer forever; the post-open ``fstat`` S_ISREG
+    check refuses everything else non-regular (a FIFO that has a
+    reader, a device). Same flags as ``core.json.append_jsonl`` — use
+    this when the caller keeps a persistent append handle (streamed
+    event trails) instead of appending one record per call.
+
+    Raises ``OSError`` on refusal. The caller owns the returned fd.
+    """
+    _validate_mode(mode)
+    flags = (
+        os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        | _O_NOFOLLOW | _O_CLOEXEC | _O_NONBLOCK
+    )
+    fd = os.open(str(path), flags, mode)
+    try:
+        if not _stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(
+                f"refusing to append to {path}: not a regular file "
+                "(planted FIFO/device at the trail path?)",
+            )
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def open_hardened_read(path: str | Path) -> int:
+    """Open *path* for reading with the hardened trail shape; return
+    the fd.
+
+    Mirror of :func:`open_hardened_append` for the read side:
+    ``O_NOFOLLOW`` refuses a planted symlink (ELOOP); ``O_NONBLOCK``
+    makes a planted reader-less FIFO fail fast instead of blocking
+    the opener forever (and is a no-op once the fd is a regular
+    file); the post-open ``fstat`` S_ISREG check refuses everything
+    else non-regular (a FIFO with a writer, a device such as
+    /dev/zero that reads forever). Use this to REOPEN an artifact the
+    process wrote earlier into a directory that untrusted children
+    also write under.
+
+    Raises ``OSError`` on refusal. The caller owns the returned fd.
+    """
+    flags = os.O_RDONLY | _O_NOFOLLOW | _O_CLOEXEC | _O_NONBLOCK
+    fd = os.open(str(path), flags)
+    try:
+        if not _stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(
+                f"refusing to read {path}: not a regular file "
+                "(planted FIFO/device at the artifact path?)",
+            )
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def rmtree_hardened(path: str | Path) -> bool:
+    """Remove a directory tree a sandboxed child may have griefed;
+    return whether the path is actually gone.
+
+    A compromised child can leave a mode-0 subdirectory inside its
+    write grant, which makes a plain ``rmtree(ignore_errors=True)``
+    fail silently — the scratch dirs then accumulate without bound
+    (or, worse, the caller logs "removed" over a tree that is still
+    there). Restore traversal permissions top-down first (chmod each
+    subdirectory before descending into it), then remove.
+
+    Symlink discipline: ``os.walk(followlinks=False)`` still LISTS a
+    symlink-to-directory in dirnames (it just doesn't descend), and
+    ``os.chmod`` follows symlinks (Linux has no lchmod) — chmoding it
+    would apply 0o700 to the symlink's TARGET, which a hostile child
+    can point anywhere outside its grant. Skip links: rmtree removes
+    the link itself without descending, and a link needs no
+    permission restore anyway. A symlink ROOT is refused outright
+    (``False``, no side effects) BEFORE any chmod or walk:
+    ``os.walk`` always follows its ``top`` argument — ``followlinks``
+    only governs entries found during the descent — so walking a
+    link root would chmod the link TARGET's subtree.
+
+    Never raises. Returns ``True`` when nothing remains at *path*
+    (including the was-never-there case) so callers can log honestly.
+    """
+    p = str(path)
+    if os.path.islink(p):
+        return False
+    try:
+        os.chmod(p, 0o700)
+    except OSError:
+        pass
+    try:
+        for root, dirs, _files in os.walk(p):
+            for name in dirs:
+                entry = os.path.join(root, name)
+                if os.path.islink(entry):
+                    continue
+                try:
+                    os.chmod(entry, 0o700)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    shutil.rmtree(p, ignore_errors=True)
+    return not os.path.lexists(p)
+
+
+__all__ = [
+    "open_exclusive_artifact",
+    "open_hardened_append",
+    "open_hardened_read",
+    "rmtree_hardened",
+    "write_bytes_atomically",
+    "write_new_bytes",
+    "write_new_text",
+    "write_text_atomically",
+]

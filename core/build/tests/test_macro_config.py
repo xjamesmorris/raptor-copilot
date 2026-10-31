@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from core.build.macro_config import MacroConfig, extract_macro_config
 
 
@@ -144,14 +146,20 @@ def test_extract_build_tus_malformed_is_none(tmp_path):
 # --- hardened read: symlink refusal + byte budgets --------------------------
 
 
-def test_symlinked_compile_commands_refused(tmp_path):
-    real = tmp_path / "elsewhere.json"
-    real.write_text(json.dumps([{
+def test_symlinked_compile_commands_out_of_tree_refused(tmp_path):
+    # Containment gate: a symlink resolving outside the target is
+    # never read. In-tree symlinks (the clangd root-symlink layout)
+    # are accepted via their resolved path — see
+    # TestCompileCommandsCandidates below.
+    outside = tmp_path / "outside.json"
+    outside.write_text(json.dumps([{
         "file": "a.c", "directory": ".",
         "arguments": ["cc", "-DFOO", "-c", "a.c"],
     }]))
-    (tmp_path / "compile_commands.json").symlink_to(real)
-    mc = extract_macro_config(tmp_path)
+    target = tmp_path / "repo"
+    target.mkdir()
+    (target / "compile_commands.json").symlink_to(outside)
+    mc = extract_macro_config(target)
     assert not mc
     assert mc.source == "absent"
 
@@ -190,3 +198,200 @@ def test_within_budget_still_parses(tmp_path):
     }])
     mc = extract_macro_config(tmp_path)
     assert mc.is_defined("FOO") is True
+
+
+def test_read_bounded_fifo_refused_without_blocking(tmp_path):
+    """A FIFO planted at a config-artifact path must be REFUSED, not
+    block open(). The reader's contract is FIFO-safe (fstat refuses
+    non-regular files), but the fstat gate only runs after open()
+    returns — a writer-less FIFO opened without O_NONBLOCK hangs the
+    unsandboxed parent forever. Callers pre-gate with is_file(), so
+    the exposure is the check-to-open swap race in an
+    attacker-writable scanned repo; the reader itself must hold the
+    contract it documents.
+    """
+    import os
+    import threading
+
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("os.mkfifo not available on this platform")
+    from core.build.macro_config import _read_bounded
+
+    fifo = tmp_path / "compile_commands.json"
+    os.mkfifo(fifo)
+    outcome: list = []
+
+    def _attempt() -> None:
+        try:
+            _read_bounded(fifo, 1024)
+            outcome.append("read")
+        except (OSError, ValueError):
+            outcome.append("refused")
+
+    t = threading.Thread(target=_attempt, daemon=True)
+    t.start()
+    t.join(timeout=10)
+    assert not t.is_alive(), "_read_bounded blocked opening a FIFO"
+    assert outcome == ["refused"]
+
+
+class TestNestingBombs:
+    """compile_commands.json is repo content read BECAUSE it is repo
+    content: a planted nesting bomb must degrade like malformed JSON
+    (the module's never-raises contract), never raise RecursionError
+    into the unwrapped inventory-stage consumers."""
+
+    def _plant(self, tmp_path, raw):
+        (tmp_path / "compile_commands.json").write_text(raw)
+
+    def test_leading_bomb_degrades_all_three_extractors(self, tmp_path):
+        from core.build.build_flags import extract_flags
+        from core.build.macro_config import extract_build_tus
+
+        self._plant(tmp_path, "[" * 100_000 + "]" * 100_000)
+        mc = extract_macro_config(tmp_path)
+        assert not mc
+        assert extract_build_tus(tmp_path) is None
+        assert extract_flags(tmp_path).extraction_confidence == "absent"
+
+    def test_bomb_past_the_scan_window_is_caught(self, tmp_path):
+        """A deep tail buried past the pre-gate's bounded prefix scan
+        exercises the RecursionError rows in the catch tuples — the
+        gate is an optimization, the catch tuple the guarantee."""
+        from core.build.build_flags import extract_flags
+        from core.build.macro_config import extract_build_tus
+
+        flat = '{"x":1},' * 140_000            # > the 1 MiB scan window
+        deep = "[" * 60_000 + "]" * 60_000
+        self._plant(tmp_path, "[" + flat + deep + "]")
+        mc = extract_macro_config(tmp_path)
+        assert not mc
+        assert extract_build_tus(tmp_path) is None
+        assert extract_flags(tmp_path).extraction_confidence == "absent"
+
+    def test_legitimately_nested_manifest_still_extracts(self, tmp_path):
+        """Real depth (array of dicts with arguments arrays, strings
+        full of brackets and escapes) stays far under the gate."""
+        entries = [
+            {"directory": "/src", "file": "a.c",
+             "arguments": ["cc", "-D_FORTIFY_SOURCE=2", "-DF\\\"[{OO",
+                           "-c", "a.c"]},
+        ]
+        self._plant(tmp_path, json.dumps(entries))
+        mc = extract_macro_config(tmp_path)
+        assert mc.is_defined("_FORTIFY_SOURCE") is True
+
+
+class TestCompileCommandsCandidates:
+    """The clangd root-symlink layout and candidate iteration."""
+
+    _ENTRIES = [{"directory": "/src", "file": "a.c",
+                 "command": "cc -D_FORTIFY_SOURCE=2 -DFEATURE_X a.c"}]
+
+    def _build_layout(self, tmp_path, root_symlink=True):
+        (tmp_path / "build").mkdir()
+        (tmp_path / "build" / "compile_commands.json").write_text(
+            json.dumps(self._ENTRIES))
+        if root_symlink:
+            import os
+            os.symlink("build/compile_commands.json",
+                       tmp_path / "compile_commands.json")
+
+    def test_root_symlink_layout_feeds_all_three_extractors(self, tmp_path):
+        """`ln -s build/compile_commands.json .` is the canonical
+        clangd layout; it used to zero macro config, hardening
+        evidence, and the TU set silently (root candidate won, the
+        O_NOFOLLOW read failed, the fallback was never tried)."""
+        from core.build.build_flags import extract_flags
+        from core.build.macro_config import extract_build_tus
+
+        self._build_layout(tmp_path)
+        mc = extract_macro_config(tmp_path)
+        assert mc.is_defined("FEATURE_X") is True
+        assert extract_flags(tmp_path).fortify_source_level == 2
+        tus = extract_build_tus(tmp_path)
+        assert tus is not None and any(t.endswith("a.c") for t in tus)
+
+    def test_out_of_tree_symlink_refused_fallback_still_wins(self, tmp_path):
+        """The acceptance is containment-gated: a symlink escaping
+        the target is skipped (INFO), and iteration still reaches the
+        real build/ candidate."""
+        import os
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        target = tmp_path / "repo"
+        target.mkdir()
+        (outside / "cc.json").write_text(json.dumps(
+            [{"file": "evil.c", "command": "cc -DEVIL evil.c"}]))
+        (target / "build").mkdir()
+        (target / "build" / "compile_commands.json").write_text(
+            json.dumps(self._ENTRIES))
+        os.symlink(outside / "cc.json",
+                   target / "compile_commands.json")
+        mc = extract_macro_config(target)
+        assert mc.is_defined("EVIL") is None      # never read
+        assert mc.is_defined("FEATURE_X") is True  # fallback used
+
+    def test_malformed_root_candidate_does_not_veto_fallback(self, tmp_path):
+        self._build_layout(tmp_path, root_symlink=False)
+        (tmp_path / "compile_commands.json").write_text("{not json")
+        mc = extract_macro_config(tmp_path)
+        assert mc.is_defined("FEATURE_X") is True
+
+
+class TestDefineValueSemantics:
+    def test_explicitly_empty_define_records_empty(self, tmp_path):
+        # -DFOO= defines FOO as the EMPTY string in C; recording "1"
+        # made value_of() misread an explicitly-empty macro as truthy.
+        _write_cc(tmp_path, [
+            {"file": "a.c", "command": "cc -DFOO= -DBAR a.c"},
+        ])
+        mc = extract_macro_config(tmp_path)
+        assert mc.value_of("FOO") == ""
+        assert mc.is_defined("FOO") is True
+        assert mc.value_of("BAR") == "1"
+
+    def test_non_ascii_macro_names_not_accumulated(self, tmp_path):
+        # C preprocessor identifiers are ASCII; a Unicode-wide \w
+        # accumulated names the preprocessor never joins on.
+        _write_cc(tmp_path, [
+            {"file": "a.c", "command": "cc -DFÖÖ=1 -DOK=1 a.c"},
+        ])
+        mc = extract_macro_config(tmp_path)
+        assert mc.is_defined("FÖÖ") is None
+        assert mc.is_defined("OK") is True
+
+
+class TestReadBoundedErrorContract:
+    """Pin the raising contract _read_bounded's callers degrade on
+    (``except (OSError, ValueError)``) across the delegation to
+    core.security.capped_read: OSError for what the OS refuses,
+    ValueError for what policy refuses."""
+
+    def test_missing_file_raises_oserror(self, tmp_path):
+        from core.build.macro_config import _read_bounded
+        with pytest.raises(OSError):
+            _read_bounded(tmp_path / "absent.json", 1024)
+
+    def test_symlink_raises_oserror(self, tmp_path):
+        from core.build.macro_config import _read_bounded
+        real = tmp_path / "real.json"
+        real.write_text("{}", encoding="utf-8")
+        link = tmp_path / "compile_commands.json"
+        link.symlink_to(real)
+        with pytest.raises(OSError):
+            _read_bounded(link, 1024)
+
+    def test_over_cap_raises_valueerror(self, tmp_path):
+        from core.build.macro_config import _read_bounded
+        big = tmp_path / "big.json"
+        big.write_bytes(b"x" * 32)
+        with pytest.raises(ValueError, match="exceeds 16 byte cap"):
+            _read_bounded(big, 16)
+
+    def test_non_utf8_decodes_with_replacement(self, tmp_path):
+        from core.build.macro_config import _read_bounded
+        f = tmp_path / "cfg"
+        f.write_bytes(b"CONFIG_X=y\xff\xfe\n")
+        text = _read_bounded(f, 1024)
+        assert text.startswith("CONFIG_X=y")

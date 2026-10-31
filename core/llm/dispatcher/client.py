@@ -32,6 +32,72 @@ _logger = logging.getLogger(__name__)
 
 _TOKEN_HEADER = "X-Raptor-Token"
 
+# Attempt-state signal (server-side twin: ``server._UPSTREAM_STATE_
+# HEADER``). The dispatcher stamps every head it sends toward the
+# worker: ``response-started`` on a relayed upstream head — from that
+# head onward the generation is processed (and billed) upstream —
+# and ``pre-response`` on its own 502 for a forward-leg failure
+# before any upstream response byte. The hooks below record the stamp
+# per worker thread so the retry gate (``core.llm.client``) can
+# refuse to re-buy a consumed generation. Thread-local is the right
+# scope: httpx runs sync event hooks on the calling thread, and each
+# provider call's request, response head, and any raised failure all
+# happen on that one thread.
+_UPSTREAM_STATE_HEADER = "X-Raptor-Upstream-State"
+_UPSTREAM_STATE_STARTED = "response-started"
+
+_attempt_state = threading.local()
+
+
+def _reset_attempt_state(_request) -> None:
+    """httpx request hook: a new wire request on this thread starts a
+    fresh attempt — whatever state was recorded belongs to a previous
+    one and must not leak into this attempt's failure handling."""
+    _attempt_state.response_started = False
+
+
+def _note_attempt_state(response) -> None:
+    """httpx response hook: record the dispatcher's attempt-state
+    stamp for the head that just arrived. Fires before the body is
+    read (httpx runs response hooks on head receipt), so a mid-body
+    transport death cannot erase it."""
+    state = response.headers.get(_UPSTREAM_STATE_HEADER)
+    _attempt_state.response_started = state == _UPSTREAM_STATE_STARTED
+
+
+def clear_upstream_response_started() -> None:
+    """Attempt-scoping reset, called at the START of every retry-loop
+    attempt that consults the signal.
+
+    The request hook resets the state for HOOKED (dispatcher-routed)
+    clients, and the destructive take clears it on consulted failures
+    — but a dispatcher-routed SUCCESS leaves ``response_started=True``
+    with nothing to consume it. A later failure from a provider
+    WITHOUT hooks on the same thread (direct-SDK paths — custom
+    ``api_base`` gateways, local inference servers — the claudecode
+    subprocess transport, and mixed multi-model fallback chains) would
+    inherit the stale stamp and be falsely vetoed as consumed spend.
+    Clearing at attempt start makes the stamp attempt-local across
+    every transport, hooked or not."""
+    _attempt_state.response_started = False
+
+
+def take_upstream_response_started() -> bool:
+    """Read-and-clear: True when the most recent dispatcher-routed
+    request on THIS thread received a relayed upstream response head
+    (the ``response-started`` stamp) — the upstream fully processed,
+    and billed, the generation before any subsequent failure.
+
+    Destructive read on purpose: the signal is scoped to the one
+    failure it is consulted for, so a later unrelated exception on
+    the same thread cannot inherit it (the per-request reset hook is
+    the second line of defence). Always False on non-dispatcher
+    transports and pre-stamp dispatchers — callers must treat that as
+    "no signal", never as evidence the attempt was free."""
+    started = getattr(_attempt_state, "response_started", False)
+    _attempt_state.response_started = False
+    return bool(started)
+
 # Worker-token renewal (mirrors server._TOKEN_RENEW_PATH). The
 # dispatcher's worker-token TTL bounds time-since-last-renewal, not
 # total run length: a still-valid token may re-arm its window via
@@ -364,6 +430,14 @@ def _make_httpx_client(
         headers={_TOKEN_HEADER: token},
         auth=_TokenRenewalAuth(token, socket_path),
         timeout=httpx.Timeout(request_timeout, connect=5.0),
+        # Attempt-state recording for the spend-aware retry gate. The
+        # renewal side-channel client (_TokenRenewalAuth) carries no
+        # hooks, so an out-of-band renewal can never clobber the
+        # state of the main request it precedes.
+        event_hooks={
+            "request": [_reset_attempt_state],
+            "response": [_note_attempt_state],
+        },
     )
 
 
@@ -603,6 +677,7 @@ def mint_child_token(
     budget_usd: float,
     models: list | None = None,
     ttl_s: int | None = None,
+    request_budget: int | None = None,
     label: str = "cc-child",
     socket_path: str | None = None,
     token: str | None = None,
@@ -614,18 +689,47 @@ def mint_child_token(
     credential — hand it ONLY to the spawned child's env, never log it
     (``token_id`` is the loggable correlation id).
     """
-    # ``is None`` (not falsy) gates: an explicit ``models=[]`` or
-    # ``ttl_s=0`` must travel to the dispatcher and be REJECTED there
-    # (allocate_child raises ValueError), never silently dropped here
-    # and replaced by a default granting more than the caller asked.
+    # ``is None`` (not falsy) gates: an explicit ``models=[]``,
+    # ``ttl_s=0``, or ``request_budget=0`` must travel to the
+    # dispatcher and be REJECTED there (allocate_child raises
+    # ValueError), never silently dropped here and replaced by a
+    # default granting more than the caller asked.
     payload: dict = {"budget_usd": budget_usd, "label": label}
     if models is not None:
         payload["models"] = list(models)
     if ttl_s is not None:
         payload["ttl_s"] = int(ttl_s)
+    if request_budget is not None:
+        payload["request_budget"] = int(request_budget)
     return _child_admin_request(
         "mint", payload, socket_path=socket_path, token=token,
     )
+
+
+def enable_child_loopback(
+    *,
+    socket_path: str | None = None,
+    token: str | None = None,
+) -> int:
+    """Enable (idempotently) the dispatcher's loopback TCP plane and
+    return its port.
+
+    The plane is the base-URL transport for CLI/SDK children that
+    cannot speak HTTP-over-UDS; it authenticates scoped child tokens
+    only. One listener is shared dispatcher-wide (repeat calls return
+    the same port) and the dispatcher's own shutdown tears it down —
+    callers scope PER-RUN authority through the child token they mint,
+    not through listener lifetime.
+    """
+    data = _child_admin_request(
+        "loopback", {}, socket_path=socket_path, token=token,
+    )
+    port = data.get("port")
+    if not isinstance(port, int) or isinstance(port, bool) \
+            or not (0 < port < 65536):
+        msg = f"child-token loopback: malformed port {port!r}"
+        raise RuntimeError(msg)
+    return port
 
 
 def revoke_child_token(
@@ -667,16 +771,17 @@ def reconcile_child_spend(
     (a killed child reports nothing; an unpriced model books $0 on
     the dispatcher). Matches the failed-call booking contract on the
     provider ledger (``max(total_cost, provider_spend)``).
+
+    ``sanitize_cost`` on both sides: ``max(float(x), 0.0)`` passed NaN
+    straight through (NaN comparisons are False, so ``max`` returns
+    its first argument), and the reconciled figure lands on the parent
+    budget ledger.
     """
-    try:
-        a = max(float(dispatcher_spent_usd), 0.0)
-    except (TypeError, ValueError):
-        a = 0.0
-    try:
-        b = max(float(child_reported_usd), 0.0)
-    except (TypeError, ValueError):
-        b = 0.0
-    return max(a, b)
+    from core.llm.cost import sanitize_cost
+    return max(
+        sanitize_cost(dispatcher_spent_usd),
+        sanitize_cost(child_reported_usd),
+    )
 
 
 def make_gemini_base_url(*, socket_path: str | None = None,

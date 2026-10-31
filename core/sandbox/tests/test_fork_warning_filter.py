@@ -23,6 +23,8 @@ import sys
 import textwrap
 from pathlib import Path
 
+import pytest
+
 _REPO = Path(__file__).resolve().parents[3]
 
 # Verbatim shape of the CI-observed message (pid varies).
@@ -48,6 +50,10 @@ def test_module_filter_swallows_the_exact_message():
     assert "SUPPRESSED-OK" in r.stdout
 
 
+# Boots a whole nested pytest session under the repo config — the
+# child interpreter + collection startup is the cost, and it is the
+# mechanism under test; over the fast tier's budget.
+@pytest.mark.slow
 def test_pytest_config_swallows_the_exact_message(tmp_path):
     probe = tmp_path / "test_forkwarn_probe.py"
     probe.write_text(textwrap.dedent(f"""
@@ -68,3 +74,48 @@ def test_pytest_config_swallows_the_exact_message(tmp_path):
         "the fork DeprecationWarning escaped the pytest.ini filter:\n"
         + r.stdout
     )
+
+
+@pytest.mark.parametrize("module", [
+    "core.sandbox._landlock_audit",
+    "core.sandbox._unix_scope",
+])
+def test_fork_site_modules_install_the_module_filter(module):
+    """The Landlock-audit lane and the unix-scope probe fork too, and
+    can do so CONCURRENTLY with _spawn sandboxes on other threads —
+    per-fork ``warnings.catch_warnings()`` blocks there mutated the
+    process-global filter list and raced (one thread's restore
+    re-exposes another thread's fork mid-flight). Each fork-site
+    module must install the module-level filter itself, in a bare
+    interpreter that never imported _spawn."""
+    child = (
+        f"import warnings\n"
+        f"import {module}\n"
+        f"warnings.warn({_MSG!r}, DeprecationWarning, stacklevel=2)\n"
+        f"print('SUPPRESSED-OK')\n"
+    )
+    r = subprocess.run(
+        [sys.executable, "-W", "error::DeprecationWarning",
+         "-c", child],
+        capture_output=True, text=True, timeout=60,
+        cwd=_REPO, env={**os.environ},
+    )
+    assert r.returncode == 0, f"stdout={r.stdout}\nstderr={r.stderr}"
+    assert "SUPPRESSED-OK" in r.stdout
+
+
+def test_fork_sites_carry_no_per_fork_catch_warnings():
+    """Source pin: no production fork site may reintroduce the racy
+    per-fork suppression block (module-level filters only)."""
+    import inspect
+
+    from core.sandbox import _landlock_audit, _unix_scope
+    for mod in (_landlock_audit, _unix_scope):
+        src = inspect.getsource(mod)
+        for lineno, line in enumerate(src.splitlines(), start=1):
+            stripped = line.split("#", 1)[0]
+            assert "catch_warnings" not in stripped, (
+                f"{mod.__name__}:{lineno} uses per-fork "
+                f"warnings.catch_warnings() — use the module-level "
+                f"filter instead: {line.strip()}"
+            )

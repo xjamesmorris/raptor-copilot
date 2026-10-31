@@ -1,6 +1,7 @@
 """Tests for the same-run resume substrate (core.audit.resume)."""
 
 import json
+import math
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -8,17 +9,32 @@ from tempfile import TemporaryDirectory
 from core.audit.resume import (
     EXHAUSTED_BUDGET_EPSILON_USD,
     RUN_CONFIG_FILENAME,
+    _MAX_SPEND_EVIDENCE_USD,
     append_resume_markers,
     booked_spend_usd,
     compute_drift,
     journal_spend_usd,
     load_prior_cost_breakdown,
     load_run_config,
+    persist_spend_floor,
     remaining_budget_usd,
+    resolve_prior_spend,
     resume_ineligibility,
     save_run_config,
+    spend_floor_usd,
 )
 from core.coverage.journal import ReviewJournalEntry, append_entry, now_iso
+
+
+import pytest
+
+@pytest.fixture(autouse=True)
+def _user_state_in_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """User registries stay out of the real home: the root-conftest
+    layer doing this is stripped from release extracts (conftest.py
+    is export-ignore), so the pin must travel in-file."""
+    from core.testing.state_isolation import pin_user_state_dirs
+    pin_user_state_dirs(monkeypatch, tmp_path)
 
 
 def _journal(out_dir: Path, file: str, function: str, *,
@@ -117,10 +133,20 @@ class TestEligibility(unittest.TestCase):
             meta = load_json(meta_path)
             meta["status"] = "running"
             meta["tool_pid"] = os.getpid()  # demonstrably alive
+            # The liveness credential is (pid, starttime): keep the
+            # stamp coherent with the substituted pid (a mismatching
+            # stamp is the RECYCLED-pid shape, which is eligible).
+            from core.project.sessions import proc_starttime
+            start = proc_starttime(os.getpid())
+            if start is not None:
+                meta["tool_pid_start"] = start
+            else:  # off-Linux: legacy bare-pid record
+                meta.pop("tool_pid_start", None)
             save_json(meta_path, meta)
             msg = resume_ineligibility(out)
             self.assertIsNotNone(msg)
             self.assertIn("still in flight", msg)
+            self.assertIn(str(os.getpid()), msg)
 
     def test_running_with_dead_worker_eligible(self):
         """SIGKILLed run: status stuck at running, worker gone."""
@@ -135,6 +161,82 @@ class TestEligibility(unittest.TestCase):
             meta["tool_pid"] = 2 ** 22 + 12345  # beyond pid_max default
             save_json(meta_path, meta)
             self.assertIsNone(resume_ineligibility(out))
+
+    def test_running_with_init_worker_eligible(self):
+        """The detached-launch incident shape: setsid/nohup reparented
+        the orchestrator to init before start_run, so the record
+        carried tool_pid=1 — and PID 1 is always alive, so this
+        refusal was PERMANENT until the metadata was hand-edited.
+        pid<=1 is never live evidence: the resume proceeds, with the
+        decision noted."""
+        from core.json import load_json, save_json
+        from core.run import RUN_METADATA_FILE, start_run
+        with TemporaryDirectory() as d:
+            out = Path(d) / "run"
+            start_run(out, "audit")
+            meta_path = out / RUN_METADATA_FILE
+            meta = load_json(meta_path)
+            meta["status"] = "running"
+            meta["session_pid"] = 1
+            meta["tool_pid"] = 1
+            meta.pop("tool_pid_start", None)
+            save_json(meta_path, meta)
+            from unittest import mock
+            # Reset the warn-once-per-process note so the assertion is
+            # order-independent across the test battery.
+            with mock.patch("core.run.metadata._PID1_NOTE_EMITTED",
+                            False), \
+                    self.assertLogs("core.run.metadata",
+                                    level="WARNING") as cm:
+                self.assertIsNone(resume_ineligibility(out))
+            self.assertTrue(any(
+                "never a liveness credential" in line
+                for line in cm.output))
+
+    def test_running_with_recycled_worker_eligible(self):
+        """Recycled pid: a live process holds the recorded pid, but
+        its /proc starttime differs from the stamp — the original
+        worker is dead, the run is not in flight."""
+        import os
+        from unittest import mock
+
+        from core.json import load_json, save_json
+        from core.project import sessions
+        from core.run import RUN_METADATA_FILE, start_run
+        with TemporaryDirectory() as d:
+            out = Path(d) / "run"
+            start_run(out, "audit")
+            meta_path = out / RUN_METADATA_FILE
+            meta = load_json(meta_path)
+            meta["status"] = "running"
+            meta["tool_pid"] = os.getpid()  # alive, but...
+            meta["tool_pid_start"] = "1"    # ...another incarnation
+            save_json(meta_path, meta)
+            with mock.patch.object(sessions, "proc_starttime",
+                                   lambda pid: "777"):
+                self.assertIsNone(resume_ineligibility(out))
+
+    def test_running_with_legacy_bare_pid_record_refused(self):
+        """Legacy record (no start-time stamp), worker alive: the old
+        behaviour is preserved — refuse, naming the unverified
+        identity."""
+        import os
+
+        from core.json import load_json, save_json
+        from core.run import RUN_METADATA_FILE, start_run
+        with TemporaryDirectory() as d:
+            out = Path(d) / "run"
+            start_run(out, "audit")
+            meta_path = out / RUN_METADATA_FILE
+            meta = load_json(meta_path)
+            meta["status"] = "running"
+            meta["tool_pid"] = os.getpid()
+            meta.pop("tool_pid_start", None)
+            save_json(meta_path, meta)
+            msg = resume_ineligibility(out)
+            self.assertIsNotNone(msg)
+            self.assertIn("still in flight", msg)
+            self.assertIn("legacy record", msg)
 
 
 class TestDriftGate(unittest.TestCase):
@@ -248,6 +350,45 @@ class TestBudgetMath(unittest.TestCase):
             _journal(out, "a.c", "g", cost_usd=0.35)
             _journal(out, "a.c", "h")  # no cost recorded
             self.assertAlmostEqual(journal_spend_usd(out), 0.75)
+
+    def test_spend_evidence_clamped_finite(self):
+        """All three prior-spend evidence sources are run-dir JSON
+        (attacker-writable): planted 1.6e308 journal rows summed to
+        inf, a booked inf reported the budget as exhausted on every
+        later resume, and the floor writer detonated on the encoder's
+        non-finite refusal. Every source must clamp finite —
+        overclaims high (refuse-to-spend), underclaims to $0."""
+        with TemporaryDirectory() as d:
+            out = Path(d)
+            _journal(out, "a.c", "f", cost_usd=1.6e308)
+            _journal(out, "a.c", "g", cost_usd=1.6e308)
+            total = journal_spend_usd(out)
+            self.assertTrue(math.isfinite(total))
+            booked, _ = resolve_prior_spend(out)
+            self.assertTrue(math.isfinite(booked))
+            # Persisting a non-finite figure must neither raise nor
+            # write a floor the reader cannot bound.
+            persist_spend_floor(out, float("inf"))
+            floor = spend_floor_usd(out)
+            self.assertTrue(math.isfinite(floor))
+            self.assertEqual(floor, _MAX_SPEND_EVIDENCE_USD)
+        # Ledger totals — the stdlib JSON backend parses Infinity/NaN,
+        # so these shapes reach the reader.
+        self.assertEqual(
+            booked_spend_usd({"totals": {"total_spend_usd": float("inf")}}),
+            _MAX_SPEND_EVIDENCE_USD,
+        )
+        self.assertEqual(
+            booked_spend_usd({"totals": {"total_spend_usd": float("nan")}}),
+            0.0,
+        )
+        self.assertEqual(
+            booked_spend_usd({"totals": {
+                "cost_usd": float("inf"),
+                "failed_attempts_cost_usd": 1.0,
+            }}),
+            _MAX_SPEND_EVIDENCE_USD + 1.0,
+        )
 
     def test_remaining_budget_math(self):
         self.assertIsNone(remaining_budget_usd(None, 5.0))

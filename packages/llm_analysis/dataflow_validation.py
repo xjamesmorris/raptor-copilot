@@ -21,12 +21,15 @@ exhausted, the helper is a no-op.
 
 import functools
 import logging
+import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from core.llm.coerce import structured_result
+from core.llm.coerce import structured_result, to_lower_token_safe
 from core.paths import strip_file_uri
+from core.run.finding_status import read_verdict
+from core.security.log_sanitisation import escape_nonprintable
 from core.security.prompt_envelope import neutralize_tag_forgery
 from packages.hypothesis_validation import Hypothesis
 from packages.hypothesis_validation.adapters import CodeQLAdapter
@@ -37,10 +40,15 @@ from packages.hypothesis_validation.runner import validate
 from .dataflow_dispatch_client import DispatchClient
 from .dataflow_query_builder import (
     TEMPLATE_PREDICATE_SCHEMA,
+    build_predicate_probe_query,
     build_template_query,
     discover_prebuilt_query,
     infer_cwe_from_rule_id,
     supported_languages_for_template,
+)
+from .verification_tier import (
+    LLM_AUTHORED_DV_TIERS,
+    dataflow_premises_mechanical,
 )
 
 logger = logging.getLogger(__name__)
@@ -152,7 +160,7 @@ def discover_codeql_database(
     if not dbs:
         return None
     if language:
-        return dbs.get(_normalise_language(language))
+        return dbs.get(_normalise_language(language))  # type: ignore[arg-type]
     return next(iter(dbs.values()))
 
 
@@ -244,7 +252,10 @@ def _eligible_for_validation(finding: dict, analysis: dict) -> bool:
     """
     if "error" in analysis:
         return False
-    if not analysis.get("is_exploitable"):
+    if read_verdict(analysis, "is_exploitable") is not True:
+        # Only confirmed-exploitable findings are selected for
+        # validation; an abstained verdict has nothing to validate
+        # (and the validator must never manufacture one).
         return False
     if finding.get("has_dataflow"):
         return False
@@ -336,6 +347,41 @@ the limitation in your reasoning."""
 # rambling.
 _MAX_CLAIM_LENGTH = 1500
 _MAX_REASONING_EXCERPT = 800
+
+
+def _effective_deep_validate(
+    analysis: dict | None,
+    *,
+    deep_validate: bool,
+    deep_validate_disabled: bool,
+) -> tuple[bool, bool]:
+    """Tri-state Tier 2/3 decision for ONE finding.
+
+    Returns ``(effective, auto_enabled)``:
+
+      --no-deep-validate  → never (opt-out, hard kill — wins even
+                            against --deep-validate)
+      --deep-validate     → always (opt-in, force-on)
+      neither (default)   → auto: enabled iff the LLM emitted
+                            ``path_conditions`` (top-level or nested
+                            under ``dataflow_validation``); an empty
+                            list means "no applicable conditions",
+                            not "extracted some", so it does NOT
+                            auto-enable.
+
+    Module-level (not inlined at the call site) so the precedence
+    contract is directly testable.
+    """
+    if deep_validate_disabled:
+        return False, False
+    if deep_validate:
+        return True, False
+    nested_dv = (analysis or {}).get("dataflow_validation") or {}
+    effective = bool(
+        nested_dv.get("path_conditions")
+        or (analysis or {}).get("path_conditions")
+    )
+    return effective, effective
 
 
 def validate_dataflow_claims(
@@ -564,7 +610,7 @@ def validate_dataflow_claims(
     # Re-running them through the LLM costs 2× and yields nothing new.
     # Cache scope is the call only — cross-run caching is a future feature
     # (would need a persistent store keyed on the project + revision).
-    cache: dict[str, Any] = {}
+    cache: dict[str, tuple[Any, str]] = {}
 
     for finding in findings:
         fid = finding.get("finding_id")
@@ -617,18 +663,11 @@ def validate_dataflow_claims(
         # key, so a duplicate-claim finding whose analysis would run
         # deeper tiers never silently reuses a shallower finding's
         # result (verdicts must not depend on iteration order).
-        auto_enabled = False
-        if deep_validate_disabled:
-            effective_deep_validate = False
-        elif deep_validate:
-            effective_deep_validate = True
-        else:
-            nested_dv = (analysis or {}).get("dataflow_validation") or {}
-            effective_deep_validate = bool(
-                nested_dv.get("path_conditions")
-                or (analysis or {}).get("path_conditions")
-            )
-            auto_enabled = effective_deep_validate
+        effective_deep_validate, auto_enabled = _effective_deep_validate(
+            analysis,
+            deep_validate=deep_validate,
+            deep_validate_disabled=deep_validate_disabled,
+        )
 
         cache_key = _hypothesis_cache_key(
             hypothesis,
@@ -645,7 +684,7 @@ def validate_dataflow_claims(
             # that skipped it would leave the duplicate finding
             # without its witness.
             metrics["n_cache_hits"] += 1
-            result = cached
+            result, tier_used = cached
         else:
             if progress_callback:
                 progress_callback(f"Validating dataflow for {fid}")
@@ -716,7 +755,9 @@ def validate_dataflow_claims(
                     metrics["path_conditions_by_cwe"].get(cwe, 0) + 1
                 )
 
-            cache[cache_key] = result
+            # Tier label rides the cache so a duplicate-claim finding
+            # gets the same honest method stamp as the first.
+            cache[cache_key] = (result, tier_used)
             metrics["n_validated"] += 1
 
         # ----- Tier 4: SMT path-feasibility refinement -----
@@ -746,7 +787,7 @@ def validate_dataflow_claims(
             elif smt_outcome == "smt_disagree":
                 metrics["n_tier4_smt_disagree"] += 1
 
-        _attach_result(analysis, result)
+        _attach_result(analysis, result, tier=tier_used)
         if analysis.get("dataflow_validation", {}).get("recommends_downgrade"):
             metrics["n_recommended_downgrades"] += 1
 
@@ -933,6 +974,13 @@ def _build_hypothesis(finding: dict, analysis: dict, repo_path: Path):
         target_function=function,
         cwe=cwe,
         context="\n".join(parts),
+        # Dataflow-claim validation asserts the reported flow IS
+        # real/reachable — a conclusive empty tool result (SMT unsat)
+        # therefore mechanically REFUTES it. Declared here, at
+        # formation time, so the verdict ladder never needs the
+        # evaluating LLM's phrasing-aware reading to pick the
+        # direction of a zero-match proof.
+        polarity="reachability",
     )
 
 
@@ -992,6 +1040,84 @@ def _hypothesis_cache_key(
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+#: Producer identity of the cross-file taint engine (the ``tool``
+#: field of its findings in every intake shape). Local constant so
+#: the gate does not import ``core.taint``; pinned against
+#: ``core.taint.emission.PRODUCER`` by test.
+_TAINT_PRODUCER = "taint-crossfile"
+
+#: The one tier value that IS source-static derivation; any other
+#: non-empty tier string on a taint path marks a hop CodeQL's
+#: source-language dataflow cannot be expected to represent.
+_TIER_RESOLVED_STATIC = "resolved_static"
+
+#: Step tags marking producer approximations (taint-all-params
+#: fallback, binding-by-convention guesses) — sub-static even when
+#: the tier field reads static.
+_SUB_STATIC_TAGS = frozenset({"assumed_propagation", "binding_approx"})
+
+
+def _taint_path_tiers(finding: dict) -> list[str]:
+    """Every tier string recorded on the finding: the path-level
+    ``path_tier`` (scan-shape ``metadata`` / validation-shape
+    ``taint_crossfile`` blocks) plus per-step ``properties.tier``."""
+    tiers: list[str] = []
+    for block_key in ("metadata", "taint_crossfile"):
+        block = finding.get(block_key)
+        if isinstance(block, dict):
+            tier = block.get("path_tier")
+            if isinstance(tier, str) and tier:
+                tiers.append(tier)
+    path = finding.get("dataflow_path")
+    if isinstance(path, dict):
+        steps = [path.get("source"), *(  # type: ignore[misc]
+            path.get("steps") if isinstance(path.get("steps"), list)
+            else []
+        ), path.get("sink")]
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            props = step.get("properties")
+            if not isinstance(props, dict):
+                continue
+            tier = props.get("tier")
+            if isinstance(tier, str) and tier:
+                tiers.append(tier)
+            tags = props.get("tags")
+            if isinstance(tags, (list, tuple)) and any(
+                isinstance(t, str) and t in _SUB_STATIC_TAGS
+                for t in tags
+            ):
+                # Represent a tag hit as a sub-static tier entry.
+                tiers.append("tag:" + next(
+                    t for t in tags
+                    if isinstance(t, str) and t in _SUB_STATIC_TAGS
+                ))
+    return tiers
+
+
+def _taint_sub_static_exemption(finding: dict) -> bool:
+    """True when the finding is a cross-file taint engine candidate
+    whose path carries POSITIVE sub-static evidence — a recorded tier
+    below ``resolved_static`` or an approximation tag on any hop.
+
+    Such flows rode edges (dispatch tables, getattr dispatch,
+    taint-all-params fallbacks) that CodeQL's source-language dataflow
+    cannot represent; a Tier 1 query finding no path there is silence,
+    not refutation evidence. Producer-scoped by the ``tool`` /
+    ``source_type`` fields; a taint finding whose recorded tiers are
+    ALL resolved_static (or that records no tier evidence at all)
+    stays fully checkable — the exemption needs positive evidence,
+    never shape drift."""
+    if (
+        finding.get("tool") != _TAINT_PRODUCER
+        and finding.get("source_type") != "taint"
+    ):
+        return False
+    tiers = _taint_path_tiers(finding)
+    return any(t != _TIER_RESOLVED_STATIC for t in tiers)
 
 
 def tier1_check_finding(
@@ -1087,6 +1213,21 @@ def _tier1_check_finding_inner(
             return "no_check"
     except ImportError:
         pass
+
+    # Tier-aware exemption: a cross-file taint candidate whose path
+    # carries sub-static hops gets no_check — never a hard refutation
+    # — from this gate (CodeQL cannot represent the approximated
+    # edges, so its silence is not evidence). Runs before any
+    # discovery/DB work: the exemption also saves the invocation.
+    # Counted here per finding; the wrapper's verdict line shows the
+    # resulting no_check.
+    if _taint_sub_static_exemption(finding):
+        logger.info(
+            "tier1_check_finding: taint-crossfile sub-static path — "
+            "no_check exemption (rule=%s)",
+            escape_nonprintable(str(finding.get("rule_id") or "?")),
+        )
+        return "no_check"
 
     language = _finding_language(finding)
     if not language:
@@ -1359,6 +1500,24 @@ def _try_template_with_retry(
                 ev, finding,
                 codeql_db=getattr(adapter, "_database_path", None),
             )
+            if verdict == "refuted":
+                # Predicate-vacuity control: the coverage gate proves
+                # the DB contains the finding's file/function, but not
+                # that the LLM's endpoint models select ANY node — a
+                # vacuous isSource/isSink body makes "no flow"
+                # vacuously true and would hard-downgrade a real
+                # finding. Only would-be refutations pay the probe
+                # cost (same compiled DB, warm evaluator).
+                vacuity = _template_vacuity_reason(
+                    adapter, language, predicates, hypothesis.target,
+                )
+                if vacuity is not None:
+                    result = _wrap_result(ev, "inconclusive", tier="template")
+                    result.reasoning = (
+                        "[template] zero-flow refutation withheld — "
+                        + vacuity
+                    )
+                    return result, True, attempt
             return (
                 _wrap_result(ev, verdict, tier="template"),
                 True,
@@ -1384,6 +1543,59 @@ def _try_template_with_retry(
         False,
         0,
     )
+
+
+def _template_vacuity_reason(
+    adapter: Any,
+    language: str,
+    predicates: dict,
+    target: Path,
+) -> str | None:
+    """Predicate-vacuity control for Tier 2 zero-flow refutations.
+
+    A zero-match taint query refutes only when its endpoint models
+    actually select something. The three-layer coverage gate
+    (`_refutation_coverage_ok`) verifies the DB contains the finding's
+    file and function — it cannot see that an LLM-written isSource or
+    isSink body selects zero nodes anywhere, which makes "no flow"
+    vacuously true. Each predicate is run standalone through the same
+    adapter/DB (mechanical selector assembled by
+    `build_predicate_probe_query`; warm evaluator, no LLM call).
+
+    Returns a refuse-to-refute reason when a predicate is vacuous or a
+    probe could not run, None when both predicates demonstrably select
+    nodes. Same condemn-toward-abstain posture as the coverage gate:
+    every failure direction degrades to inconclusive, never to
+    refuted. Analogue of the negative controls elsewhere in the repo
+    (patch_gate's unpatched-copy control, checker_synthesis'
+    _fix_mutant_control) — Tier 2 previously had none.
+    """
+    role_labels = (("source", "isSource"), ("sink", "isSink"))
+    for role, label in role_labels:
+        probe = build_predicate_probe_query(
+            language=language,
+            source_predicate_body=predicates.get("source_predicate_body", ""),
+            sink_predicate_body=predicates.get("sink_predicate_body", ""),
+            probe_role=role,
+        )
+        if probe is None:
+            return f"could not build the {label} vacuity probe query"
+        try:
+            ev = adapter.run(probe, target)
+        except Exception as e:  # noqa: BLE001 — probe failure must abstain, not crash
+            return f"{label} vacuity probe errored: {e}"
+        if not ev.success:
+            return (
+                f"{label} vacuity probe failed: "
+                f"{(ev.error or 'no error detail')[:200]}"
+            )
+        if not ev.matches:
+            return (
+                f"{label} predicate selected 0 nodes in the whole "
+                f"database — vacuous {role} model, 'no flow' would be "
+                "vacuously true"
+            )
+    return None
 
 
 def _is_compile_error(error_text: str) -> bool:
@@ -1455,16 +1667,19 @@ def _tier4_smt_refine_inner(
     if not conditions:
         return result, "no_check"
     # LLMs routinely violate structured-output schemas: `path_profile`
-    # can arrive as an int/list/dict. Coerce non-strings to the default
-    # profile instead of crashing on `.strip()`.
-    raw_profile = (
+    # can arrive as an int/list/dict. Coerce non-strings to None
+    # instead of crashing on `.strip()` — shared with the
+    # `_smt_pre_flight` twin in agent.py so the sites cannot drift.
+    # None means GUESSED signedness: validate_path reports infeasible
+    # only when both signedness profiles agree. A pinned "uint64"
+    # default asserted knowledge the LLM never declared — the
+    # ubiquitous C signed error check (ret < 0) encoded as
+    # ULT(ret, 0), unsat, and refuted a live finding outright.
+    profile_name = to_lower_token_safe(
         dataflow_validation.get("path_profile")
-        or (analysis or {}).get("path_profile")
-        or "uint64"
-    )
-    profile_name = (
-        raw_profile.strip().lower() if isinstance(raw_profile, str) else ""
-    ) or "uint64"
+        or (analysis or {}).get("path_profile"),
+        "",
+    ) or None
 
     try:
         from packages.exploit_feasibility.smt_path import validate_path
@@ -1534,7 +1749,7 @@ def _tier4_smt_refine_inner(
             summary=summary,
             matches=[],
             success=True,
-            error=None,
+            error=None,  # type: ignore[arg-type]
         )
 
     feasible = smt.get("feasible")
@@ -1657,7 +1872,7 @@ def _wrap_result(
         or f"{tier}: {len(evidence.matches)} match(es)"
     )
     return ValidationResult(
-        verdict=verdict,
+        verdict=verdict,  # type: ignore[arg-type]
         evidence=[rec],
         iterations=1,
         reasoning=f"[{tier}] {reason}",
@@ -1909,15 +2124,64 @@ def _finding_file_in_db(finding: dict, db_path: Path) -> bool:
     return _resolve_finding_in_db(finding, db_path) is not None
 
 
-@functools.lru_cache(maxsize=128)
+# Per-member read budget for src.zip source texts. The only consumer
+# is the word-boundary function-name scan in `_finding_function_in_db`
+# — it does not need the substrate's general 64 MB member cap, and an
+# adversarial DB with many huge ZIP_STORED "source" members would
+# otherwise materialise each of them in full. A member over this
+# budget reads as None → the coverage gate refuses to refute
+# (condemn-toward-abstain, same direction as every other read failure
+# here).
+_DB_SOURCE_MEMBER_CAP = 10 * 1024 * 1024
+
+# Total characters the memo below may retain. The old
+# lru_cache(maxsize=128) bounded ENTRIES, not bytes — 128 entries of
+# 64 MB members retained ~8 GB for process lifetime.
+_DB_SOURCE_CACHE_BUDGET = 64 * 1024 * 1024
+
+_db_source_cache: dict[tuple[str, str], str | None] = {}
+_db_source_cache_chars = 0
+
+
 def _read_db_source(db_path: Path, indexed_path: str) -> str | None:
     """Read a single indexed source file's text from `<db>/src.zip`.
 
-    Returns None on any error — caller treats that as 'can't verify'
-    and biases away from refutation. Cached per (db, path) so repeat
-    findings in the same file don't re-open the zip.
+    Returns None on any error or on an over-budget member — caller
+    treats that as 'can't verify' and biases away from refutation.
+    Cached per (db, path) so repeat findings in the same file don't
+    re-open the zip; the memo is bounded by total retained characters
+    (insertion-order eviction), not just entry count.
     """
-    src_zip = Path(db_path) / "src.zip"
+    global _db_source_cache_chars
+    key = (str(db_path), indexed_path)
+    if key in _db_source_cache:
+        return _db_source_cache[key]
+    text = _read_db_source_uncached(Path(db_path), indexed_path)
+    _db_source_cache[key] = text
+    _db_source_cache_chars += len(text) if text else 0
+    while (_db_source_cache_chars > _DB_SOURCE_CACHE_BUDGET
+           and len(_db_source_cache) > 1):
+        old_key = next(iter(_db_source_cache))
+        if old_key == key:
+            break
+        old_text = _db_source_cache.pop(old_key)
+        _db_source_cache_chars -= len(old_text) if old_text else 0
+    return text
+
+
+def _db_source_cache_clear() -> None:
+    """Reset the memo — mirrors the lru_cache API this replaced so
+    existing ``_read_db_source.cache_clear()`` callers keep working."""
+    global _db_source_cache_chars
+    _db_source_cache.clear()
+    _db_source_cache_chars = 0
+
+
+_read_db_source.cache_clear = _db_source_cache_clear  # type: ignore[attr-defined]
+
+
+def _read_db_source_uncached(db_path: Path, indexed_path: str) -> str | None:
+    src_zip = db_path / "src.zip"
     if not src_zip.is_file():
         return None
     try:
@@ -1930,8 +2194,14 @@ def _read_db_source(db_path: Path, indexed_path: str) -> str | None:
             # ``_db_indexed_files`` which already filtered via
             # ``safe_member_reason``, but re-check at the read site
             # so a future caller that constructs ``indexed_path`` by
-            # other means is still gated.
-            if safe_member_reason(info) != UnsafeMemberReason.SAFE:
+            # other means is still gated — with the tighter
+            # scan-appropriate member budget on top.
+            reason = safe_member_reason(info, max_size=_DB_SOURCE_MEMBER_CAP)
+            if reason != UnsafeMemberReason.SAFE:
+                logger.debug(
+                    "declining to read %s from %s: %s",
+                    indexed_path, src_zip, reason.value,
+                )
                 return None
             with zf.open(info) as f:
                 return f.read().decode("utf-8", errors="replace")
@@ -2188,6 +2458,21 @@ def _verdict_from_template(
     return "inconclusive"
 
 
+def _same_file_component_suffix(path_a: str, path_b: str) -> bool:
+    """True when the two path spellings can denote the same file:
+    equal after normalisation, or one is a path-component suffix of
+    the other (``==`` or preceded by ``/`` — the same boundary rule as
+    `_match_needle_in_index`, which was hardened against mid-component
+    matches for the refutation path)."""
+    a = strip_file_uri(path_a or "").lstrip("/")
+    b = strip_file_uri(path_b or "").lstrip("/")
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    return a.endswith("/" + b) or b.endswith("/" + a)
+
+
 def _any_match_at_finding_location(
     matches: list[dict], finding: dict,
 ) -> bool:
@@ -2207,12 +2492,19 @@ def _any_match_at_finding_location(
         # No file to location-match; assume any match supports the finding.
         return bool(matches)
 
-    target_basename = Path(target_file).name
     for m in matches:
         m_file = m.get("file") or ""
         if not m_file:
             continue
-        if Path(m_file).name != target_basename:
+        # Component-boundary path match (same rule as
+        # `_match_needle_in_index`): a bare basename comparison let a
+        # same-named file in a DIFFERENT directory (two utils.py in a
+        # monorepo) confirm the finding and grade the verdict
+        # tool_backed off an unrelated match. Differently-rooted
+        # spellings of the SAME file (project-relative vs
+        # repo-root-relative, or an engine emitting basenames) still
+        # match via the suffix rule.
+        if not _same_file_component_suffix(target_file, m_file):
             continue
         try:
             m_line = int(m.get("line") or 0)
@@ -2501,8 +2793,10 @@ def _db_is_stale(db_path: Path, repo_path: Path) -> bool:
     """True when the DB is older than recent source changes.
 
     Compares the DB's mtime to the most recent mtime of any tracked
-    source file under repo_path. Recursive walk is bounded — we sample
-    enough files to make a confident call without scanning huge trees.
+    source file under repo_path. The walk is bounded in VISITED
+    entries, not just sampled files: skip dirs are pruned in place so
+    they are never descended into, and the walk stops at the sample
+    cap.
 
     Conservative: returns False when we can't get reliable timestamps,
     because false-positive staleness warnings cause operator fatigue.
@@ -2514,21 +2808,38 @@ def _db_is_stale(db_path: Path, repo_path: Path) -> bool:
     if not repo_path or not repo_path.exists():
         return False
 
-    # Sample up to ~200 files; covers typical-sized repos and gives a
-    # reasonable freshness signal without walking massive monorepos.
+    # Sample up to ~200 SOURCE files; covers typical-sized repos and
+    # gives a reasonable freshness signal without walking massive
+    # monorepos. VCS/build metadata is excluded: `.git/` objects are
+    # touched by any git operation (fetch, gc, status refreshing the
+    # index) after the DB build, so an unfiltered first-200 sample
+    # minted false staleness warnings while deep-tree source edits
+    # were never sampled at all. Pruning (dirnames[:]) rather than
+    # filtering matters for cost too: rglob('*') still VISITED every
+    # entry under a skip dir before discarding it, so a packfile-heavy
+    # .git or million-entry node_modules paid a full lstat walk for a
+    # warn-only freshness check.
+    skip_dirs = {".git", ".hg", ".svn", "node_modules", "__pycache__",
+                 "build", "dist", ".venv", "venv"}
     newest_source = 0.0
     sampled = 0
     sample_cap = 200
-    for child in repo_path.rglob("*"):
-        if sampled >= sample_cap:
-            break
-        if child.is_file():
+    for dirpath, dirnames, filenames in os.walk(repo_path):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+        for name in filenames:
+            child = Path(dirpath) / name
             try:
+                if not child.is_file():
+                    continue
                 st = child.stat().st_mtime
             except OSError:
                 continue
             newest_source = max(newest_source, st)
             sampled += 1
+            if sampled >= sample_cap:
+                break
+        if sampled >= sample_cap:
+            break
 
     return newest_source > db_mtime + _DB_STALE_GRACE_SECONDS
 
@@ -2603,7 +2914,7 @@ def _try_structural_fallback(
             )
             _attach_result(analysis, result, method="structural-treesitter")
             n_validated += 1
-            if result.refuted and analysis.get("is_exploitable"):
+            if result.refuted and read_verdict(analysis, "is_exploitable") is True:
                 n_downgrades += 1
         except Exception as exc:  # noqa: BLE001 — fail-open validation loop
             logger.debug(
@@ -2630,7 +2941,8 @@ def _attach_result(
     analysis: dict,
     result,
     *,
-    method: str = "codeql-iris",
+    method: str | None = None,
+    tier: str | None = None,
 ) -> None:
     """Record the validation outcome on the analysis dict — NON-DESTRUCTIVE.
 
@@ -2646,8 +2958,17 @@ def _attach_result(
     would see a pre-judged finding instead of the original analysis,
     undermining their independence.
 
-    ``method`` labels the validator that produced the result:
-    ``"codeql-iris"`` (default) or ``"structural-treesitter"``.
+    ``method`` MUST reflect the actual producer of the verdict —
+    ``verification_tier`` grants ``tool_backed`` weight to mechanical
+    methods only, so a dishonest stamp would launder an LLM-shaped
+    verdict into "mechanically corroborated". When ``method`` is not
+    given it is derived from ``tier`` (the tier label returned by
+    `_validate_one_hypothesis`): LLM-authored tiers (Tier 2 template
+    predicates, Tier 3 retry, legacy fallback — the LLM wrote the
+    query) stamp ``"codeql-iris-llm"``; everything else (prebuilt
+    pack-resident queries) keeps ``"codeql-iris"``. The structural
+    lane passes ``method="structural-treesitter"`` explicitly. ``tier``
+    is persisted alongside so consumers can audit the stamp.
     """
     evidence = []
     for e in result.evidence:
@@ -2656,11 +2977,16 @@ def _attach_result(
         elif hasattr(e, "to_dict"):
             evidence.append(e.to_dict())
         else:
-            evidence.append(str(e))
+            evidence.append(str(e))  # type: ignore[arg-type]
     recommends_downgrade = (
-        result.refuted and bool(analysis.get("is_exploitable"))
+        result.refuted and read_verdict(analysis, "is_exploitable") is True
     )
-    analysis["dataflow_validation"] = {
+    if method is None:
+        method = (
+            "codeql-iris-llm" if tier in LLM_AUTHORED_DV_TIERS
+            else "codeql-iris"
+        )
+    block: dict[str, Any] = {
         "verdict": result.verdict,
         "reasoning": result.reasoning,
         "evidence": evidence,
@@ -2668,6 +2994,9 @@ def _attach_result(
         "recommends_downgrade": recommends_downgrade,
         "method": method,
     }
+    if tier is not None:
+        block["tier"] = tier
+    analysis["dataflow_validation"] = block
 
 
 def run_validation_pass(
@@ -2774,6 +3103,35 @@ def run_validation_pass(
     )
 
 
+def _panel_verdict_supports(analysis: dict, stage: str) -> bool:
+    """True when *stage*'s ``panel-verdict`` stamp stands behind the
+    finding's current verdict with at least TWO genuine model votes.
+
+    ``panel-verdict`` marks an abstained-primary finding whose verdict
+    IS the panel's own (unanimous among voters — a split panel stamps
+    ``disputed``). Support strength follows vote count, mirroring the
+    ``agreed`` gate below: ``agreed`` is the primary plus at least one
+    panel vote (two model signals), so a two-vote panel behind an
+    abstained primary carries the same weight — treating the stamp as
+    NO support hard-flipped findings with equal-or-stronger backing
+    depending only on which slot abstained. A SINGLE-vote panel-verdict
+    is one model's verdict with no second signal and still loses to the
+    tool, exactly like an unsupported primary. Votes are re-derived
+    from the stage's recorded analyses through read_verdict (junk
+    entries are non-votes; a missing analyses list means no derivable
+    support — the tool wins, the conservative direction)."""
+    if analysis.get(stage) != "panel-verdict":
+        return False
+    entries = analysis.get(f"{stage}_analyses")
+    if not isinstance(entries, list):
+        return False
+    votes = sum(
+        1 for entry in entries
+        if read_verdict(entry, "is_exploitable") is True
+    )
+    return votes >= 2
+
+
 def reconcile_dataflow_validation(results_by_id: dict[str, dict]) -> dict[str, int]:
     """Apply downgrades from the validation pass after consensus/judge.
 
@@ -2795,6 +3153,19 @@ def reconcile_dataflow_validation(results_by_id: dict[str, dict]) -> dict[str, i
         wrong (e.g. wrong language, missed an indirection) and refutes
         a finding everything else agrees on.
 
+    Premise-honesty gate on the HARD path: the terminal flip is a
+    mechanical verdict overriding an LLM analysis, so it is reserved
+    for validation blocks whose query premises were themselves
+    mechanical (``verification_tier.dataflow_premises_mechanical`` —
+    the same predicate that grants ``tool_backed``). A refutation
+    whose CodeQL predicates were LLM-AUTHORED (``method ==
+    "codeql-iris-llm"``, or an LLM-authored ``tier``, or no method
+    stamp at all — fail-closed) is one model's judgement dressed in
+    query syntax: it takes the SOFT shape instead — the downgrade
+    signal is preserved as ``validation_disputed`` plus a
+    ``validation_downgrade_withheld`` reason and lowered confidence;
+    only the verdict flip is withheld.
+
     Returns dict {n_hard_downgrades, n_soft_downgrades, n_skipped}.
     """
     n_hard = 0
@@ -2807,17 +3178,25 @@ def reconcile_dataflow_validation(results_by_id: dict[str, dict]) -> dict[str, i
             continue
         if not v.get("recommends_downgrade"):
             continue
-        if not analysis.get("is_exploitable"):
+        if read_verdict(analysis, "is_exploitable") is not True:
             n_skipped += 1
-            continue  # already not-exploitable for some other reason
+            continue  # already not-exploitable (or abstained) — no downgrade to apply
 
-        # Soft-downgrade gate: was the original verdict supported by
-        # consensus or judge? Both fields default to absent — only
-        # explicit "agreed" counts as support, so a missing field
-        # (consensus/judge weren't run) doesn't accidentally trigger
-        # the soft path.
-        consensus_agreed = analysis.get("consensus") == "agreed"
-        judge_agreed = analysis.get("judge") == "agreed"
+        # Soft-downgrade gate: was the current verdict supported by
+        # consensus or judge? Both fields default to absent — only an
+        # explicit "agreed" stamp, or a "panel-verdict" stamp backed
+        # by two genuine votes (see _panel_verdict_supports), counts
+        # as support, so a missing field (consensus/judge weren't
+        # run), "no-verdict", or "disputed" doesn't accidentally
+        # trigger the soft path.
+        consensus_agreed = (
+            analysis.get("consensus") == "agreed"
+            or _panel_verdict_supports(analysis, "consensus")
+        )
+        judge_agreed = (
+            analysis.get("judge") == "agreed"
+            or _panel_verdict_supports(analysis, "judge")
+        )
         if consensus_agreed or judge_agreed:
             # Soft: keep exploitable, lower confidence, flag the dispute
             analysis["validation_disputed"] = True
@@ -2828,6 +3207,31 @@ def reconcile_dataflow_validation(results_by_id: dict[str, dict]) -> dict[str, i
                 ) if agreed
             ]
             # Lower confidence to "low" only if it isn't already lower.
+            current_conf = (analysis.get("confidence") or "").lower()
+            if current_conf in ("high", "medium", ""):
+                analysis["confidence_pre_validation"] = analysis.get("confidence")
+                analysis["confidence"] = "low"
+            n_soft += 1
+            continue
+
+        if not dataflow_premises_mechanical(v):
+            # Premise-honesty gate: the validation verdict's own query
+            # premises are LLM-authored (or unstamped — fail-closed).
+            # Symmetric replacement, not a drop: the refutation keeps
+            # its full steering weight as a recorded dispute with
+            # lowered confidence; only the terminal is_exploitable
+            # flip is withheld.
+            analysis["validation_disputed"] = True
+            if (
+                v.get("method") == "codeql-iris-llm"
+                or v.get("tier") in LLM_AUTHORED_DV_TIERS
+            ):
+                withheld_reason = "llm-authored-premises"
+            elif v.get("method") is None:
+                withheld_reason = "missing-method"
+            else:
+                withheld_reason = "unrecognized-method"
+            analysis["validation_downgrade_withheld"] = withheld_reason
             current_conf = (analysis.get("confidence") or "").lower()
             if current_conf in ("high", "medium", ""):
                 analysis["confidence_pre_validation"] = analysis.get("confidence")

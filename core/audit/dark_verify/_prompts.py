@@ -10,6 +10,8 @@ import json
 import logging
 from typing import Any
 
+from core.orchestration.llm_json import strip_json_fences
+
 from ._types import DarkWitnessSpec, language_for_file
 
 logger = logging.getLogger(__name__)
@@ -111,7 +113,7 @@ with that would trigger the bug.
 
 Return a JSON object with these fields:
 - "function": the function name
-- "require_path": the require() path relative to the project root (e.g. "./src/auth")
+- "require_path": the require() path relative to the project root — the finding file's exact path with extension (e.g. "./src/auth.js")
 - "args": list of argument values (JSON-serialisable)
 - "expected_return": expected return value (null if expecting an error)
 - "expected_exception": the Error class name if you expect a throw (e.g. "TypeError"), empty string otherwise
@@ -129,7 +131,7 @@ with that would trigger the bug.
 
 Return a JSON object with these fields:
 - "function": the function name
-- "require_path": the require() path relative to the project root (e.g. "./src/auth")
+- "require_path": the require() path relative to the project root — the finding file's exact path with extension (e.g. "./src/auth.ts")
 - "args": list of argument values (JSON-serialisable)
 - "expected_return": expected return value (null if expecting an error)
 - "expected_exception": the Error class name if you expect a throw (e.g. "TypeError"), empty string otherwise
@@ -146,7 +148,7 @@ with that would trigger the bug.
 ## Output format
 
 Return a JSON object with these fields:
-- "function": the function name (top-level method or Class.method)
+- "function": the bare method name (a plain identifier callable at the top level after the require — never a qualified "Class.method" spelling)
 - "require_path": the require path relative to the project root (e.g. "lib/auth")
 - "args": list of argument values (JSON-serialisable)
 - "expected_return": expected return value (null if expecting an exception)
@@ -206,7 +208,7 @@ with that would trigger the bug.
 Return a JSON object with these fields:
 - "function": the method name
 - "class_name": the class containing the method (e.g. "AuthUtils")
-- "imports": list of import statements needed (e.g. ["java.util.HashMap"])
+- "imports": list of import statements needed (e.g. ["java.util.HashMap"]). If the target class is declared in a package, include exactly `<package>.<ClassName>` for it (its own package-qualified name); an import of a same-named class from any other package is rejected.
 - "arg_expressions": list of Java literal expressions for each argument (e.g. ["null", "\\"admin\\"", "0"])
 - "return_type": the Java return type (e.g. "String", "void", "int")
 - "is_static": true if the method is static, false if it needs an instance
@@ -243,7 +245,7 @@ with that would trigger the bug.
 ## Output format
 
 Return a JSON object with these fields:
-- "function": the function name (e.g. "MyModule::check" or just "check")
+- "function": the bare sub name (e.g. "check" — never a package-qualified "MyModule::check" spelling; name the package in "use_module")
 - "use_module": the Perl module name (e.g. "MyModule" or "Lib::Auth")
 - "args": list of argument values (JSON-serialisable; use null for undef)
 - "expected_return": expected return value (null if expecting a die)
@@ -319,16 +321,7 @@ def build_witness_prompt(
 
 def _extract_json(text: str) -> dict[str, Any] | None:
     """Extract a JSON object from potentially messy LLM output."""
-    text = text.strip()
-    if text.startswith("```"):
-        lines = text.splitlines()
-        start = 1
-        end = len(lines)
-        for i in range(1, len(lines)):
-            if lines[i].strip() == "```":
-                end = i
-                break
-        text = "\n".join(lines[start:end]).strip()
+    text = strip_json_fences(text)
 
     try:
         data = json.loads(text)

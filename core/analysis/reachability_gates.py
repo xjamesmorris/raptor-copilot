@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import re
+from math import isqrt
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ from core.analysis._joern_lines import (
     extract_scalar_marker,
     parse_marker_records,
 )
+from core.security.log_sanitisation import sanitise_for_terminal
 
 logger = logging.getLogger(__name__)
 
@@ -85,12 +87,16 @@ def guard_tested_sinks() -> tuple[str, ...]:
     """
     return _CORE_QUERY_SINKS
 
+# Prose gaps are bounded: an unbounded gap re-scans the rest of the
+# body from every planted verb occurrence — quadratic on
+# hostile-influenced text.  A real conduit phrase keeps its halves
+# within a clause (far under 200 chars); longer gaps stop matching.
 _CONDUIT_PHRASES: tuple[str, ...] = (
-    r"passes\b.*\bto\b",
-    r"forwards\b.*\bto\b",
+    r"passes\b.{0,200}\bto\b",
+    r"forwards\b.{0,200}\bto\b",
     r"\bdelegates\s+to\b",
-    r"\bcalls\b.*\bwithout\b",
-    r"\binvokes\b.*\bwithout\b",
+    r"\bcalls\b.{0,200}\bwithout\b",
+    r"\binvokes\b.{0,200}\bwithout\b",
 )
 
 # Dual-emit doctrine (same as unguarded_sinks.sc): the summary is
@@ -121,6 +127,71 @@ summary
 _QUERIES_DIR = Path(__file__).resolve().parents[2] / "packages" / "joern" / "queries"
 
 
+# ─── Context-map ingestion validation ───────────────────────────────────────
+
+# The full consumed context-map surface of this module: every
+# collection it walks, with the string fields it reads from each
+# entry. context-map.json is LLM-produced and only the top-level dict
+# is shape-validated upstream, so EVERY level below that is hostile
+# until proven — the collection value itself (scalars arrive where
+# lists belong), each entry (strings arrive where dicts belong), and
+# each field value (lists arrive where strings belong). All reads go
+# through the one walker below instead of per-site isinstance
+# patches, so a new read site cannot re-open the hole: it fetches
+# through the walker or it never sees the data.
+_CONTEXT_MAP_STR_FIELDS: dict[str, tuple[str, ...]] = {
+    "call_edges": ("caller", "callee", "from", "to"),
+    "entry_points": ("name", "function"),
+    "sinks": ("function",),
+}
+
+
+def _context_map_entries(
+    context_map: dict[str, Any],
+    key: str,
+) -> list[dict[str, Any]]:
+    """Validated fetch of one context-map collection.
+
+    Returns entry copies in which every consumed field is either a
+    str or absent. Wrong shapes SKIP with a logged reason rather than
+    TypeError a caller that has no enclosing try (the /audit
+    post-deepen sweep calls the public gates bare). Skip granularity
+    follows the damage: a non-list collection value drops the whole
+    collection (fail-soft, same as absent), a non-dict entry drops
+    that entry, a wrong-typed field value drops just that field.
+    """
+    value = context_map.get(key)
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        logger.debug(
+            "context-map %r is %s, not a list — collection skipped",
+            key, type(value).__name__,
+        )
+        return []
+    fields = _CONTEXT_MAP_STR_FIELDS[key]
+    entries: list[dict[str, Any]] = []
+    for entry in value:
+        if not isinstance(entry, dict):
+            logger.debug(
+                "context-map %r entry is %s, not a dict — entry skipped",
+                key, type(entry).__name__,
+            )
+            continue
+        cleaned = dict(entry)
+        for field_name in fields:
+            field_value = cleaned.get(field_name)
+            if field_value is not None and not isinstance(field_value, str):
+                logger.debug(
+                    "context-map %r field %r is %s, not a str — "
+                    "field dropped", key, field_name,
+                    type(field_value).__name__,
+                )
+                del cleaned[field_name]
+        entries.append(cleaned)
+    return entries
+
+
 # ─── Sink reachability ───────────────────────────────────────────────────────
 
 
@@ -138,14 +209,18 @@ def build_sink_reachable_set(
     """
     if not context_map:
         return None
-    sinks_list = context_map.get("sinks")
-    edges = context_map.get("call_edges")
+    # All context-map reads go through the ingestion walker (see
+    # _context_map_entries) — entries arrive dict-shaped with every
+    # consumed field str-or-absent, so no per-site type checks below.
+    edges = _context_map_entries(context_map, "call_edges")
     if not edges:
         return None
 
-    sink_fns: set[str] = set()
-    if sinks_list:
-        sink_fns = {s["function"] for s in sinks_list if "function" in s}
+    sink_fns: set[str] = {
+        s["function"]
+        for s in _context_map_entries(context_map, "sinks")
+        if "function" in s
+    }
 
     all_callees: set[str] = set()
     forward: dict[str, set[str]] = {}
@@ -201,22 +276,28 @@ def is_entry_unreachable(
     """
     if not context_map:
         return False
-    call_edges = context_map.get("call_edges")
+    # All context-map reads go through the ingestion walker (see
+    # _context_map_entries) — entries arrive dict-shaped with every
+    # consumed field str-or-absent, so no per-site type checks below.
+    call_edges = _context_map_entries(context_map, "call_edges")
     if not call_edges:
         return False
 
-    entry_points_raw = context_map.get("entry_points", [])
-    if not entry_points_raw:
+    entry_points = _context_map_entries(context_map, "entry_points")
+    if not entry_points:
         return False
 
     entry_names = {
         ep.get("name") or ep.get("function", "")
-        for ep in entry_points_raw
+        for ep in entry_points
     }
     if function_name in entry_names:
         return False
 
-    callee_set = {edge.get("callee") or edge.get("to") for edge in call_edges}
+    callee_set = {
+        edge.get("callee") or edge.get("to")
+        for edge in call_edges
+    }
     if function_name in callee_set:
         return False
 
@@ -323,12 +404,30 @@ def _joern_find_callers(
 # is persisted as a cross-run suppression learning.
 _FENCED_CODE_RE = re.compile(r"```.*?(?:```|\Z)", re.DOTALL)
 _INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
-_QUOTE_LINE_RE = re.compile(r"^[ \t]*>.*$", re.MULTILINE)
+# Markdown INDENTED code blocks (contiguous runs of 4-space- or
+# tab-indented lines) reproduce target text exactly like fenced ones
+# — a planted phrase quoted indented survived the strip and fired the
+# demotion gates. Each repetition consumes a full line opened by a
+# mandatory indent, so the run match is linear.
+_INDENTED_BLOCK_RE = re.compile(
+    r"^(?:(?: {4}|\t)[^\n]*(?:\n|$))+", re.MULTILINE,
+)
+# Quote-line indent class is ALL horizontal whitespace ([^\S\n]), not
+# just space/tab — a U+00A0-indented ``>`` line carried planted text
+# past the plain-space pattern.
+_QUOTE_LINE_RE = re.compile(r"^[^\S\n]*>.*$", re.MULTILINE)
 
 
 def _prose_only(body: str) -> str:
-    """Strip quoted target content so gates scan only model prose."""
+    """Strip quoted target content so gates scan only model prose.
+
+    Over-stripping is the safe direction here: these gates DEMOTE
+    findings, so prose lost to an aggressive strip can only leave a
+    finding standing — while an unstripped quoted phrase lets a
+    scanned repo mechanically demote a real finding (and persist the
+    demotion as a cross-run suppression learning)."""
     body = _FENCED_CODE_RE.sub(" ", body)
+    body = _INDENTED_BLOCK_RE.sub(" ", body)
     body = _INLINE_CODE_RE.sub(" ", body)
     return _QUOTE_LINE_RE.sub(" ", body)
 
@@ -422,23 +521,46 @@ def check_sink_guarded(
         summary = extract_scalar_marker(
             result.raw_output or "", "JOERN_GUARD_SUMMARY:",
         )
+        # Degraded probes warn, never whisper: this probe feeds
+        # suppression decisions (guarded-sink demotion, promotion
+        # veto), so a down channel must be operator-visible even
+        # though every consumer fails closed on GUARD_UNAVAILABLE.
+        # ``function_name`` passed the identifier check above;
+        # server-derived reply text is escaped and bounded.
         if summary is None:
-            if result.errors:
-                logger.debug(
-                    "guard query error for %s: %s",
-                    function_name, result.errors,
-                )
+            logger.warning(
+                "guard probe for %s returned no parseable summary "
+                "marker — verdict unavailable%s",
+                function_name,
+                (
+                    ": " + sanitise_for_terminal(str(result.errors))
+                    if result.errors else ""
+                ),
+            )
             return GUARD_UNAVAILABLE
         m = re.fullmatch(r"(\d+)/(\d+)", summary)
         if m is None:
+            logger.warning(
+                "guard probe for %s returned a malformed summary %s "
+                "— verdict unavailable",
+                function_name, sanitise_for_terminal(summary),
+            )
             return GUARD_UNAVAILABLE
         unguarded = int(m.group(1))
         total = int(m.group(2))
         if total == 0:
             return None
         return "guarded" if unguarded == 0 else "unguarded"
-    except Exception:
-        logger.debug("guard query exception for %s", function_name, exc_info=True)
+    except Exception as exc:
+        # The exception message can carry hostile server/reply bytes —
+        # escape and bound it like the other degraded branches; the
+        # full traceback stays at DEBUG.
+        logger.warning(
+            "guard probe exception for %s — verdict unavailable: %s",
+            function_name,
+            sanitise_for_terminal(f"{type(exc).__name__}: {exc}"),
+        )
+        logger.debug("guard probe exception detail", exc_info=True)
         return GUARD_UNAVAILABLE
 
 
@@ -466,7 +588,16 @@ def query_unguarded_sinks(
     ).replace("__SINK_NAMES__", _scala_string_list(_UNGUARDED_QUERY_SINKS))
     try:
         result = joern_server.query(query, timeout=30, validate=False)
-        if result.errors:
+        # Phantom-error tolerance (same filter as _joern_find_callers
+        # and query_sink_arg_indices): the server transport folds
+        # benign "failed to parse flow:" noise into result.errors on
+        # healthy replies; treating those as fatal silently discarded
+        # the unguarded-sink evidence from the review prompt on that
+        # transport. Only errors OUTSIDE that shape degrade.
+        if any(
+            "failed to parse flow:" not in str(e)
+            for e in (result.errors or [])
+        ):
             return []
         # Transport-tolerant parse: on the server transport the
         # records ride the final expression's value echo.
@@ -495,11 +626,31 @@ def query_sink_arg_index(
     For memcpy(dst, src, len), knowing arg 2 (src) vs arg 3 (len) is
     tainted changes the vulnerability class.
     """
+    return query_sink_arg_indices(function_name, [sink_name], joern_server)
+
+
+def query_sink_arg_indices(
+    function_name: str,
+    sink_names: list[str],
+    joern_server,
+) -> list[dict[str, Any]]:
+    """Batched :func:`query_sink_arg_index`: every sink in ONE submission.
+
+    A per-sink loop pays the REPL's Scala compilation overhead once per
+    sink; the batched template loops over the sink list inside one
+    query. Records carry their own ``sink`` name and come back ordered
+    by the caller's sink order (then arg index, then source param) —
+    the same order the per-sink loop produced.
+    """
     if joern_server is None or not joern_server.is_alive():
         return []
     if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", function_name):
         return []
-    if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", sink_name):
+    valid_sinks = [
+        s for s in sink_names
+        if re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", s or "")
+    ]
+    if not valid_sinks:
         return []
 
     query_path = _QUERIES_DIR / "sink_arg_index.sc"
@@ -509,31 +660,74 @@ def query_sink_arg_index(
     query = (
         query_path.read_text()
         .replace("__FUNCTION__", function_name)
-        .replace("__SINK__", sink_name)
+        .replace("__SINK_NAMES__", _scala_string_list(tuple(valid_sinks)))
     )
     try:
-        result = joern_server.query(query, timeout=30, validate=False)
+        # Sublinear batch budget — 30s × ceil(sqrt(N)), not N×30 and
+        # not a flat 30: linear re-inherits the per-enrichment
+        # monopoly of the shared single-threaded REPL the batch
+        # avoids, while a flat budget starves wide sink menus whose
+        # per-sink dataflow work is real even with compilation paid
+        # once. A degraded batch falls back to one per-sink pass below
+        # instead of costing the whole enrichment.
+        n = len(valid_sinks)
+        budget = 30 * (isqrt(n - 1) + 1)
+        result = joern_server.query(query, timeout=budget, validate=False)
         if result.errors:
-            return []
+            # result.errors can carry transport parse noise on some
+            # REPL echoes (same transport class the
+            # query_unguarded_sinks parse note documents), so this
+            # fallback occasionally fires on a phantom — one redundant
+            # per-sink pass, strictly better than the silent [] a
+            # degraded batch returned before.
+            return _sink_arg_indices_per_sink_fallback(
+                function_name, valid_sinks, joern_server,
+            )
         # Transport-tolerant parse — same doctrine as
         # query_unguarded_sinks.
         records, _decode_errors = parse_marker_records(
             result.raw_output or "", "JOERN_SINK_ARG:",
         )
         args = [r for r in records if isinstance(r, dict)]
-        # Deterministic order — same doctrine as query_unguarded_sinks.
+        # Deterministic order — same doctrine as query_unguarded_sinks;
+        # caller sink order first so the batch matches the loop it
+        # replaced.
+        sink_order = {name: i for i, name in enumerate(valid_sinks)}
         args.sort(key=lambda a: (
-            str(a.get("sink") or ""),
+            sink_order.get(str(a.get("sink") or ""), len(sink_order)),
             a.get("arg_index") if isinstance(a.get("arg_index"), int) else -1,
             str(a.get("source_param") or ""),
         ))
         return args
     except Exception:
         logger.debug(
-            "sink arg index query failed for %s→%s",
-            function_name, sink_name, exc_info=True,
+            "sink arg index query failed for %s→[%s]",
+            function_name, ",".join(valid_sinks), exc_info=True,
         )
+        return _sink_arg_indices_per_sink_fallback(
+            function_name, valid_sinks, joern_server,
+        )
+
+
+def _sink_arg_indices_per_sink_fallback(
+    function_name: str,
+    valid_sinks: list[str],
+    joern_server,
+) -> list[dict[str, Any]]:
+    """One-shot per-sink recovery when the batched query degrades.
+
+    Each single-sink call is the pre-batch query shape (a one-element
+    batch); only multi-sink batches fall back, so a degraded
+    single-sink query stays a single failure, never a recursion.
+    """
+    if len(valid_sinks) <= 1:
         return []
+    combined: list[dict[str, Any]] = []
+    for sink in valid_sinks:
+        combined.extend(
+            query_sink_arg_indices(function_name, [sink], joern_server),
+        )
+    return combined
 
 
 # ─── Composite gate verdicts ─────────────────────────────────────────────────

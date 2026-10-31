@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import logging
 
+from ..kinds import SUPPLYCHAIN_ID_PREFIX
 from ..findings import severity_rank
 from ..models import (
     Confidence,
@@ -65,7 +66,7 @@ from . import slopsquat as _slopsquat
 from . import typosquat as _typosquat
 from . import typosquat_domain as _typosquat_domain
 from . import workflow_signing as _workflow_signing
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -149,7 +150,7 @@ def evaluate(
     out.extend(
         SupplyChainFinding(
             finding_id=(
-                f"sca:supply_chain:install_hook_suspicious:Cargo:"
+                f"{SUPPLYCHAIN_ID_PREFIX}install_hook_suspicious:Cargo:"
                 f"{cbs.dependency.declared_in}"
             ),
             kind="install_hook_suspicious",
@@ -157,7 +158,7 @@ def evaluate(
             detail=cbs.detail,
             evidence={"file": "build.rs",
                       "ecosystem": "Cargo"},
-            severity=cbs.severity,
+            severity=cbs.severity,  # type: ignore[arg-type]
             confidence=cbs.confidence,
         )
         for cbs in _cargo_build.scan_manifests(manifests_list, deps_list)
@@ -204,7 +205,7 @@ def evaluate(
 
     out.extend(
         _gha_drift_to_finding(gha)
-        for gha in _gha_drift.scan_target(target, manifests_list)
+        for gha in _gha_drift.scan_target(target)
     )
 
     out.extend(
@@ -433,7 +434,7 @@ def _install_hook_to_finding(
             )
     return SupplyChainFinding(
         finding_id=(
-            f"sca:supplychain:install_hook_suspicious:"
+            f"{SUPPLYCHAIN_ID_PREFIX}install_hook_suspicious:"
             f"{hit.dependency.ecosystem}:{hit.dependency.name}:"
             f"{hit.hit.script_key}:{hit.dependency.declared_in}"
         ),
@@ -458,7 +459,7 @@ def _python_lifecycle_to_finding(
     why = ", ".join(plh.hit.reasons) if plh.hit.reasons else "hook present"
     return SupplyChainFinding(
         finding_id=(
-            f"sca:supplychain:install_hook_suspicious:"
+            f"{SUPPLYCHAIN_ID_PREFIX}install_hook_suspicious:"
             f"{plh.dependency.ecosystem}:{plh.dependency.name}:"
             f"setup.py:{plh.dependency.declared_in}"
         ),
@@ -487,7 +488,7 @@ def _composer_lifecycle_to_finding(
     why = ", ".join(clh.hit.reasons) if clh.hit.reasons else "hook present"
     return SupplyChainFinding(
         finding_id=(
-            f"sca:supplychain:install_hook_suspicious:"
+            f"{SUPPLYCHAIN_ID_PREFIX}install_hook_suspicious:"
             f"{clh.dependency.ecosystem}:{clh.dependency.name}:"
             f"{clh.hit.script_key}:{clh.dependency.declared_in}"
         ),
@@ -504,7 +505,7 @@ def _composer_lifecycle_to_finding(
             "reasons": list(clh.hit.reasons),
             "reads_credentials": clh.hit.reads_credentials,
             "has_publish_action": clh.hit.has_publish_action,
-            "ecosystem": "Composer",
+            "ecosystem": "Packagist",
         },
         severity=clh.severity,                # type: ignore[arg-type]
         confidence=clh.confidence,
@@ -540,7 +541,7 @@ def _commit_provenance_to_finding(
         )
     return SupplyChainFinding(
         finding_id=(
-            f"sca:supplychain:commit_provenance_drift:{h.commit_sha}"
+            f"{SUPPLYCHAIN_ID_PREFIX}commit_provenance_drift:{h.commit_sha}"
         ),
         kind="commit_provenance_drift",
         dependency=cpf.dependency,
@@ -568,7 +569,7 @@ def _rubygems_lifecycle_to_finding(
     why = ", ".join(rlh.hit.reasons) if rlh.hit.reasons else "hook present"
     return SupplyChainFinding(
         finding_id=(
-            f"sca:supplychain:install_hook_suspicious:"
+            f"{SUPPLYCHAIN_ID_PREFIX}install_hook_suspicious:"
             f"{rlh.dependency.ecosystem}:{rlh.dependency.name}:"
             f"{rlh.hit.script_key}"
         ),
@@ -601,7 +602,7 @@ def _orphan_commit_to_finding(
     ``optionalDependencies``) emit as distinct findings."""
     return SupplyChainFinding(
         finding_id=(
-            f"sca:supplychain:orphan_commit_dep:"
+            f"{SUPPLYCHAIN_ID_PREFIX}orphan_commit_dep:"
             f"{och.dependency.ecosystem}:{och.dependency.name}:"
             f"{och.hit.field}:{och.hit.dep_name}:"
             f"{och.dependency.declared_in}"
@@ -676,7 +677,7 @@ def _workflow_signing_to_finding(
             )
         return SupplyChainFinding(
             finding_id=(
-                f"sca:supplychain:workflow_unsigned_commit:"
+                f"{SUPPLYCHAIN_ID_PREFIX}workflow_unsigned_commit:"
                 f"{hit.commit_sha}"
             ),
             kind="workflow_unsigned_commit",
@@ -698,7 +699,7 @@ def _workflow_signing_to_finding(
         rate_pct = round(stats.signing_rate * 100, 1)
         return SupplyChainFinding(
             finding_id=(
-                f"sca:supplychain:workflow_unsigned_commit:"
+                f"{SUPPLYCHAIN_ID_PREFIX}workflow_unsigned_commit:"
                 f"summary:{ws.dependency.declared_in}"
             ),
             kind="workflow_unsigned_commit",
@@ -764,7 +765,7 @@ def _branch_protection_to_finding(
         )
     return SupplyChainFinding(
         finding_id=(
-            f"sca:supplychain:branch_protection_missing_signed_commits:"
+            f"{SUPPLYCHAIN_ID_PREFIX}branch_protection_missing_signed_commits:"
             f"{bp.owner_repo}:{bp.branch}"
         ),
         kind="branch_protection_missing_signed_commits",
@@ -785,7 +786,7 @@ def _sentinel_to_finding(
 ) -> SupplyChainFinding:
     return SupplyChainFinding(
         finding_id=(
-            f"sca:supplychain:sentinel_match:"
+            f"{SUPPLYCHAIN_ID_PREFIX}sentinel_match:"
             f"{sh.dependency.ecosystem}:{sh.dependency.name}:"
             f"{sh.dependency.version or '*'}:{sh.ref}"
         ),
@@ -809,7 +810,7 @@ def _typosquat_to_finding(
 ) -> SupplyChainFinding:
     return SupplyChainFinding(
         finding_id=(
-            f"sca:supplychain:typosquat_candidate:"
+            f"{SUPPLYCHAIN_ID_PREFIX}typosquat_candidate:"
             f"{ts.dependency.ecosystem}:{ts.dependency.name}:"
             f"{ts.dependency.declared_in}"
         ),
@@ -846,7 +847,7 @@ def _slopsquat_to_finding(
         detail += f"; suspected imitation of '{suspected}'"
     return SupplyChainFinding(
         finding_id=(
-            f"sca:supplychain:slopsquat_suspect:"
+            f"{SUPPLYCHAIN_ID_PREFIX}slopsquat_suspect:"
             f"{ss.dependency.ecosystem}:{ss.dependency.name}:"
             f"{ss.dependency.declared_in}"
         ),
@@ -868,7 +869,7 @@ def _artefact_to_finding(
 ) -> SupplyChainFinding:
     return SupplyChainFinding(
         finding_id=(
-            f"sca:supplychain:{art.kind}:"
+            f"{SUPPLYCHAIN_ID_PREFIX}{art.kind}:"
             f"{art.dependency.ecosystem}:{art.path}"
         ),
         kind=art.kind,                     # type: ignore[arg-type]
@@ -885,7 +886,7 @@ def _gha_secret_flow_to_finding(
 ) -> SupplyChainFinding:
     return SupplyChainFinding(
         finding_id=(
-            f"sca:supplychain:gha_secret_flow:"
+            f"{SUPPLYCHAIN_ID_PREFIX}gha_secret_flow:"
             f"{sf.workflow_path.name}:{sf.job_id}:"
             f"{sf.step_index}:{sf.sink_kind}"
         ),
@@ -943,7 +944,7 @@ def _binary_in_package_to_finding(
             "imports include high-severity capability bucket(s): "
             + ", ".join(forensic["high_severity_buckets"])
         )
-    evidence = {
+    evidence: dict[str, Any] = {
         "path": bip.relpath,
         "family": bip.family,
     }
@@ -957,7 +958,7 @@ def _binary_in_package_to_finding(
         evidence["manifest_declares_native"] = True
     return SupplyChainFinding(
         finding_id=(
-            f"sca:supplychain:binary_in_package:"
+            f"{SUPPLYCHAIN_ID_PREFIX}binary_in_package:"
             f"{bip.dependency.ecosystem}:{bip.dependency.name}:"
             f"{bip.relpath}"
         ),
@@ -986,7 +987,7 @@ def _python_import_to_finding(
 ) -> SupplyChainFinding:
     return SupplyChainFinding(
         finding_id=(
-            f"sca:supplychain:python_import_time_execution:"
+            f"{SUPPLYCHAIN_ID_PREFIX}python_import_time_execution:"
             f"{it.path}:{it.line}"
         ),
         kind="python_import_time_execution",
@@ -1003,7 +1004,7 @@ def _exfil_to_finding(
 ) -> SupplyChainFinding:
     return SupplyChainFinding(
         finding_id=(
-            f"sca:supplychain:known_exfil_destination:"
+            f"{SUPPLYCHAIN_ID_PREFIX}known_exfil_destination:"
             f"{ex.path}:{ex.line}:{ex.category}"
         ),
         kind="known_exfil_destination",
@@ -1021,7 +1022,7 @@ def _gha_drift_to_finding(
 ) -> SupplyChainFinding:
     return SupplyChainFinding(
         finding_id=(
-            f"sca:supplychain:gha_action_ref_drift:"
+            f"{SUPPLYCHAIN_ID_PREFIX}gha_action_ref_drift:"
             f"{gha.path}:{gha.line}:{gha.action}"
         ),
         kind="gha_action_ref_drift",
@@ -1041,7 +1042,7 @@ def _git_drift_to_finding(
 ) -> SupplyChainFinding:
     return SupplyChainFinding(
         finding_id=(
-            f"sca:supplychain:git_tag_drift:"
+            f"{SUPPLYCHAIN_ID_PREFIX}git_tag_drift:"
             f"{gd.dependency.ecosystem}:{gd.dependency.name}:"
             f"{gd.dependency.declared_in}"
         ),
@@ -1059,7 +1060,7 @@ def _typosquat_domain_to_finding(
 ) -> SupplyChainFinding:
     return SupplyChainFinding(
         finding_id=(
-            f"sca:supplychain:typosquat_domain:"
+            f"{SUPPLYCHAIN_ID_PREFIX}typosquat_domain:"
             f"{td.path}:{td.line}:{td.suspect_host}"
         ),
         kind="typosquat_domain",
@@ -1082,7 +1083,7 @@ def _registry_meta_to_finding(
 ) -> SupplyChainFinding:
     return SupplyChainFinding(
         finding_id=(
-            f"sca:supplychain:{rm.kind}:"
+            f"{SUPPLYCHAIN_ID_PREFIX}{rm.kind}:"
             f"{rm.dependency.ecosystem}:{rm.dependency.name}:"
             f"{rm.dependency.declared_in}"
         ),

@@ -1,0 +1,1316 @@
+"""On-disk compaction for ``review-journal.jsonl``.
+
+A multi-segment resumed audit re-emits every reused verdict as a
+fresh journal row per segment (per-segment completeness —
+``core.audit.verdict_reuse``), so a long resume chain's journal is
+dominated by duplicate re-emission rows and can cross the loader's
+retained-entry budget. The loader prunes those duplicates in MEMORY
+(``core.coverage.journal._prune_reemission_rows``); this module is
+the durable, operator-invokable twin that rewrites the FILE —
+``raptor-audit journal compact <out-dir>``.
+
+Loss contract (identical to the load-time prune, via the shared
+``_reemission_identity`` rule): a row is dropped only when it is a
+``reused`` re-emission, carries zero cost, bears no
+correction/feedback fields, is not a claim (finding/suspicious) or
+provisional row, AND a newer row with the identical
+(key, site, source_hash, verdict, model, strategy-hash) identity
+survives. Consequences:
+
+* the final verdict per function is byte-identical before/after
+  (kept rows are copied VERBATIM, so row MACs stay valid);
+* ``journal_spend_usd`` — the resume budget floor — cannot decrease:
+  only ``cost_usd``-less/zero rows are droppable;
+* corrections, lessons, claim rows, error/dark rows, markers, and
+  every unparseable line are kept as-is (never delete data the
+  reader refuses — it is evidence of something).
+
+Superseding tier (``--supersede``, opt-in): the duplicate prune above
+is lossless by contract, so a journal dominated by DISTINCT-bodied
+live review rows (a multi-segment mega-audit re-reviewing the same
+sites across passes) can stay over the loader budget with the plain
+compact a no-op — permanently wedging the spend-authorizing resume.
+The superseding tier keeps only the NEWEST row per review identity
+(:func:`_supersede_identity` — site, source hash, verdict, model,
+strategy set, producer; exactly the granularity every latest-wins
+consumer collapses to) and archives the full original journal beside
+the live file (``.pre-supersede`` family). Rows whose loss any
+consumer could observe are retained outright: claim rows
+(finding/suspicious), corrections (``validate_verdict``/``lesson``),
+provisional rows, error/dark rows, and unparseable lines. The journal
+spend floor is preserved bit-exactly: each dropped cost-bearing row is
+replaced IN PLACE by a tiny synthetic spend-carrier row bearing the
+identical ``cost_usd`` value, so the loader's sequential sum sees the
+same value sequence (:func:`_spend_carrier_line`) — and the pre-swap
+hard stop re-derives the after-floor by parsing the WRITTEN file
+(:func:`_file_spend`), so both an omitted and a value-corrupted
+carrier refuse the swap.
+
+Slim tier (``--slim-clean``, opt-in; implies ``--supersede``): a
+claim-dominated mega-audit journal of DISTINCT latest rows can stay
+over the loader budget even after superseding — the surviving
+clean/dormant rows each carry tens of KiB of prose and per-row
+domain-knowledge snapshot lists. The slim tier moves those fat, cold
+fields (``core.coverage.journal_sidecar.OFFLOAD_FIELDS``) of every
+surviving eligible clean/dormant row into the run-local
+``review-journal-bodies.jsonl`` sidecar and replaces the row with a
+loader-valid STUB carrying a ``body_offload`` pointer (offset +
+content hash). Eligibility mirrors the superseding tier's
+retained-outright classes and the offload consumer analysis: claim
+rows (finding/suspicious), corrections (``validate_verdict`` /
+``lesson``), provisional/error/dark rows, edge-contract rows,
+mechanical echoes, spend carriers, and already-slimmed stubs are
+never slimmed. Spend/verdict/coverage fields stay inline, so the
+latest-verdict view, ``reviewed_set``, and the spend floor are
+unchanged (the same written-file re-parse hard stop applies). MAC
+discipline: a stub is freshly stamped ONLY when the original row's
+token verified and the row round-trips the reader's dataclass — the
+compactor authenticates before it re-attests, so slimming never
+upgrades a tampered/unstamped row (those keep their original token
+and tier). The full original journal is archived under the
+``.pre-slim`` name family (numbered, PER SHARD — each shard is
+hardlinked beside itself before its own swap) for byte-exact
+reversibility; the sidecar plus stubs additionally reconstruct each
+original row's content exactly
+(``journal_sidecar.reconstruct_row`` — the archived token verifies
+over the reconstruction). Shard interaction: the slim arm runs per
+shard in the same pass-2 seam as superseding, while every shard's
+offloaded fields land in the ONE run-dir sidecar (see
+:func:`compact_journal`).
+
+Safety: refuses to compact a run whose recorded worker process is
+alive; holds the journal appenders' ``flock`` across both passes and
+the swap; backs the original up as ``review-journal.jsonl.pre-compact``
+(``.pre-supersede`` for the superseding tier, ``.pre-slim`` for the
+slim tier; hardlink — zero copy, never deleted) before an atomic
+tempfile+rename replace.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import logging
+import math
+import os
+import tempfile
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import IO, Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+# The loader's per-value spend clamp ceiling — imported (not
+# mirrored) so the compactor's floor accounting can never drift from
+# the loader's ``journal_spend_usd`` view. Module-level import is
+# cycle-free: ``core.audit.resume`` imports only ``core.json`` at
+# module scope.
+from core.atomic_fs.fs_lock import acquire_flock_bounded
+from core.audit.resume import _MAX_SPEND_EVIDENCE_USD
+from core.json import loads
+
+from . import journal as _journal
+from .journal import (
+    JOURNAL_FILENAME,
+    ReviewJournalEntry,
+    _canonical_strategy_hash,
+    _entry_from_dict,
+    _reemission_identity,
+    entry_producer,
+)
+
+try:
+    import fcntl
+    _HAS_FCNTL = True
+except ImportError:
+    _HAS_FCNTL = False
+
+logger = logging.getLogger(__name__)
+
+
+#: Bound on the pass-1 identity map. Real journals carry one identity
+#: per reviewed site (tens of thousands); a journal with more
+#: distinct re-emission identities than this is not a journal this
+#: tool understands — refuse rather than grow unbounded state over a
+#: hostile file.
+_MAX_IDENTITIES = 2_000_000
+
+_BACKUP_SUFFIX = ".pre-compact"
+_BACKUP_SUFFIX_SUPERSEDE = ".pre-supersede"
+_BACKUP_SUFFIX_SLIM = ".pre-slim"
+_DISCARD_CHUNK = 1 << 20
+
+#: Minimum serialized bytes the offloadable fields must total before
+#: a row is slimmed. Trade-off, both directions: too low and rows
+#: whose fat fields barely exceed the stub's own pointer overhead
+#: (~250 bytes) churn into stubs for no byte win — the sidecar grows
+#: and every reader pays a dereference for nothing; too high and a
+#: journal of mid-sized prose rows stays over budget with the slim
+#: tier a near-no-op (the wedge the tier exists to break). 1 KiB is
+#: ~4x the pointer overhead and well under the multi-KiB rows that
+#: dominate real mega-audit journals.
+_SLIM_MIN_OFFLOAD_BYTES = 1024
+
+#: Reserved identity of synthetic spend-carrier rows. The bracketed
+#: function name cannot collide with a real identifier in any target
+#: language, and the empty file component never matches an inventory
+#: path — so a carrier can never satisfy a resume lookup, earn
+#: coverage, or shadow a real function's verdict even before its
+#: ``error`` verdict excludes it from every authority path.
+SPEND_CARRIER_FUNCTION = "[journal-spend-carrier]"
+#: Strategy tag stamped on every spend-carrier row — the machine
+#: marker consumers can key on (see :func:`is_spend_carrier`).
+SPEND_CARRIER_STRATEGY = "superseded-spend-carrier"
+#: ``error_class`` stamped on spend-carrier rows.
+SPEND_CARRIER_ERROR_CLASS = "spend_carrier"
+
+
+class CompactRefused(RuntimeError):
+    """Compaction refused — nothing was modified."""
+
+
+class CompactAborted(CompactRefused):
+    """Compaction aborted cleanly mid-pass (wall-clock bound exceeded
+    or an external abort signal). The shard being processed is
+    untouched — the abort seams live only OUTSIDE the backup+rename
+    window, so a shard is either fully swapped or byte-identical; in
+    a multi-shard set, shards already swapped keep their compacted
+    form and backups (the same mid-set semantics as any refusal)."""
+
+
+#: How many pass-1/pass-2 lines run between abort-seam polls. Trade-
+#: off, both directions: lower and a multi-million-row shard spends
+#: measurable time in monotonic-clock reads and abort callbacks;
+#: higher and the abort/deadline response lags by up to that many
+#: lines of parse work (each line is bounded by the journal's
+#: per-line cap, so the lag is bounded too). 4096 lines is well under
+#: a millisecond of poll overhead per shard while keeping the
+#: response lag to a few MiB of streaming.
+_ABORT_POLL_EVERY_LINES = 4096
+
+
+@dataclass
+class CompactStats:
+    """Before/after accounting for one compaction."""
+
+    journal_path: str
+    backup_path: str
+    rows_before: int = 0
+    rows_after: int = 0
+    bytes_before: int = 0
+    bytes_after: int = 0
+    dropped_reemissions: int = 0
+    dropped_superseded: int = 0
+    spend_carriers: int = 0
+    slimmed_rows: int = 0
+    offloaded_bytes: int = 0
+    kept_unparseable: int = 0
+    spend_usd_before: float = 0.0
+    spend_usd_after: float = 0.0
+
+    @property
+    def ratio(self) -> float:
+        return (
+            self.bytes_before / self.bytes_after
+            if self.bytes_after else 1.0
+        )
+
+
+def _refuse_live_run(
+    out_dir: Path, allow_worker_pid: int | None = None,
+) -> None:
+    """Refuse when the run's recorded worker is still alive — a live
+    appender racing the rewrite could land a row on the pre-swap
+    inode (the backup) instead of the compacted journal.
+
+    ``allow_worker_pid`` is the mid-run checkpoint's self-permit: the
+    run's OWN process (the recorded worker itself) may compact its
+    journal at a quiesced point — with its workers provably idle, the
+    only appenders left are foreign ones, which the appender's
+    post-flock inode re-validation protects across the swap. The
+    permit matches ONLY when the recorded ``tool_pid`` equals the
+    caller-asserted pid (callers pass ``os.getpid()``); any other
+    live worker still refuses.
+
+    The metadata read fails CLOSED: a ``.raptor-run.json`` that exists
+    but cannot be read or parsed refuses compaction — the file is
+    run-dir content any writer can corrupt, and corrupting it must not
+    disable this refusal. An ABSENT file stays permissive: legacy and
+    foreign directories carry no run metadata and must remain
+    compactable.
+    """
+    from core.json import load_json
+    from core.run.metadata import (
+        RUN_METADATA_FILE,
+        RUN_METADATA_MAX_BYTES,
+        STATUS_RUNNING,
+        worker_liveness_for_meta,
+    )
+    meta_path = Path(out_dir) / RUN_METADATA_FILE
+    try:
+        # Strict spelling of load_run_metadata's read (same file, same
+        # byte budget). ``None`` is ambiguous — absent file OR a file
+        # containing JSON ``null`` — so the object check below
+        # re-consults the path before taking the permissive arm.
+        meta = load_json(meta_path, strict=True,
+                         max_bytes=RUN_METADATA_MAX_BYTES)
+    except (OSError, ValueError, RecursionError) as exc:
+        from core.security.log_sanitisation import sanitise_for_terminal
+        raise CompactRefused(
+            f"run metadata at {meta_path} exists but cannot be read "
+            f"({sanitise_for_terminal(str(exc), max_len=200)}) — "
+            "refusing to compact: an unreadable record cannot prove "
+            "the run is not in flight. Repair or remove the file, "
+            "then retry."
+        ) from exc
+    if meta is None and not meta_path.exists():
+        return
+    if not isinstance(meta, dict):
+        raise CompactRefused(
+            f"run metadata at {meta_path} is not a JSON object — "
+            "refusing to compact: a malformed record cannot prove "
+            "the run is not in flight. Repair or remove the file, "
+            "then retry."
+        )
+    if meta.get("status") != STATUS_RUNNING:
+        return
+    # Full-identity liveness (pid + recorded starttime; pid<=1 never
+    # live) — a reparented-to-init or recycled-pid record must not
+    # refuse compaction forever. The detail names the evidence.
+    alive, detail = worker_liveness_for_meta(meta)
+    if alive and allow_worker_pid is not None \
+            and meta.get("tool_pid") == allow_worker_pid:
+        return
+    if alive:
+        raise CompactRefused(
+            f"run at {out_dir} is still in flight ({detail}) — "
+            "refusing to compact a live run's journal. Wait for it "
+            "to stop, or kill it first."
+        )
+
+
+def refuse_live_run(out_dir: Path) -> None:
+    """Public seam for sibling run-dir rewriters (the audit-log
+    rotate remedy): raise :class:`CompactRefused` while the run
+    recorded at *out_dir* is still in flight. Same fail-closed
+    contract as compaction's own gate — an unreadable run record
+    refuses, an absent one stays permissive."""
+    _refuse_live_run(out_dir)
+
+
+def _backup_path(journal_path: Path, suffix: str = _BACKUP_SUFFIX) -> Path:
+    """First free ``.pre-compact`` / ``.pre-supersede`` name — an
+    existing backup is never overwritten (it may be the only copy of a
+    previous generation)."""
+    base = journal_path.with_name(journal_path.name + suffix)
+    if not base.exists():
+        return base
+    n = 2
+    while True:
+        candidate = base.with_name(f"{base.name}.{n}")
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
+def _iter_lines(fh: IO[bytes]):
+    """Yield ``(raw_line, overlong)`` with bounded materialisation.
+
+    An over-long line (past ``_MAX_JOURNAL_LINE_BYTES``) is yielded in
+    CHUNKS — ``(chunk, True)`` until its newline — so pass 2 can copy
+    it verbatim without ever buffering it whole. Pass 1 counts it as
+    one unparseable row and otherwise ignores the chunks.
+    """
+    while True:
+        line = fh.readline(_journal._MAX_JOURNAL_LINE_BYTES + 1)
+        if not line:
+            return
+        if (len(line) <= _journal._MAX_JOURNAL_LINE_BYTES
+                or line.endswith(b"\n")):
+            yield line, False
+            continue
+        yield line, True
+        while True:
+            chunk = fh.readline(_DISCARD_CHUNK)
+            if not chunk:
+                return
+            yield chunk, True
+            if chunk.endswith(b"\n"):
+                break
+
+
+def _row_cost(raw: dict[str, Any]) -> float:
+    """Bounded per-row cost, matching the spend loader's clamp
+    (``core.audit.resume.spend_value``): non-finite values clamp,
+    never sum raw. On stdlib-json installs a planted ``1e400`` parses
+    to ``inf`` (the row quarantines at load, but the compactor
+    accounts unparseable-dict rows too), and an ``inf`` on BOTH sides
+    of the pre-swap floor check degenerates it to ``inf == inf`` —
+    silently accepting any forged carrier value. The clamp keeps
+    every contribution finite so the check stays sensitive."""
+    cost = raw.get("cost_usd")
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+        try:
+            v = float(cost)
+        except (OverflowError, ValueError):
+            return 0.0
+        if not math.isfinite(v):
+            v = _MAX_SPEND_EVIDENCE_USD if v > 0 else 0.0
+        return min(max(0.0, v), _MAX_SPEND_EVIDENCE_USD)
+    return 0.0
+
+
+def _file_spend(path: Path) -> float:
+    """Sequential journal spend re-derived by PARSING *path*.
+
+    The pre-swap floor check must verify the bytes actually written,
+    not an accumulator fed from the source rows: a value-corrupting
+    bug in the carrier writer (or any future rewrite arm) would leave
+    a source-fed after-sum equal to the before-sum while the on-disk
+    floor drifted. Same per-row accounting as the census —
+    ``_row_cost`` over parsed rows in file order; unparseable and
+    over-long lines contribute nothing, matching the loader's
+    ``journal_spend_usd`` view."""
+    total = 0.0
+    with path.open("rb") as fh:
+        for raw_line, overlong in _iter_lines(fh):
+            if overlong:
+                continue
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            _entry, raw = _classify(stripped)
+            if raw is not None:
+                total += _row_cost(raw)
+    return total
+
+
+def is_spend_carrier(entry: Any) -> bool:
+    """True for synthetic spend-carrier rows written by the
+    superseding tier. Accepts a :class:`ReviewJournalEntry` or a raw
+    journal dict — the machine marker is the carrier strategy tag."""
+    if isinstance(entry, dict):
+        strategies = entry.get("strategies")
+    else:
+        strategies = getattr(entry, "strategies", None)
+    return SPEND_CARRIER_STRATEGY in (strategies or [])
+
+
+def _supersede_identity(entry: ReviewJournalEntry) -> tuple | None:
+    """Superseding-tier identity for a row, or ``None`` when the row
+    must be retained outright.
+
+    A row is superseded only by a NEWER row with the identical
+    identity — the granularity every latest-wins consumer collapses
+    to, which is also the project index's storage key
+    (``index_key``: site, model, strategy hash, producer), plus the
+    ``source_hash`` and ``verdict`` the loader's duplicate-prune
+    identity carries. Anything a consumer reads from NON-latest rows
+    is excluded from superseding entirely:
+
+    * claim rows (``finding``/``suspicious``) — distinct emissions can
+      record distinct findings and re-validation evidence;
+    * corrections and feedback (``validate_verdict``/``lesson``) —
+      survival stats and FP feedback read them from non-latest rows;
+    * ``provisional`` rows — not a settled verdict;
+    * ``error``/``dark`` rows — unresolved/retry states whose
+      disappearance would change what a resume re-reviews;
+    * spend-carrier rows from a previous superseding pass.
+
+    ``verdict`` stays in the identity even though only benign
+    verdicts are droppable, so a key's presence in ``reviewed_set``
+    (which screens by verdict) is preserved exactly.
+    """
+    if entry.verdict not in ("clean", "dormant"):
+        return None
+    if entry.validate_verdict or entry.lesson or entry.provisional:
+        return None
+    return (
+        entry.key, entry.line_start or 0, entry.source_hash,
+        entry.verdict, entry.model or "",
+        _canonical_strategy_hash(entry.strategies),
+        entry_producer(entry),
+    )
+
+
+def _spend_carrier_line(entry: ReviewJournalEntry,
+                        raw: dict[str, Any],
+                        archive_suffix: str = _BACKUP_SUFFIX_SUPERSEDE,
+                        ) -> bytes | None:
+    """One synthetic spend-carrier line for a superseded row, or
+    ``None`` when the row carries no cost.
+
+    The carrier preserves the dropped row's ``cost_usd`` VALUE and its
+    position in the file, so the loader's sequential spend sum
+    (``journal_spend_usd``) sees the identical value sequence — the
+    spend floor is preserved bit-exactly, not merely to the cent. The
+    row is loader-compatible by construction (built through the entry
+    dataclass and MAC-stamped like a live append) and inert
+    everywhere: ``error`` verdict (excluded from ``reviewed_set``,
+    coverage import, drift, and every reuse fold), reserved
+    file/function identity, and a ``[mechanical]`` body prefix so the
+    single counting rule (``is_mechanical_echo``) keeps it out of
+    review counts.
+    """
+    cost = raw.get("cost_usd")
+    if not isinstance(cost, (int, float)) or isinstance(cost, bool) \
+            or cost == 0:
+        return None
+    carrier = ReviewJournalEntry(
+        ts=entry.ts,
+        run_id=entry.run_id,
+        file="",
+        function=SPEND_CARRIER_FUNCTION,
+        verdict="error",
+        source_hash="",
+        strategies=[SPEND_CARRIER_STRATEGY],
+        body=(
+            "[mechanical] spend carrier: preserves the cost of a "
+            "review row dropped by `journal compact --supersede`; "
+            "the full row is in the review-journal.jsonl"
+            f"{archive_suffix}* archive"
+        ),
+        cost_usd=cost,
+        error_class=SPEND_CARRIER_ERROR_CLASS,
+    )
+    from core.coverage import journal_mac
+    row = carrier.to_dict()
+    row.pop(journal_mac.TOKEN_KEY, None)
+    token = journal_mac.mint_row(row)
+    if token:
+        row[journal_mac.TOKEN_KEY] = token
+    return (
+        json.dumps(row, separators=(",", ":"), allow_nan=False) + "\n"
+    ).encode("utf-8")
+
+
+def _slim_eligible(entry: ReviewJournalEntry) -> bool:
+    """Whether the slim tier may offload this SURVIVING row's fat
+    fields. Mirrors the superseding tier's retained-outright classes,
+    plus the offload consumer analysis' exclusions:
+
+    * only settled non-claim verdicts (``clean``/``dormant``) — claim
+      rows keep their bodies inline for sweep validation and
+      /validate; error/dark are unresolved states;
+    * no corrections/feedback (``validate_verdict``/``lesson``) —
+      survival stats and FP feedback read those rows whole;
+    * never ``provisional`` (unsettled), never edge-contract rows
+      (``edge_callee`` — the edge lane was not part of the offload
+      consumer analysis and its rows are small);
+    * never mechanical echoes — ``is_mechanical_echo`` keys on the
+      body PREFIX, so offloading the body would flip the single
+      counting/coverage screening rule for those rows;
+    * never finding-grade producer rows (/agentic and /validate
+      entries, ``is_function_grade`` False) — the prior-claims
+      context injection keeps those rows of EVERY verdict and quotes
+      their bodies as hints, so a slimmed agentic clean row would
+      feed an empty body there with no marker; excluding them at
+      eligibility keeps that lane stub-free outright (they are
+      per-finding records, not the bulk clean-essay mass this tier
+      targets);
+    * never spend carriers (tiny, reserved identity), never an
+      already-slimmed stub (idempotence).
+    """
+    return (
+        entry.verdict in ("clean", "dormant")
+        and not entry.validate_verdict
+        and not entry.lesson
+        and not entry.provisional
+        and not entry.edge_callee
+        and _journal.is_function_grade(entry)
+        and entry.body_offload is None
+        and not is_spend_carrier(entry)
+        and not _journal.is_mechanical_echo(entry)
+    )
+
+
+class _SidecarWriter:
+    """Appends offload records to the run's sidecar during pass 2.
+
+    ONE writer per :func:`compact_journal` shard walk, opened with
+    the journal appender's hardened-open discipline (O_NOFOLLOW /
+    O_CLOEXEC / O_NONBLOCK + regular-file check on the opened fd —
+    the sidecar lives in the same sandbox-writable run dir as the
+    journal). Write mutex: the writer takes its OWN exclusive
+    ``flock`` on the sidecar fd, held until :meth:`close` — the
+    journal flocks are PER SHARD, so shard 1's lock no longer
+    excludes a concurrent compactor for the whole run (it can enter
+    shard 1 while this walk is on shard 2), and interleaved appends
+    would corrupt the open-time-``st_size`` + appended-bytes offsets
+    the stubs are about to reference. Records go durable per shard
+    (:meth:`sync` before each shard's floor check and swap) — no
+    stub referencing a record can reach a live shard before the
+    record is on disk; a crash in between leaves only unreferenced
+    records (append-only, harmless). Lock ordering: see :meth:`open`.
+    """
+
+    def __init__(self, out_dir: Path) -> None:
+        from .journal_sidecar import SIDECAR_FILENAME
+        self._path = out_dir / SIDECAR_FILENAME
+        self._fd: int | None = None
+        self._offset = 0
+
+    def open(self) -> None:
+        """Open the sidecar and take its exclusive ``flock``.
+
+        Called EAGERLY by the walk — BEFORE the first shard flock is
+        acquired, never lazily at the first eligible append. LOCK
+        ORDERING RULE (deadlock freedom by construction): the total
+        lock order is ``sidecar < shard_1 < shard_2 < …`` — a slim
+        walk acquires the sidecar lock first and holds it until
+        :meth:`close`; shard flocks are then acquired strictly one at
+        a time in shard order, never re-acquired; plain (non-slim)
+        walks never take the sidecar lock at all. No path waits for a
+        lower-ordered lock while holding a higher-ordered one, so no
+        cycle exists. The REJECTED lazy shape — sidecar lock taken at
+        the first eligible append, inside some shard's critical
+        section — is deadlockable: a trailing walk that finds a fresh
+        fat row in an early shard (foreign append behind the leader)
+        holds the sidecar lock while waiting on the shard flock the
+        leading walk holds, while the leader waits on the sidecar
+        lock for ITS first append.
+
+        Blocks behind a concurrent slim walk's writer; the offset is
+        read AFTER the lock is held, so a predecessor's appends are
+        always visible. Cost of eagerness: a slim walk that offloads
+        nothing leaves an empty sidecar file behind — readers treat
+        absent and empty alike.
+        """
+        import stat as _stat
+        if self._fd is not None:
+            return
+        flags = (
+            os.O_WRONLY | os.O_APPEND | os.O_CREAT
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        fd = os.open(str(self._path), flags, 0o644)
+        try:
+            st = os.fstat(fd)
+            if not _stat.S_ISREG(st.st_mode):
+                msg = (
+                    f"sidecar path {self._path} is not a regular "
+                    "file — refusing to append"
+                )
+                raise OSError(msg)
+            if _HAS_FCNTL:
+                # Bounded, announce-once acquisition (shared helper):
+                # a second slim walk legitimately queues behind the
+                # first's whole-walk hold, but a wedged or hostile
+                # holder must abort THIS walk loudly rather than park
+                # it forever. No pid stamp — this flock is on the
+                # sidecar DATA file, not a disposable lock sidecar.
+                if not acquire_flock_bounded(
+                        fd, self._path, subject="compaction sidecar",
+                        expiry_note="refusing to append"):
+                    msg = (
+                        f"compaction sidecar {self._path} lock still "
+                        "held past the bounded wait — refusing to "
+                        "append"
+                    )
+                    raise OSError(msg)
+                st = os.fstat(fd)
+        except BaseException:
+            # Exception AND KeyboardInterrupt unwind: never leak the
+            # fd (closing it also drops the flock; on SIGKILL the
+            # kernel drops both with the process).
+            os.close(fd)
+            raise
+        self._fd = fd
+        self._offset = st.st_size
+
+    def append(self, record: dict[str, Any]) -> tuple[int, int]:
+        """Write one record line; returns ``(offset, length)``."""
+        data = (
+            json.dumps(record, separators=(",", ":"), allow_nan=False)
+            + "\n"
+        ).encode("utf-8")
+        if self._fd is None:
+            # Defensive re-open (the walk opens eagerly; see open()).
+            self.open()
+        fd = self._fd
+        if fd is None:  # open() either set it or raised
+            msg = f"sidecar writer for {self._path} is not open"
+            raise OSError(msg)
+        offset = self._offset
+        written = os.write(fd, data)
+        if written != len(data):
+            # Torn-write disposition (journal appender precedent):
+            # roll the partial line back so the sidecar never carries
+            # a torn tail, then refuse — the caller aborts the slim
+            # pass with the live journal untouched.
+            with contextlib.suppress(OSError):
+                os.ftruncate(fd, offset)
+            msg = (
+                f"sidecar append short write ({written} of "
+                f"{len(data)} bytes) — rolled back"
+            )
+            raise OSError(msg)
+        self._offset += len(data)
+        return offset, len(data)
+
+    def sync(self) -> None:
+        """fsync appended records (per-shard durability point)."""
+        if self._fd is not None:
+            os.fsync(self._fd)
+
+    def close(self) -> None:
+        if self._fd is not None:
+            try:
+                os.fsync(self._fd)
+            finally:
+                # close() drops the flock with the fd.
+                os.close(self._fd)
+                self._fd = None
+
+
+def _slim_stub_line(
+    entry: ReviewJournalEntry,
+    raw: dict[str, Any],
+    sidecar: _SidecarWriter,
+) -> bytes | None:
+    """Offload *entry*'s fat fields and build its stub line.
+
+    Returns the stub line, or ``None`` when the row is not worth
+    slimming (offloadable content below
+    ``_SLIM_MIN_OFFLOAD_BYTES``). Raises ``OSError`` on a refused
+    sidecar write (caller aborts; journal untouched).
+
+    MAC discipline — authenticate-then-re-attest, never upgrade:
+
+    * the original row's token VERIFIES over the row as written AND
+      the row round-trips the reader's dataclass exactly → the stub
+      is rebuilt through the dataclass and freshly stamped (the
+      pointer, content hash included, is covered by the new token);
+    * the token verifies over the row as written but the row does
+      NOT round-trip this reader's dataclass (a newer writer's
+      additive fields) → the stub is the raw dict minus the
+      offloaded values with the token STRIPPED: blanking the
+      offloaded values changes the stamped content, so a verbatim
+      token would demote a VERIFIED row to tampered — the sidecar
+      record's ``integrity_orig`` keeps the verifiable original for
+      reconstruction;
+    * anything else (unstamped, tampered, another install's key) →
+      the stub is the raw dict minus the offloaded values with the
+      ORIGINAL token kept verbatim, so the row keeps exactly the
+      demoted tier a reader already gave it — the compactor never
+      mints over content it
+      could not verify.
+    """
+    from dataclasses import replace
+
+    from core.coverage import journal_mac
+
+    from .journal_sidecar import (
+        OFFLOAD_FIELDS,
+        SIDECAR_FILENAME,
+        SIDECAR_SCHEMA_VERSION,
+        fields_sha256,
+    )
+
+    extracted = {
+        f: raw[f] for f in OFFLOAD_FIELDS if raw.get(f)
+    }
+    if not extracted:
+        return None
+    payload_len = sum(
+        len(json.dumps(v, separators=(",", ":"), default=str))
+        for v in extracted.values()
+    )
+    if payload_len < _SLIM_MIN_OFFLOAD_BYTES:
+        return None
+
+    token = raw.get(journal_mac.TOKEN_KEY)
+    roundtrip = entry.to_dict()
+    dataclass_shaped = (
+        {k: v for k, v in raw.items() if k != journal_mac.TOKEN_KEY}
+        == {k: v for k, v in roundtrip.items()
+            if k != journal_mac.TOKEN_KEY}
+    )
+    verified = bool(token) and journal_mac.verify_row(raw, token)
+
+    record: dict[str, Any] = {
+        "schema": SIDECAR_SCHEMA_VERSION,
+        "ts": entry.ts,
+        "run_id": entry.run_id,
+        "key": entry.key,
+        "line_start": entry.line_start or 0,
+        "source_hash": entry.source_hash,
+        "sha256": fields_sha256(extracted),
+        "fields": extracted,
+    }
+    if isinstance(token, str) and token:
+        record["integrity_orig"] = token
+    offset, length = sidecar.append(record)
+
+    pointer = {
+        "sidecar": SIDECAR_FILENAME,
+        "offset": offset,
+        "bytes": length,
+        "sha256": record["sha256"],
+        "fields": sorted(extracted),
+    }
+
+    if verified and dataclass_shaped:
+        cleared: dict[str, Any] = {}
+        for f in extracted:
+            cleared[f] = "" if f == "body" else []
+        stub_entry = replace(
+            entry, integrity=None, body_offload=pointer, **cleared)
+        row2 = stub_entry.to_dict()
+        row2.pop(journal_mac.TOKEN_KEY, None)
+        new_token = journal_mac.mint_row(row2)
+        if new_token:
+            row2[journal_mac.TOKEN_KEY] = new_token
+        # A mint failure here (key raced away since the verify) only
+        # DEMOTES the stub to the unstamped tier — the safe direction.
+    else:
+        row2 = dict(raw)
+        for f in extracted:
+            row2[f] = "" if f == "body" else []
+        row2["body_offload"] = pointer
+        if verified:
+            # The token verified over the row AS WRITTEN, but the
+            # row does not round-trip this reader's dataclass (a
+            # newer writer's additive fields). Blanking the offloaded
+            # values changes the stamped content, so keeping the
+            # token verbatim would manufacture a token-over-altered-
+            # content stub every fold reads as TAMPERED — a VERIFIED
+            # row demoted by its own compaction. Strip it: the stub
+            # lands honest-unstamped, and ``integrity_orig`` above
+            # preserves the verifiable original.
+            row2.pop(journal_mac.TOKEN_KEY, None)
+
+    return (
+        json.dumps(row2, separators=(",", ":"), allow_nan=False) + "\n"
+    ).encode("utf-8")
+
+
+def compact_journal(out_dir: Path, *,
+                    supersede: bool = False,
+                    slim_clean: bool = False,
+                    deadline_monotonic: float | None = None,
+                    should_abort: Callable[[], bool] | None = None,
+                    allow_worker_pid: int | None = None) -> CompactStats:
+    """Atomically rewrite the run's journal without its duplicate
+    re-emission rows. Returns aggregate before/after stats; raises
+    :class:`CompactRefused` when the run is live, the journal is
+    absent/unreadable, or a file's identity population exceeds the
+    tool's bounds.
+
+    Bounded execution (the mid-run checkpoint's contract): pass
+    ``deadline_monotonic`` (a ``time.monotonic`` timestamp) and/or
+    ``should_abort`` and the passes poll them every
+    ``_ABORT_POLL_EVERY_LINES`` lines plus once before each shard's
+    swap — a trip raises :class:`CompactAborted` with the current
+    shard byte-identical (there is deliberately NO seam between the
+    backup hardlink and the rename, so a shard that reached its swap
+    completes it). ``allow_worker_pid`` threads to
+    :func:`_refuse_live_run` — the mid-run self-permit.
+
+    ``supersede=True`` additionally drops every superseded row —
+    non-newest per :func:`_supersede_identity` — replacing each
+    cost-bearing one with a spend-carrier row in place, and archives
+    each original under the ``.pre-supersede`` name family instead of
+    ``.pre-compact``. Lossy on the LIVE file only (full history stays
+    in the archive): opt-in on the operator CLI; the journal
+    checkpoint's automatic tier (core.coverage.journal_checkpoint)
+    applies it under the same archival + spend-floor contract.
+
+    Shard-aware: every file in the journal's contiguous shard set is
+    compacted in place, one atomic swap each (a refusal mid-set
+    leaves earlier shards compacted — each swap is independently
+    backed up; lossless on the dedup tier, archive-preserved under
+    ``supersede``). Both tiers apply PER SHARD: duplicate re-emissions
+    spanning shard BOUNDARIES are not folded on disk (the loader's
+    cross-shard prune handles those in memory), and cross-shard
+    SUPERSEDED rows stay on disk too — latest-wins consumers collapse
+    them at read time. Per-shard rewriting is what restores each
+    file's headroom under the per-shard retained budgets, and
+    per-shard supersede stays spend-exact: every dropped cost-bearing
+    row's spend carrier lands in the same shard that held the row.
+
+    ``slim_clean=True`` (implies ``supersede=True``) further offloads
+    the SURVIVING eligible clean/dormant rows' fat fields to the
+    run's sidecar, leaving stub rows (see :func:`_slim_eligible` /
+    :func:`_slim_stub_line` and the module docstring); the archive
+    family becomes ``.pre-slim``. It implies superseding because slim
+    targets the latest-per-identity survivors — stubbing rows the
+    superseding tier would simply drop would fill the sidecar with
+    bodies of rows that no longer exist, and the operator remedy
+    ladder stays a single escalation (compact → --supersede →
+    --slim-clean). Slim x shards: the offload arm runs PER SHARD in
+    the same pass-2 seam as superseding — a row-local decision, and
+    per-shard rewriting is what restores each shard's headroom; it
+    also reaches the cross-shard SUPERSEDED clean rows per-shard
+    superseding must keep, which is where an older shard's byte win
+    comes from. Each shard archives to its own
+    ``<shard-name>.pre-slim`` family before its own swap (mid-set
+    refusal semantics identical to the other tiers), while ALL
+    shards' offloaded fields land in the ONE run-dir sidecar: a row
+    slims at most once, pointers are offset-addressed, and readers
+    resolve against the run dir — shard topology never leaks into
+    pointer resolution. The shared sidecar writer holds its own
+    exclusive flock across the whole shard walk: with per-shard
+    journal flocks, shard 1's lock no longer excludes a concurrent
+    compactor for the whole run, and interleaved sidecar appends
+    would corrupt the offsets stubs are about to reference.
+    """
+    out_dir = Path(out_dir)
+    if slim_clean:
+        supersede = True
+    _refuse_live_run(out_dir, allow_worker_pid=allow_worker_pid)
+
+    def _abort_reason() -> str | None:
+        if should_abort is not None and should_abort():
+            return "abort requested"
+        if (deadline_monotonic is not None
+                and time.monotonic() > deadline_monotonic):
+            return "wall-clock bound exceeded"
+        return None
+
+    archive_suffix = (
+        _BACKUP_SUFFIX_SLIM if slim_clean
+        else _BACKUP_SUFFIX_SUPERSEDE if supersede
+        else _BACKUP_SUFFIX
+    )
+    shards = _journal.journal_shard_paths(out_dir)
+    # ONE sidecar writer for the whole shard walk, opened (and its
+    # exclusive flock taken) EAGERLY before the first shard flock —
+    # the lock-ordering rule that makes concurrent walks cycle-free
+    # by construction (see _SidecarWriter.open). Closed here, never
+    # per shard: records go durable per shard (sync before each
+    # shard's floor check) while the writer's flock spans the walk.
+    sidecar = _SidecarWriter(out_dir) if slim_clean else None
+    total: CompactStats | None = None
+    backups: list[str] = []
+    try:
+        if sidecar is not None:
+            try:
+                sidecar.open()
+            except OSError as exc:
+                raise CompactRefused(
+                    f"slim tier: sidecar refused to open ({exc}) — "
+                    "nothing compacted"
+                ) from exc
+        for shard_path in shards:
+            reason = _abort_reason()
+            if reason:
+                raise CompactAborted(
+                    f"compaction aborted before {shard_path.name} "
+                    f"({reason}) — that shard is untouched; shards "
+                    "already swapped keep their compacted form and "
+                    "backups"
+                )
+            stats = _compact_one_file(shard_path, out_dir,
+                                      supersede=supersede,
+                                      slim_clean=slim_clean,
+                                      archive_suffix=archive_suffix,
+                                      sidecar=sidecar,
+                                      abort_reason=_abort_reason)
+            if stats is None:
+                if len(shards) == 1:
+                    raise CompactRefused(
+                        f"no readable review journal at {shard_path} "
+                        "— nothing to compact"
+                    )
+                continue
+            if stats.backup_path:
+                backups.append(stats.backup_path)
+            if total is None:
+                total = stats
+            else:
+                total.rows_before += stats.rows_before
+                total.rows_after += stats.rows_after
+                total.bytes_before += stats.bytes_before
+                total.bytes_after += stats.bytes_after
+                total.dropped_reemissions += stats.dropped_reemissions
+                total.kept_unparseable += stats.kept_unparseable
+                total.dropped_superseded += stats.dropped_superseded
+                total.spend_carriers += stats.spend_carriers
+                total.slimmed_rows += stats.slimmed_rows
+                total.offloaded_bytes += stats.offloaded_bytes
+                total.spend_usd_before += stats.spend_usd_before
+                total.spend_usd_after += stats.spend_usd_after
+    finally:
+        if sidecar is not None:
+            # Refusal/abort mid-set included: appended records are
+            # unreferenced until their shard's swap lands, and the
+            # sidecar is append-only (never rewritten), so orphans
+            # from a refused shard are inert.
+            with contextlib.suppress(OSError):
+                sidecar.close()
+    if total is None:
+        raise CompactRefused(
+            f"no readable review journal in {out_dir} — nothing to "
+            "compact"
+        )
+    total.journal_path = str(out_dir / JOURNAL_FILENAME) + (
+        f" (+{len(shards) - 1} shard(s))" if len(shards) > 1 else ""
+    )
+    total.backup_path = "; ".join(backups)
+    return total
+
+
+def _compact_one_file(
+    journal_path: Path, out_dir: Path, *, supersede: bool = False,
+    slim_clean: bool = False,
+    archive_suffix: str = _BACKUP_SUFFIX,
+    sidecar: _SidecarWriter | None = None,
+    abort_reason: Callable[[], str | None] | None = None,
+) -> CompactStats | None:
+    """Two-pass compaction of ONE journal shard file, or ``None``
+    when the file is missing/unreadable (multi-shard callers skip).
+
+    ``sidecar`` is the run's SHARED offload writer (one per
+    :func:`compact_journal` walk, never per shard): its records are
+    synced durable before THIS shard's floor check and swap, and its
+    lifetime/flock belong to the caller.
+
+    ``abort_reason`` (non-None return = abort) is polled every
+    ``_ABORT_POLL_EVERY_LINES`` lines in both passes and once after
+    the floor check — every seam sits BEFORE the backup hardlink, so
+    an abort leaves this shard byte-identical and the tmp file
+    cleaned up by the outer finally.
+    """
+
+    def _poll_abort(line_no: int) -> None:
+        if abort_reason is None or line_no % _ABORT_POLL_EVERY_LINES:
+            return
+        reason = abort_reason()
+        if reason:
+            raise CompactAborted(
+                f"compaction aborted mid-pass on {journal_path.name} "
+                f"({reason}) — the shard is untouched; in a shard "
+                "set, shards already swapped keep their compacted "
+                "form and backups"
+            )
+    from core.source import open_regular
+    fh = open_regular(journal_path, "rb")
+    if fh is None:
+        return None
+
+    stats = CompactStats(
+        journal_path=str(journal_path), backup_path="",
+    )
+    tmp_fd: int | None = None
+    tmp_path: Path | None = None
+    try:
+        with fh:
+            # Exclusive flock across BOTH passes and the swap: the
+            # appenders (core.coverage.journal.append_entry) take the
+            # same lock per row, so no cooperating writer can slip a
+            # row between the pass-1 census and the pass-2 copy.
+            # Bounded (shared helper): a wedged or hostile holder
+            # aborts this shard loudly — the shard stays untouched —
+            # instead of parking the compactor forever. No pid stamp:
+            # the flock is on the shard DATA file.
+            if _HAS_FCNTL:
+                if not acquire_flock_bounded(
+                        fh.fileno(), journal_path,
+                        subject="journal shard",
+                        expiry_note=("compaction of this shard "
+                                     "abandoned (shard untouched)")):
+                    msg = (
+                        f"journal shard {journal_path} lock still "
+                        "held past the bounded wait — compaction of "
+                        "this shard abandoned (shard untouched)"
+                    )
+                    raise OSError(msg)
+            try:
+                # Sweep tmp files leaked by a pre-rename kill of an
+                # earlier compaction (own prefix only, bounded). Safe
+                # under the held flock: a cooperating compactor holds
+                # it across its tmp's whole lifetime, so anything
+                # matching here is stale.
+                for stale in sorted(
+                        out_dir.glob(".~compact-*.jsonl"))[:16]:
+                    with contextlib.suppress(OSError):
+                        stale.unlink()
+
+                stats.bytes_before = os.fstat(fh.fileno()).st_size
+
+                # ── pass 1: newest line per droppable identity ──
+                # winner[identity] = (ts, line_no) — strictly newest
+                # ts wins; on a ts tie the FIRST row in file survives,
+                # matching the strict ``entry.ts > existing.ts``
+                # compare every latest-wins consumer applies
+                # (``latest_entries``, ``merge_into_index``, the
+                # resume per-site fold, the merge-cap collapse).
+                # The superseding tier keeps its own map: the two
+                # rules have different droppability contracts, and a
+                # row can be droppable under both.
+                winner: dict[tuple, tuple[str, int]] = {}
+                sup_winner: dict[tuple, tuple[str, int]] = {}
+                # Reemission identity of each elected sup-winner row
+                # (None for live rows) — consumed by the post-census
+                # reconciliation below.
+                sup_winner_rident: dict[tuple, tuple | None] = {}
+
+                def _note_winner(
+                    table: dict[tuple, tuple[str, int]],
+                    ident: tuple, ts: str, line_no: int,
+                ) -> bool:
+                    if len(table) >= _MAX_IDENTITIES \
+                            and ident not in table:
+                        raise CompactRefused(
+                            f"journal at {journal_path} carries more "
+                            f"than {_MAX_IDENTITIES} distinct "
+                            "row identities — refusing to "
+                            "compact a file this tool cannot bound"
+                        )
+                    prev = table.get(ident)
+                    if prev is None or ts > prev[0]:
+                        table[ident] = (ts, line_no)
+                        return True
+                    return False
+
+                line_no = -1
+                in_overlong = False
+                polled = 0
+                for raw_line, overlong in _iter_lines(fh):
+                    polled += 1
+                    _poll_abort(polled)
+                    if overlong:
+                        if not in_overlong:
+                            line_no += 1
+                            stats.rows_before += 1
+                            stats.kept_unparseable += 1
+                            in_overlong = True
+                        if raw_line.endswith(b"\n"):
+                            in_overlong = False
+                        continue
+                    line_no += 1
+                    stripped = raw_line.strip()
+                    if not stripped:
+                        continue
+                    stats.rows_before += 1
+                    entry, raw = _classify(stripped)
+                    if raw is not None:
+                        stats.spend_usd_before += _row_cost(raw)
+                    else:
+                        stats.kept_unparseable += 1
+                    if entry is None:
+                        continue
+                    ts = str(raw.get("ts", "")) if raw else ""
+                    ident = _reemission_identity(entry)
+                    if ident is not None:
+                        _note_winner(winner, ident, ts, line_no)
+                    if supersede:
+                        sident = _supersede_identity(entry)
+                        if sident is not None and _note_winner(
+                                sup_winner, sident, ts, line_no):
+                            sup_winner_rident[sident] = ident
+
+                # A sup-winner the dedup arm will itself drop (only a
+                # cross-producer reused twin can outrank it — the
+                # dedup identity lacks the producer axis, every other
+                # axis is shared) must not authorize superseding: its
+                # siblings would be dropped against a winner that
+                # never lands, leaving the identity with ZERO
+                # surviving rows (a live audit review row lost to a
+                # finding-grade twin — the re-spend direction). Skip
+                # superseding such identities this pass; the dedup arm
+                # still removes the duplicate, and a subsequent
+                # --supersede converges.
+                for sident, rident in sup_winner_rident.items():
+                    if rident is None:
+                        continue
+                    kept = winner.get(rident)
+                    if kept is not None \
+                            and kept[1] != sup_winner[sident][1]:
+                        del sup_winner[sident]
+
+                # ── pass 2: verbatim copy of every kept line ──
+                fh.seek(0)
+                tmp_fd, tmp_name = tempfile.mkstemp(
+                    prefix=".~compact-", suffix=".jsonl",
+                    dir=str(out_dir),
+                )
+                tmp_path = Path(tmp_name)
+                with os.fdopen(tmp_fd, "wb") as out:
+                    tmp_fd = None      # ownership moved to `out`
+                    line_no = -1
+                    in_overlong = False
+                    polled = 0
+                    for raw_line, overlong in _iter_lines(fh):
+                        polled += 1
+                        _poll_abort(polled)
+                        if overlong:
+                            if not in_overlong:
+                                line_no += 1
+                                stats.rows_after += 1
+                                in_overlong = True
+                            if raw_line.endswith(b"\n"):
+                                in_overlong = False
+                            out.write(raw_line)   # kept verbatim
+                            continue
+                        line_no += 1
+                        stripped = raw_line.strip()
+                        if not stripped:
+                            continue              # blank filler line
+                        entry, raw = _classify(stripped)
+                        ident = (
+                            _reemission_identity(entry)
+                            if entry is not None else None
+                        )
+                        kept_line = winner.get(ident) if ident else None
+                        if ident is not None and kept_line is not None \
+                                and kept_line[1] != line_no:
+                            stats.dropped_reemissions += 1
+                            continue
+                        if supersede and entry is not None:
+                            sident = _supersede_identity(entry)
+                            sup_kept = (
+                                sup_winner.get(sident)
+                                if sident is not None else None
+                            )
+                            if sup_kept is not None \
+                                    and sup_kept[1] != line_no:
+                                stats.dropped_superseded += 1
+                                carrier = _spend_carrier_line(
+                                    entry, raw or {}, archive_suffix)
+                                if carrier is not None:
+                                    out.write(carrier)
+                                    stats.rows_after += 1
+                                    stats.spend_carriers += 1
+                                continue
+                        if (slim_clean and sidecar is not None
+                                and entry is not None
+                                and raw is not None
+                                and _slim_eligible(entry)):
+                            try:
+                                slimmed = _slim_stub_line(
+                                    entry, raw, sidecar)
+                            except OSError as exc:
+                                raise CompactRefused(
+                                    "slim tier: sidecar append "
+                                    f"refused ({exc}) — aborting; "
+                                    f"{journal_path.name} untouched "
+                                    "(in a shard set, shards already "
+                                    "swapped before this one keep "
+                                    "their slimmed form and backups)"
+                                ) from exc
+                            if slimmed is not None:
+                                out.write(slimmed)
+                                stats.rows_after += 1
+                                stats.slimmed_rows += 1
+                                stats.offloaded_bytes += (
+                                    len(raw_line) - len(slimmed))
+                                continue
+                        out.write(raw_line)
+                        stats.rows_after += 1
+                    out.flush()
+                    os.fsync(out.fileno())
+                stats.bytes_after = tmp_path.stat().st_size
+
+                if sidecar is not None:
+                    # Durable BEFORE this shard's floor check and
+                    # swap: no stub referencing a record may reach
+                    # the live journal until the record is on disk.
+                    # Sync, not close — the writer (and its flock)
+                    # spans the caller's whole shard walk.
+                    sidecar.sync()
+
+                # Loss-contract hard stop, verified against the BYTES
+                # WRITTEN: the after-sum is re-derived by parsing the
+                # tmp file, never carried over from the source rows —
+                # a source-fed accumulator is blind to a
+                # value-corrupting bug in the carrier writer (both
+                # sums would agree while the on-disk floor drifted).
+                # Plain tier: droppable rows are zero-cost by rule, so
+                # the floor cannot decrease. Superseding tier: carriers
+                # reproduce every dropped cost value in place, so the
+                # re-parsed floor must be bit-identical; any mismatch
+                # refuses the swap.
+                stats.spend_usd_after = _file_spend(tmp_path)
+                floor_broken = (
+                    stats.spend_usd_after != stats.spend_usd_before
+                    if supersede
+                    else stats.spend_usd_after < stats.spend_usd_before
+                )
+                if floor_broken:
+                    raise CompactRefused(
+                        "compaction would change the journal spend "
+                        f"floor ({stats.spend_usd_before} -> "
+                        f"{stats.spend_usd_after}) — refusing; "
+                        f"{journal_path.name} untouched (in a shard "
+                        "set, shards already swapped before this one "
+                        "keep their compacted form and backups)"
+                    )
+
+                # Last abort seam: past this point the shard COMMITS
+                # to its swap — there is deliberately no poll between
+                # the backup hardlink and the rename (an abort inside
+                # that window would leave a backup with no swap, and
+                # the swap itself is a single atomic rename anyway).
+                if abort_reason is not None:
+                    reason = abort_reason()
+                    if reason:
+                        raise CompactAborted(
+                            f"compaction aborted before the swap of "
+                            f"{journal_path.name} ({reason}) — the "
+                            "shard is untouched; in a shard set, "
+                            "shards already swapped keep their "
+                            "compacted form and backups"
+                        )
+
+                # ── backup (hardlink, never deleted), then swap ──
+                backup = _backup_path(journal_path, archive_suffix)
+                os.link(str(journal_path), str(backup))
+                stats.backup_path = str(backup)
+                os.rename(str(tmp_path), str(journal_path))
+                tmp_path = None
+                # Drop this process's load-cache record explicitly —
+                # per swapped shard, so even a refusal later in the
+                # set leaves no record describing pre-swap bytes.
+                # The swap normally changes the shard's inode (which
+                # the reader's identity checks catch), but freed
+                # inode numbers can be recycled immediately on some
+                # filesystems, and a recycled inode at the same path
+                # with a plausible size would let a cached parse be
+                # served or extended over the compacted bytes.
+                _journal.invalidate_load_cache(out_dir)
+                dir_fd = os.open(str(out_dir), os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            finally:
+                if _HAS_FCNTL:
+                    with contextlib.suppress(OSError):
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    finally:
+        if tmp_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(tmp_fd)
+        if tmp_path is not None:
+            with contextlib.suppress(OSError):
+                tmp_path.unlink()
+    return stats
+
+
+def _classify(
+    stripped: bytes,
+) -> tuple[ReviewJournalEntry | None, dict | None]:
+    """(parsed entry | None, parsed row | None) for one line.
+
+    The entry is non-None only for rows the loader would accept —
+    droppability under either tier's identity rule is decided by the
+    callers; the parsed dict comes back for every valid JSON row so
+    both passes can account spend/ts without re-parsing.
+    """
+    try:
+        raw = loads(stripped)
+    except Exception:  # noqa: BLE001 — row containment boundary
+        return None, None
+    if not isinstance(raw, dict):
+        return None, None
+    try:
+        entry = _entry_from_dict(raw)
+    except Exception:  # noqa: BLE001 — row containment boundary
+        return None, raw if isinstance(raw, dict) else None
+    return entry, raw

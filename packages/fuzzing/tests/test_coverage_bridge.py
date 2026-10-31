@@ -9,6 +9,7 @@ document satisfies BOTH existing consumer schemas.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -228,6 +229,48 @@ class TestCorpusDiscovery:
         inputs = find_corpus_inputs(tmp_path)
         assert [f.name for f in inputs] == ["id:000000"]
 
+    def test_symlinked_entry_refused(self, tmp_path, caplog):
+        """A target-planted ``id:… -> <host file>`` in queue/crashes
+        must never be selected: file-mode replay derives a sandbox
+        read grant from the input's RESOLVED parent, handing the
+        untrusted binary a read of the symlink target's directory."""
+        secret = tmp_path / "credentials"
+        secret.write_bytes(b"AKIA-SECRET")
+        afl = tmp_path / "afl" / "main"
+        (afl / "queue").mkdir(parents=True)
+        (afl / "queue" / "id:000000").write_bytes(b"q")
+        (afl / "queue" / "id:000099").symlink_to(secret)
+
+        with caplog.at_level("WARNING"):
+            inputs = find_corpus_inputs(tmp_path)
+
+        assert [f.name for f in inputs] == ["id:000000"]
+        assert any("non-regular input" in r.getMessage()
+                   for r in caplog.records)
+
+    def test_symlinked_dir_components_refused(self, tmp_path):
+        """Symlinked directory components (instance dir, queue dir,
+        the afl/libfuzzer roots) route enumeration at a foreign tree
+        of REAL files the per-entry check cannot see."""
+        foreign = tmp_path / "foreign"
+        foreign.mkdir()
+        (foreign / "id:000001").write_bytes(b"host data")
+        foreign_inst = tmp_path / "foreign-inst"
+        (foreign_inst / "queue").mkdir(parents=True)
+        (foreign_inst / "queue" / "id:000002").write_bytes(b"host data")
+
+        out = tmp_path / "out"
+        afl = out / "afl"
+        afl.mkdir(parents=True)
+        inst = afl / "main"
+        inst.mkdir()
+        (inst / "queue").symlink_to(foreign)
+        (afl / "evilinst").symlink_to(foreign_inst)
+        (out / "merged_crashes").symlink_to(foreign)
+        (out / "libfuzzer").symlink_to(foreign)
+
+        assert find_corpus_inputs(out) == []
+
 
 class TestReplay:
     def test_file_mode_passes_input_as_argv(self, tmp_path):
@@ -276,6 +319,95 @@ class TestReplay:
         )
         assert n == 1
 
+    def test_stdin_mode_refuses_symlinked_input(self, tmp_path, caplog):
+        """TOCTOU leg: an input swapped to a symlink after selection
+        must be refused by the fd-honest host-side read, never piped
+        into the attacker's binary."""
+        secret = tmp_path / "credentials"
+        secret.write_bytes(b"AKIA-SECRET")
+        link = tmp_path / "id:000000"
+        link.symlink_to(secret)
+        good = tmp_path / "id:000001"
+        good.write_bytes(b"data")
+        calls = []
+
+        def runner(cmd, *, cwd=None, stdin_bytes=None, timeout=0):
+            calls.append(stdin_bytes)
+
+        with caplog.at_level("WARNING"):
+            n = replay_corpus(
+                tmp_path / "bin", [link, good],
+                input_mode="stdin", runner=runner,
+            )
+
+        assert n == 1
+        assert calls == [b"data"]
+        assert any("corpus replay: skipping" in r.getMessage()
+                   for r in caplog.records)
+
+    def test_stdin_mode_skips_oversize_input(self, tmp_path, caplog):
+        """Oversize inputs are skipped whole — a truncated input
+        replays a DIFFERENT execution, and an unbounded read is a
+        host-memory DoS lever for a target-written file."""
+        from packages.fuzzing import coverage_bridge as mod
+
+        big = tmp_path / "id:000000"
+        big.write_bytes(b"x" * (mod._MAX_STDIN_INPUT_BYTES + 1))
+        calls = []
+
+        def runner(cmd, *, cwd=None, stdin_bytes=None, timeout=0):
+            calls.append(stdin_bytes)
+
+        with caplog.at_level("WARNING"):
+            n = replay_corpus(
+                tmp_path / "bin", [big], input_mode="stdin",
+                runner=runner,
+            )
+
+        assert n == 0
+        assert calls == []
+
+
+class TestDefaultRunnerGrants:
+    def test_symlinked_arg_earns_no_read_grant(self, tmp_path,
+                                               monkeypatch):
+        """The sandbox read allowlist derives from argv paths; a
+        symlinked arg must not grant its resolved TARGET's parent
+        (e.g. a queue entry pointing into a credentials directory)."""
+        import core.sandbox as sandbox_mod
+        from packages.fuzzing.coverage_bridge import _default_runner
+
+        secret_dir = tmp_path / "secrets"
+        secret_dir.mkdir()
+        (secret_dir / "credentials").write_bytes(b"AKIA-SECRET")
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        good = corpus / "id:000000"
+        good.write_bytes(b"data")
+        planted = corpus / "id:000099"
+        planted.symlink_to(secret_dir / "credentials")
+        binary = tmp_path / "bin" / "target"
+        binary.parent.mkdir()
+        binary.write_bytes(b"\x7fELF")
+
+        seen = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["readable"] = kwargs.get("readable_paths")
+            import subprocess as sp
+            return sp.CompletedProcess(cmd, 0)
+
+        monkeypatch.setattr(sandbox_mod, "run", fake_run)
+
+        _default_runner(
+            [str(binary), str(good), str(planted)],
+            cwd=tmp_path,
+        )
+
+        readable = set(seen["readable"])
+        assert str(corpus.resolve()) in readable
+        assert str(secret_dir.resolve()) not in readable
+
 
 class TestEmit:
     def test_no_instrumentation_degrades_silently(self, tmp_path):
@@ -304,7 +436,9 @@ class TestEmit:
             stdout = _GCOV_OUTPUT
 
         def runner(cmd, *, cwd=None, stdin_bytes=None, timeout=0):
-            if cmd[0] == str(binary):
+            # Staged replay copy keeps the basename (0444
+            # run-dir artifacts exec via executable_stage).
+            if Path(cmd[0]).name == binary.name:
                 # Target replay drops a .gcda like gcov builds do.
                 (build / "parse.gcda").write_bytes(b"")
                 gcda_written["done"] = True
@@ -390,7 +524,9 @@ class TestEmit:
             stdout = _GCOV_OUTPUT
 
         def runner(cmd, *, cwd=None, stdin_bytes=None, timeout=0):
-            if cmd[0] == str(binary):
+            # Staged replay copy keeps the basename (0444
+            # run-dir artifacts exec via executable_stage).
+            if Path(cmd[0]).name == binary.name:
                 (build / "parse.gcda").write_bytes(b"fresh")
                 return None
             assert cmd[0] == "gcov"
@@ -470,9 +606,12 @@ class TestDefaultRunnerSandboxed:
 
         def fake_run(cmd, **kwargs):
             calls.append((cmd, kwargs))
-            return sp.CompletedProcess(
-                cmd, returncode, stdout=stdout, stderr=b"",
-            )
+            # gcov capture is file-redirected (bounded read-back),
+            # not PIPE-buffered - emit like the tool would.
+            out = kwargs.get("stdout")
+            if out is not None and hasattr(out, "write"):
+                out.write(stdout)
+            return sp.CompletedProcess(cmd, returncode)
 
         monkeypatch.setattr(core.sandbox, "run", fake_run)
         return calls
@@ -525,7 +664,9 @@ class TestDefaultRunnerSandboxed:
             ["gcov", "-f", "-t", str(gcda)], cwd=build, timeout=60,
         )
         cmd, kwargs = calls[0]
-        assert kwargs["stdout"] == sp.PIPE
+        assert kwargs["stdout"] != sp.PIPE, (
+            "PIPE buffers the whole stream before the cap can run"
+        )
         assert kwargs["block_network"] is True
         assert len(proc.stdout) == _MAX_CAPTURE_BYTES
 
@@ -545,3 +686,105 @@ class TestDefaultRunnerSandboxed:
         gcda.write_bytes(b"z")
         with pytest.raises(SandboxSetupError):
             collect_gcov_function_coverage(tmp_path / "b", runner=runner)
+
+
+class TestBaseVoteSpanCountCap:
+    def test_span_count_participation_is_capped(self, monkeypatch):
+        """Span WIDTH is already gated; span COUNT rides the
+        attacker-controlled checklist symtab and must be bounded too
+        (the vote is O(sample x spans))."""
+        import packages.fuzzing.coverage_bridge as cb
+
+        monkeypatch.setattr(cb, "_BASE_VOTE_MAX_SPANS", 1)
+        base = 0x555555000000
+        spans = [
+            (0x1000, 0x1FFF, "first"),      # participates
+            (0x2000, 0x2FFF, "second"),     # beyond the cap — ignored
+        ]
+        # PCs landing only in the SECOND span's rebased range: with
+        # the cap at 1 they can produce no quorum candidate.
+        pcs = [base + 0x2100 + i for i in range(0, 64 * 0x1000, 0x1000)]
+        assert cb._base_candidates(pcs, spans) == []
+
+
+class TestGcovCaptureBounded:
+    def test_default_runner_gcov_capture_goes_to_file(
+        self, tmp_path, monkeypatch,
+    ):
+        """gcov report capture must not buffer unbounded in a PIPE
+        before the truncation loop — redirect to a file and read back
+        capped."""
+        import subprocess as sp
+
+        import core.sandbox as sandbox_mod
+        import packages.fuzzing.coverage_bridge as cb
+
+        big = b"L" * (cb._MAX_CAPTURE_BYTES + 4096)
+
+        def fake_run(cmd, **kwargs):
+            stdout = kwargs.get("stdout")
+            assert stdout != sp.PIPE, (
+                "unbounded in-memory PIPE capture of gcov output"
+            )
+            assert hasattr(stdout, "write"), "stdout must be a file"
+            stdout.write(big)
+            return sp.CompletedProcess(cmd, 0)
+
+        monkeypatch.setattr(sandbox_mod, "run", fake_run)
+        gcov = tmp_path / "gcov"
+        gcov.write_text("#!/bin/sh\n")
+        proc = cb._default_runner([str(gcov)], cwd=tmp_path)
+        assert isinstance(proc.stdout, bytes)
+        assert len(proc.stdout) <= cb._MAX_CAPTURE_BYTES
+
+
+class TestReplayCorpusExecutableStaging:
+    """Env-built instrumented binaries sit 0444 in the run dir; the
+    corpus replay must hand the runner a staged 0o500 copy, staged
+    once for the whole corpus."""
+
+    def test_replay_stages_0444_binary_once(self, tmp_path):
+        import os
+
+        from packages.fuzzing.coverage_bridge import replay_corpus
+
+        artifact = tmp_path / "fuzz_target"
+        artifact.write_bytes(b"\x7fELF")
+        artifact.chmod(0o444)
+        inputs = []
+        for i in range(2):
+            p = tmp_path / f"input-{i}"
+            p.write_bytes(b"corpus")
+            inputs.append(p)
+        calls = []
+
+        def runner(cmd, **kwargs):
+            calls.append((list(cmd), os.access(cmd[0], os.X_OK)))
+
+        n = replay_corpus(artifact, inputs, input_mode="file",
+                          runner=runner)
+
+        assert n == 2
+        staged_paths = {c[0][0] for c in calls}
+        assert len(staged_paths) == 1  # staged once for the corpus
+        staged = Path(staged_paths.pop())
+        assert staged != artifact
+        assert all(exec_ok for _, exec_ok in calls)
+        assert not os.access(artifact, os.X_OK)
+        assert not staged.exists()
+
+    def test_replay_runs_executable_binary_in_place(self, tmp_path):
+        from packages.fuzzing.coverage_bridge import replay_corpus
+
+        binary = tmp_path / "fuzz_target"
+        binary.write_bytes(b"#!/bin/sh\n")
+        binary.chmod(0o755)
+        inp = tmp_path / "input-0"
+        inp.write_bytes(b"corpus")
+        calls = []
+
+        def runner(cmd, **kwargs):
+            calls.append(list(cmd))
+
+        replay_corpus(binary, [inp], input_mode="file", runner=runner)
+        assert calls == [[str(binary), str(inp)]]

@@ -38,6 +38,7 @@ from typing import Any, TYPE_CHECKING
 from core.json import JsonCache, MISSING
 
 from ._negative_cache import log_fetch_failure, should_negative_cache
+from ._url import registry_cache_key
 
 from ..versions.debian import compare as _debian_compare
 
@@ -93,9 +94,14 @@ class DebianClient:
         return self._query(name, suite=suite)
 
     def _query(self, name: str, *, suite: str | None) -> list[str]:
-        encoded_name = urllib.parse.quote(name, safe='')
-        cache_key = (f"{_CACHE_KEY_PREFIX}:{encoded_name}" if suite is None
-                     else f"{_CACHE_KEY_PREFIX}:{encoded_name}:{suite}")
+        # registry_cache_key percent-encodes EVERY component. The old
+        # hand-built key embedded ``suite`` raw — a ``/`` became a
+        # cache subdirectory, ``..`` raised ValueError out of _query,
+        # and ``\`` aliased distinct suites onto one file. The
+        # no-suite key shape is unchanged (same prefix:encoded-name).
+        cache_key = (registry_cache_key(_CACHE_KEY_PREFIX, name)
+                     if suite is None
+                     else registry_cache_key(_CACHE_KEY_PREFIX, name, suite))
         if self._cache is not None:
             cached = self._cache.try_get(cache_key, ttl_seconds=self._ttl)
             if cached is not MISSING:

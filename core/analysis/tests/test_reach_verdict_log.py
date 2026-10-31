@@ -311,3 +311,25 @@ def test_cli_script_reset(_isolated_sidecar):
     rc, _out = _run_script("--reset", sidecar=_isolated_sidecar)
     assert rc == 0
     assert not _isolated_sidecar.exists()
+
+
+def test_reset_leaves_no_lock_residue(tmp_path):
+    """reset() created-and-left the sidecar's .lock file — cosmetic
+    residue in out/. Both files are gone afterwards."""
+    from core.analysis import reach_verdict_log as rvl
+    sidecar = tmp_path / "verdicts.json"
+    rvl.record_verdict("python", "reachable")
+    rvl.flush(sidecar)
+    rvl.reset(sidecar)
+    assert not sidecar.exists()
+    assert not sidecar.with_suffix(sidecar.suffix + ".lock").exists()
+
+
+def test_sidecar_lock_creates_missing_file(tmp_path):
+    """_sidecar_lock creates the lock file via O_CREAT when it
+    doesn't exist and acquires without error."""
+    from core.analysis.reach_verdict_log import _sidecar_lock
+    lock_path = tmp_path / "v.json.lock"
+    assert not lock_path.exists()
+    with _sidecar_lock(lock_path):
+        assert lock_path.exists()

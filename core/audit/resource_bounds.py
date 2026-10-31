@@ -41,14 +41,16 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
-from core.json import dumps_artifact
+from core.json import save_json
 from typing import Any
+from core.source.lines import split_lines
 
 logger = logging.getLogger(__name__)
 
@@ -59,8 +61,13 @@ RULE_UNBOUNDED = "resource_bounds:unbounded-accumulation"
 # alone; participates in channel aggregation).
 DETECTION_VARIANT_SUFFIX = "-naming"
 
-# CWE families the channel joins via the fallback chain.
-RESOURCE_BOUNDS_CWES = frozenset({"CWE-770", "CWE-400", "CWE-772"})
+# CWE families the channel joins via the fallback chain. CWE-789
+# (memory allocation with excessive size value) is the
+# allocation-size shape of the same family — the attacker-influenced
+# size reaching the allocator unbounded is exactly the bound-witness
+# question this channel adjudicates.
+RESOURCE_BOUNDS_CWES = frozenset({"CWE-770", "CWE-400", "CWE-772",
+                                  "CWE-789"})
 
 # Enumerated inconclusive reasons (each a distinct tested string).
 REASON_VOCAB_UNBOUND = "vocab-unbound"
@@ -68,6 +75,7 @@ REASON_GUARD_UNDECIDED = "guard-undecided"
 REASON_CENSUS_DEGRADED = "census-degraded"
 REASON_LANGUAGE_UNSUPPORTED = "language-unsupported"
 REASON_HYPOTHESIS_UNBINDABLE = "hypothesis-unbindable"
+REASON_BUDGET_EXHAUSTED = "budget-exhausted"
 
 INCONCLUSIVE_REASONS = frozenset({
     REASON_VOCAB_UNBOUND,
@@ -137,9 +145,14 @@ _LIMITISH_RE = re.compile(
 
 _BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z_][\w.]*)\s*(?:\(\s*\))?`")
 _IDENT_RE = re.compile(r"\b([A-Za-z_]\w{2,})\b")
+# \b pins each attempt to an identifier start and the member chains
+# are depth-bounded: unanchored and unbounded, a hostile `a.a.a...`
+# run retries every suffix and re-walks the chain from each —
+# quadratic. 32 members is far beyond real chains; a mid-word start
+# was never a real identifier.
 _CMP_RE = re.compile(
-    r"([A-Za-z_]\w*(?:(?:->|\.)\w+)*)\s*(<=|>=|==|<|>)\s*"
-    r"([A-Za-z_]\w*(?:(?:->|\.)\w+)*|\d+)",
+    r"\b([A-Za-z_]\w*(?:(?:->|\.)\w+){0,32})\s*(<=|>=|==|<|>)\s*"
+    r"([A-Za-z_]\w*(?:(?:->|\.)\w+){0,32}|\d+)",
 )
 _LOOP_RE = re.compile(r"\b(?:for|while)\s*\(")
 
@@ -244,21 +257,30 @@ def _inconclusive(reason: str, detail: str = "") -> BoundEvidence:
 # ── vocabulary (seeds < pack < learned) ─────────────────────────────
 
 
+# Parsed-pack memo (the vocab_packs._pack_cache pattern): the pack
+# ships with the repo and is immutable for the process lifetime, so
+# one read serves every check call. Failures stay uncached (retried).
+_pack_collection_cache: dict[str, tuple[frozenset[str], frozenset[str]]] = {}
+
+
 def _pack_collection_verbs(
     target_path: Path | None,
 ) -> tuple[frozenset[str], frozenset[str]]:
     """Channel-local read of the vocab pack's ``collection_inserts`` /
     ``collection_removes`` keys (data-file-only extension — the pack
     loader tolerates unknown keys and DomainVocabulary carries no
-    collection classes by design)."""
+    collection classes by design). Memoised per pack name."""
     if target_path is None:
         return frozenset(), frozenset()
     try:
         from .vocab_packs import _PACK_DIR, is_kernel_tree
         if not is_kernel_tree(target_path):
             return frozenset(), frozenset()
+        cached = _pack_collection_cache.get("linux_kernel")
+        if cached is not None:
+            return cached
         raw = json.loads(
-            (_PACK_DIR / "linux_kernel.json").read_text(encoding="utf-8"),
+            (_PACK_DIR / "linux_kernel.json").read_text(encoding="utf-8"),  # raw-open: shipped vocab pack under _PACK_DIR (RAPTOR-owned)
         )
     except Exception:
         return frozenset(), frozenset()
@@ -267,7 +289,9 @@ def _pack_collection_verbs(
         vals = raw.get(key) or []
         return frozenset(n for n in vals if isinstance(n, str) and n)
 
-    return _names("collection_inserts"), _names("collection_removes")
+    result = _names("collection_inserts"), _names("collection_removes")
+    _pack_collection_cache["linux_kernel"] = result
+    return result
 
 
 def learned_collection_pairs(
@@ -401,17 +425,41 @@ def _call_re(names: tuple[str, ...] | frozenset[str]) -> re.Pattern:
 # "set" — exactly the arithmetic/bookkeeping class the weak-verb tier
 # exists to exclude. Segment atoms are ``[A-Za-z0-9]+`` (no ``_``), so
 # the quantifiers cannot backtrack across segment boundaries.
+# Stem heads and segment chains are bounded: unbounded, one long
+# stem-repeating identifier costs every head/verb split — quadratic
+# on a hostile line. Real identifiers sit far inside 256 chars and
+# 32 snake_case segments.
 _STEM_INSERT_RE = re.compile(
     r"\b("
-    r"\w+_(?:insert|enqueue)(?:_\w+)?"
-    r"|(?:[A-Za-z0-9]+_)*"
+    r"\w{1,256}?_(?:insert|enqueue)(?:_\w+)?"
+    r"|(?:[A-Za-z0-9]+_){0,32}"
     r"(?:list|queue|stack|ring|table|hash|set|vec|array|buf|heap|sk)"
-    r"(?:_[A-Za-z0-9]+)*?_(?:add|push|append)(?:_\w+)?"
+    r"(?:_[A-Za-z0-9]+){0,32}?_(?:add|push|append)(?:_\w+)?"
     r")\s*\(",
 )
 
 _STEM_VOCAB_SOURCE = "naming"
 _STEM_PROVENANCE = "naming-stem"
+
+
+def _segment_view_lines(
+    segment_lines: list[str], file_path: str,
+) -> list[str]:
+    """Sanitized view of *segment_lines* (comments and string literals
+    blanked, line count preserved). Lexical witnesses are earned on
+    the view; receipts report the ORIGINAL lines — the sibling
+    checkers' doctrine (see release_order): raw-text matching is
+    hostile-repo steerable in both directions (a block-comment clamp
+    mints a refutation, a block-comment insert mints a site)."""
+    from .source_view import sanitized_view
+    # \n-model split: the view rows must stay 1:1 with segment_lines
+    # (an exotic terminator surviving sanitisation must not add rows).
+    view = split_lines(sanitized_view(
+        "\n".join(segment_lines), file_path,
+    ))
+    while len(view) < len(segment_lines):
+        view.append("")
+    return view
 
 
 def _loop_lines(lines: list[str], start: int) -> set[int]:
@@ -447,13 +495,16 @@ def _enumerate_sites(
     span_start: int,
     insert_vocab: dict[str, tuple[str, str]],
     alloc_vocab: dict[str, tuple[str, str]],
+    *,
+    file_path: str = "",
 ) -> list[_Site]:
     sites: list[_Site] = []
     insert_re = _call_re(tuple(insert_vocab)) if insert_vocab else None
     alloc_re = _call_re(tuple(alloc_vocab)) if alloc_vocab else None
-    loop_set = _loop_lines(segment_lines, span_start)
+    view_lines = _segment_view_lines(segment_lines, file_path)
+    loop_set = _loop_lines(view_lines, span_start)
     for idx, raw in enumerate(segment_lines):
-        code = raw.split("//", 1)[0]
+        code = view_lines[idx]
         line_no = span_start + idx
         if insert_re is not None:
             m = insert_re.search(code)
@@ -548,8 +599,17 @@ def _classify_bound_guard(
     return undecided
 
 
+# Both argument groups are delimited by non-whitespace on both ends:
+# the naive trim spelling ``\s*([^,()]+?)\s*,`` overlaps three
+# unbounded repeats on whitespace, and a ``min(`` followed by a long
+# whitespace run with no closing token makes the engine try every
+# split of the run between them — cubic in the line length. Match
+# set unchanged for any argument with a non-whitespace char; the
+# whitespace-only-argument corner (``min( , x)``, not a real clamp)
+# no longer matches.
 _CLAMP_RE = re.compile(
-    r"\b(\w+)\s*=\s*(?:min|MIN)\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)",
+    r"\b(\w+)\s*=\s*(?:min|MIN)\s*\(\s*([^,()\s](?:[^,()]*[^,()\s])?)"
+    r"\s*,\s*([^()\s](?:[^()]*[^()\s])?)\s*\)",
 )
 
 
@@ -559,6 +619,8 @@ def _clamp_witness(
     site_line: int,
     constants: dict[str, int] | None,
     limit_names: frozenset[str],
+    *,
+    file_path: str = "",
 ) -> dict[str, Any] | None:
     """``min(count, MAX)``-style clamp witness for alloc-in-loop
     sites: a loop header before the site iterates over a variable that
@@ -574,12 +636,14 @@ def _clamp_witness(
             or _LIMITISH_RE.search(tail),
         )
 
+    view_lines = _segment_view_lines(segment_lines, file_path)
     clamp_map: dict[str, dict[str, Any]] = {}
     for idx, raw in enumerate(segment_lines):
         line_no = span_start + idx
         if line_no >= site_line:
             break
-        for m in _CLAMP_RE.finditer(raw.split("//", 1)[0]):
+        # Match on the sanitized view; the receipt keeps the original.
+        for m in _CLAMP_RE.finditer(view_lines[idx]):
             var, a, b = m.group(1), m.group(2), m.group(3)
             for bound in (a, b):
                 if _is_limit(bound):
@@ -592,13 +656,13 @@ def _clamp_witness(
         return None
     # Nearest loop header before the site that mentions a clamped var.
     for idx in range(site_line - span_start - 1, -1, -1):
-        code = segment_lines[idx].split("//", 1)[0]
+        code = view_lines[idx]
         if not _LOOP_RE.search(code):
             continue
         for var, info in clamp_map.items():
             if re.search(rf"\b{re.escape(var)}\b", code):
                 return {
-                    "condition": code.strip()[:200],
+                    "condition": segment_lines[idx].strip()[:200],
                     "count": var,
                     "bound": info["bound"],
                     "bound_source": "clamp-min",
@@ -665,7 +729,7 @@ def _c_function_spans(source: str) -> list[tuple[str, int, int]]:
     enclosing function; misses degrade to a smaller searched set,
     which the receipt reports honestly."""
     spans: list[tuple[str, int, int]] = []
-    lines = source.splitlines()
+    lines = split_lines(source)
     header_re = re.compile(r"^[A-Za-z_][\w\s\*]*?\b(\w+)\s*\([^;{}]*\)\s*\{?\s*$")
     i = 0
     while i < len(lines):
@@ -700,35 +764,91 @@ def _c_function_spans(source: str) -> list[tuple[str, int, int]]:
     return spans
 
 
+#: Directory names pruned from the census walk: VCS internals are
+#: never target source, and a kernel-sized ``.git/objects`` was the
+#: dominant cost of the old whole-tree rglob (every path materialised
+#: per hypothesis dispatch before the suffix filter ran).
+_CENSUS_PRUNE_DIRS = frozenset({".git", ".hg", ".svn"})
+
+
+def _source_census(target_path: Path) -> list[tuple[str, str]]:
+    """Capped, contained source intake over the tree — a pure
+    function of the target, so the orchestrator memoises it per run
+    and threads the result through ``source_texts=`` instead of
+    paying the walk once per hypothesis dispatch.
+
+    A pruned ``os.walk`` replaces ``sorted(target_path.rglob("*"))``:
+    only source-suffix files are collected and VCS internals are
+    skipped. Candidates are sorted by full path, so the
+    ``_MAX_SCAN_FILES`` selection matches the old rglob order
+    exactly (``sorted(Path)`` compares the path string on POSIX).
+    """
+    from core.source import read_contained
+
+    candidates: list[str] = []
+    try:
+        for root, dirnames, filenames in os.walk(target_path):
+            dirnames[:] = [
+                d for d in dirnames if d not in _CENSUS_PRUNE_DIRS
+            ]
+            for name in filenames:
+                if os.path.splitext(name)[1] in _SOURCE_SUFFIXES:
+                    candidates.append(os.path.join(root, name))
+    except OSError:
+        return []
+    candidates.sort()
+    census: list[tuple[str, str]] = []
+    for full in candidates:
+        if len(census) >= _MAX_SCAN_FILES:
+            break
+        rel = os.path.relpath(full, target_path)
+        try:
+            if os.path.getsize(full) > _MAX_FILE_BYTES:
+                continue
+        except OSError:
+            continue
+        content = read_contained(
+            target_path, rel, max_chars=_MAX_FILE_BYTES,
+        )
+        if content is None:
+            continue
+        census.append((rel, content))
+    return census
+
+
 def _gather_source_texts(
     target_path: Path, primary_file: str,
+    census: list[tuple[str, str]] | None = None,
 ) -> dict[str, str]:
+    """Contained, capped source intake for the hypothesis channels.
+
+    ``primary_file`` arrives from LLM-writable artifacts: every read
+    routes through :func:`core.source.read_contained` (the
+    release_order idiom), so absolute values, ``..`` traversal, and
+    symlink escapes read as nothing instead of pulling host files
+    into the analysed corpus. The primary read is capped at
+    ``_MAX_FILE_BYTES`` (prefix kept — dropping the hypothesis file
+    outright would only blind the channel); census candidates over
+    the cap are skipped, as before. *census* threads a memoised
+    :func:`_source_census` result (per-run, from the orchestrator);
+    None walks the tree fresh.
+    """
+    from core.source import read_contained
+
     texts: dict[str, str] = {}
-    primary = target_path / primary_file
-    if primary.is_file():
-        try:
-            texts[primary_file] = primary.read_text(errors="replace")
-        except OSError:
-            pass
-    try:
-        candidates = [
-            p for p in sorted(target_path.rglob("*"))
-            if p.is_file() and p.suffix in _SOURCE_SUFFIXES
-        ]
-    except OSError:
-        return texts
-    for p in candidates:
+    primary_text = read_contained(
+        target_path, primary_file, max_chars=_MAX_FILE_BYTES,
+    )
+    if primary_text is not None:
+        texts[primary_file] = primary_text
+    if census is None:
+        census = _source_census(target_path)
+    for rel, content in census:
         if len(texts) >= _MAX_SCAN_FILES:
             break
-        rel = str(p.relative_to(target_path))
         if rel in texts:
             continue
-        try:
-            if p.stat().st_size > _MAX_FILE_BYTES:
-                continue
-            texts[rel] = p.read_text(errors="replace")
-        except OSError:
-            continue
+        texts[rel] = content
     return texts
 
 
@@ -740,21 +860,34 @@ def _caller_bound_search(
     limit_names: frozenset[str],
     language: str,
     deadline: float | None = None,
-) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]], bool]:
     """Depth-bounded reverse walk: a dominating count guard in a
     caller before the call refutes (``bound-in-caller``). Returns
-    ``(witness_receipt | None, per_caller_receipts)`` — the receipt
-    list records how far the search went (the honesty requirement).
-    *deadline* (``time.monotonic()`` epoch, ``None`` = unbounded)
-    stops the walk early; the receipts stay honest about the smaller
-    searched set."""
+    ``(witness_receipt | None, per_caller_receipts, truncated)`` —
+    the receipt list records how far the search went (the honesty
+    requirement). *deadline* (``time.monotonic()`` epoch, ``None`` =
+    unbounded) stops the walk early; ``truncated=True`` marks that
+    early stop so the caller can refuse to CONFIRM on a walk that
+    never finished (a no-witness result from a truncated search says
+    nothing about the unsearched callers)."""
     per_caller: list[dict[str, Any]] = []
     spans_cache: dict[str, list[tuple[str, int, int]]] = {}
+    views_cache: dict[str, list[str]] = {}
 
     def _spans(fp: str) -> list[tuple[str, int, int]]:
         if fp not in spans_cache:
             spans_cache[fp] = _c_function_spans(source_texts.get(fp, ""))
         return spans_cache[fp]
+
+    def _view(fp: str) -> list[str]:
+        # Call sites are matched on the sanitized view — a
+        # block-comment mention of the callee must not mint a caller
+        # whose dominating guards then refute.
+        if fp not in views_cache:
+            views_cache[fp] = _segment_view_lines(
+                split_lines(source_texts.get(fp, "")), fp,
+            )
+        return views_cache[fp]
 
     frontier = {function_name.rsplit(".", 1)[-1]}
     visited: set[str] = set(frontier)
@@ -765,13 +898,11 @@ def _caller_bound_search(
             for fp, source in source_texts.items():
                 if deadline is not None and \
                         time.monotonic() > deadline:
-                    return None, per_caller
+                    return None, per_caller, True
                 if callee not in source:
                     continue
-                for m_line, raw in enumerate(
-                    source.splitlines(), start=1,
-                ):
-                    if not call_re.search(raw.split("//", 1)[0]):
+                for m_line, raw in enumerate(_view(fp), start=1):
+                    if not call_re.search(raw):
                         continue
                     enclosing = next(
                         (
@@ -806,7 +937,7 @@ def _caller_bound_search(
                             if witness and not witness.get("undecided"):
                                 receipt["bound"] = witness
                                 per_caller.append(receipt)
-                                return witness, per_caller
+                                return witness, per_caller, False
                     per_caller.append(receipt)
                     if (
                         caller_name not in visited
@@ -817,7 +948,7 @@ def _caller_bound_search(
         frontier = next_frontier
         if not frontier:
             break
-    return None, per_caller
+    return None, per_caller, False
 
 
 # ── verdict assembly ────────────────────────────────────────────────
@@ -922,7 +1053,7 @@ def _adjudicate_site(
             and segment_lines is not None:
         clamp = _clamp_witness(
             segment_lines, span_start, site.line, constants,
-            limit_names,
+            limit_names, file_path=file_path,
         )
         if clamp is not None:
             bound_search["local"] = clamp
@@ -945,11 +1076,12 @@ def _adjudicate_site(
 
     # 2. Caller-side bound (bounded reverse walk, depth ≤ 3).
     texts = source_texts or {file_path: source}
-    caller_witness, per_caller = _caller_bound_search(
+    caller_witness, per_caller, walk_truncated = _caller_bound_search(
         function_name, texts, file_path, constants, limit_names,
         language, deadline=deadline,
     )
     bound_search["callers"] = per_caller
+    bound_search["truncated"] = walk_truncated
     if caller_witness is not None:
         return BoundEvidence(
             outcome="refuted",
@@ -959,6 +1091,26 @@ def _adjudicate_site(
                 f"({caller_witness['bound_source']}); searched "
                 f"{len(per_caller)} caller site(s), depth ≤ "
                 f"{_CALLER_MAX_DEPTH}"
+            ),
+            resource=resource,
+            site=site_receipt,
+            bound_search=bound_search,
+        )
+
+    if walk_truncated:
+        # The deadline expired INSIDE the caller-bound walk: the
+        # no-witness result covers only the searched prefix, and the
+        # module contract forbids confirming (or refuting) on work
+        # not done — a hostile repo that merely slows the walk must
+        # not convert bounded sites into confirmed findings. Cap at
+        # inconclusive; the receipts stay honest about the prefix.
+        return BoundEvidence(
+            outcome="inconclusive",
+            reason=(
+                f"{REASON_BUDGET_EXHAUSTED}: deadline expired inside "
+                f"the caller-bound walk after "
+                f"{len(per_caller)} caller site(s) — a truncated "
+                f"search cannot confirm"
             ),
             resource=resource,
             site=site_receipt,
@@ -1082,9 +1234,23 @@ def run_resource_bounds_check(
     budget_s: float | None = None,
 ) -> BoundEvidence:
     """Adjudicate one resource-bounds hypothesis. See module docstring
-    for verdict semantics. ``budget_s`` is accepted for signature
-    stability (the phase-2 Joern cross-file leg's clamp)."""
-    del budget_s  # phase-2 Joern leg parameter
+    for verdict semantics. ``budget_s`` bounds the site walk: on
+    exhaustion the check degrades to the best verdict already earned,
+    or inconclusive when no site was adjudicated — never to
+    refuted/confirmed on work not done."""
+    deadline = (
+        None if budget_s is None
+        else time.monotonic() + max(0.0, float(budget_s))
+    )
+    # Binary checklist rows carry no repo source path; gate before the
+    # suffix-based language lookup can leak a meaningless ".0" reason.
+    from .fail_open_lang import is_binary_row
+    if is_binary_row(file_path):
+        return _inconclusive(
+            REASON_LANGUAGE_UNSUPPORTED,
+            "binary checklist row — resource-bounds reads repo source, "
+            "not decompiled output",
+        )
     try:
         from .fail_open_lang import language_for_path
         language = language_for_path(file_path)
@@ -1110,7 +1276,7 @@ def run_resource_bounds_check(
         span = c_function_span(source, function_name, language=language)
     except ImportError:
         span = None
-    lines = source.splitlines()
+    lines = split_lines(source)
     if span:
         segment_lines = lines[span[0] - 1:span[1]]
         span_start = span[0]
@@ -1123,6 +1289,7 @@ def run_resource_bounds_check(
     alloc_vocab = _alloc_vocabulary(domain_model)
     sites = _enumerate_sites(
         segment_lines, span_start, insert_vocab, alloc_vocab,
+        file_path=file_path,
     )
 
     if not sites:
@@ -1154,6 +1321,14 @@ def run_resource_bounds_check(
 
     best: BoundEvidence | None = None
     for site in sites:
+        if deadline is not None and time.monotonic() >= deadline:
+            if best is not None:
+                return best
+            return _inconclusive(
+                REASON_BUDGET_EXHAUSTED,
+                f"budget of {budget_s}s exhausted before adjudicating "
+                f"{function_name}",
+            )
         res = _adjudicate_site(
             site, source, file_path, function_name, language,
             segment_lines=segment_lines,
@@ -1164,6 +1339,11 @@ def run_resource_bounds_check(
             collection_pairs=collection_pairs,
             context=context,
             inventory=inventory,
+            # Thread the run's own deadline INTO the site walk (the
+            # prepass path already does): the between-sites check
+            # above bounds only site boundaries, so one slow site
+            # overran the documented budget unbounded.
+            deadline=deadline,
         )
         if res.outcome == "confirmed":
             return res
@@ -1233,7 +1413,7 @@ def run_resource_bounds_prepass(
             continue
         if not _has_insert(source):
             continue
-        lines = lines_cache.setdefault(fp, source.splitlines())
+        lines = lines_cache.setdefault(fp, split_lines(source))
         for name, start, end in _c_function_spans(source):
             segment = "\n".join(lines[start - 1:end])
             if _has_insert(segment):
@@ -1249,10 +1429,11 @@ def run_resource_bounds_prepass(
             telemetry["budget_exceeded"] = True
             break
         source = source_texts[fp]
-        lines = lines_cache.setdefault(fp, source.splitlines())
+        lines = lines_cache.setdefault(fp, split_lines(source))
         segment_lines = lines[start - 1:end]
         sites = _enumerate_sites(
             segment_lines, start, insert_vocab, alloc_vocab,
+            file_path=fp,
         )
         # Language from the file's extension, not a hardcoded "c":
         # _SOURCE_SUFFIXES admits C++ files, and the C guard walk on
@@ -1340,11 +1521,14 @@ def run_resource_bounds_prepass(
     telemetry["wall_time_s"] = round(time.monotonic() - t0, 3)
     if out_dir is not None and (findings or leads):
         try:
-            path = Path(out_dir) / "resource-bounds.json"
-            path.write_text(dumps_artifact(
+            # Atomic write (tempfile + rename via save_json): a torn
+            # write would leave a resource-bounds.json that fails to
+            # parse at review time.
+            save_json(
+                Path(out_dir) / "resource-bounds.json",
                 {"findings": findings, "leads": leads,
-                 "telemetry": telemetry}, indent=1,
-            ))
+                 "telemetry": telemetry},
+            )
         except Exception:
             logger.debug("resource-bounds.json write failed",
                          exc_info=True)

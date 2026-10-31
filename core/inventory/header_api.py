@@ -35,23 +35,48 @@ _HEADER_EXTENSIONS = frozenset({".h", ".hpp", ".hxx", ".hh", ".h++"})
 # The qualifier/type group accepts keywords, macros (XMLPUBFUN),
 # __declspec, __attribute__, and any identifier (covers library
 # typedefs like xmlIDPtr, z_stream, etc.).
+#
+# The gap after the statement boundary and the pointer/space span
+# before the name are HORIZONTAL-only: with `\s*` there, the
+# MULTILINE `^` branch re-scans a run of blank lines from every line
+# start inside it — worse than quadratic on a planted blank-line
+# header (finditer over whole header content on the inventory build
+# path). A declaration on a later line is still matched by the `^`
+# branch anchoring its own line, and multi-line declarations still
+# match because the qualifier/type group's interior `\s+` separators
+# cross line breaks.
+# Bounded loops and windows on every unbounded-reach span (same
+# discipline as the C-declaration matchers): the qualifier/type loop,
+# attribute chains and their interiors, and the parameter window let
+# every anchor re-scan the remaining text on planted
+# declaration-shaped runs — quadratic. Bounds sit far above real
+# headers (trade-off both directions: larger keeps absurd
+# declarations matching but raises per-anchor reach, smaller drops
+# them); the trailing attribute chain also carries the final
+# whitespace inside its loop iteration so no two spans are adjacent,
+# and the pointer span is stars-only (\**) — a star-space mix is
+# already a qualifier-loop token, so the old horizontal-whitespace
+# span only duplicated the loop's separator and split against it.
 _DECL_RE = re.compile(
     r"(?a)"
-    r"(?:^|;|\})\s*"
-    r"(?:__attribute__\s*\(\([^()]*(?:\([^()]*\)[^()]*)*\)\)\s+)*"
-    r"(?:__declspec\s*\([^)]*\)\s+)*"
-    r"(?:(?:\w+|\*)\s+)*?"
-    r"[*\s]*"
+    r"(?:^|;|\})[^\S\n]*"
+    r"(?:__attribute__\s*\(\([^()]{0,1024}(?:\([^()]{0,1024}\)[^()]{0,1024}){0,8}\)\)\s+){0,8}"
+    r"(?:__declspec\s*\([^)]{0,1024}\)\s+){0,4}"
+    r"(?:(?:\w+|\*)\s+){0,24}?"
+    r"\**"
     r"(\w+)"                       # capture: function name
-    r"\s*\([^)]*\)"                # parameter list
-    r"\s*(?:__attribute__\s*\(\([^()]*(?:\([^()]*\)[^()]*)*\)\)\s*)*"
-    r"\s*;",                       # ends with `;`
+    r"\s*\([^)]{0,4096}\)"         # parameter list
+    r"\s*(?:__attribute__\s*\(\([^()]{0,1024}(?:\([^()]{0,1024}\)[^()]{0,1024}){0,8}\)\)\s*){0,8}"
+    r";",                          # ends with `;`
     re.MULTILINE,
 )
 
 # zlib-style OF((...)) macro: `ZEXTERN int ZEXPORT inflate OF((args));`
+# \b pins the name to a word start: unanchored, every position in a
+# long identifier run starts a fresh scan — quadratic on hostile
+# headers; a mid-word start is never a real declaration name.
 _OF_DECL_RE = re.compile(
-    r"(?a)(\w+)\s+OF\s*\(\(",
+    r"(?a)\b(\w+)\s+OF\s*\(\(",
     re.MULTILINE,
 )
 
@@ -60,8 +85,15 @@ _OF_DECL_RE = re.compile(
 # Examples:
 #   PNG_EXPORT(1, png_uint_32, png_access_version_number, (void));
 #   MY_API_EXPORT(int, my_function, (int x));
+# Macro-name runs and the argument gap are BOUNDED: unbounded, a
+# hostile header planting EXPORT inside one long macro-name run (or
+# `EXPORT(` heads inside the gap) re-scans the tail per occurrence —
+# quadratic. Real export macro names/prefixes sit far inside 256
+# chars and the pre-name arguments inside 1000; longer spans stop
+# matching (the declaration is skipped) instead of scanning without
+# bound.
 _EXPORT_MACRO_RE = re.compile(
-    r"(?a)\b[A-Z_]*EXPORT[A-Z_]*\s*\(.*?,\s*(\w+)\s*,\s*\(",
+    r"(?a)\b[A-Z_]{0,256}EXPORT[A-Z_]{0,256}\s*\(.{0,1000}?,\s*(\w+)\s*,\s*\(",
     re.MULTILINE,
 )
 

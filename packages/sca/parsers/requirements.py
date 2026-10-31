@@ -35,6 +35,8 @@ from pathlib import Path
 from typing import Any
 
 from ..models import Confidence, Dependency, PinStyle
+from ..naming import pep503_name
+from ._base import build_purl, manifest_confidence
 from . import _safe_read, register
 
 logger = logging.getLogger(__name__)
@@ -46,9 +48,9 @@ try:
     _AVAILABLE = True
 except ImportError:                       # pragma: no cover — env-dependent
     InvalidRequirement = Exception        # type: ignore[assignment,misc]
-    Requirement = None                    # type: ignore[assignment]
-    SpecifierSet = None                   # type: ignore[assignment]
-    Version = None                        # type: ignore[assignment]
+    Requirement = None                    # type: ignore[assignment,misc]
+    SpecifierSet = None                   # type: ignore[assignment,misc]
+    Version = None                        # type: ignore[assignment,misc]
     _AVAILABLE = False
     logger.warning(
         "sca.parsers.requirements: 'packaging' not installed — requirements*.txt "
@@ -60,6 +62,8 @@ ECOSYSTEM = "PyPI"
 # Bounded depth for -r / -c chains. Real projects nest 1-3 levels; >5 is
 # almost certainly accidental or hostile.
 _MAX_INCLUDE_DEPTH = 8
+
+_MAX_SPEC_LEN = 4096
 
 # pip option flags we silently skip (no dep semantics).
 _PIP_OPTION_PREFIXES = (
@@ -187,7 +191,13 @@ def _parse_file(
         return []
     visited.add(resolved)
 
-    text = _safe_read.read_bounded(resolved, follow_symlinks=False)
+    # Read the DISCOVERED path, not its resolve() target — resolving
+    # first would hand ``read_bounded`` a plain regular file and the
+    # ``follow_symlinks=False`` symlink refusal could never fire (a
+    # ``requirements.txt -> /outside/tree`` link would be read and its
+    # rows fed to the report). ``resolved`` stays the visited-set key,
+    # ``declared_in`` value, and include-parent base.
+    text = _safe_read.read_bounded(path, follow_symlinks=False)
     if text is None:
         # ``read_bounded`` already logged the underlying reason.
         return []
@@ -413,9 +423,15 @@ def _parse_requirement_line(
             d.commented_out = commented
         return d
 
+    if len(line) > _MAX_SPEC_LEN:
+        logger.debug(
+            "sca.parsers.requirements: spec too long (%d bytes) in %s, skipping",
+            len(line), declared_in,
+        )
+        return None
     try:
         req = Requirement(line)
-    except InvalidRequirement as e:
+    except (InvalidRequirement, ValueError) as e:
         logger.debug(
             "sca.parsers.requirements: invalid requirement %r in %s: %s",
             line, declared_in, e,
@@ -442,14 +458,14 @@ def _parse_requirement_line(
 
     return Dependency(
         ecosystem=ECOSYSTEM,
-        name=_normalise_name(name),
+        name=pep503_name(name),
         version=version,
         declared_in=declared_in,
         scope="main",
         is_lockfile=False,
         pin_style=pin_style,
         direct=True,
-        purl=_build_purl(name, version),
+        purl=build_purl("pypi", pep503_name(name), version),
         parser_confidence=_confidence(pin_style, version, editable),
         version_floor=version_floor,
         version_ceiling=version_ceiling,
@@ -493,14 +509,14 @@ def _from_url_spec(
 
     return Dependency(
         ecosystem=ECOSYSTEM,
-        name=_normalise_name(name),
+        name=pep503_name(name),
         version=version,
         declared_in=declared_in,
         scope="main",
         is_lockfile=False,
         pin_style=pin_style,
         direct=True,
-        purl=_build_purl(name, version),
+        purl=build_purl("pypi", pep503_name(name), version),
         parser_confidence=Confidence(
             "medium",
             reason="requirements.txt URL/path requirement; name from #egg=",
@@ -596,36 +612,26 @@ def _spec_bounds(spec) -> tuple[str | None, str | None]:
     return floor, ceiling
 
 
-def _normalise_name(name: str) -> str:
-    """PEP 503 normalisation: lower-case + dashes/underscores/dots collapsed."""
-    return re.sub(r"[-_.]+", "-", name).lower()
-
-
 def _confidence(
     pin_style: PinStyle, version: str | None, editable: bool
 ) -> Confidence:
     if editable:
+        # Editable installs precede the shared ladder: the pin style
+        # is meaningless when the source is a live working tree.
         return Confidence(
             "medium",
             reason="requirements.txt editable install; version unresolved",
         )
-    if pin_style is PinStyle.UNKNOWN:
-        return Confidence("low", reason="requirements.txt spec unrecognised")
-    if pin_style in (PinStyle.GIT, PinStyle.PATH):
-        return Confidence(
-            "medium",
-            reason="requirements.txt git/path source; version best-effort",
-        )
-    if version is None:
-        return Confidence("medium", reason="requirements.txt unpinned entry")
-    return Confidence("high", reason="requirements.txt structured spec")
+    return manifest_confidence(
+        pin_style, version,
+        unrecognised_reason="requirements.txt spec unrecognised",
+        git_path_reason=(
+            "requirements.txt git/path source; version best-effort"
+        ),
+        unpinned_reason="requirements.txt unpinned entry",
+        pinned_reason="requirements.txt structured spec",
+    )
 
-
-def _build_purl(name: str, version: str | None) -> str:
-    base = f"pkg:pypi/{_normalise_name(name)}"
-    if version:
-        return f"{base}@{version}"
-    return base
 
 
 def _is_requirements_file(path: Path) -> bool:

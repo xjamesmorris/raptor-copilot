@@ -182,3 +182,37 @@ def test_round_trip_through_witness_store(tmp_path):
     assert loaded.bytes_hash == witness.bytes_hash
     assert loaded.source == WitnessSource.FUZZ
     assert loaded_bytes == data
+
+
+# ----------------------------------------------------------------------
+# Size cap — crashes dir is target-writable
+# ----------------------------------------------------------------------
+
+
+def test_adapter_refuses_oversized_crash_input(tmp_path):
+    """The crashes dir is writable by the (untrusted) fuzz target: a
+    planted multi-GB regular file named like a crash must not be
+    loaded into host memory / the durable witness store. The cap read
+    is bounded, so only cap+1 bytes are ever pulled in."""
+    import pytest
+
+    from packages.fuzzing.witness_adapter import _MAX_CRASH_INPUT_BYTES
+
+    crash = _make_crash(tmp_path, data=b"x")
+    crash.input_file.write_bytes(b"\0" * (_MAX_CRASH_INPUT_BYTES + 1))
+    with pytest.raises(ValueError, match="witness cap"):
+        witness_from_crash(crash)
+
+
+def test_adapter_accepts_crash_input_at_cap(tmp_path):
+    """Both directions: a crash input exactly at the cap (AFL's own
+    max input is far below it) must still round-trip untruncated —
+    truncating would store a witness whose hash doesn't match the
+    bytes that actually crashed the target."""
+    from packages.fuzzing.witness_adapter import _MAX_CRASH_INPUT_BYTES
+
+    data = b"\xab" * _MAX_CRASH_INPUT_BYTES
+    crash = _make_crash(tmp_path, data=data)
+    witness, bytes_ = witness_from_crash(crash)
+    assert bytes_ == data
+    assert witness.bytes_len == _MAX_CRASH_INPUT_BYTES

@@ -17,6 +17,9 @@ Failing modes:
 * exclusion drift — anything with ``exclude_from_listing: true``
   must also appear in commands.md's hardcoded "Exclude internal/
   duplicate commands" list; and vice-versa. Single source of truth.
+* discovery collision — command names must be disjoint from canonical
+  project-skill names because both supported frontends load the two
+  compatibility surfaces into one prompt/skill namespace.
 
 Run::
 
@@ -35,6 +38,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 COMMANDS_DIR = REPO / ".claude" / "commands"
 COMMANDS_INDEX = COMMANDS_DIR / "commands.md"
+SKILLS_DIR = REPO / ".claude" / "skills"
 
 # Dispatch tokens we accept. ``skill`` means "no single libexec — see
 # the body of the .md for multi-step workflow." Everything else must
@@ -45,6 +49,21 @@ _ACCEPTED_DISPATCH_PREFIXES = (
     "python3 raptor.py",
     "bash ",
 )
+
+# The commands.md sentence that owns the documented exclusion list.
+_EXCL_SENTENCE_RE = re.compile(
+    r"internal/duplicate commands.*?(?=\.\s|\n\n)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# A backticked command name inside that sentence: `raptor-scan` or
+# `/commands` (leading slash stripped to match .md stems).
+_BACKTICKED_NAME_RE = re.compile(r"`/?([\w][\w-]*)`")
+
+
+def _excluded_names(sentence: str) -> set[str]:
+    """Names documented as excluded: backticked tokens only."""
+    return set(_BACKTICKED_NAME_RE.findall(sentence))
 
 
 def _parse_frontmatter(text: str) -> dict[str, str]:
@@ -67,6 +86,19 @@ def _parse_frontmatter(text: str) -> dict[str, str]:
         key, _, val = line.partition(":")
         out[key.strip()] = val.strip()
     return out
+
+
+def _canonical_skill_name(path: Path) -> str:
+    """Return the frontend-visible skill name for one ``SKILL.md``."""
+    metadata = _parse_frontmatter(path.read_text(encoding="utf-8"))
+    raw_name = metadata.get("name", path.parent.name).strip()
+    if (
+        len(raw_name) >= 2
+        and raw_name[0] == raw_name[-1]
+        and raw_name[0] in {"'", '"'}
+    ):
+        raw_name = raw_name[1:-1]
+    return re.sub(r"\s+", "-", raw_name)
 
 
 def _check_dispatch(name: str, dispatch: str) -> list[str]:
@@ -110,6 +142,7 @@ def main() -> int:
     if not md_files:
         print(f"FATAL: no .md files under {COMMANDS_DIR}", file=sys.stderr)
         return 2
+    md_names = {path.stem for path in md_files}
 
     errs: list[str] = []
     excluded_via_frontmatter: set[str] = set()
@@ -130,15 +163,14 @@ def main() -> int:
             excluded_via_frontmatter.add(name)
 
     # Parity: commands.md's hardcoded exclusion list must match the
-    # frontmatter-flagged set. Pull the names out of the documented
-    # text by looking for the pattern "raptor-X" / "/X" in the
-    # exclusion sentence.
+    # frontmatter-flagged set. Only BACKTICKED names in the exclusion
+    # sentence count (`` `raptor-scan` `` / `` `/commands` ``): a bare-
+    # word scrape counted every English word that happened to collide
+    # with a command stem (the word "commands" in the sentence itself
+    # matched commands.md), so renaming a command to a common word or
+    # rewording the sentence flipped the lint in confusing ways.
     commands_md = COMMANDS_INDEX.read_text(encoding="utf-8")
-    excl_pattern = re.compile(
-        r"internal/duplicate commands.*?(?=\.\s|\n\n)",
-        re.IGNORECASE | re.DOTALL,
-    )
-    m = excl_pattern.search(commands_md)
+    m = _EXCL_SENTENCE_RE.search(commands_md)
     if not m:
         errs.append(
             "commands.md: could not locate the 'Exclude internal/duplicate "
@@ -146,9 +178,16 @@ def main() -> int:
             "lint or restore the sentence."
         )
     else:
-        excluded_in_index = set(re.findall(r"raptor-[\w-]+|\b\w[\w-]+\b", m.group(0)))
-        # Drop noise tokens; only keep names that correspond to .md files.
-        md_names = {p.stem for p in md_files}
+        excluded_in_index = _excluded_names(m.group(0))
+        if not excluded_in_index:
+            errs.append(
+                "commands.md: the exclusion sentence names no backticked "
+                "commands — list each excluded command as `name` (or "
+                "`/name`); bare prose words are not counted."
+            )
+        # Only names that correspond to .md files can be parity-checked;
+        # a mistyped name surfaces as the frontmatter side's
+        # "not listed in commands.md's exclude sentence" error.
         excluded_in_index = excluded_in_index & md_names
 
         missing_in_md = excluded_in_index - excluded_via_frontmatter
@@ -157,6 +196,32 @@ def main() -> int:
                 f"``exclude_from_listing: true`` frontmatter" for n in sorted(missing_in_md))
         errs.extend(f"/{n}: has ``exclude_from_listing: true`` frontmatter but "
                 f"not listed in commands.md's exclude sentence" for n in sorted(missing_in_index))
+
+    # Claude and Copilot both load `.claude/commands` alongside project
+    # skills. Copilot exposes both through `skill list --json`, and a
+    # same-name skill shadows the command rather than preserving two rows.
+    # Keep the namespaces disjoint instead of relying on host precedence.
+    skill_sources: dict[str, list[Path]] = {}
+    if not SKILLS_DIR.is_dir():
+        errs.append(f"{SKILLS_DIR.relative_to(REPO)}: skill directory missing")
+    else:
+        for skill in sorted(SKILLS_DIR.rglob("SKILL.md")):
+            name = _canonical_skill_name(skill)
+            skill_sources.setdefault(name, []).append(skill)
+        for name, paths in sorted(skill_sources.items()):
+            if len(paths) > 1:
+                members = ", ".join(
+                    path.relative_to(REPO).as_posix() for path in paths
+                )
+                errs.append(f"duplicate skill name {name!r}: {members}")
+            if name in md_names:
+                members = ", ".join(
+                    path.relative_to(REPO).as_posix() for path in paths
+                )
+                errs.append(
+                    f"/{name}: command name collides with project skill(s): "
+                    f"{members}"
+                )
 
     if errs:
         print("Command-metadata lint failed:", file=sys.stderr)

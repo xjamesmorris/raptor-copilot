@@ -202,8 +202,14 @@ def run_sweep_and_report(
 
     def _partial_summary(note: str) -> None:
         out(f"sweep interrupted — {note}")
-        inflight = _in_flight()
-        if inflight:
+        # Bounded acquire: this runs from the SIGTERM handler on the
+        # main thread, which may itself hold the registry lock at
+        # signal time — see _in_flight.
+        inflight = _in_flight(timeout=1.0)
+        if inflight is None:
+            out("in-flight scans: unavailable (registry lock held "
+                "at signal time)")
+        elif inflight:
             out(f"in-flight scans: {', '.join(inflight)}")
         done = [r for r in results if r is not None]
         out(f"completed scans: {len(done)}/{len(samples)}")
@@ -218,8 +224,21 @@ def run_sweep_and_report(
         sys.stderr.flush()
 
     prior_term = signal.getsignal(signal.SIGTERM)
+    handler_pid = os.getpid()
 
     def _on_term(signum: int, frame: object) -> None:
+        if os.getpid() != handler_pid:
+            # Fork-context children (inventory extractor workers, mp
+            # helpers) inherit this handler. The post-mortem below
+            # must never run in a child: its lock-taking
+            # (``_in_flight``) can block forever on a lock some
+            # sibling thread held at fork time — a terminate()d
+            # worker then never dies — and its output would
+            # interleave a bogus "sweep interrupted" summary into the
+            # real log. Die like an unhandled SIGTERM instead.
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            signal.raise_signal(signal.SIGTERM)
+            return
         _partial_summary("SIGTERM (cancellation / shutdown)")
         signal.signal(signal.SIGTERM, prior_term)
         signal.raise_signal(signal.SIGTERM)
@@ -374,8 +393,8 @@ def run_stress_sweep(
             cleanup_dir = Path(tempfile.mkdtemp(prefix="raptor-sca-stress-"))
             out_root = cleanup_dir
         else:
-            from packages.sca import SCA_CACHE_ROOT
-            out_root = SCA_CACHE_ROOT / "stress" / "clones"
+            from packages.sca import sca_cache_root
+            out_root = sca_cache_root() / "stress" / "clones"
     out_root.mkdir(parents=True, exist_ok=True)
 
     # Per-scan wall-clock budget: a scan must clone
@@ -410,7 +429,7 @@ def run_stress_sweep(
                 pass
             logger.info(
                 "sca.calibration.stress: heartbeat — in flight: %s "
-                "(rss=%s)", ", ".join(_in_flight()) or "none", rss,
+                "(rss=%s)", ", ".join(_in_flight() or []) or "none", rss,
             )
 
     threading.Thread(target=_heartbeat, daemon=True).start()
@@ -753,8 +772,27 @@ _ACTIVE_SCANS: dict[str, float] = {}
 _ACTIVE_SCANS_LOCK = threading.Lock()
 
 
-def _in_flight() -> list[str]:
-    """Names of currently-running scans, longest-running first."""
+def _in_flight(timeout: float | None = None) -> list[str] | None:
+    """Names of currently-running scans, longest-running first.
+
+    ``timeout`` is for signal-handler context: CPython delivers
+    handlers on the MAIN thread, and the main thread itself takes
+    ``_ACTIVE_SCANS_LOCK`` every poll iteration (``_scan_started_at``
+    / ``_over_budget_running``). A SIGTERM landing inside one of
+    those critical sections would deadlock a blocking acquire here —
+    the lock is non-reentrant and its holder is the very frame the
+    handler interrupted — so the process hangs through the grace
+    window and dies to SIGKILL with no post-mortem. With a timeout,
+    an unacquirable lock returns ``None`` ("unavailable") instead.
+    """
+    if timeout is not None:
+        if not _ACTIVE_SCANS_LOCK.acquire(timeout=timeout):
+            return None
+        try:
+            items = sorted(_ACTIVE_SCANS.items(), key=lambda kv: kv[1])
+        finally:
+            _ACTIVE_SCANS_LOCK.release()
+        return [k for k, _ in items]
     with _ACTIVE_SCANS_LOCK:
         items = sorted(_ACTIVE_SCANS.items(), key=lambda kv: kv[1])
     return [k for k, _ in items]
@@ -893,7 +931,7 @@ def confirm_elapsed_regressions(
     *,
     out_root: Path | None = None,
     git_clone_timeout: int = 300,
-    max_remeasures: int = 3,
+    max_remeasures: int = 5,
     vuln_warn_pct: float = DEFAULT_VULN_WARN_PCT,
     vuln_fail_pct: float = DEFAULT_VULN_FAIL_PCT,
     deps_warn_pct: float = DEFAULT_DEPS_WARN_PCT,
@@ -951,8 +989,8 @@ def confirm_elapsed_regressions(
         return severity
 
     if out_root is None:
-        from packages.sca import SCA_CACHE_ROOT
-        out_root = SCA_CACHE_ROOT / "stress" / "clones"
+        from packages.sca import sca_cache_root
+        out_root = sca_cache_root() / "stress" / "clones"
 
     _RANK = {"ok": 0, "new": 0, "warn": 1, "fail": 2}
 
@@ -1249,6 +1287,10 @@ def write_baseline(
             "deps_analysed": r.deps_analysed,
             "vuln_findings": r.vuln_findings,
             "eco_breakdown": dict(sorted(r.eco_breakdown.items())),
+            # Single-run sample, NOT a percentile — the key name is
+            # frozen in the committed baseline schema (renaming
+            # would invalidate every existing baseline file). A real
+            # p50 needs repeat runs the sweep doesn't do.
             "elapsed_seconds_p50": round(r.elapsed_seconds, 1),
         }
     output = {

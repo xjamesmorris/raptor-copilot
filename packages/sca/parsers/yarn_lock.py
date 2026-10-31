@@ -31,7 +31,9 @@ import re
 from typing import Any, TYPE_CHECKING
 
 from ..models import Confidence, Dependency, PinStyle
+from ._base import build_purl, lockfile_confidence
 from . import _safe_read, register
+from ._npm_alias import looks_like_package_name as _looks_like_package_name
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -175,9 +177,18 @@ def _parse_classic_prop(line: str) -> tuple[str | None, str]:
 def _from_classic_block(
     specs: list[str], props: dict[str, str], path: Path,
 ) -> Dependency | None:
-    name = _name_from_descriptor(specs[0]) if specs else None
+    name, alias = _name_from_descriptor(specs[0]) if specs else (None, None)
     if not name:
         return None
+    if alias is None:
+        # A classic block can list several descriptors; the alias
+        # isn't always first ("lodash@^4, my-lodash@npm:lodash@^4:") —
+        # take the first descriptor that aliases THIS block's package.
+        for extra in specs[1:]:
+            n2, a2 = _name_from_descriptor(extra)
+            if n2 == name and a2:
+                alias = a2
+                break
     version = props.get("version") or None
     resolved = props.get("resolved", "")
     pin_style = _pin_from_resolved(resolved, version)
@@ -190,8 +201,9 @@ def _from_classic_block(
         is_lockfile=True,
         pin_style=pin_style,
         direct=False,
-        purl=_build_purl(name, version),
+        purl=build_purl("npm", name, version),
         parser_confidence=_confidence(pin_style, version),
+        alias_name=alias,
     )
 
 
@@ -202,10 +214,13 @@ def _from_classic_block(
 def _parse_berry(text: str, path: Path) -> list[Dependency]:
     try:
         data = _safe_load(text)           # type: ignore[misc]
-    except (_yaml.YAMLError, ValueError) as e:  # type: ignore[union-attr]
-        # ValueError: yaml.safe_load raises it on out-of-range date
-        # scalars — report the parse failure instead of letting it
-        # escape to the dispatch catch-all as a silent zero-dep result.
+    except (_yaml.YAMLError, RecursionError, ValueError) as e:  # type: ignore[union-attr]
+        # Same tuple as the _looks_like_berry sniff. ValueError:
+        # yaml.safe_load raises it on out-of-range date scalars.
+        # RecursionError: deep nesting the flow-depth pre-bound does
+        # not see (block-mapping nesting) blows the loader stack —
+        # report the parse failure instead of letting either escape
+        # to the dispatch catch-all as a silent zero-dep result.
         logger.warning(
             "sca.parsers.yarn_lock: Berry YAML parse failed for %s: %s",
             path, e,
@@ -222,10 +237,19 @@ def _parse_berry(text: str, path: Path) -> list[Dependency]:
             continue
         # Berry lets one record cover multiple comma-separated descriptors;
         # any one of them resolves to the same version.
-        first_descriptor = descriptor.split(",")[0].strip()
-        name = _name_from_descriptor(first_descriptor)
+        descriptors = [x.strip() for x in descriptor.split(",")]
+        name, alias = _name_from_descriptor(descriptors[0])
         if not name:
             continue
+        if alias is None:
+            # The alias descriptor may not come first
+            # ("lodash@npm:^4, my-lodash@npm:lodash@^4") — take the
+            # first descriptor that aliases THIS record's package.
+            for extra in descriptors[1:]:
+                n2, a2 = _name_from_descriptor(extra)
+                if n2 == name and a2:
+                    alias = a2
+                    break
         v = entry.get("version")
         version = v if isinstance(v, str) and v else None
         resolution = entry.get("resolution")
@@ -240,8 +264,9 @@ def _parse_berry(text: str, path: Path) -> list[Dependency]:
             is_lockfile=True,
             pin_style=pin_style,
             direct=False,
-            purl=_build_purl(name, version),
+            purl=build_purl("npm", name, version),
             parser_confidence=_confidence(pin_style, version),
+            alias_name=alias,
         ))
     return deps
 
@@ -250,10 +275,10 @@ def _parse_berry(text: str, path: Path) -> list[Dependency]:
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-def _name_from_descriptor(descriptor: str) -> str | None:
-    """Extract the INSTALLED package name from a yarn descriptor.
+def _name_from_descriptor(descriptor: str) -> tuple[str | None, str | None]:
+    """Extract ``(installed_name, alias_or_None)`` from a yarn descriptor.
 
-    Examples (input → output):
+    Examples (input → installed name):
       ``lodash@^4.17.21``                 → ``lodash``
       ``"@types/node@^20.10.0"``          → ``@types/node``
       ``lodash@npm:^4.17.21``             → ``lodash``        (Berry)
@@ -264,31 +289,29 @@ def _name_from_descriptor(descriptor: str) -> str | None:
     Alias descriptors (``<alias>@npm:<real-pkg>@<range>``) resolve to
     the REAL package: that's what yarn installs, so that's what OSV
     must be queried for — recording the alias name hid the installed
-    package's advisories entirely.
+    package's advisories entirely. The alias spelling is returned as
+    the second element (``Dependency.alias_name``) so display and
+    fix-materialisation still see what the manifest declared.
     """
     s = descriptor.strip().strip('"')
     if not s:
-        return None
+        return None, None
     name, spec = _split_name_spec(s)
     if name is None:
-        return None
+        return None, None
     if spec is not None and spec.startswith("npm:"):
         target = spec[len("npm:"):]
         # ``npm:<range>`` (plain Berry protocol) vs ``npm:<pkg>[@range]``
-        # (alias) — a package name starts with a letter/digit/@/_,
-        # never a range operator or bare digit-version.
-        real, _real_spec = _split_name_spec(target)
-        if real and _NPM_NAMEISH_RE.match(real):
-            return real
-    return name
-
-
-# A plausible npm package name (plain or scoped). Range strings
-# (``^1.2``, ``>=2``, ``1.2.3``) fail this — that's the alias/protocol
-# discriminator above.
-_NPM_NAMEISH_RE = re.compile(
-    r"^(?:@[A-Za-z0-9][\w.\-]*/)?[A-Za-z_][\w.\-]*$"
-)
+        # (alias) — a package name is never a range operator, and a
+        # bare digit-version only counts as a version when no explicit
+        # ``@<range>`` separator follows (digit-leading NAMES like
+        # ``7zip-bin`` are legal on npm).
+        real, real_spec = _split_name_spec(target)
+        if real and _looks_like_package_name(
+            real, has_spec=real_spec is not None,
+        ):
+            return real, (name if real != name else None)
+    return name, None
 
 
 def _split_name_spec(s: str) -> tuple[str | None, str | None]:
@@ -338,21 +361,15 @@ def _pin_from_berry_resolution(
     return PinStyle.WILDCARD
 
 
-def _build_purl(name: str, version: str | None) -> str:
-    base = f"pkg:npm/{name}"
-    if version:
-        return f"{base}@{version}"
-    return base
-
 
 def _confidence(pin_style: PinStyle, version: str | None) -> Confidence:
-    if pin_style is PinStyle.GIT:
-        return Confidence("medium", reason="yarn.lock git source")
-    if pin_style is PinStyle.PATH:
-        return Confidence("medium", reason="yarn.lock workspace/file source")
-    if version is None:
-        return Confidence("low", reason="yarn.lock entry without version")
-    return Confidence("high", reason="yarn.lock resolved entry")
+    return lockfile_confidence(
+        pin_style, version,
+        git_reason="yarn.lock git source",
+        path_reason="yarn.lock workspace/file source",
+        unversioned_reason="yarn.lock entry without version",
+        resolved_reason="yarn.lock resolved entry",
+    )
 
 
 register(filenames=["yarn.lock"])(parse)

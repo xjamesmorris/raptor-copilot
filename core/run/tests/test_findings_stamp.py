@@ -21,6 +21,15 @@ from core.run.metadata import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _user_state_in_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """User registries stay out of the real home: the root-conftest
+    layer doing this is stripped from release extracts (conftest.py
+    is export-ignore), so the pin must travel in-file."""
+    from core.testing.state_isolation import pin_user_state_dirs
+    pin_user_state_dirs(monkeypatch, tmp_path)
+
+
 def _write_manifest(d: Path, *, ts: str = "2026-05-30T12:00:00+00:00") -> None:
     """Minimal manifest enough for build_provenance_ref to read."""
     (d / RUN_METADATA_FILE).write_text(json.dumps({
@@ -39,6 +48,33 @@ def test_build_ref_minimal_shape(tmp_path: Path) -> None:
         "manifest_path": RUN_METADATA_FILE,
         "ts": "2026-05-30T12:00:00+00:00",
     }
+
+
+def test_build_ref_relative_run_dir_stamps_resolved_run_id(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The run-attribution seam: "." from inside the run dir has
+    # name == "" unresolved — the ref would fail
+    # is_canonical_ref_shape's non-empty run_id check and the run's
+    # findings would carry no back-link.
+    run = tmp_path / "scan_20260928"
+    run.mkdir()
+    _write_manifest(run)
+    monkeypatch.chdir(run)
+    ref = build_provenance_ref(Path("."))
+    assert ref is not None
+    assert ref["run_id"] == "scan_20260928"
+    assert is_canonical_ref_shape(ref)
+
+
+def test_build_ref_absolute_run_dir_stamp_unchanged(tmp_path: Path) -> None:
+    # Differential pin: lifecycle callers pass absolute run dirs, and
+    # there the stamp stays exactly the pre-existing basename.
+    run = tmp_path / "scan_alpha"
+    run.mkdir()
+    _write_manifest(run)
+    ref = build_provenance_ref(run)
+    assert ref is not None
+    assert ref["run_id"] == run.name == "scan_alpha"
 
 
 def test_build_ref_returns_none_without_manifest(tmp_path: Path) -> None:
@@ -286,3 +322,99 @@ def test_canonical_shape_accepts_stamped_ref(tmp_path: Path) -> None:
 ])
 def test_canonical_shape_rejects_forgeries(candidate) -> None:
     assert not is_canonical_ref_shape(candidate)
+
+
+def test_stamp_skips_oversize_findings_file(tmp_path, caplog):
+    """_stamp_file runs inside complete_run — an oversize findings.json
+    plant in the sandbox-writable run dir must be skipped with a
+    warning (the budget class every other findings reader applies),
+    never read wholesale and rewritten by the finaliser."""
+    import logging
+
+    from core.run.findings import stamp_findings_in_run
+    (tmp_path / ".raptor-run.json").write_text(json.dumps({
+        "version": 2, "command": "scan",
+        "timestamp": "2026-01-01T00:00:00+00:00", "status": "running",
+    }), encoding="utf-8")
+    payload = ('{"findings": [{"id": "f1", "pad": "'
+               + "A" * (65 * 1024 * 1024) + '"}]}')
+    (tmp_path / "findings.json").write_text(payload, encoding="utf-8")
+    with caplog.at_level(logging.WARNING):
+        counts = stamp_findings_in_run(tmp_path)
+    assert counts["files_skipped"] == 1
+    assert counts["files_stamped"] == 0
+    assert (tmp_path / "findings.json").read_text(
+        encoding="utf-8") == payload
+    assert any("findings gate" in r.message or "unreadable" in
+               r.message.lower() for r in caplog.records)
+
+
+def test_stamp_still_stamps_in_budget_file(tmp_path):
+    # Two-direction guard for the budget gate.
+    from core.run.findings import stamp_findings_in_run
+    (tmp_path / ".raptor-run.json").write_text(json.dumps({
+        "version": 2, "command": "scan",
+        "timestamp": "2026-01-01T00:00:00+00:00", "status": "running",
+    }), encoding="utf-8")
+    (tmp_path / "findings.json").write_text(
+        json.dumps({"findings": [{"id": "f1"}]}), encoding="utf-8")
+    counts = stamp_findings_in_run(tmp_path)
+    assert counts["findings_stamped"] == 1
+    data = json.loads((tmp_path / "findings.json").read_text())
+    assert data["findings"][0]["provenance_refs"]
+
+
+def test_openant_findings_are_stamped(tmp_path):
+    """Standalone /openant runs write openant_findings.json and no
+    top-level findings.json — unstamped, there was no canonical
+    provenance ref for the run and a forged local-looking ref in an
+    imported archive was the record's only back-link."""
+    from core.run.findings import stamp_findings_in_run
+    (tmp_path / ".raptor-run.json").write_text(json.dumps({
+        "version": 2, "command": "openant",
+        "timestamp": "2026-01-01T00:00:00+00:00", "status": "running",
+    }), encoding="utf-8")
+    (tmp_path / "openant_findings.json").write_text(
+        json.dumps({"findings": [{"id": "f1"}]}), encoding="utf-8")
+    counts = stamp_findings_in_run(tmp_path)
+    assert counts["findings_stamped"] == 1
+    data = json.loads((tmp_path / "openant_findings.json").read_text())
+    assert data["findings"][0]["provenance_refs"]
+
+
+def test_import_ref_rewrite_paths_are_the_stamp_paths():
+    """One constant, consumed from its owner: the import-side
+    namespacing rewrite must cover exactly the stamped files, or an
+    imported file's refs read as locally-verified work."""
+    from core.project.export import _IMPORTED_REF_REWRITE_PATHS
+    from core.run.findings import _STAMP_PATHS
+    assert _IMPORTED_REF_REWRITE_PATHS is _STAMP_PATHS
+    assert "openant_findings.json" in _STAMP_PATHS
+
+
+class TestStampFileGatedRead:
+    """The stamping hook runs at run completion over files another
+    principal can populate — a planted FIFO must be skipped, not
+    hang run completion."""
+
+    def test_fifo_findings_skipped_not_hung(self, tmp_path):
+        import os as _os
+        import signal as _signal
+
+        if not hasattr(_os, "mkfifo"):
+            pytest.skip("platform lacks mkfifo")
+        _write_manifest(tmp_path)
+        _os.mkfifo(tmp_path / "findings.json")
+
+        def _on_alarm(signum, frame):
+            msg = "stamping blocked on a planted FIFO"
+            raise AssertionError(msg)
+
+        old = _signal.signal(_signal.SIGALRM, _on_alarm)
+        _signal.alarm(30)
+        try:
+            counts = stamp_findings_in_run(tmp_path)
+        finally:
+            _signal.alarm(0)
+            _signal.signal(_signal.SIGALRM, old)
+        assert counts["files_stamped"] == 0

@@ -4,16 +4,35 @@ Every run directory gets a .raptor-run.json file tracking what command
 produced it, when, and whether it succeeded. Tools use start_run/complete_run/fail_run.
 """
 
+from __future__ import annotations
+
+import copy
 import contextlib
+import errno
+import hashlib
 import json
 import logging
 import os
 import re
+import secrets
+import stat
+import threading
+import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Literal, Mapping
 
-from core.json import append_jsonl, load_json, save_json
+from core.json import (
+    JsonBudgetExceededError,
+    append_jsonl,
+    dumps_artifact,
+    load_json,
+    loads_bounded,
+    save_json,
+)
 
 try:
     import fcntl
@@ -24,6 +43,28 @@ except ImportError:                                    # pragma: no cover
 logger = logging.getLogger(__name__)
 
 RUN_METADATA_FILE = ".raptor-run.json"
+
+#: Read budget for the run metadata file. It lives in the
+#: sandbox-writable run dir, so its size is attacker-writable; a
+#: legitimate stamp is a few KB. Single-homed so every reader stays
+#: on one spelling.
+RUN_METADATA_MAX_BYTES = 1024 * 1024
+
+
+def _load_meta(path: Path) -> Any:
+    """Read a ``.raptor-run.json`` under the shared byte budget.
+
+    EVERY reader of the metadata file in this module routes through
+    here (or :func:`load_run_metadata`, its run-dir spelling) — the
+    file is sandbox-writable mid-run, so an oversize plant follows
+    the malformed-file contract (warn, return None) instead of
+    buffering unbounded. The uncapped readers this replaces put the
+    OOM inside the contention gate (every future start in the
+    project loads every sibling's metadata), the victim run's own
+    finalisers, and resume — the exact lanes the budget exists for.
+    The closure test derives the reader set and pins the routing.
+    """
+    return load_json(path, max_bytes=RUN_METADATA_MAX_BYTES)
 
 
 class RunOwnershipError(ValueError):
@@ -50,6 +91,295 @@ class RunOwnershipError(ValueError):
     """
 
 
+RUN_RUNTIME_RECEIPT_KEY = "session_runtime_receipt"
+RUN_RUNTIME_RECEIPT_LINEAGE_KEY = "session_runtime_receipt_lineage"
+MAX_RUN_METADATA_BYTES = RUN_METADATA_MAX_BYTES
+RUN_RECEIPT_LINEAGE_SCHEMA = "raptor.run_runtime_receipt_lineage/v1"
+RUN_RECEIPT_LINEAGE_SCHEMA_VERSION = 1
+MAX_RUN_RECEIPT_LINEAGE_ENTRIES = 32
+MAX_RUN_RECEIPT_LINEAGE_ROW_BYTES = 9_216
+MAX_RUN_RECEIPT_LINEAGE_BYTES = (
+    MAX_RUN_RECEIPT_LINEAGE_ENTRIES * MAX_RUN_RECEIPT_LINEAGE_ROW_BYTES + 256
+)
+
+_RUN_RECEIPT_RESERVED_EXTRA_KEYS = frozenset(
+    {
+        RUN_RUNTIME_RECEIPT_KEY,
+        RUN_RUNTIME_RECEIPT_LINEAGE_KEY,
+        "runtime_receipt_resumes",
+    }
+)
+_RUN_RECEIPT_RESERVED_TOP_LEVEL_KEYS = frozenset(
+    {
+        RUN_RUNTIME_RECEIPT_KEY,
+        RUN_RUNTIME_RECEIPT_LINEAGE_KEY,
+    }
+)
+_RUN_RECEIPT_PROJECT_SOURCES = frozenset(
+    {"session", "argv", "threaded"}
+)
+_RUN_RECEIPT_LINEAGE_RELATIONS = frozenset({"exact", "new_launch_same_stable"})
+_RUN_RECEIPT_LINEAGE_TIMESTAMP_RE = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T"
+    r"[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}\+00:00$",
+    re.ASCII,
+)
+_RUN_RECEIPT_SHA256_RE = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
+_STRICT_METADATA_LOCK_ATTEMPTS = 20
+_STRICT_METADATA_LOCK_INTERVAL_S = 0.01
+
+
+class RunReceiptComparisonResult(str, Enum):
+    """Closed, non-authorizing run-level receipt relations."""
+
+    ABSENT_BOTH = "absent_both"
+    NEW_SNAPSHOT_NON_AUTHORIZING = "new_snapshot_non_authorizing"
+    MATCH_NON_AUTHORIZING = "match_non_authorizing"
+    METADATA_ONLY = "metadata_only"
+    REGISTRY_ONLY = "registry_only"
+    METADATA_INVALID = "metadata_invalid"
+    REGISTRY_INVALID = "registry_invalid"
+    REGISTRY_PENDING = "registry_pending"
+    REGISTRY_REJECTED = "registry_rejected"
+    RECEIPT_MISSING = "receipt_missing"
+    AUTHORITY_INVALID = "authority_invalid"
+    PROFILE_MISMATCH = "profile_mismatch"
+    STABLE_IDENTITY_MISMATCH = "stable_identity_mismatch"
+    LAUNCH_INSTANCE_MISMATCH = "launch_instance_mismatch"
+    RESUME_MATCH_NON_AUTHORIZING = "resume_match_non_authorizing"
+    LINEAGE_INVALID = "lineage_invalid"
+    LINEAGE_OVERFLOW = "lineage_overflow"
+    LAUNCH_REPLAY = "launch_replay"
+    LAUNCH_INSTANCE_INVALID = "launch_instance_invalid"
+    REGISTRY_CHANGED = "registry_changed"
+    METADATA_CHANGED = "metadata_changed"
+
+
+@dataclass(frozen=True, slots=True)
+class RunReceiptComparison:
+    """A receipt relation that deliberately cannot be used as a boolean."""
+
+    result: RunReceiptComparisonResult
+    exact_snapshot_result: object | None
+    authoritative: Literal[False] = field(default=False, init=False)
+
+    def __post_init__(self) -> None:
+        from core.startup.runtime_receipt.plumbing_types import (
+            ReceiptComparisonResult,
+        )
+
+        if type(self.result) is not RunReceiptComparisonResult:
+            raise TypeError("result must be RunReceiptComparisonResult")
+        if (
+            self.exact_snapshot_result is not None
+            and type(self.exact_snapshot_result) is not ReceiptComparisonResult
+        ):
+            raise TypeError("exact snapshot result must be ReceiptComparisonResult")
+
+    def __bool__(self) -> bool:
+        raise TypeError("run receipt comparison is not an authority boolean")
+
+    def __init_subclass__(cls) -> None:
+        raise TypeError("RunReceiptComparison cannot be subclassed")
+
+
+class RunReceiptReason(str, Enum):
+    """Closed refusal reasons for run receipt operations."""
+
+    RESERVED_KEY_OVERRIDE = "reserved_key_override"
+    LEGACY_UPGRADE_FORBIDDEN = "legacy_upgrade_forbidden"
+    RECEIPT_DOWNGRADE_FORBIDDEN = "receipt_downgrade_forbidden"
+    METADATA_MISSING = "metadata_missing"
+    METADATA_INVALID = "metadata_invalid"
+    METADATA_OVERSIZED = "metadata_oversized"
+    METADATA_CHANGED = "metadata_changed"
+    REGISTRY_ABSENT = "registry_absent"
+    REGISTRY_PENDING = "registry_pending"
+    REGISTRY_REJECTED = "registry_rejected"
+    REGISTRY_INVALID = "registry_invalid"
+    REGISTRY_CHANGED = "registry_changed"
+    RECEIPT_MISSING = "receipt_missing"
+    AUTHORITY_INVALID = "authority_invalid"
+    PROFILE_MISMATCH = "profile_mismatch"
+    STABLE_IDENTITY_MISMATCH = "stable_identity_mismatch"
+    LAUNCH_INSTANCE_MISMATCH = "launch_instance_mismatch"
+    CROSS_LAUNCH_RESUME_UNSUPPORTED = "cross_launch_resume_unsupported"
+    LINEAGE_INVALID = "lineage_invalid"
+    LINEAGE_OVERFLOW = "lineage_overflow"
+    LAUNCH_REPLAY = "launch_replay"
+    LAUNCH_INSTANCE_INVALID = "launch_instance_invalid"
+    REENTRANT_STATUS_MISMATCH = "reentrant_status_mismatch"
+    REENTRANT_COMMAND_MISMATCH = "reentrant_command_mismatch"
+    PROJECT_FORBIDDEN = "project_forbidden"
+    PROJECT_PIN_MISMATCH = "project_pin_mismatch"
+    TERMINAL_TRANSITION_FORBIDDEN = "terminal_transition_forbidden"
+    PIN_REWRITE_FORBIDDEN = "pin_rewrite_forbidden"
+    STRICT_LOCK_UNAVAILABLE = "strict_lock_unavailable"
+    LOCK_BUSY = "lock_busy"
+
+
+_RUN_RECEIPT_ERROR_DETAIL_KEYS = frozenset(
+    {
+        "operation",
+        "reason",
+        "comparison",
+        "subordinate",
+        "status",
+        "segment",
+        "profile_id",
+    }
+)
+
+
+class RunRuntimeReceiptError(ValueError):
+    """Bounded, redacted refusal for a run receipt operation."""
+
+    def __init__(
+        self,
+        reason: RunReceiptReason,
+        *,
+        operation: str,
+        comparison: RunReceiptComparison | None = None,
+        subordinate: str | None = None,
+        status: str | None = None,
+        segment: int | None = None,
+        profile_id: str | None = None,
+    ) -> None:
+        if type(reason) is not RunReceiptReason:
+            raise TypeError("reason must be RunReceiptReason")
+        fields: dict[str, str] = {
+            "operation": operation,
+            "reason": reason.value,
+        }
+        if comparison is not None:
+            if type(comparison) is not RunReceiptComparison:
+                raise TypeError("comparison must be RunReceiptComparison")
+            fields["comparison"] = comparison.result.value
+        if subordinate is not None:
+            fields["subordinate"] = subordinate
+        if status is not None:
+            fields["status"] = status
+        if segment is not None:
+            fields["segment"] = str(segment)
+        if profile_id is not None:
+            fields["profile_id"] = profile_id
+        bounded: dict[str, str] = {}
+        for key, value in fields.items():
+            if key not in _RUN_RECEIPT_ERROR_DETAIL_KEYS:
+                raise ValueError("run receipt diagnostic key is not allowed")
+            if (
+                not value
+                or not value.isascii()
+                or not value.isprintable()
+                or len(value.encode("ascii")) > 128
+            ):
+                value = "<redacted>"
+            bounded[key] = value
+        if len(bounded) > 16:
+            raise ValueError("run receipt diagnostic has too many fields")
+        self.reason = reason
+        self.operation = operation
+        self.comparison = comparison
+        self.details = MappingProxyType(bounded)
+        detail = ", ".join(f"{key}={value}" for key, value in bounded.items())
+        super().__init__(f"run receipt operation refused ({detail})")
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class RunReceiptAuditSnapshot:
+    """Canonical historical snapshot used only for audit and vetoes."""
+
+    reference: Any
+    receipt: Any
+    canonical: bytes = field(repr=False)
+    authoritative: Literal[False] = field(default=False, init=False)
+
+    def __post_init__(self) -> None:
+        from core.startup.runtime_receipt.plumbing_types import (
+            PlumbingFailure,
+            ReceiptReference,
+            reference_from_receipt,
+        )
+        from core.startup.runtime_receipt.schema import RuntimeReceipt
+
+        if type(self.canonical) is not bytes or not self.canonical:
+            raise ValueError("audit snapshot canonical bytes are invalid")
+        if type(self.reference) is not ReceiptReference:
+            raise TypeError("reference must be ReceiptReference")
+        if type(self.receipt) is not RuntimeReceipt:
+            raise TypeError("receipt must be RuntimeReceipt")
+        actual = reference_from_receipt(self.receipt)
+        if isinstance(actual, PlumbingFailure) or actual != self.reference:
+            raise ValueError("audit snapshot reference and receipt disagree")
+
+    def __repr__(self) -> str:
+        return "RunReceiptAuditSnapshot(<redacted>)"
+
+    def __bool__(self) -> bool:
+        raise TypeError("run receipt audit snapshot is not an authority boolean")
+
+    def __init_subclass__(cls) -> None:
+        raise TypeError("RunReceiptAuditSnapshot cannot be subclassed")
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _RunReceiptLineageEntry:
+    segment: int
+    resumed_at_utc: str
+    resumed_at: datetime = field(repr=False)
+    relation: str
+    prior_snapshot_sha256: str
+    current_snapshot_sha256: str
+    prior_reference: Any = field(repr=False)
+    current_reference: Any = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _RunReceiptLineage:
+    entries: tuple[_RunReceiptLineageEntry, ...] = field(repr=False)
+    canonical: bytes = field(repr=False)
+    authoritative: Literal[False] = field(default=False, init=False)
+
+    def __bool__(self) -> bool:
+        raise TypeError("run receipt lineage is not an authority boolean")
+
+    def __repr__(self) -> str:
+        return "_RunReceiptLineage(<redacted>)"
+
+    def __init_subclass__(cls) -> None:
+        raise TypeError("_RunReceiptLineage cannot be subclassed")
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _ParsedReceiptMetadata:
+    snapshot: RunReceiptAuditSnapshot | None = field(repr=False)
+    lineage: _RunReceiptLineage | None = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _StrictRunMetadata:
+    raw: bytes = field(repr=False)
+    value: dict[str, Any] = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _ReceiptCommitPlan:
+    operation: str
+    output_dir: Path
+    capture: Any = field(repr=False)
+    expected_raw: bytes | None = field(repr=False)
+    desired_raw: bytes = field(repr=False)
+    desired_metadata: dict[str, Any] = field(repr=False)
+    temporary_path: Path = field(repr=False)
+    segment: int | None = None
+
+
+def _metadata_allows_legacy_attribution(meta: Mapping[str, object]) -> bool:
+    """Deny-only guard for legacy owner/liveness/consumer paths."""
+
+    return not any(key in meta for key in _RUN_RECEIPT_RESERVED_TOP_LEVEL_KEYS)
+
+
 # Status enum
 STATUS_RUNNING = "running"
 STATUS_COMPLETED = "completed"
@@ -61,6 +391,37 @@ STATUS_CANCELLED = "cancelled"
 # via resume_run() — and deliberately NOT reaped by
 # core.run.tmp_reaper.reap_stale_runs (failed/cancelled only).
 STATUS_INTERRUPTED = "interrupted"
+
+#: ``extra``-dict markers that stamp a terminal transition as a
+#: HEURISTIC verdict — written by machinery that judged a run it did
+#: not start (the abandon sweeps' ``abandon_sweep``, the lifecycle
+#: hook's Stop-path ``hook_finalize``). The precedence rule in
+#: :func:`_update_status` keys on them, both directions:
+#:
+#:   * a REAL (marker-less) terminal transition — the owner's own
+#:     complete/fail/cancel/interrupt — SUPERSEDES a heuristic
+#:     terminal state regardless of arrival order (the recovery
+#:     clause overrides it and consumes the marker);
+#:   * a heuristic write NEVER overrides an existing terminal state
+#:     (the marked-write no-op clause — the heuristic lost the race);
+#:   * real vs real keeps first-writer-wins (the terminal guard).
+#:
+#: Pre-fix only ``abandon_sweep`` (heuristic FAILURES) had this
+#: discipline; the hook's Stop-path completions were unmarked, so a
+#: hook that misjudged an IN-FLIGHT run's dead-looking worker stamped
+#: a FINAL ``completed`` that the owner's real ``fail_run`` was then
+#: refused against — a failed scan read Completed forever (observed
+#: as the openant exit-path flake under peak parallel-test load).
+_HEURISTIC_FINALIZE_MARKERS = ("abandon_sweep", "hook_finalize")
+
+
+def _heuristic_marks(extra: Any) -> list[str]:
+    """The heuristic-finalisation markers present in an ``extra``
+    dict (``[]`` for anything that is not a dict — metadata is
+    sandbox-adjacent file content, so shape is never assumed)."""
+    if not isinstance(extra, dict):
+        return []
+    return [m for m in _HEURISTIC_FINALIZE_MARKERS if extra.get(m)]
 
 # `_cleanup_abandoned` freshness threshold. A sibling run in
 # status=running that was created within this many seconds is treated
@@ -106,6 +467,7 @@ _PREFIX_MAP = {
     "web": "web",
     "crash-analysis": "crash-analysis",
     "oss-forensics": "oss-forensics",
+    "openant": "openant",
 }
 
 
@@ -195,7 +557,7 @@ def _read_ppid_ps(pid: int) -> int:
 
 
 def _get_session_pid() -> int | None:
-    """Get the PID of the Claude Code session process.
+    """Get the PID of the owning RAPTOR frontend session.
 
     Delegates to the ONE shared session resolver
     (``core.project.sessions.resolve_session_pid``: validated
@@ -207,9 +569,9 @@ def _get_session_pid() -> int | None:
     subagent pid that the sweeps then judged dead the moment the
     subagent exited.
 
-    The CLAUDECODE env + getppid() fallback survives ONLY here — for
-    run-metadata recording in claude-less contexts (bare-shell libexec
-    flows). It is never used for project-binding resolution.
+    The legacy ``CLAUDECODE`` + getppid() fallback survives ONLY here
+    for run-metadata recording in bare-shell libexec flows. It is never
+    used for project-binding resolution or Copilot host authority.
     """
     from core.project.sessions import resolve_session_pid
     pid = resolve_session_pid()
@@ -217,17 +579,26 @@ def _get_session_pid() -> int | None:
         return pid
     if not os.environ.get("CLAUDECODE"):
         return None
-    return os.getppid()
+    ppid = os.getppid()
+    if ppid <= 1:
+        # Detached launch (setsid/nohup with CLAUDECODE inherited): the
+        # launcher exited and this process reparented to init, so
+        # getppid() is 1 — a pid that is always alive and never a
+        # claude session. Recording it as the owning session made every
+        # liveness verifier read the run as live-owned forever (and the
+        # resume guard refuse forever). No session is the honest answer.
+        return None
+    return ppid
 
 
-def _session_stamp(pid: int) -> dict[str, str]:
+def _session_stamp(pid: int) -> dict[str, Any]:
     """Identity stamp for *pid*, recorded beside ``session_pid`` in run
     metadata so the liveness verifiers can tell "this exact process"
     from "some process that recycled the PID" — including another real
-    claude session, which every comm check accepts by construction.
+    frontend session, which a process-name check accepts by construction.
     Keys absent when unreadable (legacy semantics apply on read)."""
     from core.project import sessions as _sessions
-    stamp: dict[str, str] = {}
+    stamp: dict[str, Any] = {}
     start = _sessions.proc_starttime(pid)
     if start is not None:
         stamp["session_start"] = start
@@ -237,38 +608,1552 @@ def _session_stamp(pid: int) -> dict[str, str]:
     ns = _sessions.pidns_id()
     if ns is not None:
         stamp["session_pidns"] = ns
+    machine = _sessions.machine_id()
+    if machine is not None:
+        # Per-install identity (hashed — never the raw machine-id, and
+        # never logged): lets the liveness verifiers tell "prior boot
+        # of THIS machine" (provably dead) from "another machine
+        # sharing the filesystem" (unverifiable — fail open).
+        stamp["session_machine_id"] = machine
+    claim = _sessions.session_host_claim(pid)
+    if claim is not None:
+        stamp.update(claim.metadata_fields())
     return stamp
+
+
+def _worker_stamp(session_bound: bool) -> dict[str, Any]:
+    """Identity of the worker process recorded as ``tool_pid`` —
+    ``{}`` when nothing with a run-tracking lifetime is recordable.
+
+    The credential is only useful when the recorded process's lifetime
+    tracks the run, so the policy is per launch shape:
+
+    * Session-bound runs record the parent as before (the harness's
+      transient tool shell — dead seconds later, the safe direction:
+      the session identity carries ownership and the worker's death
+      never blocks anything).
+    * Sessionless runs record a worker ONLY when detached (parent is
+      init): the calling process itself is then the long-lived
+      orchestrator, and its lifetime IS the run's. A sessionless run
+      with a live interactive parent records nothing — that parent
+      shell outlives the run by hours, and recording it would wedge
+      resume/compaction on every crashed bare-shell run until the
+      terminal closed (the pid-1 wedge class with a different
+      always-alive pid).
+    * A detached launch (setsid/nohup, established practice for long
+      orchestrators) reparents to PID 1 before ``start_run`` executes,
+      and PID 1 is always alive — recording it wedged every in-flight
+      guard into refusing forever (observed live on a detached audit
+      run). pid<=1 therefore NEVER lands in the metadata: the calling
+      process is recorded instead, and if the caller itself is pid 1
+      (an orchestrator running as container init) nothing is recorded
+      — legacy pid-less posture rather than a poisoned credential.
+
+    ``tool_pid_start`` binds the identity as (pid, starttime) — the
+    standard PID-reuse discriminator (``/proc/<pid>/stat`` field 22,
+    the same read the session stamps use) — so liveness verifiers can
+    tell "this exact worker" from "some process that recycled the
+    pid". Absent off-Linux or when unreadable; readers then apply the
+    legacy bare-pid semantics (see :func:`_tool_pid_alive`).
+    """
+    pid: int | None = os.getppid()
+    if pid is not None and pid <= 1:
+        pid = os.getpid()
+        if pid <= 1:
+            pid = None  # container-init orchestrator: nothing recordable
+    elif not session_bound:
+        pid = None  # live interactive parent: outlives the run
+    if pid is None:
+        return {}
+    stamp: dict[str, Any] = {"tool_pid": pid}
+    from core.project import sessions as _sessions
+    start = _sessions.proc_starttime(pid)
+    if start is not None:
+        stamp["tool_pid_start"] = start
+    return stamp
+
+
+# Claude Code session ids are uuid-shaped; the hook payload and the
+# env credential are both harness-authored, but the meta value crosses
+# an on-disk file others can write — validate the shape on both sides.
+_SESSION_ID_RE = re.compile(r"[0-9a-fA-F][0-9a-fA-F-]{7,63}")
+
+
+def _harness_session_id() -> str | None:
+    """The frontend session id injected into tool-call subprocesses.
+
+    Claude and Copilot use different environment keys, selected by the
+    launcher-owned ``RAPTOR_FRONTEND`` marker. The value is the SAME id the
+    owning session's SessionEnd hook payload carries (subagent tool calls
+    inherit the top-level id; a nested frontend's own hooks carry ITS id,
+    which never matches a run this session stamped).
+
+    Recording it at run start lets the SessionEnd hook prove "the
+    ending session IS this run's owner" and finalize immediately.
+    None outside a harness session or on a non-uuid-shaped value.
+    """
+    if os.environ.get("RAPTOR_FRONTEND") == "copilot":
+        variables = ("COPILOT_AGENT_SESSION_ID",)
+    else:
+        # Preserve the legacy/default Claude path for older launchers and
+        # direct unit tests that do not carry RAPTOR_FRONTEND.
+        variables = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID")
+    for var in variables:
+        value = os.environ.get(var, "")
+        if value and _SESSION_ID_RE.fullmatch(value):
+            return value
+    return None
+
+
+
+def _receipt_error(
+    reason: RunReceiptReason,
+    *,
+    operation: str,
+    comparison: RunReceiptComparison | None = None,
+    subordinate: str | None = None,
+    status: str | None = None,
+    segment: int | None = None,
+    profile_id: str | None = None,
+) -> RunRuntimeReceiptError:
+    return RunRuntimeReceiptError(
+        reason,
+        operation=operation,
+        comparison=comparison,
+        subordinate=subordinate,
+        status=status,
+        segment=segment,
+        profile_id=profile_id,
+    )
+
+
+def _reserved_mapping_key(mapping: object) -> str | None:
+    if not isinstance(mapping, Mapping):
+        return None
+    return next(
+        (key for key in _RUN_RECEIPT_RESERVED_EXTRA_KEYS if key in mapping),
+        None,
+    )
+
+
+def _reject_reserved_mapping(
+    mapping: object,
+    *,
+    operation: str,
+) -> None:
+    if _reserved_mapping_key(mapping) is not None:
+        raise _receipt_error(
+            RunReceiptReason.RESERVED_KEY_OVERRIDE,
+            operation=operation,
+        )
+
+
+def _metadata_contains_reserved_input(meta: Mapping[str, object]) -> bool:
+    return (
+        not _metadata_allows_legacy_attribution(meta)
+        or _reserved_mapping_key(meta.get("extra")) is not None
+    )
+
+
+def _metadata_file_fingerprint(
+    value: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_uid,
+        value.st_gid,
+        value.st_size,
+        value.st_nlink,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _strict_read_run_metadata_bytes(
+    path: Path,
+    *,
+    operation: str,
+    missing_ok: bool,
+) -> bytes | None:
+    flags = os.O_RDONLY
+    for name in ("O_NONBLOCK", "O_NOFOLLOW", "O_CLOEXEC"):
+        value = getattr(os, name, None)
+        if type(value) is not int:
+            raise _receipt_error(
+                RunReceiptReason.STRICT_LOCK_UNAVAILABLE,
+                operation=operation,
+                subordinate=name.lower(),
+            )
+        flags |= value
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise _receipt_error(
+            RunReceiptReason.METADATA_MISSING,
+            operation=operation,
+        ) from None
+    except OSError as exc:
+        raise _receipt_error(
+            RunReceiptReason.METADATA_INVALID,
+            operation=operation,
+            subordinate=(
+                "loop"
+                if exc.errno == errno.ELOOP
+                else "permission_denied"
+                if exc.errno in {errno.EACCES, errno.EPERM}
+                else "open_failed"
+            ),
+        ) from None
+    try:
+        try:
+            first = os.fstat(fd)
+        except OSError:
+            raise _receipt_error(
+                RunReceiptReason.METADATA_INVALID,
+                operation=operation,
+                subordinate="fstat_failed",
+            ) from None
+        if (
+            not stat.S_ISREG(first.st_mode)
+            or first.st_uid != os.geteuid()
+            or first.st_nlink != 1
+            or stat.S_IMODE(first.st_mode) & 0o022
+        ):
+            raise _receipt_error(
+                RunReceiptReason.METADATA_INVALID,
+                operation=operation,
+                subordinate="file_policy",
+            )
+        if first.st_size > MAX_RUN_METADATA_BYTES:
+            raise _receipt_error(
+                RunReceiptReason.METADATA_OVERSIZED,
+                operation=operation,
+            )
+        chunks: list[bytes] = []
+        remaining = MAX_RUN_METADATA_BYTES + 1
+        while remaining:
+            try:
+                chunk = os.read(fd, min(65_536, remaining))
+            except OSError:
+                raise _receipt_error(
+                    RunReceiptReason.METADATA_INVALID,
+                    operation=operation,
+                    subordinate="read_failed",
+                ) from None
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > MAX_RUN_METADATA_BYTES:
+            raise _receipt_error(
+                RunReceiptReason.METADATA_OVERSIZED,
+                operation=operation,
+            )
+        try:
+            second = os.fstat(fd)
+            current = os.stat(path, follow_symlinks=False)
+        except OSError:
+            raise _receipt_error(
+                RunReceiptReason.METADATA_CHANGED,
+                operation=operation,
+            ) from None
+        if (
+            len(raw) != first.st_size
+            or _metadata_file_fingerprint(first)
+            != _metadata_file_fingerprint(second)
+            or _metadata_file_fingerprint(second)
+            != _metadata_file_fingerprint(current)
+        ):
+            raise _receipt_error(
+                RunReceiptReason.METADATA_CHANGED,
+                operation=operation,
+            )
+        return raw
+    finally:
+        os.close(fd)
+
+
+def _strict_load_run_metadata(
+    path: Path,
+    *,
+    operation: str,
+    missing_ok: bool,
+) -> _StrictRunMetadata | None:
+    raw = _strict_read_run_metadata_bytes(
+        path,
+        operation=operation,
+        missing_ok=missing_ok,
+    )
+    if raw is None:
+        return None
+    try:
+        value = loads_bounded(
+            raw,
+            max_bytes=MAX_RUN_METADATA_BYTES,
+            reject_duplicate_keys=True,
+        )
+    except JsonBudgetExceededError:
+        raise _receipt_error(
+            RunReceiptReason.METADATA_OVERSIZED,
+            operation=operation,
+        ) from None
+    except (UnicodeError, ValueError, RecursionError):
+        raise _receipt_error(
+            RunReceiptReason.METADATA_INVALID,
+            operation=operation,
+        ) from None
+    if not isinstance(value, dict):
+        raise _receipt_error(
+            RunReceiptReason.METADATA_INVALID,
+            operation=operation,
+        )
+    return _StrictRunMetadata(raw=raw, value=value)
+
+
+def _parse_run_receipt_snapshot(
+    value: object,
+    *,
+    operation: str,
+) -> RunReceiptAuditSnapshot:
+    from core.startup.runtime_receipt.canonical import canonical_bytes
+    from core.startup.runtime_receipt.plumbing_types import (
+        MAX_SNAPSHOT_BYTES,
+        PlumbingFailure,
+        ReceiptReference,
+        ReceiptState,
+        reference_from_receipt,
+    )
+    from core.startup.runtime_receipt.reasons import ReceiptRejection
+    from core.startup.runtime_receipt.schema import RuntimeReceipt
+    from core.startup.runtime_receipt.verify import parse_receipt
+
+    envelope_keys = frozenset({"schema", "schema_version", "receipt"})
+    identity_keys = frozenset(
+        {
+            "state",
+            "profile_id",
+            "stable_identity_sha256",
+            "launch_instance_sha256",
+            "process_corroboration_sha256",
+        }
+    )
+    binding_keys = frozenset(
+        {
+            "launch_binding_sha256",
+            "receipt_sha256",
+            "launch_nonce",
+            "session_pid",
+            "session_starttime_ticks",
+        }
+    )
+    snapshot_keys = envelope_keys | identity_keys | binding_keys
+    try:
+        if not isinstance(value, dict) or set(value) != snapshot_keys:
+            raise ValueError("snapshot keys are not exact")
+        canonical = canonical_bytes(value)
+        if len(canonical) > MAX_SNAPSHOT_BYTES:
+            raise OverflowError("snapshot exceeds its byte bound")
+        if (
+            value["schema"] != "raptor.run_runtime_receipt_snapshot/v1"
+            or value["schema_version"] != 1
+            or value["state"] != "verified"
+        ):
+            raise ValueError("snapshot schema or state is invalid")
+        receipt_raw = canonical_bytes(value["receipt"])
+        receipt = parse_receipt(receipt_raw)
+        if isinstance(receipt, ReceiptRejection) or type(receipt) is not RuntimeReceipt:
+            raise ValueError("snapshot receipt is invalid")
+        reference = reference_from_receipt(receipt)
+        if (
+            isinstance(reference, PlumbingFailure)
+            or type(reference) is not ReceiptReference
+            or reference.state is not ReceiptState.VERIFIED
+        ):
+            raise ValueError("snapshot reference is invalid")
+        duplicates = {
+            "profile_id": reference.profile_id.value,
+            "stable_identity_sha256": reference.stable_identity_sha256.value,
+            "launch_instance_sha256": reference.launch_instance_sha256.value,
+            "process_corroboration_sha256": (
+                reference.process_corroboration_sha256.value
+            ),
+            "launch_binding_sha256": reference.launch_binding_sha256.value,
+            "receipt_sha256": reference.receipt_sha256.value,
+            "launch_nonce": reference.launch_nonce.value,
+            "session_pid": reference.session_pid.text,
+            "session_starttime_ticks": reference.session_starttime_ticks.text,
+        }
+        if any(value[key] != expected for key, expected in duplicates.items()):
+            raise ValueError("snapshot duplicate field mismatch")
+    except OverflowError:
+        raise _receipt_error(
+            RunReceiptReason.METADATA_OVERSIZED,
+            operation=operation,
+        ) from None
+    except (TypeError, UnicodeError, ValueError, RecursionError):
+        raise _receipt_error(
+            RunReceiptReason.METADATA_INVALID,
+            operation=operation,
+        ) from None
+    return RunReceiptAuditSnapshot(
+        reference=reference,
+        receipt=receipt,
+        canonical=canonical,
+    )
+
+
+def _lineage_error(
+    *,
+    operation: str,
+    subordinate: str | None = None,
+) -> RunRuntimeReceiptError:
+    return _receipt_error(
+        RunReceiptReason.LINEAGE_INVALID,
+        operation=operation,
+        comparison=RunReceiptComparison(
+            RunReceiptComparisonResult.LINEAGE_INVALID,
+            None,
+        ),
+        subordinate=subordinate,
+    )
+
+
+def _lineage_overflow_error(
+    *,
+    operation: str,
+    segment: int,
+) -> RunRuntimeReceiptError:
+    return _receipt_error(
+        RunReceiptReason.LINEAGE_OVERFLOW,
+        operation=operation,
+        comparison=RunReceiptComparison(
+            RunReceiptComparisonResult.LINEAGE_OVERFLOW,
+            None,
+        ),
+        segment=segment,
+    )
+
+
+def _parse_lineage_timestamp(
+    value: object,
+    *,
+    operation: str,
+) -> datetime:
+    if (
+        type(value) is not str
+        or _RUN_RECEIPT_LINEAGE_TIMESTAMP_RE.fullmatch(value) is None
+    ):
+        raise _lineage_error(
+            operation=operation,
+            subordinate="timestamp",
+        )
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise _lineage_error(
+            operation=operation,
+            subordinate="timestamp",
+        ) from None
+    if (
+        parsed.tzinfo is None
+        or parsed.utcoffset() != timezone.utc.utcoffset(parsed)
+        or parsed.astimezone(timezone.utc).isoformat(timespec="microseconds") != value
+    ):
+        raise _lineage_error(
+            operation=operation,
+            subordinate="timestamp",
+        )
+    return parsed
+
+
+def _parse_lineage_reference(
+    value: object,
+    *,
+    operation: str,
+):
+    from core.startup.runtime_receipt.canonical import canonical_bytes
+    from core.startup.runtime_receipt.plumbing_types import (
+        PlumbingFailure,
+        ReceiptReference,
+        ReceiptState,
+        parse_reference,
+        serialize_reference,
+    )
+
+    try:
+        raw = canonical_bytes(value)  # type: ignore[arg-type]
+        reference = parse_reference(raw)
+        if (
+            isinstance(reference, PlumbingFailure)
+            or type(reference) is not ReceiptReference
+            or reference.state is not ReceiptState.VERIFIED
+            or not secrets.compare_digest(serialize_reference(reference), raw)
+        ):
+            raise ValueError("lineage reference is invalid")
+    except (TypeError, UnicodeError, ValueError, RecursionError):
+        raise _lineage_error(
+            operation=operation,
+            subordinate="reference",
+        ) from None
+    return reference
+
+
+def _references_share_lineage_identity(left: Any, right: Any) -> bool:
+    from core.startup.runtime_receipt.plumbing_types import ReceiptState
+
+    return (
+        left.state is ReceiptState.VERIFIED
+        and right.state is ReceiptState.VERIFIED
+        and left.profile_id == right.profile_id
+        and left.stable_identity_sha256 == right.stable_identity_sha256
+        and left.launcher_euid == right.launcher_euid
+    )
+
+
+def _reference_generation_is_distinct(prior: Any, current: Any) -> bool:
+    return (
+        prior.session_id != current.session_id
+        and prior.launch_id != current.launch_id
+        and prior.session_pid != current.session_pid
+        and prior.session_starttime_ticks != current.session_starttime_ticks
+        and (
+            prior.session_token_commitment_sha256
+            != current.session_token_commitment_sha256
+        )
+        and prior.launch_nonce != current.launch_nonce
+        and prior.launch_instance_sha256 != current.launch_instance_sha256
+        and prior.launch_binding_sha256 != current.launch_binding_sha256
+        and (prior.process_corroboration_sha256 != current.process_corroboration_sha256)
+        and prior.receipt_sha256 != current.receipt_sha256
+    )
+
+
+def _reference_replays_any(candidate: Any, historical: tuple[Any, ...]) -> bool:
+    for reference in historical:
+        if (
+            candidate.session_id == reference.session_id
+            or candidate.launch_id == reference.launch_id
+            or (
+                candidate.session_token_commitment_sha256
+                == reference.session_token_commitment_sha256
+            )
+            or candidate.launch_nonce == reference.launch_nonce
+            or candidate.receipt_sha256 == reference.receipt_sha256
+        ):
+            return True
+    return False
+
+
+def _append_unique_reference(references: list[Any], reference: Any) -> None:
+    if all(reference != existing for existing in references):
+        references.append(reference)
+
+
+def _lineage_replay_references(
+    lineage: _RunReceiptLineage | None,
+) -> tuple[Any, ...]:
+    references: list[Any] = []
+    if lineage is not None:
+        for entry in lineage.entries:
+            _append_unique_reference(references, entry.prior_reference)
+            _append_unique_reference(references, entry.current_reference)
+    return tuple(references)
+
+
+def _snapshot_digest(snapshot: RunReceiptAuditSnapshot) -> str:
+    return hashlib.sha256(snapshot.canonical).hexdigest()
+
+
+def _parse_run_receipt_lineage(
+    value: object,
+    *,
+    head: RunReceiptAuditSnapshot,
+    operation: str,
+) -> _RunReceiptLineage:
+    from core.startup.runtime_receipt.canonical import canonical_bytes
+
+    envelope_keys = frozenset({"schema", "schema_version", "entries"})
+    row_keys = frozenset(
+        {
+            "segment",
+            "resumed_at_utc",
+            "relation",
+            "prior_snapshot_sha256",
+            "current_snapshot_sha256",
+            "prior_reference",
+            "current_reference",
+        }
+    )
+    try:
+        if not isinstance(value, dict) or set(value) != envelope_keys:
+            raise ValueError("lineage envelope keys are not exact")
+        canonical = canonical_bytes(value)
+    except (TypeError, UnicodeError, ValueError, RecursionError):
+        raise _lineage_error(operation=operation) from None
+    if len(canonical) > MAX_RUN_RECEIPT_LINEAGE_BYTES:
+        raise _receipt_error(
+            RunReceiptReason.METADATA_OVERSIZED,
+            operation=operation,
+        )
+    if (
+        type(value["schema"]) is not str
+        or value["schema"] != RUN_RECEIPT_LINEAGE_SCHEMA
+        or type(value["schema_version"]) is not int
+        or value["schema_version"] != RUN_RECEIPT_LINEAGE_SCHEMA_VERSION
+    ):
+        raise _lineage_error(operation=operation)
+    raw_entries = value["entries"]
+    if (
+        not isinstance(raw_entries, list)
+        or not raw_entries
+        or len(raw_entries) > MAX_RUN_RECEIPT_LINEAGE_ENTRIES
+    ):
+        raise _lineage_error(operation=operation)
+
+    parsed_entries: list[_RunReceiptLineageEntry] = []
+    seen_references: list[Any] = []
+    previous_reference: Any | None = None
+    previous_snapshot_sha256: str | None = None
+    previous_timestamp: datetime | None = None
+    for index, raw_entry in enumerate(raw_entries):
+        try:
+            if not isinstance(raw_entry, dict) or set(raw_entry) != row_keys:
+                raise ValueError("lineage row keys are not exact")
+            row_canonical = canonical_bytes(raw_entry)
+        except (TypeError, UnicodeError, ValueError, RecursionError):
+            raise _lineage_error(operation=operation) from None
+        if len(row_canonical) > MAX_RUN_RECEIPT_LINEAGE_ROW_BYTES:
+            raise _receipt_error(
+                RunReceiptReason.METADATA_OVERSIZED,
+                operation=operation,
+            )
+
+        segment = raw_entry["segment"]
+        relation = raw_entry["relation"]
+        prior_digest = raw_entry["prior_snapshot_sha256"]
+        current_digest = raw_entry["current_snapshot_sha256"]
+        if type(segment) is not int or segment != index + 2:
+            raise _lineage_error(
+                operation=operation,
+                subordinate="segment",
+            )
+        if type(relation) is not str or relation not in _RUN_RECEIPT_LINEAGE_RELATIONS:
+            raise _lineage_error(
+                operation=operation,
+                subordinate="relation",
+            )
+        if (
+            type(prior_digest) is not str
+            or _RUN_RECEIPT_SHA256_RE.fullmatch(prior_digest) is None
+            or type(current_digest) is not str
+            or _RUN_RECEIPT_SHA256_RE.fullmatch(current_digest) is None
+        ):
+            raise _lineage_error(
+                operation=operation,
+                subordinate="digest",
+            )
+        timestamp = _parse_lineage_timestamp(
+            raw_entry["resumed_at_utc"],
+            operation=operation,
+        )
+        if previous_timestamp is not None and timestamp <= previous_timestamp:
+            raise _lineage_error(
+                operation=operation,
+                subordinate="timestamp",
+            )
+        prior_reference = _parse_lineage_reference(
+            raw_entry["prior_reference"],
+            operation=operation,
+        )
+        current_reference = _parse_lineage_reference(
+            raw_entry["current_reference"],
+            operation=operation,
+        )
+        if not _references_share_lineage_identity(
+            head.reference,
+            prior_reference,
+        ) or not _references_share_lineage_identity(
+            head.reference,
+            current_reference,
+        ):
+            raise _lineage_error(
+                operation=operation,
+                subordinate="identity",
+            )
+        if previous_reference is not None and (
+            prior_reference != previous_reference
+            or not secrets.compare_digest(
+                prior_digest,
+                previous_snapshot_sha256 or "",
+            )
+        ):
+            raise _lineage_error(
+                operation=operation,
+                subordinate="chain",
+            )
+
+        replay_history = list(seen_references)
+        _append_unique_reference(replay_history, prior_reference)
+        if relation == "exact":
+            if prior_reference != current_reference or not secrets.compare_digest(
+                prior_digest, current_digest
+            ):
+                raise _lineage_error(
+                    operation=operation,
+                    subordinate="relation",
+                )
+        elif (
+            _reference_replays_any(
+                current_reference,
+                tuple(replay_history),
+            )
+            or not _references_share_lineage_identity(
+                prior_reference,
+                current_reference,
+            )
+            or not _reference_generation_is_distinct(
+                prior_reference,
+                current_reference,
+            )
+            or secrets.compare_digest(prior_digest, current_digest)
+        ):
+            raise _lineage_error(
+                operation=operation,
+                subordinate="relation",
+            )
+
+        parsed_entries.append(
+            _RunReceiptLineageEntry(
+                segment=segment,
+                resumed_at_utc=raw_entry["resumed_at_utc"],
+                resumed_at=timestamp,
+                relation=relation,
+                prior_snapshot_sha256=prior_digest,
+                current_snapshot_sha256=current_digest,
+                prior_reference=prior_reference,
+                current_reference=current_reference,
+            )
+        )
+        _append_unique_reference(seen_references, prior_reference)
+        _append_unique_reference(seen_references, current_reference)
+        previous_reference = current_reference
+        previous_snapshot_sha256 = current_digest
+        previous_timestamp = timestamp
+
+    final_entry = parsed_entries[-1]
+    if final_entry.current_reference != head.reference or not secrets.compare_digest(
+        final_entry.current_snapshot_sha256,
+        _snapshot_digest(head),
+    ):
+        raise _lineage_error(
+            operation=operation,
+            subordinate="head",
+        )
+    return _RunReceiptLineage(
+        entries=tuple(parsed_entries),
+        canonical=canonical,
+    )
+
+
+def _receipt_resume_rows(
+    metadata: Mapping[str, object],
+    *,
+    operation: str,
+) -> list[object]:
+    extra = metadata.get("extra")
+    if extra is None:
+        return []
+    if not isinstance(extra, dict):
+        raise _receipt_error(
+            RunReceiptReason.METADATA_INVALID,
+            operation=operation,
+        )
+    resumes = extra.get("resumes")
+    if resumes is None:
+        return []
+    if not isinstance(resumes, list):
+        raise _receipt_error(
+            RunReceiptReason.METADATA_INVALID,
+            operation=operation,
+        )
+    return resumes
+
+
+def _parse_receipt_metadata(
+    strict: _StrictRunMetadata,
+    *,
+    operation: str,
+) -> _ParsedReceiptMetadata:
+    meta = strict.value
+    _reject_reserved_mapping(meta.get("extra"), operation=operation)
+    has_snapshot = RUN_RUNTIME_RECEIPT_KEY in meta
+    has_lineage = RUN_RUNTIME_RECEIPT_LINEAGE_KEY in meta
+    if has_lineage and not has_snapshot:
+        raise _lineage_error(operation=operation)
+    if not has_snapshot:
+        return _ParsedReceiptMetadata(snapshot=None, lineage=None)
+    snapshot = _parse_run_receipt_snapshot(
+        meta[RUN_RUNTIME_RECEIPT_KEY],
+        operation=operation,
+    )
+    resumes = _receipt_resume_rows(meta, operation=operation)
+    if not has_lineage:
+        if resumes:
+            raise _lineage_error(
+                operation=operation,
+                subordinate="legacy_resume_history",
+            )
+        return _ParsedReceiptMetadata(snapshot=snapshot, lineage=None)
+    lineage = _parse_run_receipt_lineage(
+        meta[RUN_RUNTIME_RECEIPT_LINEAGE_KEY],
+        head=snapshot,
+        operation=operation,
+    )
+    return _ParsedReceiptMetadata(snapshot=snapshot, lineage=lineage)
+
+
+def compare_run_runtime_receipt(
+    metadata_snapshot: RunReceiptAuditSnapshot | None,
+    current_capture: object | None,
+    *,
+    operation: str,
+    lineage: _RunReceiptLineage | None,
+) -> RunReceiptComparison:
+    """Compare explicit receipt state; every positive is non-authorizing."""
+    from core.project.sessions import SessionRuntimeReceiptCapture
+    from core.startup.runtime_receipt.plumbing_types import (
+        ReceiptComparatorInput,
+        ReceiptComparisonResult,
+        RuntimeReceiptSnapshot,
+        authority_invariant_failure,
+        compare_receipt_snapshot,
+        serialize_snapshot,
+    )
+
+    if operation not in {"start", "resume"}:
+        raise ValueError("operation must be start or resume")
+    if lineage is not None and (
+        type(lineage) is not _RunReceiptLineage or lineage.authoritative is not False
+    ):
+        return RunReceiptComparison(
+            RunReceiptComparisonResult.LINEAGE_INVALID,
+            None,
+        )
+    if metadata_snapshot is None and lineage is not None:
+        return RunReceiptComparison(
+            RunReceiptComparisonResult.LINEAGE_INVALID,
+            None,
+        )
+    if metadata_snapshot is None and current_capture is None:
+        return RunReceiptComparison(
+            RunReceiptComparisonResult.ABSENT_BOTH,
+            None,
+        )
+    if metadata_snapshot is None:
+        result = (
+            RunReceiptComparisonResult.NEW_SNAPSHOT_NON_AUTHORIZING
+            if operation == "start"
+            else RunReceiptComparisonResult.REGISTRY_ONLY
+        )
+        return RunReceiptComparison(result, None)
+    if type(metadata_snapshot) is not RunReceiptAuditSnapshot:
+        return RunReceiptComparison(
+            RunReceiptComparisonResult.METADATA_INVALID,
+            None,
+        )
+    try:
+        metadata_snapshot.__post_init__()
+        if type(current_capture) is SessionRuntimeReceiptCapture:
+            current_capture.__post_init__()
+    except (TypeError, ValueError):
+        return RunReceiptComparison(
+            RunReceiptComparisonResult.AUTHORITY_INVALID,
+            None,
+        )
+    if (
+        metadata_snapshot.authoritative is not False
+        or type(current_capture) is not SessionRuntimeReceiptCapture
+        or current_capture.authoritative is not False
+        or authority_invariant_failure(
+            current_capture.snapshot,
+            RuntimeReceiptSnapshot,
+        )
+        is not None
+    ):
+        return RunReceiptComparison(
+            RunReceiptComparisonResult.AUTHORITY_INVALID,
+            None,
+        )
+    exact = compare_receipt_snapshot(
+        ReceiptComparatorInput(
+            current_capture.snapshot,
+            current_capture.reference,
+            current_capture.snapshot.receipt,
+        )
+    )
+    if exact is not ReceiptComparisonResult.MATCH_NON_AUTHORIZING:
+        if exact is ReceiptComparisonResult.AUTHORITY_INVALID:
+            result = RunReceiptComparisonResult.AUTHORITY_INVALID
+        elif exact is ReceiptComparisonResult.PROFILE_MISMATCH:
+            result = RunReceiptComparisonResult.PROFILE_MISMATCH
+        elif exact is ReceiptComparisonResult.STABLE_IDENTITY_MISMATCH:
+            result = RunReceiptComparisonResult.STABLE_IDENTITY_MISMATCH
+        elif operation == "resume":
+            result = RunReceiptComparisonResult.LAUNCH_INSTANCE_INVALID
+        else:
+            result = RunReceiptComparisonResult.LAUNCH_INSTANCE_MISMATCH
+        return RunReceiptComparison(result, exact)
+    if metadata_snapshot.reference.profile_id != current_capture.reference.profile_id:
+        return RunReceiptComparison(
+            RunReceiptComparisonResult.PROFILE_MISMATCH,
+            None,
+        )
+    if (
+        metadata_snapshot.reference.stable_identity_sha256
+        != current_capture.reference.stable_identity_sha256
+    ):
+        return RunReceiptComparison(
+            RunReceiptComparisonResult.STABLE_IDENTITY_MISMATCH,
+            None,
+        )
+    if (
+        metadata_snapshot.receipt.stable_identity
+        != current_capture.snapshot.receipt.stable_identity
+    ):
+        return RunReceiptComparison(
+            RunReceiptComparisonResult.STABLE_IDENTITY_MISMATCH,
+            None,
+        )
+    current_raw = serialize_snapshot(current_capture.snapshot)
+    if secrets.compare_digest(metadata_snapshot.canonical, current_raw):
+        return RunReceiptComparison(
+            RunReceiptComparisonResult.MATCH_NON_AUTHORIZING,
+            exact,
+        )
+    if operation == "start":
+        return RunReceiptComparison(
+            RunReceiptComparisonResult.LAUNCH_INSTANCE_MISMATCH,
+            exact,
+        )
+    if _reference_replays_any(
+        current_capture.reference,
+        _lineage_replay_references(lineage),
+    ):
+        return RunReceiptComparison(
+            RunReceiptComparisonResult.LAUNCH_REPLAY,
+            exact,
+        )
+    if not _references_share_lineage_identity(
+        metadata_snapshot.reference,
+        current_capture.reference,
+    ) or not _reference_generation_is_distinct(
+        metadata_snapshot.reference,
+        current_capture.reference,
+    ):
+        return RunReceiptComparison(
+            RunReceiptComparisonResult.LAUNCH_INSTANCE_INVALID,
+            exact,
+        )
+    return RunReceiptComparison(
+        RunReceiptComparisonResult.RESUME_MATCH_NON_AUTHORIZING,
+        exact,
+    )
+
+
+def _metadata_file_has_receipt_state(path: Path) -> bool:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return False
+    try:
+        value_stat = os.fstat(fd)
+        if not stat.S_ISREG(value_stat.st_mode):
+            return True
+        if value_stat.st_size > MAX_RUN_METADATA_BYTES:
+            return True
+        chunks: list[bytes] = []
+        remaining = MAX_RUN_METADATA_BYTES + 1
+        while remaining:
+            chunk = os.read(fd, min(65_536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    if len(raw) > MAX_RUN_METADATA_BYTES:
+        return True
+    try:
+        value = loads_bounded(
+            raw,
+            max_bytes=MAX_RUN_METADATA_BYTES,
+            reject_duplicate_keys=False,
+        )
+    except (UnicodeError, ValueError, RecursionError):
+        return any(
+            json.dumps(key).encode("ascii") in raw
+            for key in _RUN_RECEIPT_RESERVED_EXTRA_KEYS
+        )
+    if isinstance(value, dict) and _metadata_contains_reserved_input(value):
+        return True
+    return False
+
+
+def _receipt_branch_selected(path: Path) -> bool:
+    from core.project.sessions import (
+        SessionHostV2CredentialState,
+        session_host_v2_credential_state,
+    )
+
+    state = session_host_v2_credential_state()
+    return (
+        state is SessionHostV2CredentialState.MATCHING_HOST_V2
+        or _metadata_file_has_receipt_state(path)
+    )
+
+
+def _capture_current_run_receipt(*, operation: str, now: datetime):
+    from core.project.sessions import capture_current_session_runtime_receipt
+    from core.startup.runtime_receipt.plumbing_types import (
+        PlumbingDisposition,
+        PlumbingFailure,
+        PlumbingReason,
+    )
+    from core.startup.runtime_receipt.profile import (
+        DEFAULT_PROFILE_DIRECTORY,
+        load_profile_store,
+    )
+    from core.startup.runtime_receipt.reasons import ReceiptRejection
+
+    profiles = load_profile_store(DEFAULT_PROFILE_DIRECTORY)
+    if isinstance(profiles, ReceiptRejection):
+        comparison = RunReceiptComparison(
+            RunReceiptComparisonResult.REGISTRY_INVALID,
+            None,
+        )
+        raise _receipt_error(
+            RunReceiptReason.REGISTRY_INVALID,
+            operation=operation,
+            comparison=comparison,
+            subordinate=profiles.reason_codes[0].value,
+        )
+    captured = capture_current_session_runtime_receipt(
+        profiles=profiles,
+        now=now,
+    )
+    if captured is None:
+        comparison = RunReceiptComparison(
+            RunReceiptComparisonResult.REGISTRY_CHANGED,
+            None,
+        )
+        raise _receipt_error(
+            RunReceiptReason.REGISTRY_CHANGED,
+            operation=operation,
+            comparison=comparison,
+        )
+    if isinstance(captured, PlumbingFailure):
+        first = captured.reason_codes[0]
+        if first is PlumbingReason.STATE_NOT_FINAL:
+            result = RunReceiptComparisonResult.REGISTRY_PENDING
+            reason = RunReceiptReason.REGISTRY_PENDING
+        elif first is PlumbingReason.RECEIPT_STATE_REJECTED:
+            result = RunReceiptComparisonResult.REGISTRY_REJECTED
+            reason = RunReceiptReason.REGISTRY_REJECTED
+        elif first in {
+            PlumbingReason.SIDECAR_MISSING,
+            PlumbingReason.SESSION_ENTRY_MISSING,
+        }:
+            result = RunReceiptComparisonResult.RECEIPT_MISSING
+            reason = RunReceiptReason.RECEIPT_MISSING
+        else:
+            result = RunReceiptComparisonResult.REGISTRY_INVALID
+            reason = RunReceiptReason.REGISTRY_INVALID
+        comparison = RunReceiptComparison(result, None)
+        subordinate = first.value
+        if captured.disposition is PlumbingDisposition.STATE_CONFLICT:
+            comparison = RunReceiptComparison(
+                RunReceiptComparisonResult.REGISTRY_CHANGED,
+                None,
+            )
+            reason = RunReceiptReason.REGISTRY_CHANGED
+        raise _receipt_error(
+            reason,
+            operation=operation,
+            comparison=comparison,
+            subordinate=subordinate,
+        )
+    return captured
+
+
+def _comparison_refusal(
+    comparison: RunReceiptComparison,
+    *,
+    operation: str,
+) -> RunRuntimeReceiptError:
+    result = comparison.result
+    if result is RunReceiptComparisonResult.METADATA_ONLY:
+        reason = RunReceiptReason.RECEIPT_DOWNGRADE_FORBIDDEN
+    elif result is RunReceiptComparisonResult.REGISTRY_ONLY:
+        reason = RunReceiptReason.LEGACY_UPGRADE_FORBIDDEN
+    elif result is RunReceiptComparisonResult.AUTHORITY_INVALID:
+        reason = RunReceiptReason.AUTHORITY_INVALID
+    elif result is RunReceiptComparisonResult.PROFILE_MISMATCH:
+        reason = RunReceiptReason.PROFILE_MISMATCH
+    elif result is RunReceiptComparisonResult.STABLE_IDENTITY_MISMATCH:
+        reason = RunReceiptReason.STABLE_IDENTITY_MISMATCH
+    elif result is RunReceiptComparisonResult.LAUNCH_INSTANCE_MISMATCH:
+        reason = RunReceiptReason.LAUNCH_INSTANCE_MISMATCH
+    elif result is RunReceiptComparisonResult.LINEAGE_INVALID:
+        reason = RunReceiptReason.LINEAGE_INVALID
+    elif result is RunReceiptComparisonResult.LINEAGE_OVERFLOW:
+        reason = RunReceiptReason.LINEAGE_OVERFLOW
+    elif result is RunReceiptComparisonResult.LAUNCH_REPLAY:
+        reason = RunReceiptReason.LAUNCH_REPLAY
+    elif result is RunReceiptComparisonResult.LAUNCH_INSTANCE_INVALID:
+        reason = RunReceiptReason.LAUNCH_INSTANCE_INVALID
+    else:
+        reason = RunReceiptReason.METADATA_INVALID
+    return _receipt_error(
+        reason,
+        operation=operation,
+        comparison=comparison,
+    )
+
+
+def _validate_receipt_project_pin(
+    metadata: Mapping[str, object],
+    *,
+    operation: str,
+) -> str:
+    if (
+        "project" not in metadata
+        or metadata.get("project") is not None
+        or metadata.get("project_source") not in _RUN_RECEIPT_PROJECT_SOURCES
+    ):
+        raise _receipt_error(
+            RunReceiptReason.PROJECT_PIN_MISMATCH,
+            operation=operation,
+        )
+    return str(metadata["project_source"])
+
+
+def _receipt_project_source(*, operation: str) -> str:
+    from core.run.pin import (
+        _process_override_source,
+        get_process_project,
+    )
+
+    override = get_process_project()
+    if override is None:
+        return "session"
+    if override == "-":
+        return _process_override_source()
+    raise _receipt_error(
+        RunReceiptReason.PROJECT_FORBIDDEN,
+        operation=operation,
+    )
+
+
+def _snapshot_json_value(capture: Any) -> dict[str, Any]:
+    from core.startup.runtime_receipt.plumbing_types import serialize_snapshot
+
+    value = json.loads(serialize_snapshot(capture.snapshot))
+    if not isinstance(value, dict):
+        raise AssertionError("serialized receipt snapshot must be an object")
+    return value
+
+
+def _audit_snapshot_json_value(
+    snapshot: RunReceiptAuditSnapshot,
+) -> dict[str, Any]:
+    value = json.loads(snapshot.canonical)
+    if not isinstance(value, dict):
+        raise AssertionError("audit receipt snapshot must be an object")
+    return value
+
+
+def _capture_audit_snapshot(capture: Any) -> RunReceiptAuditSnapshot:
+    from core.startup.runtime_receipt.plumbing_types import serialize_snapshot
+
+    return RunReceiptAuditSnapshot(
+        reference=capture.reference,
+        receipt=capture.snapshot.receipt,
+        canonical=serialize_snapshot(capture.snapshot),
+    )
+
+
+def _lineage_json_value(
+    lineage: _RunReceiptLineage,
+) -> dict[str, Any]:
+    value = json.loads(lineage.canonical)
+    if not isinstance(value, dict):
+        raise AssertionError("run receipt lineage must be an object")
+    return value
+
+
+def _reference_json_value(reference: Any) -> dict[str, Any]:
+    from core.startup.runtime_receipt.plumbing_types import serialize_reference
+
+    value = json.loads(serialize_reference(reference))
+    if not isinstance(value, dict):
+        raise AssertionError("receipt reference must be an object")
+    return value
+
+
+def _lineage_resume_timestamp(
+    now: datetime,
+    *,
+    lineage: _RunReceiptLineage | None,
+    operation: str,
+) -> str:
+    if getattr(now, "tzinfo", None) is None:
+        raise _lineage_error(
+            operation=operation,
+            subordinate="timestamp",
+        )
+    try:
+        value = now.astimezone(timezone.utc).isoformat(timespec="microseconds")
+    except (AttributeError, TypeError, ValueError):
+        raise _lineage_error(
+            operation=operation,
+            subordinate="timestamp",
+        ) from None
+    parsed = _parse_lineage_timestamp(value, operation=operation)
+    if lineage is not None and parsed <= lineage.entries[-1].resumed_at:
+        raise _lineage_error(
+            operation=operation,
+            subordinate="timestamp",
+        )
+    return value
+
+
+def _append_receipt_lineage(
+    lineage: _RunReceiptLineage | None,
+    *,
+    prior: RunReceiptAuditSnapshot,
+    current: RunReceiptAuditSnapshot,
+    relation: str,
+    now: datetime,
+    operation: str,
+) -> tuple[_RunReceiptLineage, int, str]:
+    if lineage is None:
+        entries: list[dict[str, Any]] = []
+    else:
+        lineage_value = _lineage_json_value(lineage)
+        entries = copy.deepcopy(lineage_value["entries"])
+    if len(entries) >= MAX_RUN_RECEIPT_LINEAGE_ENTRIES:
+        raise _lineage_overflow_error(
+            operation=operation,
+            segment=len(entries) + 2,
+        )
+    segment = len(entries) + 2
+    resumed_at_utc = _lineage_resume_timestamp(
+        now,
+        lineage=lineage,
+        operation=operation,
+    )
+    entries.append(
+        {
+            "segment": segment,
+            "resumed_at_utc": resumed_at_utc,
+            "relation": relation,
+            "prior_snapshot_sha256": _snapshot_digest(prior),
+            "current_snapshot_sha256": _snapshot_digest(current),
+            "prior_reference": _reference_json_value(prior.reference),
+            "current_reference": _reference_json_value(current.reference),
+        }
+    )
+    value = {
+        "schema": RUN_RECEIPT_LINEAGE_SCHEMA,
+        "schema_version": RUN_RECEIPT_LINEAGE_SCHEMA_VERSION,
+        "entries": entries,
+    }
+    parsed = _parse_run_receipt_lineage(
+        value,
+        head=current,
+        operation=operation,
+    )
+    return parsed, segment, resumed_at_utc
+
+
+def _serialize_receipt_run_metadata(
+    metadata: dict[str, Any],
+    *,
+    operation: str,
+) -> bytes:
+    try:
+        raw = (dumps_artifact(metadata, indent=2, ensure_ascii=False) + "\n").encode(
+            "utf-8"
+        )
+    except (TypeError, ValueError, RecursionError):
+        raise _receipt_error(
+            RunReceiptReason.METADATA_INVALID,
+            operation=operation,
+        ) from None
+    if len(raw) > MAX_RUN_METADATA_BYTES:
+        raise _receipt_error(
+            RunReceiptReason.METADATA_OVERSIZED,
+            operation=operation,
+        )
+    try:
+        parsed = loads_bounded(
+            raw,
+            max_bytes=MAX_RUN_METADATA_BYTES,
+            reject_duplicate_keys=True,
+        )
+    except (JsonBudgetExceededError, UnicodeError, ValueError, RecursionError):
+        raise _receipt_error(
+            RunReceiptReason.METADATA_INVALID,
+            operation=operation,
+        ) from None
+    if not isinstance(parsed, dict):
+        raise _receipt_error(
+            RunReceiptReason.METADATA_INVALID,
+            operation=operation,
+        )
+    return raw
+
+
+def _receipt_temporary_path(path: Path) -> Path:
+    suffix = secrets.token_hex(8)
+    return path.with_name(
+        f".{path.name}.receipt.{os.getpid()}.{threading.get_ident()}.{suffix}.tmp"
+    )
+
+
+def _remove_receipt_owner_fields(metadata: dict[str, Any]) -> None:
+    from core.startup.host import RUN_HOST_KEYS
+
+    for key in (
+        "session_pid",
+        "tool_pid",
+        "tool_pid_start",
+        "session_start",
+        "session_boot_id",
+        "session_pidns",
+        "session_machine_id",
+        "session_id",
+        *RUN_HOST_KEYS,
+    ):
+        metadata.pop(key, None)
 
 
 def _session_alive_for_meta(meta: dict) -> bool:
     """Is the session that owns this run metadata still alive?
 
-    Stamped metadata (``session_start`` + ``session_boot_id``) gets the
-    full identity check: a live claude process at the recorded pid with
-    a MISMATCHING stamp is a recycled pid — the owner is dead. Foreign
-    stamps (other boot / machine / pid namespace) are unverifiable here
-    and read as ALIVE — the fail-open direction: sweeps skip rather
-    than fail a run they cannot judge, and the gate preserves
-    contention. Unstamped (pre-series) metadata keeps the legacy
-    comm-checked ``_pid_alive`` — also fail-open.
+    Boolean projection of :func:`_session_liveness_for_meta` —
+    ``foreign`` (unverifiable) reads as alive: the fail-open direction
+    for sweeps (skip rather than fail a run they cannot judge). The
+    contention GATE consumes the tri-state directly so an unverifiable
+    holder does not block new runs forever.
     """
+    return _session_liveness_for_meta(meta) != "dead"
+
+
+def _session_liveness_for_meta(meta: dict) -> str:
+    """Liveness verdict for the session that owns this run metadata:
+    ``"alive"`` / ``"dead"`` / ``"foreign"`` (unverifiable).
+
+    Stamped metadata (``session_start`` + ``session_boot_id``) gets the
+    full identity check: a live frontend process at the recorded pid
+    with a MISMATCHING stamp is a recycled pid — the owner is dead.
+    Strong host metadata is corroborated against the launcher-owned
+    registry entry by token presence/shape plus exact claim/stamp
+    equality; this liveness reader does NOT possess or match the secret
+    token and therefore does not authenticate a caller. The caller-owner
+    path separately resolves the PID through the env credential, where
+    the token is matched, before lifecycle ownership is checked. Foreign
+    stamps (other boot / machine / pid namespace) are unverifiable here
+    and return ``"foreign"`` — consumers choose the fail direction
+    (sweeps treat it as alive; the contention gate applies an age
+    ceiling, see ``_live_conflicting_run``). Exception: a stamp from a
+    PRIOR BOOT of this same machine (``session_machine_id`` matches,
+    boot_id differs) is provably dead — see ``_prior_boot_entry``.
+    Unstamped (pre-series) metadata keeps the legacy comm-checked
+    ``_pid_alive`` — alive/dead only, never foreign.
+    """
+    if not _metadata_allows_legacy_attribution(meta):
+        return "dead"
     pid = meta.get("session_pid")
     if isinstance(pid, str) and pid.isascii() and pid.isdigit():
         pid = int(pid)  # stringified pid: read like the hooks do
     if not isinstance(pid, int) or isinstance(pid, bool):
-        return False
+        return "dead"
+    from core.startup.host import (
+        HostClaimError,
+        parse_metadata_host_claim,
+    )
+    try:
+        host_claim = parse_metadata_host_claim(meta)
+    except HostClaimError as exc:
+        logger.warning(
+            "run metadata has a malformed session host claim — "
+            "refusing liveness authority: %s", exc
+        )
+        return "dead"
     start = meta.get("session_start")
     boot = meta.get("session_boot_id")
+    if host_claim is not None and not (start and boot):
+        logger.warning(
+            "run metadata has host evidence without a complete process "
+            "stamp — refusing liveness authority"
+        )
+        return "dead"
     if start and boot:
         from core.project import sessions as _sessions
         fields = {"starttime": str(start), "boot_id": str(boot)}
         pidns = meta.get("session_pidns")
         if pidns:
             fields["pidns"] = str(pidns)
+        machine = meta.get("session_machine_id")
+        if machine:
+            fields["machine_id"] = str(machine)
+        if host_claim is not None:
+            # Strong metadata is not self-authenticating: pid/start/uid/inode
+            # are observable and a sibling run file is attacker-influenced.
+            # Corroborate the exact launcher-owned registry entry (including
+            # the token's presence) before accepting liveness.
+            entry = _sessions._parse_entry(
+                _sessions._sessions_dir() / str(pid)
+            )
+            if entry.get("v") != _sessions.ENTRY_VERSION:
+                return "dead"
+            token = entry.get("token", "")
+            if (len(token) != 32
+                    or any(ch not in "0123456789abcdef" for ch in token)):
+                return "dead"
+            try:
+                from core.startup.host import parse_session_host_claim
+                entry_claim = parse_session_host_claim(entry)
+            except HostClaimError as exc:
+                logger.warning(
+                    "session registry has a malformed host claim for "
+                    "pid %d — refusing liveness: %s", pid, exc
+                )
+                return "dead"
+            if entry_claim != host_claim:
+                return "dead"
+            for meta_key, entry_key in (
+                ("session_start", "starttime"),
+                ("session_boot_id", "boot_id"),
+                ("session_pidns", "pidns"),
+            ):
+                entry_value = entry.get(entry_key)
+                if entry_value and meta_key not in meta:
+                    return "dead"
+                if (meta_key in meta
+                        and str(meta[meta_key]) != entry_value):
+                    return "dead"
+            fields = entry
         if _sessions._foreign_entry(fields):
-            return True  # unverifiable — fail open
-        return _sessions._identity_matches(pid, fields)
-    return _pid_alive(pid)
+            # One foreign shape IS decidable: a stamp carrying THIS
+            # machine's identity but another boot_id was written
+            # during a prior boot of this machine — its process
+            # cannot be alive anywhere. Without this, every crashed
+            # run's meta read foreign→alive forever after a reboot:
+            # permanent status=running zombies that also held the
+            # project run-contention gate.
+            if _sessions._prior_boot_entry(fields):
+                return "dead"  # prior boot of this machine — dead
+            return "foreign"  # unverifiable
+        return ("alive" if _sessions._identity_matches(pid, fields)
+                else "dead")
+    return "alive" if _pid_alive(pid) else "dead"
+
+
+def _metadata_owned_by_session(meta: dict, session_pid: int) -> bool:
+    """Whether *meta* belongs to the exact current session owner.
+
+    Legacy metadata keeps its historical pid-based behavior, augmented by an
+    exact stamp comparison when both sides carry one. Strong host metadata
+    must match a currently verified registry entry field-for-field; a stale,
+    malformed, duplicate, or foreign record cannot drive lifecycle hooks.
+    """
+    if not _metadata_allows_legacy_attribution(meta):
+        return False
+    try:
+        from core.project.sessions import (
+            SessionHostV2CredentialState,
+            session_host_v2_credential_state,
+        )
+
+        if (
+            session_host_v2_credential_state()
+            is SessionHostV2CredentialState.MATCHING_HOST_V2
+        ):
+            return False
+    except Exception:  # noqa: BLE001 — ownership checks fail closed
+        logger.debug("host-v2 credential ownership veto failed", exc_info=True)
+        return False
+    owner = meta.get("session_pid")
+    if isinstance(owner, str) and owner.isascii() and owner.isdigit():
+        owner = int(owner)
+    if (not isinstance(owner, int) or isinstance(owner, bool)
+            or owner != session_pid):
+        return False
+
+    from core.project import sessions as _sessions
+    from core.startup.host import (
+        HostClaimError,
+        parse_metadata_host_claim,
+        parse_session_host_claim,
+    )
+
+    try:
+        meta_claim = parse_metadata_host_claim(meta)
+    except HostClaimError as exc:
+        logger.warning(
+            "run metadata has a malformed session host claim — "
+            "refusing ownership: %s", exc
+        )
+        return False
+
+    fields = _sessions._parse_entry(
+        _sessions._sessions_dir() / str(session_pid)
+    )
+    if not fields:
+        return meta_claim is None
+    if fields.get("v") == _sessions.ENTRY_VERSION:
+        if not _sessions._identity_matches(session_pid, fields):
+            return False
+        try:
+            entry_claim = parse_session_host_claim(fields)
+        except HostClaimError as exc:
+            logger.warning(
+                "session registry has a malformed host claim for pid %d — "
+                "refusing run ownership: %s", session_pid, exc
+            )
+            return False
+        if meta_claim is not None:
+            if entry_claim is None or meta_claim != entry_claim:
+                return False
+        elif (entry_claim is not None
+              and entry_claim.frontend.value != "claude"):
+            # Host-less run metadata retains only the historical Claude
+            # strength. It must never become Copilot authority merely because
+            # a current strong Copilot record happens to reuse the pid.
+            return False
+        for meta_key, entry_key in (
+            ("session_start", "starttime"),
+            ("session_boot_id", "boot_id"),
+            ("session_pidns", "pidns"),
+        ):
+            if meta_key in meta and str(meta[meta_key]) != fields.get(entry_key):
+                return False
+    return True
 
 
 def _pid_alive(pid: int) -> bool:
@@ -294,7 +2179,13 @@ def _pid_alive(pid: int) -> bool:
     accepts the residual PID-reuse risk on macOS/BSD where the
     canonical /proc isn't available.
     """
-    if pid <= 0:
+    if pid <= 1:
+        # PID 1 (init) can never be a claude session, and the EPERM
+        # path below returns alive BEFORE the comm cross-check — a
+        # reparented-to-init record (session_pid=1, written by a
+        # detached launch before the recorder refused such pids) read
+        # as a live owner forever, so its abandoned runs were never
+        # swept.
         return False
     try:
         os.kill(pid, 0)
@@ -333,6 +2224,19 @@ def _run_recently_active(run_dir: Path) -> bool:
     its real completion. Scan errors read as active (fail toward
     keeping: a wrongly-kept abandon is relabelled by a later sweep; a
     wrongly-failed live run misfiles paid results).
+
+    mtime caveat (WSL drvfs/9p, no behaviour change): on a
+    Windows-interop mount the mtimes read here pass through the 9p
+    attribute cache — same-client writes stay coherent, but another
+    client's writes (Windows side, another distro) can surface late,
+    which would read a cross-client-active run as quiet. Every caller
+    of this probe (the same-session abandon sweep, the foreign-holder
+    contention ceiling, project clean's liveness check) runs in the
+    same distro — one 9p client — as the run's usual writers, so the
+    signal holds; the one caller that contemplates writers elsewhere
+    (the foreign-holder ceiling's cross-machine leg) already fails
+    open on activity-probe imprecision by its own doctrine. See
+    docs/wsl.md.
     """
     import time
 
@@ -347,22 +2251,31 @@ def _run_recently_active(run_dir: Path) -> bool:
     return _recent_activity(Path(run_dir), now, _ABANDON_ACTIVITY_GRACE_S)
 
 
-def _tool_pid_alive(pid: Any) -> bool:
+def _tool_pid_alive(pid: Any, starttime: Any = None) -> bool:
     """Liveness check for a run's recorded ``tool_pid`` (the worker
     process that called ``start_run`` — a Bash-tool shell, a Python
     orchestrator, etc.).
 
     Unlike :func:`_pid_alive` there is NO ``comm == claude`` cross-check:
-    the tool process is deliberately NOT a claude binary. Plain
-    ``kill(pid, 0)`` accepts a residual PID-reuse risk, but the failure
-    direction is safe — a reused PID keeps a genuinely abandoned run in
-    ``running`` state until its owning session dies (the dead-session
-    branch then sweeps it), whereas a false "dead" would fail a live run.
+    the tool process is deliberately NOT a claude binary. The identity
+    axis is *starttime*: when the record carries a ``tool_pid_start``
+    stamp, alive requires the live process's ``/proc/<pid>/stat``
+    starttime to MATCH — a recycled pid means the original worker is
+    dead. Legacy records (no stamp) keep the plain ``kill(pid, 0)``
+    probe with its residual pid-reuse risk; that failure direction is
+    safe — a reused PID keeps a genuinely abandoned run in ``running``
+    state until its owning session dies (the dead-session branch then
+    sweeps it), whereas a false "dead" would fail a live run.
+
+    ``pid <= 1`` is NEVER live evidence — PID 1 is always alive, so a
+    reparented-to-init record (detached setsid/nohup launch) wedged the
+    resume/compact guards into refusing forever. This rejection applies
+    to legacy records too: init never called ``start_run``.
 
     Missing / malformed pids return False so legacy metadata (written
     before ``tool_pid`` was recorded) falls back to the old behaviour.
     """
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
         return False
     try:
         os.kill(pid, 0)
@@ -371,8 +2284,124 @@ def _tool_pid_alive(pid: Any) -> bool:
     except OverflowError:
         return False  # beyond pid_t — see _pid_alive
     except PermissionError:
-        return True  # alive but owned by another user
+        # Alive but owned by another user — the identity check below
+        # still works: /proc/<pid>/stat is world-readable.
+        pass
+    stamp = _valid_starttime(starttime)
+    if stamp is not None:
+        from core.project import sessions as _sessions
+        live = _sessions.proc_starttime(pid)
+        if live is not None:
+            return live == stamp
+        # Unverifiable (off-Linux reader of a Linux-stamped record, or
+        # the process exited between the kill probe and the /proc
+        # read racing a same-instant pid recycle): keep the bare-alive
+        # verdict — the legacy posture. Fail direction: guards refuse
+        # once and succeed on retry; sweeps skip and re-judge later.
     return True
+
+
+def _valid_starttime(value: Any) -> str | None:
+    """Canonical form of a recorded ``tool_pid_start`` stamp, or
+    ``None`` for anything malformed.
+
+    The stamp lives in sandbox-writable metadata, so its type and
+    content are plantable. A malformed stamp must degrade to the
+    LEGACY (bare-pid) semantics, never to "identity mismatch, worker
+    dead": comparing a stringified non-numeric value against the live
+    starttime always mismatches, which would let a planted stamp
+    defeat the in-flight guards on a genuinely live worker — the
+    fail-open direction. The recorder only ever writes the decimal
+    string from ``/proc/<pid>/stat``; the int form is accepted too (a
+    hand-repaired record survives a JSON round-trip as int), nothing
+    else.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and value >= 0:
+        return str(value)
+    if isinstance(value, str) and value.isascii() and value.isdigit():
+        return value
+    return None
+
+
+_PID1_NOTE_EMITTED = False
+
+
+def _pid1_noted() -> bool:
+    """True when this process already warned about a pid-1 record
+    (later occurrences demote to debug)."""
+    global _PID1_NOTE_EMITTED
+    was = _PID1_NOTE_EMITTED
+    _PID1_NOTE_EMITTED = True
+    return was
+
+
+def worker_liveness_for_meta(meta: dict) -> tuple[bool, str]:
+    """Liveness verdict for a run's recorded worker, with a detail
+    line naming exactly what was checked — the in-flight guards quote
+    it in their refusals so the operator can see which evidence drove
+    the decision (a bare "worker is alive" was undiagnosable when the
+    evidence was PID 1).
+
+    The meta-level chokepoint for worker liveness: every consumer
+    that judges a recorded WORKER (the resume guard, the
+    journal-compact guard, the abandon sweep, the clean-safety
+    predicate, the lifecycle hook's finalizer) routes here so none
+    re-invents bare-pid semantics. The run-start contention gate is
+    deliberately NOT a consumer — it contends on SESSION identity
+    (see ``_live_conflicting_run``), and a sessionless run holds no
+    contention, before or after worker stamps existed.
+    Rules (see :func:`_tool_pid_alive`):
+
+    * no / malformed recorded pid — not alive (legacy pre-``tool_pid``
+      metadata keeps its old fall-through behaviour);
+    * ``pid <= 1`` — never live evidence (reparented-to-init record);
+      logged once per check so the not-in-flight decision is visible;
+    * stamped record (``tool_pid_start``) — alive requires pid alive
+      AND matching /proc starttime (a recycled pid is the original
+      worker dead);
+    * legacy bare-pid record — plain existence probe (old behaviour,
+      minus the pid<=1 rejection, which is safe to ratchet).
+    """
+    pid = meta.get("tool_pid")
+    if pid is None:
+        return False, "no recorded worker pid (legacy or pid-less record)"
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False, "recorded worker pid is malformed — not a credential"
+    if pid == 1:
+        # One note per process (the sweeps re-evaluate every sibling
+        # run each pass — a lingering legacy record must not turn
+        # every start into a warning storm).
+        note = logger.debug if _pid1_noted() else logger.warning
+        note(
+            "run metadata records worker pid 1 — never a liveness "
+            "credential (PID 1 is always alive; the record was written "
+            "by a process reparented to init). Treating the run as "
+            "not in flight.",
+        )
+        return False, (
+            "recorded worker pid 1 is not a liveness credential "
+            "(reparented-to-init record) — treated as not in flight"
+        )
+    start = _valid_starttime(meta.get("tool_pid_start"))
+    alive = _tool_pid_alive(pid, start)
+    if start:
+        detail = (
+            f"recorded worker pid {pid} is alive and its start time "
+            "matches the record"
+            if alive else
+            f"recorded worker pid {pid} is dead, or a different "
+            "process recycled the pid (start time mismatch)"
+        )
+    else:
+        detail = (
+            f"recorded worker pid {pid} is alive (legacy record "
+            "without a start-time stamp — identity unverified)"
+            if alive else
+            f"recorded worker pid {pid} is dead"
+        )
+    return alive, detail
 
 
 @contextlib.contextmanager
@@ -393,27 +2422,409 @@ def _metadata_lock(meta_path: Path):
     process may already hold an fd to the old inode while a third
     creates a fresh file at the path, splitting lockers across two
     inodes and silently breaking mutual exclusion.
+
+    The lock path lives inside the run dir — inside a sandboxed
+    child's write grant (the metadata FILE is masked from the child
+    by the mount namespace; its ``.lock`` sibling is not), so the
+    open must not trust what it finds there: O_NOFOLLOW keeps a
+    planted symlink from making this (unsandboxed) process create an
+    attacker-chosen path and flock an aliased inode; O_NONBLOCK plus
+    the fstat S_ISREG refusal keeps a planted FIFO from wedging every
+    lifecycle finaliser (complete/fail/interrupt/resume block forever
+    on a bare FIFO open). Same discipline as the coverage journal's
+    append open one package over.
+
+    Client-locality caveat (WSL drvfs/9p, no behaviour change): on a
+    Windows-interop mount this flock — like the project op lock and
+    every sibling ``.lock`` idiom — is client-local: it serialises
+    processes within one distro but excludes nothing on the Windows
+    side or in other distros mounting the same drive. A run dir on
+    such a mount keeps same-distro update integrity and silently
+    loses the cross-context guarantee. See docs/wsl.md.
     """
     if not _HAS_FCNTL:
         yield
         return
     path = Path(meta_path)
     lock_path = path.with_suffix(path.suffix + ".lock")
+    fd = None
     try:
-        fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT, 0o600)
-    except OSError:
-        # Lock file uncreatable (read-only dir mid-teardown, ENOSPC) —
-        # proceed unserialised rather than failing the lifecycle.
+        fd = os.open(
+            str(lock_path),
+            os.O_WRONLY | os.O_CREAT | os.O_NONBLOCK
+            | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        # Regularity plus foreign-uid refusal (shared checker): the
+        # sandboxed child can pre-create the predictable `.lock`
+        # sibling; adopting it — the open SUCCEEDS, so the degrade arm
+        # below never fired — hands the child a standing hold over
+        # every lifecycle finaliser.
+        from core.atomic_fs.fs_lock import (
+            acquire_flock_bounded,
+            validate_lock_fd,
+        )
+        validate_lock_fd(fd, lock_path)
+    except OSError as exc:
+        # Lock file uncreatable (read-only dir mid-teardown, ENOSPC) or
+        # tamper-shaped (symlink → ELOOP, FIFO → ENXIO / S_ISREG
+        # refusal, foreign-uid lock file) — proceed unserialised rather
+        # than failing the lifecycle, but LOUDLY: a silent unlocked
+        # degrade turned an injected error into invisible lost-update
+        # windows.
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        logger.warning(
+            "metadata lock unavailable for %s (%s) — proceeding "
+            "UNSERIALISED; concurrent status updates may be lost",
+            path.name, exc,
+        )
         yield
         return
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        if not acquire_flock_bounded(
+                fd, lock_path, subject="metadata", stamp=True,
+                expiry_note=("proceeding UNSERIALISED; concurrent "
+                             "status updates may be lost")):
+            # A holder that outlives the generous bounded wait is
+            # wedged or hostile — same loud unserialised disposition
+            # as an unopenable lock, never an unbounded silent stall
+            # (the helper emits the warning at expiry).
+            yield
+            return
         try:
             yield
         finally:
             fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
         os.close(fd)
+
+
+_METADATA_LOCK_STAMP_RE = re.compile(rb"[1-9][0-9]*\n")
+_METADATA_LOCK_STAMP_MAX_BYTES = 32
+
+
+def _metadata_lock_stat_valid(value: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(value.st_mode)
+        and value.st_uid == os.geteuid()
+        and value.st_nlink == 1
+        and value.st_size <= _METADATA_LOCK_STAMP_MAX_BYTES
+        and stat.S_IMODE(value.st_mode) & 0o022 == 0
+    )
+
+
+def _metadata_lock_fd_valid(fd: int, value: os.stat_result) -> bool:
+    """Accept an empty strict lock or the legacy lock's PID diagnostic."""
+
+    if not _metadata_lock_stat_valid(value):
+        return False
+    try:
+        raw = os.pread(fd, _METADATA_LOCK_STAMP_MAX_BYTES + 1, 0)
+    except OSError:
+        return False
+    if len(raw) != value.st_size:
+        return False
+    return raw == b"" or _METADATA_LOCK_STAMP_RE.fullmatch(raw) is not None
+
+
+def _after_strict_metadata_lock_open(_path: Path, _fd: int) -> None:
+    """Test seam after flock acquisition and before pathname revalidation."""
+
+
+@contextlib.contextmanager
+def _strict_metadata_lock(
+    meta_path: Path,
+    *,
+    operation: str,
+    nonblocking: bool,
+):
+    """Strictly lock the same inode used by the legacy metadata lock."""
+
+    if not _HAS_FCNTL:
+        raise _receipt_error(
+            RunReceiptReason.STRICT_LOCK_UNAVAILABLE,
+            operation=operation,
+            subordinate="fcntl_unavailable",
+        )
+    path = Path(meta_path)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    flags = os.O_RDWR | os.O_CREAT
+    for name in ("O_NONBLOCK", "O_NOFOLLOW", "O_CLOEXEC"):
+        value = getattr(os, name, None)
+        if type(value) is not int:
+            raise _receipt_error(
+                RunReceiptReason.STRICT_LOCK_UNAVAILABLE,
+                operation=operation,
+                subordinate=name.lower(),
+            )
+        flags |= value
+    try:
+        fd = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise _receipt_error(
+            RunReceiptReason.STRICT_LOCK_UNAVAILABLE,
+            operation=operation,
+            subordinate=(
+                "loop"
+                if exc.errno == errno.ELOOP
+                else "permission_denied"
+                if exc.errno in {errno.EACCES, errno.EPERM}
+                else "open_failed"
+            ),
+        ) from None
+    locked = False
+    try:
+        first = os.fstat(fd)
+        if not _metadata_lock_fd_valid(fd, first):
+            raise _receipt_error(
+                RunReceiptReason.STRICT_LOCK_UNAVAILABLE,
+                operation=operation,
+                subordinate="lock_policy",
+            )
+        lock_mode = fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0)
+        try:
+            fcntl.flock(fd, lock_mode)
+            locked = True
+        except OSError as exc:
+            if nonblocking and exc.errno in {errno.EAGAIN, errno.EWOULDBLOCK}:
+                raise _receipt_error(
+                    RunReceiptReason.LOCK_BUSY,
+                    operation=operation,
+                ) from None
+            raise _receipt_error(
+                RunReceiptReason.STRICT_LOCK_UNAVAILABLE,
+                operation=operation,
+                subordinate="lock_acquire",
+            ) from None
+        _after_strict_metadata_lock_open(lock_path, fd)
+        try:
+            current = os.stat(lock_path, follow_symlinks=False)
+            held = os.fstat(fd)
+        except OSError:
+            raise _receipt_error(
+                RunReceiptReason.STRICT_LOCK_UNAVAILABLE,
+                operation=operation,
+                subordinate="lock_recheck",
+            ) from None
+        if (
+            current.st_dev != held.st_dev
+            or current.st_ino != held.st_ino
+            or not _metadata_lock_stat_valid(current)
+            or not _metadata_lock_fd_valid(fd, held)
+        ):
+            raise _receipt_error(
+                RunReceiptReason.STRICT_LOCK_UNAVAILABLE,
+                operation=operation,
+                subordinate="lock_replaced",
+            )
+        try:
+            yield
+        finally:
+            try:
+                final = os.stat(lock_path, follow_symlinks=False)
+                held = os.fstat(fd)
+            except OSError:
+                raise _receipt_error(
+                    RunReceiptReason.STRICT_LOCK_UNAVAILABLE,
+                    operation=operation,
+                    subordinate="lock_release",
+                ) from None
+            if (
+                final.st_dev != held.st_dev
+                or final.st_ino != held.st_ino
+                or not _metadata_lock_stat_valid(final)
+                or not _metadata_lock_fd_valid(fd, held)
+            ):
+                raise _receipt_error(
+                    RunReceiptReason.STRICT_LOCK_UNAVAILABLE,
+                    operation=operation,
+                    subordinate="lock_replaced",
+                )
+    finally:
+        if locked:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _write_prebuilt_metadata_bytes(
+    path: Path,
+    raw: bytes,
+    temporary_path: Path,
+    *,
+    operation: str,
+) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    for name in ("O_NONBLOCK", "O_NOFOLLOW", "O_CLOEXEC"):
+        value = getattr(os, name, None)
+        if type(value) is not int:
+            raise _receipt_error(
+                RunReceiptReason.STRICT_LOCK_UNAVAILABLE,
+                operation=operation,
+                subordinate=name.lower(),
+            )
+        flags |= value
+    fd = -1
+    try:
+        fd = os.open(temporary_path, flags, 0o600)
+        os.fchmod(fd, 0o600)
+        offset = 0
+        while offset < len(raw):
+            written = os.write(fd, raw[offset:])
+            if written <= 0:
+                raise OSError("metadata short write")
+            offset += written
+        os.fsync(fd)
+        value = os.fstat(fd)
+        if (
+            not stat.S_ISREG(value.st_mode)
+            or value.st_uid != os.geteuid()
+            or value.st_nlink != 1
+            or stat.S_IMODE(value.st_mode) != 0o600
+            or value.st_size != len(raw)
+        ):
+            raise OSError("metadata temporary policy failure")
+        os.close(fd)
+        fd = -1
+        os.replace(temporary_path, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError:
+        raise _receipt_error(
+            RunReceiptReason.METADATA_CHANGED,
+            operation=operation,
+            subordinate="write_failed",
+        ) from None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        with contextlib.suppress(OSError):
+            temporary_path.unlink()
+
+
+def _read_metadata_bytes_for_cas(
+    path: Path,
+    *,
+    operation: str,
+) -> bytes | None:
+    try:
+        return _strict_read_run_metadata_bytes(
+            path,
+            operation=operation,
+            missing_ok=True,
+        )
+    except RunRuntimeReceiptError:
+        raise _receipt_error(
+            RunReceiptReason.METADATA_CHANGED,
+            operation=operation,
+        ) from None
+
+
+def _commit_receipt_plan(plan: _ReceiptCommitPlan) -> None:
+    from core.project import sessions as _sessions
+
+    for attempt in range(_STRICT_METADATA_LOCK_ATTEMPTS):
+        try:
+            with _sessions.session_runtime_receipt_fence(plan.capture):
+                with _strict_metadata_lock(
+                    plan.output_dir / RUN_METADATA_FILE,
+                    operation=plan.operation,
+                    nonblocking=True,
+                ):
+                    path = plan.output_dir / RUN_METADATA_FILE
+                    observed = _read_metadata_bytes_for_cas(
+                        path,
+                        operation=plan.operation,
+                    )
+                    if plan.expected_raw is None:
+                        unchanged = observed is None
+                    else:
+                        unchanged = observed is not None and secrets.compare_digest(
+                            observed,
+                            plan.expected_raw,
+                        )
+                    if not unchanged:
+                        comparison = RunReceiptComparison(
+                            RunReceiptComparisonResult.METADATA_CHANGED,
+                            None,
+                        )
+                        raise _receipt_error(
+                            RunReceiptReason.METADATA_CHANGED,
+                            operation=plan.operation,
+                            comparison=comparison,
+                        )
+                    _write_prebuilt_metadata_bytes(
+                        path,
+                        plan.desired_raw,
+                        plan.temporary_path,
+                        operation=plan.operation,
+                    )
+                    try:
+                        written = _read_metadata_bytes_for_cas(
+                            path,
+                            operation=plan.operation,
+                        )
+                    except RunRuntimeReceiptError:
+                        comparison = RunReceiptComparison(
+                            RunReceiptComparisonResult.METADATA_CHANGED,
+                            None,
+                        )
+                        raise _receipt_error(
+                            RunReceiptReason.METADATA_CHANGED,
+                            operation=plan.operation,
+                            comparison=comparison,
+                            subordinate="post_replace_verification",
+                        ) from None
+                    if written is None or not secrets.compare_digest(
+                        written,
+                        plan.desired_raw,
+                    ):
+                        comparison = RunReceiptComparison(
+                            RunReceiptComparisonResult.METADATA_CHANGED,
+                            None,
+                        )
+                        raise _receipt_error(
+                            RunReceiptReason.METADATA_CHANGED,
+                            operation=plan.operation,
+                            comparison=comparison,
+                            subordinate="post_replace_verification",
+                        )
+            return
+        except RunRuntimeReceiptError as exc:
+            if (
+                exc.reason is RunReceiptReason.LOCK_BUSY
+                and attempt + 1 < _STRICT_METADATA_LOCK_ATTEMPTS
+            ):
+                time.sleep(_STRICT_METADATA_LOCK_INTERVAL_S)
+                continue
+            raise
+        except _sessions._SessionReceiptAbort as exc:
+            first = exc.failure.reason_codes[0].value
+            if first == "concurrent_finalizer":
+                reason = RunReceiptReason.LOCK_BUSY
+            elif first == "strict_lock_unavailable":
+                reason = RunReceiptReason.STRICT_LOCK_UNAVAILABLE
+            else:
+                reason = RunReceiptReason.REGISTRY_CHANGED
+            comparison = RunReceiptComparison(
+                RunReceiptComparisonResult.REGISTRY_CHANGED,
+                None,
+            )
+            raise _receipt_error(
+                reason,
+                operation=plan.operation,
+                comparison=comparison,
+                subordinate=first,
+            ) from None
+    raise _receipt_error(
+        RunReceiptReason.LOCK_BUSY,
+        operation=plan.operation,
+    )
 
 
 def _contention_project_dir(output_dir: Path) -> Path | None:
@@ -467,13 +2878,47 @@ def _gate_session_alive(pid: int) -> bool:
     return "claude" in comm
 
 
+# Gate-side age ceiling for FOREIGN-stamped running markers (see the
+# _live_conflicting_run docstring for the two-direction trade-off).
+_FOREIGN_HOLDER_CONTENTION_CEILING_S = 24 * 3600
+
+
+def _foreign_holder_past_ceiling(run_dir: Path, meta: dict) -> bool:
+    """True when a foreign-stamped running marker is past the gate's
+    contention ceiling AND its run dir shows no recent write activity.
+
+    A missing, unparseable, or FUTURE-DATED timestamp counts as past
+    the ceiling — a forged marker must not earn a longer (or with a
+    far-future stamp, INFINITE) hold by gaming the field the ceiling
+    reads; the activity probe still protects a genuinely live run (it
+    keeps writing), and modest clock skew is absorbed by the same
+    probe plus a one-hour tolerance.
+    """
+    if _run_recently_active(run_dir):
+        return False
+    ts_str = meta.get("timestamp")
+    if isinstance(ts_str, str):
+        try:
+            started = datetime.fromisoformat(ts_str)
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+            age_s = (datetime.now(timezone.utc) - started).total_seconds()
+            if age_s < -3600.0:
+                return True  # future-dated forgery — no extended hold
+            return age_s >= _FOREIGN_HOLDER_CONTENTION_CEILING_S
+        except ValueError:
+            pass
+    return True
+
+
 def _live_conflicting_run(project_dir: Path, self_dir: Path,
                           self_session_pid: int | None) -> dict | None:
     """Find a sibling run that makes a new start contention.
 
     A sibling contends when its metadata says ``status=running`` AND
-    its recorded ``session_pid`` is a live claude session belonging to
-    a DIFFERENT session than ours. Everything else is explicitly not
+    its recorded ``session_pid`` is a live verified frontend (or
+    legacy Claude session) belonging to a DIFFERENT session than ours.
+    Everything else is explicitly not
     contention:
 
     * dead recorded pid — a crashed run; detectable, must never block
@@ -483,7 +2928,26 @@ def _live_conflicting_run(project_dir: Path, self_dir: Path,
     * same session — parallel runs from one session stay legal (the
       `_cleanup_abandoned` freshness doctrine already supports them);
     * no recorded pid (legacy metadata) — unverifiable; never block on
-      what can't be checked.
+      what can't be checked;
+    * import-restored run (``IMPORTED_RUN_MARKER_FILE`` present) — the
+      marker's ``status=running`` describes a session on the EXPORTING
+      machine, never one this gate could be protecting (and a forged
+      archive gains nothing by self-labelling imported: skipping only
+      DECLINES the contention it was trying to mint);
+    * FOREIGN-stamped holder (other machine / pid namespace —
+      unverifiable here) past the age ceiling with a write-quiet run
+      dir. Without the ceiling one child-rewritten or hand-planted
+      marker held the gate FOREVER (the sweeps deliberately fail open
+      on foreign stamps and never clear it): a permanent
+      denial-of-service on every future run in the project. Ceiling
+      trade-offs both directions: too SHORT and a genuinely live
+      cross-machine run on a shared filesystem loses its contention
+      protection mid-flight (the activity probe absorbs most of this
+      — a live run keeps writing); too LONG and a planted marker
+      denies the project for that whole window. 24h covers the
+      longest legitimate runs observed while bounding the DoS; the
+      sweeps stay fail-open (the run keeps ``status=running`` and its
+      dir; only the GATE stops honouring it).
     """
     self_name = Path(self_dir).name
     try:
@@ -498,7 +2962,7 @@ def _live_conflicting_run(project_dir: Path, self_dir: Path,
             meta_path = d / RUN_METADATA_FILE
             if not meta_path.exists():
                 continue
-            meta = load_json(meta_path)
+            meta = _load_meta(meta_path)
         except OSError:
             continue
         if not isinstance(meta, dict) or meta.get("status") != STATUS_RUNNING:
@@ -510,11 +2974,32 @@ def _live_conflicting_run(project_dir: Path, self_dir: Path,
             continue
         if self_session_pid is not None and owner == self_session_pid:
             continue
+        try:
+            from core.project.findings_utils import run_is_imported
+            if run_is_imported(d):
+                continue  # restored marker — see the docstring bullet
+        except OSError:
+            pass
         # Stamped metadata gets the identity check (a recycled claude
         # pid must not hold contention forever); unstamped falls back
         # to the gate's EPERM-aware comm probe.
-        if meta.get("session_start") and meta.get("session_boot_id"):
-            if not _session_alive_for_meta(meta):
+        if (meta.get("session_start") and meta.get("session_boot_id")) \
+                or any(
+                    str(key).startswith("session_host")
+                    for key in meta
+                ):
+            liveness = _session_liveness_for_meta(meta)
+            if liveness == "dead":
+                continue
+            if (liveness == "foreign"
+                    and _foreign_holder_past_ceiling(d, meta)):
+                logger.warning(
+                    "run contention gate: ignoring foreign-stamped "
+                    "running marker in %s — older than the %dh "
+                    "contention ceiling and write-quiet (the marker "
+                    "is left untouched)",
+                    d.name, _FOREIGN_HOLDER_CONTENTION_CEILING_S // 3600,
+                )
                 continue
         elif not _gate_session_alive(owner):
             continue
@@ -558,13 +3043,34 @@ def _project_run_gate(project_dir: Path, output_dir: Path, command: str,
     # Re-entrant stamp: raptor.py's lifecycle wrapper start_run()s the
     # run dir, then the child (raptor_agentic.py) start_run()s the SAME
     # dir to enrich metadata. The second call is not a new run start —
-    # gating it against siblings could kill a run whose parent already
-    # passed the gate.
+    # gating it against SIBLINGS could kill a run whose parent already
+    # passed the gate. It still queues on the project op lock exactly
+    # like a fresh start: without the flock, a start_run into a dir
+    # whose own metadata reads status=running (the crashed-run-dir
+    # restart shape as much as the documented enrichment flows) wrote
+    # its metadata mid-sweep behind the journal-reindex sweep's back —
+    # the one writer class the sweep's whole-duration ``.op.lock``
+    # could not fence. Same wait=True posture as the fresh path below,
+    # and safe from self-deadlock by the lock's own discipline: the
+    # flock guards only each holder's short read-modify-write window
+    # (the parent's gate released it before the child ever runs), and
+    # no run-machinery path calls start_run while holding ``.op.lock``
+    # (holders are this gate, the journal sweep, and the mutating
+    # /project subcommands). Non-waiting semantics would be dishonest
+    # here in both directions: refusing on contention could kill a
+    # legitimate enrichment mid-flight, and proceeding on contention
+    # would keep the bypass. Lock order unchanged: ``.op.lock``
+    # (outermost) before the metadata lock start_run takes inside.
+    own_running = False
     with contextlib.suppress(OSError):
-        own = load_json(Path(output_dir) / RUN_METADATA_FILE)
-        if isinstance(own, dict) and own.get("status") == STATUS_RUNNING:
+        own = _load_meta(Path(output_dir) / RUN_METADATA_FILE)
+        own_running = (isinstance(own, dict)
+                       and own.get("status") == STATUS_RUNNING)
+    if own_running:
+        with project_op_lock(project_dir, f"run-start:{command}",
+                             wait=True):
             yield
-            return
+        return
 
     waiting_printed = False
     while True:
@@ -598,6 +3104,378 @@ def _project_run_gate(project_dir: Path, output_dir: Path, command: str,
         _time.sleep(2.0)
 
 
+def _matching_host_v2_credential() -> bool:
+    from core.project.sessions import (
+        SessionHostV2CredentialState,
+        session_host_v2_credential_state,
+    )
+
+    return (
+        session_host_v2_credential_state()
+        is SessionHostV2CredentialState.MATCHING_HOST_V2
+    )
+
+
+def _prepare_receipt_start_plan(
+    output_dir: Path,
+    command: str,
+    extra: dict[str, Any] | None,
+    target: str | None,
+    target_identity: dict[str, Any] | None,
+) -> _ReceiptCommitPlan:
+    operation = "start"
+    if _contention_project_dir(output_dir) is not None:
+        raise _receipt_error(
+            RunReceiptReason.PROJECT_FORBIDDEN,
+            operation=operation,
+        )
+    project_source = _receipt_project_source(operation=operation)
+    now = datetime.now(timezone.utc)
+    matching_credential = _matching_host_v2_credential()
+    capture = (
+        _capture_current_run_receipt(operation=operation, now=now)
+        if matching_credential
+        else None
+    )
+    path = output_dir / RUN_METADATA_FILE
+    strict = _strict_load_run_metadata(
+        path,
+        operation=operation,
+        missing_ok=True,
+    )
+    parsed = (
+        _parse_receipt_metadata(strict, operation=operation)
+        if strict is not None
+        else _ParsedReceiptMetadata(snapshot=None, lineage=None)
+    )
+    audit = parsed.snapshot
+    lineage = parsed.lineage
+    if not matching_credential:
+        if audit is not None:
+            comparison = RunReceiptComparison(
+                RunReceiptComparisonResult.METADATA_ONLY,
+                None,
+            )
+            raise _comparison_refusal(comparison, operation=operation)
+        raise _receipt_error(
+            RunReceiptReason.REGISTRY_ABSENT,
+            operation=operation,
+        )
+    if strict is not None and audit is None:
+        comparison = RunReceiptComparison(
+            RunReceiptComparisonResult.REGISTRY_ONLY,
+            None,
+        )
+        raise _receipt_error(
+            RunReceiptReason.LEGACY_UPGRADE_FORBIDDEN,
+            operation=operation,
+            comparison=comparison,
+        )
+    comparison = compare_run_runtime_receipt(
+        audit,
+        capture,
+        operation=operation,
+        lineage=lineage,
+    )
+    if audit is None:
+        if (
+            comparison.result
+            is not RunReceiptComparisonResult.NEW_SNAPSHOT_NON_AUTHORIZING
+        ):
+            raise _comparison_refusal(comparison, operation=operation)
+        snapshot_value = _snapshot_json_value(capture)
+        effective_source = project_source
+    else:
+        if comparison.result is not RunReceiptComparisonResult.MATCH_NON_AUTHORIZING:
+            raise _comparison_refusal(comparison, operation=operation)
+        assert strict is not None
+        prior = strict.value
+        if prior.get("status") != STATUS_RUNNING:
+            raise _receipt_error(
+                RunReceiptReason.REENTRANT_STATUS_MISMATCH,
+                operation=operation,
+                status=str(prior.get("status")),
+            )
+        if prior.get("command") != command:
+            raise _receipt_error(
+                RunReceiptReason.REENTRANT_COMMAND_MISMATCH,
+                operation=operation,
+            )
+        effective_source = _validate_receipt_project_pin(
+            prior,
+            operation=operation,
+        )
+        snapshot_value = _audit_snapshot_json_value(audit)
+
+    from core.run.provenance import build_start_manifest
+
+    desired_extra = copy.deepcopy(extra or {})
+    if strict is not None:
+        prior_extra = strict.value.get("extra")
+        if (
+            isinstance(prior_extra, dict)
+            and "resumes" in prior_extra
+            and "resumes" not in desired_extra
+        ):
+            desired_extra["resumes"] = copy.deepcopy(prior_extra["resumes"])
+    metadata: dict[str, Any] = {
+        "version": 2,
+        "command": command,
+        "timestamp": now.isoformat(),
+        "status": STATUS_RUNNING,
+        "manifest": build_start_manifest(
+            target=target,
+            target_identity=target_identity,
+        ),
+        "extra": desired_extra,
+        "project": None,
+        "project_source": effective_source,
+        RUN_RUNTIME_RECEIPT_KEY: snapshot_value,
+    }
+    if lineage is not None:
+        metadata[RUN_RUNTIME_RECEIPT_LINEAGE_KEY] = _lineage_json_value(lineage)
+    if target:
+        metadata["target_path"] = str(target)
+    _remove_receipt_owner_fields(metadata)
+    desired_raw = _serialize_receipt_run_metadata(
+        metadata,
+        operation=operation,
+    )
+    return _ReceiptCommitPlan(
+        operation=operation,
+        output_dir=output_dir,
+        capture=capture,
+        expected_raw=strict.raw if strict is not None else None,
+        desired_raw=desired_raw,
+        desired_metadata=metadata,
+        temporary_path=_receipt_temporary_path(path),
+    )
+
+
+def _run_receipt_reapers(output_dir: Path) -> None:
+    from core.run.tmp_reaper import (
+        reap_stale_logs,
+        reap_stale_runs,
+        reap_stale_tmp,
+    )
+
+    reap_stale_tmp()
+    reap_stale_logs()
+    reap_stale_runs(output_dir.parent)
+
+
+def _start_receipt_run(
+    output_dir: Path,
+    command: str,
+    extra: dict[str, Any] | None,
+    target: str | None,
+    target_identity: dict[str, Any] | None,
+) -> Path:
+    from core.run.safe_io import safe_run_mkdir
+
+    plan = _prepare_receipt_start_plan(
+        output_dir,
+        command,
+        extra,
+        target,
+        target_identity,
+    )
+    _run_receipt_reapers(output_dir)
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    created = not output_dir.exists()
+    safe_run_mkdir(output_dir)
+    try:
+        _commit_receipt_plan(plan)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            if created:
+                output_dir.rmdir()
+        raise
+    from core.run.pin import freeze_run_pin
+    from core.sandbox.summary import set_active_run_dir
+
+    set_active_run_dir(output_dir)
+    freeze_run_pin(
+        output_dir,
+        None,
+        str(plan.desired_metadata["project_source"]),
+    )
+    return output_dir
+
+
+def _prepare_receipt_resume_plan(
+    output_dir: Path,
+    note: str | None,
+) -> _ReceiptCommitPlan:
+    operation = "resume"
+    if _contention_project_dir(output_dir) is not None:
+        raise _receipt_error(
+            RunReceiptReason.PROJECT_FORBIDDEN,
+            operation=operation,
+        )
+    _receipt_project_source(operation=operation)
+    now = datetime.now(timezone.utc)
+    matching_credential = _matching_host_v2_credential()
+    capture = (
+        _capture_current_run_receipt(operation=operation, now=now)
+        if matching_credential
+        else None
+    )
+    path = output_dir / RUN_METADATA_FILE
+    strict = _strict_load_run_metadata(
+        path,
+        operation=operation,
+        missing_ok=True,
+    )
+    if strict is None:
+        if matching_credential:
+            comparison = RunReceiptComparison(
+                RunReceiptComparisonResult.REGISTRY_ONLY,
+                None,
+            )
+            raise _receipt_error(
+                RunReceiptReason.LEGACY_UPGRADE_FORBIDDEN,
+                operation=operation,
+                comparison=comparison,
+            )
+        raise FileNotFoundError(
+            f"No {RUN_METADATA_FILE} in {output_dir} — not a run directory"
+        )
+    parsed = _parse_receipt_metadata(strict, operation=operation)
+    audit = parsed.snapshot
+    lineage = parsed.lineage
+    if not matching_credential:
+        if audit is not None:
+            comparison = RunReceiptComparison(
+                RunReceiptComparisonResult.METADATA_ONLY,
+                None,
+            )
+            raise _comparison_refusal(comparison, operation=operation)
+        raise _receipt_error(
+            RunReceiptReason.REGISTRY_ABSENT,
+            operation=operation,
+        )
+    if audit is None:
+        comparison = RunReceiptComparison(
+            RunReceiptComparisonResult.REGISTRY_ONLY,
+            None,
+        )
+        raise _receipt_error(
+            RunReceiptReason.LEGACY_UPGRADE_FORBIDDEN,
+            operation=operation,
+            comparison=comparison,
+        )
+    if lineage is not None and len(lineage.entries) >= MAX_RUN_RECEIPT_LINEAGE_ENTRIES:
+        raise _lineage_overflow_error(
+            operation=operation,
+            segment=len(lineage.entries) + 2,
+        )
+    comparison = compare_run_runtime_receipt(
+        audit,
+        capture,
+        operation=operation,
+        lineage=lineage,
+    )
+    if comparison.result not in {
+        RunReceiptComparisonResult.MATCH_NON_AUTHORIZING,
+        RunReceiptComparisonResult.RESUME_MATCH_NON_AUTHORIZING,
+        RunReceiptComparisonResult.LAUNCH_REPLAY,
+        RunReceiptComparisonResult.LAUNCH_INSTANCE_INVALID,
+    }:
+        raise _comparison_refusal(comparison, operation=operation)
+    project_source = _validate_receipt_project_pin(
+        strict.value,
+        operation=operation,
+    )
+    current = strict.value.get("status")
+    if current not in RESUMABLE_STATUSES:
+        raise ValueError(
+            f"run status {current!r} is not resumable "
+            f"(resumable: {', '.join(sorted(RESUMABLE_STATUSES))})"
+        )
+    if comparison.result in {
+        RunReceiptComparisonResult.LAUNCH_REPLAY,
+        RunReceiptComparisonResult.LAUNCH_INSTANCE_INVALID,
+    }:
+        raise _comparison_refusal(comparison, operation=operation)
+    if comparison.result is RunReceiptComparisonResult.MATCH_NON_AUTHORIZING:
+        relation = "exact"
+        current_audit = audit
+    else:
+        relation = "new_launch_same_stable"
+        current_audit = _capture_audit_snapshot(capture)
+    lineage, segment, resumed_at_utc = _append_receipt_lineage(
+        lineage,
+        prior=audit,
+        current=current_audit,
+        relation=relation,
+        now=now,
+        operation=operation,
+    )
+    metadata = copy.deepcopy(strict.value)
+    extra = metadata.get("extra")
+    if extra is None:
+        extra = {}
+    if not isinstance(extra, dict):
+        raise _receipt_error(
+            RunReceiptReason.METADATA_INVALID,
+            operation=operation,
+        )
+    resumes = extra.get("resumes")
+    if resumes is None:
+        resumes = []
+    assert isinstance(resumes, list)
+    resumes = copy.deepcopy(resumes)
+    row: dict[str, Any] = {
+        "ts": resumed_at_utc,
+        "prior_status": current,
+        "segment": segment,
+    }
+    if note:
+        row["note"] = note
+    resumes.append(row)
+    extra["resumes"] = resumes
+    metadata["extra"] = extra
+    metadata["status"] = STATUS_RUNNING
+    metadata.pop("end_timestamp", None)
+    metadata.pop("duration_seconds", None)
+    metadata["project"] = None
+    metadata["project_source"] = project_source
+    metadata[RUN_RUNTIME_RECEIPT_KEY] = _audit_snapshot_json_value(current_audit)
+    metadata[RUN_RUNTIME_RECEIPT_LINEAGE_KEY] = _lineage_json_value(lineage)
+    _remove_receipt_owner_fields(metadata)
+    desired_raw = _serialize_receipt_run_metadata(
+        metadata,
+        operation=operation,
+    )
+    return _ReceiptCommitPlan(
+        operation=operation,
+        output_dir=output_dir,
+        capture=capture,
+        expected_raw=strict.raw,
+        desired_raw=desired_raw,
+        desired_metadata=metadata,
+        temporary_path=_receipt_temporary_path(path),
+        segment=segment,
+    )
+
+
+def _resume_receipt_run(output_dir: Path, note: str | None) -> int:
+    plan = _prepare_receipt_resume_plan(output_dir, note)
+    _commit_receipt_plan(plan)
+    from core.run.pin import freeze_run_pin
+    from core.sandbox.summary import set_active_run_dir
+
+    set_active_run_dir(output_dir)
+    freeze_run_pin(
+        output_dir,
+        None,
+        str(plan.desired_metadata["project_source"]),
+    )
+    assert plan.segment is not None
+    return plan.segment
+
+
 def start_run(output_dir: Path, command: str,
               extra: dict[str, Any] | None = None,
               target: str | None = None,
@@ -618,9 +3496,20 @@ def start_run(output_dir: Path, command: str,
     immediately (``wait_for_project=True`` queues instead). Crashed
     runs (status=running, dead recorded pid) never block.
     """
+    output_dir = Path(output_dir)
+    _reject_reserved_mapping(extra, operation="start")
+    _reject_reserved_mapping(target_identity, operation="start")
+    if _receipt_branch_selected(output_dir / RUN_METADATA_FILE):
+        return _start_receipt_run(
+            output_dir,
+            command,
+            extra,
+            target,
+            target_identity,
+        )
+
     from core.run.safe_io import safe_run_mkdir
 
-    output_dir = Path(output_dir)
     output_dir.parent.mkdir(parents=True, exist_ok=True)
 
     session_pid = _get_session_pid()
@@ -664,6 +3553,15 @@ def start_run(output_dir: Path, command: str,
         # wholesale. Lock ordering: project op lock (above) before the
         # metadata lock — no path takes them in the other order.
         _gate.enter_context(_metadata_lock(output_dir / RUN_METADATA_FILE))
+        _legacy_backstop = _load_meta(output_dir / RUN_METADATA_FILE)
+        if (
+            isinstance(_legacy_backstop, dict)
+            and _metadata_contains_reserved_input(_legacy_backstop)
+        ):
+            raise _receipt_error(
+                RunReceiptReason.RECEIPT_DOWNGRADE_FORBIDDEN,
+                operation="start",
+            )
 
         # Seal the provenance manifest NOW, before any analysis runs. The
         # source-control snapshot in particular must be taken here — the tree
@@ -680,10 +3578,23 @@ def start_run(output_dir: Path, command: str,
             "manifest": build_start_manifest(target=target, target_identity=target_identity),
             "extra": extra or {},
         }
+        # Worker identity: recorded per _worker_stamp's lifetime policy
+        # — session-bound runs keep the parent-shell credential;
+        # sessionless DETACHED runs (whose CLAUDECODE fallback resolved
+        # no session because the parent is init) previously recorded
+        # pid 1 and wedged every in-flight guard; sessionless
+        # interactive runs record nothing, as before.
+        metadata.update(_worker_stamp(session_bound=session_pid is not None))
         if session_pid is not None:
             metadata["session_pid"] = session_pid
-            metadata["tool_pid"] = os.getppid()
             metadata.update(_session_stamp(session_pid))
+            sid = _harness_session_id()
+            if sid:
+                # Owner-end proof for the SessionEnd hook: a SessionEnd
+                # payload whose session_id matches this stamp is the
+                # owner's OWN graceful end — the run is then genuinely
+                # unowned and may be finalized immediately.
+                metadata["session_id"] = sid
         if target:
             metadata["target_path"] = str(target)
 
@@ -693,14 +3604,34 @@ def start_run(output_dir: Path, command: str,
         # would silently kill the first session's hook attribution and
         # contention identity. resume_run is the sanctioned re-owning
         # path (it refreshes the full stamp).
-        _prior_meta = load_json(output_dir / RUN_METADATA_FILE,
-                                max_bytes=1024 * 1024)
-        if (isinstance(_prior_meta, dict)
-                and _prior_meta.get("status") == STATUS_RUNNING
-                and _prior_meta.get("session_pid") is not None
-                and _session_alive_for_meta(_prior_meta)):
-            for _k in ("session_pid", "tool_pid", "session_start",
-                       "session_boot_id", "session_pidns"):
+        _prior_meta = _load_meta(output_dir / RUN_METADATA_FILE)
+        _prior_owner_live = (
+            isinstance(_prior_meta, dict)
+            and _prior_meta.get("status") == STATUS_RUNNING
+            and (
+                (_prior_meta.get("session_pid") is not None
+                 and _session_alive_for_meta(_prior_meta))
+                # A live SESSIONLESS owner (detached orchestrator,
+                # identified by its worker stamp) is just as much a
+                # live owner: a re-entrant start must not clobber the
+                # credential the in-flight guards rely on.
+                or (_prior_meta.get("session_pid") is None
+                    and worker_liveness_for_meta(_prior_meta)[0])
+            )
+        )
+        if _prior_owner_live:
+            from core.startup.host import RUN_HOST_KEYS
+            for _k in (
+                "session_pid",
+                "tool_pid",
+                "tool_pid_start",
+                "session_start",
+                "session_boot_id",
+                "session_pidns",
+                "session_machine_id",
+                "session_id",
+                *RUN_HOST_KEYS,
+            ):
                 if _k in _prior_meta:
                     metadata[_k] = _prior_meta[_k]
                 else:
@@ -801,13 +3732,32 @@ def start_run(output_dir: Path, command: str,
                             prior_pin[0], _fresh_project)
                         prior_pin = (_fresh_project, _fresh_source)
                     else:
-                        _keep = prior_pin[0] if prior_pin[0] else "-"
+                        # The prior name is marker-derived — this
+                        # branch IS the planted/reused-marker case,
+                        # and every catcher bare-prints str(e) to
+                        # stderr — so escape it before interpolating
+                        # (repr on the description already escapes;
+                        # the --project remedy did not). A control-
+                        # char name can never be a real registry
+                        # project (charset-validated), so the escaped
+                        # remedy only changes hostile spellings;
+                        # legitimate names escape to themselves. The
+                        # fresh side is registry-validated already.
+                        from core.security.log_sanitisation import (
+                            sanitise_for_terminal,
+                        )
+                        _keep = (sanitise_for_terminal(
+                            prior_pin[0], max_len=120)
+                            if prior_pin[0] else "-")
                         _fresh = (_fresh_project if _fresh_project
                                   else "-")
+                        _prior_disp = (
+                            f"'{_keep}'" if prior_pin[0]
+                            else "'no project'")
                         msg = (
                             f"the run dir {output_dir} carries an "
                             f"uncorroborated pin to "
-                            f"{prior_pin[0] or 'no project'!r} (no "
+                            f"{_prior_disp} (no "
                             f"ledger witness — reused across a "
                             f"relaunch, or a pre-existing marker), "
                             f"while this start resolves to "
@@ -834,6 +3784,21 @@ def start_run(output_dir: Path, command: str,
             pin_project, pin_source = resolve_pin_for_start()
         metadata["project"] = pin_project
         metadata["project_source"] = pin_source
+        if pin_project is not None and not target:
+            # A PINNED marker always seals a target witness: the
+            # one-target write gate (pinned_write_target_ok) treats a
+            # pin without target_path as tamper-shaped — the deletion
+            # forgery — so a target-less start inherits the pinned
+            # project's own target (which is also what the run is
+            # implicitly pointed at under DEFAULT TARGET resolution).
+            try:
+                from core.project.project import ProjectManager
+                _pinned_proj = ProjectManager().load(pin_project)
+                if _pinned_proj is not None and _pinned_proj.target:
+                    metadata["target_path"] = str(_pinned_proj.target)
+            except Exception:  # noqa: BLE001 — witness is best-effort
+                logger.debug("pin: could not seal the project target "
+                             "into the run marker", exc_info=True)
         freeze_run_pin(output_dir, pin_project, pin_source)
         # Order: persist metadata FIRST, then mark as active.
         #
@@ -857,7 +3822,11 @@ def start_run(output_dir: Path, command: str,
         from core.sandbox.summary import set_active_run_dir
         save_json(output_dir / RUN_METADATA_FILE, metadata)
     set_active_run_dir(output_dir)
-    _setup_checklist_symlink(output_dir)
+    _run_target = metadata.get("target_path")
+    _setup_checklist_symlink(
+        output_dir,
+        target=_run_target if isinstance(_run_target, str) else None,
+    )
     # Session run ledger: the record drives exact
     # coverage-hook attribution and sibling-discovery tier 0.
     # Best-effort by contract — never lifecycle-critical.
@@ -881,7 +3850,8 @@ def _cleanup_abandoned(project_dir: Path, command: str, session_pid: int) -> Non
       worker-liveness gate keeps long-lived parallel runs of the same
       command in the same session from being false-failed.
     - Owning session DEAD — the recorded session_pid no longer maps to
-      a live claude process (session SIGKILL'd, machine rebooted, or
+      a live verified frontend/legacy Claude process (session SIGKILL'd,
+      machine rebooted, or
       PID recycled by something else). No live owner means no lifecycle
       hook will ever finalize the run: without this branch such runs
       sat in status=running forever, regardless of command type. The
@@ -918,13 +3888,15 @@ def _cleanup_abandoned(project_dir: Path, command: str, session_pid: int) -> Non
             meta_path = d / RUN_METADATA_FILE
             if not meta_path.exists():
                 continue
-            meta = load_json(meta_path)
+            meta = _load_meta(meta_path)
         except OSError:
             # Per-child stat may fail even after iterdir succeeded.
             continue
         if not isinstance(meta, dict) or not meta:
             # Corrupt or non-object metadata (torn write, hostile or
             # malformed run dir): not sweepable — never crash the sweep.
+            continue
+        if _metadata_contains_reserved_input(meta):
             continue
         if meta.get("status") != STATUS_RUNNING:
             continue
@@ -942,7 +3914,7 @@ def _cleanup_abandoned(project_dir: Path, command: str, session_pid: int) -> Non
         same_session_retry = (
             meta.get("command") == command
             and run_session == session_pid
-            and not _tool_pid_alive(meta.get("tool_pid"))
+            and not worker_liveness_for_meta(meta)[0]
             # Stub-driven runs record a transient shell as tool_pid, so
             # a dead worker alone is not abandonment evidence — the run
             # dir must ALSO be write-quiet past the activity grace.
@@ -952,6 +3924,12 @@ def _cleanup_abandoned(project_dir: Path, command: str, session_pid: int) -> Non
             isinstance(run_session, int)
             and run_session != session_pid
             and not _session_alive_for_meta(meta)
+            # A legacy detached record (session_pid<=1, written before
+            # the recorder refused reparented-to-init pids) has no
+            # checkable owner at all — owner-LESS, not owner-dead. Its
+            # orchestrator may still be running, so only a write-quiet
+            # run is an abandon; a live one keeps appending output.
+            and not (run_session <= 1 and _run_recently_active(d))
         )
         if same_session_retry or session_dead:
             # Freshness gate — skip recent siblings (probable
@@ -984,7 +3962,8 @@ def _cleanup_abandoned(project_dir: Path, command: str, session_pid: int) -> Non
                      record_timing=False)
 
 
-def _setup_checklist_symlink(run_dir: Path) -> None:
+def _setup_checklist_symlink(run_dir: Path,
+                             target: str | None = None) -> None:
     """Create a checklist.json symlink in the run dir pointing to the project-level checklist.
 
     Only acts in project mode (active project detected via .active symlink).
@@ -992,6 +3971,21 @@ def _setup_checklist_symlink(run_dir: Path) -> None:
 
     If no project-level checklist exists yet, promotes the newest run-level
     checklist from sibling run dirs.
+
+    ``target``: the run's resolved target path (``start_run``'s sealed
+    ``target_path``). When both it and the project checklist's recorded
+    ``target_path`` are known ABSOLUTE paths and they resolve to
+    different locations, the symlink is REFUSED with a loud warning —
+    inheriting an inventory that describes a different tree silently
+    audits target B against target A's items. A file target inside the
+    recorded tree is still a mismatch: the inventory's items are the
+    tree's, not the file's. The run then builds its own checklist
+    downstream, exactly as a first project run does. When either side
+    is unknown (target-less start, legacy checklist without
+    ``target_path``, a relative recorded path whose anchor is lost),
+    the historical inheritance is preserved — refusing on unknowns
+    would break every standalone-shaped flow for a guard that cannot
+    actually compare anything.
     """
 
     # THE RUN PIN decides which project this is (start_run sealed it
@@ -1027,6 +4021,12 @@ def _setup_checklist_symlink(run_dir: Path) -> None:
     if checklist_in_run.exists() and not checklist_in_run.is_symlink():
         return
 
+    # A run-local SHARDED checklist (checklist/index.json — e.g. a
+    # scoped build's run-local inventory) is a real checklist too: a
+    # symlink beside it would shadow it for every accessor read.
+    if (run_dir / "checklist" / "index.json").is_file():
+        return
+
     # Don't create symlink if it already exists
     if checklist_in_run.is_symlink():
         return
@@ -1035,6 +4035,50 @@ def _setup_checklist_symlink(run_dir: Path) -> None:
     project_checklist = project_dir / "checklist.json"
     if not project_checklist.exists():
         _promote_checklist(project_dir)
+
+    # Target-match gate: never inherit an inventory recorded against a
+    # DIFFERENT target (checked after promotion so a just-promoted
+    # checklist is vetted too). Costs one bounded JSON parse at run
+    # start — the price of not silently steering a whole run's review
+    # loop, coverage, and journal at the wrong tree's item list.
+    from core.inventory import checklist_exists
+    if target and checklist_exists(project_dir):
+        # Meta accessor: reads the sharded layout's index manifest
+        # when the project slot is sharded (the single-file probe
+        # alone silently skipped the gate there), full single files
+        # otherwise. Unreadable/corrupt checklists read as {} — the
+        # guard only acts on a POSITIVE mismatch.
+        from core.inventory import read_checklist_meta
+        recorded: str = ""
+        try:
+            recorded = str(
+                read_checklist_meta(project_dir).get("target_path") or "")
+        except (OSError, ValueError):
+            recorded = ""
+        if recorded and Path(recorded).is_absolute():
+            # RuntimeError alongside OSError: on Python 3.10-3.12,
+            # Path.resolve() raises it on symlink loops — a planted
+            # loop in either path must fail OPEN (keep inheritance,
+            # never fail the lifecycle start), same as any other
+            # uncomparable input.
+            try:
+                _mismatch = (
+                    Path(recorded).resolve() != Path(target).resolve()
+                )
+            except (OSError, RuntimeError):
+                _mismatch = False
+            if _mismatch:
+                from core.logging import get_logger
+                get_logger(__name__).warning(
+                    "checklist inheritance refused for %s: the project "
+                    "checklist %s was built for target %s but this run "
+                    "targets %s — inheriting it would audit this run's "
+                    "target against the other tree's inventory. This "
+                    "run proceeds without it; commands that need an "
+                    "inventory build a fresh one for the actual target.",
+                    run_dir, project_checklist, recorded, target,
+                )
+                return
 
     # Create relative symlink: run_dir/checklist.json → ../checklist.json
     #
@@ -1080,9 +4124,15 @@ def _promote_checklist(project_dir: Path) -> None:
 
     Scans sibling run dirs for checklist.json files. Takes the newest
     and copies it to project_dir/checklist.json, merging checked_by
-    from older checklists.
+    from older checklists. Candidates must be JSON objects — any other
+    shape is skipped with a warning (a non-dict document would brick
+    the project slot for every reader). Every candidate passes the
+    checklist frame gate: a TAMPERED run-local frame is skipped with a warning
+    (promotion re-stamps at project level, so promoting one would
+    launder it into a verified project checklist); unstamped legacy
+    and relocated frames stay promotable at the legacy tier.
     """
-    from core.json import load_json, save_json
+    from core.json import load_json
 
     try:
         children = list(project_dir.iterdir())
@@ -1107,31 +4157,118 @@ def _promote_checklist(project_dir: Path) -> None:
     # checklist became "newest" each time. Run-dir names embed a
     # PID + monotonic-ns tail (see core/run/output.unique_run_suffix),
     # so name-tie-break gives a chronologically meaningful disambiguation.
-    checklists = []
-    for d in sorted(children, key=lambda d: (_safe_mtime(d), d.name), reverse=True):
+    # Run-dir artifacts: sibling checklists are sandbox-writable; the
+    # shared run-artifact budget bounds the promotion scan.
+    from core.coverage.record import RUN_ARTIFACT_MAX_BYTES
+
+    # STREAMING merge: the newest parsed checklist is the promotion
+    # base and each older sibling is loaded, folded into it, and
+    # released before the next load. Accumulating every sibling first
+    # held N × the per-file budget live at once — a project with many
+    # runs turned promotion into the run start's high-water mark.
+    from core.inventory import _single_file_frame_gate
+    from core.inventory.builder import _carry_forward_coverage
+    promoted = None
+    for d in sorted(children, key=lambda d: (_safe_mtime(d), d.name),
+                    reverse=True):
         try:
             if not d.is_dir() or d.name.startswith((".", "_")):
                 continue
             cl = d / "checklist.json"
-            if not cl.exists() or cl.is_symlink():
+            # Run-LOCAL checklists only: a symlinked slot is the
+            # project's own checklist (self-promotion). Either
+            # on-disk form qualifies — single file or a run-local
+            # sharded dir.
+            has_single = cl.exists() and not cl.is_symlink()
+            # ``not cl.is_symlink()`` on the sharded arm too: with a
+            # dangling project symlink still in the slot, the accessor
+            # read below would resolve THROUGH it to the project's own
+            # sharded checklist — self-promotion.
+            has_sharded = (
+                (d / "checklist" / "index.json").is_file()
+                and not (d / "checklist").is_symlink()
+                and not cl.is_symlink()
+            )
+            if not has_single and not has_sharded:
                 continue
         except OSError:
             continue
-        data = load_json(cl)
-        if data:
-            checklists.append(data)
+        if has_single:
+            # Promotion must read the run-LOCAL file only — the
+            # accessor would follow a symlinked slot back to the
+            # project checklist (self-promotion).
+            data = load_json(cl, max_bytes=RUN_ARTIFACT_MAX_BYTES)  # checklist-direct-read: run-local only, symlink-excluded above
+            # Shape gate BEFORE the frame gate: this direct read can
+            # hand back any JSON value, and a non-dict candidate (a
+            # list, a string, a number) is corrupt for every consumer
+            # — read_checklist returns {} for one. Ungated, a truthy
+            # non-dict would dodge the dict-guarded frame and scope
+            # gates, crash _carry_forward_coverage on the
+            # older-siblings path, or win newest and be installed by
+            # save_checklist as a project checklist every reader then
+            # refuses. Same degrade direction as a tampered frame:
+            # loud warning naming the file + the rebuild remedy, then
+            # skip to the next-newest sibling.
+            if data is not None and not isinstance(data, dict):
+                from core.logging import get_logger
+                get_logger(__name__).warning(
+                    "checklist promotion: candidate at %s is not a "
+                    "JSON object (%s) — a non-dict checklist is "
+                    "corrupt for every reader. Skipping to the "
+                    "next-newest sibling; rebuild the inventory to "
+                    "restore this run's checklist.",
+                    cl, type(data).__name__,
+                )
+                continue
+            # Frame gate on the raw candidate: save_checklist below
+            # RE-STAMPS whatever it is handed at project level, so an
+            # ungated promotion would launder a frame every direct
+            # read refuses as tampered into a freshly-verified project
+            # checklist. A TAMPERED candidate is skipped (loud warning
+            # from the gate, naming the file + the rebuild remedy) and
+            # the scan continues to the next-newest sibling — the same
+            # degrade direction as the sharded arm, whose accessor
+            # read already returns {} for a tampered index. If no
+            # candidate survives, nothing is promoted (fail-closed).
+            # Unstamped/relocated candidates demote-and-promote at the
+            # legacy tier, exactly like every other reader.
+            if isinstance(data, dict) and not _single_file_frame_gate(
+                    data, cl, "checklist promotion"):
+                continue
+        else:
+            from core.inventory import read_checklist
+            # Accessor read: read_checklist is dict-or-{} by contract
+            # (non-dict, tampered, and integrity-failed documents all
+            # come back as {}), so the sharded arm needs no shape gate
+            # — the `if not data` below drops the empty degrade.
+            data = read_checklist(d)
+        if not data:
+            continue
+        if isinstance(data, dict) and data.get("scope"):
+            # Scope-collision rule: a scoped build's run-local
+            # checklist is PARTIAL by construction — promoting it
+            # would install a reduced file set as the project-level
+            # inventory every sibling run inherits. The project slot
+            # only ever holds the full-tree form.
+            continue
+        if promoted is None:
+            promoted = data  # newest wins the base
+        else:
+            _carry_forward_coverage(data, promoted)
 
-    if not checklists:
+    if promoted is None:
         return
 
-    # Start with newest, merge checked_by from older ones
-    promoted = checklists[0]
-    if len(checklists) > 1:
-        from core.inventory.builder import _carry_forward_coverage
-        for older in checklists[1:]:
-            _carry_forward_coverage(older, promoted)
-
-    save_json(project_dir / "checklist.json", promoted)
+    # Accessor write: an over-budget promoted inventory lands in the
+    # sharded layout instead of a single file every reader refuses.
+    from core.inventory import ChecklistBudgetExceededError, save_checklist
+    try:
+        save_checklist(project_dir, promoted)
+    except ChecklistBudgetExceededError as exc:
+        from core.logging import get_logger
+        get_logger(__name__).warning(
+            "checklist promotion skipped: %s", exc,
+        )
 
 
 def _finalize_sandbox_summary(output_dir: Path) -> None:
@@ -1240,6 +4377,22 @@ def _finalize_sandbox_triage(output_dir: Path) -> str | None:
         return None
 
 
+def _finalize_egress_summary(output_dir: Path) -> None:
+    """Write egress-summary.json and log a one-line egress report.
+
+    Best-effort, mirrors _finalize_sandbox_summary: never raises.
+    """
+    try:
+        from core.sandbox.egress_summary import finalize_egress_summary
+        finalize_egress_summary(output_dir)
+    except Exception:  # noqa: BLE001 — never fail lifecycle
+        import logging
+        logging.getLogger(__name__).debug(
+            "_finalize_egress_summary failed for %s",
+            output_dir, exc_info=True,
+        )
+
+
 # Sandbox summary + triage are finalized BEFORE the status update in every
 # terminal-state transition. If the process crashes between them:
 #  - finalize-then-status-update path: status stays "running", summary/triage
@@ -1269,7 +4422,7 @@ def ensure_run_command(output_dir: Path,
     """
     if expected_command is None:
         return
-    metadata = load_json(Path(output_dir) / RUN_METADATA_FILE)
+    metadata = _load_meta(Path(output_dir) / RUN_METADATA_FILE)
     if not isinstance(metadata, dict):
         return
     owner = metadata.get("command")
@@ -1283,6 +4436,47 @@ def ensure_run_command(output_dir: Path,
             f"dir) must leave the owner's lifecycle alone."
         )
         raise RunOwnershipError(msg)
+
+
+def _ensure_receipt_transition_allowed(
+    output_dir: Path,
+    *,
+    operation: str,
+    extra: object = None,
+    manifest: object = None,
+) -> None:
+    _reject_reserved_mapping(extra, operation=operation)
+    _reject_reserved_mapping(manifest, operation=operation)
+    path = Path(output_dir) / RUN_METADATA_FILE
+    if not _metadata_file_has_receipt_state(path):
+        return
+    strict = _strict_load_run_metadata(
+        path,
+        operation=operation,
+        missing_ok=True,
+    )
+    if strict is None:
+        return
+    _reject_reserved_mapping(strict.value.get("extra"), operation=operation)
+    if not _metadata_allows_legacy_attribution(strict.value):
+        try:
+            from core.startup.runtime_receipt.terminal import (
+                _query_owned_fake_terminal_permit,
+            )
+
+            permitted = _query_owned_fake_terminal_permit(
+                path,
+                strict.value,
+                operation,
+            )
+        except Exception:  # noqa: BLE001 — private permit must fail closed
+            permitted = False
+        if permitted:
+            return
+        raise _receipt_error(
+            RunReceiptReason.TERMINAL_TRANSITION_FORBIDDEN,
+            operation=operation,
+        )
 
 
 def complete_run(output_dir: Path, extra: dict[str, Any] | None = None,
@@ -1305,9 +4499,16 @@ def complete_run(output_dir: Path, extra: dict[str, Any] | None = None,
     triage finalisers so a refused completion leaves no side effects
     in the foreign run directory.
     """
+    _ensure_receipt_transition_allowed(
+        output_dir,
+        operation="complete",
+        extra=extra,
+        manifest=manifest,
+    )
     ensure_run_command(output_dir, expected_command)
     _finalize_sandbox_summary(output_dir)
     _triage_verdict = _finalize_sandbox_triage(output_dir)
+    _finalize_egress_summary(output_dir)
     if _triage_verdict is not None:
         # Surface the verdict in .raptor-run.json so cross-run views
         # (/project status, /review) can flag non-clean runs without
@@ -1333,6 +4534,9 @@ def complete_run(output_dir: Path, extra: dict[str, Any] | None = None,
     # Snapshot AFTER the status/manifest write so coverage provenance can read
     # the sealed manifest (engine versions / resolved models).
     _snapshot_run_coverage(output_dir)
+    # LAST, after the status write above stamps this run completed, so
+    # the split detector sees the run's own end-state as final.
+    _refresh_project_readjudication(output_dir)
 
 
 def _stamp_findings_provenance(output_dir: Path) -> None:
@@ -1400,7 +4604,8 @@ def _journal_project_dir(out_dir: Path) -> Path | None:
         # beneath it (the pin walk stops at the out-root; this direct
         # parent probe needs the same boundary).
         return None
-    if (parent / "checklist.json").exists() or (
+    from core.inventory import checklist_exists
+    if checklist_exists(parent) or (
         parent / "coverage.json"
     ).exists():
         return parent
@@ -1453,8 +4658,9 @@ def project_run_projections(output_dir: Path,
                             project_dir: Path | None = None) -> None:
     """Re-run the project-facing completion projections for one run.
 
-    The journal-index merge, reads-manifest conversion, and coverage
-    snapshot normally fire exactly once, at ``complete_run`` — a run
+    The journal-index merge, reads-manifest conversion, coverage
+    snapshot, and project re-adjudication refresh normally fire
+    exactly once, at ``complete_run`` — a run
     ADOPTED into a project after the fact (retro-created project,
     ``raptor project add``/``adopt``) already had its completion and
     missed them, so its verdicts stay invisible to cross-run reuse,
@@ -1462,10 +4668,39 @@ def project_run_projections(output_dir: Path,
     as the completion chokepoint: each step no-ops or logs at debug,
     never raises. Idempotent — the index merge is latest-ts keyed and
     the coverage import is interval-union.
+
+    IMPORTED runs are refused wholesale: the import path quarantines
+    the run's trust-bearing artifacts (coverage records, journals,
+    checklist), but ``.reads-manifest`` ships at its canonical path —
+    re-running the projections on such a run would convert a forged
+    manifest into a fresh ``coverage-read.json`` and fold it into the
+    durable store, re-minting exactly the examined-coverage trust the
+    quarantine stripped. The marker is best-effort by design (missing
+    or unreadable reads as not-imported, matching its other
+    consumers); planting one only DEMOTES a run's standing.
     """
+    try:
+        from core.project.findings_utils import run_is_imported
+        if run_is_imported(Path(output_dir)):
+            logger.info(
+                "projections skipped for imported run %s — import "
+                "quarantined its trust artifacts; adopt/add must not "
+                "re-mint them from archive-supplied inputs",
+                Path(output_dir).name,
+            )
+            return
+    except Exception:  # noqa: BLE001 — predicate is an aid, never a crash
+        logger.debug("imported-run check failed for %s",
+                     output_dir, exc_info=True)
+
+    _ensure_receipt_transition_allowed(
+        output_dir,
+        operation="project_run_projections",
+    )
     _merge_run_journal(output_dir, project_dir=project_dir)
     _convert_reads_manifest(output_dir)
     _snapshot_run_coverage(output_dir, project_dir=project_dir)
+    _refresh_project_readjudication(output_dir, project_dir=project_dir)
 
 
 def _merge_run_journal(output_dir: Path,
@@ -1502,6 +4737,57 @@ def _merge_run_journal(output_dir: Path,
     except Exception:
         logger.debug(
             "_merge_run_journal failed for %s", output_dir, exc_info=True
+        )
+
+
+def _refresh_project_readjudication(output_dir: Path,
+                                    project_dir: Path | None = None) -> None:
+    """Best-effort completion projection: refresh the PROJECT-level
+    re-adjudication queue (``<project>/_report/readjudication-queue.
+    jsonl``) so a completing run's verdicts are cross-checked against
+    every SIBLING run's recorded disproofs and confirmed verdicts. The
+    import-time detector (validation-helper ``--findings``) only sees
+    the destination run's own container; without this hook a
+    cross-run contradiction stayed invisible until an operator
+    happened to run ``/project report``.
+
+    Read-only over the project's run dirs plus one atomic queue write,
+    byte-budgeted (see ``readjudication.refresh_project_queue``).
+    THE RUN PIN decides the project, with the same witness and
+    write-target gates as the other completion projections —
+    AUTHORITATIVE pins only: the legacy parent-marker probe serves
+    shared ``--out`` dirs, whose contradiction seam the import-time
+    detector already covers, and a marker-less topology inference must
+    not mint project-store writes. Never raises — lifecycle hooks must
+    not fail on an additive trail.
+    """
+    try:
+        proj = project_dir
+        if proj is None:
+            out_res = Path(output_dir).resolve()
+            from core.run.pin import (
+                pin_project_dir,
+                pinned_write_target_ok,
+                resolve_run_pin,
+            )
+            pin = resolve_run_pin(out_res)
+            if not pin.authoritative:
+                return
+            if not _pin_witness_ok(out_res, pin):
+                return
+            proj = pin_project_dir(out_res, for_write=True)
+            if proj is None or not pinned_write_target_ok(out_res):
+                return
+        from core.project.readjudication import refresh_project_queue
+        queue_path = refresh_project_queue(Path(proj))
+        if queue_path is not None:
+            logger.info(
+                "readjudication: project queue refreshed → %s", queue_path,
+            )
+    except Exception:
+        logger.debug(
+            "_refresh_project_readjudication failed for %s",
+            output_dir, exc_info=True,
         )
 
 
@@ -1585,8 +4871,8 @@ def _snapshot_run_coverage(output_dir: Path,
             if _is_out_root(run_dir.parent):
                 return  # same out-root boundary as _journal_project_dir
             proj = run_dir.parent
-        checklist_path = proj / "checklist.json"
-        if not checklist_path.exists():
+        from core.inventory import checklist_exists, read_checklist
+        if not checklist_exists(proj):
             return                       # standalone run — no durable project store
         from core.coverage.importer import (
             _inventory_paths,
@@ -1594,10 +4880,15 @@ def _snapshot_run_coverage(output_dir: Path,
             import_run_dir,
             import_run_findings,
         )
-        from core.coverage.store import CoverageStore, coverage_store_lock
-        from core.json import load_json
+        from core.coverage.store import (
+            CoverageStore,
+            StoreWriteOverBudget,
+            coverage_store_lock,
+        )
 
-        checklist = load_json(checklist_path)
+        # Accessor read: flock + the sharded checklist/ layout, under
+        # the checklist budget class.
+        checklist = read_checklist(proj)
         if not checklist:
             return
         cov_path = proj / "coverage.json"
@@ -1614,7 +4905,15 @@ def _snapshot_run_coverage(output_dir: Path,
             # intervals so ``store.who_checked_function`` keeps
             # returning ``audit`` / ``agentic`` labels unchanged.
             import_journal(store, proj, checklist)
-            store.save()
+            try:
+                store.save()
+            except StoreWriteOverBudget as e:
+                # Loud refusal, never a silent debug swallow: the
+                # snapshot is skipped but the on-disk store stays
+                # readable (writing past the cap destroyed the whole
+                # durable union on the next load).
+                log.warning("coverage store snapshot refused: %s", e)
+                return
             _append_coverage_progress(proj, run_dir, store, checklist)
     except Exception:
         log.debug("_snapshot_run_coverage failed for %s", output_dir, exc_info=True)
@@ -1650,6 +4949,65 @@ def _append_coverage_progress(proj: Path, run_dir: Path, store,
         )
 
 
+def _already_terminal(output_dir: Path, caller: str,
+                      allow_refail: bool = False,
+                      incoming_extra: dict[str, Any] | None = None) -> bool:
+    """Shared pre-check for the non-complete finalisers (fail_run /
+    cancel_run / interrupt_run): True when the run is ALREADY terminal
+    and the finaliser must return before ANY side effect.
+
+    Re-validate the current status BEFORE the side effects: a sweep's
+    or supervisor-drain's finaliser racing a just-completed run must
+    not re-run the sandbox summary/triage finalisers, manifest
+    conversion, or journal merge against the terminal run dir (the
+    locked ``_update_status`` would refuse the status flip anyway,
+    but by then the finalisers had already rewritten it). Pre-hoist,
+    only fail_run carried this check — cancel_run/interrupt_run
+    re-ran every side effect against completed runs.
+
+    ``allow_refail`` (fail_run only): a failed->failed re-stamp is a
+    SUPPORTED merge lane — a genuine failure landing after a
+    sweep-stamped abandon must consume the ``abandon_sweep`` marker
+    (or a later stray complete_run launders the real failure via the
+    recovery clause), and an idempotent re-fail refreshes the error
+    text. Both contracts are pinned in the abandon-sweep recovery
+    tests; the side effects on that lane are overwrite-idempotent.
+    Best-effort — ``_update_status`` re-validates under the metadata
+    lock.
+
+    ``incoming_extra`` (the caller's ``extra`` dict, or None): a REAL
+    (heuristic-marker-less) finaliser is NOT blocked by a terminal
+    state that was itself stamped by a heuristic finaliser (see
+    ``_HEURISTIC_FINALIZE_MARKERS``) — the real verdict proceeds to
+    the locked ``_update_status``, whose recovery clause adjudicates
+    the override. Without this, a lifecycle hook that misjudged an
+    in-flight run's worker as dead stamped ``completed`` and this
+    pre-check refused the owner's genuine ``fail_run`` outright — the
+    failed run read Completed forever. The side effects the real
+    finaliser then re-runs against the heuristically-stamped dir are
+    the same overwrite-idempotent set as the refail lane.
+    """
+    meta_now = _load_meta(Path(output_dir) / RUN_METADATA_FILE)
+    if not isinstance(meta_now, dict):
+        return False
+    status = meta_now.get("status")
+    if status not in _TERMINAL_STATUSES:
+        return False
+    if allow_refail and status == STATUS_FAILED:
+        return False
+    if (not _heuristic_marks(incoming_extra)
+            and _heuristic_marks(meta_now.get("extra"))):
+        # Real verdict vs heuristic stamp: real wins regardless of
+        # arrival order — let _update_status adjudicate under the lock.
+        return False
+    logger.warning(
+        "%s: %s is already %r — refusing without side effects "
+        "(probable sweep/supervisor racing the run's own finaliser)",
+        caller, output_dir, status,
+    )
+    return True
+
+
 def fail_run(output_dir: Path, error: str | None = None,
              extra: dict[str, Any] | None = None,
              record_timing: bool = True,
@@ -1661,28 +5019,21 @@ def fail_run(output_dir: Path, error: str | None = None,
     fail runs they did not start (dead-session abandons, lifecycle
     hooks) simply make no claim.
     """
+    _ensure_receipt_transition_allowed(
+        output_dir,
+        operation="fail",
+        extra=extra,
+    )
     ensure_run_command(output_dir, expected_command)
-    # Re-validate the current status BEFORE any side effect: a sweep's
-    # fail_run racing a real completion must not re-run the sandbox
-    # summary/triage finalisers against an already-terminal run (the
-    # locked ``_update_status`` would refuse the flip anyway, but by
-    # then the finalisers had already touched the run dir). Best-effort
-    # pre-check — _update_status re-validates under the metadata lock.
-    _meta_now = load_json(Path(output_dir) / RUN_METADATA_FILE)
-    if (isinstance(_meta_now, dict)
-            and _meta_now.get("status") in _TERMINAL_STATUSES
-            and _meta_now.get("status") != STATUS_FAILED):
-        logger.warning(
-            "fail_run: %s is already %r — refusing without side effects "
-            "(probable sweep racing the run's own finaliser)",
-            output_dir, _meta_now.get("status"),
-        )
+    if _already_terminal(output_dir, "fail_run", allow_refail=True,
+                         incoming_extra=extra):
         return
     extra = extra or {}
     if error:
         extra["error"] = error
     _finalize_sandbox_summary(output_dir)
     _triage_verdict = _finalize_sandbox_triage(output_dir)
+    _finalize_egress_summary(output_dir)
     if _triage_verdict is not None:
         extra.setdefault("sandbox_triage", _triage_verdict)
     _update_status(output_dir, STATUS_FAILED, extra, record_timing=record_timing)
@@ -1703,9 +5054,17 @@ def cancel_run(output_dir: Path, extra: dict[str, Any] | None = None,
     ``expected_command`` (optional) asserts ownership — see
     :func:`ensure_run_command`.
     """
+    _ensure_receipt_transition_allowed(
+        output_dir,
+        operation="cancel",
+        extra=extra,
+    )
     ensure_run_command(output_dir, expected_command)
+    if _already_terminal(output_dir, "cancel_run", incoming_extra=extra):
+        return
     _finalize_sandbox_summary(output_dir)
     _triage_verdict = _finalize_sandbox_triage(output_dir)
+    _finalize_egress_summary(output_dir)
     if _triage_verdict is not None:
         extra = dict(extra or {})
         extra.setdefault("sandbox_triage", _triage_verdict)
@@ -1727,12 +5086,20 @@ def interrupt_run(output_dir: Path, reason: str | None = None,
     ``expected_command`` (optional) asserts ownership — see
     :func:`ensure_run_command`.
     """
+    _ensure_receipt_transition_allowed(
+        output_dir,
+        operation="interrupt",
+        extra=extra,
+    )
     ensure_run_command(output_dir, expected_command)
+    if _already_terminal(output_dir, "interrupt_run", incoming_extra=extra):
+        return
     extra = dict(extra or {})
     if reason:
         extra["interrupt_reason"] = reason
     _finalize_sandbox_summary(output_dir)
     _triage_verdict = _finalize_sandbox_triage(output_dir)
+    _finalize_egress_summary(output_dir)
     if _triage_verdict is not None:
         extra.setdefault("sandbox_triage", _triage_verdict)
     _update_status(output_dir, STATUS_INTERRUPTED, extra)
@@ -1770,9 +5137,13 @@ def resume_run(output_dir: Path, note: str | None = None) -> int:
     ValueError when the status is not resumable (notably
     ``completed``).
     """
+    output_dir = Path(output_dir)
+    if _receipt_branch_selected(output_dir / RUN_METADATA_FILE):
+        return _resume_receipt_run(output_dir, note)
+
     path = Path(output_dir) / RUN_METADATA_FILE
     with _metadata_lock(path):
-        metadata = load_json(path)
+        metadata = _load_meta(path)
         if metadata is None:
             msg = f"No {RUN_METADATA_FILE} in {output_dir} — not a run directory"
             raise FileNotFoundError(msg)
@@ -1784,6 +5155,11 @@ def resume_run(output_dir: Path, note: str | None = None) -> int:
                 "expected JSON object"
             )
             raise ValueError(msg)  # noqa: TRY004
+        if _metadata_contains_reserved_input(metadata):
+            raise _receipt_error(
+                RunReceiptReason.RECEIPT_DOWNGRADE_FORBIDDEN,
+                operation="resume",
+            )
         current = metadata.get("status")
         if current not in RESUMABLE_STATUSES:
             msg = (
@@ -1814,17 +5190,55 @@ def resume_run(output_dir: Path, note: str | None = None) -> int:
         metadata.pop("duration_seconds", None)
         prior_session_pid = metadata.get("session_pid")
         session_pid = _get_session_pid()
+        # Worker identity ALWAYS refreshes to the resuming shape —
+        # segment N's liveness credential must be segment N's worker,
+        # not segment 1's stale one (a stale-dead credential reads the
+        # resumed run as not-in-flight and lets a second resume
+        # double-drive it; a stale-alive one blocks it). The old keys
+        # are popped first so a refresh that records nothing (the
+        # sessionless-interactive shape) leaves the legacy pid-less
+        # posture, never segment 1's stamp paired with segment N's pid.
+        metadata.pop("tool_pid", None)
+        metadata.pop("tool_pid_start", None)
+        metadata.update(_worker_stamp(session_bound=session_pid is not None))
         if session_pid is not None:
             metadata["session_pid"] = session_pid
-            metadata["tool_pid"] = os.getppid()
             # Refresh the FULL identity stamp with the pid — a resumed
             # run owned by a different session must never carry the old
             # session's stamp (the verifiers would judge the live
             # resumed run abandoned: stamp != live process at new pid).
-            for key in ("session_start", "session_boot_id",
-                        "session_pidns"):
+            from core.startup.host import RUN_HOST_KEYS
+            for key in (
+                "session_start",
+                "session_boot_id",
+                "session_pidns",
+                "session_machine_id",
+                "session_id",
+                *RUN_HOST_KEYS,
+            ):
                 metadata.pop(key, None)
             metadata.update(_session_stamp(session_pid))
+            resumed_sid = _harness_session_id()
+            if resumed_sid:
+                metadata["session_id"] = resumed_sid
+        else:
+            # Sessionless resume (detached orchestrator, bare shell):
+            # the prior owner's session identity is stale — keeping a
+            # dead session's stamp would get the resumed run swept as
+            # "owning session terminated" mid-flight. No session is
+            # the honest owner record; the refreshed worker stamp
+            # above carries the in-flight signal instead.
+            metadata.pop("session_pid", None)
+            from core.startup.host import RUN_HOST_KEYS
+            for key in (
+                "session_start",
+                "session_boot_id",
+                "session_pidns",
+                "session_machine_id",
+                "session_id",
+                *RUN_HOST_KEYS,
+            ):
+                metadata.pop(key, None)
         save_json(path, metadata)
     # Re-mark as the active run so sandbox summaries and coverage
     # tracking attach to the resumed segment.
@@ -1884,7 +5298,7 @@ def resume_run(output_dir: Path, note: str | None = None) -> int:
                         "with", output_dir, _marker_project, _witnessed)
                 _wsource = _wsource or "session"
                 with _metadata_lock(path):
-                    _fresh = load_json(path)
+                    _fresh = _load_meta(path)
                     if isinstance(_fresh, dict):
                         _fresh["project"] = _witnessed
                         _fresh["project_source"] = _wsource
@@ -1929,9 +5343,13 @@ def reopen_run(output_dir: Path, note: str | None = None) -> None:
     Raises FileNotFoundError when there is no metadata file and
     ValueError when the current status is not ``completed``.
     """
+    _ensure_receipt_transition_allowed(
+        output_dir,
+        operation="reopen",
+    )
     path = Path(output_dir) / RUN_METADATA_FILE
     with _metadata_lock(path):
-        metadata = load_json(path)
+        metadata = _load_meta(path)
         if metadata is None:
             msg = f"No {RUN_METADATA_FILE} in {output_dir}"
             raise FileNotFoundError(msg)
@@ -1941,6 +5359,12 @@ def reopen_run(output_dir: Path, note: str | None = None) -> None:
                 "expected JSON object"
             )
             raise ValueError(msg)  # noqa: TRY004 — malformed on-disk data
+        _reject_reserved_mapping(metadata.get("extra"), operation="reopen")
+        if not _metadata_allows_legacy_attribution(metadata):
+            raise _receipt_error(
+                RunReceiptReason.TERMINAL_TRANSITION_FORBIDDEN,
+                operation="reopen",
+            )
         current = metadata.get("status")
         if current != STATUS_COMPLETED:
             msg = f"reopen_run: expected status 'completed', got {current!r}"
@@ -1997,8 +5421,14 @@ def tracked_run(output_dir: Path, command: str,
 
 
 def load_run_metadata(run_dir: Path) -> dict[str, Any] | None:
-    """Load .raptor-run.json from a run directory. Returns None if missing."""
-    return load_json(run_dir / RUN_METADATA_FILE)
+    """Load .raptor-run.json from a run directory. Returns None if missing.
+
+    Byte-budgeted (same 1 MiB the start_run ownership probe applies to
+    this exact file): the run dir is sandbox-writable mid-run, so an
+    oversize plant loads as None instead of buffering unbounded — the
+    bash hook's read of the same file is capped for the same reason.
+    """
+    return _load_meta(run_dir / RUN_METADATA_FILE)
 
 
 def corroborate_target_path(run_dir: Path, candidate) -> str | None:
@@ -2029,9 +5459,17 @@ def corroborate_target_path(run_dir: Path, candidate) -> str | None:
             return None
     except OSError:
         return None
+    # The mismatch text is printed by every consumer shim (the 11
+    # enrich/normalize/cpg-cache scripts) — and ``candidate`` is the
+    # LLM-writable checklist value that fires exactly in the
+    # tamper-detected case. Escape both paths here so every consumer
+    # print is terminal-safe at the chokepoint.
+    from core.security.log_sanitisation import sanitise_for_terminal
     return (
-        f"recovered target path {candidate!s} does not match the "
-        f"target_path sealed in {RUN_METADATA_FILE} ({sealed})"
+        f"recovered target path "
+        f"{sanitise_for_terminal(str(candidate), max_len=200)} does not "
+        f"match the target_path sealed in {RUN_METADATA_FILE} "
+        f"({sanitise_for_terminal(sealed, max_len=200)})"
     )
 
 
@@ -2154,9 +5592,15 @@ def write_run_pin(run_dir: Path, project: str | None, source: str) -> None:
     # write (a resurrected status=running reads as abandoned and gets
     # sweep-failed; a dropped pin orphans the run).
     with _metadata_lock(path):
-        meta = load_json(path)
+        meta = _load_meta(path)
         if not isinstance(meta, dict):
             meta = {}
+        _reject_reserved_mapping(meta.get("extra"), operation="write_run_pin")
+        if not _metadata_allows_legacy_attribution(meta):
+            raise _receipt_error(
+                RunReceiptReason.PIN_REWRITE_FORBIDDEN,
+                operation="write_run_pin",
+            )
         if (meta.get("status") == STATUS_RUNNING
                 and _session_alive_for_meta(meta)):
             msg = (f"refusing to re-pin {run_dir}: the run is live "
@@ -2203,10 +5647,22 @@ def _update_status(output_dir: Path, status: str,
     concurrent writers (parallel workers, a sweep racing a completion)
     serialise instead of last-writer-wins dropping each other's updates.
     """
+    _reject_reserved_mapping(extra, operation="status")
+    _reject_reserved_mapping(manifest, operation="status")
     path = Path(output_dir) / RUN_METADATA_FILE
     with _metadata_lock(path):
-        metadata = load_json(path)
+        metadata = _load_meta(path)
         if metadata is None:
+            if path.exists():
+                # The file is THERE but the budgeted read refused it
+                # (oversize plant / unreadable) — a FileNotFoundError
+                # here misled callers that had just enumerated the
+                # file. Same malformed-on-disk contract (ValueError)
+                # as the non-dict branch below.
+                msg = (f"Unreadable {RUN_METADATA_FILE} in {output_dir}"
+                       f" — over budget or malformed; refusing the "
+                       f"status update")
+                raise ValueError(msg)
             msg = f"No {RUN_METADATA_FILE} in {output_dir} — call start_run() first"
             raise FileNotFoundError(msg)
         if not isinstance(metadata, dict):
@@ -2214,30 +5670,81 @@ def _update_status(output_dir: Path, status: str,
             # exception type callers already handle.
             msg = f"Malformed {RUN_METADATA_FILE} in {output_dir} — expected JSON object"
             raise ValueError(msg)  # noqa: TRY004
-        current = metadata.get("status")
-        if current in _TERMINAL_STATUSES and current != status:
-            # Recovery clause: a ``failed`` stamped by an abandon sweep
-            # (``extra.abandon_sweep``) is a heuristic verdict, not a
-            # real terminal transition. If the sweep was wrong (the run
-            # was live), its real finaliser must not be refused — pre-
-            # fix a wrongly-abandoned paid run could never record its
-            # actual completion. The override clears the sweep's
-            # markers so the true outcome isn't contaminated.
-            swept_extra = metadata.get("extra")
-            if (current == STATUS_FAILED
-                    and isinstance(swept_extra, dict)
-                    and swept_extra.get("abandon_sweep")):
-                logger.warning(
-                    "Overriding sweep-stamped abandon %r → %r in %s "
-                    "(the abandon sweep misjudged a live run)",
-                    current, status, output_dir,
+        _reject_reserved_mapping(metadata.get("extra"), operation="status")
+        if not _metadata_allows_legacy_attribution(metadata):
+            try:
+                from core.startup.runtime_receipt.terminal import (
+                    _verify_owned_fake_terminal_permit,
                 )
-                swept_extra.pop("abandon_sweep", None)
-                # The error field was set by the same sweep that set
-                # the flag — drop it so the true outcome isn't
-                # contaminated by the wrong abandon reason.
-                swept_extra.pop("error", None)
-                metadata["extra"] = swept_extra
+
+                permitted = _verify_owned_fake_terminal_permit(
+                    path,
+                    metadata,
+                    status,
+                )
+            except Exception:  # noqa: BLE001 — private permit must fail closed
+                permitted = False
+            if not permitted:
+                raise _receipt_error(
+                    RunReceiptReason.TERMINAL_TRANSITION_FORBIDDEN,
+                    operation="status",
+                )
+        current = metadata.get("status")
+        incoming_marks = _heuristic_marks(extra)
+        if current in _TERMINAL_STATUSES and incoming_marks:
+            # A heuristic-marked write (abandon sweep, lifecycle-hook
+            # Stop finalisation) onto an ALREADY-TERMINAL status is a
+            # no-op: the heuristic judged the run from a stale
+            # status=running read and lost the race — the earlier
+            # terminal state is the truth. Merging instead (the
+            # pre-fix behaviour for failed→failed, which skips the
+            # terminal guard below) overwrote a REAL failure's error
+            # with the sweep's message and planted the marker, so a
+            # later stray complete_run laundered the genuine failure
+            # to completed via the recovery clause. Same-status writes
+            # are caught too: a heuristic ``completed`` merged onto a
+            # real ``completed`` would plant its marker and hand a
+            # later stray fail_run the recovery clause. Heuristic-first
+            # orderings are unaffected: their write lands on
+            # status=running, and the consume/recovery clauses below
+            # still let the real finaliser supersede it.
+            logger.info(
+                "Ignoring %s-stamped %r write onto terminal status %r "
+                "in %s (the heuristic finaliser lost the race)",
+                "/".join(incoming_marks), status, current, output_dir,
+            )
+            return
+        if current in _TERMINAL_STATUSES and current != status:
+            # Recovery clause: a terminal status stamped by a heuristic
+            # finaliser (abandon sweep's ``failed``, lifecycle hook's
+            # Stop-path ``completed``/``failed`` — see
+            # ``_HEURISTIC_FINALIZE_MARKERS``) is a judged verdict, not
+            # a real terminal transition. If the heuristic was wrong
+            # (the run was live), the run's own finaliser must not be
+            # refused — pre-fix a wrongly-abandoned paid run could
+            # never record its actual completion, and a hook-stamped
+            # ``completed`` on an in-flight run silently beat the
+            # owner's real ``fail_run`` (a failed scan read Completed
+            # forever). Only REAL writes reach here: heuristic-marked
+            # incoming writes returned in the no-op clause above.
+            # The override clears the heuristic's markers and error so
+            # the true outcome isn't contaminated.
+            stamped_extra = metadata.get("extra")
+            stored_marks = _heuristic_marks(stamped_extra)
+            if stored_marks:
+                logger.warning(
+                    "Overriding %s-stamped %r → %r in %s "
+                    "(the heuristic finaliser misjudged a live run)",
+                    "/".join(stored_marks), current, status, output_dir,
+                )
+                assert stamped_extra is not None
+                for _mark in _HEURISTIC_FINALIZE_MARKERS:
+                    stamped_extra.pop(_mark, None)
+                # The error field was set by the same heuristic that
+                # set the marker — drop it so the true outcome isn't
+                # contaminated by the wrong abandon/exit reason.
+                stamped_extra.pop("error", None)
+                metadata["extra"] = stamped_extra
             else:
                 logger.warning(
                     "Refusing to overwrite terminal status %r → %r in %s "
@@ -2247,22 +5754,27 @@ def _update_status(output_dir: Path, status: str,
                 return
         metadata["status"] = status
 
-        # A GENUINE failure supersedes a prior sweep-stamped abandon:
-        # consume the marker when a FAILED write arrives whose incoming
-        # extra does not itself carry it. Without this, the extras
-        # merge below preserved abandon_sweep alongside the real error,
-        # and a later complete_run took the recovery branch — flipping
-        # a genuinely failed run to completed and deleting the real
-        # error (the exact laundering the terminal guard exists to
-        # prevent).
-        if status == STATUS_FAILED and not (extra or {}).get("abandon_sweep"):
+        # A GENUINE terminal write supersedes a prior heuristic stamp:
+        # consume the markers when a real (unmarked) terminal write
+        # arrives. Without this, the extras merge below preserved the
+        # marker alongside the real outcome, and a later stray
+        # finaliser took the recovery branch — flipping a genuinely
+        # failed run to completed (or vice versa) and deleting the
+        # real error (the exact laundering the terminal guard exists
+        # to prevent). Covers the same-status lanes the recovery
+        # clause skips: failed→failed refail merges and a real
+        # complete_run landing on a hook-stamped ``completed``.
+        if status in _TERMINAL_STATUSES and not incoming_marks:
             _prior_extra = metadata.get("extra")
-            if (isinstance(_prior_extra, dict)
-                    and _prior_extra.pop("abandon_sweep", None)):
-                logger.info(
-                    "abandon_sweep marker consumed by a real failure in "
-                    "%s — the failed status is now terminal", output_dir,
-                )
+            if isinstance(_prior_extra, dict):
+                _consumed = [m for m in _HEURISTIC_FINALIZE_MARKERS
+                             if _prior_extra.pop(m, None)]
+                if _consumed:
+                    logger.info(
+                        "%s marker consumed by a real %r write in %s — "
+                        "the status is now terminal",
+                        "/".join(_consumed), status, output_dir,
+                    )
 
         if record_timing:
             now = datetime.now(timezone.utc)

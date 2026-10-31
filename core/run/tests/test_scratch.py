@@ -10,6 +10,7 @@ prefixes (the coverage gap that let unlisted prefixes leak forever).
 
 from __future__ import annotations
 
+import contextlib
 import os
 import time
 
@@ -26,6 +27,15 @@ def tmp_root(tmp_path, monkeypatch):
     monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
     monkeypatch.delenv("RAPTOR_TMP_REAP_MAX_AGE_H", raising=False)
     return tmp_path
+
+
+@pytest.fixture(autouse=True)
+def _pin_sweep_roots(monkeypatch):
+    """Hermeticity: the sweep walks the real system tmp root and the
+    lane fallback base in addition to gettempdir() — the reap
+    assertions here must only ever see the private tmp_root."""
+    monkeypatch.setattr(tmp_reaper, "_SYSTEM_TMP_ROOTS", ())
+    monkeypatch.setattr(tmp_reaper, "_lane_fallback_bases", lambda: ())
 
 
 @pytest.fixture(autouse=True)
@@ -57,8 +67,14 @@ class TestBasicLifecycle:
             sub.mkdir()
             (sub / "f").write_text("x")
             os.chmod(sub, 0o000)
-        os.chmod(sub, 0o755)  # allow the fixture's own teardown
-        assert p.exists() or not p.exists()  # no exception is the assertion
+        # Reaching here IS the assertion: cleanup swallowed whatever the
+        # unreadable subdir did to it. What that was is venue-dependent:
+        # an unprivileged run cannot descend into the 000 dir, so the
+        # survivor needs its mode back for the fixture's own teardown,
+        # while a user-namespace root (CAP_DAC_OVERRIDE over its own
+        # files) removes it outright and leaves nothing to restore.
+        with contextlib.suppress(FileNotFoundError):
+            os.chmod(sub, 0o755)
 
     def test_keep_transfers_ownership(self, tmp_root):
         with scratch_dir("raptor-scratch-test-", keep=True) as p:
@@ -336,3 +352,157 @@ class TestKeepalivePublicAPI:
             assert str(parent_dir) in scratch_mod._keepalive_paths
         finally:
             keepalive_unregister(parent_dir)
+
+
+class TestInodeCeilingAdvisory:
+    """The soft inode ceiling on system-tmp lane creation: loud past
+    the threshold, silent below it, rate-limited, operator-tunable,
+    and never a refusal."""
+
+    @pytest.fixture(autouse=True)
+    def _fresh_advisory_state(self, monkeypatch):
+        from core.run import scratch as scratch_mod
+        monkeypatch.setattr(scratch_mod, "_last_inode_warning", 0.0)
+        monkeypatch.delenv("RAPTOR_TMP_INODE_SOFT_PCT", raising=False)
+
+    @staticmethod
+    def _statvfs(files: int, free: int):
+        import types
+        return lambda _path: types.SimpleNamespace(
+            f_files=files, f_ffree=free)
+
+    def _mint_lane(self, tmp_root):
+        with scratch_dir("raptor-scratch-test-"):
+            pass
+
+    def test_below_ceiling_is_silent(self, tmp_root, monkeypatch, caplog):
+        from core.run import scratch as scratch_mod
+        monkeypatch.setattr(
+            scratch_mod.os, "statvfs", self._statvfs(1000, 500))
+        with caplog.at_level("WARNING"):
+            self._mint_lane(tmp_root)
+        assert "inode usage" not in caplog.text
+
+    def test_past_ceiling_warns_loudly_once(
+        self, tmp_root, monkeypatch, caplog,
+    ):
+        from core.run import scratch as scratch_mod
+        monkeypatch.setattr(
+            scratch_mod.os, "statvfs", self._statvfs(1000, 50))  # 95%
+        with caplog.at_level("WARNING"):
+            self._mint_lane(tmp_root)
+            self._mint_lane(tmp_root)  # within the re-warn interval
+        assert caplog.text.count("inode usage") == 1
+        assert "95% inode usage" in caplog.text
+        # Advisory only: the lane itself was still created and cleaned.
+
+    def test_env_moves_the_ceiling(self, tmp_root, monkeypatch, caplog):
+        from core.run import scratch as scratch_mod
+        monkeypatch.setattr(
+            scratch_mod.os, "statvfs", self._statvfs(1000, 500))  # 50%
+        monkeypatch.setenv("RAPTOR_TMP_INODE_SOFT_PCT", "40")
+        with caplog.at_level("WARNING"):
+            self._mint_lane(tmp_root)
+        assert "inode usage" in caplog.text
+
+    def test_env_zero_disables(self, tmp_root, monkeypatch, caplog):
+        from core.run import scratch as scratch_mod
+        monkeypatch.setattr(
+            scratch_mod.os, "statvfs", self._statvfs(1000, 0))  # 100%
+        monkeypatch.setenv("RAPTOR_TMP_INODE_SOFT_PCT", "0")
+        with caplog.at_level("WARNING"):
+            self._mint_lane(tmp_root)
+        assert "inode usage" not in caplog.text
+
+    def test_non_numeric_env_keeps_default(
+        self, tmp_root, monkeypatch, caplog,
+    ):
+        from core.run import scratch as scratch_mod
+        monkeypatch.setattr(
+            scratch_mod.os, "statvfs", self._statvfs(1000, 20))  # 98%
+        monkeypatch.setenv("RAPTOR_TMP_INODE_SOFT_PCT", "lots")
+        with caplog.at_level("WARNING"):
+            self._mint_lane(tmp_root)
+        assert "inode usage" in caplog.text
+
+    def test_no_inode_accounting_is_silent(
+        self, tmp_root, monkeypatch, caplog,
+    ):
+        from core.run import scratch as scratch_mod
+        monkeypatch.setattr(
+            scratch_mod.os, "statvfs", self._statvfs(0, 0))
+        with caplog.at_level("WARNING"):
+            self._mint_lane(tmp_root)
+        assert "inode usage" not in caplog.text
+
+    def test_statvfs_failure_never_breaks_lane_creation(
+        self, tmp_root, monkeypatch,
+    ):
+        from core.run import scratch as scratch_mod
+
+        def _boom(_path):
+            raise OSError("statvfs exploded")
+
+        monkeypatch.setattr(scratch_mod.os, "statvfs", _boom)
+        with scratch_dir("raptor-scratch-test-") as p:
+            assert p.is_dir()
+
+    def test_run_output_shape_not_probed(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        # dir=... scratch is operator-visible run output, not the
+        # session-tmp growth surface — no advisory there.
+        from core.run import scratch as scratch_mod
+        monkeypatch.setattr(
+            scratch_mod.os, "statvfs", self._statvfs(1000, 0))
+        with caplog.at_level("WARNING"):
+            with scratch_dir("x-", dir=tmp_path / "out"):
+                pass
+        assert "inode usage" not in caplog.text
+
+
+class TestTempRootInteropAdvisory:
+    """System-tmp lane creation is a temp-root advisory chokepoint."""
+
+    pytestmark = pytest.mark.wsl
+
+    @pytest.fixture(autouse=True)
+    def _reset_latch(self):
+        from core.startup import wsl
+        wsl._tmpdir_warned = False
+        yield
+        wsl._tmpdir_warned = False
+
+    def test_system_tmp_shape_fires_advisory_once(
+        self, tmp_root, monkeypatch, capsys,
+    ):
+        from core.startup import wsl
+        monkeypatch.setattr(wsl, "is_wsl", lambda kernel_id=None: True)
+        monkeypatch.setattr(wsl, "fs_is_drvfs_or_9p", lambda path: True)
+        with scratch_dir("raptor-scratch-test-"):
+            pass
+        with scratch_dir("raptor-scratch-test-"):
+            pass
+        err = capsys.readouterr().err
+        assert err.count("temp root (TMPDIR/RAPTOR_WORK_DIR)") == 1
+        assert "export TMPDIR=/tmp" in err
+
+    def test_silent_off_wsl(self, tmp_root, monkeypatch, capsys):
+        from core.startup import wsl
+        monkeypatch.setattr(wsl, "is_wsl", lambda kernel_id=None: False)
+        with scratch_dir("raptor-scratch-test-"):
+            pass
+        assert "temp root" not in capsys.readouterr().err
+
+    def test_run_output_shape_not_a_chokepoint(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        # dir=... scratch does not live under the temp root, so it
+        # must not spend the once-per-process advisory.
+        from core.startup import wsl
+        monkeypatch.setattr(wsl, "is_wsl", lambda kernel_id=None: True)
+        monkeypatch.setattr(wsl, "fs_is_drvfs_or_9p", lambda path: True)
+        with scratch_dir("x-", dir=tmp_path / "out"):
+            pass
+        assert "temp root" not in capsys.readouterr().err
+        assert wsl._tmpdir_warned is False

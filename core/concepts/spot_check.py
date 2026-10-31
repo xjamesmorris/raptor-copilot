@@ -41,7 +41,8 @@ def _value_patterns(name: str) -> list[re.Pattern]:
     esc = re.escape(name)
     return [
         # #define NAME value
-        re.compile(rf"#\s*define\s+{esc}\s+\(?\s*{_VALUE}"),
+        # gated optional paren (the \(?\s* pair was quadratic)
+        re.compile(rf"#\s*define\s+{esc}\s+(?:\(\s*)?{_VALUE}"),
         # NAME [: type] = value  (C/Go/Python/Rust/TS const forms all
         # reduce to this once the definition line is isolated).  The
         # '=' must directly follow the identifier or a ': type'
@@ -50,7 +51,12 @@ def _value_patterns(name: str) -> list[re.Pattern]:
         # read as NAME=0 and ``buf[NAME]; int other = 42;`` read as
         # NAME=42, and those wrong values were trusted unconditionally
         # as mechanical answers.
-        re.compile(rf"\b{esc}\b\s*(?::[^=;\n]*)?=(?!=)\s*{_VALUE}"),
+        # The annotation span is bounded: unbounded, every NAME occurrence
+        # planted in a hostile line re-scans the rest of the line —
+        # quadratic. Real type annotations sit far below 500 chars
+        # (beyond it the definition is not extracted, versus an
+        # unbounded scan).
+        re.compile(rf"\b{esc}\b\s*(?::[^=;\n]{{0,500}})?=(?!=)\s*{_VALUE}"),
         # enum member: NAME = value or bare position not decidable
         re.compile(rf"\b{esc}\s*=\s*{_VALUE}\s*[,;}}]"),
     ]
@@ -124,11 +130,23 @@ _FALLBACK_STOPWORDS = frozenset({
 # "Is MAX_FRAME 4096?", "Does MAX_FRAME equal 4096?",
 # "Is the value of MAX_FRAME == 0x1000?"  The verb is optional so
 # both "MAX_FRAME equals 4096" and the fronted "Is MAX_FRAME 4096"
-# shapes parse; a false identifier match is harmless because the
-# corpus lookup gates the result.
+# shapes parse.  The corpus lookup gates candidates to exact symbol
+# names, but that is NOT sufficient on its own: stopword-named
+# globals (size, count, state, version, ...) are ubiquitous, so a
+# plain-lowercase stopword capture falls back to the identifier
+# scan below instead of asserting a value match against an unrelated
+# same-named global (spot_check_question applies the same stopword
+# test both paths).
+# The optional verb gates its own trailing whitespace — the naive
+# ``\s*(?:VERB)?\s*`` put two whitespace spans around it, quadratic
+# on a claim ending in a whitespace run.
+# The identifier is pinned to the start of its token run
+# ((?<![\w.:])): an unanchored scan otherwise restarts inside every
+# identifier suffix — quadratic on a long token run — and a
+# mid-token start is never a real identifier claim.
 _QUESTION_VALUE_RE = re.compile(
-    r"[`'\"]?([A-Za-z_][\w.:]*)[`'\"]?\s*"
-    r"(?:is|==|equals?|equal to|set to|defined as)?\s*"
+    r"[`'\"]?(?<![\w.:])([A-Za-z_][\w.:]*)[`'\"]?\s*"
+    r"(?:(?:is|==|equals?|equal to|set to|defined as)\s*)?"
     rf"[`'\"]?{_VALUE}[`'\"]?",
     re.IGNORECASE,
 )
@@ -166,8 +184,20 @@ def spot_check_question(
     candidates: list[str] = []
     m = _QUESTION_VALUE_RE.search(question)
     if m:
-        candidates.append(m.group(1))
-        expected = m.group(2)
+        ident = m.group(1)
+        if (ident.isalpha() and ident.islower()
+                and ident in _FALLBACK_STOPWORDS):
+            # Same gate as the fallback loop below: a plain-lowercase
+            # stopword ("Does size equal 100 ...") is prose, not an
+            # identifier — trusting the value assertion against a
+            # same-named corpus global produced a confidently wrong
+            # mechanical matches=False that fed the contradiction
+            # machinery against the review's assumption. Fall back to
+            # fallback semantics: no asserted-value comparison.
+            pass
+        else:
+            candidates.append(ident)
+            expected = m.group(2)
     # Fall back to identifier-shaped tokens that name a corpus item —
     # excluding common English / generic-programming words, which
     # would otherwise match same-named corpus globals and answer the
@@ -182,21 +212,37 @@ def spot_check_question(
         if tok not in candidates:
             candidates.append(tok)
 
-    by_name: dict[str, dict] = {}
+    by_name: dict[str, list[dict]] = {}
     for item in study_items:
         if isinstance(item, dict) and item.get("name"):
-            by_name.setdefault(item["name"], item)
+            by_name.setdefault(item["name"], []).append(item)
 
     for cand in candidates:
         tail = re.split(r"\.|::", cand)[-1]
-        item = by_name.get(tail)
-        if item is None:
+        same_named = by_name.get(tail)
+        if not same_named:
             continue
-        value = extract_constant_value(
-            tail, item.get("definition") or "",
-        )
-        if value is None:
+        # Corpus authority is (name, definition) — first-by-name is a
+        # wrong-file trap: same-named constants in different files can
+        # carry DIFFERENT values, and picking one arbitrarily emits a
+        # confidently wrong trusted mechanical answer. When the
+        # same-named definitions disagree on the extracted value,
+        # refuse the mechanical channel (ambiguous authority — the
+        # LLM path sees the question instead). Agreeing duplicates
+        # answer normally.
+        extracted: list[tuple[dict, str]] = []
+        for it in same_named:
+            v = extract_constant_value(
+                tail, it.get("definition") or "",
+            )
+            if v is not None:
+                extracted.append((it, v))
+        if not extracted:
             continue
+        distinct = {_normalise_literal(v) or v for _, v in extracted}
+        if len(distinct) > 1:
+            continue
+        item, value = extracted[0]
         # Receipt: the definition line carrying the assignment
         def_line: str | None = None
         for line in (item.get("definition") or "").splitlines():

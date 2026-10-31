@@ -11,6 +11,7 @@ import hashlib
 import os
 import re
 import secrets
+import shlex
 import shutil
 import subprocess
 import sys
@@ -35,13 +36,103 @@ from core.git import get_safe_git_env
 # See `core.git.clone.safe_git_command` for the threat model
 # (CVE-2024-32002 family: hostile per-repo .git/config).
 from core.git.clone import safe_git_command
+from core.git.dirty import probe_worktree_dirt
 from core.hash import sha256_string
 from core.json import load_json, save_json
 from core.logging import get_logger
 from core.sandbox import SandboxSetupError
+from core.security.credential_env import (
+    CREDENTIAL_ENV_FAMILY,
+    is_credential_redirect_shaped,
+)
 from packages.codeql.tunables import CodeQLTunables
 
 logger = get_logger()
+
+
+def _filter_build_env_vars(env_vars: dict) -> dict:
+    """Admit build-system env vars past the hostile-input gate:
+    DENY-UNKNOWN — exactly the (name, value) pairs RAPTOR itself
+    declares in the static ``BUILD_SYSTEMS`` table pass; every other
+    entry is refused, loudly.
+
+    ``build_system.env_vars`` carries RAPTOR-CHOSEN CONSTANTS by
+    contract (the static table is the only producer — this docstring
+    previously claimed the dict was repo-authored, and the gate built
+    on that premise refused RAPTOR's own JVM heap constants as
+    hostile, so every traced maven/gradle/ant build ran on the
+    default heap). The dict is layered on top of ``get_safe_env()``
+    where an unblocked name OVERRIDES the baseline (including the
+    ``GIT_ENV_VARS`` pins), so an admit-by-default tail meant any
+    future producer routing repo metadata into the field inherited a
+    per-name arms race against the blocklists; pair-exact
+    deny-unknown ends it — only the literal benign pair RAPTOR would
+    have set anyway can pass. Exotic build environments are not this
+    field's job: operator-declared build configuration travels via
+    the ``build-command`` project setting and the ``build`` trust
+    marker, never through ``env_vars``.
+
+    Declared pairs WIN over the blocklist tiers below by design —
+    that IS the heap-constants fix (three of the five declared names,
+    MAVEN_OPTS/GRADLE_OPTS/ANT_OPTS, sit in the credential-env
+    ecosystem family today; refusing them re-runs every traced JVM
+    build on the default heap). The tiers are retained purely as
+    refusal CATEGORISATION for the warning below; they cannot widen
+    admission. The guard against the table becoming a blocklist
+    bypass is review-side plus the grandfathered-intersection pin in
+    the gate's tests: a NEW declared name landing inside a blocklist
+    fails there until deliberately grandfathered.
+
+    * the DANGEROUS_ENV_VARS + PROXY_ENV_VARS blocklists (LD_PRELOAD /
+      BASH_ENV re-injection, proxy redirect);
+    * the full credential-env family plus credential-redirect SHAPED
+      names (core/security/credential_env.py);
+    * RAPTOR_*-prefixed names wholesale.
+
+    Membership is CASE-FOLDED: several tools that read these names
+    honour lowercase spellings (npm's canonical form is
+    ``npm_config_userconfig``; the proxy family has lowercase-
+    canonical variants).
+    """
+    blocked_upper = {
+        name.upper()
+        for name in (
+            set(RaptorConfig.DANGEROUS_ENV_VARS)
+            | set(RaptorConfig.PROXY_ENV_VARS)
+            | CREDENTIAL_ENV_FAMILY
+        )
+    }
+    from core.build.build_detector import declared_env_constants
+    raptor_constants = declared_env_constants()
+    admitted = {}
+    refused_hostile = []
+    refused_undeclared = []
+    for k, v in env_vars.items():
+        if (k, v) in raptor_constants:
+            # RAPTOR's own declared constant — exact pair match, so a
+            # producer smuggling a DIFFERENT value under a declared
+            # name (MAVEN_OPTS=-javaagent:…) still hits the gate.
+            admitted[k] = v
+            continue
+        k_upper = k.upper()
+        if (k_upper in blocked_upper
+                or k_upper.startswith(("RAPTOR_", "_RAPTOR"))
+                or is_credential_redirect_shaped(k)):
+            refused_hostile.append(k)
+            continue
+        refused_undeclared.append(k)
+    if refused_hostile or refused_undeclared:
+        logger.warning(
+            "build env filter (deny-unknown): refused %d env var(s) — "
+            "hostile-shaped: %s; not a RAPTOR-declared BUILD_SYSTEMS "
+            "constant: %s. A legitimate build knob belongs in the "
+            "BUILD_SYSTEMS table (RAPTOR-chosen constants) or in the "
+            "operator's build-command setting, never in env_vars.",
+            len(refused_hostile) + len(refused_undeclared),
+            sorted(refused_hostile) or "-",
+            sorted(refused_undeclared) or "-",
+        )
+    return admitted
 
 # Languages whose databases are created with ``--build-mode=none``
 # (buildless extraction) BY DEFAULT.  A traced build (and the
@@ -146,6 +237,107 @@ def buildless_degradation_summary(db_path: Path) -> tuple:
     )
 
 
+# Hint appended to a failed traced build's stderr tail when the build
+# tried to write into the read-only-mounted source tree. The sandbox
+# mounts target= read-only by design; in-tree builds (object files next
+# to sources) fail on the first write and the raw errno alone does not
+# tell the operator what to change.
+_READONLY_TARGET_HINT = (
+    "hint: the target tree is mounted read-only inside the sandbox — "
+    "point the build out of tree (e.g. `make O=<dir under the staging "
+    "area>`) or otherwise avoid writing into the source tree."
+)
+
+
+def _build_stderr_tail(stderr: str | None, *, max_lines: int = 10,
+                       max_chars: int = 2048) -> str:
+    """Bounded, terminal-safe tail of a failed build's stderr.
+
+    Returns ``""`` when there is nothing to show. The bounds apply to
+    the PRE-escape text: the last ``max_lines`` lines within the last
+    ``max_chars`` characters of the raw stderr. Build stderr is
+    target-controlled text (traced builds run the repo's build
+    scripts), so that window is then escaped via the
+    ``core.security.log_sanitisation`` contract before it reaches the
+    operator's terminal — escaping expands each non-printable byte to
+    a ``\\xHH``/``\\uHHHH`` literal, so the returned string can run a
+    small constant factor past ``max_chars`` but stays bounded by it.
+    A clipped tail carries an explicit elision marker. When the tail names a read-only filesystem, the
+    out-of-tree-build hint is appended (see
+    :data:`_READONLY_TARGET_HINT`).
+    """
+    if not stderr:
+        return ""
+    from core.security.log_sanitisation import escape_nonprintable
+    window = stderr[-max_chars:]
+    lines = window.splitlines()
+    clipped = len(window) < len(stderr) or len(lines) > max_lines
+    tail = "\n".join(lines[-max_lines:])
+    detail = escape_nonprintable(tail, preserve_newlines=True)
+    if clipped:
+        detail = "[... earlier build output elided ...]\n" + detail
+    if "Read-only file system" in tail:
+        detail += "\n" + _READONLY_TARGET_HINT
+    return detail
+
+
+_PYTHON_FORK_TRAMPOLINE = (
+    "import multiprocessing, runpy, sys; "
+    "multiprocessing.set_start_method('fork'); "
+    "sys.argv = sys.argv[1:]; "
+    "runpy.run_path(sys.argv[0], run_name='__main__')"
+)
+_PYTHON_EXECUTABLE_OPTION = "CODEQL_EXTRACTOR_PYTHON_OPTION_PYTHON_EXECUTABLE_NAME"
+
+
+def _python_fork_wrapper_needed(language: str) -> bool:
+    if language != "python" or sys.platform != "linux" or sys.version_info < (3, 14):
+        return False
+    from core.sandbox.probes import check_child_unix_sockets_available
+
+    return not check_child_unix_sockets_available()
+
+
+def _create_python_fork_wrapper(db_root: Path, interpreter: str) -> Path:
+    """Select fork for CodeQL's tracer without changing other Python invocations."""
+    tmp_dir = db_root / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    fd, script_name = tempfile.mkstemp(
+        prefix=".raptor_codeql_python_",
+        suffix=".sh",
+        dir=str(tmp_dir),
+    )
+    os.close(fd)
+    script = Path(script_name)
+    python = shlex.quote(interpreter)
+    trampoline = shlex.quote(_PYTHON_FORK_TRAMPOLINE)
+    try:
+        script.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            'case "${1-}" in\n'
+            "    -S)\n"
+            '        case "${2-}" in\n'
+            "            */python_tracer.py)\n"
+            "                shift\n"
+            f'                exec {python} -S -c {trampoline} "$@"\n'
+            "                ;;\n"
+            "        esac\n"
+            "        ;;\n"
+            "    */python_tracer.py)\n"
+            f'        exec {python} -c {trampoline} "$@"\n'
+            "        ;;\n"
+            "esac\n"
+            f'exec {python} "$@"\n',
+            encoding="utf-8",
+        )
+        script.chmod(0o500)
+    except BaseException:
+        script.unlink(missing_ok=True)
+        raise
+    return script
+
+
 @dataclass
 class DatabaseMetadata:
     """Metadata for CodeQL database."""
@@ -248,7 +440,7 @@ class DatabaseManager:
         """Mount-ns bind dirs needed for codeql to run. See QueryRunner
         equivalent — same rationale (codeql install root rarely lives
         in /usr/bin)."""
-        return [str(Path(self.codeql_cli).resolve().parent)]
+        return [str(Path(self.codeql_cli).resolve().parent)]  # type: ignore[arg-type]
 
     def _detect_codeql_cli(self) -> str | None:
         """Detect CodeQL CLI path.
@@ -308,7 +500,7 @@ class DatabaseManager:
             # env-hygiene posture as the database-creation Popen
             # below.
             result = subprocess.run(
-                [self.codeql_cli, "version"],
+                [self.codeql_cli, "version"],  # type: ignore[list-item]
                 capture_output=True,
                 text=True,
                 timeout=10,
@@ -320,7 +512,10 @@ class DatabaseManager:
                 # `re.ASCII` so Unicode digits don't sneak in (see
                 # packages/exploit_feasibility/profiles.py for the same
                 # rationale applied to glibc parsing).
-                m = re.search(r'\d+(?:\.\d+){1,3}', result.stdout, re.ASCII)
+                # (?<!\d) pins the scan to digit-run starts (identical first
+                # match; unpinned, a hostile digit run is re-read from
+                # every offset — quadratic).
+                m = re.search(r'(?<!\d)\d+(?:\.\d+){1,3}', result.stdout, re.ASCII)
                 if m:
                     return m.group(0)
                 # Fallback for unexpected output: return first line so
@@ -344,9 +539,10 @@ class DatabaseManager:
         Cached per manager instance and language (the CLI doesn't
         change mid-run).
         """
-        cache = getattr(self, "_buildless_probes", None)
+        cache: dict[str, tuple[bool, str]] = getattr(self, "_buildless_probes", None)  # type: ignore[assignment]
         if cache is None:
-            cache = self._buildless_probes = {}
+            self._buildless_probes: dict[str, tuple[bool, str]] = {}
+            cache = self._buildless_probes
         if language in cache:
             return cache[language]
         min_version = BUILDLESS_MIN_VERSIONS.get(language)
@@ -424,10 +620,11 @@ class DatabaseManager:
                 # checkout, so an operator iterating on a fix kept
                 # getting the stale database (for up to the 7-day
                 # TTL). Fold in a digest of the dirty state — the
-                # porcelain listing plus size/mtime of each dirty
+                # dirty-file listing plus size/mtime of each dirty
                 # path, so re-editing an already-dirty file also
                 # invalidates. Clean tree → digest is None → key is
-                # unchanged from before (cache continuity).
+                # unchanged from before (cache continuity). Probe
+                # can't tell → per-call nonce digest → caching off.
                 combined = f"{repo_path}:{git_hash}"
                 dirty_digest = self._dirty_tree_digest(repo_path)
                 if dirty_digest:
@@ -518,50 +715,52 @@ class DatabaseManager:
         return hasher.hexdigest()[:16]
 
     def _dirty_tree_digest(self, repo_path: Path) -> str | None:
-        """Short digest of the working tree's uncommitted state, or
-        None when the tree is clean / the probe fails.
+        """Short digest of the working tree's uncommitted state; None
+        only when the tree is KNOWN clean; a per-call unique token
+        when the probe cannot tell.
 
-        Mixes the ``git status --porcelain`` listing (which files are
-        dirty and how) with each dirty path's size and mtime_ns (so a
-        further edit to an ALREADY-dirty file still changes the
-        digest — the porcelain line alone would not). mtime noise is
-        confined to the dirty set: a clean tree keeps the pure
+        The target repo can arrive with its own hostile ``.git``: a
+        committed ``* filter=x`` .gitattributes plus a
+        ``filter.x.clean`` command in ``.git/config`` turns any probe
+        that re-hashes worktree content (``git status``'s index
+        refresh, but also racy-entry re-verification in ``diff-index``
+        / ``ls-files -m``) into command execution at the operator's
+        uid. ``core.git.dirty`` is the one probe that never lets git
+        open a worktree file; its stat-cache comparison may count a
+        touched-but-identical file as dirty — conservative
+        over-invalidation of the cache, never a stale hit.
+
+        Mixes the dirty-path listings with each path's size and
+        mtime_ns (so a further edit to an ALREADY-dirty file still
+        changes the digest — the listing alone would not). mtime noise
+        is confined to the dirty set: a clean tree keeps the pure
         HEAD-based key.
         """
-        try:
-            status = subprocess.run(
-                safe_git_command("status", "--porcelain"),
-                cwd=repo_path,
-                capture_output=True,
-                text=True,
-                timeout=15,
-                check=False,
-                env=get_safe_git_env(),
-            )
-        except (subprocess.SubprocessError, OSError) as exc:
-            logger.debug(
-                "codeql DM: git status failed for %s: %s", repo_path, exc,
-            )
-            return None
-        if status.returncode != 0 or not status.stdout.strip():
+        dirt = probe_worktree_dirt(repo_path)
+        if dirt.tracked is None or dirt.untracked is None:
+            # UNKNOWABLE is not clean. A hostile target can make the
+            # probe fail on demand (e.g. ship a corrupt .git/index)
+            # while its worktree differs from HEAD; returning None
+            # here handed the tampered tree the pristine checkout's
+            # cache key, serving a stale (or pre-poisoned) database.
+            # A fresh nonce makes the key unique per call — caching is
+            # simply disabled until the tree becomes knowable.
+            return f"unknowable-{secrets.token_hex(16)}"
+        if not dirt.tracked and not dirt.untracked:
             return None
         hasher = hashlib.sha256()
-        hasher.update(
-            status.stdout.encode("utf-8", errors="surrogateescape"),
-        )
-        for line in status.stdout.splitlines():
-            if len(line) < 4:
-                continue
-            path_part = line[3:]
-            # Rename lines read "old -> new"; the new path is live.
-            if " -> " in path_part:
-                path_part = path_part.split(" -> ", 1)[1]
-            path_part = path_part.strip().strip('"')
+        hasher.update(b"tracked\x00")
+        hasher.update("\x00".join(dirt.tracked).encode(
+            "utf-8", errors="surrogateescape"))
+        hasher.update(b"\x00untracked\x00")
+        hasher.update("\x00".join(dirt.untracked).encode(
+            "utf-8", errors="surrogateescape"))
+        for path_part in (*dirt.tracked, *dirt.untracked):
             try:
                 st = (repo_path / path_part).stat()
             except (OSError, ValueError):
-                # Deleted / unstat-able path — the porcelain line
-                # above already reflects its state.
+                # Deleted / unstat-able path — the listing above
+                # already reflects its state.
                 continue
             hasher.update(
                 f"{path_part}:{st.st_size}:{st.st_mtime_ns}".encode(
@@ -603,11 +802,19 @@ class DatabaseManager:
         except Exception as e:  # noqa: BLE001 — best-effort; never fail the run
             logger.error("Failed to save metadata: %s", e)
 
+    @staticmethod
+    def _cache_ttl_days() -> int:
+        """Operator TTL knob, one source of truth for every read /
+        evict / cleanup path (RaptorConfig.CODEQL_DB_CACHE_DAYS)."""
+        return getattr(RaptorConfig, "CODEQL_DB_CACHE_DAYS", 7)
+
     def get_cached_database(
         self,
         repo_path: Path,
         language: str,
-        max_age_days: int = 7
+        max_age_days: int | None = None,
+        traced_build: bool | None = None,
+        repo_hash: str | None = None,
     ) -> Path | None:
         """
         Check if valid cached database exists.
@@ -616,11 +823,34 @@ class DatabaseManager:
             repo_path: Repository path
             language: Programming language
             max_age_days: Maximum age of cached database in days
+                (default: the operator TTL knob
+                RaptorConfig.CODEQL_DB_CACHE_DAYS — the read path must
+                honour the same TTL the auto-cleanup enforces, or a
+                raised knob still serves nothing past the old
+                hardcoded 7 days and a lowered one serves stale DBs)
+            traced_build: The requested extraction mode — build mode
+                is part of the cache contract, not just the build
+                path. ``True`` (an explicit operator trust assertion)
+                REFUSES a cached buildless DB with a visible rebuild
+                note: buildless extraction cannot see build-generated
+                code, and silently serving it would misrepresent
+                extraction fidelity for up to the whole cache TTL.
+                ``False`` serves a cached traced DB with a disclosure
+                line (strictly higher fidelity; its build already ran
+                when it was created — nothing untrusted executes by
+                serving it). ``None`` (mode-agnostic callers, e.g.
+                discovery probes) skips the check.
+            repo_hash: Pre-computed repo hash to reuse — each compute
+                is a `git status --porcelain` plus per-path stats;
+                create_database computes once and threads it through.
 
         Returns:
             Path to cached database or None
         """
-        repo_hash = self.compute_repo_hash(repo_path)
+        if max_age_days is None:
+            max_age_days = self._cache_ttl_days()
+        if repo_hash is None:
+            repo_hash = self.compute_repo_hash(repo_path)
         db_path = self.get_database_dir(repo_hash, language)
         metadata = self.load_metadata(repo_hash, language)
 
@@ -631,6 +861,28 @@ class DatabaseManager:
         if not metadata.success:
             logger.debug("Cached database marked as failed: %s", language)
             return None
+
+        # Serve-time build-mode check (see the traced_build arg doc).
+        if self._cached_mode_mismatch(metadata, language, traced_build):
+            logger.warning(
+                "Cached %s database was built buildless but this run "
+                "requested a traced build — treating as a cache miss "
+                "and rebuilding with the traced extractor (use the "
+                "cached DB via a run without --traced-build if that "
+                "was intended)", language,
+            )
+            return None
+        if (
+            traced_build is False
+            and language in BUILDLESS_DEFAULT_LANGUAGES
+            and metadata.build_system != "buildless"
+        ):
+            logger.info(
+                "Serving traced-build cached %s database to a "
+                "buildless request (higher extraction fidelity; its "
+                "build already ran when the cache entry was created)",
+                language,
+            )
 
         # Check age
         try:
@@ -655,6 +907,80 @@ class DatabaseManager:
         logger.info("✓ Using cached database for %s: %s", language, db_path)
         return db_path
 
+    @staticmethod
+    def _cached_mode_mismatch(
+        metadata: "DatabaseMetadata",
+        language: str,
+        traced_build: bool | None,
+    ) -> bool:
+        """True when a cached entry cannot satisfy the requested
+        extraction mode: the request is an explicit traced build for
+        a buildless-default language and the cached DB was built
+        buildless. Only exact ``build_system == "buildless"`` counts
+        as buildless — every other recorded value (a detected build
+        type, ``no-build`` from the pre-buildless traced path) came
+        from a traced-grade create."""
+        if traced_build is not True:
+            return False
+        if language not in BUILDLESS_DEFAULT_LANGUAGES:
+            return False
+        return metadata.build_system == "buildless"
+
+    def _sibling_canonical_acceptable(
+        self,
+        repo_hash: str,
+        language: str,
+        traced_build: bool | None,
+    ) -> bool:
+        """Lost-promote-race check: may we use the sibling's canonical
+        instead of our own just-built staging DB?
+
+        For a traced request on a buildless-default language the
+        sibling's entry must POSITIVELY record a non-buildless build —
+        missing metadata (their save may not have landed yet) or a
+        buildless record means we install our own traced staging
+        instead; anything else re-opens the silent
+        buildless-served-to-traced fidelity downgrade through the
+        race window."""
+        if traced_build is not True or language not in BUILDLESS_DEFAULT_LANGUAGES:
+            return True
+        metadata = self.load_metadata(repo_hash, language)
+        if metadata is None:
+            return False
+        return not self._cached_mode_mismatch(metadata, language, traced_build)
+
+    def _evict_mode_mismatched_canonical(
+        self,
+        repo_hash: str,
+        language: str,
+        traced_build: bool | None,
+    ) -> None:
+        """Rename a mode-mismatched canonical out of the cache slot.
+
+        A serve-time miss alone is not enough: the atomic-promote
+        flow treats ANY valid canonical as a lost race and would hand
+        the surviving buildless DB right back to the traced run that
+        just rebuilt (outcome B in the promote comment). Evicting the
+        mismatched entry up front lets the rebuild land."""
+        canonical = self.get_database_dir(repo_hash, language)
+        if not canonical.exists():
+            return
+        metadata = self.load_metadata(repo_hash, language)
+        if metadata is None or not self._cached_mode_mismatch(
+            metadata, language, traced_build,
+        ):
+            return
+        logger.info(
+            "Evicting mode-mismatched cached %s database "
+            "(buildless entry; traced build requested)", language,
+        )
+        try:
+            marker = canonical.with_name(self._stale_marker_name(canonical))
+            os.rename(canonical, marker)
+            os.utime(marker, None)
+        except OSError:
+            pass  # raced with another evictor; harmless
+
     # Concurrent-write safety: build-in-staging + atomic-promote pattern.
     # Two parallel /codeql runs against the same target+language used to
     # race on direct in-place writes to <db_root>/<repo_hash>/<language>-db,
@@ -672,12 +998,12 @@ class DatabaseManager:
         falls back to copy-then-delete which is non-atomic and would let
         readers see partial state.
 
-        **Process-safe, NOT thread-safe.** Two threads in the same process
-        share PID and thus get the same staging path; concurrent writes
-        within the staging dir would race. RAPTOR's parallelism model uses
-        processes (not threads) so this is fine in practice; a future
-        thread-based caller would need a different staging key (e.g.,
-        include thread.get_ident()).
+        **Unique per call** — PID plus a 4-byte random suffix — so
+        concurrent writers never share a staging dir whether they are
+        separate processes OR threads in one process
+        (create_databases_parallel runs create_database on a
+        ThreadPoolExecutor; each submission gets its own path from
+        its own call).
 
         Uniqueness suffix: PID alone is NOT sufficient when two writers
         live in DIFFERENT PID namespaces (containers) but share a
@@ -878,6 +1204,12 @@ class DatabaseManager:
             )
         try:
             os.rename(canonical, marker)
+            # Refresh the marker's mtime: rename preserves the
+            # evicted DB's own (stale-by-definition) timestamp, so a
+            # canonical evicted BECAUSE it aged out was GC-eligible
+            # the moment it became a marker — the documented 1-hour
+            # reader grace never held for exactly this marker class.
+            os.utime(marker, None)
         except OSError:
             pass  # raced with another evictor; harmless
 
@@ -889,7 +1221,8 @@ class DatabaseManager:
         *,
         force: bool,
         audit_run_dir: Path | None,
-        failed_errors: list,
+        failed_errors: list[str],
+        build_stderr: str | None = None,
     ) -> "DatabaseResult | None":
         """Retry a failed traced/autobuild create with ``--build-mode=none``.
 
@@ -912,13 +1245,20 @@ class DatabaseManager:
                 "unavailable: %s", language, detail,
             )
             return None
+        # The first failed_errors entry is the exit-code summary; the
+        # actual make/compiler errors ride in build_stderr and are
+        # surfaced as an escaped bounded tail (target-controlled text —
+        # never interpolated raw) so the operator does not have to dig
+        # through the staging log to learn WHY the traced build died.
+        stderr_tail = _build_stderr_tail(build_stderr)
         logger.warning(
             "traced %s build failed — falling back to buildless "
             "extraction (--build-mode=none): build-generated code is "
             "invisible and dependency types resolve best-effort. "
-            "Traced failure: %s",
+            "Traced failure: %s%s",
             language,
-            "; ".join(failed_errors[:2]) or "see extractor log",
+            "; ".join(failed_errors[:1]) or "see extractor log",
+            ("\nbuild stderr tail:\n" + stderr_tail) if stderr_tail else "",
         )
         result = self.create_database(
             repo_path, language,
@@ -1012,24 +1352,35 @@ class DatabaseManager:
                 database_path=None,
                 metadata=None,
                 errors=[
-                    ("target repo has unsafe CodeQL pack config — refusing "
-                     "to invoke `codeql database create`. Re-run with "
-                     "--trust-repo to override after auditing the printed "
-                     "findings.")
+                    ("target repo failed the CodeQL trust check (unsafe "
+                     "pack config, or the repo could not be examined — "
+                     "see the printed diagnostic) — refusing to invoke "
+                     "`codeql database create`. Re-run with --trust-repo "
+                     "to override after auditing the printed findings.")
                 ],
                 duration_seconds=time.time() - start_time,
                 cached=False,
             )
 
-        # Check for cached database
+        # Repo hash computed ONCE for the whole create: each
+        # compute_repo_hash runs `git status --porcelain` plus a stat
+        # per dirty path, and this method used to recompute it up to
+        # four times (both cache checks, the metadata reload, the
+        # paths block).
+        repo_hash = self.compute_repo_hash(repo_path)
+
+        # Check for cached database. The requested build mode joins
+        # the lookup: an explicit traced request must not be served a
+        # cached buildless DB (fidelity downgrade against an operator
+        # trust assertion — see get_cached_database).
         if not force:
-            cached_db = self.get_cached_database(repo_path, language)
+            cached_db = self.get_cached_database(
+                repo_path, language, traced_build=traced_build,
+                repo_hash=repo_hash,
+            )
             if cached_db:
                 duration = time.time() - start_time
-                metadata = self.load_metadata(
-                    self.compute_repo_hash(repo_path),
-                    language
-                )
+                metadata = self.load_metadata(repo_hash, language)
                 return DatabaseResult(
                     success=True,
                     language=language,
@@ -1040,10 +1391,9 @@ class DatabaseManager:
                     cached=True,
                 )
 
-        # Compute repo hash and paths. canonical is the cache slot;
-        # staging is per-process, on the same filesystem so atomic rename
-        # works. See _staging_path docstring for the same-fs requirement.
-        repo_hash = self.compute_repo_hash(repo_path)
+        # Paths. canonical is the cache slot; staging is per-process,
+        # on the same filesystem so atomic rename works. See
+        # _staging_path docstring for the same-fs requirement.
         canonical_path = self.get_database_dir(repo_hash, language)
         staging_path = self._staging_path(repo_hash, language)
 
@@ -1058,19 +1408,40 @@ class DatabaseManager:
         # Use rename-out-of-the-way rather than rmtree so any concurrent
         # reader keeps its inode references intact (see _evict_stale_canonical
         # docstring for the POSIX semantics).
+        force_evict_failed = False
         if force and canonical_path.exists():
             logger.info("Force rebuild: evicting cached database for %s", language)
             try:
                 marker = canonical_path.with_name(self._stale_marker_name(canonical_path))
                 os.rename(canonical_path, marker)
-            except OSError:
-                pass  # someone else evicted in parallel; harmless
+                # Fresh marker mtime — the reader grace must start at
+                # eviction, not at the evicted DB's own age (see
+                # _evict_stale_canonical).
+                os.utime(marker, None)
+            except OSError as e:
+                # "Someone else evicted in parallel" only covers the
+                # canonical-gone case. If it still exists the rename
+                # genuinely failed (perms, EIO) and the surviving old
+                # canonical would win the promote race below — the
+                # exact DB the operator forced away, served back as
+                # cached=True. Remember the failure so the lost-race
+                # branch prefers our fresh staging.
+                if canonical_path.exists():
+                    force_evict_failed = True
+                    logger.warning(
+                        "Force eviction of %s failed (%s); the stale "
+                        "canonical will be evicted at promote time "
+                        "instead", canonical_path, e,
+                    )
 
         # Race-absorbing re-check: another concurrent writer may have
         # promoted their staging to canonical between our initial cache
         # miss (line 304) and now. If so, use theirs and skip the build.
         if not force:
-            cached = self.get_cached_database(repo_path, language)
+            cached = self.get_cached_database(
+                repo_path, language, traced_build=traced_build,
+                repo_hash=repo_hash,
+            )
             if cached:
                 duration = time.time() - start_time
                 metadata = self.load_metadata(repo_hash, language)
@@ -1082,7 +1453,14 @@ class DatabaseManager:
 
         # Stale eviction independent of force — handles the case where
         # canonical exists but is older than the TTL.
-        self._evict_stale_canonical(repo_hash, language, max_age_days=7)
+        self._evict_stale_canonical(
+            repo_hash, language, max_age_days=self._cache_ttl_days(),
+        )
+        # Mode-mismatch eviction: a buildless canonical must not win
+        # the promote race against the traced rebuild it just missed.
+        self._evict_mode_mismatched_canonical(
+            repo_hash, language, traced_build,
+        )
 
         # Buildless default for C/C++: never execute an untrusted
         # repo's build system unless the operator explicitly opted in.
@@ -1233,16 +1611,7 @@ class DatabaseManager:
             env.pop(_ident, None)
         env["USER"] = env["LOGNAME"] = "sandbox"
         if build_system and build_system.env_vars:
-            # Filter build env vars through the same blocklist — a malicious
-            # repo's build config could try to re-inject LD_PRELOAD, BASH_ENV, etc.
-            # RAPTOR_*-prefixed names are blocked wholesale:
-            # repo content must never set the session credential, the
-            # out-dir override, or any other RAPTOR control var.
-            blocked = set(RaptorConfig.DANGEROUS_ENV_VARS) | set(RaptorConfig.PROXY_ENV_VARS)
-            for k, v in build_system.env_vars.items():
-                if k in blocked or k.startswith(("RAPTOR_", "_RAPTOR")):
-                    continue
-                env[k] = v
+            env.update(_filter_build_env_vars(build_system.env_vars))
         # Auto-detect toolchain-home env vars (JAVA_HOME, GOROOT, etc.)
         # per build system's env_detect list. Per-subprocess scope —
         # these land only in this build invocation, not in other sandbox
@@ -1273,15 +1642,33 @@ class DatabaseManager:
                 # atomically here: clean up our own mess if any of the three
                 # raises, then re-raise so the caller still sees the error.
                 #
-                # `dir=` is `self.db_root / "tmp"`, NOT `working_dir`. Pre-fix
-                # the build script was written into the operator's REPO
-                # directory (`dir=working_dir`). On cleanup-failure paths
-                # (cleanup at line ~831 unlinks but only if exists; sandbox
-                # crashes mid-build skip it) the user found
-                # `.raptor_codeql_build_*.sh` files in their git checkout —
-                # `git status` noise, accidental `git add -A` commits,
-                # confused operators. Keep our scratch under our managed
-                # area where we control cleanup.
+                # `dir=` is `self.db_root / "tmp"`, NOT `working_dir` and
+                # NOT anywhere the traced build can write. Three
+                # properties pick this location:
+                #  - non-polluting: pre-fix the build script was written
+                #    into the operator's REPO directory
+                #    (`dir=working_dir`). On cleanup-failure paths
+                #    (sandbox crashes mid-build skip the unlink) the user
+                #    found `.raptor_codeql_build_*.sh` files in their git
+                #    checkout — `git status` noise, accidental
+                #    `git add -A` commits, confused operators.
+                #  - namespace-visible: the sandbox_run call below engages
+                #    the mount namespace, where only the mounted host
+                #    trees exist. db_root/tmp is outside target= and
+                #    output=, so the wrapper dir is passed via tool_paths
+                #    (see the sandbox call) — a READ-ONLY, exec-capable
+                #    bind. Without that bind CodeQL's tracer fails to
+                #    exec the wrapper ("Runner failed to start ... No
+                #    such file or directory") and the traced build dies
+                #    before running a single build command.
+                #  - immutable to the target: the ro bind means the
+                #    traced build (repo-controlled code) cannot rewrite
+                #    the wrapper or plant symlinks in its directory. A
+                #    scratch dir under the sandbox's rw output mount
+                #    would hand the build a persistence surface AND a
+                #    cross-run symlink-plant window against this parent-
+                #    side mkdir/mkstemp/write (the parent runs
+                #    unsandboxed and follows symlinks).
                 tmp_dir = self.db_root / "tmp"
                 tmp_dir.mkdir(parents=True, exist_ok=True)
                 fd, script_name = tempfile.mkstemp(
@@ -1310,15 +1697,49 @@ class DatabaseManager:
         else:
             logger.info("No build command (interpreted language or no-build mode)")
 
-        logger.info("Executing: %s", ' '.join(cmd))
+        logger.info("Executing: %s", ' '.join(cmd))  # type: ignore[arg-type]
         logger.info("Timeout: %ss", RaptorConfig.CODEQL_TIMEOUT)
 
+        # Toolchain binds for the mount namespace. The build wrapper's
+        # directory rides along when a wrapper was written: it lives
+        # outside both mount trees (target=, output=) by design — see
+        # the placement rationale above — and tool_paths binds it
+        # READ-ONLY and exec-capable into the namespace (tool_paths is
+        # unioned into the mount-ns extra_ro_paths; Landlock directory
+        # read grants carry EXECUTE), so the tracer can exec the
+        # wrapper while the traced build cannot modify it.
+        sandbox_tool_paths = self._sandbox_tool_paths()
+        if build_script is not None:
+            sandbox_tool_paths = list(sandbox_tool_paths) + [
+                str(build_script.parent),
+            ]
+
         # Execute database creation in sandbox (network blocked — packs pre-fetched)
+        python_fork_wrapper = None
         try:
+            if _python_fork_wrapper_needed(language):
+                interpreter = shutil.which("python3", path=env.get("PATH"))
+                if interpreter is None:
+                    raise FileNotFoundError(
+                        "CodeQL Python extractor requires python3 in PATH"
+                    )
+                python_fork_wrapper = _create_python_fork_wrapper(
+                    self.db_root,
+                    str(Path(interpreter).resolve()),
+                )
+                env[_PYTHON_EXECUTABLE_OPTION] = str(python_fork_wrapper)
+                wrapper_dir = str(python_fork_wrapper.parent)
+                if wrapper_dir not in sandbox_tool_paths:
+                    sandbox_tool_paths.append(wrapper_dir)
+                logger.warning(
+                    "CodeQL Python extractor: using fork instead of "
+                    "forkserver because scoped AF_UNIX is unavailable; "
+                    "sandbox restrictions remain in force"
+                )
             from core.sandbox import run as sandbox_run
             from core.sandbox.fingerprint import HOST_CPU_COUNT
             result = sandbox_run(
-                cmd,
+                cmd,  # type: ignore[arg-type]
                 block_network=True,
                 cwd=working_dir,
                 env=env,
@@ -1333,7 +1754,7 @@ class DatabaseManager:
                 # next to the staging dir stay writable.
                 target=str(repo_path),
                 output=str(staging_path.parent),
-                tool_paths=self._sandbox_tool_paths(),
+                tool_paths=sandbox_tool_paths,
                 # Audit JSONL home (only used when --audit is engaged).
                 # Decoupled from output= because the build subprocess
                 # writes to working_dir / db_path / ~/.codeql, none of
@@ -1383,7 +1804,20 @@ class DatabaseManager:
                 if result.stderr:
                     errors.append(result.stderr[:1000])  # Truncate long errors
                 logger.error("✗ Database creation failed for %s", language)
-                logger.error((result.stderr or "")[:500])
+                # stderr is build/extractor output over the untrusted
+                # repo (traced builds run its build scripts) — escape
+                # control/bidi bytes before the operator's terminal;
+                # newlines stay for readability.
+                from core.security.log_sanitisation import (
+                    escape_nonprintable,
+                )
+                logger.error(
+                    "%s",
+                    escape_nonprintable(
+                        (result.stderr or "")[:500],
+                        preserve_newlines=True,
+                    ),
+                )
                 # Surface the extractor's own log before cleanup: the
                 # CLI's stderr carries only "autobuild failed" while the
                 # actual traceback (missing interpreter, denied syscall,
@@ -1393,7 +1827,12 @@ class DatabaseManager:
                 _diag = self._salvage_creation_log(staging_path)
                 if _diag:
                     errors.append(_diag[:2000])
-                    logger.error("extractor log tail:\n%s", _diag[:2000])
+                    logger.error(
+                        "extractor log tail:\n%s",
+                        escape_nonprintable(
+                            _diag[:2000], preserve_newlines=True,
+                        ),
+                    )
                 # Preserve the full staging dir for inspection under a
                 # name the stale-marker GC already reaps (1h TTL), so
                 # diagnostics survive without accumulating: keep only
@@ -1463,8 +1902,17 @@ class DatabaseManager:
                         # Lost the promotion race. Validate the sibling's
                         # canonical before trusting it — without this check,
                         # a sibling who promoted broken content would propagate
-                        # to us as success=True pointing at garbage.
-                        if self.validate_database(canonical_path):
+                        # to us as success=True pointing at garbage. Build
+                        # mode joins the check: a traced request must not
+                        # adopt a sibling's buildless (or metadata-less)
+                        # canonical over its own just-built traced staging.
+                        if (
+                            not force_evict_failed
+                            and self.validate_database(canonical_path)
+                            and self._sibling_canonical_acceptable(
+                                repo_hash, language, traced_build,
+                            )
+                        ):
                             logger.info(
                                 "✓ Database promoted by sibling; using cached %s", canonical_path
                             )
@@ -1484,7 +1932,9 @@ class DatabaseManager:
                             # gets evicted (this run's lost-race branch on
                             # the next attempt, or _gc_stale_markers).
                             logger.warning(
-                                "Canonical %s exists but failed validation; evicting and retrying promote",
+                                "Canonical %s exists but failed validation "
+                                "or cannot satisfy the requested build mode; "
+                                "evicting and retrying promote",
                                 canonical_path
                             )
                             try:
@@ -1492,6 +1942,10 @@ class DatabaseManager:
                                     self._stale_marker_name(canonical_path)
                                 )
                                 os.rename(canonical_path, marker)
+                                # Fresh marker mtime — reader grace
+                                # starts at eviction (see
+                                # _evict_stale_canonical).
+                                os.utime(marker, None)
                             except OSError:
                                 pass  # eviction failed; retry-promote will see ENOTEMPTY
                             try:
@@ -1574,6 +2028,7 @@ class DatabaseManager:
                     repo_path, language, traced_build,
                     force=force, audit_run_dir=audit_run_dir,
                     failed_errors=errors,
+                    build_stderr=result.stderr,
                 )
                 if fallback is not None:
                     return fallback
@@ -1628,6 +2083,14 @@ class DatabaseManager:
             )
 
         finally:
+            if python_fork_wrapper is not None:
+                try:
+                    python_fork_wrapper.unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.warning(
+                        "CodeQL Python extractor wrapper cleanup failed: %s",
+                        exc,
+                    )
             # build_script unlink: missing_ok=True so a script that
             # was already cleaned up by an earlier branch (or that
             # never landed on disk because mkstemp succeeded but
@@ -1815,17 +2278,20 @@ class DatabaseManager:
         except Exception:  # noqa: BLE001 — best-effort; never fail the run
             return 0
 
-    def cleanup_old_databases(self, days: int = 7, dry_run: bool = False) -> list[str]:
+    def cleanup_old_databases(self, days: int | None = None, dry_run: bool = False) -> list[str]:
         """
         Clean up databases older than specified days.
 
         Args:
-            days: Age threshold in days
+            days: Age threshold in days (default: the operator TTL
+                knob RaptorConfig.CODEQL_DB_CACHE_DAYS)
             dry_run: If True, only report what would be deleted
 
         Returns:
             List of deleted database paths
         """
+        if days is None:
+            days = self._cache_ttl_days()
         # Debug, not info: the auto-cleanup path runs this on every
         # process start and it's usually a no-op — the per-deletion
         # lines below surface actual reclaims at INFO.
@@ -1880,6 +2346,23 @@ class DatabaseManager:
                             else:
                                 logger.info("Would delete: %s", db_path)
                             deleted.append(str(db_path))
+                        elif not dry_run:
+                            # Orphan metadata: the DB dir is already
+                            # gone (evicted / manually removed) but
+                            # the metadata file survived — pre-fix
+                            # the unlink only ran alongside the
+                            # rmtree, so orphans were re-parsed by
+                            # every future cleanup pass forever.
+                            metadata_file.unlink(missing_ok=True)
+                            logger.info(
+                                "Deleted orphan metadata: %s",
+                                metadata_file,
+                            )
+                        else:
+                            logger.info(
+                                "Would delete orphan metadata: %s",
+                                metadata_file,
+                            )
                 except Exception as e:  # noqa: BLE001 — best-effort; never fail the run
                     logger.warning("Error processing %s: %s", metadata_file, e)
 

@@ -25,6 +25,26 @@ def test_health_result_row_renders_failure() -> None:
     assert "http 503" in row
 
 
+def test_health_result_row_escapes_hostile_error_text() -> None:
+    """``detail`` and ``rate_limit`` carry live-network error text
+    (HttpError bodies, response header hints): a proxied/MITM'd
+    endpoint can put ANSI/OSC bytes there, and the row reaches the
+    operator TTY through registered CLI writers. Escaped + bounded at
+    the render, per the terminal-relay (B1) discipline."""
+    r = HealthResult(
+        name="NVD API", ok=False, latency_ms=12.0,
+        detail="\x1b]0;pwned\x07network: err\x1b[31m",
+        rate_limit="x\x1b[0m" + "y" * 200,
+    )
+    row = r.as_row()
+    assert "\x1b" not in row
+    assert "\x07" not in row
+    assert "network" in row
+    # Length still bounded (pre-fix hard [:60] slice; now an escaped
+    # bounded render with an explicit elision marker).
+    assert len(row) < 400
+
+
 def test_render_table_flags_critical_failures() -> None:
     results = [
         HealthResult("DNS resolution", True, 5),
@@ -482,3 +502,75 @@ def test_run_all_returns_one_result_per_probe(monkeypatch) -> None:
     results = service_health.run_all()
     assert len(results) == 8
     assert results[0].name == "probe_dns"  # DNS first invariant
+
+
+def test_probe_anthropic_recognises_auth_token_spelling(monkeypatch):
+    """A bearer-token-only operator must not see a false
+    'ANTHROPIC_API_KEY not set' health warning."""
+    from cve_diff.infra import service_health as sh
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("RAPTOR_LLM_SOCKET", raising=False)
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "sk-ant-test-bearer")
+    monkeypatch.setattr(sh, "_health_model", lambda: "claude-sonnet-4-6")
+    monkeypatch.setattr(
+        "cve_diff.llm.auth.default_model_id", lambda: "claude-sonnet-4-6"
+    )
+    result = sh.probe_anthropic()
+    assert result.ok is True
+    assert "not set" not in result.detail
+    assert "AUTH_TOKEN" in result.detail
+
+
+# ── sibling-drift sync guards (cve_env twin) ──────────────────────────
+
+
+def _load_env_twin():
+    import sys
+    from pathlib import Path
+
+    pkg = Path(__file__).resolve().parents[4] / "cve_env"
+    if not pkg.is_dir():
+        pytest.skip("cve_env package not present in this checkout")
+    if str(pkg) not in sys.path:
+        sys.path.insert(0, str(pkg))
+    from cve_env.infra import service_health as env_sh
+
+    return env_sh
+
+
+def test_health_result_substrate_stays_in_sync_with_cve_env_twin():
+    """The HealthResult dataclass + as_row rendering are the shared
+    substrate of the two service_health twins. This alarm fires when
+    one side's substrate drifts — port the fix to the sibling (named
+    in both module docstrings) or split the substrate deliberately."""
+    import dataclasses
+    import inspect
+
+    from cve_diff.infra import service_health as diff_sh
+
+    env_sh = _load_env_twin()
+    env_fields = [(f.name, f.default) for f in
+                  dataclasses.fields(env_sh.HealthResult)]
+    diff_fields = [(f.name, f.default) for f in
+                   dataclasses.fields(diff_sh.HealthResult)]
+    assert env_fields == diff_fields
+    assert inspect.getsource(env_sh.HealthResult.as_row) == (
+        inspect.getsource(diff_sh.HealthResult.as_row)
+    )
+
+
+def test_grounding_pair_warning_present_in_both_twins():
+    """Either of NVD/OSV suffices to ground a CVE; both twins must warn
+    when BOTH are down (the rule had drifted: only the cve-env copy
+    carried it)."""
+    from cve_diff.infra import service_health as diff_sh
+
+    env_sh = _load_env_twin()
+    for sh in (diff_sh, env_sh):
+        results = [
+            sh.HealthResult("NVD API", False, 1.0, detail="down"),
+            sh.HealthResult("OSV API", False, 1.0, detail="down"),
+        ]
+        table = sh.render_table(results)
+        assert "Both NVD and OSV are unhealthy" in table, sh.__name__

@@ -15,19 +15,10 @@ unavailable).
 
 from __future__ import annotations
 
-import sys as _sys
-
-import pytest as _pytest
-
-pytestmark = _pytest.mark.skipif(
-    _sys.platform != "linux",
-    reason="Linux-only sandbox internals (mount-ns / Landlock / seccomp / ptrace tracer / pid1 shim) — see core/sandbox/_macos_spawn.py for the macOS path",
-)
-
-
 import contextlib
 import json
 import os
+import sys
 import platform
 import signal
 import subprocess
@@ -45,7 +36,15 @@ from core.sandbox import tracer as tracer_mod
 from core.sandbox._spawn import run_sandboxed
 from core.sandbox.tests.capability import requires_landlock, requires_userns
 
+# One pytestmark assignment only: a second module-level assignment
+# REBINDS the name and silently drops earlier marks (this module once
+# lost its platform gate exactly that way).
 pytestmark = [
+    # Linux-only sandbox internals (mount-ns / Landlock / seccomp /
+    # ptrace tracer / pid1 shim) on real subprocesses — see
+    # core/sandbox/_macos_spawn.py for the macOS path. Real-kernel
+    # binding.
+    pytest.mark.linux_native,
     pytest.mark.skipif(
         not tracer_mod._is_supported_arch(),
         reason=f"tracer doesn't support {platform.machine()}",
@@ -605,7 +604,7 @@ class TestAuditModeTracerDeath:
         env["PYTHONPATH"] = (str(Path(__file__).resolve().parents[3])
                              + os.pathsep + env.get("PYTHONPATH", ""))
         seizer = subprocess.Popen(
-            [_sys.executable, "-c", seizer_code],
+            [sys.executable, "-c", seizer_code],
             stdout=subprocess.PIPE, env=env,
         )
         seizer_pid = seizer.pid

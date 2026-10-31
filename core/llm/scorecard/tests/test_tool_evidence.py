@@ -303,8 +303,10 @@ class TestCLIToolEvidence:
         assert sc.get_stat("agentic:py/sql-injection", "claude-opus") is None
 
     def test_idempotency_reminder_in_output(self, tmp_path):
-        """Operator should see the 'don't double-run' contract every
-        time. Documented in stderr rather than tracked as state."""
+        """Operator guidance must state the LANDED contract: re-runs
+        are idempotent per finding_id (atomic claim-and-record); the
+        stale 'double-records' warning is gone and the real residual
+        (seen-id eviction past the cap) is named instead."""
         analysis_path = tmp_path / "orchestrated.json"
         validation_path = tmp_path / "validation.json"
         sc_path = tmp_path / "sc.json"
@@ -315,7 +317,67 @@ class TestCLIToolEvidence:
             prefix="agentic",
         )
         _, _, err = _capture(cli_mod.cmd_tool_evidence, args)
-        assert "double-records" in err
+        assert "double-records" not in err
+        assert "idempotent" in err
+
+    def test_disabled_validation_run_names_itself_in_the_notice(
+            self, tmp_path):
+        """Run-context annotation: when the validation run executed
+        with the sandbox disabled (its run dir's sandbox-summary.json
+        carries the attribution), the operator sees that the truth
+        signal came from an unsandboxed run. Notice only — recording
+        is unchanged, and a hostile consent label never reaches the
+        terminal raw. The analysis and validation artefacts live in
+        SEPARATE run dirs and only the validation dir carries the
+        attribution — the notice must come from the validation run
+        (the truth-signal side), not the analysis dir."""
+        analysis_dir = tmp_path / "analysis-run"
+        validation_dir = tmp_path / "validation-run"
+        analysis_dir.mkdir()
+        validation_dir.mkdir()
+        analysis_path = analysis_dir / "orchestrated.json"
+        validation_path = validation_dir / "validation.json"
+        sc_path = tmp_path / "sc.json"
+        analysis_path.write_text(json.dumps({
+            "results": [
+                {"finding_id": "f1", "rule_id": "py/x",
+                 "analysed_by": "claude-opus", "is_exploitable": True},
+            ],
+        }))
+        validation_path.write_text(json.dumps({
+            "findings": [{"finding_id": "f1", "is_exploitable": True}],
+        }))
+        (validation_dir / "sandbox-summary.json").write_text(json.dumps({
+            "cli_sandbox_disabled": True,
+            "disable_consent": "interactive-tty\x1b]0;evil\x07",
+        }))
+        args = SimpleNamespace(
+            path=sc_path, analysis=analysis_path,
+            validation=validation_path, prefix="agentic",
+        )
+        rc, _, err = _capture(cli_mod.cmd_tool_evidence, args)
+        assert rc == 0
+        assert "run context" in err
+        assert "sandbox DISABLED" in err
+        assert "unsandboxed" in err
+        assert "\x1b" not in err
+        # Recording itself is unchanged by the annotation.
+        sc = ModelScorecard(sc_path)
+        assert _stat(sc, "agentic:py/x", "claude-opus") == (1, 0)
+
+    def test_sandboxed_validation_run_has_no_run_context_notice(
+            self, tmp_path):
+        analysis_path = tmp_path / "orchestrated.json"
+        validation_path = tmp_path / "validation.json"
+        analysis_path.write_text(json.dumps({"results": []}))
+        validation_path.write_text(json.dumps({"findings": []}))
+        args = SimpleNamespace(
+            path=tmp_path / "sc.json", analysis=analysis_path,
+            validation=validation_path, prefix="agentic",
+        )
+        rc, _, err = _capture(cli_mod.cmd_tool_evidence, args)
+        assert rc == 0
+        assert "run context" not in err
 
     def test_isolation_from_cheap_short_circuit(self, tmp_path):
         """tool-evidence events go to TOOL_EVIDENCE slot only;
@@ -408,6 +470,45 @@ class TestAutoBackPropFromValidateRun:
             validation_findings=[{"finding_id": "f", "is_exploitable": None}],
         )
         assert auto_back_prop_from_validate_run(run, scorecard=scorecard) == 0
+
+    def test_analysis_abstention_skipped(self, tmp_path, scorecard):
+        # Schema-nulled AND absent is_exploitable are the same
+        # abstention: neither may be recorded as a "not exploitable"
+        # analysis verdict against the validation outcome (the
+        # absent-key shape used to default to False and mint a
+        # fabricated correct/incorrect event).
+        run = tmp_path / "v"
+        self._write_run(
+            run,
+            analysis_records=[
+                {"finding_id": "f1", "rule_id": "r",
+                 "analysed_by": "m", "is_exploitable": None},
+                {"finding_id": "f2", "rule_id": "r",
+                 "analysed_by": "m"},  # key absent
+            ],
+            validation_findings=[
+                {"finding_id": "f1", "is_exploitable": False},
+                {"finding_id": "f2", "is_exploitable": False},
+            ],
+        )
+        assert auto_back_prop_from_validate_run(run, scorecard=scorecard) == 0
+
+    def test_abstained_analysis_never_scored_as_negative(self, tmp_path, scorecard):
+        """An analysis record with NO is_exploitable field (an
+        abstained / errored analysis shape) issued no verdict — the
+        back-prop must skip it. Pre-fix the default-False read booked
+        it as an explicit not-exploitable verdict against the
+        validator: here that minted an INCORRECT cell for a model
+        that never concluded anything."""
+        run = tmp_path / "v"
+        self._write_run(
+            run,
+            analysis_records=[{"finding_id": "f", "rule_id": "r",
+                               "analysed_by": "m"}],  # no verdict field
+            validation_findings=[{"finding_id": "f", "is_exploitable": True}],
+        )
+        assert auto_back_prop_from_validate_run(run, scorecard=scorecard) == 0
+        assert _stat(scorecard, "agentic:r", "m") == (0, 0)
 
     def test_missing_files_returns_zero(self, tmp_path, scorecard):
         """No orchestrated_report.json (standalone /validate) → silent 0."""

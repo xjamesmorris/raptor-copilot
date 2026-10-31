@@ -10,12 +10,8 @@ from typing import Any
 import pytest
 
 from core.audit.pipeline import (
-    _apply_counter_hypothesis_veto,
-    _apply_speculative_race_gate,
-    _counter_hypothesis_vetoes,
     _dampen_file_pileup,
     _extract_bug_class,
-    _is_speculative_race,
     _merge_outcomes,
     _needs_second_pass,
 )
@@ -325,100 +321,6 @@ class TestPipelinedMerge:
 
 
 # ── Fix B: counter-hypothesis veto ─────────────────────────────────
-
-
-class TestCounterHypothesisVeto:
-    def _make_finding_with_counter(self, counter, *, evidence="", hypothesis=""):
-        hyp = hypothesis or "integer overflow in size calculation"
-        return _MockOutcome(
-            status="finding",
-            hypothesis=hyp,
-            evidence_tool=evidence,
-            review_result={"counter_hypothesis": counter},
-        )
-
-    def test_vetoes_with_protection_keyword(self):
-        o = self._make_finding_with_counter(
-            "This overflow is prevented by the bounds check on line 42 "
-            "which validates size < MAX_SIZE before the multiplication",
-        )
-        assert _counter_hypothesis_vetoes(o) is True
-
-    def test_no_veto_with_mechanical_evidence(self):
-        o = self._make_finding_with_counter(
-            "This overflow is prevented by the bounds check on line 42 "
-            "which validates size < MAX_SIZE before the multiplication",
-            evidence="semgrep:rule1",
-        )
-        assert _counter_hypothesis_vetoes(o) is False
-
-    def test_no_veto_short_counter(self):
-        o = self._make_finding_with_counter("prevented by check")
-        assert _counter_hypothesis_vetoes(o) is False
-
-    def test_no_veto_no_protection_keyword(self):
-        o = self._make_finding_with_counter(
-            "The overflow might happen but is unlikely because the values "
-            "are typically small in practice and rarely exceed 1000",
-        )
-        assert _counter_hypothesis_vetoes(o) is False
-
-    def test_no_veto_counter_too_short_relative_to_hypothesis(self):
-        long_hyp = "x" * 200
-        o = self._make_finding_with_counter(
-            "prevented by bounds check on x",
-            hypothesis=long_hyp,
-        )
-        # counter < 0.6 * hypothesis → no veto
-        assert _counter_hypothesis_vetoes(o) is False
-
-    def test_refuting_counter_vetoes(self):
-        """A counter asserting the hypothesis was refuted argues in the
-        clean direction exactly like a named protection mechanism —
-        the veto must fire even without a protection keyword (live
-        corpus case: llm-claimed SMT signal evaluated and refuted,
-        verdict stayed suspicious)."""
-        o = self._make_finding_with_counter(
-            "The use-after-free claim was refuted with specific "
-            "lock/refcount evidence: the claimed free site has no "
-            "deallocation semantics and the pin/put lifecycle "
-            "surrounds every use. Not a vulnerability.",
-            evidence="llm-claimed:smt:check-early-release signal "
-                     "evaluated and refuted",
-        )
-        assert _counter_hypothesis_vetoes(o) is True
-
-    def test_refuting_counter_no_veto_with_mechanical_evidence(self):
-        o = self._make_finding_with_counter(
-            "The use-after-free claim was refuted with specific "
-            "lock/refcount evidence: the pin/put lifecycle surrounds "
-            "every use of the object. Not a vulnerability.",
-            evidence="smt:check-early-release",
-        )
-        assert _counter_hypothesis_vetoes(o) is False
-
-    def test_prefilter_evidence_still_vetoes(self):
-        o = self._make_finding_with_counter(
-            "This overflow is prevented by the bounds check on line 42 "
-            "which validates size < MAX_SIZE before the multiplication",
-            evidence="prefilter:sink",
-        )
-        assert _counter_hypothesis_vetoes(o) is True
-
-    def test_apply_demotes_to_clean(self):
-        outcomes = [
-            self._make_finding_with_counter(
-                "This overflow is prevented by the bounds check on line 42 "
-                "which validates size < MAX_SIZE before the multiplication",
-            ),
-            _MockOutcome(status="finding", evidence_tool="semgrep:rule1"),
-            _MockOutcome(status="clean"),
-        ]
-        vetoed = _apply_counter_hypothesis_veto(outcomes)
-        assert vetoed == 1
-        assert outcomes[0].status == "clean"
-        assert outcomes[1].status == "finding"
-        assert outcomes[2].status == "clean"
 
 
 # ── Fix C: class-agnostic file dampening ───────────────────────────
@@ -766,104 +668,6 @@ class TestDampenPreExportHook:
 
 
 # ── Speculative-race gate ──────────────────────────────────────────
-
-
-class TestSpeculativeRaceGate:
-    def test_race_hypothesis_no_evidence_is_speculative(self):
-        o = _MockOutcome(
-            status="finding",
-            hypothesis="A race condition between thread A and thread B",
-        )
-        assert _is_speculative_race(o) is True
-
-    def test_toctou_hypothesis_is_speculative(self):
-        o = _MockOutcome(
-            status="suspicious",
-            hypothesis="A TOCTOU vulnerability in the check-then-use pattern",
-        )
-        assert _is_speculative_race(o) is True
-
-    def test_race_with_smt_evidence_not_speculative(self):
-        o = _MockOutcome(
-            status="finding",
-            hypothesis="A race condition in the lock acquisition",
-            evidence_tool="smt:check-lock-discipline",
-        )
-        assert _is_speculative_race(o) is False
-
-    def test_race_with_coccinelle_evidence_not_speculative(self):
-        o = _MockOutcome(
-            status="finding",
-            hypothesis="A race condition after unlock",
-            evidence_tool="coccinelle:use_after_unlock",
-        )
-        assert _is_speculative_race(o) is False
-
-    def test_non_race_hypothesis_not_gated(self):
-        o = _MockOutcome(
-            status="finding",
-            hypothesis="An integer overflow in size * count",
-        )
-        assert _is_speculative_race(o) is False
-
-    def test_clean_not_gated(self):
-        """Gate only applies to finding/suspicious."""
-        outcomes = [
-            _MockOutcome(
-                status="clean",
-                hypothesis="A race condition but the code is safe",
-            ),
-        ]
-        gated = _apply_speculative_race_gate(outcomes)
-        assert gated == 0
-
-    def test_gate_demotes_finding_to_suspicious(self):
-        outcomes = [
-            _MockOutcome(
-                status="suspicious",
-                hypothesis="A TOCTOU race condition between check and use",
-            ),
-            _MockOutcome(
-                status="finding",
-                hypothesis="A data race on the shared counter",
-            ),
-            _MockOutcome(
-                status="finding",
-                hypothesis="Integer overflow in multiplication",
-            ),
-        ]
-        gated = _apply_speculative_race_gate(outcomes)
-        assert gated == 1
-        assert outcomes[0].status == "suspicious"   # suspicious stays
-        assert outcomes[1].status == "suspicious"   # finding → suspicious
-        assert outcomes[2].status == "finding"      # non-race, untouched
-
-    def test_gate_works_on_dicts(self):
-        from core.audit.pipeline import apply_speculative_race_gate
-
-        results = [
-            {"actual": "finding", "function_id": "a.c:f1",
-             "hypothesis": "A race condition on shared state",
-             "evidence_tool": ""},
-        ]
-        gated = apply_speculative_race_gate(results)
-        assert gated == 1
-        assert results[0]["actual"] == "suspicious"  # finding → suspicious
-
-    def test_concurrent_keyword_gated(self):
-        o = _MockOutcome(
-            status="suspicious",
-            hypothesis="Two threads concurrently access the buffer",
-        )
-        assert _is_speculative_race(o) is True
-
-    def test_prefilter_lock_evidence_not_gated(self):
-        o = _MockOutcome(
-            status="finding",
-            hypothesis="A race condition in the lock path",
-            evidence_tool="prefilter:lock-imbalance",
-        )
-        assert _is_speculative_race(o) is False
 
 
 # ── Fix D: _status_matches (corpus scoring) ───────────────────────
@@ -1433,24 +1237,6 @@ class TestW8Unification:
         statuses = [r["actual"] for r in results]
         assert "finding" in statuses  # strongest kept
 
-    def test_veto_works_on_dicts(self):
-        from core.audit.pipeline import apply_counter_hypothesis_veto
-
-        results = [
-            {
-                "actual": "finding",
-                "hypothesis": "integer overflow in x * y",
-                "evidence_tool": "",
-                "counter_hypothesis": (
-                    "This overflow is prevented by the bounds check on line 42 "
-                    "which validates that x < MAX_SIZE before the multiplication"
-                ),
-            },
-        ]
-        vetoed = apply_counter_hypothesis_veto(results)
-        assert vetoed == 1
-        assert results[0]["actual"] == "clean"
-
     def test_dampen_works_on_objects(self):
         from core.audit.pipeline import dampen_file_pileup
 
@@ -1507,6 +1293,47 @@ class TestRuleRole:
         rule = os.path.join(
             os.environ.get("RAPTOR_DIR", "."),
             "engine", "coccinelle", "rules", "use_after_free.cocci",
+        )
+        assert get_rule_role(rule) == "verification"
+
+    def test_role_read_covers_the_whole_header(self, tmp_path):
+        # The role directive lives in the leading comment header, whose
+        # length is unbounded — a rule whose documentation grows must
+        # not silently demote to detection because the directive
+        # drifted past a fixed byte prefix.
+        rule = tmp_path / "long_header.cocci"
+        prose = "".join(
+            f"// header prose line {i} padding padding padding\n"
+            for i in range(90)
+        )
+        assert len(prose) > 4096
+        rule.write_text(prose + "// @role: verification\n\n@r@\n")
+        from core.audit.sweep import get_rule_role
+        assert get_rule_role(str(rule)) == "verification"
+
+    def test_role_directive_outside_header_is_ignored(self, tmp_path):
+        # The read is bounded by the header GRAMMAR (the leading
+        # comment block), not a byte count: a directive-shaped line
+        # buried after the first rule block is not the rule's
+        # declaration.
+        rule = tmp_path / "buried.cocci"
+        rule.write_text(
+            "// buried.cocci\n"
+            "@r@\nexpression E;\n@@\n\n"
+            "// @role: verification\n"
+        )
+        from core.audit.sweep import get_rule_role
+        assert get_rule_role(str(rule)) == "detection"
+
+    def test_real_format_string_is_verification(self):
+        # Regression pin: this rule's directive sits past 2048 bytes
+        # of header prose and a byte-capped read silently demoted it.
+        import os
+
+        from core.audit.sweep import get_rule_role
+        rule = os.path.join(
+            os.environ.get("RAPTOR_DIR", "."),
+            "engine", "coccinelle", "rules", "format_string.cocci",
         )
         assert get_rule_role(rule) == "verification"
 

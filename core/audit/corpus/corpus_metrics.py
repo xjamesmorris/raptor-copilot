@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from core.security.log_sanitisation import sanitise_for_terminal
 from core.json import load_json
 
 
@@ -362,10 +363,12 @@ def check_gate(
             )
             trap_what = rationales.get(fid, "")
             if trap_what:
-                detail_lines.append(f"    trap: {trap_what}")
+                detail_lines.append(
+                    f"    trap: {sanitise_for_terminal(str(trap_what))}")
             hyp = r.get("hypothesis") or ""
             if hyp:
-                detail_lines.append(f"    hypothesis: {hyp}")
+                detail_lines.append(
+                    f"    hypothesis: {sanitise_for_terminal(str(hyp))}")
         failures.append(
             f"Trap gate FAILED: {trap.fp} deliberately-safe "
             f"function(s) flagged:\n" + "\n".join(detail_lines)
@@ -537,7 +540,7 @@ def _read_results(path: Path) -> list[dict[str, Any]]:
     [...]}`` wrapper that ``run_corpus._write_results`` emits.
     """
     if path.suffix.lower() == ".csv":
-        with Path(path).open() as f:
+        with Path(path).open() as f:  # raw-open: operator-curated corpus artifact (eval lane)
             return list(csv.DictReader(f))
     raw = load_json(path, strict=True, max_bytes=_MAX_RESULTS_BYTES)
     if raw is None:
@@ -660,7 +663,8 @@ def main(argv: list[str] | None = None) -> int:
         print()
         print(f"{len(errored)} label(s) errored (excluded from P/R):")
         for r in errored:
-            reason = r.get("error_reason") or r.get("error", "")
+            reason = sanitise_for_terminal(
+                str(r.get("error_reason") or r.get("error", "")))
             suffix = f" — {reason}" if reason else ""
             print(f"  {r['function_id']}{suffix}")
 

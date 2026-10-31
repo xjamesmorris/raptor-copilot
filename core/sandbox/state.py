@@ -19,6 +19,7 @@ What lives here:
 """
 
 import threading
+from typing import Any
 
 # RLock because check_mount_available() calls check_net_available() while
 # holding it; Lock would deadlock on that nested path.
@@ -46,7 +47,7 @@ _landlock_cache = None
 # _unix_scope_cache: True when the AF_UNIX connect-scoping supervisor
 # can run on this host (seccomp user-notify + pidfd_getfd + openat2 —
 # see core/sandbox/_unix_scope.py). None = not probed.
-_unix_scope_cache = None
+_unix_scope_cache: bool | None = None
 # _pidns_fresh_proc_cache: True when a fresh procfs can be mounted
 # inside a nested user+mount+pid namespace on this host (kernel policy
 # — refused e.g. under containers with a masked host /proc). None =
@@ -55,8 +56,17 @@ _unix_scope_cache = None
 # signal or the known static host condition (warned once, stamped
 # per run).
 _pidns_fresh_proc_cache: bool | None = None
+# _pidns_supervision_cache: (verdict, reason) for the supervised
+# pid-namespace tier (core.sandbox.supervised) — single-call
+# user+pid unshare + PID-1 round-trip. None = not probed. Only
+# DEFINITIVE verdicts land here (True engaged / False refused);
+# probe infrastructure failures are never cached (the check returns
+# None ad hoc and re-probes next call). A LIVE spawn-path refusal
+# overwrites via probes.note_pidns_supervision_refused — runtime
+# evidence is authoritative over an earlier probe.
+_pidns_supervision_cache: tuple[bool, str] | None = None
 # Seccomp cache: None = unchecked, 0 = unavailable, CDLL handle = available.
-_libseccomp_cache = None
+_libseccomp_cache: Any = None
 # ptrace cache: None = unchecked, True/False = probed result. Used by
 # `--audit` to decide whether b2 (syscall audit via SCMP_ACT_TRACE)
 # and b3 (filesystem audit) can engage. Probed by core.sandbox.ptrace_probe.
@@ -86,13 +96,12 @@ _user_limits_cache_decided_at = 0.0
 # Resolved absolute paths to sandbox-setup binaries. We use absolute paths
 # to prevent PATH hijacking — a polluted PATH (e.g., a malicious .envrc
 # that direnv activated, or `.` in the user's PATH) could otherwise
-# shadow these with attacker binaries. unshare/prlimit are resolved for
-# the namespace-creation step; mount/mkdir for the mount-script setup
+# shadow these with attacker binaries. unshare is resolved for the
+# namespace engagement probe; mount/mkdir for the mount-script setup
 # (only active when mount-ns is available, e.g. not on Ubuntu 24.04 with
 # kernel.apparmor_restrict_unprivileged_userns=1).
 # All are resolved against a hardcoded safe bin-dir list, not PATH.
 _unshare_path_cache = None
-_prlimit_path_cache = None
 _mount_path_cache = None
 _mkdir_path_cache = None
 _sandbox_exec_path_cache = None
@@ -108,6 +117,14 @@ _getcap_path_cache = None
 # disable its own sandbox.
 _cli_sandbox_disabled = False   # True when --no-sandbox passed
 _cli_sandbox_profile = None     # str profile name when --sandbox <name> passed
+# Consent provenance for an ACCEPTED CLI disable: always "nonce" — a
+# validated minted RAPTOR_NO_SANDBOX_NONCE is the only consent source
+# the gate accepts. None whenever _cli_sandbox_disabled is False.
+# Written ONLY by
+# core.sandbox.cli._set_cli_state — the same entry-point-argparse-only
+# rule as the flags above; the gate that fills it fails closed
+# (core.sandbox.disable_consent.resolve_disable_consent).
+_cli_sandbox_disable_consent: str | None = None
 # Audit flags — orthogonal to profile. `--audit` engages audit mode on
 # the active profile (proxy log-and-allow + SCMP_ACT_TRACE + tracer);
 # `--verbose` (only with --audit) flips the tracer from filtered to
@@ -130,6 +147,21 @@ _cli_sandbox_audit_budget = None
 # validated absolute paths otherwise.
 _cli_sandbox_readable_paths = None
 _cli_sandbox_tool_paths = None
+# Per-run untrusted containment-floor consent: `--sandbox-floor <tier>`
+# (tier label string, e.g. "landlock"; None = flag not passed). The
+# highest-precedence consent surface for the untrusted floor classes
+# (flag > project setting > legacy env var > default-refuse — resolved
+# in core.sandbox.context.resolve_untrusted_floor). Same
+# prompt-injection rule as every slot above: set ONLY from entry-point
+# argparse (core.sandbox.cli.set_cli_sandbox_floor).
+_cli_sandbox_floor: str | None = None
+# Project-surface twin: the active project's registry-validated
+# `sandbox-floor` setting, consumed once at run start by the entry
+# script (core.project.trust.apply_project_sandbox_floor →
+# core.sandbox.cli.set_project_sandbox_floor). Operator-written
+# on-disk project config under ~/.raptor/projects — NEVER read from
+# the scanned repo, never from cwd, and never set by library code.
+_project_sandbox_floor: str | None = None
 
 # Degradation warnings are logged once per process, not once per sandbox()
 # context — kernel capability doesn't change at runtime and scan loops
@@ -153,6 +185,47 @@ _pidns_proc_mount_unavailable_warned = False
 # level mount probe); this flag is for the user-facing warning emitted from
 # the public sandbox() path that names the practical posture and remediation.
 _sandbox_landlock_only_warned = False
+# Namespace-preserving bind-tree fallback. The posture is static enough for a
+# process-level warning; per-call reporting still records every affected run.
+_mountless_backend_warned = False
+# NPROC-pressure twin of the flag above: the bind-tree spawn degraded
+# because the child's forks raced a finite RLIMIT_NPROC (per-uid task
+# count at the ceiling), not because the capability is missing. Its own
+# key so the pressure diagnosis and the genuine capability/policy
+# diagnosis each get their one loud surfacing per process.
+_nproc_pressure_degrade_warned = False
+# Consent banner: a non-default consent source (the
+# RAPTOR_ALLOW_DEGRADED_UNTRUSTED waiver) lowered the untrusted
+# containment floor for this process. Once per process; the per-call
+# consented-degrade warning fires every time the lowered floor bites.
+_floor_lowered_banner_warned = False
+# Explicit-surface twins of the consent banner above: the per-run
+# --sandbox-floor flag / the project sandbox-floor setting is the
+# in-force floor source for this process's untrusted-class calls.
+_floor_flag_banner_warned = False
+_floor_project_banner_warned = False
+# Host-consent twins: the WSL host-consent marker is the in-force
+# floor source. Banner once per process, AND — unlike the other
+# consent sources, whose consented-degrade warning fires per call —
+# the per-call degrade warning collapses to one notice per process:
+# under the marker EVERY untrusted call on the host runs at ns-only,
+# so per-call reporting is pure spam carrying no new information.
+_floor_host_banner_warned = False
+_floor_host_degrade_notice_warned = False
+# Disagreement banner: two consent surfaces named DIFFERENT untrusted
+# floors and the higher-precedence one won (flag > project > env var).
+# Once per process, naming both surfaces and both values.
+_floor_surface_disagreement_warned = False
+# inherit_netns=True dropped the network namespace from a
+# block_network run (sanctioned for netns-coordinator paired runs;
+# a host-netns caller lost the requested block). Once per process;
+# the per-run netns_inherited posture stamp records every instance.
+_inherit_netns_block_warned = False
+# The mountless namespace backend left the achievable set for a call
+# (Landlock ABI below 3 with untrusted/read-restricted write policy)
+# and the demotion continued down the ladder. Once per process; the
+# per-run mount_ns_degraded stamp records every instance.
+_mountless_unachievable_warned = False
 _bare_run_posture_warned = False
 _net_and_tcp_allowlist_warned = False
 # Degraded-mode Landlock TCP-connect deny (block_network without a
@@ -163,6 +236,16 @@ _net_and_tcp_allowlist_warned = False
 # second one-shot warning here.
 _degraded_tcp_deny_warned = False
 _degraded_net_open_override_warned = False
+# Landlock-less kernel accepted via RAPTOR_ALLOW_DEGRADED_UNTRUSTED
+# (construction-time enforceability arm).
+_degraded_landlock_override_warned = False
+# Per-call demotion twins of the two construction-time degraded-net
+# arms above (the plain-lane fallback for a namespace-shaped call).
+_demoted_tcp_deny_warned = False
+_demoted_net_open_override_warned = False
+# Trusted-floor Landlock-absence tolerance bit on a policy-carrying
+# call (the requested fs/TCP policy is unenforced on the ns-only lane).
+_tolerated_policy_unenforced_warned = False
 # Egress-proxy tier 2 engaged (Landlock TCP port pin, no netns bridge):
 # the pin is port-scoped, not (host, port)-scoped — weaker guarantee
 # than the netns tier; warned once per process at engagement.

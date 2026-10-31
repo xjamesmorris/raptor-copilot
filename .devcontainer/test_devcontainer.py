@@ -279,8 +279,9 @@ def check_raptor_structure() -> Tuple[bool, str]:
         "packages/static-analysis",
         "packages/web",
         ".claude/commands",
-        ".claude/agents",
         ".claude/skills",
+        ".github/agents",
+        "plugins/agents/agents",
     ]
 
     missing = []
@@ -472,15 +473,18 @@ def run_all_tests(verbose: bool = False, skip_optional: bool = False) -> List[Te
             used_by=used_by
         ))
 
-    # Check rr kernel configuration
+    # Check rr kernel configuration. rr RECORDING is the opt-in
+    # --privileged profile (documented in devcontainer.json); the
+    # default container is unprivileged, where perf counters are
+    # unavailable and this check legitimately reports not-configured.
     passed, msg = check_rr_kernel()
     results.append(TestResult(
         name="rr kernel config",
         category=Category.DEBUGGER,
         passed=passed,
-        required=True,  # Required when using --privileged devcontainer
+        required=False,  # opt-in rr recording profile only
         message=msg,
-        used_by=["rr-debugger skill (requires --privileged devcontainer)"]
+        used_by=["rr-debugger skill (opt-in --privileged rr profile)"]
     ))
 
     # =========================================================================
@@ -564,7 +568,7 @@ def run_all_tests(verbose: bool = False, skip_optional: bool = False) -> List[Te
         ))
 
     # =========================================================================
-    # PYTHON CORE PACKAGES (from requirements.txt)
+    # PYTHON CORE PACKAGES (from pyproject.toml)
     # =========================================================================
 
     python_core_packages = [
@@ -586,7 +590,7 @@ def run_all_tests(verbose: bool = False, skip_optional: bool = False) -> List[Te
         ))
 
     # =========================================================================
-    # PYTHON DEV PACKAGES (from requirements-dev.txt)
+    # PYTHON DEV PACKAGES (from the default uv development group)
     # =========================================================================
 
     python_dev_packages = [

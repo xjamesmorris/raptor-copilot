@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from packages.sca.kinds import SUPPLYCHAIN_ID_PREFIX
 from packages.sca.models import (
     Confidence, Dependency, PinStyle, SupplyChainFinding,
 )
@@ -84,7 +85,7 @@ def _make_finding(d: DropOnBumpFinding) -> SupplyChainFinding:
 
     return SupplyChainFinding(
         finding_id=(
-            f"sca:supply_chain:transitive_now_optional:{d.ecosystem}:"
+            f"{SUPPLYCHAIN_ID_PREFIX}transitive_now_optional:{d.ecosystem}:"
             f"{d.transitive_name}:{d.parent_name}"
         ),
         kind="transitive_now_optional",
@@ -101,13 +102,31 @@ def _make_finding(d: DropOnBumpFinding) -> SupplyChainFinding:
             "extra_name": d.extra_name,
             "underlying_severity": d.transitive_finding_severity,
         },
-        severity=severity,
+        severity=severity,  # type: ignore[arg-type]
         confidence=Confidence(
             "high",
             reason=(
-                "PyPI requires_dist diff: dep moved behind optional extra"
+                f"{_metadata_source(d.ecosystem)} diff: dep moved "
+                f"behind optional gate"
                 if d.transitive_status_in_latest == "extras-gated"
-                else "PyPI requires_dist diff across parent versions"
+                else f"{_metadata_source(d.ecosystem)} diff across "
+                     f"parent versions"
             ),
         ),
     )
+
+
+def _metadata_source(ecosystem: str) -> str:
+    """The operator-facing name of the parent-metadata field the
+    detector actually diffed — per ecosystem, matching the detector's
+    ``_dep_state_in_version`` dispatch (the reason previously claimed
+    ``PyPI requires_dist`` for every ecosystem)."""
+    return {
+        "PyPI": "PyPI requires_dist",
+        "npm": "npm dependencies/optionalDependencies",
+        "Cargo": "Cargo [dependencies]/[features]",
+        "Packagist": "Composer require/require-dev",
+        "RubyGems": "gem dependency-type",
+        "Maven": "Maven dependency scope/optional",
+        "NuGet": "NuGet TFM dependency-group",
+    }.get(ecosystem, f"{ecosystem} parent dependency metadata")

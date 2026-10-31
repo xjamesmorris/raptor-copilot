@@ -382,10 +382,21 @@ def test_disk_cache_corruption_falls_back_to_fresh_fetch(tmp_path):
     assert any(p.name == "ok" for p in sbom.packages)
 
 
-def test_no_cache_argument_means_no_persistence(tmp_path):
+def test_no_cache_argument_means_no_persistence(tmp_path, monkeypatch):
     """Passing ``cache=None`` to ``scan_dockerfiles`` (the test
     default + ``--no-cache`` operator path) means nothing is
-    written to disk. Pure per-run."""
+    written to disk. Pure per-run. Pinned by making any JsonCache
+    construction fail — the old assertion checked a directory the
+    call was never told about and could not fail."""
+    import core.json.cache as _cache_mod
+
+    def _no_cache_allowed(self, *a, **k):
+        raise AssertionError(
+            "JsonCache constructed despite cache=None — the no-cache "
+            "path must not create any disk cache tier"
+        )
+
+    monkeypatch.setattr(_cache_mod.JsonCache, "__init__", _no_cache_allowed)
     (tmp_path / "Dockerfile").write_text("FROM debian:11\n")
     layer = _layer({
         "var/lib/dpkg/status": (
@@ -409,7 +420,8 @@ def test_no_cache_argument_means_no_persistence(tmp_path):
         manifests={"11": manifest}, blobs={layer_digest: layer},
     )
 
-    cache_dir = tmp_path / "cache"
+    before = {p.relative_to(tmp_path) for p in tmp_path.rglob("*")}
     deps = scan_dockerfiles(tmp_path, client=client, cache=None)
     assert deps                                   # work happened
-    assert not cache_dir.exists()                 # nothing written
+    after = {p.relative_to(tmp_path) for p in tmp_path.rglob("*")}
+    assert after == before                        # nothing written

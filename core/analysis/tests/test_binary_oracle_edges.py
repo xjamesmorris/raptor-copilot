@@ -102,6 +102,41 @@ def test_extract_handles_offset_keyed_aflj_without_crashing(
     assert any(e.caller == "main" and e.callee == "leaf" for e in idx.edges)
 
 
+def test_extract_survives_non_utf8_r2_output(monkeypatch, tmp_path) -> None:
+    """Regression: r2 stdout over a hostile/malformed ELF can contain
+    non-UTF-8 bytes. Without ``errors="replace"`` on the aflj
+    invocation the text-mode decode raises UnicodeDecodeError — a
+    ValueError outside the caught (TimeoutExpired, SubprocessError,
+    OSError) tuple — crashing the must-not-crash inventory path. The
+    fake run decodes its stdout with the invocation's own
+    encoding/errors kwargs, exactly as subprocess text mode would."""
+    import core.analysis.binary_oracle_edges as _edges
+    import core.sandbox as _sb
+
+    monkeypatch.setattr(_edges.shutil, "which", lambda _name: "/usr/bin/r2")
+
+    binary = tmp_path / "x"
+    binary.write_bytes(b"\x7fELF placeholder")
+
+    hostile = b'[{"addr":4425,"name":"main\xff\xfe","size":20}]'
+
+    class _Proc:
+        def __init__(self, stdout):
+            self.stdout = stdout
+            self.stderr = ""
+            self.returncode = 0
+
+    def _fake_run(cmd, **kwargs):
+        enc = kwargs.get("encoding") or "utf-8"
+        errors = kwargs.get("errors") or "strict"
+        return _Proc(hostile.decode(enc, errors))
+
+    monkeypatch.setattr(_sb, "run", _fake_run, raising=False)
+
+    idx = extract_direct_call_edges(binary, use_cache=False)
+    assert isinstance(idx, BinaryEdgeIndex)
+
+
 def test_parse_axffj_batch_extracts_call_edges() -> None:
     """The axffj-batch parser must extract CALL refs grouped by
     BATCH-prefixed function addresses, mapping callee addresses back
@@ -300,22 +335,26 @@ def test_cache_rejects_cross_target_collision(
     from core.config import RaptorConfig
     monkeypatch.setattr(RaptorConfig, "BASE_OUT_DIR", tmp_path)
 
-    # Save a cache entry under build_id X claiming it's for /bin/binA.
-    idx = BinaryEdgeIndex(binary_path="/bin/binA")
-    idx.edges = [BinaryCallEdge("main", "foo", "/bin/binA")]
+    # Save a cache entry under build_id X claiming it's for binA.
+    # (Real file: since the v2 content binding, the saver hashes the
+    # binary at the recorded path and skips unbindable entries.)
+    bin_a = tmp_path / "binA"
+    bin_a.write_bytes(b"\x7fELF binA bytes")
+    idx = BinaryEdgeIndex(binary_path=str(bin_a))
+    idx.edges = [BinaryCallEdge("main", "foo", str(bin_a))]
     cache_file = _cache_path_for("abcdef" * 7)
     assert cache_file is not None
     _save_cached_index(cache_file, idx)
 
     # Now look up that same build_id but for a DIFFERENT binary path.
     # The cached binary_path mismatch should drive a miss.
-    loaded = _load_cached_index(cache_file, "/bin/binB")
+    loaded = _load_cached_index(cache_file, str(tmp_path / "binB"))
     assert loaded is None, (
         "cache must refuse to return entries whose recorded "
         "binary_path differs from the lookup's binary_path"
     )
     # Sanity: lookup with the matching path still works.
-    loaded = _load_cached_index(cache_file, "/bin/binA")
+    loaded = _load_cached_index(cache_file, str(bin_a))
     assert loaded is not None
     assert len(loaded.edges) == 1
 
@@ -378,10 +417,12 @@ def test_cache_round_trips_edges_under_build_id(tmp_path, monkeypatch) -> None:
     from core.config import RaptorConfig
     monkeypatch.setattr(RaptorConfig, "BASE_OUT_DIR", tmp_path)
 
-    idx = BinaryEdgeIndex(binary_path="/tmp/binA")
+    bin_a = tmp_path / "binA"
+    bin_a.write_bytes(b"\x7fELF binA bytes")
+    idx = BinaryEdgeIndex(binary_path=str(bin_a))
     idx.edges = [
-        BinaryCallEdge("main", "foo", "/tmp/binA"),
-        BinaryCallEdge("<vtable@0x6fab0>", "Foo::method", "/tmp/binA"),
+        BinaryCallEdge("main", "foo", str(bin_a)),
+        BinaryCallEdge("<vtable@0x6fab0>", "Foo::method", str(bin_a)),
     ]
     idx.callees = {"foo", "Foo::method"}
 
@@ -389,7 +430,7 @@ def test_cache_round_trips_edges_under_build_id(tmp_path, monkeypatch) -> None:
     _save_cached_index(cache_file, idx)
     assert cache_file.is_file()
     # Re-load — should match exactly
-    loaded = _load_cached_index(cache_file, "/tmp/binA")
+    loaded = _load_cached_index(cache_file, str(bin_a))
     assert loaded is not None
     assert len(loaded.edges) == 2
     assert ("main", "foo") in {(e.caller, e.callee) for e in loaded.edges}
@@ -399,7 +440,7 @@ def test_cache_round_trips_edges_under_build_id(tmp_path, monkeypatch) -> None:
     payload = _json.loads(cache_file.read_text())
     payload["version"] = 999
     cache_file.write_text(_json.dumps(payload))
-    assert _load_cached_index(cache_file, "/tmp/binA") is None
+    assert _load_cached_index(cache_file, str(bin_a)) is None
 
 
 def test_graph_store_reuse_requires_matching_binary_sha_and_keeps_requested_path(
@@ -446,6 +487,10 @@ def test_graph_store_reuse_requires_matching_binary_sha_and_keeps_requested_path
     shutil.which("r2") is None,
     reason="radare2 (r2) not installed — direct-edge extraction returns an "
     "empty index by design, so there is nothing to assert",
+)
+@pytest.mark.skipif(
+    shutil.which("gcc") is None,
+    reason="gcc not available — the fixture binary can't be built",
 )
 def test_extract_direct_call_edges_on_synthetic_fixture(
     tmp_path: Path,
@@ -600,14 +645,14 @@ def test_extract_script_appends_av_to_single_session(monkeypatch, tmp_path):
     monkeypatch.setattr(edges_mod.shutil, "which",
                         lambda t: f"/usr/bin/{t}")
     monkeypatch.setattr(edges_mod, "_try_graph_store", lambda p: None)
-    monkeypatch.setattr(edges_mod, "read_build_id", lambda p: None)
-    monkeypatch.setattr(edges_mod, "_content_hash", lambda p: None)
+    monkeypatch.setattr(edges_mod, "_identity_cache_key", lambda p: None)
 
     calls: list[list[str]] = []
 
     class _Proc:
         def __init__(self, stdout):
             self.stdout = stdout
+            self.returncode = 0
 
     def fake_sandbox_run(argv, **kwargs):
         calls.append(list(argv))
@@ -646,3 +691,75 @@ def test_extract_script_appends_av_to_single_session(monkeypatch, tmp_path):
     callees = idx.callees
     assert "callee" in callees          # direct edge parsed
     assert "Widget::draw" in callees    # vtable edge merged
+
+
+def _rc_extract_setup(monkeypatch, tmp_path, rc):
+    """Common stub: aflj lists two functions, the script session
+    returns ONE parsed batch with exit status ``rc`` — the torn-
+    transcript shape (r2 killed mid-script by OOM / rlimit / signal)."""
+    import core.sandbox as _sb
+    import core.analysis.binary_oracle_edges as edges_mod
+    from core.config import RaptorConfig
+
+    monkeypatch.setattr(RaptorConfig, "BASE_OUT_DIR", tmp_path)
+    monkeypatch.setattr(edges_mod.shutil, "which",
+                        lambda t: f"/usr/bin/{t}")
+    monkeypatch.setattr(edges_mod, "_try_graph_store", lambda p: None)
+    monkeypatch.setattr(edges_mod, "_identity_cache_key",
+                        lambda p: "feedface" * 5)
+
+    binary = tmp_path / "demo"
+    binary.write_bytes(b"\x7fELF-stub")
+
+    class _Proc:
+        def __init__(self, stdout, returncode=0):
+            self.stdout = stdout
+            self.stderr = ""
+            self.returncode = returncode
+
+    def fake_sandbox_run(argv, **kwargs):
+        if "-c" in argv:  # aflj listing
+            return _Proc(
+                '[{"name":"main","addr":4096,"size":10},'
+                '{"name":"sym.callee","addr":8192,"size":10}]'
+            )
+        # Script session killed after the first batch: partial
+        # transcript + non-zero exit.
+        return _Proc(
+            "BATCH 4096\n"
+            '[{"type":"CALL","ref":8192}]\n',
+            returncode=rc,
+        )
+
+    monkeypatch.setattr(_sb, "run", fake_sandbox_run)
+    return binary
+
+
+def test_nonzero_r2_exit_uses_partial_edges_but_never_caches(
+        tmp_path, monkeypatch) -> None:
+    """r2 killed mid-script exits non-zero with a truncated
+    transcript. The partial edges may serve THIS run (the witness is
+    promote-only), but caching them under the build-id would forfeit
+    every function past the cut for all later runs, permanently and
+    silently — the cache write must be skipped."""
+    from core.analysis.binary_oracle_edges import (
+        _cache_path_for,
+        extract_direct_call_edges,
+    )
+    binary = _rc_extract_setup(monkeypatch, tmp_path, rc=137)
+    idx = extract_direct_call_edges(binary, use_cache=True)
+    # Best-effort for this run: the parsed prefix is still served.
+    assert "callee" in idx.callees
+    # ... but the partial index is never cached.
+    assert not _cache_path_for("feedface" * 5).exists()
+
+
+def test_zero_r2_exit_still_caches(tmp_path, monkeypatch) -> None:
+    from core.analysis.binary_oracle_edges import (
+        _cache_path_for,
+        extract_direct_call_edges,
+    )
+    binary = _rc_extract_setup(monkeypatch, tmp_path, rc=0)
+    idx = extract_direct_call_edges(binary, use_cache=True)
+    assert "callee" in idx.callees
+    assert _cache_path_for("feedface" * 5).exists()

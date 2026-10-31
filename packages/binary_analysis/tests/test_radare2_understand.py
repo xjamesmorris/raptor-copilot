@@ -12,6 +12,8 @@ from packages.binary_analysis.radare2_understand import (
     BinaryContextMap,
     BinaryUnderstand,
     FunctionInfo,
+    R2CommandTimeout,
+    R2SessionLost,
     analyse_binary_context,
     probe_capability,
 )
@@ -92,10 +94,10 @@ class TestBinaryContextMap(unittest.TestCase):
 class TestDangerousImports(unittest.TestCase):
     def test_known_dangerous_imports_present(self):
         # Representatives from each composed category. The full
-        # taxonomy is exhaustively tested in core/tests/
-        # test_function_taxonomy.py; here we just confirm radare2_
-        # understand's composition still includes the major sink
-        # families.
+        # taxonomy is exhaustively tested in core/function_taxonomy/
+        # tests/test_function_taxonomy.py; here we just confirm
+        # radare2_understand's composition still includes the major
+        # sink families.
         self.assertIn("strcpy", _DANGEROUS_IMPORTS)         # string overflow
         self.assertIn("scanf", _DANGEROUS_IMPORTS)          # scan-family
         self.assertIn("memcpy", _DANGEROUS_IMPORTS)         # mem copy
@@ -488,6 +490,187 @@ class TestCmdTimeout(unittest.TestCase):
         self.assertLess(BinaryUnderstand._T_QUERY, 300)
         self.assertGreater(BinaryUnderstand._T_XREF, 1)
         self.assertLess(BinaryUnderstand._T_XREF, 300)
+
+
+def _timeout_base_response(command: str) -> str:
+    """Canned r2 responses for the timeout-degradation pipeline tests."""
+    responses = {
+        "aaa": "",
+        "ij": json.dumps(
+            {"bin": {"arch": "x86", "bits": 64, "bintype": "elf"}}),
+        "iij": json.dumps([{"name": "sym.imp.strcpy"}]),
+        "iEj": "[]",
+        "aflj": json.dumps([
+            {"name": "parse_a", "offset": 0x1000, "size": 64},
+            {"name": "parse_b", "offset": 0x1100, "size": 64},
+            {"name": "parse_c", "offset": 0x1200, "size": 64},
+            {"name": "sym.imp.strcpy", "offset": 0x2000, "size": 16},
+        ]),
+        "icj": "[]",
+        "izj": "[]",
+    }
+    if command in responses:
+        return responses[command]
+    if command.startswith("axffj"):
+        return json.dumps([{"type": "CALL", "name": "sym.imp.strcpy"}])
+    if command.startswith(("aflcj", "afllj")):
+        return "[]"
+    if command.startswith(("pdc", "pdg")):
+        return "int f() { return 0; }"
+    return ""
+
+
+class TestTimeoutDegradation(unittest.TestCase):
+    """A per-function r2 command timeout kills radare2; the analysis
+    must record the degradation (per-function ctx.notes entry) and
+    continue on a restarted session — pre-fix the per-function
+    `except Exception` isolation swallowed the TimeoutError and every
+    later command failed fast on the dead pipe, so the analysis
+    'completed' with a silently hollow context map."""
+
+    def _make_understand(self):
+        return _make_understand_for("r2-deg-", self.addCleanup)
+
+    def _analyse_with(self, fake_cmd_t, spawn_counter=None, quick=False):
+        understand = self._make_understand()
+        fake_r2pipe = MagicMock()
+
+        def fake_open(path, flags=None):
+            if spawn_counter is not None:
+                spawn_counter.append(1)
+            handle = MagicMock()
+            handle.cmd.return_value = "[]"
+            return handle
+
+        fake_r2pipe.open = fake_open
+        with patch.object(
+            BinaryUnderstand, "_cmd_t", new=staticmethod(fake_cmd_t),
+        ), patch.dict("sys.modules", {"r2pipe": fake_r2pipe}):
+            return understand.analyse(
+                max_decompile=0, max_strings=0, quick=quick,
+            )
+
+    def test_single_timeout_recorded_and_analysis_continues(self):
+        """One pathological function must cost exactly its own result:
+        a degradation note is recorded, r2 restarts, and the remaining
+        functions still get their xref tagging."""
+        state = {"axffj_calls": 0}
+        spawns: list = []
+
+        def fake_cmd_t(r2, command, timeout_s):
+            if command.startswith("axffj"):
+                state["axffj_calls"] += 1
+                if state["axffj_calls"] == 1:
+                    raise R2CommandTimeout(
+                        f"r2 command {command!r} exceeded {timeout_s}s")
+            return _timeout_base_response(command)
+
+        ctx = self._analyse_with(fake_cmd_t, spawn_counter=spawns)
+
+        # The timeout is a recorded degradation, not a silent gap.
+        timeout_notes = [n for n in ctx.notes if "radare2 timeout" in n]
+        self.assertEqual(len(timeout_notes), 1)
+        self.assertIn("xrefs for parse_a", timeout_notes[0])
+        # The session was restarted (initial spawn + one respawn)...
+        self.assertEqual(len(spawns), 2)
+        # ...and the analysis carried on: later functions still got
+        # their dangerous-call tagging.
+        by_name = {f.name: f for f in ctx.interesting_functions}
+        self.assertEqual(by_name["parse_a"].calls_dangerous, [])
+        self.assertEqual(by_name["parse_b"].calls_dangerous, ["strcpy"])
+        self.assertEqual(by_name["parse_c"].calls_dangerous, ["strcpy"])
+        # A recovered run is still a full-depth analysis.
+        self.assertEqual(ctx.analysis_depth, "full")
+
+    def test_session_lost_stamps_partial_with_loud_warning(self):
+        """When r2 keeps dying past the restart budget, the analysis
+        must complete with analysis_depth='partial' and a WARNING note
+        — never raise, and never pretend the hollow map is complete."""
+        def fake_cmd_t(r2, command, timeout_s):
+            if command.startswith("axffj"):
+                raise R2CommandTimeout(
+                    f"r2 command {command!r} exceeded {timeout_s}s")
+            return _timeout_base_response(command)
+
+        ctx = self._analyse_with(fake_cmd_t)
+
+        self.assertEqual(ctx.analysis_depth, "partial")
+        warnings = [n for n in ctx.notes if n.startswith("WARNING:")]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("session lost", warnings[0])
+        # Per-timeout notes are bounded by the restart budget
+        # (_R2Session._MAX_RESTARTS attempts + the final fatal one).
+        timeout_notes = [n for n in ctx.notes if "radare2 timeout" in n]
+        self.assertEqual(len(timeout_notes), 3)
+        # Everything extracted before the death is preserved.
+        self.assertEqual(ctx.arch, "x86")
+        self.assertEqual(
+            [f.name for f in ctx.interesting_functions],
+            ["parse_a", "parse_b", "parse_c"],
+        )
+
+    def test_quick_mode_session_loss_keeps_metadata_only(self):
+        """Quick mode is stamped metadata_only up front; a session
+        loss must not RELABEL it 'partial' — that overstated the
+        depth and bypassed consumers' metadata_only special-casing.
+        The loud WARNING note still rides."""
+        def fake_cmd_t(r2, command, timeout_s):
+            # Every quick-path query times out so the restart budget
+            # is exhausted and R2SessionLost reaches analyse().
+            if command.startswith(("ij", "iij", "iEj")):
+                raise R2CommandTimeout(
+                    f"r2 command {command!r} exceeded {timeout_s}s")
+            return _timeout_base_response(command)
+
+        ctx = self._analyse_with(fake_cmd_t, quick=True)
+
+        self.assertEqual(ctx.analysis_depth, "metadata_only")
+        warnings = [n for n in ctx.notes if n.startswith("WARNING:")]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("session lost", warnings[0])
+
+    def test_aaa_timeout_still_aborts_analysis(self):
+        """The initial full auto-analysis timing out means there is no
+        session to degrade gracefully from — the abort contract is
+        unchanged."""
+        def fake_cmd_t(r2, command, timeout_s):
+            if command == "aaa":
+                raise R2CommandTimeout(
+                    f"r2 command {command!r} exceeded {timeout_s}s")
+            return _timeout_base_response(command)
+
+        with self.assertRaises(TimeoutError):
+            self._analyse_with(fake_cmd_t)
+
+    def test_cmd_deg_returns_none_after_successful_restart(self):
+        understand = self._make_understand()
+        ctx = BinaryContextMap(binary_path=understand.binary)
+        session = MagicMock()
+        session.restart.return_value = True
+        with patch.object(
+            BinaryUnderstand, "_cmd_t",
+            new=staticmethod(MagicMock(side_effect=R2CommandTimeout("t"))),
+        ):
+            result = understand._cmd_deg(
+                session, ctx, "axffj @ 4096", 30.0, what="xrefs for f")
+        self.assertIsNone(result)
+        session.restart.assert_called_once()
+        self.assertEqual(len(ctx.notes), 1)
+        self.assertIn("xrefs for f", ctx.notes[0])
+
+    def test_cmd_deg_raises_session_lost_when_restart_fails(self):
+        understand = self._make_understand()
+        ctx = BinaryContextMap(binary_path=understand.binary)
+        session = MagicMock()
+        session.restart.return_value = False
+        with patch.object(
+            BinaryUnderstand, "_cmd_t",
+            new=staticmethod(MagicMock(side_effect=R2CommandTimeout("t"))),
+        ), self.assertRaises(R2SessionLost):
+            understand._cmd_deg(
+                session, ctx, "axffj @ 4096", 30.0, what="xrefs for f")
+        # The degradation note is recorded even on the fatal path.
+        self.assertEqual(len(ctx.notes), 1)
 
 
 class TestTransitiveCallers(unittest.TestCase):
@@ -995,6 +1178,440 @@ class TestMalformedR2Json(unittest.TestCase):
         r2.cmd.return_value = json.dumps(callgraph)
         understand._tag_transitive_callers(r2, ctx)  # must not raise
         self.assertEqual(ctx.interesting_functions[0].transitive_distance, 1)
+
+
+class TestStringAnchors(unittest.TestCase):
+    """The bounded string-anchor pass: diagnostic-shaped strings are
+    selected structurally, resolved to referencing functions via
+    xrefs, grouped, bounded, and escaped at capture."""
+
+    def test_diagnostic_selection_is_structural(self):
+        from packages.binary_analysis.radare2_understand import (
+            _is_diagnostic_string,
+        )
+        # printf-style conversions are the strongest marker.
+        self.assertTrue(
+            _is_diagnostic_string("failed to read %s at offset %d"))
+        # Sentence-like punctuation / labelled clause.
+        self.assertTrue(
+            _is_diagnostic_string("invalid magic: expected RIFF header"))
+        self.assertTrue(_is_diagnostic_string("Checksum mismatch."))
+        # Too short.
+        self.assertFalse(_is_diagnostic_string("%s"))
+        # Bare identifiers carry no diagnostic shape.
+        self.assertFalse(_is_diagnostic_string("config_table_entry"))
+        # Mostly non-printable payloads are rejected.
+        self.assertFalse(
+            _is_diagnostic_string("\x01\x02\x03\x04ab\x05\x06\x07\x08"))
+        # Ratio-threshold direction fixture: a real conversion inside
+        # a mostly-control-byte payload is still rejected at the 0.9
+        # floor (a 0.0 floor would accept it via the %d match).
+        self.assertFalse(_is_diagnostic_string("err %d " + "\x01" * 20))
+
+    def _run_anchor_pass(self, understand, ctx, izj, axtj_by_vaddr):
+        r2 = MagicMock()
+        calls = []
+
+        def cmd_response(cmd):
+            calls.append(cmd)
+            if cmd == "izj":
+                return json.dumps(izj)
+            if cmd.startswith("axtj @ "):
+                vaddr = int(cmd.split("@")[-1].strip())
+                return json.dumps(axtj_by_vaddr.get(vaddr, []))
+            return "[]"
+
+        r2.cmd.side_effect = cmd_response
+        understand._extract_string_anchors(r2, ctx)
+        return calls
+
+    def test_grouping_ranks_anchor_dense_functions_first(self):
+        understand = _make_understand_for("r2-anchor-", self.addCleanup)
+        ctx = BinaryContextMap(binary_path=understand.binary)
+        ctx.interesting_functions = [
+            FunctionInfo(name="fcn.parse", address=0x1000, size=128),
+            FunctionInfo(name="fcn.other", address=0x2000, size=64),
+        ]
+        izj = [
+            {"string": "failed to parse header: %s", "vaddr": 0x5000},
+            {"string": "bad checksum %d in frame", "vaddr": 0x5010},
+            {"string": "plain_identifier", "vaddr": 0x5020},
+            {"string": "unexpected token in input.", "vaddr": 0x5030},
+        ]
+        axtj = {
+            0x5000: [{"fcn_addr": 0x1000, "fcn_name": "fcn.parse"}],
+            0x5010: [{"fcn_addr": 0x1000, "fcn_name": "fcn.parse"}],
+            0x5030: [{"fcn_addr": 0x2000, "fcn_name": "fcn.other"}],
+        }
+        calls = self._run_anchor_pass(understand, ctx, izj, axtj)
+        # Non-diagnostic strings never cost an xref lookup.
+        self.assertNotIn(f"axtj @ {0x5020}", calls)
+        self.assertEqual(
+            [(item["name"], item["anchor_string_count"])
+             for item in ctx.string_anchor_functions],
+            [("fcn.parse", 2), ("fcn.other", 1)],
+        )
+        # Serialised form carries the anchor surface.
+        d = ctx.to_dict()
+        self.assertEqual(
+            d["string_anchor_functions"][0]["name"], "fcn.parse")
+        self.assertEqual(
+            d["string_anchor_functions"][0]["address"], hex(0x1000))
+
+    def test_top_k_functions_bounded(self):
+        understand = _make_understand_for("r2-anchor-k-", self.addCleanup)
+        ctx = BinaryContextMap(binary_path=understand.binary)
+        izj = [
+            {"string": f"error {i}: bad field %d", "vaddr": 0x5000 + i * 0x10}
+            for i in range(3)
+        ]
+        axtj = {
+            0x5000 + i * 0x10: [{"fcn_addr": 0x1000 + i * 0x100,
+                                 "fcn_name": f"fcn.f{i}"}]
+            for i in range(3)
+        }
+        with patch.object(BinaryUnderstand, "_MAX_ANCHOR_FUNCTIONS", 2):
+            self._run_anchor_pass(understand, ctx, izj, axtj)
+        self.assertEqual(len(ctx.string_anchor_functions), 2)
+
+    def test_xref_lookups_bounded(self):
+        understand = _make_understand_for("r2-anchor-x-", self.addCleanup)
+        ctx = BinaryContextMap(binary_path=understand.binary)
+        izj = [
+            {"string": f"error {i}: bad field %d", "vaddr": 0x5000 + i * 0x10}
+            for i in range(4)
+        ]
+        with patch.object(BinaryUnderstand, "_MAX_ANCHOR_XREF_LOOKUPS", 1):
+            calls = self._run_anchor_pass(understand, ctx, izj, {})
+        self.assertEqual(
+            sum(1 for cmd in calls if cmd.startswith("axtj")), 1)
+
+    def test_hostile_sample_strings_escaped_at_capture(self):
+        """The sample strings ride into reports and LLM prompts; raw
+        control bytes from the binary must be escaped the moment they
+        are captured."""
+        understand = _make_understand_for("r2-anchor-h-", self.addCleanup)
+        ctx = BinaryContextMap(binary_path=understand.binary)
+        hostile = "Fatal: bad header \x1b]0;pwn\x07 near %s"
+        izj = [{"string": hostile, "vaddr": 0x5000}]
+        axtj = {0x5000: [{"fcn_addr": 0x1000, "fcn_name": "fcn.parse"}]}
+        self._run_anchor_pass(understand, ctx, izj, axtj)
+        self.assertEqual(len(ctx.string_anchor_functions), 1)
+        sample = ctx.string_anchor_functions[0]["sample_strings"][0]
+        self.assertNotIn("\x1b", sample)
+        self.assertNotIn("\x07", sample)
+        self.assertIn("\\x1b", sample)
+        self.assertIn("Fatal: bad header", sample)
+
+    def test_analyse_flag_skips_the_pass(self):
+        for flag, expected_calls in ((True, 1), (False, 0)):
+            understand = _make_understand_for(
+                f"r2-anchor-flag{int(flag)}-", self.addCleanup)
+            fake_r2pipe = MagicMock()
+            fake_r2pipe.open.return_value.cmd.return_value = "[]"
+            with patch.object(
+                BinaryUnderstand, "_extract_string_anchors",
+            ) as mock_pass, patch.dict("sys.modules",
+                                       {"r2pipe": fake_r2pipe}):
+                understand.analyse(
+                    max_decompile=0, max_strings=0, string_anchors=flag)
+            self.assertEqual(mock_pass.call_count, expected_calls)
+
+    def test_infinity_vaddr_and_fcn_addr_degrade(self):
+        """json.loads accepts Infinity; int(float('inf')) raises
+        OverflowError. Hostile vaddr / fcn_addr values must skip the
+        one entry, never abort the anchor pass (or the map)."""
+        understand = _make_understand_for("r2-anchor-inf-", self.addCleanup)
+        ctx = BinaryContextMap(binary_path=understand.binary)
+        izj = [
+            {"string": "bad frame %d in stream", "vaddr": float("inf")},
+            {"string": "valid error: %s value", "vaddr": 0x5000},
+        ]
+        axtj = {
+            0x5000: [
+                {"fcn_addr": float("inf"), "fcn_name": "fcn.evil"},
+                {"fcn_addr": 0x1000, "fcn_name": "fcn.a"},
+            ],
+        }
+        self._run_anchor_pass(understand, ctx, izj, axtj)  # must not raise
+        self.assertEqual(
+            [(item["name"], item["anchor_string_count"])
+             for item in ctx.string_anchor_functions],
+            [("fcn.a", 1)],
+        )
+
+    def test_hostile_fcn_name_escaped_at_capture(self):
+        """Anchor function names ride into every downstream JSON
+        artifact and report — like the samples, they must be escaped
+        the moment they are captured."""
+        understand = _make_understand_for("r2-anchor-fn-", self.addCleanup)
+        ctx = BinaryContextMap(binary_path=understand.binary)
+        izj = [{"string": "parse failure at %s", "vaddr": 0x5000}]
+        axtj = {0x5000: [{"fcn_addr": 0x1000,
+                          "fcn_name": "fcn.\x1b[9Apwn\x07"}]}
+        self._run_anchor_pass(understand, ctx, izj, axtj)
+        name = ctx.string_anchor_functions[0]["name"]
+        self.assertNotIn("\x1b", name)
+        self.assertNotIn("\x07", name)
+        self.assertIn("\\x1b", name)
+
+    def test_malformed_izj_degrades_silently(self):
+        understand = _make_understand_for("r2-anchor-m-", self.addCleanup)
+        ctx = BinaryContextMap(binary_path=understand.binary)
+        r2 = MagicMock()
+        r2.cmd.return_value = json.dumps({"unexpected": "shape"})
+        understand._extract_string_anchors(r2, ctx)  # must not raise
+        self.assertEqual(ctx.string_anchor_functions, [])
+
+
+class TestFunctionInventoryCap(unittest.TestCase):
+    def test_cap_is_recorded_in_ctx_notes(self):
+        """Capping the aflj inventory must surface in ctx.notes (the
+        operator-facing report), not just a log line — otherwise the
+        map claims complete coverage while functions were dropped."""
+        understand = _make_understand_for("r2-cap-", self.addCleanup)
+        ctx = BinaryContextMap(binary_path=understand.binary)
+        n = BinaryUnderstand._MAX_FUNCTIONS + 5
+        r2 = MagicMock()
+        r2.cmd.return_value = json.dumps([
+            {"name": f"fn{i}", "addr": 0x1000 + i * 0x10, "size": 64}
+            for i in range(n)
+        ])
+        understand._extract_functions(r2, ctx)
+        self.assertEqual(
+            len(ctx.interesting_functions), BinaryUnderstand._MAX_FUNCTIONS)
+        cap_notes = [x for x in ctx.notes if "Function inventory capped" in x]
+        self.assertEqual(len(cap_notes), 1)
+        self.assertIn(str(BinaryUnderstand._MAX_FUNCTIONS), cap_notes[0])
+
+    def test_no_note_below_cap(self):
+        understand = _make_understand_for("r2-cap2-", self.addCleanup)
+        ctx = BinaryContextMap(binary_path=understand.binary)
+        r2 = MagicMock()
+        r2.cmd.return_value = json.dumps([
+            {"name": "fn0", "addr": 0x1000, "size": 64},
+        ])
+        understand._extract_functions(r2, ctx)
+        self.assertEqual(ctx.notes, [])
+
+    def test_cap_note_states_exact_dropped_count(self):
+        understand = _make_understand_for("r2-cap3-", self.addCleanup)
+        ctx = BinaryContextMap(binary_path=understand.binary)
+        r2 = MagicMock()
+        r2.cmd.return_value = json.dumps([
+            {"name": f"fn{i}", "addr": 0x1000 + i * 0x10, "size": 64}
+            for i in range(15)
+        ])
+        understand._extract_functions(r2, ctx, max_functions=10)
+        self.assertEqual(len(ctx.interesting_functions), 10)
+        self.assertEqual(len(ctx.notes), 1)
+        self.assertIn("5 dropped", ctx.notes[0])
+        self.assertIn("capped at 10 of 15", ctx.notes[0])
+
+    def test_override_lowers_cap(self):
+        """Two-direction control, downward: an explicit max_functions
+        below the module default must be enforced."""
+        understand = _make_understand_for("r2-cap-lo-", self.addCleanup)
+        ctx = BinaryContextMap(binary_path=understand.binary)
+        r2 = MagicMock()
+        r2.cmd.return_value = json.dumps([
+            {"name": f"fn{i}", "addr": 0x1000 + i * 0x10, "size": 64}
+            for i in range(12)
+        ])
+        understand._extract_functions(r2, ctx, max_functions=4)
+        self.assertEqual(len(ctx.interesting_functions), 4)
+
+    def test_override_raises_cap(self):
+        """Two-direction control, upward: raising max_functions above
+        the inventory size must keep every function and emit no cap
+        note — the default cap must not silently re-apply."""
+        understand = _make_understand_for("r2-cap-hi-", self.addCleanup)
+        ctx = BinaryContextMap(binary_path=understand.binary)
+        n = BinaryUnderstand._MAX_FUNCTIONS + 5
+        r2 = MagicMock()
+        r2.cmd.return_value = json.dumps([
+            {"name": f"fn{i}", "addr": 0x1000 + i * 0x10, "size": 64}
+            for i in range(n)
+        ])
+        understand._extract_functions(r2, ctx, max_functions=n + 100)
+        self.assertEqual(len(ctx.interesting_functions), n)
+        self.assertEqual(ctx.notes, [])
+
+    def test_truncation_keeps_imports_and_largest_bodies(self):
+        """The drop is principled: imports survive (the sink map is
+        derived from them), then the largest bodies — never a blind
+        prefix of whatever order r2 emitted."""
+        understand = _make_understand_for("r2-cap-int-", self.addCleanup)
+        ctx = BinaryContextMap(binary_path=understand.binary)
+        entries = [
+            # Emission order deliberately puts the interesting entries
+            # LAST so a naive prefix slice would drop them.
+            {"name": "tiny_a", "addr": 0x1000, "size": 8},
+            {"name": "tiny_b", "addr": 0x1010, "size": 8},
+            {"name": "tiny_c", "addr": 0x1020, "size": 8},
+            {"name": "big_parser", "addr": 0x2000, "size": 4096},
+            {"name": "big_handler", "addr": 0x2100, "size": 2048},
+            {"name": "sym.imp.strcpy", "addr": 0x3000, "size": 16},
+        ]
+        r2 = MagicMock()
+        r2.cmd.return_value = json.dumps(entries)
+        understand._extract_functions(r2, ctx, max_functions=3)
+        self.assertEqual(
+            [fn.name for fn in ctx.imported_functions], ["sym.imp.strcpy"])
+        self.assertEqual(
+            [fn.name for fn in ctx.interesting_functions],
+            ["big_parser", "big_handler"],
+        )
+
+    def test_negative_and_zero_override_clamped(self):
+        """Two-direction cap validation: a negative max_functions must
+        behave as 0 (never leak slice-tail semantics), and the note
+        arithmetic must stay consistent (capped at 0 of N, N dropped)."""
+        for override in (-3, 0):
+            understand = _make_understand_for(
+                f"r2-cap-neg{abs(override)}-", self.addCleanup)
+            ctx = BinaryContextMap(binary_path=understand.binary)
+            r2 = MagicMock()
+            r2.cmd.return_value = json.dumps([
+                {"name": f"fn{i}", "addr": 0x1000 + i * 0x10, "size": 64}
+                for i in range(10)
+            ])
+            understand._extract_functions(r2, ctx, max_functions=override)
+            self.assertEqual(ctx.interesting_functions, [])
+            self.assertEqual(ctx.imported_functions, [])
+            self.assertEqual(len(ctx.notes), 1)
+            self.assertIn("capped at 0 of 10", ctx.notes[0])
+            self.assertIn("10 dropped", ctx.notes[0])
+
+    def test_addr_tiebreak_prefers_lower_address(self):
+        """Direction fixture for the address tiebreak: of two
+        same-size non-imports, only the LOWER address fits the cap."""
+        understand = _make_understand_for("r2-cap-dir-", self.addCleanup)
+        ctx = BinaryContextMap(binary_path=understand.binary)
+        r2 = MagicMock()
+        r2.cmd.return_value = json.dumps([
+            {"name": "hi_addr", "addr": 0x2000, "size": 64},
+            {"name": "lo_addr", "addr": 0x1000, "size": 64},
+        ])
+        understand._extract_functions(r2, ctx, max_functions=1)
+        self.assertEqual(
+            [fn.name for fn in ctx.interesting_functions], ["lo_addr"])
+
+    def test_infinity_payload_does_not_kill_extraction(self):
+        """json.loads accepts Infinity/NaN; int(float('inf')) raises
+        OverflowError. Hostile size/addr values must degrade inside
+        the interest key, never abort the whole map."""
+        understand = _make_understand_for("r2-cap-inf-", self.addCleanup)
+        ctx = BinaryContextMap(binary_path=understand.binary)
+        r2 = MagicMock()
+        r2.cmd.return_value = (
+            '[{"name": "evil_size", "addr": 4096, "size": Infinity},'
+            ' {"name": "evil_addr", "addr": Infinity, "size": 64},'
+            ' {"name": "sane", "addr": 8192, "size": 128},'
+            ' {"name": "other", "addr": 12288, "size": 32}]'
+        )
+        understand._extract_functions(r2, ctx, max_functions=3)  # must not raise
+        self.assertEqual(len(ctx.interesting_functions), 3)
+        self.assertIn(
+            "sane", [fn.name for fn in ctx.interesting_functions])
+
+    def test_duplicate_key_records_still_deterministic(self):
+        """Hostile duplicate addr+size records used to fall back to
+        emission order on full-tuple ties; the name component makes
+        the order total. Shuffles must agree on the survivor
+        SEQUENCE, not just the set."""
+        import random
+
+        entries = [
+            {"name": f"dup_{i}", "addr": 0x1000, "size": 64}
+            for i in range(8)
+        ]
+        sequences = []
+        for seed in (3, 4):
+            understand = _make_understand_for(
+                f"r2-cap-dup{seed}-", self.addCleanup)
+            ctx = BinaryContextMap(binary_path=understand.binary)
+            shuffled = list(entries)
+            random.Random(seed).shuffle(shuffled)
+            r2 = MagicMock()
+            r2.cmd.return_value = json.dumps(shuffled)
+            understand._extract_functions(r2, ctx, max_functions=4)
+            sequences.append([fn.name for fn in ctx.interesting_functions])
+        self.assertEqual(sequences[0], sequences[1])
+        self.assertEqual(len(sequences[0]), 4)
+
+    def test_truncation_survivors_deterministic_across_input_order(self):
+        """Shuffled aflj emission order must yield the identical
+        survivor set — the interest key (imports, size desc, address
+        asc, then name) fully determines what the cap keeps."""
+        import random
+
+        entries = [
+            {"name": f"fn{i}", "addr": 0x1000 + i * 0x10,
+             "size": 16 + (i * 7) % 512}
+            for i in range(30)
+        ]
+        entries.append({"name": "sym.imp.recv", "addr": 0x9000, "size": 16})
+        survivor_sets = []
+        for seed in (1, 2):
+            understand = _make_understand_for(
+                f"r2-cap-det{seed}-", self.addCleanup)
+            ctx = BinaryContextMap(binary_path=understand.binary)
+            shuffled = list(entries)
+            random.Random(seed).shuffle(shuffled)
+            r2 = MagicMock()
+            r2.cmd.return_value = json.dumps(shuffled)
+            understand._extract_functions(r2, ctx, max_functions=10)
+            survivor_sets.append(sorted(
+                fn.name for fn in
+                [*ctx.interesting_functions, *ctx.imported_functions]
+            ))
+        self.assertEqual(survivor_sets[0], survivor_sets[1])
+        self.assertIn("sym.imp.recv", survivor_sets[0])
+
+    def test_analyse_binary_context_plumbs_max_functions(self):
+        with patch(
+            "packages.binary_analysis.radare2_understand.BinaryUnderstand",
+        ) as mock_understand:
+            mock_understand.return_value.analyse.return_value = (
+                BinaryContextMap(binary_path=Path("./sample")))
+            analyse_binary_context(Path("./sample"), max_functions=123)
+        kwargs = mock_understand.return_value.analyse.call_args.kwargs
+        self.assertEqual(kwargs["max_functions"], 123)
+
+
+class TestExportTypeExtraction(unittest.TestCase):
+    def test_export_types_recovered_from_iej(self):
+        """iEj symbol types (FUNC vs OBJ) must ride along with the
+        export names — ingress recovery needs them to keep exported
+        data objects out of the callable-API surface."""
+        understand = _make_understand_for("r2-exptype-", self.addCleanup)
+        ctx = BinaryContextMap(binary_path=understand.binary)
+        r2 = MagicMock()
+        # Both iij and iEj receive the same canned payload; only the
+        # export-side assertions matter here.
+        r2.cmd.return_value = json.dumps([
+            {"name": "DecodePacket", "type": "FUNC", "vaddr": 0x1000},
+            {"name": "kMaxPacketLen", "type": "OBJ", "vaddr": 0x2000},
+            {"name": "mystery"},
+        ])
+        understand._extract_imports_exports(r2, ctx)
+        self.assertEqual(
+            ctx.exports, ["DecodePacket", "kMaxPacketLen", "mystery"])
+        self.assertEqual(
+            ctx.export_types,
+            {"DecodePacket": "FUNC", "kMaxPacketLen": "OBJ"})
+        d = ctx.to_dict()
+        self.assertEqual(d["export_types"], ctx.export_types)
+
+    def test_export_types_cleared_on_malformed_payload(self):
+        understand = _make_understand_for("r2-exptype2-", self.addCleanup)
+        ctx = BinaryContextMap(binary_path=understand.binary)
+        ctx.export_types = {"stale": "FUNC"}
+        r2 = MagicMock()
+        r2.cmd.return_value = json.dumps([42, "junk"])
+        understand._extract_imports_exports(r2, ctx)  # must not raise
+        self.assertEqual(ctx.export_types, {})
 
 
 class TestExportedMembership(unittest.TestCase):

@@ -3,6 +3,11 @@ inference for the /describe command."""
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
+import pytest
+
+from core.build.build_detector import BuildDetector
 from packages.describe.target_shape import (
     TargetShape,
     _compute_breakdown,
@@ -223,6 +228,49 @@ class TestInferTargetShape:
         assert "cpp" in shape.build_systems
         assert shape.build_systems["cpp"] == "autotools"
 
+    @pytest.mark.parametrize("manifest_dir", (".", "rust"))
+    def test_cargo_in_mixed_tree_is_descriptive_only(self, tmp_path, manifest_dir):
+        crate = tmp_path / manifest_dir
+        crate.mkdir(exist_ok=True)
+        (crate / "Cargo.toml").write_text(
+            '[package]\nname = "fixture"\nversion = "0.1.0"\n'
+        )
+        (crate / "lib.rs").write_text("pub fn fixture() {}\n")
+        (crate / "build.rs").write_text('fn main() { panic!("must not run"); }\n')
+        (tmp_path / "shim.c").write_text("int fixture(void) { return 0; }\n")
+        (tmp_path / "entry.s").write_text(".text\n")
+        (tmp_path / "setup.sh").write_text("#!/bin/sh\nexit 99\n")
+        (tmp_path / "Makefile").write_text("all:\n\tfalse\n")
+
+        with patch("core.build.build_detector._run_trusted") as probe, \
+             patch("core.build.build_detector._sandbox_run") as build:
+            shape = infer_target_shape(tmp_path)
+
+        assert set(shape.languages) == {"rust", "cpp", "asm", "shell"}
+        assert shape.build_systems == {"rust": "cargo", "cpp": "make"}
+        probe.assert_not_called()
+        build.assert_not_called()
+
+    def test_non_build_languages_are_not_probed(self, tmp_path):
+        (tmp_path / "entry.s").write_text(".text\n")
+        (tmp_path / "setup.sh").write_text("#!/bin/sh\nexit 99\n")
+
+        with patch.object(BuildDetector, "detect_build_system") as detect:
+            shape = infer_target_shape(tmp_path)
+
+        assert set(shape.languages) == {"asm", "shell"}
+        assert shape.build_systems == {}
+        detect.assert_not_called()
+
+    def test_cargo_lock_without_manifest_does_not_invent_a_build(self, tmp_path):
+        (tmp_path / "lib.rs").write_text("pub fn fixture() {}\n")
+        (tmp_path / "Cargo.lock").write_text("version = 3\n")
+
+        shape = infer_target_shape(tmp_path)
+
+        assert shape.primary_language == "rust"
+        assert shape.build_systems == {}
+
     def test_returns_frozen_dataclass(self, tmp_path):
         # TargetShape is frozen — caller can't mutate.
         shape = infer_target_shape(tmp_path)
@@ -260,3 +308,57 @@ def test_scan_inventory_hoists_stat_import_out_of_loop():
     src = inspect.getsource(ts._scan_inventory)
     for_body = src.split("for f in files:", 1)[1]
     assert "import stat" not in for_body
+
+
+class TestProbeNoiseFilterThreadScoped:
+    def test_concurrent_threads_probe_lines_survive(self, monkeypatch, tmp_path):
+        """The probe-noise filter drops chatter from the CALLING
+        thread only — the shared "raptor" logger carries other
+        threads' records during the window, and a concurrent
+        detector run's probe lines are theirs to keep."""
+        import logging
+        import threading
+
+        from packages.describe import target_shape as ts
+
+        records: list[str] = []
+
+        class _Cap(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record.getMessage())
+
+        raptor_logger = logging.getLogger("raptor")
+        cap = _Cap()
+        prev_level = raptor_logger.level
+        raptor_logger.addHandler(cap)
+        raptor_logger.setLevel(logging.INFO)
+
+        class _FakeDetector(BuildDetector):
+            def __init__(self, _path):
+                pass
+
+            def detect_build_system(self, _lang):
+                t = threading.Thread(
+                    target=lambda: raptor_logger.info(
+                        "Detecting build system for other-thread",
+                    ),
+                )
+                t.start()
+                t.join(timeout=5)
+                assert not t.is_alive()
+                # This thread's own chatter stays suppressed.
+                raptor_logger.info(
+                    "Detecting build system for this-thread",
+                )
+                return None
+
+        monkeypatch.setattr(
+            "core.build.build_detector.BuildDetector", _FakeDetector,
+        )
+        try:
+            ts._detect_build_systems(tmp_path, {"cpp": 1})
+        finally:
+            raptor_logger.removeHandler(cap)
+            raptor_logger.setLevel(prev_level)
+        assert "Detecting build system for other-thread" in records
+        assert "Detecting build system for this-thread" not in records

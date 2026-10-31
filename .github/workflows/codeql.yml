@@ -51,7 +51,16 @@ permissions:
 
 jobs:
   # Skip the analyze + upload jobs if a previous successful run already
-  # covered this exact commit SHA. Same homebrew dedup pattern as tests.yml.
+  # covered this exact commit SHA. Exact-SHA arm ONLY — unlike
+  # tests.yml, this workflow deliberately carries NO squash-merge
+  # fallback: GitHub's default-branch code-scanning alert baseline
+  # refreshes only from analyses uploaded for refs/heads/main, and the
+  # PR run's upload targets the PR ref. Skipping the push-to-main run
+  # because the PR head's (byte-identical) tree already passed starved
+  # main's alert state — new alerts opening and fixed alerts closing —
+  # until the weekly cron or the next direct push, contradicting the
+  # concurrency comment above. A true re-run of the SAME commit stays
+  # deduped: its earlier run already uploaded for this ref.
   pre_check:
     runs-on: ubuntu-latest
     timeout-minutes: 2
@@ -85,23 +94,10 @@ jobs:
               should_skip=true
               echo "Skipping: prior successful run ${dup} already covered SHA ${SHA}"
             fi
-            # 2. Squash-merge fallback — the push-to-main SHA is brand
-            #    new, but GitHub links it to the source PR. Look up the
-            #    PR's head SHA and check whether *that* already passed.
-            if [[ "$should_skip" == "false" && "$EVENT" == "push" ]]; then
-              pr_head=$(gh api "repos/${REPO}/commits/${SHA}/pulls" \
-                          --jq '[.[] | select(.merged_at != null)][0].head.sha // empty' || true)
-              if [[ -n "${pr_head:-}" ]]; then
-                dup=$(gh api -X GET "repos/${REPO}/actions/runs" \
-                        -f "head_sha=${pr_head}" -f "status=success" \
-                        --jq ".workflow_runs[] | select(.name==\"${WORKFLOW}\" and .id != ${RUN_ID}) | .id" \
-                      | head -n1 || true)
-                if [[ -n "${dup:-}" ]]; then
-                  should_skip=true
-                  echo "Skipping: source PR head ${pr_head} already passed in run ${dup}"
-                fi
-              fi
-            fi
+            # NO arm 2 here: the squash-merge fallback (see tests.yml)
+            # must not gate this workflow — the push run's upload is
+            # the ONLY delivery to main's code-scanning baseline (see
+            # the pre_check heading comment).
           fi
           echo "should_skip=${should_skip}" >> "$GITHUB_OUTPUT"
 
@@ -149,10 +145,9 @@ jobs:
           out=/tmp/changed_files.txt
           : > "$out"
           # ``--jq`` expressions use ``?`` + ``// []`` to suppress jq's
-          # ``cannot iterate over: null`` error on diffs the API
-          # truncates or returns as an error object (compare API caps
-          # at 300 files; past that ``.files`` is omitted entirely).
-          # No list → compute_filters forces all filters true.
+          # ``cannot iterate over: null`` error on responses that are
+          # an error object (non-array). No list → compute_filters
+          # forces all filters true.
           case "$EVENT" in
             pull_request|pull_request_target)
               gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" \
@@ -162,8 +157,26 @@ jobs:
               if [[ "$BEFORE" == "0000000000000000000000000000000000000000" ]]; then
                 rm -f "$out"
               else
-                gh api --paginate "repos/${REPO}/compare/${BEFORE}...${AFTER}" \
-                  --jq '(.files // [])[]?.filename' >> "$out"
+                # The compare API caps ``files`` at 300 entries and
+                # silently returns the FIRST 300 for a bigger diff —
+                # the key stays present, so the "no list" fail-open
+                # path never fires on truncation and a truncated list
+                # could drop the only file matching a language filter.
+                # At the cap, discard the list → full scan.
+                resp=/tmp/compare_response.json
+                gh api --paginate \
+                  "repos/${REPO}/compare/${BEFORE}...${AFTER}" > "$resp"
+                # No previous_filename companion here (tests.yml emits
+                # it): deliberate asymmetry — these lists feed
+                # glob-shaped LANGUAGE filters, and a rename's old
+                # path never changes which languages the new tree
+                # contains.
+                jq -r '(.files // [])[]?.filename' "$resp" >> "$out"
+                files_n=$(wc -l < "$out")
+                if (( files_n >= 300 )); then
+                  echo "::notice::compare listed ${files_n} files — at the API's 300-file cap, list may be truncated; forcing full scan"
+                  rm -f "$out"
+                fi
               fi
               ;;
             *)
@@ -257,7 +270,7 @@ jobs:
 
       - name: Initialize CodeQL
         if: steps.gate.outputs.run == 'true'
-        uses: github/codeql-action/init@85689a103d1234521562bbb736b2c4a31c9a85d5  # v4.37.5
+        uses: github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d  # v4.38.3
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
@@ -283,7 +296,7 @@ jobs:
       # left default-on).
       - name: Perform CodeQL Analysis (no upload — deferred to barrier job)
         if: steps.gate.outputs.run == 'true'
-        uses: github/codeql-action/analyze@85689a103d1234521562bbb736b2c4a31c9a85d5  # v4.37.5
+        uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d  # v4.38.3
         with:
           category: "/language:${{matrix.language}}"
           upload: never
@@ -295,8 +308,20 @@ jobs:
       # category so the merged multi-run upload below covers all
       # three configs and the meta-check sees a complete baseline
       # match.
+      #
+      # PR / merge_group ONLY: the stub exists for the meta-check
+      # race on proposed refs. GitHub treats an upload for the same
+      # (tool, category, ref) as a REPLACEMENT of the previous
+      # analysis, so a zero-result stub uploaded for refs/heads/main
+      # (e.g. a docs-only direct push, or a merge whose PR-head run
+      # the dedup didn't find) would close that category's open
+      # alerts as no-longer-detected until the next real analysis.
+      # On push, gated-out languages upload nothing instead — their
+      # existing main-branch analysis stays authoritative.
       - name: Write empty SARIF for skipped language
-        if: steps.gate.outputs.run != 'true'
+        if: >-
+          steps.gate.outputs.run != 'true' &&
+          (github.event_name == 'pull_request' || github.event_name == 'merge_group')
         env:
           LANG_NAME: ${{ matrix.language }}
         run: |
@@ -341,9 +366,15 @@ jobs:
           print(json.dumps(doc))
           PY
 
+      # Skipped when this entry produced no SARIF (gated-out language
+      # on a push — see the stub step above): if-no-files-found: error
+      # must keep guarding the paths that DO produce one.
       - name: Stash SARIF as artifact for atomic upload
-        if: needs.pre_check.outputs.should_skip != 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # was v7.0.1
+        if: >-
+          needs.pre_check.outputs.should_skip != 'true' &&
+          (steps.gate.outputs.run == 'true' ||
+           github.event_name == 'pull_request' || github.event_name == 'merge_group')
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: sarif-${{ matrix.language }}
           path: ./sarif-out/*.sarif
@@ -354,8 +385,21 @@ jobs:
   # into a single SARIF document and uploads in one POST so GitHub's
   # CodeQL meta-check sees all configs in one shot.
   upload:
-    needs: [pre_check, analyze]
-    if: needs.pre_check.outputs.should_skip != 'true'
+    needs: [pre_check, changes, analyze]
+    # Skip entirely when no matrix entry produced a SARIF: on push,
+    # gated-out languages write no stub (see the stub step), so an
+    # all-gated push (e.g. docs-only direct push) has nothing to
+    # upload — and MUST upload nothing, or main's per-category alert
+    # baselines would be replaced by empty analyses. PR / merge_group
+    # always have all three (stubs fill the gaps); force_full events
+    # analyse everything.
+    if: >-
+      needs.pre_check.outputs.should_skip != 'true' &&
+      (github.event_name == 'pull_request' || github.event_name == 'merge_group' ||
+       needs.changes.outputs.force_full == 'true' ||
+       needs.changes.outputs.codeql_python == 'true' ||
+       needs.changes.outputs.codeql_cpp == 'true' ||
+       needs.changes.outputs.codeql_actions == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -379,7 +423,7 @@ jobs:
       # enough for the intermediary to recover.
       - name: Download all SARIF artifacts
         id: dl
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           path: ./sarif-in
           pattern: sarif-*
@@ -387,7 +431,7 @@ jobs:
 
       - name: Retry artifact download on transient failure
         if: steps.dl.outcome == 'failure'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           path: ./sarif-in
           pattern: sarif-*
@@ -402,26 +446,76 @@ jobs:
           import json, glob, os, sys
           from datetime import datetime, timezone
 
+          import re
+
+          def _infer_category(artifact_path):
+              """Synthesize automationDetails.id from the artifact dir name.
+
+              Artifact dirs are ``sarif-in/sarif-<language>/...``, so the
+              language is the second path component minus the ``sarif-``
+              prefix.  Returns ``/language:<lang>/`` matching the format
+              the action would have written."""
+              m = re.match(r"sarif-in/sarif-([^/]+)/", artifact_path)
+              return f"/language:{m.group(1)}/" if m else None
+
+          # Diagnostic: list everything the download produced.
+          all_files = sorted(glob.glob("sarif-in/**/*", recursive=True))
+          print(
+              f"::notice::sarif-in contents ({len(all_files)} files): "
+              + ", ".join(all_files),
+              file=sys.stderr,
+          )
+
+          sarif_paths = sorted(glob.glob("sarif-in/sarif-*/*.sarif"))
+          if not sarif_paths:
+              sarif_paths = sorted(
+                  glob.glob("sarif-in/**/*.sarif", recursive=True),
+              )
+              if sarif_paths:
+                  print(
+                      "::notice::flat glob empty, recursive found: "
+                      + ", ".join(sarif_paths),
+                      file=sys.stderr,
+                  )
+
           runs = []
-          for path in sorted(glob.glob("sarif-in/sarif-*/*.sarif")):
+          for path in sarif_paths:
+              sz = os.path.getsize(path)
               with open(path) as f:
                   doc = json.load(f)
+              n_runs = len(doc.get("runs", []))
+              print(
+                  f"::notice::SARIF {path} ({sz} bytes, {n_runs} runs)",
+                  file=sys.stderr,
+              )
               for run in doc.get("runs", []):
-                  # Defensive: ensure every run carries automationDetails.id.
-                  # `analyze@v4` writes it from `category:`; the stub writer
-                  # above sets it explicitly. Either path satisfies the
-                  # PR-vs-base correlator.
-                  if not run.get("automationDetails", {}).get("id"):
-                      print(
-                          f"::warning::SARIF run from {path} missing "
-                          f"automationDetails.id — skipping",
-                          file=sys.stderr,
-                      )
-                      continue
+                  aid = run.get("automationDetails", {}).get("id")
+                  if not aid:
+                      aid = _infer_category(path)
+                      if aid:
+                          run.setdefault("automationDetails", {})["id"] = aid
+                          print(
+                              f"::notice::Injected automationDetails.id "
+                              f"'{aid}' into run from {path}",
+                              file=sys.stderr,
+                          )
+                      else:
+                          print(
+                              f"::warning::SARIF run from {path} missing "
+                              f"automationDetails.id and cannot infer — "
+                              f"skipping",
+                              file=sys.stderr,
+                          )
+                          continue
                   runs.append(run)
 
           if not runs:
               print("::error::No valid SARIF runs to upload", file=sys.stderr)
+              print(
+                  f"::error::Matched {len(sarif_paths)} SARIF file(s); "
+                  f"check notices above for per-file run counts",
+                  file=sys.stderr,
+              )
               sys.exit(1)
 
           out = {
@@ -449,7 +543,7 @@ jobs:
       # the multi-run file as one batch and the meta-check fires with
       # all three configs visible.
       - name: Upload combined SARIF
-        uses: github/codeql-action/upload-sarif@85689a103d1234521562bbb736b2c4a31c9a85d5  # v4.37.5
+        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d  # v4.38.3
         with:
           sarif_file: combined.sarif
           # No `category:` here — each run carries its own

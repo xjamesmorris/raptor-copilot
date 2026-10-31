@@ -40,89 +40,89 @@ finer granularity buys nothing.
 Pure-AST. We never import / require / eval the target, never look
 at any filesystem outside the source tree. String-shape only.
 
-Languages today: Python (stdlib ``ast``) + JavaScript /
-TypeScript + Go + Java (all tree-sitter-driven for non-Python;
-gracefully empty when the grammar isn't installed). The resolver
-in :mod:`core.analysis.reachability` is language-agnostic.
+Languages today: Python (stdlib ``ast``) plus thirteen
+tree-sitter-driven extractors (JS/TS, Go, Java, Rust, Ruby, C#,
+PHP, C, C++, Lua, Scala, Kotlin, Swift — each gracefully empty
+when its grammar isn't installed). The resolver in
+:mod:`core.analysis.reachability` is language-agnostic.
 """
 
 from __future__ import annotations
 
 import ast
+import hashlib
 import logging
-import threading
+from collections import defaultdict
+import sys
 import warnings
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from tree_sitter import Node
+
+from core.inventory import _ts_cache
 
 logger = logging.getLogger(__name__)
 
 
-# Tree-sitter Parser cache.  Each ``Parser(Language(ts_X.language()))``
-# holds C-side mutable state (libtree-sitter's internal parse stack) —
-# NOT thread-safe for concurrent ``.parse()`` calls.  The inventory
-# builder fans out via ThreadPoolExecutor, so a shared module-level
-# dict would hand the same Parser to multiple workers simultaneously.
-#
-# ``threading.local`` gives every thread its own dict of parsers,
-# avoiding both the cache-mutation race and the concurrent-parse
-# unsafety.  The grammar is immutable, so each thread still gets
-# exactly one Parser per language for its lifetime.
-_TS_PARSER_LOCAL = threading.local()
-
-# Cached tree-sitter grammar imports. Python does NOT cache FAILED
-# imports, so a per-file ``import tree_sitter_go`` on a grammar-less
-# install re-ran the full import machinery — plus a log emission —
-# for every file of that language. Besides the hot-loop cost, both
-# the import lock and the logging handler locks are exactly what a
-# fork-pool worker inherits FROZEN when the parent process is
-# multi-threaded (the stress sweep runs scans as threads), turning
-# any file of a grammar-less language into a deadlock site. Cache
-# hits touch neither lock, and the missing-grammar note fires once
-# per process instead of once per file.
-_GRAMMAR_CACHE: dict = {}
+# Grammar-import and Parser caching live in core.inventory._ts_cache,
+# SHARED with extractors.py (one failure-caching importer — see that
+# module for the fork-pool deadlock rationale — and one per-thread
+# Parser cache with disjoint key spaces). The thin wrappers below are
+# this module's stable call/monkeypatch seams.
 
 
 def _import_grammar(module_name: str):
     """Import a tree-sitter grammar module, caching success AND
-    failure. Returns the module or ``None`` when not installed."""
-    if module_name in _GRAMMAR_CACHE:
-        return _GRAMMAR_CACHE[module_name]
-    try:
-        import importlib
-        mod = importlib.import_module(module_name)
-    except ImportError:
-        logger.debug(
-            "call_graph: %s not installed; files of this language "
-            "get an empty call graph", module_name,
-        )
-        mod = None
-    _GRAMMAR_CACHE[module_name] = mod
-    return mod
-
+    failure (shared cache — core.inventory._ts_cache.import_grammar).
+    Returns the module or ``None`` when not installed."""
+    return _ts_cache.import_grammar(module_name)
 
 
 def _get_ts_parser(language_fn: Any) -> Any:
-    """Return a per-thread cached tree-sitter Parser for *language_fn*.
+    """Return a per-thread cached tree-sitter Parser for *language_fn*
+    (shared cache, keyed by grammar-function identity — ints, so it
+    cannot collide with extractors' language-name keys).
 
     Raises ``ImportError`` if ``tree_sitter`` itself isn't installed.
     """
-    cache: dict[int, Any] = getattr(_TS_PARSER_LOCAL, "parsers", None)  # type: ignore[assignment]
-    if cache is None:
-        cache = {}
-        _TS_PARSER_LOCAL.parsers = cache
-    key = id(language_fn)
-    cached = cache.get(key)
-    if cached is not None:
-        return cached
-    from tree_sitter import Language, Parser
-    parser = Parser(Language(language_fn()))
-    cache[key] = parser
-    return parser
+    def _make_language() -> Any:
+        from tree_sitter import Language
+        return Language(language_fn())
+
+    return _ts_cache.cached_parser(id(language_fn), _make_language)
+
+
+def _ts_tree(content: str, grammar_module: str, label: str,
+             pre_parsed: Any = None) -> Any:
+    """Return a tree-sitter Tree for *content*, or ``None``.
+
+    ``pre_parsed`` is a tree the caller already holds for this exact
+    text, parsed with the grammar ``grammar_module`` provides — the
+    inventory builder threads the tree from ``extract_items`` through
+    so each file is tree-sitter-parsed once per build instead of once
+    by the extractors and again here (the walkers only read
+    ``root_node``, so a tree from either module's Parser is
+    interchangeable). When ``pre_parsed`` is ``None`` the grammar is
+    imported and the text parsed here; ``None`` comes back when the
+    grammar isn't installed or the parse fails (callers degrade to an
+    empty :class:`FileCallGraph`).
+    """
+    if pre_parsed is not None:
+        return pre_parsed
+    mod = _import_grammar(grammar_module)
+    if mod is None:
+        return None
+    try:
+        parser = _get_ts_parser(mod.language)
+        return parser.parse(content.encode("utf-8", errors="replace"))
+    except Exception as e:                          # noqa: BLE001
+        logger.debug("call_graph: %s parse failed (%s)", label, e)
+        return None
 
 
 # Indirection-flag values. Strings (not enum) so they round-trip
@@ -142,8 +142,215 @@ INDIRECTION_DUNDER_IMPORT = "dunder_import"     # __import__("x.y")
 # treats them the same as the Python flags: any present →
 # UNCERTAIN for queries against names this file mentions.
 INDIRECTION_DYNAMIC_IMPORT = "dynamic_import"   # JS import(<var>) / require(<var>)
+
+# Cap on harvested value chains per module-scope dispatch-table dict
+# literal. Higher captures machine-generated mega-registries exactly
+# but lets one hostile file inflate every inventory record (and every
+# downstream graph's fan-out) with tens of thousands of chains; lower
+# keeps records small but silently drops real handlers from big
+# hand-written tables, losing edges a graph consumer could have
+# originated from. 64 covers every hand-written table observed in
+# real projects; a table that overflows keeps its first 64 values —
+# still an over-approximation SOURCE, never absence evidence.
+_DISPATCH_TABLE_VALUE_CAP = 64
 INDIRECTION_BRACKET_DISPATCH = "bracket_dispatch"  # JS obj[<var>](...) / Py HANDLERS[k]()
 INDIRECTION_EVAL = "eval"                        # JS eval / new Function
+
+# --- argument-fact caps ----------------------------------------------------
+# Bounds on the literal-argument facts harvested per call expression
+# (decorator calls, module-scope constructor assignments, and
+# string+ref-shaped call sites). Each cap trades fact completeness on
+# generated / hostile code against inventory size on every file.
+
+# Longest literal string recorded as an argument fact. Higher keeps
+# giant hand-written patterns (very long regex URL patterns) usable
+# by consumers; lower stops one embedded blob (a base64 constant
+# passed positionally) from inflating every record it appears in.
+# Over-cap literals are treated as NON-literal — the consumer sees an
+# argument position with no usable literal and degrades exactly as it
+# does for a computed value.
+_ARG_STRING_CAP = 1024
+
+# Positional / keyword argument positions examined per call. Higher
+# covers machine-generated mega-signatures; lower bounds per-call
+# work and record size. Real registration APIs take < 10 arguments.
+_ARG_POSITIONAL_CAP = 32
+_ARG_KEYWORD_CAP = 32
+
+# Elements recorded from a list/tuple keyword literal (e.g.
+# ``methods=["GET", "POST"]``). Higher keeps huge literal lists
+# whole; lower keeps one generated list from dominating the record.
+# The first N are kept — an over-approximation SOURCE for consumers,
+# never absence evidence.
+_ARG_LIST_CAP = 16
+
+# Module-scope constructor assignments recorded per file. Higher
+# keeps every object of a machine-generated module; lower stops a
+# hostile file from minting thousands of records. Real modules bind
+# a handful of framework objects. First N kept; later assignments to
+# an ALREADY-recorded name still overwrite (runtime order).
+_CONSTRUCTED_OBJECT_CAP = 256
+
+# String+ref call sites recorded per file. Higher keeps every
+# registration of a giant generated URL table in one file; lower
+# bounds record growth on log-heavy files (a literal message plus an
+# identifier argument matches the shape too). 2000 covers the
+# largest hand-written URL modules observed; the first N are kept —
+# an over-approximation SOURCE for consumers, never absence evidence.
+_STRING_REF_CALL_CAP = 2000
+
+
+@dataclass(slots=True)
+class CallArgumentFacts:
+    """Literal / reference argument facts for ONE call expression.
+
+    Captures only what a static consumer can act on: literal string
+    arguments (by position or keyword), literal string-list keywords,
+    and name/attribute-chain arguments (function references). A
+    position present in ``arg_count`` but absent from every fact list
+    was something else — a computed value, a non-string literal, a
+    lambda — and consumers must treat it as dynamic.
+
+      * ``arg_count`` — total positional argument count (including
+        unrecorded ones), so "position 0 has no literal" is
+        distinguishable from "there was no argument".
+      * ``string_args`` — ``(position, literal)`` for positional
+        string constants.
+      * ``ref_args`` — ``(position, chain)`` for positional
+        name/attribute chains (``views.detail`` → ``["views",
+        "detail"]``).
+      * ``call_ref_args`` — ``(position, chain)`` for positional
+        CALL arguments whose callee has a chain
+        (``views.MyView.as_view()`` → ``["views", "MyView",
+        "as_view"]``).
+      * ``kw_strings`` / ``kw_string_lists`` / ``kw_refs`` /
+        ``kw_call_refs`` — the keyword-argument counterparts
+        (``methods=["GET"]`` → ``kw_string_lists``;
+        ``view_func=handler`` → ``kw_refs``;
+        ``view_func=V.as_view()`` → ``kw_call_refs``).
+
+    All strings and containers are bounded by the ``_ARG_*`` caps
+    above.
+    """
+    arg_count: int = 0
+    string_args: list[tuple[int, str]] = field(default_factory=list)
+    ref_args: list[tuple[int, list[str]]] = field(default_factory=list)
+    call_ref_args: list[tuple[int, list[str]]] = field(default_factory=list)
+    kw_strings: dict[str, str] = field(default_factory=dict)
+    kw_string_lists: dict[str, list[str]] = field(default_factory=dict)
+    kw_refs: dict[str, list[str]] = field(default_factory=dict)
+    kw_call_refs: dict[str, list[str]] = field(default_factory=dict)
+
+    def has_ref(self) -> bool:
+        """True when any argument is function-reference shaped."""
+        return bool(self.ref_args or self.call_ref_args
+                    or self.kw_refs or self.kw_call_refs)
+
+    def to_dict(self) -> dict:
+        """Serialise, omitting empty fact lists (most calls have a
+        couple of facts at most; empty keys would dominate)."""
+        out: dict = {"arg_count": self.arg_count}
+        if self.string_args:
+            out["string_args"] = [[p, s] for p, s in self.string_args]
+        if self.ref_args:
+            out["ref_args"] = [[p, list(ch)] for p, ch in self.ref_args]
+        if self.call_ref_args:
+            out["call_ref_args"] = [
+                [p, list(ch)] for p, ch in self.call_ref_args
+            ]
+        if self.kw_strings:
+            out["kw_strings"] = dict(self.kw_strings)
+        if self.kw_string_lists:
+            out["kw_string_lists"] = {
+                k: list(v) for k, v in self.kw_string_lists.items()
+            }
+        if self.kw_refs:
+            out["kw_refs"] = {k: list(v) for k, v in self.kw_refs.items()}
+        if self.kw_call_refs:
+            out["kw_call_refs"] = {
+                k: list(v) for k, v in self.kw_call_refs.items()
+            }
+        return out
+
+    @classmethod
+    def from_dict(cls, d: dict) -> CallArgumentFacts:
+        def _pos_pairs(value: object) -> list[tuple[int, str]]:
+            return [
+                (int(e[0] or 0), str(e[1]))
+                for e in (value if isinstance(value, list) else [])
+                if isinstance(e, (list, tuple)) and len(e) >= 2
+            ]
+
+        def _pos_chains(value: object) -> list[tuple[int, list[str]]]:
+            return [
+                (int(e[0] or 0), [str(p) for p in e[1]])
+                for e in (value if isinstance(value, list) else [])
+                if isinstance(e, (list, tuple)) and len(e) >= 2
+                and isinstance(e[1], (list, tuple))
+            ]
+
+        def _str_map(value: object) -> dict[str, str]:
+            if not isinstance(value, dict):
+                return {}
+            return {str(k): str(v) for k, v in value.items()}
+
+        def _chain_map(value: object) -> dict[str, list[str]]:
+            if not isinstance(value, dict):
+                return {}
+            return {
+                str(k): [str(p) for p in v]
+                for k, v in value.items()
+                if isinstance(v, (list, tuple))
+            }
+
+        return cls(
+            arg_count=int(d.get("arg_count") or 0),
+            string_args=_pos_pairs(d.get("string_args")),
+            ref_args=_pos_chains(d.get("ref_args")),
+            call_ref_args=_pos_chains(d.get("call_ref_args")),
+            kw_strings=_str_map(d.get("kw_strings")),
+            kw_string_lists=_chain_map(d.get("kw_string_lists")),
+            kw_refs=_chain_map(d.get("kw_refs")),
+            kw_call_refs=_chain_map(d.get("kw_call_refs")),
+        )
+
+
+@dataclass(slots=True)
+class StringRefCall:
+    """One call site whose first positional argument is a literal
+    string AND that passes at least one function-reference-shaped
+    argument — the structural fingerprint of name→handler
+    registration APIs (URL confs, ``add_url_rule``-style route
+    registration, CLI subcommand tables). Framework-agnostic: the
+    extractor records the SHAPE; classifying a site as an actual
+    registration is the consumer's join against the file's imports.
+
+    ``chain`` is the callee chain (``path(...)`` → ``["path"]``;
+    ``app.add_url_rule(...)`` → ``["app", "add_url_rule"]``).
+    """
+    line: int
+    chain: list[str]
+    caller: str | None = None
+    args: CallArgumentFacts = field(default_factory=CallArgumentFacts)
+
+
+@dataclass(slots=True)
+class ConstructedObject:
+    """One module-scope ``NAME = Chain(...)`` constructor assignment.
+
+    Records which callable a module-level name was bound to
+    (``app = Flask(__name__)`` → chain ``["Flask"]``) plus the
+    constructor call's literal-argument facts (``APIRouter(
+    prefix="/v1")`` keeps the prefix). Consumers join the chain
+    against the file's import map to type the object — the
+    receiver-binding step instance-bound decorator registrars need
+    (``@app.route`` resolves only if ``app``'s construction is
+    known). Module scope matches ``dispatch_tables``: the binding
+    exists at import time.
+    """
+    chain: list[str]
+    line: int
+    args: CallArgumentFacts = field(default_factory=CallArgumentFacts)
 
 
 @dataclass(slots=True)
@@ -215,14 +422,24 @@ class DecoratedFunction:
     ``decorators`` is a list of attribute chains, one per
     ``@decorator`` line. ``@functools.cache`` →
     ``[["functools", "cache"]]``. ``@app.route("/x")`` →
-    ``[["app", "route"]]`` (the call arguments aren't stored;
-    only the chain that names the decorator). Decorators that
-    aren't a plain name/attribute chain (e.g. ``@make_deco()``)
-    are NOT recorded — we have no qualified name to match.
+    ``[["app", "route"]]``. Decorators whose NAME isn't a plain
+    name/attribute chain (e.g. ``@make_deco()(...)`` — the
+    decorator is a call result) are NOT recorded — we have no
+    qualified name to match.
+
+    ``decorator_args`` is index-aligned with ``decorators``: the
+    :class:`CallArgumentFacts` of a decorator that is a CALL
+    (``@app.route("/x", methods=["GET"])``), or ``None`` for a
+    bare decorator (``@staticmethod``). The distinction matters
+    to registration consumers: a bare framework decorator and a
+    zero-argument call are different registration shapes.
     """
     name: str
     line: int
     decorators: list[list[str]] = field(default_factory=list)
+    decorator_args: list[CallArgumentFacts | None] = field(
+        default_factory=list,
+    )
 
 
 @dataclass(slots=True)
@@ -251,6 +468,144 @@ class ClassDef:
     nested: bool = False
 
 
+@dataclass(slots=True)
+class IncludeEdge:
+    """One structured include/require edge (PHP walker only today).
+
+    ``shape`` is the census classification from
+    :func:`core.inventory.script_handler.classify_include_argument` —
+    a syntactic class, never a resolution verdict (constant prefixes
+    resolve per entry, not per statement). ``target`` is populated
+    only for pure-literal edges anchorable relative to the including
+    file (builder-side; the walker itself has no file path).
+    ``conditional`` is True when ANY enclosing construct at any depth
+    is a branch/loop/try/ternary or the right operand of a logical
+    operator — conservative in the guarantee direction by
+    construction. ``span_hash`` is SHA-256[:12] of the include
+    expression's source text (staleness key).
+    """
+
+    line: int
+    keyword: str
+    raw: str
+    shape: str
+    const_name: str | None = None
+    literal_tail: str | None = None
+    literal_stem: str | None = None
+    target: str | None = None
+    candidates: list[str] = field(default_factory=list)
+    conditional: bool = False
+    position: str = "file_scope"
+    enclosing_function: str | None = None
+    span_hash: str = ""
+
+    def to_dict(self) -> dict:
+        out: dict = {
+            "line": self.line,
+            "keyword": self.keyword,
+            "raw": self.raw,
+            "shape": self.shape,
+            "conditional": self.conditional,
+            "position": self.position,
+            "span_hash": self.span_hash,
+        }
+        # Optional fields omitted when unset — most edges carry only
+        # a subset, and the checklist is size-sensitive.
+        if self.const_name is not None:
+            out["const_name"] = self.const_name
+        if self.literal_tail is not None:
+            out["literal_tail"] = self.literal_tail
+        if self.literal_stem is not None:
+            out["literal_stem"] = self.literal_stem
+        if self.target is not None:
+            out["target"] = self.target
+        if self.candidates:
+            out["candidates"] = list(self.candidates)
+        if self.enclosing_function is not None:
+            out["enclosing_function"] = self.enclosing_function
+        return out
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "IncludeEdge":
+        """Checklist JSON is a run-dir artifact (attacker-writable
+        shapes) — coerce types, never trust them."""
+
+        def _s(v: object) -> str | None:
+            return v if isinstance(v, str) else None
+
+        return cls(
+            line=int(d.get("line") or 0)
+            if isinstance(d.get("line"), int) else 0,
+            keyword=_s(d.get("keyword")) or "include",
+            raw=_s(d.get("raw")) or "",
+            shape=_s(d.get("shape")) or "dynamic",
+            const_name=_s(d.get("const_name")),
+            literal_tail=_s(d.get("literal_tail")),
+            literal_stem=_s(d.get("literal_stem")),
+            target=_s(d.get("target")),
+            candidates=[c for c in (d.get("candidates") or [])
+                        if isinstance(c, str)],
+            conditional=bool(d.get("conditional", False)),
+            position=_s(d.get("position")) or "file_scope",
+            enclosing_function=_s(d.get("enclosing_function")),
+            span_hash=_s(d.get("span_hash")) or "",
+        )
+
+
+@dataclass(slots=True)
+class IncludeDefine:
+    """One literal-named ``define('NAME', …)`` statement (PHP).
+
+    The phase-1b per-entry environment walk consumes these in
+    document order: unconditional file-scope defines seed/extend the
+    entry's constant environment; ``fallback`` marks the
+    ``if (!defined('NAME')) define('NAME', …)`` shape (a no-op under
+    a carried binding, a binding supplier standalone). Records are
+    captured completely at Layer 0 so the walk needs no re-parse.
+    ``value`` is set only when the second argument is a single string
+    literal — the only value class the walk propagates; anything else
+    keeps ``value=None`` with the capped ``raw_value`` for honesty.
+    """
+
+    line: int
+    name: str
+    value: str | None = None
+    raw_value: str | None = None
+    conditional: bool = False
+    fallback: bool = False
+    position: str = "file_scope"
+
+    def to_dict(self) -> dict:
+        out: dict = {
+            "line": self.line,
+            "name": self.name,
+            "conditional": self.conditional,
+            "fallback": self.fallback,
+            "position": self.position,
+        }
+        if self.value is not None:
+            out["value"] = self.value
+        if self.raw_value is not None:
+            out["raw_value"] = self.raw_value
+        return out
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "IncludeDefine":
+        def _s(v: object) -> str | None:
+            return v if isinstance(v, str) else None
+
+        return cls(
+            line=int(d.get("line") or 0)
+            if isinstance(d.get("line"), int) else 0,
+            name=_s(d.get("name")) or "",
+            value=_s(d.get("value")),
+            raw_value=_s(d.get("raw_value")),
+            conditional=bool(d.get("conditional", False)),
+            fallback=bool(d.get("fallback", False)),
+            position=_s(d.get("position")) or "file_scope",
+        )
+
+
 @dataclass
 class FileCallGraph:
     """All call-graph data for one Python file.
@@ -261,6 +616,31 @@ class FileCallGraph:
     string dispatch" — a file that contains
     ``getattr(requests, 'get')`` is a confounder for queries about
     ``requests.get`` even if no static call chain has tail ``get``.
+
+    ``dispatch_tables`` / ``subscript_calls`` / ``getattr_calls``
+    (Python only today; other extractors leave them empty) carry the
+    per-site facts behind the file-scoped indirection flags, so a
+    graph assembler can turn the two common literal dynamic-dispatch
+    idioms into explicit lower-confidence edges instead of a blanket
+    "this file is uncertain" verdict:
+
+      * ``dispatch_tables`` — module-scope ``NAME = {...}`` dict
+        literals whose values are name / attribute chains
+        (``HANDLERS = {"a": handle_a}`` → ``{"HANDLERS":
+        [["handle_a"]]}``). Keys are not recorded — consumers
+        over-approximate a ``NAME[k]()`` call as reaching every
+        value, which is the sound direction for edge origination.
+      * ``subscript_calls`` — call sites whose callee is a
+        subscript with a name-chain root (``HANDLERS[k](...)`` →
+        chain ``["HANDLERS"]``). These have no callee name so they
+        are NOT in ``calls``; recording the root name lets a
+        consumer join against ``dispatch_tables``.
+      * ``getattr_calls`` — one ``(line, caller, attr_or_None)``
+        triple per ``getattr(obj, ...)`` site. ``attr`` is the
+        literal second argument when constant, ``None`` when
+        opaque. Unlike the file-scoped ``getattr_targets`` set,
+        each triple keeps the enclosing caller so an edge can be
+        attributed to the function that dispatches.
     """
     imports: dict[str, str] = field(default_factory=dict)
     calls: list[CallSite] = field(default_factory=list)
@@ -291,6 +671,55 @@ class FileCallGraph:
     relative_imports: list[tuple[int, str, str, str | None]] = field(
         default_factory=list,
     )
+    # Literal dynamic-dispatch facts — see the class docstring.
+    # ``dispatch_tables``: table name → list of value chains.
+    # ``subscript_calls``: CallSite records whose ``chain`` is the
+    # SUBSCRIPT ROOT (the table being indexed), not a callee name.
+    # ``getattr_calls``: (line, caller_or_None, attr_or_None) triples.
+    dispatch_tables: dict[str, list[list[str]]] = field(default_factory=dict)
+    subscript_calls: list[CallSite] = field(default_factory=list)
+    getattr_calls: list[tuple[int, str | None, str | None]] = field(
+        default_factory=list,
+    )
+    # Registration-shape facts (Python only today; other extractors
+    # leave them empty). ``constructed_objects`` binds module-level
+    # names to their constructor chains so consumers can type
+    # instance receivers (``@app.route`` needs ``app``'s
+    # construction); ``string_ref_calls`` records the
+    # literal-string-plus-function-reference call shape that
+    # name→handler registration APIs share. Both serialise only
+    # when non-empty.
+    constructed_objects: dict[str, ConstructedObject] = field(
+        default_factory=dict,
+    )
+    string_ref_calls: list[StringRefCall] = field(default_factory=list)
+    # Structured include edges + define records (PHP walker only
+    # today; the file-scoped INDIRECTION_DYNAMIC_IMPORT flag stays
+    # for compatibility). ``includes_extracted`` marks that the
+    # walker's include layer RAN — it gates serialization (so the
+    # keys are present, even empty, exactly when extraction
+    # happened) and lets the builder's SHA-reuse path distinguish
+    # "no includes in this file" from "record predates the edge
+    # layer / parse failed" for exact backfill.
+    includes: list[IncludeEdge] = field(default_factory=list)
+    defines: list[IncludeDefine] = field(default_factory=list)
+    includes_extracted: bool = False
+    includes_truncated: bool = False
+    # Phase-1b walk inputs. ``parse_errors`` marks an ERROR-bearing
+    # parse tree (recovery can re-parent statements, so this file's
+    # conditional flags are never guarantee-grade). ``boundaries``
+    # lists the file-scope straight-line boundary statements
+    # (return/exit/die/goto/__halt_compiler) in document order,
+    # capped with an ``overflow`` sentinel entry.
+    parse_errors: bool = False
+    boundaries: list[dict] = field(default_factory=list)
+    # First file-scope direct-access guard, when present:
+    # ``{"line": N, "constant": "IN_APP"}`` for
+    # ``if (!defined('IN_APP')) die(...)`` /
+    # ``defined('IN_APP') or exit`` shapes. Role evidence for the
+    # include graph ("dual" is a query over includer-index +
+    # this field, never a stored label).
+    direct_access_guard: dict | None = None
 
     def to_dict(self) -> dict:
         # Default-None fields (``caller``, ``receiver_class``) are
@@ -356,7 +785,15 @@ class FileCallGraph:
             ],
             "decorated_functions": [
                 {"name": d.name, "line": d.line,
-                 "decorators": [list(ch) for ch in d.decorators]}
+                 "decorators": [list(ch) for ch in d.decorators],
+                 # ``decorator_args`` omitted when no decorator was a
+                 # call — the majority (``@staticmethod``-style), and
+                 # an all-None list carries no information.
+                 **({"decorator_args": [
+                     a.to_dict() if a is not None else None
+                     for a in d.decorator_args
+                 ]} if any(a is not None for a in d.decorator_args)
+                    else {})}
                 for d in self.decorated_functions
             ],
             "relative_imports": [list(ri) for ri in self.relative_imports],
@@ -366,6 +803,54 @@ class FileCallGraph:
         # mixed-language repo's files.
         if self.package_name is not None:
             out["package_name"] = self.package_name
+        # The literal dynamic-dispatch facts are omitted when empty
+        # (the common case for every file that doesn't use the
+        # idiom) — same size rationale as ``argument_identifiers``.
+        if self.dispatch_tables:
+            out["dispatch_tables"] = {
+                name: [list(ch) for ch in chains]
+                for name, chains in self.dispatch_tables.items()
+            }
+        if self.subscript_calls:
+            out["subscript_calls"] = [
+                {"line": c.line, "chain": list(c.chain),
+                 **({"caller": c.caller} if c.caller is not None else {})}
+                for c in self.subscript_calls
+            ]
+        if self.getattr_calls:
+            out["getattr_calls"] = [list(t) for t in self.getattr_calls]
+        if self.constructed_objects:
+            constructed: dict = {}
+            for name, co in self.constructed_objects.items():
+                co_entry: dict = {"chain": list(co.chain), "line": co.line}
+                args = co.args.to_dict()
+                # A zero-argument constructor's facts are all-empty —
+                # omitting them round-trips to the default instance.
+                if args != {"arg_count": 0}:
+                    co_entry["args"] = args
+                constructed[name] = co_entry
+            out["constructed_objects"] = constructed
+        if self.string_ref_calls:
+            out["string_ref_calls"] = [
+                {"line": c.line, "chain": list(c.chain),
+                 **({"caller": c.caller} if c.caller is not None else {}),
+                 "args": c.args.to_dict()}
+                for c in self.string_ref_calls
+            ]
+        # Include layer: keys present exactly when extraction ran
+        # (even if empty), so downstream can tell "no includes" from
+        # "pre-edge-layer record" and backfill only the latter.
+        if self.includes_extracted:
+            out["includes"] = [e.to_dict() for e in self.includes]
+            out["defines"] = [d.to_dict() for d in self.defines]
+            if self.includes_truncated:
+                out["includes_truncated"] = True
+            if self.direct_access_guard is not None:
+                out["direct_access_guard"] = dict(self.direct_access_guard)
+            if self.parse_errors:
+                out["parse_errors"] = True
+            if self.boundaries:
+                out["boundaries"] = [dict(b) for b in self.boundaries]
         return out
 
     @classmethod
@@ -405,14 +890,7 @@ class FileCallGraph:
                 for k in (d.get("classes") or [])
             ],
             decorated_functions=[
-                DecoratedFunction(
-                    name=str(df.get("name", "")),
-                    line=int(df.get("line") or 0),
-                    decorators=[
-                        list(ch) for ch in (df.get("decorators") or [])
-                        if isinstance(ch, (list, tuple))
-                    ],
-                )
+                _decorated_function_from_dict(df)
                 for df in (d.get("decorated_functions") or [])
             ],
             package_name=d.get("package_name"),
@@ -421,7 +899,109 @@ class FileCallGraph:
                  r[3] if len(r) > 3 else None)
                 for r in rel if isinstance(r, (list, tuple)) and len(r) >= 3
             ],
+            # Inventories written before these facts existed simply
+            # lack the keys — default to empty (consumers degrade to
+            # the file-scoped indirection flags, exactly the pre-fact
+            # behaviour).
+            dispatch_tables={
+                str(name): [
+                    [str(p) for p in ch]
+                    for ch in chains if isinstance(ch, (list, tuple))
+                ]
+                for name, chains in (d.get("dispatch_tables") or {}).items()
+                if isinstance(chains, (list, tuple))
+            },
+            subscript_calls=[
+                CallSite(
+                    line=int(c.get("line") or 0),
+                    chain=list(c.get("chain") or []),
+                    caller=c.get("caller"),
+                )
+                for c in (d.get("subscript_calls") or [])
+                if isinstance(c, dict)
+            ],
+            getattr_calls=[
+                (int(t[0] or 0),
+                 str(t[1]) if t[1] is not None else None,
+                 str(t[2]) if t[2] is not None else None)
+                for t in (d.get("getattr_calls") or [])
+                if isinstance(t, (list, tuple)) and len(t) >= 3
+            ],
+            constructed_objects={
+                str(name): ConstructedObject(
+                    chain=[str(p) for p in (co.get("chain") or [])],
+                    line=int(co.get("line") or 0),
+                    args=_argument_facts_from(co.get("args")),
+                )
+                for name, co in (d.get("constructed_objects") or {}).items()
+                if isinstance(co, dict)
+            },
+            string_ref_calls=[
+                StringRefCall(
+                    line=int(c.get("line") or 0),
+                    chain=list(c.get("chain") or []),
+                    caller=c.get("caller"),
+                    args=_argument_facts_from(c.get("args")),
+                )
+                for c in (d.get("string_ref_calls") or [])
+                if isinstance(c, dict)
+            ],
+            includes=[
+                IncludeEdge.from_dict(e)
+                for e in (d.get("includes") or [])
+                if isinstance(e, dict)
+            ],
+            defines=[
+                IncludeDefine.from_dict(x)
+                for x in (d.get("defines") or [])
+                if isinstance(x, dict)
+            ],
+            includes_extracted="includes" in d,
+            includes_truncated=bool(d.get("includes_truncated", False)),
+            direct_access_guard=(
+                dict(d["direct_access_guard"])
+                if isinstance(d.get("direct_access_guard"), dict) else None
+            ),
+            parse_errors=bool(d.get("parse_errors", False)),
+            boundaries=[
+                dict(b) for b in (d.get("boundaries") or [])
+                if isinstance(b, dict)
+            ],
         )
+
+
+def _argument_facts_from(raw: object) -> CallArgumentFacts:
+    """Argument facts from a serialised value of unknown shape —
+    non-dicts degrade to the empty default."""
+    if isinstance(raw, dict):
+        return CallArgumentFacts.from_dict(raw)
+    return CallArgumentFacts()
+
+
+def _decorated_function_from_dict(df: dict) -> DecoratedFunction:
+    """Rebuild one decorated-function record, index-aligning
+    ``decorator_args`` with the kept ``decorators`` (a malformed
+    chain entry drops BOTH its chain and its args so the alignment
+    contract survives hand-corrupted artifacts). Inventories written
+    before ``decorator_args`` existed default every entry to None."""
+    raw_chains = df.get("decorators") or []
+    raw_args = df.get("decorator_args")
+    if not isinstance(raw_args, list) or len(raw_args) != len(raw_chains):
+        raw_args = [None] * len(raw_chains)
+    chains: list[list[str]] = []
+    args: list[CallArgumentFacts | None] = []
+    for ch, a in zip(raw_chains, raw_args):
+        if not isinstance(ch, (list, tuple)):
+            continue
+        chains.append(list(ch))
+        args.append(CallArgumentFacts.from_dict(a)
+                    if isinstance(a, dict) else None)
+    return DecoratedFunction(
+        name=str(df.get("name", "")),
+        line=int(df.get("line") or 0),
+        decorators=chains,
+        decorator_args=args,
+    )
 
 
 def _drive_visit(visitor, root) -> None:
@@ -566,6 +1146,7 @@ class _PythonCallGraph(ast.NodeVisitor):
         # ``_enclosing``, otherwise ``@app.route(...)`` looks like
         # a call from inside the decorated function — wrong scope.
         decorator_chains: list[list[str]] = []
+        decorator_args: list[CallArgumentFacts | None] = []
         for deco in getattr(node, "decorator_list", []) or []:
             # ``@foo`` → name node
             # ``@foo.bar`` → attribute chain
@@ -574,6 +1155,12 @@ class _PythonCallGraph(ast.NodeVisitor):
             chain = _decorator_chain(deco)
             if chain is not None:
                 decorator_chains.append(chain)
+                # Literal-argument facts, index-aligned with the
+                # chain list; None marks a bare (non-call) decorator.
+                decorator_args.append(
+                    _call_argument_facts(deco)
+                    if isinstance(deco, ast.Call) else None,
+                )
             # Walk the decorator expression in the OUTER scope so
             # any nested calls inside the decorator (e.g.
             # ``@app.route(rule_for("x"))``) attribute to the
@@ -588,6 +1175,7 @@ class _PythonCallGraph(ast.NodeVisitor):
                     name=node.name,
                     line=getattr(node, "lineno", 0),
                     decorators=decorator_chains,
+                    decorator_args=decorator_args,
                 ),
             )
         # Now push the function name and walk the body. Skip the
@@ -641,6 +1229,81 @@ class _PythonCallGraph(ast.NodeVisitor):
             self._class_stack.pop()
 
     # ------------------------------------------------------------------
+    # Dispatch tables
+    # ------------------------------------------------------------------
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        # Module-scope ``NAME = {key: fn, ...}`` dict literals whose
+        # values are name / attribute chains — the dict-of-functions
+        # dispatch idiom behind ``NAME[k](...)`` calls. Module scope
+        # means "not inside any def / class body": the two scope
+        # stacks track exactly that, so a table defined under a
+        # module-level ``if`` / ``try`` still qualifies (it binds the
+        # module namespace at import, same as a bare assignment).
+        # Single-Name targets only — tuple unpacking / attribute
+        # targets carry too much ambiguity for a useful join key.
+        # Values that aren't chains (literals, lambdas, calls) are
+        # skipped individually; keys are not recorded (consumers
+        # over-approximate to every value). A later assignment to the
+        # same name overwrites the earlier harvest — runtime order.
+        if (not self._enclosing and not self._class_stack
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Dict)):
+            chains: list[list[str]] = []
+            for value in node.value.values:
+                if len(chains) >= _DISPATCH_TABLE_VALUE_CAP:
+                    break
+                chain = _attribute_chain(value)
+                if chain is not None:
+                    chains.append(chain)
+            if chains:
+                self.graph.dispatch_tables[node.targets[0].id] = chains
+        # Module-scope ``NAME = Chain(...)`` constructor assignments —
+        # the object-binding fact behind instance-receiver joins
+        # (``app = Flask(__name__)`` types every later ``app.<m>``).
+        # Same scoping rule as dispatch tables; single-Name targets
+        # only.
+        if (not self._enclosing and not self._class_stack
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)):
+            self._record_constructed(node.targets[0].id, node.value)
+        self.generic_visit(node)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        # Annotated form of the constructor assignment
+        # (``app: Flask = Flask(__name__)``) — common in typed
+        # codebases, same binding semantics as the bare form.
+        # Dispatch-table harvesting stays Assign-only (an annotated
+        # dict-of-functions table is rare enough not to warrant the
+        # extra shape).
+        if (not self._enclosing and not self._class_stack
+                and isinstance(node.target, ast.Name)
+                and node.value is not None):
+            self._record_constructed(node.target.id, node.value)
+        self.generic_visit(node)
+
+    def _record_constructed(self, name: str, value: ast.AST) -> None:
+        """Record one module-scope constructor assignment when the
+        value is a call on a name/attribute chain. A later
+        assignment to the same name overwrites (runtime order); new
+        names past the cap are dropped — see _CONSTRUCTED_OBJECT_CAP.
+        """
+        if not isinstance(value, ast.Call):
+            return
+        chain = _attribute_chain(value.func)
+        if chain is None:
+            return
+        table = self.graph.constructed_objects
+        if name not in table and len(table) >= _CONSTRUCTED_OBJECT_CAP:
+            return
+        table[name] = ConstructedObject(
+            chain=chain,
+            line=getattr(value, "lineno", 0),
+            args=_call_argument_facts(value),
+        )
+
+    # ------------------------------------------------------------------
     # Calls + indirection
     # ------------------------------------------------------------------
 
@@ -656,6 +1319,19 @@ class _PythonCallGraph(ast.NodeVisitor):
             # callable-name signal and stay invisible.
             if isinstance(node.func, ast.Subscript):
                 self.graph.indirection.add(INDIRECTION_BRACKET_DISPATCH)
+                # Record the subscript ROOT when it has a static name
+                # (``HANDLERS[k](...)`` → ``["HANDLERS"]``) so a graph
+                # assembler can join it against ``dispatch_tables``.
+                # A rootless subscript (``f()[0](...)``) has nothing
+                # to join on — the file-level flag is all we keep.
+                root_chain = _attribute_chain(node.func.value)
+                if root_chain is not None:
+                    self.graph.subscript_calls.append(CallSite(
+                        line=getattr(node, "lineno", 0),
+                        chain=root_chain,
+                        caller=(self._enclosing[-1]
+                                if self._enclosing else None),
+                    ))
             self.generic_visit(node)
             return
 
@@ -674,12 +1350,22 @@ class _PythonCallGraph(ast.NodeVisitor):
         # ``builtins.getattr(obj, …)`` are also seen.
         if _is_builtin_call(chain, "getattr", self.graph.imports) and len(node.args) >= 2:
             second = node.args[1]
+            attr_literal: str | None = None
             if (isinstance(second, ast.Constant)
                     and isinstance(second.value, str)):
                 self.graph.indirection.add(INDIRECTION_GETATTR)
                 self.graph.getattr_targets.add(second.value)
+                attr_literal = second.value
             else:
                 self.graph.indirection.add(INDIRECTION_GETATTR_OPAQUE)
+            # Per-site record keeps the enclosing caller so a graph
+            # assembler can attribute a heuristic edge to the
+            # dispatching function (the file-scoped sets above can't).
+            self.graph.getattr_calls.append((
+                getattr(node, "lineno", 0),
+                self._enclosing[-1] if self._enclosing else None,
+                attr_literal,
+            ))
 
         # Indirection: importlib.import_module("x.y")
         if chain == ["importlib", "import_module"]:
@@ -711,6 +1397,26 @@ class _PythonCallGraph(ast.NodeVisitor):
             caller=caller,
             receiver_class=receiver_class,
         ))
+        # Registration-shape fact: first positional argument is a
+        # literal string AND some argument is function-reference
+        # shaped — ``path("users/", views.detail)``,
+        # ``app.add_url_rule("/x", view_func=h)``. The extractor
+        # records the SHAPE only; whether a site is a real
+        # registration is the consumer's import join. Per-file
+        # capped — see _STRING_REF_CALL_CAP.
+        if (node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+                and len(self.graph.string_ref_calls)
+                < _STRING_REF_CALL_CAP):
+            arg_facts = _call_argument_facts(node)
+            if arg_facts.has_ref():
+                self.graph.string_ref_calls.append(StringRefCall(
+                    line=getattr(node, "lineno", 0),
+                    chain=chain,
+                    caller=caller,
+                    args=arg_facts,
+                ))
         self.generic_visit(node)
 
 
@@ -739,6 +1445,64 @@ def _is_builtin_call(
         if qualified == f"builtins.{builtin_name}":
             return True
     return chain == ["builtins", builtin_name]
+
+
+def _call_argument_facts(node: ast.Call) -> CallArgumentFacts:
+    """Harvest the literal / reference argument facts of one call.
+
+    Anything that is neither a bounded literal string, a literal
+    string list, a name/attribute chain, nor a call-on-a-chain is
+    deliberately NOT recorded — its position stays visible through
+    ``arg_count`` (positional) or simply absent (keyword), and
+    consumers treat it as dynamic. Over-cap literals degrade the
+    same way (see _ARG_STRING_CAP).
+    """
+    facts = CallArgumentFacts(arg_count=len(node.args))
+    for pos, arg in enumerate(node.args[:_ARG_POSITIONAL_CAP]):
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            if len(arg.value) <= _ARG_STRING_CAP:
+                facts.string_args.append((pos, arg.value))
+            continue
+        chain = _attribute_chain(arg)
+        if chain is not None:
+            facts.ref_args.append((pos, chain))
+            continue
+        if isinstance(arg, ast.Call):
+            call_chain = _attribute_chain(arg.func)
+            if call_chain is not None:
+                facts.call_ref_args.append((pos, call_chain))
+    for kw in node.keywords[:_ARG_KEYWORD_CAP]:
+        if kw.arg is None:
+            # ``**kwargs`` splat — nothing static to record.
+            continue
+        value = kw.value
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            if len(value.value) <= _ARG_STRING_CAP:
+                facts.kw_strings[kw.arg] = value.value
+            continue
+        if isinstance(value, (ast.List, ast.Tuple)):
+            elements = value.elts[:_ARG_LIST_CAP]
+            literals = [
+                e.value for e in elements
+                if isinstance(e, ast.Constant) and isinstance(e.value, str)
+                and len(e.value) <= _ARG_STRING_CAP
+            ]
+            # Record only when every examined element is a literal —
+            # a mixed list is not a usable literal fact (recording
+            # the literal half would misstate e.g. an HTTP-method
+            # list). First _ARG_LIST_CAP elements examined.
+            if literals and len(literals) == len(elements):
+                facts.kw_string_lists[kw.arg] = literals
+            continue
+        chain = _attribute_chain(value)
+        if chain is not None:
+            facts.kw_refs[kw.arg] = chain
+            continue
+        if isinstance(value, ast.Call):
+            call_chain = _attribute_chain(value.func)
+            if call_chain is not None:
+                facts.kw_call_refs[kw.arg] = call_chain
+    return facts
 
 
 def _decorator_chain(deco: ast.AST) -> list[str] | None:
@@ -780,7 +1544,8 @@ def _attribute_chain(node: ast.AST) -> list[str] | None:
 
 
 def extract_call_graph_javascript(
-    content: str, language: str = "javascript",
+    content: str, language: str = "javascript", *,
+    _tree: Any = None,
 ) -> FileCallGraph:
     """Walk a JavaScript / TypeScript / TSX source string via
     tree-sitter and return its :class:`FileCallGraph`.
@@ -807,24 +1572,28 @@ def extract_call_graph_javascript(
     matching the Python ``from foo import y`` convention so the
     resolver's chain semantics work unchanged.
     """
-    if language in ("typescript", "tsx"):
-        ts_ts = _import_grammar("tree_sitter_typescript")
-        if ts_ts is None:
-            return FileCallGraph()
-        language_fn = (ts_ts.language_typescript
-                       if language == "typescript" else ts_ts.language_tsx)
-    else:
-        ts_js = _import_grammar("tree_sitter_javascript")
-        if ts_js is None:
-            return FileCallGraph()
-        language_fn = ts_js.language
+    tree = _tree
+    if tree is None:
+        # Grammar resolution varies by dialect, so this can't route
+        # through _ts_tree's module.language convention.
+        if language in ("typescript", "tsx"):
+            ts_ts = _import_grammar("tree_sitter_typescript")
+            if ts_ts is None:
+                return FileCallGraph()
+            language_fn = (ts_ts.language_typescript
+                           if language == "typescript" else ts_ts.language_tsx)
+        else:
+            ts_js = _import_grammar("tree_sitter_javascript")
+            if ts_js is None:
+                return FileCallGraph()
+            language_fn = ts_js.language
 
-    try:
-        parser = _get_ts_parser(language_fn)
-        tree = parser.parse(content.encode("utf-8", errors="replace"))
-    except Exception as e:                          # noqa: BLE001
-        logger.debug("call_graph: %s parse failed (%s)", language, e)
-        return FileCallGraph()
+        try:
+            parser = _get_ts_parser(language_fn)
+            tree = parser.parse(content.encode("utf-8", errors="replace"))
+        except Exception as e:                          # noqa: BLE001
+            logger.debug("call_graph: %s parse failed (%s)", language, e)
+            return FileCallGraph()
 
     walker = _JsCallGraph()
     walker.walk(tree.root_node)
@@ -1120,7 +1889,7 @@ class _JsCallGraph:
         body = None
         for c in cls_node.children:
             if c.type == self._CLASS_HERITAGE:
-                bases.extend(hc.text.decode() for hc in c.children if hc.type == self._IDENT_NODE)
+                bases.extend(hc.text.decode() for hc in c.children if hc.type == self._IDENT_NODE)  # type: ignore[union-attr]
             elif c.type == self._CLASS_BODY:
                 body = c
         methods: list[tuple[str, int]] = []
@@ -1601,12 +2370,29 @@ def _go_bare_binding_names(path: str) -> list[str]:
                 names.append(pre_v_last)
                 names.extend(_hyphen_aliases(pre_v_last))
 
+    # gopkg.in-style DOT-VERSIONED segment: ``gopkg.in/yaml.v2``
+    # declares package ``yaml`` — the convention for EVERY gopkg.in
+    # path (``gopkg.in/<pkg>.vN`` and ``gopkg.in/<user>/<pkg>.vN``),
+    # and the ``<name>.vN`` spelling wherever else it appears. The
+    # literal last segment (``yaml.v2``) is not a valid Go
+    # identifier, so bare-last-segment binding missed every call
+    # into such a package. The pre-dot part composes with the
+    # hyphen conventions (``go-git.v4`` → ``go-git`` → ``git`` /
+    # ``gogit``).
+    dot_base, dot, dot_ver = last.rpartition(".")
+    if (dot and dot_base and dot_ver.startswith("v")
+            and len(dot_ver) > 1 and dot_ver[1:].isdigit()):
+        names.append(dot_base)
+        names.extend(_hyphen_aliases(dot_base))
+
     names.extend(_hyphen_aliases(last))
 
     return names
 
 
-def extract_call_graph_go(content: str) -> FileCallGraph:
+def extract_call_graph_go(
+    content: str, *, _tree: Any = None,
+) -> FileCallGraph:
     """Walk a Go source string via tree-sitter and return its
     :class:`FileCallGraph`.
 
@@ -1633,15 +2419,8 @@ def extract_call_graph_go(content: str) -> FileCallGraph:
     so ``http.HandlerFunc(...)`` resolves to ``"net/http" +
     ".HandlerFunc"`` for the resolver's chain comparison.
     """
-    ts_go = _import_grammar('tree_sitter_go')
-    if ts_go is None:
-        return FileCallGraph()
-
-    try:
-        parser = _get_ts_parser(ts_go.language)
-        tree = parser.parse(content.encode("utf-8", errors="replace"))
-    except Exception as e:                          # noqa: BLE001
-        logger.debug("call_graph: Go parse failed (%s)", e)
+    tree = _ts_tree(content, "tree_sitter_go", "Go", _tree)
+    if tree is None:
         return FileCallGraph()
 
     walker = _GoCallGraph()
@@ -1959,7 +2738,9 @@ class _GoCallGraph:
 # ---------------------------------------------------------------------------
 
 
-def extract_call_graph_java(content: str) -> FileCallGraph:
+def extract_call_graph_java(
+    content: str, *, _tree: Any = None,
+) -> FileCallGraph:
     """Walk a Java source string via tree-sitter and return its
     :class:`FileCallGraph`.
 
@@ -1998,15 +2779,8 @@ def extract_call_graph_java(content: str) -> FileCallGraph:
     method-on-instance — out of scope; CodeQL is the right tool
     when type-aware reachability matters.
     """
-    ts_java = _import_grammar('tree_sitter_java')
-    if ts_java is None:
-        return FileCallGraph()
-
-    try:
-        parser = _get_ts_parser(ts_java.language)
-        tree = parser.parse(content.encode("utf-8", errors="replace"))
-    except Exception as e:                          # noqa: BLE001
-        logger.debug("call_graph: Java parse failed (%s)", e)
+    tree = _ts_tree(content, "tree_sitter_java", "Java", _tree)
+    if tree is None:
         return FileCallGraph()
 
     walker = _JavaCallGraph()
@@ -2166,7 +2940,7 @@ class _JavaCallGraph:
                             text = (
                                 self._scoped_identifier_text(sub)
                                 if sub.type == self._SCOPED_IDENT
-                                else sub.text.decode(
+                                else sub.text.decode(  # type: ignore[union-attr]
                                     "utf-8", errors="replace",
                                 )
                             )
@@ -2185,7 +2959,7 @@ class _JavaCallGraph:
                                 text = (
                                     self._scoped_identifier_text(sub)
                                     if sub.type == self._SCOPED_IDENT
-                                    else sub.text.decode(
+                                    else sub.text.decode(  # type: ignore[union-attr]
                                         "utf-8", errors="replace",
                                     )
                                 )
@@ -2539,17 +3313,20 @@ class _JavaCallGraph:
 # ===========================================================================
 
 
-def extract_call_graph_rust(content: str) -> FileCallGraph:
+def extract_call_graph_rust(
+    content: str, *, _tree: Any = None,
+) -> FileCallGraph:
     """Walk a Rust source string via tree-sitter-rust and return its
     :class:`FileCallGraph`.
 
     Returns an empty graph when ``tree_sitter_rust`` isn't installed
     or the file is unparseable.
 
-    Rust shapes:
+    Rust shapes (import-map VALUES are dot-joined — the walker
+    normalises ``::`` paths so OSV symbol matching stays uniform):
 
-      * ``use foo::bar::Baz;`` -> ``imports["Baz"] = "foo::bar::Baz"``
-      * ``use foo::bar as alias;`` -> ``imports["alias"] = "foo::bar"``
+      * ``use foo::bar::Baz;`` -> ``imports["Baz"] = "foo.bar.Baz"``
+      * ``use foo::bar as alias;`` -> ``imports["alias"] = "foo.bar"``
       * ``use foo::{Bar, Baz as B};`` -> binds both
       * ``use foo::*;`` -> ``INDIRECTION_WILDCARD_IMPORT``
       * ``Baz::new()`` (scoped path call) -> chain ``["Baz", "new"]``
@@ -2564,15 +3341,8 @@ def extract_call_graph_rust(content: str) -> FileCallGraph:
     masking every macro-using file would gut the not_called signal —
     macro-generated call edges remain a documented limitation.
     """
-    ts_rust = _import_grammar('tree_sitter_rust')
-    if ts_rust is None:
-        return FileCallGraph()
-
-    try:
-        parser = _get_ts_parser(ts_rust.language)
-        tree = parser.parse(content.encode("utf-8", errors="replace"))
-    except Exception as e:                              # noqa: BLE001
-        logger.debug("call_graph: Rust parse failed (%s)", e)
+    tree = _ts_tree(content, "tree_sitter_rust", "Rust", _tree)
+    if tree is None:
         return FileCallGraph()
 
     walker = _RustCallGraph()
@@ -2729,7 +3499,7 @@ class _RustCallGraph:
             target_names: list[str] = []
             for c in node.children:
                 if c.type == self._TYPE_IDENT:
-                    target_names.append(c.text.decode())
+                    target_names.append(c.text.decode())  # type: ignore[union-attr]
                 elif c.type == "generic_type":
                     ti = self._first_child_of_type(c, (self._TYPE_IDENT,))
                     if ti is not None:
@@ -3023,7 +3793,9 @@ class _RustCallGraph:
 # ===========================================================================
 
 
-def extract_call_graph_ruby(content: str) -> FileCallGraph:
+def extract_call_graph_ruby(
+    content: str, *, _tree: Any = None,
+) -> FileCallGraph:
     """Walk a Ruby source string via tree-sitter-ruby and return its
     :class:`FileCallGraph`.
 
@@ -3047,15 +3819,8 @@ def extract_call_graph_ruby(content: str) -> FileCallGraph:
     ``method_missing`` / etc. produce calls invisible to static
     analysis — same family of limitation as Python ``getattr``.
     """
-    ts_ruby = _import_grammar('tree_sitter_ruby')
-    if ts_ruby is None:
-        return FileCallGraph()
-
-    try:
-        parser = _get_ts_parser(ts_ruby.language)
-        tree = parser.parse(content.encode("utf-8", errors="replace"))
-    except Exception as e:                              # noqa: BLE001
-        logger.debug("call_graph: Ruby parse failed (%s)", e)
+    tree = _ts_tree(content, "tree_sitter_ruby", "Ruby", _tree)
+    if tree is None:
         return FileCallGraph()
 
     walker = _RubyCallGraph()
@@ -3378,7 +4143,9 @@ class _RubyCallGraph:
 # ===========================================================================
 
 
-def extract_call_graph_csharp(content: str) -> FileCallGraph:
+def extract_call_graph_csharp(
+    content: str, *, _tree: Any = None,
+) -> FileCallGraph:
     """Walk a C# source string via tree-sitter-c-sharp and return
     its :class:`FileCallGraph`.
 
@@ -3396,15 +4163,8 @@ def extract_call_graph_csharp(content: str) -> FileCallGraph:
         ``Activator.CreateInstance(...)`` -> ``INDIRECTION_REFLECT``
       * ``Assembly.Load(...)`` -> ``INDIRECTION_IMPORTLIB``
     """
-    ts_cs = _import_grammar('tree_sitter_c_sharp')
-    if ts_cs is None:
-        return FileCallGraph()
-
-    try:
-        parser = _get_ts_parser(ts_cs.language)
-        tree = parser.parse(content.encode("utf-8", errors="replace"))
-    except Exception as e:                              # noqa: BLE001
-        logger.debug("call_graph: C# parse failed (%s)", e)
+    tree = _ts_tree(content, "tree_sitter_c_sharp", "C#", _tree)
+    if tree is None:
         return FileCallGraph()
 
     walker = _CSharpCallGraph()
@@ -3655,7 +4415,7 @@ class _CSharpCallGraph:
             return None
         t = type_node.type
         if t == self._IDENT:
-            return type_node.text.decode("utf-8", errors="replace") or None
+            return type_node.text.decode("utf-8", errors="replace") or None  # type: ignore[union-attr]
         if t == self._QUALIFIED:
             parts = self._qualified_parts(type_node)
             return parts[-1] if parts else None
@@ -3665,7 +4425,7 @@ class _CSharpCallGraph:
         if t in (self._NULLABLE_TYPE, self._ARRAY_TYPE):
             inner = type_node.child_by_field_name("type") or (
                 type_node.children[0] if type_node.children else None)
-            return self._type_name(inner)
+            return self._type_name(inner)  # type: ignore[arg-type]
         return None  # predefined_type / pointer / tuple / etc.
 
     def _collect_param_types(self, params_node) -> dict[str, str]:
@@ -3688,7 +4448,7 @@ class _CSharpCallGraph:
         out: dict[str, str] = {}
         if var_decl_node is None:
             return out
-        tn = self._type_name(var_decl_node.child_by_field_name("type"))
+        tn = self._type_name(var_decl_node.child_by_field_name("type"))  # type: ignore[arg-type]
         if not tn:
             return out
         for c in var_decl_node.children:
@@ -3697,7 +4457,7 @@ class _CSharpCallGraph:
             name = c.child_by_field_name("name") or self._first_child_of_type(
                 c, (self._IDENT,))
             if name is not None:
-                out[name.text.decode("utf-8", errors="replace")] = tn
+                out[name.text.decode("utf-8", errors="replace")] = tn  # type: ignore[union-attr]
         return out
 
     def _resolve_receiver_type(self, chain: list[str]) -> str | None:
@@ -3870,7 +4630,9 @@ class _CSharpCallGraph:
 # ===========================================================================
 
 
-def extract_call_graph_php(content: str) -> FileCallGraph:
+def extract_call_graph_php(
+    content: str, *, _tree: Any = None,
+) -> FileCallGraph:
     r"""Walk a PHP source string via tree-sitter-php and return its
     :class:`FileCallGraph`.
 
@@ -3893,32 +4655,42 @@ def extract_call_graph_php(content: str) -> FileCallGraph:
       * ``include`` / ``require`` (with var) ->
         ``INDIRECTION_DYNAMIC_IMPORT``
     """
-    ts_php = _import_grammar('tree_sitter_php')
-    if ts_php is None:
-        return FileCallGraph()
+    tree = _tree
+    if tree is None:
+        ts_php = _import_grammar('tree_sitter_php')
+        if ts_php is None:
+            return FileCallGraph()
 
-    try:
-        # tree-sitter-php exports php_only / php (with HTML mixed).
-        # For .php files we use php_only, but tolerate either.
-        # NOT routed through _get_ts_parser because the language
-        # resolution path varies (language_php attr vs language()
-        # callable vs already-realised Language object) — cache
-        # identity-keying would either thrash or mis-hit. Per-call
-        # construction here; PHP parses are infrequent enough that
-        # the missed cache opportunity is acceptable.
-        from tree_sitter import Language as _PHPLanguage
-        from tree_sitter import Parser as _PHPParser
-        lang_fn = getattr(ts_php, "language_php", None) or ts_php.language()
-        if callable(lang_fn):
-            lang_fn = lang_fn()
-        parser = _PHPParser(_PHPLanguage(lang_fn))
-        tree = parser.parse(content.encode("utf-8", errors="replace"))
-    except Exception as e:                              # noqa: BLE001
-        logger.debug("call_graph: PHP parse failed (%s)", e)
-        return FileCallGraph()
+        try:
+            # tree-sitter-php exports php_only / php (with HTML mixed).
+            # For .php files we use php_only, but tolerate either.
+            # NOT routed through _get_ts_parser because the language
+            # resolution path varies (language_php attr vs language()
+            # callable vs already-realised Language object) — cache
+            # identity-keying would either thrash or mis-hit. Per-call
+            # construction here; PHP parses are infrequent enough that
+            # the missed cache opportunity is acceptable.
+            from tree_sitter import Language as _PHPLanguage
+            from tree_sitter import Parser as _PHPParser
+            lang_fn = getattr(ts_php, "language_php", None) or ts_php.language()
+            if callable(lang_fn):
+                lang_fn = lang_fn()
+            from core.inventory._ts_cache import bounded
+            parser = bounded(_PHPParser(_PHPLanguage(lang_fn)), label="php")
+            tree = parser.parse(content.encode("utf-8", errors="replace"))
+        except Exception as e:                              # noqa: BLE001
+            logger.debug("call_graph: PHP parse failed (%s)", e)
+            return FileCallGraph()
 
     walker = _PhpCallGraph()
     walker.walk(tree.root_node)
+    # Prerequisite for every guarantee-direction consumer: ERROR
+    # recovery can re-parent statements, so an ERROR-bearing tree's
+    # conditional flags are census/reachability-usable only.
+    try:
+        walker.graph.parse_errors = bool(tree.root_node.has_error)
+    except AttributeError:
+        walker.graph.parse_errors = True  # unknown ⇒ not guarantee-grade
     return walker.graph
 
 
@@ -3956,16 +4728,95 @@ class _PhpCallGraph:
     _DYNAMIC_INCLUDE: ClassVar[set[str]] = {
         "include", "include_once", "require", "require_once",
     }
+    _INCLUDE_EXPRS: ClassVar[dict[str, str]] = {
+        "include_expression": "include",
+        "include_once_expression": "include_once",
+        "require_expression": "require",
+        "require_once_expression": "require_once",
+    }
+    # Constructs under which execution is not straight-line. An
+    # include/define with ANY of these as ancestor is flagged
+    # ``conditional`` — conservative in the guarantee direction (a
+    # false ``conditional: true`` only withholds a future guarantee;
+    # a false ``false`` would fabricate one).
+    _CONDITIONAL_NODES: ClassVar[set[str]] = {
+        "if_statement", "else_clause", "else_if_clause",
+        "switch_statement", "switch_block", "case_statement",
+        "default_statement", "while_statement", "do_statement",
+        "for_statement", "foreach_statement", "try_statement",
+        "catch_clause", "finally_clause", "match_expression",
+        "conditional_expression",
+    }
+    # Short-circuit operators: the RIGHT operand only runs when the
+    # left decides so — conditional for edge/define purposes.
+    _LOGICAL_OPS: ClassVar[set[str]] = {"or", "and", "xor",
+                                        "||", "&&", "??"}
+    _ABORT_NAMES: ClassVar[set[str]] = {"die", "exit"}
+    # File-scope statement types that keep the guard-eligible
+    # PROLOGUE open: declaration/definition statements with no
+    # runtime effect on a direct request. Guard evidence is honest
+    # only while the file's straight-line prefix is inert — anything
+    # executable or output-producing before the guard (calls,
+    # assignments, echo/markup, loops, non-guard branches, aborts,
+    # returns, goto/labels) means a direct request runs THAT first,
+    # so a later "guard" protects nothing (bottom-of-file guards)
+    # or never runs at all (post-abort/post-goto plants).
+    #: declare_statement is deliberately absent: it is inert only in
+    #: its bare-directive form (body-aware check in _prologue_inert).
+    _PROLOGUE_INERT_STMTS: ClassVar[set[str]] = {
+        "php_tag", "comment", "namespace_definition",
+        "namespace_use_declaration", "const_declaration",
+        "empty_statement", "function_definition",
+        "class_declaration", "interface_declaration",
+        "trait_declaration", "enum_declaration",
+    }
+    # Hostile-content bounds: a planted file with millions of
+    # include/define statements must not balloon the checklist.
+    _MAX_INCLUDE_EDGES: ClassVar[int] = 4096
+    _MAX_DEFINES: ClassVar[int] = 1024
+    _MAX_RAW_LEN: ClassVar[int] = 300
 
     def __init__(self) -> None:
         self.graph = FileCallGraph()
         self._enclosing: list[str] = []
         self._class_stack: list[ClassDef] = []
+        # Include-layer state: depth of enclosing conditional
+        # constructs, and the constant names of enclosing
+        # ``!defined('NAME')`` if-conditions (fallback-define
+        # detection).
+        self._cond_depth = 0
+        self._notdef_guards: list[str] = []
+        # Parallel to the conditional depth: the ``defined()``-guard
+        # condition of each enclosing conditional (name, negated) —
+        # None for non-guard conditionals. Straight-line boundary
+        # records consult the top so the phase-1b walk can treat a
+        # ``!defined(C)`` abort as a no-op under a bound C.
+        self._cond_guard_stack: list[tuple[str, bool] | None] = []
+        # Guard-eligibility window (see _PROLOGUE_INERT_STMTS).
+        self._guard_prologue_open = True
+        self.graph.includes_extracted = True
 
     def walk(self, node) -> None:
         _drive_visit(self, node)
 
     def _visit(self, node: Node):
+        # Guard-prologue tracking happens exactly where file-scope
+        # statements are ITERATED (program children here, braced
+        # namespace bodies in the namespace arm) — never via
+        # node.parent, which py-tree-sitter resolves by walking from
+        # the root (O(depth) per call: a per-node parent check made
+        # extraction quadratic in expression depth). Classification
+        # runs BEFORE the child is visited, so a guard inside an
+        # inert statement still records, while a guard nested in the
+        # first payload statement is already ineligible.
+        if node.type == "program":
+            for c in node.children:
+                if (self._guard_prologue_open and c.is_named
+                        and not self._prologue_inert(c)):
+                    self._guard_prologue_open = False
+                yield c
+            return
+
         if node.type == self._NAMESPACE_DEF:
             # ``namespace Foo\Bar;`` — capture as dotted package
             # name. The namespace_name child carries the parts.
@@ -3978,7 +4829,22 @@ class _PhpCallGraph:
                     self.graph.package_name = ".".join(parts)
             # Descend into the namespace body (declarations live
             # inside compound_statement if braced, or as siblings).
+            # Braced-body children are file-scope statements: they
+            # get the same prologue classification as program
+            # children (yielded directly — the compound wrapper has
+            # no handler of its own). Only NAMED children classify:
+            # the anonymous `{` / `}` brace tokens are not statements,
+            # and classifying them would close the prologue at the
+            # opening brace — every guard inside a braced namespace
+            # would go blind.
             for c in node.children:
+                if c.type == "compound_statement":
+                    for s in c.children:
+                        if (self._guard_prologue_open and s.is_named
+                                and not self._prologue_inert(s)):
+                            self._guard_prologue_open = False
+                        yield s
+                    continue
                 yield c
             return
 
@@ -4027,7 +4893,14 @@ class _PhpCallGraph:
                 yield c
             return
 
-        if node.type in (self._FUNCTION_DEF, self._METHOD_DECL):
+        if node.type in (self._FUNCTION_DEF, self._METHOD_DECL,
+                         "anonymous_function", "arrow_function"):
+            # Anonymous and arrow functions are enclosing scopes like
+            # any named function: their bodies run at CALL time, so
+            # includes and defines inside them are function_body
+            # facts — recording them as file-scope handed the walk
+            # unconditional-looking statements that a direct request
+            # never executes at load time.
             name = self._first_child_of_type(node, (self._NAME,))
             method_name = name.text.decode() if name else "<anon>"
             if (node.type == self._METHOD_DECL
@@ -4055,13 +4928,73 @@ class _PhpCallGraph:
                 yield c
             return
 
-        if node.type in (
-            "include_expression", "include_once_expression",
-            "require_expression", "require_once_expression",
-        ):
+        if node.type in self._INCLUDE_EXPRS:
+            self._record_include_edge(node)
+            # The lossy file-scoped flag stays for compatibility with
+            # existing indirection consumers.
             self.graph.indirection.add(INDIRECTION_DYNAMIC_IMPORT)
             for c in node.children:
                 yield c
+            return
+
+        if node.type in ("return_statement", "exit_statement",
+                         "goto_statement"):
+            self._record_boundary(
+                node,
+                "goto" if node.type == "goto_statement"
+                else ("return" if node.type == "return_statement"
+                      else "abort"),
+            )
+            for c in node.children:
+                yield c
+            return
+
+        if node.type == "if_statement":
+            guard = self._not_defined_guard_name(node)
+            self._maybe_record_access_guard(node, guard)
+            self._cond_depth += 1
+            self._cond_guard_stack.append(self._defined_condition(node))
+            if guard is not None:
+                self._notdef_guards.append(guard)
+            try:
+                for c in node.children:
+                    yield c
+            finally:
+                if guard is not None:
+                    self._notdef_guards.pop()
+                self._cond_guard_stack.pop()
+                self._cond_depth -= 1
+            return
+
+        if node.type in self._CONDITIONAL_NODES:
+            self._cond_depth += 1
+            self._cond_guard_stack.append(None)
+            try:
+                for c in node.children:
+                    yield c
+            finally:
+                self._cond_guard_stack.pop()
+                self._cond_depth -= 1
+            return
+
+        if node.type == "binary_expression":
+            # ``defined('X') or die(...)`` at file scope is a
+            # direct-access guard; more generally the RIGHT operand
+            # of a short-circuit operator executes conditionally.
+            self._maybe_record_or_die_guard(node)
+            pushed = False
+            try:
+                for c in node.children:
+                    if not pushed and c.type in self._LOGICAL_OPS:
+                        self._cond_depth += 1
+                        self._cond_guard_stack.append(None)
+                        pushed = True
+                        continue
+                    yield c
+            finally:
+                if pushed:
+                    self._cond_guard_stack.pop()
+                    self._cond_depth -= 1
             return
 
         for c in node.children:
@@ -4085,7 +5018,12 @@ class _PhpCallGraph:
                     target_parts = [c.text.decode()]
         if not target_parts:
             return
-        full = "\\".join(target_parts)
+        # Dot-join, matching ``package_name`` and every other
+        # language's import bindings: the cross-language resolver
+        # compares dot-form module paths, so a backslash-joined
+        # binding could never equal any (dot-normalised) OSV symbol
+        # module and guaranteed NOT_CALLED for PHP.
+        full = ".".join(target_parts)
         bound = alias_name or target_parts[-1]
         self.graph.imports[bound] = full
 
@@ -4151,6 +5089,514 @@ class _PhpCallGraph:
             self.graph.indirection.add(INDIRECTION_EVAL)
         if chain[0] in self._DYNAMIC_INCLUDE:
             self.graph.indirection.add(INDIRECTION_DYNAMIC_IMPORT)
+        # define('NAME', …) — walk input for the include graph's
+        # per-entry constant-environment resolution (phase 1b).
+        if node.type == self._FUNCTION_CALL and len(chain) == 1:
+            head = chain[0].lower()
+            if head == "define":
+                self._record_define(node)
+            elif head in self._ABORT_NAMES:
+                self._record_boundary(node, "abort")
+            elif head == "__halt_compiler":
+                self._record_boundary(node, "halt")
+
+    # ---- include layer (structured edges, defines, guards) --------
+
+    def _record_include_edge(self, node) -> None:
+        """One include/require expression → structured IncludeEdge.
+
+        Classification goes through the ONE include-argument
+        classifier in :mod:`core.inventory.script_handler` (the
+        wiring test is the other consumer) — a census of syntactic
+        shape, never a resolution verdict.
+        """
+        from core.inventory.script_handler import classify_include_argument
+        if self.graph.includes_truncated:
+            return
+        if len(self.graph.includes) >= self._MAX_INCLUDE_EDGES:
+            self.graph.includes_truncated = True
+            return
+        arg = None
+        for c in node.children:
+            if c.is_named:
+                arg = c
+                break
+        while arg is not None and arg.type == "parenthesized_expression":
+            inner = None
+            for c in arg.children:
+                if c.is_named:
+                    inner = c
+                    break
+            if inner is None:
+                break
+            arg = inner
+        raw_full = (arg.text.decode("utf-8", errors="replace")
+                    if arg is not None else "")
+        cls = classify_include_argument(raw_full)
+        raw = raw_full
+        if len(raw) > self._MAX_RAW_LEN:
+            raw = raw[:self._MAX_RAW_LEN] + "…"
+        # Oversized literal material is planted, not path-shaped —
+        # drop rather than truncate (a truncated tail would silently
+        # mis-match at graph derivation).
+        tail = cls.literal_tail
+        if tail is not None and len(tail) > 512:
+            tail = None
+        stem = cls.literal_stem
+        if stem is not None and len(stem) > 512:
+            stem = None
+        self.graph.includes.append(IncludeEdge(
+            line=node.start_point[0] + 1,
+            keyword=self._INCLUDE_EXPRS[node.type],
+            raw=raw,
+            shape=cls.shape,
+            const_name=cls.const_name,
+            literal_tail=tail,
+            literal_stem=stem,
+            conditional=self._cond_depth > 0,
+            position="function_body" if self._enclosing else "file_scope",
+            enclosing_function=(
+                self._enclosing[-1] if self._enclosing else None),
+            span_hash=hashlib.sha256(node.text).hexdigest()[:12],
+        ))
+
+    def _record_define(self, node) -> None:
+        """Record a literal-named ``define('NAME', …)`` statement."""
+        if len(self.graph.defines) >= self._MAX_DEFINES:
+            return
+        args_node = self._first_child_of_type(node, (self._ARGS,))
+        if args_node is None:
+            return
+        args = [c for c in args_node.children if c.type == "argument"]
+        if len(args) < 2:
+            return
+        name = self._plain_string_value(args[0])
+        if name is None or len(name) > 256:
+            # Dynamic-named defines can never seed a constant
+            # environment; oversized names are planted.
+            return
+        value = self._plain_string_value(args[1])
+        raw_value = None
+        if value is None:
+            raw_value = args[1].text.decode("utf-8", errors="replace")
+            if len(raw_value) > self._MAX_RAW_LEN:
+                raw_value = raw_value[:self._MAX_RAW_LEN] + "…"
+        elif len(value) > 512:
+            # Same planted-material rule as edge tails.
+            value, raw_value = None, value[:self._MAX_RAW_LEN] + "…"  # type: ignore[index]
+        # ``fallback`` is EXACT-SHAPE-ONLY: precisely one enclosing
+        # conditional and it is ``!defined('<same name>')``. Any
+        # extra outer conditional (a request-controlled branch around
+        # the fallback) makes this an ordinary conditional define —
+        # the record cannot express "fallback plus outer condition",
+        # so claiming fallback would let the walk bind a constant a
+        # direct request may never define.
+        exact_fallback = (
+            self._cond_depth == 1
+            and bool(self._cond_guard_stack)
+            and self._cond_guard_stack[-1] == (name, True)
+        )
+        self.graph.defines.append(IncludeDefine(
+            line=node.start_point[0] + 1,
+            name=name,
+            value=value,
+            raw_value=raw_value,
+            conditional=self._cond_depth > 0,
+            fallback=exact_fallback,
+            position="function_body" if self._enclosing else "file_scope",
+        ))
+
+    def _plain_string_value(self, arg_node) -> str | None:
+        """The argument's plain string-literal value, or None."""
+        expr = None
+        for c in arg_node.children:
+            if c.is_named:
+                expr = c
+                break
+        if expr is None or expr.type not in ("string", "encapsed_string"):
+            return None
+        parts: list[str] = []
+        for c in expr.children:
+            if c.type == "string_content":
+                parts.append(c.text.decode("utf-8", errors="replace"))
+            elif c.type == "escape_sequence":
+                t = c.text.decode("utf-8", errors="replace")
+                parts.append({"\\\\": "\\", "\\'": "'", '\\"': '"',
+                              "\\$": "$"}.get(t, t))
+            elif c.is_named:
+                return None  # interpolation hole — not a plain literal
+        return "".join(parts)
+
+    def _unwrap_parens(self, node):
+        cur = node
+        while cur is not None and cur.type == "parenthesized_expression":
+            nxt = None
+            for c in cur.children:
+                if c.is_named:
+                    nxt = c
+                    break
+            cur = nxt
+        return cur
+
+    def _defined_call_constant(self, call_node) -> str | None:
+        """``defined('NAME')`` → ``NAME``; anything else → None."""
+        fn = self._first_child_of_type(call_node, (self._NAME,))
+        if fn is None or fn.text.decode(
+                "utf-8", errors="replace").lower() != "defined":
+            return None
+        args_node = self._first_child_of_type(call_node, (self._ARGS,))
+        if args_node is None:
+            return None
+        args = [c for c in args_node.children if c.type == "argument"]
+        if len(args) != 1:
+            return None
+        return self._plain_string_value(args[0])
+
+    def _prologue_inert(self, node) -> bool:
+        """Whether one file-scope statement keeps guard eligibility
+        open. The one rule: an inert WRAPPER is inert only when its
+        body/values are — a payload can otherwise hide inside a
+        prologue-shaped statement (a declare block body, a
+        side-effectful define() value, a ``!defined(NEVER_SET)``
+        branch body) and execute on a direct request before the
+        guard the wrapper shields."""
+        t = node.type
+        if t in self._PROLOGUE_INERT_STMTS:
+            return True
+        if t == "declare_statement":
+            # Bare-directive form only: ``declare(ticks=1) f();`` /
+            # ``declare(...) { ... }`` execute their body.
+            return not any(
+                c.is_named and c.type not in ("declare_directive",
+                                              "comment")
+                for c in node.children)
+        if t == "if_statement":
+            # ``!defined('N')`` shape AND an inert body: the branch
+            # RUNS on a direct request whenever the probed constant
+            # is undefined, so a payload body would execute first.
+            if self._not_defined_guard_name(node) is None:
+                return False
+            return all(self._inert_simple_stmt(s)
+                       for s in self._if_body_stmts(node))
+        if t == "expression_statement":
+            return self._inert_simple_stmt(node)
+        if t in ("text", "text_interpolation"):
+            # Markup output; whitespace-only chunks (and a bare
+            # close/open tag pair) stay inert.
+            txt = node.text.decode("utf-8", errors="replace")
+            for tag in ("?>", "<?php", "<?=", "<?"):
+                txt = txt.replace(tag, " ")
+            return not txt.strip()
+        return False
+
+    def _inert_simple_stmt(self, stmt) -> bool:
+        """Whether one statement is prologue-inert on its own:
+        abort, include (side-effect-free argument), literal define,
+        or the or-die guard expression."""
+        if stmt.type in ("comment", "empty_statement"):
+            return True
+        if self._stmt_is_abort(stmt):
+            return True
+        expr = stmt
+        while expr is not None and expr.type in (
+            "expression_statement", "error_suppression_expression",
+            "parenthesized_expression",
+        ):
+            nxt = None
+            for c in expr.children:
+                if c.is_named:
+                    nxt = c
+                    break
+            expr = nxt
+        if expr is None:
+            return True  # bare ';'
+        if expr.type in self._INCLUDE_EXPRS:
+            # Adjudication: an include with an inert ARGUMENT of a
+            # RESOLVABLE shape (literal / const_prefix) stays
+            # prologue-inert even though the INCLUDED file's payload
+            # executes before the guard on a direct request. Scoped
+            # precisely, guard evidence claims "THIS file's own
+            # below-guard payload is not directly reachable"; the
+            # included file keeps its own role, guard, and census
+            # attention in the graph, so its exposure is never
+            # hidden behind this file's guard — and refusing
+            # includes would void guard evidence on the dominant
+            # honest idiom (bootstrap requires before the guard).
+            # Two shapes DO close the prologue: a side-effectful
+            # argument (this statement's own execution — a call
+            # computing the path runs right here), and a DYNAMIC
+            # include shape: its target carries no
+            # role/census attention of its own, so the
+            # "included file keeps its own attention" rationale has
+            # nothing to attach to — the pre-guard dispatcher risk
+            # must stay on THIS file.
+            if not self._include_arg_side_effect_free(expr):
+                return False
+            from core.inventory.script_handler import (
+                classify_include_argument,
+            )
+            arg = None
+            for c in expr.children:
+                if c.is_named:
+                    arg = c
+                    break
+            while (arg is not None
+                    and arg.type == "parenthesized_expression"):
+                nxt = None
+                for c in arg.children:
+                    if c.is_named:
+                        nxt = c
+                        break
+                if nxt is None:
+                    break
+                arg = nxt
+            raw = (arg.text.decode("utf-8", errors="replace")
+                   if arg is not None else "")
+            return classify_include_argument(raw).shape in (
+                "literal", "const_prefix")
+        if expr.type == self._FUNCTION_CALL:
+            return self._is_literal_define(expr)
+        if expr.type == "binary_expression":
+            # ``defined('N') or die`` IS the guard — inert.
+            return self._or_die_guard_constant(expr) is not None
+        return False
+
+    #: Argument-subtree node kinds that EXECUTE when the enclosing
+    #: statement runs — a prologue-inert wrapper carrying one is not
+    #: inert (seed set, closed over grammar expression kinds).
+    _SIDE_EFFECT_NODES: ClassVar[set[str]] = {
+        "function_call_expression", "scoped_call_expression",
+        "member_call_expression", "nullsafe_member_call_expression",
+        "object_creation_expression", "assignment_expression",
+        "augmented_assignment_expression", "update_expression",
+        "shell_command_expression", "include_expression",
+        "include_once_expression", "require_expression",
+        "require_once_expression", "ERROR",
+    }
+    _MAX_ARG_SCAN_NODES: ClassVar[int] = 10_000
+
+    def _include_arg_side_effect_free(self, include_node) -> bool:
+        """Whether the include's argument subtree is free of
+        executing constructs (calls, assignments, nested includes,
+        backticks, parse errors). Bounded single pass — each node
+        belongs to at most one file-scope statement, so the total
+        cost across a file stays linear; oversized arguments refuse
+        toward closing the prologue."""
+        stack = [c for c in include_node.children if c.is_named]
+        seen = 0
+        while stack:
+            cur = stack.pop()
+            seen += 1
+            if seen > self._MAX_ARG_SCAN_NODES:
+                return False
+            if cur.type in self._SIDE_EFFECT_NODES:
+                return False
+            stack.extend(c for c in cur.children if c.is_named)
+        return True
+
+    def _is_literal_define(self, call_node) -> bool:
+        """``define('NAME', <scalar literal>[, <scalar literal>])``
+        — the only define shape that is inert on execution (a call
+        or expression value runs on a direct request)."""
+        fn = self._first_child_of_type(call_node, (self._NAME,))
+        if fn is None or fn.text.decode(
+                "utf-8", errors="replace").lower() != "define":
+            return False
+        args_node = self._first_child_of_type(call_node, (self._ARGS,))
+        if args_node is None:
+            return False
+        args = [c for c in args_node.children if c.type == "argument"]
+        if len(args) < 2:
+            return False
+        if self._plain_string_value(args[0]) is None:
+            return False
+        return all(self._literal_scalar_arg(a) for a in args[1:])
+
+    def _literal_scalar_arg(self, arg_node) -> bool:
+        expr = None
+        for c in arg_node.children:
+            if c.is_named:
+                expr = c
+                break
+        if expr is None:
+            return False
+        if expr.type in ("integer", "float", "boolean", "null"):
+            return True
+        if expr.type in ("string", "encapsed_string"):
+            return self._plain_string_value(arg_node) is not None
+        return False
+
+    def _if_body_stmts(self, node) -> list:
+        """The if's consequence statements (braced, colon-syntax, or
+        the brace-less single-statement form); else clauses never
+        participate."""
+        for c in node.children:
+            if c.type in ("compound_statement", "colon_block"):
+                return [s for s in c.children if s.is_named]
+            if c.is_named and c.type not in (
+                "parenthesized_expression", "else_clause",
+                "else_if_clause",
+            ):
+                return [c]
+        return []
+
+    #: Straight-line boundary records are capped; the overflow entry
+    #: keeps the cap honest (the walk treats it as a boundary at that
+    #: line — a missed later boundary must never fabricate a
+    #: guarantee below it).
+    _MAX_BOUNDARIES: ClassVar[int] = 8
+
+    def _record_boundary(self, node, kind: str) -> None:
+        """Record a file-scope straight-line boundary statement —
+        return / exit / die / goto / __halt_compiler — with the
+        enclosing ``defined()``-guard condition when there is exactly
+        one enclosing conditional and it is guard-shaped (the
+        phase-1b walk no-ops a ``!defined(C)`` abort under a bound
+        C, and hard-applies a ``defined(C)`` one)."""
+        if self._enclosing:
+            return
+        bl = self.graph.boundaries
+        if bl and bl[-1].get("kind") == "overflow":
+            return
+        line = node.start_point[0] + 1
+        if len(bl) >= self._MAX_BOUNDARIES:
+            bl.append({"line": line, "kind": "overflow"})
+            return
+        entry: dict = {"line": line, "kind": kind}
+        if kind in ("return", "abort"):
+            if self._cond_depth == 0:
+                entry["kind"] = "terminator"
+            else:
+                entry["kind"] = "conditional_" + kind
+                if (self._cond_depth == 1 and self._cond_guard_stack
+                        and self._cond_guard_stack[-1] is not None):
+                    name, negated = self._cond_guard_stack[-1]
+                    entry["guard_constant"] = name
+                    entry["guard_negated"] = negated
+        bl.append(entry)
+
+    def _defined_condition(self, node) -> tuple[str, bool] | None:
+        """(constant, negated) for an ``if (defined('N'))`` /
+        ``if (!defined('N'))`` condition, else None."""
+        cond = self._first_child_of_type(
+            node, ("parenthesized_expression",))
+        if cond is None:
+            return None
+        expr = self._unwrap_parens(cond)
+        if expr is None:
+            return None
+        if expr.type == self._FUNCTION_CALL:
+            name = self._defined_call_constant(expr)
+            return (name, False) if name is not None else None
+        neg = self._not_defined_guard_name(node)
+        return (neg, True) if neg is not None else None
+
+    def _not_defined_guard_name(self, node) -> str | None:
+        """The N of an ``if (!defined('N'))`` condition, or None."""
+        cond = self._first_child_of_type(
+            node, ("parenthesized_expression",))
+        if cond is None:
+            return None
+        expr = self._unwrap_parens(cond)
+        if expr is None or expr.type != "unary_op_expression":
+            return None
+        if not any(c.type == "!" for c in expr.children):
+            return None
+        operand = None
+        for c in expr.children:
+            if c.is_named:
+                operand = c
+                break
+        # ``!(defined('N'))`` unwraps; ``!!defined('N')`` (inverted —
+        # dies when DEFINED) leaves a unary operand and refuses.
+        operand = self._unwrap_parens(operand)
+        if operand is None or operand.type != self._FUNCTION_CALL:
+            return None
+        return self._defined_call_constant(operand)
+
+    def _maybe_record_access_guard(self, node, guard: str | None) -> None:
+        """``if (!defined('N')) die/exit`` at file scope → the file's
+        direct-access guard (role evidence for the include graph).
+
+        Two positional requirements, both hostile-plant defenses:
+        unconditional file scope (a guard nested under another branch
+        never executes on the plant's terms), and the file's inert
+        PROLOGUE still open (see _PROLOGUE_INERT_STMTS) — a guard
+        after executable file-scope code either never runs
+        (post-abort/post-goto plants) or runs after the payload a
+        direct request already executed (bottom-of-file guards), so
+        recording it would render a web-reachable handler as a
+        guarded library. Adjudicated over demoting guard evidence
+        wholesale: prologue-position guards are exactly the honest
+        idiom, and the rule needs no cross-statement flow analysis.
+        """
+        if (guard is None or self._enclosing or self._cond_depth
+                or not self._guard_prologue_open
+                or self.graph.direct_access_guard is not None):
+            return
+        for stmt in self._if_body_stmts(node):
+            if self._stmt_is_abort(stmt):
+                self.graph.direct_access_guard = {
+                    "line": node.start_point[0] + 1,
+                    "constant": guard,
+                }
+                return
+
+    def _or_die_guard_constant(self, node) -> str | None:
+        """The N of a ``defined('N') or/|| die/exit`` expression, or
+        None when the node is not that shape."""
+        kids = list(node.children)
+        op_i = next((i for i, c in enumerate(kids)
+                     if c.type in ("or", "||")), None)
+        if op_i is None or op_i == 0 or op_i == len(kids) - 1:
+            return None
+        left = kids[op_i - 1]
+        if left.type != self._FUNCTION_CALL:
+            return None
+        const = self._defined_call_constant(left)
+        if const is None:
+            return None
+        return const if self._stmt_is_abort(kids[op_i + 1]) else None
+
+    def _maybe_record_or_die_guard(self, node) -> None:
+        """``defined('N') or die/exit`` at file scope — the other
+        idiomatic direct-access guard spelling. Same positional
+        requirements (unconditional scope + open prologue) as the
+        if form."""
+        if (self._enclosing or self._cond_depth
+                or not self._guard_prologue_open
+                or self.graph.direct_access_guard is not None):
+            return
+        const = self._or_die_guard_constant(node)
+        if const is not None:
+            self.graph.direct_access_guard = {
+                "line": node.start_point[0] + 1,
+                "constant": const,
+            }
+
+    def _stmt_is_abort(self, stmt) -> bool:
+        """Whether a statement/expression is a die/exit abort."""
+        expr = stmt
+        while expr is not None and expr.type in (
+            "expression_statement", "error_suppression_expression",
+            "parenthesized_expression",
+        ):
+            nxt = None
+            for c in expr.children:
+                if c.is_named:
+                    nxt = c
+                    break
+            expr = nxt
+        if expr is None:
+            return False
+        if expr.type == self._NAME:
+            return expr.text.decode(
+                "utf-8", errors="replace").lower() in self._ABORT_NAMES
+        if expr.type == self._FUNCTION_CALL:
+            fn = self._first_child_of_type(expr, (self._NAME,))
+            return (fn is not None and fn.text.decode(
+                "utf-8", errors="replace").lower() in self._ABORT_NAMES)
+        return expr.type == "exit_statement"
 
     def _function_call_chain(self, node) -> list[str] | None:
         # function_call_expression: function (qualified_name | name | variable) + arguments
@@ -4240,7 +5686,7 @@ class _PhpCallGraph:
         if node.type == self._NAME:
             return [node.text.decode()]
         if node.type == self._MEMBER_ACCESS:
-            parts: list[str] = [self._object_chain(c) or [] for c in node.children if c.is_named]
+            parts: list[list[str]] = [self._object_chain(c) or [] for c in node.children if c.is_named]
             flat: list[str] = []
             for p in parts:
                 flat.extend(p)
@@ -4287,7 +5733,9 @@ class _PhpCallGraph:
 INDIRECTION_FN_POINTER = "fn_pointer"  # C/C++ call through a fn pointer var
 
 
-def extract_call_graph_c(content: str) -> FileCallGraph:
+def extract_call_graph_c(
+    content: str, *, _tree: Any = None,
+) -> FileCallGraph:
     """Walk a C source string via tree-sitter-c and return its
     :class:`FileCallGraph`.
 
@@ -4324,15 +5772,8 @@ def extract_call_graph_c(content: str) -> FileCallGraph:
         but the declarator walk only handles ANSI prototypes for
         signature/parameters extraction.
     """
-    ts_c = _import_grammar('tree_sitter_c')
-    if ts_c is None:
-        return FileCallGraph()
-
-    try:
-        parser = _get_ts_parser(ts_c.language)
-        tree = parser.parse(content.encode("utf-8", errors="replace"))
-    except Exception as e:                              # noqa: BLE001
-        logger.debug("call_graph: C parse failed (%s)", e)
+    tree = _ts_tree(content, "tree_sitter_c", "C", _tree)
+    if tree is None:
         return FileCallGraph()
 
     walker = _CCallGraph()
@@ -4742,7 +6183,9 @@ class _CCallGraph:
 #   * Lambdas are opaque: the call expression they appear in is still
 #     emitted, but a lambda *call* (``[]{...}()``) returns no chain.
 
-def extract_call_graph_cpp(content: str) -> FileCallGraph:
+def extract_call_graph_cpp(
+    content: str, *, _tree: Any = None,
+) -> FileCallGraph:
     """Walk a C++ source string via tree-sitter-cpp and return its
     :class:`FileCallGraph`.
 
@@ -4785,15 +6228,8 @@ def extract_call_graph_cpp(content: str) -> FileCallGraph:
       * ``using namespace ns;`` doesn't fold ``ns::`` qualifiers off
         of subsequent calls.
     """
-    ts_cpp = _import_grammar('tree_sitter_cpp')
-    if ts_cpp is None:
-        return FileCallGraph()
-
-    try:
-        parser = _get_ts_parser(ts_cpp.language)
-        tree = parser.parse(content.encode("utf-8", errors="replace"))
-    except Exception as e:                              # noqa: BLE001
-        logger.debug("call_graph: C++ parse failed (%s)", e)
+    tree = _ts_tree(content, "tree_sitter_cpp", "C++", _tree)
+    if tree is None:
         return FileCallGraph()
 
     walker = _CppCallGraph()
@@ -5426,7 +6862,7 @@ class _CppCallGraph(_CCallGraph):
                     break
         if name_node is None:
             return
-        name = name_node.text.decode("utf-8", errors="replace")
+        name = name_node.text.decode("utf-8", errors="replace")  # type: ignore[union-attr]
         caller = self._enclosing[-1] if self._enclosing else None
         # No receiver_class tag — initialiser-list entries dispatch
         # on the literal name (base class or member), not on the
@@ -5467,7 +6903,9 @@ class _CppCallGraph(_CCallGraph):
         return None
 
 
-def extract_call_graph_lua(content: str) -> FileCallGraph:
+def extract_call_graph_lua(
+    content: str, *, _tree: Any = None,
+) -> FileCallGraph:
     """Walk a Lua source string via tree-sitter-lua and return its
     :class:`FileCallGraph`.
 
@@ -5486,15 +6924,8 @@ def extract_call_graph_lua(content: str) -> FileCallGraph:
         first/second argument is the real callee
       * ``loadstring(...)`` / ``load(...)`` -> ``INDIRECTION_EVAL``
     """
-    ts_lua = _import_grammar('tree_sitter_lua')
-    if ts_lua is None:
-        return FileCallGraph()
-
-    try:
-        parser = _get_ts_parser(ts_lua.language)
-        tree = parser.parse(content.encode("utf-8", errors="replace"))
-    except Exception as e:                              # noqa: BLE001
-        logger.debug("call_graph: Lua parse failed (%s)", e)
+    tree = _ts_tree(content, "tree_sitter_lua", "Lua", _tree)
+    if tree is None:
         return FileCallGraph()
 
     walker = _LuaCallGraph()
@@ -5694,37 +7125,13 @@ class _LuaCallGraph:
         return None
 
 
-__all__ = [
-    "INDIRECTION_BRACKET_DISPATCH",
-    "INDIRECTION_DUNDER_IMPORT",
-    "INDIRECTION_DYNAMIC_IMPORT",
-    "INDIRECTION_EVAL",
-    "INDIRECTION_FN_POINTER",
-    "INDIRECTION_GETATTR",
-    "INDIRECTION_IMPORTLIB",
-    "INDIRECTION_REFLECT",
-    "INDIRECTION_WILDCARD_IMPORT",
-    "CallSite",
-    "FileCallGraph",
-    "extract_call_graph_c",
-    "extract_call_graph_cpp",
-    "extract_call_graph_csharp",
-    "extract_call_graph_go",
-    "extract_call_graph_java",
-    "extract_call_graph_javascript",
-    "extract_call_graph_lua",
-    "extract_call_graph_php",
-    "extract_call_graph_python",
-    "extract_call_graph_ruby",
-    "extract_call_graph_rust",
-]
-
-
 # ---------------------------------------------------------------------------
 # Scala
 # ---------------------------------------------------------------------------
 
-def extract_call_graph_scala(content: str) -> FileCallGraph:
+def extract_call_graph_scala(
+    content: str, *, _tree: Any = None,
+) -> FileCallGraph:
     """Walk a Scala source string via tree-sitter-scala and return its
     :class:`FileCallGraph`.
 
@@ -5742,15 +7149,8 @@ def extract_call_graph_scala(content: str) -> FileCallGraph:
       * ``f()`` → chain ``["f"]``; ``obj.m()`` → ``["obj", "m"]``;
         ``this.m()`` → receiver_class narrowing like Java
     """
-    ts_scala = _import_grammar('tree_sitter_scala')
-    if ts_scala is None:
-        return FileCallGraph()
-
-    try:
-        parser = _get_ts_parser(ts_scala.language)
-        tree = parser.parse(content.encode("utf-8", errors="replace"))
-    except Exception as e:                              # noqa: BLE001
-        logger.debug("call_graph: Scala parse failed (%s)", e)
+    tree = _ts_tree(content, "tree_sitter_scala", "Scala", _tree)
+    if tree is None:
         return FileCallGraph()
 
     walker = _ScalaCallGraph()
@@ -5784,7 +7184,7 @@ class _ScalaCallGraph:
             pkg = next((c for c in node.children
                         if c.type == "package_identifier"), None)
             if pkg is not None:
-                name = pkg.text.decode("utf-8", errors="replace").strip()
+                name = pkg.text.decode("utf-8", errors="replace").strip()  # type: ignore[union-attr]
                 if name:
                     self.graph.package_name = name
             return
@@ -5806,16 +7206,16 @@ class _ScalaCallGraph:
             if ext is not None:
                 for sub in ext.children:
                     if sub.type == self._TYPE_IDENT:
-                        bases.append(sub.text.decode("utf-8",
+                        bases.append(sub.text.decode("utf-8",  # type: ignore[union-attr]
                                                      errors="replace"))
                     elif sub.type == "generic_type":
                         ti = next((g for g in sub.children
                                    if g.type == self._TYPE_IDENT), None)
                         if ti is not None:
-                            bases.append(ti.text.decode("utf-8",
+                            bases.append(ti.text.decode("utf-8",  # type: ignore[union-attr]
                                                         errors="replace"))
             cdef = ClassDef(
-                name=name_node.text.decode("utf-8", errors="replace"),
+                name=name_node.text.decode("utf-8", errors="replace"),  # type: ignore[union-attr]
                 line=node.start_point[0] + 1,
                 bases=bases,
                 nested=bool(self._class_stack) or bool(self._enclosing),
@@ -5832,7 +7232,7 @@ class _ScalaCallGraph:
         if t == self._FUNC_NODE:
             name_node = next((c for c in node.children
                               if c.type == self._IDENT), None)
-            fn_name = (name_node.text.decode("utf-8", errors="replace")
+            fn_name = (name_node.text.decode("utf-8", errors="replace")  # type: ignore[union-attr]
                        if name_node is not None else "<anon>")
             if self._class_stack and not self._enclosing:
                 self._class_stack[-1].methods.append(
@@ -5925,7 +7325,7 @@ class _ScalaCallGraph:
         args = next((c for c in node.children if c.type == self._ARGS),
                     None)
         arg_idents = (
-            [a.text.decode("utf-8", errors="replace")
+            [a.text.decode("utf-8", errors="replace")  # type: ignore[union-attr]
              for a in args.children if a.type == self._IDENT]
             if args is not None else []
         )
@@ -5987,7 +7387,9 @@ def _flatten_dotted_chain(node, *, ident_types, binary_types,
 # Kotlin
 # ---------------------------------------------------------------------------
 
-def extract_call_graph_kotlin(content: str) -> FileCallGraph:
+def extract_call_graph_kotlin(
+    content: str, *, _tree: Any = None,
+) -> FileCallGraph:
     """Walk a Kotlin source string via tree-sitter-kotlin and return
     its :class:`FileCallGraph`.
 
@@ -6010,15 +7412,8 @@ def extract_call_graph_kotlin(content: str) -> FileCallGraph:
     keep real node types — the walker descends ERROR nodes, so those
     declarations still contribute classes/functions/calls.
     """
-    ts_kotlin = _import_grammar('tree_sitter_kotlin')
-    if ts_kotlin is None:
-        return FileCallGraph()
-
-    try:
-        parser = _get_ts_parser(ts_kotlin.language)
-        tree = parser.parse(content.encode("utf-8", errors="replace"))
-    except Exception as e:                              # noqa: BLE001
-        logger.debug("call_graph: Kotlin parse failed (%s)", e)
+    tree = _ts_tree(content, "tree_sitter_kotlin", "Kotlin", _tree)
+    if tree is None:
         return FileCallGraph()
 
     walker = _KotlinCallGraph()
@@ -6052,7 +7447,7 @@ class _KotlinCallGraph:
             qi = next((c for c in node.children
                        if c.type == "qualified_identifier"), None)
             if qi is not None:
-                pkg = qi.text.decode("utf-8", errors="replace").strip()
+                pkg = qi.text.decode("utf-8", errors="replace").strip()  # type: ignore[union-attr]
                 if pkg:
                     self.graph.package_name = pkg
             return
@@ -6068,7 +7463,7 @@ class _KotlinCallGraph:
                 yield from node.children
                 return
             cdef = ClassDef(
-                name=name_node.text.decode("utf-8", errors="replace"),
+                name=name_node.text.decode("utf-8", errors="replace"),  # type: ignore[union-attr]
                 line=node.start_point[0] + 1,
                 bases=self._delegation_bases(node),
                 nested=bool(self._class_stack) or bool(self._enclosing),
@@ -6088,7 +7483,7 @@ class _KotlinCallGraph:
                 name_node = next((c for c in node.children
                                   if c.type == self._IDENT), None)
                 fn_name = (
-                    name_node.text.decode("utf-8", errors="replace")
+                    name_node.text.decode("utf-8", errors="replace")  # type: ignore[union-attr]
                     if name_node is not None else "<anon>"
                 )
             if self._class_stack and not self._enclosing:
@@ -6183,7 +7578,7 @@ class _KotlinCallGraph:
                     named = [g for g in a.children if g.is_named]
                     if len(named) == 1 and named[0].type == self._IDENT:
                         arg_idents.append(
-                            named[0].text.decode("utf-8", errors="replace"),
+                            named[0].text.decode("utf-8", errors="replace"),  # type: ignore[union-attr]
                         )
         self.graph.calls.append(CallSite(
             line=node.start_point[0] + 1,
@@ -6198,7 +7593,9 @@ class _KotlinCallGraph:
 # Swift
 # ---------------------------------------------------------------------------
 
-def extract_call_graph_swift(content: str) -> FileCallGraph:
+def extract_call_graph_swift(
+    content: str, *, _tree: Any = None,
+) -> FileCallGraph:
     """Walk a Swift source string via tree-sitter-swift and return its
     :class:`FileCallGraph`.
 
@@ -6221,15 +7618,8 @@ def extract_call_graph_swift(content: str) -> FileCallGraph:
       * ``f()`` → chain ``["f"]``; ``obj.m()`` → ``["obj", "m"]``;
         ``self.m()`` → receiver_class narrowing like Rust
     """
-    ts_swift = _import_grammar('tree_sitter_swift')
-    if ts_swift is None:
-        return FileCallGraph()
-
-    try:
-        parser = _get_ts_parser(ts_swift.language)
-        tree = parser.parse(content.encode("utf-8", errors="replace"))
-    except Exception as e:                              # noqa: BLE001
-        logger.debug("call_graph: Swift parse failed (%s)", e)
+    tree = _ts_tree(content, "tree_sitter_swift", "Swift", _tree)
+    if tree is None:
         return FileCallGraph()
 
     walker = _SwiftCallGraph()
@@ -6267,7 +7657,7 @@ class _SwiftCallGraph:
             ident = next((c for c in node.children
                           if c.type == "identifier"), None)
             if ident is not None:
-                name = ident.text.decode("utf-8", errors="replace").strip()
+                name = ident.text.decode("utf-8", errors="replace").strip()  # type: ignore[union-attr]
                 if name:
                     self.graph.imports[name.split(".")[-1]] = name
             return
@@ -6285,7 +7675,7 @@ class _SwiftCallGraph:
                 name_node = next((c for c in node.children
                                   if c.type == self._IDENT), None)
                 fn_name = (
-                    name_node.text.decode("utf-8", errors="replace")
+                    name_node.text.decode("utf-8", errors="replace")  # type: ignore[union-attr]
                     if name_node is not None else "<anon>"
                 )
             if self._class_stack and not self._enclosing:
@@ -6307,7 +7697,7 @@ class _SwiftCallGraph:
                               if c.type == self._IDENT), None)
             if name_node is not None and self._class_stack:
                 self._class_stack[-1].methods.append(
-                    (name_node.text.decode("utf-8", errors="replace"),
+                    (name_node.text.decode("utf-8", errors="replace"),  # type: ignore[union-attr]
                      node.start_point[0] + 1),
                 )
             return
@@ -6327,7 +7717,7 @@ class _SwiftCallGraph:
         ti = next((c for c in node.children
                    if c.type == self._TYPE_IDENT), None)
         if ti is not None:
-            name = ti.text.decode("utf-8", errors="replace")
+            name = ti.text.decode("utf-8", errors="replace")  # type: ignore[union-attr]
         else:
             # ``extension C`` wraps the target in user_type.
             ut = next((c for c in node.children
@@ -6336,7 +7726,7 @@ class _SwiftCallGraph:
                 inner = next((g for g in ut.children
                               if g.type == self._TYPE_IDENT), None)
                 if inner is not None:
-                    name = inner.text.decode("utf-8", errors="replace")
+                    name = inner.text.decode("utf-8", errors="replace")  # type: ignore[union-attr]
         if name is None:
             yield from node.children
             return
@@ -6351,7 +7741,7 @@ class _SwiftCallGraph:
                                   if g.type == self._TYPE_IDENT), None)
                     if inner is not None:
                         bases.append(
-                            inner.text.decode("utf-8", errors="replace"),
+                            inner.text.decode("utf-8", errors="replace"),  # type: ignore[union-attr]
                         )
 
         cdef: ClassDef | None = None
@@ -6414,7 +7804,7 @@ class _SwiftCallGraph:
                         if (len(named) == 1
                                 and named[0].type == self._IDENT):
                             arg_idents.append(
-                                named[0].text.decode(
+                                named[0].text.decode(  # type: ignore[union-attr]
                                     "utf-8", errors="replace",
                                 ),
                             )
@@ -6500,46 +7890,243 @@ def _extractor_for_language(language: str | None,
     return fn
 
 
-def load_call_graphs(
+#: Default per-file size gate for :func:`load_call_graphs` — larger
+#: sources are skipped, not parsed. Shared with the audit prep cache's
+#: input fingerprint so both sides agree on which bytes can matter.
+#: Both directions: RAISING it admits generated/amalgamated monsters
+#: (a single sqlite3.c-shaped file costs seconds of regex parsing and
+#: can dominate the retained-byte budget alone — file size is
+#: target-derived, so a hostile tree must not buy unbounded parse
+#: time). LOWERING it drops cross-function context for exactly the
+#: big, central files where it matters most. When the gate binds,
+#: :func:`load_call_graphs` counts the oversize skips and discloses
+#: them with a warning — the gate may bind, but never silently.
+CALL_GRAPH_MAX_FILE_BYTES = 1_500_000
+
+#: Default cumulative retained-byte budget for
+#: :func:`load_call_graphs` — bounds the ESTIMATED in-memory size of
+#: the whole returned mapping (:func:`estimate_call_graph_bytes`),
+#: which the orchestrator caches for the entire run. ``max_bytes``
+#: gates INPUT per file only; retained OUTPUT is what this bounds — a
+#: call-dense file at the input gate measures ~53 MiB retained alone
+#: (a denser shape was measured retaining ~71 MB), so density, not
+#: file count, is the exhaustion vector. Both directions, in the
+#: units the budget actually meters (estimated bytes): LOWER drops
+#: cross-function context on honestly dense trees — a kernel-scale
+#: 20,000-file checklist at the measured kernel average (~15 KiB
+#: retained/file) needs ~300 MiB, and a python-heavy tree at this
+#: repo's own measured density (~42 KiB/file estimated over core/,
+#: deep ~36 KiB) needs ~820 MiB at the checklist ceiling; both must
+#: fit. HIGHER only admits degenerate density (1 GiB already
+#: tolerates ~18 input-cap call-dense monsters at ~57 MiB estimated
+#: each before stopping) while the mapping sits in the orchestrator's
+#: module-level cache for the whole run beside everything else it
+#: holds.
+CALL_GRAPH_MAX_TOTAL_BYTES = 1024 * 1024 * 1024
+
+
+# Retained-size estimation constants, measured on 64-bit CPython
+# (3.14) by comparing the estimate against a dedup-aware deep
+# ``sys.getsizeof`` walk of extracted graphs. Fixture ratios
+# (estimate / measured): minimal-call pathological 1.03, kernel-shaped
+# C 0.87, ordinary python 1.01, chain-dense 1.21, PHP include-heavy
+# 1.25, long-caller-name shapes (380/1000/4000 chars) 1.00, astral
+# (UCS-4) caller 1.00, astral chain 1.86, decorator flood 1.04, ctor
+# flood 0.97, string-ref flood 1.00, this repo's own core/ tree
+# 1.16 — a budget gate needs "right order of magnitude, cheap, mildly
+# conservative", not pympler. String charges go through
+# ``sys.getsizeof`` so wide (UCS-2/UCS-4) identifiers are charged
+# their real bytes, with a small share discount because extracted
+# names repeat heavily within a file (dedup in the measured
+# baseline); container/instance costs fold the slots object, list
+# headers, and the per-entry int objects together.
+_EST_STR_SHARE_DISCOUNT = 21   # portion of the str header assumed shared
+_EST_STR_FLOOR = 8             # never below one pointer per reference
+_EST_CALL_SITE_BYTES = 230     # CallSite + two list headers + line int
+_EST_ENTRY_BYTES = 130         # small tuple/dict-entry shaped records
+_EST_RECORD_BYTES = 190        # slots record instances (ClassDef, ...)
+_EST_GRAPH_BASE_BYTES = 700    # empty FileCallGraph + field containers
+#: Base charge for one :class:`CallArgumentFacts` before per-fact
+#: charges — the measured deep size of an EMPTY instance (96 B slots
+#: object + 28 B int + 3 x 56 B empty lists + 4 x 64 B empty dicts =
+#: 548 B on 64-bit CPython 3.14). Both directions: LOWER re-opens the
+#: decorator-flood under-charge (``@d()`` repeated allocates one
+#: empty-ish facts object per decorator — the only uncapped carrier;
+#: a 200 B base measured est/deep 0.63, ~1.6x budget overshoot);
+#: HIGHER over-charges every constructed-object and string-ref
+#: record too (both capped, so drift is bounded) and pushes honest
+#: decorator/ctor-heavy trees toward tripping the budget early.
+_EST_ARG_FACTS_BASE = 548
+
+
+def _est_strs(seq: "Iterable[str]") -> int:
+    getsizeof = sys.getsizeof
+    return sum(
+        max(getsizeof(s) - _EST_STR_SHARE_DISCOUNT, _EST_STR_FLOOR)
+        for s in seq
+    )
+
+
+def _est_arg_facts(a: CallArgumentFacts) -> int:
+    getsizeof = sys.getsizeof
+    total = _EST_ARG_FACTS_BASE
+    total += sum(30 + getsizeof(s) for _, s in a.string_args)
+    for _, ch in a.ref_args:
+        total += 60 + _est_strs(ch)
+    for _, ch in a.call_ref_args:
+        total += 60 + _est_strs(ch)
+    for k, v in a.kw_strings.items():
+        total += 60 + getsizeof(k) + getsizeof(v)
+    for k, vs in a.kw_string_lists.items():
+        total += 60 + getsizeof(k) + 64 + _est_strs(vs)
+    for k, ch in a.kw_refs.items():
+        total += 60 + getsizeof(k) + 64 + _est_strs(ch)
+    for k, ch in a.kw_call_refs.items():
+        total += 60 + getsizeof(k) + 64 + _est_strs(ch)
+    return total
+
+
+def _est_call_sites(sites: "Iterable[CallSite]") -> int:
+    """Charge one run of :class:`CallSite` records.
+
+    ``caller`` / ``receiver_class`` / ``receiver_type`` are charged
+    byte-aware (``sys.getsizeof`` — UCS-kind aware): the caller is
+    the enclosing function name, arbitrarily long and distinct per
+    function, so leaving it uncharged lets a long-name shape defeat
+    the budget. Extractors bind the SAME string object to every site
+    of one function and sites arrive in file order, so an
+    adjacent-identity check amortizes the shared object to one
+    charge per run — matching the dedup-aware measurement baseline;
+    non-adjacent repeats over-charge, the conservative direction.
+    """
+    getsizeof = sys.getsizeof
+    total = 0
+    prev_caller = None
+    prev_recv_class = None
+    prev_recv_type = None
+    for c in sites:
+        total += (_EST_CALL_SITE_BYTES + _est_strs(c.chain)
+                  + _est_strs(c.argument_identifiers))
+        caller = c.caller
+        if caller is not None and caller is not prev_caller:
+            total += getsizeof(caller)
+        prev_caller = caller
+        rc = c.receiver_class
+        if rc is not None and rc is not prev_recv_class:
+            total += getsizeof(rc)
+        prev_recv_class = rc
+        rt = c.receiver_type
+        if rt is not None and rt is not prev_recv_type:
+            total += getsizeof(rt)
+        prev_recv_type = rt
+    return total
+
+
+def estimate_call_graph_bytes(graph: FileCallGraph) -> int:
+    """Cheap retained-size estimate for one :class:`FileCallGraph`.
+
+    Structural walk over the dataclass fields with measured per-object
+    constants (see above) — O(graph), no allocation, no reflection.
+    Every string is charged byte-aware through ``sys.getsizeof``
+    (wide-build/UCS-4 identifiers cost their real bytes), and the
+    per-site name fields (``caller``/``receiver_class``/
+    ``receiver_type``) are charged with adjacent-share amortization
+    (see :func:`_est_call_sites`). Validated within 2x of a
+    dedup-aware deep ``sys.getsizeof`` on pathological, normal,
+    long-caller-name, and astral-identifier fixtures; the deliberate
+    bias is mildly conservative (overestimate trips the budget early,
+    the safe direction for a memory guard).
+    """
+    getsizeof = sys.getsizeof
+    total = _EST_GRAPH_BASE_BYTES
+    for k, v in graph.imports.items():
+        total += 60 + getsizeof(k) + getsizeof(v)
+    total += _est_call_sites(graph.calls)
+    total += _est_call_sites(graph.subscript_calls)
+    for s in graph.indirection:
+        total += 20 + getsizeof(s)
+    for s in graph.getattr_targets:
+        total += 20 + getsizeof(s)
+    for cls_def in graph.classes:
+        total += (_EST_RECORD_BYTES + getsizeof(cls_def.name)
+                  + _est_strs(cls_def.bases)
+                  + sum(80 + getsizeof(m[0]) for m in cls_def.methods))
+    for d in graph.decorated_functions:
+        total += _EST_RECORD_BYTES + getsizeof(d.name)
+        total += sum(64 + _est_strs(ch) for ch in d.decorators)
+        total += sum(8 if a is None else _est_arg_facts(a)
+                     for a in d.decorator_args)
+    for ri in graph.relative_imports:
+        total += (_EST_ENTRY_BYTES + getsizeof(ri[1])
+                  + getsizeof(ri[2])
+                  + (getsizeof(ri[3]) if ri[3] else 0))
+    for name, chains in graph.dispatch_tables.items():
+        total += (_EST_ENTRY_BYTES + getsizeof(name)
+                  + sum(64 + _est_strs(ch) for ch in chains))
+    for t in graph.getattr_calls:
+        total += (_EST_ENTRY_BYTES
+                  + (getsizeof(t[1]) if t[1] else 0)
+                  + (getsizeof(t[2]) if t[2] else 0))
+    for name, co in graph.constructed_objects.items():
+        total += (_EST_RECORD_BYTES + getsizeof(name)
+                  + _est_strs(co.chain) + _est_arg_facts(co.args))
+    for src in graph.string_ref_calls:
+        total += (_EST_RECORD_BYTES + _est_strs(src.chain)
+                  + _est_arg_facts(src.args))
+        if src.caller is not None:
+            total += getsizeof(src.caller)
+    for e in graph.includes:
+        total += (_EST_RECORD_BYTES + 70 + getsizeof(e.keyword)
+                  + getsizeof(e.raw) + getsizeof(e.shape)
+                  + getsizeof(e.span_hash)
+                  + _est_strs(e.candidates)
+                  + sum(getsizeof(x) for x in (
+                      e.const_name, e.literal_tail, e.literal_stem,
+                      e.target, e.enclosing_function) if x))
+    for de in graph.defines:
+        total += (_EST_RECORD_BYTES + getsizeof(de.name)
+                  + (getsizeof(de.value) if de.value else 0)
+                  + (getsizeof(de.raw_value) if de.raw_value else 0))
+    if graph.package_name:
+        total += 20 + getsizeof(graph.package_name)
+    if graph.direct_access_guard:
+        total += 300
+    return total
+
+
+def iter_call_graph_candidates(
     target_path: Any,
     checklist: dict[str, Any] | None = None,
-    *,
-    max_files: int = 2000,
-    max_bytes: int = 1_500_000,
-) -> dict[str, FileCallGraph]:
-    """Extract per-file call graphs for a target tree.
+) -> list[tuple[str, Any, str | None]]:
+    """Candidate files a :func:`load_call_graphs` build would read.
 
-    Consumers (:class:`core.iris.bypass.CompositionalAnalyzer`, the
-    audit orchestrator's structural detectors) want a
-    ``{relative_path: FileCallGraph}`` mapping keyed the same way the
-    checklist / findings key files.
-
-    Args:
-        target_path: Root of the target codebase.
-        checklist: Parsed ``checklist.json`` (``{"files": [{"path":
-            ...}]}``).  When given, only its files are extracted —
-            keys are the checklist paths verbatim.  When None, the
-            tree is walked (common exclusions pruned) and keys are
-            POSIX relative paths.
-        max_files: Cap on extracted files (checklist order / walk
-            order wins; the rest are skipped with a log line).
-        max_bytes: Per-file size cap — larger sources are skipped.
-
-    Returns:
-        Mapping of file path → :class:`FileCallGraph`.  Files that
-        fail to read or parse are skipped (extraction is best-effort
-        by design); an empty dict when nothing was extractable.
+    Returns ``(relative path, absolute path, checklist language or
+    None)`` tuples in extraction order. Shared between the build and
+    the audit prep cache's input fingerprint
+    (:func:`core.audit.detector_cache.call_graph_inputs_fingerprint`)
+    so the two can never drift over which bytes matter.
     """
     from pathlib import Path
 
     root = Path(target_path)
-    # (relative path, absolute path, checklist language or None)
     candidates: list[tuple[str, Any, str | None]] = []
 
     if checklist is not None:
         for file_info in checklist.get("files", []) or []:
             rel = file_info.get("path", "")
             if not rel:
+                continue
+            # Run artifacts are data, not authority: an absolute or
+            # parent-escaping path in a checklist would read
+            # out-of-tree content into extraction (Path join with an
+            # absolute rhs REPLACES root). The builder's own scope
+            # handling hard-errors on the same shape; the loader skips
+            # and keeps going (best-effort surface).
+            rel_p = Path(rel)
+            if rel_p.is_absolute() or ".." in rel_p.parts:
+                logger.warning(
+                    "call-graph load: skipping non-relative checklist "
+                    "path %r", rel)
                 continue
             candidates.append(
                 (rel, root / rel, file_info.get("language")))
@@ -6557,12 +8144,107 @@ def load_call_graphs(
                 if p.suffix.lower() in _EXT_TO_LANGUAGE:
                     candidates.append(
                         (p.relative_to(root).as_posix(), p, None))
+    return candidates
+
+
+# Checklist-mode file-cap ceiling. Both directions: LOWER re-creates
+# the kernel-scale truncation this exists to fix (a 6,002-file scoped
+# checklist ran cross-function detectors on a third of its files —
+# measured cost of the full set: ~8 ms and ~15 KiB per kernel file,
+# i.e. ~49 s wall / ~87 MiB retained, once per run and cached);
+# HIGHER widens the retained-mapping exposure — ~300 MiB at this
+# ceiling on the MEASURED KERNEL AVERAGE (~15 KiB/file), which is an
+# extrapolation, not a bound: max_bytes gates INPUT size only, and a
+# pathological call-dense file near the input gate was measured
+# retaining ~71 MB alone. The mapping lives in the orchestrator's
+# module-level cache for the whole run. Checklist mode only: the
+# checklist already bounds candidates to the run's own reviewed
+# inventory, so the ceiling is a memory guard, not a work bound; the
+# bare tree walk keeps the conservative 2000 default (an unbounded
+# monorepo walk earns no such trust).
+_CHECKLIST_MAX_FILES = 20_000
+
+
+def _derive_max_files(checklist: "dict[str, Any] | None") -> int:
+    """Default file cap: the checklist's own file count up to the
+    checklist-mode ceiling (candidates never exceed the checklist, so
+    below the ceiling the whole checklist is covered); 2000 for a
+    bare tree walk."""
+    if checklist is None:
+        return 2000
+    n_files = len(checklist.get("files") or [])
+    return min(max(n_files, 2000), _CHECKLIST_MAX_FILES)
+
+
+def load_call_graphs(
+    target_path: Any,
+    checklist: dict[str, Any] | None = None,
+    *,
+    max_files: int | None = None,
+    max_bytes: int = CALL_GRAPH_MAX_FILE_BYTES,
+    max_total_bytes: int = CALL_GRAPH_MAX_TOTAL_BYTES,
+) -> dict[str, FileCallGraph]:
+    """Extract per-file call graphs for a target tree.
+
+    Consumers (:class:`core.iris.bypass.CompositionalAnalyzer`, the
+    audit orchestrator's structural detectors) want a
+    ``{relative_path: FileCallGraph}`` mapping keyed the same way the
+    checklist / findings key files.
+
+    Args:
+        target_path: Root of the target codebase.
+        checklist: Parsed ``checklist.json`` (``{"files": [{"path":
+            ...}]}``).  When given, only its files are extracted —
+            keys are the checklist paths verbatim.  When None, the
+            tree is walked (common exclusions pruned) and keys are
+            POSIX relative paths.
+        max_files: Cap on extracted files (checklist order / walk
+            order wins; the rest are skipped with a log line). None —
+            the default — derives the cap: 2000 for a bare tree walk,
+            the checklist's own file count up to
+            ``_CHECKLIST_MAX_FILES`` when a checklist bounds the
+            candidates. An explicit int is honoured verbatim.
+        max_bytes: Per-file size cap — larger sources are skipped.
+        max_total_bytes: Cumulative retained-byte budget over the
+            ESTIMATED in-memory size of the returned mapping
+            (:func:`estimate_call_graph_bytes`). ``max_bytes`` gates
+            input per file only; this bounds the retained output.
+            On exceed, retention stops (already-retained graphs are
+            never dropped; later candidates are skipped and counted)
+            and one warning names the top-offender file. A single
+            graph estimated larger than the whole budget is refused
+            and extraction continues — dropping only the monster
+            keeps cross-function context alive for the small files
+            behind it. An explicit int is honoured verbatim.
+
+    Returns:
+        Mapping of file path → :class:`FileCallGraph`.  Files that
+        fail to read or parse are skipped (extraction is best-effort
+        by design); an empty dict when nothing was extractable.
+    """
+    derived = max_files is None
+    if derived:
+        max_files = _derive_max_files(checklist)
+    candidates = iter_call_graph_candidates(target_path, checklist)
 
     graphs: dict[str, FileCallGraph] = {}
     skipped = 0
+    retained_bytes = 0
+    budget_exhausted = False
+    budget_skipped = 0
+    oversize_skipped = 0
+    oversize_example: str | None = None
+    top_offender: tuple[str, int] | None = None
     for rel, path, decl_language in candidates:
-        if len(graphs) >= max_files:
+        if len(graphs) >= max_files:  # type: ignore[operator]
             skipped += 1
+            continue
+        if budget_exhausted:
+            # Sticky stop: once the cumulative budget is hit, later
+            # candidates are counted without being parsed — retention
+            # order stays checklist/walk order (predictable), and the
+            # parse work for graphs we would discard is not spent.
+            budget_skipped += 1
             continue
         # The checklist's language field is content-refined by the
         # inventory builder (a C++-marker .h routes to cpp, .inc
@@ -6573,6 +8255,9 @@ def load_call_graphs(
             continue
         try:
             if path.stat().st_size > max_bytes:
+                oversize_skipped += 1
+                if oversize_example is None:
+                    oversize_example = rel
                 continue
             content = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -6591,21 +8276,144 @@ def load_call_graphs(
         if extractor is None:
             continue
         try:
-            graphs[rel] = extractor(content)
+            graph = extractor(content)
         except Exception:
             logger.debug("call-graph extraction failed for %s", rel,
                          exc_info=True)
+            continue
+        estimated = estimate_call_graph_bytes(graph)
+        if top_offender is None or estimated > top_offender[1]:
+            top_offender = (rel, estimated)
+        if estimated > max_total_bytes:
+            # A single graph larger than the WHOLE budget can never
+            # fit: refuse it and keep extracting — dropping only the
+            # monster preserves cross-function context for every
+            # small file behind it (measured: an input-cap call-dense
+            # file retains ~53 MiB while a normal file retains
+            # ~15-36 KiB, so the trade is one degenerate file's
+            # context against thousands of ordinary files').
+            budget_skipped += 1
+            continue
+        if retained_bytes + estimated > max_total_bytes:
+            budget_exhausted = True
+            budget_skipped += 1
+            continue
+        graphs[rel] = graph
+        retained_bytes += estimated
     if skipped:
         # Hitting the cap means cross-function context is INCOMPLETE
         # for every consumer of this mapping — loud, not info-level.
-        # Callers with a checklist rarely get here (in-scope files
-        # bound the candidate set); a bare tree walk on a large target
-        # is the case that overflows.
+        # Checklist mode only overflows past _CHECKLIST_MAX_FILES (the
+        # derived cap covers the whole checklist below it); a bare
+        # tree walk on a large target overflows at the 2000 default.
         logger.warning(
             "load_call_graphs: file cap (%d) reached — %d candidates "
             "skipped; cross-function detectors run with partial "
-            "call-graph context (pass the run checklist to bound "
-            "extraction to in-scope files)",
+            "call-graph context (%s)",
             max_files, skipped,
+            "checklist exceeds the checklist-mode ceiling"
+            if derived and checklist is not None else
+            "explicit max_files caller"
+            if checklist is not None else
+            "pass the run checklist to bound extraction to in-scope "
+            "files",
+        )
+    if oversize_skipped:
+        # The per-file input gate is a coverage gate too: an oversize
+        # source contributes NO call edges, and the biggest files are
+        # often the most central (amalgamations, generated cores).
+        # Loud like its cap/budget siblings — never a silent continue.
+        logger.warning(
+            "load_call_graphs: %d file(s) over the per-file size gate "
+            "(%d bytes) skipped unparsed (e.g. %r); cross-function "
+            "detectors have no call-graph context for them",
+            oversize_skipped, max_bytes, oversize_example,
+        )
+    if budget_skipped:
+        # Hitting the budget means cross-function context is
+        # INCOMPLETE for every consumer of this mapping — loud, not
+        # info-level, and it names the pathological file: max_bytes
+        # already gated input size, so the offender is call-DENSE and
+        # the operator cannot find it by looking at file sizes.
+        top_rel, top_est = top_offender if top_offender else ("?", 0)
+        logger.warning(
+            "load_call_graphs: retained-byte budget (%d bytes) "
+            "reached — %d candidate(s) not retained; cross-function "
+            "detectors run with partial call-graph context "
+            "(retained ~%d bytes across %d graphs; top offender "
+            "%r ~%d bytes)",
+            max_total_bytes, budget_skipped, retained_bytes,
+            len(graphs), top_rel, top_est,
         )
     return graphs
+
+
+# At the very end so nothing defined below it can be forgotten — the
+# previous mid-file placement silently omitted every extractor added
+# after it (scala/kotlin/swift) plus load_call_graphs.
+__all__ = [
+    "INDIRECTION_BRACKET_DISPATCH",
+    "INDIRECTION_DUNDER_IMPORT",
+    "INDIRECTION_DYNAMIC_IMPORT",
+    "INDIRECTION_EVAL",
+    "INDIRECTION_FN_POINTER",
+    "INDIRECTION_GETATTR",
+    "INDIRECTION_GETATTR_OPAQUE",
+    "INDIRECTION_IMPORTLIB",
+    "INDIRECTION_REFLECT",
+    "INDIRECTION_WILDCARD_IMPORT",
+    "CALL_GRAPH_MAX_TOTAL_BYTES",
+    "CallSite",
+    "FileCallGraph",
+    "estimate_call_graph_bytes",
+    "extract_call_graph_c",
+    "extract_call_graph_cpp",
+    "extract_call_graph_csharp",
+    "extract_call_graph_go",
+    "extract_call_graph_java",
+    "extract_call_graph_javascript",
+    "extract_call_graph_kotlin",
+    "extract_call_graph_lua",
+    "extract_call_graph_php",
+    "extract_call_graph_python",
+    "extract_call_graph_ruby",
+    "extract_call_graph_rust",
+    "extract_call_graph_scala",
+    "extract_call_graph_swift",
+    "load_call_graphs",
+    "build_reverse_edges",
+]
+
+
+FuncKey = tuple[str, str]
+
+
+def build_reverse_edges(
+    call_graphs: dict[str, FileCallGraph],
+) -> dict[FuncKey, set[FuncKey]]:
+    """Build a reverse call graph: callee → set of callers.
+
+    Each key is ``(file, function)`` and maps to the set of
+    ``(file, function)`` pairs that call it.  Same-file and cross-file
+    edges are included (cross-file via bare-name matching).
+    """
+    reverse: dict[FuncKey, set[FuncKey]] = defaultdict(set)
+    func_defined_in: dict[str, set[str]] = defaultdict(set)
+    for filepath, graph in call_graphs.items():
+        for call in graph.calls:
+            if call.caller and call.caller != "<module>":
+                func_defined_in[call.caller].add(filepath)
+
+    for filepath, graph in call_graphs.items():
+        for call in graph.calls:
+            caller = call.caller or "<module>"
+            caller_key: FuncKey = (filepath, caller)
+            if len(call.chain) == 1:
+                callee_name = call.chain[0]
+                reverse[(filepath, callee_name)].add(caller_key)
+                for other_file in func_defined_in.get(callee_name, ()):
+                    if other_file != filepath:
+                        reverse[(other_file, callee_name)].add(caller_key)
+            elif len(call.chain) == 2 and call.chain[0] in ("self", "this"):
+                reverse[(filepath, call.chain[1])].add(caller_key)
+    return dict(reverse)

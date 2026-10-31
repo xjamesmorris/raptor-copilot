@@ -288,6 +288,30 @@ def test_with_header_dominates_body():
     assert tree.dominates(with_node, body_node)
 
 
+def test_with_context_expression_payload_on_header():
+    """Statement-position expression closure pin: the context-manager
+    expression evaluates before the body, and its payload (calls, a
+    walrus rebind) belongs to the header node — a dropped subtree here
+    would be the Java-synchronized-lock class (an invisible definer
+    the value gate's exclusivity proof never sees)."""
+    src = (
+        "def f(x):\n"
+        "    y = clean(x)\n"
+        "    with open(y := x) as fh:\n"
+        "        sink(y)\n"
+    )
+    cfg = _cfg(src)
+    header = next(
+        n for n in cfg.nodes()
+        if n.kind == "stmt" and n.label.startswith("With")
+    )
+    assert "open" in header.calls
+    assert "y" in header.defs, (
+        "walrus in the context expression must surface as a def"
+    )
+    assert "fh" in header.defs
+
+
 # ---------------------------------------------------------------------------
 # Call extraction
 # ---------------------------------------------------------------------------
@@ -357,6 +381,187 @@ def test_return_terminates_flow():
         assert n not in tree.nodes() or not tree.dominates(
             cfg.entry_node, n,
         ) or tree.idom(n) == cfg.entry_node
+
+
+# ---------------------------------------------------------------------------
+# Condition labels
+# ---------------------------------------------------------------------------
+
+
+def test_if_label_embeds_condition_text():
+    """cfg_conditions parses the paren content of If/While/For labels
+    as the guard expression — a positional-only label would hand it
+    'line N' as the condition."""
+    cfg = _cfg("def f(x):\n    if x > 0:\n        return x\n    return -x\n")
+    if_node = next(n for n in cfg.nodes() if n.label.startswith("If"))
+    assert if_node.label == "If (x > 0)"
+
+
+def test_while_label_embeds_condition_text():
+    cfg = _cfg("def f(x):\n    while x.ok():\n        step(x)\n    return x\n")
+    node = next(n for n in cfg.nodes() if n.label.startswith("While ("))
+    assert node.label == "While (x.ok())"
+
+
+def test_for_label_embeds_target_and_iter():
+    cfg = _cfg("def f(xs):\n    for x in xs:\n        use(x)\n    return 0\n")
+    node = next(
+        n for n in cfg.nodes()
+        if n.label.startswith("For (") and "exit" not in n.label
+    )
+    assert node.label == "For (x in xs)"
+
+
+def test_long_condition_label_truncated():
+    cond = " or ".join(f"flag_{i}" for i in range(40))
+    cfg = _cfg(f"def f():\n    if {cond}:\n        return 1\n    return 0\n")
+    node = next(n for n in cfg.nodes() if n.label.startswith("If ("))
+    from core.analysis.cfg_builder import _LABEL_EXPR_MAX
+    assert len(node.label) <= len("If ()") + _LABEL_EXPR_MAX
+
+
+# ---------------------------------------------------------------------------
+# match statements
+# ---------------------------------------------------------------------------
+
+
+def test_match_without_wildcard_has_fallthrough_edge():
+    """A ``match`` with only refutable cases can match NOTHING — the
+    subject must flow directly to the post-match statement, or a
+    sanitizer inside a case body looks like it dominates the sink."""
+    src = (
+        "def f(x):\n"
+        "    match x:\n"
+        "        case 'a':\n"
+        "            y = clean(x)\n"
+        "    sink(x)\n"
+    )
+    cfg = _cfg(src)
+    subject = next(n for n in cfg.nodes() if n.label.startswith("match"))
+    sink = next(n for n in cfg.nodes() if "sink" in n.calls)
+    assert sink in cfg.successors(subject)
+
+
+def test_match_with_wildcard_has_no_fallthrough_edge():
+    """``case _:`` always matches — the subject's only successors are
+    the case bodies, mirroring if/else."""
+    src = (
+        "def f(x):\n"
+        "    match x:\n"
+        "        case 'a':\n"
+        "            y = clean(x)\n"
+        "        case _:\n"
+        "            y = clean(x)\n"
+        "    sink(x)\n"
+    )
+    cfg = _cfg(src)
+    subject = next(n for n in cfg.nodes() if n.label.startswith("match"))
+    sink = next(n for n in cfg.nodes() if "sink" in n.calls)
+    assert sink not in cfg.successors(subject)
+    assert len(list(cfg.successors(subject))) == 2
+
+
+def test_match_guarded_wildcard_still_falls_through():
+    """``case _ if cond:`` can fail its guard — irrefutability requires
+    the pattern to be guard-free."""
+    src = (
+        "def f(x):\n"
+        "    match x:\n"
+        "        case _ if x > 0:\n"
+        "            y = clean(x)\n"
+        "    sink(x)\n"
+    )
+    cfg = _cfg(src)
+    subject = next(n for n in cfg.nodes() if n.label.startswith("match"))
+    sink = next(n for n in cfg.nodes() if "sink" in n.calls)
+    assert sink in cfg.successors(subject)
+
+
+def test_match_case_capture_binds_as_def():
+    """Pattern captures are identifier STRINGS (MatchAs.name /
+    MatchStar.name / MatchMapping.rest) — invisible to any Name walk.
+    Each case must carry them as defs, or a capture rebind of a
+    sanitized name never reaches reaching-defs and the value-bound
+    gate's exclusivity holds falsely (false-suppression direction)."""
+    src = (
+        "def f(x):\n"
+        "    y = clean(x)\n"
+        "    match x:\n"
+        "        case [*y]:\n"
+        "            pass\n"
+        "    sink(y)\n"
+    )
+    cfg = _cfg(src)
+    case_nodes = [n for n in cfg.nodes() if n.label.startswith("case")]
+    assert case_nodes and "y" in case_nodes[0].defs
+
+
+def test_match_mapping_rest_and_as_capture_bind_as_defs():
+    src = (
+        "def f(x):\n"
+        "    match x:\n"
+        "        case {'k': v, **rest}:\n"
+        "            pass\n"
+        "        case [1, 2] as whole:\n"
+        "            pass\n"
+        "    sink(x)\n"
+    )
+    cfg = _cfg(src)
+    defs = set()
+    for n in cfg.nodes():
+        if n.label.startswith("case"):
+            defs |= n.defs
+    assert {"v", "rest", "whole"} <= defs
+
+
+def test_match_case_guard_reads_and_calls_surface():
+    src = (
+        "def f(x):\n"
+        "    match x:\n"
+        "        case p if check(p, x):\n"
+        "            pass\n"
+        "    sink(x)\n"
+    )
+    cfg = _cfg(src)
+    case_node = next(n for n in cfg.nodes() if n.label.startswith("case"))
+    assert "check" in case_node.calls
+    assert {"p", "x"} <= case_node.uses
+    assert all(not cs.assigned_names for cs in case_node.call_sites)
+
+
+def test_match_case_body_flows_through_case_node():
+    """The case body's predecessors go subject -> case node -> body,
+    so the capture def sits on every path into the body."""
+    src = (
+        "def f(x):\n"
+        "    match x:\n"
+        "        case 'a':\n"
+        "            y = clean(x)\n"
+        "    sink(x)\n"
+    )
+    cfg = _cfg(src)
+    subject = next(n for n in cfg.nodes() if n.label.startswith("match"))
+    case_node = next(n for n in cfg.nodes() if n.label.startswith("case"))
+    body = next(n for n in cfg.nodes() if "clean" in n.calls)
+    assert case_node in cfg.successors(subject)
+    assert body in cfg.successors(case_node)
+
+
+def test_match_bare_capture_counts_as_irrefutable():
+    """``case other:`` (a bare capture) always matches, like ``case _``."""
+    src = (
+        "def f(x):\n"
+        "    match x:\n"
+        "        case 'a':\n"
+        "            y = clean(x)\n"
+        "        case other:\n"
+        "            y = clean(other)\n"
+        "    sink(x)\n"
+    )
+    cfg = _cfg(src)
+    subject = next(n for n in cfg.nodes() if n.label.startswith("match"))
+    sink = next(n for n in cfg.nodes() if "sink" in n.calls)
+    assert sink not in cfg.successors(subject)
 
 
 # ---------------------------------------------------------------------------
@@ -450,3 +655,262 @@ def test_callgraph_dominators_work(tmp_path):
         assert tree.dominates(by_name["main"], by_name[name])
     # f does NOT dominate sink (because main has a direct edge to sink)
     assert not tree.dominates(by_name["f"], by_name["sink"])
+
+
+class TestCompoundStatementsNotFlattened:
+    """AsyncFor / AsyncWith / TryStar and nested def/class must not
+    collapse into one straight-line node — the flattened union puts a
+    sanitizer from a conditionally-executed (or never-called) body on
+    a node that sits unconditionally on the path, and leaks nested
+    locals into defs."""
+
+    def test_tryStar_handler_is_a_separate_node(self):
+        src = (
+            "def f(x):\n"
+            "    try:\n"
+            "        y = html.escape(x)\n"
+            "    except* ValueError:\n"
+            "        y = x\n"
+            "    sink(y)\n"
+        )
+        cfg = _cfg(src)
+        sanitizer = next(n for n in cfg.nodes() if "html.escape" in n.calls)
+        handler = next(
+            n for n in cfg.nodes()
+            if n.lineno == 5 and "y" in n.defs and not n.calls
+        )
+        assert sanitizer is not handler
+
+    def test_async_for_body_does_not_dominate(self):
+        src = (
+            "async def f(xs, x):\n"
+            "    y = x\n"
+            "    async for i in xs:\n"
+            "        y = html.escape(x)\n"
+            "    sink(y)\n"
+        )
+        cfg = _cfg(src)
+        header = next(n for n in cfg.nodes() if n.lineno == 3
+                      and "html.escape" not in n.calls)
+        # Zero-iteration path exists: the body node is NOT the only
+        # route from header to the sink.
+        sanitizer = next(n for n in cfg.nodes() if "html.escape" in n.calls)
+        assert sanitizer is not header
+
+    def test_async_with_body_is_separate(self):
+        src = (
+            "async def f(x):\n"
+            "    async with open_conn() as c:\n"
+            "        y = html.escape(x)\n"
+            "    sink(x)\n"
+        )
+        cfg = _cfg(src)
+        header = next(n for n in cfg.nodes() if n.lineno == 2)
+        assert "html.escape" not in header.calls
+        assert "open_conn" in header.calls
+        assert "c" in header.defs
+
+    def test_nested_def_body_not_attributed_to_enclosing_node(self):
+        src = (
+            "def f(x):\n"
+            "    def g(a=setup(x)):\n"
+            "        local = html.escape(a)\n"
+            "        return local\n"
+            "    sink(x)\n"
+        )
+        cfg = _cfg(src)
+        def_node = next(n for n in cfg.nodes() if n.lineno == 2)
+        # Definition-site expressions (decorators, defaults) stay;
+        # the body's calls and locals must not leak.
+        assert "setup" in def_node.calls
+        assert "html.escape" not in def_node.calls
+        assert "local" not in def_node.defs
+
+    def test_class_body_not_attributed_to_enclosing_node(self):
+        src = (
+            "def f(x):\n"
+            "    class C(Base, metaclass=meta(x)):\n"
+            "        attr = html.escape(x)\n"
+            "    sink(x)\n"
+        )
+        cfg = _cfg(src)
+        cls_node = next(n for n in cfg.nodes() if n.lineno == 2)
+        assert "meta" in cls_node.calls
+        assert "html.escape" not in cls_node.calls
+        assert "attr" not in cls_node.defs
+
+
+class TestDeferredExecutionBodies:
+    """Lambda bodies and genexp payloads run later (or never) — their
+    calls must not be attributed to the statement node, or a
+    never-executed sanitizer sits unconditionally on the path (the
+    nested-def hazard, same class). Eagerly-evaluated parts (lambda
+    defaults, a genexp's first iterable, full list/set/dict
+    comprehensions) keep contributing."""
+
+    def _stmt_calls(self, src, marker):
+        cfg = build_python_cfg(src, "handle")
+        assert cfg is not None
+        node = next(n for n in cfg.nodes() if marker in n.defs)
+        return node.calls, node.call_sites
+
+    def test_lambda_body_call_not_attributed(self):
+        src = (
+            "def handle(x):\n"
+            "    f = lambda v: html.escape(v)\n"
+            "    render(f)\n"
+        )
+        calls, sites = self._stmt_calls(src, "f")
+        assert "html.escape" not in calls
+        assert all(cs.name != "html.escape" for cs in sites)
+
+    def test_genexp_payload_call_not_attributed(self):
+        src = (
+            "def handle(xs):\n"
+            "    out = (html.escape(v) for v in xs)\n"
+            "    render(out)\n"
+        )
+        calls, _ = self._stmt_calls(src, "out")
+        assert "html.escape" not in calls
+
+    def test_genexp_first_iterable_still_eager(self):
+        src = (
+            "def handle(xs):\n"
+            "    out = (v for v in load(xs))\n"
+            "    render(out)\n"
+        )
+        calls, _ = self._stmt_calls(src, "out")
+        assert "load" in calls
+
+    def test_lambda_default_still_eager(self):
+        src = (
+            "def handle(x):\n"
+            "    f = lambda v=seed(x): v\n"
+            "    render(f)\n"
+        )
+        calls, _ = self._stmt_calls(src, "f")
+        assert "seed" in calls
+
+    def test_listcomp_stays_eager(self):
+        src = (
+            "def handle(xs):\n"
+            "    out = [html.escape(v) for v in xs]\n"
+            "    render(out)\n"
+        )
+        calls, _ = self._stmt_calls(src, "out")
+        assert "html.escape" in calls
+
+    def test_lambda_sanitizer_cannot_carry_control_flow_cut(self):
+        # Legacy no-value-context path: the vertex cut suppresses from
+        # ``calls`` alone, so a lambda-wrapped sanitizer must not
+        # register as a sanitizer node at all.
+        from core.analysis.sanitizer_cut import evaluate_finding
+        src = (
+            "def handle(x):\n"
+            "    f = lambda v: html.escape(v)\n"
+            "    render(x)\n"
+        )
+        cfg = build_python_cfg(src, "handle")
+        sink = next(n for n in cfg.nodes() if "render" in n.calls)
+        result = evaluate_finding(
+            cfg, [cfg.entry_node], sink, cwe="CWE-79", language="python",
+        )
+        assert not result.suppress
+
+
+class TestLoopJoinSentinels:
+    """Loop-exit joins are payload-free sentinels: re-extracting the
+    header's payload duplicated its defs/calls on a second node at
+    the same line (a walrus in the condition became a duplicate
+    definer; a sanitizer call in the condition appeared twice)."""
+
+    def test_while_join_carries_no_payload(self):
+        src = (
+            "def handle(x):\n"
+            "    while (y := f(x)):\n"
+            "        g(y)\n"
+            "    render(y)\n"
+        )
+        cfg = build_python_cfg(src, "handle")
+        definers = [n for n in cfg.nodes() if "y" in n.defs]
+        assert len(definers) == 1
+        join = next(n for n in cfg.nodes() if n.kind == "join")
+        assert not join.defs and not join.calls and not join.call_sites
+
+    def test_for_join_carries_no_payload(self):
+        src = (
+            "def handle(xs):\n"
+            "    for v in load(xs):\n"
+            "        g(v)\n"
+            "    render(xs)\n"
+        )
+        cfg = build_python_cfg(src, "handle")
+        joins = [n for n in cfg.nodes() if n.kind == "join"]
+        assert joins and all(
+            not j.defs and not j.calls and not j.uses for j in joins
+        )
+        # The header still carries the loop's payload.
+        header = next(n for n in cfg.nodes() if "load" in n.calls)
+        assert "v" in header.defs
+
+
+class TestExceptHandlerBinding:
+    """``except E as name`` binds ``name`` via an identifier STRING —
+    invisible to every Store-ctx walk. The handler entry node must
+    carry it as a def (mirroring the Java catch entry and the
+    match-case capture nodes), or a handler rebind of a sanitized
+    name is invisible to reaching-defs."""
+
+    def test_handler_name_is_a_def(self):
+        src = (
+            "def handle(x):\n"
+            "    try:\n"
+            "        op(x)\n"
+            "    except ValueError as err:\n"
+            "        log(err)\n"
+        )
+        cfg = build_python_cfg(src, "handle")
+        assert any("err" in n.defs for n in cfg.nodes())
+
+    def test_handler_rebind_breaks_exclusivity(self):
+        from core.analysis.sanitizer_cut import evaluate_finding
+        src = (
+            "def handle(x):\n"
+            "    y = html.escape(x)\n"
+            "    try:\n"
+            "        op(x)\n"
+            "    except ValueError as y:\n"
+            "        pass\n"
+            "    render(y)\n"
+        )
+        cfg = build_python_cfg(src, "handle")
+        sink = next(n for n in cfg.nodes() if "render" in n.calls)
+        result = evaluate_finding(
+            cfg, [cfg.entry_node], sink,
+            cwe="CWE-79", language="python",
+            source_symbols=["x"], sink_arg="y",
+        )
+        assert not result.suppress
+
+    def test_bare_except_adds_no_defs(self):
+        src = (
+            "def handle(x):\n"
+            "    try:\n"
+            "        op(x)\n"
+            "    except Exception:\n"
+            "        log(x)\n"
+        )
+        cfg = build_python_cfg(src, "handle")
+        entries = [n for n in cfg.nodes() if n.label.startswith("except")]
+        assert entries and all(not n.defs for n in entries)
+
+
+class TestHostileBytesPathRead:
+    def test_non_utf8_path_read_refuses(self, tmp_path):
+        # Direct-Path API over hostile bytes: refuse (None), never
+        # raise UnicodeDecodeError out of the builder.
+        from pathlib import Path as _P
+        from core.analysis.cfg_builder import build_python_cfg
+        f = tmp_path / "bad.py"
+        f.write_bytes(b"def f():\n    s = '\xff\xfe\x9d'\n")
+        assert build_python_cfg(_P(f), "f") is None

@@ -38,6 +38,37 @@ class TestAggregateStrategyStats:
         assert stats["memory"]["wins"] == 1
         assert stats["memory"]["misses"] == 0
 
+    def test_reads_full_shard_set(self, tmp_path):
+        # A rolled trail's later review rows live in numbered
+        # siblings; weights computed from shard 1 alone would freeze
+        # at the roll point.
+        _write_audit_log(tmp_path / "run1", [
+            {"action": "orchestrator_review", "status": "finding",
+             "strategies": ["memory"]},
+        ])
+        with open(tmp_path / "run1" / ".audit-log.002.jsonl", "w") as f:
+            f.write(json.dumps(
+                {"action": "orchestrator_review", "status": "clean",
+                 "strategies": ["memory"]}) + "\n")
+        stats = aggregate_strategy_stats([tmp_path / "run1"])
+        assert stats["memory"]["wins"] == 1
+        assert stats["memory"]["misses"] == 1
+        assert stats["memory"]["total"] == 2
+
+    def test_non_contiguous_shard_not_read(self, tmp_path):
+        # Contiguity-by-construction: a planted high-numbered file
+        # does not extend the set.
+        _write_audit_log(tmp_path / "run1", [
+            {"action": "orchestrator_review", "status": "finding",
+             "strategies": ["memory"]},
+        ])
+        with open(tmp_path / "run1" / ".audit-log.005.jsonl", "w") as f:
+            f.write(json.dumps(
+                {"action": "orchestrator_review", "status": "clean",
+                 "strategies": ["memory"]}) + "\n")
+        stats = aggregate_strategy_stats([tmp_path / "run1"])
+        assert stats["memory"]["total"] == 1
+
     def test_ignores_non_review_entries(self, tmp_path):
         _write_audit_log(tmp_path / "run1", [
             {"action": "feedback", "status": "finding",
@@ -77,14 +108,32 @@ class TestAggregateStrategyStats:
         assert stats == {}
 
     def test_error_status_excluded(self, tmp_path):
+        # Errors are excluded from the denominator AND from
+        # min_samples: an error-only strategy contributes no stats
+        # entry at all (a flaky tool run must not read as "always
+        # missed").
         _write_audit_log(tmp_path / "run1", [
             {"action": "orchestrator_review", "status": "error",
              "strategies": ["general"]},
         ])
         stats = aggregate_strategy_stats([tmp_path / "run1"])
-        assert stats["general"]["total"] == 1
-        assert stats["general"]["wins"] == 0
-        assert stats["general"]["misses"] == 0
+        assert "general" not in stats
+
+    def test_errors_do_not_dilute_win_rate(self, tmp_path):
+        # 5 wins + 5 errors must weigh like 5/5 decided wins, not
+        # like 5 wins out of 10 attempts.
+        _write_audit_log(tmp_path / "run1", [
+            {"action": "orchestrator_review", "status": "finding",
+             "strategies": ["general"]},
+        ] * 5 + [
+            {"action": "orchestrator_review", "status": "error",
+             "strategies": ["general"]},
+        ] * 5)
+        stats = aggregate_strategy_stats([tmp_path / "run1"])
+        assert stats["general"]["total"] == 5
+        assert stats["general"]["wins"] == 5
+        weights = compute_strategy_weights(stats, min_samples=5)
+        assert weights["general"] > 1.5
 
 
 class TestComputeStrategyWeights:

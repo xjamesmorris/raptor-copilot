@@ -8,17 +8,29 @@ the cross-language resolver against OSV symbol data.
 ## Verdict transitions
 
   * Any affected symbol CALLED -> ``likely_called``
-  * All affected symbols NOT_CALLED, none UNCERTAIN ->
-    ``not_function_reachable``
-  * Any UNCERTAIN OR mixed -> preserve existing verdict
+  * EVERY advisory-listed symbol evaluated and NOT_CALLED, none
+    UNCERTAIN -> ``not_function_reachable``
+  * Any UNCERTAIN, mixed, or unevaluable entry -> preserve existing
+    verdict
 
 ## Qualified-name shape
 
 NuGet OSV records ship symbols as fully-qualified .NET method
 paths (``System.Text.Json.JsonSerializer.Deserialize``). The C#
 extractor binds ``using System.Text;`` -> ``imports["Text"] =
-"System.Text"``; chains like ``["JsonSerializer", "Deserialize"]``
-resolve via the import map.
+"System.Text"``; a fully-qualified call chain resolves via the
+import map.
+
+The DOMINANT C# shape, however, is a bare namespace ``using``
+(``using Newtonsoft.Json;`` + ``JsonConvert.DeserializeObject(s)``)
+— C# brings every type of the namespace into scope WITHOUT binding
+the class name, so the chain head (``JsonConvert``) is unbound and
+the import-map resolver reads the call as NOT_CALLED. That is
+resolver blindness, not evidence of absence: when a non-test file
+binds the symbol's namespace and carries a class-shaped call chain
+matching the affected symbol, this tier treats the symbol as
+UNCERTAIN and preserves the prior verdict rather than minting a
+high-confidence ``not_function_reachable`` on called code.
 
 Limitation: instance-method calls and complex expression chains
 (``Activator.CreateInstance(t).GetType().GetMethod(...)``) are
@@ -32,6 +44,7 @@ import logging
 from typing import Any, TYPE_CHECKING
 
 from ..models import Confidence, Dependency, Reachability
+from ._shared import extract_qualified_symbols as _extract_qualified
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -55,30 +68,35 @@ def build_nuget_symbol_map(
         dep_name = dep_key.split(":", 1)[1].split("@", 1)[0]
         qualified: list[str] = []
         for adv in r.advisories:
-            qualified.extend(_extract_qualified(adv, dep_name))
+            # The dash collapse (``My-Pkg`` → ``MyPkg`` / ``My.Pkg``)
+            # is a naming CONVENTION, not a language rule — so the
+            # fold is declared non-exact: folded readings are
+            # upgrade-only twins riding alongside the retained
+            # unresolved marker, and a wrong namespace guess can
+            # never pair its way into the high-confidence downgrade.
+            qualified.extend(_extract_qualified(
+                adv, dep_name, dep_is_namespace_head=True,
+                head_fold=_package_id_fold, fold_is_exact=False,
+            ))
         if qualified:
             out.setdefault(dep_key, []).extend(qualified)
     return {k: list(dict.fromkeys(v)) for k, v in out.items()}
 
 
-def _extract_qualified(advisory: Any, dep_name: str) -> list[str]:
-    out: list[str] = []
-    es = getattr(advisory, "ecosystem_specific", None) or {}
-    ds = getattr(advisory, "database_specific", None) or {}
-    for source in (es, ds):
-        if not isinstance(source, dict):
-            continue
-        for imp in source.get("imports") or []:
-            if not isinstance(imp, dict):
-                continue
-            path = imp.get("path") or dep_name
-            symbols = imp.get("symbols") or []
-            out.extend(f"{path}.{s}" for s in symbols if isinstance(s, str) and s and isinstance(path, str))
-        for key in ("affected_symbols", "affected_functions"):
-            v = source.get(key)
-            if isinstance(v, list) and dep_name:
-                out.extend(f"{dep_name}.{s}" for s in v if isinstance(s, str) and s)
-    return out
+def _package_id_fold(head: str) -> list[str]:
+    """Conventional root-namespace spellings of a dashed package id:
+    dash removed (``My-Pkg`` → ``MyPkg``) and dash-as-dot
+    (``My.Pkg``)."""
+    if "-" not in head:
+        return []
+    return [head.replace("-", ""), head.replace("-", ".")]
+
+
+# NuGet package ids commonly ARE the root namespace
+# ("Newtonsoft.Json"), so the shared extractor runs with
+# dep_is_namespace_head=True; the byte-similar local copy it replaces
+# double-prefixed already-qualified symbols and never normalised
+# separators.
 
 
 def refine_nuget_verdicts(
@@ -89,12 +107,16 @@ def refine_nuget_verdicts(
     nuget_symbol_map: dict[str, list[str]],
     inventory: dict[str, Any] | None = None,
 ) -> None:
+    # The any-dot check skips deps whose advisory entries are ALL
+    # unresolved markers — nothing queryable, so the tier could
+    # neither upgrade nor honestly downgrade; don't pay for an
+    # inventory build to abstain.
     candidates = [
         d for d in deps
         if d.ecosystem == "NuGet"
         and out.get(d.key()) is not None
         and out[d.key()].verdict == "imported"
-        and nuget_symbol_map.get(d.key())
+        and any("." in q for q in nuget_symbol_map.get(d.key()) or [])
     ]
     if not candidates:
         return
@@ -128,6 +150,12 @@ def refine_nuget_verdicts(
         if not paired:
             continue
         verdicts = {r.verdict for _, r in paired}
+        covered = len(paired) == len(qualified_names)
+        bare_using_masked = any(
+            r.verdict == Verdict.NOT_CALLED
+            and _bare_using_masks(inventory, qn)
+            for qn, r in paired
+        )
         if Verdict.CALLED in verdicts:
             evidence: list[str] = []
             called: list[str] = []
@@ -145,7 +173,17 @@ def refine_nuget_verdicts(
                 ),
                 affected_summary=affected,
             )
-        elif Verdict.UNCERTAIN in verdicts:
+        elif Verdict.UNCERTAIN in verdicts or bare_using_masked \
+                or not covered:
+            # UNCERTAIN → preserve, per the tier's honesty rule.
+            # bare_using_masked is the same epistemic state: the
+            # resolver returned NOT_CALLED only because a bare
+            # namespace ``using`` leaves the class name unbound —
+            # the matching call chain is right there in the file.
+            # ``not covered`` too: some advisory entry never paired
+            # (an UNRESOLVED_ENTRY marker or a resolver refusal), so
+            # "all listed symbols unreached" would overstate the
+            # evidence.
             continue
         else:
             out[d.key()] = Reachability(
@@ -160,6 +198,46 @@ def refine_nuget_verdicts(
                 ),
                 evidence=[],
             )
+
+
+def _bare_using_masks(
+    inventory: dict[str, Any], qualified_name: str,
+) -> bool:
+    """True when a non-test file both binds ``qualified_name``'s
+    namespace via a bare ``using`` AND carries a class-shaped call
+    chain matching the affected symbol (head == class, tail ==
+    method). In that shape the import-map resolver CANNOT resolve
+    the call — ``using Newtonsoft.Json;`` brings ``JsonConvert``
+    into scope without binding it — so its NOT_CALLED answer is
+    blindness, not evidence. Both conditions are required: a bound
+    namespace alone (symbol's class never mentioned) leaves
+    NOT_CALLED well-supported and the downgrade correct."""
+    from core.analysis.reachability import _is_test_file
+
+    parts = qualified_name.split(".")
+    if len(parts) < 3:
+        # Need namespace + class + method to describe the shape.
+        return False
+    func = parts[-1]
+    klass = parts[-2]
+    namespace = ".".join(parts[:-2])
+    for file_record in inventory.get("files") or []:
+        if not isinstance(file_record, dict):
+            continue
+        if _is_test_file(file_record.get("path") or ""):
+            continue
+        cg = file_record.get("call_graph")
+        if not cg:
+            continue
+        imports = cg.get("imports") or {}
+        if namespace not in imports.values():
+            continue
+        for call in cg.get("calls") or []:
+            chain = call.get("chain") or []
+            if len(chain) >= 2 and chain[0] == klass \
+                    and chain[-1] == func:
+                return True
+    return False
 
 
 __all__ = ["build_nuget_symbol_map", "refine_nuget_verdicts"]

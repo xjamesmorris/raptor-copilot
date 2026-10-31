@@ -220,8 +220,8 @@ def derive_allowlist(config: LLMConfig) -> set[str]:
         # bypasses api_base entirely.
         url = (
             getattr(model, "api_base", None)
-            or PROVIDER_ENDPOINTS.get(getattr(model, "provider", None))
-            or _KNOWN_DEFAULTS.get(getattr(model, "provider", None))
+            or PROVIDER_ENDPOINTS.get(getattr(model, "provider", None) or "")
+            or _KNOWN_DEFAULTS.get(getattr(model, "provider", None) or "")
         )
         if not url:
             continue
@@ -336,6 +336,21 @@ def url_is_loopback(url: str) -> bool:
     except ValueError:
         return False
     return _is_loopback(host)
+
+
+def is_local_inference(provider: str, api_base: str | None = None) -> bool:
+    """True when (provider, api_base) points at a local inference server.
+
+    Covers ollama (always local — even a remote GPU box via OLLAMA_HOST
+    shares a single server) and any provider whose api_base resolves to a
+    loopback address (vLLM, LM Studio, llama.cpp — typically provider
+    ``openai`` with a custom api_base).
+    """
+    if (provider or "").lower() == "ollama":
+        return True
+    if api_base:
+        return url_is_loopback(api_base)
+    return False
 
 
 def loopback_safe_get(url: str, timeout: float):

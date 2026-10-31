@@ -26,6 +26,11 @@ import logging
 import os
 from pathlib import Path
 
+from core.security.log_sanitisation import (
+    escape_nonprintable,
+    sanitise_for_terminal,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -151,25 +156,71 @@ def _filter_locally_built(
     (fail-safe: the parent repo pinned that content). ``LC_ALL=C`` is
     pinned regardless — classification must never depend on
     translated output.
+
+    The invocation runs under ``core.sandbox`` (network deny, target
+    read view, scratch output) with the strict read-only git argv
+    posture: git on a hostile clone can execute repo-controlled code
+    via hooks / fsmonitor / per-repo config, so it never runs bare
+    against the scanned tree. Sandbox unavailable or refusing maps to
+    the same conservative ``([], candidates)`` split as not-a-repo.
     """
     if not candidates:
         return [], []
+    import shutil
     import subprocess
     try:
-        from core.config import RaptorConfig
-        from core.git import safe_git_command
-        from core.sandbox.preexec import set_pdeathsig
-        env = dict(RaptorConfig.get_safe_env())
-        env["LC_ALL"] = "C"
+        git = shutil.which("git")
+        if not git:
+            return [], candidates
         try:
-            proc = subprocess.run(
-                safe_git_command("-C", str(repo), "ls-files",
-                                 "-z", "--stage"),
-                capture_output=True, check=False,
-                timeout=30, env=env,
-                preexec_fn=set_pdeathsig(),
-            )
+            from core.sandbox.context import run as sandbox_run
+            from core.sandbox.errors import SandboxSetupError
+        except ImportError:
+            # git parses hostile repo state (per-repo config, index,
+            # fsmonitor hooks) — never run it on an untrusted repo
+            # without isolation; provenance stays unverifiable and
+            # the conservative split fires.
+            return [], candidates
+        from core.git import get_safe_git_env
+        from core.git.clone import safe_git_readonly_command
+        from core.run.scratch import scratch_dir
+        env = dict(get_safe_git_env())
+        env["LC_ALL"] = "C"
+        # Shared strict read-only git posture (hooks / fsmonitor /
+        # pager / transport neutralised); argv[0] swapped for the
+        # resolved absolute git path — the sandbox's env scrub drops
+        # home-rooted PATH entries, so a bare "git" may not resolve
+        # inside it.
+        cmd = safe_git_readonly_command(
+            "-C", str(repo), "ls-files", "-z", "--stage")
+        cmd[0] = git
+        try:
+            with scratch_dir("binoracle_prov_") as workdir:
+                proc = sandbox_run(
+                    cmd,
+                    block_network=True,
+                    target=str(repo),
+                    output=str(workdir),
+                    cwd=str(workdir),
+                    # env is the sanitised git allowlist env already —
+                    # assert that to the sandbox instead of drawing
+                    # the custom-env warning.
+                    env=env,
+                    env_caller_filtered=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=30,
+                    caller_label="binary-oracle-provenance",
+                )
         except subprocess.TimeoutExpired:
+            return [], candidates
+        except SandboxSetupError:
+            # Host posture refusal (BaseException by design). For
+            # this consumer the conservative split IS the fail-closed
+            # direction — every candidate is dropped from suppression
+            # authority, same as the not-a-repo arm — so the refusal
+            # maps there instead of aborting the run for an
+            # enrichment-tier feature.
             return [], candidates
         if proc.returncode != 0:
             # Not a git repo, or git errored — provenance
@@ -196,6 +247,17 @@ def _filter_locally_built(
             try:
                 rel = c.resolve().relative_to(repo.resolve()).as_posix()
             except ValueError:
+                # Resolves outside the repo (symlinked build dir, moved
+                # tree): dropped from BOTH lists — conservative, but say
+                # so like the repo-committed drop does, or the operator
+                # sees a binary vanish with no trace.
+                # Candidate names come from walking the scanned repo
+                # — attacker-chosen bytes; escape before logging.
+                logger.warning(
+                    "binary-oracle: %s resolves outside the repo — "
+                    "excluded from auto-detect (pass --binary to use it)",
+                    escape_nonprintable(str(c)),
+                )
                 continue
             committed = rel in tracked or any(
                 rel == sm or rel.startswith(sm + "/")
@@ -238,7 +300,9 @@ def _autodetect_binaries(
                 "Pass --binary <path> to use them anyway when you know "
                 "they were built fresh.",
                 len(dropped),
-                ", ".join(str(p) for p in dropped[:3])
+                ", ".join(
+                    escape_nonprintable(str(p)) for p in dropped[:3]
+                )
                 + ("..." if len(dropped) > 3 else ""),
             )
         return kept
@@ -251,7 +315,7 @@ def _autodetect_binaries(
     # filter — operator asserts trust). The post-filter below is a
     # belt-and-braces re-check of the (≤ cap) returned paths.
     detected = detect_binaries(
-        repo, target_kind, path_filter=_drop_repo_committed)
+        repo, target_kind, path_filter=_drop_repo_committed)  # type: ignore[arg-type]
     locally_built = _drop_repo_committed(detected)
     if locally_built:
         print(
@@ -259,7 +323,9 @@ def _autodetect_binaries(
             f"locally-built binary(s):"
         )
         for b in locally_built:
-            print(f"  {b}")
+            # Build-tree file paths are target-derived — a crafted
+            # filename can carry terminal escapes; sanitise.
+            print(f"  {sanitise_for_terminal(str(b))}")
         if len(locally_built) >= DEFAULT_MAX_RESULTS:
             logger.warning(
                 "binary-oracle: auto-detect result cap (%d) reached — "
@@ -287,12 +353,35 @@ def _autodetect_binaries(
 def _project_binaries(
     repo: Path | None = None,
     run_dir: Path | None = None,
+    no_suppress_out: list | None = None,
+    identity_out: dict[str, tuple[int, int, int, str] | None] | None = None,
 ) -> tuple[list[Path], str | None]:
     """Layer in any binaries persisted on the governing project (the
     run pin's project in-run, the ambient layers otherwise). Returns
     ``(paths, project_name)``. Best-effort — a missing project /
     schema mismatch returns ``([], None)`` rather than crashing the
     run.
+
+    CONTENT-WITNESS GATE (fd-honest): ``/project binary add`` pins
+    sha256 of the bytes the operator pointed at; the store is the one
+    surface where run-writable content is promoted to durable
+    suppression authority (the env-build persist hint names a path
+    inside the run dir's write grant). Each witnessed entry is
+    re-verified here on ONE open file description — O_NOFOLLOW open
+    (``core.source.open_regular``), fstat, hash that fd — never a
+    by-name re-hash that races a swap between check and use. On
+    success ``identity_out`` receives the fd's stat identity
+    ``(st_dev, st_ino, st_size, sha256)`` so the enrichment can
+    re-verify the SAME identity around its own classify pass. On
+    witness mismatch or fd-honest open failure over an occupied slot
+    the entry DEMOTES rather than refuses (loud warning + re-add
+    hint): it still loads for hint-tier enrichment (promotions keep
+    findings alive) but ``identity_out`` records ``None`` and the
+    enrichment strips its absent verdicts of suppression authority —
+    the trust travelled with the bytes, not the path. Entries with no
+    witness (pre-v6 stores) still load but join ``no_suppress_out``
+    (the env-build guessed-command channel): enrichment verdicts
+    count, ``absent`` never hard-suppresses off them.
 
     ONE-TARGET GATE: persisted binaries are an operator
     assertion about ONE target, exactly like trust markers — which got
@@ -325,18 +414,137 @@ def _project_binaries(
                 active, repo,
             )
             return [], active
-        return [Path(b).expanduser().resolve() for b in proj.binaries], active
+        witnesses = getattr(proj, "binary_witnesses", None) or {}
+        out: list[Path] = []
+        for b in proj.binaries:
+            # Open the UNRESOLVED store path: O_NOFOLLOW must judge
+            # the final component the store names — resolving first
+            # would walk THROUGH a planted symlink and verify
+            # whatever it points at instead of refusing it.
+            raw = Path(b).expanduser()
+            recorded = witnesses.get(b)
+            if recorded:
+                from core.hash import sha256_fileobj
+                from core.source import open_regular
+                fh = open_regular(raw, "rb")
+                if fh is None:
+                    if not os.path.lexists(raw):
+                        # Nothing at the slot: skip the entry (there
+                        # is nothing to classify; the run continues —
+                        # demote-not-refuse), but ACCOUNT for the
+                        # skip. Deleting a witnessed binary is a
+                        # no-race move that silently narrows the
+                        # "absent from EVERY declared binary"
+                        # quantifier — a function alive only in the
+                        # deleted binary would combine to ``absent``
+                        # over the survivors — so the missing path
+                        # rides the identity channel as a ``None``
+                        # pin and the enrichment strips the
+                        # survivors' suppression authority.
+                        p = raw.resolve()
+                        logger.warning(
+                            "binary-oracle: project binary %s is "
+                            "missing — skipped, and the declared "
+                            "witness set is narrowed: absent "
+                            "verdicts from the remaining binaries "
+                            "will not suppress for this run (re-add "
+                            "with /project binary add once rebuilt)",
+                            p)
+                        if identity_out is not None:
+                            identity_out[str(p)] = None
+                        continue
+                    # The slot is occupied but refused an fd-honest
+                    # open (symlink or special file at the stored
+                    # name): the witness cannot be verified against
+                    # any fd, so DEMOTE — load for hint-tier
+                    # enrichment only, no suppression authority.
+                    p = raw.resolve()
+                    logger.warning(
+                        "binary-oracle: project binary %s is not an "
+                        "fd-honestly openable regular file (symlink "
+                        "or special file at the stored name?) — its "
+                        "content witness cannot be verified, so it "
+                        "is DEMOTED to enrichment-only for this run "
+                        "(absent verdicts will not suppress). Re-add "
+                        "with /project binary add if you moved or "
+                        "rebuilt it.", p)
+                    if identity_out is not None:
+                        identity_out[str(p)] = None
+                    out.append(p)
+                    continue
+                try:
+                    with fh:
+                        st = os.fstat(fh.fileno())
+                        actual = sha256_fileobj(fh)  # type: ignore[arg-type]
+                except OSError:
+                    logger.warning(
+                        "binary-oracle: project binary %s could not "
+                        "be read for witness verification — DEMOTED "
+                        "to enrichment-only for this run (absent "
+                        "verdicts will not suppress)", raw)
+                    p = raw.resolve()
+                    if identity_out is not None:
+                        identity_out[str(p)] = None
+                    out.append(p)
+                    continue
+                p = raw.resolve()
+                if actual != recorded:
+                    logger.warning(
+                        "binary-oracle: project binary %s content "
+                        "changed since /project binary add pinned it "
+                        "(sha256 mismatch) — DEMOTED to enrichment-"
+                        "only for this run (absent verdicts will not "
+                        "suppress). If you rebuilt it, re-add to "
+                        "re-assert trust; if you did not, treat the "
+                        "file as tampered.", p)
+                    if identity_out is not None:
+                        identity_out[str(p)] = None
+                    out.append(p)
+                    continue
+                # Verified on this very fd: pin the fd's identity so
+                # the enrichment consumes the witness on the same
+                # terms (same dev/ino/size + content hash). Demotion
+                # is STICKY across duplicate store entries resolving
+                # to the same path: if an earlier alias already
+                # demoted (planted symlink at its slot, mismatch), a
+                # later verified entry must not restore the pin —
+                # last-writer-wins would let alias ordering launder
+                # the demotion away.
+                if identity_out is not None and identity_out.get(
+                        str(p), ()) is not None:
+                    identity_out[str(p)] = (
+                        st.st_dev, st.st_ino, st.st_size, recorded)
+                out.append(p)
+                continue
+            p = raw.resolve()
+            logger.warning(
+                "binary-oracle: project binary %s has no content "
+                "witness (pre-witness store entry) — loading as "
+                "enrichment-only; absent verdicts will not "
+                "suppress. Re-add with /project binary add to "
+                "pin it.", p)
+            if no_suppress_out is not None:
+                no_suppress_out.append(str(p))
+            out.append(p)
+        return out, active
     except Exception:  # noqa: BLE001
         return [], None
 
 
-def _env_build_debug_binaries(repo: Path) -> tuple[list[str], bool]:
+def _env_build_debug_binaries(
+    repo: Path, run_dir: Path | None = None,
+) -> tuple[list[str], bool]:
     """Build debug binaries on demand when NOTHING else resolved.
 
     Consent: the project ``build`` trust marker
     (``core.project.trust.resolve_build_execution`` — the same gate as
     /validate's Stage E build-on-demand; no per-run flag on this path).
-    The build command resolves operator-first
+    *run_dir* pins BOTH the consent resolution and the build-command
+    lookup to the run's project — privilege follows the run, so a
+    mid-run ``/project use`` switch can never steer whether this path
+    builds or WHAT it runs (the same thread-through the fuzzing and
+    validation lanes carry; this caller was the one left resolving
+    ambiently). The build command resolves operator-first
     (``core.build.resolve``); the build runs in the network-isolated
     container with debug info and ALL extracted ELF artifacts feed the
     oracle (it is multi-binary native: alive-in-any).
@@ -350,7 +558,8 @@ def _env_build_debug_binaries(repo: Path) -> tuple[list[str], bool]:
     """
     try:
         from core.project.trust import resolve_build_execution
-        if not resolve_build_execution(None, target_path=repo):
+        if not resolve_build_execution(None, target_path=repo,
+                                       run_dir=run_dir):
             print(
                 "binary-oracle: no binaries anywhere and env "
                 "build-on-demand is not authorised — set the project "
@@ -359,7 +568,7 @@ def _env_build_debug_binaries(repo: Path) -> tuple[list[str], bool]:
             )
             return [], False
         from core.build.resolve import resolve_build_command
-        resolved = resolve_build_command(repo)
+        resolved = resolve_build_command(repo, run_dir=run_dir)
         if resolved is None:
             print(
                 "binary-oracle: no binaries anywhere and no build "
@@ -367,23 +576,29 @@ def _env_build_debug_binaries(repo: Path) -> tuple[list[str], bool]:
                 "nothing detected) — oracle runs without a binary"
             )
             return [], False
-        command, source = resolved
+        command, source, subdir = resolved
         # Fail-CLOSED naming: anything not explicitly operator-set is
         # treated as guessed (a future third source defaults untrusted).
         guessed = not source.startswith("project-setting:")
+        # subdir is a repo-derived directory name — hostile bytes.
+        where = f", in {sanitise_for_terminal(subdir)}/" if subdir else ""
         print(f"binary-oracle: env build-on-demand: '{command}' "
-              f"({source})")
+              f"({source}{where})")
         from core.env.build import containerized_build
         from core.env.spec import ToolchainSpec
         out_dir = _envbuild_out_dir()
         product = containerized_build(
             repo, command, out_dir=out_dir,
             toolchain=ToolchainSpec(debug=True),
+            subdir=subdir,
         )
         if not product.ok:
-            print(f"binary-oracle: env build failed ({product.reason}): "
-                  f"{product.detail[:200]} — oracle runs without a "
-                  f"binary")
+            # reason/detail carry containerized build output of the
+            # target's own build scripts — hostile bytes; sanitise.
+            print(f"binary-oracle: env build failed "
+                  f"({sanitise_for_terminal(str(product.reason))}): "
+                  f"{sanitise_for_terminal(product.detail[:200])} — "
+                  f"oracle runs without a binary")
             return [], False
         paths = [str(pth) for pth in product.artifacts.values()]
         note = (", GUESSED build command — absent verdicts will "
@@ -391,13 +606,18 @@ def _env_build_debug_binaries(repo: Path) -> tuple[list[str], bool]:
         print(f"binary-oracle: env-built {len(paths)} debug binary(s) "
               f"(provenance: env-built{note})")
         for pth in paths:
-            print(f"  {pth}")
-        print("  persist for future runs: /project binary add <path>")
+            # Artifact names come out of the target's build — sanitise.
+            print(f"  {sanitise_for_terminal(str(pth))}")
+        print("  persist for future runs: /project binary add <path> "
+              "(pins current content by sha256; copy the artifact "
+              "out of the run dir first — run dirs get cleaned and "
+              "are run-writable)")
         return paths, guessed
     except Exception as exc:  # noqa: BLE001 — degrade, never fail the run
         logger.debug("binary-oracle env build errored", exc_info=True)
         print(f"binary-oracle: env build errored "
-              f"({type(exc).__name__}: {str(exc)[:200]}) — oracle runs "
+              f"({type(exc).__name__}: "
+              f"{sanitise_for_terminal(str(exc)[:200])}) — oracle runs "
               f"without a binary")
         return [], False
 
@@ -428,6 +648,11 @@ def _envbuild_out_dir() -> Path:
 def resolve_binary_paths(args, repo: Path, target_kind: str,
                          parser=None,
                          no_suppress_out: list | None = None,
+                         declared_out: list | None = None,
+                         identity_out: dict[
+                             str,
+                             tuple[int, int, int, str] | None,
+                         ] | None = None,
                          ) -> tuple[str, ...]:
     """Compose the final tuple of binary paths from three sources:
     ``--binary`` (explicit), auto-detect, and the active project's
@@ -449,7 +674,19 @@ def resolve_binary_paths(args, repo: Path, target_kind: str,
 
     Always returns SOMETHING — even an empty tuple — so the caller
     can unconditionally assign to ``RaptorConfig.BINARY_ORACLE_PATHS``
-    and never leak a prior run's value (adversarial review P0-117)."""
+    and never leak a prior run's value (adversarial review P0-117).
+
+    ``declared_out`` — when supplied, receives the OPERATOR-declared
+    subset (explicit ``--binary`` paths + project-store binaries).
+    The enrichment exempts these from its source-coverage floor;
+    auto-detected and env-built paths stay floor-subject.
+
+    ``identity_out`` — when supplied, receives the per-path identity
+    pins the project-store witness verification produced (see
+    ``_project_binaries``): the fstat identity of the fd the witness
+    hash was verified on, or ``None`` for a demoted entry. The
+    enrichment re-verifies tuple pins around its classify pass and
+    strips suppression authority on mismatch."""
     explicit_binary = getattr(args, "binary", None)
     explicit_auto = bool(getattr(args, "binary_auto", False))
     opted_out = bool(getattr(args, "no_binary_oracle", False))
@@ -467,6 +704,8 @@ def resolve_binary_paths(args, repo: Path, target_kind: str,
 
     for p in _validate_explicit_paths(explicit_binary, parser=parser):
         seen.setdefault(str(p), True)
+        if declared_out is not None:
+            declared_out.append(str(p))
 
     # Auto-detect runs when the operator explicitly asked
     # (--binary-auto) OR when no --binary was supplied (default-on).
@@ -479,7 +718,9 @@ def resolve_binary_paths(args, repo: Path, target_kind: str,
 
     _out = getattr(args, "out", None)
     proj_paths, proj_name = _project_binaries(
-        repo=repo, run_dir=Path(_out) if _out else None)
+        repo=repo, run_dir=Path(_out) if _out else None,
+        no_suppress_out=no_suppress_out,
+        identity_out=identity_out)
     added = 0
     for p in proj_paths:
         if not Path(p).is_file():
@@ -494,6 +735,10 @@ def resolve_binary_paths(args, repo: Path, target_kind: str,
         if str(p) not in seen:
             seen[str(p)] = True
             added += 1
+        if declared_out is not None and str(p) not in declared_out:
+            # Project-store binaries carry the same standing trust as
+            # an explicit --binary (see /project binary add).
+            declared_out.append(str(p))
     if proj_name and added:
         print(f"--project '{proj_name}' contributes {added} binary(s) "
               f"from /project binary store.")
@@ -503,8 +748,9 @@ def resolve_binary_paths(args, repo: Path, target_kind: str,
         # demand (marker-gated). Explicit --binary flows never reach
         # here; an operator opt-out (--no-binary-oracle) returned
         # earlier.
-        env_paths, guessed = _env_build_debug_binaries(repo)
-        for p in env_paths:
+        env_paths, guessed = _env_build_debug_binaries(
+            repo, run_dir=Path(_out) if _out else None)
+        for p in env_paths:  # type: ignore[assignment]
             seen.setdefault(p, True)
         if guessed and env_paths and no_suppress_out is not None:
             no_suppress_out.extend(env_paths)
@@ -525,15 +771,21 @@ def apply_to_config(args, repo: Path, parser=None) -> tuple[str, ...]:
     site for both CLIs so they can't diverge."""
     from core.config import RaptorConfig
     no_suppress: list = []
+    declared: list = []
+    identity: dict[str, tuple[int, int, int, str] | None] = {}
     paths = resolve_binary_paths(
         args, repo, resolve_target_kind(args), parser=parser,
         no_suppress_out=no_suppress,
+        declared_out=declared,
+        identity_out=identity,
     )
     # ALWAYS assign — never gate on truthiness — so a prior run's
     # value cannot leak into this one in long-lived processes
     # (Claude Code, library use, chained pytest).
     RaptorConfig.BINARY_ORACLE_PATHS = paths
     RaptorConfig.BINARY_ORACLE_NO_SUPPRESS = tuple(no_suppress)
+    RaptorConfig.BINARY_ORACLE_DECLARED = tuple(declared)
+    RaptorConfig.BINARY_ORACLE_IDENTITY_PINS = identity
     RaptorConfig.BINARY_ORACLE_EDGES = bool(
         getattr(args, "binary_edges", False))
     return paths

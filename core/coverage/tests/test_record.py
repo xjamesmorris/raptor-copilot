@@ -2,6 +2,7 @@
 
 import json
 import os
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -9,6 +10,7 @@ from unittest.mock import patch
 
 from core.coverage.record import (
     READS_MANIFEST,
+    _read_manifest_lines,
     build_from_cocci,
     build_from_codeql,
     build_from_findings,
@@ -23,7 +25,7 @@ from core.coverage.track_read import main as track_read_main
 
 class TestBuildFromManifest(unittest.TestCase):
 
-    def test_builds_from_manifest(self):
+    def test_e30_builds_from_manifest_and_deduplicates(self):
         with TemporaryDirectory() as d:
             manifest = Path(d) / READS_MANIFEST
             manifest.write_text("src/auth.py\nsrc/db.py\nsrc/auth.py\n")
@@ -145,6 +147,86 @@ class TestManifestCapAndDecoding(unittest.TestCase):
             manifest.write_text("src/odd name .py\r\n")
             record = build_from_manifest(Path(d), "test")
             self.assertEqual(record["files_examined"], ["src/odd name .py"])
+
+    def test_n3_unterminated_final_line_is_discarded(self):
+        with TemporaryDirectory() as d:
+            manifest = Path(d) / READS_MANIFEST
+            manifest.write_bytes(b"src/complete.py\nsrc/partial.py")
+            record = build_from_manifest(Path(d), "test")
+            self.assertEqual(record["files_examined"], ["src/complete.py"])
+
+    def test_n3_symlinked_manifest_is_refused(self):
+        with TemporaryDirectory() as d:
+            root = Path(d)
+            victim = root / "victim"
+            victim.write_text("src/foreign.py\n", encoding="utf-8")
+            (root / READS_MANIFEST).symlink_to(victim)
+            started = time.monotonic()
+            record = build_from_manifest(root, "test")
+            self.assertLess(time.monotonic() - started, 2)
+            self.assertIsNone(record)
+
+    @unittest.skipIf(not hasattr(os, "mkfifo"), "FIFO requires POSIX")
+    def test_n3_fifo_manifest_is_refused_without_hanging(self):
+        with TemporaryDirectory() as d:
+            root = Path(d)
+            os.mkfifo(root / READS_MANIFEST)
+            started = time.monotonic()
+            record = build_from_manifest(root, "test")
+            self.assertLess(time.monotonic() - started, 2)
+            self.assertIsNone(record)
+
+    @unittest.skipIf(not hasattr(os, "mkfifo"), "FIFO requires POSIX")
+    def test_n3_fifo_manifest_with_writer_is_refused_without_hanging(self):
+        with TemporaryDirectory() as d:
+            root = Path(d)
+            manifest = root / READS_MANIFEST
+            os.mkfifo(manifest)
+            reader = os.open(manifest, os.O_RDONLY | os.O_NONBLOCK)
+            writer = os.open(manifest, os.O_WRONLY | os.O_NONBLOCK)
+            try:
+                started = time.monotonic()
+                record = build_from_manifest(root, "test")
+                self.assertLess(time.monotonic() - started, 2)
+            finally:
+                os.close(writer)
+                os.close(reader)
+            self.assertIsNone(record)
+
+    @unittest.skipUnless(Path("/dev/null").exists(), "device node unavailable")
+    def test_n3_device_manifest_is_refused_without_hanging(self):
+        started = time.monotonic()
+        files = _read_manifest_lines(Path("/dev/null"))
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(files, set())
+
+    def test_n3_reader_stays_bound_to_opened_descriptor(self):
+        with TemporaryDirectory() as d:
+            root = Path(d)
+            manifest = root / READS_MANIFEST
+            replacement = root / "replacement"
+            manifest.write_text("src/opened.py\n", encoding="utf-8")
+            replacement.write_text("src/replaced.py\n", encoding="utf-8")
+            real_open = os.open
+            swapped = False
+
+            def open_then_swap(path, flags, *args, **kwargs):
+                nonlocal swapped
+                fd = real_open(path, flags, *args, **kwargs)
+                if Path(path) == manifest and not swapped:
+                    swapped = True
+                    os.replace(replacement, manifest)
+                return fd
+
+            with patch("core.coverage.record.os.open",
+                       side_effect=open_then_swap):
+                files = _read_manifest_lines(manifest)
+
+            self.assertEqual(files, {"src/opened.py"})
+            self.assertEqual(
+                manifest.read_text(encoding="utf-8"),
+                "src/replaced.py\n",
+            )
 
 
 class TestBuildFromSemgrep(unittest.TestCase):
@@ -469,6 +551,15 @@ class TestWriteAndLoad(unittest.TestCase):
             self.assertEqual(path.name, "coverage-semgrep.json")
             self.assertTrue(path.exists())
 
+    def test_read_record_is_owner_only(self):
+        with TemporaryDirectory() as d:
+            path = write_record(
+                Path(d),
+                {"tool": "read", "files_examined": ["/owned/a.py"]},
+                tool_name="read",
+            )
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
     def test_load_records_multiple(self):
         with TemporaryDirectory() as d:
             write_record(Path(d), {"tool": "semgrep"}, tool_name="semgrep")
@@ -780,5 +871,12 @@ class TestBuildFromFindingsShapeGuards:
         ]}))
         rec = build_from_findings(p)
         assert rec is not None
-        assert rec["functions_analysed"] == [
-            {"file": "src/a.c", "function": "f"}]
+        rows = rec["functions_analysed"]
+        assert [(fa["file"], fa["function"]) for fa in rows] == [
+            ("src/a.c", "f")]
+        # findings.json is target-writable input: builder rows are
+        # NEVER stamped (creation is a trusted act only when the
+        # creation input is trusted) — they import at machine tier.
+        from core.coverage import journal_mac
+        assert journal_mac.coverage_row_provenance(
+            rows[0], "llm") == journal_mac.ROW_UNSTAMPED

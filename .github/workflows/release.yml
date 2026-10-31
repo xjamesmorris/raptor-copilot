@@ -13,13 +13,24 @@ on:
 
 # Don't cancel in-flight releases — two concurrent releases racing on
 # the same artifact upload would corrupt the GitHub Release record.
-# Queue instead, so concurrent dispatches serialize cleanly.
+# Queue instead, so concurrent dispatches serialize cleanly. Keyed on
+# the BARE tag name in both event shapes: a tag-push run's github.ref
+# is refs/tags/<tag> while a workflow_dispatch re-release of the SAME
+# tag carries the dispatch input (the validate step refuses any
+# refs/tags/-prefixed input, so the input is always bare) — a ref-only
+# key put those two runs in different groups and they never
+# serialized despite editing the same tag, stamp targets, and Release
+# record. github.ref_name is the bare tag on tag pushes, so both
+# spellings converge on one group.
 concurrency:
-  group: release-${{ github.workflow }}-${{ github.ref }}
+  group: release-${{ github.workflow }}-${{ github.event.inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 permissions:
   contents: write
+  # `gh workflow run` — the Docker Hub re-dispatch below needs to
+  # create a workflow_dispatch event once the stamped tag has landed.
+  actions: write
 
 jobs:
   release:
@@ -118,6 +129,28 @@ jobs:
               push --force "https://github.com/${REPO}" "refs/tags/${TAG}"
           fi
 
+      # The versioned Docker Hub image must be built from the STAMPED
+      # tag: the force-moved tag was pushed with the workflow token,
+      # and token-initiated pushes never trigger workflows — without
+      # this dispatch, dockerhub-publish would build :<version> from
+      # the pre-stamp commit. (Today the two trees build identical
+      # images — the Dockerfile COPYs only pyproject.toml/uv.lock, no
+      # stamp target — but the versioned image must be built from
+      # the ref it claims to be, and any future COPY of stamped
+      # files inherits correctness instead of silently shipping the
+      # previous version.) workflow_dispatch is the
+      # documented exception deliverable by GITHUB_TOKEN. Runs
+      # unconditionally after the stamp step: on a re-release the tag
+      # already points at the stamped commit, and the dispatch is
+      # idempotent (same tag -> same image content).
+      - name: Publish versioned Docker Hub image from the stamped tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.name }}
+        run: |
+          set -euo pipefail
+          gh workflow run dockerhub-publish.yml --ref main -f tag="${TAG}"
+
       - name: Build release archives
         env:
           TAG: ${{ steps.tag.outputs.name }}
@@ -126,6 +159,25 @@ jobs:
           NAME="raptor-${TAG}"
 
           git archive --format=tar --prefix="${NAME}/" HEAD | tar -x -C /tmp
+
+          # The published archive is the product: verify the extracted
+          # tree carries the runtime surface BEFORE packaging. .claude/
+          # is the LLM dispatch surface; plugins/agents is Claude's
+          # guarded agent plugin; .github/agents and the Copilot settings
+          # are Copilot's runtime projection. Broad export-ignore rules once
+          # shipped releases with these surfaces silently absent. Named
+          # oracle for the archive-content claim; test_release_workflow.sh
+          # pins the same set against the real .gitattributes.
+          for p in .claude/commands .claude/skills .claude/hooks \
+                   .claude/settings.json .github/agents \
+                   .github/copilot/settings.json plugins/agents \
+                   CLAUDE.md raptor.py bin \
+                   libexec core packages engine tiers; do
+            if [ ! -e "/tmp/${NAME}/${p}" ]; then
+              echo "::error::release archive missing runtime surface: ${p}"
+              exit 1
+            fi
+          done
 
           cd /tmp
           zip -r "${NAME}.zip" "${NAME}" -x "*.DS_Store"

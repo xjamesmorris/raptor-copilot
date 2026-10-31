@@ -488,9 +488,9 @@ def _run_python_harness(
 
 
 # Exit codes the spawn layers re-encode a failed exec of the target as
-# (shell/util-linux convention, shared by the sandbox's pid1-shim, the
-# in-sandbox exec lane and the Landlock-only retry): 127 file not
-# found, 126 found but not executable, 125 catch-all exec errno.
+# (shell/util-linux convention, shared by the in-sandbox exec lane
+# and the Landlock-only retry): 127 file not found, 126 found but not
+# executable, 125 catch-all exec errno.
 _EXEC_FAILURE_RETURNCODES = frozenset({125, 126, 127})
 
 
@@ -776,6 +776,26 @@ def _get_safe_env() -> dict[str, str]:
         env = dict(os.environ)
         for key in ("TERMINAL", "EDITOR", "VISUAL", "BROWSER", "PAGER"):
             env.pop(key, None)
+        # Degraded-fallback belt: this branch hands the child a
+        # full-environ copy, so at minimum drop the credential-env
+        # family (the canonical vocabulary is stdlib-only and imports
+        # even where core.config cannot; guard anyway — this fallback
+        # exists precisely for broken-install conditions).
+        try:
+            from core.security.credential_env import (
+                CREDENTIAL_ENV_FAMILY,
+                is_credential_env_pattern_member,
+            )
+        except ImportError:
+            pass
+        else:
+            for key in CREDENTIAL_ENV_FAMILY:
+                env.pop(key, None)
+            # Pattern members (CARGO_TARGET_<triple>_RUNNER-shaped
+            # names) have no enumerable spelling — exact-name pops
+            # cannot reach them, so sweep the survivors by predicate.
+            for key in [k for k in env if is_credential_env_pattern_member(k)]:
+                env.pop(key)
     env["ASAN_OPTIONS"] = "detect_leaks=1:abort_on_error=1:handle_segv=0"
     # abort_on_error=1 is load-bearing for the signal-grade sanitizer
     # classification: halt_on_error alone makes UBSan STOP (exit 1,

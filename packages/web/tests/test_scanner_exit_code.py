@@ -33,9 +33,14 @@ class TestScannerExitCode(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             argv = ["scanner.py", "--url", "http://example.com",
                     "--out", tmpdir]
+            # Patch the factory module itself: main() does a call-time
+            # `from core.llm.factory import get_client`, so patching a
+            # re-export attribute elsewhere never intercepts it and the
+            # test would construct a REAL LLM client on machines with
+            # provider config.
             with patch.object(scanner_mod, "WebScanner",
                               return_value=mock_scanner), \
-                 patch("packages.llm_analysis.get_client", return_value=None), \
+                 patch("core.llm.factory.get_client", return_value=None), \
                  patch("sys.argv", argv):
                 return scanner_mod.main()
 

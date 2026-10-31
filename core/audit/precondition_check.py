@@ -101,11 +101,19 @@ def verify_preconditions(
     preconditions: list[dict[str, Any]],
     target_path: Path,
     context_map: dict[str, Any] | None = None,
+    graph_store: Path | None = None,
 ) -> PreconditionVerdict:
     """Run mechanical checks on LLM-stated preconditions.
 
     Each precondition dict has: assumption, check_type, location,
     expect_absent, and optionally parameter.
+
+    ``graph_store`` (optional) is the project graph store path; when
+    the context map's own call-edge list is capped or shed, the
+    attacker-control reachability walk resolves the map's
+    ``call_edges_store`` marker against it (verified mechanical rows
+    only). A missing/unverifiable store changes nothing — store
+    absent is the inconclusive floor, never a verdict input.
     """
     verdict = PreconditionVerdict()
 
@@ -165,7 +173,7 @@ def verify_preconditions(
         elif check_type == "attacker_controls_input":
             result = _check_attacker_control(
                 source, loc_file, loc_func, parameter,
-                expect_absent, context_map,
+                expect_absent, context_map, graph_store, target_path,
             )
         elif check_type == "function_reaches_sink":
             result = _check_reaches_sink(
@@ -188,15 +196,20 @@ def verify_preconditions(
 def _read_function_source(
     target_path: Path, file_path: str, function_name: str,
 ) -> str | None:
-    """Read a function's source from the target directory."""
-    full = (target_path / file_path).resolve()
-    if not full.is_relative_to(target_path.resolve()):
-        return None
-    if not full.is_file():
-        return None
-    try:
-        text = full.read_text(errors="replace")
-    except OSError:
+    """Read a function's source from the target directory.
+
+    ``file_path`` arrives from LLM-authored assumption records, so the
+    join is containment-checked and the read size-capped
+    (``core.source.read_contained`` — also absorbs pathological
+    values like NUL bytes that the previous hand-rolled
+    ``resolve()``/``is_relative_to`` guard let raise). Any refusal
+    reads as source-unavailable: the caller's inconclusive lane,
+    never a verdict.
+    """
+    from core.source import read_contained
+
+    text = read_contained(target_path, file_path)
+    if text is None:
         return None
 
     # For C: find function definition by name and extract the body
@@ -211,8 +224,11 @@ def _read_function_source(
 def _extract_c_function(source: str, name: str) -> str | None:
     """Extract a C function body (heuristic brace-matching)."""
     # Find the function definition: type name(...)  {
+    # Parameter window bounded: unbounded `[^)]*` re-scans a
+    # paren-free hostile run from every name occurrence — quadratic.
+    # Real parameter lists sit far under 1024 chars.
     pattern = re.compile(
-        rf'\b{re.escape(name)}\s*\([^)]*\)\s*\{{',
+        rf'\b{re.escape(name)}\s*\([^)]{{0,1024}}\)\s*\{{',
         re.MULTILINE,
     )
     m = pattern.search(source)
@@ -263,7 +279,7 @@ def _extract_python_function(source: str, name: str) -> str | None:
         return None
     indent = len(m.group(1))
     start = m.start()
-    lines = source[start:].split('\n')
+    lines = source[start:].split('\n')  # line-model: read_contained universal-newline read upstream
     result = [lines[0]]
     for line in lines[1:]:
         stripped = line.lstrip()
@@ -326,12 +342,16 @@ def _check_null_termination(
 
     # Also look for the specific parameter if given
     if parameter:
+        # Same-line gap and index windows bounded: unbounded `.*`
+        # re-scans a hostile newline-free run from every parameter
+        # mention — quadratic. A real statement sits far under the
+        # bounds (300-char line gap, 256-char index expression).
         param_null = re.compile(
-            rf'\b{re.escape(parameter)}\b.*=\s*[\'"]?\\0[\'"]?\s*;'
+            rf'\b{re.escape(parameter)}\b.{{0,300}}=\s*[\'"]?\\0[\'"]?\s*;'
             rf'|'
-            rf'\b{re.escape(parameter)}\s*\[.*\]\s*=\s*[\'"]?\\0[\'"]?\s*;'
+            rf'\b{re.escape(parameter)}\s*\[.{{0,256}}\]\s*=\s*[\'"]?\\0[\'"]?\s*;'
             rf'|'
-            rf'\b{re.escape(parameter)}\s*\[.*\]\s*=\s*0\s*;',
+            rf'\b{re.escape(parameter)}\s*\[.{{0,256}}\]\s*=\s*0\s*;',
         )
         if param_null.search(source):
             found_patterns.append(f"explicit \\0 on '{parameter}'")
@@ -395,10 +415,13 @@ _BOUNDS_PATTERNS = [
     re.compile(r"\b\w+_LEN\b"),
     re.compile(r"\b\w+_SIZE\b"),
     re.compile(r"\b\w+_CAP\b"),
-    # Comparison operators near length/size variables
-    re.compile(r"\b\w*len\w*\s*[<>=!]+"),
-    re.compile(r"\b\w*size\w*\s*[<>=!]+"),
-    re.compile(r"\b\w*cap\w*\s*[<>=!]+"),
+    # Comparison operators near length/size variables. The name
+    # prefix is bounded: unbounded `\w*` before the keyword costs
+    # every split of a hostile word run per word start; real
+    # identifiers sit far under 256 chars.
+    re.compile(r"\b\w{0,256}len\w*\s*[<>=!]+"),
+    re.compile(r"\b\w{0,256}size\w*\s*[<>=!]+"),
+    re.compile(r"\b\w{0,256}cap\w*\s*[<>=!]+"),
 ]
 
 
@@ -473,7 +496,10 @@ _SANITIZE_PATTERNS = [
     re.compile(r"\bparameteriz\w*\b", re.IGNORECASE),
     re.compile(r"\bprepared?\s+statement\b", re.IGNORECASE),
     re.compile(r"\bplaceholder\b", re.IGNORECASE),
-    re.compile(r"%s.*execute\b"),
+    # Bounded same-line gap (unbounded `.*` after a plantable "%s"
+    # head is quadratic on hostile text; real co-occurrence is
+    # within a statement).
+    re.compile(r"%s.{0,1000}execute\b"),
     re.compile(r"\?\s*,"),
 ]
 
@@ -527,14 +553,99 @@ def _check_sanitization(
     )
 
 
+def _edge_node_keys(raw: str, file_hint: str) -> tuple[str, ...]:
+    """Normalise one call-edge endpoint into its lookup keys.
+
+    Mirrors the combined-form parse of ``_edge_endpoints`` in
+    llm_summaries.py (split a ``"file:function"`` string, strip a
+    trailing ``"(...)"`` signature fragment) but, unlike the twin,
+    keeps bare-name edges usable instead of requiring a file: entry
+    points and precondition locations arrive in either shape, so every
+    node is indexed under BOTH its bare name and (when a file is
+    known) its ``"file:function"`` form.
+    """
+    name = raw
+    node_file = file_hint
+    if not node_file and ":" in raw:
+        node_file, _, name = raw.partition(":")
+    name = name.split("(")[0].strip()
+    if not name:
+        return ()
+    if node_file:
+        return (name, f"{node_file}:{name}")
+    return (name,)
+
+
+# Single-slot memo for the store's verified call-edge lane: the
+# precondition gate runs per finding, and a verified read re-derives
+# one HMAC per row (seconds at the 10^5-10^6-row scale the lane exists
+# for). Exactly one (store, snapshot, target) triple is live per run
+# stage, so one slot suffices; a concurrent recompute is merely
+# wasted work.
+_STORE_LANE_MEMO: dict[tuple[str, str, str], dict[str, Any] | None] = {}
+
+
+def _store_call_edges(
+    context_map: dict[str, Any],
+    graph_store: Path,
+    target_path: Path | str | None,
+) -> dict[str, Any] | None:
+    """Resolve the map's ``call_edges_store`` marker against the graph
+    store's verdict-feeding view (verified mechanical rows only —
+    ``core.understand_graph.queries.verified_mechanical_call_edges``).
+
+    Returns the lane dict (``{"edges", "complete", ...}``) or None
+    when there is no verified lane (no marker, store absent, snapshot
+    unverifiable). None is the store-absent → inconclusive floor: the
+    caller behaves exactly as it does today, and the store's absence
+    is never itself evidence.
+    """
+    marker = context_map.get("call_edges_store")
+    if not isinstance(marker, dict):
+        return None
+    snapshot = marker.get("snapshot")
+    if not isinstance(snapshot, str) or not snapshot:
+        return None
+    # Target-scoped: the marker is artifact-writable, and a shared
+    # project store can hold OTHER targets' verified callgraph
+    # snapshots — those must never feed this target's walk. A spelling
+    # mismatch merely drops the lane (today's behavior).
+    target = str(target_path) if target_path else None
+    key = (str(graph_store), snapshot, target or "")
+    if key in _STORE_LANE_MEMO:
+        return _STORE_LANE_MEMO[key]
+    try:
+        from pathlib import Path as _Path
+
+        from core.understand_graph.queries import (
+            verified_mechanical_call_edges,
+        )
+
+        lane = verified_mechanical_call_edges(
+            _Path(graph_store), snapshot, target)
+    except Exception:  # noqa: BLE001 — a broken store is the floor, never an error into the gate
+        lane = None
+    _STORE_LANE_MEMO.clear()  # single slot
+    _STORE_LANE_MEMO[key] = lane
+    return lane
+
+
 def _check_attacker_control(
     _source: str, file: str, func: str,
     _parameter: str, expect_absent: bool,
     context_map: dict[str, Any] | None = None,
+    graph_store: Path | None = None,
+    target_path: Path | str | None = None,
 ) -> CheckResult:
     """Check if a function's input is attacker-controlled.
 
     Uses the context map's entry_points to determine reachability.
+    When the map's own edge list is degraded (capped or shed) and a
+    graph store is given, the walk upgrades to the store's verified
+    mechanical edge set: a COMPLETE verified set lifts the truncation
+    (the full graph is present), an incomplete one — tampered or
+    deleted rows — forces truncation semantics, so no llm-tier or
+    MAC-failing row can ever flip a reachable function to unreachable.
     """
     if context_map is None:
         return CheckResult(
@@ -574,18 +685,63 @@ def _check_attacker_control(
     # exhausts the edge list (visited-set bounded); only a truncated
     # walk leaves ``reach_truncated`` set, and that must degrade to
     # inconclusive, never to contradicted.
+    # Index every edge endpoint under BOTH its bare name and its
+    # "file:func" form (see _edge_node_keys): context maps mix the two
+    # shapes edge-by-edge, and a frontier of bare names walked over
+    # combined-form keys reads real edges as missing.
+    # Edge universe: the in-map list, upgraded to the graph store's
+    # verified mechanical set when the map's own list is degraded
+    # (capped or shed) and a store is available. A COMPLETE verified
+    # set is the full graph — the truncation lifts; an INCOMPLETE one
+    # (rows tampered, deleted, or minted under a foreign key) is the
+    # same epistemic state as a truncated walk, so truncation is
+    # forced: excluded rows can hide paths, and a hidden path must
+    # never mint an unreachability verdict. No lane (store absent,
+    # no marker, snapshot unverifiable) leaves today's behavior
+    # untouched — the store-absent → inconclusive floor.
+    map_edges = context_map.get("call_edges", [])
+    reach_truncated_flag = bool(context_map.get("call_edges_truncated"))
+    edge_source: Any = map_edges
+    if graph_store is not None and (reach_truncated_flag or not map_edges):
+        lane = _store_call_edges(context_map, graph_store, target_path)
+        if lane is not None and lane.get("edges"):
+            if lane.get("complete"):
+                edge_source = lane["edges"]
+                reach_truncated_flag = False
+            else:
+                edge_source = list(map_edges) + list(lane["edges"])
+                reach_truncated_flag = True
+
     callers_by_callee: dict[str, set[str]] = {}
-    for edge in context_map.get("call_edges", []):
-        callee = edge.get("callee") or ""
-        caller = edge.get("caller") or ""
-        if callee and caller:
-            callers_by_callee.setdefault(callee, set()).add(caller)
+    edge_nodes: set[str] = set()
+    for edge in edge_source:
+        caller_keys = _edge_node_keys(
+            edge.get("caller") or "", edge.get("caller_file") or "",
+        )
+        callee_keys = _edge_node_keys(
+            edge.get("callee") or "", edge.get("callee_file") or "",
+        )
+        if not caller_keys or not callee_keys:
+            continue
+        edge_nodes.update(caller_keys)
+        edge_nodes.update(callee_keys)
+        for callee_key in callee_keys:
+            callers_by_callee.setdefault(callee_key, set()).update(caller_keys)
+
+    start_keys = {func}
+    if file:
+        start_keys.add(f"{file}:{func}")
 
     reachable = is_entry
-    reach_truncated = False
+    # A capped EDGE LIST (context_map_callgraph hit its emission cap)
+    # is the same epistemic state as a truncated walk: paths may exist
+    # beyond what the map records, so a no-path outcome degrades to
+    # inconclusive, never to contradicted/supported-unreachable.
+    # (Computed above so the store lane can lift or force it.)
+    reach_truncated = reach_truncated_flag
     if not reachable:
-        seen = {func}
-        frontier = [func]
+        seen = set(start_keys)
+        frontier = list(start_keys)
         while frontier and not reachable:
             if len(seen) > _REACHABILITY_NODE_CAP:
                 reach_truncated = True
@@ -602,6 +758,24 @@ def _check_attacker_control(
                 if reachable:
                     break
             frontier = nxt
+
+    # Graph-incompleteness gate: the map is LLM-authored /understand
+    # output and routinely incomplete.  An exhausted walk that found
+    # no path is only evidence about functions the map actually
+    # RECORDS — when no edge names the function at all, "no callers
+    # found" is absence of evidence, and it must mint neither the sole
+    # demoting verdict (contradicted) nor a positive unreachability
+    # receipt (supported).
+    if not reachable and not reach_truncated and not (start_keys & edge_nodes):
+        return CheckResult(
+            check_type="attacker_controls_input",
+            assumption="",
+            verdict="inconclusive",
+            evidence=(
+                f"context map records no call edge naming {func} — "
+                "graph incompleteness is not evidence of unreachability"
+            ),
+        )
 
     if expect_absent:
         # LLM claims attacker does NOT control input

@@ -21,19 +21,21 @@ import pytest
 REPO = Path(__file__).resolve().parents[3]
 
 def _mount_ns_usable() -> bool:
+    """Authoritative mount-ns probe: AppArmor sysctl + newuidmap +
+    functional self-test. The static checks (newuidmap presence +
+    AppArmor sysctl) are necessary but not sufficient — the kernel can
+    still refuse unshare(CLONE_NEWNS) under outer seccomp, SELinux, or
+    nested userns restrictions."""
     if sys.platform != "linux":
         return False
-    if not shutil.which("newuidmap") or not shutil.which("newgidmap"):
-        return False
-    sysctl = Path("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
-    if sysctl.exists() and sysctl.read_text().strip() == "1":
-        return False
-    return True
+    sys.path.insert(0, str(REPO))
+    from core.sandbox.probes import check_mount_available
+    return check_mount_available()
 
 
 _needs_sandbox = pytest.mark.skipif(
     not _mount_ns_usable(),
-    reason="reproduce needs mount-ns sandbox (uidmap + apparmor userns=0)",
+    reason="reproduce needs mount-ns sandbox (authoritative probe)",
 )
 
 SCRIPT = REPO / "libexec" / "raptor-zkpox"
@@ -206,6 +208,7 @@ _CRASHER = (
 )
 
 
+@pytest.mark.slow
 @_needs_sandbox
 @pytest.mark.skipif(
     shutil.which("cc") is None and shutil.which("gcc") is None,
@@ -249,7 +252,8 @@ def test_bundle_then_reproduce_happy_path(tmp_path):
     assert json.loads((bundle_dir / "manifest.json").read_text())["tier"] == "0/1"
 
     # reproduce
-    r = _run(["reproduce", str(bundle_dir), "--binary", str(binary), "--n", "3"])
+    r = _run(["reproduce", str(bundle_dir), "--binary", str(binary),
+              "--n", "3", "--timeout", "10"])
     assert r.returncode == 0, f"stdout={r.stdout}\nstderr={r.stderr}"
     manifest = json.loads((bundle_dir / "manifest.json").read_text())
     assert manifest["tier"] == "1.5"  # bumped
@@ -279,6 +283,10 @@ def test_bundle_then_reproduce_happy_path(tmp_path):
             assert "spawn_failure" in rec, rec
 
 
+# Slow tier: compiles a real C target, bundles it, and drives three
+# sandboxed replay executions through the real CLI — the spawn-retry
+# path under test only exists across multiple full sandbox runs.
+@pytest.mark.slow
 @_needs_sandbox
 @pytest.mark.skipif(
     shutil.which("cc") is None and shutil.which("gcc") is None,
@@ -356,7 +364,7 @@ def test_reproduce_first_run_silent_exit_126_is_spawn_failure(tmp_path):
     bundle_dir = out / "zkpox" / wh
 
     r = _run(["reproduce", str(bundle_dir), "--binary", str(crasher),
-              "--n", "3"])
+              "--n", "3", "--timeout", "10"])
     assert r.returncode == 0, f"stdout={r.stdout}\nstderr={r.stderr}"
     manifest = json.loads((bundle_dir / "manifest.json").read_text())
     rep = manifest["reproduction"]

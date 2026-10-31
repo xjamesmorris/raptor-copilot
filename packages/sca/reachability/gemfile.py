@@ -20,6 +20,8 @@ import re
 
 from ..models import Confidence, Reachability
 from ._shared import format_evidence as _format_evidence
+from ._shared import iter_matches_with_lines as _iter_matches_with_lines
+from ..parsers import _safe_read
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -35,8 +37,11 @@ _TEST_DIR_NAMES = {"spec", "test", "tests", "features", "__tests__"}
 
 # ``require 'name'`` / ``require "name"`` — including possible ``::``
 # subpaths (``require 'rails/all'``).
+# Leading indent is HORIZONTAL-only ([^\S\n]): under MULTILINE the
+# ``^\s*`` spelling re-scans a run of blank lines from every line
+# start inside it — quadratic on attacker-supplied source files.
 _REQUIRE_RE = re.compile(
-    r"""^\s*(?:require|require_relative)\s+
+    r"""^[^\S\n]*(?:require|require_relative)\s+
         (['"])([^'"]+)\1""",
     re.MULTILINE | re.VERBOSE,
 )
@@ -55,11 +60,8 @@ def scan_imports(
     out: dict[str, list[tuple[Path, int, bool]]] = {}
     for rb_file in _walk_ruby_sources(target, max_depth=max_depth):
         is_test = _is_test_file(rb_file, target)
-        try:
-            text = rb_file.read_text(encoding="utf-8", errors="replace")
-        except OSError as e:
-            logger.debug("sca.reachability.gemfile: skip %s (%s)",
-                          rb_file, e)
+        text = _safe_read.read_bounded(rb_file, follow_symlinks=False)
+        if text is None:
             continue
         for spec, line in _requires_in(text):
             head = spec.split("/", 1)[0]
@@ -119,8 +121,11 @@ def resolve_dep(
 # ---------------------------------------------------------------------------
 
 def _requires_in(text: str) -> Iterable[tuple[str, int]]:
-    for m in _REQUIRE_RE.finditer(text):
-        yield m.group(2), text.count("\n", 0, m.start()) + 1
+    # Rolling-cursor line numbers — the naive full-prefix count is
+    # quadratic on dense-require files.
+    for m, line in _iter_matches_with_lines(
+            text, _REQUIRE_RE.finditer(text)):
+        yield m.group(2), line
 
 
 def _walk_ruby_sources(

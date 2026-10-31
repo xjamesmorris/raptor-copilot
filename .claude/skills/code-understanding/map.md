@@ -218,6 +218,9 @@ checklist in the same dir as ground truth to:
   the target into relative ones)
 - warn (non-fatal) on hallucinated files / out-of-range line numbers /
   cross-reference typos in `unchecked_flows`
+- re-write the artifact in the compact producer encoding and enforce
+  the size budget (bounded readers cap on file bytes; an indented
+  write of the same data can exceed caps the compact form fits)
 
 ```bash
 libexec/raptor-normalize-context-map "$WORKDIR"
@@ -366,10 +369,14 @@ state. Each entry carries a `priority_hint` combining primitive
 availability with the sink's CWE.
 
 ```bash
-libexec/raptor-enrich-context-map-mitigation "$WORKDIR"
+libexec/raptor-enrich-context-map-mitigation "$WORKDIR" --binary /path/to/binary
 ```
 
-Opt-in — no-op when no binary path is available. Additive — sinks are
+Opt-in — `--binary` is required, so SKIP this step entirely when no
+binary path is available (the script argparse-errors without it; it has
+no no-op mode). Optional `--source <dir>` points at the source root so
+`extract_flags()` can override the ELF-derived FORTIFY heuristic.
+Additive — sinks are
 never dropped, only enriched. Namespaced under `source:
 "exploit_feasibility.analyze_binary"` so parallel enrichers can coexist.
 Tri-state honest — `format_n_write: null` means CONDITIONAL, distinct
@@ -411,7 +418,7 @@ Idempotent. Downstream consumers: `/validate` Stage B imports
 `has_taint_flow` via the understand bridge, pre-confirming B-3.1
 reachability. `/diagram` renders confirmed flows as solid edges.
 
-**[MAP-5j] Enrich with mechanically-extracted imports**
+**[MAP-5j] Enrich with mechanically-extracted imports** *(not yet on the settings allowlist — a permission prompt here is expected, not an error; do not fall back to manual enumeration)*
 
 After normalisation, populate the `imports` key from `checklist.json`'s
 per-file `call_graph.imports` data. Ground-truth module names extracted by
@@ -427,18 +434,23 @@ graph store's IMPORTS edge producer and downstream consumers handle
 classification. Idempotent. Skip if `$WORKDIR/checklist.json` doesn't
 exist or doesn't carry `target_path`.
 
-**[MAP-6] Record Coverage**
+**[MAP-6] Record Coverage (map-grade)**
 
-After writing `context-map.json`, update the inventory with which functions you examined.
-Write a JSON array of every function you read and analysed (entry points, sinks, trust boundary
-checks) to `$WORKDIR/reviewed-items.json`, then run the coverage recorder:
+After writing `context-map.json`, record which functions you examined.
+Write a JSON array of every function you read while mapping (entry points, sinks, trust boundary
+checks) to `$WORKDIR/map-examined-items.json`, then run the coverage recorder **with `--map-grade`**:
 
 Record coverage using the understand command's Step 3:
 ```bash
-libexec/raptor-coverage-summary "$WORKDIR" --mark src/routes/query.py:handle_query src/db/query.py:run_query
+libexec/raptor-coverage-summary "$WORKDIR" --mark src/routes/query.py:handle_query src/db/query.py:run_query --map-grade
 ```
 
-This updates the coverage record so `/project coverage` reflects what was examined.
+`--map-grade` is mandatory here: mapping a function is not reviewing it.
+Map-grade marks record examination (visible in `/project coverage`) without
+granting review credit — a plain `--mark` from this phase would silently
+drop every mapped function from the audit review plan (`gaps.json`), so
+they would never be LLM-reviewed at all. Plain `--mark` is reserved for
+actual review assertions (operator review, completed audit passes).
 
 **[MAP-7] Runtime Probe (optional)**
 
@@ -465,35 +477,17 @@ prompt — appropriate, since the probe executes the target binary):
 libexec/raptor-sandbox-observe --json --out "$WORKDIR/probe" -- \
     /path/to/binary [args...] > "$WORKDIR/probe.json"
 
-python3 -c "
-import json
-from pathlib import Path
-from core.sandbox.observe_profile import (
-    ConnectTarget, ObserveProfile,
-)
-from core.sandbox.observe_context_merge import (
-    merge_observation_into_context_map,
-)
-
-w = Path('$WORKDIR')
-ctx = json.loads((w / 'context-map.json').read_text())
-probe = json.loads((w / 'probe.json').read_text())
-profile = ObserveProfile(
-    paths_read=probe['paths_read'],
-    paths_written=probe['paths_written'],
-    paths_stat=probe['paths_stat'],
-    connect_targets=[
-        ConnectTarget(**t) for t in probe['connect_targets']
-    ],
-)
-merged = merge_observation_into_context_map(
-    ctx, profile,
-    binary='/path/to/binary',
-    command=['/path/to/binary'] + ['<args>'],
-)
-(w / 'context-map.json').write_text(json.dumps(merged, indent=2))
-"
+libexec/raptor-enrich-context-map-observe "$WORKDIR" \
+    --binary /path/to/binary -- [args...]
 ```
+
+The workdir, binary path and probe arguments ride as argv data —
+never paste them into a `python3 -c` program (the shell expands
+`$(...)` inside a double-quoted block before python runs). The
+enricher reads `$WORKDIR/probe.json`, merges it into
+`$WORKDIR/context-map.json`, and writes the map back in place
+through the `save_context_map` producer chokepoint (compact
+encoding, budget-enforced — never pretty-printed).
 
 After merge, `context-map.json` has a new `runtime_observation`
 section with:
@@ -529,6 +523,7 @@ After the summary, offer trace follow-up as a structured choice (see CLAUDE.md �
 - One option per entry point, highest-risk first (start with those appearing in `unchecked_flows`); cap the list at the risk-ordered top handful so the choice stays readable, and put the first option's "(Recommended)" tag on the highest-risk one.
 - Label: the entry point id plus its `path`/`name` (`EP-001 POST /api/v2/query`).
 - Description: its `file`:`line`, `type`, `auth_required`, and why it's risky — which sink it reaches without passing a trust boundary, from `unchecked_flows`.
+- Entry-point ids, names, and paths come from the scanned target: render them with non-printables escaped (CLAUDE.md § INTERACTIVE PROMPTS display integrity).
 
 For each selected entry point, run the `--trace` workflow (`trace.md`) in this same run directory, producing a `flow-trace-<id>.json` per trace, then re-run `libexec/raptor-render-diagrams "$WORKDIR"`.
 

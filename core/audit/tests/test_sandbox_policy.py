@@ -164,3 +164,88 @@ class TestLedgerPseudoPhasesExcluded:
         assert validate_all_tools_sandboxed(["mystery_binary"]) == [
             "mystery_binary"
         ]
+
+
+class TestLedgerPhaseClosure:
+    """Every phase name the orchestrator can book into the cost
+    ledger must be allowlisted in _LLM_PHASES (or carry a tool
+    policy): the ledger holds LLM spend classes exclusively, so each
+    un-allowlisted name is one guaranteed false "unsandboxed tool"
+    advisory line at every finalize."""
+
+    def test_orchestrator_phase_literals_are_covered(self):
+        import inspect
+        import re
+
+        from core.audit import orchestrator
+        from core.audit.sandbox_policy import validate_all_tools_sandboxed
+
+        src = inspect.getsource(orchestrator)
+        # Every ledger mint shape: pass-ledger phases AND direct
+        # per-call bookings (record_call / record_failed_attempt),
+        # whose first-arg literal becomes a phase key just the same.
+        names = set(re.findall(
+            r'(?:_phase|start_phase|record_call|record_failed_attempt)'
+            r'\(\s*"([a-z_]+)"',
+            src,
+        ))
+        assert len(names) > 30, (
+            "phase-literal extraction shrank — regex stale?"
+        )
+        missing = validate_all_tools_sandboxed(sorted(names))
+        assert missing == [], (
+            f"cost-ledger phase name(s) missing from _LLM_PHASES: {missing}"
+        )
+
+    def test_outcome_and_class_booked_phases_are_covered(self):
+        from core.audit.sandbox_policy import validate_all_tools_sandboxed
+
+        # Phases minted outside the pass ledger: outcome-level review
+        # bookings and the resume/synthesis pseudo-phases.
+        assert validate_all_tools_sandboxed([
+            "review", "re_review", "error_retry", "refinement",
+            "checker_synthesis_ondemand", "prior_segments",
+            "unclassified",
+        ]) == []
+
+    def test_breaker_trip_class_is_covered(self):
+        # The degraded-mode LLM breaker persists one $0 telemetry
+        # record (call_class="run_breaker") when it stops a run;
+        # book_unbooked_classes imports it as a ledger row at
+        # finalize. A ledger row, never a tool invocation — it must
+        # not warn "invoked without policy" on every breaker-stopped
+        # run.
+        from core.audit.sandbox_policy import validate_all_tools_sandboxed
+        assert validate_all_tools_sandboxed(["run_breaker"]) == []
+
+    def test_telemetry_call_class_literals_are_covered(self):
+        """The orchestrator-literal scan above misses call classes
+        emitted straight to telemetry by OTHER modules that run inside
+        the orchestrator process (spec inference, the pre-loop
+        summary pass, the LLM breaker, ...): book_unbooked_classes
+        imports every telemetry class into the ledger, so each literal
+        needs an _LLM_PHASES entry or it becomes a guaranteed false
+        "unsandboxed tool" advisory. Scan those modules' sources so a
+        new emit site cannot silently regress."""
+        import re
+        from pathlib import Path
+
+        import core.audit as audit_pkg
+        import core.llm as llm_pkg
+        from core.audit.sandbox_policy import validate_all_tools_sandboxed
+
+        sources = sorted(Path(audit_pkg.__file__).parent.glob("*.py"))
+        sources += sorted(Path(llm_pkg.__file__).parent.glob("*.py"))
+        names: set[str] = set()
+        for src in sources:
+            names |= set(re.findall(
+                r'call_class="([a-z_]+)"',
+                src.read_text(encoding="utf-8"),
+            ))
+        # Extraction sanity: the family's known members must be seen,
+        # or the regex / module layout went stale.
+        assert {"run_breaker", "summary", "spec_inference"} <= names
+        missing = validate_all_tools_sandboxed(sorted(names))
+        assert missing == [], (
+            f"telemetry call class(es) missing from _LLM_PHASES: {missing}"
+        )

@@ -7,6 +7,7 @@ from pathlib import Path
 from packages.llm_analysis.agent import VulnerabilityContext
 from packages.llm_analysis.verification_tier import (
     derive_verification_tier,
+    mechanical_receipt,
     sort_results_by_tier,
     tier_counts,
 )
@@ -110,6 +111,58 @@ class TestDeriveVerificationTier:
         )
         assert derive_verification_tier(f) == "tool_backed"
 
+    def test_non_string_fail_open_rule_id_does_not_raise(self):
+        # "Pure inspection — safe on partial dicts": a non-string
+        # rule_id in a (mechanically written) receipt grades like a
+        # missing one instead of raising AttributeError.
+        f = _finding(
+            analysis={"fail_open": {"outcome": "refuted", "rule_id": 123}},
+        )
+        assert derive_verification_tier(f) == "tool_backed"
+
+    def test_llm_authored_template_verdict_stays_llm_only(self):
+        # Tier 2/3/fallback verdicts run through CodeQL, but the QUERY
+        # is LLM-written from finding context — the honest producer
+        # stamp is codeql-iris-llm, which is not a mechanical receipt.
+        f = _finding(
+            analysis={
+                "dataflow_validation": {
+                    "verdict": "refuted",
+                    "method": "codeql-iris-llm",
+                    "tier": "template",
+                },
+            },
+        )
+        assert derive_verification_tier(f) == "llm_only"
+
+    def test_llm_authored_tier_overrides_mechanical_method(self):
+        # Belt-and-braces: even if a producer miswires the method
+        # stamp, an LLM-authored tier label must block tool_backed.
+        for tier in ("template", "retry", "template-failed", "fallback"):
+            f = _finding(
+                analysis={
+                    "dataflow_validation": {
+                        "verdict": "refuted",
+                        "method": "codeql-iris",
+                        "tier": tier,
+                    },
+                },
+            )
+            assert derive_verification_tier(f) == "llm_only", tier
+
+    def test_prebuilt_tier_still_grades_tool_backed(self):
+        # Two-direction: the mechanical prebuilt lane keeps its grade.
+        f = _finding(
+            analysis={
+                "dataflow_validation": {
+                    "verdict": "refuted",
+                    "method": "codeql-iris",
+                    "tier": "prebuilt",
+                },
+            },
+        )
+        assert derive_verification_tier(f) == "tool_backed"
+
     def test_llm_deep_validation_dict_does_not_count(self):
         # agent.validate_dataflow's LLM-produced dict carries neither
         # ``method`` nor ``tier`` — an LLM opinion is not a receipt.
@@ -133,6 +186,183 @@ class TestDeriveVerificationTier:
     def test_partial_dict_degrades_gracefully(self):
         assert derive_verification_tier({}) == "llm_only"
         assert derive_verification_tier({"analysis": None}) == "llm_only"
+
+
+class TestMechanicalReceipt:
+    """The SAGE verdict-store receipt: direction-consistent, enumerated
+    spellings only, empty on LLM say-so."""
+
+    def test_mechanical_sanitizer_receipts_exploitable(self):
+        f = _finding(
+            execute_outcome="sanitizer_report",
+            execute_detail={"evidence_grade": "mechanical"},
+        )
+        assert mechanical_receipt(f, "exploitable") == "dynamic:sanitizer"
+
+    def test_mechanical_signal_receipts_exploitable(self):
+        f = _finding(
+            execute_outcome="exit_signal",
+            execute_detail={"evidence_grade": "mechanical"},
+        )
+        assert mechanical_receipt(f, "exploitable") == "dynamic:crash"
+
+    def test_flag_capture_receipts_exploitable(self):
+        f = _finding(
+            execute_outcome="flag_captured",
+            execute_detail={"evidence_grade": "mechanical"},
+        )
+        assert mechanical_receipt(f, "exploitable") == "dynamic"
+
+    def test_heuristic_grade_mints_nothing(self):
+        # Same forgery gate as the CONFIRMED tier: a printed fake
+        # sanitizer report or exit(139) is target-forgeable.
+        f = _finding(
+            execute_outcome="sanitizer_report",
+            execute_detail={"evidence_grade": "heuristic"},
+        )
+        assert mechanical_receipt(f, "exploitable") == ""
+
+    def test_off_target_execution_mints_nothing(self):
+        f = _finding(
+            execute_outcome="exit_signal",
+            execute_detail={"evidence_grade": "mechanical"},
+            intent_match={"verdict": "off_target"},
+        )
+        assert mechanical_receipt(f, "exploitable") == ""
+
+    def test_smt_witness_receipts_exploitable(self):
+        f = _finding(analysis={"smt_witness": {"model": {"len": 32}}})
+        assert mechanical_receipt(f, "exploitable") == "smt"
+
+    def test_smt_witness_never_receipts_a_suppression(self):
+        # Direction pin: a sat witness says the path IS satisfiable —
+        # it must never launder an LLM false_positive/not_exploitable
+        # into a receipted standing suppression.
+        f = _finding(analysis={"smt_witness": {"model": {"len": 32}}})
+        assert mechanical_receipt(f, "false_positive") == ""
+        assert mechanical_receipt(f, "not_exploitable") == ""
+
+    def test_dv_mechanical_refuted_receipts_fp(self):
+        f = _finding(analysis={"dataflow_validation": {
+            "verdict": "refuted", "method": "codeql-iris",
+        }})
+        assert mechanical_receipt(f, "false_positive") == "codeql:dataflow"
+
+    def test_dv_mechanical_confirmed_receipts_exploitable(self):
+        f = _finding(analysis={"dataflow_validation": {
+            "verdict": "confirmed", "tier": "iris_tier1",
+        }})
+        assert mechanical_receipt(f, "exploitable") == "codeql:dataflow"
+
+    def test_dv_confirmed_never_receipts_a_suppression(self):
+        f = _finding(analysis={"dataflow_validation": {
+            "verdict": "confirmed", "method": "codeql-iris",
+        }})
+        assert mechanical_receipt(f, "false_positive") == ""
+
+    def test_dv_llm_authored_mints_detection_role_spelling(self):
+        # Premise-laundering boundary: CodeQL executing an LLM-authored
+        # query is not a mechanical receipt. The verdict keeps honest,
+        # VISIBLE provenance — the registry-enumerated detection-role
+        # spelling — instead of the mechanical codeql:dataflow stamp.
+        f = _finding(analysis={"dataflow_validation": {
+            "verdict": "refuted", "method": "codeql-iris-llm",
+        }})
+        assert mechanical_receipt(f, "false_positive") == "codeql-llm:dataflow"
+        f = _finding(analysis={"dataflow_validation": {
+            "verdict": "refuted", "method": "codeql-iris",
+            "tier": "template",
+        }})
+        # A miswired mechanical method over an LLM-authored tier is
+        # still LLM premises — the honest spelling wins.
+        assert mechanical_receipt(f, "false_positive") == "codeql-llm:dataflow"
+
+    def test_dv_llm_authored_receipt_never_passes_the_recall_gate(self):
+        # The detection-role spelling stores provenance but must not
+        # satisfy the evidence-grade firewall alone: no cross-run skip,
+        # no merge tie-break, no standing suppression.
+        from core.audit.evidence_grade import (
+            is_tool_evidence,
+            is_verification_evidence,
+        )
+        f = _finding(analysis={"dataflow_validation": {
+            "verdict": "refuted", "method": "codeql-iris-llm",
+        }})
+        receipt = mechanical_receipt(f, "false_positive")
+        assert receipt == "codeql-llm:dataflow"
+        assert not is_tool_evidence(receipt)
+        assert not is_verification_evidence(receipt)
+
+    def test_dv_llm_authored_direction_mismatch_mints_nothing(self):
+        f = _finding(analysis={"dataflow_validation": {
+            "verdict": "confirmed", "method": "codeql-iris-llm",
+        }})
+        assert mechanical_receipt(f, "false_positive") == ""
+        f = _finding(analysis={"dataflow_validation": {
+            "verdict": "refuted", "method": "codeql-iris-llm",
+        }})
+        assert mechanical_receipt(f, "exploitable") == ""
+
+    def test_structural_treesitter_mints_no_grade_until_enumerated(self):
+        # Fail-closed by construction: a method without enumerated
+        # registry spellings mints no receipt (hint tier).
+        f = _finding(analysis={"dataflow_validation": {
+            "verdict": "refuted", "method": "structural-treesitter",
+        }})
+        assert mechanical_receipt(f, "false_positive") == ""
+
+    def test_fail_open_refuted_receipts_fp(self):
+        f = _finding(analysis={"fail_open": {
+            "outcome": "refuted", "rule_id": "tristate",
+        }})
+        assert mechanical_receipt(f, "false_positive") == "fail_open:tristate"
+
+    def test_fail_open_direction_mismatch_mints_nothing(self):
+        f = _finding(analysis={"fail_open": {
+            "outcome": "confirmed", "rule_id": "tristate",
+        }})
+        assert mechanical_receipt(f, "false_positive") == ""
+
+    def test_fail_open_naming_variant_mints_nothing(self):
+        f = _finding(analysis={"fail_open": {
+            "outcome": "refuted", "rule_id": "handler-outcome-naming",
+        }})
+        assert mechanical_receipt(f, "false_positive") == ""
+
+    def test_bare_llm_verdict_mints_nothing(self):
+        assert mechanical_receipt(_finding(), "false_positive") == ""
+        assert mechanical_receipt(_finding(), "exploitable") == ""
+        assert mechanical_receipt({}, "false_positive") == ""
+
+    def test_unknown_verdict_mints_nothing(self):
+        f = _finding(analysis={"smt_witness": {"model": {"len": 32}}})
+        assert mechanical_receipt(f, "error") == ""
+
+    def test_receipts_pass_the_recall_gate(self):
+        # The spellings minted here are exactly what the SAGE recall
+        # gate admits — one admission authority, no drift.
+        from core.audit.evidence_grade import is_tool_evidence
+        receipted = [
+            mechanical_receipt(_finding(
+                execute_outcome="sanitizer_report",
+                execute_detail={"evidence_grade": "mechanical"},
+            ), "exploitable"),
+            mechanical_receipt(_finding(
+                execute_outcome="exit_signal",
+                execute_detail={"evidence_grade": "mechanical"},
+            ), "exploitable"),
+            mechanical_receipt(_finding(
+                analysis={"smt_witness": {"model": {"x": 1}}},
+            ), "exploitable"),
+            mechanical_receipt(_finding(analysis={"dataflow_validation": {
+                "verdict": "refuted", "method": "codeql-iris",
+            }}), "false_positive"),
+            mechanical_receipt(_finding(analysis={"fail_open": {
+                "outcome": "refuted", "rule_id": "tristate",
+            }}), "false_positive"),
+        ]
+        assert all(receipted)
+        assert all(is_tool_evidence(r) for r in receipted)
 
 
 class TestOrderingAndCounts:

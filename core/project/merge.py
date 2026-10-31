@@ -39,6 +39,12 @@ KNOWN_FILES = {
     "verification.json",
     "orchestrated_report.json",
     "raptor_agentic_report.json",
+    # Standalone /openant runs: the findings feed merge_findings via
+    # load_findings_from_dir's openant fallback; the per-run report
+    # pair is handled like its raptor_agentic_report.json sibling.
+    "openant_findings.json",
+    "raptor_openant_report.json",
+    "openant-report.md",
 }
 
 # Patterns for known file types (matched by extension).
@@ -75,8 +81,7 @@ def _extract_date_from_dir(run_dir: Path) -> str:
     so collision-renamed files stay stable across re-merges) and
     short enough to not bloat downstream filenames.
     """
-    # `re.ASCII` so `\d` matches only ASCII digits. Same rationale as
-    # core/run/metadata.py:_extract_date_from_dir — Unicode-default
+    # `re.ASCII` so `\d` matches only ASCII digits: Unicode-default
     # `\d` admits Devanagari / Arabic-Indic / fullwidth digits, which
     # would break the deterministic timestamp-from-name extraction
     # if a tool re-encoded glyphs in the path. Anchoring to ASCII
@@ -166,8 +171,11 @@ def _finding_key(finding: dict[str, Any]) -> tuple:
     location-based dedup; merge has its own slightly stricter
     key that keeps vuln-class information visible.
     """
+    from core.project.findings_utils import _key_str
     base = _dedup_key(finding)
-    return base + (finding.get("vuln_type", ""),)
+    # _key_str: a hostile row's dict-valued vuln_type made the tuple
+    # unhashable and one row wedged the whole merge (see findings_utils).
+    return base + (_key_str(finding.get("vuln_type", "")),)
 
 
 # Status progression: higher rank = more information about the finding.
@@ -274,7 +282,7 @@ def merge_findings(run_dirs: list[Path]) -> list[dict[str, Any]]:
                     acc_key = ("stamp", run_id,
                                r["manifest_path"], r.get("ts"))
                 else:
-                    acc_key = ("ref", run_id)
+                    acc_key = ("ref", run_id)  # type: ignore[assignment]
                 if acc_key not in ref_acc:
                     ref_acc[acc_key] = r
             candidate_rank = (origin_rank, _status_rank(finding))
@@ -361,6 +369,46 @@ def merge_runs(run_dirs: list[Path], output_dir: Path) -> dict[str, Any]:
 
     if merged:
         save_json(output_dir / "findings.json", {"findings": merged})
+
+    # --- Re-adjudication queue ---
+    # The status race above deliberately lets a recorded disproof
+    # outrank a newer claim at the same key — correct for the merged
+    # VIEW, but it destroys the contradiction signal at exactly the
+    # moment it matters (a later independent scanner re-asserting a
+    # site someone ruled out). Emit the queue IN ADDITION to the fold;
+    # nothing about the merge result changes, and no verdict is ever
+    # overturned here — adjudication is a validation-lane task.
+    # Best-effort: an additive signal must never break the merge.
+    # Per-run queue files from source runs are NOT in KNOWN_FILES, so
+    # the artefact-copy legs below carry them into the merged output
+    # (collision-renamed against the fresh queue written here). That
+    # is deliberate: /project merge deletes the source runs afterwards,
+    # and an import-time queue records contradictions against a prior
+    # container this recomputation can no longer see — the renamed
+    # copies are the only surviving per-run trail.
+    readjudication_queued = 0
+    try:
+        from core.project.readjudication import (
+            detect_project_contradictions,
+            queued_count,
+            suppressed_count,
+            write_queue,
+        )
+        readj_records = detect_project_contradictions(run_dirs)
+        readjudication_queued = queued_count(readj_records)
+        queue_path = write_queue(output_dir, readj_records)
+        if readjudication_queued and queue_path is not None:
+            n_suppressed = suppressed_count(readj_records)
+            # A capped queue must never read as complete.
+            capped = (f" (+{n_suppressed} further not recorded — "
+                      f"record caps)" if n_suppressed else "")
+            logger.info(
+                "%d cross-adjudication contradiction(s) queued for "
+                "re-adjudication%s → %s",
+                readjudication_queued, capped, queue_path,
+            )
+    except Exception:  # noqa: BLE001 — additive trail, never merge-fatal
+        logger.warning("re-adjudication detection failed", exc_info=True)
 
     # --- Re-stamp the imported-origin marker ---
     # A merged output that folds ANY imported (unsigned-archive) source
@@ -519,6 +567,7 @@ def merge_runs(run_dirs: list[Path], output_dir: Path) -> dict[str, Any]:
         "unique_vulns": vuln_count,
         "sarif_files_merged": sarif_files_merged,
         "artefacts_preserved": artefacts_preserved,
+        "readjudication_queued": readjudication_queued,
     }
 
     # Documented convention (_finding_key docstring): "N findings (M

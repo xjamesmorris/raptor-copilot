@@ -46,6 +46,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
+from core.source.lines import split_lines
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -71,10 +72,19 @@ _ATOM = (
     rf"|(?:min|max)\s*\((?:[^()]|\([^()]{{0,48}}\)){{0,80}}\)"
     rf"|{_IDENT}|\d+)"
 )
-_SIDE_TAIL = rf"{_ATOM}(?:\s*[+\-]\s*{_ATOM})*"
+# The +/- chain is bounded: with an unbounded chain, a run of
+# single-char terms ("a+a+a+...") makes every atom start re-walk the
+# chain tail when the end anchor fails — quadratic in the side text.
+# Real invariant sides carry a handful of terms; 12 is generous
+# (trade-off: a longer chain stops parsing as one side, versus an
+# unbounded re-walk on hostile text).
+_SIDE_TAIL = rf"{_ATOM}(?:\s*[+\-]\s*{_ATOM}){{0,12}}"
 # Anchored forms: the LAST expression before the operator and the
-# FIRST expression after it (prose around them is ignored).
-_LHS_RE = re.compile(rf"({_SIDE_TAIL})\s*$")
+# FIRST expression after it (prose around them is ignored).  The
+# leading \b pins the search to atom starts — a mid-word start only
+# ever fabricated a token (the "xff" tail of a hex literal), and an
+# unpinned scan re-reads the same word from every offset.
+_LHS_RE = re.compile(rf"\b({_SIDE_TAIL})\s*$")
 _RHS_RE = re.compile(rf"^\s*({_SIDE_TAIL})")
 
 # How far around the operator an invariant side may reach.
@@ -343,7 +353,7 @@ def find_mutation_sites(
     from .source_view import sanitized_view
     sites: list[tuple[int, str, str, str, str]] = []
     view = sanitized_view(source, language="c")
-    for line_no, code in enumerate(view.splitlines(), start=1):
+    for line_no, code in enumerate(split_lines(view), start=1):
         for var in sorted(variables, key=len, reverse=True):
             v = re.escape(var)
             m = re.search(
@@ -380,7 +390,7 @@ def find_alias_escapes(
     escapes: list[tuple[int, str, str]] = []
     view = sanitized_view(source, language="c")
     member = r"(?:[A-Za-z_]\w*\s*(?:->|\.)\s*)"
-    for line_no, code in enumerate(view.splitlines(), start=1):
+    for line_no, code in enumerate(split_lines(view), start=1):
         for var in sorted(variables, key=len, reverse=True):
             v = re.escape(var)
             # &var and &s->var / &s.var (member paths ending in the

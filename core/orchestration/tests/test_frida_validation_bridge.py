@@ -2,6 +2,7 @@
 
 import copy
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,20 @@ from core.orchestration.frida_validation_bridge import (
     annotate_attack_paths,
     PROXIMITY_FLOOR,
 )
+
+
+@pytest.fixture(autouse=True)
+def _raptor_logger_propagates():
+    """Let caplog see records from the 'raptor' logger.
+
+    RaptorLogger sets propagate=False on logging.getLogger('raptor'),
+    so records never reach root where pytest's caplog handler lives.
+    """
+    raptor = logging.getLogger("raptor")
+    orig = raptor.propagate
+    raptor.propagate = True
+    yield
+    raptor.propagate = orig
 
 
 # ---------------------------------------------------------------------------
@@ -331,13 +346,16 @@ class TestAnnotateAttackPaths:
         assert result[0]["proximity"] == 8
 
     def test_empty_evidence_map(self):
-        """Empty evidence map returns input unchanged (no copy needed)."""
+        """Empty evidence map returns an equal COPY — the docstring
+        contract (callers own the result, original never aliased)
+        holds on every path, including the no-evidence early
+        return."""
         paths = [_make_attack_path("P1", [
             {"step": 1, "action": "call open()", "function": "open"},
         ])]
         result = annotate_attack_paths(paths, {})
         assert result == paths
-        assert result is paths
+        assert result is not paths
 
     def test_frida_trace_id_on_path(self):
         """Annotated paths carry frida_trace_id for provenance."""
@@ -579,7 +597,7 @@ class TestBacktraceAttribution:
             },
         }])
         _write_metadata(run, target_binary=str(tmp_path / "srv"))
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.WARNING, logger="raptor"):
             assert collect_runtime_evidence([tmp_path]) == {}
         # Attribution loss must never look like "no sink calls
         # occurred".
@@ -684,7 +702,7 @@ class TestDropDiagnosticLevel:
         # run; warning each time would train operators to ignore it.
         import logging
         self._events(tmp_path, [_sink_event("memcpy", caller_module="srv")])
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.WARNING, logger="raptor"):
             evidence = collect_runtime_evidence([tmp_path])
         assert "memcpy" in evidence
         assert not any("failed target attribution" in r.message
@@ -693,7 +711,7 @@ class TestDropDiagnosticLevel:
     def test_zero_evidence_run_warns(self, tmp_path, caplog):
         import logging
         self._events(tmp_path, [])
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.WARNING, logger="raptor"):
             assert collect_runtime_evidence([tmp_path]) == {}
         assert any("NO evidence was collected" in r.message
                    for r in caplog.records)
@@ -942,3 +960,63 @@ class TestCallsiteMatch:
         re_dict = out[0]["steps"][0]["runtime_evidence"]
         assert "callsite_match" not in re_dict
         assert re_dict["observed_callsites"][0]["source"] is None
+
+
+class TestContradictedCallsiteFloor:
+    """A callsite_match of False means the resolved call sites
+    CONTRADICT the step — contradicting evidence must not establish
+    the proximity floor (None — nothing resolved — still floors)."""
+
+    def _evidence(self, source: str | None):
+        return {"memcpy": RuntimeEvidence(
+            function_observed=True, call_count=1,
+            observed_callsites=[{"module": "srv", "offset": "0x10",
+                                 "source": source}])}
+
+    def test_contradicted_step_does_not_floor(self):
+        paths = [{"steps": [{"function": "memcpy",
+                             "call_site": "src/parse.c:48"}],
+                  "proximity": 1}]
+        out = annotate_attack_paths(
+            paths, self._evidence("/build/src/other.c:200"))
+        step = out[0]["steps"][0]
+        assert step["runtime_evidence"]["callsite_match"] is False
+        # Evidence is still recorded and surfaced...
+        assert out[0]["runtime_evidence_available"] is True
+        # ...but the floor is withheld: the trace points elsewhere.
+        assert out[0]["proximity"] == 1
+
+    def test_corroborated_sibling_step_still_floors(self):
+        evidence = self._evidence("/build/src/other.c:200")
+        evidence["open"] = RuntimeEvidence(
+            function_observed=True, call_count=4, trace_id="/out/run")
+        paths = [{"steps": [
+            {"function": "memcpy", "call_site": "src/parse.c:48"},
+            {"function": "open"},
+        ], "proximity": 1}]
+        out = annotate_attack_paths(paths, evidence)
+        assert out[0]["steps"][0]["runtime_evidence"][
+            "callsite_match"] is False
+        assert out[0]["proximity"] >= PROXIMITY_FLOOR
+
+    def test_matching_callsite_floors(self):
+        paths = [{"steps": [{"function": "memcpy",
+                             "call_site": "src/parse.c:48"}],
+                  "proximity": 1}]
+        out = annotate_attack_paths(
+            paths, self._evidence("/build/src/parse.c:48"))
+        assert out[0]["steps"][0]["runtime_evidence"][
+            "callsite_match"] is True
+        assert out[0]["proximity"] >= PROXIMITY_FLOOR
+
+
+class TestEmptyEvidenceCopyContract:
+    def test_empty_map_early_return_is_a_copy(self):
+        """Docstring contract: callers always own the result — the
+        no-evidence early return handed back the ORIGINAL list
+        object, inviting aliased mutation on that path only."""
+        paths = [{"steps": [{"function": "open"}], "proximity": 1}]
+        out = annotate_attack_paths(paths, {})
+        assert out == paths
+        assert out is not paths
+        assert out[0] is not paths[0]

@@ -37,6 +37,8 @@ from typing import Any, TYPE_CHECKING
 if TYPE_CHECKING:
     from core.inventory.call_graph import FileCallGraph
 
+from core.inventory.call_graph import build_reverse_edges
+
 logger = logging.getLogger(__name__)
 
 # Byte budgets for the discovery walk over the (target-controlled)
@@ -45,8 +47,31 @@ logger = logging.getLogger(__name__)
 # walk will ever read so a hostile tree cannot grind discovery — the
 # default context-map enrichment runs this unscoped over the whole
 # target.
+# Per-file cap, both directions: RAISING it admits amalgamations
+# (file size is target-derived — a hostile tree of huge files must
+# not buy unbounded read+extract time, and one 100 MiB file would
+# also eat the aggregate budget alone). LOWERING it drops real,
+# hand-written big files — an sqlite3.c-style amalgamation is over
+# this cap yet is exactly where the sinks live. When it binds, the
+# walk counts the skips and discloses them once with a warning
+# (budget_warning consumers only — the fingerprint consumer stays
+# silent by design), so a skipped monster is visible, not a silent
+# hole in sink/reachability coverage.
 _PER_FILE_CAP = 2_000_000
-_AGGREGATE_CAP = 256 * 1024 * 1024
+# Aggregate ceiling, both directions: LOWER re-creates kernel-scale
+# truncation — a kernel tree carries on the order of 1 GiB of
+# admissible C, the previous 256 MiB budget exhausted mid-walk, the
+# remaining files contributed zero sinks/reach, and every "no sink
+# path" claim after that point was computed on a partial call graph.
+# HIGHER lets a hostile tree of cap-sized files grind discovery:
+# call-graph extraction measures ~1.8 MB/s (tree-sitter C), so the
+# ceiling already admits ~20 min of worst-case parse (paid once per
+# tree — the result rides the prep cache by content fingerprint).
+# Truncation at the ceiling is never silent: the walk stamps a
+# structured ``SinkDiscoveryResult.truncation`` record and the
+# sink-unreachable verdicts fail closed (see
+# ``discover_sinks_for_target``).
+_AGGREGATE_CAP = 2 * 1024 * 1024 * 1024
 
 # ── Source-level dangerous call targets ─────────────────────────────
 # Qualified dotted names matched against the full call chain. Only
@@ -326,6 +351,14 @@ class SinkDiscoveryResult:
     framework_apis: list[FrameworkAPI]
     dangerous_target_counts: dict[str, int]
     unreachable_eligible: dict[tuple[str, str], UnreachableVerdict] | None = None
+    #: Honest-incomplete marker: ``None`` when the discovery walk read
+    #: every eligible file; a structured record (reason, budget and
+    #: admitted/skipped file+byte counts) when the aggregate byte
+    #: budget truncated the walk. Serialised through every artifact
+    #: shape (context-map ``sink_discovery``, the audit prep cache) so
+    #: downstream consumers see the degradation as a field, not a log
+    #: line.
+    truncation: dict[str, Any] | None = None
 
     def as_dict(self) -> dict:
         """Serialise for JSON output / context-map enrichment."""
@@ -366,6 +399,10 @@ class SinkDiscoveryResult:
                     key=lambda x: -x[1],
                 )
             },
+            # Only present when the walk truncated — the common
+            # (complete) case keeps the context-map shape unchanged.
+            **({"truncation": self.truncation}
+               if self.truncation is not None else {}),
         }
 
     def to_full_dict(self) -> dict:
@@ -410,6 +447,7 @@ class SinkDiscoveryResult:
                 for f in self.framework_apis
             ],
             "dangerous_target_counts": self.dangerous_target_counts,
+            "truncation": self.truncation,
             "unreachable_eligible": (
                 [
                     {
@@ -471,6 +509,10 @@ class SinkDiscoveryResult:
             ],
             dangerous_target_counts=dict(
                 d.get("dangerous_target_counts") or {},
+            ),
+            truncation=(
+                dict(d["truncation"])
+                if isinstance(d.get("truncation"), dict) else None
             ),
             unreachable_eligible=(
                 {
@@ -594,6 +636,7 @@ def discover_sinks(
     max_depth: int = 10,
     framework_threshold: int = 5,
     framework_min_files: int = 3,
+    file_languages: dict[str, str] | None = None,
 ) -> SinkDiscoveryResult:
     """Run mechanical sink discovery over a set of per-file call graphs.
 
@@ -610,6 +653,12 @@ def discover_sinks(
         Minimum number of distinct files containing callers for a
         target to be considered a framework API (filters out
         file-local helper patterns).
+    file_languages
+        Optional relative path → RESOLVED language map (content
+        refinement included). Drives the C fn-pointer-field defense so
+        headers routed to the C grammar get the same guard as .c files;
+        without it the defense falls back to the .c suffix (legacy
+        callers keep their behavior).
 
     Returns
     -------
@@ -618,23 +667,10 @@ def discover_sinks(
     """
     # Phase 1: Find direct dangerous callers
     direct_sinks: list[SinkInfo] = []
-    # Build forward call graph: (file, caller) → set of (file, callee)
-    forward_edges: dict[FuncKey, set[FuncKey]] = defaultdict(set)
-    # Build reverse call graph: (file, callee) → set of (file, caller)
-    reverse_edges: dict[FuncKey, set[FuncKey]] = defaultdict(set)
-    # Track which functions directly call dangerous targets
+    reverse_edges = build_reverse_edges(call_graphs)
     direct_dangerous: dict[FuncKey, set[str]] = defaultdict(set)
-    # Track all call targets for framework discovery
     target_callers: dict[str, set[FuncKey]] = defaultdict(set)
     target_files: dict[str, set[str]] = defaultdict(set)
-    # Build cross-file function index: function name → files where it is
-    # defined (approximated by where it appears as a caller in call graphs).
-    # This enables cross-file edge building below.
-    _func_defined_in: dict[str, set[str]] = defaultdict(set)
-    for filepath, graph in call_graphs.items():
-        for call in graph.calls:
-            if call.caller and call.caller != "<module>":
-                _func_defined_in[call.caller].add(filepath)
 
     for filepath, graph in call_graphs.items():
         for call in graph.calls:
@@ -642,12 +678,10 @@ def discover_sinks(
             caller_key: FuncKey = (filepath, caller)
             dotted = ".".join(call.chain)
 
-            # Track for framework discovery
             if "." in dotted or ":" in dotted:
                 target_callers[dotted].add(caller_key)
                 target_files[dotted].add(filepath)
 
-            # Check if this is a dangerous call
             danger = _is_dangerous(call.chain)
             if danger:
                 direct_sinks.append(SinkInfo(
@@ -657,35 +691,6 @@ def discover_sinks(
                     target=danger,
                 ))
                 direct_dangerous[caller_key].add(danger)
-
-            # Build inter-function edges — same-file and cross-file.
-            # Cross-file edges are added when a bare function call
-            # matches a function defined in another file within the
-            # inventory.  Import-qualified resolution (e.g. resolving
-            # ``from pkg import func`` to the defining file) is not
-            # yet handled — that requires the import resolver in
-            # core.analysis.reachability.
-            # TODO: use import resolution from core.analysis.reachability
-            # to resolve qualified cross-file calls (e.g. module.func).
-            if len(call.chain) == 1:
-                callee_name = call.chain[0]
-                callee_key: FuncKey = (filepath, callee_name)
-                forward_edges[caller_key].add(callee_key)
-                reverse_edges[callee_key].add(caller_key)
-                # Cross-file: callee defined in other inventory files
-                resolved = False
-                for other_file in _func_defined_in.get(callee_name, ()):
-                    resolved = True
-                    if other_file != filepath:
-                        cross_key: FuncKey = (other_file, callee_name)
-                        forward_edges[caller_key].add(cross_key)
-                        reverse_edges[cross_key].add(caller_key)
-                if not resolved and callee_name in _func_defined_in:
-                    resolved = True
-            elif len(call.chain) == 2 and call.chain[0] in ("self", "this"):
-                callee_key = (filepath, call.chain[1])
-                forward_edges[caller_key].add(callee_key)
-                reverse_edges[callee_key].add(caller_key)
 
     # Phase 2: Transitive reverse reachability from dangerous callers
     # BFS backwards from every function that directly calls a dangerous target
@@ -802,11 +807,29 @@ def discover_sinks(
     # (L1) only cover ``(*fp)(...)`` and local fn-ptr variables; the
     # field-call form was the blind spot that triage-skipped a real
     # callback-invoking function. Consumes the existing call-graph
-    # chains — no new parsing. Scoped to ``.c`` files: in C++/Python/JS
-    # an ``a.b(...)`` chain is an ordinary method call.
+    # chains — no new parsing. Scoped to the C LANGUAGE: in
+    # C++/Python/JS an ``a.b(...)`` chain is an ordinary method call.
+    # Keyed on the resolved language when the caller provides it — a
+    # ``.h`` header routes to the C grammar and gets a C call graph
+    # (kernel-style ``static inline`` helpers with ``ctx->cb(...)``
+    # calls are the idiomatic carrier), so a suffix key left exactly
+    # the triage-skip this guard closed open one file-extension away.
+    # Headers content-refined to cpp stay excluded — the C++
+    # member-call decline is deliberate.
+    from core.inventory.languages import detect_language
+
+    def _is_c_file(fp: str) -> bool:
+        if file_languages is not None:
+            return file_languages.get(fp) == "c"
+        # No resolved map (direct callers): extension routing — .h
+        # defaults to C exactly as LANGUAGE_MAP routes it. A
+        # C++-marker header lands under the guard here too; that only
+        # BLOCKS scope-narrowing (eligible=False), the safe direction.
+        return detect_language(fp) == "c"
+
     c_indirect_callers: set[FuncKey] = set()
     for filepath, graph in call_graphs.items():
-        if not filepath.endswith(".c"):
+        if not _is_c_file(filepath):
             continue
         for call in graph.calls:
             if call.chain and len(call.chain) > 1:
@@ -902,13 +925,17 @@ def discover_sinks_for_target(
         return SinkDiscoveryResult([], [], [], {})
 
     call_graphs: dict[str, FileCallGraph] = {}
+    file_languages: dict[str, str] = {}
 
     # Language → extractor function
     extractors = _get_call_graph_extractors()
 
+    from core.inventory.languages import refine_language
+
+    walk_stats: dict[str, Any] = {}
     for source_file, rel, lang in iter_discovery_source_files(
         target, languages=languages, scope_dirs=scope_dirs,
-        budget_warning=True,
+        budget_warning=True, stats=walk_stats,
     ):
         extractor = extractors[lang]
         try:
@@ -916,6 +943,12 @@ def discover_sinks_for_target(
             graph = extractor(content)
             if graph.calls:
                 call_graphs[rel] = graph
+                # Resolved language for the fn-pointer-field defense:
+                # content refinement routes C++-marker headers to cpp
+                # (deliberately outside the C guard) and keeps plain-C
+                # headers under it.
+                file_languages[rel] = refine_language(
+                    lang, str(source_file), content) or lang
         except Exception:
             logger.debug("sink discovery: callgraph extraction failed for %s", rel, exc_info=True)
             continue
@@ -926,12 +959,53 @@ def discover_sinks_for_target(
         # without a second parse of the tree).
         collect_call_graphs.update(call_graphs)
 
-    return discover_sinks(
+    result = discover_sinks(
         call_graphs,
         max_depth=max_depth,
         framework_threshold=framework_threshold,
         framework_min_files=framework_min_files,
+        file_languages=file_languages,
     )
+
+    if walk_stats.get("truncated"):
+        # Structured honest-incomplete marker: rides as_dict() into
+        # the context map and to_full_dict() into the prep cache, so
+        # every downstream consumer (and a resumed segment reloading
+        # the cache) sees the degradation in-band, not just in a log
+        # line.
+        result.truncation = {
+            "reason": "aggregate_byte_budget",
+            "budget_bytes": walk_stats.get("budget_bytes", 0),
+            "admitted_files": walk_stats.get("admitted_files", 0),
+            "admitted_bytes": walk_stats.get("admitted_bytes", 0),
+            "skipped_files": walk_stats.get("skipped_files", 0),
+            "skipped_bytes": walk_stats.get("skipped_bytes", 0),
+        }
+        # A truncated walk saw only part of the call graph: any
+        # skipped file may hold a caller that reaches a "no sink
+        # path" function, so no eligible=True verdict may survive.
+        # eligible=False is the fail-safe direction — it only BLOCKS
+        # sink_unreachable scope-narrowing downstream (core.evidence
+        # consumes eligible verdicts as permission to narrow, never
+        # as suppression on their own).
+        assert result.unreachable_eligible is not None
+        for key, verdict in result.unreachable_eligible.items():
+            if verdict.eligible:
+                result.unreachable_eligible[key] = UnreachableVerdict(
+                    file=verdict.file,
+                    function=verdict.function,
+                    eligible=False,
+                    reason="discovery truncated: aggregate byte budget",
+                )
+        logger.warning(
+            "sink_discovery: walk truncated by aggregate byte budget "
+            "(%d files / %d bytes skipped) — sink_unreachable "
+            "scope-narrowing disabled for this run",
+            result.truncation["skipped_files"],
+            result.truncation["skipped_bytes"],
+        )
+
+    return result
 
 
 def iter_discovery_source_files(
@@ -940,6 +1014,7 @@ def iter_discovery_source_files(
     languages: set[str] | None = None,
     scope_dirs: list | None = None,
     budget_warning: bool = False,
+    stats: dict[str, Any] | None = None,
 ):
     """Yield ``(path, rel, lang)`` for every file the discovery walk
     reads, applying the same gates in the same walk order (scope,
@@ -950,6 +1025,17 @@ def iter_discovery_source_files(
     walk in :func:`discover_sinks_for_target` and any fingerprint of
     its inputs (the audit prep cache) both consume it, so the two can
     never drift.
+
+    ``stats``, when provided, is filled in place with the walk's
+    admission accounting (``admitted_files``/``admitted_bytes``/
+    ``skipped_files``/``skipped_bytes``/``budget_bytes``/
+    ``truncated``) once the generator is exhausted. The ADMITTED set
+    is byte-identical with or without ``stats`` — the first file
+    over the remaining budget permanently closes admission (matching
+    the historical ``break``), and with ``stats`` the walk merely
+    keeps counting the gate-passing files it can no longer admit.
+    The fingerprint path (no ``stats``) and the discovery walk
+    therefore still enumerate the same inputs.
     """
     from core.inventory.languages import detect_language
 
@@ -958,7 +1044,17 @@ def iter_discovery_source_files(
         tuple(str(Path(s).resolve()) for s in scope_dirs)
         if scope_dirs else None
     )
-    budget_remaining = _AGGREGATE_CAP
+    # Read once at generator start so a monkeypatched cap binds the
+    # whole walk consistently (admission AND the reported budget).
+    budget_bytes = _AGGREGATE_CAP
+    budget_remaining = budget_bytes
+    truncated = False
+    admitted_files = 0
+    admitted_bytes = 0
+    skipped_files = 0
+    skipped_bytes = 0
+    oversize_skipped = 0
+    oversize_example: str | None = None
 
     for source_file in _iter_source_files(target):
         if scope_prefixes and not str(
@@ -983,17 +1079,56 @@ def iter_discovery_source_files(
             st = source_file.lstat()
         except OSError:
             continue
-        if not stat.S_ISREG(st.st_mode) or st.st_size > _PER_FILE_CAP:
+        if not stat.S_ISREG(st.st_mode):
             continue
-        if st.st_size > budget_remaining:
-            if budget_warning:
-                logger.warning(
-                    "sink_discovery: aggregate byte budget (%d) exhausted "
-                    "at %s; remaining files skipped", _AGGREGATE_CAP, rel,
-                )
-            break
+        if st.st_size > _PER_FILE_CAP:
+            oversize_skipped += 1
+            if oversize_example is None:
+                oversize_example = rel
+            continue
+        if truncated or st.st_size > budget_remaining:
+            if not truncated:
+                truncated = True
+                if budget_warning:
+                    logger.warning(
+                        "sink_discovery: aggregate byte budget (%d) "
+                        "exhausted at %s; remaining files skipped",
+                        budget_bytes, rel,
+                    )
+            if stats is None:
+                # Historical behaviour (fingerprint path): stop the
+                # walk on the first over-budget file.
+                break
+            # Admission stays closed (identical admitted set to the
+            # break above); keep walking only to COUNT what the
+            # budget dropped, so the truncation record is honest.
+            skipped_files += 1
+            skipped_bytes += st.st_size
+            continue
         budget_remaining -= st.st_size
+        admitted_files += 1
+        admitted_bytes += st.st_size
         yield source_file, rel, lang
+    if budget_warning and oversize_skipped:
+        # Coverage-carrying disclosure, once per walk: every skipped
+        # file contributes zero sinks and zero reachability, and the
+        # over-cap files are often the central ones (amalgamations).
+        logger.warning(
+            "sink_discovery: %d file(s) over the per-file byte cap "
+            "(%d) skipped unread (e.g. %r) — they contribute no "
+            "sinks or reachability to the context map",
+            oversize_skipped, _PER_FILE_CAP, oversize_example,
+        )
+
+    if stats is not None:
+        stats.update({
+            "admitted_files": admitted_files,
+            "admitted_bytes": admitted_bytes,
+            "skipped_files": skipped_files,
+            "skipped_bytes": skipped_bytes,
+            "budget_bytes": budget_bytes,
+            "truncated": truncated,
+        })
 
 
 def _get_call_graph_extractors():
@@ -1007,12 +1142,25 @@ def _get_call_graph_extractors():
         extract_call_graph_go,
         extract_call_graph_java,
         extract_call_graph_javascript,
+        extract_call_graph_kotlin,
         extract_call_graph_lua,
         extract_call_graph_php,
         extract_call_graph_python,
         extract_call_graph_ruby,
         extract_call_graph_rust,
+        extract_call_graph_scala,
+        extract_call_graph_swift,
     )
+    # Keep in lockstep with the builder's call-graph wiring: any
+    # language missing here is silently skipped by
+    # iter_discovery_source_files, so its files contribute zero
+    # sinks/reach to /understand --map and audit review selection.
+    # Per-language sink vocabulary: scala/kotlin ride the JVM entries
+    # in _SOURCE_LEVEL_SINKS (Runtime.exec, ProcessBuilder, …); swift
+    # has no swift-specific seed sinks yet — its files still
+    # contribute call graphs (transitive reach, wrapper and framework
+    # detection), and seeds should be learned (study/IRIS) rather
+    # than guessed here.
     return {
         "python": extract_call_graph_python,
         "javascript": extract_call_graph_javascript,
@@ -1023,10 +1171,13 @@ def _get_call_graph_extractors():
         "csharp": extract_call_graph_csharp,
         "go": extract_call_graph_go,
         "java": extract_call_graph_java,
+        "kotlin": extract_call_graph_kotlin,
         "lua": extract_call_graph_lua,
         "php": extract_call_graph_php,
         "ruby": extract_call_graph_ruby,
         "rust": extract_call_graph_rust,
+        "scala": extract_call_graph_scala,
+        "swift": extract_call_graph_swift,
     }
 
 

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import copy
+import json
+from pathlib import Path
 from typing import Any
 
 from core.artifacts import context_map_budget as cmb
+from core.json import dumps_artifact, load_json
 
 
 def _llm_entry(i: int) -> dict[str, Any]:
@@ -226,6 +229,89 @@ def test_stamped_flat_sinks_are_capped():
     assert cmb._serialized_size(m) <= budget
 
 
+def _independent_sizes(m: dict[str, Any]) -> tuple[int, int]:
+    """(compact, indented) byte sizes measured WITHOUT the module under
+    test — stdlib json only — so the fixture shape cannot drift with
+    the governor's own encoder choices."""
+    compact = len(json.dumps(m, separators=(",", ":")).encode("utf-8"))
+    indented = len(json.dumps(m, indent=2).encode("utf-8"))
+    return compact, indented
+
+
+def test_indented_overage_compact_fit_is_lossless() -> None:
+    """Compact serialization is the first, lossless lever: a map whose
+    INDENTED serialization exceeds the budget must not be degraded when
+    its compact encoding fits — the compact form is what reaches disk."""
+    m = _context_map(n_llm=2, n_synth=40)
+    compact, indented = _independent_sizes(m)
+    budget = (compact + indented) // 2
+    assert compact <= budget < indented  # the defect's shape
+
+    before = copy.deepcopy(m)
+    applied = cmb.enforce_context_map_budget(m, budget_bytes=budget)
+    assert applied == []
+    assert m == before
+
+
+def test_save_context_map_round_trip(tmp_path: Path) -> None:
+    """The written artifact is compact, consumer-loadable under the
+    read cap, and parses back to exactly the enforced data."""
+    m = _context_map()
+    path = tmp_path / "context-map.json"
+    applied = cmb.save_context_map(path, m)
+    assert applied == []
+
+    raw = path.read_text(encoding="utf-8")
+    assert raw == dumps_artifact(m, indent=None) + "\n"
+    assert "\n" not in raw.rstrip("\n")  # single compact line
+
+    loaded = load_json(path, max_bytes=cmb.CONTEXT_MAP_CONSUMER_MAX_BYTES)
+    assert loaded == m
+
+
+def test_save_context_map_within_indented_overage(tmp_path: Path) -> None:
+    """End-to-end defect shape: indented size over budget, compact
+    fits — nothing dropped, on-disk size within budget, loadable."""
+    m = _context_map(n_llm=2, n_synth=40)
+    compact, indented = _independent_sizes(m)
+    budget = (compact + indented) // 2
+    before = copy.deepcopy(m)
+
+    path = tmp_path / "context-map.json"
+    applied = cmb.save_context_map(path, m, budget_bytes=budget)
+    assert applied == []
+    assert m == before
+    # +1 for the trailing newline; the producer budget carries far
+    # more headroom below the consumer cap than that.
+    assert path.stat().st_size <= budget + 1
+    assert load_json(path, max_bytes=budget + 1) == before
+
+
+def test_save_context_map_degrades_when_compact_over(tmp_path: Path) -> None:
+    """When even the compact encoding exceeds the budget, lossy
+    degradation proceeds as before and the result is written."""
+    m = _context_map(n_llm=2, n_synth=6)
+    sim = copy.deepcopy(m)
+    cmb._drop_synth_ast_views(sim)
+    budget = cmb._serialized_size(sim)
+
+    path = tmp_path / "context-map.json"
+    applied = cmb.save_context_map(path, m, budget_bytes=budget)
+    assert len(applied) == 1
+    assert applied[0].startswith("dropped ast_view")
+    assert path.stat().st_size <= budget + 1
+    assert load_json(path, max_bytes=budget + 1) == m  # enforced in place
+
+
+def test_save_context_map_sort_keys(tmp_path: Path) -> None:
+    m = {"z": 1, "a": {"c": 2, "b": 3}}
+    path = tmp_path / "context-map.json"
+    cmb.save_context_map(path, m, sort_keys=True)
+    raw = path.read_text(encoding="utf-8")
+    assert raw.index('"a"') < raw.index('"z"')
+    assert load_json(path) == m
+
+
 def test_llm_sinks_never_dropped():
     m = _context_map(n_llm=1, n_synth=0)
     m["sink_details"] = [_llm_sink(i) for i in range(50)]
@@ -235,3 +321,104 @@ def test_llm_sinks_never_dropped():
     cmb.enforce_context_map_budget(m, budget_bytes=tiny)
     assert m["sink_details"] == before
     assert len(m["sinks"]) == 50
+
+
+# ---------------------------------------------------------------------------
+# whole regenerable enricher payloads (call_edges / transitive_reach)
+# ---------------------------------------------------------------------------
+
+
+def _bulk_map(n_edges: int = 200, n_reach: int = 400,
+              n_llm: int = 2) -> dict[str, Any]:
+    """LLM narrative entries + the two unstamped mechanical bulk keys."""
+    return {
+        "entry_points": [_llm_entry(i) for i in range(n_llm)],
+        "call_edges": [
+            {"caller_file": "src/a.c", "caller": f"fn_{i}",
+             "callee": f"callee_{i}", "callee_file": "src/b.c"}
+            for i in range(n_edges)
+        ],
+        "sink_discovery": {
+            "direct_sinks": [],
+            "transitive_reach": [
+                {"file": "src/a.c", "function": f"fn_{i}", "distance": 2,
+                 "reachable_sinks": ["memcpy", "system"]}
+                for i in range(n_reach)
+            ],
+        },
+    }
+
+
+def _size_without_bulk(m: dict[str, Any]) -> int:
+    hollow = copy.deepcopy(m)
+    hollow["call_edges"] = []
+    hollow["sink_discovery"]["transitive_reach"] = []
+    return cmb._serialized_size(hollow)
+
+
+def test_sheds_mechanical_bulk_never_narrative():
+    m = _bulk_map()
+    narrative_before = copy.deepcopy(m["entry_points"])
+    # Budget fits the map once BOTH bulk payloads are shed (plus room
+    # for the markers), but not before.
+    budget = _size_without_bulk(m) + 1_000
+    assert cmb._serialized_size(m) > budget
+
+    applied = cmb.enforce_context_map_budget(m, budget_bytes=budget)
+
+    assert cmb._serialized_size(m) <= budget
+    # Mechanical keys shed, markers name the regeneration commands.
+    assert m["call_edges"] == []
+    assert "raptor-enrich-context-map-callgraph" in m["call_edges_shed"]
+    assert m["call_edges_truncated"] is True
+    sd = m["sink_discovery"]
+    assert sd["transitive_reach"] == []
+    assert "raptor-enrich-context-map-sinks" in sd["transitive_reach_shed"]
+    # Narrative entries byte-identical.
+    assert m["entry_points"] == narrative_before
+    # Applied descriptions surface the loss and the remedy.
+    assert any("call_edges" in a and "raptor-enrich-context-map-callgraph"
+               in a for a in applied)
+    assert any("transitive_reach" in a and "raptor-enrich-context-map-sinks"
+               in a for a in applied)
+
+
+def test_sheds_largest_payload_first_and_stops_when_fitting():
+    # transitive_reach is by far the larger payload; a budget that fits
+    # once it alone is shed must leave call_edges intact.
+    m = _bulk_map(n_edges=20, n_reach=2_000)
+    edges_before = copy.deepcopy(m["call_edges"])
+    hollow = copy.deepcopy(m)
+    hollow["sink_discovery"]["transitive_reach"] = []
+    budget = cmb._serialized_size(hollow) + 1_000
+    assert cmb._serialized_size(m) > budget
+
+    cmb.enforce_context_map_budget(m, budget_bytes=budget)
+
+    assert cmb._serialized_size(m) <= budget
+    assert m["sink_discovery"]["transitive_reach"] == []
+    assert "transitive_reach_shed" in m["sink_discovery"]
+    assert m["call_edges"] == edges_before
+    assert "call_edges_shed" not in m
+    assert "call_edges_truncated" not in m
+
+
+def test_shed_is_idempotent():
+    m = _bulk_map()
+    budget = _size_without_bulk(m) + 1_000
+    cmb.enforce_context_map_budget(m, budget_bytes=budget)
+    after_first = copy.deepcopy(m)
+    applied_again = cmb.enforce_context_map_budget(m, budget_bytes=budget)
+    assert applied_again == []
+    assert m == after_first
+
+
+def test_still_over_budget_warning_states_consumer_consequence(caplog):
+    # Pure LLM narrative overage: nothing degradable — the warning must
+    # say what the consumer side does with the artifact.
+    m = {"entry_points": [_llm_entry(i) for i in range(20)]}
+    with caplog.at_level("WARNING", logger="core.artifacts.context_map_budget"):
+        cmb.enforce_context_map_budget(m, budget_bytes=100)
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("refuse the WHOLE artifact" in msg for msg in messages)
+    assert any("proceeds mapless" in msg for msg in messages)

@@ -5,7 +5,7 @@ can see where the budget goes. Written to cost-breakdown.json at
 the end of each run.
 
 Ledger semantics — one audit run has three cost surfaces that MUST
-reconcile (a real run once showed $8.08 / $4.52 / $2.82 for the same
+reconcile (a real run once showed three different totals for the same
 money, all "true" for different ledgers):
 
 * ``phases.<p>.cost_usd``    — spend on calls that produced a usable
@@ -23,6 +23,7 @@ money, all "true" for different ledgers):
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING
@@ -35,9 +36,18 @@ if TYPE_CHECKING:
 
 @dataclass
 class PhaseCost:
-    """Cost for a single phase of the audit."""
+    """Cost for a single phase of the audit.
+
+    Two wall accountings, never summed together: ``wall_time_s`` is
+    PER-CALL wall time (parallel workers overlap, so cross-phase sums
+    can exceed run duration), ``pass_wall_time_s`` is the serial
+    pass-boundary clock from start_phase/end_phase markers. Folding
+    the markers into ``wall_time_s`` double-counted every call booked
+    inside an instrumented pass.
+    """
 
     wall_time_s: float = 0.0
+    pass_wall_time_s: float = 0.0
     calls: int = 0
     tokens_in: int = 0
     tokens_out: int = 0
@@ -55,6 +65,8 @@ class PhaseCost:
             "tokens_out": self.tokens_out,
             "cost_usd": round(self.cost_usd, 4),
         }
+        if self.pass_wall_time_s:
+            d["pass_wall_time_s"] = round(self.pass_wall_time_s, 2)
         if self.cache_read_tokens or self.cache_write_tokens:
             d["cache_read_tokens"] = self.cache_read_tokens
             d["cache_write_tokens"] = self.cache_write_tokens
@@ -84,6 +96,13 @@ class PhaseCostLedger:
     # Authoritative end-of-run LLM-client ledger (None until injected
     # via set_total_spend — e.g. runs without a budget client).
     _total_spend_usd: float | None = field(default=None, repr=False)
+    # Calls are recorded from parallel review workers and the parallel
+    # post-loop passes; the += accumulations below silently lose money
+    # from the ledger without exclusion. Increment-sized critical
+    # sections keep contention negligible at the worker cap.
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False,
+    )
 
     _KNOWN_PHASES = (
         "triage",
@@ -100,6 +119,7 @@ class PhaseCostLedger:
         "error_retry",
         "re_review",
         "dark_verify",
+        "differential",
         "report",
     )
 
@@ -109,17 +129,36 @@ class PhaseCostLedger:
         return self.phases[phase]
 
     def start_phase(self, phase: str) -> None:
-        """Mark the start of a phase for wall-clock tracking."""
-        if self._active_phase:
-            self.end_phase()
-        self._active_phase = phase
-        self._phase_start = time.monotonic()
+        """Mark the start of a phase for wall-clock tracking.
+
+        Single-slot by design: starting a phase while another is
+        active ends the active one first, so serial callers can lay
+        down sequential markers without paired ends. The slot is
+        lock-protected only so a marker cannot race ``record_call``'s
+        phase-dict insertion from parallel workers — two threads
+        MARKING phases would still steal each other's slot, so phase
+        markers belong at serial (main-thread) pass boundaries;
+        background threads must not place them.
+        """
+        now = time.monotonic()
+        with self._lock:
+            self._end_phase_locked(now)
+            self._active_phase = phase
+            self._phase_start = now
 
     def end_phase(self) -> None:
         """Mark the end of the current phase."""
+        with self._lock:
+            self._end_phase_locked(time.monotonic())
+
+    def _end_phase_locked(self, now: float) -> None:
+        """Book the active phase's pass wall time. Caller holds
+        ``_lock``. Lands in ``pass_wall_time_s``, never
+        ``wall_time_s`` — calls booked inside an instrumented pass
+        already carry their own per-call wall figures there."""
         if self._active_phase:
             pc = self._ensure_phase(self._active_phase)
-            pc.wall_time_s += time.monotonic() - self._phase_start
+            pc.pass_wall_time_s += now - self._phase_start
             self._active_phase = None
             self._phase_start = 0.0
 
@@ -134,15 +173,16 @@ class PhaseCostLedger:
         cache_read_tokens: int = 0,
         cache_write_tokens: int = 0,
     ) -> None:
-        """Record a single call within a phase."""
-        pc = self._ensure_phase(phase)
-        pc.calls += 1
-        pc.cost_usd += cost_usd
-        pc.tokens_in += tokens_in
-        pc.tokens_out += tokens_out
-        pc.wall_time_s += wall_time_s
-        pc.cache_read_tokens += cache_read_tokens
-        pc.cache_write_tokens += cache_write_tokens
+        """Record a single call within a phase.  Thread-safe."""
+        with self._lock:
+            pc = self._ensure_phase(phase)
+            pc.calls += 1
+            pc.cost_usd += cost_usd
+            pc.tokens_in += tokens_in
+            pc.tokens_out += tokens_out
+            pc.wall_time_s += wall_time_s
+            pc.cache_read_tokens += cache_read_tokens
+            pc.cache_write_tokens += cache_write_tokens
 
     def record_failed_attempt(
         self,
@@ -158,12 +198,13 @@ class PhaseCostLedger:
         cost — record them here so the ledgers reconcile.
         ``count_call=False`` is the end-of-run reconciliation path:
         it books residual unattributed spend as failed-attempt cost
-        without inventing a call count for it.
+        without inventing a call count for it.  Thread-safe.
         """
-        pc = self._ensure_phase(phase)
-        if count_call:
-            pc.failed_calls += 1
-        pc.failed_attempts_cost_usd += cost_usd
+        with self._lock:
+            pc = self._ensure_phase(phase)
+            if count_call:
+                pc.failed_calls += 1
+            pc.failed_attempts_cost_usd += cost_usd
 
     def set_total_spend(self, spend_usd: float) -> None:
         """Inject the authoritative end-of-run LLM-client ledger.
@@ -186,12 +227,18 @@ class PhaseCostLedger:
         silently replacing it with segment-local numbers.
         """
         amount = max(0.0, float(spend_usd))
-        pc = self._ensure_phase(PRIOR_SEGMENTS_PHASE)
-        pc.cost_usd += amount
-        self.segments.append({
-            "segment": segment,
-            "prior_spend_usd": round(amount, 4),
-        })
+        # Locked like record_call: these end-of-run bookings usually
+        # run serially after the workers drain, but ``phases`` is the
+        # same map the lock-protected hot path mutates — an unlocked
+        # read-modify-write here silently loses increments if any
+        # worker is still in flight.
+        with self._lock:
+            pc = self._ensure_phase(PRIOR_SEGMENTS_PHASE)
+            pc.cost_usd += amount
+            self.segments.append({
+                "segment": segment,
+                "prior_spend_usd": round(amount, 4),
+            })
 
     @property
     def prior_segments_spend_usd(self) -> float:
@@ -204,6 +251,22 @@ class PhaseCostLedger:
     # re_review / error_retry / refinement phases). Every other class
     # is matched to a phase by name.
     _OUTCOME_BOOKED_CLASSES = frozenset({"review"})
+
+    # Telemetry call classes registered as FIRST-CLASS phases of this
+    # ledger. Their calls dispatch outside the review-outcome loop, so
+    # no record_call site books them at source; book_unbooked_classes
+    # books each as a phase named after the class, exactly like an
+    # unregistered class. Registration changes DISCLOSURE only: these
+    # are expected, designed spend classes (the dominant ones on
+    # binary-target runs), so they are left out of the unknown-class
+    # report the caller logs — the catch-all disclosure stays for
+    # classes nobody declared. Small curated seed set by design, not
+    # a learned vocabulary: a class belongs here only once it is a
+    # named spend class of the audit pipeline.
+    _REGISTERED_CLASS_PHASES = frozenset({
+        "glance_batch",
+        "concept_discovery",
+    })
 
     def book_unbooked_classes(
         self, class_costs: dict[str, tuple[int, float]],
@@ -220,19 +283,29 @@ class PhaseCostLedger:
         (unattributed residual) or vanished from the summary entirely
         (standalone-client spend outside the budget ledger).
 
-        Returns ``{class: cost}`` for the classes booked.
+        Returns ``{class: cost}`` for the booked classes that are NOT
+        registered first-class (``_REGISTERED_CLASS_PHASES``) — the
+        genuinely unknown ones the caller should disclose. Registered
+        classes are booked identically (same phases, same totals) but
+        without a report row: they are expected, and re-disclosing
+        them as ledger anomalies on every run turned the
+        unknown-class report into per-run log noise.
         """
-        booked: dict[str, float] = {}
-        for cls, (calls, cost) in sorted(class_costs.items()):
-            if calls <= 0 and cost <= 0:
-                continue
-            if cls in self._OUTCOME_BOOKED_CLASSES or cls in self.phases:
-                continue
-            pc = self._ensure_phase(cls)
-            pc.calls += max(0, int(calls))
-            pc.cost_usd += max(0.0, float(cost))
-            booked[cls] = float(cost)
-        return booked
+        disclosable: dict[str, float] = {}
+        # Locked like record_call (see book_prior_segments).
+        with self._lock:
+            for cls, (calls, cost) in sorted(class_costs.items()):
+                if calls <= 0 and cost <= 0:
+                    continue
+                if (cls in self._OUTCOME_BOOKED_CLASSES
+                        or cls in self.phases):
+                    continue
+                pc = self._ensure_phase(cls)
+                pc.calls += max(0, int(calls))
+                pc.cost_usd += max(0.0, float(cost))
+                if cls not in self._REGISTERED_CLASS_PHASES:
+                    disclosable[cls] = float(cost)
+        return disclosable
 
     @property
     def total_cost_usd(self) -> float:
@@ -269,6 +342,10 @@ class PhaseCostLedger:
         return sum(p.wall_time_s for p in self.phases.values())
 
     @property
+    def total_pass_wall_time_s(self) -> float:
+        return sum(p.pass_wall_time_s for p in self.phases.values())
+
+    @property
     def total_calls(self) -> int:
         return sum(p.calls for p in self.phases.values())
 
@@ -281,11 +358,23 @@ class PhaseCostLedger:
         return sum(p.cache_write_tokens for p in self.phases.values())
 
     def to_dict(self) -> dict[str, Any]:
+        # Snapshot under the same lock the hot path takes: the totals
+        # properties iterate ``phases`` while record_call mutates it
+        # from workers, and the mid-run cadence tick serialises this
+        # dict while the loop is still reviewing.
+        with self._lock:
+            return self._to_dict_locked()
+
+    def _to_dict_locked(self) -> dict[str, Any]:
         totals: dict[str, Any] = {
             "cost_usd": round(self.total_cost_usd, 4),
             "wall_time_s": round(self.total_wall_time_s, 2),
             "calls": self.total_calls,
         }
+        if self.total_pass_wall_time_s:
+            totals["pass_wall_time_s"] = round(
+                self.total_pass_wall_time_s, 2,
+            )
         cr = self.total_cache_read_tokens
         cw = self.total_cache_write_tokens
         if cr or cw:
@@ -355,6 +444,8 @@ class PhaseCostLedger:
                 f"${pc.cost_usd:.4f}, "
                 f"{pc.wall_time_s:.1f}s wall"
             )
+            if pc.pass_wall_time_s:
+                line += f" ({pc.pass_wall_time_s:.1f}s pass wall)"
             if pc.failed_calls or pc.failed_attempts_cost_usd:
                 line += (
                     f" (+{pc.failed_calls} failed attempts, "
@@ -396,7 +487,7 @@ def format_cost_summary(result: Any) -> str | None:
     ledger, which includes failed/timed-out attempts) with the
     completed-vs-failed split when they differ, e.g.::
 
-        Cost: $8.08 ($2.82 across 3 completed reviews; $5.26 on
+        Cost: $3.00 ($2.00 across 3 completed reviews; $1.00 on
         failed/timed-out attempts)
 
     Returns None when the run spent nothing (no line printed).
@@ -443,9 +534,14 @@ def format_cost_summary(result: Any) -> str | None:
     if prior_spend >= 0.005:
         detail.append(f"${prior_spend:.2f} booked from prior segments")
     if support_spend >= 0.005:
+        # This bucket is every ledger phase that is not review /
+        # re_review / refinement / prior_segments — triage, sweeps,
+        # dynamic verification, spec inference, summaries, study —
+        # so the label must not name only a subset of them.
         detail.append(
-            f"${support_spend:.2f} on support phases "
-            f"(summaries/spec inference/study)"
+            f"${support_spend:.2f} on non-review phases "
+            f"(triage/sweeps/verification/study — see "
+            f"cost-breakdown.json)"
         )
     if unattributed >= 0.005:
         detail.append(

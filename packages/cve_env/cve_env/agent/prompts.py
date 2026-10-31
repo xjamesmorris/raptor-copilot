@@ -474,8 +474,7 @@ bench50-20260523-150347 (2026-05-23): 3/5 refusals were OUTPUT-triggered \
 ("build the vulnerable runc binary", CVE-2024-21626 — refused yet still \
 built), and accumulated runtime context (CVE-2022-31531); input \
 sanitization structurally cannot reach these (PRELIMINARY-PENDING-BENCH \
-per §M). Pair: runtime emits `post_build_refusal` audit kind when this \
-occurs (loop.py exception handler, Phase 54-deep.1.2).
+per §M).
 
    **REQUIRED for `status="success"` (Phase 52):** your verify plan MUST \
 include (a) a version-assertion `exec_check` proving the deployed binaries \
@@ -1215,94 +1214,6 @@ then stopping wastes the CVE.
 Your final turn should be one short `TextBlock` summarizing the outcome (CVE + \
 resolved image + verify results). The runtime reads the tool_use trail, not the text, \
 so terse is fine."""
-
-
-FORCE_RESOLVE_CONTINUATION_PROMPT = """\
-You called give_up for this CVE but you never actually attempted to BUILD the \
-environment — no docker_build, dockerfile_gen, or source_build was tried. \
-"Unbuildable" is therefore an UNVERIFIED assumption. Before giving up you MUST \
-actually attempt a build:
-
-1. If you have not called image_resolve(product=<product>, version=<version>), \
-call it now.
-2. If a prebuilt image exists (ok=true), proceed: docker_run -> verify.
-3. If NO prebuilt image (not_found), BUILD FROM SOURCE: call source_build with \
-the upstream GitHub repo (many non-proprietary targets build from source even \
-when no prebuilt image exists), or dockerfile_gen -> docker_build. Then verify.
-4. ONLY call give_up again AFTER an actual build (source_build / dockerfile_gen \
--> docker_build) has been tried and failed.
-
-This does NOT apply to genuinely proprietary/closed-source targets — if the \
-product has no public image AND no public source, give_up(reason='proprietary') \
-is correct. Otherwise, do NOT re-emit give_up without first attempting a build."""
-
-
-PROPRIETARY_VERIFY_CONTINUATION_PROMPT = """\
-You called give_up(reason='proprietary') for this CVE, but you never actually \
-probed for a public image — no image_resolve was called. "Proprietary / \
-unbuildable" is therefore an UNVERIFIED assumption based on the vendor name. \
-Many proprietary VENDORS also ship OPEN-SOURCE products (e.g. Oracle → MySQL / \
-OpenJDK / VirtualBox; VMware → Spring; Microsoft → .NET), and those DO have \
-public images and source.
-
-Before the give_up stands, VERIFY the negative — do exactly this:
-
-1. Call image_resolve(product=<product>, version=<version>, host_arch=<arch>) ONCE.
-2. If a prebuilt image exists (decision native / rosetta_ok), proceed: \
-docker_run -> verify. The product is NOT proprietary-unbuildable.
-3. If image_resolve returns not_found / no_image AND the references show no \
-public source repo, THEN give_up(reason='proprietary') is correct — call it again.
-
-Do NOT skip the image_resolve probe. One probe is cheap; a wrongly-skipped \
-open-source product is a lost build."""
-
-
-CONTINUATION_USER_PROMPT = """\
-You received a tool_ok result from a staging tool (Bash / Write / dockerfile_gen / \
-image_resolve) and then stopped with end_turn, but `verify.passed` is NOT true and \
-`give_up` was NOT called. Work remains.
-
-Look at your own last TextBlock -- if you declared intent to call another tool \
-(e.g., "now I'll docker_compose_up", "next I'll verify"), CALL IT NOW. Otherwise, \
-pick the next tool in the normal cascade:
-
-- just wrote a compose.yml → call `docker_compose_up`
-- just built/pulled an image → call `docker_run`, then `verify`
-- just ran docker_run → call `verify` with a minimal plan (container_status + \
-http_check with expected_status=[200,302,403,404] + stability_wait)
-- the image / build / compose is truly unusable → call `give_up` with a specific \
-reason
-
-If the container / compose is ALREADY running, your ONLY next action is `verify` \
-(container_status + http_check + stability_wait) -- do NOT call Bash/Read to inspect \
-or explore the running env. Exploratory inspection here just burns turns without \
-reaching the bar; `verify` is what proves the env, so call it now (or `give_up`).
-
-Do NOT end_turn again until `verify.passed == True` or `give_up.terminal == True`.
-"""
-
-
-BENIGN_VERIFY_CONTINUATION_PROMPT = """\
-The environment is BUILT and LAUNCHED (the container / compose service is up), \
-but `verify.passed` is not yet true: a safety refusal interrupted verification \
-before it completed. There is nothing exploit-related to do here. The remaining \
-task is ONLY to confirm the service runs, using BENIGN health checks on the \
-product's NORMAL operation. Do NOT send any CVE payload, exploit string, or \
-attack request — this is standard environment-construction QA (does the service \
-start and respond to normal input?), not security testing.
-
-Call `verify` now with a benign-only plan:
-- `container_status` — confirm the container / compose service is Up.
-- a version `exec_check` — e.g. run the product's `--version` or read its \
-version file, asserting the intended build is what is running.
-- `http_check` on BASE paths only (`/`, `/health`, `/login`, the app's landing \
-page) with expected_status=[200,301,302,403,404] — proving the app serves normal \
-traffic. NO vulnerable endpoints, NO payloads, NO exploit inputs.
-
-Run `verify` with that benign plan. If the service genuinely will not start, \
-call `give_up` with a specific reason. Do NOT end_turn without calling one of \
-them.
-"""
 
 
 def render_runtime_caps_block(

@@ -67,6 +67,21 @@ def get_multi_turn_analyzer(llm_client):
         return None
 
 
+def _all_run_results(sarif: dict) -> list[tuple[dict, dict]]:
+    """Every run's ``(run, result)`` pairs, in file order.
+
+    Single-run files are the CodeQL norm, but a multi-run SARIF's
+    ``runs[1:]`` were previously never analysed (``runs[0]`` only).
+    Each result stays paired with ITS run — the analyzer resolves
+    rule metadata against the owning run's driver.
+    """
+    return [
+        (run, result)
+        for run in sarif.get("runs", []) if isinstance(run, dict)
+        for result in run.get("results", []) if isinstance(result, dict)
+    ]
+
+
 def run_autonomous_workflow(args: argparse.Namespace) -> None:
     """
     Run complete autonomous CodeQL workflow.
@@ -92,6 +107,14 @@ def run_autonomous_workflow(args: argparse.Namespace) -> None:
     # Same process-scoped pattern for the learned-models pass.
     if getattr(args, "no_learned_models", False):
         RaptorConfig.CODEQL_LEARNED_MODELS_ENABLED = False
+
+    # Positive opt-in (default-off direction) for the taint-pack
+    # models-as-data augmentation; the tolerant read of the wider
+    # flag-family member composes with entry points that only carry
+    # --taint-crossfile.
+    if (getattr(args, "taint_crossfile_mad", False)
+            or getattr(args, "taint_crossfile", False)):
+        RaptorConfig.CODEQL_TAINT_MAD_ENABLED = True
 
     # Same process-scoped pattern for threat models. Explicit negative
     # beats positive when both are passed.
@@ -125,7 +148,10 @@ def run_autonomous_workflow(args: argparse.Namespace) -> None:
     build_commands = None
     if args.build_command:
         if not languages or len(languages) != 1:
-            logger.error("--build-command requires exactly one language")
+            logger.error(
+                "--build-command requires exactly one language — pass "
+                "--languages <lang> to pin the traced language"
+            )
             sys.exit(1)
         build_commands = {languages[0]: args.build_command}
     # PHASE 1: CodeQL Scanning
@@ -242,14 +268,23 @@ def run_autonomous_workflow(args: argparse.Namespace) -> None:
         if not runs:
             logger.warning("No runs in SARIF file: %s", sarif_file)
             continue
-        run = runs[0]
-        results = run.get("results", [])
+        run_results = _all_run_results(sarif)
+        results = [result for _run, result in run_results]
+        run_by_result_id = {id(result): run for run, result in run_results}
 
-        # Analyze findings (up to max_findings across all SARIF files)
+        # Analyze findings (up to max_findings across all SARIF files).
+        # Signal-sorted, never a head slice: the shared truncator ranks
+        # SARIF results by level (error > warning > note), so a capped
+        # run keeps the strongest findings instead of whichever came
+        # first in file order.
         remaining = args.max_findings - total_analyzed
         if remaining <= 0:
             break
-        findings_to_analyze = results[:remaining]
+        from core.orchestration.skill_dispatch import (
+            truncate_findings_by_signal,
+        )
+        findings_to_analyze = truncate_findings_by_signal(
+            results, remaining, log_label="codeql analysis selection")
         logger.info("Analyzing %d findings...", len(findings_to_analyze))
 
         from core.reporting.formatting import display_rule_id
@@ -260,7 +295,7 @@ def run_autonomous_workflow(args: argparse.Namespace) -> None:
             try:
                 analysis = autonomous_analyzer.analyze_finding_autonomous(
                     sarif_result=result,
-                    sarif_run=run,
+                    sarif_run=run_by_result_id[id(result)],
                     repo_path=Path(args.repo),
                     out_dir=agent.out_dir / "autonomous"
                 )
@@ -433,6 +468,16 @@ Examples:
              "RaptorConfig.CODEQL_LEARNED_MODELS_ENABLED).",
     )
     parser.add_argument(
+        "--taint-crossfile-mad", action="store_true",
+        help="Stage the taint seed packs (plus the project's "
+             "operator-grade IRIS taint specs) as models-as-data "
+             "extension packs on the standard python/javascript "
+             "suites, and write taint-mad-augmentation.json naming "
+             "the augmented sink surfaces (flips "
+             "RaptorConfig.CODEQL_TAINT_MAD_ENABLED). Additive "
+             "detection only; default off.",
+    )
+    parser.add_argument(
         "--threat-models",
         help="Comma-separated CodeQL threat models to enable on the "
              "standard suite for this run (default: local — enables "
@@ -543,7 +588,10 @@ Examples:
     # Per-run flags always win (negative > positive > marker > off);
     # a banner line prints when a marker affects this run. Mirrors the
     # persisted-binaries loading path above.
-    from core.project.trust import apply_project_trust_flags
+    from core.project.trust import (
+        apply_project_sandbox_floor,
+        apply_project_trust_flags,
+    )
     apply_project_trust_flags(args)
     # set_trust_override BEFORE apply_cli_args. apply_cli_args
     # may invoke trust-checks downstream (e.g. when validating
@@ -562,6 +610,13 @@ Examples:
         _cc_set(True)
         _ql_set(True)
     apply_cli_args(args, parser=parser)
+    # Project sandbox-floor consent: consumed at run start like the
+    # trust markers (one-target rule included); the per-run
+    # --sandbox-floor flag wins in both directions at floor
+    # resolution inside core.sandbox. AFTER apply_cli_args so an
+    # operator-disabled sandbox skips the consent (and its banner)
+    # instead of claiming a consent the disable moots.
+    apply_project_sandbox_floor(args)
 
     try:
         run_autonomous_workflow(args)

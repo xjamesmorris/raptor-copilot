@@ -70,8 +70,10 @@ import ast
 
 from core.dataflow.sanitizer_catalog import (
     SanitizerBinding,
+    repo_shadows_module_root,
     sanitizer_callables_for_cwe,
 )
+from core.analysis.python_module_callgraph import local_binding_names
 from core.analysis.taint_summaries import TaintSummary
 
 
@@ -131,18 +133,44 @@ def _param_cleanly_sanitized(
     )
 
 
+class _ConstArg:
+    """Sentinel argument entry: a literal (``ast.Constant``) — it
+    carries no symbol and cannot carry taint, so it is exempt from
+    the dirty-flow exclusion below. Everything else that is not a
+    bare ``ast.Name`` stays ``None`` (opaque): a nested call,
+    subscript, attribute, or binop can carry taint the bare-name
+    model cannot see, so an opaque value at a return-tainting
+    position must decline the whole binding."""
+
+    __slots__ = ()
+
+
+_CONST_ARG = _ConstArg()
+
+
+def _arg_entry(node: ast.AST) -> str | _ConstArg | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Constant):
+        return _CONST_ARG
+    return None
+
+
 def _call_arg_names(
     fn_ast: ast.AST, lineno: int, col_offset: int, callee_chain: str,
-) -> tuple[list[str | None], list[tuple[str | None, str | None]]] | None:
-    """Argument bare-names for the call to ``callee_chain`` at
+) -> tuple[
+    list[str | _ConstArg | None],
+    list[tuple[str | None, str | _ConstArg | None]],
+] | None:
+    """Argument entries for the call to ``callee_chain`` at
     ``(lineno, col_offset)``. Returns ``(positional, keywords)``:
     ``positional`` has one entry per positional arg — the arg's
-    identifier (``ast.Name``) or None for non-name args (literals,
-    nested calls, subscripts); ``keywords`` has one
-    ``(keyword_name, value_name)`` entry per keyword arg, where
-    ``keyword_name`` is None for ``**kwargs`` expansion and
-    ``value_name`` is the value's identifier or None for non-name
-    values. None if no matching call is found.
+    identifier (``ast.Name``), :data:`_CONST_ARG` for a literal, or
+    None for opaque expressions (nested calls, subscripts, binops);
+    ``keywords`` has one ``(keyword_name, value_entry)`` entry per
+    keyword arg, where ``keyword_name`` is None for ``**kwargs``
+    expansion and ``value_entry`` follows the positional encoding.
+    None if no matching call is found.
 
     Keyword args matter for soundness, not just coverage: a symbol
     passed BOTH positionally into a sanitized parameter AND by keyword
@@ -166,14 +194,19 @@ def _call_arg_names(
             continue
         if _chain_str(node.func) != callee_chain:
             continue
-        out: list[str | None] = [arg.id if isinstance(arg, ast.Name) else None for arg in node.args]
-        kw_out: list[tuple[str | None, str | None]] = []
-        for kw in node.keywords:
-            val = kw.value
-            kw_out.append((
-                kw.arg,
-                val.id if isinstance(val, ast.Name) else None,
-            ))
+        if any(isinstance(arg, ast.Starred) for arg in node.args):
+            # ``helper(*rest, x)`` — the unpack shifts every later
+            # runtime position by len(rest), so index-based mapping
+            # would bind x to the wrong parameter (possibly a
+            # cleanly-sanitized one). Uncertainty → decline the
+            # binding (the docstring contract).
+            return None
+        out: list[str | _ConstArg | None] = [
+            _arg_entry(arg) for arg in node.args
+        ]
+        kw_out: list[tuple[str | None, str | _ConstArg | None]] = [
+            (kw.arg, _arg_entry(kw.value)) for kw in node.keywords
+        ]
         return out, kw_out
     return None
 
@@ -184,6 +217,7 @@ def synthetic_sanitizer_bindings(
     summaries: dict[str, TaintSummary],
     cwe: str,
     language: str,
+    repo_root: str | None = None,
 ) -> frozenset[SanitizerBinding]:
     """Build synthetic sanitizer bindings for inter-procedural
     sanitization in ``cfg``'s function.
@@ -201,8 +235,40 @@ def synthetic_sanitizer_bindings(
     ``evaluate_finding``'s ``extra_bindings``.
     """
     sanitizer_names = sanitizer_callables_for_cwe(cwe, language)
+    # Unbound-root refusal (mirrors the evaluate_finding catalog
+    # guard): a dotted catalog identity certifies a helper chain only
+    # when the module self-imports its root — an unbound root
+    # resolves through repo-writable builtins at runtime.
+    trusted_roots = getattr(cfg, "trusted_import_roots", None)
+    if trusted_roots is not None:
+        def _root_trusted(name: str) -> bool:
+            if "." not in name:
+                return True
+            root = name.split(".", 1)[0]
+            if root not in trusted_roots:
+                return False
+            # Origin resolution: a repo shipping its own
+            # ``<root>.py`` / ``<root>/__init__.py`` makes the
+            # self-import resolve to the REPO's module — the chain
+            # identity is the repo's object.
+            return not (repo_root and repo_shadows_module_root(
+                repo_root, root,
+            ))
+        sanitizer_names = {
+            n for n in sanitizer_names if _root_trusted(n)
+        }
     if not sanitizer_names or not summaries:
         return frozenset()
+
+    # Shadow guard: the summary join below is keyed by NAME. When the
+    # analysed function's own scope binds the callee chain's root name
+    # (``esc = str``, a param named ``esc``, a nested ``def esc``, a
+    # walrus), the runtime callee is the local binding — joining the
+    # module-table summary would certify a helper the call provably
+    # may not reach, and the enforced sanitizer-cut would consume the
+    # forged clean-wrapper binding. Any local definition refuses the
+    # join (an ambiguous binding only ever loses suppression power).
+    local_bindings = local_binding_names(fn_ast)
 
     bindings: list[SanitizerBinding] = []
     for node in cfg.nodes():
@@ -212,6 +278,8 @@ def synthetic_sanitizer_bindings(
             # name matches its summary key directly; ``A.m`` matches a
             # static-style method summary key. ``self.m`` typically
             # won't match (summary key is ``Class.m``) — best-effort.
+            if cs.name.split(".", 1)[0] in local_bindings:
+                continue
             summary = summaries.get(cs.name)
             if summary is None:
                 continue
@@ -228,6 +296,24 @@ def synthetic_sanitizer_bindings(
                 continue
             arg_names, kw_args = resolved
             sanitized_set = set(sanitized_positions)
+            if len(arg_names) > len(summary.params):
+                # More positional args than the summary has params:
+                # the extras have no parameter mapping (a vararg
+                # helper, or an ill-formed call) — index-based flow
+                # reasoning is meaningless past the end. Uncertainty
+                # → decline the binding (the docstring contract).
+                continue
+            if (summary.positional_limit is not None
+                    and len(arg_names) > summary.positional_limit):
+                # Positional args at/past the ``*vararg`` slot:
+                # ``params`` lists the vararg and keyword-only names
+                # as ordinary entries, so the length check above
+                # passes for an exact-length call to a vararg helper
+                # while index-based mapping walks THROUGH those slots
+                # (the arg after the vararg maps onto a keyword-only
+                # param it can never reach). Same uncertainty →
+                # decline.
+                continue
             # Review #1: a symbol passed at a position that taints the
             # return but is NOT cleanly sanitized reaches the sink
             # unsanitized through that position — so the helper does not
@@ -236,36 +322,65 @@ def synthetic_sanitizer_bindings(
             # called as ``helper(x, x)``, x flows clean through ``a``
             # AND dirty through ``b``; the synthetic binding must not
             # claim x is sanitized. Exclude any such symbol so the gate
-            # declines to suppress (stays conservative).
+            # declines to suppress (stays conservative). The exclusion
+            # must cover NON-NAME values too: ``helper(x, g(x))``
+            # taints the return through position 1 just as surely,
+            # but carries no bare name to exclude — an opaque value
+            # at a return-tainting unsanitized position therefore
+            # declines the WHOLE binding (a literal is exempt: it
+            # cannot carry taint).
+            binding_ok = True
             unsanitized_symbols: set[str] = set()
-            for i, name in enumerate(arg_names):
-                if name is None or i in sanitized_set:
+            for i, entry in enumerate(arg_names):
+                if i in sanitized_set or entry is _CONST_ARG:
                     continue
-                if i < len(summary.params) and summary.param_taints_return(i):
-                    unsanitized_symbols.add(name)
+                if not summary.param_taints_return(i):
+                    continue
+                if entry is None:
+                    binding_ok = False
+                    break
+                unsanitized_symbols.add(entry)  # type: ignore[arg-type]
+            if not binding_ok:
+                continue
             # Keyword-passed flows of the same symbol are just as
             # dirty as positional ones: ``helper(x, b=x)`` sends x
             # into the unsanitized ``b`` no matter how ``a`` cleans
             # it. Map keyword name → parameter position and apply the
-            # same rule; anything unresolvable (``**kwargs``
-            # expansion, a keyword that matches no known parameter)
-            # is uncertainty — the docstring's contract is to decline
-            # to suppress on uncertainty, so treat the symbol as
-            # unsanitized.
-            for kw_name, val_name in kw_args:
-                if val_name is None:
+            # same rule. Anything unresolvable is uncertainty — the
+            # docstring's contract is to decline to suppress: a
+            # ``**kwargs`` expansion can route taint through its
+            # VALUES into any parameter (excluding the mapping's own
+            # name is not enough), an unknown keyword name has no
+            # position to reason about, and an opaque value at a
+            # return-tainting position is the keyword twin of the
+            # positional case above — all three decline the binding.
+            # Literal values stay exempt.
+            for kw_name, val_entry in kw_args:
+                if val_entry is _CONST_ARG:
                     continue
-                if kw_name is None or kw_name not in summary.params:
-                    unsanitized_symbols.add(val_name)
-                    continue
+                if (kw_name is None or kw_name not in summary.params
+                        or (summary.keyword_params is not None
+                            and kw_name not in summary.keyword_params)):
+                    # Unknown keyword, or a name that isn't
+                    # keyword-BINDABLE (the vararg/kwarg slot names,
+                    # posonly params): no trustworthy position to
+                    # reason about — decline.
+                    binding_ok = False
+                    break
                 idx = summary.params.index(kw_name)
                 if idx in sanitized_set:
                     continue
-                if summary.param_taints_return(idx):
-                    unsanitized_symbols.add(val_name)
+                if not summary.param_taints_return(idx):
+                    continue
+                if val_entry is None:
+                    binding_ok = False
+                    break
+                unsanitized_symbols.add(val_entry)  # type: ignore[arg-type]
+            if not binding_ok:
+                continue
             input_symbols: set[str] = set()
             for i in sanitized_positions:
-                if i < len(arg_names) and arg_names[i] is not None:
+                if i < len(arg_names) and isinstance(arg_names[i], str):
                     name = arg_names[i]
                     if name in unsanitized_symbols:
                         continue

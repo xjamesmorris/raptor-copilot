@@ -19,6 +19,7 @@ import hashlib
 from collections import deque
 from typing import Any
 
+from core.binary.addrmap import passthrough_fid as _fid_passthrough
 from core.evidence import BinaryEvidenceRecord, EvidenceTier, make_evidence
 
 _MAX_PATH_DEPTH = 6
@@ -99,7 +100,12 @@ def extract_parser_boundaries(
 
     candidates: list[dict[str, Any]] = []
     records: list[BinaryEvidenceRecord] = []
-    seen: set[tuple[str, str]] = set()
+    # Dedup key is (ingress, boundary function, parser surface) — the
+    # surface MUST be part of the key: a boundary function that calls
+    # two different parser surfaces (e.g. a JSON decoder AND inflate)
+    # is two distinct candidates, and a (ingress, function)-only key
+    # made the second surface invisible in reports and the graph.
+    seen: set[tuple[str, str, str]] = set()
     for ingress in context_map.get("external_ingress_candidates", []):
         if not isinstance(ingress, dict):
             continue
@@ -139,11 +145,12 @@ def extract_parser_boundaries(
             ]
             if boundary_id not in functions or start_id not in backtrace_ids:
                 continue
-            key = (ingress_id, boundary_id)
+            surface_id = str(runtime_flow.get("parser_surface_id") or "")
+            key = (ingress_id, boundary_id, surface_id)
             if key in seen:
                 continue
             seen.add(key)
-            parser_surface = surfaces.get(str(runtime_flow.get("parser_surface_id") or ""))
+            parser_surface = surfaces.get(surface_id)
             if parser_surface is None:
                 continue
             if boundary_id in backtrace_ids:
@@ -197,6 +204,10 @@ def extract_parser_boundaries(
                 "boundary_function_id": boundary_id,
                 "boundary_function_name": function.get("name"),
                 "address": function.get("address"),
+                # Additive passthrough through the strict parser: the
+                # context map is disk-loadable (hostile-run-dir
+                # surface), so a junk fid collapses to absent.
+                **_fid_passthrough(function),
                 "parser_surface_id": parser_surface.get("id"),
                 "parser_surface_name": parser_surface.get("name"),
                 "path": {
@@ -223,15 +234,16 @@ def extract_parser_boundaries(
             function_id, path = queue.popleft()
             depth = len(path) - 1
             for parser_edge in parser_calls.get(function_id, []):
-                key = (ingress_id, function_id)
+                target_surface_id = str(parser_edge.get("target_surface") or "")
+                key = (ingress_id, function_id, target_surface_id)
                 if key in seen:
                     continue
                 seen.add(key)
                 runtime_flows = runtime_parser_by_function.get(function_id, [])
                 tier = EvidenceTier.OBSERVED_RUNTIME if runtime_flows else EvidenceTier.XREF_BACKED
                 confidence = "confirmed" if runtime_flows else "candidate"
-                function = functions.get(function_id)
-                parser_surface = surfaces.get(str(parser_edge.get("target_surface") or ""))
+                function = functions.get(function_id)  # type: ignore[assignment]
+                parser_surface = surfaces.get(target_surface_id)
                 if function is None or parser_surface is None:
                     continue
                 path_names = [str(functions[item].get("name") or item) for item in path]
@@ -276,6 +288,8 @@ def extract_parser_boundaries(
                     "boundary_function_id": function_id,
                     "boundary_function_name": function.get("name"),
                     "address": function.get("address"),
+                    # Additive passthrough (see the static-path twin).
+                    **_fid_passthrough(function),
                     "parser_surface_id": parser_surface.get("id"),
                     "parser_surface_name": parser_surface.get("name"),
                     "path": {

@@ -36,6 +36,8 @@ import subprocess
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from .parsers._safe_read import read_bounded
+
 if TYPE_CHECKING:
     from pathlib import Path
     from collections.abc import Iterable
@@ -69,10 +71,16 @@ _USES_RE = re.compile(
         (?P<repo>[A-Za-z0-9_.\-]+)
         (?P<sub>(?:/[A-Za-z0-9_./\-]+)?)
         @(?P<ref>[A-Za-z0-9_./\-]+)
-        (?P<trailing>[ \t]*(?:\#.*)?)?$
+        (?P<trailing>[ \t]*(?:\#.*)?)?\r?$
     """,
     re.MULTILINE | re.VERBOSE,
 )
+# ``\r?$``: the keepends line elements carry their terminators, so a
+# CRLF checkout puts a ``\r`` between the ref and the ``$`` — without
+# the tolerance every mutable ``uses:`` ref on such a file silently
+# stayed unpinned (no match, no ``skipped`` entry).  The ``\r`` sits
+# outside every capture; the comment-arm ``.*`` can still absorb one
+# into ``trailing``, which is ``.strip()``-ed before reuse.
 
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
@@ -120,10 +128,19 @@ def hash_pin_workflows(
     changed_files: list[Path] = []
 
     for wf_path in sorted(workflows.glob("*.y*ml")):
-        try:
-            text = wf_path.read_text(encoding="utf-8")
-        except OSError as e:
-            logger.warning("sca.hash_pin: cannot read %s: %s", wf_path, e)
+        # Bounded no-follow read — workflow files come from the
+        # scanned tree. This is a REWRITE path, so a file whose bytes
+        # did not decode cleanly (U+FFFD replacement present) is
+        # skipped too: writing the replaced text back would corrupt
+        # the operator's file.
+        text = read_bounded(wf_path, follow_symlinks=False)
+        if text is None:
+            continue        # read_bounded logged the refusal
+        if "\ufffd" in text:
+            logger.warning(
+                "sca.hash_pin: %s is not valid UTF-8; refusing to "
+                "rewrite it", wf_path,
+            )
             continue
         new_text, file_changes, file_skipped = _rewrite_file(
             text, wf_path, cache, token,
@@ -154,7 +171,9 @@ def _rewrite_file(
 ) -> tuple[str, list[HashPinChange], list[tuple[Path, int, str, str]]]:
     changes: list[HashPinChange] = []
     skipped: list[tuple[Path, int, str, str]] = []
-    lines = text.splitlines(keepends=True)
+    # Keepends rewriter: out_lines must reproduce the file's exact
+    # bytes; idx + 1 feeds a skip diagnostic only.
+    lines = text.splitlines(keepends=True)  # line-model: keepends rewriter, exact-byte reconstruction; idx+1 is diagnostic-only
     out_lines: list[str] = []
     for idx, raw in enumerate(lines):
         m = _USES_RE.search(raw)
@@ -188,8 +207,15 @@ def _rewrite_file(
         )
         if trailing:
             replacement += f"  {trailing}"
-        # Preserve any original trailing newline.
-        suffix = "\n" if raw.endswith("\n") else ""
+        # Preserve the original line terminator byte-for-byte (the
+        # keepends elements carry it): a CRLF line stays CRLF instead
+        # of turning into the file's lone LF line.
+        if raw.endswith("\r\n"):
+            suffix = "\r\n"
+        elif raw.endswith(("\n", "\r")):
+            suffix = raw[-1]
+        else:
+            suffix = ""
         new_line = replacement + suffix
         out_lines.append(new_line)
         changes.append(HashPinChange(

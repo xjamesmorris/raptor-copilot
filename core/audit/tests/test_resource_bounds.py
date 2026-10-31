@@ -159,7 +159,9 @@ class TestClassifier:
         assert resource_bounds_applicable("CWE-400")
         assert resource_bounds_applicable("400")
         assert not resource_bounds_applicable("CWE-120")
-        assert RESOURCE_BOUNDS_CWES == {"CWE-770", "CWE-400", "CWE-772"}
+        assert RESOURCE_BOUNDS_CWES == {
+            "CWE-770", "CWE-400", "CWE-772", "CWE-789",
+        }
 
     def test_detection_rule_id(self):
         assert is_detection_rule_id(
@@ -513,7 +515,7 @@ class TestCallerWalkDeadline:
     def test_expired_deadline_stops_the_walk(self):
         from core.audit.resource_bounds import _caller_bound_search
 
-        witness, receipts = _caller_bound_search(
+        witness, receipts, truncated = _caller_bound_search(
             "insert_fn",
             {"a.c": "void caller(void)\n{\n    insert_fn(x);\n}\n"},
             "a.c", None, frozenset(), "c",
@@ -521,3 +523,403 @@ class TestCallerWalkDeadline:
         )
         assert witness is None
         assert receipts == []
+        assert truncated is True
+
+    def test_completed_walk_is_not_truncated(self):
+        from core.audit.resource_bounds import _caller_bound_search
+
+        _witness, _receipts, truncated = _caller_bound_search(
+            "insert_fn",
+            {"a.c": "void caller(void)\n{\n    insert_fn(x);\n}\n"},
+            "a.c", None, frozenset(), "c",
+            deadline=None,
+        )
+        assert truncated is False
+
+    def test_truncated_walk_never_confirms(self, tmp_path, monkeypatch):
+        # The fixture refutes (bound-in-caller) on a COMPLETE walk.
+        # With the deadline expiring inside the walk — after the
+        # between-sites boundary check — the no-witness result covers
+        # only the searched prefix: confirming there would let a
+        # hostile repo convert bounded sites into findings just by
+        # slowing the walk. Must cap at inconclusive.
+        import core.audit.resource_bounds as rb
+
+        for rel, text in CALLER_BOUND_DEPTH2.items():
+            _write(tmp_path, rel, text)
+        control = rb.run_resource_bounds_check(
+            tmp_path, "src/inner.c", "cache_insert",
+            "items list grows without limit",
+        )
+        assert control.outcome == "refuted"
+
+        # State-based clock: the deadline reads as expired only for
+        # monotonic() calls made INSIDE the site walk — robust to
+        # boundary/pre-load deadline checks added around the walk
+        # (a call-count stub broke every time one was added).
+        in_walk = {"flag": False}
+        real_adjudicate = rb._adjudicate_site
+
+        def spy_adjudicate(*args, **kwargs):
+            in_walk["flag"] = True
+            try:
+                return real_adjudicate(*args, **kwargs)
+            finally:
+                in_walk["flag"] = False
+
+        def fake_monotonic():
+            return 100.0 if in_walk["flag"] else 0.0
+
+        monkeypatch.setattr(rb, "_adjudicate_site", spy_adjudicate)
+        monkeypatch.setattr(rb.time, "monotonic", fake_monotonic)
+        res = rb.run_resource_bounds_check(
+            tmp_path, "src/inner.c", "cache_insert",
+            "items list grows without limit", budget_s=10.0,
+        )
+        assert res.outcome == "inconclusive"
+        assert "truncated search cannot confirm" in res.reason
+
+
+class TestCheckBudget:
+    def test_zero_budget_bails_inconclusive(self, tmp_path):
+        # budget_s was accepted-and-deleted: the walk ran deadline-free
+        # regardless. A zero budget must stop before adjudicating and
+        # degrade to inconclusive (never refuted/confirmed on no work).
+        _write(tmp_path, "src/ssl_sess.c", CVE_2024_2511)
+        res = run_resource_bounds_check(
+            tmp_path, "src/ssl_sess.c", "ssl_session_cache_add", HYP,
+            budget_s=0.0,
+        )
+        assert res.outcome == "inconclusive"
+        assert "budget" in res.reason
+
+    def test_no_budget_unchanged(self, tmp_path):
+        _write(tmp_path, "src/ssl_sess.c", CVE_2024_2511)
+        res = run_resource_bounds_check(
+            tmp_path, "src/ssl_sess.c", "ssl_session_cache_add", HYP,
+        )
+        assert res.outcome == "confirmed"
+
+    def test_deadline_threads_into_site_adjudication(
+        self, tmp_path, monkeypatch,
+    ):
+        # The between-sites check bounds only site BOUNDARIES; the
+        # walk inside one site honours the same deadline only when it
+        # is threaded through — the prepass path passes it, the
+        # hypothesis path dropped it.
+        import core.audit.resource_bounds as rb
+
+        _write(tmp_path, "src/ssl_sess.c", CVE_2024_2511)
+        seen: list = []
+        real = rb._adjudicate_site
+
+        def recording(*args, **kwargs):
+            seen.append(kwargs.get("deadline"))
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(rb, "_adjudicate_site", recording)
+        rb.run_resource_bounds_check(
+            tmp_path, "src/ssl_sess.c", "ssl_session_cache_add", HYP,
+            budget_s=30.0,
+        )
+        assert seen, "no site was adjudicated"
+        assert all(d is not None for d in seen)
+
+
+class TestPackCollectionVerbsCache:
+    def test_pack_read_once_per_process(self, tmp_path, monkeypatch):
+        # The pack JSON was re-read and re-parsed on every check call.
+        import core.audit.resource_bounds as rb
+        import core.audit.vocab_packs as vp
+
+        pack_dir = tmp_path / "packs"
+        pack_dir.mkdir()
+        (pack_dir / "linux_kernel.json").write_text(
+            '{"collection_inserts": ["list_add"],'
+            ' "collection_removes": ["list_del"]}',
+        )
+        monkeypatch.setattr(vp, "_PACK_DIR", pack_dir)
+        monkeypatch.setattr(vp, "is_kernel_tree", lambda p: True)
+        rb._pack_collection_cache.clear()
+
+        first = rb._pack_collection_verbs(tmp_path)
+        assert first == (frozenset({"list_add"}), frozenset({"list_del"}))
+        # Cache must serve the second call — the file is gone.
+        (pack_dir / "linux_kernel.json").unlink()
+        assert rb._pack_collection_verbs(tmp_path) == first
+
+
+class TestSanitizedViewMatching:
+    """Lexical witnesses are earned on the sanitized view (comments/
+    strings blanked) — both directions are hostile-repo steerable:
+    a comment clamp mints a refutation, a comment insert mints a
+    site."""
+
+    _CLAMP_SEG = [
+        "void f(struct list *l, int count) {",
+        "    {CLAMP}",
+        "    for (i = 0; i < n; i++) {",
+        "        p = malloc(64);",
+        "    }",
+        "}",
+    ]
+
+    def _clamp(self, clamp_line):
+        from core.audit.resource_bounds import _clamp_witness
+        seg = [ln.replace("{CLAMP}", clamp_line) for ln in self._CLAMP_SEG]
+        return _clamp_witness(
+            seg, 1, 4, None, frozenset(), file_path="src/a.c",
+        )
+
+    def test_comment_clamp_does_not_refute(self):
+        assert self._clamp("/* n = min(count, MAX_CONN) */") is None
+
+    def test_real_clamp_still_witnesses(self):
+        w = self._clamp("n = min(count, MAX_CONN);")
+        assert w is not None
+        assert w["bound"] == "MAX_CONN"
+
+    def test_comment_insert_does_not_mint_site(self):
+        from core.audit.resource_bounds import _enumerate_sites
+        seg = [
+            "void g(struct list *l, struct conn *c) {",
+            "    /* list_add(&c->node, l); */",
+            "}",
+        ]
+        sites = _enumerate_sites(
+            seg, 1, {"list_add": ("seed", "seed")}, {},
+            file_path="src/a.c",
+        )
+        assert sites == []
+
+    def test_real_insert_still_mints_site(self):
+        from core.audit.resource_bounds import _enumerate_sites
+        seg = [
+            "void g(struct list *l, struct conn *c) {",
+            "    list_add(&c->node, l);",
+            "}",
+        ]
+        sites = _enumerate_sites(
+            seg, 1, {"list_add": ("seed", "seed")}, {},
+            file_path="src/a.c",
+        )
+        assert [s.verb for s in sites] == ["list_add"]
+        # Receipt shows the ORIGINAL line, not the blanked view.
+        assert "list_add(&c->node, l);" in sites[0].code
+
+
+class TestGatherSourceTextsContainment:
+    """_gather_source_texts is a hypothesis-file intake: file paths
+    arrive from LLM-writable artifacts, so reads must be contained to
+    the analysed root and byte-capped (the release_order idiom)."""
+
+    def _tree(self, tmp_path):
+        target = tmp_path / "target"
+        (target / "src").mkdir(parents=True)
+        (target / "src/a.c").write_text("int f(void) { return 1; }\n")
+        secret = tmp_path / "secret.c"
+        secret.write_text("int host_secret(void) { return 42; }\n")
+        return target, secret
+
+    def test_absolute_primary_path_refused(self, tmp_path):
+        from core.audit.resource_bounds import (
+            _gather_source_texts as _rb_gather_source_texts,
+        )
+        target, secret = self._tree(tmp_path)
+        texts = _rb_gather_source_texts(target, str(secret))
+        assert str(secret) not in texts
+        assert not any("host_secret" in t for t in texts.values())
+
+    def test_traversal_primary_path_refused(self, tmp_path):
+        from core.audit.resource_bounds import (
+            _gather_source_texts as _rb_gather_source_texts,
+        )
+        target, _secret = self._tree(tmp_path)
+        texts = _rb_gather_source_texts(target, "../secret.c")
+        assert "../secret.c" not in texts
+        assert not any("host_secret" in t for t in texts.values())
+
+    def test_symlink_escape_refused(self, tmp_path):
+        from core.audit.resource_bounds import (
+            _gather_source_texts as _rb_gather_source_texts,
+        )
+        target, secret = self._tree(tmp_path)
+        (target / "src/link.c").symlink_to(secret)
+        texts = _rb_gather_source_texts(target, "src/a.c")
+        assert not any("host_secret" in t for t in texts.values())
+
+    def test_primary_read_is_capped(self, tmp_path):
+        from core.audit import resource_bounds
+        from core.audit.resource_bounds import (
+            _gather_source_texts as _rb_gather_source_texts,
+        )
+        target, _secret = self._tree(tmp_path)
+        big = "int g;\n" * (
+            resource_bounds._MAX_FILE_BYTES // 7 + 10
+        )
+        (target / "src/big.c").write_text(big)
+        texts = _rb_gather_source_texts(target, "src/big.c")
+        got = texts.get("src/big.c")
+        assert got is not None
+        assert len(got) <= resource_bounds._MAX_FILE_BYTES
+
+    def test_contained_relative_file_still_read(self, tmp_path):
+        from core.audit.resource_bounds import (
+            _gather_source_texts as _rb_gather_source_texts,
+        )
+        target, _secret = self._tree(tmp_path)
+        texts = _rb_gather_source_texts(target, "src/a.c")
+        assert "src/a.c" in texts
+        assert "int f" in texts["src/a.c"]
+
+
+class TestSourceCensusAndMemo:
+    """The census walk is a pure function of the tree, priced once
+    per run (orchestrator memo) instead of once per hypothesis
+    dispatch; VCS internals are pruned — the old whole-tree rglob
+    materialised a kernel-sized .git/objects on every call."""
+
+    def _tree(self, tmp_path):
+        target = tmp_path / "target"
+        (target / "src").mkdir(parents=True)
+        (target / "src/a.c").write_text("int f(void) { return 1; }\n")
+        (target / "src/b.c").write_text("int g(void) { return 2; }\n")
+        git = target / ".git" / "objects" / "ab"
+        git.mkdir(parents=True)
+        (git / "planted.c").write_text("int git_internal(void);\n")
+        return target
+
+    def test_census_prunes_vcs_internals(self, tmp_path):
+        from core.audit.resource_bounds import _source_census
+
+        target = self._tree(tmp_path)
+        rels = [rel for rel, _ in _source_census(target)]
+        assert "src/a.c" in rels and "src/b.c" in rels
+        assert not any(".git" in r for r in rels)
+
+    def test_census_selection_matches_rglob_order(self, tmp_path):
+        from core.audit import resource_bounds
+        from core.audit.resource_bounds import _source_census
+
+        target = tmp_path / "target"
+        for d in ("z", "a/nested", "m"):
+            (target / d).mkdir(parents=True)
+        names = [
+            "z/x.c", "a/nested/y.c", "m/q.h", "a/top.cpp", "root.c",
+        ]
+        for nm in names:
+            (target / nm).write_text(f"// {nm}\n")
+        rels = [rel for rel, _ in _source_census(target)]
+        expected = [
+            str(p.relative_to(target))
+            for p in sorted(target.rglob("*"))
+            if p.is_file() and p.suffix in resource_bounds._SOURCE_SUFFIXES
+        ]
+        assert rels == expected[:resource_bounds._MAX_SCAN_FILES]
+
+    def test_gather_with_census_does_not_walk(self, tmp_path, monkeypatch):
+        import os as _os
+
+        from core.audit.resource_bounds import (
+            _gather_source_texts as _rb_gather_source_texts,
+        )
+
+        target = self._tree(tmp_path)
+        census = [("src/b.c", "int g(void) { return 2; }\n")]
+
+        def boom(*a, **k):
+            raise AssertionError("walk must not run with a census")
+
+        monkeypatch.setattr(_os, "walk", boom)
+        texts = _rb_gather_source_texts(target, "src/a.c", census=census)
+        assert "src/a.c" in texts and "src/b.c" in texts
+
+    def test_orchestrator_memo_prices_census_once(
+        self, tmp_path, monkeypatch,
+    ):
+        from types import SimpleNamespace
+
+        from core.audit import resource_bounds
+        from core.audit.orchestrator import _hypothesis_source_texts
+        from core.audit.run_memo import BoundedMemo
+
+        target = self._tree(tmp_path)
+        calls = {"n": 0}
+        real = resource_bounds._source_census
+
+        def counting(t):
+            calls["n"] += 1
+            return real(t)
+
+        monkeypatch.setattr(resource_bounds, "_source_census", counting)
+        config = SimpleNamespace(hypothesis_source_memo=BoundedMemo(16))
+        t1 = _hypothesis_source_texts(config, target, "src/a.c")
+        t2 = _hypothesis_source_texts(config, target, "src/b.c")
+        assert calls["n"] == 1
+        assert "src/a.c" in t1 and "src/b.c" in t2
+
+    def test_non_c_primary_skips_intake(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+
+        from core.audit import resource_bounds
+        from core.audit.orchestrator import _hypothesis_source_texts
+        from core.audit.run_memo import BoundedMemo
+
+        target = self._tree(tmp_path)
+
+        def boom(t):
+            raise AssertionError("census must not run for non-C primary")
+
+        monkeypatch.setattr(resource_bounds, "_source_census", boom)
+        config = SimpleNamespace(hypothesis_source_memo=BoundedMemo(16))
+        assert _hypothesis_source_texts(config, target, "app.py") is None
+
+
+class TestConsistencyGatherContainment:
+    """Structural twin in consistency_verify: same intake contract."""
+
+    def test_absolute_and_traversal_refused(self, tmp_path):
+        from core.audit.consistency_verify import _gather_source_texts
+        target = tmp_path / "target"
+        (target / "src").mkdir(parents=True)
+        (target / "src/a.c").write_text("int f(void) { helper(); }\n")
+        secret = tmp_path / "secret.c"
+        secret.write_text("int host_secret(void) { return 42; }\n")
+        for hostile in (str(secret), "../secret.c"):
+            texts = _gather_source_texts(target, hostile, ["helper"])
+            assert hostile not in texts
+            assert not any(
+                "host_secret" in t for t in texts.values()
+            ), hostile
+        ok = _gather_source_texts(target, "src/a.c", ["helper"])
+        assert "src/a.c" in ok
+
+
+class TestClampWhitespaceRun:
+    def test_min_whitespace_run_is_fast(self):
+        """Hostile line opening ``n = min(`` and ending in a long
+        whitespace run with no comma / closing paren: the previous
+        trim spelling ``\\s*([^,()]+?)\\s*,`` overlapped three
+        unbounded repeats on whitespace and tried every split of the
+        run between them — cubic in the line length. The
+        \\S-delimited argument spelling is linear. Both-direction
+        bound: fast AND real clamps still match."""
+        from core.audit.resource_bounds import _CLAMP_RE
+        from core.testing.wallclock import cpu_budget
+
+        hostile = "n = min(count" + " " * (1 << 16) + "x"
+        with cpu_budget(1.0, what="clamp whitespace-run scan"):
+            assert _CLAMP_RE.search(hostile) is None
+
+    def test_clamp_forms_still_match(self):
+        from core.audit.resource_bounds import _CLAMP_RE
+
+        for line, args in (
+            ("n = min(count, MAX_CONN);", ("count", "MAX_CONN")),
+            ("n = MIN( a + b , limit );", ("a + b", "limit")),
+            ("sz = min(x, y + z)", ("x", "y + z")),
+        ):
+            m = _CLAMP_RE.search(line)
+            assert m is not None, line
+            assert (m.group(2), m.group(3)) == args, line
+        assert _CLAMP_RE.search("n = max(count, MAX)") is None

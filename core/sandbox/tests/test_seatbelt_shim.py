@@ -15,6 +15,7 @@ Linux-gated because the teardown assertion tracks descendant PIDs via /proc.
 """
 
 import os
+import select
 import subprocess
 import sys
 import time
@@ -22,13 +23,26 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.skipif(
-    sys.platform != "linux",
-    reason="seatbelt-shim POSIX-core tests use /proc; integration is darwin-only",
-)
+# seatbelt-shim POSIX-core tests use /proc (real-Linux binding);
+# integration is darwin-only and lives in test_macos_spawn.py.
+pytestmark = pytest.mark.linux_native
 
 SHIM_PATH = Path(__file__).resolve().parents[3] / "libexec" / "raptor-seatbelt-shim"
 _READY_BYTE = b"K"
+
+
+def _drain(fd):
+    """Read the status channel to EOF. The channel now carries the
+    watcher's ``G<pid>\n`` sandbox-group report (and ``P`` on a
+    grant-pin violation) alongside the trampoline's readiness byte,
+    so a single fixed-size read no longer captures the protocol."""
+    data = b""
+    while True:
+        chunk = os.read(fd, 4096)
+        if not chunk:
+            break
+        data += chunk
+    return data
 
 # The in-sandbox trampoline _macos_spawn builds. On Linux (no sandbox-exec)
 # we run it directly as the shim's child — the "$@" args become the target.
@@ -97,10 +111,16 @@ class TestSeatbeltShim:
         os.close(sw)
         os.close(dr)
         out, _ = p.communicate(timeout=10)
-        byte = os.read(sr, 8)
+        data = _drain(sr)
         os.close(sr)
         os.close(dw)
-        assert byte == _READY_BYTE
+        assert _READY_BYTE in data
+        # The watcher reports the sandbox process-group leader before
+        # any target code runs — well-formed and plausible.
+        import re as _re
+        m = _re.search(rb"G(\d+)\n", data)
+        assert m, f"no sandbox-group report on the status channel: {data!r}"
+        assert int(m.group(1)) > 0
         assert out.strip() == "DEEP"
         assert p.returncode == 5
 
@@ -118,9 +138,9 @@ class TestSeatbeltShim:
         )
         os.close(sw)
         out, _ = p.communicate(timeout=10)
-        byte = os.read(sr, 8)
+        data = _drain(sr)
         os.close(sr)
-        assert byte == _READY_BYTE
+        assert _READY_BYTE in data
         assert "FD3_CLOSED" in out
         assert "FD3_OPEN" not in out
 
@@ -141,9 +161,9 @@ class TestSeatbeltShim:
         )
         os.close(sw)
         out, _ = p.communicate(timeout=10)
-        byte = os.read(sr, 8)
+        data = _drain(sr)
         os.close(sr)
-        assert byte == _READY_BYTE
+        assert _READY_BYTE in data
         assert "TRUST=<unset>" in out
         assert "SFD=<unset>" in out
         assert "DFD=<unset>" in out
@@ -180,16 +200,41 @@ class TestSeatbeltShim:
         os.close(sw)
         os.close(dr)
         try:
-            time.sleep(0.7)  # let the target start
+            # Target startup is an event, not a wall-clock guess: the
+            # trampoline writes the readiness byte to the status pipe
+            # immediately before exec'ing the target in place (same
+            # pid), so K proves a live in-sandbox descendant exists.
+            # The watcher's G-report may precede K on the same
+            # channel — read until K, generous ceiling: cheap when
+            # fast, safe under load.
+            data = b""
+            deadline = time.monotonic() + 10.0
+            while _READY_BYTE not in data:
+                remaining = deadline - time.monotonic()
+                assert remaining > 0, (
+                    f"no readiness byte within 10s: {data!r}")
+                r, _w, _x = select.select([sr], [], [], remaining)
+                if r:
+                    chunk = os.read(sr, 4096)
+                    assert chunk, (
+                        f"status pipe EOF before readiness: {data!r}")
+                    data += chunk
             tree = [q for q in _descendants(p.pid) if _alive(q)]
             assert tree, "expected a running sandbox subtree"
             os.close(dw)  # orchestrator "dies" -> EOF
             rc = p.wait(timeout=5)
-            time.sleep(0.5)
+            # The group SIGKILL lands before the shim exits; only the
+            # pid table's settling remains. Poll it out rather than
+            # sleeping a fixed window — a real leak still fails, at
+            # the 5s ceiling instead of instantly-past-one-sleep.
+            deadline = time.monotonic() + 5.0
+            while (any(_alive(q) for q in tree)
+                   and time.monotonic() < deadline):
+                time.sleep(0.02)
             survivors = [q for q in tree if _alive(q)]
-            byte = os.read(sr, 8)
+            data += _drain(sr)
             assert rc == 137, f"expected teardown exit, got {rc}"
-            assert byte == _READY_BYTE
+            assert _READY_BYTE in data
             assert survivors == [], f"leaked sandbox procs: {survivors}"
         finally:
             if p.poll() is None:
@@ -208,8 +253,8 @@ class TestSeatbeltShim:
 
     def test_env_restore_reapplied_at_target_exec(self):
         """Quarantined loader vars re-apply at the target exec (loader
-        names only, key never visible) — mirrors the pid1 shim's
-        restore contract on the seatbelt path."""
+        names only, key never visible) — the shim-side restore
+        contract (sole remaining consumer of _env_quarantine)."""
         import json as _json
         from core.sandbox._env_quarantine import _LOADER_EXACT
         names = sorted(_LOADER_EXACT) + ["LD_PRELOAD_X", "DYLD_X"]
@@ -235,9 +280,9 @@ class TestSeatbeltShim:
         )
         os.close(sw)
         out, _ = p.communicate(timeout=10)
-        byte = os.read(sr, 8)
+        data = _drain(sr)
         os.close(sr)
-        assert byte == _READY_BYTE
+        assert _READY_BYTE in data
         for n in names:
             assert f"{n}=/pv/{n}" in out, (
                 f"{n} quarantined but not restored by the seatbelt shim"
@@ -246,3 +291,21 @@ class TestSeatbeltShim:
         assert "EVILPATH=False" in out, (
             "restore payload must not overwrite non-loader variables"
         )
+
+
+class TestPsCandidatesAbsolute:
+    def test_no_path_relative_ps(self):
+        """ps output drives the descendant-collection → SIGKILL list
+        and the watcher runs unsandboxed — a PATH-resolved ps could
+        fabricate a table attributing arbitrary same-UID pids to the
+        sandbox tree. Every candidate must be an absolute path."""
+        import importlib.machinery
+        import importlib.util
+        os.environ.setdefault("_RAPTOR_TRUSTED", "1")
+        loader = importlib.machinery.SourceFileLoader(
+            "raptor_seatbelt_shim_test", str(SHIM_PATH))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        assert mod._PS_CANDIDATES
+        assert all(c.startswith("/") for c in mod._PS_CANDIDATES)

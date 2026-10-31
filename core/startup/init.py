@@ -209,6 +209,13 @@ def _check_pypi_update(package: str, installed: str) -> bool:
     ``_cached_cli_version``.  Never raises — network / parse
     failures silently return False.
     """
+    from core.security.session_services import (
+        report_session_service_policy,
+        session_services_restricted,
+    )
+    if session_services_restricted():
+        report_session_service_policy()
+        return False
     import time
 
     cache_dir = Path(
@@ -320,7 +327,10 @@ def _cached_cli_version(binary: str) -> str | None:
         return None
     out = (proc.stdout or proc.stderr or "").strip()
     first = out.splitlines()[0] if out else ""
-    m = re.search(r"\d+\.\d+(?:\.\d+)*", first)
+    # (?<!\d) pins the match to its digit-run start (a bare leading
+    # \d+ re-scans a digit run from every position — quadratic); the
+    # earliest match is unchanged.
+    m = re.search(r"(?<!\d)\d+\.\d+(?:\.\d+)*", first)
     if proc.returncode != 0 or not m:
         return None
     ver = m.group(0)
@@ -483,6 +493,13 @@ def check_llm() -> tuple[list, list]:
 
     Returns (lines, warnings).
     """
+    from core.security.session_services import session_services_restricted
+    if session_services_restricted():
+        return (
+            ["   llm: Copilot session only (standalone providers blocked)"],
+            ["Copilot service policy: external probes, fallbacks, and "
+             "ancillary services disabled; saved credentials are not consent"],
+        )
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     lines = []
@@ -621,7 +638,16 @@ def check_llm() -> tuple[list, list]:
                 provider = primary.get("provider", "unknown")
                 model = primary.get("model", primary.get("model_name", "unknown"))
                 src = _key_source(provider, primary)
-            lines.append(f"   llm: {provider}/{model} (primary, {src})")
+            # models.json values render into the terminal banner —
+            # same operator-config trust class as the env values
+            # escaped below (ANSI blanks the terminal, bidi reorders,
+            # CR/LF splits lines).
+            from core.security.log_sanitisation import (
+                escape_nonprintable as _esc_np,
+            )
+            lines.append(
+                f"   llm: {_esc_np(str(provider))}/{_esc_np(str(model))}"
+                f" (primary, {src})")
 
             if validator_available and key_status.get(provider) is False:
                 _warn_key_failure(provider)
@@ -646,14 +672,18 @@ def check_llm() -> tuple[list, list]:
                     continue
                 shown += 1
                 role = fm.get("role", "fallback")
-                lines.append(f"        {fp}/{fn} ({role}, {_key_source(fp, fm)})")
+                lines.append(
+                    f"        {_esc_np(str(fp))}/{_esc_np(str(fn))} "
+                    f"({_esc_np(str(role))}, {_key_source(fp, fm)})")
                 if validator_available and key_status.get(fp) is False:
                     _warn_key_failure(fp)
         else:
             lines.append("   llm: no external LLM configured")
 
         if shutil.which("claude"):
-            lines.append("        claude code ✓")
+            lines.append(
+                "        claude code ✓ (analysis CLI installed; auth not checked)"
+            )
 
     except Exception as e:  # noqa: BLE001
         lines.append("   llm: detection error")
@@ -754,6 +784,26 @@ def _key_source(provider: str, model_entry: dict | None = None) -> str:
     if env_var and os.getenv(env_var):
         return f"via {env_var}"
     return "via models.json"
+
+
+def check_frontend() -> str | None:
+    """Describe the launcher-selected frontend without probing or selecting it."""
+    from core.security.log_sanitisation import escape_nonprintable
+
+    frontend = os.getenv("RAPTOR_FRONTEND")
+    frontend_labels = {
+        "claude": "Claude Code",
+        "copilot": "GitHub Copilot CLI",
+    }
+    if frontend not in frontend_labels:
+        return None
+    model = os.getenv("RAPTOR_FRONTEND_MODEL")
+    model_label = (
+        escape_nonprintable(model)
+        if model
+        else "session/config default"
+    )
+    return f"{frontend_labels[frontend]} (model: {model_label})"
 
 
 def check_env(unavailable_features: set) -> tuple[list, list]:
@@ -963,6 +1013,15 @@ def check_env(unavailable_features: set) -> tuple[list, list]:
                     "Subprocess sandboxing unavailable — neither user "
                     "namespaces nor Landlock are supported on this kernel"
                 )
+            # WSL host section (messaging only — banner and doctor both
+            # render it, doctor via its check_env passthrough). Rides
+            # the probe results gathered just above; is_wsl() is cached
+            # and False everywhere off-WSL, so non-WSL hosts pay one
+            # /proc read per process and see no line.
+            from core.startup.wsl import is_wsl, wsl_advisories
+            if is_wsl():
+                parts.append("WSL")
+                warnings.extend(wsl_advisories(landlock_ok))
     except Exception:
         # Never let a sandbox-probe bug kill startup, but leave a trail
         # at DEBUG so the bug is findable instead of invisible.
@@ -1083,8 +1142,7 @@ def check_lang() -> tuple[str | None, list]:
         warnings.append(
             "no tree-sitter grammars installed — inventory degrades "
             "to regex extraction (fewer functions, no spans); "
-            "install the grammar wheels listed in requirements.txt "
-            "(tree-sitter, tree-sitter-python, tree-sitter-c, ...)"
+            "install the grammar wheels with uv sync --extra grammars"
         )
         return "  lang: tree-sitter ✗", warnings
     except Exception:  # noqa: BLE001
@@ -1132,14 +1190,25 @@ def check_active_project() -> str | None:
         except Exception:  # noqa: BLE001 — banner is best-effort
             pass
 
+        # The target field is deliberately charset-unrestricted (paths
+        # may carry odd bytes) and the registry files are plain JSON on
+        # disk — escape at render like check_llm/check_env do, since
+        # the banner line reaches the operator terminal at every
+        # session start (and is reprinted verbatim from
+        # .startup-output).
+        from core.security.log_sanitisation import (
+            escape_nonprintable as _esc_np,
+        )
+        disp_name = _esc_np(str(name))
+        disp_target = _esc_np(str(proj_target))
         suffix = "`/project none` to clear for this session"
         if seeded_by == "auto":
-            line = (f"Auto-detected project: {name} ({proj_target}) "
+            line = (f"Auto-detected project: {disp_name} ({disp_target}) "
                     f"— {suffix}")
         else:
-            line = f"Project: {name} ({proj_target}) — {suffix}"
+            line = f"Project: {disp_name} ({disp_target}) — {suffix}"
         if bookmark and bookmark != name:
-            line += f" (default: {bookmark})"
+            line += f" (default: {_esc_np(str(bookmark))})"
         return line
     except Exception:  # noqa: BLE001
         return None
@@ -1178,6 +1247,7 @@ def main() -> None:
             tool_updates = check_tool_updates()
             llm_lines, llm_warnings = check_llm()
             env_parts, env_warnings = check_env(unavailable)
+            frontend_status = check_frontend()
             lang_line, lang_warnings = check_lang()
             project_line = check_active_project()
         finally:
@@ -1189,6 +1259,7 @@ def main() -> None:
             env_warnings + lang_warnings,
             project_line, lang_line,
             tool_updates=tool_updates,
+            frontend_status=frontend_status,
         )
     except Exception:  # noqa: BLE001
         output = f"{logo}\n\nraptor:~$ {quote}"

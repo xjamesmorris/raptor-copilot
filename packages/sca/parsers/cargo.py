@@ -32,6 +32,7 @@ import re
 from typing import Any, TYPE_CHECKING
 
 from ..models import Confidence, Dependency, PinStyle
+from ._base import build_purl
 from . import _safe_read, register
 
 if TYPE_CHECKING:
@@ -69,7 +70,8 @@ def parse_manifest(path: Path) -> list[Dependency]:
     try:
         data = _load_toml(path)
     except Exception as e:                   # noqa: BLE001
-        logger.warning("sca.parsers.cargo: %s: %s", path, e)
+        logger.warning(
+            "sca.parsers.cargo: TOML parse failed for %s: %s", path, e)
         return []
 
     out: list[Dependency] = []
@@ -122,7 +124,8 @@ def parse_lockfile(path: Path) -> list[Dependency]:
     try:
         data = _load_toml(path)
     except Exception as e:                   # noqa: BLE001
-        logger.warning("sca.parsers.cargo: %s: %s", path, e)
+        logger.warning(
+            "sca.parsers.cargo: TOML parse failed for %s: %s", path, e)
         return []
 
     packages = data.get("package") or []
@@ -141,7 +144,7 @@ def parse_lockfile(path: Path) -> list[Dependency]:
         source = entry.get("source") if isinstance(
             entry.get("source"), str) else None
         pin_style = _lockfile_pin_style(source)
-        purl = _build_purl(name, version)
+        purl = build_purl(_PURL_TYPE, name, version)
         dep = Dependency(
             ecosystem=ECOSYSTEM,
             name=name,
@@ -199,8 +202,8 @@ def _build_dep(
     is_optional = False
     declared_features: list | None = None
 
-    git_url: str | None = None
-    path_ref: str | None = None
+    git_url: str | None = None  # type: ignore[no-redef]
+    path_ref: str | None = None  # type: ignore[no-redef]
     if isinstance(spec, str):
         version = spec
         pin_style, normalised = _classify_version_spec(spec)
@@ -253,13 +256,13 @@ def _build_dep(
         if is_optional:
             source_extra["cargo_optional"] = True
         if declared_features is not None:
-            source_extra["cargo_features"] = declared_features
+            source_extra["cargo_features"] = declared_features  # type: ignore[assignment]
         if git_url:
-            source_extra["cargo_git"] = git_url
+            source_extra["cargo_git"] = git_url  # type: ignore[assignment]
         if path_ref:
-            source_extra["cargo_path"] = path_ref
+            source_extra["cargo_path"] = path_ref  # type: ignore[assignment]
 
-    purl = _build_purl(name, version)
+    purl = build_purl(_PURL_TYPE, name, version)
     return Dependency(
         ecosystem=ECOSYSTEM,
         name=name,
@@ -331,12 +334,6 @@ def _lockfile_pin_style(source: str | None) -> PinStyle:
         return PinStyle.GIT
     return PinStyle.EXACT
 
-
-def _build_purl(name: str, version: str | None) -> str:
-    base = f"pkg:{_PURL_TYPE}/{name}"
-    if version:
-        return f"{base}@{version}"
-    return base
 
 
 __all__ = ["parse_lockfile", "parse_manifest"]

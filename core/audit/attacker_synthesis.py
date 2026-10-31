@@ -72,6 +72,14 @@ _COMPOSABLE_PAIRS: dict[tuple, str] = {
 # Maximum length for multi-step chains (transitive composition).
 _MAX_CHAIN_LENGTH = 5
 
+# Cap on multi-step chains minted per run. Raising it grows
+# attack-chains.json and the report section on combinatorial targets
+# (the extension explores subsets of composable findings); lowering
+# it drops lower-ranked chains a large genuine run would keep.
+# Uncapped, a hostile-shaped group blew memory/time and the consumer
+# converted the blowup into a loud failure that lost the artifact.
+_MAX_MULTI_CHAINS = 128
+
 # Output→input type compatibility for chain step stitching.
 # Maps (output_primitive, input_primitive) to a description of the data
 # flowing between them.  A pair NOT in this table is a type mismatch.
@@ -124,6 +132,15 @@ class AttackChain:
     combined_impact: str
     severity: str
     narrative: str
+    # Chain-status vocabulary caveat: "confirmed" here means the
+    # table-driven composition passed its own constraint checks
+    # (_check_chain_constraints found no failures) — it is NOT the
+    # oracle-verified "confirmed" that /fuzz, /validate, and
+    # /crash-analysis mint and raptor-verified-outcomes surfaces
+    # (which does not read attack-chains.json). The value is an
+    # operator-surface contract (attack-chains.json summary keys,
+    # the findings-export count, the report's Confirmed section), so
+    # it stays; read it as "constraint-consistent", never as proof.
     chain_status: str = "confirmed"
     constraint_failures: list[str] = field(default_factory=list)
     mitigations: list[str] = field(default_factory=list)
@@ -197,7 +214,7 @@ def group_by_reachability(
 
     if context_map:
         entry_points = context_map.get("entry_points", [])
-        call_edges = context_map.get("call_edges", {})
+        call_edges = context_map.get("call_edges", [])
 
         for idx in finding_indices:
             o = outcomes[idx]
@@ -241,6 +258,13 @@ def synthesize_chains(
 
     chains: list[AttackChain] = []
     chain_counter = 0
+    # Run-level dedup: a finding reachable from two entry points lands
+    # in both groups, and each group's pairwise loop would mint the
+    # same (A,B) composition twice under fresh CHAIN-nnn ids —
+    # inflating attack-chains.json and the report's totals. Keyed on
+    # the index pair/set so order-swapped duplicates collapse too.
+    seen_pairs: set[frozenset] = set()
+    seen_key_sets: set[frozenset] = set()
 
     for group in groups:
         if len(group) < 2:
@@ -280,6 +304,11 @@ def synthesize_chains(
                     first_idx, first_prim = idx_a, prim_a
                     second_idx, second_prim = idx_b, prim_b
 
+                pair_key = frozenset((idx_a, idx_b))
+                if pair_key in seen_pairs:
+                    continue
+                seen_pairs.add(pair_key)
+
                 chain_counter += 1
                 key_a = f"{getattr(outcomes[first_idx], 'file', '')}:{getattr(outcomes[first_idx], 'function', '')}"
                 key_b = f"{getattr(outcomes[second_idx], 'file', '')}:{getattr(outcomes[second_idx], 'function', '')}"
@@ -288,6 +317,8 @@ def synthesize_chains(
                     outcomes[first_idx], outcomes[second_idx],
                     first_prim, second_prim,
                 )
+                # "confirmed" = constraint-consistent composition, not
+                # oracle-verified (see AttackChain.chain_status note).
                 status = "hypothetical" if constraint_failures else "confirmed"
                 severity = _IMPACT_SEVERITY.get(combined, "medium")
 
@@ -326,6 +357,7 @@ def synthesize_chains(
         multi, chain_counter = _build_multi_step_chains(
             outcomes, pairwise_for_group, primitives_cache,
             group, chain_counter,
+            seen_key_sets=seen_key_sets,
         )
         chains.extend(multi)
 
@@ -333,7 +365,9 @@ def synthesize_chains(
         "attacker synthesis: %d chains from %d findings "
         "(%d confirmed, %d hypothetical, %d multi-step)",
         len(chains),
-        sum(len(g) for g in groups),
+        # Distinct findings — one finding in two entry-point groups
+        # is still one finding.
+        len({idx for g in groups for idx in g}),
         sum(1 for c in chains if c.chain_status == "confirmed"),
         sum(1 for c in chains if c.chain_status == "hypothetical"),
         sum(1 for c in chains if len(c.finding_keys) > 2),
@@ -401,6 +435,8 @@ def _build_multi_step_chains(
     primitives_cache: dict[int, AttackPrimitive],
     group_indices: list[int],
     chain_counter: int,
+    *,
+    seen_key_sets: set[frozenset] | None = None,
 ) -> tuple:
     """Extend pairwise chains to multi-step chains (3-5 steps).
 
@@ -429,7 +465,11 @@ def _build_multi_step_chains(
             seeds.append(idxs)
 
     multi_chains: list[AttackChain] = []
-    seen_key_sets: set[frozenset] = set()
+    # Run-level when the caller threads it (multi-group dedup: the
+    # same extended index set otherwise re-mints per group); local
+    # fallback keeps direct callers working.
+    if seen_key_sets is None:
+        seen_key_sets = set()
 
     # BFS-style extension: grow each seed by one step at a time.
     queue = list(seeds)
@@ -448,6 +488,13 @@ def _build_multi_step_chains(
             if out_kind != tail_prim.kind:
                 continue
             for candidate_idx in kind_to_indices.get(in_kind, []):
+                if len(multi_chains) >= _MAX_MULTI_CHAINS:
+                    logger.warning(
+                        "attacker synthesis: multi-step chain cap "
+                        "(%d) reached — further extensions dropped",
+                        _MAX_MULTI_CHAINS,
+                    )
+                    return multi_chains, chain_counter
                 if candidate_idx in current:
                     continue  # no cycles
                 extended = current + [candidate_idx]
@@ -458,7 +505,7 @@ def _build_multi_step_chains(
 
                 # Build the chain.
                 chain_counter += 1
-                chain = _assemble_multi_step_chain(
+                chain = _assemble_multi_step_chain(  # type: ignore[assignment]
                     extended, outcomes, primitives_cache, chain_counter,
                 )
                 if chain is not None:
@@ -520,6 +567,8 @@ def _assemble_multi_step_chain(
         )
         constraint_failures.extend(pairwise_failures)
 
+    # "confirmed" = constraint-consistent composition, not
+    # oracle-verified (see AttackChain.chain_status note).
     status = "hypothetical" if constraint_failures else "confirmed"
 
     # Build combined impact from the full chain.
@@ -596,7 +645,7 @@ def _extract_constraints(outcome: Any) -> list[str]:
     constraints = []
     review = getattr(outcome, "review_result", None) or {}
 
-    preconditions = review.get("preconditions", [])
+    preconditions = review.get("preconditions") or []
     for p in preconditions:
         assumption = p.get("assumption", "")
         if assumption:
@@ -608,9 +657,20 @@ def _extract_constraints(outcome: Any) -> list[str]:
 def _find_reachable_entries(
     key: str,
     entry_points: list,
-    call_edges: dict,
+    call_edges: list,
 ) -> list[str]:
-    """Find which entry points can reach a given function."""
+    """Find which entry points can reach a given function.
+
+    ``call_edges`` is the context map's REAL producer shape
+    (core/orchestration/context_map_callgraph.enrich_with_call_edges):
+    a list of ``{caller_file, caller, callee, callee_file}`` dicts.
+    Keys join on the ``"file:function"`` composite the rest of the
+    audit machinery uses; an unresolved ``callee_file`` falls back to
+    the caller's file (same convention as SharedState's
+    ``call_edge_index``). The previous consumer walked a
+    caller→callees DICT no producer ever emitted, so chain synthesis
+    silently grouped nothing whenever the callgraph enricher ran.
+    """
     ep_names = set()
     for ep in entry_points:
         if isinstance(ep, dict):
@@ -622,21 +682,35 @@ def _find_reachable_entries(
     if key in ep_names:
         return [key]
 
-    reachable = []
-    visited: set[str] = set()
+    callers_of: dict[str, set[str]] = {}
+    for edge in call_edges or []:
+        if not isinstance(edge, dict):
+            continue
+        caller_key = (
+            f"{edge.get('caller_file', '')}:{edge.get('caller', '')}"
+        )
+        callee_file = edge.get("callee_file") or edge.get("caller_file", "")
+        callee_key = f"{callee_file}:{edge.get('callee', '')}"
+        callers_of.setdefault(callee_key, set()).add(caller_key)
 
-    def _walk_callers(k: str) -> None:
+    reachable: list[str] = []
+    visited: set[str] = set()
+    # Explicit stack, not recursion: the caller graph is repo-derived,
+    # and a deep chain blows the interpreter recursion limit
+    # (condition_extraction's walker was converted for exactly this).
+    # Reverse-sorted extension reproduces the sorted DFS order.
+    stack = [key]
+    while stack:
+        k = stack.pop()
         if k in visited:
-            return
+            continue
         visited.add(k)
         if k in ep_names:
             reachable.append(k)
-            return
-        for caller, callees in call_edges.items():
-            if isinstance(callees, list) and k in callees:
-                _walk_callers(caller)
-
-    _walk_callers(key)
+            if len(reachable) >= 5:
+                break
+            continue
+        stack.extend(sorted(callers_of.get(k, ()), reverse=True))
     return reachable[:5]
 
 

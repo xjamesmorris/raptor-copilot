@@ -11,8 +11,12 @@ burns one full timeout per finding for the whole run).
 
 from __future__ import annotations
 
+import json
 import sys
+import threading
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
@@ -40,21 +44,65 @@ def _make_finding(finding_id: str) -> dict:
 
 class TestErrorDictRoutedToFailurePath:
 
+    @pytest.mark.parametrize(("message", "expected"), [
+        (
+            'strict mode: missing type "object" for keyword '
+            '"properties" at "#"',
+            "missing_root_type",
+        ),
+        (
+            "--json-schema is not a valid JSON Schema: strict mode: "
+            'unknown keyword: "reasoning"',
+            "request_schema",
+        ),
+    ])
+    def test_schema_error_envelope_keeps_distinct_classification(
+        self, message, expected,
+    ):
+        results = dispatch_task(
+            task=AnalysisTask(),
+            items=[_make_finding("f-000")],
+            dispatch_fn=lambda *args: DispatchResult(
+                result={"error": message},
+                model="claude-code",
+            ),
+            role_resolution={},
+            prior_results={},
+            cost_tracker=CostTracker(0),
+            max_parallel=1,
+        )
+        assert results[0]["error_type"] == expected
+
     def test_error_envelopes_are_failure_records(self):
+        import time
+
         findings = [_make_finding(f"f-{i:03d}") for i in range(10)]
         calls = []
+        tracker = CostTracker(0)
 
         def dead_transport(prompt, schema, system_prompt, temperature, model):
+            n_prior = len(calls)
             calls.append(1)
-            # Slow failure: keeps the worker busy long enough for the
-            # drain loop to process the previous failure and mark the
-            # model dead before the next dead-check runs (same
-            # race-avoidance as the raised-exception breaker test).
-            import time
-            time.sleep(0.15)
+            # Deterministic drain sync (replaces a sleep-won race with
+            # a fixed tolerance band, which a starved CI host could
+            # lose): the drain loop books each error envelope's tokens
+            # into the cost tracker, so block until every PRIOR
+            # failure has been booked — the dead-set is then current
+            # before the next worker's dead-check can run. Reaching
+            # the breaker threshold is therefore timing-independent.
+            # Post-abort stragglers (see the count assertion below)
+            # wait on a booking that never comes — give them a short
+            # deadline so each stall also gives the drain thread ample
+            # time to land cancel_futures, instead of hanging to a
+            # long timeout.
+            deadline = time.monotonic() + (10.0 if n_prior < 3 else 0.5)
+            while (tracker.get_summary()["total_tokens"] < n_prior
+                    and time.monotonic() < deadline):
+                time.sleep(0.002)
             return DispatchResult(
                 result={"error": "timeout after 300s"},
                 model="claude-code",
+                tokens=1,
             )
 
         results = dispatch_task(
@@ -63,14 +111,19 @@ class TestErrorDictRoutedToFailurePath:
             dispatch_fn=dead_transport,
             role_resolution={},  # CC shape: model=None work items
             prior_results={},
-            cost_tracker=CostTracker(0),
+            cost_tracker=tracker,
             max_parallel=1,
         )
 
         # Circuit breaker fired: a never-succeeded model is declared
         # dead after 3 consecutive failures — the whole run must not
-        # pay one timeout per finding.
-        assert len(calls) <= 5
+        # pay one timeout per finding. One extra call (the worker whose
+        # dead-check preceded the third failure's drain) always gets
+        # in; when the all-models abort shuts the pool down, at most a
+        # couple of already-dequeued futures can slip the
+        # cancel-futures window, and each straggler's 0.5s stall gives
+        # the drain thread that long to land the cancellation.
+        assert 4 <= len(calls) <= 6
         assert len(results) == 10
 
         errored = [r for r in results if "error" in r]
@@ -89,6 +142,32 @@ class TestErrorDictRoutedToFailurePath:
             or r.get("error_type") == "circuit_breaker"
             for r in errored
         )
+
+    def test_empty_error_string_still_routes_to_failure_path(self):
+        """{"error": ""} is an error ENVELOPE per _ErrorDictResult's
+        contract (dicts with an ``error`` key) — a truthiness check
+        let it ride the success path and reset the breaker."""
+        findings = [_make_finding("f-000")]
+
+        def empty_error(prompt, schema, system_prompt, temperature, model):
+            return DispatchResult(result={"error": ""}, model="claude-code")
+
+        results = dispatch_task(
+            task=AnalysisTask(),
+            items=findings,
+            dispatch_fn=empty_error,
+            role_resolution={},
+            prior_results={},
+            cost_tracker=CostTracker(0),
+            max_parallel=1,
+        )
+        assert len(results) == 1
+        assert "error" in results[0]
+        # The discriminator: only the FAILURE machinery classifies the
+        # error — the success path copies the envelope through
+        # verbatim (with a _quality stamp) and resets the breaker.
+        assert "error_type" in results[0]
+        assert "_quality" not in results[0]
 
     def test_successful_results_still_succeed(self):
         # Two-direction: healthy payloads keep flowing through the
@@ -142,6 +221,89 @@ class TestErrorDictRoutedToFailurePath:
         )
         assert tracker.total_cost == 0.25
         assert tracker.get_summary()["total_tokens"] == 1234
+
+    def test_completed_straggler_failures_are_all_accounted(self):
+        """Every already-running failure survives the breaker sweep."""
+        findings = [_make_finding(f"f-{i:03d}") for i in range(10)]
+        barrier = threading.Barrier(len(findings))
+        tracker = CostTracker(0)
+
+        def fail_together(prompt, schema, system_prompt, temperature, model):
+            barrier.wait(timeout=5)
+            return DispatchResult(
+                result={"error": "request schema rejected"},
+                model="claude-code",
+                tokens=1,
+            )
+
+        results = dispatch_task(
+            task=AnalysisTask(),
+            items=findings,
+            dispatch_fn=fail_together,
+            role_resolution={},
+            prior_results={},
+            cost_tracker=tracker,
+            max_parallel=len(findings),
+        )
+
+        assert len(results) == len(findings)
+        assert all("error" in result for result in results)
+        summary = tracker.get_summary()
+        assert summary["failed_dispatches"] == len(findings)
+        assert summary["total_tokens"] == len(findings)
+
+    def test_typed_schema_failure_writes_private_complete_diagnostic(
+        self, tmp_path,
+    ):
+        from core.llm.cc_adapter import CCRequestSchemaError
+
+        secret = "glpat-AbCdEfGhIjKlMnOpQrStUvWx"
+        full_stderr = (
+            "strict mode: unknown keyword: \"reasoning\"\n"
+            + "detail-" * 300
+            + secret
+            + "\x1b[31mTAIL"
+        )
+        error = CCRequestSchemaError(
+            "claude -p exited 1: invalid JSON Schema",
+            error_kind="request_schema",
+            diagnostic={
+                "stderr": full_stderr,
+                "request_schema": {
+                    "type": "object",
+                    "reasoning": {"type": "string"},
+                },
+                "per_call_budget_usd": "5.00",
+                "timeout_s": 600,
+            },
+        )
+        tracker = CostTracker(
+            0,
+            diagnostic_dir=tmp_path / "diagnostics",
+        )
+
+        results = dispatch_task(
+            task=AnalysisTask(),
+            items=[_make_finding("f-000")],
+            dispatch_fn=lambda *args: (_ for _ in ()).throw(error),
+            role_resolution={},
+            prior_results={},
+            cost_tracker=tracker,
+            max_parallel=1,
+        )
+
+        result = results[0]
+        assert result["error_type"] == "request_schema"
+        artifact = tmp_path / result["diagnostic_artifact"]
+        assert artifact.stat().st_mode & 0o777 == 0o600
+        payload = json.loads(artifact.read_text(encoding="utf-8"))
+        stored = payload["transport_diagnostic"]["stderr"]
+        assert "detail-" * 300 in stored
+        assert "TAIL" in stored
+        assert secret not in stored
+        assert "[REDACTED]" in stored
+        assert "\x1b" not in stored
+        assert result["artifacts"] == [result["diagnostic_artifact"]]
 
 
 class TestThinkingTokenTelemetry:

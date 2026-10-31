@@ -33,10 +33,10 @@ pytestmark = pytest.mark.skipif(
 # machine names before the evidence-fd plumbing is reached). macOS
 # audit evidence is produced by the seatbelt log streamer instead —
 # covered in test_macos_spawn.py / seatbelt_audit tests.
-linux_only = pytest.mark.skipif(
-    not _sys.platform.startswith("linux"),
-    reason="tracer.trace() is the Linux ptrace tracer",
-)
+# tracer.trace() is the Linux ptrace tracer
+# Real-Linux-kernel binding: these tests carry the linux_native
+# marker (pytest.ini) instead of an ad hoc skipif — honest skip on
+# other native platforms, deselected under the darwin-emulation gate.
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +156,7 @@ class TestEvidenceFile:
         with pytest.raises(OSError, match="failed validation"):
             ev.EvidenceFile.open(tmp_path, "d.jsonl")
 
-    @linux_only
+    @pytest.mark.linux_native
     def test_planted_fifo_refused_promptly(self, tmp_path):
         """The pre-fix FileExistsError branch
         opened O_WRONLY before fstat — a planted FIFO with no reader
@@ -169,7 +169,7 @@ class TestEvidenceFile:
             ev.EvidenceFile.open(tmp_path, "d.jsonl")
         assert exc_info.value.errno == errno.ENXIO
 
-    @linux_only
+    @pytest.mark.linux_native
     def test_planted_fifo_with_reader_refused(self, tmp_path):
         """A FIFO WITH a live reader passes the nonblocking open but
         must fail the S_ISREG validation."""
@@ -422,7 +422,7 @@ class TestTracerFdConfigConsumption:
         finally:
             os.close(keeper)
 
-    @linux_only
+    @pytest.mark.linux_native
     def test_trace_falls_back_when_evidence_fd_invalid(
             self, tmp_path, caplog, monkeypatch):
         # A stale/bad evidence_fd number must degrade to per-record
@@ -453,7 +453,7 @@ class TestTracerFdConfigConsumption:
         assert any("evidence_fd" in r.getMessage()
                    for r in caplog.records)
 
-    @linux_only
+    @pytest.mark.linux_native
     def test_trace_adopts_valid_evidence_fd(self, tmp_path, monkeypatch):
         from core.sandbox import tracer as tracer_mod
         monkeypatch.setattr(tracer_mod, "_evidence_out_fd", None)

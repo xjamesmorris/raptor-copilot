@@ -411,3 +411,42 @@ class TestNoOverclaimFromMissingData:
             result, sink_cwe="CWE-476", binary_path=binary,
         )
         assert blob["verdict_for_downstream"]["impact"] == "info_leak"
+
+
+class TestStackSmashNotApplicableIsUnknown:
+    """'Verified blocked' must be earned from evidence, same as
+    'verified available'. stack_smash isn't the write mechanism of
+    non-stack CWEs, and 'not applicable' is absence of evidence —
+    asserting False fabricated a concrete blocked signal that alone
+    drove evidence-free sinks to priority 'low'."""
+
+    def test_stack_smash_is_none_for_non_stack_cwe(self):
+        result = {"protections": {}, "glibc_n_disabled": None}
+        avail = _availability_for_cwe("CWE-134", result)
+        assert avail["stack_smash"] is None
+
+    def test_stack_smash_stays_none_for_cwe_121(self):
+        result = {"protections": {}, "glibc_n_disabled": None}
+        avail = _availability_for_cwe("CWE-121", result)
+        assert avail["stack_smash"] is None
+
+    def test_evidence_free_known_cwe_sink_is_not_low(self):
+        """A CWE-134 sink with NO mitigation evidence at all (no RELRO
+        data, glibc unknown, %n conditional) must not be de-prioritized
+        — there is no verified-blocked primitive behind that verdict."""
+        result = {"protections": {}, "glibc_n_disabled": None}
+        avail = _availability_for_cwe("CWE-134", result)
+        assert all(v is None for v in avail.values())
+        assert _priority_hint(avail, None) == "medium"
+
+    def test_real_all_blocked_evidence_still_gives_low(self):
+        """Two-direction: when every primitive is genuinely verified
+        blocked (Full RELRO, glibc>=2.34, %n disabled), the low hint
+        still fires."""
+        result = {
+            "protections": {"full_relro": True},
+            "glibc_n_disabled": True,
+            "glibc_version": "2.39",
+        }
+        avail = _availability_for_cwe("CWE-134", result)
+        assert _priority_hint(avail, None) == "low"

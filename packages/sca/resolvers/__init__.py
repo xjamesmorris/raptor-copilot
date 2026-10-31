@@ -195,8 +195,14 @@ def _check_tool(cmd: list, *, timeout: int = 5) -> bool:
     if key in _CHECK_TOOL_CACHE:
         return _CHECK_TOOL_CACHE[key]
     try:
+        # Sanitised env for the availability probe (the codeql
+        # version-probe idiom): trusted tool, no target input, but a
+        # bare run inherits LD_PRELOAD / PYTHONPATH / JVM agent vars
+        # from the operator shell.
+        from core.security.env_sanitisation import safe_subprocess_env
         proc = subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout,
+            env=safe_subprocess_env(strip_target_markers=True),
         )
         result = proc.returncode == 0 and bool(
             proc.stdout.strip() or proc.stderr.strip())
@@ -278,7 +284,7 @@ def _run(
             sandbox_kwargs["require_proxy_netns"] = True  # 00015: untrusted egress must use the netns tier
             sandbox_kwargs["proxy_hosts"] = list(proxy_hosts)
 
-        return sandbox_run(cmd, **sandbox_kwargs)
+        return sandbox_run(cmd, **sandbox_kwargs)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -348,8 +354,8 @@ def get_resolver(
     if project_dir is not None:
         for r in candidates:
             if r.matches(project_dir):
-                return r
-    return candidates[-1]
+                return r  # type: ignore[return-value]
+    return candidates[-1]  # type: ignore[return-value]
 
 
 __all__ = [

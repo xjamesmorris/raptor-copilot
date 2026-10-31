@@ -19,6 +19,7 @@ from core.project.trust import (
     active_project_trust,
     apply_project_trust_flags,
     resolve_dynamic_validation,
+    resolve_dynamic_validation_detail,
     resolve_trust_flag,
 )
 
@@ -34,6 +35,9 @@ class TrustProjectFixture(unittest.TestCase):
     """Temp projects dir with one active project."""
 
     def setUp(self):
+        from core.project import trust
+        trust._gate_pin_memo.clear()
+        self.addCleanup(trust._gate_pin_memo.clear)
         self._tmp = TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         root = Path(self._tmp.name)
@@ -282,6 +286,139 @@ class TestResolveDynamicValidation(TrustProjectFixture):
         result, out = self._resolve(None, target=other)
         self.assertFalse(result)
         self.assertIn("IGNORED", out)
+
+
+class TestTrustResolutionDetail(TrustProjectFixture):
+    """The detail variant carries the resolution's provenance so
+    consumers can name the consulted project and layer in refusal
+    messages. The ``granted`` field must always equal what the plain
+    bool resolver returns (the bool functions delegate to it)."""
+
+    def _detail(self, explicit, target=None, run_dir=None):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            res = resolve_dynamic_validation_detail(
+                explicit, target_path=target or self.target,
+                run_dir=run_dir)
+        return res, out.getvalue()
+
+    def test_explicit_decides_before_any_project_load(self):
+        res, out = self._detail(False)
+        self.assertEqual(
+            (res.granted, res.source, res.project, res.layer),
+            (False, "explicit", None, "ambient"))
+        res, _ = self._detail(True)
+        self.assertEqual((res.granted, res.source), (True, "explicit"))
+
+    def test_marker_grant_names_project_and_layer(self):
+        self.mgr.set_trust_marker("p", "dynamic")
+        res, out = self._detail(None)
+        self.assertEqual(
+            (res.granted, res.source, res.project, res.layer),
+            (True, "marker", "p", "ambient"))
+        self.assertIn("[*] project trust: dynamic", out)
+
+    def test_default_refusal_names_consulted_project(self):
+        res, _ = self._detail(None)
+        self.assertEqual(
+            (res.granted, res.source, res.project, res.layer),
+            (False, "default", "p", "ambient"))
+
+    def test_target_mismatch_is_distinct_from_default(self):
+        self.mgr.set_trust_marker("p", "dynamic")
+        other = Path(self._tmp.name) / "other-detail"
+        other.mkdir()
+        res, out = self._detail(None, target=other)
+        self.assertEqual(
+            (res.granted, res.source, res.project),
+            (False, "marker-target-mismatch", "p"))
+        self.assertIn("IGNORED", out)
+
+    def test_run_dir_marks_run_pin_layer(self):
+        # A run dir pinned to NO project (marker present, project
+        # null) resolves through the run-pin layer and reports it —
+        # and the ambient project's marker stays out of the verdict.
+        from core.json import save_json
+        self.mgr.set_trust_marker("p", "dynamic")
+        run_dir = Path(self._tmp.name) / "out" / "run-x"
+        run_dir.mkdir(parents=True)
+        save_json(run_dir / ".raptor-run.json",
+                  {"status": "running", "project": None,
+                   "project_source": "argv"})
+        res, _ = self._detail(None, run_dir=run_dir)
+        self.assertEqual(
+            (res.granted, res.source, res.project, res.layer),
+            (False, "default", None, "run-pin"))
+
+
+class TestOneTargetRuleFollowsPin(unittest.TestCase):
+    """The one-target rule applied INSIDE a marker resolution must
+    compare the run's target against the PIN project's target — a
+    mixed-layer comparison (marker from the pin, target from the
+    ambient project) flips both directions."""
+
+    def setUp(self):
+        from core.project import sessions, trust
+        from core.run import pin
+
+        trust._gate_pin_memo.clear()
+        self.addCleanup(trust._gate_pin_memo.clear)
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.projects_dir = root / "projects"
+        self.t_pin = root / "code-pinned"
+        self.t_amb = root / "code-ambient"
+        self.t_pin.mkdir()
+        self.t_amb.mkdir()
+        self.mgr = ProjectManager(projects_dir=self.projects_dir)
+        self.mgr.create("pinned", str(self.t_pin),
+                        output_dir=str(root / "po" / "pinned"))
+        self.mgr.create("ambient", str(self.t_amb),
+                        output_dir=str(root / "po" / "ambient"))
+        self.mgr.set_active("ambient")
+        for patcher in (
+            patch("core.project.project.PROJECTS_DIR", self.projects_dir),
+            patch.object(sessions, "SESSIONS_DIR", root / "sessions.d"),
+            patch.object(pin, "_process_project", None),
+            patch.object(pin, "_process_project_set", False),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        from core.json import save_json
+        self.run_dir = root / "out" / "run-x"
+        self.run_dir.mkdir(parents=True)
+        save_json(self.run_dir / ".raptor-run.json",
+                  {"status": "running", "project": "pinned",
+                   "project_source": "argv"})
+
+    def _detail(self, target):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            return resolve_dynamic_validation_detail(
+                None, target_path=target, run_dir=self.run_dir)
+
+    def test_pinned_marker_grant_matches_pin_target(self):
+        # Availability direction: the pinned project's marker + the
+        # pinned project's own target must grant — comparing the run
+        # target against the AMBIENT project's target instead refuses
+        # the operator's standing assertion.
+        self.mgr.set_trust_marker("pinned", "dynamic")
+        res = self._detail(self.t_pin)
+        self.assertEqual(
+            (res.granted, res.source, res.project, res.layer),
+            (True, "marker", "pinned", "run-pin"))
+
+    def test_pinned_marker_never_rides_ambient_target_match(self):
+        # Security direction: run target = the AMBIENT project's
+        # target, marker from the PINNED project whose target differs.
+        # The one-target rule must compare against the PIN project's
+        # target and refuse — a mixed-layer comparison turns this
+        # into a grant.
+        self.mgr.set_trust_marker("pinned", "dynamic")
+        res = self._detail(self.t_amb)
+        self.assertIs(res.granted, False)
+        self.assertEqual(res.source, "marker-target-mismatch")
 
 
 class TestAuditPipelineDynamicOptr(unittest.TestCase):

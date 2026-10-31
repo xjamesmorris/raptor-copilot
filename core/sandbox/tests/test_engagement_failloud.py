@@ -13,16 +13,16 @@ the error names the explicit operator escape hatch. RAPTOR never silently
 downgrades.
 """
 
-import sys
 
 import pytest
 
 from core.sandbox import SandboxSetupError, check_unshare_engages, sandbox, state
 from core.sandbox.tests.capability import requires_landlock, requires_userns
 
-_linux_only = pytest.mark.skipif(
-    sys.platform != "linux", reason="unshare engagement is Linux-only",
-)
+# unshare engagement is Linux-only
+# Real-Linux-kernel binding: these tests carry the linux_native
+# marker (pytest.ini) instead of an ad hoc skipif — honest skip on
+# other native platforms, deselected under the darwin-emulation gate.
 
 
 def _poison(flags, reason="unshare: Operation not permitted"):
@@ -43,7 +43,7 @@ def _gate_flags(block_network=True):
     return flags
 
 
-@_linux_only
+@pytest.mark.linux_native
 class TestEngagementGateRaises:
     @requires_userns
     def test_block_network_engagement_failure_raises(self):
@@ -219,6 +219,73 @@ class TestLayerFunctionalSelfTests:
         from core.sandbox.probes import _mount_ns_functional_selftest
         assert isinstance(_mount_ns_functional_selftest(), bool)
 
+    def test_mount_ns_selftest_fails_on_mount_denial_exit_codes(
+            self, monkeypatch):
+        # The child exits 2/3 when namespace CREATION worked but the
+        # in-namespace mount operations were refused — the shape where
+        # an outer seccomp EPERMs the mount family while unshare stays
+        # allowed. A creation-only self-test reported such hosts as
+        # mount-capable and every spawn then died on its bind tree
+        # mid-flight; the probe must map those exits to unavailable.
+        import os as _os
+
+        from core.sandbox.probes import _mount_ns_functional_selftest
+
+        for child_exit, expected in ((0, True), (1, False), (2, False),
+                                     (3, False), (4, False)):
+            monkeypatch.setattr(_os, "fork", lambda: 12345)
+            monkeypatch.setattr(
+                _os, "waitpid",
+                lambda pid, opts, _s=child_exit << 8: (12345, _s))
+            assert _mount_ns_functional_selftest() is expected, child_exit
+
+    def test_staged_pidns_selftest_maps_child_exits(self, monkeypatch):
+        # Exit 0 = staged creation engaged; 190 = the userns itself
+        # refused (the flat CLI probe's case to diagnose — not a
+        # staged refusal, so it must NOT flip this helper); any errno
+        # = the staged unshare(CLONE_NEWPID) was refused (the
+        # restricted-userns class live-confirmed on GitHub runners).
+        import os as _os
+
+        from core.sandbox.probes import _staged_pidns_selftest
+
+        for child_exit, expected in ((0, True), (190, True), (1, False),
+                                     (13, False), (250, False)):
+            monkeypatch.setattr(_os, "fork", lambda: 12345)
+            monkeypatch.setattr(
+                _os, "waitpid",
+                lambda pid, opts, _s=child_exit << 8: (12345, _s))
+            assert _staged_pidns_selftest() is expected, child_exit
+
+    def test_net_probe_keys_on_staged_selftest(self):
+        # The namespace-backend foundation probe must agree with the
+        # staged self-test: on hosts that allow single-call namespace
+        # creation but refuse the spawn backend's staged
+        # unshare(CLONE_NEWPID), check_net_available() must report the
+        # backend unavailable so backend selection routes to the
+        # degraded lanes instead of dying mid-child on every run
+        # (live-confirmed failure mode on GitHub runners).
+        from core.sandbox.probes import (
+            _staged_pidns_selftest,
+            check_net_available,
+        )
+        if not _staged_pidns_selftest():
+            assert check_net_available() is False
+        # (On staged-capable hosts the CLI creation probe owns the
+        # verdict — True or a host-specific False both legal.)
+
+    def test_mount_probe_consistent_with_selftest(self):
+        # Mirrors the seccomp consistency test: the cached availability
+        # verdict may report True only on hosts where the functional
+        # self-test (namespace creation AND a real in-namespace mount)
+        # passes right now.
+        from core.sandbox.probes import (
+            _mount_ns_functional_selftest,
+            check_mount_available,
+        )
+        if check_mount_available():
+            assert _mount_ns_functional_selftest() is True
+
 
 class TestExecStatusPipe:
     """The exec-status pipe: an unspoofable, per-step signal of whether the
@@ -227,7 +294,10 @@ class TestExecStatusPipe:
 
     def test_parse_setup_status(self):
         from core.sandbox._spawn import _parse_setup_status
-        assert _parse_setup_status(b"") is None          # EOF → execed
+        # Only the positive exec confirmation reads as "execed";
+        # bare EOF is an unreported child death ('!'), never genuine.
+        assert _parse_setup_status(b"G:") is None
+        assert _parse_setup_status(b"")[0] == "!"
         assert _parse_setup_status(b"M:mount denied") == ("M", "mount denied")
         assert _parse_setup_status(b"L:") == ("L", "")
         assert _parse_setup_status(b"U:Operation not permitted") == (
@@ -235,11 +305,20 @@ class TestExecStatusPipe:
         assert _parse_setup_status(b"X:exec: file not found")[0] == "X"
 
     @requires_landlock
-    def test_mount_failure_degrades_to_landlock_and_runs(self, tmp_path):
-        # Force the mount-ns spawn path. On a mount-capable host it engages;
-        # on an AppArmor/nested host mount() is denied → status 'M' → degrade
-        # to Landlock-only. EITHER way the command must actually RUN (real
-        # output), never return a silent rc-126 empty result.
+    def test_mount_failure_retries_mountless_and_runs(self, tmp_path):
+        # Force the mount-ns spawn path. On a mount-capable host it
+        # engages; on an AppArmor/nested host the bind tree is denied →
+        # status 'M' → the ladder KEEPS the namespace backend and
+        # retries without the bind tree (mountless: Landlock + PID ns +
+        # fresh procfs where the kernel allows). EITHER way the command
+        # must actually RUN (real output), never return a silent rc-126
+        # empty result. The old 'M' → Landlock-only-subprocess demotion
+        # no longer exists: when the mountless retry cannot engage
+        # either, the designed outcome is a TYPED fail-loud
+        # SandboxSetupError (unit-covered by
+        # test_secure_namespace_retry_fails_closed) — treat that as the
+        # host lacking the lane, not as the silent-empty regression
+        # this test guards against.
         ok, _ = check_unshare_engages(["--user", "--pid", "--fork", "--ipc"])
         if not ok:
             pytest.skip("host cannot engage namespaces at all")
@@ -251,8 +330,15 @@ class TestExecStatusPipe:
         out.mkdir()
         (tgt / "f.txt").write_text("hi")
         tgt, out = str(tgt), str(out)
-        with sandbox(block_network=True, target=tgt, output=out) as run:
-            r = run(["/bin/echo", "ran-OK"], capture_output=True, text=True)
+        try:
+            with sandbox(block_network=True, target=tgt, output=out) as run:
+                r = run(["/bin/echo", "ran-OK"],
+                        capture_output=True, text=True)
+        except SandboxSetupError as e:
+            pytest.skip(
+                f"mountless namespace retry cannot engage on this host "
+                f"(typed fail-loud refusal, not a silent degrade): {e}"
+            )
         if r.returncode == -9:
             pytest.skip(
                 "subprocess degrade path hit EBADF (death-pipe fd "
@@ -260,7 +346,21 @@ class TestExecStatusPipe:
             )
         assert r.returncode == 0
         assert "ran-OK" in (r.stdout or "")
+        info = getattr(r, "sandbox_info", None) or {}
+        if info.get("mount_ns_degraded"):
+            # The 'M' retry actually fired: the run must record the
+            # mountless posture, not claim bind-tree isolation.
+            assert info.get("mount_ns_active") is not True
 
+    # The premise (context enters the spawn path so the faked APPLY
+    # failure can surface) is unbuildable when the namespace backend is
+    # unavailable: the context degrades to Landlock-only up front and
+    # the faked spawn is never reached — the forced mount caches below
+    # cannot override that decision.
+    @requires_userns
+    # Exercises the Linux spawn ladder's 'L' apply-failure arm via the
+    # Linux spawn seam — on any darwin dispatch the seam is inert.
+    @pytest.mark.linux_native
     def test_core_layer_apply_failure_fails_loud(self, monkeypatch, tmp_path):
         # If the spawn child reports a Landlock/seccomp/unshare APPLY failure
         # (probe passed but apply failed), context must fail loud, not degrade.
@@ -329,10 +429,10 @@ class TestExecStatusPipe:
 
     def test_drain_status_pipe_read_error_with_no_bytes_warns_unknown(
             self, caplog):
-        # Nothing read at all before the error: the status is unknown
-        # (still returned as None — the caller cannot invent a
-        # category) but the condition is named out loud instead of
-        # masquerading as a clean EOF.
+        # Nothing read at all before the error: the status is unknown,
+        # which now maps to the same '!' refusal as a missing exec
+        # confirmation — an unreadable pipe must not masquerade as a
+        # confirmed exec — and the condition is named out loud.
         import logging
         import os
         from unittest import mock
@@ -348,7 +448,7 @@ class TestExecStatusPipe:
                 caplog.at_level(logging.WARNING,
                                 logger="core.sandbox._spawn"):
             status = _drain_status_pipe(r, {r})
-        assert status is None
+        assert status is not None and status[0] == "!"
         assert any("status unknown" in rec.message
                    for rec in caplog.records)
 
@@ -365,6 +465,30 @@ class TestExecStatusPipe:
         finally:
             os.close(r)
             os.close(w)
+
+
+def test_demotion_refusal_names_the_actual_unmet_condition_source_pin():
+    """The per-call demotion refusal must not claim "Landlock ABI v4+
+    is missing" on ABI-v4+ hosts where the deny-all lane was excluded
+    by allowed_tcp_ports — that wording sent an operator chasing a
+    Landlock upgrade the host already had (live case: a GitHub runner
+    probing ABI 7 refused every block_network+allowlist call with the
+    ABI message). Source pin, same style as the cgroup pin below: the
+    arm computes the condition instead of hardcoding the ABI claim."""
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "context.py").read_text(
+        encoding="utf-8")
+    start = src.index("_demoted_net_deny = False")
+    block = src[start:src.index("ENGAGE_FAIL_INSTRUCTIONS + \" Alternatively \"",
+                                start)]
+    assert "_no_deny_why" in block, (
+        "the per-call demotion refusal no longer computes the actual "
+        "unmet network-deny condition")
+    assert "allowed_tcp_ports is the" in block, (
+        "the allowlist-excluded branch of the refusal wording is gone")
+    assert "{_no_deny_why}" in block, (
+        "the refusal message no longer interpolates the computed "
+        "condition")
 
 
 def test_engage_probe_covers_the_cgroup_flag_source_pin():

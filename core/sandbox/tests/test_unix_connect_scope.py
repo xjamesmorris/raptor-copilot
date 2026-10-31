@@ -45,7 +45,15 @@ def _mount_ns_usable() -> bool:
     if not shutil.which("newuidmap") or not shutil.which("newgidmap"):
         return False
     sysctl = Path("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
-    return not (sysctl.exists() and sysctl.read_text().strip() == "1")
+    if sysctl.exists() and sysctl.read_text().strip() == "1":
+        return False
+    # The static checks above cannot see every userns denial (a
+    # container's seccomp filter refuses unshare(2) with EPERM while
+    # uidmap tools are installed and the AppArmor sysctl is absent) —
+    # ask the kernel through the same cached probes production keys
+    # the spawn routing on.
+    from core.sandbox.probes import check_mount_available, check_net_available
+    return check_net_available() and check_mount_available()
 
 
 def _scope_usable() -> bool:
@@ -62,6 +70,16 @@ _SPAWN_DEFAULTS = dict(
     seccomp_block_udp=False,
     env=None, cwd=None, timeout=30,
     capture_output=True, text=True,
+    # The subject here is the seccomp-unotify connect supervisor, not
+    # the Landlock layer. These tests call the spawn backend directly,
+    # so they must supply the floor-plumbing value context.run() would
+    # resolve for a call whose floor admits the ns-only tier: on a
+    # Landlock-less kernel the backend then runs without the Landlock
+    # layer instead of fail-closing the whole spawn (which would leave
+    # the connect-scoping battery untested exactly on those hosts).
+    # On Landlock-capable kernels the flag is inert — the tolerance is
+    # scoped strictly to kernel absence and Landlock still engages.
+    landlock_required=False,
 )
 
 

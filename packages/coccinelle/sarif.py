@@ -21,6 +21,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
+from core.sarif import emit
+
 
 if TYPE_CHECKING:
     from .models import SpatchResult
@@ -69,50 +71,38 @@ def results_to_sarif(
 
     # Collect distinct rule definitions. ``rule`` is the rule's stem
     # (filename without .cocci), used as ``ruleId`` in results.
-    rule_defs: list[dict[str, Any]] = []
-    seen_rule_ids: set = set()
+    rule_index = emit.RuleIndex()
     sarif_results: list[dict[str, Any]] = []
     notifications: list[dict[str, Any]] = []
 
     for r in results:
         rule_id = r.rule or "(unnamed)"
-        if rule_id not in seen_rule_ids:
-            rule_defs.append({
-                "id": rule_id,
-                "name": rule_id,
-                "shortDescription": {"text": rule_id},
-                "fullDescription": {"text": (
-                    f"Coccinelle rule emitted from {r.rule_path}"
-                    if r.rule_path else f"Coccinelle rule {rule_id}"
-                )},
-                "defaultConfiguration": {"level": _DEFAULT_LEVEL},
-                "helpUri": _TOOL_INFO_URI,
-            })
-            seen_rule_ids.add(rule_id)
+        rule_index.add(emit.minimal_rule(
+            rule_id,
+            full_description=(
+                f"Coccinelle rule emitted from {r.rule_path}"
+                if r.rule_path else f"Coccinelle rule {rule_id}"
+            ),
+            level=_DEFAULT_LEVEL,
+            help_uri=_TOOL_INFO_URI,
+        ))
 
         for match in r.matches:
             file_rel = _rel_to_repo(match.file, repo_path)
-            sarif_results.append({
-                "ruleId": rule_id,
-                "level": _DEFAULT_LEVEL,
-                "message": {
-                    "text": match.message or f"{rule_id} matched",
-                },
-                "locations": [{
-                    "physicalLocation": {
-                        "artifactLocation": {"uri": file_rel},
-                        "region": {
-                            "startLine": match.line,
-                            **({"endLine": match.line_end}
-                               if match.line_end else {}),
-                            **({"startColumn": match.column}
-                               if match.column else {}),
-                            **({"endColumn": match.column_end}
-                               if match.column_end else {}),
-                        },
-                    },
-                }],
-            })
+            sarif_results.append(emit.result(
+                rule_id,
+                match.message or f"{rule_id} matched",
+                [emit.location(file_rel, {
+                    "startLine": match.line,
+                    **({"endLine": match.line_end}
+                       if match.line_end else {}),
+                    **({"startColumn": match.column}
+                       if match.column else {}),
+                    **({"endColumn": match.column_end}
+                       if match.column_end else {}),
+                })],
+                level=_DEFAULT_LEVEL,
+            ))
 
         # spatch errors → SARIF tool-execution notifications. Distinct
         # from results — operators see the rule had a problem without
@@ -123,27 +113,14 @@ def results_to_sarif(
                 "associatedRule": {"id": rule_id},
             } for err in r.errors or [])
 
-    run: dict[str, Any] = {
-        "tool": {
-            "driver": {
-                "name": _TOOL_NAME,
-                "fullName": _TOOL_FULL_NAME,
-                "informationUri": _TOOL_INFO_URI,
-                "rules": rule_defs,
-            },
-        },
-        "results": sarif_results,
-    }
+    run: dict[str, Any] = emit.run(
+        _TOOL_NAME, rule_index.rules(), sarif_results,
+        full_name=_TOOL_FULL_NAME, information_uri=_TOOL_INFO_URI,
+    )
     if notifications:
         run["invocations"] = [{
             "executionSuccessful": False,
             "toolExecutionNotifications": notifications,
         }]
 
-    return {
-        "$schema":
-            "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master"
-            "/Documents/CommitteeSpecifications/2.1.0/sarif-schema-2.1.0.json",
-        "version": "2.1.0",
-        "runs": [run],
-    }
+    return emit.document([run], schema_uri=emit.SCHEMA_URI_COMMITTEE)

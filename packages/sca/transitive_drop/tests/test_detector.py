@@ -170,6 +170,36 @@ def test_transitive_removed_entirely_in_newer_parent() -> None:
     assert findings[0].extra_name is None
 
 
+def test_issue_lookup_joins_on_canonical_spelling() -> None:
+    """Two spellings of one canonical PyPI name (``zope.interface``
+    / ``zope-interface``) group together, but the finding is
+    attached to the NON-first spelling. The issue lookup must join
+    canonically — a raw-spelling key made detection depend on
+    member order and silently dropped the finding."""
+    pypi = _StubPyPI({
+        "parent": {
+            "1.0.0": {"requires_dist": ["zope.interface>=5.0"]},
+            "2.0.0": {"requires_dist": []},
+        },
+    })
+    dep_dotted = _dep("zope.interface", "5.0.0",
+                      direct=False, source_kind="cascade_resolver",
+                      via=["parent"])
+    dep_dashed = _dep("zope-interface", "5.0.0",
+                      direct=False, source_kind="cascade_resolver",
+                      via=["parent"])
+    deps = [
+        _dep("parent", "1.0.0", direct=True),
+        dep_dotted,      # first group member — no finding attached
+        dep_dashed,
+    ]
+    findings = detect_droppable_transitives(
+        deps, vuln_findings=[_vuln(dep_dashed)], pypi_client=pypi,
+    )
+    assert len(findings) == 1
+    assert findings[0].transitive_status_in_latest == "removed"
+
+
 def test_no_finding_when_already_at_latest() -> None:
     """If the parent is already at the latest version, no bump
     available → no finding (even if the dep is troublesome)."""
@@ -387,12 +417,18 @@ class _StubCargo:
     def get_metadata(self, name):
         if name not in self._latest:
             return None
-        # crates.io aggregate: ``{crate: {newest_version}, versions: [...]}``
+        # Real crates.io aggregate shape, exactly as
+        # CratesClient.get_metadata returns it (no ``releases``
+        # adapter exists for Cargo): ``{crate: {...}, versions:
+        # [{num, yanked, ...}, ...]}``. A hand-normalised
+        # ``releases`` dict here masked a dead detector branch.
         return {
-            "releases": {
-                v: [] for (c, v) in self._d if c == name
-            },
-            "info": {"version": self._latest[name]},
+            "crate": {"name": name,
+                      "newest_version": self._latest[name]},
+            "versions": [
+                {"num": v, "yanked": False}
+                for (c, v) in self._d if c == name
+            ],
         }
 
     def get_version_dependencies(self, name, version):
@@ -441,6 +477,67 @@ def test_cargo_dep_moves_to_optional() -> None:
     assert len(findings) == 1
     assert findings[0].transitive_status_in_latest == "extras-gated"
     assert findings[0].extra_name == "optional-feature"
+
+
+def test_cargo_lane_joins_real_crates_client_shape() -> None:
+    """Producer/consumer join closure: drive the Cargo lane through
+    the REAL ``CratesClient`` over canned HTTP responses, so the
+    metadata shape the detector consumes is the client's actual
+    output, not a hand-built stub that can drift. The aggregate
+    carries a yanked newest version and a prerelease — neither may
+    be picked as the bump target."""
+    from packages.sca.registries.crates import CratesClient
+
+    aggregate = {
+        "crate": {"name": "parent", "newest_version": "3.0.0"},
+        "versions": [
+            {"num": "3.0.0", "yanked": True},
+            {"num": "2.1.0-alpha.1", "yanked": False},
+            {"num": "2.0.0", "yanked": False},
+            {"num": "1.0.0", "yanked": False},
+        ],
+    }
+    deps_by_version = {
+        "1.0.0": [{"crate_id": "dep", "kind": "normal",
+                   "optional": False}],
+        "2.0.0": [{"crate_id": "dep", "kind": "normal",
+                   "optional": True}],
+    }
+
+    class _Http:
+        def get_json(self, url: str):
+            if url.endswith("/dependencies"):
+                version = url.rstrip("/").split("/")[-2]
+                return {"dependencies": deps_by_version[version]}
+            return aggregate
+
+    client = CratesClient(_Http())
+    parent = Dependency(
+        ecosystem="Cargo", name="parent", version="1.0.0",
+        declared_in=Path("/test"), scope="main",
+        is_lockfile=False, pin_style=PinStyle.EXACT, direct=True,
+        purl="pkg:cargo/parent@1.0.0",
+        parser_confidence=Confidence("high", reason="test"),
+    )
+    transitive = Dependency(
+        ecosystem="Cargo", name="dep", version="1.0.0",
+        declared_in=Path("/test"), scope="main",
+        is_lockfile=False, pin_style=PinStyle.EXACT, direct=False,
+        purl="pkg:cargo/dep@1.0.0",
+        parser_confidence=Confidence("high", reason="test"),
+        source_kind="cascade_resolver",
+        source_extra={"via": ["parent"]},
+    )
+    findings = detect_droppable_transitives(
+        [parent, transitive],
+        vuln_findings=[_vuln(transitive)],
+        cargo_client=client,
+    )
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.parent_latest_version == "2.0.0"   # not yanked 3.0.0
+    assert f.transitive_status_in_latest == "extras-gated"
+    assert f.extra_name == "optional-feature"
 
 
 # ---------------------------------------------------------------------------
@@ -503,6 +600,124 @@ def test_rubygems_dep_moves_to_development() -> None:
     assert len(findings) == 1
     assert findings[0].transitive_status_in_latest == "extras-gated"
     assert findings[0].extra_name == "development"
+
+
+def test_via_parent_join_survives_mixed_case_producer() -> None:
+    """Producer/consumer join closure for ``source_extra["via"]``:
+    the cascade parent maps case-fold every non-PyPI name, so the
+    detector must join them case-insensitively against mixed-case
+    direct deps. The ``via`` list here comes from the REAL
+    Gemfile.lock producer over a mixed-case parent (``RedCloth``) —
+    a hand-set lowercase ``via=["parent"]`` masks exactly this
+    boundary."""
+    from packages.sca.transitive import (
+        _extract_gemfile_lock_parents,
+        _parent_map_key,
+    )
+
+    lock = (
+        b"GEM\n"
+        b"  remote: https://rubygems.org/\n"
+        b"  specs:\n"
+        b"    RedCloth (4.3.4)\n"
+        b"      dep (= 1.0.0)\n"
+        b"    dep (1.0.0)\n"
+        b"\n"
+        b"PLATFORMS\n"
+        b"  ruby\n"
+        b"\n"
+        b"DEPENDENCIES\n"
+        b"  RedCloth\n"
+    )
+    parents_by_name = _extract_gemfile_lock_parents(lock)
+    via = parents_by_name[_parent_map_key("RubyGems", "dep")]
+    assert via == ["redcloth"]   # the producer's real (folded) shape
+
+    rg = _StubRubyGems({
+        ("RedCloth", "4.3.4"): {
+            "runtime": [{"name": "dep", "requirements": ">= 1.0"}],
+            "development": [],
+        },
+        ("RedCloth", "5.0.0"): {
+            "runtime": [],
+            "development": [{"name": "dep", "requirements": ">= 2.0"}],
+        },
+    })
+    parent = Dependency(
+        ecosystem="RubyGems", name="RedCloth", version="4.3.4",
+        declared_in=Path("/test"), scope="main",
+        is_lockfile=False, pin_style=PinStyle.EXACT, direct=True,
+        purl="pkg:gem/RedCloth@4.3.4",
+        parser_confidence=Confidence("high", reason="test"),
+    )
+    transitive = Dependency(
+        ecosystem="RubyGems", name="dep", version="1.0.0",
+        declared_in=Path("/test"), scope="main",
+        is_lockfile=False, pin_style=PinStyle.EXACT, direct=False,
+        purl="pkg:gem/dep@1.0.0",
+        parser_confidence=Confidence("high", reason="test"),
+        source_kind="cascade_resolver",
+        source_extra={"via": via},
+    )
+    findings = detect_droppable_transitives(
+        [parent, transitive],
+        vuln_findings=[_vuln(transitive)],
+        rubygems_client=rg,
+    )
+    assert len(findings) == 1
+    f = findings[0]
+    # Registry queries and the operator-facing parent name carry the
+    # manifest spelling, not the producer's folded form.
+    assert f.parent_name == "RedCloth"
+    assert f.parent_latest_version == "5.0.0"
+    assert f.transitive_status_in_latest == "extras-gated"
+
+
+def test_pypi_extras_carrying_via_parent_joins() -> None:
+    """Producer/consumer join closure for the OTHER pip-compile
+    shape: via annotations name the requirement as written, extras
+    included (``# via Celery[redis]``). ``celery[redis]`` is its own
+    PEP 503 fixpoint, so without producer-side stripping the parent
+    can never equal the direct dep's join key and the candidate is
+    silently skipped. The via list comes from the REAL pip-compile
+    producer — a hand-set bare ``via=["celery"]`` masks exactly this
+    boundary."""
+    from packages.sca.transitive import (
+        _extract_pip_compile_via,
+        _parent_map_key,
+    )
+
+    lock = (
+        b"Redis==4.5.0\n"
+        b"    # via Celery[redis]\n"
+    )
+    parents_by_name = _extract_pip_compile_via(lock)
+    via = parents_by_name[_parent_map_key("PyPI", "Redis")]
+    assert via == ["celery"]   # extras stripped, pep503-folded
+
+    pypi = _StubPyPI({
+        "celery": {
+            "5.3.6": {"requires_dist": ["redis>=4.5.0"]},
+            "5.4.0": {
+                "requires_dist": ['redis>=4.5.0; extra == "redis"'],
+            },
+        },
+        "redis": {"4.5.0": {}},
+    })
+    deps = [
+        _dep("Celery", "5.3.6", direct=True),
+        _dep("redis", "4.5.0", direct=False,
+             source_kind="cascade_resolver", via=via),
+    ]
+    findings = detect_droppable_transitives(
+        deps, vuln_findings=[_vuln(deps[1])], pypi_client=pypi,
+    )
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.parent_name == "Celery"
+    assert f.parent_latest_version == "5.4.0"
+    assert f.transitive_status_in_latest == "extras-gated"
+    assert f.extra_name == "redis"
 
 
 # ---------------------------------------------------------------------------
@@ -869,3 +1084,97 @@ def test_is_stable_two_directions() -> None:
     assert _is_stable("npm", "2.0.0-alpha") is False
     assert _is_stable("Debian", "1.0~rc1") is False
     assert _is_stable("npm", "not-a-version") is False
+
+
+def test_adapter_finding_id_uses_supplychain_id_prefix() -> None:
+    """Finding ids stay consistent within the supply-chain category
+    (kinds.py: the historical no-underscore spelling) — this adapter
+    drifted onto the vuln_type prefix, splitting suppression /
+    baseline keys from every sibling of the same category."""
+    from packages.sca.kinds import SUPPLYCHAIN_ID_PREFIX
+    from packages.sca.transitive_drop.adapter import (
+        to_supply_chain_findings,
+    )
+    from packages.sca.transitive_drop.detector import DropOnBumpFinding
+
+    drop = DropOnBumpFinding(
+        ecosystem="PyPI", transitive_name="diskcache",
+        transitive_version="5.6.3",
+        transitive_finding_severity="medium",
+        parent_name="instructor",
+        parent_current_version="1.14.5",
+        parent_latest_version="1.15.1",
+        transitive_status_in_latest="extras-gated",
+        extra_name="diskcache",
+    )
+    findings = to_supply_chain_findings([drop])
+    assert len(findings) == 1
+    assert findings[0].finding_id.startswith(SUPPLYCHAIN_ID_PREFIX)
+
+
+def test_every_group_members_parents_are_diffed() -> None:
+    """Two lockfile rows for the same canonical transitive can carry
+    DIFFERENT ``via`` parents (one manifest pulls it through parent
+    A, another through parent B). Sampling only the first member's
+    parents silently skipped every other parent's cross-version
+    diff — a missed recommendation."""
+    pypi = _StubPyPI({
+        "parent-a": {
+            "1.0.0": {"requires_dist": ["badpkg>=1.0"]},
+            "2.0.0": {"requires_dist": []},
+        },
+        "parent-b": {
+            "1.0.0": {"requires_dist": ["badpkg>=1.0"]},
+            "2.0.0": {"requires_dist": []},
+        },
+        "badpkg": {"1.0.0": {}},
+    })
+    deps = [
+        _dep("parent-a", "1.0.0", direct=True),
+        _dep("parent-b", "1.0.0", direct=True),
+        _dep("badpkg", "1.0.0",
+             direct=False, source_kind="cascade_resolver",
+             via=["parent-a"]),
+        _dep("badpkg", "1.0.0",
+             direct=False, source_kind="cascade_resolver",
+             via=["parent-b"]),
+    ]
+    vuln = _vuln(deps[2], severity="high")
+    findings = detect_droppable_transitives(
+        deps, vuln_findings=[vuln], pypi_client=pypi,
+    )
+    parents = sorted(f.parent_name for f in findings)
+    assert parents == ["parent-a", "parent-b"]
+
+
+def test_adapter_reason_names_the_diffed_metadata_per_ecosystem() -> None:
+    """The operator-facing confidence reason must name the metadata
+    field the detector actually diffed — it claimed ``PyPI
+    requires_dist`` for every ecosystem."""
+    from packages.sca.transitive_drop.adapter import (
+        to_supply_chain_findings,
+    )
+    from packages.sca.transitive_drop.detector import DropOnBumpFinding
+
+    def _finding(eco: str) -> DropOnBumpFinding:
+        return DropOnBumpFinding(
+            ecosystem=eco,
+            transitive_name="badpkg",
+            transitive_version="1.0.0",
+            transitive_finding_severity="high",
+            parent_name="parent-a",
+            parent_current_version="1.0.0",
+            parent_latest_version="2.0.0",
+            transitive_status_in_latest="removed",
+            extra_name=None,
+        )
+
+    pypi_reason = to_supply_chain_findings(
+        [_finding("PyPI")],
+    )[0].confidence.reason
+    npm_reason = to_supply_chain_findings(
+        [_finding("npm")],
+    )[0].confidence.reason
+    assert "requires_dist" in pypi_reason
+    assert "PyPI" not in npm_reason
+    assert "npm" in npm_reason

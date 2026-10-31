@@ -120,6 +120,142 @@ def test_kev_and_epss_enrichment() -> None:
     assert findings[0].epss == 0.97
 
 
+def test_cve_primary_advisory_gets_kev_epss_ssvc() -> None:
+    """A record whose PRIMARY id is the CVE (no self-alias — distro
+    secdb / kernel-CNA shape) must still drive KEV / EPSS / SSVC
+    enrichment; keying off ``aliases`` alone rendered it invisible."""
+    class FakeDecision:
+        is_active = True
+        has_exploit = True
+        automatable = "yes"
+
+    class FakeVulnrichment:
+        def lookup(self, cve: str):
+            return FakeDecision() if cve == "CVE-2024-31337" else None
+
+        def lookup_many(self, cves, *, fetch_budget=None, max_workers=8):
+            out = {}
+            for c in cves:
+                d = self.lookup(c)
+                if d is not None:
+                    out[c] = d
+            return out
+
+    d = _dep()
+    adv = _adv(osv_id="CVE-2024-31337", aliases=[])
+    osv = [OsvResult(dep_key=d.key(), advisories=[adv])]
+    kev = FakeKev(hits=["CVE-2024-31337"])
+    epss = FakeEpss(scores={"CVE-2024-31337": 0.91})
+    findings = build_vuln_findings(
+        [d], osv, kev=kev, epss=epss,
+        vulnrichment=FakeVulnrichment(),  # type: ignore[arg-type]
+    )
+    assert findings[0].in_kev is True
+    assert findings[0].epss == 0.91
+    assert findings[0].ssvc_exploitation == "active"
+    assert findings[0].ssvc_automatable == "yes"
+
+
+def test_lowercase_cve_alias_enrichment_matches_uppercase() -> None:
+    """Both directions of the case-drift join: a feed row spelling
+    its alias lowercase must produce the SAME enrichment as the
+    canonical uppercase spelling. The EPSS / SSVC maps are keyed
+    uppercase and KEV folds case internally — a raw-case join loses
+    epss/ssvc while in_kev stays true, the exact internal
+    inconsistency the CVE-primary fold was landed to eliminate."""
+    class FakeDecision:
+        is_active = True
+        has_exploit = True
+        automatable = "yes"
+
+    class FakeVulnrichment:
+        def lookup_many(self, cves, *, fetch_budget=None, max_workers=8):
+            return {
+                c: FakeDecision() for c in cves if c == "CVE-2024-0001"
+            }
+
+    results = {}
+    for spelling in ("CVE-2024-0001", "cve-2024-0001"):
+        d = _dep()
+        adv = _adv(aliases=[spelling])
+        osv = [OsvResult(dep_key=d.key(), advisories=[adv])]
+        findings = build_vuln_findings(
+            [d], osv,
+            kev=FakeKev(hits=["CVE-2024-0001"]),
+            epss=FakeEpss(scores={"CVE-2024-0001": 0.9}),
+            vulnrichment=FakeVulnrichment(),  # type: ignore[arg-type]
+        )
+        results[spelling] = findings[0]
+
+    upper, lower = results["CVE-2024-0001"], results["cve-2024-0001"]
+    assert upper.in_kev is True and upper.epss == 0.9
+    assert upper.ssvc_exploitation == "active"
+    assert lower.in_kev == upper.in_kev
+    assert lower.epss == upper.epss
+    assert lower.ssvc_exploitation == upper.ssvc_exploitation
+    assert lower.ssvc_automatable == upper.ssvc_automatable
+
+
+def test_cve_primary_kev_agrees_with_exploit_evidence() -> None:
+    """Closure across the CVE-list consumers: the finding-level KEV
+    verdict and the exploit-evidence annotation on the SAME finding
+    must agree on a CVE-primary advisory (they diverged when only the
+    latter consulted ``osv_id``)."""
+    from packages.sca.exploit_evidence import ExploitCorpus, annotate_findings
+
+    d = _dep()
+    adv = _adv(osv_id="CVE-2024-31337", aliases=[])
+    osv = [OsvResult(dep_key=d.key(), advisories=[adv])]
+    kev = FakeKev(hits=["CVE-2024-31337"])
+    findings = build_vuln_findings([d], osv, kev=kev)
+    corpus = ExploitCorpus(kev={"CVE-2024-31337"})
+    annotate_findings(findings, corpus=corpus)
+    assert findings[0].in_kev is True
+    assert findings[0].exploit_evidence is not None
+    assert findings[0].exploit_evidence.kev_listed is True
+
+
+def test_upstream_only_cve_drives_kev_gate_end_to_end() -> None:
+    """Debian/Ubuntu secdb shape: ``aliases: null`` with the CVE
+    identity ONLY in ``upstream``. Driven end-to-end (wire record →
+    Advisory → finding → row → threshold gate): the KEV verdict and
+    the ``--fail-on-kev`` gate must fire exactly as they do for the
+    alias-carrying shape."""
+    from packages.sca import thresholds
+    from packages.sca.findings import _vuln_finding_to_row
+    from packages.sca.osv import parse_osv_record
+
+    record = {
+        "id": "DEBIAN-CVE-2024-6387",
+        "aliases": None,
+        "upstream": ["CVE-2024-6387"],
+        "summary": "openssh - security update",
+        "affected": [{
+            "package": {"name": "openssh", "ecosystem": "Debian:12"},
+            "ranges": [{
+                "type": "ECOSYSTEM",
+                "events": [{"introduced": "0"},
+                           {"fixed": "1:9.2p1-2+deb12u3"}],
+            }],
+        }],
+    }
+    adv = parse_osv_record(record)
+    assert "CVE-2024-6387" in adv.aliases
+
+    d = _dep(name="openssh", version="1:9.2p1-2",
+             ecosystem="Debian:12", path=Path("/repo/Dockerfile"))
+    osv = [OsvResult(dep_key=d.key(), advisories=[adv])]
+    kev = FakeKev(hits=["CVE-2024-6387"])
+    findings = build_vuln_findings([d], osv, kev=kev)
+    assert findings[0].in_kev is True
+
+    row = _vuln_finding_to_row(findings[0])
+    cfg = thresholds.ThresholdConfig(fail_on_kev=True)
+    passed, fails = thresholds.evaluate([row], cfg)
+    assert passed is False
+    assert any("KEV" in m for m in fails)
+
+
 def test_no_advisories_no_findings() -> None:
     d = _dep()
     osv = [OsvResult(dep_key=d.key(), advisories=[])]
@@ -466,6 +602,24 @@ def test_scan_health_row_never_trips_thresholds(tmp_path: Path) -> None:
     rows = json.loads(out.read_text())
     passed, fails = evaluate(rows, ThresholdConfig(fail_on_severity="info"))
     assert passed and fails == []
+
+
+def test_write_findings_json_refuses_non_finite_floats(
+    tmp_path: Path,
+) -> None:
+    """A ``nan`` / ``inf`` float anywhere in a row serialises as a
+    bare non-JSON token (``NaN``) that strict consumers reject —
+    invalidating the WHOLE document, not one row. Refusing loudly at
+    the write chokepoint beats emitting a spec-invalid artifact."""
+    import pytest
+
+    out = tmp_path / "findings.json"
+    with pytest.raises(ValueError):
+        write_findings_json(out, scan_health=[{
+            "kind": "poisoned",
+            "detail": "d",
+            "evidence": {"score": float("nan")},
+        }])
 
 
 def test_atomic_write_no_partial_file(tmp_path: Path) -> None:
@@ -925,3 +1079,61 @@ def test_write_findings_json_atomic_no_predictable_tmp(
         "findings.json", "findings.json.tmp",
     }
     assert leftovers == set()
+
+
+def test_findings_rows_carry_alias_name(tmp_path: Path) -> None:
+    """The ``sca`` block surfaces the manifest's alias spelling so
+    consumers (fix-materialisation, report display) can recover what
+    the operator literally declared; ``name`` stays the installed
+    package — the advisory identity."""
+    d = _dep()
+    d.alias_name = "my-lodash"
+    adv = _adv()
+    findings = build_vuln_findings(
+        [d],
+        [OsvResult(dep_key=d.key(), advisories=[adv])],
+    )
+    hygiene = [HygieneFinding(
+        finding_id="sca:hygiene:loose_pin:npm:lodash:/x",
+        kind="loose_pin",
+        dependency=d,
+        detail="loose pin",
+        severity="low",
+        confidence=Confidence("high", reason="t"),
+    )]
+    out = tmp_path / "findings.json"
+    write_findings_json(out, vuln_findings=findings,
+                        hygiene_findings=hygiene)
+    data = json.loads(out.read_text())
+    for row in data:
+        assert row["sca"]["name"] == "lodash"
+        assert row["sca"]["alias_name"] == "my-lodash"
+    # Plain deps emit an explicit null, not a missing key — schema-
+    # tolerant consumers can rely on the field's presence.
+    d2 = _dep(name="ms", version="2.1.3")
+    findings2 = build_vuln_findings(
+        [d2],
+        [OsvResult(dep_key=d2.key(), advisories=[_adv(osv_id="GHSA-y")])],
+    )
+    out2 = tmp_path / "findings2.json"
+    write_findings_json(out2, vuln_findings=findings2)
+    data2 = json.loads(out2.read_text())
+    assert data2[0]["sca"]["alias_name"] is None
+
+
+def test_scan_health_row_kind_survives_evidence_key_collision(
+    tmp_path: Path,
+) -> None:
+    """``evidence`` merges into the row's ``sca`` block; an evidence
+    dict carrying its own ``kind`` key must not shadow the row's real
+    kind — vuln_type and sca.kind would silently disagree."""
+    from packages.sca.findings import _scan_health_to_row
+
+    row = _scan_health_to_row({
+        "kind": "osv_lookup_degraded",
+        "detail": "d",
+        "evidence": {"kind": "SOMETHING_ELSE", "failed_lookups": 3},
+    })
+    assert row["vuln_type"] == "sca:scan_health:osv_lookup_degraded"
+    assert row["sca"]["kind"] == "osv_lookup_degraded"
+    assert row["sca"]["failed_lookups"] == 3

@@ -1,9 +1,9 @@
 """Sanitizer catalog and CFG-aware recognizer — Phase 6 of the sanitizer-cut arc.
 
-Layered on top of :mod:`core.dataflow.known_safe_calls` (the existing
-24-entry curated table — sink classes ``xss`` / ``sqli`` / ``cmdi`` /
-``pathtrav``; languages Python / Java / JavaScript / TypeScript). The
-known-safe table stays the single source of truth for *which* calls are
+Layered on top of :mod:`core.dataflow.known_safe_calls` (the curated
+table — ``all_entries()`` is the live census of entries, sink classes
+and languages; hardcoding counts here drifted twice). The known-safe
+table stays the single source of truth for *which* calls are
 sanitizers; this module adds two things on top:
 
 1. A CWE → sink-class mapping so a finding tagged with a CWE
@@ -121,7 +121,18 @@ _CWE_TO_SINK_CLASSES: Mapping[str, frozenset] = {
     # OS command / shell injection
     "CWE-77": frozenset({"cmdi"}),
     "CWE-78": frozenset({"cmdi"}),
-    "CWE-88": frozenset({"cmdi"}),
+    # Argument injection: the attack channel is the argv POSITION
+    # (option injection, tokenizer splits, re-join quoting), which the
+    # shell-quoting sanitizers catalogued under ``cmdi`` do not
+    # neutralize (``shlex.quote("-rf")`` is still ``-rf``).  Mapping
+    # CWE-88 to ``cmdi`` selected exactly those sanitizers — and the
+    # ``cmdi`` danger model (shell metachars only) proved charsets
+    # SOUND against none of the argv attack characters.  ``cmdi_argv``
+    # carries the argv-context danger model (a superset of ``cmdi``,
+    # see ``smt_barrier._DANGER_CHARS``) and no catalogue entries, so
+    # sanitizer lookups for CWE-88 abstain instead of endorsing
+    # shell-context quoting.
+    "CWE-88": frozenset({"cmdi_argv"}),
     # Path traversal family
     "CWE-22": frozenset({"pathtrav"}),
     "CWE-23": frozenset({"pathtrav"}),
@@ -138,7 +149,7 @@ def _normalize_cwe(cwe: str) -> str:
     unchanged when it doesn't look like a CWE id so unknown lookups
     return a clean empty set rather than raising.
 
-    Delegates to :func:`core.cwe.canonicalize_cwe` with a
+    Delegates to :func:`core.cve.cwe.canonicalize_cwe` with a
     bare-number fallback (the shared canonicaliser rejects plain
     ``"79"`` since it isn't prefixed) and preserves the
     return-raw-on-unknown semantics the catalog's lookup depends on.
@@ -201,6 +212,34 @@ def all_sanitizer_callables(language: str) -> set[str]:
         for entry in all_entries()
         if language in entry.languages
     }
+
+
+def repo_shadows_module_root(
+    repo_root: str, root: str,
+) -> bool:
+    """True when the scanned repo ships an import-resolvable module
+    that shadows ``root`` — ``<repo_root>/<root>.py`` or
+    ``<repo_root>/<root>/__init__.py``.
+
+    Import-target ORIGIN check: ``import html`` inside such a repo
+    resolves to the REPO's file at runtime (the script directory
+    precedes the stdlib on sys.path), so the written name is the
+    repo's object, not the stdlib/site-packages identity a catalog
+    entry names. A malformed root refuses too (True) — the caller is
+    deciding whether to TRUST an identity, and an unclassifiable one
+    must not be trusted.
+    """
+    if not root or not root.isidentifier():
+        return True
+    try:
+        from pathlib import Path as _Path
+
+        base = _Path(repo_root)
+        return (base / f"{root}.py").is_file() or (
+            base / root / "__init__.py"
+        ).is_file()
+    except OSError:
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +330,7 @@ __all__ = [
     "SanitizerBinding",
     "all_sanitizer_callables",
     "match_sanitizers_in_cfg",
+    "repo_shadows_module_root",
     "nodes_of",
     "sanitizer_callables_for_cwe",
     "sink_classes_for_cwe",

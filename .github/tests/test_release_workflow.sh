@@ -109,8 +109,14 @@ CFFEOF
     # Create .gitattributes
     cp "$SCRIPT_DIR/.gitattributes" "$REPO/.gitattributes" 2>/dev/null || \
     cat > .gitattributes <<'ATTR'
-.github/          export-ignore
-.claude/          export-ignore
+.github/actions/  export-ignore
+.github/codeql/   export-ignore
+.github/docker/   export-ignore
+.github/evals/    export-ignore
+.github/sca/      export-ignore
+.github/scripts/  export-ignore
+.github/tests/    export-ignore
+.github/workflows/ export-ignore
 .devcontainer/    export-ignore
 .vscode/          export-ignore
 .gitattributes    export-ignore
@@ -124,19 +130,36 @@ conftest.py       export-ignore
 ATTR
 
     # Create files that should be excluded from archives
-    mkdir -p .github/workflows .claude .vscode test docs/img
+    mkdir -p .github/workflows .github/agents .github/copilot \
+             plugins/agents .vscode test docs/img
     echo "workflow" > .github/workflows/test.yml
-    echo "claude"   > .claude/settings.json
+    echo "agent"    > .github/agents/demo.md
+    echo "{}"       > .github/copilot/settings.json
+    echo "plugin"   > plugins/agents/README.md
     echo "vscode"   > .vscode/settings.json
     echo "test"     > test/test_something.py
     echo "img"      > docs/img/logo.png
     echo "conftest" > conftest.py
     echo ".env"     > .env
 
-    # Create files that should be included
+    # Create files that should be included. .claude/ is RUNTIME
+    # surface (slash-command dispatch, skills, hooks, settings), not
+    # dev tooling — a release archive without it silently loses every
+    # /command and the SessionStart banner.
     echo "source" > raptor.py
-    mkdir -p packages
+    mkdir -p packages .claude/commands .claude/skills .claude/hooks \
+             libexec bin core engine tiers
     echo "pkg" > packages/__init__.py
+    echo "dispatch" > .claude/commands/scan.md
+    echo "skill"    > .claude/skills/demo.md
+    echo "hook"     > .claude/hooks/session_start.sh
+    echo "settings" > .claude/settings.json
+    echo "cli"      > bin/raptor
+    echo "exec"     > libexec/raptor-run-lifecycle
+    echo "core"     > core/__init__.py
+    echo "engine"   > engine/__init__.py
+    echo "tier"     > tiers/recovery.md
+    echo "claude-md" > CLAUDE.md
 
     git add -A
     git commit -m "initial commit"
@@ -185,6 +208,11 @@ ATTR
 
     echo "q" >> raptor.py && git add -A
     git commit -m "feat: add exploit generator"
+    # Markdown-hostile subject: release notes interpolate commit
+    # subjects into list items, so structural characters must arrive
+    # defanged (md_safe) in the generated changelog.
+    echo "r" >> raptor.py && git add -A
+    git commit -m 'feat: escape <img> [tags] in `output`'
     git tag v3.2.0
 }
 
@@ -209,43 +237,22 @@ check_on_main() {
     fi
 }
 
-resolve_prev_tag() {
-    local TAG="$1"
-    git tag --sort=version:refname \
-        | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
-        | awk -v tag="${TAG}" '$0 == tag {exit} {last=$0} END {print last}'
-}
+# Release notes come from the LIVE generator (release.yml runs
+# `changelog-generator --top 20 --repo <owner/repo> <tag>` at the tag's
+# checkout) — drive that script against the fixture repo rather than a
+# replica of its logic, the same pattern as the stamp-version section.
+CHANGELOG_GEN="$SCRIPT_DIR/.github/scripts/changelog-generator"
 
-generate_changelog() {
-    local TAG="$1"
-    local PREV_TAG
-    PREV_TAG=$(resolve_prev_tag "$TAG")
-
-    local COMMITS
-    if [ -z "$PREV_TAG" ]; then
-        COMMITS=$(git log --pretty=format:"%s" "$TAG")
-    else
-        COMMITS=$(git log --pretty=format:"%s" "${PREV_TAG}..${TAG}")
-    fi
-
-    local FEATURES FIXES SECURITY DOCS OTHER
-    FEATURES=$(echo "$COMMITS" | grep -iE '^feat(\(.+\))?:' | sed -E 's/^[^:]+:[[:space:]]*/- /' || true)
-    FIXES=$(echo "$COMMITS" | grep -iE '^fix(\(.+\))?:' | sed -E 's/^[^:]+:[[:space:]]*/- /' || true)
-    SECURITY=$(echo "$COMMITS" | grep -iE '^(security|sec)(\(.+\))?:' | sed -E 's/^[^:]+:[[:space:]]*/- /' || true)
-    DOCS=$(echo "$COMMITS" | grep -iE '^docs(\(.+\))?:' | sed -E 's/^[^:]+:[[:space:]]*/- /' || true)
-    OTHER=$(echo "$COMMITS" | grep -ivE '^(feat|fix|security|sec|docs|release|chore|ci|test|build|style)(\(.+\))?:' | sed 's/^/- /' || true)
-
-    echo "PREV_TAG=${PREV_TAG}"
-    echo "---FEATURES---"
-    echo "$FEATURES"
-    echo "---FIXES---"
-    echo "$FIXES"
-    echo "---SECURITY---"
-    echo "$SECURITY"
-    echo "---DOCS---"
-    echo "$DOCS"
-    echo "---OTHER---"
-    echo "$OTHER"
+run_changelog() {
+    # Usage: run_changelog <tag> [generator args...]
+    # Checks out the tag first (release.yml runs at the tag's commit;
+    # the generator's log range ends at HEAD), restores main after.
+    local TAG="$1"; shift
+    git checkout -q "$TAG"
+    local OUT
+    OUT=$(python3 "$CHANGELOG_GEN" --repo owner/raptor "$@" "$TAG" 2>/dev/null)
+    git checkout -q main
+    printf '%s\n' "$OUT"
 }
 
 stamp_version() {
@@ -316,61 +323,91 @@ assert_eq "v99.0.0 not on main" "NOT_ON_MAIN" "$(check_on_main v99.0.0)"
 git checkout main
 echo ""
 
-# ── 3. PREV_TAG resolution ─────────────────────────────────────────────
+# ── 3. Previous-tag resolution (live generator) ───────────────────────
 
-echo "=== PREV_TAG resolution ==="
+echo "=== Previous-tag resolution ==="
 
-assert_eq "v3.2.0 prev is v3.1.0"              "v3.1.0" "$(resolve_prev_tag v3.2.0)"
-assert_eq "v3.1.0 prev is v3.0.0 (not v3.2.0)" "v3.0.0" "$(resolve_prev_tag v3.1.0)"
-assert_eq "v2.0.0 prev is v1.0.0"              "v1.0.0" "$(resolve_prev_tag v2.0.0)"
-assert_eq "v1.0.0 prev is empty"               ""        "$(resolve_prev_tag v1.0.0)"
+# The "(since <prev>)" header pins version-order resolution, including
+# the out-of-order guard: v3.1.0's previous tag is v3.0.0 even though
+# v3.2.0 already exists.
+assert_contains "v3.2.0 prev is v3.1.0"              "$(run_changelog v3.2.0 --raw)" "(since v3.1.0)"
+assert_contains "v3.1.0 prev is v3.0.0 (not v3.2.0)" "$(run_changelog v3.1.0 --raw)" "(since v3.0.0)"
+
+CL_FIRST=$(run_changelog v1.0.0 --raw)
+assert_contains     "first release header"   "$CL_FIRST" "## What's changed in v1.0.0"
+assert_not_contains "first release: no prev" "$CL_FIRST" "(since"
 echo ""
 
-# ── 4. Changelog content ───────────────────────────────────────────────
+# ── 4. Changelog content (live generator, raw mode) ────────────────────
 
-echo "=== Changelog: v2.0.0 (all prefix types) ==="
+echo "=== Changelog: v2.0.0 raw (all prefix types) ==="
 
-CL=$(generate_changelog v2.0.0)
+CL=$(run_changelog v2.0.0 --raw)
 
-assert_eq       "prev tag is v1.0.0"                    "PREV_TAG=v1.0.0" "$(echo "$CL" | head -1)"
-assert_contains "feat in features"                      "$(echo "$CL" | sed -n '/---FEATURES---/,/---FIXES---/p')" "- add scanner module"
-assert_contains "fix in fixes"                          "$(echo "$CL" | sed -n '/---FIXES---/,/---SECURITY---/p')" "- handle empty input gracefully"
-assert_contains "security in security"                  "$(echo "$CL" | sed -n '/---SECURITY---/,/---DOCS---/p')" "- fix token leak in header"
-assert_contains "docs in docs"                          "$(echo "$CL" | sed -n '/---DOCS---/,/---OTHER---/p')" "- update installation guide"
-assert_contains "merge commit in other"                 "$(echo "$CL" | sed -n '/---OTHER---/,//p')" "- Merge pull request #42"
+assert_contains "header names prev tag"  "$CL" "## What's changed in v2.0.0 (since v1.0.0)"
+assert_contains "feat in features"       "$CL" "- add scanner module"
+assert_contains "fix in fixes"           "$CL" "- handle empty input gracefully"
+assert_contains "security in security"   "$CL" "- fix token leak in header"
+assert_contains "docs in docs"           "$CL" "- update installation guide"
+assert_contains "merge commit in other"  "$CL" "Merge pull request #42"
+assert_contains "compare link present"   "$CL" "https://github.com/owner/raptor/compare/v1.0.0...v2.0.0"
 
 # Noise filtering
-assert_not_contains "chore filtered from other"         "$(echo "$CL" | sed -n '/---OTHER---/,//p')" "bump dev dependencies"
-assert_not_contains "ci filtered from other"            "$(echo "$CL" | sed -n '/---OTHER---/,//p')" "add CodeQL workflow"
-assert_not_contains "release filtered from other"       "$(echo "$CL" | sed -n '/---OTHER---/,//p')" "stamp v1.0.0"
-assert_not_contains "test filtered from other"          "$(echo "$CL" | sed -n '/---OTHER---/,//p')" "add scanner unit tests"
+assert_not_contains "chore filtered"   "$CL" "bump dev dependencies"
+assert_not_contains "ci filtered"      "$CL" "add CodeQL workflow"
+assert_not_contains "release filtered" "$CL" "stamp v1.0.0"
+assert_not_contains "test filtered"    "$CL" "add scanner unit tests"
+
+# Prefix stripping completeness: classified subjects arrive without
+# their conventional-commit prefix anywhere in the notes.
+assert_not_contains "no feat: prefix leaks"     "$CL" "feat:"
+assert_not_contains "no security: prefix leaks" "$CL" "security:"
+assert_not_contains "no security( prefix leaks" "$CL" "security("
 echo ""
 
-echo "=== Changelog: v3.0.0 (scoped prefixes + sec:) ==="
+echo "=== Changelog: v3.0.0 raw (scoped prefixes + sec:) ==="
 
-CL3=$(generate_changelog v3.0.0)
+CL3=$(run_changelog v3.0.0 --raw)
 
-assert_contains "scoped feat stripped"       "$(echo "$CL3" | sed -n '/---FEATURES---/,/---FIXES---/p')" "- add network isolation"
-assert_contains "sec: in security"           "$(echo "$CL3" | sed -n '/---SECURITY---/,/---DOCS---/p')" "- patch CVE-2026-1234"
-assert_contains "scoped fix stripped"        "$(echo "$CL3" | sed -n '/---FIXES---/,/---SECURITY---/p')" "- correct flag parsing"
-assert_not_contains "build filtered"         "$(echo "$CL3" | sed -n '/---OTHER---/,//p')" "update Dockerfile"
-assert_not_contains "style filtered"         "$(echo "$CL3" | sed -n '/---OTHER---/,//p')" "reformat with black"
-assert_contains "refactor in other (not filtered)" "$(echo "$CL3" | sed -n '/---OTHER---/,//p')" "- refactor: split config into modules"
+assert_contains "scoped feat stripped"  "$CL3" "- add network isolation"
+assert_contains "sec: in security"      "$CL3" "- patch CVE-2026-1234"
+assert_contains "scoped fix stripped"   "$CL3" "- correct flag parsing"
+assert_not_contains "build filtered"    "$CL3" "update Dockerfile"
+assert_not_contains "style filtered"    "$CL3" "reformat with black"
+assert_contains "refactor in other (not filtered)" "$CL3" "- refactor: split config into modules"
+assert_not_contains "no sec( prefix leaks" "$CL3" "sec("
 echo ""
 
-echo "=== Changelog: prefix stripping completeness ==="
+echo "=== Changelog: markdown escaping ==="
 
-# Verify no raw prefixes leak through in categorised sections
-CL_FEAT=$(echo "$CL" | sed -n '/---FEATURES---/,/---FIXES---/p')
-assert_not_contains "no feat: prefix in features" "$CL_FEAT" "feat:"
+CL32=$(run_changelog v3.2.0 --raw)
+assert_contains "angle brackets defanged" "$CL32" "&lt;img&gt;"
+assert_contains "brackets escaped"        "$CL32" '\[tags\]'
+assert_contains "backticks escaped"       "$CL32" '\`output\`'
+assert_not_contains "raw <img> absent"    "$CL32" "<img>"
+echo ""
 
-CL_SEC=$(echo "$CL" | sed -n '/---SECURITY---/,/---DOCS---/p')
-assert_not_contains "no security: prefix in security" "$CL_SEC" "security:"
-assert_not_contains "no security( prefix in security" "$CL_SEC" "security("
+echo "=== Changelog: v3.0.0 ranked (release.yml invocation shape) ==="
 
-CL3_SEC=$(echo "$CL3" | sed -n '/---SECURITY---/,/---DOCS---/p')
-assert_not_contains "no sec: prefix in security"  "$CL3_SEC" "sec:"
-assert_not_contains "no sec( prefix in security"  "$CL3_SEC" "sec("
+CLR=$(run_changelog v3.0.0 --top 20)
+assert_contains "ranked header names prev tag" "$CLR" "## What's changed in v3.0.0 (since v2.0.0)"
+assert_contains "ranked features section"      "$CLR" "### New features"
+assert_contains "ranked feat present"          "$CLR" "add network isolation"
+assert_contains "ranked security present"      "$CLR" "- patch CVE-2026-1234"
+assert_contains "ranked fix present"           "$CLR" "- correct flag parsing"
+assert_contains "ranked compare link"          "$CLR" "https://github.com/owner/raptor/compare/v2.0.0...v3.0.0"
+assert_not_contains "ranked excludes refactor" "$CLR" "split config into modules"
+
+# The terminal preview banner must never ship inside the release notes:
+# release.yml captures stdout as the ``gh release --notes-file`` content
+# (run_changelog mirrors that by discarding stderr). Both directions —
+# the banner stays operator-visible on stderr in the workflow log.
+assert_not_contains "notes exclude preview banner"   "$CLR" "Changelog preview"
+assert_not_contains "notes exclude banner rule"      "$CLR" "═══"
+git checkout -q v3.0.0
+CLR_ERR=$(python3 "$CHANGELOG_GEN" --repo owner/raptor --top 20 v3.0.0 2>&1 >/dev/null)
+git checkout -q main
+assert_contains "banner still emitted on stderr" "$CLR_ERR" "Changelog preview: v3.0.0"
 echo ""
 
 # ── 5. Version stamping ────────────────────────────────────────────────
@@ -426,6 +463,64 @@ cp CITATION.cff.orig CITATION.cff
 rm -f "$BANNER_PATH.orig" core/config/__init__.py.orig CITATION.cff.orig
 echo ""
 
+# ── 5b. stamp-version script (the real one) ────────────────────────────
+
+echo "=== stamp-version script strictness ==="
+
+STAMP_SCRIPT="$SCRIPT_DIR/.github/scripts/stamp-version"
+
+# Fixture README with the release banner line the script stamps.
+cat > README.md <<'MDEOF'
+# fixture
+║             Based on Claude Code (v0.0.0)                                 ║
+MDEOF
+cat > pyproject.toml <<'TOMLEOF'
+[project]
+name = "fixture"
+version = "0.0.0"
+TOMLEOF
+cp core/config/__init__.py core/config/__init__.py.orig
+cp CITATION.cff CITATION.cff.orig
+
+# Happy path: every present target stamps, exit 0.
+if OUT=$(python3 "$STAMP_SCRIPT" v9.9.9 2>&1); then
+    pass "stamp-version exits 0 with all targets present"
+else
+    fail "stamp-version exits 0 with all targets present (got: $OUT)"
+fi
+assert_contains "script stamped config"    "$(cat core/config/__init__.py)" 'VERSION = "9.9.9"'
+assert_contains "script stamped CITATION"  "$(cat CITATION.cff)"            'version: "9.9.9"'
+assert_contains "script stamped pyproject" "$(cat pyproject.toml)"          'version = "9.9.9"'
+assert_contains "script stamped README"    "$(cat README.md)"               "(v9.9.9)"
+
+# A present file whose pattern misses must FAIL the run and be named —
+# warn-only per-file misses shipped stale versions flagged only in logs.
+echo "# banner line gone" > README.md
+if OUT=$(python3 "$STAMP_SCRIPT" v9.9.10 2>&1); then
+    fail "stamp-version fails when README banner pattern misses"
+else
+    pass "stamp-version fails when README banner pattern misses"
+fi
+assert_contains "miss failure names README.md" "$OUT" "README.md"
+
+# Absent pyproject.toml is an optional target — still exit 0.
+cat > README.md <<'MDEOF'
+║             Based on Claude Code (v0.0.0)                                 ║
+MDEOF
+rm -f pyproject.toml
+if OUT=$(python3 "$STAMP_SCRIPT" v9.9.11 2>&1); then
+    pass "stamp-version tolerates absent pyproject.toml"
+else
+    fail "stamp-version tolerates absent pyproject.toml (got: $OUT)"
+fi
+
+# Restore the fixture for the archive test below.
+rm -f README.md pyproject.toml
+cp core/config/__init__.py.orig core/config/__init__.py
+cp CITATION.cff.orig CITATION.cff
+rm -f core/config/__init__.py.orig CITATION.cff.orig
+echo ""
+
 # ── 6. Archive exclusions ──────────────────────────────────────────────
 
 echo "=== Archive exclusions ==="
@@ -443,9 +538,49 @@ assert_file_exists "raptor-offset in archive"       "$ARCHIVE_DIR/core/startup/a
 assert_file_exists "core/config/__init__.py in archive"      "$ARCHIVE_DIR/core/config/__init__.py"
 assert_file_exists "packages/ in archive"           "$ARCHIVE_DIR/packages/__init__.py"
 
+# Runtime surface ships. Broad export-ignore rules once removed the .claude
+# dispatch surface and the Copilot/plugin agent surfaces from releases; both
+# directions are pinned here against the REAL .gitattributes, and release.yml
+# verifies the same set at publish.
+assert_file_exists ".claude/commands in archive"    "$ARCHIVE_DIR/.claude/commands/scan.md"
+assert_file_exists ".claude/skills in archive"      "$ARCHIVE_DIR/.claude/skills/demo.md"
+assert_file_exists ".claude/hooks in archive"       "$ARCHIVE_DIR/.claude/hooks/session_start.sh"
+assert_file_exists ".claude/settings.json in archive" "$ARCHIVE_DIR/.claude/settings.json"
+assert_file_exists ".github/agents in archive"      "$ARCHIVE_DIR/.github/agents/demo.md"
+assert_file_exists ".github/copilot settings in archive" "$ARCHIVE_DIR/.github/copilot/settings.json"
+assert_file_exists "plugins/agents in archive"      "$ARCHIVE_DIR/plugins/agents/README.md"
+
+# The release.yml runtime-surface verify loop, run against the
+# fixture archive with the member list DERIVED from release.yml
+# itself (verbatim consumption, never a copy): weakening the
+# workflow's verify list fails this suite instead of drifting
+# silently past it. The floor assertion pins the load-bearing
+# members so an extraction bug reads as a loud failure, not an
+# empty loop.
+RELEASE_YML="$SCRIPT_DIR/.github/workflows/release.yml"
+VERIFY_MEMBERS=$(awk '/for p in /{f=1} f{print; if (/; do/) exit}' \
+    "$RELEASE_YML" | tr -d '\\' \
+    | sed -e 's/.*for p in//' -e 's/; do.*//' | tr -s ' \n' ' ')
+assert_contains "derived verify list carries .claude/commands" \
+    "$VERIFY_MEMBERS" ".claude/commands"
+assert_contains "derived verify list carries .github/agents" \
+    "$VERIFY_MEMBERS" ".github/agents"
+assert_contains "derived verify list carries Copilot settings" \
+    "$VERIFY_MEMBERS" ".github/copilot/settings.json"
+assert_contains "derived verify list carries agent plugin" \
+    "$VERIFY_MEMBERS" "plugins/agents"
+assert_contains "derived verify list carries CLAUDE.md" \
+    "$VERIFY_MEMBERS" "CLAUDE.md"
+assert_contains "derived verify list carries libexec" \
+    "$VERIFY_MEMBERS" "libexec"
+VERIFY_FAIL=""
+for p in $VERIFY_MEMBERS; do
+    [ -e "$ARCHIVE_DIR/$p" ] || VERIFY_FAIL="$VERIFY_FAIL $p"
+done
+assert_eq "runtime-surface verify loop finds no gaps" "" "$VERIFY_FAIL"
+
 # Should be excluded by .gitattributes export-ignore
-assert_file_missing ".github/ excluded"             "$ARCHIVE_DIR/.github"
-assert_file_missing ".claude/ excluded"             "$ARCHIVE_DIR/.claude"
+assert_file_missing ".github/workflows excluded"   "$ARCHIVE_DIR/.github/workflows"
 assert_file_missing ".vscode/ excluded"             "$ARCHIVE_DIR/.vscode"
 assert_file_missing ".gitattributes excluded"       "$ARCHIVE_DIR/.gitattributes"
 assert_file_missing ".env excluded"                 "$ARCHIVE_DIR/.env"

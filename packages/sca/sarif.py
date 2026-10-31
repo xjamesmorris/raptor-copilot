@@ -30,6 +30,12 @@ from typing import Any, TYPE_CHECKING
 from core.json import save_json
 from core.security.prompt_output_sanitise import sanitise_string
 
+from .kinds import (
+    HYGIENE_PREFIX,
+    SUPPLY_CHAIN_PREFIX,
+    VULNERABLE_DEPENDENCY,
+)
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
@@ -63,60 +69,60 @@ _LEVEL_BY_SEVERITY = {
 
 # Static rule names so consumers see human-readable labels in the UI.
 _RULE_NAMES: dict[str, str] = {
-    "sca:vulnerable_dependency": "VulnerableDependency",
-    "sca:hygiene:lockfile_missing": "LockfileMissing",
-    "sca:hygiene:lockfile_drift": "LockfileDrift",
-    "sca:hygiene:unpinned_dependency": "UnpinnedDependency",
-    "sca:hygiene:loose_pin": "LoosePin",
-    "sca:hygiene:cross_manifest_inconsistency": "CrossManifestInconsistency",
-    "sca:supply_chain:typosquat_candidate": "TyposquatCandidate",
-    "sca:supply_chain:slopsquat_suspect": "SlopsquatSuspect",
-    "sca:supply_chain:install_hook_suspicious": "InstallHookSuspicious",
-    "sca:supply_chain:python_pth_file": "PythonPthFile",
-    "sca:supply_chain:binary_in_tests": "BinaryInTests",
-    "sca:supply_chain:sentinel_match": "SentinelMatch",
+    VULNERABLE_DEPENDENCY: "VulnerableDependency",
+    f"{HYGIENE_PREFIX}lockfile_missing": "LockfileMissing",
+    f"{HYGIENE_PREFIX}lockfile_drift": "LockfileDrift",
+    f"{HYGIENE_PREFIX}unpinned_dependency": "UnpinnedDependency",
+    f"{HYGIENE_PREFIX}loose_pin": "LoosePin",
+    f"{HYGIENE_PREFIX}cross_manifest_inconsistency": "CrossManifestInconsistency",
+    f"{SUPPLY_CHAIN_PREFIX}typosquat_candidate": "TyposquatCandidate",
+    f"{SUPPLY_CHAIN_PREFIX}slopsquat_suspect": "SlopsquatSuspect",
+    f"{SUPPLY_CHAIN_PREFIX}install_hook_suspicious": "InstallHookSuspicious",
+    f"{SUPPLY_CHAIN_PREFIX}python_pth_file": "PythonPthFile",
+    f"{SUPPLY_CHAIN_PREFIX}binary_in_tests": "BinaryInTests",
+    f"{SUPPLY_CHAIN_PREFIX}sentinel_match": "SentinelMatch",
 }
 
 # Description text for each rule. Falls back to the vuln_type when a rule
 # isn't pre-registered (forward-compat with new kinds).
 _RULE_DESCRIPTIONS: dict[str, str] = {
-    "sca:vulnerable_dependency":
+    VULNERABLE_DEPENDENCY:
         "A direct or transitive dependency matches a known CVE/GHSA "
         "advisory and should be upgraded.",
-    "sca:hygiene:lockfile_missing":
+    f"{HYGIENE_PREFIX}lockfile_missing":
         "An ecosystem manifest has no sibling lockfile; CI installs are "
         "non-reproducible and may pull in upgrades that introduce new vulns.",
-    "sca:hygiene:lockfile_drift":
+    f"{HYGIENE_PREFIX}lockfile_drift":
         "The manifest's exact pin disagrees with the lockfile's resolved "
         "version. The two views of the dep tree have diverged.",
-    "sca:hygiene:unpinned_dependency":
+    f"{HYGIENE_PREFIX}unpinned_dependency":
         "A dependency was declared without a version pin; the resolver may "
         "pick any version on each install.",
-    "sca:hygiene:loose_pin":
+    f"{HYGIENE_PREFIX}loose_pin":
         "A dependency uses caret/tilde/range pinning. New patch versions "
         "land silently and may introduce vulns the operator can't audit.",
-    "sca:hygiene:cross_manifest_inconsistency":
+    f"{HYGIENE_PREFIX}cross_manifest_inconsistency":
         "The same dependency is declared at different versions across "
         "manifests in different workspaces.",
-    "sca:supply_chain:typosquat_candidate":
+    f"{SUPPLY_CHAIN_PREFIX}typosquat_candidate":
         "The dependency name is one or two edits away from a popular "
         "package and may be a typosquat targeting that package.",
-    "sca:supply_chain:slopsquat_suspect":
+    f"{SUPPLY_CHAIN_PREFIX}slopsquat_suspect":
         "The dependency name matches a shape that LLMs commonly "
         "hallucinate (generic suffix on a popular prefix, lookalike-"
         "character substitution, or untrusted scope). Attackers "
         "pre-register these hallucinated names; combined with "
         "registry-side recency or low-bus-factor signals this is "
         "the canonical LLM-paste bait archetype.",
-    "sca:supply_chain:install_hook_suspicious":
+    f"{SUPPLY_CHAIN_PREFIX}install_hook_suspicious":
         "The package.json declares a lifecycle script that runs at install "
         "time and matches a pattern associated with malicious behaviour.",
-    "sca:supply_chain:python_pth_file":
+    f"{SUPPLY_CHAIN_PREFIX}python_pth_file":
         "A `.pth` file in the project tree executes at Python startup.",
-    "sca:supply_chain:binary_in_tests":
+    f"{SUPPLY_CHAIN_PREFIX}binary_in_tests":
         "A large binary file under a test directory; could be a legitimate "
         "fixture or a hidden payload.",
-    "sca:supply_chain:sentinel_match":
+    f"{SUPPLY_CHAIN_PREFIX}sentinel_match":
         "The dependency exactly matches a known-malicious package from a "
         "documented supply-chain incident.",
 }
@@ -350,11 +356,11 @@ def _relative_uri(file_path: str, target: Path) -> str:
 
 def _tags_for(rule_id: str) -> list[str]:
     tags = ["security", "raptor"]
-    if rule_id == "sca:vulnerable_dependency":
+    if rule_id == VULNERABLE_DEPENDENCY:
         tags += ["vulnerability", "cve"]
-    elif rule_id.startswith("sca:hygiene:"):
+    elif rule_id.startswith(HYGIENE_PREFIX):
         tags += ["hygiene", "supply-chain"]
-    elif rule_id.startswith("sca:supply_chain:"):
+    elif rule_id.startswith(SUPPLY_CHAIN_PREFIX):
         tags += ["supply-chain"]
     return tags
 

@@ -55,6 +55,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from core.sandbox.escalation_signatures import is_credential_path
+from core.sandbox.tracer import _CRED_KEEP_MAX_PATHS
 from core.security.log_sanitisation import sanitise_for_terminal
 
 # Skip-budget delegated to core.sandbox.audit_budget.AuditBudget,
@@ -128,12 +129,38 @@ _SANDBOX_EXEC_FALLBACK = "/usr/bin/sandbox-exec"
 #     optional (?:\(\d+\)) group;
 #   * process names containing spaces or parentheses ("Google Chrome
 #     Helper (Renderer)") — the name is a non-greedy (.+?) anchored by
-#     the "(<PID>) <verdict>" tail, so the LAST "(digits)" before the
-#     verdict is always the PID.
+#     the "(<PID>) <verdict>" tail.
 # Pre-fix, both shapes silently failed the match and their records
 # were dropped from the audit trail.
+#
+# The format is AMBIGUOUS by construction: both the process name (the
+# kext embeds the target's p_comm — the basename the target chose for
+# its own image, ≤16 chars) and the path are attacker-influenced free
+# text, and either can embed the "(<digits>) <verdict> <token> " shape
+# itself. A lazy name arm locks onto the FIRST such shape (a name like
+# "a(1) deny b" steals the PID slot); a greedy arm locks onto the LAST
+# (a path like ".../x(1) deny y z" steals it). Neither arm alone is
+# trustworthy, so parsing runs BOTH: when they disagree on any field
+# the record is flagged ``parse_ambiguous`` (in-band tamper marker,
+# both candidate parses preserved, conservative deny verdict) and is
+# treated as in-scope-suspect by the scope gate — never silently
+# attributed to either candidate PID, and never silently dropped as
+# foreign. See parse_log_entry.
+# (?=\S) pins the whitespace run before the lazy name group (same
+# language — the lazy group absorbed any remainder): the naive
+# ``\s+(.+?)`` overlapped the run and the group — quadratic on a
+# 'Sandbox:'-opening log line ending in a whitespace run.
+# The name span is bounded: unbounded, every planted "Sandbox:"
+# head re-scans the rest of the line — quadratic. Process names sit
+# far below 300 chars (beyond it the line is unparsed, same as any
+# other format drift).
 _LOG_LINE_RE = re.compile(
-    r"Sandbox:\s+(.+?)\((\d+)\)\s+(allow|deny)(?:\(\d+\))?\s+(\S+)\s+(.+)$"
+    r"Sandbox:\s+(?=\S)(.{1,300}?)\((\d+)\)\s+(allow|deny)(?:\(\d+\))?\s+(\S+)\s+(.+)$"
+)
+# Greedy-name twin of _LOG_LINE_RE — identical structure, but (.+)
+# anchors the name to the LAST "(digits) <verdict>" occurrence.
+_LOG_LINE_RE_GREEDY = re.compile(
+    r"Sandbox:\s+(?=\S)(.{1,300})\((\d+)\)\s+(allow|deny)(?:\(\d+\))?\s+(\S+)\s+(.+)$"
 )
 
 # Parse-ratio diagnostic thresholds (see LogStreamer.stop). When at
@@ -164,6 +191,22 @@ _PARSE_DIAG_MIN_RATIO = 0.5
 _LINEAGE_POLL_INTERVAL_S = 0.2
 _PENDING_BUFFER_CAP = 512
 _FOREIGN_CACHE_CAP = 4096
+
+# Admission cap for parse_ambiguous records. Ambiguous records are
+# in-scope-SUSPECT by contract (admitted + flagged, never
+# attributed-or-dropped) and any same-host sandboxed process can mint
+# the ambiguous line shape at will — so they are EXEMPT from the
+# shared audit budget (a flood must not displace later REAL denials
+# out of the JSONL) and bounded by this cap instead. Trade-off, both
+# directions: lower and a legitimately pathological process name that
+# flags many real denials ambiguous stops landing full records in the
+# JSONL early (the total count and the in-band cap marker keep the
+# flood visible; condemn-direction evidence is counted, not lost);
+# higher and a hostile local process gets that much more JSONL disk
+# amplification per run. 64 comfortably covers every observed
+# legitimate ambiguity burst while keeping the hostile write-through
+# under one pipe buffer of marker-context.
+_AMBIGUOUS_ADMIT_MAX = 64
 
 # ppid-chain walk bound in the scope filter — defends against a
 # cyclic/corrupt process-table probe ever looping the reader thread.
@@ -262,6 +305,24 @@ def _announce_credential_path_touch(path: str, pid: int) -> None:
         pass
 
 
+def _announce_credential_banner_capped() -> None:
+    """One-shot stderr notice that the credential-path banner lane
+    reached its distinct-path cap — further credential-looking paths
+    get no live banner. Mirrors the Linux tracer's sibling of the
+    same name (shared cap constant) so neither platform's banner
+    lane degrades silently. Never raises."""
+    try:
+        os.write(2, (
+            f"RAPTOR sandbox NOTICE: credential-path banner lane "
+            f"reached its distinct-path cap ({_CRED_KEEP_MAX_PATHS}); "
+            f"further credential-looking paths will not be announced "
+            f"live (audit records continue in the JSONL subject to "
+            f"its own admission caps).\n"
+        ).encode("ascii", errors="replace"))
+    except OSError:
+        pass
+
+
 # Map SBPL action prefixes to the RAPTOR sandbox-summary type taxonomy
 # (matches Linux tracer's _NAME_TO_TYPE mapping).
 def _action_to_type(action: str) -> str:
@@ -273,6 +334,34 @@ def _action_to_type(action: str) -> str:
         return "network"
     # mach-lookup, iokit-open, sysctl-*, process-*, etc.
     return "seccomp"  # closest analogue in the Linux taxonomy
+
+
+def _parse_kext_message(
+    msg: str,
+) -> tuple[tuple[str, ...], tuple[str, ...] | None] | None:
+    """Match ``msg`` with both name arms of the kext-line grammar.
+
+    Returns ``None`` when the lazy arm doesn't match (not a
+    recognisable Sandbox.kext line — the greedy arm cannot match
+    where the lazy one didn't, they differ only in name greed).
+    Otherwise returns ``(lazy_groups, greedy_groups_if_different)``:
+    the second element is ``None`` when both arms agree (the
+    unambiguous common case) and the greedy arm's groups when they
+    disagree — the caller must then treat the line as ambiguous,
+    because name and path are both attacker-influenced and there is
+    no way to tell which arm anchored on the real PID field.
+    """
+    lazy_m = _LOG_LINE_RE.search(msg)
+    if not lazy_m:
+        return None
+    lazy_groups = lazy_m.groups()
+    greedy_m = _LOG_LINE_RE_GREEDY.search(msg)
+    if greedy_m is None:
+        return lazy_groups, None
+    greedy_groups = greedy_m.groups()
+    if greedy_groups == lazy_groups:
+        return lazy_groups, None
+    return lazy_groups, greedy_groups
 
 
 def parse_log_entry(entry: dict, *,
@@ -300,10 +389,10 @@ def parse_log_entry(entry: dict, *,
     if entry.get("senderImagePath") != SANDBOX_KEXT_SENDER:
         return None
     msg = entry.get("eventMessage", "")
-    m = _LOG_LINE_RE.search(msg)
-    if not m:
+    parsed = _parse_kext_message(msg)
+    if parsed is None:
         return None
-    process_name, pid, verdict, action, path = m.groups()
+    (process_name, pid, verdict, action, path), greedy = parsed
     record = {
         "ts": entry.get("timestamp") or _now_iso(),
         "cmd": f"<sandbox audit: {action} {path}>",
@@ -315,6 +404,27 @@ def parse_log_entry(entry: dict, *,
         "target_pid": int(pid),
         "process_name": process_name,
     }
+    if greedy is not None:
+        # The two name arms disagree — the line embeds the
+        # "(digits) <verdict> <token>" shape more than once, so the
+        # PID field cannot be anchored (see the _LOG_LINE_RE comment:
+        # name and path are both attacker-influenced). Never silently
+        # attribute: flag the record as tamper-suspect, preserve BOTH
+        # candidate parses, and pick the condemn-direction verdict —
+        # if either arm read "deny", a deny happened somewhere in the
+        # line and the record must count as one, not be laundered
+        # into an allow-report by a name that embeds "allow".
+        g_name, g_pid, g_verdict, g_action, g_path = greedy
+        record["parse_ambiguous"] = True
+        record["alt_parse"] = {
+            "process_name": g_name,
+            "target_pid": int(g_pid),
+            "verdict": g_verdict,
+            "syscall": g_action,
+            "path": g_path,
+        }
+        if "deny" in (verdict, g_verdict):
+            record["verdict"] = "deny"
     record["observe" if observe_mode else "audit"] = True
     if nonce is not None:
         record["nonce"] = nonce
@@ -407,11 +517,11 @@ class LogStreamer:
         self._proc: subprocess.Popen | None = None
         self._reader: threading.Thread | None = None
         self._stopped = threading.Event()
-        # Scope-required + lineage state (see class docstring). All of
-        # it is guarded by _scope_lock. The process-tree probes are
+        # Lineage state (see class docstring; _require_scope itself is
+        # assigned with the PID-scoping block below). All of it is
+        # guarded by _scope_lock. The process-tree probes are
         # injectable so tests drive attribution deterministically
         # without a real /proc, ps, or getpgid.
-        self._require_scope = bool(require_scope)
         # Fail-closed warm-up: when True, a warm-up gate miss raises
         # AuditWarmUpError from start() instead of proceeding
         # best-effort (see start()'s docstring for the trade-offs).
@@ -473,15 +583,47 @@ class LogStreamer:
         # Live-escalation dedup: paths already announced to stderr
         # this run, so a target repeatedly touching the same
         # credential-looking path doesn't spam the operator's
-        # terminal. One banner per distinct path per run — mirrors
-        # tracer.py's per-syscall-name dedup.
+        # terminal. One banner per distinct path per run, and the
+        # SET ITSELF is bounded at the Linux tracer's
+        # _CRED_KEEP_MAX_PATHS (shared constant): the dedup key is
+        # the PATH — attacker-minted, so path-dedup alone is no
+        # bound at all. A target minting credential-lookalike names
+        # (".env.0001", ".env.0002", ...) — including through the
+        # budget-exempt parse_ambiguous admission lane — must not
+        # turn the banner lane into an unbounded stderr flood
+        # (drowning the very ALERT channel the banners exist for)
+        # or unbounded parent-memory growth. Exhaustion is announced
+        # once (_announce_credential_banner_capped), never silent —
+        # both platforms' banner lanes now carry the same cap and
+        # the same one-shot notice.
         self._escalated_paths: set = set()
+        self._banner_cap_announced = False
         # Parse-ratio bookkeeping for the "parsed M of N kext lines"
         # diagnostic (kernel eventMessage format drift detector).
         # Mutated only on the reader thread; read at stop() after the
         # reader join, so no lock needed.
         self._kext_lines_seen = 0
         self._kext_lines_parsed = 0
+        # Ambiguous-parse tamper counter (see _LOG_LINE_RE): records
+        # whose PID field could not be anchored because the line
+        # embeds the "(digits) <verdict> <token>" shape more than
+        # once. Incremented under _append_lock — BOTH the reader
+        # thread and the parent thread write it (register_target_pid
+        # flushes the pending buffer through _filter_and_append on
+        # the parent thread). Counted once per post-pending
+        # evaluation, after the buffer gate, so a buffered record is
+        # counted only when its flush re-enters — the count can
+        # still exceed the JSONL's flagged-record count by
+        # foreign-scope drops. stop() reads it after joining the
+        # reader.
+        self._ambiguous_records = 0
+        # Ambiguous-record admission accounting (_AMBIGUOUS_ADMIT_MAX):
+        # admitted/dropped counts and the one-shot in-band cap marker
+        # flag. Mutated under _append_lock alongside the appends they
+        # describe; read by stop() after the reader joins.
+        self._ambiguous_admitted = 0
+        self._ambiguous_dropped = 0
+        self._ambiguous_cap_marker_emitted = False
 
     def register_target_pid(self, pid: int) -> None:
         """Mark ``pid`` — and its process group and session, when
@@ -598,7 +740,21 @@ class LogStreamer:
         PID that cannot be attributed by any layer is out of scope —
         reject rather than attribute an unverifiable event to this
         run.
+
+        ``parse_ambiguous`` records are in-scope-SUSPECT by contract
+        (see _LOG_LINE_RE): their PID field could not be anchored, so
+        scoping them on the lazy arm's candidate PID would let a
+        process name embedding a foreign "(pid) verdict token" shape
+        route its own records into the silent foreign-drop path —
+        evading the nonce stamp, the admission accounting, the JSONL
+        append AND the credential-path escalation. They are admitted
+        (flagged, both parses preserved) rather than
+        attributed-or-dropped; admission is budget-exempt and bounded
+        by its own cap (_AMBIGUOUS_ADMIT_MAX) so the mintable shape
+        buys neither budget displacement nor unbounded disk.
         """
+        if record.get("parse_ambiguous"):
+            return True
         with self._scope_lock:
             if not self._scope_pids and not self._scope_pgids:
                 # Under require_scope nothing may be attributed until
@@ -769,7 +925,16 @@ class LogStreamer:
                     self._proc.wait(timeout=5)
                 except Exception:  # noqa: BLE001 — any wait failure (timeout, interpreter shutdown) must escalate to kill
                     self._proc.kill()
-                    self._proc.wait()
+                    try:
+                        self._proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        if self._proc.stdout:
+                            self._proc.stdout.close()
+                        logger.debug(
+                            "seatbelt audit: killed log-stream "
+                            "process did not exit within 10s; "
+                            "abandoning reap",
+                        )
             except OSError:
                 # KEEP-SILENT (F070 per-site triage W21): terminate()
                 # on an already-dead process is the only realistic
@@ -896,13 +1061,21 @@ class LogStreamer:
                 except json.JSONDecodeError:
                     continue
                 msg = entry.get("eventMessage", "")
-                m = _LOG_LINE_RE.search(msg)
-                if not m:
+                parsed = _parse_kext_message(msg)
+                if parsed is None:
                     continue
-                # Group 2 is the PID per `_LOG_LINE_RE`.
-                pid_str = m.group(2)
+                # Index 1 of each arm's groups is its PID candidate.
+                # The warm-up workload's name is ours (sandbox-exec,
+                # fixed SBPL), so ambiguity is not expected here —
+                # but "did an event with our PID arrive" is answered
+                # honestly by accepting a match from either arm.
+                lazy_groups, greedy_groups = parsed
+                pid_candidates = [lazy_groups[1]]
+                if greedy_groups is not None:
+                    pid_candidates.append(greedy_groups[1])
                 try:
-                    if int(pid_str) == target_pid:
+                    if any(int(p) == target_pid
+                           for p in pid_candidates):
                         seen = True
                         break
                 except ValueError:
@@ -943,17 +1116,37 @@ class LogStreamer:
         Pulled out of `_read_loop` as its own method purely so tests
         can exercise it directly against a synthetic `record` dict
         without needing a real `log stream` subprocess."""
-        path = record.get("path")
-        if (path
-                and record.get("type") in ("read", "write")
-                and path not in self._escalated_paths
-                and not _audit_budget.live_escalation_disabled()
-                and is_credential_path(path)):
-            self._escalated_paths.add(path)
-            # .get: the never-raise-out-of-the-hot-path contract must
-            # not hinge on every record shape carrying target_pid.
-            _announce_credential_path_touch(
-                path, record.get("target_pid", -1))
+        # Ambiguous parses carry two candidate (path, action) reads —
+        # escalate when EITHER names a credential path (checking only
+        # the lazy arm would let the ambiguity itself suppress the
+        # escalation; see _LOG_LINE_RE).
+        alt = record.get("alt_parse") or {}
+        candidates = [
+            (record.get("path"), record.get("type")),
+            (alt.get("path"), _action_to_type(alt["syscall"])
+             if alt.get("syscall") else None),
+        ]
+        for path, rec_type in candidates:
+            if (path
+                    and rec_type in ("read", "write")
+                    and path not in self._escalated_paths
+                    and not _audit_budget.live_escalation_disabled()
+                    and is_credential_path(path)):
+                if len(self._escalated_paths) >= _CRED_KEEP_MAX_PATHS:
+                    # The dedup key is attacker-minted (the target
+                    # chose the paths), so the set is bounded at the
+                    # shared cross-platform cap; exhaustion is
+                    # announced once, never silent (see __init__).
+                    if not self._banner_cap_announced:
+                        self._banner_cap_announced = True
+                        _announce_credential_banner_capped()
+                    return
+                self._escalated_paths.add(path)
+                # .get: the never-raise-out-of-the-hot-path contract
+                # must not hinge on every record shape carrying
+                # target_pid.
+                _announce_credential_path_touch(
+                    path, record.get("target_pid", -1))
 
     def _read_loop(self) -> None:
         """Read ndjson lines from `log stream`, parse, and append
@@ -1018,6 +1211,34 @@ class LogStreamer:
                     else:
                         self._foreign_records_dropped += 1
                     return
+        if record.get("parse_ambiguous"):
+            # One-shot loud escalation (the in-band flag on every
+            # such record carries the per-record detail; a hostile
+            # target can mint these at will, so the logger is not
+            # given a per-record amplification channel). Counted
+            # AFTER the pending gate — a pre-registration record is
+            # buffered here and re-enters via the registration
+            # flush, so counting before the gate double-counted it
+            # (and the flush runs on the PARENT thread, refuting the
+            # old "only the reader thread increments" comment) —
+            # and under _append_lock, because the reader thread and
+            # the parent-thread flush can evaluate concurrently.
+            # Records the buffer drops as unattributable are not
+            # counted; foreign-scope drops below still are (the
+            # count can exceed the JSONL's flagged-record count by
+            # exactly those).
+            with self._append_lock:
+                first = self._ambiguous_records == 0
+                self._ambiguous_records += 1
+            if first:
+                logger.warning(
+                    "seatbelt audit: kext log line with an "
+                    "unanchorable PID field (process name or path "
+                    "embeds the '(pid) verdict action' shape — "
+                    "possible audit-attribution spoofing attempt). "
+                    "Record kept, flagged parse_ambiguous, both "
+                    "candidate parses preserved; see the audit JSONL.",
+                )
         if not self._record_in_scope(record):
             # Host-wide kext event from a process outside the
             # registered scope — a sibling sandboxed run or an
@@ -1047,6 +1268,45 @@ class LogStreamer:
             self._maybe_escalate_credential_path(record)
 
             with self._append_lock:
+                if record.get("parse_ambiguous"):
+                    # Budget EXEMPTION plus a dedicated admission cap
+                    # (_AMBIGUOUS_ADMIT_MAX — rationale at the
+                    # constant). Ambiguous records are admitted as
+                    # in-scope-SUSPECT evidence, and any same-host
+                    # sandboxed process can mint the shape at will:
+                    # letting them ride the shared budget handed a
+                    # hostile local process displacement power over
+                    # later REAL denials (its flood consumed the
+                    # run's budget; genuine deny records then hit the
+                    # cap and dropped). Exempting them keeps the full
+                    # budget for real records; the cap keeps the
+                    # flood's disk amplification bounded. The
+                    # credential-path escalation above still ran for
+                    # every record (dedup-bounded, condemn-direction),
+                    # and every record is counted on the summary
+                    # whether appended or capped.
+                    if self._ambiguous_admitted < _AMBIGUOUS_ADMIT_MAX:
+                        self._ambiguous_admitted += 1
+                        self._append_record_locked(record)
+                    else:
+                        self._ambiguous_dropped += 1
+                        if not self._ambiguous_cap_marker_emitted:
+                            self._ambiguous_cap_marker_emitted = True
+                            self._append_record_locked({
+                                "ts": _now_iso(),
+                                "type": "parse_ambiguous_cap_exceeded",
+                                "audit": True,
+                                "cap": _AMBIGUOUS_ADMIT_MAX,
+                                "note": (
+                                    "parse-ambiguous admission cap "
+                                    f"({_AMBIGUOUS_ADMIT_MAX}) "
+                                    "reached; further flagged records "
+                                    "are counted on the summary "
+                                    "(parse_ambiguous_records / "
+                                    "parse_ambiguous_records_dropped) "
+                                    "but not appended."),
+                            })
+                    return
                 decision, marker = self._budget.evaluate(
                     record["syscall"], record["target_pid"],
                 )
@@ -1225,6 +1485,17 @@ class LogStreamer:
                 # Scope-gate diagnostic: how many records were
                 # rejected as outside the workload's process scope.
                 summary["foreign_records_dropped"] = foreign_dropped
+                # Tamper diagnostic: kext lines whose PID field could
+                # not be anchored (kept, flagged parse_ambiguous).
+                if self._ambiguous_records:
+                    summary["parse_ambiguous_records"] = (
+                        self._ambiguous_records)
+                    # Cap accounting (_AMBIGUOUS_ADMIT_MAX): dropped
+                    # records stay visible as a count even though
+                    # their bodies were not appended.
+                    if self._ambiguous_dropped:
+                        summary["parse_ambiguous_records_dropped"] = (
+                            self._ambiguous_dropped)
                 # Stamp nonce on the summary so an observe-mode
                 # parser attributes it to this run and rejects one
                 # spoofed by a target binary writing a fake summary

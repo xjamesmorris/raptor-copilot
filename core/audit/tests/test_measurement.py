@@ -324,8 +324,8 @@ class TestWriteEvaluation:
 
 
 class TestDuplicateGroundTruthKeys:
-    def test_duplicate_key_keeps_first(self, tmp_path):
-        gt = [
+    def _gt_pair(self):
+        return [
             GroundTruthEntry(
                 id="GT-1", file="a.c", function="f",
                 line=10, vuln_type="overflow", description="first",
@@ -335,10 +335,60 @@ class TestDuplicateGroundTruthKeys:
                 line=20, vuln_type="uaf", description="second",
             ),
         ]
+
+    def _run(self, tmp_path, findings, gt):
         out = tmp_path / "run"
         out.mkdir()
-        (out / "findings.json").write_text(json.dumps([]))
-        result = evaluate_run(out, gt)
+        (out / "findings.json").write_text(json.dumps(findings))
+        return evaluate_run(out, gt)
+
+    def test_duplicate_keys_both_counted_as_missed(self, tmp_path):
+        result = self._run(tmp_path, [], self._gt_pair())
         assert result.total_ground_truth == 2
-        assert len(result.false_negatives) == 1
-        assert result.false_negatives[0].id == "GT-1"
+        assert {e.id for e in result.false_negatives} == {"GT-1", "GT-2"}
+
+    def test_two_findings_credit_both_planted_bugs(self, tmp_path):
+        findings = [
+            {"file": "a.c", "function": "f", "status": "finding"},
+            {"file": "a.c", "function": "f", "status": "suspicious"},
+        ]
+        result = self._run(tmp_path, findings, self._gt_pair())
+        assert {e.id for e in result.true_positives} == {"GT-1", "GT-2"}
+        assert result.false_negatives == []
+        assert result.false_positives == []
+
+    def test_vuln_type_prefers_matching_entry(self, tmp_path):
+        findings = [
+            {"file": "a.c", "function": "f", "status": "finding",
+             "vuln_type": "uaf"},
+        ]
+        result = self._run(tmp_path, findings, self._gt_pair())
+        assert [e.id for e in result.true_positives] == ["GT-2"]
+        assert [e.id for e in result.false_negatives] == ["GT-1"]
+
+    def test_type_mismatch_still_credits_by_location(self, tmp_path):
+        # Vocabularies differ between finding and manifest vuln types;
+        # a location hit with a non-matching type stays a TP (type is a
+        # preference among co-located entries, never a gate).
+        findings = [
+            {"file": "a.c", "function": "f", "status": "finding",
+             "vuln_type": "sqli"},
+        ]
+        result = self._run(tmp_path, findings, self._gt_pair())
+        assert [e.id for e in result.true_positives] == ["GT-1"]
+        assert result.false_positives == []
+
+    def test_rereport_of_credited_key_not_double_counted(self, tmp_path):
+        gt = [
+            GroundTruthEntry(
+                id="GT-1", file="a.c", function="f",
+                line=10, vuln_type="overflow", description="only",
+            ),
+        ]
+        findings = [
+            {"file": "a.c", "function": "f", "status": "finding"},
+            {"file": "a.c", "function": "f", "status": "suspicious"},
+        ]
+        result = self._run(tmp_path, findings, gt)
+        assert len(result.true_positives) == 1
+        assert result.false_positives == []

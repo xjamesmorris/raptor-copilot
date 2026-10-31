@@ -190,9 +190,14 @@ def _availability_for_cwe(
 
     # Stack smash primitives are gated on canary + PIE relative to the
     # attacker's leak posture — not statically decidable from the ELF
-    # alone. Leave as None for CWE-121, False for non-stack CWEs.
-    stack_smash: bool | None
-    stack_smash = None if cwe == "CWE-121" else False
+    # alone, so CONDITIONAL (None) for CWE-121. For non-stack CWEs the
+    # primitive is simply not this sink's write mechanism — also None:
+    # "not applicable" is absence of evidence, never "verified blocked"
+    # (False). Asserting False here fed _priority_hint a fabricated
+    # concrete signal, so a known-CWE sink with NO mitigation evidence
+    # at all read as all_blocked → priority "low" — exactly the
+    # all-None misread the all_blocked guard documents.
+    stack_smash: bool | None = None
 
     return {
         "arbitrary_write": arbitrary_write,

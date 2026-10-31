@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import difflib
 import logging
+import json
 import re
 import sys
 from dataclasses import dataclass, field
@@ -28,7 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from core.json import dumps_display, load_json_bounded
+from core.json import load_json_bounded
 
 from .languages import detect_engine
 from .library import RuleLibrary
@@ -38,6 +39,7 @@ from .synthesise import (
     LLMCallable,
     synthesise_with_refinement,
 )
+from core.source.lines import split_lines
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +144,12 @@ def load_cve_run(output_dir: Path | str) -> CveFixRecord:
     except (OSError, ValueError) as exc:
         msg = f"unreadable OSV record {osv_path}: {exc}"
         raise ProvenanceError(msg) from exc
+    if not isinstance(osv, dict):
+        # A JSON-array body passes the bounded read; .get below must
+        # surface the structured exit-2 refusal, not an AttributeError
+        # traceback out of cli_main.
+        msg = f"OSV record {osv_path} is not a JSON object"
+        raise ProvenanceError(msg)
 
     cve_id = str(osv.get("id", ""))
     if not _CVE_RE.match(cve_id):
@@ -263,7 +271,7 @@ def derive_seeds(
 
     bundles: list[CveSeedBundle] = []
     for count, first, last, f in scored[:max_seeds]:
-        lines = f.before_source.splitlines()
+        lines = split_lines(f.before_source)
         lo = max(0, first - 1 - _SNIPPET_CONTEXT_LINES)
         hi = min(len(lines), last + _SNIPPET_CONTEXT_LINES)
         snippet = "\n".join(lines[lo:hi])
@@ -461,5 +469,8 @@ def cli_main(argv: list[str] | None = None) -> int:
         library_dir=Path(args.library_dir) if args.library_dir else None,
         promote=not args.no_promote,
     )
-    print(dumps_display(report.to_dict(), indent=2))
+    # ensure_ascii: terminal lane — JSON escapes C0 but passes C1
+    # controls raw without it; stays valid JSON for consumers.
+    print(json.dumps(report.to_dict(), indent=2, ensure_ascii=True,
+                     default=str))
     return 0

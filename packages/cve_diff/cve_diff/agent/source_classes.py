@@ -116,8 +116,3 @@ def should_surrender_no_evidence(
         return False
     return enough_classes_tried(tool_call_log)
 
-
-def untried_classes(tool_call_log: list[str]) -> frozenset[str]:
-    """Source classes the agent hasn't invoked yet — used by the
-    cascade rule's tried-set logic."""
-    return frozenset(SOURCE_CLASSES.keys()) - tried_classes(tool_call_log)

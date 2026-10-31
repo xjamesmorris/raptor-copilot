@@ -47,18 +47,37 @@ RAPTOR_PY = REPO_ROOT / "raptor.py"
 #     project target whose detached grandchildren outlive any kill of
 #     the direct child, plus junk failed-run dirs in the project's
 #     output tree.
+#   - RAPTOR_CALLER_DIR is stripped — it is the OTHER layer of the
+#     default-target chain (resolve_default_target: active project,
+#     then $RAPTOR_CALLER_DIR). Launcher sessions export it, so with
+#     HOME isolated but the variable inherited, ``raptor.py scan`` /
+#     ``agentic`` with no --repo back-fill a real target and start a
+#     full scan of the launcher's caller directory. The missing-arg
+#     tests then ride their 20 s timeout, and the group SIGKILL cannot
+#     reach the scan's sandboxed workers (each is spawned as a new
+#     session leader): the orphaned workers run on for hours holding
+#     the inherited stdout/stderr — on CI the runner waits for pipe
+#     EOF after a green summary, so the suite's step hangs.
+#   - RAPTOR_OUT_DIR points into the child TMPDIR — run-lifecycle
+#     litter from killed children (failed-run dirs, run ledgers,
+#     project output bases) lands under basetemp rotation instead of
+#     the checkout's ``out/`` tree (gitignored, so the porcelain guard
+#     below never sees it).
 _CHILD_TMPDIR: str | None = None
 _CHILD_HOME: str | None = None
+_CHILD_OUT_DIR: str | None = None
 
 
 @pytest.fixture(autouse=True, scope="module")
 def _child_isolation(tmp_path_factory):
-    global _CHILD_TMPDIR, _CHILD_HOME
+    global _CHILD_TMPDIR, _CHILD_HOME, _CHILD_OUT_DIR
     _CHILD_TMPDIR = str(tmp_path_factory.mktemp("raptor-smoke-tmp"))
     _CHILD_HOME = str(tmp_path_factory.mktemp("raptor-smoke-home"))
+    _CHILD_OUT_DIR = str(tmp_path_factory.mktemp("raptor-smoke-out"))
     yield
     _CHILD_TMPDIR = None
     _CHILD_HOME = None
+    _CHILD_OUT_DIR = None
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -111,6 +130,13 @@ def _run_raptor(*args: str, timeout: float = 10.0) -> subprocess.CompletedProces
         env["TMPDIR"] = _CHILD_TMPDIR
     if _CHILD_HOME:
         env["HOME"] = _CHILD_HOME
+    if _CHILD_OUT_DIR:
+        env["RAPTOR_OUT_DIR"] = _CHILD_OUT_DIR
+    # No default target may reach the children: with the launcher's
+    # RAPTOR_CALLER_DIR inherited, a no---repo scan/agentic back-fills
+    # a REAL target and starts real analysis work (see the isolation
+    # comment at _CHILD_TMPDIR).
+    env.pop("RAPTOR_CALLER_DIR", None)
     cmd = [sys.executable, str(RAPTOR_PY), *args]
     proc = subprocess.Popen(
         cmd,
@@ -226,6 +252,45 @@ def test_missing_required_arg_errors(mode: str, required_keyword: str):
         or "required" in combined
         or "error" in combined
     )
+
+
+@pytest.mark.parametrize("mode", ["scan", "agentic"])
+def test_missing_repo_errors_even_with_caller_dir(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A launcher-exported RAPTOR_CALLER_DIR must not reach the children.
+
+    Regression this pins: the default-target chain (active project,
+    then $RAPTOR_CALLER_DIR) back-filled --repo for scan/agentic when
+    the suite ran inside a launcher session, so the missing-arg smoke
+    invocations started REAL full scans of the caller directory. They
+    rode their timeout, and the group SIGKILL could not reach the
+    scan's sandboxed workers (new session leaders) — the orphans kept
+    scanning for hours and held the suite's stdout/stderr pipe, which
+    hung the CI step after a green summary. ``_run_raptor`` now strips
+    RAPTOR_CALLER_DIR from the child env; with HOME already isolated,
+    no default target can resolve and the child must error out.
+    """
+    caller_dir = tmp_path / "caller-target"
+    caller_dir.mkdir()
+    # Non-empty real directory: the volatile-target sanity gate refuses
+    # empty/scratch defaults, which would mask the regression by
+    # erroring for the wrong reason.
+    (caller_dir / "app.py").write_text("x = 1\n")
+    monkeypatch.setenv("RAPTOR_CALLER_DIR", str(caller_dir))
+    try:
+        r = _run_raptor(mode, timeout=20)
+    except subprocess.TimeoutExpired:
+        pytest.fail(
+            f"{mode} with no --repo started real work from "
+            "RAPTOR_CALLER_DIR instead of erroring"
+        )
+    assert r.returncode != 0, (
+        f"{mode} with no --repo resolved a default target from "
+        f"RAPTOR_CALLER_DIR and ran to completion:\n{r.stdout}{r.stderr}"
+    )
+    combined = (r.stdout + r.stderr).lower()
+    assert "repo" in combined or "required" in combined or "error" in combined
 
 
 # ---------------------------------------------------------------------------

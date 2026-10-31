@@ -28,9 +28,10 @@ import json as _json
 import logging
 from dataclasses import dataclass
 
-from ..models import Confidence, Dependency, Manifest, PinStyle
+from ..models import Confidence, Dependency, Manifest
 from ..parsers import _safe_read
-from . import _hook_patterns
+from . import _hook_patterns, _own_host
+from ..parsers._base import PARSE_ESCAPE_ERRORS
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -74,11 +75,17 @@ def scan_manifests(
     out: list[ComposerLifecycleFinding] = []
     deps_list = list(deps)
     for m in manifests:
-        if m.ecosystem != "Composer":
+        # Discovery classifies composer.json as "Packagist" (the OSV
+        # ecosystem name) — filtering on the registry-brand spelling
+        # "Composer" matched NOTHING in production and left the whole
+        # detector dead for every PHP target. The filename gate below
+        # is the precise selector; the ecosystem gate is belt and
+        # braces against same-named non-PHP files.
+        if m.ecosystem != "Packagist":
             continue
         if m.path.name != "composer.json" or m.is_lockfile:
             continue
-        host = _host_dep(deps_list, m) or _placeholder_for_manifest(m)
+        host = _host_dep(deps_list, m)
         out.extend(_scan_one(m.path, host))
     return out
 
@@ -92,7 +99,7 @@ def _scan_one(
         return []
     try:
         data = _json.loads(text)
-    except _json.JSONDecodeError:
+    except (_json.JSONDecodeError, *PARSE_ESCAPE_ERRORS):  # type: ignore[misc]  # hostile-input escape classes
         return []
     if not isinstance(data, dict):
         return []
@@ -125,10 +132,12 @@ def _scan_one(
                 reads_credentials=analysis.reads_credentials,
                 has_publish_action=analysis.has_publish_action,
             )
+            worm_conjunction = (
+                analysis.reads_credentials and analysis.has_publish_action
+            )
             worm_shape = (
-                analysis.reads_credentials
-                and analysis.has_publish_action
-                and not _hook_patterns.is_publish_helper(host)
+                worm_conjunction
+                and not _hook_patterns.is_attested_publish_helper(host)
             )
             if analysis.reasons:
                 out.append(ComposerLifecycleFinding(
@@ -153,6 +162,25 @@ def _scan_one(
                         ),
                     ),
                 ))
+            elif worm_conjunction:
+                # Worm conjunction fired but the host is an ATTESTED
+                # publish helper — suppress the HIGH promotion, but
+                # keep a low-severity row (parity with the npm
+                # adapter's fall-through) so the HOOK family survives
+                # for the composite chokepoint and the suppression
+                # stays operator-visible.
+                out.append(ComposerLifecycleFinding(
+                    dependency=host, hit=hit, severity="low",
+                    confidence=Confidence(
+                        "medium",
+                        reason=(
+                            "composer.json script reads credentials "
+                            "and invokes a publish action, but the "
+                            "package is an attested publish helper — "
+                            "worm-shape promotion suppressed"
+                        ),
+                    ),
+                ))
             # FP-tightening: composer scripts blocks are routine
             # (CI/test glue, code-style hooks, etc.).  No row on
             # mere presence — only pattern-hit and worm-shape earn
@@ -162,40 +190,16 @@ def _scan_one(
 
 def _host_dep(
     deps: list[Dependency], manifest: Manifest,
-) -> Dependency | None:
-    text = _safe_read.read_bounded(manifest.path, follow_symlinks=False)
-    if text is None:
-        return None
-    try:
-        data = _json.loads(text)
-    except _json.JSONDecodeError:
-        return None
-    if not isinstance(data, dict):
-        return None
-    project_name = data.get("name")
-    if not isinstance(project_name, str) or not project_name:
-        return None
-    for d in deps:
-        if d.ecosystem == "Composer" and d.name == project_name:
-            return d
-    return None
-
-
-def _placeholder_for_manifest(manifest: Manifest) -> Dependency:
-    return Dependency(
-        ecosystem=manifest.ecosystem,
-        name="<composer.json>",
-        version=None,
-        declared_in=manifest.path,
-        scope="main",
-        is_lockfile=False,
-        pin_style=PinStyle.UNKNOWN,
-        direct=True,
-        purl="",
-        parser_confidence=Confidence(
-            "low",
-            reason="placeholder for composer-lifecycle-hook finding host",
-        ),
+) -> Dependency:
+    """Anchor the finding on the package's OWN ``name`` from
+    composer.json (placeholder when absent), via the shared resolver
+    so every package-own detector produces an identical host key for
+    this manifest."""
+    del deps
+    return _own_host.resolve_own_host(
+        manifest,
+        reason="placeholder for composer-lifecycle-hook finding host",
+        placeholder_name="<composer.json>",
     )
 
 

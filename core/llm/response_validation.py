@@ -24,6 +24,10 @@ from core.schema_constants import (
     VULN_TYPES,
     normalise_vuln_type,
 )
+from core.llm.schema_normalization import (
+    descriptor_type_token,
+    is_raptor_descriptive_schema,
+)
 
 _CVSS_RE = re.compile(
     r"^CVSS:3\.[01]/"
@@ -100,7 +104,9 @@ EXEMPT_FREEFORM_PARSE_SITES: tuple = (
 )
 
 
-def _allowed_top_level_keys(schema: dict[str, Any]) -> set[str] | None:
+def _allowed_top_level_keys(
+    schema: dict[str, Any] | bool,
+) -> set[str] | None:
     """Return the set of permitted top-level keys, or None when the
     schema does not describe a closed object (strict check skipped).
 
@@ -121,12 +127,7 @@ def _allowed_top_level_keys(schema: dict[str, Any]) -> set[str] | None:
         if schema.get("additionalProperties"):
             return None  # explicitly-open object
         keys = set(props)
-    elif "type" not in schema and all(isinstance(v, str) for v in schema.values()):
-        # Simple format. A top-level "type" key marks a JSON Schema
-        # fragment (e.g. {"type": "array"}) rather than a field list —
-        # skip those conservatively. (A simple schema with a field
-        # literally named "type" also skips: conservative, never
-        # rejects a response the schema didn't clearly constrain.)
+    elif is_raptor_descriptive_schema(schema):
         keys = set(schema)
     else:
         return None
@@ -137,7 +138,7 @@ def _allowed_top_level_keys(schema: dict[str, Any]) -> set[str] | None:
 
 def unknown_response_fields(
     raw: Any,
-    schema: dict[str, Any],
+    schema: dict[str, Any] | bool,
 ) -> list[str]:
     """Return the top-level keys of ``raw`` not permitted by ``schema``.
 
@@ -257,7 +258,9 @@ _DEFAULT_WEIGHT = 0.5
 _QUALITY_RETRY_THRESHOLD: float = 0.5
 
 
-def _resolve_weights(schema: dict[str, Any]) -> dict[str, float]:
+def _resolve_weights(
+    schema: dict[str, Any] | bool,
+) -> dict[str, float]:
     """Pick the right weight table for a schema, or fall back to uniform."""
     props = _get_properties(schema)
     field_names = set(props)
@@ -269,28 +272,33 @@ def _resolve_weights(schema: dict[str, Any]) -> dict[str, float]:
 
 # ---- Schema helpers ----------------------------------------------------------
 
-def _get_properties(schema: dict[str, Any]) -> dict[str, Any]:
+def _get_properties(
+    schema: dict[str, Any] | bool,
+) -> dict[str, Any]:
+    if not isinstance(schema, dict):
+        return {}
     if "properties" in schema:
         return schema.get("properties", {})
     # Simple schema: values are description strings like "boolean" or
     # "float (0.0-1.0)".  Return as-is — _get_field_type and _is_nullable
     # both handle string descriptions.
-    return schema
+    return schema if is_raptor_descriptive_schema(schema) else {}
 
 
-def _get_required(schema: dict[str, Any]) -> set[str]:
+def _get_required(
+    schema: dict[str, Any] | bool,
+) -> set[str]:
+    if not isinstance(schema, dict):
+        return set()
     if "properties" in schema:
         return set(schema.get("required", []))
-    return set(schema)
+    return set(schema) if is_raptor_descriptive_schema(schema) else set()
 
 
 def _get_field_type(field_spec: Any) -> str:
     """Extract the primary type from a JSON Schema property or simple description."""
     if isinstance(field_spec, str):
-        parts = field_spec.split()
-        token = parts[0].strip().lower() if parts else "string"
-        return {"bool": "boolean", "str": "string", "int": "integer",
-                "float": "number", "list": "array"}.get(token, token)
+        return descriptor_type_token(field_spec) or "string"
     if isinstance(field_spec, dict):
         t = field_spec.get("type", "string")
         if isinstance(t, list):
@@ -424,6 +432,124 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
 }
 
 
+# ---- Schema enum enforcement -------------------------------------------------
+
+def _enforce_enum(value: Any, enum_values: list[Any]) -> tuple[Any, bool, bool]:
+    """Check a value against a schema ``enum`` list.
+
+    Returns ``(value, ok, coerced)``. Exact membership passes the value
+    untouched; a string that strip/casefolds onto a string member is
+    coerced to that member (mirroring the severity/confidence domain
+    normalisers); anything else fails — the caller nulls it. Non-string
+    enum members (integers, booleans) require exact membership.
+    """
+    try:
+        if value in enum_values:
+            return value, True, False
+    except TypeError:
+        return value, False, False
+    if isinstance(value, str):
+        folded = value.strip().casefold()
+        for member in enum_values:
+            if isinstance(member, str) and member.strip().casefold() == folded:
+                return member, True, True
+    return value, False, False
+
+
+def _validate_array_items(
+    values: list[Any], items_spec: dict[str, Any],
+) -> tuple["list[Any] | None", bool, bool]:
+    """Validate array elements against the schema ``items`` spec.
+
+    Returns ``(cleaned, coerced, lossy)``. Object items keep undeclared
+    keys as-is; each declared property present on the item is
+    type-coerced and enum-checked, and a failing property becomes None
+    (the item survives so its good properties still flow). Nested
+    arrays recurse. Scalar items failing type coercion or the enum are
+    dropped. ``cleaned`` is None when every element of a non-empty
+    array was dropped — silently returning ``[]`` would hide a
+    wholesale discard, the same doctrine as the array branch of
+    ``_coerce_value``. ``lossy`` reports any dropped item or nulled
+    property so the caller can flag the field for the corrective retry.
+    """
+    item_type = _get_field_type(items_spec)
+    cleaned: list[Any] = []
+    coerced = False
+    lossy = False
+    if item_type == "object":
+        item_props = items_spec.get("properties")
+        for item in values:
+            if not isinstance(item, dict):
+                lossy = True
+                continue
+            if not isinstance(item_props, dict):
+                cleaned.append(item)
+                continue
+            new_item = dict(item)
+            for prop_name, prop_spec in item_props.items():
+                if prop_name not in new_item:
+                    continue
+                pv = new_item[prop_name]
+                if pv is None:
+                    continue
+                prop_type = _get_field_type(prop_spec)
+                pv, prop_coerced = _coerce_value(pv, prop_type)
+                coerced = coerced or prop_coerced
+                if pv is None:
+                    new_item[prop_name] = None
+                    lossy = True
+                    continue
+                enum_values = (prop_spec.get("enum")
+                               if isinstance(prop_spec, dict) else None)
+                if isinstance(enum_values, list) and enum_values:
+                    pv, enum_ok, enum_coerced = _enforce_enum(pv, enum_values)
+                    coerced = coerced or enum_coerced
+                    if not enum_ok:
+                        new_item[prop_name] = None
+                        lossy = True
+                        continue
+                if (prop_type == "array" and isinstance(pv, list)
+                        and isinstance(prop_spec, dict)
+                        and isinstance(prop_spec.get("items"), dict)):
+                    pv, sub_coerced, sub_lossy = _validate_array_items(
+                        pv, prop_spec["items"])
+                    coerced = coerced or sub_coerced
+                    lossy = lossy or sub_lossy
+                new_item[prop_name] = pv
+            cleaned.append(new_item)
+    else:
+        enum_values = items_spec.get("enum")
+        nested_spec = items_spec.get("items")
+        for item in values:
+            item, item_coerced = _coerce_value(item, item_type)
+            if item is None:
+                lossy = True
+                continue
+            # Array-typed items recurse — without this, an
+            # array-of-arrays passed its inner elements through with
+            # their type/enum constraints unenforced.
+            if (item_type == "array" and isinstance(item, list)
+                    and isinstance(nested_spec, dict)):
+                item, sub_coerced, sub_lossy = _validate_array_items(
+                    item, nested_spec)
+                item_coerced = item_coerced or sub_coerced
+                lossy = lossy or sub_lossy
+                if item is None:
+                    lossy = True
+                    continue
+            if isinstance(enum_values, list) and enum_values:
+                item, enum_ok, enum_coerced = _enforce_enum(item, enum_values)
+                item_coerced = item_coerced or enum_coerced
+                if not enum_ok:
+                    lossy = True
+                    continue
+            coerced = coerced or item_coerced
+            cleaned.append(item)
+    if values and not cleaned:
+        return None, coerced, True
+    return cleaned, coerced, lossy
+
+
 # ---- Type coercion -----------------------------------------------------------
 
 def _coerce_value(value: Any, field_type: str) -> tuple[Any, bool]:
@@ -495,7 +621,7 @@ def _coerce_value(value: Any, field_type: str) -> tuple[Any, bool]:
 
 def validate_structured_response(
     raw: dict[str, Any],
-    schema: dict[str, Any],
+    schema: dict[str, Any] | bool,
 ) -> ValidatedResponse:
     """Validate and normalise an LLM response dict against a schema.
 
@@ -508,6 +634,28 @@ def validate_structured_response(
             data={}, quality=0.0,
             incomplete=list(_get_properties(schema).keys()),
             raw={},
+        )
+
+    if schema is False:
+        return ValidatedResponse(
+            data={},
+            quality=0.0,
+            incomplete=["$schema:false"],
+            raw=dict(raw),
+        )
+    if schema is True or (
+        isinstance(schema, dict)
+        and "properties" not in schema
+        and not is_raptor_descriptive_schema(schema)
+    ):
+        # References/combinators/enum/annotation-only roots are valid JSON
+        # Schema but this field-level validator cannot interpret them. The
+        # provider transport already enforces the schema; preserve its result
+        # instead of treating root keywords as response field names.
+        return ValidatedResponse(
+            data=dict(raw),
+            quality=1.0,
+            raw=dict(raw),
         )
 
     properties = _get_properties(schema)
@@ -575,6 +723,32 @@ def validate_structured_response(
             value, norm_coerced = normaliser(value)
             was_coerced = was_coerced or norm_coerced
 
+        # Schema enum enforcement. The schema's own ``enum`` list is
+        # the schema author's declared value set — honoured for EVERY
+        # field, not just the names the domain tables happen to cover
+        # (pre-fix, a field like "severity" with a schema enum but no
+        # domain entry accepted arbitrary free text). The field-name
+        # domain tables below remain the STRICTER overlay: a value the
+        # schema enum admits can still be nulled by its domain
+        # validator.
+        enum_values = (field_spec.get("enum")
+                       if isinstance(field_spec, dict) else None)
+        if (isinstance(enum_values, list) and enum_values
+                and value is not None):
+            value, enum_ok, enum_coerced = _enforce_enum(value, enum_values)
+            was_coerced = was_coerced or enum_coerced
+            if not enum_ok:
+                data[field_name] = None
+                status = "coerced" if was_coerced else "invalid"
+                fields[field_name] = FieldResult(status=status, original=original)
+                incomplete.append(field_name)
+                if was_coerced:
+                    coerced_fields.append(field_name)
+                    weighted_score += weight * 0.5
+                else:
+                    weighted_score += weight * 0.25
+                continue
+
         # Domain validation. Rejected values are NULLED, honouring the
         # module contract ("nulls bad ones") — keeping them let e.g. a
         # score of 8 on a 0-1 scale flow into triage. Both branches
@@ -593,6 +767,37 @@ def validate_structured_response(
             else:
                 weighted_score += weight * 0.25
             continue
+
+        # Array item validation. A declared ``items`` spec is a
+        # per-element contract — pre-fix the array passed as one
+        # opaque blob, so nested enum fields (verdicts, confidence
+        # tiers) carried arbitrary free text into consumers.
+        items_spec = (field_spec.get("items")
+                      if isinstance(field_spec, dict) else None)
+        if (field_type == "array" and isinstance(value, list)
+                and isinstance(items_spec, dict)):
+            cleaned, items_coerced, lossy = _validate_array_items(
+                value, items_spec)
+            was_coerced = was_coerced or items_coerced
+            if cleaned is None:
+                # Every element failed — nulling beats returning [] at
+                # near-full credit (wholesale discard must be visible).
+                data[field_name] = None
+                fields[field_name] = FieldResult(status="invalid", original=original)
+                incomplete.append(field_name)
+                weighted_score += weight * 0.25
+                continue
+            value = cleaned
+            if lossy:
+                # Some elements/properties were dropped or nulled —
+                # keep the good remainder but flag the field so the
+                # corrective retry can target the loss.
+                data[field_name] = value
+                fields[field_name] = FieldResult(status="coerced", original=original)
+                coerced_fields.append(field_name)
+                incomplete.append(field_name)
+                weighted_score += weight * 0.5
+                continue
 
         # Passed
         data[field_name] = value

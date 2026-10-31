@@ -135,6 +135,34 @@ class PyModuleCallGraph:
         default_factory=dict)
     _asts_by_node: dict[tuple[str, int], ast.AST] = field(
         default_factory=dict)
+    # Module-scope names whose runtime binding may differ from their
+    # def: a non-def module-level assignment to a def's name
+    # (``def esc(…): …`` then ``esc = str``), or a ``global``
+    # declaration of it anywhere in the module (a sibling function
+    # can rewrite the slot before the analysed call runs). Name-keyed
+    # summary consumers must treat these identities as unknown — the
+    # written name no longer proves which body executes.
+    rebound_names: frozenset[str] = frozenset()
+    # Module-scope roots whose binding is repo-controlled (see
+    # :func:`module_shadowed_identity_roots` — non-import rebinds
+    # plus import aliases binding a different source) — consumers
+    # must never let a WRITTEN dotted name whose root is here match a
+    # trusted external identity (catalog sanitizer, chain stamp).
+    distrusted_roots: frozenset[str] = frozenset()
+    # The non-import subset (:func:`module_distrusted_roots`): the
+    # decorator gate refuses these outright but resolves import
+    # aliases through :attr:`import_map` instead — ``from functools
+    # import lru_cache`` is a trusted identity, ``lru_cache = str``
+    # is not.
+    nonimport_distrusted_roots: frozenset[str] = frozenset()
+    # Module-scope import bindings (root → dotted source) for
+    # resolving written names to trusted identities.
+    import_map: dict[str, str] = field(default_factory=dict)
+    # True when a dynamic route (star-import, exec/eval, sys.modules,
+    # escaping globals()/vars()) makes the WHOLE module's name
+    # resolution unprovable — every summary degrades to unknown and
+    # every catalog identity is refused (see module_dynamic_namespace).
+    namespace_unprovable: bool = False
 
     @property
     def entry(self) -> PyCallGraphNode:
@@ -195,6 +223,16 @@ class _FunctionRecord:
     is_method: bool
     class_name: str | None
     ast_node: ast.AST
+    # Names this function's own scope binds (params, assignments,
+    # nested defs, imports, …) — computed lazily via
+    # :meth:`local_bindings`; the bare-name callee arm refuses to
+    # resolve through them (shadow guard).
+    _local_bindings: frozenset[str] | None = None
+
+    def local_bindings(self) -> frozenset[str]:
+        if self._local_bindings is None:
+            self._local_bindings = local_binding_names(self.ast_node)
+        return self._local_bindings
 
 
 def _function_params(
@@ -317,6 +355,430 @@ def _collect_functions(tree: ast.AST) -> list[_FunctionRecord]:
 
 
 # ---------------------------------------------------------------------------
+# Local-binding discovery — the shadow guard for name-keyed joins
+# ---------------------------------------------------------------------------
+
+
+def local_binding_names(fn_ast: ast.AST) -> frozenset[str]:
+    """Every name the function's OWN scope binds, flow-insensitively.
+
+    The summary/binding joins downstream (``taint_summaries``'s
+    callee join, ``interproc``'s synthetic bindings, this module's
+    bare-name callee resolution) are keyed by NAME against the
+    module-level table. A local binding of that name (``esc = str``,
+    a parameter named ``esc``, a nested ``def esc``, a walrus, a
+    ``for``/``with``/``except``/import target) makes the runtime
+    callee a different object than the table entry — a hostile repo
+    collides the key and mints a clean-sanitizer wrapper the enforced
+    sanitizer-cut consumes. Joins must refuse when the name has ANY
+    local definition: an ambiguous binding can only lose suppression
+    power, never gain it.
+
+    Scope rules:
+
+    * Parameters, assignment/augmented/annotated targets (including
+      tuple/list/star destructuring), walrus targets, ``for`` /
+      ``async for`` targets, ``with … as`` targets, ``except … as``
+      names, import aliases, ``match`` capture names, and the NAMES
+      of nested function/class definitions all bind locally.
+    * Nested function/class BODIES bind their own scopes and are not
+      descended into — but their decorators and default expressions
+      evaluate in THIS scope, so walruses there are collected.
+    * Comprehension for-targets are NOT collected: comprehensions
+      have their own scope, so a target there never rebinds the
+      function's names (a walrus inside a comprehension DOES — it is
+      an ordinary ``NamedExpr`` in the walk and is collected).
+    """
+    out: set[str] = set()
+    args = getattr(fn_ast, "args", None)
+    if args is not None:
+        for a in (*args.posonlyargs, *args.args, *args.kwonlyargs):
+            out.add(a.arg)
+        if args.vararg is not None:
+            out.add(args.vararg.arg)
+        if args.kwarg is not None:
+            out.add(args.kwarg.arg)
+
+    def _add_target(t: ast.AST) -> None:
+        if isinstance(t, ast.Name):
+            out.add(t.id)
+        elif isinstance(t, ast.Starred):
+            _add_target(t.value)
+        elif isinstance(t, (ast.Tuple, ast.List)):
+            for e in t.elts:
+                _add_target(e)
+        # Attribute / Subscript targets bind no bare name.
+
+    def _walk(node: ast.AST) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                out.add(child.name)
+                # Decorators and defaults evaluate in THIS scope.
+                for expr in (*child.decorator_list,
+                             *child.args.defaults,
+                             *(d for d in child.args.kw_defaults
+                               if d is not None)):
+                    _walk(expr)
+                continue
+            if isinstance(child, ast.ClassDef):
+                out.add(child.name)
+                for expr in (*child.decorator_list, *child.bases,
+                             *(kw.value for kw in child.keywords)):
+                    _walk(expr)
+                continue
+            if isinstance(child, ast.Lambda):
+                for expr in (*child.args.defaults,
+                             *(d for d in child.args.kw_defaults
+                               if d is not None)):
+                    _walk(expr)
+                continue
+            if isinstance(child, ast.Assign):
+                for t in child.targets:
+                    _add_target(t)
+            elif isinstance(child, (ast.AnnAssign, ast.AugAssign)):
+                _add_target(child.target)
+            elif isinstance(child, ast.NamedExpr):
+                _add_target(child.target)
+            elif isinstance(child, (ast.For, ast.AsyncFor)):
+                _add_target(child.target)
+            elif isinstance(child, (ast.With, ast.AsyncWith)):
+                for item in child.items:
+                    if item.optional_vars is not None:
+                        _add_target(item.optional_vars)
+            elif isinstance(child, ast.ExceptHandler):
+                if child.name:
+                    out.add(child.name)
+            elif isinstance(child, (ast.Import, ast.ImportFrom)):
+                for alias in child.names:
+                    if alias.asname:
+                        out.add(alias.asname)
+                    elif alias.name != "*":
+                        out.add(alias.name.split(".", 1)[0])
+            elif isinstance(child, (ast.MatchAs, ast.MatchStar)):
+                if child.name:
+                    out.add(child.name)
+            elif isinstance(child, ast.MatchMapping):
+                if child.rest:
+                    out.add(child.rest)
+            _walk(child)
+
+    _walk(fn_ast)
+    return frozenset(out)
+
+
+def _module_rebound_names(tree: ast.Module) -> frozenset[str]:
+    """Module-scope names whose runtime binding is not proven to be
+    their def — see :attr:`PyModuleCallGraph.rebound_names`.
+
+    Two channels, both flow-insensitive (order between the def and
+    the rebind does not matter — either order leaves the name's
+    runtime identity unprovable to a name-keyed consumer):
+
+    * A non-def binding statement at module scope naming the same
+      name as a ``def``/lambda-def elsewhere at module scope
+      (``esc = str``, an import alias, a ``for`` target, …). The
+      single-``Name``-target lambda assignment is exempt — it IS the
+      def :func:`_collect_functions` harvests.
+    * A ``global`` declaration of the name anywhere in the module: a
+      sibling function that runs at any point before the analysed
+      call can rewrite the module slot.
+    * A module-scope CLASS sharing a module-scope function def's name
+      (either order — flow-insensitive): the runtime binding is
+      whichever ran last, so the name proves neither body.
+    """
+    # Non-def bindings at module scope: same boundary walk as
+    # local_binding_names (stops at def/class bodies) but WITHOUT
+    # recording the def/class names themselves — those are the defs,
+    # not rebinds — and skipping harvested lambda-assign statements.
+    # def/class names are collected separately so the class ∩ def
+    # collision can join the poison set without every ordinary class
+    # poisoning its own methods.
+    nondef: set[str] = set()
+    def_names: set[str] = set()
+    class_names: set[str] = set()
+
+    def _add_target(t: ast.AST) -> None:
+        if isinstance(t, ast.Name):
+            nondef.add(t.id)
+        elif isinstance(t, ast.Starred):
+            _add_target(t.value)
+        elif isinstance(t, (ast.Tuple, ast.List)):
+            for e in t.elts:
+                _add_target(e)
+
+    def _walk(node: ast.AST) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                def_names.add(child.name)
+                continue
+            if isinstance(child, ast.ClassDef):
+                class_names.add(child.name)
+                continue
+            if isinstance(child, ast.Lambda):
+                continue
+            if isinstance(child, ast.Assign):
+                if (len(child.targets) == 1
+                        and isinstance(child.targets[0], ast.Name)
+                        and isinstance(child.value, ast.Lambda)):
+                    # The lambda-def shape — a function record, not a
+                    # rebind of one (but it IS a def name for the
+                    # class-collision check).
+                    def_names.add(child.targets[0].id)
+                    continue
+                for t in child.targets:
+                    _add_target(t)
+            elif isinstance(child, (ast.AnnAssign, ast.AugAssign)):
+                _add_target(child.target)
+            elif isinstance(child, ast.NamedExpr):
+                _add_target(child.target)
+            elif isinstance(child, (ast.For, ast.AsyncFor)):
+                _add_target(child.target)
+            elif isinstance(child, (ast.With, ast.AsyncWith)):
+                for item in child.items:
+                    if item.optional_vars is not None:
+                        _add_target(item.optional_vars)
+            elif isinstance(child, ast.ExceptHandler):
+                if child.name:
+                    nondef.add(child.name)
+            elif isinstance(child, (ast.Import, ast.ImportFrom)):
+                for alias in child.names:
+                    if alias.asname:
+                        nondef.add(alias.asname)
+                    elif alias.name != "*":
+                        nondef.add(alias.name.split(".", 1)[0])
+            _walk(child)
+
+    _walk(tree)
+
+    # ``global`` declarations anywhere in the module (function bodies
+    # included — that is the point).
+    global_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Global):
+            global_names.update(node.names)
+
+    return frozenset(nondef | global_names | (class_names & def_names))
+
+
+def module_import_map(tree: ast.Module) -> dict[str, str]:
+    """Module-scope import bindings: bound root name → dotted source.
+
+    ``import a.b`` binds ``a`` → ``a``; ``import a.b as c`` binds
+    ``c`` → ``a.b``; ``from m import n as k`` binds ``k`` → ``m.n``.
+    Relative imports resolve outside the module's own vocabulary and
+    map to a ``<relative>``-prefixed source that can never match a
+    trusted dotted name. Later bindings win (runtime order)."""
+    out: dict[str, str] = {}
+
+    def _walk(node: ast.AST) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                  ast.ClassDef, ast.Lambda)):
+                continue
+            if isinstance(child, ast.Import):
+                for alias in child.names:
+                    root = alias.name.split(".", 1)[0]
+                    if alias.asname:
+                        out[alias.asname] = alias.name
+                    else:
+                        out[root] = root
+            elif isinstance(child, ast.ImportFrom):
+                module = child.module or ""
+                prefix = "<relative>." * child.level + module
+                for alias in child.names:
+                    if alias.name == "*":
+                        continue
+                    bound = alias.asname or alias.name
+                    src = f"{prefix}.{alias.name}" if prefix else alias.name
+                    out[bound] = src
+            _walk(child)
+
+    _walk(tree)
+    return out
+
+
+def module_distrusted_roots(tree: ast.Module) -> frozenset[str]:
+    """Module-scope names whose binding is REPO-CONTROLLED rather than
+    the same-named external module / builtin.
+
+    The catalog matcher and the decorator allowlist trust WRITTEN
+    names (``html.escape``, ``@staticmethod``); a hostile module can
+    rebind the root of such a name and keep the spelling. Distrusted:
+
+    * every module-scope def / class / lambda-def name (a def named
+      ``html`` or ``staticmethod`` is the repo's object);
+    * every non-import module-scope binding (assignments including
+      destructuring, walrus, ``for``/``with``/``except`` targets);
+    * names declared ``global`` anywhere in the module (any sibling
+      can rewrite the slot);
+    Import bindings are NOT in this set — they resolve exactly
+    through :func:`module_import_map` (a ``from functools import
+    lru_cache`` alias is a trusted identity, not a rebind); consumers
+    that check WRITTEN dotted identities against external catalogs
+    need :func:`module_shadowed_identity_roots`, which unions in the
+    aliases that bind a different source.
+
+    Trusted absences: an unbound root (resolves to builtins or fails
+    at runtime — it cannot be the repo's object) and the plain
+    self-import (``import html``, ``import html.parser``)."""
+    out: set[str] = set()
+
+    def _add_target(t: ast.AST) -> None:
+        if isinstance(t, ast.Name):
+            out.add(t.id)
+        elif isinstance(t, ast.Starred):
+            _add_target(t.value)
+        elif isinstance(t, (ast.Tuple, ast.List)):
+            for e in t.elts:
+                _add_target(e)
+
+    def _walk(node: ast.AST) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                  ast.ClassDef)):
+                out.add(child.name)
+                continue
+            if isinstance(child, ast.Lambda):
+                continue
+            if isinstance(child, ast.Assign):
+                for t in child.targets:
+                    _add_target(t)
+            elif isinstance(child, (ast.AnnAssign, ast.AugAssign)):
+                _add_target(child.target)
+            elif isinstance(child, ast.NamedExpr):
+                _add_target(child.target)
+            elif isinstance(child, (ast.For, ast.AsyncFor)):
+                _add_target(child.target)
+            elif isinstance(child, (ast.With, ast.AsyncWith)):
+                for item in child.items:
+                    if item.optional_vars is not None:
+                        _add_target(item.optional_vars)
+            elif isinstance(child, ast.ExceptHandler):
+                if child.name:
+                    out.add(child.name)
+            _walk(child)
+
+    _walk(tree)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Global):
+            out.update(node.names)
+
+    return frozenset(out)
+
+
+def module_dynamic_namespace(
+    tree: ast.Module,
+) -> tuple[bool, frozenset[str]]:
+    """Dynamic module-namespace rebinding routes → ``(whole_module,
+    poisoned_names)``.
+
+    The static walkers above see BINDING STATEMENTS; Python also
+    rebinds module names through routes with no binding syntax at
+    all, and a hostile repo used every one of them to keep a clean
+    written identity over a raw runtime callee:
+
+    * ``from x import *`` — every name in the module is now
+      potentially the star module's object → the WHOLE module's
+      name-resolution confidence is void.
+    * ``exec`` / ``eval`` at module-reachable scope (module body,
+      class body — both run at import), or anywhere with an explicit
+      globals argument — arbitrary rebinds → whole module.
+    * any reachable ``sys.modules`` (aliased imports included) — a
+      ``setattr(sys.modules[__name__], …)`` rebinds by attribute,
+      and aliasing makes name-level tracking unsound → whole module.
+    * ``globals()`` / ``vars()`` / module-scope ``locals()``:
+      a constant-key subscript STORE/DELETE poisons exactly that
+      name; a constant-key LOAD is harmless; every other use
+      (non-constant key store, aliasing the dict, ``.update(…)``,
+      passing it on) → whole module.
+
+    Consumers abstain: a poisoned name (or every name, when
+    whole_module) loses join/catalog trust — suppression can only be
+    lost, never gained.
+    """
+    whole = False
+    names: set[str] = set()
+
+    # Parent map for positional analysis of globals()/vars() calls.
+    parents: dict[ast.AST, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+
+    imap = module_import_map(tree)
+    sys_aliases = {r for r, src in imap.items() if src == "sys"}
+    modules_aliases = {
+        r for r, src in imap.items()
+        if src == "sys.modules" or src.startswith("sys.modules.")
+    }
+
+    def _module_reachable(node: ast.AST) -> bool:
+        cur = parents.get(node)
+        while cur is not None:
+            if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                ast.Lambda)):
+                return False
+            cur = parents.get(cur)
+        return True
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if any(alias.name == "*" for alias in node.names):
+                whole = True
+        elif isinstance(node, ast.Attribute):
+            if (node.attr == "modules"
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id in sys_aliases):
+                whole = True
+        elif isinstance(node, ast.Name):
+            if node.id in modules_aliases:
+                whole = True
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if not isinstance(func, ast.Name):
+                continue
+            fname = func.id
+            if fname in ("exec", "eval"):
+                if len(node.args) >= 2 or _module_reachable(node):
+                    whole = True
+                continue
+            if fname not in ("globals", "vars", "locals"):
+                continue
+            if fname == "locals" and not _module_reachable(node):
+                # A function's locals() cannot rebind module names.
+                continue
+            parent = parents.get(node)
+            if (isinstance(parent, ast.Subscript)
+                    and parent.value is node):
+                if isinstance(parent.ctx, ast.Load):
+                    continue                     # read-only — harmless
+                key = parent.slice
+                if (isinstance(key, ast.Constant)
+                        and isinstance(key.value, str)):
+                    names.add(key.value.split(".", 1)[0])
+                    continue
+                whole = True                     # computed-key write
+                continue
+            # Aliased, updated, or escaping namespace dict.
+            whole = True
+
+    return whole, frozenset(names)
+
+
+def module_shadowed_identity_roots(tree: ast.Module) -> frozenset[str]:
+    """Roots a WRITTEN dotted identity must never be trusted through:
+    every non-import rebind (:func:`module_distrusted_roots`) plus
+    import aliases binding a DIFFERENT source (``import fakelib as
+    html``, ``from fakelib import html``). The sanitizer-catalog
+    guard and the summary chain stamps consume this set."""
+    return module_distrusted_roots(tree) | frozenset(
+        root for root, src in module_import_map(tree).items()
+        if src != root
+    )
+
+
+# ---------------------------------------------------------------------------
 # Call resolution
 # ---------------------------------------------------------------------------
 
@@ -382,6 +844,15 @@ def _resolve_callee(
       resolve to ``ClassName.m`` when defined.
     * Anything longer or with an unknown root — drop (cross-module
       or dynamic).
+
+    Shadow guard: when the CALLER's own scope binds the chain's root
+    name (``esc = str``, a param named ``esc``, a walrus, an import
+    alias), the runtime callee is the local binding, not the module
+    table's entry — resolving through the table would attribute the
+    call to a function it provably may not reach (the downstream
+    taint summaries then certify forged clean-sanitizer wrappers).
+    The one exception is the nested-def preference below: a nested
+    ``def esc`` IS the local binding, so resolving to it is exact.
     """
     if not chain:
         return None
@@ -393,6 +864,10 @@ def _resolve_callee(
             nested = f"{caller.qualified_name}.{name}"
             if nested in function_records_by_name:
                 return nested
+        if caller is not None and name in caller.local_bindings():
+            # Locally rebound (and not the nested def handled above)
+            # — the module-level entry is not the runtime callee.
+            return None
         if name in function_records_by_name:
             return name
         # Class construction — ClassName() → ClassName.__init__
@@ -410,6 +885,9 @@ def _resolve_callee(
         return None
     # ``Class.m`` — module-level class methods, static-style.
     if len(chain) == 2:
+        if caller is not None and chain[0] in caller.local_bindings():
+            # A local named like the class shadows it for this call.
+            return None
         cls = chain[0]
         if cls in class_methods and chain[1] in class_methods[cls]:
             return f"{cls}.{chain[1]}"
@@ -482,7 +960,13 @@ def build_python_module_callgraph(
     """
     if isinstance(source, Path):
         file_path = str(source)
-        source_text = source.read_text(encoding="utf-8")
+        # errors="replace": a non-UTF-8 target file must degrade to
+        # the parse-failure None path (or parse what it can), not
+        # raise UnicodeDecodeError into the caller — the resolver's
+        # blanket except would silently drop the file's summaries,
+        # and new callers would crash outright.
+        source_text = source.read_text(encoding="utf-8",
+                                       errors="replace")
     else:
         file_path = "<string>"
         source_text = source
@@ -608,6 +1092,16 @@ def build_python_module_callgraph(
         fn_node_by_key.values(), key=lambda n: (n.lineno, n.name),
     )
 
+    # Rebound-identity poison set: only roots that actually name a
+    # collected function (or its enclosing class prefix) matter to
+    # summary consumers, so intersect the module-scope rebinds down
+    # to them.
+    fn_roots = {fr.qualified_name.split(".", 1)[0] for fr in fn_records}
+    dyn_whole, dyn_names = module_dynamic_namespace(tree)
+    rebound = frozenset(
+        (_module_rebound_names(tree) | dyn_names) & fn_roots,
+    )
+
     return PyModuleCallGraph(
         file_path=file_path,
         entry_node=entry,
@@ -619,6 +1113,15 @@ def build_python_module_callgraph(
             name: tuple(nodes) for name, nodes in variants_by_name.items()
         },
         _asts_by_node=asts_by_node,
+        rebound_names=rebound,
+        distrusted_roots=(
+            module_shadowed_identity_roots(tree) | dyn_names
+        ),
+        nonimport_distrusted_roots=(
+            module_distrusted_roots(tree) | dyn_names
+        ),
+        import_map=module_import_map(tree),
+        namespace_unprovable=dyn_whole,
     )
 
 
@@ -627,4 +1130,9 @@ __all__ = [
     "PyCallGraphNode",
     "PyModuleCallGraph",
     "build_python_module_callgraph",
+    "local_binding_names",
+    "module_distrusted_roots",
+    "module_import_map",
+    "module_dynamic_namespace",
+    "module_shadowed_identity_roots",
 ]

@@ -40,7 +40,11 @@
 
 ## What is RAPTOR?
 
-RAPTOR is an autonomous security research framework built on top of Claude Code (but not tied to it -- you can plug in your own analysis layer too). It chains together static analysis, binary analysis, LLM-powered vulnerability validation, exploit generation, and patch writing into a single workflow you can run against a codebase or binary.
+RAPTOR is an autonomous security research framework driven interactively by
+Claude Code (the default) or GitHub Copilot CLI (native Linux). You can also
+plug in a separate analysis layer. It chains together static analysis, binary
+analysis, LLM-powered vulnerability validation, exploit generation, and patch
+writing into a single workflow you can run against a codebase or binary.
 
 It is not polished software. It was built in free time, held together with enthusiasm and duct tape, and it works well enough that we can't stop using it. If you want to make it better, open a PR.
 
@@ -58,11 +62,17 @@ the code.
 
 ## Prerequisites
 
-- **Claude Code** with an active subscription (Max, Pro, Team, or Enterprise) or an Anthropic API key. This is the orchestration layer -- RAPTOR runs inside a Claude Code session.
-- **Python 3.10+** and **Node.js 18+**.
+- One interactive frontend (optional if you only need the standalone CLIs):
+  - **Claude Code** with an active subscription (Max, Pro, Team, or Enterprise) or an Anthropic API key; or
+  - **GitHub Copilot CLI** with a signed-in account. Copilot frontend launch currently requires its native Linux executable.
+- **Python 3.12+**. Node.js is not required when using the recommended native
+  frontend installers.
 - **Semgrep** (`pip install semgrep`) for static analysis. CodeQL is optional but recommended.
 
-For the analysis dispatch layer (the LLM that analyses individual findings), Claude Code itself handles everything by default -- no extra API keys needed. If you want multi-model analysis (e.g. Claude + GPT + Gemini), you will need API keys for each provider. See [Using a different LLM](#using-a-different-llm) below.
+The interactive frontend and analysis dispatch layer are separate. Claude Code
+can provide both by default. Copilot CLI currently provides only the interactive
+frontend, so Copilot-only installations must configure an analysis provider for
+LLM-backed analysis. See [Using a different LLM](#using-a-different-llm).
 
 ## Quick Start
 
@@ -74,28 +84,61 @@ git clone https://github.com/gadievron/raptor.git
 cd raptor
 
 # Install Python dependencies
-pip install -r requirements.txt
+uv sync --locked
 
-# Install Claude Code (if you don't already have it)
-npm install -g @anthropic-ai/claude-code
+# Compatibility path during the uv migration
+# pip install -r requirements.txt
+
+# Install your chosen native interactive frontend (Claude shown here)
+curl -fsSL https://claude.ai/install.sh | bash
 
 # Install Semgrep (required for scanning)
-pip install semgrep
+pipx install semgrep
 
 # Add the launcher to your PATH -- put this in your shell profile to make it
 # permanent. Append rather than prepend, so system directories stay ahead of
 # the repo. (Alternatively, symlink bin/raptor into a directory already on PATH.)
 export PATH="$PATH:$PWD/bin"
 
-# Launch RAPTOR
+# Launch RAPTOR with Claude Code (default)
 raptor
+
+# Or launch RAPTOR with GitHub Copilot CLI
+# First install its native Linux executable:
+# curl -fsSL https://gh.io/copilot-install | bash
+raptor --frontend copilot
 ```
 
-The `raptor` launcher is the recommended way to start a session, and it works from any directory -- it resolves the RAPTOR installation, remembers the directory you launched from (so commands like `/scan` default to it), runs the pre-flight trust and project checks, loads the coverage-tracking plugin, and sanitises the environment before handing off to Claude Code. It also takes an optional target path and flags like `--project`, `--continue`, and `--model` -- see `raptor --help`.
+Copilot users should also read
+[README-Copilot.md](README-Copilot.md) for model routing, subagent
+configuration, and troubleshooting. Copilot sessions enforce a fail-closed
+service boundary: repository-managed providers, harness fallbacks, and
+ancillary network services are blocked, rather than using another account.
+This includes direct `copilot` development sessions; it does not control
+Copilot's own internal routing or arbitrary host tools.
 
-Running plain `claude` from inside the repo directory also works -- Claude Code picks up RAPTOR's configuration from the checkout -- but you skip everything the launcher does above: no pre-flight checks, no coverage tracking, and commands that default to "the directory you ran this from" can't see it.
+The `raptor` launcher is the recommended way to start a session, and it works
+from any directory -- it resolves the RAPTOR installation, remembers the
+directory you launched from (so commands like `/scan` default to it), runs the
+pre-flight trust and project checks, loads the coverage-tracking plugin, and
+sanitises the environment before handing off to the selected frontend. It also
+takes an optional target path and flags like `--project`, `--continue`,
+Copilot's exact-session `--resume ID`, `--model`, `--max-findings N`, and
+`--max-cost-usd USD` to start an agentic scan with explicit limits -- see
+`raptor --help`.
 
-**Important:** RAPTOR loads its configuration from the repo directory. If you run `claude` from any other directory, you get plain Claude Code, not RAPTOR. The `raptor` launcher avoids this failure mode entirely.
+Running plain `copilot` from inside the repo loads RAPTOR's compatible
+instructions, commands, skills, and generated `.github/agents` projection,
+but skips launcher pre-flight checks, strong session/project binding, and
+automatic coverage-plugin loading. Plain `claude` loads the repository
+instructions, commands, and skills, but **not** the `raptor-agents` plugin:
+RAPTOR's Claude agents and their identity-gated security hooks are
+launcher-only. Start them through `bin/raptor` rather than adding the plugin
+manually without the launcher's trusted environment.
+
+**Important:** RAPTOR loads its decision assets from the repo directory. If you
+run a frontend directly from another directory, you get a plain frontend
+session, not RAPTOR. The `raptor` launcher avoids this failure mode entirely.
 
 ### Option 2: Run in a container (recommended)
 
@@ -194,6 +237,7 @@ Environment variables that could inject code into the launcher chain are strippe
 | `/diagram` | Mermaid visual maps from `/understand` and `/validate` JSON outputs | Beta |
 | `/codeql` | CodeQL-only deep analysis with SMT dataflow pre-screening | Stable |
 | `/analyze` | Analyse existing SARIF findings with LLM, without re-scanning | Stable |
+| `/openant` | OpenAnt LLM source-code scan: AST analysis plus per-function LLM reasoning | Beta |
 | `/sca` | Software composition analysis: dependencies, advisories, supply-chain signals, SBOMs, and fixes | Beta |
 | `/cve-diff` | Discover and diff the fix commit for a CVE across OSV, NVD, GitHub, and GitLab | Beta |
 | `/cve-env` | Build and verify a Docker environment running a CVE's affected application at its pre-patch version | Experimental |
@@ -351,8 +395,8 @@ CodeQL needs network access only during initial setup to download the CLI and qu
 
 RAPTOR ships over 200 custom static analysis rules, adversarially tested to eliminate false positives:
 
-- **Semgrep (145 rules)** — taint-tracking and pattern rules for Python, Go, Java, and JS/TS. Covers SQLi, XSS, SSRF, SSTI, command injection, deserialisation, XXE, LDAP/NoSQL injection, path traversal, open redirect, log/header injection, eval injection, ReDoS, prototype pollution, JWT misconfiguration, weak crypto, insecure TLS, and hardcoded secrets.
-- **Coccinelle (63 rules)** — structural matching for C/C++. Memory safety (double free, use-after-free, free of non-base pointer, free of stack array, mmap'd memory, use-after-close), integer bugs (overflow, sign extension, double sizeof), resource leaks (popen/fclose mismatch, fdopendir double close), buffer handling (strncpy without NUL, copy_user size mismatch, malloc/strlen off-by-one), signal handler safety, API misuse (fcntl flag domain, SIGKILL/SIGSTOP, double byte-swap, inet_ntoa static buffer), compiler dead-store elimination, kernel IS_ERR/PTR_ERR confusion, format string injection, TOCTOU races, and more.
+- **Semgrep (~150 rules)** — taint-tracking and pattern rules for Python, Go, Java, and JS/TS. Covers SQLi, XSS, SSRF, SSTI, command injection, deserialisation, XXE, LDAP/NoSQL injection, path traversal, open redirect, log/header injection, eval injection, ReDoS, prototype pollution, JWT misconfiguration, weak crypto, insecure TLS, and hardcoded secrets.
+- **Coccinelle (68 rules)** — structural matching for C/C++. Memory safety (double free, use-after-free, free of non-base pointer, free of stack array, mmap'd memory, use-after-close), integer bugs (overflow, sign extension, double sizeof), resource leaks (popen/fclose mismatch, fdopendir double close), buffer handling (strncpy without NUL, copy_user size mismatch, malloc/strlen off-by-one), signal handler safety, API misuse (fcntl flag domain, SIGKILL/SIGSTOP, double byte-swap, inet_ntoa static buffer), compiler dead-store elimination, kernel IS_ERR/PTR_ERR confusion, format string injection, TOCTOU races, and more.
 - **CodeQL (8 queries)** — interprocedural taint tracking for C++ (format string injection, integer truncation, use-after-move, iterator invalidation) and Java (XXE, insecure deserialisation, log injection, Spring SSRF).
 
 Browse the rules directly: `engine/semgrep/rules/`, `engine/coccinelle/rules/`, `engine/codeql/queries/`. These complement the Semgrep registry packs RAPTOR pulls in (`p/security-audit`, `p/owasp-top-ten`, `p/secrets` always; per-policy-group packs like `p/command-injection`, `p/jwt`, `p/xss` on top) — overlap is minimal.
@@ -373,12 +417,12 @@ RAPTOR dogfoods a fair bit of its own security tooling, but it is worth being ho
 | RAPTOR SCA PR gate | Dependency and supply-chain regressions introduced by a PR | Manifest / lockfile / workflow changes | `.github/workflows/sca-pr-gate.yml` |
 | RAPTOR SCA self-bump | Mechanical dependency hardening and safe upgrade proposals | Weekly schedule, manual run | `.github/workflows/sca-self-bump.yml` |
 | SCA compromise corpus | Whether known dependency compromises still trigger the expected signal | Weekly schedule, relevant PR changes | `test/data/sca-e2e/compromise-corpus/`, `.github/workflows/sca-compromise-check.yml` |
-| Miswiring scan | Dead-code / wrong-call detection, env-var documentation drift, vocabulary-list guardrails, optional-dep import lint | Daily schedule | `.github/workflows/miswiring-scan.yml`, `.github/scripts/*_baseline.json` |
+| Repo-invariant detectors | Dead-code / wrong-call detection, env-var documentation drift, vocabulary-list guardrails, canonical-JSON byte forms, optional-dep import lint | PR gate (`lint.yml` `repo-invariants` job), plus daily sweep | `.github/workflows/lint.yml`, `.github/workflows/miswiring-scan.yml`, `.github/scripts/*_baseline.json` |
 | SCA calibration + stress corpus | Whether risk scoring and parser coverage drift over time | Weekly / monthly scheduled jobs | `packages/sca/data/calibration/`, `.github/workflows/refresh-sca-calibration.yml`, `.github/workflows/sca-stress-sweep.yml` |
 | Dataflow corpus | Precision / recall / FP-category tracking for validator behaviour | Developer-run benchmark and corpus tests | `core/dataflow/corpus/`, `core/dataflow/scripts/corpus-metrics` |
 | CI controls doc guard | Documented paths exist, ruff config matches, README links to the doc | PRs | `.github/tests/test_ci_controls_docs.py` |
 
-Not currently enforced: `mypy` is installed in `requirements-dev.txt` but does not block anything; Ruff formatting is not enforced; Semgrep is part of RAPTOR's scanner surface, but we do not yet have a dedicated "scan RAPTOR with RAPTOR" Semgrep workflow.
+Not currently enforced: `mypy` is pinned in `pyproject.toml` but does not block anything; Ruff formatting is not enforced; Semgrep is part of RAPTOR's scanner surface, but we do not yet have a dedicated "scan RAPTOR with RAPTOR" Semgrep workflow.
 
 ---
 
@@ -386,7 +430,14 @@ Not currently enforced: `mypy` is installed in `requirements-dev.txt` but does n
 
 RAPTOR has two separate model layers, and it is worth knowing how both work before you change anything.
 
-The **orchestration layer** is always Claude Code. The CLAUDE.md, skills, and commands all run as Claude Code instructions. To change which Claude model orchestrates RAPTOR, use Claude Code's `--model` flag or the `/model` command inside a session.
+The **orchestration layer** is the selected interactive frontend: Claude Code
+by default, or GitHub Copilot CLI on native Linux with
+`raptor --frontend copilot`. `CLAUDE.md`, skills, commands, and agents drive
+that layer in either frontend. Use `raptor --model <model>` or `/model` inside
+the session to select a frontend model. Copilot frontend support does not
+register Copilot as an analysis-dispatch provider. Copilot child agents may
+also use a separately configured model; see
+[README-Copilot.md](README-Copilot.md).
 
 The **analysis dispatch layer** is the LLM that analyses individual vulnerability findings. This is separate from the orchestration layer and can be any supported provider. Configure it in `~/.config/raptor/models.json`:
 
@@ -454,7 +505,38 @@ Budget control:
 python3 raptor.py agentic --repo /code --max-cost-usd 5.00
 ```
 
-Ollama works for analysis but produces unreliable exploit and patch code. For code generation tasks, use a frontier model.
+Ollama works well for analysis; reliability for exploit/patch code generation tracks model scale and quantization rather than being a fixed property of local models — see [Quality Tradeoffs](llm.md#quality-tradeoffs) in the LLM guide, and check `/scorecard` for what your specific model is actually measuring.
+
+### Running fully standalone (no Claude Code)
+
+`bin/raptor` -- the interactive shell with the banner and slash commands --
+execs into the selected frontend and needs that frontend's login. The actual
+mechanics underneath it do not: `python3 raptor.py <mode>` is a plain Python
+CLI with no interactive-frontend dependency.
+
+```bash
+# No `claude` process involved at any point
+./bin/raptor doctor --verbose                   # actionable local setup check; no frontend needed
+python3 raptor.py agentic --repo /path/to/code   # scan -> dedup -> analysis
+python3 raptor.py scan --repo /path/to/code
+```
+
+`libexec/raptor-*` scripts (including `raptor-project-manager` -- `raptor.py` has no `project` mode, project management lives there exclusively) are also plain Python, but they refuse to run unless `CLAUDECODE` is set (true automatically inside a Claude Code session) or `_RAPTOR_TRUSTED=1` is set explicitly -- a guard against being invoked outside the launcher's environment sanitisation. Set it once for standalone use:
+
+```bash
+export _RAPTOR_TRUSTED=1
+
+libexec/raptor-project-manager create myapp --target /path/to/code
+libexec/raptor-project-manager use myapp
+python3 raptor.py agentic --repo /path/to/code   # picks up the active project automatically
+libexec/raptor-project-manager status
+libexec/raptor-project-manager findings
+```
+
+Point `models.json` / `OLLAMA_HOST` at a local Ollama instance (see above) and
+this whole path can stay local -- useful for airgapped boxes or local-only
+hardware. You lose the conversational slash-command layer; the
+scan/analysis/exploit pipeline itself is unaffected.
 
 ### Fast-tier short-circuit + the model scorecard
 
@@ -495,14 +577,15 @@ RAPTOR is two layers.
 
 The **Python execution layer** (`raptor.py`, `packages/`, `core/`, `engine/`) handles the heavy lifting: running Semgrep and CodeQL, managing subprocesses, parsing SARIF, deduplicating findings, dispatching LLM API calls, tracking costs, writing output files. It does not make decisions. It executes.
 
-The **Claude Code decision layer** (`.claude/`, `tiers/`, `CLAUDE.md`) makes the calls: which findings to prioritise, how to interpret results, what the attack scenario is, whether the exploit is realistic. Implemented as Claude Code skills, commands, and agents that load progressively.
+The **interactive decision layer** (`.claude/`, `plugins/agents/`, `tiers/`, `CLAUDE.md`) makes the calls: which findings to prioritise, how to interpret results, what the attack scenario is, whether the exploit is realistic. Implemented as skills, commands, and agents that load progressively in Claude Code or Copilot CLI.
 
 ```
 CLAUDE.md              always loaded -- bootstrap, routing, security rules
 .claude/commands/      slash commands (/agentic, /scan, /validate, etc.)
 .claude/skills/        methodology detail, loaded on demand
 tiers/                 adversarial thinking, recovery, expert personas
-.claude/agents/        specialist sub-agents (offsec, crash analysis, forensics)
+plugins/agents/agents/ authoritative Claude agents (`model: inherit`)
+.github/agents/        generated Copilot projection
 ```
 
 The split means you can run the Python layer from a CI pipeline (`python3 raptor.py scan --repo ...`) and get structured SARIF output without Claude Code, or run it interactively with the full agentic workflow.
@@ -519,7 +602,7 @@ Requires `GOOGLE_APPLICATION_CREDENTIALS` for BigQuery access. See `.claude/comm
 
 ## Expert personas
 
-Seven expert personas are available on demand. Load one when you want a different perspective on a finding or a specific technique:
+Eight expert personas are available on demand. Load one when you want a different perspective on a finding or a specific technique:
 
 ```
 Exploit Developer (Mark Dowd)                  Exploit PoC generation
@@ -527,6 +610,7 @@ Crash Analyst (Charlie Miller / Halvar Flake)  Crash analysis and exploitability
 Security Researcher                            General adversarial code review
 Patch Engineer                                 Secure fix generation
 Penetration Tester                             Realistic attack scenario assessment
+Web Researcher (James Kettle)                  Web endpoint research (smuggling, cache poisoning, SSRF)
 Fuzzing Strategist                             Corpus design and triage
 Binary Exploitation Specialist                 ROP, heap, and memory corruption
 ```
@@ -545,6 +629,8 @@ See `docs/README.md` for the full index. Key guides:
 | `docs/architecture.md` | Codebase structure and directory tree |
 | `docs/llm.md` | LLM provider configuration, Bedrock, multi-model workflows |
 | `docs/sandbox.md` | Process isolation: profiles, Landlock, namespaces |
+| `docs/troubleshooting.md` | Self-test, sandbox setup errors (mount-ns/uidmap on Ubuntu 24.04+), EDR interaction |
+| `docs/agent-security.md` | Agent capabilities, tool boundaries, network controls, human approval |
 | `docs/audit.md` | Systematic code review: hypotheses, tools, strategies, gates |
 | `docs/validation.md` | Exploitability validation pipeline (stages 0--1) |
 | `docs/static-analysis.md` | Semgrep and Coccinelle rules |
@@ -591,3 +677,24 @@ MIT -- Copyright (c) 2025-2026 Gadi Evron, Daniel Cuthbert, Thomas Dullien (Halv
 See LICENSE for the full text. Review the licences for all dependencies before commercial use -- CodeQL in particular does not permit it.
 
 **Issues:** https://github.com/gadievron/raptor/issues
+
+
+---
+
+## Python Dependencies
+
+RAPTOR uses `pyproject.toml` and `uv.lock` as the source of truth for
+Python dependencies. The checked-in `requirements.txt` remains as a
+compatibility export for users who prefer `pip install`.
+
+Useful installs:
+
+```bash
+uv sync --locked                            # core runtime
+uv sync --locked --group dev                # tests + linting
+uv sync --locked --extra web                # /web scanner support
+uv sync --locked --extra "web smt llm sage" # optional stacks
+```
+
+Keeping `/web`, Z3, SAGE and cloud provider SDKs as optional extras avoids
+making the default RAPTOR install heavier and more brittle than it needs to be.

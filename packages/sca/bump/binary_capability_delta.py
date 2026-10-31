@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from core.binary import diff_binary_capabilities
+from ..kinds import BUMP_ID_PREFIX
 from ..models import (
     Confidence,
     Dependency,
@@ -117,7 +118,7 @@ def binary_capability_delta_finding(
 
     return SupplyChainFinding(
         finding_id=(
-            f"sca:bump:binary_capability_delta:"
+            f"{BUMP_ID_PREFIX}binary_capability_delta:"
             f"{ecosystem}:{name}@{target_version}"
         ),
         kind="binary_capability_delta",

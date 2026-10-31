@@ -65,6 +65,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .kinds import SCA_PREFIX
+from .parsers._base import PARSE_ESCAPE_ERRORS
+from .parsers._safe_read import read_bounded
+from .registries._negative_cache import should_negative_cache
 from .models import (
     Confidence,
     Dependency,
@@ -168,10 +172,18 @@ def load_policy(target: Path) -> LicensePolicy:
             "policy file at %s, using default", path,
         )
         return DEFAULT_POLICY
+    # Bounded no-follow read: the policy file ships in the scanned
+    # tree (trust-gated by the pipeline, but the trusted path must be
+    # bounded and must not follow a committed symlink either).
+    text = read_bounded(path, follow_symlinks=False)
+    if text is None:
+        logger.warning(
+            "sca.license: failed to read %s — using default", path,
+        )
+        return DEFAULT_POLICY
     try:
-        text = path.read_text(encoding="utf-8")
         data = safe_load(text) or {}
-    except (OSError, yaml.YAMLError) as e:
+    except (yaml.YAMLError, *PARSE_ESCAPE_ERRORS) as e:  # hostile-input escape classes
         logger.warning(
             "sca.license: failed to read %s (%s) — using default",
             path, e,
@@ -473,7 +485,7 @@ def _evaluate_or(
     # All choices produced findings. If they're all DENY, the
     # OR is unambiguously denied. Otherwise it's "incompatible"
     # (operator should pick / configure one).
-    if all(f.kind == "license_denied" for _, f in classified):
+    if all(f.kind == "license_denied" for _, f in classified):  # type: ignore[union-attr]
         return _deny_finding(dep, spdx)
     return LicenseFinding(
         finding_id=_finding_id(dep, "license_incompatible"),
@@ -519,11 +531,17 @@ def _classify(
     if " WITH " in spdx:
         base = spdx.split(" WITH ", 1)[0].strip()
         return _classify(dep, base, policy)
-    if spdx in policy.deny:
+    # SPDX license identifiers are case-insensitive by spec, and
+    # registries report them in every casing ("agpl-3.0",
+    # "Agpl-3.0-Only"). A case-sensitive compare silently bypassed
+    # the operator's deny/warn lists — the non-canonical spelling
+    # fell through to the (default-allow) fallback.
+    spdx_l = spdx.lower()
+    if spdx_l in {d.lower() for d in policy.deny}:
         return _deny_finding(dep, spdx)
-    if spdx in policy.warn:
+    if spdx_l in {w.lower() for w in policy.warn}:
         return _warn_finding(dep, spdx)
-    if spdx in policy.allow:
+    if spdx_l in {a.lower() for a in policy.allow}:
         return None
     # Unmatched — apply default.
     if policy.default == "deny":
@@ -583,7 +601,7 @@ def _unknown_finding(
             f"No license metadata for {dep.ecosystem}:{dep.name}"
             f"@{dep.version or '*'} — registry returned no SPDX field"
         ),
-        severity=severity,
+        severity=severity,  # type: ignore[arg-type]
         confidence=Confidence(
             "medium",
             reason="declared_license is None after enrichment",
@@ -615,7 +633,7 @@ def _unparseable_finding(
             f"Unparseable SPDX license expression {spdx!r} — "
             f"cannot evaluate it against the license policy"
         ),
-        severity=severity,
+        severity=severity,  # type: ignore[arg-type]
         confidence=Confidence(
             "medium",
             reason="declared license expression failed SPDX parsing",
@@ -625,7 +643,7 @@ def _unparseable_finding(
 
 def _finding_id(dep: Dependency, kind: str) -> str:
     return (
-        f"sca:{kind}:{dep.ecosystem}:{dep.name}@{dep.version or '*'}"
+        f"{SCA_PREFIX}{kind}:{dep.ecosystem}:{dep.name}@{dep.version or '*'}"
         f":{dep.declared_in}"
     )
 
@@ -869,8 +887,15 @@ def _fetch_maven_license(
     )
     try:
         body = http.get_bytes(pom_url, max_bytes=2 * 1024 * 1024)
-    except Exception:                                   # noqa: BLE001
-        if cache is not None:
+    except Exception as e:                              # noqa: BLE001
+        # Negative-cache ONLY authoritative not-found (404/410). A
+        # timeout/5xx says nothing about the artifact's license;
+        # caching it as "" mints ``license_unknown`` (info under the
+        # default policy) for the full TTL — a ``--fail-on-license
+        # high`` gate then passes a denied-license dep on one blip.
+        # Transient failures stay uncached so the next run retries
+        # (the crates fetcher's behaviour, same file).
+        if cache is not None and should_negative_cache(e):
             cache.put(cache_key, "", ttl_seconds=24 * 3600)
         return None
 
@@ -998,8 +1023,9 @@ def _fetch_nuget_license(
             f"{_quote_seg(name.lower())}/{_quote_seg(version)}.json"
         )
         data = http.get_json(url)
-    except Exception:                                   # noqa: BLE001
-        if cache is not None:
+    except Exception as e:                              # noqa: BLE001
+        # Authoritative not-found only — see the maven fetcher above.
+        if cache is not None and should_negative_cache(e):
             cache.put(cache_key, "", ttl_seconds=24 * 3600)
         return None
     # registration5 entries embed the catalog entry inline.
@@ -1045,8 +1071,9 @@ def _fetch_packagist_license(
         url = (f"https://repo.packagist.org/p2/"
                f"{_quote_seg(name, safe='/')}.json")
         data = http.get_json(url)
-    except Exception:                                   # noqa: BLE001
-        if cache is not None:
+    except Exception as e:                              # noqa: BLE001
+        # Authoritative not-found only — see the maven fetcher above.
+        if cache is not None and should_negative_cache(e):
             cache.put(cache_key, "", ttl_seconds=24 * 3600)
         return None
     packages = (data or {}).get("packages") if isinstance(data, dict) else None

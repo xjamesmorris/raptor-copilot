@@ -172,3 +172,18 @@ class TestJulietProbeAndWindow:
         f = tmp_path / "T.java"
         f.write_text("alpha\nomega")
         assert _read_clean_source({"file": str(f)}, None) == "alpha\nomega"
+
+
+class TestReadCleanSourceContainment:
+    def test_relative_entry_joins_root(self, tmp_path):
+        from core.recall.census import _read_clean_source
+        (tmp_path / "T.java").write_text("alpha")
+        assert _read_clean_source({"file": "T.java"}, tmp_path) == "alpha"
+
+    def test_escaping_relative_entry_unreadable(self, tmp_path):
+        from core.recall.census import _read_clean_source
+        (tmp_path / "outside.java").write_text("secret")
+        root = tmp_path / "corpus"
+        root.mkdir()
+        got = _read_clean_source({"file": "../outside.java"}, root)
+        assert got is None

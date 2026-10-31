@@ -88,6 +88,32 @@ class TestCollectAgentic:
         rec = _record(is_exploitable=False, exploitable=False)
         assert collect_agentic_findings([rec]) == []
 
+    def test_junk_verdict_shapes_excluded(self):
+        # analysed_results.json is operator-supplied JSON: a non-bool
+        # verdict shape is a non-verdict, not an exploitable claim —
+        # pre-fix a truthy "yes" exported the record.
+        rec = _record(is_true_positive="yes", exploitable=False,
+                      is_exploitable=False)
+        assert collect_agentic_findings([rec]) == []
+        rec = _record(is_exploitable="yes", exploitable=False)
+        assert collect_agentic_findings([rec]) == []
+
+    def test_junk_alias_shapes_excluded(self):
+        # The legacy ``exploitable`` alias follows the same
+        # genuine-bool rule (agentic_passes precedent) — pre-fix the
+        # alias kept a truthy contract and the junk string "no"
+        # exported the record as exploitable.
+        for junk in ("no", "yes", 1, [1], {"x": 1}):
+            rec = _record(is_exploitable=False, exploitable=junk)
+            assert collect_agentic_findings([rec]) == [], junk
+
+    def test_analysis_verdict_fallback_on_junk_result_field(self):
+        # A junk result-level is_true_positive falls back to the
+        # nested analysis copy (junk = abstention, not a block).
+        rec = _record(is_true_positive="junk")
+        rec["analysis"]["is_true_positive"] = True
+        assert len(collect_agentic_findings([rec])) == 1
+
     def test_null_analysis_survives(self):
         # Prep-mode records serialize "analysis": null — the collector
         # must not crash and falls back to the scanner message.
@@ -229,3 +255,23 @@ class TestRedbCacheCandidates:
         assert len(candidates) == 2
         assert "ghidra-target" in str(candidates[0])
         assert "ghidra-import-target" in str(candidates[1])
+
+
+class TestRedbCandidatesOutBase:
+    def test_fallback_candidate_uses_configured_out_base(
+            self, tmp_path, monkeypatch):
+        # A bare Path("out/...") resolved against the process CWD —
+        # callers outside the repo root missed the cache and context
+        # injection silently disabled itself.
+        from packages.ghidra.roundtrip import redb_cache_candidates
+
+        out_base = tmp_path / "custom-out"
+        from core.config import RaptorConfig
+        monkeypatch.setattr(
+            RaptorConfig, "get_out_dir", staticmethod(lambda: out_base))
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+        cands = redb_cache_candidates(tmp_path / "proj.gpr")
+        expected = out_base / "ghidra-import-proj" / "re-database.json"
+        assert expected in cands

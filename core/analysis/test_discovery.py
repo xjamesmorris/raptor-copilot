@@ -19,8 +19,73 @@ logger = logging.getLogger(__name__)
 # ``regress`` covers the OpenBSD/openssh convention (openssh ships a
 # 200+ file ``regress/`` tree; without the pattern the whole suite was
 # invisible to discovery).
-_TEST_DIR_PATTERNS = ("test_", "tests", "test", "spec", "specs", "regress")
-_TEST_FILE_PATTERNS = re.compile(r"(?:test_\w+|_test)\.\w+$")
+_TEST_DIR_PATTERNS = ("test_", "tests", "test", "testing", "spec",
+                      "specs", "regress")
+
+# Exact-name-only test dirs, no separator variants: ``t`` is the
+# Perl / git convention — giving it the ``t_*`` / ``t-*`` semantics of
+# the patterns above would claim far too many unrelated directories.
+_EXACT_TEST_DIR_NAMES = ("t",)
+
+
+def _dir_matches_test_pattern(part: str) -> bool:
+    """Exact or separator-delimited match against the dir patterns.
+
+    A bare prefix match classified ``special/`` (spec) and
+    ``testimonials/`` (test) as test trees — heuristic FPs that then
+    joined the discovery denominator. Patterns ending in ``_``
+    (``test_``) keep their prefix semantics; the rest match exactly or
+    with a ``_``/``-`` separator (``tests-unit``). ``testing`` joined
+    the list explicitly since it no longer rides the ``test`` prefix.
+    """
+    if part in _EXACT_TEST_DIR_NAMES:
+        return True
+    for pat in _TEST_DIR_PATTERNS:
+        if part == pat:
+            return True
+        if pat.endswith("_"):
+            if part.startswith(pat):
+                return True
+        elif part.startswith((pat + "_", pat + "-")):
+            return True
+    return False
+
+
+def _in_recognized_test_tree(dir_parts: tuple[str, ...]) -> bool:
+    """True when any enclosing directory is a recognized test dir.
+
+    Single provenance predicate for both the discovery walk and the
+    per-case ``in_test_tree`` stamp — the two must never diverge, or a
+    file could be admitted under one rule and trust-graded under
+    another.
+    """
+    return any(_dir_matches_test_pattern(part) for part in dir_parts)
+
+
+def _resolves_within(path: Path, root: Path) -> bool:
+    """Whether *path* resolves inside *root* (which must be resolved).
+
+    A tests/-dir entry that is a symlink to a file OUTSIDE the repo
+    root carries content the repo's test tree does not actually
+    contain — it must not inherit in-tree provenance from the
+    symlink's location. Directory symlinks are not the concern here:
+    the discovery walk does not follow them.
+    """
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    return resolved.is_relative_to(root)
+
+
+# ``\w+Test.php`` is the PHPUnit file convention (class-per-file,
+# suffix mandatory for the default phpunit.xml discovery); the
+# prefix/suffix ``test`` shapes cover the rest of the ecosystems.
+# Name stems bounded at 256: an unbounded \w+ re-scans a hostile
+# name run from every position — quadratic — and real filesystem
+# components cap at 255 bytes anyway.
+_TEST_FILE_PATTERNS = re.compile(
+    r"(?:test_\w{1,256}|_test)\.\w+$|\w{1,256}Test\.php$")
 # Languages the extraction heuristics below understand. Test-tree files
 # in other languages are counted and reported as skipped, not silently
 # dropped — a huge native test suite used to surface as "found 0 test
@@ -30,9 +95,13 @@ _SUPPORTED_EXTENSIONS = (
     ".py", ".js", ".ts", ".go", ".rs", ".rb", ".java",
     # C/C++ test conventions (regress/, tests/, *_test.c, test_*.c).
     ".c", ".cc", ".cpp", ".cxx",
+    # PHP test conventions (tests/, *Test.php, PHPUnit test* methods).
+    ".php",
 )
 _ASSERT_PATTERN = re.compile(
-    r"^\s*(?:assert(?:Equal|True|False|Raises|In|NotIn|Is|IsNot|Greater|Less"
+    # Horizontal-only indent — the MULTILINE ^\s* idiom is quadratic
+    # on blank-line runs in scanned source.
+    r"^[^\S\n]*(?:assert(?:Equal|True|False|Raises|In|NotIn|Is|IsNot|Greater|Less"
     r"|Regex|Almost|Count|Contains|Not)?|self\.assert\w+|expect\(|assert |"
     # C-family assertion conventions: libc assert(), openssh-style
     # ASSERT_INT_EQ / ASSERT_PTR_NE, gtest EXPECT_*/ASSERT_*, check's
@@ -40,7 +109,10 @@ _ASSERT_PATTERN = re.compile(
     # ecosystem vocabulary (like the def/fn/func keywords above), not
     # project-specific API lists.
     r"assert\(|ASSERT_\w+\s*\(|EXPECT_\w+\s*\(|ck_assert\w*\s*\(|"
-    r"CU_ASSERT\w*\s*\(|TEST_ASSERT\w*\s*\()"
+    r"CU_ASSERT\w*\s*\(|TEST_ASSERT\w*\s*\(|"
+    # PHPUnit: instance and static assertion/expectation styles.
+    r"\$this\s*->\s*(?:assert|expect)\w+\s*\(|"
+    r"(?:self|static)::assert\w+\s*\()"
     r"(.+)",
     re.MULTILINE,
 )
@@ -53,6 +125,27 @@ _TEST_FUNC_PATTERN = re.compile(
     r"(?:def|function|fn|func)\s+(test_\w+)"
     r"|(?:static\s+)?(?:void|int|bool)\s+\**(test_\w+|\w+_tests?)\s*\(",
 )
+# PHP variant: ``test[A-Z]\w*`` adds the PHPUnit camelCase method
+# convention (uppercase continuation required, so ``tester``/
+# ``testify`` helpers don't read as tests). Enabled for .php ONLY:
+# in the other ecosystems a lowercase-``test`` camel name is a helper
+# convention, not a test — Go's real tests are ``TestXxx`` and its
+# ``testAccCheck*`` acceptance helpers, JS ``testSetup``-style
+# helpers, and Python's unittest camel methods would either fabricate
+# targets or change long-standing base behaviour.
+_PHP_TEST_FUNC_PATTERN = re.compile(
+    r"(?:def|function|fn|func)\s+(test_\w+|test[A-Z]\w*)"
+    r"|(?:static\s+)?(?:void|int|bool)\s+\**(test_\w+|\w+_tests?)\s*\(",
+)
+# PHP construct / ubiquitous stdlib noise the ``name(`` heuristic
+# would misread as targets in PHPUnit test bodies. Applied to .php
+# only — in other languages these are legitimate project-function
+# names (a Python suite calling its own count() keeps the mapping).
+_PHP_CALL_NOISE = frozenset({
+    "isset", "empty", "unset", "array",
+    "count", "sprintf", "implode", "explode",
+    "in_array", "array_merge",
+})
 
 
 @dataclass
@@ -65,6 +158,14 @@ class TestCase:
     test_function: str
     target_function: str
     assertions: List[str] = field(default_factory=list)
+    #: Whether the defining file sits under a recognized test dir
+    #: (tests/, regress/, ...). Loose test_* / *_test files elsewhere
+    #: in the tree are still discovered — they must be reviewed as
+    #: code — but their location is the only mechanical provenance
+    #: signal, so spec inference demotes their assertions instead of
+    #: granting executable-spec trust. Defaults False: a case whose
+    #: provenance is unknown must never be promoted.
+    in_test_tree: bool = False
 
 
 def discover_tests(
@@ -96,15 +197,23 @@ def discover_tests(
     result: Dict[str, List[TestCase]] = {}
 
     for test_file in test_files:
-        rel_path = str(test_file.relative_to(target))
+        rel = test_file.relative_to(target)
+        rel_path = str(rel)
+        in_tree = (
+            _in_recognized_test_tree(rel.parent.parts)
+            and _resolves_within(test_file, target)
+        )
         try:
             source = test_file.read_text(errors="replace")
         except OSError:
             continue
 
-        test_funcs = _extract_test_functions(source)
+        suffix = test_file.suffix.lower()
+        test_funcs = _extract_test_functions(source, suffix)
         for test_func_name, test_body in test_funcs:
-            targets = _infer_target_functions(test_func_name, test_body)
+            targets = _infer_target_functions(
+                test_func_name, test_body, suffix,
+            )
             assertions = _extract_assertions(test_body)
 
             for target_fn in targets:
@@ -113,6 +222,7 @@ def discover_tests(
                     test_function=test_func_name,
                     target_function=target_fn,
                     assertions=assertions[:10],
+                    in_test_tree=in_tree,
                 )
                 result.setdefault(target_fn, []).append(tc)
 
@@ -198,8 +308,14 @@ def discover_tests_cached(
                     TestCase(
                         test_file=tc.get("test_file", ""),
                         test_function=tc.get("test_function", ""),
-                        target_function=tc.get("target_function", fn),
+                        target_function=str(tc.get("target_function") or fn),
                         assertions=list(tc.get("assertions") or []),
+                        # Deliberately strict: a cache written before
+                        # provenance existed carries no location trust
+                        # grade — the KeyError degrades to the re-scan
+                        # below, which recomputes it from disk rather
+                        # than guessing either direction.
+                        in_test_tree=bool(tc["in_test_tree"]),
                     )
                     for tc in cases
                     if isinstance(tc, dict)
@@ -233,6 +349,7 @@ def discover_tests_cached(
                     "test_function": tc.test_function,
                     "target_function": tc.target_function,
                     "assertions": tc.assertions,
+                    "in_test_tree": tc.in_test_tree,
                 }
                 for tc in cases
             ]
@@ -258,11 +375,22 @@ def format_tests_for_context(
             f"({assertion_count} assertions total)."
         )
 
+    from core.security.prompt_envelope import neutralize_tag_forgery
+
     lines = [f"**{len(tests)} test(s):**"]
     for t in tests[:5]:
-        lines.append(f"- `{t.test_function}` in `{t.test_file}`")
+        # File names are repo-controlled and POSIX permits newlines
+        # and `<` in them: collapse whitespace first (a raw newline
+        # would mint a fresh line start inside the trusted block),
+        # then neutralize — neutralization always last. The function
+        # name needs neither: extraction constrains it to \w+.
+        fname = neutralize_tag_forgery(" ".join(t.test_file.split()))
+        lines.append(f"- `{t.test_function}` in `{fname}`")
         for a in t.assertions[:3]:
-            lines.append(f"  - assert: {a}")
+            # Assertion text is lifted verbatim from repo files — in a
+            # hostile repo it can carry envelope-tag / heading forgery
+            # aimed at the trusted prompt region this renders into.
+            lines.append(f"  - assert: {neutralize_tag_forgery(a)}")
 
     return "\n".join(lines)
 
@@ -276,7 +404,8 @@ def _find_test_files(target: Path) -> tuple[List[Path], int]:
     summary on a large native suite is attributable to the language
     boundary rather than looking like a discovery bug.
     """
-    test_files: List[Path] = []
+    in_tree_files: List[Path] = []
+    loose_files: List[Path] = []
     skipped_unsupported = 0
 
     for root, dirs, files in os.walk(str(target)):
@@ -284,15 +413,19 @@ def _find_test_files(target: Path) -> tuple[List[Path], int]:
         rel = root_path.relative_to(target)
         parts = rel.parts
 
+        # Prune skipped subtrees IN PLACE so os.walk doesn't descend
+        # them — the `continue` alone still paid the full walk cost of
+        # .git / node_modules / vendor trees on big vendored repos.
+        dirs[:] = [d for d in dirs
+                   if not d.startswith(".")
+                   and d not in ("node_modules", "vendor")]
+
         if any(p.startswith(".") for p in parts):
             continue
         if "node_modules" in parts or "vendor" in parts:
             continue
 
-        is_test_dir = any(
-            any(part.startswith(pat) or part == pat for pat in _TEST_DIR_PATTERNS)
-            for part in parts
-        )
+        is_test_dir = _in_recognized_test_tree(parts)
 
         for fname in files:
             if not fname.endswith(_SUPPORTED_EXTENSIONS):
@@ -301,17 +434,39 @@ def _find_test_files(target: Path) -> tuple[List[Path], int]:
                 continue
             if is_test_dir or _TEST_FILE_PATTERNS.search(fname):
                 fpath = root_path / fname
-                if fpath.stat().st_size < 500_000:
-                    test_files.append(fpath)
+                try:
+                    size = fpath.stat().st_size
+                except OSError:
+                    # Dangling symlink / vanished file in the scanned
+                    # repo: skip the entry, keep the pass — one bad
+                    # entry used to abort the whole discovery walk
+                    # (ALL test evidence for the target lost).
+                    continue
+                if size < 500_000:
+                    if is_test_dir:
+                        in_tree_files.append(fpath)
+                    else:
+                        loose_files.append(fpath)
 
-    return test_files[:500], skipped_unsupported
+    # The result cap must not be walk-ordered: enough planted loose
+    # test files sorting ahead of tests/ in the walk would evict the
+    # entire curated suite from the capped set. Recognized test trees
+    # take the cap first; loose files fill the remainder.
+    return (in_tree_files + loose_files)[:500], skipped_unsupported
 
 
-def _extract_test_functions(source: str) -> List[tuple]:
-    """Extract test function names and their bodies from source."""
+def _extract_test_functions(source: str, suffix: str = "") -> List[tuple]:
+    """Extract test function names and their bodies from source.
+
+    ``suffix`` selects per-language openers: .php gains the PHPUnit
+    camelCase convention; every other language keeps the base set.
+    """
     results = []
 
-    func_starts = list(_TEST_FUNC_PATTERN.finditer(source))
+    pattern = (
+        _PHP_TEST_FUNC_PATTERN if suffix == ".php" else _TEST_FUNC_PATTERN
+    )
+    func_starts = list(pattern.finditer(source))
     for i, match in enumerate(func_starts):
         # Group 1: keyword-introduced definitions; group 2: C-family.
         name = match.group(1) or match.group(2)
@@ -326,16 +481,26 @@ def _extract_test_functions(source: str) -> List[tuple]:
 def _infer_target_functions(
     test_name: str,
     test_body: str,
+    file_suffix: str = "",
 ) -> List[str]:
     """Infer which function(s) a test exercises.
 
     Uses naming convention: test_<function_name>[_suffix].
+    ``file_suffix`` scopes per-language call-reference noise: the PHP
+    stoplist applies to .php bodies only, so a project function that
+    shares a PHP builtin's name (``count``, ``sprintf``) keeps its
+    call-reference mapping in every other language.
     """
     targets = []
 
     stripped = test_name
     if stripped.startswith("test_"):
         stripped = stripped[5:]
+    elif re.match(r"test[A-Z]", stripped):
+        # PHPUnit camelCase convention: testFindUser exercises
+        # findUser.
+        rest = stripped[4:]
+        stripped = rest[0].lower() + rest[1:]
     elif stripped.endswith(("_tests", "_test")):
         # C-family suffix convention (``sshkey_tests``): the driver
         # name itself is not a target; call references in the body
@@ -352,14 +517,23 @@ def _infer_target_functions(
     if stripped and len(stripped) >= 2:
         targets.append(stripped)
 
-    calls = re.findall(r"(\w{2,})\s*\(", test_body)
+    php = file_suffix == ".php"
+    # \b pins the callee name to a word start: without it an
+    # unanchored scan restarts inside every identifier suffix —
+    # quadratic on a long token — and the dropped mid-word starts
+    # were never real callee names.
+    calls = re.findall(r"\b(\w{2,})\s*\(", test_body)
     for call in calls:
         if (
-            call in test_body
-            and call != test_name  # the definition line matches too
+            call != test_name  # the definition line matches too
             and not call.startswith("test_")
             and not call.startswith("assert")
             and not call.startswith("self")
+            # PHPUnit expectation setup ($this->expectException(...))
+            # is assertion machinery, not a target — same treatment
+            # as the assert prefix above, .php-scoped.
+            and not (php and call.startswith("expect"))
+            and not (php and call in _PHP_CALL_NOISE)
             and call not in ("print", "len", "str", "int", "list",
                              "dict", "set", "range", "type", "isinstance",
                              "hasattr", "getattr", "setattr", "super",

@@ -6,7 +6,6 @@ The earlier draft of this design tried a ``verdict`` field with
 short-circuit behaviour; it was rejected because collapsing the
 suppression decision to a single LLM call is the worst class of
 failure for security tooling.
-for the rationale.
 
 Three records:
 
@@ -40,6 +39,8 @@ from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
 
 from core.json import dumps_artifact, loads
+
+from core.dataflow._schema_checks import check_extra_fields, require_nonempty
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -123,17 +124,11 @@ _EVIDENCE_KEYS: frozenset[str] = frozenset(
 )
 
 
-def _check_extra_fields(name: str, data: Mapping[str, Any], allowed: frozenset[str]) -> None:
-    extras = set(data.keys()) - allowed
-    if extras:
-        msg = f"unknown fields in {name} JSON: {sorted(extras)}"
-        raise ValueError(msg)
-
-
-def _require_nonempty(label: str, value: str) -> None:
-    if not isinstance(value, str) or not value.strip():
-        msg = f"{label} must be a non-empty string"
-        raise ValueError(msg)
+# Strict from_dict checks — shared with the sibling value modules via
+# core.dataflow._schema_checks (local underscore names kept: they are
+# these modules' call-site and patch seams).
+_check_extra_fields = check_extra_fields
+_require_nonempty = require_nonempty
 
 
 @dataclass(frozen=True)

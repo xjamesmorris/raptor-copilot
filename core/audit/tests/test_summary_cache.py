@@ -188,6 +188,16 @@ class TestDetectLibraryVersion:
         )
         assert detect_library_version(tmp_path, "gin") == "1.9.1"
 
+    def test_non_utf8_manifest_still_parses(self, tmp_path):
+        # Target-controlled manifests are not guaranteed UTF-8; a
+        # stray byte must not silently disable version detection for
+        # the whole file (read_text() with the default codec raised
+        # and the broad except skipped the manifest).
+        (tmp_path / "requirements.txt").write_bytes(
+            b"# caf\xe9 deps\ndjango==4.2.1\n"
+        )
+        assert detect_library_version(tmp_path, "django") == "4.2.1"
+
     def test_go_mod_no_substring_match(self, tmp_path):
         """"crypto" must match golang.org/x/crypto, not cryptoutil."""
         (tmp_path / "go.mod").write_text(

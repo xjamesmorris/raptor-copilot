@@ -1,0 +1,121 @@
+{
+  "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Documents/CommitteeSpecifications/2.1.0/sarif-schema-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "compiler",
+          "fullName": "Compiler static analyzers (gcc -fanalyzer / clang --analyze)",
+          "rules": [
+            {
+              "id": "-Wanalyzer-null-dereference",
+              "name": "-Wanalyzer-null-dereference",
+              "shortDescription": {
+                "text": "-Wanalyzer-null-dereference"
+              },
+              "fullDescription": {
+                "text": "Compiler static-analyzer diagnostic -Wanalyzer-null-dereference"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "properties": {
+                "cwe": "CWE-476",
+                "tags": [
+                  "external/cwe/cwe-476"
+                ]
+              }
+            },
+            {
+              "id": "core.CallAndMessage",
+              "name": "core.CallAndMessage",
+              "shortDescription": {
+                "text": "core.CallAndMessage"
+              },
+              "fullDescription": {
+                "text": "Compiler static-analyzer diagnostic core.CallAndMessage"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            }
+          ]
+        }
+      },
+      "results": [
+        {
+          "ruleId": "-Wanalyzer-null-dereference",
+          "level": "warning",
+          "message": {
+            "text": "dereference of NULL 'p'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/a.c"
+                },
+                "region": {
+                  "startLine": 12
+                }
+              }
+            }
+          ],
+          "properties": {
+            "tool": "compiler",
+            "compiler": "gcc",
+            "cwe": "CWE-476"
+          }
+        },
+        {
+          "ruleId": "-Wanalyzer-null-dereference",
+          "level": "warning",
+          "message": {
+            "text": "-Wanalyzer-null-dereference diagnostic"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/b.c"
+                },
+                "region": {
+                  "startLine": 40
+                }
+              }
+            }
+          ],
+          "properties": {
+            "tool": "compiler",
+            "compiler": "gcc",
+            "cwe": "CWE-476"
+          }
+        },
+        {
+          "ruleId": "core.CallAndMessage",
+          "level": "warning",
+          "message": {
+            "text": "uninitialized argument"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/c.cc"
+                },
+                "region": {
+                  "startLine": 7
+                }
+              }
+            }
+          ],
+          "properties": {
+            "tool": "compiler",
+            "compiler": "clang"
+          }
+        }
+      ]
+    }
+  ]
+}

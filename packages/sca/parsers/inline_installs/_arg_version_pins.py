@@ -45,6 +45,7 @@ import re
 from pathlib import Path
 
 from ...models import Confidence, Dependency, PinStyle
+from core.source.lines import split_lines
 
 
 # ``ARG <NAME>=<value>`` optionally followed by a comment. Captures:
@@ -70,8 +71,13 @@ _ARG_RE = re.compile(
 # Operator override inside the comment:
 #   # raptor-sca: PyPI:semgrep
 #   # raptor-sca: skip
+# The spec head is non-space ([\w.-]): the class overlapped the
+# leading whitespace run on spaces, so a space-storm row cost
+# every split of the run — quadratic. The dropped corner is a
+# whitespace-only override name (garbage, not a spec); interior
+# spaces still match.
 _OVERRIDE_RE = re.compile(
-    r"raptor-sca:\s*(?P<spec>skip|[\w. -]+:[\w/@.\-+_]+)"
+    r"raptor-sca:\s*(?P<spec>skip|[\w.-][\w. -]*:[\w/@.\-+_]+)"
 )
 
 
@@ -132,7 +138,7 @@ def extract(text: str, path: Path) -> list[Dependency]:
     we can't query.
     """
     deps: list[Dependency] = []
-    for line_no, raw in enumerate(text.splitlines(), start=1):
+    for line_no, raw in enumerate(split_lines(text), start=1):
         # rstrip is part of the regex contract — see ``_ARG_RE``.
         match = _ARG_RE.match(raw.rstrip())
         if match is None:

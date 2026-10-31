@@ -79,46 +79,50 @@ def _setup_target(tmp_path: Path):
 
 
 class TestGetReviewedSet:
+    """Rows are appended through the legitimate writer
+    (``append_audit_log``), which stamps the per-purpose integrity
+    token — suppression authority requires it (see the forged/
+    tampered cases at the end)."""
+
     def test_empty_log(self, tmp_path: Path):
         result = get_reviewed_set(tmp_path)
         assert result == set()
 
     def test_reads_record_actions(self, tmp_path: Path):
-        log = tmp_path / ".audit-log.jsonl"
-        log.write_text(
-            '{"action":"record","key":"src/auth.c:check_pw"}\n'
-            '{"action":"context","key":"src/auth.c:validate"}\n'
-            '{"action":"record","key":"src/util.c:helper"}\n'
-        )
+        from core.audit.record import append_audit_log
+        append_audit_log(tmp_path, {"action": "record",
+                                    "key": "src/auth.c:check_pw"})
+        append_audit_log(tmp_path, {"action": "context",
+                                    "key": "src/auth.c:validate"})
+        append_audit_log(tmp_path, {"action": "record",
+                                    "key": "src/util.c:helper"})
         result = get_reviewed_set(tmp_path)
         assert "src/auth.c:check_pw" in result
         assert "src/util.c:helper" in result
         assert "src/auth.c:validate" not in result
 
     def test_reads_orchestrator_review_actions(self, tmp_path: Path):
-        log = tmp_path / ".audit-log.jsonl"
-        log.write_text(
-            '{"action":"orchestrator_review","key":"src/auth.c:check_pw"}\n'
-            '{"action":"context","key":"src/auth.c:validate"}\n'
-        )
+        from core.audit.record import append_audit_log
+        append_audit_log(tmp_path, {"action": "orchestrator_review",
+                                    "key": "src/auth.c:check_pw"})
+        append_audit_log(tmp_path, {"action": "context",
+                                    "key": "src/auth.c:validate"})
         result = get_reviewed_set(tmp_path)
         assert "src/auth.c:check_pw" in result
         assert "src/auth.c:validate" not in result
 
     def test_lined_key_produces_bare_fallback(self, tmp_path: Path):
-        log = tmp_path / ".audit-log.jsonl"
-        log.write_text(
-            '{"action":"orchestrator_review","key":"sql.go:Scan:3232"}\n'
-        )
+        from core.audit.record import append_audit_log
+        append_audit_log(tmp_path, {"action": "orchestrator_review",
+                                    "key": "sql.go:Scan:3232"})
         result = get_reviewed_set(tmp_path)
         assert "sql.go:Scan:3232" in result
         assert "sql.go:Scan" in result
 
     def test_bare_key_no_spurious_strip(self, tmp_path: Path):
-        log = tmp_path / ".audit-log.jsonl"
-        log.write_text(
-            '{"action":"orchestrator_review","key":"src/auth.c:check_pw"}\n'
-        )
+        from core.audit.record import append_audit_log
+        append_audit_log(tmp_path, {"action": "orchestrator_review",
+                                    "key": "src/auth.c:check_pw"})
         result = get_reviewed_set(tmp_path)
         assert "src/auth.c:check_pw" in result
         assert "src/auth.c" not in result
@@ -130,29 +134,122 @@ class TestGetReviewedSet:
         the caller function. Without the edge_callee screen the caller
         was treated as reviewed and its function review silently
         dropped from the workqueue (observed live on pinned targets)."""
-        log = tmp_path / ".audit-log.jsonl"
-        log.write_text(
-            '{"action":"orchestrator_review","key":"src/a.c:recv:66",'
-            '"status":"clean","edge_callee":"src/b.c:pull"}\n'
-            '{"action":"orchestrator_review","key":"src/a.c:send:20",'
-            '"status":"clean"}\n'
-        )
+        from core.audit.record import append_audit_log
+        append_audit_log(tmp_path, {
+            "action": "orchestrator_review", "key": "src/a.c:recv:66",
+            "status": "clean", "edge_callee": "src/b.c:pull"})
+        append_audit_log(tmp_path, {
+            "action": "orchestrator_review", "key": "src/a.c:send:20",
+            "status": "clean"})
         result = get_reviewed_set(tmp_path)
         assert "src/a.c:recv" not in result
         assert "src/a.c:recv:66" not in result
         assert "src/a.c:send" in result
 
     def test_error_status_excluded(self, tmp_path: Path):
-        log = tmp_path / ".audit-log.jsonl"
-        log.write_text(
-            '{"action":"orchestrator_review","key":"src/a.c:ok","status":"clean"}\n'
-            '{"action":"orchestrator_review","key":"src/b.c:fail","status":"error"}\n'
-            '{"action":"record","key":"src/c.c:also_fail","status":"error"}\n'
-        )
+        from core.audit.record import append_audit_log
+        append_audit_log(tmp_path, {"action": "orchestrator_review",
+                                    "key": "src/a.c:ok",
+                                    "status": "clean"})
+        append_audit_log(tmp_path, {"action": "orchestrator_review",
+                                    "key": "src/b.c:fail",
+                                    "status": "error"})
+        append_audit_log(tmp_path, {"action": "record",
+                                    "key": "src/c.c:also_fail",
+                                    "status": "error"})
         result = get_reviewed_set(tmp_path)
         assert "src/a.c:ok" in result
         assert "src/b.c:fail" not in result
         assert "src/c.c:also_fail" not in result
+
+    def test_dark_status_excluded(self, tmp_path: Path):
+        # ``dark`` is the unresolved gate-resolution bucket, written
+        # mid-loop and resolved by the POST-loop dark pass. A run
+        # interrupted between the flush and that pass persists dark
+        # rows; suppressing the key on resume left the function at
+        # "needs concrete verification" forever (the resumed
+        # segment's dark pass only walks its own outcomes).
+        from core.audit.record import append_audit_log
+        append_audit_log(tmp_path, {"action": "orchestrator_review",
+                                    "key": "src/a.c:ok",
+                                    "status": "clean"})
+        append_audit_log(tmp_path, {"action": "orchestrator_review",
+                                    "key": "src/b.c:pending",
+                                    "status": "dark"})
+        result = get_reviewed_set(tmp_path)
+        assert "src/a.c:ok" in result
+        assert "src/b.c:pending" not in result
+
+    def test_forged_unstamped_row_never_suppresses(self, tmp_path: Path):
+        """The log is target-writable mid-run and its rows are
+        declared telemetry; a hand-planted clean row (the journal's
+        forged-clean-row lever, one file over) must not silently drop
+        the function from the workqueue."""
+        log = tmp_path / ".audit-log.jsonl"
+        log.write_text(
+            '{"action":"record","status":"clean","key":"src/x.c:f"}\n'
+            '{"action":"orchestrator_review","status":"clean",'
+            '"key":"src/y.c:g"}\n'
+        )
+        assert get_reviewed_set(tmp_path) == set()
+
+    def test_tampered_row_never_suppresses(self, tmp_path: Path):
+        from core.audit.record import append_audit_log, load_audit_log
+        append_audit_log(tmp_path, {"action": "record",
+                                    "key": "src/a.c:real",
+                                    "status": "clean"})
+        rows = load_audit_log(tmp_path)
+        rows[0]["key"] = "src/b.c:forged"      # edit under a valid token
+        import json as _json
+        (tmp_path / ".audit-log.jsonl").write_text(
+            "\n".join(_json.dumps(r) for r in rows) + "\n")
+        assert get_reviewed_set(tmp_path) == set()
+
+    def test_cross_run_replay_never_suppresses(self, tmp_path: Path):
+        """A row legitimately stamped in run A, copied verbatim into
+        run B's log, must NOT suppress in run B: the audit-log lane
+        has no source-hash gate or fold to bound a replay, and a
+        sibling run's log carries exactly the file:function keys the
+        current workqueue would use. The MAC is run-bound."""
+        from core.audit.record import append_audit_log
+        run_a = tmp_path / "run-a"
+        run_b = tmp_path / "run-b"
+        run_a.mkdir()
+        run_b.mkdir()
+        append_audit_log(run_a, {"action": "record",
+                                 "key": "src/x.c:f",
+                                 "status": "clean"})
+        (run_b / ".audit-log.jsonl").write_bytes(
+            (run_a / ".audit-log.jsonl").read_bytes())
+        assert "src/x.c:f" in get_reviewed_set(run_a)
+        assert get_reviewed_set(run_b) == set()
+
+    def test_oversize_log_never_suppresses(self, tmp_path: Path):
+        """The log is suppression-authority input from the
+        sandbox-writable run dir — an over-budget trail loads as
+        nothing (over-review direction), same intake rule as the
+        journal's cap."""
+        from core.audit.record import append_audit_log
+        append_audit_log(tmp_path, {"action": "record",
+                                    "key": "src/x.c:f",
+                                    "status": "clean"})
+        log = tmp_path / ".audit-log.jsonl"
+        with log.open("ab") as f:
+            f.truncate(65 * 1024 * 1024)
+        assert get_reviewed_set(tmp_path) == set()
+
+    def test_collector_flush_rows_suppress(self, tmp_path: Path):
+        """The Collector's batched flush is the production writer of
+        orchestrator_review rows — its rows must carry the token and
+        keep their resume-suppression authority."""
+        from core.audit.collector import Collector
+        collector = Collector(
+            out_dir=tmp_path, target_path=tmp_path, run_id="r1")
+        collector._log_entries.append({
+            "action": "orchestrator_review",
+            "key": "src/a.c:reviewed", "status": "clean"})
+        collector._flush_audit_log()
+        assert "src/a.c:reviewed" in get_reviewed_set(tmp_path)
 
 
 @pytest.mark.slow
@@ -197,8 +294,13 @@ class TestRunOrchestrator:
     def test_resume_skips_reviewed(self, tmp_path: Path):
         target, out = _setup_target(tmp_path)
 
-        log = out / ".audit-log.jsonl"
-        log.write_text('{"action":"record","key":"src/auth.c:check_pw"}\n')
+        # Stamped via the production writer: resume only suppresses
+        # rows whose run-bound integrity token verifies — a raw
+        # unstamped line re-reviews by design (see
+        # test_forged_unstamped_row_never_suppresses).
+        from core.audit.record import append_audit_log
+        append_audit_log(out, {"action": "record",
+                               "key": "src/auth.c:check_pw"})
 
         def review_fn(ctx, config):
             return ReviewOutcome(
@@ -874,6 +976,60 @@ class TestConstraintWiring:
         assert not (out / "constraints.json").exists()
 
 
+class TestExtractAndPropagate:
+    """The propagation-result consumption seam in _extract_and_propagate."""
+
+    def _outcome_with_constraint(self):
+        return ReviewOutcome(
+            file="src/auth.c",
+            function="check_pw",
+            status="suspicious",
+            body="needs bounds check",
+            review_result={
+                "constraints": [
+                    {
+                        "kind": "parameter",
+                        "target": "len",
+                        "rule": "len must be <= 1024",
+                    },
+                ],
+            },
+        )
+
+    def test_depth_limited_status_lands_on_constraint(self):
+        """A depth-limited hop must mark the constraint, not fall
+        through as an ordinary unresolved result."""
+        from core.audit.orchestrator import _extract_and_propagate
+        from core.audit.propagation import PropagationConfig
+
+        constraints = _extract_and_propagate(
+            self._outcome_with_constraint(),
+            [],
+            {"files": []},
+            set(),
+            PropagationConfig(max_depth=0),
+        )
+        assert len(constraints) == 1
+        assert constraints[0].status == "depth_limited"
+        assert constraints[0].depth_reached == 0
+
+    def test_unresolved_constraint_stays_open(self):
+        """An unresolved hop (no inventory, no resolvers) leaves the
+        constraint open — nothing is derived, nothing is demoted."""
+        from core.audit.orchestrator import _extract_and_propagate
+        from core.audit.propagation import PropagationConfig
+
+        constraints = _extract_and_propagate(
+            self._outcome_with_constraint(),
+            [],
+            {"files": []},
+            set(),
+            PropagationConfig(max_depth=5),
+        )
+        assert len(constraints) == 1
+        assert constraints[0].status == "open"
+
+
 @pytest.mark.slow
 class TestPrefilterWiring:
     """Test that the prefilter is wired into the orchestrator loop."""
@@ -926,6 +1082,11 @@ class TestPrefilterWiring:
             )
 
         config = OrchestratorConfig(
+            # hermetic: prefilter wiring only — with Joern installed a
+            # live server spins up for this two-function target, and a
+            # loaded-host CPG build failure fails the review, whose
+            # error-retry recovery then double-counts the function.
+            joern_overrides={"enabled": False},
             target_path=target, out_dir=out, resume=False,
             prefilter=True, batch_sloc_threshold=0,
         )
@@ -949,6 +1110,8 @@ class TestPrefilterWiring:
             )
 
         config = OrchestratorConfig(
+            # hermetic: see the note on the prefilter=True siblings.
+            joern_overrides={"enabled": False},
             target_path=target, out_dir=out, resume=False,
             prefilter=False, batch_sloc_threshold=0,
         )
@@ -971,6 +1134,11 @@ class TestPrefilterWiring:
             )
 
         config = OrchestratorConfig(
+            # hermetic: prefilter wiring only — with Joern installed a
+            # live server spins up for this two-function target, and a
+            # loaded-host CPG build failure fails the review, whose
+            # error-retry recovery then double-counts the function.
+            joern_overrides={"enabled": False},
             target_path=target, out_dir=out, resume=False,
             prefilter=True, batch_sloc_threshold=0,
         )
@@ -995,6 +1163,11 @@ class TestPrefilterWiring:
             )
 
         config = OrchestratorConfig(
+            # hermetic: prefilter wiring only — with Joern installed a
+            # live server spins up for this two-function target, and a
+            # loaded-host CPG build failure fails the review, whose
+            # error-retry recovery then double-counts the function.
+            joern_overrides={"enabled": False},
             target_path=target, out_dir=out, resume=False,
             prefilter=True, batch_sloc_threshold=0,
         )
@@ -3487,12 +3660,12 @@ class TestToolChain:
         def mock_cocci(**kw):
             return SweepResult(
                 tool="coccinelle", file_path=kw.get("file_path", "<codebase>"),
-                function_name=kw["function_name"],
-                outcome="confirmed",
+                function_name="",
+                outcome="confirmed", matches=[{"line": 1}],
             )
 
         monkeypatch.setattr(orch_mod, "run_smt_verb_direct", mock_smt)
-        monkeypatch.setattr(orch_mod, "run_coccinelle_sweep", mock_cocci)
+        monkeypatch.setattr(orch_mod, "run_coccinelle_file_sweep", mock_cocci)
 
         chain = [
             {"type": "smt", "config": {"verb": "check-oob"}},
@@ -3521,12 +3694,12 @@ class TestToolChain:
         def mock_cocci(**kw):
             return SweepResult(
                 tool="coccinelle", file_path=kw.get("file_path", "<codebase>"),
-                function_name=kw["function_name"],
-                outcome="confirmed",
+                function_name="",
+                outcome="confirmed", matches=[{"line": 1}],
             )
 
         monkeypatch.setattr(orch_mod, "run_smt_verb_direct", mock_smt)
-        monkeypatch.setattr(orch_mod, "run_coccinelle_sweep", mock_cocci)
+        monkeypatch.setattr(orch_mod, "run_coccinelle_file_sweep", mock_cocci)
 
         chain = [
             {"type": "smt", "config": {"verb": "check-oob"}},
@@ -3557,12 +3730,12 @@ class TestToolChain:
         def mock_cocci(**kw):
             return SweepResult(
                 tool="coccinelle", file_path=kw.get("file_path", "<codebase>"),
-                function_name=kw["function_name"],
-                outcome="confirmed",
+                function_name="",
+                outcome="confirmed", matches=[{"line": 1}],
             )
 
         monkeypatch.setattr(orch_mod, "run_smt_verb_direct", mock_smt)
-        monkeypatch.setattr(orch_mod, "run_coccinelle_sweep", mock_cocci)
+        monkeypatch.setattr(orch_mod, "run_coccinelle_file_sweep", mock_cocci)
 
         chain = [
             {"type": "smt", "config": {"verb": "check-oob"}},
@@ -3593,17 +3766,19 @@ class TestJoernLiveQuery:
             source_method="parse_header", source_param="buf",
             sink_call="memcpy", sink_arg_idx=0,
         )
-        server.run_taint_query.return_value = [flow]
+        server.run_taint_queries_batch.return_value = [flow]
 
         result = _joern_live_query(server, "parse_header", ["memcpy"])
         assert len(result) == 1
         assert result[0].sink_call == "memcpy"
-        server.run_taint_query.assert_called_once()
-        call_args = server.run_taint_query.call_args
-        assert call_args[0] == ("parse_header", "memcpy")
+        server.run_taint_queries_batch.assert_called_once()
+        call_args = server.run_taint_queries_batch.call_args
+        assert call_args[0][0] == [("parse_header", "memcpy")]
         assert call_args[1]["timeout"] == 30
 
-    def test_live_query_short_circuits_on_first_hit(self):
+    def test_live_query_batches_all_sinks_in_one_submission(self):
+        """One batched call covers every sink; the budget scales
+        sublinearly with batch width (base x ceil(sqrt(N)))."""
         from unittest.mock import MagicMock
 
         from packages.joern.models import TaintFlow
@@ -3613,21 +3788,69 @@ class TestJoernLiveQuery:
             source_method="fn", source_param="x",
             sink_call="strcpy", sink_arg_idx=0,
         )
-        server.run_taint_query.return_value = [flow]
+        server.run_taint_queries_batch.return_value = [flow]
 
         result = _joern_live_query(server, "fn", ["strcpy", "memcpy"])
         assert len(result) == 1
-        server.run_taint_query.assert_called_once()
+        server.run_taint_queries_batch.assert_called_once()
+        call_args = server.run_taint_queries_batch.call_args
+        assert call_args[0][0] == [("fn", "strcpy"), ("fn", "memcpy")]
+        assert call_args[1]["timeout"] == 60  # 30 x ceil(sqrt(2))
+
+    def test_live_query_budget_sublinear_on_wide_menus(self):
+        """11 sinks (the widest dispatch menu) gets 4x the base, not
+        11x (per-sink loop) and not 1x (flat batch)."""
+        from unittest.mock import MagicMock
+
+        server = MagicMock()
+        server.run_taint_queries_batch.return_value = []
+        sinks = [f"sink_{i}" for i in range(11)]
+        _joern_live_query(server, "fn", sinks)
+        call_args = server.run_taint_queries_batch.call_args
+        assert call_args[1]["timeout"] == 120  # 30 x ceil(sqrt(11))
+
+    def test_live_query_single_sink_keeps_base_budget(self):
+        from unittest.mock import MagicMock
+
+        server = MagicMock()
+        server.run_taint_queries_batch.return_value = []
+        _joern_live_query(server, "fn", ["memcpy"])
+        call_args = server.run_taint_queries_batch.call_args
+        assert call_args[1]["timeout"] == 30
+
+    def test_live_query_multi_sink_returns_all_flows_sorted(self):
+        """The batch returns every sink's flows (the per-sink loop's
+        first-hit-wins returned only the first) in deterministic
+        order — strictly more evidence, same truthiness."""
+        from unittest.mock import MagicMock
+
+        from packages.joern.models import TaintFlow
+
+        strcpy_flow = TaintFlow(
+            source_method="fn", source_param="x",
+            sink_call="strcpy", sink_arg_idx=0,
+        )
+        memcpy_flow = TaintFlow(
+            source_method="fn", source_param="x",
+            sink_call="memcpy", sink_arg_idx=0,
+        )
+        server = MagicMock()
+        server.run_taint_queries_batch.return_value = [
+            strcpy_flow, memcpy_flow,
+        ]
+
+        result = _joern_live_query(server, "fn", ["strcpy", "memcpy"])
+        assert [f.sink_call for f in result] == ["memcpy", "strcpy"]
 
     def test_live_query_empty_when_no_flows(self):
         from unittest.mock import MagicMock
 
         server = MagicMock()
-        server.run_taint_query.return_value = []
+        server.run_taint_queries_batch.return_value = []
 
         result = _joern_live_query(server, "fn", ["memcpy", "strcpy"])
         assert result == []
-        assert server.run_taint_query.call_count == 2
+        server.run_taint_queries_batch.assert_called_once()
 
     def test_live_query_rejects_invalid_function_name(self):
         from unittest.mock import MagicMock
@@ -3635,26 +3858,173 @@ class TestJoernLiveQuery:
         server = MagicMock()
         result = _joern_live_query(server, "not valid!", ["memcpy"])
         assert result == []
-        server.run_taint_query.assert_not_called()
+        server.run_taint_queries_batch.assert_not_called()
 
     def test_live_query_skips_invalid_sink(self):
         from unittest.mock import MagicMock
 
         server = MagicMock()
-        server.run_taint_query.return_value = []
+        server.run_taint_queries_batch.return_value = []
         _joern_live_query(server, "fn", ["bad;sink", "memcpy"])
-        assert server.run_taint_query.call_count == 1
-        call_args = server.run_taint_query.call_args
-        assert call_args[0][1] == "memcpy"
+        server.run_taint_queries_batch.assert_called_once()
+        call_args = server.run_taint_queries_batch.call_args
+        assert call_args[0][0] == [("fn", "memcpy")]
 
-    def test_live_query_handles_exception(self):
+    def test_live_query_all_sinks_invalid_never_queries(self):
         from unittest.mock import MagicMock
 
         server = MagicMock()
-        server.run_taint_query.side_effect = RuntimeError("timeout")
-
-        result = _joern_live_query(server, "fn", ["memcpy"])
+        result = _joern_live_query(server, "fn", ["bad;sink"])
         assert result == []
+        server.run_taint_queries_batch.assert_not_called()
+
+    def test_live_query_handles_exception(self):
+        """Batch-level failure falls back to a one-shot per-sink pass;
+        the loop's own error accounting is what reaches errors_out."""
+        from unittest.mock import MagicMock
+
+        server = MagicMock()
+        server.run_taint_queries_batch.side_effect = RuntimeError("timeout")
+        server.run_taint_query.side_effect = RuntimeError("still down")
+
+        errors: list = []
+        result = _joern_live_query(
+            server, "fn", ["memcpy"], errors_out=errors,
+        )
+        assert result == []
+        assert errors and "RuntimeError" in errors[0]
+
+    def test_live_query_batch_failure_recovers_via_per_sink_pass(self):
+        """A slow-CPG batch timeout must not cost every joern:live
+        confirmation — the fallback loop still answers per sink."""
+        from unittest.mock import MagicMock
+
+        from packages.joern.models import TaintFlow
+
+        flow = TaintFlow(
+            source_method="fn", source_param="x",
+            sink_call="memcpy", sink_arg_idx=0,
+        )
+        server = MagicMock()
+        server.run_taint_queries_batch.side_effect = RuntimeError("timeout")
+        server.run_taint_query.return_value = [flow]
+
+        errors: list = []
+        result = _joern_live_query(
+            server, "fn", ["memcpy", "strcpy"], errors_out=errors,
+        )
+        assert len(result) == 1
+        # First-hit-wins loop semantics in the fallback.
+        server.run_taint_query.assert_called_once()
+        # The loop answered — the batch's failure must not read as
+        # "unanswered" next to a real verdict.
+        assert errors == []
+
+    def test_live_query_batch_errors_fall_back_then_account(self):
+        """A degraded batch is 'unanswered', never a refutation: the
+        per-sink recovery pass runs, and when IT also degrades its
+        per-sink accounting is what reaches errors_out."""
+        from unittest.mock import MagicMock
+
+        server = MagicMock()
+
+        def fake_batch(pairs, *, timeout=None, errors_out=None, **kw):
+            if errors_out is not None:
+                errors_out.append("timeout (async poll)")
+            return []
+
+        def fake_single(fn, sink, *, timeout=None, errors_out=None, **kw):
+            if errors_out is not None:
+                errors_out.append("server is restarting")
+            return []
+
+        server.run_taint_queries_batch.side_effect = fake_batch
+        server.run_taint_query.side_effect = fake_single
+
+        errors: list = []
+        result = _joern_live_query(
+            server, "fn", ["memcpy", "strcpy"], errors_out=errors,
+        )
+        assert result == []
+        assert errors == [
+            "fn->memcpy: server is restarting",
+            "fn->strcpy: server is restarting",
+        ]
+
+    def test_live_query_partial_batch_keeps_flows_and_reports_errors(self):
+        """Flows AND errors in one batch: the flows are returned (no
+        fallback pass) and the partial degradation stays visible to
+        the error tier through errors_out."""
+        from unittest.mock import MagicMock
+
+        from packages.joern.models import TaintFlow
+
+        flow = TaintFlow(
+            source_method="fn", source_param="x",
+            sink_call="memcpy", sink_arg_idx=0,
+        )
+        server = MagicMock()
+
+        def fake_batch(pairs, *, timeout=None, errors_out=None, **kw):
+            if errors_out is not None:
+                errors_out.append("truncated response")
+            return [flow]
+
+        server.run_taint_queries_batch.side_effect = fake_batch
+
+        errors: list = []
+        result = _joern_live_query(
+            server, "fn", ["memcpy", "strcpy"], errors_out=errors,
+        )
+        assert len(result) == 1
+        server.run_taint_query.assert_not_called()
+        assert errors == ["fn->[memcpy,strcpy]: truncated response"]
+
+    def test_live_query_batch_error_then_clean_loop_is_a_refutation(self):
+        """When the recovery pass completes cleanly with no flows, the
+        result is a genuine negative — the batch's earlier degradation
+        must not linger in errors_out and mislabel it 'unanswered'."""
+        from unittest.mock import MagicMock
+
+        server = MagicMock()
+
+        def fake_batch(pairs, *, timeout=None, errors_out=None, **kw):
+            if errors_out is not None:
+                errors_out.append("timeout (async poll)")
+            return []
+
+        server.run_taint_queries_batch.side_effect = fake_batch
+        server.run_taint_query.return_value = []
+
+        errors: list = []
+        result = _joern_live_query(
+            server, "fn", ["memcpy", "strcpy"], errors_out=errors,
+        )
+        assert result == []
+        assert errors == []
+        assert server.run_taint_query.call_count == 2
+
+    def test_live_query_without_batch_api_falls_back_to_loop(self):
+        """Duck-typed servers without run_taint_queries_batch keep the
+        historical per-sink first-hit-wins loop."""
+        from packages.joern.models import TaintFlow
+
+        calls: list[tuple[str, str]] = []
+        flow = TaintFlow(
+            source_method="fn", source_param="x",
+            sink_call="strcpy", sink_arg_idx=0,
+        )
+
+        class _LoopOnlyServer:
+            def run_taint_query(self, source, sink, **kwargs):
+                calls.append((source, sink))
+                return [flow] if sink == "strcpy" else []
+
+        result = _joern_live_query(
+            _LoopOnlyServer(), "fn", ["strcpy", "memcpy"],
+        )
+        assert len(result) == 1
+        assert calls == [("fn", "strcpy")]
 
     def test_tool_chain_joern_live_fallback(self, tmp_path: Path):
         """When pre-sweep has no hit and server is available, fires live query."""
@@ -3667,7 +4037,7 @@ class TestJoernLiveQuery:
             source_method="fn", source_param="buf",
             sink_call="memcpy", sink_arg_idx=0,
         )
-        server.run_taint_query.return_value = [flow]
+        server.run_taint_queries_batch.return_value = [flow]
 
         chain = [{"type": "joern", "config": {"sinks": ["memcpy"]}}]
         config = OrchestratorConfig(target_path=tmp_path, out_dir=tmp_path)
@@ -3702,7 +4072,7 @@ class TestJoernLiveQuery:
             joern_server=server,
         )
         assert "joern:pre_sweep" in confirmed
-        server.run_taint_query.assert_not_called()
+        server.run_taint_queries_batch.assert_not_called()
 
     def test_tool_chain_joern_no_server_skips(self, tmp_path: Path):
         """When no server and no pre-sweep hit, joern is skipped."""
@@ -3720,11 +4090,11 @@ class TestJoernLiveQuery:
         from unittest.mock import MagicMock
 
         server = MagicMock()
-        server.run_taint_query.return_value = []
+        server.run_taint_queries_batch.return_value = []
 
         _joern_live_query(server, "fn", ["os.system"])
-        call_args = server.run_taint_query.call_args
-        assert call_args[0][1] == "system"
+        call_args = server.run_taint_queries_batch.call_args
+        assert call_args[0][0] == [("fn", "system")]
 
 
 @pytest.mark.slow
@@ -3842,9 +4212,14 @@ class TestIterativeReReview:
         """No re-review pass when the initial pass finds nothing."""
         target, out = _setup_target(tmp_path)
 
-        call_count = [0]
+        # list.append is atomic across the executor's worker threads
+        # (auto max_workers > 1 dispatches both reviews concurrently);
+        # a bare ``count[0] += 1`` read-modify-write can lose an
+        # increment to a thread switch.
+        calls: list[str] = []
+
         def review_fn(ctx, config):
-            call_count[0] += 1
+            calls.append(ctx["function"])
             return ReviewOutcome(
                 file=ctx["file"],
                 function=ctx["function"],
@@ -3855,9 +4230,28 @@ class TestIterativeReReview:
         config = OrchestratorConfig(
             target_path=target, out_dir=out, resume=False,
             batch_sloc_threshold=0, propagate_constraints=True,
+            # hermetic: the clean-check rescue is a separate, documented
+            # second review call for clean verdicts whose trigger is
+            # CPG-arrival timing — when the Joern build is still pending
+            # at dispatch (gap["_joern_pending"], routine under load),
+            # the pre-run is skipped and the post-verdict rescue re-calls
+            # review_fn on the taint-approx flows both toy functions
+            # carry. That channel is not the no-findings re-review gate
+            # under test; pin it off so the call tally is deterministic.
+            clean_check=False,
+            # hermetic: same interleaving, second channel — reviews that
+            # finish while the CPG is still building are queued on
+            # shared.reviewed_before_joern, and the post-loop pass
+            # re-reviews clean verdicts that gained Joern evidence.
+            # Also a documented pass distinct from the no-findings
+            # re-review gate; keeping the joern channel off makes the
+            # call tally deterministic (and drops the JVM spawn).
+            joern_overrides={"enabled": False},
         )
         result = run_orchestrator(config, review_fn)
-        assert call_count[0] == 2
+        # Exactly one review per checklist function, none re-reviewed —
+        # any iterative re-review would add a duplicate entry here.
+        assert sorted(calls) == ["check_pw", "validate"]
         assert result.findings == 0
 
     def test_convergence_no_infinite_loop(self, tmp_path: Path):
@@ -3983,6 +4377,14 @@ class TestSessionObservations:
         config = OrchestratorConfig(
             target_path=target, out_dir=out,
             budget=10, batch_sloc_threshold=0,
+            # The assertions below encode strict review ORDER (f1's
+            # observation visible to f2's context) — auto worker
+            # derivation can go parallel and race the accumulation.
+            max_workers=1,
+            # Observation accumulation is the subject, not the taint
+            # channel: a joern-equipped host must not boot a real JVM
+            # whose pre-sweep timing varies with machine load.
+            joern_overrides={"enabled": False},
         )
         run_orchestrator(config, review_fn)
 
@@ -4573,6 +4975,107 @@ class TestEnrichSummariesFromJoern:
         )
         assert taint_summary["a.c:f"] is existing
 
+    def test_hostile_method_cannot_clobber_truncation_marker(self):
+        """``_truncation`` is reserved for the builder's in-band
+        truncation marker (a plain dict — it fails the
+        ``source != "joern_cpg"`` overwrite guard, so without the
+        collision guard a hostile method literally named
+        ``_truncation`` with no file path overwrote it). The marker
+        must survive the merge verbatim; the hostile summary is kept
+        under the escaped empty-file colon spelling."""
+        from core.audit.orchestrator import _enrich_summaries_from_joern
+        from packages.joern.models import JoernMethodSummary
+
+        class FakeServer:
+            def run_summary_batch(self, methods, *, timeout=None):
+                return {
+                    "_truncation": JoernMethodSummary(
+                        method="_truncation", taint_rules=["x"],
+                        preconditions=[], returns=[],
+                    ),
+                }
+
+        marker = {"truncated": True, "skipped_files": 2}
+        taint_summary: dict = {"_truncation": marker}
+        _enrich_summaries_from_joern(
+            FakeServer(),
+            # Empty file key: the one path that yields a colon-less
+            # summary key equal to the reserved marker name.
+            {"": [{"source_method": "_truncation", "source_param": "",
+                   "sink_call": "x", "sink_arg_idx": 0, "steps": []}]},
+            taint_summary,
+        )
+        assert taint_summary["_truncation"] is marker
+        escaped = taint_summary[":_truncation"]
+        assert escaped.source == "joern_cpg"
+        assert escaped.function == "_truncation"
+
+    def test_hostile_method_without_marker_never_mints_reserved_key(self):
+        """No-marker merge order — no truncation occurred, the
+        common case: the hostile ``_truncation`` summary must land
+        under the escaped colon spelling and the bare reserved key
+        must never be minted (readers treat its presence as the
+        truncation record, and a ``FunctionSummary`` there breaks
+        dict-shaped marker reads)."""
+        from core.audit.orchestrator import _enrich_summaries_from_joern
+        from packages.joern.models import JoernMethodSummary
+
+        class FakeServer:
+            def run_summary_batch(self, methods, *, timeout=None):
+                return {
+                    "_truncation": JoernMethodSummary(
+                        method="_truncation", taint_rules=["x"],
+                        preconditions=[], returns=[],
+                    ),
+                }
+
+        taint_summary: dict = {}
+        _enrich_summaries_from_joern(
+            FakeServer(),
+            {"": [{"source_method": "_truncation", "source_param": "",
+                   "sink_call": "x", "sink_arg_idx": 0, "steps": []}]},
+            taint_summary,
+        )
+        assert "_truncation" not in taint_summary
+        escaped = taint_summary[":_truncation"]
+        assert escaped.source == "joern_cpg"
+        assert escaped.function == "_truncation"
+
+    def test_hostile_method_collision_warns_exactly_once(self, caplog):
+        """The relocation is announced: exactly one constant warning
+        line (no target-derived bytes — the guard only fires when
+        the method name is literally ``_truncation``)."""
+        from core.audit.orchestrator import _enrich_summaries_from_joern
+        from packages.joern.models import JoernMethodSummary
+
+        class FakeServer:
+            def run_summary_batch(self, methods, *, timeout=None):
+                return {
+                    "_truncation": JoernMethodSummary(
+                        method="_truncation", taint_rules=["x"],
+                        preconditions=[], returns=[],
+                    ),
+                }
+
+        taint_summary: dict = {"_truncation": {"truncated": True}}
+        with caplog.at_level(
+                "WARNING", logger="core.audit.joern_backend"):
+            _enrich_summaries_from_joern(
+                FakeServer(),
+                {"": [{"source_method": "_truncation",
+                       "source_param": "", "sink_call": "x",
+                       "sink_arg_idx": 0, "steps": []}]},
+                taint_summary,
+            )
+        expected = (
+            "joern_summary_batch: a method literally named "
+            "'_truncation' (no file path) collides with the "
+            "reserved truncation marker key — its summary is "
+            "stored under ':_truncation' instead"
+        )
+        assert [rec.getMessage() for rec in caplog.records
+                if rec.getMessage() == expected] == [expected]
+
     def test_empty_flows_is_noop(self):
         from core.audit.orchestrator import _enrich_summaries_from_joern
 
@@ -5062,6 +5565,372 @@ class TestSageCombinedPathway:
             assert obs["kind"] == "tool_confirmation"
 
 
+class TestSageRecallGate:
+    """The pre-LLM SAGE recall gate in review_one_function.
+
+    A prior clean/dormant hypothesis verdict with a matching source
+    hash skips the LLM review entirely; findings/suspicious always
+    re-test; ``config.sage_recall`` and the force bypasses gate it.
+    Hermetic: the hook function is stubbed at its module seam, so no
+    SAGE client is ever contacted.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _stub_mechanical_detectors(self, monkeypatch) -> None:
+        """Stub the pre-loop mechanical-detector pass at its seam (the
+        test_consistency_wiring / TestSageFpPrimer idiom): it does real
+        I/O — sandboxed coccinelle spawns where spatch is installed,
+        plus the detector-cache import-closure fingerprint — seconds
+        per run, entirely orthogonal to the recall gate under test,
+        and enough to trip the default-tier duration guard on a
+        loaded CI runner."""
+        from core.audit import orchestrator as orch
+        monkeypatch.setattr(orch, "_run_mechanical_detectors",
+                            lambda *a, **k: ({}, set()))
+
+    def _run(self, tmp_path: Path, recall, *, config_kw=None):
+        from unittest.mock import patch as _patch
+
+        target, out = _setup_target(tmp_path)
+        calls: list[str] = []
+
+        def review_fn(ctx, config):
+            calls.append(ctx["function"])
+            return ReviewOutcome(
+                file=ctx["file"], function=ctx["function"],
+                status="clean", body="looked fine",
+            )
+
+        config = OrchestratorConfig(
+            target_path=target, out_dir=out, resume=False,
+            sweep_validate_findings=False, batch_sloc_threshold=0,
+            joern_overrides={"enabled": False},
+            **(config_kw or {}),
+        )
+        with _patch(
+            "core.sage.hooks.recall_audit_hypothesis_verdict",
+            side_effect=recall,
+        ) as mock_recall:
+            result = run_orchestrator(config, review_fn)
+        return result, calls, mock_recall
+
+    def test_prior_clean_verdict_skips_llm(self, tmp_path: Path):
+        from core.audit.journal import latest_entries
+
+        result, calls, mock_recall = self._run(
+            tmp_path,
+            lambda **kw: {
+                "status": "clean",
+                "tool": "semgrep:x",
+                "source_hash": kw["source_hash"],
+            },
+        )
+
+        assert calls == []  # LLM never invoked
+        assert result.prefilter_skipped == 2
+        assert mock_recall.call_count == 2
+        kw = mock_recall.call_args[1]
+        assert kw["file_path"] == "src/auth.c"
+        assert kw["function"] in ("check_pw", "validate")
+        assert kw["source_hash"]  # real hash from the real source
+
+        # The skip is journaled as a real outcome with the recall
+        # provenance stamp — coverage and reports see it.
+        entries = latest_entries(tmp_path / "out")
+        entry = entries.get("src/auth.c:check_pw")
+        assert entry is not None
+        assert entry.verdict == "clean"
+        assert entry.evidence_tools == ["sage:recall:semgrep:x"]
+
+    def test_prior_dormant_verdict_skips_as_dormant(self, tmp_path: Path):
+        result, calls, _ = self._run(
+            tmp_path,
+            lambda **kw: {"status": "dormant", "tool": ""},
+        )
+        assert calls == []
+        assert all(o.status == "dormant" for o in result.outcomes)
+
+    def test_prior_finding_status_never_skips(self, tmp_path: Path):
+        """Findings and suspicious verdicts always re-test — even if a
+        hook ever returned one, the gate must not skip on it."""
+        _, calls, _ = self._run(
+            tmp_path,
+            lambda **kw: {"status": "finding", "tool": "semgrep:x"},
+        )
+        assert sorted(calls) == ["check_pw", "validate"]
+
+    def test_no_prior_verdict_reviews_normally(self, tmp_path: Path):
+        _, calls, mock_recall = self._run(tmp_path, lambda **kw: None)
+        assert sorted(calls) == ["check_pw", "validate"]
+        assert mock_recall.call_count == 2
+
+    def test_sage_recall_flag_disables_gate(self, tmp_path: Path):
+        _, calls, mock_recall = self._run(
+            tmp_path,
+            lambda **kw: {"status": "clean", "tool": ""},
+            config_kw={"sage_recall": False},
+        )
+        assert sorted(calls) == ["check_pw", "validate"]
+        mock_recall.assert_not_called()
+
+    def test_force_bypasses_recall(self, tmp_path: Path):
+        _, calls, mock_recall = self._run(
+            tmp_path,
+            lambda **kw: {"status": "clean", "tool": ""},
+            config_kw={"force": True},
+        )
+        assert sorted(calls) == ["check_pw", "validate"]
+        mock_recall.assert_not_called()
+
+    def test_recall_failure_never_blocks_review(self, tmp_path: Path):
+        def _boom(**kw):
+            raise RuntimeError("sage unavailable")
+
+        _, calls, _ = self._run(tmp_path, _boom)
+        assert sorted(calls) == ["check_pw", "validate"]
+
+    def test_validate_confirmed_floor_blocks_recall_skip(
+        self, tmp_path: Path,
+    ):
+        """Never-skip-validate-confirmed floor: a /validate-CONFIRMED
+        function must get a real review even when a prior clean
+        verdict with a matching source hash is recalled — a stored
+        pre-validate clean is exactly what a confirmed detection-
+        evasion defect looks like from the recall's side."""
+        from unittest.mock import patch as _patch
+
+        def _floor(evidence_index, gap_key):
+            return gap_key == "src/auth.c:check_pw"
+
+        with _patch(
+            "core.audit.orchestrator._validate_confirmed_gap",
+            side_effect=_floor,
+        ):
+            _, calls, _ = self._run(
+                tmp_path,
+                lambda **kw: {"status": "clean", "tool": "semgrep:x"},
+            )
+        # The confirmed gap reaches the LLM; the sibling still skips.
+        assert calls == ["check_pw"]
+
+
+class TestSageFpPrimer:
+    """Prior finding-verdict FP primers in review_one_function.
+
+    A prior false_positive / not_exploitable adjudication for a
+    finding in the function (source window unchanged) is injected as
+    HINT-TIER review context — the review always runs and the verdict
+    is the reviewer's own. Never a skip, never a committed verdict:
+    a finding-scoped adjudication says nothing about bug classes it
+    never examined. Hermetic: both SAGE hooks stubbed at their seams.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _stub_mechanical_detectors(self, monkeypatch) -> None:
+        """Stub the pre-loop mechanical-detector pass at its seam (the
+        test_consistency_wiring / test_peer_group idiom): it does real
+        I/O — sandboxed coccinelle spawns where spatch is installed,
+        plus the detector-cache import-closure fingerprint — seconds
+        per run, entirely orthogonal to the FP-primer injection under
+        test, and enough to trip the default-tier duration guard on a
+        loaded CI runner."""
+        from core.audit import orchestrator as orch
+        monkeypatch.setattr(orch, "_run_mechanical_detectors",
+                            lambda *a, **k: ({}, set()))
+
+    @staticmethod
+    def _hash_for(target: Path, line: int) -> str:
+        from core.sage.hooks import compute_finding_source_hash
+        return compute_finding_source_hash(target / "src" / "auth.c", line)
+
+    def _run(self, tmp_path: Path, rows_fn, *, config_kw=None):
+        from unittest.mock import patch as _patch
+
+        target, out = _setup_target(tmp_path)
+        seen_ctx: dict[str, dict] = {}
+
+        def review_fn(ctx, config):
+            seen_ctx[ctx["function"]] = ctx
+            return ReviewOutcome(
+                file=ctx["file"], function=ctx["function"],
+                status="clean", body="looked fine",
+            )
+
+        config = OrchestratorConfig(
+            target_path=target, out_dir=out, resume=False,
+            sweep_validate_findings=False, batch_sloc_threshold=0,
+            joern_overrides={"enabled": False},
+            **(config_kw or {}),
+        )
+        with (
+            _patch(
+                "core.sage.hooks.recall_audit_hypothesis_verdict",
+                return_value=None,
+            ),
+            _patch(
+                "core.sage.hooks.recall_prior_fp_verdicts",
+                side_effect=lambda **kw: rows_fn(target, **kw),
+            ) as mock_fp,
+        ):
+            result = run_orchestrator(config, review_fn)
+        return result, seen_ctx, mock_fp, out
+
+    def test_matching_prior_injects_hint_and_never_skips(
+        self, tmp_path: Path,
+    ):
+        def rows(target, **kw):
+            if kw["function"] != "check_pw":
+                return []
+            # Store-side shape: window hash around the FINDING line.
+            return [{
+                "verdict": "false_positive",
+                "rule": "semgrep.strcpy",
+                "source_hash": self._hash_for(target, 4),
+                "confidence": 0.95,
+            }]
+
+        result, seen_ctx, _, out = self._run(tmp_path, rows)
+
+        # BOTH functions were fully reviewed — the primer never skips.
+        assert sorted(seen_ctx) == ["check_pw", "validate"]
+        assert result.prefilter_skipped == 0
+        # The hint reached the primed function's context only.
+        priors = seen_ctx["check_pw"].get("sage_fp_priors")
+        assert priors == [
+            {"verdict": "false_positive", "rule": "semgrep.strcpy"},
+        ]
+        assert "sage_fp_priors" not in seen_ctx["validate"]
+        # The committed verdict is the REVIEWER's, with no recall stamp.
+        for o in result.outcomes:
+            assert not (o.evidence_tool or "").startswith("sage:fp")
+
+        # Hint-tier provenance trail: recorded, and dropped=False —
+        # nothing was suppressed.
+        recs = [
+            json.loads(line)
+            for line in (out / "suppressions.jsonl").read_text().splitlines()
+        ]
+        fp_recs = [
+            r for r in recs if r.get("verdict") == "sage_false_positive"
+        ]
+        assert fp_recs and fp_recs[0]["function"] == "check_pw"
+        assert fp_recs[0]["dropped"] is False
+        assert fp_recs[0]["injected"] is True
+
+    def test_stale_source_hash_injects_nothing(self, tmp_path: Path):
+        """A recalled verdict whose window hash no longer matches any
+        line of the function is dropped — no hint, plain review."""
+        def rows(target, **kw):
+            return [{
+                "verdict": "false_positive",
+                "rule": "semgrep.strcpy",
+                "source_hash": "feedfacecafe",
+            }]
+
+        _, seen_ctx, _, out = self._run(tmp_path, rows)
+        assert sorted(seen_ctx) == ["check_pw", "validate"]
+        assert all(
+            "sage_fp_priors" not in ctx for ctx in seen_ctx.values()
+        )
+        assert not (out / "suppressions.jsonl").exists()
+
+    def test_blind_first_pass_withholds_hint(self, tmp_path: Path):
+        def rows(target, **kw):
+            if kw["function"] != "check_pw":
+                return []
+            return [{
+                "verdict": "false_positive",
+                "rule": "semgrep.strcpy",
+                "source_hash": self._hash_for(target, 4),
+            }]
+
+        _, seen_ctx, _, out = self._run(
+            tmp_path, rows, config_kw={"blind_first_pass": True},
+        )
+        assert sorted(seen_ctx) == ["check_pw", "validate"]
+        assert "sage_fp_priors" not in seen_ctx["check_pw"]
+        # The provenance record states what happened: matched but
+        # withheld — it must not claim an injection blind mode never
+        # performed.
+        recs = [
+            json.loads(line)
+            for line in (out / "suppressions.jsonl").read_text().splitlines()
+        ]
+        fp_recs = [
+            r for r in recs if r.get("verdict") == "sage_false_positive"
+        ]
+        assert fp_recs and fp_recs[0]["injected"] is False
+        assert "matched" in fp_recs[0]["reason"]
+
+    def test_sage_recall_flag_disables_primer(self, tmp_path: Path):
+        def rows(target, **kw):
+            raise AssertionError("hook must not be consulted")
+
+        _, seen_ctx, mock_fp, _ = self._run(
+            tmp_path, rows, config_kw={"sage_recall": False},
+        )
+        assert sorted(seen_ctx) == ["check_pw", "validate"]
+        mock_fp.assert_not_called()
+
+    def test_prompt_renders_hints_not_verdicts(self):
+        from core.audit.context import format_context_for_prompt
+
+        ctx = {
+            "file": "src/auth.c",
+            "function": "check_pw",
+            "line_start": 1,
+            "source": "int check_pw(void) { return 0; }",
+            "sage_fp_priors": [
+                {"verdict": "false_positive", "rule": "semgrep.strcpy"},
+                {"verdict": "not_exploitable", "rule": "codeql.of\nlow"},
+            ],
+        }
+        prompt = format_context_for_prompt(ctx)
+        assert "hints, not verdicts" in prompt
+        assert "never inherit a verdict" in prompt
+        assert "semgrep.strcpy" in prompt
+        # not_exploitable is dormant-leaning — a REAL defect, never
+        # a clean steer.
+        assert "not_exploitable" in prompt
+        assert "dormant-leaning" in prompt
+        assert "never clean" in prompt
+        # Rule ids are single-line clamped before joining the prompt.
+        assert "codeql.of low" in prompt
+
+    def test_match_helper_requires_span(self):
+        from core.audit.orchestrator import _match_fp_verdict_to_source
+
+        rows = [{"verdict": "false_positive", "source_hash": "abc"}]
+        assert _match_fp_verdict_to_source(
+            rows, Path("/nonexistent"), {"file": "a.c", "name": "f"},
+        ) == []
+
+    def test_scan_bound_binds_both_directions(self, tmp_path, monkeypatch):
+        """_FP_RECALL_MAX_SCAN_LINES is load-bearing: a finding line
+        within the cap matches; one beyond it does not (and raising
+        the cap would flip the second assertion — two-direction pin)."""
+        import core.audit.orchestrator as orch_mod
+        from core.audit.orchestrator import _match_fp_verdict_to_source
+        from core.sage.hooks import compute_finding_source_hash
+
+        target = tmp_path / "t"
+        (target / "src").mkdir(parents=True)
+        (target / "src" / "big.c").write_text(
+            "\n".join(f"int l{i};" for i in range(1, 40)) + "\n",
+        )
+        monkeypatch.setattr(orch_mod, "_FP_RECALL_MAX_SCAN_LINES", 10)
+        gap = {"file": "src/big.c", "name": "f",
+               "line_start": 1, "line_end": 39}
+
+        within = compute_finding_source_hash(target / "src" / "big.c", 5)
+        beyond = compute_finding_source_hash(target / "src" / "big.c", 20)
+        row_within = [{"verdict": "false_positive", "source_hash": within}]
+        row_beyond = [{"verdict": "false_positive", "source_hash": beyond}]
+
+        assert _match_fp_verdict_to_source(row_within, target, gap)
+        assert _match_fp_verdict_to_source(row_beyond, target, gap) == []
+
+
 class TestDeadCodeReason:
     """Tests for _dead_code_reason helper."""
 
@@ -5260,6 +6129,144 @@ class TestGapIndex:
         assert "a.py:f" in _gap_index(checklist)
 
 
+class TestChecklistItemIndex:
+    """One walking authority for checklist["files"][*] items: the
+    hand-rolled per-pass walkers had drifted on the path/file and
+    items/functions key fallbacks, and the per-outcome lookup walked
+    the whole checklist every call."""
+
+    @staticmethod
+    def _checklist():
+        return {
+            "files": [
+                {"path": "a.c", "items": [
+                    {"name": "f", "line_start": 10, "line_end": 20},
+                ]},
+            ],
+        }
+
+    def test_find_gap_resolves_legacy_file_key(self):
+        # The pre-index walker matched the strict "path" key only —
+        # a "file"-keyed record (older artifacts) silently returned
+        # None while _gap_index resolved it. One walker, one fallback.
+        from core.audit.orchestrator import _find_gap_in_checklist
+
+        checklist = {
+            "files": [
+                {"file": "a.c", "items": [
+                    {"name": "f", "line_start": 3, "line_end": 9},
+                ]},
+            ],
+        }
+        gap = _find_gap_in_checklist(checklist, "a.c", "f")
+        assert gap == {
+            "file": "a.c", "name": "f", "line_start": 3, "line_end": 9,
+        }
+
+    def test_find_gap_contract_unchanged(self):
+        from core.audit.orchestrator import _find_gap_in_checklist
+
+        gap = _find_gap_in_checklist(self._checklist(), "a.c", "f")
+        assert gap == {
+            "file": "a.c", "name": "f", "line_start": 10, "line_end": 20,
+        }
+        assert _find_gap_in_checklist(self._checklist(), "a.c", "x") is None
+        # Absent line_end stays None (not 0) — consumers distinguish.
+        gap2 = _find_gap_in_checklist(
+            {"files": [{"path": "b.c", "items": [{"name": "g"}]}]},
+            "b.c", "g",
+        )
+        assert gap2["line_start"] == 0
+        assert gap2["line_end"] is None
+
+    def test_first_match_wins_on_duplicates(self):
+        from core.audit.orchestrator import _find_gap_in_checklist
+
+        checklist = {
+            "files": [
+                {"path": "a.c", "items": [{"name": "f", "line_start": 1}]},
+                {"path": "a.c", "items": [{"name": "f", "line_start": 99}]},
+            ],
+        }
+        assert _find_gap_in_checklist(
+            checklist, "a.c", "f",
+        )["line_start"] == 1
+
+    def test_index_memoised_per_checklist_identity(self):
+        from core.audit.orchestrator import _checklist_item_index
+
+        checklist = self._checklist()
+        first = _checklist_item_index(checklist)
+        assert _checklist_item_index(checklist) is first
+        # In-place growth invalidates (fingerprint guard).
+        checklist["files"].append(
+            {"path": "b.c", "items": [{"name": "g"}]},
+        )
+        second = _checklist_item_index(checklist)
+        assert second is not first
+        assert ("b.c", "g") in second
+        # A different checklist object never reads another's index.
+        other = self._checklist()
+        other["files"][0]["items"][0]["line_start"] = 77
+        assert (
+            _checklist_item_index(other)[("a.c", "f")][1]["line_start"]
+            == 77
+        )
+
+    def test_item_append_with_stable_file_count_invalidates(self):
+        # The fingerprint covers TOTAL item count, not just the files
+        # count — an in-place item append inside an existing file
+        # record must not serve a stale index.
+        from core.audit.orchestrator import (
+            _checklist_item_index,
+            _find_gap_in_checklist,
+        )
+
+        checklist = self._checklist()
+        _checklist_item_index(checklist)
+        checklist["files"][0]["items"].append(
+            {"name": "late", "line_start": 44, "line_end": 50},
+        )
+        gap = _find_gap_in_checklist(checklist, "a.c", "late")
+        assert gap is not None
+        assert gap["line_start"] == 44
+
+    def test_colon_bearing_path_never_aliases(self):
+        # Tuple keys, not a "file:name" join: with a joined key,
+        # file "a" + function "b.c:f" and file "a:b.c" + function "f"
+        # collapse to the same spelling and serve each other's items.
+        from core.audit.orchestrator import _find_gap_in_checklist
+
+        checklist = {
+            "files": [
+                {"path": "a", "items": [
+                    {"name": "b.c:f", "line_start": 1, "line_end": 2},
+                ]},
+                {"path": "a:b.c", "items": [
+                    {"name": "f", "line_start": 30, "line_end": 40},
+                ]},
+            ],
+        }
+        gap = _find_gap_in_checklist(checklist, "a:b.c", "f")
+        assert gap is not None
+        assert gap["line_start"] == 30
+        gap2 = _find_gap_in_checklist(checklist, "a", "b.c:f")
+        assert gap2 is not None
+        assert gap2["line_start"] == 1
+
+    def test_function_line_resolves_legacy_file_key(self):
+        from core.audit.orchestrator import _checklist_function_line
+
+        checklist = {
+            "files": [
+                {"file": "a.c", "functions": [
+                    {"name": "f", "line_start": 12},
+                ]},
+            ],
+        }
+        assert _checklist_function_line(checklist, "a.c", "f") == 12
+
+
 class TestTaintApproxHasFlow:
     """_taint_approx_has_flow must handle both TaintApprox objects and
     the plain dicts the taint-approx cache round-trips through JSON on
@@ -5295,12 +6302,33 @@ class TestTaintApproxHasFlow:
                 self._dangerous = dangerous
                 self.direct_flows = direct
 
-            def has_any_dangerous_flow(self):
+            def has_any_dangerous(self):
                 return self._dangerous
 
         assert _taint_approx_has_flow(FakeApprox(True, {}))
         assert _taint_approx_has_flow(FakeApprox(False, {0: [("f", 1)]}))
         assert not _taint_approx_has_flow(FakeApprox(False, {}))
+
+    def test_real_class_dangerous_only(self):
+        # Pin the getattr probe against the real CTaintApprox method
+        # name: dangerous-only (no direct flows) makes the dangerous
+        # probe the sole True path — a misspelt probe is masked when
+        # direct_flows is populated too.
+        from core.analysis.taint_approx import CTaintApprox
+        from core.audit.orchestrator import _taint_approx_has_flow
+
+        assert _taint_approx_has_flow(CTaintApprox(
+            function="f",
+            params=["buf"],
+            direct_flows={},
+            dangerous_flows={0: [("memcpy", 1)]},
+        ))
+        assert not _taint_approx_has_flow(CTaintApprox(
+            function="f",
+            params=["buf"],
+            direct_flows={},
+            dangerous_flows={},
+        ))
 
     def test_none(self):
         from core.audit.orchestrator import _taint_approx_has_flow
@@ -5541,7 +6569,7 @@ class TestRunCritiqueConcurrency:
 
         monkeypatch.setattr(
             orch_mod, "_hypothesis_to_tool_chain",
-            lambda hyp, f, cwe="": ["fake-rule"],
+            lambda hyp, f, cwe="", language=None: ["fake-rule"],
         )
         monkeypatch.setattr(
             orch_mod, "_read_raw_source", lambda *a, **kw: "src",
@@ -5882,6 +6910,9 @@ class TestJoernLiveErrorAccounting:
         from unittest.mock import MagicMock
 
         server = MagicMock()
+        server.run_taint_queries_batch.side_effect = RuntimeError("timeout")
+        # The recovery pass is equally down — its per-sink accounting
+        # is what lands in errors_out.
         server.run_taint_query.side_effect = RuntimeError("timeout")
         errors: list = []
         result = _joern_live_query(
@@ -5895,12 +6926,18 @@ class TestJoernLiveErrorAccounting:
 
         server = MagicMock()
 
-        def _query(fn, sink, timeout=30, errors_out=None, **kw):
+        def _batch(pairs, timeout=30, errors_out=None, **kw):
             if errors_out is not None:
                 errors_out.append("server is restarting")
             return []
 
-        server.run_taint_query.side_effect = _query
+        def _single(fn, sink, timeout=30, errors_out=None, **kw):
+            if errors_out is not None:
+                errors_out.append("server is restarting")
+            return []
+
+        server.run_taint_queries_batch.side_effect = _batch
+        server.run_taint_query.side_effect = _single
         errors: list = []
         result = _joern_live_query(
             server, "fn", ["memcpy"], errors_out=errors)
@@ -5911,7 +6948,7 @@ class TestJoernLiveErrorAccounting:
         from unittest.mock import MagicMock
 
         server = MagicMock()
-        server.run_taint_query.return_value = []
+        server.run_taint_queries_batch.return_value = []
         errors: list = []
         result = _joern_live_query(
             server, "fn", ["memcpy"], errors_out=errors)
@@ -5938,9 +6975,9 @@ class TestJoernLiveErrorAccounting:
         c = _flow("a.c", 2)
 
         server = MagicMock()
-        server.run_taint_query.return_value = [b, a, c]
+        server.run_taint_queries_batch.return_value = [b, a, c]
         first = _joern_live_query(server, "fn", ["memcpy"])
-        server.run_taint_query.return_value = [a, c, b]
+        server.run_taint_queries_batch.return_value = [a, c, b]
         second = _joern_live_query(server, "fn", ["memcpy"])
         assert first == second
         assert [f.steps[0].file for f in first] == ["a.c", "a.c", "b.c"]
@@ -6046,7 +7083,9 @@ class TestPostPassWiring:
         window = self._body_src()
         phase2 = window.find("_run_phase2(result, config)")
         hooks = window.find("config.pre_export_hooks")
-        final_persist = window.rfind("_persist_findings(result, config)")
+        # Match the call head only: the persists thread the prep-time
+        # vendor verdicts (tree-class stamp) as an extra argument.
+        final_persist = window.rfind("_persist_findings(")
         rejournal = window.find("_rejournal_final_statuses(result, config)")
         assert -1 not in (phase2, hooks, final_persist, rejournal)
         assert phase2 < hooks < final_persist < rejournal
@@ -6063,6 +7102,124 @@ class TestPostPassWiring:
         cancel = sub.find("f.cancel()")
         assert harvest != -1 and cancel != -1
         assert harvest < cancel
+
+
+class TestContainedSourceText:
+    """The shared confined whole-file reader behind the prep loops,
+    post-loop verifiers and prompt-context builders: file fields come
+    from LLM-writable artifacts, so escaping paths must read as
+    no-source, never as out-of-root content."""
+
+    def test_normal_read(self, tmp_path: Path):
+        from core.audit.orchestrator import _contained_source_text
+
+        (tmp_path / "a.c").write_text("int x;\n")
+        assert _contained_source_text(tmp_path, "a.c") == "int x;\n"
+
+    def test_traversal_refused(self, tmp_path: Path):
+        from core.audit.orchestrator import _contained_source_text
+
+        target = tmp_path / "target"
+        target.mkdir()
+        (tmp_path / "outside.c").write_text("secret\n")
+        assert _contained_source_text(target, "../outside.c") is None
+
+    def test_absolute_refused(self, tmp_path: Path):
+        from core.audit.orchestrator import _contained_source_text
+
+        target = tmp_path / "target"
+        target.mkdir()
+        outside = tmp_path / "outside.c"
+        outside.write_text("secret\n")
+        assert _contained_source_text(target, str(outside)) is None
+
+    def test_missing_and_empty_name(self, tmp_path: Path):
+        from core.audit.orchestrator import _contained_source_text
+
+        assert _contained_source_text(tmp_path, "absent.c") is None
+        assert _contained_source_text(tmp_path, "") is None
+
+
+class TestFpVerdictHashProbeContainment:
+    """The FP-primer staleness probe hashes the gap's file: an
+    escaping gap path must never reach the hash helper (it would fold
+    arbitrary host files into the staleness match)."""
+
+    def test_escaping_gap_path_never_hashed(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        import core.sage.hooks as hooks_mod
+
+        from core.audit.orchestrator import _match_fp_verdict_to_source
+
+        target = tmp_path / "target"
+        target.mkdir()
+        (tmp_path / "outside.c").write_text("int f(void) { return 0; }\n")
+        probed: list = []
+
+        def spy(path, line_start, line_end):
+            probed.append(str(path))
+            return set()
+
+        monkeypatch.setattr(hooks_mod, "finding_source_hashes", spy)
+        rows = [{"source_hash": "deadbeef", "verdict": "false_positive"}]
+        gap = {"file": "../outside.c", "line_start": 1, "line_end": 1}
+        assert _match_fp_verdict_to_source(rows, target, gap) == []
+        assert probed == []
+
+    def test_contained_gap_path_still_probed(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        import core.sage.hooks as hooks_mod
+
+        from core.audit.orchestrator import _match_fp_verdict_to_source
+
+        (tmp_path / "a.c").write_text("int f(void) { return 0; }\n")
+        probed: list = []
+
+        def spy(path, line_start, line_end):
+            probed.append(str(path))
+            return {"deadbeef"}
+
+        monkeypatch.setattr(hooks_mod, "finding_source_hashes", spy)
+        rows = [{"source_hash": "deadbeef", "verdict": "false_positive"}]
+        gap = {"file": "a.c", "line_start": 1, "line_end": 1}
+        matched = _match_fp_verdict_to_source(rows, tmp_path, gap)
+        assert len(matched) == 1
+        assert probed and probed[0].endswith("a.c")
+
+
+class TestBlockContextContainment:
+    """_try_block_level_context derives priority-0 prompt text from
+    the gap's file: an escaping path must never feed out-of-root
+    content into the CFG builder / prompt path."""
+
+    def test_outside_content_never_reaches_the_builder(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        from types import SimpleNamespace
+
+        import core.audit.block_review as br_mod
+
+        from core.audit.orchestrator import _try_block_level_context
+
+        target = tmp_path / "target"
+        target.mkdir()
+        (tmp_path / "outside.c").write_text("int f(void) { return 0; }\n")
+        seen: dict = {}
+
+        def spy(file_path, function_name, target_path, source=""):
+            seen["source"] = source
+            return None
+
+        monkeypatch.setattr(br_mod, "try_build_cfg", spy)
+        gap = {"file": "../outside.c", "name": "f",
+               "line_start": 1, "line_end": 1}
+        config = SimpleNamespace(target_path=target, out_dir=tmp_path)
+        assert _try_block_level_context(gap, {}, config, None) is None
+        assert seen["source"] == "", (
+            "out-of-root file content reached the block-review builder"
+        )
 
 
 class TestValidateConfirmedPrefilterFloor:
@@ -6097,3 +7254,734 @@ class TestValidateConfirmedPrefilterFloor:
             "confirmed": [], "ruled_out": [{"fresh": True}],
         })
         assert not _validate_confirmed_gap({"a.c:fn": rec}, "a.c:fn")
+
+
+class TestDiscardPresweepFuture:
+    """Empty-gaps runs discard the server-start pre-sweep future."""
+
+    def test_unstarted_future_is_cancelled(self):
+        from concurrent.futures import Future
+
+        from core.audit.orchestrator import _discard_presweep_future
+
+        fut: Future = Future()
+        _discard_presweep_future(fut)
+        assert fut.cancelled()
+
+    def test_discard_sets_the_abort_event(self):
+        """cancel() essentially never lands (the 1-worker executor
+        starts the task at submit) — the abort event is the real
+        interrupt, and it must be set for running AND unstarted
+        futures alike."""
+        import threading
+        from concurrent.futures import Future
+
+        from core.audit.orchestrator import _discard_presweep_future
+
+        for started in (False, True):
+            fut: Future = Future()
+            if started:
+                fut.set_running_or_notify_cancel()
+            ev = threading.Event()
+            _discard_presweep_future(fut, abort_event=ev)
+            assert ev.is_set()
+
+    def test_running_future_interrupts_and_logs_its_failure(self, caplog):
+        """Real interrupt path: a running build stops when the abort
+        event is set, and the attached done-callback logs a failing
+        discarded future instead of letting it vanish unobserved."""
+        import logging as _logging
+        import threading
+        import time as _time
+        from concurrent.futures import ThreadPoolExecutor
+
+        from core.audit.orchestrator import _discard_presweep_future
+
+        ev = threading.Event()
+        started = threading.Event()
+
+        def fake_build():
+            # Step-boundary polling stand-in: waits for the abort,
+            # then fails — exercising both the interrupt and the
+            # logging callback.
+            started.set()
+            assert ev.wait(timeout=10)
+            raise RuntimeError("pre-sweep died")
+
+        pool = ThreadPoolExecutor(max_workers=1)
+        try:
+            fut = pool.submit(fake_build)
+            # Structural running-ness: a fixed pre-discard sleep let a
+            # starved pool worker start the task late, cancel() landed,
+            # and the not-cancelled assert false-failed.
+            assert started.wait(timeout=10)  # running: cancel() cannot land
+            with caplog.at_level(
+                _logging.DEBUG, logger="core.audit.orchestrator",
+            ):
+                _discard_presweep_future(fut, abort_event=ev)
+                assert not fut.cancelled()
+                with pytest.raises(RuntimeError):
+                    fut.result(timeout=10)
+                deadline = _time.monotonic() + 5
+                while _time.monotonic() < deadline:
+                    if "discarded joern pre-sweep failed" in caplog.text:
+                        break
+                    _time.sleep(0.02)
+            assert "discarded joern pre-sweep failed" in caplog.text
+        finally:
+            pool.shutdown(wait=True)
+
+    def test_none_is_a_noop(self):
+        from core.audit.orchestrator import _discard_presweep_future
+
+        _discard_presweep_future(None)
+
+
+def _presweep_target(tmp_path: Path, n_functions: int = 1):
+    """Tiny C target + checklist for run-level pre-sweep wiring tests."""
+    target = tmp_path / "target"
+    (target / "src").mkdir(parents=True)
+    items = []
+    src_lines: list[str] = []
+    line = 1
+    for i in range(n_functions):
+        body = (
+            f"int handler_{i}(char *input, int len) {{\n"
+            "  char buf[64];\n"
+            "  memcpy(buf, input, len);\n"
+            "  return buf[0];\n"
+            "}"
+        )
+        n = body.count("\n") + 1
+        items.append({
+            "name": f"handler_{i}",
+            "line_start": line, "line_end": line + n - 1,
+        })
+        src_lines.append(body)
+        line += n
+    (target / "src" / "app.c").write_text("\n".join(src_lines) + "\n")
+    out = tmp_path / "out"
+    out.mkdir()
+    checklist = {"files": [{"path": "src/app.c", "items": items}]}
+    (out / "checklist.json").write_text(json.dumps(checklist))
+    return target, out
+
+
+def _presweep_config(target: Path, out: Path, **kw):
+    defaults: dict = {
+        "target_path": target,
+        "out_dir": out,
+        "resume": False,
+        "force": True,
+        "max_workers": 1,
+        "batch_sloc_threshold": 0,
+        "prefilter": False,
+        "validate": False,
+        # The wiring under test is the future hand-off, not a live
+        # server; a joern-equipped host must not start a real JVM.
+        "joern_overrides": {"enabled": False},
+    }
+    defaults.update(kw)
+    return OrchestratorConfig(**defaults)
+
+
+def _clean_review_fn(ctx, config):
+    return ReviewOutcome(
+        file=ctx["file"], function=ctx["function"],
+        status="clean", body="ok",
+    )
+
+
+@pytest.mark.slow
+class TestPresweepSubmittedAtServerStart:
+    """The pre-sweep future is submitted before prep runs (ordering
+    probe) and adopted by prep — never resubmitted; an empty-gaps run
+    discards it."""
+
+    def test_submission_precedes_prep_and_is_adopted(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        from concurrent.futures import Future
+
+        import core.audit.orchestrator as orch_mod
+
+        target, out = _presweep_target(tmp_path)
+        events: list[str] = []
+        fut: Future = Future()
+        fut.set_result(None)  # completed: the drain path is a no-op
+
+        def fake_resolve(*args, **kwargs):
+            events.append("presweep_submit")
+            return (None, fut)
+
+        real_prep = orch_mod._compute_audit_prep
+        received: dict = {}
+
+        def probed_prep(config, **kwargs):
+            events.append("prep")
+            received.update(kwargs)
+            return real_prep(config, **kwargs)
+
+        monkeypatch.setattr(
+            orch_mod, "_resolve_joern_evidence_raw", fake_resolve,
+        )
+        monkeypatch.setattr(orch_mod, "_compute_audit_prep", probed_prep)
+
+        result = orch_mod.run_orchestrator(
+            _presweep_config(target, out), _clean_review_fn,
+        )
+
+        assert result.reviewed >= 1
+        assert events[0] == "presweep_submit"
+        assert "prep" in events
+        # Prep adopted the server-start future instead of resubmitting.
+        assert events.count("presweep_submit") == 1
+        assert received.get("presweep_future") is fut
+        assert received.get("presweep_activity") is not None
+
+    def test_empty_gaps_run_interrupts_the_running_build(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """Real interrupt path: the pre-sweep task is already RUNNING
+        when the empty-gaps discard fires (the 1-worker executor
+        starts it at submit, so cancel() cannot land) — the discard
+        must set the abort event the build polls, and the build must
+        finish promptly instead of paying a full pre-sweep."""
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        import core.audit.orchestrator as orch_mod
+
+        target, out = _presweep_target(tmp_path, n_functions=1)
+        # Empty checklist → zero gaps → nothing consumes the future.
+        (out / "checklist.json").write_text(json.dumps({"files": []}))
+
+        pool = ThreadPoolExecutor(max_workers=1)
+        state: dict = {}
+
+        def fake_resolve(*args, abort_event=None, **kwargs):
+            assert abort_event is not None
+            state["abort_event"] = abort_event
+            build_started = threading.Event()
+
+            def fake_build():
+                # Mirrors build_joern_evidence's step-boundary poll.
+                build_started.set()
+                state["interrupted"] = abort_event.wait(timeout=30)
+                return None
+
+            fut = pool.submit(fake_build)
+            # Structural running-ness (like production, where the
+            # build is in flight before prep): a fixed sleep let a
+            # starved pool worker start late, the discard's cancel()
+            # landed, and the not-cancelled assert false-failed.
+            assert build_started.wait(timeout=10)
+            state["future"] = fut
+            return (None, fut)
+
+        monkeypatch.setattr(
+            orch_mod, "_resolve_joern_evidence_raw", fake_resolve,
+        )
+        try:
+            orch_mod.run_orchestrator(
+                _presweep_config(target, out), _clean_review_fn,
+            )
+        finally:
+            pool.shutdown(wait=True)
+
+        assert isinstance(state.get("abort_event"), threading.Event)
+        assert state["abort_event"].is_set()
+        assert state["interrupted"] is True
+        assert state["future"].done()
+        assert not state["future"].cancelled()
+
+
+@pytest.mark.slow
+class TestPerPassWallClockPhases:
+    """Prep sub-passes and post-loop passes book wall time into the
+    run ledger (cost-breakdown.json's phases block)."""
+
+    def test_prep_and_postloop_phases_booked(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        import itertools
+        from types import SimpleNamespace
+
+        import core.audit.cost_tracker as ct_mod
+        from core.audit.orchestrator import run_orchestrator
+
+        # Deterministic step clock for the ledger: every read
+        # advances 1ms, so each start_phase/end marker pair books a
+        # positive pass wall by construction. The sum assert below
+        # then pins that the markers were laid down AND closed
+        # (structural), instead of deriving "prep did work" from the
+        # real clock — which under a loaded runner measured the
+        # scheduler, not the booking.
+        ticks = itertools.count(1)
+        monkeypatch.setattr(
+            ct_mod, "time",
+            SimpleNamespace(monotonic=lambda: next(ticks) * 0.001),
+        )
+
+        target, out = _presweep_target(tmp_path)
+        result = run_orchestrator(
+            _presweep_config(target, out), _clean_review_fn,
+        )
+
+        phases = result.cost_tracker.phases
+        expected = (
+            "prep_macro_recovery",
+            "prep_context_map",
+            "prep_taint_passes",
+            "prep_evidence_index",
+            "prep_gap_compute",
+            "prep_triage",
+            "prep_mechanical_detectors",
+            "prep_finalize",
+            "iterative_re_review",
+            "confidence_propagation",
+            "resolve_gate_demoted",
+            "auto_synthesize_rules",
+            "flow_trace_review",
+            "post_loop_checks",
+        )
+        for name in expected:
+            assert name in phases, f"missing phase: {name}"
+        # Every prep marker was opened and closed — under the step
+        # clock each pair books a positive pass wall, so a zero sum
+        # can only mean the markers stopped being laid down. Pass
+        # wall stays out of the per-call wall_time_s accounting.
+        assert sum(
+            phases[n].pass_wall_time_s
+            for n in expected if n.startswith("prep_")
+        ) > 0.0
+        # No dangling open phase at run end.
+        assert result.cost_tracker._active_phase is None
+        # The phases serialize into the cost-breakdown shape.
+        d = result.cost_tracker.to_dict()
+        assert "prep_triage" in d["phases"]
+
+    def test_cpg_build_time_lands_on_the_joern_tier(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        import core.audit.orchestrator as orch_mod
+
+        target, out = _presweep_target(tmp_path)
+
+        def fake_start(path, overrides, jt, out_dir=None,
+                       exclude_dirs=(), scope_exclude_dirs=(),
+                       timings_out=None):
+            if timings_out is not None:
+                timings_out["cpg_build_s"] = 7.5
+            return None
+
+        monkeypatch.setattr(
+            orch_mod, "_start_joern_server_raw", fake_start,
+        )
+        result = orch_mod.run_orchestrator(
+            _presweep_config(target, out), _clean_review_fn,
+        )
+        assert result.tier_counters["joern"].cpg_build_s == 7.5
+
+
+class TestPhase2bChainCommit:
+    """Phase-2b chain outcomes vs the tool-gated promotion firewall.
+
+    Chain composition is an LLM judgement, so a chain outcome may
+    claim ``finding`` only when both constituent bugs carry real tool
+    receipts (the joined stamp passes ``is_tool_evidence``); anything
+    less commits as ``suspicious``. The pre-fix unconditional
+    ``finding`` with the unregistered ``chain_detector`` stamp fired
+    the CRITICAL promotion alarm on every legitimate chain and was
+    silently demoted at export while already counted."""
+
+    @staticmethod
+    def _run(monkeypatch, tmp_path: Path, constituents, chain):
+        import core.audit.chain_detector as chain_mod
+        import core.audit.orchestrator as orch_mod
+        import core.audit.security_classifier as sc_mod
+
+        result = OrchestratorResult()
+        result.outcomes = list(constituents)
+        config = OrchestratorConfig(
+            target_path=tmp_path, out_dir=tmp_path,
+        )
+        monkeypatch.setattr(orch_mod, "_run_llm_client", lambda cfg: None)
+        monkeypatch.setattr(
+            orch_mod, "_make_dispatch_gate",
+            lambda cfg, stop_check=None: (lambda: False),
+        )
+        monkeypatch.setattr(
+            sc_mod, "classify_security_impact",
+            lambda *a, **k: {},
+        )
+        monkeypatch.setattr(
+            chain_mod, "find_chain_candidates",
+            lambda outcomes, out_dir, cls: [
+                (constituents[0], constituents[1]),
+            ],
+        )
+        monkeypatch.setattr(
+            chain_mod, "evaluate_chains",
+            lambda cands, client, **kw: [chain],
+        )
+        orch_mod._run_phase2(result, config)
+        return result
+
+    @staticmethod
+    def _constituents(tool_a: str, tool_b: str):
+        return [
+            ReviewOutcome(
+                file="a.c", function="f", status="finding",
+                body="b", hypothesis="h", evidence_tool=tool_a,
+            ),
+            ReviewOutcome(
+                file="b.c", function="g", status="finding",
+                body="b", hypothesis="h", evidence_tool=tool_b,
+            ),
+        ]
+
+    _CHAIN = {
+        "bug_a": "a.c:f", "bug_b": "b.c:g",
+        "chain_description": "A leaks a pointer B dereferences",
+        "primitive": "read", "confidence": "high",
+    }
+
+    def test_receipt_backed_chain_commits_as_finding(
+        self, monkeypatch, tmp_path: Path,
+    ):
+        from core.audit.evidence_grade import is_tool_evidence
+
+        result = self._run(
+            monkeypatch, tmp_path,
+            self._constituents("semgrep", "joern:flow"), dict(self._CHAIN),
+        )
+        chain_out = result.outcomes[-1]
+        assert chain_out.review_result["chain"] is True
+        assert chain_out.status == "finding"
+        assert chain_out.evidence_tool == "semgrep+joern:flow"
+        assert is_tool_evidence(chain_out.evidence_tool)
+        assert result.findings == 1
+
+    def test_unreceipted_chain_commits_as_suspicious_not_counted(
+        self, monkeypatch, tmp_path: Path,
+    ):
+        result = self._run(
+            monkeypatch, tmp_path,
+            self._constituents("", "llm-claimed:manual"), dict(self._CHAIN),
+        )
+        chain_out = result.outcomes[-1]
+        assert chain_out.review_result["chain"] is True
+        assert chain_out.status == "suspicious"
+        assert chain_out.evidence_tool == "chain_detector"
+        assert result.findings == 0
+
+    def test_half_receipted_chain_commits_as_suspicious(
+        self, monkeypatch, tmp_path: Path,
+    ):
+        # One receipt-backed constituent must not lend its receipt to
+        # the composition claim.
+        result = self._run(
+            monkeypatch, tmp_path,
+            self._constituents("semgrep", ""), dict(self._CHAIN),
+        )
+        assert result.outcomes[-1].status == "suspicious"
+        assert result.outcomes[-1].evidence_tool == "chain_detector"
+        assert result.findings == 0
+
+    def test_committed_chains_never_alarm_or_demote(
+        self, monkeypatch, tmp_path: Path,
+    ):
+        # The alarm channel is documented EMPTY on legitimate runs;
+        # both chain lanes must survive the enforcing export sweep
+        # untouched.
+        from core.audit.promotion_alarm import ALARM_FILENAME, check_outcomes
+
+        for tools, status in (
+            (("semgrep", "joern:flow"), "finding"),
+            (("", ""), "suspicious"),
+        ):
+            out_dir = tmp_path / f"run-{status}"
+            out_dir.mkdir()
+            result = self._run(
+                monkeypatch, out_dir,
+                self._constituents(*tools), dict(self._CHAIN),
+            )
+            chain_out = result.outcomes[-1]
+            check_outcomes(
+                out_dir, [chain_out], stage="findings-export",
+                enforce=True,
+            )
+            assert chain_out.status == status
+            assert not (out_dir / ALARM_FILENAME).exists()
+
+
+class TestReReviewCostBooking:
+    """Every post-loop re-review pass books its LLM spend: the phase
+    ledger gets a re_review record for each call, and a call whose
+    verdict is KEPT (no tally) still lands in result.total_cost_usd —
+    otherwise the --max-cost rail under-enforces by the untracked
+    spend and cost-breakdown.json shows the money only as end-of-run
+    unattributed residual."""
+
+    COST = 0.25
+
+    def _patch_ctx(self, monkeypatch):
+        import core.audit.orchestrator as orch_mod
+
+        monkeypatch.setattr(
+            orch_mod, "_build_context",
+            lambda config, gap, *a, **kw: {
+                "file": gap["file"], "function": gap["name"],
+                "line_start": gap.get("line_start", 1),
+            },
+        )
+        monkeypatch.setattr(
+            orch_mod, "_commit_outcome", lambda *a, **kw: None,
+        )
+        return orch_mod
+
+    def _review_fn(self, status: str):
+        def review_fn(ctx, cfg):
+            return ReviewOutcome(
+                file="a.c", function="f", status=status,
+                body="re-review", hypothesis="h", cost_usd=self.COST,
+            )
+        return review_fn
+
+    def _assert_booked(self, result):
+        assert result.cost_tracker.phases["re_review"].cost_usd == (
+            pytest.approx(self.COST)
+        )
+        assert result.total_cost_usd == pytest.approx(self.COST)
+
+    def test_joern_enriched_kept_verdict_books_spend(
+        self, tmp_path, monkeypatch,
+    ):
+        import time as _time
+        from unittest.mock import MagicMock
+
+        orch_mod = self._patch_ctx(monkeypatch)
+
+        prior = ReviewOutcome(
+            file="a.c", function="f", status="clean", body="ok",
+        )
+        result = OrchestratorResult(clean=1)
+        result.outcomes = [prior]
+        config = OrchestratorConfig(target_path=tmp_path, out_dir=tmp_path)
+
+        rec = MagicMock()
+        rec.all_joern_flows.return_value = ["flow"]
+
+        orch_mod._re_review_joern_enriched(
+            result, config, self._review_fn("clean"),
+            checklist={"files": []},
+            context_map=None,
+            fuzz_coverage=None,
+            evidence_index={"a.c:f": rec},
+            sarif_cache=None,
+            entry_points=set(),
+            gaps_before_joern=[
+                {"file": "a.c", "name": "f", "line_start": 1},
+            ],
+            start_time=_time.monotonic(),
+            on_progress=None,
+        )
+        # Verdict kept clean: no tally ran, the spend must still land.
+        assert result.outcomes[0] is prior
+        self._assert_booked(result)
+
+    def test_joern_enriched_changed_verdict_books_phase(
+        self, tmp_path, monkeypatch,
+    ):
+        import time as _time
+        from unittest.mock import MagicMock
+
+        orch_mod = self._patch_ctx(monkeypatch)
+
+        prior = ReviewOutcome(
+            file="a.c", function="f", status="clean", body="ok",
+        )
+        result = OrchestratorResult(clean=1)
+        result.outcomes = [prior]
+        config = OrchestratorConfig(target_path=tmp_path, out_dir=tmp_path)
+
+        rec = MagicMock()
+        rec.all_joern_flows.return_value = ["flow"]
+
+        orch_mod._re_review_joern_enriched(
+            result, config, self._review_fn("suspicious"),
+            checklist={"files": []},
+            context_map=None,
+            fuzz_coverage=None,
+            evidence_index={"a.c:f": rec},
+            sarif_cache=None,
+            entry_points=set(),
+            gaps_before_joern=[
+                {"file": "a.c", "name": "f", "line_start": 1},
+            ],
+            start_time=_time.monotonic(),
+            on_progress=None,
+        )
+        assert result.outcomes[0].status == "suspicious"
+        self._assert_booked(result)
+
+    def test_callee_contract_kept_verdict_books_spend(
+        self, tmp_path, monkeypatch,
+    ):
+        import time as _time
+
+        orch_mod = self._patch_ctx(monkeypatch)
+
+        caller = ReviewOutcome(
+            file="a.c", function="f", status="clean", body="ok",
+            review_result={
+                "relies_on": [
+                    {"callee": "g", "assumption": "validates input"},
+                ],
+            },
+        )
+        callee = ReviewOutcome(
+            file="a.c", function="g", status="finding",
+            body="bad", evidence_tool="semgrep",
+        )
+        result = OrchestratorResult(clean=1, findings=1)
+        result.outcomes = [caller, callee]
+        config = OrchestratorConfig(target_path=tmp_path, out_dir=tmp_path)
+
+        re_reviewed = orch_mod._callee_contract_requeue(
+            result, config, self._review_fn("clean"),
+            checklist={"files": []},
+            context_map=None,
+            fuzz_coverage=None,
+            evidence_index={},
+            start_time=_time.monotonic(),
+        )
+        assert re_reviewed == 0  # verdict kept
+        self._assert_booked(result)
+
+    def test_study_enriched_kept_verdict_books_spend(
+        self, tmp_path, monkeypatch,
+    ):
+        import time as _time
+
+        orch_mod = self._patch_ctx(monkeypatch)
+
+        prior = ReviewOutcome(
+            file="a.c", function="f", status="clean", body="ok",
+        )
+        result = OrchestratorResult(clean=1)
+        result.outcomes = [prior]
+        config = OrchestratorConfig(target_path=tmp_path, out_dir=tmp_path)
+
+        orch_mod._re_review_study_enriched(
+            result, config, self._review_fn("clean"),
+            checklist={"files": []},
+            context_map=None,
+            evidence_index={},
+            sarif_cache=None,
+            entry_points=set(),
+            reading_list_functions={"a.c:f"},
+            start_time=_time.monotonic(),
+            on_progress=None,
+        )
+        assert result.outcomes[0] is prior
+        self._assert_booked(result)
+
+    def test_disagreement_kept_verdict_books_spend(
+        self, tmp_path, monkeypatch,
+    ):
+        import time as _time
+        from types import SimpleNamespace
+
+        orch_mod = self._patch_ctx(monkeypatch)
+
+        prior = ReviewOutcome(
+            file="a.c", function="f", status="clean", body="ok",
+        )
+        result = OrchestratorResult(clean=1)
+        result.outcomes = [prior]
+        config = OrchestratorConfig(target_path=tmp_path, out_dir=tmp_path)
+
+        orch_mod._re_review_disagreements(
+            [SimpleNamespace(
+                file="a.c", function="f", resolution="needs_re_review",
+                mechanical_claim=None,
+            )],
+            result, config, self._review_fn("clean"),
+            checklist={
+                "files": [{
+                    "path": "a.c",
+                    "items": [{"name": "f", "line_start": 1}],
+                }],
+            },
+            context_map=None,
+            evidence_index={},
+            start_time=_time.monotonic(),
+            _on_progress=None,
+        )
+        # Verdict kept clean: no tally ran, the spend must still land.
+        assert result.outcomes[0] is prior
+        self._assert_booked(result)
+
+    def test_disagreement_changed_verdict_books_phase(
+        self, tmp_path, monkeypatch,
+    ):
+        import time as _time
+        from types import SimpleNamespace
+
+        orch_mod = self._patch_ctx(monkeypatch)
+
+        prior = ReviewOutcome(
+            file="a.c", function="f", status="clean", body="ok",
+        )
+        result = OrchestratorResult(clean=1)
+        result.outcomes = [prior]
+        config = OrchestratorConfig(target_path=tmp_path, out_dir=tmp_path)
+
+        orch_mod._re_review_disagreements(
+            [SimpleNamespace(
+                file="a.c", function="f", resolution="needs_re_review",
+                mechanical_claim=None,
+            )],
+            result, config, self._review_fn("suspicious"),
+            checklist={
+                "files": [{
+                    "path": "a.c",
+                    "items": [{"name": "f", "line_start": 1}],
+                }],
+            },
+            context_map=None,
+            evidence_index={},
+            start_time=_time.monotonic(),
+            _on_progress=None,
+        )
+        assert result.outcomes[0].status == "suspicious"
+        self._assert_booked(result)
+
+
+class TestCallEdgesBootstrapPredicate:
+    """The in-memory call-edge bootstrap fires for maps that carry no
+    usable edges: never enriched, or shed by the size budget."""
+
+    def _pred(self, cm):
+        from core.audit.orchestrator import _call_edges_need_bootstrap
+        return _call_edges_need_bootstrap(cm)
+
+    def test_absent_key_bootstraps(self):
+        assert self._pred({}) is True
+
+    def test_shed_empty_list_with_marker_bootstraps(self):
+        assert self._pred({
+            "call_edges": [],
+            "call_edges_shed": "shed by the context-map size budget",
+        }) is True
+
+    def test_populated_edges_do_not_bootstrap(self):
+        assert self._pred({
+            "call_edges": [{"caller": "f", "callee": "g"}],
+        }) is False
+
+    def test_genuinely_empty_without_marker_does_not_bootstrap(self):
+        # The enricher ran and found no edges; re-running finds none.
+        assert self._pred({"call_edges": []}) is False

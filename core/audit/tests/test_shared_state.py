@@ -110,3 +110,21 @@ class TestMutableFieldIsolation:
         ss2 = SharedState()
         ss.reviewed_before_joern.append({"fn": "test"})
         assert ss2.reviewed_before_joern == []
+
+
+class TestQuarantineSnapshotLocking:
+    def test_snapshot_taken_under_rule_triage_lock(self):
+        # quarantined_rules is mutated under _rule_triage_lock by the
+        # triage writer; the mid-loop synthesis snapshot iterates it
+        # from worker threads and must copy under the same lock or a
+        # concurrent quarantine can raise "set changed size during
+        # iteration".
+        import inspect
+
+        import core.audit.orchestrator as orch
+
+        src = inspect.getsource(orch)
+        i = src.index("quarantined_rules=quarantined_snapshot")
+        window = src[max(0, i - 800):i]
+        assert "with shared._rule_triage_lock:" in window
+        assert "quarantined_snapshot = set(shared.quarantined_rules)" in window

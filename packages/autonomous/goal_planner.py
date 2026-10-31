@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Goal-Directed Planning - High-Level Objective Achievement
+Goal-Directed Planning - Goal Parsing and Crash Re-ranking
 
-This module enables RAPTOR to work towards user-specified goals:
-- "Find heap overflow vulnerabilities"
-- "Target parser code"
-- "Achieve remote code execution"
-- "Test authentication bypass"
+Parses user-specified goals ("find heap overflow vulnerabilities",
+"target parser code", "achieve remote code execution") into
+structured Goal objects, and re-ranks crashes by goal alignment.
+Goals steer prioritisation only — the fuzz loop's duration and stop
+conditions are the operator's timer, not goal state.
 """
 
 import time
@@ -45,11 +45,15 @@ class Goal:
 
 
 class GoalPlanner:
-    """
-    Plans actions to achieve high-level goals.
+    """Parses operator goals and re-ranks crashes against them.
 
-    Transforms abstract goals like "find heap overflow" into concrete
-    fuzzing strategies and analysis priorities.
+    Historic goal-progress methods (adapt_fuzzing_strategy /
+    update_goal_progress / should_continue_towards_goal) were removed:
+    they had no production caller, and should_continue_towards_goal
+    looped forever on FIND_VULNERABILITY_TYPE goals — no code path
+    ever set ``achieved`` for that goal type. Any future stop-
+    condition wiring must close that loop (verify the crash type
+    actually matches) before consulting goal state.
     """
 
     def __init__(self) -> None:
@@ -176,47 +180,6 @@ class GoalPlanner:
             }
         )
 
-    def adapt_fuzzing_strategy(self, base_strategy: dict) -> dict:
-        """
-        Adapt fuzzing strategy based on current goal.
-
-        Args:
-            base_strategy: Base fuzzing strategy
-
-        Returns:
-            Goal-adapted strategy
-        """
-        if not self.current_goal:
-            return base_strategy
-
-        adapted = base_strategy.copy()
-        hints = self.current_goal.strategy_hints
-
-        # Apply strategy hints
-        if hints.get("focus_on_memory"):
-            logger.info("Goal: Focusing on memory operations")
-            adapted["extra_flags"] = (adapted.get("extra_flags") or []) + ["-m", "none"]
-
-        if hints.get("enable_asan"):
-            logger.info("Goal: Recommending ASAN for memory bugs")
-            # This is a hint to the user, can't force it
-
-        if hints.get("mutation_strategy") == "aggressive":
-            logger.info("Goal: Using aggressive mutations")
-            adapted["extra_flags"] = (adapted.get("extra_flags") or []) + ["-L", "0"]
-
-        if hints.get("mutation_strategy") == "diverse":
-            logger.info("Goal: Using diverse mutations")
-            adapted["extra_flags"] = (adapted.get("extra_flags") or []) + ["-D"]
-
-        if hints.get("parallel_instances"):
-            from core.tuning import get_tuning
-            ceiling = get_tuning().max_fuzz_parallel
-            adapted["parallel"] = min(hints["parallel_instances"], ceiling)
-            logger.info("Goal: Using %s parallel instances", adapted['parallel'])
-
-        return adapted
-
     def prioritize_crashes_for_goal(self, crashes: list) -> list:
         """
         Prioritize crashes based on current goal.
@@ -267,70 +230,14 @@ class GoalPlanner:
 
         return [c for c, s in scored_crashes]
 
-    def update_goal_progress(self, fuzzing_state) -> None:
-        """
-        Update progress towards current goal.
-
-        Args:
-            fuzzing_state: Current fuzzing state
-        """
-        if not self.current_goal:
-            return
-
-        goal = self.current_goal
-
-        if goal.goal_type == GoalType.FIND_ANY_CRASH:
-            if fuzzing_state.total_crashes > 0:
-                goal.progress = 1.0
-                goal.achieved = True
-                logger.info("✓ GOAL ACHIEVED: %s", goal.description)
-
-        elif goal.goal_type == GoalType.MAXIMIZE_COVERAGE:
-            # Progress based on coverage growth rate
-            if fuzzing_state.total_coverage > 0:
-                # Normalize progress (arbitrary scale)
-                goal.progress = min(1.0, fuzzing_state.total_coverage / 10000.0)
-
-        elif goal.goal_type == GoalType.FIND_VULNERABILITY_TYPE:
-            # Check if we found the target vulnerability
-            if fuzzing_state.total_crashes > 0:
-                # Would need to check crash types
-                goal.progress = 0.5  # Partial progress for finding any crash
-
-        # Log progress
-        if goal.progress > 0:
-            logger.info("Goal progress: %.1f%%", goal.progress * 100)
-
-    def should_continue_towards_goal(self, fuzzing_state) -> bool:
-        """
-        Decide if we should continue fuzzing to achieve goal.
-
-        Args:
-            fuzzing_state: Current fuzzing state
-
-        Returns:
-            True if should continue
-        """
-        if not self.current_goal:
-            return True  # No goal, use default logic
-
-        goal = self.current_goal
-
-        # If goal achieved, we can stop
-        if goal.achieved:
-            logger.info("Goal achieved: %s", goal.description)
-            return False
-
-        # If goal is to find specific vulnerability, keep going until found
-        if goal.goal_type == GoalType.FIND_VULNERABILITY_TYPE:
-            # Keep going if we haven't found it yet
-            return not goal.achieved
-
-        # Default: continue
-        return True
-
     def get_summary(self) -> dict:
-        """Get summary of goals and progress."""
+        """Get summary of goals and progress.
+
+        ``progress`` / ``achieved`` are static defaults today: no
+        production path advances them (the progress updater was
+        removed as dead code). The keys stay for report-shape
+        compatibility.
+        """
         return {
             "current_goal": {
                 "description": self.current_goal.description,

@@ -5,7 +5,9 @@ dispatch: libexec/raptor-render-diagrams <out-dir> [args]
 
 # /diagram
 
-Turn `/understand` and `/validate` JSON outputs into Mermaid diagrams. Instead of reading raw JSON, you get a visual map of entry points, trust boundaries, sinks, attack trees, and attack paths.
+Turn `/understand` and `/validate` JSON outputs into Mermaid diagrams. Instead of reading raw JSON, you get a visual map of entry points, trust boundaries, sinks, attack trees, and attack paths. Consider this very much a WIP, but it can be of use to those wanting to see relationships and flows better.
+
+Diagrams are auto-generated at the end of `/validate` and `/understand --map`/`--trace`; use `/diagram <dir>` to re-render after manual edits to the JSON outputs.
 
 ## Usage
 
@@ -28,6 +30,7 @@ read-only preview, or `--force` if you really do want to overwrite an existing
 | `attack-paths.json` | flowchart TD per path | Step chain with proximity score (0–10) and blocker annotations |
 | `hypotheses.json` | flowchart TD | Hypothesis states |
 | `findings.json` | pie | Verdict/type summary (rendered when 2+ findings) |
+| `graph/raptor.graph.sqlite` | flowchart LR | Fallback context map from persistent `/understand` graph memory when local JSON is absent |
 
 Black-box binary `context-map.json` files (and `binary-context-map.json`) also render xref-backed candidate call
 edges as dotted grey edges labelled `candidate`. They are deliberately not
@@ -56,7 +59,7 @@ Writes `diagrams.md` into the target directory next to the existing JSON files. 
 libexec/raptor-render-diagrams <out-dir> [--target <name>] [--stdout] [--force]
 ```
 
-Parse `$ARGS` for `<out-dir>` and `--target`, then run the command. Show the output path.
+Parse `$ARGUMENTS` for `<out-dir>` and `--target`, then run the command. Show the output path.
 
 ## When to run
 

@@ -18,7 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..models import Confidence, Dependency, Manifest, PinStyle
-from . import _hook_patterns
+from ..parsers import _safe_read
+from . import _hook_patterns, _own_host
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -66,12 +67,42 @@ def scan_target(
     if not target.is_dir():
         return []
     deps_list = list(deps)
-    host = _host_dep_for_target(deps_list, manifests, target) \
+    fallback_host = _host_dep_for_target(deps_list, manifests, target) \
         or _placeholder_for_target(target)
+    # Multi-gem monorepo: anchor EACH script to the closest RubyGems
+    # manifest dominating it (as binary_in_package does for binaries)
+    # rather than pinning every extconf in the tree to the FIRST
+    # manifest — that attributed gem B's extension script to gem A,
+    # fragmented the composite HOOK/BINARY pair across the two gems'
+    # hosts, and keyed the publish-helper suppression on the wrong
+    # name.  Fall back to the historical first-manifest host when no
+    # RubyGems manifest dominates the script.
+    rubygems_manifests = [
+        m for m in manifests
+        if m.ecosystem == "RubyGems" and not m.is_lockfile
+    ]
     out: list[RubyGemsLifecycleFinding] = []
     for script in _iter_extconf_scripts(target):
+        host = (_dominating_host(script, rubygems_manifests)
+                or fallback_host)
         out.extend(_scan_script(script, target, host))
     return out
+
+
+def _dominating_host(
+    script: Path, rubygems_manifests: list[Manifest],
+) -> Dependency | None:
+    """Host anchored at the deepest RubyGems manifest whose directory
+    dominates ``script``; None when no manifest dominates."""
+    from ._closest_manifest import closest_manifest
+    m = closest_manifest(rubygems_manifests, script)
+    if m is None:
+        return None
+    return _own_host.resolve_own_host(
+        m,
+        reason="placeholder for rubygems-lifecycle-hook finding host",
+        placeholder_name="<extconf>",
+    )
 
 
 def _iter_extconf_scripts(target: Path) -> Iterable[Path]:
@@ -79,8 +110,12 @@ def _iter_extconf_scripts(target: Path) -> Iterable[Path]:
     from ..discovery import EXCLUDED_DIR_NAMES
     import os
     for dirpath, dirnames, filenames in os.walk(target):
-        dirnames[:] = [d for d in dirnames if d not in EXCLUDED_DIR_NAMES]
-        for fn in filenames:
+        # Sorted so evidence order is filesystem-independent (parity
+        # with reachability._walker's determinism rule).
+        dirnames[:] = sorted(
+            d for d in dirnames if d not in EXCLUDED_DIR_NAMES
+        )
+        for fn in sorted(filenames):
             if fn in _EXTCONF_NAMES:
                 yield Path(dirpath) / fn
 
@@ -88,13 +123,9 @@ def _iter_extconf_scripts(target: Path) -> Iterable[Path]:
 def _scan_script(
     script: Path, target: Path, host: Dependency,
 ) -> list[RubyGemsLifecycleFinding]:
-    try:
-        body = script.read_text(encoding="utf-8", errors="replace")
-    except OSError as e:
-        logger.debug(
-            "sca.supply_chain.rubygems_lifecycle_hooks: %s read failed: %s",
-            script, e,
-        )
+    body = _safe_read.read_bounded(script, follow_symlinks=False)
+    if body is None:
+        # ``read_bounded`` already logged the underlying reason.
         return []
     analysis = _hook_patterns.analyse_body(body)
     try:
@@ -108,10 +139,12 @@ def _scan_script(
         reads_credentials=analysis.reads_credentials,
         has_publish_action=analysis.has_publish_action,
     )
+    worm_conjunction = (
+        analysis.reads_credentials and analysis.has_publish_action
+    )
     worm_shape = (
-        analysis.reads_credentials
-        and analysis.has_publish_action
-        and not _hook_patterns.is_publish_helper(host)
+        worm_conjunction
+        and not _hook_patterns.is_attested_publish_helper(host)
     )
     if analysis.reasons:
         return [RubyGemsLifecycleFinding(
@@ -132,6 +165,23 @@ def _scan_script(
                 ),
             ),
         )]
+    if worm_conjunction:
+        # Worm conjunction fired but the host is an ATTESTED publish
+        # helper — suppress the HIGH promotion, but keep a
+        # low-severity row (parity with the npm adapter's
+        # fall-through) so the HOOK family survives for the composite
+        # chokepoint and the suppression stays operator-visible.
+        return [RubyGemsLifecycleFinding(
+            dependency=host, hit=hit, severity="low",
+            confidence=Confidence(
+                "medium",
+                reason=(
+                    "extconf.rb reads credentials and invokes a "
+                    "publish action, but the gem is an attested "
+                    "publish helper — worm-shape promotion suppressed"
+                ),
+            ),
+        )]
     # FP-tightening: ``extconf.rb`` legitimately calls ``system``
     # for autoconf-style platform probes; mere presence isn't
     # signal.  Only pattern-hit and worm-shape earn a finding.
@@ -143,9 +193,13 @@ def _host_dep_for_target(
     manifests: Sequence[Manifest],
     target: Path,
 ) -> Dependency | None:
-    """Find the first RubyGems dep whose declared manifest is under
-    ``target``.  Used to attribute extconf findings to the host
-    gemspec/Gemfile."""
+    """Anchor extconf findings at the first RubyGems manifest under
+    ``target``, carrying the gem's OWN name (gemspec) when it
+    declares one.  The extconf script is the gem's own code —
+    attributing it to whichever dep the parser emitted first named
+    an innocent third party and keyed the publish-helper worm-shape
+    suppression on the wrong name."""
+    del deps
     for m in manifests:
         if m.ecosystem != "RubyGems" or m.is_lockfile:
             continue
@@ -153,9 +207,11 @@ def _host_dep_for_target(
             m.path.relative_to(target)
         except ValueError:
             continue
-        for d in deps:
-            if d.declared_in == m.path:
-                return d
+        return _own_host.resolve_own_host(
+            m,
+            reason="placeholder for rubygems-lifecycle-hook finding host",
+            placeholder_name="<extconf>",
+        )
     return None
 
 

@@ -41,7 +41,11 @@ to preserve it for re-inspection.
 
 Safety posture (world-writable /tmp on a shared box):
 
-  - Only entries directly under :func:`tempfile.gettempdir` whose name
+  - Only entries directly under a sweep root — :func:`tempfile.gettempdir`,
+    the real system tmp root (under the launcher gettempdir() is the
+    per-session TMPDIR, so root-level strays from bare-shell runs were
+    otherwise invisible forever), and the lane-socket fallback base
+    ``/run/user/<uid>`` (lane dirs only) — whose name
     matches a known RAPTOR prefix, an anchored third-party tool name
     that only RAPTOR's own tool runs strand here
     (``_ANCHORED_DIR_PREFIXES``), or a neutral de-branded scratch name
@@ -68,6 +72,7 @@ import os
 import shutil
 import socket
 import stat
+import sys
 import tempfile
 from pathlib import Path
 
@@ -93,9 +98,13 @@ _DIR_PREFIXES = (
     # IRIS per-refinement CodeQL pack scratch (core/iris/codeql_runner.py);
     # rmtree'd in the runner's finally.
     "raptor-iris-codeql-",
-    # Recon-agent clone scratch (packages/recon/agent.py); rmtree'd on
-    # exit unless --keep. A --keep dir surviving past the age floor is
-    # forgotten debug output — the sweep reclaims it like any other.
+    # Line-checker build scratch (packages/binary_analysis/
+    # blamed_lines.py TemporaryDirectory); cleaned on exit, leaked on
+    # SIGKILL/OOM.
+    "raptor-line-checker-",
+    # Historical recon-agent clone scratch (the deprecated
+    # packages/recon agent, since removed, used this prefix). Kept so
+    # the sweep still reclaims leftovers written by older installs.
     "raptor_recon_",
     # CPython multiprocessing's own resource dir — leaks when a process
     # (e.g. a sandboxed child we SIGKILL) dies without cleanup.
@@ -113,6 +122,16 @@ _DIR_PREFIXES = (
     # (removed on stop(); survives when the parent dies or a worker
     # hangs past the join grace).
     "raptor-ghidra-",
+    # eBPF ISA-probe object-build scratch (packages/ghidra/
+    # ebpf_probe.py TemporaryDirectory); cleaned up in the probe's
+    # finally, so survival past the floor means the process died
+    # mid-probe (SIGKILL/OOM skip the cleanup).
+    "raptor-ebpf-probe-",
+    # eBPF TLV cross-check decode scratch (packages/binary_analysis/
+    # corpus_profile.py TemporaryDirectory); cleaned by the context
+    # manager on exit, so survival past the floor means the process
+    # died mid-decode (SIGKILL/OOM skip the cleanup).
+    "raptor-ebpf-xcheck-",
     # Per-session pytest temp containment (root conftest.py): the test
     # session points TMPDIR/tempfile.tempdir at one scratch dir so raw
     # tempfile call sites in tests and code under test land inside it.
@@ -138,6 +157,11 @@ _DIR_PREFIXES = (
     # binary_oracle_cli.py); the artifacts outlive the resolve call and
     # are rmtree'd atexit, which SIGKILL skips.
     "raptor-oracle-envbuild-",
+    # Binary-oracle c++filt demangle scratch (core/analysis/
+    # binary_oracle.py TemporaryDirectory); context-managed, so
+    # survival past the floor means the process died mid-batch
+    # (SIGKILL/OOM skip __exit__).
+    "raptor-bo-demangle-",
     # Corpus excerpt trees (core/audit/corpus/run_corpus.py); ownership
     # passes to the corpus loop, released in its finally. The owner
     # holds a scratch keepalive while live (excerpt trees are written
@@ -156,6 +180,12 @@ _DIR_PREFIXES = (
     # covers core/env/build.py's raptor-env-build- staging contexts —
     # same always-cleaned contract, context-manager lifetime.
     "raptor-env-",
+    # Consented-exec staging copies of 0444 run-dir artifacts
+    # (core/sandbox/exec_stage.py; context-manager lifetime). Normally
+    # placed under exec_workdir()'s session dir; this entry covers the
+    # default-temp-dir fallback — a SIGKILLed run must never strand a
+    # mode-0o500 copy of an attacker-built binary in the system tmp.
+    "raptor-exec-stage-",
     # cve-env source-checkout work dirs (packages/cve_env
     # tools/source_build.py; cleanup()-scoped). retain() hands
     # ownership to the operator — a retained dir surviving past the
@@ -182,9 +212,9 @@ _DIR_PREFIXES = (
     # so only SIGKILL strands one). A live lane's socket still answers
     # and the in-use probe below keeps it out of the sweep. Lanes
     # minted under make_lane_dir's short-path fallback bases
-    # (/run/user/<uid>, /tmp when the temp dir is deep) sit outside
-    # the gettempdir() root this sweep covers — kept, never
-    # mis-deleted.
+    # (/run/user/<uid>, /tmp when the ambient temp dir is deep) are
+    # swept too, under the same guards — the fallback bases are extra
+    # sweep roots (see _sweep_roots; the /run/user base is lane-only).
     ".raptor-lane-",
     # Sandbox root stubs (core/sandbox/_spawn mkdtemp and the mount-ns
     # pid-named fallback); removed post-exit by _cleanup_stub, leaked
@@ -216,6 +246,46 @@ _DIR_PREFIXES = (
     # contract as raptor-coord-isolation- above.
     "raptor-pdsig-",
     "raptor-hifd-",
+    # --- Derivation-swept production scratch (one block) -----------
+    # Every prefix below was found by the mechanical mkdtemp /
+    # TemporaryDirectory sweep over production call sites (the census
+    # test derives the same set and asserts coverage — a NEW
+    # uncovered prefix fails there instead of stranding scratch
+    # forever). All are cleaned on exit paths only (finally blocks,
+    # context-manager __exit__, GC): SIGKILL and OOM skip every exit
+    # path, so cross-process reclamation needs the static entry. The
+    # age floor plus the in-use probes keep live dirs safe; each name
+    # is distinctly tool-scoped, so the prefix match cannot claim an
+    # operator's own files.
+    "audit-codeql-",
+    "binmatch-precision-",
+    "codeql-sweep-",
+    "codeql-warmup-",
+    "ghsa-resolve-",
+    "hv_sandbox_",
+    "raptor-bo-edges-",
+    "raptor-bo-stream-",
+    "raptor-bq-",
+    "raptor-describe-",
+    "raptor-doctor-probe-",
+    "raptor-feas-seccomp-",
+    "raptor-gcov-",
+    "raptor-joern-uds-",
+    "raptor-ls-remote-",
+    "raptor-resolver-home-",
+    "raptor-sca-",
+    "raptor-symex-",
+    "raptor_cc_probe_",
+    "raptor_dc_",
+    "raptor_fm_",
+    "raptor_gt_",
+    "raptor_pg_",
+    "raptor_selftest_",
+    "raptor_study_probe_",
+    "recall-sarif-chunks-",
+    "sanitizer-cut-precision-",
+    "semgrep-sbx-",
+    "source_intel_rules_",
 )
 
 # Third-party scratch names carry no RAPTOR marker and end in a bare
@@ -325,6 +395,165 @@ _ANCHORED_FILE_PATTERNS = (
     ("x2cpg", "stdout"),
     ("x2cpg", "stderr"),
 )
+
+# Pid-owned sidecar files. The root conftest points every pytest
+# process's default scorecard ledger at
+# ``raptor-pytest-scorecard-<pid>.json`` (plus its ``.lock`` flock
+# sibling) so test-minted cells never reach production telemetry.
+# Those names start with the ``raptor-pytest-`` DIR prefix above, so
+# the classifier routed them into dir candidates, where the S_ISDIR
+# squat guard skipped them every sweep — they accreted unbounded (one
+# pair per pytest process). The embedded pid is the liveness contract
+# (the reap_dead_pid_dirs precedent): a dead owner's pair is garbage
+# regardless of age, and a LIVE owner's lock sibling must never be
+# unlinked — a second process could then create and "hold" a fresh
+# lock file beside the live holder's flock. Non-pid spellings under
+# the prefix keep the dir-branch squat semantics.
+_PID_FILE_PATTERNS = (
+    ("raptor-pytest-scorecard-", ".json"),
+    ("raptor-pytest-scorecard-", ".json.lock"),
+)
+
+
+def _pid_file_match(name: str, prefix: str, suffix: str) -> int | None:
+    """The embedded pid when *name* is ``<prefix><digits><suffix>``
+    exactly; None otherwise."""
+    if not (name.startswith(prefix) and name.endswith(suffix)):
+        return None
+    digits = name[len(prefix):len(name) - len(suffix)]
+    if not digits or not digits.isdigit():
+        return None
+    return int(digits)
+
+
+# --------------------------------------------------------------------
+# Pid-liveness doctrine: namespaces and age floors
+# --------------------------------------------------------------------
+#
+# ``os.kill(pid, 0)`` verdicts are only meaningful about pids in the
+# CALLER'S pid namespace and only within one pid-reuse epoch. Inside a
+# child pid namespace every other session's live pid probes ESRCH
+# ("invisible from here", not "dead"), and even in the root namespace
+# a name-embedded pid may have been minted inside another namespace
+# (where it meant a different process) or already recycled. Every
+# liveness-based deletion below is therefore double-gated: refuse
+# entirely outside the root namespace, and never let ESRCH alone reap
+# a YOUNG entry — the mtime age floor is the backstop.
+
+# Fixed inode of the initial pid namespace's nsfs entry
+# (PROC_PID_INIT_INO in include/linux/proc_ns.h; ABI-stable since
+# namespace proc inodes were introduced).
+_PROC_PID_INIT_INO = 0xEFFFFFFC
+
+
+def _in_child_pid_ns() -> bool:
+    """True when this process runs in a non-initial pid namespace —
+    where kill(2) verdicts about other sessions' pids are meaningless.
+
+    Two unprivileged probes, either one sufficing to refuse:
+
+    - the ``/proc/self/ns/pid`` nsfs inode versus the kernel's fixed
+      initial-namespace inode. This works even under ``--mount-proc``,
+      where the remounted ``/proc`` hides every outer namespace (and
+      makes the NSpid line below single-entry). In every coherent
+      ``/proc`` shape — host-mounted or remounted — this primary
+      answers first and the NSpid leg below never decides.
+    - the NSpid entry count in ``/proc/self/status``: more than one
+      entry proves nesting below the namespace that mounted this
+      ``/proc``. Belt-and-braces for INCOHERENT ``/proc`` shapes
+      only: a ``/proc/self/ns/pid`` masked or bind-mounted from an
+      outer namespace (container runtimes overmounting proc entries)
+      while ``status`` still reflects nesting. Deliberately kept
+      although no test exercises it — it is dead code wherever
+      ``/proc`` is self-consistent — because a hit here can only ADD
+      a refusal (the fail-safe direction), never suppress one.
+
+    Non-Linux platforms have no pid namespaces, so the probe reads
+    False there (verdicts are always in-namespace). On Linux, probe
+    ERRORS read True — a ``/proc`` too broken to answer is not a
+    ``/proc`` to base deletions on (fail toward keeping).
+    """
+    if sys.platform != "linux":
+        return False
+    try:
+        if os.stat("/proc/self/ns/pid").st_ino != _PROC_PID_INIT_INO:
+            return True
+        with open("/proc/self/status", "rb") as fh:
+            for line in fh:
+                if line.startswith(b"NSpid:"):
+                    return len(line.split()) > 2
+        return False
+    except OSError:
+        return True
+
+
+# Age floor for pid-liveness dir reaping (reap_dead_pid_dirs): a dir
+# younger than this is NEVER reaped, whatever the liveness verdict.
+# A live session's scratch is always recently touched (core.run.scratch
+# keepalive-refreshes owned dirs' mtimes at most one interval apart),
+# so a young dir is presumed to belong to a live concurrent session
+# whose pid this process simply cannot judge. Churn-prone limit — both
+# directions:
+#   - LOWERED, ESRCH edges back toward being sufficient on its own: a
+#     concurrent session whose pid is invisible from here (nested
+#     containers, namespaced batteries) or already recycled loses LIVE
+#     scratch mid-run — the exact collateral this floor exists to
+#     stop. It must never drop below two keepalive ticks
+#     (2 * core.run.scratch._KEEPALIVE_INTERVAL_S) or a live
+#     keepalive'd dir could age past it between refreshes.
+#   - RAISED, killed sessions' scratch survives that much longer, and
+#     the leak this sweep exists for (one killed session's
+#     multi-million-inode build tree exhausted /tmp's inode table)
+#     gets that much more time to starve the filesystem. Hours, not
+#     days: past ~4h this sweep stops adding value over the 24h
+#     stale-tmp age gate.
+# The two-direction regression test pins both bounds.
+_PID_DIR_AGE_FLOOR_S: float = 3600.0
+
+# Age floor for UNVERIFIABLE owners — pid 1 (init in every namespace:
+# a probe against it is meaningless, and no kill() call with pid <= 1
+# is ever made) and EPERM verdicts (some process holds the pid under
+# another uid: the same-euid owner either exited and the pid was
+# recycled, or minted the name inside another namespace). Age-governed
+# instead of kept forever. Both directions:
+#   - LOWERED toward the dead floor, a quiet-but-live keepalive-less
+#     dir whose in-namespace pid collides with another uid's host
+#     process gets a shrinking survival margin; 24h matches the
+#     stale-tmp sweep's default floor, which the same dirs were
+#     already subject to.
+#   - RAISED, namespace-minted ``raptor-pytest-1-*`` roots (in-ns
+#     pid 1) accrete for that much longer — the observed pileup this
+#     floor exists to clear ran to hundreds of dirs.
+_UNVERIFIABLE_PID_DIR_AGE_FLOOR_S: float = 24 * 3600.0
+
+
+def _pid_alive(pid: int) -> bool:
+    """Conservative liveness for the pid-file contract: only a
+    confirmed-dead pid reads False. EPERM means alive under another
+    uid; any other surprise reads alive. Pid reuse at worst delays a
+    reap — the safe direction. OverflowError is in the net because
+    ``os.kill`` raises it (not OSError) for out-of-range pids — a
+    single poison-named file must read "alive" (kept, skipped), never
+    abort the sweep for every entry after it.
+
+    Namespace honesty: inside a child pid namespace every outer
+    session's pid probes ESRCH ("invisible from here", not "dead"),
+    so everything reads alive there — a dead owner's pair is
+    reclaimed by the next root-namespace sweep instead. pid 1 is init
+    in EVERY namespace: it reads alive without probing (no kill()
+    call is ever made with pid <= 1)."""
+    if pid <= 1:
+        return True
+    if _in_child_pid_ns():
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (OSError, OverflowError):
+        return True
+    return True
+
 
 _MAX_AGE_ENV = "RAPTOR_TMP_REAP_MAX_AGE_H"
 _DEFAULT_MAX_AGE_H = 24.0
@@ -475,6 +704,57 @@ def _dir_in_use(path: Path, live_cwds: set[str]) -> bool:
     return False
 
 
+# Fixed roots swept IN ADDITION to gettempdir(). Under the launcher,
+# gettempdir() is the per-session TMPDIR — strays with reaper-known
+# prefixes minted at the REAL system tmp root (bare-shell runs,
+# pre-containment sessions, the lane-socket short-path fallback) were
+# invisible to every launcher-session sweep and accumulated forever.
+# Module-level so tests can pin the sweep to private roots. Every root
+# gets the identical per-entry guards (same-euid, age floor, internal
+# activity, live-cwd/socket probes, identity re-check).
+_SYSTEM_TMP_ROOTS: tuple[str, ...] = ("/tmp",)
+
+# Keep in sync with core/sandbox/proxy.py's _LANE_DIR_PREFIX (proxy.py
+# imports heavier machinery; this module stays import-light).
+_LANE_DIR_PREFIX = ".raptor-lane-"
+
+
+def _lane_fallback_bases() -> tuple[str, ...]:
+    """``make_lane_dir()``'s fixed short-path fallback bases that are
+    not already full sweep roots (see core/sandbox/proxy.py: the lane
+    dir falls back to ``/run/user/<uid>`` then ``/tmp`` when the
+    ambient temp path would overflow ``sun_path``). ``/tmp`` is a full
+    root via _SYSTEM_TMP_ROOTS; ``/run/user/<uid>`` is swept for lane
+    dirs ONLY — the one RAPTOR artifact ever minted there."""
+    return (f"/run/user/{os.getuid()}",)
+
+
+def _sweep_roots() -> list[tuple[Path, bool]]:
+    """``(root, lane_only)`` pairs, existing dirs only, deduped by
+    realpath (a bare-shell run's gettempdir() IS the system root)."""
+    roots: list[tuple[Path, bool]] = []
+    seen: set[str] = set()
+
+    def _add(base: str, lane_only: bool) -> None:
+        if not base or not os.path.isdir(base):
+            return
+        try:
+            real = os.path.realpath(base)
+        except OSError:
+            return
+        if real in seen:
+            return
+        seen.add(real)
+        roots.append((Path(base), lane_only))
+
+    _add(tempfile.gettempdir(), False)
+    for base in _SYSTEM_TMP_ROOTS:
+        _add(base, False)
+    for base in _lane_fallback_bases():
+        _add(base, True)
+    return roots
+
+
 def reap_stale_tmp(now: float | None = None) -> list[Path]:
     """Remove orphaned RAPTOR temp artifacts; return the reaped paths.
 
@@ -492,31 +772,52 @@ def _reap(now: float | None) -> list[Path]:
     max_age = _max_age_seconds()
     if max_age is None:
         return []
-    tmp_root = Path(tempfile.gettempdir())
-    try:
-        names = os.listdir(tmp_root)
-    except OSError:
-        return []
 
     dir_candidates: list[Path] = []
     file_candidates: list[Path] = []
-    for name in names:
-        if any(name.startswith(p) for p in _dir_prefixes()) or any(
-            _anchored_name_match(name, p) for p in _ANCHORED_DIR_PREFIXES
-        ) or any(
-            _mkdtemp_anchored_match(name, p)
-            for p in _MKDTEMP_ANCHORED_DIR_PREFIXES
-        ):
-            dir_candidates.append(tmp_root / name)
-        elif any(
-            name.startswith(pre) and name.endswith(suf)
-            for pre, suf in _FILE_PATTERNS
-        ) or any(
-            _anchored_name_match(name, pre, suf)
-            for pre, suf in _ANCHORED_FILE_PATTERNS
-        ):
-            file_candidates.append(tmp_root / name)
-    if not dir_candidates and not file_candidates:
+    pid_file_candidates: list[tuple[Path, int]] = []
+    for tmp_root, lane_only in _sweep_roots():
+        try:
+            names = os.listdir(tmp_root)
+        except OSError:
+            continue
+        for name in names:
+            if lane_only:
+                # Narrow-scope root: only the lane-dir fallback ever
+                # lands RAPTOR artifacts here — everything else in it
+                # belongs to other subsystems entirely.
+                if name.startswith(_LANE_DIR_PREFIX):
+                    dir_candidates.append(tmp_root / name)
+                continue
+            # Pid-file patterns are checked FIRST: their names also
+            # match the raptor-pytest- dir prefix, and the dir branch's
+            # S_ISDIR squat guard would silently skip them forever.
+            pid: int | None = None
+            for pre, suf in _PID_FILE_PATTERNS:
+                pid = _pid_file_match(name, pre, suf)
+                if pid is not None:
+                    break
+            if pid is not None:
+                pid_file_candidates.append((tmp_root / name, pid))
+                continue
+            if any(name.startswith(p) for p in _dir_prefixes()) or any(
+                _anchored_name_match(name, p)
+                for p in _ANCHORED_DIR_PREFIXES
+            ) or any(
+                _mkdtemp_anchored_match(name, p)
+                for p in _MKDTEMP_ANCHORED_DIR_PREFIXES
+            ):
+                dir_candidates.append(tmp_root / name)
+            elif any(
+                name.startswith(pre) and name.endswith(suf)
+                for pre, suf in _FILE_PATTERNS
+            ) or any(
+                _anchored_name_match(name, pre, suf)
+                for pre, suf in _ANCHORED_FILE_PATTERNS
+            ):
+                file_candidates.append(tmp_root / name)
+    if (not dir_candidates and not file_candidates
+            and not pid_file_candidates):
         return []
 
     if now is None:
@@ -587,10 +888,241 @@ def _reap(now: float | None) -> list[Path]:
             continue
         reaped.append(path)
 
+    # Pid-owned sidecars: the embedded pid, not age, is the contract —
+    # a dead owner's pair is reaped even when fresh; a live owner's
+    # pair (its flock target in particular) is kept even when old.
+    for path, pid in pid_file_candidates:
+        try:
+            st = path.lstat()
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            continue
+        if st.st_uid != euid:
+            continue
+        if _pid_alive(pid):
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        reaped.append(path)
+
     if reaped:
         logger.info(
             "reaped %d stale temp artifact(s) from earlier interrupted runs",
             len(reaped),
+        )
+    return reaped
+
+
+def reap_dead_pid_dirs(root: Path, prefix: str, *, keep: int = 0,
+                       pid_suffix: bool = False) -> list[Path]:
+    """Remove ``<prefix><pid>`` dirs under *root* whose pid is dead.
+
+    For scratch families whose name embeds the owning pid as THE
+    liveness contract (the root conftest's darwin-emulation basetemp
+    roots, ``raptor-pytest-emu-<pid>``): per-pid roots defeat both
+    pytest's keep-last-N retention (it prunes numbered runs under one
+    shared basetemp, never sibling per-pid roots) and the stale-tmp
+    sweep's cadence, so dead sessions accreted tens of thousands of
+    inodes each.
+
+    A dead-probing pid is strong evidence the session is gone — but
+    only within this process's pid namespace and one pid-reuse epoch,
+    so it is never sufficient on its own:
+
+      - In a child pid namespace (``unshare`` batteries, nested CI
+        containers) EVERY outer session's live pid probes ESRCH; a
+        sweep running there deleted concurrent sessions' LIVE scratch
+        under the shared system tmp mid-run. The sweep refuses to run
+        at all outside the root namespace (:func:`_in_child_pid_ns`).
+      - Even in the root namespace a dead-probing pid may be a
+        namespace-minted name (a session's in-namespace pid means
+        nothing here) or sit in a reuse window, so ESRCH alone never
+        reaps a YOUNG dir: the mtime age floor
+        (``_PID_DIR_AGE_FLOOR_S``) is the backstop — a live session's
+        scratch is keepalive-refreshed and always recently touched.
+      - Unverifiable owners (pid 1 — init in every namespace — and
+        EPERM probes) are governed by the longer
+        ``_UNVERIFIABLE_PID_DIR_AGE_FLOOR_S`` instead of being kept
+        forever (observed: hundreds of namespace-minted
+        ``raptor-pytest-1-*`` roots accreting unreaped).
+      - Dirs this euid cannot remove (root-owned strays from
+        privileged runs) are skipped without probing and disclosed
+        once per sweep — never crashed on, never spammed per entry.
+
+    ``keep`` retains that many of the most-recently-modified DEAD dirs
+    for post-mortem inspection, mirroring pytest's own retention
+    semantics at the per-pid level.
+
+    ``pid_suffix=True`` widens the exact ``prefix + digits`` name rule
+    to ``prefix + digits + "-" + anything`` — the shape mkdtemp-minted
+    per-session scratch gets when its caller embeds the owning pid in
+    the mkdtemp prefix (``raptor-pytest-<pid>-<rand>``). The pid
+    segment stays digits-anchored between the literal prefix and the
+    literal ``-``, so sibling families that put WORDS there
+    (``raptor-pytest-emu-<pid>``) never match a widened sweep of the
+    shorter prefix, and a planted name cannot smuggle a live pid past
+    the check by decoration — the decoration is never parsed.
+
+    Safety posture matches the launcher's dead-session sweep: lstat
+    only (a symlink squatting on the name is never followed), dirs
+    only, same-euid only, exact-shape names, live pids always kept.
+    Best-effort by contract — never raises.
+    """
+    try:
+        return _reap_dead_pid_dirs(root, prefix, keep,
+                                   pid_suffix=pid_suffix)
+    except Exception as exc:  # noqa: BLE001 — sweep must never block a run
+        logger.debug("dead-pid dir sweep aborted: %s", exc)
+        return []
+
+
+def _reap_dead_pid_dirs(root: Path, prefix: str, keep: int, *,
+                        pid_suffix: bool = False) -> list[Path]:
+    if _in_child_pid_ns():
+        logger.debug(
+            "dead-pid dir sweep skipped under %s: this process runs in "
+            "a child pid namespace, where kill() verdicts about other "
+            "sessions' pids are meaningless", root,
+        )
+        return []
+    import time
+
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return []
+    now = time.time()
+    euid = os.geteuid()
+    dead: list[tuple[float, Path, os.stat_result]] = []
+    foreign_owned = 0
+    unremovable = 0
+    for name in names:
+        if not name.startswith(prefix):
+            continue
+        rest = name[len(prefix):]
+        if pid_suffix:
+            digits, sep, tail = rest.partition("-")
+            if not (sep and tail):
+                continue
+        else:
+            digits = rest
+        # ASCII-only, then a guarded parse: str.isdigit() accepts
+        # non-ASCII digits int() rejects (a planted `²` name would
+        # raise and — through the wrapper's blanket except — silently
+        # abort the WHOLE sweep, a one-dir DoS any local user can
+        # place in sticky /tmp). pid 0 is never a reapable owner
+        # (kill(0,0) probes the caller's own process group — reads
+        # eternally live — and no real scratch embeds it).
+        if not (digits.isascii() and digits.isdigit()):
+            continue
+        try:
+            pid = int(digits)
+        except ValueError:
+            continue
+        if pid == 0:
+            continue
+        if pid == os.getpid():
+            continue
+        path = root / name
+        try:
+            st = path.lstat()
+        except OSError:
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            continue
+        if st.st_uid != euid:
+            # Not removable by this euid (root-owned strays from
+            # privileged runs): skip without probing; disclosed once
+            # per sweep below.
+            foreign_owned += 1
+            continue
+        age = now - st.st_mtime
+        if age < _PID_DIR_AGE_FLOOR_S:
+            # Young dir: never reaped on a liveness verdict alone —
+            # see the floor's rationale at its definition.
+            continue
+        if pid == 1:
+            # pid 1 is init in EVERY pid namespace: such names are
+            # minted by sessions running inside their own namespace
+            # (their in-namespace pid is 1), so the real owner is
+            # unknowable from here — and no kill() call with
+            # pid <= 1 is ever made. Age-governed.
+            if age >= _UNVERIFIABLE_PID_DIR_AGE_FLOOR_S:
+                dead.append((st.st_mtime, path, st))
+            continue
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, OverflowError):
+            # Dead in this (root) namespace — or a pid beyond pid_t
+            # (a planted huge-digit name), which no live process can
+            # hold. The age floor above already vouched this is not a
+            # live concurrent session's fresh scratch.
+            dead.append((st.st_mtime, path, st))
+        except OSError:
+            # EPERM: some process holds this pid under another uid —
+            # the same-euid owner either exited and the pid was
+            # recycled, or minted the name inside another namespace.
+            # Unverifiable either way: age-governed so old strays are
+            # cleaned instead of accreting forever.
+            if age >= _UNVERIFIABLE_PID_DIR_AGE_FLOOR_S:
+                dead.append((st.st_mtime, path, st))
+            continue
+        else:
+            continue  # alive; keep
+    dead.sort(key=lambda entry: entry[0], reverse=True)
+    reaped: list[Path] = []
+    for _, path, st in dead[max(keep, 0):]:
+        # Same validation-to-delete identity pin as the sibling
+        # sweeps: everything above judged an lstat snapshot; deletion
+        # is by pathname. A dir that VANISHED since classification (a
+        # concurrent sweep or the owner's own cleanup won the race —
+        # historically this raced rmtree into FileNotFoundError
+        # mid-walk) is skipped and never reported reaped; a same-uid
+        # writer swapping a different entry (or a symlink — S_ISDIR
+        # on lstat is then false) into the name is skipped this
+        # sweep.
+        try:
+            st2 = path.lstat()
+        except OSError:
+            continue
+        if (
+            (st2.st_dev, st2.st_ino) != (st.st_dev, st.st_ino)
+            or not stat.S_ISDIR(st2.st_mode)
+        ):
+            logger.debug(
+                "dead-pid dir sweep: %s changed identity between "
+                "validation and delete; skipping this sweep", path,
+            )
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+        if not path.exists():
+            reaped.append(path)
+        else:
+            # Partial-permission residue (e.g. root-owned entries
+            # inside a same-euid dir): rmtree could not finish. Count
+            # for the bounded disclosure below instead of failing or
+            # logging per entry; the dir is retried on later sweeps
+            # and remains visible to an operator.
+            unremovable += 1
+    if foreign_owned:
+        logger.info(
+            "dead-pid dir sweep: left %d %s* dir(s) under %s in place "
+            "(owned by another user — not removable from this account)",
+            foreign_owned, prefix, root,
+        )
+    if unremovable:
+        logger.info(
+            "dead-pid dir sweep: %d %s* dir(s) under %s resisted "
+            "removal (permission residue inside); left in place",
+            unremovable, prefix, root,
+        )
+    if reaped:
+        logger.info(
+            "reaped %d dead-owner %s* dir(s) under %s",
+            len(reaped), prefix, root,
         )
     return reaped
 

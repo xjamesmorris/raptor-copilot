@@ -70,6 +70,16 @@ DEFAULT_MAX_BYTES_BILLED = 200 * 1000**3
 
 DEFAULT_TIMEOUT_S = 300.0
 
+# Cap on result rows materialised into the JSON envelope. Every other
+# read on this surface is budgeted (query text 1 MiB, credentials
+# 64 KB, bytes billed capped) — the row list was the one unbounded
+# materialisation: a missing LIMIT on a wide table pulled the whole
+# result set into memory and onto stdout. 100k rows is far beyond any
+# forensic-triage read; raise explicitly with --max-rows when a bulk
+# export is intentional. Truncation is surfaced via ``"truncated"``
+# in the envelope, never silent.
+DEFAULT_MAX_ROWS = 100_000
+
 # BigQuery's own GoogleSQL query-length ceiling is 1024k characters;
 # anything bigger is misuse regardless of content.
 MAX_QUERY_BYTES = 1024 * 1024
@@ -282,12 +292,18 @@ _CREDS_INLINE_MAX = 64 * 1024
 
 def _load_override() -> list[str] | None:
     """Operator override list, or None. Same contract as the git
-    proxy-hosts override: the override REPLACES the default so a shop
-    with a locked-down mirror can also ban the public endpoints."""
+    proxy-hosts override (core.config.hosts_override, mirrored here
+    because this module must stay stdlib-only): a file that parses to
+    the ``{"hosts": [...]}`` schema is an explicit operator statement
+    and is honoured even when the list is empty — the override
+    REPLACES the default, so ``{"hosts": []}`` means "allow nothing",
+    never "restore the public default". A shop banning BigQuery
+    egress must not silently fail open. Only a missing or malformed
+    file returns None (keep the static default)."""
     if not _OVERRIDE_CONFIG_PATH.exists():
         return None
     try:
-        data = json.loads(_OVERRIDE_CONFIG_PATH.read_text(encoding="utf-8"))
+        data = json.loads(_OVERRIDE_CONFIG_PATH.read_text(encoding="utf-8"))  # raw-open: operator config under the user config dir, not run-dir content
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     if not isinstance(data, dict):
@@ -301,7 +317,7 @@ def _load_override() -> list[str] | None:
         if isinstance(h, str) and h and h not in seen:
             seen.add(h)
             result.append(h)
-    return result or None
+    return result
 
 
 def _token_uri_host() -> str | None:
@@ -412,7 +428,8 @@ def _resolve_credentials() -> tuple[Any, str | None]:
 def execute(sql: str, *, project: str | None = None,
             max_bytes_billed: int = DEFAULT_MAX_BYTES_BILLED,
             timeout_s: float = DEFAULT_TIMEOUT_S,
-            dry_run: bool = False) -> dict:
+            dry_run: bool = False,
+            max_rows: int = DEFAULT_MAX_ROWS) -> dict:
     """Validate and run one read-only query; return the result envelope.
 
     Raises the typed :class:`BQQueryError` subclasses documented in the
@@ -457,7 +474,13 @@ def execute(sql: str, *, project: str | None = None,
                 "estimated_cost_usd": round(n / 1024**4 * _USD_PER_TIB, 4),
             }
         rows_iter = job.result(timeout=timeout_s)
-        rows = [dict(row) for row in rows_iter]
+        rows: list[dict[str, Any]] = []
+        truncated = False
+        for row in rows_iter:
+            if len(rows) >= max_rows:
+                truncated = True
+                break
+            rows.append(dict(row))
     except (concurrent.futures.TimeoutError, TimeoutError) as exc:
         msg = f"query did not complete within {timeout_s}s"
         raise QueryTimeoutError(msg) from exc
@@ -470,6 +493,7 @@ def execute(sql: str, *, project: str | None = None,
         "dry_run": False,
         "rows": rows,
         "row_count": len(rows),
+        "truncated": truncated,
         "job": {
             "job_id": job.job_id,
             "project": client.project,
@@ -500,6 +524,18 @@ def _child_main() -> int:
             msg = "request must be a JSON object"
             raise TypeError(msg)
         sql = request["sql"]
+        # Coerce request fields INSIDE the malformed-request handler:
+        # a non-numeric value here is wrapper-authored input error and
+        # owes the structured exit-4 envelope, not a raw traceback.
+        max_bytes_billed = int(
+            request.get("max_bytes_billed", DEFAULT_MAX_BYTES_BILLED)
+        )
+        timeout_s = float(request.get("timeout_s", DEFAULT_TIMEOUT_S))
+        dry_run = bool(request.get("dry_run", False))
+        max_rows = int(request.get("max_rows", DEFAULT_MAX_ROWS))
+        if max_rows <= 0:
+            msg = "max_rows must be positive"
+            raise ValueError(msg)
     except (TypeError, ValueError, KeyError) as exc:
         return write_error_json(
             sys.stderr, RequestInputError(f"malformed child request: {exc}")
@@ -509,11 +545,10 @@ def _child_main() -> int:
         result = execute(
             sql,
             project=request.get("project"),
-            max_bytes_billed=int(
-                request.get("max_bytes_billed", DEFAULT_MAX_BYTES_BILLED)
-            ),
-            timeout_s=float(request.get("timeout_s", DEFAULT_TIMEOUT_S)),
-            dry_run=bool(request.get("dry_run", False)),
+            max_bytes_billed=max_bytes_billed,
+            timeout_s=timeout_s,
+            dry_run=dry_run,
+            max_rows=max_rows,
         )
     except BQQueryError as exc:
         return write_error_json(sys.stderr, exc)

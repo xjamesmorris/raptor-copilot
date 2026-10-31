@@ -37,7 +37,8 @@ PROBED_TYPES = sorted(BuildDetector._VALIDATION_COMMANDS)
 
 _KNOWN_MINIMUM = {
     "maven", "gradle", "ant", "npm", "yarn", "pnpm", "pip", "poetry",
-    "gomod", "cmake", "make", "dotnet", "bundler",
+    "setuptools", "gomod", "cmake", "autotools", "meson", "make",
+    "dotnet", "msbuild", "bundler", "rake",
 }
 
 

@@ -1,8 +1,8 @@
 """Structured counter-direction: schema field + gate consumption.
 
 The review model emits ``counter_direction`` (supports_vuln /
-refutes_vuln) at generation time; the escalation and veto gates
-consume it instead of re-deriving direction from prose. The keyword
+refutes_vuln) at generation time; the clean-counter escalation gate
+consumes it instead of re-deriving direction from prose. The keyword
 classifier stays as the fallback for responses lacking the field.
 """
 
@@ -11,8 +11,6 @@ from core.audit.llm_review import (
     REVIEW_SCHEMA_BLIND,
     _clean_counter_escalates,
 )
-from core.audit.orchestrator import ReviewOutcome
-from core.audit.pipeline import counter_hypothesis_vetoes
 
 # The subjunctive-conditional refutation shape that sailed past the
 # keyword classifier: full of vulnerability vocabulary, but its
@@ -76,60 +74,3 @@ class TestEscalationConsumesDirection:
                 "on line 42 that caps size below the buffer length."
             ),
         }) is False
-
-
-class TestVetoConsumesDirection:
-    def _outcome(self, counter, direction=None, evidence="", hyp="h" * 60):
-        rr = {"counter_hypothesis": counter}
-        if direction is not None:
-            rr["counter_direction"] = direction
-        return ReviewOutcome(
-            file="a.c", function="f", status="finding", body="b",
-            hypothesis=hyp, evidence_tool=evidence, review_result=rr,
-        )
-
-    def test_refutes_vuln_vetoes_subjunctive_counter(self):
-        o = self._outcome(_SUBJUNCTIVE_REFUTATION, "refutes_vuln")
-        assert counter_hypothesis_vetoes(o) is True
-
-    def test_supports_vuln_never_vetoes(self):
-        # Prose full of protection keywords, but the model declared
-        # the counter argues FOR the vulnerability.
-        o = self._outcome(
-            "The check on line 42 is prevented from validating the "
-            "size because the attacker-controlled length bypasses it",
-            "supports_vuln",
-        )
-        assert counter_hypothesis_vetoes(o) is False
-
-    def test_mechanical_evidence_still_blocks_veto(self):
-        o = self._outcome(
-            _SUBJUNCTIVE_REFUTATION, "refutes_vuln",
-            evidence="smt:check-early-release",
-        )
-        assert counter_hypothesis_vetoes(o) is False
-
-    def test_exempt_hypothesis_still_blocks_veto(self):
-        o = self._outcome(
-            _SUBJUNCTIVE_REFUTATION, "refutes_vuln",
-            hyp="replay attack via stale sequence number acceptance "
-                "in the handshake",
-        )
-        assert counter_hypothesis_vetoes(o) is False
-
-    def test_absent_direction_keeps_keyword_behaviour(self):
-        o = self._outcome(
-            "This overflow is prevented by the bounds check on line "
-            "42 which validates size < MAX_SIZE before the multiply",
-        )
-        assert counter_hypothesis_vetoes(o) is True
-
-    def test_dict_shape_supported(self):
-        item = {
-            "status": "finding",
-            "hypothesis": "h" * 60,
-            "counter_hypothesis": _SUBJUNCTIVE_REFUTATION,
-            "counter_direction": "refutes_vuln",
-            "evidence_tool": "",
-        }
-        assert counter_hypothesis_vetoes(item) is True

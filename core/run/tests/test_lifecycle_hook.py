@@ -1,7 +1,12 @@
 """Tests for libexec/raptor-lifecycle-hook."""
 
+import contextlib
+import copy
+import hashlib
 import importlib.machinery
 import importlib.util
+import io
+import json
 import os
 import subprocess
 import sys
@@ -10,9 +15,24 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+import pytest
+
 from core.json import load_json, save_json
+from core.project import sessions
+from core.run import metadata as run_metadata
 from core.run.metadata import (
-    RUN_METADATA_FILE, STATUS_RUNNING, STATUS_COMPLETED, STATUS_FAILED,
+    RUN_METADATA_FILE,
+    STATUS_CANCELLED,
+    STATUS_RUNNING,
+    STATUS_COMPLETED,
+    STATUS_FAILED,
+)
+from core.startup.host import Frontend, SessionHostClaim
+from core.testing.runtime_receipt_fake import (
+    build_runtime_receipt_document as _receipt_document,
+    build_runtime_receipt_lineage_fields as _valid_exact_lineage_fields,
+    forbid_receipt_sidecar_reads as _sidecar_reads_forbidden,
+    resign_runtime_receipt_document as _resign,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[3]  # core/run/tests/ → raptor/
@@ -20,8 +40,9 @@ HOOK_SCRIPT = REPO_ROOT / "libexec" / "raptor-lifecycle-hook"
 
 # Import the hook module despite its hyphenated filename and missing .py ext.
 _loader = importlib.machinery.SourceFileLoader("lifecycle_hook", str(HOOK_SCRIPT))
-_spec = importlib.util.spec_from_loader("lifecycle_hook", _loader,
-                                        origin=str(HOOK_SCRIPT))
+_spec = importlib.util.spec_from_loader(
+    "lifecycle_hook", _loader, origin=str(HOOK_SCRIPT)
+)
 _hook_mod = importlib.util.module_from_spec(_spec)
 _hook_mod.__file__ = str(HOOK_SCRIPT)
 _spec.loader.exec_module(_hook_mod)
@@ -30,11 +51,16 @@ FAILURE_MARKER = _hook_mod.FAILURE_MARKER
 MULTI_TURN = _hook_mod._MULTI_TURN_COMMANDS
 
 SESSION_PID = 99999
+_HOST_V2_TOKEN = "00112233445566778899aabbccddeeff"
 
 
-def _make_running_run(parent: Path, name: str, command: str,
-                      session_pid: int = SESSION_PID,
-                      tool_pid: int = 11111) -> Path:
+def _make_running_run(
+    parent: Path,
+    name: str,
+    command: str,
+    session_pid: int = SESSION_PID,
+    tool_pid: int = 11111,
+) -> Path:
     """Create a run directory with status=running metadata."""
     d = parent / name
     d.mkdir(parents=True, exist_ok=True)
@@ -55,6 +81,97 @@ def _status(d: Path) -> str:
     return load_json(d / RUN_METADATA_FILE).get("status")
 
 
+#: PostToolUseFailure stdin payload for a failed RAPTOR pipeline call —
+#: the only shape that may stamp the failure marker.
+RAPTOR_BASH_FAILURE = json.dumps({
+    "tool_name": "Bash",
+    "tool_input": {"command": "libexec/raptor-run-lifecycle start scan"},
+})
+
+
+def _stdin(payload: str):
+    return patch.object(sys, "stdin", io.StringIO(payload))
+
+def _receipt_marker_value(variant: str) -> object:
+    if variant == "invalid":
+        return {"malformed": True}
+    document = copy.deepcopy(_receipt_document())
+    if variant in {"pending", "rejected"}:
+        document["decision"]["state"] = variant
+    elif variant == "digest":
+        document["receipt_sha256"] = "f" * 64
+    elif variant == "profile":
+        document["stable_identity"]["profile_id"] = "other-profile"
+    elif variant == "stable":
+        document["stable_identity"]["cli_version"] = "9.9.9"
+    elif variant == "nonce":
+        document["launch_binding"]["receipt_nonce"] = "f" * 32
+    elif variant == "session":
+        replacement = "99999999-8888-4777-8666-555555555555"
+        document["launch_instance"]["session_id"] = replacement
+        document["launch_binding"]["session_id"] = replacement
+    elif variant not in {"exact", "missing-sidecar"}:
+        raise AssertionError(f"unknown lifecycle variant {variant}")
+    return _resign(document)
+
+
+def _write_host_v2_entry(root: Path) -> Path:
+    fields = {
+        "v": "2",
+        "project": "-",
+        "since": "2026-09-12T00:00:00+00:00",
+        "starttime": "1",
+        "boot_id": "00000000-0000-4000-8000-000000000000",
+        "pidns": "1",
+        "host_v": "2",
+        "host": "copilot",
+        "host_uid": str(os.geteuid()),
+        "host_exe": "/owned/copilot",
+        "host_exe_dev": "10",
+        "host_exe_ino": "20",
+        "host_receipt_v": "1",
+        "host_receipt_state": "verified",
+        "host_receipt_sha256": "a" * 64,
+        "host_receipt_reference": "{}",
+        "token": _HOST_V2_TOKEN,
+        "seeded_by": "owned_fake",
+    }
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    root.chmod(0o700)
+    entry = root / str(os.getpid())
+    entry.write_text(
+        "".join(f"{key}={fields[key]}\n" for key in sessions._HOST_V2_ENTRY_KEYS),
+        encoding="utf-8",
+    )
+    entry.chmod(0o600)
+    return entry
+
+
+@contextlib.contextmanager
+def _receipt_authority_calls_forbidden(*, metadata_lock: bool = True):
+    paths = [
+        "core.run.metadata.compare_run_runtime_receipt",
+        "core.project.sessions.capture_current_session_runtime_receipt",
+        "core.project.sessions.session_runtime_receipt_fence",
+        "core.project.sessions._strict_session_lock",
+        "core.project.oplock.project_op_lock",
+    ]
+    if metadata_lock:
+        paths.append("core.run.metadata._metadata_lock")
+    with contextlib.ExitStack() as stack:
+        for target in paths:
+            stack.enter_context(
+                patch(
+                    target,
+                    side_effect=AssertionError(
+                        f"lifecycle deny-only path called {target}"
+                    ),
+                )
+            )
+        stack.enter_context(_sidecar_reads_forbidden("lifecycle deny-only path"))
+        yield
+
+
 class TestToolFailureMarker(unittest.TestCase):
     """tool-failure mode writes a soft marker without changing status."""
 
@@ -64,24 +181,59 @@ class TestToolFailureMarker(unittest.TestCase):
             run = _make_running_run(out, "scan-20260503", "scan")
             with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
                  patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID):
+                       return_value=SESSION_PID), \
+                 _stdin(RAPTOR_BASH_FAILURE):
                 sys.argv = ["hook", "tool-failure"]
                 _hook_mod.main()
             self.assertTrue((run / FAILURE_MARKER).exists())
             self.assertEqual(_status(run), STATUS_RUNNING)
 
-    def test_marks_all_running_in_session(self):
+    def test_marks_only_newest_running_in_session(self):
+        # Stamping EVERY running run let a failed single-call command
+        # poison an unrelated in-flight run (the next Stop fail_run's
+        # it). With no run dir named in the command, only the newest
+        # running run — the one a just-failed single-call belongs to —
+        # gets the marker.
         with TemporaryDirectory() as tmp:
             out = Path(tmp) / "out"
             run1 = _make_running_run(out, "scan-001", "scan")
             run2 = _make_running_run(out, "agentic-002", "agentic")
+            meta = load_json(run2 / RUN_METADATA_FILE)
+            meta["timestamp"] = "2026-05-03T13:00:00+00:00"  # newer
+            save_json(run2 / RUN_METADATA_FILE, meta)
             with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
                  patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID):
+                       return_value=SESSION_PID), \
+                 _stdin(RAPTOR_BASH_FAILURE):
+                sys.argv = ["hook", "tool-failure"]
+                _hook_mod.main()
+            self.assertFalse((run1 / FAILURE_MARKER).exists())
+            self.assertTrue((run2 / FAILURE_MARKER).exists())
+
+    def test_marks_the_run_named_in_the_command(self):
+        # A failing command that carries a run dir (lifecycle-managed
+        # commands carry their OUTPUT_DIR) attributes the marker to
+        # THAT run, even when a newer run is in flight.
+        with TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out"
+            run1 = _make_running_run(out, "scan-001", "scan")
+            run2 = _make_running_run(out, "agentic-002", "agentic")
+            meta = load_json(run2 / RUN_METADATA_FILE)
+            meta["timestamp"] = "2026-05-03T13:00:00+00:00"  # newer
+            save_json(run2 / RUN_METADATA_FILE, meta)
+            payload = json.dumps({
+                "tool_name": "Bash",
+                "tool_input": {"command":
+                               f"libexec/raptor-run-lifecycle complete {run1}"},
+            })
+            with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
+                 patch("core.run.metadata._get_session_pid",
+                       return_value=SESSION_PID), \
+                 _stdin(payload):
                 sys.argv = ["hook", "tool-failure"]
                 _hook_mod.main()
             self.assertTrue((run1 / FAILURE_MARKER).exists())
-            self.assertTrue((run2 / FAILURE_MARKER).exists())
+            self.assertFalse((run2 / FAILURE_MARKER).exists())
 
     def test_skips_different_session(self):
         with TemporaryDirectory() as tmp:
@@ -90,7 +242,8 @@ class TestToolFailureMarker(unittest.TestCase):
                                     session_pid=88888)
             with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
                  patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID):
+                       return_value=SESSION_PID), \
+                 _stdin(RAPTOR_BASH_FAILURE):
                 sys.argv = ["hook", "tool-failure"]
                 _hook_mod.main()
             self.assertFalse((run / FAILURE_MARKER).exists())
@@ -104,10 +257,321 @@ class TestToolFailureMarker(unittest.TestCase):
             save_json(run / RUN_METADATA_FILE, meta)
             with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
                  patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID):
+                       return_value=SESSION_PID), \
+                 _stdin(RAPTOR_BASH_FAILURE):
                 sys.argv = ["hook", "tool-failure"]
                 _hook_mod.main()
             self.assertFalse((run / FAILURE_MARKER).exists())
+
+
+class TestToolFailureFiltering(unittest.TestCase):
+    """Only failed Bash calls on the libexec/raptor-* dispatch surface
+    may stamp the failure marker: the hook-config `matcher` filters by
+    tool NAME only, so an unrelated failed Bash call (a typo'd grep)
+    would otherwise flip a successful run to failed at the next Stop."""
+
+    def _run_hook(self, tmp: str, payload: str) -> Path:
+        out = Path(tmp) / "out"
+        run = _make_running_run(out, "scan-001", "scan")
+        with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
+             patch("core.run.metadata._get_session_pid",
+                   return_value=SESSION_PID), \
+             _stdin(payload):
+            sys.argv = ["hook", "tool-failure"]
+            _hook_mod.main()
+        return run
+
+    def test_unrelated_bash_failure_writes_no_marker(self):
+        payload = json.dumps({
+            "tool_name": "Bash",
+            "tool_input": {"command": "grep -r pattern /nonexistent"},
+        })
+        with TemporaryDirectory() as tmp:
+            run = self._run_hook(tmp, payload)
+            self.assertFalse((run / FAILURE_MARKER).exists())
+
+    def test_non_bash_tool_failure_writes_no_marker(self):
+        payload = json.dumps({
+            "tool_name": "Read",
+            "tool_input": {"file_path": "libexec/raptor-agentic"},
+        })
+        with TemporaryDirectory() as tmp:
+            run = self._run_hook(tmp, payload)
+            self.assertFalse((run / FAILURE_MARKER).exists())
+
+    def test_malformed_stdin_writes_no_marker(self):
+        with TemporaryDirectory() as tmp:
+            run = self._run_hook(tmp, "{not json")
+            self.assertFalse((run / FAILURE_MARKER).exists())
+
+    def test_empty_stdin_writes_no_marker(self):
+        with TemporaryDirectory() as tmp:
+            run = self._run_hook(tmp, "")
+            self.assertFalse((run / FAILURE_MARKER).exists())
+
+    def test_raptor_dispatch_failure_writes_marker(self):
+        with TemporaryDirectory() as tmp:
+            run = self._run_hook(tmp, RAPTOR_BASH_FAILURE)
+            self.assertTrue((run / FAILURE_MARKER).exists())
+
+    def test_mention_only_command_writes_no_marker(self):
+        # Commands that merely MENTION the dispatch surface fail for
+        # their own reasons: CLAUDE.md's dispatch rule instructs
+        # `ls libexec/raptor-<name>*`, which exits 2 on a glob miss —
+        # a marker here flips a successful run to Failed at Stop.
+        for command in (
+            "ls libexec/raptor-coverage*",
+            "grep -n verdict libexec/raptor-agentic",
+            "cat libexec/raptor-run-lifecycle",
+        ):
+            payload = json.dumps({
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+            })
+            with TemporaryDirectory() as tmp:
+                run = self._run_hook(tmp, payload)
+                self.assertFalse(
+                    (run / FAILURE_MARKER).exists(),
+                    f"mention-only command stamped a marker: {command}",
+                )
+
+    def test_invocation_shapes_write_marker(self):
+        # Command-position invocations, including behind a path
+        # prefix or a shell separator, are the relevant shapes.
+        for command in (
+            "libexec/raptor-coverage-summary --gaps",
+            '"$CLAUDE_PROJECT_DIR"/libexec/raptor-run-lifecycle start scan',
+            "cd /repo && libexec/raptor-agentic --repo /x",
+            "true; libexec/raptor-verified-outcomes out/run",
+        ):
+            payload = json.dumps({
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+            })
+            with TemporaryDirectory() as tmp:
+                run = self._run_hook(tmp, payload)
+                self.assertTrue(
+                    (run / FAILURE_MARKER).exists(),
+                    f"invocation shape missed: {command}",
+                )
+
+
+class TestCopilotLifecycleEventAdapter(unittest.TestCase):
+    """Observed Copilot hook payloads normalize without widening trust."""
+
+    def test_exact_live_session_end_fields_are_canonicalized(self):
+        sid = "22222222-2222-4222-8222-222222222222"
+        payload = _hook_mod._read_hook_payload(
+            io.StringIO(
+                json.dumps(
+                    {
+                        "cwd": "/workspace/raptor",
+                        "sessionId": sid,
+                        "reason": "user_exit",
+                        "timestamp": 946782245678,
+                    }
+                )
+            ),
+            copilot=True,
+            event="session-end",
+        )
+
+        self.assertEqual(
+            payload,
+            {
+                "session_id": sid,
+                "reason": "user_exit",
+            },
+        )
+        self.assertEqual(
+            _hook_mod._session_end_payload(payload),
+            (sid, "user_exit"),
+        )
+
+    def test_pascalcase_command_hook_snake_fields_are_canonicalized(self):
+        sid = "22222222-2222-4222-8222-222222222222"
+        payload = _hook_mod._read_hook_payload(
+            io.StringIO(
+                json.dumps(
+                    {
+                        "hook_event_name": "SessionEnd",
+                        "session_id": sid,
+                        "timestamp": "2000-01-02T03:04:05.678Z",
+                        "cwd": "/workspace/raptor",
+                        "reason": "user_exit",
+                    }
+                )
+            ),
+            copilot=True,
+            event="session-end",
+        )
+
+        self.assertEqual(
+            payload,
+            {
+                "hook_event_name": "SessionEnd",
+                "session_id": sid,
+                "reason": "user_exit",
+            },
+        )
+        self.assertEqual(
+            _hook_mod._session_end_payload(payload),
+            (sid, "user_exit"),
+        )
+
+    def test_tool_failure_fields_are_canonicalized(self):
+        command = "libexec/raptor-run-lifecycle start scan"
+        payload = _hook_mod._read_hook_payload(
+            io.StringIO(
+                json.dumps(
+                    {
+                        "hookEventName": "postToolUseFailure",
+                        "toolName": "shell",
+                        "toolArgs": {"command": command},
+                    }
+                )
+            ),
+            copilot=True,
+            event="tool-failure",
+        )
+
+        self.assertEqual(payload["tool_name"], "Bash")
+        self.assertEqual(payload["tool_input"], {"command": command})
+        self.assertEqual(_hook_mod._tool_failure_command(payload), command)
+
+    def test_mixed_aliases_duplicate_keys_and_wrong_kind_fail_closed(self):
+        cases = (
+            json.dumps(
+                {
+                    "hookEventName": "sessionEnd",
+                    "sessionId": "aaaaaaaa-1111-2222-3333-444444444444",
+                    "session_id": "bbbbbbbb-1111-2222-3333-444444444444",
+                }
+            ),
+            (
+                '{"hookEventName":"sessionEnd",'
+                '"sessionId":"aaaaaaaa-1111-2222-3333-444444444444",'
+                '"sessionId":"bbbbbbbb-1111-2222-3333-444444444444"}'
+            ),
+            json.dumps(
+                {
+                    "hookEventName": "postToolUse",
+                    "sessionId": "aaaaaaaa-1111-2222-3333-444444444444",
+                }
+            ),
+            json.dumps(
+                {
+                    "hookEventName": "sessionEnd",
+                    "sessionId": "aaaaaaaa-1111-2222-3333-444444444444",
+                    "reason": {"hostile": True},
+                }
+            ),
+            json.dumps(
+                {
+                    "hook_event_name": "sessionEnd",
+                    "session_id": "aaaaaaaa-1111-2222-3333-444444444444",
+                }
+            ),
+            "[]",
+            "{not json",
+        )
+        for raw in cases:
+            with self.subTest(raw=raw[:80]):
+                self.assertIsNone(
+                    _hook_mod._read_hook_payload(
+                        io.StringIO(raw),
+                        copilot=True,
+                        event="session-end",
+                    )
+                )
+
+    def test_oversized_and_hostile_identifier_payloads_have_no_owner_proof(self):
+        oversized = json.dumps(
+            {
+                "hookEventName": "sessionEnd",
+                "padding": "x" * _hook_mod._MAX_HOOK_EVENT_BYTES,
+            }
+        )
+        self.assertIsNone(
+            _hook_mod._read_hook_payload(
+                io.StringIO(oversized),
+                copilot=True,
+                event="session-end",
+            )
+        )
+
+        payload = _hook_mod._read_hook_payload(
+            io.StringIO(
+                json.dumps(
+                    {
+                        "hookEventName": "sessionEnd",
+                        "sessionId": "owner\nforged",
+                    }
+                )
+            ),
+            copilot=True,
+            event="session-end",
+        )
+        self.assertIsNotNone(payload)
+        self.assertEqual(_hook_mod._session_end_payload(payload), (None, None))
+
+    def test_missing_or_malformed_reason_has_no_owner_proof(self):
+        sid = "aaaaaaaa-1111-2222-3333-444444444444"
+        missing = _hook_mod._read_hook_payload(
+            io.StringIO(
+                json.dumps(
+                    {
+                        "cwd": "/repo",
+                        "reason": "user_exit",
+                        "timestamp": 946782245678,
+                    }
+                )
+            ),
+            copilot=True,
+            event="session-end",
+        )
+        self.assertEqual(_hook_mod._session_end_payload(missing), (None, "user_exit"))
+
+        malformed = _hook_mod._read_hook_payload(
+            io.StringIO(
+                json.dumps(
+                    {
+                        "sessionId": sid,
+                        "reason": "exit\nforged",
+                    }
+                )
+            ),
+            copilot=True,
+            event="session-end",
+        )
+        self.assertIsNotNone(malformed)
+        self.assertEqual(_hook_mod._session_end_payload(malformed), (None, None))
+
+    def test_copilot_project_binding_requires_exact_pin_witness(self):
+        run = Path("/owned/project/run")
+        meta = {"project": "project-a"}
+        cases = (
+            ((None, "absent"), (True, "project-a", "argv"), False),
+            (("project-b", "bound"), (True, "project-b", "argv"), False),
+            (("project-a", "bound"), (False, None, None), False),
+            (("project-a", "bound"), (True, "project-b", "argv"), False),
+            (("project-a", "bound"), (True, "project-a", "argv"), True),
+        )
+        for binding, witness, expected in cases:
+            with self.subTest(binding=binding, witness=witness):
+                with patch(
+                    "core.project.sessions.ledger_pin_witness",
+                    return_value=witness,
+                ):
+                    self.assertIs(
+                        _hook_mod._copilot_run_matches_binding(
+                            run,
+                            meta,
+                            SESSION_PID,
+                            binding,
+                        ),
+                        expected,
+                    )
 
 
 class TestStopHook(unittest.TestCase):
@@ -117,10 +581,11 @@ class TestStopHook(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             out = Path(tmp) / "out"
             run = _make_running_run(out, "scan-001", "scan", tool_pid=1)
-            with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID), \
-                 patch("core.run.metadata._pid_alive", return_value=False):
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+                patch("core.run.metadata._pid_alive", return_value=False),
+            ):
                 sys.argv = ["hook", "stop"]
                 _hook_mod.main()
             self.assertEqual(_status(run), STATUS_COMPLETED)
@@ -130,10 +595,11 @@ class TestStopHook(unittest.TestCase):
             out = Path(tmp) / "out"
             run = _make_running_run(out, "scan-001", "scan", tool_pid=1)
             (run / FAILURE_MARKER).write_text("")
-            with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID), \
-                 patch("core.run.metadata._pid_alive", return_value=False):
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+                patch("core.run.metadata._pid_alive", return_value=False),
+            ):
                 sys.argv = ["hook", "stop"]
                 _hook_mod.main()
             self.assertEqual(_status(run), STATUS_FAILED)
@@ -145,10 +611,11 @@ class TestStopHook(unittest.TestCase):
             out = Path(tmp) / "out"
             run = _make_running_run(out, "scan-001", "scan", tool_pid=1)
             (run / FAILURE_MARKER).write_text("")
-            with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID), \
-                 patch("core.run.metadata._pid_alive", return_value=False):
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+                patch("core.run.metadata._pid_alive", return_value=False),
+            ):
                 sys.argv = ["hook", "stop"]
                 _hook_mod.main()
             self.assertFalse((run / FAILURE_MARKER).exists())
@@ -164,10 +631,11 @@ class TestStopHook(unittest.TestCase):
             # to test that Stop cleans it up even on the fail path.
             # Test the complete path instead: no marker.
             (run / FAILURE_MARKER).unlink()
-            with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID), \
-                 patch("core.run.metadata._pid_alive", return_value=False):
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+                patch("core.run.metadata._pid_alive", return_value=False),
+            ):
                 sys.argv = ["hook", "stop"]
                 _hook_mod.main()
             self.assertEqual(_status(run), STATUS_COMPLETED)
@@ -176,12 +644,12 @@ class TestStopHook(unittest.TestCase):
     def test_skips_multi_turn_validate(self):
         with TemporaryDirectory() as tmp:
             out = Path(tmp) / "out"
-            run = _make_running_run(out, "validate-001", "validate",
-                                    tool_pid=1)
-            with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID), \
-                 patch("core.run.metadata._pid_alive", return_value=False):
+            run = _make_running_run(out, "validate-001", "validate", tool_pid=1)
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+                patch("core.run.metadata._pid_alive", return_value=False),
+            ):
                 sys.argv = ["hook", "stop"]
                 _hook_mod.main()
             self.assertEqual(_status(run), STATUS_RUNNING)
@@ -189,12 +657,12 @@ class TestStopHook(unittest.TestCase):
     def test_skips_multi_turn_understand(self):
         with TemporaryDirectory() as tmp:
             out = Path(tmp) / "out"
-            run = _make_running_run(out, "understand-001", "understand",
-                                    tool_pid=1)
-            with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID), \
-                 patch("core.run.metadata._pid_alive", return_value=False):
+            run = _make_running_run(out, "understand-001", "understand", tool_pid=1)
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+                patch("core.run.metadata._pid_alive", return_value=False),
+            ):
                 sys.argv = ["hook", "stop"]
                 _hook_mod.main()
             self.assertEqual(_status(run), STATUS_RUNNING)
@@ -206,7 +674,8 @@ class TestStopHook(unittest.TestCase):
             with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
                  patch("core.run.metadata._get_session_pid",
                        return_value=SESSION_PID), \
-                 patch("core.run.metadata._pid_alive", return_value=True):
+                 patch("core.run.metadata._tool_pid_alive",
+                       return_value=True):
                 sys.argv = ["hook", "stop"]
                 _hook_mod.main()
             self.assertEqual(_status(run), STATUS_RUNNING)
@@ -214,12 +683,14 @@ class TestStopHook(unittest.TestCase):
     def test_skips_different_session(self):
         with TemporaryDirectory() as tmp:
             out = Path(tmp) / "out"
-            run = _make_running_run(out, "scan-001", "scan",
-                                    session_pid=88888, tool_pid=1)
-            with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID), \
-                 patch("core.run.metadata._pid_alive", return_value=False):
+            run = _make_running_run(
+                out, "scan-001", "scan", session_pid=88888, tool_pid=1
+            )
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+                patch("core.run.metadata._pid_alive", return_value=False),
+            ):
                 sys.argv = ["hook", "stop"]
                 _hook_mod.main()
             self.assertEqual(_status(run), STATUS_RUNNING)
@@ -231,10 +702,11 @@ class TestStopHook(unittest.TestCase):
             meta = load_json(run / RUN_METADATA_FILE)
             meta["status"] = STATUS_COMPLETED
             save_json(run / RUN_METADATA_FILE, meta)
-            with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID), \
-                 patch("core.run.metadata._pid_alive", return_value=False):
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+                patch("core.run.metadata._pid_alive", return_value=False),
+            ):
                 sys.argv = ["hook", "stop"]
                 _hook_mod.main()
             self.assertEqual(_status(run), STATUS_COMPLETED)
@@ -246,16 +718,19 @@ class TestStopHook(unittest.TestCase):
             d = out / "scan-001"
             d.mkdir(parents=True)
             meta = {
-                "version": 1, "command": "scan",
+                "version": 1,
+                "command": "scan",
                 "timestamp": "2026-05-03T12:00:00+00:00",
-                "status": STATUS_RUNNING, "extra": {},
+                "status": STATUS_RUNNING,
+                "extra": {},
                 "session_pid": SESSION_PID,
                 # no tool_pid
             }
             save_json(d / RUN_METADATA_FILE, meta)
-            with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID):
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+            ):
                 sys.argv = ["hook", "stop"]
                 _hook_mod.main()
             self.assertEqual(_status(d), STATUS_COMPLETED)
@@ -269,9 +744,10 @@ class TestSessionEndHook(unittest.TestCase):
             out = Path(tmp) / "out"
             run1 = _make_running_run(out, "scan-001", "scan")
             run2 = _make_running_run(out, "validate-002", "validate")
-            with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID):
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+            ):
                 sys.argv = ["hook", "session-end"]
                 _hook_mod.main()
             self.assertEqual(_status(run1), STATUS_FAILED)
@@ -282,9 +758,10 @@ class TestSessionEndHook(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             out = Path(tmp) / "out"
             run = _make_running_run(out, "validate-001", "validate")
-            with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID):
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+            ):
                 sys.argv = ["hook", "session-end"]
                 _hook_mod.main()
             self.assertEqual(_status(run), STATUS_FAILED)
@@ -296,9 +773,10 @@ class TestSessionEndHook(unittest.TestCase):
             out = Path(tmp) / "out"
             run = _make_running_run(out, "scan-001", "scan")
             (run / FAILURE_MARKER).write_text("")
-            with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID):
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+            ):
                 sys.argv = ["hook", "session-end"]
                 _hook_mod.main()
             self.assertFalse((run / FAILURE_MARKER).exists())
@@ -310,9 +788,10 @@ class TestSessionEndHook(unittest.TestCase):
             meta = load_json(run / RUN_METADATA_FILE)
             meta["status"] = STATUS_COMPLETED
             save_json(run / RUN_METADATA_FILE, meta)
-            with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID):
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+            ):
                 sys.argv = ["hook", "session-end"]
                 _hook_mod.main()
             self.assertEqual(_status(run), STATUS_COMPLETED)
@@ -320,14 +799,481 @@ class TestSessionEndHook(unittest.TestCase):
     def test_skips_different_session(self):
         with TemporaryDirectory() as tmp:
             out = Path(tmp) / "out"
-            run = _make_running_run(out, "scan-001", "scan",
-                                    session_pid=88888)
-            with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID):
+            run = _make_running_run(out, "scan-001", "scan", session_pid=88888)
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+            ):
                 sys.argv = ["hook", "session-end"]
                 _hook_mod.main()
             self.assertEqual(_status(run), STATUS_RUNNING)
+
+    def test_copilot_session_end_finalizes_only_matching_ledger_orphan(self):
+        sid = "22222222-2222-4222-8222-222222222222"
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            owned = _make_running_run(
+                repo / "project-a",
+                "owned-orphan",
+                "understand",
+            )
+            unledgered = _make_running_run(
+                repo / "project-a",
+                "unledgered-run",
+                "understand",
+            )
+            other_project = _make_running_run(
+                repo / "project-b",
+                "foreign-project",
+                "understand",
+            )
+            foreign = _make_running_run(
+                repo / "project-a",
+                "foreign-session",
+                "understand",
+                session_pid=88888,
+            )
+            failed = _make_running_run(
+                repo / "project-a",
+                "already-failed",
+                "understand",
+            )
+            completed = _make_running_run(
+                repo / "project-a",
+                "already-completed",
+                "understand",
+            )
+            cancelled = _make_running_run(
+                repo / "project-a",
+                "already-cancelled",
+                "understand",
+            )
+            project_by_run = {
+                owned: "project-a",
+                unledgered: "project-a",
+                other_project: "project-b",
+                foreign: "project-a",
+                failed: "project-a",
+                completed: "project-a",
+                cancelled: "project-a",
+            }
+            for run, project in project_by_run.items():
+                meta = load_json(run / RUN_METADATA_FILE)
+                meta["session_id"] = sid
+                meta["project"] = project
+                meta["project_source"] = "argv"
+                save_json(run / RUN_METADATA_FILE, meta)
+            failed_meta = load_json(failed / RUN_METADATA_FILE)
+            failed_meta["status"] = STATUS_FAILED
+            save_json(failed / RUN_METADATA_FILE, failed_meta)
+            completed_meta = load_json(completed / RUN_METADATA_FILE)
+            completed_meta["status"] = STATUS_COMPLETED
+            save_json(completed / RUN_METADATA_FILE, completed_meta)
+            cancelled_meta = load_json(cancelled / RUN_METADATA_FILE)
+            cancelled_meta["status"] = STATUS_CANCELLED
+            save_json(cancelled / RUN_METADATA_FILE, cancelled_meta)
+
+            claim = SessionHostClaim(
+                frontend=Frontend.COPILOT,
+                uid=os.geteuid(),
+                executable=repo / "copilot",
+                executable_device=10,
+                executable_inode=20,
+            )
+            ledger = [
+                {"run_dir": str(owned)},
+                {"run_dir": str(other_project)},
+                {"run_dir": str(foreign)},
+                {"run_dir": str(failed)},
+                {"run_dir": str(completed)},
+                {"run_dir": str(cancelled)},
+            ]
+            payload = json.dumps(
+                {
+                    "cwd": str(repo),
+                    "sessionId": sid,
+                    "reason": "user_exit",
+                    "timestamp": 946782245678,
+                }
+            )
+            before_failed = (failed / RUN_METADATA_FILE).read_bytes()
+            before_completed = (completed / RUN_METADATA_FILE).read_bytes()
+            before_cancelled = (cancelled / RUN_METADATA_FILE).read_bytes()
+
+            def pin_witness(run_dir, *, pid):
+                self.assertEqual(pid, SESSION_PID)
+                project = project_by_run.get(Path(run_dir))
+                if project is None:
+                    return False, None, None
+                return True, project, "argv"
+
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", repo),
+                patch("core.run.metadata._get_session_pid",
+                      return_value=SESSION_PID),
+                patch("core.run.metadata._session_alive_for_meta",
+                      return_value=True),
+                patch("core.project.sessions.session_host_claim",
+                      return_value=claim),
+                patch("core.project.sessions.session_binding",
+                      return_value=("project-a", "bound")),
+                patch("core.project.sessions.ledger_runs",
+                      return_value=ledger),
+                patch("core.project.sessions.ledger_pin_witness",
+                      side_effect=pin_witness),
+                patch("core.config.RaptorConfig.get_out_dir",
+                      return_value=repo),
+                _stdin(payload),
+            ):
+                sys.argv = ["hook", "session-end"]
+                _hook_mod.main()
+                first = (owned / RUN_METADATA_FILE).read_bytes()
+                first_meta = load_json(owned / RUN_METADATA_FILE)
+                self.assertEqual(first_meta["status"], STATUS_FAILED)
+                self.assertIn("end_timestamp", first_meta)
+                self.assertGreaterEqual(first_meta["duration_seconds"], 0)
+                self.assertIs(
+                    first_meta["extra"]["session_end_cleanup"],
+                    True,
+                )
+                self.assertEqual(
+                    first_meta["extra"]["session_end_reason"],
+                    "user_exit",
+                )
+                self.assertNotIn("abandon_sweep", first_meta["extra"])
+
+                # A duplicate SessionEnd is a no-op: no timing or status
+                # rewrite after the first exact terminal transition.
+                sys.stdin.seek(0)
+                _hook_mod.main()
+                self.assertEqual(
+                    (owned / RUN_METADATA_FILE).read_bytes(),
+                    first,
+                )
+
+            from core.run.metadata import complete_run
+
+            complete_run(owned)
+            self.assertEqual((owned / RUN_METADATA_FILE).read_bytes(), first)
+            self.assertEqual(_status(owned), STATUS_FAILED)
+            self.assertEqual(_status(unledgered), STATUS_RUNNING)
+            self.assertEqual(_status(other_project), STATUS_RUNNING)
+            self.assertEqual(_status(foreign), STATUS_RUNNING)
+            self.assertEqual(_status(failed), STATUS_FAILED)
+            self.assertEqual(_status(completed), STATUS_COMPLETED)
+            self.assertEqual(_status(cancelled), STATUS_CANCELLED)
+            self.assertEqual(
+                (failed / RUN_METADATA_FILE).read_bytes(),
+                before_failed,
+            )
+            self.assertEqual(
+                (completed / RUN_METADATA_FILE).read_bytes(),
+                before_completed,
+            )
+            self.assertEqual(
+                (cancelled / RUN_METADATA_FILE).read_bytes(),
+                before_cancelled,
+            )
+
+    def test_copilot_resume_reason_preserves_live_matching_orphan(self):
+        sid = "aaaaaaaa-1111-2222-3333-444444444444"
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            run = _make_running_run(
+                repo / "project-a",
+                "resume-orphan",
+                "understand",
+            )
+            meta = load_json(run / RUN_METADATA_FILE)
+            meta["session_id"] = sid
+            meta["session_start"] = "same-start"
+            meta["session_boot_id"] = "same-boot"
+            meta["project"] = "project-a"
+            meta["project_source"] = "argv"
+            save_json(run / RUN_METADATA_FILE, meta)
+            claim = SessionHostClaim(
+                frontend=Frontend.COPILOT,
+                uid=os.geteuid(),
+                executable=repo / "copilot",
+                executable_device=10,
+                executable_inode=20,
+            )
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", repo),
+                patch("core.run.metadata._get_session_pid",
+                      return_value=SESSION_PID),
+                patch("core.run.metadata._metadata_owned_by_session",
+                      return_value=True),
+                patch("core.run.metadata._session_alive_for_meta",
+                      return_value=True),
+                patch("core.project.sessions.session_host_claim",
+                      return_value=claim),
+                patch("core.project.sessions.session_binding",
+                      return_value=("project-a", "bound")),
+                patch(
+                    "core.project.sessions.ledger_runs",
+                    return_value=[{"run_dir": str(run)}],
+                ),
+                patch(
+                    "core.project.sessions.ledger_pin_witness",
+                    return_value=(True, "project-a", "argv"),
+                ),
+                patch("core.config.RaptorConfig.get_out_dir",
+                      return_value=repo),
+                _stdin(
+                    json.dumps(
+                        {
+                            "hookEventName": "sessionEnd",
+                            "sessionId": sid,
+                            "reason": "resume",
+                        }
+                    )
+                ),
+            ):
+                sys.argv = ["hook", "session-end"]
+                _hook_mod.main()
+
+            self.assertEqual(_status(run), STATUS_RUNNING)
+
+    def test_copilot_missing_mixed_or_malformed_event_keeps_live_orphan(self):
+        sid = "aaaaaaaa-1111-2222-3333-444444444444"
+        payloads = (
+            {
+                "cwd": "/repo",
+                "reason": "user_exit",
+                "timestamp": 946782245678,
+            },
+            {
+                "sessionId": sid,
+                "session_id": sid,
+                "reason": "user_exit",
+            },
+            {
+                "sessionId": sid,
+                "reason": "user_exit\nforged",
+            },
+        )
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            run = _make_running_run(
+                repo / "project-a",
+                "malformed-event-orphan",
+                "understand",
+            )
+            meta = load_json(run / RUN_METADATA_FILE)
+            meta.update(
+                {
+                    "session_id": sid,
+                    "session_start": "same-start",
+                    "session_boot_id": "same-boot",
+                    "project": "project-a",
+                    "project_source": "argv",
+                }
+            )
+            save_json(run / RUN_METADATA_FILE, meta)
+            claim = SessionHostClaim(
+                frontend=Frontend.COPILOT,
+                uid=os.geteuid(),
+                executable=repo / "copilot",
+                executable_device=10,
+                executable_inode=20,
+            )
+            for payload in payloads:
+                with self.subTest(payload=payload):
+                    with (
+                        patch.object(_hook_mod, "REPO_ROOT", repo),
+                        patch(
+                            "core.run.metadata._get_session_pid",
+                            return_value=SESSION_PID,
+                        ),
+                        patch(
+                            "core.run.metadata._metadata_owned_by_session",
+                            return_value=True,
+                        ),
+                        patch(
+                            "core.run.metadata._session_alive_for_meta",
+                            return_value=True,
+                        ),
+                        patch(
+                            "core.project.sessions.session_host_claim",
+                            return_value=claim,
+                        ),
+                        patch(
+                            "core.project.sessions.session_binding",
+                            return_value=("project-a", "bound"),
+                        ),
+                        patch(
+                            "core.project.sessions.ledger_runs",
+                            return_value=[{"run_dir": str(run)}],
+                        ),
+                        patch(
+                            "core.project.sessions.ledger_pin_witness",
+                            return_value=(True, "project-a", "argv"),
+                        ),
+                        patch(
+                            "core.config.RaptorConfig.get_out_dir",
+                            return_value=repo,
+                        ),
+                        _stdin(json.dumps(payload)),
+                    ):
+                        sys.argv = ["hook", "session-end"]
+                        _hook_mod.main()
+                self.assertEqual(_status(run), STATUS_RUNNING)
+
+    def test_stale_same_pid_host_record_cannot_finalize_run(self):
+        """PID equality alone cannot let a recycled/mutated host act."""
+        from core.project import sessions
+
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            sessions_dir = repo / "sessions.d"
+            claim = SessionHostClaim(
+                frontend=Frontend.COPILOT,
+                uid=os.geteuid(),
+                executable=repo / "copilot",
+                executable_device=10,
+                executable_inode=20,
+            )
+            with (
+                patch.object(sessions, "SESSIONS_DIR", sessions_dir),
+                patch.object(sessions, "_pid_running", lambda pid: pid == SESSION_PID),
+                patch.object(sessions, "proc_starttime", lambda _pid: "new-start"),
+                patch.object(sessions, "boot_id", lambda: "same-boot"),
+                patch.object(sessions, "pidns_id", lambda: "same-ns"),
+                patch.object(sessions, "_comm", lambda _pid: "copilot"),
+                patch.object(sessions, "_process_uid", lambda _pid: os.geteuid()),
+                patch.object(
+                    sessions,
+                    "_process_executable_identity",
+                    lambda _pid: (10, 20),
+                ),
+            ):
+                sessions_dir.mkdir(parents=True)
+                fields = {
+                    "v": "2",
+                    "project": "-",
+                    "since": "2026-09-11T00:00:00+00:00",
+                    "starttime": "new-start",
+                    "boot_id": "same-boot",
+                    "pidns": "same-ns",
+                    "token": "ab" * 16,
+                    **claim.session_fields(),
+                }
+                (sessions_dir / str(SESSION_PID)).write_text(
+                    "".join(f"{key}={value}\n" for key, value in fields.items()),
+                    encoding="utf-8",
+                )
+                run = _make_running_run(repo / "out", "scan-001", "scan", tool_pid=1)
+                meta = load_json(run / RUN_METADATA_FILE)
+                meta.update(
+                    {
+                        "session_start": "old-start",
+                        "session_boot_id": "same-boot",
+                        "session_pidns": "same-ns",
+                        **claim.metadata_fields(),
+                    }
+                )
+                save_json(run / RUN_METADATA_FILE, meta)
+                sessions.ledger_record_start(
+                    run,
+                    pid=SESSION_PID,
+                    pin_project=None,
+                    record_pin=True,
+                )
+                with (
+                    patch.object(_hook_mod, "REPO_ROOT", repo),
+                    patch(
+                        "core.run.metadata._get_session_pid", return_value=SESSION_PID
+                    ),
+                    patch("core.run.metadata._pid_alive", return_value=False),
+                ):
+                    sys.argv = ["hook", "session-end"]
+                    _hook_mod.main()
+                self.assertEqual(_status(run), STATUS_RUNNING)
+
+                meta["session_start"] = "new-start"
+                session_id = "aaaaaaaa-1111-2222-3333-444444444444"
+                meta["session_id"] = session_id
+                save_json(run / RUN_METADATA_FILE, meta)
+                with (
+                    patch.object(_hook_mod, "REPO_ROOT", repo),
+                    patch(
+                        "core.run.metadata._get_session_pid", return_value=SESSION_PID
+                    ),
+                    patch("core.run.metadata._pid_alive", return_value=False),
+                    _stdin(
+                        json.dumps(
+                            {
+                                "sessionId": session_id,
+                                "hookEventName": "sessionEnd",
+                            }
+                        )
+                    ),
+                ):
+                    sys.argv = ["hook", "session-end"]
+                    _hook_mod.main()
+                self.assertEqual(_status(run), STATUS_FAILED)
+
+    def test_legacy_run_record_is_not_promoted_to_copilot_authority(self):
+        """Host-less metadata keeps Claude-only legacy strength."""
+        from core.project import sessions
+
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            sessions_dir = repo / "sessions.d"
+            claim = SessionHostClaim(
+                frontend=Frontend.COPILOT,
+                uid=os.geteuid(),
+                executable=repo / "copilot",
+                executable_device=10,
+                executable_inode=20,
+            )
+            with (
+                patch.object(sessions, "SESSIONS_DIR", sessions_dir),
+                patch.object(sessions, "_pid_running", lambda pid: pid == SESSION_PID),
+                patch.object(sessions, "proc_starttime", lambda _pid: "same-start"),
+                patch.object(sessions, "boot_id", lambda: "same-boot"),
+                patch.object(sessions, "pidns_id", lambda: "same-ns"),
+                patch.object(sessions, "_comm", lambda _pid: "copilot"),
+                patch.object(sessions, "_process_uid", lambda _pid: os.geteuid()),
+                patch.object(
+                    sessions,
+                    "_process_executable_identity",
+                    lambda _pid: (10, 20),
+                ),
+            ):
+                sessions_dir.mkdir(parents=True)
+                fields = {
+                    "v": "2",
+                    "project": "-",
+                    "since": "2026-09-11T00:00:00+00:00",
+                    "starttime": "same-start",
+                    "boot_id": "same-boot",
+                    "pidns": "same-ns",
+                    "token": "ab" * 16,
+                    **claim.session_fields(),
+                }
+                (sessions_dir / str(SESSION_PID)).write_text(
+                    "".join(f"{key}={value}\n" for key, value in fields.items()),
+                    encoding="utf-8",
+                )
+                run = _make_running_run(repo / "out", "scan-legacy", "scan", tool_pid=1)
+                sessions.ledger_record_start(
+                    run,
+                    pid=SESSION_PID,
+                    pin_project=None,
+                    record_pin=True,
+                )
+                with (
+                    patch.object(_hook_mod, "REPO_ROOT", repo),
+                    patch(
+                        "core.run.metadata._get_session_pid", return_value=SESSION_PID
+                    ),
+                    patch("core.run.metadata._pid_alive", return_value=False),
+                ):
+                    sys.argv = ["hook", "session-end"]
+                    _hook_mod.main()
+                self.assertEqual(_status(run), STATUS_RUNNING)
 
 
 class TestLLMOverride(unittest.TestCase):
@@ -341,13 +1287,15 @@ class TestLLMOverride(unittest.TestCase):
             (run / FAILURE_MARKER).write_text("")
             # LLM explicitly completes
             from core.run.metadata import complete_run
+
             complete_run(run)
             self.assertEqual(_status(run), STATUS_COMPLETED)
             # Now Stop fires — should skip because not running
-            with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID), \
-                 patch("core.run.metadata._pid_alive", return_value=False):
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+                patch("core.run.metadata._pid_alive", return_value=False),
+            ):
                 sys.argv = ["hook", "stop"]
                 _hook_mod.main()
             self.assertEqual(_status(run), STATUS_COMPLETED)
@@ -358,12 +1306,14 @@ class TestLLMOverride(unittest.TestCase):
             out = Path(tmp) / "out"
             run = _make_running_run(out, "scan-001", "scan", tool_pid=1)
             from core.run.metadata import fail_run
+
             fail_run(run, "analysis found nothing")
             self.assertEqual(_status(run), STATUS_FAILED)
-            with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID), \
-                 patch("core.run.metadata._pid_alive", return_value=False):
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+                patch("core.run.metadata._pid_alive", return_value=False),
+            ):
                 sys.argv = ["hook", "stop"]
                 _hook_mod.main()
             self.assertEqual(_status(run), STATUS_FAILED)
@@ -382,26 +1332,29 @@ class TestProjectDirScan(unittest.TestCase):
         session run ledger names the run dir exactly."""
         import os
         from core.project import sessions
+
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
             proj = repo / "out" / "projects" / "myapp"
             run = _make_running_run(proj, "scan-001", "scan", tool_pid=1)
             sessions_dir = repo / "sessions.d"
-            with patch.object(_hook_mod, "REPO_ROOT", repo), \
-                 patch.object(sessions, "SESSIONS_DIR", sessions_dir), \
-                 patch.object(sessions, "_comm",
-                              lambda pid: "claude"
-                              if pid in (SESSION_PID, os.getpid())
-                              else None), \
-                 patch.object(sessions, "_pid_running",
-                              lambda pid: pid in (SESSION_PID,
-                                                  os.getpid())), \
-                 patch.object(sessions, "proc_starttime",
-                              lambda pid: "7"), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID), \
-                 patch("core.run.metadata._pid_alive",
-                       return_value=False):
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", repo),
+                patch.object(sessions, "SESSIONS_DIR", sessions_dir),
+                patch.object(
+                    sessions,
+                    "_comm",
+                    lambda pid: "claude" if pid in (SESSION_PID, os.getpid()) else None,
+                ),
+                patch.object(
+                    sessions,
+                    "_pid_running",
+                    lambda pid: pid in (SESSION_PID, os.getpid()),
+                ),
+                patch.object(sessions, "proc_starttime", lambda pid: "7"),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+                patch("core.run.metadata._pid_alive", return_value=False),
+            ):
                 sessions.record_session("myapp", pid=SESSION_PID)
                 sessions.ledger_record_start(run, pid=SESSION_PID)
                 sys.argv = ["hook", "stop"]
@@ -413,10 +1366,11 @@ class TestProjectDirScan(unittest.TestCase):
             repo = Path(tmp)
             out = repo / "out"
             run = _make_running_run(out, "scan-001", "scan", tool_pid=1)
-            with patch.object(_hook_mod, "REPO_ROOT", repo), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID), \
-                 patch("core.run.metadata._pid_alive", return_value=False):
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", repo),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+                patch("core.run.metadata._pid_alive", return_value=False),
+            ):
                 sys.argv = ["hook", "stop"]
                 _hook_mod.main()
             self.assertEqual(_status(run), STATUS_COMPLETED)
@@ -426,10 +1380,11 @@ class TestProjectDirScan(unittest.TestCase):
             repo = Path(tmp)
             out = repo / "out"
             run = _make_running_run(out, ".internal", "scan", tool_pid=1)
-            with patch.object(_hook_mod, "REPO_ROOT", repo), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID), \
-                 patch("core.run.metadata._pid_alive", return_value=False):
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", repo),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+                patch("core.run.metadata._pid_alive", return_value=False),
+            ):
                 sys.argv = ["hook", "stop"]
                 _hook_mod.main()
             self.assertEqual(_status(run), STATUS_RUNNING)
@@ -451,16 +1406,20 @@ class TestMultiTurnGuard(unittest.TestCase):
             with TemporaryDirectory() as tmp:
                 out = Path(tmp) / "out"
                 run = _make_running_run(out, f"{cmd}-001", cmd, tool_pid=1)
-                with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                     patch("core.run.metadata._get_session_pid",
-                           return_value=SESSION_PID), \
-                     patch("core.run.metadata._pid_alive",
-                           return_value=False):
+                with (
+                    patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                    patch(
+                        "core.run.metadata._get_session_pid", return_value=SESSION_PID
+                    ),
+                    patch("core.run.metadata._pid_alive", return_value=False),
+                ):
                     sys.argv = ["hook", "stop"]
                     _hook_mod.main()
                 self.assertEqual(
-                    _status(run), STATUS_RUNNING,
-                    f"Stop should skip multi-turn command '{cmd}'")
+                    _status(run),
+                    STATUS_RUNNING,
+                    f"Stop should skip multi-turn command '{cmd}'",
+                )
 
     def test_all_multi_turn_caught_by_session_end(self):
         """SessionEnd catches every multi-turn command."""
@@ -468,23 +1427,293 @@ class TestMultiTurnGuard(unittest.TestCase):
             with TemporaryDirectory() as tmp:
                 out = Path(tmp) / "out"
                 run = _make_running_run(out, f"{cmd}-001", cmd)
-                with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                     patch("core.run.metadata._get_session_pid",
-                           return_value=SESSION_PID):
+                with (
+                    patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                    patch(
+                        "core.run.metadata._get_session_pid", return_value=SESSION_PID
+                    ),
+                ):
                     sys.argv = ["hook", "session-end"]
                     _hook_mod.main()
                 self.assertEqual(
-                    _status(run), STATUS_FAILED,
-                    f"SessionEnd should catch multi-turn command '{cmd}'")
+                    _status(run),
+                    STATUS_FAILED,
+                    f"SessionEnd should catch multi-turn command '{cmd}'",
+                )
+
+
+@pytest.mark.parametrize("event", ("tool-failure", "stop", "session-end"))
+@pytest.mark.parametrize(
+    "variant",
+    (
+        "metadata-only",
+        "lineage-only",
+        "valid-lineage",
+        "pending",
+        "rejected",
+        "invalid",
+        "missing-sidecar",
+        "digest",
+        "profile",
+        "stable",
+        "nonce",
+        "session",
+        "exact",
+        "planted-owner-fields",
+    ),
+)
+@pytest.mark.parametrize("marker_present", (False, True), ids=("absent", "present"))
+def test_t24_receipt_metadata_never_drives_lifecycle(
+    tmp_path: Path,
+    event: str,
+    variant: str,
+    marker_present: bool,
+) -> None:
+    repo = tmp_path / "repo"
+    run = _make_running_run(repo / "out", f"scan-{variant}", "scan", tool_pid=1)
+    meta = load_json(run / RUN_METADATA_FILE)
+    if variant == "valid-lineage":
+        meta.update(_valid_exact_lineage_fields())
+    elif variant == "lineage-only":
+        meta[run_metadata.RUN_RUNTIME_RECEIPT_LINEAGE_KEY] = {"entries": []}
+    else:
+        marker_variant = (
+            "exact"
+            if variant
+            in {
+                "metadata-only",
+                "planted-owner-fields",
+            }
+            else variant
+        )
+        meta[run_metadata.RUN_RUNTIME_RECEIPT_KEY] = _receipt_marker_value(
+            marker_variant
+        )
+    if variant == "planted-owner-fields":
+        meta.update(
+            {
+                "session_pid": SESSION_PID,
+                "session_start": "1",
+                "session_boot_id": "boot",
+                "session_pidns": "2",
+                "tool_pid": 1,
+                "host_v": 1,
+                "host_frontend": "claude",
+                "host_uid": os.geteuid(),
+                "host_executable": "/planted/claude",
+                "host_executable_device": 10,
+                "host_executable_inode": 20,
+            }
+        )
+    save_json(run / RUN_METADATA_FILE, meta)
+    before = (run / RUN_METADATA_FILE).read_bytes()
+    failure_marker = run / FAILURE_MARKER
+    if marker_present:
+        failure_marker.write_bytes(b"preserve")
+    ledger = tmp_path / "sessions.d" / f"{SESSION_PID}.run"
+    ledger.parent.mkdir(parents=True)
+    ledger.write_bytes(b"ledger-sentinel\n")
+    ledger_before = ledger.read_bytes()
+
+    with (
+        patch.object(_hook_mod, "REPO_ROOT", repo),
+        patch(
+            "core.config.RaptorConfig.get_out_dir",
+            return_value=repo / "out",
+        ),
+        patch.object(sessions, "SESSIONS_DIR", ledger.parent),
+        patch.object(sessions, "ledger_runs", return_value=[]),
+        patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+        patch("core.run.metadata._pid_alive", return_value=False),
+        patch(
+            "core.run.metadata.complete_run",
+            side_effect=AssertionError("receipt run reached complete_run"),
+        ),
+        patch(
+            "core.run.metadata.fail_run",
+            side_effect=AssertionError("receipt run reached fail_run"),
+        ),
+        patch.object(sys, "argv", ["hook", event]),
+        _receipt_authority_calls_forbidden(),
+    ):
+        _hook_mod.main()
+
+    assert (run / RUN_METADATA_FILE).read_bytes() == before
+    assert _status(run) == STATUS_RUNNING
+    assert failure_marker.exists() is marker_present
+    if marker_present:
+        assert failure_marker.read_bytes() == b"preserve"
+    assert ledger.read_bytes() == ledger_before
+    assert not tuple(tmp_path.rglob("*.receipt.*.json"))
+
+
+@pytest.mark.parametrize("event", ("tool-failure", "stop", "session-end"))
+def test_t24_real_claudecode_resolver_still_denies_registry_only_host_v2(
+    tmp_path: Path,
+    event: str,
+) -> None:
+    repo = tmp_path / "repo"
+    run = _make_running_run(
+        repo / "out",
+        "scan-registry-only",
+        "scan",
+        session_pid=os.getppid(),
+        tool_pid=1,
+    )
+    before = (run / RUN_METADATA_FILE).read_bytes()
+    failure_marker = run / FAILURE_MARKER
+    failure_marker.write_bytes(b"preserve")
+    sessions_dir = tmp_path / "sessions.d"
+    entry = _write_host_v2_entry(sessions_dir)
+    entry_before = entry.read_bytes()
+    env = {
+        "CLAUDECODE": "1",
+        sessions.ENV_SESSION_PID: str(os.getpid()),
+        sessions.ENV_SESSION_TOKEN: _HOST_V2_TOKEN,
+    }
+
+    with (
+        patch.object(_hook_mod, "REPO_ROOT", repo),
+        patch(
+            "core.config.RaptorConfig.get_out_dir",
+            return_value=repo / "out",
+        ),
+        patch.object(sessions, "SESSIONS_DIR", sessions_dir),
+        patch.object(sessions, "ledger_runs", return_value=[]),
+        patch("core.run.metadata.complete_run", side_effect=AssertionError),
+        patch("core.run.metadata.fail_run", side_effect=AssertionError),
+        patch("core.run.metadata._pid_alive", return_value=False),
+        patch.dict(os.environ, env, clear=False),
+        patch.object(sys, "argv", ["hook", event]),
+        _receipt_authority_calls_forbidden(),
+    ):
+        _hook_mod.main()
+
+    assert (run / RUN_METADATA_FILE).read_bytes() == before
+    assert failure_marker.read_bytes() == b"preserve"
+    assert entry.read_bytes() == entry_before
+    assert not tuple(sessions_dir.glob("*.receipt.*.json"))
+
+
+@pytest.mark.parametrize(
+    ("event", "marker_present"),
+    (("stop", False), ("stop", True), ("session-end", True)),
+)
+def test_t24_terminal_wrapper_race_rechecks_reserved_marker(
+    tmp_path: Path,
+    event: str,
+    marker_present: bool,
+) -> None:
+    repo = tmp_path / "repo"
+    run = _make_running_run(repo / "out", "scan-race", "scan", tool_pid=1)
+    failure_marker = run / FAILURE_MARKER
+    if marker_present:
+        failure_marker.write_bytes(b"preserve")
+    mutated: list[bytes] = []
+
+    def insert_marker(_meta, _pid):
+        current = load_json(run / RUN_METADATA_FILE)
+        current[run_metadata.RUN_RUNTIME_RECEIPT_KEY] = {"race": True}
+        save_json(run / RUN_METADATA_FILE, current)
+        mutated.append((run / RUN_METADATA_FILE).read_bytes())
+        return True
+
+    with (
+        patch.object(_hook_mod, "REPO_ROOT", repo),
+        patch(
+            "core.config.RaptorConfig.get_out_dir",
+            return_value=repo / "out",
+        ),
+        patch.object(sessions, "ledger_runs", return_value=[]),
+        patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+        patch("core.run.metadata._pid_alive", return_value=False),
+        patch(
+            "core.run.metadata._metadata_owned_by_session",
+            side_effect=insert_marker,
+        ),
+        patch(
+            "core.run.metadata._finalize_sandbox_summary",
+            side_effect=AssertionError(
+                "terminal receipt veto followed finalization side effect"
+            ),
+        ),
+        patch.object(sys, "argv", ["hook", event]),
+        _receipt_authority_calls_forbidden(metadata_lock=False),
+    ):
+        _hook_mod.main()
+
+    assert len(mutated) == 1
+    assert (run / RUN_METADATA_FILE).read_bytes() == mutated[0]
+    assert _status(run) == STATUS_RUNNING
+    assert failure_marker.exists() is marker_present
+    if marker_present:
+        assert failure_marker.read_bytes() == b"preserve"
+
+
+def test_t24_lifecycle_scripts_remain_byte_identical() -> None:
+    shim = REPO_ROOT / "libexec" / "raptor-run-lifecycle"
+    assert hashlib.sha256(HOOK_SCRIPT.read_bytes()).hexdigest() == (
+        "cdaa1d49dbef47982046fd4716b5b6537643bec4dbd6275120d5dee76b48fe6d"
+    )
+    assert hashlib.sha256(shim.read_bytes()).hexdigest() == (
+        "7ef2d63e1fd8f218ef6c462b725058f89909181618b5ca6d7cf0c0b8ac9c42d9"
+    )
 
 
 class TestE2EHookScript(unittest.TestCase):
-    """Run the actual hook script as a subprocess."""
+    """Run the actual hook script as a subprocess.
+
+    The event-mode smoke tests spawn the hook hermetically: with an
+    inherited environment, a run from inside a live claude session
+    resolved THAT session and swept its real run ledger and real
+    ``out/`` — ``session-end`` fails every running run of the session
+    (``abandon_sweep``), ``stop`` can stamp ``hook_finalize``
+    completions, and ``tool-failure`` drops failure markers into real
+    run directories.
+    """
+
+    @staticmethod
+    def _hermetic_invocation(tmp: Path) -> tuple[list[str], dict[str, str]]:
+        """A byte-identical hook copy rooted in *tmp* + a scrubbed env.
+
+        The hook finalises runs on two lanes the test must never
+        reach: the session run ledger under ``$HOME`` and the out-dir
+        scan (``$RAPTOR_OUT_DIR`` plus the unconditional
+        ``REPO_ROOT/out``, where ``REPO_ROOT`` derives from the
+        SCRIPT's own location — no env var moves it). A fresh HOME
+        (no registered sessions.d entry) with the session credential
+        pair popped empties the ledger lane; running a copy of the
+        script from *tmp* relocates ``REPO_ROOT/out`` to an empty tmp
+        tree — the subprocess twin of the in-process tests'
+        ``patch.object(_hook_mod, "REPO_ROOT", ...)``. PYTHONPATH
+        carries the real repo for the copy's imports, and
+        CLAUDECODE=1 satisfies the trust gate from the child's own
+        env rather than the invoking session's.
+        """
+        libexec = tmp / "libexec"
+        libexec.mkdir()
+        hook_copy = libexec / "raptor-lifecycle-hook"
+        hook_copy.write_bytes(HOOK_SCRIPT.read_bytes())
+        home = tmp / "home"
+        home.mkdir()
+        out_scan = tmp / "out-scan"
+        out_scan.mkdir()
+        env = dict(os.environ)
+        env["HOME"] = str(home)
+        env["RAPTOR_OUT_DIR"] = str(out_scan)
+        env["CLAUDECODE"] = "1"
+        env["RAPTOR_DIR"] = str(REPO_ROOT)
+        env["PYTHONPATH"] = os.pathsep.join(
+            p for p in (str(REPO_ROOT), env.get("PYTHONPATH")) if p)
+        env.pop("RAPTOR_SESSION_PID", None)
+        env.pop("RAPTOR_SESSION_TOKEN", None)
+        return [sys.executable, str(hook_copy)], env
 
     def test_invalid_arg_exits_nonzero(self):
         result = subprocess.run(
             [sys.executable, str(HOOK_SCRIPT), "bogus"],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Usage", result.stderr)
@@ -492,7 +1721,8 @@ class TestE2EHookScript(unittest.TestCase):
     def test_no_args_exits_nonzero(self):
         result = subprocess.run(
             [sys.executable, str(HOOK_SCRIPT)],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         self.assertNotEqual(result.returncode, 0)
 
@@ -500,31 +1730,355 @@ class TestE2EHookScript(unittest.TestCase):
         """In Claude Code env, stop runs without error."""
         if not os.environ.get("CLAUDECODE"):
             self.skipTest("Requires CLAUDECODE environment")
-        result = subprocess.run(
-            [sys.executable, str(HOOK_SCRIPT), "stop"],
-            capture_output=True, text=True,
-        )
-        self.assertEqual(result.returncode, 0)
+        with TemporaryDirectory() as tmp:
+            argv, env = self._hermetic_invocation(Path(tmp))
+            result = subprocess.run(
+                [*argv, "stop"],
+                capture_output=True, text=True, env=env, timeout=120,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_tool_failure_runs_in_claudecode(self):
         """In Claude Code env, tool-failure runs without error."""
         if not os.environ.get("CLAUDECODE"):
             self.skipTest("Requires CLAUDECODE environment")
-        result = subprocess.run(
-            [sys.executable, str(HOOK_SCRIPT), "tool-failure"],
-            capture_output=True, text=True,
-        )
-        self.assertEqual(result.returncode, 0)
+        with TemporaryDirectory() as tmp:
+            argv, env = self._hermetic_invocation(Path(tmp))
+            result = subprocess.run(
+                [*argv, "tool-failure"],
+                capture_output=True, text=True, env=env, timeout=120,
+                input=RAPTOR_BASH_FAILURE,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_session_end_runs_in_claudecode(self):
         """In Claude Code env, session-end runs without error."""
         if not os.environ.get("CLAUDECODE"):
             self.skipTest("Requires CLAUDECODE environment")
-        result = subprocess.run(
-            [sys.executable, str(HOOK_SCRIPT), "session-end"],
-            capture_output=True, text=True,
+        with TemporaryDirectory() as tmp:
+            argv, env = self._hermetic_invocation(Path(tmp))
+            result = subprocess.run(
+                [*argv, "session-end"],
+                capture_output=True, text=True, env=env, timeout=120,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class TestSessionEndLivenessProof(unittest.TestCase):
+    """session-end proves the recorded session dead before reaping.
+
+    A SessionEnd event can fire from a context that inherited the
+    parent session's identity env (a nested subagent ending its own
+    session) while the recorded session_pid is alive and mid-pipeline
+    — pre-fix the reap failed the parent's live run. Stamped metas
+    (session_start + session_boot_id) get the full identity check;
+    whatever IS reaped carries ``extra.abandon_sweep`` so the
+    metadata recovery clause can self-heal a misjudged reap.
+    """
+
+    def _isolated(self, tmp: Path, session_pid: int):
+        """Patch stack confining the hook to *tmp* and *session_pid*.
+
+        The stub tests use REAL (recyclable) pids, so the ledger and
+        the configured out dir must not leak real runs into the scan.
+        """
+        return (
+            patch.object(_hook_mod, "REPO_ROOT", tmp),
+            patch("core.run.metadata._get_session_pid",
+                  return_value=session_pid),
+            patch("core.project.sessions.ledger_runs",
+                  side_effect=Exception("no ledger in this test")),
+            patch("core.config.RaptorConfig.get_out_dir",
+                  return_value=tmp / "out"),
         )
-        self.assertEqual(result.returncode, 0)
+
+    def _run_session_end(self, tmp: Path, session_pid: int,
+                         payload: str = "") -> None:
+        p1, p2, p3, p4 = self._isolated(tmp, session_pid)
+        with p1, p2, p3, p4, _stdin(payload):
+            sys.argv = ["hook", "session-end"]
+            _hook_mod.main()
+
+    @staticmethod
+    def _spawn_claude_shaped_stub(tmp: Path) -> subprocess.Popen:
+        """A live stub whose comm reads ``claude`` (comm comes from
+        the execve filename, so a symlink to the interpreter named
+        ``claude`` suffices — no real session)."""
+        link = tmp / "claude"
+        link.symlink_to(sys.executable)
+        proc = subprocess.Popen(
+            [str(link), "-c",
+             "import time; print('ready', flush=True); time.sleep(300)"],
+            stdout=subprocess.PIPE, text=True,
+        )
+        assert proc.stdout is not None
+        proc.stdout.readline()
+        return proc
+
+    @staticmethod
+    def _reap_stub(proc: subprocess.Popen) -> None:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=10)
+
+    @staticmethod
+    def _stamp_meta(run: Path, **fields) -> None:
+        meta = load_json(run / RUN_METADATA_FILE)
+        meta.update(fields)
+        save_json(run / RUN_METADATA_FILE, meta)
+
+    @unittest.skipUnless(sys.platform == "linux",
+                         "identity proof is procfs-based")
+    def test_live_stamped_session_is_skipped(self):
+        from core.run.metadata import _session_stamp
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            stub = self._spawn_claude_shaped_stub(tmp)
+            try:
+                run = _make_running_run(tmp / "out", "validate-001",
+                                        "validate", session_pid=stub.pid)
+                stamp = _session_stamp(stub.pid)
+                self.assertIn("session_start", stamp)  # live stub readable
+                self._stamp_meta(run, **stamp)
+                self._run_session_end(tmp, stub.pid)
+                self.assertEqual(_status(run), STATUS_RUNNING)
+                self.assertIsNone(stub.poll())
+            finally:
+                self._reap_stub(stub)
+
+    @unittest.skipUnless(sys.platform == "linux",
+                         "identity proof is procfs-based")
+    def test_dead_stamped_session_is_reaped_with_marker(self):
+        from core.project.sessions import boot_id, pidns_id
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            dead_pid = 2_000_000_000  # inert: beyond pid_max
+            run = _make_running_run(tmp / "out", "validate-001",
+                                    "validate", session_pid=dead_pid)
+            # Live boot/ns so the stamp is judged HERE (a foreign
+            # stamp reads as alive — fail-open — and would skip).
+            self._stamp_meta(
+                run, session_start="12345",
+                session_boot_id=boot_id(), session_pidns=pidns_id(),
+            )
+            self._run_session_end(tmp, dead_pid)
+            self.assertEqual(_status(run), STATUS_FAILED)
+            meta = load_json(run / RUN_METADATA_FILE)
+            self.assertIs(meta["extra"]["abandon_sweep"], True)
+            self.assertIn("session ended", meta["extra"]["error"])
+
+    @unittest.skipUnless(sys.platform == "linux",
+                         "identity proof is procfs-based")
+    def test_recycled_pid_is_treated_dead_and_reaped(self):
+        # A live claude-shaped process at the recorded pid whose
+        # starttime does not match the stamp is a RECYCLED pid — the
+        # recorded session is gone; the run is reaped (with marker),
+        # and the impostor process is never signalled.
+        from core.project.sessions import boot_id, pidns_id, proc_starttime
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            stub = self._spawn_claude_shaped_stub(tmp)
+            try:
+                run = _make_running_run(tmp / "out", "validate-001",
+                                        "validate", session_pid=stub.pid)
+                real_start = proc_starttime(stub.pid)
+                self.assertIsNotNone(real_start)
+                self._stamp_meta(
+                    run, session_start=str(int(real_start) + 1),
+                    session_boot_id=boot_id(), session_pidns=pidns_id(),
+                )
+                self._run_session_end(tmp, stub.pid)
+                self.assertEqual(_status(run), STATUS_FAILED)
+                meta = load_json(run / RUN_METADATA_FILE)
+                self.assertIs(meta["extra"]["abandon_sweep"], True)
+                self.assertIsNone(stub.poll())
+            finally:
+                self._reap_stub(stub)
+
+    def test_legacy_meta_keeps_unconditional_reap(self):
+        # No identity fields — no proof is possible either way; the
+        # pre-existing reap applies, now with the recovery marker.
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            run = _make_running_run(tmp / "out", "scan-001", "scan")
+            self._run_session_end(tmp, SESSION_PID)
+            self.assertEqual(_status(run), STATUS_FAILED)
+            meta = load_json(run / RUN_METADATA_FILE)
+            self.assertIs(meta["extra"]["abandon_sweep"], True)
+
+    def test_matching_session_id_finalizes_despite_live_owner(self):
+        # Owner-end proof: the SessionEnd payload's session_id equals
+        # the id start_run recorded — the ending session IS the owner,
+        # so the run is finalized immediately even though the owner
+        # process still breathes while its own hook executes.
+        if sys.platform != "linux":
+            self.skipTest("identity proof is procfs-based")
+        from core.run.metadata import _session_stamp
+        sid = "aaaaaaaa-1111-2222-3333-444444444444"
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            stub = self._spawn_claude_shaped_stub(tmp)
+            try:
+                run = _make_running_run(tmp / "out", "validate-001",
+                                        "validate", session_pid=stub.pid)
+                stamp = _session_stamp(stub.pid)
+                self.assertIn("session_start", stamp)
+                self._stamp_meta(run, session_id=sid, **stamp)
+                # No ``reason`` in the payload: absent reads as a real
+                # end (the enum may grow) — finalize.
+                self._run_session_end(
+                    tmp, stub.pid,
+                    payload=json.dumps({"session_id": sid,
+                                        "hook_event_name": "SessionEnd"}))
+                self.assertEqual(_status(run), STATUS_FAILED)
+                meta = load_json(run / RUN_METADATA_FILE)
+                self.assertIs(meta["extra"]["session_end_cleanup"], True)
+                self.assertNotIn("abandon_sweep", meta["extra"])
+                self.assertIsNone(stub.poll())  # owner never signalled
+            finally:
+                self._reap_stub(stub)
+
+    def _matching_id_session_end(self, reason: str) -> str:
+        """Run session-end with a matching recorded/payload session_id
+        and the given payload ``reason``; returns the run's status."""
+        from core.run.metadata import _session_stamp
+        sid = "aaaaaaaa-1111-2222-3333-444444444444"
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            stub = self._spawn_claude_shaped_stub(tmp)
+            try:
+                run = _make_running_run(tmp / "out", "validate-001",
+                                        "validate", session_pid=stub.pid)
+                stamp = _session_stamp(stub.pid)
+                self.assertIn("session_start", stamp)
+                self._stamp_meta(run, session_id=sid, **stamp)
+                self._run_session_end(
+                    tmp, stub.pid,
+                    payload=json.dumps({"session_id": sid,
+                                        "reason": reason,
+                                        "hook_event_name": "SessionEnd"}))
+                self.assertIsNone(stub.poll())
+                return _status(run)
+            finally:
+                self._reap_stub(stub)
+
+    @unittest.skipUnless(sys.platform == "linux",
+                         "identity proof is procfs-based")
+    def test_reason_clear_keeps_liveness_skip(self):
+        # /clear retires the session id but the owner PROCESS survives
+        # (a background orchestrator may still finalize its run) — the
+        # matching id must NOT finalize; the liveness gate applies.
+        self.assertEqual(self._matching_id_session_end("clear"),
+                         STATUS_RUNNING)
+
+    @unittest.skipUnless(sys.platform == "linux",
+                         "identity proof is procfs-based")
+    def test_reason_resume_keeps_liveness_skip(self):
+        self.assertEqual(self._matching_id_session_end("resume"),
+                         STATUS_RUNNING)
+
+    @unittest.skipUnless(sys.platform == "linux",
+                         "identity proof is procfs-based")
+    def test_reason_logout_finalizes(self):
+        # A real end reason (and any future unknown one) finalizes.
+        self.assertEqual(self._matching_id_session_end("logout"),
+                         STATUS_FAILED)
+
+    def test_mismatched_session_id_keeps_liveness_skip(self):
+        # A different session's end (e.g. a nested subagent's own
+        # SessionEnd, which carries ITS id) must not reap the live
+        # owner's run.
+        if sys.platform != "linux":
+            self.skipTest("identity proof is procfs-based")
+        from core.run.metadata import _session_stamp
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            stub = self._spawn_claude_shaped_stub(tmp)
+            try:
+                run = _make_running_run(tmp / "out", "validate-001",
+                                        "validate", session_pid=stub.pid)
+                stamp = _session_stamp(stub.pid)
+                self.assertIn("session_start", stamp)
+                self._stamp_meta(
+                    run,
+                    session_id="aaaaaaaa-1111-2222-3333-444444444444",
+                    **stamp)
+                self._run_session_end(
+                    tmp, stub.pid,
+                    payload=json.dumps({
+                        "session_id":
+                            "bbbbbbbb-5555-6666-7777-888888888888",
+                        "hook_event_name": "SessionEnd"}))
+                self.assertEqual(_status(run), STATUS_RUNNING)
+            finally:
+                self._reap_stub(stub)
+
+    def test_absent_payload_session_id_keeps_liveness_skip(self):
+        # No payload id (or unreadable stdin) proves nothing — the
+        # liveness-gated behaviour applies unchanged.
+        if sys.platform != "linux":
+            self.skipTest("identity proof is procfs-based")
+        from core.run.metadata import _session_stamp
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            stub = self._spawn_claude_shaped_stub(tmp)
+            try:
+                run = _make_running_run(tmp / "out", "validate-001",
+                                        "validate", session_pid=stub.pid)
+                stamp = _session_stamp(stub.pid)
+                self.assertIn("session_start", stamp)
+                self._stamp_meta(
+                    run,
+                    session_id="aaaaaaaa-1111-2222-3333-444444444444",
+                    **stamp)
+                self._run_session_end(tmp, stub.pid, payload="")
+                self.assertEqual(_status(run), STATUS_RUNNING)
+            finally:
+                self._reap_stub(stub)
+
+    def test_meta_without_recorded_id_keeps_liveness_skip(self):
+        # A stamped meta that predates session_id recording offers no
+        # owner-end proof: a payload id matches nothing, the live
+        # owner keeps its run.
+        if sys.platform != "linux":
+            self.skipTest("identity proof is procfs-based")
+        from core.run.metadata import _session_stamp
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            stub = self._spawn_claude_shaped_stub(tmp)
+            try:
+                run = _make_running_run(tmp / "out", "validate-001",
+                                        "validate", session_pid=stub.pid)
+                stamp = _session_stamp(stub.pid)
+                self.assertIn("session_start", stamp)
+                self._stamp_meta(run, **stamp)
+                self._run_session_end(
+                    tmp, stub.pid,
+                    payload=json.dumps({
+                        "session_id":
+                            "aaaaaaaa-1111-2222-3333-444444444444",
+                        "hook_event_name": "SessionEnd"}))
+                self.assertEqual(_status(run), STATUS_RUNNING)
+            finally:
+                self._reap_stub(stub)
+
+    def test_reaped_run_recovers_through_real_finaliser(self):
+        # End-to-end self-heal: a hook-reaped run's real finaliser
+        # overrides the heuristic verdict via the metadata recovery
+        # clause, clearing the marker and the sweep's error.
+        from core.run.metadata import complete_run
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            run = _make_running_run(tmp / "out", "validate-001",
+                                    "validate")
+            self._run_session_end(tmp, SESSION_PID)
+            self.assertEqual(_status(run), STATUS_FAILED)
+            complete_run(run)
+            self.assertEqual(_status(run), STATUS_COMPLETED)
+            meta = load_json(run / RUN_METADATA_FILE)
+            extra = meta.get("extra") or {}
+            self.assertNotIn("abandon_sweep", extra)
+            self.assertNotIn("error", extra)
 
 
 if __name__ == "__main__":

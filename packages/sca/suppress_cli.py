@@ -28,7 +28,9 @@ from datetime import date
 from pathlib import Path
 
 from core.json import load_json
+from core.security.log_sanitisation import sanitise_for_terminal as _sft
 
+from .parsers._safe_read import scan_root_context
 from .suppressions import (
     SUPPRESS_FILENAME,
     SuppressionEntry,
@@ -36,17 +38,24 @@ from .suppressions import (
 )
 from typing import TYPE_CHECKING
 
-from core.json import dumps_display
+import json
 
 # findings.json artifacts are RAPTOR-written run output — the
 # findings-class budget.
-_MAX_FINDINGS_BYTES = 64 * 1024 * 1024
+from .kinds import MAX_FINDINGS_BYTES as _MAX_FINDINGS_BYTES
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
 
 def main(argv: Sequence[str]) -> int:
+    # Escaping-console chokepoint: this subcommand runs as its own
+    # libexec-dispatched process; with no logging config,
+    # logging.lastResort would relay WARNING+ foreign text (YAMLError
+    # text quoting a hostile suppressions file) to the TTY with a
+    # plain formatter.
+    from .cli import _configure_logging  # local import: avoid cycle
+    _configure_logging(0)
     parser = argparse.ArgumentParser(
         prog="raptor-sca suppress",
         description="Inspect and validate the suppression overlay.",
@@ -91,8 +100,9 @@ def main(argv: Sequence[str]) -> int:
             target=Path(args.target).resolve(),
             findings_path=Path(args.findings).resolve(),
         )
+    # argparse ``choices`` makes an unknown action unreachable;
+    # parser.error raises SystemExit if that invariant ever breaks.
     parser.error(f"unknown action {args.action!r}")
-    return 2
 
 
 def _cmd_list(target: Path, *, emit_json: bool) -> int:
@@ -101,10 +111,19 @@ def _cmd_list(target: Path, *, emit_json: bool) -> int:
         print(f"raptor-sca suppress: no {SUPPRESS_FILENAME} in "
               f"{target}", file=sys.stderr)
         return 1
-    entries = load(suppress_path)
+    # Scan-root context: an overlay symlink resolving inside the
+    # target is honoured (monorepo shared-config); escapes refused.
+    with scan_root_context(target):
+        entries = load(suppress_path)
     if emit_json:
-        print(dumps_display(
+        # The entries come from the SCANNED target's suppress file —
+        # hostile bytes in reasons/ids must not reach the terminal as
+        # live controls. ensure_ascii keeps the JSON lane valid for
+        # parsing consumers while escaping C1 controls (dumps_display
+        # is ensure_ascii=False and passes them raw).
+        print(json.dumps(
             [_entry_to_dict(e) for e in entries], indent=2,
+            ensure_ascii=True, default=str,
         ))
         return 0
     if not entries:
@@ -118,9 +137,9 @@ def _cmd_list(target: Path, *, emit_json: bool) -> int:
         bits: list[str] = [kind, target_label]
         if e.expires:
             note = ("EXPIRED" if e.is_expired(today)
-                     else f"until {e.expires}")
+                     else f"until {_sft(str(e.expires), max_len=32)}")
             bits.append(note)
-        bits.append(f"reason: {e.reason}")
+        bits.append(f"reason: {_sft(e.reason)}")
         print("  · " + " · ".join(bits))
     return 0
 
@@ -135,7 +154,8 @@ def _cmd_check(*, target: Path, findings_path: Path) -> int:
         print(f"raptor-sca suppress: {findings_path} not found",
               file=sys.stderr)
         return 2
-    entries = load(suppress_path)
+    with scan_root_context(target):
+        entries = load(suppress_path)
     if not entries:
         print(f"raptor-sca suppress: {suppress_path} has no entries.")
         return 0
@@ -147,13 +167,21 @@ def _cmd_check(*, target: Path, findings_path: Path) -> int:
             # Strict load_json soft-returns None for a missing file.
             raise FileNotFoundError(findings_path)
     except (OSError, ValueError) as exc:
-        print(f"raptor-sca suppress: cannot read {findings_path}: {exc}",
-              file=sys.stderr)
+        # Decode/OS errors on a target-adjacent file can quote hostile
+        # bytes — escape before the terminal.
+        print(f"raptor-sca suppress: cannot read {findings_path}: "
+              f"{_sft(str(exc))}", file=sys.stderr)
         return 2
     if not isinstance(rows, list):
         print("raptor-sca suppress: findings.json top-level is not a "
               "list", file=sys.stderr)
         return 2
+    # Hand-edited / third-party findings.json may contain stray
+    # non-dict elements — soft-skip like the thresholds gate
+    # (FindingRow.from_row) two lines over in the same CLI, rather
+    # than crash the CI-gate helper with an AttributeError inside
+    # SuppressionEntry.matches.
+    rows = [r for r in rows if isinstance(r, dict)]
 
     today = date.today()
     expired: list[SuppressionEntry] = []
@@ -180,26 +208,30 @@ def _cmd_check(*, target: Path, findings_path: Path) -> int:
         print("Orphan entries:")
         for e in orphan:
             kind, label = _describe_entry(e)
-            print(f"  · {kind} · {label} · reason: {e.reason}")
+            print(f"  · {kind} · {label} · reason: {_sft(e.reason)}")
     if expired:
         print()
         print("Expired entries:")
         for e in expired:
             kind, label = _describe_entry(e)
-            print(f"  · {kind} · {label} · expired {e.expires}")
+            print(f"  · {kind} · {label} · expired "
+                  f"{_sft(str(e.expires), max_len=32)}")
     # Exit 1 if there's anything actionable so CI gates can fail
     # the build when operators leave stale entries lying around.
     return 1 if (orphan or expired) else 0
 
 
 def _describe_entry(e: SuppressionEntry) -> tuple[str, str]:
+    """Kind + label for one entry. The label fields come from the
+    scanned target's suppress YAML — escape control bytes here so
+    every print site downstream is terminal-safe by construction."""
     if e.finding_id:
-        return ("finding_id", e.finding_id)
+        return ("finding_id", _sft(e.finding_id, max_len=128))
     if e.advisory_id:
-        return ("advisory_id", e.advisory_id)
+        return ("advisory_id", _sft(e.advisory_id, max_len=128))
     pkg = ":".join(p for p in (e.ecosystem, e.name, e.version) if p)
     if pkg:
-        return ("package", pkg)
+        return ("package", _sft(pkg, max_len=128))
     return ("?", "(no matcher)")
 
 

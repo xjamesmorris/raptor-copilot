@@ -15,13 +15,15 @@ tool results.
 
 from __future__ import annotations
 
+import ast
 import logging
 import re
+import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ._util import safe_join
+from core.audit.source_view import sanitized_view
 
 logger = logging.getLogger(__name__)
 
@@ -499,7 +501,12 @@ def run_prefilter(
     ):
         result.skip_llm = True
 
-    if not result.skip_llm:
+    # A standing hit is a live signal on the wrapper's own line(s)
+    # (shell=True, unsafe deserialization, format string): the shape
+    # being a one-line delegate does not discharge it, and resolving
+    # it mechanically clean is the suppression direction — the hits
+    # must reach review.
+    if not result.skip_llm and not result.hits:
         is_wrapper, wrapper_reason = _is_trivial_wrapper(
             source, result.language, callees,
             project_sinks=project_sinks,
@@ -573,19 +580,965 @@ _DANGEROUS_MACROS = frozenset({
 })
 
 
-_WRAPPER_CALL_RE = re.compile(r'\b(\w+)\s*\(')
+# Captures the DOTTED callee form (subprocess.run, pickle.loads): a
+# bare-word capture could never match the dotted _DANGEROUS_PY_APIS
+# entries, so dangerous one-line delegates skipped as trivial.
+# Bounded segment loop: every '.'-boundary in a dotted run is a \b,
+# so an unanchored scan restarted at each segment and re-walked the
+# rest of the chain — quadratic on a long synthetic chain with no
+# paren. 32 segments sits far above real dotted callees (trade-off
+# both directions: larger admits absurd chains, smaller drops them).
+_WRAPPER_CALL_RE = re.compile(r'\b((?:\w+\.){0,32}\w+)\s*\(')
+
+#: The js/ts slash context the lexer heuristic cannot decide (regex
+#: vs division after `)` / `]`) — the wrapper skip refuses instead
+#: of judging it; see the refusal site in _is_trivial_wrapper.
+_JS_AMBIGUOUS_SLASH_RE = re.compile(r"[)\]]\s*/")
+
+#: A backslash ANYWHERE after a division-read `/` on the same
+#: ref-view line has no valid-JS reading (a backslash in code
+#: position is a syntax error outside Unicode-escaped identifiers,
+#: an obfuscation-tier spelling refused by policy) — but a would-be
+#: regex body reads it fine, so its presence marks the reading the
+#: lexer got wrong. Partial hardening, not a closure: a regex body
+#: can hide a comment-opener with NO backslash (`a /[//]x/` — the
+#: char-class spelling), see the refusal-site comment.
+_JS_INVALID_SLASH_RE = re.compile(r"[)\]\"'`\w]\s*/[^\n\\]{0,1000}\\")
 _WRAPPER_RETURN_CALL_RE = re.compile(r'return\s+(\w+)\s*\(')
+# The subscript body is \S-headed ([^\]\s][^]]*): the naive
+# ``\[\s*[^]]+\]`` overlapped the whitespace span and the body on
+# whitespace — quadratic on a '['-opening expression ending in a
+# whitespace run. The dropped corner is a whitespace-only subscript
+# ('x[  ]'), not real C.
 _WRAPPER_PTR_ARITH_RE = re.compile(
-    r'(?<!\w->)\w+\s*\+\s*\w|\w+\s*\[\s*[^]]+\]|'
+    r'(?<!\w->)\w\s*\+\s*\w|\b\w+\s*\[\s*[^\]\s][^]]{0,4000}\]|'
     r'\(\s*\w+\s*\*\s*\)|'
     r'\(\s*(?:unsigned\s+)?(?:char|int|long|short|void)\s*\*\s*\)',
 )
 
 
+_WRAPPER_DANGEROUS_CALLEES = frozenset(
+    _DANGEROUS_C_APIS | _DANGEROUS_PY_APIS
+    | _DANGEROUS_GO_CALLEES | _DANGEROUS_RUST_CALLEES
+    | _DANGEROUS_PHP_CALLEES | _DANGEROUS_JAVA_CALLEES
+    | _DANGEROUS_JS_CALLEES | _DANGEROUS_LUA_CALLEES
+    | _DANGEROUS_PERL_CALLEES,
+)
+
+#: Bare tails of the dotted entries (subprocess.run -> run): the
+#: wrapper capture sees the bare form when the API is imported
+#: unqualified.
+_WRAPPER_DANGEROUS_TAILS = frozenset(
+    e.rsplit(".", 1)[-1] for e in _WRAPPER_DANGEROUS_CALLEES
+)
+
+#: getattr with a LITERAL attribute name: base object dotted path and
+#: the quoted attribute, with no further arguments (a default-argument
+#: form stays unresolved -> conservative no-skip).
+_WRAPPER_GETATTR_LITERAL_RE = re.compile(
+    r'\bgetattr\s*\(\s*([A-Za-z_]\w*(?:\.\w+)*)\s*,\s*'
+    r'[\'"]([A-Za-z_]\w*)[\'"]\s*\)',
+)
+
+#: The standard indirection family: a one-line delegate through any of
+#: these hides its real target from the dotted-callee exclusion.
+#: Shapes with LITERAL arguments resolve mechanically and re-enter the
+#: exclusion checks under the resolved name(s); a shape with no
+#: resolvable literal (dynamic name) refuses the skip — an
+#: unresolvable delegate must never be journalled mechanically clean.
+_WRAPPER_INDIRECTION_TAILS = frozenset({
+    "getattr", "__import__", "import_module",
+    "attrgetter", "methodcaller", "partial",
+    "vars", "globals", "dlsym",
+})
+
+#: Literal names an indirection shape resolves through: quoted string
+#: literals (attrgetter("run"), dlsym(h, "system"), vars(m)["run"],
+#: globals()["system"]) anywhere in the delegate body.
+_WRAPPER_LITERAL_NAME_RE = re.compile(r'[\'"]([A-Za-z_][\w.]*)[\'"]')
+
+#: Line terminators normalised to "\n" before any judged-view split,
+#: derived from ``str.splitlines`` semantics (every character it
+#: splits on, minus "\n" itself, plus the "\r\n" compound first so it
+#: never yields a double newline). A member missing here let one
+#: plantable byte inside a string literal desync the kept/blanked
+#: view pair — the byte survives as string data in the strings-kept
+#: view (splitlines gains a line) but blanks to a space in the ref
+#: view, so every later line judges drop-eligibility against the
+#: wrong blanked twin and a live sink line is swallowed from both
+#: views. A closure test derives this tuple from splitlines itself
+#: (test_wrapper_lexer.TestSplitlinesTerminatorUniverse). The judged
+#: views additionally split on "\n" ONLY, so even a terminator this
+#: tuple were to miss stays inside one line in BOTH views and cannot
+#: desync them.
+_LINE_TERMINATORS: tuple[str, ...] = (
+    "\r\n", "\r", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e",
+    "\x85", "\u2028", "\u2029",
+)
+
+
+def _normalize_line_terminators(src: str) -> str:
+    """Rewrite every exotic ``str.splitlines`` terminator to ``\\n``."""
+    for _term in _LINE_TERMINATORS:
+        src = src.replace(_term, "\n")
+    return src
+
+#: functools.partial's wrapped callable: the first argument as a plain
+#: (possibly dotted) identifier REFERENCE — `partial(sp.run)` never
+#: emits a call to sp.run, so the reference is the resolvable name.
+_WRAPPER_PARTIAL_ARG_RE = re.compile(
+    r'\bpartial\s*\(\s*((?:\w+\.)*\w+)\s*[,)]',
+)
+
+#: A sink escaping as a VALUE: `pool.submit(os.system, cmd)`,
+#: `map(os.system, args)`, `asyncio.to_thread(os.system, a)` — the
+#: dangerous target appears as an identifier REFERENCE, never as a
+#: call, so the captured-callee exclusion cannot see it. The executor
+#: is deliberately NOT enumerated (submit/to_thread/map/filter/
+#: starmap/apply/…): the class rule is "sink callable escapes as a
+#: value", so EVERY non-call identifier reference in the delegate
+#: body re-enters the exclusion checks.
+_WRAPPER_REF_TOKEN_RE = re.compile(
+    r"(?<![\w.])((?:[A-Za-z_]\w*\.)*[A-Za-z_]\w*)",
+)
+
+#: Object-protocol executor attributes: calling `x.__call__(...)`
+#: (or the bound-method / decorator unwrap chains `.__func__` /
+#: `.__wrapped__`) executes the underlying `x`. A trailing executor
+#: segment hid the real dotted target from the exclusion checks —
+#: `os.system.__call__` has tail `__call__`, which matched neither
+#: the dotted dangerous entries nor their bare tails.
+_WRAPPER_EXECUTOR_DUNDERS = frozenset({
+    "__call__", "__func__", "__wrapped__",
+})
+
+
+def _strip_executor_dunders(name: str) -> str:
+    """Strip trailing executor-dunder segments — the executed target
+    is the remaining base object. Empty result = nothing left to
+    judge (the caller refuses the skip)."""
+    parts = name.split(".")
+    while parts and parts[-1] in _WRAPPER_EXECUTOR_DUNDERS:
+        parts.pop()
+    return ".".join(parts)
+
+
+# ── Wrapper escape analysis ────────────────────────────────────────
+#
+# The trivial-wrapper skip is only sound if NO sink value escapes the
+# delegate body: a sink reference carried by value into a binding, an
+# argument, a return, or a yield reaches code the skip never reviews.
+# The analysis below computes, per bound name, the set of references
+# its value can carry (whole-value view over the language's real
+# binding grammar — not a per-shape pattern list), resolves alias
+# chains to a fixpoint, and judges every carried reference against the
+# dangerous-callee exclusion. Anything the grammar walk cannot account
+# for is UNRESOLVED: an unresolved value refuses the skip when it is
+# the delegate (an unresolvable delegate must never be journalled
+# mechanically clean); in data positions (arguments, returns, binding
+# values) unresolved-ness alone does not refuse — a value the body
+# never spells (parameter data, elements of externally-populated
+# containers) is introduced and reviewed at its own spelling site, and
+# judging it here would re-open the measured legitimate-corpus flip
+# the argument-position gate exists to prevent.
+
+#: A binding's value: (references carried by value, fully-resolved?).
+_WrapperValue = tuple[set[str], bool]
+
+#: ast fields that introduce or receive name bindings. The collector
+#: must explicitly handle (or deliberately no-op) every node type
+#: carrying one of these fields; an unlisted type refuses the whole
+#: analysis (conservative default), and the closure test enumerates
+#: the installed grammar against the handled set so new binder node
+#: types fail loudly instead of silently escaping.
+_PY_BINDER_FIELDS = frozenset({
+    "target", "targets", "name", "names", "optional_vars", "rest",
+})
+
+#: Node types the collector fully handles (binds, judges, or safely
+#: ignores). Everything else with a binder-shaped field refuses.
+_PY_HANDLED_BINDERS: tuple[type, ...] = (
+    ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr,
+    ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef,
+    ast.ClassDef, ast.For, ast.AsyncFor, ast.With, ast.AsyncWith,
+    ast.ExceptHandler, ast.Global, ast.Nonlocal,
+    ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp,
+    # Deliberate no-ops: Delete unbinds; withitem/alias/comprehension
+    # are handled through their parent statements.
+    ast.Delete, ast.withitem, ast.alias, ast.comprehension,
+)
+
+
+def _py_dotted(node: ast.expr) -> str | None:
+    """Dotted spelling of a pure Name/Attribute chain, else None."""
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+        return ".".join(reversed(parts))
+    return None
+
+
+def _py_all_refs(node: ast.AST) -> set[str]:
+    """Every dotted reference spelled anywhere under ``node`` —
+    the conservative carry-set for opaque callables (lambdas, nested
+    defs) whose call-time behaviour the prefilter cannot model."""
+    out: set[str] = set()
+    for n in ast.walk(node):
+        if isinstance(n, (ast.Name, ast.Attribute)):
+            d = _py_dotted(n)
+            if d is not None:
+                out.add(d)
+    return out
+
+
+def _py_value_refs(node: ast.expr | None) -> _WrapperValue:
+    """Whole-value view of an expression: the references whose VALUE
+    the expression can yield or carry. Value-preserving constructs
+    (conditionals, boolean folds, displays, starring, walrus, await)
+    are walked; value-computing constructs (arithmetic, comparisons,
+    f-strings) yield a fresh object that cannot BE a body-spelled
+    reference. Comprehensions carry their element/key/value, iterator
+    and guard references (their own loop targets excluded); call
+    results carry nothing here because the collector judges the
+    callee and every argument at the Call node itself. Remaining
+    opaque positions (subscripted elements, unknown node types)
+    conservatively CARRY every reference spelled under them,
+    unresolved — the value may not be one of them, but a body-spelled
+    sink reference must never drop out of judgment."""
+    if node is None:
+        return set(), True
+    if isinstance(node, (ast.Name, ast.Attribute)):
+        d = _py_dotted(node)
+        if d is not None:
+            return {d}, True
+        if isinstance(node, ast.Attribute):
+            refs, ok = _py_value_refs(node.value)
+            return {f"{r}.{node.attr}" for r in refs}, ok
+        return set(), False
+    if isinstance(node, (ast.Constant, ast.JoinedStr, ast.FormattedValue)):
+        return set(), True
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        refs: set[str] = set()  # type: ignore[no-redef]
+        ok = True
+        for e in node.elts:
+            r, o = _py_value_refs(e)
+            refs |= r
+            ok = ok and o
+        return refs, ok
+    if isinstance(node, ast.Dict):
+        refs = set()
+        ok = True
+        for k, v in zip(node.keys, node.values):
+            if k is None:
+                ok = False  # **spread: stored values are not spelled here
+            else:
+                r, o = _py_value_refs(k)
+                refs |= r
+                ok = ok and o
+            r, o = _py_value_refs(v)
+            refs |= r
+            ok = ok and o
+        return refs, ok
+    if isinstance(node, (ast.Starred, ast.NamedExpr, ast.Await)):
+        return _py_value_refs(node.value)
+    if isinstance(node, ast.IfExp):
+        b_refs, b_ok = _py_value_refs(node.body)
+        o_refs, o_ok = _py_value_refs(node.orelse)
+        return b_refs | o_refs, b_ok and o_ok
+    if isinstance(node, ast.BoolOp):
+        refs = set()
+        ok = True
+        for v in node.values:
+            r, o = _py_value_refs(v)
+            refs |= r
+            ok = ok and o
+        return refs, ok
+    if isinstance(node, ast.Lambda):
+        return _py_all_refs(node), False
+    if isinstance(node, ast.Call):
+        # A call RESULT is a value the body does not spell. Nothing
+        # drops out of judgment here: the collector's walk judges the
+        # callee and every argument/keyword at the Call node itself,
+        # so this arm only keeps the result from re-carrying inner
+        # construct binders (a comprehension's loop variable) into
+        # the enclosing position.
+        return set(), False
+    if isinstance(
+        node, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp),
+    ):
+        # A comprehension's element/key/value escapes by value like a
+        # display element; iterator and guard refs are carried too.
+        # Comprehension-scoped target names are the construct's own
+        # binders, not body values — dropping them keeps a loop
+        # variable that merely tail-collides with a sink from
+        # refusing a benign wrapper.
+        refs = set()
+        targets: set[str] = set()
+        for comp in node.generators:
+            r, _o = _py_value_refs(comp.iter)
+            refs |= r
+            for cond in comp.ifs:
+                r, _o = _py_value_refs(cond)
+                refs |= r
+            for n in ast.walk(comp.target):
+                if isinstance(n, ast.Name):
+                    targets.add(n.id)
+        parts = (
+            (node.key, node.value) if isinstance(node, ast.DictComp)
+            else (node.elt,)
+        )
+        for part in parts:
+            r, _o = _py_value_refs(part)
+            refs |= r
+        return {
+            x for x in refs if x.split(".", 1)[0] not in targets
+        }, False
+    if isinstance(node, (ast.BinOp, ast.UnaryOp, ast.Compare)):
+        return set(), True  # computed value — a fresh object
+    # Opaque/unknown expression positions (comprehension elements,
+    # subscripted displays, call results, future grammar additions):
+    # conservatively carry every reference spelled under the node,
+    # unresolved. A body-spelled sink reference is then judged
+    # wherever the value escapes; unresolvedness alone still never
+    # refuses in data positions (a value the body does not spell is
+    # reviewed at its own spelling site).
+    return _py_all_refs(node), False
+
+
+def _py_wrapper_escape(
+    source: str,
+) -> tuple[dict[str, _WrapperValue], list[_WrapperValue], set[str]] | None:
+    """Collect (bindings, judged values, parameters) for a Python
+    wrapper body.
+
+    ``bindings`` maps every bound name to its whole-value carry set;
+    ``judged`` holds the value view of every escape position: binding
+    values (including stores into containers/attributes), signature
+    defaults, call arguments, returns, and yields; ``params`` names
+    the caller-data parameters (unbound ones — see the exemption in
+    _wrapper_ref_hits_exclusion).
+
+    Returns None when the analysis cannot account for the body —
+    unparseable source, star imports, or a binder construct outside
+    the handled set — and the caller refuses the skip.
+    """
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+
+    bindings: dict[str, _WrapperValue] = {}
+    judged: list[_WrapperValue] = []
+    accounted: set[str] = set()
+    params: set[str] = set()
+    outer_defs = {
+        id(n) for n in tree.body
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    def bind(name: str, refs: set[str], ok: bool) -> None:
+        if ok and refs == {name}:
+            # A name grounding to itself (`import os` binds os->os)
+            # is not an alias; recording it would read as a cycle.
+            accounted.add(name)
+            return
+        cur = bindings.get(name)
+        if cur is not None:
+            bindings[name] = (cur[0] | refs, cur[1] and ok)
+        else:
+            bindings[name] = (set(refs), ok)
+
+    def bind_target(
+        t: ast.expr, value_node: ast.expr | None,
+        refs: set[str], ok: bool,
+    ) -> None:
+        if isinstance(t, ast.Name):
+            bind(t.id, refs, ok)
+        elif isinstance(t, ast.Starred):
+            bind_target(t.value, None, refs, False)
+        elif isinstance(t, (ast.Tuple, ast.List)):
+            elts = t.elts
+            if (
+                isinstance(value_node, (ast.Tuple, ast.List))
+                and len(value_node.elts) == len(elts)
+                and not any(isinstance(e, ast.Starred) for e in elts)
+            ):
+                for te, ve in zip(elts, value_node.elts):
+                    r, o = _py_value_refs(ve)
+                    bind_target(te, ve, r, o)
+            else:
+                for te in elts:
+                    bind_target(te, None, refs, False)
+        # Attribute/Subscript targets bind no local name; the stored
+        # value's refs are judged through the assignment's entry.
+
+    def bind_default(arg_name: str, default: ast.expr) -> None:
+        r, o = _py_value_refs(default)
+        judged.append((r, o))
+        # A pure-literal default leaves the parameter as plain
+        # caller data (the caller's argument usually replaces it);
+        # a reference-carrying or unresolved default joins the
+        # parameter's value domain and must resolve like any alias.
+        if r or not o:
+            bind(arg_name, r, o)
+
+    def bind_defaults(a: ast.arguments, exempt: bool = False) -> None:
+        pos = a.posonlyargs + a.args
+        # Only the WRAPPER's own parameters are caller data. A
+        # lambda / nested-def parameter shadows only inside its own
+        # scope — outside it the same spelling is the module or
+        # import — so exempting it would launder a bare sink call
+        # (`g = lambda system: 0` then `return system(c)`) through
+        # the root drop in _wrapper_ref_hits_exclusion. Those
+        # parameters get no exemption and no outer binding; their
+        # in-scope references are already carried conservatively by
+        # the opaque value view.
+        if exempt:
+            params.update(arg_.arg for arg_ in pos + a.kwonlyargs)
+            if a.vararg is not None:
+                params.add(a.vararg.arg)
+            if a.kwarg is not None:
+                params.add(a.kwarg.arg)
+        for arg_, default in zip(pos[len(pos) - len(a.defaults):], a.defaults):
+            bind_default(arg_.arg, default)
+        for arg_, kw_default in zip(a.kwonlyargs, a.kw_defaults):
+            if kw_default is not None:
+                bind_default(arg_.arg, kw_default)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            r, o = _py_value_refs(node.value)
+            judged.append((r, o))
+            for tgt in node.targets:
+                bind_target(tgt, node.value, r, o)
+        elif isinstance(node, ast.AnnAssign):
+            if node.value is not None:
+                r, o = _py_value_refs(node.value)
+                judged.append((r, o))
+                bind_target(node.target, node.value, r, o)
+            elif isinstance(node.target, ast.Name):
+                accounted.add(node.target.id)  # bare annotation binds nothing
+        elif isinstance(node, ast.AugAssign):
+            r, o = _py_value_refs(node.value)
+            judged.append((r, o))
+            if isinstance(node.target, ast.Name):
+                # accumulated value: prior carry judged at its own site
+                bind(node.target.id, r, False)
+        elif isinstance(node, ast.NamedExpr):
+            r, o = _py_value_refs(node.value)
+            judged.append((r, o))
+            if isinstance(node.target, ast.Name):
+                bind(node.target.id, r, o)
+        elif isinstance(node, ast.Import):
+            for al in node.names:
+                if al.asname:
+                    bind(al.asname, {al.name}, True)
+                else:
+                    root = al.name.split(".")[0]
+                    bind(root, {root}, True)
+        elif isinstance(node, ast.ImportFrom):
+            for al in node.names:
+                if al.name == "*":
+                    return None  # star import: unanalyzable binding set
+                # Relative imports are spelled delegates too: the
+                # level dots drop and the module path joins the ref,
+                # so its parts face the same tail judgment as any
+                # project-local name.
+                if node.module:
+                    bind(al.asname or al.name,
+                         {f"{node.module}.{al.name}"}, True)
+                else:
+                    bind(al.asname or al.name, {al.name}, True)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # A decorator reference is executed at definition time —
+            # a bare `@os.system` runs the sink on the function
+            # object. Judge decorator refs like any escape position
+            # (call-shaped decorators are judged by the Call arm too).
+            for dec in node.decorator_list:
+                judged.append(_py_value_refs(dec))
+            bind_defaults(node.args, exempt=id(node) in outer_defs)
+            if id(node) not in outer_defs:
+                bind(node.name, _py_all_refs(node), False)
+        elif isinstance(node, ast.Lambda):
+            bind_defaults(node.args)
+        elif isinstance(node, ast.ClassDef):
+            for dec in node.decorator_list:
+                judged.append(_py_value_refs(dec))
+            bind(node.name, _py_all_refs(node), False)
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            r, _o = _py_value_refs(node.iter)
+            judged.append((r, _o))
+            bind_target(node.target, None, r, False)
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                if item.optional_vars is not None:
+                    r, _o = _py_value_refs(item.context_expr)
+                    bind_target(item.optional_vars, None, r, False)
+        elif isinstance(node, ast.ExceptHandler):
+            if node.name:
+                bind(node.name, set(), False)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            for n in node.names:
+                bind(n, set(), False)  # externally rebindable
+        elif isinstance(
+            node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
+        ):
+            for comp in node.generators:
+                r, _o = _py_value_refs(comp.iter)
+                judged.append((r, _o))
+                for tgt_node in ast.walk(comp.target):
+                    if isinstance(tgt_node, ast.Name):
+                        accounted.add(tgt_node.id)  # comprehension-scoped
+        elif isinstance(node, ast.Call):
+            # The callee reference is judged too: the textual
+            # single-call gate and the main callee check can miss a
+            # call the AST sees (line-view divergence), and a
+            # call-position reference is exactly the exclusion's
+            # domain.
+            judged.append(_py_value_refs(node.func))
+            for a in node.args:
+                judged.append(_py_value_refs(a))
+            for kw in node.keywords:
+                judged.append(_py_value_refs(kw.value))
+        elif isinstance(node, ast.Return):
+            judged.append(_py_value_refs(node.value))
+        elif isinstance(node, (ast.Yield, ast.YieldFrom)):
+            if node.value is not None:
+                judged.append(_py_value_refs(node.value))
+        elif isinstance(node, _PY_HANDLED_BINDERS):
+            pass  # deliberate no-op binder carriers
+        elif any(f in _PY_BINDER_FIELDS for f in getattr(node, "_fields", ())):
+            return None  # binder construct outside the handled grammar
+
+    # Completeness sweep: every stored Name must be accounted for.
+    # This is the by-construction closure — a binding construct the
+    # walk above missed (or a future grammar addition) refuses the
+    # skip instead of silently carrying a value.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            if node.id not in bindings and node.id not in accounted:
+                return None
+
+    # A parameter that is rebound (or carries a reference default)
+    # loses the caller-data exemption — its binding resolves instead.
+    params -= set(bindings)
+    return bindings, judged, params
+
+
+#: Function-pointer declarator: the declared name sits inside the
+#: first `(*name)` group (`int (*fp)(int) = system`).
+_C_FNPTR_TARGET_RE = re.compile(r"\(\s*\*+\s*([A-Za-z_]\w*)\s*\)")
+
+_C_LITERAL_RE = re.compile(
+    r"0[xXbB][0-9a-fA-F]+[uUlL]*|\d+(?:\.\d*)?[uUlLfF]*"
+    r"|NULL|nullptr|true|false",
+)
+
+#: A cast prefix: `(type)`, `(struct foo *)`, `(unsigned long)` — word
+#: sequences with pointer stars only, so a parenthesized EXPRESSION
+#: (operators inside) never strips.
+_C_CAST_PREFIX_RE = re.compile(
+    r"^\(\s*[A-Za-z_]\w*(?:\s+[A-Za-z_]\w*)*[\s*]*\)\s*",
+)
+
+_C_PURE_REF_RE = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*")
+
+
+def _c_value_refs(rhs: str) -> set[str]:
+    """Every identifier chain spelled in a C-family value expression
+    (`->` pre-normalised to `.` by the caller)."""
+    return {m.group(1) for m in _WRAPPER_REF_TOKEN_RE.finditer(rhs)}
+
+
+def _c_value_pure(rhs: str) -> bool:
+    """True when the value expression provably yields only what it
+    spells: a lone identifier chain or literal, possibly behind
+    unary operators / casts, or a ternary of pure arms. Everything
+    else is unresolved. Brace-initializer values never reach this
+    classifier — the caller's statement splitter consumes `{`/`}`
+    before value classification, so brace-carried references are
+    refused upstream (body-view truncation at the initializer's `}`
+    plus the multi-statement tail gates), not judged here."""
+    rhs = rhs.strip()
+    if not rhs:
+        return False
+    if "?" in rhs:
+        _cond, _, rest = rhs.partition("?")
+        a, sep, b = rest.partition(":")
+        return bool(sep) and _c_value_pure(a) and _c_value_pure(b)
+    prev = None
+    while rhs != prev:
+        prev = rhs
+        rhs = rhs.lstrip("&*+-!~ ").strip()
+        m = _C_CAST_PREFIX_RE.match(rhs)
+        if m is not None and m.end() < len(rhs):
+            rhs = rhs[m.end():].strip()
+    return bool(
+        _C_PURE_REF_RE.fullmatch(rhs) or _C_LITERAL_RE.fullmatch(rhs)
+    )
+
+
+def _c_find_assign(stmt: str) -> tuple[int, int, bool] | None:
+    """Locate the first assignment operator in a statement fragment.
+
+    Returns (lhs_end, rhs_start, is_compound), skipping comparison
+    spellings (`==`, `!=`, `<=`, `>=`); shift-compounds (`<<=`,
+    `>>=`) and single-op compounds (`+=`, `|=`, …) are assignments
+    whose stored value is computed, not spelled — compound."""
+    i = -1
+    while True:
+        i = stmt.find("=", i + 1)
+        if i < 0:
+            return None
+        nxt = stmt[i + 1] if i + 1 < len(stmt) else ""
+        if nxt == "=":
+            i += 1
+            continue
+        if nxt == ">":
+            continue  # `=>` arrow — a value, not an assignment
+        prev = stmt[i - 1] if i > 0 else ""
+        if prev == "=":
+            continue
+        if prev in "<>!":
+            if prev in "<>" and i >= 2 and stmt[i - 2] == prev:
+                return i - 2, i + 1, True  # <<= / >>=
+            continue  # comparison
+        if prev in "+-*/%&|^":
+            return i - 1, i + 1, True
+        if prev == ":":
+            return i - 1, i + 1, False  # := declaration-assignment
+        return i, i + 1, False
+
+
+def _text_wrapper_escape(
+    ref_lines: list[str],
+) -> tuple[dict[str, _WrapperValue], list[_WrapperValue]] | None:
+    """Whole-value binding/escape scan for the languages without an
+    AST leg. Statement-level grammar: declarations with initializers
+    (including typedef'd/`auto`/function-pointer declarators), plain,
+    chained, and compound assignments, `:=` declarations, ternary
+    values, and return-position value escapes. Splitting on `{`/`}`
+    destroys brace initializers before this scan — their refusal
+    comes from the caller's body-view truncation and tail gates, not
+    from value judgment here. An assignment whose target cannot be
+    named refuses the analysis (None — the caller refuses the
+    skip).
+
+    ``ref_lines`` are REFERENCE-view lines: strings and comments
+    already blanked by the caller (the shared ``sanitized_view``
+    chokepoint) so prose can never bind or escape a value."""
+    text = "\n".join(ref_lines)
+    text = text.replace("->", ".")
+    bindings: dict[str, _WrapperValue] = {}
+    judged: list[_WrapperValue] = []
+
+    def bind(name: str, refs: set[str], ok: bool) -> None:
+        cur = bindings.get(name)
+        if cur is not None:
+            bindings[name] = (cur[0] | refs, cur[1] and ok)
+        else:
+            bindings[name] = (set(refs), ok)
+
+    def process(stmt: str) -> tuple[set[str], bool] | None:
+        """Handle one fragment; returns the fragment's value view
+        (for chained assignments), or None when unaccountable."""
+        pos = _c_find_assign(stmt)
+        if pos is None:
+            # Expression statement — no binding, but its references
+            # are JUDGED value escapes. The `[;{}\n]` split turns a
+            # JS/TS `${…}` template interpolation into exactly this
+            # shape (`const t = \`$` + `x && execSync`): pre-fix the
+            # fragment's refs were returned unjudged, so a dangerous
+            # ref escaping as an interpolation VALUE journalled
+            # mechanically clean even though both judged views showed
+            # it (the one-element-outside-the-derivation member of
+            # the escape rebase). Judging every expression fragment
+            # is the file's stated doctrine — over-exclusion costs
+            # one review; a hidden value escape mints a false clean.
+            value = (_c_value_refs(stmt), True)
+            judged.append(value)
+            return value
+        lhs_end, rhs_start, compound = pos
+        lhs = stmt[:lhs_end].strip()
+        rhs = stmt[rhs_start:].strip()
+        if _c_find_assign(rhs) is not None:
+            value = process(rhs)  # type: ignore[assignment]
+            if value is None:
+                return None
+        else:
+            value = (_c_value_refs(rhs), _c_value_pure(rhs))
+        judged.append(value)
+        if compound:
+            value = (value[0], False)  # accumulated/computed store
+        if lhs.startswith("*") or "[" in lhs or "." in lhs:
+            # Store through a pointer / into a container or member:
+            # no local name is bound; the value refs stay judged.
+            return value
+        fnptr = _C_FNPTR_TARGET_RE.search(lhs)
+        if fnptr is not None:
+            bind(fnptr.group(1), *value)
+            return value
+        idents = re.findall(r"[A-Za-z_]\w*", lhs)
+        if not idents:
+            return None  # assignment with an unnameable target
+        bind(idents[-1], *value)
+        return value
+
+    for stmt in re.split(r"[;{}\n]", text):
+        stmt = stmt.strip()
+        if not stmt:
+            continue
+        if re.match(r"return\b", stmt):
+            judged.append((_c_value_refs(stmt[6:]), True))
+            continue
+        if process(stmt) is None:
+            return None
+    return bindings, judged
+
+
+def _resolve_wrapper_ref(
+    ref: str, bindings: dict[str, _WrapperValue],
+) -> _WrapperValue:
+    """Fixpoint alias resolution: expand the reference's leading
+    segment through the binding map until it no longer names a
+    binding. Cycles and expansion past the bound (pathological
+    self-referential bodies) resolve to unresolved."""
+    out: set[str] = set()
+    ok = True
+    seen: set[str] = set()
+    stack = [ref]
+    steps = 0
+    while stack:
+        steps += 1
+        if steps > 256:
+            return out, False
+        r = _strip_executor_dunders(stack.pop())
+        if not r:
+            ok = False  # pure executor-dunder chain: no base to judge
+            continue
+        if r in seen:
+            ok = False  # alias cycle never grounds
+            continue
+        seen.add(r)
+        head, _, rest = r.partition(".")
+        bound = bindings.get(head)
+        if bound is None:
+            out.add(r)
+            continue
+        refs, resolved = bound
+        if not resolved:
+            ok = False
+        for base in refs:
+            stack.append(f"{base}.{rest}" if rest else base)
+    return out, ok
+
+
+def _wrapper_ref_hits_exclusion(
+    ref: str,
+    exclusion: frozenset,
+    tails: frozenset,
+    project_sinks: frozenset | None,
+    params: frozenset[str] | set[str] = frozenset(),
+) -> bool:
+    """Judge one carried reference: every dotted prefix against the
+    full dangerous entries, every segment against the bare tails.
+
+    A reference ROOTED at a parameter name is caller data — the local
+    binding shadows any module or import of the same spelling, so the
+    root segment carries no sink identity of its own and is dropped
+    before judgment (a bare parameter reference is exempt entirely).
+    The attribute segments still name the API reached through the
+    caller's object (`sp.run`) and stay judged — for the built-in
+    sets via their bare tails, and a declared project sink keeps its
+    ROOT too: the operator's dotted declaration names the module, so
+    a parameter colliding with that root never drops it (dropping
+    would launder `utilmod.launch` through a parameter named
+    `utilmod`, and dotted project sinks derive no tail set)."""
+    parts = ref.split(".")
+    if parts and parts[0] in params:
+        sink_roots = {s.split(".", 1)[0] for s in project_sinks or ()}
+        if parts[0] not in sink_roots:
+            parts = parts[1:]
+            if not parts:
+                return False
+    prefixes = {".".join(parts[:i]) for i in range(1, len(parts) + 1)}
+    if prefixes & exclusion or set(parts) & tails:
+        return True
+    return bool(project_sinks and prefixes & project_sinks)
+
+
+def _judged_view_lines(
+    source: str, lang: str,
+) -> tuple[list[str], list[str]] | None:
+    """Cut the two judged views every lexical prefilter tier shares.
+
+    One derivation for every consumer (trivial-wrapper AND
+    simple-accessor tiers): a tier with its own raw-text line
+    filter re-minted the one-planted-line suppression class the
+    shared views closed. Returns ``(code_lines, ref_lines)``, or
+    ``None`` when the js/ts ambiguous-slash refusal applies (the
+    shape must not be judged lexically at all)."""
+    # Judged views, both cut by the shared sanitized_view chokepoint
+    # (escape-aware, multi-line-aware, per-language string grammar —
+    # raw strings, template literals, backticks, text blocks,
+    # heredocs; see core/audit/source_view.py):
+    #
+    # - code_lines (comments-only view, strings KEPT): comment
+    #   markers are recognised lexically in code position only, and
+    #   every MODELED string form (single-line escapes, raw/template/
+    #   backtick/text-block/heredoc/long-string, value-position regex
+    #   literals) carries state across lines, so its data can never
+    #   open or close comment state and swallow a sink line out of
+    #   the judged view; constructs the scanner does not model keep
+    #   their text in the view (over-inclusion, costs a review). The
+    #   grammar hole the scanner cannot decide from tokens — a js/ts
+    #   `/` read as division whose regex reading would hide a
+    #   comment-opener — is PARTIALLY refused at the wrapper tier
+    #   below (ambiguous `)`/`]` contexts; backslash-bearing
+    #   division tails); the backslash-free char-class spelling
+    #   remains a DECLARED OPEN residual there.
+    # - ref_lines (strings AND comments blanked): the reference view
+    #   the escape analysis and the argument-position scan judge, so
+    #   prose can never flip a benign wrapper. Blanking is confined
+    #   to lexically closed literals; a mis-opened literal can only
+    #   weaken these AUXILIARY refusal layers, never hide a call
+    #   from the code_lines gates above, which see the same bytes
+    #   with strings kept.
+    #
+    # For python the plain line filter stays: `/*` is not a comment
+    # there and the AST escape leg supplies the reference judgment.
+    code_lines: list[str] = []
+    ref_lines: list[str] = []
+    if lang == "python":
+        raw_lines = [ln.strip() for ln in source.strip().splitlines()]
+        code_lines = [
+            ln for ln in raw_lines
+            if ln
+            and not ln.startswith("//")
+            and not ln.startswith("/*")
+            and not ln.startswith("*")
+            and not ln.startswith("#")
+            and ln not in ("{", "}")
+        ]
+    elif lang in ("perl", "lua"):
+        # No prefix-based line drops here. The scanner does not model
+        # every perl quote construct (plain `"…"` spans lines, q//,
+        # qq{}, heredocs), so neither the raw text nor the blanked
+        # twin can DECIDE that a `#`-prefixed line is a comment: a
+        # multi-line string's continuation line can start with `#`
+        # (string data) and carry live code after the closing quote —
+        # dropping it removed a `system(` call from every judged view
+        # (the one-planted-line suppression class the C-family branch
+        # closed by judging drops on its fully-modeled blanked twin).
+        # Perl typeglob aliases (`*glob = \&system;`) start with `*`
+        # and were dropped as block-comment continuations — live
+        # sink-aliasing code. Lua comment lines (`--`) never matched
+        # the old filter and have always been kept, so keeping
+        # `#`-prefixed lines merely aligns perl with the branch's
+        # existing lua behavior. Cost is refusal-direction only: a
+        # genuine comment line counts toward the 5-line cap, and
+        # comment prose spelling `name(…)` reads as a call and
+        # refuses the skip — one LLM review, the documented safe
+        # direction (over-inclusion costs a review).
+        #
+        # Exotic line terminators normalised before the two views
+        # split (same rationale as the C-family branch below): a lone
+        # \r \u2014 or ANY other str.splitlines terminator in string data \u2014
+        # splits raw_lines but survives blanked-to-space in the ref
+        # view, pairing ref lines with the wrong source line and
+        # weakening the escape/argument refusal layers. The
+        # normalisation set is the full splitlines universe
+        # (_LINE_TERMINATORS), and both views then split on "\n" ONLY
+        # so no residual byte can desync them.
+        src = _normalize_line_terminators(source.strip())
+        raw_lines = [ln.strip() for ln in src.split("\n")]  # line-model: _normalize_line_terminators rewrites \r to \n above
+        kept = [
+            idx for idx, ln in enumerate(raw_lines)
+            if ln and ln not in ("{", "}")
+        ]
+        code_lines = [raw_lines[i] for i in kept]
+        sview = sanitized_view(src, language=lang).split("\n")  # line-model: _normalize_line_terminators rewrites \r to \n above
+        ref_lines = [
+            sview[i].strip() if i < len(sview) else ""
+            for i in kept
+        ]
+    else:
+        # Exotic line terminators normalised first so the two views
+        # split onto the SAME indices: a lone \r \u2014 or any other
+        # str.splitlines terminator (\x0b, \x0c, \x1c-\x1e, \x85,
+        # U+2028/9) \u2014 survives as string data in the comments-only
+        # view but blanks to a space in the ref view, desynchronising
+        # splitlines() and pairing ref lines with the wrong source
+        # line (one plantable byte swallowed a live sink line from
+        # both judged views). The normalisation set is derived from
+        # splitlines itself (_LINE_TERMINATORS), and both views then
+        # split on "\n" ONLY \u2014 sanitized_view preserves "\n" 1:1 and
+        # blanks everything else to spaces, so the two views agree on
+        # line indices BY CONSTRUCTION even for a terminator the
+        # tuple were to miss.
+        src = _normalize_line_terminators(source.strip())
+        cview = sanitized_view(src, language=lang, keep_strings=True)
+        rlines = sanitized_view(src, language=lang).split("\n")  # line-model: _normalize_line_terminators rewrites \r to \n above
+        for idx, raw in enumerate(cview.split("\n")):  # line-model: _normalize_line_terminators rewrites \r to \n above
+            ln = raw.strip()
+            rl = rlines[idx].strip() if idx < len(rlines) else ""
+            if not ln or ln in ("{", "}"):
+                continue
+            # Drop-eligibility is judged on the BLANKED twin, never
+            # on the strings-kept text: in the comments-only view
+            # string data is present BY DESIGN, so a prefix-textual
+            # filter there re-swallowed whole lines when a multi-line
+            # literal's continuation started with `//` or `#` and its
+            # closing line carried live code — the same suppression
+            # class the lexer adoption closed, reintroduced one line
+            # below it. In the blanked view comments and string data
+            # are spaces, so `#` can only open a real preprocessor
+            # directive there, and `//` cannot start a line at all
+            # (that arm served only the hostile case; removed).
+            if rl.startswith("#"):
+                continue
+            code_lines.append(ln)
+            ref_lines.append(rl)
+
+    # Ambiguous-slash refusal (js/ts): a `/` right after `)` or `]`
+    # is the one spelling the scanner's division-vs-regex heuristic
+    # cannot decide from tokens alone (`if (x) /re/` vs `(a+b) / c`)
+    # — and a mis-call there lets a regex interior mint comment state
+    # in code position, the full one-planted-line suppression
+    # primitive. The wrapper tier refuses the skip outright instead
+    # of judging it: cost is one LLM review for division-bearing
+    # delegates (refusal direction), and unambiguous division (after
+    # an identifier/number) keeps its skip. Scanned on the REF view,
+    # where string/comment/modeled-regex content is already spaces —
+    # only real code can spell the trigger.
+    # Beside it, the no-valid-reading spelling: a backslash after a
+    # division-read `/` on the same line is not JS (only a would-be
+    # regex body reads it), so refusing costs nothing on legitimate
+    # code. The two gates are PARTIAL HARDENING, not a closure of
+    # the division-vs-regex mint class: a regex body can hide a
+    # comment-opener with no backslash at all (`a /[//]x/` — the
+    # `//` sits in a char class, the division reading dies on the
+    # unterminated `[` only on a LATER line, and everything after
+    # the `//` blanks out of both views). That residual is a
+    # declared open bound (suppression direction, js/ts wrapper
+    # delegates only, pinned in the battery); closing it needs
+    # parser-grade JS lexing, not another spelling rule.
+    if lang in ("javascript", "typescript"):
+        for rl in ref_lines:
+            if (_JS_AMBIGUOUS_SLASH_RE.search(rl)
+                    or _JS_INVALID_SLASH_RE.search(rl)):
+                return None
+
+    return code_lines, ref_lines
+
+
 def _is_trivial_wrapper(
     source: str,
     lang: str,
-    _callees: list[dict[str, Any]] | None,
+    callees: list[dict[str, Any]] | None,
     *,
     project_sinks: frozenset | None = None,
     extra_dangerous: frozenset = frozenset(),
@@ -598,16 +1551,28 @@ def _is_trivial_wrapper(
     if not source or not source.strip():
         return False, ""
 
-    lines = source.strip().splitlines()
-    code_lines = [
-        ln.strip() for ln in lines
-        if ln.strip()
-        and not ln.strip().startswith("//")
-        and not ln.strip().startswith("/*")
-        and not ln.strip().startswith("*")
-        and not ln.strip().startswith("#")
-        and ln.strip() not in ("{", "}")
-    ]
+    # Call-graph veto: when the extraction pipeline already resolved
+    # this function's callees, a dangerous resolved name refuses the
+    # skip regardless of how the body spells the call (macro
+    # indirection, token paste, an alias the textual analysis below
+    # cannot see). Exact-name match, mirroring _is_trivially_clean's
+    # callee check — tail matching here would flip wrappers delegating
+    # to project functions that merely share a bare name with a sink.
+    for c in callees or []:
+        cname = c.get("name", "")
+        if not cname:
+            continue
+        if cname in _WRAPPER_DANGEROUS_CALLEES or cname in extra_dangerous:
+            return False, ""
+        if project_sinks and cname in project_sinks:
+            return False, ""
+
+    views = _judged_view_lines(source, lang)
+    if views is None:
+        # js/ts ambiguous-slash refusal — the lexer cannot decide
+        # the shape; never judged mechanically clean.
+        return False, ""
+    code_lines, ref_lines = views
 
     if len(code_lines) > 5:
         return False, ""
@@ -639,26 +1604,274 @@ def _is_trivial_wrapper(
     if _WRAPPER_PTR_ARITH_RE.search(body_no_sig):
         return False, ""
 
-    calls = _WRAPPER_CALL_RE.findall(body_no_sig)
-    real_calls = [
-        c for c in calls
-        if c not in ("if", "while", "for", "switch", "sizeof", "typeof",
-                      "return", "else", "case", "offsetof", "container_of")
-        and c not in _DANGEROUS_MACROS
+    call_matches = [
+        m for m in _WRAPPER_CALL_RE.finditer(body_no_sig)
+        if m.group(1) not in (
+            "if", "while", "for", "switch", "sizeof", "typeof",
+            "return", "else", "case", "offsetof", "container_of")
+        and m.group(1) not in _DANGEROUS_MACROS
     ]
 
-    if len(real_calls) != 1:
+    if len(call_matches) != 1:
         return False, ""
 
-    callee_name = real_calls[0]
+    callee_name = call_matches[0].group(1)
 
-    if callee_name in (_DANGEROUS_C_APIS | _DANGEROUS_PY_APIS | extra_dangerous):
+    # Self-capture guard: for the languages whose signature is not
+    # stripped from the body view (everything but c/cpp/python), the
+    # signature's own name matches the call regex (`func Wrap(`,
+    # `fn wrap(`, `public String wrap(`). When the ONE captured call
+    # is that self-capture — the shape a desynced view degrades to —
+    # the delegate is signature-only and never mechanically clean;
+    # the healthy reason string must also never name the wrapper
+    # itself as its own delegate.
+    if lang not in ("c", "cpp", "python"):
+        start = call_matches[0].start(1)
+        brace = body_no_sig.find("{")
+        if brace >= 0 and start < brace:
+            return False, ""
+        if re.search(
+            # Param window bounded: planted 'func (' heads inside an
+            # unbounded [^)] span re-scan the tail per head —
+            # quadratic on hostile source (4000 is far above real
+            # parameter lists; longer ones stop matching).
+            r"\b(?:func(?:tion)?|fn|sub)\s+(?:\([^)]{0,4000}\)\s*)?$",
+            body_no_sig[:start],
+        ):
+            return False, ""
+
+    # Indirection: `getattr(subprocess, "run")(...)`, `vars(m)["run"]
+    # (...)`, `functools.partial(sp.run)(...)`, `dlsym(h, "system")` —
+    # single-call delegates whose captured callee is the indirection
+    # helper, so the dangerous-callee exclusion below never sees the
+    # real target. Literal arguments resolve mechanically: getattr's
+    # base+attr precisely; the rest through every quoted name in the
+    # body (plus partial's first-argument reference). Each resolved
+    # candidate re-enters the exclusion checks; a shape with NO
+    # resolvable literal, or resolving to another indirection helper,
+    # refuses the skip — an unresolvable delegate must never be
+    # journalled mechanically clean.
+    # One-hop local alias first: `f2 = subprocess.run` (or Go `:=`)
+    # then `return f2(...)` captures the LOCAL name as the callee
+    # while the real target sits surface-spelled on the assignment
+    # line. Resolve through the body's simple assignments before the
+    # family/exclusion checks. Known residual (documented, not
+    # chased): a concatenated literal inside a family call
+    # (`attrgetter("ru"+"n")`) is not folded — the wrapper skip is
+    # prefilter-tier only, and the function still passes the triage,
+    # Joern, and hit-scan evidence layers, which see the file's
+    # surface spellings.
+    # Every language's dangerous-callee set joins the exclusion here
+    # (needed below for both the callee and the escape judgments).
+    exclusion = _WRAPPER_DANGEROUS_CALLEES | extra_dangerous
+    tails = _WRAPPER_DANGEROUS_TAILS | {
+        e.rsplit(".", 1)[-1] for e in extra_dangerous
+    }
+
+    # Whole-value escape analysis over the language's real binding
+    # grammar: bindings feed the callee/reference fixpoint resolution,
+    # and every value-escape position (binding value, signature
+    # default, call argument, return, yield, and bare expression
+    # fragments — which is where the `[;{}\n]` split lands `${…}`
+    # template-interpolation values) is judged against the exclusion.
+    # An unaccountable body refuses the skip. Position coverage is
+    # pinned, not claimed: TestTemplateInterpolationValueEscape holds
+    # the interpolation/expression-fragment members.
+    wrapper_params: set[str] = set()
+    if lang == "python":
+        escape = _py_wrapper_escape(source)
+        if escape is None:
+            return False, ""
+        wrapper_bindings, judged_values, wrapper_params = escape
+    else:
+        text_escape = _text_wrapper_escape(ref_lines)
+        if text_escape is None:
+            return False, ""
+        wrapper_bindings, judged_values = text_escape
+    for refs, _resolved in judged_values:
+        for r in refs:
+            expanded, _ok = _resolve_wrapper_ref(r, wrapper_bindings)
+            for er in expanded:
+                if _wrapper_ref_hits_exclusion(
+                    er, exclusion, tails, project_sinks, wrapper_params,
+                ):
+                    return False, ""
+
+    # Executor-dunder chains resolve to their base object BEFORE the
+    # alias walk (`f2.__call__` must alias-resolve as `f2`), and again
+    # after it (the alias target can itself carry the chain).
+    callee_name = _strip_executor_dunders(callee_name)
+    if not callee_name:
         return False, ""
-    if any(api in callee_name.lower() for api in _CRYPTO_APIS):
-        return False, ""
-    if project_sinks and callee_name in project_sinks:
+    if callee_name.split(".", 1)[0] in wrapper_bindings:
+        resolved_set, resolved_ok = _resolve_wrapper_ref(
+            callee_name, wrapper_bindings,
+        )
+        if not resolved_ok or not resolved_set:
+            # An unresolvable delegate (or one whose value the
+            # body never names — a literal, a container element)
+            # must never be journalled mechanically clean.
+            return False, ""
+        stripped = {_strip_executor_dunders(r) for r in resolved_set}
+        if "" in stripped:
+            return False, ""
+        if len(stripped) == 1:
+            callee_name = next(iter(stripped))
+        else:
+            # Multi-valued delegate: judge every candidate; the
+            # spelled local name stays in the reason/gates.
+            multi = sorted(stripped)
+            if any(
+                c.rsplit(".", 1)[-1] in _WRAPPER_INDIRECTION_TAILS
+                for c in multi
+            ):
+                return False, ""
+            if re.search(r"\)\s*[([]", body_no_sig):
+                return False, ""
+            for name in multi:
+                if any(
+                    seg.startswith("__") and seg.endswith("__")
+                    and seg != "__import__"
+                    for seg in name.split(".")
+                ):
+                    return False, ""
+                if _wrapper_ref_hits_exclusion(
+                    name, exclusion, tails, project_sinks, wrapper_params,
+                ):
+                    return False, ""
+                if any(api in name.lower() for api in _CRYPTO_APIS):
+                    return False, ""
+            return _wrapper_tail_gates(
+                lang, body_no_sig, callee_name,
+            )
+
+    candidates = [callee_name]
+    _tail = callee_name.rsplit(".", 1)[-1]
+    if _tail in _WRAPPER_INDIRECTION_TAILS:
+        if _tail == "getattr":
+            m = _WRAPPER_GETATTR_LITERAL_RE.search(body_no_sig)
+            if not m:
+                return False, ""
+            callee_name = f"{m.group(1)}.{m.group(2)}"
+            candidates = [callee_name]
+        else:
+            resolved = _WRAPPER_LITERAL_NAME_RE.findall(body_no_sig)
+            if _tail == "partial":
+                pm = _WRAPPER_PARTIAL_ARG_RE.search(body_no_sig)
+                if pm is None:
+                    return False, ""
+                resolved.append(pm.group(1))
+            if not resolved:
+                return False, ""
+            if any(
+                r.rsplit(".", 1)[-1] in _WRAPPER_INDIRECTION_TAILS
+                for r in resolved
+            ):
+                return False, ""
+            candidates = [callee_name, *resolved]
+    elif re.search(r"\)\s*[([]", body_no_sig):
+        # The captured call's RESULT is itself called or subscripted
+        # (`make_fn()(arg)`): the executed target is unknown, and an
+        # unknown delegate is never mechanically clean. Resolved
+        # indirection shapes are handled above; this guards the
+        # factories the family list does not name.
         return False, ""
 
+    # Any remaining dunder segment routes the call through the object
+    # protocol (`x.__class__(...)`, `x.__self__.run(...)`): the
+    # executed target is not the spelled name, and an unresolvable
+    # delegate must never be journalled mechanically clean.
+    # (`__import__` is the indirection family's own member, resolved
+    # above.)
+    for name in candidates:
+        if any(
+            seg.startswith("__") and seg.endswith("__")
+            and seg != "__import__"
+            for seg in name.split(".")
+        ):
+            return False, ""
+
+    # Every language's dangerous-callee set (a wrapper's language arm
+    # only strips the signature; the exclusion must not be narrower
+    # than _is_trivially_clean's), matched against EVERY dotted prefix
+    # of the name AND every segment against the bare tails — `from
+    # subprocess import run` delegates via the bare name, and an
+    # attribute chain can bury the dangerous target mid-name
+    # (`sp.run.retry(...)`). Over-exclusion only costs one review; a
+    # missed exclusion journals a dangerous delegate mechanically
+    # clean.
+    for name in candidates:
+        if _wrapper_ref_hits_exclusion(
+            name, exclusion, tails, project_sinks, wrapper_params,
+        ):
+            return False, ""
+        if any(api in name.lower() for api in _CRYPTO_APIS):
+            return False, ""
+
+    # A sink passed as an ARGUMENT to any call is non-clean: the
+    # delegate never spells the target in call position
+    # (`pool.submit(os.system, cmd)`, `map(os.system, args)`), so the
+    # callee checks above cannot exclude it. For Python the AST
+    # escape analysis above already judged every argument / return /
+    # yield / binding value; the textual scan below serves the
+    # languages without an AST leg. Judge every identifier reference
+    # in argument position (inside a call's parentheses, not itself
+    # called) against the same exclusion — dotted references over
+    # every prefix + every segment tail, bare references against the
+    # full entry names AND the bare tails (`pool.submit(system, cmd)`
+    # after a bare import escapes via the bare name exactly like the
+    # bare-callee case above). The position gate is load-bearing: a
+    # name-blind scan flags keyword spellings (`assert x == f()`) and
+    # plain data reads (`return request.param`) that share a tail
+    # with a sink but cannot escape a callable — measured at
+    # thousands of flipped legitimate rows; with the gate the flip
+    # set is callable-shaped references only. Strings and comments
+    # are cut from this view only. The crypto substring heuristic
+    # stays call-position-only: matching it against every variable
+    # NAME (`hash_val`, `signed_off`) would flip accessor-adjacent
+    # wrappers wholesale without naming a sink. Over-exclusion costs
+    # one review; the miss journals a dangerous delegate mechanically
+    # clean.
+    if lang != "python":
+        ref_body = " ".join(ref_lines)
+        if lang in ("c", "cpp"):
+            cut = ref_body.find("{")
+            if cut >= 0:
+                ref_body = ref_body[cut + 1:]
+                closing = ref_body.rfind("}")
+                if closing >= 0:
+                    ref_body = ref_body[:closing]
+        # Local aliases (`f2 = os.system` then `pool.submit(f2,
+        # cmd)`): the argument spells the LOCAL name while the sink
+        # sits surface-spelled on the assignment line, outside any
+        # argument list — resolve through the escape analysis'
+        # binding fixpoint.
+        for rm in _WRAPPER_REF_TOKEN_RE.finditer(ref_body):
+            if ref_body[rm.end():].lstrip()[:1] == "(":
+                continue  # call position — judged by the callee checks
+            before = ref_body[:rm.start()]
+            if before.count("(") <= before.count(")"):
+                continue  # not inside any call's argument list
+            ref = _strip_executor_dunders(rm.group(1))
+            if not ref:
+                continue
+            expanded, _ok = _resolve_wrapper_ref(ref, wrapper_bindings)
+            if any(
+                _wrapper_ref_hits_exclusion(
+                    er, exclusion, tails, project_sinks,
+                )
+                for er in expanded
+            ):
+                return False, ""
+
+    return _wrapper_tail_gates(lang, body_no_sig, callee_name)
+
+
+def _wrapper_tail_gates(
+    lang: str, body_no_sig: str, callee_name: str,
+) -> tuple[bool, str]:
+    """Final shape gates: a trivial delegate has at most one return
+    and, without one, at most a single statement."""
     if lang in ("c", "cpp"):
         return_count = len(re.findall(r'\breturn\b', body_no_sig))
         if return_count > 1:
@@ -674,7 +1887,7 @@ def _is_trivial_wrapper(
         if return_count > 1:
             return False, ""
         if not re.search(r'\breturn\b', body_no_sig):
-            stmts = [s.strip() for s in body_no_sig.split("\n") if s.strip()]
+            stmts = [s.strip() for s in body_no_sig.split("\n") if s.strip()]  # line-model: statement count only; strip()-normalised
             if len(stmts) > 1:
                 return False, ""
 
@@ -786,95 +1999,259 @@ def _is_sink_unreachable_clean(
     return not _has_integer_arithmetic(source)
 
 
-def _is_simple_accessor(source: str, lang: str) -> bool:
-    """Check if a function is a trivial field accessor or constant return."""
-    stripped = source.strip()
-    lines = [ln.strip() for ln in stripped.splitlines() if ln.strip()]
+def _py_simple_accessor(source: str) -> bool:
+    """AST-shape membership for the python accessor arm.
 
-    code_lines = [
-        ln for ln in lines
-        if not ln.startswith("//") and not ln.startswith("/*")
-        and not ln.startswith("*") and not ln.startswith("#")
+    The function body must be EXACTLY one ``return`` (an optional
+    docstring aside) of a ``self`` field, a gated bare name, or a
+    numeric/boolean/None constant. Anything else — a second
+    statement, a call, a subscript — refuses. The AST judgment
+    replaces the old raw-line prefix filter + suffix-anchored regex,
+    which let a side-effecting statement ride in front of the return
+    and dropped ``#``-prefixed string-continuation lines carrying
+    live code.
+    """
+    # Size cap first (the lexical counting the pre-AST arm used, kept
+    # for parity so the rewrite never skips MORE than before): the
+    # dropped comment/docstring-continuation lines can only
+    # under-count, and honesty never rests on the count — the AST
+    # shape check below is the verdict.
+    stripped = [ln.strip() for ln in source.strip().splitlines()]
+    counted = [
+        ln for ln in stripped
+        if ln
+        and not ln.startswith(("//", "/*", "*", "#"))
         and ln not in ("{", "}")
     ]
-
-    if len(code_lines) > 3:
+    if len(counted) > 3:
         return False
-
-    body = " ".join(code_lines)
-
-    if lang in ("c", "cpp"):
-        if re.search(r"return\s+\w+->\w+\s*;$", body):
-            return True
-        if re.search(r"return\s+\w+\.\w+\s*;$", body):
-            return True
-        if re.search(r"return\s+\d+\s*;$", body):
-            return True
-        if re.search(r"return\s+NULL\s*;$", body):
-            return True
-    elif lang == "python":
-        if re.search(r"return\s+self\.\w+$", body):
-            return True
-        m = re.search(r"return\s+(\w+)$", body)
-        if m:
-            returned = m.group(1).lower()
-            if not any(s in returned for s in _SECURITY_SENSITIVE_NAMES):
-                return True
-    elif lang == "go":
-        if re.search(r"return\s+\w+\.\w+$", body):
-            return True
-        if re.search(r"return\s+\w+\.\w+\s*,\s*nil$", body):
-            return True
-        if re.search(r"return\s+\d+$", body):
-            return True
-    elif lang == "rust":
-        if re.search(r"\bself\.\w+\s*$", body):
-            return True
-        if re.search(r"\bself\.\w+\.clone\(\)\s*$", body):
-            return True
-        if re.search(r"return\s+self\.\w+\s*;?\s*$", body):
-            return True
-        if re.search(r"^\s*\d+\s*$", body):
-            return True
-    elif lang == "php":
-        if re.search(r"return\s+\$this->\w+\s*;$", body):
-            return True
-        if re.search(r"return\s+self::\$?\w+\s*;$", body):
-            return True
-        if re.search(r"return\s+\d+\s*;$", body):
-            return True
-        if re.search(r"return\s+(true|false|null)\s*;$", body):
-            return True
-    elif lang == "java":
-        if re.search(r"return\s+this\.\w+\s*;$", body):
-            return True
-        if re.search(r"return\s+\w+\s*;$", body):
-            m = re.search(r"return\s+(\w+)\s*;$", body)
-            if m:
-                returned = m.group(1).lower()
-                if not any(s in returned for s in _SECURITY_SENSITIVE_NAMES):
-                    return True
-    elif lang in ("javascript", "typescript"):
-        if re.search(r"return\s+this\.\w+\s*;?$", body):
-            return True
-        if re.search(r"return\s+this\._\w+\s*;?$", body):
-            return True
-        if re.search(r"return\s+\d+\s*;?$", body):
-            return True
-    elif lang == "lua":
-        if re.search(r"return\s+self\.\w+\s*$", body):
-            return True
-        if re.search(r"return\s+\d+\s*$", body):
-            return True
-    elif lang == "perl":
-        if re.search(r"return\s+\$self->\{\s*\w+\s*\}\s*;$", body):
-            return True
-        if re.search(r"return\s+\$_\[\d+\]\s*;$", body):
-            return True
-
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except (SyntaxError, ValueError):
+        return False
+    funcs = [
+        n for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    if len(funcs) != 1:
+        return False
+    fn = funcs[0]
+    # Def-time-executed expressions are live code the body-shape
+    # check below never sees: a Call in a decorator, a default
+    # argument, or an annotation (`@reg(os.system(c))`,
+    # `n=(m := f(c))`, `-> f(c)`) runs when the def executes and
+    # would ride an otherwise-trivial body into the skip. Plain
+    # decorators (@property) and literal defaults/annotations keep
+    # their skip.
+    def_time: list[ast.expr] = list(fn.decorator_list)
+    def_time.extend(fn.args.defaults)
+    def_time.extend(d for d in fn.args.kw_defaults if d is not None)
+    if fn.returns is not None:
+        def_time.append(fn.returns)
+    annotated = list(fn.args.args) + list(fn.args.posonlyargs) + list(
+        fn.args.kwonlyargs,
+    )
+    if fn.args.vararg is not None:
+        annotated.append(fn.args.vararg)
+    if fn.args.kwarg is not None:
+        annotated.append(fn.args.kwarg)
+    def_time.extend(
+        a.annotation for a in annotated if a.annotation is not None
+    )
+    for expr in def_time:
+        for sub in ast.walk(expr):
+            if isinstance(sub, (ast.Call, ast.NamedExpr, ast.Await)):
+                return False
+    body = list(fn.body)
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+    if len(body) != 1 or not isinstance(body[0], ast.Return):
+        return False
+    val = body[0].value
+    if (
+        isinstance(val, ast.Attribute)
+        and isinstance(val.value, ast.Name)
+        and val.value.id == "self"
+    ):
+        return not _accessor_ref_refused(val.attr)
+    if isinstance(val, ast.Name):
+        return not _accessor_ref_refused(val.id)
+    if isinstance(val, ast.Constant):
+        # int/bool/None only — the parity set the pre-AST arm
+        # accepted (strings and floats always went to review).
+        return isinstance(val.value, (bool, int)) or val.value is None
     return False
 
 
+def _accessor_ref_refused(returned: str) -> bool:
+    """Gate a returned name/field against the dangerous + sensitive sets.
+
+    The principle the lua arm documented, applied to every arm:
+    ``return os.execute`` hands the sink back as a VALUE — the
+    wrapper path's escape analysis exists to refuse that, and an
+    accessor arm must not bypass it. Security-sensitive field names
+    (password, token, ...) also refuse: over-inclusion costs one
+    review, the documented safe direction.
+    """
+    if not returned:
+        return False
+    ref = re.sub(
+        r"[^\w.]", "", returned.replace("->", ".").replace("::", "."),
+    ).strip(".")
+    if not ref or ref.replace(".", "").isdigit():
+        return False
+    if _wrapper_ref_hits_exclusion(
+        ref, _WRAPPER_DANGEROUS_CALLEES, _WRAPPER_DANGEROUS_TAILS, None,
+    ):
+        return True
+    low = ref.lower()
+    return any(s in low for s in _SECURITY_SENSITIVE_NAMES)
+
+
+#: A bare signature line (K&R `{`-on-next-line form): the parameter
+#: list closes the line, no statement follows.
+_ACCESSOR_SIG_LINE_RE = re.compile(r"^[^=;{}]*\([^;{}]*\)\s*$")
+
+#: A return-type-only line (the BSD/kernel `int\nname(...)` split
+#: signature): qualifier/type identifiers and pointer stars only —
+#: no punctuation a statement would carry.
+_ACCESSOR_TYPE_LINE_RE = re.compile(
+    r"^(?:[A-Za-z_]\w*\s+)*[A-Za-z_]\w*(?:\s*\*+)?\s*$"
+)
+
+#: Whole-body accessor arms, matched with fullmatch over the
+#: signature-stripped body — a suffix anchor let any side-effecting
+#: statement ride in front of the accessor return.
+_ACCESSOR_ARMS: dict[str, re.Pattern[str]] = {
+    "c": re.compile(
+        r"return\s+(?:(\w+(?:->|\.)\w+)|\d+|NULL)\s*;",
+    ),
+    "go": re.compile(
+        r"return\s+(?:(\w+\.\w+)(?:\s*,\s*nil)?|\d+)",
+    ),
+    "lua": re.compile(
+        r"return\s+(?:(\w+\.\w+)|\d+)",
+    ),
+    "rust": re.compile(
+        r"(?:return\s+)?(?:(self\.\w+(?:\.clone\(\))?)|\d+)\s*;?",
+    ),
+    "php": re.compile(
+        r"return\s+(?:(\$this->\w+|self::\$?\w+)"
+        r"|\d+|true|false|null)\s*;",
+    ),
+    "java": re.compile(
+        r"return\s+(?:this\.(\w+)|(\w+))\s*;",
+    ),
+    "javascript": re.compile(
+        r"return\s+(?:this\.(_?\w+)|\d+)\s*;?",
+    ),
+    "perl": re.compile(
+        r"return\s+(?:\$self->\{\s*(\w+)\s*\}|\$_\[\d+\])\s*;",
+    ),
+}
+_ACCESSOR_ARMS["cpp"] = _ACCESSOR_ARMS["c"]
+_ACCESSOR_ARMS["typescript"] = _ACCESSOR_ARMS["javascript"]
+
+
+def _is_simple_accessor(source: str, lang: str) -> bool:
+    """True only when the WHOLE body is a single accessor return.
+
+    Judged semantically, never on raw prefix-dropped lines or a
+    suffix-anchored arm: python parses to an AST whose body must be
+    exactly one ``return`` of a self-field/name/constant; every other
+    language judges the shared sanitized-view line pair
+    (``_judged_view_lines`` — the wrapper tier's chokepoint, so a
+    string-continuation line can never be dropped as a comment) and
+    anchors its arm over the ENTIRE signature-stripped body, so a
+    side-effecting statement (deref-store, refcount op, sink call)
+    can never ride in front of the return. The returned name is
+    gated against the dangerous callee sets in every arm.
+    """
+    if lang == "python":
+        return _py_simple_accessor(source)
+
+    views = _judged_view_lines(source, lang)
+    if views is None:
+        return False
+    code_lines, _ref_lines = views
+    if not code_lines or len(code_lines) > 3:
+        return False
+
+    body = " ".join(code_lines)
+    if lang == "lua":
+        body_no_sig = re.sub(
+            r"^\s*(?:local\s+)?function\b[^)]*\)\s*", "", body)
+        # No leading ``\s*``: it re-scanned a hostile whitespace run
+        # from every position (quadratic) and the trailing .strip()
+        # already removes whatever whitespace precedes the cut.
+        body_no_sig = re.sub(r"\bend\s*$", "", body_no_sig).strip()
+    else:
+        sig_end = body.find("{")
+        if sig_end >= 0:
+            body_no_sig = body[sig_end + 1:].strip()
+            # Trailing close-brace only: rfind would cut at an
+            # INTERIOR brace (perl `$self->{name}`) when the
+            # function's own closing brace sits on a dropped
+            # brace-only line.
+            if body_no_sig.endswith("}"):
+                body_no_sig = body_no_sig[:-1].strip()
+        elif (
+            len(code_lines) >= 2
+            and "return" not in code_lines[0]
+            and _ACCESSOR_SIG_LINE_RE.match(code_lines[0])
+        ):
+            # Brace-only lines are dropped from the judged views, so
+            # a K&R-style `{` on its own line leaves a braceless
+            # body: strip the leading line only when it is
+            # unambiguously a bare signature (ends at its parameter
+            # list). Anything else refuses — never guess at a body.
+            body_no_sig = " ".join(code_lines[1:]).strip()
+        elif (
+            len(code_lines) >= 3
+            and code_lines[0].split()[0] != "return"
+            and _ACCESSOR_TYPE_LINE_RE.match(code_lines[0])
+            and "return" not in code_lines[1]
+            and _ACCESSOR_SIG_LINE_RE.match(code_lines[1])
+        ):
+            # The BSD/kernel split-signature idiom — the return type
+            # on its OWN line above the name (`int\ndiskmapopen(...)
+            # \n{`). Without this join the dominant kernel style lost
+            # its accessor skip wholesale (refusal-direction cost);
+            # honesty still rests entirely on the whole-body arm
+            # below.
+            body_no_sig = " ".join(code_lines[2:]).strip()
+        else:
+            return False
+    if not body_no_sig:
+        return False
+
+    arm = _ACCESSOR_ARMS.get(lang)
+    if arm is None:
+        return False
+    m = arm.fullmatch(body_no_sig)
+    if m is None:
+        return False
+    returned = next((g for g in m.groups() if g), "")
+    return not _accessor_ref_refused(returned)
+
+
+
+
+# Convention for the per-language pattern checks below: same-line
+# co-occurrence gaps are bounded (``.{0,200}``/``.{0,1000}`` by
+# shape, delimiter spans ``[^)]{0,4000}``) instead of unbounded
+# ``.*``/``[^)]*``.  The
+# scanned source is hostile, and an unbounded gap lets a crafted line
+# re-scan its whole tail from every occurrence of the head token —
+# quadratic in the line length.  The bounds sit far above real code
+# lines (short of generated/minified bundles); a longer gap simply
+# stops matching, which costs at most one heuristic hit on inputs no
+# human wrote.
 def _check_c_patterns(
     result: PrefilterResult,
     source: str,
@@ -900,12 +2277,12 @@ def _check_c_patterns(
         )
 
     result.has_pointer_ops = bool(
-        re.search(r'\*\s*\(.*\+', source)
+        re.search(r'\*\s*\(.{0,1000}\+', source)
         or re.search(r'->\s*\w+\s*\[', source)
         or re.search(r'\(\w+\s*\*\)\s*\w+', source)
     )
 
-    result.has_array_access = bool(re.search(r'\w+\s*\[', source))
+    result.has_array_access = bool(re.search(r'\b\w+\s*\[', source))
 
     for i, line in enumerate(source.splitlines(), start=line_start):
         stripped = line.strip()
@@ -935,8 +2312,8 @@ def _check_c_patterns(
             ))
 
         match = re.search(
-            r'snprintf\s*\([^,]+,\s*sizeof\s*\([^)]+\)\s*,'
-            r'\s*"[^"]*%s[^"]*"',
+            r'snprintf\s*\([^,]{1,4000},\s*sizeof\s*\([^)]{1,4000}\)\s*,'
+            r'\s*"[^"]{0,1000}%s[^"]{0,1000}"',
             stripped,
         )
         if match:
@@ -951,7 +2328,7 @@ def _check_c_patterns(
             ))
 
         if re.search(
-            r"(SELECT|INSERT|UPDATE|DELETE)\b.*%s",
+            r"(SELECT|INSERT|UPDATE|DELETE)\b.{0,1000}%s",
             stripped, re.IGNORECASE,
         ):
             result.hits.append(PrefilterHit(
@@ -961,7 +2338,11 @@ def _check_c_patterns(
                 severity="error",
             ))
 
-        if re.search(r'\buint16_t\b.*\boffset\b|\buint16_t\b.*\blen\b', stripped):
+        if re.search(
+            r'\buint16_t\b.{0,1000}\boffset\b'
+            r'|\buint16_t\b.{0,1000}\blen\b',
+            stripped,
+        ):
             result.hits.append(PrefilterHit(
                 rule_id="narrow-integer-size",
                 message=(
@@ -982,7 +2363,7 @@ def _check_c_patterns(
                     severity="warning",
                 ))
 
-        if re.search(r'\bmalloc\s*\([^)]*\*', stripped):
+        if re.search(r'\bmalloc\s*\([^)]{0,4000}\*', stripped):
             result.hits.append(PrefilterHit(
                 rule_id="malloc-multiply-overflow",
                 message=(
@@ -1049,7 +2430,7 @@ def _check_c_missing_bounds(
 
     params_with_index_access = set()
     for i, line in enumerate(lines, start=line_start):
-        for m in re.finditer(r'(\w+)\s*\[(\w+)\]', line):
+        for m in re.finditer(r'\b(\w+)\s*\[(\w+)\]', line):
             index_var = m.group(2)
             if not index_var.isdigit():
                 params_with_index_access.add((index_var, i))
@@ -1059,8 +2440,8 @@ def _check_c_missing_bounds(
         for line in lines:
             if re.search(
                 rf'\b{re.escape(var)}\s*(?:[<>]=?)\s*\w+|'
-                rf'\w+\s*(?:[<>]=?)\s*{re.escape(var)}|'
-                rf'if\s*\(.*{re.escape(var)}',
+                rf'\b\w+\s*(?:[<>]=?)\s*{re.escape(var)}|'
+                rf'if\s*\(.{{0,1000}}{re.escape(var)}',
                 line,
             ):
                 has_check = True
@@ -1194,7 +2575,7 @@ def _check_c_post_loop_oob(
     """
     lines = source.splitlines()
     loop_re = re.compile(
-        r'\b(?:while|for)\b.*\b(\w+)\s*<\s*(\w+)\b'
+        r'\b(?:while|for)\b.{0,200}\b(\w+)\s*<\s*(\w+)\b'
         r'(?!\s*[-+*/])',
     )
     brace_depth = 0
@@ -1234,9 +2615,11 @@ def _check_c_post_loop_oob(
         if loop_index_var and not in_loop:
             idx_esc = re.escape(loop_index_var)
             if re.search(
-                rf'\bif\b.*\b{idx_esc}\b.*<|'
-                rf'\bif\b.*\b{idx_esc}\b.*>|'
-                rf'\bif\b.*<.*\b{idx_esc}\b',
+                rf'\bif\b(?:(?!\b{idx_esc}\b).){{0,64}}'
+                rf'\b{idx_esc}\b.{{0,200}}<|'
+                rf'\bif\b(?:(?!\b{idx_esc}\b).){{0,64}}'
+                rf'\b{idx_esc}\b.{{0,200}}>|'
+                rf'\bif\b[^<\n]{{0,64}}<.{{0,200}}\b{idx_esc}\b',
                 stripped,
             ):
                 loop_index_var = None
@@ -1321,7 +2704,9 @@ def _check_python_patterns(
                 severity="error",
             ))
 
-        if re.search(r'\bsubprocess\.\w+\(.*shell\s*=\s*True', stripped):
+        if re.search(
+            r'\bsubprocess\.\w+\(.{0,1000}shell\s*=\s*True', stripped,
+        ):
             result.hits.append(PrefilterHit(
                 rule_id="subprocess-shell-true",
                 message="subprocess with shell=True — command injection risk",
@@ -1361,7 +2746,7 @@ def _check_go_patterns(
         callee_names = {c.get("name", "") for c in callees}
 
     result.has_dangerous_apis = bool(callee_names & _DANGEROUS_GO_CALLEES)
-    result.has_array_access = bool(re.search(r'\w+\s*\[', source))
+    result.has_array_access = bool(re.search(r'\b\w+\s*\[', source))
     result.has_pointer_ops = bool(
         re.search(r'\bunsafe\.Pointer\b', source)
         or re.search(r'\buintptr\b', source)
@@ -1438,7 +2823,7 @@ def _check_go_patterns(
             source,
         ) and not re.search(
             r'filepath\.Clean|filepath\.Abs|'
-            r'strings\.Contains.*\.\.|path\.Clean',
+            r'strings\.Contains.{0,1000}\.\.|path\.Clean',
             source,
         ):
             result.hits.append(PrefilterHit(
@@ -1525,7 +2910,7 @@ def _check_rust_patterns(
         re.search(r'\*const\b|\*mut\b', source)
         or re.search(r'\bas\s+\*(?:const|mut)\b', source)
     )
-    result.has_array_access = bool(re.search(r'\w+\s*\[', source))
+    result.has_array_access = bool(re.search(r'\b\w+\s*\[', source))
 
     has_unsafe_block = bool(re.search(r'\bunsafe\s*\{', source))
 
@@ -1693,7 +3078,7 @@ def _check_php_patterns(
             ))
 
         if re.search(
-            r'\bpreg_replace\s*\(\s*["\'].*?/e["\']',
+            r'\bpreg_replace\s*\(\s*["\'].{0,1000}?/e["\']',
             stripped,
         ):
             result.hits.append(PrefilterHit(
@@ -1719,7 +3104,9 @@ def _check_php_patterns(
                 severity="error",
             ))
 
-        if re.search(r'\becho\b.*\$_(?:GET|POST|REQUEST|COOKIE)', stripped):
+        if re.search(
+            r'\becho\b.{0,1000}\$_(?:GET|POST|REQUEST|COOKIE)', stripped,
+        ):
             result.hits.append(PrefilterHit(
                 rule_id="php-xss",
                 message=(
@@ -1748,7 +3135,7 @@ def _check_php_patterns(
             r'readfile|unlink|rename)\s*\(\s*\$',
             stripped,
         ) and not re.search(
-            r'realpath|basename|str_replace.*\.\.',
+            r'realpath|basename|str_replace.{0,1000}\.\.',
             source,
         ):
             result.hits.append(PrefilterHit(
@@ -1761,7 +3148,9 @@ def _check_php_patterns(
                 severity="warning",
             ))
 
-        if re.search(r'\bheader\s*\(\s*["\']Location.*\$', stripped):
+        if re.search(
+            r'\bheader\s*\(\s*["\']Location.{0,1000}\$', stripped,
+        ):
             result.hits.append(PrefilterHit(
                 rule_id="php-open-redirect",
                 message="redirect with user-controlled URL — open redirect",
@@ -1783,7 +3172,7 @@ def _check_java_patterns(
         callee_names = {c.get("name", "") for c in callees}
 
     result.has_dangerous_apis = bool(callee_names & _DANGEROUS_JAVA_CALLEES)
-    result.has_array_access = bool(re.search(r'\w+\s*\[', source))
+    result.has_array_access = bool(re.search(r'\b\w+\s*\[', source))
 
     for i, line in enumerate(source.splitlines(), start=line_start):
         stripped = line.strip()
@@ -1833,7 +3222,7 @@ def _check_java_patterns(
 
         if re.search(
             r'Class\.forName\s*\(|\.newInstance\s*\(|'
-            r'\.getMethod\s*\(.*\.invoke\s*\(',
+            r'\.getMethod\s*\(.{0,1000}\.invoke\s*\(',
             stripped,
         ):
             result.hits.append(PrefilterHit(
@@ -1847,7 +3236,8 @@ def _check_java_patterns(
             ))
 
         if re.search(
-            r'new\s+File\s*\(.*(?:request|param|input|getParameter)',
+            r'new\s+File\s*\(.{0,200}'
+            r'(?:request|param|input|getParameter)',
             stripped, re.IGNORECASE,
         ):
             result.hits.append(PrefilterHit(
@@ -1873,7 +3263,7 @@ def _check_java_patterns(
         ) and not re.search(
             r'FEATURE_SECURE_PROCESSING|'
             r'disallow-doctype-decl|'
-            r'setExpandEntityReferences.*false',
+            r'setExpandEntityReferences.{0,1000}false',
             source,
         ):
             result.hits.append(PrefilterHit(
@@ -1887,7 +3277,7 @@ def _check_java_patterns(
             ))
 
         if re.search(
-            r'ScriptEngine|\.eval\s*\(.*(?:request|param|input)',
+            r'ScriptEngine|\.eval\s*\(.{0,200}(?:request|param|input)',
             stripped, re.IGNORECASE,
         ):
             result.hits.append(PrefilterHit(
@@ -1897,7 +3287,10 @@ def _check_java_patterns(
                 severity="error",
             ))
 
-        if re.search(r'\bLDAP\b.*\+\s*(?:request|param|input)', stripped, re.IGNORECASE):
+        if re.search(
+            r'\bLDAP\b.{0,1000}\+\s*(?:request|param|input)',
+            stripped, re.IGNORECASE,
+        ):
             result.hits.append(PrefilterHit(
                 rule_id="java-ldap-injection",
                 message="LDAP query with user input — injection risk",
@@ -1919,7 +3312,7 @@ def _check_js_patterns(
         callee_names = {c.get("name", "") for c in callees}
 
     result.has_dangerous_apis = bool(callee_names & _DANGEROUS_JS_CALLEES)
-    result.has_array_access = bool(re.search(r'\w+\s*\[', source))
+    result.has_array_access = bool(re.search(r'\b\w+\s*\[', source))
 
     for i, line in enumerate(source.splitlines(), start=line_start):
         stripped = line.strip()
@@ -1941,12 +3334,13 @@ def _check_js_patterns(
             ))
 
         if re.search(
-            r'child_process.*\b(?:exec|execSync|spawn|execFile)\s*\(',
+            r'child_process.{0,1000}'
+            r'\b(?:exec|execSync|spawn|execFile)\s*\(',
             stripped,
         ) or (re.search(
             r'\b(?:exec|execSync|spawn|spawnSync|execFile)\s*\(',
             stripped,
-        ) and re.search(r'child_process|require.*child', source)):
+        ) and re.search(r'child_process|require.{0,1000}child', source)):
             result.hits.append(PrefilterHit(
                 rule_id="js-command-exec",
                 message="child_process execution — command injection risk",
@@ -2005,7 +3399,7 @@ def _check_js_patterns(
             source,
         ) and not re.search(
             r'path\.(?:resolve|normalize|basename)|'
-            r'sanitize|includes.*\.\.',
+            r'sanitize|includes.{0,1000}\.\.',
             source,
         ):
             result.hits.append(PrefilterHit(
@@ -2038,7 +3432,7 @@ def _check_js_patterns(
                 severity="warning",
             ))
 
-        if re.search(r'\.redirect\s*\(.*(?:req\.|params\.|query\.)', stripped):
+        if re.search(r'\.redirect\s*\(.{0,200}(?:req\.|params\.|query\.)', stripped):
             result.hits.append(PrefilterHit(
                 rule_id="js-open-redirect",
                 message="redirect with user-controlled URL — open redirect",
@@ -2046,7 +3440,10 @@ def _check_js_patterns(
                 severity="warning",
             ))
 
-        if re.search(r'\bnew\s+RegExp\s*\(.*(?:req\.|params\.|input)', stripped):
+        if re.search(
+            r'\bnew\s+RegExp\s*\(.{0,1000}(?:req\.|params\.|input)',
+            stripped,
+        ):
             result.hits.append(PrefilterHit(
                 rule_id="js-regex-injection",
                 message="RegExp with user input — ReDoS risk",
@@ -2068,7 +3465,7 @@ def _check_lua_patterns(
         callee_names = {c.get("name", "") for c in callees}
 
     result.has_dangerous_apis = bool(callee_names & _DANGEROUS_LUA_CALLEES)
-    result.has_array_access = bool(re.search(r'\w+\s*\[', source))
+    result.has_array_access = bool(re.search(r'\b\w+\s*\[', source))
 
     for i, line in enumerate(source.splitlines(), start=line_start):
         stripped = line.strip()
@@ -2161,7 +3558,8 @@ def _check_lua_patterns(
             ))
 
         if re.search(r'\bstring\.format\s*\(', stripped) and re.search(
-            r'%s.*user|%s.*input|%s.*req', stripped, re.IGNORECASE,
+            r'%s.{0,200}user|%s.{0,200}input|%s.{0,200}req',
+            stripped, re.IGNORECASE,
         ):
                 result.hits.append(PrefilterHit(
                     rule_id="lua-format-injection",
@@ -2193,7 +3591,8 @@ def _check_perl_patterns(
     for i, line in enumerate(source.splitlines(), start=line_start):
         stripped = line.strip()
 
-        if re.search(r'\beval\s*\(?\s*["\$]', stripped):
+        # gated optional paren (the \(?\s* pair was quadratic)
+        if re.search(r'\beval\s*(?:\(\s*)?["\$]', stripped):
             result.hits.append(PrefilterHit(
                 rule_id="perl-eval",
                 message="eval with variable — code injection risk",
@@ -2201,7 +3600,7 @@ def _check_perl_patterns(
                 severity="error",
             ))
 
-        if re.search(r'\b(?:system|exec)\s*\(?\s*["\$]', stripped):
+        if re.search(r'\b(?:system|exec)\s*(?:\(\s*)?["\$]', stripped):
             result.hits.append(PrefilterHit(
                 rule_id="perl-command-exec",
                 message="system/exec — command injection risk",
@@ -2218,7 +3617,7 @@ def _check_perl_patterns(
             ))
 
         if re.search(
-            r'\bopen\s*\(?\s*\w+\s*,\s*["\$]', stripped,
+            r'\bopen\s*(?:\(\s*)?\w+\s*,\s*["\$]', stripped,
         ) and re.search(r'\||\>', stripped):
                 result.hits.append(PrefilterHit(
                     rule_id="perl-open-pipe",
@@ -2231,7 +3630,7 @@ def _check_perl_patterns(
                 ))
 
         if re.search(
-            r'\bDBI\b.*\bdo\s*\(|\bprepare\s*\(.*\$',
+            r'\bDBI\b.{0,200}\bdo\s*\(|\bprepare\s*\(.{0,200}\$',
             stripped,
         ) and re.search(r'"\s*\.\s*\$|\$\w+', stripped) and not re.search(
             r'\?|placeholder', stripped, re.IGNORECASE,
@@ -2247,7 +3646,8 @@ def _check_perl_patterns(
             ))
 
         if re.search(
-            r'\bprint\b.*\$(?:query|param|input|cgi)', stripped, re.IGNORECASE,
+            r'\bprint\b.{0,1000}\$(?:query|param|input|cgi)',
+            stripped, re.IGNORECASE,
         ) and not re.search(r'encode_entities|escapeHTML|CGI::escape', source):
                 result.hits.append(PrefilterHit(
                     rule_id="perl-xss",
@@ -2256,7 +3656,18 @@ def _check_perl_patterns(
                     severity="warning",
                 ))
 
-        if re.search(r'=~\s*s/.*\$.*?/.*?/e', stripped):
+        if re.search(
+            # The pattern body BEFORE the interpolation excludes bare '$':
+            # it stops at the first unescaped '$' deterministically —
+            # with '$' inside the class, a '$'-storm line made every
+            # split of the run explorable, quadratic per line.  Escaped
+            # dollars still ride the escape branch; a match exists for
+            # exactly the same lines (first-$ vs any-$ anchoring), and
+            # the consumer is a boolean hit.
+            r'=~\s*s/(?:\\.|[^/\\\n$])*\$(?:\\.|[^/\\\n])*'
+            r'/(?:\\.|[^/\\\n])*/e',
+            stripped,
+        ):
             result.hits.append(PrefilterHit(
                 rule_id="perl-regex-eval",
                 message="regex substitution with /e modifier — code execution",
@@ -2273,7 +3684,7 @@ def _check_perl_patterns(
             ))
 
         if re.search(
-            r'\bchmod\s*\(?\s*0?777|\bchmod\b.*\$',
+            r'\bchmod\s*(?:\(\s*)?0?777|\bchmod\b.{0,1000}\$',
             stripped,
         ):
             result.hits.append(PrefilterHit(
@@ -2282,45 +3693,3 @@ def _check_perl_patterns(
                 line=i,
                 severity="warning",
             ))
-
-
-def run_prefilter_batch(
-    *,
-    target_path: Path,
-    functions: list[dict[str, Any]],
-) -> dict[str, PrefilterResult]:
-    """Run pre-filter on a batch of functions.
-
-    Returns dict keyed by 'file:function'.
-    """
-    results = {}
-    for func in functions:
-        file_path = func.get("file", "")
-        name = func.get("name", "")
-        source = func.get("source", "")
-
-        if not source:
-            full = safe_join(target_path, file_path) if file_path else None
-            if full is not None and full.exists():
-                try:
-                    all_lines = full.read_text(errors="replace").splitlines()
-                    start = max(0, func.get("line_start", 1) - 1)
-                    end = func.get("line_end") or (start + 50)
-                    source = "\n".join(all_lines[start:end])
-                except OSError:
-                    source = ""
-
-        result = run_prefilter(
-            target_path=target_path,
-            file_path=file_path,
-            function_name=name,
-            source=source,
-            line_start=func.get("line_start", 0),
-            line_end=func.get("line_end", 0),
-            callers=func.get("callers"),
-            callees=func.get("callees"),
-            metadata=func.get("metadata"),
-        )
-        results[f"{file_path}:{name}"] = result
-
-    return results

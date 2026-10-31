@@ -54,7 +54,14 @@ _SECRET_TOKEN_RE = re.compile(
     r"|apiKey\s*[:=]\s*[A-Za-z0-9_-]{8,}"  # NVD API key header value
     r"|ya29\.[A-Za-z0-9_-]{20,}"  # GCP OAuth access token
     r"|xox[bpras]-[A-Za-z0-9-]{10,}"  # Slack bot/user/app tokens
-    r"|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}"  # JWT
+    # The lookbehind pins the JWT branch to token-run starts: the
+    # bare prefix let every ``eyJ`` planted inside one base64ish run
+    # restart the scan and re-read the run — quadratic on hostile
+    # log text. A real JWT glued directly to a preceding token char
+    # (no delimiter) is no longer redacted — accepted corner; every
+    # delimited spelling (quotes, =, :, whitespace) still matches.
+    r"|(?<![A-Za-z0-9_-])"
+    r"eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}"  # JWT
     r"|npm_[A-Za-z0-9]{36,}"  # npm publish tokens
     r"|pypi-[A-Za-z0-9_-]{20,}"  # PyPI API tokens
 )
@@ -96,11 +103,6 @@ AuditStatus = Literal[
     "final_turn_cap",
     "final_no_verify",
     "recovery",
-    "post_build_refusal",
-    "fix8_continuation",
-    "force_resolve_continuation",
-    "benign_verify_continuation",
-    "proprietary_verify_continuation",
 ]
 """Agent-visible outcomes of a single audit entry.
 
@@ -117,25 +119,12 @@ build-path tool succeeds within ``RECOVERY_GAP_TURNS`` turns of a
 same-tool failure. Lets post-bench analysis count recovery events without
 scripted forensic over raw tool_ok / tool_error pairs.
 
-``post_build_refusal`` is emitted when the SDK throws a refusal-class
-exception AFTER ``state.launched_ok`` is True, i.e., the agent reached
-docker_run/compose_up success but the verify-plan composition (or a
-downstream tool input) tripped Anthropic's safety classifier. Distinct
-from research-phase refusals (NVD-description trigger handled by the
-sanitizer). Paired with the prompts.py open-clause verify-plan
-composition rule.
-
-``force_resolve_continuation`` is emitted by the build-engagement gate.
-``benign_verify_continuation`` is emitted when a post-launch refusal
-blocked verify and the env-gated benign-verify continuation resumes the
-session with a benign-only verify prompt.
-
-``proprietary_verify_continuation`` is emitted when the env-gated
-proprietary-verify continuation resumes the session because the agent gave
-up ``proprietary`` WITHOUT an image_resolve probe — verify-the-negative
-against the open-source-by-proprietary-vendor false-positive class. Locked
-by ``test_proprietary_verify_continuation`` +
-``test_audit_status_registers_all_emitted_continuations``.
+Historical statuses (``post_build_refusal``, ``fix8_continuation``,
+``force_resolve_continuation``, ``benign_verify_continuation``,
+``proprietary_verify_continuation``) belonged to the retired SDK-engine
+backend and are no longer emitted by any surviving code path — old
+audit JSONLs may still carry them; forensic consumers must not read
+their absence in new runs as "the feature fired 0 times".
 """
 
 
@@ -200,6 +189,25 @@ class AuditWriter:
         """Directory for this run's traces (``root/run_id/``)."""
         return self._root / self._run_id
 
+    def ensure_run_root(self) -> Path:
+        """Create (and mode-restrict) the run directory, returning it.
+
+        ``write()`` calls this lazily before every append; callers that
+        need the directory to exist EARLIER than the first entry (the
+        dispatcher gate only places its L5 audit log in a run directory
+        that already exists) call it directly.
+
+        Security: the run dir is restricted to the owner (0700) — it
+        holds the full agentic transcript. The chmod is best-effort: it
+        can fail on exotic filesystems and must not abort the run (the
+        fail-loud contract is about writing the trace, not its mode).
+        """
+        root = self.run_root
+        root.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            os.chmod(root, 0o700)
+        return root
+
     def write(self, *, cve_id: str, entry: AuditEntry) -> Path:
         r"""Append one :class:`AuditEntry` to the CVE's trace.
 
@@ -212,13 +220,7 @@ class AuditWriter:
         concurrent reader without waiting on Python's I/O buffer.
         """
         path = self._path_for(cve_id=cve_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # Security: restrict the run dir to the owner (0700) — it holds the full
-        # agentic transcript. Best-effort: chmod can fail on exotic filesystems
-        # and must not abort the run (the fail-loud contract is about writing the
-        # trace, not its mode).
-        with contextlib.suppress(OSError):
-            os.chmod(path.parent, 0o700)
+        self.ensure_run_root()
         payload: dict[str, object] = {
             "run_id": self._run_id,
             "cve_id": cve_id,

@@ -17,12 +17,12 @@ composer mirror.
 from __future__ import annotations
 
 import logging
-import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 
 from . import ResolverResult, _check_tool, _run
+from ._safe_io import copy_regular_file
 
 logger = logging.getLogger(__name__)
 
@@ -67,10 +67,11 @@ class ComposerResolver:
         # use a temp copy so the operator's checkout is untouched.
         with tempfile.TemporaryDirectory(prefix="raptor-sca-composer-") as tmp:
             tmp_path = Path(tmp)
+            # lstat-gated, size-bounded copies — a symlinked or
+            # special-file manifest in the scanned (hostile) tree is
+            # refused instead of followed / opened.
             for fname in ("composer.json", "composer.lock"):
-                src = project_dir / fname
-                if src.exists():
-                    shutil.copy2(src, tmp_path / fname)
+                copy_regular_file(project_dir / fname, tmp_path / fname)
 
             try:
                 proc = _run(

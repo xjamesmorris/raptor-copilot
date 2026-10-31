@@ -84,6 +84,33 @@ class TestWriter:
         # filesystem-safe, bounded filename
         assert len(fname) < 100
 
+    def test_hostile_names_control_scrubbed_like_match_layer(
+        self, tmp_path,
+    ):
+        # Same scrub class as match._clip / diff._display, "so the
+        # layers cannot drift": names land in the jq'd sidecar, in .c
+        # doc-comment headers, and in the byte-ceiling warning — none
+        # may carry raw ESC/BEL/bidi bytes.
+        db = _db(functions=[
+            _fn("evil\x1b]0;pwn\x07‮name", 0x1000,
+                sig="void evil\x1b[2J(void)",
+                decomp=("void f(void){\n"
+                        "  puts(\"lit\x1b]0;pwn\x07\x9b2J‮lit\");\n"
+                        "}")),
+        ])
+        tree = write_decomp_tree(db, tmp_path)
+        fname = [f for f in tree.files if f.endswith(".c")][0]
+        text = (tmp_path / fname).read_text()
+        sidecar = tree.sidecar_path.read_text()
+        for emitted in (text, sidecar):
+            assert "\x1b" not in emitted
+            assert "\x07" not in emitted
+            assert "\x9b" not in emitted
+            assert "‮" not in emitted
+        assert "evil" in text
+        # The multi-line body survives structurally (newlines intact).
+        assert "  puts(" in text
+
     def test_byte_ceiling_truncates_loudly(self, tmp_path, monkeypatch):
         import packages.ghidra.decomp_tree as mod
         monkeypatch.setattr(mod, "_MAX_TREE_BYTES", 512)
@@ -195,6 +222,27 @@ class TestWriterHardening:
         assert on_disk == {f for f in tree.files if f.endswith(".c")}
         assert not any("gone" in n for n in on_disk)
 
+    def test_planted_dangling_symlink_swept_never_followed(
+        self, tmp_path,
+    ):
+        """The stale sweep gated on is_file(), which is False for a
+        DANGLING symlink — a link planted at a tree name survived and
+        the write then created the attacker-chosen target."""
+        db = _db(functions=[
+            _fn("keep", 0x1000, decomp="void k(void){}"),
+        ])
+        probe = write_decomp_tree(db, tmp_path)
+        emitted = next(f for f in probe.files if f.endswith(".c"))
+        victim = tmp_path / "victim"
+        (tmp_path / emitted).unlink()
+        (tmp_path / emitted).symlink_to(victim)
+
+        write_decomp_tree(db, tmp_path)
+
+        assert not victim.exists()
+        assert not (tmp_path / emitted).is_symlink()
+        assert "keep" in (tmp_path / emitted).read_text()
+
     def test_types_header_over_budget_marks_truncated(
         self, tmp_path, monkeypatch,
     ):
@@ -209,3 +257,23 @@ class TestWriterHardening:
         tree = write_decomp_tree(db, tmp_path)
         assert tree.truncated
         assert not (tmp_path / TYPES_HEADER).exists()
+
+
+def test_body_control_is_match_control_minus_structural_ws() -> None:
+    # ``_BODY_CONTROL`` must scrub exactly what ``match._CONTROL``
+    # scrubs, minus \t and \n (structural in multi-line decompiled C).
+    # Exact set equality over every codepoint: neither layer may gain
+    # or lose a control/bidi/invisible character without the other —
+    # a silent divergence would let a hostile binary pick whichever
+    # emission path forgot a character.
+    from packages.ghidra.decomp_tree import _BODY_CONTROL
+    from packages.ghidra.match import _CONTROL
+    every_codepoint = "".join(map(chr, range(0x110000)))
+    body = set(_BODY_CONTROL.findall(every_codepoint))
+    ctrl = set(_CONTROL.findall(every_codepoint))
+    assert body == ctrl - {"\t", "\n"}
+    # Spot anchors: terminal-escape (ESC, CSI), bidi override, BOM and
+    # C0 boundaries stay scrubbed; structural whitespace stays legal.
+    assert {"\x00", "\x0b", "\x1b", "\x7f", "\x9b",
+            "‮", "﻿"} <= body
+    assert "\t" not in body and "\n" not in body

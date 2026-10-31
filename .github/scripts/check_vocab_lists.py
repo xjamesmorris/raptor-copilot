@@ -29,7 +29,9 @@ compared against ``vocab_baseline.json`` next to this script. A key
 not in the baseline fails the run — route the vocabulary through the
 learned seams or a data pack, or (deliberately, with a note) add the
 key to the baseline. Baselined lists that GROW past their recorded
-size warn; baseline entries that no longer fire warn as stale.
+size warn; lists that SHRINK below it warn too (a stale high count is
+silent growth headroom); baseline entries that no longer fire warn as
+stale.
 
 Usage:
     python3 .github/scripts/check_vocab_lists.py            # CI mode
@@ -37,8 +39,8 @@ Usage:
     python3 .github/scripts/check_vocab_lists.py --write-baseline
     python3 .github/scripts/check_vocab_lists.py --json out.json
 
-Exit codes: 0 clean (stale/growth warnings only), 1 new findings,
-2 usage error.
+Exit codes: 0 clean (stale/growth/shrink warnings only), 1 new
+findings, 2 usage error.
 """
 
 from __future__ import annotations
@@ -50,23 +52,25 @@ import re
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from runtime_universe import runtime_file_universe  # noqa: E402
+
 # Seed-set policy: census/operator guidance allows curated seed sets
 # of up to ~9 names per category. Lists strictly larger are flagged.
 MAX_SEED_NAMES = 9
 
-PY_ROOTS = ["core", "packages", "plugins", "libexec", "engine"]
-
-SKIP_DIR_NAMES = {
-    ".git", "__pycache__", "node_modules", "out", ".out", ".tox", ".venv",
-    "venv", "build", "dist", ".claude", "worktrees",
-    # Legitimate homes for big name lists:
+# Universe: the shared runtime-source derivation (see
+# runtime_universe.py for roots and standing exclusions — its
+# root-anchored walk is what keeps runtime packages like core/build
+# from being dropped by a bare artifact-dir name). Only this gate's
+# LEGITIMATE HOMES for big name lists stay declared here.
+LEGITIMATE_LIST_HOMES = (
     "data",       # data packs / packaged datasets
-    "tests",      # test files and their fixtures
-    "fixtures",
     "seeds",
     "corpus",
     "binary_oracle_corpora",
-}
+)
 
 # Files/dirs where large curated name lists are the DESIGN, not a
 # regression (relative-path prefixes).
@@ -240,30 +244,15 @@ class _Scanner(ast.NodeVisitor):
 
 
 def iter_python_files(root: Path):
-    for sub in PY_ROOTS:
-        base = root / sub
-        if not base.is_dir():
-            continue
-        for p in sorted(base.rglob("*")):
-            if not p.is_file():
-                continue
-            rel_parts = p.relative_to(root).parts
-            if any(part in SKIP_DIR_NAMES for part in rel_parts):
-                continue
-            if _is_python_file(p):
-                yield p
-
-
-def _is_python_file(p: Path) -> bool:
-    if p.suffix == ".py":
-        return True
-    if p.suffix == "" and p.parent.name == "libexec":
-        try:
-            head = p.open("rb").read(64)
-        except OSError:
-            return False
-        return b"python" in head.split(b"\n", 1)[0]
-    return False
+    # Shared runtime-source derivation (roots, entry modules, libexec
+    # shebang detection, test exclusions). Dev scripts/ dirs stay in
+    # this gate's universe — a curated vocabulary in a verification
+    # harness steers the same reviewers.
+    yield from runtime_file_universe(
+        root,
+        include_dev_scripts=True,
+        extra_excluded_parts=LEGITIMATE_LIST_HOMES,
+    )
 
 
 def scan_tree(root: Path) -> list[_Finding]:
@@ -294,10 +283,42 @@ def load_baseline(path: Path) -> dict:
 
 
 def write_baseline(path: Path, findings: list[_Finding]) -> None:
-    entries = {
-        f.key: {"kind": f.kind, "count": f.count}
-        for f in findings
-    }
+    """Write the current findings as the new baseline, ROUND-TRIPPING
+    the existing rows' review provenance: for every key that survives
+    the refresh, each field other than the regenerated ``kind`` and
+    ``count`` — the ``note`` a reviewer attached, and any field a
+    future schema adds — is carried over from the existing baseline.
+    The baseline doctrine admits entries only WITH a review note, so
+    a count refresh that rewrote rows bare erased every note in one
+    keystroke behind a diff that read as churn. Keys that no longer
+    fire drop; new keys start bare, awaiting their note.
+
+    A present-but-unreadable baseline REFUSES the rewrite: treating
+    it as empty would be the same one-keystroke erasure.
+    """
+    old_entries: dict[str, dict] = {}
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            print(
+                f"[vocab] refusing --write-baseline: cannot parse the "
+                f"existing baseline at {path} ({exc}); fix or remove it "
+                f"first — overwriting would erase every review note",
+                file=sys.stderr,
+            )
+            raise SystemExit(2) from exc
+        if isinstance(loaded, dict):
+            old_entries = {
+                k: v for k, v in loaded.items() if isinstance(v, dict)
+            }
+    entries: dict[str, dict] = {}
+    for f in findings:
+        carried = {
+            k: v for k, v in old_entries.get(f.key, {}).items()
+            if k not in ("kind", "count")
+        }
+        entries[f.key] = {**carried, "kind": f.kind, "count": f.count}
     path.write_text(
         json.dumps(entries, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -341,14 +362,57 @@ def main() -> int:
         for k, f in sorted(by_key.items())
         if k in baseline and f.count > baseline[k].get("count", 0)
     ]
+    # Shrunk lane, symmetric to grown: a baseline count above the
+    # measured count is silent headroom — the list can grow back to
+    # the recorded count with no tripwire firing anywhere, so the
+    # count-accurate-baseline rule warns on ANY shrink. Threshold
+    # trade-off, both directions: warning only past a slack margin
+    # would re-open exactly the headroom this lane exists to close
+    # (a census found one row sitting at 3.2x for months, silently);
+    # any-shrink stays noise-free because shrinks are rare (that
+    # census: 1 row of 646) and each warn is retired by one
+    # note-preserving --write-baseline refresh.
+    shrunk = [
+        (f, baseline[k].get("count", 0))
+        for k, f in sorted(by_key.items())
+        if k in baseline and f.count < baseline[k].get("count", 0)
+    ]
     stale = sorted(set(baseline) - set(by_key))
 
     for f, old_count in grown:
         print(f"[vocab] WARN grown: {f.key} ({old_count} -> {f.count} "
               f"names) — route additions through DomainVocabulary/IRIS "
               f"or a data pack")
+    for f, old_count in shrunk:
+        print(f"[vocab] WARN shrunk: {f.key} ({old_count} -> {f.count} "
+              f"names) — the recorded count is silent growth headroom; "
+              f"run --write-baseline (review notes are preserved) and "
+              f"commit the refresh")
     for k in stale:
         print(f"[vocab] WARN stale baseline entry (no longer fires): {k}")
+
+    # Grown-count drift budget. INDIVIDUAL growth stays warn-only by
+    # design (a baselined list may legitimately grow ahead of its
+    # next reviewed refresh), but ACCUMULATED drift makes the
+    # recorded counts meaningless — at ~10% drift a hostile or
+    # careless addition to an already-baselined list was
+    # indistinguishable from noise. Threshold trade-off, both
+    # directions: lower re-arms a refresh-churn treadmill where every
+    # routine growth demands an immediate baseline commit; higher
+    # lets unreviewed additions pool under baselined keys whose notes
+    # vouch for a review they never had. 5% of the baseline (floor 10
+    # so small baselines are not gated on a couple of growths) forces
+    # a reviewed refresh (--write-baseline round-trips notes) once
+    # per accumulation cycle.
+    max_grown = max(10, len(baseline) // 20)
+    if len(grown) > max_grown:
+        print(
+            f"[vocab] {len(grown)} baselined list(s) exceed their "
+            f"recorded counts — over the drift budget of {max_grown}. "
+            f"Run --write-baseline (review notes are preserved), "
+            f"review the count-only diff, and commit it.",
+        )
+        return 1
 
     if new:
         print(f"[vocab] {len(new)} NEW literal function-name list(s) "
@@ -367,7 +431,8 @@ def main() -> int:
         return 1
 
     print(f"[vocab] clean: {len(by_key)} baselined vocabulary lists, "
-          f"no new ones ({len(stale)} stale, {len(grown)} grown).")
+          f"no new ones ({len(stale)} stale, {len(grown)} grown, "
+          f"{len(shrunk)} shrunk).")
     return 0
 
 

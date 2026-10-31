@@ -35,6 +35,41 @@ def _as_dict(value: object) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+#: Dismissed-finding spellings across the producing pipelines
+#: (validate rulings, /agentic classifier statuses). Feasibility
+#: analysis must not resurrect a dismissed finding with an
+#: "analyzed" feasibility verdict.
+_NEGATIVE_VERDICTS = frozenset({
+    "disproven", "ruled_out", "false_positive",
+})
+
+
+def _verdict_token(value: object) -> str:
+    """One normalised spelling for a status/ruling verdict."""
+    return str(value or "").strip().lower().replace(
+        "-", "_").replace(" ", "_")
+
+
+def _ruling_dict(finding: dict) -> "dict | None":
+    """The finding's ruling, dict-normalised across both documented
+    shapes: validate writes ``{"status": ...}`` dicts, /agentic
+    rulings can arrive as a bare status string."""
+    ruling = finding.get("ruling")
+    if isinstance(ruling, dict):
+        return ruling
+    if isinstance(ruling, str):
+        return {"status": ruling}
+    return None
+
+
+def _is_dismissed(finding: dict) -> bool:
+    """Whether a finding carries a negative status or ruling."""
+    if _verdict_token(finding.get("status")) in _NEGATIVE_VERDICTS:
+        return True
+    ruling = _ruling_dict(finding) or {}
+    return _verdict_token(ruling.get("status")) in _NEGATIVE_VERDICTS
+
+
 def _map_filename(raw_id: str) -> str:
     """Filesystem-safe stem for a finding's mitigation-feasibility file.
 
@@ -139,13 +174,36 @@ def main():
     # serialises stage transitions, so this script's lock is
     # the only contended writer.
     import fcntl
+    import time
     lock_path = findings_path.with_suffix(".lock")
     with open(lock_path, "a+b") as findings_lock_fh:
         try:
-            try:
-                fcntl.flock(findings_lock_fh.fileno(), fcntl.LOCK_EX)
-            except OSError as e:
-                print(f"WARNING: could not acquire flock on {lock_path}: {e} — proceeding without lock", file=sys.stderr)
+            # Failure to LOCK is failure to RUN: flock errors (ENOLCK
+            # — e.g. NFS without lockd) correlate with exactly the
+            # contended filesystems where the lock matters, and
+            # proceeding unlocked reopens the documented lost-update
+            # race. Bounded retry for transient hiccups, then fail —
+            # the stage orchestrator already tolerates per-binary
+            # failures.
+            lock_error = None
+            for attempt in range(3):
+                if attempt:
+                    time.sleep(0.5 * attempt)
+                try:
+                    fcntl.flock(findings_lock_fh.fileno(), fcntl.LOCK_EX)
+                    lock_error = None
+                    break
+                except OSError as e:
+                    lock_error = e
+            if lock_error is not None:
+                print(
+                    f"✗ could not acquire flock on {lock_path}: "
+                    f"{lock_error} — refusing to run the unlocked "
+                    "read-modify-write (a parallel instance's "
+                    "feasibility merge would be silently lost)",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
 
             findings_data = load_json(findings_path)
             if findings_data is None:
@@ -156,13 +214,16 @@ def main():
             # authored across stages — a null or non-dict feasibility/
             # ruling is expected shape drift (``.get(key, {})`` returns
             # the null, then ``.get`` on it raises), and one malformed
-            # finding must not abort the whole group.
+            # finding must not abort the whole group. Dismissal covers
+            # every documented negative spelling and BOTH ruling
+            # shapes — the old two-literal filter admitted
+            # false_positive rows and string-shaped rulings into the
+            # analysis flow.
             group = [
                 f for f in findings_data.get("findings", [])
                 if _as_dict(f.get("feasibility")).get("binary_path")
                 == binary_path
-                and f.get("status") != "disproven"
-                and _as_dict(f.get("ruling")).get("status") != "ruled_out"
+                and not _is_dismissed(f)
             ]
 
             if not group:
@@ -190,8 +251,20 @@ def main():
             result = constraints
             print(f"  Binary verdict (generic): {constraints.get('verdict', 'unknown')}", file=sys.stderr)
             print("  Mapping per-finding verdicts (vuln-type-aware)...", file=sys.stderr)
+            # Forward each finding's ruling (dict-normalised) and
+            # status: the mapper owns a dismissal gate of its own,
+            # and a gate behind a caller that strips rulings protects
+            # nothing — the mapper must see what the finding carries.
             mapped = map_findings_to_constraints(
-                [{"id": f.get("id"), "vuln_type": f.get("vuln_type", "")} for f in group if f.get("id")],
+                [
+                    {
+                        "id": f.get("id"),
+                        "vuln_type": f.get("vuln_type", ""),
+                        "status": f.get("status"),
+                        "ruling": _ruling_dict(f),
+                    }
+                    for f in group if f.get("id")
+                ],
                 constraints,
             )
 
@@ -222,6 +295,13 @@ def main():
                             for p in (assessment.exploitation_paths or [])
                         ],
                     }
+                    # A prior binary-less pass leaves skipped-era
+                    # advice ("Binary not found ... Provide --binary")
+                    # that contradicts status=analyzed once the merge
+                    # above keeps it — drop what this analysis
+                    # supersedes.
+                    for stale in ("note", "guidance"):
+                        finding["feasibility"].pop(stale, None)
                     # Mechanical-provenance stamp: consumers (prepare_F,
                     # the report chokepoint) verify this before mapping
                     # the verdict into final_status — an unstamped
@@ -395,6 +475,15 @@ def _enrich_with_empirical_mitigation_map(
 
     enriched = 0
     for finding in group:
+        # findings.json is LLM-authored and schema validation is
+        # advisory — an id-less finding must not KeyError this loop:
+        # the exception would escape past the final save_json and the
+        # run's freshly computed feasibility maps would be lost
+        # wholesale. The per-finding map filename below needs a real
+        # id anyway, so skip id-less entries.
+        fid = finding.get("id")
+        if not fid:
+            continue
         finding_file = finding.get("file") or finding.get("file_path")
         if not finding_file:
             continue
@@ -426,7 +515,7 @@ def _enrich_with_empirical_mitigation_map(
             "empirical_mitigation_map") or {}
         if existing.get("witness_hash") == best.witness.bytes_hash:
             print(
-                f"  {finding['id']}: empirical map already attached "
+                f"  {fid}: empirical map already attached "
                 "for this witness (synthesis pass) — keeping it",
                 file=sys.stderr,
             )
@@ -441,7 +530,7 @@ def _enrich_with_empirical_mitigation_map(
             witness_bytes = store.get_bytes(best.witness.bytes_hash)
         except Exception as e:  # noqa: BLE001
             print(
-                f"  WARN: {finding['id']}: couldn't load witness "
+                f"  WARN: {fid}: couldn't load witness "
                 f"bytes ({type(e).__name__}: {e})",
                 file=sys.stderr,
             )
@@ -455,7 +544,7 @@ def _enrich_with_empirical_mitigation_map(
             )
         except Exception as e:  # noqa: BLE001
             print(
-                f"  WARN: {finding['id']}: empirical analysis raised "
+                f"  WARN: {fid}: empirical analysis raised "
                 f"({type(e).__name__}: {e}); skipping",
                 file=sys.stderr,
             )
@@ -469,7 +558,7 @@ def _enrich_with_empirical_mitigation_map(
             # the flags) — an all-unbuildable map is noise, not
             # evidence. Say so instead of attaching it.
             print(
-                f"  {finding['id']}: empirical map skipped — no "
+                f"  {fid}: empirical map skipped — no "
                 "profile built "
                 f"(unbuildable: {summary_probe.get('unbuildable_profiles')})",
                 file=sys.stderr,
@@ -477,9 +566,12 @@ def _enrich_with_empirical_mitigation_map(
             continue
 
         fmap_file = (
-            feasibility_dir / f"{_map_filename(str(finding['id']))}.json"
+            feasibility_dir / f"{_map_filename(str(fid))}.json"
         )
-        fmap_file.write_text(to_json(fmap), encoding="utf-8")
+        # Atomic write (planted-symlink defence at the predictable
+        # artifact name in the reused run dir).
+        from core.atomic_fs import write_text_atomically
+        write_text_atomically(fmap_file, to_json(fmap))
 
         finding.setdefault("feasibility", {})[
             "empirical_mitigation_map"
@@ -495,7 +587,7 @@ def _enrich_with_empirical_mitigation_map(
         }
         summary = fmap.summary()
         print(
-            f"  {finding['id']}: empirical: "
+            f"  {fid}: empirical: "
             f"fired={summary['bug_fired_under']} "
             f"blocked={summary['blocked_under']}",
             file=sys.stderr,

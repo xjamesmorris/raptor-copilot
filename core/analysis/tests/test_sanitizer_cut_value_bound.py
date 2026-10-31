@@ -147,6 +147,7 @@ class TestWrongVariableCase:
 
     def test_phase_4_refuses_to_suppress_wrong_variable_case(self):
         src = (
+            "import html\n"
             "def handle(user, other):\n"
             "    safe_other = html.escape(other)\n"
             "    render(user.name)\n"
@@ -173,6 +174,7 @@ class TestWrongVariableCase:
         the value-binding arc (smt_barrier wire-up behind flag)
         will switch the default to the value-bound path."""
         src = (
+            "import html\n"
             "def handle(user, other):\n"
             "    safe_other = html.escape(other)\n"
             "    render(user.name)\n"
@@ -201,6 +203,7 @@ class TestTruePositives:
         """``y = html.escape(x); render(y)`` — x flows in, y flows
         out, sink reads y. All four conditions hold."""
         src = (
+            "import html\n"
             "def handle(x):\n"
             "    y = html.escape(x)\n"
             "    render(y)\n"
@@ -223,6 +226,7 @@ class TestTruePositives:
         whole arc was designed for — control-flow + value-flow
         both hold."""
         src = (
+            "import html\n"
             "def handle(user):\n"
             "    if user.is_admin:\n"
             "        safe = html.escape(user.name)\n"
@@ -256,6 +260,7 @@ class TestBypass:
 
     def test_only_one_branch_sanitizes_no_suppress(self):
         src = (
+            "import html\n"
             "def handle(user):\n"
             "    if user.is_admin:\n"
             "        safe = html.escape(user.name)\n"
@@ -290,6 +295,7 @@ class TestChainedSanitizer:
 
     def test_chained_call_yields_candidate_only(self):
         src = (
+            "import html\n"
             "def handle(x):\n"
             "    y = wrap(html.escape(x))\n"
             "    render(y)\n"
@@ -329,6 +335,7 @@ class TestSanitizationOverwritten:
 
     def test_rebound_after_sanitize_yields_candidate_only(self):
         src = (
+            "import html\n"
             "def handle(x):\n"
             "    y = html.escape(x)\n"
             "    y = x\n"
@@ -354,6 +361,7 @@ class TestSanitizationOverwritten:
 class TestGatePreconditions:
     def test_wrong_cwe_still_no_suppress(self):
         src = (
+            "import html\n"
             "def handle(x):\n"
             "    y = html.escape(x)\n"
             "    render(y)\n"
@@ -374,6 +382,7 @@ class TestGatePreconditions:
         2 fails because input_symbols ∩ ∅ = ∅. With control-flow cut
         holding → candidate_only."""
         src = (
+            "import html\n"
             "def handle(x):\n"
             "    y = html.escape(x)\n"
             "    render(y)\n"
@@ -467,6 +476,7 @@ class TestNonEntrySource:
 
     def test_body_source_propagates_taint_to_sink(self):
         src = (
+            "import html\n"
             "def handle(request):\n"
             "    user_input = request.body\n"
             "    y = html.escape(user_input)\n"
@@ -485,3 +495,456 @@ class TestNonEntrySource:
             sink_arg="y",
         )
         assert result.verdict == VERDICT_SUPPRESS
+
+
+# ---------------------------------------------------------------------------
+# _rhs_is_catalog_call — sibling-guard catalog matching
+# ---------------------------------------------------------------------------
+
+
+def _java_rhs_node(expr: str):
+    """The declarator value node of ``String s = <expr>;`` — the exact
+    shape _siblings_fold_or_refuse hands to _rhs_is_catalog_call."""
+    import pytest
+
+    pytest.importorskip("tree_sitter_java")
+    from core.analysis.java_collection_index import _parser
+
+    parser = _parser()
+    assert parser is not None
+    src = "class T { void m() { String s = " + expr + "; } }"
+    tree = parser.parse(src.encode("utf-8"))
+    stack = [tree.root_node]
+    while stack:
+        n = stack.pop()
+        if n.type == "variable_declarator":
+            return n.child_by_field_name("value")
+        stack.extend(n.children)
+    raise AssertionError("no declarator in fixture")
+
+
+class TestRhsCatalogCall:
+    """The catalog match guards the value-bound SUPPRESS path — a
+    lookalike helper accepted as a catalog sanitizer lets taint ride a
+    sibling argument past an enforced suppression."""
+
+    _CATALOG = frozenset({"encodeForHTML", "escape"})
+
+    def _check(self, expr: str) -> bool:
+        from core.analysis.sanitizer_cut import _rhs_is_catalog_call
+
+        return _rhs_is_catalog_call(_java_rhs_node(expr), self._CATALOG)
+
+    def test_lookalike_suffix_rejected(self):
+        # "myencodeForHTML" ends with the catalog name but is not it.
+        assert not self._check("myencodeForHTML(x)")
+
+    def test_lookalike_suffix_rejected_short_name(self):
+        # "unescape" ends with "escape" — the measured refuse-averse
+        # shape of the bare-suffix alternative.
+        assert not self._check("unescape(x)")
+
+    def test_exact_name_accepted(self):
+        assert self._check("encodeForHTML(x)")
+
+    def test_method_qualified_call_accepted(self):
+        assert self._check("Encoder.encodeForHTML(x)")
+
+    def test_chained_call_receiver_refuses(self):
+        # The callee text is truncated at the FIRST paren, so a
+        # call-chained receiver never matches — pre-existing refusal,
+        # kept: refusing a real sanitizer only loses a suppression.
+        assert not self._check("ESAPI.encoder().encodeForHTML(x)")
+
+    def test_cast_wrapped_call_accepted(self):
+        assert self._check("(String) Encoder.encodeForHTML(x)")
+
+    def test_non_invocation_rejected(self):
+        assert not self._check("x + Encoder.encodeForHTML(y)")
+
+
+class TestMatchCaptureRebindNotSuppressed:
+    """A match-case capture pattern rebinds the sanitized name with
+    raw subject content (``case [*y]:``); the value-bound gate must
+    not suppress — the capture def breaks condition-3 exclusivity."""
+
+    def test_capture_rebind_of_sanitized_name_downgrades(self):
+        src = (
+            "import html\n"
+            "def handle(x, render):\n"
+            "    s = str(x)\n"
+            "    y = html.escape(s)\n"
+            "    match x:\n"
+            "        case [*y]:\n"
+            "            pass\n"
+            "    render(y)\n"
+        )
+        cfg = _cfg(src)
+        sink = next(n for n in cfg.nodes() if "render" in n.calls)
+        r = evaluate_finding(
+            cfg, [cfg.entry_node], sink, cwe="CWE-79",
+            language="python", source_symbols={"x"}, sink_arg="y",
+        )
+        assert r.verdict != VERDICT_SUPPRESS
+
+    def test_unrelated_capture_still_suppresses(self):
+        # Direction check: a capture of a DIFFERENT name must not cost
+        # the legitimate suppression.
+        src = (
+            "import html\n"
+            "def handle(x, render):\n"
+            "    s = str(x)\n"
+            "    y = html.escape(s)\n"
+            "    match x:\n"
+            "        case [*other]:\n"
+            "            pass\n"
+            "    render(y)\n"
+        )
+        cfg = _cfg(src)
+        sink = next(n for n in cfg.nodes() if "render" in n.calls)
+        r = evaluate_finding(
+            cfg, [cfg.entry_node], sink, cwe="CWE-79",
+            language="python", source_symbols={"x"}, sink_arg="y",
+        )
+        assert r.verdict == VERDICT_SUPPRESS
+
+
+class TestCatalogModuleShadowDegraded:
+    """The catalog join matches the WRITTEN dotted name; a local
+    binding of the chain's root swaps the runtime callee for an
+    attacker-chosen object (``html = FakeNs; html.escape(x)``). The
+    binding must degrade — a forged catalog identity drove an
+    enforced suppression."""
+
+    def test_local_root_rebind_degrades_binding(self):
+        src = (
+            "import html\n"
+            "def handle(x):\n"
+            "    html = fake_ns()\n"
+            "    y = html.escape(x)\n"
+            "    render(y)\n"
+        )
+        cfg = _cfg(src)
+        sink = _node_with_call(cfg, "render")
+        result = evaluate_finding(
+            cfg, [cfg.entry_node], sink,
+            cwe="CWE-79", language="python",
+            source_symbols={"x"},
+            sink_arg="y",
+        )
+        assert result.verdict == VERDICT_NO_SUPPRESS
+
+    def test_param_named_like_catalog_root_degrades(self):
+        src = (
+            "import html\n"
+            "def handle(x, html):\n"
+            "    y = html.escape(x)\n"
+            "    render(y)\n"
+        )
+        cfg = _cfg(src)
+        sink = _node_with_call(cfg, "render")
+        result = evaluate_finding(
+            cfg, [cfg.entry_node], sink,
+            cwe="CWE-79", language="python",
+            source_symbols={"x"},
+            sink_arg="y",
+        )
+        assert result.verdict == VERDICT_NO_SUPPRESS
+
+    def test_unshadowed_catalog_call_still_suppresses(self):
+        # Direction pin: the ordinary module-level-import shape keeps
+        # its suppression — the guard keys on the FUNCTION's own
+        # bindings only.
+        src = (
+            "import html\n"
+            "def handle(x):\n"
+            "    y = html.escape(x)\n"
+            "    render(y)\n"
+        )
+        cfg = _cfg(src)
+        sink = _node_with_call(cfg, "render")
+        result = evaluate_finding(
+            cfg, [cfg.entry_node], sink,
+            cwe="CWE-79", language="python",
+            source_symbols={"x"},
+            sink_arg="y",
+        )
+        assert result.verdict == VERDICT_SUPPRESS
+
+
+class TestModuleLevelCatalogRootDistrust:
+    """The catalog guard must also see MODULE-level identity rebinds
+    — a local-defs-only derivation missed ``import fakelib as html``
+    in both local and module positions."""
+
+    def _evaluate(self, src):
+        cfg = build_python_cfg(src, "handle")
+        assert cfg is not None
+        sink = _node_with_call(cfg, "render")
+        return evaluate_finding(
+            cfg, [cfg.entry_node], sink,
+            cwe="CWE-79", language="python",
+            source_symbols={"x"}, sink_arg="y",
+        )
+
+    def test_module_import_alias_degrades(self):
+        src = (
+            "import html\n"
+            "import fakelib as html\n"
+            "def handle(x):\n"
+            "    y = html.escape(x)\n"
+            "    render(y)\n"
+        )
+        assert self._evaluate(src).verdict == VERDICT_NO_SUPPRESS
+
+    def test_local_import_alias_degrades(self):
+        src = (
+            "import html\n"
+            "def handle(x):\n"
+            "    import fakelib as html\n"
+            "    y = html.escape(x)\n"
+            "    render(y)\n"
+        )
+        assert self._evaluate(src).verdict == VERDICT_NO_SUPPRESS
+
+    def test_module_assign_root_degrades(self):
+        src = (
+            "import html\n"
+            "html = object()\n"
+            "def handle(x):\n"
+            "    y = html.escape(x)\n"
+            "    render(y)\n"
+        )
+        assert self._evaluate(src).verdict == VERDICT_NO_SUPPRESS
+
+    def test_global_sibling_root_degrades(self):
+        src = (
+            "import html\n"
+            "def evil():\n"
+            "    global html\n"
+            "    html = object()\n"
+            "def handle(x):\n"
+            "    y = html.escape(x)\n"
+            "    render(y)\n"
+        )
+        assert self._evaluate(src).verdict == VERDICT_NO_SUPPRESS
+
+    def test_self_import_stays_trusted(self):
+        src = (
+            "import html\n"
+            "def handle(x):\n"
+            "    y = html.escape(x)\n"
+            "    render(y)\n"
+        )
+        assert self._evaluate(src).verdict == VERDICT_SUPPRESS
+
+
+class TestNestedNonlocalWriteBackGate:
+    def test_nonlocal_writeback_never_suppresses(self):
+        src = (
+            "import html\n"
+            "def handle(x):\n"
+            "    y = html.escape(x)\n"
+            "    def fixup():\n"
+            "        nonlocal y\n"
+            "        y = x\n"
+            "    fixup()\n"
+            "    render(y)\n"
+        )
+        cfg = build_python_cfg(src, "handle")
+        assert cfg is not None
+        sink = _node_with_call(cfg, "render")
+        result = evaluate_finding(
+            cfg, [cfg.entry_node], sink,
+            cwe="CWE-79", language="python",
+            source_symbols={"x"}, sink_arg="y",
+        )
+        assert result.verdict != VERDICT_SUPPRESS
+
+    def test_nested_def_without_nonlocal_unaffected(self):
+        src = (
+            "import html\n"
+            "def handle(x):\n"
+            "    y = html.escape(x)\n"
+            "    def helper():\n"
+            "        return 1\n"
+            "    helper()\n"
+            "    render(y)\n"
+        )
+        cfg = build_python_cfg(src, "handle")
+        assert cfg is not None
+        sink = _node_with_call(cfg, "render")
+        result = evaluate_finding(
+            cfg, [cfg.entry_node], sink,
+            cwe="CWE-79", language="python",
+            source_symbols={"x"}, sink_arg="y",
+        )
+        assert result.verdict == VERDICT_SUPPRESS
+
+
+class TestDynamicNamespaceCatalogRefusal:
+    def _evaluate2(self, src):
+        cfg = build_python_cfg(src, "handle")
+        assert cfg is not None
+        sink = _node_with_call(cfg, "render")
+        return evaluate_finding(
+            cfg, [cfg.entry_node], sink,
+            cwe="CWE-79", language="python",
+            source_symbols={"x"}, sink_arg="y",
+        )
+
+    def test_star_import_refuses_catalog_identity(self):
+        src = (
+            "import html\n"
+            "from evilmod import *\n"
+            "def handle(x):\n"
+            "    y = html.escape(x)\n"
+            "    render(y)\n"
+        )
+        assert self._evaluate2(src).verdict == VERDICT_NO_SUPPRESS
+
+    def test_constant_globals_write_on_catalog_root_refuses(self):
+        src = (
+            "import html\n"
+            "globals()['html'] = object()\n"
+            "def handle(x):\n"
+            "    y = html.escape(x)\n"
+            "    render(y)\n"
+        )
+        assert self._evaluate2(src).verdict == VERDICT_NO_SUPPRESS
+
+    def test_sys_modules_setattr_refuses(self):
+        src = (
+            "import html\n"
+            "import sys\n"
+            "setattr(sys.modules[__name__], 'html', object())\n"
+            "def handle(x):\n"
+            "    y = html.escape(x)\n"
+            "    render(y)\n"
+        )
+        assert self._evaluate2(src).verdict == VERDICT_NO_SUPPRESS
+
+    def test_globals_read_keeps_suppression(self):
+        src = (
+            "import html\n"
+            "v = globals()['__name__']\n"
+            "def handle(x):\n"
+            "    y = html.escape(x)\n"
+            "    render(y)\n"
+        )
+        assert self._evaluate2(src).verdict == VERDICT_SUPPRESS
+
+
+class TestUnboundCatalogRootRefused:
+    """The final name-binding route: NO binding at all. An unbound
+    root resolves through builtins, and builtins are writable by any
+    module in the repo — the identity is only trusted through a
+    module-scope self-import."""
+
+    def test_unbound_root_refuses(self):
+        src = (
+            "def handle(x):\n"
+            "    y = html.escape(x)\n"
+            "    render(y)\n"
+        )
+        cfg = build_python_cfg(src, "handle")
+        sink = _node_with_call(cfg, "render")
+        result = evaluate_finding(
+            cfg, [cfg.entry_node], sink,
+            cwe="CWE-79", language="python",
+            source_symbols={"x"}, sink_arg="y",
+        )
+        assert result.verdict == VERDICT_NO_SUPPRESS
+
+    def test_hand_built_cfg_skips_the_check(self):
+        # ``trusted_import_roots is None`` (hand-built CFGs, other
+        # languages) keeps the historical behaviour — the refusal is
+        # python-resolver-scoped.
+        import dataclasses
+
+        src = (
+            "import html\n"
+            "def handle(x):\n"
+            "    y = html.escape(x)\n"
+            "    render(y)\n"
+        )
+        cfg = build_python_cfg(src, "handle")
+        cfg = dataclasses.replace(cfg, trusted_import_roots=None)
+        sink = _node_with_call(cfg, "render")
+        result = evaluate_finding(
+            cfg, [cfg.entry_node], sink,
+            cwe="CWE-79", language="python",
+            source_symbols={"x"}, sink_arg="y",
+        )
+        assert result.verdict == VERDICT_SUPPRESS
+
+
+class TestRepoShadowedModuleOrigin:
+    """Origin resolution: a repo shipping its own html.py (or
+    html/__init__.py) makes `import html` resolve to the REPO's file
+    at runtime — the self-import alone no longer proves the catalog
+    identity. The trust route is self-import AND no repo-resolvable
+    shadow."""
+
+    _SRC = (
+        "import html\n"
+        "def handle(x):\n"
+        "    y = html.escape(x)\n"
+        "    render(y)\n"
+    )
+
+    def _evaluate3(self, repo_root):
+        cfg = build_python_cfg(self._SRC, "handle")
+        assert cfg is not None
+        sink = _node_with_call(cfg, "render")
+        return evaluate_finding(
+            cfg, [cfg.entry_node], sink,
+            cwe="CWE-79", language="python",
+            source_symbols={"x"}, sink_arg="y",
+            repo_root=str(repo_root) if repo_root else None,
+        )
+
+    def test_flat_shadow_refuses(self, tmp_path):
+        (tmp_path / "html.py").write_text("def escape(s):\n    return s\n")
+        assert self._evaluate3(tmp_path).verdict == VERDICT_NO_SUPPRESS
+
+    def test_package_shadow_refuses(self, tmp_path):
+        (tmp_path / "html").mkdir()
+        (tmp_path / "html" / "__init__.py").write_text(
+            "def escape(s):\n    return s\n")
+        assert self._evaluate3(tmp_path).verdict == VERDICT_NO_SUPPRESS
+
+    def test_clean_repo_root_keeps_suppression(self, tmp_path):
+        # Recall pin: repo_root given, no shadow shipped.
+        assert self._evaluate3(tmp_path).verdict == VERDICT_SUPPRESS
+
+    def test_no_repo_root_keeps_legacy(self):
+        assert self._evaluate3(None).verdict == VERDICT_SUPPRESS
+
+    def test_helper_chain_shadow_no_binding(self, tmp_path):
+        from core.analysis.finding_resolver import (
+            ResolvedFinding,
+            resolve_finding,
+        )
+        src = (
+            "import html\n"
+            "def _clean(s):\n"
+            "    return html.escape(s)\n"
+            "def handle(x):\n"
+            "    y = _clean(x)\n"
+            "    render(y)\n"
+        )
+        (tmp_path / "app.py").write_text(src)
+        (tmp_path / "html.py").write_text("def escape(s):\n    return s\n")
+        finding = {
+            "cwe": "CWE-79", "file_path": str(tmp_path / "app.py"),
+            "source_line": 4, "sink_line": 6, "language": "python",
+        }
+        shadowed = resolve_finding(finding, target_root=tmp_path)
+        assert isinstance(shadowed, ResolvedFinding)
+        assert shadowed.inter_proc_bindings == frozenset()
+        # Recall pin: without the shadow file the binding returns.
+        (tmp_path / "html.py").unlink()
+        clean = resolve_finding(finding, target_root=tmp_path)
+        assert isinstance(clean, ResolvedFinding)
+        assert len(clean.inter_proc_bindings) == 1

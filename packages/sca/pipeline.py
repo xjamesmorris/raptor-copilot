@@ -27,11 +27,12 @@ from typing import Any, TYPE_CHECKING
 
 from core.cve import EpssClient, KevClient
 from core.json import JsonCache
-from core.progress import HackerProgressBar
 
-from . import SCA_CACHE_ROOT, default_client
+from . import sca_cache_root, default_client
 from . import suppressions as _suppressions
+from .diagnostics import DeadlineHttpClient, ScaDeadline, ScaProgress
 from .discovery import find_manifests
+from .rows import FindingRow
 from .findings import build_vuln_findings, write_findings_json
 from .hygiene import evaluate as evaluate_hygiene
 from .join import join as join_deps
@@ -42,6 +43,7 @@ from .models import (
 )
 from .osv import OsvClient
 from .parsers import capture_parse_failures, parse_manifest
+from .parsers._safe_read import scan_root_context
 from .reachability import scan as scan_reachability
 from .report import render_markdown_report, write_markdown_report
 from .sarif import write_sarif
@@ -65,6 +67,26 @@ logger = logging.getLogger(__name__)
 # load_policy``). Named here so the trust gate can detect its
 # presence without loading it.
 _LICENSE_POLICY_FILENAME = ".raptor-sca-license-policy.yml"
+
+
+def _registry_metadata_client(
+    cls: type, *, http: Any, cache: JsonCache | None, options: RunOptions,
+) -> Any:
+    """Single owner of registry-METADATA client construction.
+
+    ``--no-cache`` zeroes the TTL here: freshness is these clients'
+    whole reason to exist (recent_publish / maintainer_change /
+    yanked_version / transitive-drop / LLM registry views / parent-POM
+    fetch), and hand-constructed clients silently served day-old
+    registry metadata to the one flag whose documented purpose is
+    bypassing the cache. Without ``--no-cache`` each client keeps its
+    own default TTL. The closure test over this module pins that no
+    registry client is constructed outside this helper.
+    """
+    kwargs: dict[str, Any] = {"offline": options.offline}
+    if options.no_cache:
+        kwargs["ttl_seconds"] = 0
+    return cls(http, cache, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -204,17 +226,62 @@ class RunOptions:
                                                 # ``--impact-analysis``.
     enable_progress: bool = True                 # multi-stage TTY
                                                 # progress display via
-                                                # ``HackerProgressBar``.
+                                                # ``ScaProgress``.
                                                 # Auto-disables on non-
                                                 # TTY stderr (pipes / CI
                                                 # logs / file redirect).
                                                 # ``--no-progress``
                                                 # forces off explicitly.
+    deadline_seconds: float | None = None       # propagated child budget;
+                                                # bounds each HTTP request
+                                                # and is checked at every
+                                                # phase boundary.
+    diagnostics_path: Path | None = None        # private phase receipt.
+                                                # Defaults to
+                                                # <output>/diagnostics.json.
+    analysis_mode: str = "deep"                 # receipt label only:
+                                                # mechanical or deep.
+    request_timeout_seconds: float = 30.0       # one network call may not
+                                                # consume the whole run
+                                                # deadline.
     sbom_input: Path | None = None            # CycloneDX SBOM to
                                                 # import as the dep list
                                                 # in place of discovery
                                                 # + parser dispatch.
                                                 # ``--sbom <path>``.
+
+    def __post_init__(self) -> None:
+        if self.analysis_mode not in {"mechanical", "deep"}:
+            raise ValueError(
+                "analysis_mode must be 'mechanical' or 'deep'")
+        if self.analysis_mode == "mechanical":
+            enabled_deep_gates = [
+                name
+                for name, enabled in (
+                    ("enable_llm_review", self.enable_llm_review),
+                    ("enable_triage", self.enable_triage),
+                    ("review_maintainers", self.review_maintainers),
+                    ("review_slopsquats", self.review_slopsquats),
+                    ("enable_llm_inline_installs",
+                     self.enable_llm_inline_installs),
+                    ("enable_impact_analysis",
+                     self.enable_impact_analysis),
+                )
+                if enabled
+            ]
+            if enabled_deep_gates:
+                raise ValueError(
+                    "mechanical SCA forbids deep/LLM gates: "
+                    + ", ".join(enabled_deep_gates)
+                    + "; use analysis_mode='deep' or disable every "
+                      "listed gate"
+                )
+        if (self.deadline_seconds is not None
+                and self.deadline_seconds <= 0):
+            raise ValueError("deadline_seconds must be greater than zero")
+        if self.request_timeout_seconds <= 0:
+            raise ValueError(
+                "request_timeout_seconds must be greater than zero")
 
 
 @dataclass
@@ -296,17 +363,26 @@ def run_sca(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if cache is None:
-        cache = JsonCache(root=options.cache_root or SCA_CACHE_ROOT)
+        cache = JsonCache(root=options.cache_root or sca_cache_root())
+    deadline = ScaDeadline.from_seconds(options.deadline_seconds)
     if http is None:
         # Pass the target so default_client can augment the
         # allowlist with Dockerfile-derived container-registry
         # hosts (B9 base-image scanning needs e.g. docker.io,
         # ghcr.io which aren't in the static SCA_ALLOWED_HOSTS).
         http = default_client(target=target, offline=options.offline)
+    if deadline is not None:
+        http = DeadlineHttpClient(
+            http,
+            deadline,
+            per_request_total_timeout=options.request_timeout_seconds,
+        )
 
     # Apply --no-cache by zeroing TTLs at every client level. This
     # avoids special-casing every caller; a TTL of 0 forces a refetch
-    # while still letting fresh in-process state be reused.
+    # while still letting fresh in-process state be reused. The
+    # registry-METADATA clients get the same treatment through
+    # ``_registry_metadata_client`` (the single construction owner).
     osv_query_ttl = 0 if options.no_cache else 24 * 3600
     osv_vuln_ttl = 0 if options.no_cache else 24 * 3600
     kev_ttl = 0 if options.no_cache else 24 * 3600
@@ -315,9 +391,13 @@ def run_sca(
     # Multi-stage TTY progress display. Auto-disables on non-TTY
     # stderr (pipes / CI logs / file redirect); ``--no-progress``
     # forces off explicitly.
-    progress = HackerProgressBar(
+    progress = ScaProgress(
         target=str(target),
+        output_dir=output_dir,
+        diagnostics_path=options.diagnostics_path,
         disabled=(None if options.enable_progress else True),
+        mode=options.analysis_mode,
+        deadline=deadline,
     )
 
     # 1. Discover + parse + join. Per-parser opts are toggled via
@@ -341,7 +421,8 @@ def run_sca(
     # 2 (network parent) and 3 (BOM imports) need the Maven client.
     from .parsers import pom_inheritance as _pom_inh
     from .registries.maven import MavenClient as _MvnC
-    _maven_for_pom = _MvnC(http, cache, offline=options.offline)
+    _maven_for_pom = _registry_metadata_client(
+        _MvnC, http=http, cache=cache, options=options)
     _pom_inh.set_inheritance_resolver(
         _pom_inh.PomInheritanceResolver(
             _maven_for_pom, offline=options.offline,
@@ -377,16 +458,29 @@ def run_sca(
                 manifests = [
                     m for m in manifests if m.ecosystem != "Inline"
                 ]
-            raw_deps: list[Dependency] = []
+            raw_deps = []
             # scan_root_context: lets bounded parser reads accept
             # symlinked manifests whose resolved target stays inside
             # the target tree (monorepo shared-manifest layouts)
             # while still refusing links that escape it.
-            from .parsers._safe_read import scan_root_context
             with capture_parse_failures() as parse_failures, \
                     scan_root_context(target):
                 for m in manifests:
                     raw_deps.extend(parse_manifest(m))
+            # Durable analysis-gap trail: every parse failure is a
+            # file whose dependency set dropped out of SCA. The
+            # report section shows them for this run; the JSONL
+            # record makes the gap visible to run summaries and
+            # cross-run tooling.
+            from core.run.gaps import record_analysis_gap
+            for failure in parse_failures:
+                record_analysis_gap(
+                    output_dir,
+                    file_path=str(failure.path),
+                    reason="parse_error",
+                    tool="sca",
+                    detail=failure.reason,
+                )
     finally:
         # Clear the resolver so test runs of subsequent scans (or
         # libraries that import pom.parse directly after pipeline)
@@ -480,7 +574,7 @@ def run_sca(
             dockerfile_cache = None
         else:
             dockerfile_cache = JsonCache(
-                root=(options.cache_root or SCA_CACHE_ROOT) / "dockerfile_from",
+                root=(options.cache_root or sca_cache_root()) / "dockerfile_from",
             )
         try:
             base_image_deps = scan_image_sources(
@@ -512,7 +606,7 @@ def run_sca(
             try:
                 from .image_drift import detect_image_drift
                 fingerprint_store = (
-                    options.cache_root or SCA_CACHE_ROOT
+                    options.cache_root or sca_cache_root()
                 ) / "fingerprints"
                 image_drift_findings = detect_image_drift(
                     target,
@@ -541,7 +635,7 @@ def run_sca(
 
     # 2. Hygiene (mechanical, no network).
     progress.stage("hygiene")
-    hygiene_findings = evaluate_hygiene(manifests, joined)
+    hygiene_findings = evaluate_hygiene(manifests, joined, root=target)
     progress.done(f"{len(hygiene_findings)} findings")
 
     # 2a. Supply-chain mechanical heuristics (install hooks, typosquat,
@@ -555,9 +649,12 @@ def run_sca(
         from .registries.github_actions import GitHubActionsClient
         from .registries.npm import NpmClient
         from .registries.pypi import PyPIClient
-        sc_pypi = PyPIClient(http, cache, offline=options.offline)
-        sc_npm = NpmClient(http, cache, offline=options.offline)
-        sc_gha = GitHubActionsClient(http, cache, offline=options.offline)
+        sc_pypi = _registry_metadata_client(
+            PyPIClient, http=http, cache=cache, options=options)
+        sc_npm = _registry_metadata_client(
+            NpmClient, http=http, cache=cache, options=options)
+        sc_gha = _registry_metadata_client(
+            GitHubActionsClient, http=http, cache=cache, options=options)
         supply_chain_findings = evaluate_supply_chain(
             target, manifests, joined,
             pypi_client=sc_pypi,
@@ -587,10 +684,14 @@ def run_sca(
         from .registries.rubygems import RubyGemsClient as _GemYC
         yanked_findings = scan_pinned_versions(
             joined,
-            pypi_client=_PypiYC(http, cache, offline=options.offline),
-            npm_client=_NpmYC(http, cache, offline=options.offline),
-            cargo_client=_CratesYC(http, cache, offline=options.offline),
-            rubygems_client=_GemYC(http, cache, offline=options.offline),
+            pypi_client=_registry_metadata_client(
+                _PypiYC, http=http, cache=cache, options=options),
+            npm_client=_registry_metadata_client(
+                _NpmYC, http=http, cache=cache, options=options),
+            cargo_client=_registry_metadata_client(
+                _CratesYC, http=http, cache=cache, options=options),
+            rubygems_client=_registry_metadata_client(
+                _GemYC, http=http, cache=cache, options=options),
         )
         hygiene_findings.extend(yanked_findings)
         progress.done(f"{len(yanked_findings)} yanked-version finding(s)")
@@ -656,10 +757,15 @@ def run_sca(
                 policy = DEFAULT_POLICY
         # Enrichment fetches from PyPI / npm registries. Skipped
         # offline (cache may still populate via prior runs).
+        # ``--no-cache`` passes cache=None (the harden shape): the
+        # license fetchers hardcode their read TTLs internally, so a
+        # zeroed-TTL cache can't be threaded through them — a cache-
+        # less run forces the refetch the flag documents.
         if not options.offline:
             try:
                 enriched = enrich_licenses(
-                    joined, http=http, cache=cache,
+                    joined, http=http,
+                    cache=None if options.no_cache else cache,
                     offline=options.offline,
                 )
                 if enriched:
@@ -688,11 +794,23 @@ def run_sca(
         elif options.cache_root is not None:
             db_path = options.cache_root / "osv.sqlite"
         else:
-            db_path = SCA_CACHE_ROOT / "osv.sqlite"
+            db_path = sca_cache_root() / "osv.sqlite"
         offline_db = OsvOfflineDB(db_path, http=http)
         # Refresh per-ecosystem zips for the ecosystems we discovered.
+        # Warn-and-degrade on refresh failure: the DB is shared across
+        # processes, and an unguarded crash here (e.g. a concurrent
+        # refresh still holding the write lock past the busy timeout)
+        # aborted the WHOLE scan. Degrading to the possibly-stale DB /
+        # per-query cache loses freshness, not the run.
         ecosystems_in_use = {d.ecosystem for d in canonical}
-        offline_db.ensure_fresh(ecosystems_in_use)
+        try:
+            offline_db.ensure_fresh(ecosystems_in_use)
+        except Exception:                       # noqa: BLE001
+            logger.warning(
+                "sca.pipeline: offline-DB refresh failed — continuing "
+                "with existing cached advisories (possibly stale)",
+                exc_info=True,
+            )
 
     progress.stage("osv", total=len(canonical))
     osv_client = OsvClient(
@@ -763,9 +881,11 @@ def run_sca(
         vulnrichment = VulnrichmentClient(
             http, cache, offline=options.offline,
             # Vulnrichment is shipped via raw.githubusercontent.com
-            # one-CVE-at-a-time; a 7-day TTL matches the SSVC update
-            # cadence (CISA refreshes daily, but per-CVE drift within
-            # a week is rare).
+            # one-CVE-at-a-time; the client's default 7-day TTL
+            # matches the SSVC update cadence (CISA refreshes daily,
+            # but per-CVE drift within a week is rare). --no-cache
+            # still forces a refetch like every other feed client.
+            **({"ttl_seconds": 0} if options.no_cache else {}),
         )
 
     # 6. Reachability — skip if disabled or when no advisories were
@@ -887,13 +1007,20 @@ def run_sca(
             vuln_findings=vuln_findings,
             supply_chain_findings=supply_chain_findings,
             hygiene_findings=hygiene_findings,
-            pypi_client=_PypiC(http, cache, offline=options.offline),
-            npm_client=_NpmC(http, cache, offline=options.offline),
-            cargo_client=_CratesC(http, cache, offline=options.offline),
-            composer_client=_PackC(http, cache, offline=options.offline),
-            rubygems_client=_GemC(http, cache, offline=options.offline),
-            maven_client=_MvnC(http, cache, offline=options.offline),
-            nuget_client=_NgC(http, cache, offline=options.offline),
+            pypi_client=_registry_metadata_client(
+                _PypiC, http=http, cache=cache, options=options),
+            npm_client=_registry_metadata_client(
+                _NpmC, http=http, cache=cache, options=options),
+            cargo_client=_registry_metadata_client(
+                _CratesC, http=http, cache=cache, options=options),
+            composer_client=_registry_metadata_client(
+                _PackC, http=http, cache=cache, options=options),
+            rubygems_client=_registry_metadata_client(
+                _GemC, http=http, cache=cache, options=options),
+            maven_client=_registry_metadata_client(
+                _MvnC, http=http, cache=cache, options=options),
+            nuget_client=_registry_metadata_client(
+                _NgC, http=http, cache=cache, options=options),
         )
         from .transitive_drop.adapter import to_supply_chain_findings
         td_sc = to_supply_chain_findings(drop_findings)
@@ -908,18 +1035,33 @@ def run_sca(
     #     an overlay that suppresses its own findings.
     suppressed_total = 0
     if options.enable_suppressions:
-        entries = _suppressions.load(target / _suppressions.SUPPRESS_FILENAME)
-        if entries and not options.trust_repo:
+        overlay_path = target / _suppressions.SUPPRESS_FILENAME
+        # Trust gate BEFORE the read — "ignored when untrusted" must
+        # mean "never read": loading first handed a hostile repo the
+        # full read+parse of an arbitrary committed file with zero
+        # trust granted (mirror of the license-policy lane above).
+        # ``is_symlink() or exists()`` so a dangling-symlink overlay
+        # still triggers the notice instead of silently vanishing.
+        entries: list[_suppressions.SuppressionEntry] = []
+        if ((overlay_path.is_symlink() or overlay_path.exists())
+                and not options.trust_repo):
             logger.warning(
                 "sca.pipeline: suppression overlay present but not "
-                "trusted — %d entries ignored; set the project `config` "
-                "trust marker or pass --trust-repo", len(entries),
+                "trusted — %s ignored (not read); set the project "
+                "`config` trust marker or pass --trust-repo",
+                _suppressions.SUPPRESS_FILENAME,
             )
             progress.flash(
-                "SUPPRESS",
-                f"{len(entries)} untrusted overlay entries ignored",
+                "SUPPRESS", "untrusted overlay ignored (not read)",
             )
-            entries = []
+        else:
+            # Scan-root context: a TRUSTED run honours an overlay
+            # symlink whose resolved target stays inside the tree
+            # (monorepo shared-config layouts) — same containment
+            # discipline the manifest readers use; out-of-tree
+            # targets stay refused by the no-follow reader.
+            with scan_root_context(target):
+                entries = _suppressions.load(overlay_path)
         if entries:
             finding_sets = (vuln_findings, hygiene_findings,
                              supply_chain_findings, license_findings)
@@ -1067,8 +1209,21 @@ def run_sca(
 
     # Re-read the rows we just wrote — SARIF emission consumes the
     # canonical row shape, including the suppression overlay.
-    import json as _json_mod
-    rows = _json_mod.loads(findings_path.read_text(encoding="utf-8"))
+    from core.json import load_json as _load_json
+
+    # Self-produced budget, NOT the steered-path one: this re-reads
+    # the findings.json THIS call wrote a few lines up, so its size
+    # is the pipeline's own legitimate output — the 64 MiB steered
+    # budget refused real 75-202 MB big-target output here, failing
+    # the whole completed scan at its final step.
+    from .kinds import MAX_SELF_FINDINGS_BYTES as _MAX_SELF_FINDINGS
+    rows = _load_json(
+        findings_path, strict=True, max_bytes=_MAX_SELF_FINDINGS,
+    )
+    if rows is None:
+        # Strict load_json soft-returns None only for a MISSING file —
+        # our own just-written findings vanishing is a hard error.
+        raise FileNotFoundError(findings_path)
     sarif_path = output_dir / "findings.sarif"
     write_sarif(sarif_path, target=target, rows=rows)
 
@@ -1297,7 +1452,7 @@ def _run_maintainer_review(client, supply_chain_findings, canonical, http, optio
     # Build metadata from registry clients.
     from core.json import JsonCache
 
-    from . import SCA_CACHE_ROOT
+    from . import sca_cache_root
     from .registries.npm import NpmClient
     from .registries.pypi import PyPIClient
 
@@ -1307,20 +1462,32 @@ def _run_maintainer_review(client, supply_chain_findings, canonical, http, optio
     # the largest --offline leak surfaced by Tier-6 E2E.
     # ``cache_root`` also honoured so the operator's ``--cache-root``
     # override reaches this path (was previously hardcoded to
-    # ``SCA_CACHE_ROOT``).
+    # the default cache root).
     cache = JsonCache(
-        root=options.cache_root or SCA_CACHE_ROOT,
+        root=options.cache_root or sca_cache_root(),
     )
-    pypi = PyPIClient(http, cache, offline=options.offline)
-    npm = NpmClient(http, cache, offline=options.offline)
+    pypi = _registry_metadata_client(
+        PyPIClient, http=http, cache=cache, options=options)
+    npm = _registry_metadata_client(
+        NpmClient, http=http, cache=cache, options=options)
+
+    from .llm.registry_view import build_registry_view
 
     for dep in deps_to_review[:20]:
         meta = {}
         try:
+            # Raw registry documents (PyPI JSON / npm packument) carry
+            # none of the keys the renderer contract reads — project
+            # them through the seam constructor so the trust prompt
+            # actually sees maintainers / publish history / repo.
             if dep.ecosystem == "PyPI":
-                meta = pypi.get_metadata(dep.name) or {}
+                meta = build_registry_view(
+                    dep.ecosystem, pypi.get_metadata(dep.name),
+                )
             elif dep.ecosystem == "npm":
-                meta = npm.get_metadata(dep.name) or {}
+                meta = build_registry_view(
+                    dep.ecosystem, npm.get_metadata(dep.name),
+                )
             else:
                 continue
         except Exception as e:  # noqa: BLE001
@@ -1412,15 +1579,17 @@ def _run_slopsquat_review(
     # ``_run_maintainer_review``.
     from core.json import JsonCache
 
-    from . import SCA_CACHE_ROOT
+    from . import sca_cache_root
     from .registries.npm import NpmClient
     from .registries.pypi import PyPIClient
 
     cache = JsonCache(
-        root=options.cache_root or SCA_CACHE_ROOT,
+        root=options.cache_root or sca_cache_root(),
     )
-    pypi = PyPIClient(http, cache, offline=options.offline)
-    npm = NpmClient(http, cache, offline=options.offline)
+    pypi = _registry_metadata_client(
+        PyPIClient, http=http, cache=cache, options=options)
+    npm = _registry_metadata_client(
+        NpmClient, http=http, cache=cache, options=options)
 
     # Cap at 20 to bound LLM cost — the same cap
     # ``_run_maintainer_review`` uses. An operator seeing >20
@@ -1453,10 +1622,18 @@ def _run_slopsquat_review(
 
         meta: dict[str, Any] = {}
         try:
+            # Project the raw registry document through the renderer-
+            # contract constructor (see the maintainer-trust stage).
+            from .llm.registry_view import build_registry_view
+
             if dep.ecosystem == "PyPI":
-                meta = pypi.get_metadata(dep.name) or {}
+                meta = build_registry_view(
+                    dep.ecosystem, pypi.get_metadata(dep.name),
+                )
             elif dep.ecosystem == "npm":
-                meta = npm.get_metadata(dep.name) or {}
+                meta = build_registry_view(
+                    dep.ecosystem, npm.get_metadata(dep.name),
+                )
             else:
                 # Other ecosystems don't have client metadata
                 # wired today — skip the LLM call rather than
@@ -1505,7 +1682,6 @@ def _run_version_diff_review(client, canonical, supply_chain_findings, http, out
     Looks for a ``previous-deps.json`` in the output directory's sibling
     (project-aware) or skips gracefully.  Returns count of enriched findings.
     """
-    import json as _json_mod
 
     from .llm.version_diff_review import review_version_diff
 
@@ -1516,8 +1692,14 @@ def _run_version_diff_review(client, canonical, supply_chain_findings, http, out
 
     prev_deps: dict[tuple[str, str], str] = {}
     try:
-        rows = _json_mod.loads(prev_path.read_text(encoding="utf-8"))
-        for row in rows:
+        from core.json import load_json as _load_json
+
+        from .kinds import MAX_FINDINGS_BYTES as _MAX_FINDINGS
+        # Byte-budgeted: ``output_dir`` can be pointed at another
+        # run's (or any) directory, so the previous-deps read must not
+        # be an unbounded-slurp primitive.
+        rows = _load_json(prev_path, strict=True, max_bytes=_MAX_FINDINGS)
+        for row in rows or []:
             if not isinstance(row, dict):
                 continue
             # findings.json nests ecosystem/name/version under the
@@ -1683,9 +1865,9 @@ def _run_triage(
     rows.extend(_hygiene_finding_to_row(f) for f in hygiene_findings)
     rows.extend(_supply_chain_finding_to_row(f) for f in supply_chain_findings)
 
-    rows = [r for r in rows if isinstance(r, dict)]
-    sca_rows = [r for r in rows if r.get("vuln_type", "").startswith("sca:")]
-    cross_rows = [r for r in rows if not r.get("vuln_type", "").startswith("sca:")]
+    parsed = [fr for fr in map(FindingRow.from_row, rows) if fr is not None]
+    sca_rows = [fr.raw for fr in parsed if fr.is_sca]
+    cross_rows = [fr.raw for fr in parsed if not fr.is_sca]
 
     result = triage_findings(client, sca_rows, cross_rows or None)
     if result is None:
@@ -1746,12 +1928,14 @@ def _run_llm_inline_review(
 
     all_new: list[Dependency] = []
     for m in inline_manifests[:30]:
-        try:
-            content = m.path.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            logger.debug("sca.pipeline: inline-install manifest read "
-                         "failed for %s; skipping", m.path, exc_info=True)
-            continue
+        # Bounded no-follow read — inline manifests come from the
+        # scanned tree and this content is fed to the LLM reviewer;
+        # a bare read_text was an unbounded-memory (and prompt-size)
+        # primitive per file, up to the 30-file cap.
+        from .parsers._safe_read import read_bounded as _read_bounded
+        content = _read_bounded(m.path, follow_symlinks=False)
+        if content is None:
+            continue        # read_bounded logged the refusal
         if not content.strip():
             continue
 
@@ -1999,18 +2183,29 @@ def select_canonical_for_osv(
         by_name[key].append(d)
 
     out: list[Dependency] = []
-    seen_versions: set[tuple[str, str, str]] = set()
+    kept_by_version: dict[tuple[str, str, str], Dependency] = {}
+
+    def _keep(triple: tuple[str, str, str], r: Dependency) -> None:
+        kept = kept_by_version.get(triple)
+        if kept is not None:
+            # Collapsed duplicate. Don't lose the npm-alias spelling to
+            # first-seen order: a manifest declaring the package both
+            # plain and aliased ("lodash" + "my-lodash": "npm:lodash@…")
+            # must keep the alias on the canonical row, or the fix
+            # path can't rewrite the aliased declaration.
+            if kept.alias_name is None and r.alias_name is not None:
+                kept.alias_name = r.alias_name
+            return
+        kept_by_version[triple] = r
+        out.append(r)
+
     for key in order:
         rows = by_name[key]
         lockfile_versions = [r for r in rows
                              if r.is_lockfile and r.version is not None]
         if lockfile_versions:
             for r in lockfile_versions:
-                triple = (key[0], key[1], r.version or "")
-                if triple in seen_versions:
-                    continue
-                seen_versions.add(triple)
-                out.append(r)
+                _keep((key[0], key[1], r.version or ""), r)
             continue
         manifest_versions = [r for r in rows
                              if not r.is_lockfile and r.version is not None]
@@ -2019,22 +2214,14 @@ def select_canonical_for_osv(
                         if not _is_placeholder_version(r.version or "")]
             keep = resolved if resolved else manifest_versions[:1]
             for r in keep:
-                triple = (key[0], key[1], r.version or "")
-                if triple in seen_versions:
-                    continue
-                seen_versions.add(triple)
-                out.append(r)
+                _keep((key[0], key[1], r.version or ""), r)
             continue
         corridor_rows = [
             r for r in rows
             if r.version_floor is not None or r.version_ceiling is not None
         ]
         if corridor_rows:
-            r = corridor_rows[0]
-            triple = (key[0], key[1], "")
-            if triple not in seen_versions:
-                seen_versions.add(triple)
-                out.append(r)
+            _keep((key[0], key[1], ""), corridor_rows[0])
     return out
 
 

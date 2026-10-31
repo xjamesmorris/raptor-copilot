@@ -20,6 +20,7 @@ from core.audit.asm_zero_len_loop import (
     check_zero_length_loop_entry,
     scan_inventory_asm,
 )
+from core.audit.tests.checklist_corpus import ChecklistBuildCache
 
 FIXTURES = Path(__file__).parent / "fixtures" / "perlasm"
 
@@ -277,48 +278,44 @@ class TestMechanicalConversion:
 
 
 @pytest.fixture(scope="module")
-def prep_with_generated_asm(tmp_path_factory):
+def prep_with_generated_asm(
+    checklist_builds: ChecklistBuildCache,
+    tmp_path_factory: pytest.TempPathFactory,
+):
     """Real ``_compute_audit_prep`` over a checklist carrying an
     asm-generated record — the orchestrator routing seam, hermetic
     (no perl, no sandbox: the record is appended post-build, exactly
     the shape ``core.inventory.perlasm`` emits).
-    """
-    import os
-    import subprocess
-    import sys
 
-    raptor_dir = Path(__file__).resolve().parents[3]
-    target = tmp_path_factory.mktemp("perlasm_target")
-    (target / "app.py").write_text(
-        "def entry(data):\n    return data.strip()\n"
+    The trivial-corpus checklist build is shared (one CLI run per
+    process; the historical RAPTOR_NO_PERLASM=1 build env was a
+    no-op belt for a target with no .pl files — the builds are
+    canonical-hash identical with and without it). The run dir is
+    this module's private copy, nested below its mktemp allocation
+    so out_dir.parent is a private empty dir: prep's cross-run
+    readers (sibling_run_dirs, domain-model/coverage lookups) scan
+    the parent, and a session-shared parent grows by one dir per
+    test — tens of thousands of stat calls late in a full run
+    (observed as 9-12s fixture setups on CI). Nesting also makes
+    hermeticity structural: no other test's run dir can be a
+    sibling.
+    """
+    build = checklist_builds.build(
+        {"app.py": "def entry(data):\n    return data.strip()\n"},
     )
-    # Nested below the mktemp allocation so out_dir.parent is a
-    # private empty dir: prep's cross-run readers (sibling_run_dirs,
-    # domain-model/coverage lookups) scan the parent, and the
-    # session-shared pytest tmp root grows by one dir per test —
-    # tens of thousands of stat calls late in a full run (observed
-    # as 9-12s fixture setups on CI). Also makes hermeticity
-    # structural: no other test's run dir can be a sibling.
-    out = tmp_path_factory.mktemp("perlasm_out") / "run"
-    out.mkdir()
-    env = dict(
-        os.environ,
-        CLAUDECODE="1",
-        _RAPTOR_TRUSTED="1",
-        PYTHONPATH=str(raptor_dir),
-        RAPTOR_NO_PERLASM="1",
+    target = build.target
+    out = build.make_run_dir(
+        tmp_path_factory.mktemp("perlasm_out") / "run",
     )
-    r = subprocess.run(
-        [sys.executable, str(raptor_dir / "libexec" / "raptor-build-checklist"),
-         str(target), str(out)],
-        env=env, capture_output=True, text=True, check=False,
-    )
-    assert r.returncode == 0, f"build-checklist failed: {r.stderr}"
 
     cached = tmp_path_factory.mktemp("perlasm_cache") / "kernel.S"
     cached.write_text(_fixture("aes-sha1-armv8.linux64.S"))
-    checklist_path = out / "checklist.json"
-    checklist = json.loads(checklist_path.read_text())
+    # Round-trip through the gated accessors: the frame is MAC-stamped
+    # at the write chokepoint, so an in-place json edit reads tampered
+    # and prep refuses the checklist.
+    from core.inventory import read_checklist, save_checklist
+
+    checklist = read_checklist(out)
     checklist["files"].append({
         "path": ".perlasm-generated/crypto/aes/asm/aes-sha1-armv8.pl.linux64.S",
         "language": "asm-generated",
@@ -332,8 +329,9 @@ def prep_with_generated_asm(tmp_path_factory):
             "generated_path": str(cached),
         },
     })
-    checklist_path.write_text(json.dumps(checklist))
+    save_checklist(out, checklist)
 
+    from core.audit import orchestrator as orch
     from core.audit.orchestrator import (
         OrchestratorConfig,
         _compute_audit_prep,
@@ -348,7 +346,21 @@ def prep_with_generated_asm(tmp_path_factory):
         enable_session_context=False,
         propagate_constraints=False,
     )
-    prep = _compute_audit_prep(config)
+    # The asm-lead routing seam is under test — scan_inventory_asm runs
+    # in prep AFTER (and independent of) the mechanical-detector phase,
+    # which is incidental substrate here: sandboxed Coccinelle runs on
+    # spatch-equipped hosts plus the detector-cache import-closure
+    # fingerprint, the bulk of this fixture's setup and enough to trip
+    # the default-tier duration guard on a loaded CI runner. Manual
+    # patch/restore because module-scoped fixtures cannot take the
+    # function-scoped monkeypatch; full variadic signature + the real
+    # (dict, set) return contract (the test_consistency_wiring idiom).
+    _real_mechanical = orch._run_mechanical_detectors
+    orch._run_mechanical_detectors = lambda *args, **kwargs: ({}, set())
+    try:
+        prep = _compute_audit_prep(config)
+    finally:
+        orch._run_mechanical_detectors = _real_mechanical
     assert prep is not None, "prep returned None (checklist missing?)"
     return prep, out
 

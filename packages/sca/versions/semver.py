@@ -137,15 +137,32 @@ _PRERELEASE_KEYWORDS = frozenset({
 
 _DIGIT_RE = re.compile(r"\d")
 
+# Upstream branch / channel names that show up as prerelease tokens on
+# branch-snapshot builds of the SAME project (``1.0.0-master``). These
+# are NOT fork indicators: a branch snapshot builds the upstream
+# codebase, so a vulnerability match on it must stay reported.  Only
+# genuine org/fork tags (``0.4.3-succinct``, ``1.0.0-fork.mycorp``)
+# qualify for the false-positive prune.  Lives here (not in the
+# findings-layer post-filter alone) so BOTH match paths share one
+# guard — the offline-DB path filters advisories through ``in_range``
+# directly and used to silently drop ``1.0.0-master``-style matches
+# the live path deliberately keeps.
+UPSTREAM_BRANCH_TOKENS = frozenset({
+    "master", "main", "trunk", "head", "default",
+    "develop", "development", "staging",
+    "stable", "latest", "release",
+})
+
 
 def is_fork_tag(pre: list[str]) -> bool:
     """True when prerelease identifiers look like an org/fork tag
-    rather than a genuine prerelease.
+    rather than a genuine prerelease or an upstream branch snapshot.
 
     Fork tags:   ["succinct"], ["tokio"], ["myorg"], ["tokio-rs"]
     Prereleases: ["alpha"], ["beta", "1"], ["rc", "2"], ["pre1"],
                  ["20250522"], ["0"], ["dev"], ["alpha", "succinct"],
                  ["hotfix"], ["0alpha"], ["v2"], ["build"]
+    Branch snapshots: ["master"], ["develop"], ["myorg", "main"]
     """
     if not pre:
         return False
@@ -154,6 +171,8 @@ def is_fork_tag(pre: list[str]) -> bool:
             return False
         low = ident.lower()
         if low in _PRERELEASE_KEYWORDS:
+            return False
+        if low in UPSTREAM_BRANCH_TOKENS:
             return False
         if _DIGIT_RE.search(ident):
             return False

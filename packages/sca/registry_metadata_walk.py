@@ -26,9 +26,13 @@ This module is the fallback when the toolchain isn't available, and
 the natural mode for ``raptor-sca check <pkg@ver>`` pre-installation
 analysis where there's no project to resolve against.
 
-Supported ecosystems today: PyPI, npm, crates.io. Other ecosystems
+Supported ecosystems today: PyPI, npm, Cargo. Other ecosystems
 follow as separate fetcher modules — adding one is purely a matter of
-the per-registry metadata shape.
+the per-registry metadata shape. Fetcher tables are keyed by the
+CANONICAL ecosystem names (``ecosystems.KNOWN_ECOSYSTEMS``) that every
+producer passes (``Manifest.ecosystem`` / ``canonicalise`` output) —
+Rust is ``"Cargo"`` here; the crates.io registry naming lives inside
+the fetcher URLs, same convention as the resolver layer.
 
 Caching: ``(ecosystem, name, version) -> metadata blob`` is cached
 forever (registry metadata for a pinned version is immutable).
@@ -47,6 +51,7 @@ from core.http import HttpClient, HttpError
 from core.json import TTL_FOREVER, JsonCache
 
 from .models import Confidence, Dependency, PinStyle
+from .naming import fold_name as _norm_name
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -398,7 +403,7 @@ def _make_dep(
 
 def _purl(ecosystem: str, name: str, version: str | None) -> str:
     eco = {
-        "PyPI": "pypi", "npm": "npm", "crates.io": "cargo",
+        "PyPI": "pypi", "npm": "npm", "Cargo": "cargo",
     }.get(ecosystem, ecosystem.lower())
     if version:
         return f"pkg:{eco}/{name}@{version}"
@@ -464,18 +469,6 @@ def _lower_bound(spec: str) -> str | None:
 # Name normalisation
 # ---------------------------------------------------------------------------
 
-def _norm_name(name: str, ecosystem: str) -> str:
-    """Per-ecosystem canonical name. PEP 503 for PyPI; lower-case for
-    npm scoped names. Cargo / Maven are case-sensitive at registry
-    level so we leave them as-is.
-    """
-    if ecosystem == "PyPI":
-        return re.sub(r"[-_.]+", "-", name).lower()
-    if ecosystem == "npm":
-        return name.lower()
-    return name
-
-
 # ---------------------------------------------------------------------------
 # Per-ecosystem fetchers
 # ---------------------------------------------------------------------------
@@ -512,7 +505,12 @@ def _fetch_pypi(
         # and marker; keep name + specifier. Extras-gated entries
         # deliberately ride along (see docstring).
         spec = entry.split(";", 1)[0].strip()
-        spec = re.sub(r"\[[^\]]+\]", "", spec)        # drop extras
+        # Bounded extras body: an unbounded ``[^\]]+`` re-scans every
+        # planted ``[`` inside an unclosed bracket — quadratic on
+        # hostile registry metadata. 256 is far above any real
+        # extras list; a longer body is left in place and the entry
+        # is then skipped by the name match below.
+        spec = re.sub(r"\[[^\]]{1,256}\]", "", spec)  # drop extras
         m = re.match(r"^\s*([A-Za-z0-9._-]+)\s*(.*?)\s*$", spec)
         if not m:
             continue
@@ -593,10 +591,14 @@ def _fetch_crates(
     return out
 
 
+# Keyed by CANONICAL ecosystem names (``ecosystems.KNOWN_ECOSYSTEMS``):
+# producers pass ``Manifest.ecosystem`` / ``canonicalise`` output, so a
+# registry-domain key here ("crates.io") is unreachable from every
+# production caller and silently kills the whole lane.
 _FETCHERS: dict[str, _Fetcher] = {
     "PyPI": _fetch_pypi,
     "npm": _fetch_npm,
-    "crates.io": _fetch_crates,
+    "Cargo": _fetch_crates,
 }
 
 
@@ -608,7 +610,7 @@ def supported_ecosystems() -> set[str]:
 _EXISTENCE_URLS = {
     "PyPI": "https://pypi.org/pypi/{name}/{version}/json",
     "npm": "https://registry.npmjs.org/{name}/{version}",
-    "crates.io": "https://crates.io/api/v1/crates/{name}/{version}",
+    "Cargo": "https://crates.io/api/v1/crates/{name}/{version}",
 }
 
 

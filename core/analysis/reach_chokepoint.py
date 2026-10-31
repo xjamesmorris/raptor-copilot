@@ -130,8 +130,17 @@ def check_suppress(
         verdict_from_classification,
     )
 
+    # Shape-tolerant line coercion: every other input on this path
+    # survives odd SARIF shapes, but a non-numeric line ("N/A") made
+    # this one raw int() raise out of the chokepoint into the
+    # /agentic + /codeql consumer loops. Line 0 already means
+    # "no line".
+    try:
+        line_no = int(line or 0)
+    except (TypeError, ValueError):
+        line_no = 0
     verdict = classify_reachability(
-        checklist, rel, function_name, int(line or 0), module)
+        checklist, rel, function_name, line_no, module)
     spec = verdict_from_classification(verdict)
     if not spec.may_suppress(STRUCTURALLY_SUPPRESSIBLE_KINDS):
         return None
@@ -201,19 +210,28 @@ def record_suppression(
 
     Order of operations between verdict producers (review #6 on
     PR #794). ``suppressions.jsonl`` has a SINGLE writer — this
-    function. Two producers feed it:
+    function. Producers feeding it:
 
     * binary-oracle reachability (``verdict="binary_oracle_absent"``)
       — the LIVE producer, invoked from the /agentic and /codeql
       reachability chokepoint as a PRE-LLM hard-suppress.
     * sanitizer-cut (``verdict="sanitizer_dominated"`` /
       ``candidate_only``) — bridged in via
-      :func:`core.analysis.sanitizer_cut.record_sanitizer_cut_suppression`.
-      It writes the same schema but is NOT yet wired into the
-      pipeline (only tests call it — see that function's note), so
-      today there is no live ordering interaction.
+      :func:`core.analysis.sanitizer_cut.record_sanitizer_cut_suppression`
+      and LIVE: the scan post-pass
+      (:mod:`core.analysis.sanitizer_cut_postpass`, invoked from the
+      static-analysis scanner) enforces full-proof ``suppress``
+      verdicts by default (corpus-earned 2026-08-19; opt out with
+      ``--no-sanitizer-cut-enforce``) and records ``candidate_only``
+      evidence; the SMT-barrier lane
+      (:mod:`core.dataflow.smt_barrier`) writes record-only entries.
+    * the audit pipeline — the /audit orchestrator's oracle-earned
+      and vendored/generated triage drops, the refutation engine's
+      witness records, and the merge fence all write the same record
+      shape here (CLAUDE.md documents the shared contract), as does
+      ``packages/source_intel``.
 
-    When sanitizer-cut is wired, the intended order is binary-oracle
+    The order between the producers is binary-oracle
     FIRST: a function absent from the binary is dropped before any
     dataflow/sanitizer reasoning runs, so the sanitizer-cut gate never
     sees it and can't double-record it. The producers do not observe
@@ -243,7 +261,12 @@ def record_suppression(
             record.update(extra)
         from core.json import append_jsonl
         append_jsonl(out_dir / "suppressions.jsonl", record)
-    except OSError as e:
+    except (OSError, TypeError, ValueError) as e:
+        # TypeError/ValueError: core.json.append_jsonl raises them for
+        # non-serialisable / NaN values a producer smuggles in through
+        # ``extra`` — the "best-effort, never propagate" contract must
+        # be structural, not dependent on every caller's enclosing
+        # except.
         logger.debug(
             "reach_chokepoint: failed to write suppression record: %s", e)
 

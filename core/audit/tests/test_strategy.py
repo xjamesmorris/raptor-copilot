@@ -585,3 +585,49 @@ class TestStrategiesForText:
     def test_no_signal_returns_empty(self):
         from core.audit.strategy import strategies_for_text
         assert strategies_for_text("colour naming conventions") == []
+
+
+class TestLearnedVocabStaleness:
+    """The vocab cache is keyed on the domain-model content stamp:
+    the model grows mid-run via concept discovery, and a (dir,
+    target)-only key served stale vocabulary to late-reviewed
+    functions."""
+
+    @staticmethod
+    def _write_model(out_dir, acquire: str, release: str) -> None:
+        import json
+
+        (out_dir / "domain-model.json").write_text(json.dumps({
+            "paired_operations": [
+                {"acquire": acquire, "release": release,
+                 "kind": "alloc"},
+            ],
+        }))
+
+    def test_mid_run_domain_model_growth_invalidates_cache(
+        self, tmp_path,
+    ):
+        from core.audit.strategy import learned_vocab
+
+        self._write_model(tmp_path, "obj_take", "obj_give")
+        first = learned_vocab(tmp_path)
+        assert first is not None
+        assert "obj_take" in first.allocators
+
+        # Concept discovery adds a new pair mid-run.
+        self._write_model(tmp_path, "sess_open", "sess_close")
+        second = learned_vocab(tmp_path)
+        assert second is not None
+        assert "sess_open" in second.allocators
+
+    def test_unchanged_model_still_served_from_cache(self, tmp_path):
+        from core.audit import strategy as strategy_mod
+        from core.audit.strategy import learned_vocab
+
+        self._write_model(tmp_path, "obj_take", "obj_give")
+        first = learned_vocab(tmp_path)
+        before = strategy_mod._learned_vocab_cached.cache_info().hits
+        second = learned_vocab(tmp_path)
+        after = strategy_mod._learned_vocab_cached.cache_info().hits
+        assert second is first
+        assert after == before + 1

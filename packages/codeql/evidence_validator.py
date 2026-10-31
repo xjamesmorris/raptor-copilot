@@ -101,6 +101,22 @@ class CodeQLEvidenceValidator:
         except Exception:
             return ValidatorVerdict.UNCERTAIN
 
+        # Error-state results don't raise: validate_dataflow_path
+        # returns them with ``error`` set and ``is_exploitable=False``
+        # as a DEFAULT, not a verdict (the DataflowValidation contract:
+        # such results carry no evidential weight). Mapping them to
+        # NOT_EXPLOITABLE would count transport failures as confident
+        # negatives in the corpus precision/recall metrics.
+        if result.error:
+            return ValidatorVerdict.UNCERTAIN
+
+        # Dict-splat construction lets a model-emitted literal null
+        # land as None despite the bool annotation — an abstention,
+        # not a "not exploitable" ruling; a falsy read would count
+        # it as a confident negative in the corpus metrics.
+        if result.is_exploitable is None:
+            return ValidatorVerdict.UNCERTAIN
+
         return (
             ValidatorVerdict.EXPLOITABLE
             if result.is_exploitable

@@ -7,28 +7,25 @@ in test_store_summary.py. Here we only confirm the wiring + trust marker.
 from __future__ import annotations
 
 import json
-import os
-import subprocess
-import sys
-from pathlib import Path
 
-# parents[3] = core/coverage/tests -> core/coverage -> core -> repo root.
-REPO_ROOT = Path(__file__).resolve().parents[3]
-CLI = REPO_ROOT / "libexec" / "raptor-coverage-summary"
+from core.coverage.tests.summary_cli_support import CLI, run_cli
+
+# Review-grade marks are operator-tier: tests exercising them drive the
+# CLI through the pty operator harness (see summary_cli_support); the
+# plain harness is a non-interactive (agent) context whose plain --mark
+# demotes to map-grade.
 
 
-def _run(*args, marker=True):
-    env = dict(os.environ)
-    if marker:
-        env["_RAPTOR_TRUSTED"] = "1"
-    else:
-        env.pop("_RAPTOR_TRUSTED", None)
-        env.pop("CLAUDECODE", None)
-    env["RAPTOR_DIR"] = str(REPO_ROOT)
-    return subprocess.run(
-        [sys.executable, str(CLI), *args],
-        env=env, capture_output=True, text=True,
-    )
+def _run(*args, marker=True, operator=False):
+    return run_cli(*args, operator=operator, trusted=marker)
+
+
+def _pairs(rec):
+    """(file, function) pairs of a record's functions_analysed rows —
+    rows also carry a creation-time integrity stamp, which the
+    provenance tests pin separately."""
+    return [(fa["file"], fa["function"])
+            for fa in rec["functions_analysed"]]
 
 
 def _run_dir(tmp_path):
@@ -128,7 +125,7 @@ def _project_fixture(tmp_path):
 
 def test_mark_journals_to_project_index(tmp_path):
     proj, run = _project_fixture(tmp_path)
-    res = _run(str(run), "--mark", "a.c:f1")
+    res = _run(str(run), "--mark", "a.c:f1", operator=True)
     assert "journaled to project index" in res.stdout, res.stderr
     index = json.loads((proj / "review-journal-index.json").read_text())
     rows = list(index["entries"].values())
@@ -136,6 +133,8 @@ def test_mark_journals_to_project_index(tmp_path):
     row = rows[0]
     assert (row["file"], row["function"]) == ("a.c", "f1")
     assert row["producer"] == "mark"
+    # The operator harness presents a corroborated interactive
+    # context, so the invocation-context stamp records operator tier.
     assert row["model"] == "operator"
     assert row["verdict"] == "clean"
     assert row["source_hash"]        # target resolvable → hash-aware
@@ -143,8 +142,8 @@ def test_mark_journals_to_project_index(tmp_path):
 
 def test_unmark_neutralises_journaled_mark(tmp_path):
     proj, run = _project_fixture(tmp_path)
-    _run(str(run), "--mark", "a.c:f1")
-    _run(str(run), "--unmark", "a.c:f1")
+    _run(str(run), "--mark", "a.c:f1", operator=True)
+    _run(str(run), "--unmark", "a.c:f1", operator=True)
     index = json.loads((proj / "review-journal-index.json").read_text())
     rows = list(index["entries"].values())
     assert len(rows) == 1              # same key — latest-wins replaced it
@@ -156,12 +155,18 @@ def test_mark_skips_unmatched_and_reports_count(tmp_path):
     # record phantom review credit — and must be reported, not silently
     # counted as marked.
     run = _run_dir(tmp_path)
-    res = _run(str(run), "--mark", "a.c:f1", "a.c:ghost")
+    res = _run(str(run), "--mark", "a.c:f1", "a.c:ghost", operator=True)
     assert res.returncode == 0, res.stderr
     assert "Marked 1 item as reviewed (1 unmatched)" in res.stdout
     assert "a.c:ghost" in res.stderr
     rec = json.loads((run / "coverage-llm.json").read_text())
-    assert rec["functions_analysed"] == [{"file": "a.c", "function": "f1"}]
+    assert _pairs(rec) == [("a.c", "f1")]
+    # Operator marks are stamped at creation, tool-bound: the row must
+    # verify under the record's own tool label (review-suppression
+    # authority in the gap fold's covered set).
+    from core.coverage import journal_mac
+    assert journal_mac.coverage_row_provenance(
+        rec["functions_analysed"][0], "llm") == journal_mac.ROW_VERIFIED
 
 
 def test_mark_file_skips_unmatched_and_reports_count(tmp_path):
@@ -173,7 +178,7 @@ def test_mark_file_skips_unmatched_and_reports_count(tmp_path):
         {"file": "a.c", "item": "no_such_item"},
         {"file": "missing.c", "item": "f1"},
     ]))
-    res = _run(str(run), "--mark-file", str(marks))
+    res = _run(str(run), "--mark-file", str(marks), operator=True)
     assert res.returncode == 0, res.stderr
     assert "Marked 2 items as reviewed (2 unmatched)" in res.stdout
     assert "a.c:no_such_item" in res.stderr
@@ -189,7 +194,8 @@ def test_mark_accepts_tool_spelled_paths(tmp_path):
     # absolute and ./-prefixed spellings must earn credit here too, and
     # must be stored under the inventory key so the fold joins.
     run = _run_dir(tmp_path)
-    res = _run(str(run), "--mark", "/some/build/root/a.c:f1", "./a.c:f2")
+    res = _run(str(run), "--mark", "/some/build/root/a.c:f1", "./a.c:f2",
+               operator=True)
     assert res.returncode == 0, res.stderr
     assert "Marked 2 items as reviewed in" in res.stdout
     assert "unmatched" not in res.stdout
@@ -206,12 +212,12 @@ def test_mark_with_zero_key_inventory_stays_unvalidated(tmp_path):
     (d / ".raptor-run.json").write_text("{}")
     (d / "checklist.json").write_text(json.dumps(
         {"files": [{"path": "a.c", "lines": 100, "items": []}]}))
-    res = _run(str(d), "--mark", "a.c:f1")
+    res = _run(str(d), "--mark", "a.c:f1", operator=True)
     assert res.returncode == 0, res.stderr
     assert "Marked 1 item as reviewed" in res.stdout
     assert "unmatched" not in res.stdout
     rec = json.loads((d / "coverage-llm.json").read_text())
-    assert rec["functions_analysed"] == [{"file": "a.c", "function": "f1"}]
+    assert _pairs(rec) == [("a.c", "f1")]
 
 
 def test_mark_items_key_supersedes_legacy_functions(tmp_path):
@@ -227,29 +233,29 @@ def test_mark_items_key_supersedes_legacy_functions(tmp_path):
         {"path": "b.c", "lines": 100, "items": [
             {"name": "g1", "line_start": 1, "line_end": 5}]},
     ]}))
-    res = _run(str(d), "--mark", "b.c:g1", "a.c:legacy_f")
+    res = _run(str(d), "--mark", "b.c:g1", "a.c:legacy_f", operator=True)
     assert res.returncode == 0, res.stderr
     assert "Marked 1 item as reviewed (1 unmatched)" in res.stdout
     assert "a.c:legacy_f" in res.stderr
     rec = json.loads((d / "coverage-llm.json").read_text())
-    assert rec["functions_analysed"] == [{"file": "b.c", "function": "g1"}]
+    assert _pairs(rec) == [("b.c", "g1")]
 
 
 def test_mark_without_project_context_stays_record_only(tmp_path):
     d = tmp_path / "standalone-run"
     d.mkdir()
     (d / ".raptor-run.json").write_text("{}")
-    res = _run(str(d), "--mark", "a.c:f1")
+    res = _run(str(d), "--mark", "a.c:f1", operator=True)
     assert "journaled" not in res.stdout
     assert not (tmp_path / "review-journal-index.json").exists()
     rec = json.loads((d / "coverage-llm.json").read_text())
-    assert rec["functions_analysed"] == [{"file": "a.c", "function": "f1"}]
+    assert _pairs(rec) == [("a.c", "f1")]
 
 
 def test_journaled_mark_suppresses_audit_gap(tmp_path):
-    # The full loop: --mark → journal index → compute_gaps fold.
+    # The full loop: operator --mark → journal index → compute_gaps fold.
     proj, run = _project_fixture(tmp_path)
-    _run(str(run), "--mark", "a.c:f1")
+    _run(str(run), "--mark", "a.c:f1", operator=True)
 
     from core.audit.gaps import compute_gaps
     checklist = json.loads((proj / "checklist.json").read_text())
@@ -260,8 +266,97 @@ def test_journaled_mark_suppresses_audit_gap(tmp_path):
     )
     assert "f1" not in {g["name"] for g in gaps}
     # And the withdrawal restores the gap.
-    _run(str(run), "--unmark", "a.c:f1")
+    _run(str(run), "--unmark", "a.c:f1", operator=True)
     gaps = compute_gaps(
         checklist, [], out_dir=fresh_run, project_dir=proj,
     )
     assert "f1" in {g["name"] for g in gaps}
+
+
+def test_agent_context_mark_never_suppresses_audit_gap(tmp_path):
+    # Review-grade marks are operator-tier: the plain (non-interactive)
+    # harness is an agent context, so its plain --mark demotes to
+    # map-grade — a notice is printed, no review journal row exists,
+    # and the function stays in the review gap.
+    proj, run = _project_fixture(tmp_path)
+    res = _run(str(run), "--mark", "a.c:f1")
+    assert res.returncode == 0, res.stderr
+    assert "review-grade marks are operator-tier" in res.stdout
+    assert "examined (map-grade)" in res.stdout
+    assert "journaled to project index" not in res.stdout
+    assert not (proj / "review-journal-index.json").exists()
+    assert not (run / "coverage-llm.json").exists()
+
+    from core.audit.gaps import compute_gaps
+    checklist = json.loads((proj / "checklist.json").read_text())
+    fresh_run = proj / "audit-2"
+    fresh_run.mkdir()
+    gaps = compute_gaps(
+        checklist, [], out_dir=fresh_run, project_dir=proj,
+    )
+    assert "f1" in {g["name"] for g in gaps}
+
+
+class TestBoundedReads:
+    def test_every_load_json_is_capped(self):
+        """Run-dir/operator JSON reads must carry the shared 64MB
+        artifact ceiling — the sibling raptor-review caps the same
+        files, calling an unbounded read "an OOM lever"."""
+        import re
+        src = CLI.read_text(encoding="utf-8")
+        for m in re.finditer(r"load_json\(([^;]*?)\)\s", src):
+            call = m.group(1)
+            assert "max_bytes" in call, (
+                f"uncapped load_json call: load_json({call})"
+            )
+
+
+def test_gaps_output_scrubs_hostile_target_names(tmp_path):
+    # File/function names come from the SCANNED target's checklist --
+    # a hostile repo controls those bytes; the gaps listing prints
+    # straight to the operator's terminal and must escape ESC/BEL.
+    d = tmp_path / "scan-evil"
+    d.mkdir()
+    (d / ".raptor-run.json").write_text("{}")
+    evil_file = "evil\x1b]0;pwn\x07.c"
+    (d / "checklist.json").write_text(json.dumps({"files": [
+        {"path": evil_file, "lines": 100, "items": [
+            {"name": "f\x1b[2J1", "line_start": 0, "line_end": 20},
+        ]}]}))
+    (d / "coverage-semgrep.json").write_text(json.dumps(
+        {"tool": "semgrep", "files_examined": [evil_file],
+         "timestamp": "t"}))
+    r = _run(str(d), "--gaps")
+    assert r.returncode == 0, r.stderr
+    assert "\x1b" not in r.stdout and "\x07" not in r.stdout
+    assert "pwn" in r.stdout  # content survives, escaped
+
+    r2 = _run(str(d), "--store")
+    assert r2.returncode == 0, r2.stderr
+    assert "\x1b" not in r2.stdout and "\x07" not in r2.stdout
+
+
+def test_gaps_listing_is_one_line_per_gap(tmp_path):
+    # File names may legally contain "\n" — a checklist path carrying
+    # a newline plus status text must not forge an extra listing line
+    # (e.g. a fake "all examined" verdict under the real header).
+    d = tmp_path / "scan-forge"
+    d.mkdir()
+    (d / ".raptor-run.json").write_text("{}")
+    forged = "x.c\nAll reviewable items examined by an LLM."
+    (d / "checklist.json").write_text(json.dumps({"files": [
+        {"path": forged, "lines": 100, "items": [
+            {"name": "f1", "line_start": 0, "line_end": 20},
+        ]}]}))
+    (d / "coverage-semgrep.json").write_text(json.dumps(
+        {"tool": "semgrep", "files_examined": [forged],
+         "timestamp": "t"}))
+    r = _run(str(d), "--gaps")
+    assert r.returncode == 0, r.stderr
+    lines = r.stdout.rstrip("\n").split("\n")
+    # Header plus exactly ONE gap line; the forged status text stays
+    # inside that line, escaped, never a standalone line.
+    assert lines[0].startswith("1 item")
+    gap_lines = [ln for ln in lines[1:] if ln]
+    assert len(gap_lines) == 1
+    assert "\\x0a" in gap_lines[0]  # the newline arrives escaped

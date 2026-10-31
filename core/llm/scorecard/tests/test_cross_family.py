@@ -51,6 +51,33 @@ class TestRecordCrossFamilyOutcomes:
         assert ec is not None
         assert ec.correct == 1
 
+    def test_model_version_never_the_checker_alias(self, tmp_path: Path):
+        """Family convention (see consensus.py): model_version is the
+        concrete served snapshot, None when unavailable so the cell
+        stays alias-keyed — the check record carries no
+        resolved_model, and stamping the alias made the cell lie
+        about its snapshot."""
+        sc = ModelScorecard(path=tmp_path / "sc.json")
+        results = {"F-001": _make_result(
+            "F-001",
+            cf_check={"checker_model": "gpt-5", "verdict": "agreed"},
+        )}
+        assert record_cross_family_outcomes(sc, results_by_id=results) == 1
+        dc = "agentic:test-rule"
+        assert sc.get_stat(dc, "gpt-5").model_version in ("", None)
+
+    def test_future_disagreed_verdict_is_not_agreement(
+            self, tmp_path: Path):
+        """Prefix-anchored grammar: a verdict string outside the
+        producer's known set must record nothing — the bare substring
+        test read a hypothetical "disagreed" as agreement."""
+        sc = ModelScorecard(path=tmp_path / "sc.json")
+        results = {"F-001": _make_result(
+            "F-001",
+            cf_check={"checker_model": "gpt-5", "verdict": "disagreed"},
+        )}
+        assert record_cross_family_outcomes(sc, results_by_id=results) == 0
+
     def test_disputed_records_incorrect(self, tmp_path: Path):
         sc = ModelScorecard(path=tmp_path / "sc.json")
         results = {"F-001": _make_result(
@@ -232,3 +259,65 @@ class TestConsistencyNotReliabilityGraded:
             if event_type in RELIABILITY_EVENT_TYPES:
                 assert counts.correct == 0
                 assert counts.incorrect == 0
+
+
+class TestMalformedVerdict:
+    def test_none_verdict_skips_without_aborting_walk(self, tmp_path: Path):
+        """A present-but-None verdict (checker errored upstream) must
+        degrade to a skip — pre-fix it raised AttributeError outside
+        the per-event try, dropping every remaining finding's event."""
+        sc = ModelScorecard(path=tmp_path / "sc.json")
+        results = {
+            "F-001": _make_result("F-001", cf_check={
+                "verdict": None,
+                "checker_model": "gpt-5.2",
+            }),
+            "F-002": _make_result("F-002", cf_check={
+                "verdict": "disputed",
+                "checker_model": "gpt-5.2",
+                "trigger": "verdict-flip",
+                "checker_ruling": "disagree",
+            }),
+        }
+        n = record_cross_family_outcomes(sc, results_by_id=results)
+        assert n == 1
+
+
+class TestVerdictStringIsAuthoritative:
+    """The verdict string is the producer's grammar; the top-level
+    boolean flags are set by a different code path and can fall out
+    of sync. An out-of-sync True flag must never mint ``correct``
+    past a present-but-unknown verdict; the flag serves only as the
+    backstop for legacy records that carry no verdict string."""
+
+    def test_unknown_verdict_with_true_flag_mints_nothing(self, tmp_path):
+        sc = ModelScorecard(tmp_path / "sc.json")
+        n = record_cross_family_outcomes(
+            sc,
+            results_by_id={"f1": {
+                "rule_id": "r",
+                "cross_family_agreed": True,  # out-of-sync flag
+                "cross_family_check": {
+                    "verdict": "someday-a-new-verdict",
+                    "checker_model": "gemini-pro",
+                },
+            }},
+        )
+        assert n == 0
+
+    def test_flag_backstops_verdictless_legacy_record(self, tmp_path):
+        sc = ModelScorecard(tmp_path / "sc.json")
+        n = record_cross_family_outcomes(
+            sc,
+            results_by_id={"f1": {
+                "rule_id": "r",
+                "cross_family_agreed": True,
+                "cross_family_check": {
+                    # legacy record: no verdict string at all
+                    "checker_model": "gemini-pro",
+                },
+            }},
+        )
+        assert n == 1
+        stat = sc.get_stat("agentic:r", "gemini-pro")
+        assert stat.events["cross_family_consistency"].correct == 1

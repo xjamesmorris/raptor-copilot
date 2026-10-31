@@ -11,6 +11,15 @@ from core.sandbox import evidence as evidence_mod
 from core.sandbox import summary as summary_mod
 
 
+@pytest.fixture(autouse=True)
+def _user_state_in_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """User registries stay out of the real home: the root-conftest
+    layer doing this is stripped from release extracts (conftest.py
+    is export-ignore), so the pin must travel in-file."""
+    from core.testing.state_isolation import pin_user_state_dirs
+    pin_user_state_dirs(monkeypatch, tmp_path)
+
+
 def _denials_path(run_dir):
     """Canonical (post-relocation) denials JSONL path for a run dir:
     ``<run_dir>/.audit/.sandbox-denials.jsonl``. Tests that pre-plant
@@ -251,6 +260,67 @@ class TestSummarizeAndWrite:
             (tmp_path / summary_mod.SUMMARY_FILE).read_text())
         assert on_disk["corrupt_lines"] == 1
 
+    def test_deeply_nested_line_counts_as_corrupt(self, tmp_path):
+        """A deeply nested line ("["*200k) makes json.loads raise
+        RecursionError, not JSONDecodeError. The line is
+        target-writable content read AFTER the irreversible rename —
+        it must count as corruption and flag the summary, never
+        escape and suppress the drained records."""
+        jsonl = tmp_path / summary_mod.DENIALS_FILE
+        jsonl.write_text(
+            json.dumps({"ts": "x", "type": "network", "cmd": "c",
+                        "returncode": 1}) + "\n"
+            + "[" * 200_000 + "\n"
+        )
+        result = summary_mod.summarize_and_write(tmp_path)
+        assert result is not None
+        assert result["total_denials"] == 1
+        assert result["corrupt_lines"] == 1
+        on_disk = json.loads(
+            (tmp_path / summary_mod.SUMMARY_FILE).read_text())
+        assert on_disk["corrupt_lines"] == 1
+
+    def test_read_failure_closes_fd_exactly_once(self, tmp_path,
+                                                 monkeypatch):
+        """A host-I/O failure while draining the renamed JSONL takes
+        the warn-and-return-None path — and the fd it was reading must
+        be closed exactly once (a second close races a concurrent
+        thread's fd reuse)."""
+        jsonl = tmp_path / summary_mod.DENIALS_FILE
+        jsonl.write_text(
+            json.dumps({"ts": "x", "type": "network", "cmd": "c",
+                        "returncode": 1}) + "\n"
+        )
+        tracked_fds: set[int] = set()
+        close_calls: list[int] = []
+        real_open = os.open
+        real_read = os.read
+        real_close = os.close
+
+        def fake_open(path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            if ".summarising." in str(path):
+                tracked_fds.add(fd)
+            return fd
+
+        def fake_read(fd, n):
+            if fd in tracked_fds:
+                raise OSError(5, "injected read failure")
+            return real_read(fd, n)
+
+        def fake_close(fd):
+            if fd in tracked_fds:
+                close_calls.append(fd)
+            real_close(fd)
+
+        monkeypatch.setattr(os, "open", fake_open)
+        monkeypatch.setattr(os, "read", fake_read)
+        monkeypatch.setattr(os, "close", fake_close)
+        result = summary_mod.summarize_and_write(tmp_path)
+        assert result is None
+        assert len(tracked_fds) == 1
+        assert len(close_calls) == 1
+
     def test_space_overwritten_record_counts_as_corrupt(self, tmp_path,
                                                         monkeypatch):
         """The in-place-overwrite shape: same inode, same length, one
@@ -303,6 +373,32 @@ class TestSummarizeAndWrite:
         result = summary_mod.summarize_and_write(tmp_path)
         assert result is not None
         assert result["inode_mismatch"] is True
+
+    def test_inode_swap_flag_survives_run_dir_spelling_drift(
+            self, tmp_path, monkeypatch):
+        """The finalizer's evidence-handle match must resolve() both
+        sides like every other run-dir key in the module: with a
+        symlink-spelled run_dir the unresolved compare skipped the
+        close-and-verify here, and the later set_active_run_dir close
+        discarded the verdict — a swapped evidence file's
+        inode_mismatch flag was silently lost for that run."""
+        monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+        real = tmp_path / "run"
+        real.mkdir()
+        alias = tmp_path / "alias"
+        alias.symlink_to(real, target_is_directory=True)
+        summary_mod.set_active_run_dir(real)
+        summary_mod.record_denial("real", 1, "network")
+        jsonl = _denials_path(real)
+        content = jsonl.read_bytes()
+        jsonl.unlink()
+        jsonl.write_bytes(content)  # same bytes, NEW inode
+        result = summary_mod.summarize_and_write(alias)
+        assert result is not None
+        assert result["inode_mismatch"] is True, (
+            "spelling drift (symlinked run dir) lost the "
+            "inode_mismatch tamper flag"
+        )
 
     def test_planted_fifo_does_not_hang_and_flags_summary(self, tmp_path):
         """The legacy denials location is target-writable; a planted

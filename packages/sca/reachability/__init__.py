@@ -16,8 +16,7 @@ matching OSV advisory), every PyPI dep that came up
 with on-demand wheel-metadata fetch enabled
 (:mod:`packages.sca.python_modules`). Cost is bounded by a
 forever-cache keyed on (name, version) and gated to CVE-bearing
-deps so clean projects pay nothing extra. See ``design/sca.md``
-§856.
+deps so clean projects pay nothing extra.
 """
 
 from __future__ import annotations
@@ -28,7 +27,12 @@ from pathlib import Path
 from typing import Any
 from collections.abc import Callable, Iterable
 
-from ..models import Confidence, Dependency, Reachability
+from ..models import (
+    Confidence,
+    Dependency,
+    REACHABILITY_ORDER,
+    Reachability,
+)
 from . import cargo as _cargo
 from . import composer as _composer
 from . import gemfile as _gemfile
@@ -37,8 +41,19 @@ from . import maven as _maven
 from . import nodejs as _nodejs
 from . import nuget as _nuget
 from . import python as _python
+from ._shared import UNRESOLVED_ENTRY
 
 logger = logging.getLogger(__name__)
+
+
+def _verdict_rank(r: Reachability) -> int:
+    """Strength rank for verdict comparison — lower is stronger
+    (``REACHABILITY_ORDER`` is reachable-tier first). Unknown verdicts
+    sort weakest."""
+    try:
+        return REACHABILITY_ORDER.index(r.verdict)
+    except ValueError:
+        return len(REACHABILITY_ORDER)
 
 
 # Per-ecosystem scanner: returns the raw module → evidence map.
@@ -54,28 +69,28 @@ _Resolver = Callable[
 
 _HANDLERS: dict[str, tuple[_Scanner, _Resolver]] = {
     "PyPI": (_python.scan_imports,
-             lambda name, scan, target=None:
+             lambda name, scan, target=None:  # type: ignore[misc]
                  _python.resolve_dep(name, scan, target=target)),
     "npm":  (_nodejs.scan_imports,
-             lambda name, scan, target=None:
+             lambda name, scan, target=None:  # type: ignore[misc]
                  _nodejs.resolve_dep(name, scan, target=target)),
     "Cargo": (_cargo.scan_imports,
-              lambda name, scan, target=None:
+              lambda name, scan, target=None:  # type: ignore[misc]
                   _cargo.resolve_dep(name, scan, target=target)),
     "Go": (_gomod.scan_imports,
-           lambda name, scan, target=None:
+           lambda name, scan, target=None:  # type: ignore[misc]
                _gomod.resolve_dep(name, scan, target=target)),
     "RubyGems": (_gemfile.scan_imports,
-                  lambda name, scan, target=None:
+                  lambda name, scan, target=None:  # type: ignore[misc]
                       _gemfile.resolve_dep(name, scan, target=target)),
     "NuGet": (_nuget.scan_imports,
-              lambda name, scan, target=None:
+              lambda name, scan, target=None:  # type: ignore[misc]
                   _nuget.resolve_dep(name, scan, target=target)),
     "Packagist": (_composer.scan_imports,
-                   lambda name, scan, target=None:
+                   lambda name, scan, target=None:  # type: ignore[misc]
                        _composer.resolve_dep(name, scan, target=target)),
     "Maven": (_maven.scan_imports,
-              lambda name, scan, target=None:
+              lambda name, scan, target=None:  # type: ignore[misc]
                   _maven.resolve_dep(name, scan, target=target)),
 }
 
@@ -100,6 +115,13 @@ def scan(
     """
     deps_list = list(deps)
     out: dict[str, Reachability] = {}
+
+    # Per-scan walk memo: the unified walker exists so the
+    # per-ecosystem scanners within THIS scan share one traversal —
+    # it has no mtime axis, so entries outliving the scan serve
+    # stale file lists to long-lived processes re-scanning a target.
+    from ._walker import reset_walk_cache
+    reset_walk_cache()
 
     by_eco: dict[str, list[Dependency]] = defaultdict(list)
     for d in deps_list:
@@ -164,9 +186,27 @@ def scan(
                     )
                 out[d.key()] = seen[cache_key]
             else:
-                if d.name not in seen:
-                    seen[d.name] = resolver(d.name, scan_result, target)
-                out[d.key()] = seen[d.name]
+                # An npm-aliased dep is imported by its ALIAS spelling
+                # (``require("my-lodash")`` for ``"my-lodash":
+                # "npm:lodash@^4"``) — but the canonical row can cover
+                # BOTH a plain and an aliased declaration of the same
+                # package, so resolve every spelling source code could
+                # reference and keep the strongest verdict. Alias-only
+                # resolution deterministically demoted a plainly-
+                # imported dual-declared package to not_reachable.
+                candidates = [d.name]
+                if d.alias_name and d.alias_name != d.name:
+                    candidates.insert(0, d.alias_name)
+                best: Reachability | None = None
+                for nm in candidates:
+                    if nm not in seen:
+                        seen[nm] = resolver(nm, scan_result, target)
+                    r = seen[nm]
+                    if best is None or (_verdict_rank(r)
+                                        < _verdict_rank(best)):
+                        best = r
+                assert best is not None  # candidates is never empty
+                out[d.key()] = best
 
     # Tier-3 escalation. Only PyPI today; other ecosystems' resolvers
     # don't yet support wheel-style on-demand metadata. Gated on:
@@ -205,6 +245,13 @@ def scan(
     _inventory_build_failed.discard(str(target))
 
     if osv_results:
+        # ``_shared_inventory`` returns None ONLY when the build
+        # failed (failure is memoised per target). Each tier is
+        # gated on a non-None inventory: passing None through would
+        # trigger every tier's own tempdir rebuild fallback — up to
+        # 8 redundant ~21s builds (istio-scale) of a builder that
+        # just failed, with 8 warning stacks. The per-tier fallback
+        # stays for direct callers.
         shared_inventory = None
 
         from .python_function_level import (
@@ -212,8 +259,8 @@ def scan(
             refine_pypi_verdicts,
         )
         pypi_symbols = build_pypi_symbol_map(osv_results)
-        if pypi_symbols:
-            shared_inventory = _shared_inventory(target, shared_inventory)
+        if pypi_symbols and (shared_inventory := _shared_inventory(
+                target, shared_inventory)) is not None:
             refine_pypi_verdicts(
                 deps_list, out,
                 target=target,
@@ -226,8 +273,8 @@ def scan(
             refine_npm_verdicts,
         )
         npm_symbols = build_npm_symbol_map(osv_results)
-        if npm_symbols:
-            shared_inventory = _shared_inventory(target, shared_inventory)
+        if npm_symbols and (shared_inventory := _shared_inventory(
+                target, shared_inventory)) is not None:
             refine_npm_verdicts(
                 deps_list, out,
                 target=target,
@@ -240,8 +287,8 @@ def scan(
             refine_go_verdicts,
         )
         go_symbols = build_go_symbol_map(osv_results)
-        if go_symbols:
-            shared_inventory = _shared_inventory(target, shared_inventory)
+        if go_symbols and (shared_inventory := _shared_inventory(
+                target, shared_inventory)) is not None:
             refine_go_verdicts(
                 deps_list, out,
                 target=target,
@@ -254,8 +301,8 @@ def scan(
             refine_maven_verdicts,
         )
         maven_symbols = build_maven_symbol_map(osv_results)
-        if maven_symbols:
-            shared_inventory = _shared_inventory(target, shared_inventory)
+        if maven_symbols and (shared_inventory := _shared_inventory(
+                target, shared_inventory)) is not None:
             refine_maven_verdicts(
                 deps_list, out,
                 target=target,
@@ -268,8 +315,8 @@ def scan(
             refine_cargo_verdicts,
         )
         cargo_symbols = build_cargo_symbol_map(osv_results)
-        if cargo_symbols:
-            shared_inventory = _shared_inventory(target, shared_inventory)
+        if cargo_symbols and (shared_inventory := _shared_inventory(
+                target, shared_inventory)) is not None:
             refine_cargo_verdicts(
                 deps_list, out,
                 target=target,
@@ -282,8 +329,8 @@ def scan(
             refine_rubygems_verdicts,
         )
         rubygems_symbols = build_rubygems_symbol_map(osv_results)
-        if rubygems_symbols:
-            shared_inventory = _shared_inventory(target, shared_inventory)
+        if rubygems_symbols and (shared_inventory := _shared_inventory(
+                target, shared_inventory)) is not None:
             refine_rubygems_verdicts(
                 deps_list, out,
                 target=target,
@@ -296,8 +343,8 @@ def scan(
             refine_nuget_verdicts,
         )
         nuget_symbols = build_nuget_symbol_map(osv_results)
-        if nuget_symbols:
-            shared_inventory = _shared_inventory(target, shared_inventory)
+        if nuget_symbols and (shared_inventory := _shared_inventory(
+                target, shared_inventory)) is not None:
             refine_nuget_verdicts(
                 deps_list, out,
                 target=target,
@@ -310,8 +357,8 @@ def scan(
             refine_packagist_verdicts,
         )
         packagist_symbols = build_packagist_symbol_map(osv_results)
-        if packagist_symbols:
-            shared_inventory = _shared_inventory(target, shared_inventory)
+        if packagist_symbols and (shared_inventory := _shared_inventory(
+                target, shared_inventory)) is not None:
             refine_packagist_verdicts(
                 deps_list, out,
                 target=target,
@@ -371,12 +418,12 @@ def _inventory_cache_dir(target: Path) -> Path:
     target path so distinct projects get distinct cache dirs.
     """
     import hashlib
-    from packages.sca import SCA_CACHE_ROOT
+    from packages.sca import sca_cache_root
     target_abs = str(target.resolve())
     target_hash = hashlib.sha256(
         target_abs.encode("utf-8"),
     ).hexdigest()[:16]
-    return SCA_CACHE_ROOT / "inventory" / target_hash
+    return sca_cache_root() / "inventory" / target_hash
 
 
 def _build_go_symbol_map(
@@ -386,6 +433,19 @@ def _build_go_symbol_map(
 
     Returns ``{dep_key: [symbol_name, ...]}`` from
     ``advisory.ecosystem_specific.imports[].symbols``.
+
+    OSV feed data is hostile-input tier: elements are validated
+    per-entry. A junk (non-string) element degrades to the shared
+    ``UNRESOLVED_ENTRY`` marker — visible in the map and counted,
+    but its NUL prefix can never satisfy the downstream
+    identifier-boundary grep, and it can never crash the symbol
+    sweep (``re.escape`` on a non-string TypeError'd the whole
+    reachability stage). A non-list ``symbols`` container is
+    junk-shaped in one piece (a bare string would iterate
+    CHAR-BY-CHAR, turning one advisory into single-letter grep
+    probes that upgrade verdicts from garbage) and degrades to one
+    marker. Empty strings name no function and are excluded — the
+    same contract as the function-tier builders.
     """
     if not osv_results:
         return {}
@@ -404,8 +464,19 @@ def _build_go_symbol_map(
                 if not isinstance(imp, dict):
                     continue
                 syms = imp.get("symbols", [])
-                if syms:
-                    out.setdefault(r.dep_key, []).extend(syms)
+                cleaned: list[str]
+                if isinstance(syms, list):
+                    cleaned = [
+                        s if isinstance(s, str) else UNRESOLVED_ENTRY
+                        for s in syms
+                        if not (isinstance(s, str) and not s)
+                    ]
+                elif syms:
+                    cleaned = [UNRESOLVED_ENTRY]
+                else:
+                    cleaned = []
+                if cleaned:
+                    out.setdefault(r.dep_key, []).extend(cleaned)
     for key in out:
         out[key] = list(dict.fromkeys(out[key]))
     return out

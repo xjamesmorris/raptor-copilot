@@ -299,7 +299,7 @@ def test_runner_shaped_etc_completes_fast(tmp_path, monkeypatch,
     (Locally proven against a planted 100k-entry / 200MB skel; the
     committed fixture keeps CI runtime negligible while exercising
     the same code path.)"""
-    import time
+    from core.testing.wallclock import cpu_budget
 
     src = tmp_path / "src"
     (src / "ssl" / "certs").mkdir(parents=True)
@@ -316,14 +316,63 @@ def test_runner_shaped_etc_completes_fast(tmp_path, monkeypatch,
         (skel / ".cargo" / "bin" / name).write_bytes(b"\x7fELF" + b"\x00" * (2 << 20))
 
     dst = tmp_path / "dst"
-    start = time.monotonic()
-    _copy(monkeypatch, src, dst, force_byte_copy=True)
-    elapsed = time.monotonic() - start
-
-    assert elapsed < 2.0, (
-        f"runner-shaped /etc copy took {elapsed:.2f}s — the skel skip "
-        f"or budget is not engaging")
+    # CPU budget, not wall clock: a disengaged skel skip/budget shows
+    # up as CPU+sys time walking and copying the toolchain-stuffed
+    # skel; a loaded runner only stalls wall time.
+    with cpu_budget(2.0, what="runner-shaped /etc copy"):
+        _copy(monkeypatch, src, dst, force_byte_copy=True)
     assert not (dst / "skel").exists()
     for f in ("passwd", "hosts", "resolv.conf"):
         assert (dst / f).exists()
     assert (dst / "ssl" / "certs" / "ca-certificates.crt").exists()
+
+
+def test_alternatives_never_copied(tmp_path, monkeypatch, phase_trace):
+    """Debian/Ubuntu alternatives symlinks are skipped — hundreds of
+    package-manager entries that no sandbox target reads directly."""
+    src = tmp_path / "src"
+    src.mkdir()
+    alts = src / "alternatives"
+    alts.mkdir()
+    for i in range(200):
+        (alts / f"editor.{i}").symlink_to(f"/usr/bin/vim.{i}")
+    (src / "passwd").write_text("root:x:0:0::/root:/bin/sh\n")
+    dst = tmp_path / "dst"
+    _copy(monkeypatch, src, dst, force_byte_copy=True)
+
+    assert not (dst / "alternatives").exists()
+    assert (dst / "passwd").exists()
+    trace = _read_trace(phase_trace)
+    assert "etc copy skip: " in trace
+    assert str(src / "alternatives") in trace
+    assert "never copied" in trace
+
+
+def test_wallclock_deadline_stops_copy(tmp_path, monkeypatch, phase_trace):
+    """A wall-clock deadline prevents the copy from consuming the
+    caller's timeout on a pathologically large host /etc."""
+    import core.sandbox.mount_ns as mns
+
+    src = tmp_path / "src"
+    src.mkdir()
+    for f in ("passwd", "hosts", "resolv.conf"):
+        (src / f).write_text(f"{f}\n")
+    # Deep tree that takes real time to copy when hard-links fail
+    # (forced byte-copy). Use enough entries that the deadline fires
+    # before the entry budget does.
+    big = src / "deep" / "tree"
+    big.mkdir(parents=True)
+    for i in range(200):
+        (big / f"blob{i:04d}").write_bytes(b"\x00" * 512)
+
+    monkeypatch.setattr(mns, "_ETC_COPY_MAX_SECONDS", 0.0)
+    dst = tmp_path / "dst"
+    _copy(monkeypatch, src, dst, force_byte_copy=True)
+
+    # Root-level config files must be present (BFS copies them first —
+    # the deadline fires during directory descent, not on root files).
+    for f in ("passwd", "hosts", "resolv.conf"):
+        assert (dst / f).exists(), (
+            f"root-level {f} lost to the deadline — BFS ordering broken")
+    trace = _read_trace(phase_trace)
+    assert "etc copy deadline exceeded" in trace

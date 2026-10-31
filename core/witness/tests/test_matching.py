@@ -333,3 +333,111 @@ def test_finding_level_binary_path_is_hashed(tmp_path):
     finding = {"id": "FIND-0006", "binary_path": str(binary)}
     score, _ = score_witness_for_finding(w, finding)
     assert score == 2
+
+
+# ----------------------------------------------------------------------
+# Join-key normalisation — real producer/finding spellings must join
+# ----------------------------------------------------------------------
+
+
+def test_finding_id_fallback_key():
+    # provenance's _finding_coords precedent: findings that carry
+    # finding_id (no bare id) still join at score 10.
+    w = _make_witness({"finding_id": "FIND-7"})
+    score, reason = score_witness_for_finding(
+        w, {"finding_id": "FIND-7"})
+    assert score == 10
+
+
+def test_cwe_spelling_normalised_both_directions():
+    w = _make_witness({"cwe_id": "79", "file_path": "src/a.c"})
+    score, _ = score_witness_for_finding(
+        w, {"cwe_id": "CWE-79", "file": "src/a.c"})
+    assert score == 7
+    w2 = _make_witness({"cwe_id": "cwe-79", "file_path": "src/a.c"})
+    score2, _ = score_witness_for_finding(
+        w2, {"cwe_id": "79", "file": "src/a.c"})
+    assert score2 == 7
+
+
+def test_absolute_vs_relative_path_joins_on_component_boundary():
+    w = _make_witness({"file_path": "/work/repo/src/auth.c"})
+    score, reason = score_witness_for_finding(
+        w, {"file": "src/auth.c"})
+    assert score == 4
+    assert "file match" in reason
+
+
+def test_path_suffix_never_matches_inside_a_component():
+    w = _make_witness({"file_path": "ab/x.c"})
+    score, _ = score_witness_for_finding(w, {"file": "b/x.c"})
+    assert score == 0
+
+
+def test_unrelated_paths_still_no_signal():
+    w = _make_witness({"file_path": "other/src/x.c"})
+    score, _ = score_witness_for_finding(w, {"file": "mine/src/y.c"})
+    assert score == 0
+
+
+def test_junk_cwe_spelling_does_not_promote():
+    # Non-numeric CWE junk normalises to None on both sides — a
+    # None==None equality must not fake the +CWE tier.
+    w = _make_witness({"cwe_id": "not-a-cwe", "file_path": "src/a.c"})
+    score, reason = score_witness_for_finding(
+        w, {"cwe_id": "also-junk", "file": "src/a.c"})
+    assert score == 4
+
+
+def test_symbolic_producer_spelling_joins():
+    # The symbolic-witness producer records cwe / file (not
+    # cwe_id / file_path) — both live spellings must join.
+    w = _make_witness({"cwe": "CWE-120", "file": "src/auth.c"})
+    score, _ = score_witness_for_finding(
+        w, {"cwe_id": "CWE-120", "file": "src/auth.c"})
+    assert score == 7
+
+
+def test_fifo_binary_path_does_not_hang_scoring(tmp_path):
+    # binary_path comes from finding JSON in run directories; a
+    # planted FIFO must be treated as unhashable, not block the
+    # scoring loop at the open.
+    import os as _os
+    import signal as _signal
+
+    import pytest
+
+    if not hasattr(_os, "mkfifo"):
+        pytest.skip("platform lacks mkfifo")
+    fifo = tmp_path / "target.bin"
+    _os.mkfifo(fifo)
+
+    def _on_alarm(signum, frame):
+        msg = "binary hashing blocked on a planted FIFO"
+        raise AssertionError(msg)
+
+    w = _make_witness({}, target_binary_hash="ab" * 32)
+    old = _signal.signal(_signal.SIGALRM, _on_alarm)
+    _signal.alarm(30)
+    try:
+        score, _ = score_witness_for_finding(
+            w, {"binary_path": str(fifo)})
+    finally:
+        _signal.alarm(0)
+        _signal.signal(_signal.SIGALRM, old)
+    assert score == 0
+
+
+def test_bare_basename_never_suffix_joins():
+    # A single-component finding path would suffix-join ANY same-named
+    # file anywhere in a sibling run's tree — and the matched bytes
+    # influence downstream feasibility verdicts in both directions.
+    # Bare basenames join on exact equality only.
+    w = _make_witness(
+        {"file_path": "/sibling-run/other_project/src/util/index.js"})
+    score, _ = score_witness_for_finding(w, {"file": "index.js"})
+    assert score == 0
+    # Exact single-component equality still joins.
+    w2 = _make_witness({"file_path": "index.js"})
+    score2, _ = score_witness_for_finding(w2, {"file": "index.js"})
+    assert score2 == 4

@@ -391,3 +391,31 @@ class TestForkTagInRange:
         """Fork base above the fix: not in range regardless."""
         events = [{"introduced": "0"}, {"fixed": "0.4.3"}]
         assert in_range("Cargo", "0.5.0-succinct", events) is False
+
+
+class TestBranchSnapshotGuard:
+    """Upstream branch/channel tokens are NOT fork tags — the guard
+    lives in ``is_fork_tag`` itself so both the live post-filter and
+    the offline ``in_range`` path share it."""
+
+    def test_branch_tokens_are_not_fork_tags(self) -> None:
+        assert is_fork_tag(["master"]) is False
+        assert is_fork_tag(["develop"]) is False
+        assert is_fork_tag(["latest"]) is False
+        assert is_fork_tag(["myorg", "main"]) is False
+
+    def test_in_range_keeps_branch_snapshot_match(self) -> None:
+        """Offline-DB path: a vulnerable ``1.0.0-master`` pin matching
+        ``[introduced, 1.0.0)`` must stay reported — it is an upstream
+        branch snapshot, not a fork.  This was the offline/live
+        asymmetry: the live path's post-filter kept the match while
+        ``in_range`` silently dropped it."""
+        events = [{"introduced": "0"}, {"fixed": "1.0.0"}]
+        assert in_range("npm", "1.0.0-master", events) is True
+        assert in_range("Cargo", "1.0.0-develop", events) is True
+
+    def test_in_range_still_prunes_true_fork_tag_at_fix(self) -> None:
+        """The fork-tag suppression itself is retained: a fork tagged
+        exactly at the fix version stays pruned."""
+        events = [{"introduced": "0"}, {"fixed": "0.4.3"}]
+        assert in_range("Cargo", "0.4.3-succinct", events) is False

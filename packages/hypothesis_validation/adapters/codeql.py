@@ -423,7 +423,7 @@ class CodeQLAdapter(ToolAdapter):
         # (real-HOME pack cache) rationale.
         runner = (
             make_sandbox_runner(
-                target=self._database_path,
+                target=self._database_path,  # type: ignore[arg-type]
                 output=self._database_path,
                 fake_home=False,
                 readable_paths=_codeql_user_state_paths(),
@@ -435,7 +435,7 @@ class CodeQLAdapter(ToolAdapter):
         # RAPTOR-shipped manifests only, and the lockfile fetch needs
         # the network the sandbox denies. Analyze stays sandboxed.
         for qp in unique_paths:
-            _ensure_pack_installed(Path(qp), self._codeql_bin, subprocess.run, env)
+            _ensure_pack_installed(Path(qp), self._codeql_bin or "", subprocess.run, env)
 
         try:
             # Scratch (SARIF output, temp pack) lives INSIDE the
@@ -449,7 +449,7 @@ class CodeQLAdapter(ToolAdapter):
             ) as tmp:
                 sarif_path = Path(tmp) / "result.sarif"
                 cmd = [
-                    self._codeql_bin,
+                    self._codeql_bin or "codeql",
                     "database", "analyze",
                     str(self._database_path),
                     *unique_paths,
@@ -532,9 +532,12 @@ class CodeQLAdapter(ToolAdapter):
                 # Bounded header scan for @id — the metadata comment
                 # normally sits in the first few hundred bytes; 64 KiB
                 # tolerates long licence/doc headers while still
-                # capping the read on a pathological file.
-                ql_header = Path(qp).read_text(encoding="utf-8", errors="replace")[:65536]
-                for line in ql_header.split("\n"):
+                # capping the read on a pathological file. f.read(n)
+                # actually bounds the READ — a post-hoc slice would
+                # materialise the whole file first.
+                with Path(qp).open(encoding="utf-8", errors="replace") as fh:
+                    ql_header = fh.read(65536)
+                for line in ql_header.split("\n"):  # line-model: RAPTOR-side query files; lines strip()-normalised
                     stripped = line.strip().lstrip("*").strip()
                     if stripped.startswith("@id "):
                         at_id = stripped[4:].strip()

@@ -158,6 +158,21 @@ class TestLoadTuning(unittest.TestCase):
             t = load_tuning(p)
             self.assertEqual(t.max_semgrep_workers, _detect_semgrep_workers())
 
+    def test_llm_account_posture_is_valid_passthrough(self):
+        # The posture is a recognised key (no unknown-key warning) but
+        # a passthrough one: consumed raw by core/llm/concurrency.py,
+        # never resolved into the Tuning dataclass.
+        with TemporaryDirectory() as d:
+            p = Path(d) / "tuning.json"
+            p.write_text(json.dumps({
+                "llm_account_posture": "solo",
+                "max_semgrep_workers": 8,
+            }))
+            with self.assertNoLogs("core.tuning", level="WARNING"):
+                t = load_tuning(p)
+            self.assertEqual(t.max_semgrep_workers, 8)
+            self.assertFalse(hasattr(t, "llm_account_posture"))
+
     def test_unknown_key_warns(self):
         with TemporaryDirectory() as d:
             p = Path(d) / "tuning.json"
@@ -391,7 +406,9 @@ class TestTuningFrozen(unittest.TestCase):
             codeql_max_disk_cache_mb=0,
             joern_enabled=True,
             joern_heap_mb=2048,
+            joern_heap_ceiling_mb=65536,
             joern_cpg_timeout_s=300,
+            joern_import_timeout_s=900,
             joern_query_timeout_s=300,
             max_semgrep_workers=4, max_codeql_workers=2,
             max_fuzz_parallel=1,
@@ -433,3 +450,302 @@ class TestJoernHeapDeadZone:
 
     def test_floor_untouched(self, monkeypatch):
         assert self._heap_for_total(1024, monkeypatch) == 1024
+
+
+class TestJoernHeapCeiling:
+    """The heap ceiling caps the DERIVED heap; explicit values pass."""
+
+    def _load(self, tmp_path, monkeypatch, config, total_mb):
+        import core.tuning as t
+        monkeypatch.setattr(t, "_detect_total_ram_mb", lambda: total_mb)
+        path = tmp_path / "tuning.json"
+        path.write_text(json.dumps(config))
+        return t.load_tuning(path)
+
+    def test_ceiling_default_is_min_quarter_ram_64g(self, monkeypatch):
+        import core.tuning as t
+        monkeypatch.setattr(t, "_detect_total_ram_mb", lambda: 495 * 1024)
+        assert t._detect_joern_heap_ceiling_mb() == 64 * 1024
+        monkeypatch.setattr(t, "_detect_total_ram_mb", lambda: 64 * 1024)
+        assert t._detect_joern_heap_ceiling_mb() == 16 * 1024
+
+    def test_auto_heap_capped_at_default_ceiling(self, tmp_path, monkeypatch):
+        # 25% of 495 GiB ≈ 124 GiB raw derivation — the very heap the
+        # ceiling exists to stop on a fresh install.
+        t = self._load(tmp_path, monkeypatch, {}, total_mb=495 * 1024)
+        assert t.joern_heap_mb == 64 * 1024
+        assert t.joern_heap_ceiling_mb == 64 * 1024
+
+    def test_auto_heap_below_ceiling_untouched(self, tmp_path, monkeypatch):
+        t = self._load(tmp_path, monkeypatch, {}, total_mb=64 * 1024)
+        assert t.joern_heap_mb == 16 * 1024
+
+    def test_explicit_heap_never_capped(self, tmp_path, monkeypatch):
+        t = self._load(
+            tmp_path, monkeypatch,
+            {"joern_heap_mb": 126 * 1024}, total_mb=495 * 1024,
+        )
+        assert t.joern_heap_mb == 126 * 1024
+
+    def test_explicit_ceiling_caps_auto_heap(self, tmp_path, monkeypatch):
+        t = self._load(
+            tmp_path, monkeypatch,
+            {"joern_heap_ceiling_mb": 8192}, total_mb=495 * 1024,
+        )
+        assert t.joern_heap_mb == 8192
+
+    def test_ceiling_in_dead_zone_clamps_down(self, tmp_path, monkeypatch):
+        # A capped heap in the compressed-oops dead zone is strictly
+        # worse than the 31 GiB compressed maximum.
+        t = self._load(
+            tmp_path, monkeypatch,
+            {"joern_heap_ceiling_mb": 40 * 1024}, total_mb=495 * 1024,
+        )
+        assert t.joern_heap_mb == 31 * 1024
+
+    def test_invalid_heap_falls_back_to_capped_auto(self, tmp_path, monkeypatch):
+        t = self._load(
+            tmp_path, monkeypatch,
+            {"joern_heap_mb": -5}, total_mb=495 * 1024,
+        )
+        assert t.joern_heap_mb == 64 * 1024
+
+    def test_derived_flag_tracks_heap_provenance(self, tmp_path, monkeypatch):
+        # Limit-raising consumers key on this flag: an explicit heap
+        # is an operator assertion, honored both directions.
+        auto = self._load(tmp_path, monkeypatch, {}, total_mb=64 * 1024)
+        assert auto.joern_heap_mb_derived is True
+        explicit = self._load(
+            tmp_path, monkeypatch,
+            {"joern_heap_mb": 2048}, total_mb=64 * 1024,
+        )
+        assert explicit.joern_heap_mb_derived is False
+
+
+class TestDerivedCpgTimeout:
+    """SLOC-derived CPG-build timeout curve and the auto sentinel."""
+
+    def test_auto_resolves_to_derived_sentinel(self, tmp_path):
+        from core.tuning import JOERN_CPG_TIMEOUT_DERIVED, load_tuning
+        path = tmp_path / "tuning.json"
+        path.write_text(json.dumps({"joern_cpg_timeout_s": "auto"}))
+        t = load_tuning(path)
+        assert t.joern_cpg_timeout_s == JOERN_CPG_TIMEOUT_DERIVED
+
+    def test_default_is_auto_sentinel(self, tmp_path):
+        from core.tuning import JOERN_CPG_TIMEOUT_DERIVED, load_tuning
+        path = tmp_path / "tuning.json"
+        path.write_text("{}")
+        assert load_tuning(path).joern_cpg_timeout_s == JOERN_CPG_TIMEOUT_DERIVED
+
+    def test_static_value_unchanged(self, tmp_path):
+        from core.tuning import load_tuning
+        path = tmp_path / "tuning.json"
+        path.write_text(json.dumps({"joern_cpg_timeout_s": 7200}))
+        assert load_tuning(path).joern_cpg_timeout_s == 7200
+
+    def test_curve_floor(self):
+        from core.tuning import derive_joern_cpg_timeout_s
+        assert derive_joern_cpg_timeout_s(10_000) == 300
+
+    def test_curve_calibration_point_has_slack(self):
+        from core.tuning import derive_joern_cpg_timeout_s
+        # The measured 2,849 s build must clear its own derived wall.
+        derived = derive_joern_cpg_timeout_s(3_000_000)
+        assert derived >= 2 * 2849
+        assert derived <= 14400
+
+    def test_curve_cap(self):
+        from core.tuning import derive_joern_cpg_timeout_s
+        assert derive_joern_cpg_timeout_s(40_000_000) == 14400
+
+    def test_unknown_scope_fallback(self):
+        from core.tuning import derive_joern_cpg_timeout_s
+        assert derive_joern_cpg_timeout_s(None) == 1800
+        assert derive_joern_cpg_timeout_s(0) == 1800
+
+    def test_knowably_undersized_cap_warns(self, caplog):
+        # When even the PRE-slack estimate exceeds the cap, the
+        # capped wall is knowably undersized — say so at derivation
+        # time so the operator can act before paying it.
+        import logging
+        from core.tuning import derive_joern_cpg_timeout_s
+        with caplog.at_level(logging.WARNING, logger="core.tuning"):
+            assert derive_joern_cpg_timeout_s(38_000_000) == 14400
+        assert "likely undersized" in caplog.text
+
+    def test_in_cap_scopes_do_not_warn(self, caplog):
+        import logging
+        from core.tuning import derive_joern_cpg_timeout_s
+        with caplog.at_level(logging.WARNING, logger="core.tuning"):
+            derive_joern_cpg_timeout_s(3_000_000)
+            # Slack-capped but raw estimate inside the cap: the wall
+            # still carries real headroom, no advisory.
+            derive_joern_cpg_timeout_s(10_000_000)
+        assert not caplog.records
+
+    def test_derived_max_helpers(self, tmp_path, monkeypatch):
+        import core.tuning as t
+        assert t.derived_max_joern_cpg_timeout_s() == 14400
+        monkeypatch.setattr(t, "_detect_total_ram_mb", lambda: 495 * 1024)
+        path = tmp_path / "tuning.json"
+        path.write_text("{}")
+        monkeypatch.setattr(t, "_TUNING_PATH", path)
+        monkeypatch.setattr(t, "_cached", None)
+        monkeypatch.setattr(t, "_cached_stat", None)
+        assert t.derived_max_joern_heap_mb() == 64 * 1024
+
+
+_MIB = 1024 * 1024
+
+
+class TestDerivedImportTimeout:
+    """CPG-size-derived import timeout curve and the auto sentinel."""
+
+    def test_auto_resolves_to_derived_sentinel(self, tmp_path):
+        from core.tuning import JOERN_IMPORT_TIMEOUT_DERIVED, load_tuning
+        path = tmp_path / "tuning.json"
+        path.write_text(json.dumps({"joern_import_timeout_s": "auto"}))
+        t = load_tuning(path)
+        assert t.joern_import_timeout_s == JOERN_IMPORT_TIMEOUT_DERIVED
+
+    def test_default_is_auto_sentinel(self, tmp_path):
+        from core.tuning import JOERN_IMPORT_TIMEOUT_DERIVED, load_tuning
+        path = tmp_path / "tuning.json"
+        path.write_text("{}")
+        assert (load_tuning(path).joern_import_timeout_s
+                == JOERN_IMPORT_TIMEOUT_DERIVED)
+
+    def test_static_value_unchanged(self, tmp_path):
+        from core.tuning import load_tuning
+        path = tmp_path / "tuning.json"
+        path.write_text(json.dumps({"joern_import_timeout_s": 3600}))
+        assert load_tuning(path).joern_import_timeout_s == 3600
+
+    def test_curve_floor_keeps_historical_default(self):
+        # Direction 1: small CPGs keep today's 900 s kill latency —
+        # the derivation must never TIGHTEN the historical budget.
+        from core.tuning import derive_joern_import_timeout_s
+        assert derive_joern_import_timeout_s(10 * _MIB) == 900
+        assert derive_joern_import_timeout_s(1) == 900
+
+    def test_kernel_scale_cpg_clears_the_failed_budget(self):
+        # Calibration datum: a ~190 MiB kernel-scale CPG failed to
+        # import within 1800 s. The derived wall must clear that
+        # observed-insufficient budget with real headroom.
+        from core.tuning import derive_joern_import_timeout_s
+        derived = derive_joern_import_timeout_s(190 * _MIB)
+        assert derived >= 2 * 1800
+        assert derived <= 10800
+
+    def test_curve_cap_bounds_hostile_sizes(self):
+        # Direction 2: a hostile / degenerate multi-TB cpg.bin must
+        # not buy unbounded wall — the cap is absolute.
+        from core.tuning import derive_joern_import_timeout_s
+        assert derive_joern_import_timeout_s(4 * 1024**4) == 10800
+
+    def test_unknown_size_falls_back_to_floor(self):
+        from core.tuning import derive_joern_import_timeout_s
+        assert derive_joern_import_timeout_s(None) == 900
+        assert derive_joern_import_timeout_s(0) == 900
+        assert derive_joern_import_timeout_s(-1) == 900
+
+    def test_slope_pinned_exactly_mid_curve(self):
+        # Exact mid-curve pin (100 MiB x 20 s/MiB = 2000 s, between
+        # floor and cap) holds the slope in BOTH directions: the
+        # floor/headroom pins above only fail from below (a silently
+        # doubled slope passes them all), the cap pins only from
+        # above (a halved slope passes those). Any slope change must
+        # move this number and re-argue the calibration.
+        from core.tuning import derive_joern_import_timeout_s
+        assert derive_joern_import_timeout_s(100 * _MIB) == 2000
+
+    def test_derived_max_helper(self):
+        from core.tuning import derived_max_joern_import_timeout_s
+        assert derived_max_joern_import_timeout_s() == 10800
+
+
+class TestDerivedPresweepTimeout:
+    """CPG-size-derived bulk pre-sweep window budget."""
+
+    def test_floor_is_configured_query_timeout(self):
+        # Direction 1: small CPGs keep the configured per-query
+        # budget unchanged (no inflation of the historical default).
+        from core.tuning import derive_joern_presweep_timeout_s
+        assert derive_joern_presweep_timeout_s(300, 5 * _MIB) == 300
+        assert derive_joern_presweep_timeout_s(300, None) == 300
+        assert derive_joern_presweep_timeout_s(300, 0) == 300
+
+    def test_operator_raised_floor_stays_authoritative(self):
+        from core.tuning import derive_joern_presweep_timeout_s
+        # An operator-raised query timeout above the derived value
+        # passes through unchanged (floor scaling, upward authority).
+        assert derive_joern_presweep_timeout_s(9000, 190 * _MIB) == 9000
+
+    def test_kernel_scale_cpg_clears_the_killing_budget(self):
+        # Calibration datum: a ~190 MiB kernel-scale CPG's bulk sweep
+        # was killed at a flat 300 s and recorded zero flows. The
+        # derived window must clear that budget with real headroom.
+        from core.tuning import derive_joern_presweep_timeout_s
+        derived = derive_joern_presweep_timeout_s(300, 190 * _MIB)
+        assert derived >= 10 * 300
+        assert derived <= 7200
+
+    def test_cap_bounds_hostile_sizes(self):
+        # Direction 2: the REPL is single-threaded — one wedged
+        # window must not park the run beyond the cap, no matter how
+        # large (or hostile) the CPG size signal is.
+        from core.tuning import derive_joern_presweep_timeout_s
+        assert derive_joern_presweep_timeout_s(300, 4 * 1024**4) == 7200
+
+    def test_include_import_widens_budget_and_cap(self):
+        from core.tuning import derive_joern_presweep_timeout_s
+        # The subprocess path's single wall covers importCpg + solve:
+        # the import slope is added, and the cap widens accordingly.
+        server_side = derive_joern_presweep_timeout_s(300, 190 * _MIB)
+        local = derive_joern_presweep_timeout_s(
+            300, 190 * _MIB, include_import=True)
+        assert local > server_side
+        assert derive_joern_presweep_timeout_s(
+            300, 4 * 1024**4, include_import=True) == 7200 + 10800
+
+    def test_non_positive_query_timeout_passes_through(self):
+        # 0 is some callers' "no budget" sentinel — never inflate it.
+        from core.tuning import derive_joern_presweep_timeout_s
+        assert derive_joern_presweep_timeout_s(0, 10**9) == 0
+        assert derive_joern_presweep_timeout_s(-5, 10**9) == -5
+
+    def test_slope_pinned_exactly_mid_curve(self):
+        # Exact mid-curve pins hold the slope in BOTH directions (the
+        # headroom pins above only fail from below, the cap pins only
+        # from above — a silently doubled or halved slope would pass
+        # every one of them). 100 MiB x 20 s/MiB = 2000 s; the
+        # subprocess path adds the import slope on the same bytes
+        # (40 s/MiB total = 4000 s). Any slope change must move these
+        # numbers and re-argue the calibration.
+        from core.tuning import derive_joern_presweep_timeout_s
+        assert derive_joern_presweep_timeout_s(300, 100 * _MIB) == 2000
+        assert derive_joern_presweep_timeout_s(
+            300, 100 * _MIB, include_import=True,
+        ) == 4000
+
+
+class TestDerivedMaxPresweepTimeout:
+    def test_cap_is_the_derivations_upper_bound(self):
+        from core.tuning import (
+            derive_joern_presweep_timeout_s,
+            derived_max_joern_presweep_timeout_s,
+        )
+        huge = 4 * 1024**4
+        assert derived_max_joern_presweep_timeout_s(300) == (
+            derive_joern_presweep_timeout_s(300, huge)
+        )
+        assert derived_max_joern_presweep_timeout_s(
+            300, include_import=True,
+        ) == derive_joern_presweep_timeout_s(
+            300, huge, include_import=True,
+        )
+
+    def test_operator_budget_above_cap_stays_authoritative(self):
+        from core.tuning import derived_max_joern_presweep_timeout_s
+        assert derived_max_joern_presweep_timeout_s(90000) == 90000

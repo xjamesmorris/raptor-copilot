@@ -43,13 +43,17 @@ restores AUDIT/OBSERVE signal that was missing. The Linux
 from __future__ import annotations
 
 import contextlib
+import ctypes
+import ctypes.util
 import json
 import logging
 import os
+import resource
 import select
 import subprocess
 import sys
 import time
+import warnings
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -57,11 +61,30 @@ from . import evidence as _evidence_mod
 
 logger = logging.getLogger(__name__)
 
+# Python 3.12+ warns on every os.fork() in a multi-threaded process.
+# Both fork sites in this module honour the fork-safety contract (the
+# children only do fd plumbing, bare syscalls and exec — see
+# _spawn.py's module docstring). The filter must live at module
+# level, exactly like _spawn's: per-fork ``warnings.catch_warnings()``
+# blocks mutate the PROCESS-GLOBAL filter list and race when this
+# audit lane forks concurrently with _spawn sandboxes on another
+# thread — one thread's restore re-exposes another thread's fork
+# mid-flight, which is how the warning kept escaping into CI output.
+warnings.filterwarnings(
+    "ignore", category=DeprecationWarning,
+    message=r".*use of fork\(\) may lead to deadlocks in the child.*",
+)
+
 
 # Default tracer-ready timeout. The tracer's PTRACE_SEIZE +
-# SETOPTIONS dance is microseconds on a healthy host; allow 5s
-# to absorb pathological scheduler stalls (CI under heavy load).
-_TRACER_READY_TIMEOUT_S = 5.0
+# SETOPTIONS dance is microseconds on a healthy host; the budget only
+# binds the WEDGED-tracer case (a dead tracer delivers EOF instantly),
+# so it trades wedge-detection latency against false kills on a badly
+# stalled host. 15s matches the spawn lane's tracer-ready deadline —
+# the two lanes fail the same way at the same threshold; a shorter
+# value here previously bought nothing but a 3x-earlier misdiagnosis
+# window on loaded CI hosts.
+_TRACER_READY_TIMEOUT_S = 15.0
 
 # How long to wait for the tracer to exit on its own after the target
 # is reaped. A healthy tracer exits promptly once its last tracee is
@@ -94,7 +117,7 @@ _PR_SET_PTRACER = 0x59616d61
 _PR_SET_PTRACER_ANY = 0xFFFFFFFFFFFFFFFF  # cast of (-1) to unsigned long
 
 
-def _set_ptracer_any_in_child() -> None:
+def _set_ptracer_any_in_child(libc: ctypes.CDLL | None) -> None:
     """``prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY)`` so a sibling
     tracer can attach under Yama scope 1.
 
@@ -105,17 +128,20 @@ def _set_ptracer_any_in_child() -> None:
     explicitly opt in to being traced by ``any`` process. Same
     approach the mount-ns spawn uses inside its preexec.
 
-    Failures are best-effort silent: on hosts without Yama (older
+    ``libc`` is the CDLL handle resolved PRE-FORK by the parent
+    (``run_landlock_audit``): this function runs in the forked target child,
+    where ``ctypes.util.find_library("c")`` — which can shell out to
+    /sbin/ldconfig — would be the banned fork-storm pattern (same
+    parent-side capture as ``_spawn._parent_libc``).
+
+    Failures are best-effort silent: ``libc is None`` (load failure)
+    keeps the historic degrade; on hosts without Yama (older
     kernels, some containers) prctl returns EINVAL and ptrace
     works without this opt-in. If Yama IS the gate, the tracer's
     SEIZE will fail and the parent's diagnostic fires there.
     """
-    import ctypes
-    import ctypes.util
-    _libc_name = ctypes.util.find_library("c")
-    if not _libc_name:
+    if libc is None:
         return
-    libc = ctypes.CDLL(_libc_name, use_errno=True)
     libc.prctl.argtypes = [
         ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong,
         ctypes.c_ulong, ctypes.c_ulong,
@@ -194,10 +220,12 @@ def _write_audit_config(audit_config: dict) -> int:
     the TRACER's exec) and closes its own copy after the fork; the
     tracer closes the inherited fd right after parsing.
 
-    sort_keys=True — the serialised audit config is hashed elsewhere
-    for cache lookups and reproducibility. Without stable key
-    ordering, dict-rebuild order changes (across Python versions /
-    interpreter restarts) would break the cache identity contract.
+    sort_keys=True — deterministic serialisation: no consumer hashes
+    or caches the config (nothing in the tree keys on its bytes),
+    but stable key ordering keeps the fd contents byte-comparable
+    across runs and interpreter dict-order changes, which matters
+    for debugging and for any future consumer that DOES fingerprint
+    it.
     """
     serialised = json.dumps(audit_config, sort_keys=True).encode("utf-8")
     return _evidence_mod.anonymous_fd(serialised)
@@ -257,12 +285,16 @@ def _drain_pipes_until_eof(
     We instead check whether the target is still alive via
     ``waitid(..., WNOWAIT)`` — which does NOT reap, so the caller's
     own ``waitpid`` still observes the exit status. The liveness probe
-    runs on a TIME schedule (every ``_DRAIN_IDLE_POLL_S``), not only
-    on idle ticks: a grandchild that inherited the write end and
-    writes continuously keeps ``select()`` non-empty forever, so an
+    runs on EVERY loop wake, not only on idle ticks and not on a time
+    schedule: a grandchild that inherited the write end and writes
+    continuously keeps ``select()`` non-empty forever, so an
     idle-branch-only probe never noticed the target's exit and a
     ``timeout=None`` run (legitimate callers exist — host.py) never
-    finished draining. Draining stops when:
+    finished draining; and a scheduled probe (one per poll interval)
+    never fired at all when the caller's ``deadline`` was shorter
+    than the interval, so a target that exited 0 immediately — its
+    stdio held open by a backgrounded grandchild — broke out of the
+    drain with its exit undetected. Draining stops when:
 
       * EOF is seen on every fd (normal case), or
       * ``deadline`` expires (caller kills the child and raises), or
@@ -285,9 +317,6 @@ def _drain_pipes_until_eof(
     fds_open = set(bufs)
     target_exited = False
     sweep_deadline: float | None = None
-    # First liveness probe fires one poll interval in; a chattering
-    # pipe must not defer it past that (see the docstring).
-    next_exit_probe = time.monotonic() + _DRAIN_IDLE_POLL_S
 
     def _probe_target_exited() -> bool:
         try:
@@ -300,6 +329,21 @@ def _drain_pipes_until_eof(
         return res is not None
 
     while fds_open:
+        # Liveness probe on EVERY wake (WNOWAIT — non-reaping and
+        # cheap), not on a time schedule. The schedule (one probe per
+        # _DRAIN_IDLE_POLL_S) had two starvation shapes: a
+        # continuously-readable pipe starves the idle branch (the
+        # 14d5c87c lesson — with timeout=None the idle probe was the
+        # ONLY exit condition, so a chattering grandchild hung the
+        # run forever after the target exited), and a caller deadline
+        # SHORTER than the poll interval expired before the first
+        # scheduled probe ever ran — the drain broke with the
+        # target's exit unknown and a target that exited 0
+        # immediately was reported as TimeoutExpired (its stdio held
+        # open by a backgrounded grandchild). Probing per wake keeps
+        # exit detection ahead of both the deadline and the chatter.
+        if not target_exited and _probe_target_exited():
+            target_exited = True
         # Enforce the caller's deadline on EVERY iteration, not only when
         # select() returns idle: a hostile target that keeps a pipe
         # continuously readable makes select() return non-empty each tick,
@@ -313,15 +357,6 @@ def _drain_pipes_until_eof(
             and time.monotonic() >= deadline
         ):
             break
-        # Liveness probe on a TIME schedule (same 14d5c87c lesson as the
-        # deadline above): a continuously-readable pipe starves the idle
-        # branch, and with timeout=None the probe there was the ONLY
-        # exit condition — a chattering grandchild made the drain (and
-        # the run) hang forever after the target exited.
-        if not target_exited and time.monotonic() >= next_exit_probe:
-            next_exit_probe = time.monotonic() + _DRAIN_IDLE_POLL_S
-            if _probe_target_exited():
-                target_exited = True
         if target_exited and sweep_deadline is None:
             # Bounded final sweep: consume what the pipes still hold,
             # but a grandchild that KEEPS writing must not extend the
@@ -340,18 +375,22 @@ def _drain_pipes_until_eof(
             # the pipes, but don't block for more.
             wait = 0.0
         else:
-            wait = min(_DRAIN_IDLE_POLL_S,
-                       max(0.0, next_exit_probe - time.monotonic()))
+            wait = _DRAIN_IDLE_POLL_S
             if deadline is not None:
                 wait = min(wait, max(0.0, deadline - time.monotonic()))
         ready, _, _ = select.select(list(fds_open), [], [], wait)
         if not ready:
             if target_exited:
                 break
+            if _probe_target_exited():
+                # Probe BEFORE the deadline check: a target that
+                # exited by the caller's deadline is an exit (drain
+                # what's buffered, report its real status), not a
+                # timeout.
+                target_exited = True
+                continue
             if deadline is not None and time.monotonic() >= deadline:
                 break
-            if _probe_target_exited():
-                target_exited = True
             continue
         for fd in ready:
             try:
@@ -400,8 +439,9 @@ def run_landlock_audit(
     capture_output: bool = True,
     text: bool = True,
     stdin=None,
+    stdout=None,
+    stderr=None,
     start_new_session: bool = True,
-    install_death_fd: bool = False,
 ) -> subprocess.CompletedProcess:
     """Spawn ``cmd`` under Landlock + seccomp + ptrace tracer, no
     namespaces.
@@ -416,20 +456,10 @@ def run_landlock_audit(
     the target's first traced syscall would fire SCMP_ACT_TRACE
     with no tracer attached → kernel SIGSYS-kills the process.
 
-    ``install_death_fd=True`` plumbs the pid1-shim orphan-teardown
-    liveness pipe through this path, mirroring the non-audit
-    ``need_unshare`` branch in context.py: the READ end is inherited
-    by the target chain (advertised via ``_RAPTOR_DEATH_FD`` in the
-    child env; the fd is made inheritable so it survives the
-    unshare→prlimit→shim execs), while THIS process holds the sole
-    surviving WRITE end for the duration of the call. If the
-    orchestrator is hard-killed (SIGKILL/OOM) mid-run, the write end
-    closes, the shim reads EOF and exits, and the kernel cascade-
-    SIGKILLs the pid-ns — without it, a shim spawned via the audit
-    path outlived a dead orchestrator. Pass it only when ``cmd``
-    actually carries the shim (context.py gates on ``need_unshare``);
-    requires an explicit ``env=`` because the fd must be advertised
-    through the child environment.
+    Teardown containment on this lane is the tracer's
+    PTRACE_O_EXITKILL. (The former ``install_death_fd=`` plumbing —
+    the pid1-shim's orphan-teardown liveness pipe — was deleted with
+    the unshare-CLI lane; ``cmd`` is always the bare target now.)
 
     Returns a CompletedProcess shaped to match subprocess.run's
     return value.
@@ -440,15 +470,6 @@ def run_landlock_audit(
             "tracer has a place to write the JSONL"
         )
         raise ValueError(msg)
-    if install_death_fd and env is None:
-        msg = (
-            "run_landlock_audit(install_death_fd=True) requires env= "
-            "— the death fd is advertised via _RAPTOR_DEATH_FD in the "
-            "child env, and silently falling back to os.environ here "
-            "would hand the child an unsanitised environment."
-        )
-        raise ValueError(msg)
-
     # F11: create the evidence JSONL up-front in <run_dir>/.audit/
     # (O_EXCL, held fd, inode recorded — see core/sandbox/evidence.py).
     # The tracer inherits the fd and appends through it.
@@ -485,59 +506,66 @@ def run_landlock_audit(
     # opened above — the covering try below has not been entered yet.
     p_go_r = p_go_w = t_ready_r = t_ready_w = -1
     out_r = out_w = err_r = err_w = -1
-    death_r = death_w = -1
     try:
         p_go_r, p_go_w = os.pipe()
         t_ready_r, t_ready_w = os.pipe()
         # The tracer subprocess inherits t_ready_w via execvpe →
         # mark inheritable (PEP 446 sets O_CLOEXEC by default).
         os.set_inheritable(t_ready_w, True)
-        # Orphan-teardown liveness pipe (see docstring). Read end is
-        # inheritable so it survives the target chain's execs; the
-        # write end stays non-inheritable — it closes at the tracer's
-        # exec and at the target's exec, leaving THIS process as the
-        # sole holder, which is exactly the one-bit "parent still
-        # alive" signal the shim watches.
-        if install_death_fd:
-            death_r, death_w = os.pipe()
-            os.set_inheritable(death_r, True)
-            env = {**env, "_RAPTOR_DEATH_FD": str(death_r)}
         # Capture pipes (only when capture_output=True).
         if capture_output:
             out_r, out_w = os.pipe()
             err_r, err_w = os.pipe()
     except BaseException:
         for fd in (p_go_r, p_go_w, t_ready_r, t_ready_w,
-                   out_r, out_w, err_r, err_w,
-                   death_r, death_w):
+                   out_r, out_w, err_r, err_w):
             _close_safely(fd)
         _close_safely(config_fd)
         evidence_file.close(verify=False)
         raise
+
+    # env=None → scrubbed allowlist env, NOT the full host
+    # environment (same contract as _spawn.run_sandboxed): the public
+    # context.run() path always supplies an env, so this default only
+    # serves direct callers — and an audited target must not inherit
+    # ambient secrets (session credentials, cloud keys) because a
+    # caller skipped the wrapper. This is the namespace-less lane,
+    # where /proc-based exfil defences are weakest. env={} still
+    # means an empty env. Resolved parent-side so the forked child
+    # performs no post-fork imports.
+    if env is None:
+        from core.config import RaptorConfig
+        env = RaptorConfig.get_safe_env()
+
+    # libc handle resolved PRE-FORK for the target child's
+    # PR_SET_PTRACER opt-in: find_library("c") can shell out to
+    # /sbin/ldconfig, and spawning a subprocess from the forked child
+    # of this multi-threaded parent is the banned fork-storm pattern
+    # (same parent-side capture as _spawn._parent_libc). None → the
+    # child degrades best-effort silent, exactly as the load-failure
+    # branch always did.
+    _parent_libc: ctypes.CDLL | None = None
+    with contextlib.suppress(OSError, AttributeError):
+        _parent_libc = ctypes.CDLL(
+            ctypes.util.find_library("c") or "libc.so.6",
+            use_errno=True,
+        )
 
     target_pid = -1
     tracer_pid = -1
     def _cleanup_fds() -> None:
         nonlocal p_go_r, p_go_w, t_ready_r, t_ready_w
         nonlocal out_r, out_w, err_r, err_w
-        nonlocal death_r, death_w
         for fd in (p_go_r, p_go_w, t_ready_r, t_ready_w,
-                   out_r, out_w, err_r, err_w,
-                   death_r, death_w):
+                   out_r, out_w, err_r, err_w):
             _close_safely(fd)
         p_go_r = p_go_w = t_ready_r = t_ready_w = -1
         out_r = out_w = err_r = err_w = -1
-        death_r = death_w = -1
 
     try:
         # ----- Fork the target -----
-        import warnings
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore", category=DeprecationWarning,
-                message=r".*fork.*may lead to deadlocks.*",
-            )
-            target_pid = os.fork()
+        # (fork-warning suppression is the module-level filter above)
+        target_pid = os.fork()
 
         if target_pid == 0:
             # ============== TARGET CHILD ==============
@@ -546,61 +574,109 @@ def run_landlock_audit(
             _close_safely(p_go_w)
             _close_safely(t_ready_r)
             _close_safely(t_ready_w)
-            if capture_output:
-                _close_safely(out_r)
-                _close_safely(err_r)
-                try:
-                    os.dup2(out_w, 1)
-                    os.dup2(err_w, 2)
-                finally:
-                    _close_safely(out_w)
-                    _close_safely(err_w)
-            # stdin: caller-supplied or /dev/null. Same shape as
-            # _spawn for parity (no PIPE on this path; that's a
-            # caller-side construct that wouldn't survive exec).
-            _use_devnull = (
-                stdin is None or stdin in (subprocess.DEVNULL, subprocess.PIPE)
-            )
-            if _use_devnull:
-                try:
-                    devnull = os.open("/dev/null", os.O_RDONLY)
-                    os.dup2(devnull, 0)
-                    os.close(devnull)
-                except OSError:
-                    pass
-            else:
-                try:
-                    stdin_fd = (stdin if isinstance(stdin, int)
-                                else stdin.fileno())
-                    os.dup2(stdin_fd, 0)
-                    if stdin_fd != 0:
-                        _close_safely(stdin_fd)
-                except (AttributeError, OSError):
+            # The guard starts HERE, before the stdio plumbing: a
+            # dup2/fileno failure (e.g. a caller-supplied stdin
+            # object whose fileno() raises ValueError — the closed-
+            # file shape; the inner handler catches only
+            # AttributeError/OSError) would otherwise unwind the
+            # FORKED child through this function's finally (running
+            # _cleanup_fds + evidence close in BOTH processes) and
+            # on into the caller's stack — the classic forked-
+            # child-runs-parent-code double execution _spawn's
+            # child guard already refuses.
+            try:
+                if capture_output:
+                    _close_safely(out_r)
+                    _close_safely(err_r)
+                    try:
+                        os.dup2(out_w, 1)
+                        os.dup2(err_w, 2)
+                    finally:
+                        _close_safely(out_w)
+                        _close_safely(err_w)
+                else:
+                    # stdout=/stderr= redirects (int fd, file-like,
+                    # DEVNULL, STDOUT for stderr). Same shape as
+                    # _spawn's mount-ns child: pre-fix these kwargs
+                    # were silently DROPPED on this lane — the child
+                    # inherited the parent's fd 1/2 regardless, which
+                    # also defeated run_untrusted's write-only tty
+                    # reopen (the child kept the O_RDWR pty slave and
+                    # could read() the operator's keystrokes through
+                    # its own stdout). PIPE is unsupported here, same
+                    # as stdin: fail closed to /dev/null with a
+                    # stderr note.
+                    for _redir, _fdnum, _label in ((stdout, 1,
+                                                    b"stdout"),
+                                                   (stderr, 2,
+                                                    b"stderr")):
+                        if _redir is None:
+                            continue
+                        if _redir == subprocess.PIPE:
+                            with contextlib.suppress(OSError):
+                                os.write(2, b"sandbox: %s=subprocess."
+                                            b"PIPE not supported via "
+                                            b"the Landlock-audit path;"
+                                            b" falling back to "
+                                            b"/dev/null.\n" % _label)
+                            _redir = subprocess.DEVNULL
+                        if _redir == subprocess.DEVNULL:
+                            _dn = os.open("/dev/null", os.O_WRONLY)
+                            os.dup2(_dn, _fdnum)
+                            os.close(_dn)
+                            continue
+                        if _fdnum == 2 and _redir == subprocess.STDOUT:
+                            os.dup2(1, 2)
+                            continue
+                        _rfd = (_redir if isinstance(_redir, int)
+                                else _redir.fileno())
+                        if _rfd != _fdnum:
+                            os.dup2(_rfd, _fdnum)
+                # stdin: caller-supplied or /dev/null. Same shape as
+                # _spawn for parity (no PIPE on this path; that's a
+                # caller-side construct that wouldn't survive exec).
+                _use_devnull = (
+                    stdin is None or stdin in (subprocess.DEVNULL, subprocess.PIPE)
+                )
+                if _use_devnull:
                     try:
                         devnull = os.open("/dev/null", os.O_RDONLY)
                         os.dup2(devnull, 0)
                         os.close(devnull)
                     except OSError:
                         pass
+                else:
+                    try:
+                        stdin_fd = (stdin if isinstance(stdin, int)
+                                    else stdin.fileno())
+                        os.dup2(stdin_fd, 0)
+                        if stdin_fd != 0:
+                            _close_safely(stdin_fd)
+                    except (AttributeError, OSError):
+                        try:
+                            devnull = os.open("/dev/null", os.O_RDONLY)
+                            os.dup2(devnull, 0)
+                            os.close(devnull)
+                        except OSError:
+                            pass
 
-            if start_new_session:
-                try:
-                    os.setsid()
-                except OSError:
-                    pass
+                if start_new_session:
+                    try:
+                        os.setsid()
+                    except OSError:
+                        pass
 
-            # cwd
-            if cwd is not None:
-                try:
-                    os.chdir(cwd)
-                except OSError:
-                    os._exit(126)
+                # cwd
+                if cwd is not None:
+                    try:
+                        os.chdir(cwd)
+                    except OSError:
+                        os._exit(126)
 
-            # rlimits + ptracer-any
-            try:
+                # rlimits + ptracer-any
                 if rlimit_preexec is not None:
                     rlimit_preexec()
-                _set_ptracer_any_in_child()
+                _set_ptracer_any_in_child(_parent_libc)
 
                 # Block until parent says tracer is attached.
                 byte = os.read(p_go_r, 1)
@@ -608,28 +684,35 @@ def run_landlock_audit(
                 if byte != b"G":
                     os._exit(125)
 
-                # Full fd-range sweep before handing control to the
-                # UNTRUSTED target — parity with the tracer child's
-                # sweep above. PEP 446 makes Python-opened fds CLOEXEC
-                # by default, but fds inherited from C extensions or
-                # opened with closefd tricks are not guaranteed;
-                # relying on CLOEXEC alone leaves the target a window
-                # onto whatever the parent had open. Nothing needs to
-                # survive this exec except stdio.
-                import resource as _resource
-                _soft, _ = _resource.getrlimit(_resource.RLIMIT_NOFILE)
-                _sweep_cap = min(_soft, 65536)
-                if death_r >= 3:
-                    # The orphan-teardown liveness read end must
-                    # survive into the target chain (it is advertised
-                    # via _RAPTOR_DEATH_FD and watched by the pid1
-                    # shim) — split the sweep around it, the same
-                    # shape as the spawn grandchild's closerange
-                    # split around status_w.
-                    os.closerange(3, death_r)
-                    os.closerange(death_r + 1, _sweep_cap)
-                else:
-                    os.closerange(3, _sweep_cap)
+                # Full fd sweep before handing control to the
+                # UNTRUSTED target. PEP 446 makes Python-opened fds
+                # CLOEXEC by default, but fds inherited from C
+                # extensions or opened with closefd tricks are not
+                # guaranteed; relying on CLOEXEC alone leaves the
+                # target a window onto whatever the parent had open.
+                # Nothing needs to survive this exec except stdio.
+                # Enumerate the ACTUALLY-open fds instead of sweeping
+                # a range bounded by RLIMIT_NOFILE: rlimit_preexec
+                # above already LOWERED that limit, and lowering
+                # NOFILE does not invalidate existing descriptors — a
+                # non-CLOEXEC fd numbered at/above the reduced soft
+                # limit survived the old range-based sweep and rode
+                # the exec into the target as an out-of-policy
+                # capability (same shape _spawn's grandchild sweep
+                # closes). Fall back to the bounded range only when
+                # /proc isn't listable.
+                _soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+                try:
+                    _open_fds = [int(_n)
+                                 for _n in os.listdir("/proc/self/fd")]
+                except (OSError, ValueError):
+                    _open_fds = list(range(3, min(_soft, 65536)))
+                for _fd in _open_fds:
+                    if _fd > 2:
+                        try:
+                            os.close(_fd)
+                        except OSError:
+                            pass
 
                 # Apply Landlock then seccomp(audit). Ordering:
                 # Landlock first (filesystem isolation in place),
@@ -640,18 +723,16 @@ def run_landlock_audit(
                 if seccomp_preexec is not None:
                     seccomp_preexec()
 
-                # Exec target. env=None → inherit parent's; env={} →
-                # empty env. subprocess.run uses None-sentinel for
-                # inherit; we honour the same.
-                if env is None:
-                    os.execvp(cmd[0], list(cmd))
-                else:
-                    os.execvpe(cmd[0], list(cmd), env)
+                # Exec target. env was resolved parent-side: the
+                # caller's dict verbatim (including {} = empty env),
+                # or the scrubbed allowlist when the caller passed
+                # None — never the full parent environment.
+                os.execvpe(cmd[0], list(cmd), env)
             except FileNotFoundError:
                 os._exit(127)
             except PermissionError:
                 os._exit(126)
-            except Exception:  # noqa: BLE001 — post-fork guard; any failure must become an exit code, never a traceback in the child
+            except BaseException:  # noqa: BLE001 — post-fork guard; any failure must become an exit code, never a traceback in the child (BaseException: even SystemExit must not unwind the fork)
                 os._exit(125)
 
         # ============== PARENT after target fork ==============
@@ -659,12 +740,6 @@ def run_landlock_audit(
         # the target owns them now.
         _close_safely(p_go_r)
         p_go_r = -1
-        # Same for the death pipe's read end: the target chain holds
-        # its inheritable copy; only the write end stays here (held
-        # until the finally so a hard-killed parent closes it and the
-        # shim's EOF fires).
-        _close_safely(death_r)
-        death_r = -1
         if capture_output:
             _close_safely(out_w)
             out_w = -1
@@ -672,19 +747,36 @@ def run_landlock_audit(
             err_w = -1
 
         # ----- Fork the tracer -----
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore", category=DeprecationWarning,
-                message=r".*fork.*may lead to deadlocks.*",
+        # Resolve the tracer's import root PRE-FORK, in the parent,
+        # where logging works. PYTHONPATH-to-child is sys.path-
+        # equivalent injection, so the path-safety doctrine applies:
+        # RAPTOR_DIR is authoritative. The Path(__file__) fallback is
+        # a BLESSED doctrine exception, decided here rather than left
+        # implicit: this lane must stay usable as a library (bare
+        # callers without the launcher), and converting a missing env
+        # var into a hard KeyError would kill runs the fallback
+        # serves correctly on single-checkout hosts — but on a
+        # multi-checkout host it silently steers the tracer to
+        # whichever tree this module file sits in, so the ambiguity
+        # is surfaced loudly instead of guessed silently.
+        tracer_raptor_dir = os.environ.get("RAPTOR_DIR")
+        if tracer_raptor_dir is None:
+            tracer_raptor_dir = str(
+                Path(__file__).resolve().parent.parent.parent
             )
-            tracer_pid = os.fork()
+            logger.warning(
+                "landlock-audit: RAPTOR_DIR unset — tracer will "
+                "import from the tree containing this module (%s); "
+                "on multi-checkout hosts export RAPTOR_DIR to pin "
+                "the intended tree", tracer_raptor_dir,
+            )
+        tracer_pid = os.fork()
 
         if tracer_pid == 0:
             # ============== TRACER CHILD ==============
             # Close every inherited fd except stdio + t_ready_w.
             try:
-                import resource as _resource
-                soft, _hard = _resource.getrlimit(_resource.RLIMIT_NOFILE)
+                soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
                 upper = min(soft, 65536)
                 # Keep the sync write end, the anonymous config fd,
                 # and the held evidence fd; closerange over the gaps.
@@ -704,13 +796,10 @@ def run_landlock_audit(
                 if config_fd >= 0:
                     os.set_inheritable(config_fd, True)
                 os.set_inheritable(evidence_file.fd, True)
-                raptor_dir = os.environ.get("RAPTOR_DIR")
-                if raptor_dir is None:
-                    raptor_dir = str(
-                        Path(__file__).resolve().parent.parent.parent
-                    )
+                # Resolved pre-fork in the parent (see the comment at
+                # the fork site) — the child only closes over it.
                 tracer_env = {
-                    "PYTHONPATH": raptor_dir,
+                    "PYTHONPATH": tracer_raptor_dir,
                     "PATH": "/usr/bin:/bin",
                 }
                 tracer_argv = [
@@ -727,7 +816,7 @@ def run_landlock_audit(
                 os._exit(127)
             except PermissionError:
                 os._exit(126)
-            except Exception:  # noqa: BLE001 — post-fork guard; any failure must become an exit code, never a traceback in the child
+            except BaseException:  # noqa: BLE001 — post-fork guard; any failure must become an exit code, never a traceback in the child (BaseException: even SystemExit must not unwind the fork)
                 os._exit(125)
 
         # ============== PARENT after tracer fork ==============
@@ -745,16 +834,30 @@ def run_landlock_audit(
 
         # Wait for tracer to signal ready (or die).
         ready = b""
+        ready_timed_out = False
         try:
             rlist, _, _ = select.select([t_ready_r], [], [], _TRACER_READY_TIMEOUT_S)
             if rlist:
                 ready = os.read(t_ready_r, 1)
+            else:
+                ready_timed_out = True
         finally:
             _close_safely(t_ready_r)
             t_ready_r = -1
         if not ready:
             # Tracer failed before signalling. Reap it for diag,
-            # kill the still-blocked target, raise.
+            # kill the still-blocked target, raise. On the deadline
+            # path the tracer may still be ALIVE but wedged (import
+            # stall, PTRACE_SEIZE hang, SIGSTOP) — kill it FIRST so
+            # the diagnostic waitpid cannot block forever (mirrors
+            # _spawn's kill-first twin; pre-fix one wedged tracer
+            # parked this parent in an unbounded blocking waitpid,
+            # with the target child parked on its go-pipe for the
+            # same duration and the caller's timeout= never engaged
+            # — the deadline is computed after this handshake).
+            if ready_timed_out:
+                with contextlib.suppress(ProcessLookupError, OSError):
+                    os.kill(tracer_pid, 9)
             tracer_status = None
             try:
                 _, tracer_status = os.waitpid(tracer_pid, 0)
@@ -775,10 +878,23 @@ def run_landlock_audit(
                     f" (tracer exit code "
                     f"{os.WEXITSTATUS(tracer_status)})"
                 )
+            if ready_timed_out:
+                # We SIGKILLed it ourselves above; a signal/exit-code
+                # diagnostic would misattribute that.
+                cause = (
+                    f"tracer did not signal ready within the "
+                    f"{_TRACER_READY_TIMEOUT_S:g}s deadline (wedged "
+                    f"during attach or a badly stalled host) — killed"
+                )
+                rc_hint = ""
+            else:
+                cause = (
+                    "likely PTRACE_SEIZE rejected (Yama scope, "
+                    "container cap-drop, AppArmor)"
+                )
             msg = (
                 f"audit-mode tracer failed to attach to sandboxed "
-                f"child{rc_hint} — likely PTRACE_SEIZE rejected "
-                f"(Yama scope, container cap-drop, AppArmor)"
+                f"child{rc_hint} — {cause}"
             )
             raise RuntimeError(msg)
 
@@ -808,10 +924,17 @@ def run_landlock_audit(
             _close_safely(err_r)
             err_r = -1
 
-        # waitpid the target.
+        # waitpid the target. The reap attempt comes FIRST on every
+        # iteration — deadline expiry is only checked after a WNOHANG
+        # found the target still running, so a target that already
+        # exited is NEVER reported as a timeout even when the drain
+        # above consumed the whole budget (grandchild-held stdio kept
+        # the pipes open past the deadline while the target itself
+        # exited 0 long before). Mirrors _spawn's exited-target
+        # exemption ("never call an exited-0 target a timeout").
         target_rc = -1
         if deadline is not None:
-            while time.monotonic() < deadline:
+            while True:
                 try:
                     done, status = os.waitpid(target_pid, os.WNOHANG)
                 except (ChildProcessError, OSError):
@@ -825,24 +948,25 @@ def run_landlock_audit(
                         target_rc = -os.WTERMSIG(status)
                     target_pid = -1
                     break
+                if time.monotonic() >= deadline:
+                    # Genuinely still running past the deadline —
+                    # kill, then re-wait, then raise.
+                    _kill_and_reap(target_pid)
+                    target_pid = -1
+                    # Tracer is PTRACE_O_EXITKILL'd — should die soon.
+                    if tracer_pid > 0:
+                        _kill_and_reap(tracer_pid)
+                        tracer_pid = -1
+                    raise subprocess.TimeoutExpired(
+                        cmd=list(cmd), timeout=timeout,  # type: ignore[arg-type]
+                        output=stdout_bytes if text is False else (
+                            stdout_bytes.decode(errors="replace")
+                        ),
+                        stderr=stderr_bytes if text is False else (
+                            stderr_bytes.decode(errors="replace")
+                        ),
+                    )
                 time.sleep(0.02)
-            else:
-                # Timed out — kill, then re-wait, then raise.
-                _kill_and_reap(target_pid)
-                target_pid = -1
-                # Tracer is PTRACE_O_EXITKILL'd — should die soon.
-                if tracer_pid > 0:
-                    _kill_and_reap(tracer_pid)
-                    tracer_pid = -1
-                raise subprocess.TimeoutExpired(
-                    cmd=list(cmd), timeout=timeout,
-                    output=stdout_bytes if text is False else (
-                        stdout_bytes.decode(errors="replace")
-                    ),
-                    stderr=stderr_bytes if text is False else (
-                        stderr_bytes.decode(errors="replace")
-                    ),
-                )
         else:
             try:
                 _, status = os.waitpid(target_pid, 0)
@@ -884,8 +1008,8 @@ def run_landlock_audit(
             stdout_out = stdout_bytes.decode(errors="replace")
             stderr_out = stderr_bytes.decode(errors="replace")
         else:
-            stdout_out = stdout_bytes
-            stderr_out = stderr_bytes
+            stdout_out = stdout_bytes  # type: ignore[assignment]
+            stderr_out = stderr_bytes  # type: ignore[assignment]
 
         # Finalise the evidence file now that both children are
         # reaped: verify the on-disk path still names the inode
@@ -903,7 +1027,7 @@ def run_landlock_audit(
             stdout=stdout_out if capture_output else None,
             stderr=stderr_out if capture_output else None,
         )
-        result.evidence_verified = evidence_ok
+        result.evidence_verified = evidence_ok  # type: ignore[attr-defined]
         return result
     finally:
         _cleanup_fds()

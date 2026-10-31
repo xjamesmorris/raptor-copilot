@@ -11,6 +11,7 @@ Usage:
       --lines <start>-<end> --cwe <id> --reasoning <text> \
       --repo <repo_root> [--out <dir>] [--no-refine] [--json]
 """
+import json
 import sys
 from pathlib import Path
 
@@ -30,7 +31,30 @@ if not (os.environ.get("CLAUDECODE")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import core.startup.process_init  # noqa: E402,F401
-from core.json import dumps_display  # noqa: E402
+from core.logging import configure_cli_logging  # noqa: E402
+from core.security.log_sanitisation import sanitise_for_terminal as _sft  # noqa: E402
+from core.source.lines import split_lines
+
+
+def _resolve_out_dir(out_arg: str | None,
+                     raptor_dir: Path) -> Path | None:
+    """Output dir for synthesis artifacts.
+
+    RAPTOR-side default, never inside the target repo: a hostile repo
+    could pre-plant `out` as a symlink and steer the artifact writes
+    anywhere, and run output must not pollute the scanned tree
+    (run-lifecycle output doctrine). A symlinked default refuses
+    (returns None after printing the error); an explicit --out is the
+    operator's assertion and passes through.
+    """
+    if out_arg:
+        return Path(out_arg)
+    out_dir = raptor_dir / "out" / "checker-synthesis"
+    if out_dir.is_symlink() or out_dir.parent.is_symlink():
+        print(f"error: default output dir {out_dir} is a symlink; "
+              "refusing (pass --out explicitly)", file=sys.stderr)
+        return None
+    return out_dir
 
 
 def main() -> int:
@@ -55,7 +79,8 @@ def main() -> int:
     parser.add_argument("--repo", required=True,
                         help="Root of the target repository")
     parser.add_argument("--out", default=None,
-                        help="Output directory (default: <repo>/out/checker-synthesis)")
+                        help="Output directory (default: "
+                             "<raptor>/out/checker-synthesis)")
     parser.add_argument("--no-refine", action="store_true",
                         help="Single-shot synthesis (skip iterative FP elimination)")
     parser.add_argument("--max-iterations", type=int, default=5,
@@ -68,15 +93,13 @@ def main() -> int:
                         help="Enable debug logging")
     args = parser.parse_args()
 
-    if args.verbose:
-        logging.basicConfig(level=logging.DEBUG)
-    else:
-        logging.basicConfig(level=logging.INFO)
+    # Escaping console formatter — see core.logging.configure_cli_logging.
+    configure_cli_logging(logging.DEBUG if args.verbose else logging.INFO)
 
     parts = args.lines.split("-")
     if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
-        print(f"error: --lines must be <start>-<end>, got '{args.lines}'",
-              file=sys.stderr)
+        print(f"error: --lines must be <start>-<end>, got "
+              f"'{_sft(args.lines, max_len=64)}'", file=sys.stderr)
         return 1
     line_start, line_end = int(parts[0]), int(parts[1])
 
@@ -85,13 +108,19 @@ def main() -> int:
         print(f"error: repo not found: {repo_root}", file=sys.stderr)
         return 1
 
-    out_dir = Path(args.out) if args.out else repo_root / "out" / "checker-synthesis"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
+    # Validate BEFORE creating any output directory — nothing should
+    # touch the filesystem for an invocation that is about to refuse.
     if ".." in args.file.split("/") or os.path.isabs(args.file):
         print(f"error: --file must be a repo-relative path without '..' "
-              f"segments, got '{args.file}'", file=sys.stderr)
+              f"segments, got '{_sft(args.file, max_len=200)}'",
+              file=sys.stderr)
         return 1
+
+    out_dir = _resolve_out_dir(args.out,
+                               Path(__file__).resolve().parents[1])
+    if out_dir is None:
+        return 1
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     snippet = args.snippet
     if not snippet:
@@ -100,13 +129,13 @@ def main() -> int:
             if src_file.is_file():
                 text = src_file.read_text(
                     encoding="utf-8", errors="replace")
-                lines = text.splitlines()
+                lines = split_lines(text)
                 snippet = "\n".join(
                     lines[max(0, line_start - 1):line_end]
                 )
         except OSError as exc:
-            print(f"warning: cannot read {src_file}: {exc}",
-                  file=sys.stderr)
+            print(f"warning: cannot read {src_file}: "
+                  f"{_sft(str(exc), max_len=200)}", file=sys.stderr)
 
     from packages.checker_synthesis import SeedBug
     seed = SeedBug(
@@ -124,22 +153,19 @@ def main() -> int:
     client = LLMClient()
 
     # Self-serve the in-process LLM dispatcher for dispatcher-only
-    # providers (Bedrock) — same gate as raptor-compile-invariants /
-    # raptor-study-run / raptor-llm-ask. Without a route every LLM
-    # call fails, and llm_callable's broad except would silently turn
-    # that transport misconfiguration into "no rule passed positive
-    # control". No-op when a route exists or none is needed.
+    # providers (Bedrock) — the shared gate never raises. Without a
+    # route every LLM call fails, and llm_callable's broad except
+    # would silently turn that transport misconfiguration into "no
+    # rule passed positive control". No-op when a route exists or
+    # none is needed. run_dir places the dispatcher's L5 audit JSONL
+    # in this run's output directory instead of the in-memory default.
     try:
-        from core.llm.dispatcher.lifecycle import (
-            ensure_route_for_model_configs,
-        )
-        configs = [getattr(client.config, "primary_model", None)]
-        configs += list(getattr(client.config, "fallback_models", []) or [])
-        ensure_route_for_model_configs(
-            configs, label="raptor-synthesise-checker",
-        )
-    except Exception:  # noqa: BLE001 — provider errors surface at call time
+        from core.llm.dispatcher.lifecycle import ensure_route_for_client
+    except ImportError:  # no dispatcher machinery, no route to serve
         pass
+    else:
+        ensure_route_for_client(
+            client, "raptor-synthesise-checker", run_dir=out_dir)
 
     def llm_callable(prompt, schema, system_prompt):
         try:
@@ -156,8 +182,11 @@ def main() -> int:
             )
             return None
 
-    print(f"Seed: {seed.file}:{seed.line_start}-{seed.line_end} "
-          f"({seed.function})", file=sys.stderr)
+    # Seed names are target-derived; rule ids/rationale and triage
+    # statuses below are LLM-authored; snippets are target source;
+    # error strings quote engine stderr. Escape each foreign field.
+    print(f"Seed: {_sft(seed.file, max_len=200)}:{seed.line_start}-{seed.line_end} "
+          f"({_sft(seed.function, max_len=120)})", file=sys.stderr)
     print("Engine: auto-detect from file extension", file=sys.stderr)
     print(f"Mode: {'single-shot' if args.no_refine else f'refinement (up to {args.max_iterations} iterations)'}",
           file=sys.stderr)
@@ -181,22 +210,27 @@ def main() -> int:
         )
 
     if args.json_output:
-        print(dumps_display(result.to_dict(), indent=2))
+        # ensure_ascii: JSON escapes C0 but passes C1 terminal
+        # controls raw when off — dumps_display is exactly that, and
+        # the result embeds LLM-authored rule text. Still valid JSON.
+        print(json.dumps(result.to_dict(), indent=2,
+                         ensure_ascii=True, default=str))
         return 0
 
     if result.rule is None:
         print("Synthesis failed: no rule passed positive control.")
         if result.errors:
             for e in result.errors:
-                print(f"  {e}")
+                print(f"  {_sft(str(e))}")
         return 1
 
-    print(f"Rule: {result.rule.rule_id} ({result.rule.engine})")
+    print(f"Rule: {_sft(result.rule.rule_id, max_len=120)} "
+          f"({_sft(result.rule.engine, max_len=32)})")
     print(f"Positive control: {'pass' if result.positive_control else 'FAIL'}")
     if result.rule_path:
         print(f"Rule file: {result.rule_path}")
     if result.rule.rationale:
-        print(f"Rationale: {result.rule.rationale}")
+        print(f"Rationale: {_sft(result.rule.rationale)}")
     print()
 
     if not result.matches:
@@ -209,18 +243,18 @@ def main() -> int:
             if result.triage:
                 for t in result.triage:
                     if t.match.file == m.file and t.match.line == m.line:
-                        triage_str = f" [{t.status}]"
+                        triage_str = f" [{_sft(str(t.status), max_len=32)}]"
                         break
-            print(f"  {m.file}:{m.line}{triage_str}")
+            print(f"  {_sft(m.file, max_len=200)}:{m.line}{triage_str}")
             if m.snippet:
                 for sl in m.snippet.splitlines()[:3]:
-                    print(f"    {sl}")
+                    print(f"    {_sft(sl, max_len=200)}")
 
     if result.errors:
         print()
         print("Notes:")
         for e in result.errors:
-            print(f"  {e}")
+            print(f"  {_sft(str(e))}")
 
     return 0
 

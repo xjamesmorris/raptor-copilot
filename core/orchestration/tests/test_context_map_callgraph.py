@@ -6,6 +6,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from core.orchestration.context_map_callgraph import (
     enrich_with_call_edges,
     enrich_with_forward_reachable,
@@ -283,3 +285,179 @@ def test_call_edges_no_checklist():
     n = enrich_with_call_edges(cmap)
     assert n == 0
     assert "call_edges" not in cmap
+
+
+class TestCallEdgeCap:
+    """Emission is bounded and truncation is marked on the map, so
+    negative reachability consumers can degrade instead of reading a
+    capped list as unreachability."""
+
+    @staticmethod
+    def _big_checklist(n_calls: int) -> dict:
+        return {"files": [{
+            "path": "src/a.c",
+            "items": [{"name": "f0"}],
+            "call_graph": {"calls": [
+                {"caller": f"f{i}", "chain": [f"g{i}", f"h{i}"]}
+                for i in range(n_calls)
+            ]},
+        }]}
+
+    def test_cap_truncates_and_marks(self, monkeypatch):
+        from core.orchestration import context_map_callgraph as cmc
+        monkeypatch.setattr(cmc, "_MAX_CALL_EDGES", 10)
+        cm: dict = {}
+        n = cmc.enrich_with_call_edges(
+            cm, checklist=self._big_checklist(20))
+        assert n == 10
+        assert len(cm["call_edges"]) == 10
+        assert cm["call_edges_truncated"] is True
+
+    def test_under_cap_unmarked_and_rebuild_clears_stale_marker(self):
+        from core.orchestration import context_map_callgraph as cmc
+        cm: dict = {"call_edges_truncated": True}
+        n = cmc.enrich_with_call_edges(
+            cm, checklist=self._big_checklist(3))
+        assert n == 6
+        assert "call_edges_truncated" not in cm
+
+    def test_rebuild_clears_stale_shed_marker(self):
+        # A map whose call_edges were shed by the size budget carries
+        # `[]` + `call_edges_shed`; a rebuild replaces the payload, so
+        # the shed marker must not outlive it (mirror of the
+        # truncated-flag clear above).
+        from core.orchestration import context_map_callgraph as cmc
+        cm: dict = {
+            "call_edges": [],
+            "call_edges_shed": "shed by the context-map size budget",
+        }
+        n = cmc.enrich_with_call_edges(
+            cm, checklist=self._big_checklist(3))
+        assert n == 6
+        assert "call_edges_shed" not in cm
+
+
+class TestStoreRouting:
+    """Project-mode routing: the full mechanical edge set lands in the
+    graph store while the map keeps the capped in-artifact list (the
+    storeless compatibility path) plus a small ``call_edges_store``
+    marker store-capable consumers resolve."""
+
+    @pytest.fixture(autouse=True)
+    def _hermetic_ambient_state(self, tmp_path, monkeypatch):
+        # The store's MAC key lives under the real XDG data dir; pin
+        # ambient state to the test's tmp dir.
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+
+    @staticmethod
+    def _checklist(n_calls: int) -> dict:
+        return {"files": [{
+            "path": "src/a.c",
+            "items": [{"name": "f0"}],
+            "call_graph": {"calls": [
+                {"caller": f"f{i}", "chain": [f"g{i}", f"h{i}"]}
+                for i in range(n_calls)
+            ]},
+        }]}
+
+    def _route(self, tmp_path, monkeypatch, *, n_calls=10, cap=None):
+        from core.orchestration import context_map_callgraph as cmc
+        if cap is not None:
+            monkeypatch.setattr(cmc, "_MAX_CALL_EDGES", cap)
+        run_dir = tmp_path / "run"
+        run_dir.mkdir(exist_ok=True)
+        store = tmp_path / "project" / "graph" / "raptor.graph.sqlite"
+        cm: dict = {}
+        n = cmc.enrich_with_call_edges(
+            cm, checklist=self._checklist(n_calls),
+            graph_store=store, run_dir=run_dir, target_path="/target",
+        )
+        return cm, n, store
+
+    def test_full_set_routed_while_map_stays_capped(
+            self, tmp_path, monkeypatch):
+        from core.understand_graph.queries import (
+            verified_mechanical_call_edges,
+        )
+        cm, n, store = self._route(tmp_path, monkeypatch, n_calls=10, cap=4)
+        assert n == 4
+        assert len(cm["call_edges"]) == 4
+        assert cm["call_edges_truncated"] is True
+        marker = cm["call_edges_store"]
+        assert marker["edges"] == 20  # the UNCAPPED set
+        lane = verified_mechanical_call_edges(
+            store, marker["snapshot"], "/target")
+        assert lane is not None
+        assert lane["complete"] is True
+        assert len(lane["edges"]) == 20
+
+    def test_cap_warning_names_the_store(
+            self, tmp_path, monkeypatch, caplog):
+        import logging
+        with caplog.at_level(
+                logging.WARNING,
+                logger="core.orchestration.context_map_callgraph"):
+            self._route(tmp_path, monkeypatch, n_calls=10, cap=4)
+        assert any("graph store" in r.message for r in caplog.records)
+
+    def test_storeless_cap_warning_names_the_remedy(
+            self, monkeypatch, caplog):
+        import logging
+        from core.orchestration import context_map_callgraph as cmc
+        monkeypatch.setattr(cmc, "_MAX_CALL_EDGES", 4)
+        cm: dict = {}
+        with caplog.at_level(
+                logging.WARNING,
+                logger="core.orchestration.context_map_callgraph"):
+            cmc.enrich_with_call_edges(cm, checklist=self._checklist(10))
+        assert "call_edges_store" not in cm
+        assert any("graph store" in r.message for r in caplog.records)
+
+    def test_storeless_call_leaves_no_marker(self):
+        from core.orchestration import context_map_callgraph as cmc
+        cm: dict = {}
+        cmc.enrich_with_call_edges(cm, checklist=self._checklist(3))
+        assert "call_edges_store" not in cm
+
+    def test_rebuild_clears_stale_store_marker(self):
+        from core.orchestration import context_map_callgraph as cmc
+        cm: dict = {
+            "call_edges": [],
+            "call_edges_store": {"snapshot": "stale", "edges": 1},
+        }
+        cmc.enrich_with_call_edges(cm, checklist=self._checklist(3))
+        assert "call_edges_store" not in cm
+
+    def test_broken_store_degrades_to_artifact_path(
+            self, tmp_path, monkeypatch):
+        from core.orchestration import context_map_callgraph as cmc
+
+        def _boom(*_a, **_k):
+            raise RuntimeError("store down")
+
+        import core.understand_graph.ingest as ig
+        monkeypatch.setattr(ig, "ingest_call_edges", _boom)
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        cm: dict = {}
+        n = cmc.enrich_with_call_edges(
+            cm, checklist=self._checklist(3),
+            graph_store=tmp_path / "g.sqlite", run_dir=run_dir,
+            target_path="/target",
+        )
+        assert n == 6
+        assert len(cm["call_edges"]) == 6
+        assert "call_edges_store" not in cm
+
+    def test_partial_routing_args_skip_store(self, tmp_path):
+        """graph_store without run_dir/target: storeless behavior."""
+        from core.orchestration import context_map_callgraph as cmc
+        cm: dict = {}
+        n = cmc.enrich_with_call_edges(
+            cm, checklist=self._checklist(3),
+            graph_store=tmp_path / "g.sqlite",
+        )
+        assert n == 6
+        assert "call_edges_store" not in cm
+        assert not (tmp_path / "g.sqlite").exists()

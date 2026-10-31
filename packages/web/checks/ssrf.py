@@ -111,7 +111,15 @@ class SsrfParameterCheck(Check):
                 continue
             tested.add(param)
 
-            for payload in _SSRF_PAYLOADS[:2]:
+            # All payloads, deliberately: four of the six indicators
+            # (AMI id, instanceId, computeMetadata, local-ipv4) can only
+            # fire on cloud-metadata responses, so probing just the
+            # loopback payloads left the highest-impact SSRF variant
+            # undetectable here. Budget: 10 params x 4 payloads = 40
+            # requests. The payloads ride as parameter VALUES on
+            # requests to the in-scope target — the scanner itself never
+            # contacts these addresses.
+            for payload in _SSRF_PAYLOADS:
                 try:
                     resp = client.get(_url_with_param(source_url, param, payload))
                     body = resp.text if isinstance(resp.text, str) else ""

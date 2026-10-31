@@ -29,6 +29,14 @@ if [ -z "${CLAUDECODE:-}" ] && [ -z "${_RAPTOR_TRUSTED:-}" ]; then
 fi
 # ─── end trust-marker check ─────────────────────────────────
 
+if [[ -n "${RAPTOR_SESSION_SERVICE_POLICY:-}"
+        || "${RAPTOR_FRONTEND:-}" == "copilot"
+        || -n "${COPILOT_CLI:-}"
+        || -n "${COPILOT_AGENT_SESSION_ID:-}" ]]; then
+    echo "raptor-sage-mcp: Copilot session service policy blocks SAGE/Docker access; prior setup is not current authorization." >&2
+    exit 3
+fi
+
 # Resolve RAPTOR_DIR via symlink chain (same pattern as raptor-sage-setup).
 SCRIPT="$0"
 _symhops=0
@@ -38,12 +46,12 @@ while [ -L "$SCRIPT" ]; do
         echo "raptor-sage-mcp: symlink hop limit exceeded resolving $0" >&2
         exit 3
     fi
-    DIR="$(cd "$(dirname "$SCRIPT")" && pwd)"
+    DIR="$(CDPATH= cd -- "$(dirname "$SCRIPT")" && pwd)"
     SCRIPT="$(readlink "$SCRIPT")"
     [[ "$SCRIPT" != /* ]] && SCRIPT="$DIR/$SCRIPT"
 done
 unset _symhops
-RAPTOR_DIR="$(cd "$(dirname "$SCRIPT")/.." && pwd)"
+RAPTOR_DIR="$(CDPATH= cd -- "$(dirname "$SCRIPT")/.." && pwd)"
 
 # Users who access docker via group membership (sg docker) rather than
 # direct socket permissions need the sg wrapper. Re-exec under sg if
@@ -101,7 +109,13 @@ if [ -n "${RAPTOR_SAGE_BOOT_CAPTURE:-}" ]; then
     echo "raptor-sage-mcp: RAPTOR_SAGE_BOOT_CAPTURE is set but does not match a fresh capture nonce — ignoring the bypass; boot-payload enforcement stays on." >&2
 fi
 
-exec python3 "$RAPTOR_DIR/libexec/raptor-sage-mcp-guard" \
+# -I: the guard enforces the operator-authorized boot-payload stamp,
+# and a session environment's interpreter-startup hook (PYTHONPATH
+# sitecustomize, user-site .pth/usercustomize) could otherwise
+# monkeypatch its comparison before enforcement begins. Isolated mode
+# at the call site means the hook never loads at all; the guard's own
+# in-file re-exec covers routes that bypass this wrapper.
+exec python3 -I "$RAPTOR_DIR/libexec/raptor-sage-mcp-guard" \
     --authorized "$RAPTOR_DIR/.sage/boot-payload.authorized" \
     -- \
     "${CHILD[@]}"

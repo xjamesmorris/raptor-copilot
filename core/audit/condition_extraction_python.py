@@ -54,7 +54,7 @@ def _call_name(node: ast.Call) -> str:
         cur = func
         while isinstance(cur, ast.Attribute):
             parts.append(cur.attr)
-            cur = cur.value
+            cur = cur.value  # type: ignore[assignment]
         if isinstance(cur, ast.Name):
             parts.append(cur.id)
         parts.reverse()
@@ -200,7 +200,9 @@ def _if_polarity(if_node: ast.If, target_line: int) -> str:
             return "excluded"
 
     # Early-return guard pattern: if-body is just return/raise,
-    # target is after the if — condition is negated
+    # target is after the if — the NEGATED condition protects the
+    # taken path (distinct from "excluded": that shape's check
+    # protects a different path entirely).
     if if_node.body and all(
         isinstance(s, (ast.Return, ast.Raise, ast.Continue, ast.Break))
         for s in if_node.body
@@ -210,7 +212,7 @@ def _if_polarity(if_node: ast.If, target_line: int) -> str:
             for s in if_node.body
         )
         if target_line > if_end:
-            return "excluded"
+            return "negated_guard"
 
     return "required"
 
@@ -275,7 +277,7 @@ def _find_preceding_guard_clauses_ast(
         if len(results) >= max_depth:
             break
         # Only look at statements BEFORE the call
-        stmt_end = getattr(stmt, "end_lineno", None) or getattr(stmt, "lineno", 0)
+        stmt_end: int = getattr(stmt, "end_lineno", None) or getattr(stmt, "lineno", 0)  # type: ignore[assignment]
         if stmt_end >= call_line:
             break
         # Must be an If with exit-only body and no else
@@ -290,14 +292,15 @@ def _find_preceding_guard_clauses_ast(
             for s in stmt.body
         ):
             continue
-        # This is a guard clause — add with "excluded" polarity
+        # This is a guard clause — the NEGATED condition protects
+        # everything after it.
         cond_text = ast.unparse(stmt.test)
         category = classify_condition(cond_text)
         resolvable, concrete = _try_resolve_condition(cond_text, constants)
         results.append(GuardCondition(
             text=cond_text,
             category=category,
-            polarity="excluded",
+            polarity="negated_guard",
             line=stmt.lineno,
             resolvable=resolvable,
             concrete_values=concrete,
@@ -388,7 +391,7 @@ def extract_sink_guards_python(
                         text=dec,
                         category=category,
                         polarity="required",
-                        line=func_node.lineno,
+                        line=func_node.lineno,  # type: ignore[attr-defined]
                     ))
 
         # 2. Enclosing conditionals (if/with/match)

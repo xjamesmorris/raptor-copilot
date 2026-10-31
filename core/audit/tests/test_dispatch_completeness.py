@@ -516,3 +516,26 @@ def get_cmd2():
         missing = {g.missing_key for g in gaps}
         assert "cmd_gamma" in missing
         assert "cmd_delta" in missing
+
+
+class TestGetSourceNoRoot:
+    def test_no_target_root_skips_disk_fallback(self, tmp_path, monkeypatch):
+        # Without a target root the disk fallback resolved fpath
+        # against the process CWD — the tool's own repo dir, not the
+        # scanned target. Source must read as unavailable instead.
+        from core.audit.dispatch_completeness import _get_source
+        (tmp_path / "handlers.py").write_text("KEY = 'a'\n")
+        monkeypatch.chdir(tmp_path)
+        assert _get_source("handlers.py", None, None) is None
+
+    def test_in_memory_source_still_served_without_root(self):
+        from core.audit.dispatch_completeness import _get_source
+        texts = {"handlers.py": "KEY = 'a'\n"}
+        assert _get_source("handlers.py", texts, None) == "KEY = 'a'\n"
+
+    def test_confined_disk_fallback_still_reads(self, tmp_path):
+        from core.audit.dispatch_completeness import _get_source
+        (tmp_path / "handlers.py").write_text("KEY = 'a'\n")
+        assert _get_source(
+            "handlers.py", None, tmp_path,
+        ) == "KEY = 'a'\n"

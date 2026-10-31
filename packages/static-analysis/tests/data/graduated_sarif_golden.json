@@ -1,0 +1,107 @@
+{
+  "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "raptor-graduated",
+          "informationUri": "https://github.com/anthropics/raptor",
+          "rules": [
+            {
+              "id": "synthesized:lib-rule-1",
+              "name": "synthesized:lib-rule-1",
+              "shortDescription": {
+                "text": "synthesized:lib-rule-1"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "synthesized:lib-rule-2",
+              "name": "synthesized:lib-rule-2",
+              "shortDescription": {
+                "text": "synthesized:lib-rule-2"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            }
+          ]
+        }
+      },
+      "results": [
+        {
+          "ruleId": "synthesized:lib-rule-1",
+          "level": "error",
+          "message": {
+            "text": "graduated hit"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/a.py"
+                },
+                "region": {
+                  "startLine": 12
+                }
+              }
+            }
+          ],
+          "properties": {
+            "provenance": "synthesized:lib-rule-1",
+            "semgrep_rule_id": "llm-kebab-rule"
+          }
+        },
+        {
+          "ruleId": "synthesized:lib-rule-1",
+          "level": "warning",
+          "message": {
+            "text": "graduated rule lib-rule-1 matched"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/b.py"
+                },
+                "region": {
+                  "startLine": 0
+                }
+              }
+            }
+          ],
+          "properties": {
+            "provenance": "synthesized:lib-rule-1",
+            "semgrep_rule_id": ""
+          }
+        },
+        {
+          "ruleId": "synthesized:lib-rule-2",
+          "level": "warning",
+          "message": {
+            "text": "second rule"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/c.py"
+                },
+                "region": {
+                  "startLine": 3
+                }
+              }
+            }
+          ],
+          "properties": {
+            "provenance": "synthesized:lib-rule-2",
+            "semgrep_rule_id": "another-kebab"
+          }
+        }
+      ]
+    }
+  ]
+}

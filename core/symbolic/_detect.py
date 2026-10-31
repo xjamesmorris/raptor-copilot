@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from core.source.contained import read_text_capped
+
 
 # Source-pattern regexes for overflow detection. Naive "any read(0, ...)"
 # gives false positives on heap targets whose menu reads are size-bounded
@@ -108,7 +110,6 @@ def _find_user_controlled_fmt(src: str) -> str | None:
             return f"{fn}({', '.join(args[:pos])}...)"[:60]
     return None
 _C_LINE_COMMENT_RE = re.compile(r"//[^\n]*")
-_C_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", flags=re.DOTALL)
 
 # Symbol names the corpus uses for "attacker's goal" functions.
 # Kept broad so the detector doesn't miss variants; the router's
@@ -208,10 +209,14 @@ def detect_shape(
     # strcpy / scanf-%s) combined with a marker-target symbol → pc_control_shape.
     # User-controlled format string → fmtstr_shape.
     if source_path is not None and source_path.is_file():
-        try:
-            raw = source_path.read_text(errors="replace")
-        except OSError:
-            raw = ""
+        # Guarded read: this pre-gate runs over attacker-supplied
+        # targets BEFORE any budget/isolation, so a bare read_text
+        # would load a planted multi-GB source line whole (or block on
+        # a FIFO swapped past the is_file() gate). 512 KiB dwarfs any
+        # legitimate PoC/fixture source these detector-grade regexes
+        # are aimed at; None (unreadable/non-regular) means no source.
+        got = read_text_capped(source_path, 512 * 1024)
+        raw = "" if got is None else got[0]
         if raw:
             src = _strip_c_comments(raw)
             char_bufs = {
@@ -248,8 +253,30 @@ def detect_shape(
     )
 
 
+def _strip_block_comments(text: str) -> str:
+    """Replace each ``/* ... */`` span (non-nesting, first close
+    wins) with one space — the language of a lazy ``/\\*.*?\\*/``
+    DOTALL sub, done with str.find: a hostile file stuffed with
+    unclosed ``/*`` openers costs one linear pass instead of a
+    rescan of the tail per opener."""
+    out: list[str] = []
+    i = 0
+    while True:
+        j = text.find("/*", i)
+        if j < 0:
+            out.append(text[i:])
+            return "".join(out)
+        k = text.find("*/", j + 2)
+        if k < 0:
+            out.append(text[i:])
+            return "".join(out)
+        out.append(text[i:j])
+        out.append(" ")
+        i = k + 2
+
+
 def _strip_c_comments(src: str) -> str:
-    src = _C_BLOCK_COMMENT_RE.sub(" ", src)
+    src = _strip_block_comments(src)
     src = _C_LINE_COMMENT_RE.sub(" ", src)
     return src
 

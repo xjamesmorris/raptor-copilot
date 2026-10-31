@@ -24,13 +24,29 @@ def verify(
     picked_sha: str,
     client: NvdClient,
 ) -> OracleVerdict:
-    """Compare a ``(picked_slug, picked_sha)`` against NVD Patch-tagged refs."""
-    payload = client.get_payload(cve_id)
+    """Compare a ``(picked_slug, picked_sha)`` against NVD Patch-tagged refs.
+
+    A TRANSIENT lookup failure (outage, quota, network) yields
+    ``Verdict.UNKNOWN`` — "the oracle could not look" — while a
+    definitive NVD miss yields ``ORPHAN`` ("NVD has no record").
+    Conflating the two let an NVD outage read as a don't-penalize
+    orphan across a whole verification batch.
+    """
+    from .client import NvdLookupError
+
+    try:
+        payload = client.get_payload(cve_id, raise_on_transient=True)
+    except NvdLookupError as exc:
+        return OracleVerdict(
+            cve_id=cve_id, picked_slug=picked_slug, picked_sha=picked_sha,
+            verdict=Verdict.UNKNOWN, source="none",
+            notes=f"NVD lookup failed (transient): {exc}",
+        )
     if payload is None:
         return OracleVerdict(
             cve_id=cve_id, picked_slug=picked_slug, picked_sha=picked_sha,
             verdict=Verdict.ORPHAN, source="none",
-            notes="NVD fetch failed or 404",
+            notes="NVD has no record for this CVE",
         )
 
     pairs = extract_patch_refs(payload)

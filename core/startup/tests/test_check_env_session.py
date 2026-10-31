@@ -88,6 +88,65 @@ class TestRaptorDirCheck:
         )
 
 
+class TestFrontendMetadata:
+    @pytest.mark.parametrize(
+        ("frontend", "label"),
+        (("copilot", "GitHub Copilot CLI"), ("claude", "Claude Code")),
+    )
+    def test_frontend_metadata_is_separate_from_env(
+        self,
+        fake_repo,
+        monkeypatch,
+        frontend,
+        label,
+    ):
+        monkeypatch.setenv("RAPTOR_DIR", str(fake_repo))
+        monkeypatch.setenv("RAPTOR_FRONTEND", frontend)
+        monkeypatch.setenv("RAPTOR_FRONTEND_MODEL", "gpt-5.6-sol")
+
+        parts, _warnings = _run_check_env(monkeypatch)
+
+        assert startup_init.check_frontend() == f"{label} (model: gpt-5.6-sol)"
+        assert not any(part.startswith("frontend ") for part in parts)
+
+    def test_frontend_without_explicit_model_names_default(
+        self,
+        fake_repo,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("RAPTOR_DIR", str(fake_repo))
+        monkeypatch.setenv("RAPTOR_FRONTEND", "copilot")
+        monkeypatch.delenv("RAPTOR_FRONTEND_MODEL", raising=False)
+
+        assert startup_init.check_frontend() == (
+            "GitHub Copilot CLI (model: session/config default)"
+        )
+
+    def test_unknown_frontend_is_not_rendered(
+        self,
+        fake_repo,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("RAPTOR_DIR", str(fake_repo))
+        monkeypatch.setenv("RAPTOR_FRONTEND", "unexpected\nfrontend")
+
+        assert startup_init.check_frontend() is None
+
+    def test_model_control_characters_cannot_inject_status_lines(
+        self, monkeypatch,
+    ):
+        monkeypatch.setenv("RAPTOR_FRONTEND", "copilot")
+        monkeypatch.setenv("RAPTOR_FRONTEND_MODEL", "astra\x1b[2J\r\nllm: fake")
+
+        status = startup_init.check_frontend()
+
+        assert status is not None
+        assert "\x1b" not in status
+        assert "\r" not in status
+        assert "\n" not in status
+        assert "\\x1b" in status
+
+
 # ---------------------------------------------------------------------------
 # No .claude/raptor.env or .claude/settings.json checks
 # ---------------------------------------------------------------------------

@@ -66,6 +66,7 @@ pin) and 4.16.0; all PoC cases finish in 7-9 ms.
 from __future__ import annotations
 
 import ast
+import builtins
 import logging
 import re as _re
 from dataclasses import dataclass, field
@@ -73,8 +74,10 @@ from enum import Enum
 from pathlib import Path
 
 from core.dataflow import sanitizer_cut_config as _sc_config
+from core.paths import confine
 from core.smt_solver import z3
 from core.smt_solver import z3_available as _z3_available
+from core.source import read_text_capped
 
 # --------------------------------------------------------------------------
 # Sink danger model.  Each sink_class maps to the set of characters whose
@@ -84,34 +87,111 @@ from core.smt_solver import z3_available as _z3_available
 # (missing danger chars) is unsound; too wide just defers more cases to
 # Tier 2.
 # --------------------------------------------------------------------------
+# Per-class derivation rule: a danger set must name every character
+# that is load-bearing in ANY interpolation context the sink class can
+# put the value in — the charset model cannot see which context a
+# given finding actually uses, so the union of the class's contexts is
+# the sound set.  Each entry's comment enumerates the contexts it
+# covers; a new attack context for a class means new chars here, never
+# a caveat elsewhere.
 _DANGER_CHARS = {
+    # Contexts: POSIX path segments, downstream joins.
     # Path separators are the load-bearing chars for traversal, and '.'
     # builds '..' segments.  Whether a bare '..' (no separator) is
     # dangerous depends on how the value is joined downstream —
     # ``join(base, name, "x")`` escapes via name=".." — which the
     # charset model cannot see, so '.' must be excluded for the
-    # verdict to be sound.
+    # verdict to be sound.  Residuals, named: (a) the
+    # WINDOWS-only ':' contexts (drive-relative ``C:evil``, NTFS
+    # alternate data streams); (b) the decode-after-validate channel
+    # ('%': a sink that URL-decodes AFTER the check turns
+    # ``%2e%2e%2f`` into ``../``). Both excluded because either char
+    # would decline the canonical separator-stripping fix shape
+    # (``re.sub(r'[/\\.]+'``) this tier exists to certify, and no
+    # routing funnels Windows-path or decode-order findings into this
+    # class the way CWE-88 funnelled argv findings into cmdi.
+    # Revisit if such a corpus lands.
     "pathtrav": ["/", "\\", "."],
+    # Contexts: POSIX shell strings, cmd.exe strings.
     # Shell metachars that introduce command separation, substitution,
     # backgrounding, or redirection.  Newlines included because they
     # terminate a command in most shell contexts; '<' / '>' because
-    # redirects need no separator (``foo>x`` clobbers x).  Residual
-    # known gap: option injection (a leading '-') is argument-position
-    # dependent and out of scope for a charset model.
-    "cmdi":     [";", "|", "&", "$", "`", "\n", "<", ">"],
+    # redirects need no separator (``foo>x`` clobbers x); '%' and '!'
+    # because cmd.exe expands ``%VAR%`` (and ``!VAR!`` under delayed
+    # expansion) inside plain strings — the expansion splices variable
+    # content, metachars included, with none of the POSIX chars
+    # present in the value itself.  This class covers the
+    # command-STRING contexts only; findings whose sink is an argv
+    # element (CWE-88, the command-LINE-injection rule families) are
+    # routed to ``cmdi_argv`` below — string metachars cover none of
+    # that channel.
+    "cmdi":     [";", "|", "&", "$", "`", "\n", "<", ">", "%", "!"],
+    # Contexts: argv elements (option parsing, tokenizer splits,
+    # re-join quoting) UNION the command-string contexts.
+    # Argument-position command sinks (Runtime.exec / ProcessBuilder /
+    # execFile argv elements — CWE-88 and the ``*-command-line-
+    # injection`` rule families).  Extends ``cmdi`` (composed below —
+    # the superset invariant is structural, not a parallel list to
+    # hand-sync):
+    #   * '-' — option injection (``-rf``, ``--upload-file x``).  The
+    #     charset model cannot see string position, so ANY dash must
+    #     count, not just a leading one.
+    #   * whitespace (space/tab/CR — LF rides in from cmdi) —
+    #     tokenizing sinks split one value into several argv elements
+    #     (``Runtime.exec(String)`` tokenizes on whitespace; wrapper
+    #     relaunches re-split).
+    #   * quote chars — platforms that re-JOIN argv into a command
+    #     line and re-parse it (Windows CreateProcess) let a quote
+    #     break out of the element.
+    #   * the ``cmdi`` string set rides along because the model cannot
+    #     see whether the argv element later reaches a shell
+    #     (``ProcessBuilder("sh", "-c", x)``, cmd.exe wrappers) —
+    #     excluding it only when provably shell-free would need
+    #     command-target knowledge a charset has no access to.
+    "cmdi_argv": [" ", "\t", "\r", "-", "'", '"'],
+    # Contexts: quoted string literals, UNQUOTED (numeric) positions,
+    # quoted identifiers, backslash-escaping dialects, comment
+    # truncation.
     # SQL quote / comment / statement-terminator chars PLUS the chars
     # that suffice in an UNQUOTED (numeric) context, where no quote is
     # needed to change the query: whitespace and grouping/comparison
     # chars (``1 OR 1``, ``1)--``).  The charset model cannot see the
-    # interpolation context, so both contexts must be covered for the
-    # verdict to be sound.  Digits-only charsets remain provably safe.
+    # interpolation context, so every context must be covered for the
+    # verdict to be sound.  Identifier-quote chars ('`' MySQL, '['/']'
+    # T-SQL) cover the quoted-IDENTIFIER context: ``ORDER BY `pin```
+    # is a no-quote-chars tautology injection when the value lands in
+    # an identifier position.  '\\' covers backslash-escaping dialects
+    # (MySQL et al.): a value ENDING in '\\' escapes the closing quote
+    # and splices the next literal into the statement.  '#' is the
+    # MySQL comment lead — ``1#`` truncates the statement tail from an
+    # unquoted position with no other danger char.  Digits-only
+    # charsets remain provably safe.
     "sqli":     ["'", '"', ";", "-", " ", "\t", "\n", "\r",
-                 "=", "(", ")"],
+                 "=", "(", ")", "`", "[", "]", "\\", "#"],
+    # Contexts: element text, quoted attributes, unquoted attributes,
+    # URL-valued attributes (incl. the entity-decoding channel).
     # XSS tag- and attribute-breakers PLUS unquoted-attribute-context
     # injectors: whitespace and '=' add new attributes without any of
     # <>"' (``x onmouseover=...``), '`' breaks IE-legacy attributes.
-    "xss":      ["<", ">", '"', "'", " ", "\t", "\n", "=", "`"],
+    # ':' / '(' / ')' cover the URL-valued attribute context (href,
+    # src, formaction): ``javascript:alert(1)`` executes from a
+    # QUOTED attribute using none of the tag/attribute breakers.
+    # '&' covers the ENTITY-DECODING channel inside attribute values:
+    # HTML decodes ``&#58;`` etc. before URL parsing, so
+    # ``javascript&#58;alert&#40;1&#41;`` spells the same payload from
+    # letters/digits plus '&', '#', ';' alone — and every entity needs
+    # the '&' lead, so excluding '&' closes the whole channel without
+    # also outlawing '#' and ';'.
+    "xss":      ["<", ">", '"', "'", " ", "\t", "\n", "=", "`",
+                 ":", "(", ")", "&"],
 }
+# Structural superset: the argv context can never rule out a
+# downstream command-string join, so cmdi_argv = cmdi ∪ argv-specific.
+_DANGER_CHARS["cmdi_argv"] = (
+    _DANGER_CHARS["cmdi"]
+    + [c for c in _DANGER_CHARS["cmdi_argv"]
+       if c not in _DANGER_CHARS["cmdi"]]
+)
 
 
 def danger_chars_for(sink_class: str):
@@ -192,11 +272,17 @@ class Tier0Result:
 # silently truncated the captured pattern — see Gerapy CVE-2020-7698
 # fix whose pattern contains ``\"`` and ``\'`` inside a single-quoted
 # Python string.
+# The literal body is BOUNDED: with an unbounded body, a hostile line
+# that plants the call head inside an unterminated quote makes every
+# head occurrence re-scan the rest of the line — quadratic in line
+# length. Real validator pattern literals are tens of chars; 1000 is
+# generous (a longer literal stops matching and the spec-lift is
+# declined, versus an unbounded scan on hostile text).
 _STR_LITERAL = (
     r"r?(?:"
-    r"'(?:[^'\\]|\\.)+'"     # 'body' with escaped chars allowed
+    r"'(?:[^'\\]|\\.){1,1000}'"     # 'body' with escaped chars allowed
     r"|"
-    r"\"(?:[^\"\\]|\\.)+\""  # "body" with escaped chars allowed
+    r"\"(?:[^\"\\]|\\.){1,1000}\""  # "body" with escaped chars allowed
     r")"
 )
 
@@ -218,7 +304,12 @@ _STR_LITERAL = (
 # spec-lift (Tier 2 takes the case).  The Ruby extractor refuses
 # line-anchored guards for exactly this hazard.
 _RE_MATCH_CALL = _re.compile(
-    r"re\.(?:match|fullmatch)\s*\(\s*"
+    # The called function is captured as a group: classification must
+    # read the CALL, never a substring of the whole matched span — the
+    # span includes the variable name, and a variable named
+    # ``*fullmatch*`` would otherwise lift an unanchored ``re.match``
+    # prefix guard to whole-string fullmatch semantics.
+    r"re\.(?P<kind>fullmatch|match)\s*\(\s*"
     rf"(?P<pat>{_STR_LITERAL})"
     r"\s*,\s*"
     r"(?P<var>[A-Za-z_][A-Za-z0-9_]*)"
@@ -254,8 +345,12 @@ _FULLMATCH_CHARSET = _re.compile(r"^\[((?:[^\]\\]|\\.)+)\][+*]$")
 #      forbidden char removed" claim breaks), and flags change the
 #      pattern semantics.  Same suffix-blindness hazard as
 #      _RE_MATCH_CALL above.
+# The \b pins the variable to a word start: unanchored, every
+# position inside a long identifier-shaped run starts a fresh scan of
+# the rest of the line — quadratic on hostile text. A mid-word start
+# is never a real assignment target.
 _RE_SUB_REBIND = _re.compile(
-    r"(?P<var>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
+    r"\b(?P<var>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
     r"re\.sub\s*\(\s*"
     rf"(?P<pat>{_STR_LITERAL})"
     r"\s*,\s*"
@@ -293,16 +388,25 @@ _SUB_CHARSET = _re.compile(r"^\[((?:[^\]\\]|\\.)+)\][+*]?$")
 # --------------------------------------------------------------------------
 
 # JS/TS — `if (!/^[chars]+$/.test(<var>)) return|throw …`
+# The optional brace gates its own trailing whitespace in all five
+# guard shapes ((?:\{\s*)?): the naive ``\{?\s*`` pair put two
+# whitespace spans around it — quadratic on a guard-opening line
+# ending in a whitespace run.
+# The chars-class body is BOUNDED in all five guard shapes: with an
+# unbounded ``[^\]]+``, a hostile line that plants the guard head
+# inside an unterminated class makes every head occurrence re-scan
+# the rest of the line — quadratic. Real allowlist classes are tens
+# of chars; 1000 is generous (a longer class declines the spec-lift).
 _JS_GUARD_TEST = _re.compile(
-    r"if\s*\(\s*!\s*/\^\[(?P<chars>[^\]]+)\][+*]\$/\s*\.test\s*\(\s*"
+    r"if\s*\(\s*!\s*/\^\[(?P<chars>[^\]]{1,1000})\][+*]\$/\s*\.test\s*\(\s*"
     r"(?P<var>[A-Za-z_$][A-Za-z_$0-9]*)\s*\)\s*\)\s*"
-    r"\{?\s*(?:return|throw)\b"
+    r"(?:\{\s*)?(?:return|throw)\b"
 )
 # JS/TS — `if (!<var>.match(/^[chars]+$/)) return|throw …`
 _JS_GUARD_MATCH = _re.compile(
     r"if\s*\(\s*!\s*(?P<var>[A-Za-z_$][A-Za-z_$0-9]*)\s*\.match\s*\(\s*"
-    r"/\^\[(?P<chars>[^\]]+)\][+*]\$/\s*\)\s*\)\s*"
-    r"\{?\s*(?:return|throw)\b"
+    r"/\^\[(?P<chars>[^\]]{1,1000})\][+*]\$/\s*\)\s*\)\s*"
+    r"(?:\{\s*)?(?:return|throw)\b"
 )
 
 # Java — `if (!<var>.matches("[chars]+")) return|throw …`
@@ -311,8 +415,8 @@ _JS_GUARD_MATCH = _re.compile(
 # permitted (no-op) but not required.
 _JAVA_GUARD = _re.compile(
     r'if\s*\(\s*!\s*(?P<var>[A-Za-z_$][A-Za-z_$0-9]*)\s*\.matches\s*\(\s*'
-    r'"\^?\[(?P<chars>[^\]]+)\][+*]\$?"\s*\)\s*\)\s*'
-    r'\{?\s*(?:return|throw)\b'
+    r'"\^?\[(?P<chars>[^\]]{1,1000})\][+*]\$?"\s*\)\s*\)\s*'
+    r'(?:\{\s*)?(?:return|throw)\b'
 )
 
 # Ruby — `return|raise … unless <var> =~ /^[chars]+$/`
@@ -328,15 +432,35 @@ _JAVA_GUARD = _re.compile(
 # outside the modeled set; none of Onigmo's flags are modeled, so any
 # flagged literal declines the spec-lift (same suffix-blindness
 # doctrine as _RE_MATCH_CALL).
-_RUBY_GUARD_UNLESS = _re.compile(
-    r"(?:return|raise)\b[^\n]*?\s+unless\s+(?P<var>[a-z_][a-z_0-9]*)\s*=~\s*"
-    r"/\\A\[(?P<chars>[^\]]+)\][+*]\\z/(?![a-zA-Z])"
+# The guard is matched in TWO steps — statement head, then the
+# ``unless``/``if`` tail searched from the head's end — instead of a
+# single regex with an unbounded statement filler between them: the
+# filler made every planted head re-scan the line tail (quadratic,
+# cubic through the chars class). Two anchored searches are linear
+# and accept the same lines: head anywhere before a whitespace-
+# preceded tail is exactly the old ``head (filler?) \s+ tail``.
+_RUBY_STMT_HEAD_RE = _re.compile(r"\b(?:return|raise)\b")
+_RUBY_GUARD_UNLESS_TAIL = _re.compile(
+    r"(?<=\s)unless\s+(?P<var>[a-z_][a-z_0-9]*)\s*=~\s*"
+    r"/\\A\[(?P<chars>[^\]]{1,200})\][+*]\\z/(?![a-zA-Z])"
 )
 # Ruby — `return|raise … if <var> !~ /\A[chars]+\z/`
-_RUBY_GUARD_IF_NOT_MATCH = _re.compile(
-    r"(?:return|raise)\b[^\n]*?\s+if\s+(?P<var>[a-z_][a-z_0-9]*)\s*!~\s*"
-    r"/\\A\[(?P<chars>[^\]]+)\][+*]\\z/(?![a-zA-Z])"
+_RUBY_GUARD_IF_NOT_TAIL = _re.compile(
+    r"(?<=\s)if\s+(?P<var>[a-z_][a-z_0-9]*)\s*!~\s*"
+    r"/\\A\[(?P<chars>[^\]]{1,200})\][+*]\\z/(?![a-zA-Z])"
 )
+
+
+def _ruby_guard_search(line: str):
+    """(tail match, head start) for the Ruby guard shapes, or None."""
+    head = _RUBY_STMT_HEAD_RE.search(line)
+    if head is None:
+        return None
+    m = (_RUBY_GUARD_UNLESS_TAIL.search(line, head.end())
+         or _RUBY_GUARD_IF_NOT_TAIL.search(line, head.end()))
+    if m is None:
+        return None
+    return m, head.start()
 
 
 def _string_escape_decode(body: str) -> str:
@@ -421,14 +545,76 @@ def _charset_body_is_safe(body: str) -> bool:
     return _ALPHA_BACKSLASH_ESCAPE.search(body) is None
 
 
-def _try_charset_validator(line: str) -> ValidatorSpec | None:
+def _code_view_line(line: str, language: str) -> str:
+    """Comment/string-blanked view of ONE line (no file context).
+
+    Uses the shared core.audit.source_view scanner (lazy leaf import —
+    source_view depends only on ``re``, so the downward-only import
+    doctrine is not violated at module import time). Single-line
+    scanning cannot see enclosing multi-line constructs; callers that
+    hold the whole file pass a full-file view line instead.
+    """
+    from core.audit.source_view import sanitized_view
+
+    return sanitized_view(line, language=language)
+
+
+def code_view_lines(source_text: str, language: str) -> list[str]:
+    """Comment/string-blanked view of a whole file, split into lines
+    (newlines are preserved by the scanner, so indices map 1:1)."""
+    from core.audit.source_view import sanitized_view
+
+    return split_source_lines(
+        sanitized_view(source_text, language=language),
+    )
+
+
+
+def split_source_lines(text: str) -> list[str]:
+    r"""Split target-controlled text into lines by ``\n`` ONLY.
+
+    Every producer whose line numbers this stack consumes (CodeQL
+    SARIF locations, git diffs, SARIF snippets) counts lines by
+    ``\n``; ``str.splitlines()`` additionally breaks on U+2028/U+2029,
+    U+000B, U+000C, U+0085 — one exotic terminator planted early in a
+    target file shifts every line-keyed judgment after it (observed
+    direction: refusal — a real guard becomes unfindable; the
+    suppression direction is blocked by the var-reach and dominance
+    gates, which shift consistently with the sink text).  One shared
+    helper so producer and consumer line arithmetic cannot diverge
+    again; ``\r`` tails from CRLF files survive on the line and are
+    tolerated by the strip()/regex matching at every consumer.
+
+    A trailing newline yields one final empty element ("phantom
+    line"); consumers bounds-check indices and skip blank lines, so
+    it is inert.
+    """
+    return text.split("\n")  # line-model: deliberate \n-only model; \r tails tolerated at every consumer (see docstring)
+
+
+def _span_is_code(view: str | None, start: int) -> bool:
+    """True when a regex match starting at ``start`` is anchored in
+    executable code: the view (comments and string interiors blanked
+    to spaces) still carries a non-space character there.  Every
+    extractor regex starts its match on a non-space char, so a space
+    in the view means the span is prose — a comment or string decoy
+    must never mint a validator.
+    """
+    if view is None:
+        return True
+    return start < len(view) and view[start] != " "
+
+
+def _try_charset_validator(
+    line: str, view: str | None = None,
+) -> ValidatorSpec | None:
     """Match the whole-string `re.match`/`re.fullmatch` over `^[chars]+$`
     pattern.  Returns ``None`` on no match so the caller can try other
     extractors."""
     m = _RE_MATCH_CALL.search(line)
-    if not m:
+    if not m or not _span_is_code(view, m.start()):
         return None
-    call_kind = "fullmatch" if "fullmatch" in line[m.start():m.end()] else "match"
+    call_kind = m.group("kind")
     pattern = _strip_string_literal(m.group("pat"))
     var_name = m.group("var")
     cs = _ANCHORED_CHARSET.match(pattern)
@@ -442,11 +628,13 @@ def _try_charset_validator(line: str) -> ValidatorSpec | None:
     )
 
 
-def _try_charset_sub_validator(line: str) -> ValidatorSpec | None:
+def _try_charset_sub_validator(
+    line: str, view: str | None = None,
+) -> ValidatorSpec | None:
     """Match the ``x = re.sub('[forbidden]+', '', x)`` rebind pattern.
     Returns ``None`` on no match."""
     m = _RE_SUB_REBIND.search(line)
-    if not m:
+    if not m or not _span_is_code(view, m.start()):
         return None
     pattern = _strip_string_literal(m.group("pat"))
     cs = _SUB_CHARSET.match(pattern)
@@ -464,12 +652,16 @@ def _try_charset_sub_validator(line: str) -> ValidatorSpec | None:
     )
 
 
-def _try_jsts_validator(line: str) -> ValidatorSpec | None:
+def _try_jsts_validator(
+    line: str, view: str | None = None,
+) -> ValidatorSpec | None:
     """JS / TS guard-and-exit shapes.  Single regex match implies both
     the validator and its exit-on-fail are on the line — dominance is
     established by the diff itself."""
     m = _JS_GUARD_TEST.search(line) or _JS_GUARD_MATCH.search(line)
-    if m is None or not _charset_body_is_safe(m.group("chars")):
+    if m is None or not _span_is_code(view, m.start()):
+        return None
+    if not _charset_body_is_safe(m.group("chars")):
         return None
     return ValidatorSpec(
         kind="charset", var_name=m.group("var"), charset=m.group("chars"),
@@ -477,7 +669,9 @@ def _try_jsts_validator(line: str) -> ValidatorSpec | None:
     )
 
 
-def _try_java_validator(line: str) -> ValidatorSpec | None:
+def _try_java_validator(
+    line: str, view: str | None = None,
+) -> ValidatorSpec | None:
     """Java ``String.matches`` guard-and-exit shape.
 
     The captured class body is the SOURCE spelling of a Java string
@@ -488,7 +682,7 @@ def _try_java_validator(line: str) -> ValidatorSpec | None:
     from the model.
     """
     m = _JAVA_GUARD.search(line)
-    if m is None:
+    if m is None or not _span_is_code(view, m.start()):
         return None
     chars = _string_escape_decode(m.group("chars"))
     if not _charset_body_is_safe(chars):
@@ -499,15 +693,22 @@ def _try_java_validator(line: str) -> ValidatorSpec | None:
     )
 
 
-def _try_ruby_validator(line: str) -> ValidatorSpec | None:
+def _try_ruby_validator(
+    line: str, view: str | None = None,
+) -> ValidatorSpec | None:
     r"""Ruby ``unless x =~ /…/`` and ``if x !~ /…/`` guard shapes.
 
     Only ``\A[chars]+\z``-anchored patterns lift — Ruby ``^``/``$``
     are line anchors, so a line-anchored guard does not bound the whole
     string (see the anchor note on the guard regexes above).
     """
-    m = _RUBY_GUARD_UNLESS.search(line) or _RUBY_GUARD_IF_NOT_MATCH.search(line)
-    if m is None or not _charset_body_is_safe(m.group("chars")):
+    found = _ruby_guard_search(line)
+    if found is None:
+        return None
+    m, head_start = found
+    if not _span_is_code(view, head_start):
+        return None
+    if not _charset_body_is_safe(m.group("chars")):
         return None
     return ValidatorSpec(
         kind="charset", var_name=m.group("var"), charset=m.group("chars"),
@@ -535,7 +736,7 @@ def extractor_languages() -> frozenset:
 
 
 def extract_validator_from_line(
-    line: str, language: str = "python",
+    line: str, language: str = "python", *, code_view: str | None = None,
 ) -> ValidatorSpec | None:
     """Run the per-``language`` extractor table on ONE source line.
 
@@ -544,12 +745,22 @@ def extract_validator_from_line(
     lifts validators from dataflow-path step lines instead of diff
     ``+`` lines. First matching extractor wins; None when the line
     carries no recognised validator shape.
+
+    Every match is anchored against a comment/string-blanked view of
+    the line: a validator that exists only inside a comment or string
+    literal is prose, and lifting it would let the scanned repo
+    neutralise its own live flows (mint refutations) with a planted
+    decoy.  ``code_view`` is the view line when the caller holds the
+    whole file (needed to see enclosing multi-line comments/strings);
+    by default the line itself is scanned in isolation.
     """
     extractors = _LANG_EXTRACTORS.get(language)
     if not extractors:
         return None
+    if code_view is None:
+        code_view = _code_view_line(line, language)
     for try_fn in extractors:
-        spec = try_fn(line)
+        spec = try_fn(line, code_view)
         if spec is not None:
             return spec
     return None
@@ -574,7 +785,7 @@ def extract_validator(fix_diff: str, language: str = "python") -> ValidatorSpec 
         return None
     if language not in _LANG_EXTRACTORS:
         return None
-    for raw in fix_diff.splitlines():
+    for raw in split_source_lines(fix_diff):
         if not raw.startswith("+") or raw.startswith("+++"):
             continue
         spec = extract_validator_from_line(raw[1:], language)
@@ -698,46 +909,125 @@ def _block_uses_raise(body: list) -> bool:
     return any(isinstance(stmt, ast.Raise) for stmt in body)
 
 
+# Plain and exception-group try statements — ``except*`` handlers
+# swallow (and run conditionally) exactly like plain ``except`` for
+# dominance purposes. ``ast.TryStar`` is 3.11+; on older runtimes
+# ``except*`` source is a SyntaxError and the parse-failure path
+# already declines.
+_TRY_NODES: tuple[type, ...] = (
+    (ast.Try, ast.TryStar) if hasattr(ast, "TryStar") else (ast.Try,)
+)
+
+# ``type X = ...`` alias statements are 3.12+; the construct is a
+# SyntaxError on older runtimes, so ``None`` there is exhaustive
+# (same guard shape as ``_TRY_NODES``).
+_TYPE_ALIAS_NODE: type | None = getattr(ast, "TypeAlias", None)
+
+
+def _raised_exception_names(body: list) -> list[str | None]:
+    """Names of the exception classes the block's top-level ``raise``
+    statements throw. ``None`` entries mark statically-unresolvable
+    raises (dotted classes, re-raises, computed expressions) — the
+    caller must treat those as catchable-by-anything."""
+    names: list[str | None] = []
+    for stmt in body:
+        if not isinstance(stmt, ast.Raise):
+            continue
+        exc = stmt.exc
+        if isinstance(exc, ast.Call):
+            exc = exc.func
+        names.append(exc.id if isinstance(exc, ast.Name) else None)
+    return names
+
+
+def _handler_type_names(t: ast.AST | None) -> list[str | None]:
+    """Exception-class names an ``except`` clause declares. ``None``
+    entries mark unresolvable elements (dotted / computed)."""
+    elts = t.elts if isinstance(t, ast.Tuple) else [t]
+    return [e.id if isinstance(e, ast.Name) else None for e in elts]
+
+
+def _handler_name_may_catch(handler: str | None, raised: str | None) -> bool:
+    """Whether an ``except <handler>:`` clause may catch a ``raise
+    <raised>`` — resolvable statically only when BOTH names are real
+    builtin exception classes (then Python's own hierarchy answers);
+    every unresolvable pairing errs toward "may catch" (refusing a
+    dominance claim costs yield, never soundness). Builtin-name
+    shadowing by the scanned repo can only ADD catches this misses in
+    the certify direction for provably-disjoint builtin pairs — the
+    same static-name assumption the pre-existing disjoint-class
+    behavior already encodes."""
+    if handler is None or raised is None:
+        return True
+    if handler in {"Exception", "BaseException"}:
+        return True
+    handler_cls = getattr(builtins, handler, None)
+    raised_cls = getattr(builtins, raised, None)
+    if (isinstance(handler_cls, type)
+            and issubclass(handler_cls, BaseException)
+            and isinstance(raised_cls, type)
+            and issubclass(raised_cls, BaseException)):
+        return issubclass(raised_cls, handler_cls)
+    return True
+
+
 def _line_in_try_body_with_catching_handler(
     tree: ast.AST, validator_line: int,
+    raised_names: list[str | None],
 ) -> bool:
     """True iff ``validator_line`` falls inside the ``try.body`` of a
-    ``Try`` whose handlers might catch a generic / unspecified
-    exception.
+    ``Try`` with a handler that may SWALLOW the failure branch's raise
+    — the exception is caught and control falls through to the code
+    after the ``try``, so the unvalidated value reaches the sink.
 
-    Conservative: any ``except:`` (bare), ``except Exception:``,
-    ``except BaseException:`` triggers; specific exception classes
-    don't (since the validator's ``raise`` typically raises
-    ``ValueError``/``BadRequest`` and a generic ``except OSError:``
-    won't catch those).  False positives here only cost yield —
-    they don't compromise soundness.
+    Triggers:
+
+    * ``except:`` (bare), ``except Exception:``, ``except
+      BaseException:`` — catch everything, always trigger (even an
+      exiting body stays conservative here, the pre-existing rule).
+    * A TYPED handler that may catch one of ``raised_names`` (builtin
+      hierarchy when both names resolve to real builtin exception
+      classes; assumed catching otherwise) AND whose body falls
+      through (does not provably exit) — ``except ValueError: pass``
+      around a ``raise ValueError`` guard swallows exactly like a bare
+      except. A catching handler that re-raises / returns keeps the
+      failure path exiting and does NOT trigger.
+
+    False positives here only cost yield — they don't compromise
+    soundness.
     """
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Try):
+        if not isinstance(node, _TRY_NODES):
             continue
         # validator_line must be inside try.body specifically (NOT inside
         # an except handler or finally — those are different control paths)
         in_try_body = False
-        for stmt in node.body:
+        for stmt in node.body:  # type: ignore[attr-defined]
             stmt_end = getattr(stmt, "end_lineno", None) or stmt.lineno
             if stmt.lineno <= validator_line <= stmt_end:
                 in_try_body = True
                 break
         if not in_try_body:
             continue
-        for h in node.handlers:
-            t = h.type
+        for h in node.handlers:  # type: ignore[attr-defined]
+            names = _handler_type_names(h.type) if h.type is not None else []
             # bare except: -> catches everything (UNSOUND if validator raises)
-            if t is None:
+            if h.type is None:
                 return True
-            # except Exception: / except BaseException:
-            if isinstance(t, ast.Name) and t.id in {"Exception", "BaseException"}:
+            # except Exception: / except BaseException: (incl. in tuples)
+            if any(n in {"Exception", "BaseException"} for n in names):
                 return True
-            # except (Exception, OSError): tuple of types
-            if isinstance(t, ast.Tuple):
-                for elt in t.elts:
-                    if isinstance(elt, ast.Name) and elt.id in {"Exception", "BaseException"}:
-                        return True
+            # Typed handler: a swallow needs BOTH a catch and a
+            # fall-through — a re-raising / returning handler keeps
+            # the failure path exiting.
+            if _block_always_exits(h.body):
+                continue
+            if any(
+                _handler_name_may_catch(hn, rn)
+                for hn in names
+                for rn in (raised_names or [None])
+            ):
+                return True
     return False
 
 
@@ -764,31 +1054,422 @@ def _validator_block_exits_on_failure(
                 failure_body = node.orelse
             if not _block_always_exits(failure_body):
                 return False
-            # If the exit is `raise` and we're inside a catching try,
-            # the raise gets caught — decline.
+            # If the exit is `raise` and we're inside a try with a
+            # handler that may swallow it, the raise gets caught —
+            # decline.
             return not (
                 _block_uses_raise(failure_body)
                 and _line_in_try_body_with_catching_handler(
-                    tree, validator_line)
+                    tree, validator_line,
+                    _raised_exception_names(failure_body))
             )
     return False
 
 
-def find_validator_line(source_text: str, spec: ValidatorSpec) -> int | None:
+def _binds_conditional_value(tree: ast.AST, line: int) -> bool:
+    """True when an assignment on ``line`` binds a CONDITIONAL value —
+    ``x = clean(x) if cond else x`` (IfExp) or ``x = cond and clean(x)
+    or x`` (short-circuit BoolOp). The statement itself executes
+    unconditionally, so the statement-level branch walk cannot see it,
+    but the SANITIZED value is bound only on some paths — the
+    fall-through arm sends the raw value into the sink. Conservative:
+    any IfExp / BoolOp anywhere in the assigned value refuses (an
+    exotic-but-sound conditional value costs yield, never soundness).
+    Walrus bindings (``log(safe := clean(x) if cond else x)``) are the
+    same shape spelled as an expression — the transform gate accepts
+    NamedExpr as a binding form, so this walk must see it too or the
+    conditional value slips through inside a call argument."""
+    for node in ast.walk(tree):
+        if not isinstance(
+            node, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr),
+        ):
+            continue
+        if node.lineno != line or node.value is None:
+            continue
+        if any(isinstance(sub, (ast.IfExp, ast.BoolOp))
+               for sub in ast.walk(node.value)):
+            return True
+    return False
+
+
+def _validator_in_branch(
+    tree: ast.AST, validator_line: int, sink_line: int,
+    *, exclude_guard_at: int | None = None,
+) -> bool:
+    """Return True if ``validator_line`` is inside a conditional branch
+    of the function containing the sink — meaning the validator does NOT
+    dominate the sink unconditionally.  An assignment whose VALUE is
+    conditional (ternary / short-circuit — see
+    :func:`_binds_conditional_value`) counts as branch-wrapped too: the
+    sanitized binding happens only on some paths even though the
+    statement itself is unconditional.
+
+    ``exclude_guard_at`` names the line of the validator's OWN ``if``
+    statement for guard-shaped validators (``kind="charset"``): a
+    single-line guard (``if not re.match(...): return``) has its body
+    on the guard's own line, and without the exclusion the guard would
+    read as wrapped by itself. Substitution / safe-call validators are
+    plain statements — callers leave the exclusion unset.
+    """
+    fn = _function_containing(tree, sink_line)
+    body = fn.body if fn else tree.body  # type: ignore[attr-defined]
+
+    def _in_branch(stmts, target) -> bool:
+        for stmt in stmts:
+            if isinstance(stmt, ast.If):
+                if stmt.lineno == exclude_guard_at:
+                    continue
+                if _spans(stmt.body, target) or _spans(stmt.orelse, target):
+                    return True
+            elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
+                # A loop body may run ZERO times, and the ``else:``
+                # clause is skipped whenever the loop ``break``s —
+                # both are conditional placements for a validator
+                # (async-for included: aiohttp-style retry wrappers
+                # are exactly the loop-wrapped-sanitizer shape).
+                # Conservative refuse — the sound tier's bar is zero
+                # false suppression.
+                if _spans(stmt.body, target) or _spans(stmt.orelse, target):
+                    return True
+            elif isinstance(stmt, _TRY_NODES):
+                for handler in stmt.handlers:  # type: ignore[attr-defined]
+                    if _spans(handler.body, target):
+                        return True
+                # A conditional nested inside the try body / else /
+                # finally still wraps the validator — descend.
+                if (_in_branch(stmt.body, target)  # type: ignore[attr-defined]
+                        or _in_branch(stmt.orelse, target)  # type: ignore[attr-defined]
+                        or _in_branch(stmt.finalbody, target)):  # type: ignore[attr-defined]
+                    return True
+            elif isinstance(stmt, (ast.With, ast.AsyncWith)):
+                # ``with`` executes unconditionally, but its body can
+                # contain conditionals — descend rather than skip.
+                if _in_branch(stmt.body, target):
+                    return True
+            elif isinstance(stmt, ast.Match):
+                # Every case arm is conditional.
+                if any(_spans(case.body, target) for case in stmt.cases):
+                    return True
+        return False
+
+    def _spans(stmts, target) -> bool:
+        for stmt in stmts:
+            if hasattr(stmt, "lineno") and hasattr(stmt, "end_lineno"):
+                if stmt.lineno <= target <= (stmt.end_lineno or stmt.lineno):
+                    return True
+            elif hasattr(stmt, "lineno") and stmt.lineno == target:
+                return True
+        return False
+
+    if _binds_conditional_value(tree, validator_line):
+        return True
+    return _in_branch(body, validator_line)
+
+
+# Block-opening keywords that make a brace block CONDITIONAL (or
+# repeated) — a safe-call inside one does not dominate a sink outside
+# it.  ``else``/``catch``/``case``/``default`` are conditional arms;
+# loops are included because a loop body may execute zero times.
+_COND_BLOCK_KEYWORD = _re.compile(
+    r"\b(?:if|else|for|while|switch|case|default|catch|do)\b"
+)
+
+
+def _tracker_brace_view(line: str) -> str:
+    """Second-stage blanking for the BRACE COUNTING only.
+
+    Applied on top of the whole-file sanitized view, and consumed
+    exclusively by the brace-stack scan — every KEYWORD read (the
+    validator-line arms, the preceding-line dangling scan, and the
+    ``prev_tail`` conditional classifier inside the loop) stays on
+    the softer sanitized view, where a phantom keyword inside a
+    visible regex can only mark a real block conditional (a refusal),
+    never un-mark one.
+
+    * ``/…/`` spans blank GREEDILY, ignoring the sanitizer's
+      regex-vs-division position heuristic.  That heuristic errs
+      toward leaving code visible (right for its original absence/
+      presence consumers), which is ANTI-conservative here: a
+      statement-position regex literal (``if (a) /{/.test(x)``, or
+      after ``return`` / ``]``) stays visible and feeds its interior
+      braces to the tracker as phantoms — and a balanced phantom PAIR
+      (``/{/`` inside the wrap, ``/}/`` after it) defeats the
+      EOF-unbalance refusal.  Over-blanking is brace-conservative in
+      both directions: an UNBALANCED swallow of a real brace leaves
+      the file unbalanced (underflow or EOF-leftover → True), and a
+      BALANCED swallow needs the block's open and close inside one
+      same-line span, where the validator-line keyword arms already
+      refuse.  Keyword classification is untouched by construction —
+      it never reads this view (a greedy span between two genuine
+      divisions can swallow an ``if``, which is exactly why the
+      classifier must not look here).  Character classes (``[/{]``)
+      and escapes do not close a span; an unclosed ``/`` blanks
+      nothing (division tails carry no braces the source didn't).
+    * Annex-B HTML comment channels — ``<!--`` to end of line, and a
+      line whose code starts with ``-->`` — blank the same way: dead
+      to execution, visible to the tracker, and pairable into the
+      same balanced-phantom shape.
+
+    Length-preserving (blanked spans become spaces), so the tracker
+    view stays per-character aligned with the sanitized view it was
+    derived from.
+    """
+    stripped = line.lstrip()
+    if stripped.startswith("-->"):
+        return " " * len(line)
+    cut = line.find("<!--")
+    if cut != -1:
+        line = line[:cut] + " " * (len(line) - cut)
+    if "/" not in line:
+        return line
+    out = list(line)
+    n = len(line)
+    i = 0
+    while i < n:
+        if line[i] != "/":
+            i += 1
+            continue
+        j = i + 1
+        in_class = False
+        closed = False
+        while j < n:
+            ch = line[j]
+            if ch == "\\":
+                j += 2
+                continue
+            if in_class:
+                if ch == "]":
+                    in_class = False
+            elif ch == "[":
+                in_class = True
+            elif ch == "/":
+                closed = True
+                break
+            j += 1
+        if not closed:
+            break
+        for k in range(i, j + 1):
+            out[k] = " "
+        i = j + 1
+    return "".join(out)
+def _lexical_validator_in_branch(
+    source_text: str, validator_line: int, sink_line: int,
+    *, guard_shaped: bool = False, language: str = "javascript",
+) -> bool:
+    """Brace-language (JS/TS/Java/C/C++) analogue of
+    :func:`_validator_in_branch`: True when the validator line is
+    conditionally executed relative to the sink.
+
+    Tracks a stack of ``{`` blocks tagged conditional by the keyword
+    preceding the brace.  The validator is branch-wrapped when a
+    conditional block open at the validator line has closed again
+    before the sink line (``if (opts.clean) { x = escape(x); }
+    send(x)``) — sharing the block is fine (whenever the sink runs the
+    validator ran).  A conditional keyword on the validator line
+    itself (braceless ``if (c) x = escape(x);``) also flags, as does a
+    DANGLING guard — ``if (c)`` alone on the nearest preceding
+    non-blank line with no ``{``, whose guarded statement is the
+    validator line (legal Java/JS braceless form the brace tracker
+    never sees).  Residual, not modeled: ternaries, and dangling
+    guards whose condition spans multiple lines (the keyword is then
+    not on the nearest preceding line).  CONSERVATIVE on tracker
+    confusion (unbalanced braces after scrubbing) in BOTH directions:
+    a ``}`` with no open block (underflow) returns True immediately,
+    and a block still open when the file ends (excess ``{``) returns
+    True as well — "not proven unconditional" must never read as
+    dominance.  The excess direction matters: a phantom ``{`` the
+    scrubber failed to blank pushes an extra block, the real ``}``
+    closing the enclosing conditional pops the phantom instead, and
+    the conditional reads "still open at the sink" — certifying
+    dominance for a branch-wrapped validator.
+
+    Scrubbing uses the whole-file comment/string-blanked view
+    (:func:`code_view_lines`, ``language``-aware) — the same
+    chokepoint the validator-line anchors use.  A per-line scrubber
+    cannot see enclosing multi-line constructs, so one ``{`` planted
+    inside a multi-line block comment or template literal leaked into
+    the stack (the phantom above).
+
+    ``guard_shaped=True`` is for ``kind="charset"`` guard validators
+    whose exit-on-fail lives ON the matched line (``if
+    (!x.matches("[a-z]+")) return;``): the guard line legitimately
+    carries ONE conditional keyword and legitimately opens its own
+    conditional block, so the single-keyword-on-line check is skipped
+    and blocks OPENED on the validator line itself are exempt from
+    the closed-before-sink test.  The preceding-line dangling scan
+    still applies — the guard's own ``if`` is on its line, so a
+    conditional keyword on the nearest preceding non-blank line is
+    always enclosing.  A SECOND conditional
+    keyword on the guard line is an enclosing conditional collapsed
+    onto it (``if (strict) { if (!ok) { return; } }``) and refuses —
+    a block that both opens and closes on the guard line is invisible
+    to the brace snapshots below.  Enclosing conditional blocks
+    (opened on earlier lines) still flag, including ones whose ``}``
+    lands on the guard line: the branch-wrap snapshot is taken at the
+    START of the validator line so a same-line close cannot hide them.
+    """
+    lines = split_source_lines(source_text)
+    if not (0 < validator_line <= len(lines) and 0 < sink_line <= len(lines)):
+        return True
+    view = code_view_lines(source_text, language)
+    if len(view) < len(lines):
+        # Defensive: the scanner preserves newlines, so the views map
+        # 1:1; pad rather than index past the end if that ever drifts.
+        view = view + [""] * (len(lines) - len(view))
+    scrubbed_validator = view[validator_line - 1]
+    if not guard_shaped:
+        if _COND_BLOCK_KEYWORD.search(scrubbed_validator):
+            return True
+    elif len(_COND_BLOCK_KEYWORD.findall(scrubbed_validator)) >= 2:
+        # The guard accounts for exactly one conditional keyword on
+        # its own line; any further one wraps the guard conditionally.
+        return True
+    # Dangling braceless conditional on the nearest preceding
+    # non-blank scrubbed line (a conditional keyword opening no block
+    # there): for a plain validator, the validator line IS its
+    # guarded statement; for guard_shaped, the guard's own ``if``
+    # lives on the validator line, so a preceding-line keyword is
+    # always an ENCLOSING conditional — braceless (`if (strict)` then
+    # the guard line), or with its `{` landing on the guard line,
+    # where the open-line exemption below would otherwise wave it
+    # through.
+    for prev_idx in range(validator_line - 2, -1, -1):
+        prev = view[prev_idx]
+        if not prev.strip():
+            continue
+        if _COND_BLOCK_KEYWORD.search(prev) and "{" not in prev:
+            return True
+        break
+    # Each block gets a unique id so "still open at the sink" means the
+    # SAME block, not merely the same nesting depth.  The scan runs to
+    # the END of the file (not just the sink line): leftover open
+    # blocks at EOF mean the tracker mis-lexed something — every
+    # judgment it made is then suspect, including the sink snapshot.
+    stack: list[tuple[int, bool, int]] = []  # (block id, conditional?, open line)
+    at_validator: list[tuple[int, bool, int]] | None = None
+    opened_on_validator: list[tuple[int, bool, int]] = []
+    open_at_sink: set[int] | None = None
+    next_id = 0
+    prev_tail = ""                       # SOFT-view text since the last brace
+    # Braces come from the hard-blanked tracker view; prev_tail (the
+    # conditional classifier) accumulates the per-char-aligned SOFT
+    # view — a greedy division span must never swallow a real keyword
+    # (that would classify a real wrap non-conditional), and a phantom
+    # keyword from the soft view can only add a refusal.
+    for idx, (soft, text) in enumerate(
+            zip(view, map(_tracker_brace_view, view)), start=1):
+        if idx == validator_line:
+            # Snapshot at line START: a block whose `}` lands on the
+            # validator line itself must still count as wrapping it.
+            at_validator = list(stack)
+        if "{" not in text and "}" not in text:
+            prev_tail += soft
+        else:
+            for pos, ch in enumerate(text):
+                if ch == "{":
+                    conditional = bool(_COND_BLOCK_KEYWORD.search(prev_tail))
+                    entry = (next_id, conditional, idx)
+                    stack.append(entry)
+                    if idx == validator_line:
+                        opened_on_validator.append(entry)
+                    next_id += 1
+                    prev_tail = ""
+                elif ch == "}":
+                    if not stack:
+                        return True      # tracker confused — conservative
+                    stack.pop()
+                    prev_tail = ""
+                else:
+                    prev_tail += soft[pos]
+        if idx == sink_line:
+            # Snapshot at line END (matches the historical semantics of
+            # stopping the scan after the sink line).
+            open_at_sink = {block_id for block_id, _, _ in stack}
+    if stack:
+        # Excess-'{' direction: a block never closed by EOF.  The
+        # phantom-brace shape (a '{' the scrubber failed to blank)
+        # lands here when its stray open survives to EOF; a stray open
+        # CONSUMED by a later real '}' shifts every close after it, so
+        # the file still ends unbalanced unless the source itself also
+        # carries a matching stray '}' — at which point the underflow
+        # arm above fires first on that close.
+        return True
+    if at_validator is None or open_at_sink is None:
+        return True
+    # Every conditional block wrapping the validator — open at its
+    # line start, or opened on the line itself — must STILL be open
+    # at the sink; one that closed in between means the sink runs on
+    # paths that skipped the validator.
+    return any(
+        conditional and block_id not in open_at_sink
+        for block_id, conditional, open_line in at_validator + opened_on_validator
+        if not (guard_shaped and open_line == validator_line)
+    )
+
+
+def find_validator_line(
+    source_text: str, spec: ValidatorSpec, *, language: str = "python",
+    sink_line: int | None = None,
+) -> int | None:
     """Locate the validator's 1-based line number in the post-fix source
     text.  Matches by the stripped line-text the extractor saved on the
-    spec; first occurrence wins (multiple matches are unusual and any of
-    them would gate the sink the same way).
+    spec.
+
+    Occurrence selection mirrors Tier 1B's
+    ``_find_best_validator_line``: with ``sink_line`` given, prefer
+    CODE occurrences strictly before the sink — for Python, among
+    those in the SAME function as the sink — picking the closest
+    (largest line < sink_line).  First-match-wins (the historical
+    rule, kept for callers without a sink) could bind an occurrence
+    in an unrelated function and fail the dominance check even when a
+    later occurrence is the actual sanitizer — a pure yield loss, the
+    verdict then lands NOT_APPLICABLE rather than SOUND.  When no
+    occurrence precedes the sink, the first occurrence is returned
+    and the dominance check downstream refuses it.
+
+    Anchored against the comment/string-blanked view of the file: a
+    line whose validator text lives inside a comment or a multi-line
+    string is prose — matching it would bind the dominance check to a
+    decoy location (a planted earlier copy inside a docstring would
+    otherwise shadow the real validator).
 
     Pre-fix this read the file from disk; the refactor pulls the I/O out
     to :func:`try_tier0` so the source text can be reused by the
     dominance check without a second read.
     """
     needle = spec.source_line
-    for idx, ln in enumerate(source_text.splitlines()):
-        if ln.strip() == needle:
-            return idx + 1
-    return None
+    lines = split_source_lines(source_text)
+    view = code_view_lines(source_text, language)
+    candidates: list[int] = []
+    for idx, ln in enumerate(lines):
+        if ln.strip() != needle:
+            continue
+        view_ln = view[idx] if idx < len(view) else None
+        if extract_validator_from_line(
+            ln, language, code_view=view_ln,
+        ) is None:
+            continue
+        candidates.append(idx + 1)
+    if not candidates:
+        return None
+    if sink_line is None:
+        return candidates[0]
+    before = [ln for ln in candidates if ln < sink_line]
+    if not before:
+        return candidates[0]
+    if language == "python":
+        try:
+            tree = ast.parse(source_text)
+        except SyntaxError:
+            return max(before)
+        sink_fn = _function_containing(tree, sink_line)
+        if sink_fn is not None:
+            same_fn = [ln for ln in before
+                       if _function_containing(tree, ln) is sink_fn]
+            if same_fn:
+                return max(same_fn)
+        return max(before)
+    return max(before)
 
 
 def _target_rebinds(target: ast.AST, var_name: str) -> bool:
@@ -822,12 +1503,27 @@ def _variable_reassigned_between(
       * ``for x in …:`` (For / AsyncFor)
       * ``with … as x:`` (With / AsyncWith optional_vars)
       * ``(x := …)`` (NamedExpr walrus)
+      * ``except … as x:`` (ExceptHandler, plain and ``except*``)
+      * ``case x:`` / ``case … as x`` / ``case [*x]`` / ``case {**x}``
+        (match-case capture / as / star / mapping-rest patterns — all
+        bind in the ENCLOSING scope, 3.10+)
+      * ``def x(…)`` / ``class x`` / ``type x = …`` (definition
+        statements shadow the name with a new object)
+      * ``import m as x`` / ``from m import y as x`` (and
+        ``from m import *``, which can rebind ANY name — flagged for
+        every variable, the conservative direction)
 
     Pure-mutation forms (``x[0] = …``, ``x.attr = …``) don't rebind
-    ``x`` itself and are NOT flagged.  Function/class definitions and
-    imports that happen to bind ``x`` are not flagged either — they
-    create their own scopes and very rarely appear between a fix-added
-    substitution and its sink.
+    ``x`` itself and are NOT flagged.  Also NOT flagged, each sound by
+    scope/runtime semantics rather than by rarity: ``del x`` (unbinds —
+    a later use of the name raises ``NameError``, so no value flows),
+    comprehension targets and ``lambda``/``def`` parameters (they bind
+    their own scope, never the enclosing one), and ``global`` /
+    ``nonlocal`` statements (declarations — the actual binding is an
+    Assign-family node this walk already flags).  The
+    constructs-vs-detector closure test pins this enumeration against
+    CPython's own ``symtable`` so a new binding construct cannot be
+    missed silently.
     """
     for node in ast.walk(tree):
         line = getattr(node, "lineno", None)
@@ -863,6 +1559,33 @@ def _node_rebinds_var(node: ast.AST, var_name: str) -> bool:
     # body x IS the exception, not the sanitized value).
     if isinstance(node, ast.ExceptHandler) and node.name == var_name:
         return True
+    # match-case patterns bind names in the ENCLOSING scope (3.10+):
+    # ``case x:`` and ``case [...] as x`` (MatchAs), ``case [1, *x]``
+    # (MatchStar), ``case {..., **x}`` (MatchMapping rest).  Nested
+    # patterns (inside MatchClass / MatchSequence / MatchOr) are
+    # reached because every caller drives ``ast.walk``.  A sink
+    # consuming the case-bound value is exactly the rebind this
+    # helper exists to catch.
+    if isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name == var_name:
+        return True
+    if isinstance(node, ast.MatchMapping) and node.rest == var_name:
+        return True
+    # ``import m as x`` / ``from m import y as x`` rebind x to a
+    # module/attribute object; a bare ``import a.b`` binds the top
+    # package name ``a``.  ``from m import *`` (module scope only)
+    # can rebind ANY name — flagged for every variable, the
+    # conservative (kill) direction.
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        for alias in node.names:
+            if alias.name == "*":
+                return True
+            if (alias.asname or alias.name.split(".")[0]) == var_name:
+                return True
+    # ``type x = ...`` (3.12+) binds x like a class definition.
+    if _TYPE_ALIAS_NODE is not None and isinstance(node, _TYPE_ALIAS_NODE):
+        alias_name = node.name  # type: ignore[attr-defined]
+        if isinstance(alias_name, ast.Name) and alias_name.id == var_name:
+            return True
     # Nested function / class definitions inside the body shadow
     # the outer name with a function/class object — rare but
     # possible in fix code.
@@ -872,10 +1595,13 @@ def _node_rebinds_var(node: ast.AST, var_name: str) -> bool:
 
 def _rebound_in_loop_containing_sink(
     tree: ast.AST, var_name: str, validator_line: int, sink_line: int,
+    *, sanitizer_call_tails: frozenset | None = None,
 ) -> bool:
     """True iff ``var_name`` is rebound anywhere inside a loop whose
-    span contains the sink line (the validator's own line is exempt —
-    for ``charset_sub`` the rebind IS the sanitization).
+    span contains the sink line (the validator's own sanitizing
+    binding NODE is exempt — for ``charset_sub`` that rebind IS the
+    sanitization; other bindings sharing the validator's line, e.g. a
+    trailing ``; x = raw``, count like any other rebind).
 
     Loop back-edge soundness: the flat ``(validator, sink)`` interval
     treats the function as straight-line code, but when the sink sits
@@ -896,7 +1622,10 @@ def _rebound_in_loop_containing_sink(
             continue
         for node in ast.walk(loop):
             line = getattr(node, "lineno", None)
-            if line is None or line == validator_line:
+            if line is None:
+                continue
+            if line == validator_line and _is_sanitizing_binding_node(
+                    node, sanitizer_call_tails):
                 continue
             if _node_rebinds_var(node, var_name):
                 return True
@@ -927,6 +1656,7 @@ _SINK_CLASS_TO_CWE = {
     "xss": "CWE-79",
     "sqli": "CWE-89",
     "cmdi": "CWE-78",
+    "cmdi_argv": "CWE-88",
     "pathtrav": "CWE-22",
 }
 
@@ -1002,7 +1732,14 @@ def _maybe_record_parity(
         }
         verdict = value_bound_verdict_for(finding)
         record = build_parity_record(
-            finding_id=f"{file_path}:{validator_line}:{sink_line}:{cwe}",
+            # ``kind`` joins the id: a charset and a charset_sub
+            # observation at the same coordinates are two different
+            # lexical decisions, and the report's last-record-wins
+            # dedupe would otherwise collapse them (under-counting one
+            # shape in the window that gates lexical removal).
+            finding_id=(
+                f"{file_path}:{validator_line}:{sink_line}:{cwe}:{kind}"
+            ),
             file=file_path,
             cwe=cwe,
             language=language,
@@ -1125,13 +1862,11 @@ def _value_bound_dominates(
         java_text = None
         if resolved.language == "java" and file_path:
             # The constant-definers pre-check folds over the file's
-            # AST; an unreadable file skips that check, never the gate.
-            try:
-                java_text = Path(file_path).read_text(
-                    encoding="utf-8", errors="replace",
-                )
-            except OSError:
-                java_text = None
+            # AST; an unreadable file skips that check, never the
+            # gate. Capped read: the path names scanned-repo source,
+            # and a truncated read only weakens the pre-check.
+            got = read_text_capped(file_path)
+            java_text = got[0] if got is not None else None
         result = evaluate_finding(
             resolved.cfg,
             [resolved.source_node],
@@ -1147,6 +1882,13 @@ def _value_bound_dominates(
             # telemetry used for the strict-promotion decision.
             extra_bindings=resolved.inter_proc_bindings,
             java_source_text=java_text,
+            # Keep the kwarg set in lockstep with the Phase-15 parity
+            # shadow (sanitizer_cut_parity.value_bound_verdict_for):
+            # java_file_path activates the bounded cross-file constant
+            # resolver, so omitting it here while the shadow passes it
+            # makes the telemetry that gates Phase-16 lexical removal
+            # measure a DIFFERENT gate than production runs.
+            java_file_path=file_path,
         )
     except Exception:                                       # noqa: BLE001
         return None
@@ -1226,6 +1968,54 @@ def validator_dominates_sink(
     return lexical
 
 
+def _if_test_contains_call(tree: ast.AST, line: int) -> bool:
+    """True when the :class:`ast.If` at ``line`` tests a CALL result.
+
+    Node-anchor for the guard kind: the certified charset always comes
+    from a validation call (``re.match``/``fullmatch``/method guard),
+    so the ``if`` at the validator line must actually test one.  A
+    decoy sharing a line with an unrelated exiting guard (``if not
+    flag: raise  # if not re.match(...): raise``) has a call-free
+    test — prose next to code must not certify.
+    """
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If) and node.lineno == line:
+            return any(
+                isinstance(sub, ast.Call) for sub in ast.walk(node.test)
+            )
+    return False
+
+
+def _sub_call_bound_at_line(
+    tree: ast.AST, line: int, var_name: str,
+) -> bool:
+    """True when ``line`` really binds ``var_name`` from a ``.sub``
+    call — the AST node-anchor for ``kind="charset_sub"``.  A
+    substitution that exists only inside a comment or string literal
+    is invisible to the AST, so requiring the real binding kills
+    comment/string decoys for every lift lane (mechanical and
+    LLM-pointed alike)."""
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+            continue
+        if node.lineno != line or node.value is None:
+            continue
+        targets = (
+            node.targets if isinstance(node, ast.Assign) else [node.target]
+        )
+        if not any(
+            isinstance(t, ast.Name) and t.id == var_name for t in targets
+        ):
+            continue
+        for sub in ast.walk(node.value):
+            if isinstance(sub, ast.Call):
+                func = sub.func
+                if (isinstance(func, ast.Attribute) and func.attr == "sub") \
+                        or (isinstance(func, ast.Name) and func.id == "sub"):
+                    return True
+    return False
+
+
 def _lexical_validator_dominates(
     source_text: str, validator_line: int, sink_line: int,
 ) -> bool:
@@ -1240,7 +2030,20 @@ def _lexical_validator_dominates(
         return False
     if not _same_function_in_order(tree, validator_line, sink_line):
         return False
-    return _validator_block_exits_on_failure(tree, validator_line)
+    if not _validator_block_exits_on_failure(tree, validator_line):
+        return False
+    if not _if_test_contains_call(tree, validator_line):
+        return False
+    # Enclosing-conditional gate: an exit-on-fail guard nested inside
+    # another conditional (``if cond: if not re.match(...): raise``)
+    # executes only on some paths — the sink still runs on paths that
+    # skipped the guard, so certifying dominance would suppress a live
+    # flow. The guard's OWN ``if`` is excluded (a single-line guard
+    # spans its own body). Same gate the known_safe_call kind already
+    # carries in tier1_llm.
+    return not _validator_in_branch(
+        tree, validator_line, sink_line, exclude_guard_at=validator_line,
+    )
 
 
 # Function-definition markers per non-Python language.  Used by the
@@ -1268,7 +2071,10 @@ _JSTS_METHOD_MODIFIERS = (
     r"|public\s+|private\s+|protected\s+|readonly\s+)*"
 )
 # Optional generator marker — ``function* name()`` / ``*method()``.
-_JSTS_GENERATOR = r"\*?\s*"
+# The whitespace is gated on the literal ``*`` ((?:\*\s*)?): the
+# naive ``\*?\s*`` put a second unbounded whitespace span adjacent
+# to the surrounding ones — quadratic on an indentation-run line.
+_JSTS_GENERATOR = r"(?:\*\s*)?"
 
 _FUNCTION_BOUNDARY_PATTERNS = {
     # JS / TS:
@@ -1276,19 +2082,25 @@ _FUNCTION_BOUNDARY_PATTERNS = {
     #   `=> {` arrow function declaration at end of line
     #   `<modifier*> [*] name(args) {` ES6 method or TS class method —
     #     with a negative lookahead so `if (x) {` etc. don't match
+    # ``function`` head: the generator star and the name each own
+    # their trailing whitespace ((?:\*\s*)? / (?:\w+\s*)?) — the
+    # naive ``\s*\*?\s*\w*\s*\(`` chained unbounded whitespace
+    # spans through optional atoms, quadratic on a whitespace run
+    # after the keyword. Same language: the merged runs land in the
+    # first span.
     "javascript": _re.compile(
-        rf"\bfunction\s*{_JSTS_GENERATOR}\w*\s*\("
-        r"|=>\s*\{?\s*$"
+        rf"\bfunction\s*(?:\*\s*)?(?:\w+\s*)?\("
+        r"|=>\s*(?:\{\s*)?$"
         rf"|^\s*{_JSTS_METHOD_MODIFIERS}{_JSTS_GENERATOR}"
         rf"(?!{_JS_NOT_FUNC}\b)"
-        r"[A-Za-z_$][\w$]*\s*\([^)]*\)\s*\{",
+        r"[A-Za-z_$][\w$]*\s*\([^)]{0,4096}\)\s*\{",
     ),
     "typescript": _re.compile(
-        rf"\bfunction\s*{_JSTS_GENERATOR}\w*\s*\("
-        r"|=>\s*\{?\s*$"
+        rf"\bfunction\s*(?:\*\s*)?(?:\w+\s*)?\("
+        r"|=>\s*(?:\{\s*)?$"
         rf"|^\s*{_JSTS_METHOD_MODIFIERS}{_JSTS_GENERATOR}"
         rf"(?!{_JS_NOT_FUNC}\b)"
-        r"[A-Za-z_$][\w$]*\s*\([^)]*\)\s*\{",
+        r"[A-Za-z_$][\w$]*\s*\([^)]{0,4096}\)\s*\{",
     ),
     # Java:
     #   `<modifier+> <return-type?> name(args) [throws ...] {?` — the
@@ -1300,12 +2112,26 @@ _FUNCTION_BOUNDARY_PATTERNS = {
     #     negative lookahead excludes control-flow keywords so
     #     `if (x) {` doesn't false-positive match.
     "java": _re.compile(
+        # gated optional brace tails ((?:\{\s*)?$) — the
+        # ``\{?\s*$`` pairs were quadratic on signature lines
+        # ending in whitespace runs
+        # signature spans BOUNDED and paren-deterministic: the
+        # pre-parameter run stops at '(' (with a bounded allowance
+        # for up to two parenthesized annotation groups), parameter/
+        # throws/generic spans carry generous bounds. Unbounded (or
+        # '('-crossing) spans let a hostile line planting the
+        # modifier keyword re-scan the line tail per occurrence —
+        # quadratic, and worse through the nested parameter span.
+        # Real one-line signatures sit far inside these bounds; a
+        # longer line stops matching (the boundary check misses it)
+        # instead of scanning without bound.
         r"\b(?:public|private|protected|static|final|abstract|synchronized)\b"
-        r"[^{};]*\([^)]*\)\s*(?:throws[^{]*)?\{?\s*$"
+        r"(?:[^{};(]{0,400}\([^){};]{0,200}\)){0,2}[^{};(]{0,400}"
+        r"\([^)]{0,2000}\)\s*(?:throws[^{]{0,2000})?(?:\{\s*)?$"
         rf"|^\s*(?!{_JAVA_NOT_FUNC}\b)"
         r"(?:(?:void|boolean|byte|char|short|int|long|float|double)"
-        r"|[A-Z]\w*(?:<[^>]*>)?(?:\[\])?)\s+"
-        r"\w+\s*\([^)]*\)\s*(?:throws[^{]*)?\{?\s*$",
+        r"|[A-Z]\w*(?:<[^>]{0,1000}>)?(?:\[\])?)\s+"
+        r"\w+\s*\([^)]{0,2000}\)\s*(?:throws[^{]{0,2000})?(?:\{\s*)?$",
     ),
     # Ruby: ``def name`` (instance) or ``def self.name`` (class method)
     # at line start (any indentation level for nested methods / class
@@ -1330,7 +2156,7 @@ def _crosses_function_boundary(
     pat = _FUNCTION_BOUNDARY_PATTERNS.get(language)
     if pat is None:
         return False
-    lines = source_text.splitlines()
+    lines = split_source_lines(source_text)
     # lines is 0-indexed; validator/sink are 1-indexed lines.
     return any(pat.search(ln) for ln in lines[validator_line:sink_line - 1])
 
@@ -1349,21 +2175,30 @@ def _collect_target_names(target: ast.AST, names: set) -> None:
 
 
 def _operator_mixes_taint(value: ast.AST, chain: set) -> bool:
-    """True when a string-building operator expression inside ``value``
-    combines a chain member with a non-chain :class:`ast.Name`.
+    """True when a string-building operator expression OR a container
+    literal inside ``value`` combines a chain member with a non-chain
+    :class:`ast.Name`.
 
-    Covers ``BinOp`` (``+`` concatenation and ``%`` formatting) and
-    f-strings (``JoinedStr``).  Call-ARGUMENT mixing
-    (``os.path.join(BASE, name)``) is deliberately NOT flagged: the
-    chain's documented contract accepts derivations through calls
+    Covers ``BinOp`` (``+`` concatenation and ``%`` formatting),
+    f-strings (``JoinedStr``), and container literals (``Tuple`` /
+    ``List`` / ``Set`` / ``Dict``): ``p = [safe, raw]`` carries the
+    raw element verbatim to whatever consumes ``p`` (``''.join(p)``),
+    and a select over a mixed container (``{...: safe, ...: raw}[k]``)
+    may BE the raw member — so a target bound to a mixed container
+    must never join the chain as fully validated.  Call-ARGUMENT
+    mixing (``os.path.join(BASE, name)``) is deliberately NOT flagged:
+    the chain's documented contract accepts derivations through calls
     (the whoogle archetype), and distinguishing a module constant
     from a tainted local inside an argument list needs real taint
     tracking — Tier 2's job.  Operator mixing is the shape the
-    charset proof actually breaks on: the concatenated non-chain
+    charset proof actually breaks on: the mixed-in non-chain
     operand's characters reach the sink unvalidated.
     """
     for sub in ast.walk(value):
-        if isinstance(sub, (ast.BinOp, ast.JoinedStr)):
+        if isinstance(sub, (ast.BinOp, ast.JoinedStr,
+                            ast.Tuple, ast.List, ast.Set, ast.Dict)):
+            if isinstance(sub, ast.Tuple) and isinstance(sub.ctx, ast.Store):
+                continue  # target-side tuple, not a value expression
             names = {
                 n.id for n in ast.walk(sub) if isinstance(n, ast.Name)
             }
@@ -1372,9 +2207,220 @@ def _operator_mixes_taint(value: ast.AST, chain: set) -> bool:
     return False
 
 
+def _is_sanitizer_call_value(
+    value: ast.AST | None, tails: frozenset | None,
+) -> bool:
+    """True iff ``value`` IS the sanitizer call's result expression —
+    an :class:`ast.Call` whose callee tail is one of ``tails`` (any
+    call when the lane cannot name it).  Deliberately NOT a subtree
+    search: a value that merely CONTAINS the call
+    (``[escape(x), x]``, ``{...}[flag]``, ``escape(x) + raw``) mixes
+    raw input around the sanitized result, so it must never earn the
+    validator-binding exemption."""
+    if not isinstance(value, ast.Call):
+        return False
+    if tails is None:
+        return True
+    func = value.func
+    if isinstance(func, ast.Name):
+        return func.id in tails
+    if isinstance(func, ast.Attribute):
+        return func.attr in tails
+    return False
+
+
+def _is_sanitizing_binding_node(
+    node: ast.AST, tails: frozenset | None,
+) -> bool:
+    """True iff ``node`` is a binding statement whose bound value IS
+    the sanitizer call (Assign / AnnAssign / walrus).  Used to scope
+    the validator-line exemption to the sanitizing binding NODE — the
+    whole-LINE exemption certified any trailing same-line rebind
+    (``p = safe_join(base, fn); p = fn``) as still validated."""
+    if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+        return _is_sanitizer_call_value(getattr(node, "value", None), tails)
+    return False
+
+
+def _class_body_escaping_bindings(
+    scope_root: ast.AST,
+) -> list[tuple[ast.AST, frozenset]]:
+    """``(node, declared_names)`` pairs for bindings inside class
+    bodies that can rebind an ENCLOSING-scope name.
+
+    Class bodies execute inline at definition time (unlike function
+    bodies), and a ``global`` / ``nonlocal`` declaration inside the
+    body redirects that name's bindings to the enclosing/module scope
+    — ``class C: global x; x = raw`` between validator and sink
+    rebinds the validated ``x`` exactly like a top-level assignment,
+    while :func:`_walk_same_scope` correctly keeps ordinary
+    class-namespace bindings out of the chain walk.  Kill-direction
+    only: a class-body binding never GROWS the chain (an undeclared
+    target is a class attribute, and modelling even the declared case
+    as growth buys nothing the kill doesn't).
+
+    Nested classes are collected by the outer scan; function bodies
+    inside class bodies stay excluded (they do not execute inline).
+    """
+    classes: list[ast.ClassDef] = []
+    stack = list(ast.iter_child_nodes(scope_root))
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.Lambda)):
+            continue
+        if isinstance(node, ast.ClassDef):
+            classes.append(node)
+        stack.extend(ast.iter_child_nodes(node))
+    out: list[tuple[ast.AST, frozenset]] = []
+    for cls in classes:
+        declared: set = set()
+        body_nodes: list[ast.AST] = []
+        inner = list(ast.iter_child_nodes(cls))
+        while inner:
+            n = inner.pop()
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                              ast.Lambda, ast.ClassDef)):
+                continue  # nested classes handled by the outer scan
+            if isinstance(n, (ast.Global, ast.Nonlocal)):
+                declared.update(n.names)
+            body_nodes.append(n)
+            inner.extend(ast.iter_child_nodes(n))
+        if declared:
+            frozen = frozenset(declared)
+            out.extend((n, frozen) for n in body_nodes)
+    return out
+
+
+def _nested_scope_escaping_rebinds(scope_root: ast.AST) -> frozenset:
+    """Enclosing-scope names a NESTED function can rebind — the
+    ``nonlocal``/``global``-declared names that some nested
+    function/method body assigns.
+
+    Function bodies do not execute inline, but any call between
+    validator and sink (direct, indirect, or through a callback) may
+    run them — and call positions are not tracked here, so the only
+    sound treatment is kill-direction membership for the whole
+    window: a chain member a nested scope can rebind is never
+    provably still the validated value at the sink.  Shrink-only
+    (mirrors the class-body arm): these names never GROW the chain.
+
+    Over-approximates on purpose: declarations and assignments are
+    paired per nested function without modelling which enclosing
+    scope each ``nonlocal`` resolves to — the cost is a declined
+    suppression, never a false one.
+    """
+    out: set = set()
+    for node in ast.walk(scope_root):
+        if node is scope_root or not isinstance(
+            node, (ast.FunctionDef, ast.AsyncFunctionDef),
+        ):
+            continue
+        declared: set = set()
+        for sub in ast.walk(node):
+            if isinstance(sub, (ast.Global, ast.Nonlocal)):
+                declared.update(sub.names)
+        if not declared:
+            continue
+        for sub in ast.walk(node):
+            for name in declared - out:
+                if _node_rebinds_var(sub, name):
+                    out.add(name)
+    return frozenset(out)
+
+
+def _sanitizer_tails_for_spec_kind(kind: str) -> frozenset | None:
+    """Callee-name tails identifying the sanitizing binding on the
+    validator line for a mechanical :class:`ValidatorSpec` kind.
+    ``charset_sub``'s binding is always an ``re.sub`` rebind;
+    guard-shaped kinds bind nothing themselves, so any call-valued
+    binding on the guard line (e.g. a walrus normalising the guarded
+    value, which the guard then constrains) keeps the exemption
+    (``None`` = any call)."""
+    return frozenset({"sub"}) if kind == "charset_sub" else None
+
+
+def _bind_chain_target(
+    target: ast.AST, value: ast.AST, chain: set,
+    grows: set, kills: set, *, at_validator: bool,
+    tails: frozenset | None,
+) -> None:
+    """Chain grow/kill decision for ONE assignment target bound to
+    ``value``, element-wise through tuple/list structure (mirroring
+    runtime unpacking).
+
+    Statement-level "any RHS name is a member → every target joins"
+    certified the co-assigned raw value in ``a, b = safe, x`` (``b``
+    IS raw ``x``) and kept ``safe`` a member through the swap idiom
+    ``safe, x = x, safe`` while rebinding it to raw ``x``.  Pairing
+    evaluates each element against the PRE-statement chain
+    (simultaneous-assignment semantics) and the caller applies
+    ``(chain | grows) - kills`` — kill wins on a name that appears in
+    both, the conservative direction.  Unpairable shapes (starred
+    target, length mismatch, non-literal RHS for a destructuring
+    target) contribute no members and kill member targets — the
+    unpacked provenance is unknown; refusing costs yield, never
+    soundness.
+
+    The validator line's own sanitizing binding — the target(s) whose
+    paired value IS the sanitizer call (:func:`_is_sanitizer_call_value`)
+    — is exempt: it binds the validated value.  Every OTHER binding on
+    the validator line carries a pre-sanitizer value forward and is
+    processed like any other line's.
+    """
+    if isinstance(target, (ast.Tuple, ast.List)):
+        if (
+            isinstance(value, (ast.Tuple, ast.List))
+            and len(value.elts) == len(target.elts)
+            and not any(isinstance(t, ast.Starred) for t in target.elts)
+        ):
+            for t_elt, v_elt in zip(target.elts, value.elts):
+                _bind_chain_target(
+                    t_elt, v_elt, chain, grows, kills,
+                    at_validator=at_validator, tails=tails,
+                )
+            return
+        names: set = set()
+        _collect_target_names(target, names)
+        kills |= names
+        return
+    names = set()
+    _collect_target_names(target, names)
+    if not names:
+        return  # Attribute / Subscript target: mutation, not a rebind
+    if at_validator and _is_sanitizer_call_value(value, tails):
+        return  # the sanitizing binding itself — the chain's seed
+    # Load-context names only: a walrus TARGET inside the RHS
+    # (``y = (x := raw)``) is a simultaneous rebind, not a read of
+    # the (possibly validated) old value — counting it as a read
+    # certified ``y`` from stale ``x`` while ``x`` was being
+    # rebound to raw data in the same statement.
+    rhs_names = {
+        n.id for n in ast.walk(value)
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
+    }
+    if chain & rhs_names:
+        if _operator_mixes_taint(value, chain):
+            # Taint mixing on a plain Assign: a string-building
+            # operator expression (``cmd = name + raw``, an f-string
+            # interpolating both) or a mixed container literal
+            # combines a chain member with a non-chain name.  The
+            # target carries PARTIALLY-unvalidated data, so it must
+            # never join the chain — and if it was a member, it stops
+            # being one.
+            kills |= names
+            return
+        grows |= names
+        return
+    # Rebind from non-chain RHS: the target no longer carries the
+    # validated value.
+    kills |= names
+
+
 def _python_chain_reaches_sink(
     tree: ast.AST, start_var: str, validator_line: int,
     sink_line: int, sink_line_text: str,
+    *, sanitizer_call_tails: frozenset | None = None,
 ) -> bool:
     """Intra-procedural data-dependency chain: ``True`` iff some variable
     reachable from ``start_var`` (via assignments between validator and
@@ -1392,19 +2438,39 @@ def _python_chain_reaches_sink(
 
     Chain growth: any Assign/AnnAssign/AugAssign between validator and
     sink whose RHS references a chain variable adds its target name(s)
-    to the chain — UNLESS the RHS operator-mixes taint
+    to the chain — element-wise through tuple/list destructuring
+    (:func:`_bind_chain_target`: ``a, b = safe, x`` grows only ``a``;
+    unpairable shapes never join and kill member targets) and UNLESS
+    the paired RHS operator-mixes taint
     (:func:`_operator_mixes_taint`): ``cmd = name + raw`` combines the
     validated ``name`` with the unvalidated ``raw``, so ``cmd`` never
-    joins the chain (and a chain-member target is killed).  Mixing
-    through call ARGUMENTS is not modeled (see the helper's docstring).
+    joins the chain (and a chain-member target is killed); container
+    literals mixing chain and non-chain names count as mixing too.
+    Mixing through call ARGUMENTS is not modeled (see the helper's
+    docstring).
+
+    Validator-line exemption is per-NODE, never per-line: only the
+    binding whose value IS the sanitizer call
+    (``sanitizer_call_tails``; any call when the lane cannot name it)
+    binds the validated value.  Any OTHER binding sharing the
+    validator's line carries a pre-sanitizer value forward and kills
+    like any other line's — the whole-line exemption certified
+    ``p = safe_join(base, fn); p = fn`` (and the ``p += fn`` /
+    trailing ``x = raw`` spellings) as still validated.
 
     Chain KILL: an assignment whose target is a chain member and whose
     RHS references NO chain member REBINDS that variable to a fresh
     value — the validator's constraint no longer applies to it.
     Without the kill, ``y = name; y = request.args.get('raw')`` left
     ``y`` "validated" at the sink and the Tier 0 verdict suppressed a
-    live flow.  Assignments are processed in source order (single
-    forward pass) so a later rebind wins over earlier derivation.
+    live flow.  ALL binding forms — Assign-family and the non-Assign
+    rebinds :func:`_node_rebinds_var` enumerates (loop targets, walrus,
+    ``with``/``except … as``, match captures, imports, def/class) —
+    are processed in ONE pass ordered by source position, so a later
+    rebind wins over an earlier derivation AND a derivation from an
+    already-rebound variable never joins (a kill that ran after chain
+    growth let ``for name in …: … ; y = name`` certify ``y`` from the
+    raw loop value).
     Loop-carried back-edges ARE modeled in the kill direction: a
     rebind sharing a loop with the sink removes the member (see
     :func:`_rebound_in_loop_containing_sink` — a rebind after the sink
@@ -1423,57 +2489,95 @@ def _python_chain_reaches_sink(
     # straight-line same-scope code and extended the validated chain
     # across scopes (false SOUND).  Walk only the sink's own scope.
     scope_root = _function_containing(tree, sink_line) or tree
-    assigns = [
-        node for node in _walk_same_scope(scope_root)
-        if isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign))
-        and validator_line <= (getattr(node, "lineno", None) or 0) <= sink_line
-        and node.value is not None
+    # ONE ordered pass over the whole window — Assign-family chain
+    # grow/kill AND the non-Assign rebind-KILL interleaved by source
+    # position.  A separate position-insensitive kill pass ran AFTER
+    # chain growth and only removed the rebound name itself, so
+    # ``for name in request.args.getlist('e'):`` followed by
+    # ``y = name`` certified ``y`` from the ALREADY-REBOUND raw value
+    # (false SOUND).  Killing at the rebind's own position means every
+    # later derivation sees the member already gone.
+    window: list = [
+        (node, None) for node in _walk_same_scope(scope_root)
+        if validator_line <= (getattr(node, "lineno", None) or -1) <= sink_line
     ]
-    assigns.sort(key=lambda n: (n.lineno, n.col_offset))
-    for node in assigns:
-        rhs_names = {
-            n.id for n in ast.walk(node.value) if isinstance(n, ast.Name)
-        }
-        targets = (list(node.targets) if isinstance(node, ast.Assign)
-                   else [node.target])
-        target_names: set = set()
-        for t in targets:
-            _collect_target_names(t, target_names)
-        # The validator line's own assignment BINDS the validated
-        # value (``abs_path = safe_join(...)``, ``x = re.sub(...)``) —
-        # it must not be treated as a rebind of the start variable.
+    # Class bodies execute inline: their ``global``/``nonlocal``-
+    # declared bindings rebind THIS scope's names, so they join the
+    # ordered window as kill-only events (see
+    # :func:`_class_body_escaping_bindings`).
+    window += [
+        (node, decls)
+        for node, decls in _class_body_escaping_bindings(scope_root)
+        if validator_line <= (getattr(node, "lineno", None) or -1) <= sink_line
+    ]
+    window.sort(
+        key=lambda pair: (pair[0].lineno,
+                          getattr(pair[0], "col_offset", 0)),
+    )
+    for node, class_decls in window:
+        if class_decls is not None:
+            # Kill-only: a class-body binding of a declared name
+            # escapes to this scope; everything else in the body is
+            # class-namespace and never touches the chain.
+            for var in list(chain):
+                if var in class_decls and _node_rebinds_var(node, var):
+                    chain.discard(var)
+            continue
+        if not isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+            # Non-Assign binding forms: walrus / loop targets,
+            # ``with|except ... as``, match-case captures, import
+            # aliases, nested def/class shadowing.  Shrink-only —
+            # back-edges never GROW the chain.  Only the node that IS
+            # the sanitization keeps its binding (a walrus wrapping
+            # the sanitizer call); every OTHER binding sharing the
+            # validator's line carries a pre-sanitizer value forward
+            # and kills like any other line's.
+            if (
+                node.lineno == validator_line
+                and isinstance(node, ast.NamedExpr)
+                and _is_sanitizer_call_value(node.value,
+                                             sanitizer_call_tails)
+            ):
+                continue
+            for var in list(chain):
+                if _node_rebinds_var(node, var):
+                    chain.discard(var)
+            continue
+        if node.value is None:
+            continue  # bare annotation (``x: int``) binds nothing
         at_validator = node.lineno == validator_line
         if isinstance(node, ast.AugAssign):
             # ``x += rhs`` mixes the old value with the RHS.  It never
             # ADDS to the chain (the old target value may be
             # unvalidated), and it kills a chain member when the RHS
             # references any non-chain name (the mixed-in data is not
-            # covered by the validator's constraint).
-            if rhs_names - chain and not at_validator:
+            # covered by the validator's constraint).  An AugAssign is
+            # never the sanitizing binding itself (every curated /
+            # mechanical sanitizer binds via plain assignment), so the
+            # validator line grants NO exemption here —
+            # ``p = safe_join(base, fn); p += fn`` re-taints ``p``.
+            rhs_names = {
+                n.id for n in ast.walk(node.value)
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
+            }
+            target_names: set = set()
+            _collect_target_names(node.target, target_names)
+            if rhs_names - chain:
                 chain -= target_names
             continue
-        if chain & rhs_names:
-            if _operator_mixes_taint(node.value, chain):
-                # Taint mixing on a plain Assign: a string-building
-                # operator expression (``cmd = name + raw``, an
-                # f-string interpolating both) combines a chain
-                # member with a non-chain name.  The target carries
-                # PARTIALLY-unvalidated data, so it must never join
-                # the chain — and if it was a member, it stops being
-                # one.  Pre-fix any RHS referencing at least one
-                # chain member added the target as fully validated,
-                # so the Tier 0 SOUND verdict suppressed the live
-                # ``raw``→sink flow (the AugAssign form already
-                # killed; the Assign spelling of the same mix did
-                # not).
-                if not at_validator:
-                    chain -= target_names
-                continue
-            chain |= target_names
-        elif not at_validator:
-            # Rebind from non-chain RHS: the target no longer carries
-            # the validated value.
-            chain -= target_names
+        targets = (list(node.targets) if isinstance(node, ast.Assign)
+                   else [node.target])
+        grows: set = set()
+        kills: set = set()
+        for t in targets:
+            _bind_chain_target(
+                t, node.value, chain, grows, kills,
+                at_validator=at_validator, tails=sanitizer_call_tails,
+            )
+        # Simultaneous-assignment semantics: every element pair was
+        # evaluated against the PRE-statement chain; kill wins when a
+        # name lands in both sets (conservative).
+        chain = (chain | grows) - kills
     # Loop back-edge kill: a rebind textually AFTER the sink (or before
     # the validator) still reaches the sink on the next iteration when
     # it shares a loop with the sink — the flat forward pass cannot see
@@ -1482,8 +2586,16 @@ def _python_chain_reaches_sink(
         var for var in chain
         if not _rebound_in_loop_containing_sink(
             tree, var, validator_line, sink_line,
+            sanitizer_call_tails=sanitizer_call_tails,
         )
     }
+    # Nested-scope escape kill: a nested function rebinding a chain
+    # member through ``nonlocal``/``global`` executes on ANY call in
+    # the window (``def taint(): nonlocal y; y = raw`` + ``taint()``),
+    # and call positions are untracked — such members leave the chain
+    # (shrink-only: conservative; see
+    # :func:`_nested_scope_escaping_rebinds`).
+    chain -= _nested_scope_escaping_rebinds(scope_root)
     if not chain:
         return False
     return any(_re.search(rf"\b{_re.escape(var)}\b", sink_line_text) for var in chain)
@@ -1529,7 +2641,7 @@ def _lexical_var_reaches_sink(
     """
     if not _re.search(rf"\b{_re.escape(var)}\b", sink_line_text):
         return False
-    lines = source_text.splitlines()
+    lines = split_source_lines(source_text)
     assign_re = _re.compile(rf"\b{_re.escape(var)}\b\s*=(?!=)")
     compound_re = _re.compile(
         rf"\b{_re.escape(var)}\b\s*"
@@ -1613,14 +2725,26 @@ def _lexical_substitution_dominates(
         tree = ast.parse(source_text)
     except SyntaxError:
         return False
+    if not _sub_call_bound_at_line(tree, validator_line, var_name):
+        return False
     if not _same_function_in_order(tree, validator_line, sink_line):
         return False
     if _variable_reassigned_between(tree, var_name, validator_line, sink_line):
         return False
+    # Enclosing-conditional gate: ``if cond: x = re.sub('[/.]', '', x)``
+    # sanitizes only on some paths — a branch-skipping path reaches the
+    # sink with the raw value, so certifying dominance would suppress a
+    # live flow. Same gate the known_safe_call kind already carries in
+    # tier1_llm.
+    if _validator_in_branch(tree, validator_line, sink_line):
+        return False
     # Loop back-edge: a rebind outside the flat interval still reaches
-    # the sink on the next iteration when both share a loop.
+    # the sink on the next iteration when both share a loop.  This
+    # helper is substitution-form only, so the sanitizing binding on
+    # the validator line is exactly the ``re.sub`` rebind.
     return not _rebound_in_loop_containing_sink(
         tree, var_name, validator_line, sink_line,
+        sanitizer_call_tails=frozenset({"sub"}),
     )
 
 
@@ -1898,22 +3022,41 @@ def try_tier0(
             Tier0Status.NOT_APPLICABLE,
             "no recognised charset/regex validator added in fix diff",
         )
-    src_path = repo_root / sink_uri.lstrip("/")
+    # Containment-checked read: ``sink_uri`` derives from SARIF /
+    # finding records produced over an untrusted repo, so a
+    # traversal-shaped URI (or an in-repo symlink) would walk the read
+    # outside ``repo_root`` and adjudicate a barrier against an
+    # arbitrary host file. Same defence as the module's siblings
+    # (tier1_llm.try_tier1b, injection_prescreen._read_source,
+    # cvefix_bridge._resolve_in_repo).
+    src_path = confine(repo_root, sink_uri)
+    if src_path is None:
+        return Tier0Result(
+            Tier0Status.NOT_APPLICABLE,
+            f"sink path {sink_uri!r} resolves outside the repo root — "
+            f"refusing to read it",
+            spec=spec,
+        )
     if not src_path.is_file():
         return Tier0Result(
             Tier0Status.NOT_APPLICABLE,
             f"post-fix source not readable at {sink_uri!r}",
             spec=spec,
         )
-    try:
-        source_text = src_path.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
+    # Capped read (shared default): a truncated read can only make
+    # the validator line unfindable below — NOT_APPLICABLE, falling
+    # through to Tier 2 — never prove a barrier from missing text.
+    got = read_text_capped(src_path)
+    if got is None:
         return Tier0Result(
             Tier0Status.NOT_APPLICABLE,
-            f"could not read source {sink_uri!r}: {exc}",
+            f"could not read source {sink_uri!r}",
             spec=spec,
         )
-    line = find_validator_line(source_text, spec)
+    source_text = got[0]
+    line = find_validator_line(
+        source_text, spec, language=language, sink_line=sink_line,
+    )
     if line is None:
         return Tier0Result(
             Tier0Status.NOT_APPLICABLE,
@@ -1922,21 +3065,35 @@ def try_tier0(
         )
     if language != "python":
         # Non-Python extractors require guard-and-exit on one diff line —
-        # dominance is partly established by the diff itself.  Two
+        # dominance is partly established by the diff itself.  Three
         # additional checks:
         #   1. source order in the post-fix file (cheap textual);
         #   2. no function boundary between validator and sink — without
         #      an AST per language, a regex-based function-definition
         #      heuristic plugs the cross-function-dominance hole that
-        #      source-order alone would create.
-        dominates = (line < sink_line and not _crosses_function_boundary(
-            source_text, line, sink_line, language,
-        ))
-        why = (f"either out of source order, or a function boundary "
+        #      source-order alone would create;
+        #   3. the guard is not wrapped in an ENCLOSING conditional that
+        #      closes before the sink (``if (opts.strict) { if (!ok)
+        #      return; } use(x)``) — the sink then runs on paths that
+        #      skipped the guard.  guard_shaped exempts the guard's own
+        #      exit-on-fail block.
+        dominates = (
+            line < sink_line
+            and not _crosses_function_boundary(
+                source_text, line, sink_line, language,
+            )
+            and not _lexical_validator_in_branch(
+                source_text, line, sink_line,
+                guard_shaped=(spec.kind == "charset"),
+                language=language,
+            )
+        )
+        why = (f"either out of source order, a function boundary "
                f"appears between the validator at line {line} and the "
                f"sink at line {sink_line} (the validator's exit-on-fail "
                f"would then return from a different function than the "
-               f"sink's)")
+               f"sink's), or the validator is wrapped in an enclosing "
+               f"conditional the sink does not share")
     elif spec.kind == "charset_sub":
         # Phase 7 plumbing: pass the resolved absolute path + CWE +
         # language through so the dominance function can consult the
@@ -1979,7 +3136,7 @@ def try_tier0(
     # "var must appear at sink line" check — conservative direction
     # but loses pass-through cases.  Both still catch the original
     # Bug 15 scenario (validator for x, unrelated sink for y).
-    source_lines = source_text.splitlines()
+    source_lines = split_source_lines(source_text)
     if sink_line - 1 < len(source_lines):
         sink_line_text = source_lines[sink_line - 1]
     else:
@@ -1992,6 +3149,8 @@ def try_tier0(
         else:
             var_reaches = _python_chain_reaches_sink(
                 chain_tree, spec.var_name, line, sink_line, sink_line_text,
+                sanitizer_call_tails=_sanitizer_tails_for_spec_kind(
+                    spec.kind),
             )
     else:
         var_reaches = _lexical_var_reaches_sink(

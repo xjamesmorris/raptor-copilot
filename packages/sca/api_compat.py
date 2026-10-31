@@ -49,6 +49,8 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
+
+from .naming import pep503_name
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -292,7 +294,7 @@ def _dep_name(spec: str) -> str:
     m = re.match(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)", spec)
     if not m:
         return spec.strip().lower()
-    return re.sub(r"[-_.]+", "-", m.group(1)).lower()
+    return pep503_name(m.group(1))
 
 
 __all__ = [

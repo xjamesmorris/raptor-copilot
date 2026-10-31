@@ -21,7 +21,18 @@ from core.sandbox import (
 from core.sandbox import (
     run as sandbox_run,
 )
-from core.sandbox.tests.capability import requires_landlock, requires_mount, requires_userns
+from core.sandbox.tests.capability import (
+    requires_landlock,
+    requires_mount,
+    requires_network_block_backend,
+    requires_userns,
+)
+
+# Real spawns against whatever enforcement the REAL kernel provides
+# (namespaces/Landlock on Linux, seatbelt on macOS) — a real-kernel
+# binding on both platforms, so both native markers (pytest.ini): the
+# darwin-emulation gate deselects the file, native lanes are unchanged.
+pytestmark = [pytest.mark.linux_native, pytest.mark.darwin_native]
 
 
 class TestAvailabilityCheck(unittest.TestCase):
@@ -994,6 +1005,23 @@ class TestPidNamespace(unittest.TestCase):
         """kill(host_pid) returns ESRCH — host PID doesn't exist in the ns."""
         import os as _os
         host_pid = _os.getpid()
+        if host_pid < 300:
+            # A fresh pid namespace hands out 1, 2, 3, ... to the
+            # sandbox's own processes, so a SMALL host pid (a nested-
+            # namespace test runner: pytest under unshare -pf IS pid 1)
+            # can exist inside the child namespace as a DIFFERENT
+            # process -- kill(host_pid, 0) then probes the sandbox's
+            # own tree and cannot discriminate host visibility. 300 is
+            # comfortably above the handful of pids a fresh namespace
+            # allocates during one sandbox run (false-pass direction)
+            # and far below the pids a real host session runs at, so
+            # the assertion still executes everywhere it is meaningful
+            # (false-skip direction).
+            self.skipTest(
+                f"test runner pid {host_pid} is small enough to "
+                "collide with the sandbox's fresh pid namespace -- "
+                "host-visibility probe would be vacuous"
+            )
         with TemporaryDirectory() as d:
             r = sandbox_run(
                 ["python3", "-c", (
@@ -1013,14 +1041,12 @@ class TestPidNamespace(unittest.TestCase):
         """With --pid --fork, the sandboxed command runs at a low pid
         in the new pid-ns.
 
-        Exact pid depends on the sandbox layout:
-        - pid=1 if the target is exec'd directly as pid-ns init
-        - pid=3 when wrapped by libexec/raptor-pid1-shim (shim=pid-1,
-          intermediate=pid-2, target=pid-3). The shim exists to avoid
-          the kernel's pid-ns signal filter swallowing raise()/abort()
-          from the target — see docs/sandbox.md for why.
-        Either way, the pid is a small single-digit value and definitely
-        not a host pid (which would be in the thousands).
+        Exact pid depends on the sandbox layout: pid=2 on the spawn
+        backend (the in-ns init waiter is pid-1 — the target must NOT
+        be pid-1, or the kernel's pid-ns signal filter swallows its
+        raise()/abort() identities). Either way, the pid is a small
+        single-digit value and definitely not a host pid (which would
+        be in the thousands).
         """
         with TemporaryDirectory() as d:
             r = sandbox_run(
@@ -1030,8 +1056,8 @@ class TestPidNamespace(unittest.TestCase):
                 capture_output=True, text=True, timeout=5,
             )
         self.assertIn(r.stdout.strip(), ("1", "2", "3"),
-                      f"target pid should be 1–3 (pid-ns root or shim "
-                      f"grandchild), got: {r.stdout!r}")
+                      f"target pid should be 1–3 (pid-ns-local), "
+                      f"got: {r.stdout!r}")
 
 
 @requires_landlock
@@ -1059,6 +1085,51 @@ class TestFdIsolation(unittest.TestCase):
                 self.assertIn("socket", str(cm.exception))
         finally:
             s.close()
+
+    def test_pass_fds_own_socketpair_half_accepted(self):
+        """The ONE admissible socket shape: a connected anonymous
+        AF_UNIX stream socketpair half created by this process —
+        pipe-equivalent (a private byte stream to the trusted
+        parent), so it clears the gate like the stdio pipes do."""
+        import socket as _socket
+        if not hasattr(_socket, "SO_PEERCRED"):
+            self.skipTest("SO_PEERCRED unavailable on this platform")
+        parent_half, child_half = _socket.socketpair()
+        try:
+            with sandbox() as run:
+                result = run(
+                    ["true"], pass_fds=[child_half.fileno()],
+                    capture_output=True, text=True, timeout=10,
+                )
+            self.assertEqual(result.returncode, 0)
+        finally:
+            parent_half.close()
+            child_half.close()
+
+    def test_pass_fds_pathname_socket_rejected_even_declared(self):
+        """The docker.sock client shape (connected to a PATHNAME
+        server) stays refused, and pass_fds_declared cannot override
+        the socket refusal — the declared escape hatch covers policy
+        mismatches on files/dirs, never sockets outside the
+        own-socketpair carve-out."""
+        import socket as _socket
+        with TemporaryDirectory() as td:
+            path = os.path.join(td, "srv.sock")
+            srv = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+            cli = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+            try:
+                srv.bind(path)
+                srv.listen(1)
+                cli.connect(path)
+                with sandbox() as run:
+                    with self.assertRaises(TypeError) as cm:
+                        run(["true"], pass_fds=[cli.fileno()],
+                            pass_fds_declared=True)
+                self.assertIn("socket", str(cm.exception))
+                self.assertIn("does not override", str(cm.exception))
+            finally:
+                cli.close()
+                srv.close()
 
     def test_pass_fds_pipe_accepted(self):
         """Pipes (S_ISFIFO) are a legitimate pass_fds use — not blocked."""
@@ -1764,7 +1835,13 @@ class TestNetProbeLockDiscipline(unittest.TestCase):
             )
             return mock.Mock(returncode=0, stderr=b"")
 
-        with mock.patch.object(probes.subprocess, "run", fake_run):
+        # Pin the staged pid-ns self-test too: this test asserts LOCK
+        # DISCIPLINE, not host shape, and on restricted-userns hosts
+        # the real self-test correctly reports the backend unavailable
+        # even when the mocked CLI probe "succeeds".
+        with mock.patch.object(probes.subprocess, "run", fake_run), \
+                mock.patch.object(probes, "_staged_pidns_selftest",
+                                  return_value=True):
             result = probes.check_net_available()
 
         # The probe may exit before the subprocess stage (missing
@@ -1934,45 +2011,13 @@ class TestCliProfile(unittest.TestCase):
         with self.assertRaises(ValueError):
             set_cli_profile("fulll")
 
-    def test_set_cli_profile_none_also_disables(self):
-        """profile='none' must set both _cli_sandbox_profile and _cli_sandbox_disabled
-        so existing disabled-checks continue to work."""
-        from core.sandbox import set_cli_profile
-        from core.sandbox import state as mod_state
-        set_cli_profile("none")
-        self.assertEqual(mod_state._cli_sandbox_profile, "none")
-        self.assertTrue(mod_state._cli_sandbox_disabled)
-
-    def test_set_cli_profile_switches_coherently(self):
-        """Switching profile='none' → 'full' must un-stick the disabled flag."""
-        from core.sandbox import set_cli_profile
-        from core.sandbox import state as mod_state
-        set_cli_profile("none")
-        self.assertTrue(mod_state._cli_sandbox_disabled)
-        set_cli_profile("full")
-        self.assertEqual(mod_state._cli_sandbox_profile, "full")
-        self.assertFalse(mod_state._cli_sandbox_disabled)
-
-    def test_disable_from_cli_coherent_after_profile_full(self):
-        """disable_from_cli() after set_cli_profile('full') must disable — it
-        used to leave _cli_sandbox_profile='full' and silently win."""
-        from core.sandbox import disable_from_cli, set_cli_profile
-        from core.sandbox import state as mod_state
-        set_cli_profile("full")
-        self.assertEqual(mod_state._cli_sandbox_profile, "full")
-        disable_from_cli()
-        # Both flags must be coherent after the disable.
-        self.assertEqual(mod_state._cli_sandbox_profile, "none")
-        self.assertTrue(mod_state._cli_sandbox_disabled)
-
-    def test_set_cli_profile_overrides_code_profile(self):
-        """CLI --sandbox takes precedence over caller-passed profile= arg."""
-        from core.sandbox import set_cli_profile
-        set_cli_profile("none")
-        # Code asks for full, CLI said none — CLI wins.
-        with sandbox(profile="full") as run:
-            result = run(["echo", "ok"], capture_output=True, text=True)
-        self.assertEqual(result.returncode, 0)
+    # NOTE: the profile="none" state-transition tests that used to
+    # live here (none-also-disables, switches-coherently,
+    # disable-after-full, CLI-none-overrides-code-profile) and the
+    # --no-sandbox apply_cli_args case migrated to module-level
+    # pytest functions right below this class: setting profile "none"
+    # is now consent-gated, and the ``no_sandbox_consent`` fixture
+    # (conftest) is the designated mint path for tests.
 
     def test_add_cli_args_adds_both_flags(self):
         """add_cli_args attaches --sandbox and --no-sandbox to an argparse parser."""
@@ -2013,19 +2058,6 @@ class TestCliProfile(unittest.TestCase):
         with self.assertRaises(SystemExit):
             parser.parse_args(["--sandbox", "full", "--no-sandbox"])
 
-    def test_apply_cli_args_no_sandbox_alone(self):
-        """--no-sandbox sets BOTH flags coherently via shared _set_cli_state."""
-        import argparse
-
-        from core.sandbox import add_cli_args, apply_cli_args
-        from core.sandbox import state as mod_state
-        parser = argparse.ArgumentParser()
-        add_cli_args(parser)
-        args = parser.parse_args(["--no-sandbox"])
-        apply_cli_args(args)
-        self.assertTrue(mod_state._cli_sandbox_disabled)
-        self.assertEqual(mod_state._cli_sandbox_profile, "none")
-
     def test_apply_cli_args_sandbox_network_only(self):
         """--sandbox network-only sets profile, does NOT set disabled."""
         import argparse
@@ -2050,6 +2082,75 @@ class TestCliProfile(unittest.TestCase):
         apply_cli_args(args)
         self.assertIsNone(mod_state._cli_sandbox_profile)
         self.assertFalse(mod_state._cli_sandbox_disabled)
+
+
+# --- profile "none" transitions (consent-gated) -----------------------
+# Migrated out of TestCliProfile: setting profile "none" now requires a
+# disable consent, minted per-test by the ``no_sandbox_consent``
+# fixture (conftest — the designated test-suite mint path). State
+# restore rides the autouse ``_sandbox_state_guard``.
+
+
+def test_set_cli_profile_none_also_disables(no_sandbox_consent):
+    """profile='none' must set both _cli_sandbox_profile and
+    _cli_sandbox_disabled so existing disabled-checks continue to
+    work — and now also stamps the consent source."""
+    from core.sandbox import set_cli_profile
+    from core.sandbox import state as mod_state
+    set_cli_profile("none")
+    assert mod_state._cli_sandbox_profile == "none"
+    assert mod_state._cli_sandbox_disabled
+    assert mod_state._cli_sandbox_disable_consent == "nonce"
+
+
+def test_set_cli_profile_switches_coherently(no_sandbox_consent):
+    """Switching profile='none' → 'full' must un-stick the disabled
+    flag AND clear the consent stamp."""
+    from core.sandbox import set_cli_profile
+    from core.sandbox import state as mod_state
+    set_cli_profile("none")
+    assert mod_state._cli_sandbox_disabled
+    set_cli_profile("full")
+    assert mod_state._cli_sandbox_profile == "full"
+    assert not mod_state._cli_sandbox_disabled
+    assert mod_state._cli_sandbox_disable_consent is None
+
+
+def test_disable_from_cli_coherent_after_profile_full(no_sandbox_consent):
+    """disable_from_cli() after set_cli_profile('full') must disable — it
+    used to leave _cli_sandbox_profile='full' and silently win."""
+    from core.sandbox import disable_from_cli, set_cli_profile
+    from core.sandbox import state as mod_state
+    set_cli_profile("full")
+    assert mod_state._cli_sandbox_profile == "full"
+    disable_from_cli()
+    # Both flags must be coherent after the disable.
+    assert mod_state._cli_sandbox_profile == "none"
+    assert mod_state._cli_sandbox_disabled
+
+
+def test_set_cli_profile_overrides_code_profile(no_sandbox_consent):
+    """CLI --sandbox takes precedence over caller-passed profile= arg."""
+    from core.sandbox import set_cli_profile
+    set_cli_profile("none")
+    # Code asks for full, CLI said none — CLI wins.
+    with sandbox(profile="full") as run:
+        result = run(["echo", "ok"], capture_output=True, text=True)
+    assert result.returncode == 0
+
+
+def test_apply_cli_args_no_sandbox_alone(no_sandbox_consent):
+    """--no-sandbox sets BOTH flags coherently via shared _set_cli_state."""
+    import argparse
+
+    from core.sandbox import add_cli_args, apply_cli_args
+    from core.sandbox import state as mod_state
+    parser = argparse.ArgumentParser()
+    add_cli_args(parser)
+    args = parser.parse_args(["--no-sandbox"])
+    apply_cli_args(args)
+    assert mod_state._cli_sandbox_disabled
+    assert mod_state._cli_sandbox_profile == "none"
 
 
 @pytest.mark.skipif(
@@ -2090,7 +2191,9 @@ class TestLandlockDegradationWarnings(unittest.TestCase):
         self.assertIn("Landlock is unavailable", cm.exception.reason)
 
     @requires_userns
+    @requires_landlock
     def test_warns_when_tcp_allowlist_on_abi_lt_4(self):
+        # requires_landlock: see the abi_v2 sibling.
         from unittest.mock import patch
 
         import core.sandbox as mod
@@ -2156,9 +2259,13 @@ class TestLandlockDegradationWarnings(unittest.TestCase):
                     run(["true"], capture_output=True, text=True)
 
     @requires_userns
+    @requires_landlock
     def test_warns_on_old_landlock_abi_v2(self):
         """Pre-5.19 kernels lack REFER — rename-across-dirs isn't blocked.
-        Operator should see a WARNING so the gap is visible."""
+        Operator should see a WARNING so the gap is visible.
+        requires_landlock: the probe patches fake availability, but the
+        live child install is REAL — on a genuinely Landlock-less
+        kernel the spawn backend fails loud ('L') by design."""
         import core.sandbox as mod
         with patch.object(mod.landlock, "check_landlock_available", return_value=True), \
                 patch.object(mod.landlock, "_get_landlock_abi", return_value=1), \
@@ -2172,8 +2279,10 @@ class TestLandlockDegradationWarnings(unittest.TestCase):
         self.assertTrue(any("ABI v3" in m and "TRUNCATE" in m for m in cm.output))
 
     @requires_userns
+    @requires_landlock
     def test_warns_on_old_landlock_abi_v3_only(self):
-        """Pre-6.2 kernels lack TRUNCATE but have REFER (ABI 2)."""
+        """Pre-6.2 kernels lack TRUNCATE but have REFER (ABI 2).
+        requires_landlock: see the v2 sibling."""
         import core.sandbox as mod
         with patch.object(mod.landlock, "check_landlock_available", return_value=True), \
                 patch.object(mod.landlock, "_get_landlock_abi", return_value=2), \
@@ -2196,8 +2305,10 @@ class TestLandlockDegradationWarnings(unittest.TestCase):
             run(["true"], capture_output=True, text=True)
         self.assertTrue(any("unreachable" in m and "443" in m for m in cm.output))
 
+    @requires_landlock
     def test_no_warning_on_abi_v4_with_tcp_allowlist(self):
-        """On ABI v4+, allowed_tcp_ports is enforceable — no degradation warning."""
+        """On ABI v4+, allowed_tcp_ports is enforceable — no degradation
+        warning. requires_landlock: see the abi_v2 sibling."""
         from unittest.mock import patch
 
         import core.sandbox as mod
@@ -2254,6 +2365,11 @@ class TestCliProfileAuthoritative(unittest.TestCase):
 class TestSandboxObservability(unittest.TestCase):
     """Test signal interpretation and sandbox_info."""
 
+    # gcc compile plus the spawn backend's whole child setup (userns
+    # maps, pivot_root, pid-ns fork, fresh /proc, Landlock, seccomp) —
+    # measured 5-7s on loaded workers (see the budget comment below);
+    # over the fast tier's budget.
+    @pytest.mark.slow
     def test_crash_detected(self):
         """A segfaulting process gets sandbox_info with crash evidence."""
         # Write a tiny C program that segfaults, compile and run it
@@ -2267,9 +2383,20 @@ class TestSandboxObservability(unittest.TestCase):
                            capture_output=True, timeout=10, check=False)
             if not binary.exists():
                 self.skipTest("gcc not available")
-            # Run in sandbox
+            # Run in sandbox. The wall budget covers the spawn backend's
+            # whole child setup (userns maps, pivot_root, pid-ns fork,
+            # fresh /proc, Landlock, seccomp), not just the instant
+            # segfault: the run() deadline starts at the go-signal,
+            # before the child has built its namespaces. On a loaded CI
+            # worker running the full suite in parallel that setup has
+            # been measured at 5-7s (the rootfs E2E crash test, same
+            # backend, passes at those durations inside its 60s budget),
+            # so a 5s budget timed out healthy runs. Keep the budget
+            # generous — the crash assertions below carry the test; the
+            # timeout only bounds a genuine hang. Tightening it back
+            # re-races the nightly tier's spawn latency.
             result = sandbox_run([str(binary)], block_network=True,
-                                 capture_output=True, text=True, timeout=5)
+                                 capture_output=True, text=True, timeout=60)
             self.assertTrue(hasattr(result, "sandbox_info"))
             self.assertTrue(result.sandbox_info.get("crashed"))
             self.assertIn("SIGSEGV", result.sandbox_info.get("signal", ""))
@@ -2277,7 +2404,9 @@ class TestSandboxObservability(unittest.TestCase):
 
     def test_normal_exit_no_crash(self):
         """A normal process gets sandbox_info without crash."""
-        result = sandbox_run(["true"], capture_output=True, text=True, timeout=5)
+        # Same spawn-setup wall budget as test_crash_detected above.
+        result = sandbox_run(["true"], capture_output=True, text=True,
+                             timeout=60)
         self.assertTrue(hasattr(result, "sandbox_info"))
         self.assertFalse(result.sandbox_info.get("crashed"))
         self.assertNotIn("signal", result.sandbox_info)
@@ -2315,6 +2444,67 @@ class TestCmdVisibleInMountTree(unittest.TestCase):
         # Binary inside the target dir (rare, but legal).
         self.assertTrue(_cmd_visible_in_mount_tree(
             ["/data/target/run.sh"], "/data/target", None, None))
+
+    def test_invisible_symlink_to_visible_target_not_visible(self):
+        """The venv shape: a symlink at an INVISIBLE location pointing
+        at a visible target (venv/bin/python3 → /usr/bin/env-alike).
+        The child execs the LITERAL argv path, which does not exist in
+        the bind tree — realpath alone said 'visible' and bought a
+        guaranteed-to-fail mount-ns spawn plus a misleading
+        bind-tree-unusable memo for the binary."""
+        from core.sandbox.context import _cmd_visible_in_mount_tree
+        with TemporaryDirectory() as td:
+            link = Path(td) / "venv-bin" / "python3"
+            link.parent.mkdir()
+            link.symlink_to("/usr/bin/env")
+            self.assertFalse(_cmd_visible_in_mount_tree(
+                [str(link)], None, None, None))
+            # The documented remedy: granting the symlink's directory
+            # (tool_paths / readable_paths) makes BOTH ends visible.
+            self.assertTrue(_cmd_visible_in_mount_tree(
+                [str(link)], None, None, [str(link.parent)]))
+
+    def test_symlink_spelled_grant_visible_at_its_spelling(self):
+        """Grants spelled THROUGH a symlink stay visible: binds land at
+        the caller-spelled path (mount_ns canonical_bind_path never
+        resolves symlinks), so a command under the spelled grant execs
+        fine in the tree — comparing the literal leg against the
+        grant's REALPATH would falsely pre-demote every symlink-spelled
+        target/tool_paths grant to the mountless backend, silently.
+        Both grant channels: extras (tool_paths) and target."""
+        from core.sandbox.context import _cmd_visible_in_mount_tree
+        with TemporaryDirectory() as td:
+            real = Path(td) / "real-tools"
+            real.mkdir()
+            tool = real / "mytool"
+            tool.write_text("#!/bin/sh\n")
+            spelled = Path(td) / "spelled-tools"
+            spelled.symlink_to(real)
+            cmd = str(spelled / "mytool")
+            # tool_paths grant spelled via the symlink.
+            self.assertTrue(_cmd_visible_in_mount_tree(
+                [cmd], None, None, [str(spelled)]))
+            # target spelled via the symlink (everyday operator shape:
+            # a symlinked workspace path).
+            self.assertTrue(_cmd_visible_in_mount_tree(
+                [cmd], str(spelled), None, None))
+
+    def test_visible_symlink_to_invisible_target_not_visible(self):
+        """The original direction stays caught: a granted location
+        whose symlink resolves OUTSIDE the granted set is still
+        invisible — the conjunction never regresses to literal-only."""
+        from core.sandbox.context import _cmd_visible_in_mount_tree
+        with TemporaryDirectory() as td:
+            bin_dir = Path(td) / "bin"
+            bin_dir.mkdir()
+            hidden = Path(td) / "hidden" / "tool"
+            hidden.parent.mkdir()
+            hidden.write_text("#!/bin/sh\n")
+            link = bin_dir / "tool"
+            link.symlink_to(hidden)
+            # Only the LINK's directory is granted; the target is not.
+            self.assertFalse(_cmd_visible_in_mount_tree(
+                [str(link)], None, None, [str(bin_dir)]))
 
     def test_relative_cmd_falls_through_to_true(self):
         """Can't resolve a non-PATH-findable cmd → don't trigger fallback;
@@ -2385,6 +2575,7 @@ class TestSandboxKwargsGuard(unittest.TestCase):
             f"missing={sorted(sig_params - _SANDBOX_KWARGS)} "
             f"stale={sorted(_SANDBOX_KWARGS - sig_params)}")
 
+    @requires_network_block_backend
     def test_sandbox_level_kwarg_rejected_on_inner_run(self):
         """One of the 7 formerly-missing names must now hit the guard
         (early, clearly-messaged TypeError) instead of dropping or
@@ -2395,6 +2586,14 @@ class TestSandboxKwargsGuard(unittest.TestCase):
                 run(["true"], writable_paths=["/tmp/x"])
             self.assertIn("sandbox kwargs", str(ctx.exception))
 
+    def test_no_degrade_is_rejected_on_inner_run(self):
+        from core.sandbox import sandbox
+
+        with sandbox(disabled=True) as run:
+            with self.assertRaisesRegex(TypeError, "sandbox kwargs"):
+                run(["true"], no_degrade=True)
+
+    @requires_network_block_backend
     def test_non_sandbox_kwargs_still_pass_the_guard(self):
         """Opposite direction: ordinary subprocess kwargs must not be
         caught by the widened guard."""
@@ -2407,6 +2606,7 @@ class TestSandboxKwargsGuard(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
 
 
+@requires_network_block_backend
 class TestRunCheckKwarg:
     """run() honours check= with subprocess.run semantics. Pre-fix the
     kwarg was silently popped: callers' CalledProcessError handlers
@@ -2583,7 +2783,11 @@ class TestSpeculativeFailureCache(unittest.TestCase):
         src = Path(_ctx.__file__).read_text()
         idx = src.find("if _first_seen:")
         assert idx > 0, "first-seen branch missing"
-        block = src[idx:idx + 1500]
+        # Window covers the whole if/else: big enough that comments or
+        # the diagnostic-carrying INFO call don't push the DEBUG arm
+        # out; small enough to stay inside this branch (the next
+        # logger call after the pair is several thousand chars on).
+        block = src[idx:idx + 2500]
         self.assertIn("logger.info(", block,
                       "first-failure-per-binary must log at INFO")
         self.assertIn("logger.debug(", block,

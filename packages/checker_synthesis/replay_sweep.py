@@ -20,6 +20,10 @@ Engine coverage:
   (packages/codeql/database_manager) and run against CACHED databases
   only — a sweep must never trigger new database builds.
 
+Library API only: the raptor-variant-sweep CLI that used to front
+this module was removed as an undiscoverable orphan; run_sweep /
+write_report are the supported entry points for future wiring.
+
 Feedback: matches are recorded back into the library via
 ``RuleLibrary.update`` with an EMPTY triage list — that records target
 coverage and match counts while leaving ``tp_rate`` untouched
@@ -31,16 +35,15 @@ would corrupt the precision the replay gate is built on.
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
 import logging
-import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from core.atomic_fs import write_text_atomically
 from core.json import save_json
 from packages.coccinelle import runner as cocci_runner
 from packages.semgrep import runner as semgrep_runner
@@ -50,6 +53,8 @@ from .library import (
     _REPLAY_TP_THRESHOLD,
     LibraryEntry,
     RuleLibrary,
+    graduated_stem,
+    rule_join_key,
 )
 from .models import Match
 
@@ -96,6 +101,10 @@ class SweepReport:
     matches: list[SweepMatch] = field(default_factory=list)
     capped: dict[str, int] = field(default_factory=dict)  # "rule@target" -> dropped
     errors: list[str] = field(default_factory=list)
+    # "rule@target" keys whose engine run ERRORED but still produced
+    # matches — the matches are reported (flagged partial here), only
+    # the coverage recording is skipped.
+    partial: list[str] = field(default_factory=list)
     cocci_skipped_targets: list[str] = field(default_factory=list)
     recorded_updates: int = 0
 
@@ -110,6 +119,7 @@ class SweepReport:
             "total_matches": len(self.matches),
             "capped": self.capped,
             "errors": self.errors,
+            "partial": self.partial,
             "cocci_skipped_targets": self.cocci_skipped_targets,
             "recorded_updates": self.recorded_updates,
         }
@@ -133,9 +143,18 @@ def replayable_entries(
     for e in lib.active_entries():
         if e.tp_rate < _REPLAY_TP_THRESHOLD:
             continue
-        if len(e.targets) < _MIN_TARGETS_FOR_REPLAY:
+        # Distinct target identities, not records (mirrors
+        # find_replayable): duplicate-hash records in a hand-edited
+        # manifest are one target's evidence and must not clear the
+        # floor.
+        if len({t.target_hash for t in e.targets}) < _MIN_TARGETS_FOR_REPLAY:
             continue
         if not e.dual_control:
+            continue
+        # Same doctrine as graduate()/find_replayable: replay treats
+        # the rule as proven, and only the full mechanical-control
+        # tier (fix-mutant included) earns that.
+        if e.rule_tier != "library":
             continue
         if e.engine == "semgrep":
             semgrep_entries.append(e)
@@ -164,13 +183,21 @@ def _target_hash(target: Path) -> str:
 
     sha256 of the RESOLVED path, 12 hex chars — resolving first means
     relative and symlinked spellings of one physical target dedup to a
-    single TargetRecord. Per-run replay records made by
-    packages/llm_analysis/checker_followup.py currently hash the path
-    string as passed (no resolve), so a non-canonical repo_root there
-    can still produce a second record for the same target; align that
-    site to the resolved convention rather than un-resolving this one.
+    single TargetRecord. Every recorder must join on this convention:
+    hashing the path as passed would mint a second TargetRecord for
+    the same physical target, inflating len(entry.targets) (the
+    replay-confidence sort key and the auto-archive floor) and
+    targets_tested. Out-of-package recorders use the public
+    :func:`target_hash_for` spelling.
     """
     return hashlib.sha256(str(target.resolve()).encode()).hexdigest()[:12]
+
+
+def target_hash_for(target: Path) -> str:
+    """Public spelling of the TargetRecord identity convention (see
+    :func:`_target_hash`) for out-of-package recorders — per-run
+    replay recording in llm_analysis joins on the same hash."""
+    return _target_hash(Path(target))
 
 
 def _cap(
@@ -200,13 +227,26 @@ def _sweep_semgrep_rule(
     tier: str,
     tp_rate: float | None,
     targets_tested: int,
-) -> list[SweepMatch]:
+) -> tuple[list[SweepMatch], bool]:
+    """Run one semgrep library rule against *target*.
+
+    Returns ``(matches, engine_errored)``. An errored run is NOT a
+    zero-match run and must never become coverage evidence (see the
+    ``engine_errored`` handling in ``run_sweep``), but the matches
+    the rule DID produce before/around the error (fatal per-file
+    failures land in ``errors`` alongside real findings on large
+    targets) are still worth reporting — they are returned flagged
+    partial instead of being discarded with the failure. The error
+    is recorded on ``report.errors``.
+    """
     result = semgrep_runner.run_rule(target, str(rule_path), name=rule_id)
-    if result.errors:
+    errored = bool(result.errors)
+    if errored:
         report.errors.extend(
             f"semgrep {rule_id} @ {target}: {e}" for e in result.errors
         )
-        return []
+        if result.findings:
+            report.partial.append(f"{rule_id}@{target}")
     hits = _cap(report, rule_id, target, result.findings)
     return [
         SweepMatch(
@@ -223,7 +263,7 @@ def _sweep_semgrep_rule(
             targets_tested=targets_tested,
         )
         for f in hits
-    ]
+    ], errored
 
 
 def _sweep_cocci_rule(
@@ -237,13 +277,17 @@ def _sweep_cocci_rule(
     targets_tested: int,
     provenance: str = "rule-library",
     tier: str = "library",
-) -> list[SweepMatch]:
+) -> tuple[list[SweepMatch], bool]:
+    """Coccinelle counterpart to ``_sweep_semgrep_rule`` — same
+    ``(matches, engine_errored)`` contract."""
     result = cocci_runner.run_rule(target, rule_path, no_includes=True)
-    if result.errors:
+    errored = bool(result.errors)
+    if errored:
         report.errors.extend(
             f"coccinelle {rule_id} @ {target}: {e}" for e in result.errors
         )
-        return []
+        if result.matches:
+            report.partial.append(f"{rule_id}@{target}")
     hits = _cap(report, rule_id, target, result.matches)
     return [
         SweepMatch(
@@ -260,13 +304,13 @@ def _sweep_cocci_rule(
             targets_tested=targets_tested,
         )
         for m in hits
-    ]
+    ], errored
 
 
 def _record(
     lib: RuleLibrary,
     report: SweepReport,
-    rule_id: str,
+    entry: LibraryEntry,
     target: Path,
     matches: list[SweepMatch],
     timestamp: str,
@@ -280,15 +324,27 @@ def _record(
     keep its precision forever (auto-archive can only trigger when the
     target list grows) and overstate per-target confidence (counting
     only hit-targets).
+
+    Engine-ERRORED runs never reach this function: a target the
+    engine could not fully scan proves nothing about coverage (same
+    fail-closed stance as synthesis's fixture handling), so
+    ``run_sweep`` skips this record when the runner flags
+    ``engine_errored`` — the failure lives on ``report.errors`` (one
+    explicit entry per rule@target) instead of becoming zero-match
+    coverage that inflates targets_tested and feeds auto-archive.
+    The matches such a run DID produce still flow to
+    ``report.matches`` (flagged on ``report.partial``): reporting is
+    not coverage, and discarding real hits over one fatal per-file
+    failure silently cost every variant hit on large targets.
     """
-    entry = lib.update(
-        rule_id,
+    updated = lib.update(
+        rule_join_key(entry),
         _target_hash(target),
         [Match(file=m.file, line=m.line) for m in matches],
         [],
         timestamp=timestamp,
     )
-    if entry is not None:
+    if updated is not None:
         report.recorded_updates += 1
 
 
@@ -344,17 +400,38 @@ def run_sweep(
         if engine_rules_dir is not None else ([], [])
     )
     report.rules_graduated = len(graduated_semgrep) + len(graduated_cocci)
-    library_rule_ids = {e.rule_id for e in lib.all_entries()}
+    # Graduated files are named with graduated_stem(entry.rule_id) —
+    # every join from a file stem back to the library goes through the
+    # same constructor. Comparing stems against raw rule_ids silently
+    # never matched ids that sanitisation changed, double-sweeping the
+    # rule and recording no coverage for it. Stems shared by several
+    # entries are ambiguous: resolve to None (no record, one warning)
+    # rather than first-entry-wins.
+    stem_to_entries: dict[str, list[LibraryEntry]] = {}
+    for e in lib.all_entries():
+        stem_to_entries.setdefault(graduated_stem(e.rule_id), []).append(e)
+
+    def _entry_for_stem(stem: str) -> "LibraryEntry | None":
+        candidates = stem_to_entries.get(stem, [])
+        if len(candidates) > 1:
+            logger.warning(
+                "variant-sweep: graduated stem %r matches %d library "
+                "entries — skipping coverage recording for it",
+                stem, len(candidates),
+            )
+            return None
+        return candidates[0] if candidates else None
+
     # Rules present BOTH as replayable library entries and as
     # graduated files (the normal case — graduation copies FROM the
     # library) run once, in the library loop. Sweeping the graduated
     # copy again duplicated every match in the report and, with
     # record=True, double-incremented total_matches via a second
     # lib.update on the same target.
-    swept_library_ids = (
-        {e.rule_id for e in semgrep_entries}
-        | {e.rule_id for e in cocci_entries}
-    )
+    swept_library_stems = {
+        graduated_stem(e.rule_id)
+        for e in (*semgrep_entries, *cocci_entries)
+    }
 
     for target in targets:
         target = Path(target)
@@ -363,7 +440,10 @@ def run_sweep(
             if (cocci_entries or graduated_cocci) else False
         )
         run_cocci = bool(cocci_entries) and target_is_c
-        if cocci_entries and not run_cocci:
+        # Graduated cocci rules skip non-C targets the same way the
+        # library entries do — the skip record must cover both, or a
+        # graduated-only sweep under-reports its skipped targets.
+        if (cocci_entries or graduated_cocci) and not target_is_c:
             report.cocci_skipped_targets.append(str(target))
 
         for entry in semgrep_entries:
@@ -374,7 +454,7 @@ def run_sweep(
                     f"({rule_path})"
                 )
                 continue
-            matches = _sweep_semgrep_rule(
+            matches, errored = _sweep_semgrep_rule(
                 report, target, rule_path,
                 rule_id=entry.rule_id,
                 cwe=entry.cwe,
@@ -384,9 +464,10 @@ def run_sweep(
                 targets_tested=len(entry.targets),
             )
             report.matches.extend(matches)
-            if record:
-                _record(lib, report, entry.rule_id, target, matches,
-                        timestamp)
+            if record and not errored:
+                # Errored runs are never coverage evidence — the
+                # failure is on report.errors, matches flow above.
+                _record(lib, report, entry, target, matches, timestamp)
 
         if run_cocci:
             for entry in cocci_entries:
@@ -397,7 +478,7 @@ def run_sweep(
                         f"({rule_path})"
                     )
                     continue
-                matches = _sweep_cocci_rule(
+                matches, errored = _sweep_cocci_rule(
                     report, target, rule_path,
                     rule_id=entry.rule_id,
                     cwe=entry.cwe,
@@ -405,52 +486,45 @@ def run_sweep(
                     targets_tested=len(entry.targets),
                 )
                 report.matches.extend(matches)
-                if record:
-                    _record(lib, report, entry.rule_id, target, matches,
-                            timestamp)
+                if record and not errored:
+                    _record(lib, report, entry, target, matches, timestamp)
 
         for rule_file in graduated_semgrep:
             rule_id = rule_file.stem
-            if rule_id in swept_library_ids:
+            if rule_id in swept_library_stems:
                 continue  # already ran as a library entry on this target
-            entry = next(
-                (e for e in lib.all_entries() if e.rule_id == rule_id),
-                None,
-            )
-            matches = _sweep_semgrep_rule(
+            entry_sem = _entry_for_stem(rule_id)
+            matches, errored = _sweep_semgrep_rule(
                 report, target, rule_file,
                 rule_id=rule_id,
-                cwe=entry.cwe if entry else "",
+                cwe=entry_sem.cwe if entry_sem else "",
                 provenance="graduated",
                 tier="graduated",
-                tp_rate=entry.tp_rate if entry else None,
-                targets_tested=len(entry.targets) if entry else 0,
+                tp_rate=entry_sem.tp_rate if entry_sem else None,
+                targets_tested=len(entry_sem.targets) if entry_sem else 0,
             )
             report.matches.extend(matches)
-            if record and rule_id in library_rule_ids:
-                _record(lib, report, rule_id, target, matches, timestamp)
+            if record and not errored and entry_sem is not None:
+                _record(lib, report, entry_sem, target, matches, timestamp)
 
         if target_is_c:
             for rule_file in graduated_cocci:
                 rule_id = rule_file.stem
-                if rule_id in swept_library_ids:
+                if rule_id in swept_library_stems:
                     continue
-                entry = next(
-                    (e for e in lib.all_entries() if e.rule_id == rule_id),
-                    None,
-                )
-                matches = _sweep_cocci_rule(
+                entry_cocci = _entry_for_stem(rule_id)
+                matches, errored = _sweep_cocci_rule(
                     report, target, rule_file,
                     rule_id=rule_id,
-                    cwe=entry.cwe if entry else "",
-                    tp_rate=entry.tp_rate if entry else None,
-                    targets_tested=len(entry.targets) if entry else 0,
+                    cwe=entry_cocci.cwe if entry_cocci else "",
+                    tp_rate=entry_cocci.tp_rate if entry_cocci else None,
+                    targets_tested=len(entry_cocci.targets) if entry_cocci else 0,
                     provenance="graduated",
                     tier="graduated",
                 )
                 report.matches.extend(matches)
-                if record and rule_id in library_rule_ids:
-                    _record(lib, report, rule_id, target, matches, timestamp)
+                if record and not errored and entry_cocci is not None:
+                    _record(lib, report, entry_cocci, target, matches, timestamp)
 
     return report
 
@@ -459,89 +533,15 @@ def write_report(report: SweepReport, out_dir: Path) -> Path:
     """Write matches.jsonl + summary.json under *out_dir*."""
     out_dir.mkdir(parents=True, exist_ok=True)
     matches_path = out_dir / "matches.jsonl"
-    with matches_path.open("w", encoding="utf-8") as f:
-        for m in report.matches:
-            f.write(json.dumps(m.to_dict(), sort_keys=True) + "\n")
+    # Atomic like the save_json below (planted-symlink defence at the
+    # predictable artifact name in the reused out dir).
+    write_text_atomically(
+        matches_path,
+        "".join(
+            json.dumps(m.to_dict(), sort_keys=True) + "\n"
+            for m in report.matches
+        ),
+    )
     summary_path = out_dir / "summary.json"
     save_json(summary_path, report.summary_dict(), sort_keys=True)
     return matches_path
-
-
-def _print_summary(report: SweepReport) -> None:
-    by_rule: dict[str, list[SweepMatch]] = {}
-    for m in report.matches:
-        by_rule.setdefault(m.rule_id, []).append(m)
-    print(
-        f"variant-sweep: {len(report.targets)} target(s), "
-        f"{report.rules_semgrep} semgrep + {report.rules_coccinelle} "
-        f"coccinelle library rule(s) + {report.rules_graduated} "
-        f"graduated, {len(report.matches)} match(es)"
-    )
-    for rule_id in sorted(by_rule):
-        ms = by_rule[rule_id]
-        hit_targets = len({m.target for m in ms})
-        first = ms[0]
-        tp = f"{first.tp_rate:.0%}" if first.tp_rate is not None else "n/a"
-        print(
-            f"  {rule_id}  [{first.engine} {first.cwe or '-'} "
-            f"{first.provenance} tp={tp}]  "
-            f"{len(ms)} match(es) across {hit_targets} target(s)"
-        )
-    if report.capped:
-        print(f"  ⚠ {len(report.capped)} rule/target pair(s) hit the "
-              f"{MATCH_CAP}-match cap; see summary.json")
-    if report.cocci_skipped_targets:
-        print(
-            "  coccinelle skipped (no C sources): "
-            + ", ".join(report.cocci_skipped_targets)
-        )
-    if report.errors:
-        print(f"  ⚠ {len(report.errors)} error(s); see summary.json")
-
-
-def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(
-        prog="raptor-variant-sweep",
-        description=(
-            "Replay the proven rule library (and optionally graduated "
-            "engine rules) across multiple targets — zero-LLM variant "
-            "hunting. Matches are ranked by each rule's earned "
-            "precision tier."
-        ),
-    )
-    p.add_argument("targets", nargs="+", type=Path,
-                   help="target directories/files to sweep")
-    p.add_argument("--library-dir", type=Path, default=None,
-                   help="rule library dir (default: out/rule-library)")
-    p.add_argument("--engine-rules-dir", type=Path, default=None,
-                   help=("project engine-rules dir; its "
-                         "semgrep/rules/*.yaml graduated rules join "
-                         "the sweep"))
-    p.add_argument("--out", type=Path, default=None,
-                   help=("output dir (default: "
-                         "out/variant-sweep/runs/<ts>)"))
-    p.add_argument("--no-record", action="store_true",
-                   help=("do not record sweep matches back onto library "
-                         "entries (coverage/match counts only; "
-                         "precision is never touched either way)"))
-    args = p.parse_args(argv)
-
-    missing = [str(t) for t in args.targets if not Path(t).exists()]
-    if missing:
-        print(f"targets do not exist: {missing}", file=sys.stderr)
-        return 2
-
-    if args.out is None:
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        args.out = Path("out/variant-sweep/runs") / ts
-
-    report = run_sweep(
-        [Path(t) for t in args.targets],
-        library_dir=args.library_dir,
-        engine_rules_dir=args.engine_rules_dir,
-        record=not args.no_record,
-    )
-    matches_path = write_report(report, args.out)
-    _print_summary(report)
-    print(f"matches: {matches_path}")
-    return 0

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import re
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -36,10 +37,28 @@ from core.dataflow.codeql_augmented_run import (
 from core.json import load_json
 from core.llm.coerce import extract_fenced_code
 from core.run.scratch import scratch_dir
+from core.sarif.parser import SARIF_MAX_BYTES, count_results
 
 # CodeQL SARIF over corpus code — the SARIF budget class shared with
-# core.sarif.parser.load_sarif.
-_MAX_SARIF_BYTES = 100 * 1024 * 1024
+# core.sarif.parser.load_sarif (one constant, aliased for the local
+# call sites).
+_MAX_SARIF_BYTES = SARIF_MAX_BYTES
+
+_SLUG_RE = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def _slug_finding_id(finding_id: str) -> str:
+    """Filesystem/QL-safe projection of a finding id.
+
+    Every in-repo producer emits hash/basename-shaped ids, but the API
+    accepts arbitrary strings: a traversal-shaped id joined onto the
+    work dir writes qlpack scratch outside it, and the id is also
+    embedded into the query's ``@id`` header where a newline would
+    inject QL header lines. Dots are excluded so ``..`` cannot be
+    spelled at all; empty in, ``unnamed`` out."""
+    slug = _SLUG_RE.sub("_", finding_id)
+    return slug or "unnamed"
+
 
 # sink-class -> (customizations module, module name exposing Source/Sink/Sanitizer).
 # Python: each module imports Concepts/RemoteFlowSources/BarrierGuards and
@@ -123,6 +142,19 @@ _LANG_PACK = {
     "ruby": "codeql/ruby-all",
     "java": "codeql/java-all",
     "go": "codeql/go-all",
+}
+
+# Per-language sink-class tables, for early CLI validation: the java
+# table deliberately omits codeinjection (no generic Java
+# CodeInjectionSink), so validating --sink-class against the Python
+# table alone let an unsupported combination pass argparse and fail
+# deep in the loop.
+_SINK_TABLE_BY_LANG = {
+    "python": _CUSTOMIZATIONS,
+    "javascript": _JS_CUSTOMIZATIONS,
+    "ruby": _RB_CUSTOMIZATIONS,
+    "java": _JAVA_SINKS,
+    "go": _GO_CUSTOMIZATIONS,
 }
 
 
@@ -460,8 +492,8 @@ select sink, "synthesized-barrier {sink_class} [go]"
 """
 
 
-def _count_sarif_results(sarif_path: Path, target_uri: str | None = None,
-                         target_line: int | None = None) -> int:
+def _count_results_for_target(sarif_path: Path, target_uri: str | None = None,
+                              target_line: int | None = None) -> int:
     """Count SARIF results. With ``target_uri`` (+ optional ``target_line``),
     count only findings at that file (and line) — so the suppress check can be
     scoped to the SPECIFIC flagged finding rather than all findings in the file
@@ -472,7 +504,8 @@ def _count_sarif_results(sarif_path: Path, target_uri: str | None = None,
     if not isinstance(data, dict):
         return 0
     if target_uri is None:
-        return sum(len(r.get("results") or []) for r in (data.get("runs") or []))
+        # Unscoped mode is exactly the shared tolerant counter.
+        return count_results(data)
     n = 0
     for run in (data.get("runs") or []):
         for res in (run.get("results") or []):
@@ -495,7 +528,7 @@ def _summarise_surviving_finding(
     barrier, formatted for the LLM refinement prompt.
 
     Picks the first result matching ``target_uri`` (+ optional
-    ``target_line``) — same scoping logic as :func:`_count_sarif_results`
+    ``target_line``) — same scoping logic as :func:`_count_results_for_target`
     so the summary describes the SPECIFIC finding the synth was scoped
     to.  Returns ``""`` on missing file, parse error, no matching result,
     or empty codeFlows.  Conservative by design — a noisy summary
@@ -581,7 +614,7 @@ def adjudicate(
         db_path, [str(ql)], pack / "out.sarif",
         codeql_bin=codeql_bin, runner=runner, extra_args=extra,
     )
-    return _count_sarif_results(Path(result.sarif_path), target_uri, target_line)
+    return _count_results_for_target(Path(result.sarif_path), target_uri, target_line)
 
 
 class _BarrierProposerAdapter:
@@ -647,7 +680,10 @@ class _CodeQLAdjudicationOracle:
 
         query_ql = assemble_barrier_query(
             candidate, sink_class=self._proposal.sink_class,
-            query_id=f"raptor/synth/{self._proposal.finding_id}/{n}",
+            query_id=(
+                f"raptor/synth/{_slug_finding_id(self._proposal.finding_id)}"
+                f"/{n}"
+            ),
             language=self._proposal.language,
         )
 
@@ -810,7 +846,8 @@ def synthesize_over_corpus(
     for item in items:
         res = run_synthesis_loop(
             item.proposal, item.after_db, item.before_db,
-            proposer=proposer, work_dir=work_dir / item.proposal.finding_id,
+            proposer=proposer,
+            work_dir=work_dir / _slug_finding_id(item.proposal.finding_id),
             search_path=search_path, codeql_bin=codeql_bin, runner=runner,
             max_attempts=max_attempts,
         )
@@ -1197,7 +1234,12 @@ def _build_prompt(
             ]
         parts += [
             "Prior attempt's QL was:",
-            refine_context.prior_query_ql,
+            # The prior QL is LLM output produced from a prompt that
+            # contained (neutralized) hostile-repo content — an echo
+            # re-enters this round, so it gets the same envelope
+            # treatment as every other untrusted lane above
+            # (idempotent on clean QL).
+            neutralize_tag_forgery(refine_context.prior_query_ql),
         ]
     return "\n".join(parts)
 
@@ -1284,13 +1326,19 @@ def main(argv: list | None = None) -> int:
     p.add_argument("--max-attempts", type=int, default=3)
     p.add_argument("--work-dir", type=Path, default=None)
     args = p.parse_args(argv)
+    if args.sink_class not in _SINK_TABLE_BY_LANG[args.language]:
+        p.error(
+            f"sink-class {args.sink_class!r} is not available for "
+            f"--language {args.language} "
+            f"(known: {sorted(_SINK_TABLE_BY_LANG[args.language])})"
+        )
 
     # Caller-supplied --work-dir is never deleted; otherwise a scratch
     # dir (auto-registered with the tmp reaper) is removed on exit.
     if args.work_dir is not None:
         work_ctx = contextlib.nullcontext(args.work_dir)
     else:
-        work_ctx = scratch_dir("trust-synth-work-")
+        work_ctx = scratch_dir("trust-synth-work-")  # type: ignore[assignment]
     with work_ctx as work_dir:
         proposal = BarrierProposal(
             sink_class=args.sink_class, finding_id=args.finding_id, language=args.language,

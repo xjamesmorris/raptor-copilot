@@ -207,6 +207,26 @@ class TestMergeOutcomes:
         result = merge_outcomes(orig, refined)
         assert result.evidence_tool == "joern:flow"
 
+    def test_clean_rescue_does_not_inherit_original_tool(self):
+        """A clean original's tool stamp backed no finding: copying it
+        onto an LLM-only rescue would grade the rescue tool-confirmed
+        on a tool run that never confirmed anything. The rescue keeps
+        its finding status but stays LLM-graded."""
+        orig = FakeOutcome(status="clean", evidence_tool="joern:flow")
+        refined = FakeOutcome(status="finding", evidence_tool="")
+        result = merge_outcomes(orig, refined)
+        assert result.status == "finding"
+        assert result.evidence_tool == ""
+
+    def test_suspicious_promotion_inherits_original_tool(self):
+        """When the original round's tool evidence backed the same
+        (suspicious) hypothesis, the promotion to finding carries it."""
+        orig = FakeOutcome(status="suspicious", evidence_tool="joern:flow")
+        refined = FakeOutcome(status="finding", evidence_tool="")
+        result = merge_outcomes(orig, refined)
+        assert result.status == "finding"
+        assert result.evidence_tool == "joern:flow"
+
     def test_both_clean(self):
         orig = FakeOutcome(status="clean")
         refined = FakeOutcome(status="clean")
@@ -334,3 +354,99 @@ class TestCollectToolResults:
         index = {"c.c:h": FakeRec()}
         results = collect_tool_results(o, evidence_index=index)
         assert "cpp/injection" in results[0]["result"]
+
+
+class TestSemgrepDispatchCaps:
+    def test_dispatch_threads_hypothesis_and_keyword(self, monkeypatch):
+        # Without hypothesis/rule_keyword the sweep's per-rule caps
+        # (negative-control presence check, identifier window) were
+        # disarmed for every refinement dispatch.
+        import core.audit.sweep as sweep_mod
+        from core.audit.refinement import _dispatch_semgrep
+
+        seen: dict = {}
+
+        def fake_sweep(**kwargs):
+            seen.update(kwargs)
+
+            class R:
+                outcome = "confirmed"
+                matches: ClassVar[list] = [{"m": 1}]
+
+            return R()
+
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        monkeypatch.setattr(sweep_mod, "run_semgrep_sweep", fake_sweep)
+        outcome = FakeOutcome(hypothesis="if len unchecked, CWE-787")
+        config = SimpleNamespace(target_path=Path("/t"))
+        ctx = {"file": "a.c", "function": "f",
+               "line_start": 1, "line_end": 9}
+        result = _dispatch_semgrep(
+            "rule.yaml", outcome, ctx, config,
+            rule_keyword="buffer overflow",
+        )
+        assert result is not None
+        assert seen["rule_keyword"] == "buffer overflow"
+        assert seen["hypothesis"] == "if len unchecked, CWE-787"
+
+
+class TestDescribeToolResultHonesty:
+    """Tool-result rows must reflect the outcome's actual evidence —
+    never a hardcoded negative that contradicts the confirming
+    receipt the verdict carries."""
+
+    class _EmptyRec:
+        semgrep_hits: ClassVar[list] = []
+        codeql_alerts: ClassVar[list] = []
+
+        def all_joern_flows(self):
+            return []
+
+    def test_smt_confirming_receipt_reported(self):
+        o = FakeOutcome(
+            file="a.c", function="f",
+            tools_dispatched={"smt"},
+            evidence_tool="smt:disproof:sat",
+        )
+        results = collect_tool_results(
+            o, evidence_index={"a.c:f": self._EmptyRec()},
+        )
+        assert "smt:disproof:sat" in results[0]["result"]
+        assert "no confirmation" not in results[0]["result"]
+
+    def test_coccinelle_confirming_receipt_reported(self):
+        o = FakeOutcome(
+            file="a.c", function="f",
+            tools_dispatched={"coccinelle"},
+            evidence_tool="coccinelle:double-free",
+        )
+        results = collect_tool_results(
+            o, evidence_index={"a.c:f": self._EmptyRec()},
+        )
+        assert "coccinelle:double-free" in results[0]["result"]
+        assert results[0]["result"] != "no matches"
+
+    def test_coccinelle_without_receipt_not_a_definite_negative(self):
+        o = FakeOutcome(
+            file="a.c", function="f",
+            tools_dispatched={"coccinelle"},
+        )
+        results = collect_tool_results(
+            o, evidence_index={"a.c:f": self._EmptyRec()},
+        )
+        # "no matches" claims the tool ran and found nothing; without
+        # a per-function record the honest statement is weaker.
+        assert results[0]["result"] != "no matches"
+
+    def test_errored_tool_stated(self):
+        o = FakeOutcome(
+            file="a.c", function="f",
+            tools_dispatched={"smt"},
+        )
+        o.tools_errored = {"smt"}
+        results = collect_tool_results(
+            o, evidence_index={"a.c:f": self._EmptyRec()},
+        )
+        assert "error" in results[0]["result"].lower()

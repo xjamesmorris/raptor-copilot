@@ -865,3 +865,33 @@ class TestOpenat2StructReadInjectable:
         records = fake_helpers["calls"]["write_record"]
         assert len(records) == 1
         assert records[0]["name"] == "openat2"
+
+
+class TestGlobalCapNoticeStderr:
+    """The one-time global-cap stderr notice is best-effort: fd 2 can
+    be closed/broken (parent died mid-run, daemonised invocation) and
+    an OSError escaping the notice would crash the tracer out of its
+    event loop — PTRACE_O_EXITKILL then SIGKILLs every tracee
+    mid-workload. Same guarantee the live-escalation and credential
+    banners already carry."""
+
+    def test_notice_write_failure_does_not_crash_event_loop(
+            self, arch_info, fake_helpers, monkeypatch):
+        from core.sandbox import audit_budget
+
+        def raising_write(fd, data):
+            raise OSError("stderr closed")
+        monkeypatch.setattr(tracer.os, "write", raising_write)
+        budget = audit_budget.AuditBudget()
+        # Arm the one-shot notice exactly as the budget does when the
+        # global cap first fires; the next dispatched event emits it.
+        budget._global_cap_notified = True
+        traced = {1000}
+        b = _dispatch(
+            1000, _ptrace_event_status(tracer._PTRACE_EVENT_SECCOMP),
+            traced, 1000, arch_info, fake_helpers, budget=budget,
+        )
+        # The event loop survived: the tracee was resumed and the
+        # notice was consumed (no re-raise storm on later events).
+        assert fake_helpers["calls"]["ptrace_cont"] == [(1000, 0)]
+        assert b.pop_global_cap_notice() is False

@@ -1,7 +1,8 @@
 """Harness generators for each supported language.
 
 Every harness writes JSON to stdout in the same shape:
-  {"status": "returned"|"exception"|"import_error", ...}
+  {"status": "returned"|"exception"|"import_error"|"binding_error"
+             |"arg_binding_error", ...}
 
 This lets the shared classifier (_classify_json_output) handle all
 interpreted languages uniformly.
@@ -15,6 +16,16 @@ import textwrap
 from pathlib import Path, PurePosixPath
 from typing import Any, TYPE_CHECKING
 
+from ._resolve import (
+    _LUA_PATH_TEMPLATES,
+    binding_error,
+    derive_lua_require_path,
+    derive_perl_use_module,
+    derive_php_require_path,
+    derive_ruby_require_path,
+    derive_js_require_path as _js_require_path,
+    file_to_import_path,
+)
 
 if TYPE_CHECKING:
     from ._types import DarkWitnessSpec
@@ -38,7 +49,7 @@ _CALL_MARKER_PREFIX = "__raptor_witness_start__:"
 # in the executors; validate the shape anyway so a caller-supplied
 # token can never break out of the string/JSON contexts the harness
 # templates embed it in.
-_TOKEN_RE = re.compile(r"^[a-f0-9]*$")
+_TOKEN_RE = re.compile(r"^[a-f0-9]*\Z")
 
 
 def _checked_token(witness_token: str) -> str:
@@ -127,26 +138,17 @@ def _format_args_scripting(
 # ---------------------------------------------------------------------------
 
 
-def file_to_import_path(file_path: str, _target_root: Path) -> str | None:
-    """``core/audit/gate.py`` → ``core.audit.gate``. None for non-Python."""
-    rel = file_path.replace("\\", "/")
-    p = PurePosixPath(rel)
-    if p.suffix != ".py":
-        return None
-    parts = list(p.parts)
-    parts[-1] = p.stem
-    if parts[-1] == "__init__":
-        parts = parts[:-1]
-    if not parts:
-        return None
-    return ".".join(parts)
-
-
 def validate_import_path(
     spec: DarkWitnessSpec,
     target_root: Path,
 ) -> str | None:
-    """Returns an error string if invalid, None if ok."""
+    """Returns an error string if invalid, None if ok.
+
+    The Python executor's binding gate: module_path must be present,
+    the finding's file must exist, and the reference must resolve to
+    it under CPython's own rules (the resolution engine also refuses a
+    repo-planted package-directory shadow of the finding's module).
+    """
     expected = file_to_import_path(spec.file, target_root)
     if expected is None:
         return f"non-Python file: {spec.file}"
@@ -158,7 +160,7 @@ def validate_import_path(
     source_file = target_root / spec.file
     if not source_file.is_file():
         return f"source file not found: {spec.file}"
-    return None
+    return binding_error(spec, "python", target_root)
 
 
 def generate_witness_script(
@@ -167,13 +169,40 @@ def generate_witness_script(
     *,
     witness_token: str = "",
 ) -> str:
-    """Render a fixed-template Python script."""
+    """Render a fixed-template Python script.
+
+    After a successful import the script asserts the LOADED module's
+    ``__file__`` is the finding's file, reporting ``binding_error``
+    (never a verdict) on mismatch.  This belt is BEST-EFFORT, second
+    to the static resolution engine (``_resolve``), which is the
+    refusal authority: ``__file__`` is interpreter state read AFTER
+    target code has run, so any executing plant can forge it — the
+    belt catches only mis-binds where no plant code runs (a shadow
+    that appeared after validation, a stale or mismatched
+    environment).  Plants that would execute are the static engine's
+    job to refuse pre-execution.
+
+    Argument-binding gate: before the call, ``inspect.signature(...)
+    .bind(*args, **kwargs)`` checks the vector against the target's
+    signature WITHOUT calling it; a bind failure reports
+    ``arg_binding_error`` — the target body never ran, so the failure
+    characterises the witness arguments, not the code under test.
+    Counting a call-boundary TypeError as the function "rejecting"
+    the input would mint semantic verdicts out of pure signature
+    mismatch.  The gate must not swallow the target's OWN TypeErrors
+    either: when ``inspect.signature`` cannot describe the callable
+    (C-implemented, ``__signature__``-less builtins) the precheck is
+    skipped, and the belt in the except arm reclassifies only
+    TypeErrors whose traceback never entered a callee frame — an
+    exception raised inside the target keeps status ``exception``.
+    """
     args_json = json.dumps(spec.args)
     kwargs_json = json.dumps(spec.kwargs)
     target_str = str(target_root.resolve())
+    expected_file = target_str + "/" + spec.file.replace("\\", "/")
     token = _checked_token(witness_token)
     return textwrap.dedent(f"""\
-        import sys, json
+        import sys, json, os.path, inspect
         _tok = {token!r}
         sys.path.insert(0, {target_str!r})
         try:
@@ -184,11 +213,50 @@ def generate_witness_script(
         except Exception as e:
             print(json.dumps({{"status": "import_error", "token": _tok, "message": str(e)}}))
             sys.exit(0)
+        _mod = sys.modules.get({spec.module_path!r})
+        _loaded = os.path.realpath(getattr(_mod, "__file__", "") or "")
+        _expected = os.path.realpath({expected_file!r})
+        if _loaded != _expected:
+            print(json.dumps({{
+                "status": "binding_error",
+                "token": _tok,
+                "message": "loaded %r, expected %r" % (_loaded, _expected),
+            }}))
+            sys.exit(0)
         _args = json.loads({args_json!r})
         _kwargs = json.loads({kwargs_json!r})
         try:
+            _sig = inspect.signature({spec.function})
+        except (TypeError, ValueError):
+            _sig = None
+        if _sig is not None:
+            try:
+                _sig.bind(*_args, **_kwargs)
+            except TypeError as e:
+                print(json.dumps({{
+                    "status": "arg_binding_error",
+                    "token": _tok,
+                    "message": str(e),
+                }}))
+                sys.exit(0)
+        try:
             _result = {spec.function}(*_args, **_kwargs)
             print(json.dumps({{"status": "returned", "token": _tok, "value": repr(_result)}}))
+        except TypeError as e:
+            _tb = e.__traceback__
+            if _tb is None or _tb.tb_next is None:
+                print(json.dumps({{
+                    "status": "arg_binding_error",
+                    "token": _tok,
+                    "message": str(e),
+                }}))
+            else:
+                print(json.dumps({{
+                    "status": "exception",
+                    "token": _tok,
+                    "type": type(e).__name__,
+                    "message": str(e),
+                }}))
         except Exception as e:
             print(json.dumps({{
                 "status": "exception",
@@ -257,18 +325,43 @@ def generate_c_harness(
 def _c_format_for_type(return_type: str) -> str:
     stripped = return_type.strip()
     if stripped.endswith("*"):
-        base = stripped.rstrip("*").strip()
-        if base == "char":
-            return "%s"
+        # Every pointer — including char* — prints as %p pointer
+        # identity. %s would make the HARNESS dereference the returned
+        # buffer after the pre-call sentinel: a function legitimately
+        # returning a non-NUL-terminated buffer then overreads inside
+        # harness code, and the post-sentinel sanitizer report would
+        # classify as a confirmed bug in the target.
         return "%p"
     rt = stripped
     if rt in ("float", "double"):
         return "%g"
     if rt in ("char",):
         return "%c"
-    if "unsigned" in return_type or rt in ("size_t",):
-        return "%lu"
-    if rt in ("long", "long long", "ssize_t", "ptrdiff_t", "int64_t"):
+    # Width-exact conversions: %lu for `unsigned int` and %ld for
+    # `long long` were LP64-benign varargs mismatches but wrong on
+    # ILP32. size_t/ssize_t/ptrdiff_t take their own C99 modifiers;
+    # the 64-bit fixed-width types are `long long`-width on every
+    # target this harness compiles for spelling purposes (matching
+    # width on LP64, exact on ILP32).
+    if rt == "size_t":
+        return "%zu"
+    if rt == "ssize_t":
+        return "%zd"
+    if rt == "ptrdiff_t":
+        return "%td"
+    if "unsigned" in return_type:
+        if "long long" in rt:
+            return "%llu"
+        if "long" in rt:
+            return "%lu"
+        return "%u"  # unsigned int/short/char: promoted, non-negative
+    if rt in ("long long", "int64_t"):
+        return "%lld"
+    if rt in ("uint64_t",):
+        return "%llu"
+    if rt in ("uint32_t", "uint16_t", "uint8_t"):
+        return "%u"
+    if rt == "long":
         return "%ld"
     return "%d"
 
@@ -362,19 +455,6 @@ def generate_go_harness(
 # ---------------------------------------------------------------------------
 
 
-def _js_require_path(spec: DarkWitnessSpec, *, strip_suffixes: tuple[str, ...]) -> str:
-    """Resolve require path from spec or file."""
-    rp = spec.lang_config.get("require_path", "")
-    if rp:
-        return rp
-    rel = spec.file
-    for suffix in strip_suffixes:
-        if rel.endswith(suffix):
-            rel = rel[: -len(suffix)]
-            break
-    return "./" + rel
-
-
 def generate_js_harness(
     spec: DarkWitnessSpec,
     target_root: Path,
@@ -382,7 +462,7 @@ def generate_js_harness(
     witness_token: str = "",
 ) -> str:
     """Render a fixed-template Node.js harness."""
-    require_path = _js_require_path(spec, strip_suffixes=(".js", ".mjs", ".cjs"))
+    require_path = _js_require_path(spec)
     target_str = str(target_root.resolve())
     args_json = json.dumps(spec.args)
     func_name = spec.function
@@ -439,9 +519,7 @@ def generate_ts_harness(
     witness_token: str = "",
 ) -> str:
     """Render a TypeScript harness (same shape as JS but with TS import)."""
-    require_path = _js_require_path(
-        spec, strip_suffixes=(".ts", ".tsx", ".mts", ".cts"),
-    )
+    require_path = _js_require_path(spec)
     target_str = str(target_root.resolve())
     args_json = json.dumps(spec.args)
     func_name = spec.function
@@ -501,17 +579,22 @@ def generate_ruby_harness(
     *,
     witness_token: str = "",
 ) -> str:
-    """Render a fixed-template Ruby harness."""
-    lc = spec.lang_config
-    require_path = lc.get("require_path", "")
-    if not require_path:
-        rel = spec.file
-        rel = rel.removesuffix(".rb")
-        require_path = rel
+    """Render a fixed-template Ruby harness.
+
+    After a successful require the harness asserts the finding's file
+    is among $LOADED_FEATURES — a load that never touched it bound
+    some other artifact and reports binding_error, never a verdict.
+    Membership is a runtime BELT (a plant that itself requires the
+    real file would pass it); the verdict-bearing shadow refusal is
+    the static resolution engine's.
+    """
+    require_path = derive_ruby_require_path(spec)
 
     target_str = str(target_root.resolve())
     args_str = _format_args_scripting(spec.args, nil_kw="nil")
     token_lit = _single_quote(_checked_token(witness_token))
+    expected_lit = _single_quote(
+        target_str + "/" + spec.file.replace("\\", "/"))
 
     return textwrap.dedent(f"""\
         require 'json'
@@ -521,6 +604,19 @@ def generate_ruby_harness(
           require {_single_quote(require_path)}
         rescue LoadError => e
           puts JSON.generate({{ status: 'import_error', token: _tok, message: e.message }})
+          exit 0
+        end
+        _expected = {expected_lit}
+        _loaded = $LOADED_FEATURES.any? do |f|
+          begin
+            File.identical?(f, _expected)
+          rescue StandardError
+            false
+          end
+        end
+        unless _loaded
+          puts JSON.generate({{ status: 'binding_error', token: _tok,
+            message: "finding file #{{_expected}} not among loaded features" }})
           exit 0
         end
         begin
@@ -549,8 +645,7 @@ def generate_php_harness(
     witness_token: str = "",
 ) -> str:
     """Render a fixed-template PHP harness."""
-    lc = spec.lang_config
-    require_path = lc.get("require_path", spec.file)
+    require_path = derive_php_require_path(spec)
     target_str = str(target_root.resolve())
     args_str = _format_args_scripting(
         spec.args, nil_kw="null",
@@ -663,7 +758,7 @@ def generate_rust_harness(
 # to survive the ';' strip and inject top-level Java code).
 _JAVA_IMPORT_SAFE_RE = re.compile(
     r"^(?:static\s+)?[A-Za-z_$][A-Za-z0-9_$]*"
-    r"(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*(?:\.\*)?$"
+    r"(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*(?:\.\*)?\Z"
 )
 
 
@@ -693,6 +788,27 @@ def generate_java_harness(
         parts.append(f'import {safe_imp};\n')
 
     parts.append('\npublic class DarkWitnessHarness {\n')
+    # JSON-string escaper for the epilogue's repo-controlled text
+    # (return value's toString(), exception message). Per-char
+    # dispatch: backslash and quote get their JSON escapes, and every
+    # control char becomes \\uXXXX (same coverage as the Lua lane's
+    # json_escape) — so a legitimate multi-line toString()/message
+    # stays ONE parseable status line instead of degrading a truthful
+    # verdict to inconclusive on an unescaped newline.
+    parts.append(
+        '    private static String esc(String s) {\n'
+        '        StringBuilder b = new StringBuilder();\n'
+        '        for (int i = 0; i < s.length(); i++) {\n'
+        '            char c = s.charAt(i);\n'
+        '            if (c == \'\\\\\') b.append("\\\\\\\\");\n'
+        '            else if (c == \'"\') b.append("\\\\\\"");\n'
+        '            else if (c < 0x20) b.append('
+        'String.format("\\\\u%04x", (int) c));\n'
+        '            else b.append(c);\n'
+        '        }\n'
+        '        return b.toString();\n'
+        '    }\n'
+    )
     parts.append('    public static void main(String[] args) {\n')
     parts.append('        try {\n')
 
@@ -709,11 +825,20 @@ def generate_java_harness(
         parts.append(
             f'            {return_type} result = {call_target}({args_str});\n'
         )
+        # The return value is repo-controlled text (toString() of a
+        # target object): concatenating it raw let a crafted value
+        # smuggle duplicate keys into the token-authenticated verdict
+        # JSON (json.loads keeps the LAST duplicate, so the injection
+        # rode INSIDE the authenticated epilogue). esc() makes it
+        # pure data — same escaper as the exception path's _msg.
+        parts.append(
+            '            String _val = esc(String.valueOf(result));\n'
+        )
         parts.append(
             '            System.out.println('
             '"{\\"status\\":\\"returned\\",'
             f'{token_json}'
-            '\\"value\\":\\"" + result + "\\"}");\n'
+            '\\"value\\":\\"" + _val + "\\"}");\n'
         )
     else:
         parts.append(f'            {call_target}({args_str});\n')
@@ -726,8 +851,8 @@ def generate_java_harness(
 
     parts.append('        } catch (Exception e) {\n')
     parts.append(
-        '            String _msg = e.getMessage() == null ? "" : e.getMessage()'
-        '.replace("\\\\", "\\\\\\\\").replace("\\"", "\\\\\\"");\n'
+        '            String _msg = e.getMessage() == null ? "" : '
+        'esc(e.getMessage());\n'
     )
     parts.append(
         '            System.out.println('
@@ -753,13 +878,21 @@ def generate_lua_harness(
     *,
     witness_token: str = "",
 ) -> str:
-    """Render a fixed-template Lua harness."""
-    lc = spec.lang_config
-    require_path = lc.get("require_path", "")
-    if not require_path:
-        rel = spec.file
-        rel = rel.removesuffix(".lua")
-        require_path = rel.replace("/", ".")
+    """Render a fixed-template Lua harness.
+
+    package.path is rendered from ``_LUA_PATH_TEMPLATES`` — the same
+    tuple the resolution engine derives its candidate slots from — so
+    the search order the validator reasoned about IS the search order
+    the interpreter runs.  Where the interpreter provides
+    ``package.searchpath`` (5.2+, LuaJIT) the harness also re-runs the
+    search at execution time and reports binding_error when it does
+    not land on the finding's file.  Unlike the Python/Perl/Ruby
+    post-load belts, this check runs BEFORE ``require`` executes
+    anything — it is the one runtime belt target code cannot have
+    forged (though the static engine remains the refusal authority
+    for plants visible at validation time).
+    """
+    require_path = derive_lua_require_path(spec)
 
     args_str = _format_args_scripting(
         spec.args, nil_kw="nil", quote=_lua_quote,
@@ -768,25 +901,47 @@ def generate_lua_harness(
     )
     target_str = str(target_root.resolve())
     token_lit = _lua_quote(_checked_token(witness_token))
+    path_prefix = " .. ".join(
+        f"{_lua_quote(target_str)} .. {_lua_quote('/' + t + ';')}"
+        for t in _LUA_PATH_TEMPLATES
+    )
+    expected_lit = _lua_quote(
+        target_str + "/" + spec.file.replace("\\", "/"))
 
     return textwrap.dedent(f"""\
-        package.path = {_lua_quote(target_str)} .. '/?.lua;' .. package.path
+        package.path = {path_prefix} .. package.path
         local _tok = {token_lit}
         local json_ok = true
+        local function json_escape(s)
+            -- Backslash FIRST: escaping the quote first would let a
+            -- message containing backslash-quote re-open the string.
+            s = s:gsub('\\\\', '\\\\\\\\')
+            s = s:gsub('"', '\\\\"')
+            s = s:gsub('%c', function(c)
+                return string.format('\\\\u%04X', string.byte(c))
+            end)
+            return s
+        end
         local function json_encode(t)
             local parts = {{}}
             for k, v in pairs(t) do
                 local vstr
                 if type(v) == "string" then
-                    vstr = '"' .. v:gsub('"', '\\\\"') .. '"'
-                elseif v == nil then
-                    vstr = "null"
+                    vstr = '"' .. json_escape(v) .. '"'
                 else
                     vstr = tostring(v)
                 end
                 parts[#parts+1] = '"' .. k .. '":' .. vstr
             end
             return '{{' .. table.concat(parts, ',') .. '}}'
+        end
+        if package.searchpath then
+            local _resolved = package.searchpath({_lua_quote(require_path)}, package.path)
+            if _resolved ~= {expected_lit} then
+                print(json_encode({{status="binding_error", token=_tok,
+                    message="loaded " .. tostring(_resolved) .. ", expected " .. {expected_lit}}}))
+                os.exit(0)
+            end
         end
         local ok_req, mod = pcall(require, {_lua_quote(require_path)})
         if not ok_req then
@@ -821,18 +976,24 @@ def generate_perl_harness(
     *,
     witness_token: str = "",
 ) -> str:
-    """Render a fixed-template Perl harness."""
-    lc = spec.lang_config
-    use_module = lc.get("use_module", "")
-    if not use_module:
-        rel = spec.file
-        if rel.endswith((".pl", ".pm")):
-            rel = rel[:-3]
-        use_module = rel.replace("/", "::")
+    """Render a fixed-template Perl harness.
+
+    After a successful require the harness asserts %INC recorded the
+    finding's file for the bareword's ``::``→``/`` + ``.pm`` key,
+    reporting binding_error, never a verdict, on mismatch.  Best-effort
+    belt behind the static resolution engine (the refusal authority):
+    %INC is interpreter state read AFTER the required code has run, so
+    an executing plant can rewrite it — the belt catches only
+    mis-binds where no plant code runs (e.g. a load served by another
+    @INC entry).
+    """
+    use_module = derive_perl_use_module(spec)
 
     target_str = str(target_root.resolve())
     args_str = _format_args_scripting(spec.args, nil_kw="undef")
     token_lit = _single_quote(_checked_token(witness_token))
+    inc_key = use_module.replace("::", "/") + ".pm"
+    expected_lit = _single_quote(target_str + "/" + inc_key)
 
     return textwrap.dedent(f"""\
         use strict;
@@ -843,6 +1004,12 @@ def generate_perl_harness(
         eval {{ require {use_module}; {use_module}->import() if {use_module}->can('import'); }};
         if ($@) {{
             print encode_json({{status => 'import_error', token => $_tok, message => "$@"}});
+            exit 0;
+        }}
+        my $_loaded = $INC{{{_single_quote(inc_key)}}} || '';
+        if ($_loaded ne {expected_lit}) {{
+            print encode_json({{status => 'binding_error', token => $_tok,
+                message => "loaded '$_loaded', expected " . {expected_lit}}});
             exit 0;
         }}
         eval {{

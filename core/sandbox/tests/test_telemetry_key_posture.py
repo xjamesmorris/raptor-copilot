@@ -68,10 +68,19 @@ class TestPostureRecording:
         assert summary_mod.get_run_posture(tmp_path) == {
             "mount_ns_active": True, "restrict_reads": False,
             "mac_key_hidden": True,
+            "block_network": False, "udp_block_engaged": False,
         }
 
     def test_unknown_run_is_none(self, tmp_path):
         assert summary_mod.get_run_posture(tmp_path) is None
+
+    def test_mountless_backend_is_reported(self, tmp_path):
+        summary_mod.record_run_posture(
+            tmp_path, mount_ns_active=False, restrict_reads=True,
+            mountless_backend=True,
+        )
+        assert summary_mod.get_run_posture(
+            tmp_path)["mountless_backend"] is True
 
     def test_key_hidden_needs_mount_ns_or_restrict_reads(self, tmp_path):
         summary_mod.record_run_posture(
@@ -303,7 +312,9 @@ class TestMacosSpawnWiring:
         posture = summary_mod.get_run_posture(tmp_path)
         assert posture == {"mount_ns_active": False,
                            "restrict_reads": False,
-                           "mac_key_hidden": False}
+                           "mac_key_hidden": False,
+                           "block_network": False,
+                           "udp_block_engaged": False}
 
     def test_restrict_reads_run_records_hidden_key(
             self, tmp_path, monkeypatch):
@@ -311,7 +322,16 @@ class TestMacosSpawnWiring:
         posture = summary_mod.get_run_posture(tmp_path)
         assert posture["mac_key_hidden"] is True
 
+    def test_block_network_sets_udp_engaged_in_sandbox_info(
+            self, tmp_path, monkeypatch):
+        result = self._run(tmp_path, monkeypatch, restrict_reads=False,
+                           block_network=True)
+        assert result.sandbox_info["udp_block_engaged"] is True
 
+
+# The Linux dispatch layer with a real sandboxed call — a real-Linux
+# binding (requires_landlock already keeps it off real macs).
+@pytest.mark.linux_native
 @requires_landlock
 class TestLinuxContextWiring:
     """The Linux dispatch layer records the per-call posture too —

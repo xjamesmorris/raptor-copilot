@@ -11,6 +11,7 @@ Two families:
 
 from __future__ import annotations
 
+import functools
 import shutil
 import subprocess
 import sys
@@ -259,7 +260,10 @@ def test_replay_uses_run_untrusted_with_hardened_defaults(
     assert result.attempted is True
     assert len(calls) == 2
     for cmd, kwargs in calls:
-        assert cmd == [str(fake_bin)]
+        # Consented-exec staging: the replayed path is a private
+        # executable copy that keeps the basename — never the
+        # run-dir file itself when that file is non-executable.
+        assert Path(cmd[0]).name == fake_bin.name
         # The helper's hardened defaults (restrict_reads=True,
         # fake_home=True, forced block_network / strict_env) must not
         # be overridden by the caller.
@@ -267,8 +271,8 @@ def test_replay_uses_run_untrusted_with_hardened_defaults(
         assert "fake_home" not in kwargs
         assert "block_network" not in kwargs
         assert "strict_env" not in kwargs
-        assert kwargs["target"] == str(fake_bin.parent)
-        assert kwargs["output"] == str(fake_bin.parent)
+        assert kwargs["target"] == str(Path(cmd[0]).parent)
+        assert kwargs["output"] == str(Path(cmd[0]).parent)
         assert kwargs["input"] == data
     # Only outcome values are persisted — never stdout.
     assert result.observed_outcomes == ["no_obvious_effect"] * 2
@@ -820,16 +824,23 @@ def test_attach_reproduction_keeps_tier_when_not_reproduced(tmp_path):
 # ----------------------------------------------------------------------
 
 
+@functools.lru_cache(maxsize=None)
 def _untrusted_contract_available() -> bool:
     """The integration tests execute witness code under
-    ``run_untrusted()``, which fails closed on Linux hosts without
-    unprivileged user namespaces unless the operator opted into
-    degraded containment. Skip there — the refusal is the sandbox's
-    contract working as designed, not a reproduction failure."""
+    ``run_untrusted()``, whose containment floor requires mount-ns
+    capability. Skip when the authoritative mount-ns probe
+    (``check_mount_available``: AppArmor sysctl + newuidmap + functional
+    self-test) reports unavailable — the refusal is the sandbox's
+    contract working as designed, not a reproduction failure.
+
+    Memoised and evaluated lazily from ``_untrusted_contract_or_skip``:
+    ``check_mount_available()`` is a subprocess probe (cached, but up to
+    seconds cold), and a module-level ``skipif`` condition would run it
+    at pytest COLLECTION in every invocation and every xdist worker."""
     if sys.platform == "darwin":
         return True
-    from core.sandbox import check_net_available
-    if check_net_available():
+    from core.sandbox.probes import check_mount_available
+    if check_mount_available():
         return True
     import os
     return os.environ.get(
@@ -837,7 +848,10 @@ def _untrusted_contract_available() -> bool:
     ).strip().lower() in ("1", "true", "yes", "on")
 
 
+@functools.lru_cache(maxsize=None)
 def _has_libasan() -> bool:
+    # Real ASAN test-compile (subprocess) — memoised, and evaluated
+    # lazily from ``_libasan_or_skip`` so collection never spawns it.
     cxx = next((c for c in ("c++", "g++", "clang++") if shutil.which(c)), None)
     if cxx is None:
         return False
@@ -854,6 +868,18 @@ def _has_libasan() -> bool:
         return False
 
 
+@pytest.fixture
+def _untrusted_contract_or_skip() -> None:
+    if not _untrusted_contract_available():
+        pytest.skip("no unprivileged userns and no degraded opt-in")
+
+
+@pytest.fixture
+def _libasan_or_skip() -> None:
+    if not _has_libasan():
+        pytest.skip("gcc -fsanitize=address not usable")
+
+
 _BOF_SOURCE = """
 #include <cstring>
 #include <iostream>
@@ -868,10 +894,7 @@ int main() {
 
 
 @pytest.mark.slow
-@pytest.mark.skipif(not _has_libasan(),
-                    reason="gcc -fsanitize=address not usable")
-@pytest.mark.skipif(not _untrusted_contract_available(),
-                    reason="no unprivileged userns and no degraded opt-in")
+@pytest.mark.usefixtures("_libasan_or_skip", "_untrusted_contract_or_skip")
 def test_real_sanitizer_witness_reproduces(tmp_path):
     """End-to-end: an LLM_EMIT_RUN witness whose bytes are a BOF
     source recorded as SANITIZER_REPORT must reproduce — recompile
@@ -912,8 +935,7 @@ int main(void){
 @pytest.mark.skipif(shutil.which("gcc") is None and
                     shutil.which("cc") is None,
                     reason="no C compiler")
-@pytest.mark.skipif(not _untrusted_contract_available(),
-                    reason="no unprivileged userns and no degraded opt-in")
+@pytest.mark.usefixtures("_untrusted_contract_or_skip")
 def test_real_fuzz_replay_reproduces(tmp_path):
     """End-to-end Mode B: a FUZZ witness (crash input) replayed
     against the actual binary N times. Build a stdin crasher,
@@ -949,19 +971,22 @@ def test_real_fuzz_replay_reproduces(tmp_path):
 def _mount_ns_spawn_lane_usable() -> bool:
     """The ETXTBSY integration test needs the mount-ns spawn lane: on
     the plain-subprocess fallback lanes Popen surfaces ETXTBSY as an
-    in-parent OSError (recorded 'error', a different contract)."""
+    in-parent OSError (recorded 'error', a different contract).
+
+    Uses the authoritative ``check_mount_available()`` probe (AppArmor
+    sysctl + newuidmap presence + functional self-test), not the partial
+    ``mount_ns_available()`` from ``_spawn`` (newuidmap-only)."""
     if sys.platform != "linux":
         return False
-    from core.sandbox._spawn import mount_ns_available
-    return mount_ns_available()
+    from core.sandbox.probes import check_mount_available
+    return check_mount_available()
 
 
 @pytest.mark.slow  # compile + up to four real sandboxed replays
 @pytest.mark.skipif(shutil.which("gcc") is None and
                     shutil.which("cc") is None,
                     reason="no C compiler")
-@pytest.mark.skipif(not _untrusted_contract_available(),
-                    reason="no unprivileged userns and no degraded opt-in")
+@pytest.mark.usefixtures("_untrusted_contract_or_skip")
 def test_real_replay_first_run_etxtbsy_is_spawn_failure_not_outcome(
         tmp_path, monkeypatch):
     """End-to-end through the REAL spawn plumbing: run 1 execs the
@@ -1034,3 +1059,62 @@ def test_real_replay_first_run_etxtbsy_is_spawn_failure_not_outcome(
     sf = [d for d in result.run_details
           if d.get("outcome") == "spawn_failure"]
     assert sf and sf[0]["run"] == 1
+
+
+# ----------------------------------------------------------------------
+# Infra-error runs never read as witness non-determinism — that word is
+# reserved for clean executed runs that disagree.
+# ----------------------------------------------------------------------
+
+def test_all_error_runs_read_inconclusive_not_nondeterministic(
+        tmp_path, monkeypatch):
+    bundle, data, fake_bin = _replay_fixture(tmp_path)
+
+    def flaky(cmd, **kwargs):
+        raise OSError("transient")
+
+    monkeypatch.setattr(core.sandbox, "run_untrusted", flaky)
+    result = reproduce_witness(bundle, data, binary_path=fake_bin, n=2)
+    assert result.reproduced is False
+    assert result.deterministic is False
+    assert "non-deterministic" not in result.reason
+    assert "inconclusive" in result.reason
+    assert "infrastructure" in result.reason
+
+
+def test_mixed_error_and_match_reads_inconclusive(tmp_path, monkeypatch):
+    """One clean matching run + one infra error: not reproduced, but
+    the reason names the errors instead of claiming outcome variance."""
+    from packages.zkpox.reproduce import _finalize
+
+    result = _finalize("crash", ["crash", "error"], 2)
+    assert result.reproduced is False
+    assert "non-deterministic" not in result.reason
+    assert "inconclusive" in result.reason
+    assert "infrastructure" in result.reason
+
+
+def test_clean_disagreement_still_reads_nondeterministic():
+    from packages.zkpox.reproduce import _finalize
+
+    result = _finalize("crash", ["crash", "no_obvious_effect"], 2)
+    assert "non-deterministic" in result.reason
+
+
+def test_error_plus_offtarget_reads_offtarget():
+    from packages.zkpox.reproduce import _finalize
+
+    result = _finalize("crash", ["no_obvious_effect", "error"], 2)
+    assert "non-deterministic" not in result.reason
+    assert "off-target" in result.reason
+    assert result.deterministic is True
+
+
+def test_error_plus_clean_disagreement_names_both():
+    from packages.zkpox.reproduce import _finalize
+
+    result = _finalize(
+        "crash", ["crash", "no_obvious_effect", "error"], 3,
+    )
+    assert "non-deterministic" in result.reason
+    assert "infrastructure error" in result.reason

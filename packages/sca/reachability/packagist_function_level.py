@@ -8,17 +8,20 @@ cross-language resolver against OSV symbol data.
 ## Verdict transitions
 
   * Any affected symbol CALLED -> ``likely_called``
-  * All affected symbols NOT_CALLED, none UNCERTAIN ->
-    ``not_function_reachable``
-  * Any UNCERTAIN OR mixed -> preserve existing verdict
+  * EVERY advisory-listed symbol evaluated and NOT_CALLED, none
+    UNCERTAIN -> ``not_function_reachable``
+  * Any UNCERTAIN, mixed, or unevaluable entry -> preserve existing
+    verdict
 
 ## Qualified-name shape
 
 PHP / Packagist OSV records ship symbols as fully-qualified
 namespace paths (``Symfony\Component\HttpFoundation\Request::create``).
-The PHP extractor binds ``use Foo\Bar\Baz;`` ->
-``imports["Baz"] = "Foo\Bar\Baz"``; chains like
-``["Baz", "method"]`` resolve via the import map.
+``_shared._normalise_qualified`` folds both ``::`` and ``\`` to
+dots; the PHP extractor binds ``use Foo\Bar\Baz;`` ->
+``imports["Baz"] = "Foo.Bar.Baz"`` (dot-joined, matching the
+resolver's dot-form comparisons); chains like ``["Baz", "method"]``
+resolve via the import map.
 
 Limitation: ``call_user_func`` / variable callables / ``$$var``
 indirection is flagged as ``INDIRECTION_REFLECT`` so the resolver
@@ -55,7 +58,13 @@ def build_packagist_symbol_map(
         dep_name = dep_key.split(":", 1)[1].split("@", 1)[0]
         qualified: list[str] = []
         for adv in r.advisories:
-            qualified.extend(_extract_qualified(adv, dep_name))
+            qualified.extend(_extract_qualified(
+                adv, dep_name,
+                # Gem / Composer package names never head code
+                # namespaces - a dep-prefixed spelling is
+                # unbindable by construction.
+                dep_is_namespace_head=False,
+            ))
         if qualified:
             out.setdefault(dep_key, []).extend(qualified)
     return {k: list(dict.fromkeys(v)) for k, v in out.items()}
@@ -69,12 +78,16 @@ def refine_packagist_verdicts(
     packagist_symbol_map: dict[str, list[str]],
     inventory: dict[str, Any] | None = None,
 ) -> None:
+    # The any-dot check skips deps whose advisory entries are ALL
+    # unresolved markers — nothing queryable, so the tier could
+    # neither upgrade nor honestly downgrade; don't pay for an
+    # inventory build to abstain.
     candidates = [
         d for d in deps
         if d.ecosystem == "Packagist"
         and out.get(d.key()) is not None
         and out[d.key()].verdict == "imported"
-        and packagist_symbol_map.get(d.key())
+        and any("." in q for q in packagist_symbol_map.get(d.key()) or [])
     ]
     if not candidates:
         return
@@ -108,6 +121,7 @@ def refine_packagist_verdicts(
         if not paired:
             continue
         verdicts = {r.verdict for _, r in paired}
+        covered = len(paired) == len(qualified_names)
         if Verdict.CALLED in verdicts:
             evidence: list[str] = []
             called: list[str] = []
@@ -125,7 +139,12 @@ def refine_packagist_verdicts(
                 ),
                 affected_summary=affected,
             )
-        elif Verdict.UNCERTAIN in verdicts:
+        elif Verdict.UNCERTAIN in verdicts or not covered:
+            # ``not covered``: some advisory entry never paired — an
+            # UNRESOLVED_ENTRY marker (bare symbol; vendor/pkg names
+            # never head code namespaces) or a resolver refusal.
+            # Downgrading on the bindable remainder alone would be a
+            # false suppression → abstain.
             continue
         else:
             out[d.key()] = Reachability(

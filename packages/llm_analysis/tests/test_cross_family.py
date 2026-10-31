@@ -216,6 +216,141 @@ class TestCrossFamilyCheckTaskAdjudication:
         assert prior["F-001"]["is_exploitable"] is True
         assert prior["F-001"].get("cross_family_disputed") is True
 
+    def test_checker_abstention_does_not_flip_primary(self):
+        """A nulled checker verdict (errored / refused / schema-failed
+        response) is an abstention, not a vote (shared counting rule —
+        correlation.py tally contract). Pre-fix it read as a "dispute"
+        and the conservative override flipped a clean not-exploitable
+        primary to exploitable."""
+        prior = {"F-001": _result("F-001", exploitable=False, quality=0.5)}
+        checker_results = [
+            {"finding_id": "F-001", "is_exploitable": None, "ruling": None,
+             "analysed_by": "claude-haiku-4-5-20251001"},
+        ]
+        task = CrossFamilyCheckTask(ANTHROPIC_CHECKER, results_by_id=prior)
+        task.finalize(checker_results, prior)
+
+        assert prior["F-001"]["is_exploitable"] is False
+        assert prior["F-001"].get("cross_family_disputed") is None
+        assert prior["F-001"].get("cross_family_agreed") is None
+        check = prior["F-001"]["cross_family_check"]
+        assert check["verdict"] == "skipped — checker returned no verdict"
+
+    def test_checker_abstention_does_not_dispute_exploitable_primary(self):
+        """Mirror direction: primary exploitable, checker abstained —
+        no dispute noise, verdict preserved."""
+        prior = {"F-001": _result("F-001", exploitable=True, quality=0.5)}
+        checker_results = [
+            {"finding_id": "F-001", "is_exploitable": None,
+             "analysed_by": "claude-haiku-4-5-20251001"},
+        ]
+        task = CrossFamilyCheckTask(ANTHROPIC_CHECKER, results_by_id=prior)
+        task.finalize(checker_results, prior)
+
+        assert prior["F-001"]["is_exploitable"] is True
+        assert prior["F-001"].get("cross_family_disputed") is None
+        assert prior["F-001"].get("cross_family_agreed") is None
+
+    def test_both_abstained_mints_no_agreement(self):
+        """Primary nulled + checker nulled compared equal pre-fix and
+        minted ``cross_family_agreed`` corroboration from zero actual
+        verdicts (downstream: judge/consensus skip agreed findings)."""
+        primary = _result("F-001", quality=0.5)
+        primary["is_exploitable"] = None
+        prior = {"F-001": primary}
+        checker_results = [
+            {"finding_id": "F-001", "is_exploitable": None,
+             "analysed_by": "claude-haiku-4-5-20251001"},
+        ]
+        task = CrossFamilyCheckTask(ANTHROPIC_CHECKER, results_by_id=prior)
+        task.finalize(checker_results, prior)
+
+        assert prior["F-001"].get("cross_family_agreed") is None
+        assert prior["F-001"].get("cross_family_disputed") is None
+        assert "skipped" in prior["F-001"]["cross_family_check"]["verdict"]
+
+    def test_primary_abstention_not_adjudicated(self):
+        """Primary nulled + checker voting: there is no primary vote
+        to agree or dispute with — record but don't adjudicate,
+        matching the same-family fallback shape."""
+        primary = _result("F-001", quality=0.5)
+        primary["is_exploitable"] = None
+        prior = {"F-001": primary}
+        checker_results = [
+            {"finding_id": "F-001", "is_exploitable": False,
+             "ruling": "false_positive",
+             "analysed_by": "claude-haiku-4-5-20251001"},
+        ]
+        task = CrossFamilyCheckTask(ANTHROPIC_CHECKER, results_by_id=prior)
+        task.finalize(checker_results, prior)
+
+        assert prior["F-001"]["is_exploitable"] is None
+        assert prior["F-001"].get("cross_family_disputed") is None
+        assert prior["F-001"].get("cross_family_agreed") is None
+        check = prior["F-001"]["cross_family_check"]
+        assert check["verdict"] == "skipped — primary returned no verdict"
+        assert check["checker_exploitable"] is False
+
+    def test_junk_on_both_sides_mints_no_agreement(self):
+        """Identical junk shapes compared equal pre-fix ("yes" ==
+        "yes") and minted ``cross_family_agreed`` from two non-verdicts
+        — which then EXCLUDED the finding from both the consensus and
+        judge panels (their select_items skip agreed findings). Junk is
+        a non-verdict: record the check, don't adjudicate."""
+        primary = _result("F-001", quality=0.5)
+        primary["is_exploitable"] = "yes"
+        prior = {"F-001": primary}
+        checker_results = [
+            {"finding_id": "F-001", "is_exploitable": "yes",
+             "analysed_by": "claude-haiku-4-5-20251001"},
+        ]
+        task = CrossFamilyCheckTask(ANTHROPIC_CHECKER, results_by_id=prior)
+        task.finalize(checker_results, prior)
+
+        assert prior["F-001"].get("cross_family_agreed") is None
+        assert prior["F-001"].get("cross_family_disputed") is None
+        assert "skipped" in prior["F-001"]["cross_family_check"]["verdict"]
+        # The panels must still see this finding.
+        from packages.llm_analysis.tasks import ConsensusTask, JudgeTask
+        findings = [_finding("F-001")]
+        assert ConsensusTask().select_items(findings, prior) == findings
+        assert JudgeTask(results_by_id=prior).select_items(
+            findings, prior) == findings
+
+    def test_junk_checker_does_not_flip_genuine_primary(self):
+        """Junk checker shape vs a genuine False primary read as a
+        "dispute" pre-fix and the conservative override flipped the
+        primary to exploitable — noise minted from a non-verdict."""
+        prior = {"F-001": _result("F-001", exploitable=False, quality=0.5)}
+        checker_results = [
+            {"finding_id": "F-001", "is_exploitable": "yes",
+             "analysed_by": "claude-haiku-4-5-20251001"},
+        ]
+        task = CrossFamilyCheckTask(ANTHROPIC_CHECKER, results_by_id=prior)
+        task.finalize(checker_results, prior)
+
+        assert prior["F-001"]["is_exploitable"] is False
+        assert prior["F-001"].get("cross_family_disputed") is None
+        assert prior["F-001"].get("cross_family_agreed") is None
+        check = prior["F-001"]["cross_family_check"]
+        assert check["verdict"] == "skipped — checker returned no verdict"
+
+    def test_int_bool_cross_shape_is_not_agreement(self):
+        """``1 == True`` in Python: an int-shaped checker verdict
+        compared equal to a genuine bool primary pre-fix and minted
+        agreement across shapes. Only genuine bools vote."""
+        prior = {"F-001": _result("F-001", exploitable=True, quality=0.5)}
+        checker_results = [
+            {"finding_id": "F-001", "is_exploitable": 1,
+             "analysed_by": "claude-haiku-4-5-20251001"},
+        ]
+        task = CrossFamilyCheckTask(ANTHROPIC_CHECKER, results_by_id=prior)
+        task.finalize(checker_results, prior)
+
+        assert prior["F-001"].get("cross_family_agreed") is None
+        assert prior["F-001"].get("cross_family_disputed") is None
+        assert "skipped" in prior["F-001"]["cross_family_check"]["verdict"]
+
     def test_reasoning_distance_attached_for_long_reasonings(self):
         """When primary and checker reasonings are both substantial,
         the cross-family check captures their pairwise Jaccard
@@ -367,6 +502,125 @@ class TestCrossFamilyCheckTaskAdjudication:
         assert check["intended_model"] == "claude-haiku-4-5-20251001"
 
 
+class TestUnknownFamilyAdjudicationBelt:
+    def test_two_unknowns_never_adjudicate(self):
+        """The same-family fallback guard is void when both families
+        are unknown (same_family returns False for any unknown), so a
+        rebadged same-lineage checker adjudicated pre-fix. Unprovable
+        is not cross-family — record the check, skip adjudication.
+
+        Uses genuinely-unrecognised model names: known open lineages
+        (qwen/deepseek/…) now resolve to real families, so the "unknown"
+        invariant must be exercised with a model family_of() cannot place."""
+        prior = {"F-001": _result("F-001", exploitable=False, quality=0.5,
+                                  analysed_by="acme-llm-7b")}
+        checker_results = [
+            {"finding_id": "F-001", "is_exploitable": True,
+             "ruling": "validated",
+             "analysed_by": "acme-llm-7b-checker"},
+        ]
+        checker = _model("ollama", "acme-llm-7b-checker")
+        task = CrossFamilyCheckTask(checker, results_by_id=prior)
+        task.finalize(checker_results, prior)
+
+        assert prior["F-001"]["is_exploitable"] is False  # no override
+        assert prior["F-001"].get("cross_family_disputed") is None
+        assert prior["F-001"].get("cross_family_agreed") is None
+        check = prior["F-001"]["cross_family_check"]
+        assert "not provable" in check["verdict"]
+
+    def test_unknown_checker_against_known_primary_skipped(self):
+        prior = {"F-001": _result("F-001", exploitable=False, quality=0.5,
+                                  analysed_by="gemini-2.5-pro")}
+        checker_results = [
+            {"finding_id": "F-001", "is_exploitable": True,
+             "ruling": "validated",
+             "analysed_by": "acme-llm-7b"},
+        ]
+        checker = _model("ollama", "acme-llm-7b")
+        task = CrossFamilyCheckTask(checker, results_by_id=prior)
+        task.finalize(checker_results, prior)
+
+        assert prior["F-001"]["is_exploitable"] is False
+        check = prior["F-001"]["cross_family_check"]
+        assert "not provable" in check["verdict"]
+
+
+class TestCrossFamilyOverrideSnapshot:
+    """The conservative override must never erase the analyst's own
+    verdict: downstream stages (consensus tally + stamp, the judge's
+    critique prompt, the pre_consensus audit snapshot) read
+    ``is_exploitable`` as "the primary's vote" — pre-fix the override
+    wrote over it with the CHECKER's opinion and the original vote
+    survived nowhere on the record (mechanism sibling of the landed
+    pre-consensus snapshot fix, one stage earlier)."""
+
+    def test_dispute_snapshots_primary_verdict(self):
+        prior = {"F-001": _result("F-001", exploitable=False, quality=0.5)}
+        checker_results = [
+            {"finding_id": "F-001", "is_exploitable": True,
+             "ruling": "validated",
+             "analysed_by": "claude-haiku-4-5-20251001"},
+        ]
+        task = CrossFamilyCheckTask(ANTHROPIC_CHECKER, results_by_id=prior)
+        task.finalize(checker_results, prior)
+
+        assert prior["F-001"]["is_exploitable"] is True  # override stands
+        assert prior["F-001"]["pre_crossfamily_is_exploitable"] is False
+
+    def test_check_record_carries_primary_vote_both_arms(self):
+        # Dispute arm.
+        prior = {"F-001": _result("F-001", exploitable=False, quality=0.5)}
+        task = CrossFamilyCheckTask(ANTHROPIC_CHECKER, results_by_id=prior)
+        task.finalize(
+            [{"finding_id": "F-001", "is_exploitable": True,
+              "ruling": "validated",
+              "analysed_by": "claude-haiku-4-5-20251001"}],
+            prior,
+        )
+        assert prior["F-001"]["cross_family_check"][
+            "primary_exploitable"] is False
+        # Agreed arm.
+        prior2 = {"F-002": _result("F-002", exploitable=True, quality=0.5)}
+        task2 = CrossFamilyCheckTask(ANTHROPIC_CHECKER, results_by_id=prior2)
+        task2.finalize(
+            [{"finding_id": "F-002", "is_exploitable": True,
+              "ruling": "validated",
+              "analysed_by": "claude-haiku-4-5-20251001"}],
+            prior2,
+        )
+        assert prior2["F-002"]["cross_family_check"][
+            "primary_exploitable"] is True
+
+    def test_snapshot_never_overwritten(self):
+        # Idempotence: a second adjudication pass (or a re-run over a
+        # record the override already touched) must not re-snapshot
+        # the OVERRIDDEN value as the analyst's own.
+        prior = {"F-001": _result("F-001", exploitable=False, quality=0.5)}
+        checker_results = [
+            {"finding_id": "F-001", "is_exploitable": True,
+             "ruling": "validated",
+             "analysed_by": "claude-haiku-4-5-20251001"},
+        ]
+        task = CrossFamilyCheckTask(ANTHROPIC_CHECKER, results_by_id=prior)
+        task.finalize(checker_results, prior)
+        task.finalize(checker_results, prior)  # second pass sees True
+        assert prior["F-001"]["pre_crossfamily_is_exploitable"] is False
+
+    def test_agreed_arm_writes_no_snapshot(self):
+        # No override happened — the raw field still IS the analyst's
+        # verdict; a snapshot here would freeze a redundant copy.
+        prior = {"F-001": _result("F-001", exploitable=True, quality=0.5)}
+        task = CrossFamilyCheckTask(ANTHROPIC_CHECKER, results_by_id=prior)
+        task.finalize(
+            [{"finding_id": "F-001", "is_exploitable": True,
+              "ruling": "validated",
+              "analysed_by": "claude-haiku-4-5-20251001"}],
+            prior,
+        )
+        assert "pre_crossfamily_is_exploitable" not in prior["F-001"]
+
+
 # ---------------------------------------------------------------------------
 # _resolve_cross_family_checker / auto-detect
 # ---------------------------------------------------------------------------
@@ -443,21 +697,111 @@ class TestResolveCrossFamilyChecker:
             result = _resolve_cross_family_checker(GEMINI_PRIMARY, role_res)
         assert result is None
 
+    def test_unknown_primary_refuses(self):
+        # Documented invariant (llm_family.select_cross_family_checker):
+        # an unknown-family producer makes every same_family comparison
+        # False, so ANY candidate — including a same-lineage rebadge of
+        # the primary — would read as "cross-family". Unprovable is not
+        # cross-family: refuse rather than hand conservative-override
+        # authority to a possibly identical model. Pre-fix the resolver
+        # returned the FIRST candidate unconditionally.
+        # Uses a genuinely-unrecognised lineage: known open families
+        # (qwen/deepseek) now resolve, so the unknown-producer invariant
+        # must be exercised with a name family_of() cannot place.
+        from packages.llm_analysis.orchestrator import (
+            _resolve_cross_family_checker,
+        )
+        unknown_primary = _model("ollama", "acme-llm-7b", role="analysis")
+        rebadged_sibling = _model("ollama", "acme-llm-7b-checker")
+        role_res = {
+            "analysis_model": unknown_primary,
+            "consensus_models": [rebadged_sibling, ANTHROPIC_CHECKER],
+            "fallback_models": [],
+        }
+        with patch.dict(
+            os.environ, {"ANTHROPIC_API_KEY": "sk-test"}, clear=True,
+        ):
+            result = _resolve_cross_family_checker(unknown_primary, role_res)
+        # No provable cross-family relation exists for an unknown
+        # producer — auto-detect must not fire either.
+        assert result is None
+
+    def test_unknown_candidate_skipped(self):
+        # A known-family primary must never receive an unknown-family
+        # candidate as its checker (cannot be proven cross-family);
+        # the next provable candidate wins. Uses a genuinely-unknown
+        # candidate name (qwen3-coder now resolves to a real family).
+        from packages.llm_analysis.orchestrator import (
+            _resolve_cross_family_checker,
+        )
+        unknown_candidate = _model("ollama", "acme-llm-7b")
+        role_res = {
+            "analysis_model": GEMINI_PRIMARY,
+            "consensus_models": [unknown_candidate, ANTHROPIC_CHECKER],
+            "fallback_models": [],
+        }
+        result = _resolve_cross_family_checker(GEMINI_PRIMARY, role_res)
+        assert result is ANTHROPIC_CHECKER
+
 
 # ---------------------------------------------------------------------------
 # dispatch.py quality/nonce persistence (integration-ish)
 # ---------------------------------------------------------------------------
 
 class TestDispatchQualityPersistence:
-    """Verify that _quality and _nonce_leaked are set on processed results."""
+    """_quality / _nonce_leaked persist onto PROCESSED result dicts
+    through the real ``dispatch_task`` loop — the named contract that
+    feeds CrossFamilyCheckTask.select_items. The previous tests
+    asserted a dataclass field the test itself had just set, so the
+    persistence seam could regress without a failure."""
 
-    def test_quality_on_dispatch_result(self):
-        dr = DispatchResult(
-            result={"is_exploitable": True, "reasoning": "test"},
-            quality=0.65,
+    @staticmethod
+    def _dispatch(quality: float = 0.65, echo_prompt: bool = False):
+        from packages.llm_analysis.dispatch import dispatch_task
+        from packages.llm_analysis.orchestrator import CostTracker
+        from packages.llm_analysis.tasks import AnalysisTask
+
+        finding = {
+            "finding_id": "F1",
+            "rule_id": "CWE-120",
+            "file_path": "src/parse.c",
+            "start_line": 42,
+            "end_line": 45,
+            "level": "high",
+            "message": "Potential CWE-120",
+            "code": "strcpy(buf, input);",
+            "surrounding_context": "void parse(char *input) { ... }",
+        }
+
+        def dispatch_fn(prompt, schema, system_prompt, temperature, model):
+            content = prompt if echo_prompt else "ok"
+            return DispatchResult(
+                result={"content": content, "is_exploitable": True,
+                        "exploitability_score": 0.9, "reasoning": "test",
+                        "is_true_positive": True},
+                cost=0.0, tokens=1, model="test-model", duration=0.1,
+                quality=quality,
+            )
+
+        task = AnalysisTask()
+        results = dispatch_task(
+            task, [finding], dispatch_fn, {"analysis_model": None},
+            {}, CostTracker(), max_parallel=1,
         )
-        assert dr.quality == 0.65
+        assert len(results) == 1
+        return results[0]
 
-    def test_quality_default(self):
-        dr = DispatchResult(result={"is_exploitable": True})
-        assert dr.quality == 1.0
+    def test_quality_persisted_onto_processed_result(self):
+        processed = self._dispatch(quality=0.65)
+        assert processed["_quality"] == 0.65
+
+    def test_nonce_leak_flag_persisted_when_response_echoes_envelope(self):
+        """A response that echoes the prompt (envelope nonce included)
+        must be stamped ``_nonce_leaked`` — the low-quality/leak signal
+        CrossFamilyCheckTask selects on."""
+        processed = self._dispatch(echo_prompt=True)
+        assert processed.get("_nonce_leaked") is True
+
+    def test_no_leak_flag_on_clean_response(self):
+        processed = self._dispatch()
+        assert processed.get("_nonce_leaked") is not True

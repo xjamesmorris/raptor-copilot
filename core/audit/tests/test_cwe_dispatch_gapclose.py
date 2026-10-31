@@ -1,0 +1,399 @@
+"""Dispatch adjudication for the long-tail empty-dispatch classes.
+
+An instrumented audit run warned ``review emitted CWE-<n> but no
+tool-chain dispatch entry exists`` for sixty concrete classes. Every
+one is now adjudicated into exactly one lane: a real stock-tool chain
+where a deterministic tool states the harm mechanism; a fallback
+channel (fail_open / api_boundary / resource_bounds / compiler) where
+a channel's question matches the class; the policy park where no tool
+output could ever adjudicate (CWE-223 / CWE-1357); or an explicit
+``synthesis_owned`` marker where per-hypothesis checker synthesis IS
+the designed verifier — the unmapped-class log line downgrades to
+info while chain construction and synthesis candidacy stay unchanged.
+Classes outside every lane keep the loud warning. Hermetic — no LLM,
+no tool subprocesses.
+"""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
+import pytest
+
+from core.audit.api_boundary import api_boundary_applicable
+from core.audit.checker_synthesis import ondemand_synthesis_refusal_reason
+from core.audit.compiler_sweep import COMPILER_CWE_MAP, compiler_applicable
+from core.audit.cwe_dispatch import (
+    CWE_TO_TOOL_DISPATCH,
+    dark_verify_applicable,
+    lookup,
+    not_tool_verifiable_reason,
+    resolve_cocci_rules_for_cwe,
+    resolve_semgrep_rule_for_cwe,
+    sinks_for_cwe,
+    smt_verb_for_cwe,
+    synthesis_owned,
+)
+from core.audit.fail_open_verify import fail_open_applicable
+from core.audit.orchestrator import _cwe_fallback_chain
+from core.audit.resource_bounds import resource_bounds_applicable
+
+_ORCH_LOGGER = "core.audit.orchestrator"
+
+# Classes whose deliberate verifier is on-demand checker synthesis:
+# entry present, ``synthesis_owned`` marker set, chain empty.
+_SYNTHESIS_OWNED = (
+    "CWE-41", "CWE-176", "CWE-178", "CWE-180", "CWE-183", "CWE-184",
+    "CWE-185", "CWE-200", "CWE-214", "CWE-349", "CWE-412", "CWE-426",
+    "CWE-427", "CWE-436", "CWE-522", "CWE-526", "CWE-668", "CWE-670",
+    "CWE-684", "CWE-693", "CWE-694", "CWE-696", "CWE-697", "CWE-706",
+    "CWE-756", "CWE-1023", "CWE-1188", "CWE-1236", "CWE-1289",
+    "CWE-1339", "CWE-1427",
+)
+
+
+@pytest.fixture()
+def fresh_warn_log(monkeypatch):
+    """Isolate the once-per-run unmapped-CWE dedup set per test."""
+    import core.audit.orchestrator as _orch
+
+    monkeypatch.setattr(_orch, "_UNMAPPED_CWES_LOGGED", set())
+    return _orch
+
+
+class TestToctouFamily:
+    """CWE-59/61 (symlink following) — the CWE-367 mechanism: SMT
+    TOCTOU verb, stat-then-open cocci rule, cpp TOCTOU query."""
+
+    @pytest.mark.parametrize("cwe", ["CWE-59", "CWE-61"])
+    def test_dispatch_entry(self, cwe):
+        entry = lookup(cwe)
+        assert entry is not None
+        assert smt_verb_for_cwe(cwe) == "check-toctou"
+        assert entry["cocci"] == "toctou_stat_open.cocci"
+        assert entry["codeql"] == "cpp/toctou-race-condition"
+
+    @pytest.mark.parametrize("cwe", ["CWE-59", "CWE-61"])
+    def test_fallback_chain(
+        self, cwe: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Hermetic: the chain's codeql leg survives only when the
+        # entry's pack query ID resolves against installed CodeQL
+        # packs — environment state a bare runner lacks. Stub the
+        # resolver seam (the test_codeql_query_resolver pattern) so
+        # chain composition is what's under test, not pack presence.
+        ql = tmp_path / "TOCTOURaceCondition.ql"
+        ql.write_text("import cpp\nselect 1\n")
+        monkeypatch.setattr(
+            "core.audit.codeql_query_resolver.resolve_query_id",
+            lambda qid: (
+                str(ql) if qid == "cpp/toctou-race-condition" else None
+            ),
+        )
+        types = {e["type"] for e in _cwe_fallback_chain(cwe)}
+        assert types >= {"smt", "coccinelle", "codeql"}
+
+    @pytest.mark.parametrize("cwe", ["CWE-59", "CWE-61"])
+    def test_fallback_chain_degrades_without_packs(
+        self, cwe: str, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # The bare-runner shape: an unresolvable pack ID drops the
+        # codeql leg only — smt + coccinelle still cover the claim.
+        monkeypatch.setattr(
+            "core.audit.codeql_query_resolver.resolve_query_id",
+            lambda qid: None,
+        )
+        monkeypatch.setattr(
+            "core.audit.orchestrator._CODEQL_UNSUPPORTED_IDS_LOGGED",
+            set(),
+        )
+        types = {e["type"] for e in _cwe_fallback_chain(cwe)}
+        assert "codeql" not in types
+        assert types >= {"smt", "coccinelle"}
+
+
+class TestTaintEntries:
+    """Joern-seeded taint families reusing established sibling
+    vocabularies (CWE-73 <- 22/23, CWE-776 <- 611, CWE-915 <- 1321,
+    CWE-807 <- 863)."""
+
+    def test_path_control(self):
+        entry = lookup("CWE-73")
+        assert entry is not None and entry["joern"] is True
+        assert entry["codeql"] == "py/path-injection"
+        assert entry["sinks"] == lookup("CWE-23")["sinks"]
+
+    def test_entity_expansion(self):
+        entry = lookup("CWE-776")
+        assert entry is not None and entry["joern"] is True
+        assert entry["codeql"] == "py/xml-bomb"
+        assert entry["sinks"] == lookup("CWE-611")["sinks"]
+
+    def test_mass_assignment(self):
+        entry = lookup("CWE-915")
+        assert entry is not None and entry["joern"] is True
+        assert entry["sinks"] == lookup("CWE-1321")["sinks"]
+
+    def test_security_decision(self):
+        entry = lookup("CWE-807")
+        assert entry is not None and entry["joern"] is True
+        assert smt_verb_for_cwe("CWE-807") == "check-auth-bypass"
+        assert entry["sinks"] == lookup("CWE-863")["sinks"]
+        # The dark-code heuristic's calibration evidence covers the
+        # authn/authz families only — CWE-807 must not inherit it.
+        assert dark_verify_applicable("CWE-807") is False
+
+
+class TestCuratedRuleEntries:
+    """Entries whose verifying channel is a curated semgrep rule:
+    language-gated so non-matching targets keep pre-entry behaviour."""
+
+    _CASES = [
+        ("CWE-117", "app.py", "injection/log-injection.yaml"),
+        ("CWE-117", "app.go", "injection/log-injection.yaml"),
+        ("CWE-532", "app.java", "logging/logs-secrets.yaml"),
+        ("CWE-923", "app.py", "auth/tls-skip-verify.yaml"),
+        ("CWE-943", "app.js", "injection/nosql-taint.yaml"),
+        ("CWE-1333", "app.ts", "injection/regex-dos.yaml"),
+        ("CWE-1336", "app.py", "injection/ssti-taint.yaml"),
+    ]
+
+    @pytest.mark.parametrize("cwe,path,rule", _CASES)
+    def test_rule_resolves_on_declared_language(self, cwe, path, rule):
+        resolved = resolve_semgrep_rule_for_cwe(cwe, path)
+        assert resolved is not None
+        assert resolved.endswith(rule)
+        assert Path(resolved).is_file()
+
+    @pytest.mark.parametrize(
+        "cwe", ["CWE-117", "CWE-532", "CWE-923", "CWE-943", "CWE-1333",
+                "CWE-1336"],
+    )
+    def test_rule_dropped_on_other_language(self, cwe):
+        assert resolve_semgrep_rule_for_cwe(cwe, "main.c") is None
+
+    def test_log_injection_keeps_codeql_leg(self):
+        assert lookup("CWE-117")["codeql"] == "py/log-injection"
+
+    def test_secret_logging_keeps_codeql_leg(self):
+        assert (lookup("CWE-532")["codeql"]
+                == "py/clear-text-logging-sensitive-data")
+
+    def test_redos_keeps_codeql_leg(self):
+        assert lookup("CWE-1333")["codeql"] == "py/redos"
+
+
+class TestCocciSmtEntries:
+    """Cocci/SMT-anchored fixed-vocabulary families."""
+
+    def test_array_index(self):
+        assert smt_verb_for_cwe("CWE-129") == "check-oob"
+        assert (lookup("CWE-129")["codeql"]
+                == "cpp/unclear-array-index-validation")
+
+    def test_privilege_drop_order(self):
+        assert (lookup("CWE-269")["codeql"]
+                == "cpp/drop-linux-privileges-outoforder")
+
+    def test_cleartext_storage(self):
+        assert (lookup("CWE-312")["codeql"]
+                == "py/clear-text-storage-sensitive-data")
+
+    def test_insecure_temp_dir_variant(self):
+        entry = lookup("CWE-379")
+        assert entry is not None
+        assert entry["cocci"] == lookup("CWE-377")["cocci"]
+        assert entry["codeql"] == lookup("CWE-377")["codeql"]
+
+    def test_error_path_cleanup(self):
+        assert smt_verb_for_cwe("CWE-460") == "check-resource-leak"
+        assert lookup("CWE-460")["cocci"] == "resource_leak_err.cocci"
+
+    def test_double_close_family(self):
+        rules = resolve_cocci_rules_for_cwe("CWE-675")
+        names = {Path(r).name for r in rules}
+        assert names == {"double_close.cocci",
+                         "fdopendir_double_close.cocci"}
+
+    def test_incorrect_calculation(self):
+        assert smt_verb_for_cwe("CWE-682") == "check-overflow"
+        rules = resolve_cocci_rules_for_cwe("CWE-682")
+        names = {Path(r).name for r in rules}
+        assert names == {"shift_overflow.cocci", "division_by_zero.cocci"}
+
+
+class TestCompilerChannelFamilies:
+    """CWE-674 (recursion) and CWE-834 (excessive iteration) join the
+    compiler channel confirm-only — silence never refutes."""
+
+    def test_recursion_spec(self):
+        assert compiler_applicable("CWE-674")
+        spec = COMPILER_CWE_MAP["CWE-674"]
+        assert spec.reliable is False
+        assert "-Winfinite-recursion" in spec.gcc_ids
+        assert "-Winfinite-recursion" in spec.clang_ids
+        assert spec.clang_engine == "warning"
+
+    def test_iteration_shares_loop_spec(self):
+        assert compiler_applicable("CWE-834")
+        assert COMPILER_CWE_MAP["CWE-834"] is COMPILER_CWE_MAP["CWE-835"]
+        assert smt_verb_for_cwe("CWE-834") == "check-overflow"
+
+    def test_fallback_chains(self):
+        assert {e["type"] for e in _cwe_fallback_chain("CWE-674")} == {
+            "compiler",
+        }
+        assert {e["type"] for e in _cwe_fallback_chain("CWE-834")} >= {
+            "compiler", "smt",
+        }
+
+
+class TestChannelOwnedFamilies:
+    """All-None keys whose verifier is a fallback channel."""
+
+    @pytest.mark.parametrize(
+        "cwe", ["CWE-754", "CWE-755", "CWE-392", "CWE-346"],
+    )
+    def test_fail_open_members(self, cwe):
+        assert lookup(cwe) is not None
+        assert fail_open_applicable(cwe)
+        assert {e["type"] for e in _cwe_fallback_chain(cwe)} == {
+            "fail_open",
+        }
+
+    def test_caller_contract(self):
+        assert lookup("CWE-573") is not None
+        # Unconditional like CWE-345 — no hypothesis phrasing needed.
+        assert api_boundary_applicable("CWE-573")
+        assert {e["type"] for e in _cwe_fallback_chain("CWE-573")} == {
+            "api_boundary",
+        }
+
+    def test_excessive_allocation_size(self):
+        assert lookup("CWE-789") is not None
+        assert resource_bounds_applicable("CWE-789")
+        assert {e["type"] for e in _cwe_fallback_chain("CWE-789")} == {
+            "resource_bounds",
+        }
+
+
+class TestPolicyPark:
+    """CWE-223 / CWE-1357 are not-tool-verifiable by policy: no
+    dispatch entry, no synthesized checker, info-grade log line."""
+
+    @pytest.mark.parametrize("cwe", ["CWE-223", "CWE-1357"])
+    def test_parked(self, cwe):
+        assert lookup(cwe) is None
+        assert not_tool_verifiable_reason(cwe) != ""
+        reason = ondemand_synthesis_refusal_reason(
+            cwe, "logs omit the client identity on auth failure",
+        )
+        assert reason.startswith("not tool-verifiable by policy")
+
+    @pytest.mark.parametrize("cwe", ["CWE-223", "CWE-1357"])
+    def test_info_line_not_warning(self, cwe, fresh_warn_log, caplog):
+        with caplog.at_level(logging.INFO, logger=_ORCH_LOGGER):
+            fresh_warn_log._warn_unmapped_cwe(cwe)
+        records = [r for r in caplog.records if cwe in r.getMessage()]
+        assert records and all(
+            r.levelno == logging.INFO for r in records
+        )
+
+    @pytest.mark.parametrize("cwe", ["CWE-117", "CWE-532"])
+    def test_taint_verifiable_log_classes_never_parked(self, cwe):
+        # Log injection and secret-to-log flows have taint-statable
+        # mechanisms — they carry entries and stay out of the park.
+        assert not_tool_verifiable_reason(cwe) == ""
+        assert lookup(cwe) is not None
+
+
+class TestSynthesisOwned:
+    """Marker-carrying entries: empty chain by adjudication, info-
+    grade log line, synthesis lane open."""
+
+    @pytest.mark.parametrize("cwe", _SYNTHESIS_OWNED)
+    def test_entry_and_empty_chain(self, cwe):
+        entry = lookup(cwe)
+        assert entry is not None
+        assert synthesis_owned(cwe) is True
+        assert _cwe_fallback_chain(cwe) == []
+        # Inert everywhere a leg accessor looks.
+        assert sinks_for_cwe(cwe) == []
+        assert smt_verb_for_cwe(cwe) is None
+        assert resolve_cocci_rules_for_cwe(cwe) == []
+        assert entry["codeql"] is None
+
+    @pytest.mark.parametrize("cwe", _SYNTHESIS_OWNED)
+    def test_synthesis_lane_open(self, cwe):
+        # Concrete class: the harm gate passes on the class alone.
+        assert ondemand_synthesis_refusal_reason(
+            cwe, "hypothesis prose without a keyword-table mechanism",
+        ) == ""
+
+    def test_info_line_not_warning(self, fresh_warn_log, caplog):
+        with caplog.at_level(logging.INFO, logger=_ORCH_LOGGER):
+            fresh_warn_log._warn_unmapped_cwe("CWE-41")
+        records = [
+            r for r in caplog.records if "CWE-41" in r.getMessage()
+        ]
+        assert records and all(
+            r.levelno == logging.INFO for r in records
+        )
+        assert any("synthesis-owned" in r.getMessage() for r in records)
+
+    def test_marker_never_on_language_gated_entries(self):
+        # Language-gated entries document loud pre-entry behaviour on
+        # non-matching targets — the marker would silence it.
+        for cwe, entry in CWE_TO_TOOL_DISPATCH.items():
+            if entry.get("semgrep_langs") or entry.get("semgrep_by_lang"):
+                assert not entry.get("synthesis_owned"), cwe
+
+    def test_marker_only_on_leg_free_entries(self):
+        for cwe, entry in CWE_TO_TOOL_DISPATCH.items():
+            if not entry.get("synthesis_owned"):
+                continue
+            assert entry["smt"] is None, cwe
+            assert entry["cocci"] is None, cwe
+            assert entry["joern"] is False, cwe
+            assert entry["codeql"] is None, cwe
+            assert entry["sinks"] == [], cwe
+
+
+class TestLoudWarningPreserved:
+    """The two shapes that must keep the WARNING level: classes
+    outside every lane, and language-gated entries on non-matching
+    targets."""
+
+    def test_unmapped_tail_still_warns(self, fresh_warn_log, caplog):
+        with caplog.at_level(logging.INFO, logger=_ORCH_LOGGER):
+            fresh_warn_log._warn_unmapped_cwe("CWE-1104")
+        records = [
+            r for r in caplog.records if "CWE-1104" in r.getMessage()
+        ]
+        assert records and all(
+            r.levelno == logging.WARNING for r in records
+        )
+
+    def test_language_gated_entry_warns_on_other_target(
+        self, fresh_warn_log, caplog,
+    ):
+        # CWE-923's only leg is the curated rule; on a C target the
+        # chain is empty and — with no synthesis_owned marker — the
+        # loud warning fires (the php-entry precedent).
+        with caplog.at_level(logging.INFO, logger=_ORCH_LOGGER):
+            chain = _cwe_fallback_chain("CWE-923", "", "main.c")
+        assert chain == []
+        records = [
+            r for r in caplog.records if "CWE-923" in r.getMessage()
+        ]
+        assert records and all(
+            r.levelno == logging.WARNING for r in records
+        )
+        # The message must not claim "no entry exists" unqualified:
+        # for this shape an entry DOES exist — the language gate
+        # dropped its legs — and the text names that possibility.
+        assert all(
+            "dropped for this target's language" in r.getMessage()
+            for r in records
+        )

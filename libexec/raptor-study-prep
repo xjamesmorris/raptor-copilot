@@ -20,7 +20,6 @@ import bisect
 import re
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -42,12 +41,14 @@ if not (os.environ.get("CLAUDECODE")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import core.startup.process_init  # noqa: E402,F401
+from core.security.log_sanitisation import sanitise_for_terminal as _sft  # noqa: E402
 import argparse  # noqa: E402
 from dataclasses import asdict  # noqa: E402
 
 from core.concepts.model import StudyItem  # noqa: E402
 from core.json import load_json, loads, save_json  # noqa: E402
 from core.paths import confine  # noqa: E402
+from core.source import read_text_capped  # noqa: E402
 
 # Study artifacts (reading/study lists) are small RAPTOR-written run
 # output.
@@ -216,10 +217,24 @@ _RESOURCE_LIFECYCLE_PATTERN = re.compile(
 _OWNED_TYPE_PATTERN = re.compile(r"\bstruct\s+(\w+)\s*\*")
 _REFERENCED_TYPE_PATTERN = re.compile(r"\bstruct\s+(\w+)\b")
 
-_FLEX_ARRAY_PATTERN = re.compile(r"(\w+)\s+(\w+)\s*\[\s*(?:0|1)?\s*\]\s*;")
+# Gated optional atoms (bound digit, bracket tail): the naive
+# ``\[\s*(?:0|1)?\s*\]\s*;`` chained whitespace spans around
+# optional atoms — quadratic on a field-shaped line ending in a
+# whitespace run.
+# \b pins the scan to identifier starts: unanchored, every position
+# inside a long identifier run restarts the scan and re-reads the
+# run — quadratic on hostile source. Mid-word starts only ever
+# matched a truncated tail of the type name.
+_FLEX_ARRAY_PATTERN = re.compile(
+    r"\b(\w+)\s+(\w+)\s*\[\s*(?:[01]\s*)?\]\s*;",
+)
 
+# The condition span is bounded: with an unbounded span, hostile
+# source repeating `if(` inside one close-paren-free run makes every
+# opener re-scan the rest of the run — quadratic. Real if-conditions
+# sit well inside 256 chars (beyond it the flag check is missed).
 _FLAG_CHECK_PATTERN = re.compile(
-    r"\bif\s*\([^)]*\b(\w+)\s*&\s*(\w+)",
+    r"\bif\s*\([^)]{0,256}\b(\w+)\s*&\s*(\w+)",
 )
 
 _ALLOC_NAMES = frozenset({
@@ -258,14 +273,16 @@ _ALLOC_FREE_PATTERN = re.compile(
 )
 
 # State machine signals
+# \b pin: same identifier-run scan-restart rationale as
+# _FLEX_ARRAY_PATTERN above.
 _STATE_TRANSITION_PATTERN = re.compile(
-    r"(\w+)->(\w+)\s*=\s*(?!NULL\b|0\b|false\b)(\w+)",
+    r"\b(\w+)->(\w+)\s*=\s*(?!NULL\b|0\b|false\b)(\w+)",
 )
 
 _GATE_CHECK_PATTERN = re.compile(
     r"(?:"
     r"err\s*=\s*(\w+_check_\w+)\s*\("          # err = check_key(...)
-    r"|if\s*\(\s*!?\s*(\w+)->(\w+)\s*\)\s*\{?"  # if (!obj->field) { return/goto
+    r"|if\s*\(\s*(?:!\s*)?(\w+)->(\w+)\s*\)\s*\{?"  # if (!obj->field) { return/goto
     r"|if\s*\(\s*atomic_read\s*\(&(\w+)->(\w+)\)"  # if (atomic_read(&obj->field))
     r")",
 )
@@ -275,19 +292,46 @@ _DISPATCH_TABLE_PATTERN = re.compile(
 )
 
 # Value constraint signals
+# The optional brace gates its own trailing whitespace: the naive
+# ``\)\s*\{?\s*\n`` chained spans around it — quadratic on an
+# if-line followed by a whitespace run.
 _NULL_GUARD_PATTERN = re.compile(
-    r"if\s*\(\s*!(\w+(?:->\w+)*)\s*\)\s*\{?\s*\n\s*"
+    # Member chains bounded: a body-unit ("->a") storm makes every
+# chain start re-walk the run — quadratic on hostile source.
+# Real access chains sit far inside 32 links.
+# The guard gap anchors on the FIRST newline (same language:
+# any whitespace mix with one required newline after the
+# optional brace) — the `\s*\n\s*` spelling split a hostile
+# newline run three ways per scan position, quadratic.
+r"if\s*\(\s*!(\w+(?:->\w+){0,32})\s*\)(?:\s*\{)?[^\S\n]*\n\s*"
     r"(?:return\s+(-\w+)|goto\s+(\w+))",
 )
 
+# The RHS call-argument span and accessor chain are bounded: with an
+# unbounded span, hostile source repeating the opener inside one
+# close-paren-free run makes every opener re-scan the rest of the
+# run — quadratic. Real bound expressions sit far inside the bounds
+# (beyond them the validation is not credited).
+# The brace tail is a gated fold: the naive ``\)\s*\{?\s*\n?\s*``
+# stacks three whitespace spans around optional atoms — the engine
+# explores every split of a hostile brace/newline/space run (the
+# ``\n?`` is subsumed by ``\s``, so the gated spelling matches the
+# identical language).
 _VALIDATION_BOUND_PATTERN = re.compile(
-    r"if\s*\(\s*(\w+(?:->\w+)*)\s*([><!]=?)\s*(\w+(?:->\w+|\([^)]*\))*)\s*\)"
-    r"\s*\{?\s*\n?\s*return\s+(-\w+)",
+    r"if\s*\(\s*(\w+(?:->\w+)*)\s*([><!]=?)"
+    r"\s*(\w+(?:->\w+|\([^)]{0,256}\)){0,32})\s*\)"
+    r"\s*(?:\{\s*)?return\s+(-\w+)",
 )
 
+# \b keeps the unanchored scan from restarting inside an
+# identifier run (quadratic); earliest-start matches unchanged.
+# The allocator argument span is bounded (same close-paren-free run
+# rationale as _FLAG_CHECK_PATTERN; alloc arguments are tiny).
 _ALLOC_THEN_CHECK_PATTERN = re.compile(
-    r"(\w+(?:->\w+)*)\s*=\s*(\w+alloc\w*|alloc_\w+)\s*\([^)]*\)\s*;"
-    r"\s*\n\s*if\s*\(\s*!(?:\1)\s*\)",
+    # Member chain bounded — same rationale as _NULL_GUARD_PATTERN.
+    r"\b(\w+(?:->\w+){0,32})\s*=\s*(\w+alloc\w*|alloc_\w+)\s*\([^)]{0,256}\)\s*;"
+    # First-newline anchoring — same rationale as _NULL_GUARD_PATTERN.
+    r"[^\S\n]*\n\s*if\s*\(\s*!(?:\1)\s*\)",
 )
 
 _INFRA_TYPES = frozenset({
@@ -448,7 +492,8 @@ def _extract_flexible_arrays(definition: str) -> list[str]:
     last = matches[-1]
     closing_brace = definition.find("}", last.end())
     between = definition[last.end():closing_brace] if closing_brace != -1 else ""
-    if re.search(r"\w+\s+\w+\s*[;\[]", between):
+    # \b pin: identifier-run scan-restart (see _FLEX_ARRAY_PATTERN).
+    if re.search(r"\b\w+\s+\w+\s*[;\[]", between):
         return []
     return [last.group(2)]
 
@@ -533,11 +578,22 @@ def _extract_struct_blocks(
 def _extract_fields(block: str) -> list[str]:
     """Extract field names from a struct/union block."""
     fields = []
-    for line in block.split("\n"):
+    for line in block.split("\n"):  # line-model: universal-newline read_text upstream
         line = line.strip()
         if line.startswith(("//", "/*", "*")):
             continue
-        fm = re.search(r"(\w+)\s*(?:\[[\w\s]*\])?\s*(?::\s*\d+)?\s*;", line)
+        # Each optional tail atom (array suffix, bitfield width)
+        # carries its own trailing whitespace span: the naive
+        # ``\s*(?:\[...\])?\s*(?::\s*\d+)?\s*;`` stacks three
+        # unbounded whitespace spans around optional atoms, and a
+        # field-shaped line ending in a long whitespace run with no
+        # ``;`` makes the engine try every split of the run between
+        # them — cubic in the line length. Match set unchanged.
+        # \b pin: identifier-run scan-restart (see
+        # _FLEX_ARRAY_PATTERN).
+        fm = re.search(
+            r"\b(\w+)\s*(?:\[[\w\s]*\]\s*)?(?::\s*\d+\s*)?;", line,
+        )
         if fm:
             fields.append(fm.group(1))
     return fields
@@ -555,8 +611,11 @@ def _detect_refcount_fields(fields: list[str], block: str) -> list[str]:
         if _REFCOUNT_PATTERNS.search(f):
             result.append(f)
             continue
+        # Horizontal-only indent and type-token span — the MULTILINE
+        # ``^\s*`` spelling is quadratic on blank-line runs in scanned
+        # source, and a C field declaration is single-line anyway.
         line_re = re.compile(
-            r"^\s*\w[\w\s\*]*\b" + re.escape(f) + r"\b[^;]*;[^\n]*$",
+            r"^[^\S\n]*\w[\w \t\*]*\b" + re.escape(f) + r"\b[^;]*;[^\n]*$",
             re.MULTILINE,
         )
         lm = line_re.search(block)
@@ -610,15 +669,35 @@ def _extract_doc_comment(source: str, pos: int) -> str:
 # Attribute/declspec prefix: handles __attribute__((visibility("default"))),
 # __attribute__((format(printf, 1, 2))), __declspec(dllexport), extern, etc.
 # Two-level paren matching covers all common attribute forms.
+# The attribute interior is spelled in first-rest normal form
+# ([^()]*(?:\([^()]*\)[^()]*)*): the previous (?:[^()]*|\([^()]*\))*
+# nested an unbounded branch inside an unbounded loop, so an
+# '__attribute__((' followed by a long run with no closing paren made
+# the engine try every split of the run across loop iterations —
+# exponential. Same language (any mix of non-paren runs and
+# single-level paren groups), deterministic scan.
+# The attribute loop itself is bounded ({0,8}): under MULTILINE
+# every line start anchors a match attempt, and an unbounded
+# attribute loop lets each anchor consume arbitrarily many following
+# attribute-shaped lines before failing — quadratic over a planted
+# file of such lines. Eight chained attributes sits far above real
+# declarations (trade-off both directions: larger admits absurd
+# chains, smaller drops them) while capping per-anchor reach.
 _ATTR_PREFIX = (
-    r"(?:__attribute__\s*\(\((?:[^()]*|\([^()]*\))*\)\)\s*)*"
+    r"(?:__attribute__\s*\(\([^()]*(?:\([^()]*\)[^()]*)*\)\)\s*){0,8}"
     r"(?:__declspec\s*\([^()]*\)\s*)?"
     r"(?:extern\s+)?"
 )
 
+# The __-qualifier loop is bounded: it overlaps the type token on
+# every __-word, so an unbounded spelling let a run of __-words with
+# no paren drive the engine through every split of the run between
+# the loop and the type/name tokens. Eight qualifiers sits far above
+# real declarations while capping per-anchor work (trade-off both
+# directions: larger admits absurd headers, smaller drops them).
 _C_FUNC_RE = re.compile(
     r"^" + _ATTR_PREFIX +
-    r"(?:static\s+)?(?:inline\s+)?(?:__\w+\s+)*"
+    r"(?:static\s+)?(?:inline\s+)?(?:__\w+\s+){0,8}"
     r"(?:const\s+)?(?:unsigned\s+)?"
     r"(?:struct\s+\w+(?:\s+\*\s*|\s+)|enum\s+\w+\s+|union\s+\w+(?:\s+\*\s*|\s+)|"
     r"\w+(?:\s+\*\s*|\s+))"
@@ -689,8 +768,12 @@ def _get_ts_parser():
     try:
         import tree_sitter
         import tree_sitter_c
+        from core.inventory._ts_cache import bounded
         lang = tree_sitter.Language(tree_sitter_c.language())
-        return tree_sitter.Parser(lang)
+        # Bounded like every other tree-sitter parser: the study
+        # pipeline parses untrusted target C content, and an
+        # unbudgeted parse hangs uninterruptibly on crafted input.
+        return bounded(tree_sitter.Parser(lang), label="c")
     except Exception:  # noqa: BLE001 - any grammar failure means "no AST"
         return None
 
@@ -811,11 +894,15 @@ def _extract_prototypes_regex(
 ) -> list[dict]:
     """Fallback prototype extraction when tree-sitter is unavailable."""
     nl_index = _nl_index if _nl_index is not None else _build_newline_index(source)
+    # Bounded whitespace gaps and parameter window (same discipline
+    # as _C_FUNC_RE above): unbounded ``\s+``/``[^)]*`` reach let
+    # every line anchor re-scan shared runs — quadratic on planted
+    # prototype-shaped lines. Bounds sit far above real prototypes.
     proto_re = re.compile(
         r"^(?:extern\s+)?(?:const\s+)?(?:unsigned\s+)?"
-        r"(?:struct\s+\w+(?:\s+\*\s*|\s+)|enum\s+\w+\s+|"
-        r"\w+(?:\s+\*\s*|\s+))"
-        r"(\w+)\s*\([^)]*\)\s*;",
+        r"(?:struct\s+\w+(?:\s{1,256}\*\s{0,256}|\s{1,256})|enum\s+\w+\s{1,256}|"
+        r"\w+(?:\s{1,256}\*\s{0,256}|\s{1,256}))"
+        r"(\w+)\s*\([^)]{0,4096}\)\s*;",
         re.MULTILINE,
     )
     results = []
@@ -927,12 +1014,12 @@ def _extract_param_names(sig: str, type_name: str, lang: str) -> list[str]:
     elif lang in ("java", "go", "rust", "js", "python"):
         pat = re.compile(
             rf"\b(?:{re.escape(type_name)}|{re.escape(bare)})"
-            rf"\s*[*&]?\s*(\w+)",
+            rf"\s*(?:[*&]\s*)?(\w+)",
         )
     else:
         pat = re.compile(
             rf"\b(?:{re.escape(type_name)}|{re.escape(bare)})"
-            rf"\s*[*&]?\s*(\w+)",
+            rf"\s*(?:[*&]\s*)?(\w+)",
         )
     return pat.findall(sig)
 
@@ -962,7 +1049,12 @@ def _classify_dotlang(body: str, param_names: list[str]) -> str:
         pe = re.escape(pname)
         if re.search(rf"\b{pe}\s*\.\s*\w+\s*[+\-|&^]?=", body):
             return "writer"
-        if re.search(rf"\b{pe}\s*\[[^\]]*\]\s*[+\-|&^]?=", body):
+        # The subscript span is bounded: hostile source repeating the
+        # parameter name inside one close-bracket-free run makes
+        # every occurrence re-scan the run — quadratic. Real
+        # subscript expressions are tiny (beyond the bound the write
+        # is not seen — "reader" is the conservative verdict here).
+        if re.search(rf"\b{pe}\s*\[[^\]]{{0,256}}\]\s*[+\-|&^]?=", body):
             return "writer"
         if re.search(rf"\.\s*\w+\s*=\s*{pe}\b", body):
             return "writer"
@@ -1463,9 +1555,33 @@ def _build_study_items(
     for entries in type_ref_index.values():
         type_ref_fns.update(fn for fn, _cls in entries)
 
+    # One study item per function NAME, not per regex match: the
+    # extractor deliberately returns every match (forward declarations
+    # and duplicate decomp thunks included) and documents that
+    # consumers merge on name keys preferring the entry with a body —
+    # the call graph and fn_loc above already do. Item ids
+    # (func_<name>_<line>) kept line-distinct duplicates alive here,
+    # so every duplicate burned a paid study slot and a derived-
+    # attention cap slot (observed live: identical decomp-tree thunks
+    # studied several times over). The implementation wins, and among
+    # several body-bearing entries the LAST wins — the same tie-break
+    # the call graph applies — so the survivor's definition and its
+    # `calls` list come from the same entry. A dropped forward
+    # declaration's doc comment is carried onto the survivor rather
+    # than lost with it.
+    best_by_name: dict[str, dict] = {}
+    doc_by_name: dict[str, str] = {}
     for f in functions:
+        name = f["name"]
+        if name not in doc_by_name and f.get("doc_comment"):
+            doc_by_name[name] = f["doc_comment"]
+        prev = best_by_name.get(name)
+        if prev is None or f.get("body"):
+            best_by_name[name] = f
+
+    for f in best_by_name.values():
         signals = f.get("signals", {})
-        doc = f.get("doc_comment", "")
+        doc = f.get("doc_comment", "") or doc_by_name.get(f["name"], "")
         calls = call_graph.get(f["name"], [])
         callers = reverse_graph.get(f["name"], [])
         flag_checks = signals.get("flag_checks", [])
@@ -1672,10 +1788,13 @@ def _scan_file_result(
     When concept_filter is set, bail early if none of the terms appear in the
     file content — avoids the expensive extraction on irrelevant files.
     """
-    try:
-        content = sf.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    # Capped read (shared default): the tree is untrusted repo
+    # content — extraction is additive, so a huge generated file's
+    # prefix only loses items past the cap.
+    got = read_text_capped(sf, errors="replace")
+    if got is None:
         return [], [], [], {}
+    content = got[0]
 
     if concept_filter:
         # Terms arrive lowercased; compare against lowercased content so
@@ -1694,9 +1813,20 @@ def _scan_file_result(
     if extract_protos:
         parser = _get_ts_parser_for_thread() if use_ts else None
         if parser is not None:
-            protos = _extract_prototypes_ts(
-                content.encode("utf-8", errors="replace"), rel, parser,
-            )
+            try:
+                from core.run.gaps import parse_origin
+                with parse_origin(rel):
+                    protos = _extract_prototypes_ts(
+                        content.encode("utf-8", errors="replace"), rel,
+                        parser,
+                    )
+            except Exception:  # noqa: BLE001 - degrade like grammar-absent
+                # A budget-abandoned parse already emitted its loud
+                # gap record naming this file; prototypes fall back
+                # to the same regex path a missing grammar takes.
+                protos = _extract_prototypes_regex(
+                    content, rel, _nl_index=nl_index,
+                )
         else:
             protos = _extract_prototypes_regex(content, rel, _nl_index=nl_index)
 
@@ -1714,6 +1844,86 @@ _IDENT_RE = re.compile(r"\b([a-zA-Z_]\w+_t)\b")
 _CONTEXT_NAME_RE = re.compile(r"(?:Unresolved|Dependency)\s+\w+:\s+(\S+)")
 
 
+def _reading_items(raw: object) -> "list[dict]":
+    """Dict rows of a reading-list payload, shape-tolerant.
+
+    reading-list.json is an LLM-authored artifact: ``items`` itself
+    arrives present-but-null, and rows arrive as strings/numbers.
+    Malformed shapes must cost the bad rows only, never a prep abort
+    (prep exit!=0 disables the domain-model subsystem for the whole
+    run). Mirrors ReadingList.load's per-record degrade.
+    """
+    if not isinstance(raw, dict):
+        return []
+    items = raw.get("items")
+    if not isinstance(items, list):
+        return []
+    return [i for i in items if isinstance(i, dict)]
+
+
+def _item_str(item: dict, key: str) -> str:
+    """A reading-list row leaf as str.
+
+    Present-but-null AND non-str leaves (int/list file hints are the
+    observed LLM drift) route like an absent value — never reach
+    Path()/regex/.strip() as the wrong type.
+    """
+    v = item.get(key)
+    return v if isinstance(v, str) else ""
+
+
+def _scope_fingerprint(parsed: argparse.Namespace) -> dict:
+    """Scope stamp for the study-list cache: every input that changes
+    which items land in study-list.json. Stored under ``scope`` in the
+    written file; the cache short-circuit reuses the file only when
+    the stamp matches the current invocation."""
+    pending: list[str] = []
+    if parsed.reading_list:
+        raw = load_json(Path(parsed.reading_list),
+                        max_bytes=_MAX_STUDY_ARTIFACT_BYTES)
+        pending = sorted(
+            str(item.get("id") or item.get("question") or "")
+            for item in _reading_items(raw)
+            if not item.get("resolved")
+            and not item.get("unresolvable")
+        )
+    return {
+        "identifier": parsed.identifier or "",
+        "concept": parsed.concept or "",
+        "correlate": parsed.correlate or "",
+        "narrow": bool(parsed.narrow),
+        "redb": str(parsed.redb or ""),
+        # Bridge seeds change item tiers/ordering, so a cached list
+        # from a bridged run must not serve an unbridged one (or
+        # vice versa). CONTENT hash, not just the path: the bridge
+        # regenerates the file at the same path per run, and a
+        # path-only stamp let a direct prep re-user serve a stale
+        # cached list against fresh seeds.
+        "bridge_seed_file": _bridge_seed_fingerprint(
+            parsed.bridge_seed_file),
+        "reading_list_pending": pending,
+    }
+
+
+def _bridge_seed_fingerprint(path_arg: "str | None") -> str:
+    """``<path>:<sha256>`` stamp for the bridge-seeds scope key.
+
+    Bounded read (the prep loader rejects >4MiB files anyway);
+    unreadable content stamps as such rather than aliasing an empty
+    file.
+    """
+    if not path_arg:
+        return ""
+    import hashlib
+    try:
+        with open(path_arg, "rb") as fh:
+            digest = hashlib.sha256(
+                fh.read(4 * 1024 * 1024 + 1)).hexdigest()
+    except OSError:
+        digest = "unreadable"
+    return f"{path_arg}:{digest}"
+
+
 def _load_reading_list(path: Path) -> tuple[list[str], list[str]]:
     """Extract pending items from reading-list.json, partitioned by resolution.
 
@@ -1728,22 +1938,22 @@ def _load_reading_list(path: Path) -> tuple[list[str], list[str]]:
     seen: set[str] = set()
     identifiers: list[str] = []
     concepts: list[str] = []
-    for item in raw.get("items", []):
+    for item in _reading_items(raw):
         if item.get("resolved"):
             continue
         resolution = item.get("resolution", "identifier")
         if resolution == "concept":
-            q = item.get("question", "").strip()
+            q = _item_str(item, "question").strip()
             if q and q not in seen:
                 seen.add(q)
                 concepts.append(q)
             continue
         # source_function is the strongest anchor — always include it
-        src_fn = (item.get("source_function") or "").strip()
+        src_fn = _item_str(item, "source_function").strip()
         if src_fn and src_fn not in seen:
             seen.add(src_fn)
             identifiers.append(src_fn)
-        ctx = item.get("context") or ""
+        ctx = _item_str(item, "context")
         m = _CONTEXT_NAME_RE.search(ctx)
         if m:
             name = m.group(1)
@@ -1751,12 +1961,138 @@ def _load_reading_list(path: Path) -> tuple[list[str], list[str]]:
                 seen.add(name)
                 identifiers.append(name)
             continue
-        for m2 in _IDENT_RE.finditer(item.get("question", "")):
+        for m2 in _IDENT_RE.finditer(_item_str(item, "question")):
             name = m2.group(1)
             if name not in seen:
                 seen.add(name)
                 identifiers.append(name)
     return identifiers, concepts
+
+
+def _vet_reading_list_identifiers(
+    rl_idents: list[str],
+    scope_files: list[Path],
+) -> tuple[list[str], list[str]]:
+    """Partition reading-list identifiers by presence in the scanned tree.
+
+    Reading-list identifiers are carryover from PRIOR runs via the
+    project concepts store — when that store was populated against a
+    DIFFERENT tree (another binary's decomp tree is the live-hit
+    shape), its identifiers match nothing here, the identifier focus
+    then matches zero files, and the study "succeeds" with zero items,
+    silently inheriting the old domain model.
+
+    The vet is resolve-keyed deliberately, not identity-keyed: an
+    identity stamp on the entries (binary fid / content hash) could
+    never be the decision function — a same-binary re-decompile or
+    ordinary source drift changes any content identity while the
+    entries stay perfectly valid, so a mismatch would still have to
+    fall back to exactly this presence check. Presence-in-scope is
+    the property the focus filter actually consumes, so keying on it
+    cannot false-drop an identifier that would have focused anything.
+
+    Case-insensitive substring match on the SAME lowercased key
+    family the pass-2 ``concept_filter`` gate is built from —
+    {ident, bare (struct/union/enum prefix stripped), bare_no_t
+    (``_t`` suffix stripped)}. Matcher parity is the correctness
+    property: the filter's direct search terms are ident/bare, and
+    its type-ref expansion only ever adds function names that
+    contain bare_no_t (names that themselves appear in some scanned
+    file), so an identifier with NO family witness in the scope is
+    one the downstream filter could not have matched anywhere.
+    Vetting on the literal spelling alone false-dropped ``sg_table_t``
+    against a tree that spells only ``sg_table`` — narrowing the
+    study below what the unvetted focus would have covered.
+
+    Early-exits once every identifier has a witness, so the healthy
+    case reads few files; the contaminated case costs one capped
+    read per in-scope file (pass 2 would have read them all anyway).
+    Returns ``(kept, dropped)``, both preserving input order.
+    """
+    def _key_family(ident: str) -> frozenset[str]:
+        low = ident.lower()
+        bare = re.sub(r"^(?:struct|union|enum)\s+", "", low)
+        bare_no_t = bare.removesuffix("_t")
+        # Drop empty keys: "" is a substring of everything and would
+        # vacuously witness a degenerate identifier.
+        return frozenset(k for k in (low, bare, bare_no_t) if k)
+
+    families: dict[str, frozenset[str]] = {
+        ident: _key_family(ident) for ident in rl_idents
+    }
+    witnessed: set[str] = set()
+    unresolved = {i for i, fam in families.items() if fam}
+    for sf in scope_files:
+        if not unresolved:
+            break
+        got = read_text_capped(sf, errors="replace")
+        if got is None:
+            continue
+        content_low = got[0].lower()
+        search = {k for i in unresolved for k in families[i]} - witnessed
+        hits = {key for key in search if key in content_low}
+        if hits:
+            witnessed |= hits
+            unresolved = {
+                i for i in unresolved if not families[i] & witnessed
+            }
+    kept = [i for i in rl_idents if families[i] & witnessed]
+    dropped = [i for i in rl_idents if not families[i] & witnessed]
+    return kept, dropped
+
+
+def _load_bridge_seeds(path: Path) -> tuple[list[str], list[str]]:
+    """Seed names + concept hints from a bridge-seeds.json.
+
+    Returns (names, concepts) in the bridge's priority order. The
+    file lives in a run directory — a surface a hostile process
+    could pre-stage — so prep re-validates independently of the
+    bridge's own bounds (shared constants, no drift): name charset
+    and count caps are re-enforced here. Concept strings are
+    target-derived by definition (anchor stems), so they are routed
+    through the prompt envelope (neutralize_tag_forgery) at THIS
+    load — the single point where they enter prompt-bound lists —
+    matching the interpolation discipline the study prompts apply
+    to every other target-derived string.
+    """
+    from core.orchestration.binary_study_bridge import (
+        BRIDGE_SEED_NAME_RE,
+        MAX_BRIDGE_CONCEPTS,
+        MAX_BRIDGE_SEEDS,
+    )
+    from core.security.log_sanitisation import escape_nonprintable
+    from core.security.prompt_envelope import neutralize_tag_forgery
+
+    try:
+        data = load_json(path, max_bytes=4 * 1024 * 1024)
+    except (OSError, ValueError):
+        data = None
+    if not isinstance(data, dict) or data.get("schema_version") != 1:
+        print(f"study-prep: bridge seed file unreadable or "
+              f"wrong-shape — ignored: {path}", file=sys.stderr)
+        return [], []
+    names: list[str] = []
+    for seed in data.get("seeds") or []:
+        if len(names) >= MAX_BRIDGE_SEEDS:
+            break
+        if not isinstance(seed, dict):
+            continue
+        name = str(seed.get("name") or "")
+        if BRIDGE_SEED_NAME_RE.fullmatch(name) and name not in names:
+            names.append(name)
+    concepts: list[str] = []
+    for concept in data.get("concepts") or []:
+        if len(concepts) >= MAX_BRIDGE_CONCEPTS:
+            break
+        text = concept.get("text") if isinstance(concept, dict) else concept
+        if isinstance(text, str) and text.strip():
+            # escape_nonprintable first (control bytes AND embedded
+            # newlines — a raw newline would forge extra list lines
+            # in the concept-seeding prompt), then tag-forgery
+            # neutralisation, then the length clip.
+            concepts.append(neutralize_tag_forgery(
+                escape_nonprintable(text.strip()))[:64])
+    return names, concepts
 
 
 def _multilang_pass(
@@ -1771,9 +2107,9 @@ def _multilang_pass(
     """Resolve reading-list identifiers in non-C sources.
 
     The C/C++ extraction above only sees ``_C_EXTENSIONS`` files; this
-    pass dispatches Python/Go/Java/JS-TS/Rust identifiers to
-    ``core.concepts.lang_resolve`` and mirrors its output into the
-    study-list shapes.  Returns ``(items, related_docs, unresolved)``
+    pass dispatches Python/Go/Java/JS-TS/Rust/PHP/Kotlin/C#/Swift
+    identifiers to ``core.concepts.lang_resolve`` and mirrors its
+    output into the study-list shapes.  Returns ``(items, related_docs, unresolved)``
     where *unresolved* records carry the honest reason an identifier
     could not be statically resolved (never guessed).
     """
@@ -1786,7 +2122,7 @@ def _multilang_pass(
             resolve_identifiers,
         )
     except Exception as exc:  # noqa: BLE001 - degrade to C-only prep
-        print(f"study-prep: multilang pass unavailable: {exc}",
+        print(f"study-prep: multilang pass unavailable: {_sft(str(exc), max_len=300)}",
               file=sys.stderr)
         return [], [], []
 
@@ -1818,20 +2154,25 @@ def _multilang_pass(
         )
         if not isinstance(raw, dict):
             raw = {}
-        for item in raw.get("items", []):
+        for item in _reading_items(raw):
             if item.get("resolved") or item.get("unresolvable"):
                 continue
-            sf = item.get("source_file", "")
+            # _item_str, not a .get default: reading-list.json is an
+            # LLM-authored artifact — keys arrive PRESENT but null
+            # and leaves arrive non-str; both must route like an
+            # absent value, never reach Path()/regex as the wrong
+            # type.
+            sf = _item_str(item, "source_file")
             if not language_for_path(sf):
                 continue  # C/C++ and unsupported handled elsewhere
-            question = item.get("question", "")
-            context = item.get("context", "")
+            question = _item_str(item, "question")
+            context = _item_str(item, "context")
             if item.get("resolution") == "concept":
                 if question:
                     concept_questions.append(question)
                 continue
             names = extract_question_identifiers(question, context)
-            src_fn = (item.get("source_function") or "").strip()
+            src_fn = _item_str(item, "source_function").strip()
             if src_fn:
                 names.append(src_fn)
             for name in names:
@@ -1887,8 +2228,8 @@ def _scope_from_reading_list(
         return None
 
     seed_files: set[str] = set()
-    for item in raw.get("items", []):
-        sf = item.get("source_file", "")
+    for item in _reading_items(raw):
+        sf = _item_str(item, "source_file")
         if sf:
             seed_files.add(sf)
     if not seed_files:
@@ -1915,10 +2256,11 @@ def _scope_from_reading_list(
             if fpath in collected:
                 continue
             collected.add(fpath)
-            try:
-                src = fpath.read_text(encoding="utf-8", errors="replace")
-            except OSError:
+            # Capped read: an include past the cap just isn't chased.
+            got = read_text_capped(fpath, errors="replace")
+            if got is None:
                 continue
+            src = got[0]
             for inc in _extract_includes(src):
                 resolved = _resolve_include(inc, search_dirs, source_root)
                 if resolved and resolved not in collected:
@@ -1947,11 +2289,12 @@ def _grep_scope(
     hit_files: list[Path] = []
     regex = re.compile(pattern)
     for sf in source_files:
-        try:
-            text = sf.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        # Capped read: a term past the cap only leaves the file out
+        # of the scope (and an empty scope falls back to everything).
+        got = read_text_capped(sf, errors="replace")
+        if got is None:
             continue
-        if regex.search(text):
+        if regex.search(got[0]):
             hit_files.append(sf)
     print(
         f"study-prep: grep-scoped {len(source_files)} -> {len(hit_files)} "
@@ -1965,11 +2308,13 @@ def _llm_seed_concepts_from_names(
     semantic_concepts: list[str],
     all_names: list[str],
     model: str | None = None,
+    run_dir: Path | None = None,
 ) -> list[str]:
     """Ask LLM to map semantic concepts to concrete identifiers.
 
     Takes an in-memory name list and returns identifier strings that the
-    LLM considers relevant to the given concepts.
+    LLM considers relevant to the given concepts. ``run_dir`` rides
+    through to the dispatcher gate (L5 audit-log placement).
     """
     if not all_names:
         return []
@@ -1979,13 +2324,31 @@ def _llm_seed_concepts_from_names(
             from core.llm.config import LLMConfig
             cfg = LLMConfig()
             mc = cfg.config_for_model(model)
-            if mc.api_key:
+            # Keyless providers (Bedrock, claudecode, ollama) are
+            # legitimate pins — study-run's gate documents the set.
+            # Pre-fix `if mc.api_key` silently dropped the pin for
+            # them, so a pinned Bedrock/CC run seeded concepts with a
+            # DIFFERENT model than it studied with.
+            keyless_ok = {"bedrock", "claudecode",
+                          "claudecode-resumable", "ollama"}
+            if mc.api_key or mc.provider in keyless_ok:
                 client = get_client(config=LLMConfig(
                     primary_model=mc, fallback_models=[]))
             else:
                 client = get_client()
         else:
             client = get_client()
+        if client is not None:
+            # Dispatcher-only providers (Bedrock-routed) need an
+            # in-process route — both sibling CLIs bootstrap it; prep
+            # was the copy that was never made, so standalone prep on
+            # a Bedrock default silently degraded to unseeded
+            # extraction. Shared gate (never raises).
+            from core.llm.dispatcher.lifecycle import (
+                ensure_route_for_client,
+            )
+            ensure_route_for_client(client, "raptor-study-prep",
+                                    run_dir=run_dir)
     except Exception:  # noqa: BLE001 - seeding is best-effort
         print("study-prep: WARNING: no LLM available for concept seeding",
               file=sys.stderr)
@@ -2013,13 +2376,13 @@ def _llm_seed_concepts_from_names(
         text = resp.content if isinstance(resp.content, str) else str(resp.content)
         text = text.strip()
         if text.startswith("```"):
-            text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+            text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()  # line-model: LLM response fence parsing
         seeded = loads(text, max_bytes=_MAX_STUDY_ARTIFACT_BYTES)
         if isinstance(seeded, list):
             name_set = set(all_names)
             return [s for s in seeded if isinstance(s, str) and s in name_set]
     except Exception as exc:  # noqa: BLE001 - seeding is best-effort
-        print(f"study-prep: WARNING: concept seeding failed: {exc}",
+        print(f"study-prep: WARNING: concept seeding failed: {_sft(str(exc), max_len=300)}",
               file=sys.stderr)
     return []
 
@@ -2028,6 +2391,7 @@ def _llm_seed_concepts(
     semantic_concepts: list[str],
     study_list_path: Path,
     model: str | None = None,
+    run_dir: Path | None = None,
 ) -> list[str]:
     """Wrapper: reads names from study-list.json, then delegates to _from_names."""
     if not study_list_path.is_file():
@@ -2036,7 +2400,8 @@ def _llm_seed_concepts(
     if not isinstance(data, dict):
         return []
     all_names = sorted({item["name"] for item in data.get("items", [])})
-    return _llm_seed_concepts_from_names(semantic_concepts, all_names, model=model)
+    return _llm_seed_concepts_from_names(semantic_concepts, all_names,
+                                         model=model, run_dir=run_dir)
 
 
 def _discover_docs(
@@ -2095,14 +2460,14 @@ def _discover_docs(
             # Check first 4KB of content — require struct/type context
             # for short stems to avoid false positives (e.g. "page" matches
             # everything in mm/ docs)
-            try:
-                snippet = doc_file.read_text(encoding="utf-8", errors="ignore")[:4096]
-            except OSError:
+            got = read_text_capped(doc_file, 4096, errors="ignore")
+            if got is None:
                 continue
+            snippet = got[0]
             snippet_lower = snippet.lower()
             # Extract document title from RST heading
             doc_title = ""
-            lines = snippet.split("\n")
+            lines = snippet.split("\n")  # line-model: universal-newline read_text above
             for i, line in enumerate(lines):
                 stripped = line.strip()
                 if (not stripped
@@ -2179,11 +2544,11 @@ def _chase_reading_list_definitions(
         r"(?:(?:struct|union|enum)\s+)?([A-Za-z_]\w+)"
     )
     idents: set[str] = set()
-    for item in raw.get("items", []):
+    for item in _reading_items(raw):
         if item.get("resolved"):
             continue
-        ctx = item.get("context") or ""
-        q = item.get("question") or ""
+        ctx = _item_str(item, "context")
+        q = _item_str(item, "question")
         # "Unresolved type: struct scatterlist" → scatterlist
         m = _CTX_FULL_RE.search(ctx)
         if m:
@@ -2207,7 +2572,16 @@ def _chase_reading_list_definitions(
     safe_env = RaptorConfig.get_safe_env()
 
     target_resolved = target.resolve()
+    source_root_resolved = source_root.resolve()
     candidates: set[Path] = set()
+
+    def _contained(p: Path) -> bool:
+        """True iff *p* stays inside the scanned tree and outside the
+        study target. Filenames come from an untrusted repo: a
+        symlinked path (or a stale/hostile entry) resolving outside
+        ``source_root`` must never enter the study set."""
+        return (p.is_relative_to(source_root_resolved)
+                and not p.is_relative_to(target_resolved))
 
     def _collect_grep(dest: set[Path]) -> None:
         """Find files containing struct/function/typedef definitions."""
@@ -2221,17 +2595,23 @@ def _chase_reading_list_definitions(
             return
         combined = "|".join(def_patterns[:300])
         try:
+            # --null: NUL-delimited filenames. Repo file names are
+            # untrusted and may embed newlines — newline-split parsing
+            # would let one crafted name smuggle arbitrary path lines
+            # into the candidate set. The long spelling, not -Z: GNU
+            # grep aliases the two, but BSD grep's -Z means decompress
+            # while --null is the NUL framing on both.
             proc = subprocess.run(
-                ["grep", "-rlE", "--include=*.c", "--include=*.h",
-                 combined, str(source_root)],
+                ["grep", "-rlE", "--null", "--include=*.c",
+                 "--include=*.h", combined, str(source_root)],
                 capture_output=True, text=True, timeout=60, check=False,
                 env=safe_env,
             )
-            for line in proc.stdout.strip().split("\n"):
-                if not line:
+            for entry in proc.stdout.split("\0"):
+                if not entry:
                     continue
-                p = Path(line).resolve()
-                if p.is_file() and not p.is_relative_to(target_resolved):
+                p = Path(entry).resolve()
+                if p.is_file() and _contained(p):
                     dest.add(p)
         except (subprocess.TimeoutExpired, OSError):
             pass
@@ -2250,18 +2630,19 @@ def _chase_reading_list_definitions(
             name_args.extend(["-o", "-name", f"*_{il}.*"])
             name_args.extend(["-o", "-name", f"{il}_*.*"])
         try:
+            # -print0: NUL-delimited — see the grep --null rationale
+            # above.
             proc = subprocess.run(
                 ["find", str(source_root), "-type", "f", "("]
-                + name_args + [")"],
+                + name_args + [")", "-print0"],
                 capture_output=True, text=True, timeout=30, check=False,
                 env=safe_env,
             )
-            for line in proc.stdout.strip().split("\n"):
-                if not line:
+            for entry in proc.stdout.split("\0"):
+                if not entry:
                     continue
-                p = Path(line).resolve()
-                if p.suffix in (".c", ".h") \
-                        and not p.is_relative_to(target_resolved):
+                p = Path(entry).resolve()
+                if p.suffix in (".c", ".h") and _contained(p):
                     dest.add(p)
         except (subprocess.TimeoutExpired, OSError):
             pass
@@ -2315,13 +2696,17 @@ def _redb_mechanical_items(
         print(f"study-prep: --redb ignored (packages.ghidra "
               f"unavailable: {exc})", file=sys.stderr)
         return []
-    cap = 64 * 1024 * 1024
+    # The shared RE-database ceiling — a private 64MiB cap here
+    # refused the legitimate --decompile-all databases the importer
+    # writes (rationale at the constant's definition).
+    from core.json.utils import RE_DATABASE_MAX_BYTES
+    cap = RE_DATABASE_MAX_BYTES
     try:
         raw = load_json(redb_path, max_bytes=cap)
         db = REDatabase.from_dict(raw) if isinstance(raw, dict) else None
         side = load_json(sidecar_path, max_bytes=cap)
     except Exception as exc:  # noqa: BLE001 — degrade, never abort prep
-        print(f"study-prep: --redb ignored (unreadable: {exc})",
+        print(f"study-prep: --redb ignored (unreadable: {_sft(str(exc), max_len=300)})",
               file=sys.stderr)
         return []
     if db is None or not isinstance(side, dict):
@@ -2544,6 +2929,14 @@ def main() -> None:
     ap.add_argument("--redb-map", default=None, metavar="PATH",
                     help="decomp-map.json sidecar for --redb (default: "
                          "<target>/decomp-map.json).")
+    ap.add_argument("--bridge-seed-file", default=None, metavar="PATH",
+                    help="bridge-seeds.json from the map→study bridge "
+                         "(core.orchestration.binary_study_bridge). "
+                         "Seed names get a distinct bridge_seed focus "
+                         "tier BELOW operator identifiers; with "
+                         "--identifier present they only annotate — "
+                         "the bridge never widens an operator-scoped "
+                         "study.")
     ap.add_argument("--force", action="store_true",
                     help="Re-run even if study-list.json already exists.")
     # Strict parsing: a typo'd scoping flag (e.g. a misspelled
@@ -2555,10 +2948,27 @@ def main() -> None:
     output_dir = Path(parsed.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Cache validity is keyed on the SCOPE, not bare existence: a
+    # cached study-list from an earlier differently-scoped run (or one
+    # predating newly queued reading-list items) must not short-
+    # circuit this run — that both re-spends the study LLM budget on
+    # the identical old batch and starves the reading-list drain
+    # (pending items never enter the study list). A legacy cache
+    # without a scope stamp regenerates: one cheap mechanical re-run
+    # beats silently reusing a list of unknown scope.
+    scope_fp = _scope_fingerprint(parsed)
     study_list_cache = output_dir / "study-list.json"
     if study_list_cache.is_file() and not getattr(parsed, "force", False):
-        print("study-prep: reusing cached study-list.json", file=sys.stderr)
-        return 0
+        cached = load_json(study_list_cache,
+                           max_bytes=_MAX_STUDY_ARTIFACT_BYTES)
+        cached_scope = (cached.get("scope")
+                        if isinstance(cached, dict) else None)
+        if cached_scope == scope_fp:
+            print("study-prep: reusing cached study-list.json",
+                  file=sys.stderr)
+            return 0
+        print("study-prep: cached study-list.json has a different "
+              "scope — regenerating", file=sys.stderr)
 
     if parsed.root:
         source_root = Path(parsed.root).resolve()
@@ -2752,29 +3162,35 @@ def main() -> None:
         # Collect all #include paths from already-scanned files
         all_includes: set[str] = set()
         for sf in source_files:
-            try:
-                content = sf.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
+            # Capped read: an include past the cap isn't collected.
+            got = read_text_capped(sf, errors="ignore")
+            if got is None:
                 continue
-            all_includes.update(_extract_includes(content))
+            all_includes.update(_extract_includes(got[0]))
 
-        # Resolve against search_dirs WITHOUT the source_root constraint
+        # Resolve against search_dirs WITHOUT the target-dir constraint
+        # (that's the point of pass 1.5), but CONFINED to each search
+        # dir: #include paths come straight from the scanned repo, so
+        # `../../../etc/foo.h` traversal or an out-pointing symlink
+        # must never pull host files into study-list.json / LLM
+        # prompts. confine() resolves symlinks and refuses escapes.
         scanned_paths = {str(f.resolve()) for f in source_files}
         ext_headers: list[Path] = []
         for inc_path in all_includes:
             for d in search_dirs:
-                candidate = (d / inc_path).resolve()
-                if not candidate.is_file():
+                candidate = confine(d, inc_path)
+                if candidate is None or not candidate.is_file():
                     continue
                 if candidate.suffix not in _HEADER_EXTENSIONS:
                     continue
                 if str(candidate) in scanned_paths:
                     break
-                try:
-                    snippet = candidate.read_text(
-                        encoding="utf-8", errors="ignore")[:8192]
-                except OSError:
+                # Capped read (bounded probe): the old slice-after-
+                # read buffered the whole header just to keep 8 KB.
+                got = read_text_capped(candidate, 8192, errors="ignore")
+                if got is None:
                     break
+                snippet = got[0]
                 if any(term in snippet.lower() for term in ext_terms):
                     ext_headers.append(candidate)
                     scanned_paths.add(str(candidate))
@@ -2802,17 +3218,68 @@ def main() -> None:
     concept_arg = parsed.concept
     semantic_concepts = [c.strip() for c in concept_arg.split(",") if c.strip()] if concept_arg else []
 
+    # Operator-asked names, captured BEFORE any extension of the
+    # list: only these earn the "operator" seed_source stamp in the
+    # report's seed table. Captured-late once meant reading-list
+    # names (LLM-authored free text) laundered into operator rows —
+    # exempt from the joint derived-attention accounting AND
+    # rendered as the operator's own asks. --correlate names join
+    # below at their parse site: the flag's whole argument is
+    # literal operator-typed names, so leaving them unstamped
+    # under-reported the operator's asks.
+    cli_ident_names = {i.lower() for i in identifiers}
+
+    rl_dropped: list[str] = []
+    rl_all_dropped = False
     if parsed.reading_list:
         rl_idents, rl_concepts = _load_reading_list(Path(parsed.reading_list))
         if rl_idents:
+            # Cross-binary contamination gate: the reading list rides
+            # in from the PROJECT concepts store, and a store populated
+            # against a different tree (another binary's decomp tree)
+            # carries identifiers that match nothing here — an
+            # unvetted focus then matches zero files and the study
+            # "succeeds" with zero items. Identifiers with no witness
+            # in the current scope leave the focus, loudly.
+            rl_idents, rl_dropped = _vet_reading_list_identifiers(
+                rl_idents, source_files)
+            if rl_dropped:
+                # rl names are LLM-authored free text — escape before
+                # the operator terminal.
+                print(f"study-prep: {len(rl_dropped)} reading-list "
+                      f"identifiers resolve to no file in this tree — "
+                      f"dropped from focus (different binary?): "
+                      f"{_sft(', '.join(rl_dropped[:5]), max_len=300)}"
+                      f"{' ...' if len(rl_dropped) > 5 else ''}",
+                      file=sys.stderr)
+            rl_all_dropped = bool(rl_dropped) and not rl_idents
+        if rl_idents:
             identifiers.extend(rl_idents)
+            # reading-list identifiers are LLM-authored free text
+            # (_CONTEXT_NAME_RE's (\S+) happily captures ESC bytes).
             print(f"study-prep: reading list added {len(rl_idents)} identifiers: "
-                  f"{', '.join(rl_idents[:5])}"
+                  f"{_sft(', '.join(rl_idents[:5]), max_len=300)}"
                   f"{' ...' if len(rl_idents) > 5 else ''}",
                   file=sys.stderr)
         if rl_concepts:
             semantic_concepts.extend(rl_concepts)
             print(f"study-prep: reading list added {len(rl_concepts)} semantic concepts",
+                  file=sys.stderr)
+
+    # Map→study bridge seeds: a distinct derived-attention channel.
+    # Loaded here (validation + prompt-enveloping happen at load),
+    # consumed after item assembly — deliberately NOT merged into
+    # `identifiers`, which would grant target-derived names the
+    # operator's tier-0 focus and scope-narrowing authority.
+    bridge_names: list[str] = []
+    bridge_concepts: list[str] = []
+    if parsed.bridge_seed_file:
+        bridge_names, bridge_concepts = _load_bridge_seeds(
+            Path(parsed.bridge_seed_file))
+        if bridge_names or bridge_concepts:
+            print(f"study-prep: bridge seeds: {len(bridge_names)} "
+                  f"name(s), {len(bridge_concepts)} concept hint(s) "
+                  f"(bridge_seed tier — below operator identifiers)",
                   file=sys.stderr)
 
     _deferred_concepts = semantic_concepts if semantic_concepts else []
@@ -2822,7 +3289,9 @@ def main() -> None:
             print("study-prep: no prior study-list.json — will seed concepts "
                   "from in-memory items after extraction", file=sys.stderr)
         else:
-            seeded = _llm_seed_concepts(semantic_concepts, study_list_path, model=parsed.model)
+            seeded = _llm_seed_concepts(semantic_concepts, study_list_path,
+                                        model=parsed.model,
+                                        run_dir=output_dir)
             if seeded:
                 identifiers.extend(seeded)
                 _deferred_concepts = []
@@ -2852,6 +3321,21 @@ def main() -> None:
                 for ci in correlate_identifiers:
                     if ci not in identifiers:
                         identifiers.append(ci)
+            # Operator-typed like --identifier (see the capture
+            # above) — stamp-eligible.
+            cli_ident_names.update(
+                ci.lower() for ci in correlate_identifiers)
+
+    # Announced AFTER the --correlate merge above: correlate names
+    # are a focus source like --identifier, so an all-foreign
+    # reading list beside a live --correlate run must not claim the
+    # run is unfocused (and a degenerate single-name --correlate,
+    # ignored above, correctly still counts as no focus).
+    if rl_all_dropped and not identifiers and not semantic_concepts:
+        print("study-prep: ALL reading-list identifiers dropped and "
+              "no other focus source — proceeding with the "
+              "unfocused default scope (never an empty focus)",
+              file=sys.stderr)
 
     cf: frozenset[str] | None = None
     if identifiers and c_files:
@@ -2983,7 +3467,8 @@ def main() -> None:
     if _deferred_concepts and items:
         all_item_names = sorted({it.name for it in items})
         seeded = _llm_seed_concepts_from_names(
-            _deferred_concepts, all_item_names, model=parsed.model)
+            _deferred_concepts, all_item_names, model=parsed.model,
+            run_dir=output_dir)
         if seeded:
             identifiers.extend(seeded)
             print(f"study-prep: deferred concept seeding: {len(seeded)} identifiers "
@@ -3129,6 +3614,12 @@ def main() -> None:
         items = [it for it in items if _relevance(it) <= 2]
         for it in items:
             it.relevance_tier = _relevance(it)
+            # Seed provenance for the report's seed table: only the
+            # names the operator actually typed — reading-list and
+            # concept-seeded extensions of `identifiers` are the
+            # study's own attention, not an operator ask.
+            if it.name.lower() in cli_ident_names:
+                it.seed_source = "operator"
         items.sort(key=_relevance)
 
         # Types referenced by surviving items may have been dropped
@@ -3188,8 +3679,8 @@ def main() -> None:
                   file=sys.stderr)
 
     # Multi-language pass: resolve reading-list identifiers that live
-    # in Python/Go/Java/JS-TS/Rust sources (the C passes above only
-    # scan _C_EXTENSIONS files).
+    # in Python/Go/Java/JS-TS/Rust/PHP/Kotlin/C#/Swift sources (the
+    # C passes above only scan _C_EXTENSIONS files).
     ml_items, ml_docs, ml_unresolved = _multilang_pass(
         target if target.is_dir() else target.parent,
         source_root,
@@ -3239,19 +3730,23 @@ def main() -> None:
             print(f"study-prep: stale-doc markers on {n_stale} item(s)",
                   file=sys.stderr)
     except Exception as exc:  # noqa: BLE001 - marker pass is best-effort
-        print(f"study-prep: stale-doc pass skipped: {exc}", file=sys.stderr)
+        print(f"study-prep: stale-doc pass skipped: {_sft(str(exc), max_len=300)}", file=sys.stderr)
 
     if parsed.redb:
         redb_path = Path(parsed.redb)
         sidecar_path = (Path(parsed.redb_map) if parsed.redb_map
                         else Path(target) / "decomp-map.json")
         existing_keys = {(it.kind, it.name) for it in items}
-        if parsed.reading_list and not identifiers:
+        if parsed.reading_list and not identifiers and not rl_all_dropped:
             # A reading list exists but yielded no identifiers (e.g.
             # concept-only items with failed seeding) — an unscoped
             # merge would re-inflate a narrowed pass to the whole
             # binary. Skip the merge; the regex items are already
-            # reading-list-scoped.
+            # reading-list-scoped. Exception: when EVERY reading-list
+            # identifier was dropped as foreign to this tree, the run
+            # is deliberately falling back to the unfocused default —
+            # skipping the merge then would hand back the silent
+            # zero-item study the drop just prevented.
             redb_items = []
             print("study-prep: --redb merge skipped (reading list "
                   "present but no identifiers to scope by)",
@@ -3265,21 +3760,99 @@ def main() -> None:
             print(f"study-prep: merged {len(redb_items)} mechanical "
                   f"item(s) from {redb_path.name}", file=sys.stderr)
 
+    # Bridge concept hints seed identifiers at BRIDGE tier: the
+    # resulting names join bridge_names, never `identifiers` (which
+    # would grant them operator tier-0). Skipped when the operator
+    # scoped the study — bridge material must not widen that scope,
+    # so the LLM call would buy nothing.
+    if bridge_concepts and items and not identifiers:
+        all_item_names = sorted({it.name for it in items})
+        seeded = _llm_seed_concepts_from_names(
+            bridge_concepts, all_item_names, model=parsed.model,
+            run_dir=output_dir)
+        if seeded:
+            for name in seeded:
+                if name not in bridge_names:
+                    bridge_names.append(name)
+            print(f"study-prep: bridge concepts seeded {len(seeded)} "
+                  f"identifiers (bridge_seed tier)", file=sys.stderr)
+
+    # Bridge seed stamping (after every item source has merged, so
+    # redb-derived items can match too). With operator identifiers
+    # present the operator's scoping wins: bridge matches are only
+    # ANNOTATED (bridge_corroborated) — never promoted, never
+    # widening. Without them, matched items get focus tier 1 (below
+    # the operator's tier 0) with seed_source "bridge_seed" and rise
+    # to the front in bridge-priority order; every OTHER item keeps
+    # its default treatment — the bridge prioritizes, it never
+    # filters (anti-monopoly: the study's autonomous selection keeps
+    # the remainder of the batch budget).
+    if bridge_names and items:
+        bridge_rank = {n.lower(): i for i, n in enumerate(bridge_names)}
+        unranked = len(bridge_rank)
+        # Unique NAMES, not item occurrences: a seed name can match
+        # several items (a function item plus a struct item, say), and
+        # counting occurrences printed impossible ratios like 52/36.
+        matched_names: set[str] = set()
+        for it in items:
+            rank = bridge_rank.get(it.name.lower())
+            if rank is None:
+                continue
+            matched_names.add(it.name.lower())
+            if identifiers:
+                if not it.seed_source:
+                    it.seed_source = "bridge_corroborated"
+            else:
+                it.seed_source = "bridge_seed"
+                if it.relevance_tier is None or it.relevance_tier > 1:
+                    it.relevance_tier = 1
+        if matched_names and not identifiers:
+            items.sort(key=lambda it: (
+                bridge_rank.get(it.name.lower(), unranked)
+                if it.seed_source == "bridge_seed" else unranked
+            ))
+        print(f"study-prep: bridge seeds matched {len(matched_names)}/"
+              f"{len(bridge_names)} name(s)", file=sys.stderr)
+
     out_path = output_dir / "study-list.json"
     out_data = {
         "target": str(target),
         "source_root": str(source_root),
+        "scope": scope_fp,
         "file_count": len(source_files),
         "resolved_includes": len(resolved_includes),
         "identifiers": ",".join(identifiers) if identifiers else None,
         "semantic_concepts": ",".join(semantic_concepts) if semantic_concepts else None,
         "correlate_identifiers": correlate_identifiers,
+        "bridge_seed_file": parsed.bridge_seed_file or None,
         "related_docs": related_docs,
         "unresolved_identifiers": ml_unresolved,
+        # Foreign-identifier drop record: downstream (study-loop's
+        # zero-item check) names the cause from these instead of
+        # reporting a silent empty study. Count is authoritative;
+        # names are a bounded sample for the operator. The names are
+        # target-derived (LLM-authored free text) — any future
+        # terminal renderer must sanitise_for_terminal them first.
+        "reading_list_dropped": len(rl_dropped),
+        "reading_list_dropped_names": rl_dropped[:20],
         "items": [asdict(item) for item in items],
     }
     save_json(out_path, out_data)
     print(f"study-prep: wrote {out_path} ({len(items)} items)", file=sys.stderr)
+    if not items:
+        # Drop-first attribution names the likeliest cause, not the
+        # only one: survivors/other focus may also have matched no
+        # extractable items, so the drop-shaped cause says so too.
+        cause = (
+            f"{len(rl_dropped)} reading-list identifier(s) resolved "
+            "to no file in this tree (different binary?) and the "
+            "remaining focus matched no extractable items"
+            if rl_dropped else
+            "no extractable items matched the requested focus"
+        )
+        print(f"study-prep: WARNING: study list is EMPTY (0 items) — "
+              f"{cause}; a study pass over it learns nothing",
+              file=sys.stderr)
 
     if discovered_patterns:
         patterns_path = output_dir / "patterns.json"
@@ -3309,9 +3882,14 @@ def _is_under_projects_base(directory: Path) -> bool:
 
 
 def _promote_to_project_concepts(src: Path, output_dir: Path) -> None:
-    """Copy a file to ``<project>/concepts/`` if inside a project."""
-    import shutil
+    """Merge ``patterns.json`` into ``<project>/concepts/`` if inside
+    a project.
 
+    Merge, never copy: an unconditional replace let a narrowly scoped
+    run's patterns clobber the whole-tree accumulation (last writer
+    wins). Routed through the shared core merge so there is one
+    promotion semantics to maintain.
+    """
     project_dir = output_dir.parent
     if not (
         (project_dir / "project.json").is_file()
@@ -3323,23 +3901,13 @@ def _promote_to_project_concepts(src: Path, output_dir: Path) -> None:
     concepts_dir.mkdir(parents=True, exist_ok=True)
     canonical = concepts_dir / src.name
 
-    tmp = None
     try:
-        fd, tmp = tempfile.mkstemp(
-            dir=str(concepts_dir), suffix=".tmp", prefix=f"{src.stem}-",
-        )
-        os.close(fd)
-        shutil.copy2(str(src), tmp)
-        Path(tmp).rename(canonical)
+        from core.concepts.study import merge_promote_patterns
+        merge_promote_patterns(src, canonical)
         print(f"study-prep: promoted {src.name} to {canonical}",
               file=sys.stderr)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         print(f"study-prep: promotion failed: {exc}", file=sys.stderr)
-        if tmp:
-            import contextlib
-
-            with contextlib.suppress(OSError):
-                Path(tmp).unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

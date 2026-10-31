@@ -904,6 +904,46 @@ def test_handler_error_default_feeds_back_to_model() -> None:
     assert "oops" in err.content
 
 
+@pytest.mark.parametrize("bad_return", [None, {"k": "v"}, 42])
+def test_handler_non_str_return_feeds_back_as_error(bad_return) -> None:
+    """A handler returning non-str is a handler failure like any
+    other — pre-fix it reached preflight/wrap_tool_result (typed str)
+    and the TypeError escaped the per-tool containment, killing the
+    whole run with an unattributed traceback instead of an is_error
+    result."""
+    bad = ToolDef(name="bad", description="d", input_schema={},
+                  handler=lambda _inp: bad_return)
+    fp = _FakeProvider([
+        _tool_call_response(("c1", "bad", {})),
+        _text_response("ok"),
+    ])
+    loop = ToolUseLoop(fp, [bad])
+    out = loop.run("go")
+    assert out.terminated_by == "complete"
+    second = fp.calls[1]["messages"]
+    err = second[-1].content[0]
+    assert err.is_error is True
+    assert "expected str" in err.content
+
+
+def test_handler_non_str_return_contained_on_timeout_path() -> None:
+    """Same containment when the handler runs under the timeout
+    watchdog thread."""
+    bad = ToolDef(name="bad", description="d", input_schema={},
+                  handler=lambda _inp: None)
+    fp = _FakeProvider([
+        _tool_call_response(("c1", "bad", {})),
+        _text_response("ok"),
+    ])
+    loop = ToolUseLoop(fp, [bad], tool_timeout_s=5.0)
+    out = loop.run("go")
+    assert out.terminated_by == "complete"
+    second = fp.calls[1]["messages"]
+    err = second[-1].content[0]
+    assert err.is_error is True
+    assert "expected str" in err.content
+
+
 def test_handler_error_terminate_on_error_propagates() -> None:
     """``terminate_on_handler_error=True`` re-raises rather than feeding
     the error back — for agents wrapping destructive ops. Loop emits
@@ -1474,7 +1514,8 @@ def test_submission_warning_callable_exception_logged_but_does_not_crash_loop(
 ) -> None:
     """If the submission_warning callable raises, the loop must NOT
     crash — log a warning and treat this iteration as "no warning."
-    A bug in the consumer's nudge logic can't take down a $15 fire."""
+    A bug in the consumer's nudge logic can't take down an expensive
+    in-flight run."""
     fp = _FakeProvider([
         _tool_call_response(("c1", "echo", {"a": 1})),
         _text_response("ok"),
@@ -1558,7 +1599,7 @@ def test_in_fire_mutator_callable_exception_logged_but_does_not_crash_loop(
     caplog,
 ) -> None:
     """If the mutator raises, log it and continue — a bug in the
-    steering logic must not take down a $15 fire."""
+    steering logic must not take down an expensive in-flight run."""
     fp = _FakeProvider([
         _tool_call_response(("c1", "echo", {"a": 1})),
         _text_response("ok"),
@@ -1862,3 +1903,108 @@ def test_xsource_absurd_nesting_fails_closed() -> None:
     loop.run("Analyze CVE-2024-1234")
     blocked = [e for e in events if isinstance(e, ToolCallBlocked)]
     assert len(blocked) == 1
+
+
+def test_truncate_single_orphaned_tool_result_raises_typed_error() -> None:
+    """A pathological history can truncate down to a SINGLE leading
+    tool-result message — a shape every provider rejects. The loop
+    must raise its typed ContextOverflow instead of shipping a
+    guaranteed request rejection."""
+    fp = _FakeProvider([_text_response("ok")], ctx_window=260)
+    loop = ToolUseLoop(fp, [], context_policy=ContextPolicy.TRUNCATE_OLDEST)
+    history = [
+        Message(role="user", content=[TextBlock(text="a" * 800)]),
+        # Plain assistant text (no ToolCall) so the pair-drop does not
+        # remove the trailing tool_result alongside it.
+        Message(role="assistant", content=[TextBlock(text="b" * 800)]),
+        Message(role="user", content=[
+            ToolResult(tool_use_id="c1", content="r" * 100),
+        ]),
+    ]
+    with pytest.raises(ContextOverflow, match="cannot open a conversation"):
+        loop.run_with_history(history, "")
+    assert len(fp.calls) == 0
+
+
+class TestPerTurnTokensScope:
+    """``per_turn_tokens`` covers assistant turns appended THIS RUN —
+    a resumed history contributes turns with no tuple, so the
+    documented contract must not promise a per-``messages`` zip."""
+
+    def test_resumed_history_turns_carry_no_tuple(self):
+        provider = _FakeProvider([_text_response("final", 7, 3)])
+        history = [
+            Message(role="user", content=[TextBlock(text="q1")]),
+            Message(role="assistant", content=[TextBlock(text="a1")]),
+            Message(role="user", content=[TextBlock(text="q2")]),
+            Message(role="assistant", content=[TextBlock(text="a2")]),
+        ]
+        loop = ToolUseLoop(provider, [_echo_tool()], max_iterations=2)
+        result = loop.run_with_history(list(history), "resume")
+        n_assistant = sum(
+            1 for m in result.messages if m.role == "assistant"
+        )
+        assert n_assistant == 3
+        # One tuple for the one turn THIS run added.
+        assert result.per_turn_tokens == ((7, 3),)
+
+
+class TestCacheBreakpointRemapOnTruncation:
+    """``cache_control.history_through_index`` is a message index;
+    truncation pops head messages, so the frozen constructor value
+    must shift down with them — otherwise the breakpoint silently
+    lands on an unintended message (cache-efficiency/telemetry only;
+    the bounds check prevents a crash). The caller's CacheControl is
+    never mutated."""
+
+    def test_index_remapped_after_head_drop(self):
+        provider = _FakeProvider(
+            [_text_response("done", 5, 2)], ctx_window=200,
+        )
+        big = "x" * 2000  # ~500 tokens — forces truncation at window 200
+        history = [
+            Message(role="user", content=[TextBlock(text=big)]),
+            Message(role="assistant", content=[TextBlock(text="a1")]),
+            Message(role="user", content=[TextBlock(text="keep-me")]),
+            Message(role="assistant", content=[TextBlock(text="a2")]),
+        ]
+        cc = CacheControl(history_through_index=3)
+        loop = ToolUseLoop(
+            provider, [_echo_tool()],
+            context_policy=ContextPolicy.TRUNCATE_OLDEST,
+            cache_control=cc, max_iterations=1,
+        )
+        result = loop.run_with_history(list(history), "resume")
+        assert result.terminated_by == "complete"
+        sent = provider.calls[0]
+        dropped = 5 - len(sent["messages"])  # history(4) + next(1)
+        assert dropped >= 2  # the oversized head pair went
+        received = sent["cache_control"]
+        assert received.history_through_index == 3 - dropped
+        # The breakpoint still names the message it originally named.
+        target = sent["messages"][received.history_through_index]
+        assert target.content[0].text == "a2"
+        # Caller's object untouched.
+        assert cc.history_through_index == 3
+
+    def test_breakpoint_dropped_with_its_message(self):
+        provider = _FakeProvider(
+            [_text_response("done", 5, 2)], ctx_window=200,
+        )
+        big = "x" * 2000
+        history = [
+            Message(role="user", content=[TextBlock(text=big)]),
+            Message(role="assistant", content=[TextBlock(text="a1")]),
+            Message(role="user", content=[TextBlock(text="q2")]),
+        ]
+        cc = CacheControl(history_through_index=0)
+        loop = ToolUseLoop(
+            provider, [_echo_tool()],
+            context_policy=ContextPolicy.TRUNCATE_OLDEST,
+            cache_control=cc, max_iterations=1,
+        )
+        loop.run_with_history(list(history), "resume")
+        received = provider.calls[0]["cache_control"]
+        # The indexed message was itself truncated away — no history
+        # breakpoint survives.
+        assert received.history_through_index is None

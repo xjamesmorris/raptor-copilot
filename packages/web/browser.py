@@ -43,6 +43,8 @@ from urllib.parse import urlparse, urlsplit, urlunsplit
 
 from core.logging import get_logger
 
+from packages.web.origin import origin_of
+
 logger = get_logger()
 
 _DEFAULT_TIMEOUT_MS = 10_000
@@ -194,16 +196,7 @@ class BrowserEngine:
         carrying an explicit default port ('http://host:80') mismatched
         on every request and silently aborted the whole browser phase.
         """
-        parsed = urlparse(url)
-        scheme = parsed.scheme.lower()
-        if scheme_map:
-            scheme = scheme_map.get(scheme, scheme)
-        default_port = 443 if scheme == "https" else 80
-        try:
-            port = parsed.port
-        except ValueError:
-            port = -1  # invalid port never matches a real origin
-        return (scheme, (parsed.hostname or "").lower(), port or default_port)
+        return origin_of(url, scheme_map=scheme_map)
 
     def _same_origin(self, url: str, *, scheme_map: dict | None = None) -> bool:
         return self._normalized_origin(url, scheme_map=scheme_map) == self._origin
@@ -243,6 +236,11 @@ class BrowserEngine:
                     target,
                 ):
                     self._blocked_requests += 1
+                    # Record the blocked hop destination too: without
+                    # it the blocked_hosts diff was blind to poisoned
+                    # markup delivered via a same-origin request whose
+                    # redirect CHAIN pivoted off-origin.
+                    self._note_blocked(target)
                     route.abort()
                     return
                 hop_headers = {

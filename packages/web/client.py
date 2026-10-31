@@ -28,8 +28,25 @@ from typing_extensions import Self
 from core.logging import get_logger
 from core.security.redaction import redact_secrets
 
+from packages.web.origin import origin_of
+
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _MAX_REDIRECTS = 10
+
+
+class ScopeRedirectBlockedError(ValueError):
+    """A redirect Location pointed outside the configured target scope.
+
+    Subclasses ValueError so existing handlers keep working; carries
+    the blocked destination so callers can explain WHERE the target
+    tried to send the scan (preflight uses this to tell the operator
+    "the target lives at https://... — scan that origin" instead of a
+    generic unreachable error).
+    """
+
+    def __init__(self, message: str, next_url: str) -> None:
+        super().__init__(message)
+        self.next_url = next_url
 
 # What closing a Response/Session can legitimately raise: socket/SSL
 # teardown (OSError family) plus the requests/urllib3 error trees a
@@ -41,11 +58,20 @@ _CLOSE_ERRORS = (
     urllib3.exceptions.HTTPError,
 )
 
-# Cap on buffered response body. A hostile in-scope endpoint can
-# serve multi-GB responses (or chunked-encoding slowloris) and OOM
-# the scanner. 128 MiB is generous for real HTML / API responses
-# (typical pages <1 MiB) and catches the catastrophic shapes.
+# Caps on the buffered response body — hostile endpoints attack in
+# BOTH directions. Memory: multi-GB responses OOM the scanner; 128 MiB
+# is generous for real HTML / API responses (typical pages <1 MiB).
+# Time: the request `timeout` is a PER-READ socket timeout, so a
+# chunked-encoding slowloris sending one byte per window keeps every
+# read alive and stalls the sequential check pipeline indefinitely —
+# the byte cap alone never fires against it. The wall-clock deadline
+# runs from the start of the body read; 60s lets a well-behaved
+# endpoint deliver the full 128 MiB at ~2 MiB/s while cutting a
+# dripping endpoint off in bounded time (raising it tolerates slower
+# legitimate servers at the cost of longer hostile stalls per request;
+# lowering it truncates slow-but-real large bodies).
 _MAX_RESPONSE_BYTES = 128 * 1024 * 1024
+_MAX_BODY_READ_SECONDS = 60.0
 
 # Cap on request_history length — without this, long-running scans
 # against large targets accumulate hundreds of MB (full request +
@@ -66,15 +92,85 @@ _pin_install_lock = threading.Lock()
 _pin_local = threading.local()
 _original_getaddrinfo = None
 
+# Trailing label separators (ASCII dot plus the IDNA/UTS46 dot
+# variants U+3002, U+FF0E, U+FF61): a fully-qualified spelling of a
+# hostname names the same host, so pins must fold it away.
+_HOST_DOT_VARIANTS = ".。．｡"
+
+
+def _canonical_pin_host(host: object) -> str:
+    """Fold a hostname into the one canonical form pins are keyed on.
+
+    The pin is only sound when it is keyed on the SAME form the socket
+    layer later resolves. urllib3 hands ``getaddrinfo`` the IDNA2008
+    punycode form of the URL host, while ``urlparse().hostname`` yields
+    the unicode form — keying the pin on the latter made it miss for
+    every non-ASCII hostname (live second resolution: the exact
+    rebinding TOCTOU the pin exists to close). Both the pin key and the
+    wrapper's lookup key go through this fold, so any spelling of the
+    same host (mixed case, trailing FQDN dot, unicode dot variants,
+    unicode vs punycode) lands on one key.
+
+    Total: never raises. Returns "" for values that cannot name a
+    resolvable host (``None``, non-ASCII bytes, IDNA-invalid unicode) —
+    "" never appears as a pin key, so the wrapper treats it as a miss.
+    """
+    if host is None:
+        return ""
+    if isinstance(host, (bytes, bytearray)):
+        try:
+            text = bytes(host).decode("ascii")
+        except UnicodeDecodeError:
+            return ""
+    else:
+        text = str(host)
+    text = text.rstrip(_HOST_DOT_VARIANTS).lower()
+    if not text or text.isascii():
+        return text
+    try:
+        import idna
+        return idna.encode(text, uts46=True).decode("ascii")
+    except Exception:
+        # IDNA2008-invalid unicode hostname: no canonical ASCII form
+        # exists, so no pin can be keyed for it. Callers that VALIDATE
+        # (block_private_ips) fail closed on ""; the lookup wrapper
+        # falls through to live resolution, which the transport layer
+        # rejects for the same reason.
+        return ""
+
 
 def _pinning_getaddrinfo(host, port, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
     pins = getattr(_pin_local, "stack", None)
     if pins:
-        for mapping in reversed(pins):
-            addrs = mapping.get(host)
-            if addrs is not None:
-                return addrs
+        key = _canonical_pin_host(host)
+        if key:
+            for mapping in reversed(pins):
+                addrs = mapping.get(key)
+                if addrs is not None:
+                    return addrs
     return _original_getaddrinfo(host, port, *args, **kwargs)
+
+
+def _shutdown_response_socket(response: requests.Response) -> None:
+    """Best-effort shutdown of a streamed response's underlying socket.
+
+    Used by the body-read watchdog: a thread blocked in ``recv`` is NOT
+    woken by ``close()`` on the socket object — only ``shutdown()``
+    makes the pending read return. Walks the requests -> urllib3 ->
+    http.client -> SocketIO private chain defensively; when any hop is
+    missing (mocked responses, future library layouts) it silently
+    does nothing and the caller's ``close()`` remains the fallback.
+    """
+    raw = getattr(response, "raw", None)
+    http_response = getattr(raw, "_fp", None)
+    sock_file = getattr(http_response, "fp", None)
+    sock = getattr(getattr(sock_file, "raw", None), "_sock", None)
+    if sock is None:
+        connection = getattr(raw, "_connection", None)
+        sock = getattr(connection, "sock", None)
+    if sock is not None:
+        with contextlib.suppress(OSError, ValueError):
+            sock.shutdown(socket.SHUT_RDWR)
 
 
 def _ensure_pin_wrapper_installed() -> None:
@@ -110,8 +206,14 @@ class WebClient:
         # checks run sequentially over this client (they do: both check
         # phases iterate one check at a time); concurrent client use
         # elsewhere (the discovery thread pool) happens outside any
-        # check window.
+        # check window. Increments go through note_transport_error()
+        # under _transport_error_lock: the discovery pool's concurrent
+        # `+= 1` lost increments, under-counting degraded coverage.
         self.transport_errors = 0
+        self._transport_error_lock = threading.Lock()
+        # Guards request_history: get_stats() iterating the deque while
+        # a pool thread appends raised "deque mutated during iteration".
+        self._history_lock = threading.Lock()
         self.verify_ssl = verify_ssl
         self.reveal_secrets = reveal_secrets
         self.block_private_ips = block_private_ips
@@ -154,19 +256,9 @@ class WebClient:
 
         logger.info("Web client initialized for %s (verify_ssl=%s)", base_url, verify_ssl)
 
-    def _origin(self, url: str) -> tuple:
+    def _origin(self, url: str) -> tuple[str, str, int]:
         """Return normalized (scheme, host, port) tuple for URL scope checks."""
-        parsed = urlparse(url)
-        default_port = 443 if parsed.scheme == 'https' else 80
-        try:
-            port = parsed.port
-        except ValueError:
-            # Out-of-range or non-numeric port (a hostile crawled anchor
-            # like http://h:99999/x). Such a URL can never match a real
-            # origin — classify it out of scope instead of letting the
-            # ValueError abort the caller's whole page/phase.
-            port = -1
-        return (parsed.scheme.lower(), (parsed.hostname or '').lower(), port or default_port)
+        return origin_of(url)
 
     def _is_in_scope(self, url: str) -> bool:
         """Check whether URL stays within the configured base origin."""
@@ -189,6 +281,13 @@ class WebClient:
             return None
         try:
             ip_obj = ipaddress.ip_address(hostname)
+        except ValueError:
+            # Not an IP literal — a hostname; resolve and validate below.
+            # (Deciding this by substring-matching the exception message
+            # mis-blocked any hostname whose text collided with our own
+            # error wording.)
+            ip_obj = None
+        if ip_obj is not None:
             if not ip_obj.is_global:
                 msg = (
                     f"Blocked request to non-global IP {hostname} — "
@@ -196,13 +295,26 @@ class WebClient:
                 )
                 raise ValueError(msg)
             return None
-        except ValueError as exc:
-            if "non-global" in str(exc):
-                raise
         default_port = 443 if parsed.scheme == "https" else 80
         port = parsed.port or default_port
+        # Canonicalise ONCE (IDNA2008 punycode) and use the ASCII form
+        # for BOTH the validation resolution and the pin key. Resolving
+        # the unicode form judged a DIFFERENT registrable domain than
+        # the one the transport connects to (CPython's str-host path
+        # uses the legacy IDNA2003 codec: 'faß.de' -> 'fass.de', while
+        # urllib3 connects to 'xn--fa-hia.de'), and keying the pin on
+        # the unicode form made it miss the socket layer's punycode
+        # lookup — a live second resolution for every IDN hostname.
+        pin_key = _canonical_pin_host(hostname)
+        if not pin_key:
+            msg = (
+                f"Blocked request: hostname {hostname!r} has no valid "
+                f"IDNA2008 form, so its resolution cannot be validated "
+                f"or pinned"
+            )
+            raise ValueError(msg)
         try:
-            addrs = socket.getaddrinfo(hostname, port, proto=socket.IPPROTO_TCP)
+            addrs = socket.getaddrinfo(pin_key, port, proto=socket.IPPROTO_TCP)
         except socket.gaierror as exc:
             msg = f"DNS resolution failed for {hostname}: {exc}"
             raise ValueError(msg) from exc
@@ -219,7 +331,7 @@ class WebClient:
                     f"to scan internal targets)"
                 )
                 raise ValueError(msg)
-        return (hostname, port, addrs)
+        return (pin_key, port, addrs)
 
     @staticmethod
     @contextlib.contextmanager
@@ -246,7 +358,10 @@ class WebClient:
         if stack is None:
             stack = []
             _pin_local.stack = stack
-        stack.append({hostname: addrs})
+        # Same fold as the wrapper's lookup side: pin key and lookup
+        # key must be computed by ONE function or they drift apart
+        # (the pre-fix bug class).
+        stack.append({_canonical_pin_host(hostname) or hostname: addrs})
         try:
             yield
         finally:
@@ -277,7 +392,7 @@ class WebClient:
         next_url = urljoin(current_url, location)
         if not self._is_in_scope(next_url):
             msg = f"Blocked redirect outside configured target scope: {next_url}"
-            raise ValueError(msg)
+            raise ScopeRedirectBlockedError(msg, next_url)
         if self.execution_policy is not None:
             self.execution_policy.authorize(
                 tool_id="raptor-http",
@@ -295,7 +410,10 @@ class WebClient:
         threads therefore space out at the configured rate instead of
         all reading a stale ``last_request_time`` and bursting.
         """
-        now = time.time()
+        # Monotonic clock: reservations on time.time() stretched or
+        # stalled the limiter across NTP steps (a backward step parked
+        # last_request_time in the future).
+        now = time.monotonic()
         with self._rate_lock:
             scheduled = max(now, self.last_request_time + self.rate_limit)
             self.last_request_time = scheduled
@@ -310,14 +428,15 @@ class WebClient:
                      duration: float) -> None:
         """Log request details."""
         log_url = self._redact_for_logging(url)
-        self.request_history.append({
-            'method': method,
-            'url': log_url,
-            'status_code': response.status_code,
-            'duration': duration,
-            'content_length': len(response.content),
-            'timestamp': time.time(),
-        })
+        with self._history_lock:
+            self.request_history.append({
+                'method': method,
+                'url': log_url,
+                'status_code': response.status_code,
+                'duration': duration,
+                'content_length': len(response.content),
+                'timestamp': time.time(),
+            })
 
         logger.debug("%s %s -> %s (%.2fs)", method, log_url, response.status_code, duration)
 
@@ -418,13 +537,38 @@ class WebClient:
 
     def _enforce_response_cap(self, response: requests.Response) -> None:
         """Read the streamed body into ``response._content`` up to
-        :data:`_MAX_RESPONSE_BYTES`. If the body exceeds the cap,
-        truncate and close the connection — the caller sees a body
-        of exactly ``_MAX_RESPONSE_BYTES`` bytes rather than the
-        process OOMing on a hostile multi-GB response.
+        :data:`_MAX_RESPONSE_BYTES` and within
+        :data:`_MAX_BODY_READ_SECONDS`. If the body exceeds either
+        bound, truncate and close the connection — the caller sees a
+        body capped near the byte limit (it may overshoot by up to one
+        64 KiB read chunk) rather than the process OOMing on a hostile
+        multi-GB response, and a drip-fed body (each read succeeding
+        inside the per-read socket timeout, forever) hands back what
+        arrived instead of stalling the scan pipeline.
         """
+        chunks: list[bytes] = []
+        # Watchdog, not an in-loop clock check: a dripping server keeps
+        # the SINGLE blocking read inside iter_content alive (each byte
+        # restarts the per-recv socket timeout and the buffered read
+        # does not yield until its chunk fills), so loop-body code
+        # never runs while the stall lasts. Closing the response from
+        # the timer thread unblocks the read; the buffered prefix is
+        # kept.
+        expired = threading.Event()
+
+        def _expire() -> None:
+            expired.set()
+            # shutdown() BEFORE close(): closing a socket object does
+            # not wake a thread blocked in recv on it — shutdown does
+            # (the read returns EOF immediately).
+            _shutdown_response_socket(response)
+            with contextlib.suppress(*_CLOSE_ERRORS):
+                response.close()
+
+        watchdog = threading.Timer(_MAX_BODY_READ_SECONDS, _expire)
+        watchdog.daemon = True
+        watchdog.start()
         try:
-            chunks: list[bytes] = []
             total = 0
             for chunk in response.iter_content(chunk_size=64 * 1024):
                 if not chunk:
@@ -442,10 +586,22 @@ class WebClient:
                         response.close()
                     break
             response._content = b"".join(chunks)
-        except requests.exceptions.RequestException:
+        except (requests.exceptions.RequestException, *_CLOSE_ERRORS,
+                ValueError):
             # Let the caller see whatever was buffered; do not raise
-            # from the cap-enforcer.
+            # from the cap-enforcer. The extra classes are what the
+            # watchdog's close() makes the blocked read raise
+            # (protocol errors, closed-file ValueError).
             response._content = b"".join(chunks) if chunks else b""
+        finally:
+            watchdog.cancel()
+            if expired.is_set():
+                logger.warning(
+                    "WebClient: response body still streaming after "
+                    "%.0fs at %s; truncated (drip-fed/slowloris shape)",
+                    _MAX_BODY_READ_SECONDS,
+                    self._redact_for_logging(response.url or "<unknown>"),
+                )
 
     def get(self, path: str, params: dict | None = None,
             headers: dict | None = None,
@@ -476,11 +632,11 @@ class WebClient:
             return response
 
         except requests.exceptions.Timeout:
-            self.transport_errors += 1
+            self.note_transport_error()
             logger.warning("Timeout on GET %s", self._redact_for_logging(url))
             raise
         except requests.exceptions.RequestException as e:
-            self.transport_errors += 1
+            self.note_transport_error()
             logger.error("Request failed: %s", self._redact_for_logging(e))
             raise
 
@@ -510,7 +666,7 @@ class WebClient:
             return response
 
         except requests.exceptions.RequestException as e:
-            self.transport_errors += 1
+            self.note_transport_error()
             logger.error("POST request failed: %s", self._redact_for_logging(e))
             raise
 
@@ -536,16 +692,28 @@ class WebClient:
         """Set session cookies."""
         self.session.cookies.update(cookies)
 
+    def note_transport_error(self, count: int = 1) -> None:
+        """Atomically count transport-level failures (see
+        ``transport_errors``): the discovery thread pool's concurrent
+        bare ``+= 1`` lost increments and under-counted degraded
+        coverage."""
+        with self._transport_error_lock:
+            self.transport_errors += count
+
     def get_stats(self) -> dict[str, Any]:
         """Get request statistics."""
-        if not self.request_history:
+        with self._history_lock:
+            # Snapshot under the append lock — iterating the live
+            # deque while a pool thread appends raised RuntimeError.
+            history = list(self.request_history)
+        if not history:
             return {}
 
-        total_requests = len(self.request_history)
-        total_duration = sum(r['duration'] for r in self.request_history)
+        total_requests = len(history)
+        total_duration = sum(r['duration'] for r in history)
         status_codes: dict[int, int] = {}
 
-        for req in self.request_history:
+        for req in history:
             code = req['status_code']
             status_codes[code] = status_codes.get(code, 0) + 1
 

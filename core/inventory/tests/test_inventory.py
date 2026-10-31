@@ -1,13 +1,9 @@
 """Tests for core.inventory — shared source inventory."""
 
 import json
-import sys
 from pathlib import Path
 
 import pytest
-
-# core/inventory/tests/test_inventory.py -> repo root
-sys.path.insert(0, str(Path(__file__).parents[3]))
 
 from core.inventory import (
     build_inventory,
@@ -261,6 +257,25 @@ class TestJavaScriptExtractor:
         funcs = JavaScriptExtractor().extract("test.js", code)
         assert all(f.name != "if" for f in funcs)
 
+    def test_object_method_arrow_spacings_still_match(self):
+        for line in (
+            "handler: (req) => {",
+            "handler: (req) =>{",
+            "handler: (req)=> {",
+            "handler: async (req) => {",
+            "handler: function (req) {",
+            "handler: (req) {",
+        ):
+            funcs = JavaScriptExtractor().extract("t.js", line + "\n}\n")
+            assert [f.name for f in funcs] == ["handler"], line
+
+    def test_object_method_whitespace_run_is_linear(self):
+        from core.testing.wallclock import cpu_budget
+
+        hostile = "m: ()" + " " * 8192 + "x\n"
+        with cpu_budget(1.0, what="js object-method whitespace run"):
+            assert JavaScriptExtractor().extract("t.js", hostile) == []
+
 
 class TestCExtractor:
     def test_ansi_style(self):
@@ -279,6 +294,23 @@ class TestCExtractor:
         code = "if (x) {\n}\nint real(void) {\n}\n"
         funcs = CExtractor().extract("test.c", code)
         assert all(f.name != "if" for f in funcs)
+
+    def test_ansi_declaration_prefix_shapes_still_match(self):
+        for line, name in (
+            ("static void *alloc_page(size_t n) {", "alloc_page"),
+            ("unsigned long long wide(void) {", "wide"),
+            ("static  inline  int   spaced(int x) {", "spaced"),
+            ("z_streamp * deref(void) {", "deref"),
+        ):
+            funcs = CExtractor().extract("t.c", line + "\n}\n")
+            assert [f.name for f in funcs] == [name], line
+
+    def test_ansi_word_space_run_scans_in_linear_time(self):
+        from core.testing.wallclock import cpu_budget
+
+        hostile = "a " * 8000 + "\n"
+        with cpu_budget(1.0, what="c extractor word-space run"):
+            assert CExtractor().extract("t.c", hostile) == []
 
 
 class TestJavaExtractor:
@@ -309,6 +341,36 @@ class TestGenericExtractor:
         funcs = GenericExtractor().extract("test.rb", code)
         assert len(funcs) == 1
         assert funcs[0].name == "foo"
+
+    def test_brace_style_modifier_shapes_still_match(self):
+        for line, name in (
+            ("public static int foo(int x) {", "foo"),
+            ("private void bar() {", "bar"),
+            ("static string baz(string s) {", "baz"),
+            ("int qux(void) {", "qux"),
+            ("publicstatic void glued(int x) {", "glued"),
+        ):
+            funcs = GenericExtractor().extract("t.cs", line + "\n}\n")
+            assert [f.name for f in funcs] == [name], line
+
+    def test_whitespace_run_line_scans_in_linear_time(self):
+        from core.testing.wallclock import cpu_budget
+
+        hostile = "public" + " " * 8192 + "(\n"
+        with cpu_budget(1.0, what="generic extractor whitespace run"):
+            assert GenericExtractor().extract("t.cs", hostile) == []
+
+    def test_oversized_line_is_skipped_not_scanned(self):
+        from core.testing.wallclock import cpu_budget
+
+        # Two-direction bound check: a line beyond the cap is skipped
+        # outright (no scan cost), while a normal declaration on the
+        # next line is still extracted.
+        content = ("x" * (GenericExtractor._MAX_LINE + 1) + "\n"
+                   + "public int ok() {\n}\n")
+        with cpu_budget(1.0, what="generic extractor oversized line"):
+            funcs = GenericExtractor().extract("t.cs", content)
+        assert [f.name for f in funcs] == ["ok"]
 
 
 class TestExtractFunctions:
@@ -580,6 +642,51 @@ class TestCoverageStats:
         }
         update_coverage(inv, [{"file": "app.py", "function": "foo"}], "validate:stage-a")
         assert "validate:stage-a" in inv["files"][0]["functions"][0]["checked_by"]
+
+    def test_update_coverage_class_key_disambiguates_twins(self):
+        # Items carry class context as metadata.class_name (the shape
+        # the extractors serialise) — a class-carrying caller must
+        # mark ONLY its twin. Pre-fix the item side read a bare
+        # `class` key nothing writes: the documented shape matched
+        # nothing (silent total mark loss) and twins always collided.
+        inv = {
+            "files": [{
+                "path": "app.py",
+                "functions": [
+                    {"name": "do_thing", "checked_by": [],
+                     "metadata": {"class_name": "ClassA"}},
+                    {"name": "do_thing", "checked_by": [],
+                     "metadata": {"class_name": "ClassB"}},
+                ],
+            }]
+        }
+        update_coverage(
+            inv,
+            [{"file": "app.py", "function": "do_thing", "class": "ClassA"}],
+            "audit:review",
+        )
+        funcs = inv["files"][0]["functions"]
+        assert funcs[0]["checked_by"] == ["audit:review"]
+        assert funcs[1]["checked_by"] == []
+
+    def test_update_coverage_bare_name_still_matches_methods(self):
+        # Legacy callers without class info keep working (bare-name
+        # fallback) even though items now derive a class key.
+        inv = {
+            "files": [{
+                "path": "app.py",
+                "functions": [
+                    {"name": "do_thing", "checked_by": [],
+                     "metadata": {"class_name": "ClassA"}},
+                ],
+            }]
+        }
+        update_coverage(
+            inv, [{"file": "app.py", "function": "do_thing"}], "validate:stage-a",
+        )
+        assert inv["files"][0]["functions"][0]["checked_by"] == [
+            "validate:stage-a",
+        ]
 
     def test_update_coverage_deduplicates(self):
         inv = {
@@ -903,6 +1010,55 @@ class TestDefaultCacheDir:
         rel = default_cache_dir("project")
         absolute = default_cache_dir(str(proj))
         assert rel == absolute
+
+    def test_default_cache_root_reads_home_at_call_time(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """$HOME is read per call, not snapshotted at import: a HOME
+        pin installed after the module was imported redirects the
+        default cache root (fabricated HOME — never the real one)."""
+        import core.inventory.builder as builder
+        monkeypatch.setattr(builder, "_DEFAULT_INVENTORY_CACHE_ROOT", None)
+        home_a = tmp_path / "home-a"
+        home_b = tmp_path / "home-b"
+        monkeypatch.setenv("HOME", str(home_a))
+        assert builder._default_inventory_cache_root() == (
+            home_a / ".raptor" / "cache" / "inventory"
+        )
+        # Changing HOME after the first call takes effect on the next.
+        monkeypatch.setenv("HOME", str(home_b))
+        cache = builder.default_cache_dir(str(tmp_path))
+        assert cache.parent == home_b / ".raptor" / "cache" / "inventory"
+        assert not home_a.exists() and not home_b.exists()
+
+    def test_default_cache_root_seam_wins_over_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The monkeypatch seam (what this suite's other tests use)
+        wins over the env-derived default."""
+        import core.inventory.builder as builder
+        monkeypatch.setenv("HOME", str(tmp_path / "ignored"))
+        monkeypatch.setattr(
+            builder, "_DEFAULT_INVENTORY_CACHE_ROOT", tmp_path / "pinned",
+        )
+        assert builder._default_inventory_cache_root() == tmp_path / "pinned"
+
+    def test_reach_cache_writes_land_under_the_conftest_pin(self) -> None:
+        """Every ``build_inventory`` in this suite persists a
+        reachability index; the conftest's XDG_CACHE_HOME pin is what
+        keeps those writes out of the developer's real
+        ``~/.cache/raptor/reachability/`` (whose small eviction budget
+        a single suite run would otherwise churn through). Fail loudly
+        if the pin disappears or stops steering the store."""
+        import os
+
+        from core.analysis import _reach_cache
+
+        pinned = os.environ.get("XDG_CACHE_HOME")
+        assert pinned, "conftest must pin XDG_CACHE_HOME for this suite"
+        assert _reach_cache._cache_dir() == (
+            Path(pinned) / "raptor" / "reachability"
+        )
 
     def test_build_inventory_uses_default_when_output_dir_omitted(
         self, tmp_path, monkeypatch,

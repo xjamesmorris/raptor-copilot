@@ -8,7 +8,9 @@ steer an (optionally authenticated) registry request at a different
 endpoint: path traversal, per-version metadata swap, query-string
 injection.
 
-Every client routes its path components through this module:
+Clients route their path components through this module (npm keeps
+its own registry-specific name grammar + quoting; everything else
+uses these helpers):
 
 * :func:`quote_segment` — one URL path segment. Rejects empty
   values, dot segments (``.`` / ``..``), path separators (unless

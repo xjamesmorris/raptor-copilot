@@ -121,12 +121,14 @@ class TestAuditSystemRoMatchesContext:
         assert spawn_m, "could not find _system_ro literal in _spawn"
         spawn_paths = re.findall(r'"([^"]+)"', spawn_m.group(1))
 
-        # Extract effective_read_paths default in context.
+        # Extract the restricted-read default from its helper in context.
         ctx_m = re.search(
-            r"effective_read_paths\s*=\s*\[\s*((?:\"[^\"]+\"[,\s]*)+)\]",
+            r"def _restricted_read_allowlist\(\).*?"
+            r"paths\s*=\s*\[\s*((?:\"[^\"]+\"[,\s]*)+)\]",
             ctx_src,
+            re.DOTALL,
         )
-        assert ctx_m, "could not find effective_read_paths in context"
+        assert ctx_m, "could not find restricted read allowlist in context"
         ctx_paths = re.findall(r'"([^"]+)"', ctx_m.group(1))
 
         assert set(spawn_paths) == set(ctx_paths), (

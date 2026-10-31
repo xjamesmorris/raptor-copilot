@@ -17,10 +17,11 @@ from __future__ import annotations
 
 import logging
 
-from packaging.version import InvalidVersion, Version
+from packaging.version import Version
 
 from core.json import MISSING, JsonCache
 
+from ..naming import pep503_name
 from ._negative_cache import log_fetch_failure, should_negative_cache
 from ._url import (
     UnsafeUrlComponentError,
@@ -186,7 +187,7 @@ class PyPIClient:
         the same TTL so workspace-internal / private package names
         don't re-query on every detector call.
         """
-        canon = _canonical_name(name)
+        canon = pep503_name(name)
         try:
             url = self._build_url(canon)
         except UnsafeUrlComponentError:
@@ -214,7 +215,7 @@ class PyPIClient:
             return None
         # Strip security-irrelevant fields before caching. See
         # ``_strip_pypi_metadata`` for the rationale.
-        data = _strip_pypi_metadata(data)
+        data = _strip_pypi_metadata(data)  # type: ignore[assignment]
         if self._cache is not None:
             self._cache.put(cache_key, data, ttl_seconds=self._ttl)
         return data
@@ -235,7 +236,7 @@ class PyPIClient:
         Cached separately from the aggregate metadata; same TTL.
         Same negative-caching policy as ``get_metadata``.
         """
-        canon = _canonical_name(name)
+        canon = pep503_name(name)
         try:
             base = self._build_url(canon).rsplit("/", 1)[0]
             url = f"{base}/{quote_segment(version)}/json"
@@ -273,7 +274,7 @@ class PyPIClient:
         return data
 
     def list_versions(self, name: str) -> list[str]:
-        canon = _canonical_name(name)
+        canon = pep503_name(name)
         try:
             url = self._build_url(canon)
         except UnsafeUrlComponentError:
@@ -304,12 +305,6 @@ class PyPIClient:
         if self._cache is not None:
             self._cache.put(cache_key, versions, ttl_seconds=self._ttl)
         return versions
-
-
-def _canonical_name(name: str) -> str:
-    """PEP 503 normalisation."""
-    import re
-    return re.sub(r"[-_.]+", "-", name).lower()
 
 
 def _extract_versions(data: dict) -> list[str]:
@@ -344,7 +339,10 @@ def _extract_versions(data: dict) -> list[str]:
             continue
         try:
             parsed = Version(ver)
-        except InvalidVersion:
+        except ValueError:
+            # ValueError, not just its InvalidVersion subclass:
+            # CPython's int digit limit raises bare ValueError on a
+            # hostile registry's huge-digit version string.
             continue
         # Skip pre-releases by default — operators don't want
         # ``pip install requests==2.31.0a1`` from a hardening pass.

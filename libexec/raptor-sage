@@ -38,7 +38,6 @@ if not (os.environ.get("CLAUDECODE")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import core.startup.process_init  # noqa: E402,F401
-from core.json import dumps_display  # noqa: E402
 
 import argparse  # noqa: E402
 import logging  # noqa: E402
@@ -420,9 +419,13 @@ def cmd_list(client, args):
     if getattr(args, "json", False):
         # Machine-readable path: full (untruncated) IDs and content so
         # downstream commands (get/forget/task --id) can consume the
-        # output. json.dumps with the default ensure_ascii=True renders
-        # every non-ASCII and control byte as an inert \uXXXX escape,
-        # so hostile store content cannot reach the terminal raw.
+        # output. Serialised with ensure_ascii=True so every non-ASCII
+        # and control byte renders as an inert \uXXXX escape — hostile
+        # store content (C1 terminal controls: CSI, OSC clipboard
+        # writes) must never reach the terminal raw, and a JSON
+        # consumer still parses the escapes back to the original
+        # content. NOT dumps_display: that uses ensure_ascii=False on
+        # both encoder branches and passes C1 bytes through.
         records = []
         for m in memories:
             st = getattr(m, "status", "")
@@ -439,7 +442,8 @@ def cmd_list(client, args):
                 "tags": [str(t) for t in (getattr(m, "tags", []) or [])],
                 "created_at": str(created) if created is not None else None,
             })
-        print(dumps_display(records, indent=2))
+        import json as _json
+        print(_json.dumps(records, indent=2, ensure_ascii=True))
         return 0
 
     if not memories:

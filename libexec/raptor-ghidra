@@ -59,6 +59,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p_attach.add_argument("--program", default=None, help="Program name in multi-binary project")
     p_attach.add_argument("--binary", type=Path, help="Binary path for r2 enrichment")
     p_attach.add_argument(
+        "--timeout", type=int, default=None,
+        help="Headless import timeout in seconds "
+             "(default: 300, or 3600 with --decompile-all)",
+    )
+    p_attach.add_argument(
         "--wait", action="store_true",
         help="Block on a busy project lock instead of failing fast",
     )
@@ -91,6 +96,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p_import.add_argument("--decompile-all", action="store_true", help="Decompile every function")
     p_import.add_argument("--program", default=None, help="Program name in multi-binary project")
     p_import.add_argument("--binary", type=Path, help="Binary path for r2 enrichment")
+    p_import.add_argument(
+        "--timeout", type=int, default=None,
+        help="Headless import timeout in seconds "
+             "(default: 300, or 3600 with --decompile-all)",
+    )
 
     # diff
     p_diff = sub.add_parser("diff", help="Cross-version comparison of two Ghidra projects")
@@ -112,6 +122,11 @@ def _build_parser() -> argparse.ArgumentParser:
                              "instead of by name — required for stripped "
                              "or renamed binaries; writes binary-match.json")
     p_diff.add_argument("--json", action="store_true", help="JSON output to stdout")
+    p_diff.add_argument(
+        "--timeout", type=int, default=None,
+        help="Headless import timeout in seconds, per side "
+             "(default: 300, or 3600 with --decompile-all)",
+    )
 
     # decompile
     p_decomp = sub.add_parser("decompile", help="Decompile a single function")
@@ -144,8 +159,18 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
+# \x80-\x9f: the FULL C1 range, not just CSI 0x9B \u2014 U+009D is a
+# single-character OSC introducer and U+0090 a DCS introducer on
+# 8-bit-clean terminals, and ghidra-derived names/decompilation are
+# attacker bytes end-to-end. Matches escape_nonprintable's coverage,
+# plus the invisible/reordering class decomp_tree._BODY_CONTROL
+# strips (ZWSP..RLM, line/para separators, BOM) so the two
+# ghidra-derived-text scrubbers cover the same character set.
 _CTRL_CHARS = re.compile(
-    r"[\x00-\x08\x0b-\x1f\x7f\x9b\u202a-\u202e\u2066-\u2069]"
+    r"[\x00-\x08\x0b-\x1f\x7f\x80-\x9f"
+    r"\u200b-\u200f\u2028\u2029"
+    r"\u202a-\u202e\u2066-\u2069"
+    r"\ufeff]"
 )
 
 
@@ -199,10 +224,13 @@ def _do_import(gpr: Path, args: argparse.Namespace, out_dir: Path):
             db = bridge.import_and_enrich(
                 out_dir,
                 binary_path=args.binary.resolve() if args.binary else None,
+                decompile=args.decompile_all,
+                timeout=args.timeout,
             )
         else:
             db = bridge.import_project(
-                out_dir, decompile=args.decompile_all)
+                out_dir, decompile=args.decompile_all,
+                timeout=args.timeout)
     return db
 
 
@@ -405,12 +433,18 @@ def _import_binary_fallback(binary: Path, out_dir: Path) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     db = None
     if r2_available():
-        print("ghidra unavailable for this input — importing via r2 "
-              "(degraded: no decompiler types)", file=sys.stderr)
+        # The caller has already printed WHY Ghidra is out of the
+        # picture (no install / create failed) — this line only names
+        # the degradation.
+        print("importing via r2 (degraded: no decompiler types)",
+              file=sys.stderr)
         try:
             db = import_binary_r2(binary)
         except (RuntimeError, ImportError) as e:
-            print(f"warning: r2 import failed ({e}) — falling back to "
+            # Exception text quotes binary-derived strings (section
+            # names, embedded paths) — scrub like the other relays.
+            print("warning: r2 import failed "
+                  f"({_safe_line(str(e), limit=300)}) — falling back to "
                   "objdump/nm", file=sys.stderr)
     if db is None:
         from packages.ghidra.objdump_import import import_binary_objdump
@@ -422,8 +456,78 @@ def _import_binary_fallback(binary: Path, out_dir: Path) -> int:
               "stripped, or objdump/nm are not installed; the written "
               "database is empty", file=sys.stderr)
     out_path = out_dir / "re-database.json"
-    with open(out_path, "w") as f:
-        json.dump(db.to_dict(), f, indent=2)
+    # Atomic like raptor-build-checklist's writer for the same
+    # artifact: a crash mid-dump must not leave a torn database that
+    # every later reader rejects.
+    from core.audit.binary_context import stamp_binary_sha256
+    from core.json import save_json
+    doc = db.to_dict()
+    # Content-hash stamp (the bridge writer's discipline): later
+    # cache hits on this file are validated against the binary they
+    # are being used for, not just its path.
+    stamp_binary_sha256(doc, binary)
+    save_json(out_path, doc)
+    _print_db_summary(db, out_dir)
+    return 0
+
+
+def _import_raw_binary(binary: Path, args: argparse.Namespace,
+                       out_dir: Path) -> int:
+    """Raw-binary onramp: create a Ghidra project from the binary via
+    analyzeHeadless, then continue through the normal .gpr import
+    path (--decompile-all / --enrich / --timeout all apply). Only when
+    no headless install exists — or the create fails — does this
+    degrade to the r2/objdump fallback importers, with the real reason
+    printed (pre-fix the fallback fired even with Ghidra installed)."""
+    from packages.ghidra.detect import ghidra_available
+
+    if not ghidra_available():
+        print("no Ghidra install found (analyzeHeadless not on PATH)",
+              file=sys.stderr)
+        return _import_binary_fallback(binary, out_dir)
+
+    from packages.ghidra.headless import (
+        GhidraError,
+        GhidraProjectExistsError,
+        create_project_from_binary,
+    )
+    project_dir = out_dir / "ghidra-project" / binary.stem
+    print(f"creating Ghidra project from {_safe_line(str(binary))} "
+          "(auto-analysis — minutes on large binaries)",
+          file=sys.stderr)
+    try:
+        # Create + auto-analysis is decompile-scale work, so an unset
+        # --timeout gets the 3600s default, not the 300s metadata cap.
+        gpr = create_project_from_binary(
+            binary, project_dir,
+            timeout=args.timeout if args.timeout is not None else 3600,
+        )
+    except GhidraProjectExistsError as e:
+        # TERMINAL by design, on both horns: silently reusing the
+        # pre-existing project would trust possibly stale or poisoned
+        # analysis nothing this run produced, and degrading to the
+        # r2/objdump fallback would OVERWRITE the existing
+        # full-fidelity re-database.json in this (deterministic)
+        # output dir with a symbols-only one. The message carries the
+        # operator's two options: pass the existing .gpr, or remove
+        # the directory.
+        print(f"error: {_safe_line(str(e), limit=1600)}",
+              file=sys.stderr)
+        return 1
+    except (GhidraError, OSError) as e:
+        # GhidraError embeds analyzeHeadless output tails
+        # (attacker-influenced) — scrub before echoing, like main().
+        print(f"ghidra project create failed: "
+              f"{_safe_line(str(e), limit=1600)}", file=sys.stderr)
+        return _import_binary_fallback(binary, out_dir)
+
+    print(f"created: {_safe_line(str(gpr))}", file=sys.stderr)
+    if args.enrich and args.binary is None:
+        # The operator handed us the raw binary explicitly — feed it
+        # to the r2 enrichment pass directly instead of making the
+        # bridge re-derive it from project metadata.
+        args.binary = binary
+    db = _do_import(gpr, args, out_dir)
     _print_db_summary(db, out_dir)
     return 0
 
@@ -440,16 +544,19 @@ def _cmd_import(args: argparse.Namespace) -> int:
         pyghidra_available,
     )
 
-    # Raw-binary input, or Ghidra absent: engine fallback chain.
-    if gpr.suffix != ".gpr" or not (
-            ghidra_available() or pyghidra_available()):
+    # Raw-binary input: create a Ghidra project first (headless
+    # present), else the engine fallback chain.
+    if gpr.suffix != ".gpr":
         out_dir = args.out or Path(f"out/ghidra-import-{gpr.stem}")
-        if gpr.suffix == ".gpr":
-            print("error: analyzeHeadless not on PATH — cannot open a "
-                  ".gpr project; pass the raw binary to use the "
-                  "r2/objdump fallback importers", file=sys.stderr)
-            return 1
-        return _import_binary_fallback(gpr, Path(out_dir).resolve())
+        return _import_raw_binary(gpr, args, Path(out_dir).resolve())
+
+    # .gpr input needs a Ghidra engine — there is no fallback that
+    # can open a project database.
+    if not (ghidra_available() or pyghidra_available()):
+        print("error: analyzeHeadless not on PATH — cannot open a "
+              ".gpr project; pass the raw binary to use the "
+              "r2/objdump fallback importers", file=sys.stderr)
+        return 1
 
     version = get_ghidra_version()
     if version:
@@ -488,13 +595,15 @@ def _cmd_diff(args: argparse.Namespace) -> int:
     print(f"importing: {old_gpr.name}", file=sys.stderr)
     bridge_old = GhidraBridge(old_gpr, program_name=args.program)
     db_old = bridge_old.import_project(out_dir / "old",
-                                       decompile=args.decompile_all)
+                                       decompile=args.decompile_all,
+                                       timeout=args.timeout)
     bridge_old.close()
 
     print(f"importing: {new_gpr.name}", file=sys.stderr)
     bridge_new = GhidraBridge(new_gpr, program_name=args.program)
     db_new = bridge_new.import_project(out_dir / "new",
-                                       decompile=args.decompile_all)
+                                       decompile=args.decompile_all,
+                                       timeout=args.timeout)
     bridge_new.close()
 
     label_old = args.label_old or db_old.metadata.get("program_name", old_gpr.stem)
@@ -524,7 +633,11 @@ def _cmd_diff(args: argparse.Namespace) -> int:
                   file=sys.stderr)
         matches = match_databases(db_old, db_new)
         match_path = out_dir / "binary-match.json"
-        match_path.write_text(json.dumps(matches.to_dict(), indent=2))
+        # Atomic write (planted-symlink defence at the predictable
+        # artifact name in the reused run dir).
+        from core.atomic_fs import write_text_atomically
+        write_text_atomically(
+            match_path, json.dumps(matches.to_dict(), indent=2))
         stats = matches.stats
         print(f"matched: {stats.get('matched', 0)} pairs, "
               f"{stats.get('unmatched_old', 0)} old / "
@@ -606,7 +719,8 @@ def _cmd_decompile(args: argparse.Namespace) -> int:
                 srv.open()
                 code = srv.decompile(func_id, timeout=args.timeout)
         except Exception as e:  # noqa: BLE001 — fall to next engine
-            print(f"note: sandboxed decompile server failed ({e}) — "
+            print("note: sandboxed decompile server failed "
+                  f"({_safe_line(str(e), limit=300)}) — "
                   "trying next engine", file=sys.stderr)
     if code is None and (prefer_in_process() or not pyghidra_available()):
         try:
@@ -615,7 +729,8 @@ def _cmd_decompile(args: argparse.Namespace) -> int:
                 code = session.decompile_function(
                     func_id, timeout=args.timeout)
         except GhidraSessionError as e:
-            print(f"note: in-process decompiler unavailable ({e}) — "
+            print("note: in-process decompiler unavailable "
+                  f"({_safe_line(str(e), limit=300)}) — "
                   "trying disassembly fallback", file=sys.stderr)
 
     if code is None:

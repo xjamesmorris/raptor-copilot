@@ -49,6 +49,7 @@ from packages.fuzzing import AFLRunner, CrashCollector
 from packages.llm_analysis.crash_agent import (
     CrashAnalysisAgent,
     exploit_artifact_path,
+    refined_exploit_artifact_path,
 )
 
 logger = get_logger()
@@ -147,6 +148,29 @@ def _resolve_dict_path(args: argparse.Namespace, out_dir):
         return None
 
 
+def _exploitability_from_deep_analysis(level: object) -> str | None:
+    """Map the multi-turn dialogue's graded exploitability level onto
+    the CrashContext verdict vocabulary, preserving abstention.
+
+    The producer (``packages/autonomous/dialogue.py``) deliberately
+    keeps ``"unknown"`` as a non-verdict when the model never
+    committed to a level. Splitting the tri-state domain with a bare
+    membership test (``in ['high', 'medium']`` … else
+    ``'not_exploitable'``) collapsed unknown/absent/junk into a
+    definitive negative — and, through
+    ``record_crash_pattern(exploitable=False)``, persisted cross-run
+    "not exploitable" facts no model produced. ``None`` means the
+    analysis abstained: leave the context's existing value untouched
+    and record nothing durable. Same mapping direction as the
+    crash agent's single-shot lane (explicit True/False/unknown).
+    """
+    if level in ("high", "medium"):
+        return "exploitable"
+    if level == "low":
+        return "not_exploitable"
+    return None
+
+
 def _load_generated_exploit(agent_out_dir: Path, crash_id: str) -> str | None:
     """Re-read the exploit PoC the crash agent just generated.
 
@@ -162,6 +186,20 @@ def _load_generated_exploit(agent_out_dir: Path, crash_id: str) -> str | None:
     if not exploit_file.exists():
         return None
     return exploit_file.read_text(encoding="utf-8")
+
+
+def _campaign_execs(afl_runner: AFLRunner) -> int:
+    """Executions-done from the campaign's AFL stats, 0 when absent.
+
+    Strategy-outcome records previously hardcoded ``execs=0``, so
+    cross-run strategy memory could never weigh throughput — a
+    strategy that ran millions of execs finding nothing and one that
+    barely executed looked identical.
+    """
+    try:
+        return int(str(afl_runner.get_stats().get("execs_done") or 0))
+    except (AttributeError, TypeError, ValueError):
+        return 0
 
 
 def main() -> None:
@@ -322,6 +360,41 @@ Examples:
     ap.add_argument("--plan-only", action="store_true",
                     help="With --orchestrator, print the plan and exit without running")
     ap.add_argument(
+        "--engine",
+        choices=["afl", "libfuzzer", "atheris", "cargo-fuzz", "jazzer"],
+        default=None,
+        help="Force a specific engine on the orchestrator path. "
+             "Honoured only when the detected target kind supports it "
+             "(atheris drives python-pkg targets; cargo-fuzz drives "
+             "rust-crate targets; jazzer drives java-project targets); "
+             "otherwise the plan blocks with the reason. Implies "
+             "--orchestrator.")
+    ap.add_argument(
+        "--fuzz-target", metavar="NAME",
+        help="In-repo harness to build and run: the cargo-fuzz target "
+             "name for rust-crate targets (a "
+             "fuzz/fuzz_targets/<NAME>.rs harness), or the Jazzer "
+             "target class for java-project targets (a "
+             "fuzzerTestOneInput / @FuzzTest class; fully-qualified, "
+             "or the simple name when unambiguous). Auto-selected "
+             "when the project has exactly one; several targets block "
+             "the plan with the list. Implies --orchestrator.")
+    py_harness_group = ap.add_mutually_exclusive_group()
+    py_harness_group.add_argument(
+        "--py-harness", metavar="FILE",
+        help="Operator-written atheris TestOneInput harness (.py) for "
+             "python-pkg targets. Implies --orchestrator.")
+    py_harness_group.add_argument(
+        "--py-entry", metavar="MODULE:FUNCTION",
+        help="Scaffold a template atheris harness around this entry "
+             "point (simple case only: a target function taking one "
+             "bytes/str argument; the generated file is clearly "
+             "marked). Implies --orchestrator.")
+    ap.add_argument(
+        "--py-input", choices=["bytes", "text"], default="bytes",
+        help="Payload type the scaffolded harness feeds the entry "
+             "point (with --py-entry; default: bytes)")
+    ap.add_argument(
         "--no-verify-exploits",
         action="store_true",
         help="Skip the compile-verify step on LLM-emitted exploits "
@@ -401,6 +474,12 @@ Examples:
         from core.run.pin import set_process_project
         set_process_project(args.project)
     apply_cli_args(args, parser=ap)
+    # Project sandbox-floor consent: /fuzz executes target code, so
+    # it consumes the setting at run start like the trust markers;
+    # the per-run --sandbox-floor flag wins in both directions at
+    # floor resolution inside core.sandbox.
+    from core.project.trust import apply_project_sandbox_floor
+    apply_project_sandbox_floor(args)
 
     if args.export_seed_corpus:
         from packages.fuzzing.seed_corpus import prepare_builtin_seed_corpus
@@ -491,9 +570,16 @@ Examples:
     from core.run.pin import bootstrap_process_pin
     bootstrap_process_pin(out_dir)
 
+    # In-memory SMT seed manifest: set ONLY when THIS run synthesised
+    # witness seeds. The post-campaign crash attribution keys off this
+    # object — never off smt-seeds-manifest.json in the reused run
+    # dir, whose content any other occupant of the dir could have
+    # planted or swapped.
+    smt_seed_manifest: dict | None = None
     if args.from_smt_witness:
         from packages.fuzzing.smt_seed import (
             SEED_DIR_NAME,
+            ensure_real_seed_dir,
             synthesize_from_run_dir,
         )
         source_dir = Path(args.from_smt_witness)
@@ -501,8 +587,26 @@ Examples:
             logger.error("--from-smt-witness dir not found: %s", source_dir)
             sys.exit(1)
         seed_dir = out_dir / SEED_DIR_NAME
+        # Entry containment for EVERY smt-seeds touch on this flow
+        # (see ensure_real_seed_dir): the run dir is reused and was
+        # writable by the previous campaign's sandboxed target, so a
+        # plant at the predictable smt-seeds name must refuse before
+        # the FIRST write — the built-in corpus materialisation below
+        # writes into seed_dir too, and a planted symlink would
+        # redirect it (with the witness seeds, dictionary, and
+        # manifest) into an attacker-chosen directory that the
+        # campaign would then read its corpus back from.
+        seed_dir_refused = ensure_real_seed_dir(seed_dir)
+        if seed_dir_refused is not None:
+            from core.security.log_sanitisation import sanitise_for_terminal
+            logger.warning(
+                "planted object at %s (%s) — witness seeds, built-in "
+                "corpus, and dictionary merge are all skipped for this "
+                "run; remove the object to re-enable them",
+                sanitise_for_terminal(str(seed_dir)),
+                sanitise_for_terminal(seed_dir_refused, max_len=200))
         builtin_ok = False
-        if corpus_dir is None:
+        if corpus_dir is None and seed_dir_refused is None:
             # Baseline variety first, witness seeds on top, and the
             # combined directory becomes the run corpus. With an
             # operator --corpus we never mutate their directory —
@@ -515,17 +619,35 @@ Examples:
             except Exception as e:  # noqa: BLE001 — witness seeds alone still work
                 logger.warning("built-in corpus materialisation failed: %s", e)
         manifest = synthesize_from_run_dir(source_dir, out_dir)
+        smt_seed_manifest = manifest
         print(
             f"SMT witness seeds: {manifest['witnesses']} witnesses -> "
             f"{manifest['seed_count']} seeds, {manifest['dict_entries']} "
             f"dict entries, {len(manifest['skipped'])} skipped"
         )
         if manifest["seed_count"] == 0 and manifest["dict_entries"] == 0:
-            logger.warning(
-                "--from-smt-witness produced nothing usable from %s "
-                "(see %s/%s)", source_dir, seed_dir, "smt-seeds-manifest.json",
-            )
-        if corpus_dir is None and (builtin_ok or manifest["seed_count"]):
+            if manifest.get("seed_dir_refused"):
+                # No manifest file exists to point at — nothing was
+                # written under the planted name (see the warnings
+                # above for the refusal).
+                logger.warning(
+                    "--from-smt-witness produced nothing usable from "
+                    "%s (seed dir refused — see the planted-object "
+                    "warning above)", source_dir,
+                )
+            else:
+                logger.warning(
+                    "--from-smt-witness produced nothing usable from %s "
+                    "(see %s/%s)", source_dir, seed_dir, "smt-seeds-manifest.json",
+                )
+        if (
+            corpus_dir is None
+            and not manifest.get("seed_dir_refused")
+            and (builtin_ok or manifest["seed_count"])
+        ):
+            # Corpus read-back is gated on the same containment as the
+            # writes: when the seed-dir name is planted, the campaign
+            # must not read its corpus through it.
             corpus_dir = seed_dir
         if args.dict and manifest["dict_entries"]:
             logger.warning(
@@ -538,6 +660,16 @@ Examples:
     # ORCHESTRATOR PATH (new): capability detection + libFuzzer/AFL++ + telemetry
     # ========================================================================
     use_orchestrator = args.orchestrator
+    if args.engine or args.py_harness or args.py_entry or args.fuzz_target:
+        # Engine selection and the atheris / cargo-fuzz harness flags
+        # are orchestrator-path features; the legacy AFL++ path has no
+        # equivalents, so silently dropping them is never OK.
+        if args.legacy:
+            ap.error(
+                "--legacy cannot be combined with --engine / "
+                "--py-harness / --py-entry / --fuzz-target "
+                "(orchestrator-path flags)")
+        use_orchestrator = True
     if binary_path.is_dir() and not args.orchestrator:
         # Directory targets (source trees, crates, packages) only the
         # orchestrator can plan — the legacy path requires a binary
@@ -607,7 +739,13 @@ Examples:
             logger.warning("--no-env-build wins over --env-build "
                            "(negative flag precedence)")
         plan = orch.plan(binary_path, env_build=env_build_consent,
-                         run_dir=out_dir)
+                         run_dir=out_dir,
+                         engine=args.engine,
+                         py_harness=(Path(args.py_harness)
+                                     if args.py_harness else None),
+                         py_entry=args.py_entry,
+                         py_payload=args.py_input,
+                         fuzz_target=args.fuzz_target)
         print(plan.summary())
 
         if args.plan_only:
@@ -774,10 +912,7 @@ Examples:
         if best_strategy:
             logger.info("Found best strategy from memory: %s", best_strategy)
 
-        planner = FuzzingPlanner(
-            memory=memory,
-            sage_strategy_rows=sage_strategy_rows,
-        )
+        planner = FuzzingPlanner()
 
         # Generate autonomous corpus if no corpus provided
         if not corpus_dir:
@@ -909,7 +1044,7 @@ Examples:
                     binary_fingerprint=binary_hash,
                     strategy_id="default",
                     duration_s=args.duration,
-                    execs=0,
+                    execs=_campaign_execs(afl_runner),
                     unique_crashes=0,
                     hangs=0,
                     exploitable_crashes=0,
@@ -972,15 +1107,32 @@ Examples:
             # AFL mutation lineage (exact chains only — see
             # crash_attribution). Attribution failure is never fatal:
             # crashes record without a finding_id.
+            #
+            # Provenance comes from the IN-MEMORY manifest this run's
+            # own synthesis returned, and ONLY on a run that
+            # synthesised seeds. smt-seeds-manifest.json in the run
+            # dir is never read back here: on a run that never
+            # synthesised, a previous campaign's target could have
+            # planted a real seed dir + regular manifest naming
+            # predictable corpus seed names — its origin_id would ride
+            # the crash Witness into raptor-verified-outcomes as a
+            # fabricated finding confirmation; and even on a witness
+            # run, this campaign's sandboxed target could swap the
+            # file's content between the pre-campaign write and a
+            # post-campaign read. The disk manifest stays an audit
+            # artifact only.
             attribution = None
             try:
                 from packages.fuzzing.crash_attribution import (
-                    attribute_crashes,
-                    manifest_path_for_run,
+                    attribute_crashes_from_seeds,
                 )
-                smt_manifest = manifest_path_for_run(out_dir)
-                if smt_manifest.is_file():
-                    attribution = attribute_crashes(crashes, smt_manifest)
+                if (
+                    args.from_smt_witness
+                    and smt_seed_manifest is not None
+                    and not smt_seed_manifest.get("seed_dir_refused")
+                ):
+                    attribution = attribute_crashes_from_seeds(
+                        crashes, smt_seed_manifest.get("seeds"))
             except Exception as e:  # noqa: BLE001 — best-effort
                 logger.warning(
                     "SMT crash attribution failed: %s: %s", type(e).__name__, e
@@ -1051,7 +1203,6 @@ Examples:
             # Create dummy state for prioritization
             dummy_state = FuzzingState(
                 start_time=time.time(),
-                current_time=time.time(),
                 total_crashes=len(crashes),
                 unique_crashes=len(crashes),
             )
@@ -1131,21 +1282,23 @@ Examples:
 
                 # Update crash context with deep analysis
                 crash_context.vulnerability_type = deep_analysis.get('vulnerability_type', crash_context.crash_type)
-                if deep_analysis.get('exploitability') in ['high', 'medium']:
-                    crash_context.exploitability = 'exploitable'
-                else:
-                    crash_context.exploitability = 'not_exploitable'
+                verdict = _exploitability_from_deep_analysis(
+                    deep_analysis.get('exploitability'))
+                if verdict is not None:
+                    crash_context.exploitability = verdict
 
                 analysed += 1
 
-                # Record crash pattern in memory
-                if memory:
-                    is_exploitable = crash_context.exploitability == 'exploitable'
+                # Record crash pattern in memory — real verdicts
+                # only. An abstention recorded as exploitable=False
+                # became a durable cross-run "not exploitable" fact
+                # no model ever produced.
+                if memory and verdict is not None:
                     memory.record_crash_pattern(
                         signal=crash_context.signal,
                         function=crash_context.function_name or "unknown",
                         binary_hash=binary_hash,
-                        exploitable=is_exploitable
+                        exploitable=(verdict == 'exploitable')
                     )
             # Standard single-shot analysis
             elif llm_agent.analyse_crash(
@@ -1192,7 +1345,9 @@ Examples:
 
                             # If refined version is better, save it
                             if success and refined_code:
-                                refined_file = out_dir / "analysis" / "exploits" / f"{crash.crash_id}_exploit_validated.c"
+                                refined_file = refined_exploit_artifact_path(
+                                    out_dir / "analysis", crash.crash_id, validated=True
+                                )
                                 refined_file.write_text(refined_code, encoding="utf-8")
                                 logger.info("Validated exploit saved: %s", refined_file)
 
@@ -1206,7 +1361,9 @@ Examples:
                                     )
                             elif refined_code:
                                 # Refinement attempted but failed - save best attempt
-                                refined_file = out_dir / "analysis" / "exploits" / f"{crash.crash_id}_exploit_best_attempt.c"
+                                refined_file = refined_exploit_artifact_path(
+                                    out_dir / "analysis", crash.crash_id, validated=False
+                                )
                                 refined_file.write_text(refined_code, encoding="utf-8")
                                 logger.warning("Best attempt exploit saved: %s", refined_file)
 
@@ -1346,7 +1503,7 @@ Examples:
         binary_fingerprint=binary_hash,
         strategy_id="default",
         duration_s=args.duration,
-        execs=0,
+        execs=_campaign_execs(afl_runner),
         unique_crashes=num_crashes,
         hangs=0,
         exploitable_crashes=exploitable,

@@ -1,0 +1,107 @@
+{
+  "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Documents/CommitteeSpecifications/2.1.0/sarif-schema-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "semgrep-expanded",
+          "fullName": "Semgrep over fidelity-3 preprocessor-expanded views (macro-hidden sinks)",
+          "rules": [
+            {
+              "id": "c.buffer.overflow",
+              "name": "c.buffer.overflow",
+              "shortDescription": {
+                "text": "c.buffer.overflow"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "(unnamed)",
+              "name": "(unnamed)",
+              "shortDescription": {
+                "text": "(unnamed)"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            }
+          ]
+        }
+      },
+      "results": [
+        {
+          "ruleId": "c.buffer.overflow",
+          "level": "warning",
+          "message": {
+            "text": "macro-hidden memcpy overflow"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/a.c"
+                },
+                "region": {
+                  "startLine": 33
+                }
+              }
+            }
+          ],
+          "properties": {
+            "expanded_view": true,
+            "expanded_line": 210
+          }
+        },
+        {
+          "ruleId": "c.buffer.overflow",
+          "level": "warning",
+          "message": {
+            "text": "c.buffer.overflow matched (fidelity-3 expanded view)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/b.c"
+                },
+                "region": {
+                  "startLine": 4
+                }
+              }
+            }
+          ],
+          "properties": {
+            "expanded_view": true,
+            "expanded_line": 90
+          }
+        },
+        {
+          "ruleId": "(unnamed)",
+          "level": "warning",
+          "message": {
+            "text": "(unnamed) matched (fidelity-3 expanded view)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/c.c"
+                },
+                "region": {
+                  "startLine": 0
+                }
+              }
+            }
+          ],
+          "properties": {
+            "expanded_view": true,
+            "expanded_line": 0
+          }
+        }
+      ]
+    }
+  ]
+}

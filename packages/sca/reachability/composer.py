@@ -29,6 +29,8 @@ import re
 
 from ..models import Confidence, Reachability
 from ._shared import format_evidence as _format_evidence
+from ._shared import iter_matches_with_lines as _iter_matches_with_lines
+from ..parsers import _safe_read
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -43,8 +45,11 @@ _DEFAULT_MAX_DEPTH = 12
 _TEST_DIR_NAMES = {"tests", "test", "Tests", "Test", "spec"}
 
 # ``use Vendor\Class;`` / ``use function Vendor\fn;`` / ``use const ...``
+# Leading indent is HORIZONTAL-only ([^\S\n]): under MULTILINE the
+# ``^\s*`` spelling re-scans a run of blank lines from every line
+# start inside it — quadratic on attacker-supplied source files.
 _PHP_USE_RE = re.compile(
-    r"^\s*use\s+(?:function\s+|const\s+)?"
+    r"^[^\S\n]*use\s+(?:function\s+|const\s+)?"
     r"([A-Z][A-Za-z0-9_]*(?:\\[A-Za-z_][A-Za-z0-9_]*)*)",
     re.MULTILINE,
 )
@@ -62,11 +67,8 @@ def scan_imports(
     out: dict[str, list[tuple[Path, int, bool]]] = {}
     for php_file in _walk_php_sources(target, max_depth=max_depth):
         is_test = _is_test_file(php_file, target)
-        try:
-            text = php_file.read_text(encoding="utf-8", errors="replace")
-        except OSError as e:
-            logger.debug("sca.reachability.composer: skip %s (%s)",
-                          php_file, e)
+        text = _safe_read.read_bounded(php_file, follow_symlinks=False)
+        if text is None:
             continue
         for ns, line in _imports_in(text):
             out.setdefault(ns, []).append((php_file, line, is_test))
@@ -160,8 +162,11 @@ def resolve_dep(
 # ---------------------------------------------------------------------------
 
 def _imports_in(text: str) -> Iterable[tuple[str, int]]:
-    for m in _PHP_USE_RE.finditer(text):
-        yield m.group(1), text.count("\n", 0, m.start()) + 1
+    # Rolling-cursor line numbers — the naive full-prefix count is
+    # quadratic on dense-use files.
+    for m, line in _iter_matches_with_lines(
+            text, _PHP_USE_RE.finditer(text)):
+        yield m.group(1), line
 
 
 def _to_pascal(name: str) -> str:

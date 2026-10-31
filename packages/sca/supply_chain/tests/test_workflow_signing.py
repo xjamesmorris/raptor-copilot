@@ -40,6 +40,60 @@ _HAS_GIT = shutil.which("git") is not None
 _HAS_GPG = shutil.which("gpg") is not None
 
 
+def test_copilot_signature_probe_uses_private_writable_gpg_home(
+    tmp_path, monkeypatch,
+):
+    from packages.sca.supply_chain import workflow_signing
+
+    monkeypatch.setattr(
+        workflow_signing, "session_services_restricted", lambda: True,
+    )
+    observed = {}
+
+    def fake_git(cmd, *, env, **kwargs):
+        home = Path(env["GNUPGHOME"])
+        assert env["HOME"] == str(home)
+        assert home.is_dir()
+        assert home.stat().st_mode & 0o777 == 0o700
+        observed["home"] = home
+        return subprocess.CompletedProcess(
+            cmd, 0, "a" * 40 + "\x00E\x00Signer\x00nobody@example.test\x00signed\n", "",
+        )
+
+    monkeypatch.setattr(workflow_signing.subprocess, "run", fake_git)
+    rows = workflow_signing._git_log_signatures(
+        tmp_path, (".github/workflows",),
+    )
+
+    assert rows[0][1] == "E"
+    assert not observed["home"].exists()
+
+
+def _patch_safe_env_for_gnupghome(monkeypatch, gnupghome: str) -> None:
+    """Make ``RaptorConfig.get_safe_env()`` include GNUPGHOME.
+
+    The detector passes ``env=RaptorConfig.get_safe_env()`` to the
+    ``git log`` subprocess.  ``get_safe_env()`` uses a strict
+    allowlist that does not include GNUPGHOME (correctly — production
+    code must not let a scanned repo steer GPG to an attacker-
+    controlled keyring).  ``monkeypatch.setenv`` sets it in
+    ``os.environ`` but the allowlist filter still drops it, so the
+    test's throwaway keyring is invisible to the detector.
+
+    Wrap ``get_safe_env`` to inject GNUPGHOME into the returned dict
+    for the duration of the test.
+    """
+    from core.config import RaptorConfig
+    _orig = RaptorConfig.get_safe_env
+
+    def _patched(**kw):
+        env = _orig(**kw)
+        env["GNUPGHOME"] = gnupghome
+        return env
+
+    monkeypatch.setattr(RaptorConfig, "get_safe_env", staticmethod(_patched))
+
+
 def _git(target: Path, *args: str) -> None:
     r = subprocess.run(
         ["git", "-C", str(target), *args],
@@ -315,11 +369,12 @@ def test_anomaly_branch_flags_unsigned_minority(
     if gpg_signing_key is None:
         pytest.skip("gpg key generation failed in this environment")
     keyid, gnupghome = gpg_signing_key
-    # Production ``_git_log_signatures`` runs ``git log %G?`` with
-    # the inherited env, which by default doesn't know about the
-    # test fixture's keyring. Set GNUPGHOME for the duration of the
-    # test so signature verification has access to the test key.
+    # Production ``_git_log_signatures`` passes
+    # ``env=RaptorConfig.get_safe_env()`` which strips GNUPGHOME
+    # (correctly — production must not let a scanned repo steer GPG).
+    # Inject the test keyring into both os.environ AND get_safe_env.
     monkeypatch.setenv("GNUPGHOME", gnupghome)
+    _patch_safe_env_for_gnupghome(monkeypatch, gnupghome)
     _init_repo(tmp_path)
     # 7 signed.
     for i in range(7):
@@ -367,6 +422,7 @@ def test_mixed_norm_emits_only_summary(
         pytest.skip("gpg key generation failed in this environment")
     keyid, gnupghome = gpg_signing_key
     monkeypatch.setenv("GNUPGHOME", gnupghome)
+    _patch_safe_env_for_gnupghome(monkeypatch, gnupghome)
     _init_repo(tmp_path)
     for i in range(3):
         _commit_workflow_signed(
@@ -405,6 +461,7 @@ def test_all_signed_produces_no_findings(
         pytest.skip("gpg key generation failed in this environment")
     keyid, gnupghome = gpg_signing_key
     monkeypatch.setenv("GNUPGHOME", gnupghome)
+    _patch_safe_env_for_gnupghome(monkeypatch, gnupghome)
     _init_repo(tmp_path)
     for i in range(4):
         _commit_workflow_signed(
@@ -539,6 +596,7 @@ def test_anomaly_findings_cap_at_emit_limit(
     from packages.sca.supply_chain import workflow_signing as ws_mod
     keyid, gnupghome = gpg_signing_key
     monkeypatch.setenv("GNUPGHOME", gnupghome)
+    _patch_safe_env_for_gnupghome(monkeypatch, gnupghome)
     _init_repo(tmp_path)
     # 80 signed + 25 unsigned → 76% signing rate (above 70%).
     # 25 unsigned anomalies should cap at 20 emitted.

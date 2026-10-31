@@ -97,6 +97,12 @@ Task: oss-investigator-local-git-agent
            Targets: repos=<repo_urls>"
 
 [CONDITIONAL - only if vendor report URL in prompt]
+(first, run
+`libexec/raptor-fetch-anchor --ioc write <vendor-report-url>`, passing the
+operator-supplied URL exactly as one argv value. This securely replaces
+`.claude/run/oss-ioc-extractor.anchor` immediately before dispatch; never
+write that path directly, and do not dispatch the extractor if the helper
+refuses the URL or anchor path)
 Task: oss-investigator-ioc-extractor-agent
   Prompt: "Extract IOCs from vendor report for <research question>.
            Working directory: <workdir>

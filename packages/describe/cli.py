@@ -69,6 +69,19 @@ def describe_main(
         if raw_path.is_dir():
             target_path = raw_path
         else:
+            # Single-binary arm FIRST, keyed on format MAGIC (never
+            # extension): an ELF/PE/Mach-O file gets the binary
+            # facts block — extension-based archive handling must
+            # not swallow e.g. a PE that happens to end in .zip.
+            # The magic sets are NOT disjoint from every archive
+            # signature (a tar's first bytes are its first member
+            # NAME, which may start "MZ"), so the arm claims a
+            # magic-matched file only when its headers actually
+            # parse — a refusal on a recognised archive falls
+            # through to the extraction path below.
+            rc = _describe_binary(raw_path, json_output, stderr, stdout)
+            if rc is not None:
+                return rc
             resolved = _resolve_archive(raw_path, stderr)
             if resolved is None:
                 return 1
@@ -79,6 +92,11 @@ def describe_main(
         )
         report = build_describe_report(
             target_path, archive_label=archive_label,
+            # Full archive path: renderers point "start analysis" at
+            # the archive itself, because for a cache miss the
+            # extraction dir below is deleted in this function's
+            # ``finally`` before the operator can act on it.
+            archive_path=(raw_path if archive_label else None),
         )
         if json_output:
             stdout.write(format_json(report))
@@ -90,6 +108,70 @@ def describe_main(
     finally:
         if tmp_extract_root is not None:
             shutil.rmtree(tmp_extract_root, ignore_errors=True)
+
+
+def _describe_binary(
+    raw_path: Path, json_output: bool, stderr, stdout,
+) -> int | None:
+    """The single-binary target arm. Returns an exit code when the
+    file is a recognised binary (handled here, describe ends), or
+    ``None`` when it is not (the caller continues to the archive
+    path — pre-existing behavior untouched).
+
+    A file whose MAGIC matches but whose bytes the facts extractor
+    refuses (truncated / doctored image) is reported as an error
+    rather than falling through — UNLESS the file is a recognised
+    archive: a tar whose first member name begins "MZ" carries the
+    MZ bytes at offset 0 without being any kind of PE, and it must
+    keep its extraction path (the error here would hard-fail a
+    perfectly valid archive on a filename coincidence).
+    """
+    try:
+        from packages.describe.binary_target import (
+            build_binary_report,
+            format_binary_json,
+            format_binary_text,
+            is_binary_target,
+        )
+    except Exception:  # noqa: BLE001 — substrate optional, arm degrades
+        return None
+    if not is_binary_target(raw_path):
+        return None
+    report = build_binary_report(raw_path)
+    if report is None:
+        if _is_recognised_archive(raw_path):
+            return None       # magic collision — archive path serves it
+        # The path is operator-typed but may traverse target-
+        # controlled directory names — escape per the terminal
+        # display-integrity contract before it hits stderr.
+        from core.security.log_sanitisation import sanitise_for_terminal
+        stderr.write(
+            f"✗ target has a binary format magic but its headers "
+            f"do not parse (truncated or malformed image): "
+            f"{sanitise_for_terminal(str(raw_path))}\n"
+        )
+        return 1
+    if json_output:
+        stdout.write(format_binary_json(report))
+    else:
+        stdout.write(format_binary_text(report))
+    stdout.write("\n")
+    return 0
+
+
+def _is_recognised_archive(raw_path: Path) -> bool:
+    """Best-effort ``core.archive.is_archive`` probe for the binary
+    arm's fall-through decision. Unavailable substrate = not an
+    archive (the caller then reports the binary-arm error — with no
+    extractor there is no archive path to lose)."""
+    try:
+        from core.archive import is_archive
+    except Exception:  # noqa: BLE001 — substrate optional
+        return False
+    try:
+        return bool(is_archive(raw_path))
+    except Exception:  # noqa: BLE001 — probe must never raise past here
+        return False
 
 
 def _resolve_archive(
@@ -168,34 +250,68 @@ def _resolve_archive(
 def _find_cached_extraction(
     archive_path: Path, safe_cache_name_fn,
 ) -> Path | None:
-    """Return the cached extraction dir for ``archive_path``
-    under the active project's ``_sources/<name>-<sha>/``, or
-    None on no active project / no cache hit / snapshot
-    failure.
+    """Return a cached extraction dir for ``archive_path``, or None
+    on no cache hit / snapshot failure.
 
-    Mirrors ``raptor.py:_unpack_archive_target``'s cache
-    layout: ``<project_output_dir>/_sources/<safe-name>-<sha>``.
+    Mirrors ``raptor.py:_unpack_archive_target``'s cache layout —
+    ``<out_dir.parent>/_sources/<safe-name>-<sha>`` — which lands in
+    two places depending on how the producing run was placed:
+
+    * ``<project_output_dir>/_sources/`` for project runs (probed
+      when a project is active), and
+    * ``<out root>/_sources/`` for standalone runs (``out/`` under
+      the RAPTOR dir, or RAPTOR_OUT_DIR). Pre-fix only the project
+      location was probed, so with no active project — or when the
+      extraction was produced by a projectless run — the cache was
+      re-extracted every time despite the content-addressed hit
+      sitting on disk.
+
+    The dir name embeds the archive's sha256, so a hit from either
+    location is content-bound to exactly these archive bytes.
     """
     try:
+        from core.config import RaptorConfig
         from core.run.output import _resolve_active_project
         from core.run.provenance import archive_snapshot
     except Exception:  # noqa: BLE001
         return None
 
-    active = _resolve_active_project()
-    if active is None:
-        return None
-    project_output_dir = active[0]
-
     snap = archive_snapshot(archive_path)
     if snap is None:
         return None
-
     cache_name = safe_cache_name_fn(snap["archive_name"], snap["archive_sha256"])
-    candidate = Path(project_output_dir) / "_sources" / cache_name
-    if candidate.is_dir():
-        return candidate
+
+    roots: list = []
+    try:
+        active = _resolve_active_project()
+    except Exception:  # noqa: BLE001 — cache probe is best-effort
+        active = None
+    if active is not None:
+        roots.append(Path(active[0]))
+    try:
+        roots.append(RaptorConfig.get_out_dir())
+    except Exception:  # noqa: BLE001 — cache probe is best-effort
+        pass
+
+    for root in roots:
+        candidate = root / "_sources" / cache_name
+        try:
+            if candidate.is_dir():
+                return candidate
+        except OSError:
+            continue
     return None
+
+
+def resolve_archive_target(
+    raw_path: Path, stderr,
+) -> tuple[Path, Path | None, str] | None:
+    """Public seam over :func:`_resolve_archive` for other
+    read-only, create-time consumers (project create's target-type
+    detection): cache-or-tmp extraction + single-subdir descent,
+    returning ``(target_dir, tmp_root_to_cleanup_or_None, label)``
+    or None on failure. The caller owns ``tmp_root`` cleanup."""
+    return _resolve_archive(Path(raw_path), stderr)
 
 
 def _descend_single_subdir(root: Path) -> Path:
@@ -227,4 +343,4 @@ def _descend_single_subdir(root: Path) -> Path:
     return root
 
 
-__all__ = ["describe_main"]
+__all__ = ["describe_main", "resolve_archive_target"]

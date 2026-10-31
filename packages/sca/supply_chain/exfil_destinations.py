@@ -36,6 +36,8 @@ from core.json import load_json_bounded
 
 from ..discovery import EXCLUDED_DIR_NAMES
 from ..models import Confidence, Dependency, Manifest
+from ..parsers import _safe_read
+from ._source_exts import SOURCE_CODE_EXTS as _SOURCE_CODE_EXTS
 from ._closest_manifest import project_host_dep
 from ._closest_manifest import rel_to_target as _rel
 from typing import TYPE_CHECKING
@@ -54,11 +56,11 @@ _EXCLUDED_DIRS: set[str] = EXCLUDED_DIR_NAMES | {
     "site-packages",        # any virtualenv that snuck in
 }
 
-# Files we'll scan. Source + config. Exclude binary / archive types.
-_SCAN_EXTS: set[str] = {
-    ".py", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx",
-    ".sh", ".bash", ".zsh", ".rb", ".go", ".rs", ".java", ".kt",
-    ".json", ".yaml", ".yml", ".toml", ".xml", ".cfg", ".ini",
+# Files we'll scan: the shared source/config set (kept in
+# ``_source_exts`` so this walker and typosquat_domain can't drift
+# apart again) plus documentation formats — an exfil indicator in a
+# doc is still an indicator. Exclude binary / archive types.
+_SCAN_EXTS: set[str] = set(_SOURCE_CODE_EXTS) | {
     ".md", ".rst", ".txt", ".html",
 }
 
@@ -74,9 +76,13 @@ _DEFAULT_MAX_DEPTH = 12
 # host would evaluate the decoy name while the runtime connects to
 # the real destination. The group requires a literal ``@`` to consume
 # anything, so plain URLs are unaffected.
+# IGNORECASE: URL schemes are case-insensitive at runtime —
+# ``HTTPS://pastebin.com/x`` fetches exactly like the lowercase
+# spelling, so a cased scheme must not slip past the extractor.
 _URL_RE = re.compile(
     rb"\bhttps?://(?:[A-Za-z0-9._%+:\-]*@)?"
-    rb"(?P<host>[A-Za-z0-9.\-]+)(?::\d+)?(?P<rest>[^\s'\"<>`)\]]*)"
+    rb"(?P<host>[A-Za-z0-9.\-]+)(?::\d+)?(?P<rest>[^\s'\"<>`)\]]*)",
+    re.IGNORECASE,
 )
 
 
@@ -193,16 +199,9 @@ def _scan_file(
     path: Path, target: Path, manifests: list[Manifest],
     rules: list[_Rule],
 ) -> Iterable[ExfilFinding]:
-    try:
-        with path.open("rb") as fh:
-            data = fh.read(_MAX_BYTES_PER_FILE)
-    except OSError as e:
-        logger.debug(
-            "sca.supply_chain.exfil_destinations: read failed for %s: %s",
-            path, e,
-        )
-        return
+    data = _safe_read.read_head_bytes(path, max_bytes=_MAX_BYTES_PER_FILE)
     if not data:
+        # ``read_head_bytes`` already logged any underlying reason.
         return
     seen: set[tuple[str, str]] = set()         # (category, host) dedup per file
     # Line numbers via a rolling (last_pos, last_line) cursor — the
@@ -215,11 +214,10 @@ def _scan_file(
         last_pos = m.start()
         url_bytes = m.group(0)
         host_bytes = m.group("host") or b""
-        try:
-            url = url_bytes.decode("utf-8", errors="replace")
-            host = host_bytes.decode("utf-8", errors="replace").lower()
-        except UnicodeDecodeError:
-            continue
+        # errors="replace" cannot raise — no dead UnicodeDecodeError
+        # handler needed.
+        url = url_bytes.decode("utf-8", errors="replace")
+        host = host_bytes.decode("utf-8", errors="replace").lower()
         for rule in rules:
             if not _matches_rule(rule, url, host):
                 continue
@@ -311,11 +309,13 @@ def _walk_source_files(target: Path, *, max_depth: int) -> Iterable[Path]:
         if depth >= max_depth:
             dirnames[:] = []
         else:
-            dirnames[:] = [
+        # Sorted so evidence/walk order is filesystem-independent
+        # (parity with reachability._walker's determinism rule).
+            dirnames[:] = sorted(
                 d for d in dirnames
                 if d not in _EXCLUDED_DIRS and d not in TEST_DIR_NAMES
-            ]
-        for fn in filenames:
+            )
+        for fn in sorted(filenames):
             if Path(fn).suffix.lower() not in _SCAN_EXTS:
                 continue
             full = cur / fn

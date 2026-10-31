@@ -293,6 +293,74 @@ def test_trace_parser_matching_hash_reaches_frida_phase(tmp_path: Path) -> None:
     assert rc == 1
 
 
+def test_corpus_subcommand_accepts_flags() -> None:
+    args = _build_parser().parse_args([
+        "corpus",
+        "/tmp/samples",
+        "--family",
+        "*.sys",
+        "--max-samples",
+        "100",
+        "--max-bytes-per-sample",
+        "4096",
+        "--out",
+        "/tmp/out",
+    ])
+    assert args.samples_dir == "/tmp/samples"
+    assert args.family == "*.sys"
+    assert args.max_samples == 100
+    assert args.max_bytes_per_sample == 4096
+    assert args.out == "/tmp/out"
+
+
+def test_corpus_writes_profile_and_lifecycle(tmp_path: Path, capsys) -> None:
+    corpus = tmp_path / "samples"
+    corpus.mkdir()
+    for i in range(4):
+        (corpus / f"s{i}.dat").write_bytes(b"MAGX" + bytes([i]) * 40)
+    out = tmp_path / "out"
+
+    with (
+        patch("packages.binary_analysis.cli.start_run") as start_run,
+        patch("packages.binary_analysis.cli.complete_run") as complete_run,
+    ):
+        rc = main(["corpus", str(corpus), "--out", str(out)])
+
+    assert rc == 0
+    start_run.assert_called_once_with(out.resolve(), "understand", target=str(corpus.resolve()))
+    complete_run.assert_called_once_with(out.resolve())
+    payload = json.loads((out / "format-profile.json").read_text())
+    assert payload["summary"]["samples_profiled"] == 4
+    assert (out / "format-profile.md").is_file()
+    stdout = capsys.readouterr().out
+    assert "Mode: corpus" in stdout
+    assert "mechanical byte statistics" in stdout
+
+
+def test_corpus_rejects_missing_directory(tmp_path: Path) -> None:
+    rc = main(["corpus", str(tmp_path / "nope")])
+    assert rc == 2
+
+
+def test_corpus_summary_scrubs_hostile_family_keys(tmp_path: Path, capsys) -> None:
+    corpus = tmp_path / "samples"
+    corpus.mkdir()
+    # Attacker-chosen names ride into the family key (extension +
+    # template) — the terminal summary must render them inert.
+    for i in range(3):
+        (corpus / f"evil\x1b]0;pwn{i}\x07.b\x1bd").write_bytes(b"MAGY" + bytes([i]) * 30)
+    out = tmp_path / "out"
+    with (
+        patch("packages.binary_analysis.cli.start_run"),
+        patch("packages.binary_analysis.cli.complete_run"),
+    ):
+        rc = main(["corpus", str(corpus), "--out", str(out)])
+    assert rc == 0
+    stdout = capsys.readouterr().out
+    assert "\x1b" not in stdout
+    assert "\x07" not in stdout
+
+
 def test_wrapper_help_is_available() -> None:
     env = os.environ.copy()
     env["_RAPTOR_TRUSTED"] = "1"
@@ -318,6 +386,61 @@ def test_report_prefers_investigation_report(tmp_path: Path, capsys) -> None:
 
     assert _print_report(str(tmp_path)) == 0
     assert capsys.readouterr().out == "investigation report\n"
+
+
+def test_report_print_scrubs_terminal_escapes(tmp_path: Path, capsys) -> None:
+    # Last line of defence: even if a report artifact carries raw
+    # control bytes (older run, hand-edited file), the terminal print
+    # must escape them.
+    (tmp_path / "binary-analysis-report.md").write_text(
+        "before\x1b]0;pwn\x07after\n",
+    )
+    assert _print_report(str(tmp_path)) == 0
+    out = capsys.readouterr().out
+    assert "\x1b" not in out and "\x07" not in out
+    assert "before" in out and "after" in out
+    assert out.endswith("\n")
+
+
+def test_investigation_summary_scrubs_hostile_names_and_commands(capsys) -> None:
+    """Every summary field derived from the analysed binary — names AND
+    the priority-queue commands (which embed shlex.quote()d artifact
+    paths; quoting preserves control bytes) — must reach the terminal
+    scrubbed."""
+    from packages.binary_analysis.cli import _print_investigation_summary
+
+    investigation = {
+        "status": "static_only",
+        "summary": {
+            "surface_candidates": 1,
+            "candidate_flows": 0,
+            "ranked_ingress": 1,
+            "runtime_input_flows": 0,
+            "fuzz_witnesses": 0,
+            "discovered_artifacts": 0,
+        },
+        "ranked_surfaces": [{
+            "name": "parse\x1b[2Jbuf", "category": "parser",
+            "direct_callers": 2,
+        }],
+        "ranked_ingress": [{
+            "name": "recv\x1b]0;pwn\x07loop", "kind": "socket",
+            "boundary": "network\x1b[8m",
+        }],
+        "ranked_parser_boundaries": [{
+            "boundary_function_name": "read\x1bcfg",
+            "parser_surface_name": "parse\x07hdr",
+            "ingress_name": "recv\x1b[1mloop",
+            "path": {"depth": 2},
+        }],
+        "priority_queue": [{
+            "command": "raptor-binary fuzz 'evil\x1b]0;pwned\x07.bin'",
+        }],
+    }
+    _print_investigation_summary(investigation, Path("/nonexistent-out"))
+    out = capsys.readouterr().out
+    assert "\x1b" not in out and "\x07" not in out
+    assert "raptor-binary fuzz" in out
 
 
 def test_investigate_active_does_not_fuzz_whole_app_without_harness_boundary(tmp_path: Path) -> None:
@@ -422,3 +545,130 @@ def test_investigate_active_does_not_try_frida_against_driver_file(tmp_path: Pat
     active_phases = write_investigation.call_args.kwargs["active_phases"]
     assert active_phases[0]["kind"] == "runtime"
     assert active_phases[0]["status"] == "skipped"
+
+
+def test_print_file_json_lane_ascii_encodes_c1(tmp_path, capsys) -> None:
+    """--json artifact relay: bare JSON escapes C0 but passes C1
+    terminal controls (single-byte CSI/OSC) raw — the lane must
+    ASCII-encode while staying valid JSON."""
+    from packages.binary_analysis.cli import _print_file
+
+    hostile = "sym\x9b2J\x9d0;pwn\x1b]t\x07‮x"
+    (tmp_path / "graph.json").write_text(
+        json.dumps({"nodes": [{"name": hostile}]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    rc = _print_file(str(tmp_path), "graph.json", json_output=True)
+    assert rc == 0
+    out = capsys.readouterr().out
+    for raw in ("\x1b", "\x07", "\x9b", "\x9d", "‮"):
+        assert raw not in out
+    assert json.loads(out)["nodes"][0]["name"] == hostile  # intact
+
+
+class TestRunActivePhaseStreaming:
+    """_run_active_phase streams child output to the log files —
+    capture_output buffered an hour-long fuzz/frida child's whole
+    stdout+stderr in this process's memory before writing them."""
+
+    def test_output_streams_to_log_files(self, tmp_path):
+        from packages.binary_analysis.cli import _run_active_phase
+
+        phase = _run_active_phase(
+            kind="probe",
+            cmd=[sys.executable, "-c",
+                 "import sys; print('to-out'); print('to-err', file=sys.stderr)"],
+            output_dir=tmp_path / "phase",
+        )
+        assert phase["status"] == "completed"
+        assert "to-out" in Path(phase["stdout"]).read_text()
+        assert "to-err" in Path(phase["stderr"]).read_text()
+
+    def test_child_output_never_buffered_in_memory(self, tmp_path):
+        import packages.binary_analysis.cli as cli_mod
+        from packages.binary_analysis.cli import _run_active_phase
+
+        seen = {}
+        real_run = cli_mod.subprocess.run
+
+        def spying_run(cmd, **kwargs):
+            seen.update(kwargs)
+            return real_run(cmd, **kwargs)
+
+        with patch.object(cli_mod.subprocess, "run", spying_run):
+            _run_active_phase(
+                kind="probe",
+                cmd=[sys.executable, "-c", "print('x')"],
+                output_dir=tmp_path / "phase",
+            )
+        assert not seen.get("capture_output"), (
+            "child output must stream to the log files, not buffer "
+            "in memory")
+        assert hasattr(seen.get("stdout"), "write")
+        assert hasattr(seen.get("stderr"), "write")
+
+    def test_failure_appends_error_after_partial_output(self, tmp_path):
+        import packages.binary_analysis.cli as cli_mod
+        from packages.binary_analysis.cli import _run_active_phase
+
+        def exploding_run(cmd, **kwargs):
+            kwargs["stderr"].write("partial diagnostics\n")
+            raise subprocess.TimeoutExpired(cmd, 1)
+
+        with patch.object(cli_mod.subprocess, "run", exploding_run):
+            phase = _run_active_phase(
+                kind="probe",
+                cmd=["whatever"],
+                output_dir=tmp_path / "phase",
+            )
+        assert phase["status"] == "failed"
+        text = Path(phase["stderr"]).read_text()
+        assert "partial diagnostics" in text
+        assert "TimeoutExpired" in text
+
+    def test_failure_record_survives_hostile_log_shape(self, tmp_path, capsys):
+        """The failure-recording handler must not itself raise: a
+        hostile object occupying the predictable log names (planted
+        by a previous phase's sandboxed child in the shared output
+        dir) makes both the exclusive create and the hardened append
+        refuse with OSError. The refusal is correct — but it must be
+        noted and contained, not escape _run_active_phase and abort
+        the run: callers consume the returned record inline to keep
+        the static map useful."""
+        from packages.binary_analysis.cli import _run_active_phase
+
+        out_dir = tmp_path / "phase"
+        out_dir.mkdir()
+        (out_dir / "stdout.log").mkdir()  # directory: EISDIR on open
+        (out_dir / "stderr.log").mkdir()
+
+        phase = _run_active_phase(
+            kind="probe", cmd=["/bin/true"], output_dir=out_dir,
+        )
+
+        assert phase["status"] == "failed"
+        assert phase["kind"] == "probe"
+        assert "IsADirectoryError" in phase["error"]
+        assert "failure log not written" in capsys.readouterr().err
+
+    def test_failure_message_scrubs_target_influenced_bytes(self, tmp_path):
+        """Exception text echoes the child's argv/paths — a hostile
+        filename rides e.g. TimeoutExpired's message, so the appended
+        error line gets the terminal-grade scrub like every other exc
+        interpolation in this module."""
+        import packages.binary_analysis.cli as cli_mod
+
+        def exploding_run(cmd, **kwargs):
+            raise subprocess.TimeoutExpired(
+                ["fuzz", "/tmp/evil\x1b]0;pwn\x07.bin"], 1)
+
+        with patch.object(cli_mod.subprocess, "run", exploding_run):
+            phase = cli_mod._run_active_phase(
+                kind="probe",
+                cmd=["whatever"],
+                output_dir=tmp_path / "phase",
+            )
+        text = Path(phase["stderr"]).read_text()
+        assert "\x1b" not in text and "\x07" not in text
+        assert "\x1b" not in phase["error"]
+        assert "TimeoutExpired" in text

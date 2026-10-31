@@ -45,8 +45,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Iterable
 
-from ..models import Confidence, Dependency, Manifest, PinStyle
-from . import _hook_patterns
+from ..models import Confidence, Dependency, Manifest
+from ..parsers import _safe_read
+from . import _hook_patterns, _own_host
 
 logger = logging.getLogger(__name__)
 
@@ -85,8 +86,8 @@ def scan_manifests(
     HOOK-shaped risk lives in ``setup.py`` (still required for
     sdist + legacy compatibility on most packages today).
     """
+    del deps  # host is a pure function of the manifest (see below)
     out: list[PythonLifecycleFinding] = []
-    deps_list = list(deps)
     seen_dirs: set = set()
     for m in manifests:
         if m.ecosystem != "PyPI":
@@ -95,7 +96,16 @@ def scan_manifests(
         if manifest_dir in seen_dirs:
             continue
         seen_dirs.add(manifest_dir)
-        host = _host_dep(deps_list, m) or _placeholder_for_manifest(m)
+        # The hook is OWNED BY the package itself — anchor to the
+        # project's own name (pyproject.toml), never to whichever
+        # dep the parser happened to emit first: that mis-attributed
+        # the finding to an innocent third party and keyed the
+        # publish-helper worm-shape suppression on the wrong name.
+        host = _own_host.resolve_own_host(
+            m,
+            reason="placeholder for python-lifecycle-hook finding host",
+            placeholder_name="<setup.py>",
+        )
         out.extend(_scan_setup_py(manifest_dir, host))
     return out
 
@@ -106,13 +116,9 @@ def _scan_setup_py(
     setup_py = manifest_dir / "setup.py"
     if not setup_py.is_file():
         return []
-    try:
-        body = setup_py.read_text(encoding="utf-8", errors="replace")
-    except OSError as e:
-        logger.debug(
-            "sca.supply_chain.python_lifecycle_hooks: %s read failed: %s",
-            setup_py, e,
-        )
+    body = _safe_read.read_bounded(setup_py, follow_symlinks=False)
+    if body is None:
+        # ``read_bounded`` already logged the underlying reason.
         return []
     analysis = _hook_patterns.analyse_body(body)
     hit = PythonLifecycleHit(
@@ -122,10 +128,12 @@ def _scan_setup_py(
         reads_credentials=analysis.reads_credentials,
         has_publish_action=analysis.has_publish_action,
     )
+    worm_conjunction = (
+        analysis.reads_credentials and analysis.has_publish_action
+    )
     worm_shape = (
-        analysis.reads_credentials
-        and analysis.has_publish_action
-        and not _hook_patterns.is_publish_helper(host)
+        worm_conjunction
+        and not _hook_patterns.is_attested_publish_helper(host)
     )
     if analysis.reasons:
         return [PythonLifecycleFinding(
@@ -150,37 +158,29 @@ def _scan_setup_py(
                 ),
             ),
         )]
+    if worm_conjunction:
+        # Worm conjunction fired but the host is an ATTESTED publish
+        # helper — suppress the HIGH promotion, but keep a
+        # low-severity row (parity with the npm adapter's
+        # fall-through) so the HOOK family survives for the composite
+        # chokepoint and the suppression stays operator-visible.
+        return [PythonLifecycleFinding(
+            dependency=host,
+            hit=hit,
+            severity="low",
+            confidence=Confidence(
+                "medium",
+                reason=(
+                    "setup.py reads credentials and invokes a publish "
+                    "action, but the package is an attested publish "
+                    "helper — worm-shape promotion suppressed"
+                ),
+            ),
+        )]
     # FP-tightening: ``setup.py`` is the default state for legacy
     # Python packages; emitting on mere presence floods reports.
     # Only the pattern-hit and worm-shape branches earn a finding.
     return []
-
-
-def _host_dep(
-    deps: list[Dependency], manifest: Manifest,
-) -> Dependency | None:
-    for d in deps:
-        if d.declared_in == manifest.path:
-            return d
-    return None
-
-
-def _placeholder_for_manifest(manifest: Manifest) -> Dependency:
-    return Dependency(
-        ecosystem=manifest.ecosystem,
-        name="<setup.py>",
-        version=None,
-        declared_in=manifest.path,
-        scope="main",
-        is_lockfile=False,
-        pin_style=PinStyle.UNKNOWN,
-        direct=True,
-        purl="",
-        parser_confidence=Confidence(
-            "low",
-            reason="placeholder for python-lifecycle-hook finding host",
-        ),
-    )
 
 
 __all__ = [

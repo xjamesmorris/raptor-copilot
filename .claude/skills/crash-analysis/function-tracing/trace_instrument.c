@@ -25,7 +25,11 @@ static void make_thread_key(void) {
     pthread_key_create(&thread_key, NULL);
 }
 
-static pid_t gettid(void) {
+// glibc >= 2.30 declares gettid() in unistd.h under _GNU_SOURCE, so a
+// static function named gettid fails to compile there. Keep a private
+// syscall wrapper instead: it builds on both older glibc (no gettid
+// declaration at all) and newer glibc (no name collision).
+static pid_t trace_gettid(void) {
     return syscall(SYS_gettid);
 }
 
@@ -35,7 +39,12 @@ static thread_state_t* get_thread_state(void) {
     thread_state_t *state = pthread_getspecific(thread_key);
     if (!state) {
         state = calloc(1, sizeof(thread_state_t));
-        state->tid = gettid();
+        if (!state) {
+            /* OOM: instrumentation must degrade to no-op, never
+             * crash the traced program with its own NULL deref. */
+            return NULL;
+        }
+        state->tid = trace_gettid();
         
         char filename[256];
         snprintf(filename, sizeof(filename), "trace_%d.log", state->tid);

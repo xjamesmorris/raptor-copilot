@@ -42,9 +42,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from core.json import dumps_display
+if TYPE_CHECKING:
+    from packages.fuzzing.harness_census import FuzzHarnessCensus
+
+import json
+from core.security.log_sanitisation import sanitise_for_terminal
 from packages.describe.recommendations import recommend_next
 from packages.describe.target_shape import TargetShape, infer_target_shape
 from packages.describe.tool_readiness import ToolCheck, check_tool_readiness
@@ -77,11 +81,25 @@ class DescribeReport:
     # tarball/zip (extracted on the fly into a temp dir before
     # inference). None when the target was a plain directory.
     archive_label: str | None = None
+    # Full path of that original archive. The renderers use it for
+    # the "to start analysis" pointer: for a cache-miss archive the
+    # ``target_shape.target_path`` extraction dir is DELETED by the
+    # CLI right after rendering, so a command referencing it would
+    # point at a path that no longer exists — analysis commands
+    # accept the archive itself.
+    archive_path: Path | None = None
+    # Shipped fuzz harnesses (packages.fuzzing.harness_census) —
+    # detection only, same read-only posture as the rest of
+    # /describe (no target code executed, no toolchain probes).
+    # None when the census found nothing OR its substrate failed:
+    # either way the renderers omit the section (no noise).
+    fuzz_census: FuzzHarnessCensus | None = None
 
 
 def build_describe_report(
     target_path: Path,
     archive_label: str | None = None,
+    archive_path: Path | None = None,
 ) -> DescribeReport:
     """Compose the substrates: target shape (#17 catalog +
     language/build detectors), tool readiness, catalog
@@ -89,19 +107,40 @@ def build_describe_report(
 
     ``archive_label`` is the original archive basename when the
     caller extracted an archive to ``target_path`` before
-    calling here. None for plain-directory targets.
+    calling here; ``archive_path`` its full path. None for
+    plain-directory targets.
     """
     shape = infer_target_shape(target_path)
     checks = check_tool_readiness(shape)
     preview = _target_type_defaults(shape)
     estimate = _scorecard_estimate(target_path)
+    census = _fuzz_harness_census(target_path)
     return DescribeReport(
         target_shape=shape,
         tool_checks=checks,
         target_type_defaults=preview,
         estimate_summary=estimate,
         archive_label=archive_label,
+        archive_path=archive_path,
+        fuzz_census=census,
     )
+
+
+def _fuzz_harness_census(target_path: Path) -> FuzzHarnessCensus | None:
+    """Shipped-harness census, or None when empty / substrate failed.
+
+    The census keeps /describe's read-only posture: one bounded
+    static sweep, no target code executed, no subprocess spawns
+    (packages/fuzzing/harness_census.py pins this). Best-effort like
+    every other /describe sub-detector — a census failure never
+    fails the report.
+    """
+    try:
+        from packages.fuzzing.harness_census import census_fuzz_harnesses
+        census = census_fuzz_harnesses(target_path)
+    except Exception:  # noqa: BLE001
+        return None
+    return census if census.engines else None
 
 
 def _scorecard_estimate(target_path: Path) -> str | None:
@@ -191,7 +230,13 @@ def format_text(report: DescribeReport) -> str:
     # rest of the block describes the extracted tree (not a
     # mystery binary blob).
     if report.archive_label:
-        lines.append(f"  Source: archive {report.archive_label}")
+        # Archive basename is attacker-influenceable (a downloaded
+        # tarball ships whatever name its publisher chose) — escape
+        # before it lands on the operator's terminal.
+        lines.append(
+            "  Source: archive "
+            f"{sanitise_for_terminal(report.archive_label, max_len=120)}"
+        )
 
     # Languages — "C++ (95%, 47k LOC), Python (5%, 2k LOC)".
     # File-share % alone over-represents languages with many
@@ -257,7 +302,12 @@ def format_text(report: DescribeReport) -> str:
         if s.license.classification == "missing":
             lines.append("  License: none detected")
         elif s.license.spdx_id:
-            line = f"  License: {s.license.spdx_id}"
+            # License file names are matched by fnmatch globs whose *
+            # accepts ANY bytes — a hostile repo can ship
+            # "LICENSE-<ESC...>" and its raw name would land on the
+            # operator's terminal. spdx_id/source_file are
+            # target-derived too; escape each.
+            line = f"  License: {sanitise_for_terminal(s.license.spdx_id, max_len=64)}"
             # Surface additional license files when present —
             # dual-licensed projects (libgcrypt: COPYING +
             # COPYING.LIB; NetworkManager: COPYING +
@@ -273,7 +323,9 @@ def format_text(report: DescribeReport) -> str:
                     if len(names) > 3 else ""
                 )
                 line += (
-                    f"  (also: {', '.join(shown)}{suffix})"
+                    "  (also: "
+                    f"{sanitise_for_terminal(', '.join(shown), max_len=200)}"
+                    f"{suffix})"
                 )
             lines.append(line)
         elif s.license.source_file:
@@ -284,7 +336,8 @@ def format_text(report: DescribeReport) -> str:
             # actual MPL text). Be explicit so the operator
             # doesn't read "License: unknown" as "no license".
             lines.append(
-                f"  License: present in {s.license.source_file} "
+                "  License: present in "
+                f"{sanitise_for_terminal(str(s.license.source_file), max_len=120)} "
                 f"(couldn't classify — check manually)"
             )
         else:
@@ -316,7 +369,11 @@ def format_text(report: DescribeReport) -> str:
         else:
             parts = []
             if s.git.branch:
-                parts.append(s.git.branch)
+                # Branch names are target-controlled. git's ref-format
+                # rules block C0 controls, but bidi overrides (U+202E
+                # etc.) are legal in ref names — and a handcrafted
+                # hostile .git needn't play by the rules at all.
+                parts.append(sanitise_for_terminal(s.git.branch, max_len=64))
             parts.append(f"@ {s.git.commit_short}")
             tail = []
             if s.git.dirty is True:
@@ -364,6 +421,36 @@ def format_text(report: DescribeReport) -> str:
         cmd_w = max(len(r.command) for r in recs)
         lines.extend(f"  {r.command:<{cmd_w}}  — {r.reason}" for r in recs)
 
+    # Shipped fuzz harnesses — per-engine counts + one ready-to-run
+    # /fuzz pointer each. Omitted entirely when the census is empty
+    # (no noise). Example target names are target-derived: already
+    # charset-vetted by the census, and escaped again here per the
+    # escape-at-render convention (engine names + hints are
+    # operator-authored constants; the substituted path is escaped).
+    if report.fuzz_census is not None and report.fuzz_census.engines:
+        census = report.fuzz_census
+        total = census.total_harnesses
+        partial = " (counts partial)" if census.truncated else ""
+        lines.append("")
+        lines.append(
+            f"Fuzz harnesses shipped ({total}){partial}:"
+        )
+        for eng in census.engines:
+            head = f"  {eng.engine}: {eng.count}"
+            if eng.examples:
+                eng_names = ", ".join(
+                    sanitise_for_terminal(n, max_len=64)
+                    for n in eng.examples
+                )
+                more = eng.count - len(eng.examples)
+                suffix = f", +{more} more" if more > 0 else ""
+                head += f" ({eng_names}{suffix})"
+            lines.append(head)
+            lines.append(
+                "      "
+                f"{sanitise_for_terminal(eng.invocation_hint, max_len=300)}"
+            )
+
     # Tool applicability — target-level signals only. Host-level
     # checks (binary presence, LLM keys, env) live in /doctor.
     # Header says ``checks`` not ``gaps`` because the section
@@ -395,12 +482,23 @@ def format_text(report: DescribeReport) -> str:
     # ``--repo`` value substituted with the resolved target path
     # so operators can copy the line directly (rather than the
     # pre-fix ``<target>`` placeholder which forced them to
-    # substitute by hand).
+    # substitute by hand). For archive targets, point at the
+    # archive itself (analysis commands extract archives
+    # themselves): a cache-miss extraction dir is deleted the
+    # moment the report is printed, so a command naming it would
+    # fail with "path does not exist".
+    analysis_target = report.archive_path or s.target_path
     lines.append("")
     lines.append("For host-level setup, run `raptor doctor`.")
+    # The target path is target-derived, not just operator-typed: an
+    # archive's single top-level dir (which /describe descends into)
+    # is named by the archive author, so raw ESC/bidi could land on
+    # the operator's terminal here. Same escape the license section
+    # applies above.
     lines.append(
         f"To start analysis, run `raptor.py agentic --repo "
-        f"{s.target_path}` (runs sandboxed)."
+        f"{sanitise_for_terminal(str(analysis_target), max_len=256)}` "
+        f"(runs sandboxed)."
     )
 
     return "\n".join(lines)
@@ -464,7 +562,18 @@ def format_json(report: DescribeReport) -> str:
             }
         ),
         "estimate_summary": report.estimate_summary,
+        # Shipped fuzz harnesses (census shape mirrors
+        # FuzzHarnessCensus.to_dict). None when the census found
+        # nothing / failed — same omission rule as the text render.
+        "fuzz_harnesses": (
+            None if report.fuzz_census is None
+            else report.fuzz_census.to_dict()
+        ),
         "archive_label": report.archive_label,
+        "archive_path": (
+            str(report.archive_path)
+            if report.archive_path is not None else None
+        ),
         # Signal-based recommendations — sibling to the catalog's
         # static "pipeline_names" (in target_type_defaults) but
         # derived from THIS tree's detected signals. RAPTOR
@@ -475,7 +584,11 @@ def format_json(report: DescribeReport) -> str:
             for r in recommend_next(s)
         ],
     }
-    return dumps_display(doc, indent=2)
+    # ensure_ascii: JSON escapes C0 but passes C1 terminal controls
+    # raw when off — dumps_display is exactly that, and this string
+    # is printed to the operator terminal by the --json lane with
+    # target-derived names inside. Still valid JSON.
+    return json.dumps(doc, indent=2, ensure_ascii=True, default=str)
 
 
 # Shared with the start-line renderer — one implementation so the two

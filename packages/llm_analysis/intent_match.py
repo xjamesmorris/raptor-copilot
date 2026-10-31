@@ -195,14 +195,26 @@ def _cwe_command_injection_shape(exploit_code: str) -> bool:
         return False
     # Shell metachars in single/double-quoted literals.
     if re.search(
-        r"""['"][^'"]*[;&|][^'"]*['"]""", exploit_code,
+        # The first span excludes the metachars (anchors on the FIRST
+        # one — same quoted strings flagged, identical spans): with
+        # them inside it, a metachar storm between quotes made every
+        # split explorable, quadratic in the payload.
+        r"""['"][^'";&|]*[;&|][^'"]*['"]""", exploit_code,
     ):
         # Filter false positives: bitwise / boolean ops in strings of
         # *non-shell* code (Python boolean strings, etc.) are rare;
         # the pattern is already narrow enough.
         return True
     # `$()` subshell or backticks inside string literals.
-    return bool(re.search(r"""['"][^'"]*(?:\$\([^)]+\)|`[^`]+`)[^'"]*['"]""", exploit_code))
+    # Subshell/backtick interiors are bounded: unbounded, a crafted
+    # payload that repeats `"$(` re-scans the rest of the code from
+    # every occurrence — quadratic. Real subshell bodies sit well
+    # inside the bound (the caller only tests
+    # whether a match exists at all).
+    return bool(re.search(
+        r"""['"][^'"]*(?:\$\([^)]{1,2000}\)|`[^`]{1,2000}`)[^'"]*['"]""",
+        exploit_code,
+    ))
 
 
 def _cwe_sql_injection_shape(exploit_code: str) -> bool:
@@ -228,7 +240,10 @@ def _cwe_xss_shape(exploit_code: str) -> bool:
         r"<\s*script\b",
         r"\bon\w+\s*=\s*['\"]",  # onerror=, onclick=, etc.
         r"\bjavascript\s*:",
-        r"<\s*img\b[^>]*\bonerror\b",
+        # Attribute span bounded: planted "<img" openers inside an
+        # unbounded [^>] span re-scan the rest of the payload per
+        # opener; real attribute lists sit far inside 500 chars.
+        r"<\s*img\b[^>]{0,500}\bonerror\b",
     ]
     return any(
         re.search(p, exploit_code, re.IGNORECASE) for p in patterns
@@ -529,7 +544,7 @@ def _parse_judge_response(content: str) -> tuple[str, str]:
     """
     if not content:
         return VERDICT_UNCERTAIN, "empty LLM response"
-    first_line = content.strip().split("\n", 1)[0].strip()
+    first_line = content.strip().split("\n", 1)[0].strip()  # line-model: LLM response verdict line; strip()-normalised
     if ":" in first_line:
         verdict_word, _, reason = first_line.partition(":")
         verdict_word = verdict_word.strip().lower()

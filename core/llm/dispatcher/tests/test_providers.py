@@ -27,20 +27,22 @@ def all_providers_creds():
         "anthropic": "anthropic-real-NOT-LEAKED",
         "openai":    "sk-openai-real-NOT-LEAKED",
         "gemini":    "AIza-gemini-real-NOT-LEAKED",
-        # Phase C-β aggregators + ecosystem providers. Distinct
-        # values so a header-injection bug that swaps providers
-        # (e.g. mistral key landing on groq path) shows up
-        # immediately in the upstream-captured headers.
-        "mistral":     "mistral-real-NOT-LEAKED",
+        # Aggregators — distinct values so a header-injection bug that
+        # swaps providers shows up immediately in the upstream-captured
+        # headers.
+        "apiroute": "apiroute-real-NOT-LEAKED",
+        "cheaperinference": "ci-cheaperinference-real-NOT-LEAKED",
+        "cohere":      "cohere-real-NOT-LEAKED",
+        "deepinfra":   "deepinfra-real-NOT-LEAKED",
+        "fireworks":   "fw-fireworks-real-NOT-LEAKED",
         "groq":        "gsk-groq-real-NOT-LEAKED",
-        "together":    "together-real-NOT-LEAKED",
+        "mistral":     "mistral-real-NOT-LEAKED",
         "openrouter":  "sk-or-real-NOT-LEAKED",
         "orcarouter":  "sk-orca-real-NOT-LEAKED",
-        "fireworks":   "fw-fireworks-real-NOT-LEAKED",
-        "deepinfra":   "deepinfra-real-NOT-LEAKED",
         "perplexity":  "pplx-perplexity-real-NOT-LEAKED",
-        "cohere":      "cohere-real-NOT-LEAKED",
         "replicate":   "r8-replicate-real-NOT-LEAKED",
+        "together":    "together-real-NOT-LEAKED",
+        # Cloud gateways
         "azure_openai":          "azure-real-NOT-LEAKED",
         "azure_openai_endpoint": "https://example-azure.invalid",
     }
@@ -112,6 +114,7 @@ def _post_via_dispatcher(d: LLMDispatcher, token: str, path: str, body: bytes,
         })
 
 
+@pytest.mark.upstream_forward
 class TestAnthropicProvider:
 
     def test_x_api_key_injected_dummy_stripped(self, all_providers_creds, tmp_path):
@@ -136,7 +139,36 @@ class TestAnthropicProvider:
             upstream.shutdown()
             d.shutdown()
 
+    def test_caller_anthropic_version_honoured(
+        self, all_providers_creds, tmp_path,
+    ):
+        """Claude Code negotiates anthropic-version per request; the
+        static rule's injected default must not clobber a
+        worker-supplied value (the Bedrock leg already honours it —
+        sibling parity). The credential header still always wins."""
+        upstream = _CaptiveUpstream()
+        d = _setup_with_provider_redirected(
+            all_providers_creds, tmp_path, "anthropic", upstream.base_url,
+        )
+        try:
+            _, fd = d.allocate_worker(label="anthropic-version-test")
+            token = os.read(fd, 64).decode().strip()
+            os.close(fd)
+            _post_via_dispatcher(
+                d, token, "http://_/anthropic/v1/messages",
+                b'{"x":1}',
+                {"x-api-key": "dummy-stripped-please",
+                 "anthropic-version": "2024-10-22"},
+            )
+            sent = {k.lower(): v for k, v in upstream.captured["headers"].items()}
+            assert sent.get("anthropic-version") == "2024-10-22"
+            assert sent.get("x-api-key") == "anthropic-real-NOT-LEAKED"
+        finally:
+            upstream.shutdown()
+            d.shutdown()
 
+
+@pytest.mark.upstream_forward
 class TestOpenAIProvider:
 
     def test_authorization_bearer_injected(self, all_providers_creds, tmp_path):
@@ -164,6 +196,7 @@ class TestOpenAIProvider:
             d.shutdown()
 
 
+@pytest.mark.upstream_forward
 class TestGeminiProvider:
 
     def test_x_goog_api_key_injected_dummy_stripped(self, all_providers_creds, tmp_path):
@@ -252,20 +285,23 @@ class TestUnknownProviderPath:
 # ``Authorization: Bearer <key>``. Parameterised so a future provider
 # with the same shape adds one row, not a whole new class.
 _BEARER_PROVIDERS = [
-    # (provider name, path tail, expected creds key, dummy header)
-    ("mistral",    "v1/chat/completions",    "mistral-real-NOT-LEAKED"),
+    # (provider name, path tail, expected key)
+    ("apiroute", "v1/chat/completions", "apiroute-real-NOT-LEAKED"),
+    ("cheaperinference", "v1/chat/completions", "ci-cheaperinference-real-NOT-LEAKED"),
+    ("cohere",     "v1/chat",                "cohere-real-NOT-LEAKED"),
+    ("deepinfra",  "v1/openai/chat/completions", "deepinfra-real-NOT-LEAKED"),
+    ("fireworks",  "inference/v1/chat/completions", "fw-fireworks-real-NOT-LEAKED"),
     ("groq",       "openai/v1/chat/completions", "gsk-groq-real-NOT-LEAKED"),
-    ("together",   "v1/chat/completions",    "together-real-NOT-LEAKED"),
+    ("mistral",    "v1/chat/completions",    "mistral-real-NOT-LEAKED"),
     ("openrouter", "api/v1/chat/completions", "sk-or-real-NOT-LEAKED"),
     ("orcarouter", "v1/chat/completions", "sk-orca-real-NOT-LEAKED"),
-    ("fireworks",  "inference/v1/chat/completions", "fw-fireworks-real-NOT-LEAKED"),
-    ("deepinfra",  "v1/openai/chat/completions", "deepinfra-real-NOT-LEAKED"),
     ("perplexity", "chat/completions",       "pplx-perplexity-real-NOT-LEAKED"),
-    ("cohere",     "v1/chat",                "cohere-real-NOT-LEAKED"),
+    ("together",   "v1/chat/completions",    "together-real-NOT-LEAKED"),
 ]
 
 
 @pytest.mark.parametrize("provider,path_tail,expected_key", _BEARER_PROVIDERS)
+@pytest.mark.upstream_forward
 def test_bearer_provider_authorization_injected(
     all_providers_creds, tmp_path, provider, path_tail, expected_key,
 ):
@@ -298,6 +334,7 @@ def test_bearer_provider_authorization_injected(
         d.shutdown()
 
 
+@pytest.mark.upstream_forward
 class TestReplicateProvider:
 
     def test_token_prefix_injected_dummy_stripped(
@@ -330,6 +367,7 @@ class TestReplicateProvider:
             d.shutdown()
 
 
+@pytest.mark.upstream_forward
 class TestAzureOpenAIProvider:
 
     def test_api_key_header_injected_dummy_stripped(
@@ -382,38 +420,53 @@ class TestAzureOpenAIWithoutEndpoint:
         )
 
 
+def _keyless_store() -> CredentialStore:
+    creds = CredentialStore.__new__(CredentialStore)
+    creds._keys = {}
+    return creds
+
+
+def _rule_names() -> list[str]:
+    from core.llm.dispatcher.auth import build_rules
+    return sorted(build_rules(_keyless_store()))
+
+
+class TestRuleTableParity:
+    """The path-prefix routing map (server.py) and the auth rules
+    table (auth.py:build_rules) are hand-maintained in different
+    modules. Both drift directions fail closed (404 unknown path /
+    503 unconfigured), so drift is silent availability loss — and a
+    provider added to both tables used to get zero 503 coverage
+    because the 503 test was a third hand-typed list. One parity pin
+    closes the pair; the 503 test below derives from the rules table."""
+
+    def test_prefix_map_matches_rules_table(self):
+        from core.llm.dispatcher.server import _PROVIDER_FROM_PATH_PREFIX
+        assert set(_PROVIDER_FROM_PATH_PREFIX.values()) == set(_rule_names())
+        for prefix, name in _PROVIDER_FROM_PATH_PREFIX.items():
+            assert prefix == f"/{name}/", (
+                f"prefix {prefix!r} does not follow the /<provider>/ "
+                f"shape for {name!r}"
+            )
+
+
 class TestNewProvidersUnconfiguredKeyReturns503:
-    """Every aggregator must surface a clean 503 when its key is
-    unset — same UX as the original three. Pinned per provider so
-    a future build_rules edit that drops a 503 path gets caught."""
+    """Every provider must surface a clean 503 when its key is unset.
+    Parametrised over the rules table itself so a provider added to
+    production gets this pin automatically. Bedrock is excluded: its
+    unconfigured path (botocore/AWS-credential resolution) has its own
+    dedicated tests."""
 
     @pytest.mark.parametrize(
-        "provider,path",
-        [
-            ("mistral",      "/mistral/v1/chat/completions"),
-            ("groq",         "/groq/openai/v1/chat/completions"),
-            ("together",     "/together/v1/chat/completions"),
-            ("openrouter",   "/openrouter/api/v1/chat/completions"),
-            ("orcarouter",   "/orcarouter/v1/chat/completions"),
-            ("fireworks",    "/fireworks/inference/v1/chat/completions"),
-            ("deepinfra",    "/deepinfra/v1/openai/chat/completions"),
-            ("perplexity",   "/perplexity/chat/completions"),
-            ("cohere",       "/cohere/v1/chat"),
-            ("replicate",    "/replicate/v1/predictions"),
-            ("azure_openai", "/azure_openai/openai/deployments/x/chat/completions"),
-        ],
+        "provider",
+        [n for n in _rule_names() if n != "bedrock"],
     )
-    def test_unconfigured_provider_returns_503(self, tmp_path, provider, path):
-        creds = CredentialStore.__new__(CredentialStore)
-        # All keys absent — every provider should 503.
-        creds._keys = {p: None for p in [
-            "anthropic", "openai", "gemini",
-            "mistral", "groq", "together", "openrouter",
-            "orcarouter",
-            "fireworks", "deepinfra", "perplexity",
-            "cohere", "replicate",
-            "azure_openai", "azure_openai_endpoint",
-        ]}
+    def test_unconfigured_provider_returns_503(self, tmp_path, provider):
+        # Any path under the provider prefix routes to the rule; the
+        # 503 fires on the configured-check before the path suffix is
+        # ever consulted.
+        path = f"/{provider}/v1/chat/completions"
+        creds = _keyless_store()
         d = LLMDispatcher(
             run_id=f"unconf-{provider}", creds=creds,
             audit_path=tmp_path / "audit.jsonl",
@@ -442,16 +495,18 @@ class TestCredentialStoreReadsAggregatorEnvs:
 
     def test_all_new_keys_read_and_kept_in_env(self, monkeypatch):
         env_to_set = {
-            "MISTRAL_API_KEY":    "mistral-test",
+            "API_ROUTE_API_KEY": "apiroute-test",
+            "CHEAPER_INFERENCE_API_KEY": "cheaperinference-test",
+            "COHERE_API_KEY":     "cohere-test",
+            "DEEPINFRA_API_KEY":  "deepinfra-test",
+            "FIREWORKS_API_KEY":  "fireworks-test",
             "GROQ_API_KEY":       "groq-test",
-            "TOGETHER_API_KEY":   "together-test",
+            "MISTRAL_API_KEY":    "mistral-test",
             "OPENROUTER_API_KEY": "openrouter-test",
             "ORCAROUTER_API_KEY": "orcarouter-test",
-            "FIREWORKS_API_KEY":  "fireworks-test",
-            "DEEPINFRA_API_KEY":  "deepinfra-test",
             "PERPLEXITY_API_KEY": "perplexity-test",
-            "COHERE_API_KEY":     "cohere-test",
             "REPLICATE_API_TOKEN": "replicate-test",
+            "TOGETHER_API_KEY":   "together-test",
             "AZURE_OPENAI_API_KEY": "azure-test",
             "AZURE_OPENAI_ENDPOINT": "https://example-azure.invalid",
         }
@@ -459,16 +514,18 @@ class TestCredentialStoreReadsAggregatorEnvs:
             monkeypatch.setenv(k, v)
         creds = CredentialStore()
         # Each key landed in the store under the expected name.
-        assert creds.get("mistral") == "mistral-test"
+        assert creds.get("apiroute") == "apiroute-test"
+        assert creds.get("cheaperinference") == "cheaperinference-test"
+        assert creds.get("cohere") == "cohere-test"
+        assert creds.get("deepinfra") == "deepinfra-test"
+        assert creds.get("fireworks") == "fireworks-test"
         assert creds.get("groq") == "groq-test"
-        assert creds.get("together") == "together-test"
+        assert creds.get("mistral") == "mistral-test"
         assert creds.get("openrouter") == "openrouter-test"
         assert creds.get("orcarouter") == "orcarouter-test"
-        assert creds.get("fireworks") == "fireworks-test"
-        assert creds.get("deepinfra") == "deepinfra-test"
         assert creds.get("perplexity") == "perplexity-test"
-        assert creds.get("cohere") == "cohere-test"
         assert creds.get("replicate") == "replicate-test"
+        assert creds.get("together") == "together-test"
         assert creds.get("azure_openai") == "azure-test"
         assert creds.get("azure_openai_endpoint") == "https://example-azure.invalid"
         # Each env var STAYS in os.environ — workers reach these

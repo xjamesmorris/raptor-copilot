@@ -17,9 +17,36 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from core.orchestration.llm_json import strip_json_fences
+from core.security.prompt_envelope import neutralize_tag_forgery
 from core.security.prompt_framing import with_audit_framing
 
 logger = logging.getLogger(__name__)
+
+# Line-separator controls that regex `.` matches straight through and
+# whose downstream renderings can start a new visual line: VT, FF,
+# NEL, LS, PS, plus the FS/GS/RS information separators (all
+# str.splitlines boundaries). The neutralizer's (?m)^ escapes fire
+# only after \n, so these must become spaces BEFORE neutralization —
+# and never \n, which would mint real line starts for the escaped
+# content to land on.
+_LINE_SEPARATOR_CONTROLS = dict.fromkeys(
+    map(ord, "\v\f\x85\u2028\u2029\r\x1c\x1d\x1e"), " ",
+)
+
+
+def _defuse_repo_text(text: str) -> str:
+    """Defuse repo-derived free text headed for a trusted prompt region.
+
+    Order is load-bearing: any truncation must happen BEFORE this call
+    — a cut through already-neutralized text can amputate the very
+    character that masked a forgery token from the neutralizer's
+    word-boundary vocabulary, reviving it at line end. Neutralization
+    is always the last transform.
+    """
+    return neutralize_tag_forgery(
+        text.translate(_LINE_SEPARATOR_CONTROLS)
+    )
 
 
 @dataclass
@@ -74,7 +101,11 @@ _NAME_INTENT: list[tuple] = [
 
 _PARAM_PRECONDITIONS: list[tuple] = [
     (re.compile(r"__user\b"), "pointer is user-space (must copy_from_user)"),
-    (re.compile(r"\bsize_t\b.*\blen\b|\bsize_t\b.*\bsize\b|\bsize_t\b.*\bcount\b"),
+    # Bounded type-to-name gap: a real parameter declaration never
+    # spans 300 chars, and an unbounded gap is re-scanned from every
+    # planted ``size_t`` on hostile source.
+    (re.compile(r"\bsize_t\b.{0,300}\blen\b|\bsize_t\b.{0,300}\bsize\b"
+                r"|\bsize_t\b.{0,300}\bcount\b"),
      "length parameter must be bounds-checked"),
     (re.compile(r"\bconst\s+char\s*\*"), "string pointer must not be NULL"),
     (re.compile(r"\bFILE\s*\*"), "file handle must be open and valid"),
@@ -172,37 +203,58 @@ def should_infer_with_llm(
 
 
 def format_spec_for_context(spec: InferredSpec) -> str:
-    """Render an inferred spec as a prompt section."""
+    """Render an inferred spec as a prompt section.
+
+    Every free-text field can carry repo-derived text (docstring
+    lines, assertion macros, test assertions, LLM claims), so each is
+    defused HERE as well as at extraction: one render seam covers
+    every producer channel at once — including specs whose producer
+    never routed through a defusing extractor — while extraction-side
+    defusal covers the non-render consumers (contracts, evidence
+    fusion). neutralize_tag_forgery converges on its own output —
+    later passes only ever add breaks, never re-liven a defused token
+    (pinned in its test suite) — so the double pass is safe.
+    """
     if not spec.intent and not spec.preconditions and not spec.postconditions:
         return ""
 
     lines = ["### Inferred specification"]
 
     if spec.intent:
-        lines.append(f"**Intent:** {spec.intent}")
+        lines.append(f"**Intent:** {_defuse_repo_text(spec.intent)}")
 
     if spec.preconditions:
         lines.append("**Preconditions:**")
-        lines.extend(f"- {p}" for p in spec.preconditions[:6])
+        lines.extend(
+            f"- {_defuse_repo_text(p)}" for p in spec.preconditions[:6]
+        )
 
     if spec.postconditions:
         lines.append("**Postconditions:**")
-        lines.extend(f"- {p}" for p in spec.postconditions[:6])
+        lines.extend(
+            f"- {_defuse_repo_text(p)}" for p in spec.postconditions[:6]
+        )
 
     if spec.invariants:
         lines.append("**Invariants:**")
-        lines.extend(f"- {inv}" for inv in spec.invariants[:4])
+        lines.extend(
+            f"- {_defuse_repo_text(inv)}" for inv in spec.invariants[:4]
+        )
 
     if spec.negative_specs:
         lines.append("**Must NOT:**")
-        lines.extend(f"- {ns}" for ns in spec.negative_specs[:4])
+        lines.extend(
+            f"- {_defuse_repo_text(ns)}" for ns in spec.negative_specs[:4]
+        )
 
     if spec.llm_hints:
         lines.append(
             "**Unverified LLM hints** (no source anchor — NOT part of "
             "the spec; treat as leads only):"
         )
-        lines.extend(f"- {hint}" for hint in spec.llm_hints[:4])
+        lines.extend(
+            f"- {_defuse_repo_text(hint)}" for hint in spec.llm_hints[:4]
+        )
 
     source_strs = [f"{s.signal} [{s.confidence}]" for s in spec.sources[:5]]
     if source_strs:
@@ -280,39 +332,73 @@ def _infer_from_docstring(spec: InferredSpec, gap: dict[str, Any]) -> None:
     if not docstring:
         source = gap.get("source", "")
         if source:
-            doc_match = re.search(
-                r'(?:"""|\'\'\'|/\*\*)(.*?)(?:"""|\'\'\'|\*/)',
-                source, re.DOTALL,
-            )
-            if doc_match:
-                docstring = doc_match.group(1).strip()
+            # Opener regex + str.find closer lookup instead of the
+            # single-regex spelling (`(?:"""|'''|/\*\*)(.*?)(?:"""|
+            # '''|\*/)`): source that repeats an opener the closer
+            # set never terminates (`/**` with the `*/` withheld)
+            # made every planted opener lazy-scan the rest of the
+            # function source — quadratic on hostile repo text.  A
+            # tempered interior does NOT fix that (each unclosed
+            # opener still scans to the end); this two-step scan is
+            # one pass plus at most one failed find per closer kind.
+            # Match-equivalent to the single regex on every input:
+            # its first match is the first opener with any closer
+            # after it, and a closer after a LATER opener is also
+            # after the first, so only the first opener ever needs
+            # the lookup, with the earliest closer of any kind as
+            # its end (the alternation closed any opener with any
+            # closer — semantics kept, deliberately).
+            opener = re.search(r'"""|\'\'\'|/\*\*', source)
+            if opener is not None:
+                ends = [at for at in (source.find(closer, opener.end())
+                                      for closer in ('"""', "'''", "*/"))
+                        if at != -1]
+                if ends:
+                    docstring = source[opener.end():min(ends)].strip()
 
     if not docstring or len(docstring) < 10:
         return
 
+    # Docstrings are repo text — the same forgery surface as test
+    # assertions, reachable without planting any test file. Truncate
+    # first, defuse last (see _defuse_repo_text).
     if not spec.intent:
-        first_line = docstring.split("\n")[0].strip().rstrip(".")
+        first_line = docstring.split("\n")[0].strip().rstrip(".")  # line-model: first-line intent slice; strip() drops any trailing \r
         if 10 <= len(first_line) <= 200:
-            spec.intent = first_line.lower()
+            spec.intent = _defuse_repo_text(first_line.lower())
             spec.sources.append(SpecSource(
                 signal="docstring",
                 confidence="medium",
                 evidence=f"first line: {first_line[:60]}",
             ))
 
-    for line in docstring.split("\n"):
+    for line in docstring.split("\n"):  # line-model: per-line keyword scan; strip()-normalised
         line_stripped = line.strip().lower()
 
         if any(k in line_stripped for k in ("raises", "throw", "error")):
-            spec.postconditions.append(line.strip()[:120])
+            spec.postconditions.append(_defuse_repo_text(line.strip()[:120]))
 
         if any(k in line_stripped for k in ("returns", "return")):
-            spec.postconditions.append(line.strip()[:120])
+            spec.postconditions.append(_defuse_repo_text(line.strip()[:120]))
 
         if any(k in line_stripped for k in ("must be", "should be",
                                              "must not", "requires",
                                              "precondition", "expects")):
-            spec.preconditions.append(line.strip()[:120])
+            spec.preconditions.append(_defuse_repo_text(line.strip()[:120]))
+
+
+def _case_in_test_tree(tc: Any) -> bool:
+    """Location provenance of one test case (object or dict shape).
+
+    Missing provenance reads as False: a case that cannot prove it
+    came from a recognized test tree must never be promoted to the
+    executable-spec trust grade.
+    """
+    if hasattr(tc, "in_test_tree"):
+        return bool(tc.in_test_tree)
+    if isinstance(tc, dict):
+        return bool(tc.get("in_test_tree", False))
+    return False
 
 
 def _infer_from_tests(
@@ -320,7 +406,27 @@ def _infer_from_tests(
     function_name: str,
     tests: dict[str, Any] | None,
 ) -> None:
-    """Extract postconditions from test assertions."""
+    """Extract postconditions from test assertions.
+
+    Assertion text is repo-derived — in a hostile repo it is verbatim
+    attacker text headed for the trusted region of the review prompt,
+    so every line is truncated FIRST and then defused (structural
+    forgery only: envelope tags, markdown headings, line-separator
+    controls; plain imperative prose survives, bounded and labelled).
+    Evidence whose location is unverified — a loose test_*/ *_test
+    file planted next to production code, or a test-tree symlink
+    escaping the repo root — is additionally demoted: its lines are
+    labelled, its SpecSource confidence drops to "low", and it only
+    consumes assertion budget after in-tree evidence.
+
+    The confidence demotion is the THIN control here: the prompt
+    section's never-shed slot keys on ANY high-confidence source, so
+    high can still ride in via function_name / parameter_type — the
+    controls that actually contain planted text are the per-line
+    label, in-tree-first budget order, and defusal. Both grades share
+    ``signal="test_assertions"``; consumers must key on confidence,
+    never on the signal name alone.
+    """
     if not tests:
         return
 
@@ -328,20 +434,45 @@ def _infer_from_tests(
     if not test_cases:
         return
 
+    in_tree = [tc for tc in test_cases if _case_in_test_tree(tc)]
+    loose = [tc for tc in test_cases if not _case_in_test_tree(tc)]
+
     added = 0
-    for tc in test_cases:
+    added_loose = 0
+    for tc in in_tree + loose:
+        trusted_location = _case_in_test_tree(tc)
         assertions = getattr(tc, "assertions", []) if hasattr(tc, "assertions") else tc.get("assertions", [])
         for assertion in assertions:
             if added >= 5:
                 break
-            spec.postconditions.append(f"[test] {assertion[:100]}")
+            # Truncate BEFORE defusing: a cut through neutralized
+            # text can amputate the character that masked a forgery
+            # token (e.g. a digit suffix defeating the vocabulary's
+            # word boundary), leaving a live token at line end.
+            text = _defuse_repo_text(str(assertion)[:100])
+            if trusted_location:
+                spec.postconditions.append(f"[test] {text}")
+            else:
+                spec.postconditions.append(
+                    f"[test, unverified location] {text}"
+                )
+                added_loose += 1
             added += 1
 
-    if test_cases:
+    if in_tree:
         spec.sources.append(SpecSource(
             signal="test_assertions",
             confidence="high",
-            evidence=f"{len(test_cases)} test(s), {added} assertion(s)",
+            evidence=f"{len(in_tree)} test(s), {added - added_loose} assertion(s)",
+        ))
+    if loose:
+        spec.sources.append(SpecSource(
+            signal="test_assertions",
+            confidence="low",
+            evidence=(
+                f"{len(loose)} test(s) at unverified locations, "
+                f"{added_loose} assertion(s)"
+            ),
         ))
 
 
@@ -366,7 +497,7 @@ def _infer_from_caller_usage(
     considered = getattr(entry, "considered", 0) if entry else 0
     if considered >= 3:
         caller_count = considered
-        callers_that_check_return = entry.count("tested")
+        callers_that_check_return = entry.count("tested")  # type: ignore[union-attr]
     elif checklist:
         items = checklist.get("items", [])
         for item in items:
@@ -376,7 +507,9 @@ def _infer_from_caller_usage(
                 if callee_name == function_name:
                     caller_count += 1
                     source = item.get("source", "")
-                    if _checks_return_value(source, function_name):
+                    if _checks_return_value(
+                        source, function_name, item.get("file", ""),
+                    ):
                         callers_that_check_return += 1
                     break
 
@@ -424,21 +557,28 @@ def _infer_negative_specs(
                 ))
 
 
+# The captured condition is bounded: real assertion conditions sit
+# far below the bound, and an unbounded lazy body is re-expanded from
+# every planted macro head on hostile source (quadratic).
 _ASSERTION_PATTERNS: list[tuple] = [
-    (re.compile(r"\bBUG_ON\s*\((.+?)\)"), "invariant"),
-    (re.compile(r"\bWARN_ON\s*\((.+?)\)"), "postcondition"),
-    (re.compile(r"\bBUILD_BUG_ON\s*\((.+?)\)"), "compile_time_invariant"),
-    (re.compile(r"\blockdep_assert_held\s*\((.+?)\)"), "lock_precondition"),
-    (re.compile(r"\blockdep_assert_held_read\s*\((.+?)\)"), "lock_precondition"),
-    (re.compile(r"\bassert\s*\((.+?)\)"), "precondition"),
-    (re.compile(r"\bASSERT\s*\((.+?)\)"), "precondition"),
-    (re.compile(r"\bCHECK\s*\((.+?)\)"), "precondition"),
-    (re.compile(r"\bDCHECK\s*\((.+?)\)"), "precondition"),
-    (re.compile(r"\bg_assert\s*\((.+?)\)"), "precondition"),
-    (re.compile(r"\bg_return_if_fail\s*\((.+?)\)"), "precondition"),
-    (re.compile(r"\bg_return_val_if_fail\s*\((.+?)\s*,"), "precondition"),
-    (re.compile(r"\bprecondition\s*\((.+?)\)"), "precondition"),
-    (re.compile(r"\bPy_CHECK_TYPE\s*\((.+?)\)"), "type_precondition"),
+    (re.compile(r"\bBUG_ON\s*\((.{1,1000}?)\)"), "invariant"),
+    (re.compile(r"\bWARN_ON\s*\((.{1,1000}?)\)"), "postcondition"),
+    (re.compile(r"\bBUILD_BUG_ON\s*\((.{1,1000}?)\)"), "compile_time_invariant"),
+    (re.compile(r"\blockdep_assert_held\s*\((.{1,1000}?)\)"), "lock_precondition"),
+    (re.compile(r"\blockdep_assert_held_read\s*\((.{1,1000}?)\)"), "lock_precondition"),
+    (re.compile(r"\bassert\s*\((.{1,1000}?)\)"), "precondition"),
+    (re.compile(r"\bASSERT\s*\((.{1,1000}?)\)"), "precondition"),
+    (re.compile(r"\bCHECK\s*\((.{1,1000}?)\)"), "precondition"),
+    (re.compile(r"\bDCHECK\s*\((.{1,1000}?)\)"), "precondition"),
+    (re.compile(r"\bg_assert\s*\((.{1,1000}?)\)"), "precondition"),
+    (re.compile(r"\bg_return_if_fail\s*\((.{1,1000}?)\)"), "precondition"),
+    # The condition group ends non-whitespace or is a single char
+    # ((.*?\S|.)): the naive ``(.+?)\s*,`` overlapped the lazy group
+    # and the whitespace span — quadratic on an assert-opening line
+    # ending in a whitespace run with no comma. Captures unchanged.
+    (re.compile(r"\bg_return_val_if_fail\s*\((.{0,1000}?\S|.)\s*,"), "precondition"),
+    (re.compile(r"\bprecondition\s*\((.{1,1000}?)\)"), "precondition"),
+    (re.compile(r"\bPy_CHECK_TYPE\s*\((.{1,1000}?)\)"), "type_precondition"),
 ]
 
 
@@ -460,7 +600,11 @@ def _infer_from_assertions(
             m = pattern.search(stripped)
             if not m:
                 continue
-            condition = m.group(1).strip()
+            # Assertion-macro conditions are repo text headed for the
+            # same trusted spec section as docstring lines — defuse at
+            # extraction so non-render consumers (contracts, evidence
+            # fusion, precondition verification) see defused text too.
+            condition = _defuse_repo_text(m.group(1).strip())
             if kind == "lock_precondition":
                 text = f"lock {condition} must be held on entry"
                 spec.preconditions.append(text)
@@ -481,12 +625,20 @@ def _infer_from_assertions(
 
 @dataclass
 class PreconditionVerification:
-    """Result of verifying a precondition against all call sites."""
+    """Presence of matching caller-side checks for one precondition.
+
+    Observation grade only: ``verified`` means a lexical check
+    matching the precondition's variable was OBSERVED somewhere in
+    the caller source — it is not bound to the call site (a
+    same-named variable elsewhere in the caller counts), so it can
+    corroborate but never refute a caller-violation hypothesis.
+    There is no ``violated`` lane: the lexical scan can only find
+    presence, never prove absence-at-the-call-site.
+    """
 
     precondition: str
     total_call_sites: int
     verified_sites: int
-    violated_sites: int
     unknown_sites: int
     is_universally_satisfied: bool = False
     evidence: list[dict[str, str]] = field(default_factory=list)
@@ -519,7 +671,6 @@ def _verify_one_precondition(
 ) -> PreconditionVerification:
     """Check one precondition against all known callers."""
     verified = 0
-    violated = 0
     unknown = 0
     evidence: list[dict[str, str]] = []
 
@@ -540,25 +691,25 @@ def _verify_one_precondition(
 
         satisfied = _check_precondition_in_source(
             check_type, precondition, caller_source,
+            caller.get("file", ""),
         )
         caller_id = f"{caller.get('file', '')}:{caller.get('name', caller.get('function', ''))}"
 
+        # _check_precondition_in_source returns True or None only —
+        # a lexical presence scan cannot prove a violation, so there
+        # is no "violated" lane to count.
         if satisfied is True:
             verified += 1
             evidence.append({"caller": caller_id, "status": "verified"})
-        elif satisfied is False:
-            violated += 1
-            evidence.append({"caller": caller_id, "status": "violated"})
         else:
             unknown += 1
             evidence.append({"caller": caller_id, "status": "unknown"})
 
-    total = verified + violated + unknown
+    total = verified + unknown
     return PreconditionVerification(
         precondition=precondition,
         total_call_sites=total,
         verified_sites=verified,
-        violated_sites=violated,
         unknown_sites=unknown,
         is_universally_satisfied=(total > 0 and verified == total),
         evidence=evidence,
@@ -583,14 +734,36 @@ def _check_precondition_in_source(
     check_type: str,
     precondition: str,
     caller_source: str,
+    file_path: str = "",
 ) -> bool | None:
-    """Check if the caller source satisfies the precondition."""
+    """Check if a matching check is OBSERVED in the caller source.
+
+    Returns True (check present somewhere in the caller) or None
+    (nothing found / not checkable) — never False: the match is not
+    bound to the call site or even the right variable (a same-named
+    ``ret``/``ptr``/``len`` anywhere in the caller counts, a lock
+    released before the call still matches), so presence is an
+    observation and absence proves nothing. Renderers must keep the
+    wording observation-grade for the same reason.
+
+    Scans a comment/string-blanked view of the caller so a comment
+    that merely mentions a guard ("/* if (!p) */") does not count.
+    """
+    from .source_view import sanitized_view
+
+    caller_source = sanitized_view(caller_source, file_path)
     if check_type == "null_check":
-        var_match = re.search(r"(\w+)\s*(?:!=\s*(?:NULL|0)|!= null)", precondition)
+        # \b pins the variable to a word start — an unpinned \w+ is
+        # re-scanned from every position of a hostile identifier run.
+        var_match = re.search(
+            r"\b(\w+)\s*(?:!=\s*(?:NULL|0)|!= null)", precondition,
+        )
         if var_match:
             var = var_match.group(1)
+            # gated optional bang (the \s*!?\s* chain was
+            # quadratic on 'if (' + whitespace run)
             if re.search(
-                rf"if\s*\(\s*!?\s*{re.escape(var)}\s*\)|"
+                rf"if\s*\(\s*(?:!\s*)?{re.escape(var)}\s*\)|"
                 rf"if\s*\(\s*{re.escape(var)}\s*==\s*NULL|"
                 rf"if\s*\(\s*{re.escape(var)}\s*!=\s*NULL",
                 caller_source,
@@ -633,38 +806,57 @@ def _get_source_from_checklist(
 def format_precondition_verification(
     verifications: list[PreconditionVerification],
 ) -> str:
-    """Render precondition verification as a context section for the LLM."""
+    """Render caller-check observations as a context section for the LLM.
+
+    Observation grade by design: the underlying scan is lexical,
+    position-insensitive and name-collision-prone, so the rendering
+    must never claim a violation hypothesis is refuted — it only
+    reports where matching checks were observed.
+    """
     if not verifications:
         return ""
-    lines = ["### Precondition verification (mechanical)"]
+    lines = ["### Precondition checks observed in callers (lexical)"]
     for v in verifications:
         if v.total_call_sites == 0:
             continue
-        status = "UNIVERSALLY SATISFIED" if v.is_universally_satisfied else (
-            f"{v.verified_sites}/{v.total_call_sites} callers verified "
-            f"({v.violated_sites} violated, {v.unknown_sites} unknown)"
-        )
-        lines.append(f"- `{v.precondition}`: {status}")
         if v.is_universally_satisfied:
-            lines.append(
-                "  A hypothesis that callers violate this precondition "
-                "is mechanically refuted."
+            status = (
+                f"all {v.total_call_sites} caller(s) contain a "
+                "matching check (lexical observation — not bound to "
+                "the call site)"
             )
-        elif v.violated_sites > 0:
-            lines.append(
-                "  At least one caller mechanically violates this "
-                "precondition — chase the violating call site(s) first."
+        else:
+            status = (
+                f"{v.verified_sites}/{v.total_call_sites} caller(s) "
+                f"contain a matching check ({v.unknown_sites} with "
+                "none observed)"
             )
+        lines.append(f"- `{v.precondition}`: {status}")
     return "\n".join(lines)
 
 
-def _checks_return_value(source: str, function_name: str) -> bool:
-    """Heuristic: does the source check the return of function_name?"""
+def _checks_return_value(
+    source: str, function_name: str, file_path: str = "",
+) -> bool:
+    """Heuristic: does the source check the return of function_name?
+
+    Scans a comment/string-blanked view — a comment that merely
+    mentions the checked call must not count as a real check.
+    """
     if not source:
         return False
 
+    from .source_view import sanitized_view
+
+    source = sanitized_view(source, file_path)
+
     patterns = [
-        rf"if\s*\(\s*!?\s*{re.escape(function_name)}\s*\(",
+        # ``(?:!\s*)?`` gates the bang with its trailing whitespace
+        # (same language as ``!?\s*`` after ``\s*``): two bare ``\s*``
+        # runs around an optional atom backtrack every split of a
+        # whitespace run when the callee never follows — quadratic
+        # over hostile function source.
+        rf"if\s*\(\s*(?:!\s*)?{re.escape(function_name)}\s*\(",
         rf"(?:ret|rc|err|result|status|rv)\s*=\s*{re.escape(function_name)}\s*\(",
         r"if\s*\(\s*(?:ret|rc|err|result|status|rv)\s*[!=<>]",
     ]
@@ -781,16 +973,7 @@ def _parse_llm_spec_response(response: str) -> dict[str, Any]:
     """
     import json as _json
 
-    text = response.strip()
-    if text.startswith("```"):
-        lines = text.splitlines()
-        start = 1
-        end = len(lines)
-        for i in range(1, len(lines)):
-            if lines[i].strip() == "```":
-                end = i
-                break
-        text = "\n".join(lines[start:end])
+    text = strip_json_fences(response)
 
     data: Any = None
     try:
@@ -908,8 +1091,10 @@ def infer_spec_with_llm_sync(
 
     try:
         if client is None:
-            from core.llm.client import LLMClient
-            client = LLMClient()
+            # Transcript seam: identical to LLMClient() with no
+            # session active.
+            from core.llm.transcript import build_llm_client
+            client = build_llm_client()
         prompt, system_prompt = build_spec_prompt(
             function_name, file_path, source,
             model_id=getattr(client, "model_name", "") or "",
@@ -949,6 +1134,21 @@ def infer_spec_with_llm_sync(
     if not data:
         return spec
 
+    return merge_spec_response_data(
+        spec, data, source[:_SPEC_SOURCE_MAX_CHARS],
+    )
+
+
+def merge_spec_response_data(
+    spec: InferredSpec,
+    data: dict[str, Any],
+    source: str,
+) -> InferredSpec:
+    """Merge a parsed LLM spec payload into *spec* with source-grounding.
+
+    *source* must be the exact source slice the model was shown —
+    anchors are verified verbatim against it.
+    """
     if data.get("intent") and not spec.intent:
         # Intent is one sentence of descriptive prose consumed as
         # context only (same pass-through as _ground_summary's state
@@ -961,7 +1161,7 @@ def infer_spec_with_llm_sync(
     # Source-grounding: only claims whose verbatim anchor verifies
     # against the exact source slice the model was shown enter the
     # spec lists; the rest are demoted to the hint tier (llm_hints).
-    norm_source = _normalise_anchor(source[:_SPEC_SOURCE_MAX_CHARS])
+    norm_source = _normalise_anchor(source)
     hint_count = 0
     for field_name, target in (
         ("preconditions", spec.preconditions),
@@ -983,7 +1183,7 @@ def infer_spec_with_llm_sync(
     if hint_count:
         logger.debug(
             "spec_inference: %d unanchored claim(s) for %s:%s demoted "
-            "to hint tier", hint_count, file_path, function_name,
+            "to hint tier", hint_count, spec.file, spec.function,
         )
 
     if not any(s.signal == "llm_inference" for s in spec.sources):
@@ -992,6 +1192,113 @@ def infer_spec_with_llm_sync(
         ))
 
     return spec
+
+
+def _iter_spec_payload_texts(payload: dict[str, Any]):
+    """Yield every free-text string in a folded spec payload."""
+    yield str(payload.get("intent", "") or "")
+    for field_name in (
+        "preconditions", "postconditions", "invariants", "negative_specs",
+    ):
+        items = payload.get(field_name) or []
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if isinstance(item, dict):
+                yield str(item.get("claim", "") or "")
+                yield str(item.get("anchor", "") or "")
+            else:
+                yield str(item)
+
+
+def folded_spec_from_review(
+    payload: Any,
+    mechanical_spec: InferredSpec | None,
+    *,
+    function_name: str,
+    file_path: str,
+    source: str,
+) -> InferredSpec | None:
+    """Build an :class:`InferredSpec` from the review response's folded
+    ``inferred_spec`` field.
+
+    Applies the same floors as the standalone path: strict
+    unknown-field rejection, envelope-echo discard, and verbatim
+    anchor grounding. *source* must be the exact slice the review
+    prompt rendered (``ctx["source"]`` — the line-numbered view); a
+    gutter-free single-line anchor still verifies against it as a
+    whitespace-normalised substring, while anchors spanning line
+    boundaries fail against the interleaved numbers and demote to
+    hints — conservative, never authority-granting. Returns None when
+    the payload is unusable.
+    """
+    if not isinstance(payload, dict) or not payload:
+        return None
+    unknown = sorted(k for k in payload if k not in _SPEC_RESPONSE_KEYS)
+    if unknown:
+        logger.debug(
+            "folded spec payload rejected — unknown fields %s", unknown,
+        )
+        return None
+    if any("<untrusted-" in t for t in _iter_spec_payload_texts(payload)):
+        logger.warning(
+            "folded spec for %s:%s discarded — envelope structure "
+            "echoed in output (possible injection contamination)",
+            file_path, function_name,
+        )
+        return None
+    spec = mechanical_spec or InferredSpec(
+        function=function_name, file=file_path,
+    )
+    return merge_spec_response_data(spec, payload, source)
+
+
+def format_spec_infer_instruction(
+    mechanical_spec: InferredSpec | None = None,
+) -> str:
+    """Render the folded spec-inference instruction as a prompt section.
+
+    Injected into the review prompt for functions that previously got
+    a standalone spec-inference call (high-value, mechanical spec
+    without intent) — the review call carries the contract-inference
+    task and returns the result in the ``inferred_spec`` response
+    field.
+    """
+    lines = [
+        "### Specification inference",
+        "",
+        ("No behavioural contract could be derived mechanically for "
+         "this function. While reviewing, infer what it SHOULD do — "
+         "its contract with callers — and return it in the "
+         "`inferred_spec` response field: `intent` (one sentence) plus "
+         "`preconditions` / `postconditions` / `invariants` / "
+         "`negative_specs`."),
+        "",
+        ('Every claim MUST carry an "anchor": a short snippet copied '
+         "VERBATIM from the function source above (code only — do not "
+         "include the line-number gutter). Keep each anchor on a "
+         "SINGLE source line — the verifier cannot match a snippet "
+         "that spans lines. Anchors are verified mechanically against "
+         "the source; a claim whose anchor does not appear is demoted "
+         "to an unverified hint. Do not paraphrase anchors."),
+        "",
+        ("Focus on the safety-relevant parts of the contract: bounds "
+         "on sizes, null-safety, authentication requirements, "
+         "sanitization guarantees, resource lifecycle, crypto "
+         'properties. Omit trivial specs (e.g. "returns a value").'),
+    ]
+    if mechanical_spec is not None and (
+        mechanical_spec.preconditions
+        or mechanical_spec.postconditions
+        or mechanical_spec.invariants
+        or mechanical_spec.negative_specs
+    ):
+        lines.extend([
+            "",
+            ("A partial mechanically-derived specification appears "
+             "above — extend it rather than restating it."),
+        ])
+    return "\n".join(lines)
 
 
 def find_peer_functions(

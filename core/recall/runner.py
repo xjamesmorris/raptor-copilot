@@ -11,13 +11,21 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import contextlib
+import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any
 
+from core.atomic_fs import (
+    open_exclusive_artifact,
+    open_hardened_append,
+    open_hardened_read,
+)
 from core.json import dumps_artifact
 from core.sarif.parser import parse_sarif_findings
 
@@ -83,6 +91,17 @@ def build_pipeline_argv(manifest: RecallManifest, target: Path,
     elif manifest.profile == "agentic":
         argv = [sys.executable, str(raptor_py), "agentic",
                 "--repo", str(target)]
+    elif manifest.profile == "agentic-taint":
+        # The flip-gate candidate shape: the agentic argv plus exactly
+        # `--taint-crossfile`, nothing else — baseline (`agentic`) and
+        # candidate runs must differ by the engine flag alone or the
+        # measured delta stops being attributable to the engine. The
+        # flag is parsed by raptor.py's agentic surface; a pipeline
+        # build without it fails loudly at argparse (no sentinel, no
+        # SARIFs -> RunnerError), never silently degrades to a
+        # flag-less run.
+        argv = [sys.executable, str(raptor_py), "agentic",
+                "--repo", str(target), "--taint-crossfile"]
     else:  # pragma: no cover - manifest validation refuses others
         msg = f"unknown profile {manifest.profile!r}"
         raise RunnerError(msg)
@@ -125,23 +144,69 @@ def run_pipeline(manifest: RecallManifest, target: Path, repo_root: Path,
     argv = build_pipeline_argv(manifest, target, repo_root,
                                pipeline_out=pipeline_out)
     logger.info("running: %s", " ".join(argv))
+    # Stream both pipeline streams to disk instead of buffering them:
+    # capture_output held a multi-hour pipeline's whole stdout+stderr
+    # in memory just to write it out and grep one sentinel line.
+    stderr_tmp = log_path.with_suffix(log_path.suffix + ".stderr.tmp")
     try:
-        proc = subprocess.run(
-            argv, capture_output=True, text=True, cwd=str(repo_root),
-            timeout=timeout_s, check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        msg = f"pipeline timed out after {timeout_s}s"
-        raise RunnerError(msg) from exc
+        # Exclusive create (lstat-honest replace + O_EXCL|O_NOFOLLOW):
+        # the log dir is reused run output the pipeline's children
+        # write under — a planted symlink/FIFO at these predictable
+        # names must not be followed / block the open.
+        with os.fdopen(
+            open_exclusive_artifact(log_path, replace=True), "wb",
+        ) as out_f, os.fdopen(
+            open_exclusive_artifact(stderr_tmp, replace=True), "wb",
+        ) as err_f:
+            try:
+                proc = subprocess.run(
+                    argv, stdout=out_f, stderr=err_f,
+                    cwd=str(repo_root), timeout=timeout_s, check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                msg = f"pipeline timed out after {timeout_s}s"
+                raise RunnerError(msg) from exc
 
-    log_path.write_text(
-        (proc.stdout or "") + "\n--- stderr ---\n" + (proc.stderr or ""),
-        encoding="utf-8")
+        # The lifecycle contract is "the LAST line of output is
+        # OUTPUT_DIR=<path>" — earlier occurrences (echoed config,
+        # nested tool output) can name other directories, so bind the
+        # final one. Scan the stdout portion of the log line by line
+        # (bounded memory).
+        # Hardened reopen (O_NOFOLLOW + non-regular refusal): the
+        # pipeline's children wrote under this directory, so the
+        # write-side symlink/FIFO discipline applies to the reads
+        # that follow them too. A refusal is a deliberate fail-closed
+        # verdict, so translate it to RunnerError here — the runner's
+        # error type is what the CLI turns into a clean ``error:``
+        # line; a bare OSError would surface as a traceback.
+        sentinel_matches: list[str] = []
+        try:
+            with os.fdopen(
+                open_hardened_read(log_path),
+                encoding="utf-8", errors="replace",
+            ) as f:
+                for line in f:
+                    m = _OUTPUT_DIR_RE.match(line.rstrip("\n"))
+                    if m:
+                        sentinel_matches.append(m.group(1))
 
-    # The lifecycle contract is "the LAST line of output is
-    # OUTPUT_DIR=<path>" — earlier occurrences (echoed config, nested
-    # tool output) can name other directories, so bind the final one.
-    sentinel_matches = _OUTPUT_DIR_RE.findall(proc.stdout or "")
+            # Append stderr behind the same separator the log always
+            # carried, by chunked copy (never buffered whole).
+            # Hardened append (O_NOFOLLOW + FIFO refusal) for the
+            # reopen of our own log after the pipeline's children ran.
+            with os.fdopen(
+                open_hardened_append(log_path), "ab",
+            ) as out_f, os.fdopen(
+                open_hardened_read(stderr_tmp), "rb",
+            ) as err_f:
+                out_f.write(b"\n--- stderr ---\n")
+                shutil.copyfileobj(err_f, out_f)
+        except OSError as exc:
+            msg = f"hardened reopen of the run log refused: {exc}"
+            raise RunnerError(msg) from exc
+    finally:
+        with contextlib.suppress(OSError):
+            stderr_tmp.unlink(missing_ok=True)
     sentinel_dir = (Path(sentinel_matches[-1].strip())
                     if sentinel_matches else None)
 

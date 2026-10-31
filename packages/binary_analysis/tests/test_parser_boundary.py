@@ -149,3 +149,105 @@ def test_runtime_backtrace_recovers_hidden_static_edge():
         and c["boundary_function_id"] == "F2"
     ]
     assert len(backtrace_candidates) >= 1
+
+
+def test_boundary_function_with_two_parser_surfaces_yields_both():
+    """A boundary function calling TWO parser surfaces (JSON decoder
+    AND inflate) is two distinct candidates. Pre-fix the dedup key was
+    (ingress, function) only, so the second surface was invisible in
+    reports and the graph."""
+    ctx = _make_context_map(
+        functions=[
+            {"id": "F1", "name": "url_handler", "address": "0x1000"},
+            {"id": "F2", "name": "parse_payload", "address": "0x2000"},
+        ],
+        surfaces=[
+            {"id": "S1", "name": "JSONDecoder", "category": "parser"},
+            {"id": "S2", "name": "inflate", "category": "parser"},
+        ],
+        edges=[
+            {"source_function": "F1", "target_function": "F2"},
+            {"source_function": "F2", "target_surface": "S1"},
+            {"source_function": "F2", "target_surface": "S2"},
+        ],
+        ingress=[{
+            "id": "ING-1", "name": "openURL", "kind": "url_handler",
+            "bound_function_id": "F1", "evidence_ids": [], "score": 50,
+        }],
+    )
+    candidates, _ = extract_parser_boundaries(
+        binary_sha256=SHA, binary_path=PATH, context_map=ctx,
+    )
+    surfaces_seen = {
+        c["parser_surface_id"] for c in candidates
+        if c["boundary_function_id"] == "F2"
+    }
+    assert surfaces_seen == {"S1", "S2"}
+
+
+def test_same_surface_still_deduplicated():
+    """Direction two: duplicate edges to the SAME surface stay a
+    single candidate — the surface-qualified key must not over-emit."""
+    ctx = _make_context_map(
+        functions=[
+            {"id": "F1", "name": "url_handler", "address": "0x1000"},
+            {"id": "F2", "name": "parse_payload", "address": "0x2000"},
+        ],
+        surfaces=[
+            {"id": "S1", "name": "JSONDecoder", "category": "parser"},
+        ],
+        edges=[
+            {"source_function": "F1", "target_function": "F2"},
+            {"source_function": "F2", "target_surface": "S1"},
+            {"source_function": "F2", "target_surface": "S1"},
+        ],
+        ingress=[{
+            "id": "ING-1", "name": "openURL", "kind": "url_handler",
+            "bound_function_id": "F1", "evidence_ids": [], "score": 50,
+        }],
+    )
+    candidates, _ = extract_parser_boundaries(
+        binary_sha256=SHA, binary_path=PATH, context_map=ctx,
+    )
+    matches = [
+        c for c in candidates
+        if c["boundary_function_id"] == "F2"
+        and c["parser_surface_id"] == "S1"
+    ]
+    assert len(matches) == 1
+
+
+def test_runtime_flows_to_two_surfaces_yield_both():
+    """Same fix on the runtime-backtrace lane: two runtime flows from
+    one boundary function to different surfaces both surface."""
+    ctx = _make_context_map(
+        functions=[
+            {"id": "F1", "name": "handler", "address": "0x1000"},
+            {"id": "F2", "name": "do_parse", "address": "0x2000"},
+        ],
+        surfaces=[
+            {"id": "S1", "name": "JSONDecoder", "category": "parser"},
+            {"id": "S2", "name": "inflate", "category": "parser"},
+        ],
+        ingress=[{
+            "id": "ING-1", "name": "recv_handler", "kind": "network_input",
+            "bound_function_id": "F1", "evidence_ids": [], "score": 30,
+        }],
+        runtime_parser_flows=[
+            {"id": "RPF-1", "function_id": "F2",
+             "parser_surface_id": "S1", "evidence_ids": [],
+             "backtrace_function_ids": ["F1", "F2"]},
+            {"id": "RPF-2", "function_id": "F2",
+             "parser_surface_id": "S2", "evidence_ids": [],
+             "backtrace_function_ids": ["F1", "F2"]},
+        ],
+    )
+    candidates, _ = extract_parser_boundaries(
+        binary_sha256=SHA, binary_path=PATH, context_map=ctx,
+    )
+    runtime = {
+        c["parser_surface_id"] for c in candidates
+        if c["evidence_tier"] == "observed_runtime"
+        and c["boundary_function_id"] == "F2"
+    }
+    assert runtime == {"S1", "S2"}

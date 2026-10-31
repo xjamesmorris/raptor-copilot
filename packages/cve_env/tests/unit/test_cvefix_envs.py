@@ -12,6 +12,7 @@ import importlib.util
 import json
 import subprocess
 from importlib.machinery import SourceFileLoader
+import sys
 from pathlib import Path
 
 import pytest
@@ -28,7 +29,21 @@ def _load():
     loader = SourceFileLoader("raptor_cvefix_envs", str(SCRIPT))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     mod = importlib.util.module_from_spec(spec)
-    loader.exec_module(mod)
+    # The shim's import-time path setup (sys.path.insert of the repo
+    # root / its package dir) must not leak process-wide: a leaked
+    # packages/<pkg> prepend shadows the sibling package's bare
+    # 'tests' test-package for every LATER fresh import in this
+    # process — including multiprocessing forkserver children, which
+    # freeze sys.path at first pool use (an unpickle in the child then
+    # fails with ModuleNotFoundError on the victim's test module).
+    # The shim's own imports resolve during exec; nothing needs the
+    # leaked entries afterwards (pytest.ini pythonpath + the root
+    # conftest already pin the canonical entries).
+    path_before = list(sys.path)
+    try:
+        loader.exec_module(mod)
+    finally:
+        sys.path[:] = path_before
     return mod
 
 
@@ -41,7 +56,7 @@ def _spec_dict(tmp_path: Path, cve: str = CVE, fix: str = FIX) -> dict:
     return {
         "cve_id": cve, "repo_url": "https://github.com/drupal/drupal",
         "fix_commit": fix, "local_clone": str(tmp_path / "clone"),
-        "language": "php", "cwe": "CWE-94",
+        "language": "php", "file_suffixes": [".php"], "cwe": "CWE-94",
     }
 
 
@@ -265,3 +280,64 @@ class TestMainLoop:
         assert mod.main(["--specs", str(specs_dir),
                          "--out", str(tmp_path / "out"),
                          "--dry-run"]) == 0
+
+
+class TestResolveParentChokepoints:
+    def test_rev_parse_runs_through_the_safe_git_chokepoint(
+            self, mod, tmp_path, monkeypatch):
+        """The clone is an untrusted working tree: the rev-parse must
+        carry safe_git_command's config-isolation overrides and the
+        sanitised git env — a bare ["git", ...] invocation honours the
+        clone's own config (the CVE-2024-32002 family)."""
+        from core.git import get_safe_git_env
+        from core.git.clone import safe_git_command
+        from core.recall.cvefix_manifest import CvefixSpec
+
+        clone = tmp_path / "clone"
+        (clone / ".git").mkdir(parents=True)
+        spec = CvefixSpec.from_dict(
+            dict(_spec_dict(tmp_path), local_clone=str(clone)))
+        captured: dict = {}
+
+        def fake_run(argv, **kw):
+            captured["argv"] = argv
+            captured["env"] = kw.get("env")
+
+            class R:
+                returncode = 0
+                stdout = "b" * 40
+                stderr = ""
+            return R()
+
+        monkeypatch.setattr(mod.subprocess, "run", fake_run)
+        assert mod.resolve_parent(spec) == "b" * 40
+        expected = safe_git_command(
+            "-C", str(clone), "rev-parse", f"{FIX}^")
+        assert captured["argv"] == expected
+        assert len(expected) > 5, "safety overrides present in argv"
+        assert captured["env"] == get_safe_git_env()
+
+    def test_api_fallback_is_bounded_core_http(self, mod, tmp_path,
+                                               monkeypatch):
+        """The GitHub fallback must use core.http with a response-size
+        cap, never an unbounded json.load over raw urllib."""
+        from core.http import urllib_backend
+        from core.recall.cvefix_manifest import CvefixSpec
+
+        spec = CvefixSpec.from_dict(_spec_dict(tmp_path))  # clone absent
+        captured: dict = {}
+
+        class FakeClient:
+            def __init__(self, *a, **kw):
+                pass
+
+            def get_json(self, url, **kw):
+                captured["url"] = url
+                captured["kwargs"] = kw
+                return {"parents": [{"sha": "c" * 40}]}
+
+        monkeypatch.setattr(urllib_backend, "UrllibClient", FakeClient)
+        assert mod.resolve_parent(spec) == "c" * 40
+        assert captured["url"].startswith(
+            "https://api.github.com/repos/drupal/drupal/commits/")
+        assert captured["kwargs"].get("max_bytes"), "response-size cap required"

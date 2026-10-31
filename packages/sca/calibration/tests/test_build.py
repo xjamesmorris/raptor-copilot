@@ -206,6 +206,59 @@ def test_build_epss_skips_malformed_scores(tmp_path: Path) -> None:
     assert result.record_count == 1
 
 
+def test_build_epss_rejects_nonfinite_and_out_of_range(
+    tmp_path: Path,
+) -> None:
+    """Float-parseable poison from a hostile / corrupted feed —
+    "NaN", "Infinity", "1e999", out-of-range 7.5 — must be rejected
+    per-row (mirrors the ingest-side core.cve.epss guard), and the
+    written artifact must stay spec-valid strict JSON."""
+    from core.json import load_json
+
+    http = _StubHttp({
+        "https://api.first.org/data/v1/epss?epss-gt=0.05&limit=10000&offset=0": {
+            "data": [
+                {"cve": "CVE-2024-OK", "epss": "0.5",
+                 "percentile": "0.9"},
+                {"cve": "CVE-2024-NAN", "epss": "NaN",
+                 "percentile": "0.9"},
+                {"cve": "CVE-2024-INF", "epss": "Infinity",
+                 "percentile": "0.9"},
+                {"cve": "CVE-2024-RANGE", "epss": "7.5",
+                 "percentile": "0.9"},
+                {"cve": "CVE-2024-PCT", "epss": "0.5",
+                 "percentile": "1e999"},
+            ],
+        },
+    })
+    result = _build_epss(tmp_path, http)
+    assert result.record_count == 1
+    raw = (tmp_path / "epss_signals.json").read_text()
+    assert "NaN" not in raw
+    assert "Infinity" not in raw
+    # The repo's own strict loader (what validate/refit use on the
+    # committed corpus) must accept the artifact whole.
+    data = load_json(tmp_path / "epss_signals.json", strict=True)
+    assert list(data["signals"]) == ["CVE-2024-OK"]
+
+
+def test_write_if_changed_refuses_nonfinite_floats(
+    tmp_path: Path,
+) -> None:
+    """Belt-and-braces: any builder letting a non-finite float
+    through must fail loudly at the writer instead of committing a
+    spec-invalid artifact."""
+    import pytest
+
+    from packages.sca.calibration.build import _write_if_changed
+
+    with pytest.raises(ValueError):
+        _write_if_changed(
+            tmp_path / "x.json", {"signals": {"CVE-1": float("nan")}},
+            source="test", record_count=1,
+        )
+
+
 def test_build_epss_paginates_to_completeness(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -427,6 +480,19 @@ _MSF_INDEX = {
         "references": ["URL: https://example.com"],
     },
 }
+
+
+def test_msf_ref_to_cve_tolerates_integer_refs() -> None:
+    """Feed rows have shipped {"type": "CVE", "ref": 12345} — a
+    non-str ref used to AttributeError on .startswith and abort the
+    whole metasploit source build for the run."""
+    assert _msf_ref_to_cve({"type": "CVE", "ref": 12345}) == "CVE-12345"
+    assert _msf_ref_to_cve({"type": "CVE", "ref": "2021-44228"}) == (
+        "CVE-2021-44228"
+    )
+    assert _msf_ref_to_cve({"type": "CVE", "ref": None}) is None
+    # Container shapes must not stringify into garbage signal keys.
+    assert _msf_ref_to_cve({"type": "CVE", "ref": {"x": 1}}) is None
 
 
 def test_build_metasploit_extracts_cve_to_module_mapping(tmp_path: Path) -> None:
@@ -733,3 +799,59 @@ def test_build_vulnrichment_skips_oversized_member(
     )
     assert set(data["signals"]) == {"CVE-2024-0001", "CVE-2024-0002"}
     assert result.record_count == 2
+
+
+def test_write_if_changed_writes_atomically(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Signal files are ground truth for validation/refit — a torn
+    write is silently warn-and-skipped by the loaders, dropping a
+    whole label source. The write must go through the atomic
+    (tmp + rename) path like every other calibration writer."""
+    import core.atomic_fs as atomic_fs
+
+    calls: list = []
+    real = atomic_fs.write_bytes_atomically
+
+    def _spy(path, data, **kwargs):
+        calls.append(Path(path))
+        return real(path, data, **kwargs)
+
+    monkeypatch.setattr(atomic_fs, "write_bytes_atomically", _spy)
+    out = tmp_path / "kev_signals.json"
+    r = _write_if_changed(
+        out, {"_source": {"fetched_at": "t"}, "rows": [1]},
+        source="kev", record_count=1,
+    )
+    assert r.written is True
+    assert calls == [out]
+    import json as _json
+    assert _json.loads(out.read_text())["rows"] == [1]
+
+
+def test_edb_csv_fetched_once_across_derived_builders(
+    tmp_path: Path,
+) -> None:
+    """exploitdb and github_poc both parse the same ~64MB EDB index;
+    a build must download it ONCE (the two builders run concurrently
+    under the default pool, previously starting two downloads)."""
+    from packages.sca.calibration.build import build_corpus
+
+    calls: list[str] = []
+
+    class _CountingHttp(_StubHttp):
+        def get_bytes(self, url: str, *, max_bytes: int = 0) -> bytes:
+            calls.append(url)
+            return super().get_bytes(url, max_bytes=max_bytes)
+
+    http = _CountingHttp({
+        "https://gitlab.com/exploit-database/exploitdb/-/raw/HEAD/"
+        "files_exploits.csv": _EDB_CSV,
+    })
+    results = build_corpus(
+        out_dir=tmp_path, http=http,
+        sources=["exploitdb", "github_poc"], jobs=2,
+    )
+    assert all(r.error is None for r in results), results
+    edb_fetches = [u for u in calls if u.endswith("files_exploits.csv")]
+    assert len(edb_fetches) == 1

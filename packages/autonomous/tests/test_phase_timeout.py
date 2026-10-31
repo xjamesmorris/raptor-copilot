@@ -52,6 +52,13 @@ class PhaseTimeoutArgparseTests(unittest.TestCase):
             msg="help text should mention unbounded/kernel-scale use case",
         )
 
+    def test_help_preserves_sca_default_until_explicit_override(self):
+        proc = self._run_help()
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("SCA keeps its own", proc.stdout)
+        self.assertIn("600s default", proc.stdout)
+        self.assertIn("parent and child timeouts", proc.stdout)
+
 
 class RaptorCodeqlPhaseTimeoutTests(unittest.TestCase):
     """`/codeql --phase-timeout` parses + mutates RaptorConfig.CODEQL_TIMEOUT.
@@ -125,6 +132,23 @@ class RunCommandStreamingTimeoutTests(unittest.TestCase):
         differently from a bare REPL; thread crash before wait()
         can leave the captured list empty)."""
         import io
+
+        # Prime the parent-side libc cache BEFORE the callers replace
+        # Popen: mock.patch("subprocess.Popen") mutates the shared
+        # subprocess module for the whole process — including
+        # ctypes.util.find_library("c"), which run_command_streaming
+        # reaches through set_pdeathsig() on a cold cache and which
+        # uses Popen as a context manager (the fake supports no
+        # context manager protocol, and its str stdout would trip the
+        # ldconfig probe's bytes regex even if it did). This factory
+        # is evaluated before the ``with mock.patch(...)`` installs
+        # the fake, so the prime always lands pre-patch; afterwards
+        # every _get_libc() is a pure cache read and the tests no
+        # longer depend on another test in the same process having
+        # warmed the cache first.
+        from core.sandbox.preexec import set_pdeathsig
+
+        set_pdeathsig()
 
         class FakePopen:
             returncode = 0

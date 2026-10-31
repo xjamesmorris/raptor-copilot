@@ -10,7 +10,7 @@ detectors:
   use case and silently drops languages with few files —
   wrong for /describe's "what's actually in this tree"
   question.
-* ``packages/codeql/build_detector.py:BuildDetector`` — per-
+* ``core/build/build_detector.py:BuildDetector`` — per-
   language build system (autotools / cmake / poetry / npm / …)
 * ``core/run/target_types`` — catalog entry (#17 substrate)
 
@@ -208,7 +208,7 @@ def _detect_build_systems(
     target_path: Path, languages: dict[str, int],
 ) -> dict[str, str]:
     """Per-language build-system type. Skips languages the
-    BuildDetector can't classify (returns None).
+    BuildDetector has no detection rules for.
 
     Silences ``BuildDetector``'s INFO / WARNING log lines for
     the duration of detection — its "Detecting … / No build
@@ -225,16 +225,24 @@ def _detect_build_systems(
         import logging
         from core.build.build_detector import BuildDetector
 
+        import threading
+
         # Drop the per-language probe chatter from the report.
         # BuildDetector uses ``get_logger()`` (no name), which
         # resolves to the shared "raptor" logger — so we can't
         # silence by logger name without quieting unrelated
         # modules. Instead install a record-content filter for
         # the duration of probing: drops ONLY the "Detecting …"
-        # / "No build system detected …" probe lines, leaves
-        # every other log record alone.
+        # / "No build system detected …" probe lines, and ONLY
+        # from this thread — the shared logger carries other
+        # threads' records during the window, and a concurrent
+        # detector run's probe lines are theirs to keep.
+        calling_thread = threading.get_ident()
+
         class _ProbeNoiseFilter(logging.Filter):
             def filter(self, record: logging.LogRecord) -> bool:
+                if threading.get_ident() != calling_thread:
+                    return True
                 msg = record.getMessage()
                 return not (
                     msg.startswith(("Detecting build system for ", "No build system detected for ", "✓ Detected ", "  Command: "))
@@ -246,6 +254,8 @@ def _detect_build_systems(
         try:
             detector = BuildDetector(target_path)
             for lang in languages:
+                if lang not in detector.BUILD_SYSTEMS:
+                    continue
                 try:
                     bs = detector.detect_build_system(lang)
                     if bs is not None:

@@ -24,6 +24,10 @@ from core.container.containers import (
 )
 from core.container.exec import ExecOutcome, classify_exec_exit, exec_in_container
 
+# SandboxHandle exec-log retention bounds (see _retain_log).
+_LOG_CHUNK_CAP_BYTES: int = 64 * 1024
+_LOG_RETAIN_CAP_BYTES: int = 1024 * 1024
+
 
 class RuntimeHandle(ABC):
     """A live environment instance, wherever it runs."""
@@ -149,6 +153,18 @@ def sandbox_rootfs_supported() -> bool:
     return "rootfs" in _inspect.signature(sandbox_run).parameters
 
 
+# Per-stream sandbox capture ceiling for SandboxHandle.exec (bytes),
+# enforced transiently at the spawn backend's pipe drain. The handle
+# only ever consumes bounded tails of exec output (kilobytes into
+# ExecOutcome, a bounded logs replay), so a hostile command streaming
+# gigabytes must not balloon the trusted parent's memory first.
+# Trade-off, both directions: too SMALL truncates the output a verify
+# log/exec check greps before the interesting line arrives; too LARGE
+# re-opens the transient memory-DoS this bound exists to close. 1 MiB
+# per stream matches the docker tier's logs cap.
+_EXEC_CAPTURE_CAP_BYTES: int = 1024 * 1024
+
+
 class SandboxHandle(RuntimeHandle):
     """Witness-tier handle: an unpacked image rootfs run under the
     RAPTOR sandbox (namespace isolation, fail-closed rootfs mode).
@@ -206,6 +222,25 @@ class SandboxHandle(RuntimeHandle):
         lines = "".join(self._log_chunks).splitlines()
         return "\n".join(lines[-tail:])
 
+    def _retain_log(self, text: str) -> None:
+        """Bounded exec-log retention for :meth:`logs` replay.
+
+        Exec output is hostile workload output; retaining it uncapped
+        for the handle's lifetime was a persistent memory-DoS lever
+        (one gigabyte-spamming exec_check inflated the provisioner's
+        RSS until teardown). Tail-sliced per chunk and bounded in
+        total, matching ``logs()``'s own tail orientation. Trade-off,
+        documented both ways: too SMALL starves verify log_check greps
+        of the lines they match; too LARGE re-opens the persistent
+        retention DoS. 1 MiB total matches the docker tier's logs cap
+        (``container_logs_tail`` ``max_bytes``); oldest chunks age out
+        first.
+        """
+        self._log_chunks.append(text[-_LOG_CHUNK_CAP_BYTES:])
+        total = sum(len(c) for c in self._log_chunks)
+        while total > _LOG_RETAIN_CAP_BYTES and len(self._log_chunks) > 1:
+            total -= len(self._log_chunks.pop(0))
+
     def exec(
         self,
         command: str,
@@ -230,6 +265,11 @@ class SandboxHandle(RuntimeHandle):
                 rootfs=str(self.rootfs),
                 block_network=self.block_network,
                 capture_output=True,
+                # Bounded at the sandbox drain: only tails of the
+                # hostile output are ever consumed (see
+                # _EXEC_CAPTURE_CAP_BYTES), so the capture must not
+                # transit unbounded through host memory.
+                max_capture_bytes=_EXEC_CAPTURE_CAP_BYTES,
                 text=True,
                 timeout=timeout_seconds,
                 cwd=(workdir or self.workdir) or None,
@@ -253,9 +293,11 @@ class SandboxHandle(RuntimeHandle):
                 # from an untrusted image are exactly the primitive
                 # being removed. Residual: DANGEROUS_ENV_VARS is an
                 # exact-name blocklist — loader-adjacent names outside
-                # it (e.g. GCONV_PATH-class knobs) ride through; the
-                # gate-#5 mount-ns pin remains the containment for
-                # anything the list misses.
+                # it ride through (GCONV_PATH itself IS a member; the
+                # class exemplar is a not-yet-enumerated sibling like
+                # a future glibc tunable spelling); the gate-#5
+                # mount-ns pin remains the containment for anything
+                # the list misses.
                 strict_env=True,
             )
         except Exception as exc:  # noqa: BLE001 — outcome shape, not raise
@@ -274,9 +316,9 @@ class SandboxHandle(RuntimeHandle):
         duration = time.monotonic() - start
         stdout = result.stdout or ""
         stderr = result.stderr or ""
-        self._log_chunks.append(stdout)
+        self._retain_log(stdout)
         if stderr:
-            self._log_chunks.append(stderr)
+            self._retain_log(stderr)
         exit_code = result.returncode
         ok = exit_code == 0
         return ExecOutcome(

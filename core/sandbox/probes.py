@@ -160,43 +160,14 @@ SEATBELT_FAIL_INSTRUCTIONS = (
 
 
 @functools.lru_cache(maxsize=1)
-def unshare_supports_kill_child() -> bool:
-    """Whether this host's ``unshare`` supports ``--kill-child`` (util-linux
-    ≥ 2.32, 2018). Used as belt-and-braces teardown: ``unshare --kill-child=
-    SIGKILL`` kills its pid-1 child (and thus cascades the pid-ns) if unshare
-    itself dies. The primary orphan-teardown is the death-pipe in
-    raptor-pid1-shim; this just covers "unshare killed directly". Probed via
-    ``--help`` (cheap, no namespace creation) and cached for the process; a
-    host without the flag silently runs without it.
-    """
-    try:
-        from core.config import RaptorConfig
-        # ``text=True`` keeps stdout/stderr as str regardless of caller-
-        # imposed mocks. Help text is plain ASCII, no encoding concern; the
-        # explicit text mode also stops ``str + b""`` blowing up under any
-        # global ``subprocess.run`` mock that returns str-typed stdout (the
-        # llm_analysis test_orchestrator pipeline patches subprocess.run
-        # process-wide, and bytes-typed defaults would TypeError on the
-        # membership check below).
-        out = subprocess.run(
-            [_resolve_sandbox_binary("unshare"), "--help"],
-            capture_output=True, text=True, timeout=5,
-            env=RaptorConfig.get_safe_env(),
-        )
-        return "--kill-child" in (out.stdout or "") + (out.stderr or "")
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return False
-
-
-@functools.lru_cache(maxsize=1)
 def unshare_supports_cgroup() -> bool:
     """Whether this host's ``unshare`` supports ``--cgroup`` (util-linux
-    ≥ 2.32, 2018). With it, the subprocess-lane bootstrap gets a fresh
-    cgroup namespace so /proc/self/cgroup reads ``0::/`` instead of the
-    orchestrator's host cgroup path (a systemd session scope names the
-    operator's uid and login session to any target that reads it).
-    Probed via ``--help`` and cached; a host without the flag runs
-    without the mask, host-real cgroup visible on this lane only.
+    ≥ 2.32, 2018). Consumed by the namespace ENGAGEMENT PROBE
+    (check_unshare_engages callers): the spawn backend unshares
+    CLONE_NEWCGROUP unconditionally, and the probe must exercise the
+    same kernel capability — the CLI flag is only expressible when
+    the installed util-linux knows it. Probed via ``--help`` and
+    cached.
     """
     try:
         from core.config import RaptorConfig
@@ -208,6 +179,58 @@ def unshare_supports_cgroup() -> bool:
         return "--cgroup" in (out.stdout or "") + (out.stderr or "")
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return False
+
+
+def _staged_pidns_selftest() -> bool:
+    """Fork a child that runs the spawn backend's exact two-step
+    namespace pattern: ``os.unshare(CLONE_NEWUSER)`` then a SECOND
+    ``os.unshare(CLONE_NEWPID)`` with no exec in between.
+
+    Restricted-userns hosts (Ubuntu's AppArmor transition; GitHub
+    runners) allow single-call multi-namespace creation but deny the
+    staged second call with EPERM — the shape the flat CLI engagement
+    probe cannot see. In-process on purpose: the userns creator keeps
+    full capabilities in the new namespace until an exec recalculates
+    them, and the real spawn stages its pid-ns unshare in-process too,
+    so an exec'd CLI form of this check false-negatives on capable
+    hosts. Same fork/exit-code discipline as the sibling functional
+    self-tests; the child is two ``os.unshare`` calls + ``os._exit``.
+    Exit codes: 0 engaged; 190 the userns itself refused (the flat CLI
+    probe reports that case with its own diagnostic); errno otherwise.
+    """
+    _CLONE_NEWUSER = getattr(os, "CLONE_NEWUSER", 0x10000000)
+    _CLONE_NEWPID = getattr(os, "CLONE_NEWPID", 0x20000000)
+    import warnings as _warnings
+    with _warnings.catch_warnings():
+        _warnings.filterwarnings(
+            "ignore", category=DeprecationWarning,
+            message=r".*fork.*may lead to deadlocks.*",
+        )
+        pid = os.fork()
+    if pid == 0:
+        try:
+            os.unshare(_CLONE_NEWUSER)
+        except BaseException:
+            os._exit(190)
+        try:
+            os.unshare(_CLONE_NEWPID)
+        except OSError as e:
+            os._exit((e.errno or 250) & 0xFF)
+        except BaseException:
+            os._exit(250)
+        os._exit(0)
+    try:
+        _, status = os.waitpid(pid, 0)
+    except ChildProcessError:
+        return False
+    if not os.WIFEXITED(status):
+        return False
+    code = os.WEXITSTATUS(status)
+    # 190 = the user namespace itself refused; that is the flat CLI
+    # probe's case to diagnose (its stderr names the real reason), not
+    # a staged-creation refusal — don't mask it with this helper's
+    # message.
+    return code in (0, 190)
 
 
 def check_unshare_engages(unshare_flags) -> tuple:
@@ -224,6 +247,16 @@ def check_unshare_engages(unshare_flags) -> tuple:
     real run depends on. Namespace creation is a deterministic kernel
     check (not data-dependent), so a pass here means the real wrapper will
     engage too.
+
+    Scope note: this single-call CLI probe cannot see the STAGED
+    creation pattern the spawn backend uses (a second
+    ``os.unshare(CLONE_NEWPID)`` from inside the new user namespace) —
+    restricted-userns hosts allow the single call and refuse the staged
+    one. That host class is excluded UPSTREAM: the namespace-backend
+    foundation probe (``check_net_available`` →
+    ``_staged_pidns_selftest``) reports the whole backend unavailable
+    there, so backend selection routes to the degraded lanes and this
+    gate is never consulted.
 
     ``unshare_flags`` is the namespace flag list WITHOUT the ``unshare``
     binary or the ``-- cmd`` tail, e.g.
@@ -383,6 +416,186 @@ def _probe_pidns_fresh_proc() -> tuple[bool, bool]:
         return True, False
 
 
+def check_pidns_supervision_available() -> tuple[bool | None, str]:
+    """Whether the supervised pid-namespace tier can engage on this host.
+
+    Consulted by ``core.sandbox.supervised.spawn_supervised`` under
+    ``pid_ns="auto"`` / ``"require"``. Exercises the tier's EXACT
+    namespace-setup sequence in-process: a single
+    ``os.unshare(CLONE_NEWUSER | CLONE_NEWPID)`` call (never staged —
+    restricted-userns hosts permit the combined call and refuse a
+    staged second one), then the identity uid/gid self-map writes the
+    tier's ``_ns_setup`` performs (hosts exist — Ubuntu's AppArmor
+    unprivileged-userns restriction — where the combined unshare
+    succeeds and the self-map write is what gets denied; a probe that
+    stops at the unshare says True where the live spawn fails),
+    followed by a fork whose child must be PID 1 of the new namespace.
+    In-process on purpose, like ``_staged_pidns_selftest``: the real
+    spawn unshares in-process, so an exec'd CLI probe would answer the
+    wrong question.
+
+    Returns ``(verdict, reason)`` — tri-state:
+      True  — the tier engages (cached).
+      False — DEFINITIVE refusal: the kernel/LSM denied the unshare
+              (EPERM/EACCES — e.g. AppArmor's unprivileged-userns
+              restriction — or ENOSYS/EINVAL), the post-unshare
+              identity self-map write was refused, the platform lacks
+              the primitives, or the namespace did not actually take
+              effect. Cached.
+      None  — the probe itself could not run (fork failure under
+              pressure, signal death, unexpected error). NOT a verdict
+              and NOT cached; the next call re-probes, and the spawn
+              path treats it as attempt-and-see — the live unshare is
+              the authoritative test.
+
+    Lock discipline matches the sibling checks: brief lock around
+    cache reads/writes, the fork-based probe runs outside the lock;
+    the first publisher wins and racers adopt its verdict.
+    """
+    with state._cache_lock:
+        if state._pidns_supervision_cache is not None:
+            return state._pidns_supervision_cache
+
+    verdict, reason = _probe_pidns_supervision()
+
+    if verdict is None:
+        return (None, reason)
+    with state._cache_lock:
+        if state._pidns_supervision_cache is None:
+            state._pidns_supervision_cache = (verdict, reason)
+        return state._pidns_supervision_cache
+
+
+def note_pidns_supervision_refused(reason: str) -> None:
+    """Record a LIVE unshare refusal seen by the supervised spawn path.
+
+    A runtime refusal is authoritative over any earlier probe verdict
+    (the probe can race an LSM policy load, or the policy can change
+    between probe and spawn), so this overwrites the cache
+    unconditionally: subsequent ``pid_ns="auto"`` spawns skip the
+    doomed namespace attempt instead of re-failing it per spawn.
+    """
+    with state._cache_lock:
+        state._pidns_supervision_cache = (False, reason)
+
+
+def _probe_pidns_supervision() -> tuple[bool | None, str]:
+    """Run the actual probe. Never touches the cache —
+    ``check_pidns_supervision_available`` owns caching and locking.
+
+    Fork/exit-code discipline of ``_staged_pidns_selftest``. Child exit
+    codes: 0 engaged; 190 EPERM/EACCES; 191 ENOSYS/EINVAL; 192 other
+    unshare failure; 193 the identity uid/gid self-map write failed
+    (the tier's ``_ns_setup`` performs the same writes and converts
+    the failure into its typed refusal); 194 the post-unshare fork
+    failed (infrastructure, not a verdict); 195 the fork child was not
+    PID 1 (namespace did not take effect); 196 the grandchild died
+    abnormally.
+    """
+    import sys as _sys
+    if _sys.platform != "linux":
+        return (False, f"pid-namespace supervision is Linux-only "
+                       f"(platform: {_sys.platform})")
+    for mod, attr in ((os, "unshare"), (os, "pidfd_open")):
+        if not hasattr(mod, attr):
+            return (False, f"os.{attr} unavailable on this Python/kernel")
+
+    _CLONE_NEWUSER = getattr(os, "CLONE_NEWUSER", 0x10000000)
+    _CLONE_NEWPID = getattr(os, "CLONE_NEWPID", 0x20000000)
+    uid = os.getuid()
+    gid = os.getgid()
+    import warnings as _warnings
+    with _warnings.catch_warnings():
+        _warnings.filterwarnings(
+            "ignore", category=DeprecationWarning,
+            message=r".*fork.*may lead to deadlocks.*",
+        )
+        try:
+            pid = os.fork()
+        except OSError as e:
+            return (None, f"probe fork failed: {e}")
+    if pid == 0:
+        try:
+            os.unshare(_CLONE_NEWUSER | _CLONE_NEWPID)
+        except OSError as e:
+            import errno as _errno
+            if e.errno in (_errno.EPERM, _errno.EACCES):
+                os._exit(190)
+            if e.errno in (_errno.ENOSYS, _errno.EINVAL):
+                os._exit(191)
+            os._exit(192)
+        except BaseException:
+            os._exit(192)
+        # The identity self-map sequence, verbatim from the tier's
+        # _ns_setup (deny setgroups, then the single-row gid/uid
+        # self-maps): the write is a distinct kernel/LSM permission
+        # from the unshare itself, and the live spawn fails closed on
+        # it — so the probe must too.
+        try:
+            for _path, _data in (
+                ("/proc/self/setgroups", "deny"),
+                ("/proc/self/gid_map", f"{gid} {gid} 1"),
+                ("/proc/self/uid_map", f"{uid} {uid} 1"),
+            ):
+                _fd = os.open(_path, os.O_WRONLY)
+                try:
+                    os.write(_fd, _data.encode("ascii"))
+                finally:
+                    os.close(_fd)
+        except BaseException:
+            os._exit(193)
+        try:
+            grandchild = os.fork()
+        except BaseException:
+            os._exit(194)
+        if grandchild == 0:
+            os._exit(0 if os.getpid() == 1 else 61)
+        try:
+            _, gstatus = os.waitpid(grandchild, 0)
+        except BaseException:
+            os._exit(196)
+        if os.WIFEXITED(gstatus) and os.WEXITSTATUS(gstatus) == 0:
+            os._exit(0)
+        if os.WIFEXITED(gstatus) and os.WEXITSTATUS(gstatus) == 61:
+            os._exit(195)
+        os._exit(196)
+    try:
+        _, status = os.waitpid(pid, 0)
+    except ChildProcessError:
+        return (None, "probe child reaped elsewhere (broad os.wait "
+                      "in this process?)")
+    if not os.WIFEXITED(status):
+        return (None, f"probe child died by signal "
+                      f"{os.WTERMSIG(status) if os.WIFSIGNALED(status) else '?'}")
+    code = os.WEXITSTATUS(status)
+    if code == 0:
+        return (True, "")
+    if code == 190:
+        return (False, "unshare(CLONE_NEWUSER|CLONE_NEWPID) refused: "
+                       "EPERM/EACCES (unprivileged user namespaces "
+                       "restricted on this host)")
+    if code == 191:
+        return (False, "unshare(CLONE_NEWUSER|CLONE_NEWPID) refused: "
+                       "ENOSYS/EINVAL (kernel lacks the namespace "
+                       "support)")
+    if code == 192:
+        return (False, "unshare(CLONE_NEWUSER|CLONE_NEWPID) failed")
+    if code == 193:
+        return (False, "post-unshare identity uid/gid self-map write "
+                       "refused (hosts with restricted unprivileged "
+                       "user namespaces — e.g. Ubuntu's AppArmor "
+                       "userns transition — permit the unshare and "
+                       "deny the map write; the supervised tier "
+                       "cannot complete namespace setup)")
+    if code == 195:
+        return (False, "pid namespace did not take effect (fork child "
+                       "was not PID 1)")
+    if code == 194:
+        return (None, "probe could not fork inside the namespace "
+                      "(process pressure?)")
+    return (None, f"probe child exited {code} (infrastructure failure)")
+
+
 def check_net_available() -> bool:
     """Check if network isolation via user namespaces is available.
 
@@ -404,8 +617,8 @@ def check_net_available() -> bool:
 
     with state._cache_lock:
         if state._net_available_cache is None:
-            state._net_available_cache = available
-        return state._net_available_cache
+            state._net_available_cache = available  # type: ignore[assignment]
+        return state._net_available_cache  # type: ignore[return-value]
 
 
 def _probe_net_available() -> bool:
@@ -465,12 +678,32 @@ def _probe_net_available() -> bool:
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return False
 
+    # Namespace CREATION alone is not the backend: the fork-based spawn
+    # stages a second os.unshare(CLONE_NEWPID) from inside the new user
+    # namespace, and restricted-userns hosts (Ubuntu's AppArmor
+    # transition — GitHub runners, live-confirmed from run artifacts)
+    # allow every single-call creation above while refusing that staged
+    # second call with EPERM. On such hosts the CLI probe passes, every
+    # namespace-backed run then dies mid-child (silent rc-126 empty
+    # results, demotion warnings for calls that were promised
+    # isolation), and the capability-gated test suite mis-runs. Treat
+    # the staged refusal as "no namespace backend": backend selection
+    # then routes to the same degraded lanes an outright userns denial
+    # gets — deny-all TCP via Landlock, floor consent, honest skips.
+    if not _staged_pidns_selftest():
+        logger.debug(
+            "Sandbox: staged pid-namespace creation refused "
+            "(restricted unprivileged user namespaces) — namespace "
+            "backend unavailable")
+        return False
+
     return True
 
 
 def _mount_ns_functional_selftest() -> bool:
-    """Fork a child and actually ``unshare(CLONE_NEWUSER|CLONE_NEWNS)`` to
-    verify the kernel permits creating a user+mount namespace at runtime.
+    """Fork a child, ``unshare(CLONE_NEWUSER|CLONE_NEWNS)`` AND perform a
+    real mount inside the new namespace, to verify the kernel permits the
+    operations the spawn path actually runs.
 
     The other ``check_mount_available()`` signals — uidmap binaries present,
     AppArmor sysctl != 1 — are necessary but NOT sufficient: an outer-container
@@ -480,10 +713,34 @@ def _mount_ns_functional_selftest() -> bool:
     ``os.unshare`` (exit 126 + empty stdout) — a silent "0 findings". Testing
     it here means a NEWNS-incapable host instead falls back to Landlock-only
     and still produces real results. Same approach as the Landlock and seccomp
-    functional self-tests. Child is ``os.unshare`` + ``os._exit`` only.
+    functional self-tests.
+
+    Namespace CREATION alone is still not sufficient: there are hosts where
+    ``unshare(CLONE_NEWUSER|CLONE_NEWNS)`` succeeds but every mount(2) inside
+    the owned namespace is denied — an outer-container seccomp that EPERMs
+    the mount family is the concrete case (the feature-matrix ``no-mount``
+    lane models it). On such a host a creation-only probe reports mount-ns
+    available and every spawn then fails its bind tree mid-flight, so the
+    child also remounts ``/`` recursively private and mounts a tmpfs at
+    ``/tmp`` — the same first operations ``core.sandbox.mount_ns`` performs.
+    Both live only in the child's namespace and evaporate with it. This
+    gives the outer-seccomp class the same up-front Landlock-only posture
+    the AppArmor-sysctl class already gets from the fast path above; the
+    spawn ladder's mountless 'M' retry remains the mid-flight net for
+    failures no probe saw coming.
+
+    Child is ``os.unshare`` + two pre-resolved ``libc.mount`` calls +
+    ``os._exit`` only (libc handle resolved before the fork).
     """
     _CLONE_NEWUSER = getattr(os, "CLONE_NEWUSER", 0x10000000)
     _CLONE_NEWNS = getattr(os, "CLONE_NEWNS", 0x00020000)
+    _MS_REC = 0x4000
+    _MS_PRIVATE = 1 << 18
+    import ctypes
+    try:
+        _libc = ctypes.CDLL(None, use_errno=True)
+    except OSError:
+        return False
     import warnings as _warnings
     with _warnings.catch_warnings():
         _warnings.filterwarnings(
@@ -494,9 +751,17 @@ def _mount_ns_functional_selftest() -> bool:
     if pid == 0:
         try:
             os.unshare(_CLONE_NEWUSER | _CLONE_NEWNS)
-            os._exit(0)
         except BaseException:
             os._exit(1)
+        try:
+            if _libc.mount(b"none", b"/", None, _MS_REC | _MS_PRIVATE,
+                           None) != 0:
+                os._exit(2)
+            if _libc.mount(b"none", b"/tmp", b"tmpfs", 0, None) != 0:
+                os._exit(3)
+        except BaseException:
+            os._exit(4)
+        os._exit(0)
     try:
         _, status = os.waitpid(pid, 0)
     except ChildProcessError:
@@ -518,7 +783,7 @@ def check_mount_available() -> bool:
             return state._mount_available_cache
 
         if not check_net_available():
-            state._mount_available_cache = False
+            state._mount_available_cache = False  # type: ignore[assignment]
             return False
 
         # Check AppArmor restriction — fast path, avoids functional test.
@@ -553,7 +818,7 @@ def check_mount_available() -> bool:
                         "sudo sysctl -w "
                         "kernel.apparmor_restrict_unprivileged_userns=0"
                     )
-                state._mount_available_cache = False
+                state._mount_available_cache = False  # type: ignore[assignment]
                 return False
         except OSError:
             pass
@@ -585,26 +850,68 @@ def check_mount_available() -> bool:
                     "newgidmap missing). Fallback: Landlock-only. "
                     "To enable, run: sudo apt install uidmap"
                 )
-            state._mount_available_cache = False
+            state._mount_available_cache = False  # type: ignore[assignment]
             return False
 
         # Functional test (see _mount_ns_functional_selftest): binary presence
         # + AppArmor-sysctl=0 are necessary but not sufficient — the kernel can
-        # still refuse unshare(CLONE_NEWNS) (outer seccomp / SELinux / nested
-        # userns). If it does, report unavailable so we degrade to Landlock-
-        # only rather than dying mid-spawn with empty output.
+        # still refuse unshare(CLONE_NEWNS), or allow it and refuse the
+        # mounts inside the owned namespace (outer seccomp / SELinux /
+        # nested userns). If it does, report unavailable so we degrade to
+        # Landlock-only rather than dying mid-spawn with empty output.
         if not _mount_ns_functional_selftest():
             if state.warn_once("_mount_unavailable_warned"):
                 logger.info(
                     "Sandbox: mount-namespace isolation UNAVAILABLE — "
-                    "unshare(CLONE_NEWNS) refused at runtime (outer seccomp / "
-                    "LSM / nested-userns restriction). Fallback: Landlock-only."
+                    "unshare(CLONE_NEWNS) or mount(2) inside the owned "
+                    "namespace refused at runtime (outer seccomp / LSM / "
+                    "nested-userns restriction). Fallback: Landlock-only."
                 )
-            state._mount_available_cache = False
+            state._mount_available_cache = False  # type: ignore[assignment]
             return False
 
-        state._mount_available_cache = True
+        state._mount_available_cache = True  # type: ignore[assignment]
         return True
+
+
+def check_child_unix_sockets_available() -> bool:
+    """Whether a child sandboxed by ``core.sandbox.run`` can CREATE
+    AF_UNIX sockets (``socket(AF_UNIX)`` + ``bind``).
+
+    Consumers that host a unix-socket server INSIDE the sandbox (the
+    persistent Ghidra worker) use this as a transport pre-flight: when
+    it returns False the child's very first ``socket(2)`` dies with
+    EPERM under the seccomp policy, so the caller must hand the child
+    an inherited descriptor (socketpair) instead of a pathname socket.
+
+    The verdict mirrors the spawn path's own gating:
+
+    - darwin: the seatbelt profile does not filter socket creation —
+      always True.
+    - Linux: socket creation is allowed only on the NAMESPACE spawn
+      lane (``core.sandbox._spawn``), and only when the connect-
+      scoping supervisor can run (``probe_unix_scope`` — without it
+      ``allow_unix_sockets`` stays disabled, fail-closed). Every other
+      lane (subprocess+preexec) installs a seccomp filter that denies
+      ``socket(AF_UNIX)`` unconditionally. ``check_mount_available()``
+      stands in for "the namespace lane serves this host" — it implies
+      ``check_net_available()`` (the staged pid-ns self-test included,
+      which is exactly what nested-sandbox hosts fail).
+
+    Deliberately conservative: a Linux host where seccomp itself is
+    unavailable would let the preexec lane create sockets unfiltered,
+    but this helper still reports False there — a false negative only
+    steers the consumer onto the inherited-descriptor transport, which
+    works on every lane. A false POSITIVE would boot-loop the child
+    against EPERM, so the bias is the safe one.
+    """
+    import sys
+    if sys.platform == "darwin":
+        return True
+    if not check_mount_available():
+        return False
+    from ._unix_scope import probe_unix_scope
+    return probe_unix_scope()
 
 
 def _selinux_enforcing() -> bool:
@@ -683,9 +990,14 @@ def mount_unavailable_reason() -> tuple[str, str]:
             "host where mount-ns is available.",
         )
     # 4. Catch-all: outer seccomp filter / nested userns / unknown LSM.
+    #    Names BOTH refusal points the functional self-test probes:
+    #    namespace creation and the mounts inside the owned namespace —
+    #    an outer seccomp that EPERMs only the mount family fails the
+    #    second while the first succeeds.
     return (
         "mount-ns blocked by host "
-        "(unshare(CLONE_NEWNS) refused at runtime — likely outer "
+        "(unshare(CLONE_NEWNS), or mount(2) inside the owned "
+        "namespace, refused at runtime — likely outer "
         "seccomp filter, nested user-namespace restriction, or "
         "unknown LSM policy)",
         "rerun outside the restricting container / VM, or rerun on a "

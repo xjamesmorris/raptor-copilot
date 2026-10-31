@@ -19,9 +19,9 @@ UNCERTAIN bucket separately — it doesn't contribute to precision /
 recall, so Phase 2 lands without harming the V2 baseline.
 
 Wire via:
-    libexec/raptor-corpus-run --output source_intel.csv \
+    core/dataflow/scripts/corpus-run --output source_intel.csv \
         --validator packages.source_intel.adapter:SourceIntelValidator
-    libexec/raptor-corpus-metrics source_intel.csv
+    core/dataflow/scripts/corpus-metrics source_intel.csv
 """
 
 from __future__ import annotations
@@ -29,10 +29,14 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
+
+from core.paths import confine
+from core.source import read_text_capped
 from typing import Any, TYPE_CHECKING
 
 from core.dataflow.validator import ValidatorVerdict
 from packages.source_intel.analyze import (
+    C_CPP_EXTS,
     GRADE_DOMINATES,
     GRADE_SAME_FUNCTION,
     GRADE_SAME_PATH,
@@ -46,6 +50,7 @@ from packages.source_intel.analyze import (
     KIND_WUR,
     SourceIntelResult,
     _is_word_present,
+    _sub_block_comments,
     analyze,
 )
 from packages.source_intel.cache import SourceIntelCache
@@ -401,7 +406,10 @@ def _finding_in_dead_code(finding: Finding, repo_root: Path) -> bool:
         return False
 
     facts = _gather_prereqs_cached(target)
-    if facts is None or facts.is_skipped:
+    if facts is None or facts.is_skipped or not facts.complete:
+        # Incomplete sweeps (an errored rule) may be missing exactly
+        # the call site that would disprove "zero callers" — a
+        # dead-code verdict needs the complete caller map.
         return False
     # Function must be defined AND have zero callers in the target.
     if not facts.function_exists(finding_fn):
@@ -572,23 +580,34 @@ def _function_referenced_as_pointer_scan(
     # Single regex covering the common pointer-use shapes. Each
     # alternative requires ``function_name`` is NOT followed by ``(``
     # — otherwise it is just a normal call PR-4 would have caught.
+    # Line-start indent is HORIZONTAL-only ([^\S\n]): under MULTILINE
+    # the ``^\s*`` spelling re-scans a run of blank lines from every
+    # line start inside it — quadratic on scanned source.
     pat = _re.compile(
-        r"(?:[.=&,(]\s*" + fn + r"|^\s*" + fn + r")"
+        r"(?:[.=&,(]\s*" + fn + r"|^[^\S\n]*" + fn + r")"
         r"(?!\s*\()"  # NOT a call
         r"(?:\s*[,;)}]|\s*$|\s+\w)",
         _re.MULTILINE,
     )
-    EXTS = {".c", ".h", ".cc", ".cpp", ".hpp", ".cxx", ".hxx"}
+    # Shared extension set (analyze.C_CPP_EXTS): this scan is the
+    # final guard before a static function is declared dead code, so
+    # a header extension missing here (.hh had drifted out) wrongly
+    # suppressed callback-only-referenced functions.
     if target.is_file():
         files = [target]
     else:
-        files = [p for p in target.rglob("*") if p.suffix in EXTS]
+        files = [
+            p for p in target.rglob("*")
+            if p.suffix.lower() in C_CPP_EXTS
+        ]
     for path in files:
-        try:
-            with open(path, encoding="utf-8", errors="replace") as f:
-                text = f.read()
-        except OSError:
+        resolved = confine(target, path)
+        if resolved is None:
             continue
+        got = read_text_capped(resolved)
+        if got is None:
+            continue
+        text = got[0]
         # Strip the function's own definition line so we don't
         # match it as a self-reference. Cheap heuristic: skip lines
         # containing both the name AND `(` AND `{` on same line, OR
@@ -599,6 +618,20 @@ def _function_referenced_as_pointer_scan(
     return False
 
 
+# Comment/string-blanked view — the single lexical substrate for
+# every helper in this module that mints or withholds a verdict-
+# relevant fact from file text. Hoisted to the package-shared
+# ``_source_view`` module so analyze.py and render.py read the SAME
+# substrate; see its docstring for the hostile-repo rationale and the
+# byte cap (a consumer's None path is always its conservative
+# direction). Imported here (not in the header block) to keep the
+# module's lexical-substrate seam next to its consumers.
+from packages.source_intel._source_view import (  # noqa: E402
+    sanitized_lines as _sanitized_lines,
+    sanitized_source as _sanitized_source,
+)
+
+
 def _function_is_static(file_path: str, function_name: str) -> bool:
     """Best-effort: scan ``file_path`` for a line beginning with
     ``static`` and containing ``function_name(``.
@@ -606,17 +639,25 @@ def _function_is_static(file_path: str, function_name: str) -> bool:
     Conservative: returns False when uncertain. Static-detection
     failure ALWAYS keeps a non-static function from being marked
     dead, which is the safe direction (avoids false positives on
-    cross-TU-callable functions).
+    cross-TU-callable functions). The TRUE direction is
+    hostile-steerable from prose (static-ness gates dead-code and
+    privilege back-walk completeness), so the scan runs on the
+    comment/string-blanked view.
     """
-    try:
-        with Path(file_path).open(encoding="utf-8", errors="replace") as f:
-            text = f.read()
-    except OSError:
+    text = _sanitized_source(file_path)
+    if text is None:
         return False
     # Match `static [optional return-type tokens] funcname(`
+    # Line-start indent is HORIZONTAL-only ([^\S\n]): under MULTILINE
+    # the ``^\s*`` spelling re-scans a run of blank lines from every
+    # line start inside it — quadratic on scanned source.
     import re as _re
+    # Bounded type-token loop ({0,24}): the unbounded loop let every
+    # line anchor consume arbitrarily many following token lines
+    # before failing at the name — quadratic over planted
+    # static-shaped lines. 24 tokens sits far above real signatures.
     pat = _re.compile(
-        r"^\s*static\s+(?:[A-Za-z_][A-Za-z0-9_]*\s+|\*\s*)*"
+        r"^[^\S\n]*static\s+(?:[A-Za-z_][A-Za-z0-9_]*\s+|\*\s*){0,24}"
         + _re.escape(function_name) + r"\s*\(",
         _re.MULTILINE,
     )
@@ -689,8 +730,12 @@ def _unchecked_alloc_supports_finding(
     return False
 
 
+# Bounded type window (same discipline as _FN_DEF_OPEN_RE): the
+# unbounded window overlapped its whitespace separator — quadratic
+# even at the anchored match call. 256 chars sits far above real
+# declarations.
 _LOCAL_ASSIGN_RE = re.compile(
-    r"^\s*(?:[A-Za-z_][A-Za-z0-9_*\s]*\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*="
+    r"^\s*(?:[A-Za-z_][A-Za-z0-9_*\s]{0,256}\s)?([A-Za-z_][A-Za-z0-9_]*)\s*="
 )
 
 
@@ -733,14 +778,20 @@ def _has_interprocedural_check(
     """
     if not file_path or sink_line <= alloc_line + 1:
         return False
-    try:
-        with Path(file_path).open(encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-    except OSError:
+    # Blanked view: a commented-out ``if (p) goto out;`` between
+    # alloc and sink must not withhold the axis-3 support.
+    lines = _sanitized_lines(file_path)
+    if lines is None:
         return False
 
+    # The condition span is bounded: with an unbounded span, hostile
+    # source repeating `if(` inside one close-paren-free run makes
+    # every opener re-scan the rest of the run for the variable —
+    # quadratic. Real if-conditions sit well inside 512 chars
+    # (beyond it the guard is not credited — the conservative
+    # direction for this witness).
     var_in_if = re.compile(
-        r"\bif\s*\([^)]*\b" + re.escape(var_name) + r"\b"
+        r"\bif\s*\([^)]{0,512}\b" + re.escape(var_name) + r"\b"
     )
     early_exit = re.compile(r"\b(?:return\b|continue\b|break\b|goto\b)")
     # Two-line "separate err var" pattern:
@@ -767,8 +818,9 @@ def _has_interprocedural_check(
         m = call_with_var.search(lines[i])
         if m:
             assigned = m.group(1)
+            # Bounded for the same reason as var_in_if above.
             if_with_assigned = re.compile(
-                r"\bif\s*\([^)]*\b" + re.escape(assigned) + r"\b"
+                r"\bif\s*\([^)]{0,512}\b" + re.escape(assigned) + r"\b"
             )
             # Look for `if (assigned ...)` within next 5 lines,
             # then early-exit within 3 lines after that.
@@ -1025,17 +1077,16 @@ def _line_uses_privileged_cap(file_path: str, line_no: int) -> bool:
     actual build, and a mock capability constant in test code could
     spuriously match. Scope is bounded by upstream filters
     (function-name + memory-corruption rule_id + line proximity).
+    Reads the comment/string-blanked view: ``capable(mask)
+    /* CAP_SYS_ADMIN */`` must not upgrade a bounded capability to
+    root-equivalent (this check also gates every hop of the
+    privilege back-walk).
     """
-    try:
-        with Path(file_path).open(encoding="utf-8", errors="replace") as f:
-            for i, line in enumerate(f, 1):
-                if i == line_no:
-                    return any(c in line for c in _PRIVILEGED_CAP_CONSTANTS)
-                if i > line_no:
-                    return False
-    except OSError:
+    lines = _sanitized_lines(file_path)
+    if lines is None or not (1 <= line_no <= len(lines)):
         return False
-    return False
+    line = lines[line_no - 1]
+    return any(c in line for c in _PRIVILEGED_CAP_CONSTANTS)
 
 
 # =====================================================================
@@ -1070,6 +1121,66 @@ _FORTIFIED_WRITE_CALLS: frozenset[str] = frozenset({
 })
 
 
+def _build_flags_trusted(repo_root: Path | str | None) -> bool:
+    """Operator ``build`` trust-marker gate for build-config-derived
+    SUPPRESSION — with the one-target rule.
+
+    ``extract_flags`` parses declarative text the SCANNED repo ships
+    — the parsing is line-anchored, but nothing verifies the parsed
+    file drives any real build: a planted ``.config`` or a dead
+    Makefile carrying ``-D_FORTIFY_SOURCE=2 -fstack-protector-strong``
+    arms the fortify / stack-protector suppressors with no trust
+    gate. Suppression therefore requires the operator's ``build``
+    trust marker (the exact contract project trust markers exist
+    for); without it the flags stay steering-only evidence in the
+    rendered prose.
+
+    One-target rule (the sibling marker consumer in
+    packages/sca/bump/orchestrator.py carries the same gate): the
+    marker is an assertion about ONE tree — the governing project's
+    ambient marker must never relax vetting for a DIFFERENT tree the
+    run actually scans, so the analysed root must be shown to be the
+    project's target (``run_target_matches_project`` — fail-closed on
+    unknown/unresolvable roots, including ``repo_root=None``).
+    Resolved per call, never process-cached: a mid-process project
+    switch or a multi-target process must not carry another
+    resolution's answer. Run-pin (``run_dir``) resolution is not
+    plumbed into this layer; the one-target rule is the operative
+    defence and matches the sibling consumer's shape.
+    """
+    try:
+        from core.project.trust import (
+            active_project_trust,
+            run_target_matches_project,
+        )
+    except ImportError:
+        return False
+    markers, _project = active_project_trust()
+    if "build" not in markers:
+        return False
+    return run_target_matches_project(repo_root)
+
+
+_UNTRUSTED_BUILD_FLAGS_NOTICED: set[str] = set()
+
+
+def _notice_untrusted_build_flags(kind: str) -> None:
+    """One logged line (per suppressor kind, per process) when
+    build-flags evidence matched but the missing/mismatched ``build``
+    trust marker withheld suppression — trust state must never be
+    invisible (the project-trust doctrine); operators otherwise see
+    extra findings with no stated cause."""
+    if kind in _UNTRUSTED_BUILD_FLAGS_NOTICED:
+        return
+    _UNTRUSTED_BUILD_FLAGS_NOTICED.add(kind)
+    logger.warning(
+        "source_intel: %s evidence matched but suppression is "
+        "withheld — declared build config is only suppression-grade "
+        "under the project's `build` trust marker for THIS target "
+        "(set with `/project trust build`)", kind,
+    )
+
+
 def _fortify_source_blocks_finding(
     finding: Finding,
     result: SourceIntelResult,
@@ -1080,7 +1191,10 @@ def _fortify_source_blocks_finding(
 
     * build_flags has fortify_source_level >= 2, AND
     * finding's rule_id is unbounded-write-class, AND
-    * the sink line names a FORTIFY-intercepted call.
+    * the sink line names a FORTIFY-intercepted call, AND
+    * the operator has asserted the ``build`` trust marker (see
+      :func:`_build_flags_trusted` — declared build config is
+      plantable and never suppression-grade on its own).
 
     The sink-line snippet check uses a token boundary check to
     avoid spurious matches on substrings (e.g. ``my_strcpy`` would
@@ -1126,7 +1240,14 @@ def _fortify_source_blocks_finding(
     # unchecked. Without this guard the verdict policy over-suppresses
     # findings on malloc'd destinations, which is the common case in
     # most userspace.
-    return not _fortified_dest_is_variable_size(finding, repo_root=repo_root)
+    if _fortified_dest_is_variable_size(finding, repo_root=repo_root):
+        return False
+    # Trust gate LAST so that reaching it means the evidence matched:
+    # the withheld direction gets its visibility notice.
+    if not _build_flags_trusted(repo_root):
+        _notice_untrusted_build_flags("fortify-source")
+        return False
+    return True
 
 
 _DYNAMIC_ALLOCATORS_PATTERN = re.compile(
@@ -1160,8 +1281,12 @@ def _fortified_dest_is_variable_size(
     snippet = finding.sink.snippet or ""
     # Match the first identifier inside the call's argument list:
     # `strcpy(buf, src)` → "buf"; `memcpy(dst, src, n)` → "dst"
+    # \b pins the scan to identifier starts: unanchored, every
+    # position inside a long identifier run restarts the scan and
+    # re-reads the run — quadratic on hostile snippets. Mid-word
+    # starts only ever matched a truncated tail of the identifier.
     m = re.search(
-        r"[A-Za-z_][A-Za-z0-9_]*\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\b",
+        r"\b[A-Za-z_][A-Za-z0-9_]*\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\b",
         snippet,
     )
     if not m:
@@ -1179,17 +1304,28 @@ def _fortified_dest_is_variable_size(
             ((repo_root or _DEFAULT_REPO_ROOT) / sink_path).resolve()
         )
 
-    try:
-        with open(sink_path_abs, encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-    except OSError:
+    # Comment/string-blanked view (shared _sanitized_lines
+    # chokepoint): a planted `/* buf = malloc(64) legacy */` comment
+    # forged True over raw lines, withholding the fortify
+    # NOT_EXPLOITABLE suppression from prose (a comment cannot erase
+    # real code, so the False direction was never forgeable).
+    lines = _sanitized_lines(sink_path_abs)
+    if lines is None:
         return False
 
     # Scope: scan up to 200 lines before the sink (typical function
     # body); we don't have function-bounds info here so use a bounded
     # window. Look for `dest_var = <dyn-alloc>(`.
+    # The optional cast paren gates its own whitespace and the
+    # filler expression is \S-headed: the naive
+    # ``\(?\s*[^=;]*?`` overlapped the lazy filler and the
+    # preceding whitespace span, so an assignment line ending in a
+    # long whitespace run with no allocator call cost every split of
+    # the run — cubic in the line length. Match set unchanged (the
+    # greedy ``\s*`` already owned the leading whitespace).
     assign_pat = re.compile(
-        r"\b" + re.escape(dest_var) + r"\s*=\s*\(?\s*[^=;]*?"
+        r"\b" + re.escape(dest_var) + r"\s*=\s*(?:\(\s*)?"
+        r"(?:[^=;\s][^=;]*?)?"
         + _DYNAMIC_ALLOCATORS_PATTERN.pattern[:-2] + r"\("
     )
     start = max(0, sink_line - 200)
@@ -1259,10 +1395,11 @@ def _downstream_check_suppresses_finding(
             ((repo_root or _DEFAULT_REPO_ROOT) / sink_path).resolve()
         )
 
-    try:
-        with open(sink_path_abs, encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-    except OSError:
+    # Blanked view: a multi-line block comment (or #if 0-style dead
+    # text inside strings) containing ``if (size < 0) return ...``
+    # must not mint NOT_EXPLOITABLE on an unbounded-write finding.
+    lines = _sanitized_lines(sink_path_abs)
+    if lines is None:
         return False
 
     # Scan forward up to 30 lines (typical alloc-then-validate-then-use
@@ -1281,8 +1418,13 @@ def _downstream_check_suppresses_finding(
     var_rel_re = re.compile(
         r"\b" + re.escape(var_name) + r"\s*(?:[<>]=?|==|!=)"
     )
+    # The gap between `if(` and the comparison is bounded: with an
+    # unbounded gap, hostile source repeating `if(` on one line makes
+    # every opener re-scan the rest of the line — quadratic. Real
+    # conditions sit well inside 512 chars (beyond it the guard is
+    # not credited — the conservative direction for this witness).
     var_in_if = re.compile(
-        r"\bif\s*\(.*?" + var_rel_re.pattern,
+        r"\bif\s*\(.{0,512}?" + var_rel_re.pattern,
     )
     has_relational = re.compile(r"(?<![<>])[<>](?![<>=])|[<>]=")
 
@@ -1306,7 +1448,6 @@ def _downstream_check_suppresses_finding(
     return False
 
 
-_COMMENT_STRIP_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 _LINE_COMMENT_STRIP_RE = re.compile(r"//.*$", re.MULTILINE)
 
 _EARLY_EXIT_RE = re.compile(r"\b(?:return\b|continue\b|break\b|goto\b)")
@@ -1353,7 +1494,7 @@ def _if_scope_has_early_exit(
 
     max_scan = min(if_idx + 20, len(lines))
     for j in range(if_idx, max_scan):
-        stripped = _COMMENT_STRIP_RE.sub("", lines[j])
+        stripped = _sub_block_comments(lines[j], cross_lines=True)
         stripped = _LINE_COMMENT_STRIP_RE.sub("", stripped)
         if j == if_idx:
             stripped = stripped[if_col:]
@@ -1622,7 +1763,10 @@ def _privilege_back_walk_suppresses(
         return False
 
     facts = _gather_prereqs_cached(target)
-    if facts is None or facts.is_skipped:
+    if facts is None or facts.is_skipped or not facts.complete:
+        # "Every path is gated" quantifies over the caller map; an
+        # incomplete sweep may be missing an ungated caller, so the
+        # suppression claim needs the complete map.
         return False
 
     callers = facts.callers_of(finding_fn)
@@ -1659,7 +1803,7 @@ def _path_is_gated(
     result: SourceIntelResult,
     *,
     remaining_depth: int,
-    visited: frozenset[str],
+    visited: frozenset[str] | set[str],
     fn_file: str | None = None,
 ) -> bool:
     """Multi-hop helper: True iff every call path reaching ``fn_name``
@@ -1781,10 +1925,16 @@ def _wur_annotation_trustworthy(file_path: str, function_name: str) -> bool:
     # the inventory's tree-sitter parser.
     body_lines = _function_body_via_inventory(file_path, function_name)
     if body_lines is None:
-        try:
-            with Path(file_path).open(encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()
-        except OSError:
+        # Comment/string-blanked view (shared _sanitized_lines
+        # chokepoint): both defense layers below are per-line lexical
+        # passes, and over raw text a WUR-annotated no-op could carry
+        # its "body" inside one multi-line block comment — the
+        # interior lines have no comment markers, so they counted as
+        # statements (defeating the triviality check) and their
+        # `return r;` read as a varying return (defeating constancy).
+        # The blanked view is what the code actually says.
+        lines = _sanitized_lines(file_path)
+        if lines is None:
             return True
 
         fn_open_line = _find_function_definition_open(
@@ -1868,6 +2018,7 @@ def _function_body_via_inventory(
     inv, target_dir = _lookup_cached_inventory(file_path)
     if inv is None:
         return None
+    assert target_dir is not None
     try:
         from pathlib import Path
         rel = str(Path(file_path).resolve().relative_to(target_dir))
@@ -1894,10 +2045,13 @@ def _function_body_via_inventory(
             continue
         if not isinstance(line_end, int) or line_end < line_start:
             continue
-        try:
-            with Path(file_path).open(encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()
-        except OSError:
+        # Comment/string-blanked view: the inventory anchors only the
+        # BODY BOUNDS — the triviality / return-constancy counting
+        # over the slice is the same per-line lexical pass as the
+        # regex path, so raw lines made the "preferred" path equally
+        # forgeable by a block-comment body.
+        lines = _sanitized_lines(file_path)
+        if lines is None:
             return None
         # Convert inventory 1-indexed inclusive range → 0-indexed slice.
         if line_end > len(lines):
@@ -1906,8 +2060,15 @@ def _function_body_via_inventory(
     return None
 
 
+# Bounded return-type window with a gated pointer star: the naive
+# ``[A-Za-z_][A-Za-z_0-9*\s]*?\s+\*?\s*`` chained overlapping
+# whitespace-capable spans, so a declaration-shaped line ending in a
+# long token run with no paren cost every split of the run — cubic
+# even at the anchored match call. 256 chars sits far above real
+# return types (trade-off both directions: larger admits absurd
+# types, smaller drops them).
 _FN_DEF_OPEN_RE = re.compile(
-    r"^\s*(?:[A-Za-z_][A-Za-z_0-9*\s]*?\s+\*?\s*)?"  # optional return type
+    r"^\s*(?:[A-Za-z_][A-Za-z_0-9*\s]{0,256}?\s+(?:\*\s*)?)?"
     r"(?P<name>[A-Za-z_][A-Za-z_0-9]*)\s*\("
 )
 
@@ -1931,7 +2092,7 @@ def _find_function_definition_open(
         # Strip comments first — `int foo(void) /* ... ; ... */` has `;`
         # in the comment but is still a definition.
         for j in range(i, min(i + 5, len(lines))):
-            stripped = re.sub(r"/\*.*?\*/", "", lines[j], flags=re.DOTALL)
+            stripped = _sub_block_comments(lines[j], cross_lines=True)
             stripped = re.sub(r"//.*$", "", stripped, flags=re.MULTILINE)
             if "{" in stripped:
                 return j
@@ -1975,7 +2136,7 @@ def _count_statements(body_lines: list) -> int:
     """
     count = 0
     for line in body_lines:
-        stripped = re.sub(r"/\*.*?\*/", "", line, flags=re.DOTALL)
+        stripped = _sub_block_comments(line, cross_lines=True)
         stripped = re.sub(r"//.*$", "", stripped, flags=re.MULTILINE)
         stripped = stripped.strip()
         if not stripped:
@@ -1989,7 +2150,25 @@ def _count_statements(body_lines: list) -> int:
     return count
 
 
-_RETURN_VALUE_RE = re.compile(r"\breturn\s+([^;]+?)\s*;")
+# The value group is \S-delimited: the naive trim spelling
+# ([^;]+?)\s*; overlaps the lazy value and the following whitespace
+# span on whitespace, and a 'return'-opening line ending in a long
+# whitespace run with no ';' makes the engine try every split of the
+# run between them — cubic in the line length. Real return values
+# capture identically; the one dropped corner is a whitespace-only
+# value ('return  ;'), which previously appended an empty normalized
+# value and now skips like the bare 'return;' the docstring already
+# excludes.
+# The interior span is bounded ({0,400}): unbounded, a line that
+# repeats 'return '-shaped heads with the ';' withheld makes every
+# planted head re-scan the rest of the line — quadratic on a
+# hostile line (measured exp 1.98; bounded, exp 1.0).  Both
+# directions: raising the bound re-opens per-head rescan cost;
+# lowering it drops long-but-real one-line return expressions from
+# the value census (402 chars covers any sane spelling).
+_RETURN_VALUE_RE = re.compile(
+    r"\breturn\s+([^;\s](?:[^;]{0,400}[^;\s])?)\s*;",
+)
 
 
 def _extract_return_values(body_lines: list) -> list:
@@ -2001,7 +2180,7 @@ def _extract_return_values(body_lines: list) -> list:
     """
     values = []
     for line in body_lines:
-        stripped = re.sub(r"/\*.*?\*/", "", line, flags=re.DOTALL)
+        stripped = _sub_block_comments(line, cross_lines=True)
         stripped = re.sub(r"//.*$", "", stripped, flags=re.MULTILINE)
         m = _RETURN_VALUE_RE.search(stripped)
         if m:
@@ -2120,10 +2299,10 @@ def _stack_protector_suppresses_finding(
         sink_path_abs = str(
             ((repo_root or _DEFAULT_REPO_ROOT) / sink_path).resolve()
         )
-    try:
-        with open(sink_path_abs, encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-    except OSError:
+    # Blanked view: a comment ``/* char buf[64] legacy */`` above the
+    # sink must not satisfy the fixed-size-stack-buffer gate.
+    lines = _sanitized_lines(sink_path_abs)
+    if lines is None:
         return False
     # Search window: 10 lines back from sink (the buffer declaration
     # is typically near the top of the function).
@@ -2132,4 +2311,12 @@ def _stack_protector_suppresses_finding(
     fixed_array_re = re.compile(
         r"\b[A-Za-z_][A-Za-z_0-9]*\s+[A-Za-z_][A-Za-z_0-9]*\s*\[\s*\d+\s*\]"
     )
-    return any(fixed_array_re.search(lines[i]) for i in range(start, end))
+    if not any(fixed_array_re.search(lines[i]) for i in range(start, end)):
+        return False
+    # Trust gate LAST (declared build config is plantable — see
+    # _build_flags_trusted): reaching it means the evidence matched,
+    # so the withheld direction gets its visibility notice.
+    if not _build_flags_trusted(repo_root):
+        _notice_untrusted_build_flags("stack-protector")
+        return False
+    return True

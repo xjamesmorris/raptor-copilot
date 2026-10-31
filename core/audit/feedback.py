@@ -1,5 +1,6 @@
 """/validate → /audit feedback loop (Reflexion pattern — Shinn et
-al., NeurIPS 2023, arXiv:2303.11366; see docs/references.md).
+al., "Reflexion: Language Agents with Verbal Reinforcement
+Learning", NeurIPS 2023, arXiv:2303.11366).
 
 Reads a /validate report (Stage-D ``stage-d.json`` or final
 ``findings.json``), matches findings back to prior audit review
@@ -177,9 +178,13 @@ def _mechanical_disqualifier(
     - ``smt_paths_infeasible`` — the Stage-B SMT sweep proved every
       linked attack path's conditions jointly unsatisfiable.
     - ``sanity_check_failed+structural`` — Stage C's ruling is
-      corroborated by a mechanical structural fact (Coccinelle
-      ``function_exists=False`` or the C0 checklist lookup failing);
-      a bare ``sanity_check_failed`` is LLM output and does not count.
+      corroborated by a mechanical structural fact: a positive
+      Coccinelle absence witness (see :func:`_cocci_absence_witness`
+      — the producer's applicable, non-skipped record with
+      ``checks.function_exists`` False) or the C0 checklist lookup
+      failing. A bare ``sanity_check_failed`` is LLM output and does
+      not count; neither does an abstained or forged-flat cocci
+      record.
     """
     ruling = finding.get("ruling")
     if not isinstance(ruling, dict):
@@ -204,16 +209,38 @@ def _mechanical_disqualifier(
             return "smt_paths_infeasible"
 
     if disqualifier == "sanity_check_failed":
-        cocci = finding.get("cocci_prereqs")
-        if not isinstance(cocci, dict):
-            cocci = {}
         if (
-            cocci.get("function_exists") is False
+            _cocci_absence_witness(finding.get("cocci_prereqs"))
             or finding.get("checklist_verified") is False
         ):
             return "sanity_check_failed+structural"
 
     return None
+
+
+def _cocci_absence_witness(cocci: Any) -> bool:
+    """True only for a POSITIVE absence witness in the producer's
+    own shape (packages.coccinelle.prereqs.evaluate_finding):
+    an applicable, non-skipped record whose nested
+    ``checks.function_exists`` is exactly False.
+
+    A bare/flat ``{"function_exists": false}`` — a shape no
+    mechanical producer emits — must not count: accepting it let a
+    hand-rolled field upgrade a bare LLM ``sanity_check_failed``
+    into the accepted mechanical-refutation class. Abstentions
+    (``null`` from a partial sweep or an uncovered file class) and
+    skipped records never corroborate either.
+    """
+    if not isinstance(cocci, dict):
+        return False
+    if cocci.get("applicable") is not True:
+        return False
+    if cocci.get("skipped_reason") is not None:
+        return False
+    checks = cocci.get("checks")
+    if not isinstance(checks, dict):
+        return False
+    return checks.get("function_exists") is False
 
 
 def import_validation_results(
@@ -266,7 +293,9 @@ def import_validation_results(
     report = load_json(validation_report, max_bytes=64 * 1024 * 1024)
     if report is None:
         logger.warning("failed to load validation report %s", validation_report)
-        return {"updated": 0, "downgraded": 0, "upgraded": 0, "corroborated": 0, "skipped": 0}
+        return {"updated": 0, "downgraded": 0, "downgraded_clean": 0,
+                "downgraded_suspicious": 0, "upgraded": 0,
+                "corroborated": 0, "skipped": 0}
 
     findings = _extract_findings(report)
 
@@ -290,6 +319,14 @@ def import_validation_results(
     counts = {
         "updated": 0,
         "downgraded": 0,
+        # Referee-outcome split of "downgraded": a mechanical
+        # disqualifier (or an LLM-tier prior) licenses the clean
+        # downgrade; an LLM-only ruling against a tool-evidenced
+        # finding only demotes to suspicious. Consumers rendering
+        # the counts must label the two transitions distinctly —
+        # "downgraded" alone does not say where the verdict landed.
+        "downgraded_clean": 0,
+        "downgraded_suspicious": 0,
         "upgraded": 0,
         "corroborated": 0,
         "skipped": 0,
@@ -361,6 +398,23 @@ def import_validation_results(
         prior_entry = prior_by_key.get(key)
         audit_status = prior_entry.verdict if prior_entry else ""
         prior_body = prior_entry.body if prior_entry else ""
+        if (prior_entry is not None and not prior_body
+                and getattr(prior_entry, "body_offload", None)
+                and audit_out_dir):
+            # Slim-tier stub (journal compact --slim-clean): restore
+            # the prior prose from the run sidecar so the correction
+            # row carries the reasoning it corrects. Unresolvable →
+            # the correction lands with an empty body (prose-only
+            # degrade; verdict/lesson fields are inline regardless).
+            try:
+                from core.coverage.journal_sidecar import resolve_offload
+                fields = resolve_offload(audit_out_dir, prior_entry)
+                body = fields.get("body") if fields else None
+                if isinstance(body, str):
+                    prior_body = body
+            except Exception:  # noqa: BLE001 — sidecar is run-dir content; containment boundary
+                logger.debug("sidecar hydration failed for %s", key,
+                             exc_info=True)
 
         # Machine-tier path: annotations without human grade — legacy
         # pre-migration LLM verdicts, agent-sourced notes, and human
@@ -533,6 +587,11 @@ def import_validation_results(
 
         counts["updated"] += 1
         counts[transition["kind"]] += 1
+        if transition["kind"] == "downgraded":
+            if transition.get("new_status") == "suspicious":
+                counts["downgraded_suspicious"] += 1
+            else:
+                counts["downgraded_clean"] += 1
 
         # Reliability event for the model that made the prior claim.
         # Decoy-vetoed disprovals carry no signal about THIS verdict
@@ -592,7 +651,7 @@ def _deduplicate_findings(
         if fid:
             key = ("id", str(fid))
         else:
-            key = (
+            key = (  # type: ignore[assignment]
                 finding.get("file", ""),
                 finding.get("function", ""),
                 _finding_cwe(finding),
@@ -658,7 +717,7 @@ def _sanitize_markdown(text: str) -> str:
     annotation parser would interpret as real function headings.
     """
     lines = []
-    for line in text.split("\n"):
+    for line in text.split("\n"):  # line-model: per-line prefix sanitiser; \r never inspected
         stripped = line.lstrip()
         if stripped.startswith("#"):
             line = stripped.lstrip("#").lstrip()

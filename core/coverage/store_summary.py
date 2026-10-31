@@ -14,22 +14,58 @@ shown alongside.
 
 from __future__ import annotations
 
+from collections import deque
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from core.json import loads
 
+from core.inventory.script_handler import script_handler_stamp
+
 from .registry import DEPTH_SCANNED, category_of, depth_of
-from .store import CoverageStore, iter_inventory_functions
+from .schema import iter_file_entries
+from .store import CoverageStore, iter_inventory_items
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
 _CATEGORIES = ("static", "llm", "runtime")
+
+# Byte budget for the coverage-progress trail read. One row per
+# completed run (~200 bytes) — even thousand-run projects stay under
+# a MiB; the ceiling only exists so a planted/imported trail cannot
+# grow the render's read unbounded (the trail sits in the writable
+# project dir and ships in project archives).
+_MAX_PROGRESS_BYTES = 64 * 1024 * 1024
 # Kinds an LLM reviews unit-by-unit. The LLM-review gap is scoped to these:
 # globals/macros/typedefs/classes are whole-file-scanner territory and
-# interstitial is glue — listing them overstates "unreviewed".
+# interstitial is glue — listing them overstates "unreviewed". EXCEPT the
+# script-per-file handler spans: an interstitial whose builder-persisted
+# ``script_handler`` stamp is True is the unit gap selection schedules for
+# review (a classic PHP request handler), so it belongs in the reviewable
+# denominator too — on script-heavy trees the handler share is roughly a
+# third of the scheduled units, and excluding it made the coverage report
+# claim completion the review loop never had. Stamp absent (a pre-stamp
+# checklist) keeps the old exclusion: this is a reporting surface with no
+# source access, and understating "reviewable" is the safe direction
+# (never overstates "reviewed").
 _REVIEWABLE_KINDS = ("function", "top_level")
+
+
+def _is_reviewable(kind: str, item: dict[str, Any]) -> bool:
+    """Unit-by-unit LLM-reviewable: the fixed kinds, plus stamped
+    script-handler interstitials (see _REVIEWABLE_KINDS)."""
+    if kind in _REVIEWABLE_KINDS:
+        return True
+    return kind == "interstitial" and script_handler_stamp(item) is True
+
+
+def _str_members(value: Any) -> list[str]:
+    """The string members of a run-dir JSON list value ([] for any
+    other shape) — set-update/sorted()-safe intake for record fields."""
+    if not isinstance(value, list):
+        return []
+    return [v for v in value if isinstance(v, str)]
 
 
 def _workflow_step_files(checklist: dict[str, Any]) -> set[str]:
@@ -42,9 +78,9 @@ def _workflow_step_files(checklist: dict[str, Any]) -> set[str]:
     checklists written before the per-file ``language`` field.
     """
     out: set[str] = set()
-    for fe in checklist.get("files", []):
+    for fe in iter_file_entries(checklist):
         path = fe.get("path")
-        if not path:
+        if not path or not isinstance(path, str):
             continue
         if (fe.get("language") == "yaml"
                 or ".github/workflows/" in path.replace("\\", "/")):
@@ -86,18 +122,27 @@ def file_level_view(run_dirs: Iterable[Path]) -> dict[str, Any]:
                 "target_path": md.get("target_path"),
             })
         for rec in load_records(rd):
+            if not isinstance(rec, dict):
+                # load_records may yield one legacy list-of-records
+                # element (an audit-loader contract, spliced flat
+                # there) — this render lane consumes record OBJECTS
+                # only; a list rec crashed every summary render.
+                continue
             tool = rec.get("tool")
             if not tool:
                 continue
             t = tools.setdefault(
                 tool, {"files": set(), "versions": set(), "rules": set(), "newest": None}
             )
-            t["files"].update(rec.get("files_examined", []) or [])
-            if rec.get("version"):
+            # Records are run-dir JSON: keep only string members —
+            # a non-string (or unhashable) element crashed the set
+            # updates and the sorted() views this function feeds.
+            t["files"].update(_str_members(rec.get("files_examined")))
+            if isinstance(rec.get("version"), str):
                 t["versions"].add(rec["version"])
-            t["rules"].update(rec.get("rules_applied", []) or [])
+            t["rules"].update(_str_members(rec.get("rules_applied")))
             ts = rec.get("timestamp")
-            if ts and (t["newest"] is None or ts > t["newest"]):
+            if isinstance(ts, str) and (t["newest"] is None or ts > t["newest"]):
                 t["newest"] = ts
     return {
         "tools": {
@@ -178,40 +223,73 @@ def format_progress_trend(store_path) -> str | None:
     if not store_path:
         return None
     progress = Path(store_path).parent / "coverage-progress.jsonl"
-    if not progress.is_file():
+    rows: deque[dict[str, Any]] = deque(maxlen=2)
+    row_count = 0
+    # fd-discipline open + running byte budget: the trail sits in the
+    # writable project dir (and ships in project archives), this line
+    # renders on EVERY coverage report, and the pre-fix reader
+    # retained every row and iterated unbounded lines — one planted
+    # multi-MB trail added hundreds of MB of peak RSS to every
+    # render. Only the LAST TWO rows are ever needed (current +
+    # previous), so retention is a two-slot deque; the budgeted
+    # readline keeps one capped chunk the worst case (journal-reader
+    # idiom).
+    from core.source import open_regular
+    f = open_regular(progress, "rb")
+    if f is None:
         return None
-    rows = []
     try:
-        with Path(progress).open(encoding="utf-8") as f:
-            for line in f:
+        with f:
+            budget = _MAX_PROGRESS_BYTES
+            while True:
+                line = f.readline(budget + 1)
+                if not line:
+                    break
+                budget -= len(line)
+                if budget < 0:
+                    # Over-budget trail: the tail (the rows that
+                    # matter) is beyond the cap — no trustworthy
+                    # trend to report.
+                    return None
                 line = line.strip()
                 if not line:
                     continue
                 try:
                     row = loads(line)
-                except ValueError:
+                except Exception:  # noqa: BLE001 — row containment boundary
+                    # Any parse failure (malformed JSON, nesting bomb
+                    # raising RecursionError on the stdlib backend)
+                    # quarantines this line.
                     continue
                 # Valid JSON that isn't an object (a bare ``null`` /
                 # number / string line) would AttributeError on
                 # ``.get`` below — skip like a malformed line.
                 if isinstance(row, dict):
                     rows.append(row)
+                    row_count += 1
     except OSError:
         return None
     if not rows:
         return None
+
+    def _count(row: dict[str, Any], key: str) -> int:
+        # Genuine ints only — a forged string count crashed the delta
+        # subtraction below on every render.
+        v = row.get(key, 0)
+        return v if isinstance(v, int) and not isinstance(v, bool) else 0
+
     last = rows[-1]
-    reviewed = last.get("llm_reviewed", 0)
-    reviewable = last.get("llm_reviewable", 0)
-    if len(rows) == 1:
+    reviewed = _count(last, "llm_reviewed")
+    reviewable = _count(last, "llm_reviewable")
+    if row_count == 1:
         return (f"  Progress: {reviewed}/{reviewable} reviewed "
                 f"after {last.get('run', '?')} (1 run recorded)")
     prev = rows[-2]
-    delta = reviewed - prev.get("llm_reviewed", 0)
+    delta = reviewed - _count(prev, "llm_reviewed")
     sign = "+" if delta >= 0 else ""
     return (f"  Progress: {reviewed}/{reviewable} reviewed "
             f"({sign}{delta} in {last.get('run', '?')}; "
-            f"{len(rows)} runs recorded)")
+            f"{row_count} runs recorded)")
 
 
 def render_coverage(
@@ -302,7 +380,7 @@ def file_breakdown(store: CoverageStore, checklist: dict[str, Any]) -> list[dict
     reviewable units, examined items, findings, and file coverage %. Sorted
     worst-first by LLM-review ratio so files needing attention surface first."""
     files: dict[str, dict[str, Any]] = {}
-    for f, _name, lo, hi, kind in iter_inventory_functions(checklist):
+    for f, _name, lo, hi, kind, item in iter_inventory_items(checklist):
         high = hi if hi is not None else lo
         row = files.setdefault(f, {
             "path": f, "items": 0, "reviewable": 0, "llm": 0, "examined": 0})
@@ -310,7 +388,7 @@ def file_breakdown(store: CoverageStore, checklist: dict[str, Any]) -> list[dict
         cov = store.tool_coverage_of_range(f, lo, high)
         if store.function_verdict(f, lo, high) != "unexamined":
             row["examined"] += 1
-        if kind in _REVIEWABLE_KINDS:
+        if _is_reviewable(kind, item):
             row["reviewable"] += 1
             # reviewed = deep llm review (depth >= analysed), not a whole-file read.
             if any(category_of(t) == "llm" and depth_of(t) != DEPTH_SCANNED
@@ -360,17 +438,29 @@ def format_file_breakdown(rows: list[dict[str, Any]], max_files: int = 40) -> st
 def render_run_coverage(run_dir) -> str | None:
     """Single-run convenience wrapper over :func:`render_coverage` (used by
     /agentic and standalone /scan end-of-run printing). Read-only."""
-    from core.json import load_json
+    from core.inventory import read_checklist
 
     run = Path(run_dir)
     return render_coverage(
-        [run], load_json(run / "checklist.json"), run / "coverage.json",
+        [run],
+        # Accessor read: flock + project-symlink resolution + the
+        # sharded checklist/ layout, under the checklist budget class.
+        read_checklist(run),
+        run / "coverage.json",
         annotations_base=run / "annotations",
     )
 
 
 def store_llm_coverage_percent(view: dict[str, Any]) -> float:
-    """Percent of REVIEWABLE units (function/top_level) with LLM coverage."""
+    """Percent of REVIEWABLE units (function/top_level) with LLM coverage.
+
+    A view with ZERO reviewable units reads as 100.0 (vacuously
+    covered) — callers gating on the number must surface the
+    degenerate-inventory case themselves (see
+    :func:`store_coverage_threshold_met` and the format notice) so an
+    empty or extraction-failed inventory doesn't silently satisfy a
+    ``--fail-under`` gate.
+    """
     total = view.get("llm_reviewable", 0)
     if not total:
         return 100.0
@@ -379,6 +469,16 @@ def store_llm_coverage_percent(view: dict[str, Any]) -> float:
 
 
 def store_coverage_threshold_met(view: dict[str, Any], fail_under: float) -> bool:
+    if not view.get("llm_reviewable", 0):
+        # Degenerate inventory: 0 reviewable units passes ANY
+        # threshold vacuously. Loud, because the common cause is an
+        # empty/failed inventory extraction, not a genuinely
+        # function-free target.
+        from core.logging import get_logger
+        get_logger(__name__).warning(
+            "coverage threshold check: inventory has 0 reviewable "
+            "units — the %.1f%% gate is vacuously satisfied",
+            fail_under)
     return store_llm_coverage_percent(view) >= fail_under
 
 
@@ -440,7 +540,7 @@ def store_view(store: CoverageStore, checklist: dict[str, Any]) -> dict[str, Any
     workflow_files = _workflow_step_files(checklist)
     workflow_excluded = 0
 
-    for file, name, lo, hi, kind in iter_inventory_functions(checklist):
+    for file, name, lo, hi, kind, item in iter_inventory_items(checklist):
         total += 1
         by_kind[kind] = by_kind.get(kind, 0) + 1
         high = hi if hi is not None else lo
@@ -467,14 +567,15 @@ def store_view(store: CoverageStore, checklist: dict[str, Any]) -> dict[str, Any
         for c in _CATEGORIES:
             if c in cats:
                 by_category[c] += 1
-        is_interstitial = kind == "interstitial"
-        # The LLM-review gap lists only REVIEWABLE units (function / top_level).
+        reviewable = _is_reviewable(kind, item)
+        # The LLM-review gap lists only REVIEWABLE units (function /
+        # top_level / stamped script-handler interstitials).
         # Globals/macros/typedefs/classes are whole-file-scanner territory and
-        # interstitial is glue — none are units the LLM reviews one-by-one, so
+        # interstitial glue is not a unit the LLM reviews one-by-one, so
         # listing them overstates "unreviewed" and drowns the real gaps.
         # (Completeness counts above — total/by_kind/examined/verdicts — still
         # include every kind.)
-        if kind in _REVIEWABLE_KINDS:
+        if reviewable:
             # CI workflow jobs/steps carry kind "function" but are not
             # units an LLM reviews one-by-one — scanners own them.
             # Leading the gap with `.github/workflows/...:job:ci.step-N`
@@ -495,9 +596,12 @@ def store_view(store: CoverageStore, checklist: dict[str, Any]) -> dict[str, Any
 
         verdicts[verdict] = verdicts.get(verdict, 0) + 1
         # The re-review gap: never examined (by ANY tool) or found-then-lost.
-        # Interstitial glue excluded; other kinds kept — a genuinely unexamined
-        # global (no scanner ran over it) is a real gap worth surfacing.
-        if verdict in ("unexamined", "found_then_lost") and not is_interstitial:
+        # Interstitial glue excluded — but stamped script-handler spans are
+        # reviewable units, not glue; other kinds kept — a genuinely
+        # unexamined global (no scanner ran over it) is a real gap worth
+        # surfacing.
+        if verdict in ("unexamined", "found_then_lost") and (
+                kind != "interstitial" or reviewable):
             review_gap.append(
                 {"file": file, "function": name, "line": lo, "verdict": verdict}
             )
@@ -547,6 +651,13 @@ def format_store_view(view: dict[str, Any], max_gap: int = 15) -> str:
         lines.append(
             f"    llm-reviewed: {rev}/{reviewable} reviewable units "
             f"({_pct(rev, reviewable):.1f}%) — whole-file reads excluded")
+    else:
+        # Degenerate inventory: any --fail-under gate is vacuously
+        # satisfied at 0 reviewable units — say so instead of
+        # silently omitting the line.
+        lines.append(
+            "    llm-reviewed: 0 reviewable units in the inventory "
+            "(coverage thresholds are vacuously satisfied)")
     v = view.get("verdicts")
     if v:
         lines.append("  Verdict:")
@@ -590,4 +701,220 @@ def format_store_view(view: dict[str, Any], max_gap: int = 15) -> str:
             f"    {_defang(g['file'])}:{_defang(g['function'])} "
             f"@ {g['line']}" for g in shown)
 
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# External-scanner overlay views (the analyzed-units projection —
+# packages/openant/coverage.py writes the records; any future external
+# scanner that emits a ``scanner_coverage`` record joins for free).
+# ---------------------------------------------------------------------------
+
+
+def _reviewed_functions(store: CoverageStore,
+                        checklist: dict[str, Any]) -> set[tuple[str, str]]:
+    """``{(file, name)}`` of inventory items with a REVIEW-grade
+    llm mark — the same depth screen as :func:`store_view` (scanner /
+    read / understand marks never qualify). Walks the full item
+    inventory (stamped script-handler spans included), no kind filter:
+    any item a review-grade mark covers belongs in the intersection."""
+    reviewed: set[tuple[str, str]] = set()
+    for file, name, lo, hi, _kind, _item in iter_inventory_items(checklist):
+        high = hi if hi is not None else lo
+        cov = store.tool_coverage_of_range(file, lo, high)
+        if any(category_of(t) == "llm" and depth_of(t) != DEPTH_SCANNED
+               for t in cov):
+            reviewed.add((file, name))
+    return reviewed
+
+
+def scanner_overlay_view(
+    run_dirs: Iterable[Path],
+    checklist: dict[str, Any] | None,
+    store_path: Path | str | None,
+    annotations_base: Path | str | None = None,
+) -> list[dict[str, Any]] | None:
+    """Per-scanner view over the analyzed-units overlay records.
+
+    For every ``scanner_coverage``-carrying coverage record across the
+    run dirs, aggregated per tool label: which inventory functions the
+    scanner analysed, how many of those ALSO have a RAPTOR LLM review,
+    and the scanner-only residual (analysed by the scanner, reviewed by
+    no one — the set worth routing to --gap-audit or another lane),
+    plus the records' own unit accounting and provenance. Deferred
+    records whose recorded target does not bind to THIS inventory's
+    target are refused the join here exactly like the store import
+    (``importer._deferred_join_refused`` — fail-closed), shown with a
+    ``deferred-refused`` join mode instead. ``None`` when there is no
+    inventory; ``[]`` when no overlay records exist.
+    """
+    if not checklist:
+        return None
+    from core.coverage.record import load_records
+
+    from .importer import (
+        _checklist_target,
+        _deferred_join_refused,
+        _function_ranges,
+        _inventory_paths,
+        _to_inventory_path,
+    )
+    from .summary import _inventory_name_index
+
+    inv_target = _checklist_target(checklist)
+    store = _build_store(run_dirs, checklist, store_path, annotations_base)
+    reviewed = _reviewed_functions(store, checklist)
+    ranges = _function_ranges(checklist, normalise_hi=True)
+    inv_paths = _inventory_paths(checklist)
+    inv_index = _inventory_name_index(inv_paths)
+
+    # Numeric accounting keys summed across a tool's records; the rest
+    # of scanner_coverage rides per-run in ``runs``.
+    _SUM_KEYS = ("units_analyzed", "units_matched", "units_unmatched",
+                 "units_error")
+    tools: dict[str, dict[str, Any]] = {}
+    for rd in run_dirs:
+        rd = Path(rd)
+        for rec in load_records(rd):
+            if not isinstance(rec, dict):
+                continue
+            sc = rec.get("scanner_coverage")
+            tool = rec.get("tool")
+            if not isinstance(sc, dict) or not isinstance(tool, str):
+                continue
+            agg = tools.setdefault(tool, {
+                "tool": tool, "functions": set(), "units": {}, "runs": [],
+            })
+            join_refused = _deferred_join_refused(rec, inv_target)
+            if not join_refused:
+                for fa in rec.get("functions_analysed") or []:
+                    if not isinstance(fa, dict):
+                        continue
+                    file = fa.get("file")
+                    name = fa.get("function")
+                    if not isinstance(file, str) or not isinstance(name, str) \
+                            or not file or not name:
+                        continue
+                    key = (_to_inventory_path(file, inv_paths, inv_index), name)
+                    if key in ranges:
+                        agg["functions"].add(key)
+            for k in _SUM_KEYS:
+                v = sc.get(k)
+                if isinstance(v, int) and not isinstance(v, bool):
+                    agg["units"][k] = agg["units"].get(k, 0) + v
+            if sc.get("truncated"):
+                agg["units"]["truncated"] = True
+            if sc.get("overlap_explosion"):
+                agg["units"]["overlap_explosion"] = True
+            run_row: dict[str, Any] = {"run": rd.name}
+            for k in ("source", "model", "level", "join"):
+                v = sc.get(k)
+                if isinstance(v, str) and v:
+                    run_row[k] = v
+            if join_refused:
+                # Same fail-closed rule as the store import: the
+                # deferred rows never join a foreign inventory; the
+                # record stays visible with its accounting.
+                run_row["join"] = "deferred-refused"
+            agg["runs"].append(run_row)
+
+    out: list[dict[str, Any]] = []
+    for tool in sorted(tools):
+        agg = tools[tool]
+        funcs = agg["functions"]
+        unreviewed = sorted(funcs - reviewed)
+        out.append({
+            "tool": tool,
+            "functions_analysed": len(funcs),
+            "also_reviewed": len(funcs & reviewed),
+            "unreviewed": [
+                {"file": f, "function": n, "line": ranges[(f, n)][0]}
+                for f, n in unreviewed],
+            "units": agg["units"],
+            "runs": agg["runs"],
+        })
+    return out
+
+
+def format_scanner_overlay(rows: list[dict[str, Any]],
+                           max_list: int = 15) -> str:
+    """Render :func:`scanner_overlay_view` as an operator-facing
+    section. Every record-derived string (tool label, provenance
+    fields, file/function names) is terminal-defanged — the overlay
+    records quote child-written scan artifacts."""
+    if rows is None:
+        return "No coverage data (missing checklist.json)."
+    if not rows:
+        return ("No external-scanner overlay records found "
+                "(run /openant or /agentic --openant first).")
+    lines = ["External-scanner coverage overlay (scanner grade — "
+             "never review credit):"]
+    for row in rows:
+        units = row.get("units") or {}
+        lines.append(
+            f"  {_defang(row['tool'])}: {row['functions_analysed']} "
+            f"inventory function(s) analysed; "
+            f"{row['also_reviewed']} also LLM-reviewed; "
+            f"{len(row['unreviewed'])} scanner-only")
+        analyzed = units.get("units_analyzed")
+        if analyzed is not None:
+            bits = [f"{analyzed} analysed"]
+            if units.get("units_unmatched"):
+                bits.append(f"{units['units_unmatched']} unmatched")
+            if units.get("units_error"):
+                bits.append(f"{units['units_error']} errored")
+            if units.get("truncated"):
+                bits.append("TRUNCATED at the intake budget — "
+                            "partial overlay")
+            if units.get("overlap_explosion"):
+                bits.append("WARNING: span blowup — extent suspect")
+            runs_count = len(row.get("runs") or [])
+            summed = (f" (summed across {runs_count} records)"
+                      if runs_count > 1 else "")
+            lines.append(f"    units: {', '.join(bits)}{summed}")
+        for run in row.get("runs") or []:
+            detail = ", ".join(
+                f"{k}={_defang(run[k])}" for k in
+                ("source", "model", "level", "join") if k in run)
+            lines.append(f"    run {_defang(run.get('run') or '?')}"
+                         + (f": {detail}" if detail else ""))
+        shown = row["unreviewed"][:max_list]
+        if shown:
+            lines.append(
+                f"    analysed by {_defang(row['tool'])} but reviewed by "
+                f"no lane (first {len(shown)} of "
+                f"{len(row['unreviewed'])}):")
+            lines.extend(
+                f"      {_defang(g['file'])}:{_defang(g['function'])} "
+                f"@ {g['line']}" for g in shown)
+    return "\n".join(lines)
+
+
+def no_lane_residual(view: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """The actionable residual: checklist functions with ZERO coverage
+    of any grade (no tool mark, no finding — verdict ``unexamined``).
+    Derived from :func:`store_view`'s review gap; found-then-lost items
+    are deliberately excluded (they HAD coverage — the main report
+    already flags them for re-examination)."""
+    if not view:
+        return []
+    return [g for g in view.get("review_gap", [])
+            if g.get("verdict") == "unexamined"]
+
+
+def format_no_lane_residual(residual: list[dict[str, Any]],
+                            max_list: int = 200) -> str:
+    """Render :func:`no_lane_residual` ('' never — always states the
+    count, zero included)."""
+    if not residual:
+        return "Every checklist item has coverage from at least one lane."
+    lines = [f"{len(residual)} item(s) analysed by NO lane "
+             f"(no scanner, no LLM, no runtime — route to --gap-audit, "
+             f"another lane, or a fuller scan config):"]
+    shown = residual[:max_list]
+    lines.extend(
+        f"  {_defang(g['file'])}:{_defang(g['function'])} @ {g['line']}"
+        for g in shown)
+    if len(residual) > max_list:
+        lines.append(f"  … (+{len(residual) - max_list} more)")
     return "\n".join(lines)

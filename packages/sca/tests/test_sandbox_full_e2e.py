@@ -34,11 +34,10 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
-linux_only = pytest.mark.skipif(
-    sys.platform != "linux",
-    reason="sandbox composition uses Landlock + namespaces "
-           "(Linux-only kernel features)",
-)
+# sandbox composition uses Landlock + namespaces  (Linux-only kernel features)
+# Real-Linux-kernel binding: these tests carry the linux_native
+# marker (pytest.ini) instead of an ad hoc skipif — honest skip on
+# other native platforms, deselected under the darwin-emulation gate.
 
 
 def _build_fixture(repo: Path) -> None:
@@ -64,7 +63,7 @@ def _run_agent(
 # Composition paths
 # ---------------------------------------------------------------------------
 
-@linux_only
+@pytest.mark.linux_native
 def test_sandbox_none_completes(tmp_path: Path) -> None:
     """``--sandbox=none`` — no kernel isolation, just the egress
     proxy. The lightest profile, should work everywhere."""
@@ -84,7 +83,7 @@ def test_sandbox_none_completes(tmp_path: Path) -> None:
 
 
 @pytest.mark.slow
-@linux_only
+@pytest.mark.linux_native
 def test_sandbox_network_only_completes(tmp_path: Path) -> None:
     """``--sandbox=network-only`` — Landlock + egress proxy.
     Should work on stock Linux kernels with Landlock support
@@ -119,7 +118,7 @@ def test_sandbox_network_only_completes(tmp_path: Path) -> None:
     assert (out / "findings.json").is_file()
 
 
-@linux_only
+@pytest.mark.linux_native
 def test_sandbox_audit_emits_audit_record(tmp_path: Path) -> None:
     """``--sandbox=network-only --audit`` records sandbox
     behaviour. Audit file should land somewhere in the output
@@ -151,7 +150,7 @@ def test_sandbox_audit_emits_audit_record(tmp_path: Path) -> None:
             assert p.stat().st_size > 0, f"audit file empty: {p}"
 
 
-@linux_only
+@pytest.mark.linux_native
 def test_sandbox_no_sandbox_overrides_profile(tmp_path: Path) -> None:
     """``--no-sandbox`` overrides any ``--sandbox=`` flag — escape
     hatch for operators that need to debug without the sandbox."""
@@ -175,7 +174,7 @@ def test_sandbox_no_sandbox_overrides_profile(tmp_path: Path) -> None:
 # that the original Tier-7 tests didn't pin.
 # ---------------------------------------------------------------------------
 
-@linux_only
+@pytest.mark.linux_native
 def test_sandbox_audit_engages_proxy_audit_log_mode(
     tmp_path: Path,
 ) -> None:
@@ -217,7 +216,7 @@ def test_sandbox_audit_engages_proxy_audit_log_mode(
     )
 
 
-@linux_only
+@pytest.mark.linux_native
 def test_sandbox_no_audit_does_not_engage_audit_mode(
     tmp_path: Path,
 ) -> None:

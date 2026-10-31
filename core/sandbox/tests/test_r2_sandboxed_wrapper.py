@@ -180,6 +180,47 @@ class TestFastFailMissingBinary:
         assert r.returncode == _RC_BINARY_MISSING, r.stderr
 
 
+class TestSandboxEngageFailureContract:
+    """A sandbox-engage failure must exit with the wrapper's ≥100
+    code (101), never with a code inside r2's own 0-127 range.
+    SandboxSetupError subclasses BaseException by design, so the
+    wrapper has to NAME it in its except tuple — a plain traceback
+    exits 1, which callers misread as "r2 exited 1"."""
+
+    def test_sandbox_setup_error_maps_to_101(self, tmp_path):
+        # Pre-seed sys.modules with a fake core.sandbox whose
+        # sandbox() raises a REAL SandboxSetupError, then execute the
+        # wrapper in-process via runpy. The wrapper's own
+        # `from core.sandbox import sandbox` resolves to the seeded
+        # module, so the engage failure is deterministic and hermetic
+        # (no namespace/userns support needed).
+        code = (
+            "import sys, types, runpy\n"
+            f"sys.path.insert(0, {str(REPO_ROOT)!r})\n"
+            "from core.sandbox.errors import SandboxSetupError\n"
+            "fake = types.ModuleType('core.sandbox')\n"
+            "def _sandbox(**kw):\n"
+            "    raise SandboxSetupError('engage refused (test)')\n"
+            "fake.sandbox = _sandbox\n"
+            "fake.SandboxSetupError = SandboxSetupError\n"
+            "sys.modules['core.sandbox'] = fake\n"
+            f"sys.argv = ['raptor-r2-sandboxed', '-2', '-q0', "
+            f"{_REAL_BINARY!r}]\n"
+            f"runpy.run_path({str(WRAPPER)!r}, run_name='__main__')\n"
+        )
+        env = _trusted_env(OUTPUT_DIR=str(tmp_path))
+        r = subprocess.run(
+            [sys.executable, "-c", code],
+            check=False, env=env, capture_output=True, text=True,
+            timeout=60,
+        )
+        assert r.returncode == _RC_SANDBOX_FAILED, (
+            f"rc={r.returncode}\nstderr:\n{r.stderr}"
+        )
+        assert "SandboxSetupError" in r.stderr
+        assert "Traceback" not in r.stderr
+
+
 class TestSymlinkResolution:
     """Realpath collapses symlinks BEFORE the wrapper proceeds. Closes
     the residual where a binary at /tmp/X/target → /etc/passwd would

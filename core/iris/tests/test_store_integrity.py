@@ -13,15 +13,19 @@ envelope.
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 from pathlib import Path
+
+import pytest
 
 from core.evidence import EvidenceTier
 from core.iris import integrity
 from core.iris.api import get_project_sanitisers
 from core.iris.specs import TaintSpec
 from core.iris.store import load_specs, persist_refined_specs, save_specs
+from core.security import mac_key
 
 
 def _project(tmp_path: Path):
@@ -144,6 +148,69 @@ def test_verified_store_without_target_binding_floors(
     )
     names = get_project_sanitisers(out_dir=run, target_path=target)
     assert names == frozenset()
+
+
+def test_persist_floors_unbound_store_before_rebinding(
+    tmp_path: Path,
+) -> None:
+    """persist_refined_specs re-saves the merged envelope WITH a fresh
+    target binding: a verified-but-UNBOUND pre-existing store (validly
+    MAC'd on this install, e.g. built for another target and dropped
+    into this project's dir) must floor exactly like the load path
+    floors it — otherwise its tiers launder into a freshly stamped,
+    target-bound envelope that every later load honours."""
+    proj, run, target = _project(tmp_path)
+    save_specs(
+        run,
+        [TaintSpec(function="laundered", file="a.c", role="sanitiser",
+                   evidence_tier=EvidenceTier.XREF_BACKED)],
+        target_path=None,
+    )
+    # The spec's file exists in the target, so stale-file eviction
+    # cannot mask the laundering question.
+    (target / "a.c").write_text("int x;\n")
+
+    persist_refined_specs(
+        run,
+        [TaintSpec(function="fresh", file="b.c", role="source",
+                   evidence_tier=EvidenceTier.HEURISTIC)],
+        target_path=target,
+    )
+    # The merged envelope is now stamped AND bound — loads honour its
+    # tiers, so the pre-merge floor was the only guard.
+    names = get_project_sanitisers(out_dir=run, target_path=target)
+    assert "laundered" not in names
+    by_fn = {s.function: s for s in load_specs(run, target_path=target)}
+    assert by_fn["laundered"].evidence_tier == EvidenceTier.HEURISTIC
+
+
+def test_persist_without_any_target_stays_unbound_and_honest(
+    tmp_path: Path,
+) -> None:
+    """No target anywhere (run nor store): the merge must NOT floor —
+    but it must also re-save UNBOUND, so target-scoped loads keep
+    flooring and nothing is laundered."""
+    proj, run, target = _project(tmp_path)
+    save_specs(
+        run,
+        [TaintSpec(function="clean_it", file="a.c", role="sanitiser",
+                   evidence_tier=EvidenceTier.XREF_BACKED)],
+        target_path=None,
+    )
+    persist_refined_specs(
+        run,
+        [TaintSpec(function="fresh", file="b.c", role="source",
+                   evidence_tier=EvidenceTier.HEURISTIC)],
+        target_path=None,
+    )
+    data = json.loads((proj / "iris-specs" / "specs.json").read_text())
+    assert not data.get("target_path")
+    # Target-less load: tier honoured (same trust decision as before).
+    by_fn = {s.function: s for s in load_specs(run)}
+    assert by_fn["clean_it"].evidence_tier == EvidenceTier.XREF_BACKED
+    # Target-scoped load still floors the unbound envelope.
+    names = get_project_sanitisers(out_dir=run, target_path=target)
+    assert "clean_it" not in names
 
 
 def test_merge_does_not_launder_unverified_tiers(tmp_path: Path) -> None:
@@ -290,3 +357,83 @@ def test_truncated_key_file_reads_exact_length(tmp_path, monkeypatch) -> None:
     got = integrity._read_existing_key(key_file)
     assert isinstance(got, bytes)
     assert len(got) == 10
+
+
+# ---------------------------------------------------------------------------
+# Key-creation race: the loser must tolerate the winner's write gap
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def _race_warn_calls(monkeypatch):
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        integrity, "_warn_once_suspect_key",
+        lambda *args: calls.append(args),
+    )
+    return calls
+
+
+@pytest.fixture()
+def _lose_creation_race(monkeypatch, tmp_path):
+    """Make the key-create os.open lose the O_EXCL race."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    real_open = os.open
+
+    def fake_open(path, flags, mode=0o777):
+        if flags & os.O_EXCL:
+            raise FileExistsError(path)
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(os, "open", fake_open)
+    monkeypatch.setattr(mac_key.time, "sleep", lambda s: None)
+
+
+def test_race_loser_retries_through_empty_read(
+        monkeypatch, _race_warn_calls, _lose_creation_race) -> None:
+    """Between the winner's O_EXCL create and its write the key file
+    exists with 0 bytes. The loser must keep polling through that
+    transient shape and stamp with the winner's full key — aborting on
+    the first short read left the loser's envelope unstamped (tiers
+    floor to heuristic on the next read) and flagged the operator's
+    healthy key as suspect."""
+    full_key = b"k" * 32
+    reads = iter([None, b"", full_key])
+    monkeypatch.setattr(
+        integrity, "_read_existing_key", lambda path: next(reads),
+    )
+
+    assert integrity._load_or_create_key() == full_key
+    assert _race_warn_calls == []
+
+
+def test_persistent_wrong_length_warns_after_retries(
+        monkeypatch, _race_warn_calls, _lose_creation_race) -> None:
+    """A key file that STAYS short is genuinely suspect: the loop runs
+    out of retries, warns once, and refuses (None)."""
+    reads = itertools.chain([None], itertools.repeat(b"short"))
+    monkeypatch.setattr(
+        integrity, "_read_existing_key", lambda path: next(reads),
+    )
+
+    assert integrity._load_or_create_key() is None
+    assert len(_race_warn_calls) == 1
+    assert "wrong length" in _race_warn_calls[0][1]
+
+
+def test_forged_operator_confirmed_source_demoted(tmp_path: Path) -> None:
+    """Operator provenance is exactly as trust-bearing as the tier:
+    source == "operator_confirmed" grants refutation immunity and
+    equal-tier merge stickiness. A forged row in an unverified store
+    must lose it alongside the tier floor — never keep durable
+    prompt-direction pollution under a subsequently re-stamped
+    envelope."""
+    proj, run, target = _project(tmp_path)
+    envelope = _forged_envelope(target)
+    envelope["specs"][0]["source"] = "operator_confirmed"
+    _write_store(proj, envelope)
+
+    specs = load_specs(run, target_path=target)
+    assert len(specs) == 1
+    assert specs[0].evidence_tier == EvidenceTier.HEURISTIC
+    assert specs[0].source == "unverified"

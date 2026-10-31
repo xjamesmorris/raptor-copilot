@@ -21,6 +21,7 @@ import pytest
 from core.llm.dispatcher.auth import CredentialStore, ProviderRule
 from core.llm.dispatcher.client import (
     child_token_spend,
+    enable_child_loopback,
     mint_child_token,
     reconcile_child_spend,
     revoke_child_token,
@@ -254,6 +255,27 @@ def _wait_spend(d: LLMDispatcher, token_id: str, timeout: float = 2.0) -> dict:
     return snapshot
 
 
+def _wait_reservation_released(
+    d: LLMDispatcher, token_id: str, timeout: float = 2.0,
+) -> float:
+    """The budget reservation is released in the handler's ``finally``
+    AFTER the forward leg returns, while booking lands inside the leg
+    when the response bytes are flushed — so both the client and a
+    spend poll can observe a booked request whose reservation is
+    still held for one more scheduler beat. Poll like
+    ``_wait_spend``; returns the last observed ``reserved_usd``."""
+    deadline = time.time() + timeout
+    reserved = -1.0
+    while time.time() < deadline:
+        with d._tokens_lock:
+            rec = d._child_by_id_locked(token_id)
+            reserved = rec.reserved_usd
+        if reserved == 0.0:
+            return reserved
+        time.sleep(0.02)
+    return reserved
+
+
 # ---------------------------------------------------------------------------
 # Mint / dispatch / booking
 # ---------------------------------------------------------------------------
@@ -261,6 +283,7 @@ def _wait_spend(d: LLMDispatcher, token_id: str, timeout: float = 2.0) -> dict:
 
 class TestMintAndDispatch:
 
+    @pytest.mark.upstream_forward
     def test_child_token_round_trip_and_booking(self, fake_creds, tmp_path):
         upstream = _Upstream("json")
         d = _make_dispatcher(fake_creds, tmp_path, upstream)
@@ -293,6 +316,7 @@ class TestMintAndDispatch:
             upstream.shutdown()
             d.shutdown()
 
+    @pytest.mark.upstream_forward
     def test_streamed_response_books_from_final_usage_frame(
         self, fake_creds, tmp_path,
     ):
@@ -315,6 +339,7 @@ class TestMintAndDispatch:
             upstream.shutdown()
             d.shutdown()
 
+    @pytest.mark.upstream_forward
     def test_streamed_abort_books_what_upstream_reported(
         self, fake_creds, tmp_path,
     ):
@@ -395,6 +420,7 @@ class TestEnforcement:
             upstream.shutdown()
             d.shutdown()
 
+    @pytest.mark.upstream_forward
     def test_allowlist_matches_across_id_spellings(
         self, fake_creds, tmp_path,
     ):
@@ -414,6 +440,7 @@ class TestEnforcement:
             upstream.shutdown()
             d.shutdown()
 
+    @pytest.mark.upstream_forward
     def test_budget_exhaustion_refuses_before_forward(
         self, fake_creds, tmp_path,
     ):
@@ -480,6 +507,7 @@ class TestEnforcement:
 
 class TestReservationIsACap:
 
+    @pytest.mark.upstream_forward
     def test_huge_declared_max_tokens_refused_at_admission(
         self, fake_creds, tmp_path,
     ):
@@ -511,6 +539,7 @@ class TestReservationIsACap:
             upstream.shutdown()
             d.shutdown()
 
+    @pytest.mark.upstream_forward
     def test_booked_spend_at_budget_refuses_next_admission(
         self, fake_creds, tmp_path,
     ):
@@ -540,6 +569,7 @@ class TestReservationIsACap:
             upstream.shutdown()
             d.shutdown()
 
+    @pytest.mark.upstream_forward
     def test_count_tokens_exempt_from_reservation_ceiling(
         self, fake_creds, tmp_path,
     ):
@@ -686,6 +716,7 @@ class TestReservationIsACap:
             upstream.shutdown()
             d.shutdown()
 
+    @pytest.mark.upstream_forward
     def test_release_returns_captured_amount_after_knob_lowered(
         self, fake_creds, tmp_path, monkeypatch,
     ):
@@ -748,17 +779,26 @@ class TestReservationIsACap:
 
 class TestLifecycle:
 
+    @pytest.mark.upstream_forward
     def test_expiry_enforced_and_spend_survives(self, fake_creds, tmp_path):
         upstream = _Upstream("json")
         d = _make_dispatcher(fake_creds, tmp_path, upstream)
         try:
+            # Generous TTL + deterministic expiry: the former 1s TTL
+            # with sleep(1.1) raced the FIRST request's full HTTP
+            # round trip against the real clock — under load it
+            # expired mid-flight and the 200 assert false-failed.
+            # Rewinding the record's deadline exercises the same
+            # validation path ("now >= expires_at" -> expired 401,
+            # record retained) without any live-clock window.
             token, info = d.allocate_child(
-                "cc-ttl", budget_usd=1.0, ttl_s=1,
+                "cc-ttl", budget_usd=1.0, ttl_s=3600,
             )
             with _uds_client(d) as client:
                 first = _messages_post(client, token)
                 assert first.status_code == 200
-                time.sleep(1.1)
+                with d._tokens_lock:
+                    d._tokens[token].expires_at = time.time() - 1.0
                 late = _messages_post(client, token)
             assert late.status_code == 401
             assert "expired" in late.json()["error"]
@@ -799,6 +839,50 @@ class TestLifecycle:
         finally:
             d.shutdown()
 
+    @pytest.mark.upstream_forward
+    def test_child_rows_use_public_token_id_not_secret_prefix(
+            self, fake_creds, tmp_path):
+        """Every audit row a child request produces joins on the
+        minted public token_id — pre-fix the dispatch/error/provider
+        rows logged a 12-char prefix of the bearer SECRET instead, so
+        the same request appeared under two identifiers and
+        secret-derived material landed where a purpose-built public
+        id exists."""
+        upstream = _Upstream("json")
+        d = _make_dispatcher(fake_creds, tmp_path, upstream)
+        try:
+            token, info = d.allocate_child("cc-audit", budget_usd=1.0)
+            with _uds_client(d) as client:
+                resp = _messages_post(client, token)
+                assert resp.status_code == 200
+            # The dispatch row lands on the handler thread AFTER the
+            # response bytes flush — poll like _wait_spend does.
+            rows: list[dict] = []
+            dispatch_rows: list[dict] = []
+            deadline = time.time() + 2.0
+            while time.time() < deadline and not dispatch_rows:
+                rows = [
+                    json.loads(line)
+                    for line in
+                    (tmp_path / "audit.jsonl").read_text().splitlines()
+                ]
+                dispatch_rows = [
+                    r for r in rows
+                    if r.get("event") == "request.dispatch"
+                ]
+                if not dispatch_rows:
+                    time.sleep(0.02)
+            assert dispatch_rows
+            assert all(
+                r["token_id"] == info["token_id"] for r in dispatch_rows
+            )
+            # No row anywhere in the trail carries the secret prefix.
+            assert all(r.get("token_id") != token[:12] for r in rows)
+        finally:
+            upstream.shutdown()
+            d.shutdown()
+
+    @pytest.mark.upstream_forward
     def test_audit_never_contains_token_value(self, fake_creds, tmp_path):
         upstream = _Upstream("json")
         d = _make_dispatcher(fake_creds, tmp_path, upstream)
@@ -931,6 +1015,7 @@ class TestMintValidationHardening:
 
 class TestPlanes:
 
+    @pytest.mark.upstream_forward
     def test_tcp_plane_serves_child_tokens(self, fake_creds, tmp_path):
         upstream = _Upstream("json")
         d = _make_dispatcher(fake_creds, tmp_path, upstream)
@@ -1000,6 +1085,7 @@ class TestPlanes:
             upstream.shutdown()
             d.shutdown()
 
+    @pytest.mark.upstream_forward
     def test_admin_endpoints_with_worker_token_over_uds(
         self, fake_creds, tmp_path,
     ):
@@ -1044,6 +1130,185 @@ class TestPlanes:
                 socket_path=str(dead_socket), token="whatever",
             )
         assert time.monotonic() - t0 < 5.0  # fail fast, not a hang
+
+    @pytest.mark.upstream_forward
+    def test_loopback_admin_op_returns_usable_shared_port(
+        self, fake_creds, tmp_path,
+    ):
+        """POST /_child/loopback (worker token, UDS) enables the TCP
+        plane and returns its port — idempotently, so concurrent
+        workers share one listener — and a scoped child token
+        authenticates on that port."""
+        upstream = _Upstream("json")
+        d = _make_dispatcher(fake_creds, tmp_path, upstream)
+        try:
+            worker = _worker_token(d)
+            port = enable_child_loopback(
+                socket_path=str(d.socket_path), token=worker,
+            )
+            assert 0 < port < 65536
+            # Idempotent: the second enable is the SAME listener.
+            assert enable_child_loopback(
+                socket_path=str(d.socket_path), token=worker,
+            ) == port
+            token, _ = d.allocate_child("loopback-child", budget_usd=1.0)
+            with httpx.Client(
+                base_url=f"http://127.0.0.1:{port}", timeout=10.0,
+            ) as client:
+                resp = _messages_post(
+                    client, token, url="/anthropic/v1/messages",
+                )
+            assert resp.status_code == 200
+        finally:
+            upstream.shutdown()
+            d.shutdown()
+
+    def test_loopback_admin_op_refused_for_child_tokens(
+        self, fake_creds, tmp_path,
+    ):
+        """A scoped child token cannot open the TCP plane — on the
+        UDS or on the (already-open) TCP plane itself."""
+        upstream = _Upstream("json")
+        d = _make_dispatcher(fake_creds, tmp_path, upstream)
+        try:
+            token, _ = d.allocate_child("cc-esc", budget_usd=1.0)
+            for client, url in (
+                (_uds_client(d), "http://_/_child/loopback"),
+                (_tcp_client(d), "/_child/loopback"),
+            ):
+                with client:
+                    r = client.post(
+                        url,
+                        headers={"Authorization": f"Bearer {token}"},
+                        content=b"{}",
+                    )
+                assert r.status_code == 403, url
+        finally:
+            upstream.shutdown()
+            d.shutdown()
+
+    @pytest.mark.upstream_forward
+    def test_mint_request_budget_travels_and_enforces(
+        self, fake_creds, tmp_path,
+    ):
+        """The client's ``request_budget`` reaches allocate_child:
+        request N+1 against an N-request token is refused without an
+        upstream forward."""
+        upstream = _Upstream("json")
+        d = _make_dispatcher(fake_creds, tmp_path, upstream)
+        try:
+            worker = _worker_token(d)
+            minted = mint_child_token(
+                budget_usd=1.0, models=[_PRICED_MODEL], ttl_s=120,
+                request_budget=1, label="one-shot",
+                socket_path=str(d.socket_path), token=worker,
+            )
+            assert minted["request_budget"] == 1
+            with _uds_client(d) as client:
+                assert _messages_post(
+                    client, minted["token"],
+                ).status_code == 200
+                resp = _messages_post(client, minted["token"])
+            assert resp.status_code == 401
+            assert len(upstream.requests) == 1
+        finally:
+            upstream.shutdown()
+            d.shutdown()
+
+
+class TestAnthropicSDKDialect:
+    """Wire-shape pins for the base-URL SDK children the TCP plane
+    fronts (Claude CLI, OpenAnt's pinned anthropic adapter): the
+    anthropic SDK called with ``base_url=http://127.0.0.1:<port>/
+    anthropic`` POSTs ``/anthropic/v1/messages`` with the credential
+    in ``x-api-key`` (no Authorization header) plus its own
+    ``anthropic-version``. Verified against anthropic SDK 1.7.0 —
+    httpx-style base-URL merge keeps the path prefix."""
+
+    def _sdk_shaped_post(self, client, token, path="/anthropic/v1/messages",
+                         model=_PRICED_MODEL):
+        return client.post(
+            path,
+            headers={
+                "x-api-key": token,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+                "Accept-Encoding": "gzip, deflate, zstd",
+            },
+            content=json.dumps({
+                "model": model, "max_tokens": 100, "messages": [],
+            }).encode(),
+        )
+
+    @pytest.mark.upstream_forward
+    def test_x_api_key_dialect_books_once_and_releases_reservation(
+        self, fake_creds, tmp_path,
+    ):
+        upstream = _Upstream("json")
+        d = _make_dispatcher(fake_creds, tmp_path, upstream)
+        try:
+            token, info = d.allocate_child("sdk-child", budget_usd=1.0)
+            with _tcp_client(d) as client:
+                resp = self._sdk_shaped_post(client, token)
+            assert resp.status_code == 200
+            spend = _wait_spend(d, info["token_id"])
+            assert spend["requests_made"] == 1
+            assert spend["spent_usd"] == pytest.approx(_expected_cost())
+            assert _wait_reservation_released(d, info["token_id"]) == 0.0
+            # The forwarded request carries the REAL key, never the
+            # child token, and identity encoding for the usage scan.
+            sent = upstream.requests[0]["headers"]
+            assert sent.get("x-api-key") == \
+                "real-secret-anthropic-key-NOT-LEAKED"
+            assert token not in json.dumps(upstream.requests[0]["headers"])
+            assert sent.get("Accept-Encoding") == "identity"
+        finally:
+            upstream.shutdown()
+            d.shutdown()
+
+    def test_x_api_key_dialect_scope_still_enforced(
+        self, fake_creds, tmp_path,
+    ):
+        """The dialect earns no scope: a non-allowlisted upstream path
+        is 403'd unforwarded, and a revoked token's reuse is 401'd."""
+        upstream = _Upstream("json")
+        d = _make_dispatcher(fake_creds, tmp_path, upstream)
+        try:
+            token, info = d.allocate_child("sdk-esc", budget_usd=1.0)
+            with _tcp_client(d) as client:
+                resp = self._sdk_shaped_post(
+                    client, token, path="/anthropic/v1/complete",
+                )
+                assert resp.status_code == 403
+                assert upstream.requests == []
+                d.revoke_child(info["token_id"])
+                resp = self._sdk_shaped_post(client, token)
+            assert resp.status_code == 401
+            assert upstream.requests == []
+        finally:
+            upstream.shutdown()
+            d.shutdown()
+
+    def test_x_api_key_dialect_budget_exhaustion_402(
+        self, fake_creds, tmp_path,
+    ):
+        """Overspend surfaces as a 402 the SDK raises as a typed API
+        error — the child reports it, never silently retries free."""
+        upstream = _Upstream("json")
+        d = _make_dispatcher(fake_creds, tmp_path, upstream)
+        try:
+            token, info = d.allocate_child("sdk-poor", budget_usd=0.02)
+            with d._tokens_lock:
+                rec = d._child_by_id_locked(info["token_id"])
+                rec.spent_usd = 0.02  # ledger already at budget
+            with _tcp_client(d) as client:
+                resp = self._sdk_shaped_post(client, token)
+            assert resp.status_code == 402
+            assert "budget exhausted" in resp.json()["error"]
+            assert upstream.requests == []
+        finally:
+            upstream.shutdown()
+            d.shutdown()
 
 
 # ---------------------------------------------------------------------------

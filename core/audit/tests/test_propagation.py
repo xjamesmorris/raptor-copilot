@@ -86,12 +86,12 @@ class TestScoreCaller:
         assert "passthrough" in result.reasons
         assert result.score >= 4
 
-    def test_no_source_file(self):
+    def test_no_source_file(self, tmp_path: Path):
         c = _constraint()
         result = score_caller(
             "nonexistent.c", "fn", 1, c,
             entry_points=set(),
-            target_path=Path("/tmp/empty"),
+            target_path=tmp_path / "empty",
         )
         assert result.score == 0
 
@@ -346,7 +346,11 @@ class TestPropagateOneHop:
             config=config,
             current_depth=0,
         )
-        assert not result.resolved
+        # The consumer keys the depth-limited status transition off
+        # resolved AND resolution — an unresolved-shaped result is
+        # indistinguishable from a heuristic passthrough and the
+        # depth signal never lands.
+        assert result.resolved
         assert result.resolution == "depth_limited"
         assert result.depth_probe is not None
 
@@ -388,6 +392,7 @@ class TestPropagateOneHop:
             config=config,
             current_depth=5,
         )
+        assert result.resolved
         assert result.resolution == "depth_limited"
 
 
@@ -789,3 +794,104 @@ class TestGetCallers:
     def test_accepts_valid_inventory(self):
         result = get_callers("src/a.c", "func", 10, inventory={"files": {}})
         assert result is None or isinstance(result, list)
+
+
+class TestCoccinelleCallerCap:
+    def _fake_runner(self, n_matches: int):
+        matches = [
+            SimpleNamespace(file=f"src/f{i}.c", line=i + 1)
+            for i in range(n_matches)
+        ]
+        fake_result = SimpleNamespace(ok=True, matches=matches)
+        return SimpleNamespace(
+            is_available=lambda: True,
+            run_rules_batched=lambda *a, **k: {"rule": fake_result},
+            run_rule=lambda *a, **k: fake_result,
+            # Unrelated consumers of the runner module may import
+            # during fixture teardown while the patch is active.
+            contains_script_block=lambda *a, **k: False,
+        )
+
+    def test_matches_capped_at_max_callers_per_hop(
+        self, monkeypatch, tmp_path: Path,
+    ):
+        import sys
+
+        monkeypatch.setitem(
+            sys.modules, "packages.coccinelle.runner", self._fake_runner(25),
+        )
+        c = _constraint(
+            kind="precondition",
+            mechanical_check="copy_to_user_uninit.cocci",
+        )
+        config = PropagationConfig(
+            coccinelle_available=True,
+            target_path=tmp_path,
+            max_callers_per_hop=10,
+        )
+        result = try_coccinelle_resolve(c, config)
+        assert result is not None
+        assert len(result.callers_scheduled) == 10
+
+    def test_under_cap_all_matches_kept(self, monkeypatch, tmp_path: Path):
+        import sys
+
+        monkeypatch.setitem(
+            sys.modules, "packages.coccinelle.runner", self._fake_runner(3),
+        )
+        c = _constraint(
+            kind="precondition",
+            mechanical_check="copy_to_user_uninit.cocci",
+        )
+        config = PropagationConfig(
+            coccinelle_available=True,
+            target_path=tmp_path,
+            max_callers_per_hop=10,
+        )
+        result = try_coccinelle_resolve(c, config)
+        assert result is not None
+        assert len(result.callers_scheduled) == 3
+
+
+class TestSourceReadMemo:
+    def test_repeat_scoring_reads_file_once(
+        self, monkeypatch, tmp_path: Path,
+    ):
+        from core.audit.run_memo import BoundedMemo
+
+        from core.audit import propagation
+
+        src = tmp_path / "caller.c"
+        src.write_text("void a() { parse_header(len); }\n")
+        reads: list = []
+        orig = propagation.read_text_capped
+
+        def counting(path, *args, **kwargs):
+            reads.append(str(path))
+            return orig(path, *args, **kwargs)
+
+        monkeypatch.setattr(propagation, "read_text_capped", counting)
+        c = _constraint()
+        memo: BoundedMemo = BoundedMemo(8)
+        for _ in range(3):
+            result = score_caller(
+                "caller.c", "a", 1, c,
+                entry_points=set(),
+                target_path=tmp_path,
+                source_memo=memo,
+            )
+            # The scoring itself must still see the source text.
+            assert "variable_arg" in result.reasons
+        assert reads.count(str(src)) == 1
+
+    def test_no_memo_still_reads(self, tmp_path: Path):
+        src = tmp_path / "caller.c"
+        src.write_text("void a() { parse_header(len); }\n")
+        c = _constraint()
+        result = score_caller(
+            "caller.c", "a", 1, c,
+            entry_points=set(),
+            target_path=tmp_path,
+            source_memo=None,
+        )
+        assert "variable_arg" in result.reasons

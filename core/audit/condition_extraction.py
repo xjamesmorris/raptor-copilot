@@ -38,7 +38,16 @@ class GuardCondition:
 
     text: str
     category: str  # auth|bounds|null|config|error|type|resource|unknown
-    polarity: str  # "required" (sink in true-branch) | "excluded" (sink in else-branch)
+    #: "required"      — sink in the true-branch: the check protects it.
+    #: "excluded"      — sink in the else-branch: the sink runs exactly
+    #:                   when the check FAILS; the check protects a
+    #:                   DIFFERENT path and says nothing about this one.
+    #: "negated_guard" — early-return guard clause (exit-only body, sink
+    #:                   after the if): the sink also runs when the check
+    #:                   fails, but here the NEGATED condition genuinely
+    #:                   protects the taken path — the dominant C guard
+    #:                   idiom, counted by adequacy with its negated sense.
+    polarity: str
     line: int
     resolvable: bool = False
     concrete_values: dict[str, str] = field(default_factory=dict)
@@ -136,6 +145,16 @@ def _get_parser(lang: str) -> Any | None:
         return _ts_parser_for(lang)
     except ImportError:
         pass
+    except Exception:
+        # Parser setup must degrade to the regex fallback, never
+        # crash the audit stage: mixed installs (grammar wheel
+        # present, tree_sitter runtime absent) historically raised
+        # NameError out of the shared loader, and this call site is
+        # reached from extract_sink_guards with no catch above it.
+        logger.debug(
+            "condition_extraction: shared parser cache failed for %s",
+            lang, exc_info=True,
+        )
     if not _TS_AVAILABLE:
         return None
     try:
@@ -143,7 +162,8 @@ def _get_parser(lang: str) -> Any | None:
         ts_lang = _ts_language(lang)
         if ts_lang is None:
             return None
-        return TSParser(ts_lang)
+        from core.inventory._ts_cache import bounded
+        return bounded(TSParser(ts_lang), label=lang)
     except Exception:
         logger.debug("condition_extraction: parser setup failed for "
                      "%s", lang, exc_info=True)
@@ -154,6 +174,11 @@ def _get_parser(lang: str) -> Any | None:
 # Language → file extension mapping
 # ---------------------------------------------------------------------------
 
+# Extension → TREE-SITTER GRAMMAR name (not the inventory language:
+# grammar names are what Language()/parser loading accepts). Kept
+# value-aligned with core.inventory.languages.LANGUAGE_MAP where the
+# keys overlap — test_language_map_alignment pins the alignment and
+# the enumerated extras, so drift is a test-visible act.
 _EXT_TO_LANG: dict[str, str] = {
     ".c": "c", ".h": "c",
     ".cc": "cpp", ".cpp": "cpp", ".cxx": "cpp", ".hpp": "cpp", ".hh": "cpp",
@@ -167,6 +192,8 @@ _EXT_TO_LANG: dict[str, str] = {
     ".php": "php",
     ".lua": "lua",
     ".cs": "csharp",
+    ".kt": "kotlin", ".kts": "kotlin",
+    ".swift": "swift",
 }
 
 
@@ -197,6 +224,11 @@ _CONDITIONAL_TYPES: dict[str, tuple[str, ...]] = {
     "php": ("if_statement", "switch_statement", "match_expression"),
     "lua": ("if_statement",),
     "csharp": ("if_statement", "switch_statement", "switch_expression"),
+    "kotlin": ("if_expression", "when_expression"),
+    "swift": (
+        "if_statement", "switch_statement", "guard_statement",
+        "ternary_expression",
+    ),
 }
 
 # Node types that represent function definitions (for enclosing function lookup)
@@ -214,6 +246,8 @@ _FUNCTION_TYPES: dict[str, tuple[str, ...]] = {
     "php": ("method_declaration", "function_definition"),
     "lua": ("function_declaration", "function_definition"),
     "csharp": ("method_declaration", "constructor_declaration"),
+    "kotlin": ("function_declaration", "secondary_constructor"),
+    "swift": ("function_declaration", "init_declaration"),
 }
 
 # Node types representing early exit (return/goto/break/throw)
@@ -231,6 +265,12 @@ _EXIT_TYPES: dict[str, tuple[str, ...]] = {
     "php": ("return_statement", "throw_expression"),
     "lua": ("return_statement",),
     "csharp": ("return_statement", "throw_statement", "break_statement"),
+    # Kotlin has no dedicated break/continue node in this grammar
+    # (they parse as bare identifiers), so only the typed exits are
+    # named. Swift folds return/throw/break/continue into one
+    # control_transfer_statement node.
+    "kotlin": ("return_expression", "throw_expression"),
+    "swift": ("control_transfer_statement",),
 }
 
 
@@ -271,6 +311,10 @@ def _get_function_name(func_node, _lang: str, source_bytes: bytes) -> str:
             return _node_text(child, source_bytes)
         if child.type == "name":
             return _node_text(child, source_bytes)
+        if child.type == "simple_identifier":
+            # Swift: function_declaration names its identifier child
+            # simple_identifier (no `name` field in this grammar).
+            return _node_text(child, source_bytes)
         if child.type in ("function_declarator", "declarator"):
             # C/C++: dig into declarator for the identifier
             for sub in child.children:
@@ -298,7 +342,7 @@ def _extract_condition_text(cond_node, lang: str, source_bytes: bytes) -> str:
     For match: extracts the subject.
     """
     if cond_node.type in ("if_statement", "if_expression", "if_let_expression",
-                          "if", "unless"):
+                          "if", "unless", "guard_statement"):
         # Look for 'condition', 'parenthesized_expression', or first expression child
         for child in cond_node.children:
             if child.type == "condition_clause":
@@ -324,9 +368,12 @@ def _extract_condition_text(cond_node, lang: str, source_bytes: bytes) -> str:
                 text = _node_text(child, source_bytes).strip()
                 if text:
                     return text
-        # Fallback: first meaningful child after keyword
+        # Fallback: first meaningful child after keyword ("guard" and
+        # "else" are keyword children too — Swift guard_statement puts
+        # both around the bare condition expression)
         for child in cond_node.children:
-            if child.type not in ("if", "elif", "switch", "match", "(", ")", "{", "}"):
+            if child.type not in ("if", "elif", "switch", "match",
+                                  "guard", "else", "(", ")", "{", "}"):
                 text = _node_text(child, source_bytes).strip()
                 if text and len(text) < 200:
                     return text
@@ -367,7 +414,7 @@ def _extract_condition_text(cond_node, lang: str, source_bytes: bytes) -> str:
     # Last resort: return full text truncated
     full = _node_text(cond_node, source_bytes)
     # Take first line only
-    first_line = full.split("\n")[0].strip()
+    first_line = full.split("\n")[0].strip()  # line-model: first-line display slice; strip() drops any trailing \r
     if len(first_line) > 200:
         first_line = first_line[:197] + "..."
     return first_line
@@ -385,7 +432,20 @@ def _determine_polarity(
     "excluded" if sink is in the alternative (else block).
     Also detects the early-return-guard pattern:
       if (error) return;  // sink is AFTER — guard by negation
+    which returns "negated_guard": semantically opposite to "excluded"
+    (the negated check DOES protect the taken path), so the two shapes
+    must not share a polarity — adequacy discards "excluded" but counts
+    "negated_guard" with its negated sense.
     """
+    # Swift guard: control continues past the statement only when the
+    # condition HOLDS (the compiler requires the else body to exit
+    # scope), so the condition itself protects everything after the
+    # guard; only the else body runs with the condition FALSE.
+    if cond_node.type == "guard_statement":
+        if sink_line - 1 > cond_node.end_point[0]:
+            return "required"
+        return "excluded"
+
     # Find consequence and alternative blocks
     consequence = None
     alternative = None
@@ -393,7 +453,8 @@ def _determine_polarity(
     children = list(cond_node.children)
     for i, child in enumerate(children):
         if child.type in ("block", "compound_statement", "consequence",
-                          "statement_block", "then", "body"):
+                          "statement_block", "then", "body",
+                          "statements"):
             if consequence is None:
                 consequence = child
             elif alternative is None:
@@ -445,17 +506,26 @@ def _determine_polarity(
         is_exit_only = False
         if consequence.type in exit_types:
             is_exit_only = True
-        elif consequence.type in ("block", "compound_statement", "statement_block"):
+        elif consequence.type in ("block", "compound_statement",
+                                  "statement_block", "statements"):
             blk_children = [c for c in consequence.children
                             if c.type not in ("{", "}", "comment")]
             if blk_children and blk_children[-1].type in exit_types:
                 is_exit_only = True
 
         if is_exit_only and sink_row > cond_node.end_point[0]:
-            return "required" if is_unless else "excluded"
+            # unless(cond) exit → sink requires cond TRUE = "required";
+            # if(cond) exit → the NEGATED cond protects the sink.
+            return "required" if is_unless else "negated_guard"
 
     # Sink is after the if-block but not in an early-return pattern,
-    # or we can't determine — assume required (conservative)
+    # or we can't determine — fall back to "required". NOT
+    # conservative for every consumer: "required" counts toward
+    # adequacy, and the SUFFICIENT verdict's consumer SKIPS review —
+    # so this guess leans toward suppression there. It is the
+    # less-wrong default only because "excluded" polarity is
+    # discarded outright and a dropped condition under-counts
+    # protection for the confirm direction.
     if sink_row > cond_node.end_point[0]:
         return "excluded" if is_unless else "required"
 
@@ -529,7 +599,8 @@ def _find_preceding_guard_clauses(
     cond_types = _CONDITIONAL_TYPES.get(lang, ())
     exit_types = _EXIT_TYPES.get(lang, ())
     block_types = ("block", "compound_statement", "statement_block",
-                   "statement_list", "function_body", "source_file")
+                   "statement_list", "function_body", "source_file",
+                   "statements")
 
     # Find the enclosing block that contains the sink as a direct child
     enclosing_block = target_node.parent
@@ -561,16 +632,26 @@ def _find_preceding_guard_clauses(
         # Must be a conditional
         if child.type not in cond_types:
             continue
-        # Must be an if_statement type (not switch/match)
-        if "if" not in child.type and "unless" not in child.type:
+        # Must be an if_statement type (not switch/match) or a Swift
+        # guard_statement (whose else body the compiler REQUIRES to
+        # exit scope — every guard is a guard clause by grammar).
+        is_guard_stmt = child.type == "guard_statement"
+        if ("if" not in child.type and "unless" not in child.type
+                and not is_guard_stmt):
             continue
         # Check if its body is exit-only (guard clause pattern)
-        if _is_exit_only_body(child, lang, exit_types):
+        if is_guard_stmt or _is_exit_only_body(child, lang, exit_types):
             cond_text = _extract_condition_text(child, lang, source_bytes)
             if cond_text:
-                # unless guard: body fires when condition is FALSE,
-                # so sink after it requires condition TRUE = "required"
-                polarity = "required" if child.type == "unless" else "excluded"
+                # unless/guard: the exit body fires when the condition
+                # is FALSE, so a sink after it requires the condition
+                # TRUE = "required"; if-guard: the NEGATED condition
+                # protects the sink.
+                polarity = (
+                    "required"
+                    if child.type == "unless" or is_guard_stmt
+                    else "negated_guard"
+                )
                 results.append((child, cond_text, polarity))
 
     return results
@@ -584,7 +665,8 @@ def _is_exit_only_body(if_node, _lang: str, exit_types: tuple) -> bool:
       - C/Go: if_statement → [if, (cond), compound_statement{return}]
       - C: if_statement → [if, (cond), return_statement] (no braces)
     """
-    block_types = ("block", "compound_statement", "statement_block")
+    block_types = ("block", "compound_statement", "statement_block",
+                   "statements")
 
     # Strategy: find the first block-type child (the body).
     # If none, look for a bare exit statement as a direct child.
@@ -662,6 +744,8 @@ _CALL_TYPES: dict[str, tuple[str, ...]] = {
             "scoped_call_expression"),
     "lua": ("function_call",),
     "csharp": ("invocation_expression",),
+    "kotlin": ("call_expression",),
+    "swift": ("call_expression",),
 }
 
 
@@ -783,7 +867,11 @@ def extract_sink_guards(
         return []
 
     source_bytes = source.encode("utf-8")
-    tree = parser.parse(source_bytes)
+    # parse_origin: a budget-abandoned parse must name this file on
+    # the run's analysis-gap trail.
+    from core.run.gaps import parse_origin
+    with parse_origin(filepath):
+        tree = parser.parse(source_bytes)
     root = tree.root_node
 
     # Determine sink call sites

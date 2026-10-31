@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
@@ -24,6 +26,7 @@ from packages.joern.runner import (
     build_cpg,
     build_cpg_cached,
     cleanup_cpg,
+    cpg_cache_slot_name,
     load_cached_cpg,
     run_query,
     run_taint_query,
@@ -51,6 +54,29 @@ class TestValidateQuery:
     def test_blocks_reflection(self):
         err = _validate_query('Class.forName("Evil")')
         assert err is not None
+
+    def test_blocks_classloader_and_handle_reflection(self):
+        # The enumerable bypasses of the original list — each reaches
+        # code execution in the unsandboxed joern JVM without any
+        # blocked token.
+        for query in (
+            'getClass.getClassLoader.loadClass("java.lang.Runtime")',
+            'classOf[Runtime].getMethod ("exec")',
+            "classOf[X].getConstructor().newInstance()",
+            "MethodHandles.lookup()",
+            "loader.defineClass(name, bytes, 0, bytes.length)",
+            "field.setAccessible(true)",
+        ):
+            assert _validate_query(query) is not None, query
+
+    def test_plain_method_traversals_stay_clean(self):
+        # The blocklist must not eat legitimate CPG traversals.
+        for query in (
+            'cpg.method.name("getMethodTable").l',
+            "cpg.method.fullName.l",
+            'cpg.call.name("instantiate").l',
+        ):
+            assert _validate_query(query) is None, query
 
     def test_length_cap(self):
         err = _validate_query("x" * 5000)
@@ -511,13 +537,70 @@ class TestCleanupCpg:
         cleanup_cpg(cpg)
         assert (victim / "precious.txt").exists()
 
+    def test_removes_stray_query_scratch_dirs(self, tmp_path: Path):
+        """A hard-killed query never reaches run_query's own rmtree —
+        its raptor-query-* scratch (wrapper + workspace copy) must not
+        pin the CPG dir alive forever. Strays qualify by AGE."""
+        cpg_dir = tmp_path / "cpg_dir"
+        stray = cpg_dir / "raptor-query-abc123"
+        (stray / "workspace").mkdir(parents=True)
+        (stray / "workspace" / "cpg.bin").write_bytes(b"copy")
+        (stray / "query.sc").write_text("cpg.method.l")
+        old = time.time() - 25 * 3600
+        os.utime(stray, (old, old))
+        f = cpg_dir / "cpg.bin"
+        f.write_bytes(b"data")
+        cpg = JoernCPG(path=f, target=tmp_path)
+
+        cleanup_cpg(cpg)
+        assert not stray.exists()
+        assert not cpg_dir.exists()
+
+    def test_fresh_query_scratch_survives_sibling_cleanup(
+            self, tmp_path: Path):
+        """A FRESH raptor-query-* dir is a sibling session's possibly
+        in-flight query against the same shared cache slot — a
+        sibling's cleanup_cpg must not delete its cwd/tmpdir out from
+        under it mid-query. It ages into the sweep instead."""
+        cpg_dir = tmp_path / "cpg_dir"
+        live = cpg_dir / "raptor-query-live01"
+        live.mkdir(parents=True)
+        (live / "query.sc").write_text("cpg.method.l")
+        f = cpg_dir / "cpg.bin"
+        f.write_bytes(b"data")
+        cpg = JoernCPG(path=f, target=tmp_path)
+
+        cleanup_cpg(cpg)
+        assert (live / "query.sc").exists()
+        # The slot dir stays (non-empty) — reclaimed by a later
+        # cleanup once the stray ages out.
+        assert cpg_dir.exists()
+
+    def test_stray_query_dir_symlink_not_followed(self, tmp_path: Path):
+        """Same symlink guard as workspace/: a link squatting at a
+        raptor-query-* name is never traversed."""
+        victim = tmp_path / "victim"
+        victim.mkdir()
+        (victim / "precious.txt").write_text("keep")
+        cpg_dir = tmp_path / "cpg_dir"
+        cpg_dir.mkdir()
+        (cpg_dir / "raptor-query-evil").symlink_to(victim)
+        f = cpg_dir / "cpg.bin"
+        f.write_bytes(b"data")
+        cpg = JoernCPG(path=f, target=tmp_path)
+
+        cleanup_cpg(cpg)
+        assert (victim / "precious.txt").exists()
+
 
 class TestRunQueryScratchCwd:
-    def test_fallback_runner_gets_cpg_dir_cwd(self, tmp_path: Path):
+    def test_fallback_runner_gets_per_query_cwd(self, tmp_path: Path):
         """The TypeError fallback (runner without sandbox kwargs) must
-        still pin cwd to the CPG dir — importCpg drops a workspace/
-        copy under the process cwd, which pre-fix was whatever
-        directory the CALLER ran from."""
+        still pin cwd to a per-query scratch dir INSIDE the CPG dir —
+        importCpg drops a workspace/ copy under the process cwd, which
+        pre-fix-one was whatever directory the CALLER ran from, and
+        pre-fix-two was the CPG dir itself, shared with every
+        concurrent query against the same cache slot."""
         f = tmp_path / "cpg.bin"
         f.write_bytes(b"fake")
         cpg = JoernCPG(path=f, target=tmp_path)
@@ -525,14 +608,63 @@ class TestRunQueryScratchCwd:
         seen: dict = {}
 
         def bare_runner(cmd, capture_output, text, timeout, cwd):
-            seen["cwd"] = cwd
+            seen["cwd"] = Path(cwd)
             return SimpleNamespace(stdout="", stderr="", returncode=0)
 
         result = run_query(
             cpg, "cpg.method.l", subprocess_runner=bare_runner,
         )
         assert result.ok
-        assert seen["cwd"] == str(tmp_path)
+        assert seen["cwd"].parent == tmp_path
+        assert seen["cwd"].name.startswith("raptor-query-")
+
+    def test_concurrent_queries_get_distinct_cwds(self, tmp_path: Path):
+        """The collision the scratch dir exists to prevent: two
+        queries against the SAME CPG must never share a cwd, or their
+        importCpg workspace/ copies race."""
+        f = tmp_path / "cpg.bin"
+        f.write_bytes(b"fake")
+        cpg = JoernCPG(path=f, target=tmp_path)
+
+        cwds: list[Path] = []
+
+        def bare_runner(cmd, capture_output, text, timeout, cwd):
+            cwds.append(Path(cwd))
+            # The scratch cwd must exist while the query runs.
+            assert Path(cwd).is_dir()
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+        run_query(cpg, "cpg.method.l", subprocess_runner=bare_runner)
+        run_query(cpg, "cpg.method.l", subprocess_runner=bare_runner)
+        assert len(cwds) == 2
+        assert cwds[0] != cwds[1]
+
+    def test_query_scratch_removed_after_run(self, tmp_path: Path):
+        """The per-query dir (cwd + wrapper script + workspace copy)
+        is reclaimed after every query — success and JVM-error alike —
+        so a long-lived cache slot never accumulates per-query
+        scratch."""
+        f = tmp_path / "cpg.bin"
+        f.write_bytes(b"fake")
+        cpg = JoernCPG(path=f, target=tmp_path)
+
+        def ok_runner(cmd, capture_output, text, timeout, cwd):
+            # Simulate importCpg's workspace copy inside the cwd.
+            (Path(cwd) / "workspace").mkdir()
+            (Path(cwd) / "workspace" / "cpg.bin").write_bytes(b"copy")
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+        def raising_runner(cmd, capture_output, text, timeout, cwd):
+            raise OSError("boom")
+
+        run_query(cpg, "cpg.method.l", subprocess_runner=ok_runner)
+        assert list(tmp_path.glob("raptor-query-*")) == []
+
+        result = run_query(
+            cpg, "cpg.method.l", subprocess_runner=raising_runner,
+        )
+        assert not result.ok
+        assert list(tmp_path.glob("raptor-query-*")) == []
 
     def test_default_tempdir_prefix_is_reaper_registered(
         self, tmp_path: Path, monkeypatch,
@@ -702,6 +834,23 @@ class TestCPGCaching:
         # Undeclared, the same artifacts enter the key (rebuild —
         # safe, never stale).
         assert _target_content_hash(tmp_path) != h1
+
+    def test_content_hash_filename_cannot_forge_another_tree(self, tmp_path):
+        # ':' and '\n' are legal in POSIX filenames: a single file
+        # whose NAME embeds another tree's "path:digest" line must not
+        # collide with that tree's key — a collision would serve one
+        # tree's cached CPG for the other.
+        import hashlib as hashlib_mod
+        body = b"int f(void) { return 0; }\n"
+        honest = tmp_path / "honest"
+        honest.mkdir()
+        (honest / "a.c").write_bytes(b"int a;\n")
+        (honest / "b.c").write_bytes(body)
+        digest_a = hashlib_mod.sha256(b"int a;\n").hexdigest()
+        forged = tmp_path / "forged"
+        forged.mkdir()
+        (forged / f"a.c:{digest_a}\nb.c").write_bytes(body)
+        assert _target_content_hash(honest) != _target_content_hash(forged)
 
     def test_content_hash_skips_non_regular_files(self, tmp_path):
         # A symlink to a device (git-committable) or a FIFO named
@@ -971,9 +1120,16 @@ class TestBuildCpgSandbox:
         target = tmp_path / "src"
         target.mkdir()
 
+        def _fake_optout_runner(cmd, **kwargs):
+            return subprocess.run(cmd, **kwargs)
+
+        # The opt-out lane is detected by the marker attribute, not
+        # by identity with subprocess.run (the fallback now wraps it
+        # to inject the sanitised env).
+        _fake_optout_runner._raptor_unsandboxed = True
         monkeypatch.setattr(
             "packages.joern.runner._default_sandbox_runner",
-            lambda: subprocess.run,
+            lambda: _fake_optout_runner,
         )
 
         called: dict = {}
@@ -1063,8 +1219,19 @@ class TestDefaultSandboxRunnerFailClosed:
         )
         with _patch.dict(_sys.modules, {"core.sandbox": None}):
             runner = _default_sandbox_runner()
-        assert runner is subprocess.run
         assert events == ["unsandboxed_tool_fallback"]
+        # The opt-out waives the sandbox, never env hygiene: the
+        # fallback must hand joern-parse a SANITISED environment, not
+        # the operator's full credential env.
+        assert getattr(runner, "_raptor_unsandboxed", False)
+        monkeypatch.setenv("SUPER_SECRET_TOKEN", "hunter2")
+        proc = runner(
+            [_sys.executable, "-c",
+             "import os,sys; sys.exit("
+             "1 if 'SUPER_SECRET_TOKEN' in os.environ else 0)"],
+            capture_output=True, timeout=30,
+        )
+        assert proc.returncode == 0, "operator env leaked to joern-parse"
 
 
 # ── Failed builds must never poison the cache ───────────────────────
@@ -1106,7 +1273,8 @@ class TestFailedBuildCacheGate:
             subprocess_runner=self._timeout_runner(b"partial-write"),
         )
         assert cpg.build_failed is True
-        assert not (cache / "joern-cpg" / "manifest.json").exists()
+        slot = cpg_cache_slot_name((), target=target)
+        assert not (cache / slot / "manifest.json").exists()
 
     def test_unparseable_method_count_not_manifested(self, tmp_path):
         # A "successful" build whose cpg.bin has no flatgraph tail
@@ -1126,7 +1294,8 @@ class TestFailedBuildCacheGate:
 
         cpg = build_cpg_cached(target, cache, subprocess_runner=runner)
         assert cpg.exists()  # this run may still use the build
-        assert not (cache / "joern-cpg" / "manifest.json").exists()
+        slot = cpg_cache_slot_name((), target=target)
+        assert not (cache / slot / "manifest.json").exists()
 
     def test_valid_build_still_manifested(self, tmp_path):
         # Two-direction: a build whose tail manifest parses is cached.
@@ -1143,7 +1312,8 @@ class TestFailedBuildCacheGate:
 
         cpg = build_cpg_cached(target, cache, subprocess_runner=runner)
         assert cpg.build_failed is False
-        manifest = _read_cpg_manifest(cache / "joern-cpg")
+        slot = cpg_cache_slot_name((), target=target)
+        manifest = _read_cpg_manifest(cache / slot)
         assert manifest is not None
         assert manifest["method_count"] == 3
 
@@ -1311,3 +1481,235 @@ class TestRunQueryScriptBodyValidation:
         )
         assert any("cap" in e for e in result.errors)
         assert calls == []
+
+
+class TestStallKillAddressesTheGroup:
+    """The unsandboxed joern-parse lane's stall/timeout kills must
+    address the process GROUP: joern-parse may be a shell wrapper
+    whose JVM child survives a leader-only kill (the shape the server
+    documents and defends with start_new_session+killpg)."""
+
+    def _wrapper_with_grandchild(self):
+        import subprocess as sp
+        from packages.joern.server import _proc_starttime
+        proc = sp.Popen(
+            ["bash", "-c", "sleep 300 & echo $!; wait"],
+            stdout=sp.PIPE, text=True,
+            start_new_session=True,  # as the build Popen now spawns
+        )
+        assert proc.stdout is not None
+        grandchild = int(proc.stdout.readline())
+        # (pid, starttime) names this process INCARNATION. The anchor
+        # read cannot race the kill: the grandchild's 300s sleep pins
+        # it alive here, before the monitor exists. None only without
+        # procfs, where the identity check below degrades away.
+        return proc, grandchild, _proc_starttime(grandchild)
+
+    @staticmethod
+    def _gone(pid: int, starttime: int | None) -> bool:
+        """True once *pid* has been KILLED — a zombie counts as gone,
+        and so does a RECYCLED pid (same number, different starttime).
+
+        The waits below poll the condition the stall monitor CONTROLS:
+        the group SIGKILL landing on the grandchild. A kill victim is
+        observable the instant it dies — it disappears outright or
+        turns zombie awaiting its reaper — but WHEN the zombie is
+        reaped belongs to whoever inherited it, not to the monitor. On
+        an idle host init adopts the orphaned grandchild and reaps
+        near-instantly, so kill-0 aliveness happens to work; under
+        load the reap lags, and inside a nested pid namespace (the
+        mandated runner for kill-exercising tests) the orphan
+        reparents to ns-init — the pytest process itself — which never
+        waits on strangers, so the zombie persists for the life of the
+        run and the kill-0 deadline times out. Counting a zombie as
+        gone cannot mask a missed kill in the other direction: a
+        grandchild the monitor failed to signal stays in state R/S,
+        which still reads as not-gone. Same semantics as the sibling
+        escalation tests' ``_pid_gone`` and the production
+        ``_pgid_alive`` zombie confirmation; without procfs the coarse
+        kill-0 answer stands (there the platform reaper owns orphans).
+
+        The starttime anchor closes the reuse hole on a churning
+        host: once the reaped grandchild's pid is handed to a
+        stranger, kill-0 sees a live non-zombie and the poll runs out
+        its deadline against a process the monitor never owned. A
+        mismatched starttime proves the recorded incarnation no
+        longer exists — which for a 300s sleeper means it was killed.
+        Matching starttime keeps the strict direction: the original
+        grandchild still running reads as not-gone.
+        """
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            pass  # EPERM-class: somebody is there — check its state below.
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+        except OSError:
+            return False  # no procfs — accept the coarse kill-0 answer
+        fields = stat.rsplit(")", 1)[-1].split()
+        if fields[0] == "Z":
+            return True
+        # /proc/<pid>/stat field 22 (starttime), 0-indexed 19 after
+        # the state field that follows the ")"-terminated comm.
+        return starttime is not None and int(fields[19]) != starttime
+
+    def test_stall_kill_reaps_wrapper_spawned_grandchild(self):
+        import os
+        import signal as sig
+        import threading
+        import time as time_mod
+        from packages.joern.runner import _StallMonitor
+        proc, grandchild, anchor = self._wrapper_with_grandchild()
+        try:
+            mon = _StallMonitor(proc)
+            mon._threshold = 0.1
+            mon._last_progress = time_mod.monotonic() - 60
+            t = threading.Thread(target=mon.watch)
+            t.start()
+            t.join(15)
+            proc.wait(10)
+            # The deadline bounds only the FAILURE mode: a grandchild
+            # the kill genuinely missed is a 300s sleeper that stays
+            # not-gone for every poll, while a killed one satisfies
+            # the first poll that observes it — so a generous ceiling
+            # buys load immunity without ever masking a miss.
+            gone = False
+            deadline = time_mod.monotonic() + 20
+            while time_mod.monotonic() < deadline:
+                if self._gone(grandchild, anchor):
+                    gone = True
+                    break
+                time_mod.sleep(0.05)
+            assert mon.was_killed
+            # Assert the RECORDED observation — never re-roll the
+            # predicate. ``_gone`` answers a racy question (kill-0 +
+            # /proc reads on a pid a churning host may already have
+            # recycled to a short-lived stranger), and its transient
+            # not-gone answers (stat vanishing between kill-0 and the
+            # read, a momentary dead-transitional state) are benign
+            # inside the poll loop but final in a re-evaluation: one
+            # transient after the loop already saw the kill land
+            # would indict a kill that landed.
+            assert gone, (
+                "wrapper-spawned grandchild survived the stall kill"
+            )
+        finally:
+            with __import__("contextlib").suppress(OSError):
+                os.killpg(proc.pid, sig.SIGKILL)
+
+    def test_kill_helper_tolerates_mock_pids(self):
+        # Handle-shaped mocks reach the helper from tests; a non-int
+        # pid must fall back to proc.kill(), never raise.
+        from unittest.mock import MagicMock
+        from packages.joern.runner import _kill_build_group
+        proc = MagicMock()
+        proc.pid = MagicMock()
+        _kill_build_group(proc)
+        proc.kill.assert_called_once()
+
+
+# ── Sandbox CPU-limit plumbing at the two spawn sites ───────────────
+
+class TestSandboxCpuLimitsPlumbing:
+    """Both sandboxed spawns must carry a wall-sized RLIMIT_CPU
+    override, and injected runners without the kwarg must keep
+    working via the TypeError fallback."""
+
+    def _patch_budget(self, monkeypatch, *, standing: int, cpus: int) -> None:
+        import os as _os
+
+        import core.sandbox.preexec as preexec
+        monkeypatch.setattr(
+            preexec, "standing_cpu_seconds", lambda: standing,
+        )
+        monkeypatch.setattr(
+            _os, "sched_getaffinity", lambda pid: set(range(cpus)),
+            raising=False,
+        )
+
+    def _capturing_runner(self, captured: dict, stdout: str = ""):
+        def runner(cmd, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                stdout=stdout, stderr="", returncode=0,
+            )
+        return runner
+
+    def test_build_spawn_raises_cpu_for_long_wall(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        # The defect direction: a 4 h wall must carry a CPU budget the
+        # multi-threaded JVM cannot exhaust before the wall.
+        self._patch_budget(monkeypatch, standing=3600, cpus=8)
+        target = tmp_path / "src"
+        target.mkdir()
+        (target / "a.c").write_text("int f() { return 0; }")
+        captured: dict = {}
+        build_cpg(
+            target,
+            subprocess_runner=self._capturing_runner(captured),
+            output_dir=tmp_path / "out",
+            timeout=14400,
+        )
+        assert captured["limits"] == {"cpu_seconds": 14400 * 8 + 300}
+
+    def test_query_spawn_floors_at_standing_for_short_wall(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        # The other direction: a short wall must not tighten the
+        # standing sandbox posture.
+        self._patch_budget(monkeypatch, standing=3600, cpus=8)
+        f = tmp_path / "cpg.bin"
+        f.write_bytes(b"fake")
+        cpg = JoernCPG(path=f, target=tmp_path)
+        captured: dict = {}
+        run_query(
+            cpg, "cpg.method.l",
+            subprocess_runner=self._capturing_runner(captured),
+            timeout=300,
+        )
+        assert captured["limits"] == {"cpu_seconds": 3600}
+
+    def test_build_strict_runner_falls_back_without_limits(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        # An injected runner without the sandbox kwargs (bare
+        # subprocess.run shape) must still be reached via the
+        # TypeError fallback.
+        self._patch_budget(monkeypatch, standing=3600, cpus=8)
+        target = tmp_path / "src"
+        target.mkdir()
+        calls: list = []
+
+        def strict_runner(cmd, capture_output, text, timeout, cwd):
+            calls.append(cmd)
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+        cpg = build_cpg(
+            target,
+            subprocess_runner=strict_runner,
+            output_dir=tmp_path / "out",
+        )
+        assert cpg.target == target
+        assert len(calls) == 1
+
+    def test_query_strict_runner_falls_back_without_limits(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        self._patch_budget(monkeypatch, standing=3600, cpus=8)
+        f = tmp_path / "cpg.bin"
+        f.write_bytes(b"fake")
+        cpg = JoernCPG(path=f, target=tmp_path)
+        calls: list = []
+
+        def strict_runner(cmd, capture_output, text, timeout, cwd):
+            calls.append(cmd)
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+        result = run_query(
+            cpg, "cpg.method.l", subprocess_runner=strict_runner,
+        )
+        assert result.errors == []
+        assert len(calls) == 1

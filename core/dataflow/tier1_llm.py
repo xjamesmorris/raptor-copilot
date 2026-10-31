@@ -53,16 +53,23 @@ from core.dataflow.smt_barrier import (
     ValidatorSpec,
     _crosses_function_boundary,
     _function_containing,
+    code_view_lines,
+    _lexical_validator_in_branch,
     _python_chain_reaches_sink,
     _lexical_var_reaches_sink,
+    _sanitizer_tails_for_spec_kind,
     _same_function_in_order,
+    _validator_in_branch,
     prove_neutralizes,
+    split_source_lines,
     substitution_dominates_sink,
     validator_dominates_sink,
 )
 from core.dataflow.smt_barrier import (
     extract_validator as _mechanical_extract,
 )
+from core.paths import confine
+from core.source import read_text_capped
 from core.llm.coerce import extract_fenced_code
 
 # A bare-minimum LLM completer signature, compatible with the existing
@@ -149,7 +156,7 @@ def _validator_line_in_diff(fix_diff: str, claimed_line: str) -> bool:
     needle = claimed_line.strip()
     if not needle:
         return False
-    for raw in fix_diff.splitlines():
+    for raw in split_source_lines(fix_diff):
         if not raw.startswith("+") or raw.startswith("+++"):
             continue
         if raw[1:].strip() == needle:
@@ -196,18 +203,38 @@ def _find_best_validator_line(
     occurrence (in the sink's function) is the actual sanitizer.
 
     Selection rule:
-      * For Python: among occurrences strictly before ``sink_line``,
-        prefer one in the SAME function as the sink; among those, pick
-        the closest one (largest line < sink_line).
-      * Non-Python (no AST): among occurrences before ``sink_line``,
-        pick the closest.
+      * Occurrences are anchored against the comment/string-blanked
+        view of the file (same rule as ``find_validator_line``): a
+        line whose text lives inside a block comment or a multi-line
+        string is prose — binding to it would hand the dominance and
+        chain gates a decoy location (CVE fix diffs routinely carry
+        commented-out old sanitizer lines as ``+`` lines, and the
+        cheap LLM is pointed at the diff). Unlike Tier 0's per-line
+        re-extraction this lane's needles (e.g. curated safe calls)
+        have no extractor, so the anchor is positional: the
+        candidate's first code character must survive in the view.
+        Fails CLOSED — a missing or short view line reads as prose.
+      * For Python: among code occurrences strictly before
+        ``sink_line``, prefer one in the SAME function as the sink;
+        among those, pick the closest one (largest line < sink_line).
+      * Non-Python (no AST): among code occurrences before
+        ``sink_line``, pick the closest.
       * Returns ``None`` if no usable occurrence exists.
     """
     needle = claimed_line_text.strip()
     if not needle:
         return None
-    candidates = [idx + 1 for idx, ln in enumerate(source_text.splitlines())
-                  if ln.strip() == needle and idx + 1 < sink_line]
+    view = code_view_lines(source_text, language)
+    candidates = []
+    for idx, ln in enumerate(split_source_lines(source_text)):
+        if ln.strip() != needle or idx + 1 >= sink_line:
+            continue
+        first = len(ln) - len(ln.lstrip())
+        view_ln = view[idx] if idx < len(view) else None
+        if (view_ln is None or first >= len(view_ln)
+                or view_ln[first] == " "):
+            continue
+        candidates.append(idx + 1)
     if not candidates:
         return None
     if language == "python":
@@ -226,149 +253,9 @@ def _find_best_validator_line(
     return max(candidates)
 
 
-def _validator_in_branch(tree, validator_line: int, sink_line: int) -> bool:
-    """Return True if ``validator_line`` is inside a conditional branch
-    of the function containing the sink — meaning the validator does NOT
-    dominate the sink unconditionally."""
-    import ast as _ast
-    fn = _function_containing(tree, sink_line)
-    body = fn.body if fn else tree.body
-
-    def _in_branch(stmts, target) -> bool:
-        for stmt in stmts:
-            if isinstance(stmt, _ast.If):
-                if _spans(stmt.body, target) or _spans(stmt.orelse, target):
-                    return True
-            elif isinstance(stmt, (_ast.For, _ast.While)):
-                if _spans(stmt.body, target):
-                    return True
-            elif isinstance(stmt, _ast.Try):
-                for handler in stmt.handlers:
-                    if _spans(handler.body, target):
-                        return True
-                # A conditional nested inside the try body / else /
-                # finally still wraps the validator — descend.
-                if (_in_branch(stmt.body, target)
-                        or _in_branch(stmt.orelse, target)
-                        or _in_branch(stmt.finalbody, target)):
-                    return True
-            elif isinstance(stmt, (_ast.With, _ast.AsyncWith)):
-                # ``with`` executes unconditionally, but its body can
-                # contain conditionals — descend rather than skip.
-                if _in_branch(stmt.body, target):
-                    return True
-            elif isinstance(stmt, _ast.Match):
-                # Every case arm is conditional.
-                if any(_spans(case.body, target) for case in stmt.cases):
-                    return True
-        return False
-
-    def _spans(stmts, target) -> bool:
-        for stmt in stmts:
-            if hasattr(stmt, "lineno") and hasattr(stmt, "end_lineno"):
-                if stmt.lineno <= target <= (stmt.end_lineno or stmt.lineno):
-                    return True
-            elif hasattr(stmt, "lineno") and stmt.lineno == target:
-                return True
-        return False
-
-    return _in_branch(body, validator_line)
-
-
-# Block-opening keywords that make a brace block CONDITIONAL (or
-# repeated) — a safe-call inside one does not dominate a sink outside
-# it.  ``else``/``catch``/``case``/``default`` are conditional arms;
-# loops are included because a loop body may execute zero times.
-_COND_BLOCK_KEYWORD = _re.compile(
-    r"\b(?:if|else|for|while|switch|case|default|catch|do)\b"
-)
-# Crude string/comment scrubber for the lexical brace tracker: brace
-# characters inside literals or comments must not perturb the stack.
-_LEXICAL_NOISE = _re.compile(
-    r'"(?:[^"\\]|\\.)*"'
-    r"|'(?:[^'\\]|\\.)*'"
-    r"|`(?:[^`\\]|\\.)*`"
-    r"|/\*.*?\*/"
-    r"|//.*$"
-)
-
-
-def _lexical_validator_in_branch(
-    source_text: str, validator_line: int, sink_line: int,
-) -> bool:
-    """Brace-language (JS/TS/Java/C/C++) analogue of
-    :func:`_validator_in_branch`: True when the validator line is
-    conditionally executed relative to the sink.
-
-    Tracks a stack of ``{`` blocks tagged conditional by the keyword
-    preceding the brace.  The validator is branch-wrapped when a
-    conditional block open at the validator line has closed again
-    before the sink line (``if (opts.clean) { x = escape(x); }
-    send(x)``) — sharing the block is fine (whenever the sink runs the
-    validator ran).  A conditional keyword on the validator line
-    itself (braceless ``if (c) x = escape(x);``) also flags, as does a
-    DANGLING guard — ``if (c)`` alone on the nearest preceding
-    non-blank line with no ``{``, whose guarded statement is the
-    validator line (legal Java/JS braceless form the brace tracker
-    never sees).  Residual, not modeled: ternaries, and dangling
-    guards whose condition spans multiple lines (the keyword is then
-    not on the nearest preceding line).  CONSERVATIVE on tracker
-    confusion (unbalanced braces after scrubbing): returns True —
-    "not proven unconditional" must never read as dominance.
-    """
-    lines = source_text.splitlines()
-    if not (0 < validator_line <= len(lines) and 0 < sink_line <= len(lines)):
-        return True
-    if _COND_BLOCK_KEYWORD.search(
-            _LEXICAL_NOISE.sub(" ", lines[validator_line - 1])):
-        return True
-    # Dangling braceless guard: the nearest preceding non-blank
-    # scrubbed line carries a conditional keyword and opens no block —
-    # the validator line IS its guarded statement.
-    for prev_idx in range(validator_line - 2, -1, -1):
-        prev = _LEXICAL_NOISE.sub(" ", lines[prev_idx])
-        if not prev.strip():
-            continue
-        if _COND_BLOCK_KEYWORD.search(prev) and "{" not in prev:
-            return True
-        break
-    # Each block gets a unique id so "still open at the sink" means the
-    # SAME block, not merely the same nesting depth.
-    stack: list[tuple[int, bool]] = []   # (block id, conditional?)
-    at_validator: list[tuple[int, bool]] | None = None
-    next_id = 0
-    prev_tail = ""                       # scrubbed text since the last brace
-    for idx, raw in enumerate(lines[:sink_line], start=1):
-        text = _LEXICAL_NOISE.sub(" ", raw)
-        for ch in text:
-            if ch == "{":
-                conditional = bool(_COND_BLOCK_KEYWORD.search(prev_tail))
-                stack.append((next_id, conditional))
-                next_id += 1
-                prev_tail = ""
-            elif ch == "}":
-                if not stack:
-                    return True          # tracker confused — conservative
-                stack.pop()
-                prev_tail = ""
-            else:
-                prev_tail += ch
-        if idx == validator_line:
-            at_validator = list(stack)
-    if at_validator is None:
-        return True
-    # Every conditional block open at the validator must STILL be open
-    # at the sink — one that closed in between means the sink runs on
-    # paths that skipped the validator.
-    open_at_sink = {block_id for block_id, _ in stack}
-    return any(
-        conditional and block_id not in open_at_sink
-        for block_id, conditional in at_validator
-    )
-
-
 def _line_invokes_library_call(
     line: str, library_call: str, variable: str,
+    *, require_variable_in_args: bool = False,
 ) -> bool:
     """Verify the LLM-claimed ``library_call`` actually appears on the
     claimed line as a call, applied to (or assigned from) the claimed
@@ -378,10 +265,27 @@ def _line_invokes_library_call(
     at any real added line (a log statement, a comment-adjacent
     assignment) and claim it is ``shlex.quote``.  Without this check
     the curated-table lookup adjudicates a call that never happens.
+
+    ``require_variable_in_args=True`` (validate-kind entries) drops
+    the assigned-from fallback: a validate-kind chain starts DIRECTLY
+    from the claimed variable, so accepting ``safe = raw; ok =
+    ipcheck(z)`` for variable ``safe`` — bound on the line but never
+    an argument of (nor bound from) the call — would certify SOUND
+    for a value the validator never constrained.  Transform-kind
+    callers keep the fallback: their chain start is re-derived from
+    the actual binding targets, so a mis-attributed variable here is
+    harmless.
     """
     tail = library_call.rsplit(".", maxsplit=1)[-1]
     lib_parts = library_call.split(".")
-    for m in _re.finditer(r"([A-Za-z_][\w.]*)\s*\(", line):
+    # \b pin: unanchored, every position inside a long dotted-name
+    # run starts a fresh scan of the line tail — quadratic; a
+    # mid-word start is never a real callee name.
+    for m in _re.finditer(# Name run bounded: a separator fill keeps the \b live at every
+    # planted head, so an unbounded run is re-scanned per head —
+    # quadratic on a hostile line (real dotted names sit far
+    # inside 128 chars).
+    r"\b([A-Za-z_][\w.]{0,128})\s*\(", line):
         name_parts = m.group(1).split(".")
         if name_parts[-1] != tail:
             continue
@@ -410,9 +314,177 @@ def _line_invokes_library_call(
             return True
         if _re.search(rf"\b{_re.escape(variable)}\b", args):
             return True
-        if _re.match(rf"\s*{_re.escape(variable)}\s*=", line):
+        if (not require_variable_in_args
+                and _re.match(rf"\s*{_re.escape(variable)}\s*=", line)):
             return True
     return False
+
+
+def _value_calls_tail(value, tail: str) -> bool:
+    """True iff ``value``'s subtree contains a call whose callee name
+    (bare or attribute) is ``tail``.  Pre-filter only — binding
+    decisions use :func:`_value_is_call_result` (the value must BE the
+    call, not merely contain it)."""
+    import ast
+    return any(
+        isinstance(c, ast.Call)
+        and isinstance(c.func, (ast.Name, ast.Attribute))
+        and (c.func.id if isinstance(c.func, ast.Name)
+             else c.func.attr) == tail
+        for c in ast.walk(value)
+    )
+
+
+def _value_is_call_result(value, tail: str) -> bool:
+    """True iff ``value`` IS a call to ``tail`` — not merely contains
+    one.  The subtree form credited containers and selects that mix
+    the raw input around the sanitized element
+    (``p = [escape(x), x]``, ``p = q, r = escape(x), x``,
+    ``{...: escape(x), ...: x}[flag]``) with a fully-sanitized
+    binding (false SOUND).  Parentheses/annotations are transparent at
+    the AST level; anything else refuses — refusing costs yield,
+    never soundness."""
+    import ast
+    if not isinstance(value, ast.Call):
+        return False
+    func = value.func
+    if isinstance(func, ast.Name):
+        return func.id == tail
+    if isinstance(func, ast.Attribute):
+        return func.attr == tail
+    return False
+
+
+def _paired_transform_targets(target, value, tail: str) -> set[str]:
+    """Names whose paired value IS the transform call, matched
+    element-wise through tuple/list structure.
+
+    A tuple co-assignment binds each target element to its
+    corresponding VALUE element — ``escaped, raw = html.escape(x), x``
+    binds ``raw`` to the RAW input, so collecting every target name of
+    the statement handed the chain a variable the transform never
+    touched (false SOUND).  Only the element whose paired value IS the
+    call joins (a value that merely CONTAINS the call — a container
+    literal, a chained-target tuple, a subscript select — mixes raw
+    input around the sanitized element); when the pairing cannot be
+    established (starred targets, non-tuple RHS for a tuple target,
+    length mismatch) the whole target contributes nothing — refusing
+    costs yield, never soundness."""
+    import ast
+    if isinstance(target, ast.Name):
+        return {target.id} if _value_is_call_result(value, tail) else set()
+    if isinstance(target, (ast.Tuple, ast.List)):
+        if (
+            isinstance(value, (ast.Tuple, ast.List))
+            and len(value.elts) == len(target.elts)
+            and not any(isinstance(t, ast.Starred) for t in target.elts)
+        ):
+            out: set[str] = set()
+            for t_elt, v_elt in zip(target.elts, value.elts):
+                out |= _paired_transform_targets(t_elt, v_elt, tail)
+            return out
+        return set()
+    # Starred / Attribute / Subscript: nothing the chain can follow.
+    return set()
+
+
+def _lexical_binding_segments(line: str) -> list[str]:
+    """Split a lexical-language source line into per-binding segments:
+    on ``;`` (statement joins) and on top-level ``,`` (declarator
+    lists).  Commas nested inside brackets or string literals never
+    split.  Over-splitting only narrows a segment — the capture and
+    the call must co-reside in one segment — so the crude split errs
+    toward refusal, never toward crediting."""
+    segments: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    quote: str | None = None
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote is not None:
+            buf.append(ch)
+            if ch == "\\" and i + 1 < len(line):
+                buf.append(line[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "'\"`":
+            quote = ch
+            buf.append(ch)
+        elif ch in "([{":
+            depth += 1
+            buf.append(ch)
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+            buf.append(ch)
+        elif ch in ";," and depth == 0:
+            segments.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+        i += 1
+    segments.append("".join(buf))
+    return segments
+
+
+def _transform_binding_targets(
+    tree, source_text: str, validator_line: int, library_call: str,
+) -> set[str]:
+    """Plain-Name targets the transform call's result is bound to on
+    the claimed line — empty when the result is discarded or bound to
+    nothing the chain tracker can follow (attribute/subscript)."""
+    import ast
+    tail = library_call.rsplit(".", maxsplit=1)[-1]
+    targets: set[str] = set()
+    if tree is not None:
+        for node in ast.walk(tree):
+            if getattr(node, "lineno", None) != validator_line:
+                continue
+            if not isinstance(
+                node, (ast.Assign, ast.AnnAssign, ast.NamedExpr),
+            ):
+                continue
+            value = getattr(node, "value", None)
+            if value is None:
+                continue
+            if not _value_calls_tail(value, tail):
+                continue
+            node_targets = (list(node.targets)
+                            if isinstance(node, ast.Assign)
+                            else [node.target])
+            for t in node_targets:
+                targets |= _paired_transform_targets(t, value, tail)
+        return targets
+    # Lexical languages: accept ``x = ...call(...)`` (with optional
+    # const/let/var/final or a type before the name).  Statement
+    # segments are split on ``;`` AND on top-level ``,`` and the
+    # capture + call-presence test applied PER SEGMENT: on a
+    # semicolon-joined line (``var safe = x; var y = sanitize(x);``)
+    # or a multi-declarator list (``var safe = x, y = sanitize(x);``)
+    # the call must sit in the SAME binding as the captured target,
+    # otherwise the FIRST target (bound to the raw value) was credited
+    # with a transform that belongs to a later binding.  Commas inside
+    # brackets (call arguments, literals) and string literals do not
+    # split; a delimiter inside a string literal only narrows a
+    # segment further — it can never join two statements — so the
+    # crude split errs toward refusal.
+    lines = split_source_lines(source_text)
+    if not (0 < validator_line <= len(lines)):
+        return set()
+    line = lines[validator_line - 1]
+    out: set[str] = set()
+    for segment in _lexical_binding_segments(line):
+        m = _re.match(
+            r"\s*(?:(?:const|let|var|final)\s+)?"
+            r"(?:[A-Za-z_$][\w$<>\[\].]*\s+)?"
+            r"([A-Za-z_$][\w$]*)\s*=[^=]",
+            segment,
+        )
+        if m and _re.search(rf"\b{_re.escape(tail)}\s*\(", segment[m.end():]):
+            out.add(m.group(1))
+    return out
 
 
 def _try_known_safe_call(
@@ -431,7 +503,8 @@ def _try_known_safe_call(
         )
     if not _line_invokes_library_call(
             spec.validator_source_line, spec.library_call,
-            spec.variable_name):
+            spec.variable_name,
+            require_variable_in_args=(entry.input_arg_kind == "validate")):
         return Tier0Result(
             Tier0Status.NOT_APPLICABLE,
             f"Tier 1B: claimed library call {spec.library_call!r} does "
@@ -451,11 +524,26 @@ def _try_known_safe_call(
     # Source-order + same-function check (the helper above already
     # picked a same-function candidate when possible; this confirms
     # for the AST-aware Python path).
-    try:
-        import ast
-        tree = ast.parse(source_text) if language == "python" else None
-    except SyntaxError:
-        tree = None
+    tree = None
+    if language == "python":
+        try:
+            import ast
+            tree = ast.parse(source_text)
+        except SyntaxError:
+            # Refuse, never degrade: every dominance gate below
+            # (same-function, binding-target, branch) is conditioned
+            # on `tree is not None` for Python, so carrying on with
+            # tree=None silently certified with ALL gates skipped —
+            # one syntax error anywhere in the file (common in py2 /
+            # newer-syntax corpora, and plantable in a scanned repo)
+            # disabled dominance for every known-safe-call
+            # certification in it. Same behaviour as the tier1b
+            # extraction lane's parse refusal below.
+            return Tier0Result(
+                Tier0Status.NOT_APPLICABLE,
+                "post-fix source has syntax errors — Python dominance "
+                "gates unavailable for a known-safe-call certification",
+            )
     if tree is not None and not _same_function_in_order(
             tree, validator_line, sink_line):
         return Tier0Result(
@@ -473,29 +561,67 @@ def _try_known_safe_call(
             f"safe-call at line {validator_line} is separated from the "
             f"sink at line {sink_line} by a function boundary",
         )
-    # Chain check — only Python has an AST chain tracker for now.  For
-    # non-Python we conservatively require the LLM's variable_name to
-    # appear textually at the sink line.
-    sink_lines = source_text.splitlines()
-    sink_line_text = sink_lines[sink_line - 1] if 0 < sink_line <= len(sink_lines) else ""
-    if language == "python" and tree is not None and spec.variable_name:
-        chain_ok = _python_chain_reaches_sink(
-            tree, spec.variable_name, validator_line, sink_line, sink_line_text,
+    # Transform-kind entries return the sanitized VALUE: the chain
+    # must start from what the call's result is BOUND to, never from
+    # the input argument — ``safe = html.escape(name); render(name)``
+    # (mis-bound) and a bare ``html.escape(name)`` (discarded) both
+    # leave raw ``name`` at the sink, the exact incomplete-fix class
+    # this gate exists to catch (the curated-table contract says "the
+    # return value (or a name assigned from it)"). Validate-kind
+    # entries constrain the input itself, so the LLM's variable stays
+    # the chain start there — sound ONLY because the table contract
+    # requires validate-kind calls to RAISE on bad input (a
+    # sentinel-returning validator leaves the raw input live and must
+    # be classed transform; see the KnownSafeCall docstring and the
+    # werkzeug.security.safe_join precedent).
+    chain_vars: set[str] = (
+        {spec.variable_name} if spec.variable_name else set()
+    )
+    if entry.input_arg_kind == "transform":
+        chain_vars = _transform_binding_targets(
+            tree, source_text, validator_line, spec.library_call,
         )
-    elif spec.variable_name:
-        chain_ok = _lexical_var_reaches_sink(
-            spec.variable_name, source_text, validator_line, sink_line,
-            sink_line_text,
+        if not chain_vars:
+            return Tier0Result(
+                Tier0Status.NOT_APPLICABLE,
+                f"Tier 1B: {entry.library_call} result at line "
+                f"{validator_line} is not bound to a variable the "
+                f"chain can follow — a discarded transform sanitizes "
+                f"nothing",
+            )
+    # Chain check — only Python has an AST chain tracker for now.  For
+    # non-Python we conservatively require the chain variable to
+    # appear textually at the sink line.
+    sink_lines = split_source_lines(source_text)
+    sink_line_text = sink_lines[sink_line - 1] if 0 < sink_line <= len(sink_lines) else ""
+    if language == "python" and tree is not None:
+        # The sanitizing binding on the validator line is exactly the
+        # curated call — name it so the chain walker exempts ONLY that
+        # binding node, never the whole line.
+        tail_set = frozenset({entry.library_call.rsplit(".", 1)[-1]})
+        chain_ok = any(
+            _python_chain_reaches_sink(
+                tree, var, validator_line, sink_line, sink_line_text,
+                sanitizer_call_tails=tail_set,
+            )
+            for var in chain_vars
         )
     else:
-        chain_ok = False
+        chain_ok = any(
+            _lexical_var_reaches_sink(
+                var, source_text, validator_line, sink_line,
+                sink_line_text,
+            )
+            for var in chain_vars
+        )
     if not chain_ok:
         return Tier0Result(
             Tier0Status.NOT_APPLICABLE,
-            f"variable {spec.variable_name!r} sanitized by "
+            f"variable {sorted(chain_vars) or [spec.variable_name]!r} "
+            f"sanitized by "
             f"{entry.library_call} does not reach the sink line",
         )
-    if (language == "python" and tree is not None and spec.variable_name
+    if (language == "python" and tree is not None and chain_vars
             and _validator_in_branch(tree, validator_line, sink_line)):
         return Tier0Result(
             Tier0Status.NOT_APPLICABLE,
@@ -508,7 +634,7 @@ def _try_known_safe_call(
     # the flow is live whenever the branch is skipped — breaking the
     # sound tier's zero-false-suppression guarantee.
     if language != "python" and _lexical_validator_in_branch(
-            source_text, validator_line, sink_line):
+            source_text, validator_line, sink_line, language=language):
         return Tier0Result(
             Tier0Status.NOT_APPLICABLE,
             f"safe-call at line {validator_line} not proven to execute "
@@ -566,17 +692,16 @@ def try_tier1b(
             "Tier 1B: LLM-claimed validator_source_line not found as "
             "a + line in the fix diff (possible hallucination)",
         )
-    # Read post-fix source for verification.  Containment-checked:
-    # ``sink_uri`` arrives verbatim from finding/corpus records
-    # (cvefix_bridge threads it from the diff/finding shape), so a
-    # crafted ``..`` segment would walk the read outside ``repo_root``
-    # and adjudicate a barrier against an arbitrary host file.  Same
-    # defence as the rest of the arc (``finding_resolver.
-    # _read_finding_source``, ``injection_prescreen._read_source``).
-    try:
-        src_path = (repo_root / sink_uri.lstrip("/")).resolve()
-        src_path.relative_to(repo_root.resolve())
-    except (ValueError, OSError):
+    # Read post-fix source for verification.  Containment-checked via
+    # the shared chokepoint: ``sink_uri`` arrives verbatim from
+    # finding/corpus records (cvefix_bridge threads it from the
+    # diff/finding shape), so a crafted ``..`` segment would walk the
+    # read outside ``repo_root`` and adjudicate a barrier against an
+    # arbitrary host file.  Same defence as the rest of the arc
+    # (``finding_resolver._read_finding_source``,
+    # ``injection_prescreen._read_source``).
+    src_path = confine(repo_root, sink_uri.lstrip("/"))
+    if src_path is None:
         return Tier0Result(
             Tier0Status.NOT_APPLICABLE,
             f"Tier 1B: sink path {sink_uri!r} resolves outside the "
@@ -587,13 +712,16 @@ def try_tier1b(
             Tier0Status.NOT_APPLICABLE,
             f"Tier 1B: post-fix source not readable at {sink_uri!r}",
         )
-    try:
-        source_text = src_path.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
+    # Capped read (shared default) like try_tier0's: a truncated read
+    # can only make the validator/sink lines unfindable below —
+    # NOT_APPLICABLE, never a barrier proved from missing text.
+    got = read_text_capped(src_path, errors="replace")
+    if got is None:
         return Tier0Result(
             Tier0Status.NOT_APPLICABLE,
-            f"Tier 1B: could not read source: {exc}",
+            f"Tier 1B: could not read source {sink_uri!r}",
         )
+    source_text = got[0]
 
     if spec.kind in ("charset", "charset_sub"):
         # Mechanical re-extract on the LLM-named line; agreement gates
@@ -646,7 +774,21 @@ def try_tier1b(
                 f"function boundary",
                 spec=mech,
             )
-        sink_lines = source_text.splitlines()
+        if language != "python" and _lexical_validator_in_branch(
+                source_text, validator_line, sink_line,
+                guard_shaped=(mech.kind == "charset"), language=language):
+            # Same conditional-execution gate the known_safe_call path
+            # applies: a branch-wrapped sanitizer certifies SOUND while
+            # the flow is live whenever the branch is skipped. For the
+            # guard form the guard's own exit-on-fail block is exempt.
+            return Tier0Result(
+                Tier0Status.NOT_APPLICABLE,
+                f"Tier 1B: validator at line {validator_line} not "
+                f"proven to execute unconditionally before the sink "
+                f"(branch-wrapped or tracker-inconclusive)",
+                spec=mech,
+            )
+        sink_lines = split_source_lines(source_text)
         sink_line_text = (sink_lines[sink_line - 1]
                           if 0 < sink_line <= len(sink_lines) else "")
         if language == "python":
@@ -660,6 +802,8 @@ def try_tier1b(
                 )
             chain_ok = _python_chain_reaches_sink(
                 tree, mech.var_name, validator_line, sink_line, sink_line_text,
+                sanitizer_call_tails=_sanitizer_tails_for_spec_kind(
+                    mech.kind),
             )
         else:
             chain_ok = _lexical_var_reaches_sink(

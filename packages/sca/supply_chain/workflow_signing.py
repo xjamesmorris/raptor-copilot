@@ -49,6 +49,35 @@ additionally earns its own per-commit finding in every regime:
 it is the one status that is anomalous regardless of the repo's
 signing norm.
 
+Known evasions (documented trade-offs, deliberately not "fixed")
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Two attacker moves defeat the rate heuristic by construction; both
+are accepted costs of the FP posture above rather than gaps to
+close silently:
+
+  * **Zero-cost throwaway signature** — a Megalodon-class attacker
+    signs the forged commit with ANY key (status ``U``, or ``E`` in
+    a fresh clone without the maintainer keyring).  It counts as
+    signed-ish, so no per-commit anomaly fires in any regime.
+    Treating ``U``/``E`` as unsigned instead would FP-flood every
+    clone-time scan (``E`` is the DEFAULT state for legitimately
+    signed commits in a fresh clone — raptor's own history reads
+    all-``E``).  A future low lane for first-seen-author ``U``/``E``
+    commits touching workflows could narrow this without the flood;
+    it needs per-author history, which this detector doesn't build
+    today.
+
+  * **Unsigned-flood norm dilution** — an attacker with write
+    access can push enough unsigned junk commits touching workflow
+    paths (≥30 in the 100-commit window at the 0.70 threshold) to
+    drag the rate below the norm branch, demoting the one REAL
+    forged commit from a per-commit anomaly to a line item inside a
+    single info summary.  The flood itself is loud (30+ junk
+    commits in history), which is why the trade-off is accepted;
+    raising the threshold instead would misclassify legitimately
+    mixed-signing teams into the anomaly regime.
+
 ``%G?`` placeholder semantics (from git docs):
   G — good signature, key trusted in keyring
   U — good signature, key not in trusted keyring
@@ -69,9 +98,12 @@ from __future__ import annotations
 import logging
 import shutil
 import subprocess
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
+from core.security.session_services import session_services_restricted
 from ..models import Confidence, Dependency, Manifest, PinStyle
 
 logger = logging.getLogger(__name__)
@@ -264,11 +296,21 @@ def _git_log_signatures(
     try:
         from core.config import RaptorConfig
         from core.sandbox.preexec import set_pdeathsig
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=30,
-            check=False, env=RaptorConfig.get_safe_env(),
-            preexec_fn=set_pdeathsig(),
+        env = RaptorConfig.get_safe_env()
+        private_home = (
+            TemporaryDirectory(prefix="raptor-sca-gpg-", dir="/tmp")
+            if session_services_restricted() and "GNUPGHOME" not in env
+            else nullcontext(None)
         )
+        with private_home as home:
+            if home:
+                env["GNUPGHOME"] = home
+                env["HOME"] = home
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=30,
+                check=False, env=env,
+                preexec_fn=set_pdeathsig(),
+            )
     except (OSError, subprocess.TimeoutExpired) as e:
         logger.debug(
             "sca.supply_chain.workflow_signing: git log failed: %s", e,

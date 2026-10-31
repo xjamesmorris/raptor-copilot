@@ -1,8 +1,9 @@
 """End-of-run spend block: one authoritative number.
 
-A v5 corpus run printed four mutually inconsistent totals and its
-prominent final "Cost:" banner under-stated total spend by 3.2x (it
-summed only per-label review cost). The spend block aggregates the
+The run summary used to print four mutually inconsistent totals and
+its prominent final "Cost:" banner under-stated total spend by
+roughly 3x (it summed only per-label review cost). The spend block
+aggregates the
 per-group telemetry ledgers — the only source that saw every
 completed call — and folds the telemetry-vs-summary divergence
 warnings into one reconciliation section.

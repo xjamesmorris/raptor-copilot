@@ -25,7 +25,11 @@ parent processes a structured way to react without parsing text.
 # expected an enforced sandbox; silent downgrade would be a
 # contract violation, so the child exits before any user code runs.
 SANDBOX_EXIT_LANDLOCK_DOWNGRADE = 126
-SANDBOX_EXIT_MOUNT_NS_BIND_FAIL = 126
+# (The former SANDBOX_EXIT_MOUNT_NS_BIND_FAIL direct-exit was replaced
+# by a typed raise: an extra_ro_paths bind failure now reports the
+# fail-closed category 'C' on the exec-status pipe — see
+# mount_ns.ExtraRoBindError — instead of exiting 126 with no status
+# byte, which the parent misread as a genuine target result.)
 
 # RLIMIT_CORE could not be set to (0, 0). Without it, a crashing
 # sandboxed process can dump a core file containing the full address

@@ -127,6 +127,11 @@ class TestCollectDescendants:
 
 
 class TestSweepDescendants:
+    # Every direct sweep call passes protect=frozenset(): the sweep's
+    # default protect set is {os.getpid(), os.getppid()}, and inside a
+    # container pid namespace a pytest worker can genuinely run AS pid
+    # 101/103 — silently exempting that synthetic pid from the verdict
+    # and flipping these assertions on whichever worker drew the pid.
     @pytest.fixture(autouse=True)
     def _record_kills(self, monkeypatch):
         self.killed = []
@@ -136,7 +141,8 @@ class TestSweepDescendants:
     def test_live_descendants_swept(self):
         tables = [[(100, 50, 100), (101, 100, 101), (103, 101, 103)], []]
         swept = _macos_spawn._sweep_descendants(
-            100, snapshot_fn=lambda: tables.pop(0))
+            100, snapshot_fn=lambda: tables.pop(0),
+            protect=frozenset())
         assert swept == {101, 103}
         assert sorted(self.killed) == [101, 103]
 
@@ -148,7 +154,8 @@ class TestSweepDescendants:
         post = [(100, 50, 100), (103, 1, 103), (200, 1, 200)]
         tables = [post, []]
         swept = _macos_spawn._sweep_descendants(
-            100, live_snapshot=live, snapshot_fn=lambda: tables.pop(0))
+            100, live_snapshot=live, snapshot_fn=lambda: tables.pop(0),
+            protect=frozenset())
         assert swept == {103}
         assert 200 not in self.killed
 
@@ -158,7 +165,8 @@ class TestSweepDescendants:
         post = [(100, 50, 100), (103, 1, 103)]
         tables = [post, []]
         swept = _macos_spawn._sweep_descendants(
-            100, snapshot_fn=lambda: tables.pop(0))
+            100, snapshot_fn=lambda: tables.pop(0),
+            protect=frozenset())
         assert swept == set()
         assert self.killed == []
 
@@ -170,7 +178,8 @@ class TestSweepDescendants:
         post = [(100, 50, 100), (103, 1, 777)]
         tables = [post, []]
         swept = _macos_spawn._sweep_descendants(
-            100, live_snapshot=live, snapshot_fn=lambda: tables.pop(0))
+            100, live_snapshot=live, snapshot_fn=lambda: tables.pop(0),
+            protect=frozenset())
         assert swept == set()
 
     def test_sweep_is_bounded(self):
@@ -182,12 +191,13 @@ class TestSweepDescendants:
             calls["n"] += 1
             return [(100, 50, 100), (101, 100, 101)]
 
-        _macos_spawn._sweep_descendants(100, snapshot_fn=snapshot)
+        _macos_spawn._sweep_descendants(100, snapshot_fn=snapshot,
+                                        protect=frozenset())
         assert calls["n"] == _macos_spawn._SWEEP_MAX_PASSES
 
     def test_snapshot_failure_is_quiet_noop(self):
         swept = _macos_spawn._sweep_descendants(
-            100, snapshot_fn=lambda: None)
+            100, snapshot_fn=lambda: None, protect=frozenset())
         assert swept == set()
         assert self.killed == []
 
@@ -470,3 +480,227 @@ class TestShimSweepIntegration:
             proc.wait(timeout=10)
             if daemon is not None and _alive(daemon):
                 os.kill(daemon, signal.SIGKILL)
+
+
+# --- cumulative lineage ledger (shim watcher) ----------------------------
+
+class TestShimSweepLineageLedger:
+    """The watcher's cumulative pid/pgid lineage ledger: descendants
+    attributed in ANY while-alive snapshot stay sweepable after they
+    reparent, and process groups led by attributed descendants (their
+    pid, once they setsid) attribute members even when the leader —
+    the classic double-fork intermediate — is already dead. Pre-ledger,
+    only the LATEST snapshot fed the sweep, so both classes escaped."""
+
+    def test_ledger_bridges_descendant_forgotten_by_latest_table(
+            self, shim_mod, monkeypatch):
+        child = FAKE_SHIM_PID + 1
+        escapee = FAKE_SHIM_PID + 2
+        monkeypatch.setattr(os, "killpg", lambda pid, sig: None)
+        # The latest live table no longer attributes the escapee (its
+        # link broke before the final snapshot) — only the ledger,
+        # accumulated from an EARLIER snapshot, still knows it.
+        post = [(escapee, 1, escapee)]
+        tables = [post, []]
+        killed = []
+        swept = shim_mod._sweep_orphans(
+            child, None, snapshot_fn=lambda: tables.pop(0),
+            kill_fn=killed.append,
+            known_pids={escapee: escapee})
+        assert swept == {escapee}
+        assert killed == [escapee]
+
+    def test_dead_intermediate_group_attributes_daemon(
+            self, shim_mod, monkeypatch):
+        # Double-fork shape: intermediate A (seen alive once, now dead)
+        # setsid'd, forked daemon B (pgid == A), exited. B is
+        # unreachable via ppid (1) and via the sandbox group — only A's
+        # pid-as-candidate-pgid attributes it.
+        child = FAKE_SHIM_PID + 1
+        intermediate = FAKE_SHIM_PID + 4
+        daemon = FAKE_SHIM_PID + 5
+        monkeypatch.setattr(os, "killpg", lambda pid, sig: None)
+        post = [(daemon, 1, intermediate), (200, 1, 200)]
+        killed = []
+        tables = [list(post), []]
+        swept = shim_mod._sweep_orphans(
+            child, None, snapshot_fn=lambda: tables.pop(0),
+            kill_fn=killed.append,
+            extra_pgids={intermediate})
+        assert swept == {daemon}
+        assert killed == [daemon]
+        # Control: without the candidate group the daemon is honestly
+        # unattributable (this is the pre-ledger behaviour).
+        tables = [list(post), []]
+        killed = []
+        swept = shim_mod._sweep_orphans(
+            child, None, snapshot_fn=lambda: tables.pop(0),
+            kill_fn=killed.append)
+        assert swept == set()
+
+    def test_ledger_pid_reuse_guard_checks_pgid(
+            self, shim_mod, monkeypatch):
+        # A recycled pid lands in a different process group: the ledger
+        # kills a known pid only while it still carries the recorded
+        # pgid.
+        child = FAKE_SHIM_PID + 1
+        recycled = FAKE_SHIM_PID + 6
+        monkeypatch.setattr(os, "killpg", lambda pid, sig: None)
+        post = [(recycled, 1, 777)]  # different group now
+        tables = [post, []]
+        killed = []
+        swept = shim_mod._sweep_orphans(
+            child, None, snapshot_fn=lambda: tables.pop(0),
+            kill_fn=killed.append,
+            known_pids={recycled: recycled})
+        assert swept == set()
+        assert killed == []
+
+    def test_shim_own_ps_children_never_attributed(self, shim_mod,
+                                                    monkeypatch):
+        """The shim's transient ps snapshot helpers list themselves in
+        the very table they produce (ppid = shim). They must never be
+        attributed — rooting at the shim would feed them into the
+        cumulative candidate-group ledger, turning recycled pids into
+        false-kill candidates for unrelated processes."""
+        self_pid = os.getpid()
+        child = FAKE_SHIM_PID + 1
+        ps_child = FAKE_SHIM_PID + 7
+        monkeypatch.setattr(os, "killpg", lambda pid, sig: None)
+        # The ps helper appears as a live child of the SHIM, outside
+        # the sandbox group.
+        post = [(child, self_pid, child), (ps_child, self_pid, self_pid)]
+        tables = [post, []]
+        killed = []
+        swept = shim_mod._sweep_orphans(
+            child, None, snapshot_fn=lambda: tables.pop(0),
+            kill_fn=killed.append)
+        assert ps_child not in swept
+        assert killed == []
+        # And the lineage derivation (rooted at the sandbox leader)
+        # never records it either.
+        collected = shim_mod._collect_descendants(
+            post, child, extra_pgids=(child,))
+        assert ps_child not in collected
+
+    def test_note_lineage_accumulates_across_snapshots(self, shim_mod):
+        # Drive the ledger derivation the watcher uses: attribute via
+        # the ppid chain in snapshot 1; the pid stays known (and
+        # becomes a candidate group) even though snapshot 2 can no
+        # longer attribute it. Uses the same _collect_descendants the
+        # watcher calls, rooted at the sandbox LEADER exactly like the
+        # watcher — this pins the accumulation CONTRACT, not the
+        # watcher's closure (exercised by the integration test below).
+        self_pid = 100
+        child = 101
+        intermediate = 102
+        lineage = {"pids": {}, "pgids": set()}
+
+        def note(table):
+            cur = {pid: pgid for pid, _pp, pgid in table}
+            extra = (child, *tuple(lineage["pgids"]))
+            for pid in shim_mod._collect_descendants(
+                    table, child, extra_pgids=extra):
+                lineage["pids"][pid] = cur.get(pid)
+                lineage["pgids"].add(pid)
+
+        # Snapshot 1: intermediate alive, attributed via ppid=child
+        # (the walk roots at child; the shim itself and its ps helpers
+        # sit outside it).
+        note([(child, self_pid, child), (intermediate, child,
+                                         intermediate)])
+        assert intermediate in lineage["pids"]
+        assert intermediate in lineage["pgids"]
+        # Snapshot 2: intermediate dead; its daemon (pgid ==
+        # intermediate) attributes through the candidate group.
+        daemon = 103
+        note([(child, self_pid, child), (daemon, 1, intermediate)])
+        assert daemon in lineage["pids"]
+
+
+@needs_linux_setsid
+class TestShimDoubleForkIntegration:
+    """Real shim, double-fork daemoniser with an intermediate that
+    stays alive across snapshot ticks: the intermediate setsids, waits
+    long enough to be seen, forks the daemon, and dies. The daemon
+    (ppid 1, pgid = dead intermediate) was unattributable pre-ledger
+    and survived normal completion; the candidate-group lineage now
+    sweeps it. The fully-in-between variant (intermediate born and
+    dead within one snapshot interval) remains the documented
+    residual and is NOT asserted here."""
+
+    def test_normal_completion_sweeps_double_fork_daemon(self, tmp_path):
+        bpid = tmp_path / "bpid"
+        # Intermediate: new session (setsid(1)), visible for ~1.5s,
+        # then forks the daemon into its session's group and exits.
+        # Target stays alive 3s so the watcher's 0.5s snapshots
+        # attribute the intermediate while its ppid link is intact.
+        script = (
+            f'setsid /bin/sh -c \'sleep 1.5; '
+            f'sleep 300 </dev/null >/dev/null 2>&1 & '
+            f'echo $! > "{bpid}"\' & '
+            f'sleep 3; exit 0'
+        )
+        argv = [sys.executable, "-I", str(SHIM_PATH),
+                "/bin/sh", "-c", script]
+        proc = subprocess.run(
+            argv, env=_shim_env(), capture_output=True, text=True,
+            timeout=30,
+        )
+        daemon = None
+        try:
+            assert proc.returncode == 0, proc.stderr
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not bpid.exists():
+                time.sleep(0.05)
+            daemon = int(bpid.read_text().strip())
+            assert _wait_dead(daemon), (
+                "double-fork daemon (dead intermediate's group) "
+                "survived normal completion — lineage ledger regressed")
+        finally:
+            if daemon is not None and _alive(daemon):
+                os.kill(daemon, signal.SIGKILL)
+
+
+class TestParentBackstopGroupReport:
+    """The parent's normal-completion backstop sweep consumes the
+    watcher's G sandbox-group report from the status channel, so it
+    can killpg-attribute group members even after the shim died
+    without sweeping (the ppid walk from a dead shim pid attributes
+    nothing)."""
+
+    def test_group_report_threaded_into_backstop_sweep(
+            self, monkeypatch):
+        reported_group = 4242
+
+        class _ReportingPopen(_FakePopen):
+            def __init__(self, cmd, **kwargs):
+                super().__init__(cmd, **kwargs)
+                # Stand in for the watcher: write the group report and
+                # the readiness byte through the real status pipe the
+                # spawn wired into our env.
+                fd = int(kwargs["env"]["_RAPTOR_STATUS_FD"])
+                os.write(fd, b"G%d\n" % reported_group)
+                os.write(fd, b"K")
+
+        fake_subprocess = types.SimpleNamespace(
+            Popen=_ReportingPopen,
+            TimeoutExpired=subprocess.TimeoutExpired,
+            CompletedProcess=subprocess.CompletedProcess,
+            PIPE=subprocess.PIPE,
+        )
+        monkeypatch.setattr(_macos_spawn, "subprocess", fake_subprocess)
+        monkeypatch.setattr(_macos_spawn, "_ps_snapshot", lambda: [])
+        sweeps = []
+
+        def record_sweep(root_pid, **kwargs):
+            sweeps.append((root_pid, kwargs))
+            return set()
+
+        monkeypatch.setattr(
+            _macos_spawn, "_sweep_descendants", record_sweep)
+        result = _macos_spawn.run_sandboxed(["/usr/bin/true"], env={})
+        assert result.returncode == 0
+        assert getattr(result, "_setup_status", "missing") is None
+        assert [pid for pid, _kw in sweeps] == [FAKE_SHIM_PID]
+        assert sweeps[0][1].get("extra_pgids") == (reported_group,)

@@ -74,6 +74,16 @@ class TestTruncateOutput:
         assert len(result) == 999999
         assert note is None
 
+    def test_unknown_tool_key_warns(self, caplog):
+        # An unregistered tool key means the cap silently never
+        # applies — the drift must at least be loud in the logs.
+        import logging
+        with caplog.at_level(logging.WARNING, logger="core.audit.safe_env"):
+            truncate_output(list(range(3)), "unknown_tool")
+        assert any(
+            "unknown_tool" in rec.message for rec in caplog.records
+        )
+
 
 class TestFormatSummary:
     def test_includes_tools(self):

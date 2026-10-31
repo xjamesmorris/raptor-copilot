@@ -20,9 +20,17 @@ from core.audit.gaps import (
 )
 
 
+# Fixture target root: a path an unprivileged process CANNOT create
+# (making a top-level directory needs root), unlike the previous
+# "/tmp/target" — /tmp is world-writable, so any other process on the
+# host could materialise the fixture path and flip compute_gaps's
+# is_file() probes mid-test.
+_TARGET = "/raptor-nonexistent-test-target"
+
+
 def _sample_checklist():
     return {
-        "target_path": "/tmp/target",
+        "target_path": _TARGET,
         "files": [
             {
                 "path": "src/handler.c",
@@ -44,6 +52,8 @@ def _sample_checklist():
 
 def _sample_coverage_records():
     return [
+        # Scanner examination: feeds the file-tool priority tiers
+        # only — the files{} shape earns no review credit.
         {
             "tool": "semgrep",
             "files": {
@@ -55,7 +65,27 @@ def _sample_coverage_records():
             },
             "files_examined": ["src/handler.c"],
         },
+        # The review lane: a stamped review-grade row suppresses.
+        {
+            "tool": "llm",
+            "functions_analysed": [
+                _reviewed_row("src/handler.c", "parse_request"),
+            ],
+        },
     ]
+
+
+def _reviewed_row(file, function, tool="llm", **fields):
+    """A functions_analysed row as a LEGITIMATE writer produces it:
+    stamped at creation (core.coverage.journal_mac coverage-row
+    domain, tool-bound). The gap fold refuses unstamped hashless
+    rows — see test_coverage_record_provenance.py for the tiers."""
+    from core.coverage import journal_mac
+    row = {"file": file, "function": function, **fields}
+    token = journal_mac.mint_coverage_row(row, tool)
+    assert token, "hermetic XDG key must be mintable"
+    row[journal_mac.TOKEN_KEY] = token
+    return row
 
 
 class TestComputeGaps:
@@ -156,25 +186,19 @@ class TestComputeGaps:
         assert gaps == []
 
     def test_all_covered(self):
-        records = [
-            {
-                "tool": "audit",
-                "files": {
-                    "src/handler.c": {
-                        "functions": {
-                            "parse_request": {},
-                            "handle_error": {},
-                            "tiny_helper": {},
-                        },
-                    },
-                    "src/auth.c": {
-                        "functions": {
-                            "check_password": {},
-                        },
-                    },
-                },
-            },
-        ]
+        records = [{
+            "tool": "audit",
+            "functions_analysed": [
+                _reviewed_row("src/handler.c", "parse_request",
+                              tool="audit"),
+                _reviewed_row("src/handler.c", "handle_error",
+                              tool="audit"),
+                _reviewed_row("src/handler.c", "tiny_helper",
+                              tool="audit"),
+                _reviewed_row("src/auth.c", "check_password",
+                              tool="audit"),
+            ],
+        }]
         gaps = compute_gaps(_sample_checklist(), records)
         assert len(gaps) == 0
 
@@ -227,14 +251,14 @@ class TestComputeGaps:
             assert {g["name"] for g in gaps} == {"check_password"}, scope
 
     def test_scope_absolute_under_target_matches(self):
-        # target_path is /tmp/target in _sample_checklist.
+        # target_path is _TARGET in _sample_checklist.
         gaps = compute_gaps(
-            _sample_checklist(), [], scope="/tmp/target/src/auth",
+            _sample_checklist(), [], scope=f"{_TARGET}/src/auth",
         )
         assert {g["name"] for g in gaps} == {"check_password"}
 
     def test_scope_absolute_target_root_means_whole_tree(self):
-        for scope in ("/tmp/target", "/tmp/target/"):
+        for scope in (_TARGET, _TARGET + "/"):
             gaps = compute_gaps(_sample_checklist(), [], scope=scope)
             assert len(gaps) == 4, scope
 
@@ -249,7 +273,7 @@ class TestComputeGaps:
         checklist = _sample_checklist()
         checklist.pop("target_path")
         with pytest.raises(ValueError, match="never match"):
-            compute_gaps(checklist, [], scope="/tmp/target/src/auth")
+            compute_gaps(checklist, [], scope=f"{_TARGET}/src/auth")
 
     def test_scope_target_root_means_whole_tree(self):
         # "." is the parent of a repo-root file (a top-level
@@ -519,7 +543,7 @@ class TestAnnotationsDirWiring:
         (ann_dir / "auth.c.md").write_text(
             "## old_fn\n"
             "<!-- meta: status=clean hash=0000000000 "
-            "line_start=1 line_end=1 -->\n\n"
+            "start_line=1 end_line=1 -->\n\n"
             "Reviewed before the rewrite.\n",
             encoding="utf-8",
         )
@@ -780,7 +804,7 @@ class TestCoveredKeyInjectivity:
 
     def _checklist(self):
         return {
-            "target_path": "/tmp/target",
+            "target_path": _TARGET,
             "files": [
                 {
                     "path": "src/a.c:evil",
@@ -799,10 +823,8 @@ class TestCoveredKeyInjectivity:
 
     def test_coverage_record_does_not_alias(self):
         records = [{
-            "tool": "semgrep",
-            "files": {
-                "src/a.c:evil": {"functions": {"f": {"status": "clean"}}},
-            },
+            "tool": "llm",
+            "functions_analysed": [_reviewed_row("src/a.c:evil", "f")],
             "files_examined": ["src/a.c:evil"],
         }]
         gaps = compute_gaps(self._checklist(), records)
@@ -838,7 +860,7 @@ class TestModernRecordCoveredSet:
         records = [{
             "tool": "llm",
             "functions_analysed": [
-                {"file": "src/handler.c", "function": "parse_request"},
+                _reviewed_row("src/handler.c", "parse_request"),
             ],
         }]
         gaps = compute_gaps(_sample_checklist(), records)
@@ -893,3 +915,65 @@ def test_runtime_records_never_suppress_gaps():
     }]
     gaps = compute_gaps(_sample_checklist(), records)
     assert "parse_request" in {g["name"] for g in gaps}
+
+
+class TestFindChecklistItem:
+    def _checklist(self, items_key: str = "items"):
+        return {"files": [
+            {"path": "src/a.c", items_key: [
+                {"name": "foo", "line_start": 10, "line_end": 20},
+                {"name": "bar", "line_start": 30, "line_end": 40},
+            ]},
+            {"path": "src/b.c", items_key: [
+                {"name": "baz", "line_start": 1, "line_end": 5},
+            ]},
+        ]}
+
+    def test_finds_item_modern_shape(self):
+        from core.audit.gaps import find_checklist_item
+        item = find_checklist_item(self._checklist(), "src/a.c", "bar")
+        assert item is not None
+        assert item["line_start"] == 30
+
+    def test_finds_item_legacy_functions_shape(self):
+        from core.audit.gaps import find_checklist_item
+        item = find_checklist_item(
+            self._checklist("functions"), "src/a.c", "foo",
+        )
+        assert item is not None
+        assert item["line_end"] == 20
+
+    def test_missing_function_returns_none(self):
+        from core.audit.gaps import find_checklist_item
+        assert find_checklist_item(
+            self._checklist(), "src/a.c", "nope",
+        ) is None
+
+    def test_missing_file_returns_none(self):
+        from core.audit.gaps import find_checklist_item
+        assert find_checklist_item(
+            self._checklist(), "src/z.c", "foo",
+        ) is None
+
+    def test_none_and_empty_checklists(self):
+        from core.audit.gaps import find_checklist_item
+        assert find_checklist_item(None, "src/a.c", "foo") is None
+        assert find_checklist_item({}, "src/a.c", "foo") is None
+
+    def test_first_matching_file_entry_wins(self):
+        # Duplicate path entries: only the first is consulted — the
+        # break-after-match behaviour every hand-rolled copy had.
+        from core.audit.gaps import find_checklist_item
+        cl = {"files": [
+            {"path": "src/a.c", "items": [{"name": "foo", "line_start": 1}]},
+            {"path": "src/a.c", "items": [{"name": "bar", "line_start": 2}]},
+        ]}
+        assert find_checklist_item(cl, "src/a.c", "bar") is None
+
+    def test_tolerates_non_dict_entries(self):
+        from core.audit.gaps import find_checklist_item
+        cl = {"files": ["junk", {"path": "src/a.c", "items": [
+            "junk", {"name": "foo", "line_start": 1},
+        ]}]}
+        item = find_checklist_item(cl, "src/a.c", "foo")
+        assert item is not None

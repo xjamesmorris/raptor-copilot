@@ -10,20 +10,24 @@ from __future__ import annotations
 
 import logging
 import re
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 
-from core.inventory.fixture_detection import is_fixture_path
 from core.json import save_json
 
 from .evidence_grade import (
+    LLM_CLAIM_PREFIX,
     Confidence,
+    EvidenceSource,
     GradedEvidence,
     finding_confidence,
+    grade_evidence,
     grade_evidence_record,
     grade_review_result,
     is_tool_evidence,
+    sanitize_llm_evidence_tool,
 )
+from .tree_class import classify_tree_class, is_test_tree_path
 
 logger = logging.getLogger(__name__)
 
@@ -121,12 +125,6 @@ def _validate_history_receipt(
     return ""
 
 
-# Test-tree directory conventions the fixture path patterns don't
-# cover: OpenSSH-style ``regress/`` trees. Directory segments only —
-# a file named ``regress.c`` is production code.
-_TEST_TREE_SEGMENTS = frozenset({"regress", "regression", "regressions"})
-
-
 def classify_file_class(
     file_path: str,
     vendor_verdicts: dict[str, Any] | None = None,
@@ -148,19 +146,9 @@ def classify_file_class(
                 kind = verdict.get("kind", "")
             if kind:
                 return str(kind)
-    if _is_test_tree_path(file_path):
+    if is_test_tree_path(file_path):
         return "test"
     return ""
-
-
-def _is_test_tree_path(file_path: str) -> bool:
-    """Test-tree membership: the shared fixture-path conventions
-    (``core.inventory.fixture_detection``) plus regress-tree directory
-    segments."""
-    if is_fixture_path(file_path)[0]:
-        return True
-    parts = PurePosixPath(file_path.replace("\\", "/")).parts
-    return any(p.lower() in _TEST_TREE_SEGMENTS for p in parts[:-1])
 
 
 def build_graded_finding(
@@ -168,6 +156,7 @@ def build_graded_finding(
     evidence_record: Any | None = None,
     *,
     file_class: str = "",
+    tree_class: str = "",
 ) -> dict[str, Any]:
     """Build a finding dict with graded evidence chain.
 
@@ -190,13 +179,50 @@ def build_graded_finding(
 
     review_result = getattr(outcome, "review_result", None) or {}
     evidence_tool = getattr(outcome, "evidence_tool", "")
-    review_items = grade_review_result(review_result, evidence_tool)
+    # Pipeline-recorded typestate context for this function — the
+    # corroboration gate for the model's typestate_violation claim
+    # (absent record / absent field → the claim grades LLM-only).
+    ts_context = (
+        getattr(evidence_record, "typestate_violations", None)
+        if evidence_record is not None else None
+    )
+    review_items = grade_review_result(
+        review_result, evidence_tool, typestate_context=ts_context,
+    )
     chain.extend(review_items)
 
     if is_tool_evidence(evidence_tool):
         confidence = finding_confidence(chain)
     else:
         confidence = finding_confidence(review_items)
+
+    # Disasm cross-check receipt — read from the pipeline-controlled
+    # outcome ATTRIBUTE, never review_result: parsed model JSON lands
+    # there, and a fabricated key would mint a mechanical-looking
+    # chain entry (the typestate lesson in grade_review_result).
+    # Appended AFTER the confidence computation above and graded LOW:
+    # the channel is corroboration-only by contract, so its receipt
+    # is chain context and must never lift the exported confidence
+    # (finding_confidence upgrades LOW LLM entries when any
+    # mechanical:* entry is present). Known scope limit: the attribute
+    # lives only on the in-memory outcome, so this receipt reaches the
+    # LIVE export chain exclusively — export_graded_from_journal
+    # rebuilds outcomes from journal rows, which never carry it, and a
+    # journal re-export ships without the entry. Accepted for a
+    # corroboration-only LOW receipt (no verdict or confidence
+    # effect); the audit-log ``action=disasm_xcheck`` row remains the
+    # durable record.
+    dx = getattr(outcome, "disasm_xcheck", None)
+    if isinstance(dx, dict) and dx.get("engine") == "disasm":
+        detail = str(dx.get("excerpt") or "")[:600] or None
+        chain.append(grade_evidence(
+            EvidenceSource.DISASM,
+            (
+                f"disasm cross-check {str(dx.get('outcome'))[:24]}: "
+                f"{str(dx.get('reason'))[:150]}"
+            ),
+            detail=detail,
+        ))
 
     file_val = getattr(outcome, "file", "")
     func_val = getattr(outcome, "function", "")
@@ -234,6 +260,19 @@ def build_graded_finding(
             part = part.strip()
             if not part or part in _confirmed_by:
                 continue
+            if part.startswith(LLM_CLAIM_PREFIX):
+                # A sanitized model claim is display text, never a
+                # receipt: sanitize_llm_evidence_tool prefixes the
+                # model's whole raw string, so a claim that happens to
+                # end ":witness" would otherwise ride the witness arm
+                # below into confirmed_by and defeat the no-receipt
+                # tier cap. Stop at the marker, don't skip past it: a
+                # '+' inside the claim splits into unprefixed tail
+                # parts that are still the claim's own text (the
+                # is_verification_evidence positional rule — genuine
+                # receipts sit BEFORE the marker in the
+                # evidence-combine shape).
+                break
             # The validate-bridge runtime stamps and witness stamps are
             # confirming receipts in compute_tier's vocabulary but not
             # tool namespaces — count them here so the receipt gate
@@ -305,12 +344,22 @@ def build_graded_finding(
         # Tool-blind bucket: no mechanical channel can decide this
         # class — exactly the findings /validate exists to judge.
         finding["needs_validation"] = True
+    if getattr(outcome, "provisional", False):
+        # Cadence-tick promotion not yet finalized — only interrupted
+        # runs export it (finalization clears the mark first).
+        finding["provisional"] = True
     if file_class:
         # File-class context: a finding in vendored / generated / test
         # code is not an unqualified first-party finding — a fuzz-
         # harness overflow must not export indistinguishable from a
         # production one. Absent for first-party code.
         finding["file_class"] = file_class
+    # Tree class (core.audit.tree_class vocabulary) — always present,
+    # so report ordering and /validate selection read one field
+    # instead of re-deriving it. A tag for ordering/weighting only.
+    finding["tree_class"] = (
+        tree_class or classify_tree_class(file_val)
+    )
 
     # Hypothesis multiplicity: the review's full hypotheses array.
     # A multi-bug function used to export as one finding with one
@@ -362,6 +411,25 @@ def build_graded_finding(
     if dampening:
         finding["file_dampening"] = dampening
 
+    # Deepen-adjudication record (see orchestrator
+    # _mark_deepen_unadjudicated): the run announced a deepen
+    # re-review for this verdict and the stop rails stranded it — the
+    # stamp travels with the exported finding so the operator can see
+    # the verdict finished the run without its verification lane.
+    deepen_unadjudicated = review_result.get("deepen_unadjudicated")
+    if deepen_unadjudicated:
+        finding["deepen_unadjudicated"] = deepen_unadjudicated
+
+    # Deepen-selection stranding record (see orchestrator
+    # _mark_deepen_stranded): the deepen selection skipped this
+    # verdict (sub-floor SLOC without tool evidence, or a dedup'd
+    # repeat hypothesis) — the stamp travels with the exported
+    # finding so a suspicious that stayed unverified for the run is
+    # distinguishable from one deepen adjudicated.
+    deepen_stranded = review_result.get("deepen_stranded")
+    if deepen_stranded:
+        finding["deepen_stranded"] = deepen_stranded
+
     # Caller-contract demotion receipt (see orchestrator
     # _apply_caller_contract_gate): the per-site receipts travel with
     # the finding, and the confidence clamp is ENFORCED here — a
@@ -372,6 +440,21 @@ def build_graded_finding(
     if caller_ev:
         finding["caller_evidence"] = caller_ev
         clamp = (caller_ev.get("demotion") or {}).get("confidence_clamp")
+        if clamp == "low" and not _confirmed_by:
+            confidence = Confidence.LOW
+            finding["confidence"] = confidence.value
+
+    # Gadget-absence demotion receipt (see orchestrator
+    # _apply_gadget_absence_gate): the corpus-earned zero-POP-surface
+    # refutation travels with the finding, and the confidence clamp is
+    # ENFORCED here — a gadget-dependent finding refuted by the earned
+    # absence tier may not export above low unless a confirming
+    # receipt exists (tool-confirmed findings are never demoted).
+    # Status is never touched.
+    gadget_abs = review_result.get("gadget_absence")
+    if gadget_abs:
+        finding["gadget_absence"] = gadget_abs
+        clamp = (gadget_abs.get("demotion") or {}).get("confidence_clamp")
         if clamp == "low" and not _confirmed_by:
             confidence = Confidence.LOW
             finding["confidence"] = confidence.value
@@ -484,6 +567,7 @@ def export_findings(
         finding = build_graded_finding(
             outcome, ev_record,
             file_class=classify_file_class(file_path, vendor_verdicts),
+            tree_class=classify_tree_class(file_path, vendor_verdicts),
         )
         findings.append(finding)
 
@@ -564,3 +648,218 @@ def format_findings_summary(export: dict[str, Any]) -> str:
         lines.append(f"Attack chains: {len(chains)} ({confirmed} confirmed)")
 
     return "\n".join(lines)
+
+
+def export_graded_from_journal(out_dir: Path) -> dict[str, Any] | None:
+    """Emit findings-graded.json from the review journal when the
+    orchestrator's richer export is absent (in-session runs).
+
+    findings-graded.json is the finding-level escrow hand-off: the
+    /validate import and cross-run dedup read it, and suspicious/dark
+    records ride it into downstream adjudication. The orchestrator
+    writes it unconditionally, but in-session runs (reviews recorded
+    via ``raptor-audit record``) never produced one at all — a
+    tool-confirmed suspicious result from such a run was invisible to
+    every later dedup/validation set and got re-discovered as novel.
+    A pass with suspicious/dark items and ZERO findings must still
+    emit the artifact.
+
+    Returns the graded container, or ``None`` when nothing was
+    written (an existing export is never overwritten — the
+    orchestrator's outcome-based export carries evidence chains this
+    journal reconstruction cannot; and a run with no journal has
+    nothing to grade).
+    """
+    out_dir = Path(out_dir)
+    if (out_dir / "findings-graded.json").exists():
+        return None
+    if not (out_dir / "review-journal.jsonl").exists():
+        return None
+    from types import SimpleNamespace
+
+    from core.coverage import journal_mac
+    from core.coverage.journal import RUN_ID_UNATTRIBUTED, latest_entries
+
+    outcomes = []
+    unverified_rows = 0
+    foreign_run_rows = 0
+    unscoped_run_rows = 0
+    # The exporting run's identity for the receipt run-scope check:
+    # journal writers stamp ``run_id`` with the run dir's NAME, and
+    # the row MAC covers it (an edited run_id demotes the row to
+    # tampered). Derived from the consumer's own directory, never
+    # from a run-dir artifact. RESOLVED first: a relative spelling
+    # ("." from --out .) has name == "" — comparing against that
+    # inverted both fail directions (same-run rows read foreign;
+    # run_id="" rows read run-scoped WITH receipts and no marker).
+    # A still-empty resolved name (filesystem root) disables the
+    # run-scope tier entirely: nothing grades run-scoped, attributed
+    # rows fail toward foreign, unattributed rows keep the marked
+    # grandfather.
+    # Scope bound (documented, adjudicated): the identity is the
+    # directory BASENAME, so a same-basename dir in another project
+    # replays with receipts. Stamping a stronger identity into rows
+    # is not available — an additive row field demotes at older
+    # readers (their dataclass round-trip drops it before the MAC
+    # recompute; measured) — and basenames are operator-conventional
+    # (timestamped run names), not attacker-chosen from outside the
+    # same-user trust tier that could forge rows outright anyway.
+    try:
+        run_identity = Path(out_dir).resolve().name
+    except OSError:
+        run_identity = out_dir.name
+    for entry in latest_entries(out_dir).values():
+        if entry.verdict not in ("finding", "suspicious", "dark"):
+            continue
+        hypothesis = ""
+        for hyp in entry.hypotheses or []:
+            if isinstance(hyp, dict):
+                hypothesis = str(
+                    hyp.get("mechanism") or hyp.get("text") or "",
+                )
+                if hypothesis:
+                    break
+        if not hypothesis:
+            hypothesis = (entry.body or "")[:500]
+        review_result: dict[str, Any] = {}
+        if entry.cwe:
+            review_result["vuln_type"] = entry.cwe
+        # Receipt authority is tiered on row provenance AND run
+        # scope: the journal lives in the target-writable run dir,
+        # and the journaled ``evidence_tools`` stamp is what mints
+        # ``confirmed_by`` receipts and confidence=high downstream.
+        # The row MAC is install-scoped (journal rows travel across
+        # runs by design — see core.coverage.journal_mac), so a MAC
+        # alone proves "this install's writer recorded it in SOME
+        # run" — a writer-minted row byte-copied from a sibling run
+        # dir verifies here too. Receipts therefore additionally
+        # require the MAC-covered ``run_id`` to name THIS run: only
+        # then is the row this run's own record (whose in-session
+        # record gate enforced tool grounding at record time).
+        # Unstamped/tampered rows, and verified rows attributed to
+        # another run, export receipt-less — the grading caps their
+        # confidence at the LLM-only tier instead of shipping a
+        # replayed or forged receipt. Verified rows with NO run
+        # attribution are grandfathered WITH a marker: stripping
+        # every legacy receipt would regress honest old exports, and
+        # the grandfather is visible per record
+        # (``provenance.receipt_scope: install``) and per container
+        # (``derivation.unscoped_run_rows``). No-attribution has two
+        # equivalent spellings: ``run_id=""`` (legacy writers that
+        # never stamped one) and the record CLI's documented
+        # ``RUN_ID_UNATTRIBUTED`` sentinel (stamped whenever no dir
+        # basename was available — including every relative ``--out``
+        # spelling before the CLI resolved it). Both say "this row
+        # names no run", never "this row names another run", so both
+        # take the marked install tier — grading the sentinel foreign
+        # stripped honest rows with an accusatory replay warning. The
+        # tier's exposure is unchanged by admitting the sentinel: a
+        # sibling-run copy of a sentinel row verifies here exactly
+        # like a sibling-run copy of a ``run_id=""`` row always did,
+        # and both stay visibly install-scoped, never run-scoped —
+        # the run arm below therefore refuses a run identity that
+        # EQUALS the sentinel (a run dir literally named
+        # ``cli-record`` would otherwise mint run scope for every
+        # sentinel row byte-copied into it: receipts with no marker
+        # and no count). Exact match only: any other value is a run
+        # attribution and fails toward the foreign arm.
+        verified = (
+            journal_mac.entry_provenance(entry)
+            == journal_mac.ROW_VERIFIED
+        )
+        receipt_scope = None
+        if not verified:
+            unverified_rows += 1
+        elif (run_identity != RUN_ID_UNATTRIBUTED
+                and run_identity and entry.run_id == run_identity):
+            receipt_scope = "run"
+        elif not entry.run_id or entry.run_id == RUN_ID_UNATTRIBUTED:
+            receipt_scope = "install"
+            unscoped_run_rows += 1
+        else:
+            foreign_run_rows += 1
+        outcomes.append(SimpleNamespace(
+            file=entry.file,
+            function=entry.function,
+            line=entry.line_start or 0,
+            status=entry.verdict,
+            hypothesis=hypothesis,
+            review_result=review_result,
+            # Receipt-less rows keep their journaled stamp AS A CLAIM:
+            # each "+"-part is sanitized under llm-claimed: (per PART
+            # within each element — a composite legacy element like
+            # "note+dynamic:sanitizer" must not leak a raw receipt part
+            # to split-on-"+" consumers), so the operator still sees
+            # WHAT the row claimed while is_tool_evidence, confirmed_by
+            # and the confidence grades all read it as unverified.
+            # Silent-drop history: this arm exported "" — the claim
+            # vanished from the record instead of displaying demoted.
+            evidence_tool=(
+                "+".join(entry.evidence_tools or [])
+                if receipt_scope
+                else "+".join(
+                    p
+                    for t in (entry.evidence_tools or [])
+                    for p in (
+                        sanitize_llm_evidence_tool(part.strip())
+                        for part in str(t).split("+")
+                    )
+                    if p
+                )
+            ),
+            model=entry.model or "",
+            receipt_scope=receipt_scope,
+        ))
+    # out_dir deliberately NOT passed to export_findings: the
+    # promotion-alarm sweep correlates orchestrator outcome objects
+    # with dispatch receipts; journal reconstructions carry only the
+    # journaled evidence stamp, and the in-session ``record`` gate
+    # (G2: executed confirmed sweep receipt) already enforced tool
+    # grounding at record time. Re-demoting here on a correlation the
+    # reconstruction cannot express would strip gated statuses.
+    graded = export_findings(outcomes)
+    # Provenance marker, container AND per-record: this export is a
+    # journal reconstruction, not the orchestrator's outcome-based
+    # export — downstream consumers (and cross-run merges that lift
+    # records out of the container) can weigh its evidence chains
+    # accordingly. Consumers tolerate extra keys by contract.
+    graded["derivation"] = {
+        "source": "review-journal",
+        "unverified_rows": unverified_rows,
+        "foreign_run_rows": foreign_run_rows,
+        "unscoped_run_rows": unscoped_run_rows,
+    }
+    # Statuses are pre-filtered above, so export_findings emits exactly
+    # one record per outcome, in order — the zip is total.
+    for rec, oc in zip(graded["findings"], outcomes):
+        prov = rec.setdefault("provenance", {})
+        prov["derivation"] = "journal"
+        if getattr(oc, "receipt_scope", None) == "install":
+            # Grandfathered receipt: the row MAC verifies but carries
+            # no run attribution (legacy writer) — receipts kept, the
+            # scope RECORDED per record. No consumer weighs the
+            # marker today; it exists so one can, and so an operator
+            # reading the export sees which receipts are install-
+            # scoped rather than run-attributed.
+            prov["receipt_scope"] = "install"
+    if unverified_rows:
+        logger.warning(
+            "graded findings (journal-derived): %d row(s) without a "
+            "verifying integrity token — exported without tool "
+            "receipts (confidence capped at the LLM-only tier)",
+            unverified_rows,
+        )
+    if foreign_run_rows:
+        logger.warning(
+            "graded findings (journal-derived): %d verified row(s) "
+            "attributed to another run (authenticated run_id does not "
+            "name this run dir — replayed or relocated) — exported "
+            "without tool receipts",
+            foreign_run_rows,
+        )
+    write_graded_findings(graded, out_dir)
+    logger.info(
+        "graded findings (journal-derived): %d record(s) exported",
+        graded["stats"]["total"],
+    )
+    return graded

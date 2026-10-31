@@ -468,3 +468,182 @@ def test_tier3_skipped_when_http_not_provided(tmp_path, monkeypatch):
     assert captured == [], (
         f"wheel fetch fired without http: {captured}"
     )
+
+
+def test_npm_alias_resolves_reachability_by_alias_spelling(
+    tmp_path: Path,
+) -> None:
+    """An aliased dep (``"my-lodash": "npm:lodash@^4"``) is imported
+    by its ALIAS (``require('my-lodash')``) — the real package's row
+    must read as imported, not not_reachable."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "client.js").write_text(
+        "require('my-lodash');\n", encoding="utf-8",
+    )
+    aliased = _dep("lodash", ecosystem="npm")
+    aliased.alias_name = "my-lodash"
+    plain = _dep("ms", ecosystem="npm")
+    out = scan(repo, [aliased, plain])
+    assert out[aliased.key()].verdict == "imported"
+    assert out[plain.key()].verdict == "not_reachable"
+
+
+def test_npm_alias_dual_declared_resolves_stronger_spelling(
+    tmp_path: Path,
+) -> None:
+    """A canonical row can cover a plain AND an aliased declaration of
+    the same package — either spelling's import must count. Alias-only
+    resolution demoted a plainly-imported dual-declared package."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "client.js").write_text(
+        "require('lodash');\n", encoding="utf-8",
+    )
+    dual = _dep("lodash", ecosystem="npm")
+    dual.alias_name = "my-lodash"
+    out = scan(repo, [dual])
+    assert out[dual.key()].verdict == "imported"
+
+
+def test_failed_inventory_build_not_retried_per_tier(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """When the shared inventory build fails, the function-level
+    tiers must be SKIPPED — not each fall back to its own tempdir
+    rebuild of the builder that just failed (up to 8 redundant
+    expensive builds with 8 warning stacks on istio-scale trees)."""
+    import core.inventory.builder as builder_mod
+    from packages.sca.reachability import scan as _scan
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text(
+        "import requests\nrequests.get('u')\n", encoding="utf-8",
+    )
+
+    calls: list[str] = []
+
+    def _failing_build(target, cache_dir, *a, **kw):
+        calls.append(str(target))
+        raise RuntimeError("inventory builder down")
+
+    monkeypatch.setattr(builder_mod, "build_inventory", _failing_build)
+
+    dep = _dep("requests", ecosystem="PyPI")
+
+    class _Adv:
+        ecosystem_specific = None
+        database_specific = {"affected_functions": ["get"]}
+
+    class _Osv:
+        dep_key = dep.key()
+        advisories = [_Adv()]
+
+    out = _scan(repo, [dep], osv_results=[_Osv()])
+    # One shared attempt; no per-tier retry of the failed builder.
+    assert len(calls) == 1, calls
+    # Tier skipped → the module-level verdict is preserved.
+    assert out[dep.key()].verdict == "imported"
+
+
+def test_go_junk_advisory_symbol_element_does_not_crash_scan(
+    tmp_path: Path,
+) -> None:
+    """One non-string element in an OSV ``imports[].symbols`` list
+    must degrade to the counted unresolved marker — not propagate a
+    TypeError through resolve_dep and kill the whole scan. String
+    siblings in the same list keep working."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "main.go").write_text(
+        'package main\n\n'
+        'import "golang.org/x/crypto/ssh"\n\n'
+        'func main() {\n\tssh.ParsePrivateKey(nil)\n}\n',
+        encoding="utf-8",
+    )
+    dep = _dep("golang.org/x/crypto", ecosystem="Go", version="0.10.0")
+    osv_results = [
+        _FakeOsvResult(
+            dep_key=dep.key(),
+            advisories=[
+                _FakeAdvisory(ecosystem_specific={
+                    "imports": [
+                        {"path": "golang.org/x/crypto/ssh",
+                         "symbols": [123, "ParsePrivateKey"]},
+                    ],
+                }),
+            ],
+        ),
+    ]
+    out = scan(repo, [dep], osv_results=osv_results)
+    assert out[dep.key()].verdict == "likely_called"
+
+
+def test_go_junk_only_advisory_symbols_stay_imported(
+    tmp_path: Path,
+) -> None:
+    """An advisory whose symbols are ALL junk elements keeps the
+    module-level verdict (imported) — visible marker, no crash, no
+    fabricated upgrade."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "main.go").write_text(
+        'package main\n\n'
+        'import "golang.org/x/crypto/ssh"\n\n'
+        'func main() {\n\tssh.Dial("tcp", "h:22", nil)\n}\n',
+        encoding="utf-8",
+    )
+    dep = _dep("golang.org/x/crypto", ecosystem="Go", version="0.10.0")
+    osv_results = [
+        _FakeOsvResult(
+            dep_key=dep.key(),
+            advisories=[
+                _FakeAdvisory(ecosystem_specific={
+                    "imports": [
+                        {"path": "golang.org/x/crypto/ssh",
+                         "symbols": [123, None]},
+                    ],
+                }),
+            ],
+        ),
+    ]
+    out = scan(repo, [dep], osv_results=osv_results)
+    assert out[dep.key()].verdict == "imported"
+
+
+def test_go_string_valued_symbols_container_not_iterated_charwise(
+    tmp_path: Path,
+) -> None:
+    """A STRING-valued ``symbols`` container used to iterate
+    char-by-char, turning one advisory into single-letter grep
+    probes — spurious identifier matches upgraded the verdict from
+    garbage data. A non-list container is junk-shaped and degrades
+    to the marker."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "main.go").write_text(
+        'package main\n\n'
+        'import "golang.org/x/crypto/ssh"\n\n'
+        'func main() {\n\tl := 1\n\t_ = l\n\tssh.Dial("tcp", "h:22", nil)\n}\n',
+        encoding="utf-8",
+    )
+    dep = _dep("golang.org/x/crypto", ecosystem="Go", version="0.10.0")
+    osv_results = [
+        _FakeOsvResult(
+            dep_key=dep.key(),
+            advisories=[
+                _FakeAdvisory(ecosystem_specific={
+                    "imports": [
+                        {"path": "golang.org/x/crypto/ssh",
+                         # "Dial" IS called — but as a container this
+                         # is junk, and its chars ('l' matches the
+                         # local identifier) must not become probes.
+                         "symbols": "Dial"},
+                    ],
+                }),
+            ],
+        ),
+    ]
+    out = scan(repo, [dep], osv_results=osv_results)
+    assert out[dep.key()].verdict == "imported"

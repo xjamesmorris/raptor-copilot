@@ -57,6 +57,7 @@ from urllib.parse import urlparse
 
 from ..models import Confidence, Dependency, PinStyle
 from . import _safe_read, register
+from ._base import PARSE_ESCAPE_ERRORS
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +91,7 @@ def parse(path: Path) -> list[Dependency]:
         return []
     try:
         data = safe_load(text)
-    except yaml.YAMLError as e:
+    except (yaml.YAMLError, *PARSE_ESCAPE_ERRORS) as e:  # hostile-input escape classes
         logger.warning(
             "sca.parsers.precommit: YAML parse failed for %s: %s",
             path, e,
@@ -114,12 +115,15 @@ def parse(path: Path) -> list[Dependency]:
         # the hook needs at runtime. Each entry is a PEP 508 / npm
         # spec string. Common in ``mirrors-mypy`` configs:
         #   additional_dependencies: ["pydantic>=2.5", "types-PyYAML"]
-        out.extend(_extract_additional_deps(entry, declared_in=path))
+        out.extend(_extract_additional_deps(
+            entry, declared_in=path, repo_map=repo_map,
+        ))
     return out
 
 
 def _extract_additional_deps(
     entry: Any, *, declared_in: Path,
+    repo_map: dict[str, dict[str, str]] | None = None,
 ) -> list[Dependency]:
     """Extract ``hooks[].additional_dependencies`` entries.
 
@@ -144,7 +148,11 @@ def _extract_additional_deps(
     if not isinstance(hooks, list):
         return []
 
-    repo_map = _load_repo_map()
+    # ``parse`` passes its already-loaded map — re-loading here cost
+    # one file read + JSON parse PER repos-entry (N+1). The fallback
+    # load keeps direct callers working.
+    if repo_map is None:
+        repo_map = _load_repo_map()
     canonical = _canonicalise_repo(repo)
     if canonical:
         mapping = repo_map.get(canonical)
@@ -235,13 +243,15 @@ def _classify_addl_spec(
     """Split a PEP 508 / npm install spec into (name, version,
     pin_style)."""
     import re as _re
+
+    from ..naming import fold_name
     if ecosystem == "npm" and spec.startswith("@"):
         # Scoped npm: ``@scope/name@version``.
         # First ``@`` is the scope marker; tag separator is the
         # second.
         tail_match = _re.search(r"^(@[^/]+/[^@<>=~ ]+)([<>=~@].*)?$", spec)
         if tail_match:
-            name = tail_match.group(1)
+            name = fold_name(tail_match.group(1), ecosystem)
             ver_part = tail_match.group(2) or ""
             ver_part = ver_part.lstrip("@").strip()
             return _wrap_version(name, ver_part)
@@ -250,7 +260,13 @@ def _classify_addl_spec(
     m = _re.match(r"^([A-Za-z0-9._\-]+)(\[[^\]]*\])?(.*)$", spec)
     if not m:
         return "", None, PinStyle.UNKNOWN
-    name = m.group(1)
+    # Route through the canonical per-ecosystem fold — OSV keys PyPI
+    # advisories on the PEP 503 spelling and case-folds npm names, so
+    # an as-written ``types-PyYAML`` / ``ESLint`` here got zero
+    # advisory coverage and broke join-key parity with the
+    # inline-install producer (which folds every ecosystem). A
+    # hand-rolled PyPI-only special case left the npm arm open.
+    name = fold_name(m.group(1), ecosystem)
     rest = m.group(3).strip()
     # ``name@<spec>`` (npm tag-separator form): drop the separator
     # BEFORE classification. Leaving it attached meant ``pkg@^1.0`` /
@@ -291,12 +307,12 @@ def _load_repo_map() -> dict[str, dict[str, str]]:
     """Load the curated repo→registry map. Per-call rather than
     module-level so a future test injection point stays simple."""
     try:
-        text = _REPO_MAP_PATH.read_text(encoding="utf-8")
+        text = _REPO_MAP_PATH.read_text(encoding="utf-8")  # raw-open: curated data map shipped in the repo, not run-dir content
     except OSError:
         return {}
     try:
         data = json.loads(text)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, *PARSE_ESCAPE_ERRORS):  # type: ignore[misc]  # hostile-input escape classes
         return {}
     if not isinstance(data, dict):
         return {}

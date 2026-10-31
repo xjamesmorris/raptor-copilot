@@ -365,3 +365,109 @@ class TestForwardCompatibleLoad:
         loaded = DomainModel.load(p)
         assert len(loaded.contracts) == 1
         assert loaded.contracts[0].function == "foo"
+
+
+class TestGetContractsForQualified:
+    def test_file_narrows_same_named_functions(self):
+        from core.concepts.model import Contract, DomainModel
+        m = DomainModel(contracts=[
+            Contract(function="init", file="a.c", when="A"),
+            Contract(function="init", file="b.c", when="B"),
+            Contract(function="init", file="", when="anywhere"),
+        ])
+        got = m.get_contracts_for("init", file="a.c")
+        assert {c.when for c in got} == {"A", "anywhere"}
+
+    def test_name_only_returns_all(self):
+        from core.concepts.model import Contract, DomainModel
+        m = DomainModel(contracts=[
+            Contract(function="init", file="a.c"),
+            Contract(function="init", file="b.c"),
+        ])
+        assert len(m.get_contracts_for("init")) == 2
+
+
+class TestDriftLoadNonDictRecords:
+    """The drift loader's degrade-never-crash contract holds for
+    non-dict records and mis-typed containers, not just missing
+    fields."""
+
+    def _load(self, tmp_path, raw):
+        import json as _json
+
+        from core.concepts.model import DomainModel
+        p = tmp_path / "domain-model.json"
+        p.write_text(_json.dumps(raw), encoding="utf-8")
+        return DomainModel.load(p)
+
+    def test_evidence_as_strings(self, tmp_path):
+        m = self._load(tmp_path, {"concepts": [
+            {"id": "c1", "description": "d",
+             "evidence": ["src/a.c:12 observation"]},
+        ]})
+        assert m.concepts[0].id == "c1"
+        assert m.concepts[0].evidence == []
+
+    def test_concept_as_string(self, tmp_path):
+        m = self._load(tmp_path, {"concepts": ["not a concept",
+                                               {"id": "c1",
+                                                "description": "d"}]})
+        assert [c.id for c in m.concepts] == ["c1"]
+
+    def test_invariant_as_string(self, tmp_path):
+        m = self._load(tmp_path, {"invariants": ["bare statement"]})
+        assert m.invariants == []
+
+    def test_concepts_as_dict_container(self, tmp_path):
+        m = self._load(tmp_path, {"concepts": {"c1": {"id": "c1"}}})
+        assert m.concepts == []
+
+    def test_security_context_as_string(self, tmp_path):
+        m = self._load(tmp_path, {"security_context": "kernel"})
+        assert m.security_context is None
+
+    def test_bug_pattern_as_number(self, tmp_path):
+        m = self._load(tmp_path, {"bug_patterns": [42]})
+        assert m.bug_patterns == []
+
+
+class TestDecompEvidenceCeiling:
+    """The shared decompiled-evidence grading ceiling.
+
+    ONE spelling for every decomp-evidence consumer (binary --study's
+    domain-model clamp, the audit's decomp-tree sweep): these pins
+    make silently forking the ceiling a test-visible act.
+    """
+
+    def test_ceiling_is_a_legal_grade(self):
+        from core.concepts.model import DECOMP_EVIDENCE_MAX_CONFIDENCE
+        assert DECOMP_EVIDENCE_MAX_CONFIDENCE in CONFIDENCE_GRADES
+
+    def test_ceiling_value(self):
+        from core.concepts.model import DECOMP_EVIDENCE_MAX_CONFIDENCE
+        assert DECOMP_EVIDENCE_MAX_CONFIDENCE == "traced"
+
+    def test_tag_value(self):
+        from core.concepts.model import DECOMP_EVIDENCE_TAG
+        assert DECOMP_EVIDENCE_TAG == "decompiled-evidence"
+
+    def test_clamp_caps_above_ceiling(self):
+        from core.concepts.model import (
+            DECOMP_EVIDENCE_MAX_CONFIDENCE,
+            clamp_decomp_confidence,
+        )
+        for grade in ("corroborated", "documented", "tested"):
+            assert clamp_decomp_confidence(grade) == \
+                DECOMP_EVIDENCE_MAX_CONFIDENCE
+
+    def test_clamp_passes_below_ceiling_unchanged(self):
+        from core.concepts.model import clamp_decomp_confidence
+        assert clamp_decomp_confidence("inferred") == "inferred"
+        assert clamp_decomp_confidence("observed") == "observed"
+        assert clamp_decomp_confidence("traced") == "traced"
+
+    def test_unknown_grade_floors_never_lifts(self):
+        from core.concepts.model import clamp_decomp_confidence
+        assert clamp_decomp_confidence("proven!!") == "inferred"
+        assert clamp_decomp_confidence(None) == "inferred"
+        assert clamp_decomp_confidence("") == "inferred"

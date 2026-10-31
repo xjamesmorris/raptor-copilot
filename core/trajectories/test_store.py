@@ -68,7 +68,7 @@ def _record(run_id: str = "run-0001", **overrides) -> TrajectoryRecord:
         "timestamp": "2026-06-03T14:05:32+00:00",
     }
     base.update(overrides)
-    return TrajectoryRecord(**base)
+    return TrajectoryRecord(**base)  # type: ignore[arg-type]
 
 
 # --------------------------------------------------------------------------
@@ -131,6 +131,27 @@ def test_serialize_truncates_long_text():
     [step] = serialize_messages(msgs)
     assert len(step.text_blocks[0]) < len(big)
     assert "truncated" in step.text_blocks[0]
+
+
+def test_serialize_records_loop_injected_provenance():
+    """Loop-authored text blocks (budget warnings, steering nudges)
+    keep their provenance in the persisted step so a rebuilt history
+    can distinguish them from user-authored text."""
+    msgs = [Message(role="user", content=[
+        TextBlock(text="user says hello"),
+        TextBlock(text="[loop] budget warning", loop_injected=True),
+        TextBlock(text="user says more"),
+    ])]
+    [step] = serialize_messages(msgs)
+    assert step.text_blocks == [
+        "user says hello", "[loop] budget warning", "user says more",
+    ]
+    assert step.loop_injected_blocks == [1]
+
+
+def test_serialize_loop_injected_default_empty():
+    [step] = serialize_messages([_msg_assistant_text("plain")])
+    assert step.loop_injected_blocks == []
 
 
 def test_serialize_truncates_long_tool_result():

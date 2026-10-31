@@ -15,8 +15,15 @@ from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
 from core.orchestration.agentic_passes import (
+    NATIVE_AUDIT_REQUEST_SCHEMA,
+    NATIVE_CONTEXT_REQUEST_SCHEMA,
+    NATIVE_VALIDATE_REQUEST_SCHEMA,
     _enrich_agentic_checklist,
     _select_findings_for_validate,
+    _supersede_stale_native_validate_handoff,
+    prepare_native_audit_postpass,
+    prepare_native_context_prepass,
+    prepare_native_validate_postpass,
     run_understand_prepass,
     run_validate_postpass,
 )
@@ -84,7 +91,9 @@ def _patch_passes(dispatcher):
     with patch("core.orchestration.skill_dispatch.subprocess.run",
                side_effect=_subprocess_side_effect), \
          patch("core.orchestration.skill_dispatch.run_untrusted_networked",
-               side_effect=_sandbox_side_effect):
+               side_effect=_sandbox_side_effect), \
+         patch("core.llm.cc_probe.probe_cc_session_model",
+               return_value="fake-model"):
         yield combined
 
 
@@ -137,6 +146,14 @@ def _make_lifecycle_dispatcher(start_dir=None, claude_writes=None,
         return _ok(returncode=claude_returncode)
 
     return dispatcher
+
+
+# A healthy /validate child's terminal artifact. The dispatch's outcome
+# probe (missing_validation_report) requires it before the pass may
+# count as ran — the child's exit status alone is not an outcome.
+_VALIDATE_REPORT_WRITES = {
+    "validation-report.md": "# Exploitability Validation Report\n",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +265,502 @@ class SelectFindingsTests(unittest.TestCase):
             path = tmp / "weird.json"
             path.write_text(json.dumps({"results": "not a list"}))
             self.assertEqual(_select_findings_for_validate(path), [])
+
+
+# ---------------------------------------------------------------------------
+# Copilot-native validation handoff
+# ---------------------------------------------------------------------------
+
+
+class NativeContextHandoffTests(unittest.TestCase):
+
+    def test_prepares_interrupted_understand_run(self):
+        from core.inventory import save_checklist
+        from core.run.metadata import load_run_metadata, start_run
+
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            target = tmp / "target"
+            target.mkdir()
+            (target / "app.py").write_text("def main():\n    return 0\n")
+            agentic_out = tmp / "agentic"
+            agentic_out.mkdir()
+            save_checklist(agentic_out, {
+                "target_path": str(target),
+                "files": [{
+                    "path": "app.py",
+                    "items": [{"name": "main", "line_start": 1}],
+                }],
+            })
+            understand_dir = tmp / "understand"
+
+            def fake_start(command, started_target, parent_run_dir=None):
+                self.assertEqual(command, "understand")
+                self.assertEqual(Path(started_target), target.resolve())
+                self.assertEqual(Path(parent_run_dir), agentic_out.resolve())
+                start_run(understand_dir, "understand", target=str(target))
+                return MagicMock(
+                    run_dir=understand_dir.resolve(),
+                    error=None,
+                )
+
+            with patch(
+                "core.orchestration.agentic_passes.start_lifecycle",
+                side_effect=fake_start,
+            ):
+                result = prepare_native_context_prepass(
+                    target=target,
+                    agentic_out_dir=agentic_out,
+                    threat_model_requested=True,
+                    threat_model_refresh=True,
+                )
+
+            self.assertTrue(result.prepared)
+            request = json.loads(result.request_path.read_text())
+            self.assertEqual(
+                request["schema"],
+                NATIVE_CONTEXT_REQUEST_SCHEMA,
+            )
+            self.assertEqual(request["mode"], "map")
+            self.assertTrue(request["threat_model_requested"])
+            self.assertTrue(request["threat_model_refresh"])
+            self.assertFalse(request["apply_target_patches"])
+            self.assertEqual(
+                request["resume_argv"],
+                [
+                    "libexec/raptor-run-lifecycle",
+                    "start",
+                    "understand",
+                    "--target",
+                    str(target.resolve()),
+                    "--out",
+                    str(understand_dir.resolve()),
+                ],
+            )
+            self.assertEqual(
+                Path(request["context_map_path"]),
+                understand_dir / "context-map.json",
+            )
+            self.assertEqual(
+                Path(request["context_receipt_path"]),
+                agentic_out / "copilot-native" / "context-receipt.json",
+            )
+            self.assertTrue((understand_dir / "checklist.json").is_file())
+            metadata = load_run_metadata(understand_dir)
+            self.assertEqual(metadata["status"], "interrupted")
+            self.assertEqual(
+                metadata["extra"]["copilot_native_context_request"],
+                str(result.request_path),
+            )
+
+    def test_context_lifecycle_failure_is_explicit(self):
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            target = tmp / "target"
+            target.mkdir()
+            agentic_out = tmp / "agentic"
+            agentic_out.mkdir()
+
+            with patch(
+                "core.orchestration.agentic_passes.start_lifecycle",
+                return_value=MagicMock(
+                    run_dir=None,
+                    error="project target mismatch",
+                ),
+            ), self.assertRaisesRegex(
+                RuntimeError,
+                "project target mismatch",
+            ):
+                prepare_native_context_prepass(
+                    target=target,
+                    agentic_out_dir=agentic_out,
+                )
+
+
+class NativeValidateHandoffTests(unittest.TestCase):
+
+    def test_prepares_interrupted_sibling_validate_run(self):
+        from core.run.metadata import load_run_metadata, start_run
+
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            target = tmp / "target"
+            target.mkdir()
+            (target / "app.py").write_text("dangerous(value)\n")
+            agentic_out = tmp / "agentic"
+            agentic_out.mkdir()
+            (agentic_out / "checklist.json").write_text('{"files": []}')
+            report = agentic_out / "orchestrated_report.json"
+            report.write_text(json.dumps({
+                "results": [
+                    {
+                        "finding_id": "FIND-001",
+                        "file_path": "app.py",
+                        "start_line": 1,
+                        "is_exploitable": True,
+                        "confidence": "high",
+                        "ruling": "validated",
+                    },
+                    {
+                        "finding_id": "FIND-002",
+                        "file_path": "app.py",
+                        "start_line": 1,
+                        "is_exploitable": False,
+                        "confidence": "low",
+                    },
+                ],
+            }))
+            validate_dir = tmp / "validate"
+
+            def fake_start(command, started_target, parent_run_dir=None):
+                self.assertEqual(command, "validate")
+                self.assertEqual(Path(started_target), target.resolve())
+                self.assertEqual(Path(parent_run_dir), agentic_out.resolve())
+                start_run(validate_dir, "validate", target=str(target))
+                return MagicMock(run_dir=validate_dir.resolve(), error=None)
+
+            with patch(
+                "core.orchestration.agentic_passes.start_lifecycle",
+                side_effect=fake_start,
+            ) as start:
+                result = prepare_native_validate_postpass(
+                    target=target,
+                    agentic_out_dir=agentic_out,
+                    analysis_report=report,
+                    allow_unreachable=True,
+                )
+                reused = prepare_native_validate_postpass(
+                    target=target,
+                    agentic_out_dir=agentic_out,
+                    analysis_report=report,
+                    allow_unreachable=True,
+                )
+
+            self.assertTrue(result.prepared)
+            self.assertEqual(reused.request_path, result.request_path)
+            self.assertEqual(
+                reused.request_sha256,
+                result.request_sha256,
+            )
+            self.assertEqual(
+                reused.selection_sha256,
+                result.selection_sha256,
+            )
+            self.assertEqual(start.call_count, 1)
+            self.assertEqual(result.selected_count, 1)
+            request = json.loads(result.request_path.read_text())
+            self.assertEqual(
+                request["schema"],
+                NATIVE_VALIDATE_REQUEST_SCHEMA,
+            )
+            self.assertFalse(request["apply_target_patches"])
+            self.assertEqual(
+                Path(request["analysis_report"]),
+                validate_dir / "agentic-validation-source.json",
+            )
+            self.assertEqual(
+                Path(request["source_analysis_report"]),
+                report.resolve(),
+            )
+            self.assertEqual(
+                request["pipeline_stages"],
+                ["0", "A", "B", "C", "D", "E", "F", "1"],
+            )
+            self.assertEqual(
+                request["stage0_argv"],
+                [
+                    "libexec/raptor-validation-helper",
+                    "0",
+                    "--target",
+                    str(target.resolve()),
+                    "--out",
+                    str(validate_dir.resolve()),
+                    "--findings",
+                    str(result.selection_file),
+                ],
+            )
+            selection = json.loads(result.selection_file.read_text())
+            self.assertEqual(
+                [row["id"] for row in selection["findings"]],
+                ["FIND-001"],
+            )
+            self.assertTrue(
+                (validate_dir / "parent-checklist-pointer.json").is_file(),
+            )
+            self.assertEqual(
+                json.loads(
+                    (
+                        validate_dir / "pipeline-config-overrides.json"
+                    ).read_text()
+                ),
+                {"allow_unreachable": True},
+            )
+            metadata = load_run_metadata(validate_dir)
+            self.assertEqual(metadata["status"], "interrupted")
+            self.assertEqual(
+                metadata["extra"]["copilot_native_validation_request"],
+                str(result.request_path),
+            )
+            self.assertFalse(metadata["extra"]["apply_target_patches"])
+
+    def test_skips_without_qualifying_findings(self):
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            target = tmp / "target"
+            target.mkdir()
+            agentic_out = tmp / "agentic"
+            agentic_out.mkdir()
+            report = agentic_out / "orchestrated_report.json"
+            report.write_text(json.dumps({
+                "results": [{
+                    "finding_id": "FIND-001",
+                    "is_exploitable": False,
+                    "confidence": "low",
+                }],
+            }))
+
+            with patch(
+                "core.orchestration.agentic_passes.start_lifecycle",
+            ) as start:
+                result = prepare_native_validate_postpass(
+                    target=target,
+                    agentic_out_dir=agentic_out,
+                    analysis_report=report,
+                )
+
+            self.assertFalse(result.prepared)
+            self.assertEqual(result.selected_count, 0)
+            self.assertIn("no findings matched", result.skipped_reason)
+            start.assert_not_called()
+
+    def test_reuses_completed_validation_without_new_request(self):
+        from core.run.metadata import complete_run, start_run
+
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            target = tmp / "target"
+            target.mkdir()
+            agentic_out = tmp / "agentic"
+            agentic_out.mkdir()
+            report = agentic_out / "orchestrated_report.json"
+            report.write_text(json.dumps({
+                "results": [{
+                    "finding_id": "FIND-001",
+                    "file_path": "app.py",
+                    "start_line": 1,
+                    "is_exploitable": True,
+                    "confidence": "high",
+                }],
+            }))
+            validate_dir = tmp / "validate"
+
+            def fake_start(_command, _target, parent_run_dir=None):
+                self.assertEqual(Path(parent_run_dir), agentic_out.resolve())
+                start_run(validate_dir, "validate", target=str(target))
+                return MagicMock(run_dir=validate_dir.resolve(), error=None)
+
+            with patch(
+                "core.orchestration.agentic_passes.start_lifecycle",
+                side_effect=fake_start,
+            ) as start:
+                first = prepare_native_validate_postpass(
+                    target=target,
+                    agentic_out_dir=agentic_out,
+                    analysis_report=report,
+                )
+                start_run(validate_dir, "validate", target=str(target))
+                (validate_dir / "validation-report.md").write_text(
+                    "# Exploitability Validation Report\n",
+                )
+                complete_run(validate_dir)
+                reused = prepare_native_validate_postpass(
+                    target=target,
+                    agentic_out_dir=agentic_out,
+                    analysis_report=report,
+                )
+
+            self.assertTrue(first.prepared)
+            self.assertFalse(reused.prepared)
+            self.assertTrue(reused.completed)
+            self.assertEqual(reused.validate_dir, validate_dir.resolve())
+            self.assertEqual(start.call_count, 1)
+
+    def test_refuses_to_supersede_live_validation(self):
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            agentic_out = tmp / "agentic"
+            agentic_out.mkdir()
+            validate_dir = tmp / "validate"
+            validate_dir.mkdir()
+            pointer = agentic_out / "copilot-native" / "validation-handoff.json"
+            pointer.parent.mkdir()
+            pointer.write_text(json.dumps({
+                "validate_dir": str(validate_dir),
+            }))
+
+            with patch(
+                "core.run.metadata.load_run_metadata",
+                return_value={"status": "running"},
+            ), patch(
+                "core.run.metadata.worker_liveness_for_meta",
+                return_value=(True, "worker pid 123 is live"),
+            ), patch(
+                "core.orchestration.agentic_passes.fail_lifecycle",
+            ) as fail, self.assertRaisesRegex(
+                RuntimeError,
+                "still in flight",
+            ):
+                _supersede_stale_native_validate_handoff(
+                    pointer,
+                    agentic_out_dir=agentic_out,
+                )
+
+            fail.assert_not_called()
+
+
+class NativeAuditHandoffTests(unittest.TestCase):
+
+    def test_prepares_and_reuses_interrupted_audit_run(self):
+        from core.inventory import save_checklist
+        from core.run.metadata import load_run_metadata, start_run
+
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            target = tmp / "target"
+            target.mkdir()
+            (target / "app.py").write_text("def handler(value):\n    return value\n")
+            agentic_out = tmp / "agentic"
+            agentic_out.mkdir()
+            save_checklist(agentic_out, {
+                "target_path": str(target),
+                "files": [{
+                    "path": "app.py",
+                    "items": [{"name": "handler", "line_start": 1}],
+                }],
+            })
+            context_map = tmp / "context-map.json"
+            context_map.write_text(json.dumps({
+                "entry_points": [],
+                "sinks": [],
+                "trust_boundaries": [],
+            }))
+            context_receipt = {
+                "context_map": str(context_map),
+                "context_map_sha256": __import__("hashlib").sha256(
+                    context_map.read_bytes(),
+                ).hexdigest(),
+            }
+            policy = {
+                "enabled": True,
+                "validate_after": True,
+                "budget": 10,
+                "strategy": "general",
+                "scopes": ["src/"],
+            }
+            audit_dir = tmp / "audit"
+
+            def fake_start(command, started_target, parent_run_dir=None):
+                self.assertEqual(command, "audit")
+                self.assertEqual(Path(started_target), target.resolve())
+                self.assertEqual(Path(parent_run_dir), agentic_out.resolve())
+                start_run(audit_dir, "audit", target=str(target))
+                return MagicMock(run_dir=audit_dir.resolve(), error=None)
+
+            with patch(
+                "core.orchestration.agentic_passes.start_lifecycle",
+                side_effect=fake_start,
+            ) as start:
+                result = prepare_native_audit_postpass(
+                    target=target,
+                    agentic_out_dir=agentic_out,
+                    context_receipt=context_receipt,
+                    audit_policy=policy,
+                )
+                reused = prepare_native_audit_postpass(
+                    target=target,
+                    agentic_out_dir=agentic_out,
+                    context_receipt=context_receipt,
+                    audit_policy=policy,
+                )
+
+            self.assertTrue(result.prepared)
+            self.assertEqual(reused.request_path, result.request_path)
+            self.assertEqual(start.call_count, 1)
+            request = json.loads(result.request_path.read_text())
+            self.assertEqual(request["schema"], NATIVE_AUDIT_REQUEST_SCHEMA)
+            self.assertEqual(request["policy"], policy)
+            self.assertEqual(
+                request["coverage_policy"],
+                "map_grade_is_not_review",
+            )
+            self.assertTrue(request["validation_deferred_to_parent"])
+            self.assertFalse(request["apply_target_patches"])
+            self.assertTrue((audit_dir / "checklist.json").is_file())
+            self.assertTrue((audit_dir / "context-map.json").is_file())
+            metadata = load_run_metadata(audit_dir)
+            self.assertEqual(metadata["status"], "interrupted")
+
+    def test_native_validation_merges_audit_findings_first(self):
+        from core.run.metadata import start_run
+
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            target = tmp / "target"
+            target.mkdir()
+            agentic_out = tmp / "agentic"
+            agentic_out.mkdir()
+            report = agentic_out / "orchestrated_report.json"
+            report.write_text(json.dumps({
+                "results": [{
+                    "finding_id": "AGENT-001",
+                    "file_path": "app.py",
+                    "start_line": 1,
+                    "is_exploitable": True,
+                    "confidence": "high",
+                }],
+            }))
+            audit_dir = tmp / "audit"
+            audit_dir.mkdir()
+            (audit_dir / "findings.json").write_text(json.dumps({
+                "findings": [{
+                    "id": "AUDIT-001",
+                    "file": "app.py",
+                    "line": 2,
+                    "description": "Tool-confirmed audit finding",
+                    "status": "finding",
+                    "confidence": "high",
+                }],
+            }))
+            validate_dir = tmp / "validate"
+
+            def fake_start(_command, _target, parent_run_dir=None):
+                self.assertEqual(Path(parent_run_dir), agentic_out.resolve())
+                start_run(validate_dir, "validate", target=str(target))
+                return MagicMock(run_dir=validate_dir.resolve(), error=None)
+
+            with patch(
+                "core.orchestration.agentic_passes.start_lifecycle",
+                side_effect=fake_start,
+            ):
+                result = prepare_native_validate_postpass(
+                    target=target,
+                    agentic_out_dir=agentic_out,
+                    analysis_report=report,
+                    audit_dir=audit_dir,
+                )
+
+            selection = json.loads(result.selection_file.read_text())
+            self.assertEqual(
+                [row["id"] for row in selection["findings"]],
+                ["AUDIT-001", "AGENT-001"],
+            )
+            request = json.loads(result.request_path.read_text())
+            self.assertEqual(request["selected_count"], 2)
+            self.assertEqual(request["audit_selected_count"], 1)
+            self.assertEqual(
+                request["audit_run_dir"],
+                str(audit_dir.resolve()),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +891,8 @@ class UnderstandPrepassTests(unittest.TestCase):
                        side_effect=dispatcher), \
                  patch("core.orchestration.skill_dispatch.run_untrusted_networked",
                        side_effect=_sandbox_capture), \
+                 patch("core.llm.cc_probe.probe_cc_session_model",
+                       return_value="fake-model"), \
                  patch.dict("os.environ", _FIRST_PARTY_PROVIDER_ENV):
                 run_understand_prepass(
                     target=tmp, agentic_out_dir=tmp,
@@ -574,7 +1089,9 @@ class ValidatePostpassTests(unittest.TestCase):
                 {"finding_id": "FINDING-F3", "is_exploitable": False, "confidence": "low"},
             ])
             validate_dir = tmp / "validate_run"
-            dispatcher = _make_lifecycle_dispatcher(start_dir=validate_dir)
+            dispatcher = _make_lifecycle_dispatcher(
+                start_dir=validate_dir,
+                claude_writes=dict(_VALIDATE_REPORT_WRITES))
             with _patch_passes(dispatcher) as mock_run:
                 result = run_validate_postpass(
                     target=tmp, agentic_out_dir=tmp, analysis_report=report,
@@ -603,6 +1120,26 @@ class ValidatePostpassTests(unittest.TestCase):
             self.assertNotIn("FINDING-F2", prompt)
             self.assertNotIn("FINDING-F3", prompt)
 
+    def test_zero_verdict_child_fails_the_postpass(self):
+        """A child that exits 0 WITHOUT writing validation-report.md
+        must yield ran=False with the no-verdicts reason. It used to
+        yield ran=True with report_path=None — the pass read as
+        completed while every selected finding stayed pending."""
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            report = self._make_report(tmp, [
+                {"finding_id": "FINDING-F1", "is_exploitable": True},
+            ])
+            validate_dir = tmp / "validate_run"
+            dispatcher = _make_lifecycle_dispatcher(start_dir=validate_dir)
+            with _patch_passes(dispatcher):
+                result = run_validate_postpass(
+                    target=tmp, agentic_out_dir=tmp, analysis_report=report,
+                    claude_bin="/fake/claude",
+                )
+            self.assertFalse(result.ran)
+            self.assertIn("produced no verdicts", result.skipped_reason)
+
     def test_validate_dispatch_uses_sandbox_with_egress_proxy(self):
         with TemporaryDirectory() as tmp:
             tmp = Path(tmp)
@@ -621,6 +1158,8 @@ class ValidatePostpassTests(unittest.TestCase):
                        side_effect=dispatcher), \
                  patch("core.orchestration.skill_dispatch.run_untrusted_networked",
                        side_effect=_sandbox_capture), \
+                 patch("core.llm.cc_probe.probe_cc_session_model",
+                       return_value="fake-model"), \
                  patch.dict("os.environ", _FIRST_PARTY_PROVIDER_ENV):
                 run_validate_postpass(
                     target=tmp, agentic_out_dir=tmp, analysis_report=report,
@@ -819,7 +1358,9 @@ class NaNScoreTests(unittest.TestCase):
             import json as _json
             report.write_text(_json.dumps({"results": findings}))
             validate_dir = tmp / "validate_run"
-            dispatcher = _make_lifecycle_dispatcher(start_dir=validate_dir)
+            dispatcher = _make_lifecycle_dispatcher(
+                start_dir=validate_dir,
+                claude_writes=dict(_VALIDATE_REPORT_WRITES))
             with _patch_passes(dispatcher):
                 result = run_validate_postpass(
                     target=tmp, agentic_out_dir=tmp, analysis_report=report,
@@ -951,7 +1492,9 @@ class SortKeyTypeSafetyTests(unittest.TestCase):
             report = tmp / "report.json"
             report.write_text(json.dumps({"results": findings}))
             validate_dir = tmp / "validate_run"
-            dispatcher = _make_lifecycle_dispatcher(start_dir=validate_dir)
+            dispatcher = _make_lifecycle_dispatcher(
+                start_dir=validate_dir,
+                claude_writes=dict(_VALIDATE_REPORT_WRITES))
             with _patch_passes(dispatcher):
                 # Must not raise — backstop would catch it but the user would
                 # see "unexpected ValueError" instead of a clean post-pass.
@@ -1274,6 +1817,25 @@ class FormatConverterTests(unittest.TestCase):
         self.assertEqual(out["findings"][0]["description"],
                          "tainted from req.body to db.execute")
 
+    def test_junk_verdict_shapes_never_export(self):
+        # Tri-state export rule: a non-bool shape is a non-verdict —
+        # it must not export under the canonical key, whether it
+        # arrives on the schema key or launders through the legacy
+        # "exploitable" alias.
+        from core.orchestration.agentic_passes import convert_agentic_to_validate
+        out = convert_agentic_to_validate(
+            [{"finding_id": "f1", "is_exploitable": "yes"},
+             {"finding_id": "f2", "exploitable": "yes"},
+             {"finding_id": "f3", "exploitable": True},
+             {"finding_id": "f4", "is_true_positive": 1}],
+            target_path="/repo")
+        by_id = {f["id"]: f for f in out["findings"]}
+        self.assertIsNot(by_id["f1"].get("is_exploitable"), True)
+        self.assertIsNot(by_id["f2"].get("is_exploitable"), True)
+        # A genuine legacy bool still normalises to the canonical key.
+        self.assertIs(by_id["f3"].get("is_exploitable"), True)
+        self.assertIsNot(by_id["f4"].get("is_true_positive"), True)
+
     def test_wraps_string_ruling_into_object(self):
         # /agentic emits ruling as a string verdict; /validate wants an object
         # {"status": ..., ...}. The converter must wrap, not pass through.
@@ -1461,7 +2023,7 @@ class RuleOfTwoTests(unittest.TestCase):
     def test_understand_passes_gate_when_human(self):
         h, s = self._legs(human=True, sandbox=False)
         with h, s, patch(
-            "core.orchestration.agentic_passes.shutil.which", return_value=None
+            "shutil.which", return_value=None
         ):
             result = run_understand_prepass(
                 target=Path("scratch/nonexistent-target"),
@@ -1476,7 +2038,7 @@ class RuleOfTwoTests(unittest.TestCase):
         # The new capability: CI/cron with containment runs the pass.
         h, s = self._legs(human=False, sandbox=True)
         with h, s, patch(
-            "core.orchestration.agentic_passes.shutil.which", return_value=None
+            "shutil.which", return_value=None
         ):
             result = run_understand_prepass(
                 target=Path("scratch/nonexistent-target"),
@@ -1493,7 +2055,7 @@ class RuleOfTwoTests(unittest.TestCase):
             report.write_text('{"results": []}')
             h, s = self._legs(human=False, sandbox=True)
             with h, s, patch(
-                "core.orchestration.agentic_passes.shutil.which",
+                "shutil.which",
                 return_value=None,
             ):
                 result = run_validate_postpass(

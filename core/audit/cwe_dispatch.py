@@ -12,7 +12,11 @@ Consumed by:
 
 from __future__ import annotations
 
+import logging
+from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 CWE_TO_TOOL_DISPATCH: dict[str, dict[str, Any]] = {
     # Memory / bounds
@@ -34,7 +38,11 @@ CWE_TO_TOOL_DISPATCH: dict[str, dict[str, Any]] = {
         "smt": "check-oob",
         "cocci": None,
         "joern": True,
-        "codeql": "cpp/out-of-bounds-read",
+        # cpp-queries carries no out-of-bounds-read @id; the pack's
+        # OOB adjudicator is the invalid-pointer-dereference query
+        # (tagged cwe-119/125/193/787 — covers reads and writes past
+        # the allocation).
+        "codeql": "cpp/invalid-pointer-deref",
         "sinks": ["memcmp", "strlen", "strstr", "strcmp", "strncmp", "read", "fread"],
     },
     "CWE-787": {
@@ -100,7 +108,11 @@ CWE_TO_TOOL_DISPATCH: dict[str, dict[str, Any]] = {
         "cocci": ["integer_overflow_alloc.cocci",
                   "alloc_narrow_count.cocci"],
         "joern": False,
-        "codeql": "cpp/integer-overflow",
+        # cpp-queries carries no bare integer-overflow @id; the CWE-190
+        # security query for overflow from untrusted input is
+        # cpp/integer-overflow-tainted (also tagged cwe-197/681, which
+        # covers the narrowing entries below that share it).
+        "codeql": "cpp/integer-overflow-tainted",
         "sinks": [],
         "dark_verify": True,
         "dark_verify_statuses": ("dark", "suspicious", "finding"),
@@ -109,7 +121,7 @@ CWE_TO_TOOL_DISPATCH: dict[str, dict[str, Any]] = {
         "smt": "check-overflow",
         "cocci": None,
         "joern": False,
-        "codeql": "cpp/integer-overflow",
+        "codeql": "cpp/integer-overflow-tainted",
         "sinks": [],
     },
     # Injection
@@ -133,6 +145,13 @@ CWE_TO_TOOL_DISPATCH: dict[str, dict[str, Any]] = {
         "joern": True,
         "codeql": "js/xss",
         "sinks": ["document.write", "innerHTML", "eval"],
+        # PHP leg: the quote-breakout attribute subset only (raw
+        # request data into a single-quoted/unquoted attribute) — the
+        # encoded-but-wrong-flags residual stays with CWE-116's
+        # php/attr-encoding.yaml. Language-gated: every other target
+        # keeps the pre-existing chain byte-identical.
+        "semgrep": "php/attr-xss.yaml",
+        "semgrep_langs": ("php",),
     },
     "CWE-90": {
         "smt": None,
@@ -179,6 +198,13 @@ CWE_TO_TOOL_DISPATCH: dict[str, dict[str, Any]] = {
                   "sendFile", "include", "require_once"],
         "dark_verify": True,
         "dark_verify_statuses": ("dark", "suspicious", "finding"),
+        # PHP leg: include/require path injection only (the
+        # code-inclusion class) — read/write file-op traversal shapes
+        # are out of the rule's sink scope by design. Language-gated:
+        # every other target keeps the pre-existing chain
+        # byte-identical.
+        "semgrep": "php/include-injection.yaml",
+        "semgrep_langs": ("php",),
     },
     "CWE-23": {
         "smt": None,
@@ -189,7 +215,11 @@ CWE_TO_TOOL_DISPATCH: dict[str, dict[str, Any]] = {
                   "file_get_contents", "os.path.join", "send_file",
                   "sendFile", "include", "require_once"],
     },
-    # Deserialization
+    # Deserialization. The gadget-oracle channel joins this class's
+    # fallback chain additively for PHP targets
+    # (core.analysis.gadget_oracle.GADGET_ORACLE_CWES — magic-method
+    # enumeration + property→sink flow over the whole tree; both
+    # directions detection-grade, absence never suppresses).
     "CWE-502": {
         "smt": None,
         "cocci": None,
@@ -199,6 +229,12 @@ CWE_TO_TOOL_DISPATCH: dict[str, dict[str, Any]] = {
                   "Marshal.load", "readObject", "ObjectInputStream", "loads"],
         "dark_verify": True,
         "dark_verify_statuses": ("dark", "suspicious", "finding"),
+        # PHP leg: request data reaching one-arg unserialize(); the
+        # two-arg options form is out of scope (its safe variant is
+        # the rule's own remediation). Language-gated: every other
+        # target keeps the pre-existing chain byte-identical.
+        "semgrep": "php/unserialize-taint.yaml",
+        "semgrep_langs": ("php",),
     },
     # Server-side request forgery
     "CWE-918": {
@@ -232,6 +268,12 @@ CWE_TO_TOOL_DISPATCH: dict[str, dict[str, Any]] = {
                   "RedirectResponse"],
         "dark_verify": True,
         "dark_verify_statuses": ("dark", "suspicious", "finding"),
+        # PHP leg: Location headers built from request params or the
+        # attacker-controlled $_SERVER echoes (host header,
+        # PHP_SELF, REQUEST_URI). Language-gated: every other target
+        # keeps the pre-existing chain byte-identical.
+        "semgrep": "php/open-redirect.yaml",
+        "semgrep_langs": ("php",),
     },
     # Prototype pollution
     "CWE-1321": {
@@ -270,7 +312,14 @@ CWE_TO_TOOL_DISPATCH: dict[str, dict[str, Any]] = {
         "smt": "check-null-propagation",
         "cocci": "missing_null_check.cocci",
         "joern": False,
-        "codeql": "cpp/null-dereference",
+        # cpp-queries carries no null-dereference @id (the
+        # so-named variants are experimental-tree, which the
+        # resolver never dispatches). Of the stock cwe-476-tagged
+        # queries, cpp/missing-null-test is the one that detects
+        # the dereference itself (returned pointer dereferenced
+        # without a null check); the others detect null-check
+        # INCONSISTENCY, not the deref.
+        "codeql": "cpp/missing-null-test",
         "sinks": [],
     },
     # Improper neutralization of escape/control sequences — the
@@ -436,7 +485,7 @@ CWE_TO_TOOL_DISPATCH: dict[str, dict[str, Any]] = {
         "smt": "check-integer-narrowing",
         "cocci": "sign_extension_widen.cocci",
         "joern": False,
-        "codeql": "cpp/integer-overflow",
+        "codeql": "cpp/integer-overflow-tainted",
         "sinks": [],
     },
     # Signed/unsigned conversion — the 190/681 signedness family
@@ -445,7 +494,7 @@ CWE_TO_TOOL_DISPATCH: dict[str, dict[str, Any]] = {
         "smt": "check-integer-narrowing",
         "cocci": "sign_extension_widen.cocci",
         "joern": False,
-        "codeql": "cpp/integer-overflow",
+        "codeql": "cpp/integer-overflow-tainted",
         "sinks": [],
     },
     # Type confusion / strict-aliasing punning — no static dataflow
@@ -603,6 +652,547 @@ CWE_TO_TOOL_DISPATCH: dict[str, dict[str, Any]] = {
                   "System.loadLibrary",
                   "importlib.import_module", "__import__"],
     },
+    # PHP web-audit families — the curated semgrep rule file is the
+    # verifying channel (a new dispatch key, resolved by
+    # resolve_semgrep_rule_for_cwe). The rules self-select via their
+    # ``languages: [php]`` key AND the chain builder drops the leg for
+    # non-matching targets via ``semgrep_langs`` — so on C/C++ targets
+    # these classes keep their pre-entry behaviour exactly (empty
+    # chain, loud unmapped warning, checker-synthesis seeding) instead
+    # of dispatching a rule that scans nothing.
+    #
+    # CRLF injection into protocol streams: request data reaching a
+    # socket write / protocol command string with CR/LF intact. The
+    # C/C++ leg is the protocol-line residual rule (format literal
+    # with a trailing "\r\n" passing a bare variable, no strip) —
+    # per-language routing via semgrep_by_lang; the php keys keep
+    # their original single-rule form.
+    "CWE-93": {
+        "smt": None,
+        "cocci": None,
+        "joern": False,
+        "codeql": None,
+        "sinks": [],
+        "semgrep": "php/crlf-injection.yaml",
+        "semgrep_langs": ("php",),
+        "semgrep_by_lang": {
+            "c": "c/crlf-protocol-line.yaml",
+            "cpp": "c/crlf-protocol-line.yaml",
+        },
+    },
+    # Unsafe reflection: tainted variable function / callable /
+    # class-name / method-name selection.
+    "CWE-470": {
+        "smt": None,
+        "cocci": None,
+        "joern": False,
+        "codeql": None,
+        "sinks": [],
+        "semgrep": "php/unsafe-reflection.yaml",
+        "semgrep_langs": ("php",),
+    },
+    # Argument injection: tainted data in a shell command string with
+    # no escapeshellarg (escapeshellcmd does not quote argument
+    # boundaries — the rule encodes that).
+    "CWE-88": {
+        "smt": None,
+        "cocci": None,
+        "joern": False,
+        "codeql": None,
+        "sinks": [],
+        "semgrep": "php/argument-injection.yaml",
+        "semgrep_langs": ("php",),
+    },
+    # Improper encoding for the output context — the honestly
+    # expressible sub-shapes only. PHP: the htmlspecialchars-without-
+    # ENT_QUOTES attribute residual (semgrep leg only — the PHP chain
+    # shape is unchanged from before the C legs existed). C/C++: the
+    # quoted-string escape residual (escapes one of quote/backslash
+    # but not the other) plus the joern legs (generic taint +
+    # flow-reachability, see joern_verify.FLOW_CWES) for taint-
+    # reaches-emitter-unsanitized hypotheses. The joern legs are
+    # language-gated to c/cpp (joern_langs): the seed sinks are libc
+    # emitters and the lane's fixtures are C — exposing other
+    # languages needs its own fixture evidence first. Sinks are
+    # SEED-tier, used only to bind hypothesis prose — the per-target
+    # vocabulary arrives via the IRIS-synthesised specs at runtime,
+    # and the flow lane's confirms are detection-grade
+    # (joern:flow-encoding).
+    "CWE-116": {
+        "smt": None,
+        "cocci": None,
+        "joern": True,
+        "joern_langs": ("c", "cpp"),
+        "codeql": None,
+        "sinks": ["fwrite", "fputs", "send", "write", "fprintf",
+                  "dprintf"],
+        "semgrep": "php/attr-encoding.yaml",
+        "semgrep_langs": ("php",),
+        "semgrep_by_lang": {
+            "c": "c/quoted-string-escape.yaml",
+            "cpp": "c/quoted-string-escape.yaml",
+        },
+    },
+    # Weak crypto in a security context: md5/sha1 password digests
+    # (name-anchored — a checksum/etag md5 never fires).
+    "CWE-327": {
+        "smt": None,
+        "cocci": None,
+        "joern": False,
+        "codeql": None,
+        "sinks": [],
+        "semgrep": "php/weak-password-hash.yaml",
+        "semgrep_langs": ("php",),
+    },
+    # Weak PRNG for security material: mt_rand/rand/uniqid stored
+    # under token/secret/nonce-shaped names (name-anchored — bare
+    # mt_rand jitter never fires).
+    "CWE-338": {
+        "smt": None,
+        "cocci": None,
+        "joern": False,
+        "codeql": None,
+        "sinks": [],
+        "semgrep": "php/weak-prng-token.yaml",
+        "semgrep_langs": ("php",),
+    },
+    # Symlink following — the TOCTOU family's link-resolution shape:
+    # a path checked and then re-resolved through an
+    # attacker-replaceable link. Same libc vocabulary and adjudicators
+    # as CWE-367; the CodeQL leg is the pack's TOCTOU query (tagged
+    # cwe-367 — cpp-queries carries no symlink-specific @id; the
+    # stat/access-then-open race it detects is the mechanism both
+    # classes share).
+    "CWE-59": {
+        "smt": "check-toctou",
+        "cocci": "toctou_stat_open.cocci",
+        "joern": False,
+        "codeql": "cpp/toctou-race-condition",
+        "sinks": [],
+    },
+    # UNIX symbolic link following — the CWE-59 child; same
+    # mechanism, same chain.
+    "CWE-61": {
+        "smt": "check-toctou",
+        "cocci": "toctou_stat_open.cocci",
+        "joern": False,
+        "codeql": "cpp/toctou-race-condition",
+        "sinks": [],
+    },
+    # External control of file name or path — the parent shape of
+    # path traversal; the tainted-path sink vocabulary and the CodeQL
+    # query (py/path-injection is tagged cwe-073) are shared with
+    # CWE-22/23.
+    "CWE-73": {
+        "smt": None,
+        "cocci": None,
+        "joern": True,
+        "codeql": "py/path-injection",
+        "sinks": ["open", "fopen", "readFile", "readFileSync",
+                  "file_get_contents", "os.path.join", "send_file",
+                  "sendFile", "include", "require_once"],
+    },
+    # Log injection: tainted data reaching a log emitter with CR/LF /
+    # control characters intact — taint-verifiable (contrast the
+    # policy-parked operational-logging classes in
+    # CWE_NOT_TOOL_VERIFIABLE, which ask about ABSENT or insufficient
+    # logging). The curated taint rule declares its own languages and
+    # the leg is dropped for other targets (semgrep_langs); the
+    # CodeQL leg (tagged cwe-117) covers Python databases.
+    "CWE-117": {
+        "smt": None,
+        "cocci": None,
+        "joern": False,
+        "codeql": "py/log-injection",
+        "sinks": [],
+        "semgrep": "injection/log-injection.yaml",
+        "semgrep_langs": ("python", "go", "java", "javascript",
+                          "typescript"),
+    },
+    # Improper validation of array index — the OOB family keyed on
+    # the index rather than the buffer. The SMT OOB verb covers the
+    # index-arithmetic mechanism; cpp-queries carries no bare
+    # cwe-129-only adjudicator beyond the pack's index-validation
+    # query (tagged cwe-129), which flags tainted indexes with
+    # unclear bounds checks.
+    "CWE-129": {
+        "smt": "check-oob",
+        "cocci": None,
+        "joern": False,
+        "codeql": "cpp/unclear-array-index-validation",
+        "sinks": [],
+    },
+    # Improper privilege management — cpp-queries carries no bare
+    # cwe-269 @id; the pack's privilege-management adjudicator is the
+    # privilege-drop ordering query (tagged cwe-273), which detects
+    # the out-of-order / unchecked setuid/setgid drop sequence — the
+    # class's dominant statically-statable C shape. The @id resolves
+    # from the pack's experimental/ directory; dispatch resolves by
+    # @id and runs the resolved query path, so the location changes
+    # nothing mechanically — but the pack maintainers' precision bar
+    # for experimental queries is lower than for default-suite ones.
+    # The leg is deliberately narrow: no-match stays inconclusive,
+    # never refuted.
+    "CWE-269": {
+        "smt": None,
+        "cocci": None,
+        "joern": False,
+        "codeql": "cpp/drop-linux-privileges-outoforder",
+        "sinks": [],
+    },
+    # Cleartext storage of sensitive information — the persistent-
+    # store sibling of CWE-532. Contrast the policy-parked CWE-316
+    # (cleartext in memory): here the sink is a durable, attacker-
+    # readable observable (file/DB write), so the CodeQL taint query
+    # (tagged cwe-312) can adjudicate the flow.
+    "CWE-312": {
+        "smt": None,
+        "cocci": None,
+        "joern": False,
+        "codeql": "py/clear-text-storage-sensitive-data",
+        "sinks": [],
+    },
+    # Temporary file with insecure creation semantics — the CWE-377
+    # sibling (directory-permission variant); the observable
+    # mechanism is the same race-prone name-generation vocabulary
+    # (mktemp/tmpnam/tempnam, reopen-by-path), so the chain mirrors
+    # CWE-377.
+    "CWE-379": {
+        "smt": None,
+        "cocci": "insecure_temp_file.cocci",
+        "joern": False,
+        "codeql": "py/insecure-temporary-file",
+        "sinks": [],
+    },
+    # Improper cleanup on error/exception path — the error-path leak
+    # shape CWE-401's rule already encodes (goto-err / early return
+    # with the resource still live); same verifiers.
+    "CWE-460": {
+        "smt": "check-resource-leak",
+        "cocci": "resource_leak_err.cocci",
+        "joern": False,
+        "codeql": None,
+        "sinks": [],
+    },
+    # Sensitive data written to log output — the name-anchored
+    # secret-to-log-emitter flow is taint/pattern-verifiable
+    # (contrast the policy-parked CWE-778/223, which ask about ABSENT
+    # logging). Curated rule declares its languages; the CodeQL leg
+    # (tagged cwe-532) covers Python databases.
+    "CWE-532": {
+        "smt": None,
+        "cocci": None,
+        "joern": False,
+        "codeql": "py/clear-text-logging-sensitive-data",
+        "sinks": [],
+        "semgrep": "logging/logs-secrets.yaml",
+        "semgrep_langs": ("python", "java", "javascript"),
+    },
+    # Duplicate operations on a resource — the double-close family;
+    # both rules encode the operate-twice mechanism (plain fd
+    # double-close, and the fdopendir/closedir-then-close alias).
+    "CWE-675": {
+        "smt": None,
+        "cocci": ["double_close.cocci", "fdopendir_double_close.cocci"],
+        "joern": False,
+        "codeql": None,
+        "sinks": [],
+    },
+    # Incorrect calculation — the pillar over the arithmetic family.
+    # The SMT overflow verb plus the calculation-shape rules
+    # (shift-exceeds-width, unchecked division) cover the mechanisms
+    # a deterministic tool can state; other calculation shapes reach
+    # the SMT leg only.
+    "CWE-682": {
+        "smt": "check-overflow",
+        "cocci": ["shift_overflow.cocci", "division_by_zero.cocci"],
+        "joern": False,
+        "codeql": None,
+        "sinks": [],
+    },
+    # XML entity expansion (billion laughs) — the CWE-611 sibling;
+    # same parser-sink vocabulary, and the CodeQL leg is the
+    # entity-expansion query (tagged cwe-776).
+    "CWE-776": {
+        "smt": None,
+        "cocci": None,
+        "joern": True,
+        "codeql": "py/xml-bomb",
+        "sinks": ["etree.parse", "fromstring", "parseString",
+                  "simplexml_load_string", "XMLReader", "DocumentBuilder",
+                  "xmlReadFile", "xmlParseFile", "xmlCtxtReadMemory"],
+    },
+    # Reliance on untrusted inputs in a security decision — taint
+    # reaching a decision callee is exactly the class's question, so
+    # the sink vocabulary is the CWE-863 authorisation set. No
+    # dark_verify: that heuristic's calibration evidence covers the
+    # authn/authz families only.
+    "CWE-807": {
+        "smt": "check-auth-bypass",
+        "cocci": None,
+        "joern": True,
+        "codeql": None,
+        "sinks": [
+            "authorize", "check_permission", "has_role", "is_admin",
+            "check_access", "require_auth", "can_access",
+        ],
+    },
+    # Excessive iteration — the CWE-835 parent; same loop-bound
+    # mechanisms and the same verifiers (SMT overflow verb for
+    # wrapping / non-advancing bound arithmetic, compiler channel for
+    # the locally-provable shapes — see
+    # compiler_sweep.COMPILER_CWE_MAP).
+    "CWE-834": {
+        "smt": "check-overflow",
+        "cocci": None,
+        "joern": False,
+        "codeql": None,
+        "sinks": [],
+    },
+    # Improperly controlled modification of dynamically-determined
+    # object attributes (mass assignment / object injection) — the
+    # CWE-1321 sibling; the recursive-merge/setter sink vocabulary is
+    # the same set prototype pollution rides.
+    "CWE-915": {
+        "smt": None,
+        "cocci": None,
+        "joern": True,
+        "codeql": None,
+        "sinks": ["merge", "extend", "assign", "defaultsDeep", "setWith",
+                  "set"],
+    },
+    # Communication channel to unintended endpoints — the statically
+    # statable shape is disabled TLS peer verification
+    # (verify=False / trust-all managers), which the curated rule
+    # encodes for its declared languages.
+    "CWE-923": {
+        "smt": None,
+        "cocci": None,
+        "joern": False,
+        "codeql": None,
+        "sinks": [],
+        "semgrep": "auth/tls-skip-verify.yaml",
+        "semgrep_langs": ("python", "java", "javascript", "typescript"),
+    },
+    # Improper neutralization in data-query logic (NoSQL injection) —
+    # the curated taint rule ($where / operator-injection shapes) is
+    # the verifying channel for its declared languages.
+    "CWE-943": {
+        "smt": None,
+        "cocci": None,
+        "joern": False,
+        "codeql": None,
+        "sinks": [],
+        "semgrep": "injection/nosql-taint.yaml",
+        "semgrep_langs": ("javascript", "typescript", "python"),
+    },
+    # Regex denial of service — tainted input reaching a
+    # backtracking-vulnerable pattern (curated taint rule) or the
+    # pattern itself being catastrophic (CodeQL redos query, tagged
+    # cwe-1333).
+    "CWE-1333": {
+        "smt": None,
+        "cocci": None,
+        "joern": False,
+        "codeql": "py/redos",
+        "sinks": [],
+        "semgrep": "injection/regex-dos.yaml",
+        "semgrep_langs": ("python", "javascript", "typescript", "java"),
+    },
+    # Server-side template injection — tainted data compiled as a
+    # template; the curated taint rule is the verifying channel for
+    # its declared languages.
+    "CWE-1336": {
+        "smt": None,
+        "cocci": None,
+        "joern": False,
+        "codeql": None,
+        "sinks": [],
+        "semgrep": "injection/ssti-taint.yaml",
+        "semgrep_langs": ("python", "go", "java", "javascript",
+                          "typescript"),
+    },
+    # Uncontrolled recursion — no static dataflow channel adjudicates
+    # recursion depth; the compiler channel probes with
+    # -Winfinite-recursion (confirm-only, see
+    # compiler_sweep.COMPILER_CWE_MAP), the CWE-843/835 precedent.
+    "CWE-674": {
+        "smt": None,
+        "cocci": None,
+        "joern": False,
+        "codeql": None,
+        "sinks": [],
+    },
+    # Fail-open / error-handling family extensions — the fail_open
+    # channel (fail_open_verify.FAIL_OPEN_CWES) is the verifier via
+    # the fallback chain: CWE-754/755 are the CWE-703 children
+    # (improper check / improper handling of exceptional conditions),
+    # CWE-392 is the missing-error-report sibling of CWE-390/391, and
+    # CWE-346 (origin validation error) is the CWE-345 authenticity
+    # child — a verification role whose failure or absence lets the
+    # data through.
+    "CWE-754": {
+        "smt": None,
+        "cocci": None,
+        "joern": False,
+        "codeql": None,
+        "sinks": [],
+    },
+    "CWE-755": {
+        "smt": None,
+        "cocci": None,
+        "joern": False,
+        "codeql": None,
+        "sinks": [],
+    },
+    "CWE-392": {
+        "smt": None,
+        "cocci": None,
+        "joern": False,
+        "codeql": None,
+        "sinks": [],
+    },
+    "CWE-346": {
+        "smt": None,
+        "cocci": None,
+        "joern": False,
+        "codeql": None,
+        "sinks": [],
+    },
+    # Improper following of specification by caller — the
+    # caller-contract violation is exactly the asserted-obligation-
+    # at-call-sites question the api_boundary channel answers
+    # (api_boundary.API_BOUNDARY_CWES), unconditionally like CWE-345.
+    "CWE-573": {
+        "smt": None,
+        "cocci": None,
+        "joern": False,
+        "codeql": None,
+        "sinks": [],
+    },
+    # Memory allocation with excessive size value — the
+    # attacker-influenced allocation-size shape of the unbounded-
+    # allocation family; the resource_bounds channel (bound-witness
+    # comparator, resource_bounds.RESOURCE_BOUNDS_CWES) is the
+    # verifier via the fallback chain.
+    "CWE-789": {
+        "smt": None,
+        "cocci": None,
+        "joern": False,
+        "codeql": None,
+        "sinks": [],
+    },
+    # ── Synthesis-owned classes ─────────────────────────────────────
+    # Entries below carry ``synthesis_owned``: no stock cocci rule,
+    # curated semgrep rule, CodeQL @id, SMT verb, or fallback channel
+    # states the class's harm mechanism, so the deliberately empty
+    # chain routes suspicious verdicts to on-demand checker synthesis
+    # as the designed verifier (see synthesis_owned() below). The
+    # marker only downgrades the unmapped-class log line — chain
+    # construction and synthesis candidacy are unchanged.
+    #
+    # Canonicalisation / normalisation family: the defect is a
+    # missing or mis-ordered transform relative to the TARGET'S
+    # canonical form (path equivalence, Unicode, case folding,
+    # validate-before-canonicalise) — no fixed pattern or sink
+    # vocabulary states what canonical means for a given target.
+    "CWE-41": {"smt": None, "cocci": None, "joern": False,
+               "codeql": None, "sinks": [], "synthesis_owned": True},
+    "CWE-176": {"smt": None, "cocci": None, "joern": False,
+                "codeql": None, "sinks": [], "synthesis_owned": True},
+    "CWE-178": {"smt": None, "cocci": None, "joern": False,
+                "codeql": None, "sinks": [], "synthesis_owned": True},
+    "CWE-180": {"smt": None, "cocci": None, "joern": False,
+                "codeql": None, "sinks": [], "synthesis_owned": True},
+    "CWE-1289": {"smt": None, "cocci": None, "joern": False,
+                 "codeql": None, "sinks": [], "synthesis_owned": True},
+    # Allow/deny-list correctness: whether a permissive entry or a
+    # missing deny entry is harmful is a list-completeness judgment
+    # against the target's semantics, not a fixed pattern.
+    "CWE-183": {"smt": None, "cocci": None, "joern": False,
+                "codeql": None, "sinks": [], "synthesis_owned": True},
+    "CWE-184": {"smt": None, "cocci": None, "joern": False,
+                "codeql": None, "sinks": [], "synthesis_owned": True},
+    # Incorrect regular expression: the claim is that a SPECIFIC
+    # pattern fails to match its intended language — a per-pattern
+    # semantic assertion (the DoS shape has its own entry, CWE-1333).
+    "CWE-185": {"smt": None, "cocci": None, "joern": False,
+                "codeql": None, "sinks": [], "synthesis_owned": True},
+    # Information-exposure family remainders: which datum is
+    # sensitive and which channel is attacker-visible are target
+    # semantics; the tool-statable sub-shapes have their own entries
+    # (CWE-312 storage, CWE-532 logs) and CWE-200 is the pillar.
+    # CWE-214/526 (sensitive data in argv / environment) and CWE-522
+    # (insufficiently protected credentials) name protection
+    # judgments whose statable members are covered elsewhere
+    # (CWE-327/312/532).
+    "CWE-200": {"smt": None, "cocci": None, "joern": False,
+                "codeql": None, "sinks": [], "synthesis_owned": True},
+    "CWE-214": {"smt": None, "cocci": None, "joern": False,
+                "codeql": None, "sinks": [], "synthesis_owned": True},
+    "CWE-522": {"smt": None, "cocci": None, "joern": False,
+                "codeql": None, "sinks": [], "synthesis_owned": True},
+    "CWE-526": {"smt": None, "cocci": None, "joern": False,
+                "codeql": None, "sinks": [], "synthesis_owned": True},
+    # Interpretation-conflict / comparison-semantics families: the
+    # harm depends on which pair of interpreters, which behaviour
+    # ordering, or which comparison factors the target composes —
+    # no stock pattern generalises across targets.
+    "CWE-349": {"smt": None, "cocci": None, "joern": False,
+                "codeql": None, "sinks": [], "synthesis_owned": True},
+    "CWE-436": {"smt": None, "cocci": None, "joern": False,
+                "codeql": None, "sinks": [], "synthesis_owned": True},
+    "CWE-696": {"smt": None, "cocci": None, "joern": False,
+                "codeql": None, "sinks": [], "synthesis_owned": True},
+    "CWE-697": {"smt": None, "cocci": None, "joern": False,
+                "codeql": None, "sinks": [], "synthesis_owned": True},
+    "CWE-1023": {"smt": None, "cocci": None, "joern": False,
+                 "codeql": None, "sinks": [], "synthesis_owned": True},
+    # Externally accessible lock: whether the lock primitive is
+    # reachable by an external actor is a deployment property, not a
+    # code pattern.
+    "CWE-412": {"smt": None, "cocci": None, "joern": False,
+                "codeql": None, "sinks": [], "synthesis_owned": True},
+    # Untrusted search path / uncontrolled search-path element: the
+    # defect is a constant-code property (which directories the
+    # loader consults, in what order) — not a dataflow; adjudication
+    # needs the target's loader configuration.
+    "CWE-426": {"smt": None, "cocci": None, "joern": False,
+                "codeql": None, "sinks": [], "synthesis_owned": True},
+    "CWE-427": {"smt": None, "cocci": None, "joern": False,
+                "codeql": None, "sinks": [], "synthesis_owned": True},
+    # Pillar / class-level abstractions naming no single mechanism
+    # (resource exposure, always-incorrect control flow, incorrect
+    # provided functionality, protection-mechanism failure, duplicate
+    # identifiers, incorrectly resolved reference): the concrete
+    # children with statable mechanisms have their own entries.
+    "CWE-668": {"smt": None, "cocci": None, "joern": False,
+                "codeql": None, "sinks": [], "synthesis_owned": True},
+    "CWE-670": {"smt": None, "cocci": None, "joern": False,
+                "codeql": None, "sinks": [], "synthesis_owned": True},
+    "CWE-684": {"smt": None, "cocci": None, "joern": False,
+                "codeql": None, "sinks": [], "synthesis_owned": True},
+    "CWE-693": {"smt": None, "cocci": None, "joern": False,
+                "codeql": None, "sinks": [], "synthesis_owned": True},
+    "CWE-694": {"smt": None, "cocci": None, "joern": False,
+                "codeql": None, "sinks": [], "synthesis_owned": True},
+    "CWE-706": {"smt": None, "cocci": None, "joern": False,
+                "codeql": None, "sinks": [], "synthesis_owned": True},
+    # Configuration / content families with no static observable
+    # (missing custom error page, insecure default initialisation,
+    # spreadsheet-formula neutralisation for generated CSV, numeric
+    # precision adequacy, LLM prompt-injection neutralisation): the
+    # asserted defect is target-policy-relative.
+    "CWE-756": {"smt": None, "cocci": None, "joern": False,
+                "codeql": None, "sinks": [], "synthesis_owned": True},
+    "CWE-1188": {"smt": None, "cocci": None, "joern": False,
+                 "codeql": None, "sinks": [], "synthesis_owned": True},
+    "CWE-1236": {"smt": None, "cocci": None, "joern": False,
+                 "codeql": None, "sinks": [], "synthesis_owned": True},
+    "CWE-1339": {"smt": None, "cocci": None, "joern": False,
+                 "codeql": None, "sinks": [], "synthesis_owned": True},
+    "CWE-1427": {"smt": None, "cocci": None, "joern": False,
+                 "codeql": None, "sinks": [], "synthesis_owned": True},
 }
 
 # Classes a deterministic tool CANNOT adjudicate — by policy, not by
@@ -621,11 +1211,11 @@ CWE_TO_TOOL_DISPATCH: dict[str, dict[str, Any]] = {
 #
 # Known gap (next pass): the park is class-exact, so logging-family
 # CWE drift bypasses it — a review emitting the operational-logging
-# neighbours CWE-779 (logging of excessive data) or CWE-223 (omission
-# of security-relevant information) is a concrete class and keeps the
-# synthesis lane open. NOT CWE-117 (log injection), which is
-# taint-verifiable and must never be parked. Extend the family or add
-# drift telemetry when a run shows drift evidence.
+# neighbour CWE-779 (logging of excessive data) is a concrete class
+# and keeps the synthesis lane open. NOT CWE-117 (log injection) or
+# CWE-532 (secret written to log), which are taint-verifiable and
+# carry dispatch entries — they must never be parked. Extend the
+# family or add drift telemetry when a run shows drift evidence.
 CWE_NOT_TOOL_VERIFIABLE: dict[str, str] = {
     # Insufficient logging: "enough logging" is an operational
     # detectability judgment; absence of a log call names no harm
@@ -664,6 +1254,30 @@ CWE_NOT_TOOL_VERIFIABLE: dict[str, str] = {
         "property — whether a value recurs under the same key at "
         "runtime is outside every static tool's observables; a match "
         "on IV construction asserts a shape, not reuse"
+    ),
+    # Omission of security-relevant log information: like CWE-778 an
+    # operational-detectability judgment — "this log line should have
+    # carried more" names no harm mechanism a tool could test. NOT
+    # CWE-117 (log injection) or CWE-532 (secret written to log),
+    # whose mechanisms are taint-verifiable and carry dispatch
+    # entries.
+    "CWE-223": (
+        "omission of security-relevant log information is an "
+        "operational/detectability property — no deterministic tool "
+        "output can adjudicate what a log line should have carried; "
+        "not an exploitability claim"
+    ),
+    # Insufficiently trustworthy component: component provenance and
+    # maintenance trustworthiness are supply-chain judgments outside
+    # any static observable in the scanned tree — a match on an
+    # import or dependency declaration asserts a shape, never the
+    # trust deficit.
+    "CWE-1357": (
+        "reliance on an insufficiently trustworthy component is a "
+        "supply-chain provenance judgment — no deterministic tool "
+        "output over the scanned tree can adjudicate a component's "
+        "trustworthiness; a dependency match asserts a shape, not "
+        "harm"
     ),
 }
 
@@ -711,24 +1325,51 @@ def lookup(cwe: str) -> dict[str, Any] | None:
     return CWE_TO_TOOL_DISPATCH.get(normalized)
 
 
+def synthesis_owned(cwe: str) -> bool:
+    """True when checker synthesis is the class's designed verifier.
+
+    Entries carrying ``synthesis_owned`` have no stock-tool chain BY
+    ADJUDICATION: no cocci rule, curated semgrep rule, CodeQL @id,
+    SMT verb, or fallback channel states the class's harm mechanism,
+    so the deliberately empty chain routes suspicious verdicts to
+    on-demand checker synthesis. The marker only selects the info-
+    grade log line over the loud unmapped warning — chain
+    construction and synthesis candidacy are unchanged. Language-
+    gated entries (``semgrep_langs``) never carry the marker: on
+    non-matching targets their empty chain keeps the loud warning,
+    exactly the pre-entry behaviour those entries document.
+    """
+    entry = lookup(cwe)
+    return bool(entry and entry.get("synthesis_owned"))
+
+
+# Every gap and word-suffix run in these rows is BOUNDED: the rows
+# are compiled through a loop and searched unanchored over
+# hypothesis text, where an unbounded gap re-scans the tail from
+# every planted keyword — quadratic-to-quartic on hostile text. A
+# real hypothesis phrase separates its keywords by a few words
+# (bounds of 200 chars per gap, 32 per suffix run are generous);
+# beyond a bound the row stops matching and inference falls through
+# to later rows or returns no CWE — the conservative direction for
+# a fallback used only when the review omitted the CWE field.
 _HYPOTHESIS_CWE_MAP = [
-    (r"race\s+condition|data\s+race|concurrent.*(?:write|access|modif)", "CWE-362"),
-    (r"toctou|time.of.check.*time.of.use|check.*then.*use.*race", "CWE-367"),
-    (r"deadlock|livelock|lock.*order|double.*lock", "CWE-667"),
-    (r"use.after.free|dangling.*pointer|freed.*(?:object|memory|buffer)", "CWE-416"),
-    (r"double.free|free.*twice", "CWE-415"),
-    (r"(?:integer|arithmetic).*overflow|integer.*wrap", "CWE-190"),
-    (r"(?:integer|arithmetic).*underflow", "CWE-191"),
-    (r"null.*(?:pointer|deref)|nullptr.*deref|deref.*null", "CWE-476"),
-    (r"(?:buffer|heap|stack).*overflow|out.of.bounds.*(?:write|access)", "CWE-787"),
-    (r"out.of.bounds.*read|oob.*read", "CWE-125"),
-    (r"format.*string.*(?:vuln|inject|attack)", "CWE-134"),
-    (r"(?:command|os|shell).*inject", "CWE-78"),
-    (r"sql.*inject", "CWE-89"),
-    (r"(?:auth|permission|privilege).*bypass", "CWE-863"),
-    (r"missing.*auth|no.*auth.*check", "CWE-862"),
-    (r"resource.*leak|memory.*leak|missing.*free", "CWE-401"),
-    (r"(?:integer|type).*(?:truncat|narrow)", "CWE-681"),
+    (r"race\s+condition|data\s+race|concurrent.{0,200}(?:write|access|modif)", "CWE-362"),
+    (r"toctou|time.of.check.{0,100}time.of.use|check.{0,100}then.{0,100}use.{0,100}race", "CWE-367"),
+    (r"deadlock|livelock|lock.{0,200}order|double.{0,200}lock", "CWE-667"),
+    (r"use.after.free|dangling.{0,200}pointer|freed.{0,200}(?:object|memory|buffer)", "CWE-416"),
+    (r"double.free|free.{0,200}twice", "CWE-415"),
+    (r"(?:integer|arithmetic).{0,200}overflow|integer.{0,200}wrap", "CWE-190"),
+    (r"(?:integer|arithmetic).{0,200}underflow", "CWE-191"),
+    (r"null.{0,200}(?:pointer|deref)|nullptr.{0,200}deref|deref.{0,200}null", "CWE-476"),
+    (r"(?:buffer|heap|stack).{0,200}overflow|out.of.bounds.{0,200}(?:write|access)", "CWE-787"),
+    (r"out.of.bounds.{0,200}read|oob.{0,200}read", "CWE-125"),
+    (r"format.{0,200}string.{0,200}(?:vuln|inject|attack)", "CWE-134"),
+    (r"(?:command|os|shell).{0,200}inject", "CWE-78"),
+    (r"sql.{0,200}inject", "CWE-89"),
+    (r"(?:auth|permission|privilege).{0,200}bypass", "CWE-863"),
+    (r"missing.{0,200}auth|no.{0,200}auth.{0,200}check", "CWE-862"),
+    (r"resource.{0,200}leak|memory.{0,200}leak|missing.{0,200}free", "CWE-401"),
+    (r"(?:integer|type).{0,200}(?:truncat|narrow)", "CWE-681"),
     (r"uninitiali[sz]ed", "CWE-457"),
     # Web-facing families (P10). Appended after the memory/injection
     # entries so pre-existing first-match behaviour is unchanged.
@@ -737,31 +1378,31 @@ _HYPOTHESIS_CWE_MAP = [
     ((r"deseriali[sz]|unpickl|pickle\.loads?|unseriali[sz]e|"
       r"marshal\.load|yaml\.load"), "CWE-502"),
     ((r"\bssrf\b|server.side.request.forgery|"
-      r"forged.*(?:server|internal).*request"), "CWE-918"),
+      r"forged.{0,200}(?:server|internal).{0,200}request"), "CWE-918"),
     (r"\bxxe\b|xml.external.entit|external.entity.(?:inject|expan)", "CWE-611"),
     ((r"open.redirect|unvalidated.redirect|"
-      r"redirect.*attacker.(?:controlled|supplied)"), "CWE-601"),
+      r"redirect.{0,200}attacker.(?:controlled|supplied)"), "CWE-601"),
     (r"prototype.pollution|__proto__", "CWE-1321"),
-    (r"(?:code|eval).*inject", "CWE-94"),
+    (r"(?:code|eval).{0,200}inject", "CWE-94"),
     # Appended after all earlier entries (first match wins, so
     # pre-existing behaviour is unchanged).
-    (r"type.confus|strict.alias|type.punn|punned.*pointer", "CWE-843"),
-    ((r"length.*(?:field|parameter|header|prefix).*"
+    (r"type.confus|strict.alias|type.punn|punned.{0,200}pointer", "CWE-843"),
+    ((r"length.{0,100}(?:field|parameter|header|prefix).{0,100}"
       r"(?:inconsisten|mismatch|truncat|exceed|larger|shorter)"),
      "CWE-130"),
-    (r"sign(?:ed)?.to.unsign|unsigned.conversion|negative.*(?:length|size|count).*(?:unsigned|size_t)", "CWE-195"),
+    (r"sign(?:ed)?.to.unsign|unsigned.conversion|negative.{0,200}(?:length|size|count).{0,200}(?:unsigned|size_t)", "CWE-195"),
     # Fail-open family. Appended after all existing entries
     # (first-match-wins, so pre-existing behaviour is unchanged).
-    (r"fail[s\-]?.?open|swallow\w*.{0,20}(?:exception|error)", "CWE-703"),
+    (r"fail[s\-]?.?open|swallow\w{0,32}.{0,20}(?:exception|error)", "CWE-703"),
     (r"empty.{0,10}catch|except.{0,10}pass", "CWE-703"),
-    ((r"(?:ignor|discard|unchecked)\w*.{0,20}"
+    ((r"(?:ignor|discard|unchecked)\w{0,32}.{0,20}"
       r"(?:error|return value|\berr\b)"), "CWE-252"),
     ((r"(?:return\s+value|result|\berr\b).{0,40}"
       r"(?:ignor|discard|not\s+checked|unchecked)"), "CWE-252"),
     # Go recover()-to-continue phrasings (the fail_open channel's
     # recover leg). Appended: first-match-wins, pre-existing behaviour
     # unchanged.
-    ((r"panic\w*.{0,40}recover|recover\w*.{0,40}"
+    ((r"panic\w{0,32}.{0,40}recover|recover\w{0,32}.{0,40}"
       r"(?:continue|proceed|swallow)"), "CWE-703"),
     # Midpoint-D1 long-tail families (appended: first-match-wins, so
     # pre-existing behaviour is unchanged). No CWE-908 keyword row:
@@ -773,13 +1414,13 @@ _HYPOTHESIS_CWE_MAP = [
     ((r"infinite\s+loop|loop.{0,30}(?:never|unreachable|cannot)"
       r".{0,15}(?:exit|terminat)|unbounded\s+loop|endless\s+loop"),
      "CWE-835"),
-    ((r"(?:v?snprintf).{0,80}truncat|truncat\w*.{0,40}"
+    ((r"(?:v?snprintf).{0,80}truncat|truncat\w{0,32}.{0,40}"
       r"(?:boundary|exact.fit|off.by.one)|"
       r"exact.fit.{0,30}truncat"), "CWE-193"),
-    ((r"authentic(?:ity)?.{0,40}(?:not|un|insufficient|missing|no)\w*"
+    ((r"authentic(?:ity)?.{0,40}(?:not|un|insufficient|missing|no)\w{0,16}"
       r".{0,15}(?:verif|check|validat)|(?:unverified|unauthenticated)"
       r".{0,25}(?:data|origin|source|message|payload|signature)|"
-      r"signature.{0,25}(?:not|never|un)\w*.{0,10}(?:verif|check)"),
+      r"signature.{0,25}(?:not|never|un)\w{0,16}.{0,10}(?:verif|check)"),
      "CWE-345"),
     # Five-channel programme families (appended: first-match-wins, so
     # pre-existing behaviour is unchanged).
@@ -790,10 +1431,10 @@ _HYPOTHESIS_CWE_MAP = [
     # Untrusted-inclusion family (appended: first-match-wins, so
     # pre-existing behaviour is unchanged; "...inject" phrasings keep
     # routing to the earlier CWE-78/94 rows).
-    ((r"(?:includ|inclusion|import|load)\w*.{0,40}untrusted"
+    ((r"(?:includ|inclusion|import|load)\w{0,16}.{0,40}untrusted"
       r".{0,25}(?:content|code|source|sphere|url|librar|module)|"
       r"untrusted.{0,40}(?:inclusion|functionality)|"
-      r"(?:remote|untrusted).{0,25}(?:code|script|librar\w+|module)"
+      r"(?:remote|untrusted).{0,25}(?:code|script|librar\w{1,32}|module)"
       r".{0,30}(?:includ|import|load)"), "CWE-829"),
     # Straggler families (appended: first-match-wins, so pre-existing
     # behaviour is unchanged). Temp-file races phrased as TOCTOU keep
@@ -806,8 +1447,33 @@ _HYPOTHESIS_CWE_MAP = [
       r"insecure|hijack)"), "CWE-377"),
     ((r"terminal\s+escape|escape.sequence.{0,25}inject|"
       r"ansi\s+escape.{0,25}(?:inject|spoof)|"
-      r"control.(?:byte|char|sequence)\w*.{0,60}"
+      r"control.(?:byte|char|sequence)\w{0,32}.{0,60}"
       r"(?:terminal|console|inject|spoof)"), "CWE-150"),
+    # PHP web-audit families (appended: first-match-wins, so
+    # pre-existing behaviour is unchanged — "shell/command ...
+    # injection" phrasings keep routing to the earlier CWE-78 row,
+    # "sql injection" to CWE-89).
+    (r"crlf.{0,40}inject|inject\w{0,32}.{0,30}crlf", "CWE-93"),
+    (r"argument.{0,12}inject|option.{0,12}inject", "CWE-88"),
+    ((r"unsafe.{0,8}reflection|reflection.{0,20}inject|"
+      r"variable.{0,8}(?:function|method).{0,30}"
+      r"(?:call|invok|invoc|user|attacker|taint|input)|"
+      r"call_user_func"), "CWE-470"),
+    (r"ent_quotes", "CWE-116"),
+    ((r"(?:md5|sha1).{0,40}password|password.{0,40}(?:md5|sha1)"),
+     "CWE-327"),
+    ((r"(?:mt_rand|uniqid|lcg_value)\w{0,16}.{0,60}"
+      r"(?:token|secret|nonce|session)|"
+      r"predictable.{0,20}(?:token|nonce|session)"), "CWE-338"),
+    # Output-encoding residual phrasings (appended: first-match-wins,
+    # so pre-existing behaviour is unchanged — "... injection"
+    # phrasings keep routing to their earlier class rows). Narrow by
+    # design: bare "without escaping" is claimed by many injection
+    # hypotheses and stays unmapped, and the phrase set stays
+    # seed-sized (the vocab-list policy).
+    ((r"(?:improper|missing)\s+(?:output\s+)?encoding|"
+      r"missing\s+escap\w*|escapes?\s+only\b|"
+      r"unescaped\s+(?:backslash|quote)"), "CWE-116"),
 ]
 
 _HYPOTHESIS_CWE_RE = None
@@ -873,6 +1539,142 @@ def cocci_rules_for_cwe(cwe: str) -> list[str]:
     return [val]
 
 
+#: Where the table's bare .cocci filenames live on disk.
+_COCCI_RULES_DIR = (
+    Path(__file__).resolve().parents[2] / "engine" / "coccinelle" / "rules"
+)
+
+# Rule names already warned about (missing on disk) — one loud line
+# per name per process, not one per dispatch.
+_MISSING_COCCI_WARNED: set[str] = set()
+
+
+def resolve_cocci_rules_for_cwe(cwe: str) -> list[str]:
+    """Absolute on-disk rule paths for a CWE's Coccinelle rules.
+
+    The dispatch table stores bare filenames; the runner resolves a
+    bare name against the process CWD, where it never exists, so
+    every table-seeded dispatch errored before spatch even spawned.
+    Resolve against the engine rules directory here and DROP names
+    whose file is missing (loud once per name) — a dead entry in the
+    chain both errors on every dispatch and, via the chain's
+    seen-types dedup, shadows the working keyword-mapped leg.
+    """
+    resolved: list[str] = []
+    for name in cocci_rules_for_cwe(cwe):
+        path = Path(name)
+        if not path.is_absolute():
+            path = _COCCI_RULES_DIR / name
+        if path.is_file():
+            resolved.append(str(path))
+        elif name not in _MISSING_COCCI_WARNED:
+            _MISSING_COCCI_WARNED.add(name)
+            logger.warning(
+                "cwe dispatch: coccinelle rule %s (for %s) not found "
+                "under %s — dropped from the tool chain",
+                name, cwe, _COCCI_RULES_DIR,
+            )
+    return resolved
+
+
+#: Where the table's semgrep rule names live on disk (names are
+#: relative to this directory, e.g. "php/crlf-injection.yaml").
+_SEMGREP_RULES_DIR = (
+    Path(__file__).resolve().parents[2] / "engine" / "semgrep" / "rules"
+)
+
+# Rule names already warned about (missing on disk) — one loud line
+# per name per process, not one per dispatch.
+_MISSING_SEMGREP_WARNED: set[str] = set()
+
+
+def semgrep_rule_for_cwe(cwe: str) -> str | None:
+    """Raw semgrep rule name from the dispatch table, or None.
+
+    Unresolved and language-ungated — chain builders use
+    :func:`resolve_semgrep_rule_for_cwe`.
+    """
+    entry = lookup(cwe)
+    if entry is None:
+        return None
+    return entry.get("semgrep")
+
+
+def resolve_semgrep_rule_for_cwe(
+    cwe: str, file_path: str, language: str | None = None,
+) -> str | None:
+    """Absolute on-disk semgrep rule path for a CWE's rule, or None.
+
+    Language-gated: when the entry declares ``semgrep_langs`` and the
+    audited file's semgrep language is not among them, the leg is
+    dropped — a language-mismatched rule file scans nothing (semgrep
+    never selects the target), the sweep degrades to inconclusive,
+    and via the chain's seen-types dedup the dead leg would shadow
+    the keyword-mapped dynamic semgrep leg. Missing rule files are
+    dropped loudly once per name (the resolve_cocci_rules_for_cwe
+    precedent: a bare table name resolves against the process CWD at
+    scan time, where it never exists).
+
+    ``language`` is the inventory's recorded language for the file:
+    for extensions no table maps, the content probe's verdict (a PHP
+    plugin "module" file, an extensionless script) may satisfy the
+    gate where the extension cannot. The executed sweep honours the
+    same hint with ``--scan-unknown-extensions``, so a leg admitted
+    this way is actually scanned — the gate stays honest in both
+    directions (a probed non-matching language still drops the leg,
+    and mapped extensions never consult the hint).
+
+    Per-language routing: an entry may additionally carry
+    ``semgrep_by_lang`` ({semgrep language: rule name}), consulted
+    FIRST — languages not in the map fall through to the original
+    ``semgrep`` + ``semgrep_langs`` pair, so existing entries and the
+    php legs behave exactly as before. One rule file per (CWE,
+    language): the chain builder emits a single semgrep leg, so
+    multiple sub-shape rules for one language live as multiple rule
+    ids in one file. The by-lang lookup keys on the extension-mapped
+    language only; the content-probe hint participates solely in the
+    ``semgrep_langs`` gate below (the probe-hint x by-lang
+    cross-product is deliberately not implied by either surface).
+    """
+    entry = lookup(cwe)
+    if entry is None:
+        return None
+    by_lang = entry.get("semgrep_by_lang") or {}
+    name: str | None = None
+    if by_lang:
+        from .hypothesis_mapping import semgrep_language_for
+
+        name = by_lang.get(semgrep_language_for(file_path or ""))
+    if not name:
+        name = entry.get("semgrep")
+        if not name:
+            return None
+        langs = entry.get("semgrep_langs") or ()
+        if langs:
+            from .hypothesis_mapping import (
+                semgrep_language_for,
+                semgrep_probed_language,
+            )
+
+            if semgrep_language_for(file_path or "") not in langs:
+                probed = semgrep_probed_language(file_path or "", language)
+                if probed is None or probed not in langs:
+                    return None
+    path = Path(name)
+    if not path.is_absolute():
+        path = _SEMGREP_RULES_DIR / name
+    if not path.is_file():
+        if name not in _MISSING_SEMGREP_WARNED:
+            _MISSING_SEMGREP_WARNED.add(name)
+            logger.warning(
+                "cwe dispatch: semgrep rule %s (for %s) not found "
+                "under %s — dropped from the tool chain",
+                name, cwe, _SEMGREP_RULES_DIR,
+            )
+        return None
+    return str(path)
+
+
 def codeql_query_for_cwe(cwe: str) -> str | None:
     """Return the CodeQL query ID for a CWE, or None."""
     entry = lookup(cwe)
@@ -881,12 +1683,61 @@ def codeql_query_for_cwe(cwe: str) -> str | None:
     return entry.get("codeql")
 
 
-def joern_applicable(cwe: str) -> bool:
-    """Return whether Joern taint tracking is useful for a CWE."""
+def codeql_query_ids_by_pack() -> dict[str, list[str]]:
+    """Every distinct CodeQL query spec the table can emit, by pack prefix.
+
+    Keys are the ID's leading path segment (``cpp`` / ``py`` / ``js``);
+    values are sorted and deduplicated. This is the static universe of
+    ``codeql`` chain entries the dispatch builders can produce — the
+    whole-run warm-up enumerates it per database language so one
+    analyze covers every query a hypothesis could later dispatch.
+    """
+    by_pack: dict[str, set[str]] = {}
+    for entry in CWE_TO_TOOL_DISPATCH.values():
+        query = entry.get("codeql")
+        if not query or "/" not in query:
+            continue
+        by_pack.setdefault(query.split("/", 1)[0], set()).add(query)
+    return {pack: sorted(ids) for pack, ids in sorted(by_pack.items())}
+
+
+def joern_language_permitted(cwe: str, file_path: str | None) -> bool:
+    """Language gate for a CWE's joern legs.
+
+    True unless the dispatch entry declares ``joern_langs`` and the
+    target's semgrep language is not among them. Entries without the
+    key keep their ungated behaviour exactly. Fail-closed when the
+    entry declares languages and the caller has no file context — a
+    leg whose fixtures cover only the declared languages must not
+    dispatch blind.
+    """
+    entry = lookup(cwe)
+    if entry is None:
+        return True
+    langs = entry.get("joern_langs") or ()
+    if not langs:
+        return True
+    if not file_path:
+        return False
+    from .hypothesis_mapping import semgrep_language_for
+
+    return semgrep_language_for(file_path) in langs
+
+
+def joern_applicable(cwe: str, file_path: str | None = None) -> bool:
+    """Return whether Joern taint tracking is useful for a CWE.
+
+    ``file_path`` feeds the ``joern_langs`` language gate; entries
+    without that key behave as before regardless of the argument.
+    """
     entry = lookup(cwe)
     if entry is None:
         return False
-    return bool(entry.get("joern")) and bool(entry.get("sinks"))
+    return (
+        bool(entry.get("joern"))
+        and bool(entry.get("sinks"))
+        and joern_language_permitted(cwe, file_path)
+    )
 
 
 def dark_verify_applicable(cwe: str) -> bool:

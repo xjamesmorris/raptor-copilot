@@ -922,3 +922,165 @@ class TestReadLicenseFullHardening:
         f = tmp_path / "LICENSE"
         f.write_text("A" * 100)
         assert _read_license_full(f, 10) == "A" * 10
+
+
+class TestHeadReaderBounded:
+    def test_single_giant_line_read_is_capped(self, tmp_path, monkeypatch):
+        # A planted LICENSE that is ONE huge line: line iteration
+        # buffered the whole line, OOMing the run at lifecycle start.
+        # The head reader must load at most the byte cap.
+        import core.license.detector as det
+
+        monkeypatch.setattr(det, "_INDIRECTION_FILE_BYTES", 4096)
+        lic = tmp_path / "LICENSE"
+        lic.write_text("MIT License " + "x" * 100_000)  # one line
+        head = det._read_license_head(lic)
+        assert len(head) <= 4096
+        assert head.startswith("MIT License")
+
+    def test_normal_license_header_unchanged(self, tmp_path):
+        import core.license.detector as det
+
+        lic = tmp_path / "LICENSE"
+        lic.write_text(
+            "MIT License\n\nPermission is hereby granted...\n"
+            + "".join(f"line {i}\n" for i in range(200)),
+        )
+        head = det._read_license_head(lic)
+        # Line cap still applies on top of the byte cap.
+        assert len(head.splitlines()) == det._LICENSE_READ_LINES
+        assert head.startswith("MIT License")
+
+
+class TestHeadReaderFdGuard:
+    """_read_license_head shares _read_license_full's fd discipline:
+    the is_file() gate can be raced, so a FIFO swapped in must fail
+    closed instead of blocking detection forever."""
+
+    def test_fifo_returns_empty(self, tmp_path):
+        import os
+        from core.license.detector import _read_license_head
+        fifo = tmp_path / "LICENSE"
+        os.mkfifo(fifo)
+        # Pre-fix the plain open() blocked until a writer appeared.
+        assert _read_license_head(fifo) == ""
+
+    def test_in_tree_symlink_still_reads(self, tmp_path):
+        # REUSE-style COPYING → LICENSES/<SPDX>.txt stays supported:
+        # resolve-then-guarded-open follows the (caller-validated)
+        # symlink while the fd check still refuses non-regular files.
+        from core.license.detector import _read_license_head
+        (tmp_path / "LICENSES").mkdir()
+        real = tmp_path / "LICENSES" / "MIT.txt"
+        real.write_text("MIT License\n")
+        link = tmp_path / "COPYING"
+        link.symlink_to("LICENSES/MIT.txt")
+        assert _read_license_head(link) == "MIT License\n"
+
+
+class TestProprietaryPrecedence:
+    """Proprietary declarations join the earliest-position race.
+
+    A LICENSE that opens with an explicit proprietary statement and
+    later NAMES a bundled third-party license must not classify as OSS
+    — pre-fix, proprietary markers were consulted only after the
+    fingerprint race, so any bundled-license mention won.
+    """
+
+    def test_proprietary_header_naming_bundled_oss_is_not_oss(
+            self, tmp_path):
+        (tmp_path / "LICENSE").write_text(
+            "PROPRIETARY AND CONFIDENTIAL. All use subject to the "
+            "Example Corp master agreement.\n\n"
+            "Third-party components are used under the Apache License, "
+            "Version 2.0.\n",
+        )
+        lic = detect_target_license(tmp_path)
+        assert lic.classification == "proprietary"
+
+    def test_oss_body_mentioning_proprietary_later_stays_oss(
+            self, tmp_path):
+        # The other direction: a real OSS text whose later prose
+        # mentions the word (e.g. an exception clause) keeps its
+        # fingerprint classification.
+        (tmp_path / "LICENSE").write_text(
+            "Apache License\nVersion 2.0, January 2004\n"
+            "Licensed under the Apache License, Version 2.0; "
+            "you may not use this file except in compliance.\n\n"
+            "Note: linking with proprietary modules is permitted.\n",
+        )
+        lic = detect_target_license(tmp_path)
+        assert lic.classification == "oss"
+
+    def test_bsd_all_rights_reserved_boilerplate_stays_oss(
+            self, tmp_path):
+        # BSD headers carry "All rights reserved" ABOVE the intro
+        # marker; that boilerplate must not win the race.
+        (tmp_path / "LICENSE").write_text(
+            "Copyright (c) 2020 Example Project.\n"
+            "All rights reserved.\n\n"
+            "Redistribution and use in source and binary forms, with "
+            "or without modification, are permitted provided that the "
+            "following conditions are met:\n"
+            "* Redistributions of source code must retain the above.\n",
+        )
+        lic = detect_target_license(tmp_path)
+        assert lic.classification == "oss"
+        assert lic.spdx_id in ("BSD-2-Clause", "BSD-3-Clause")
+
+
+class TestIndirectionDirectoryDepth:
+    """Directory children enqueue at the SAME depth as the reference
+    that named the directory: the dir itself isn't being classified,
+    just enumerated, so each file inside is the same hop as if it had
+    been referenced directly. Charging an extra hop made boundary
+    chains (dir reference at max depth) silently lose classification.
+    """
+
+    _MIT = (
+        "MIT License\n\nPermission is hereby granted, free of charge, "
+        "to any person obtaining a copy of this software and associated "
+        "documentation files"
+    )
+
+    def test_boundary_chain_through_directory_classifies(self, tmp_path):
+        (tmp_path / "LICENSE").write_text("see the file A.txt")
+        (tmp_path / "A.txt").write_text("see the file B.txt")
+        (tmp_path / "B.txt").write_text("see the L2/ directory")
+        (tmp_path / "L2").mkdir()
+        (tmp_path / "L2" / "MIT.txt").write_text(self._MIT)
+        lic = detect_target_license(tmp_path)
+        assert lic.classification == "oss"
+        assert lic.spdx_id == "MIT"
+
+    def test_shorter_chain_control(self, tmp_path):
+        (tmp_path / "LICENSE").write_text("see the file B.txt")
+        (tmp_path / "B.txt").write_text("see the L2/ directory")
+        (tmp_path / "L2").mkdir()
+        (tmp_path / "L2" / "MIT.txt").write_text(self._MIT)
+        lic = detect_target_license(tmp_path)
+        assert lic.classification == "oss"
+        assert lic.spdx_id == "MIT"
+
+    def test_over_depth_direct_chain_still_bounded(self, tmp_path):
+        # The depth budget itself still holds for file-to-file hops.
+        (tmp_path / "LICENSE").write_text("see the file A.txt")
+        (tmp_path / "A.txt").write_text("see the file B.txt")
+        (tmp_path / "B.txt").write_text("see the file C.txt")
+        (tmp_path / "C.txt").write_text("see the file D.txt")
+        (tmp_path / "D.txt").write_text(self._MIT)
+        lic = detect_target_license(tmp_path)
+        assert lic.classification == "unknown"
+
+    def test_same_depth_directory_chain_is_budget_bounded(self, tmp_path):
+        # Same-depth enumeration must not turn into an unbounded walk:
+        # a hostile chain of alternating directory references stops at
+        # the total-files budget instead of reading the whole tree.
+        (tmp_path / "LICENSE").write_text("see the D0/ directory")
+        for i in range(40):
+            d = tmp_path / f"D{i}"
+            d.mkdir()
+            (d / "license.txt").write_text(
+                f"see the ../D{i + 1}/ directory")
+        lic = detect_target_license(tmp_path)
+        assert lic.classification == "unknown"

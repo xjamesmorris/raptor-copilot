@@ -6,7 +6,8 @@ it so the sandbox re-anonymisation follow-up extends the CONSTANT and
 gets the coverage for free:
 
 * the constant's own contents and allowlist relationship,
-* the pid1 shim's hand-copied tuple (the shim cannot import core),
+* the seatbelt shim's hand-copied tuple (the isolated shim cannot
+  import core),
 * the fuzzing env scrub,
 * the frida raw-spawn env builder (frida spawn-mode targets inherit
   the CLI's environ — a raw subprocess, no sandbox chokepoint),
@@ -18,6 +19,7 @@ gets the coverage for free:
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -36,6 +38,7 @@ def test_constant_contents():
     assert "_RAPTOR_TRUSTED" in STRIP_SET
     assert "RAPTOR_SESSION_PID" in STRIP_SET
     assert "RAPTOR_SESSION_TOKEN" in STRIP_SET
+    assert "RAPTOR_ALLOW_DEGRADED_UNTRUSTED" in STRIP_SET
 
 
 def test_session_credential_is_allowlisted_but_stripped():
@@ -46,14 +49,87 @@ def test_session_credential_is_allowlisted_but_stripped():
     assert "RAPTOR_SESSION_TOKEN" in RaptorConfig.SAFE_ENV_ALLOWLIST
 
 
-def test_pid1_shim_tuple_in_sync():
-    """The shim hand-copies the set (it cannot import core inside
-    namespace setup) — this is the tripwire that keeps it honest."""
-    shim = (_REPO_ROOT / "libexec" / "raptor-pid1-shim").read_text(
+def test_degraded_untrusted_consent_is_allowlisted_but_stripped():
+    """RAPTOR workers inherit consent, but scanned code cannot change it."""
+    assert "RAPTOR_ALLOW_DEGRADED_UNTRUSTED" in (
+        RaptorConfig.SAFE_ENV_ALLOWLIST
+    )
+
+
+def test_explicit_worker_dispatch_can_preserve_disable_consent(
+    monkeypatch,
+    tmp_path,
+):
+    """Only the dedicated RAPTOR-worker kwarg restores the nonce.
+
+    keep_trust_markers alone deliberately remains insufficient: sandbox
+    disable consent is separate authority.
+    """
+    from core.sandbox import context, state
+    from core.sandbox.disable_consent import NONCE_ENV_VAR
+
+    monkeypatch.setattr(state, "_cli_sandbox_profile", "none")
+    monkeypatch.setattr(state, "_cli_sandbox_disabled", True)
+    monkeypatch.setattr(
+        state,
+        "_cli_sandbox_disable_consent",
+        "nonce",
+    )
+    nonce = "ab" * 16
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "CLAUDECODE": "1",
+        NONCE_ENV_VAR: nonce,
+    }
+    command = [
+        "/usr/bin/python3",
+        "-c",
+        (
+            "import json, os; "
+            "print(json.dumps({"
+            f"'nonce': os.environ.get({NONCE_ENV_VAR!r}), "
+            "'cc': os.environ.get('CLAUDECODE')}))"
+        ),
+    ]
+
+    stripped = context.run(
+        command,
+        output=str(tmp_path),
+        env=env,
+        env_caller_filtered=True,
+        keep_trust_markers_for_dispatch=True,
+        capture_output=True,
+        text=True,
+    )
+    assert stripped.returncode == 0, stripped.stderr
+    assert json.loads(stripped.stdout)["nonce"] is None
+
+    preserved = context.run(
+        command,
+        output=str(tmp_path),
+        env=env,
+        env_caller_filtered=True,
+        keep_trust_markers_for_dispatch=True,
+        keep_disable_consent_for_dispatch=True,
+        capture_output=True,
+        text=True,
+    )
+    assert preserved.returncode == 0, preserved.stderr
+    payload = json.loads(preserved.stdout)
+    assert payload == {"nonce": nonce, "cc": "1"}
+
+
+def test_seatbelt_shim_tuple_in_sync():
+    """The macOS seatbelt shim hand-copies the set (the isolated
+    ``python3 -I`` shim cannot import core) — this is the tripwire
+    that keeps it honest. (The Linux pid1 shim carried the sibling
+    tuple until the unshare-CLI lane was deleted; every Linux lane
+    now strips via the context.run() seam directly.)"""
+    shim = (_REPO_ROOT / "libexec" / "raptor-seatbelt-shim").read_text(
         encoding="utf-8")
     for member in STRIP_SET:
         assert re.search(rf'"{re.escape(member)}"', shim), (
-            f"pid1 shim strip tuple is missing {member!r} — "
+            f"seatbelt shim strip tuple is missing {member!r} — "
             f"keep it in sync with TARGET_ENV_STRIP_SET"
         )
 
@@ -70,10 +146,30 @@ def test_fuzzing_env_hygiene_scrubs_the_set():
 def test_frida_safe_env_excludes_the_set(monkeypatch):
     for member in STRIP_SET:
         monkeypatch.setenv(member, "leak-me")
-    from core.audit.frida_observe import _safe_env
-    env = _safe_env()
+    from core.security.env_sanitisation import safe_subprocess_env
+    env = safe_subprocess_env(strip_target_markers=True)
     for member in STRIP_SET:
         assert member not in env, f"{member} reached the frida CLI env"
+    # And the frida-observe spawn site actually requests the strip —
+    # the semantic assertion above is only load-bearing if the call
+    # site opts in.
+    src = (_REPO_ROOT / "core" / "audit" / "frida_observe.py").read_text(
+        encoding="utf-8")
+    assert "safe_subprocess_env(strip_target_markers=True)" in src
+
+
+def test_frida_safe_env_strips_the_marker_family(monkeypatch):
+    """frida spawn-mode targets inherit this env: allowlisted RAPTOR_*
+    riders (budget knobs, CI stamp) are one-getenv fingerprints to a
+    hostile binary — the whole prefix family must strip, exactly as
+    on the packages/frida runner spawn path."""
+    monkeypatch.setenv("RAPTOR_EF_TIMEOUT_S", "5")
+    monkeypatch.setenv("RAPTOR_CI", "1")
+    monkeypatch.setenv("_RAPTOR_TRUSTED", "1")
+    from core.security.env_sanitisation import safe_subprocess_env
+    env = safe_subprocess_env(strip_target_markers=True)
+    for name in ("RAPTOR_EF_TIMEOUT_S", "RAPTOR_CI", "_RAPTOR_TRUSTED"):
+        assert name not in env, f"{name} fingerprints RAPTOR to the target"
 
 
 def test_codeql_build_env_blocks_raptor_vars():

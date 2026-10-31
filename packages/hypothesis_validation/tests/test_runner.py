@@ -426,6 +426,55 @@ class TestValidateAdapterFiltering:
         assert result.refuted
 
 
+class ConclusiveEmptyAdapter(FakeAdapter):
+    """SMT-shaped adapter: no matches, but the emptiness IS the tool
+    result (unsat), flagged via empty_matches_conclusive."""
+
+    def run(self, rule, target, *, timeout=300, env=None) -> ToolEvidence:
+        self.run_calls.append({"rule": rule, "target": target})
+        return ToolEvidence(
+            tool=self._name, rule=rule, success=True, matches=[],
+            summary="unsat — constraints are mutually exclusive",
+            empty_matches_conclusive=True,
+        )
+
+
+class TestValidateConclusiveEmptyPolarity:
+    """The unsat verdict direction is mechanical (declared polarity),
+    never the evaluating LLM's phrasing-aware claim."""
+
+    def _llm(self, verdict: str) -> FakeLLM:
+        return FakeLLM([
+            {"tool": "smt", "rule": "x > 1\nx < 0",
+             "expected_evidence": "unsat", "reasoning": "..."},
+            {"verdict": verdict, "reasoning": "...",
+             "matches_support_claim": False},
+        ])
+
+    def test_reachability_polarity_refutes_despite_llm_confirmed(self):
+        h = Hypothesis(claim="path reachable", target=Path("/src"),
+                       polarity="reachability")
+        adapter = ConclusiveEmptyAdapter("smt")
+        result = validate(h, [adapter], self._llm("confirmed"))
+        assert result.refuted
+
+    def test_infeasibility_polarity_confirms_despite_llm_refuted(self):
+        h = Hypothesis(claim="conditions mutually exclusive",
+                       target=Path("/src"), polarity="infeasibility")
+        adapter = ConclusiveEmptyAdapter("smt")
+        result = validate(h, [adapter], self._llm("refuted"))
+        assert result.confirmed
+
+    def test_undeclared_polarity_never_mints_confirmed(self):
+        # Fail closed: without a declared polarity an LLM "confirmed"
+        # on a zero-match conclusive result stays inconclusive.
+        h = Hypothesis(claim="ambiguous phrasing", target=Path("/src"))
+        adapter = ConclusiveEmptyAdapter("smt")
+        result = validate(h, [adapter], self._llm("confirmed"))
+        assert not result.confirmed
+        assert not result.refuted
+
+
 class TestValidateAuditTrail:
     def test_evidence_records_rule_and_summary(self):
         h = Hypothesis(claim="c", target=Path("/src"))

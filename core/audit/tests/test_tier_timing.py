@@ -9,6 +9,8 @@ onto the entry's tier. No real tools run here — the sweep is stubbed.
 
 from __future__ import annotations
 
+import sys
+import threading
 import time
 import types
 
@@ -128,3 +130,64 @@ class TestTierWallTime:
         m = re.search(r"(\d+\.\d)s", semgrep_line)
         assert m, semgrep_line
         assert float(m.group(1)) >= 0.2
+
+
+class TestIncrementTierThreadSafety:
+    """``increment_tier`` runs in parallel review workers; its
+    read-modify-write on the shared ``TierCounters`` must hold the
+    module lock or concurrent increments are silently lost
+    (under-counted tier-diagnostics.json on parallel runs)."""
+
+    def test_concurrent_increments_are_exact(self):
+        from core.audit.diagnostics import increment_tier
+
+        result = types.SimpleNamespace(tier_counters=_make_tier_counters())
+        n_threads, n_iter = 8, 500
+        start = threading.Barrier(n_threads)
+
+        def worker() -> None:
+            start.wait()
+            for _ in range(n_iter):
+                increment_tier(result, "semgrep", "confirmed")
+                increment_tier(result, "semgrep", "refuted")
+
+        # Shrink the bytecode switch interval so unlocked
+        # read-modify-write races actually interleave.
+        old = sys.getswitchinterval()
+        sys.setswitchinterval(1e-5)
+        try:
+            threads = [
+                threading.Thread(target=worker) for _ in range(n_threads)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        finally:
+            sys.setswitchinterval(old)
+
+        assert result.tier_counters["semgrep"].confirmed == n_threads * n_iter
+        assert result.tier_counters["semgrep"].refuted == n_threads * n_iter
+
+    def test_increment_takes_the_shared_lock(self, monkeypatch):
+        # Structural pin: the exactness test above can pass by luck on
+        # a quiet interpreter even without the lock; entering the
+        # module lock cannot.
+        from core.audit import diagnostics
+
+        entered: list[bool] = []
+
+        class RecordingLock:
+            def __enter__(self) -> None:
+                entered.append(True)
+
+            def __exit__(self, *exc: object) -> bool:
+                return False
+
+        monkeypatch.setattr(
+            diagnostics, "_TIER_COUNTER_LOCK", RecordingLock(),
+        )
+        result = types.SimpleNamespace(tier_counters=_make_tier_counters())
+        diagnostics.increment_tier(result, "semgrep", "confirmed")
+        assert entered
+        assert result.tier_counters["semgrep"].confirmed == 1

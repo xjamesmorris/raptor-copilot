@@ -1,7 +1,8 @@
 """Tests for ``core.llm.dispatcher.lifecycle``.
 
 Confirms:
-  * ``dispatcher_for_run`` derives ``run_id`` from the run dir basename.
+  * ``dispatcher_for_run`` derives ``run_id`` from the RESOLVED run
+    dir basename.
   * Audit log lands at ``<run_dir>/audit-llm-dispatcher.jsonl``.
   * Context-manager shuts the dispatcher down on normal + exceptional exits.
   * Missing run_dir raises early (rather than silently writing audit
@@ -9,6 +10,8 @@ Confirms:
 """
 
 from __future__ import annotations
+
+from pathlib import Path
 
 import pytest
 
@@ -47,6 +50,21 @@ class TestDispatcherForRun:
         d = dispatcher_for_run(run_dir, creds=fake_creds)
         try:
             assert d.run_id == "scan_alpha"
+        finally:
+            d.shutdown()
+
+    def test_relative_run_dir_gets_resolved_run_id(
+            self, fake_creds: CredentialStore, tmp_path: Path,
+            monkeypatch: pytest.MonkeyPatch) -> None:
+        # The run-attribution seam: "." from inside the run dir has
+        # name == "" unresolved — the dispatcher identity (audit
+        # rows, socket-dir prefix) would carry no run attribution.
+        run_dir = tmp_path / "scan_beta"
+        run_dir.mkdir()
+        monkeypatch.chdir(run_dir)
+        d = dispatcher_for_run(Path("."), creds=fake_creds)
+        try:
+            assert d.run_id == "scan_beta"
         finally:
             d.shutdown()
 
@@ -125,6 +143,64 @@ class TestEnsureInprocessDispatcherEnv:
             os.environ.pop("RAPTOR_LLM_SOCKET", None)
             os.environ.pop("RAPTOR_LLM_TOKEN_FD", None)
             if d is not None:
+                d.shutdown()
+
+
+class TestConcurrentFirstCallers:
+    def test_concurrent_first_callers_construct_one_dispatcher(
+        self, monkeypatch,
+    ):
+        """The env check-then-set sequence is locked: two racing first
+        callers must not both pass the RAPTOR_LLM_SOCKET check — the
+        loser's dispatcher would be stray (socket dir until the
+        atexit/dead-owner sweep) and its env write would silently
+        clobber the winner's route."""
+        import os
+        import threading
+        import time as _time
+
+        from core.llm.dispatcher import lifecycle
+        from core.llm.dispatcher.server import LLMDispatcher
+
+        monkeypatch.delenv("RAPTOR_LLM_SOCKET", raising=False)
+        monkeypatch.delenv("RAPTOR_LLM_TOKEN_FD", raising=False)
+
+        constructed: list = []
+        real_init = LLMDispatcher.__init__
+
+        def slow_init(self, *a, **k):
+            constructed.append(self)
+            _time.sleep(0.3)  # hold the construction window open
+            real_init(self, *a, **k)
+
+        monkeypatch.setattr(LLMDispatcher, "__init__", slow_init)
+
+        results: list = []
+
+        def caller(tag: str) -> None:
+            results.append(
+                lifecycle.ensure_inprocess_dispatcher_env(
+                    label=f"race-{tag}"))
+
+        t1 = threading.Thread(target=caller, args=("a",))
+        t2 = threading.Thread(target=caller, args=("b",))
+        t1.start()
+        t2.start()
+        t1.join(timeout=30)
+        t2.join(timeout=30)
+        live = [d for d in results if d is not None]
+        try:
+            assert len(constructed) == 1, (
+                "concurrent first callers constructed "
+                f"{len(constructed)} dispatchers"
+            )
+            assert len(live) == 1
+            assert os.environ["RAPTOR_LLM_SOCKET"] == str(
+                live[0].socket_path)
+        finally:
+            os.environ.pop("RAPTOR_LLM_SOCKET", None)
+            os.environ.pop("RAPTOR_LLM_TOKEN_FD", None)
+            for d in live:
                 d.shutdown()
 
 
@@ -318,3 +394,121 @@ class TestAuditTrailHardening:
             assert getattr(d, "_audit_warned", False) is True
         finally:
             d.shutdown()
+
+
+class TestSocketPathBudget:
+    def test_deep_tmpdir_still_binds(self, monkeypatch, tmp_path):
+        """AF_UNIX sun_path tops out around 108 bytes: a deep TMPDIR
+        (nested session/pytest scratch layers) used to push
+        <sock_dir>/llm-child.sock past the limit and bind() failed at
+        dispatcher init. The fallback must land the socket somewhere
+        bindable."""
+        import os
+        import tempfile as _tempfile
+
+        from core.llm.dispatcher.auth import CredentialStore
+        from core.llm.dispatcher.server import LLMDispatcher
+
+        creds = CredentialStore.__new__(CredentialStore)
+        creds._keys = {}
+
+        deep = tmp_path
+        for i in range(12):
+            deep = deep / f"layer-{i:02d}"
+        deep.mkdir(parents=True)
+        monkeypatch.setenv("TMPDIR", str(deep))
+        _tempfile.tempdir = None  # re-derive gettempdir from env
+        try:
+            d = LLMDispatcher(
+                run_id="deep-tmpdir-e2e",
+                creds=creds,
+                audit_path=tmp_path / "audit.jsonl",
+            )
+            try:
+                assert d.socket_path.exists()
+                # Bytes, via os.fsencode: sun_path is a byte cap and
+                # bare .encode() crashes on surrogate-escaped paths.
+                assert len(os.fsencode(d.child_socket_path)) <= 104
+            finally:
+                d.shutdown()
+        finally:
+            _tempfile.tempdir = None
+
+    def test_surrogate_tmpdir_falls_back_instead_of_crashing(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """A TMPDIR carrying undecodable bytes reaches Python as a
+        surrogate-escaped str. The socket-path budget check must
+        MEASURE it (os.fsencode round-trips the escapes, one byte
+        each) rather than crash: bare str.encode() raised
+        UnicodeEncodeError at construction — before the /tmp fallback
+        this check exists to trigger could rescue the path."""
+        import os
+        import tempfile as _tempfile
+
+        from core.llm.dispatcher.auth import CredentialStore
+        from core.llm.dispatcher.server import LLMDispatcher
+
+        creds = CredentialStore.__new__(CredentialStore)
+        creds._keys = {}
+
+        # Real undecodable byte in a real dir; padded well past the
+        # byte budget so the /tmp fallback MUST divert.
+        bad = os.fsencode(tmp_path) + b"/srg-\xff-" + b"x" * 64
+        os.mkdir(bad)
+        bad_str = os.fsdecode(bad)
+        assert "\udcff" in bad_str  # the hazard is live on this fs
+        monkeypatch.setenv("TMPDIR", bad_str)
+        monkeypatch.setattr(_tempfile, "tempdir", None)
+
+        d = LLMDispatcher(
+            run_id="srg-tmpdir-e2e",
+            creds=creds,
+            audit_path=tmp_path / "audit.jsonl",
+        )
+        try:
+            assert d.socket_path.exists()
+            assert not str(d._sock_dir).startswith(bad_str)
+            assert len(os.fsencode(d.child_socket_path)) <= 104
+        finally:
+            d.shutdown()
+
+    def test_surrogate_tmpdir_within_budget_stays(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Two-direction pin for the byte measurement: a
+        surrogate-escaped root that FITS the budget is used as-is —
+        no needless /tmp diversion — and the socket still binds."""
+        import os
+        import shutil
+        import tempfile as _tempfile
+
+        from core.llm.dispatcher.auth import CredentialStore
+        from core.llm.dispatcher.server import LLMDispatcher
+
+        creds = CredentialStore.__new__(CredentialStore)
+        creds._keys = {}
+
+        # Anchor at /tmp (not tmp_path) to keep the fsencoded socket
+        # path safely under the budget on deep-scratch hosts.
+        host = _tempfile.mkdtemp(prefix="rl-srg-", dir="/tmp")
+        try:
+            bad = os.fsencode(host) + b"/s\xff"
+            os.mkdir(bad)
+            bad_str = os.fsdecode(bad)
+            assert "\udcff" in bad_str
+            monkeypatch.setenv("TMPDIR", bad_str)
+            monkeypatch.setattr(_tempfile, "tempdir", None)
+
+            d = LLMDispatcher(
+                run_id="srg",
+                creds=creds,
+                audit_path=tmp_path / "audit.jsonl",
+            )
+            try:
+                assert d.socket_path.exists()
+                assert str(d._sock_dir).startswith(bad_str)
+            finally:
+                d.shutdown()
+        finally:
+            shutil.rmtree(host, ignore_errors=True)

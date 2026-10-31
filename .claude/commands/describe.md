@@ -1,5 +1,5 @@
 ---
-description: Describe a target — language mix, build system, catalog match, target-specific tool gaps, cost estimate. Read-only; no commands executed.
+description: Describe a target — language mix, build system, catalog match, target-specific tool gaps, cost estimate. Read-only against the target; no target code executed (host tool version probes and hardened git metadata reads only).
 dispatch: libexec/raptor-describe --target <path>
 ---
 

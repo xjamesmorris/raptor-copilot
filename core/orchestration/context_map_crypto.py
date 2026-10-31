@@ -30,6 +30,8 @@ from pathlib import Path
 from typing import Any
 
 from core.json import load_json
+from core.paths import confine
+from core.source.lines import split_lines
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +58,17 @@ _C_SUFFIXES = (".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hxx")
 
 _MAX_FILES = 2000
 _MAX_FILE_BYTES = 2_000_000
+# Site caps: _MAX_FILES/_MAX_FILE_BYTES bound the SCAN, not the
+# EMISSION — without these, one dense-match in-root file (200k
+# `rand()` calls fits under the 2MB file cap) mints one dict per
+# regex hit, and the 2000-file cap extrapolates to ~4e8 dicts from
+# scanned-repo (untrusted) content. Sized generously above real
+# crypto-heavy trees (openssl-scale files yield tens of sites per
+# file, hundreds per tree): raising them buys nothing but memory
+# exposure; lowering them risks dropping legitimate inventory on
+# dense crypto libraries. Loud log on hit either way.
+_MAX_SITES = 5000
+_MAX_FILE_SITES = 500
 
 
 def _load_packs() -> list[dict[str, Any]]:
@@ -183,7 +196,18 @@ def enrich_with_crypto_inventory(
                 "remaining files skipped", _MAX_FILES,
             )
             break
-        full = root / fp
+        # Checklist entry paths are external input (the run-dir
+        # checklist is CC-child-writable): containment before any
+        # stat/read, like every sibling enricher — a `../` or
+        # absolute path must not point the unsandboxed parent at
+        # host files outside the target.
+        full = confine(root, fp)
+        if full is None:
+            logger.debug(
+                "crypto inventory bootstrap: checklist path escapes "
+                "the target root — skipped",
+            )
+            continue
         try:
             if not full.is_file() or full.stat().st_size > _MAX_FILE_BYTES:
                 continue
@@ -192,16 +216,41 @@ def enrich_with_crypto_inventory(
             continue
         scanned += 1
         spans = spans_by_file.get(fp)
-        for lineno, line in enumerate(text.splitlines(), start=1):
+        file_sites = 0
+        capped = False
+        for lineno, line in enumerate(split_lines(text), start=1):
+            if capped or file_sites >= _MAX_FILE_SITES:
+                break
             for api, kind, pattern in matchers:
-                sites.extend({
+                for m in pattern.finditer(line):
+                    sites.append({
                         "kind": kind,
                         "file": fp,
                         "line": lineno,
                         "function": _enclosing(spans, lineno),
                         "api": api,
                         "fn": m.group(1),
-                    } for m in pattern.finditer(line))
+                    })
+                    file_sites += 1
+                    if len(sites) >= _MAX_SITES:
+                        capped = True
+                        break
+                    if file_sites >= _MAX_FILE_SITES:
+                        break
+                if capped or file_sites >= _MAX_FILE_SITES:
+                    break
+        if file_sites >= _MAX_FILE_SITES and not capped:
+            logger.warning(
+                "crypto inventory bootstrap: per-file site cap (%d) "
+                "reached in %s — rest of file skipped",
+                _MAX_FILE_SITES, fp,
+            )
+        if capped:
+            logger.warning(
+                "crypto inventory bootstrap: total site cap (%d) "
+                "reached — remaining files skipped", _MAX_SITES,
+            )
+            break
 
     if sites:
         context_map["crypto_inventory"] = sites

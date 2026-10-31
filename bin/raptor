@@ -1,9 +1,47 @@
 #!/usr/bin/env bash
 #
-# raptor - launch RAPTOR via Claude Code
+# raptor - launch RAPTOR via an explicitly selected interactive frontend
 #
 # Install: add this directory to PATH, or symlink to a directory already on PATH.
 #
+
+# ── Exported-function pre-sweep (the FIRST executable block: nothing
+# above may run a command — `set -euo pipefail` itself comes AFTER,
+# because `set` is a function-shadowable builtin too) ───────────────
+# bash imports BASH_FUNC_<name>%% env entries as functions at
+# startup, and function lookup precedes EVERY builtin — so a hostile
+# parent env can shadow any name the pre-strip window calls
+# (set, dirname, readlink, cd, pwd, [, echo — and `command` itself,
+# so `command -p` pinning alone is not protection). The dangerous-env
+# strip fragment cannot be sourced yet (RAPTOR_DIR is unresolved),
+# so the sweep half of its idiom runs inline here first, built only
+# on primitives an exported function cannot shadow: assignment and
+# expansion are SYNTAX, and once POSIXLY_CORRECT=1 is assigned,
+# POSIX command search finds special builtins (unset is one) BEFORE
+# functions. Clear the shadows on the two regular builtins the sweep
+# needs, then drop every EXPORTED function outright — in a fresh
+# launcher they can only have arrived via env import, and unset -f
+# removes both the function and its export. Runs without -e (set
+# comes after); every fallible line is || :-guarded regardless. The
+# fragment repeats this sweep idempotently after RAPTOR_DIR
+# resolution and owns the canonical copy of the idiom.
+_raptor_presweep_posix=${POSIXLY_CORRECT+set}
+POSIXLY_CORRECT=1
+unset -f unset declare read 2>/dev/null || :
+while read -r _raptor_pd _raptor_pf _raptor_pn; do
+    case $_raptor_pd:$_raptor_pf in
+        declare:*x*) unset -f "$_raptor_pn" 2>/dev/null || : ;;
+    esac
+done <<RAPTOR_PRESWEEP
+$(declare -F)
+RAPTOR_PRESWEEP
+unset _raptor_pd _raptor_pf _raptor_pn 2>/dev/null || :
+# Function table is clean now — plain builtins are trustworthy again.
+if [ "$_raptor_presweep_posix" != set ]; then
+    unset POSIXLY_CORRECT
+fi
+unset _raptor_presweep_posix 2>/dev/null || :
+
 
 set -euo pipefail
 
@@ -26,7 +64,13 @@ if [ -z "${RAPTOR_NO_LAUNCHER_HARDENING:-}" ]; then
             *)   _entry="$_rest"; _last=1 ;;
         esac
         _drop_reason=""
-        _shown="$_entry"
+        # PATH entries are attacker-influenceable by this script's own
+        # threat model (a hostile direnv/.envrc poisons PATH) — strip
+        # non-printables and bound length (builtins only, like the
+        # session-entry _fsince lane) before any echo below renders
+        # the very entry we classified hostile.
+        _shown="${_entry//[![:print:]]/}"
+        _shown="${_shown:0:200}"
         if [ -z "$_entry" ]; then
             _drop_reason="empty entry (resolves as cwd)"
             _shown="(empty)"
@@ -62,7 +106,12 @@ else
     _rp() { command "$@"; }
 fi
 
-# Resolve symlinks to find the real script location
+# Resolve symlinks to find the real script location.
+# Every cd inside a substitution here runs with `CDPATH= cd --`: a
+# CDPATH entry in the operator's env (the hostile-direnv threat
+# model; the env strip does not cover it) would both REDIRECT a
+# relative operand to the CDPATH base and print the resolved dir
+# into the substitution — a wrong, newline-doubled path.
 SCRIPT="$0"
 _symhops=0
 while [ -L "$SCRIPT" ]; do
@@ -71,12 +120,12 @@ while [ -L "$SCRIPT" ]; do
         echo "raptor: symlink hop limit exceeded resolving $0" >&2
         exit 1
     fi
-    DIR="$(cd "$(command -p dirname "$SCRIPT")" && pwd)"
+    DIR="$(CDPATH= cd -- "$(command -p dirname "$SCRIPT")" && pwd)"
     SCRIPT="$(command -p readlink "$SCRIPT")"
     [[ "$SCRIPT" != /* ]] && SCRIPT="$DIR/$SCRIPT"
 done
 unset _symhops
-RAPTOR_DIR="$(cd "$(_rp dirname "$SCRIPT")/.." && pwd)"
+RAPTOR_DIR="$(CDPATH= cd -- "$(_rp dirname "$SCRIPT")/.." && pwd)"
 
 if [ ! -d "$RAPTOR_DIR/core" ]; then
     echo "raptor: cannot find RAPTOR installation at $RAPTOR_DIR" >&2
@@ -102,9 +151,25 @@ if [ -z "${RAPTOR_NO_LAUNCHER_HARDENING:-}" ]; then
     # sticky — sticky doesn't stop planting a NEW binary). Skip
     # nonexistent dirs silently. RAPTOR_ALLOW_UNSAFE_PATH=1 keeps
     # flagged entries, with a warning each.
+    #
+    # WSL aggregation (message shape only — the drop decision is
+    # identical): Windows interop appends every Windows PATH dir as
+    # /mnt/<drive>/... entries, world-writable under the default
+    # drvfs automount, so a stock WSL launch would print one drop
+    # line per Windows dir. Multiple such drops on a WSL kernel
+    # collapse into one summary line after the loop; a single drop
+    # keeps its per-entry line. RAPTOR_TEST_PROC_VERSION and
+    # RAPTOR_TEST_INTEROP_ROOT point the kernel-identity read and the
+    # interop-mount prefix at fixtures (tests only — either can only
+    # trade per-entry lines for the summary, never keep an entry).
     _scrubbed=""
     _rest="${PATH:-}"
     _last=""
+    _wsl_drops=0
+    _wsl_first_line=""
+    _wsl_host=""
+    _wsl_checked=""
+    _interop_root="${RAPTOR_TEST_INTEROP_ROOT:-/mnt}"
     while [ -z "$_last" ]; do
         case "$_rest" in
             *:*) _entry="${_rest%%:*}"; _rest="${_rest#*:}" ;;
@@ -134,43 +199,47 @@ if [ -z "${RAPTOR_NO_LAUNCHER_HARDENING:-}" ]; then
             fi
         fi
         if [ -n "$_drop_reason" ]; then
+            # Same strip-before-echo as the pre-pass: never render the
+            # entry we just classified hostile with its raw bytes.
+            _shown="${_entry//[![:print:]]/}"
+            _shown="${_shown:0:200}"
             if [ -n "${RAPTOR_ALLOW_UNSAFE_PATH:-}" ]; then
-                echo "raptor: WARNING: keeping unsafe PATH entry ($_drop_reason; RAPTOR_ALLOW_UNSAFE_PATH set): $_entry" >&2
+                echo "raptor: WARNING: keeping unsafe PATH entry ($_drop_reason; RAPTOR_ALLOW_UNSAFE_PATH set): $_shown" >&2
                 _scrubbed="$_scrubbed$_entry:"
             else
-                echo "raptor: dropped unsafe PATH entry ($_drop_reason): $_entry" >&2
+                case "$_entry" in
+                    "$_interop_root"/*)
+                        # Windows-interop candidate — check the kernel
+                        # identity once, lazily (non-WSL hosts with no
+                        # interop-root PATH entries never run grep here).
+                        if [ -z "$_wsl_checked" ]; then
+                            _wsl_checked=1
+                            if _rp grep -qi microsoft "${RAPTOR_TEST_PROC_VERSION:-/proc/version}" 2>/dev/null; then
+                                _wsl_host=1
+                            fi
+                        fi
+                        ;;
+                esac
+                if [ -n "$_wsl_host" ] && [ "${_entry#"$_interop_root"/}" != "$_entry" ]; then
+                    _wsl_drops=$((_wsl_drops + 1))
+                    _wsl_first_line="raptor: dropped unsafe PATH entry ($_drop_reason): $_shown"
+                else
+                    echo "raptor: dropped unsafe PATH entry ($_drop_reason): $_shown" >&2
+                fi
             fi
         else
             _scrubbed="$_scrubbed$_entry:"
         fi
     done
+    if [ "$_wsl_drops" -eq 1 ]; then
+        echo "$_wsl_first_line" >&2
+    elif [ "$_wsl_drops" -gt 1 ]; then
+        echo "raptor: $_wsl_drops Windows-interop PATH entries dropped (world-writable under default drvfs automount); RAPTOR_ALLOW_UNSAFE_PATH=1 keeps them" >&2
+    fi
     PATH="${_scrubbed%:}"
     export PATH
-    unset _scrubbed _rest _last _entry _drop_reason _perm
-
-    # Warn (don't drop) when claude resolves under a world-writable
-    # ANCESTOR — the per-entry check above can't see parents.
-    _claude_path="$(command -v claude 2>/dev/null || true)"
-    if [ -n "$_claude_path" ]; then
-        _dir="$(_rp dirname "$_claude_path")"
-        _hops=0
-        while [ -n "$_dir" ] && [ "$_dir" != "/" ] && [ "$_hops" -lt 64 ]; do
-            _perm="$(_rp stat -Lc '%a' "$_dir" 2>/dev/null \
-                     || _rp stat -Lf '%Lp' "$_dir" 2>/dev/null \
-                     || echo '')"
-            if [ -n "$_perm" ] && [ "$(( 0$_perm & 2 ))" -ne 0 ]; then
-                echo "raptor: WARNING: claude resolves under a world-writable tree: $_claude_path (writable ancestor: $_dir)" >&2
-                break
-            fi
-            # Parameter expansion, not dirname(1) — no external
-            # command per hop.
-            _dir="${_dir%/*}"
-            [ -n "$_dir" ] || _dir="/"
-            _hops=$((_hops + 1))
-        done
-        unset _dir _hops _perm
-    fi
-    unset _claude_path
+    unset _scrubbed _rest _last _entry _shown _drop_reason _perm
+    unset _wsl_drops _wsl_first_line _wsl_host _wsl_checked _interop_root
 
     # Per-session TMPDIR: <base>/raptor-<uid>/session-<pid>-<rand>
     # (0700; <base> = RAPTOR_WORK_DIR, else operator TMPDIR, else
@@ -199,18 +268,47 @@ if [ -z "${RAPTOR_NO_LAUNCHER_HARDENING:-}" ]; then
                     # Depth bound: refuse suspiciously deep trees
                     # (planted junk). find is -P: no symlink follow.
                     if [ -n "$(_rp find "$_d" -mindepth 24 -print -quit 2>/dev/null)" ]; then
-                        echo "raptor: skipping suspiciously deep stale session dir: $_d" >&2
+                        # $_d inherits the RAPTOR_WORK_DIR/TMPDIR-derived
+                        # base prefix (attacker-influenceable env, same
+                        # class as PATH) — strip before echoing.
+                        _shown_d="${_d//[![:print:]]/}"
+                        echo "raptor: skipping suspiciously deep stale session dir: ${_shown_d:0:200}" >&2
+                        unset _shown_d
                         continue
                     fi
-                    _rp rm -rf -- "$_d"
+                    # A failed removal (root-owned or immutable
+                    # leftovers from container/sandbox tool runs)
+                    # must not abort the launch — and would otherwise
+                    # re-abort EVERY launch until cleaned by hand.
+                    # rm's own stderr is nulled: it echoes raw
+                    # scratch-content filenames (tool/target-derived
+                    # bytes); the bounded, stripped path below is the
+                    # operator-facing report.
+                    if ! _rp rm -rf -- "$_d" 2>/dev/null; then
+                        _shown_d="${_d//[![:print:]]/}"
+                        echo "raptor: could not fully remove stale session dir (clean up manually): ${_shown_d:0:200}" >&2
+                        unset _shown_d
+                    fi
                 fi
             fi
         done
         unset _d _name _spid
-        # Advisory only — live sessions' scratch counts too.
-        _kb="$(_rp du -sk "$_tmp_base" 2>/dev/null | _rp cut -f1)"
+        # Advisory only — live sessions' scratch counts too. The
+        # measurement must never abort the launch: du exits nonzero
+        # when an entry vanishes mid-walk (live sibling sessions churn
+        # scratch here) or is unreadable, and under set -e/pipefail
+        # that status would kill the launcher with stderr already
+        # nulled. du still prints the total it summed, so keep it.
+        _kb="$(_rp du -sk "$_tmp_base" 2>/dev/null | _rp cut -f1)" || true
+        # Single-bracket `[` on purpose: `[[ ]]` arithmetic-evaluates
+        # its -gt operands, and _kb derives from du output over an
+        # attacker-influenceable base path. `[` treats a non-numeric
+        # _kb as an error (status 2, nulled, condition false) instead
+        # of evaluating it. Do not rewrite to `[[ ]]`.
         if [ -n "$_kb" ] && [ "$_kb" -gt 5242880 ] 2>/dev/null; then
-            echo "raptor: note: $_tmp_base holds >5G of session scratch — stale dirs sweep on each launch; live ones may need manual cleanup" >&2
+            _shown_tb="${_tmp_base//[![:print:]]/}"
+            echo "raptor: note: ${_shown_tb:0:200} holds >5G of session scratch — stale dirs sweep on each launch; live ones may need manual cleanup" >&2
+            unset _shown_tb
         fi
         unset _kb
         # $$ survives the exec, so the name tracks the session.
@@ -225,7 +323,11 @@ if [ -z "${RAPTOR_NO_LAUNCHER_HARDENING:-}" ]; then
         done
         unset _try _sess
     else
-        echo "raptor: warning: $_tmp_base is not a directory owned by this user — session TMPDIR disabled for this launch" >&2
+        # RAPTOR_WORK_DIR/TMPDIR are attacker-influenceable env (the
+        # PATH-scrub threat model) — strip before echoing.
+        _shown_tb="${_tmp_base//[![:print:]]/}"
+        echo "raptor: warning: ${_shown_tb:0:200} is not a directory owned by this user — session TMPDIR disabled for this launch" >&2
+        unset _shown_tb
     fi
     unset _tmp_base
 fi
@@ -284,8 +386,18 @@ Arguments:
 
 Options:
   -c, --continue     Resume last RAPTOR session
-  -m, --model MODEL  Choose model (opus, sonnet, haiku)
+  -r, --resume ID    Resume an exact Copilot session (not with --continue)
+  --frontend HOST    Interactive frontend: claude (default) or copilot
+                     (Copilot requires a native Linux executable)
+  -m, --model MODEL  Choose the frontend model
+  --max-findings N   Start agentic scan with an analysis cap of N
+                     (0 = no cap; new sessions only)
+  --max-cost-usd USD Start agentic scan with a positive LLM cost cap
+                     (inf uses tuning default or no cap; new sessions only)
+  --max-ai-credits N Copilot session limit (installed CLI minimum: 30)
   -p, --project NAME Set the active project
+  --yolo             Copilot all-permissions opt-in; passed through unchanged
+                     (never enabled by RAPTOR or stored as project trust)
   -v, --verbose      Verbose output
   --trust-repo       Trust target repo's config (skip safety checks)
   -h, --help         Show this help
@@ -303,17 +415,40 @@ Projects:
   raptor project none                  Clear the active project
   raptor project help                  Full subcommand list
 
-Any additional flags are passed through to Claude Code.
+Any additional flags are passed through to the selected supported frontend.
 USAGE
     exit 0
 fi
 
-# Route project subcommands directly (no Claude needed). Export the
+# Export static env vars. RAPTOR_CALLER_DIR = operator's PWD at
+# launch (resolves targets/projects downstream — the direct routes
+# below cd into RAPTOR_DIR, so a relative operator path is dead
+# without it). Reject control bytes so a crafted pwd can't smuggle
+# line-injection payloads.
+# [[:cntrl:]] under the C locale is exactly the C0 range + DEL; the
+# subshell scopes the locale pin so the operator's LC_* survive. (A
+# literal $'\x00...' byte list is not usable here: bash strings
+# cannot hold NUL, which silently empties the bracket expression.
+# NUL itself needs no pattern entry for the same reason - $(pwd)
+# can never carry one into the variable.)
+_caller_dir="$(pwd)"
+if ! (LC_ALL=C; case "$_caller_dir" in (*[[:cntrl:]]*) false;; esac); then
+    echo "raptor: RAPTOR_CALLER_DIR contains control bytes - refusing" >&2
+    echo "  (\$PWD has chars in the C0 control range; this is suspicious - bailing safely)" >&2
+    exit 1
+fi
+export RAPTOR_CALLER_DIR="$_caller_dir"
+unset _caller_dir
+
+# Route project subcommands directly (no interactive frontend needed). Export the
 # trust marker + RAPTOR_DIR like the doctor/frida routes do — pre-fix
 # this route exported NOTHING, so every bare-shell `raptor project
 # <sub>` tripped the libexec trust preamble and exited 2 (the
 # bare-shell /project UX was unreachable through its documented entry
-# point).
+# point). RAPTOR_CALLER_DIR (exported above) lets the project CLI
+# resolve a relative --target/--binary against the operator's shell
+# cwd — the cd below otherwise silently persisted repo-relative
+# paths (e.g. `--target ./code` became <raptor>/code).
 if [[ "${1:-}" == "project" ]]; then
     shift
     cd "$RAPTOR_DIR" || exit 1
@@ -355,42 +490,170 @@ if [[ "${1:-}" == "sage-setup" ]]; then
     exec "$RAPTOR_DIR/libexec/raptor-sage-setup" "$@"
 fi
 
-# Claude required for everything else
-if ! command -v claude >/dev/null 2>&1; then
-    echo "raptor: claude not found. Install Claude Code:" >&2
-    echo "  https://docs.anthropic.com/en/docs/claude-code/overview" >&2
-    exit 1
+# Route wsl-consent directly (no Claude needed) - the WSL host-consent
+# ceremony is TTY-gated and must run at the operator's own terminal
+# (the grant hard-refuses a non-TTY stdin); resolving it must not
+# launch a Claude session.
+if [[ "${1:-}" == "wsl-consent" ]]; then
+    shift
+    export RAPTOR_DIR
+    export _RAPTOR_TRUSTED=1
+    exec "$RAPTOR_DIR/libexec/raptor-wsl-consent" "$@"
 fi
 
-# Export static env vars. RAPTOR_CALLER_DIR = operator's PWD at
-# launch (resolves targets/projects downstream). Reject control
-# bytes so a crafted pwd can't smuggle line-injection payloads.
-# [[:cntrl:]] under the C locale is exactly the C0 range + DEL; the
-# subshell scopes the locale pin so the operator's LC_* survive. (A
-# literal $'\x00...' byte list is not usable here: bash strings
-# cannot hold NUL, which silently empties the bracket expression.
-# NUL itself needs no pattern entry for the same reason - $(pwd)
-# can never carry one into the variable.)
-_caller_dir="$(pwd)"
-if ! (LC_ALL=C; case "$_caller_dir" in (*[[:cntrl:]]*) false;; esac); then
-    echo "raptor: RAPTOR_CALLER_DIR contains control bytes - refusing" >&2
-    echo "  (\$PWD has chars in the C0 control range; this is suspicious - bailing safely)" >&2
-    exit 1
+# Route review directly (no Claude needed) - the review CLI is the
+# operator's query/verdict surface, and its fp --ceremony typed
+# consent is TTY-gated on every standard fd and must run at the
+# operator's own terminal (like wsl-consent); resolving it must not
+# launch a Claude session.
+if [[ "${1:-}" == "review" ]]; then
+    shift
+    export RAPTOR_DIR
+    export _RAPTOR_TRUSTED=1
+    exec "$RAPTOR_DIR/libexec/raptor-review" "$@"
 fi
-export RAPTOR_CALLER_DIR="$_caller_dir"
-unset _caller_dir
+
+# Analysis commands run on local models / deterministic tools and need
+# no Claude login. Dispatch them to the direct Python path when EITHER:
+#   - the operator forces it with RAPTOR_NO_CLAUDE=1 (local-only box —
+#     claude may be installed but unauthenticated, which otherwise drops
+#     into the interactive login prompt), OR
+#   - claude is simply absent.
+# When claude is present AND RAPTOR_NO_CLAUDE is unset, behaviour is
+# unchanged: the main path below launches the Claude Code session
+# (prefer-claude). Command list is a curated subset of raptor.py's
+# mode_handlers — omits describe/doctor/frida (need LLM credentials
+# or are utility-only).
+_raptor_local_route() {
+    # $1 is the subcommand. execs on match; returns 1 (no match) otherwise.
+    case "${1:-}" in
+        agentic|scan|codeql|analyze|fuzz|web|sca|binary|openant)
+            _cmd="$1"; shift
+            # No cd: a relative --repo/--target/--binary/--url must resolve
+            # against the operator's shell cwd (RAPTOR_CALLER_DIR exported
+            # above). Export the markers so the whole process tree — and the
+            # lifecycle/SCA sub-steps — are trusted.
+            export RAPTOR_DIR
+            export _RAPTOR_TRUSTED=1
+            exec python3 "$RAPTOR_DIR/raptor.py" "$_cmd" "$@"
+            ;;
+    esac
+    return 1
+}
+
 export RAPTOR_DIR
 # Trust marker - libexec scripts refuse to run without one of
 # CLAUDECODE or _RAPTOR_TRUSTED. We've just stripped the env, so
 # direct invocation through this launcher is the safe path.
 export _RAPTOR_TRUSTED=1
 
-# Parse RAPTOR-specific args, collect Claude args
+# Strip the frontend selector before applying the legacy local-route
+# fallback. This keeps local-capable commands working when Claude is
+# unavailable while ensuring an explicit Copilot selection reaches frontend
+# preparation instead of being mistaken for a Claude launch.
+FRONTEND="claude"
+_route_args=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --frontend)
+            [[ $# -ge 2 ]] || {
+                echo "raptor: $1 requires a value" >&2
+                exit 1
+            }
+            FRONTEND="$2"
+            shift 2
+            ;;
+        --frontend=*)
+            FRONTEND="${1#--frontend=}"
+            if [ -z "$FRONTEND" ]; then
+                echo "raptor: --frontend= requires a value" >&2
+                exit 1
+            fi
+            shift
+            ;;
+        *)
+            _route_args+=("$1")
+            shift
+            ;;
+    esac
+done
+set -- "${_route_args[@]}"
+unset _route_args
+
+if [[ "$FRONTEND" == "claude" && -n "${RAPTOR_NO_CLAUDE:-}" ]]; then
+    # `|| true`: _raptor_local_route execs on a match (never returns); a
+    # non-match returns 1, which under `set -e` would abort before the
+    # guidance below — tolerate it so the error message prints.
+    _raptor_local_route "$@" || true
+    # RAPTOR_NO_CLAUDE set but the subcommand isn't local-capable (or is
+    # the bare interactive session, which has no local equivalent).
+    echo "raptor: RAPTOR_NO_CLAUDE is set but '${1:-<none>}' needs the" >&2
+    echo "  Claude Code session. Unset RAPTOR_NO_CLAUDE, or use a local" >&2
+    echo "  analysis command (agentic/scan/codeql/analyze/fuzz/web/sca/binary/openant)." >&2
+    exit 1
+fi
+
+# Preserve the login-free local fallback for the default/Claude frontend.
+# Other frontend selections are resolved by core.startup.host below.
+if [[ "$FRONTEND" == "claude" ]]; then
+    if ! command -v claude >/dev/null 2>&1; then
+        _raptor_local_route "$@" || true
+    fi
+fi
+
+# Parse RAPTOR-specific args, collect frontend args. Selection is an
+# operator argument only — no RAPTOR_HOST/COPILOT_* environment value
+# participates in host authority.
+if [[ -n "${RAPTOR_SESSION_SERVICE_POLICY:-}"
+        || "${RAPTOR_FRONTEND:-}" == "copilot"
+        || -n "${COPILOT_CLI:-}"
+        || -n "${COPILOT_AGENT_SESSION_ID:-}" ]]; then
+    echo "raptor: Copilot session service policy refuses a nested frontend/harness." >&2
+    echo "  Use the already-running Copilot session; another CLI process cannot prove the same account." >&2
+    exit 1
+fi
 STARTUP_ARGS=("--caller-dir" "$RAPTOR_CALLER_DIR")
-CLAUDE_ARGS=("-n" "RAPTOR")
+FRONTEND_ARGS=()
+FRONTEND_MODEL=""
+CONTINUE_SESSION=0
+COPILOT_SESSION_MODE=""
+_COPILOT_MIN_AI_CREDITS=30
+_validate_copilot_ai_credits() {
+    local value="$1"
+    local whole
+
+    # Preserve native parsing for spellings the CLI may support now or later.
+    # The launcher owns only the installed CLI's documented decimal floor.
+    if [[ "$value" =~ ^([0-9]+)([.][0-9]+)?$ ]]; then
+        whole="${BASH_REMATCH[1]}"
+        while [[ ${#whole} -gt 1 && "$whole" == 0* ]]; do
+            whole="${whole#0}"
+        done
+        if (( ${#whole} < 2 )) \
+                || (( ${#whole} == 2
+                    && 10#$whole < _COPILOT_MIN_AI_CREDITS )); then
+            echo "raptor: Copilot --max-ai-credits requires at least ${_COPILOT_MIN_AI_CREDITS}; smaller limits are unsupported by the installed CLI" >&2
+            return 1
+        fi
+    fi
+}
+_validate_max_cost_usd() {
+    local value="$1"
+    [[ "$value" =~ ^(inf|([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?)$ ]] || return 1
+    python3 -c 'import math, sys; n = float(sys.argv[1]); sys.exit(not (n > 0 and (math.isfinite(n) or sys.argv[1] == "inf")))' "$value"
+}
+if [[ "$FRONTEND" == "copilot" ]]; then
+    # Pin the executable whose device/inode was captured in the strong host
+    # claim instead of allowing an auto-update handoff during launch.
+    FRONTEND_ARGS+=("--no-auto-update")
+else
+    FRONTEND_ARGS+=("-n" "RAPTOR")
+fi
 INITIAL_PROMPT="/raptor"
 TARGET=""
 TRUST_REPO_ARG=""
+MAX_FINDINGS=""
+MAX_COST_USD=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -p|--project)
@@ -411,17 +674,199 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -c|--continue)
-            CLAUDE_ARGS+=("--continue")
+            if [[ "$FRONTEND" == "copilot"
+                    && "$COPILOT_SESSION_MODE" == "resume" ]]; then
+                echo "raptor: --continue cannot be used with --resume" >&2
+                exit 1
+            fi
+            FRONTEND_ARGS+=("--continue")
+            CONTINUE_SESSION=1
+            if [[ "$FRONTEND" == "copilot" ]]; then
+                COPILOT_SESSION_MODE="continue"
+            fi
             INITIAL_PROMPT=""
+            shift
+            ;;
+        -r|--resume)
+            if [[ "$FRONTEND" != "copilot" ]]; then
+                # Preserve Claude's existing native passthrough semantics.
+                FRONTEND_ARGS+=("$1")
+                shift
+                continue
+            fi
+            [[ $# -ge 2 ]] || {
+                echo "raptor: $1 requires a session id or name" >&2
+                exit 1
+            }
+            _resume_value="$2"
+            if [[ -z "$_resume_value" || "$_resume_value" == -* ]]; then
+                echo "raptor: $1 requires a value before the next option" >&2
+                exit 1
+            fi
+            if (LC_ALL=C; [[ "$_resume_value" == *[[:cntrl:]]* ]]); then
+                echo "raptor: $1 value contains control bytes" >&2
+                exit 1
+            fi
+            if [[ -n "$COPILOT_SESSION_MODE" ]]; then
+                if [[ "$COPILOT_SESSION_MODE" == "continue" ]]; then
+                    echo "raptor: --resume cannot be used with --continue" >&2
+                else
+                    echo "raptor: --resume may be specified only once" >&2
+                fi
+                exit 1
+            fi
+            # Copilot's exact-session CLI surface is --session-id. Keep
+            # --resume distinct from --session-id=<new UUID>, which creates
+            # and names a new session with the initial RAPTOR prompt.
+            FRONTEND_ARGS+=("--session-id=$_resume_value")
+            COPILOT_SESSION_MODE="resume"
+            CONTINUE_SESSION=1
+            INITIAL_PROMPT=""
+            unset _resume_value
+            shift 2
+            ;;
+        --resume=*)
+            if [[ "$FRONTEND" != "copilot" ]]; then
+                FRONTEND_ARGS+=("$1")
+                shift
+                continue
+            fi
+            _resume_value="${1#--resume=}"
+            if [[ -z "$_resume_value" ]]; then
+                echo "raptor: --resume= requires a session id or name" >&2
+                exit 1
+            fi
+            if (LC_ALL=C; [[ "$_resume_value" == *[[:cntrl:]]* ]]); then
+                echo "raptor: --resume= value contains control bytes" >&2
+                exit 1
+            fi
+            if [[ -n "$COPILOT_SESSION_MODE" ]]; then
+                if [[ "$COPILOT_SESSION_MODE" == "continue" ]]; then
+                    echo "raptor: --resume cannot be used with --continue" >&2
+                else
+                    echo "raptor: --resume may be specified only once" >&2
+                fi
+                exit 1
+            fi
+            FRONTEND_ARGS+=("--session-id=$_resume_value")
+            COPILOT_SESSION_MODE="resume"
+            CONTINUE_SESSION=1
+            INITIAL_PROMPT=""
+            unset _resume_value
             shift
             ;;
         -m|--model)
             [[ $# -ge 2 ]] || { echo "raptor: $1 requires a value" >&2; exit 1; }
-            CLAUDE_ARGS+=("--model" "$2")
+            # Copilot model ids are intentionally opaque here: the native
+            # CLI/service owns catalog admission, including valid models not
+            # present in its offline help catalog. Reject only the ambiguous
+            # empty spelling; never substitute or resolve the id in RAPTOR.
+            if [[ "$FRONTEND" == "copilot" && -z "$2" ]]; then
+                echo "raptor: $1 requires a non-empty value" >&2
+                exit 1
+            fi
+            if [[ "$FRONTEND" == "copilot" && "$2" == -* ]]; then
+                echo "raptor: $1 requires a value before the next option" >&2
+                exit 1
+            fi
+            FRONTEND_ARGS+=("--model" "$2")
+            FRONTEND_MODEL="$2"
             shift 2
             ;;
+        --model=*)
+            if [[ "$FRONTEND" == "copilot" ]]; then
+                _model_value="${1#--model=}"
+                if [ -z "$_model_value" ]; then
+                    echo "raptor: --model= requires a non-empty value" >&2
+                    exit 1
+                fi
+                # Preserve the operator's exact frontend argument while
+                # keeping RAPTOR's startup label aligned with it.
+                FRONTEND_MODEL="$_model_value"
+                unset _model_value
+            fi
+            FRONTEND_ARGS+=("$1")
+            shift
+            ;;
+        --max-findings|--max-findings=*)
+            if [[ "$1" == --max-findings=* ]]; then
+                _findings_value="${1#--max-findings=}"
+                shift
+            else
+                [[ $# -ge 2 ]] || {
+                    echo "raptor: --max-findings requires a non-negative integer" >&2
+                    exit 1
+                }
+                _findings_value="$2"
+                shift 2
+            fi
+            if [[ ! "$_findings_value" =~ ^[0-9]+$ ]]; then
+                echo "raptor: --max-findings requires a non-negative integer" >&2
+                exit 1
+            fi
+            MAX_FINDINGS="$_findings_value"
+            unset _findings_value
+            ;;
+        --max-cost-usd|--max-cost-usd=*)
+            if [[ "$1" == --max-cost-usd=* ]]; then
+                _cost_value="${1#--max-cost-usd=}"
+                shift
+            else
+                [[ $# -ge 2 ]] || {
+                    echo "raptor: --max-cost-usd requires a positive USD amount or inf" >&2
+                    exit 1
+                }
+                _cost_value="$2"
+                shift 2
+            fi
+            if ! _validate_max_cost_usd "$_cost_value"; then
+                echo "raptor: --max-cost-usd requires a positive USD amount or inf" >&2
+                exit 1
+            fi
+            MAX_COST_USD="$_cost_value"
+            unset _cost_value
+            ;;
+        --max-ai-credits)
+            if [[ "$FRONTEND" == "copilot" ]]; then
+                [[ $# -ge 2 ]] || {
+                    echo "raptor: --max-ai-credits requires a value" >&2
+                    exit 1
+                }
+                if [[ -z "$2" || "$2" == -* ]]; then
+                    echo "raptor: --max-ai-credits requires a value before the next option" >&2
+                    exit 1
+                fi
+                if ! _validate_copilot_ai_credits "$2"; then
+                    exit 1
+                fi
+                FRONTEND_ARGS+=("$1" "$2")
+                shift 2
+            else
+                FRONTEND_ARGS+=("$1")
+                shift
+            fi
+            ;;
+        --max-ai-credits=*)
+            if [[ "$FRONTEND" == "copilot" ]]; then
+                _credits_value="${1#--max-ai-credits=}"
+                if [[ -z "$_credits_value" ]]; then
+                    echo "raptor: --max-ai-credits= requires a non-empty value" >&2
+                    exit 1
+                fi
+                if ! _validate_copilot_ai_credits "$_credits_value"; then
+                    exit 1
+                fi
+                unset _credits_value
+            fi
+            FRONTEND_ARGS+=("$1")
+            shift
+            ;;
         -v|--verbose)
-            CLAUDE_ARGS+=("--verbose")
+            if [[ "$FRONTEND" == "copilot" ]]; then
+                FRONTEND_ARGS+=("--log-level" "debug")
+            else
+                FRONTEND_ARGS+=("--verbose")
+            fi
             shift
             ;;
         --trust-repo)
@@ -435,7 +880,7 @@ while [[ $# -gt 0 ]]; do
             exec "$0" -h
             ;;
         -*)
-            CLAUDE_ARGS+=("$1")
+            FRONTEND_ARGS+=("$1")
             shift
             ;;
         *)
@@ -445,12 +890,41 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+if [[ "$FRONTEND" == "copilot"
+        && "$COPILOT_SESSION_MODE" == "resume"
+        && -n "$TARGET" ]]; then
+    echo "raptor: --resume cannot be combined with a target" >&2
+    exit 1
+fi
+if [[ -n "$MAX_FINDINGS" && "$CONTINUE_SESSION" -eq 1 ]]; then
+    echo "raptor: --max-findings requires a new session (not --continue or --resume)" >&2
+    exit 1
+fi
+if [[ -n "$MAX_COST_USD" && "$CONTINUE_SESSION" -eq 1 ]]; then
+    echo "raptor: --max-cost-usd requires a new session (not --continue or --resume)" >&2
+    exit 1
+fi
+if [[ "$FRONTEND" == "copilot" && "$CONTINUE_SESSION" -eq 0 ]]; then
+    FRONTEND_ARGS+=("--name" "RAPTOR")
+fi
+unset CONTINUE_SESSION COPILOT_SESSION_MODE
+export RAPTOR_FRONTEND="$FRONTEND"
+if [[ "$FRONTEND" == "copilot" ]]; then
+    export RAPTOR_SESSION_SERVICE_POLICY="copilot-only"
+fi
+if [[ -n "$FRONTEND_MODEL" ]]; then
+    export RAPTOR_FRONTEND_MODEL="$FRONTEND_MODEL"
+else
+    unset RAPTOR_FRONTEND_MODEL
+fi
 
 # Build initial prompt: /raptor [target]. Strip control bytes from
 # the operator-supplied TARGET first - an embedded newline would
 # split the prompt and read as a second downstream instruction;
-# legitimate paths don't contain them.
-_target_clean=$(printf '%s' "$TARGET" | tr -d '\000-\010\012-\037')
+# legitimate paths don't contain them. Full C0 range plus DEL, the
+# same class the caller-dir gate below refuses via [[:cntrl:]] -
+# TAB and DEL are no more legitimate in a target path than ESC.
+_target_clean=$(printf '%s' "$TARGET" | tr -d '\000-\037\177')
 if [ "$_target_clean" != "$TARGET" ]; then
     echo "raptor: TARGET contained control bytes - stripped before use" >&2
 fi
@@ -465,11 +939,105 @@ fi
 # names the stripped path) falls back to resolving another.
 CHECK_TARGET=""
 if [ -n "$_target_clean" ] && [ -d "$_target_clean" ]; then
-    CHECK_TARGET="$(cd "$_target_clean" && pwd)"
+    # `-d` passes on a readable dir the user cannot traverse (no
+    # execute bit) and the dir can vanish between test and cd; either
+    # way the substitution's failure would abort under set -e with
+    # only cd's terse stderr. Refuse loudly instead — an unresolvable
+    # target cannot be vetted or scanned. Strip + bound the echoed
+    # path: TARGET is operator-supplied argv.
+    # `CDPATH= cd --`: an operator-env CDPATH would resolve a
+    # relative target through the CDPATH base instead of the shell
+    # cwd — the gate would vet a different directory than the
+    # session scans (and capture it newline-doubled: a CDPATH hit
+    # makes cd print the resolved dir into the substitution).
+    if ! CHECK_TARGET="$(CDPATH= cd -- "$_target_clean" 2>/dev/null && pwd)"; then
+        _shown_t="${_target_clean//[![:print:]]/}"
+        echo "raptor: cannot resolve target directory (permission denied, or removed mid-launch): ${_shown_t:0:200}" >&2
+        exit 1
+    fi
 elif [ -d "$RAPTOR_CALLER_DIR" ]; then
     CHECK_TARGET="$RAPTOR_CALLER_DIR"
 fi
+if [ -n "$MAX_FINDINGS" ] || [ -n "$MAX_COST_USD" ]; then
+    INITIAL_PROMPT="/agentic"
+    if [ -n "$MAX_FINDINGS" ]; then
+        INITIAL_PROMPT+=" --max-findings $MAX_FINDINGS"
+    fi
+    if [ -n "$MAX_COST_USD" ]; then
+        INITIAL_PROMPT+=" --max-cost-usd $MAX_COST_USD"
+    fi
+    if [ -n "$_target_clean" ]; then
+        if [ ! -d "$_target_clean" ]; then
+            if [ -n "$MAX_FINDINGS" ]; then
+                echo "raptor: --max-findings requires a repository directory target" >&2
+            else
+                echo "raptor: --max-cost-usd requires a repository directory target" >&2
+            fi
+            exit 1
+        fi
+        printf -v _repo_arg '%q' "$CHECK_TARGET"
+        INITIAL_PROMPT+=" --repo $_repo_arg"
+        unset _repo_arg
+    fi
+fi
 unset _target_clean
+
+# Resolve and gate the selected frontend only after the complete launcher
+# hardening and dangerous-environment strip, but before target trust checks,
+# project activation, or session-registry mutation. The helper reports
+# installed presence separately from launch support and admits Copilot only
+# when it can mint a direct native Linux process-identity claim.
+# RAPTOR_FRONTEND_GATE_BEGIN
+set +e
+_frontend_out="$(
+    cd "$RAPTOR_DIR" \
+        && python3 -m core.startup.host "$FRONTEND"
+)"
+_frontend_rc=$?
+set -e
+if [ "$_frontend_rc" -ne 0 ]; then
+    exit "$_frontend_rc"
+fi
+FRONTEND_EXECUTABLE=""
+_host_claim=""
+while IFS== read -r _key _value; do
+    case "$_key" in
+        launch_executable) FRONTEND_EXECUTABLE="$_value" ;;
+        host|host_*) printf -v _host_claim '%s%s=%s\n' \
+            "$_host_claim" "$_key" "$_value" ;;
+    esac
+done <<< "$_frontend_out"
+unset _frontend_out _frontend_rc _key _value
+if [ -z "$FRONTEND_EXECUTABLE" ]; then
+    echo "raptor: frontend preparation returned no executable" >&2
+    exit 1
+fi
+# RAPTOR_FRONTEND_GATE_END
+
+# Warn (don't drop) when the selected executable resolves under a
+# world-writable ANCESTOR — the per-PATH-entry check above can't see
+# parents.
+if [ -z "${RAPTOR_NO_LAUNCHER_HARDENING:-}" ]; then
+    _frontend_path="$FRONTEND_EXECUTABLE"
+    _dir="$(_rp dirname "$_frontend_path")"
+    _hops=0
+    while [ -n "$_dir" ] && [ "$_dir" != "/" ] && [ "$_hops" -lt 64 ]; do
+        _perm="$(_rp stat -Lc '%a' "$_dir" 2>/dev/null \
+                 || _rp stat -Lf '%Lp' "$_dir" 2>/dev/null \
+                 || echo '')"
+        if [ -n "$_perm" ] && [ "$(( 0$_perm & 2 ))" -ne 0 ]; then
+            _shown_fp="${_frontend_path//[![:print:]]/}"
+            _shown_dir="${_dir//[![:print:]]/}"
+            echo "raptor: WARNING: $FRONTEND resolves under a world-writable tree: ${_shown_fp:0:200} (writable ancestor: ${_shown_dir:0:200})" >&2
+            unset _shown_fp _shown_dir
+            break
+        fi
+        _dir="${_dir%/*}"
+        [ -n "$_dir" ] || _dir="/"
+        _hops=$((_hops + 1))
+    done
+    unset _frontend_path _dir _hops _perm
+fi
 
 # Clear the screen BEFORE the pre-flight checks so their stderr
 # (trust warnings, project-mismatch prompts) stays visible instead
@@ -493,7 +1061,16 @@ if [ -n "$CHECK_TARGET" ]; then
         echo "raptor: refusing to launch. Override: --trust-repo" >&2
         exit 2
     fi
-    # rc=3 = internal error; already logged to stderr. Don't block the launcher.
+    # rc=3 = internal error (python missing, import failure); already
+    # logged to stderr. DELIBERATELY non-blocking, asymmetric with the
+    # undocumented-code fail-closed mapping in raptor-cc-trust-check:
+    # rc=3 fires on operator-environment breakage (no python3 on PATH
+    # is exactly when the operator most needs the launcher to start),
+    # not on scan-result ambiguity — and the check re-runs inside the
+    # session where a working python gets a real verdict. An attacker
+    # who could force a CLEAN internal error would get the same skip,
+    # which is why the check runs with `-I` from RAPTOR_DIR (hostile
+    # repo content cannot reach its import path or cwd).
 fi
 
 cd "$RAPTOR_DIR" || { echo "raptor: cannot cd to $RAPTOR_DIR" >&2; exit 1; }
@@ -541,13 +1118,28 @@ fi
 
 # Session registry (AUTHORITATIVE v2): sessions.d/<pid>
 # carries this session's project binding, identity-stamped so a
-# recycled pid (even another claude) can never inherit it, and
+# recycled pid (even another supported host) can never inherit it, and
 # token-carrying so the env credential is unforgeable. $$ survives the
-# exec into claude; starttime is fork-time and survives too. The seed
+# exec into the frontend; starttime is fork-time and survives too. The seed
 # is MANDATORY — 'project=-' when nothing resolved — so an
 # empty-bookmark launch is insulated from later bookmark moves.
 # Format/keys shared with core/project/sessions.py (ENTRY_KEYS).
-_sessions_dir="$HOME/.local/share/raptor/sessions.d"
+# Registry base honours the RAPTOR_REGISTRY_HOME seam
+# (core/project/registry_home.py): the python readers of this very
+# file resolve sessions.d through it, so the seeder must write where
+# they will read. Same rule as the python side: absolute values only,
+# no ~ expansion. Unlike the async coverage hook (which exits quietly),
+# a bad value at LAUNCH must fail loudly — silently seeding the default
+# registry while every python consumer errors would split the session.
+_sessions_base="$HOME/.local/share/raptor"
+if [ -n "${RAPTOR_REGISTRY_HOME:-}" ]; then
+    case "$RAPTOR_REGISTRY_HOME" in
+        /*) _sessions_base="$RAPTOR_REGISTRY_HOME" ;;
+        *)  echo "raptor: RAPTOR_REGISTRY_HOME must be an absolute path, got: $RAPTOR_REGISTRY_HOME" >&2
+            exit 1 ;;
+    esac
+fi
+_sessions_dir="$_sessions_base/sessions.d"
 RAPTOR_SESSION_TOKEN=""
 if _rp mkdir -p -m 700 "$_sessions_dir" 2>/dev/null; then
     _rp chmod 700 "$_sessions_dir" 2>/dev/null || true
@@ -556,7 +1148,7 @@ if _rp mkdir -p -m 700 "$_sessions_dir" 2>/dev/null; then
     # python reader's rules).
     _starttime="0"
     if [ -r "/proc/$$/stat" ]; then
-        _starttime="$(_rp awk '{match($0, /\) /); print substr($0, RSTART+2)}' "/proc/$$/stat" 2>/dev/null | _rp awk '{print $20}')"
+        _starttime="$(_rp awk '{match($0, /\) /); print substr($0, RSTART+2)}' "/proc/$$/stat" 2>/dev/null | _rp awk '{print $20}' || true)"
         [ -n "$_starttime" ] || _starttime="0"
     fi
     _bootid="none-$(uname -s 2>/dev/null | _rp tr 'A-Z' 'a-z' || echo unknown)"
@@ -573,48 +1165,62 @@ if _rp mkdir -p -m 700 "$_sessions_dir" 2>/dev/null; then
     if [ -z "$RAPTOR_SESSION_TOKEN" ] && [ -r /dev/urandom ]; then
         RAPTOR_SESSION_TOKEN="$(_rp od -An -N16 -tx1 /dev/urandom 2>/dev/null | _rp tr -d ' \n')"
     fi
-
-    # Unconditional stale-state delete for $$ FIRST (a recycled pid
-    # must never expose a predecessor's binding or ledger). Under the
-    # per-pid ledger flock when flock(1) exists — a predecessor's
-    # straggling finisher may be mid-RMW; without the lock this rm
-    # raced it (python writers hold the same lock).
-    if command -v flock >/dev/null 2>&1; then
-        # exit 1 on flock timeout so the || fallback DELETES anyway:
-        # inheriting a predecessor's ledger (records + pin witnesses)
-        # is strictly worse than the unlocked-delete race the lock
-        # narrows. The lock file itself is removed only on the locked
-        # path (unlinking it under a live holder splits the lock for
-        # other bash writers; python verifies-after-lock).
-        (
-            flock -w 2 9 || exit 1
-            rm -f -- "$_sessions_dir/$$" "$_sessions_dir/$$.run" 2>/dev/null || true
-            rm -f -- "$_sessions_dir/$$.run.lock" 2>/dev/null || true
-        ) 9>"$_sessions_dir/$$.run.lock" 2>/dev/null ||             rm -f -- "$_sessions_dir/$$" "$_sessions_dir/$$.run" 2>/dev/null || true
-    else
-        rm -f -- "$_sessions_dir/$$" "$_sessions_dir/$$.run" "$_sessions_dir/$$.run.lock" 2>/dev/null || true
+    # Without a token, retain the legacy Claude-shaped record.
+    if [ -z "$RAPTOR_SESSION_TOKEN" ]; then
+        _host_claim=""
     fi
 
-    # Prune + awareness pass. Prune predicate: only
-    # same-boot, same-pidns entries with a positively dead pid are
-    # removed; stamped-mismatch pruning is left to the python readers
-    # (richer checks), foreign entries are never touched.
+    _old_receipt_sidecar=""
+    if [ -f "$_sessions_dir/$$" ]; then
+        _old_hostv="$(_rp awk -F= '$1=="host_v"{print substr($0,index($0,"=")+1); exit}' "$_sessions_dir/$$" 2>/dev/null || true)"
+        _old_receipt_sha="$(_rp awk -F= '$1=="host_receipt_sha256"{print substr($0,index($0,"=")+1); exit}' "$_sessions_dir/$$" 2>/dev/null || true)"
+        if [ "$_old_hostv" = "2" ] && [ "${#_old_receipt_sha}" -eq 64 ]; then
+            case "$_old_receipt_sha" in
+                *[!0-9a-f]*) ;;
+                *) _old_receipt_sidecar="$_sessions_dir/$$.receipt.$_old_receipt_sha.json" ;;
+            esac
+        fi
+    fi
+    if command -v flock >/dev/null 2>&1; then
+        (
+            flock -w 2 9 || exit 1
+            rm -f -- "$_sessions_dir/$$" 2>/dev/null || true
+            [ -z "$_old_receipt_sidecar" ] || rm -f -- "$_old_receipt_sidecar" 2>/dev/null || true
+            rm -f -- "$_sessions_dir/$$.run" "$_sessions_dir/$$.run.lock" 2>/dev/null || true
+        ) 9>"$_sessions_dir/$$.run.lock" 2>/dev/null || {
+            rm -f -- "$_sessions_dir/$$" 2>/dev/null || true
+            [ -z "$_old_receipt_sidecar" ] || rm -f -- "$_old_receipt_sidecar" 2>/dev/null || true
+            rm -f -- "$_sessions_dir/$$.run" 2>/dev/null || true
+        }
+    else
+        rm -f -- "$_sessions_dir/$$" 2>/dev/null || true
+        [ -z "$_old_receipt_sidecar" ] || rm -f -- "$_old_receipt_sidecar" 2>/dev/null || true
+        rm -f -- "$_sessions_dir/$$.run" "$_sessions_dir/$$.run.lock" 2>/dev/null || true
+    fi
+
     for _f in "$_sessions_dir"/*; do
         [ -f "$_f" ] || continue
         _fpid="${_f##*/}"
         case "$_fpid" in
             ''|*[!0-9]*) continue ;;  # not a pid-named entry — not ours
         esac
-        # One builtin read-loop per entry (first-key-wins, matching
-        # the python parser) — the sed|head pipelines spawned 4-6
-        # processes per entry, ~12ms each, paid on EVERY launch.
-        _fboot=""; _fns=""; _fproj=""; _fsince=""
+        _fboot=""; _fns=""; _fproj=""; _fsince=""; _fstart=""
+        _fhostv=""; _fhost=""; _fuid=""; _fexe=""; _fdev=""; _fino=""
+        _freceipt=""; _fhvseen=0; _frseen=0
         while IFS== read -r _k _v; do
             case "$_k" in
                 boot_id) [ -n "$_fboot" ] || _fboot="$_v" ;;
                 pidns)   [ -n "$_fns" ] || _fns="$_v" ;;
                 project) [ -n "$_fproj" ] || _fproj="$_v" ;;
                 since)   [ -n "$_fsince" ] || _fsince="$_v" ;;
+                starttime) [ -n "$_fstart" ] || _fstart="$_v" ;;
+                host_v) if [ "$_fhvseen" -eq 0 ]; then _fhostv="$_v"; _fhvseen=1; fi ;;
+                host) [ -n "$_fhost" ] || _fhost="$_v" ;;
+                host_uid) [ -n "$_fuid" ] || _fuid="$_v" ;;
+                host_exe) [ -n "$_fexe" ] || _fexe="$_v" ;;
+                host_exe_dev) [ -n "$_fdev" ] || _fdev="$_v" ;;
+                host_exe_ino) [ -n "$_fino" ] || _fino="$_v" ;;
+                host_receipt_sha256) if [ "$_frseen" -eq 0 ]; then _freceipt="$_v"; _frseen=1; fi ;;
             esac
         done < "$_f" 2>/dev/null || true
         if [ -n "$_fboot" ] && [ "$_fboot" != "$_bootid" ]; then
@@ -623,28 +1229,73 @@ if _rp mkdir -p -m 700 "$_sessions_dir" 2>/dev/null; then
         if [ -n "$_fns" ] && [ -n "$_pidns" ] && [ "$_fns" != "$_pidns" ]; then
             continue  # foreign pid namespace — never prune here
         fi
+        _fsidecar=""
+        if [ "$_fhostv" = "2" ] && [ "${#_freceipt}" -eq 64 ]; then
+            case "$_freceipt" in *[!0-9a-f]*) ;; *) _fsidecar="$_sessions_dir/$_fpid.receipt.$_freceipt.json" ;; esac
+        fi
         if ! kill -0 "$_fpid" 2>/dev/null; then
-            rm -f -- "$_f" "$_sessions_dir/$_fpid.run" "$_sessions_dir/$_fpid.run.lock"
+            rm -f -- "$_f"
+            [ -z "$_fsidecar" ] || rm -f -- "$_fsidecar"
+            rm -f -- "$_sessions_dir/$_fpid.run" "$_sessions_dir/$_fpid.run.lock"
             continue
+        fi
+        [ "$_fhostv" = "2" ] && continue
+        if [ -n "$_fhostv$_fhost$_fuid$_fexe$_fdev$_fino" ]; then
+            _fclaim_ok=1
+            case "$_fhostv" in 1) ;; *) _fclaim_ok=0 ;; esac
+            case "$_fhost" in claude|copilot) ;; *) _fclaim_ok=0 ;; esac
+            case "$_fuid" in ''|*[!0-9]*) _fclaim_ok=0 ;; esac
+            case "$_fdev" in ''|*[!0-9]*) _fclaim_ok=0 ;; esac
+            case "$_fino" in ''|*[!0-9]*) _fclaim_ok=0 ;; esac
+            case "$_fstart" in ''|*[!0-9]*) _fclaim_ok=0 ;; esac
+            case "$_fexe" in /*) ;; *) _fclaim_ok=0 ;; esac
+            case "$_fexe" in *[[:cntrl:]]*) _fclaim_ok=0 ;; esac
+            if [ "$_fclaim_ok" -ne 1 ]; then
+                echo "raptor: WARNING: ignoring malformed host claim for session pid $_fpid" >&2
+                continue
+            fi
+            _flive_start=""
+            if [ -r "/proc/$_fpid/stat" ]; then
+                _flive_start="$(_rp awk '{match($0, /\) /); print substr($0, RSTART+2)}' "/proc/$_fpid/stat" 2>/dev/null | _rp awk '{print $20}' || true)"
+            fi
+            _flive_uid="$(_rp stat -Lc %u "/proc/$_fpid" 2>/dev/null || true)"
+            _flive_identity="$(_rp stat -Lc '%d %i' "/proc/$_fpid/exe" 2>/dev/null || true)"
+            _flive_dev="${_flive_identity%% *}"
+            _flive_ino="${_flive_identity#* }"
+            _fcomm=""
+            if [ -r "/proc/$_fpid/comm" ]; then
+                read -r _fcomm < "/proc/$_fpid/comm" || _fcomm=""
+            fi
+            case "$_fhost:$_fcomm" in
+                claude:claude|claude:claude-*|copilot:copilot|copilot:copilot-*|copilot:MainThread|copilot:mainthread) ;;
+                *) _fclaim_ok=0 ;;
+            esac
+            if [ "$_flive_start" != "$_fstart" ] \
+                    || [ "$_flive_uid" != "$_fuid" ] \
+                    || [ "$_flive_dev" != "$_fdev" ] \
+                    || [ "$_flive_ino" != "$_fino" ]; then
+                _fclaim_ok=0
+            fi
+            unset _flive_start _flive_uid _flive_identity \
+                _flive_dev _flive_ino _fcomm
+            [ "$_fclaim_ok" -eq 1 ] || continue
+            unset _fclaim_ok
         fi
         if [ "$_fpid" != "$$" ] && [ "$_seed_proj" != "-" ]; then
             if [ "$_fproj" = "$_seed_proj" ]; then
-                # Entry fields are file content: strip non-printables
-                # and bound length (builtins) before echoing.
                 _fsince="${_fsince//[![:print:]]/}"
                 _fsince="${_fsince:0:64}"
                 echo "raptor: project $_seed_proj is also active in session pid $_fpid (since ${_fsince:-unknown})" >&2
             fi
         fi
     done
-
-    # MANDATORY seed, atomic (tmp+rename): v2 entry keyed to $$.
     _tmp_entry="$_sessions_dir/.$$.tmp.$$"
     if {
         printf 'v=2\nproject=%s\nsince=%s\nstarttime=%s\nboot_id=%s\n' \
             "$_seed_proj" "$(date -u +%Y-%m-%dT%H:%M:%S+00:00)" \
             "$_starttime" "$_bootid"
         [ -n "$_pidns" ] && printf 'pidns=%s\n' "$_pidns"
+        [ -n "$_host_claim" ] && printf '%s' "$_host_claim"
         [ -n "$RAPTOR_SESSION_TOKEN" ] && printf 'token=%s\n' "$RAPTOR_SESSION_TOKEN"
         printf 'seeded_by=%s\n' "$_seed_by"
     } > "$_tmp_entry" 2>/dev/null && mv -f "$_tmp_entry" "$_sessions_dir/$$" 2>/dev/null; then
@@ -656,7 +1307,10 @@ if _rp mkdir -p -m 700 "$_sessions_dir" 2>/dev/null; then
         fi
         RAPTOR_SESSION_TOKEN=""
     fi
-    unset _f _fpid _fproj _fsince _fboot _fns _tmp_entry _starttime _bootid _pidns
+    unset _f _fpid _fproj _fsince _fboot _fns _fstart _fsidecar \
+        _fhostv _fhost _fuid _fexe _fdev _fino _fclaim_ok _freceipt \
+        _fhvseen _frseen _old_hostv _old_receipt_sha _old_receipt_sidecar \
+        _tmp_entry _starttime _bootid _pidns
 else
     echo "raptor: WARNING: could not create $_sessions_dir — no session binding recorded; this session follows the machine-wide default" >&2
 fi
@@ -668,12 +1322,20 @@ if [ -n "$RAPTOR_SESSION_TOKEN" ]; then
 else
     unset RAPTOR_SESSION_TOKEN
 fi
-unset _sessions_dir _startup_out _seed_proj _seed_by
+unset _sessions_dir _startup_out _seed_proj _seed_by _host_claim
 
-# Load coverage tracking plugin if available
+# Load the cross-frontend coverage plugin if available. Copilot accepts the
+# legacy plugin layout and PascalCase PostToolUse(Read) hook contract.
 PLUGIN_ARGS=()
 if [ -d "$RAPTOR_DIR/plugins/coverage" ]; then
     PLUGIN_ARGS+=(--plugin-dir "$RAPTOR_DIR/plugins/coverage")
+fi
+# Claude owns the authoritative custom-agent definitions so their explicit
+# `model: inherit` metadata cannot be weakened by ambient model variables.
+# Copilot loads the generated, model-free `.github/agents` projection instead.
+if [[ "$FRONTEND" == "claude"
+        && -f "$RAPTOR_DIR/plugins/agents/.claude-plugin/plugin.json" ]]; then
+    PLUGIN_ARGS+=(--plugin-dir "$RAPTOR_DIR/plugins/agents")
 fi
 
 # `env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS` at the exec
@@ -691,10 +1353,32 @@ if [[ -n "${ANTHROPIC_MODEL:-}" && -z "${CLAUDE_CODE_SUBAGENT_MODEL:-}" ]]; then
     export CLAUDE_CODE_SUBAGENT_MODEL="$ANTHROPIC_MODEL"
 fi
 
-if [[ -n "$INITIAL_PROMPT" ]]; then
-    exec env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS \
-        claude "${PLUGIN_ARGS[@]}" "${CLAUDE_ARGS[@]}" "$INITIAL_PROMPT"
-else
-    exec env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS \
-        claude "${PLUGIN_ARGS[@]}" "${CLAUDE_ARGS[@]}"
+# RAPTOR_FRONTEND_EXEC_BEGIN
+_frontend_env_unsets=(-u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS)
+if [[ "$FRONTEND" == "copilot" ]]; then
+    # A launch nested inside Copilot inherits the parent's identity markers.
+    # The selected native process must establish its own session instead.
+    _frontend_env_unsets+=(
+        -u COPILOT_AGENT_SESSION_ID
+        -u COPILOT_CLI
+        -u COPILOT_CLI_BINARY_VERSION
+        -u COPILOT_CLI_RESOLVED_DIST_DIR
+        -u COPILOT_LOADER_PID
+    )
 fi
+if [[ -n "$INITIAL_PROMPT" ]]; then
+    if [[ "$FRONTEND" == "copilot" ]]; then
+        exec env "${_frontend_env_unsets[@]}" \
+            "$FRONTEND_EXECUTABLE" "${PLUGIN_ARGS[@]}" \
+            "${FRONTEND_ARGS[@]}" -i "$INITIAL_PROMPT"
+    else
+        exec env "${_frontend_env_unsets[@]}" \
+            "$FRONTEND_EXECUTABLE" "${PLUGIN_ARGS[@]}" \
+            "${FRONTEND_ARGS[@]}" "$INITIAL_PROMPT"
+    fi
+else
+    exec env "${_frontend_env_unsets[@]}" \
+        "$FRONTEND_EXECUTABLE" "${PLUGIN_ARGS[@]}" \
+        "${FRONTEND_ARGS[@]}"
+fi
+# RAPTOR_FRONTEND_EXEC_END

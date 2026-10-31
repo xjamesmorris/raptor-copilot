@@ -102,10 +102,11 @@ class TestCorroborateSample:
             return _StubSweep(outcomes[len(calls) - 1])
 
         with patch(
-            "core.audit.compiler_sweep._gcc_analyzer",
+            "core.audit.compiler_sweep.gcc_analyzer_available",
             return_value=("/usr/bin/gcc", "sarif-file"),
         ), patch(
-            "core.audit.compiler_sweep._clang_path", return_value=None,
+            "core.audit.compiler_sweep.clang_path_available",
+            return_value=None,
         ), patch(
             "core.audit.compiler_sweep.run_compiler_analyzer_sweep",
             side_effect=lambda **kw: _fake_sweep(**kw),
@@ -136,9 +137,11 @@ class TestCorroborateSample:
     def test_no_analyzer_skips_fast(self):
         records = [_kill()]
         with patch(
-            "core.audit.compiler_sweep._gcc_analyzer", return_value=None,
+            "core.audit.compiler_sweep.gcc_analyzer_available",
+            return_value=None,
         ), patch(
-            "core.audit.compiler_sweep._clang_path", return_value=None,
+            "core.audit.compiler_sweep.clang_path_available",
+            return_value=None,
         ):
             assert corroborate_sample(records, "/repo") == 0
         assert records[0]["corroboration"] == "not_sampled"

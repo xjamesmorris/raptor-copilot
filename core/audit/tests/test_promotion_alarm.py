@@ -239,6 +239,137 @@ class TestCheckAndEmit:
 
 
 # ---------------------------------------------------------------------------
+# Fail-closed gate — an exception inside the gate must BLOCK the
+# promotion (demoted + blocked + logged at WARNING or above), never
+# ship it.  A gate that throws mid-check and then writes the forged
+# finding anyway, with only a debug line, is exactly the bypass the
+# alarm exists to catch.
+# ---------------------------------------------------------------------------
+
+
+class TestGateFailsClosed:
+    def test_reverify_exception_still_demotes_and_blocks(
+        self, tmp_path, caplog, monkeypatch,
+    ):
+        # An exception in the G2 re-verification step means the bypass
+        # claim is UNVERIFIED, not exempt: the evidence-less finding is
+        # demoted + blocked, and the gate failure surfaces at WARNING.
+        import core.audit.invariant_gate as invariant_gate
+
+        def _boom(out_dir, outcome):
+            raise RuntimeError("domain model load exploded")
+
+        monkeypatch.setattr(invariant_gate, "reverify_bypass", _boom)
+        outcome = _FakeOutcome(
+            status="finding", evidence_tool="",
+            review_result={"g2_invariant_bypass": ["INV-001"]},
+        )
+        with caplog.at_level(
+            logging.WARNING, logger="core.audit.promotion_alarm",
+        ):
+            rec = check_and_emit(
+                tmp_path, outcome, stage="journal-write", enforce=True,
+            )
+        assert rec is not None
+        assert rec["blocked"] is True
+        assert outcome.status == "suspicious"
+        lines = _alarm_lines(tmp_path)
+        assert len(lines) == 1
+        assert lines[0]["blocked"] is True
+        assert lines[0]["bypass_claimed"] == ["INV-001"]
+        assert any(
+            r.levelno >= logging.WARNING and "re-verification" in r.getMessage()
+            for r in caplog.records
+        ), "gate failure not logged at WARNING or above"
+
+    def test_emit_exception_after_demotion_is_warned_not_lost(
+        self, tmp_path, caplog, monkeypatch,
+    ):
+        # The demotion happens BEFORE the fallible emission step, and
+        # an emission failure is a WARNING with the record still
+        # returned — never a silently swallowed None.
+        import core.audit.promotion_alarm as pa
+
+        def _boom(out_dir, record):
+            raise RuntimeError("jsonl append exploded")
+
+        monkeypatch.setattr(pa, "emit_alarm", _boom)
+        outcome = _FakeOutcome(status="finding", evidence_tool="")
+        with caplog.at_level(
+            logging.WARNING, logger="core.audit.promotion_alarm",
+        ):
+            rec = check_and_emit(
+                tmp_path, outcome, stage="journal-write", enforce=True,
+            )
+        assert rec is not None
+        assert rec["blocked"] is True
+        assert outcome.status == "suspicious"
+        assert any(
+            r.levelno >= logging.WARNING and "emission failed" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_status_setter_exception_never_raises_and_trail_is_honest(
+        self, tmp_path, caplog,
+    ):
+        # _enforce_demotion honours its never-raises contract even when
+        # the status assignment itself explodes — and the trail then
+        # says the gate only observed (blocked False, demotion_failed
+        # True) instead of claiming a demotion that never landed.
+        class _FrozenStatus:
+            file = "a.c"
+            function = "f"
+            hypothesis = ""
+            evidence_tool = ""
+            review_result: dict[str, Any] | None = None
+            body = ""
+
+            @property
+            def status(self) -> str:
+                return "finding"
+
+            @status.setter
+            def status(self, value: str) -> None:
+                raise RuntimeError("immutable outcome")
+
+        outcome = _FrozenStatus()
+        with caplog.at_level(
+            logging.CRITICAL, logger="core.audit.promotion_alarm",
+        ):
+            rec = check_and_emit(
+                tmp_path, outcome, stage="journal-write", enforce=True,
+            )
+        assert rec is not None
+        assert rec["blocked"] is False
+        assert rec["demotion_failed"] is True
+        lines = _alarm_lines(tmp_path)
+        assert len(lines) == 1
+        assert lines[0]["demotion_failed"] is True
+        assert any(
+            "failed to demote" in r.getMessage() for r in caplog.records
+        )
+
+    def test_tool_backed_promotion_passes_untouched_under_enforce(
+        self, tmp_path,
+    ):
+        # The pass-through lane: a tool-evidenced finding (including
+        # cadence-tick promotions stamped via _promote_outcome) must
+        # ship exactly as promoted — no demotion, no body marker, no
+        # alarm artifact.
+        outcome = _FakeOutcome(
+            status="finding", evidence_tool="smt:check-overflow",
+            body="overflow proven",
+        )
+        rec = check_and_emit(
+            tmp_path, outcome, stage="journal-write", enforce=True,
+        )
+        assert rec is None
+        assert outcome.status == "finding"
+        assert outcome.body == "overflow proven"
+        assert not (tmp_path / ALARM_FILENAME).exists()
+
+
+# ---------------------------------------------------------------------------
 # Chokepoint integration — journal write + findings export
 # ---------------------------------------------------------------------------
 

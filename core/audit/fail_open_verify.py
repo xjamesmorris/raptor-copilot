@@ -48,8 +48,12 @@ Verdict semantics:
 * ``refuted`` — fail-closed demonstrated with per-site receipts (the
   handler re-raises / returns a restrictive value / aborts, or every
   site checks the result correctly).
-* ``inconclusive`` — one of seven enumerated reasons (each a distinct
-  tested string); never silently dropped.
+* ``inconclusive`` — one of the enumerated reasons (each a distinct
+  tested string); never silently dropped. A refutation additionally
+  requires the leg to have EXAMINED the asserted mechanism: the
+  handler-outcome legs (python/java/JS catch analysis) abstain with
+  ``mechanism-unsupported`` on ignored-return/tri-state phrasings,
+  which they have no adjudicator for.
 
 No LLM calls, no subprocesses.
 """
@@ -70,6 +74,9 @@ from .fail_open_lang import (
     c_function_span,
     c_ignored_return_sites,
     c_tristate_sites,
+    csharp_function_throws,
+    csharp_handlers,
+    csharp_method_segment,
     function_parameters,
     go_discard_sites,
     go_function_returns_error,
@@ -79,6 +86,9 @@ from .fail_open_lang import (
     java_function_throws,
     java_handlers,
     java_method_segment,
+    kotlin_function_throws,
+    kotlin_handlers,
+    kotlin_method_segment,
     js_function_returns_promise,
     js_function_span,
     js_function_throws,
@@ -90,6 +100,13 @@ from .fail_open_lang import (
     rust_discard_sites,
     rust_function_returns_result,
     rust_function_span,
+    swift_do_has_plain_try,
+    swift_erasure_sites,
+    swift_function_declares_throws,
+    swift_function_span,
+    swift_function_throws,
+    swift_handlers,
+    swift_method_segment,
 )
 from .fail_open_roles import (
     GRADE_DETECTION,
@@ -97,6 +114,7 @@ from .fail_open_roles import (
     RoleEvidence,
     bind_role,
 )
+from core.source.lines import split_lines
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +152,7 @@ REASON_TYPES_UNRESOLVED = "types-unresolved"
 REASON_ASYNC_UNPROVABLE = "async-unprovable"
 REASON_HYPOTHESIS_UNBINDABLE = "hypothesis-unbindable"
 REASON_SPAN_UNRESOLVED = "span-unresolved"
+REASON_MECHANISM_UNSUPPORTED = "mechanism-unsupported"
 
 INCONCLUSIVE_REASONS = frozenset({
     REASON_ROLE_UNBOUND,
@@ -144,6 +163,7 @@ INCONCLUSIVE_REASONS = frozenset({
     REASON_ASYNC_UNPROVABLE,
     REASON_HYPOTHESIS_UNBINDABLE,
     REASON_SPAN_UNRESOLVED,
+    REASON_MECHANISM_UNSUPPORTED,
 })
 
 # CWE families the channel joins via the fallback chain. CWE-248
@@ -152,29 +172,73 @@ INCONCLUSIVE_REASONS = frozenset({
 # use case appears (design §15.2).
 FAIL_OPEN_CWES = frozenset({
     "CWE-703", "CWE-636", "CWE-391", "CWE-390", "CWE-252", "CWE-248",
+    # CWE-703 children: improper check for (754) / improper handling
+    # of (755) exceptional conditions — the same role x
+    # permissive-outcome x fallibility question, one level down the
+    # family tree.
+    "CWE-754", "CWE-755",
+    # Missing report of error condition — the sibling of
+    # CWE-390/391: the error is detected but the caller never learns,
+    # so execution proceeds on the permissive path.
+    "CWE-392",
     # Authenticity family: "insufficient verification of data
     # authenticity" is a verification role whose failure or absence
     # lets the data through — exactly the role x permissive-outcome x
-    # fallibility question this channel adjudicates. The api-boundary
-    # channel covers the caller-obligation leg (see
+    # fallibility question this channel adjudicates. CWE-346 (origin
+    # validation error) is the CWE-345 child with the same shape. The
+    # api-boundary channel covers the caller-obligation leg (see
     # api_boundary.API_BOUNDARY_CWES).
-    "CWE-345",
+    "CWE-345", "CWE-346",
 })
 
 # Hypothesis shapes that assert a fail-open / swallowed-error defect.
+# ``stem\w*.{0,N}`` gaps are respelled in canonical-split form
+# ``stem(?:.{0,N}|\w{1,64}.{N})``: the suffix run and the gap both
+# consume word characters, so the unbounded ambiguous spelling
+# re-splits against every stem repeat inside one long word —
+# quadratic on hostile text. The split form matches the same
+# language (the gap alone, or a word run plus an exactly-N gap)
+# with one bounded probe per split point; only a stem buried more
+# than 64 word-characters before the gap stops matching (16 on the
+# two-link verify-then-outcome chain, whose split probes multiply —
+# real English suffixes are well under either cap).
 _FAIL_OPEN_HYPOTHESIS_RE = re.compile(
     r"(?:fail[s\-]?\s?open"
-    r"|swallow\w*.{0,20}(?:exception|error|failure)"
+    r"|swallow(?:.{0,20}|\w{1,64}.{20})(?:exception|error|failure)"
     r"|(?:empty|silent)\W{0,20}(?:catch|except|handler)"
-    r"|(?:ignor|discard|unchecked)\w*.{0,30}"
+    r"|(?:ignor|discard|unchecked)(?:.{0,30}|\w{1,64}.{30})"
     r"(?:error|return\s+(?:value|code)|result|\berr\b)"
     r"|(?:error|return\s+(?:value|code)|result|\berr\b).{0,40}"
     r"(?:ignor|discard|unchecked|\bnot\s+checked)"
-    r"|recover\w*.{0,20}continue"
+    r"|recover(?:.{0,20}|\w{1,64}.{20})continue"
     r"|unawaited|floating\s+promise"
-    r"|(?:verif|auth|valid|sanitiz|permission)\w*.{0,40}"
-    r"(?:error|exception|failure)\w*.{0,30}"
+    r"|(?:verif|auth|valid|sanitiz|permission)(?:.{0,40}|\w{1,16}.{40})"
+    r"(?:error|exception|failure)(?:.{0,30}|\w{1,16}.{30})"
     r"(?:proceed|continue|allow|bypass|ignored|silently))",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Ignored/discarded/unchecked RETURN phrasings (plus tri-state
+# acceptance) — the mechanism the handler-outcome legs (python, java,
+# JS/TS catch analysis) have no adjudicator for. A refutation is only
+# evidence when the leg examined the asserted mechanism: a fail-closed
+# handler says nothing about a return value that is never looked at,
+# so handler legs must abstain instead of refuting these shapes.
+# Deliberately narrower than the routing regex above: bare
+# "error"/"exception" phrasings lean toward the swallow mechanism the
+# handler legs DO examine, and keep their refutation authority.
+# The keyword suffix run is bounded: unbounded ``\w*`` after a stem
+# drawn from word chars re-scans a hostile stem-repeating word from
+# every planted stem — quadratic on LLM-derived hypothesis prose.
+# English suffixes fit well inside 24 chars.
+_IGNORED_RETURN_HYPOTHESIS_RE = re.compile(
+    r"(?:(?:ignor|discard|unchecked)\w{0,24}.{0,30}"
+    r"(?:return\s+(?:value|code)|results?\b|\berr\b"
+    r"|errors?\s+returned\b)"
+    r"|(?:return\s+(?:value|code)|results?\b|\berr\b"
+    r"|errors?\s+returned\b).{0,40}"
+    r"(?:ignor|discard|unchecked|\bnot\s+checked)"
+    r"|tri-?state)",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -289,10 +353,23 @@ def _apply_role_grade(rule_id: str, role: RoleEvidence) -> str:
 
 
 def _read_source(target_path: Path, file_path: str) -> str | None:
+    # file_path arrives from review-outcome/checklist artifacts — an
+    # LLM-writable trust class. Confine the join: an absolute path
+    # would discard target_path entirely and a ``..`` segment would
+    # escape it, pulling arbitrary host file lines into evidence
+    # records and prompts. Rejection reads as "source unavailable"
+    # (the caller's hypothesis-unbindable inconclusive), never a
+    # verdict.
+    from ._util import safe_join
+    # Capped like every migrated core/audit sibling: a multi-GB
+    # planted file must truncate, not buffer wholesale into evidence
+    # records and prompts.
+    from core.source import read_text_capped
     try:
-        p = Path(target_path) / file_path
-        if p.is_file():
-            return p.read_text(encoding="utf-8", errors="replace")
+        p = safe_join(Path(target_path), file_path)
+        if p is not None and p.is_file():
+            got = read_text_capped(p)
+            return None if got is None else got[0]
     except OSError:
         pass
     return None
@@ -311,7 +388,7 @@ def _python_function_segment(source: str, function_name: str) -> str:
     except SyntaxError:
         return ""
     tail = _function_tail(function_name)
-    lines = source.splitlines()
+    lines = split_lines(source)
     for node in _ast.walk(tree):
         if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)) \
                 and node.name == tail:
@@ -432,6 +509,7 @@ def _run_python_check(
     source: str,
     file_path: str,
     function_name: str,
+    hypothesis: str,
     role_context: RoleContext,
     inventory: dict[str, Any] | None,
 ) -> FailOpenResult:
@@ -456,6 +534,24 @@ def _run_python_check(
 
     if not permissive:
         if fail_closed and not undecided:
+            if _IGNORED_RETURN_HYPOTHESIS_RE.search(hypothesis):
+                # Mechanism-bind the refutation: this leg adjudicates
+                # HANDLER outcomes only — it has no ignored-return
+                # adjudicator, so a fail-closed handler elsewhere in
+                # the function is evidence about a mechanism the
+                # hypothesis never asserted. A leg that did not
+                # examine the asserted mechanism must abstain, not
+                # refute (the mechanical verdict carries
+                # verification-grade authority downstream).
+                return _inconclusive(
+                    REASON_MECHANISM_UNSUPPORTED,
+                    "hypothesis asserts an ignored/discarded return "
+                    "value — the python leg adjudicates handler "
+                    "outcomes only and never examined that "
+                    "mechanism; fail-closed handler evidence cannot "
+                    "refute it",
+                    language="python",
+                )
             first = fail_closed[0]
             return FailOpenResult(
                 outcome="refuted",
@@ -583,6 +679,7 @@ def _run_java_check(
     source: str,
     file_path: str,
     function_name: str,
+    hypothesis: str,
     role_context: RoleContext,
     inventory: dict[str, Any] | None,
 ) -> FailOpenResult:
@@ -614,6 +711,20 @@ def _run_java_check(
 
     if not permissive:
         if fail_closed and not undecided:
+            if _IGNORED_RETURN_HYPOTHESIS_RE.search(hypothesis):
+                # Same mechanism-binding as the python leg: no
+                # ignored-return adjudicator here, so a fail-closed
+                # catch clause cannot refute a hypothesis about a
+                # return value nothing examined.
+                return _inconclusive(
+                    REASON_MECHANISM_UNSUPPORTED,
+                    "hypothesis asserts an ignored/discarded return "
+                    "value — the java leg adjudicates catch-clause "
+                    "outcomes only and never examined that "
+                    "mechanism; fail-closed handler evidence cannot "
+                    "refute it",
+                    language="java",
+                )
             first = fail_closed[0]
             return FailOpenResult(
                 outcome="refuted",
@@ -727,6 +838,730 @@ def _run_java_check(
     return result
 
 
+# ── Kotlin leg: catch-block outcome ─────────────────────────────────
+
+
+def _kotlin_fallibility(
+    handler: HandlerOutcome, source: str,
+) -> dict[str, Any] | None:
+    """Leg 2b for Kotlin: evidence that the guarded region can throw.
+
+    Strongest form is a same-file callee whose ``@Throws(X::class)``
+    annotation (or a ``throw`` in its body) names the very type the
+    handler catches. Kotlin has no checked exceptions, so unlike Java
+    there is no compilability witness: a specific catch of a type
+    nothing throws still compiles. Broad catches accept any call with
+    the weaker ``any-call-under-broad-catch`` receipt.
+    """
+    caught = set(handler.caught)
+    line = handler.try_span[0] if handler.try_span else 0
+    for callee in handler.try_calls:
+        thrown = kotlin_function_throws(source, callee)
+        if not thrown:
+            continue
+        declared_and_caught = set(thrown) & caught
+        if declared_and_caught:
+            return {
+                "callee": callee,
+                "line": line,
+                "evidence": "declared-throws",
+                "types": thrown,
+            }
+        if handler.broad:
+            return {
+                "callee": callee,
+                "line": line,
+                "evidence": "throws",
+                "types": thrown,
+            }
+    if handler.broad and handler.try_calls:
+        return {
+            "callee": handler.try_calls[0],
+            "line": line,
+            "evidence": "catchable: any-call-under-broad-catch",
+            "types": sorted(caught),
+        }
+    return None
+
+
+def _run_kotlin_check(
+    source: str,
+    file_path: str,
+    function_name: str,
+    hypothesis: str,
+    role_context: RoleContext,
+    inventory: dict[str, Any] | None,
+) -> FailOpenResult:
+    all_handlers = kotlin_handlers(source, file_path)
+    if all_handlers is None:
+        return _inconclusive(
+            REASON_LANGUAGE_UNSUPPORTED,
+            "no tree-sitter kotlin parser available — the Kotlin leg "
+            "has no honest regex fallback for brace-delimited "
+            "handlers",
+            language="kotlin",
+        )
+    handlers = [
+        h for h in all_handlers
+        if _handler_in_function(h, function_name)
+    ]
+    if not handlers:
+        return _inconclusive(
+            REASON_HYPOTHESIS_UNBINDABLE,
+            f"no catch block found in {function_name}",
+            language="kotlin",
+        )
+
+    permissive = [h for h in handlers if h.is_permissive]
+    fail_closed = [h for h in handlers if h.is_fail_closed]
+    undecided = [
+        h for h in handlers
+        if not h.is_permissive and not h.is_fail_closed
+    ]
+
+    if not permissive:
+        if fail_closed and not undecided:
+            if _IGNORED_RETURN_HYPOTHESIS_RE.search(hypothesis):
+                # Same mechanism-binding as the python/java legs: no
+                # ignored-return adjudicator here, so a fail-closed
+                # catch block cannot refute a hypothesis about a
+                # return value nothing examined.
+                return _inconclusive(
+                    REASON_MECHANISM_UNSUPPORTED,
+                    "hypothesis asserts an ignored/discarded return "
+                    "value — the kotlin leg adjudicates catch-block "
+                    "outcomes only and never examined that "
+                    "mechanism; fail-closed handler evidence cannot "
+                    "refute it",
+                    language="kotlin",
+                )
+            first = fail_closed[0]
+            return FailOpenResult(
+                outcome="refuted",
+                reason=(
+                    f"fail-closed handler(s) demonstrated: "
+                    f"{first.evidence_snippet} at {file_path}:"
+                    f"{first.line} ({first.permissive_value}); no "
+                    f"permissive handler present in {function_name}"
+                ),
+                rule_id=RULE_HANDLER_OUTCOME,
+                language="kotlin",
+                handler=first.to_dict(),
+            )
+        first = undecided[0] if undecided else handlers[0]
+        return _inconclusive(
+            REASON_HANDLER_UNDECIDED,
+            f"handler at {file_path}:{first.line} does substantial "
+            f"fallback work ({first.permissive_value}) — outcome not "
+            "structurally decidable",
+            language="kotlin",
+        )
+
+    segment = kotlin_method_segment(source, function_name)
+    role: RoleEvidence | None = None
+    chosen: HandlerOutcome | None = None
+    for handler in permissive:
+        role = bind_role(
+            handler.try_calls,
+            function_name,
+            file_path,
+            language="kotlin",
+            context=role_context,
+            enclosing_source=segment,
+        )
+        if role is not None:
+            chosen = handler
+            break
+    if role is None or chosen is None:
+        return _inconclusive(
+            REASON_ROLE_UNBOUND,
+            "could not bind a security role to the guarded region "
+            f"(calls: {', '.join(permissive[0].try_calls) or '<none>'})",
+            language="kotlin",
+        )
+
+    fallible = _kotlin_fallibility(chosen, source)
+    if fallible is None:
+        return _inconclusive(
+            REASON_FALLIBILITY_UNRESOLVED,
+            "no throw-capable callee resolvable inside the try body "
+            "(no same-file @Throws/throw evidence and the catch is "
+            "not broad) — a swallow around code that cannot throw is "
+            "vacuous",
+            language="kotlin",
+        )
+
+    rule_id = _apply_role_grade(RULE_HANDLER_OUTCOME, role)
+    caught_desc = ", ".join(chosen.caught)
+    reason = (
+        f"{chosen.evidence_snippet or chosen.idiom} at "
+        f"{file_path}:{chosen.line} swallows {fallible['callee']} "
+        f"({caught_desc}) inside {role.kind}-role region; control "
+        f"proceeds as if the check passed"
+    )
+    result = FailOpenResult(
+        outcome="confirmed",
+        reason=reason,
+        rule_id=rule_id,
+        language="kotlin",
+        role=role.to_dict(),
+        handler=chosen.to_dict(),
+        fallible=fallible,
+    )
+    result.reachability = _entry_reachability(
+        role_context, inventory, file_path, function_name,
+    )
+    return result
+
+
+# ── C# leg: catch-clause outcome ────────────────────────────────────
+
+
+def _csharp_fallibility(
+    handler: HandlerOutcome, source: str,
+) -> dict[str, Any] | None:
+    """Leg 2b for C#: evidence that the guarded region can throw.
+
+    Strongest form is a same-file callee whose body throws the very
+    type the handler catches. C# has no checked exceptions and no
+    throws declarations, so unlike Java there is no compilability
+    witness. Broad catches accept any call with the weaker
+    ``any-call-under-broad-catch`` receipt.
+    """
+    caught = set(handler.caught)
+    line = handler.try_span[0] if handler.try_span else 0
+    for callee in handler.try_calls:
+        thrown = csharp_function_throws(source, callee)
+        if not thrown:
+            continue
+        thrown_and_caught = set(thrown) & caught
+        if thrown_and_caught:
+            return {
+                "callee": callee,
+                "line": line,
+                "evidence": "throws-caught-type",
+                "types": thrown,
+            }
+        if handler.broad:
+            return {
+                "callee": callee,
+                "line": line,
+                "evidence": "throws",
+                "types": thrown,
+            }
+    if handler.broad and handler.try_calls:
+        return {
+            "callee": handler.try_calls[0],
+            "line": line,
+            "evidence": "catchable: any-call-under-broad-catch",
+            "types": sorted(caught),
+        }
+    return None
+
+
+def _run_csharp_check(
+    source: str,
+    file_path: str,
+    function_name: str,
+    hypothesis: str,
+    role_context: RoleContext,
+    inventory: dict[str, Any] | None,
+) -> FailOpenResult:
+    all_handlers = csharp_handlers(source, file_path)
+    if all_handlers is None:
+        return _inconclusive(
+            REASON_LANGUAGE_UNSUPPORTED,
+            "no tree-sitter c-sharp parser available — the C# leg "
+            "has no honest regex fallback for brace-delimited "
+            "handlers",
+            language="csharp",
+        )
+    handlers = [
+        h for h in all_handlers
+        if _handler_in_function(h, function_name)
+    ]
+    if not handlers:
+        return _inconclusive(
+            REASON_HYPOTHESIS_UNBINDABLE,
+            f"no catch clause found in {function_name}",
+            language="csharp",
+        )
+
+    permissive = [h for h in handlers if h.is_permissive]
+    fail_closed = [h for h in handlers if h.is_fail_closed]
+    undecided = [
+        h for h in handlers
+        if not h.is_permissive and not h.is_fail_closed
+    ]
+
+    if not permissive:
+        if fail_closed and not undecided:
+            if _IGNORED_RETURN_HYPOTHESIS_RE.search(hypothesis):
+                # Same mechanism-binding as the python/java legs: no
+                # ignored-return adjudicator here, so a fail-closed
+                # catch clause cannot refute a hypothesis about a
+                # return value nothing examined.
+                return _inconclusive(
+                    REASON_MECHANISM_UNSUPPORTED,
+                    "hypothesis asserts an ignored/discarded return "
+                    "value — the csharp leg adjudicates catch-clause "
+                    "outcomes only and never examined that "
+                    "mechanism; fail-closed handler evidence cannot "
+                    "refute it",
+                    language="csharp",
+                )
+            first = fail_closed[0]
+            return FailOpenResult(
+                outcome="refuted",
+                reason=(
+                    f"fail-closed handler(s) demonstrated: "
+                    f"{first.evidence_snippet} at {file_path}:"
+                    f"{first.line} ({first.permissive_value}); no "
+                    f"permissive handler present in {function_name}"
+                ),
+                rule_id=RULE_HANDLER_OUTCOME,
+                language="csharp",
+                handler=first.to_dict(),
+            )
+        first = undecided[0] if undecided else handlers[0]
+        return _inconclusive(
+            REASON_HANDLER_UNDECIDED,
+            f"handler at {file_path}:{first.line} does substantial "
+            f"fallback work ({first.permissive_value}) — outcome not "
+            "structurally decidable",
+            language="csharp",
+        )
+
+    segment = csharp_method_segment(source, function_name)
+    role: RoleEvidence | None = None
+    chosen: HandlerOutcome | None = None
+    for handler in permissive:
+        role = bind_role(
+            handler.try_calls,
+            function_name,
+            file_path,
+            language="csharp",
+            context=role_context,
+            enclosing_source=segment,
+        )
+        if role is not None:
+            chosen = handler
+            break
+    if role is None or chosen is None:
+        return _inconclusive(
+            REASON_ROLE_UNBOUND,
+            "could not bind a security role to the guarded region "
+            f"(calls: {', '.join(permissive[0].try_calls) or '<none>'})",
+            language="csharp",
+        )
+
+    fallible = _csharp_fallibility(chosen, source)
+    if fallible is None:
+        return _inconclusive(
+            REASON_FALLIBILITY_UNRESOLVED,
+            "no throw-capable callee resolvable inside the try body "
+            "(no same-file throw evidence and the catch is not "
+            "broad) — a swallow around code that cannot throw is "
+            "vacuous",
+            language="csharp",
+        )
+
+    rule_id = _apply_role_grade(RULE_HANDLER_OUTCOME, role)
+    caught_desc = ", ".join(chosen.caught)
+    reason = (
+        f"{chosen.evidence_snippet or chosen.idiom} at "
+        f"{file_path}:{chosen.line} swallows {fallible['callee']} "
+        f"({caught_desc}) inside {role.kind}-role region; control "
+        f"proceeds as if the check passed"
+    )
+    result = FailOpenResult(
+        outcome="confirmed",
+        reason=reason,
+        rule_id=rule_id,
+        language="csharp",
+        role=role.to_dict(),
+        handler=chosen.to_dict(),
+        fallible=fallible,
+    )
+    result.reachability = _entry_reachability(
+        role_context, inventory, file_path, function_name,
+    )
+    return result
+
+
+# ── Swift legs: do/catch outcome + try?-erasure ─────────────────────
+
+
+def _swift_fallibility(
+    handler: HandlerOutcome, source: str,
+) -> dict[str, Any] | None:
+    """Leg 2b for Swift's handler leg: evidence the do body can throw.
+
+    Strongest form is a same-file callee whose typed ``throws(X)``
+    clause or body ``throw`` names the very type the handler catches.
+    Swift's plain ``throws`` is untyped, so a declared-throws callee
+    helps only a broad catch; but the language adds a witness of its
+    own — ``try`` is required at exactly the call sites that can
+    throw, so a plain-``try``-marked call under a broad catch is
+    compiler-verified fallibility. A specific catch with no
+    caught-type evidence stays unresolved, never a guess.
+    """
+    caught = set(handler.caught)
+    line = handler.try_span[0] if handler.try_span else 0
+    for callee in handler.try_calls:
+        thrown = swift_function_throws(source, callee)
+        if thrown:
+            thrown_and_caught = set(thrown) & caught
+            if thrown_and_caught:
+                return {
+                    "callee": callee,
+                    "line": line,
+                    "evidence": "throws-caught-type",
+                    "types": thrown,
+                }
+            if handler.broad:
+                return {
+                    "callee": callee,
+                    "line": line,
+                    "evidence": "throws",
+                    "types": thrown,
+                }
+        if handler.broad and swift_function_declares_throws(
+                source, callee):
+            return {
+                "callee": callee,
+                "line": line,
+                "evidence": "declared-throws",
+                "types": thrown,
+            }
+    if handler.broad and handler.try_span and swift_do_has_plain_try(
+            source, handler.try_span):
+        return {
+            "callee": handler.try_calls[0] if handler.try_calls else "",
+            "line": line,
+            "evidence": "try-marked-call",
+            "types": sorted(caught),
+        }
+    if handler.broad and handler.try_calls:
+        return {
+            "callee": handler.try_calls[0],
+            "line": line,
+            "evidence": "catchable: any-call-under-broad-catch",
+            "types": sorted(caught),
+        }
+    return None
+
+
+def _swift_erasure_fallibility(
+    callee: str,
+    role: RoleEvidence,
+    source: str,
+    inventory: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Leg 2b for Swift's erasure leg: the callee is declared
+    ``throws`` (same-file signature, then inventory extractor
+    metadata), or a learned contract records fallibility. The ``try?``
+    marker itself already proves the compiler thinks the call can
+    throw, but the site classification must not double as its own
+    fallibility witness — the declaration is the receipt.
+    """
+    tail = _function_tail(callee)
+    if swift_function_declares_throws(source, tail):
+        return {
+            "callee": callee,
+            "evidence": "declared-throws (same-file signature)",
+            "types": swift_function_throws(source, tail),
+        }
+    sig = _inventory_signature(inventory, tail)
+    if sig and re.search(r"\bthrows\b", sig):
+        return {
+            "callee": callee,
+            "evidence": "declared-throws (inventory signature)",
+            "types": [],
+        }
+    if role.contract:
+        return {
+            "callee": callee,
+            "evidence": f"contract:{role.contract}",
+            "types": [],
+        }
+    return None
+
+
+def _run_swift_erasure_check(
+    source: str,
+    file_path: str,
+    function_name: str,
+    hypothesis: str,
+    role_context: RoleContext,
+    inventory: dict[str, Any] | None,
+) -> FailOpenResult:
+    """The ``try?``-erasure leg — the Rust discard-leg discipline on
+    Swift's try markers."""
+    span = swift_function_span(source, function_name)
+    if span is None:
+        return _inconclusive(
+            REASON_SPAN_UNRESOLVED,
+            f"cannot resolve the span of {function_name} — refusing "
+            "the whole-file scan (a match elsewhere in the file is "
+            "not evidence about this function)",
+            language="swift", rule_id=RULE_IGNORED_RETURN,
+        )
+    lines = split_lines(source)
+    segment = "\n".join(lines[span[0] - 1:span[1]])
+
+    candidates = _candidate_callees(hypothesis, segment)
+    if not candidates:
+        return _inconclusive(
+            REASON_HYPOTHESIS_UNBINDABLE,
+            f"hypothesis names no call present in {function_name} — "
+            "the try?-erasure leg cannot bind",
+            language="swift", rule_id=RULE_IGNORED_RETURN,
+        )
+
+    role: RoleEvidence | None = None
+    callee = ""
+    for candidate in candidates:
+        role = bind_role(
+            [candidate],
+            "",  # per-callee binding: the enclosing name must not
+                 # smuggle a role onto an unrelated callee
+            file_path,
+            language="swift",
+            context=role_context,
+            enclosing_source=segment,
+        )
+        if role is not None:
+            callee = candidate
+            break
+    if role is None:
+        return _inconclusive(
+            REASON_ROLE_UNBOUND,
+            "could not bind a security role to any hypothesis callee "
+            f"({', '.join(candidates)})",
+            language="swift", rule_id=RULE_IGNORED_RETURN,
+        )
+
+    tail = _function_tail(callee)
+    fallible = _swift_erasure_fallibility(callee, role, source,
+                                          inventory)
+    if fallible is None:
+        return _inconclusive(
+            REASON_FALLIBILITY_UNRESOLVED,
+            f"no throws-declared signature resolvable for {callee} "
+            "(same-file, inventory) and no learned contract — cannot "
+            "demonstrate the erased result can fail",
+            language="swift", rule_id=RULE_IGNORED_RETURN,
+        )
+
+    sites = swift_erasure_sites(
+        source, file_path, tail, function_span=span,
+    )
+    if sites is None:
+        return _inconclusive(
+            REASON_LANGUAGE_UNSUPPORTED,
+            "no tree-sitter swift parser available — try-marker "
+            "consumption is not honestly decidable from line shapes",
+            language="swift", rule_id=RULE_IGNORED_RETURN,
+        )
+    if not sites:
+        return _inconclusive(
+            REASON_HYPOTHESIS_UNBINDABLE,
+            f"no call sites of {callee} located in {function_name}",
+            language="swift", rule_id=RULE_IGNORED_RETURN,
+        )
+
+    unguarded = [s for s in sites if s.verdict == "unguarded"]
+    undecided = [s for s in sites if s.verdict == "undecided"]
+    rule_id = _apply_role_grade(RULE_IGNORED_RETURN, role)
+
+    if unguarded:
+        first = unguarded[0]
+        result = FailOpenResult(
+            outcome="confirmed",
+            reason=(
+                f"{first.code} at {file_path}:{first.line} — "
+                f"{first.evidence} ({role.kind}-role callee "
+                f"{callee}, {fallible['evidence']})"
+            ),
+            rule_id=rule_id,
+            language="swift",
+            role=role.to_dict(),
+            handler={
+                "idiom": "try_erasure",
+                "line": first.line,
+                "caught": [callee],
+                "broad": False,
+                "outcome_kind": "try_erasure",
+                "permissive_value": first.shape,
+                "code": first.code,
+                "parser": first.parser,
+            },
+            fallible=fallible,
+            sites=sites,
+        )
+        result.reachability = _entry_reachability(
+            role_context, inventory, file_path, function_name,
+        )
+        return result
+    if not undecided:
+        return FailOpenResult(
+            outcome="refuted",
+            reason=(
+                f"all {len(sites)} site(s) of {callee} in "
+                f"{function_name} consume the error branch "
+                f"fail-closed (receipts per site)"
+            ),
+            rule_id=RULE_IGNORED_RETURN,
+            language="swift",
+            role=role.to_dict(),
+            fallible=fallible,
+            sites=sites,
+        )
+    return FailOpenResult(
+        outcome="inconclusive",
+        reason=(
+            f"{REASON_HANDLER_UNDECIDED}: {len(undecided)} of "
+            f"{len(sites)} site(s) could not be structurally decided"
+        ),
+        rule_id=RULE_IGNORED_RETURN,
+        language="swift",
+        role=role.to_dict(),
+        fallible=fallible,
+        sites=sites,
+    )
+
+
+def _run_swift_check(
+    source: str,
+    file_path: str,
+    function_name: str,
+    hypothesis: str,
+    role_context: RoleContext,
+    inventory: dict[str, Any] | None,
+) -> FailOpenResult:
+    """Dual-leg dispatch: the do/catch handler leg when the function
+    has handlers, the ``try?``-erasure leg otherwise — and the
+    erasure leg also takes over when the hypothesis asserts a
+    discarded result that fail-closed handlers cannot refute (the
+    kotlin/java legs abstain there; Swift HAS an adjudicator for
+    that mechanism)."""
+    from .fail_open_lang import _ts_parser
+    if _ts_parser("swift") is None:
+        return _inconclusive(
+            REASON_LANGUAGE_UNSUPPORTED,
+            "no tree-sitter swift parser available — neither Swift "
+            "leg has an honest regex fallback",
+            language="swift",
+        )
+    all_handlers = swift_handlers(source, file_path) or []
+    handlers = [
+        h for h in all_handlers
+        if _handler_in_function(h, function_name)
+    ]
+    if not handlers:
+        return _run_swift_erasure_check(
+            source, file_path, function_name, hypothesis,
+            role_context, inventory,
+        )
+
+    permissive = [h for h in handlers if h.is_permissive]
+    fail_closed = [h for h in handlers if h.is_fail_closed]
+    undecided = [
+        h for h in handlers
+        if not h.is_permissive and not h.is_fail_closed
+    ]
+
+    if not permissive:
+        if fail_closed and not undecided:
+            if _IGNORED_RETURN_HYPOTHESIS_RE.search(hypothesis):
+                # The hypothesis is about a discarded result, not the
+                # handlers — route to the erasure leg, which
+                # adjudicates exactly that mechanism (where the
+                # java/kotlin legs must abstain).
+                return _run_swift_erasure_check(
+                    source, file_path, function_name, hypothesis,
+                    role_context, inventory,
+                )
+            first = fail_closed[0]
+            return FailOpenResult(
+                outcome="refuted",
+                reason=(
+                    f"fail-closed handler(s) demonstrated: "
+                    f"{first.evidence_snippet} at {file_path}:"
+                    f"{first.line} ({first.permissive_value}); no "
+                    f"permissive handler present in {function_name}"
+                ),
+                rule_id=RULE_HANDLER_OUTCOME,
+                language="swift",
+                handler=first.to_dict(),
+            )
+        first = undecided[0] if undecided else handlers[0]
+        return _inconclusive(
+            REASON_HANDLER_UNDECIDED,
+            f"handler at {file_path}:{first.line} does substantial "
+            f"fallback work ({first.permissive_value}) — outcome not "
+            "structurally decidable",
+            language="swift",
+        )
+
+    segment = swift_method_segment(source, function_name)
+    role: RoleEvidence | None = None
+    chosen: HandlerOutcome | None = None
+    for handler in permissive:
+        role = bind_role(
+            handler.try_calls,
+            function_name,
+            file_path,
+            language="swift",
+            context=role_context,
+            enclosing_source=segment,
+        )
+        if role is not None:
+            chosen = handler
+            break
+    if role is None or chosen is None:
+        return _inconclusive(
+            REASON_ROLE_UNBOUND,
+            "could not bind a security role to the guarded region "
+            f"(calls: {', '.join(permissive[0].try_calls) or '<none>'})",
+            language="swift",
+        )
+
+    fallible = _swift_fallibility(chosen, source)
+    if fallible is None:
+        return _inconclusive(
+            REASON_FALLIBILITY_UNRESOLVED,
+            "no throw evidence binding the do body to the caught "
+            "type (no same-file thrown-type match, and the catch is "
+            "not broad) — a swallow around code that cannot fail the "
+            "caught way is vacuous",
+            language="swift",
+        )
+
+    rule_id = _apply_role_grade(RULE_HANDLER_OUTCOME, role)
+    caught_desc = ", ".join(chosen.caught)
+    reason = (
+        f"{chosen.evidence_snippet or chosen.idiom} at "
+        f"{file_path}:{chosen.line} swallows {fallible['callee']} "
+        f"({caught_desc}) inside {role.kind}-role region; control "
+        f"proceeds as if the check passed"
+    )
+    result = FailOpenResult(
+        outcome="confirmed",
+        reason=reason,
+        rule_id=rule_id,
+        language="swift",
+        role=role.to_dict(),
+        handler=chosen.to_dict(),
+        fallible=fallible,
+    )
+    result.reachability = _entry_reachability(
+        role_context, inventory, file_path, function_name,
+    )
+    return result
+
+
 # ── C legs: ignored return + tri-state ──────────────────────────────
 
 
@@ -767,7 +1602,7 @@ def _same_file_wur(source: str, tail: str) -> bool:
         from packages.source_intel.aliases import wur_alias_in
     except ImportError:
         return False
-    lines = source.splitlines()
+    lines = split_lines(source)
     decl_re = re.compile(rf"\b{re.escape(tail)}\s*\(")
     for idx, line in enumerate(lines):
         if not decl_re.search(line):
@@ -926,7 +1761,7 @@ def _run_c_check(
     inventory: dict[str, Any] | None,
 ) -> FailOpenResult:
     span = c_function_span(source, function_name, language=language)
-    lines = source.splitlines()
+    lines = split_lines(source)
     if span:
         segment = "\n".join(lines[span[0] - 1:span[1]])
     else:
@@ -1097,7 +1932,7 @@ def _go_segment(source: str, function_name: str) -> str:
     span = go_function_span(source, function_name)
     if span is None:
         return ""
-    lines = source.splitlines()
+    lines = split_lines(source)
     return "\n".join(lines[span[0] - 1:span[1]])
 
 
@@ -1445,7 +2280,7 @@ def _js_segment(source: str, function_name: str, language: str) -> str:
     span = js_function_span(source, function_name, language=language)
     if span is None:
         return ""
-    lines = source.splitlines()
+    lines = split_lines(source)
     return "\n".join(lines[span[0] - 1:span[1]])
 
 
@@ -1496,6 +2331,7 @@ def _run_js_handler_check(
     source: str,
     file_path: str,
     function_name: str,
+    hypothesis: str,
     language: str,
     role_context: RoleContext,
     inventory: dict[str, Any] | None,
@@ -1529,6 +2365,21 @@ def _run_js_handler_check(
 
     if not permissive:
         if fail_closed and not undecided:
+            if _IGNORED_RETURN_HYPOTHESIS_RE.search(hypothesis):
+                # Same mechanism-binding as the python/java legs: the
+                # unawaited split has its own code-shape gate in
+                # _run_js_check, but plain ignored-RETURN prose (not
+                # promise-shaped) lands here, where catch-clause
+                # outcomes are the only thing examined.
+                return _inconclusive(
+                    REASON_MECHANISM_UNSUPPORTED,
+                    "hypothesis asserts an ignored/discarded return "
+                    f"value — the {language} handler leg adjudicates "
+                    "catch/`.catch` outcomes only and never examined "
+                    "that mechanism; fail-closed handler evidence "
+                    "cannot refute it",
+                    language=language,
+                )
             first = fail_closed[0]
             return FailOpenResult(
                 outcome="refuted",
@@ -1814,8 +2665,8 @@ def _run_js_check(
         # when the function has no handler to check; any handler-leg
         # answer (either direction, or undecided) supersedes it.
         handler_result = _run_js_handler_check(
-            source, file_path, function_name, language, role_context,
-            inventory,
+            source, file_path, function_name, hypothesis, language,
+            role_context, inventory,
         )
         if (
             handler_result.outcome == "inconclusive"
@@ -1825,8 +2676,8 @@ def _run_js_check(
             return result
         return handler_result
     return _run_js_handler_check(
-        source, file_path, function_name, language, role_context,
-        inventory,
+        source, file_path, function_name, hypothesis, language,
+        role_context, inventory,
     )
 
 
@@ -1891,7 +2742,7 @@ def _run_rust_check(
             "not evidence about this function)",
             language="rust", rule_id=RULE_IGNORED_RETURN,
         )
-    lines = source.splitlines()
+    lines = split_lines(source)
     segment = "\n".join(lines[span[0] - 1:span[1]])
 
     candidates = _candidate_callees(hypothesis, segment)
@@ -2140,11 +2991,13 @@ def run_fail_open_check(
 
     if language == "python":
         result = _run_python_check(
-            source, file_path, function_name, ctx, inventory,
+            source, file_path, function_name, hypothesis, ctx,
+            inventory,
         )
     elif language == "java":
         result = _run_java_check(
-            source, file_path, function_name, ctx, inventory,
+            source, file_path, function_name, hypothesis, ctx,
+            inventory,
         )
     elif language == "go":
         result = _run_go_check(
@@ -2158,6 +3011,21 @@ def run_fail_open_check(
         )
     elif language == "rust":
         result = _run_rust_check(
+            source, file_path, function_name, hypothesis, ctx,
+            inventory,
+        )
+    elif language == "kotlin":
+        result = _run_kotlin_check(
+            source, file_path, function_name, hypothesis, ctx,
+            inventory,
+        )
+    elif language == "csharp":
+        result = _run_csharp_check(
+            source, file_path, function_name, hypothesis, ctx,
+            inventory,
+        )
+    elif language == "swift":
+        result = _run_swift_check(
             source, file_path, function_name, hypothesis, ctx,
             inventory,
         )

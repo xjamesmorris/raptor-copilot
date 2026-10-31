@@ -13,16 +13,55 @@ from typing import Any
 from datetime import datetime, timezone
 from pathlib import Path
 
-from core.json import dumps_display
+import json
 from core.run.output import unique_run_suffix
+from core.security.log_sanitisation import sanitise_for_terminal
 
 from .oplock import OpLockContention, project_op_lock
-from .project import DEFAULT_OUTPUT_BASE, ProjectManager
+from .project import DEFAULT_OUTPUT_BASE, ProjectManager, _URL_SCHEME_RE
+
+
+def _caller_relative(path: str | None) -> str | None:
+    """Resolve a relative operator path against ``RAPTOR_CALLER_DIR``.
+
+    The launcher's project route (and the in-session dispatch) run
+    with cwd moved to the RAPTOR repo dir, so a bare ``Path.resolve``
+    on a relative ``--target``/``--binary`` silently persisted a
+    repo-relative path (``--target ./code`` became ``<raptor>/code``,
+    or worse, an existing repo subdir). A relative path given by the
+    operator means "relative to MY shell", which the launcher records
+    in RAPTOR_CALLER_DIR. Absolute paths, URLs, ``~``-paths, and None
+    pass through; without the env var the historical cwd resolution
+    holds.
+    """
+    if (not path or os.path.isabs(path) or path.startswith("~")
+            or _URL_SCHEME_RE.match(path)):
+        return path
+    caller = os.environ.get("RAPTOR_CALLER_DIR")
+    if caller and os.path.isdir(caller):
+        return str((Path(caller) / path).resolve())
+    return path
 
 # Help text for the shared --wait flag on mutating subcommands.
 _WAIT_HELP = ("Block until a concurrent project operation releases the "
               "lock (default: 3s silent grace, then error naming the "
               "holder)")
+
+
+def _confirm(prompt: str) -> bool:
+    """y/N confirmation that treats an unanswerable prompt as "no".
+
+    ``input()`` raises EOFError when stdin is closed or piped dry (a
+    scripted ``raptor project clean`` without ``--yes``); main() only
+    handles ValueError/FileExistsError/OpLockContention, so the
+    destructive-confirm prompt turned into a traceback instead of the
+    safe "Cancelled." default.
+    """
+    try:
+        return input(prompt).lower() == "y"
+    except EOFError:
+        print()  # keep the next line off the prompt's row
+        return False
 
 
 def _c(text, code):
@@ -140,7 +179,13 @@ def _emit_json_payload(payload) -> None:
     payload, indent=2, sort_keys=True))`` — pipe-friendly, one
     trailing newline.
     """
-    data = dumps_display(payload, sort_keys=True).encode("utf-8")
+    # ensure_ascii: JSON escapes C0 but passes C1 terminal controls
+    # (U+0080-U+009F, incl. single-byte CSI/OSC) through raw when
+    # ensure_ascii is off — dumps_display is exactly that, and these
+    # payloads carry target-derived strings; ASCII-encode the terminal
+    # JSON lane (still valid JSON, pipe-friendly).
+    data = json.dumps(payload, indent=2, sort_keys=True,
+                      ensure_ascii=True, default=str).encode("utf-8")
     sys.stdout.buffer.write(data)
     sys.stdout.buffer.write(b"\n")
 
@@ -156,10 +201,72 @@ def _detect_target_type(target_path: str):
     ``core.run.target_types.load`` — this is just the project-
     create surface so operators see the catalog match at
     create-time.
+
+    Binary-dominant targets (compiled ELF / Mach-O / PE artifacts,
+    no substantial source tree) route to the ``binary`` catalog
+    entry: the extension/glob catalog would classify such a tree
+    as ``generic`` and recommend the source-tree pattern scanners
+    (scan → agentic), which have nothing to scan there — the
+    binary lane is the right recommendation. Scoped here on
+    purpose: the runtime ``load`` consumers keep their existing
+    classification.
     """
     try:
-        from core.run.target_types import load
-        return load(Path(target_path))
+        from core.run.target_types import binary_dominant, load, load_by_name
+        target = Path(target_path)
+        if target.is_file():
+            from core.archive import is_archive
+            if is_archive(target):
+                # Archive target: detect on the EXTRACTED tree, the
+                # way /describe does — the extension/glob catalog run
+                # against the archive file itself classified every
+                # zip-target project as ``generic`` and printed
+                # generic-wrong /scan pack baselines at create time.
+                return _detect_archive_target_type(target)
+        if binary_dominant(target):
+            entry = load_by_name("binary")
+            if entry is not None:
+                return entry
+            # Missing catalog entry — degrade to the catalog match
+            # (substrate stays best-effort, create never refuses).
+        return load(target)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _detect_archive_target_type(archive: Path):
+    """Catalog detection for an ARCHIVE project target: reuse the
+    /describe resolver (cached extraction when a prior run populated
+    ``_sources/``, else a one-shot tmp extract with the shared safe
+    extractor, single-subdir descent either way) and run the same
+    binary-dominant + catalog classification on the resulting tree.
+
+    One-time cost at create, proportional to the archive (a cache hit
+    is free); tmp extractions are removed before returning. Same
+    best-effort posture as :func:`_detect_target_type` — any failure
+    collapses to None and create proceeds without a tuning block.
+    """
+    import shutil
+    try:
+        from packages.describe.cli import resolve_archive_target
+        resolved = resolve_archive_target(archive, sys.stderr)
+        if resolved is None:
+            return None
+        tree, tmp_root, _label = resolved
+        try:
+            from core.run.target_types import (
+                binary_dominant,
+                load,
+                load_by_name,
+            )
+            if binary_dominant(tree):
+                entry = load_by_name("binary")
+                if entry is not None:
+                    return entry
+            return load(tree)
+        finally:
+            if tmp_root is not None:
+                shutil.rmtree(tmp_root, ignore_errors=True)
     except Exception:  # noqa: BLE001
         return None
 
@@ -228,10 +335,11 @@ def main() -> None:
         "--require-target-type", default=None, metavar="<name>",
         help=("Hard-fail if target-type catalog detection didn't "
               "pick this exact name (e.g. ``c.userspace-daemon``, "
-              "``python.web-app``). For strict-CI runs that assert "
-              "the project's target shape — catches malformed "
-              "targets or stale catalog drift BEFORE any LLM cost. "
-              "On mismatch the project is NOT created."),
+              "``python.web-app``, or ``binary`` for a "
+              "compiled-artifact tree). For strict-CI runs that "
+              "assert the project's target shape — catches "
+              "malformed targets or stale catalog drift BEFORE any "
+              "LLM cost. On mismatch the project is NOT created."),
     )
     p_create.add_argument("--wait", action="store_true", help=_WAIT_HELP)
 
@@ -275,6 +383,54 @@ def main() -> None:
         help="Project name (default: active)")
     p_ghidra.add_argument("--wait", action="store_true", help=_WAIT_HELP)
 
+    # graph — persistent graph store management
+    p_graph = sub.add_parser(
+        "graph",
+        help="Manage the persistent /understand graph store",
+        usage="raptor project graph <status|stats|clear|rebuild> [<name>]",
+        **_F,
+    )
+    p_graph.add_argument(
+        "action", choices=("status", "stats", "clear", "rebuild"),
+        help="Action: status, stats (detailed), clear, or rebuild")
+    p_graph.add_argument(
+        "name", nargs="?", default=None,
+        help="Project name (default: active)")
+
+    # ledger — engagement artifact ledger over the project target
+    p_ledger = sub.add_parser(
+        "ledger",
+        help=("Engagement artifact ledger — enumerate the project "
+              "target into per-artifact rows with coverage "
+              "denominators"),
+        usage=("raptor project ledger <build|status|show> "
+               "[<artifact>] [<name>] [caps flags]"),
+        **_F,
+    )
+    p_ledger.add_argument(
+        "action", choices=("build", "status", "show"),
+        help=("Action: build (enumerate the target), status "
+              "(coverage table), show <artifact-id>"))
+    p_ledger.add_argument(
+        "artifact", nargs="?", default=None,
+        help="Artifact id (required for show)")
+    p_ledger.add_argument(
+        "name", nargs="?", default=None,
+        help="Project name (default: active)")
+    p_ledger.add_argument(
+        "--max-archive-children", type=int, default=None,
+        metavar="<n>",
+        help="Per-archive extracted-member cap for this build")
+    p_ledger.add_argument(
+        "--max-archive-bytes", type=int, default=None, metavar="<n>",
+        help="Per-archive extracted-byte cap for this build")
+    p_ledger.add_argument(
+        "--max-archive-depth", type=int, default=None, metavar="<n>",
+        help="Nested-archive expansion depth cap for this build")
+    p_ledger.add_argument(
+        "--no-expand", action="store_true",
+        help="Classify archives without extracting any members")
+
     # trust / untrust — per-project trust markers
     p_trust = sub.add_parser(
         "trust",
@@ -311,7 +467,8 @@ def main() -> None:
         "set",
         help=("List or set project settings (registry-validated: "
               "description, notes, threat-model, target-kind, "
-              "build-command[.<lang>])"),
+              "build-command[.<lang>], sandbox-floor, "
+              "journal-checkpoint)"),
         usage="raptor project set [<key> <value>] [<name>]",
         **_F,
     )
@@ -581,7 +738,12 @@ def main() -> None:
     p_merge.add_argument("--yes", action="store_true", help="Skip confirmation")
 
     # clean
-    p_clean = sub.add_parser("clean", help="Delete old runs, keep latest n",
+    p_clean = sub.add_parser("clean",
+                             help="Delete old runs, keep latest n; sweeps "
+                                  "_sources extractions no kept run "
+                                  "references (any _sources dir named "
+                                  "*-<sha256> counts as a cache entry — "
+                                  "don't store your own data there)",
                              usage="raptor project clean [<name>] [--keep <n>] [--dedup] [--dry-run] [--yes]", **_F)
     p_clean.add_argument("name", nargs="?", help="Project name")
     p_clean.add_argument("--keep", type=int, default=1, metavar="<n>",
@@ -662,6 +824,9 @@ def main() -> None:
                 parser.print_help()
 
         elif args.subcommand == "create":
+            args.target = _caller_relative(args.target)
+            if getattr(args, "binary", None):
+                args.binary = [_caller_relative(b) for b in args.binary]
             # Target-type catalog detection — runs BEFORE
             # ProjectManager.create so a --require-target-type
             # mismatch refuses without leaving a half-created
@@ -695,7 +860,12 @@ def main() -> None:
                            description=args.description,
                            output_dir=args.output_dir,
                            binaries=getattr(args, "binary", None))
-            print(f"Created project '{p.name}' → {p.output_dir}")
+            # Echo registry round-trip values defensively — the same
+            # fields render from imported archives elsewhere, and the
+            # print surface should not depend on create's validation.
+            _pname = sanitise_for_terminal(p.name, max_len=120)
+            print(f"Created project '{_pname}' → "
+                  f"{sanitise_for_terminal(str(p.output_dir), max_len=256)}")
             # Creation activates for the creating session and bumps the
             # last-activated default — binding
             # first, bookmark second, same discipline as `use`.
@@ -719,12 +889,13 @@ def main() -> None:
             except OSError as e:
                 print(f"  WARNING: could not update the last-activated "
                       f"default ({e}) — new sessions will NOT default "
-                      f"to '{p.name}'.")
+                      f"to '{_pname}'.")
             else:
                 print(_bound_msg)
             _p_binaries = getattr(p, "binaries", None) or []
             if _p_binaries:
-                print(f"  binaries: {', '.join(_p_binaries)}")
+                print("  binaries: "
+                      f"{sanitise_for_terminal(', '.join(_p_binaries), max_len=512)}")
             # Print the catalog tuning block AFTER the create
             # confirmation — operator sees what RAPTOR will use as
             # defaults when /scan, /agentic, /codeql etc. run on
@@ -749,7 +920,7 @@ def main() -> None:
                           "Use: raptor project binary <action> [args] "
                           "<name>, or set an active project first."))
                 return
-            p = mgr.load(name)
+            p = mgr.load(name)  # type: ignore[assignment]
             if not p:
                 print(_red(f"Project '{name}' not found."))
                 return
@@ -759,38 +930,102 @@ def main() -> None:
                     print(f"Project '{name}': no binaries declared.")
                 else:
                     print(f"Project '{name}' binaries ({len(p.binaries)}):")
+                    # Persisted paths arrive via project-import zips
+                    # too — same defang as the list view's fields.
                     for b in p.binaries:
-                        print(f"  {b}")
+                        witness = (getattr(p, "binary_witnesses", None)
+                                   or {}).get(str(b))
+                        # Witness strings ride project-import zips too
+                        # — defang the excerpt like the path.
+                        tag = (f"sha256 "
+                               f"{sanitise_for_terminal(witness[:12])}…"
+                               if witness
+                               else "no content witness — re-add to "
+                                    "pin (enrichment-only until then)")
+                        print(f"  {sanitise_for_terminal(str(b), max_len=256)}"
+                              f"  [{tag}]")
             elif args.action == "add":
                 if not args.path:
                     print(_red("add requires a <path> argument"))
                     return
-                resolved_path = Path(args.path).expanduser().resolve()
-                if not resolved_path.is_file():
+                resolved_path = Path(
+                    _caller_relative(args.path)
+                    or args.path).expanduser().resolve()
+                resolved = str(resolved_path)
+                # Content witness: the add is a trust assertion about
+                # the BYTES at this path right now — persisted-store
+                # binaries drive `absent`-verdict hard-suppression on
+                # every later run, and the path may sit inside a run
+                # dir's write grant (the env-build persist hint points
+                # there). Pin sha256 here; the oracle load seam
+                # re-verifies fd-honestly and DEMOTES a changed file
+                # out of suppression authority. Hash OUTSIDE the
+                # project-file lock — the lock guards the registry
+                # write, not the binary, and a multi-GB debug binary
+                # must not hold it.
+                #
+                # ONE gated open carries existence check + regularity
+                # check + digest (fstat on the OPENED fd, hash of the
+                # same fd via sha256_fileobj) — a separate is_file()
+                # probe followed by a by-name hash spanned a swap
+                # window in which the checked file and the hashed
+                # file could differ. resolve() above fixes the store
+                # KEY; O_NOFOLLOW on the resolved name means anything
+                # swapped in behind the resolve refuses (ELOOP)
+                # instead of silently minting a witness for a file
+                # the check never saw.
+                from core.hash import sha256_fileobj
+                from core.source import open_regular_gated
+                try:
+                    with open_regular_gated(
+                            resolved_path,
+                            follow_symlinks=False) as pin:
+                        digest = sha256_fileobj(pin)  # type: ignore[arg-type]
+                except (FileNotFoundError, NotADirectoryError,
+                        ValueError):
                     # Reject at add-time so the operator sees the typo
                     # NOW, not silently weeks later when the scan
                     # produces no binary-oracle evidence (adversarial
-                    # review P1-D-2).
+                    # review P1-D-2). ValueError = opened but not a
+                    # regular file (directory, FIFO, device).
                     print(_red(
                         f"add: path does not exist or is not a file: "
                         f"{args.path} (resolved to {resolved_path})"
                     ))
                     return
-                resolved = str(resolved_path)
+                except OSError as exc:
+                    # Unreadable — or ELOOP from a symlink raced in
+                    # behind the resolve.
+                    print(_red(
+                        f"add: cannot read {resolved} for content "
+                        f"pinning ({exc}) — not added"))
+                    return
                 # RMW under the project-file lock (re-load inside it)
                 # so a concurrent mutator's write isn't dropped.
                 from .project import project_file_lock
                 with project_file_lock(project_file):
-                    p = mgr.load(name)
+                    p = mgr.load(name)  # type: ignore[assignment]
                     if not p:
                         print(_red(f"Project '{name}' not found."))
                         return
                     if resolved in p.binaries:
-                        print(f"Already present: {resolved}")
+                        if p.binary_witnesses.get(resolved) == digest:
+                            print(f"Already present: {resolved}")
+                        else:
+                            # Re-add = re-assertion: the operator
+                            # rebuilt (or is upgrading a pre-witness
+                            # entry) and re-pins the current bytes.
+                            p.binary_witnesses[resolved] = digest
+                            save_json(project_file, p.to_dict())
+                            print(_green(
+                                f"Witness refreshed: {resolved} "
+                                f"(sha256 {digest[:12]}…)"))
                     else:
                         p.binaries.append(resolved)
+                        p.binary_witnesses[resolved] = digest
                         save_json(project_file, p.to_dict())
-                        print(_green(f"Added: {resolved}"))
+                        print(_green(f"Added: {resolved} "
+                                     f"(pinned sha256 {digest[:12]}…)"))
             elif args.action == "remove":
                 if not args.path:
                     print(_red("remove requires a <path> argument"))
@@ -798,7 +1033,7 @@ def main() -> None:
                 resolved = str(Path(args.path).resolve())
                 from .project import project_file_lock
                 with project_file_lock(project_file):
-                    p = mgr.load(name)
+                    p = mgr.load(name)  # type: ignore[assignment]
                     if not p:
                         print(_red(f"Project '{name}' not found."))
                         return
@@ -806,16 +1041,18 @@ def main() -> None:
                         print(f"Not present: {resolved}")
                     else:
                         p.binaries.remove(resolved)
+                        p.binary_witnesses.pop(resolved, None)
                         save_json(project_file, p.to_dict())
                         print(_green(f"Removed: {resolved}"))
             elif args.action == "clear":
                 from .project import project_file_lock
                 with project_file_lock(project_file):
-                    p = mgr.load(name)
+                    p = mgr.load(name)  # type: ignore[assignment]
                     if not p:
                         print(_red(f"Project '{name}' not found."))
                         return
                     p.binaries = []
+                    p.binary_witnesses = {}
                     save_json(project_file, p.to_dict())
                 print(_green(f"Cleared binaries for '{name}'"))
 
@@ -877,7 +1114,13 @@ def main() -> None:
                                "path — refused (status/list surfaces "
                                "echo the stored path)"))
                     return
-                resolved_path = Path(args.path).expanduser().resolve()
+                # _caller_relative: a relative path means "relative
+                # to the OPERATOR's shell", not the RAPTOR repo dir
+                # the launcher moved cwd to (the same D18-class rule
+                # every other path-taking subcommand applies).
+                resolved_path = Path(
+                    _caller_relative(args.path)
+                    or args.path).expanduser().resolve()
                 if (resolved_path.suffix != ".gpr"
                         or not resolved_path.is_file()):
                     # Reject at add-time so the operator sees the typo
@@ -909,7 +1152,9 @@ def main() -> None:
                 if not args.path:
                     print(_red("remove requires a <path.gpr> argument"))
                     return
-                resolved = str(Path(args.path).expanduser().resolve())
+                resolved = str(Path(
+                    _caller_relative(args.path)
+                    or args.path).expanduser().resolve())
                 from .project import project_file_lock
                 with project_file_lock(project_file):
                     gproj = mgr.load(name)
@@ -938,6 +1183,12 @@ def main() -> None:
                     save_json(project_file, gproj.to_dict())
                 print(_green(f"Detached all Ghidra projects for "
                              f"'{name}'"))
+
+        elif args.subcommand == "graph":
+            _handle_graph(mgr, args)
+
+        elif args.subcommand == "ledger":
+            _handle_ledger(mgr, args)
 
         elif args.subcommand in ("trust", "untrust"):
             _handle_trust(mgr, args)
@@ -975,11 +1226,8 @@ def main() -> None:
                 # description/target may arrive via a project-import
                 # zip — defang terminal escapes like every other
                 # untrusted-content print surface.
-                from core.security.log_sanitisation import (
-                    sanitise_for_terminal,
-                )
-                desc = (f"  {sanitise_for_terminal(p.description, max_len=60)}"
-                        if p.description else "")
+                desc = sanitise_for_terminal(p.description or "", max_len=60)
+                desc = f"  {desc}" if desc else ""
                 tgt = sanitise_for_terminal(str(p.target or ""), max_len=120)
                 print(f"{marker}{p.name:<{col}s}{desc:30s}  {tgt}")
             if any_marker:
@@ -991,7 +1239,7 @@ def main() -> None:
             if not name:
                 print("No project specified. Use: raptor project status <name>")
                 return
-            p = mgr.load(name)
+            p = mgr.load(name)  # type: ignore[assignment]
             if not p:
                 print(f"Project '{name}' not found.")
                 return
@@ -1003,7 +1251,7 @@ def main() -> None:
             if not name:
                 print("No project specified.")
                 return
-            p = mgr.load(name)
+            p = mgr.load(name)  # type: ignore[assignment]
             if not p:
                 print(f"Project '{name}' not found.")
                 return
@@ -1016,7 +1264,7 @@ def main() -> None:
             if not name:
                 print("No project specified.")
                 return
-            p = mgr.load(name)
+            p = mgr.load(name)  # type: ignore[assignment]
             if not p:
                 print(f"Project '{name}' not found.")
                 return
@@ -1027,7 +1275,7 @@ def main() -> None:
             if not name:
                 print("No project specified.")
                 return
-            p = mgr.load(name)
+            p = mgr.load(name)  # type: ignore[assignment]
             if not p:
                 print(f"Project '{name}' not found.")
                 return
@@ -1038,7 +1286,7 @@ def main() -> None:
             if not name:
                 print("No project specified.")
                 return
-            p = mgr.load(name)
+            p = mgr.load(name)  # type: ignore[assignment]
             if not p:
                 print(f"Project '{name}' not found.")
                 return
@@ -1049,7 +1297,7 @@ def main() -> None:
             if not name:
                 print("No project specified.")
                 return
-            p = mgr.load(name)
+            p = mgr.load(name)  # type: ignore[assignment]
             if not p:
                 print(f"Project '{name}' not found.")
                 return
@@ -1071,7 +1319,7 @@ def main() -> None:
                 binding, state = session_binding()
                 bookmark = _read_bookmark(mgr)
                 if state == "bound":
-                    if mgr.load(binding) is None:
+                    if mgr.load(binding) is None:  # type: ignore[arg-type]
                         # Same existence vet get_active applies: the
                         # bound project was deleted from elsewhere.
                         print(f"Session project: none (bound project "
@@ -1119,7 +1367,7 @@ def main() -> None:
                     else:
                         print("No last-activated default was set.")
                 return
-            p = mgr.load(args.name)
+            p = mgr.load(args.name)  # type: ignore[assignment]
             if not p:
                 print(f"Project '{args.name}' not found.")
                 return
@@ -1175,7 +1423,11 @@ def main() -> None:
                       f"default; {_n} live session(s) keep their "
                       f"bindings — switch inside a session with "
                       f"/project use)")
-                print(f"Last-activated default: {p.name} ({p.target})")
+                # target/name may arrive via a project-import zip —
+                # the list lane sanitises the same fields (:1039).
+                print(f"Last-activated default: "
+                      f"{sanitise_for_terminal(p.name, max_len=120)} "
+                      f"({sanitise_for_terminal(str(p.target or ''), max_len=256)})")
             print(f"  Output dir: {p.output_dir}")
             # Session-awareness (advisory, never lock-based): project
             # switch is one of exactly two places this line surfaces —
@@ -1185,7 +1437,7 @@ def main() -> None:
                 print(f"  note: {_line}")
 
         elif args.subcommand == "delete":
-            p = mgr.load(args.name)
+            p = mgr.load(args.name)  # type: ignore[assignment]
             if not p:
                 print(f"Project '{args.name}' not found.")
                 return
@@ -1210,7 +1462,7 @@ def main() -> None:
                 else:
                     size_str = f"{size}B"
                 print(f"This will delete {args.name} and its output ({size_str})")
-                if input("Proceed? [y/N] ").lower() != "y":
+                if not _confirm("Proceed? [y/N] "):
                     print("Cancelled.")
                     return
             output_dir = p.output_dir
@@ -1232,7 +1484,7 @@ def main() -> None:
                 print("Specify only one of: text, --file, --edit")
                 return
             if args.file:
-                p = mgr.load(args.name)
+                p = mgr.load(args.name)  # type: ignore[assignment]
                 if not p:
                     print(f"Project '{args.name}' not found.")
                     return
@@ -1270,7 +1522,7 @@ def main() -> None:
                 import shlex
                 import subprocess
                 import tempfile
-                p = mgr.load(args.name)
+                p = mgr.load(args.name)  # type: ignore[assignment]
                 if not p:
                     print(f"Project '{args.name}' not found.")
                     return
@@ -1362,14 +1614,22 @@ def main() -> None:
                 mgr.update_notes(args.name, args.text)
                 print("Notes updated.")
             else:
-                p = mgr.load(args.name)
+                p = mgr.load(args.name)  # type: ignore[assignment]
                 if p:
-                    print(p.notes or "(no notes)")
+                    # Notes are free text set via /project set —
+                    # escape control bytes, keep line structure.
+                    from core.security.log_sanitisation import (
+                        escape_nonprintable,
+                    )
+                    print(escape_nonprintable(p.notes, preserve_newlines=True)
+                          if p.notes else "(no notes)")
                 else:
                     print(f"Project '{args.name}' not found.")
 
         elif args.subcommand == "add":
-            added = mgr.add_directory(args.name, args.directory, target=args.target,
+            added = mgr.add_directory(args.name,
+                                       _caller_relative(args.directory),  # type: ignore[arg-type]
+                                       target=_caller_relative(args.target),
                                        output_dir=args.output_dir)
             if added:
                 print(f"Added {added} run(s) to project '{args.name}' "
@@ -1379,12 +1639,14 @@ def main() -> None:
                       f"or none found in {args.directory})")
 
         elif args.subcommand == "adopt":
-            target = args.target
+            target = _caller_relative(args.target)
             if not target and not mgr.load(args.name):
                 for candidate in args.runs:
                     target = mgr.adopt_target_for(candidate)
                     if target:
-                        print(f"Target inferred from run metadata: {target}")
+                        # Inferred from run-dir metadata (child-writable).
+                        print(f"Target inferred from run metadata: "
+                              f"{sanitise_for_terminal(str(target), max_len=256)}")
                         break
                 if not target:
                     print("No project by that name, no --target, and no run "
@@ -1408,6 +1670,16 @@ def main() -> None:
                                         seeded_by="adopt") is not None:
                             print(f"  Active for this session "
                                   f"(last-activated default unchanged).")
+                # Binary-lane steer — adopt-time twin of smart
+                # create. Only fires when the resolved target is
+                # binary-dominant (compiled artifacts, no
+                # substantial source tree); every other target
+                # keeps adopt's existing output byte-for-byte.
+                if target:
+                    _entry = _detect_target_type(str(target))
+                    if _entry is not None and _entry.name == "binary":
+                        for line in _format_project_tuning(_entry):
+                            print(line)
             else:
                 print("No runs adopted (already present, target mismatch, "
                       "or no run directories found)")
@@ -1422,7 +1694,7 @@ def main() -> None:
             if not name:
                 print("No project specified.")
                 return
-            p = mgr.load(name)
+            p = mgr.load(name)  # type: ignore[assignment]
             if not p:
                 print(f"Project '{name}' not found.")
                 return
@@ -1430,7 +1702,7 @@ def main() -> None:
 
         elif args.subcommand == "diff":
             from .diff import diff_runs
-            p = mgr.load(args.name)
+            p = mgr.load(args.name)  # type: ignore[assignment]
             if not p:
                 print(f"Project '{args.name}' not found.")
                 return
@@ -1452,7 +1724,7 @@ def main() -> None:
             if not name:
                 print("No project specified.")
                 return
-            p = mgr.load(name)
+            p = mgr.load(name)  # type: ignore[assignment]
             if not p:
                 print(f"Project '{name}' not found.")
                 return
@@ -1472,7 +1744,7 @@ def main() -> None:
             if not name:
                 print("No project specified.")
                 return
-            p = mgr.load(name)
+            p = mgr.load(name)  # type: ignore[assignment]
             if not p:
                 print(f"Project '{name}' not found.")
                 return
@@ -1489,7 +1761,7 @@ def main() -> None:
 
         elif args.subcommand == "export":
             from .export import export_project
-            p = mgr.load(args.name)
+            p = mgr.load(args.name)  # type: ignore[assignment]
             if not p:
                 print(f"Project '{args.name}' not found.")
                 return
@@ -1523,7 +1795,7 @@ def main() -> None:
             if not name:
                 print("No project specified.")
                 return
-            p = mgr.load(name)
+            p = mgr.load(name)  # type: ignore[assignment]
             if not p:
                 print(f"Project '{name}' not found.")
                 return
@@ -1534,7 +1806,7 @@ def main() -> None:
             if not name:
                 print("No project specified.")
                 return
-            p = mgr.load(name)
+            p = mgr.load(name)  # type: ignore[assignment]
             if not p:
                 print(f"Project '{name}' not found.")
                 return
@@ -1696,16 +1968,26 @@ def _get_active_project():
     return mgr.get_active()
 
 
-def _count_sarif_results(run_dir: Path):
-    """Count total results across all SARIF files in a run directory."""
+def _count_sarif_results_in_dir(run_dir: Path) -> int:
+    """Count total results across all SARIF files in a run directory.
+
+    Per-file counting goes through the shared shape-tolerant
+    ``core.sarif.parser.count_results`` — these files sit in run
+    directories (tool-emitted, operator-editable), and the inline
+    loop this replaces raised on a non-dict run entry, taking the
+    whole /project status rendering down with one malformed file.
+    """
+    from core.coverage.record import RUN_ARTIFACT_MAX_BYTES
     from core.json import load_json
+    from core.sarif.parser import count_results
     count = 0
     for sarif_path in run_dir.glob("*.sarif"):
-        data = load_json(sarif_path)
-        if not data or not isinstance(data, dict):
-            continue
-        for run in (data.get("runs") or []):
-            count += len(run.get("results") or [])
+        # Budgeted (run-artifact class): /project status loads every
+        # run's SARIF wholesale just to COUNT — an oversize plant in a
+        # sandbox-writable run dir must degrade to 0, not buffer
+        # unbounded per file listed.
+        count += count_results(
+            load_json(sarif_path, max_bytes=RUN_ARTIFACT_MAX_BYTES))
     return count
 
 
@@ -1745,7 +2027,7 @@ def _get_output_summary(run_dir, meta):
         # preserving for code-only runs and additive for SCA.
         result = f"{count_vulns(findings)} findings"
     else:
-        sarif_count = _count_sarif_results(run_dir)
+        sarif_count = _count_sarif_results_in_dir(run_dir)
         result = f"{sarif_count} results" if sarif_count else ""
 
     # Cache in metadata for completed/failed runs (won't change)
@@ -1753,9 +2035,21 @@ def _get_output_summary(run_dir, meta):
     if result and status in ("completed", "failed"):
         meta_path = run_dir / RUN_METADATA_FILE
         if meta_path.exists() and meta:
-            meta["output_summary"] = result
-            meta["output_summary_v"] = summary_version
-            save_json(meta_path, meta)
+            # Same cross-process lock every other RMW on this file
+            # takes (start_run, _update_status, write_run_pin) — an
+            # unlocked save of the pre-computed snapshot raced
+            # concurrent marker writers (a pin rewrite, another status
+            # invocation) and clobbered their update. Re-load inside
+            # the lock and add ONLY the cache keys.
+            # _load_meta, not bare load_json: the marker is sandbox-
+            # writable and every reader carries the metadata budget.
+            from core.run.metadata import _load_meta, _metadata_lock
+            with _metadata_lock(meta_path):
+                fresh = _load_meta(meta_path)
+                if isinstance(fresh, dict):
+                    fresh["output_summary"] = result
+                    fresh["output_summary_v"] = summary_version
+                    save_json(meta_path, fresh)
 
     return result
 
@@ -1775,6 +2069,220 @@ def _resolve_project_or_exit(mgr, name):
         print(_red(f"Project '{name}' not found."), file=sys.stderr)
         sys.exit(1)
     return name, p
+
+
+def _handle_graph(mgr, args: argparse.Namespace) -> None:
+    """Manage the persistent /understand graph store for a project."""
+    name = args.name or _get_active_project()
+    if not name:
+        print(_red("No project specified. "
+                    "Use: raptor project graph <action> <name>, "
+                    "or set an active project first."))
+        return
+    p = mgr.load(name)
+    if not p:
+        print(_red(f"Project '{name}' not found."))
+        return
+
+    from core.understand_graph import graph_path_for_run
+    graph_path = graph_path_for_run(Path(p.output_dir))
+
+    if args.action == "status":
+        if not graph_path.exists():
+            print(f"Project '{name}': no graph store.")
+            return
+        from core.understand_graph import graph_summary
+        info = graph_summary(graph_path)
+        size = graph_path.stat().st_size
+        if size >= 1024 * 1024:
+            size_str = f"{size / 1024 / 1024:.1f}MB"
+        elif size >= 1024:
+            size_str = f"{size / 1024:.1f}KB"
+        else:
+            size_str = f"{size}B"
+        mtime = datetime.fromtimestamp(
+            graph_path.stat().st_mtime, tz=timezone.utc)
+        from core.understand_graph.schema import SCHEMA_VERSION
+        total_nodes = sum(info.get("nodes", {}).values())
+        total_edges = sum(info.get("edges", {}).values())
+        print(f"Graph store: {graph_path}")
+        print(f"  Size: {size_str}")
+        print(f"  Schema: v{SCHEMA_VERSION}")
+        print(f"  Last modified: {mtime:%Y-%m-%d %H:%M:%S UTC}")
+        print(f"  Nodes: {total_nodes}")
+        print(f"  Edges: {total_edges}")
+        snap = info.get("latest_snapshot")
+        if snap:
+            # Graph-store metadata is a RAPTOR-written artifact, but a
+            # tampered store reaches the terminal here — scrub like
+            # every other artifact-derived render lane.
+            _when = sanitise_for_terminal(str(snap.get('created_at', '?')), max_len=64)
+            _prod = sanitise_for_terminal(str(snap.get('producer', '?')), max_len=64)
+            print(f"  Latest snapshot: {_when} ({_prod})")
+
+    elif args.action == "stats":
+        if not graph_path.exists():
+            print(f"Project '{name}': no graph store.")
+            return
+        from core.understand_graph import graph_summary
+        info = graph_summary(graph_path)
+        nodes = info.get("nodes", {})
+        edges = info.get("edges", {})
+        if not nodes and not edges:
+            print(f"Project '{name}': graph is empty.")
+            return
+        print(f"Graph store: {graph_path.name}")
+        if nodes:
+            print("\n  Node counts by type:")
+            for kind in sorted(nodes, key=lambda k: -nodes[k]):
+                print(f"    {kind:<24s} {nodes[kind]:>6d}")
+            print(f"    {'TOTAL':<24s} {sum(nodes.values()):>6d}")
+        if edges:
+            print("\n  Edge counts by type:")
+            for kind in sorted(edges, key=lambda k: -edges[k]):
+                print(f"    {kind:<24s} {edges[kind]:>6d}")
+            print(f"    {'TOTAL':<24s} {sum(edges.values()):>6d}")
+
+    elif args.action == "clear":
+        if not graph_path.exists():
+            print(f"Project '{name}': no graph store to clear.")
+            return
+        from core.understand_graph import remove_graph_db
+        if remove_graph_db(graph_path):
+            print(_green(f"Cleared graph store for '{name}'"))
+        else:
+            print(f"✗ Could not fully clear graph store for '{name}': "
+                  f"{graph_path}", file=sys.stderr)
+
+    elif args.action == "rebuild":
+        from core.understand_graph import rebuild_graph
+        result = rebuild_graph(Path(p.output_dir))
+        if result and result.exists():
+            from core.understand_graph import graph_summary
+            info = graph_summary(result)
+            total_nodes = sum(info.get("nodes", {}).values())
+            total_edges = sum(info.get("edges", {}).values())
+            print(_green(
+                f"Rebuilt graph for '{name}': "
+                f"{total_nodes} nodes, {total_edges} edges"))
+        else:
+            print(f"No artefacts found to rebuild from in '{name}'.")
+
+
+def _handle_ledger(mgr, args: argparse.Namespace) -> None:
+    """Engagement artifact ledger verbs (build / status / show).
+
+    Rendering discipline: every target-derived value the ledger holds
+    reaches this terminal only through the module's own escape-at-
+    render helpers (`core.security.log_sanitisation` contract).
+    """
+    # Positional reshuffle (the ``binary clear <project>`` idiom):
+    # build/status take no artifact, so their lone positional is the
+    # project name — without this, ``ledger build myproj`` would bind
+    # ``myproj`` to the artifact slot and silently run against the
+    # ACTIVE project instead.
+    if args.action in ("build", "status") and args.artifact and not args.name:
+        args.name, args.artifact = args.artifact, None
+    name = args.name or _get_active_project()
+    if not name:
+        print(_red("No project specified. "
+                   "Use: raptor project ledger <action> [...] <name>, "
+                   "or set an active project first."))
+        return
+    p = mgr.load(name)
+    if not p:
+        print(_red(f"Project '{name}' not found."))
+        return
+
+    from core.engagement.ledger import (
+        LedgerCaps,
+        build_ledger,
+        load_ledger,
+        render_artifact_lines,
+        render_status_lines,
+    )
+    output_dir = Path(p.output_dir)
+
+    if args.action == "build":
+        target = Path(p.target)
+        if not target.is_dir():
+            print(_red(
+                f"Project target is not a directory: "
+                f"{sanitise_for_terminal(str(target), max_len=200)}"))
+            return
+        for flag, value in (
+            ("--max-archive-children", args.max_archive_children),
+            ("--max-archive-bytes", args.max_archive_bytes),
+            ("--max-archive-depth", args.max_archive_depth),
+        ):
+            if value is not None and value < 0:
+                print(_red(f"{flag} must be >= 0 (got {value})"))
+                return
+        defaults = LedgerCaps()
+        caps = LedgerCaps(
+            max_archive_children=(
+                args.max_archive_children
+                if args.max_archive_children is not None
+                else defaults.max_archive_children),
+            max_archive_total_bytes=(
+                args.max_archive_bytes
+                if args.max_archive_bytes is not None
+                else defaults.max_archive_total_bytes),
+            max_archive_depth=(
+                args.max_archive_depth
+                if args.max_archive_depth is not None
+                else defaults.max_archive_depth),
+            expand_archives=not args.no_expand,
+        )
+        doc = build_ledger(target, output_dir, caps=caps)
+        counts = doc.get("counts") or {}
+        print(_green(
+            f"Ledger built: {counts.get('rows', 0)} row(s) → "
+            f"{output_dir / 'ledger.json'}"))
+        for cls, n in sorted((counts.get("by_class") or {}).items()):
+            print(f"  {cls:<20s} {n:>5d}")
+        residuals = doc.get("residuals") or []
+        if residuals:
+            print(f"  {len(residuals)} residual(s) — "
+                  "see `raptor project ledger status`")
+        return
+
+    ledger = load_ledger(output_dir)
+    if ledger is None:
+        print(f"Project '{name}': no ledger. "
+              "Run `raptor project ledger build` first.")
+        return
+
+    if args.action == "status":
+        for line in render_status_lines(ledger, output_dir):
+            print(line)
+        return
+
+    if args.action == "show":
+        if not args.artifact:
+            print(_red("Usage: raptor project ledger show "
+                       "<artifact-id> [<name>]"))
+            return
+        matches = [
+            row for row in ledger.get("rows") or []
+            if row.get("artifact_id") == args.artifact
+        ]
+        if not matches:
+            matches = [
+                row for row in ledger.get("rows") or []
+                if str(row.get("artifact_id", "")).startswith(
+                    args.artifact)
+            ]
+        if not matches:
+            print(_red(
+                "No artifact matches "
+                f"{sanitise_for_terminal(args.artifact, max_len=120)}"))
+            return
+        for i, row in enumerate(matches):
+            if i:
+                print()
+            for line in render_artifact_lines(row):
+                print(line)
 
 
 def _handle_trust(mgr, args: argparse.Namespace) -> None:
@@ -1883,7 +2391,7 @@ def _handle_settings(mgr, args: argparse.Namespace) -> None:
 
 def _handle_threat_model(mgr, args: argparse.Namespace) -> None:
     """Create, show, export, or resync a project's threat-model artefact."""
-    from core.json import load_json, save_json
+    from core.json import load_json
     from core.threat_model import (
         blank_for_project,
         diff_context_map,
@@ -1941,9 +2449,8 @@ def _handle_threat_model(mgr, args: argparse.Namespace) -> None:
                 return
         model = from_context_map(project, context_map) if context_map else blank_for_project(project)
         save_model(model, json_path, markdown_path)
-        project.threat_model_path = str(json_path)
-        project.threat_model_updated = model.updated_at
-        save_json(mgr.projects_dir / f"{name}.json", project.to_dict())
+        mgr.update_threat_model_stamp(
+            name, updated_at=model.updated_at, path=str(json_path))
         print(_green(f"Threat model initialised for '{name}'"))
         print(f"  json:     {json_path}")
         print(f"  markdown: {markdown_path}")
@@ -1951,7 +2458,7 @@ def _handle_threat_model(mgr, args: argparse.Namespace) -> None:
             print(f"  focus areas: {len(model.focus_areas)}")
         return
 
-    model = load_model(json_path)
+    model = load_model(json_path)  # type: ignore[assignment]
     if not model:
         print(_yellow(f"Project '{name}' has no threat model yet."))
         print(f"Run: raptor project threat-model init {name}")
@@ -2015,15 +2522,14 @@ def _handle_threat_model(mgr, args: argparse.Namespace) -> None:
         except RuntimeError as e:
             print(_red(f"Save refused (concurrent writer?): {e}"))
             return
-        project.threat_model_updated = model.updated_at
-        save_json(mgr.projects_dir / f"{name}.json", project.to_dict())
+        mgr.update_threat_model_stamp(name, updated_at=model.updated_at)
         print(f"  {field}: {len(current)} entries")
         return
 
     if args.action == "sync":
         markdown_path.write_text(render_markdown(model), encoding="utf-8")
-        project.threat_model_updated = datetime.now(timezone.utc).isoformat()
-        save_json(mgr.projects_dir / f"{name}.json", project.to_dict())
+        mgr.update_threat_model_stamp(
+            name, updated_at=datetime.now(timezone.utc).isoformat())
         print(_green(f"Threat model markdown synced: {markdown_path}"))
         return
 
@@ -2044,11 +2550,15 @@ def _handle_threat_model(mgr, args: argparse.Namespace) -> None:
         info = len([i for i in issues if i.get("severity") == "info"])
         print(f"Threat model lint: {errors} errors, {warnings} warnings, {info} info")
         for issue in issues:
+            # Lint messages can quote threat-model / context-map text
+            # (LLM-refreshed fields) — terminal lane, escape at print.
             print(
                 "  - {severity}: {field}: {message}".format(
-                    severity=str(issue.get("severity", "info")).title(),
-                    field=issue.get("field", "?"),
-                    message=issue.get("message", ""),
+                    severity=sanitise_for_terminal(
+                        str(issue.get("severity", "info")).title(),
+                        max_len=40),
+                    field=sanitise_for_terminal(str(issue.get("field", "?")), max_len=120),
+                    message=sanitise_for_terminal(str(issue.get("message", "")), max_len=500),
                 )
             )
         return
@@ -2076,7 +2586,10 @@ def _handle_threat_model(mgr, args: argparse.Namespace) -> None:
             values = drift.get(key) or []
             print(f"  {key}: {len(values)}")
             for value in values[:8]:
-                print(f"    - {value}")
+                # Drift summaries interpolate context-map fields
+                # (LLM-refreshed) — terminal lane, escape at print
+                # like the adjacent lint action.
+                print(f"    - {sanitise_for_terminal(str(value), max_len=300)}")
         return
 
     if args.action == "report":
@@ -2087,7 +2600,7 @@ def _handle_threat_model(mgr, args: argparse.Namespace) -> None:
                 print(_red(f"Not a context-map JSON object: {args.context_map}"))
                 return
         lint = lint_model(model)
-        drift = diff_context_map(model, context_map) if context_map else None
+        drift = diff_context_map(model, context_map) if context_map else None  # type: ignore[assignment]
         if args.json_out:
             _emit_json_payload({
                 "report": str(report_path),
@@ -2138,12 +2651,15 @@ def _print_status(project) -> None:
         project_threat_model_paths,
     )
 
+    from core.security.log_sanitisation import sanitise_for_terminal
+
     print(f"Project: {project.name}")
     if project.description:
-        from core.security.log_sanitisation import sanitise_for_terminal
         print("Description: "
               f"{sanitise_for_terminal(project.description, max_len=500)}")
-    print(f"Target: {project.target}")
+    # target/description arrive via project-import zips too — same
+    # defang as the `list` view of the identical fields.
+    print(f"Target: {sanitise_for_terminal(str(project.target or ''), max_len=256)}")
     print(f"Output: {project.output_dir}")
     print(f"Created: {project.created[:10] if project.created else 'unknown'}")
     # Containment-defended resolution (see _project_threat_model_json_path
@@ -2158,7 +2674,6 @@ def _print_status(project) -> None:
     else:
         print("Threat model: not initialised")
     if project.notes:
-        from core.security.log_sanitisation import sanitise_for_terminal
         print(f"Notes: {sanitise_for_terminal(project.notes, max_len=2000)}")
 
     # Trust block — trust state must never be invisible.
@@ -2173,7 +2688,8 @@ def _print_status(project) -> None:
     # dict (description/notes/threat-model already have lines above).
     setting_parts = [
         f"{k}={v}" for k, v in project.settings_view().items()
-        if v and (k == "target-kind" or k.startswith("build-command"))
+        if v and (k in ("target-kind", "sandbox-floor")
+                  or k.startswith("build-command"))
     ]
     print("Settings: " + (", ".join(setting_parts)
                           if setting_parts else "(defaults)"))
@@ -2181,14 +2697,29 @@ def _print_status(project) -> None:
     runs = project.get_run_dirs(sweep=False)
     if runs:
         print(f"\nRuns: {len(runs)}")
-        name_col = max(max(len(d.name) for d in runs) + 2, 20)
+        # Column width from the ESCAPED names (what actually prints):
+        # escaping can lengthen a hostile name, and a raw-length column
+        # would misalign every row after it.
+        shown_names = {d: sanitise_for_terminal(d.name, max_len=120)
+                       for d in runs}
+        name_col = max(max(len(s) for s in shown_names.values()) + 2, 20)
         for d in runs:
             meta = load_run_metadata(d)
             if not isinstance(meta, dict):
                 meta = None
-            cmd = meta.get("command", "?") if meta else "?"
-            status = meta.get("status", "?") if meta else "?"
-            findings_str = _get_output_summary(d, meta)
+            # command/status/output_summary are child-writable run
+            # metadata restored verbatim: str()-coerce (a non-string
+            # cell would raise TypeError in the :12s format spec and
+            # wedge /project status on one junk marker) and escape
+            # before the terminal.
+            cmd = (sanitise_for_terminal(str(meta.get("command", "?")),
+                                         max_len=40)
+                   if meta else "?")
+            status = (sanitise_for_terminal(str(meta.get("status", "?")),
+                                            max_len=32)
+                      if meta else "?")
+            findings_str = sanitise_for_terminal(
+                str(_get_output_summary(d, meta)), max_len=64)
             if status == "completed":
                 status_str = _green(status)
             elif status == "failed":
@@ -2206,12 +2737,28 @@ def _print_status(project) -> None:
             tag = " ".join(
                 t for t in (format_sha_short(_manifest), format_repro_short(_manifest)) if t
             )
-            line = f"  {d.name:<{name_col}s}  {cmd:12s}  {findings_str:24s}  {status_str}"
+            line = (f"  {shown_names[d]:<{name_col}s}  {cmd:12s}  "
+                    f"{findings_str:24s}  {status_str}")
             print(f"{line}  {tag}" if tag else line)
+            # M5 (park is not silence): a run carrying unacknowledged
+            # engagement parks surfaces them right here, not only in
+            # the run dir. Best-effort — a corrupt marker never wedges
+            # /project status; the helper bounds and escapes every
+            # marker-derived field.
+            try:
+                from core.engagement.supervise import parked_run_line
+                parked = parked_run_line(d)
+            except Exception:
+                parked = None
+            if parked:
+                print(f"    ⚠ {parked}")
         # Disk usage — use os.walk(followlinks=False) so we stay inside
         # the run dir even if a stray symlink points outside (or back into
-        # the run, creating a loop). Path.rglob follows symlinked dirs on
-        # Python <3.13, so a symlink loop would hang status indefinitely.
+        # the run, creating a loop). Path.rglob follows symlinked dirs
+        # only via 3.13's recurse_symlinks=True opt-in (glob.glob's
+        # recursive mode is what followed them by default); the explicit
+        # os.walk idiom keeps the no-follow guarantee obvious — a
+        # followed symlink loop would hang status indefinitely.
         total_size = 0
         for d in runs:
             for root, _dirs, files in os.walk(d, followlinks=False):
@@ -2233,6 +2780,36 @@ def _print_status(project) -> None:
             print(f"\nDisk usage: {total_size / 1024:.1f}KB")
         else:
             print(f"\nDisk usage: {total_size}B")
+
+        # Graph store summary — best-effort, never breaks status
+        import sqlite3 as _graph_sqlite3
+        try:
+            from core.understand_graph import dashboard_summary, graph_path_for_run
+            _gp = graph_path_for_run(Path(project.output_dir))
+            if _gp.exists():
+                _gs = dashboard_summary(_gp)
+                totals = _gs.get("totals") or {}
+                if any(totals.values()):
+                    print(f"\nGraph store: {_gp.relative_to(Path(project.output_dir))}")
+                    parts = []
+                    for label, key in (
+                        ("entries", "entries"),
+                        ("sinks", "sinks"),
+                        ("findings", "scan_findings"),
+                        ("CodeQL", "codeql_results"),
+                        ("hypotheses", "hypotheses"),
+                        ("validated", "validated"),
+                    ):
+                        v = totals.get(key, 0)
+                        if v:
+                            parts.append(f"{v} {label}")
+                    if parts:
+                        print(f"  {', '.join(parts)}")
+                    cov = _gs.get("validation_coverage", 0.0)
+                    if cov > 0:
+                        print(f"  Validation coverage: {cov:.0%}")
+        except (ImportError, _graph_sqlite3.Error, KeyError, TypeError, ValueError):
+            pass
 
     else:
         print("\nNo runs.")
@@ -2264,18 +2841,22 @@ def _print_run_provenance(project, run_query) -> None:
     if len(matches) > 1:
         print(f"Ambiguous '{run_query}' — matches {len(matches)} runs:")
         for d in matches:
-            print(f"  {d.name}")
+            print(f"  {sanitise_for_terminal(d.name, max_len=120)}")
         return
 
     d = matches[0]
     raw_meta = load_run_metadata(d)
     meta = raw_meta if isinstance(raw_meta, dict) else {}
-    print(f"Run: {d.name}")
-    print(f"  Command: {meta.get('command', '?')}")
-    ts = (meta.get("timestamp") or "")[:19]
+    print(f"Run: {sanitise_for_terminal(d.name, max_len=120)}")
+    # command/status are child-writable run metadata — coerce + escape
+    # like the status view's run rows.
+    print(f"  Command: "
+          f"{sanitise_for_terminal(str(meta.get('command', '?')), max_len=40)}")
+    ts = str(meta.get("timestamp") or "")[:19]
     if ts:
-        print(f"  When: {ts}")
-    print(f"  Status: {meta.get('status', '?')}")
+        print(f"  When: {sanitise_for_terminal(ts, max_len=32)}")
+    print(f"  Status: "
+          f"{sanitise_for_terminal(str(meta.get('status', '?')), max_len=32)}")
     block = format_manifest_block(meta.get("manifest"))
     print(block or "  (no provenance manifest)")
 
@@ -2289,7 +2870,6 @@ def _print_coverage(project, detailed: bool=False, fail_under=None):
         render_coverage,
         store_coverage_threshold_met,
     )
-    from core.json import load_json
 
     base = Path(project.output_dir)
     try:
@@ -2298,12 +2878,14 @@ def _print_coverage(project, detailed: bool=False, fail_under=None):
         import logging as _logging
         _logging.getLogger(__name__).warning("failed to list run dirs: %s", exc)
         run_dirs = []
-    checklist = load_json(base / "checklist.json")
-    if not isinstance(checklist, dict):
-        checklist = None
+    # Accessor reads (checklist budget class): flock, project-symlink
+    # resolution, and the sharded checklist/ layout in one place.
+    from core.inventory import read_checklist
+    checklist = read_checklist(base) or None
+    if checklist is None:
         for d in run_dirs:
-            cl = load_json(d / "checklist.json")
-            if isinstance(cl, dict):
+            cl = read_checklist(d)
+            if cl:
                 checklist = cl
                 break
     store_path = base / "coverage.json"
@@ -2355,6 +2937,58 @@ def _print_findings(project, detailed: bool=False) -> None:
             print()
         _print_sca_findings_section(sca_findings, detailed)
 
+    # Re-adjudication signal: the merged view above deliberately lets
+    # a recorded disproof outrank a newer claim at the same site —
+    # surface the contradiction count so the fold is never SILENT.
+    # Counts only here (no finding-derived text reaches the terminal);
+    # /project report materialises the full queue artifact.
+    # Best-effort: an additive signal must never break the view.
+    try:
+        from .readjudication import (
+            SHAPE_CLAIM_AFTER_DISPROOF,
+            SHAPE_INTRA_RUN_SPLIT,
+            SHAPE_OVERTURN,
+            contradicted_disproof_count,
+            detect_project_contradictions,
+            queued_count,
+            shape_counts,
+            suppressed_count,
+        )
+        readj_records = detect_project_contradictions(run_dirs)
+        n_queued = queued_count(readj_records)
+        if n_queued:
+            n_suppressed = suppressed_count(readj_records)
+            # A capped queue must never read as complete.
+            capped = (f" +{n_suppressed} further not recorded "
+                      f"(record caps)" if n_suppressed else "")
+            counts = shape_counts(readj_records)
+            parts = []
+            if counts.get(SHAPE_CLAIM_AFTER_DISPROOF):
+                parts.append(
+                    f"{contradicted_disproof_count(readj_records)} "
+                    f"recorded disproof(s) contradicted by newer signals")
+            if counts.get(SHAPE_OVERTURN):
+                parts.append(
+                    f"{counts[SHAPE_OVERTURN]} confirmed verdict(s) "
+                    f"disproven by a later run")
+            if counts.get(SHAPE_INTRA_RUN_SPLIT):
+                parts.append(
+                    f"{counts[SHAPE_INTRA_RUN_SPLIT]} intra-run "
+                    f"final-verdict split(s)")
+            if not parts:
+                parts.append(f"{n_queued} contradiction signal(s)")
+            print()
+            print(
+                f"⚠️  {'; '.join(parts)} "
+                f"({n_queued} queued{capped}) — re-adjudication queue; run "
+                f"`/project report` to write the queue artifact. "
+                f"Nothing is auto-overturned."
+            )
+    except Exception:  # noqa: BLE001 — additive trail, never view-fatal
+        import logging as _logging
+        _logging.getLogger(__name__).debug(
+            "re-adjudication detection failed", exc_info=True)
+
 
 def _print_code_findings(merged, detailed: bool=False) -> None:
     """Render code findings as a grouped table (the original view)."""
@@ -2364,6 +2998,8 @@ def _print_code_findings(merged, detailed: bool=False) -> None:
         title_case_type,
         truncate_path,
     )
+
+    from core.security.log_sanitisation import sanitise_for_terminal
 
     from .findings_utils import count_vulns, group_findings
 
@@ -2391,11 +3027,21 @@ def _print_code_findings(merged, detailed: bool=False) -> None:
             loc = f"{fname}:{','.join(str(line) for line in lines_in_group)}"
         loc = truncate_path(loc) if loc else "—"
 
-        vtype = title_case_type(rep.get("vuln_type", ""))
-        status = get_display_status(rep)
+        # file/vuln_type/status are finding-derived (LLM-authored or
+        # restored verbatim by /project import) — escape before the
+        # aligned table is built so widths match what prints.
+        loc = sanitise_for_terminal(loc, max_len=120)
+        vtype = sanitise_for_terminal(
+            title_case_type(rep.get("vuln_type", "")), max_len=64)
+        status = sanitise_for_terminal(get_display_status(rep), max_len=32)
 
         cvss = rep.get("cvss_score_estimate")
-        cvss_str = str(cvss) if cvss is not None else "—"
+        # Same provenance as the three cells above (nothing upstream
+        # coerces it numeric — an import archive restores it verbatim),
+        # so it gets the same escape; also keeps len()-based column
+        # sizing honest for the aligned table below.
+        cvss_str = (sanitise_for_terminal(str(cvss), max_len=16)
+                    if cvss is not None else "—")
 
         grouped_rows.append((loc, vtype, status, cvss_str, findings, fpath))
 
@@ -2435,9 +3081,9 @@ def _print_code_findings(merged, detailed: bool=False) -> None:
             or rep.get("reasoning")
         )
         if reasoning and isinstance(reasoning, str):
-            rlines = reasoning.strip().split("\n")[:2]
+            rlines = reasoning.strip().split("\n")[:2]  # line-model: display slice; lines strip()-normalised and terminal-sanitised
             for ln in rlines:
-                print(f"{indent}{ln.strip()}")
+                print(f"{indent}{sanitise_for_terminal(ln.strip())}")
 
         # Proof
         proof_source = rep.get("proof_source")
@@ -2445,9 +3091,11 @@ def _print_code_findings(merged, detailed: bool=False) -> None:
         if proof_source or proof_sink:
             parts = []
             if proof_source:
-                parts.append(f"source: {proof_source}")
+                parts.append(
+                    f"source: {sanitise_for_terminal(str(proof_source), max_len=200)}")
             if proof_sink:
-                parts.append(f"sink: {proof_sink}")
+                parts.append(
+                    f"sink: {sanitise_for_terminal(str(proof_sink), max_len=200)}")
             print(f"{indent}Proof: {', '.join(parts)}")
 
         print()
@@ -2510,10 +3158,14 @@ def _print_sca_findings_section(sca_findings, detailed: bool=False) -> None:
     rows = []
     for f in ordered:
         sev = (f.get("severity") or "").strip()
+        # Package/kind/severity cells derive from the scanned tree's
+        # manifests and external OSV data (and survive /project import
+        # verbatim) — escape at construction so the column widths are
+        # computed from the escaped strings, like _print_status does.
         rows.append((
-            _sca_finding_package(f),
-            _sca_finding_kind(f),
-            sev.title() if sev else "—",
+            sanitise_for_terminal(str(_sca_finding_package(f)), max_len=120),
+            sanitise_for_terminal(str(_sca_finding_kind(f)), max_len=120),
+            sanitise_for_terminal(sev.title(), max_len=40) if sev else "—",
         ))
 
     headers = ("Package", "Kind", "Severity")
@@ -2533,21 +3185,30 @@ def _print_sca_findings_section(sca_findings, detailed: bool=False) -> None:
     print()
     pad = len(str(len(ordered)))
     indent = " " * (pad + 5)
+
     for i, f in enumerate(ordered, 1):
-        title = f.get("title") or _sca_finding_package(f)
+        # Advisory titles/descriptions come from external OSV/registry
+        # data (and survive /project import verbatim) — escape.
+        title = sanitise_for_terminal(
+            str(f.get("title") or _sca_finding_package(f)), max_len=200)
         print(f"  [{i:0{pad}d}] {title}")
         desc = f.get("description")
         if desc and isinstance(desc, str):
-            for ln in desc.strip().split("\n")[:2]:
-                print(f"{indent}{ln.strip()}")
+            for ln in desc.strip().split("\n")[:2]:  # line-model: display slice; lines strip()-normalised and terminal-sanitised
+                print(f"{indent}{sanitise_for_terminal(ln.strip())}")
         for reason in _sca_finding_escalations(f):
-            print(f"{indent}escalated: {reason}")
+            print(f"{indent}escalated: {sanitise_for_terminal(str(reason))}")
         print()
 
 
 def _finding_label(f) -> str:
-    """Location-based label for a finding."""
-    return f"{f.get('file', '?')}:{f.get('function', '?')}:{f.get('line', '?')}"
+    """Location-based label for a finding (terminal-safe: file and
+    function names are target-derived)."""
+    from .findings_utils import finding_file
+    return sanitise_for_terminal(
+        f"{finding_file(f) or '?'}:{f.get('function', '?')}:{f.get('line', '?')}",
+        max_len=200,
+    )
 
 
 def _parse_since(spec: str):
@@ -2591,12 +3252,18 @@ def _print_annotations(
     """
     from core.annotations import iter_all_annotations
 
+    from .findings_utils import safe_run_mtime
+
     # Candidate annotation roots: one per run dir + the project root.
     roots = []
     for rd in project.get_run_dirs(sweep=False):
         ann_dir = rd / "annotations"
         if ann_dir.exists():
-            roots.append((rd.stat().st_mtime, ann_dir))
+            # safe_run_mtime: the run dir can vanish between the
+            # exists() probe and the stat (concurrent /project clean,
+            # manual rm) — a vanished dir sorts oldest instead of
+            # crashing the listing.
+            roots.append((safe_run_mtime(rd), ann_dir))
     project_ann = Path(project.output_dir) / "annotations"
     if project_ann.exists():
         # Project-level annotations win over run-level (operator
@@ -2664,13 +3331,29 @@ def _print_annotations(
         return
 
     print(f"{len(anns)} annotation(s):")
-    file_w = max(len(a.file) for a in anns)
-    fn_w = max(len(a.function) for a in anns)
+    # File/function/status/source come from annotation .md files that
+    # agents (and /project import) write — a hand-crafted file bypasses
+    # the storage writer's validation, so every column is escaped at
+    # construction and the widths are computed from the escaped
+    # strings (the _print_status discipline).
+    rows = []
     for a in anns:
-        status = a.metadata.get("status", "-")
-        source = a.metadata.get("source", "-")
-        snippet = " ".join(a.body.split())[:60]
-        print(f"  {a.file:<{file_w}}  {a.function:<{fn_w}}  "
+        status = str(a.metadata.get("status", "-"))
+        source = str(a.metadata.get("source", "-"))
+        # Annotation bodies are free prose (agent-written ones are
+        # hint-tier, untrusted) — escape the excerpt.
+        snippet = sanitise_for_terminal(" ".join(a.body.split())[:60], max_len=80)
+        rows.append((
+            sanitise_for_terminal(a.file, max_len=200),
+            sanitise_for_terminal(a.function, max_len=120),
+            sanitise_for_terminal(status, max_len=40),
+            sanitise_for_terminal(source, max_len=40),
+            snippet,
+        ))
+    file_w = max(len(r[0]) for r in rows)
+    fn_w = max(len(r[1]) for r in rows)
+    for file_c, fn_c, status, source, snippet in rows:
+        print(f"  {file_c:<{file_w}}  {fn_c:<{fn_w}}  "
               f"{status:<14}  {source:<5}  {snippet}")
 
 
@@ -2687,8 +3370,34 @@ def _print_diff(result) -> None:
     if result["changed"]:
         print(f"Changed ({len(result['changed'])}):")
         for c in result["changed"]:
-            print(_yellow(f"  ~ {c['label']} ({c.get('status_before', '?')} → {c.get('status_after', '?')})"))
+            # label and both statuses are finding-derived (diff.py
+            # builds them raw for the JSON payload) — escape at the
+            # print site like the new/removed rows' _finding_label.
+            label = sanitise_for_terminal(str(c["label"]), max_len=200)
+            before = sanitise_for_terminal(
+                str(c.get("status_before", "?")), max_len=60)
+            after = sanitise_for_terminal(
+                str(c.get("status_after", "?")), max_len=60)
+            print(_yellow(f"  ~ {label} ({before} → {after})"))
     print(f"Unchanged: {result['unchanged']}")
+
+
+def _print_correlate_counts(counts: dict) -> None:
+    """One-line correlation header. Integer statistics only — every
+    value is int()-coerced so nothing foreign can render here."""
+    parts = [f"Runs: {int(counts.get('runs') or 0)}",
+             f"Findings: {int(counts.get('total_unique_findings') or 0)}"]
+    if counts.get("disagreements"):
+        parts.append(f"Disagreements: {int(counts['disagreements'])}")
+    if counts.get("new_findings"):
+        parts.append(f"New: {int(counts['new_findings'])}")
+    if counts.get("potentially_resolved"):
+        parts.append(f"Resolved?: {int(counts['potentially_resolved'])}")
+    if counts.get("token_enforcement_drift"):
+        parts.append(
+            f"Token drift: {int(counts['token_enforcement_drift'])}",
+        )
+    print(f"  {' | '.join(parts)}")
 
 
 def _do_correlate(project, json_out: bool=False) -> None:
@@ -2696,22 +3405,19 @@ def _do_correlate(project, json_out: bool=False) -> None:
 
     from .correlate import correlate_project
 
+    from core.security.log_sanitisation import sanitise_for_terminal
+
     result = correlate_project(project)
-    summary = result["summary"]
 
     if json_out:
-        print(dumps_display(result))
+        # ensure_ascii like _emit_json_payload (C1 controls pass raw
+        # through bare JSON); insertion order kept — this lane never
+        # sorted its keys.
+        print(json.dumps(result, indent=2, ensure_ascii=True, default=str))
         return
 
     print(f"Project: {project.name}")
-    parts = [f"Runs: {summary['runs']}", f"Findings: {summary['total_unique_findings']}"]
-    if summary["disagreements"]:
-        parts.append(f"Disagreements: {summary['disagreements']}")
-    if summary["new_findings"]:
-        parts.append(f"New: {summary['new_findings']}")
-    if summary["potentially_resolved"]:
-        parts.append(f"Resolved?: {summary['potentially_resolved']}")
-    print(f"  {' | '.join(parts)}")
+    _print_correlate_counts(result["summary"])
 
     # --- Actions (primary output) ---
     actions = result["actions"]
@@ -2726,17 +3432,24 @@ def _do_correlate(project, json_out: bool=False) -> None:
         print(f"  {'─' * 60}")
         for a in actions[:10]:
             sigil = _SIGILS.get(a["category"], "[?]")
-            label = a["category"].upper().replace("_", " ")
-            print(f"  {sigil} {label}  {a['summary']}")
+            label = sanitise_for_terminal(
+                a["category"].upper().replace("_", " "), max_len=32)
+            # Action summaries embed finding-derived text (files,
+            # vuln types) — escape every foreign field.
+            print(f"  {sigil} {label}  "
+                  f"{sanitise_for_terminal(str(a['summary']), max_len=200)}")
             detail = a.get("detail", {})
             if a["category"] == "disagreement":
                 for v in detail.get("verdicts", []):
-                    m = f" ({v['model']})" if v.get("model") else ""
-                    print(f"      {v['run']}: {v['status']}{m}")
+                    m = (f" ({sanitise_for_terminal(str(v['model']), max_len=64)})"
+                         if v.get("model") else "")
+                    print(f"      {sanitise_for_terminal(str(v['run']), max_len=64)}: "
+                          f"{sanitise_for_terminal(str(v['status']), max_len=32)}{m}")
             elif a["category"] == "resolved":
                 absent = detail.get("absent_from", [])
                 if absent:
-                    print(f"      absent from: {', '.join(absent)}")
+                    print("      absent from: "
+                          f"{sanitise_for_terminal(', '.join(absent), max_len=200)}")
         if len(actions) > 10:
             print(f"  ... and {len(actions) - 10} more (use --json for full list)")
     else:
@@ -2747,7 +3460,28 @@ def _do_correlate(project, json_out: bool=False) -> None:
     if suggested:
         print("\n  Next steps:")
         for cmd in suggested:
-            print(f"    → {cmd}")
+            print(f"    → {sanitise_for_terminal(str(cmd), max_len=200)}")
+
+    # --- Token-enforcement drift (compact, hint-tier) ---
+    token_drift = result.get("token_enforcement_drift") or []
+    if token_drift:
+        print(f"\n  Token-enforcement drift ({len(token_drift)}):")
+        for rec in token_drift[:10]:
+            print(
+                "    "
+                f"{sanitise_for_terminal(str(rec.get('file', '?')), max_len=120)}: "
+                f"{sanitise_for_terminal(str(rec.get('prior_status', '?')), max_len=32)}"
+                " -> "
+                f"{sanitise_for_terminal(str(rec.get('current_status', '?')), max_len=32)}"
+                f" [{sanitise_for_terminal(str(rec.get('change', '?')), max_len=32)}]"
+                f" ({sanitise_for_terminal(str(rec.get('prior_run', '?')), max_len=64)}"
+                " -> "
+                f"{sanitise_for_terminal(str(rec.get('current_run', '?')), max_len=64)})",
+            )
+        if len(token_drift) > 10:
+            print(f"    ... and {len(token_drift) - 10} more (use --json)")
+        print("    Hint-tier: a lost_enforcement row is re-review food for "
+              "token-guard disproofs, never an auto-overturn.")
 
     # --- Persistent findings (compact) ---
     persistent = result["persistent_findings"]
@@ -2757,11 +3491,13 @@ def _do_correlate(project, json_out: bool=False) -> None:
         for pf in display:
             models = ", ".join(pf.get("models") or []) or "—"
             rows.append((
-                f"{pf['file']}:{pf['line']}" if pf.get("file") else "?",
-                pf.get("vuln_type", ""),
-                pf.get("status", ""),
+                sanitise_for_terminal(
+                    f"{pf['file']}:{pf['line']}" if pf.get("file") else "?",
+                    max_len=120),
+                sanitise_for_terminal(str(pf.get("vuln_type", "")), max_len=64),
+                sanitise_for_terminal(str(pf.get("status", "")), max_len=32),
                 f"{pf['runs_seen']} runs",
-                models,
+                sanitise_for_terminal(models, max_len=120),
             ))
         headers = ("Location", "Type", "Status", "Seen", "Models")
         widths = [len(h) for h in headers]
@@ -2789,14 +3525,33 @@ def _do_clean(project, keep, dry_run, yes, dedup: bool=False) -> None:
     """Clean old runs from a project. With ``dedup``, the deletion set is the
     coverage-aware lossless subset (runs fully subsumed by a survivor) rather
     than recency-based ``--keep N``."""
-    from .clean import execute_clean, plan_clean, plan_dedup
+    from .clean import (
+        execute_clean,
+        execute_sources_sweep,
+        plan_clean,
+        plan_dedup,
+        plan_sources_sweep,
+    )
 
     plan = plan_dedup(project) if dedup else plan_clean(project, keep=keep)
 
     for name in plan.get("skipped_live", []):
         print(f"  Skipped (still running): {name}")
 
-    if not plan["deleted"]:
+    # Extraction-cache sweep rides every clean: _sources entries whose
+    # archive sha no surviving run (nor the project's own archive
+    # target) references are reclaimed alongside the runs. Bounded and
+    # age-gated — see plan_sources_sweep. Best-effort: a sweep-plan
+    # hiccup must never block the run clean.
+    try:
+        sources_plan = plan_sources_sweep(project, plan["delete_dirs"])
+    except Exception as exc:  # noqa: BLE001
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "sources sweep planning failed: %s", exc)
+        sources_plan = {"delete_dirs": [], "deleted": [], "freed_bytes": 0}
+
+    if not plan["deleted"] and not sources_plan["deleted"]:
         print("No redundant runs to dedup." if dedup else "Nothing to clean.")
         return
 
@@ -2810,6 +3565,13 @@ def _do_clean(project, keep, dry_run, yes, dedup: bool=False) -> None:
     freed_mb = plan['freed_bytes'] / 1024 / 1024
     total_runs = len(plan['deleted']) + len(plan['kept'])
     print(f"\n  Total: {total_runs} runs → {len(plan['kept'])} runs ({freed_mb:.1f}MB to free)")
+
+    if sources_plan["deleted"]:
+        src_mb = sources_plan["freed_bytes"] / 1024 / 1024
+        print(f"  _sources cache: {len(sources_plan['deleted'])} "
+              f"unreferenced extraction(s) to sweep ({src_mb:.1f}MB)")
+        for name in sources_plan["deleted"]:
+            print(f"    {sanitise_for_terminal(name, max_len=120)}")
 
     # Coverage-aware: classify what each removal costs (read-only).
     consequences = _classify_clean_coverage(project, plan)
@@ -2828,7 +3590,7 @@ def _do_clean(project, keep, dry_run, yes, dedup: bool=False) -> None:
         print("\n(dry run — no changes)")
         return
 
-    if not yes and input("\nProceed? [y/N] ").lower() != "y":
+    if not yes and not _confirm("\nProceed? [y/N] "):
         print("Cancelled.")
         return
 
@@ -2841,7 +3603,29 @@ def _do_clean(project, keep, dry_run, yes, dedup: bool=False) -> None:
     execute_clean(plan, output_path=project.output_path)
     for name in plan["deleted"]:
         print(_red(f"  Deleted: {name}"))
-    print(f"Done. {len(plan['deleted'])} runs deleted ({freed_mb:.1f}MB freed)")
+    if sources_plan["deleted"]:
+        # The sweep executor re-vets the plan at the last moment: the
+        # confirm wait above is unbounded and a cache HIT doesn't bump
+        # an entry's mtime, so a run that started while we waited can
+        # have re-referenced a planned entry. The refresh only ever
+        # SHRINKS the confirmed set; a re-plan failure deletes
+        # nothing. Same containment root as the run clean.
+        sources_plan = execute_sources_sweep(
+            project, sources_plan, plan["delete_dirs"],
+            output_path=project.output_path)
+        for name in sources_plan.get("skipped_referenced", []):
+            print("  Skipped (re-referenced since plan): _sources/"
+                  f"{sanitise_for_terminal(name, max_len=120)}")
+        for name in sources_plan["deleted"]:
+            print(_red("  Swept: _sources/"
+                       f"{sanitise_for_terminal(name, max_len=120)}"))
+    swept_note = ""
+    if sources_plan["deleted"]:
+        swept_note = (
+            f", {len(sources_plan['deleted'])} _sources extraction(s) "
+            f"swept ({sources_plan['freed_bytes'] / 1024 / 1024:.1f}MB)")
+    print(f"Done. {len(plan['deleted'])} runs deleted "
+          f"({freed_mb:.1f}MB freed){swept_note}")
 
 
 def _classify_clean_coverage(project, plan):
@@ -2850,9 +3634,9 @@ def _classify_clean_coverage(project, plan):
     hiccup must never block a clean. Returns [] when there's no inventory."""
     try:
         from core.coverage.clean import classify_removal
-        from core.json import load_json
+        from core.inventory import read_checklist
 
-        checklist = load_json(Path(project.output_dir) / "checklist.json")
+        checklist = read_checklist(Path(project.output_dir))
         victims = plan.get("delete_dirs", [])
         if not checklist or not victims:
             return []
@@ -2877,10 +3661,10 @@ def _apply_clean_coverage(project, plan, consequences) -> None:
     try:
         from core.coverage.clean import apply_removal
         from core.coverage.store import CoverageStore, coverage_store_lock
-        from core.json import load_json
+        from core.inventory import read_checklist
 
-        checklist = load_json(Path(project.output_dir) / "checklist.json")
-        if not isinstance(checklist, dict):
+        checklist = read_checklist(Path(project.output_dir))
+        if not checklist:
             return
         cov_path = Path(project.output_dir) / "coverage.json"
         # Lock the whole read-modify-write: a run completing mid-clean snapshots
@@ -2891,7 +3675,7 @@ def _apply_clean_coverage(project, plan, consequences) -> None:
                 apply_removal(store, victim, checklist, cons)
             store.save()
     except Exception as e:  # noqa: BLE001 — must never block a clean
-        print(_red(f"  (coverage snapshot skipped: {e})"))
+        print(_red(f"  (coverage snapshot skipped: {sanitise_for_terminal(str(e), max_len=300)})"))
 
 
 def _do_merge(project, merge_type, yes) -> None:
@@ -2902,10 +3686,41 @@ def _do_merge(project, merge_type, yes) -> None:
     from core.json import save_json
     from core.run.metadata import RUN_METADATA_FILE
 
-    from .clean import split_live_runs
+    from .clean import run_is_live, split_live_runs
     from .merge import merge_runs
 
     groups = project.get_run_dirs_by_type()
+
+    # `command` is child-writable run metadata restored verbatim
+    # (see core/project/report.py) and it becomes both the merged
+    # directory's name prefix AND terminal output.  Enforce the same
+    # direct-child-NAME contract remove/move already carry — a
+    # separator-bearing value ("../victim", "/home/user/.config")
+    # re-anchors the Path join and lets two planted markers steer the
+    # merge (and the source-run rmtree) outside the project — and
+    # keep raw bytes off the terminal.
+    # Leading "." / "_" are unsafe too: the merged dir would be named
+    # ".x-<ts>", which _list_run_dirs skips FOREVER while the source
+    # runs are rmtree'd on success — merged data invisible to
+    # status/findings/report/export. Length-capped so an
+    # over-NAME_MAX or NUL-bearing cmd_type refuses here instead of
+    # escaping as an uncaught OSError from the mkdir.
+    unsafe = {
+        k for k in groups
+        if not k or os.sep in k or (os.altsep and os.altsep in k)
+        or k in (".", "..")
+        or k.startswith((".", "_"))
+        or "\x00" in k
+        or len(k) > 64
+    }
+    for k in sorted(unsafe):
+        shown = sanitise_for_terminal(k, max_len=120)
+        print(f"  refusing to merge group with unsafe command type "
+              f"{shown!r} (run metadata is child-writable; "
+              "expected a plain name)")
+    groups = {
+        k: v for k, v in groups.items() if k not in unsafe
+    }
 
     if merge_type != "all":
         groups = {k: v for k, v in groups.items() if k == merge_type}
@@ -2916,7 +3731,12 @@ def _do_merge(project, merge_type, yes) -> None:
     for cmd_type, dirs in groups.items():
         rest, live = split_live_runs(dirs)
         for d in live:
-            print(f"  {cmd_type}: skipped (still running): {d.name}")
+            shown = sanitise_for_terminal(cmd_type, max_len=120)
+            # d.name can carry adopted/imported directory names —
+            # same keep-raw-bytes-off-the-terminal contract as the
+            # sibling merge prints.
+            print(f"  {shown}: skipped (still running): "
+                  f"{sanitise_for_terminal(d.name, max_len=120)}")
         filtered[cmd_type] = rest
     groups = filtered
 
@@ -2929,15 +3749,17 @@ def _do_merge(project, merge_type, yes) -> None:
 
     # Show plan
     for cmd_type, dirs in mergeable.items():
-        print(f"  {cmd_type}: {len(dirs)} runs → 1")
+        print(f"  {sanitise_for_terminal(cmd_type, max_len=120)}: "
+              f"{len(dirs)} runs → 1")
 
-    if not yes and input("\nProceed? [y/N] ").lower() != "y":
+    if not yes and not _confirm("\nProceed? [y/N] "):
         print("Cancelled.")
         return
 
     groups = mergeable
 
     for cmd_type, dirs in groups.items():
+        shown_type = sanitise_for_terminal(cmd_type, max_len=120)
         # Collision-prevention via unique_run_suffix — see core/run/output.py.
         merged_dir = project.output_path / f"{cmd_type}-{unique_run_suffix('-')}"
 
@@ -2947,7 +3769,7 @@ def _do_merge(project, merge_type, yes) -> None:
             # newest run wins ties (the documented latest-wins contract).
             stats = merge_runs(list(reversed(dirs)), merged_dir)
         except Exception as e:  # noqa: BLE001 — abort merge, keep sources
-            print(f"  {cmd_type}: merge failed — {e}")
+            print(f"  {shown_type}: merge failed — {sanitise_for_terminal(str(e), max_len=300)}")
             print("  Source runs preserved.")
             continue
 
@@ -2982,24 +3804,47 @@ def _do_merge(project, merge_type, yes) -> None:
             # write); source dirs stay on disk (no data lost). The
             # operator sees both the warning AND a clear "source
             # runs preserved" line so they know to re-run.
-            print(f"  {cmd_type}: ERROR — metadata write failed ({e})")
-            print(f"  {cmd_type}: source runs PRESERVED (merged output left at {merged_dir})")
+            print(f"  {shown_type}: ERROR — metadata write failed ({sanitise_for_terminal(str(e), max_len=300)})")
+            print(f"  {shown_type}: source runs PRESERVED (merged output left at {merged_dir})")
             continue
 
         # Delete source runs (continue on individual failures)
         failed_deletes = []
         for d in dirs:
+            # Liveness re-check immediately before the delete, exactly
+            # as execute_clean does: the plan-time split is arbitrarily
+            # stale by now (an unbounded operator confirm sits between
+            # plan and delete, and a planned run can be RESUMED in that
+            # gap) — a plan-time check alone rmtree'd in-flight runs.
+            # The merged copy already exists, so skipping only leaves a
+            # duplicate source dir behind, never loses data.
+            if run_is_live(Path(d)):
+                print(f"  {shown_type}: skipped delete (resumed while "
+                      f"merging): "
+                      f"{sanitise_for_terminal(d.name, max_len=120)}")
+                continue
             try:
                 shutil.rmtree(d)
             except Exception as e:  # noqa: BLE001 — continue past one failure
-                failed_deletes.append(f"{d.name}: {e}")
+                # rmtree exception text embeds child-writable file
+                # names from inside the run dir — escape at
+                # construction (the list-mediated print below relays
+                # it verbatim).
+                failed_deletes.append(
+                    f"{sanitise_for_terminal(d.name, max_len=120)}: "
+                    f"{sanitise_for_terminal(str(e), max_len=300)}")
         if failed_deletes:
             for msg in failed_deletes:
-                print(f"  {cmd_type}: warning — failed to delete {msg}")
+                print(f"  {shown_type}: warning — failed to delete {msg}")
 
+        # Documented convention (merge.py `_finding_key`): "N findings
+        # (M vulns)". Pre-fix the override relabelled the LOGICAL-vuln
+        # count as "findings" whenever the counts differed — exactly
+        # the case where the distinction matters.
         vuln_count = stats.get("unique_vulns", stats["unique_findings"])
+        findings_label = f"{stats['unique_findings']} findings"
         if vuln_count != stats["unique_findings"]:
-            findings_label = f"{vuln_count} findings"
-        else:
-            findings_label = f"{stats['unique_findings']} findings"
-        print(f"  {cmd_type}: merged {stats['runs_merged']} runs ({findings_label})")
+            findings_label = (
+                f"{stats['unique_findings']} findings ({vuln_count} vulns)"
+            )
+        print(f"  {shown_type}: merged {stats['runs_merged']} runs ({findings_label})")

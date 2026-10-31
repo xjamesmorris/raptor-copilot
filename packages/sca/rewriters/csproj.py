@@ -34,9 +34,14 @@ from __future__ import annotations
 import logging
 import re
 
-from core.atomic_fs import write_text_atomically as _atomic_write
-
-from . import RewriteEdit, RewriteResult, apply_version_edit, register
+from . import (
+    RewriteEdit,
+    RewriteResult,
+    apply_version_edit,
+    build_element_attr_version_pattern,
+    register,
+    rewrite_file_with,
+)
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -51,47 +56,39 @@ def _csproj_predicate(path: Path) -> bool:
 
 def _build_inline_version_pattern(include_name: str) -> re.Pattern:
     """``<PackageReference Include="X" Version="OLD" />`` — the
-    pre-CPM and CPM-with-inline shape."""
-    inc = re.escape(include_name)
-    return re.compile(
-        r"""(?P<open><PackageReference\b)"""
-        r"""(?P<prefix>[^>]*?Include\s*=\s*['"])"""
-        rf"""(?P<inc>{inc})"""
-        r"""(?P<inc_close>['"])"""
-        r"""(?P<mid>[^>]*?Version\s*=\s*['"])"""
-        r"""(?P<version>[^'"]*)"""
-        r"""(?P<ver_close>['"])""",
-        re.IGNORECASE,
+    pre-CPM and CPM-with-inline shape, either attribute order
+    (MSBuild is order-agnostic)."""
+    return build_element_attr_version_pattern(
+        ("PackageReference",), "Include", include_name, "Version",
     )
 
 
 def _build_version_override_pattern(include_name: str) -> re.Pattern:
     """``<PackageReference Include="X" VersionOverride="OLD" />`` —
-    CPM per-csproj override shape. Separate from the inline
-    pattern so the rewriter can pick which attribute to update."""
-    inc = re.escape(include_name)
-    return re.compile(
-        r"""(?P<open><PackageReference\b)"""
-        r"""(?P<prefix>[^>]*?Include\s*=\s*['"])"""
-        rf"""(?P<inc>{inc})"""
-        r"""(?P<inc_close>['"])"""
-        r"""(?P<mid>[^>]*?VersionOverride\s*=\s*['"])"""
-        r"""(?P<version>[^'"]*)"""
-        r"""(?P<ver_close>['"])""",
-        re.IGNORECASE,
+    CPM per-csproj override shape, either attribute order. Separate
+    from the inline pattern so the rewriter can pick which attribute
+    to update."""
+    return build_element_attr_version_pattern(
+        ("PackageReference",), "Include", include_name, "VersionOverride",
     )
 
 
 def _build_child_version_pattern(include_name: str) -> re.Pattern:
     """``<PackageReference Include="X"><Version>OLD</Version></PackageReference>``
-    — older child-element shape some projects use."""
+    — older child-element shape some projects use.
+
+    Attribute spans are ``[^<>]`` (not ``[^>]``): a raw ``<`` is
+    illegal inside an XML open tag, so real tags match identically,
+    while with ``[^>]`` every planted ``<PackageReference`` inside
+    an unclosed tag re-scanned the rest of it — quadratic on
+    hostile project files."""
     inc = re.escape(include_name)
     return re.compile(
         r"""(?P<open><PackageReference\b)"""
-        r"""(?P<prefix>[^>]*?Include\s*=\s*['"])"""
+        r"""(?P<prefix>[^<>]*?Include\s*=\s*['"])"""
         rf"""(?P<inc>{inc})"""
         r"""(?P<inc_close>['"])"""
-        r"""(?P<gap>[^>]*>\s*<Version>\s*)"""
+        r"""(?P<gap>[^<>]*>\s*<Version>\s*)"""
         r"""(?P<version>[^<]*?)"""
         r"""(?P<post>\s*</Version>\s*</PackageReference>)""",
         re.IGNORECASE,
@@ -116,30 +113,7 @@ def rewrite_csproj(
     matched only; the others are left alone to preserve
     operator intent. Logged at debug for diagnosis.
     """
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as e:
-        return [RewriteResult(edit=ed, applied=False,
-                              reason=f"error: read failed: {e}")
-                for ed in edits]
-
-    new_text = text
-    results: list[RewriteResult] = []
-    for edit in edits:
-        new_text, result = _apply_one(new_text, edit)
-        results.append(result)
-
-    if any(r.applied for r in results):
-        try:
-            _atomic_write(path, new_text)
-        except OSError as e:
-            return [
-                RewriteResult(edit=r.edit, applied=False,
-                              reason=f"error: write failed: {e}")
-                if r.applied else r
-                for r in results
-            ]
-    return results
+    return rewrite_file_with(path, edits, _apply_one)
 
 
 def _apply_one(text: str, edit: RewriteEdit) -> tuple[str, RewriteResult]:

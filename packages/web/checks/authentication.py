@@ -90,7 +90,9 @@ class BruteForceProtectionCheck(Check):
     risk = "intrusive"
     """Check if the login endpoint rate-limits repeated failures.
 
-    Makes at most 5 login attempts. Does NOT perform an actual dictionary attack.
+    Makes at most 6 login POSTs (5 rate-limit probes + 1 final
+    captcha/lockout-text probe). Does NOT perform an actual
+    dictionary attack.
     """
 
     def run(self, client, target_url, session=None, discovery=None):

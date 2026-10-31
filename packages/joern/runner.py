@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import signal
 import stat
 import shlex
 import shutil
@@ -22,14 +23,21 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from core.analysis._joern_lines import parse_marker_line, parse_marker_records
+from core.analysis._joern_lines import (
+    FLOW_RECORD_CHUNK_CHARS,
+    MarkerChunkAssembler,
+    parse_marker_records,
+)
+from core.atomic_fs.fs_lock import artifact_lock
 
+from .heap_ledger import heap_admission
 from .models import FlowStep, JoernCPG, JoernMethodSummary, JoernResult, TaintFlow
-from .prereqs import _joern_parse_path, _joern_path
-from typing import TYPE_CHECKING
+from .prereqs import _joern_parse_path, _joern_path, joern_tool_paths
+from .tunables import sandbox_cpu_limits
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -37,12 +45,23 @@ _JOERN_PARSE_BIN = "joern-parse"
 
 _QUERY_MAX_LEN = 4096
 
+# ADVISORY defence-in-depth, not a security boundary: the check is
+# purely textual, so string concatenation ("Process" + "Builder") or
+# any reflection primitive outside the list slips through — and the
+# validated query executes in the UNSANDBOXED joern --server JVM
+# (netns hides only the network; the JVM keeps full user-privilege
+# filesystem access). The real contract is that every in-tree query
+# author composes from static templates whose slots go through
+# _validate_substitution_value (identifier/qualified-name only) —
+# never pass composed or LLM-authored text to run_query()/query(),
+# with or without validate=True.
 _DANGEROUS_QUERY_PATTERNS = re.compile(
     r"java\.io\b|java\.nio\b|scala\.io\b"
     r"|java\.net\b|scala\.sys\b"
     r"|Runtime\.exec|ProcessBuilder|sys\.process"
     r"|Class\.forName|getDeclaredMethod|getDeclaredField"
-    r"|getRuntime",
+    r"|getRuntime|loadClass|getMethod\b|getConstructor"
+    r"|newInstance|MethodHandles|defineClass|setAccessible",
     re.IGNORECASE,
 )
 
@@ -96,9 +115,79 @@ def _escape_scala_string(value: str) -> str:
 #: identical line (drift-guarded by tests/test_template_json_escaping).
 SCALA_JSON_ESC_DEF = r'''def jsonEsc(v: String): String = v.replace("\\", "\\\\").replace("\"", "\\\"").replace("\r", "").replace("\n", " ").flatMap(c => if (c.toInt < 0x20 || c.toInt == 0x85 || c.toInt == 0x2028 || c.toInt == 0x2029) " " else c.toString)'''
 
+#: The one Scala-side record emitter for ``JOERN_FLOW`` lines. A record
+#: whose ``[...]`` payload fits ``FLOW_RECORD_CHUNK_CHARS`` emits as the
+#: classic single ``JOERN_FLOW:[...]`` line; a longer record emits as
+#: ordered ``JOERN_FLOW_PART:<i>/<n>/<len>:<fragment>`` lines that the
+#: parser (``core.analysis._joern_lines.MarkerChunkAssembler``)
+#: reassembles before JSON parsing — one overlong line used to be
+#: wrapped/truncated by REPL rendering caps, every fragment then failed
+#: per-line parsing, and the record was dropped. ``len`` is the
+#: fragment's exact length in Unicode CODE POINTS
+#: (``codePointCount``), never UTF-16 code units: the parse side is
+#: Python, whose ``len()`` counts code points, so declaring units
+#: would spuriously drop every chunked record carrying a non-BMP
+#: character (Scala ``String.length`` counts an astral char as 2).
+#: The cut steps back one unit when it would bisect a surrogate pair
+#: (``isHighSurrogate`` at the boundary): a split pair becomes two
+#: lone surrogates that the JVM stdout encoder replaces independently
+#: (one unit AND one code point each), which passes a naive length
+#: check and silently corrupts the reassembled record.
+#: jsonEsc has already flattened every line-break class out of record
+#: text, so fragments never split across transcript segments. Kept on
+#: ONE line, mirrored byte-identically into ``queries/*.sc``
+#: (drift-guarded by tests/test_flow_chunk_transport.py).
+SCALA_FLOW_EMIT_DEF = (
+    r'''def flowRecordLines(steps: String): List[String] = { val rec = "[" + steps + "]"; if (rec.length <= __CHUNK__) List("JOERN_FLOW:" + rec) else { val ps = List.unfold(0) { s => if (s >= rec.length) None else { val c = math.min(s + __CHUNK__, rec.length); val e = if (c < rec.length && Character.isHighSurrogate(rec.charAt(c - 1))) c - 1 else c; Some((rec.substring(s, e), e)) } }; ps.zipWithIndex.map { case (p, i) => "JOERN_FLOW_PART:" + (i + 1) + "/" + ps.size + "/" + p.codePointCount(0, p.length) + ":" + p } } }'''
+    .replace("__CHUNK__", str(FLOW_RECORD_CHUNK_CHARS))
+)
+
+
+#: Per-thread pin for the default sandbox runner. The default seam
+#: below re-resolves ``core.sandbox.run`` at every call, so a spawn
+#: made from a thread that outlives its submitter (the audit joern
+#: presweep) picks up whatever is globally live at SPAWN time — a
+#: transient process-wide patch of ``core.sandbox.run`` (test
+#: fixtures monkeypatch that seam) then silently steers a background
+#: build it never targeted. Submitters resolve the runner once via
+#: :func:`resolve_sandbox_runner` and pin it in the worker with
+#: :func:`bound_sandbox_runner`; an explicit ``subprocess_runner``
+#: argument still wins (the pin only replaces DEFAULT resolution).
+_thread_bound_runner = threading.local()
+
+
+def resolve_sandbox_runner() -> Callable[..., Any]:
+    """Resolve the default sandbox runner NOW, in the calling thread.
+
+    Submit-time companion to :func:`bound_sandbox_runner`: a caller
+    handing joern work to a background thread resolves the runner
+    while its own context is authoritative, then pins that resolution
+    for the worker. Raises exactly like the default seam (fail-closed
+    ``SandboxUnavailableError`` without the explicit opt-out).
+    """
+    return _default_sandbox_runner()
+
+
+@contextlib.contextmanager
+def bound_sandbox_runner(runner: Callable[..., Any]) -> Iterator[None]:
+    """Pin *runner* as the CURRENT thread's default sandbox runner.
+
+    Scoped and re-entrant: restores the previous pin (or none) on
+    exit. Other threads are unaffected.
+    """
+    prev = getattr(_thread_bound_runner, "runner", None)
+    _thread_bound_runner.runner = runner
+    try:
+        yield
+    finally:
+        _thread_bound_runner.runner = prev
+
 
 def _default_sandbox_runner():
     """Return the default sandbox runner for subprocess calls.
+
+    A thread-pinned runner (:func:`bound_sandbox_runner`) wins over
+    live resolution — see ``_thread_bound_runner``.
 
     Fail-closed: when ``core.sandbox`` cannot be imported this raises
     ``core.run.sandbox_policy.SandboxUnavailableError`` instead of
@@ -108,13 +197,31 @@ def _default_sandbox_runner():
     via ``RAPTOR_ALLOW_UNSANDBOXED_TOOLS=1`` (loud warning +
     security-event emission).
     """
+    bound = getattr(_thread_bound_runner, "runner", None)
+    if bound is not None:
+        return bound
     try:
         from core.sandbox import run as sandbox_run
         return sandbox_run
     except ImportError as exc:
         from core.run.sandbox_policy import require_sandbox_or_optout
         require_sandbox_or_optout("joern (CPG build / query runner)", exc)
-        return subprocess.run
+
+        def _unsandboxed_run(cmd, **kwargs):
+            # The opt-out waives the sandbox, never environment
+            # hygiene: joern parses untrusted source, and the bare
+            # subprocess.run fallback handed it the operator's FULL
+            # environment (tokens, GIT_* overrides). The stall-monitor
+            # twin already uses the sanitised env.
+            try:
+                from core.config import RaptorConfig
+                kwargs.setdefault("env", RaptorConfig.get_safe_env())
+            except ImportError:
+                pass
+            return subprocess.run(cmd, **kwargs)
+
+        _unsandboxed_run._raptor_unsandboxed = True
+        return _unsandboxed_run
 
 
 _STALL_CALIBRATION_FILES = 10
@@ -135,6 +242,31 @@ def _drain_stream(stream, chunks: list[str]) -> None:
             chunks.append(line)  # noqa: PERF402 — incremental drain, not a copy
     except (OSError, ValueError):
         pass
+
+
+def _kill_build_group(proc: subprocess.Popen) -> None:
+    """SIGKILL the joern-parse process GROUP, not just the leader.
+
+    joern-parse may be a shell wrapper that spawns the JVM without
+    exec (the shape ``JoernServer.stop()`` documents and defends): a
+    leader-only ``proc.kill()`` orphaned the wrapper-spawned JVM,
+    which kept parsing — and holding memory — after the stall/timeout
+    verdict. Only ``killpg`` when the pid still leads its own group
+    (the build Popen used ``start_new_session=True``; anything else
+    means reuse or a mock) and the group is not the caller's own —
+    mirroring the server's ``_signal_group``.
+    """
+    try:
+        pid = proc.pid
+        if pid != os.getpgid(pid) or pid == os.getpgrp():
+            raise ProcessLookupError
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError, TypeError,
+            AttributeError):
+        # Mock/handle shapes without a real leader pid keep the
+        # leader-only kill.
+        with contextlib.suppress(OSError):
+            proc.kill()
 
 
 class _StallMonitor:
@@ -174,6 +306,8 @@ class _StallMonitor:
     def run(self) -> None:
         """Read stderr line by line, track file processing times."""
         try:
+            if self._proc.stderr is None:
+                return
             for raw_line in self._proc.stderr:
                 line = raw_line.strip()
                 if not line:
@@ -218,8 +352,7 @@ class _StallMonitor:
                     self._total_files, elapsed, threshold,
                 )
                 self._killed = True
-                with contextlib.suppress(OSError):
-                    self._proc.kill()
+                _kill_build_group(self._proc)
                 return
 
     def _calibrate(self) -> None:
@@ -278,6 +411,17 @@ _CC_DB_NAME = "compile_commands.json"
 # plausibly hold a cmake/bear-generated database. First match wins.
 _CC_SEARCH_SUBDIRS = ("", "build", "builddir", "out", "Debug", "Release")
 _CC_MAX_BYTES = 32 * 1024 * 1024
+# Entry budget, both directions: RAISING it tokenises more TUs per run
+# (each entry is a bounded token walk; entry count is target-derived,
+# so a hostile database must not buy unbounded parse time — the OUTPUT
+# is already bounded by _CC_MAX_DEFINES/_CC_MAX_INCLUDES regardless).
+# LOWERING it misses config flags on ordinary databases. When it
+# binds, the budget is spread EVENLY across the database — index-based
+# even selection that fills the budget EXACTLY — rather than taking
+# the first N (cmake emits entries in directory order, so a prefix
+# slice reads one subsystem's flags; a ~25k-TU kernel database would
+# contribute only its first corner), and the selection ratio is
+# disclosed with a warning.
 _CC_MAX_ENTRIES = 2000
 _CC_MAX_TOKENS_PER_ENTRY = 512
 _CC_MAX_DEFINES = 64
@@ -406,9 +550,24 @@ def discover_frontend_args(target: Path) -> FrontendArgs:
     if not isinstance(entries, list):
         return _EMPTY_FRONTEND_ARGS
     if len(entries) > _CC_MAX_ENTRIES:
-        logger.info("compile_commands at %s has %d entries; scanning first %d",
-                    db, len(entries), _CC_MAX_ENTRIES)
-        entries = entries[:_CC_MAX_ENTRIES]
+        n = len(entries)
+        # Index-based even selection: exactly the budget, spread over
+        # the whole database, first entry always included. (NOT a
+        # stride slice — xs[::ceil(n/cap)] under-fills at non-divisible
+        # boundaries: n = cap + 1 selects only ~half the budget. Here
+        # the exact steps are n/cap > 1 apart, so rounding — which
+        # moves each index by < 0.5 — keeps them strictly increasing:
+        # cap distinct indices, always.)
+        entries = [
+            entries[round(i * n / _CC_MAX_ENTRIES)]
+            for i in range(_CC_MAX_ENTRIES)
+        ]
+        logger.warning(
+            "compile_commands at %s has %d entries; sampling %d evenly "
+            "across the database — macro/include config unique to "
+            "unsampled TUs is not recovered",
+            db, n, len(entries),
+        )
 
     defines: dict = {}
     undefined: set = set()
@@ -517,6 +676,7 @@ def build_cpg(
     subprocess_runner=None,
     on_progress: Callable | None = None,
     heap_mb: int | None = None,
+    heap_is_derived: bool = False,
     frontend_args: FrontendArgs | None = None,
     exclude_dirs=(),
 ) -> JoernCPG:
@@ -526,6 +686,13 @@ def build_cpg(
     (default: tempdir) as a binary file. ``heap_mb`` sets the JVM
     ``-Xms``/``-Xmx`` via the launcher's ``-J`` passthrough, matching
     JoernServer's heap flags; ``None`` keeps the JVM default.
+
+    ``heap_is_derived``: True when ``heap_mb`` came from the tuning
+    derivation rather than an operator. The parse JVM's heap is
+    admitted against the host-global ledger for exactly this call's
+    duration (:mod:`packages.joern.heap_ledger`): a derived heap may
+    be clamped when concurrent sessions have the budget committed;
+    an explicit heap registers but is never reduced.
 
     ``frontend_args``: sanitized c2cpg flags. ``None`` auto-discovers
     from the target's compile_commands.json when the pinned language
@@ -538,6 +705,34 @@ def build_cpg(
     ``--exclude-regex`` so the graph's coverage matches the content
     key's file set exactly (key/analysis parity).
     """
+    with heap_admission(heap_mb, derived=heap_is_derived) as granted_mb:
+        return _build_cpg_admitted(
+            target,
+            languages=languages,
+            output_dir=output_dir,
+            timeout=timeout,
+            subprocess_runner=subprocess_runner,
+            on_progress=on_progress,
+            heap_mb=granted_mb,
+            frontend_args=frontend_args,
+            exclude_dirs=exclude_dirs,
+        )
+
+
+def _build_cpg_admitted(
+    target: Path,
+    *,
+    languages: set[str] | None = None,
+    output_dir: Path | None = None,
+    timeout: int = 600,
+    subprocess_runner=None,
+    on_progress: Callable | None = None,
+    heap_mb: int | None = None,
+    frontend_args: FrontendArgs | None = None,
+    exclude_dirs=(),
+) -> JoernCPG:
+    """:func:`build_cpg`'s body, running under an already-admitted
+    heap grant (``heap_mb`` here is the GRANTED -Xmx)."""
     target = Path(target).resolve()
     if not target.is_dir():
         msg = f"target must be a directory: {target}"
@@ -553,6 +748,13 @@ def build_cpg(
         tmp_reaper.register_dir_prefix("raptor-joern-cpg-")
         output_dir = Path(tempfile.mkdtemp(prefix="raptor-joern-cpg-"))
     output_dir.mkdir(parents=True, exist_ok=True)
+    # Absolute from here on: output_dir feeds joern-parse argv
+    # (--output, -J-Djava.io.tmpdir) AND is the cwd pin for the bare
+    # spawn lanes below — a caller-relative dir must keep meaning
+    # "relative to the CALLER's cwd", not silently re-anchor to the
+    # pinned one. (target and the --exclude/--include operands are
+    # already resolved on their own paths.)
+    output_dir = output_dir.resolve()
 
     cpg_path = output_dir / "cpg.bin"
 
@@ -614,7 +816,7 @@ def build_cpg(
     start = time.monotonic()
 
     if on_progress is not None and subprocess_runner is None:
-        if runner is subprocess.run:
+        if getattr(runner, "_raptor_unsandboxed", False):
             # core.sandbox is unavailable — the stall-monitor's raw
             # Popen is the same trust level as the subprocess.run
             # fallback the non-monitor branch would use.
@@ -637,14 +839,31 @@ def build_cpg(
             target=str(target),
             output=str(output_dir),
             block_network=True,
+            tool_paths=joern_tool_paths(),
+            # The sandbox's standing RLIMIT_CPU counts CPU across all
+            # JVM threads and can fire long before this wall on large
+            # targets — size it to the wall so the wall stays the
+            # binding limit (SIGXCPU killed a kernel-scale build at
+            # ~1 h inside a 4 h derived wall).
+            limits=sandbox_cpu_limits(timeout),
         )
     except TypeError:
         try:
+            # Runner without the sandbox kwargs (injected stubs, bare
+            # subprocess.run). Still pass an explicit cwd: a bare
+            # runner inherits the CALLER's cwd, and any cwd-relative
+            # write from the launcher/JVM (importCpg drops a
+            # `workspace/` copy under the process cwd; observed once
+            # as workspace/cpg.bin debris at a repo root) must land
+            # in the run-owned output dir, never the directory the
+            # caller happened to run from. Mirrors the sandboxed lane
+            # above, whose runner defaults cwd to its `output=`.
             proc = runner(
                 cmd,
                 capture_output=True,
                 text=True,
                 timeout=timeout,
+                cwd=str(output_dir),
             )
         except subprocess.TimeoutExpired:
             logger.warning("joern-parse timed out after %ds", timeout)
@@ -715,6 +934,19 @@ def _build_cpg_with_stall_monitor(
             stderr=subprocess.PIPE,
             text=True,
             env=safe_env,
+            # Raw Popen inherits the CALLER's cwd — pin it to the
+            # build's own output dir (cpg_path's parent, created by
+            # build_cpg before cmd assembly) so any cwd-relative
+            # write from the launcher/JVM (importCpg drops a
+            # `workspace/` copy under the process cwd; observed once
+            # as workspace/cpg.bin debris at a repo root) lands in a
+            # run-owned directory, never the directory the caller
+            # happened to run from. Mirrors the sandboxed lane and
+            # the TypeError fallback in build_cpg.
+            cwd=str(cpg_path.parent),
+            # Own group, so the stall/timeout kills below can address
+            # the wrapper-spawned JVM too (see _kill_build_group).
+            start_new_session=True,
         )
     except OSError as e:
         logger.error("joern-parse failed to start: %s", e)
@@ -752,8 +984,13 @@ def _build_cpg_with_stall_monitor(
     try:
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
+        _kill_build_group(proc)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            for pipe in (proc.stdout, proc.stderr, proc.stdin):
+                if pipe is not None and not pipe.closed:
+                    pipe.close()
         logger.warning("joern-parse timed out after %ds", timeout)
         return _failed_build_cpg(cpg_path, target)
 
@@ -848,28 +1085,40 @@ def run_query(
         if err:
             return JoernResult(query=query, errors=[err])
 
+    # Per-query scratch dir INSIDE the CPG dir, used as the joern
+    # process cwd: importCpg copies the CPG into a `workspace/` under
+    # the cwd, and the CPG dir is a cache slot SHARED across sessions
+    # (build_cpg_cached) — two JVMs racing on one `<slot>/workspace/`
+    # corrupt each other's imports. A private cwd per query makes the
+    # workspace copy collision-free, and the whole dir is removed
+    # after the run. Kept inside the CPG dir so the sandbox write
+    # grant (`output=` below) covers it.
+    try:
+        query_dir = Path(tempfile.mkdtemp(
+            prefix="raptor-query-", dir=cpg.path.parent,
+        ))
+    except OSError as e:
+        return JoernResult(
+            query=query, errors=[f"cannot create query scratch dir: {e}"])
+
     # joern's CLI flag surface drifts across releases: `--script-content`
     # does not exist in 4.x, and `--import` there means "compile .sc onto
     # the classpath", not "load this CPG".  The stable interface across
     # versions is `--script` plus the importCpg predef, so wrap every
-    # query in a temporary script that loads the CPG itself.  Written
-    # next to the CPG so the sandbox read grant covers it.
+    # query in a temporary script that loads the CPG itself.
     wrapper = (
         f'importCpg("{_escape_scala_string(str(cpg.path))}")\n'
         f"{script_body}\n"
     )
+    wrapper_path = query_dir / "query.sc"
     try:
-        with tempfile.NamedTemporaryFile(
-            "w", dir=cpg.path.parent, suffix=".sc",
-            prefix="raptor-query-", delete=False,
-        ) as f:
-            f.write(wrapper)
-            wrapper_path = Path(f.name)
+        wrapper_path.write_text(wrapper)
     except OSError as e:
+        shutil.rmtree(query_dir, ignore_errors=True)
         return JoernResult(query=query, errors=[f"cannot write query script: {e}"])
 
-    # Point the driver JVM's java.io.tmpdir at the CPG dir (already
-    # the sandbox's writable surface and the caller's to clean).
+    # Point the driver JVM's java.io.tmpdir at the per-query dir (a
+    # writable surface inside the sandbox grant, removed below).
     # This does NOT capture the script-wrapping scratch
     # (scala-repl-pp*/ and wrapped-script*.sc land in /tmp from a
     # nested JVM the argv flag never reaches; only an _JAVA_OPTIONS
@@ -877,7 +1126,7 @@ def run_query(
     # — those strays are reaped by core.run.tmp_reaper instead.
     cmd = [
         joern,
-        f"-J-Djava.io.tmpdir={cpg.path.parent}",
+        f"-J-Djava.io.tmpdir={query_dir}",
         "--script", str(wrapper_path),
     ]
 
@@ -886,9 +1135,9 @@ def run_query(
     start = time.monotonic()
     try:
         try:
-            # cwd + output grant point at the CPG dir: importCpg copies
-            # the CPG into a `workspace/` under the process cwd, which
-            # must be writable inside the sandbox.
+            # cwd = the per-query dir; the output grant stays the CPG
+            # dir (its parent) so both the scratch cwd and the CPG
+            # itself are writable inside the sandbox.
             proc = runner(
                 cmd,
                 capture_output=True,
@@ -896,8 +1145,14 @@ def run_query(
                 timeout=timeout,
                 target=str(cpg.target),
                 output=str(cpg.path.parent),
-                cwd=str(cpg.path.parent),
+                cwd=str(query_dir),
                 block_network=True,
+                tool_paths=joern_tool_paths(),
+                # This single wall covers importCpg + the query solve,
+                # both multi-threaded JVM work: keep RLIMIT_CPU (which
+                # sums across threads) above wall x CPUs so the wall
+                # stays the binding limit.
+                limits=sandbox_cpu_limits(timeout),
             )
         except TypeError:
             # Runner without the sandbox kwargs (injected stubs,
@@ -912,7 +1167,7 @@ def run_query(
                 capture_output=True,
                 text=True,
                 timeout=timeout,
-                cwd=str(cpg.path.parent),
+                cwd=str(query_dir),
             )
     except subprocess.TimeoutExpired:
         return JoernResult(
@@ -922,10 +1177,7 @@ def run_query(
     except OSError as e:
         return JoernResult(query=query, errors=[str(e)])
     finally:
-        try:
-            wrapper_path.unlink()
-        except OSError:
-            pass
+        shutil.rmtree(query_dir, ignore_errors=True)
 
     elapsed = int((time.monotonic() - start) * 1000)
 
@@ -1076,6 +1328,8 @@ import scala.util.Try
 
 ''' + SCALA_JSON_ESC_DEF + r'''
 
+''' + SCALA_FLOW_EMIT_DEF + r'''
+
 implicit val engineContext: EngineContext = EngineContext(config = EngineConfig(maxCallDepth = __MAX_CALL_DEPTH__))
 val source = __SOURCE_FILTER__
 val sink = cpg.call.name("__SINK_CALL__").argument
@@ -1084,7 +1338,7 @@ val sink = cpg.call.name("__SINK_CALL__").argument
 // lower = real flows silently dropped past the cap (the JOERN_FLOW
 // protocol has no truncation marker). 500 mirrors tiered_taint.sc.
 val flows = sink.reachableByFlows(source).take(500).l
-val flowLines = flows.map { flow =>
+val flowLines = flows.flatMap { flow =>
   val steps = flow.elements.map { e =>
     val ln = e.lineNumber.getOrElse(0)
     val cd = jsonEsc(e.code.take(200))
@@ -1097,7 +1351,7 @@ val flowLines = flows.map { flow =>
     val flEsc = jsonEsc(fl)
     s"""{"line":${ln},"code":"${cd}","function":"${fnEsc}","file":"${flEsc}"}"""
   }.mkString(",")
-  "JOERN_FLOW:[" + steps + "]"
+  flowRecordLines(steps)
 }
 flowLines.foreach(println)
 "JOERN_FLOWS_START\n" + flowLines.mkString("\n") + "\nJOERN_FLOWS_END"
@@ -1202,6 +1456,64 @@ def run_output_exclude_dirs(
     return (str(out),)
 
 
+#: Source extensions the content key hashes — the same set the SLOC
+#: estimator measures, so estimate and key describe one file set.
+_CONTENT_KEY_SOURCE_EXTS = frozenset({
+    ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp",
+    ".py", ".java", ".js", ".ts", ".go", ".rs",
+})
+
+# Stat-only SLOC estimate density: source bytes per line. Measured
+# large C trees run ~30-34 bytes/line, so 32 is the midpoint. A
+# smaller divisor overestimates SLOC — derived CPG walls grow and a
+# hung frontend costs more before the kill; a larger one
+# underestimates — the derived wall can kill a legitimate build on
+# dense code. The 2x slack in the timeout curve absorbs the residual
+# density error either way.
+_EST_SOURCE_BYTES_PER_LINE = 32
+
+
+def estimate_in_scope_sloc(target: Path, *, exclude_dirs=()) -> int:
+    """Cheap (stat-only, no reads) SLOC estimate of the in-scope tree.
+
+    Walks with exactly the pruning rules of
+    :func:`_target_content_hash` (shared directory-name rule plus the
+    caller-declared ``exclude_dirs``), sums the sizes of files with a
+    content-key source extension, and converts bytes to lines via
+    :data:`_EST_SOURCE_BYTES_PER_LINE`. Feeds
+    :func:`core.tuning.derive_joern_cpg_timeout_s`; 0 means "no
+    measurable source" and reads as scope-size-unknown there.
+    """
+    excluded_roots = _resolved_exclude_dirs(exclude_dirs)
+    total_bytes = 0
+    for root, dirs, files in os.walk(target):
+        root_path = Path(root)
+        dirs[:] = [
+            d for d in dirs
+            if not _dir_name_excluded(d)
+            and (not excluded_roots
+                 or (root_path / d).resolve() not in excluded_roots)
+        ]
+        for name in files:
+            p = root_path / name
+            if p.suffix.lower() not in _CONTENT_KEY_SOURCE_EXTS:
+                continue
+            try:
+                # lstat, deliberately: a planted symlink named like
+                # source (huge.c -> an out-of-tree multi-GB file)
+                # must not inflate the estimate — an inflated
+                # estimate grows the derived CPG wall, so a hung
+                # frontend burns longer before the kill. The symlink
+                # entry itself fails S_ISREG and carries no bytes.
+                st = os.lstat(p)
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            total_bytes += st.st_size
+    return total_bytes // _EST_SOURCE_BYTES_PER_LINE
+
+
 def _target_content_hash(target: Path, *, exclude_dirs=()) -> str:
     """Content-only cache key for the target tree.
 
@@ -1229,10 +1541,7 @@ def _target_content_hash(target: Path, *, exclude_dirs=()) -> str:
     skipped, not opened — reading either blocks the orchestrator
     indefinitely.
     """
-    source_exts = {
-        ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp",
-        ".py", ".java", ".js", ".ts", ".go", ".rs",
-    }
+    source_exts = _CONTENT_KEY_SOURCE_EXTS
     excluded_roots = _resolved_exclude_dirs(exclude_dirs)
     entries = []
     for root, dirs, files in os.walk(target):
@@ -1262,10 +1571,19 @@ def _target_content_hash(target: Path, *, exclude_dirs=()) -> str:
             except OSError:
                 continue
             entries.append(
-                f"{p.relative_to(target)}:{digest.hexdigest()}")
+                (str(p.relative_to(target)), digest.hexdigest()))
     entries.sort()
     h = hashlib.sha256()
-    h.update("\n".join(entries).encode())
+    for rel, hexdigest in entries:
+        # Length-prefix the path: ':' and '\n' are legal in POSIX
+        # filenames, so joining "path:digest" lines lets two distinct
+        # trees serialise to identical bytes (a filename crafted to
+        # embed the separator and a sibling's line). The digest is
+        # fixed-width hex, so only the path needs the prefix.
+        rel_b = rel.encode()
+        h.update(len(rel_b).to_bytes(8, "big"))
+        h.update(rel_b)
+        h.update(hexdigest.encode())
     return h.hexdigest()[:16]
 
 
@@ -1346,12 +1664,143 @@ def _reject_empty_cpg(cpg_path: Path, languages: set[str] | None) -> bool:
     return False
 
 
+#: Unscoped CPG slot name — also the pre-slotting legacy layout, so
+#: existing single-slot caches keep loading (migration: the legacy
+#: slot IS the unscoped key).
+_CPG_SLOT_UNSCOPED = "joern-cpg"
+_CPG_SLOT_SCOPED_PREFIX = "joern-cpg-scope-"
+_CPG_SLOT_TARGET_PREFIX = "joern-cpg-target-"
+
+# Retained scoped-slot bound (keep-N by slot mtime; the unscoped slot
+# is never pruned — it holds the whole-tree graph, the costliest
+# rebuild, and its lifecycle predates slotting). Lower re-creates the
+# single-slot thrash slotting exists to fix: two alternating scoped
+# runs each re-buy a full CPG build per run. Higher lets multi-GB CPG
+# slots accumulate on the project disk with no consumer.
+_CPG_SCOPED_SLOTS_KEEP = 4
+
+
+def _normalised_scope_excludes(scope_exclude_dirs) -> list[str]:
+    """Canonical (resolved, sorted, stringified) scope-exclusion set."""
+    return sorted(str(p) for p in _resolved_exclude_dirs(scope_exclude_dirs))
+
+
+def cpg_cache_slot_name(scope_exclude_dirs=(), *, target=None) -> str:
+    """Cache slot for a scope-exclusion set (and, unscoped, a target).
+
+    Consumers key on their OWN scope: every distinct scoped set maps
+    to its own hash-suffixed slot — a scoped build can never evict
+    (or be served to) a consumer with a different scope. The unscoped
+    set keys on the TARGET path when one is given: pre-fix every
+    unscoped consumer shared ONE slot, so two projects analysed
+    alternately each re-bought a full multi-minute CPG build per run
+    (single-slot thrash), and under concurrency a handle returned for
+    one target could point at a slot just promoted for another. No
+    target keeps the legacy shared name (compat: legacy layouts and
+    external callers that only name slots).
+    """
+    norm = _normalised_scope_excludes(scope_exclude_dirs)
+    if norm:
+        digest = hashlib.sha256("\n".join(norm).encode()).hexdigest()[:12]
+        return f"{_CPG_SLOT_SCOPED_PREFIX}{digest}"
+    if target is None:
+        return _CPG_SLOT_UNSCOPED
+    key = str(Path(target).resolve())
+    digest = hashlib.sha256(key.encode()).hexdigest()[:12]
+    return f"{_CPG_SLOT_TARGET_PREFIX}{digest}"
+
+
+def _prune_scoped_cpg_slots(cache_dir: Path, *, active_slot: str) -> None:
+    """Bound retained keyed CPG slots to :data:`_CPG_SCOPED_SLOTS_KEEP`.
+
+    Scoped (``joern-cpg-scope-*``) and target-keyed
+    (``joern-cpg-target-*``) slots are bounded as SEPARATE pools —
+    a burst of scoped runs must not evict every project's whole-tree
+    graph and vice versa. The unscoped legacy slot is exempt (see the
+    keep constant).
+    """
+    _prune_cpg_slot_pool(
+        cache_dir, prefix=_CPG_SLOT_SCOPED_PREFIX, active_slot=active_slot)
+    _prune_cpg_slot_pool(
+        cache_dir, prefix=_CPG_SLOT_TARGET_PREFIX, active_slot=active_slot)
+
+
+def _prune_cpg_slot_pool(
+    cache_dir: Path, *, prefix: str, active_slot: str,
+) -> None:
+    """Keep-N (by slot mtime, newest first) for one slot-name pool.
+
+    The just-written slot is always kept. rmtree only a real
+    directory, never a planted symlink.
+    """
+    try:
+        slots = [
+            d for d in cache_dir.iterdir()
+            if d.name.startswith(prefix)
+            and d.is_dir() and not d.is_symlink()
+        ]
+    except OSError:
+        return
+    if len(slots) <= _CPG_SCOPED_SLOTS_KEEP:
+        return
+
+    def _mtime(d: Path) -> float:
+        try:
+            return d.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    slots.sort(key=_mtime, reverse=True)
+    for stale in slots[_CPG_SCOPED_SLOTS_KEEP:]:
+        if stale.name == active_slot:
+            continue
+        shutil.rmtree(stale, ignore_errors=True)
+        logger.info("pruned stale keyed CPG cache slot %s", stale)
+
+
+# In-progress build scratch under the cache dir (SAME filesystem as
+# the slots, so the promote below is an atomic os.replace). Hidden
+# name: slot discovery and the scoped-slot prune iterate the cache
+# dir by prefix and must never mistake scratch for a slot.
+_CPG_BUILD_DIR_PREFIX = ".cpg-build-"
+
+# Age bound for orphaned build scratch (builder crashed between
+# mkdtemp and its cleanup). Generous on purpose: the longest
+# legitimate build wall is the derived CPG-build cap (4 h) and a
+# too-tight bound would sweep a LIVE sibling's in-progress build out
+# from under it mid-write; much larger just leaves multi-GB scratch
+# on the project disk longer after a crash.
+_CPG_BUILD_DIR_MAX_AGE_S = 24 * 3600.0
+
+
+def _sweep_stale_cpg_build_dirs(cache_dir: Path) -> None:
+    """Remove crashed builders' orphaned scratch dirs (best-effort)."""
+    now = time.time()
+    try:
+        entries = list(cache_dir.iterdir())
+    except OSError:
+        return
+    for d in entries:
+        if not d.name.startswith(_CPG_BUILD_DIR_PREFIX):
+            continue
+        if not d.is_dir() or d.is_symlink():
+            continue
+        try:
+            age = now - d.stat().st_mtime
+        except OSError:
+            continue
+        if age > _CPG_BUILD_DIR_MAX_AGE_S:
+            shutil.rmtree(d, ignore_errors=True)
+            logger.info("removed stale CPG build scratch %s", d)
+
+
 def _write_cpg_manifest(
     cpg_dir: Path, target: Path, content_hash: str,
     languages: set[str] | None = None, build_time_ms: int = 0,
     frontend_args_fingerprint: str = "",
     method_count: int | None = None,
     exclude_dirs=(),
+    scope_exclude_dirs=(),
 ) -> None:
     """Write manifest.json alongside the cached CPG."""
     manifest = {
@@ -1367,6 +1816,9 @@ def _write_cpg_manifest(
         # key/analysis parity.
         "exclude_regex": CPG_EXCLUDE_REGEX,
         "exclude_dirs": sorted(str(d) for d in exclude_dirs or ()),
+        # The scope contract: consumers refuse a slot whose recorded
+        # scope differs from their own (see load_cached_cpg).
+        "scope_exclude_dirs": _normalised_scope_excludes(scope_exclude_dirs),
     }
     manifest_path = cpg_dir / "manifest.json"
     from core.json import save_json
@@ -1382,15 +1834,20 @@ def _read_cpg_manifest(cpg_dir: Path) -> dict | None:
     return load_json(manifest_path, max_bytes=8 * 1024 * 1024)
 
 
-def load_cached_cpg(
+def _load_cached_cpg_slot(
     target: Path,
-    cache_dir: Path,
+    cpg_dir: Path,
     *,
     expected_frontend_fingerprint: str | None = None,
     current_content_hash: str | None = None,
     exclude_dirs=(),
+    scope_exclude_dirs=(),
 ) -> JoernCPG | None:
-    """Return a cached CPG if fresh, None if stale or missing.
+    """Validate ONE slot directory against the consumer's contract.
+
+    All of :func:`load_cached_cpg`'s checks applied to an explicit
+    slot; the public wrapper owns slot RESOLUTION (target-keyed slot
+    first, then the legacy shared slot as a read-only fallback).
 
     ``expected_frontend_fingerprint``: when given, the manifest's
     recorded c2cpg frontend-args fingerprint must match it — a
@@ -1399,24 +1856,62 @@ def load_cached_cpg(
 
     ``current_content_hash``: precomputed :func:`_target_content_hash`
     of the target tree; ``None`` computes it here (with
-    ``exclude_dirs``). Callers that go on to rebuild pass it so the
-    freshness check and the rebuilt cache's manifest describe the
-    SAME tree state.
+    ``exclude_dirs`` plus ``scope_exclude_dirs``). Callers that go on
+    to rebuild pass it so the freshness check and the rebuilt cache's
+    manifest describe the SAME tree state.
+
+    ``scope_exclude_dirs`` (the run's scope COMPLEMENT — semantic
+    coverage exclusions, unlike the freshness-neutral run-artifact
+    ``exclude_dirs``) selects the cache slot: consumers key on their
+    OWN scope (:func:`cpg_cache_slot_name`), and the manifest's
+    recorded scope must match it exactly — an unscoped consumer
+    refuses a scoped graph and vice versa, whatever slot the file
+    sits in (covers legacy single-slot layouts and slot-name
+    collisions).
 
     Read-only consumers that pass neither hash nor ``exclude_dirs``
     reproduce the manifest's recorded exclusion contract: a graph
     built under caller-declared exclusions would otherwise hash the
     excluded run artifacts back into the key and read as permanently
     stale. Trusting the recorded list adds nothing an attacker did not
-    already have — the manifest carries ``content_hash`` itself.
+    already have — the manifest carries ``content_hash`` itself. The
+    recorded SCOPE list is never trusted that way: it must equal the
+    consumer's own scope, so the hash always reproduces exactly that
+    set.
     """
-    cpg_dir = cache_dir / "joern-cpg"
     cpg_path = cpg_dir / "cpg.bin"
     if not cpg_path.exists():
         return None
 
     manifest = _read_cpg_manifest(cpg_dir)
     if manifest is None:
+        return None
+
+    if not _same_target_path(manifest.get("target_path"), target):
+        # Built for a DIFFERENT target: whatever slot the file sits
+        # in (legacy shared layouts, slot-name collisions), a graph
+        # of another codebase must never answer this consumer's
+        # queries. A refusal, not staleness — this consumer rebuilds
+        # in its own slot without touching this one.
+        logger.info(
+            "CPG cache at %s refused (built for a different target) "
+            "— this consumer will rebuild in its own slot", cpg_dir,
+        )
+        return None
+
+    own_scope = _normalised_scope_excludes(scope_exclude_dirs)
+    recorded_scope = manifest.get("scope_exclude_dirs") or []
+    if recorded_scope != own_scope:
+        # Scope mismatch is a REFUSAL, not staleness: the graph's
+        # coverage was carved for a different scope, and serving it
+        # would let a scoped CPG answer an unscoped consumer's
+        # queries (or the reverse) as silent false negatives.
+        logger.info(
+            "CPG cache at %s refused (scope contract mismatch: "
+            "recorded %d scope exclusion(s), consumer has %d) — this "
+            "consumer will rebuild in its own slot",
+            cpg_dir, len(recorded_scope), len(own_scope),
+        )
         return None
 
     recorded_regex = manifest.get("exclude_regex")
@@ -1444,9 +1939,13 @@ def load_cached_cpg(
     if current_content_hash:
         current_hash = current_content_hash
     else:
-        effective_exclude = (
+        # The scope set joins the key unconditionally: it was
+        # verified equal to the consumer's own scope above, so this
+        # never trusts the manifest for anything the caller did not
+        # assert itself.
+        effective_exclude = tuple(
             exclude_dirs or manifest.get("exclude_dirs") or ()
-        )
+        ) + tuple(own_scope)
         current_hash = _target_content_hash(
             target, exclude_dirs=effective_exclude)
     if manifest.get("content_hash") != current_hash:
@@ -1480,7 +1979,29 @@ def load_cached_cpg(
         )
         return None
 
+    # Torn-read close: every check above ran against the manifest
+    # snapshot, but a concurrent builder promotes a new graph into
+    # this slot as unlink-manifest → replace cpg.bin → write-manifest.
+    # A reader that raced that sequence may have validated the OLD
+    # manifest against the NEW cpg.bin (or a mid-promote mix). If the
+    # manifest changed — or vanished — since the snapshot, report a
+    # miss and let the caller re-enter. The residual race (a promote
+    # landing after this re-read) can only serve a NEWER graph for the
+    # same slot contract, never a differently-scoped or (once slots
+    # are target-keyed) different-target one.
+    if _read_cpg_manifest(cpg_dir) != manifest:
+        logger.info(
+            "CPG cache at %s changed under this reader (concurrent "
+            "rebuild) — treating as a miss", cpg_dir,
+        )
+        return None
+
     langs = set(manifest.get("languages", []))
+    # Recency bump: the scoped-slot prune orders by slot mtime, which
+    # otherwise only moves at build time — a frequently-HIT old slot
+    # would evict before a never-read newer one. Best-effort.
+    with contextlib.suppress(OSError):
+        os.utime(cpg_dir)
     logger.info("CPG cache hit for %s (cache: %s)", target, cpg_dir)
     return JoernCPG(
         path=cpg_path,
@@ -1488,6 +2009,56 @@ def load_cached_cpg(
         languages=langs,
         build_time_ms=manifest.get("build_time_ms", 0),
     )
+
+
+def _same_target_path(recorded: object, target: Path) -> bool:
+    """True when a manifest's recorded target is this consumer's."""
+    if not isinstance(recorded, str) or not recorded:
+        return False
+    try:
+        return Path(recorded).resolve() == Path(target).resolve()
+    except OSError:
+        return False
+
+
+def load_cached_cpg(
+    target: Path,
+    cache_dir: Path,
+    *,
+    expected_frontend_fingerprint: str | None = None,
+    current_content_hash: str | None = None,
+    exclude_dirs=(),
+    scope_exclude_dirs=(),
+) -> JoernCPG | None:
+    """Return a cached CPG if fresh, None if stale or missing.
+
+    Slot resolution: scoped consumers key on their scope, unscoped
+    consumers on their TARGET (:func:`cpg_cache_slot_name`). An
+    unscoped miss falls back to READING the legacy shared slot —
+    whose manifest must name this exact target — so pre-migration
+    caches keep serving; new builds always land in the target-keyed
+    slot. Per-slot validation (target and scope contracts, exclusion
+    rules, content hash, structural probes, torn-read close) lives in
+    :func:`_load_cached_cpg_slot`, whose docstring describes the
+    keyword arguments.
+    """
+    slot = cpg_cache_slot_name(scope_exclude_dirs, target=target)
+    got = _load_cached_cpg_slot(
+        target, cache_dir / slot,
+        expected_frontend_fingerprint=expected_frontend_fingerprint,
+        current_content_hash=current_content_hash,
+        exclude_dirs=exclude_dirs,
+        scope_exclude_dirs=scope_exclude_dirs,
+    )
+    if got is None and slot.startswith(_CPG_SLOT_TARGET_PREFIX):
+        got = _load_cached_cpg_slot(
+            target, cache_dir / _CPG_SLOT_UNSCOPED,
+            expected_frontend_fingerprint=expected_frontend_fingerprint,
+            current_content_hash=current_content_hash,
+            exclude_dirs=exclude_dirs,
+            scope_exclude_dirs=scope_exclude_dirs,
+        )
+    return got
 
 
 def build_cpg_cached(
@@ -1499,24 +2070,39 @@ def build_cpg_cached(
     subprocess_runner=None,
     on_progress: Callable | None = None,
     heap_mb: int | None = None,
+    heap_is_derived: bool = False,
     exclude_dirs=(),
+    scope_exclude_dirs=(),
 ) -> JoernCPG:
     """Build or reuse a cached CPG for the target.
 
     cache_dir is typically the project directory. The CPG is stored
-    in cache_dir/joern-cpg/cpg.bin with a manifest for freshness.
-    Frontend args discovered from compile_commands.json join the
-    freshness contract: a flags change rebuilds even when source
-    contents are unchanged.
+    in ``cache_dir/<slot>/cpg.bin`` with a manifest for freshness,
+    where the slot is keyed by ``scope_exclude_dirs``, or by the
+    target path for unscoped builds (:func:`cpg_cache_slot_name`;
+    the legacy shared ``joern-cpg`` slot remains readable via
+    :func:`load_cached_cpg`'s fallback). Frontend args discovered from
+    compile_commands.json join the freshness contract: a flags change
+    rebuilds even when source contents are unchanged.
 
     ``exclude_dirs``: caller-declared exclusion roots (a run's
     configured output directory inside the target). They are pruned
     from the content key AND passed to the build as ``--exclude`` —
     the two must always travel together (key/analysis parity).
+
+    ``scope_exclude_dirs``: the run's scope COMPLEMENT — directories
+    deliberately outside the analysed scope. Same key/analysis parity
+    as ``exclude_dirs``, PLUS slot selection and the manifest scope
+    contract (see :func:`load_cached_cpg`): they carve the graph's
+    coverage, so they must never share a cache slot with a
+    differently-scoped build.
     """
     frontend_args = _EMPTY_FRONTEND_ARGS
     if languages and "c" in languages:
         frontend_args = discover_frontend_args(Path(target))
+
+    combined_excludes = tuple(exclude_dirs or ()) + tuple(
+        scope_exclude_dirs or ())
 
     # Hash the tree ONCE, before the (potentially minutes-long) build.
     # The manifest then records the tree state the CPG was built FROM;
@@ -1524,47 +2110,97 @@ def build_cpg_cached(
     # written while it ran, producing a recorded hash that never
     # matched the at-rest tree — a guaranteed rebuild at the next
     # consumer.
-    content_hash = _target_content_hash(target, exclude_dirs=exclude_dirs)
+    content_hash = _target_content_hash(
+        target, exclude_dirs=combined_excludes)
 
     cached = load_cached_cpg(
         target, cache_dir,
         expected_frontend_fingerprint=frontend_args.fingerprint(),
         current_content_hash=content_hash,
+        scope_exclude_dirs=scope_exclude_dirs,
     )
     if cached is not None:
         return cached
 
-    cpg_dir = cache_dir / "joern-cpg"
-    cpg = build_cpg(
-        target,
-        languages=languages,
-        output_dir=cpg_dir,
-        timeout=timeout,
-        subprocess_runner=subprocess_runner,
-        on_progress=on_progress,
-        heap_mb=heap_mb,
-        frontend_args=frontend_args,
-        exclude_dirs=exclude_dirs,
-    )
+    cpg_dir = cache_dir / cpg_cache_slot_name(
+        scope_exclude_dirs, target=target)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    _sweep_stale_cpg_build_dirs(cache_dir)
 
-    # Cache admission gates. A manifest is a promise that cpg.bin is a
-    # complete graph for content_hash, so it is written only when
-    # (a) the build path signalled success (a timeout / stall-kill can
-    # leave a partial file that would otherwise become a permanent
-    # cache hit), and (b) the flatgraph tail manifest parses to a
-    # method count — a fresh successful build always has one, so an
-    # unreadable tail here means truncation (or a format this probe
-    # cannot vouch for; that degrades to rebuild-per-run, never to
-    # serving an unverifiable graph).
-    if cpg.exists() and not cpg.build_failed:
-        method_count = cpg_method_count(cpg.path)
-        if method_count is None:
-            logger.warning(
-                "CPG at %s has no parseable flatgraph manifest — "
-                "refusing to cache it (this run still uses the build; "
-                "the next run rebuilds)", cpg.path,
+    # Slot lock: pre-lock, two sessions missing the same slot built
+    # DIRECTLY into cpg_dir concurrently — interleaved c2cpg output
+    # streams into one cpg.bin (corruption), and the loser's manifest
+    # described the winner's bytes. The lock serialises the
+    # miss→build→admit critical section per slot; artifact_lock
+    # degrades loudly (never silently unlocked) when flock is
+    # unavailable.
+    with artifact_lock(cpg_dir / "cpg.bin", subject="joern CPG cache slot"):
+        # Double-checked reload: a sibling holding the lock may have
+        # completed this exact build while we queued — a fresh cache
+        # hit here saves a full rebuild.
+        cached = load_cached_cpg(
+            target, cache_dir,
+            expected_frontend_fingerprint=frontend_args.fingerprint(),
+            current_content_hash=content_hash,
+            scope_exclude_dirs=scope_exclude_dirs,
+        )
+        if cached is not None:
+            return cached
+
+        # Build into private scratch on the SAME filesystem, then
+        # promote atomically. Readers (load_cached_cpg holds no lock)
+        # never observe a half-written cpg.bin in the slot.
+        build_dir = Path(tempfile.mkdtemp(
+            prefix=_CPG_BUILD_DIR_PREFIX, dir=cache_dir))
+        keep = False
+        try:
+            cpg = build_cpg(
+                target,
+                languages=languages,
+                output_dir=build_dir,
+                timeout=timeout,
+                subprocess_runner=subprocess_runner,
+                on_progress=on_progress,
+                heap_mb=heap_mb,
+                heap_is_derived=heap_is_derived,
+                frontend_args=frontend_args,
+                exclude_dirs=combined_excludes,
             )
-        else:
+
+            # Cache admission gates. A manifest is a promise that
+            # cpg.bin is a complete graph for content_hash, so the
+            # build is promoted only when (a) the build path signalled
+            # success (a timeout / stall-kill can leave a partial file
+            # that would otherwise become a permanent cache hit), and
+            # (b) the flatgraph tail manifest parses to a method count
+            # — a fresh successful build always has one, so an
+            # unreadable tail here means truncation (or a format this
+            # probe cannot vouch for; that degrades to
+            # rebuild-per-run, never to serving an unverifiable
+            # graph).
+            if not cpg.exists() or cpg.build_failed:
+                return cpg
+            method_count = cpg_method_count(cpg.path)
+            if method_count is None:
+                logger.warning(
+                    "CPG at %s has no parseable flatgraph manifest — "
+                    "refusing to cache it (this run still uses the "
+                    "build; the next run rebuilds)", cpg.path,
+                )
+                # The handle points into the scratch dir; this run
+                # queries it there and cleanup_cpg removes it.
+                keep = True
+                return cpg
+
+            # Ordered promote. The manifest is unlinked FIRST so a
+            # reader racing the replace sees manifest-missing (a miss)
+            # rather than old-manifest-describing-new-bytes; it is
+            # rewritten LAST, when the bytes it vouches for are in
+            # place. os.replace is atomic (same filesystem — scratch
+            # lives under cache_dir for exactly this reason).
+            cpg_dir.mkdir(parents=True, exist_ok=True)
+            (cpg_dir / "manifest.json").unlink(missing_ok=True)
+            os.replace(cpg.path, cpg_dir / "cpg.bin")
             _write_cpg_manifest(
                 cpg_dir, target, content_hash,
                 languages=cpg.languages,
@@ -1572,20 +2208,37 @@ def build_cpg_cached(
                 frontend_args_fingerprint=frontend_args.fingerprint(),
                 method_count=method_count,
                 exclude_dirs=exclude_dirs,
+                scope_exclude_dirs=scope_exclude_dirs,
             )
-
-    return cpg
+            _prune_scoped_cpg_slots(cache_dir, active_slot=cpg_dir.name)
+            return JoernCPG(
+                path=cpg_dir / "cpg.bin",
+                target=cpg.target,
+                languages=cpg.languages,
+                build_time_ms=cpg.build_time_ms,
+            )
+        finally:
+            if not keep:
+                shutil.rmtree(build_dir, ignore_errors=True)
 
 
 def cleanup_cpg(cpg: JoernCPG) -> None:
     """Remove the CPG binary from disk, plus the ``workspace/`` copy
     ``importCpg`` leaves next to it.
 
-    ``run_query`` executes joern with cwd = the CPG's directory, and
+    ``run_query`` executed joern with cwd = the CPG's directory, and
     importCpg copies the CPG into ``<cwd>/workspace/``. Pre-fix the
     cleanup unlinked only ``cpg.bin`` — the workspace copy survived,
     the ``rmdir`` below always failed on the non-empty dir, and the
-    duplicated CPGs accumulated for the life of the host."""
+    duplicated CPGs accumulated for the life of the host. The bare
+    ``workspace/`` removal stays for that legacy layout; current
+    queries run in per-query ``raptor-query-*`` scratch dirs, which
+    are removed by ``run_query`` itself — the sweep here reclaims
+    only the strays a hard-killed query leaves behind. The sweep is
+    AGE-GATED (same threshold as the build-scratch sweep): when the
+    CPG lives in a shared cache slot, a sibling session's query can
+    be live in its own scratch dir at this instant — an unconditional
+    sweep would delete the cwd/tmpdir out from under it mid-query."""
     try:
         cpg.path.unlink(missing_ok=True)
         parent = cpg.path.parent
@@ -1594,6 +2247,16 @@ def cleanup_cpg(cpg: JoernCPG) -> None:
         # follow a symlink planted at that name.
         if workspace.is_dir() and not workspace.is_symlink():
             shutil.rmtree(workspace, ignore_errors=True)
+        now = time.time()
+        for stray in parent.glob("raptor-query-*"):
+            if not stray.is_dir() or stray.is_symlink():
+                continue
+            try:
+                age = now - stray.stat().st_mtime
+            except OSError:
+                continue
+            if age > _CPG_BUILD_DIR_MAX_AGE_S:
+                shutil.rmtree(stray, ignore_errors=True)
         try:
             parent.rmdir()
         except OSError:
@@ -1602,7 +2265,10 @@ def cleanup_cpg(cpg: JoernCPG) -> None:
         logger.warning("cleanup_cpg failed: %s", e)
 
 
-_CALL_RE = re.compile(r"(\w+)\s*\(")
+# \b pins each attempt to a word start: a bare \w+ head re-scans a
+# hostile identifier run from every offset — quadratic. Dropped
+# starts are mid-word false tokens only.
+_CALL_RE = re.compile(r"\b(\w+)\s*\(")
 
 
 def _infer_function(code: str) -> str:
@@ -1617,8 +2283,15 @@ def _infer_call(code: str) -> str:
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
 
+# Bound on the first-failure excerpt carried by the aggregated
+# "failed to parse flow:" entry. Lower cuts into the failure's own
+# message (payload excerpts upstream are !r-escaped and 200-bounded,
+# plus marker/exception text) and costs diagnosis; higher re-grows the
+# very log noise the aggregation exists to bound.
+_PARSE_FAILURE_HEAD_CHARS = 500
 
-def _parse_output(stdout: str) -> tuple:
+
+def _parse_output(stdout: str) -> tuple[list[TaintFlow], list[str]]:
     """Parse Joern stdout for JOERN_FLOW: lines.
 
     Returns (flows, errors).
@@ -1627,7 +2300,8 @@ def _parse_output(stdout: str) -> tuple:
     (joern 4.x) wraps values in ANSI colour codes and echoes the final
     string as ``val resN: String = \"\"\"JOERN_FLOWS_START...``, and
     each flow may appear multiple times (println + value echoes, the
-    latter with escaped quotes).  ``parse_marker_line`` owns that
+    latter with escaped quotes).  ``MarkerChunkAssembler`` (delegating
+    unchunked lines to ``parse_marker_line``) owns that
     transport tolerance; echo discrimination is by the echo prefix
     shape, not by escaped quotes in the payload (genuinely printed
     records deliberately contain ``\\"`` via jsonEsc).
@@ -1637,23 +2311,24 @@ def _parse_output(stdout: str) -> tuple:
     never prints the final-expression sentinels, and sentinel-gated
     error recording let dropped flows read as genuine negatives to
     refuting callers that honour the ``result.errors`` contract.
+    Repeated decode failures aggregate into ONE bounded ``errors``
+    entry keeping the ``failed to parse flow: `` prefix (the benign-
+    noise classifier in ``core.analysis.reachability_gates`` matches
+    on that substring) — a transcript-wide transport failure used to
+    repeat one line per damaged fragment, unbounded.
+
+    Oversized records arrive chunked (``JOERN_FLOW_PART:`` lines, see
+    ``SCALA_FLOW_EMIT_DEF``); the assembler reassembles them before
+    parsing, and lines are fed UNSTRIPPED because fragment edges can
+    be legitimate spaces inside JSON string content.
     """
     flows: list[TaintFlow] = []
     errors: list[str] = []
+    parse_failures: list[str] = []
     seen_flows: set[str] = set()
+    assembler = MarkerChunkAssembler("JOERN_FLOW:")
 
-    for raw_line in stdout.splitlines():
-        line = _ANSI_ESCAPE_RE.sub("", raw_line).strip()
-        # Sentinel lines are framing, never content.
-        if line.endswith("JOERN_FLOWS_START"):
-            continue
-        if line.startswith("JOERN_FLOWS_END") or line.endswith("JOERN_FLOWS_END"):
-            continue
-
-        records, decode_error = parse_marker_line(line, "JOERN_FLOW:")
-        if decode_error is not None:
-            errors.append(f"failed to parse flow: {decode_error}")
-            continue
+    def _consume(records: list[Any]) -> None:
         for steps_data in records:
             dedupe_key = json.dumps(steps_data, sort_keys=True)
             if dedupe_key in seen_flows:
@@ -1677,6 +2352,44 @@ def _parse_output(stdout: str) -> tuple:
                         is_inter_procedural=len(funcs) > 1,
                     )
                     flows.append(flow)
+
+    for raw_line in stdout.splitlines():
+        line = _ANSI_ESCAPE_RE.sub("", raw_line)
+        framing = line.strip()
+        # Sentinel lines are framing, never content. This filter runs
+        # BEFORE the assembler, so a chunk fragment whose content ends
+        # exactly at a chunk boundary with the literal sentinel text is
+        # eaten as framing — the resulting sequence gap is a LOUD chunk
+        # error (fail-closed), never a silent wrong record; the classic
+        # single-line emission always ends "]" and could not hit this.
+        if framing.endswith("JOERN_FLOWS_START"):
+            continue
+        if framing.startswith("JOERN_FLOWS_END") or framing.endswith("JOERN_FLOWS_END"):
+            continue
+
+        records, decode_error = assembler.feed_line(line)
+        if decode_error is not None:
+            parse_failures.append(decode_error)
+        _consume(records)
+    tail = assembler.finish()
+    if tail is not None:
+        parse_failures.append(tail)
+
+    if parse_failures:
+        # One bounded entry for the whole transcript. The head keeps
+        # the first failure verbatim (its embedded payload excerpts
+        # are already !r-escaped and 200-bounded upstream); the count
+        # preserves the evidence that MORE was lost. A single failure
+        # keeps the exact historical message shape.
+        head = parse_failures[0][:_PARSE_FAILURE_HEAD_CHARS]
+        suppressed = len(parse_failures) - 1
+        if suppressed:
+            errors.append(
+                f"failed to parse flow: {head} "
+                f"(+{suppressed} more parse failure(s) suppressed)"
+            )
+        else:
+            errors.append(f"failed to parse flow: {head}")
 
     return flows, errors
 
@@ -1741,7 +2454,13 @@ def _build_summary_batch_query(method_names: list[str]) -> str | None:
     """
     if not method_names:
         return None
-    safe = [n for n in method_names if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", n)]
+    # fullmatch, not match — the module's own anchoring rule (see
+    # _validate_substitution_value): a `$` anchor alone admits a
+    # trailing newline, and one admitted name with a raw newline
+    # breaks the List(...) literal's compile — the WHOLE batch then
+    # returns {} for one bad name.
+    safe = [n for n in method_names
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", n)]
     if not safe:
         return None
     names_list = ", ".join(f'"{n}"' for n in safe)

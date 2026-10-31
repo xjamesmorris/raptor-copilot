@@ -1,9 +1,9 @@
 """Compute the minimal Python file set for a CodeQL PR scan.
 
-Parses every .py file under core/ and packages/ with the stdlib ast
-module, builds a reverse import graph, then walks outward from the
-changed-file set to collect everything that transitively depends on
-a change.  Emits a dynamic CodeQL config with ``paths:`` restricted
+Parses every .py file under the SCAN_ROOTS code roots (core/,
+packages/, engine/) with the stdlib ast module, builds a reverse
+import graph, then walks outward from the changed-file set to collect
+everything that transitively depends on a change.  Emits a dynamic CodeQL config with ``paths:`` restricted
 to that closure.
 
 Falls back to full scan when:
@@ -11,7 +11,13 @@ Falls back to full scan when:
   - import parsing fails on enough files to make the graph unreliable
   - no changed-file list is available (schedule / workflow_dispatch)
 
-Usage (from GitHub Actions):
+The import-graph half of this module (build_graph, discover_py_files,
+transitive_dependents, init_imports) is the live library surface —
+test_scope.py and test_impact.py drive CI dispatch with it. The
+scoped-config emitter below (main()) has NO CI caller today:
+codeql.yml gates per-language matrix entries via compute_filters.py
+instead of consuming a scoped config. It remains usable standalone:
+
     python3 .github/scripts/codeql_scope.py \
         --changed-files /tmp/changed_files.txt \
         --base-config  .github/codeql/codeql-config.yml \
@@ -32,32 +38,51 @@ from collections import defaultdict
 from pathlib import Path
 
 
-SCAN_ROOTS = ("core", "packages")
+# Top-level code roots the import graph covers. engine/ is a code
+# root like the other two — its rule engines carry their own
+# precision/regression suites (semgrep ReDoS gate, per-rule coccinelle
+# tests, vocab renderer) which import through ``engine.`` dotted
+# paths; leaving it out of the graph made every engine-only PR
+# dispatch zero test tiers.
+SCAN_ROOTS = ("core", "packages", "engine")
 
 FULL_SCAN_THRESHOLD = 0.60
 
 PARSE_FAILURE_THRESHOLD = 0.05
 
-EXTRA_ROOTS = (
-    "raptor.py",
-    "raptor_agentic.py",
-)
+def is_root_module_path(path: str) -> bool:
+    """True for a repo-root .py file (raptor.py, raptor_agentic.py,
+    conftest.py, ...).
+
+    Pattern-based on purpose, never a name list and never a disk
+    check: the graph-coverage decision must hold for files a PR just
+    DELETED (a glob cannot see them), and a hand-maintained entry-
+    module list silently dropped new entry points before (root
+    modules outside it dispatched zero test tiers whether edited or
+    deleted).
+    """
+    return path.endswith(".py") and "/" not in path and path != ".py"
+
+
+def discover_root_modules(repo: Path) -> list[Path]:
+    """Every repo-root .py file, derived from the tree."""
+    return sorted(
+        p.relative_to(repo) for p in repo.glob("*.py") if p.is_file()
+    )
 
 
 def discover_py_files(
     repo: Path, extra_roots: tuple[str, ...] = ()
 ) -> list[Path]:
-    """Walk SCAN_ROOTS (+ extra_roots) and collect every .py file."""
+    """Walk SCAN_ROOTS (+ extra_roots) and collect every .py file,
+    plus every repo-root .py entry module."""
     files: list[Path] = []
     for root in (*SCAN_ROOTS, *extra_roots):
         root_path = repo / root
         if not root_path.is_dir():
             continue
         files.extend(p.relative_to(repo) for p in root_path.rglob("*.py"))
-    for name in EXTRA_ROOTS:
-        p = repo / name
-        if p.is_file():
-            files.append(Path(name))
+    files.extend(discover_root_modules(repo))
     return files
 
 
@@ -169,8 +194,11 @@ def _extract_lazy_export_dicts(tree: ast.Module) -> list[str]:
     return modules
 
 
+# Derived from SCAN_ROOTS so a widened root set widens the
+# string-constant module extraction with it (the core|packages
+# hardcoding would silently drop e.g. mock.patch("engine.x.y") edges).
 _MODULE_PATH_RE = __import__("re").compile(
-    r"^(?:core|packages)\.[a-z_][a-z0-9_.]*[a-z0-9_]$"
+    r"^(?:" + "|".join(SCAN_ROOTS) + r")\.[a-z_][a-z0-9_.]*[a-z0-9_]$"
 )
 
 
@@ -198,18 +226,43 @@ def _extract_parametrize_modules(tree: ast.Module) -> list[str]:
     return modules
 
 
-def extract_imports(path: Path, repo: Path) -> list[str] | None:
+def extract_imports(
+    path: Path,
+    repo: Path,
+    root_modules: frozenset[str] | None = None,
+) -> list[str] | None:
     """Parse a .py file and return the dotted module names it imports.
 
     Covers static imports, importlib.import_module() /
     __import__() with string literals, PEP 562 lazy-export
     dicts, and project-internal module paths in string constants
     (e.g. ``@pytest.mark.parametrize`` arguments).
+
+    ``root_modules`` is the set of repo-root module names (raptor,
+    raptor_agentic, ...) whose imports must be kept alongside the
+    SCAN_ROOTS ones; when None it is derived from the tree. Callers
+    looping over many files (``build_graph``) pass it once.
     """
+    if root_modules is None:
+        root_modules = frozenset(
+            p.stem for p in discover_root_modules(repo)
+        )
     try:
         source = (repo / path).read_text(encoding="utf-8", errors="replace")
         tree = ast.parse(source, filename=str(path))
     except (SyntaxError, ValueError):
+        return None
+    except OSError:
+        # A discovered path that cannot be read — in practice a
+        # dangling .py symlink: rglob lists it, read_text raises
+        # FileNotFoundError. Uncaught it crashed the whole scope job
+        # (fail-closed but misattributed, on every PR, whatever it
+        # touched). An unreadable file has no extractable imports, so
+        # report it as a parse failure like a syntactically broken
+        # one: callers count it against PARSE_FAILURE_THRESHOLD, and
+        # a CHANGED unreadable path is caught by
+        # missing_graph_covered_py (not a regular file) and fails
+        # toward full dispatch.
         return None
 
     modules: list[str] = []
@@ -252,10 +305,16 @@ def extract_imports(path: Path, repo: Path) -> list[str] | None:
     # Project-internal module paths in string constants (parametrize etc.).
     modules.extend(_extract_parametrize_modules(tree))
 
-    # Only keep imports that point into our scan roots.
+    # Only keep imports that point into our scan roots or at a
+    # repo-root entry module. Filtering to SCAN_ROOTS alone erased
+    # every ``import raptor_agentic`` edge: the root modules sat in
+    # the graph as NODES but could never acquire reverse-dependents,
+    # so a PR editing only a root entry module dispatched zero test
+    # tiers while the tests importing it silently went unrun.
     return [
         m for m in modules
         if any(m == r or m.startswith(r + ".") for r in SCAN_ROOTS)
+        or m in root_modules
     ]
 
 
@@ -276,8 +335,9 @@ def build_graph(
     forward: dict[Path, set[Path]] = defaultdict(set)
     parse_failures = 0
 
+    root_modules = frozenset(p.stem for p in discover_root_modules(repo))
     for f in py_files:
-        imports = extract_imports(f, repo)
+        imports = extract_imports(f, repo, root_modules)
         if imports is None:
             parse_failures += 1
             continue
@@ -294,6 +354,40 @@ def build_graph(
             reverse[dep].add(src)
 
     return dict(reverse), parse_failures
+
+
+def missing_graph_covered_py(
+    changed_py: set[Path], repo: Path
+) -> list[str]:
+    """Changed .py paths the import graph is responsible for but which
+    are absent from disk — deleted files, or the pre-rename path of a
+    renamed file.
+
+    The reverse graph resolves edges only through files present on
+    disk (``discover_py_files`` → ``mod_to_file``), so a deleted or
+    renamed-away module has no key in it: the importers the change
+    just broke silently drop out of the closure. Callers must treat
+    any hit as "cannot map" and fail toward a FULL scan / dispatch,
+    never toward zero.
+
+    Only graph-covered paths count (under ``SCAN_ROOTS`` or a
+    repo-root entry module — ``is_root_module_path``, which is
+    pattern-based exactly so a DELETED root module still counts);
+    a deleted .py elsewhere was never in the graph, so its absence
+    proves nothing about lost edges.
+    """
+    missing: list[str] = []
+    for f in sorted(changed_py):
+        s = str(f)
+        if not s.endswith(".py"):
+            continue
+        covered = (
+            any(s.startswith(r + "/") for r in SCAN_ROOTS)
+            or is_root_module_path(s)
+        )
+        if covered and not (repo / f).is_file():
+            missing.append(s)
+    return missing
 
 
 def transitive_dependents(
@@ -377,7 +471,8 @@ def write_scoped_config(
         # exclude_pip_21_3_build_dir_options) treats each paths: entry as a
         # directory to walk — file-level paths crash with NotADirectoryError.
         # Deduplicate to parent directories instead.
-        dirs = sorted(set(str(Path(p).parent) or "." for p in scoped_paths))
+        # str(Path("f.py").parent) is already "." for root-level files.
+        dirs = sorted({str(Path(p).parent) for p in scoped_paths})
         lines.append("paths:")
         lines.extend(f"  - {_yaml_val(d)}" for d in dirs)
         lines.append("")
@@ -461,6 +556,16 @@ def main() -> int:
                     full_reason = "requirements file changed"
                 elif not changed_py:
                     full_reason = "no Python files in changeset"
+                else:
+                    missing = missing_graph_covered_py(changed_py, repo)
+                    if missing:
+                        # Deleted / renamed-away modules have no key in
+                        # the reverse graph — their broken importers
+                        # cannot be resolved, so scan everything.
+                        full_reason = (
+                            "changed Python file(s) missing from disk "
+                            f"(deleted or renamed): {', '.join(missing)}"
+                        )
 
     # Discover all .py files and build the graph.
     all_py = discover_py_files(repo)

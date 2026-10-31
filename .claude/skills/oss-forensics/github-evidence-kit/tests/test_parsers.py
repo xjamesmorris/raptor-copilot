@@ -329,6 +329,26 @@ class TestParseMemberEvent:
         assert event.member.id == 456
         assert event.who.login == "owner"
 
+    def test_parses_member_edited_without_aborting(self):
+        """GitHub emits `member edited` (permission change) events;
+        the schema Literal used to reject them, and collect_events
+        deliberately raises on malformed rows — one real-world edited
+        event aborted a whole day's batch ingest."""
+        row = {
+            "type": "MemberEvent",
+            "created_at": "2025-07-13T20:37:04Z",
+            "actor_login": "owner",
+            "actor_id": 123,
+            "repo_name": "owner/repo",
+            "payload": {
+                "action": "edited",
+                "member": {"login": "existing", "id": 456},
+            },
+        }
+        event = parse_member_event(row)
+        assert event.action == "edited"
+        assert "edited" in event.what
+
     def test_parses_member_removed(self):
         """Parses a member removed event."""
         row = {
@@ -479,6 +499,36 @@ class TestParseWorkflowRunEvent:
         assert event.head_sha == "abc123def456abc123def456abc123def456abc1"
         assert event.conclusion is None
 
+    def test_lifecycle_actions_get_distinct_evidence_ids(self):
+        """`requested` and `completed` events of one run must not share
+        an evidence id — EvidenceStore.add replaces on id match, so a
+        collision silently discarded one lifecycle event and corrupted
+        the workflow-timing attribution pattern."""
+        base = {
+            "type": "WorkflowRunEvent",
+            "actor_login": "owner",
+            "actor_id": 123,
+            "repo_name": "owner/repo",
+        }
+        wf = {"name": "CI", "head_sha": "abc123def456abc123def456abc123def456abc1"}
+        requested = parse_workflow_run_event(
+            {**base, "created_at": "2025-07-13T20:37:04Z",
+             "payload": {"action": "requested", "workflow_run": dict(wf)}},
+        )
+        completed = parse_workflow_run_event(
+            {**base, "created_at": "2025-07-13T20:39:11Z",
+             "payload": {"action": "completed",
+                         "workflow_run": {**wf, "conclusion": "success"}}},
+        )
+        assert requested.evidence_id != completed.evidence_id
+
+        from src.store import EvidenceStore
+
+        store = EvidenceStore()
+        store.add(requested)
+        store.add(completed)
+        assert len(store) == 2, "one lifecycle event was silently discarded"
+
     def test_parses_workflow_completed_success(self):
         """Parses a workflow run completed with success."""
         row = {
@@ -603,3 +653,89 @@ class TestParseWatchEvent:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# =============================================================================
+# EVIDENCE-ID KEYING (timeline integrity)
+# =============================================================================
+
+
+class TestEvidenceIdKeying:
+    """EvidenceStore.add replaces on id match, so every parser's id
+    must discriminate lifecycle recurrences: same issue
+    closed→reopened→closed, branch recreate-after-delete, re-push —
+    each is its own forensic event and must never evict an earlier
+    one. The WorkflowRunEvent id (action + row timestamp) is the
+    pattern; every parser follows it."""
+
+    _BASE_ROW = {
+        "type": "PushEvent",
+        "actor_login": "user",
+        "actor_id": 1,
+        "repo_name": "owner/repo",
+        "payload": {},
+    }
+
+    def _row(self, type_, payload, created_at):
+        row = dict(self._BASE_ROW)
+        row["type"] = type_
+        row["payload"] = payload
+        row["created_at"] = created_at
+        return row
+
+    @pytest.mark.parametrize("type_,payload", [
+        ("PushEvent", {"ref": "refs/heads/main",
+                       "after": "a" * 40, "commits": []}),
+        ("IssuesEvent", {"action": "closed",
+                         "issue": {"number": 7, "title": "t"}}),
+        ("CreateEvent", {"ref_type": "branch", "ref": "feature"}),
+        ("PullRequestEvent", {"action": "closed",
+                              "pull_request": {"number": 3,
+                                               "title": "t"}}),
+        ("IssueCommentEvent", {"action": "created",
+                               "issue": {"number": 7},
+                               "comment": {"id": 55, "body": "x"}}),
+        ("WatchEvent", {"action": "started"}),
+        ("ForkEvent", {"forkee": {"full_name": "evil/repo"}}),
+        ("DeleteEvent", {"ref_type": "branch", "ref": "feature"}),
+        ("MemberEvent", {"action": "added",
+                         "member": {"login": "backdoor"}}),
+        ("PublicEvent", {}),
+        ("ReleaseEvent", {"action": "published",
+                          "release": {"tag_name": "v1.0"}}),
+        ("WorkflowRunEvent", {"action": "completed",
+                              "workflow_run": {"name": "ci",
+                                               "head_sha": "b" * 40,
+                                               "conclusion": "success"}}),
+    ])
+    def test_same_payload_different_time_distinct_ids(
+        self, type_, payload,
+    ):
+        e1 = parse_gharchive_event(
+            self._row(type_, payload, "2025-07-13T20:37:04Z"))
+        e2 = parse_gharchive_event(
+            self._row(type_, payload, "2025-07-14T09:00:00Z"))
+        assert e1.evidence_id != e2.evidence_id, type_
+
+    def test_same_row_reingest_is_idempotent(self):
+        payload = {"action": "closed", "issue": {"number": 7,
+                                                 "title": "t"}}
+        row = self._row("IssuesEvent", payload, "2025-07-13T20:37:04Z")
+        assert (parse_gharchive_event(row).evidence_id
+                == parse_gharchive_event(dict(row)).evidence_id)
+
+    def test_issue_lifecycle_cycle_keeps_all_events(self):
+        # closed → reopened → closed: three timeline events, three ids.
+        ids = set()
+        for action, when in (
+            ("closed", "2025-07-13T20:00:00Z"),
+            ("reopened", "2025-07-13T21:00:00Z"),
+            ("closed", "2025-07-13T22:00:00Z"),
+        ):
+            row = self._row(
+                "IssuesEvent",
+                {"action": action, "issue": {"number": 7, "title": "t"}},
+                when,
+            )
+            ids.add(parse_gharchive_event(row).evidence_id)
+        assert len(ids) == 3

@@ -76,14 +76,12 @@ class TestGenerateEvidenceId:
 class TestParseDatetimeLenient:
     """Test lenient datetime parsing (for GH Archive data)."""
 
-    def test_none_returns_now(self):
-        """None input returns current time."""
-        result = parse_datetime_lenient(None)
-        assert isinstance(result, datetime)
-        assert result.tzinfo is not None
-        # Should be within last few seconds
-        now = datetime.now(timezone.utc)
-        assert abs((now - result).total_seconds()) < 5
+    def test_none_raises(self):
+        """A missing timestamp raises: a forensic event must never be
+        minted with COLLECTION time (the old now() fallback fabricated
+        event times and derived the wrong verification table)."""
+        with pytest.raises(ValueError):
+            parse_datetime_lenient(None)
 
     def test_datetime_passthrough(self):
         """datetime objects pass through unchanged."""
@@ -107,13 +105,11 @@ class TestParseDatetimeLenient:
         assert result.year == 2025
         assert result.hour == 7
 
-    def test_invalid_string_returns_now(self):
-        """Invalid string returns current time (graceful degradation)."""
-        result = parse_datetime_lenient("not a date")
-        assert isinstance(result, datetime)
-        # Should be recent
-        now = datetime.now(timezone.utc)
-        assert abs((now - result).total_seconds()) < 5
+    def test_invalid_string_raises(self):
+        """An unparseable timestamp raises — fail the row, never
+        invent evidence."""
+        with pytest.raises(ValueError):
+            parse_datetime_lenient("not a date")
 
 
 # =============================================================================
@@ -206,12 +202,12 @@ class TestMakeRepoFromFullName:
         with pytest.raises(ValueError, match="must be 'owner/repo' format"):
             make_repo_from_full_name("single-name")
 
-    def test_handles_multiple_slashes(self):
-        """Handles repo name with multiple slashes (takes first as owner)."""
-        repo = make_repo_from_full_name("owner/repo/with/slashes")
-        assert repo.owner == "owner"
-        assert repo.name == "repo/with/slashes"
-        assert repo.full_name == "owner/repo/with/slashes"
+    def test_rejects_multiple_slashes(self):
+        """Rejects extra slashes: a repository name containing ``/``
+        would splice extra path segments into the verification URL,
+        and GitHub names never contain one."""
+        with pytest.raises(ValueError):
+            make_repo_from_full_name("owner/repo/with/slashes")
 
 
 if __name__ == "__main__":

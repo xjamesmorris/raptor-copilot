@@ -699,3 +699,190 @@ class TestPersistEvictsStale:
         )
         loaded = load_specs(run_dir)
         assert "renamed" in {s.function for s in loaded}
+
+
+class TestStoreLock:
+    """Cross-process serialisation of read-merge-write cycles.
+
+    Both persist_refined_specs and the annotation promotion path do
+    load → merge → save on the shared project store; without the lock
+    two concurrent writers interleave and the later save silently
+    drops the earlier one's specs."""
+
+    def test_persist_waits_for_lock_then_merges(self, tmp_path):
+        import threading
+
+        import pytest
+
+        pytest.importorskip("fcntl")
+        from core.iris.store import persist_refined_specs, store_lock
+
+        run_dir = tmp_path / "project" / "run_001"
+        run_dir.mkdir(parents=True)
+
+        done = threading.Event()
+
+        def _writer():
+            persist_refined_specs(run_dir, [
+                _make_spec(fn="late_writer", role="sanitiser"),
+            ])
+            done.set()
+
+        with store_lock(run_dir):
+            # Simulate a concurrent writer mid-cycle: it seeded the
+            # store and holds the lock while this persist runs.
+            save_specs(run_dir, [_make_spec(fn="early_writer",
+                                            role="sink")])
+            t = threading.Thread(target=_writer, daemon=True)
+            t.start()
+            # The persist must block on the lock, not proceed.
+            assert not done.wait(0.3)
+
+        t.join(timeout=10)
+        assert done.is_set()
+        # Serialised: the blocked persist saw the early writer's save
+        # and merged instead of clobbering it.
+        loaded = {s.function for s in load_specs(run_dir)}
+        assert loaded == {"early_writer", "late_writer"}
+
+    def test_annotation_promotion_waits_for_lock(self, tmp_path):
+        import threading
+
+        import pytest
+
+        pytest.importorskip("fcntl")
+        from core.iris.api import promote_spec_on_annotation
+        from core.iris.store import store_lock
+
+        run_dir = tmp_path / "project" / "run_001"
+        run_dir.mkdir(parents=True)
+        save_specs(run_dir, [
+            _make_spec(fn="check_input", file="src/auth.py",
+                       role="sink"),
+        ])
+
+        done = threading.Event()
+
+        def _promoter():
+            promote_spec_on_annotation(
+                "src/auth.py", "check_input", "sink",
+                out_dir=run_dir,
+            )
+            done.set()
+
+        with store_lock(run_dir):
+            t = threading.Thread(target=_promoter, daemon=True)
+            t.start()
+            assert not done.wait(0.3)
+        t.join(timeout=10)
+        assert done.is_set()
+
+
+class TestAssumptionEvictionAtPersist:
+    """persist_refined_specs evicts deleted-file assumptions beside
+    the spec eviction (the merge is add/upgrade-only, so without it
+    the store grows monotonically and stale assumptions feed prompts
+    and the bypass runner every round)."""
+
+    @staticmethod
+    def _assumption(file):
+        return SafetyAssumption(
+            target="t_" + file.replace("/", "_").replace(".", "_"),
+            file=file, assumption="x",
+            category=AssumptionCategory.ORDERING,
+            enforced_by=["check"],
+        )
+
+    def test_deleted_file_assumption_evicted(self, tmp_path):
+        from core.iris.store import load_assumptions, persist_refined_specs
+
+        target = tmp_path / "repo"
+        target.mkdir()
+        (target / "live.c").write_text("int x;\n")
+
+        run_dir = tmp_path / "project" / "run_001"
+        run_dir.mkdir(parents=True)
+        save_specs(
+            run_dir, [_make_spec(file="live.c")],
+            assumptions=[
+                self._assumption("live.c"),
+                self._assumption("gone.c"),
+                self._assumption(""),  # exempt: nothing to be stale against
+            ],
+            target_path=target,
+        )
+        dest = persist_refined_specs(
+            run_dir, [_make_spec(file="live.c")],
+            history=[{"round": 0, "n_specs": 1, "n_confirmed": 1,
+                      "aborted": False}],
+            target_path=target,
+        )
+        assert dest is not None
+        files = sorted(a.file for a in load_assumptions(run_dir))
+        assert files == ["", "live.c"], (
+            f"expected gone.c evicted, empty-file kept: {files}"
+        )
+
+
+class TestStorePinRouting:
+    """``_project_dir`` follows the RUN PIN state table
+    (core/run/pin.py): pinned ``project=P`` → P's store wherever the
+    run dir physically sits; authoritative pin-null (explicitly
+    projectless) → run-local, even inside a project-shaped parent;
+    pin-less legacy run dirs keep the documented parent convention."""
+
+    def _register(self, monkeypatch, root, name):
+        from pathlib import Path
+
+        from core.project.project import ProjectManager
+        projects_dir = root / "registry"
+        monkeypatch.setattr(
+            "core.project.project.PROJECTS_DIR", projects_dir)
+        target = root / "code"
+        target.mkdir(exist_ok=True)
+        proj_out = root / "out" / name
+        ProjectManager().create(name, str(target),
+                                output_dir=str(proj_out))
+        return Path(proj_out), target
+
+    def test_pinned_run_writes_project_store(self, tmp_path, monkeypatch):
+        from core.json import save_json
+        proj_out, target = self._register(monkeypatch, tmp_path, "pinproj")
+        run_dir = tmp_path / "elsewhere" / "run"   # e.g. an --out run
+        run_dir.mkdir(parents=True)
+        save_json(run_dir / ".raptor-run.json",
+                  {"project": "pinproj", "project_source": "argv",
+                   "target_path": str(target)})
+
+        save_specs(run_dir, [_make_spec()])
+
+        assert (proj_out / "iris-specs" / "specs.json").is_file()
+        assert not (run_dir / "iris-specs").exists()
+        assert len(load_specs(run_dir)) == 1
+
+    def test_null_pin_keeps_specs_run_local(self, tmp_path, monkeypatch):
+        """An explicitly projectless run must not leak specs into the
+        project whose output dir happens to contain it — containment
+        inference is forbidden for authoritative null pins."""
+        from core.json import save_json
+        proj_out, target = self._register(monkeypatch, tmp_path, "hostproj")
+        run_dir = proj_out / "audit_20990101_000000"
+        run_dir.mkdir(parents=True)
+        save_json(run_dir / ".raptor-run.json",
+                  {"project": None, "project_source": "argv",
+                   "target_path": str(target)})
+
+        save_specs(run_dir, [_make_spec()])
+
+        assert (run_dir / "iris-specs" / "specs.json").is_file()
+        assert not (proj_out / "iris-specs").exists()
+        assert len(load_specs(run_dir)) == 1
+
+    def test_legacy_pinless_dir_keeps_parent_convention(self, tmp_path):
+        run_dir = tmp_path / "proj" / "run_001"    # no .raptor-run.json
+        run_dir.mkdir(parents=True)
+
+        save_specs(run_dir, [_make_spec()])
+
+        assert (tmp_path / "proj" / "iris-specs" / "specs.json").is_file()
+        assert len(load_specs(run_dir)) == 1

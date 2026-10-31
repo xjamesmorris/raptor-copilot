@@ -34,6 +34,14 @@ CHECKER_MATCHES_FILE = "checker-matches.jsonl"
 # LLM analysis call on top of the synthesis spend that produced it.
 MAX_VARIANT_REVIEWS_PER_RUN = 10
 
+# Byte budget for the checker-matches artifact read. Run dirs are
+# target-writable during dynamic phases, so this is a hostile-input
+# surface, not just an our-own-artifact one; the in-unit convention
+# is flow_context_inject's 64 MB artifact cap. A truncated read drops
+# the trailing candidates — bounded loss on a file that should be
+# orders of magnitude smaller.
+_MAX_MATCHES_BYTES = 64 * 1024 * 1024
+
 
 def _llm_callable_from_client(
     llm_client, cost_tracker=None,
@@ -178,14 +186,13 @@ def _try_replay_from_library(
     try:
         from packages.checker_synthesis import RuleLibrary
         from packages.checker_synthesis.languages import detect_engine
-        from packages.checker_synthesis.library import _DEFAULT_LIBRARY_DIR
         from packages.checker_synthesis.synthesise import _run_engine, _triage
 
         engine = detect_engine(seed.file)
         if engine is None:
             return None
 
-        lib = RuleLibrary(_DEFAULT_LIBRARY_DIR)
+        lib = RuleLibrary()
         candidates = lib.find_replayable(seed.cwe, engine)
         if not candidates:
             return None
@@ -225,12 +232,19 @@ def _try_replay_from_library(
             )
             errors.extend(t_errors)
 
-        import hashlib
-        target_hash = hashlib.sha256(
-            str(repo_root).encode(),
-        ).hexdigest()[:12]
+        # Join on the library's resolved-path convention: hashing the
+        # path as passed minted a SECOND TargetRecord for the same
+        # physical target whenever repo_root arrived non-canonical,
+        # inflating len(entry.targets) and targets_tested.
+        from packages.checker_synthesis.library import rule_join_key
+        from packages.checker_synthesis.replay_sweep import target_hash_for
+        target_hash = target_hash_for(Path(repo_root))
+        # Key on the entry's identity (body hash), not its rule_id —
+        # rule ids are documented-non-unique, and an id-keyed update
+        # recorded THIS entry's replay verdicts onto whichever entry
+        # happened to be first in the manifest.
         lib.update(
-            entry.rule_id, target_hash, variants, triage_list,
+            rule_join_key(entry), target_hash, variants, triage_list,
         )
 
         result = CheckerSynthesisResult(seed=seed)
@@ -261,15 +275,12 @@ def _try_replay_from_library(
 def _try_promote_to_library(result, repo_root: Path) -> None:
     """Promote a synthesis result to the rule library if eligible."""
     try:
-        import hashlib
-
         from packages.checker_synthesis import RuleLibrary
-        from packages.checker_synthesis.library import _DEFAULT_LIBRARY_DIR
+        from packages.checker_synthesis.replay_sweep import target_hash_for
 
-        lib = RuleLibrary(_DEFAULT_LIBRARY_DIR)
-        target_hash = hashlib.sha256(
-            str(repo_root).encode(),
-        ).hexdigest()[:12]
+        lib = RuleLibrary()
+        # Resolved-path convention — see the replay-record twin above.
+        target_hash = target_hash_for(Path(repo_root))
         lib.promote(result, target_hash=target_hash)
     except Exception:
         logger.debug("checker_followup: library promotion failed", exc_info=True)
@@ -528,11 +539,18 @@ def load_variant_candidates(
 
     candidates: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set(exclude_keys)
-    try:
-        lines = matches_path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        logger.debug("checker-matches read failed", exc_info=True)
+    from core.source import read_text_capped
+    got = read_text_capped(matches_path, _MAX_MATCHES_BYTES)
+    if got is None:
+        logger.debug("checker-matches read failed: %s", matches_path)
         return []
+    text, truncated = got
+    if truncated:
+        logger.warning(
+            "checker-matches.jsonl over the %d-byte budget — trailing "
+            "candidates ignored", _MAX_MATCHES_BYTES,
+        )
+    lines = text.splitlines()
 
     for raw in lines:
         if len(candidates) >= max_candidates:

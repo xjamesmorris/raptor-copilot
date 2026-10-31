@@ -243,15 +243,38 @@ def test_refit_no_samples_at_all(tmp_path: Path):
     assert report.sample_count == 0
 
 
-def test_refit_writes_report_to_default_location(tmp_path: Path):
-    """Without --out, the report lands at refit/<date>.json."""
+def test_refit_default_is_metrics_only(tmp_path: Path):
+    """Without out_path / update_snapshot, nothing is written — the
+    default refit/ dir is repo-committed, and a local verification
+    run must not overwrite or prune committed snapshots."""
     _write_signals(tmp_path, [])
     _write_sample(tmp_path, "PyPI", "p", [_make_finding(cve="CVE-X")])
-    grid_search_refit(tmp_path, min_samples=1)
+    report = grid_search_refit(tmp_path, min_samples=1)
+    assert report.status is not None
+    assert not (tmp_path / "refit").exists()
+
+
+def test_refit_update_snapshot_writes_dated_report(tmp_path: Path):
+    """update_snapshot=True is the explicit opt-in that writes the
+    dated refit/<date>.json snapshot (the refit workflow's mode)."""
+    _write_signals(tmp_path, [])
+    _write_sample(tmp_path, "PyPI", "p", [_make_finding(cve="CVE-X")])
+    grid_search_refit(tmp_path, min_samples=1, update_snapshot=True)
     refit_dir = tmp_path / "refit"
     assert refit_dir.is_dir()
     files = list(refit_dir.glob("*.json"))
     assert len(files) == 1
+
+
+def test_refit_out_path_and_update_snapshot_conflict(tmp_path: Path):
+    import pytest
+    _write_signals(tmp_path, [])
+    _write_sample(tmp_path, "PyPI", "p", [_make_finding(cve="CVE-X")])
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        grid_search_refit(
+            tmp_path, min_samples=1,
+            out_path=tmp_path / "r.json", update_snapshot=True,
+        )
 
 
 def test_refit_writes_report_to_custom_out(tmp_path: Path):
@@ -343,6 +366,61 @@ def test_refit_rejects_when_improvement_below_threshold(
         tmp_path, improvement_threshold=0.99,
     )
     assert report.status == "rejected"
+
+
+def test_composition_rejection_is_not_misreported(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """When per-constant variants beat the baseline but their joint
+    composition is inadmissible, the report must say exactly that —
+    pre-fix it ALSO appended the false 'no per-constant variant beat
+    the baseline' note, mis-describing why the refit was rejected."""
+    import packages.sca.risk as risk_mod
+    from packages.sca.calibration import refit as refit_mod
+    from packages.sca.risk import current_constants
+
+    _write_signals(tmp_path, ["CVE-X"])
+    _write_sample(tmp_path, "PyPI", "p", [_make_finding(cve="CVE-X")])
+
+    current = current_constants()
+    real_admissible = risk_mod.is_admissible
+
+    def fake_admissible(values):
+        changed = sum(
+            1 for k, v in values.items() if v != current.get(k)
+        )
+        if changed >= 2:
+            return False, "test: composition inadmissible"
+        return real_admissible(values)
+
+    def fake_metric(samples, *, overrides=None):
+        if overrides and any(
+            v != current.get(k) for k, v in overrides.items()
+        ):
+            return (0.9, 0.9, 0.9)
+        return (0.5, 0.5, 0.5)
+
+    monkeypatch.setattr(risk_mod, "is_admissible", fake_admissible)
+    monkeypatch.setattr(refit_mod, "_search_metric", fake_metric)
+
+    report = refit_mod.grid_search_refit(tmp_path, min_samples=1)
+    assert report.status == "rejected"
+    assert any("joint composition rejected" in n for n in report.notes)
+    assert not any(
+        "no per-constant variant beat the baseline" in n
+        for n in report.notes
+    )
+
+
+def test_error_arm_reports_keep_accumulated_notes(tmp_path: Path):
+    """The too-few-samples report must carry the notes gathered
+    before the bail-out (the ecosystem_filter provenance note) —
+    pre-fix both twins built a fresh notes list and dropped it."""
+    _write_signals(tmp_path, ["CVE-X"])
+    _write_sample(tmp_path, "PyPI", "p", [_make_finding(cve="CVE-X")])
+    report = grid_search_refit(tmp_path, ecosystem_filter="PyPI")
+    assert report.status == "insufficient_samples"
+    assert any("ecosystem_filter='PyPI'" in n for n in report.notes)
 
 
 def test_refit_max_delta_caps_proposed_value(tmp_path: Path):
@@ -675,3 +753,26 @@ def test_cve_legacy_osv_id_key_still_labelled(tmp_path: Path):
     _write_sample(tmp_path, "PyPI", "p", [f])
     samples = _load_findings_with_labels(tmp_path)
     assert samples[0][1] == 1
+
+
+class TestAcceptGateClamp:
+    """(P20 ∨ ρ) accept gate with the P20 non-regression clamp on the
+    ρ arm — both directions."""
+
+    def test_p20_above_threshold_accepts(self):
+        from packages.sca.calibration.refit import _fails_accept_gate
+        assert _fails_accept_gate(0.06, -0.5, 0.05) is False
+
+    def test_rho_accept_with_nonregressing_p20_accepts(self):
+        from packages.sca.calibration.refit import _fails_accept_gate
+        assert _fails_accept_gate(0.0, 0.06, 0.05) is False
+
+    def test_rho_accept_with_p20_regression_rejects(self):
+        """Pre-fix: a ρ jump shipped an auto-applied refit that lowered
+        top-20 precision."""
+        from packages.sca.calibration.refit import _fails_accept_gate
+        assert _fails_accept_gate(-0.01, 0.5, 0.05) is True
+
+    def test_both_below_threshold_rejects(self):
+        from packages.sca.calibration.refit import _fails_accept_gate
+        assert _fails_accept_gate(0.01, 0.01, 0.05) is True

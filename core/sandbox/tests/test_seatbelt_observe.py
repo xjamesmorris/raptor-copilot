@@ -47,7 +47,6 @@ is **not validated** without this smoke test.
 from __future__ import annotations
 
 import json
-import sys
 
 import pytest
 
@@ -359,10 +358,8 @@ class TestNonceStamping:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(
-    sys.platform != "darwin",
-    reason="macOS sandbox-exec + log stream — Darwin only",
-)
+# macOS sandbox-exec + log stream — Darwin only (real-kernel binding).
+@pytest.mark.darwin_native
 class TestObserveModeDarwinE2E:
     """End-to-end on macOS: sandbox(observe=True) writes a parseable
     .sandbox-observe.jsonl and does not pollute .sandbox-denials.jsonl.

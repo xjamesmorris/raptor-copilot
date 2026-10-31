@@ -17,6 +17,8 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import pytest
+
 from core.sandbox import (
     check_landlock_available,
     check_mount_available,
@@ -26,6 +28,11 @@ from core.sandbox import (
     state,
 )
 from core.sandbox.tests.capability import requires_landlock
+
+# Threat-model regression checks run real attacker-shaped children
+# under the REAL kernel's enforcement — real-kernel binding on both
+# platforms (see pytest.ini's native markers).
+pytestmark = [pytest.mark.linux_native, pytest.mark.darwin_native]
 
 
 def _compile(source: str, path: Path, extra_flags=()) -> bool:
@@ -364,21 +371,30 @@ class TestAPIContract(unittest.TestCase):
         self.assertIn("shell", str(cm.exception).lower())
 
     def test_pass_fds_socket_rejected(self):
-        """An inherited AF_UNIX socket FD can reach the docker daemon
-        socket. Defense: stat each pass_fds entry and refuse S_ISSOCK.
-        Pipe FDs (S_ISFIFO) remain allowed for legitimate stdin piping."""
+        """An inherited AF_UNIX socket FD connected to a pathname
+        listener can reach the docker daemon socket. Defense: refuse
+        any pass_fds socket that has an addressable endpoint. (The
+        one admitted socket shape — an own anonymous socketpair half,
+        pipe-equivalent — is covered in test_pass_fds_socketpair.py;
+        pipe FDs remain allowed for legitimate stdin piping.)"""
         if not check_net_available() or not check_mount_available():
             self.skipTest("User/mount namespaces not available")
-        # Create a socket FD — should be rejected
-        s1, s2 = socket.socketpair()
+        # A client connected to a pathname AF_UNIX listener — the
+        # /var/run/docker.sock shape — must be rejected.
+        sock_path = os.path.join(self.tmp.name, "daemon.sock")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
+            listener.bind(sock_path)
+            listener.listen(1)
+            client.connect(sock_path)
             with self.assertRaises((TypeError, ValueError)), sandbox(
                 target=self.tmp.name, output=self.tmp.name,
             ) as run:
-                run(["true"], pass_fds=[s1.fileno()], timeout=5)
+                run(["true"], pass_fds=[client.fileno()], timeout=5)
         finally:
-            s1.close()
-            s2.close()
+            client.close()
+            listener.close()
 
     @requires_landlock
     def test_pass_fds_pipe_allowed(self):
@@ -451,7 +467,11 @@ class TestFakeHomeXDGRedirection(unittest.TestCase):
 
     def test_all_xdg_vars_redirected(self):
         """Confirm HOME, XDG_CONFIG_HOME, XDG_CACHE_HOME, XDG_DATA_HOME,
-        XDG_STATE_HOME all point inside {output}/.home/."""
+        XDG_STATE_HOME all point inside the fake home. setUp requires
+        the mount-ns lane, where the fake home lives in the per-sandbox
+        private /tmp (/tmp/.home): the ``<output>/.home`` intake is
+        copied there so the child's home never names the run
+        directory."""
         out = self.tmp.name
         r = run_untrusted(
             ["sh", "-c",
@@ -468,8 +488,12 @@ class TestFakeHomeXDGRedirection(unittest.TestCase):
                     "XDG_DATA_HOME", "XDG_STATE_HOME"):
             self.assertIn(key, kv, f"{key} missing from env")
             self.assertTrue(
-                kv[key].startswith(os.path.join(out, ".home")),
-                f"{key}={kv[key]!r} — expected under {out}/.home/",
+                kv[key].startswith("/tmp/.home"),
+                f"{key}={kv[key]!r} — expected under /tmp/.home/",
+            )
+            self.assertNotIn(
+                out, kv[key],
+                f"{key}={kv[key]!r} — must not name the run directory",
             )
 
 
@@ -852,12 +876,9 @@ class TestPidNamespaceDefenses(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
 
     def test_self_runs_as_init_pid(self):
-        """Child should see itself as a low pid (1, 2, or 3) inside the
-        PID namespace. The exact value depends on layout:
-        - pid=1 if target is the direct pid-ns init
-        - pid=2 under the mount-ns path's intermediate fork
-        - pid=3 under the subprocess-path pid-1 shim
-          (libexec/raptor-pid1-shim with its double-fork layout)
+        """Child should see itself as a low pid (1, 2, or 3) inside
+        the PID namespace (pid=2 on the spawn backend: the in-ns init
+        waiter is pid-1 so the target keeps normal signal semantics).
         Any of these prove host pids are hidden."""
         r = run_untrusted(
             ["sh", "-c", "echo $$"],
@@ -871,6 +892,24 @@ class TestPidNamespaceDefenses(unittest.TestCase):
         """kill(host_pid) must return ESRCH — the host PID does not exist
         inside the PID namespace."""
         host_pid = os.getpid()
+        if host_pid < 300:
+            # A fresh pid namespace hands out 1, 2, 3, ... to the
+            # sandbox's own processes, so a SMALL host pid (a nested-
+            # namespace test runner: pytest under unshare -pf IS pid 1)
+            # can exist inside the child namespace as a DIFFERENT
+            # process -- kill -0 / procfs on it then probes the
+            # sandbox's own tree and cannot discriminate host
+            # visibility. 300 mirrors the lowest-pid gate used for
+            # kill safety fleet-wide: comfortably above the handful of
+            # pids a fresh namespace allocates during one sandbox run
+            # (false-pass direction), and far below the pids a real
+            # host session runs at, so the test still executes
+            # everywhere it is meaningful (false-skip direction).
+            self.skipTest(
+                f"test runner pid {host_pid} is small enough to "
+                "collide with the sandbox's fresh pid namespace -- "
+                "host-visibility probe would be vacuous"
+            )
         r = run_untrusted(
             ["sh", "-c", f"kill -0 {host_pid} 2>&1; echo rc=$?"],
             target=self.tmp.name, output=self.tmp.name,
@@ -932,6 +971,24 @@ class TestRestrictReadsCredentialExfil(unittest.TestCase):
         """Cross-process /proc/<host_pid>/environ read must return ENOENT
         (host pid invisible under the new PID ns)."""
         host_pid = os.getpid()
+        if host_pid < 300:
+            # A fresh pid namespace hands out 1, 2, 3, ... to the
+            # sandbox's own processes, so a SMALL host pid (a nested-
+            # namespace test runner: pytest under unshare -pf IS pid 1)
+            # can exist inside the child namespace as a DIFFERENT
+            # process -- kill -0 / procfs on it then probes the
+            # sandbox's own tree and cannot discriminate host
+            # visibility. 300 mirrors the lowest-pid gate used for
+            # kill safety fleet-wide: comfortably above the handful of
+            # pids a fresh namespace allocates during one sandbox run
+            # (false-pass direction), and far below the pids a real
+            # host session runs at, so the test still executes
+            # everywhere it is meaningful (false-skip direction).
+            self.skipTest(
+                f"test runner pid {host_pid} is small enough to "
+                "collide with the sandbox's fresh pid namespace -- "
+                "host-visibility probe would be vacuous"
+            )
         r = run_untrusted(
             ["sh", "-c", f"cat /proc/{host_pid}/environ 2>&1 || echo BLOCKED"],
             target=self.tmp.name, output=self.tmp.name,

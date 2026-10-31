@@ -1,5 +1,5 @@
 """
-Diagram package,Mermaid diagram generation from /understand and /validate outputs.
+Diagram package — Mermaid diagram generation from /understand and /validate outputs.
 
 Public API:
     from packages.diagram import render_and_write, render_directory

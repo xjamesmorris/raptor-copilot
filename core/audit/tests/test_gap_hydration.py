@@ -10,8 +10,6 @@ safe on a large or hostile tree.
 
 from __future__ import annotations
 
-import time
-
 import pytest
 
 from core.audit.gaps import (
@@ -22,6 +20,7 @@ from core.audit.gaps import (
     read_gap_source,
 )
 from core.audit.negative_space import discover_conventions
+from core.testing.wallclock import cpu_budget
 
 # Matches _GENERIC_PATTERNS[CONCERN_AUTH]; four occurrences clear
 # MIN_CONVENTION_OCCURRENCES so a convention is actually discovered.
@@ -220,14 +219,12 @@ class TestScalesToManySpans:
     def test_many_spans_over_a_large_file_is_fast(self, tmp_path):
         (tmp_path / "f.py").write_text("x = 1\n" * 200_000)
         spans = [(i * 10 + 1, i * 10 + 5) for i in range(2000)]
-        started = time.monotonic()
-        got = _read_spans(tmp_path, "f.py", spans)
-        elapsed = time.monotonic() - started
+        # CPU budget, not wall clock: the per-line-per-span scan burns
+        # ~0.7s of CPU here, the sweep ~0.005s — the quadratic
+        # regression is a CPU signature a scheduler stall can't fake.
+        with cpu_budget(1.0, what="many-spans sweep"):
+            got = _read_spans(tmp_path, "f.py", spans)
         assert len(got) == 2000
-        # The per-line-per-span scan takes ~0.7s here; the sweep ~0.005s.
-        # 1.0s gives loaded CI runners headroom while still catching
-        # the quadratic O(lines x spans) regression.
-        assert elapsed < 1.0, f"took {elapsed:.3f}s — sweep may have regressed"
 
 
 class TestMalformedInputIsSurvivable:
@@ -418,3 +415,68 @@ class TestReadGapSource:
     def test_no_file_key(self, tmp_path):
         gap = {"line_start": 1, "line_end": 2}
         assert read_gap_source(gap, tmp_path) == ""
+
+
+class TestBudgetExhaustionDisclosure:
+    """Two-direction pin on the total-bytes ceiling: ordinary trees
+    hydrate fully with no warning; a binding ceiling discloses the
+    selection ratio LOUDLY — the cap may bind, but never silently.
+    Exhaustion manifests through _read_spans abandoning spans against
+    the shrunken remaining allowance (total_bytes never reaches the
+    ceiling exactly, because abandoned spans refund), so the signal
+    rides the budget_exhausted out-param, not the byte counter."""
+
+    def test_no_warning_when_budget_does_not_bind(self, tmp_path, caplog):
+        import logging
+
+        _tree(tmp_path)
+        with caplog.at_level(logging.WARNING, logger="core.audit.gaps"):
+            hydrated = hydrate_live_gaps_for_detectors(
+                [_gap(i) for i in range(4)], tmp_path,
+            )
+        assert len(hydrated) == 4
+        assert "hydration budget" not in caplog.text
+
+    def test_warning_with_ratio_when_budget_binds(
+        self, tmp_path, caplog, monkeypatch,
+    ):
+        import logging
+
+        _tree(tmp_path)
+        body_bytes = len(ADHERENT.format(i=0).encode())
+        monkeypatch.setattr(
+            "core.audit.gaps._MAX_HYDRATED_TOTAL_BYTES", body_bytes + 1,
+        )
+        with caplog.at_level(logging.WARNING, logger="core.audit.gaps"):
+            hydrated = hydrate_live_gaps_for_detectors(
+                [_gap(i) for i in range(4)], tmp_path,
+            )
+        # The ceiling admitted the first body and starved the rest.
+        assert 1 <= len(hydrated) < 4
+        hits = [r for r in caplog.records
+                if "hydration budget" in r.getMessage()]
+        assert len(hits) == 1, "exhaustion warns exactly once"
+        msg = hits[0].getMessage()
+        assert "of 4 span-valid" in msg
+
+    def test_read_spans_signals_budget_not_function_cap(self, tmp_path):
+        (tmp_path / "f.py").write_text("x = 1\n" * 100)
+        flag: list[bool] = []
+        got = _read_spans(
+            tmp_path, "f.py", [(1, 50)], budget_bytes=10,
+            budget_exhausted=flag,
+        )
+        assert not got
+        assert flag, "total-budget abandonment must signal"
+        # Per-function-cap abandonment does NOT signal: it would be
+        # dropped under any budget, so it is not ceiling pressure.
+        big = "z" * 2048 + "\n"
+        (tmp_path / "g.py").write_text(big * 200)
+        flag2: list[bool] = []
+        got2 = _read_spans(
+            tmp_path, "g.py", [(1, 200)],
+            budget_bytes=_MAX_HYDRATED_FUNCTION_BYTES * 4,
+            budget_exhausted=flag2,
+        )
+        assert not got2
+        assert not flag2

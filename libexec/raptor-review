@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I
 # ruff: noqa: RUF100, I001
 # (preamble protection; see .github/tests/test_libexec_marker_coverage.py)
 """Unified operator CLI for reviewing audit state across all layers.
@@ -22,6 +22,34 @@ Usage:
   raptor-review diff [run1 run2]           # verdict changes between two runs
   raptor-review live                       # tail-follow a running audit's journal
   raptor-review compact                    # compact project journal index
+  raptor-review verdict <id> fp|tp|retest  # record a human verdict on a finding
+                                           # (fp gates on the live-context
+                                           #  operator grant, which refuses the
+                                           #  dispatch trust markers every
+                                           #  shipped launcher route carries —
+                                           #  a plain fp does not mint in
+                                           #  production; the sanctioned
+                                           #  production route is the
+                                           #  typed-consent ceremony below;
+                                           #  use /annotate for operator FP
+                                           #  assertions without a standing
+                                           #  suppression, tp/retest for
+                                           #  re-analysis — both work
+                                           #  non-interactively)
+  raptor-review verdict <id> fp --ceremony # typed operator consent: at the
+                                           # operator's own terminal (every
+                                           # std fd a TTY), shows what is
+                                           # being suppressed, requires the
+                                           # confirmation phrase
+                                           # 'suppress <finding-id>' typed
+                                           # back, and mints the standing
+                                           # suppression recorded as
+                                           # minted=ceremony with the grant
+                                           # result and the full invocation
+                                           # context. Revoke with the retest
+                                           # verb. Run via:
+                                           #   raptor review verdict <id> fp --ceremony
+  raptor-review digest [run-dir]           # ranked end-of-run summary
 
 Common options:
   --out DIR       Run output directory (default: active project's latest)
@@ -31,7 +59,48 @@ Common options:
 """
 from __future__ import annotations
 
+# ─── interpreter-isolation guard (do not import; inline by design) ───
+# fmt: off
+# This launcher is an authority/consent surface: its checks
+# (invocation context, operator-approved records) run in-process,
+# and interpreter-startup hooks run BEFORE this file's first line —
+# a PYTHONPATH sitecustomize, or a .pth/usercustomize.py in the
+# user site, the latter with ZERO environment variables set — so a
+# hook can monkeypatch those checks (demonstrated against
+# detect_invocation_context). Isolated mode closes both at the
+# interpreter level: -I ignores PYTHON* variables and never enables
+# the user site, so on the shebang route (env -S python3 -I)
+# neither hook shape ever loads. This re-exec extends the closure
+# to every other route (`python3 <script>`): execv replaces the
+# process in place — same pid, fds, controlling terminal, session
+# and parent chain, so TTY and ancestry gates observe the unchanged
+# invocation context — and cannot loop, because the re-execed
+# interpreter's sys.flags.isolated is 1. __main__-gated: importing
+# this file never re-execs the importer. Honest bound
+# (docs/security.md): on the `python3 <script>` route the hook has
+# ALREADY run when this guard fires, so a hook written against the
+# guard itself can neuter it; the shebang route is isolated from
+# the first instruction, and same-user writes to RAPTOR's own files
+# or the interpreter's startup surface remain the trust edge. Repo
+# imports still work under -I: the sys.path setup below is
+# Path(__file__)-relative, never PYTHONPATH-derived.
+import os  # noqa: E402
+import sys  # noqa: E402
+if __name__ == "__main__" and not sys.flags.isolated:
+    os.execv(
+        sys.executable,
+        [sys.executable, "-I", os.path.abspath(__file__), *sys.argv[1:]],
+    )
+    # execv does not return; reached only if a startup hook neutered
+    # it in this unisolated interpreter — refuse to run the authority
+    # checks on hooked code.
+    raise SystemExit(97)
+# fmt: on
+# ─── end interpreter-isolation guard ─────────────────────────────────
+
 import argparse
+import json
+import re
 import sys
 from pathlib import Path
 
@@ -49,9 +118,53 @@ if not (os.environ.get("CLAUDECODE")
 # fmt: on
 # ─── end trust-marker check ─────────────────────────────────
 
+# ─── interpreter-env hardening (fp-mint surface) ─────────────
+# fmt: off
+# This CLI can mint a standing cross-run suppression (verdict fp).
+# PYTHONPATH / PYTHONSTARTUP / PYTHONHOME / PYTHONUSERBASE let a
+# caller-controlled sitecustomize / usercustomize / .pth / startup
+# module run BEFORE this file's first line and forge the provenance
+# the mint records (demonstrated in adversarial review: one piped
+# command minted the ideal operator row, via PYTHONPATH and again
+# via a PYTHONUSERBASE-redirected user site), so their presence
+# refuses outright — the same variables the launcher's
+# dangerous-env strip removes. Honest bounds — the in-process rule:
+# (1) this check runs AFTER any such hook already ran, so it
+# defeats the STOCK shape (variable still present), not a hook that
+# scrubs its own variable; (2) a .pth/usercustomize planted in the
+# DEFAULT user site (~/.local/lib/pythonX.Y/site-packages) runs
+# with ZERO of these variables set and is undetectable by ANY env
+# check — the general closure for consent-surface launchers is
+# interpreter isolated mode (-I / -s -P), tracked as a fleet
+# follow-up. The MAC-bound mint markers and the session transcript
+# are the durable evidence layers. Shipped launcher routes strip
+# the interpreter variables, so production invocations never carry
+# them; an operator with a legitimate global PYTHONPATH re-runs
+# with it unset.
+_env_hazards = [
+    k for k in ("PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME",
+                "PYTHONUSERBASE")
+    if os.environ.get(k)
+]
+if _env_hazards:
+    sys.stderr.write(
+        f"{sys.argv[0]}: refusing to run with "
+        f"{', '.join(_env_hazards)} set.\n"
+        "  This CLI records verdict provenance, and interpreter-"
+        "startup hooks\n"
+        "  (sitecustomize et al.) can forge it before any check "
+        "here can fire.\n"
+        "  Re-run with the variable(s) unset, e.g.:\n"
+        f"    env -u {' -u '.join(_env_hazards)} raptor review ...\n"
+    )
+    sys.exit(2)
+# fmt: on
+# ─── end interpreter-env hardening ───────────────────────────
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import core.startup.process_init  # noqa: E402,F401
-from core.json import dumps_display, load_json, loads  # noqa: E402
+from core.security.log_sanitisation import sanitise_for_terminal as _sft  # noqa: E402
+from core.json import load_json, load_jsonl, loads  # noqa: E402
 from core.security.prompt_output_sanitise import sanitise_string  # noqa: E402
 
 # Byte budgets for run artifacts this CLI renders: context maps /
@@ -91,7 +204,24 @@ def _resolve_project_dir(explicit: str | None = None) -> Path | None:
         p = Path(explicit)
         if p.is_dir():
             return p
-        return None
+        # Accept a registry NAME like the rest of the operator
+        # surface (project doctrine: explicit values are a hard
+        # error when invalid, never a silent fallback — pre-fix a
+        # bad --project degraded every layer to "no data").
+        try:
+            from core.json import load_json
+            from core.startup import PROJECTS_DIR
+            data = load_json(PROJECTS_DIR / f"{explicit}.json")
+            if isinstance(data, dict) and data.get("output_dir"):
+                candidate = Path(data["output_dir"])
+                if candidate.is_dir():
+                    return candidate
+        except Exception:  # noqa: BLE001 — fall through to the hard error
+            pass
+        print(f"raptor-review: --project {explicit!r} is neither a "
+              "project directory nor a registered project name",
+              file=sys.stderr)
+        sys.exit(2)
     # The active-project pointer lives at ~/.raptor/projects/.active and
     # is a symlink to the project's <name>.json FILE; the project
     # directory is that JSON's output_dir (the same derivation the run
@@ -137,18 +267,22 @@ def _project_dir_for(args) -> Path | None:
     return _resolve_project_dir(None)
 
 
+# Shared ordering key (core/run/locate.py) — the run's recorded start
+# timestamp, mtime fallback, vanished-dir safe. One home with
+# raptor-run-status so the two CLIs cannot drift on "latest run".
+from core.run.locate import run_started_key as _run_started_key  # noqa: E402
+
+
 def _resolve_out_dir(args) -> Path | None:
-    """Resolve output directory: explicit --out, or latest in project."""
+    """Resolve output directory: explicit --out, or latest in project
+    (shared newest-first discovery: core/run/locate.py)."""
     if getattr(args, "out", None):
         return Path(args.out)
     project = _project_dir_for(args)
     if not project:
         return None
-    runs = sorted(
-        [d for d in project.iterdir() if d.is_dir() and (d / ".raptor-run.json").is_file()],
-        key=lambda d: d.stat().st_mtime,
-        reverse=True,
-    )
+    from core.run.locate import run_dirs_newest_first
+    runs = run_dirs_newest_first(project)
     return runs[0] if runs else None
 
 
@@ -217,45 +351,108 @@ def _load_suppression_records(
     """
     if not out_dir:
         return []
-    path = out_dir / "suppressions.jsonl"
-    if not path.is_file():
-        return []
+    # Bounded line-oriented load: the file sits inside a run dir
+    # whose rw grant sandboxed code holds — attacker bytes. load_jsonl
+    # refuses symlinks/FIFOs/devices on the OPENED fd (no
+    # stat-then-read window a swap can race, no plantable open hang)
+    # and enforces the per-line and total byte budgets; malformed and
+    # oversize lines are skipped, a missing or refused file loads as
+    # no records.
+    return [
+        rec for rec in load_jsonl(
+            out_dir / "suppressions.jsonl",
+            max_line_bytes=1024 * 1024,
+            max_total_bytes=64 * 1024 * 1024,
+        )
+        if isinstance(rec, dict)
+        and rec.get("file_path") == file
+        and rec.get("function") == function
+    ]
+
+
+def _load_readjudication_records(
+    out_dir: Path | None, file: str, function: str,
+    project_dir: Path | None = None,
+) -> tuple[list[dict], int]:
+    """Re-adjudication queue records for this function from
+    readjudication-queue.jsonl (core.project.readjudication), plus
+    the queue's GLOBAL suppressed count from its truncation marker.
+
+    Two queue homes are read: the run-local queue (the /validate
+    import's cross-check against the run's OWN prior container) and
+    the PROJECT-level queue at ``<project>/_report/`` (the cross-run
+    detection the completion hook and /project report write) — a
+    sibling-run contradiction only ever appears in the latter, so
+    reading one home showed an incomplete picture.
+
+    A record means two adjudications disagree at this site — queued,
+    never auto-overturned. The suppressed count is surfaced even when
+    this function has no records: a capped queue may have refused
+    exactly this function's contradiction, so silence would be
+    dishonest. Same tolerant-reader + hostile-artifact discipline as
+    :func:`_load_suppression_records` (the queues live in
+    agent-writable run/report dirs; only positive int-typed
+    suppressed fields count).
+    """
+    paths = []
+    if out_dir:
+        paths.append(Path(out_dir) / "readjudication-queue.jsonl")
+    if project_dir:
+        candidate = (Path(project_dir) / "_report"
+                     / "readjudication-queue.jsonl")
+        if candidate not in paths:
+            paths.append(candidate)
     records = []
-    try:
-        # Bounded + regular-file-gated: the file sits inside a run
-        # dir whose rw grant sandboxed code holds — attacker bytes.
-        # An unbounded read_text() was an OOM lever and a FIFO there
-        # a plantable hang.
-        import os as _os
-        import stat as _stat
-        _st = _os.stat(path)
-        if not _stat.S_ISREG(_st.st_mode) or _st.st_size > 64 * 1024 * 1024:
-            return []
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
+    suppressed = 0
+    for path in paths:
+        if not path.is_file():
+            continue
+        try:
+            import os as _os
+            import stat as _stat
+            _st = _os.stat(path)
+            if (not _stat.S_ISREG(_st.st_mode)
+                    or _st.st_size > 64 * 1024 * 1024):
                 continue
-            try:
-                rec = loads(line)
-            except ValueError:
-                continue
-            if not isinstance(rec, dict):
-                continue
-            if rec.get("file_path") == file and rec.get("function") == function:
-                records.append(rec)
-    except OSError:
-        return []
-    return records
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                if rec.get("action") == "truncated":
+                    value = rec.get("suppressed")
+                    if (isinstance(value, int)
+                            and not isinstance(value, bool) and value > 0):
+                        suppressed += value
+                    continue
+                if rec.get("action") != "queued":
+                    continue
+                site = rec.get("site")
+                site = site if isinstance(site, dict) else {}
+                if (site.get("file") == file
+                        and site.get("function") == function):
+                    records.append(rec)
+        except OSError:
+            continue
+    return records, suppressed
 
 
 def _annotations_dir(out_dir: Path | None) -> Path | None:
+    """Annotation base for READS — the run pin decides the project
+    level (record.py's resolver, shared with the orchestrator and
+    validate writers). A bare marker+parent probe here read
+    annotations at a DIFFERENT level than the writers for --out and
+    standalone runs, so operator notes landed where no view showed
+    them."""
     if not out_dir:
         return None
-    run_marker = out_dir / ".raptor-run.json"
-    if run_marker.is_file():
-        ann = out_dir.parent / "annotations"
-    else:
-        ann = out_dir / "annotations"
+    from core.audit.record import _resolve_annotations_dir
+    ann = _resolve_annotations_dir(out_dir)
     return ann if ann.is_dir() else None
 
 
@@ -302,14 +499,19 @@ def cmd_show(args) -> None:
     if args.function:
         _show_function(
             args.file, args.function, cm, entries, index, ann_dir, args,
-            out_dir=out_dir,
+            out_dir=out_dir, project_dir=project_dir,
         )
     else:
         _show_file(args.file, cm, entries, index, ann_dir, args)
 
 
-def _show_function(file, function, cm, entries, index, ann_dir, args, out_dir=None):
-    key = f"{file}:{function}"
+def _show_function(file, function, cm, entries, index, ann_dir, args,
+                   out_dir=None, project_dir=None):
+    # Shared injective key (file component percent-encoded) — a raw
+    # f-string key misses journal entries for paths containing ':'
+    # or '%'.
+    from core.coverage.journal import make_function_key
+    key = make_function_key(file, function)
     role = _context_map_role(cm, file, function)
     ann = _load_annotation(ann_dir, file, function)
     suppressions = _load_suppression_records(out_dir, file, function)
@@ -323,7 +525,12 @@ def _show_function(file, function, cm, entries, index, ann_dir, args, out_dir=No
         journal_entry = index[key]
 
     if getattr(args, "raw", False) and journal_entry:
-        print(dumps_display(journal_entry.to_dict(), indent=2))
+        # ensure_ascii on every --json lane: JSON escapes C0 but
+        # passes C1 terminal controls (single-byte CSI/OSC) raw when
+        # off — dumps_display is exactly that, and journal/finding
+        # content is LLM-derived. Still valid JSON for consumers.
+        print(json.dumps(journal_entry.to_dict(), indent=2,
+                         ensure_ascii=True, default=str))
         return
 
     header = f"─── {_line(file)} :: {_line(function)} "
@@ -344,6 +551,31 @@ def _show_function(file, function, cm, entries, index, ann_dir, args, out_dir=No
             print(f"  Strategy: {sid} [{strats}]" if sid else f"  Strategy: [{strats}]")
     else:
         print("  Verdict:  (no review recorded)")
+
+    if journal_entry and getattr(journal_entry, "body_offload", None):
+        # Offload stub: point the operator where the prose actually
+        # lives. A run-side slim stub (journal compact --slim-clean)
+        # names its sidecar file — constant text plus the fixed
+        # sidecar name, nothing row-derived, so no escaping is
+        # needed. An index write-boundary stub carries an EMPTY
+        # sidecar name and NO sidecar file is ever written for it:
+        # the full row stays in the producing run's own journal, and
+        # naming the sidecar here would send the operator hunting a
+        # file that does not exist. The run id on that arm is
+        # row-derived, so it goes through _line.
+        pointer = journal_entry.body_offload
+        if isinstance(pointer, dict) and pointer.get("sidecar"):
+            print("  Offloaded: body/hypotheses in "
+                  "review-journal-bodies.jsonl "
+                  "(journal compact --slim-clean; --raw shows the "
+                  "pointer)")
+        else:
+            run_id = getattr(journal_entry, "run_id", "") or ""
+            where = (f"run {_line(run_id, max_chars=60)}'s journal"
+                     if run_id else "the producing run's journal")
+            print(f"  Offloaded: body/hypotheses in {where} "
+                  "(index write-boundary slim — no sidecar file; "
+                  "--raw shows the pointer)")
 
     if journal_entry and journal_entry.hypotheses:
         print()
@@ -370,6 +602,57 @@ def _show_function(file, function, cm, entries, index, ann_dir, args, out_dir=No
             reason = str(rec.get("reason", ""))
             if reason:
                 print(f"      {_line(reason, max_chars=160)}")
+
+    readjudication, readj_suppressed = _load_readjudication_records(
+        out_dir, file, function, project_dir=project_dir)
+    if readjudication:
+        from core.project.readjudication import (
+            SHAPE_INTRA_RUN_SPLIT,
+            SHAPE_OVERTURN,
+        )
+        print()
+        print("  Re-adjudication queued (contradictory adjudications at "
+              "this site — nothing auto-overturned):")
+        for rec in readjudication:
+            claim = rec.get("new_claim")
+            claim = claim if isinstance(claim, dict) else {}
+            disproof = rec.get("disproof")
+            disproof = disproof if isinstance(disproof, dict) else {}
+            shape = rec.get("shape")
+            # Missing/foreign shape reads as the legacy class.
+            shape = shape if isinstance(shape, str) else ""
+            claim_src = _line(str(claim.get("source", "?")), max_chars=80)
+            claim_status = _line(
+                str(claim.get("status", "confirmed")), max_chars=40)
+            dis_src = _line(str(disproof.get("source", "?")), max_chars=80)
+            dis_status = _line(
+                str(disproof.get("status", "disproof")), max_chars=40)
+            if shape == SHAPE_OVERTURN:
+                print(f"    prior {claim_status} verdict from {claim_src} "
+                      f"disproven by later {dis_status} from {dis_src} "
+                      f"[overturn-shaped]")
+            elif shape == SHAPE_INTRA_RUN_SPLIT:
+                print(f"    intra-run split in {claim_src}: {claim_status} "
+                      f"and {dis_status} both final at this site")
+            else:
+                mech = ", ".join(
+                    str(m) for m in claim.get("mechanism") or [])
+                print(f"    new {_line(mech or '?', max_chars=80)} claim "
+                      f"from {claim_src} vs {dis_status} from {dis_src}")
+            reconsider = str(disproof.get("would_reconsider_if", ""))
+            if reconsider:
+                print(f"      would reconsider if: "
+                      f"{_line(reconsider, max_chars=160)}")
+            if rec.get("mechanism_match") is False:
+                print(f"      {_line(str(rec.get('mechanism_note', 'mechanism mismatch')), max_chars=160)}")
+    if readj_suppressed:
+        # The queue is capped and the caps are global — a truncated
+        # queue may have refused THIS function's contradiction, so the
+        # marker surfaces here even with no per-function records.
+        print()
+        print(f"  Re-adjudication queue truncated: {readj_suppressed} "
+              f"further contradiction(s) not recorded (record caps) — "
+              f"this function may have unrecorded contradictions.")
 
     if ann:
         print()
@@ -445,7 +728,8 @@ def cmd_findings(args):
             all_findings[key] = e
 
     if getattr(args, "raw", False):
-        print(dumps_display([e.to_dict() for e in all_findings.values()], indent=2))
+        print(json.dumps([e.to_dict() for e in all_findings.values()],
+                 indent=2, ensure_ascii=True, default=str))
         return
 
     if not all_findings:
@@ -492,7 +776,7 @@ def cmd_gaps(args) -> None:
         return
 
     if getattr(args, "raw", False):
-        print(dumps_display(gaps, indent=2))
+        print(json.dumps(gaps, indent=2, ensure_ascii=True, default=str))
         return
 
     print(f"  {len(gaps)} function(s) need review")
@@ -571,7 +855,8 @@ def cmd_history(args):
     """Show all reviews of a function over time."""
     out_dir = _resolve_out_dir(args)
     project_dir = _project_dir_for(args)
-    key = f"{args.file}:{args.function}"
+    from core.coverage.journal import make_function_key
+    key = make_function_key(args.file, args.function)
 
     entries = [e for e in _load_journal_entries(out_dir) if e.key == key]
 
@@ -586,7 +871,8 @@ def cmd_history(args):
         return
 
     if getattr(args, "raw", False):
-        print(dumps_display([e.to_dict() for e in entries], indent=2))
+        print(json.dumps([e.to_dict() for e in entries],
+                 indent=2, ensure_ascii=True, default=str))
         return
 
     for e in entries:
@@ -667,6 +953,21 @@ def cmd_notes(args):
         print("  No operator notes found.")
 
 
+def _write_base(args) -> str | None:
+    """Annotation base for WRITES, derived from the resolved out dir
+    (and through it the run's project pin) exactly like the read side
+    (_annotations_dir) — never from the ambient active project. The
+    delegate's own default is the ACTIVE project's annotations dir,
+    so without an explicit --base a note filed against project B's
+    run landed under project A: B's audit never consumed it and
+    `show` never displayed it."""
+    out_dir = _resolve_out_dir(args)
+    if out_dir is None:
+        return None
+    from core.audit.record import _resolve_annotations_dir
+    return str(_resolve_annotations_dir(out_dir))
+
+
 def cmd_note(args):
     """Add an operator note (delegates to raptor-annotate)."""
     import subprocess
@@ -679,8 +980,9 @@ def cmd_note(args):
         cmd.extend(["-m", args.body])
     if getattr(args, "status", None):
         cmd.extend(["--status", args.status])
-    if getattr(args, "base", None):
-        cmd.extend(["--base", args.base])
+    base = getattr(args, "base", None) or _write_base(args)
+    if base:
+        cmd.extend(["--base", base])
     env = os.environ.copy()
     env["_RAPTOR_TRUSTED"] = "1"
     # No --source: the delegate stamps the inherited fds' TTY context
@@ -697,8 +999,9 @@ def cmd_edit(args):
         sys.executable, str(libexec / "raptor-annotate"),
         "edit", args.file, args.function,
     ]
-    if getattr(args, "base", None):
-        cmd.extend(["--base", args.base])
+    base = getattr(args, "base", None) or _write_base(args)
+    if base:
+        cmd.extend(["--base", base])
     env = os.environ.copy()
     env["_RAPTOR_TRUSTED"] = "1"
     sys.exit(subprocess.call(cmd, env=env))
@@ -817,7 +1120,7 @@ def _stale_journal(args) -> None:
     try:
         entries = load_index(project_dir)
     except Exception as exc:  # noqa: BLE001
-        print(f"  Corrupt journal index: {exc}", file=sys.stderr)
+        print(f"  Corrupt journal index: {_sft(str(exc), max_len=300)}", file=sys.stderr)
         sys.exit(1)
 
     stale = []
@@ -860,7 +1163,7 @@ def cmd_edges(args):
         print("edge-obligations.json unreadable.")
         return
     if getattr(args, "raw", False):
-        print(dumps_display(ob, indent=2))
+        print(json.dumps(ob, indent=2, ensure_ascii=True, default=str))
         return
 
     reviewed = {}
@@ -939,7 +1242,7 @@ def _resolve_diff_runs(args, project_dir):
         [d for d in project_dir.iterdir()
          if d.is_dir() and (d / ".raptor-run.json").is_file()
          and (d / "review-journal.jsonl").is_file()],
-        key=lambda d: d.stat().st_mtime,
+        key=_run_started_key,
     )
     if len(resolved) == 1:
         others = [r for r in runs if r != resolved[0]]
@@ -973,7 +1276,7 @@ def cmd_diff(args):
         elif prior.verdict != entry.verdict:
             changed.append((prior, entry))
     if getattr(args, "raw", False):
-        print(dumps_display({
+        print(json.dumps({
             "run_a": run_a.name, "run_b": run_b.name,
             "changed": [
                 {"file": e.file, "function": e.function,
@@ -985,7 +1288,7 @@ def cmd_diff(args):
                  "verdict": e.verdict, "model": e.model}
                 for e in new_reviews
             ],
-        }, indent=2))
+        }, indent=2, ensure_ascii=True, default=str))
         return
     print(f"─── {_line(run_a.name, 60)} → "
           f"{_line(run_b.name, 60)} ───")
@@ -1027,7 +1330,7 @@ def cmd_live(args) -> None:
     try:
         while True:
             if journal.is_file():
-                with open(journal, encoding="utf-8") as fh:
+                with open(journal, encoding="utf-8") as fh:  # raw-open: stateful tail-follow, bounded per poll below
                     fh.seek(pos)
                     # Bounded per poll: the journal sits in a run dir
                     # whose write grant sandboxed code holds — an
@@ -1097,6 +1400,162 @@ def cmd_coverage(args):
     print(f"\n  {len(all_files)} file(s) with coverage data.")
 
 
+def _collect_toolrun_rows(out_dir: Path) -> tuple[list[dict], str]:
+    """Per-item tool/gate engagement rows for one run.
+
+    Sources, in the shapes their writers produce:
+
+    * ``refutation_gate_engagement`` audit-log rows — per-gate
+      ``{"gate", "engaged", "blocked_on"}`` records. The trail keeps
+      append order, so the LAST row per (key, phase) speaks for that
+      site — a gate that eventually engaged must not keep reporting
+      its stale block.
+    * ``substrate_skip`` audit-log rows — tool + reason for channels
+      that never looked at the site (target language outside the
+      tier's model).
+    * review-journal ``tools_skipped`` — channels the review-time
+      dispatch recorded as skipped; the journal row does not carry a
+      per-tool reason, so the row says where the record lives.
+
+    Returns ``(rows, disclosure_note)`` — each row is
+    ``{"file", "function", "kind", "channel", "status", "reason",
+    "phase"}`` with status engaged | blocked | skipped; the note
+    names anything the audit-log byte budgets kept out ("" when the
+    load was complete).
+    """
+    rows: list[dict] = []
+    note = ""
+    try:
+        from core.audit.record import load_audit_log_disclosed
+        log_rows, disclosure = load_audit_log_disclosed(out_dir)
+        note = disclosure.reason
+    except Exception:  # noqa: BLE001 — layer loaders degrade gracefully when absent
+        log_rows = []
+    gate_rows: dict[tuple, dict] = {}
+    skip_seen: set[tuple] = set()
+    for row in log_rows:
+        if not isinstance(row, dict):
+            continue
+        action = row.get("action")
+        if action == "refutation_gate_engagement":
+            # Last row per (site key, phase) wins — append order.
+            gate_rows[(str(row.get("key", "")),
+                       str(row.get("phase", "")))] = row
+        elif action == "substrate_skip":
+            dedupe = (str(row.get("key", "")), str(row.get("tool", "")),
+                      str(row.get("reason", "")))
+            if dedupe in skip_seen:
+                continue
+            skip_seen.add(dedupe)
+            rows.append({
+                "file": str(row.get("file", "") or ""),
+                "function": str(row.get("function", "") or ""),
+                "kind": "tool",
+                "channel": str(row.get("tool", "") or ""),
+                "status": "skipped",
+                "reason": str(row.get("reason", "") or ""),
+                "phase": "",
+            })
+    for (_key, phase), row in gate_rows.items():
+        gates = row.get("gates")
+        for rec in gates if isinstance(gates, list) else []:
+            if not isinstance(rec, dict):
+                continue
+            engaged = bool(rec.get("engaged"))
+            rows.append({
+                "file": str(row.get("file", "") or ""),
+                "function": str(row.get("function", "") or ""),
+                "kind": "gate",
+                "channel": str(rec.get("gate", "") or ""),
+                "status": "engaged" if engaged else "blocked",
+                "reason": "" if engaged
+                          else str(rec.get("blocked_on") or "unknown"),
+                "phase": phase,
+            })
+    # Journal-recorded review-time skips: latest row per site that
+    # carries the (additive) tools_skipped field.
+    latest_skips: dict = {}
+    for e in _load_journal_entries(out_dir):
+        if not getattr(e, "tools_skipped", None):
+            continue
+        prev = latest_skips.get(e.key)
+        if prev is None or e.ts > prev.ts:
+            latest_skips[e.key] = e
+    for e in latest_skips.values():
+        for tool in e.tools_skipped or []:
+            rows.append({
+                "file": e.file,
+                "function": e.function,
+                "kind": "tool",
+                "channel": str(tool),
+                "status": "skipped",
+                "reason": "review-time dispatch skip "
+                          "(journal tools_skipped)",
+                "phase": "",
+            })
+    rows.sort(key=lambda r: (r["file"], r["function"], r["kind"],
+                             r["channel"], r["phase"]))
+    return rows, note
+
+
+def cmd_tools(args) -> None:
+    """Per-function tool/gate engagement: what could not run and why."""
+    out_dir = _resolve_out_dir(args)
+    if not out_dir:
+        print("  No output directory found. Run an audit first.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    rows, note = _collect_toolrun_rows(out_dir)
+
+    if getattr(args, "raw", False):
+        print(json.dumps(rows, indent=2, ensure_ascii=True))
+        return
+
+    if not rows:
+        print("  No tool/gate engagement records in this run.")
+        print("  (Sources: refutation_gate_engagement / substrate_skip "
+              "rows in .audit-log.jsonl, tools_skipped in the review "
+              "journal.)")
+        return
+
+    # Functions with at least one could-not-run channel get the
+    # per-item listing (their engaged gates stay visible for
+    # contrast); fully-engaged functions are summarised as a count so
+    # a healthy run is one line, not a wall.
+    by_func: dict[tuple, list[dict]] = {}
+    for r in rows:
+        by_func.setdefault((r["file"], r["function"]), []).append(r)
+    affected = {
+        k: v for k, v in by_func.items()
+        if any(r["status"] != "engaged" for r in v)
+    }
+    clean = len(by_func) - len(affected)
+
+    blocked = sum(1 for r in rows if r["status"] == "blocked")
+    skipped = sum(1 for r in rows if r["status"] == "skipped")
+    print(f"  {len(affected)} function(s) with channels that could "
+          f"not run ({blocked} blocked gate(s), {skipped} skipped "
+          "tool(s))")
+    if note:
+        print(f"  ⚠️ audit trail partially read: {_line(note)}")
+    for (file, function), items in sorted(affected.items()):
+        print()
+        print(f"  {_line(file)}:{_line(function, max_chars=80)}")
+        for r in items:
+            channel = _line(r["channel"], max_chars=40)
+            status = _line(r["status"], max_chars=10)
+            reason = _line(r["reason"], max_chars=120)
+            phase = _line(r["phase"], max_chars=20)
+            tail = f"  [{phase}]" if phase else ""
+            print(f"    {r['kind']:<4} {channel:<24} {status:<8} "
+                  f"{reason}{tail}")
+    if clean:
+        print()
+        print(f"  {clean} function(s) with every recorded gate "
+              "engaged (not listed; --raw has the full rows).")
+
+
 def cmd_compact(args) -> None:
     """Compact the project journal index.
 
@@ -1123,52 +1582,798 @@ def cmd_compact(args) -> None:
         return
 
     from core.coverage.journal import (
-        INDEX_SCHEMA_VERSION,
-        _entry_from_dict,
+        IndexUnreadable,
+        IndexWriteOverBudget,
         _flock,
-        now_iso,
+        _load_index,
+        _write_index,
+        rehome_legacy_keys,
     )
-    from core.json import save_json
 
     # Same lock every index writer takes (merge_into_index) — a
     # compaction racing a run-completion merge must not clobber it.
     # Load INSIDE the lock so the rewrite is based on current bytes.
+    # The load + rewrite go through the journal module's own writer
+    # gates (_load_index(for_write=True) / _write_index) rather than a
+    # re-implemented copy — compaction is a WRITER, so it inherits the
+    # full refusal discipline (unreadable file, non-object container,
+    # non-serializable preserved rows) instead of drifting behind it.
     with _flock(index_path):
-        data = load_json(index_path, max_bytes=_MAX_ARTIFACT_BYTES)
-        if not isinstance(data, dict) or not isinstance(
-                data.get("entries", {}), dict):
-            print("  Corrupt index.", file=sys.stderr)
+        try:
+            entries = _load_index(index_path, for_write=True)
+        except IndexUnreadable as e:
+            print(f"  Corrupt index — not compacting: {e}",
+                  file=sys.stderr)
             sys.exit(1)
 
-        entries = data.get("entries", {})
         before = len(entries)
-        rehomed = 0
-        for old_key in list(entries.keys()):
-            try:
-                entry = _entry_from_dict(entries[old_key])
-            except (TypeError, KeyError, ValueError):
-                continue  # unreadable row: leave in place, never drop
-            new_key = entry.index_key
-            if new_key == old_key:
-                continue
-            existing = entries.get(new_key)
-            existing_ts = existing.get("ts", "") if isinstance(
-                existing, dict) else ""
-            if existing is None or entry.ts > existing_ts:
-                entries[new_key] = entries[old_key]
-            del entries[old_key]
-            rehomed += 1
+        # The journal module's own walk — compaction and the
+        # run-completion merge must re-home (and quarantine) rows
+        # identically, so there is exactly one implementation.
+        rehomed = rehome_legacy_keys(entries)
 
         if rehomed:
-            save_json(index_path, {
-                "schema_version": INDEX_SCHEMA_VERSION,
-                "updated_at": now_iso(),
-                "entries": entries,
-            })
+            try:
+                _write_index(index_path, entries)
+            except IndexWriteOverBudget as e:
+                # The write gate refuses rather than freeze the index
+                # (an over-budget file degrades every reader to empty
+                # and every writer to refusal); the on-disk index is
+                # untouched.
+                print(f"  Index rewrite refused — not compacting: {e}",
+                      file=sys.stderr)
+                sys.exit(1)
             print(f"  Compacted: {before} -> {len(entries)} entries "
                   f"({rehomed} legacy key(s) re-homed).")
         else:
             print(f"  Index already compact ({before} entries).")
+
+
+def cmd_digest(args) -> None:
+    """Ranked end-of-run summary for one run (shared digest reader)."""
+    run_dir = Path(args.run_dir) if getattr(args, "run_dir", None) \
+        else _resolve_out_dir(args)
+    if not run_dir:
+        print("  No run found — pass a run dir or activate a project.",
+              file=sys.stderr)
+        sys.exit(1)
+    if not (Path(run_dir) / ".raptor-run.json").is_file():
+        print(f"  {_line(str(run_dir), max_chars=200)} is not a run "
+              "directory (no .raptor-run.json).", file=sys.stderr)
+        sys.exit(2)
+    from core.run.digest import read_run_digest, render_run_digest
+    digest = read_run_digest(Path(run_dir))
+    if getattr(args, "raw", False):
+        print(json.dumps(digest.to_dict(), indent=2, ensure_ascii=True,
+                         default=str))
+        return
+    # Renderer output is escaped at render (core/run/digest.py).
+    print(render_run_digest(digest))
+
+
+def _verdict_run_dirs(args) -> list:
+    """Run dirs the verdict verb resolves finding ids against:
+    the explicit ``--out`` run, else every run in the governing
+    project, newest first (same enumeration as the latest-run
+    resolver)."""
+    out = getattr(args, "out", None)
+    if out:
+        return [Path(out)]
+    project = _project_dir_for(args)
+    if not project:
+        return []
+    from core.run.locate import run_dirs_newest_first
+    return run_dirs_newest_first(project)
+
+
+def _project_registry_target(args, run_dir) -> Path | None:
+    """The governing project's registered target tree, when the run
+    actually BELONGS to that project (run dir inside its output dir —
+    an ambient active project must not veto an unrelated --out run).
+    Best-effort — None means no cross-check possible."""
+    project_dir = _project_dir_for(args)
+    if not project_dir:
+        return None
+    try:
+        if not Path(run_dir).resolve().is_relative_to(
+                Path(project_dir).resolve()):
+            return None
+    except (OSError, ValueError):
+        return None
+    try:
+        from core.startup import PROJECTS_DIR
+        for reg in Path(PROJECTS_DIR).glob("*.json"):
+            data = load_json(reg, max_bytes=_MAX_META_BYTES)
+            if not isinstance(data, dict):
+                continue
+            out = data.get("output_dir")
+            if not (isinstance(out, str) and out):
+                continue
+            if Path(out).resolve() != Path(project_dir).resolve():
+                continue
+            target = data.get("target")
+            if isinstance(target, str) and target \
+                    and Path(target).is_dir():
+                return Path(target)
+            return None
+    except Exception:  # noqa: BLE001 — registry problems mean "no cross-check"
+        pass
+    return None
+
+
+def _verdict_repo_root(args, ref) -> Path | None:
+    """Source tree the verdict's source hash is computed against:
+    explicit ``--target`` first, else the ``target_path`` sealed in
+    the finding's run manifest — corroborated against the governing
+    project's registered target when one is known (the manifest sits
+    in the child-writable run dir; a swapped target_path must not
+    silently steer which tree gets hashed)."""
+    explicit = getattr(args, "target", None)
+    if explicit:
+        p = Path(explicit)
+        if not p.is_dir():
+            print(f"raptor-review: --target {_line(explicit)} is not a "
+                  "directory", file=sys.stderr)
+            sys.exit(2)
+        return p
+    try:
+        from core.run import load_run_metadata
+        meta = load_run_metadata(ref.run_dir) or {}
+        tp = meta.get("target_path")
+        if isinstance(tp, str) and tp and Path(tp).is_dir():
+            resolved = Path(tp)
+            project_target = _project_registry_target(args, ref.run_dir)
+            if project_target is not None and \
+                    project_target.resolve() != resolved.resolve():
+                print("  ⚠️  the run manifest's target_path "
+                      f"({_line(tp, max_chars=200)}) disagrees with "
+                      "the project's registered target — pass "
+                      "--target <repo> to name the tree explicitly.",
+                      file=sys.stderr)
+                return None
+            return resolved
+    except Exception:  # noqa: BLE001 — manifest problems fall to "unknown"
+        pass
+    return None
+
+
+def _operator_provenance(args) -> tuple:
+    """``(source, note, warning, operator, ctx)`` for the verdict row.
+
+    Same doctrine as /annotate: ``source`` defaults to ``human`` when
+    the invocation is interactive-TTY, else ``agent``; an explicit
+    ``--source human`` from a non-TTY invocation is demoted to
+    ``agent`` with a warning (the non-tty stamp would contradict it —
+    readers demote such records anyway). The note records the full
+    invocation-context stamp for the auditor.
+
+    ``operator`` feeds the fp verb's gate and is the full live-context
+    operator-grant discipline
+    (``core.annotations.provenance.live_context_grants_operator`` —
+    the same chokepoint the coverage --mark path stamps with), NOT the
+    bare TTY stamp: a pty makes ``isatty`` true by design, and an
+    in-session agent invocation is interactive-TTY on the launcher's
+    terminal while carrying the dispatch environment marker — the
+    exact shapes the grant demotes. Both facts come from ONE detected
+    context so the gate can never disagree with the audited stamp.
+    ``ctx`` is that detected context — the fp ceremony's own gates
+    read it too, for the same single-detection reason.
+    """
+    from core.annotations.provenance import (
+        ENV_MARKERS_KEY,
+        INTERACTIVE_TTY,
+        PARENTS_KEY,
+        PROVENANCE_KEY,
+        SID_KEY,
+        TTY_KEY,
+        detect_invocation_context,
+        live_context_grants_operator,
+    )
+    ctx = detect_invocation_context()
+    interactive = ctx[PROVENANCE_KEY] == INTERACTIVE_TTY
+    operator = live_context_grants_operator(ctx)
+    requested = getattr(args, "source", None)
+    warning = None
+    if requested == "human" and not interactive:
+        source = "agent"
+        warning = ("--source human requested from a non-TTY invocation — "
+                   "recording source=agent (a non-tty stamp contradicts "
+                   "the human claim; readers demote such records)")
+    elif requested:
+        source = requested
+    else:
+        source = "human" if interactive else "agent"
+    note = (f"operator-verdict source={source} "
+            f"tty={ctx[TTY_KEY]} provenance={ctx[PROVENANCE_KEY]} "
+            f"sid={ctx[SID_KEY]} envm={ctx[ENV_MARKERS_KEY]} "
+            f"parents={ctx[PARENTS_KEY]}")
+    return source, note, warning, operator, ctx
+
+
+# ── fp ceremony (typed operator consent) ────────────────────────────
+#
+# The sanctioned production route for the fp mint. The operator grant
+# above refuses the dispatch trust markers every shipped launcher
+# route carries, so a plain fp cannot mint in production; the ceremony
+# is the DIFFERENT, stronger authority the retirement decision named:
+# a typed confirmation at the operator's own terminal, precedent-shaped
+# on raptor-wsl-consent grant and raptor-sage-setup review --approve.
+# It does not bypass the grant silently — the grant result AND the
+# ceremony evidence are both recorded into the minted row.
+
+# Every standard fd must be a TTY — stricter than the any-fd
+# interactive stamp, and read from the SAME detected context the
+# audited note records, so the gate can never disagree with the stamp.
+_CEREMONY_ALL_FDS = frozenset({"stdin", "stdout", "stderr"})
+# A finding id admitted into the typed phrase must be one the
+# operator can verify BY EYE, so the charset is conservative-ASCII
+# and bounded (ids come from findings files — attacker bytes, and
+# printable-Unicode confusables like the U+2011 non-breaking hyphen
+# would otherwise render indistinguishably from the ASCII form while
+# comparing unequal). Cross-form phrases already abort (fail-safe);
+# the charset closes the confusable channel at the authority object
+# itself. Refusal direction: /annotate.
+_CEREMONY_MAX_ID_CHARS = 120
+_CEREMONY_ID_RE = re.compile(
+    r"[A-Za-z0-9._:/-]{1,%d}" % _CEREMONY_MAX_ID_CHARS)
+
+
+def _ceremony_context_refusal(ctx) -> str | None:
+    """Why the typed-consent ceremony refuses this invocation context
+    (None = proceed to the typed confirmation).
+
+    Refused shapes: any non-TTY std fd (an agent tool-call or script
+    runs this CLI with piped fds — measured: the agent harness pipes
+    all three), the process being its own session leader, and the
+    stock ``script(1)`` wrapper in the recorded ancestry (the
+    corroboration demote set). Dispatch environment markers are
+    deliberately NOT refused: every shipped launcher route exports
+    one, so refusing them would retire the ceremony exactly the way
+    it retired the grant — ``envm=trusted`` with ``grant=refused``
+    is the EXPECTED legitimate production shape, never a tell.
+
+    TIER STATEMENT (adversarially verified, read before granting
+    these gates any weight): on this substrate every in-process
+    authority check bounds at "same-user code execution defeats
+    it" — a curated pty with an interposed shell, a prctl-renamed
+    ancestor, or an interpreter-startup hook can each produce a
+    passing context. These gates catch the DRIVE-BY shapes (a piped
+    tool call, a bare ``script -qec``, a stock wrapper), not a
+    determined forger. The ceremony's surviving defenses are
+    OUT-OF-PROCESS: the typed exchange lands in the driving
+    session's transcript, the mint provenance is MAC-bound into the
+    stored row (post-hoc editing fails verification; forging it
+    in-process still leaves the transcript), and ``retest`` revokes
+    instantly. This is the same tier as both precedent ceremonies
+    (raptor-wsl-consent gates on a single ``isatty``; sage-setup
+    review --approve on ``[ -t 0 ]``): no silent forgery, not
+    impossibility.
+    """
+    from core.annotations.provenance import (
+        PARENTS_KEY,
+        SID_INHERITED,
+        SID_KEY,
+        TTY_KEY,
+    )
+    tty = str(ctx.get(TTY_KEY) or "")
+    if set(tty.split(",")) != _CEREMONY_ALL_FDS:
+        return ("stdin, stdout and stderr must all be terminals "
+                f"(found: tty={_line(tty, max_chars=40)}) — an agent "
+                "or script invocation runs with piped fds and stops "
+                "here")
+    if ctx.get(SID_KEY) != SID_INHERITED:
+        return ("the process is its own session leader — the "
+                "script(1)/pty-wrapper launder shape, not a "
+                "shell-launched command")
+    parents = str(ctx.get(PARENTS_KEY) or "").split(",")
+    if "script" in parents:
+        return ("the stock script(1) wrapper appears in the recorded "
+                "ancestry")
+    return None
+
+
+def _ceremony_confirm(ref, ctx, operator) -> None:
+    """Show WHAT is being suppressed, then require the confirmation
+    phrase ``suppress <finding-id>`` typed back (the sage-setup
+    review shape: evidence first, decision second; no bare y/n — the
+    phrase names THIS finding, so a phrase copy-pasted for another
+    finding cannot confirm it).
+
+    Exits without returning on refusal or abort — nothing stored.
+    Every finding-derived value shown here is attacker bytes
+    (findings files, scanner output) and renders through ``_line``.
+    """
+    from core.annotations.provenance import (
+        ENV_MARKERS_KEY,
+        PARENTS_KEY,
+        SID_KEY,
+        TTY_KEY,
+    )
+    from core.sage.hooks import SUPPRESS_TTL_DAYS
+
+    fid = str(ref.finding_id)
+    if not _CEREMONY_ID_RE.fullmatch(fid):
+        # A phrase the operator cannot verify by eye must not become
+        # the authority object: conservative ASCII charset, bounded
+        # (see _CEREMONY_ID_RE — confusables and non-printables both
+        # refuse here). Fail toward /annotate.
+        print("  Ceremony refused: the resolved finding id is outside "
+              "the ceremony charset ([A-Za-z0-9._:/-], at most "
+              f"{_CEREMONY_MAX_ID_CHARS} chars) — a confirmation "
+              "phrase the operator can verify by eye cannot be built "
+              "(non-printables, markup, and printable Unicode "
+              "confusables all refuse). Record the review via "
+              "/annotate instead. Nothing was stored or changed.",
+              file=sys.stderr)
+        sys.exit(2)
+    title = ref.finding.get("title") or ref.finding.get("message") \
+        or ref.finding.get("description") or ""
+    print()
+    print("  Ceremony:  standing false-positive suppression "
+          "(typed operator consent)")
+    print("  This mints a SAGE verdict row with pipeline-grade "
+          "suppression authority:")
+    print("  future /agentic and /codeql runs on this repo skip the "
+          "LLM call for this")
+    print(f"  finding while its source is unchanged, for "
+          f"{SUPPRESS_TTL_DAYS} days.")
+    if title:
+        # Display-integrity note: _line escapes non-printables to
+        # visible \xHH/\uHHHH forms, EXCEPT bidi override characters
+        # (U+202A-U+202E, U+2066-U+2069), which its autofetch-markup
+        # pass DROPS silently (pre-existing sanitiser behaviour,
+        # shared with every report writer). Dropped is inert — the
+        # display cannot be reordered — but an auditor comparing this
+        # line to the raw finding must know removal, not escaping, is
+        # the bidi treatment here.
+        print(f"  Title:     {_line(title, max_chars=200)}")
+    if operator:
+        print("  Grant:     the live-context operator grant also "
+              "grants this context")
+    else:
+        print("  Grant:     the live-context operator grant refuses "
+              "this context — the")
+        print("             refusal is recorded with the mint "
+              "(grant=refused), not bypassed")
+    print("  Context:   recorded into the minted row — "
+          f"tty={_line(str(ctx.get(TTY_KEY) or ''), max_chars=40)} "
+          f"sid={_line(str(ctx.get(SID_KEY) or ''), max_chars=20)} "
+          f"envm={_line(str(ctx.get(ENV_MARKERS_KEY) or ''), max_chars=40)}")
+    print("             "
+          f"parents={_line(str(ctx.get(PARENTS_KEY) or ''), max_chars=120)}")
+    envm = set(str(ctx.get(ENV_MARKERS_KEY) or "").split(","))
+    if envm & {"claudecode", "trusted"}:
+        print("  Note:      a dispatch environment marker is present "
+              "— this ceremony run")
+        print("             is recorded as such for the auditor.")
+    print(f"  Revoke:    raptor-review verdict {fid} retest "
+          "(works non-interactively)")
+    print()
+    try:
+        answer = input(f"  Type the confirmation phrase "
+                       f"'suppress {fid}' to mint, or anything "
+                       "else to abort: ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        print("  Aborted — nothing stored or changed.")
+        sys.exit(3)
+    if answer.strip() != f"suppress {fid}":
+        print("  Aborted — the phrase does not match "
+              "'suppress <finding-id>' for THIS finding. Nothing was "
+              "stored or changed.")
+        sys.exit(3)
+
+
+def _record_operator_verdict(run_dir, finding, verdict, reason, source,
+                             extra=None):
+    """Disk-side audit record for the verb, via the suppressions
+    single-writer (dropped=false — an operator verdict never drops a
+    finding from THIS run; it steers future ones). Best-effort like
+    every other producer. ``extra`` merges additional audit fields
+    (the fp mint provenance: ``minted``, ``operator_grant``)."""
+    from core.analysis.reach_chokepoint import record_suppression
+    record_suppression(
+        run_dir,
+        finding=finding,
+        verdict=f"operator_{verdict}",
+        reason=reason or "operator verdict (no reason given)",
+        dropped=False,
+        extra={"source": source, **(extra or {})},
+    )
+
+
+def _report_failed_edits(failed_paths) -> bool:
+    """Surface findings files a manual_override edit could NOT
+    rewrite. Returns True when any failed — callers exit nonzero: an
+    edit that silently did not happen reads as success."""
+    if not failed_paths:
+        return False
+    print(f"  ⚠️  could not rewrite {len(failed_paths)} findings "
+          "file(s) (unreadable, over the byte budget, or write "
+          "failure):", file=sys.stderr)
+    for p in failed_paths:
+        print(f"        {_line(str(p), max_chars=200)}", file=sys.stderr)
+    return True
+
+
+def _forget_or_report(forget_fn, *args, **kwargs) -> int:
+    """Run a verdict-row clear, failing CLOSED on every partial
+    outcome: a truncated store walk, an enumeration failure, or a
+    server that refused some deprecations must never report
+    'cleared' while a suppressing row survives. Exits 1 before any
+    disk edit; returns the cleared count on full success."""
+    from core.sage.hooks import VerdictWalkTruncated
+    try:
+        result = forget_fn(*args, **kwargs)
+    except VerdictWalkTruncated as e:
+        print(f"  Could not enumerate the SAGE verdict store "
+              f"({_line(str(e), max_chars=200)}) — nothing was "
+              "cleared or changed. Re-run when the store is "
+              "reachable end to end.", file=sys.stderr)
+        sys.exit(1)
+    if result is None:
+        # Reachable client, failed enumeration (non-truncation) —
+        # never fall through as if the store held nothing.
+        print("  Could not enumerate the SAGE verdict store (listing "
+              "failed — see debug logs) — nothing was cleared or "
+              "changed.", file=sys.stderr)
+        sys.exit(1)
+    cleared, failed = result
+    if failed:
+        print(f"  ⚠️  {failed} verdict row(s) could not be deprecated "
+              f"(server refused; {cleared} cleared). The surviving "
+              "row(s) keep suppressing this finding — re-run when "
+              "the store accepts deprecations. No disk records were "
+              "changed.", file=sys.stderr)
+        sys.exit(1)
+    return cleared
+
+
+def cmd_verdict(args) -> None:
+    """Record a human FP/TP/retest verdict on a finding.
+
+    Authority asymmetry: ``fp`` is refused unless the live invocation
+    context earns the OPERATOR grant
+    (``live_context_grants_operator`` — not a bare TTY check: a pty
+    makes ``isatty`` true by design) — its row suppresses the finding
+    cross-run with pipeline authority, so it is reserved for human
+    terminal judgment. ``fp --ceremony`` is the sanctioned production
+    route: the grant refuses every shipped launcher route's dispatch
+    marker, so the ceremony substitutes a stronger, recorded
+    authority — all std fds TTYs, a typed confirmation phrase naming
+    the finding id, and a mint stamped ``minted=ceremony`` with the
+    grant result. ``tp`` and ``retest`` stay available
+    non-interactively: they are fail-safe (their only effect is that
+    the finding gets RE-analyzed), and their provenance stamp records
+    the invocation context either way.
+    """
+    from core.run.verdicts import (
+        finding_coords,
+        finding_rule_id,
+        resolve_finding,
+        set_manual_override,
+    )
+
+    run_dirs = _verdict_run_dirs(args)
+    if not run_dirs:
+        print("  No runs found — pass --out <run-dir> or activate a "
+              "project.", file=sys.stderr)
+        sys.exit(1)
+
+    matches, suggestions = resolve_finding(run_dirs, args.finding_id)
+    if not matches:
+        print(f"  No finding with id {_line(args.finding_id, max_chars=120)!r} "
+              f"in {len(run_dirs)} run(s).", file=sys.stderr)
+        if suggestions:
+            print("  Did you mean:", file=sys.stderr)
+            for s in suggestions:
+                print(f"    {_line(s, max_chars=120)}", file=sys.stderr)
+        sys.exit(2)
+
+    verb = args.verdict
+    ref = matches[0]  # newest run first — SAGE keys are run-agnostic
+    rel, fn, line = finding_coords(ref.finding)
+    rule = finding_rule_id(ref.finding)
+    reason = (args.reason or "").strip()
+    source, prov_note, prov_warning, operator, ctx = \
+        _operator_provenance(args)
+    if prov_warning:
+        print(f"  ⚠️  {prov_warning}", file=sys.stderr)
+
+    ceremony = bool(getattr(args, "ceremony", False))
+    if ceremony and verb != "fp":
+        print("  --ceremony applies to the fp verb only (tp and "
+              "retest never need it — they are fail-safe and work "
+              "in any context). Nothing was stored or changed.",
+              file=sys.stderr)
+        sys.exit(2)
+
+    from core.sage.hooks import SUPPRESS_TTL_DAYS
+
+    # Operator-grant gate — fp only, decided BEFORE anything touches
+    # SAGE or disk. A CLI fp row is MAC-identical to a pipeline row
+    # and suppresses this finding cross-run for the whole TTL; the
+    # pipeline's own agent-authored rows are minted at a governed
+    # chokepoint behind an actual analysis verdict, while this verb
+    # is an id-addressed assertion channel on the preapproved libexec
+    # surface — human judgment is the gate that keeps it
+    # operator-tier, and the bar is the live-context operator-grant
+    # chokepoint (live_context_grants_operator, same as the coverage
+    # --mark writer), not a bare isatty check: an in-session agent on
+    # the launcher's pty IS interactive-TTY and could otherwise mint
+    # the standing suppression itself. The --ceremony route below is
+    # the sanctioned substitute authority for the contexts the grant
+    # refuses. tp/retest stay available non-interactively (fail-safe
+    # asymmetry: they only ever cause RE-analysis).
+    if verb == "fp" and not ceremony and not operator:
+        print("  Refused: the fp verb requires an operator context "
+              "(the live-context grant discipline: an interactive "
+              "terminal at an operator shell, no agent-session or "
+              "dispatch environment marker — "
+              "core.annotations.provenance."
+              "live_context_grants_operator). A false-positive "
+              "verdict suppresses this finding on future runs for "
+              f"{SUPPRESS_TTL_DAYS} days — that standing "
+              "suppression is reserved for human judgment (the "
+              "annotation provenance doctrine), and a bare TTY is "
+              "not evidence of one (a pty wrapper or an agent "
+              "session's own terminal makes isatty true by design). "
+              "Nothing was stored or changed. Use 'tp'/'retest' "
+              "(both stay available non-interactively — they only "
+              "cause re-analysis), record the review via /annotate, "
+              "or — for a standing suppression — run the "
+              "typed-consent ceremony at your own terminal:\n"
+              "    raptor review verdict "
+              f"{_line(args.finding_id, max_chars=120)} fp "
+              "--ceremony",
+              file=sys.stderr)
+        sys.exit(2)
+
+    # Ceremony context gate — decided up front with zero mutation,
+    # from the SAME detected context the audited stamp records. The
+    # typed confirmation itself happens later, after the fp
+    # preconditions (source hash, SAGE reachability) are known good:
+    # never ask the operator to consent to a mint that then fails.
+    if verb == "fp" and ceremony:
+        refusal = _ceremony_context_refusal(ctx)
+        if refusal:
+            print(f"  Ceremony refused: {refusal}. The typed consent "
+                  "must come from the operator at their own terminal "
+                  "— run:\n"
+                  "    raptor review verdict "
+                  f"{_line(args.finding_id, max_chars=120)} fp "
+                  "--ceremony\n"
+                  "  Nothing was stored or changed.",
+                  file=sys.stderr)
+            sys.exit(2)
+
+    # fp mint provenance — HOW the mint was authorised
+    # (minted=grant|ceremony), what the operator grant said
+    # (grant=granted|refused), and the detected invocation context
+    # (mintctx), so ceremony-minted rows stay distinguishable from
+    # grant-minted ones and the ceremony never silently bypasses the
+    # grant. MAC-BOUND: store_finding_verdict puts these in the row's
+    # ||key=value|| markers AND the rowmac'd decision-field set, so a
+    # stored row's mint authority cannot be edited after the fact
+    # (the note stamp stays free audit text; readers rebuild the
+    # field set from the row's own markers, so pre-mint rows keep
+    # verifying). Same-user key-read bound applies — see the rowmac
+    # module.
+    mint = None
+    if verb == "fp":
+        from core.annotations.provenance import (
+            ENV_MARKERS_KEY,
+            PARENTS_KEY,
+            SID_KEY,
+            TTY_KEY,
+        )
+        mint = {
+            "minted": "ceremony" if ceremony else "grant",
+            "grant": "granted" if operator else "refused",
+            "mintctx": (
+                f"tty={ctx.get(TTY_KEY, '')};"
+                f"sid={ctx.get(SID_KEY, '')};"
+                f"envm={ctx.get(ENV_MARKERS_KEY, '')};"
+                f"parents={ctx.get(PARENTS_KEY, '')}"
+            ),
+        }
+    note = prov_note + (
+        f" reason={_line(reason, max_chars=200)}" if reason else "")
+
+    from core.sage.hooks import (
+        SUPPRESS_TTL_DAYS,
+        SUPPRESS_VERDICTS,
+        finding_verdict_source_hash,
+        forget_finding_verdicts,
+        operator_client,
+        store_finding_verdict,
+    )
+
+    client = operator_client()
+    sage_absent_msg = (
+        "SAGE is not reachable — the cross-run verdict store requires "
+        "the SAGE sidecar (there is no disk-side verdict store). "
+        "Install/start it with libexec/raptor-sage-setup, then re-run."
+    )
+
+    # Source hash: needs the repo and the pipeline's raw coordinates.
+    repo_root = _verdict_repo_root(args, ref)
+    src_hash = ""
+    hash_note = None
+    if repo_root and rel and fn and rule:
+        # Validate the record's path stays inside the tree before any
+        # read — findings files are attacker bytes and a traversal rel
+        # must not turn the hash into an arbitrary-file oracle. The
+        # STORE still uses the record's raw strings (the pipeline
+        # fingerprints on them).
+        from core.paths import to_repo_relative
+        if to_repo_relative(rel, repo_root, outside_root="none") is None:
+            hash_note = "finding path escapes the target tree"
+        else:
+            src_hash = finding_verdict_source_hash(repo_root, rel, line)
+            if not src_hash:
+                hash_note = "source file unreadable under the target tree"
+    elif not repo_root:
+        hash_note = ("target tree unknown — pass --target <repo> "
+                     "(no target_path in the run manifest)")
+    else:
+        hash_note = "finding record lacks rule/file/function coordinates"
+
+    header = {"fp": "False Positive", "tp": "True Positive",
+              "retest": "Retest"}[verb]
+    loc = f"{_line(rel or '?', max_chars=120)}:{line}"
+    print(f"  Verdict:  {header}")
+    print(f"  Finding:  {_line(ref.finding_id, max_chars=120)}  "
+          f"{loc}  {_line(fn or '?', max_chars=80)}"
+          + (f"  [{_line(rule, max_chars=80)}]" if rule else ""))
+
+    if verb == "fp":
+        if not src_hash:
+            print(f"  Cannot record: {hash_note}.", file=sys.stderr)
+            sys.exit(1)
+        if client is None:
+            print(f"  {sage_absent_msg}", file=sys.stderr)
+            sys.exit(1)
+        if ceremony:
+            # Preconditions are known good — evidence display and
+            # typed confirmation now, mint immediately after (exits
+            # without returning on abort/mismatch; nothing stored).
+            _ceremony_confirm(ref, ctx, operator)
+        # SAGE store FIRST — if it refuses, the command fails with
+        # zero disk mutation (a cleared force-through beside a failed
+        # store would silently re-enable suppression the operator
+        # never consented to lose).
+        ok = store_finding_verdict(
+            str(repo_root), rule, rel, fn, src_hash, "false_positive",
+            note=note, mint=mint, client=client,
+        )
+        if not ok:
+            print("  Store failed — SAGE refused the row (see logs). "
+                  "Nothing was changed.", file=sys.stderr)
+            sys.exit(1)
+        # A standing manual_override force-through contradicts an
+        # operator FP — clear it so the new verdict actually takes.
+        cleared_paths, failed_paths = set_manual_override(matches, False)
+        _record_operator_verdict(
+            ref.run_dir, ref.finding, "false_positive", reason, source,
+            extra={"minted": "ceremony" if ceremony else "grant",
+                   "operator_grant": operator})
+        print(f"  Stored:   false_positive verdict row "
+              f"(source={source}, "
+              f"minted={'ceremony' if ceremony else 'grant'})")
+        if cleared_paths:
+            print(f"  Cleared:  manual_override on "
+                  f"{len(cleared_paths)} findings file(s)")
+        if _report_failed_edits(failed_paths):
+            print("  The false_positive row IS stored; re-run fp "
+                  "once the findings file is writable to clear the "
+                  "remaining force-through.", file=sys.stderr)
+            sys.exit(1)
+        if line > 0:
+            print(f"  Effect:   future /agentic and /codeql runs on this "
+                  f"repo skip the LLM call for this finding while its "
+                  f"source is unchanged (TTL {SUPPRESS_TTL_DAYS} days). "
+                  f"Undo with: raptor-review verdict "
+                  f"{_line(ref.finding_id, max_chars=120)} retest")
+        else:
+            print("  Effect:   recorded for the knowledge base only — "
+                  "line-less findings never auto-suppress.")
+        return
+
+    if verb == "tp":
+        cleared = None
+        stored = False
+        if client is not None:
+            # The SAGE domain is repo-scoped — without a known target
+            # tree there is nothing addressable to clear; say so
+            # rather than reporting a normal-looking "Cleared: 0".
+            if rule and rel and fn and repo_root:
+                cleared = _forget_or_report(
+                    forget_finding_verdicts,
+                    str(repo_root), rule, rel, fn,
+                    verdicts=SUPPRESS_VERDICTS,
+                    reason="operator true_positive verdict",
+                    client=client,
+                )
+            else:
+                print("  ⚠️  target tree unknown or coordinates "
+                      "missing — prior suppressing SAGE verdict rows "
+                      "(if any) were NOT cleared; pass --target "
+                      "<repo>.", file=sys.stderr)
+            if src_hash:
+                stored = store_finding_verdict(
+                    str(repo_root), rule, rel, fn, src_hash,
+                    "true_positive", note=note, client=client,
+                )
+        changed, failed_paths = set_manual_override(
+            matches, True, reason or "operator true_positive verdict")
+        _record_operator_verdict(
+            ref.run_dir, ref.finding, "true_positive", reason, source)
+        if client is None:
+            print(f"  ⚠️  {sage_absent_msg} Any prior suppressing SAGE "
+                  "verdict rows were NOT cleared.", file=sys.stderr)
+        else:
+            if cleared is not None:
+                print(f"  Cleared:  {cleared} prior suppressing SAGE "
+                      "verdict row(s)")
+            if stored:
+                print(f"  Stored:   true_positive verdict row "
+                      f"(source={source})")
+            elif hash_note:
+                print(f"  Note:     no verdict row stored ({hash_note})")
+        if changed:
+            print(f"  Set:      manual_override on {len(changed)} "
+                  "findings file(s):")
+            for p in changed:
+                print(f"              {_line(str(p), max_chars=200)}")
+        elif not any(m.editable for m in matches):
+            print("  Note:     this finding only appears in analysis "
+                  "reports (no editable findings file) — the cleared "
+                  "SAGE verdict alone makes the next run re-analyze it")
+        elif not failed_paths:
+            print("  Note:     no findings file needed a manual_override "
+                  "change")
+        if _report_failed_edits(failed_paths):
+            sys.exit(1)
+        print("  Effect:   future runs re-analyze this finding; passes "
+              "that consume these findings files (/validate, /analyze, "
+              "project views) bypass reachability, guard-dominance, and "
+              "SAGE prior-verdict suppression for it.")
+        return
+
+    # retest — clear everything back to neutral.
+    cleared = None
+    if client is not None and rule and rel and fn:
+        key_root = str(repo_root) if repo_root else None
+        if key_root:
+            cleared = _forget_or_report(
+                forget_finding_verdicts,
+                key_root, rule, rel, fn,
+                reason="operator retest verdict", client=client,
+            )
+        else:
+            print("  ⚠️  target tree unknown — cannot address the "
+                  "repo-scoped SAGE domain; pass --target <repo> to "
+                  "clear stored rows.", file=sys.stderr)
+    elif client is None:
+        print(f"  ⚠️  {sage_absent_msg} Stored SAGE verdict rows (if "
+              "any) were NOT cleared.", file=sys.stderr)
+    else:
+        print("  ⚠️  finding record lacks rule/file/function "
+              "coordinates — stored SAGE verdict rows (if any) were "
+              "NOT cleared.", file=sys.stderr)
+    changed, failed_paths = set_manual_override(matches, False)
+    _record_operator_verdict(
+        ref.run_dir, ref.finding, "retest", reason, source)
+    if cleared is not None:
+        print(f"  Cleared:  {cleared} stored SAGE verdict row(s)")
+    if changed:
+        print(f"  Cleared:  manual_override on {len(changed)} findings "
+              "file(s)")
+    if _report_failed_edits(failed_paths):
+        sys.exit(1)
+    print("  Effect:   the next run re-analyzes this finding from "
+          "scratch (no stored verdict, no force-through).")
 
 
 # ── Argument parsing ─────────────────────────────────────────────────
@@ -1204,10 +2409,21 @@ def _first_positional(argv_rest: list) -> str | None:
 
 
 def main():
+    # SUPPRESS, not None/False: ``common`` parents BOTH the main
+    # parser and every subparser, and a subparser re-applies its
+    # defaults over the namespace — `--project X <subcmd>` (flag
+    # before the subcommand) parsed fine and then had the value
+    # silently clobbered back to the default. With SUPPRESS the
+    # subparser only touches the attribute when the flag actually
+    # appears after the subcommand; every reader already goes through
+    # getattr(args, ..., default).
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--out", default=None, help="Output directory")
-    common.add_argument("--project", default=None, help="Project directory")
-    common.add_argument("--raw", action="store_true", help="JSON output")
+    common.add_argument("--out", default=argparse.SUPPRESS,
+                        help="Output directory")
+    common.add_argument("--project", default=argparse.SUPPRESS,
+                        help="Project directory")
+    common.add_argument("--raw", action="store_true",
+                        default=argparse.SUPPRESS, help="JSON output")
 
     parser = argparse.ArgumentParser(
         prog="raptor-review",
@@ -1274,13 +2490,58 @@ def main():
 
     sub.add_parser("compact", parents=[common], help="Compact project journal index")
 
+    sub.add_parser(
+        "tools", parents=[common],
+        help="Per-function tool/gate engagement — what could not "
+             "run and why")
+
     p_cov = sub.add_parser("coverage", parents=[common], help="Mechanical tool coverage")
     p_cov.add_argument("file", nargs="?", default=None)
 
+    p_dig = sub.add_parser(
+        "digest", parents=[common],
+        help="Ranked end-of-run summary for a run")
+    p_dig.add_argument("run_dir", nargs="?", default=None)
+
+    p_verd = sub.add_parser(
+        "verdict", parents=[common],
+        help="Record a human FP/TP/retest verdict on a finding. "
+             "fp gates on the live-context operator grant, which "
+             "refuses the dispatch trust markers every shipped "
+             "launcher route carries — a plain fp does not mint in "
+             "production (setting _RAPTOR_TRUSTED=1 to reach this "
+             "CLI is itself a refused marker, so the preamble's "
+             "bypass hint does not help here); the sanctioned "
+             "production route is 'raptor review verdict <id> fp "
+             "--ceremony' at the operator's own terminal; use "
+             "/annotate for operator FP assertions without a "
+             "standing suppression, tp/retest for re-analysis")
+    p_verd.add_argument("finding_id")
+    p_verd.add_argument("verdict", choices=["fp", "tp", "retest"])
+    p_verd.add_argument("-m", "--reason", default=None,
+                        help="why (recorded with the verdict)")
+    p_verd.add_argument("--target", default=None,
+                        help="source tree root (default: the run "
+                             "manifest's target_path)")
+    p_verd.add_argument("--source", default=None,
+                        choices=["human", "agent"],
+                        help="verdict source (default: human on an "
+                             "interactive TTY, else agent)")
+    p_verd.add_argument("--ceremony", action="store_true",
+                        default=False,
+                        help="fp only: typed operator consent at the "
+                             "operator's own terminal (every std fd "
+                             "a TTY; the confirmation phrase "
+                             "'suppress <finding-id>' typed back). "
+                             "Mints the standing suppression as "
+                             "minted=ceremony with the grant result "
+                             "and full invocation context recorded. "
+                             "Revoke with the retest verb")
+
     known_commands = {
         "show", "findings", "gaps", "history", "stats", "notes",
-        "note", "edit", "stale", "compact", "coverage", "diff", "live",
-        "edges",
+        "note", "edit", "stale", "compact", "coverage", "tools",
+        "diff", "live", "edges", "verdict", "digest",
     }
     argv_rest = sys.argv[1:]
     first_positional = _first_positional(argv_rest)
@@ -1305,9 +2566,12 @@ def main():
         "stale": cmd_stale,
         "compact": cmd_compact,
         "coverage": cmd_coverage,
+        "tools": cmd_tools,
         "diff": cmd_diff,
         "live": cmd_live,
         "edges": cmd_edges,
+        "verdict": cmd_verdict,
+        "digest": cmd_digest,
     }
 
     handler = dispatch.get(args.command)

@@ -402,6 +402,31 @@ class TestRefusesFalseClaims:
         assert not r.held
         assert "local static state" in r.reasoning
 
+    def test_local_static_probe_linear_on_blank_run(self) -> None:
+        """The static-state probe runs over attacker-shaped function
+        source under MULTILINE.  A ``(?:^|[;{}])\\s*`` boundary gap
+        re-scans a run of blank lines from every line start inside it
+        — quadratic (seconds at 64K).  The horizontal gap is linear,
+        and a ``static`` after the boundary — same line or a later
+        line — is still matched."""
+        import time
+
+        from core.audit.caller_lock import _LOCAL_STATIC_RE
+
+        start = time.monotonic()
+        assert _LOCAL_STATIC_RE.search("{" + "\n" * (1 << 18)) is None
+        assert time.monotonic() - start < 1.0
+        # Behavior pins: statement-start statics still match ...
+        for body in (
+            "{\n\tstatic int calls;\n}",
+            "{ int tmp = 0; static int counter; }",
+            "{\n\tint a;\n\n\n\tstatic int b;\n}",
+            "{ };static int c;",
+        ):
+            assert _LOCAL_STATIC_RE.search(body) is not None, body
+        # ... and non-statement-start identifiers still do not.
+        assert _LOCAL_STATIC_RE.search("{ int nonstatic = 1; }") is None
+
     def test_braceless_if_acquire_refuses(self, tmp_path):
         # A braceless `if` guard adds no brace: the guarded acquire
         # sits at depth 1 on its own line but is CONDITIONAL.
@@ -566,6 +591,23 @@ class TestRefusesFalseClaims:
 
 
 class TestRefusesUndecidable:
+    def test_overlong_argument_list_caller_refuses(self, tmp_path):
+        # A call whose argument list overflows the span bound is
+        # dropped by the enumerator — an UNLOCKED caller can hide
+        # behind one planted over-long call, so the witness must
+        # refuse rather than certify the surviving (locked) sites as
+        # the whole caller set.
+        args = ", ".join(f"arg_{i:04d}" for i in range(600))
+        evil = (
+            "\nvoid evil_caller(struct inode *inode)\n{\n"
+            f"\tsample_collapse_range(inode, {args});\n"
+            "}\n"
+        )
+        r = _run(tmp_path, CALLEE + CALLER_LOCKED + evil)
+        assert not r.held
+        assert "span bound" in r.reasoning
+
+
     def test_name_referenced_in_another_file(self, tmp_path):
         r = _run(
             tmp_path, CALLEE + CALLER_LOCKED,
@@ -890,3 +932,64 @@ class TestRefusesUndecidable:
         r = _run(tmp_path, tu)
         assert not r.held
         assert "line-splice" in r.reasoning
+
+
+class TestDefiningFileContainment:
+    """The witness's defining-file read is contained: rel_file
+    arrives from finding records, so absolute and ../ values must
+    refuse instead of joining out of the target root."""
+
+    def test_escaping_rel_file_refuses_without_reading(self, tmp_path):
+        import sys
+
+        target = tmp_path / "target"
+        target.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        secret = outside / "evil.c"
+        secret.write_text(
+            "static void locked_cb(void) { }\n"
+            "void call(void) { locked_cb(); }\n",
+        )
+        opened: list = []
+
+        def hook(event, args):
+            if event == "open" and args and str(secret) in str(args[0]):
+                opened.append(args)
+
+        sys.addaudithook(hook)
+        for rel in (str(secret), "../outside/evil.c"):
+            res = check_caller_lock_serialization(
+                "static void locked_cb(void) { }\n",
+                "locked_cb",
+                rel_file=rel,
+                target_path=target,
+            )
+            assert res.held is False
+            assert "not found" in res.reasoning
+        assert opened == [], (
+            "out-of-root defining file was opened by the caller-lock "
+            "witness"
+        )
+
+    def test_in_tree_fifo_refuses_instead_of_wedging(self, tmp_path):
+        import multiprocessing
+        import os
+
+        os.mkfifo(tmp_path / "wedge.c")
+        child = multiprocessing.Process(
+            target=check_caller_lock_serialization,
+            args=("static void f(void) { }\n", "f"),
+            kwargs={"rel_file": "wedge.c", "target_path": tmp_path},
+        )
+        child.start()
+        child.join(timeout=20)
+        try:
+            assert not child.is_alive(), (
+                "check_caller_lock_serialization blocked on an "
+                "in-tree FIFO"
+            )
+        finally:
+            if child.is_alive():
+                child.kill()
+                child.join()

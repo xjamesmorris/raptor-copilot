@@ -46,6 +46,46 @@ def outcome_from_entry(entry: Any) -> Any:
     ]
     hypothesis = hypotheses[0]["mechanism"] if hypotheses else ""
 
+    body = entry.body or ""
+    if not body and getattr(entry, "body_offload", None):
+        # Offload stub: DELIBERATELY not hydrated. The re-emitted
+        # reused row is re-journaled per resume segment, so restoring
+        # the prose here would re-inflate the journal the slim tier
+        # just shrank, every segment — and the candidates can come
+        # from the project index, which has no route back to the
+        # producing run's sidecar. The verdict, cwe, and evidence
+        # provenance stay inline on the stub; the outcome's
+        # HYPOTHESES (and the hypothesis line above) come back empty
+        # too — offloaded alongside the body, prose-hint tier only on
+        # the function-grade clean/dormant rows the slim tiers touch
+        # — so the marker names both. (Claim bodies always travel
+        # inline.) The marker must point where the prose actually
+        # lives: a run-side slim stub (journal compact --slim-clean)
+        # names its sidecar file; an index write-boundary stub
+        # carries an EMPTY sidecar name — no sidecar file is ever
+        # written for it, the full row stays in the producing run's
+        # own journal — so pointing operators at
+        # review-journal-bodies.jsonl would send them hunting a file
+        # that does not exist.
+        pointer = entry.body_offload
+        sidecar = (pointer.get("sidecar")
+                   if isinstance(pointer, dict) else None)
+        if sidecar:
+            body = (
+                "[body and hypotheses offloaded: "
+                "review-journal-bodies.jsonl — journal compact "
+                "--slim-clean]"
+            )
+        else:
+            where = (
+                f"the journal of run {origin}" if origin
+                else "the producing run's journal"
+            )
+            body = (
+                "[body and hypotheses offloaded at the index write "
+                f"boundary — the full row stays in {where}]"
+            )
+
     review_result: dict[str, Any] = {
         "status": entry.verdict,
         "reused": True,
@@ -62,7 +102,7 @@ def outcome_from_entry(entry: Any) -> Any:
         status=entry.verdict,
         body=(
             f"[reused: verdict imported from run {origin}; "
-            f"source hash unchanged]\n\n{entry.body or ''}"
+            f"source hash unchanged]\n\n{body}"
         ),
         hypothesis=hypothesis,
         hypotheses=hypotheses or None,
@@ -168,7 +208,7 @@ def import_reused_verdicts(
                     "verdict reuse: sweep validation failed for %s",
                     key, exc_info=True,
                 )
-            with result._lock:
+            with result.counter_lock():
                 if outcome.status == "finding":
                     result.sweep_validated += 1
                     # "Confirmed" only when a tool actually stamped a

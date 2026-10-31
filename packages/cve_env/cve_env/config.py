@@ -1,11 +1,9 @@
 """Runtime configuration: model id, caps, paths.
 
-Cost is reported by claude-agent-sdk's ResultMessage.total_cost_usd, but on
-certain stop_reasons (max_turns_reached, end_turn after low-turn give_up)
-the SDK emits cost=0.0 even after multiple LLM rounds.
-``get_token_rates`` (shared model table) provides a token-based fallback so
-cost-loss never leaves Outcome.total_cost_usd=0 when actual LLM tokens
-were consumed. Tune caps here; everything else derives.
+Cost comes from the core engine's per-turn cost events (core_loop
+accumulates TurnCompleted.cost_usd); there is no token-based cost
+fallback in this package — the token accumulators on the loop state are
+telemetry only. Tune caps here; everything else derives.
 """
 
 from __future__ import annotations
@@ -17,15 +15,6 @@ from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
-
-
-def _safe_float(name: str, default: float) -> float:
-    """Parse a float from env ``name``; fall back to ``default`` on absence or
-    malformed value (never raises at module scope)."""
-    try:
-        return float(os.environ.get(name) or default)
-    except (ValueError, TypeError):
-        return default
 
 
 def _safe_int(name: str, default: int) -> int:
@@ -163,12 +152,13 @@ of the cap-hit. Beyond this window the agent is presumed stuck."""
 # ResultMessages are attributed to the most-recently-called tool's stage.
 # Provides telemetry for budget engine.
 #
-# Sibling tables (different schemas, same conceptual mapping):
-#   - src/cve_env/cli.py::_STAGE_BY_TOOL — lowercase for end-of-run report
-#   - scripts/cve_evidence.py::_STAGE_BY_TOOL — 3-letter codes for evidence JSONL
-#   - scripts/heartbeat_status.sh::STAGE_BY_TOOL — long names for heartbeat
-# When adding a new tool, update all four. Sync (modulo documented
-# divergence) enforced by refactor/tests/unit/test_stage_table_sync.py.
+# Sibling table (different schema, same conceptual mapping):
+#   - cve_env/cli.py::_STAGE_BY_TOOL — lowercase for end-of-run report
+# When adding a new tool, update both. Sync (modulo the documented
+# divergence allowlist) enforced by
+# tests/unit/test_stage_table_sync.py. (The upstream cve-env repo
+# carries two further script-side siblings; they are not vendored
+# into this tree.)
 STAGES: tuple[str, ...] = (
     "RESEARCH",
     "RESOLVE",
@@ -281,36 +271,6 @@ def get_recovery_gap_turns() -> int:
 
 
 
-# force-resolve-before-giveup knobs: make the cascade-skip re-query
-# continuation an operator dial — its compute cost on genuinely unbuildable
-# cascade-skips (~6× a clean unresolvable) is a trade-off.
-# `CVE_ENV_FORCE_RESOLVE_MAX=0` disables it entirely.
-_DEFAULT_FORCE_RESOLVE_MAX: int = 1
-
-
-
-
-_DEFAULT_FORCE_RESOLVE_BUDGET_FRACTION: float = 0.50
-
-
-
-
-_DEFAULT_BENIGN_VERIFY_CONTINUATION_MAX: int = 1
-
-
-
-
-
-
-_DEFAULT_PROPRIETARY_VERIFY_CONTINUATION_MAX: int = 1
-
-
-
-
-
-
-
-
 # image_resolve aggregate per-call budget. A single image_resolve call can run
 # ~1430s (10 candidates x ~70s + a 30s cooldown re-probe), alone approaching
 # the 1440s bench wall — and the connectivity breaker is suppressed during it
@@ -350,8 +310,12 @@ def get_recovery_eligible_stages() -> frozenset[str]:
 #
 # Override per stage: ``CVE_ENV_BUDGET_<STAGE>=<usd>`` env var.
 #
-# These are SOFT thresholds by default (telemetry only). Enable HARD
-# enforcement via ``CVE_ENV_BUDGET_<STAGE>_MODE=hard``.
+# These are SOFT thresholds (telemetry only): the outcome generator
+# surfaces over-budget stages via ``over_budget_stages``; nothing
+# terminates a run on them. The hard-enforcement mode that once read
+# ``CVE_ENV_BUDGET_<STAGE>_MODE`` belonged to the retired SDK engine
+# and was removed with it — the surviving run-level control is
+# core_loop's overall cost budget (``budget_exceeded``).
 _DEFAULT_STAGE_BUDGETS: dict[str, float] = {
     "RESEARCH": 0.50,
     "RESOLVE": 0.20,
@@ -421,17 +385,6 @@ def over_budget_stages(stage_costs: dict[str, float]) -> list[str]:
     return over
 
 
-# Per-stage budget enforcement mode.
-# Three modes:
-#   "soft" (default) — telemetry + over_budget_stages_list; NO termination
-#   "hard"           — over-budget terminates the run with
-#                      give_up_reason = f"stage_budget_exhausted_{stage}"
-#   "off"            — skip the budget check entirely (no telemetry,
-#                      no enforcement; useful when stage budgets aren't
-#                      meaningful for a particular use case)
-_VALID_BUDGET_MODES: frozenset[str] = frozenset({"soft", "hard", "off"})
-
-
 
 
 
@@ -448,30 +401,6 @@ MAX_COST_EXTENSIONS: int = _env_parse("CVE_ENV_MAX_COST_EXTENSIONS", int, 1)
 """Maximum number of cost-cap extensions per CVE. Default 1 (single
 extension); set to 0 to fully disable adaptive extension. Override via env var
 ``CVE_ENV_MAX_COST_EXTENSIONS``."""
-
-
-# Per-tool default attempt caps.
-# Backstops for cost-spirals; agent still reasons per-input. Each entry MUST
-# have M-class evidence (≥3 benches) AND be set at-or-above
-# max-across-successful-CVEs so no historical success is regressed.
-# Env var CVE_ENV_MAX_<TOOL>_ATTEMPTS still overrides.
-#
-# image_resolve=5: catches 6-call resolve spirals. Evidence: across benched
-#   runs, sampled successful CVEs show image_resolve max-successful=5, p95=3,
-#   p50=1 → cap=5 fires at attempt 6, zero historical regression.
-#
-# Other tools retain default 0 (unbounded) until their own M-class evidence
-# + pre-flight grounds a default. A verify spiral needs a consecutive-error
-# counter (not total-call counter) — deferred.
-_PER_TOOL_DEFAULT_CAPS: dict[str, int] = {
-    "image_resolve": 5,
-}
-
-
-
-
-
-
 
 
 def productive_extension_allowed(
@@ -581,8 +510,10 @@ only — safer than -a). CLI override: ``--auto-prune-images`` (cli.py)."""
 
 AUTO_STOP_COLIMA: bool = _env_bool("CVE_ENV_AUTO_STOP_COLIMA")
 """When True, post-build ``colima stop`` IFF no other cve-env
-build is running (lockfile guard at /tmp/cve-env-active.lock).
-CLI override: ``--auto-stop-colima`` (cli.py)."""
+build is running (per-uid lockfile guard —
+``<tempdir>/cve-env-locks-<uid>/cve-env-<pid>.lock``, see
+cve_env/utils/lifecycle.py). CLI override: ``--auto-stop-colima``
+(cli.py)."""
 
 # Docker resource label — the single contract between the WRITERS that tag
 # per-CVE docker resources (docker_run / docker_build / docker_compose_up) and
@@ -673,10 +604,15 @@ VERSION_ASSERTION_CMD_PATTERN: re.Pattern[str] = re.compile(
     r"|\bnpm (ls|list)\b"
     r"|\byarn list\b"
     r"|\bgo version\b"
-    r"|\bfind .*\.jar\b"
+    # Bounded gaps in the find/cat/unzip rows: with unbounded `.*`, a
+    # command line repeating the head token makes every occurrence
+    # re-scan the rest of the line — quadratic. Real command
+    # arguments sit far inside 1000 chars (beyond it the command is
+    # not credited as a version assertion).
+    r"|\bfind .{0,1000}\.jar\b"
     r"|\bunzip -l\b"
-    r"|\bunzip -p .*MANIFEST\.MF\b"
-    r"|\bcat .*pom\.xml\b"
+    r"|\bunzip -p .{0,1000}MANIFEST\.MF\b"
+    r"|\bcat .{0,1000}pom\.xml\b"
     r"|\bphp -m\b"
     r"|\bphpversion\b"
     r"|\bapache2 -v\b"
@@ -687,7 +623,7 @@ VERSION_ASSERTION_CMD_PATTERN: re.Pattern[str] = re.compile(
     r"|\bdrush status\b"
     r"|\bwp core version\b"
     r"|\brpm -qa?\b"
-    r"|\bcat /etc/.*-release\b"
+    r"|\bcat /etc/.{0,1000}-release\b"
     r"|\bcat /etc/issue\b"
     # Lockfile-grep + versioned-dir finds are legitimate version proofs. The
     # strict-marker gate (loop._has_specific_version_marker) still requires the
@@ -697,6 +633,6 @@ VERSION_ASSERTION_CMD_PATTERN: re.Pattern[str] = re.compile(
     r"|\bcomposer\.lock\b"
     r"|\bpackage-lock\.json\b"
     r"|\bPipfile\.lock\b"
-    r"|\bfind .* -name ['\"]?[a-z]+[_.-]\d+\.\d+",
+    r"|\bfind .{0,1000} -name ['\"]?[a-z]+[_.-]\d+\.\d+",
     re.IGNORECASE,
 )

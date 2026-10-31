@@ -7,7 +7,16 @@ orchestrator's idempotence + diff-aware writes.
 
 from __future__ import annotations
 
+import itertools
 import json
+import os
+import random
+import re
+import subprocess
+import sys
+import textwrap
+import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +27,7 @@ from packages.sca.refresh_typosquat_lists import (
     _ANVAKA_NPM_RANK,
     _CRATES_API,
     _HUGOVK_TOP_PYPI,
+    _NAME_GRAMMARS,
     _NPM_MAX_BYTES,
     _PACKAGIST_POPULAR,
     _get_json,
@@ -28,6 +38,7 @@ from packages.sca.refresh_typosquat_lists import (
     main,
     refresh_all,
 )
+from packages.sca.supply_chain._name_grammar import _GRAMMARS
 
 
 class _StubHttp:
@@ -320,7 +331,8 @@ def test_refresh_all_write_failure_marked_distinctly(tmp_path, monkeypatch):
     def boom(*a, **k):
         raise PermissionError("read-only filesystem")
 
-    monkeypatch.setattr(Path, "write_text", boom)
+    import packages.sca.refresh_typosquat_lists as rtl
+    monkeypatch.setattr(rtl, "write_text_atomically", boom)
     results = refresh_all(http, top_n=10, data_dir=tmp_path, only=["PyPI"])
     assert results["PyPI.json"].startswith("write-failed:")
 
@@ -359,3 +371,210 @@ def test_main_all_skipped_is_ok(monkeypatch, tmp_path):
     rc = _main_with_results(monkeypatch, tmp_path, {
         "PyPI.json": "skipped", "npm.json": "skipped"})
     assert rc == 0
+
+
+# ---------------------------------------------------------------------------
+# Feed validation: grammar + churn guard
+# ---------------------------------------------------------------------------
+
+def test_feed_names_failing_grammar_are_dropped(tmp_path) -> None:
+    """The feeds are remote and seed the typosquat reference sets —
+    injected garbage (markdown, whitespace, traversal, oversize) must
+    never land in the bundle."""
+    from packages.sca.refresh_typosquat_lists import refresh_all
+
+    hostile = [
+        "requests", "flask",
+        "evil name with spaces",
+        "../../../etc/passwd",
+        "![beacon](https://evil.example)",
+        "x" * 500,
+    ]
+
+    class _Http:
+        def get_json(self, url, **kw):
+            return {"rows": [{"project": n} for n in hostile]}
+
+    out = refresh_all(_Http(), top_n=50, only=["PyPI"],
+                      data_dir=tmp_path)
+    assert out["PyPI.json"] == "updated"
+    import json as _json
+    written = _json.loads(
+        (tmp_path / "popular" / "PyPI.json").read_text())
+    assert set(written) == {"requests", "flask"}
+
+
+def test_churn_guard_refuses_wholesale_replacement(tmp_path) -> None:
+    """A hijacked feed rotating the reference set wholesale must be
+    refused; --allow-churn is the explicit operator override; and
+    ordinary drift stays under the guard (both directions)."""
+    import json as _json
+
+    from packages.sca.refresh_typosquat_lists import refresh_all
+
+    popular = tmp_path / "popular"
+    popular.mkdir(parents=True)
+    old = [f"pkg-{i}" for i in range(20)]
+    (popular / "PyPI.json").write_text(_json.dumps(old, indent=2) + "\n",
+                                       encoding="utf-8")
+
+    class _Http:
+        def __init__(self, names): self._names = names
+        def get_json(self, url, **kw):
+            return {"rows": [{"project": n} for n in self._names]}
+
+    # Wholesale replacement → refused, file untouched.
+    rotated = [f"attacker-{i}" for i in range(20)]
+    out = refresh_all(_Http(rotated), top_n=50, only=["PyPI"],
+                      data_dir=tmp_path)
+    assert out["PyPI.json"].startswith("failed: churn guard")
+    assert _json.loads((popular / "PyPI.json").read_text()) == old
+
+    # Operator override applies it.
+    out = refresh_all(_Http(rotated), top_n=50, only=["PyPI"],
+                      data_dir=tmp_path, allow_churn=True)
+    assert out["PyPI.json"] == "updated"
+
+    # Ordinary drift (a few entries rotate) stays under the guard.
+    (popular / "PyPI.json").write_text(_json.dumps(old, indent=2) + "\n",
+                                       encoding="utf-8")
+    drifted = old[:-2] + ["newpkg-1", "newpkg-2"]
+    out = refresh_all(_Http(drifted), top_n=50, only=["PyPI"],
+                      data_dir=tmp_path)
+    assert out["PyPI.json"] == "updated"
+
+
+# ---------------------------------------------------------------------------
+# Packagist fetch-time grammar: linear-time rewrite equivalence
+# ---------------------------------------------------------------------------
+
+# The pre-rewrite fetch-time Packagist pattern, verbatim.  Its
+# optional-separator repetitions (including two empty alternation
+# branches) are ambiguous, so a failing hostile feed row backtracked
+# exponentially — seconds at ~20 characters, minutes shortly after.
+# Kept ONLY as the equivalence fixture for the tests below; never
+# promote it into production code.
+_LEGACY_PACKAGIST = re.compile(
+    r"[a-z0-9]([_.-]?[a-z0-9]+)*/[a-z0-9](([_.]?|-{0,2})[a-z0-9]+)*")
+
+
+def _packagist_probe_corpus() -> Iterator[str]:
+    """Strings over the grammar's structural alphabet.
+
+    Exhaustive to length 6 (every corner shape: leading / trailing /
+    doubled separators, the ``--`` package-half corner, misplaced
+    slashes), then longer structured strings with short alnum runs so
+    the legacy fixture's ambiguity stays cheap to evaluate.
+    """
+    for length in range(1, 7):
+        for tup in itertools.product("0a_.-/", repeat=length):
+            yield "".join(tup)
+    rng = random.Random(0x5CA)
+    tokens = ["0", "00", "000", "a", "_", ".", "-", "--", "---", "/"]
+    for _ in range(2000):
+        yield "".join(rng.choice(tokens) for _ in range(rng.randint(2, 9)))
+    yield from (
+        "symfony/console", "my-vendor/my-package", "foo/bar--baz",
+        "a/b--c--d", "a/b---c", "a--b/c", "a-/b", "a/-b", "-a/b",
+        "a//b", "a/b/c", "a_b-c.d/e_f-g.h", "0/0", "a/b--", "a--/b",
+    )
+
+
+def test_packagist_grammar_rewrite_is_equivalent() -> None:
+    # ``_validate_names`` applies the grammar with ``fullmatch`` — the
+    # rewrite must agree with the legacy pattern under exactly those
+    # semantics.
+    new = _NAME_GRAMMARS["Packagist"]
+    for s in _packagist_probe_corpus():
+        assert (new.fullmatch(s) is None) == (
+            _LEGACY_PACKAGIST.fullmatch(s) is None
+        ), s
+
+
+def test_packagist_grammar_matches_load_time_grammar() -> None:
+    # Fetch-time (here) and load-time (supply_chain._name_grammar)
+    # gates intend the same Composer name language; a row accepted at
+    # one end and rejected at the other silently drops or admits
+    # trusted entries.
+    load_time = _GRAMMARS["Packagist"]
+    fetch_time = _NAME_GRAMMARS["Packagist"]
+    for s in _packagist_probe_corpus():
+        assert (fetch_time.fullmatch(s) is None) == (
+            load_time.fullmatch(s) is None
+        ), s
+
+
+def test_packagist_grammar_linear_on_adversarial_rows() -> None:
+    # Row shapes that made the legacy pattern backtrack exponentially.
+    # The linear form must dispatch 100k-character rows in
+    # milliseconds; 1s leaves ample headroom for slow CI runners.
+    new = _NAME_GRAMMARS["Packagist"]
+    for row in ("0" * 100_000 + "!", "0/" + "0" * 100_000 + "!"):
+        start = time.perf_counter()
+        assert new.fullmatch(row) is None
+        assert time.perf_counter() - start < 1.0
+
+
+# ---------------------------------------------------------------------------
+# Import chain without PyYAML
+# ---------------------------------------------------------------------------
+#
+# The data-refresh workflow runs this module in a minimal environment
+# (urllib3 only — the feeds are all JSON). PyYAML is an optional
+# dependency of the sca package: every yaml-format lane guards its own
+# use-site import and degrades without it, so nothing on the refresh
+# CLI's import chain may require it at IMPORT time. A fresh interpreter
+# per test: the block must apply before anything cached ``yaml``.
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
+_YAML_BLOCK_PRELUDE = textwrap.dedent("""\
+    import sys
+
+    class _BlockYaml:
+        # Raising from find_spec ends the module search exactly like a
+        # genuinely absent distribution does.
+        def find_spec(self, name, path=None, target=None):
+            if name == "yaml" or name.startswith("yaml."):
+                raise ModuleNotFoundError(f"No module named {name!r}")
+
+    sys.meta_path.insert(0, _BlockYaml())
+""")
+
+
+def _run_without_yaml(code: str) -> subprocess.CompletedProcess:
+    env = dict(os.environ)
+    env["PYTHONPATH"] = (
+        str(_REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    )
+    return subprocess.run(
+        [sys.executable, "-c", _YAML_BLOCK_PRELUDE + code],
+        capture_output=True, text=True, cwd=str(_REPO_ROOT), env=env,
+        timeout=120,
+    )
+
+
+def test_refresh_import_chain_needs_no_pyyaml() -> None:
+    r = _run_without_yaml(
+        "import packages.sca.refresh_typosquat_lists\nprint('chain-ok')"
+    )
+    assert r.returncode == 0, r.stderr
+    assert "chain-ok" in r.stdout
+
+
+def test_yaml_fast_defers_the_dependency_to_use_time() -> None:
+    r = _run_without_yaml(textwrap.dedent("""\
+        from packages.sca._yaml_fast import safe_load, safe_load_all
+        for fn, doc in ((safe_load, "a: 1"), (safe_load_all, "a: 1")):
+            try:
+                # safe_load_all is lazy — consume it to force the call.
+                out = fn(doc)
+                list(out) if fn is safe_load_all else out
+            except ModuleNotFoundError as e:
+                assert "pyyaml" in str(e).lower(), e
+            else:
+                raise AssertionError(f"{fn.__name__} did not raise")
+        print("use-time-raise-ok")
+    """))
+    assert r.returncode == 0, r.stderr
+    assert "use-time-raise-ok" in r.stdout

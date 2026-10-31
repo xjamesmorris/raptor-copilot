@@ -129,6 +129,42 @@ class TestStoreRedaction(unittest.TestCase):
         self.assertIn("[REDACTED]", stored)
 
 
+class TestListJsonTerminalSafety(unittest.TestCase):
+    """`list --json` output reaches the operator's terminal raw —
+    hostile store content carrying C1 controls (U+009B CSI, U+009D
+    OSC: clipboard writes, row-hiding redraws) must render as inert
+    \\uXXXX escapes, exactly like the table path's _safe()."""
+
+    def test_c1_controls_escaped_but_roundtrip(self):
+        hostile = "note \u009b31mowned\u009d clipboard"
+
+        class _ListClient(_RecordingClient):
+            def list_memories(self, **kwargs):
+                return SimpleNamespace(memories=[SimpleNamespace(
+                    memory_id="m-1", domain_tag="general",
+                    memory_type="fact", status="committed",
+                    task_status=None, confidence_score=0.9,
+                    content=hostile, tags=["a"],
+                    created_at="2026-01-01",
+                )])
+
+        args = SimpleNamespace(
+            limit=None, domain=None, tag=None, status=None, sort=None,
+            json=True,
+        )
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = _cli.cmd_list(_ListClient(), args)
+        self.assertEqual(rc, 0)
+        text = out.getvalue()
+        self.assertNotIn("\u009b", text)
+        self.assertNotIn("\u009d", text)
+        # A JSON consumer still parses back the original content.
+        import json
+        records = json.loads(text)
+        self.assertEqual(records[0]["content"], hostile)
+
+
 class TestRecallMinConfidenceZero(unittest.TestCase):
     def test_zero_floor_reaches_server(self):
         client = _RecordingClient()

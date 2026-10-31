@@ -633,3 +633,16 @@ class TestAtomicWriteIdiom:
             "tempfile+rename writer misclassified; artifact reported "
             f"as orphan reader: {orphans}"
         )
+
+
+class TestDefaultRoot:
+    def test_default_root_is_script_anchored(
+            self, detector, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """--root must default to the repo containing the script, not the
+        ambient cwd — a wrong-cwd invocation used to index zero modules
+        and exit 0 vacuously."""
+        expected = Path(__file__).resolve().parents[3]
+        monkeypatch.chdir(tmp_path)
+        assert detector._default_root() == expected
+        assert detector._default_root() != Path.cwd()

@@ -230,3 +230,81 @@ def test_input_list_is_not_mutated() -> None:
     snapshot_sev = [f.severity for f in inputs]
     apply(inputs)
     assert [f.severity for f in inputs] == snapshot_sev
+
+
+# ---------------------------------------------------------------------------
+# Placeholder-host keying — tree-walking detectors whose manifest has
+# no own name anchor via ``<placeholder>`` deps; those key on the
+# anchoring manifest so per-detector placeholder spellings still join
+# ---------------------------------------------------------------------------
+
+def _placeholder_dep(name: str, declared_in: Path,
+                     ecosystem: str = "npm") -> Dependency:
+    return Dependency(
+        ecosystem=ecosystem, name=name, version=None,
+        declared_in=declared_in,
+        scope="main", is_lockfile=False,
+        pin_style=PinStyle.UNKNOWN, direct=True,
+        purl="",
+        parser_confidence=Confidence("low", reason="t"),
+    )
+
+
+def test_placeholder_hosts_same_manifest_combine_across_spellings() -> None:
+    """A hook anchored as ``<package.json>`` and a binary anchored as
+    ``<project-tree>`` at the SAME manifest describe the same package
+    — the Iron Worm hard pair must fire despite the differing
+    placeholder names (and ecosystems)."""
+    m = Path("/repo/package.json")
+    fs = [
+        _finding("install_hook_suspicious",
+                 _placeholder_dep("<package.json>", m), severity="low"),
+        _finding("binary_in_package",
+                 _placeholder_dep("<project-tree>", m,
+                                  ecosystem="unknown"),
+                 severity="low"),
+    ]
+    out = apply(fs)
+    assert all(f.severity == "critical" for f in out)
+
+
+def test_placeholder_hosts_different_manifests_do_not_combine() -> None:
+    """Same placeholder spelling under two DIFFERENT manifests (two
+    monorepo members) must not merge."""
+    fs = [
+        _finding("install_hook_suspicious",
+                 _placeholder_dep("<project>",
+                                  Path("/repo/a/package.json")),
+                 severity="low"),
+        _finding("binary_in_package",
+                 _placeholder_dep("<project>",
+                                  Path("/repo/b/package.json")),
+                 severity="low"),
+    ]
+    out = apply(fs)
+    assert all(f.severity == "low" for f in out)
+    assert all("composite_score" not in f.evidence for f in out)
+
+
+def test_named_hosts_still_key_on_name() -> None:
+    """Non-placeholder hosts keep the (ecosystem, name, version) key
+    — real third-party deps never merge on manifest alone."""
+    m = Path("/repo/package.json")
+    a = Dependency(
+        ecosystem="npm", name="a", version="1.0.0", declared_in=m,
+        scope="main", is_lockfile=False, pin_style=PinStyle.EXACT,
+        direct=True, purl="pkg:npm/a@1.0.0",
+        parser_confidence=Confidence("high", reason="t"),
+    )
+    b = Dependency(
+        ecosystem="npm", name="b", version="1.0.0", declared_in=m,
+        scope="main", is_lockfile=False, pin_style=PinStyle.EXACT,
+        direct=True, purl="pkg:npm/b@1.0.0",
+        parser_confidence=Confidence("high", reason="t"),
+    )
+    fs = [
+        _finding("recent_publish", a, severity="low"),
+        _finding("typosquat_candidate", b, severity="low"),
+    ]
+    out = apply(fs)
+    assert all(f.severity == "low" for f in out)

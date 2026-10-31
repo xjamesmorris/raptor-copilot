@@ -17,6 +17,17 @@ from core.project.report import (
 from core.run import complete_run, start_run
 
 
+import pytest
+
+@pytest.fixture(autouse=True)
+def _user_state_in_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """User registries stay out of the real home: the root-conftest
+    layer doing this is stripped from release extracts (conftest.py
+    is export-ignore), so the pin must travel in-file."""
+    from core.testing.state_isolation import pin_user_state_dirs
+    pin_user_state_dirs(monkeypatch, tmp_path)
+
+
 def _sca_row(name, *, severity="high", escalation_reasons=None):
     sca = {"kind": "slopsquat_suspect", "ecosystem": "npm", "name": name}
     if escalation_reasons is not None:
@@ -410,3 +421,45 @@ class TestMarkdownInertness(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestProvenanceMdScrub(unittest.TestCase):
+    def test_hostile_command_defanged_in_provenance_md(self):
+        # .raptor-run.json is child-writable during the run and
+        # restored verbatim by /project import — a hostile `command`
+        # must not land in provenance.md as live markdown / controls.
+        hostile = "# forged heading\n\x1b]0;pwned\x07scan"
+        with TemporaryDirectory() as d:
+            output_dir = Path(d) / "project"
+            output_dir.mkdir()
+            run_dir = output_dir / "scan-20260401"
+            start_run(run_dir, "scan")
+            complete_run(run_dir)
+            meta_path = run_dir / ".raptor-run.json"
+            meta = json.loads(meta_path.read_text())
+            meta["command"] = hostile
+            meta_path.write_text(json.dumps(meta))
+            (run_dir / "findings.json").write_text("[]")
+            p = Project(name="test", target=str(Path(d) / "code"),
+                        output_dir=str(output_dir))
+            stats = generate_project_report(p)
+            prov = (Path(stats["report_dir"]) / "provenance.md").read_text()
+        self.assertNotIn("\x1b", prov)
+        self.assertNotIn("\x07", prov)
+        # Line-leading '#' is defanged — no forged heading renders.
+        self.assertNotIn("\n# forged heading", prov)
+        self.assertIn("scan", prov)
+
+
+def test_clear_generated_findings_dir_unlinks_symlink(tmp_path):
+    """rmtree refuses symlinks with OSError — uncaught it crashed the
+    whole report pass; the link (not the pointed-to tree) is removed."""
+    from core.project.report import _clear_generated_findings_dir
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "keep.txt").write_text("x")
+    link = tmp_path / "findings"
+    link.symlink_to(real)
+    _clear_generated_findings_dir(link)
+    assert not link.exists()
+    assert (real / "keep.txt").exists()

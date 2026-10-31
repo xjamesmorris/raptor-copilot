@@ -81,3 +81,49 @@ def test_success_path_mirrors_child_exit(monkeypatch, tmp_path, capsys):
     captured = capsys.readouterr()
     assert "child-out" in captured.out
     assert "[sandbox] ERROR" not in captured.err
+
+
+def test_env_timeout_override_reaches_run(monkeypatch, tmp_path):
+    """RAPTOR_SANDBOX_TIMEOUT raises the 1800s default per run —
+    ASAN builds of large projects routinely exceed 30 minutes and the
+    hardcoded backstop killed them with no override."""
+    seen: dict = {}
+
+    def run_fn(cmd, **kwargs):
+        seen["timeout"] = kwargs.get("timeout")
+        return SimpleNamespace(
+            returncode=0, stdout="", stderr="", sandbox_info={})
+
+    monkeypatch.setenv("RAPTOR_SANDBOX_TIMEOUT", "7200")
+    with pytest.raises(SystemExit) as exc:
+        _exec_script(monkeypatch, tmp_path, run_fn)
+    assert exc.value.code == 0
+    assert seen["timeout"] == 7200
+
+
+def test_default_timeout_still_1800(monkeypatch, tmp_path):
+    seen: dict = {}
+
+    def run_fn(cmd, **kwargs):
+        seen["timeout"] = kwargs.get("timeout")
+        return SimpleNamespace(
+            returncode=0, stdout="", stderr="", sandbox_info={})
+
+    monkeypatch.delenv("RAPTOR_SANDBOX_TIMEOUT", raising=False)
+    with pytest.raises(SystemExit):
+        _exec_script(monkeypatch, tmp_path, run_fn)
+    assert seen["timeout"] == 1800
+
+
+@pytest.mark.parametrize("bad", ["abc", "-5", "0", "1.5"])
+def test_invalid_env_timeout_refuses(monkeypatch, tmp_path, capsys, bad):
+    """A malformed override must refuse loudly, never fall back
+    silently (an unbounded or zero timeout defeats the backstop)."""
+    def run_fn(cmd, **_kwargs):  # pragma: no cover — must not be reached
+        raise AssertionError("sandbox must not engage")
+
+    monkeypatch.setenv("RAPTOR_SANDBOX_TIMEOUT", bad)
+    with pytest.raises(SystemExit) as exc:
+        _exec_script(monkeypatch, tmp_path, run_fn)
+    assert exc.value.code == 1
+    assert "RAPTOR_SANDBOX_TIMEOUT" in capsys.readouterr().err

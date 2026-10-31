@@ -177,6 +177,7 @@ def test_classic_alias_resolves_to_real_package(tmp_path: Path) -> None:
     p.write_text(body, encoding="utf-8")
     [d] = parse(p)
     assert d.name == "realpkg"
+    assert d.alias_name == "myalias"
     assert d.version == "1.0.2"
 
 
@@ -192,6 +193,7 @@ def test_berry_alias_resolves_to_real_scoped_package(tmp_path: Path) -> None:
     p.write_text(body, encoding="utf-8")
     [d] = parse(p)
     assert d.name == "@scope/real"
+    assert d.alias_name == "myalias"
     assert d.version == "1.4.0"
 
 
@@ -210,4 +212,64 @@ def test_plain_berry_protocol_descriptor_keeps_name(tmp_path: Path) -> None:
     p.write_text(body, encoding="utf-8")
     [d] = parse(p)
     assert d.name == "lodash"
+    assert d.alias_name is None
     assert d.version == "4.17.21"
+
+
+def test_berry_alias_in_later_descriptor_still_preserved(
+    tmp_path: Path,
+) -> None:
+    # One Berry record can cover several descriptors; the alias isn't
+    # always first.
+    body = (
+        "__metadata:\n"
+        "  version: 8\n"
+        '"lodash@npm:^4.17.0, my-lodash@npm:lodash@^4.17.0":\n'
+        '  version: 4.17.21\n'
+        '  resolution: "lodash@npm:4.17.21"\n'
+    )
+    p = tmp_path / "yarn.lock"
+    p.write_text(body, encoding="utf-8")
+    [d] = parse(p)
+    assert d.name == "lodash"
+    assert d.alias_name == "my-lodash"
+
+
+def test_berry_digit_leading_alias_target(tmp_path: Path) -> None:
+    # Digit-leading names are legal on npm (7zip-bin, 0x, 3d-view);
+    # the explicit @range separator disambiguates from the protocol
+    # form, and a bare version after npm: stays a version.
+    body = (
+        "__metadata:\n"
+        "  version: 8\n"
+        '"zip@npm:7zip-bin@^5.0.0":\n'
+        '  version: 5.2.0\n'
+        '  resolution: "7zip-bin@npm:5.2.0"\n'
+        '"left-pad@npm:1.3.0":\n'
+        '  version: 1.3.0\n'
+        '  resolution: "left-pad@npm:1.3.0"\n'
+    )
+    p = tmp_path / "yarn.lock"
+    p.write_text(body, encoding="utf-8")
+    deps = {d.name: d for d in parse(p)}
+    assert deps["7zip-bin"].alias_name == "zip"
+    assert deps["7zip-bin"].version == "5.2.0"
+    # ``left-pad@npm:1.3.0`` is the protocol-exact form, NOT an alias
+    # to a package named "1.3.0".
+    assert deps["left-pad"].alias_name is None
+
+
+def test_classic_alias_in_later_descriptor_still_preserved(
+    tmp_path: Path,
+) -> None:
+    body = (
+        "# yarn lockfile v1\n\n"
+        'lodash@^4.17.0, "my-lodash@npm:lodash@^4.17.0":\n'
+        '  version "4.17.21"\n'
+        '  resolved "https://registry.yarnpkg.com/lodash/-/lodash-4.17.21.tgz"\n'
+    )
+    p = tmp_path / "yarn.lock"
+    p.write_text(body, encoding="utf-8")
+    [d] = parse(p)
+    assert d.name == "lodash"
+    assert d.alias_name == "my-lodash"

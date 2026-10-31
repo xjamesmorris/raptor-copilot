@@ -51,20 +51,26 @@ _ENCODER_PATTERNS = re.compile(
 )
 
 
-class PostconditionKind(str):
+class PostconditionKind:
+    """Constants namespace (never instantiated); values are the JSON strings."""
+
     SAFETY_GUARANTEE = "safety_guarantee"
     VALIDATION_GUARANTEE = "validation_guarantee"
     ENCODING_GUARANTEE = "encoding_guarantee"
     TYPE_GUARANTEE = "type_guarantee"
 
 
-class ViolationKind(str):
+class ViolationKind:
+    """Constants namespace (never instantiated); values are the JSON strings."""
+
     ORDERING = "ordering"
     COMPLETENESS = "completeness"
     COMPOSITION = "composition"
 
 
-class FunctionRole(str):
+class FunctionRole:
+    """Constants namespace (never instantiated); values are the JSON strings."""
+
     SANITISER = "sanitiser"
     VALIDATOR = "validator"
     ENCODER = "encoder"
@@ -185,6 +191,7 @@ def extract_postconditions(
     validator, encoder, decoder, serialiser, deserialiser).
     """
     postconditions: list[Postcondition] = []
+    summary_tail_index = _build_tail_index(summaries)
 
     for gap in gaps:
         func_name = gap.get("name", "")
@@ -192,7 +199,9 @@ def extract_postconditions(
         if not func_name:
             continue
 
-        summary = _lookup_summary(func_name, file_path, summaries)
+        summary = _lookup_summary(
+            func_name, file_path, summaries, summary_tail_index,
+        )
         return_type = gap.get("return_type", "")
         summary_text = ""
         if summary:
@@ -385,6 +394,13 @@ def verify_postconditions(
     if not call_graphs:
         return result
 
+    # Built once per run; the gap loop below resolves every callee
+    # against these instead of rescanning the whole index/summaries.
+    postcond_key_index = _build_tail_index(
+        postcond_by_func, include_full_keys=True,
+    )
+    summary_tail_index = _build_tail_index(summaries)
+
     # Index the call graphs so gaps carrying no callee data can be
     # filled from them: "file:caller" -> [callee tail names]. The
     # ``call_graphs`` parameter used to be a pure boolean gate the
@@ -412,7 +428,9 @@ def verify_postconditions(
             for c in callees
         ]
 
-        consumer_preconditions = _extract_consumer_preconditions(gap, summaries)
+        consumer_preconditions = _extract_consumer_preconditions(
+            gap, summaries, summary_tail_index,
+        )
 
         # Ordering is a property of THIS gap's call sequence — check it
         # once per gap and attribute it to the consumer, not once per
@@ -422,7 +440,7 @@ def verify_postconditions(
         gap_producers = [
             (c, postcond_by_func[k])
             for c in callee_names
-            for k in (_find_key_for_function(c, postcond_by_func),)
+            for k in (postcond_key_index.get(c),)
             if k is not None
         ]
         ordering_pc = None
@@ -441,7 +459,7 @@ def verify_postconditions(
                 result.violations.append(ordering_viol)
 
         for callee in callee_names:
-            callee_key = _find_key_for_function(callee, postcond_by_func)
+            callee_key = postcond_key_index.get(callee)
             if callee_key is None:
                 continue
 
@@ -469,7 +487,7 @@ def verify_postconditions(
                 FunctionRole.SERIALISER,
             ):
                 handled = _extract_handled_representations(
-                    producer_pc, summaries,
+                    producer_pc, summaries, summary_tail_index,
                 )
                 completeness_viol = check_completeness(
                     producer_pc, handled,
@@ -682,19 +700,45 @@ def format_postcondition_context(
 
 # -- Internal helpers --
 
+def _build_tail_index(
+    mapping: dict[str, Any],
+    *,
+    include_full_keys: bool = False,
+) -> dict[str, str]:
+    """One-pass index replacing per-lookup linear key scans.
+
+    Maps every ``:``-suffix of each key (and, with
+    ``include_full_keys``, the key itself) to the first key carrying
+    it — first match in iteration order, mirroring the
+    ``endswith(":name")`` scans it replaces. Built once per run;
+    per-callee lookups become O(1) instead of O(index).
+    """
+    index: dict[str, str] = {}
+    for key in mapping:
+        if include_full_keys:
+            index.setdefault(key, key)
+        parts = key.split(":")
+        for i in range(1, len(parts)):
+            index.setdefault(":".join(parts[i:]), key)
+    return index
+
+
 def _lookup_summary(
     function_name: str,
     file_path: str,
     summaries: dict[str, Any],
+    tail_index: dict[str, str] | None = None,
 ) -> Any:
     if file_path:
         key = f"{file_path}:{function_name}"
         if key in summaries:
             return summaries[key]
 
-    for k, v in summaries.items():
-        if k.endswith(f":{function_name}"):
-            return v
+    if tail_index is None:
+        tail_index = _build_tail_index(summaries)
+    key = tail_index.get(function_name)  # type: ignore[assignment]
+    if key is not None:
+        return summaries[key]
 
     return summaries.get(function_name)
 
@@ -790,24 +834,15 @@ def _default_representations() -> list[str]:
     ]
 
 
-def _find_key_for_function(
-    function_name: str,
-    index: dict[str, Any],
-) -> str | None:
-    for key in index:
-        if key.endswith(f":{function_name}") or key == function_name:
-            return key
-    return None
-
-
 def _extract_consumer_preconditions(
     gap: dict[str, Any],
     summaries: dict[str, Any],
+    tail_index: dict[str, str] | None = None,
 ) -> list[str]:
     """Extract preconditions that a consumer function expects from its inputs."""
     func_name = gap.get("name", "")
     file_path = gap.get("file", "")
-    summary = _lookup_summary(func_name, file_path, summaries)
+    summary = _lookup_summary(func_name, file_path, summaries, tail_index)
     if summary is None:
         return []
     preconds = getattr(summary, "preconditions", [])
@@ -835,10 +870,11 @@ _EXTRACTABLE_REPRESENTATIONS = frozenset({
 def _extract_handled_representations(
     postcondition: Postcondition,
     summaries: dict[str, Any],
+    tail_index: dict[str, str] | None = None,
 ) -> list[str]:
     """Extract character representations the sanitiser handles."""
     summary = _lookup_summary(
-        postcondition.function, postcondition.file, summaries,
+        postcondition.function, postcondition.file, summaries, tail_index,
     )
     handled: list[str] = []
     guarantee = postcondition.claimed_guarantee.lower()

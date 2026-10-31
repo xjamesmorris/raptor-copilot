@@ -108,6 +108,20 @@ class TestRecordSelfConsistencyOutcomes:
             sc, results_by_id=results, verdicts_pre_retry={"F-001": True},
         ) == 0
 
+    def test_skips_junk_post_verdict(self, tmp_path: Path):
+        # A junk shape that bypassed response validation is a
+        # non-verdict: grading it would score the model on a vote it
+        # never cast (the raw read coerced "yes" into a truthy
+        # "held" outcome).
+        sc = ModelScorecard(path=tmp_path / "sc.json")
+        for junk in ("yes", "true", 1, [], {}):
+            results = {"F-001": _make_result(
+                "F-001", is_exploitable=junk, retried=True)}
+            assert record_self_consistency_outcomes(
+                sc, results_by_id=results,
+                verdicts_pre_retry={"F-001": True},
+            ) == 0
+
     def test_skips_empty_model(self, tmp_path: Path):
         sc = ModelScorecard(path=tmp_path / "sc.json")
         r = _make_result("F-001", retried=True, model="")
@@ -132,3 +146,67 @@ class TestRecordSelfConsistencyOutcomes:
         ec = cell.events[EventType.SELF_CONSISTENCY]
         assert ec.correct == 1
         assert ec.incorrect == 1
+
+
+def test_abstained_pre_verdict_records_nothing(tmp_path):
+    """A None snapshot entry (abstained pre-retry analysis) grades
+    nothing — held/flipped cannot be computed against a vote that
+    never existed. The producer's pre-existing None-skip now doubles
+    as the abstention rule; this pins it against 'tightening' the
+    skip away."""
+    from pathlib import Path
+
+    from core.llm.scorecard.scorecard import ModelScorecard
+    from core.llm.scorecard.self_consistency import (
+        record_self_consistency_outcomes,
+    )
+
+    sc = ModelScorecard(Path(tmp_path) / "sc.json", shadow_rate=0.0)
+    n = record_self_consistency_outcomes(
+        sc,
+        results_by_id={"f1": {
+            "retried": True,
+            "is_exploitable": False,
+            "rule_id": "py/sqli",
+            "analysed_by": "m1",
+        }},
+        verdicts_pre_retry={"f1": None},
+    )
+    assert n == 0
+    assert sc.get_stat("agentic:py/sqli", "m1") is None
+
+
+class TestJunkPreVerdictAbstains:
+    """The snapshot contract is bool | None, but the boundary must be
+    guarded like judge.py's: a junk pre-retry value ("false", 1)
+    bool()-coerced into a phantom vote and graded the model on a vote
+    it never cast."""
+
+    def test_junk_pre_verdict_skips(self, tmp_path):
+        sc = ModelScorecard(tmp_path / "sc.json")
+        n = record_self_consistency_outcomes(
+            sc,
+            results_by_id={"f1": {
+                "retried": True,
+                "rule_id": "r",
+                "analysed_by": "m",
+                "is_exploitable": True,
+            }},
+            verdicts_pre_retry={"f1": "false"},  # junk shape
+        )
+        assert n == 0
+        assert sc.get_stat("agentic:r", "m") is None
+
+    def test_real_bool_pre_verdict_still_grades(self, tmp_path):
+        sc = ModelScorecard(tmp_path / "sc.json")
+        n = record_self_consistency_outcomes(
+            sc,
+            results_by_id={"f1": {
+                "retried": True,
+                "rule_id": "r",
+                "analysed_by": "m",
+                "is_exploitable": True,
+            }},
+            verdicts_pre_retry={"f1": False},
+        )
+        assert n == 1

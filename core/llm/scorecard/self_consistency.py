@@ -21,6 +21,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from core.run.finding_status import read_verdict
+
 from . import _MAX_REASONING_CHARS
 from ._batch import record_event_batch
 from .scorecard import EventType, ModelScorecard
@@ -32,13 +34,16 @@ def record_self_consistency_outcomes(
     scorecard: ModelScorecard | None,
     *,
     results_by_id: dict[str, dict[str, Any]],
-    verdicts_pre_retry: dict[str, bool],
+    verdicts_pre_retry: dict[str, bool | None],
     decision_class_prefix: str = "agentic",
 ) -> int:
     """Record self-consistency outcomes for retried findings.
 
     ``verdicts_pre_retry`` maps ``finding_id → is_exploitable``
-    captured before ``RetryTask`` ran.
+    captured before ``RetryTask`` ran. A ``None`` entry means the
+    pre-retry analysis ABSTAINED (no verdict was cast) — the
+    ``pre_verdict is None`` skip below covers it: a held/flipped
+    outcome cannot be graded against a vote that never existed.
 
     Returns the number of events recorded.
     """
@@ -51,14 +56,22 @@ def record_self_consistency_outcomes(
             continue
 
         pre_verdict = verdicts_pre_retry.get(fid)
-        if pre_verdict is None:
+        if not isinstance(pre_verdict, bool):
+            # None (the snapshot's documented abstention) or a junk
+            # shape — same isinstance guard judge.py applies at this
+            # boundary: a junk value must read as an abstention,
+            # never a bool()-coerced phantom vote.
             continue
 
-        post_verdict = result.get("is_exploitable")
+        # Tri-state read: a junk shape ("yes", 1) that bypassed
+        # response validation is a non-verdict — grading it (the raw
+        # `is None` guard + bool() coercion) would score the model on
+        # a vote it never cast.
+        post_verdict = read_verdict(result, "is_exploitable")
         if post_verdict is None:
             continue
 
-        held = bool(pre_verdict) == bool(post_verdict)
+        held = pre_verdict == post_verdict
         outcome = "correct" if held else "incorrect"
 
         rule_id = str(result.get("rule_id") or "unknown")

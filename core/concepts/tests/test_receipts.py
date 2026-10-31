@@ -218,3 +218,84 @@ class TestModelFields:
         e = Evidence(type="code_path", file="a.py", observation="o",
                      quote="def f():")
         assert json.loads(json.dumps(asdict(e)))["quote"] == "def f():"
+
+
+class TestStaleDocDecidableOnly:
+    """Check (c) fires only on decidable mismatches: negated claims
+    and multi-line returns must not flag a CORRECT doc as stale."""
+
+    def test_negated_claim_not_flagged(self):
+        from core.concepts.receipts import detect_stale_doc
+        reason = detect_stale_doc(
+            "This helper never returns NULL on any path.",
+            "struct foo *get(void) {\n    return &g_foo;\n}",
+            "get",
+        )
+        assert reason == "", f"correct negated doc flagged: {reason}"
+
+    def test_does_not_return_none_not_flagged(self):
+        from core.concepts.receipts import detect_stale_doc
+        reason = detect_stale_doc(
+            "Does not return None; raises on failure.",
+            "def get(x):\n    return x\n",
+            "get",
+        )
+        assert reason == ""
+
+    def test_multiline_return_not_flagged(self):
+        from core.concepts.receipts import detect_stale_doc
+        reason = detect_stale_doc(
+            "Returns NULL on failure.",
+            "void *get(int x) {\n"
+            "    if (x < 0)\n"
+            "        return (\n"
+            "            NULL);\n"
+            "    return p;\n"
+            "}",
+            "get",
+        )
+        assert reason == "", f"multi-line NULL return flagged: {reason}"
+
+    def test_true_mismatch_still_fires(self):
+        from core.concepts.receipts import detect_stale_doc
+        reason = detect_stale_doc(
+            "Returns NULL on failure.",
+            "int get(void) {\n    return -1;\n}",
+            "get",
+        )
+        assert "NULL" in reason
+
+
+class TestHashCoversStoredQuote:
+    """sha256 and quote cover the same text: a >2000-char quote's
+    stored receipt must be internally consistent (hash of the stored
+    prefix), for both the verifying and mechanical constructors."""
+
+    def test_verify_receipt_hashes_stored_prefix(self, tmp_path):
+        import hashlib
+
+        from core.concepts.receipts import _normalise, verify_receipt
+
+        long_quote = "int frame_check(void) { return 1; } " * 100
+        assert len(long_quote) > 2000
+        f = tmp_path / "a.c"
+        f.write_text(long_quote, encoding="utf-8")
+        r = verify_receipt(tmp_path, "a.c", None, long_quote)
+        assert r.verified
+        assert r.quote == long_quote[:2000]
+        expect = hashlib.sha256(
+            _normalise(r.quote).encode()).hexdigest()[:16]
+        assert r.sha256 == expect
+
+    def test_mechanical_receipt_hashes_stored_prefix(self):
+        import hashlib
+
+        from core.concepts.receipts import _normalise, mechanical_receipt
+
+        long_snip = "x = 1  # padding\n" * 300
+        assert len(long_snip) > 2000
+        r = mechanical_receipt("a.py", 1, long_snip)
+        assert r.quote == long_snip[:2000]
+        expect = hashlib.sha256(
+            _normalise(r.quote).encode()).hexdigest()[:16]
+        assert r.sha256 == expect

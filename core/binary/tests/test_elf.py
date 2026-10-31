@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from core.binary.elf import parse_elf
+from core.binary.elf import is_elf, parse_elf
 
 
 # ---------------------------------------------------------------------------
@@ -117,17 +117,14 @@ class TestRealBinaryParse:
         assert len(meta.imports) > 10
 
     def test_parse_bin_ls_fast(self):
-        """Sub-50ms — generous bound that still catches a
-        regression to the slow path."""
-        import time
-        t0 = time.perf_counter()
-        meta = parse_elf(Path("/bin/ls"))
-        elapsed = time.perf_counter() - t0
+        """Sub-50ms of CPU — generous budget that still catches a
+        regression to the slow path. CPU, not wall: a 50ms wall
+        bound is one scheduler stall away from false-failing on a
+        loaded runner, while the slow-path regression burns CPU."""
+        from core.testing.wallclock import cpu_budget
+        with cpu_budget(0.05, what="native ELF parse of /bin/ls"):
+            meta = parse_elf(Path("/bin/ls"))
         assert meta is not None
-        assert elapsed < 0.05, (
-            f"native ELF parser took {elapsed*1000:.1f}ms — "
-            f"suggests regression to a non-stdlib path"
-        )
 
     def test_idempotent(self):
         """Same binary parsed twice → identical metadata.
@@ -516,3 +513,41 @@ class TestSectionlessDynamic:
         out = parse_elf(p)
         if out is not None:
             assert out.imports == set()
+
+
+# ---------------------------------------------------------------------------
+# is_elf — the shared 4-byte magic check
+# ---------------------------------------------------------------------------
+
+
+class TestIsElf:
+    """One magic-check for every consumer (provenance probing,
+    binary-oracle auto-detect) — previously each carried its own."""
+
+    def test_true_on_elf_magic(self, tmp_path):
+        p = tmp_path / "bin"
+        p.write_bytes(b"\x7fELF" + b"\x00" * 12)
+        assert is_elf(p) is True
+
+    def test_false_on_non_elf(self, tmp_path):
+        p = tmp_path / "not-elf"
+        p.write_bytes(b"#!/bin/sh\n")
+        assert is_elf(p) is False
+
+    def test_false_on_short_file(self, tmp_path):
+        p = tmp_path / "short"
+        p.write_bytes(b"\x7fEL")
+        assert is_elf(p) is False
+
+    def test_false_on_missing_file(self, tmp_path):
+        assert is_elf(tmp_path / "absent") is False
+
+    def test_consumers_delegate_here(self):
+        from core.analysis import binary_oracle_autodetect, binary_provenance
+        import inspect as _inspect
+        for mod in (binary_oracle_autodetect, binary_provenance):
+            src = _inspect.getsource(mod._is_elf)
+            assert "is_elf(" in src, (
+                f"{mod.__name__}._is_elf must delegate to "
+                "core.binary.elf.is_elf, not re-roll the magic check"
+            )

@@ -1,10 +1,25 @@
 """Rank witnesses by how well they match a given finding.
 
-Stage E (and any future consumer that wants "the most relevant
-witness for this finding") needs to pick from the witness set
-discovered by :mod:`core.witness.discovery`. The matching is
-purely structural — no LLM judgment — driven by the
-``outcome_detail`` fields the witness producers populate.
+LIVE consumer: ``libexec/raptor-run-feasibility`` imports
+``discover_witness_stores`` / ``iter_visible_witnesses`` /
+``best_match_for_finding`` and feeds the matched witness bytes into
+binary feasibility analysis (persisted as the empirical mitigation
+map). Stage E's witness stage
+(``packages/exploitability_validation/witness_stage.py``) still does
+dark-verify execution and does not import this module. Because a
+consumer is wired, the join keys are normalised rather than compared
+by raw spelling: the finding id falls back from ``id`` to
+``finding_id`` (provenance's ``_finding_coords`` precedent), CWE
+spellings ("79" vs "CWE-79", case) canonicalise before comparison,
+and file paths match on exact equality OR a component-boundary
+suffix (absolute producer path vs repo-relative finding path). The
+matching is purely structural — no LLM judgment — driven by the
+``outcome_detail`` fields the witness producers populate. Treat
+residual mis-joins as VERDICT-RELEVANT: the matched bytes feed the
+persisted empirical mitigation map, and the validation stage that
+consumes it adjusts verdicts in both directions (softens on
+blocked-under, lifts on bug-fired-under) — which is why the suffix
+tier refuses bare-basename joins.
 
 Ranking (higher score → better match):
 
@@ -60,6 +75,8 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
+import stat as _stat_mod
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -104,6 +121,56 @@ def _outcome_priority(outcome: WitnessOutcome) -> int:
     return 1
 
 
+def _norm_cwe(value: Any) -> str | None:
+    """Canonical ``CWE-N`` spelling from any common form, or None.
+
+    Producers and findings disagree on spelling ("79", "CWE-79",
+    "cwe-79"); comparing raw strings silently never matched across
+    the divide and fell through to weaker criteria.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip().upper()
+    if text.startswith("CWE-"):
+        text = text[4:]
+    return f"CWE-{text}" if text.isdigit() else None
+
+
+def _paths_match(a: Any, b: Any) -> bool:
+    """Exact or component-boundary-suffix path equality.
+
+    The producer side records the path it analysed (often absolute);
+    the finding side is usually repo-relative — raw equality never
+    joined them. A suffix match is accepted only on a whole-component
+    boundary so ``b/x.c`` never matches ``ab/x.c``, and only when the
+    SUFFIX side carries at least two components: a bare basename
+    (``index.js``) would suffix-join any same-named file anywhere in
+    a sibling run's tree, and the matched bytes influence downstream
+    feasibility verdicts in BOTH directions — a bare-basename join is
+    the wrong-witness transplant this tier must not admit. Bare
+    basenames still join on exact equality.
+    """
+    if not isinstance(a, str) or not isinstance(b, str):
+        return False
+
+    def _norm(p: str) -> str:
+        p = p.replace("\\", "/")
+        while p.startswith("./"):
+            p = p[2:]
+        return p
+
+    na, nb = _norm(a), _norm(b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    if na.endswith("/" + nb):
+        return "/" in nb
+    if nb.endswith("/" + na):
+        return "/" in na
+    return False
+
+
 def score_witness_for_finding(
     witness: Witness,
     finding: dict[str, Any],
@@ -113,19 +180,27 @@ def score_witness_for_finding(
     the maxima via :func:`best_match_for_finding`."""
     detail = witness.outcome_detail if isinstance(witness.outcome_detail, dict) else {}
 
-    finding_id = finding.get("id")
-    finding_cwe = finding.get("cwe_id") or finding.get("cwe")
+    finding_id = finding.get("id") or finding.get("finding_id")
+    finding_cwe = _norm_cwe(finding.get("cwe_id") or finding.get("cwe"))
     finding_file = finding.get("file") or finding.get("file_path")
     binary_path = _finding_binary_path(finding)
 
     if finding_id and detail.get("finding_id") == finding_id:
         return 10, "exact finding-id match"
 
-    if (finding_cwe and detail.get("cwe_id") == finding_cwe
-            and finding_file and detail.get("file_path") == finding_file):
+    # Both producer spellings are live: the LLM-emit adapter writes
+    # cwe_id / file_path, the symbolic-witness producer writes cwe /
+    # file. Reading one spelling silently never matched the other
+    # producer's witnesses.
+    detail_cwe = _norm_cwe(detail.get("cwe_id") or detail.get("cwe"))
+    file_matches = bool(finding_file) and _paths_match(
+        detail.get("file_path") or detail.get("file"), finding_file,
+    )
+
+    if finding_cwe and detail_cwe == finding_cwe and file_matches:
         return 7, "cwe + file match"
 
-    if finding_file and detail.get("file_path") == finding_file:
+    if file_matches:
         return 4, "file match"
 
     # Binary-hash fallback for fuzz witnesses (no finding_id /
@@ -202,9 +277,33 @@ def _on_disk_binary_hash(binary_path: str | None) -> str | None:
     """
     if not binary_path:
         return None
+    # Gated read on the OPEN fd: binary_path comes from finding
+    # JSON in run directories, so the size bound and the file-type
+    # gate must hold on the fd actually read — a stat-by-name gate
+    # misses a planted FIFO (stats 0 bytes, then blocks the scoring
+    # loop forever at the open) and a swap-after-stat.
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
     try:
         p = Path(binary_path)
-        st = p.stat()
+        fd = os.open(str(p), flags)
+    except OSError:
+        logger.debug(
+            "witness matching: cannot hash finding binary %s",
+            binary_path, exc_info=True,
+        )
+        return None
+    try:
+        st = os.fstat(fd)
+        if not _stat_mod.S_ISREG(st.st_mode):
+            logger.debug(
+                "witness matching: finding binary %s is not a "
+                "regular file — treating as unhashable", binary_path,
+            )
+            return None
         if st.st_size > _MAX_BINARY_HASH_BYTES:
             logger.debug(
                 "witness matching: finding binary %s exceeds the "
@@ -217,7 +316,8 @@ def _on_disk_binary_hash(binary_path: str | None) -> str | None:
         if cached:
             return cached
         h = hashlib.sha256()
-        with open(p, "rb") as f:
+        with os.fdopen(fd, "rb") as f:
+            fd = -1  # fdopen owns it now
             for chunk in iter(lambda: f.read(1 << 20), b""):
                 h.update(chunk)
         digest = h.hexdigest()
@@ -229,6 +329,12 @@ def _on_disk_binary_hash(binary_path: str | None) -> str | None:
             binary_path, exc_info=True,
         )
         return None
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def best_match_for_finding(

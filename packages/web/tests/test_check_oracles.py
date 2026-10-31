@@ -520,6 +520,46 @@ def test_ssrf_probes_the_url_where_the_parameter_was_discovered():
     assert probed, "the probe must hit the discovered /proxy endpoint"
 
 
+def test_ssrf_probes_every_catalogued_payload():
+    """A clean target sees all payloads: the metadata-only indicators
+    (AMI id, instanceId, computeMetadata, ...) are unreachable unless
+    the cloud-metadata payloads actually ride a probe."""
+    from urllib.parse import quote
+
+    from packages.web.checks.ssrf import _SSRF_PAYLOADS
+
+    def handler(method, path, **_kw):
+        return FakeResponse(200, "<html>home</html>")
+
+    findings, client = _ssrf_param_check(
+        handler,
+        {"parameters": [], "urls": ["https://t.example/fetch?url=https://a"]},
+    )
+    assert findings == []
+    sent = [str(call[1]) for call in client.calls]
+    for payload in _SSRF_PAYLOADS:
+        assert any(quote(payload, safe="") in url for url in sent), payload
+
+
+def test_ssrf_metadata_indicator_confirms_via_metadata_payload():
+    from urllib.parse import quote
+
+    def handler(method, path, **_kw):
+        if quote("169.254.169.254", safe="") in str(path):
+            return FakeResponse(
+                200, '{"instanceId": "i-0abc", "region": "eu-west-1"}',
+            )
+        return FakeResponse(200, "<html>home</html>")
+
+    findings, _client = _ssrf_param_check(
+        handler,
+        {"parameters": [], "urls": ["https://t.example/fetch?url=https://a"]},
+    )
+    assert len(findings) == 1
+    assert findings[0].severity == "critical"
+    assert "instanceId" in findings[0].evidence
+
+
 # -- redirect legs are observable (client no longer eats the 3xx) --------------
 
 
@@ -607,7 +647,7 @@ def test_raw_socket_smuggling_probe_failures_count_as_degradation():
     from packages.web.checks.cache import RequestSmugglingCheck
 
     check = RequestSmugglingCheck()
-    check._raw_exchange = lambda *args: (None, 0.0)  # target unreachable
+    check._raw_exchange = lambda *args: (None, 0.0, False)  # target unreachable
     client = _CountingClient(lambda *a, **k: FakeResponse(200, "ok"))
     assert check.run(client, "https://t.example") == []
     assert client.transport_errors == 3  # one per probe variant
@@ -618,10 +658,12 @@ def test_https_downgrade_probe_failure_counts_as_degradation(monkeypatch):
 
     from packages.web.checks.tls import HttpsRedirectCheck
 
-    def _refuse(*args, **kwargs):
+    def _refuse(self, *args, **kwargs):
         raise requests.ConnectionError("refused")
 
-    monkeypatch.setattr(requests, "get", _refuse)
+    # The check probes through its own Session (trust_env control for
+    # loopback targets), so patch the Session method.
+    monkeypatch.setattr(requests.Session, "get", _refuse)
     client = _CountingClient(lambda *a, **k: FakeResponse(200, "ok"))
     assert HttpsRedirectCheck().run(client, "https://t.example") == []
     assert client.transport_errors == 1
@@ -630,14 +672,16 @@ def test_https_downgrade_probe_failure_counts_as_degradation(monkeypatch):
 def test_options_probe_failure_counts_as_degradation(monkeypatch):
     import requests
 
-    from packages.web.checks.information import VerbosHttpMethodsCheck
+    from packages.web.checks.information import VerboseHttpMethodsCheck
 
-    def _refuse(*args, **kwargs):
+    def _refuse(self, *args, **kwargs):
         raise requests.ConnectionError("refused")
 
-    monkeypatch.setattr(requests, "options", _refuse)
+    # The probe rides its own Session (trust_env control for loopback
+    # targets), so patch the Session method.
+    monkeypatch.setattr(requests.Session, "options", _refuse)
     client = _CountingClient(lambda *a, **k: FakeResponse(200, "ok"))
-    assert VerbosHttpMethodsCheck().run(client, "https://t.example") == []
+    assert VerboseHttpMethodsCheck().run(client, "https://t.example") == []
     assert client.transport_errors == 1
 
 
@@ -647,9 +691,101 @@ def test_successful_bypass_probes_do_not_count(monkeypatch):
     from packages.web.checks.tls import HttpsRedirectCheck
 
     monkeypatch.setattr(
-        requests, "get",
-        lambda *a, **k: FakeResponse(301, "", headers={"Location": "https://t.example/"}),
+        requests.Session, "get",
+        lambda self, *a, **k: FakeResponse(
+            301, "", headers={"Location": "https://t.example/"}),
     )
     client = _CountingClient(lambda *a, **k: FakeResponse(200, "ok"))
     HttpsRedirectCheck().run(client, "https://t.example")
     assert client.transport_errors == 0
+
+
+# -- CORS null-origin credential escalation ------------------------------------
+
+
+def _cors_findings(check_name: str, respond):
+    """Run one cors.py check against a server whose CORS headers are
+    computed from the request's Origin header by ``respond``."""
+    from packages.web.checks import cors
+
+    def handler(method, path, headers=None, **_kw):
+        return FakeResponse(200, "", headers=respond((headers or {}).get("Origin", "")))
+
+    return getattr(cors, check_name)().run(FakeClient(handler), "https://t.example")
+
+
+def _null_only_server(credentialed: bool):
+    """CORS policy that trusts exactly the null origin (allowlist entry
+    or reflection — indistinguishable on the wire)."""
+    def respond(origin: str) -> dict:
+        if origin != "null":
+            return {}
+        out = {"Access-Control-Allow-Origin": "null"}
+        if credentialed:
+            out["Access-Control-Allow-Credentials"] = "true"
+        return out
+    return respond
+
+
+def test_credentialed_null_origin_is_critical() -> None:
+    findings = _cors_findings("CorsNullOriginCheck", _null_only_server(credentialed=True))
+    assert len(findings) == 1
+    assert findings[0].severity == "critical"
+    assert "credentialed" in findings[0].detail
+
+
+def test_null_origin_without_credentials_stays_high() -> None:
+    findings = _cors_findings("CorsNullOriginCheck", _null_only_server(credentialed=False))
+    assert len(findings) == 1
+    assert findings[0].severity == "high"
+
+
+def test_null_origin_ownership_stays_with_the_null_check() -> None:
+    # The wildcard/reflection check must not grow a null REFLECTION arm:
+    # a null-only credentialed server is V14.5.2's, reported there at
+    # critical, and nothing from V14.5.1 (its null probe exists only to
+    # feed the wildcard arm).
+    assert _cors_findings(
+        "CorsWildcardWithCredentialsCheck", _null_only_server(credentialed=True),
+    ) == []
+
+
+def test_reflected_origin_with_credentials_still_critical() -> None:
+    def respond(origin: str) -> dict:
+        if not origin:
+            return {}
+        return {
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Credentials": "true",
+        }
+    findings = _cors_findings("CorsWildcardWithCredentialsCheck", respond)
+    assert len(findings) == 1
+    assert findings[0].severity == "critical"
+
+
+def test_wildcard_with_credentials_still_flagged() -> None:
+    def respond(origin: str) -> dict:
+        return {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Credentials": "true",
+        }
+    findings = _cors_findings("CorsWildcardWithCredentialsCheck", respond)
+    assert len(findings) == 1
+    assert findings[0].severity == "high"
+
+
+def test_null_conditioned_wildcard_with_credentials_still_flagged() -> None:
+    # Some servers emit 'ACAO: *' (+ credentials) ONLY for null-origin
+    # requests — e.g. a wildcard header gated behind an origin regex
+    # that matches 'null'. The null probe must keep feeding the
+    # wildcard arm so this configuration stays detected.
+    def respond(origin: str) -> dict:
+        if origin != "null":
+            return {}
+        return {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Credentials": "true",
+        }
+    findings = _cors_findings("CorsWildcardWithCredentialsCheck", respond)
+    assert len(findings) == 1
+    assert findings[0].severity == "high"

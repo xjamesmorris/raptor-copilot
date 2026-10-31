@@ -21,6 +21,7 @@ from pathlib import Path
 from core.logging import get_logger
 
 from .evidence import discover_evidence
+from core.security.env_sanitisation import safe_subprocess_env
 
 log = get_logger("frida.active")
 
@@ -31,21 +32,15 @@ _MAX_STDOUT_CAPTURE = 10 * 1024 * 1024  # 10MB cap on captured output
 
 
 def _safe_env() -> dict[str, str]:
-    """Build a safe subprocess environment via RaptorConfig.get_safe_env().
+    """Frida-CLI subprocess environment.
 
-    Falls back to a minimal env if RaptorConfig is unavailable (e.g., in
-    tests without full RAPTOR bootstrap).
+    Sanitised base from the shared fail-closed helper
+    (``safe_subprocess_env``), minus the target-facing strip set,
+    plus the RAPTOR runtime variables the hook pipeline itself needs
+    (the frida CLI is RAPTOR tooling, not the observed target — the
+    markers are re-added deliberately below).
     """
-    try:
-        from core.config import RaptorConfig
-        env = RaptorConfig.get_safe_env()
-    except (ImportError, AttributeError, TypeError):
-        env = {
-            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-            "HOME": os.environ.get("HOME", "/tmp"),
-            "LANG": os.environ.get("LANG", "C.UTF-8"),
-            "TERM": "dumb",
-        }
+    env = safe_subprocess_env()
     # Subtract the target-facing strip set (trust markers + the
     # session credential): several of its members sit on the safe-env
     # allowlist for RAPTOR's own tooling, but the process observed
@@ -109,6 +104,8 @@ def observe_target(
         cmd.extend(["--out", str(out_dir)])
 
     env = _safe_env()
+    nonce = _mint_nonce()
+    env["RAPTOR_FRIDA_RUNDIR_NONCE"] = nonce
 
     log.info("launching frida observation: %s (template=%s, duration=%ds)",
              target, template, duration_sec)
@@ -131,10 +128,16 @@ def observe_target(
                   result.returncode, stderr_tail)
         return None
 
-    # The wrapper echoes the lifecycle output — the only OUTPUT_DIR=
-    # line — to STDERR (operator visibility); scan both streams.
-    run_dir = (_extract_output_dir(result.stdout)
-               or _extract_output_dir(result.stderr or ""))
+    # An explicit out_dir is the caller's choice and always wins —
+    # parsed sentinels only resolve wrapper-owned lifecycle dirs.
+    if out_dir is not None:
+        run_dir = Path(out_dir)
+    else:
+        run_dir_ = _extract_output_dir(result.stderr or "", nonce)
+        if not run_dir_:
+            log.error("frida observation produced no output directory")
+            return None
+        run_dir = run_dir_
     if run_dir and run_dir.is_dir() and (run_dir / "metadata.json").is_file():
         log.info("observation complete: %s", run_dir)
         return run_dir
@@ -199,6 +202,8 @@ def watch_sinks(
         cmd.extend(["--out", str(out_dir)])
 
     env = _safe_env()
+    nonce = _mint_nonce()
+    env["RAPTOR_FRIDA_RUNDIR_NONCE"] = nonce
 
     log.info("launching frida sink watch: %s (sinks=%s, duration=%ds%s)",
              target, sinks_file, duration_sec,
@@ -222,8 +227,14 @@ def watch_sinks(
                   result.returncode, stderr_tail)
         return None
 
-    run_dir = (_extract_output_dir(result.stdout)
-               or _extract_output_dir(result.stderr or ""))
+    if out_dir is not None:
+        run_dir = Path(out_dir)
+    else:
+        run_dir_ = _extract_output_dir(result.stderr or "", nonce)
+        if not run_dir_:
+            log.error("frida sink watch produced no output directory")
+            return None
+        run_dir = run_dir_
     if run_dir and run_dir.is_dir() and (run_dir / "metadata.json").is_file():
         log.info("sink watch complete: %s", run_dir)
         return run_dir
@@ -277,6 +288,20 @@ def observe_paired(
     run_dir = out_dir or _make_run_dir(raptor_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    # The target binary is hostile code: its write grant is a work
+    # subdirectory, never the run dir itself — the run dir carries
+    # parent-attributed state (metadata.json is the success check
+    # below; when out_dir is a lifecycle run dir, .raptor-run.json
+    # and findings live there too) that a hostile child must not be
+    # able to rewrite. The frida lane (trusted tooling) keeps writing
+    # its observation artifacts to the run dir via --out.
+    from core.sandbox.work_dir import hostile_work_subdir
+    try:
+        target_work = hostile_work_subdir(run_dir, "target")
+    except ValueError as exc:
+        log.error("cannot stage target work dir: %s", exc)
+        return None
+
     target_binary = Path(target_cmd[0])
     target_name = target_binary.name[:15]  # TASK_COMM_LEN truncation
 
@@ -305,7 +330,7 @@ def observe_paired(
             # filesystem boundary the coordinator (fail-closed) refuses
             # the spec — network-only isolation is not enough for a
             # hostile child.
-            "output": str(run_dir),
+            "output": str(target_work),
             "restrict_reads": True,
         },
         "exploit": {
@@ -348,7 +373,12 @@ def observe_paired(
                 os.killpg(os.getpgid(proc.pid), 9)
             except (OSError, ProcessLookupError):
                 proc.kill()
-            proc.communicate()
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                for pipe in (proc.stdout, proc.stderr, proc.stdin):
+                    if pipe is not None and not pipe.closed:
+                        pipe.close()
         log.error("paired observation timed out")
         return None
     except OSError as exc:
@@ -426,13 +456,36 @@ def auto_observe(
     )
 
 
-def _extract_output_dir(stdout: str) -> Path | None:
-    """Parse OUTPUT_DIR=<path> from libexec output."""
-    for line in stdout.splitlines():
-        if line.startswith("OUTPUT_DIR="):
-            p = Path(line[len("OUTPUT_DIR="):].strip())
+_RUN_DIR_SENTINEL = "RAPTOR_FRIDA_RUN_DIR:"
+
+
+def _mint_nonce() -> str:
+    """Fresh per-launch sentinel nonce."""
+    return os.urandom(8).hex()
+
+
+def _extract_output_dir(stderr: str, nonce: str) -> Path | None:
+    """Parse the nonce-framed run-dir sentinel from WRAPPER stderr.
+
+    The spawned target inherits the wrapper's stdio, so both captured
+    streams carry attacker bytes once the target runs — the previous
+    stdout-first scan for a bare ``OUTPUT_DIR=`` line let the target
+    substitute a pre-planted evidence directory. The wrapper emits
+    ``RAPTOR_FRIDA_RUN_DIR:<nonce>=<path>`` on stderr BEFORE spawning
+    the target (and unsets the nonce from the child env): the nonce
+    is unguessable to bytes baked into the target, and the FIRST
+    framed line wins, so a later forged line can never displace the
+    wrapper's own. The bare ``OUTPUT_DIR=`` lifecycle line stays on
+    stderr for operators and downstream lifecycle steps; it is no
+    longer trusted for evidence-dir selection.
+    """
+    marker = f"{_RUN_DIR_SENTINEL}{nonce}="
+    for line in (stderr or "").splitlines():
+        if line.startswith(marker):
+            p = Path(line[len(marker):].strip())
             if p.is_dir():
                 return p
+            return None  # first framed line decides; never fall through
     return None
 
 

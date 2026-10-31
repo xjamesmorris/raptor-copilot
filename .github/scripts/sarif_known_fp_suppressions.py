@@ -25,7 +25,8 @@ uploads carrying stamped suppressions left the alerts open), so
 stamping is not a dismissal mechanism. Deleting the result instead
 closes the corresponding alert as no-longer-detected on the next
 upload. The reviewed justification for every removal lives in the
-tables below; adding a new entry
+tables below; adding a new entry requires its justification row and
+a paired regression test in test_sarif_known_fp_suppressions.
 """
 
 from __future__ import annotations
@@ -142,6 +143,42 @@ KNOWN_FP_RULES: tuple[KnownFP, ...] = (
             "operator-visible by design. Source taint is a "
             "heuristically-named path variable, not real secret "
             "material. Triaged FP."
+        ),
+    ),
+    KnownFP(
+        rule_id="py/redos",
+        sink_file_prefixes=(
+            "packages/sca/tests/test_refresh_typosquat_lists.py",
+            "packages/sca/supply_chain/tests/test_name_grammar.py",
+        ),
+        justification=(
+            "Deliberately-superlinear regexes retained verbatim as "
+            "equivalence fixtures: these tests prove the production "
+            "linear-time Packagist grammar accepts exactly the same "
+            "language as the ambiguous legacy/published original, so "
+            "the vulnerable spelling must stay in the test text — "
+            "deleting it deletes the proof. The fixtures run only "
+            "against bounded, self-generated corpora (exhaustive "
+            "strings to length 6 plus structured strings with short "
+            "alnum runs), never attacker-controlled input, and each "
+            "site's comment forbids promoting the pattern into "
+            "production code. Intended fixture."
+        ),
+    ),
+    KnownFP(
+        rule_id="py/overly-large-range",
+        sink_file_prefixes=(
+            "core/annotations/storage.py",
+        ),
+        justification=(
+            "The flagged character range is a deliberate C0/C1 "
+            "control-character REJECT class in a write-time validator "
+            "(_CONTROL_CHARS_RE): matching text is refused with a "
+            "ValueError, never interpreted or rendered. Breadth is "
+            "the defence — over-rejecting is the safe direction for "
+            "terminal-control bytes in persisted annotations — and "
+            "the range's composition is documented in the comment at "
+            "the pattern. Intended behavior."
         ),
     ),
 )

@@ -198,6 +198,30 @@ class TestProxyHosts:
         monkeypatch.setattr(bq, "_OVERRIDE_CONFIG_PATH", override)
         assert bq.proxy_hosts_for_bq() == list(bq._DEFAULT_BQ_HOSTS)
 
+    def test_explicit_empty_override_allows_nothing(self, tmp_path,
+                                                    monkeypatch):
+        """{"hosts": []} is an explicit operator statement (ban
+        BigQuery egress) — it must yield an empty allowlist, never
+        silently restore the permissive Google-host default."""
+        override = tmp_path / "bq-proxy-hosts.json"
+        override.write_text(json.dumps({"hosts": []}))
+        monkeypatch.setattr(bq, "_OVERRIDE_CONFIG_PATH", override)
+        assert bq.proxy_hosts_for_bq() == []
+
+    def test_override_with_only_invalid_entries_allows_nothing(
+            self, tmp_path, monkeypatch):
+        """Schema parsed but every entry dropped (non-string/empty):
+        still an explicit override — allow nothing, don't fail open."""
+        override = tmp_path / "bq-proxy-hosts.json"
+        override.write_text(json.dumps({"hosts": [42, ""]}))
+        monkeypatch.setattr(bq, "_OVERRIDE_CONFIG_PATH", override)
+        assert bq.proxy_hosts_for_bq() == []
+
+    def test_missing_override_keeps_default(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            bq, "_OVERRIDE_CONFIG_PATH", tmp_path / "nope.json")
+        assert bq.proxy_hosts_for_bq() == list(bq._DEFAULT_BQ_HOSTS)
+
 
 # =========================================================================
 # execution against a stubbed google client
@@ -304,6 +328,28 @@ class TestExecute:
         self._auth_exceptions = _install_google_stub(monkeypatch, holder)
         monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
         return holder
+
+    def test_row_cap_truncates_and_flags(self, clients, monkeypatch):
+        # The one unbounded read on an otherwise fully-budgeted
+        # surface: result materialisation must stop at max_rows and
+        # say so in the envelope (maximum_bytes_billed bounds scan
+        # cost, not result cardinality).
+        rows = [{"a": i} for i in range(5)]
+        orig_init = _FakeClient.__init__
+
+        def _init(self, credentials=None, project=None):
+            orig_init(self, credentials=credentials, project=project)
+            self.next_job = _FakeJob(rows=list(rows))
+
+        monkeypatch.setattr(_FakeClient, "__init__", _init)
+        result = bq.execute("SELECT 1", max_rows=3)
+        assert result["row_count"] == 3
+        assert len(result["rows"]) == 3
+        assert result["truncated"] is True
+
+    def test_default_row_cap_not_truncated(self, clients):
+        result = bq.execute("SELECT 1")
+        assert result["truncated"] is False
 
     def test_envelope_shape(self, clients):
         result = bq.execute("SELECT 1")
@@ -459,6 +505,23 @@ class TestChildMain:
         assert code == bq.EXIT_VALIDATION
         assert json.loads(err)["error"] == "validation"
 
+    def test_non_numeric_max_bytes_billed_is_structured(self, monkeypatch):
+        # Contract: malformed request fields produce exit 4 + ONE JSON
+        # error line — never a raw traceback. The numeric coercions
+        # ran outside the typed-error try and crashed unstructured.
+        code, _, err = self._run_child(
+            monkeypatch,
+            json.dumps({"sql": "SELECT 1", "max_bytes_billed": "lots"}))
+        assert code == bq.EXIT_INPUT
+        assert json.loads(err)["error"] == "input"
+
+    def test_non_numeric_timeout_is_structured(self, monkeypatch):
+        code, _, err = self._run_child(
+            monkeypatch,
+            json.dumps({"sql": "SELECT 1", "timeout_s": {"x": 1}}))
+        assert code == bq.EXIT_INPUT
+        assert json.loads(err)["error"] == "input"
+
     def test_success_roundtrip(self, monkeypatch):
         holder: list = []
         _install_google_stub(monkeypatch, holder)
@@ -471,6 +534,20 @@ class TestChildMain:
         assert payload["rows"] == [{"a": 1}]
         assert holder[0].last_job_config.maximum_bytes_billed == 999
 
+    def test_non_numeric_max_rows_is_structured(self, monkeypatch):
+        code, _, err = self._run_child(
+            monkeypatch,
+            json.dumps({"sql": "SELECT 1", "max_rows": "many"}))
+        assert code == bq.EXIT_INPUT
+        assert json.loads(err)["error"] == "input"
+
+    def test_non_positive_max_rows_is_structured(self, monkeypatch):
+        code, _, err = self._run_child(
+            monkeypatch,
+            json.dumps({"sql": "SELECT 1", "max_rows": 0}))
+        assert code == bq.EXIT_INPUT
+        assert json.loads(err)["error"] == "input"
+
 
 class TestJsonDefault:
     def test_bytes_base64(self):
@@ -481,3 +558,36 @@ class TestJsonDefault:
         stamp = datetime.datetime(
             2025, 7, 13, 20, 30, 24, tzinfo=datetime.timezone.utc)
         assert "2025-07-13" in bq._json_default(stamp)
+
+
+class TestEmptyOverridePolicyRefusal:
+    def test_empty_override_is_a_policy_error_not_a_sandbox_valueerror(
+            self, tmp_path, monkeypatch):
+        """An empty operator override means allow-nothing; the wrapper
+        must refuse with a policy-shaped structured error BEFORE the
+        sandbox turns the empty allowlist into a caller-bug-shaped
+        ValueError."""
+        import importlib.util
+        from importlib.machinery import SourceFileLoader
+        from pathlib import Path as _P
+
+        monkeypatch.setenv("_RAPTOR_TRUSTED", "1")
+        script = str(
+            _P(__file__).resolve().parents[3] / "libexec" / "raptor-bq-query")
+        loader = SourceFileLoader("raptor_bq_query_cli", script)
+        spec = importlib.util.spec_from_loader("raptor_bq_query_cli", loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+
+        monkeypatch.setattr(bq, "proxy_hosts_for_bq", lambda: [])
+        err = io.StringIO()
+        monkeypatch.setattr(mod.sys, "stderr", err)
+        rc = mod._run_sandboxed(
+            {"query": "SELECT 1"},
+            types.SimpleNamespace(timeout=5, output=None),
+            "/nonexistent/creds.json",
+        )
+        assert rc == bq.EXIT_USAGE
+        payload = json.loads(err.getvalue())
+        assert payload["error"] == "policy"
+        assert "denied by policy" in payload["message"]

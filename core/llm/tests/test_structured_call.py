@@ -44,6 +44,21 @@ class TestClassifier:
         assert is_auth_error_text("rate limit exceeded")
         assert not is_auth_error_text("credentials.py had a typo")
 
+    def test_genai_leading_status_auth_shapes(self):
+        """google-genai renders errors as ``"<code> <STATUS>. {...}"``
+        — the message-leading 401/403 and gRPC reason vocabulary must
+        classify auth, same SDK shape the 429/500 arms already model
+        (``429 RESOURCE_EXHAUSTED``, ``500 INTERNAL``)."""
+        assert classify_error_text(
+            "401 UNAUTHENTICATED. {'error': {'code': 401}}") == "auth"
+        assert classify_error_text(
+            "403 PERMISSION_DENIED. {'error': {'code': 403}}") == "auth"
+        assert is_auth_error_text("401 UNAUTHENTICATED")
+        # Boundary discipline holds: stack-trace 40x stays unclassified.
+        assert classify_error_text(
+            'File "x.py", line 403, in forbidden_fruit') == "error"
+        assert classify_error_text("processed 401 records") == "error"
+
     def test_timeout(self):
         assert classify_error_text("read timed out") == "timeout"
         assert classify_error_text("deadline exceeded") == "timeout"
@@ -56,6 +71,11 @@ class TestClassifier:
         assert classify_error_text("rate_limit_error") == "auth"
         assert classify_error_text("429 RESOURCE_EXHAUSTED") == "auth"
         assert classify_error_text("HTTP 429 Too Many Requests") == "auth"
+        # Wrapper phrasings: "HTTP error 429" and a colon after the
+        # status before the reason phrase.
+        assert classify_error_text(
+            "HTTP error 429: Too Many Requests") == "auth"
+        assert classify_error_text("429: too many requests") == "auth"
 
     def test_unrelated_429_numerics_stay_error(self):
         # Boundary/context anchoring: a stack-trace line number or an
@@ -63,6 +83,7 @@ class TestClassifier:
         assert classify_error_text(
             'File "x.py", line 429, in foo') == "error"
         assert classify_error_text("request id 14290 failed") == "error"
+        assert classify_error_text("HTTP 4290 is not a status") == "error"
 
     def test_precedence_blocked_over_auth_over_timeout(self):
         assert classify_error_text(
@@ -136,6 +157,38 @@ class TestUnwrap:
     def test_default_result_type(self):
         assert isinstance(unwrap_structured_response(None),
                           StructuredCallResult)
+
+    def test_bare_dict_is_already_unwrapped(self):
+        # Twin-parity: structured_result treats a bare dict as an
+        # already-unwrapped payload; pre-unification this helper
+        # tried response[0], hit KeyError, and silently returned the
+        # sentinel — the exact sibling-drift shape the consolidation
+        # was meant to end.
+        payload = {"verdict": "sound"}
+        call = unwrap_structured_response(payload, empty_result="x")
+        assert call.result == payload
+
+    def test_result_shape_never_drifts_from_structured_result(self):
+        # Drift guard: for every tolerated response shape, the result
+        # this wrapper reports must equal what the canonical
+        # structured_result extracts (this wrapper only ADDS the
+        # cost/model/usage view).
+        from core.llm.coerce import structured_result
+        sentinel = {"status": "error"}
+        shapes = [
+            None,
+            (),
+            ({"b": 2}, "raw"),
+            {"bare": "dict"},
+            _FakeResponse(result={"a": 1}),
+            object(),
+            "",
+            [{"first": 1}, "rest"],
+        ]
+        for shape in shapes:
+            assert unwrap_structured_response(
+                shape, empty_result=sentinel,
+            ).result == structured_result(shape, default=sentinel), shape
 
 
 class TestChainWalkingClassifiers:

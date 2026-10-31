@@ -36,7 +36,10 @@ from core.json import load_json_bounded
 from .._test_paths import TEST_DIR_NAMES as _SHARED_TEST_DIR_NAMES
 from ..discovery import EXCLUDED_DIR_NAMES
 from ..models import Confidence, Dependency, Manifest
+from ..parsers import _safe_read
+from ._closest_manifest import project_host_dep
 from ._edit_distance import damerau_levenshtein
+from ._source_exts import SOURCE_CODE_EXTS as _SOURCE_CODE_EXTS
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -65,8 +68,12 @@ _SKIP_HOSTS = {
 # decoy name while the runtime connects to the real one. The group
 # requires a literal ``@`` to consume anything, so plain URLs are
 # unaffected.
+# IGNORECASE: URL schemes are case-insensitive at runtime —
+# ``HTTPS://pastebin.com/x`` fetches exactly like the lowercase
+# spelling, so a cased scheme must not slip past the extractor.
 _URL_RE = re.compile(
     r"https?://(?:[A-Za-z0-9._%+:\-]*@)?(?P<host>[A-Za-z0-9._\-]+)",
+    re.IGNORECASE,
 )
 
 # Test-path detection is delegated to the shared ``_test_paths``
@@ -81,9 +88,10 @@ _TEST_DIR_NAMES = _SHARED_TEST_DIR_NAMES | _LOCAL_FIXTURE_DIRS
 # Canonical skip set — drift-free with discovery.EXCLUDED_DIR_NAMES.
 _SKIP_DIRS = EXCLUDED_DIR_NAMES
 
-_EXTENSIONS = {".py", ".js", ".ts", ".sh", ".bash", ".rb", ".go",
-                ".rs", ".php", ".cs", ".java", ".kt", ".gradle",
-                ".dockerfile", ".yml", ".yaml", ".json"}
+# Shared with exfil_destinations — see ``_source_exts`` (the two
+# walkers drifted; the typosquat one was missing the primary npm
+# hook-payload extensions .mjs/.cjs/.jsx/.tsx).
+_EXTENSIONS = _SOURCE_CODE_EXTS
 
 
 @dataclass
@@ -111,11 +119,13 @@ def scan_target(
     if not popular:
         return []
 
-    # Group manifests by parent dir so the synthesised Dependency for a
-    # finding gets attached to a real declared_in.
+    # Anchor findings through the shared dominance-based resolver
+    # (``project_host_dep``) like every other tree-walking detector:
+    # pinning to the FIRST discovered manifest with a literal
+    # ``<project>`` name produced a dep key no sibling detector ever
+    # matched, so SQUAT-family composite promotions could never
+    # co-fire, and multi-manifest repos got a wrong ``declared_in``.
     manifests_list = list(manifests)
-    fallback_manifest: Manifest | None = (
-        manifests_list[0] if manifests_list else None)
 
     # Per-scan cache: a popular-near-miss check is purely a function
     # of the host string and the popular set, both stable across the
@@ -129,11 +139,9 @@ def scan_target(
     for src in _walk_sources(target, max_depth=max_depth):
         if _is_test_file(src, target):
             continue
-        try:
-            text = src.read_text(encoding="utf-8", errors="replace")
-        except OSError as e:
-            logger.debug("sca.supply_chain.typosquat_domain: skip %s (%s)",
-                          src, e)
+        text = _safe_read.read_bounded(src, follow_symlinks=False)
+        if text is None:
+            # ``read_bounded`` already logged the underlying reason.
             continue
         for host, line in _hosts_in(text):
             if host in _SKIP_HOSTS:
@@ -150,7 +158,10 @@ def scan_target(
             if best is None:
                 continue
             distance, nearest = best
-            dep = _stub_dep(fallback_manifest, src)
+            dep = project_host_dep(
+                manifests_list, src, target,
+                reason="domain typosquat — project-level finding",
+            )
             detail = (
                 f"{src.relative_to(target)}:{line} references "
                 f"`{host}` — distance {distance} from popular "
@@ -211,6 +222,36 @@ def _hosts_in(text: str) -> Iterable[tuple[str, int]]:
 
 
 def _nearest_popular(
+    host: str, popular: set[str],
+) -> tuple[int, str] | None:
+    """Best near-miss for ``host`` against the popular set —
+    whole-host comparison PLUS trailing 2- / 3-label suffixes.
+
+    The suffix pass exists for the module's own motivating attack
+    shape: ``scan.aquasecurtiy.org`` (CVE-2026-33634) is distance ≥5
+    from ``aquasecurity.org`` as a whole host, but its registrable
+    suffix is distance 1 — attackers control DNS for the squat
+    domain, so subdomain hosting is the OBSERVED shape.  An exact
+    suffix match means the host is a subdomain of a popular domain
+    (only that domain's owner can serve it) and is skipped as
+    in-family.
+    """
+    best = _nearest_whole(host, popular)
+    labels = host.split(".")
+    for n in (2, 3):
+        if len(labels) <= n:
+            continue
+        suffix = ".".join(labels[-n:])
+        if suffix in popular:
+            # Subdomain of a popular domain — same owner, not a squat.
+            return best
+        cand = _nearest_whole(suffix, popular)
+        if cand is not None and (best is None or cand[0] < best[0]):
+            best = cand
+    return best
+
+
+def _nearest_whole(
     host: str, popular: set[str],
 ) -> tuple[int, str] | None:
     best: tuple[int, str] | None = None
@@ -291,8 +332,12 @@ def _walk_sources(target: Path, *, max_depth: int) -> Iterable[Path]:
         if len(cur.parts) - root_depth >= max_depth:
             dirnames[:] = []
         else:
-            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
-        for fn in filenames:
+        # Sorted so evidence/walk order is filesystem-independent
+        # (parity with reachability._walker's determinism rule).
+            dirnames[:] = sorted(
+                d for d in dirnames if d not in _SKIP_DIRS
+            )
+        for fn in sorted(filenames):
             if any(fn.endswith(ext) for ext in _EXTENSIONS) or fn in ("Dockerfile", "Containerfile"):
                 yield cur / fn
 
@@ -314,34 +359,6 @@ def _is_test_file(path: Path, target: Path) -> bool:
     except ValueError:
         rel = path
     return any(p in _TEST_DIR_NAMES for p in rel.parts)
-
-
-def _stub_dep(manifest: Manifest | None, src: Path) -> Dependency:
-    """Synthesise a Dependency row for the finding's required field.
-
-    Domain typosquats aren't tied to a specific dep — they're a signal
-    in source files. We attach the finding to the project's first
-    discovered manifest as a representative reference; the file path
-    is captured separately in ``TyposquatDomainFinding.path``.
-    """
-    declared_in = manifest.path if manifest else src
-    return Dependency(
-        ecosystem=manifest.ecosystem if manifest else "Inline",
-        name="<project>",
-        version=None,
-        declared_in=declared_in,
-        scope="main",
-        is_lockfile=False,
-        pin_style=__import__("packages.sca.models",
-                              fromlist=["PinStyle"]).PinStyle.UNKNOWN,
-        direct=True,
-        purl=f"pkg:project/{src.parent.name}",
-        parser_confidence=Confidence(
-            "high",
-            reason="domain typosquat — project-level finding",
-        ),
-        source_kind="manifest" if manifest else "inline",
-    )
 
 
 __all__ = ["TyposquatDomainFinding", "scan_target"]

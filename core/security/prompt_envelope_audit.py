@@ -201,7 +201,44 @@ _ALLOWLIST: tuple[AllowlistEntry, ...] = (
             'to [A-Za-z0-9_.-] — no tag or delimiter can survive.'
         ),
     ),
+    # ----- core/audit/spec_inference.py -----
+    AllowlistEntry(
+        file='core/audit/spec_inference.py',
+        func_name='_infer_negative_specs',
+        attr='source',
+        expr_text="{gap.get('source', '')}",
+        audit_note=(
+            'scratch string for in-process keyword matching '
+            '(combined_lower substring tests) — never rendered into a '
+            'prompt or report'
+        ),
+    ),
+    # ----- packages/checker_synthesis/synthesise.py -----
+    AllowlistEntry(
+        file='packages/checker_synthesis/synthesise.py',
+        func_name='_write_rule',
+        attr='rule_id',
+        expr_text='{rule.rule_id}',
+        audit_note=(
+            'filename construction for the checkers/ rule file on disk, '
+            'not an LLM prompt; rule_id is built by _make_rule_id from '
+            '_slugify-sanitised components'
+        ),
+    ),
     # ----- packages/codeql/autonomous_analyzer.py -----
+    AllowlistEntry(
+        file='packages/codeql/autonomous_analyzer.py',
+        func_name='_artifact_safe_id',
+        attr='start_line',
+        expr_text='{finding.start_line}',
+        audit_note=(
+            'filesystem artifact-stem construction (per-finding '
+            'analysis/exploit/visualization names), not an LLM prompt; '
+            'start_line is the int-typed dataclass field and the '
+            'sibling stem components are sanitised (basename filtered, '
+            'path digested, rule id slash mapped)'
+        ),
+    ),
     AllowlistEntry(
         file='packages/codeql/autonomous_analyzer.py',
         func_name='AutonomousCodeQLAnalyzer.analyze_vulnerability',
@@ -228,84 +265,13 @@ _ALLOWLIST: tuple[AllowlistEntry, ...] = (
     AllowlistEntry(
         file='packages/codeql/autonomous_analyzer.py',
         func_name='AutonomousCodeQLAnalyzer.analyze_finding_autonomous',
-        attr='rule_id',
-        expr_text='{finding.rule_id}',
-        audit_note='filename construction (DataflowVisualizer finding_id), not LLM prompt',
-    ),
-    AllowlistEntry(
-        file='packages/codeql/autonomous_analyzer.py',
-        func_name='AutonomousCodeQLAnalyzer.analyze_finding_autonomous',
-        attr='start_line',
-        expr_text='{finding.start_line}',
-        audit_note='filename construction (DataflowVisualizer finding_id), not LLM prompt',
-    ),
-    AllowlistEntry(
-        file='packages/codeql/autonomous_analyzer.py',
-        func_name='AutonomousCodeQLAnalyzer.analyze_finding_autonomous',
-        attr='rule_id',
-        expr_text='{finding.rule_id}',
+        attr='file_path',
+        expr_text="{_finding_dict['file_path']}",
         audit_note=(
-            'ID passed to validator.validate_exploit (subprocess '
-            'invocation), not LLM'
+            'suppression audit-trail reason (suppressions.jsonl record) '
+            'written via record_suppression — not prompt input; report- '
+            'side renderers sanitise at display'
         ),
-    ),
-    AllowlistEntry(
-        file='packages/codeql/autonomous_analyzer.py',
-        func_name='AutonomousCodeQLAnalyzer.analyze_finding_autonomous',
-        attr='start_line',
-        expr_text='{finding.start_line}',
-        audit_note=(
-            'ID passed to validator.validate_exploit (subprocess '
-            'invocation), not LLM'
-        ),
-    ),
-    AllowlistEntry(
-        file='packages/codeql/autonomous_analyzer.py',
-        func_name='AutonomousCodeQLAnalyzer._refine_exploit_loop',
-        attr='rule_id',
-        expr_text='{finding.rule_id}',
-        audit_note=(
-            'ID passed to validator.validate_exploit (subprocess '
-            'invocation), not LLM'
-        ),
-    ),
-    AllowlistEntry(
-        file='packages/codeql/autonomous_analyzer.py',
-        func_name='AutonomousCodeQLAnalyzer._refine_exploit_loop',
-        attr='start_line',
-        expr_text='{finding.start_line}',
-        audit_note=(
-            'ID passed to validator.validate_exploit (subprocess '
-            'invocation), not LLM'
-        ),
-    ),
-    AllowlistEntry(
-        file='packages/codeql/autonomous_analyzer.py',
-        func_name='AutonomousCodeQLAnalyzer.analyze_finding_autonomous',
-        attr='rule_id',
-        expr_text='{finding.rule_id}',
-        audit_note='filename for analysis JSON output (out_dir / ...), not LLM prompt',
-    ),
-    AllowlistEntry(
-        file='packages/codeql/autonomous_analyzer.py',
-        func_name='AutonomousCodeQLAnalyzer.analyze_finding_autonomous',
-        attr='start_line',
-        expr_text='{finding.start_line}',
-        audit_note='filename for analysis JSON output (out_dir / ...), not LLM prompt',
-    ),
-    AllowlistEntry(
-        file='packages/codeql/autonomous_analyzer.py',
-        func_name='AutonomousCodeQLAnalyzer.analyze_finding_autonomous',
-        attr='rule_id',
-        expr_text='{finding.rule_id}',
-        audit_note='filename / artifact identifier, not LLM prompt',
-    ),
-    AllowlistEntry(
-        file='packages/codeql/autonomous_analyzer.py',
-        func_name='AutonomousCodeQLAnalyzer.analyze_finding_autonomous',
-        attr='start_line',
-        expr_text='{finding.start_line}',
-        audit_note='filename / artifact identifier, not LLM prompt',
     ),
     # ----- packages/codeql/dataflow_validator.py -----
     AllowlistEntry(
@@ -338,18 +304,7 @@ _ALLOWLIST: tuple[AllowlistEntry, ...] = (
             'solver output, same provenance as smt_result.reasoning'
         ),
     ),
-    # ----- packages/hypothesis_validation/runner.py (_evaluate_with_refinement) -----
-    AllowlistEntry(
-        file='packages/hypothesis_validation/runner.py',
-        func_name='_evaluate_with_refinement',
-        attr='summary',
-        expr_text='{evidence.summary}',
-        audit_note=(
-            'exception-path return value (verdict, reasoning) for '
-            'operator display; reasoning is not directly fed back into '
-            'an LLM prompt by callers'
-        ),
-    ),
+    # ----- packages/hypothesis_validation/runner.py -----
     AllowlistEntry(
         file='packages/hypothesis_validation/runner.py',
         func_name='_evaluate_with_refinement',
@@ -362,10 +317,6 @@ _ALLOWLIST: tuple[AllowlistEntry, ...] = (
         ),
     ),
     # ----- packages/llm_analysis/agent.py -----
-    # file_path / level / analysis / patch body now route through
-    # output sanitisation into local names before interpolation, so
-    # only the numeric line span remains a direct attribute
-    # interpolation.
     AllowlistEntry(
         file='packages/llm_analysis/agent.py',
         func_name='AutonomousSecurityAgentV2.generate_patch',
@@ -380,16 +331,16 @@ _ALLOWLIST: tuple[AllowlistEntry, ...] = (
         expr_text='{vuln.end_line}',
         audit_note='markdown for disk, not LLM prompt',
     ),
-    # ----- packages/checker_synthesis/synthesise.py -----
+    # ----- packages/llm_analysis/dataflow_validation.py -----
     AllowlistEntry(
-        file='packages/checker_synthesis/synthesise.py',
-        func_name='_write_rule',
-        attr='rule_id',
-        expr_text='{rule.rule_id}',
+        file='packages/llm_analysis/dataflow_validation.py',
+        func_name='reconcile_dataflow_validation',
+        attr='reasoning',
+        expr_text="{v.get('reasoning', '')}",
         audit_note=(
-            'filename construction for the checkers/ rule file on '
-            'disk, not an LLM prompt; rule_id is built by '
-            '_make_rule_id from _slugify-sanitised components'
+            'validation_downgrade_reason analysis-record field — '
+            'consumed by registered report writers that sanitise at '
+            'render, not fed back into a prompt'
         ),
     ),
 )
@@ -452,6 +403,15 @@ def audit_file(path: Path) -> list[Violation]:
             if isinstance(cur, ast.Attribute):
                 return cur.attr
             if isinstance(cur, ast.Subscript):
+                # Dict-subscript read: ``finding["message"]`` is the
+                # dominant repo idiom for finding dicts — the KEY is
+                # the meaningful name. Pre-fix the branch discarded it
+                # and walked to the receiver, fully exempting every
+                # dict-consuming prompt builder. Non-constant keys
+                # keep the receiver walk (``items[0].attr``).
+                sl = cur.slice
+                if isinstance(sl, ast.Constant) and isinstance(sl.value, str):
+                    return sl.value
                 cur = cur.value
                 continue
             if isinstance(cur, ast.NamedExpr):
@@ -464,10 +424,24 @@ def audit_file(path: Path) -> list[Violation]:
                 if _is_sanitised(cur):
                     return None
                 if isinstance(cur.func, ast.Attribute):
+                    # ``.get("key")`` reads: the string KEY is the
+                    # meaningful name, same as the subscript form.
+                    if (cur.func.attr == "get" and cur.args
+                            and isinstance(cur.args[0], ast.Constant)
+                            and isinstance(cur.args[0].value, str)):
+                        return cur.args[0].value
                     # Method call: the receiver carries the taint
                     # (``x.message.strip()`` → ``x.message``).
                     cur = cur.func.value
                     continue
+                # ``getattr(x, "key")``: dynamic spelling of the
+                # attribute read (the sibling writer gate models it).
+                if (isinstance(cur.func, ast.Name)
+                        and cur.func.id == "getattr"
+                        and len(cur.args) >= 2
+                        and isinstance(cur.args[1], ast.Constant)
+                        and isinstance(cur.args[1].value, str)):
+                    return cur.args[1].value
                 return None
             return None
 
@@ -516,6 +490,18 @@ def audit_file(path: Path) -> list[Violation]:
             "UntrustedBlock",
             "wrap_tool_result",
             "wrap_untrusted",
+            # Identifier-grade defence helpers (core/audit/context.py):
+            # flatten + tag-forgery neutralise + non-printable/backtick
+            # escape, and the integral-or-"?" line-number rejection.
+            # Naming them here (rather than riding the unknown-call
+            # fallthrough in _attr_name) lets the ancestor walk in
+            # _is_in_sanitiser_call recognise the compose-then-defend
+            # idiom: f"[{x.get('source')}]" passed WHOLE to the
+            # defence, which must see the composed text precisely
+            # because individually-clean fragments can reassemble a
+            # boundary-tag shape across the composition.
+            "_defend_identifier",
+            "_defend_line",
         }
 
     # Functions whose f-string args are logged/displayed, not sent to
@@ -561,6 +547,21 @@ def audit_file(path: Path) -> list[Violation]:
                 # First enclosing Call settles it — don't keep walking.
                 return (isinstance(func, ast.Attribute)
                         and func.attr in _NON_LLM_CALLS)
+        return False
+
+    def _is_in_sanitiser_call(parent_stack: list[ast.AST]) -> bool:
+        """Return True if the f-string is an ARGUMENT of a known
+        sanitiser call — the compose-then-defend idiom:
+        ``_defend_identifier(f"[{obs.get('source')}]")`` sanitises
+        the COMPOSED text (which is the point: fragments that are
+        individually clean can reassemble a boundary-tag shape across
+        the template's own characters, so the defence must run after
+        composition). Same first-enclosing-Call discipline as
+        ``_is_in_non_llm_call``: an interpolation nested under a
+        NON-sanitiser call still fires."""
+        for parent in reversed(parent_stack):
+            if isinstance(parent, ast.Call):
+                return _is_sanitised(parent)
         return False
 
     def _is_in_envelope_constructor(parent_stack: list[ast.AST]) -> bool:
@@ -658,7 +659,7 @@ def audit_file(path: Path) -> list[Violation]:
                 src = f"<{attr}>"
             violations.append(Violation(
                 file=rel,
-                line=node.lineno,
+                line=node.lineno,  # type: ignore[attr-defined]
                 attr=attr,
                 expr_text=src[:80],
                 func_name=self._qualified_func_name(),
@@ -669,6 +670,7 @@ def audit_file(path: Path) -> list[Violation]:
             if (attr in _UNTRUSTED_ATTRS
                     and not _is_sanitised(node.value)
                     and not _is_in_non_llm_call(self._parent_stack)
+                    and not _is_in_sanitiser_call(self._parent_stack)
                     and not _is_in_envelope_constructor(self._parent_stack)):
                 self._emit(node, attr)
             self.generic_visit(node)
@@ -707,8 +709,16 @@ def audit_file(path: Path) -> list[Violation]:
                             if (attr in _UNTRUSTED_ATTRS
                                     and not _is_sanitised(arg)):
                                 self._emit(arg, attr)
-                # Pattern 2: ``.format(...)`` with kwargs.
+                # Pattern 2: ``.format(...)`` — positional args carry
+                # untrusted reads exactly like kwargs
+                # (``"{} {}".format(f.message, f.snippet)``); pre-fix
+                # only keywords were walked.
                 elif method == "format":
+                    for arg in node.args:
+                        attr = _attr_name(arg)
+                        if (attr in _UNTRUSTED_ATTRS
+                                and not _is_sanitised(arg)):
+                            self._emit(arg, attr)
                     for kw in node.keywords:
                         if kw.value is None:
                             continue

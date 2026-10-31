@@ -141,6 +141,132 @@ def test_pinned_sha_is_full_hex():
 
 
 # ---------------------------------------------------------------------------
+# Family slices (concurrency / integer)
+# ---------------------------------------------------------------------------
+
+_LOCK_FILE = """\
+public class CWE609_Double_Checked_Locking__test_01 {
+    public void bad() throws Throwable {
+        if (instance == null) {
+            synchronized (lock) {
+                if (instance == null) { instance = mk(); }
+            }
+        }
+    }
+
+    public void good() throws Throwable {
+        synchronized (lock) {
+            if (instance == null) { instance = mk(); }
+        }
+    }
+}
+"""
+
+_INT_FILE = """\
+public class CWE190_Integer_Overflow__test_01 {
+    public void bad() throws Throwable {
+        int data = source();
+        sink(data + 1);
+    }
+
+    public void good() throws Throwable {
+        int data = 2;
+        sink(data + 1);
+    }
+}
+"""
+
+
+def _make_family_clone(tmp_path: Path) -> Path:
+    clone = tmp_path / "juliet-fam"
+    lock = clone / "src/testcases/CWE609_Double_Checked_Locking/s01"
+    lock.mkdir(parents=True)
+    (lock / "CWE609_Double_Checked_Locking__test_01.java").write_text(
+        _LOCK_FILE, encoding="utf-8")
+    integer = clone / "src/testcases/CWE190_Integer_Overflow/s01"
+    integer.mkdir(parents=True)
+    (integer / "CWE190_Integer_Overflow__test_01.java").write_text(
+        _INT_FILE, encoding="utf-8")
+    # injection-set dir must stay OUT of the family manifests
+    inj = clone / "src/testcases/CWE89_SQL_Injection/s01"
+    inj.mkdir(parents=True)
+    (inj / "CWE89_SQL_Injection__test_01.java").write_text(
+        _GOOD_FILE, encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(clone)], check=True)
+    subprocess.run(["git", "-C", str(clone), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(clone), "-c", "user.email=t@example.org",
+         "-c", "user.name=t", "commit", "-qm", "fixture"], check=True)
+    return clone
+
+
+class TestFamilies:
+    def _generate(self, tmp_path, monkeypatch, family):
+        clone = _make_family_clone(tmp_path)
+        head = subprocess.run(
+            ["git", "-C", str(clone), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True).stdout.strip()
+        monkeypatch.setattr("core.recall.juliet_manifest."
+                            "JULIET_PINNED_SHA", head)
+        return generate_manifest(clone, family=family), head
+
+    def test_concurrency_slice(self, tmp_path, monkeypatch):
+        manifest, head = self._generate(tmp_path, monkeypatch,
+                                        "concurrency")
+        assert manifest["name"] == "juliet-java-concurrency"
+        assert manifest["notes"]["family"] == "concurrency"
+        assert [e["cwe"] for e in manifest["expected"]] == ["CWE-609"]
+        assert manifest["expected"][0]["provenance"]["kind"] == "benchmark"
+        manifest["target"]["pinned_sha"] = head
+        parsed = parse_manifest(json.loads(json.dumps(manifest)))
+        assert parsed.profile == "scan-codeql"
+
+    def test_integer_slice(self, tmp_path, monkeypatch):
+        manifest, _ = self._generate(tmp_path, monkeypatch, "integer")
+        assert manifest["name"] == "juliet-java-integer"
+        assert [e["cwe"] for e in manifest["expected"]] == ["CWE-190"]
+        # the injection dir present in the clone must not leak in
+        ids = {e["id"] for e in manifest["expected"]}
+        assert not any("SQL_Injection" in i for i in ids)
+
+    def test_default_family_is_the_injection_set(self, tmp_path,
+                                                 monkeypatch):
+        manifest, _ = self._generate(tmp_path, monkeypatch, "injection")
+        assert manifest["name"] == "juliet-java-holdout"
+        assert [e["cwe"] for e in manifest["expected"]] == ["CWE-89"]
+        # byte-identity contract: the default slice's manifest layout
+        # predates the family field, so it must carry NO family stamp
+        # (downstream identity stamps hash regenerated manifests)
+        assert "family" not in manifest["notes"]
+
+    def test_unknown_family_refused(self, tmp_path):
+        clone = _make_family_clone(tmp_path)
+        with pytest.raises(JulietManifestError, match="unknown"):
+            generate_manifest(clone, family="nope")
+        with pytest.raises(JulietManifestError, match="unknown"):
+            generate_manifest_b(clone, family="nope")
+
+    def test_family_doctrine_notes_present(self, tmp_path, monkeypatch):
+        manifest, _ = self._generate(tmp_path, monkeypatch,
+                                     "concurrency")
+        assert "never used to tune" in manifest["notes"][
+            "holdout_doctrine"]
+
+    def test_cli_family_flag(self, tmp_path, monkeypatch):
+        clone = _make_family_clone(tmp_path)
+        head = subprocess.run(
+            ["git", "-C", str(clone), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True).stdout.strip()
+        monkeypatch.setattr("core.recall.juliet_manifest."
+                            "JULIET_PINNED_SHA", head)
+        out = tmp_path / "fam.json"
+        rc = jm_main(["--clone-dir", str(clone), "--out", str(out),
+                      "--family", "integer"])
+        assert rc == 0
+        assert json.loads(out.read_text())["name"] == "juliet-java-integer"
+
+
+# ---------------------------------------------------------------------------
 # Juliet-B (multi-file variants)
 # ---------------------------------------------------------------------------
 
@@ -285,6 +411,8 @@ class TestGenerateB:
         manifest, head = self._manifest(tmp_path, monkeypatch)
         assert "LEDGER-FRESH" in manifest["notes"]["ledger"]
         assert manifest["profile"] == "scan-codeql"
+        # default slice carries no family stamp (byte-identity rule)
+        assert "family" not in manifest["notes"]
         manifest["target"]["pinned_sha"] = head
         parsed = parse_manifest(json.loads(json.dumps(manifest)))
         assert parsed.name == "juliet-b-multifile"
@@ -302,3 +430,30 @@ class TestGenerateB:
         assert rc == 0
         assert "refused" in capsys.readouterr().out
         assert json.loads(out.read_text())["name"] == "juliet-b-multifile"
+
+
+class TestSingleLetterLeftoverCounted:
+    def test_leftover_refused_by_reason(self, tmp_path, monkeypatch):
+        """A chain with only one letter present is not a multi-file
+        case — it must join the refused-by-reason counts, never drop
+        silently (the module's coverage-honesty posture)."""
+        clone = _make_clone_b(tmp_path)
+        d = clone / "src/testcases/CWE89_SQL_Injection/s01"
+        (d / "CWE89_SQL_Injection__t_99a.java").write_text(
+            _CHAIN_A, encoding="utf-8")
+        subprocess.run(["git", "-C", str(clone), "add", "-A"],
+                       check=True)
+        subprocess.run(
+            ["git", "-C", str(clone), "-c", "user.email=t@example.org",
+             "-c", "user.name=t", "commit", "-qm", "leftover"],
+            check=True)
+        head = subprocess.run(
+            ["git", "-C", str(clone), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True).stdout.strip()
+        monkeypatch.setattr(
+            "core.recall.juliet_manifest.JULIET_PINNED_SHA", head)
+        manifest = generate_manifest_b(clone)
+        refused = manifest["notes"]["refused"]
+        assert refused.get("single_letter_chain_leftover", 0) >= 1
+        ids = {e["id"] for e in manifest["expected"]}
+        assert "CWE89_SQL_Injection__t_99" not in ids

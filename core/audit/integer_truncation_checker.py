@@ -17,7 +17,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 _APPLICABLE_CWES = frozenset({"CWE-190", "CWE-195", "CWE-680"})
 
@@ -48,8 +49,8 @@ class TruncationFinding:
     evidence: str = ""
     confidence: str = "medium"
 
-    def to_dict(self) -> Dict[str, Any]:
-        d: Dict[str, Any] = {
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
             "function": self.function,
             "wide_var": self.wide_var,
             "narrow_var": self.narrow_var,
@@ -88,7 +89,7 @@ _VERY_NARROW_TYPES = frozenset({
     "uint8", "byte", "BYTE",
 })
 
-_TYPE_WIDTHS: Dict[str, int] = {}
+_TYPE_WIDTHS: dict[str, int] = {}
 for _t in _VERY_NARROW_TYPES:
     _TYPE_WIDTHS[_t] = 8
 for _t in _NARROW_TYPES:
@@ -108,12 +109,21 @@ _IMPLICIT_NARROW_DECL_RE = re.compile(
     + r')\s+(\w+)\s*=\s*(\w+)\s*;',
 )
 
+# Cast and argument spans are bounded: unbounded, a crafted body
+# that repeats the pattern's own head inside such a span re-scans
+# the remainder from every head occurrence — quadratic in the body
+# length. A cast is a type name (256 chars is generous) and 1000
+# chars sits far above any real argument list; beyond the bound the
+# site stops matching rather than scanning without bound. The
+# leading \b drops mid-word starts (never real assignments).
 _ALLOC_RE = re.compile(
-    r'(\w+)\s*=\s*(?:\([^)]*\)\s*)?(malloc|calloc|realloc)\s*\(([^)]+)\)',
+    r'\b(\w+)\s*=\s*(?:\([^)]{0,256}\)\s*)?'
+    r'(malloc|calloc|realloc)\s*\(([^)]{1,1000})\)',
 )
 
 _COPY_RE = re.compile(
-    r'\b(memcpy|memmove|bcopy)\s*\(([^,]+),([^,]+),([^)]+)\)',
+    r'\b(memcpy|memmove|bcopy)\s*'
+    r'\(([^,]{1,1000}),([^,]{1,1000}),([^)]{1,1000})\)',
 )
 
 _RECV_SOURCES = frozenset({
@@ -122,7 +132,7 @@ _RECV_SOURCES = frozenset({
 })
 
 _NETWORK_PARSE_RE = re.compile(
-    r'\b(\w+)\s*=\s*(?:\([^)]*\)\s*)?(?:'
+    r'\b(\w+)\s*=\s*(?:\([^)]{0,256}\)\s*)?(?:'
     + '|'.join(re.escape(s) for s in sorted(_RECV_SOURCES, key=len, reverse=True))
     + r')\s*\(',
 )
@@ -134,7 +144,8 @@ _PARAM_RE = re.compile(
 )
 
 _BYTE_ORDER_RE = re.compile(
-    r'\b(\w+)\s*=\s*(?:\([^)]*\)\s*)?(?:ntohs|ntohl|ntohll|htons|htonl)\s*\(',
+    r'\b(\w+)\s*=\s*(?:\([^)]{0,256}\)\s*)?'
+    r'(?:ntohs|ntohl|ntohll|htons|htonl)\s*\(',
 )
 
 
@@ -156,26 +167,48 @@ def _is_network_tainted(source: str, var_name: str) -> bool:
     return False
 
 
+def narrowing_sites_present(
+    source: str, xref_source: str | None = None,
+) -> bool:
+    """Whether any narrowing site (explicit cast or implicit narrow
+    declaration) appears in the checker's search space — the
+    structural precondition ``check_integer_truncation`` requires
+    before it can test anything. Consulted by the sweep wrapper so a
+    model miss maps to inconclusive, never refuted."""
+    search_source = source
+    if xref_source:
+        search_source = source + "\n" + xref_source
+    return bool(
+        _EXPLICIT_CAST_RE.search(search_source)
+        or _IMPLICIT_NARROW_DECL_RE.search(search_source)
+    )
+
+
 def check_integer_truncation(
     function_name: str,
     source: str,
     *,
     file: str = "",
     xref_source: str | None = None,
-) -> List[TruncationFinding]:
+) -> list[TruncationFinding]:
     """Analyse one decompiled function for integer truncation bugs.
 
     When *xref_source* is provided, extends the search for alloc/copy
     patterns into caller/callee decompilation (cross-function chains).
     """
-    findings: List[TruncationFinding] = []
+    findings: list[TruncationFinding] = []
     primary_len = len(source)
 
     search_source = source
     if xref_source:
-        search_source = source + xref_source
+        # Newline sentinel: without it the primary's last line glues
+        # to the xref blob's first and identifiers merge across the
+        # seam — a truncated decompile ending mid-token minted a
+        # cast/alloc/copy chain that exists in neither function
+        # (same seam fixed in proto_length_checker).
+        search_source = source + "\n" + xref_source
 
-    narrows: Dict[str, Dict[str, str]] = {}
+    narrows: dict[str, dict[str, str]] = {}
 
     for m in _EXPLICIT_CAST_RE.finditer(search_source):
         narrow_var = m.group(1)
@@ -201,7 +234,7 @@ def check_integer_truncation(
     if not narrows:
         return findings
 
-    allocs: Dict[str, Dict[str, Any]] = {}
+    allocs: dict[str, dict[str, Any]] = {}
     for m in _ALLOC_RE.finditer(search_source):
         buf_var = m.group(1).strip()
         alloc_fn = m.group(2)

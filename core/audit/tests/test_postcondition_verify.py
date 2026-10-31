@@ -540,3 +540,77 @@ class TestSiblingSanitizerStrength:
             {"name": "b", "file": "f.py"},
         ]
         assert check_sibling_sanitizer_strength(siblings) == []
+
+
+class TestTailIndexEquivalence:
+    """The per-run tail index must resolve exactly like the linear
+    endswith(":name") / key-equality scans it replaced."""
+
+    def _reference_find_key(self, name, index):
+        # The replaced linear scan, kept as the equivalence oracle.
+        for key in index:
+            if key.endswith(f":{name}") or key == name:
+                return key
+        return None
+
+    def test_index_matches_linear_scan(self):
+        from core.audit.postcondition_verify import _build_tail_index
+
+        keys = {
+            "a.py:foo": 1,
+            "b.py:foo": 2,      # later duplicate tail — first must win
+            "bar": 3,           # bare key, no colon
+            "c.py:sub:qux": 4,  # multi-segment key
+        }
+        idx = _build_tail_index(keys, include_full_keys=True)
+        for name in ("foo", "bar", "qux", "sub:qux", "a.py:foo",
+                     "c.py:sub:qux", "missing", "py:foo"):
+            assert idx.get(name) == self._reference_find_key(name, keys), name
+
+    def test_lookup_summary_with_and_without_index(self):
+        from core.audit.postcondition_verify import (
+            _build_tail_index,
+            _lookup_summary,
+        )
+
+        summaries = {
+            "a.py:sanitize": SimpleNamespace(summary="first"),
+            "b.py:sanitize": SimpleNamespace(summary="second"),
+            "plain": SimpleNamespace(summary="bare"),
+        }
+        idx = _build_tail_index(summaries)
+        for name, file_path in (
+            ("sanitize", "b.py"),   # exact file:function hit
+            ("sanitize", ""),       # tail scan — first key wins
+            ("sanitize", "x.py"),   # miss on exact, tail fallback
+            ("plain", ""),          # bare-name fallback
+            ("absent", ""),
+        ):
+            assert _lookup_summary(name, file_path, summaries, idx) is \
+                _lookup_summary(name, file_path, summaries), (name, file_path)
+
+    def test_verify_resolves_callee_via_index(self):
+        # End-to-end: a consumer whose callee matches only by tail
+        # name still yields the ordering violation through the
+        # prebuilt index (sanitise, then a transform that can undo it).
+        gaps = [
+            {"name": "sanitize_html", "file": "san.py",
+             "return_type": "str"},
+            {"name": "consumer", "file": "app.py",
+             "callees": ["sanitize_html", "normalize_unicode"]},
+        ]
+        summaries = {
+            "san.py:sanitize_html": SimpleNamespace(
+                summary="strips script tags", postconditions=[],
+                preconditions=[],
+            ),
+        }
+        result = verify_postconditions(
+            gaps, summaries,
+            call_graphs={"app.py": SimpleNamespace(calls=[])},
+        )
+        ordering = [
+            v for v in result.violations if v.violation_kind == "ordering"
+        ]
+        assert len(ordering) == 1
+        assert ordering[0].function == "consumer"

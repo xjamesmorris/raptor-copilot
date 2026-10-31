@@ -24,11 +24,11 @@ from __future__ import annotations
 
 import argparse
 import logging
+import json
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from core.json import dumps_display
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -158,7 +158,7 @@ def main(argv: Sequence[str]) -> int:
     from core.cve import EpssClient, KevClient
     from core.json import JsonCache
 
-    from .. import SCA_CACHE_ROOT
+    from .. import sca_cache_root
     from .. import default_client as _sca_default_http
     from ..osv import OsvClient
     from ..registries.npm import NpmClient
@@ -170,7 +170,7 @@ def main(argv: Sequence[str]) -> int:
     # known-host set augmented by anything the target's Dockerfiles
     # reference.
     http = _sca_default_http(target=target, offline=args.offline)
-    cache_root = Path(args.cache_root) if args.cache_root else SCA_CACHE_ROOT
+    cache_root = Path(args.cache_root) if args.cache_root else sca_cache_root()
     # ``--no-cache`` never passes ``cache=None`` into the feed clients:
     # OsvClient / KevClient / EpssClient require a real JsonCache and
     # would crash on first use — the crash used to be swallowed by the
@@ -226,7 +226,10 @@ def main(argv: Sequence[str]) -> int:
         return 3
 
     if args.emit_json:
-        sys.stdout.write(dumps_display(_report_to_dict(report), indent=2))
+        # ensure_ascii: terminal JSON lane — C1 controls pass raw
+        # without it; stays valid JSON for parsing consumers.
+        sys.stdout.write(json.dumps(_report_to_dict(report), indent=2,
+                                    ensure_ascii=True, default=str))
         sys.stdout.write("\n")
     elif args.pr_comment:
         from .pr_comment import render_pr_comment as _render_pr

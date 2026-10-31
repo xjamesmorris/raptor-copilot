@@ -61,9 +61,10 @@ class FakeFinding:
 
 
 class FakeSemgrepResult:
-    def __init__(self, findings=(), errors=()):
+    def __init__(self, findings=(), errors=(), files_examined=()):
         self.findings = list(findings)
         self.errors = list(errors)
+        self.files_examined = list(files_examined)
 
 
 _MACRO_C = """\
@@ -92,10 +93,17 @@ def _repo(tmp_path: Path, main_text: str) -> Path:
 
 
 def _mock_plain_no_findings(monkeypatch):
-    """Plain pass sees nothing (macro hides the sink)."""
+    """Plain pass sees nothing (macro hides the sink).
+
+    The target rides in ``files_examined`` (paths.scanned), as the
+    real runner reports for a completed scan — a zero-finding scan
+    without that witness degrades to inconclusive instead of refuting.
+    """
     monkeypatch.setattr(
         "packages.semgrep.runner.run_rule",
-        lambda target_file, config, **kw: FakeSemgrepResult(),
+        lambda target_file, config, **kw: FakeSemgrepResult(
+            files_examined=[str(target_file)],
+        ),
     )
     monkeypatch.setattr("packages.semgrep.runner.is_available", lambda: True)
 
@@ -359,7 +367,7 @@ def test_integration_real_preprocessor(tmp_path, sandbox_spy, monkeypatch):
         # scratch copy (prefix "expanded_").
         if Path(str(target_file)).name.startswith("expanded_"):
             return FakeSemgrepResult(findings=[FakeFinding(line=exp_line)])
-        return FakeSemgrepResult()
+        return FakeSemgrepResult(files_examined=[str(target_file)])
 
     monkeypatch.setattr("packages.semgrep.runner.run_rule", fake_run_rule)
     monkeypatch.setattr("packages.semgrep.runner.is_available", lambda: True)

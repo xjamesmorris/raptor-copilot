@@ -14,10 +14,19 @@ from typing import Any
 
 from core.json import load_json
 
+from .caps import DEFAULT_CAP, cap_elements, truncation_marker_lines
 from .sanitize import sanitize as _sanitize
 from .sanitize import sanitize_id as _sid
 
 _C0_RE = re.compile(r"[\x00-\x09\x0b\x0c\x0e-\x1f\x7f]")
+
+# Shared flow_trace rationale (see packages.diagram.caps): every
+# ingested list comes from an LLM/run artifact with no upstream bound.
+_MAX_ELEMENTS = DEFAULT_CAP
+# Per-entry forward-reachable name lists: the substrate caps these at
+# 10 by default, so 50 only fires on hand-edited or hostile artifacts;
+# the existing "Showing x/y" comment discloses any shortfall.
+_MAX_FORWARD_NAMES = 50
 
 
 def _addr(v: Any) -> str:
@@ -89,8 +98,8 @@ def _location_text(item: dict[str, Any], *, compact_binary: bool = False) -> str
 
 def _is_remote_surface(data: dict[str, Any]) -> bool:
     meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
-    app_type = str(meta.get("app_type") or meta.get("target_kind") or "").lower()
-    target = str(meta.get("target") or "").lower()
+    app_type = str(meta.get("app_type") or meta.get("target_kind") or "").lower()  # type: ignore[union-attr]
+    target = str(meta.get("target") or "").lower()  # type: ignore[union-attr]
     return (
         app_type in {"http_server", "web_app", "web_service", "web"}
         or "httpd-" in target
@@ -100,7 +109,7 @@ def _is_remote_surface(data: dict[str, Any]) -> bool:
 
 def _is_blackbox_binary(data: dict[str, Any]) -> bool:
     meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
-    return str(meta.get("analysis_mode") or "").lower() == "blackbox_binary"
+    return str(meta.get("analysis_mode") or "").lower() == "blackbox_binary"  # type: ignore[union-attr]
 
 
 def _is_support_tool(item: dict[str, Any]) -> bool:
@@ -121,6 +130,12 @@ def _filter_support_tool_sinks(
     sink_details: list[dict[str, Any]],
     unchecked_flows: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Drop local CLI/support-tool sinks from remote-server diagrams.
+
+    Apache httpd, for example, ships `support/ab.c`. Those sinks are
+    useful when reviewing bundled tools, but they are misleading inside a
+    remote HTTP server attack-surface map.
+    """
     if not _is_remote_surface(data):
         return sink_details, unchecked_flows
 
@@ -178,6 +193,16 @@ def generate(data: dict[str, Any]) -> str:
         sink_details,
         unchecked_flows,
     )
+
+    entry_points, dropped_eps = cap_elements(entry_points, _MAX_ELEMENTS)
+    boundary_details, dropped_tbs = cap_elements(
+        boundary_details, _MAX_ELEMENTS)
+    sink_details, dropped_sinks = cap_elements(sink_details, _MAX_ELEMENTS)
+    unchecked_flows, dropped_uf = cap_elements(
+        unchecked_flows, _MAX_ELEMENTS)
+    candidate_flows, dropped_cf = cap_elements(
+        candidate_flows, _MAX_ELEMENTS)
+
     candidate_function_nodes: dict[str, dict[str, Any]] = {}
     entry_by_address = {
         _addr(ep.get("address")): _sid(ep.get("id", "EP-?"))
@@ -253,21 +278,23 @@ def generate(data: dict[str, Any]) -> str:
         emitted_edges.add(edge)
         lines.append(edge)
 
+    # EP → covering-TB index, built once: the TB→SINK join below used
+    # to re-scan boundary_details and re-parse every ``covers`` list
+    # per (sink, reaches_from-entry) pair — an O(S·R·B·C) join that
+    # dominated render time on large maps.
+    ep_to_tbs: dict[str, list[str]] = {}
     for tb in boundary_details:
         tb_id = _sid(tb.get("id", "TB-?"))
         for ep_id in [_sid(e) for e in _id_list(tb.get("covers"))]:
             add_edge(f"    {ep_id} --> {tb_id}")
             covered_eps.add(ep_id)
+            ep_to_tbs.setdefault(ep_id, []).append(tb_id)
 
     # -- Edges: TB → SINK (reaches_from) --
     for sink in sink_details:
         sink_id = _sid(sink.get("id", "SINK-?"))
         for ep_id in [_sid(e) for e in _id_list(sink.get("reaches_from"))]:
-            # Find which TB covers this EP
-            tb_for_ep = [
-                _sid(tb.get("id")) for tb in boundary_details
-                if ep_id in [_sid(e) for e in _id_list(tb.get("covers"))]
-            ]
+            tb_for_ep = ep_to_tbs.get(ep_id, [])
             if tb_for_ep:
                 for tb_id in tb_for_ep:
                     add_edge(f"    {tb_id} --> {sink_id}")
@@ -336,6 +363,17 @@ def generate(data: dict[str, Any]) -> str:
         fn_ids = ",".join(_sid(fn.get("id", "")) for fn in candidate_function_nodes.values() if fn.get("id"))
         if fn_ids:
             lines.append(f"    class {fn_ids} candidate")
+
+    lines.extend(truncation_marker_lines(
+        "TRUNC_EP", dropped_eps, "entry points", _MAX_ELEMENTS))
+    lines.extend(truncation_marker_lines(
+        "TRUNC_TB", dropped_tbs, "trust boundaries", _MAX_ELEMENTS))
+    lines.extend(truncation_marker_lines(
+        "TRUNC_SINK", dropped_sinks, "sinks", _MAX_ELEMENTS))
+    lines.extend(truncation_marker_lines(
+        "TRUNC_UF", dropped_uf, "unchecked flows", _MAX_ELEMENTS))
+    lines.extend(truncation_marker_lines(
+        "TRUNC_CF", dropped_cf, "candidate flows", _MAX_ELEMENTS))
 
     return "\n".join(lines)
 
@@ -412,8 +450,13 @@ def _render_one_entry_forward(_ep: dict[str, Any], fr: dict[str, Any]) -> str:
 
     internal_names = list(fr.get("internal_names") or [])
     external_names = list(fr.get("external_names") or [])
+    # Counts BEFORE the render cap: the "Showing x/y" comment below
+    # then discloses cap-driven shortfalls exactly like substrate-
+    # driven ones.
     int_count = fr.get("internal_count", len(internal_names))
     ext_count = fr.get("external_count", len(external_names))
+    internal_names, _ = cap_elements(internal_names, _MAX_FORWARD_NAMES)
+    external_names, _ = cap_elements(external_names, _MAX_FORWARD_NAMES)
 
     # Internal nodes
     if internal_names:

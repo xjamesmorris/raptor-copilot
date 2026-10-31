@@ -22,10 +22,29 @@ from __future__ import annotations
 
 import logging
 import re
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from core.atomic_fs import write_new_text
+
+from .match import _CONTROL
+
+# Body variant of ``match._CONTROL``: the same class with \t/\n carved
+# out. Decompiled C is multi-line; raw control/bidi bytes are never
+# legal in it (r2's pdc/pdg reproduce string-literal bytes from the
+# hostile binary verbatim), and the .c tree is catted by operators and
+# fed to raptor-study-prep. Regex-level escapes (not Python-decoded
+# literals), matching match._CONTROL's style: the range boundaries
+# stay greppable, and range linters can see the control-char spans
+# are deliberate. Exact-set parity with match._CONTROL minus \t/\n
+# is asserted in tests so the two layers cannot drift.
+_BODY_CONTROL = re.compile(
+    "[\\x00-\\x08\\x0b-\\x1f\\x7f-\\x9f"    # C0 minus \t\n; DEL + C1 (incl. ESC)
+    "\\u200b-\\u200f\\u2028\\u2029"          # zero-width, marks, line/para sep
+    "\\u202a-\\u202e\\u2066-\\u2069"         # bidi embedding/override/isolate
+    "\\ufeff]")                              # zero-width no-break space / BOM
 from .model import REDatabase, REFunction
 
 logger = logging.getLogger(__name__)
@@ -37,7 +56,8 @@ _MAX_SIG_CHARS = 512
 _MAX_NEIGHBORS = 8
 _MAX_TYPE_FIELDS = 64
 #: Hard ceiling on total emitted bytes — a hostile binary within the
-#: 64MiB cache cap must not balloon into an unbounded tree.
+#: shared RE-database cache cap must not balloon into an unbounded
+#: tree.
 _MAX_TREE_BYTES = 256 * 1024 * 1024
 #: Functions per emitted file: large connected components are split
 #: (address order) so study batching and file reads stay bounded.
@@ -48,7 +68,14 @@ TYPES_HEADER = "types.h"
 
 
 def _clip(text: object, limit: int) -> str:
-    s = str(text or "")
+    """Clip AND control/bidi-scrub binary-derived text for emission.
+
+    Shares ``match._CONTROL`` so the layers cannot drift: names land
+    in the decomp-map.json sidecar operators ``jq`` to a terminal, in
+    the .c doc-comment headers, and in the byte-ceiling
+    ``logger.warning`` — the console formatter does no scrubbing of
+    its own, so a hostile ESC/bidi-laden symbol name must die here."""
+    s = _CONTROL.sub(" ", str(text or ""))
     return s if len(s) <= limit else s[:limit] + "…"
 
 
@@ -262,7 +289,9 @@ def _render_function(
         lines.append(" * external (import)")
     lines.append(" */")
     if func.decompilation:
-        lines.append(func.decompilation.rstrip("\n"))
+        # Same scrub class as the header/sidecar fields — the body is
+        # the most attacker-shaped surface of the whole emission.
+        lines.append(_BODY_CONTROL.sub(" ", func.decompilation).rstrip("\n"))
     else:
         sig = _clip(func.signature, _MAX_SIG_CHARS) if func.signature \
             else f"void {name}(void)"
@@ -325,7 +354,9 @@ def _render_types(db: REDatabase) -> str:
     return "\n".join(parts)
 
 
-def write_decomp_tree(db: REDatabase, root: Path) -> DecompTree:
+def write_decomp_tree(
+    db: REDatabase, root: Path, *, conformance: bool = True,
+) -> DecompTree:
     """Write the pseudo-source tree for *db* under *root*.
 
     Idempotent for a given database: file grouping and content are
@@ -333,6 +364,13 @@ def write_decomp_tree(db: REDatabase, root: Path) -> DecompTree:
     database rewrites in place — the sidecar is written LAST so a
     reader never sees a sidecar pointing at files that don't exist
     yet.
+
+    ``conformance`` (default on) measures per-tool parse conformance
+    of the freshly emitted tree — sandboxed tree-sitter + semgrep
+    probe legs — into ``decomp-tree-conformance.json`` beside the
+    sidecar (:mod:`packages.ghidra.decomp_conformance`; the audit
+    report cites it as the sweep denominator). Best-effort: a
+    measurement failure warns and never fails the build.
     """
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
@@ -348,7 +386,16 @@ def write_decomp_tree(db: REDatabase, root: Path) -> DecompTree:
     # that is no longer in the database as if it were live code.
     for old in list(root.glob("g*.c")) + [root / TYPES_HEADER]:
         try:
-            if old.is_file():
+            # lstat, not is_file(): is_file() follows symlinks and is
+            # False for a dangling one, so planted symlinks/FIFOs at
+            # tree names survived the sweep and the write_text below
+            # then followed them. Remove any non-directory entry —
+            # unlink removes a symlink ITSELF, never its target.
+            st = old.lstat()
+        except OSError:
+            continue
+        try:
+            if not stat.S_ISDIR(st.st_mode):
                 old.unlink()
         except OSError:
             logger.warning("could not remove stale tree file %s", old)
@@ -363,8 +410,10 @@ def write_decomp_tree(db: REDatabase, root: Path) -> DecompTree:
     types_text = _render_types(db)
     if db.types:
         if len(types_text.encode("utf-8")) <= budget:
-            (root / TYPES_HEADER).write_text(types_text,
-                                             encoding="utf-8")
+            # Exclusive create (replace unlinks a planted entry
+            # itself; the sweep above already cleared known names).
+            write_new_text(root / TYPES_HEADER, types_text,
+                           replace=True)
             result.files.append(TYPES_HEADER)
             budget -= len(types_text.encode("utf-8"))
         else:
@@ -411,6 +460,10 @@ def write_decomp_tree(db: REDatabase, root: Path) -> DecompTree:
                 "function": _clip(func.name, _MAX_NAME_CHARS),
                 "address": func.address
                 if isinstance(func.address, int) else None,
+                # Normalized identity minted at the import seam;
+                # additive — absent on base-less producers.
+                **({"fid": func.fid}
+                   if getattr(func, "fid", None) else {}),
                 "start_line": line_no,
                 "end_line": line_no + n_lines - 1,
                 "decompiled": bool(func.decompilation),
@@ -420,7 +473,8 @@ def write_decomp_tree(db: REDatabase, root: Path) -> DecompTree:
         if not chunks:
             continue
         text = "\n".join(chunks)
-        (root / fname).write_text(text, encoding="utf-8")
+        # Exclusive create — see the TYPES_HEADER write above.
+        write_new_text(root / fname, text, replace=True)
         budget = group_budget
         result.files.append(fname)
         result.functions_emitted += len(entries)
@@ -432,6 +486,17 @@ def write_decomp_tree(db: REDatabase, root: Path) -> DecompTree:
     sidecar["truncated"] = result.truncated
     from core.json import save_json
     save_json(root / SIDECAR_NAME, sidecar)
+    if conformance:
+        try:
+            # Module-attribute call so tests can stub the sandboxed
+            # measurement without touching the tree emitter.
+            from . import decomp_conformance
+            decomp_conformance.measure_conformance(root)
+        except Exception:  # noqa: BLE001 — measurement never fails the build
+            logger.warning(
+                "decomp-tree conformance measurement failed",
+                exc_info=True,
+            )
     return result
 
 
@@ -446,11 +511,12 @@ def resolve_citation(
     hostile binary's function count.
     """
     from core.json import load_json
+    from core.json.utils import RE_DATABASE_MAX_BYTES
     sidecar = Path(tree_root) / SIDECAR_NAME
     if not sidecar.is_file():
         return None
     try:
-        data = load_json(sidecar, max_bytes=64 * 1024 * 1024)
+        data = load_json(sidecar, max_bytes=RE_DATABASE_MAX_BYTES)
     except Exception:  # noqa: BLE001 — corrupt sidecar degrades to None
         logger.debug("unreadable decomp sidecar: %s", sidecar,
                      exc_info=True)

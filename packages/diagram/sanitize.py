@@ -2,9 +2,26 @@
 
 import re
 
+from core.security.log_sanitisation import escape_nonprintable
+
 _SAFE_ID_RE = re.compile(r'[^A-Za-z0-9_-]')
+# Dash runs are Mermaid edge tokens (`--`, `---`) — see sanitize_id.
+_DASH_RUN_RE = re.compile(r'-{2,}')
 
 _FENCE_RE = re.compile(r'`{3,}')
+
+#: Cap on sanitized Mermaid node-id length. Churn-prone limit —
+#: rationale in both directions:
+#:
+#: * Not smaller: node ids legally embed compound producer forms
+#:   (``graph-path-<ep>-<sink>``, ``binary-handoff:<escaped>`` at up
+#:   to ~116 chars); every observed honest id is <= 116, so 128 keeps
+#:   all of them byte-identical and never truncates honest output.
+#: * Not larger: node ids land UNQUOTED in Mermaid positions and
+#:   diagrams.md is catted to operator terminals — the charset strip
+#:   already makes the bytes inert, so length is the remaining
+#:   channel, and no renderer or join benefits from ids past 128.
+ID_MAX_LEN = 128
 
 
 def sanitize(text: str, max_len: int | None = None) -> str:
@@ -35,6 +52,14 @@ def sanitize(text: str, max_len: int | None = None) -> str:
         .replace("\u2028", " ")
         .replace("\u2029", " ")
     )
+    # Control/bidi bytes become inert \xHH escapes at this chokepoint —
+    # diagrams.md is catted to operator terminals, and some sections
+    # (attack-paths headings and self-fenced blocks) do not pass
+    # through the renderer's last-hop `_fence`. Escaping here closes
+    # the channel for every generator at once. Runs BEFORE the
+    # fence-break ZWSP insertion below, which must stay raw
+    # (escape_nonprintable would turn it into a visible literal).
+    result = escape_nonprintable(result)
     # Fence-break defence: diagram text is embedded inside the
     # renderer's ```mermaid fences (and attack-path headings sit in the
     # surrounding markdown). A 3+ backtick run in a label sourced from
@@ -56,10 +81,23 @@ def sanitize_id(node_id: str) -> str:
     ID can inject arbitrary Mermaid directives including click callbacks
     that execute JavaScript when rendered in a browser.
 
-    Strips everything except [A-Za-z0-9_-].
+    Strips everything except [A-Za-z0-9_-], then collapses dash RUNS
+    to a single dash: `--`/`---` are Mermaid EDGE tokens even in node
+    position, so an id like `A---B` would parse as an edge between
+    phantom nodes A and B and inject spurious topology into the
+    rendered graph. A single `-` inside an id is inert.
+
+    Finally truncates to ID_MAX_LEN — a hostile producer's flood id
+    is charset-inert after the strip but would otherwise survive
+    length-unbounded into diagrams.md. Truncation runs AFTER the dash
+    collapse (removing a suffix cannot create a new dash run), and
+    truncation collisions surface via detect_id_collisions, which
+    groups by this function's output.
     """
     sanitized = _SAFE_ID_RE.sub('_', str(node_id))
-    return sanitized if sanitized.strip('_') else "node"
+    sanitized = _DASH_RUN_RE.sub('-', sanitized)
+    sanitized = sanitized[:ID_MAX_LEN]
+    return sanitized if sanitized.strip('_-') else "node"
 
 
 def detect_id_collisions(raw_ids) -> list[tuple[str, list[str]]]:

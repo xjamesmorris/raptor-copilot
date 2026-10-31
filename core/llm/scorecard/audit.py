@@ -31,6 +31,8 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
 from core.json import dumps_artifact
+from core.llm.scorecard._render import scrub_cell
+from core.llm.scorecard.paths import default_scorecard_path
 from core.llm.scorecard.scorecard import (
     ALL_EVENT_TYPES,
     EventType,
@@ -42,7 +44,11 @@ if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
 
 
-DEFAULT_PATH = Path("out/llm_scorecard.json")
+# Shared resolver (RAPTOR_SCORECARD_PATH override → RAPTOR_DIR-anchored
+# → relative fallback): the audit must read the SAME ledger analysis
+# runs write, regardless of the invoking cwd. Resolved lazily at each
+# entry point, NOT frozen at import — an env override set after import
+# (in-process callers, some test orders) must still win.
 
 # Sample-count thresholds reported in the cell-count histogram. N=10 is
 # the existing scorecard's ``sample_size_floor`` (where ``learning`` ends
@@ -93,6 +99,17 @@ class AuditReport:
     primary_event_type: str
     verdict: str  # "green" | "amber" | "red" | "no-data"
     verdict_reason: str
+    # True when the sidecar failed HMAC verification under a usable
+    # key (tamper-or-legacy): the raw walk's content was discarded,
+    # mirroring the stats view's demotion. Additive field — JSON
+    # consumers tolerate extra keys.
+    sidecar_demoted: bool = False
+    # True when the integrity key itself was unusable: verification
+    # could not run at all, and the counts above include UNVERIFIED
+    # sidecar content (the introspection clamp, mirroring
+    # ``get_stats()``). Additive field — JSON consumers tolerate
+    # extra keys.
+    key_unusable: bool = False
 
 
 def _empty_event_summary(event_type: str) -> EventTypeSummary:
@@ -153,12 +170,22 @@ def _load_raw(path: Path) -> dict | None:
         raise SystemExit(msg) from exc
 
 
-def audit(path: Path = DEFAULT_PATH) -> AuditReport:
+def audit(path: Path | None = None) -> AuditReport:
     """Compute the audit report for the scorecard at ``path``.
 
     Pure function modulo file IO — given identical input, output is
-    identical. No locking, no mutation.
+    identical. No mutation; the stats half does take the shared read
+    flock (``ModelScorecard.get_stats``), while the raw event walk
+    reads the file directly — both halves apply the SAME integrity
+    demotion (see the gate below), so a sidecar that fails
+    verification under a usable key contributes to neither.
+
+    ``path=None`` resolves through the shared resolver at CALL time so
+    a ``RAPTOR_SCORECARD_PATH`` override set after import still wins.
     """
+    if path is None:
+        path = default_scorecard_path()
+    from core.llm.scorecard import integrity
     raw = _load_raw(path)
     if raw is None or not isinstance(raw, dict):
         return AuditReport(
@@ -177,9 +204,34 @@ def audit(path: Path = DEFAULT_PATH) -> AuditReport:
                 if raw is None
                 else f"scorecard is not a JSON object at {path}"
             ),
+            # The key state is a property of the INSTALL, not the
+            # file — a no-data report must not claim a healthy key
+            # via the dataclass default when the key is unusable.
+            key_unusable=not integrity.key_usable(),
         )
 
-    schema_version = raw.get("version")
+    # Consistency note: the raw walk below and the stats view read
+    # the same same-user-writable file at two instants; a swap between
+    # them can yield halves describing different documents. Both
+    # halves demote independently (integrity holds either way) — the
+    # report is best-effort observability, not a single-snapshot view.
+    #
+    # Integrity gate for the RAW half of the report. The stats view
+    # below verifies through ``ModelScorecard`` and discards unverified
+    # content; reading the sidecar directly must not reopen that door —
+    # the raw walk's event-type keys (and ``version``) are otherwise
+    # attacker-chosen bytes from a same-user forger that end up counted
+    # and rendered. Mirror the scorecard's demotion semantics exactly:
+    # verified → full raw walk; unverified under a USABLE key
+    # (tamper-or-legacy) → discard; unusable key → operator-side
+    # condition, content stays readable for introspection, matching
+    # ``get_stats()``'s key-unusable clamp.
+    key_usable = integrity.key_usable()
+    sidecar_demoted = (
+        not integrity.verify(raw, integrity.extract_token(raw))
+        and key_usable
+    )
+    schema_version = None if sidecar_demoted else raw.get("version")
 
     # Use ``ModelScorecard.get_stats()`` for the per-cell view — it handles
     # the v2 age-bucket flattening and the migration path. The audit cares
@@ -232,7 +284,8 @@ def audit(path: Path = DEFAULT_PATH) -> AuditReport:
     # silently dropped. Types already summarised above are skipped so
     # nothing double-counts.
     raw_only: set[str] = set()
-    for event_type, n in _iter_raw_event_counts(raw):
+    raw_events = () if sidecar_demoted else _iter_raw_event_counts(raw)
+    for event_type, n in raw_events:
         if event_type in event_summaries and event_type not in raw_only:
             continue  # already summarised via the stats view
         raw_only.add(event_type)
@@ -275,7 +328,19 @@ def audit(path: Path = DEFAULT_PATH) -> AuditReport:
     # populated only via ``cheap_short_circuit`` would look like red rather
     # than no-data.
     cells_with_data = primary.cells_with_any_data
-    if cells_with_data == 0:
+    if sidecar_demoted:
+        # The stats view discarded the same content, so the counts
+        # above are (near-)empty either way — but the REASON must name
+        # the integrity failure, not masquerade as a producer that
+        # never ran.
+        verdict = "no-data"
+        reason = (
+            "sidecar failed integrity verification (missing or invalid "
+            "provenance token) — its content is demoted, not counted. "
+            "Re-bless genuine pre-MAC history with: "
+            "raptor-llm-scorecard adopt"
+        )
+    elif cells_with_data == 0:
         verdict = "no-data"
         reason = (
             f"no cells carry any {PRIMARY_EVENT_TYPE} events; the panel "
@@ -320,6 +385,8 @@ def audit(path: Path = DEFAULT_PATH) -> AuditReport:
         primary_event_type=PRIMARY_EVENT_TYPE,
         verdict=verdict,
         verdict_reason=reason,
+        sidecar_demoted=sidecar_demoted,
+        key_unusable=not key_usable,
     )
 
 
@@ -330,11 +397,23 @@ def audit(path: Path = DEFAULT_PATH) -> AuditReport:
 
 def render_markdown(report: AuditReport) -> str:
     """Operator-facing markdown report. Tables paste cleanly into issues
-    and notebooks."""
+    and notebooks.
+
+    event_type / decision_class / schema_version are read from the
+    sidecar WITHOUT HMAC verification (`_load_raw` bypasses
+    ModelScorecard on purpose) — a same-user forger picks those bytes,
+    so each is escaped and bounded before it reaches the terminal,
+    and in-slot markdown structure (pipes, backticks) is entity-
+    escaped so a forged cell cannot mint table columns in the pasted
+    report (the shared ``scrub_cell`` discipline).
+    """
+    def _cell(value: object) -> str:
+        return scrub_cell(value)
+
     lines: list[str] = []
     lines.append(f"# Scorecard audit — `{report.scorecard_path}`")
     lines.append("")
-    lines.append(f"Schema version: `{report.schema_version}`")
+    lines.append(f"Schema version: `{_cell(report.schema_version)}`")
     lines.append(f"Distinct models: **{report.total_models}**")
     lines.append(
         f"Distinct decision classes: **{report.total_decision_classes}**"
@@ -349,6 +428,18 @@ def render_markdown(report: AuditReport) -> str:
     lines.append("")
     lines.append(report.verdict_reason)
     lines.append("")
+    if report.sidecar_demoted:
+        lines.append(
+            "⚠️ Sidecar content failed integrity verification and was "
+            "excluded from every count above."
+        )
+        lines.append("")
+    if report.key_unusable:
+        lines.append(
+            "⚠️ Integrity key unusable — verification could not run; "
+            "every count above includes unverified sidecar content."
+        )
+        lines.append("")
     lines.append("## Per-event-type coverage")
     lines.append("")
     lines.append(
@@ -363,7 +454,7 @@ def render_markdown(report: AuditReport) -> str:
     )
     for summary in report.event_type_summaries:
         row_parts = [
-            f"| `{summary.event_type}` "
+            f"| `{_cell(summary.event_type)}` "
             f"| {summary.total_cells} "
             f"| {summary.cells_with_any_data} ",
         ]
@@ -382,7 +473,7 @@ def render_markdown(report: AuditReport) -> str:
             "| decision_class | distinct models | median obs/cell | total obs |"
         )
         lines.append("|---|---:|---:|---:|")
-        lines.extend(f"| `{s.decision_class}` "
+        lines.extend(f"| `{_cell(s.decision_class)}` "
                 f"| {s.distinct_models} "
                 f"| {s.median_obs_primary:.1f} "
                 f"| {s.total_obs_primary} |" for s in report.decision_class_summaries)
@@ -391,8 +482,15 @@ def render_markdown(report: AuditReport) -> str:
 
 
 def render_json(report: AuditReport) -> str:
+    # ensure_ascii: this lane is written to the operator terminal by
+    # main(); JSON escapes C0 but passes C1 controls (U+0080-U+009F,
+    # incl. single-byte CSI/OSC) through raw when ensure_ascii is off,
+    # and the report carries sidecar-derived strings (event_type keys,
+    # decision_class values) that are attacker-choosable under the
+    # key-unusable clamp. ASCII output stays valid JSON for consumers
+    # that parse it (same rationale as cli.py's _dumps_json_lane).
     payload = asdict(report)
-    return dumps_artifact(payload, sort_keys=True)
+    return dumps_artifact(payload, sort_keys=True, ensure_ascii=True)
 
 
 # ---------------------------------------------------------------------------
@@ -411,9 +509,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--path",
         type=Path,
-        default=DEFAULT_PATH,
+        default=None,
         help=(
-            f"Path to the scorecard JSON (default: {DEFAULT_PATH}). "
+            "Path to the scorecard JSON (default: the shared "
+            "resolver's path, resolved at invocation). "
             "Pass a project-local path to audit a project sidecar."
         ),
     )

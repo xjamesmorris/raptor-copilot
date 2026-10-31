@@ -81,6 +81,21 @@ _PROPRIETARY_MARKERS = (
     "no part of this",
 )
 
+# The subset of proprietary markers strong enough to join the
+# earliest-position race against OSS fingerprints (see
+# ``_classify_text``). "all rights reserved" is deliberately EXCLUDED
+# from the race in both directions of the trade-off: it is standard
+# boilerplate ABOVE the intro marker of every BSD-style header (racing
+# it would misclassify BSD texts as proprietary), while as a
+# no-fingerprint fallback it still signals proprietary (dropping it
+# there would stop flagging classic all-rights-reserved notices).
+_STRONG_PROPRIETARY_MARKERS = (
+    "proprietary",
+    "confidential",
+    "internal use only",
+    "no part of this",
+)
+
 # Heuristic text fingerprints for the most common OSS licenses,
 # fallback when no SPDX-Identifier header is present. Each entry is
 # ``(spdx_id, marker_text)``; the first marker that hits wins.
@@ -156,8 +171,13 @@ _SPDX_COMPOUND_HEADER_RE = re.compile(
 # principal X) — split_compound_expression flattens the operators
 # away, so these splitters recover the structure. Case-insensitive to
 # match the IGNORECASE header regex above.
-_ANDOR_SPLIT_RE_CI = re.compile(r"\s+(?:AND|OR)\s+", re.IGNORECASE)
-_WITH_SPLIT_RE_CI = re.compile(r"\s+WITH\s+", re.IGNORECASE)
+# (?<!\s) pins each operator match to the start of its whitespace
+# run: a bare leading \s+ re-consumes a hostile whitespace run from
+# every scan position — quadratic in the expression length. The
+# earliest match always starts at the run start, so the split is
+# unchanged.
+_ANDOR_SPLIT_RE_CI = re.compile(r"(?<!\s)\s+(?:AND|OR)\s+", re.IGNORECASE)
+_WITH_SPLIT_RE_CI = re.compile(r"(?<!\s)\s+WITH\s+", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -253,17 +273,36 @@ def _read_license_head(path: Path) -> str:
     text (original case preserved — SPDX ids are case-sensitive).
     Best-effort: binary files and encoding errors return ``""`` so
     the caller's pattern matching falls through to
-    ``classification="unknown"`` cleanly."""
+    ``classification="unknown"`` cleanly.
+
+    Size-capped: line iteration buffers a whole line per step, so a
+    planted LICENSE that is one multi-GB line loaded itself into host
+    memory at lifecycle start — before any analysis ran — on every
+    untrusted target. The sibling ``_read_license_full`` is byte-
+    capped at 256 KB; the same bound (as a character cap here — with
+    ``errors="replace"`` every character decodes from at least one
+    byte, so memory stays within a small constant factor) dwarfs any
+    legitimate 50-line license header.
+    """
+    # Same fd-guarded open discipline as ``_read_license_full`` (which
+    # this reader's cap rationale already cites): a plain ``open()``
+    # blocks forever when the ``is_file()``-gated path is swapped for a
+    # reader-less FIFO between check and open, so the guard must live
+    # on the fd, not the name. Delegating keeps one implementation of
+    # the O_NOFOLLOW | O_NONBLOCK + fstat(S_ISREG) sequence. In-tree
+    # symlinked license files (REUSE-style ``COPYING`` →
+    # ``LICENSES/<SPDX>.txt``) are a supported shape and the callers'
+    # discovery step already validates in-tree-ness — so resolve
+    # first, then apply the no-follow open to the resolved path (the
+    # standard read-through-symlinks composition documented on
+    # ``core.source.contained``).
     try:
-        with path.open("r", encoding="utf-8", errors="replace") as f:
-            lines = []
-            for i, line in enumerate(f):
-                if i >= _LICENSE_READ_LINES:
-                    break
-                lines.append(line)
-            return "".join(lines)
+        resolved = path.resolve(strict=True)
     except OSError:
         return ""
+    text = _read_license_full(resolved, _INDIRECTION_FILE_BYTES)
+    lines = text.splitlines(keepends=True)[:_LICENSE_READ_LINES]
+    return "".join(lines)
 
 
 def _classify_text(text: str) -> tuple:
@@ -403,7 +442,21 @@ def _classify_text(text: str) -> tuple:
             spdx = _classify_gpl_version(text, family, pos, default_ver)
             earliest_pos = pos
             earliest_spdx = spdx
-    if earliest_spdx is not None:
+    # Proprietary declarations join the earliest-position race: a
+    # LICENSE that OPENS with "PROPRIETARY AND CONFIDENTIAL" and later
+    # names a bundled third-party license is proprietary — pre-fix the
+    # markers were consulted only after the fingerprint race, so any
+    # bundled-license mention won and the operator never saw the
+    # CodeQL-terms warning. Strong markers only; see
+    # ``_STRONG_PROPRIETARY_MARKERS`` for why "all rights reserved"
+    # does not race.
+    prop_pos: int | None = None
+    for marker in _STRONG_PROPRIETARY_MARKERS:
+        pos = lowered.find(marker)
+        if pos != -1 and (prop_pos is None or pos < prop_pos):
+            prop_pos = pos
+    if earliest_spdx is not None and earliest_pos is not None and (
+            prop_pos is None or earliest_pos < prop_pos):
         return earliest_spdx, "oss", "medium"
     for marker in _PROPRIETARY_MARKERS:
         if marker in lowered:
@@ -544,6 +597,11 @@ def detect_target_license(target_dir: Path) -> TargetLicense:
 # detection allocate forever.
 _INDIRECTION_DEPTH_LIMIT = 2          # root LICENSE → linked → linked-of-linked
 _INDIRECTION_PATH_LIMIT = 8           # cap referenced paths per file
+# Total files read per chain walk. Needed because directory children
+# enqueue at the SAME depth as the reference that named the directory
+# (the dir is enumerated, not classified), so depth alone no longer
+# bounds a hostile chain of alternating dir references — this cap does.
+_INDIRECTION_TOTAL_FILES = 32
 _INDIRECTION_FILE_BYTES = 256 * 1024  # cap per-file read at 256 KB
 
 
@@ -688,10 +746,14 @@ def _follow_license_indirection(
     visited: set = set()
     visited.add(source_file.resolve())
 
+    files_read = 0
     while queue:
         current_file, depth, is_root = queue.pop(0)
         if depth > _INDIRECTION_DEPTH_LIMIT:
             continue
+        if files_read >= _INDIRECTION_TOTAL_FILES:
+            break
+        files_read += 1
 
         # Read the file ONCE — classify_text AND extract refs
         # both consume the same body. Pre-fix this read each
@@ -762,10 +824,13 @@ def _follow_license_indirection(
             # Directory reference: enqueue every license-named
             # file inside it. Same-depth, NOT depth+1 — the dir
             # itself isn't being classified, just enumerated;
-            # each file inside is the same hop as if it had been
-            # referenced directly. Otherwise a real chain like
-            # "LICENSE → see LICENSES/ directory → MIT.txt" hits
-            # the depth limit at the contents step.
+            # following INTO the directory's contents is the one
+            # hop this reference costs, charged when the child is
+            # classified at the enqueue depth. Charging an extra
+            # hop made a chain whose directory reference sits at
+            # the depth boundary ("LICENSE → ... → see LICENSES/
+            # directory → MIT.txt") silently drop the contents
+            # step past the limit.
             #
             # Capped at ``_INDIRECTION_PATH_LIMIT`` children too —
             # otherwise a hostile target with 10k files in
@@ -782,7 +847,7 @@ def _follow_license_indirection(
                         if child.suffix.lower() in (".txt", ".md", ".rst", ".html", ".htm") or "license" in child.name.lower() or "copying" in child.name.lower():
                             if child.resolve() not in visited:
                                 visited.add(child.resolve())
-                                queue.append((child, depth + 1, False))
+                                queue.append((child, depth, False))
                                 enqueued_from_dir += 1
                 except OSError:
                     pass

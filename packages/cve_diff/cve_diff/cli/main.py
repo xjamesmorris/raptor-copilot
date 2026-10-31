@@ -26,6 +26,7 @@ from typing import Annotated
 import typer
 
 from core.json import save_json
+from core.security.log_sanitisation import sanitise_for_terminal
 from cve_diff import __version__
 from cve_diff.analysis.analyzer import RootCauseAnalysisError, RootCauseAnalyzer
 from cve_diff.cli.bench import bench as _bench_cmd
@@ -37,6 +38,7 @@ from cve_diff.core.exceptions import (
     UnsupportedSource,
 )
 from cve_diff.infra import api_status
+from cve_diff.infra.disk_budget import DiskBudgetExceeded
 from cve_diff.infra.github_client import warn_if_token_missing
 from cve_diff.llm.client import LLMCallFailed
 from cve_diff.pipeline import Pipeline, PipelineResult
@@ -82,7 +84,7 @@ def _restore_termination_handlers(
     """Undo :func:`_install_termination_handlers`."""
     for signum, previous in restore:
         try:
-            signal.signal(signum, previous)
+            signal.signal(signum, previous)  # type: ignore[arg-type]
         except (ValueError, TypeError):
             pass
 
@@ -129,10 +131,20 @@ def _echo_flow_md(output_dir: Path, cve_id: str, quiet: bool) -> None:
             body = flow_md_path.read_text(encoding="utf-8")
         except OSError:
             return
+    # flow.md content is producer-escaped (telemetry escapes tool args
+    # and stage signals before they reach the file), but this relay is
+    # the terminal sink — escape here too so a producer regression (or
+    # a hand-edited flow.md) cannot drive the operator's TTY. Newlines
+    # are structural in the trace body and kept; the body is already
+    # display-capped above.
+    from core.security.log_sanitisation import (
+        escape_nonprintable,
+        sanitise_for_terminal,
+    )
     typer.echo("")
-    typer.echo(f"=== {cve_id} — pipeline trace ===")
+    typer.echo(f"=== {sanitise_for_terminal(str(cve_id), max_len=128)} — pipeline trace ===")
     typer.echo("")
-    typer.echo(body.rstrip())
+    typer.echo(escape_nonprintable(body.rstrip(), preserve_newlines=True))
     typer.echo("")
     typer.echo("=== Artifacts ===")
 
@@ -415,7 +427,14 @@ def run(
     progress_cb = None
     if not quiet:
         def progress_cb(stage: str, status: str, info: dict) -> None:
-            kv = " ".join(f"{k}={v}" for k, v in info.items())
+            # info values carry exception text (which embeds remote
+            # git stderr banners) and repo-derived slugs — escape the
+            # kv string; the typed-handler relays below apply the same
+            # chokepoint to the same content classes.
+            kv = sanitise_for_terminal(
+                " ".join(f"{k}={v}" for k, v in info.items()),
+                max_len=300,
+            )
             typer.echo(f"  · {stage:<16} {status:<8} {kv}", err=True)
 
     # Track the most-recent Pipeline so the except handlers can read
@@ -445,6 +464,7 @@ def run(
                         scorecard_enabled=True,
                         sage_enabled=True,
                     )
+                    assert pipeline_slot[0] is not None
                     result = pipeline_slot[0].run(cve_id, work)
                     break
                 except DiscoveryError as exc:
@@ -468,8 +488,29 @@ def run(
                             )
                             continue
                     raise
+        except DiskBudgetExceeded as exc:
+            # Terminal by design: the pipeline re-raises this typed so
+            # no retry layer spends more while the disk stays over its
+            # limit. Own exit code — not an acquisition failure.
+            typer.echo("disk budget exceeded: "
+                       f"{sanitise_for_terminal(str(exc), max_len=300)}",
+                       err=True)
+            typer.echo(
+                "hint: free space on the output filesystem or raise the "
+                "disk limit before re-running.",
+                err=True,
+            )
+            _write_failure_md(output_dir, cve_id, "DiskBudgetExceeded",
+                              f"DiskBudgetExceeded: {exc}")
+            if pipeline_slot[0] is not None:
+                _flow_from_pipeline(output_dir, cve_id, pipeline_slot[0],
+                                    ok=False, error_class="DiskBudgetExceeded")
+            _echo_flow_md(output_dir, cve_id, quiet)
+            raise typer.Exit(code=8) from exc
         except UnsupportedSource as exc:
-            typer.echo(f"unsupported source: {exc}", err=True)
+            typer.echo("unsupported source: "
+                       f"{sanitise_for_terminal(str(exc), max_len=300)}",
+                       err=True)
             typer.echo(
                 "hint: this CVE points at a closed-source vendor; cve-diff only handles OSS.",
                 err=True,
@@ -482,7 +523,9 @@ def run(
             _echo_flow_md(output_dir, cve_id, quiet)
             raise typer.Exit(code=4) from exc
         except DiscoveryError as exc:
-            typer.echo(f"discovery failed: {exc}", err=True)
+            typer.echo("discovery failed: "
+                       f"{sanitise_for_terminal(str(exc), max_len=300)}",
+                       err=True)
             typer.echo(
                 "hint: verify the CVE id, check OSV at https://api.osv.dev/v1/vulns/"
                 f"{cve_id}, or set GITHUB_TOKEN if rate-limited.",
@@ -498,7 +541,9 @@ def run(
             _echo_flow_md(output_dir, cve_id, quiet)
             raise typer.Exit(code=5) from exc
         except AcquisitionError as exc:
-            typer.echo(f"acquisition failed: {exc}", err=True)
+            typer.echo("acquisition failed: "
+                       f"{sanitise_for_terminal(str(exc), max_len=300)}",
+                       err=True)
             typer.echo(
                 "hint: check network / proxy; the discovered repo may have been renamed "
                 "or made private since the OSV record was published.",
@@ -512,7 +557,9 @@ def run(
             _echo_flow_md(output_dir, cve_id, quiet)
             raise typer.Exit(code=6) from exc
         except IdenticalCommitsError as exc:
-            typer.echo(f"identical commits: {exc}", err=True)
+            typer.echo("identical commits: "
+                       f"{sanitise_for_terminal(str(exc), max_len=300)}",
+                       err=True)
             typer.echo(
                 "hint: OSV record's fix sha and its parent resolved to the same commit; "
                 "the record likely names a tag rather than the fix commit.",
@@ -526,7 +573,9 @@ def run(
             _echo_flow_md(output_dir, cve_id, quiet)
             raise typer.Exit(code=7) from exc
         except AnalysisError as exc:
-            typer.echo(f"analysis rejected: {exc}", err=True)
+            typer.echo("analysis rejected: "
+                       f"{sanitise_for_terminal(str(exc), max_len=300)}",
+                       err=True)
             typer.echo(
                 "hint: the diff shape is notes_only — the agent picked a downstream "
                 "mirror rather than the upstream fix. Re-run with verbose tracing to "
@@ -545,12 +594,19 @@ def run(
         if with_root_cause:
             try:
                 rc = RootCauseAnalyzer(model_id=model_id).analyze(result.bundle)
+                # vulnerability_type is unconstrained model-JSON text
+                # (cwe_id is regex-normalised by the analyzer) — same
+                # chokepoint as the failure relays below.
                 typer.echo(
-                    f"root cause: {rc.cwe_id} ({rc.vulnerability_type}) "
+                    "root cause: "
+                    f"{rc.cwe_id} "
+                    f"({sanitise_for_terminal(str(rc.vulnerability_type), max_len=80)}) "
                     f"conf={rc.confidence:.2f} tokens={rc.input_tokens}+{rc.output_tokens}"
                 )
             except (RootCauseAnalysisError, LLMCallFailed) as exc:
-                typer.echo(f"root-cause analysis failed: {exc}", err=True)
+                typer.echo("root-cause analysis failed: "
+                           f"{sanitise_for_terminal(str(exc), max_len=300)}",
+                           err=True)
                 raise typer.Exit(code=9) from exc
 
         # Consensus-confirmed discovery → run-local verified outcome

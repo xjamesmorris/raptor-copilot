@@ -45,6 +45,36 @@ def test_extract_cve_ids_skips_informational():
     ) == []
 
 
+def test_extract_cve_ids_distro_primary_resolves_to_cve():
+    """Debian / Ubuntu / Alpine secdb records carry the CVE embedded
+    in the PRIMARY id with an EMPTY alias list — the exploited-label
+    join must land on the canonical CVE key."""
+    for primary in (
+        "DEBIAN-CVE-2026-54369",
+        "UBUNTU-CVE-2017-18018",
+        "ALPINE-CVE-2024-0001",
+    ):
+        expected = primary.split("-", 1)[1]
+        assert _extract_cve_ids(
+            {"id": primary, "aliases": []},
+        ) == [expected], primary
+
+
+def test_extract_cve_ids_distro_informational_still_skipped():
+    assert _extract_cve_ids(
+        {"id": "DEBIAN-CVE-2026-54369", "aliases": [],
+         "informational": "unsound"},
+    ) == []
+
+
+def test_extract_cve_ids_lowercase_spellings_normalised():
+    """The ground-truth signal maps are keyed uppercase; a lowercase
+    feed spelling must not silently lose its label join."""
+    assert _extract_cve_ids(
+        {"id": "cve-2023-1234", "aliases": ["cve-2020-0001"]},
+    ) == ["CVE-2020-0001", "CVE-2023-1234"]
+
+
 # ---------------------------------------------------------------------------
 # _ranks — average-rank for ties
 # ---------------------------------------------------------------------------
@@ -251,11 +281,45 @@ def test_validate_corpus_emits_report_file(tmp_path: Path) -> None:
     corpus_dir = tmp_path / "calibration"
     corpus_dir.mkdir()
     _build_synthetic_corpus(corpus_dir, scored=80)
-    validate_corpus(corpus_dir)
+    validate_corpus(corpus_dir, update_snapshot=True)
     out_files = list((corpus_dir / "validation").iterdir())
     assert len(out_files) == 1
     on_disk = json.loads(out_files[0].read_text())
     assert on_disk["findings_with_score"] == 80
+
+
+def test_validate_corpus_default_is_metrics_only(tmp_path: Path) -> None:
+    """Without out_path / update_snapshot, nothing is written and
+    nothing is pruned — the default validation/ dir is repo-committed,
+    and the natural "verify the committed report reproduces" call
+    must not overwrite the committed same-day snapshot or prune
+    committed history as a side effect."""
+    corpus_dir = tmp_path / "calibration"
+    corpus_dir.mkdir()
+    _build_synthetic_corpus(corpus_dir, scored=80)
+    # Pre-existing committed snapshots must survive untouched.
+    validation_dir = corpus_dir / "validation"
+    validation_dir.mkdir()
+    (validation_dir / "2020-01-01.json").write_text("{}")
+    report = validate_corpus(corpus_dir)
+    assert report.findings_with_score == 80
+    assert sorted(p.name for p in validation_dir.iterdir()) == [
+        "2020-01-01.json",
+    ]
+
+
+def test_validate_corpus_out_path_and_snapshot_conflict(
+    tmp_path: Path,
+) -> None:
+    import pytest
+    corpus_dir = tmp_path / "calibration"
+    corpus_dir.mkdir()
+    _build_synthetic_corpus(corpus_dir, scored=80)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        validate_corpus(
+            corpus_dir, out_path=tmp_path / "r.json",
+            update_snapshot=True,
+        )
 
 
 def test_validate_corpus_validated_when_score_correlates(
@@ -298,6 +362,42 @@ def test_validate_corpus_per_ecosystem_breakdown(tmp_path: Path) -> None:
     # Synthetic corpus has only PyPI — breakdown should reflect that.
     assert "PyPI" in report.by_ecosystem
     assert report.by_ecosystem["PyPI"]["total"] == 60
+    # Every synthetic advisory carries a CVE-joinable id — the
+    # label-coverage column must say so beside with_signal / ρ.
+    assert report.by_ecosystem["PyPI"]["with_cve"] == 60
+
+
+def test_validate_corpus_distro_primary_labels_exploited(
+    tmp_path: Path,
+) -> None:
+    """A ``DEBIAN-CVE-*``-primary finding whose embedded CVE is in
+    ``kev_signals`` must count as ``with_signal`` (label=1) and as
+    CVE-joinable in the per-ecosystem coverage — pre-fix the whole
+    distro-secdb corpus population sat at with_cve=0/with_signal=0."""
+    corpus_dir = tmp_path / "calibration"
+    corpus_dir.mkdir()
+    (corpus_dir / "kev_signals.json").write_text(json.dumps({
+        "_source": {"license": "PD", "url": "x",
+                    "fetched_at": "2024-01-01"},
+        "signals": {"CVE-2017-18018": {"kev": True}},
+    }))
+    samples_dir = corpus_dir / "project_samples" / "Ubuntu"
+    samples_dir.mkdir(parents=True)
+    (samples_dir / "img.json").write_text(json.dumps({
+        "_source": {"license": "MIT", "url": "x"},
+        "findings": [
+            {"ecosystem": "Ubuntu", "raptor_risk_estimate": 0.9,
+             "advisory": {"id": "UBUNTU-CVE-2017-18018",
+                          "aliases": []}},
+            {"ecosystem": "Ubuntu", "raptor_risk_estimate": 0.1,
+             "advisory": {"id": "UBUNTU-CVE-2020-99990",
+                          "aliases": []}},
+        ],
+    }))
+    report = validate_corpus(corpus_dir)
+    assert report.findings_with_signal == 1
+    assert report.by_ecosystem["Ubuntu"]["with_signal"] == 1
+    assert report.by_ecosystem["Ubuntu"]["with_cve"] == 2
 
 
 def test_validate_corpus_provenance_captured(tmp_path: Path) -> None:

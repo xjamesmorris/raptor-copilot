@@ -16,6 +16,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -28,6 +29,10 @@ from core.audit.compiler_sweep import (
     run_compiler_analyzer_sweep,
 )
 from core.audit.evidence_grade import is_tool_evidence
+from core.audit.sweep import SweepResult
+from core.audit.tests._live_transport import (
+    run_compiler_analyzer_sweep_guarded,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures" / "compiler_sweep"
 
@@ -42,13 +47,18 @@ needs_compiler = pytest.mark.skipif(
     not HAVE_ANY, reason="neither gcc -fanalyzer nor clang installed",
 )
 needs_clang = pytest.mark.skipif(not HAVE_CLANG, reason="clang not installed")
+needs_gcc = pytest.mark.skipif(
+    not HAVE_GCC, reason="gcc -fanalyzer not installed",
+)
 
 
 @pytest.fixture(autouse=True)
 def _fresh_probe_cache():
     compiler_sweep._reset_probe_cache()
+    compiler_sweep._reset_tu_cache()
     yield
     compiler_sweep._reset_probe_cache()
+    compiler_sweep._reset_tu_cache()
 
 
 @pytest.fixture
@@ -82,11 +92,27 @@ def _target_with(tmp_path: Path, *fixture_names: str) -> Path:
     return target
 
 
+def _guarded_compiler_sweep(
+    *, gcc_probed: bool = HAVE_GCC, **kwargs: Any,
+) -> SweepResult:
+    """Live analyzer runs route through the transport guard: runtime
+    degradation (deadline, signal-killed compile, spawn OSError, a
+    gcc probe lost under load) skips with the transport's reason;
+    every product classification passes through untouched for the
+    caller's own hard assertions. ``gcc_probed`` pins the toolchain
+    identity this module observed at collection time (legs that
+    deliberately mask gcc pass False)."""
+    return run_compiler_analyzer_sweep_guarded(
+        gcc_probed=gcc_probed, **kwargs,
+    )
+
+
 def _sweep(tmp_path, fixture, cwe, hypothesis, function_name="f",
-           line_start=0, line_end=0):
+           line_start=0, line_end=0, gcc_probed: bool = HAVE_GCC):
     target = _target_with(tmp_path, fixture)
     out_dir = tmp_path / "out"
-    return run_compiler_analyzer_sweep(
+    return _guarded_compiler_sweep(
+        gcc_probed=gcc_probed,
         target_path=target,
         file_path=fixture,
         function_name=function_name,
@@ -333,7 +359,7 @@ class TestSandboxInvocation:
     def test_sandbox_used_with_network_deny(self, tmp_path, sandbox_spy):
         target = _target_with(tmp_path, "uaf.c")
         out_dir = tmp_path / "out"
-        run_compiler_analyzer_sweep(
+        _guarded_compiler_sweep(
             target_path=target,
             file_path="uaf.c",
             function_name="use_after_free",
@@ -406,14 +432,29 @@ class TestToolchainFallback:
             tmp_path, "uaf.c", "CWE-416",
             "use-after-free of `p` in use_after_free",
             function_name="use_after_free", line_start=3, line_end=9,
+            # gcc is masked ON PURPOSE: clang is this leg's expected
+            # analyzer, not a degraded fallback, so the guard's
+            # probe-flip arm must stay out of the way (the transport
+            # arms still cover the live clang run).
+            gcc_probed=False,
         )
         assert result.details and result.details["compiler"] == "clang"
         assert result.outcome == "confirmed"
 
     def test_both_missing_is_error(self, tmp_path, monkeypatch):
         monkeypatch.setattr(shutil, "which", lambda *a, **k: None)
-        result = _sweep(
-            tmp_path, "uaf.c", "CWE-416", "use-after-free of `p`",
+        # Deliberate toolchain fault: this leg MINTS the not-installed
+        # error on purpose, so it bypasses the transport guard (which
+        # reads exactly that shape as a degraded runtime) and calls
+        # the sweep raw.
+        target = _target_with(tmp_path, "uaf.c")
+        result = run_compiler_analyzer_sweep(
+            target_path=target,
+            file_path="uaf.c",
+            function_name="f",
+            hypothesis="use-after-free of `p`",
+            cwe="CWE-416",
+            out_dir=tmp_path / "out",
         )
         assert result.outcome == "error"
         assert any("not installed" in e for e in result.errors)
@@ -448,7 +489,7 @@ class TestMappingEdges:
         target = tmp_path / "repo"
         target.mkdir()
         (target / "app.py").write_text("x = 1\n")
-        result = run_compiler_analyzer_sweep(
+        result = _guarded_compiler_sweep(
             target_path=target, file_path="app.py", function_name="f",
             hypothesis="use-after-free of `x`", cwe="CWE-416",
             out_dir=tmp_path / "out",
@@ -459,7 +500,7 @@ class TestMappingEdges:
     def test_path_escape_is_error(self, tmp_path, sandbox_spy):
         target = tmp_path / "repo"
         target.mkdir()
-        result = run_compiler_analyzer_sweep(
+        result = _guarded_compiler_sweep(
             target_path=target, file_path="../evil.c", function_name="f",
             hypothesis="h", cwe="CWE-416", out_dir=tmp_path / "out",
         )
@@ -469,7 +510,7 @@ class TestMappingEdges:
     def test_missing_file_is_error(self, tmp_path, sandbox_spy):
         target = tmp_path / "repo"
         target.mkdir()
-        result = run_compiler_analyzer_sweep(
+        result = _guarded_compiler_sweep(
             target_path=target, file_path="ghost.c", function_name="f",
             hypothesis="h", cwe="CWE-416", out_dir=tmp_path / "out",
         )
@@ -564,6 +605,58 @@ class TestSuppressionWitness:
             "int f(void) { return 0; }\n",
         )
 
+    # Closure over both compilers' documented suppression spellings:
+    # the witness exists because analyzer silence on an attacker-
+    # authored TU is forgeable, so an enumeration gap (the clang
+    # system_header spelling was missing) is a forged-refutation
+    # channel on that compiler's path.
+    _SUPPRESSION_SPELLINGS = (
+        '#pragma GCC diagnostic ignored "-Wanalyzer-use-after-free"',
+        '#pragma clang diagnostic ignored "-Wall"',
+        "#pragma GCC system_header",
+        "#pragma clang system_header",
+        "#  pragma clang system_header",  # whitespace-tolerant
+        '_Pragma("GCC diagnostic ignored \\"-Wall\\"")',
+        "#ifndef __clang_analyzer__",
+        "[[clang::suppress]] int *q = p;",
+        '[[gsl::suppress("type.1")]] int *q = p;',
+        "__attribute__((suppress)) int g(void);",
+        # Linemarker system-header flag: silences warnings AND
+        # analyzer reports on BOTH compiler paths with no pragma.
+        '# 1 "hostile.h" 3',
+        '#  1  "hostile.h"  3',  # whitespace-tolerant
+        '# 1 "/usr/include/evil.h" 1 3 4',  # preprocessed-output flags
+        '#line 1 "hostile.h" 3',
+    )
+
+    def test_documented_suppression_spellings_all_detected(self):
+        for spelling in self._SUPPRESSION_SPELLINGS:
+            assert compiler_sweep._suppression_witness(
+                f"{spelling}\nint f(void) {{ return 0; }}\n",
+            ), spelling
+
+    def test_benign_pragmas_do_not_trip(self):
+        # Over-triggering costs genuine refutations (every hit fails
+        # toward inconclusive) — common non-suppression pragmas stay
+        # inert.
+        for spelling in (
+            "#pragma once",
+            "#pragma pack(push, 1)",
+            '#pragma GCC optimize("O2")',
+            "#pragma omp parallel for",
+            "#pragma clang loop unroll(full)",
+            "#pragma GCC visibility push(default)",
+            "__attribute__((unused)) int x;",
+            # Flagless / non-3-flag linemarkers renumber only.
+            '#line 1 "x.h"',
+            '# 1 "x.c"',
+            '# 1 "x.c" 1',
+            '# 42 "x.c" 2 4',
+        ):
+            assert not compiler_sweep._suppression_witness(
+                f"{spelling}\nint f(void) {{ return 0; }}\n",
+            ), spelling
+
 
 @needs_compiler
 class TestSuppressionForgery:
@@ -583,7 +676,7 @@ class TestSuppressionForgery:
             "int f(void){char *p=malloc(8); if(!p) return 0; "
             "free(p); return p[0];}\n",
         )
-        result = run_compiler_analyzer_sweep(
+        result = _guarded_compiler_sweep(
             target_path=target,
             file_path="poc.c",
             function_name="f",
@@ -591,7 +684,34 @@ class TestSuppressionForgery:
             cwe="CWE-416",
             out_dir=tmp_path / "out",
         )
-        assert result.outcome != "refuted", result.to_dict()
+        assert result.outcome != "refuted", vars(result)
+        if result.outcome == "inconclusive":
+            assert result.details.get("suppression_witness")
+
+    def test_linemarker_system_header_silence_cannot_refute(
+        self, tmp_path, sandbox_spy,
+    ):
+        # A TU opening with `# 1 "x.h" 3` (linemarker system-header
+        # flag, no pragma anywhere) silences clang --analyze AND
+        # gcc -fanalyzer on a live double-free — mechanically forged
+        # silence must fail toward unknown, never mint 'refuted'.
+        target = tmp_path / "repo"
+        target.mkdir()
+        (target / "poc.c").write_text(
+            '# 1 "poc.h" 3\n'
+            "#include <stdlib.h>\n"
+            "int f(void){char *p=malloc(8); if(!p) return 0; "
+            "free(p); free(p); return 0;}\n",
+        )
+        result = _guarded_compiler_sweep(
+            target_path=target,
+            file_path="poc.c",
+            function_name="f",
+            hypothesis="double free of `p` in f",
+            cwe="CWE-415",
+            out_dir=tmp_path / "out",
+        )
+        assert result.outcome != "refuted", vars(result)
         if result.outcome == "inconclusive":
             assert result.details.get("suppression_witness")
 
@@ -606,7 +726,7 @@ class TestSuppressionForgery:
             "/* never add #pragma GCC diagnostic ignored here */\n"
             "int f(int y){ return y + 1; }\n",
         )
-        result = run_compiler_analyzer_sweep(
+        result = _guarded_compiler_sweep(
             target_path=target,
             file_path="ok.c",
             function_name="f",
@@ -614,4 +734,234 @@ class TestSuppressionForgery:
             cwe="CWE-416",
             out_dir=tmp_path / "out",
         )
-        assert result.outcome == "refuted", result.to_dict()
+        assert result.outcome == "refuted", vars(result)
+
+
+@needs_gcc
+class TestIncludeClosureSuppressionForgery:
+    """The suppression witness must cover the WHOLE translation unit:
+    a diagnostic pragma in an included repo header persists past its
+    #include into the includer's code, so silence over the primary
+    file's text alone is forgeable by one planted header line."""
+
+    def _sweep_uaf(self, tmp_path, fixture, *extra):
+        target = _target_with(tmp_path, fixture, *extra)
+        return _guarded_compiler_sweep(
+            target_path=target,
+            file_path=fixture,
+            function_name="use_after_free",
+            hypothesis="use-after-free of `p` in use_after_free",
+            cwe="CWE-416",
+            out_dir=tmp_path / "out",
+        )
+
+    def test_pragma_in_included_repo_header_cannot_refute(
+        self, tmp_path, sandbox_spy,
+    ):
+        # gcc-confirmed live UAF; the header's pragma silences the
+        # family diagnostic for the includer's code after the
+        # #include — silence must fail toward unknown with the
+        # header named, never mint 'refuted'.
+        result = self._sweep_uaf(tmp_path, "uaf_incl.c", "evil_pragma.h")
+        assert result.outcome != "refuted", vars(result)
+        assert result.outcome == "inconclusive"
+        assert "evil_pragma.h" in (
+            result.details.get("suppression_witness") or ""
+        ), vars(result)
+
+    def test_token_pasted_pragma_cannot_refute(
+        self, tmp_path, sandbox_spy,
+    ):
+        # One level deeper: `_Pra##gma` synthesizes the operator at
+        # expansion time, invisible to any raw-text scan of any file
+        # — but the resulting `#pragma` line lands in the compiler's
+        # own preprocessed output, where the closure vet reads it.
+        result = self._sweep_uaf(tmp_path, "uaf_paste.c", "evil_paste.h")
+        assert result.outcome != "refuted", vars(result)
+        assert result.outcome == "inconclusive"
+        assert "pragma" in (
+            result.details.get("suppression_witness") or ""
+        ).lower(), vars(result)
+
+    def test_laundered_attribution_cannot_refute(
+        self, tmp_path, sandbox_spy,
+    ):
+        # Two levels deeper: a plain linemarker in the repo header
+        # re-attributes its own lines to a system path, and the
+        # pragma arrives token-pasted — invisible to raw scans AND
+        # classified system-authored in -E output. Attribution from
+        # an out-of-tree-naming repo linemarker is unverifiable; the
+        # vet must refuse, never refute.
+        result = self._sweep_uaf(
+            tmp_path, "uaf_launder.c", "evil_launder.h",
+        )
+        assert result.outcome != "refuted", vars(result)
+        assert result.outcome == "inconclusive"
+        detail = (
+            result.details.get("suppression_witness")
+            or result.details.get("closure_unvetted")
+            or ""
+        )
+        assert "evil_launder.h" in detail, vars(result)
+
+    def test_in_tree_linemarker_still_refutes(
+        self, tmp_path, sandbox_spy,
+    ):
+        # Generated sources (bison/flex) cite their in-tree grammar
+        # files with plain linemarkers — those must not cost the
+        # refutation.
+        target = tmp_path / "repo"
+        target.mkdir()
+        (target / "ok.c").write_text(
+            '#line 5 "parser.y"\n'
+            "int f(int y){ return y + 1; }\n",
+        )
+        result = _guarded_compiler_sweep(
+            target_path=target,
+            file_path="ok.c",
+            function_name="f",
+            hypothesis="use-after-free of `y` in f",
+            cwe="CWE-416",
+            out_dir=tmp_path / "out",
+        )
+        assert result.outcome == "refuted", vars(result)
+
+    def test_digraph_pragma_cannot_refute(self, tmp_path, sandbox_spy):
+        # Pinned-by-review shape: the digraph spelling `%:pragma`
+        # suppresses gcc and carries no literal `#pragma` for a raw
+        # scan — the preprocessor normalises it to a `#pragma` line
+        # in -E output, where the closure vet reads it.
+        result = self._sweep_uaf(
+            tmp_path, "uaf_digraph.c", "evil_digraph.h",
+        )
+        assert result.outcome != "refuted", vars(result)
+        assert result.outcome == "inconclusive"
+        assert "pragma" in (
+            result.details.get("suppression_witness") or ""
+        ).lower(), vars(result)
+
+    def test_backslash_spliced_pragma_cannot_refute(
+        self, tmp_path, sandbox_spy,
+    ):
+        # Pinned-by-review shape: `#prag\` + newline + `ma …` splices
+        # into a live pragma the raw text never spells — caught
+        # post-splice in -E output.
+        result = self._sweep_uaf(
+            tmp_path, "uaf_splice.c", "evil_splice.h",
+        )
+        assert result.outcome != "refuted", vars(result)
+        assert result.outcome == "inconclusive"
+        assert "pragma" in (
+            result.details.get("suppression_witness") or ""
+        ).lower(), vars(result)
+
+    def test_clean_include_closure_still_refutes(
+        self, tmp_path, sandbox_spy,
+    ):
+        # Two-direction pin: system headers are outside the repo's
+        # control — a guarded TU including <stdlib.h> keeps its
+        # mechanical refutation.
+        result = self._sweep_uaf(tmp_path, "uaf_guarded.c")
+        assert result.outcome == "refuted", vars(result)
+
+    def test_conditional_analyzer_token_in_header_cannot_refute(
+        self, tmp_path, sandbox_spy,
+    ):
+        # `#ifndef __clang_analyzer__` in a repo header resolves away
+        # in -E output — the raw per-file scan of the closure must
+        # still catch the token.
+        target = tmp_path / "repo"
+        target.mkdir()
+        (target / "cond.h").write_text(
+            "#ifndef __clang_analyzer__\n"
+            "#define MAYBE_FREE(p)\n"
+            "#else\n"
+            "#define MAYBE_FREE(p) free(p)\n"
+            "#endif\n",
+        )
+        (target / "ok.c").write_text(
+            '#include "cond.h"\n'
+            "int f(int y){ return y + 1; }\n",
+        )
+        result = _guarded_compiler_sweep(
+            target_path=target,
+            file_path="ok.c",
+            function_name="f",
+            hypothesis="use-after-free of `y` in f",
+            cwe="CWE-416",
+            out_dir=tmp_path / "out",
+        )
+        assert result.outcome != "refuted", vars(result)
+        assert "cond.h" in (
+            result.details.get("suppression_witness") or ""
+        ), vars(result)
+
+
+class TestClosureWitnessParsing:
+    """Unit pins for the preprocessed-output walker."""
+
+    def _pp(self, target: Path, tu: Path, text: str):
+        # The TU itself is always raw-scanned — make it exist.
+        if not tu.exists():
+            tu.write_text("int t;\n")
+        return compiler_sweep._closure_suppression_witness(
+            text, target, tu,
+        )
+
+    def test_repo_pragma_attributed(self, tmp_path):
+        (tmp_path / "h.h").write_text("int x;\n")
+        w, fail = self._pp(
+            tmp_path, tmp_path / "a.c",
+            f'# 1 "{tmp_path}/h.h" 1\n'
+            '#pragma GCC diagnostic ignored "-Wanalyzer-use-after-free"\n',
+        )
+        assert "h.h" in w and not fail
+
+    def test_system_pragma_trusted(self, tmp_path):
+        w, fail = self._pp(
+            tmp_path, tmp_path / "a.c",
+            '# 1 "/usr/include/glib.h" 1\n'
+            '#pragma GCC diagnostic ignored "-Wall"\n',
+        )
+        assert (w, fail) == ("", "")
+
+    def test_benign_system_macro_expansion_markers_inert(self, tmp_path):
+        # gcc emits `# N "tu.c" 3 4` around every system-macro
+        # expansion (NULL, offsetof) — those must not read as
+        # suppression, or every real TU loses its refutations.
+        tu = tmp_path / "a.c"
+        tu.write_text("int f(void) { return 0; }\n")
+        w, fail = self._pp(
+            tmp_path, tu,
+            f'# 1 "{tu}"\nint *p =\n# 2 "{tu}" 3 4\n((void *)0)\n'
+            f'# 2 "{tu}"\n;\n',
+        )
+        assert (w, fail) == ("", "")
+
+    def test_repo_system_header_pragma_caught_by_raw_scan(self, tmp_path):
+        # The construct that puts a repo region into system-header
+        # state is textual in the repo file — the raw closure scan
+        # names it.
+        (tmp_path / "h.h").write_text("#pragma GCC system_header\n")
+        w, fail = self._pp(
+            tmp_path, tmp_path / "a.c",
+            f'# 1 "{tmp_path}/h.h" 1\nint x;\n',
+        )
+        assert "system_header" in w and "h.h" in w and not fail
+
+    def test_unreadable_closure_file_fails_vet(self, tmp_path):
+        w, fail = self._pp(
+            tmp_path, tmp_path / "a.c",
+            f'# 1 "{tmp_path}/missing.h" 1\nint x;\n',
+        )
+        assert not w and "missing.h" in fail
+
+    def test_closure_file_raw_scan_catches_analyzer_token(self, tmp_path):
+        (tmp_path / "h.h").write_text(
+            "#ifndef __clang_analyzer__\nint x;\n#endif\n",
+        )
+        w, fail = self._pp(
+            tmp_path, tmp_path / "a.c",
+            f'# 1 "{tmp_path}/h.h" 1\nint x;\n',
+        )
+        assert "__clang_analyzer__" in w and not fail

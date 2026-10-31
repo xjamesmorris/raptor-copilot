@@ -780,6 +780,51 @@ def test_install_hook_compounded_with_recent_publish_blocks() -> None:
     assert verdict == _VERDICT_BLOCK
 
 
+def test_pypi_legacy_naive_upload_time_parses_as_utc() -> None:
+    """PyPI's legacy ``upload_time`` field (the fallback when
+    ``upload_time_iso_8601`` is absent) is naive-UTC. Pre-fix the
+    naive result crashed the aware-vs-naive age subtraction with
+    TypeError, and the orchestrator floored the whole candidate at
+    Review with an exception string — every bump-tier detector
+    skipped."""
+    now = datetime(2026, 9, 21, tzinfo=timezone.utc)
+    pypi = _StubPyPIClient({
+        "x": {"releases": {
+            "2.0.0": [{"upload_time": "2026-09-20T12:00:00"}],
+        }},
+    })
+    findings = evaluate_bump_supply_chain(
+        ecosystem="PyPI", name="x",
+        current_version="1.0.0", target_version="2.0.0",
+        pypi_client=pypi, npm_client=None, now=now,
+    )
+    kinds = [f.kind for f in findings]
+    assert "recent_publish" in kinds
+
+
+def test_pypi_mixed_aware_and_naive_upload_times() -> None:
+    """One release with both timestamp shapes must compare cleanly
+    inside the earliest-file scan (pre-fix: TypeError on the
+    ``parsed < earliest`` comparison)."""
+    now = datetime(2026, 5, 11, tzinfo=timezone.utc)
+    pypi = _StubPyPIClient({
+        "x": {"releases": {
+            "2.0.0": [
+                {"upload_time_iso_8601": "2026-03-12T00:00:00Z"},
+                {"upload_time": "2026-05-01T00:00:00"},
+            ],
+        }},
+    })
+    findings = evaluate_bump_supply_chain(
+        ecosystem="PyPI", name="x",
+        current_version="1.0.0", target_version="2.0.0",
+        pypi_client=pypi, npm_client=None, now=now,
+    )
+    # Earliest (2026-03-12) is outside the 30-day window — no
+    # recent_publish, and crucially no TypeError.
+    assert all(f.kind != "recent_publish" for f in findings)
+
+
 def test_pypi_chooses_earliest_upload_time_across_files() -> None:
     """A PyPI release can have multiple distribution files (.whl
     for each platform + .tar.gz source). The earliest upload
@@ -899,6 +944,55 @@ def test_platform_compat_improvement_fires_when_resolved() -> None:
                     if f.kind == "platform_compat_improvement"]
     assert len(improvement) == 1
     assert improvement[0].severity == "info"
+
+
+def test_platform_compat_finding_ids_use_bump_prefix() -> None:
+    """Finding ids minted by the bump evaluator carry the
+    evaluator's own namespace (kinds.py: ``sca:bump:``), like every
+    sibling constructor in the module — these two kinds drifted onto
+    the vuln_type prefix, splitting suppression / baseline keys from
+    the rest of the evaluator's output."""
+    from packages.sca.kinds import BUMP_ID_PREFIX
+    now = datetime(2026, 5, 15, tzinfo=timezone.utc)
+    pypi = _pypi_with_wheels({
+        "z3-solver": {
+            # 4.15: installable on glibc 2.36; 4.16: needs 2.38;
+            # 4.17: ships a 2.34 fallback. 4.15→4.16 mints the
+            # regression, 4.16→4.17 the improvement.
+            "4.15.0.0": [
+                "z3_solver-4.15.0.0-py3-none-manylinux_2_17_aarch64.whl",
+            ],
+            "4.16.0.0": [
+                "z3_solver-4.16.0.0-py3-none-manylinux_2_38_aarch64.whl",
+            ],
+            "4.17.0.0": [
+                "z3_solver-4.17.0.0-py3-none-manylinux_2_34_aarch64.whl",
+            ],
+        },
+    })
+    matrix = _matrix_with("aarch64", "glibc", (2, 36))
+    regression = [
+        f for f in evaluate_bump_supply_chain(
+            ecosystem="PyPI", name="z3-solver",
+            current_version="4.15.0.0", target_version="4.16.0.0",
+            pypi_client=pypi, npm_client=None,
+            platform_matrix=matrix, now=now,
+        )
+        if f.kind == "platform_compat_regression"
+    ]
+    improvement = [
+        f for f in evaluate_bump_supply_chain(
+            ecosystem="PyPI", name="z3-solver",
+            current_version="4.16.0.0", target_version="4.17.0.0",
+            pypi_client=pypi, npm_client=None,
+            platform_matrix=matrix, now=now,
+        )
+        if f.kind == "platform_compat_improvement"
+    ]
+    assert len(regression) == 1
+    assert len(improvement) == 1
+    for f in regression + improvement:
+        assert f.finding_id.startswith(BUMP_ID_PREFIX)
 
 
 def test_platform_compat_no_finding_when_both_ok() -> None:

@@ -45,7 +45,7 @@ from contextlib import asynccontextmanager, contextmanager
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterator
+    from collections.abc import AsyncIterator, Callable, Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +72,10 @@ class AdaptiveThrottle:
         doubling.
     min_workers:
         Floor — never reduce below this.
+    clock:
+        Monotonic time source for cooldown bookkeeping.  Defaults to
+        ``time.monotonic``.  Tests inject a fake clock so cooldown
+        choreography never races wall time.
     """
 
     def __init__(
@@ -81,10 +85,17 @@ class AdaptiveThrottle:
         cooldown_s: float = _DEFAULT_COOLDOWN_S,
         min_workers: int = _MIN_WORKERS,
         auto_register: bool = True,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self._max_workers = max(max_workers, 1)
         self._cooldown_s = cooldown_s
         self._min_workers = max(min_workers, 1)
+        # Resolved at construction (not in the signature default) so a
+        # caller that patches ``time.monotonic`` before constructing
+        # still takes effect.
+        self._clock: Callable[[], float] = (
+            clock if clock is not None else time.monotonic
+        )
 
         self._lock = threading.Lock()
         self._effective = self._max_workers
@@ -156,7 +167,7 @@ class AdaptiveThrottle:
         through the reduction and only wake on the next release.
         """
         with self._condition:
-            self._last_signal = time.monotonic()
+            self._last_signal = self._clock()
             self._signal_count += 1
             old = self._effective
             self._effective = max(self._effective // 2, self._min_workers)
@@ -187,7 +198,7 @@ class AdaptiveThrottle:
             if self._effective >= self._max_workers:
                 return
             anchor = max(self._last_signal, self._last_ramp)
-            elapsed = time.monotonic() - anchor
+            elapsed = self._clock() - anchor
             if elapsed >= self._cooldown_s:
                 # Credit every FULL quiet interval since the anchor —
                 # a checker that only wakes occasionally still earns
@@ -204,7 +215,7 @@ class AdaptiveThrottle:
                         break
                     new *= 2
                 self._effective = min(new, self._max_workers)
-                self._last_ramp = time.monotonic()
+                self._last_ramp = self._clock()
                 logger.info(
                     "throttle: cooldown elapsed — concurrency %d → %d%s",
                     old, self._effective,
@@ -322,23 +333,37 @@ class AdaptiveThrottle:
         before entering the wait loop and after each timeout expiry
         (the ``wait()`` releases the lock internally, so
         ``_maybe_restore`` runs outside the held region).
+
+        A normal-priority waiter registers in ``_sync_waiters`` ONCE
+        and stays registered until it has acquired (or unwound) — not
+        per wait cycle.  A per-cycle decrement left a between-cycles
+        gap (lock dropped, ``_maybe_restore`` running) in which the
+        counter read 0 with the waiter still logically waiting, so a
+        low-priority caller whose 0.5s expiry landed in the gap could
+        legally take the freed slot first — the order the priority
+        contract forbids.
         """
-        while True:
-            self._maybe_restore()
-            with self._condition:
-                if self._in_flight < self._effective and (
-                    not low_priority or self._sync_waiters == 0
-                ):
-                    self._in_flight += 1
-                    break
-                if low_priority:
+        registered = False
+        try:
+            while True:
+                self._maybe_restore()
+                with self._condition:
+                    if self._in_flight < self._effective and (
+                        not low_priority or self._sync_waiters == 0
+                    ):
+                        self._in_flight += 1
+                        break
+                    if not low_priority and not registered:
+                        self._sync_waiters += 1
+                        registered = True
                     self._condition.wait(timeout=0.5)
-                else:
-                    self._sync_waiters += 1
-                    try:
-                        self._condition.wait(timeout=0.5)
-                    finally:
-                        self._sync_waiters -= 1
+        finally:
+            if registered:
+                with self._condition:
+                    self._sync_waiters -= 1
+                    # A deferring low-priority waiter may be eligible
+                    # the moment the last normal waiter deregisters.
+                    self._condition.notify_all()
         try:
             yield
         finally:

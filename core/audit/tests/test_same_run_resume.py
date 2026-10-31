@@ -3,9 +3,12 @@ prior-segment ledger booking. Zero LLM calls."""
 
 from __future__ import annotations
 
+import pytest
+
 from core.audit.cost_tracker import PRIOR_SEGMENTS_PHASE, PhaseCostLedger
 from core.audit.gaps import compute_gaps
 from core.audit.orchestrator import OrchestratorConfig, OrchestratorResult
+from core.audit.record import _compute_hash
 from core.audit.strategy import strategies_from_item
 from core.audit.verdict_reuse import import_reused_verdicts
 from core.coverage.journal import (
@@ -97,7 +100,9 @@ class TestOwnRunReuseFold:
         original = _entry(target, verdict="suspicious")
         corrective = _entry(
             target, verdict="clean", strategies=[], line_end=None,
-            source_hash=hash_span(target / "auth.c", 1, 1),
+            # The corrective writer's minimal gap had no line_end, so
+            # its stamp covers the fallback read window.
+            source_hash=_compute_hash(target, "auth.c", 1, None),
             body="[resolution] corrective entry",
         )
         run_dir = _run_dir(tmp_path, original, corrective)
@@ -311,7 +316,7 @@ class TestMultiResumeCostContinuity:
     immediately-prior segment's ledger — pre-fix a segment whose
     predecessor died unreconciled restarted the chain, and the final
     ledger under-reported the run by all earlier segments' spend
-    (observed live: segment 4 booked $47.29 of a ~$4,534 run).
+    (observed live: segment 4 booked only ~1% of its run's spend).
     """
 
     def _segment(self, tmp_path, segment, own_spend, *, reconcile=True):
@@ -400,17 +405,17 @@ class TestMultiResumeCostContinuity:
         out_dir = tmp_path / "run1"
         out_dir.mkdir(exist_ok=True)
         (out_dir / "cost-breakdown.json").write_text(_json.dumps({
-            "phases": {"re_review": {"calls": 129, "cost_usd": 14.0}},
+            "phases": {"re_review": {"calls": 129, "cost_usd": 12.5}},
             "totals": {
-                "cost_usd": 14.0072,
+                "cost_usd": 12.5034,
                 "calls": 129,
                 "failed_attempts_cost_usd": 0.0,
-                "unattributed_cost_usd": 33.2853,
-                "total_spend_usd": 47.2925,
+                "unattributed_cost_usd": 21.7881,
+                "total_spend_usd": 34.2915,
             },
         }))
         booked, note = resolve_prior_spend(out_dir)
-        assert abs(booked - 47.2925) < 1e-6
+        assert abs(booked - 34.2915) < 1e-6
         assert note == "reconciled ledger"
 
     def test_journal_floor_rescues_legacy_broken_ledger(self, tmp_path):
@@ -427,7 +432,7 @@ class TestMultiResumeCostContinuity:
         out_dir.mkdir(exist_ok=True)
         (out_dir / "cost-breakdown.json").write_text(_json.dumps({
             "phases": {},
-            "totals": {"cost_usd": 47.29, "total_spend_usd": 47.29},
+            "totals": {"cost_usd": 34.29, "total_spend_usd": 34.29},
         }))
         for i, cost in enumerate((150.0, 250.0)):
             append_entry(out_dir, ReviewJournalEntry(
@@ -754,3 +759,463 @@ class TestPerSiteEligibility:
         )
         assert stats2 == {"auth.c:check_pw": "strategy_changed"}
         assert sink2 == {}
+
+
+class TestDarkRowResumeMatrix:
+    """dark × EVERY fold mode: the resume × reuse × dark matrix.
+
+    ``dark`` is the unresolved gate-resolution bucket ("tool-blind,
+    needs concrete verification"). A dark journal row may be
+    suppressed from the gap list ONLY when it simultaneously rides
+    the $0 verdict-reuse import — imported outcomes carry
+    ``status="dark"`` and the post-loop dark-verification pass
+    re-walks them. On every fold mode without that import route the
+    row must resurface as a gap (over-review direction, matching
+    error's retry contract). The reviewed-set hardening closed the
+    audit-log and journal ``reviewed_set`` suppression surfaces; this
+    matrix pins the third surface — compute_gaps' journal folds — on
+    every mode combination so no untested path can suppress dark.
+
+    Modes (own-journal fold branch × reuse wiring):
+
+    * ``plain``            — fresh run, reuse off
+    * ``plain-same-run``   — same-run resume, reuse off (the cold
+                             profile: ``--no-verdict-reuse`` resume)
+    * ``plain-reuse``      — reuse ON but NOT same-run mode (project
+                             route): the own-journal fold is still
+                             the plain fold and never feeds the sink
+    * ``verified-same-run``— same-run resume with reuse on: the one
+                             mode whose fold imports
+    * ``project``          — prior-run row via the project index,
+                             reuse off
+    * ``project-reuse``    — prior-run row via the project index,
+                             reuse on: imports
+    """
+
+    _MODES = (
+        "plain",
+        "plain-same-run",
+        "plain-reuse",
+        "verified-same-run",
+        "project",
+        "project-reuse",
+    )
+    #: Modes whose fold imports into the reuse sink — the only modes
+    #: where a dark row may be suppressed (it re-adjudicates as an
+    #: imported dark outcome).
+    _IMPORTING = {"verified-same-run", "project-reuse"}
+
+    def _fold(self, tmp_path, mode, verdict):
+        """Run compute_gaps in *mode* over one journaled *verdict* row.
+
+        Returns ``(gap_keys, sink)`` — ``sink`` is the reuse sink that
+        was wired in (empty dict for the reuse-off modes, which pass
+        ``reuse_sink=None``).
+        """
+        target = _write_target(tmp_path)
+        entry = _entry(target, verdict=verdict)
+        sink: dict = {}
+        kwargs: dict = {"current_model": "model-a"}
+        if mode in ("project", "project-reuse"):
+            project = tmp_path / "project"
+            prior_dir = project / "run0"
+            prior_dir.mkdir(parents=True, exist_ok=True)
+            append_entry(prior_dir, entry)
+            merge_into_index(project, prior_dir)
+            kwargs["project_dir"] = project
+        else:
+            kwargs["out_dir"] = _run_dir(tmp_path, entry)
+        kwargs["own_run_reuse"] = mode in (
+            "plain-same-run", "verified-same-run")
+        reuse_on = mode in ("plain-reuse", *self._IMPORTING)
+        kwargs["reuse_sink"] = sink if reuse_on else None
+        gaps = compute_gaps(_checklist(target), [], **kwargs)
+        return _gap_keys(gaps), sink
+
+    @pytest.mark.parametrize("mode", _MODES)
+    def test_dark_never_silently_suppressed(self, tmp_path, mode):
+        gap_keys, sink = self._fold(tmp_path, mode, "dark")
+        if mode in self._IMPORTING:
+            # Suppression is legitimate here BECAUSE the row is
+            # imported: the $0 dark outcome re-enters the post-loop
+            # dark-verification pass.
+            assert "auth.c:check_pw" not in gap_keys, mode
+            assert "auth.c:check_pw" in sink, mode
+            assert sink["auth.c:check_pw"].verdict == "dark", mode
+        else:
+            # No import route → the row must re-enter review.
+            assert "auth.c:check_pw" in gap_keys, (
+                f"mode {mode}: dark row suppressed with no "
+                "re-adjudication route"
+            )
+            assert "auth.c:check_pw" not in sink, mode
+
+    @pytest.mark.parametrize("mode", _MODES)
+    def test_error_control_resurfaces_everywhere(self, tmp_path, mode):
+        gap_keys, sink = self._fold(tmp_path, mode, "error")
+        assert "auth.c:check_pw" in gap_keys, mode
+        assert "auth.c:check_pw" not in sink, mode
+
+    @pytest.mark.parametrize("mode", _MODES)
+    def test_clean_control_suppresses_everywhere(self, tmp_path, mode):
+        gap_keys, _ = self._fold(tmp_path, mode, "clean")
+        assert "auth.c:check_pw" not in gap_keys, mode
+
+
+class TestDarkRowVerifiedFoldRoutes:
+    """Reuse ON is not blanket permission: inside the verified fold,
+    only the route that actually IMPORTS a dark row may credit it.
+    Binary rows, hashless rows, and unstamped rows credit without
+    importing for settled verdicts — for dark they must resurface."""
+
+    def _fold(self, entries, target, current_spans=None,
+              binary_hashes=None):
+        from core.audit.gaps import _verify_entries_fold
+        covered: set = set()
+        sink: dict = {}
+        _verify_entries_fold(
+            covered, entries, target_path=target,
+            current_spans=current_spans or {"auth.c:check_pw": (1, 5)},
+            binary_hashes=binary_hashes,
+            reuse_sink=sink,
+            current_strategies_fn=lambda *_: set(_current_strategies()),
+            current_model="model-a",
+            source_label="test",
+        )
+        return covered, sink
+
+    def _stamped(self, tmp_path, target, **over):
+        """A MAC-stamped row (written through the production writer)."""
+        from core.coverage.journal import load_entries
+        run_dir = tmp_path / "stamp"
+        run_dir.mkdir(exist_ok=True)
+        append_entry(run_dir, _entry(target, **over))
+        return load_entries(run_dir)[-1]
+
+    def test_unstamped_dark_row_never_credits(self, tmp_path):
+        # Unstamped rows are hash-gated fold credit ONLY (no reuse
+        # import) — so an unstamped dark row has no re-adjudication
+        # route and must resurface even though its hash verifies.
+        target = _write_target(tmp_path)
+        covered, sink = self._fold([_entry(target, verdict="dark")], target)
+        assert covered == set()
+        assert sink == {}
+        # Control: the same unstamped row with a settled verdict keeps
+        # the legacy hash-gated suppression.
+        covered, sink = self._fold([_entry(target, verdict="clean")], target)
+        assert covered == {"auth.c:check_pw"}
+        assert sink == {}
+
+    def test_hashless_dark_row_never_credits(self, tmp_path):
+        # Reuse requires positive hash evidence; a verified-but-
+        # hashless dark row cannot import, so it must resurface.
+        target = _write_target(tmp_path)
+        row = self._stamped(tmp_path, target, verdict="dark",
+                            source_hash="")
+        covered, sink = self._fold([row], target)
+        assert covered == set()
+        assert sink == {}
+        # Control: settled hashless verified rows keep the historical
+        # suppression.
+        row = self._stamped(tmp_path, target, verdict="clean",
+                            source_hash="")
+        covered, sink = self._fold([row], target)
+        assert covered == {"auth.c:check_pw"}
+
+    def test_binary_dark_row_never_credits(self, tmp_path):
+        # The binary branch credits and continues without ever
+        # reaching the reuse import — a dark binary row has no
+        # re-adjudication route even with reuse on.
+        target = _write_target(tmp_path)
+        row = self._stamped(tmp_path, target, verdict="dark",
+                            source_hash="bin:deadbeef")
+        covered, sink = self._fold(
+            [row], target,
+            binary_hashes={"auth.c:check_pw": "bin:deadbeef"},
+        )
+        assert covered == set()
+        assert sink == {}
+        # Control: a settled binary row with a matching anchor stays
+        # covered.
+        row = self._stamped(tmp_path, target, verdict="clean",
+                            source_hash="bin:deadbeef")
+        covered, sink = self._fold(
+            [row], target,
+            binary_hashes={"auth.c:check_pw": "bin:deadbeef"},
+        )
+        assert covered == {"auth.c:check_pw"}
+
+    def test_dark_resurface_named_in_reuse_stats(self, tmp_path):
+        # The resurfacing is attributable: the not-reusable split
+        # names the driver so a resume's re-review storm is
+        # explainable from the run summary. (Project-index fold with
+        # reuse off — the verified-fold route that records stats.)
+        target = _write_target(tmp_path)
+        project = tmp_path / "project"
+        prior_dir = project / "run0"
+        prior_dir.mkdir(parents=True)
+        append_entry(prior_dir, _entry(target, verdict="dark"))
+        merge_into_index(project, prior_dir)
+        stats: dict = {}
+        gaps = compute_gaps(
+            _checklist(target), [], project_dir=project,
+            reuse_sink=None, current_model="model-a",
+            reuse_stats=stats,
+        )
+        assert "auth.c:check_pw" in _gap_keys(gaps)
+        assert stats == {"auth.c:check_pw": "dark_unresolved"}
+
+
+class TestDarkRecordSurfaces:
+    """Store/record-layer directions of the dark matrix.
+
+    Same defect class as the fold modes, different surfaces: a dark
+    row must not become coverage through a COVERAGE RECORD
+    (functions_analysed) or through the coverage store's journal
+    import either — neither surface has any re-adjudication route.
+    """
+
+    def _record_gaps(self, tmp_path, status):
+        target = _write_target(tmp_path)
+        from core.coverage import journal_mac
+        row = {"file": "auth.c", "function": "check_pw",
+               "status": status}
+        token = journal_mac.mint_coverage_row(row, "journal")
+        assert token
+        row[journal_mac.TOKEN_KEY] = token
+        record = {"tool": "journal", "functions_analysed": [row]}
+        return _gap_keys(compute_gaps(_checklist(target), [record]))
+
+    @pytest.mark.parametrize("status,suppressed", [
+        ("dark", False),
+        ("error", False),
+        ("clean", True),
+    ])
+    def test_record_surface_dark_never_suppresses(
+            self, tmp_path, status, suppressed):
+        gap_keys = self._record_gaps(tmp_path, status)
+        assert ("auth.c:check_pw" not in gap_keys) is suppressed, status
+
+    @pytest.mark.parametrize("verdict,marked", [
+        ("dark", 0),
+        ("error", 0),
+        ("clean", 1),
+    ])
+    def test_store_import_skips_dark_rows(self, tmp_path, verdict,
+                                          marked):
+        from unittest import mock
+
+        from core.coverage.importer import import_journal
+        from core.coverage.store import CoverageStore
+
+        target = _write_target(tmp_path)
+        entry = _entry(target, verdict=verdict)
+        store = CoverageStore(tmp_path / "coverage.json")
+        with mock.patch(
+            "core.coverage.journal.load_index",
+            return_value={entry.key: entry},
+        ):
+            marks = import_journal(store, tmp_path, _checklist(target))
+        assert marks == marked, verdict
+        assert bool(
+            store.tool_coverage_of_range("auth.c", 1, 5)
+        ) is bool(marked), verdict
+
+    def test_store_import_skips_edge_rows(self, tmp_path):
+        # An edge-contract row keys on the CALLER: marking its full
+        # range would vanish a never-reviewed function from every
+        # store-derived gap view (the entry.key invariant).
+        from unittest import mock
+
+        from core.coverage.importer import import_journal
+        from core.coverage.store import CoverageStore
+
+        target = _write_target(tmp_path)
+        entry = _entry(target, edge_callee="lib.c:callee")
+        store = CoverageStore(tmp_path / "coverage.json")
+        with mock.patch(
+            "core.coverage.journal.load_index",
+            return_value={entry.key: entry},
+        ):
+            marks = import_journal(store, tmp_path, _checklist(target))
+        assert marks == 0
+        assert not store.tool_coverage_of_range("auth.c", 1, 5)
+
+    # ── record BUILDER directions (coverage-journal.json) ───────────
+    #
+    # The builder feeds two durable consumers with the same row: the
+    # coverage store (import_functions_analysed → llm-gap views,
+    # --fail-under) and the audit gap fold (_build_covered_set). A
+    # dark/error/edge journal row must not become a
+    # functions_analysed mark on either.
+
+    def _build_record(self, tmp_path, *entries):
+        from core.coverage.record import build_from_journal
+        run_dir = tmp_path / "builder-run"
+        run_dir.mkdir(exist_ok=True)
+        for entry in entries:
+            append_entry(run_dir, entry)
+        return build_from_journal(run_dir)
+
+    @pytest.mark.parametrize("verdict", ["dark", "error"])
+    def test_builder_screens_unresolved_rows(self, tmp_path, verdict):
+        target = _write_target(tmp_path)
+        record = self._build_record(
+            tmp_path, _entry(target, verdict=verdict))
+        # No earner → no coverage rows, but the unresolved counts
+        # stay visible in journal_statuses (a record of "this run
+        # carried unresolved work", never a mark).
+        assert record is not None
+        assert record["functions_analysed"] == []
+        assert record["journal_statuses"] == {verdict: 1}
+
+    def test_builder_screens_edge_rows(self, tmp_path):
+        target = _write_target(tmp_path)
+        record = self._build_record(
+            tmp_path, _entry(target, edge_callee="lib.c:callee"))
+        assert record is None
+
+    def test_builder_keeps_earners_beside_screened_rows(self, tmp_path):
+        target = _write_target(tmp_path)
+        record = self._build_record(
+            tmp_path,
+            _entry(target, verdict="clean"),
+            _entry(target, function="f_dark", verdict="dark"),
+            _entry(target, function="f_err", verdict="error"),
+            _entry(target, function="f_edge",
+                   edge_callee="lib.c:callee"),
+        )
+        assert record is not None
+        rows = {
+            (fa["file"], fa["function"]): fa.get("status")
+            for fa in record["functions_analysed"]
+        }
+        assert rows == {("auth.c", "check_pw"): "clean"}
+        # The screened unresolved rows stay visible in the summary
+        # counts (observability), just never as coverage rows.
+        assert record["journal_statuses"].get("dark") == 1
+        assert record["journal_statuses"].get("error") == 1
+
+    def test_builder_latest_per_key_prefers_correction(self, tmp_path):
+        # A Reflexion correction — not the seed row — determines the
+        # recorded status (the seed's first-seen-wins buried it).
+        target = _write_target(tmp_path)
+        record = self._build_record(
+            tmp_path,
+            _entry(target, verdict="suspicious"),
+            _entry(target, verdict="clean",
+                   body="[resolution] corrective entry"),
+        )
+        assert record is not None
+        (fa,) = record["functions_analysed"]
+        assert fa["status"] == "clean"
+
+    def test_builder_later_unresolved_row_parks_credit(self, tmp_path):
+        # Latest-per-key runs BEFORE the screen — the same order as
+        # the store's journal import — so a settled review followed
+        # by an errored/interrupted re-review resurfaces the function
+        # on BOTH durable lanes (over-review direction) instead of
+        # the two lanes disagreeing.
+        target = _write_target(tmp_path)
+        record = self._build_record(
+            tmp_path,
+            _entry(target, verdict="clean"),
+            _entry(target, verdict="error"),
+        )
+        assert record is not None
+        assert record["functions_analysed"] == []
+        assert record["journal_statuses"] == {"error": 1}
+
+    def test_builder_record_feeds_no_covered_set_for_screened(
+            self, tmp_path):
+        # Lane composition: the builder's record, walked by the audit
+        # gap fold, covers only the earner.
+        from core.audit.gaps import _build_covered_set
+        target = _write_target(tmp_path)
+        record = self._build_record(
+            tmp_path,
+            _entry(target, verdict="clean"),
+            _entry(target, function="f_dark", verdict="dark"),
+            _entry(target, function="f_edge",
+                   edge_callee="lib.c:callee"),
+        )
+        assert _build_covered_set([record]) == {"auth.c:check_pw"}
+
+    @pytest.mark.parametrize("status,marked", [
+        ("dark", 0),
+        ("error", 0),
+        ("clean", 1),
+    ])
+    def test_store_import_screens_legacy_record_rows(
+            self, tmp_path, status, marked):
+        # Legacy coverage-journal.json records written BEFORE the
+        # builder screen persist in old run dirs and are re-imported
+        # raw at every render — the store-lane consumer must apply
+        # the same discipline the audit gap fold already does.
+        from core.coverage.importer import (
+            _function_ranges,
+            _inventory_paths,
+            import_functions_analysed,
+        )
+        from core.coverage.store import CoverageStore
+
+        target = _write_target(tmp_path)
+        checklist = _checklist(target)
+        record = {
+            "tool": "journal",
+            "functions_analysed": [{
+                "file": "auth.c", "function": "check_pw",
+                "status": status,
+            }],
+        }
+        store = CoverageStore(tmp_path / "coverage.json")
+        marks = import_functions_analysed(
+            store, record, _function_ranges(checklist, normalise_hi=True),
+            _inventory_paths(checklist),
+        )
+        assert marks == marked, status
+        assert bool(
+            store.tool_coverage_of_range("auth.c", 1, 5)
+        ) is bool(marked), status
+
+
+class TestOwnRunFoldSpendRefusal:
+    """The own-run reuse fold is a SPEND-AUTHORIZING journal read: a
+    partial load silently re-buys every unloaded verdict, so it must
+    refuse (raise) instead of degrading. The plain (reuse-disabled)
+    fold keeps the historical degrade direction — it only grants
+    coverage credit, never $0 imports."""
+
+    def test_incomplete_journal_refuses_own_run_fold(
+            self, tmp_path, monkeypatch):
+        import core.coverage.journal as journal_mod
+        from core.coverage.journal import JournalIncomplete
+        target = _write_target(tmp_path)
+        run_dir = _run_dir(
+            tmp_path, _entry(target),
+            _entry(target, function="other_fn", line_start=2),
+        )
+        size = (run_dir / "review-journal.jsonl").stat().st_size
+        monkeypatch.setattr(journal_mod, "_MAX_JOURNAL_BYTES", size - 1)
+        with pytest.raises(JournalIncomplete):
+            compute_gaps(
+                _checklist(target), [], out_dir=run_dir,
+                reuse_sink={}, own_run_reuse=True,
+                current_model="model-a",
+            )
+
+    def test_incomplete_journal_degrades_plain_fold(
+            self, tmp_path, monkeypatch):
+        import core.coverage.journal as journal_mod
+        target = _write_target(tmp_path)
+        run_dir = _run_dir(
+            tmp_path, _entry(target),
+            _entry(target, function="other_fn", line_start=2),
+        )
+        size = (run_dir / "review-journal.jsonl").stat().st_size
+        monkeypatch.setattr(journal_mod, "_MAX_JOURNAL_BYTES", size - 1)
+        gaps = compute_gaps(
+            _checklist(target), [], out_dir=run_dir,
+            own_run_reuse=False,
+        )
+        assert isinstance(gaps, list)

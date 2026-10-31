@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 
 from packages.sca.llm.install_hook_review import (
     _merge_verdict,
@@ -140,3 +142,69 @@ class TestReviewInstallHooks:
         )
         review_install_hooks(object(), [finding])
         assert "llm_verdict" not in finding.evidence
+
+
+class TestConfidenceEscalateOnly:
+    def test_low_confidence_llm_malicious_keeps_mechanical_confidence(self):
+        """The module contract is escalate-only; pre-fix a low-confidence
+        LLM "malicious" replaced the mechanical Confidence("high", 0.95)
+        with 0.30, so the escalated-to-critical finding ranked BELOW
+        untouched ones for numeric-confidence consumers."""
+        from packages.sca.models import Confidence as _Confidence
+
+        finding = _make_finding(severity="high")
+        finding.confidence = _Confidence(
+            level="high", numeric=0.95, reason="mechanical detector",
+        )
+        verdict = InstallHookVerdict(
+            verdict="malicious",
+            confidence="low",
+            behaviours=[],
+            evidence_quotes=[],
+            reasoning="uncertain",
+        )
+        _merge_verdict(finding, verdict)
+        assert finding.severity == "critical"
+        assert finding.confidence.numeric >= 0.95
+        # LLM confidence still recorded for transparency.
+        assert finding.evidence["llm_confidence"] == "low"
+
+    def test_high_confidence_llm_malicious_still_takes_over(self):
+        from packages.sca.models import Confidence as _Confidence
+
+        finding = _make_finding(severity="high")
+        finding.confidence = _Confidence(
+            level="medium", numeric=0.70, reason="mechanical detector",
+        )
+        verdict = InstallHookVerdict(
+            verdict="malicious",
+            confidence="high",
+            behaviours=[],
+            evidence_quotes=[],
+            reasoning="clear exfil",
+        )
+        _merge_verdict(finding, verdict)
+        assert finding.confidence.numeric == pytest.approx(0.95)
+        assert finding.confidence.reason == "LLM classified as malicious"
+
+
+class TestScriptBodyCap:
+    def test_oversized_body_is_head_tail_sampled(self):
+        from packages.sca.llm.install_hook_review import (
+            _SCRIPT_BODY_CAP,
+            _cap_script_body,
+        )
+
+        head = "H" * (_SCRIPT_BODY_CAP // 2)
+        tail = "T" * (_SCRIPT_BODY_CAP // 2)
+        body = head + "M" * 500_000 + tail
+        capped = _cap_script_body(body)
+        assert len(capped) < len(body)
+        assert capped.startswith("H" * 100)
+        assert capped.endswith("T" * 100)
+        assert "omitted" in capped
+
+    def test_small_body_untouched(self):
+        from packages.sca.llm.install_hook_review import _cap_script_body
+
+        assert _cap_script_body("echo hi") == "echo hi"

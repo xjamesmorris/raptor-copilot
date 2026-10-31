@@ -78,11 +78,61 @@ def test_npm_alias_records_real_target(tmp_path: Path) -> None:
     deps = parse(p)
     assert len(deps) == 1
     d = deps[0]
-    # Name keeps the alias so the user sees what they wrote, but the
-    # purl reflects the real installed package.
-    assert d.name == "my-lodash"
+    # ``name`` is the REAL installed package — OSV queries key on it,
+    # so recording the alias spelling hid lodash's advisories in
+    # lockfile-less projects. The manifest spelling survives in
+    # ``alias_name`` for display and fix-materialisation.
+    assert d.name == "lodash"
+    assert d.alias_name == "my-lodash"
     assert d.pin_style is PinStyle.CARET
     assert d.version == "4.17.21"
+    assert d.purl == "pkg:npm/lodash@4.17.21"
+    # The corridor comes from the range after the alias target.
+    assert d.version_floor == "4.17.21"
+
+
+def test_npm_alias_scoped_target(tmp_path: Path) -> None:
+    p = _write(tmp_path, {
+        "dependencies": {"legacy-form": "npm:@scope/real@~1.2.3"},
+    })
+    deps = parse(p)
+    assert len(deps) == 1
+    d = deps[0]
+    assert d.name == "@scope/real"
+    assert d.alias_name == "legacy-form"
+    assert d.pin_style is PinStyle.TILDE
+    assert d.purl == "pkg:npm/@scope/real@1.2.3"
+
+
+def test_npm_alias_self_alias_and_protocol_form(tmp_path: Path) -> None:
+    # ``npm:lodash@^4`` under the same name is a version-forcing
+    # self-alias — no alias_name; ``npm:^4.17.21`` is the bare
+    # protocol-range form, whose range must never become a name.
+    p = _write(tmp_path, {
+        "dependencies": {
+            "lodash": "npm:lodash@^4.17.21",
+            "ms": "npm:^2.1.3",
+        },
+    })
+    deps = {d.name: d for d in parse(p)}
+    assert set(deps) == {"lodash", "ms"}
+    assert deps["lodash"].alias_name is None
+    assert deps["lodash"].version == "4.17.21"
+    assert deps["ms"].alias_name is None
+    assert deps["ms"].pin_style is PinStyle.CARET
+    assert deps["ms"].purl == "pkg:npm/ms@2.1.3"
+
+
+def test_non_aliased_dep_unchanged_by_alias_handling(tmp_path: Path) -> None:
+    p = _write(tmp_path, {
+        "dependencies": {"lodash": "^4.17.21"},
+    })
+    deps = parse(p)
+    assert len(deps) == 1
+    d = deps[0]
+    assert d.name == "lodash"
+    assert d.alias_name is None
+    assert d.pin_style is PinStyle.CARET
     assert d.purl == "pkg:npm/lodash@4.17.21"
 
 
@@ -167,3 +217,55 @@ def test_dep_rows_never_carry_the_project_license(tmp_path: Path) -> None:
     deps = parse(p)
     assert deps
     assert all(d.declared_license is None for d in deps)
+
+
+def test_npm_alias_digit_leading_target(tmp_path: Path) -> None:
+    p = _write(tmp_path, {
+        "dependencies": {"zip": "npm:7zip-bin@^5.0.0"},
+    })
+    [d] = parse(p)
+    assert d.name == "7zip-bin"
+    assert d.alias_name == "zip"
+    assert d.pin_style is PinStyle.CARET
+    assert d.purl == "pkg:npm/7zip-bin@5.0.0"
+
+
+def test_npm_protocol_bare_version_not_a_name(tmp_path: Path) -> None:
+    # ``npm:4.17.21`` / ``npm:1.x`` pin a version of the declared
+    # package — a version token must never become the canonical name.
+    p = _write(tmp_path, {
+        "dependencies": {"lodash": "npm:4.17.21", "ms": "npm:2.x"},
+    })
+    deps = {d.name: d for d in parse(p)}
+    assert set(deps) == {"lodash", "ms"}
+    assert deps["lodash"].version == "4.17.21"
+    assert deps["lodash"].alias_name is None
+    assert deps["ms"].alias_name is None
+
+
+def test_npm_malformed_scope_target_stays_unknown(tmp_path: Path) -> None:
+    # ``npm:@scope`` (scope marker, no name) — neither a name nor a
+    # range; the scope marker must not leak into version/purl.
+    p = _write(tmp_path, {"dependencies": {"x": "npm:@scope"}})
+    [d] = parse(p)
+    assert d.name == "x"
+    assert d.version is None
+    assert d.purl == "pkg:npm/x"
+    assert d.pin_style is PinStyle.UNKNOWN
+
+
+def test_all_digit_bare_version_is_exact_not_git(tmp_path):
+    """"1234567" is hex-shaped but far likelier a bare version than a
+    commit that spells only digits — a git classification suppressed
+    the EXACT pin (and its registry lookup) for a real version."""
+    p = tmp_path / "package.json"
+    p.write_text(
+        '{"dependencies": {"leftpad": "1234567", '
+        '"pinned": "deadbeefcafe"}}',
+        encoding="utf-8",
+    )
+    deps = {d.name: d for d in parse(p)}
+    assert deps["leftpad"].pin_style is PinStyle.EXACT
+    assert deps["leftpad"].version == "1234567"
+    # A sha with hex letters keeps the git classification.
+    assert deps["pinned"].pin_style is PinStyle.GIT

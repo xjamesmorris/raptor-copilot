@@ -87,8 +87,10 @@ def strategy_for_cwe(cwe: str) -> str | None:
     return _CWE_STRATEGY.get((cwe or "").upper().strip())
 
 
-def _find_sca_findings(out_dir: Path) -> Path | None:
-    """Newest SCA findings.json: own run dir first, then siblings."""
+def _find_sca_findings(out_dir: Path) -> tuple[Path, list] | None:
+    """Newest SCA findings.json (path + parsed rows): own run dir
+    first, then siblings. Returning the parsed rows spares the caller
+    a second full parse of the winning file."""
     try:
         out_dir = Path(out_dir)
         candidates = []
@@ -106,7 +108,6 @@ def _find_sca_findings(out_dir: Path) -> Path | None:
             # seeded audit strategies whenever runs shared a parent.
             own_target = None
             try:
-                from core.json import load_json
                 meta = load_json(out_dir / ".raptor-run.json",
                                  max_bytes=1024 * 1024)
                 own_target = ((meta or {}).get("target_path")
@@ -125,17 +126,17 @@ def _find_sca_findings(out_dir: Path) -> Path | None:
         # Keep only files whose rows actually look like SCA output
         # (audit runs write findings-graded.json, so collisions are
         # unlikely — but a list of sca-typed rows is the contract).
-        sca_files = []
+        sca_files: list[tuple[Path, list]] = []
         for cand in candidates:
             rows = load_json(cand, max_bytes=_MAX_FINDINGS_BYTES)
             if isinstance(rows, list) and any(
                 isinstance(r, dict) and r.get("vuln_type") == SCA_VULN_TYPE
                 for r in rows
             ):
-                sca_files.append(cand)
+                sca_files.append((cand, rows))
         if not sca_files:
             return None
-        return max(sca_files, key=lambda p: p.stat().st_mtime)
+        return max(sca_files, key=lambda e: e[0].stat().st_mtime)
     except Exception:
         logger.debug("SCA findings discovery failed", exc_info=True)
         return None
@@ -149,12 +150,10 @@ def load_component_priors(out_dir: Path) -> dict[str, dict[str, Any]]:
     Files come from the reachability evidence rows (``file:line``) —
     a component nobody imports produces no priors.
     """
-    findings_path = _find_sca_findings(out_dir)
-    if findings_path is None:
+    found = _find_sca_findings(out_dir)
+    if found is None:
         return {}
-    rows = load_json(findings_path, max_bytes=_MAX_FINDINGS_BYTES)
-    if not isinstance(rows, list):
-        return {}
+    findings_path, rows = found
 
     priors: dict[str, dict[str, Any]] = {}
     components_seen = 0
@@ -280,8 +279,17 @@ def apply_sca_advisories(
             if s not in strategies:
                 strategies.append(s)
         gap["strategies"] = strategies
-        hyps = gap.setdefault("injected_hypotheses", [])
-        if not any(h.get("source") == "sca_advisory" for h in hyps):
+        # "Never raises" (docstring contract): a malformed gap — a
+        # non-list injected_hypotheses or a non-dict entry — must not
+        # AttributeError outside the try above.
+        hyps = gap.get("injected_hypotheses")
+        if not isinstance(hyps, list):
+            hyps = []
+            gap["injected_hypotheses"] = hyps
+        if not any(
+            isinstance(h, dict) and h.get("source") == "sca_advisory"
+            for h in hyps
+        ):
             hyps.append({
                 "mechanism": _advisory_note(info),
                 "confidence": "medium" if info["cwes"] else "low",

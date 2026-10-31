@@ -1,11 +1,8 @@
 """Manifest parsers — one per file format.
 
-Every parser implements:
-
-    class ManifestParser(Protocol):
-        ecosystem: str
-        filenames: List[str]
-        def parse(self, path: Path) -> List[Dependency]: ...
+Parsers are plain functions registered per filename; the exported
+``ManifestParser`` Protocol documents the class-based shape for
+external implementations but no in-tree parser uses it.
 
 Discovery emits ``Manifest`` records keyed by filename; ``parse_manifest``
 dispatches to the right parser. Parsers do not call out to the network,
@@ -70,10 +67,18 @@ class ParseFailure:
 # ``package_lock_json.py``, etc. The path captured is the
 # parser's view of the manifest, which is what we want to show
 # operators.
+# (?=\S) pins the whitespace run before the lazy path (same
+# language — the path group absorbed any remainder): the naive
+# ``for\s+(?P<path>.+?)`` overlapped the run and the DOTALL group —
+# quadratic on a failure line ending in a whitespace run.
 _PARSE_FAILURE_RE = re.compile(
     r"sca\.parsers\.[\w_]+:\s+"
-    r"(?P<kind>\w+(?:\s\w+)?)\s+parse failed for\s+"
-    r"(?P<path>.+?):\s+(?P<reason>.+)$"
+    r"(?P<kind>\w+(?:\s\w+)?)\s+parse failed for\s+(?=\S)"
+    r"(?P<path>.+?):\s+(?P<reason>.+)$",
+    # DOTALL: PyYAML (and friends) raise multi-line error messages
+    # with source-context snippets; the reason must capture them or
+    # the whole failure silently misses the collector.
+    re.DOTALL,
 )
 
 # Pattern matching ``_safe_read.read_bounded``'s refusal warnings
@@ -83,9 +88,29 @@ _PARSE_FAILURE_RE = re.compile(
 # structured ``parse_failures`` on the run report, while a malformed
 # sibling shows up — the operator would have no structured trace of
 # the skipped file.
+# The path group is \S-delimited: the naive trim spelling
+# (.+?)\s+\( overlaps the lazy path and the following whitespace
+# span on horizontal whitespace, and a refusal line whose
+# target-derived path region carries a long whitespace run with no
+# '(' makes the engine try every split of the run between them —
+# cubic in the log-line length. Real refusal lines (the
+# read_bounded writer always interpolates a non-empty path) match
+# identically; the one dropped corner is a degenerate all-whitespace
+# path region, which previously minted a ParseFailure whose path
+# stripped to '' — noise, not signal.
+# Both variable regions are bounded and the path region is tempered
+# against the message head: unbounded fillers let a planted
+# "refusing to read" run inside the path region re-scan the rest of
+# the message from every occurrence — quadratic on hostile path
+# text. 4096 sits at PATH_MAX, far above anything the bounded
+# reader interpolates, and 256 far above any reason the writer
+# emits; a path carrying the head literal itself, or a longer
+# region, stops matching and the line simply stays an unstructured
+# warning (no wrong parse either way).
 _READ_REFUSAL_RE = re.compile(
     r"sca\.parsers:\s+refusing to read\s+"
-    r"(?P<path>.+?)\s+\((?P<reason>[^)]+)\)"
+    r"(?P<path>\S(?:(?:(?!sca\.parsers: refusing).){0,4096}?\S)?)"
+    r"\s+\((?P<reason>[^)]{1,256})\)"
 )
 
 
@@ -153,12 +178,18 @@ def capture_parse_failures() -> Iterator[list[ParseFailure]]:
     handler = _ParseFailureCollector()
     parsers_logger = logging.getLogger(__name__)
     parsers_logger.addHandler(handler)
+    # Restore the PREVIOUS collector on exit (not None): a nested
+    # capture — a helper that captures around one parse inside an
+    # outer discovery-stage capture — otherwise clobbered the outer
+    # collector, silently dropping every failure after the inner
+    # block.
+    prev = getattr(_TLS, "collector", None)
     _TLS.collector = handler
     try:
         yield handler.failures
     finally:
         parsers_logger.removeHandler(handler)
-        _TLS.collector = None
+        _TLS.collector = prev
 
 
 class ManifestParser(Protocol):
@@ -227,11 +258,17 @@ def parse_manifest(manifest: Manifest) -> list[Dependency]:
         return []
     try:
         return fn(manifest.path)
-    except Exception:  # noqa: BLE001 — parsers must never break the pipeline
+    except Exception as exc:  # noqa: BLE001 — parsers must never break the pipeline
+        # Name the escaping class: the collector lifts this message
+        # into the run report's parse_failures, and an anonymous
+        # "unhandled exception" hides which contract-violation class
+        # the parser leaked (the type name is safe to log; the
+        # message may quote hostile input and stays in exc_info).
         logger.warning(
             "sca.parsers.dispatch: uncaught parse failed for %s: "
-            "parser raised an unhandled exception",
+            "parser raised an unhandled exception (%s)",
             manifest.path,
+            exc.__class__.__name__,
             exc_info=True,
         )
         return []

@@ -495,7 +495,8 @@ class TestReadingListLanguageGate:
     def test_supported_language_registry(self) -> None:
         from core.audit.llm_review import STUDY_SUPPORTED_LANGUAGES
         for lang in ("C", "C++", "Python", "Go", "Java",
-                     "JavaScript", "TypeScript", "Rust"):
+                     "JavaScript", "TypeScript", "Rust", "PHP",
+                     "Kotlin", "C#", "Swift"):
             assert lang in STUDY_SUPPORTED_LANGUAGES
 
     def test_schema_no_longer_c_only(self) -> None:
@@ -530,7 +531,8 @@ class TestReadingListLanguageGate:
         )
         for prompt in (_DEFAULT_SYSTEM_PROMPT, _QUALITY_SYSTEM_PROMPT):
             assert "ASSUMED KNOWLEDGE (C/C++, Python, Go, Java, " \
-                   "JavaScript/TypeScript, and Rust)" in prompt
+                   "JavaScript/TypeScript, Rust, PHP, " \
+                   "Kotlin, C#, and Swift)" in prompt
             assert "C/C++ only" not in prompt
             assert "cannot resolve assumptions in other languages" \
                    not in prompt
@@ -601,3 +603,59 @@ class TestDeadLlmOnlyEvidenceRemoved:
         assert not hasattr(llm_review, "_LLM_ONLY_EVIDENCE")
         from core.audit.evidence_grade import _LLM_ONLY_EVIDENCE
         assert "manual" in _LLM_ONLY_EVIDENCE
+
+
+class TestConstraintKindSchemaValidation:
+    """Structured-output validation of constraints[].kind.
+
+    Review models recurrently emit kind="invariant"; a strictly
+    five-valued enum turned each such review into a schema-validation
+    failure (the whole review lost, error_class="internal", no in-run
+    retry). "invariant" is now accepted by the enum and coerced to
+    "state" at extraction; a genuinely unknown kind must still fail
+    validation.
+    """
+
+    @staticmethod
+    def _review_with_kind(kind: str) -> dict[str, Any]:
+        return {
+            "hypothesis": "h",
+            "counter_hypothesis": "c",
+            "counter_direction": "refutes_vuln",
+            "hypotheses": [],
+            "body": "b",
+            "cwe": "",
+            "verdict_rationale": "r",
+            "status": "clean",
+            "constraints": [
+                {"kind": kind, "target": "len", "rule": "len <= cap"},
+            ],
+        }
+
+    def test_invariant_kind_passes_validation(self) -> None:
+        pytest.importorskip("pydantic")
+        from core.audit.llm_review import REVIEW_SCHEMA
+        from core.llm.providers import _dict_schema_to_pydantic
+
+        model = _dict_schema_to_pydantic(REVIEW_SCHEMA)
+        validated = model.model_validate(self._review_with_kind("invariant"))
+        assert validated.constraints[0].kind == "invariant"
+
+    def test_unknown_kind_still_fails_validation(self) -> None:
+        pydantic = pytest.importorskip("pydantic")
+        from core.audit.llm_review import REVIEW_SCHEMA
+        from core.llm.providers import _dict_schema_to_pydantic
+
+        model = _dict_schema_to_pydantic(REVIEW_SCHEMA)
+        with pytest.raises(pydantic.ValidationError):
+            model.model_validate(self._review_with_kind("bogus_kind"))
+
+    def test_blind_schema_shares_constraints_property(self) -> None:
+        # REVIEW_SCHEMA_BLIND reuses the property object by reference,
+        # so the widened enum covers blind first-pass reviews too.
+        from core.audit.llm_review import REVIEW_SCHEMA, REVIEW_SCHEMA_BLIND
+
+        assert (
+            REVIEW_SCHEMA_BLIND["properties"]["constraints"]
+            is REVIEW_SCHEMA["properties"]["constraints"]
+        )

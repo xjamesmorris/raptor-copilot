@@ -1,0 +1,785 @@
+"""Exit-path contract for the /openant command (raptor_openant.py).
+
+Every path on which the target was NOT scanned must exit non-zero so
+the run lifecycle records a FAILED run — an empty-findings exit 0 is
+indistinguishable from a target that scanned clean in every cross-run
+findings view. Hard scanner failures (timeout, launch failure,
+exit >= 2, missing pipeline output) exit 1 with report
+outcome=scan_failed; not-configured runs (no usable openant-core)
+exit 3 with report outcome=not_configured, and neither writes an
+``openant_findings.json`` (the file is a claim that OpenAnt scanned
+the target). Only a scan that actually ran writes the findings file
+and completes the run.
+
+No LLM ever launches here: the fake openant-core provides its own
+``openant`` module that either exits with an error code or writes an
+empty pipeline_output.json.
+"""
+
+import json
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+_REPO_ROOT = Path(__file__).parents[3]  # packages/openant/tests -> repo root
+sys.path.insert(0, str(_REPO_ROOT))
+
+_FAKE_MAIN_EXIT3 = "import sys\nsys.exit(3)\n"
+
+_FAKE_MAIN_CLEAN = """\
+import json
+import sys
+
+out = None
+for i, a in enumerate(sys.argv):
+    if a == "--output" and i + 1 < len(sys.argv):
+        out = sys.argv[i + 1]
+if out:
+    with open(out + "/pipeline_output.json", "w") as f:
+        json.dump({"findings": [], "pipeline_stats": {}}, f)
+sys.exit(0)
+"""
+
+
+def _make_fake_core(src_dir: Path, main_body: str) -> Path:
+    """Build a fake openant-core whose ``openant`` module runs
+    ``main_body`` when the scanner launches ``python -m openant``.
+
+    Nested INSIDE the scanned repo dir: the scanner subprocess runs
+    sandboxed with only the target and output paths mounted, so a fake
+    core elsewhere under the host tmp dir would be invisible as the
+    subprocess cwd. Invocations pass --openant-core-unpinned alongside
+    the stub path — the flag surface is consent-gated against
+    non-pinned checkouts."""
+    core = src_dir / "openant-core"
+    (core / "core").mkdir(parents=True)
+    (core / "core" / "scanner.py").touch()
+    pkg = core / "openant"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "__main__.py").write_text(main_body)
+    return core
+
+
+def _run(cmd: list, env_extra: dict, env_drop: tuple = ()) -> subprocess.CompletedProcess:
+    env = {**os.environ, "_RAPTOR_TRUSTED": "1", **env_extra}
+    for key in env_drop:
+        env.pop(key, None)
+    return subprocess.run(
+        cmd, capture_output=True, text=True, timeout=300,
+        cwd=str(_REPO_ROOT), env=env,
+    )
+
+
+def _make_repo(base: Path) -> Path:
+    src = base / "src"
+    src.mkdir()
+    (src / "app.py").write_text("import os\n")
+    return src
+
+
+def _run_status(out_dir: Path) -> str:
+    meta = json.loads((out_dir / ".raptor-run.json").read_text())
+    return meta.get("status", "")
+
+
+def _discovery_would_succeed() -> bool:
+    """Mirror the child's config discovery with OPENANT_CORE and
+    RAPTOR_DIR removed — if a real openant-core sibling exists on this
+    machine, the not-configured test cannot run hermetically."""
+    from packages.openant.config import get_config
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("OPENANT_CORE", None)
+        os.environ.pop("RAPTOR_DIR", None)
+        try:
+            get_config(raptor_dir=_REPO_ROOT)
+            return True
+        except RuntimeError:
+            return False
+
+
+class TestHardErrorFailsRun(unittest.TestCase):
+    """Hard subprocess error → exit 1, lifecycle records status=failed."""
+
+    def test_scanner_exit3_fails_lifecycle(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            src = _make_repo(base)
+            core = _make_fake_core(src, _FAKE_MAIN_EXIT3)
+            out_dir = base / "out"
+            proc = _run(
+                [sys.executable, str(_REPO_ROOT / "raptor.py"), "openant",
+                 "--repo", str(src), "--out", str(out_dir),
+                 "--openant-core", str(core),
+                 "--openant-core-unpinned"],
+                {},
+            )
+            self.assertEqual(proc.returncode, 1,
+                             f"stdout={proc.stdout}\nstderr={proc.stderr}")
+            self.assertIn("OpenAnt scan failed", proc.stdout + proc.stderr)
+            self.assertEqual(_run_status(out_dir), "failed")
+            self.assertFalse(
+                (out_dir / "openant_findings.json").exists(),
+                "a failed scan must not leave a findings file behind")
+            report = json.loads(
+                (out_dir / "raptor_openant_report.json").read_text())
+            self.assertEqual(report["outcome"], "scan_failed")
+            # The failed run's report carries the resume-gate fields —
+            # a later --resume of this run must get the same drift
+            # refusal, shape adoption, and cost accounting a resume of
+            # a successful run gets.
+            self.assertIn("target_fingerprint", report)
+            self.assertEqual(report["config"]["model"], "sonnet")
+            self.assertIn("core_provenance", report["config"])
+            self.assertIn("total_usd", report["cost"])
+
+    def test_scanner_exit3_direct_exit_code(self):
+        """Direct raptor_openant.py invocation: same exit 1 without the
+        raptor.py lifecycle wrapper."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            src = _make_repo(base)
+            core = _make_fake_core(src, _FAKE_MAIN_EXIT3)
+            proc = _run(
+                [sys.executable, str(_REPO_ROOT / "raptor_openant.py"),
+                 "--repo", str(src), "--out", str(base / "out"),
+                 "--openant-core", str(core),
+                 "--openant-core-unpinned"],
+                {},
+            )
+            self.assertEqual(proc.returncode, 1,
+                             f"stdout={proc.stdout}\nstderr={proc.stderr}")
+
+
+class TestNotConfiguredFailsRun(unittest.TestCase):
+    """Not-configured → distinct exit 3, lifecycle records a FAILED
+    run, no findings file — the run cannot masquerade as a clean
+    completed scan in cross-run findings views."""
+
+    def test_invalid_core_path_fails_honestly(self):
+        """--openant-core pointing nowhere: nothing was scanned — exit
+        3, status=failed, outcome=not_configured, no findings file."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            src = _make_repo(base)
+            out_dir = base / "out"
+            proc = _run(
+                [sys.executable, str(_REPO_ROOT / "raptor.py"), "openant",
+                 "--repo", str(src), "--out", str(out_dir),
+                 "--openant-core", str(base / "does-not-exist"),
+                 "--openant-core-unpinned"],
+                {},
+            )
+            self.assertEqual(proc.returncode, 3,
+                             f"stdout={proc.stdout}\nstderr={proc.stderr}")
+            self.assertIn("OpenAnt not available", proc.stdout + proc.stderr)
+            self.assertEqual(_run_status(out_dir), "failed")
+            self.assertFalse(
+                (out_dir / "openant_findings.json").exists(),
+                "a not-configured run must not leave a findings file")
+            report = json.loads(
+                (out_dir / "raptor_openant_report.json").read_text())
+            self.assertEqual(report["outcome"], "not_configured")
+
+    @unittest.skipIf(_discovery_would_succeed(),
+                     "a real openant-core is discoverable on this machine")
+    def test_missing_core_checkout_exits_three(self):
+        """No OPENANT_CORE, no discoverable checkout: the discovery
+        RuntimeError is a not-configured outcome — exit 3."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            src = _make_repo(base)
+            proc = _run(
+                [sys.executable, str(_REPO_ROOT / "raptor_openant.py"),
+                 "--repo", str(src), "--out", str(base / "out")],
+                {}, env_drop=("OPENANT_CORE", "RAPTOR_DIR"),
+            )
+            self.assertEqual(proc.returncode, 3,
+                             f"stdout={proc.stdout}\nstderr={proc.stderr}")
+            self.assertIn("OpenAnt not available", proc.stdout + proc.stderr)
+
+
+class TestCleanScanUnchanged(unittest.TestCase):
+    """A scan that ran and found nothing still exits 0 and completes."""
+
+    def test_zero_findings_scan_exit_zero(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            src = _make_repo(base)
+            core = _make_fake_core(src, _FAKE_MAIN_CLEAN)
+            out_dir = base / "out"
+            proc = _run(
+                [sys.executable, str(_REPO_ROOT / "raptor.py"), "openant",
+                 "--repo", str(src), "--out", str(out_dir),
+                 "--openant-core", str(core),
+                 "--openant-core-unpinned"],
+                {},
+            )
+            self.assertEqual(proc.returncode, 0,
+                             f"stdout={proc.stdout}\nstderr={proc.stderr}")
+            self.assertIn("OPENANT WORKFLOW COMPLETE", proc.stdout)
+            self.assertEqual(_run_status(out_dir), "completed")
+            findings = json.loads(
+                (out_dir / "openant_findings.json").read_text())
+            self.assertEqual(findings, [])
+
+
+_FAKE_MAIN_60_FINDINGS = """\
+import json
+import sys
+
+out = None
+for i, a in enumerate(sys.argv):
+    if a == "--output" and i + 1 < len(sys.argv):
+        out = sys.argv[i + 1]
+findings = []
+for n in range(55):
+    findings.append({
+        "id": "VULN-%03d" % n,
+        "stage1_verdict": "vulnerable",
+        "location": {"file": "src/app.py", "function": "f%d" % n},
+        "cwe_id": 78,
+        "description": "warning-level finding",
+    })
+for n in range(55, 60):
+    findings.append({
+        "id": "VULN-%03d" % n,
+        "stage1_verdict": "vulnerable",
+        "stage2_verdict": "confirmed",
+        "location": {"file": "src/app.py", "function": "f%d" % n},
+        "cwe_id": 78,
+        "description": "error-level finding emitted LAST",
+    })
+if out:
+    with open(out + "/pipeline_output.json", "w") as f:
+        json.dump({"findings": findings, "pipeline_stats": {}}, f)
+sys.exit(1)
+"""
+
+
+class TestMaxFindingsArtifactHonesty(unittest.TestCase):
+    """--max-findings caps only the markdown report (severity-first,
+    truncation stated). The durable openant_findings.json artifact —
+    what /validate, merged views and cross-run correlation consume —
+    is NEVER capped: the pipeline-order slice dropped whatever OpenAnt
+    emitted last, including every error-level finding, while the
+    terminal, the JSON report and all doc surfaces claimed the full
+    count."""
+
+    def _scan_60(self, td: Path) -> Path:
+        base = Path(td)
+        src = _make_repo(base)
+        core = _make_fake_core(src, _FAKE_MAIN_60_FINDINGS)
+        out_dir = base / "out"
+        proc = _run(
+            [sys.executable, str(_REPO_ROOT / "raptor.py"), "openant",
+             "--repo", str(src), "--out", str(out_dir),
+             "--openant-core", str(core),
+             "--openant-core-unpinned"],
+            {},
+        )
+        self.assertEqual(proc.returncode, 0,
+                         f"stdout={proc.stdout}\nstderr={proc.stderr}")
+        return out_dir
+
+    def test_artifact_uncapped_and_report_severity_first(self):
+        with tempfile.TemporaryDirectory() as td:
+            out_dir = self._scan_60(Path(td))
+            findings = json.loads(
+                (out_dir / "openant_findings.json").read_text())
+            self.assertEqual(len(findings), 60)
+            errors = [f for f in findings if f.get("level") == "error"]
+            self.assertEqual(len(errors), 5)
+            report = json.loads(
+                (out_dir / "raptor_openant_report.json").read_text())
+            phase = report["phases"]["openant_scan"]
+            self.assertEqual(phase["translated_findings"], 60)
+            self.assertEqual(phase["report_findings"], 50)
+            self.assertEqual(phase["report_truncated"], 10)
+            md = (out_dir / "openant-report.md").read_text()
+            self.assertIn("**Findings:** 60", md)
+            self.assertIn("Report truncated", md)
+            self.assertIn("top 50 of 60", md)
+            # Severity-first: ALL FIVE error-level findings (emitted
+            # last by the scanner) survive the cut.
+            self.assertIn("## High (5)", md)
+
+    def test_negative_max_findings_refused_at_parse(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            src = _make_repo(base)
+            core = _make_fake_core(src, _FAKE_MAIN_60_FINDINGS)
+            proc = _run(
+                [sys.executable, str(_REPO_ROOT / "raptor_openant.py"),
+                 "--repo", str(src), "--out", str(base / "out"),
+                 "--openant-core", str(core),
+                 "--openant-core-unpinned",
+                 "--max-findings", "-5"],
+                {},
+            )
+            self.assertEqual(proc.returncode, 2)
+            self.assertIn("positive integer", proc.stderr)
+
+
+class TestConsentRouteRecorded(unittest.TestCase):
+    """A consented run's report records the GATE's provenance (consent
+    route included), and the flag path warns once, not twice."""
+
+    def test_report_carries_gate_record_and_single_warning(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            src = _make_repo(base)
+            core = _make_fake_core(src, _FAKE_MAIN_CLEAN)
+            out_dir = base / "out"
+            proc = _run(
+                [sys.executable, str(_REPO_ROOT / "raptor_openant.py"),
+                 "--repo", str(src), "--out", str(out_dir),
+                 "--openant-core", str(core),
+                 "--openant-core-unpinned"],
+                {},
+            )
+            self.assertEqual(proc.returncode, 0,
+                             f"stdout={proc.stdout}\nstderr={proc.stderr}")
+            report = json.loads(
+                (out_dir / "raptor_openant_report.json").read_text())
+            prov = report["config"]["core_provenance"]
+            self.assertEqual(prov["consent"], "operator-flag")
+            # The fake core is the unverifiable non-git shape: exactly
+            # ONE loud warning (the gate's) — the scan-side re-run
+            # used to emit a second.
+            self.assertEqual(proc.stderr.count("UNVERIFIABLE"), 1,
+                             proc.stderr)
+
+
+_FAKE_MAIN_PARSE = """\
+import json
+import sys
+
+out = None
+for i, a in enumerate(sys.argv):
+    if a == "--output" and i + 1 < len(sys.argv):
+        out = sys.argv[i + 1]
+if out and "parse" in sys.argv:
+    with open(out + "/dataset.json", "w") as f:
+        json.dump({"units": [
+            {"id": "app.py:f", "code": {"primary_code": "x" * 200}},
+            {"id": "app.py:g", "code": {"primary_code": "y" * 300}},
+        ]}, f)
+sys.exit(0)
+"""
+
+
+class TestForecastExitPath(unittest.TestCase):
+    """--forecast: exit 0 with $0 LLM spend, report outcome=
+    forecast_only, and NO findings file — a forecast can never read as
+    a scan (clean or otherwise) in cross-run views."""
+
+    def test_forecast_only_exit_zero_no_findings(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            src = _make_repo(base)
+            core = _make_fake_core(src, _FAKE_MAIN_PARSE)
+            out_dir = base / "out"
+            out_dir.mkdir()
+            proc = _run(
+                [sys.executable, str(_REPO_ROOT / "raptor_openant.py"),
+                 "--repo", str(src), "--out", str(out_dir), "--forecast",
+                 "--openant-core", str(core),
+                 "--openant-core-unpinned"],
+                {},
+            )
+            self.assertEqual(proc.returncode, 0,
+                             f"stdout={proc.stdout}\nstderr={proc.stderr}")
+            self.assertIn("Cost forecast:", proc.stdout)
+            self.assertIn("no scan performed", proc.stdout)
+            self.assertFalse(
+                (out_dir / "openant_findings.json").exists(),
+                "a forecast must not leave a findings file behind")
+            report = json.loads(
+                (out_dir / "raptor_openant_report.json").read_text())
+            self.assertEqual(report["outcome"], "forecast_only")
+            self.assertEqual(report["forecast"]["units"],
+                             {"enhance": 2, "analyze": 2})
+            self.assertEqual(report["cost"]["total_usd"], 0.0)
+
+
+class TestResumeRefusalExitPath(unittest.TestCase):
+    """--resume validation refusal: exit 2, report outcome=
+    resume_refused, no findings file."""
+
+    def test_resume_of_never_scanned_run_refuses(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            src = _make_repo(base)
+            core = _make_fake_core(src, _FAKE_MAIN_PARSE)
+            prior = base / "prior"
+            prior.mkdir()
+            (prior / "raptor_openant_report.json").write_text(json.dumps({
+                "repository": str(src),
+                "outcome": "not_configured",
+                "phases": {"openant_scan": {"completed": False}},
+            }))
+            out_dir = base / "out"
+            out_dir.mkdir()
+            proc = _run(
+                [sys.executable, str(_REPO_ROOT / "raptor_openant.py"),
+                 "--repo", str(src), "--out", str(out_dir),
+                 "--resume", str(prior),
+                 "--openant-core", str(core),
+                 "--openant-core-unpinned"],
+                {},
+            )
+            self.assertEqual(proc.returncode, 2,
+                             f"stdout={proc.stdout}\nstderr={proc.stderr}")
+            self.assertIn("never scanned", proc.stdout + proc.stderr)
+            self.assertFalse((out_dir / "openant_findings.json").exists())
+            report = json.loads(
+                (out_dir / "raptor_openant_report.json").read_text())
+            self.assertEqual(report["outcome"], "resume_refused")
+
+
+class TestCostLedgerBounding(unittest.TestCase):
+    """Cost figures read from child-writable run-dir ledgers must come
+    out finite, bounded, and non-negative — a planted non-finite would
+    otherwise reach save_json (allow_nan=False) and destroy the report
+    it rides in."""
+
+    def _reconcile(self, gateway_payload: str,
+                   token_usage: dict | None = None) -> dict:
+        import raptor_openant
+        with tempfile.TemporaryDirectory() as td:
+            oa_out = Path(td)
+            (oa_out / "openant-gateway-spend.json").write_text(
+                gateway_payload)
+            return raptor_openant._reconcile_run_cost(
+                oa_out, token_usage or {})
+
+    def test_nonfinite_gateway_figure_books_zero(self):
+        # stdlib json parses 1e309 to inf (orjson is optional); the
+        # literal Infinity spelling must book the same $0.
+        for payload in ('{"dispatcher_spent_usd": 1e309}',
+                        '{"dispatcher_spent_usd": -1e309}'):
+            cost = self._reconcile(payload)
+            self.assertEqual(cost["gateway_ledger_usd"], 0.0, payload)
+            self.assertEqual(cost["total_usd"], 0.0, payload)
+
+    def test_negative_and_garbage_book_zero(self):
+        self.assertEqual(
+            self._reconcile('{"dispatcher_spent_usd": -5.0}')["total_usd"],
+            0.0)
+        self.assertEqual(
+            self._reconcile('{"dispatcher_spent_usd": "junk"}')["total_usd"],
+            0.0)
+
+    def test_absurd_finite_figure_clamps_to_ceiling(self):
+        import raptor_openant
+        cost = self._reconcile('{"dispatcher_spent_usd": 1e12}')
+        self.assertEqual(cost["gateway_ledger_usd"],
+                         raptor_openant._MAX_LEDGER_USD)
+
+    def test_oversize_int_books_zero_not_overflow(self):
+        # The integer spelling of the plant: stdlib json parses a
+        # hundreds-digit int literal to an exact Python int, which
+        # OVERFLOWS float() rather than parsing to inf — the clamp
+        # must book $0, never raise.
+        import raptor_openant
+        self.assertEqual(
+            raptor_openant._bounded_usd(10 ** 400, source="test"), 0.0)
+        self.assertEqual(
+            raptor_openant._bounded_usd(-(10 ** 400), source="test"), 0.0)
+
+    def test_nonfinite_tracker_figure_books_zero(self):
+        cost = self._reconcile('{}',
+                               token_usage={"total_cost_usd": float("inf")})
+        self.assertEqual(cost["openant_reported_usd"], 0.0)
+        self.assertEqual(cost["total_usd"], 0.0)
+
+    def test_genuine_figures_unchanged(self):
+        cost = self._reconcile('{"dispatcher_spent_usd": 3.25}',
+                               token_usage={"total_cost_usd": 2.5})
+        self.assertEqual(cost["gateway_ledger_usd"], 3.25)
+        self.assertEqual(cost["openant_reported_usd"], 2.5)
+        self.assertEqual(cost["total_usd"], 3.25)
+
+
+_FAKE_MAIN_FAIL_PLANT_INF = """\
+import sys
+
+out = None
+for i, a in enumerate(sys.argv):
+    if a == "--output" and i + 1 < len(sys.argv):
+        out = sys.argv[i + 1]
+if out:
+    with open(out + "/openant-gateway-spend.json", "w") as f:
+        f.write('{"dispatcher_spent_usd": 1e309}')
+sys.exit(3)
+"""
+
+# Integer spelling of the same plant: stdlib json parses the literal to
+# an exact Python int (no inf at parse time — the float lane never
+# engages), and float() overflows instead.
+_FAKE_MAIN_FAIL_PLANT_BIGINT = _FAKE_MAIN_FAIL_PLANT_INF.replace(
+    "1e309", "1" + "0" * 400)
+
+
+def _stub_no_orjson(base: Path) -> dict:
+    """Env overlay simulating a host without orjson: core.json's
+    optional import hits ImportError and falls back to stdlib json —
+    the path on which 1e309 parses to inf."""
+    stub = base / "no-orjson"
+    stub.mkdir()
+    (stub / "orjson.py").write_text(
+        'raise ImportError("simulated host without orjson")\n')
+    return {"PYTHONPATH": str(stub)}
+
+
+class TestPlantedNonFiniteCostReports(unittest.TestCase):
+    """A child-planted 1e309 gateway ledger must not destroy the
+    failure-lane reports on stdlib-json hosts: the scan_failed report
+    still writes (with $0 booked for that ledger) and the interrupted
+    lane keeps its 130/report/lifecycle contract."""
+
+    def test_scan_failed_report_survives_inf_plant(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            src = _make_repo(base)
+            core = _make_fake_core(src, _FAKE_MAIN_FAIL_PLANT_INF)
+            out_dir = base / "out"
+            proc = _run(
+                [sys.executable, str(_REPO_ROOT / "raptor_openant.py"),
+                 "--repo", str(src), "--out", str(out_dir),
+                 "--openant-core", str(core),
+                 "--openant-core-unpinned"],
+                _stub_no_orjson(base),
+            )
+            self.assertEqual(proc.returncode, 1,
+                             f"stdout={proc.stdout}\nstderr={proc.stderr}")
+            report = json.loads(
+                (out_dir / "raptor_openant_report.json").read_text())
+            self.assertEqual(report["outcome"], "scan_failed")
+            self.assertEqual(report["cost"]["total_usd"], 0.0)
+            self.assertEqual(report["cost"]["gateway_ledger_usd"], 0.0)
+
+    def test_scan_failed_report_survives_bigint_plant(self):
+        # Integer spelling: parses to an exact int on the stdlib path
+        # and OVERFLOWS float() instead of arriving as inf — the report
+        # must still write with $0 booked for that ledger.
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            src = _make_repo(base)
+            core = _make_fake_core(src, _FAKE_MAIN_FAIL_PLANT_BIGINT)
+            out_dir = base / "out"
+            proc = _run(
+                [sys.executable, str(_REPO_ROOT / "raptor_openant.py"),
+                 "--repo", str(src), "--out", str(out_dir),
+                 "--openant-core", str(core),
+                 "--openant-core-unpinned"],
+                _stub_no_orjson(base),
+            )
+            self.assertEqual(proc.returncode, 1,
+                             f"stdout={proc.stdout}\nstderr={proc.stderr}")
+            report = json.loads(
+                (out_dir / "raptor_openant_report.json").read_text())
+            self.assertEqual(report["outcome"], "scan_failed")
+            self.assertEqual(report["cost"]["total_usd"], 0.0)
+            self.assertEqual(report["cost"]["gateway_ledger_usd"], 0.0)
+
+    @unittest.skipUnless(os.name == "posix",
+                         "signal-driven test is POSIX-only")
+    def test_interrupted_report_survives_inf_plant(self):
+        fake_main = _FAKE_MAIN_HANG.replace(
+            'if out:\n',
+            'if out:\n'
+            '    with open(out + "/openant-gateway-spend.json", "w") as f:\n'
+            "        f.write('{\"dispatcher_spent_usd\": 1e309}')\n",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            src = _make_repo(base)
+            core = _make_fake_core(src, fake_main)
+            out_dir = base / "out"
+            out_dir.mkdir()
+            env = {**os.environ, "_RAPTOR_TRUSTED": "1",
+                   **_stub_no_orjson(base)}
+            proc = subprocess.Popen(
+                [sys.executable, str(_REPO_ROOT / "raptor_openant.py"),
+                 "--repo", str(src), "--out", str(out_dir),
+                 "--openant-core", str(core),
+                 "--openant-core-unpinned"],
+                cwd=str(_REPO_ROOT), env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            marker = out_dir / "openant_scan" / "dataset.json"
+            out = err = ""
+            try:
+                deadline = time.time() + 120
+                while not marker.exists():
+                    if proc.poll() is not None or time.time() > deadline:
+                        out, err = proc.communicate(timeout=30)
+                        self.fail(
+                            f"scan child never started:\n{out}\n{err}")
+                    time.sleep(0.2)
+                time.sleep(1.0)
+                proc.send_signal(signal.SIGTERM)
+                out, err = proc.communicate(timeout=120)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.communicate(timeout=30)
+            self.assertEqual(proc.returncode, 130, f"{out}\n{err}")
+            report = json.loads(
+                (out_dir / "raptor_openant_report.json").read_text())
+            self.assertEqual(report["outcome"], "interrupted")
+            self.assertEqual(report["cost"]["total_usd"], 0.0)
+            self.assertEqual(_run_status(out_dir), "interrupted")
+
+
+class TestResumeUnexpectedFailureRefusesCleanly(unittest.TestCase):
+    """An unexpected exception out of resume validation/seeding is a
+    clean refusal — exit 2 with an outcome=resume_refused report —
+    never an unhandled traceback that leaves no report behind."""
+
+    def test_unexpected_seed_error_exits_two_with_report(self):
+        import raptor_openant
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            src = _make_repo(base)
+            core = _make_fake_core(src, _FAKE_MAIN_CLEAN)
+            prior = base / "prior"
+            scan = prior / "openant_scan"
+            ck = scan / "analyze_checkpoints"
+            ck.mkdir(parents=True)
+            (scan / "dataset.json").write_text(json.dumps({"units": []}))
+            (ck / "u0.json").write_text(json.dumps(
+                {"id": "a",
+                 "result": {"verdict": "ERROR", "finding": "error"}}))
+            (prior / "raptor_openant_report.json").write_text(json.dumps({
+                "repository": str(src),
+                "config": {},
+                "phases": {"openant_scan": {"completed": False}},
+            }))
+            out_dir = base / "out"
+            out_dir.mkdir()
+            argv = ["raptor_openant.py", "--repo", str(src),
+                    "--out", str(out_dir), "--resume", str(prior),
+                    "--openant-core", str(core),
+                    "--openant-core-unpinned"]
+            with patch.object(sys, "argv", argv), \
+                    patch("packages.openant.resume.seed_scan_dir",
+                          side_effect=RuntimeError("boom")):
+                rc = raptor_openant.main()
+            self.assertEqual(rc, 2)
+            report = json.loads(
+                (out_dir / "raptor_openant_report.json").read_text())
+            self.assertEqual(report["outcome"], "resume_refused")
+            self.assertIn("boom", report["error"])
+
+
+_FAKE_MAIN_HANG = """\
+import json
+import os
+import sys
+import time
+
+out = None
+for i, a in enumerate(sys.argv):
+    if a == "--output" and i + 1 < len(sys.argv):
+        out = sys.argv[i + 1]
+if out:
+    with open(out + "/dataset.json", "w") as f:
+        json.dump({"units": [
+            {"id": "app.py:f", "code": {"primary_code": "x" * 200}},
+        ]}, f)
+    ck = out + "/analyze_checkpoints"
+    os.makedirs(ck, exist_ok=True)
+    with open(ck + "/u0.json", "w") as f:
+        json.dump({"id": "app.py:f",
+                   "result": {"verdict": "ERROR", "finding": "error"}}, f)
+time.sleep(45)
+sys.exit(1)
+"""
+
+
+@unittest.skipUnless(os.name == "posix", "signal-driven test is POSIX-only")
+class TestInterruptedRunLane(unittest.TestCase):
+    """SIGTERM mid-scan: exit 130, an outcome=interrupted report
+    carrying the resume-gate fields, lifecycle status interrupted —
+    and the interrupted dir validates as a resumable prior run."""
+
+    def test_sigterm_writes_resumable_report(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            src = _make_repo(base)
+            core = _make_fake_core(src, _FAKE_MAIN_HANG)
+            out_dir = base / "out"
+            out_dir.mkdir()
+            env = {**os.environ, "_RAPTOR_TRUSTED": "1"}
+            proc = subprocess.Popen(
+                [sys.executable, str(_REPO_ROOT / "raptor_openant.py"),
+                 "--repo", str(src), "--out", str(out_dir),
+                 "--openant-core", str(core),
+                 "--openant-core-unpinned"],
+                cwd=str(_REPO_ROOT), env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            marker = out_dir / "openant_scan" / "dataset.json"
+            out = err = ""
+            try:
+                deadline = time.time() + 120
+                while not marker.exists():
+                    if proc.poll() is not None or time.time() > deadline:
+                        out, err = proc.communicate(timeout=30)
+                        self.fail(
+                            f"scan child never started:\n{out}\n{err}")
+                    time.sleep(0.2)
+                time.sleep(1.0)  # let the child settle into its wait
+                proc.send_signal(signal.SIGTERM)
+                out, err = proc.communicate(timeout=120)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.communicate(timeout=30)
+            self.assertEqual(proc.returncode, 130, f"{out}\n{err}")
+            report = json.loads(
+                (out_dir / "raptor_openant_report.json").read_text())
+            self.assertEqual(report["outcome"], "interrupted")
+            # The resume-gate fields ride the interrupted report too.
+            self.assertIn("target_fingerprint", report)
+            self.assertEqual(report["config"]["model"], "sonnet")
+            self.assertIn("core_provenance", report["config"])
+            self.assertIn("total_usd", report["cost"])
+            self.assertEqual(_run_status(out_dir), "interrupted")
+            self.assertFalse(
+                (out_dir / "openant_findings.json").exists(),
+                "an interrupted run must not leave a findings file")
+            # The dead interrupted run is eligible for --resume.
+            from packages.openant.config import OPENANT_PINNED_COMMIT
+            from packages.openant.resume import validate_prior_run
+            result = validate_prior_run(
+                out_dir, src, pinned_commit=OPENANT_PINNED_COMMIT,
+                current_core_head=None)
+            self.assertTrue(result.remaining["resumable"])
+
+
+class TestScannerResultShape(unittest.TestCase):
+    """The scanner's skipped result carries the structured hard_error
+    distinction consumers key off."""
+
+    def test_empty_result_carries_hard_error_flag(self):
+        from packages.openant.scanner import _empty_result
+        hard = _empty_result("boom", hard_error=True)
+        self.assertTrue(hard["skipped"])
+        self.assertTrue(hard["hard_error"])
+        soft = _empty_result("n/a", hard_error=False)
+        self.assertTrue(soft["skipped"])
+        self.assertFalse(soft["hard_error"])
+
+
+if __name__ == "__main__":
+    unittest.main()

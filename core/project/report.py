@@ -4,12 +4,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from core.json import dumps_artifact, dumps_display, save_json
-from core.security.prompt_output_sanitise import sanitise_code, sanitise_string
+from core.security.prompt_output_sanitise import (
+    sanitise_code,
+    sanitise_inline,
+    sanitise_string,
+)
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -212,6 +219,7 @@ def render_grouped_findings_markdown(
     project_name: str,
     *,
     sca_findings: Iterable[dict[str, Any]] = (),
+    readjudication: Iterable[dict[str, Any]] = (),
 ) -> str:
     """Render all findings into one project-level Markdown report.
 
@@ -220,6 +228,13 @@ def render_grouped_findings_markdown(
     (SCA)" section below — they're dep-level (no source file:line), so bucketing them
     separately keeps the severity-grouped code view clean. Mirrors the
     interactive ``/project findings`` view.
+
+    ``readjudication`` — queue records from
+    :mod:`core.project.readjudication` — render in their own section:
+    recorded disproofs that a later independent signal contradicts.
+    The section states counts and per-site pairs only; it never
+    changes a finding's rendered status (re-adjudication is a
+    validation-lane task).
     """
     findings = sorted(
         findings,
@@ -229,8 +244,9 @@ def render_grouped_findings_markdown(
         sca_findings,
         key=lambda item: (*_severity_key(item), _finding_title(item).lower()),
     )
+    readjudication = [r for r in readjudication if isinstance(r, dict)]
     lines = [f"# {project_name} findings", ""]
-    if not findings and not sca_findings:
+    if not findings and not sca_findings and not readjudication:
         lines.append("No findings.")
         return "\n".join(lines) + "\n"
 
@@ -289,6 +305,112 @@ def render_grouped_findings_markdown(
                 lines.extend(f"  - escalated: {_md_heading(reason)}" for reason in reasons)
         lines.append("")
 
+    queued = [r for r in readjudication if r.get("action") == "queued"]
+    if queued:
+        from core.project.readjudication import (
+            QUEUE_FILENAME,
+            SHAPE_CLAIM_AFTER_DISPROOF,
+            SHAPE_INTRA_RUN_SPLIT,
+            SHAPE_OVERTURN,
+            contradicted_disproof_count,
+            record_shape,
+            shape_counts,
+            suppressed_count,
+        )
+        counts = shape_counts(queued)
+        parts = []
+        if counts.get(SHAPE_CLAIM_AFTER_DISPROOF):
+            parts.append(
+                f"{contradicted_disproof_count(queued)} recorded "
+                f"disproof(s) contradicted by new signals"
+            )
+        if counts.get(SHAPE_OVERTURN):
+            parts.append(
+                f"{counts[SHAPE_OVERTURN]} confirmed verdict(s) "
+                f"disproven by a later run (overturn-shaped)"
+            )
+        if counts.get(SHAPE_INTRA_RUN_SPLIT):
+            parts.append(
+                f"{counts[SHAPE_INTRA_RUN_SPLIT]} intra-run "
+                f"final-verdict split(s)"
+            )
+        if not parts:
+            # Foreign-shaped records (the queue file is agent-writable
+            # and readers tolerate unknown shapes): count honestly.
+            parts.append(f"{len(queued)} contradiction signal(s)")
+        lines.append("## Re-adjudication queue")
+        lines.append("")
+        lines.append(
+            f"{'; '.join(parts)} — re-adjudication queue ({len(queued)} "
+            f"queued signal(s); full records in `{QUEUE_FILENAME}`). "
+            f"Nothing is auto-overturned: adjudicate with a scoped "
+            f"/validate on the queued sites."
+        )
+        n_suppressed = suppressed_count(readjudication)
+        if n_suppressed:
+            # A capped queue must never read as complete — restate the
+            # truncation marker wherever the count renders.
+            lines.append("")
+            lines.append(
+                f"⚠️ {n_suppressed} further contradiction(s) not "
+                f"recorded (record caps) — the listing below is a "
+                f"bounded sample, not the full set."
+            )
+        lines.append("")
+        for record in queued:
+            # Every rendered value is finding-derived (LLM-authored or
+            # import-restored) — same _md_heading sanitiser as the
+            # finding sections above.
+            site = record.get("site")
+            site = site if isinstance(site, dict) else {}
+            claim = record.get("new_claim")
+            claim = claim if isinstance(claim, dict) else {}
+            disproof = record.get("disproof")
+            disproof = disproof if isinstance(disproof, dict) else {}
+            location = str(site.get("file") or "?")
+            if site.get("function"):
+                location += f"::{site.get('function')}"
+            shape = record_shape(record)
+            if shape == SHAPE_OVERTURN:
+                lines.append(
+                    f"- **{_md_heading(location)}** — prior "
+                    f"{_md_heading(claim.get('status') or 'confirmed')} "
+                    f"verdict from "
+                    f"{_md_heading(claim.get('source') or '?')} disproven "
+                    f"by later "
+                    f"{_md_heading(disproof.get('status') or 'disproof')} "
+                    f"from {_md_heading(disproof.get('source') or '?')} "
+                    f"(overturn-shaped)"
+                )
+            elif shape == SHAPE_INTRA_RUN_SPLIT:
+                lines.append(
+                    f"- **{_md_heading(location)}** — intra-run split in "
+                    f"{_md_heading(claim.get('source') or '?')}: "
+                    f"{_md_heading(claim.get('status') or 'confirmed')} "
+                    f"and "
+                    f"{_md_heading(disproof.get('status') or 'disproof')} "
+                    f"both final"
+                )
+            else:
+                claim_mech = ", ".join(
+                    str(m) for m in claim.get("mechanism") or []) or "?"
+                lines.append(
+                    f"- **{_md_heading(location)}** — new "
+                    f"{_md_heading(claim_mech)} claim from "
+                    f"{_md_heading(claim.get('source') or '?')} vs recorded "
+                    f"{_md_heading(disproof.get('status') or 'disproof')} "
+                    f"from {_md_heading(disproof.get('source') or '?')}"
+                )
+            if record.get("mechanism_match") is False:
+                lines.append(
+                    f"  - {_md_heading(record.get('mechanism_note') or 'mechanism mismatch')}")
+            reconsider = disproof.get("would_reconsider_if")
+            if reconsider:
+                lines.append(
+                    f"  - disproof's own reconsideration condition: "
+                    f"{_md_heading(reconsider)}")
+        lines.append("")
+
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -296,6 +418,12 @@ def _clear_generated_findings_dir(findings_dir: Path) -> None:
     """Remove prior generated per-finding artifacts without following symlinks."""
     import shutil
 
+    if findings_dir.is_symlink():
+        # rmtree refuses symlinks with OSError (uncaught it crashed
+        # the whole report pass); unlinking the LINK honours the
+        # no-follow contract — the pointed-to tree is not ours.
+        findings_dir.unlink(missing_ok=True)
+        return
     try:
         shutil.rmtree(findings_dir)
     except NotADirectoryError:
@@ -308,6 +436,7 @@ def export_findings_directory(
     findings: Iterable[dict[str, Any]], output_dir: Path, *,
     project_name: str = "project",
     sca_findings: Iterable[dict[str, Any]] = (),
+    readjudication: Iterable[dict[str, Any]] = (),
 ) -> dict[str, Any]:
     """Write grouped Markdown/JSON findings under ``output_dir/findings``.
 
@@ -333,6 +462,7 @@ def export_findings_directory(
     aggregate_path.write_text(
         render_grouped_findings_markdown(
             findings, project_name, sca_findings=sca_findings,
+            readjudication=readjudication,
         ),
         encoding="utf-8",
     )
@@ -444,24 +574,33 @@ def render_annotations_markdown(records: list[dict[str, Any]],
     lines.append(f"_{len(records)} unique annotation(s) "
                  f"(deduped, project-level wins)._")
     lines.append("")
+    # Bucket keys are the same agent-written fields as the headings
+    # below — sanitise for the same reason.
     lines.append("**By status:** " + ", ".join(
-        f"{k}={v}" for k, v in sorted(status_counts.items())
+        f"{sanitise_inline(k, max_chars=32)}={v}"
+        for k, v in sorted(status_counts.items())
     ))
     lines.append("")
     lines.append("**By source:** " + ", ".join(
-        f"{k}={v}" for k, v in sorted(source_counts.items())
+        f"{sanitise_inline(k, max_chars=32)}={v}"
+        for k, v in sorted(source_counts.items())
     ))
     lines.append("")
     lines.append("## Per-function entries")
     lines.append("")
     for r in records:
-        # Header line: file:function (status, source)
-        title = f"### `{r['file']}` :: `{r['function']}`"
+        # Header line: file:function (status, source). Annotation
+        # fields are agent-written (and import-restorable) — the
+        # backtick spans do not stop ANSI bytes or a backtick
+        # breakout, so the values are sanitised like the bodies
+        # below (sanitise_inline entity-escapes in-span backticks).
+        title = (f"### `{sanitise_inline(r['file'], max_chars=200)}` :: "
+                 f"`{sanitise_inline(r['function'], max_chars=120)}`")
         meta = []
         if r["status"]:
-            meta.append(f"status=`{r['status']}`")
+            meta.append(f"status=`{sanitise_inline(r['status'], max_chars=32)}`")
         if r["source"]:
-            meta.append(f"source=`{r['source']}`")
+            meta.append(f"source=`{sanitise_inline(r['source'], max_chars=32)}`")
         lines.append(title)
         if meta:
             lines.append(" · ".join(meta))
@@ -504,11 +643,32 @@ def generate_project_report(project) -> dict[str, Any]:
         report_dir / "findings.json",
         {"findings": merged, "sca_findings": sca_findings},
     )
+
+    # Re-adjudication queue: recorded disproofs a LATER run's signal
+    # contradicts. The merge fold above (correctly) let the disproof
+    # win the merged view; the queue preserves the contradiction as an
+    # additive artifact + report section — never a verdict change.
+    # Best-effort: the report must not fail on the additive trail.
+    readj_records: list[dict[str, Any]] = []
+    try:
+        from core.project.readjudication import (
+            detect_project_contradictions,
+            queued_count,
+            write_queue,
+        )
+        readj_records = detect_project_contradictions(oldest_first)
+        write_queue(report_dir, readj_records)
+        readjudication_queued = queued_count(readj_records)
+    except Exception:  # noqa: BLE001 — additive trail, never report-fatal
+        logger.warning("re-adjudication detection failed", exc_info=True)
+        readjudication_queued = 0
+
     findings_export = export_findings_directory(
         merged,
         project.output_path,
         project_name=project.name,
         sca_findings=sca_findings,
+        readjudication=readj_records,
     )
 
     # Aggregate annotations across runs + project-level overrides.
@@ -527,9 +687,18 @@ def generate_project_report(project) -> dict[str, Any]:
     for d in run_dirs:
         raw_meta = load_run_metadata(d)
         meta = raw_meta if isinstance(raw_meta, dict) else {}
-        ts = (meta.get("timestamp") or "")[:19]
-        prov_lines.append(f"## {d.name}")
-        prov_lines.append(f"{meta.get('command', '?')} · {ts}")
+        # timestamp is child-writable like `command`, and a run-dir
+        # name is operator/child-chosen on --out runs — both land in
+        # markdown an LLM pass later reads, so heading-sanitise them
+        # (newlines collapsed: a crafted name cannot mint extra
+        # headings below the real one).
+        ts = _md_heading(str(meta.get("timestamp") or "")[:19])
+        prov_lines.append(f"## {_md_heading(d.name)}")
+        # `command` is child-writable run metadata restored verbatim by
+        # /project import — defang before it lands in provenance.md.
+        prov_lines.append(
+            f"{sanitise_string(str(meta.get('command', '?')), max_chars=200)}"
+            f" · {ts}")
         block = format_manifest_block(meta.get("manifest"), indent="- ")
         prov_lines.append(block or "- (no provenance manifest)")
         prov_lines.append("")
@@ -539,6 +708,7 @@ def generate_project_report(project) -> dict[str, Any]:
     return {
         "findings": len(merged),
         "sca_findings": len(sca_findings),
+        "readjudication_queued": readjudication_queued,
         "runs": len(run_dirs),
         "annotations": len(annotations),
         "report_dir": str(report_dir),

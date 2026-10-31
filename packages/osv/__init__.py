@@ -9,7 +9,12 @@ package owns wire-format parsing, verdict classification, and
 verification logic.
 """
 
-from .client import OSV_BASE_URL, DEFAULT_TTL_SECONDS, OsvClient
+from .client import (
+    OSV_BASE_URL,
+    DEFAULT_TTL_SECONDS,
+    OsvClient,
+    OsvLookupError,
+)
 from .parser import parse_record
 from .types import (
     OsvAffected,
@@ -26,6 +31,7 @@ __all__ = [
     "OracleVerdict",
     "OsvAffected",
     "OsvClient",
+    "OsvLookupError",
     "OsvRange",
     "OsvRecord",
     "OsvReference",

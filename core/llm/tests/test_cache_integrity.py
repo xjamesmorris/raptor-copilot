@@ -51,12 +51,16 @@ def test_forged_unstamped_entry_is_a_miss(tmp_path: Path) -> None:
     token — the pre-fix replay shape, including the missing-timestamp
     "fresh" dodge — must read as a miss."""
     client = make_test_client(tmp_path)
-    key = client._get_cache_key("Is function X vulnerable?", None, "m")
+    key = client._get_cache_key(
+        "Is function X vulnerable?", None, "m", provider="anthropic",
+    )
     _plant(client.config.cache_dir, key, {
         "content": "VERDICT: clean — no issues found",
         "model": "x", "provider": "y", "tokens_used": 1,
     })
-    assert client._get_cached_response(key) is None
+    assert client._get_cached_response(
+        key, requested_provider="anthropic", requested_model="m",
+    ) is None
 
 
 def test_tampered_stamped_entry_is_a_miss(tmp_path: Path) -> None:
@@ -69,7 +73,9 @@ def test_tampered_stamped_entry_is_a_miss(tmp_path: Path) -> None:
     })
     entry["content"] = "forged verdict"
     _plant(client.config.cache_dir, key, entry)
-    assert client._get_cached_response(key) is None
+    assert client._get_cached_response(
+        key, requested_provider="anthropic", requested_model="m",
+    ) is None
 
 
 def test_entry_copied_to_another_slot_is_a_miss(tmp_path: Path) -> None:
@@ -80,7 +86,9 @@ def test_entry_copied_to_another_slot_is_a_miss(tmp_path: Path) -> None:
         "content": "genuine answer for prompt A", "timestamp": 1.0,
     })
     _plant(client.config.cache_dir, "slot-b", entry)
-    assert client._get_cached_response("slot-b") is None
+    assert client._get_cached_response(
+        "slot-b", requested_provider="anthropic", requested_model="m",
+    ) is None
 
 
 def test_own_write_round_trips(tmp_path: Path) -> None:
@@ -88,12 +96,23 @@ def test_own_write_round_trips(tmp_path: Path) -> None:
     from core.llm.providers import LLMResponse
 
     client = make_test_client(tmp_path)
-    key = client._get_cache_key("p", None, "m")
-    client._save_to_cache(key, LLMResponse(
-        content="real answer", model="m", provider="fake",
-        tokens_used=3, cost=0.0, finish_reason="stop",
-    ))
-    assert client._get_cached_response(key) == "real answer"
+    key = client._get_cache_key(
+        "p", None, "m", provider="anthropic",
+    )
+    client._save_to_cache(
+        key,
+        LLMResponse(
+            content="real answer", model="m", provider="fake",
+            tokens_used=3, cost=0.0, finish_reason="stop",
+        ),
+        requested_provider="anthropic",
+        requested_model="m",
+        serving_provider="fake",
+        serving_model="m",
+    )
+    assert client._get_cached_response(
+        key, requested_provider="anthropic", requested_model="m",
+    ) == ("real answer", "m", "fake", None)
     # And the on-disk entry actually carries the stamp.
     data = json.loads(
         (client.config.cache_dir / f"{key}.json").read_text())
@@ -113,12 +132,16 @@ def test_forged_structured_entry_is_a_miss(tmp_path: Path) -> None:
     schema = {"type": "object",
               "properties": {"verdict": {"type": "string"}}}
 
-    key = client._get_structured_cache_key("review f()", None, "m", schema)
+    key = client._get_structured_cache_key(
+        "review f()", None, "m", schema, provider="anthropic",
+    )
     _plant(client.config.cache_dir, f"structured-{key}", {
         "result": {"verdict": "clean"}, "raw": '{"verdict":"clean"}',
         "model": "x", "provider": "y", "tokens_used": 1,
     })
-    assert client._get_cached_structured_response(key) is None
+    assert client._get_cached_structured_response(
+        key, requested_provider="anthropic", requested_model="m",
+    ) is None
 
 
 def test_structured_round_trip_still_cached(tmp_path: Path) -> None:
@@ -185,7 +208,9 @@ def test_tampered_entry_is_quarantined_and_counted(tmp_path: Path) -> None:
     entry["content"] = "forged verdict"
     path = _plant(client.config.cache_dir, key, entry)
 
-    assert client._get_cached_response(key) is None
+    assert client._get_cached_response(
+        key, requested_provider="anthropic", requested_model="m",
+    ) is None
     assert not path.exists(), "tampered entry must be moved aside"
     quarantine = path.with_name(path.name + ".unverified")
     assert quarantine.exists()
@@ -200,7 +225,9 @@ def test_unstamped_entry_is_not_counted_as_tamper(tmp_path: Path) -> None:
     key = "u" * 16
     path = _plant(client.config.cache_dir, key, {"content": "old"})
 
-    assert client._get_cached_response(key) is None
+    assert client._get_cached_response(
+        key, requested_provider="anthropic", requested_model="m",
+    ) is None
     assert path.exists()
     assert "cache_tamper_events" not in client.get_stats()
 
@@ -213,7 +240,9 @@ def test_quarantine_evidence_budget_is_bounded(tmp_path: Path) -> None:
                                             "timestamp": 1.0})
         entry["content"] = "forged"
         _plant(client.config.cache_dir, key, entry)
-        client._get_cached_response(key)
+        client._get_cached_response(
+            key, requested_provider="anthropic", requested_model="m",
+        )
     quarantined = list(client.config.cache_dir.glob("*.unverified"))
     assert len(quarantined) <= 8
     assert client.get_stats()["cache_tamper_events"] == 12

@@ -25,9 +25,7 @@ from __future__ import annotations
 import logging
 import re
 
-from core.atomic_fs import write_text_atomically as _atomic_write
-
-from . import RewriteEdit, RewriteResult
+from . import RewriteEdit, RewriteResult, rewrite_file_with
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -50,28 +48,7 @@ def rewrite_dockerfile_inline_install(
     token anywhere in the file, refusing to touch any other line
     that happens to contain ``<name>==``.
     """
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as e:
-        return [RewriteResult(edit=e2, applied=False,
-                              reason=f"error: read failed: {e}")
-                for e2 in edits]
-
-    results: list[RewriteResult] = []
-    new_text = text
-    for edit in edits:
-        new_text, result = _apply_one(new_text, edit)
-        results.append(result)
-
-    if any(r.applied for r in results):
-        try:
-            _atomic_write(path, new_text)
-        except OSError as e:
-            return [RewriteResult(edit=r.edit, applied=False,
-                                  reason=f"error: write failed: {e}")
-                    if r.applied else r
-                    for r in results]
-    return results
+    return rewrite_file_with(path, edits, _apply_one)
 
 
 def _apply_one(
@@ -93,29 +70,50 @@ def _apply_one(
     pattern = re.compile(
         rf"(?<![A-Za-z0-9_.\-])({name}==)([A-Za-z0-9.+\-]+)",
     )
-    match = pattern.search(text)
-    if match is None:
+    # Multi-stage Dockerfiles repeat the same install line per stage
+    # (``pip install foo==1.0`` in builder AND runtime). Verdicts are
+    # computed across ALL occurrences and every one still at the old
+    # value is bumped — a first-match ``count=1`` substitution bumped
+    # one stage and left its twin on the vulnerable version while the
+    # run reported applied.
+    matches = list(pattern.finditer(text))
+    if not matches:
         return text, RewriteResult(
             edit=edit, applied=False, reason="not_found",
         )
-    current_value = match.group(2)
-    if current_value == edit.new_value:
-        return text, RewriteResult(
-            edit=edit, applied=False, reason="no_change",
-        )
-    if current_value != edit.old_value:
+    values = [m.group(2) for m in matches]
+    needs_bump = [
+        m for m in matches
+        if m.group(2) == edit.old_value and m.group(2) != edit.new_value
+    ]
+    if not needs_bump:
+        if all(v == edit.new_value for v in values):
+            return text, RewriteResult(
+                edit=edit, applied=False, reason="no_change",
+            )
+        stray = next(v for v in values if v != edit.new_value)
         return text, RewriteResult(
             edit=edit, applied=False,
             reason=(
-                f"value_mismatch: file has {current_value!r}, "
+                f"value_mismatch: file has {stray!r}, "
                 f"plan expected {edit.old_value!r}"
             ),
         )
-    new_text = pattern.sub(
-        rf"\g<1>{edit.new_value}", text, count=1,
-    )
+    # Splice the value span directly, back-to-front so earlier
+    # offsets stay valid (also removes the re.sub template
+    # interpolation of new_value entirely).
+    new_text = text
+    for m in sorted(needs_bump, key=lambda m: m.start(2), reverse=True):
+        new_text = new_text[:m.start(2)] + edit.new_value + new_text[m.end(2):]
+    stray_values = sorted(set(values) - {edit.old_value, edit.new_value})
+    reason = "applied"
+    if stray_values:
+        reason = (
+            f"partial: {len(needs_bump)} occurrence(s) bumped; other "
+            f"value(s) left in place: {stray_values!r}"
+        )
     return new_text, RewriteResult(
-        edit=edit, applied=True, reason="applied",
+        edit=edit, applied=True, reason=reason,
     )
 
 

@@ -56,7 +56,8 @@ _FILE_COLUMN_INDEX = FINDINGS_COLUMNS.index("File")
 
 
 def _markdown_rows(rows: list[tuple]) -> list[tuple]:
-    r"""Escape cells and wrap file paths in backticks for markdown rendering.
+    r"""Escape cells and wrap file paths in backticks for markdown
+    that this module emits DIRECTLY (``findings_summary``).
 
     `build_findings_rows` output is shared with the console renderer
     (which does its own `escape_nonprintable` pass and must not show
@@ -66,6 +67,13 @@ def _markdown_rows(rows: list[tuple]) -> list[tuple]:
     split table columns or open an inline-code span. Matches the
     per-finding detail table, which already escapes via
     `_md_table_cell`.
+
+    NOT for rows destined for a :class:`ReportSpec`: the spec
+    renderer's ``_render_table`` defangs every cell itself (its
+    chokepoint contract), so pre-escaped rows came out
+    double-escaped — the wrapping backticks entity-escaped into
+    literal ``&#96;`` characters and the ``\|`` escape survived as a
+    visible stray backslash in every rendered report.
     """
     return [
         tuple(
@@ -102,6 +110,15 @@ def build_findings_summary(findings: list[dict[str, Any]]) -> dict[str, int]:
     The ``confirmed`` umbrella key is retained as a sum across the
     three sub-counts so older consumers that read just ``confirmed``
     still see the right total.
+
+    Agentic negative rulings retain their typed reasons (Mitigated,
+    Test Code, Dead Code, Unreachable) rather than being folded into
+    the displayed False Positive count. Compatibility counters remain
+    additive:
+
+    * ``false_positive`` — legacy exact False Positive rulings
+    * ``false_positive_exact`` — explicit alias for the exact count
+    * ``negative_total`` — all exact and typed negative rulings
     """
     counts = {"total": len(findings),
               "exploitable": 0,
@@ -112,7 +129,14 @@ def build_findings_summary(findings: list[dict[str, Any]]) -> dict[str, int]:
               "confirmed_unverified": 0,
               "not_disproven": 0,
               "false_positive": 0,
-              "ruled_out": 0, "error": 0, "other": 0}
+              "false_positive_exact": 0,
+              "negative_total": 0,
+              "mitigated": 0,
+              "test_code": 0,
+              "dead_code": 0,
+              "unreachable": 0,
+              "ruled_out": 0, "ruled_out_unverified": 0,
+              "error": 0, "other": 0}
     for f in findings:
         status = get_display_status(f)
         if status == "Exploitable":
@@ -138,8 +162,28 @@ def build_findings_summary(findings: list[dict[str, Any]]) -> dict[str, int]:
             counts["not_disproven"] += 1
         elif status == "False Positive":
             counts["false_positive"] += 1
+            counts["false_positive_exact"] += 1
+            counts["negative_total"] += 1
+        elif status == "Mitigated":
+            counts["mitigated"] += 1
+            counts["negative_total"] += 1
+        elif status == "Test Code":
+            counts["test_code"] += 1
+            counts["negative_total"] += 1
+        elif status == "Dead Code":
+            counts["dead_code"] += 1
+            counts["negative_total"] += 1
+        elif status == "Unreachable":
+            counts["unreachable"] += 1
+            counts["negative_total"] += 1
         elif status == "Ruled Out":
             counts["ruled_out"] += 1
+        elif status == "Ruled Out (Unverified)":
+            # NOT summed into ruled_out: an unverified rule-out is a
+            # quarantined claim with no mechanical refutation behind
+            # it — counting it as a verified rule-out would grant it
+            # the suppression weight the quarantine exists to withhold.
+            counts["ruled_out_unverified"] += 1
         elif status.startswith("Error"):
             counts["error"] += 1
         else:
@@ -173,10 +217,23 @@ def findings_summary_line(counts: dict[str, int], vuln_count: int | None = None)
         parts.append(f"{counts['confirmed_unverified']} Confirmed (Unverified)")
     if counts.get("not_disproven"):
         parts.append(f"{counts['not_disproven']} Not Disproven")
-    if counts["false_positive"]:
-        parts.append(f"{counts['false_positive']} False Positive")
+    exact_false_positive = counts.get(
+        "false_positive_exact", counts["false_positive"],
+    )
+    if exact_false_positive:
+        parts.append(f"{exact_false_positive} False Positive")
+    if counts.get("mitigated"):
+        parts.append(f"{counts['mitigated']} Mitigated")
+    if counts.get("test_code"):
+        parts.append(f"{counts['test_code']} Test Code")
+    if counts.get("dead_code"):
+        parts.append(f"{counts['dead_code']} Dead Code")
+    if counts.get("unreachable"):
+        parts.append(f"{counts['unreachable']} Unreachable")
     if counts["ruled_out"]:
         parts.append(f"{counts['ruled_out']} Ruled Out")
+    if counts.get("ruled_out_unverified"):
+        parts.append(f"{counts['ruled_out_unverified']} Ruled Out (Unverified)")
     if counts["error"]:
         parts.append(f"{counts['error']} Error")
     if counts.get("other"):
@@ -218,6 +275,13 @@ def _md_table_cell(s: str) -> str:
       * `|` → `\|` (table column separator)
       * `` ` `` → `\` ` (inline-code fence)
       * Newlines → `<br>` (rows must be one line)
+      * Control/bidi bytes → `\xHH` escapes (`escape_nonprintable`):
+        table cells carry hostile-influenceable fields (file path,
+        function, vuln_type, code_line) and the report is catted to
+        terminals — `sanitise_code`'s own docstring names the exact
+        threat ("ANSI/BIDI/control-byte injection via terminal
+        emulators"); the prose fields go through `sanitise_string`
+        which already escapes, this hand-rolled cell lane must too.
 
     Also strips autofetch markup (image/`<img>`/`<iframe>` tags,
     `javascript:`/`data:` links) via the shared prompt-envelope
@@ -231,9 +295,16 @@ def _md_table_cell(s: str) -> str:
     """
     if s is None:
         return ""
+    from core.security.log_sanitisation import escape_nonprintable
     from core.security.prompt_envelope import _strip_autofetch_markup
     s = str(s)
     s = _strip_autofetch_markup(s)
+    # Before the backslash-doubling below, so the `\xHH` escapes this
+    # pass emits render as single-backslash literals in the cell.
+    # ``\r\n``/``\r`` are normalised first so bare carriage returns
+    # keep their pre-existing ``<br>`` rendering instead of escaping.
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = escape_nonprintable(s, preserve_newlines=True)
     s = s.replace("\\", "\\\\")
     s = s.replace("|", "\\|")
     # Backticks are REPLACED (U+02BC, same policy as the threat-model
@@ -256,9 +327,12 @@ def build_finding_detail(finding: dict[str, Any], index: int) -> ReportSection:
     # Section titles render as one heading line — collapse and sanitise
     # the finding-derived pieces (id, type, file:line) so a crafted value
     # cannot inject extra heading lines or live markup. Same policy as
-    # core.project.report._md_heading.
+    # core.project.report._md_heading. No backticks: these titles are
+    # rendered through the spec renderer's heading defang, which
+    # entity-escapes them into literal ``&#96;`` characters instead of
+    # a code span.
     title = sanitise_string(
-        " ".join(f"{fid} — {vtype} in `{loc}`".split()), max_chars=300,
+        " ".join(f"{fid} — {vtype} in {loc}".split()), max_chars=300,
     )
 
     lines = []
@@ -289,7 +363,7 @@ def build_finding_detail(finding: dict[str, Any], index: int) -> ReportSection:
     code = finding.get("proof", {}).get("vulnerable_code") if isinstance(finding.get("proof"), dict) else None
     code = code or finding.get("code") or ""
     if code:
-        code_line = code.strip().split("\n")[0][:100]
+        code_line = code.strip().split("\n")[0][:100]  # line-model: report display slice; a snippet \r is cosmetic
         lines.append(f"| Code | `{_md_table_cell(code_line)}` |")
 
     lines.append(f"| Final Status | {_md_table_cell(get_display_status(finding))} |")
@@ -356,8 +430,17 @@ def build_finding_detail(finding: dict[str, Any], index: int) -> ReportSection:
     if isinstance(feasibility, dict):
         if feasibility.get("verdict"):
             lines.append(f"\n**Feasibility:** {sanitise_string(str(feasibility['verdict']), max_chars=200)}")
-        if feasibility.get("chain_breaks"):
-            breaks = [sanitise_string(str(b), max_chars=200) for b in feasibility['chain_breaks'][:3]]
+        # List-shaped only: feasibility records are finding-supplied
+        # JSON, and a dict here crashed the slice (KeyError on the
+        # slice object) while a string iterated per character into a
+        # junk render. Anything non-list is silently not a blocker
+        # list.
+        chain_breaks = feasibility.get("chain_breaks")
+        if isinstance(chain_breaks, list) and chain_breaks:
+            breaks = [
+                sanitise_string(str(b), max_chars=200)
+                for b in chain_breaks[:3]
+            ]
             lines.append(f"**Blockers:** {', '.join(breaks)}")
 
     # Dataflow
@@ -384,7 +467,11 @@ def build_findings_spec(
     (what columns, how to count, what note to show) lives here.
     Pipeline-specific data goes in metadata, extra_summary, extra_sections.
     """
-    rows = _markdown_rows(build_findings_rows(findings))
+    # RAW rows: the spec renderer defangs every table cell exactly
+    # once at its own chokepoint (escaping here double-escaped — see
+    # _markdown_rows). Cell markup like code spans cannot survive
+    # that defang, so none is added.
+    rows = build_findings_rows(findings)
     counts = build_findings_summary(findings)
 
     # Build summary metrics — extra_summary first (caller controls order),
@@ -396,8 +483,19 @@ def build_findings_spec(
         summary["Exploitable"] = counts["exploitable"]
     if counts["confirmed"]:
         summary["Confirmed"] = counts["confirmed"]
-    if counts["false_positive"]:
-        summary["False Positive"] = counts["false_positive"]
+    exact_false_positive = counts.get(
+        "false_positive_exact", counts["false_positive"],
+    )
+    if exact_false_positive:
+        summary["False Positive"] = exact_false_positive
+    if counts.get("mitigated"):
+        summary["Mitigated"] = counts["mitigated"]
+    if counts.get("test_code"):
+        summary["Test Code"] = counts["test_code"]
+    if counts.get("dead_code"):
+        summary["Dead Code"] = counts["dead_code"]
+    if counts.get("unreachable"):
+        summary["Unreachable"] = counts["unreachable"]
     if counts["ruled_out"]:
         summary["Ruled Out"] = counts["ruled_out"]
 

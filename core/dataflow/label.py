@@ -20,6 +20,8 @@ from typing import Any, TYPE_CHECKING
 
 from core.json import dumps_artifact, loads
 
+from core.dataflow._schema_checks import check_extra_fields, require_nonempty
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
@@ -77,12 +79,10 @@ class LifecyclePrecondition:
     ground-truth records, capturing the lifecycle invariant whose
     violation makes the bug shape consume an under-guarded field.
 
-    v1 source_intel verdict policy IGNORES this field. v2 (the future
-    annotation is precomputed during corpus seeding while the kernel
-    patch is in the labeler's head, so the v2 consumer doesn't have
-    to re-derive it later.
-
-    CVE-2026-46333 as the canonical example).
+    v1 source_intel verdict policy IGNORES this field; the annotation
+    is precomputed during corpus seeding, while the kernel patch is in
+    the labeler's head, so a future v2 consumer does not have to
+    re-derive it later (CVE-2026-46333 is the canonical example).
     """
 
     field: str
@@ -125,17 +125,11 @@ class LifecyclePrecondition:
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
-def _check_extra_fields(name: str, data: Mapping[str, Any], allowed: frozenset[str]) -> None:
-    extras = set(data.keys()) - allowed
-    if extras:
-        msg = f"unknown fields in {name} JSON: {sorted(extras)}"
-        raise ValueError(msg)
-
-
-def _require_nonempty(label: str, value: str) -> None:
-    if not isinstance(value, str) or not value.strip():
-        msg = f"{label} must be a non-empty string"
-        raise ValueError(msg)
+# Strict from_dict checks — shared with the sibling value modules via
+# core.dataflow._schema_checks (local underscore names kept: they are
+# these modules' call-site and patch seams).
+_check_extra_fields = check_extra_fields
+_require_nonempty = require_nonempty
 
 
 @dataclass(frozen=True)
@@ -159,8 +153,9 @@ class GroundTruth:
     labeled_at: str
     fp_category: str | None = None
     #: Optional forward-compatible annotation for CWE-476 / CWE-416
-    #: fixtures (and structurally-related logic bugs). v1 source_intel
-    #: directly. See `LifecyclePrecondition` for shape.
+    #: fixtures (and structurally-related logic bugs). The v1
+    #: source_intel verdict policy ignores it. See
+    #: `LifecyclePrecondition` for the shape.
     lifecycle_precondition: LifecyclePrecondition | None = None
 
     def __post_init__(self) -> None:

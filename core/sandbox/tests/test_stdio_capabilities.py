@@ -22,7 +22,11 @@ import unittest
 from pathlib import Path
 
 import pytest
-from core.sandbox.tests.capability import requires_landlock, requires_userns
+from core.sandbox.tests.capability import (
+    requires_landlock,
+    requires_mount,
+    requires_userns,
+)
 
 pytestmark = pytest.mark.skipif(
     sys.platform != "linux", reason="spawn backends are Linux-only",
@@ -115,6 +119,8 @@ class TestPtyReadbackPlugged(unittest.TestCase):
         if not _mount_ns_usable():
             self.skipTest("mount-ns unusable here")
 
+    # Exercises mount-delivered capability; hosts with userns but no mount capability degrade by design -> named SKIP, not a mid-flight mount failure.
+    @requires_mount
     def test_child_cannot_read_operator_terminal(self):
         wt = str(Path(__file__).resolve().parents[3])
         # Markers are CONSTRUCTED at runtime so a traceback echoing

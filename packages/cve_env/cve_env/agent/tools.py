@@ -8,8 +8,10 @@ tool can never be silently unregistered at run time.
 
 Tool taxonomy:
 
-* **Deterministic shortcut** (zero-LLM inside the tool): ``vulhub_lookup``,
-  ``image_resolve``, ``arch_decide``.
+* **Deterministic shortcut** (zero-LLM inside the tool):
+  ``image_resolve`` (``vulhub_lookup`` was folded into it and
+  ``arch_decide`` into ``image_resolve``'s decision field — neither is
+  a registered tool; see the TOOL_NAMES note).
 * **Build/run/verify plumbing**: ``dockerfile_gen``, ``docker_build``,
   ``docker_run``, ``verify``, ``source_build``.
 * **Terminal**: ``give_up`` -- agent emits ``{reason}`` and the loop
@@ -69,7 +71,7 @@ def _json(payload: dict[str, Any]) -> str:
 # -- nvd_lookup -----------------------------------------------------------
 
 
-# Module-level per-CVE state. Thread-unsafe by design: single-process-per-CVE model (see _activity.py).
+# Module-level per-CVE state. Thread-unsafe by design: one process per CVE.
 # Must call reset_all_tool_state() between CVEs.
 #
 # Guard against re-calling nvd_lookup mid-CVE. The agent can re-research
@@ -869,7 +871,7 @@ ALL_TOOLS: list[ToolDef] = [
                 },
                 "allow_devices": {
                     "type": "boolean",
-                    "description": "pass True for hardware/driver CVEs that need device node access. Default False: only safe pseudo-devices (/dev/null, /dev/urandom, etc.) are kept; dangerous mappings are stripped"
+                    "description": "REQUEST device node access for hardware/driver CVEs. Granted only when the operator has set CVE_ENV_ALLOW_DEVICES=1; otherwise dangerous mappings are stripped and the result carries a devices_note. Default False: only safe pseudo-devices (/dev/null, /dev/urandom, etc.) are kept"
                 }
             },
             "required": [
@@ -974,9 +976,11 @@ ALL_TOOLS: list[ToolDef] = [
         "silent_end_turn (was silent_end_turn_p0x, Phase 24A rename), "
         "stuck_after_launch_intervention (Phase 8.4 era — currently dormant), "
         "no_image_without_resolve (Phase 7.4 CF-4), "
-        "refusal_persistent (Phase 7.5 CF-6), "
-        "max_tool_attempts_<tool> (Phase 12.5 attempts cap), "
-        "stage_budget_exhausted_<stage> (Phase 12.3 hard mode).",
+        "refusal_persistent (Phase 7.5 CF-6). "
+        "Historical reasons no longer emitted by any surviving code path "
+        "(retired with the SDK engine; old audit JSONLs may still carry "
+        "them — do not read their absence as 0 fires): "
+        "max_tool_attempts_<tool>, stage_budget_exhausted_<stage>.",
         input_schema={
             "type": "object",
             "properties": {

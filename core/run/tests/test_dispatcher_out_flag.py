@@ -192,6 +192,30 @@ class TestRunWithLifecycleOut:
         # --out passes through untouched on the help path.
         assert "--out" in (h.child_args or [])
 
+    def test_interrupted_child_is_not_completed_by_parent(
+        self, tmp_path, monkeypatch,
+    ):
+        raptor = _import_raptor()
+        h = _LifecycleHarness(raptor, monkeypatch)
+        completed = []
+        monkeypatch.setattr(
+            "core.run.metadata.load_run_metadata",
+            lambda _out: {"status": "interrupted"},
+        )
+        monkeypatch.setattr(
+            raptor, "complete_run",
+            lambda out, **_kw: completed.append(Path(out)),
+        )
+
+        rc = raptor._run_with_lifecycle(
+            "agentic", Path("/nonexistent/script.py"),
+            ["--out", str(tmp_path / "prepared")], "label",
+        )
+
+        assert rc == 0
+        assert completed == []
+        assert h.child_args is not None
+
 
 class TestExtractAndStripProject:
     """The wrapper's --project extraction mirrors --out: stripped for

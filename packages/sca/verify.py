@@ -19,6 +19,9 @@ whether the patch is safe to apply:
         patch (or some advisory the operator expected to clear didn't)
     2 — invalid arguments
     3 — internal error during pipeline run
+    4 — verdict unavailable: an analyse run behind the delta carries the
+        ``sca:scan_health:osv_lookup_degraded`` row, so advisory coverage
+        was incomplete and "resolved"/"new" counts cannot be trusted
 
 Outputs (under ``--out``):
 
@@ -40,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import shutil
 import sys
 from datetime import datetime, timezone
@@ -48,11 +52,13 @@ from typing import Any, TYPE_CHECKING
 
 from core.json import JsonCache, load_json, save_json
 
-# findings.json artifacts are RAPTOR-written run output — the
-# findings-class budget.
-_MAX_FINDINGS_BYTES = 64 * 1024 * 1024
-from . import SCA_CACHE_ROOT
-from .diff import compute_delta
+# findings.json byte budgets (single owner + rationale: kinds.py) —
+# steered-path budget for the operator-supplied --findings read,
+# self-produced budget for files a run_sca in THIS process just wrote.
+from .kinds import MAX_FINDINGS_BYTES as _MAX_FINDINGS_BYTES
+from .kinds import MAX_SELF_FINDINGS_BYTES as _MAX_SELF_FINDINGS_BYTES
+from . import sca_cache_root
+from .diff import compute_delta, md_cell
 from .findings import severity_rank
 from . import default_client
 from .pipeline import RunOptions, run_sca
@@ -65,17 +71,16 @@ logger = logging.getLogger(__name__)
 
 
 # Vendored / build-output directories we don't bother copying.
-# Mirrors discovery.EXCLUDED_DIR_NAMES and the supply-chain artefact
-# walk's skiplist.
-_SKIP_DIR_NAMES: set[str] = {
-    "node_modules", "vendor", "bower_components",
-    ".git", ".svn", ".hg",
-    "target", "build", "dist", "out", "_build",
-    "__pycache__", ".tox", ".venv", "venv", ".env",
-    ".pytest_cache", ".mypy_cache", ".ruff_cache",
-    ".gradle", ".idea", ".vscode",
-    ".angular", ".next", ".nuxt", ".cache", ".turbo",
-}
+# DERIVED from discovery's exclusion list, not hand-mirrored: the
+# hand-copied version drifted (no ``.out``, ``.claude``,
+# ``codeql_dbs`` / ``codeql_db``), so every verify overlay copied
+# CodeQL database caches (10K+ files) and agent worktree state into
+# the scratch tree on every run. Anything discovery skips, the
+# overlay skips — a dir discovery won't scan contributes nothing to
+# the verify delta.
+from .discovery import EXCLUDED_DIR_NAMES as _DISCOVERY_EXCLUDED
+
+_SKIP_DIR_NAMES: set[str] = set(_DISCOVERY_EXCLUDED)
 
 
 def main(
@@ -100,7 +105,7 @@ def main(
         return 2
 
     if cache is None:
-        cache = JsonCache(root=Path(args.cache_root) if args.cache_root else SCA_CACHE_ROOT)
+        cache = JsonCache(root=Path(args.cache_root) if args.cache_root else sca_cache_root())
     if http is None:
         http = default_client()
 
@@ -140,6 +145,8 @@ def main(
 
     if args.findings:
         before_findings = Path(args.findings).resolve()
+        # Operator-steered location — steered-path budget.
+        before_max_bytes = _MAX_FINDINGS_BYTES
         if not before_findings.exists():
             print(f"raptor-sca verify: --findings file not found: {before_findings}",
                   file=sys.stderr)
@@ -153,13 +160,18 @@ def main(
             print(f"raptor-sca verify: analyse on target failed: {e}", file=sys.stderr)
             return 3
         before_findings = before.findings_path
+        # Self-produced: the run_sca above just wrote it.
+        before_max_bytes = _MAX_SELF_FINDINGS_BYTES
 
     try:
         rows_before = load_json(
-            before_findings, strict=True, max_bytes=_MAX_FINDINGS_BYTES,
+            before_findings, strict=True, max_bytes=before_max_bytes,
         )
+        # The after-file is always self-produced (the overlay run_sca
+        # above just wrote it) — self-produced budget.
         rows_after = load_json(
-            after.findings_path, strict=True, max_bytes=_MAX_FINDINGS_BYTES,
+            after.findings_path, strict=True,
+            max_bytes=_MAX_SELF_FINDINGS_BYTES,
         )
         if rows_before is None or rows_after is None:
             # Strict load_json soft-returns None for a MISSING file —
@@ -174,8 +186,25 @@ def main(
         return 3
 
     summary, exit_code = _verdict(delta, severity_floor=args.fail_on_severity,
-                                  applied=applied)
-    delta_md = _render_markdown(target, proposed, applied, delta, summary)
+                                  applied=applied, overlay_root=overlay_dir)
+    osv_degraded = (_rows_osv_degraded(rows_before)
+                    or _rows_osv_degraded(rows_after))
+    delta_md = _render_markdown(target, proposed, applied, delta, summary,
+                                osv_degraded=osv_degraded)
+    if osv_degraded:
+        # A degraded analyse run cannot answer "does proposed/ resolve
+        # the findings": failed OSV slots make advisories invisible, so
+        # the delta reads them as resolved/absent and a network outage
+        # would wave an unverified patch through this gate with exit 0.
+        # Refuse to conclude — the artifacts above stay for inspection.
+        delta_md += (
+            "\n## OSV lookups degraded — verdict unavailable\n\n"
+            "An analyse run behind this delta carries the "
+            "`sca:scan_health:osv_lookup_degraded` row: advisory "
+            "coverage was incomplete, so the resolved/new counts above "
+            "cannot be trusted. Re-run when the network/OSV recovers.\n"
+        )
+        exit_code = 4
     from ._atomic import atomic_write_text
     atomic_write_text(out_dir / "delta.md", delta_md)
     save_json(
@@ -244,23 +273,33 @@ def _resolve_out(explicit: str | None) -> Path:
 def _copy_target(src: Path, dst: Path) -> None:
     """Mirror the target into ``dst``, skipping vendored / build dirs.
 
-    ``shutil.copytree(..., ignore=...)`` would be neat but its ``ignore``
-    callback sees lists of names and we want a name-based predicate; the
-    direct walk is simpler and lets us handle symlinks the same way
-    discovery does (don't follow).
+    Walks with ``os.walk(..., followlinks=False)`` — NOT ``rglob``:
+    before Python 3.13 ``Path.rglob`` recurses THROUGH directory
+    symlinks, so a hostile repo's ``docs -> ~/.ssh`` link pulled
+    operator files into the overlay (which is then scanned and lands
+    in delta artifacts); a cyclic symlink additionally recursed
+    unboundedly. Files are copied through the resolvers' lstat-gated,
+    size-bounded ``copy_regular_file`` so symlinked / non-regular /
+    oversized entries are refused with a log line instead of followed.
     """
+    from .resolvers._safe_io import copy_regular_file
+
     dst.mkdir(parents=True, exist_ok=False)
     src = src.resolve()
-    for path in src.rglob("*"):
-        if any(part in _SKIP_DIR_NAMES for part in path.relative_to(src).parts):
-            continue
-        target_path = dst / path.relative_to(src)
-        if path.is_dir() and not path.is_symlink():
-            target_path.mkdir(parents=True, exist_ok=True)
-        elif path.is_file() and not path.is_symlink():
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, target_path)
-        # symlinks: skip (we don't want to follow)
+    for dirpath, dirnames, filenames in os.walk(src, followlinks=False):
+        # In-place prune: neither descends into nor recreates the
+        # vendored/build dirs. Symlinked directories are listed in
+        # ``dirnames`` but never walked (followlinks=False) and never
+        # recreated (only walked dirpaths get a mkdir below).
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIR_NAMES]
+        cur = Path(dirpath)
+        target_dir = dst / cur.relative_to(src)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        for fn in filenames:
+            path = cur / fn
+            if path.is_symlink():
+                continue        # never follow, silently (matches discovery)
+            copy_regular_file(path, target_dir / fn)
 
 
 def _apply_overlay(proposed: Path, overlay: Path) -> list[Path]:
@@ -284,8 +323,23 @@ def _apply_overlay(proposed: Path, overlay: Path) -> list[Path]:
 # Verdict + rendering
 # ---------------------------------------------------------------------------
 
+def _rows_osv_degraded(rows: Any) -> bool:
+    """True when a findings.json row set carries the pipeline's
+    OSV-degradation scan-health row (see ``pipeline`` step 4 — the row
+    is the machine-readable "advisory coverage was incomplete" signal
+    CI consumers key on)."""
+    from .kinds import SCAN_HEALTH_PREFIX
+    degraded_type = f"{SCAN_HEALTH_PREFIX}osv_lookup_degraded"
+    if not isinstance(rows, list):
+        return False
+    return any(
+        isinstance(r, dict) and r.get("vuln_type") == degraded_type
+        for r in rows
+    )
+
 def _verdict(
     delta, *, severity_floor: str, applied: list[Path] | None = None,
+    overlay_root: Path | None = None,
 ) -> tuple[dict[str, Any], int]:
     floor = severity_rank(severity_floor)
     triggering = [
@@ -302,7 +356,8 @@ def _verdict(
     # the open advisories — the documented exit-1 contract. Persistent
     # findings in files the patch never touched don't gate (a targeted
     # ``fix --fix=<adv>`` must not fail on unrelated backlog).
-    not_cleared = _not_cleared_in_applied(persistent_above, applied)
+    not_cleared = _not_cleared_in_applied(
+        persistent_above, applied, overlay_root=overlay_root)
     summary = {
         "resolved": len(delta.resolved),
         "new": len(delta.new),
@@ -319,20 +374,35 @@ def _verdict(
 
 def _not_cleared_in_applied(
     rows: list[dict[str, Any]], applied: list[Path] | None,
+    *, overlay_root: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Subset of ``rows`` whose ``file`` is one of the overlaid
     (patched) relative paths. Finding rows carry overlay-absolute
-    paths; ``applied`` carries proposed/-relative paths — match on
-    the relative suffix."""
+    paths; ``applied`` carries proposed/-relative paths — relativise
+    the row path against the overlay root and require EXACT set
+    membership. A basename/suffix match here false-failed targeted
+    ``fix --fix=<adv>`` runs on any monorepo where an untouched
+    manifest's overlay path merely ends with a patched one's relative
+    path (``x/sub/package.json`` vs applied ``sub/package.json``)."""
     if not applied:
         return []
     rels = {str(p) for p in applied}
+    root = overlay_root.resolve() if overlay_root is not None else None
     out: list[dict[str, Any]] = []
     for r in rows:
         f = r.get("file")
         if not isinstance(f, str):
             continue
-        if any(f == rel or f.endswith("/" + rel) for rel in rels):
+        rel = f
+        if root is not None:
+            try:
+                rel = str(Path(f).resolve().relative_to(root))
+            except (ValueError, OSError):
+                # Row path outside the overlay (or already relative
+                # and unresolvable against it): fall through to the
+                # exact-string check below.
+                rel = f
+        if rel in rels:
             out.append(r)
     return out
 
@@ -343,10 +413,21 @@ def _render_markdown(
     applied: list[Path],
     delta,
     summary: dict[str, Any],
+    *,
+    osv_degraded: bool = False,
 ) -> str:
     lines: list[str] = []
     lines.append(f"# sca verify — `{target}` ⇐ `{proposed}`\n")
-    if summary["regressing_above_threshold"]:
+    if osv_degraded:
+        # The human-readable verdict must reflect the degradation — a
+        # "clean"/"pass" line above the exit-4 refusal section would
+        # contradict it. The counts below stay for inspection.
+        lines.append(
+            "**Verdict: unavailable** — OSV lookups degraded during "
+            "the analyse run(s); the resolved/new counts below cannot "
+            "be trusted.\n"
+        )
+    elif summary["regressing_above_threshold"]:
         lines.append(
             f"**Verdict: regression** — proposed/ introduces "
             f"{summary['regressing_above_threshold']} new finding(s) "
@@ -401,14 +482,20 @@ def _render_markdown(
 
 
 def _row_line(r: dict[str, Any]) -> str:
-    sev = (r.get("severity") or "info").title()
+    # Every interpolated cell is findings.json content that downstream
+    # carries registry / manifest bytes — the same trust boundary
+    # ``diff.md_cell`` was built for. Unescaped pipes / newlines /
+    # ``</details>`` in a crafted package name or advisory id would
+    # break the delta.md table, forge report rows, or land terminal
+    # escapes on stdout.
+    sev = md_cell((r.get("severity") or "info").title())
     sca = r.get("sca") or {}
     eco = sca.get("ecosystem") or ""
     name = sca.get("name") or ""
     version = sca.get("version") or ""
     adv = sca.get("advisory") or {}
     adv_id = (adv.get("id") or "") if isinstance(adv, dict) else ""
-    finding = f"{eco}:{name}@{version} {adv_id}".strip()
+    finding = md_cell(f"{eco}:{name}@{version} {adv_id}".strip())
     kev = "yes" if sca.get("in_kev") else ""
     epss_val = sca.get("epss")
     epss = f"{epss_val:.2f}" if isinstance(epss_val, (int, float)) else ""

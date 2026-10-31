@@ -14,7 +14,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from core.config import RaptorConfig
+from core.llm.models_config_perm import (
+    WorldReadableModelsConfigError,
+    loose_mode_bits,
+    refuse_exposed_inline_keys,
+)
 from core.logging import get_logger
+from core.security.session_services import (
+    report_session_service_policy,
+    session_services_restricted,
+)
 
 logger = get_logger()
 
@@ -51,7 +60,7 @@ except ImportError as _e:
 try:
     # Probe botocore, not boto3: everything RAPTOR needs for Bedrock
     # SigV4 (the dispatcher's signer in core/llm/dispatcher/auth.py)
-    # imports botocore only, and requirements.txt ships botocore
+    # imports botocore only, and pyproject.toml ships botocore
     # without boto3. Probing boto3 here made a botocore-only install
     # fail detection while the actual signing path worked.
     import botocore as _botocore_module  # noqa: F401 — availability probe
@@ -154,6 +163,9 @@ _ollama_checked: bool = False
 
 def _get_available_ollama_models() -> list[str]:
     """Get list of available Ollama models. Cached per-process to avoid repeated HTTP checks."""
+    if session_services_restricted():
+        report_session_service_policy()
+        return []
     global _cached_ollama_models, _ollama_checked
     if _ollama_checked:
         return _cached_ollama_models or []
@@ -179,7 +191,7 @@ def _get_available_ollama_models() -> list[str]:
         if response.status_code == 200:
             data = response.json()
             _cached_ollama_models = [
-                model.get('name') for model in data.get('models', [])
+                str(model['name']) for model in data.get('models', [])
                 if isinstance(model, dict) and model.get('name')
             ]
             _ollama_checked = True
@@ -697,10 +709,29 @@ def _read_config_models() -> list:
     versioned snapshot (``claude-haiku-4-5-20251001``). See
     :mod:`core.llm.model_resolution` for the resolver and its failure
     posture (verbatim passthrough on any error).
+
+    Permission gate: this loader reads the identical file the
+    dispatcher credential seeder does, so it applies the identical
+    fail-closed gate (:mod:`core.llm.models_config_perm`) — a
+    group/other-readable file that carries inline ``api_key`` entries
+    refuses to load instead of carrying the exposed keys into live
+    transports.
+
+    Raises:
+        WorldReadableModelsConfigError: the file is group/other-
+            readable AND carries inline API keys, and
+            ``RAPTOR_ALLOW_WORLD_READABLE_MODELS_JSON=1`` is not set.
+            The message names the ``chmod 600`` remedy. Deliberately
+            NOT folded into the return-[] error posture below — a
+            silent zero-model result would hide the refusal (and its
+            remedy) behind whatever downstream fallback runs next.
     """
     try:
         from core.json import load_json_with_comments
 
+        if session_services_restricted():
+            report_session_service_policy()
+            return []
         config_path = _models_config_path()
 
         data = load_json_with_comments(config_path)
@@ -720,8 +751,20 @@ def _read_config_models() -> list:
         else:
             return []
 
+        # Fail-closed permission gate, BEFORE anything consumes the
+        # entries' api_key fields (_apply_anthropic_resolution uses
+        # them for the network inventory fetch).
+        loose_mode = loose_mode_bits(config_path)
+        if loose_mode is not None:
+            refuse_exposed_inline_keys(config_path, loose_mode, model_list)
+
         _warn_unknown_roles(model_list, config_path)
         return _apply_anthropic_resolution(model_list)
+    except WorldReadableModelsConfigError:
+        # The refusal must surface — swallowing it into the return-[]
+        # posture turns a named, remediable exposure into a silent
+        # zero-model brick.
+        raise
     except Exception as e:  # noqa: BLE001
         logger.debug("detection: model list parse failed, returning []: %s", e)
         return []
@@ -876,6 +919,11 @@ def detect_llm_availability() -> LLMAvailability:
     Returns:
         LLMAvailability with three flags: external_llm, claude_code, llm_available
     """
+    if session_services_restricted():
+        report_session_service_policy()
+        return LLMAvailability(
+            external_llm=False, claude_code=False, llm_available=False,
+        )
     global _cached_llm_availability
     if _cached_llm_availability is not None:
         return _cached_llm_availability

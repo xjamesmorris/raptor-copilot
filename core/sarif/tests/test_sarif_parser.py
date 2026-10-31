@@ -2,6 +2,8 @@
 
 import importlib.util
 import json
+import os
+import signal
 import tempfile
 import unittest
 from pathlib import Path
@@ -185,6 +187,49 @@ class TestLoadSarif(unittest.TestCase):
             path.write_text(doc)
 
             self.assertIsNone(load_sarif(path))
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "platform lacks mkfifo")
+    @unittest.skipUnless(hasattr(signal, "SIGALRM"), "platform lacks SIGALRM")
+    def test_fifo_refused_not_hung(self):
+        # A FIFO stats as 0 bytes — it passes any size cap — and then
+        # blocks the reader forever at the open (no writer ever
+        # arrives). SARIF paths include run-dir artifacts producible
+        # under another principal's write grant, so the safe-load
+        # boundary must refuse non-regular files on the fd it reads
+        # instead of wedging the pipeline stage. Alarm-guarded so a
+        # regression fails instead of hanging the suite.
+        from core.sarif.parser import load_sarif
+
+        def _on_alarm(signum: int, frame) -> None:
+            msg = "load_sarif blocked on a planted FIFO"
+            raise AssertionError(msg)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "planted.sarif"
+            os.mkfifo(path)
+            old = signal.signal(signal.SIGALRM, _on_alarm)
+            signal.alarm(30)
+            try:
+                self.assertIsNone(load_sarif(path))
+            finally:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old)
+
+    def test_symlink_to_regular_still_loads(self):
+        # Keep-direction: run-dir artifacts are legitimately reached
+        # through symlinks; only non-regular TARGETS are refused.
+        from core.sarif.parser import load_sarif
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            real = Path(tmpdir) / "real.sarif"
+            real.write_text('{"version": "2.1.0", "runs": []}')
+            link = Path(tmpdir) / "link.sarif"
+            try:
+                link.symlink_to(real)
+            except OSError:
+                self.skipTest("platform lacks symlinks")
+            result = load_sarif(link)
+            self.assertIsInstance(result, dict)
 
 
 class TestMergeSarif(unittest.TestCase):
@@ -1078,6 +1123,204 @@ class TestCollidedIdNotStampedOut(unittest.TestCase):
         }])
         result = doc["runs"][0]["results"][0]
         self.assertNotIn("fingerprints", result)
+
+
+class TestSeverityInheritance(unittest.TestCase):
+    """Results without an explicit level inherit the rule's
+    defaultConfiguration.level (SARIF severity inheritance). Semgrep's
+    emitter never sets result.level, so without inheritance every
+    rule-declared severity — including error-severity rules — flattens
+    to warning."""
+
+    @staticmethod
+    def _semgrep_shaped(results, rules):
+        # Semgrep-shaped: results carry NO level; rules carry
+        # defaultConfiguration.level.
+        return {
+            "version": "2.1.0",
+            "runs": [{
+                "tool": {"driver": {"name": "semgrep", "rules": rules}},
+                "results": results,
+            }],
+        }
+
+    def _levelless_result(self, rule_id):
+        r = _result(rule_id=rule_id)
+        del r["level"]
+        return r
+
+    def test_rule_declared_error_severity_survives(self):
+        from core.sarif.parser import parse_sarif_findings
+
+        doc = self._semgrep_shaped(
+            [self._levelless_result("high-rule"),
+             self._levelless_result("info-rule")],
+            [
+                {"id": "high-rule", "defaultConfiguration": {"level": "error"}},
+                {"id": "info-rule", "defaultConfiguration": {"level": "note"}},
+            ],
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            findings = parse_sarif_findings(_write_sarif(tmpdir, doc))
+        levels = {f["rule_id"]: f["level"] for f in findings}
+        self.assertEqual(levels["high-rule"], "error")
+        self.assertEqual(levels["info-rule"], "note")
+
+    def test_explicit_result_level_wins_over_rule_default(self):
+        from core.sarif.parser import parse_sarif_findings
+
+        result = _result(rule_id="high-rule")
+        result["level"] = "note"  # explicit override
+        doc = self._semgrep_shaped(
+            [result],
+            [{"id": "high-rule", "defaultConfiguration": {"level": "error"}}],
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            findings = parse_sarif_findings(_write_sarif(tmpdir, doc))
+        self.assertEqual(findings[0]["level"], "note")
+
+    def test_no_level_anywhere_defaults_to_warning(self):
+        from core.sarif.parser import parse_sarif_findings
+
+        doc = self._semgrep_shaped(
+            [self._levelless_result("bare-rule")],
+            [{"id": "bare-rule"}],
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            findings = parse_sarif_findings(_write_sarif(tmpdir, doc))
+        self.assertEqual(findings[0]["level"], "warning")
+
+    def test_metrics_count_inherited_severity(self):
+        from core.sarif.parser import generate_scan_metrics
+
+        doc = self._semgrep_shaped(
+            [self._levelless_result("high-rule")],
+            [{"id": "high-rule", "defaultConfiguration": {"level": "error"}}],
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            metrics = generate_scan_metrics(
+                [str(_write_sarif(tmpdir, doc))],
+            )
+        self.assertEqual(metrics["findings_by_severity"]["error"], 1)
+        self.assertEqual(metrics["findings_by_severity"]["warning"], 0)
+
+
+class TestCountResults(unittest.TestCase):
+    """count_results — the one shared SARIF result counter.
+
+    Shape-tolerant by contract (summary signal, not a validator):
+    every malformed layer counts as zero instead of raising. The
+    per-module copies this replaced drifted exactly on that
+    tolerance."""
+
+    def test_counts_across_runs(self):
+        from core.sarif.parser import count_results
+        sarif = {"runs": [
+            {"results": [{"ruleId": "a"}, {"ruleId": "b"}]},
+            {"results": [{"ruleId": "c"}]},
+        ]}
+        self.assertEqual(count_results(sarif), 3)
+
+    def test_empty_and_missing_shapes(self):
+        from core.sarif.parser import count_results
+        self.assertEqual(count_results({}), 0)
+        self.assertEqual(count_results({"runs": []}), 0)
+        self.assertEqual(count_results({"runs": [{}]}), 0)
+        self.assertEqual(count_results({"runs": [{"results": []}]}), 0)
+
+    def test_hostile_shapes_count_zero_not_raise(self):
+        from core.sarif.parser import count_results
+        # Non-dict document / non-list runs / non-dict run entry /
+        # non-list results: each layer degrades, never raises.
+        self.assertEqual(count_results(None), 0)
+        self.assertEqual(count_results([{"results": [1]}]), 0)
+        self.assertEqual(count_results({"runs": "corrupt"}), 0)
+        self.assertEqual(count_results({"runs": {"results": [1]}}), 0)
+        self.assertEqual(
+            count_results({"runs": ["corrupt", {"results": [{}]}]}), 1)
+        self.assertEqual(
+            count_results({"runs": [{"results": "corrupt"}]}), 0)
+
+
+class TestExtensionRules(unittest.TestCase):
+    """SARIF places pack-/plugin-provided rules on
+    tool.extensions[*].rules (CodeQL pack-based runs emit that layout).
+    A driver-only get_rules dropped their severity defaults and CWE
+    tags — every extension-ruled result flattened to warning with no
+    CWE mapping."""
+
+    @staticmethod
+    def _extensions_shaped(results, ext_rules, driver_rules=None):
+        return {
+            "version": "2.1.0",
+            "runs": [{
+                "tool": {
+                    "driver": {
+                        "name": "codeql",
+                        "rules": driver_rules or [],
+                    },
+                    "extensions": [{
+                        "name": "codeql/python-queries",
+                        "rules": ext_rules,
+                    }],
+                },
+                "results": results,
+            }],
+        }
+
+    def test_get_rules_unions_extensions(self):
+        from core.sarif.parser import get_rules
+
+        run = self._extensions_shaped(
+            [], [{"id": "py/sql-injection"}],
+            driver_rules=[{"id": "drv-rule"}],
+        )["runs"][0]
+        rules = get_rules(run)
+        self.assertIn("py/sql-injection", rules)
+        self.assertIn("drv-rule", rules)
+
+    def test_get_rules_driver_wins_id_collision(self):
+        from core.sarif.parser import get_rules
+
+        run = self._extensions_shaped(
+            [],
+            [{"id": "shared", "defaultConfiguration": {"level": "note"}}],
+            driver_rules=[
+                {"id": "shared", "defaultConfiguration": {"level": "error"}},
+            ],
+        )["runs"][0]
+        rules = get_rules(run)
+        self.assertEqual(
+            rules["shared"]["defaultConfiguration"]["level"], "error",
+        )
+
+    def test_extension_rule_severity_and_cwe_join(self):
+        """A level-less result whose ruleId is defined only on an
+        extension component inherits that rule's severity and CWE."""
+        from core.sarif.parser import parse_sarif_findings
+
+        r = _result(rule_id="py/sql-injection")
+        del r["level"]
+        sarif = self._extensions_shaped(
+            [r],
+            [{
+                "id": "py/sql-injection",
+                "defaultConfiguration": {"level": "error"},
+                "properties": {"tags": ["external/cwe/cwe-089"]},
+            }],
+        )
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".sarif", delete=False,
+        ) as fh:
+            json.dump(sarif, fh)
+            path = Path(fh.name)
+        try:
+            findings = parse_sarif_findings(path)
+        finally:
+            path.unlink()
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["level"], "error")
+        self.assertEqual(findings[0]["cwe_id"], "CWE-89")
 
 
 if __name__ == "__main__":

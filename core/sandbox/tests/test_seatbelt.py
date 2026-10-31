@@ -322,14 +322,11 @@ def test_restrict_reads_emits_deny_read_with_exceptions(tmp_path):
     """restrict_reads=True mirrors the Linux read-allowlist behaviour
     (Landlock's path_beneath denies reads outside the listed dirs).
     Profile must emit:
-      1. `(allow file-read-metadata)` so path traversal works
-         everywhere (stat/readdir on any inode is permissive — just
-         metadata, not content).
+      1. `(allow file-read-metadata)` so path traversal works on the
+         system prefixes (dyld stats every component at image load;
+         the home tree is then narrowed — see the home-metadata tests below).
       2. `(deny file-read-data (require-not ...))` with the
-         system-dirs allowlist + output + readable_paths.
-    The split prevents readdir-of-/ leaking the top-level directory
-    listing (info leak) while keeping dyld + standard tools
-    functional."""
+         system-dirs allowlist + output + readable_paths."""
     output = str(tmp_path / "out")
     os.makedirs(output, exist_ok=True)
     p = seatbelt.build_profile(
@@ -356,6 +353,193 @@ def test_restrict_reads_off_omits_read_deny():
     clause — reads are unrestricted by the (allow default) baseline."""
     p = seatbelt.build_profile()
     assert "file-read*" not in p
+
+
+# --- Home-tree metadata narrowing -------------------------------------
+#
+# Read-restricted shapes deny file-read-metadata under /Users and
+# re-allow exactly the /Users-resident subset of the data-read
+# allowlist. Everything here is generation-level; enforcement is
+# adjudicated by a live macOS probe run (home-tree existence-oracle
+# and stat-detail probes expected to flip to denied on the
+# read-restricted shapes; home readdir — measured already-denied
+# live on current macOS — stays denied).
+
+_HOME_DENY = '(deny file-read-metadata (subpath "/Users"))'
+
+
+def _data_read_grants(profile: str) -> tuple[list, list]:
+    """Extract (subpaths, literals) from the file-read-data deny's
+    require-any exception clause."""
+    import re
+    m = re.search(
+        r"\(deny file-read-data \(require-not \(require-any (.*)"
+        r"\)\)\)", profile,
+    )
+    assert m, f"no file-read-data deny found in:\n{profile}"
+    inside = m.group(1)
+    return (re.findall(r'\(subpath "([^"]*)"\)', inside),
+            re.findall(r'\(literal "([^"]*)"\)', inside))
+
+
+def _home_metadata_allow_subpaths(profile: str) -> list:
+    """Extract the subpaths of the filtered file-read-metadata allow
+    (the home-tree re-allow line; the universal `(allow file-read-metadata)`
+    line is bare and audit_verbose's `(with report)` form carries no
+    subpath filter — neither matches)."""
+    import re
+    lines = [line for line in profile.splitlines()
+             if line.startswith("(allow file-read-metadata (subpath ")]
+    assert len(lines) <= 1, lines
+    if not lines:
+        return []
+    return re.findall(r'\(subpath "([^"]*)"\)', lines[0])
+
+
+def test_home_meta_deny_present_in_restrict_reads_shapes():
+    """Every read-restricted enforcement profile carries the /Users
+    metadata deny — including when no grant lives under /Users (a
+    home-tree-free run leaks nothing and reads nothing there)."""
+    p = seatbelt.build_profile(output="/private/scratch/out",
+                               restrict_reads=True)
+    assert _HOME_DENY in p
+    # No grant under /Users → no filtered metadata re-allow at all.
+    assert _home_metadata_allow_subpaths(p) == []
+
+
+def test_home_meta_deny_skipped_when_grant_covers_home_root():
+    """A data-read grant covering the home root itself ("/" or
+    "/Users", via any grant kwarg) must SKIP the narrowing: emitting
+    the deny anyway would make metadata NARROWER than data-read
+    across the granted tree (the /Users filter on the re-allow list
+    would miss an ancestor-shaped grant), silently breaking
+    stat-before-open inside it. The superset invariant holds by
+    falling back to the universal metadata allow."""
+    for kwargs in (
+        {"readable_paths": ["/"]},
+        {"readable_paths": ["/Users"]},
+        {"target": "/Users"},
+        {"writable_paths": ["/Users/"]},
+    ):
+        p = seatbelt.build_profile(output="/private/scratch/out",
+                                   restrict_reads=True, **kwargs)
+        assert "(deny file-read-metadata" not in p, (kwargs, p)
+        assert "(allow file-read-metadata)" in p, kwargs
+    # Near-miss guard: a sibling path sharing the prefix ("/Users2")
+    # does NOT cover the home root — the deny must stay.
+    p = seatbelt.build_profile(output="/private/scratch/out",
+                               readable_paths=["/Users2"],
+                               restrict_reads=True)
+    assert _HOME_DENY in p
+
+
+def test_home_meta_allows_mirror_home_grants_exact_path_set():
+    """The filtered metadata allow mirrors the data-read allowlist's
+    /Users-resident grants EXACTLY: output, writable_paths,
+    readable_paths, target-when-under-home. Non-home grants must not
+    ride along (they are already metadata-open via the universal
+    allow — re-listing them obscures the diff)."""
+    p = seatbelt.build_profile(
+        output="/Users/op/raptor-out/run1",
+        writable_paths=["/Users/op/raptor-out/shared"],
+        readable_paths=["/Users/op/corpora", "/opt/myapp"],
+        target="/Users/op/target-repo",
+        restrict_reads=True,
+    )
+    assert _HOME_DENY in p
+    assert sorted(_home_metadata_allow_subpaths(p)) == sorted([
+        "/Users/op/raptor-out/run1",
+        "/Users/op/raptor-out/shared",
+        "/Users/op/corpora",
+        "/Users/op/target-repo",
+    ])
+
+
+def test_home_meta_clause_shape_and_order():
+    """Clause SHAPE is load-bearing (measured live on macOS
+    26.x): `(target others)`-filtered denies and `require-not`
+    exception forms measured broken/inert live; deny-then-allow with
+    OR-ing filters on one allow measured correct. Pin the shape:
+      universal metadata allow → /Users deny → filtered re-allow,
+    with no require-not anywhere on the metadata clauses."""
+    p = seatbelt.build_profile(output="/Users/op/out",
+                               restrict_reads=True)
+    lines = [line.strip() for line in p.splitlines() if line.strip()]
+    universal = lines.index("(allow file-read-metadata)")
+    deny = lines.index(_HOME_DENY)
+    allow = next(i for i, line in enumerate(lines)
+                 if line.startswith("(allow file-read-metadata ("))
+    assert universal < deny < allow, (universal, deny, allow)
+    for line in lines:
+        if "file-read-metadata" in line:
+            assert "require-not" not in line, line
+            assert "(target " not in line, line
+
+
+def test_home_meta_is_superset_of_home_data_reads():
+    """THE invariant: every path the profile grants file-read-data on
+    under /Users must have file-read-metadata coverage, or
+    stat-before-open patterns break on it. Derived mechanically from
+    the emitted profile (grants parsed from the data deny's exception,
+    coverage checked against the metadata re-allow), so any future
+    grant source added to read_exceptions is covered by construction
+    or fails here."""
+    p = seatbelt.build_profile(
+        output="/Users/op/raptor-out/run1",
+        writable_paths=["/Users/op/raptor-out/shared", "/private/w"],
+        readable_paths=["/Users/op/corpora", "/opt/myapp"],
+        target="/Users/op/target-repo",
+        restrict_reads=True,
+    )
+    subpaths, literals = _data_read_grants(p)
+    meta = _home_metadata_allow_subpaths(p)
+    for grant in subpaths:
+        if grant == "/Users" or grant.startswith("/Users/"):
+            assert any(grant == m or grant.startswith(m + "/")
+                       for m in meta), (grant, meta)
+    # The literal grants ("/" + /dev nodes) must never live under the
+    # home tree — a /Users literal in the data allowlist would need a
+    # matching metadata literal the generator doesn't emit.
+    for lit in literals:
+        assert not lit.startswith("/Users"), lit
+
+
+def test_home_meta_fake_home_and_tmp_scratch_ride_the_output_grant():
+    """The fake-home layout ({output}/.home — HOME + XDG dirs, see
+    _macos_spawn) and the spawn-layer TMPDIR scratch ({output}/.tmp) live
+    under the output dir, so the output subpath grant covers their
+    metadata by SBPL subpath semantics. Pin that the output grant is
+    present whenever output sits under /Users — losing it silently
+    breaks stat() inside the child's own HOME/TMPDIR."""
+    out = "/Users/op/raptor-out/run1"
+    p = seatbelt.build_profile(output=out, restrict_reads=True,
+                               fake_home=True,
+                               exclude_tmp_baseline=True)
+    assert out in _home_metadata_allow_subpaths(p)
+
+
+def test_home_meta_absent_outside_restrict_reads_shapes():
+    """The narrowing belongs to the read-restricted family ONLY.
+    Permissive shapes stay byte-identical: no metadata clause of any
+    kind without restrict_reads, and audit mode keeps its
+    observe-don't-block allow-with-report form."""
+    # Write isolation without read restriction — no metadata clauses.
+    p = seatbelt.build_profile(output="/Users/op/out")
+    assert "file-read-metadata" not in p
+    # Fully permissive.
+    assert "file-read-metadata" not in seatbelt.build_profile()
+    # Audit mode: observe, never deny.
+    p = seatbelt.build_profile(output="/Users/op/out",
+                               restrict_reads=True, audit_mode=True)
+    assert "(deny file-read-metadata" not in p
+    assert "(allow file-read* (with report))" in p
+
+
+def test_home_meta_tree_root_constant():
+    """The deny is scoped to the exported constant — seatbelt_audit /
+    kit tooling may key on it; drift would silently unscope the
+    narrowing."""
+    assert seatbelt.MACOS_HOME_TREE_ROOT == "/Users"
 
 
 def test_quote_sbpl_escapes_quotes_and_backslashes():
@@ -486,12 +670,33 @@ def test_seccomp_profile_none_omits_process_info_deny():
 
 
 def test_seccomp_profile_full_emits_process_info_deny():
-    """Linux's "full" seccomp blocks ptrace. Closest macOS analogue
-    is denying introspection of OTHER processes' pidinfo / pidfdinfo.
-    `(target others)` keeps self-introspection working."""
+    """Linux's "full" seccomp blocks ptrace; the macOS analogue denies
+    introspection of OTHER processes. The deny must cover the WHOLE
+    process-info* family: the earlier narrow pidinfo/pidfdinfo pair
+    left process-info-listpids open (proc_listallpids() enumerated
+    every host pid) and the narrow pidinfo deny itself proved
+    ineffective against proc_name() on current macOS (26.6.2).
+    The clause SHAPE is load-bearing: a `(target others)`-filtered
+    deny proved inert live on current macOS — the attested pattern is
+    a bare family deny followed by a `(target self)` allow (later
+    allow wins for this family), which keeps self-introspection
+    working."""
     p = seatbelt.build_profile(seccomp_profile="full")
-    assert "(deny process-info-pidinfo (target others))" in p
-    assert "(deny process-info-pidfdinfo (target others))" in p
+    assert "(deny process-info*)" in p
+    assert "(allow process-info* (target self))" in p
+    # Ordering pin: the self allow must FOLLOW the family deny —
+    # this family relies on later-allow-wins (like network*, unlike
+    # file-*). An inverted emission silently loses self-allowance.
+    lines = [line.strip() for line in p.splitlines() if line.strip()]
+    d = lines.index("(deny process-info*)")
+    a = lines.index("(allow process-info* (target self))")
+    assert a > d, (d, a)
+    # The inert filtered-deny shape must not come back.
+    assert "(target others)" not in p
+    # The narrow forms are subsumed — regressing back to them would
+    # silently reopen listpids enumeration.
+    assert "(deny process-info-pidinfo" not in p
+    assert "(deny process-info-pidfdinfo" not in p
 
 
 def test_seccomp_profile_full_emits_iokit_deny():
@@ -522,26 +727,253 @@ def test_debug_profile_omits_iokit_deny():
 
 
 def test_strict_profile_emits_macos_strict_extras():
-    """profile_name='strict' layers the probe-validated extras: scoped
-    signal deny, nvram deny, and the curated mach-lookup allowlist.
+    """profile_name='strict' carries the scoped signal deny, nvram
+    deny, and the mach-lookup allowlist (now baseline for full too).
     All three passed the 2026-08-15 toolchain battery (mach even as a
-    blanket deny — the allowlist is deliberate headroom)."""
+    blanket deny)."""
     p = seatbelt.build_profile(seccomp_profile="full",
                                profile_name="strict")
-    assert "(deny signal (target others))" in p
+    assert "(deny signal)" in p
+    assert "(allow signal (target self))" in p
     assert "(deny nvram*)" in p
     assert "(deny mach-lookup (require-not (require-any" in p
     for svc in seatbelt.MACOS_STRICT_MACH_SERVICES:
         assert svc in p
 
 
-def test_full_profile_omits_strict_extras():
-    """full stays the compatible default — no strict extras."""
+def test_full_profile_carries_hardening_baseline():
+    """The historical strict extras (signal / nvram / mach-lookup)
+    are BASELINE for the full profile now: with mach-lookup open, a
+    sandboxed child could have LaunchServices execute a helper
+    unsandboxed (full escape, confirmed reachable on current macOS),
+    and signal/nvram denies were battery-validated free. full must
+    never regress to the permissive pre-hardening shape."""
     p = seatbelt.build_profile(seccomp_profile="full",
                                profile_name="full")
-    assert "mach-lookup" not in p
-    assert "nvram" not in p
-    assert "(deny signal" not in p
+    assert "(deny signal)" in p
+    assert "(allow signal (target self))" in p
+    # Ordering pin (same later-allow-wins reliance as process-info):
+    # the self allow must FOLLOW the family deny.
+    lines = [line.strip() for line in p.splitlines() if line.strip()]
+    assert (lines.index("(allow signal (target self))")
+            > lines.index("(deny signal)"))
+    assert "(deny nvram*)" in p
+    assert "(deny mach-lookup (require-not (require-any" in p
+
+
+def test_strict_legacy_branch_emits_deny_then_allow_self_signal():
+    """The legacy strict-extras branch (profile_name='strict' with a
+    seccomp profile outside the hardening set — unreached in
+    production) must carry the same signal clause shape as the
+    hardened baseline: the filtered-deny form it historically used is
+    inert on current macOS."""
+    p = seatbelt.build_profile(seccomp_profile="debug",
+                               profile_name="strict")
+    assert "(deny signal)" in p
+    assert "(allow signal (target self))" in p
+    lines = [line.strip() for line in p.splitlines() if line.strip()]
+    assert (lines.index("(allow signal (target self))")
+            > lines.index("(deny signal)"))
+    assert "(target others)" not in p
+    assert "(deny nvram*)" in p
+    assert "(deny mach-lookup (require-not (require-any" in p
+
+
+def test_strict_profile_equals_full_profile():
+    """strict is the fail-closed profile and must never be WEAKER
+    than full; with the hardening baseline in full, the two are
+    identical at the SBPL layer. Byte-equality also proves the
+    strict branch does not duplicate baseline clauses."""
+    kwargs = dict(target="/t", output="/o", block_network=True,
+                  seccomp_profile="full")
+    full = seatbelt.build_profile(profile_name="full", **kwargs)
+    strict = seatbelt.build_profile(profile_name="strict", **kwargs)
+    assert full == strict
+    # The untrusted shapes (restrict_reads=True, home-tree grants —
+    # the family that carries the home-tree metadata narrowing) must stay
+    # byte-identical between strict and default too.
+    kwargs = dict(target="/Users/op/target-repo",
+                  output="/Users/op/raptor-out/run1",
+                  block_network=True, restrict_reads=True,
+                  fake_home=True, exclude_tmp_baseline=True,
+                  seccomp_profile="full")
+    full = seatbelt.build_profile(profile_name="full", **kwargs)
+    strict = seatbelt.build_profile(profile_name="strict", **kwargs)
+    assert full == strict
+
+
+def test_strict_mach_services_is_the_base_list():
+    """The strict allowlist must be the same lookup-only base list —
+    an earlier wider 'headroom' list retained launchservicesd /
+    coreservicesd / SecurityServer / cfprefsd, i.e. the escape and
+    persistence channels survived the strictest profile."""
+    assert (seatbelt.MACOS_STRICT_MACH_SERVICES
+            == seatbelt.MACOS_BASE_MACH_SERVICES)
+
+
+def test_mach_allowlist_excludes_capability_daemons():
+    """Pin the dropped services: each is a capability channel out of
+    the sandbox (unsandboxed proxy execution, keychain, prefs
+    persistence, fs monitoring, cross-sandbox signalling) — none may
+    reappear in ANY emitted mach allowlist."""
+    p = seatbelt.build_profile(seccomp_profile="full")
+    for banned in (
+        "com.apple.coreservices.launchservicesd",
+        "com.apple.CoreServices.coreservicesd",
+        "com.apple.SecurityServer",
+        "com.apple.securityd.xpc",
+        "com.apple.trustd",
+        "com.apple.cfprefsd.daemon",
+        "com.apple.cfprefsd.agent",
+        "com.apple.FSEvents",
+        "com.apple.system.notification_center",
+    ):
+        assert banned not in p, banned
+        assert banned not in seatbelt.MACOS_BASE_MACH_SERVICES
+    # The lookup-only infrastructure services survive.
+    for kept in seatbelt.MACOS_BASE_MACH_SERVICES:
+        assert f'(global-name "{kept}")' in p
+
+
+def test_full_profile_sysctl_read_allowlist_deny():
+    """sysctl-read allowlist-deny: KERN_PROCARGS2 reads the argv AND
+    (for most non-Apple targets) the environment of any same-UID host
+    process — a credential-exfiltration channel, confirmed reachable
+    on current macOS. The deny closes it while the allowlist keeps
+    the hardware/OS-identity names runtimes consult at startup."""
+    p = seatbelt.build_profile(seccomp_profile="full")
+    # Clause shape is load-bearing: the require-not exception form
+    # never matched live on current macOS (every named sysctl was
+    # denied, allowlist included) — the attested Apple shape is a
+    # bare deny followed by filtered allows, later allow wins.
+    assert "(deny sysctl-read)" in p
+    assert "(deny sysctl-read (require-not" not in p
+    lines = [line.strip() for line in p.splitlines() if line.strip()]
+    d = lines.index("(deny sysctl-read)")
+    allows = [i for i, line in enumerate(lines)
+              if line.startswith("(allow sysctl-read ")]
+    assert allows and all(i > d for i in allows), (d, allows)
+    for prefix in seatbelt.MACOS_SYSCTL_READ_PREFIX_ALLOWLIST:
+        assert f'(sysctl-name-prefix "{prefix}")' in p
+    for name in seatbelt.MACOS_SYSCTL_READ_NAME_ALLOWLIST:
+        assert f'(sysctl-name "{name}")' in p
+    # The credential/fingerprint names must never be allowlisted.
+    # (kern.hostname is NOT in this set: Darwin's uname(3) reads it
+    # together with kern.ostype/osrelease/version and hw.machine and
+    # fails entirely if any one is denied — census evidence from a
+    # live macOS run; the allowlist carries the trade-off comment.)
+    for banned in ("kern.proc.", "kern.procargs",
+                   "kern.bootsessionuuid"):
+        assert f'"{banned}' not in p, banned
+    # Exact-name form too: the prefix checks above use a trailing
+    # dot / open quote, which an exact "kern.proc" entry would evade.
+    assert '(sysctl-name "kern.proc")' not in p
+    assert '(sysctl-name "kern.hostname")' in p
+    # sysctl-WRITE denial breaks Apple's linker + ensurepip — the
+    # hardening must stay read-side only.
+    assert "sysctl-write" not in p
+
+
+def test_full_profile_ipc_shm_denies():
+    """POSIX shm is not mediated by file-write* — shm_open of another
+    same-UID process's segment succeeded under every write-isolated
+    shape on current macOS. This is the /dev/shm-equivalent surface
+    the Linux tier closes via mount-ns. Only the libSystem cfprefs
+    read fast-path stays open."""
+    p = seatbelt.build_profile(seccomp_profile="full")
+    assert ('(deny ipc-posix-shm-read* (require-not '
+            '(ipc-posix-name-prefix "apple.cfprefs.")))') in p
+    assert "(deny ipc-posix-shm-write*)" in p
+    assert "(deny ipc-sysv*)" in p
+
+
+def test_full_profile_daemon_proxy_denies():
+    """Belt-and-braces op-level denies over the mach allowlist drops:
+    darwin notifications (host-wide signalling / covert channel),
+    AppleEvents (automation of other apps), user-preference-write
+    (`defaults write` persistence outside the write scope via the
+    cfprefsd proxy)."""
+    p = seatbelt.build_profile(seccomp_profile="full")
+    assert "(deny darwin-notification-post)" in p
+    assert "(deny appleevent-send)" in p
+    assert "(deny user-preference-write)" in p
+
+
+def test_hardening_absent_from_permissive_profiles():
+    """The hardening set engages ONLY for seccomp_profile='full'
+    (which full/strict/target_run all map to). debug keeps debugger
+    primitives; none/network-only stay Linux-parity permissive."""
+    for kwargs in (
+        {},
+        {"seccomp_profile": "debug"},
+        {"seccomp_profile": "none"},
+        {"seccomp_profile": "", "block_network": True},
+    ):
+        p = seatbelt.build_profile(**kwargs)
+        for fragment in (
+            "process-info", "iokit-open", "(deny signal", "nvram",
+            "mach-lookup", "sysctl-read", "ipc-posix-shm", "ipc-sysv",
+            "darwin-notification-post", "appleevent-send",
+            "user-preference-write",
+        ):
+            assert fragment not in p, (kwargs, fragment)
+
+
+def test_hardening_audit_duals_report_every_denied_family():
+    """Audit mode observes instead of blocking: every family the
+    enforcement branch denies must appear as (allow X (with report)),
+    and no hardening deny may survive into the audit profile."""
+    p = seatbelt.build_profile(seccomp_profile="full", audit_mode=True,
+                               output="/tmp/x")
+    for family in (
+        "process-info*", "iokit-open", "signal", "nvram*",
+        "mach-lookup", "sysctl-read", "ipc-posix-shm*", "ipc-sysv*",
+        "darwin-notification-post", "appleevent-send",
+        "user-preference-write",
+    ):
+        assert f"(allow {family} (with report))" in p, family
+    for fragment in (
+        "(deny process-info", "(deny iokit-open", "(deny signal",
+        "(deny nvram", "(deny mach-lookup", "(deny sysctl-read",
+        "(deny ipc-", "(deny darwin-notification-post",
+        "(deny appleevent-send", "(deny user-preference-write",
+    ):
+        assert fragment not in p, fragment
+
+
+def test_untrusted_default_shape_carries_full_hardening():
+    """The floor shape (run_untrusted's darwin kwargs) must carry the
+    complete hardening set alongside its read/write/network denies —
+    the untrusted contract ('credential exfil blocked') depends on
+    the mach/sysctl/shm/signal denies, not just the fs clauses."""
+    p = seatbelt.build_profile(
+        target="/t", output="/o", block_network=True,
+        restrict_reads=True, readable_paths=["/usr"],
+        writable_paths=[], fake_home=True, exclude_tmp_baseline=True,
+        seccomp_profile="full", profile_name="full",
+    )
+    for clause in (
+        "(deny process-info*)",
+        "(allow process-info* (target self))",
+        "(deny iokit-open)",
+        "(deny signal)",
+        "(allow signal (target self))",
+        "(deny nvram*)",
+        "(deny mach-lookup (require-not (require-any",
+        "(deny sysctl-read)",
+        "(allow sysctl-read (sysctl-name-prefix",
+        "(allow sysctl-read (sysctl-name ",
+        "(deny ipc-posix-shm-write*)",
+        "(deny ipc-sysv*)",
+        "(deny darwin-notification-post)",
+        "(deny appleevent-send)",
+        "(deny user-preference-write)",
+        "(deny network*)",
+        "(deny file-write*",
+        "(deny file-read-data",
+        '(deny file-read-metadata (subpath "/Users"))',
+    ):
+        assert clause in p, clause
 
 
 def test_strict_extras_report_under_audit():
@@ -581,7 +1013,7 @@ def test_seccomp_profile_with_audit_mode_uses_report():
 def test_seccomp_profile_debug_omits_introspection_denies():
     """Linux's `--sandbox debug` is "full minus ptrace block" so
     gdb/rr can attach to the sandboxed target. The macOS analogue
-    must keep process-info-* on `target others` unrestricted so
+    must keep other-process process-info-* unrestricted so
     lldb / sample / dtrace can introspect — same intent both
     platforms. Regression catch: any earlier behaviour where
     "debug" engaged the same hardening as "full" silently broke
@@ -597,8 +1029,8 @@ def test_seccomp_profile_full_distinct_from_debug():
     them, this test catches it."""
     full = seatbelt.build_profile(seccomp_profile="full")
     debug = seatbelt.build_profile(seccomp_profile="debug")
-    assert "(deny process-info-pidinfo" in full
-    assert "(deny process-info-pidinfo" not in debug
+    assert "(deny process-info*)" in full
+    assert "(deny process-info*" not in debug
 
 
 # --- audit_verbose (Phase 2c) ------------------------------------------

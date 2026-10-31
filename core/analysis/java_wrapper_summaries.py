@@ -190,7 +190,12 @@ def _straight_line_locals(body, params: tuple[str, ...],
     or raise :class:`_Refused`. ``strict_state`` (cross-class
     instance helpers) forbids bare assignments entirely — an
     undeclared assignment target could be a field."""
-    stmts = [c for c in body.children if c.is_named]
+    # Comments are NAMED nodes in tree-sitter-java: without the
+    # filter any comment inside a helper body refused the summary
+    # ("unsupported body statement: line_comment") — the conduit twin
+    # (_walk_conduit_body) already filters them.
+    stmts = [c for c in body.children
+             if c.is_named and c.type not in _COMMENTS]
     if len(stmts) > _MAX_BODY_STATEMENTS:
         msg = "body exceeds statement cap"
         raise _Refused(msg)
@@ -221,27 +226,28 @@ def _straight_line_locals(body, params: tuple[str, ...],
             locals_map[name] = value
             continue
         if stmt.type == _EXPR_STMT:
-            if strict_state:
-                msg = "bare assignment in a cross-class helper body"
-                raise _Refused(msg)
             inner = next((c for c in stmt.children if c.is_named), None)
             if inner is None or inner.type != _ASSIGNMENT:
                 msg = "non-assignment statement in body"
                 raise _Refused(msg)
             left = inner.child_by_field_name("left")
-            right = inner.child_by_field_name("right")
-            op = inner.child_by_field_name("operator")
-            if (left is None or left.type != _IDENT or right is None
-                    or _text(op) != "="):
-                msg = "unsupported assignment shape in body"
-                raise _Refused(msg)
-            name = _text(left)
-            if name in assigned or name in params:
+            lhs_name = _text(left) if left is not None \
+                and left.type == _IDENT else None
+            if lhs_name is not None and (lhs_name in assigned or lhs_name in params):
                 msg = "local reassignment / parameter shadowing"
                 raise _Refused(msg)
-            assigned.add(name)
-            locals_map[name] = right
-            continue
+            # Any other bare ``name = expr`` target is NEVER a
+            # declared local: declaration goes through the
+            # _LOCAL_DECL lane and reassigning a declared local
+            # refuses above — so the target can only be a FIELD (or
+            # an outer binding), which any interleaved call in a
+            # later statement can rewrite before the return.
+            # Modelling it as a local temp minted a "sanitizes
+            # positions" summary over a rewritable slot; refuse in
+            # EVERY lane (previously only cross-class instance
+            # helpers refused).
+            msg = "bare assignment target may be a field"
+            raise _Refused(msg)
         msg = f"unsupported body statement: {stmt.type}"
         raise _Refused(msg)
     ret = stmts[-1]
@@ -529,7 +535,17 @@ def derive_wrapper_summaries(
         return {}, ["parse failure"]
     root = tree.root_node
     types, statics = build_import_map(root)
-    resolver = _NameResolver(types, statics)
+    # Positional vouch: a local obscuring an imported catalog class
+    # must not lend its name's static identity to helper-body calls;
+    # same-file member types / type parameters shadow type imports
+    # the same way (JLS 6.4.1).
+    from core.analysis.cfg_builder_java import (
+        _file_type_shadow_names,
+        _FileLocalScopes,
+    )
+    resolver = _NameResolver(types, statics,
+                             local_scopes=_FileLocalScopes(root),
+                             type_shadows=_file_type_shadow_names(root))
 
     by_name, extended = _class_inventory(root)
 
@@ -628,6 +644,8 @@ def _index_calls(
     except Exception:  # noqa: BLE001
         return {}
     out: dict[tuple[int, int], _CallInfo] = {}
+    from core.analysis.cfg_builder_java import _FileLocalScopes
+    scopes = _FileLocalScopes(tree.root_node)
     for cur in _iter_named(tree.root_node):
         if cur.type != _METHOD_INVOCATION:
             continue
@@ -643,7 +661,11 @@ def _index_calls(
         obj_u = _unwrap(obj)
         if obj_u is None:
             continue
-        if obj_u.type == _IDENT and _text(obj_u) in class_names:
+        # Positional vouch before the static form: a local variable
+        # named like the summarised class (JLS 6.4.2 obscuring)
+        # dispatches to ITS runtime type — never binds.
+        if obj_u.type == _IDENT and _text(obj_u) in class_names \
+                and not scopes.vouches(_text(obj_u), obj_u.start_byte):
             out[key] = _CallInfo(
                 form="static", owner=_text(obj_u),
                 args=_positional_args(cur))
@@ -713,13 +735,13 @@ def synthetic_wrapper_bindings_java(
                     continue
                 summary = matching[0]
             else:
-                summary = summaries.get((info.owner, method_name, arity))
+                summary = summaries.get((info.owner, method_name, arity))  # type: ignore[arg-type,assignment]
                 if summary is None:
                     continue
                 if info.form == "static" and not summary.is_static:
                     continue
-            input_symbols = frozenset(
-                info.args[i]
+            input_symbols: frozenset[str] = frozenset(
+                info.args[i]  # type: ignore[misc]
                 for i in summary.sanitized_positions
                 if i < len(info.args) and info.args[i] is not None
             )
@@ -939,8 +961,13 @@ def _walk_conduit_body(
         if name in params:
             msg = "parameter reassigned in body"
             raise _Refused(msg)
-        if strict_state and name not in declared:
-            msg = "bare assignment in a cross-class helper body"
+        if name not in declared:
+            # An undeclared assignment target resolves to a FIELD
+            # (or an outer binding) — a slot any interleaved call
+            # can rewrite before the return, so it must never be
+            # modelled as a local temp. EVERY lane refuses
+            # (previously only cross-class instance helpers did).
+            msg = "assignment target is not a declared local"
             raise _Refused(msg)
         env[name] = _classify_expr(rhs, params, env)
 
@@ -1019,8 +1046,10 @@ def _walk_conduit_body(
                     msg = "partially assigned local (unknown fall-through)"
                     raise _Refused(msg)
                 merged = _merge_vals(then_val, prior)
-            if strict_state and name not in declared:
-                msg = "bare assignment in a cross-class helper body"
+            if name not in declared:
+                # Same undeclared-target-may-be-a-field rule as
+                # ``assign`` — the if-arm merge writes the name too.
+                msg = "assignment target is not a declared local"
                 raise _Refused(msg)
             if name in params:
                 msg = "parameter reassigned in body"
@@ -1174,6 +1203,8 @@ def _index_conduit_calls(
         return {}
     out: dict[tuple[int, int],
               tuple[ConduitSummary, tuple[str | None, ...]]] = {}
+    from core.analysis.cfg_builder_java import _FileLocalScopes
+    scopes = _FileLocalScopes(tree.root_node)
     for cur in _iter_named(tree.root_node):
         if cur.type != _METHOD_INVOCATION:
             continue
@@ -1197,7 +1228,10 @@ def _index_conduit_calls(
             obj_u = _unwrap(obj)
             if obj_u is None:
                 continue
-            if obj_u.type == _IDENT and _text(obj_u) in class_names:
+            if obj_u.type == _IDENT and _text(obj_u) in class_names \
+                    and not scopes.vouches(
+                        _text(obj_u), obj_u.start_byte):
+                # (vouched local receivers never bind — obscuring)
                 s = summaries.get((_text(obj_u), method, arity))
                 summary = s if (s is not None and s.is_static) else None
             elif obj_u.type == _OBJECT_CREATION:

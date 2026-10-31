@@ -355,3 +355,224 @@ class TestBuildDescribeReport:
         assert preview.semgrep_packs == ["security-audit"]
         assert preview.high_priority_dirs == []
         assert preview.pipeline_names == []
+
+
+class TestLicenseLinesEscaped:
+    """License file names come from fnmatch globs whose * accepts any
+    bytes — a hostile repo names a file LICENSE-<ESC...> and format_text
+    prints it. Escape at the writer."""
+
+    HOSTILE = "\x1b]0;pwned\x07\x9b2J‮evil"
+
+    def _out(self, license_obj) -> str:
+        return format_text(_report(_shape(license=license_obj)))
+
+    def test_additional_files_escaped(self):
+        from core.license.detector import TargetLicense
+        lic = TargetLicense(
+            spdx_id=f"MIT{self.HOSTILE}",
+            classification="oss",
+            source_file="LICENSE",
+            confidence="high",
+            additional_files=(f"LICENSE-{self.HOSTILE}",),
+        )
+        out = self._out(lic)
+        assert "License:" in out
+        for raw in ("\x1b", "\x07", "\x9b", "‮"):
+            assert raw not in out
+
+    def test_unclassified_source_file_escaped(self):
+        from core.license.detector import TargetLicense
+        lic = TargetLicense(
+            spdx_id=None,
+            classification="unknown",
+            source_file=f"LICENSE-{self.HOSTILE}",
+            confidence="low",
+        )
+        out = self._out(lic)
+        for raw in ("\x1b", "\x07", "\x9b", "‮"):
+            assert raw not in out
+
+
+class TestTargetDerivedLinesEscaped:
+    """Target-derived strings beyond the license section: the footer's
+    analysis-target path (an archive's top-level dir name is chosen by
+    the archive author), the archive-source label (a downloaded
+    tarball's basename is publisher-chosen), and the git branch name
+    (bidi overrides are legal in ref names; a handcrafted .git needn't
+    honour ref-format at all). All must land escaped."""
+
+    HOSTILE = "\x1b]0;pwned\x07\x9b2J‮evil"
+    RAW = ("\x1b", "\x07", "\x9b", "‮")
+
+    def test_footer_target_path_escaped(self):
+        out = format_text(_report(_shape(
+            target_path=Path(f"/targets/x{self.HOSTILE}dir"),
+        )))
+        assert "raptor.py agentic --repo" in out
+        for raw in self.RAW:
+            assert raw not in out
+        # Escaped form of the path still lands in the footer.
+        assert "/targets/x" in out
+
+    def test_footer_archive_path_escaped(self):
+        report = DescribeReport(
+            target_shape=_shape(),
+            tool_checks=[],
+            target_type_defaults=None,
+            estimate_summary=None,
+            archive_label=f"rel-{self.HOSTILE}.tar.gz",
+            archive_path=Path(f"/downloads/rel-{self.HOSTILE}.tar.gz"),
+        )
+        out = format_text(report)
+        assert "Source: archive" in out
+        for raw in self.RAW:
+            assert raw not in out
+
+    def test_git_branch_escaped(self):
+        from packages.describe.git_provenance import GitProvenance
+        out = format_text(_report(_shape(git=GitProvenance(
+            branch=f"feat/{self.HOSTILE}",
+            commit_short="1a2b3c4",
+            dirty=False,
+            last_commit_date="2026-05-30T14:22:11+00:00",
+        ))))
+        assert "Git:" in out and "@ 1a2b3c4" in out
+        for raw in self.RAW:
+            assert raw not in out
+
+    def test_hostile_dirname_end_to_end(self, tmp_path):
+        # Through the real describe build: a target dir whose NAME
+        # carries ESC + bidi (exactly what extracting a hostile
+        # archive's single top-level dir produces) renders inert.
+        hostile_dir = tmp_path / f"pkg-{self.HOSTILE}"
+        hostile_dir.mkdir()
+        (hostile_dir / "main.c").write_text("int main(){return 0;}")
+        report = build_describe_report(hostile_dir)
+        out = format_text(report)
+        assert "raptor.py agentic --repo" in out
+        for raw in self.RAW:
+            assert raw not in out
+
+
+class TestFormatJsonAsciiEncoded:
+    def test_c1_controls_never_raw(self):
+        """The --json lane prints this string to the operator terminal;
+        bare JSON escapes C0 but passes C1 controls (single-byte
+        CSI/OSC) raw — the renderer must ASCII-encode."""
+        report = _report(_shape(
+            target_path=Path("/targets/x\x9b2J\x9d0;pwn\x1bdir"),
+        ))
+        out = format_json(report)
+        for raw in ("\x9b", "\x9d", "\x1b"):
+            assert raw not in out
+        doc = json.loads(out)  # still valid JSON
+        assert "x\x9b2J" in doc["target_path"]  # value survives, escaped
+
+
+class TestFuzzHarnessSection:
+    """Shipped fuzz-harness census section — rendering, omission,
+    hostile-name egress, and the read-only failure isolation."""
+
+    @staticmethod
+    def _census(engines=None, truncated=False):
+        from packages.fuzzing.harness_census import (
+            EngineCensus,
+            FuzzHarnessCensus,
+        )
+        engines = engines if engines is not None else [
+            EngineCensus(
+                engine="cargo-fuzz", count=3,
+                examples=["parse_header", "decode"],
+                invocation_hint="/fuzz --binary /tmp/test — cargo-fuzz "
+                                "drives the fuzz/fuzz_targets/ harnesses",
+            ),
+            EngineCensus(
+                engine="libfuzzer", count=1, examples=["fuzz_x"],
+                invocation_hint="/fuzz --binary <compiled-harness> — "
+                                "libFuzzer harness sources ship in-tree",
+            ),
+        ]
+        return FuzzHarnessCensus(
+            target_path=Path("/tmp/test"),
+            engines_checked=["cargo-fuzz", "libfuzzer", "afl", "atheris"],
+            engines=engines,
+            truncated=truncated,
+        )
+
+    def _report_with(self, census):
+        return DescribeReport(
+            target_shape=_shape(),
+            tool_checks=[],
+            target_type_defaults=None,
+            estimate_summary=None,
+            fuzz_census=census,
+        )
+
+    def test_section_renders_counts_examples_hints(self):
+        out = format_text(self._report_with(self._census()))
+        assert "Fuzz harnesses shipped (4):" in out
+        assert "cargo-fuzz: 3 (parse_header, decode, +1 more)" in out
+        assert "libfuzzer: 1 (fuzz_x)" in out
+        assert "/fuzz --binary /tmp/test" in out
+        assert "/fuzz --binary <compiled-harness>" in out
+
+    def test_truncated_census_says_counts_partial(self):
+        out = format_text(self._report_with(self._census(truncated=True)))
+        assert "(counts partial)" in out
+
+    def test_empty_census_omits_section(self):
+        out = format_text(self._report_with(None))
+        assert "Fuzz harness" not in out
+        doc = json.loads(format_json(self._report_with(None)))
+        assert doc["fuzz_harnesses"] is None
+
+    def test_json_carries_census_shape(self):
+        doc = json.loads(format_json(self._report_with(self._census())))
+        fh = doc["fuzz_harnesses"]
+        assert fh["total_harnesses"] == 4
+        assert fh["engines"][0]["engine"] == "cargo-fuzz"
+        assert fh["engines_checked"] == [
+            "cargo-fuzz", "libfuzzer", "afl", "atheris",
+        ]
+
+    def test_hostile_example_names_escaped_at_render(self):
+        # The census vets names, but the renderer must not rely on
+        # that — escape-at-render is the surface's own contract.
+        from packages.fuzzing.harness_census import EngineCensus
+        hostile = EngineCensus(
+            engine="cargo-fuzz", count=1,
+            examples=["evil\x1b]0;pwn\x07name"],
+            invocation_hint="/fuzz --binary /t\x9bmp",
+        )
+        out = format_text(self._report_with(self._census([hostile])))
+        for raw in ("\x1b", "\x07", "\x9b"):
+            assert raw not in out
+
+    def test_build_report_populates_census_end_to_end(self, tmp_path):
+        (tmp_path / "Cargo.toml").write_text("[package]\n")
+        fuzz = tmp_path / "fuzz"
+        (fuzz / "fuzz_targets").mkdir(parents=True)
+        (fuzz / "Cargo.toml").write_text("[package]\n")
+        (fuzz / "fuzz_targets" / "roundtrip.rs").write_text(
+            "fuzz_target!(|data: &[u8]| {});\n")
+        report = build_describe_report(tmp_path)
+        assert report.fuzz_census is not None
+        assert report.fuzz_census.total_harnesses == 1
+        assert "Fuzz harnesses shipped (1):" in format_text(report)
+
+    def test_census_absent_on_harnessless_tree(self, tmp_path):
+        (tmp_path / "main.c").write_text("int main(){return 0;}")
+        report = build_describe_report(tmp_path)
+        assert report.fuzz_census is None
+
+    def test_census_failure_never_fails_report(self, tmp_path, monkeypatch):
+        import packages.fuzzing.harness_census as hc
+
+        def _boom(_path):
+            raise RuntimeError("census exploded")
+
+        monkeypatch.setattr(hc, "census_fuzz_harnesses", _boom)
+        report = build_describe_report(tmp_path)
+        assert report.fuzz_census is None
+        assert "Target analysis:" in format_text(report)

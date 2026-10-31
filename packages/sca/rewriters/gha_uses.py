@@ -28,10 +28,9 @@ from __future__ import annotations
 import logging
 import re
 
-from core.atomic_fs import write_text_atomically as _atomic_write
-
-from . import RewriteEdit, RewriteResult, register
+from . import RewriteEdit, RewriteResult, register, rewrite_file_with
 from typing import TYPE_CHECKING
+from ..file_shapes import is_gha_workflow as _is_gha_workflow
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -39,45 +38,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _is_gha_workflow(path: Path) -> bool:
-    """Predicate: path is a GHA workflow file
-    (``.github/workflows/*.yml`` or ``*.yaml``)."""
-    if path.suffix not in (".yml", ".yaml"):
-        return False
-    parts = path.parts
-    for i in range(len(parts) - 2):
-        if parts[i] == ".github" and parts[i + 1] == "workflows":
-            return True
-    return False
-
-
 @register(predicate=_is_gha_workflow)
 def rewrite_gha_uses(
     path: Path, edits: list[RewriteEdit],
 ) -> list[RewriteResult]:
     """Apply ``uses:`` ref-bump edits to a GHA workflow file."""
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as e:
-        return [RewriteResult(edit=e2, applied=False,
-                              reason=f"error: read failed: {e}")
-                for e2 in edits]
-
-    new_text = text
-    results: list[RewriteResult] = []
-    for edit in edits:
-        new_text, result = _apply_one_uses(new_text, edit)
-        results.append(result)
-
-    if any(r.applied for r in results):
-        try:
-            _atomic_write(path, new_text)
-        except OSError as e:
-            return [RewriteResult(edit=r.edit, applied=False,
-                                  reason=f"error: write failed: {e}")
-                    if r.applied else r
-                    for r in results]
-    return results
+    return rewrite_file_with(path, edits, _apply_one_uses)
 
 
 def _apply_one_uses(
@@ -110,8 +76,11 @@ def _apply_one_uses(
     # Allow YAML list marker (``- uses:``) and arbitrary
     # indentation. Three groups: prefix (everything up to + ``@``),
     # the ref value, and the trailing boundary char.
+    # Leading indent is HORIZONTAL-only ([^\S\n]) — the MULTILINE
+    # ^\s* idiom is quadratic on blank-line runs (see the helm
+    # rewriter's fixed anchor; same sibling idiom).
     pattern = re.compile(
-        rf"^(\s*(?:-\s+)?uses:\s*{locator}(?:/[\w./-]+)?@)"
+        rf"^([^\S\n]*(?:-\s+)?uses:\s*{locator}(?:/[\w./-]+)?@)"
         rf"([^\s#]+)"                    # ref (up to whitespace or comment)
         rf"(\s|$|#)",                    # boundary
         re.MULTILINE,
@@ -202,49 +171,79 @@ def _apply_sha_pinned(
     tags (``v6`` / ``v7``); SHAs are in extra.
     """
     locator = re.escape(edit.locator)
-    old_sha = edit.extra["old_sha"]
-    new_sha = edit.extra["new_sha"]
+    old_sha = (edit.extra or {}).get("old_sha") or ""
+    new_sha = (edit.extra or {}).get("new_sha") or ""
+    # The ``rewrite()`` chokepoint validates ``new_value`` (the tag),
+    # but the bytes actually spliced into the workflow line on this
+    # path are the SHAs from ``edit.extra`` — a poisoned upstream
+    # tag→SHA resolution must not write arbitrary bytes into a file
+    # that executes in CI. Enforce the 40-hex grammar here, the one
+    # place the extra values reach the file.
+    if not (_SHA_RE.match(old_sha) and _SHA_RE.match(new_sha)):
+        return text, RewriteResult(
+            edit=edit, applied=False,
+            reason=(
+                "invalid_new_value: extra sha is not a 40-hex "
+                "commit SHA"
+            ),
+        )
     # The expected line shape: optional YAML list marker,
     # ``uses:``, the locator (possibly with subpath), ``@<40hex>``,
     # whitespace, comment containing ``was <tag>``. We MATCH on
     # locator + 40-hex SHA, REWRITE both the SHA and the
     # ``was <tag>`` value.
+    # Horizontal-only indent — same rationale as the match pattern.
     pattern = re.compile(
-        rf"^(\s*(?:-\s+)?uses:\s*{locator}(?:/[\w./-]+)?@)"
+        rf"^([^\S\n]*(?:-\s+)?uses:\s*{locator}(?:/[\w./-]+)?@)"
         rf"([a-f0-9]{{40}})"             # current SHA
         rf"(\s+#\s*was\s+)"               # the "# was " prefix
         rf"([^\s#]+)"                     # current tag in the comment
         rf"([\s#]|$)",                    # boundary
         re.MULTILINE,
     )
-    match = pattern.search(text)
-    if match is None:
+    # A workflow can pin the same action in several jobs/steps.
+    # Verdicts are computed across ALL matching lines — deciding
+    # from the first match alone let an occurrence at a different
+    # SHA (or one already bumped) shadow a legitimate bump into
+    # value_mismatch / no_change while its twin stayed on the old
+    # SHA. Same all-occurrence semantics as the tag-pinned arm.
+    matches = list(pattern.finditer(text))
+    if not matches:
         return text, RewriteResult(
             edit=edit, applied=False, reason="not_found",
         )
-    file_sha = match.group(2)
-    file_tag = match.group(4)
-    if file_sha == new_sha and file_tag == edit.new_value:
-        return text, RewriteResult(
-            edit=edit, applied=False, reason="no_change",
+    needs_bump = [
+        m for m in matches
+        if m.group(2) == old_sha and m.group(4) == edit.old_value
+        and (m.group(2) != new_sha or m.group(4) != edit.new_value)
+    ]
+    if not needs_bump:
+        if all(m.group(2) == new_sha and m.group(4) == edit.new_value
+               for m in matches):
+            return text, RewriteResult(
+                edit=edit, applied=False, reason="no_change",
+            )
+        stray = next(
+            m for m in matches
+            if m.group(2) != new_sha or m.group(4) != edit.new_value
         )
-    if file_sha != old_sha:
+        if stray.group(2) != old_sha:
+            return text, RewriteResult(
+                edit=edit, applied=False,
+                reason=(
+                    f"value_mismatch: file SHA {stray.group(2)[:12]}... "
+                    f"differs from plan's old SHA {old_sha[:12]}..."
+                ),
+            )
         return text, RewriteResult(
             edit=edit, applied=False,
             reason=(
-                f"value_mismatch: file SHA {file_sha[:12]}... "
-                f"differs from plan's old SHA {old_sha[:12]}..."
-            ),
-        )
-    if file_tag != edit.old_value:
-        return text, RewriteResult(
-            edit=edit, applied=False,
-            reason=(
-                f"value_mismatch: file '# was {file_tag}' "
+                f"value_mismatch: file '# was {stray.group(4)}' "
                 f"differs from plan's old tag {edit.old_value!r}"
             ),
         )
-    # Rewrite both the SHA and the ``# was vX`` tag comment.
+    # Rewrite both the SHA and the ``# was vX`` tag comment on every
+    # occurrence still at the plan's old (SHA, tag) pair.
     def _repl(m):
         if m.group(2) == old_sha and m.group(4) == edit.old_value:
             return f"{m.group(1)}{new_sha}{m.group(3)}{edit.new_value}{m.group(5)}"

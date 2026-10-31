@@ -121,6 +121,33 @@ class TestDetectLanguage:
     def test_empty_directory_defaults(self, tmp_path):
         assert detect_language(str(tmp_path)) == "python"
 
+    def test_excluded_dirs_do_not_skew_census(self, tmp_path):
+        """node_modules / .git / target content must not vote —
+        the pruned walk skips them entirely instead of enumerating
+        and discarding (the pre-fix rglob paid a full descent into
+        exactly the trees it ignores)."""
+        (tmp_path / "main.py").write_text("x = 1", encoding="utf-8")
+        nm = tmp_path / "node_modules" / "pkg"
+        nm.mkdir(parents=True)
+        for i in range(5):
+            (nm / f"dep{i}.js").write_text("z", encoding="utf-8")
+        tgt = tmp_path / "target" / "debug"
+        tgt.mkdir(parents=True)
+        (tgt / "gen.rs").write_text("fn f() {}", encoding="utf-8")
+        assert detect_language(str(tmp_path)) == "python"
+
+    def test_excluded_name_in_ancestors_does_not_blank_census(
+        self, tmp_path,
+    ):
+        """Exclusion applies BELOW the target only. Pre-fix the
+        any-part check matched excluded names in the target's own
+        ancestor path, so a project checked out under .../build/proj
+        counted zero files and fell back to 'python'."""
+        proj = tmp_path / "build" / "proj"
+        proj.mkdir(parents=True)
+        (proj / "main.c").write_text("int main(void){}", encoding="utf-8")
+        assert detect_language(str(proj)) == "c"
+
 
 class TestParseLanguagesFor:
     """parse_languages_for pins the joern-parse frontend from the
@@ -198,3 +225,20 @@ class TestSupportedSourceExtensions:
             lang = {".kt": "kotlin", ".kts": "kotlin",
                     ".cs": "csharp", ".swift": "swift"}[ext]
             assert profile_for(lang).joern_parse_language == frontend
+
+
+class TestScalaStringListEscaping:
+    """The render chokepoint escapes every element — convention (static
+    curated tuples) is not a contract."""
+
+    def test_quote_bearing_name_cannot_splice(self):
+        from packages.joern.lang_config import scala_string_list
+        rendered = scala_string_list(('bad"sink', "ok"))
+        assert '"bad\\"sink"' in rendered
+        assert '"ok"' in rendered
+
+    def test_newline_flattened(self):
+        from packages.joern.lang_config import scala_string_list
+        rendered = scala_string_list(("a\nb",))
+        assert "\n" not in rendered
+        assert '"a\\nb"' in rendered

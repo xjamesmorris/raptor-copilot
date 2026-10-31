@@ -15,6 +15,7 @@ from packages.sca.models import (
     HygieneFinding,
     PinStyle,
     Reachability,
+    VulnFinding,
 )
 from packages.sca.osv import OsvResult
 from packages.sca.report import (
@@ -181,6 +182,33 @@ def test_report_includes_severity_table_and_kev_badge() -> None:
     assert "| Critical | 1 |" in md
     assert "**KEV**" in md
     assert "EPSS 0.97" in md
+
+
+def test_base_image_line_defangs_hostile_from_string() -> None:
+    """The Dockerfile FROM image / stage strings come from the scanned
+    repo — a backtick must not escape the code span and inject
+    markdown (autofetch class) into the report."""
+    d = _dep(name="alpine-libcrypto")
+    d.source_kind = "dockerfile_from"
+    d.source_extra = {
+        "image": "evil`![x](https://evil.example/p)`\x1b[31m",
+        "stage_name": "build`er",
+    }
+    findings = build_vuln_findings(
+        [d], [OsvResult(dep_key=d.key(), advisories=[_adv()])],
+    )
+    md = render_markdown_report(
+        target=Path("/repo"),
+        deps_analysed=1,
+        vuln_findings=findings,
+        hygiene_findings=[],
+    )
+    # Backticks neutralised (no code-span escape), non-printables
+    # defanged (no raw ESC byte in the artifact).
+    assert "evil`" not in md
+    assert "evil'![x](https://evil.example/p)'" in md
+    assert "build'er" in md
+    assert "\x1b" not in md
 
 
 def test_findings_are_sorted_by_severity_then_kev_then_epss() -> None:
@@ -486,7 +514,7 @@ def _supply_chain(kind: str = "version_publish",
         declared_in=Path(declared_in),
         scope="main", is_lockfile=False,
         pin_style=PinStyle.RANGE, direct=True,
-        purl="pkg:pypi/[email protected]",
+        purl="pkg:pypi/requests@2.31.0",
         parser_confidence=Confidence("high", reason="t"),
     )
     return SupplyChainFinding(
@@ -541,7 +569,7 @@ def test_hygiene_dedup_uses_same_grouping():
         "ecosystem": "npm", "name": "lodash", "version": "4.17.20",
         "scope": "main", "is_lockfile": False,
         "pin_style": PinStyle.RANGE, "direct": True,
-        "purl": "pkg:npm/[email protected]",
+        "purl": "pkg:npm/lodash@4.17.20",
         "parser_confidence": Confidence("high", reason="t"),
     }
     h_a = HygieneFinding(
@@ -856,11 +884,17 @@ class TestAdvisoryDetailSanitization:
         result = _strip_autofetch_markup(normal)
         assert "Buffer overflow" in result
 
-    def test_source_uses_strip_autofetch(self):
+    def test_source_uses_output_sanitiser(self):
+        """Advisory detail routes through ``sanitise_string`` (which
+        strips autofetch markup, defangs line-leading markdown, and
+        escapes non-printables) — the previous bare
+        ``_strip_autofetch_markup`` + ``escape_nonprintable`` pair let
+        raw ``</details>`` and forged headings through."""
         source = Path(__file__).resolve().parents[1] / "report.py"
         content = source.read_text()
-        assert "_strip_autofetch_markup" in content, (
-            "report.py must call _strip_autofetch_markup on advisory detail"
+        assert "sanitise_string(clipped" in content, (
+            "report.py must sanitise the advisory detail block with "
+            "sanitise_string"
         )
 
 
@@ -1062,3 +1096,64 @@ def test_reachability_bullet_uses_display_label() -> None:
     )
     assert "- Reachability: Not function reachable (" in md
     assert "- Reachability: not_function_reachable" not in md
+
+
+# ---------------------------------------------------------------------------
+# npm alias display — the heading names the installed package; a
+# dedicated line surfaces the manifest spelling
+# ---------------------------------------------------------------------------
+
+def test_vuln_report_shows_alias_declaration_line(tmp_path: Path) -> None:
+    dep = _dep()
+    dep.alias_name = "my-lodash"
+    f = VulnFinding(
+        finding_id="sca:vuln:npm:lodash:4.17.20:GHSA-x",
+        dependency=dep,
+        advisories=[_adv()],
+        in_kev=False,
+        epss=None,
+        fixed_version="5.0.0",
+        reachability=Reachability(
+            verdict="not_evaluated",
+            confidence=Confidence("low", reason="t"),
+        ),
+        version_match_confidence=Confidence("high", reason="t"),
+        cvss_score=9.8,
+        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+        severity="critical",
+        exposure_factor=0.0,
+        transitive_depth=0,
+    )
+    md = render_markdown_report(
+        target=tmp_path, deps_analysed=1,
+        vuln_findings=[f], hygiene_findings=[],
+    )
+    # Heading: the installed package (the advisory identity).
+    assert "lodash" in md
+    assert "Declared as npm alias: `my-lodash`" in md
+
+
+def test_vuln_report_no_alias_line_for_plain_deps(tmp_path: Path) -> None:
+    f = VulnFinding(
+        finding_id="sca:vuln:npm:lodash:4.17.20:GHSA-x",
+        dependency=_dep(),
+        advisories=[_adv()],
+        in_kev=False,
+        epss=None,
+        fixed_version="5.0.0",
+        reachability=Reachability(
+            verdict="not_evaluated",
+            confidence=Confidence("low", reason="t"),
+        ),
+        version_match_confidence=Confidence("high", reason="t"),
+        cvss_score=9.8,
+        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+        severity="critical",
+        exposure_factor=0.0,
+        transitive_depth=0,
+    )
+    md = render_markdown_report(
+        target=tmp_path, deps_analysed=1,
+        vuln_findings=[f], hygiene_findings=[],
+    )
+    assert "Declared as npm alias" not in md

@@ -75,7 +75,7 @@ class FakeDevice:
         self.attach_calls: list[Any] = []
         self._next_spawn_pid = 9999
 
-    def spawn(self, argv: list[str]) -> int:
+    def spawn(self, argv: list[str], env: dict | None = None) -> int:
         self.spawn_calls.append(argv)
         return self._next_spawn_pid
 
@@ -302,6 +302,76 @@ def test_run_spawn_resumes_after_load(tmp_path: Path):
     assert result.resolved_pid == 9999
 
 
+class EnvCapturingFakeDevice(FakeDevice):
+    """FakeDevice whose spawn accepts the env kwarg (modern bindings)."""
+
+    def __init__(self, id_: str = "local"):
+        super().__init__(id_)
+        self.spawn_envs: list[dict | None] = []
+
+    def spawn(self, argv: list[str], env: dict | None = None) -> int:
+        self.spawn_envs.append(env)
+        return super().spawn(argv)
+
+
+def test_spawn_env_is_allowlist_derived_not_operator_environ(
+    tmp_path: Path, monkeypatch,
+):
+    """The spawned process is untrusted TARGET code. In --unsafe-attach /
+    direct-CLI mode the driver runs in the operator's full environment,
+    so the child env must be built from the safe-env allowlist — a raw
+    os.environ copy hands the target every credential the operator
+    carries (getenv is all it takes)."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-secret-do-not-leak")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "aws-secret")
+    monkeypatch.setenv("GH_TOKEN", "gh-secret")
+    # On the allowlist for RAPTOR's own tooling (RAPTOR_ prefix) but in
+    # the target-facing strip set — must not reach target code.
+    monkeypatch.setenv("RAPTOR_SESSION_TOKEN", "session-secret")
+
+    device = EnvCapturingFakeDevice("local")
+    binary = tmp_path / "victim"
+    binary.write_text("#!/bin/sh\necho hi\n")
+    cfg = runner.RunConfig(
+        target=runner.parse_target(str(binary)),
+        out_dir=tmp_path,
+        script_source="// noop",
+        script_origin="file:noop.js",
+        duration_sec=0.02,
+    )
+    _session, pid = runner._attach_or_spawn(None, device, cfg)
+    assert pid == 9999
+    assert len(device.spawn_envs) == 1
+    env = device.spawn_envs[0]
+    assert env is not None
+    for secret in ("ANTHROPIC_API_KEY", "AWS_SECRET_ACCESS_KEY",
+                   "GH_TOKEN", "RAPTOR_SESSION_TOKEN"):
+        assert secret not in env, f"{secret} leaked into spawn env"
+    # A desktop target still needs the basics.
+    assert "PATH" in env
+
+
+def test_spawn_env_strips_session_credential_without_config(monkeypatch):
+    """Fallback lane (core.config unavailable) must still be a minimal
+    env, never a fall-open to the full operator environment."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _no_core_config(name, *args, **kwargs):
+        if name == "core.config" or name.startswith("core.config."):
+            raise ImportError("simulated missing core.config")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-secret-do-not-leak")
+    monkeypatch.setenv("RAPTOR_SESSION_TOKEN", "session-secret")
+    monkeypatch.setattr(builtins, "__import__", _no_core_config)
+    env = runner._spawn_env()
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "RAPTOR_SESSION_TOKEN" not in env
+    assert "PATH" in env
+
+
 def test_run_zero_events_still_creates_events_jsonl(tmp_path: Path):
     # frida-report.md unconditionally points at events.jsonl, so the file
     # must exist even when the script emits nothing during the window.
@@ -490,5 +560,94 @@ def test_fast_setup_reports_small_setup_sec(tmp_path: Path):
     )
     result = runner.run(cfg, frida_mod_override=fake)
     assert result.ok is True
-    assert result.setup_sec < 0.5
+    # Sanity ceiling only: with all-fake devices setup is ~ms, and
+    # the semantics of what setup_sec measures are pinned by the
+    # slow-setup companion above. 5s absorbs a loaded runner's stall
+    # where the old 0.5s bound false-failed on one deschedule.
+    assert result.setup_sec < 5.0
     assert result.duration_actual_sec >= 0.05
+
+
+class OldBindingsFakeDevice(FakeDevice):
+    """frida bindings predating the spawn env kwarg."""
+
+    def spawn(self, argv: list[str]) -> int:  # type: ignore[override]
+        self.spawn_calls.append(argv)
+        return self._next_spawn_pid
+
+
+def test_old_bindings_spawn_refuses_instead_of_leaking_env(
+    tmp_path: Path, monkeypatch,
+):
+    """Bindings without env control would spawn the untrusted target
+    with the driver's FULL environment — refuse instead of leaking."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-secret-do-not-leak")
+    device = OldBindingsFakeDevice("local")
+    binary = tmp_path / "victim"
+    binary.write_text("#!/bin/sh\necho hi\n")
+    cfg = runner.RunConfig(
+        target=runner.parse_target(str(binary)),
+        out_dir=tmp_path,
+        script_source="// noop",
+        script_origin="file:noop.js",
+        duration_sec=0.02,
+    )
+    fake = _fake_frida(device)
+    result = runner.run(cfg, frida_mod_override=fake)
+    assert result.ok is False
+    assert "refusing to spawn" in (result.error or "")
+
+
+def test_spawn_env_carries_no_raptor_markers(tmp_path: Path, monkeypatch):
+    """Allowlist survivors like RAPTOR_EF_* / RAPTOR_CI serve RAPTOR's
+    own tool children, but to the spawned TARGET every RAPTOR_* name
+    is a one-getenv framework fingerprint (anti-analysis trigger).
+    The target env must carry none."""
+    monkeypatch.setenv("RAPTOR_EF_TIMEOUT_FAST", "5")
+    monkeypatch.setenv("RAPTOR_EF_VERBOSE", "1")
+    monkeypatch.setenv("RAPTOR_CI", "1")
+    monkeypatch.setenv("RAPTOR_CC_TRANSPORT_DISABLED", "1")
+
+    env = runner._spawn_env()
+    raptor_names = [k for k in env
+                    if k.startswith(("RAPTOR_", "_RAPTOR"))
+                    or k == "CLAUDECODE"]
+    assert raptor_names == [], raptor_names
+    # A desktop target still needs the basics.
+    assert "PATH" in env
+
+
+def test_tooling_safe_env_still_carries_ef_knobs(monkeypatch):
+    """Both directions: the marker strip is TARGET-exec only — the
+    tooling baseline (get_safe_env) must keep the documented
+    RAPTOR_EF_* budget knobs for scrub-spawned tool children."""
+    from core.config import RaptorConfig
+
+    monkeypatch.setenv("RAPTOR_EF_TIMEOUT_FAST", "5")
+    env = RaptorConfig.get_safe_env()
+    assert env.get("RAPTOR_EF_TIMEOUT_FAST") == "5"
+
+
+def test_report_error_field_defanged(tmp_path: Path):
+    # result.error can embed target-process/device text — the report
+    # .md must not carry raw controls or markdown out of the field.
+    from packages.frida.runner import (
+        RunConfig,
+        RunResult,
+        TargetSpec,
+        _write_report,
+    )
+    hostile = "attach failed \x1b]0;pwned\x07\x9b2J‮ for `proc`\n# forged"
+    cfg = RunConfig(
+        target=TargetSpec(raw="1234", pid=1234),
+        out_dir=tmp_path,
+        script_source="send(1);",
+        script_origin="template:t",
+    )
+    result = RunResult(ok=False, error=hostile)
+    _write_report(cfg, result)
+    report = (tmp_path / "frida-report.md").read_text()
+    for raw in ("\x1b", "\x07", "\x9b", "‮"):
+        assert raw not in report
+    assert "\n# forged" not in report
+    assert "attach failed" in report

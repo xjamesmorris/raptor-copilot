@@ -24,19 +24,21 @@ does the mechanical work: running Semgrep and CodeQL, managing subprocesses,
 parsing SARIF, deduplicating findings, dispatching LLM API calls, tracking
 costs, writing output files.  It does not make judgement calls.
 
-The **Claude Code decision layer** (`.claude/`, `tiers/`, `CLAUDE.md`) makes
-the calls: which findings to prioritise, how to interpret results, what the
-attack scenario is, whether the exploit is realistic.  Implemented as Claude
-Code skills, commands, and agents that load progressively -- the context window
-only carries the expertise the current step needs.
+The **interactive decision layer** (`.claude/`, `plugins/agents/`, `tiers/`,
+`CLAUDE.md`) makes the calls: which findings to prioritise, how to interpret
+results, what the attack scenario is, whether the exploit is realistic. It
+runs in Claude Code by default or GitHub Copilot CLI on native Linux. Skills,
+commands, and agents load progressively so the context window only carries
+the expertise the current step needs.
 
 ```
-Claude Code session
+Claude Code or Copilot CLI session
 ├── CLAUDE.md              bootstrap, routing, security rules (always loaded)
 ├── .claude/commands/      slash commands (/agentic, /scan, /validate, ...)
 ├── .claude/skills/        methodology detail (loaded on demand)
 ├── tiers/                 adversarial thinking, recovery, expert personas
-└── .claude/agents/        specialist sub-agents (crash analysis, forensics, ...)
+├── plugins/agents/agents/ authoritative Claude agents (`model: inherit`)
+└── .github/agents/        generated Copilot projection of those agents
 
 Python layer
 ├── raptor.py              unified launcher / CLI entry point
@@ -48,7 +50,7 @@ Python layer
 
 The split means you can run the Python layer from a CI pipeline
 (`python3 raptor.py scan --repo ...`) and get structured SARIF output without
-Claude Code, or run it interactively with the full agentic workflow.  See
+an interactive frontend, or run it interactively with the full agentic workflow. See
 [Python CLI](python-cli.md).
 
 
@@ -57,9 +59,9 @@ Claude Code, or run it interactively with the full agentic workflow.  See
 RAPTOR uses LLMs in two distinct roles -- it is worth knowing both before
 changing the configuration.
 
-The **orchestration model** is always Claude Code.  The skills, commands, and
-decision logic all execute inside a Claude Code session.  Change it with Claude
-Code's `--model` flag or the `/model` command.
+The **orchestration model** runs in the selected interactive frontend. Claude
+Code is the default; use `raptor --frontend copilot` for GitHub Copilot CLI on
+native Linux. Change the frontend model with `raptor --model` or `/model`.
 
 The **analysis dispatch model** is the LLM that analyses individual
 vulnerability findings (Stages A--F).  This is a separate call path and can be
@@ -67,38 +69,40 @@ any [supported provider](llm.md): Anthropic, OpenAI, Gemini, Mistral, Bedrock,
 Ollama, or Claude Code itself as a fallback.  Configure it in
 `~/.config/raptor/models.json` or via environment variables.
 
-When no external provider is configured, Claude Code handles both roles.  When
-an external provider is configured, it takes priority for analysis dispatch and
-Claude Code becomes the fallback.
+When no external provider is configured and Claude Code is available, Claude
+Code can handle analysis dispatch. Copilot frontend selection does not create a
+Copilot dispatch provider; configure another supported provider when running a
+Copilot-only installation.
 
 
 ## Cost model
 
 RAPTOR has two separate cost surfaces:
 
-**Orchestration (Claude Code subscription).** The Claude Code session that runs
-RAPTOR uses your subscription (Max, Pro, Team, or Enterprise) or an Anthropic
-API key.  This covers all interactive reasoning: reading code, interpreting
-results, deciding what to do next.
+**Orchestration (Claude Code account).** The Claude Code session that runs
+RAPTOR uses the account and billing mode configured for that CLI. RAPTOR does
+not infer whether a particular call is included in a subscription or billed
+separately.
 
 **Analysis dispatch (per-token API calls).** When `/agentic` or `/codeql
 --analyze` dispatches findings to an external LLM, those calls are billed per
-token to the configured provider.  If you only use Claude Code as the analysis
-model (the default), there is no extra cost beyond your subscription.  If you
-configure external models (OpenAI, Gemini, etc.), those API calls are billed to
-those providers.
+token to the configured provider. Claude CLI-reported amounts are estimates;
+an absent amount is unknown rather than zero. External API routes use
+versioned catalog or configured-rate estimates unless a provider supplies
+stronger evidence.
 
-A per-run budget cap (`--max-cost-usd`, default $10) prevents runaway spend on
-the dispatch layer.  The cap is enforced atomically -- concurrent analysis
-workers cannot race past it.  Cost is tracked in real time and reported at run
-end.
+The default per-run budget (`--max-cost-usd`, default $10) is advisory. RAPTOR
+atomically reserves estimates so concurrent workers share the same budget
+state, but no current provider supports a preemptive provider-enforced USD hard
+limit. Reports keep provider-billed USD, estimated USD, subscription calls,
+unknown calls, and unresolved failed-attempt exposure separate.
 
 | Scenario | Orchestration cost | Dispatch cost |
 |----------|--------------------|---------------|
 | `/scan` (no LLM) | Subscription | None |
-| `/agentic` with Claude Code as analyser | Subscription | Subscription (same) |
-| `/agentic --model gemini-2.5-pro` | Subscription | Gemini API |
-| `/agentic` with Ollama | Subscription | Free (local) |
+| `/agentic` with Claude Code as analyser | Account-dependent | CLI-reported estimate or unknown |
+| `/agentic --model gemini-2.5-pro` | Account-dependent | Catalog estimate for Gemini API |
+| `/agentic` with Ollama | Account-dependent | Unknown (a URL does not prove local/no-charge execution) |
 
 See [LLM providers](llm.md) for token pricing, budget configuration, and
 credential isolation.
@@ -172,6 +176,15 @@ scanner  →  dedup  →  prep  →  analysis (A-D)  →  validation (0, A-F, 1)
 
 At each stage a finding can be ruled out.  The pipeline is deliberately
 reductive: start with many candidates, end with the ones that matter.
+
+**Known limitation — finding identity is location-anchored.**  A finding's
+stable id derives from its producer, rule id, and source/sink file:line
+locations, and cross-run views key findings by file, function, and line.
+Renaming or moving a file — or any edit that shifts line numbers — therefore
+gives the same defect a new identity, which weakens cross-run correlation
+(`/project correlate`, `/project findings`) across such changes.  A
+content-anchored redesign is deliberately deferred; treat cross-run identity
+as reliable only while the surrounding code has not moved.
 
 
 ## Sandbox
@@ -254,7 +267,51 @@ cheaper without sacrificing accuracy.  Inspect with `/scorecard`.
 
 The coverage plugin (`plugins/coverage/`) records which source files the LLM
 reads during analysis via a `PostToolUse` hook.  It runs automatically when a
-run is active and has zero overhead otherwise.
+run is active and has no run-side effect otherwise (the async hook
+still fires per Read and exits early when no run is active).
+The hook is a thin entry shim over the shared Python ingestion path in
+`core.coverage.track_read`. The verified session owner selects a fixed
+frontend profile: Claude `Read`/`tool_input.file_path` and Copilot
+`view`/`toolArgs.path` both normalize to the canonical
+`Read`/`tool_input.file_path` contract before attribution. The historical
+Copilot candidate profile remains parse-only. Native camelCase registrations
+and PascalCase plugin registrations use different field spellings. The
+owner-selected live profile normalizes either complete spelling and
+deterministically coalesces duplicate aliases only when session, tool, and
+path meanings agree; incomplete or conflicting mixtures are rejected. The
+fixed hook registration supplies any omitted event kind. A credentialed hook
+writes only when exactly one run owned by the matching frontend session is
+eligible.
+Multiple concurrent runs are deliberately ambiguous and receive no
+attribution. The pre-series `.active` lookup remains Claude-only and is used
+only when both session credential variables are absent.
+
+For this coverage policy, an **absent** run `target_path` means unfiltered
+attribution (needed by targetless commands such as `cve-diff`/`cve-env`). Once
+the field is **present**, it must be a non-empty printable absolute path whose
+real path is an existing directory other than the filesystem root `/`;
+empty, relative, unresolvable, root, or control-containing values produce no
+attribution. Root refusal is an explicit restriction of this coverage policy,
+not a claim that every other RAPTOR target gate makes `/` unreachable. The
+same path validation uses Python's stricter `str.isprintable()` policy, so
+some Unicode separator/format characters are rejected in addition to
+NUL/CR/LF.
+
+Successful read attribution is silent. A credentialed session with no running
+run is also an ordinary idle state and is silent. Expected refusals emit one
+fixed, payload-free diagnostic. The hook's exit status remains 0 for all of
+these paths; exit 0 is the hook protocol, **not** proof that a read was
+recorded. The manifest is opened with `O_CREAT` before the final post-open
+status/owner recheck, so a run that changes state in that narrow window can
+retain an empty `.reads-manifest`, but never the refused path line.
+
+The hook's 1 MiB budget applies to the **whole hook payload**, including
+`tool_response` file content, not only `tool_input.file_path`. A very large
+successful Read can therefore lose coverage evidence when its event exceeds
+the budget. The `MAX+1` read is a byte bound, not a time or EOF guarantee: a
+producer that keeps stdin open can still block the waited hook child. A cold
+Python cache may create operator-owned `__pycache__/*.pyc` files in the RAPTOR
+repository before producing the same manifest effect.
 
 Coverage produces per-tool records (`coverage-read.json` for LLM reads,
 `coverage-<tool>.json` for scanners) in the run directory -- a manifest of
@@ -269,6 +326,12 @@ libexec/raptor-coverage-summary --gaps   # unreviewed functions
 
 Coverage is per-run.  Project-level coverage merges across all runs, so
 running `/scan` then `/codeql` on the same project gives a combined view.
+Read arguments retain their host-native key names; tool-name aliases do not
+rewrite arguments. Manifest writes are relative to an opened, owner-checked
+run directory and refuse symlinks, FIFOs, devices, hard links, and
+foreign-owned files. Duplicate read lines collapse when the coverage record
+is built. A whole-file `read` remains shallow evidence that a file was opened,
+not proof that any function was reviewed.
 
 
 ## Annotations

@@ -22,9 +22,26 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from core.analysis.taint_approx import function_key
 from core.evidence import EvidenceTier
 
 logger = logging.getLogger(__name__)
+
+
+def _prompt_field_defence() -> Any:
+    """The shared render defence, with a flatten-only fallback.
+
+    Lazy so core.analysis keeps working without core.audit; the
+    fallback preserves the load-bearing property (no embedded newline
+    survives into a trusted line-shaped prompt region).
+    """
+    try:
+        from core.audit.prompt_defence import defend_prompt_field
+    except Exception:
+        def defend_prompt_field(value: Any, max_length: int = 200) -> str:
+            text = " ".join(str(value).split())
+            return text[:max_length]
+    return defend_prompt_field
 
 
 @dataclass
@@ -86,32 +103,50 @@ class FunctionSummary:
 
         depth="oneline" — one-sentence summary for GLANCE context.
         depth="full"    — complete summary for DEEP_DIVE context.
+
+        Every data field (names, params, conditions, code excerpts,
+        state prose) may derive from analysed source or an LLM
+        summary of it, and this rendering lands RAW in other
+        functions' review prompts — each field passes through
+        ``defend_prompt_field`` (newline flatten + tag/heading
+        neutralise + cap) so an embedded newline cannot mint a forged
+        heading or instruction line in trusted prompt position.
         """
+        _dpf = _prompt_field_defence()
         if self.is_empty():
             if depth == "oneline":
-                return f"`{self.function}()`: no CPG-derived security signals."
+                return (
+                    f"`{_dpf(self.function, 120)}()`: no CPG-derived "
+                    f"security signals."
+                )
             return ""
 
         if depth == "oneline":
             parts = []
             if self.taint_rules:
                 sinks = sorted({r.sink_call for r in self.taint_rules})
-                parts.append(f"taint→{','.join(sinks)}")
+                parts.append(
+                    "taint→" + ",".join(_dpf(s, 80) for s in sinks)
+                )
             if self.preconditions:
                 parts.append(f"{len(self.preconditions)} guards")
             if self.error_paths:
                 parts.append(f"{len(self.error_paths)} error returns")
             detail = "; ".join(parts) if parts else "utility"
-            return f"`{self.function}()`: {detail}."
+            return f"`{_dpf(self.function, 120)}()`: {detail}."
 
-        lines = [f"### CPG summary: `{self.function}()` [{self.evidence_tier.value}]"]
+        lines = [
+            f"### CPG summary: `{_dpf(self.function, 120)}()` "
+            f"[{self.evidence_tier.value}]"
+        ]
 
         if self.taint_rules:
             lines.append("**Taint propagation:**")
             for r in self.taint_rules:
                 tier_tag = f" [{r.evidence_tier.value}]" if r.evidence_tier != self.evidence_tier else ""
                 lines.append(
-                    f"- param `{r.source_param}` → `{r.sink_call}()` arg #{r.sink_arg_index}"
+                    f"- param `{_dpf(r.source_param, 120)}` → "
+                    f"`{_dpf(r.sink_call, 120)}()` arg #{r.sink_arg_index}"
                     + (f" ({r.hop_count} hops)" if r.hop_count > 1 else "")
                     + tier_tag
                 )
@@ -119,24 +154,30 @@ class FunctionSummary:
         if self.preconditions:
             lines.append("**Guards:**")
             for p in self.preconditions:
-                conds = ", ".join(str(c)[:80] for c in p.conditions[:3])
-                lines.append(f"- param `{p.param}` guarded by: {conds}")
+                conds = ", ".join(_dpf(c, 80) for c in p.conditions[:3])
+                lines.append(
+                    f"- param `{_dpf(p.param, 120)}` guarded by: {conds}"
+                )
 
         if self.returns:
             lines.append("**Returns:**")
-            for r in self.returns[:5]:
+            for rc in self.returns[:5]:
                 cond_str = ""
-                if r.conditions:
-                    cond_str = f" when {r.conditions[0][:60]}"
-                lines.append(f"- `{r.code[:80]}`{cond_str}")
+                if rc.conditions:
+                    cond_str = f" when {_dpf(rc.conditions[0], 60)}"
+                lines.append(f"- `{_dpf(rc.code, 80)}`{cond_str}")
 
         if self.error_paths:
             lines.append("**Error returns:**")
-            lines.extend(f"- `{ep[:80]}`" for ep in self.error_paths[:3])
+            lines.extend(
+                f"- `{_dpf(ep, 80)}`" for ep in self.error_paths[:3]
+            )
 
         if self.state_transitions:
             lines.append("**State transitions:**")
-            lines.extend(f"- {st[:80]}" for st in self.state_transitions[:5])
+            lines.extend(
+                f"- {_dpf(st, 80)}" for st in self.state_transitions[:5]
+            )
 
         return "\n".join(lines)
 
@@ -303,7 +344,10 @@ def build_summary_from_query_outputs(
 
 # Identifier immediately followed by an open paren — the way review
 # prose names a concrete call ("passes fmt to sprintf(dst, fmt)").
-_CALL_SHAPED_NAME_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_.]*)\s*\(")
+# Name run bounded — separator fills keep the \b live at every
+# planted head, so an unbounded run is re-scanned per head.
+_CALL_SHAPED_NAME_RE = re.compile(
+    r"\b([A-Za-z_][A-Za-z0-9_.]{0,128})\s*\(")
 
 # Fallback label when a reaches-sink assumption doesn't name the sink
 # concretely. Kept stable so dedup in propagate_taint_upward (keyed on
@@ -363,9 +407,14 @@ def summary_from_review_result(
         param = pc.get("parameter", pc.get("param", ""))
         assumption = pc.get("assumption", "")
         if param and assumption:
+            # Default -1 (unknown), matching the taint-rule branch
+            # below: defaulting to 0 fabricated a concrete index that
+            # _param_index_of then "recovered" for ANY named param,
+            # binding inherited taint to whichever caller symbol
+            # feeds callee arg 0.
             preconditions.append(Precondition(
                 param=param,
-                param_index=pc.get("param_index", 0),
+                param_index=pc.get("param_index", -1),
                 conditions=[assumption],
                 evidence_tier=EvidenceTier.HEURISTIC,
             ))
@@ -491,15 +540,20 @@ def resolve_scc_summaries(
     Returns the number of new rules propagated.
     """
     total_new = 0
+    # Set view: membership runs per edge per iteration; list
+    # membership made the loop O(edges x |scc|).
+    scc_set = set(scc)
 
     for _iteration in range(max_iterations):
         round_new = 0
         for edge in call_edges:
-            caller_key = f"{edge.get('caller_file', '')}:{edge.get('caller', '')}"
+            caller_key = function_key(
+                edge.get("caller_file", ""), edge.get("caller", ""),
+            )
             callee_file = edge.get("callee_file") or edge.get("caller_file", "")
-            callee_key = f"{callee_file}:{edge.get('callee', '')}"
+            callee_key = function_key(callee_file, edge.get("callee", ""))
 
-            if caller_key not in scc or callee_key not in scc:
+            if caller_key not in scc_set or callee_key not in scc_set:
                 continue
             if caller_key not in summaries or callee_key not in summaries:
                 continue

@@ -1,18 +1,22 @@
 """Clean old runs from a project, keeping latest N per command type."""
 
 import os
+import re
 import shutil
+import time
 from pathlib import Path
 from typing import Any
 
 
 def _run_dir_size(d: Path) -> int:
-    # `Path.rglob` follows symlinks under Python <3.13 with no opt-out; a
-    # malicious or accidental symlink under the run dir (e.g.
-    # `out/run-X/incoming -> /var/log`) would walk into and stat-sum
-    # unrelated trees, double-counting bytes and (worse) reading from
-    # arbitrary file descriptors. Use os.walk(followlinks=False) so we stay
-    # inside the run dir tree on every supported Python version.
+    # Directory-symlink recursion stays off explicitly: `Path.rglob`
+    # follows dir symlinks only via 3.13's `recurse_symlinks=True`
+    # opt-in (`glob.glob(recursive=True)` is what followed them by
+    # default), and a malicious or accidental symlink under the run dir
+    # (e.g. `out/run-X/incoming -> /var/log`) walked into would
+    # stat-sum unrelated trees, double-counting bytes. Use
+    # os.walk(followlinks=False) so we stay inside the run dir tree on
+    # every supported Python version.
     size = 0
     for root, _dirs, files in os.walk(d, followlinks=False):
         for fname in files:
@@ -41,29 +45,45 @@ def run_is_live(d: Path) -> bool:
     worker AND session are both dead are stale abandons; the sweep
     machinery marks them failed, and clean may reclaim them.
 
-    Runs that recorded NO pids at all (pre-recording legacy metadata)
-    are unjudgeable by liveness: they get a grace-age gate — recent
-    write activity inside the run dir reads as live — instead of
-    falling open to deletable.
+    Runs that recorded no SESSION (bare-shell / detached starts, and
+    pre-recording legacy metadata) are not fully judgeable by worker
+    liveness alone: they get a grace-age gate — recent write activity
+    inside the run dir reads as live — instead of falling open to
+    deletable.
     """
-    from core.json import load_json
     from core.run.metadata import (
-        RUN_METADATA_FILE,
         _run_recently_active,
         _session_alive_for_meta,
-        _tool_pid_alive,
+        load_run_metadata,
+        worker_liveness_for_meta,
     )
     try:
-        meta = load_json(Path(d) / RUN_METADATA_FILE,
-                         max_bytes=1024 * 1024)
+        # The budgeted metadata loader — the shared 1 MiB budget stays
+        # single-homed in core.run.metadata instead of re-spelled here.
+        meta = load_run_metadata(Path(d))
     except Exception:  # noqa: BLE001 — unreadable metadata is not live
         meta = None
     if not (isinstance(meta, dict) and meta.get("status") == "running"):
         return False
-    if (_tool_pid_alive(meta.get("tool_pid"))
+    if (worker_liveness_for_meta(meta)[0]
             or _session_alive_for_meta(meta)):
         return True
-    if meta.get("session_pid") is None and meta.get("tool_pid") is None:
+    session_pid = meta.get("session_pid")
+    if session_pid is None or (
+        isinstance(session_pid, int)
+        and not isinstance(session_pid, bool)
+        and session_pid <= 1
+    ):
+        # No checkable owner: session-less runs (bare shell, legacy
+        # pid-less metadata) and legacy DETACHED records
+        # (session_pid<=1, written before the recorder refused
+        # reparented-to-init pids — owner-LESS, not owner-dead; the
+        # orchestrator may still be running). The recorded worker may
+        # be a transient stub shell, dead seconds after a healthy
+        # start while the run's work continues, and a pid-1 stamp
+        # proves nothing either way — so neither may read as deletable
+        # on its own. Recent write activity keeps the run live — the
+        # same grace the abandon sweep applies.
         return _run_recently_active(Path(d))
     return False
 
@@ -248,6 +268,169 @@ def execute_clean(plan: dict[str, Any],
             shutil.rmtree(d)
         except FileNotFoundError:
             pass
+
+
+#: safe_cache_name shape: <sanitised-archive-name>-<sha256 hex>.
+_SOURCES_ENTRY_RE = re.compile(r"-([0-9a-f]{64})$")
+
+#: Grace window before an unreferenced _sources entry may be swept.
+#: Lower bound: a concurrently STARTING run publishes its extraction
+#: dir moments before start_run seals the marker that references it —
+#: sweeping inside that gap would yank the tree out from under a live
+#: run, so the window must comfortably exceed extraction-to-seal
+#: (seconds). Upper bound: this is only a leak-tolerance knob — a
+#: longer window merely delays reclaim of an orphan by one clean
+#: cycle, so generous beats clever. One hour.
+_SOURCES_SWEEP_GRACE_SECONDS = 3600
+
+
+def _referenced_archive_shas(project, delete_dirs) -> set[str]:
+    """sha256s the project still references after the clean: every
+    surviving run's recorded acquisition stamp, plus the project's own
+    target when it is an archive (its extraction is the cache the NEXT
+    run and /describe reuse — deleting it would only force a
+    re-extract of bytes still on the operator's disk)."""
+    from core.run.metadata import load_run_metadata
+    from core.run.provenance import run_target
+
+    victims = {Path(d).resolve() for d in delete_dirs}
+    shas: set[str] = set()
+    for d in project.get_run_dirs(sweep=False):
+        try:
+            if Path(d).resolve() in victims:
+                continue
+            stamp = run_target(load_run_metadata(Path(d)))
+        except Exception:  # noqa: BLE001
+            # An unreadable stamp contributes no sha. Deliberate: a
+            # single corrupt run must not pin every cache entry
+            # forever, and the worst case of a wrongly-swept entry is
+            # a re-extract of archive bytes still on disk — a cache
+            # miss, never data loss.
+            continue
+        if isinstance(stamp, dict):
+            sha = stamp.get("archive_sha256")
+            if isinstance(sha, str) and sha:
+                shas.add(sha)
+    try:
+        target = getattr(project, "target", None)
+        if target and Path(target).is_file():
+            from core.run.provenance import archive_snapshot
+            snap = archive_snapshot(target)
+            if snap is not None:
+                shas.add(snap["archive_sha256"])
+    except Exception:  # noqa: BLE001 — best-effort retention widening
+        pass
+    return shas
+
+
+def plan_sources_sweep(project, delete_dirs=()) -> dict[str, Any]:
+    """Plan removal of ``_sources`` extraction-cache entries no longer
+    referenced once *delete_dirs* are gone. Same plan shape as
+    :func:`plan_clean` so :func:`execute_clean` (containment check,
+    liveness re-check) is reused unchanged. Does not modify the
+    filesystem.
+
+    Bounded by construction:
+
+    * only DIRECT children of ``<project output dir>/_sources`` whose
+      name carries the content-addressed ``-<sha256>`` suffix
+      (``core.archive.safe_cache_name``) are candidates — anything
+      else in there was not written by the extraction cache and is
+      left alone;
+    * symlinked entries are never candidates (rmtree through a link
+      could escape containment);
+    * entries whose sha is referenced by ANY surviving run's
+      acquisition stamp — or by the project's own archive target —
+      are kept;
+    * entries younger than the grace window are kept (a racing run
+      publishes its extraction before sealing the marker that
+      references it).
+    """
+    stats: dict[str, Any] = {
+        "delete_dirs": [], "deleted": [], "kept": [], "freed_bytes": 0,
+        "by_type": {}, "skipped_live": [],
+    }
+    sources_root = Path(project.output_dir) / "_sources"
+    try:
+        entries = sorted(p for p in sources_root.iterdir())
+    except OSError:
+        return stats
+    referenced: set[str] | None = None
+    now = time.time()
+    for entry in entries:
+        m = _SOURCES_ENTRY_RE.search(entry.name)
+        try:
+            if (m is None or entry.is_symlink() or not entry.is_dir()):
+                continue
+            mtime = entry.stat().st_mtime
+        except OSError:
+            continue
+        if now - mtime < _SOURCES_SWEEP_GRACE_SECONDS:
+            stats["kept"].append(entry.name)
+            continue
+        if referenced is None:  # lazy: most cleans have no _sources
+            referenced = _referenced_archive_shas(project, delete_dirs)
+        if m.group(1) in referenced:
+            stats["kept"].append(entry.name)
+            continue
+        size = _run_dir_size(entry)
+        stats["freed_bytes"] += size
+        stats["delete_dirs"].append(entry)
+        stats["deleted"].append(entry.name)
+    return stats
+
+
+def refresh_sources_plan(project, plan: dict[str, Any],
+                         delete_dirs=()) -> dict[str, Any]:
+    """Re-vet a :func:`plan_sources_sweep` plan IMMEDIATELY before
+    execution. The operator confirm wait between plan and execute is
+    unbounded, and a cache HIT does not bump an entry's mtime — so an
+    entry old+unreferenced at plan time can be re-referenced by a run
+    that starts during the wait, and the age gate alone would never
+    notice. Same discipline as :func:`execute_clean`'s pre-delete
+    liveness re-check, applied to the reference set.
+
+    Returns a plan containing only entries the fresh computation STILL
+    selects — never more than was shown and confirmed (entries only
+    the fresh plan selects are ignored); entries no longer selected
+    are reported in ``skipped_referenced``. A re-plan failure fails
+    toward retention: nothing is deleted.
+    """
+    out: dict[str, Any] = {
+        "delete_dirs": [], "deleted": [],
+        "kept": list(plan.get("kept", [])), "freed_bytes": 0,
+        "by_type": {}, "skipped_live": [], "skipped_referenced": [],
+    }
+    try:
+        fresh_names = set(
+            plan_sources_sweep(project, delete_dirs)["deleted"])
+    except Exception:  # noqa: BLE001 — fail toward retention
+        fresh_names = set()
+    for d in plan.get("delete_dirs", []):
+        name = Path(d).name
+        if name in fresh_names:
+            out["delete_dirs"].append(d)
+            out["deleted"].append(name)
+            out["freed_bytes"] += _run_dir_size(Path(d))
+        else:
+            out["skipped_referenced"].append(name)
+    return out
+
+
+def execute_sources_sweep(project, plan: dict[str, Any], delete_dirs=(),
+                          output_path: Path | None = None) -> dict[str, Any]:
+    """THE executor for :func:`plan_sources_sweep` plans — the re-vet
+    is applied here, at the last moment, so every caller gets it (the
+    run-dir arm's liveness re-check lives inside its executor for the
+    same reason; a caller handing a stale plan straight to
+    ``execute_clean`` would bypass the race protection). Returns the
+    refreshed plan that was actually executed (``skipped_referenced``
+    names the entries the re-vet rescued)."""
+    refreshed = refresh_sources_plan(project, plan, delete_dirs)
+    if refreshed["delete_dirs"]:
+        execute_clean(refreshed,
+                      output_path=output_path or project.output_path)
+    return refreshed
 
 
 def clean_project(project, keep: int=1, dry_run: bool=False) -> dict[str, Any]:

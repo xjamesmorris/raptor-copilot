@@ -5,9 +5,9 @@ Numeric half: a shared home for the ``_safe_int`` / ``_safe_float``
 helpers that pre-uplift each subsystem carried its own copy of.
 
 Rationale for a shared module rather than absorbing into
-:mod:`core.cost`:
+:mod:`core.llm.cost`:
 
-  * ``core.cost`` already owns the domain-specific clamping rule for
+  * ``core.llm.cost`` already owns the domain-specific clamping rule for
     LLM cost accumulators (NaN / +inf / negative → 0.0). Extending
     it to be a general-purpose numeric coerecer would blur its
     contract.
@@ -112,6 +112,23 @@ def to_float_safe(
         return default
 
 
+def to_lower_token_safe(value: Any, default: str) -> str:
+    """Coerce an LLM-supplied string token to stripped lowercase.
+
+    LLMs routinely violate structured-output schemas: a field typed
+    "string" can arrive as an int/list/dict (or as whitespace).
+    Returns ``value.strip().lower()`` when ``value`` is a non-blank
+    ``str``, else ``default`` — so enum-ish token fields (e.g. an SMT
+    ``path_profile``) degrade to their documented default instead of
+    crashing on ``.strip()``.
+    """
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token:
+            return token
+    return default
+
+
 def structured_result(response: Any, *, default: Any = None) -> Any:
     """Unwrap the result payload from a ``generate_structured`` return.
 
@@ -129,6 +146,10 @@ def structured_result(response: Any, *, default: Any = None) -> Any:
 
     Never raises — the hand-rolled copies sat inside broad ``try``
     blocks and an unwrap failure must stay non-fatal.
+
+    :func:`core.llm.structured_call.unwrap_structured_response` builds
+    its result field on THIS helper (it adds the cost/model/usage
+    view) — shape-tolerance changes belong here, in one place.
     """
     if response is None:
         return default
@@ -164,7 +185,7 @@ def extract_fenced_code(text: str) -> str:
     block = text.split("```", 2)[1]
     if "\n" in block:
         # Drop the fence line (optional language tag).
-        block = block.split("\n", 1)[1]
+        block = block.split("\n", 1)[1]  # line-model: LLM response fence parsing
     else:
         # Single-line block — strip a leading language tag, but only a
         # whitespace-delimited KNOWN tag (see _LEADING_LANG_TAG_RE):
@@ -181,4 +202,5 @@ __all__ = [
     "structured_result",
     "to_float_safe",
     "to_int_safe",
+    "to_lower_token_safe",
 ]

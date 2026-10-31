@@ -45,6 +45,24 @@ def test_unknown_tool_is_conservative():
     assert category_of("mystery-tool:v2") == "unknown"
 
 
+def test_machine_annotations_are_hint_tier_not_reviewed():
+    # Agent-written (and non-TTY-stamped) notes import under
+    # annotations:machine — hint-tier by doctrine, so llm-extent but
+    # scanned depth: they must NOT clear the LLM-review gap.
+    assert classify("annotations:machine") == ("llm", "scanned")
+    # Human-grade annotations keep full review credit (both-direction).
+    assert classify("annotations") == ("llm", "analysed")
+
+
+def test_backlog_drain_is_static_but_never_review_credit():
+    # backlog-drain journal rows carry a synthesized STATIC checker
+    # witness (pattern-scanner extent, not an LLM review), so the
+    # category is static -- but the depth stays at the unknown/scanned
+    # default: drain marks must never count as reviewed or clear the
+    # LLM-review gap (both-direction with the reviewed tools above).
+    assert classify("backlog-drain") == ("static", "scanned")
+
+
 def test_journal_records_are_review_grade():
     # coverage-journal.json (build_from_journal; /agentic) derives every
     # functions_analysed entry from a per-function review-journal verdict,

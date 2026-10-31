@@ -14,15 +14,26 @@ Requires:
 
 import argparse
 import asyncio
+import os
 import sys
 from typing import Any
 from pathlib import Path
 
-# Add repo root to path
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+if not __package__:
+    # Script mode (python3 core/sage/scripts/seed_sage_knowledge.py):
+    # the repo root must come from RAPTOR_DIR — the path-safety rule
+    # forbids deriving it from __file__ (a namespace-shadowed checkout
+    # would import a foreign tree). Package imports need no path setup.
+    if "RAPTOR_DIR" not in os.environ:
+        sys.exit(
+            "RAPTOR_DIR is not set — run via libexec/raptor-sage-setup, "
+            "or export RAPTOR_DIR=<repo root> first"
+        )
+    sys.path.insert(0, os.environ["RAPTOR_DIR"])
 
 # Import errors are deferred to main() so the module stays import-safe
 # (test collection must never die on a missing optional dependency).
+_SAGE_SDK_IMPORT_ERROR: ImportError | None = None
 try:
     import httpx
     from sage_sdk.async_client import AsyncSageClient
@@ -31,9 +42,7 @@ try:
     from sage_sdk.models import MemoryType
 except ImportError as _exc:
     _SAGE_SDK_IMPORT_ERROR = _exc
-    httpx = AsyncSageClient = AgentIdentity = SageError = MemoryType = None
-else:
-    _SAGE_SDK_IMPORT_ERROR = None
+    httpx = AsyncSageClient = AgentIdentity = SageError = MemoryType = None  # type: ignore[assignment]
 
 from core.sage.scripts._common import async_memory_exists
 
@@ -308,7 +317,7 @@ def _chunk_text(text: str, max_chars: int = 1500) -> list[str]:
         # Greedy fixed-width split on `max_chars` boundaries.
         return [line[i:i + max_chars] for i in range(0, len(line), max_chars)] or [""]
 
-    for line in text.split("\n"):
+    for line in text.split("\n"):  # line-model: RAPTOR-owned tiers/ markdown, universal-newline read
         # Hard-split any line that, on its own, exceeds the budget.
         # The flush of `current` happens first so we don't merge an
         # oversized line into the previous paragraph's chunk.
@@ -352,7 +361,11 @@ async def _seed_one(
                 return (label, "skipped")
 
             embedding = await client.embed(mem["content"])
-            mt = getattr(MemoryType, mem["memory_type"], MemoryType.observation)
+            # Shared allowlist resolution — never getattr on the enum
+            # (dunder acceptance / silent-typo default; see
+            # resolve_memory_type).
+            from core.sage.client import resolve_memory_type
+            mt = resolve_memory_type(mem["memory_type"], MemoryType)
             await client.propose(
                 content=mem["content"],
                 memory_type=mt,
@@ -514,10 +527,6 @@ async def seed(sage_url: str, dry_run: bool = False, force: bool = False) -> Non
 
 
 def main() -> None:
-    if _SAGE_SDK_IMPORT_ERROR is not None:
-        print("ERROR: sage-agent-sdk not installed.")
-        print("  pip install sage-agent-sdk")
-        sys.exit(1)
     parser = argparse.ArgumentParser(
         description="Seed RAPTOR institutional knowledge into SAGE"
     )
@@ -537,6 +546,14 @@ def main() -> None:
         help="Re-propose even if memories with the same label are already seeded",
     )
     args = parser.parse_args()
+
+    # Checked after parse_args so `--help` works without the optional
+    # SDK; the deferred import error gates work, not usage. stderr so
+    # callers capturing streams see the failure where they look for it.
+    if _SAGE_SDK_IMPORT_ERROR is not None:
+        print("ERROR: sage-agent-sdk not installed.", file=sys.stderr)
+        print("  pip install sage-agent-sdk", file=sys.stderr)
+        sys.exit(1)
 
     asyncio.run(seed(args.sage_url, args.dry_run, args.force))
 

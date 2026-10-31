@@ -53,6 +53,9 @@ class _FakeOsv:
             out.append(OsvResult(dep_key=d.key(), advisories=list(advs)))
         return out
 
+    def lookup_failed(self, dep_key: str) -> bool:
+        return False
+
 
 def _adv(osv_id: str, severity: str = "medium") -> Advisory:
     return Advisory(
@@ -474,16 +477,30 @@ def test_degraded_picks_fewer_when_severity_tied() -> None:
     assert cand.to_version == "1.8"     # fewer advisories at same severity
 
 
-def test_degraded_with_major_crossing_still_review_required() -> None:
-    """Even degraded candidates respect the major-crossing gate."""
+def test_degraded_with_major_crossing_needs_both_gates() -> None:
+    """Degraded candidates respect the major-crossing gate WITHOUT
+    losing their own: the status stays ``degraded_safety`` (so
+    ``--allow-degraded`` is still required) and the recorded crossing
+    additionally demands major consent. The old rewrite to
+    ``review_required`` let ``--allow-major-without-review`` alone
+    apply a residual-advisory target without the degraded opt-in."""
+    from packages.sca.harden import _count_actionable
+
     dep = _dep(version="1.0")
     osv = _FakeOsv(advisories_by_version={
         "2.0": [_adv("GHSA-x", "low")],
     })
     cand = _plan_one(dep, registries={"PyPI": _FakeRegistry(["2.0"])},
                      osv=osv, offline=False, allow_major=False)
-    assert cand.status == "review_required"
+    assert cand.status == "degraded_safety"
     assert cand.to_version == "2.0"
+    assert cand.crosses_major is True
+    assert _count_actionable([cand], allow_major_without_review=True,
+                             allow_degraded=False) == 0
+    assert _count_actionable([cand], allow_major_without_review=False,
+                             allow_degraded=True) == 0
+    assert _count_actionable([cand], allow_major_without_review=True,
+                             allow_degraded=True) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -501,7 +518,7 @@ def _candidate(status: str) -> HardenCandidate:
 def test_count_actionable_promoted_always_counts() -> None:
     from packages.sca.harden import _count_actionable
     cands = [_candidate("promoted"), _candidate("promoted")]
-    assert _count_actionable(cands, allow_major=False,
+    assert _count_actionable(cands,
                              allow_major_without_review=False,
                              allow_degraded=False) == 2
 
@@ -515,7 +532,7 @@ def test_count_actionable_skips_non_actionable() -> None:
         _candidate("no_versions"),
         _candidate("needs_network"),
     ]
-    assert _count_actionable(cands, allow_major=False,
+    assert _count_actionable(cands,
                              allow_major_without_review=False,
                              allow_degraded=False) == 0
 
@@ -524,11 +541,11 @@ def test_count_actionable_review_required_gated() -> None:
     from packages.sca.harden import _count_actionable
     cands = [_candidate("review_required")]
     # Default: review_required not actionable.
-    assert _count_actionable(cands, allow_major=False,
+    assert _count_actionable(cands,
                              allow_major_without_review=False,
                              allow_degraded=False) == 0
     # With --allow-major-without-review: counts.
-    assert _count_actionable(cands, allow_major=True,
+    assert _count_actionable(cands,
                              allow_major_without_review=True,
                              allow_degraded=False) == 1
 
@@ -536,10 +553,10 @@ def test_count_actionable_review_required_gated() -> None:
 def test_count_actionable_degraded_gated() -> None:
     from packages.sca.harden import _count_actionable
     cands = [_candidate("degraded_safety")]
-    assert _count_actionable(cands, allow_major=False,
+    assert _count_actionable(cands,
                              allow_major_without_review=False,
                              allow_degraded=False) == 0
-    assert _count_actionable(cands, allow_major=False,
+    assert _count_actionable(cands,
                              allow_major_without_review=False,
                              allow_degraded=True) == 1
 
@@ -603,21 +620,21 @@ def test_count_actionable_ecosystem_allowlist() -> None:
 
     cands = [_c("PyPI"), _c("npm"), _c("Debian")]
     # No allowlist: all 3 count.
-    assert _count_actionable(cands, allow_major=False,
+    assert _count_actionable(cands,
                              allow_major_without_review=False,
                              allow_degraded=False) == 3
     # PyPI only: just 1.
-    assert _count_actionable(cands, allow_major=False,
+    assert _count_actionable(cands,
                              allow_major_without_review=False,
                              allow_degraded=False,
                              ecosystem_allowlist={"PyPI"}) == 1
     # PyPI + npm: 2.
-    assert _count_actionable(cands, allow_major=False,
+    assert _count_actionable(cands,
                              allow_major_without_review=False,
                              allow_degraded=False,
                              ecosystem_allowlist={"PyPI", "npm"}) == 2
     # Empty allowlist: 0.
-    assert _count_actionable(cands, allow_major=False,
+    assert _count_actionable(cands,
                              allow_major_without_review=False,
                              allow_degraded=False,
                              ecosystem_allowlist=set()) == 0
@@ -715,8 +732,9 @@ def test_promotion_demoted_when_target_published_recently() -> None:
     2026-05-20 self-bump simulation: harden's OSV-only ranking says
     Clean (no CVEs at 1.163.0); but the bump-tier
     ``recent_publish`` detector says target was published ~now.
-    Post option-2c, harden mirrors bump's verdict and demotes to
-    ``review_required``."""
+    Post option-2c, harden mirrors bump's verdict and demotes —
+    to the distinct ``demoted_safety`` status, which no apply flag
+    (not even --allow-major-without-review) can force through."""
     from datetime import datetime, timezone
 
     dep = _dep(name="semgrep", version="1.161.0",
@@ -734,7 +752,7 @@ def test_promotion_demoted_when_target_published_recently() -> None:
         offline=False, allow_major=False,
     )
 
-    assert cand.status == "review_required"
+    assert cand.status == "demoted_safety"
     assert cand.to_version == "1.163.0"
     assert "recent_publish" in (cand.detail or ""), (
         f"detail should cite the supply-chain finding kind; got: "
@@ -1510,3 +1528,296 @@ def test_plan_parallel_walk_preserves_dep_order(
     assert [c.name for c in candidates] == names
     assert all(c.status == "promoted" and c.to_version == "1.5"
                for c in candidates)
+
+
+# ---------------------------------------------------------------------------
+# demoted_safety: distinct status, never force-appliable; safety check
+# runs even for major-crossing candidates
+# ---------------------------------------------------------------------------
+
+def test_demoted_safety_never_actionable_under_any_flags() -> None:
+    """A supply-chain demotion previously shared review_required with
+    the major-crossing gate, so --allow-major-without-review — a flag
+    about major bumps — force-applied candidates the safety check had
+    demoted. The distinct status must be inert under EVERY flag
+    combination."""
+    from packages.sca.harden import _count_actionable
+    cands = [_candidate("demoted_safety")]
+    for amwr in (False, True):
+        for ad in (False, True):
+            assert _count_actionable(
+                cands, allow_major_without_review=amwr,
+                allow_degraded=ad) == 0
+
+
+def test_major_crossing_candidate_still_gets_safety_check() -> None:
+    """The old early return for major crossings skipped the
+    promotion-safety evaluation entirely: under
+    --allow-major-without-review a major bump to a version published
+    hours ago auto-applied with the recent-publish check never
+    executed. The safety check must run first; its demotion wins."""
+    from datetime import datetime, timezone
+
+    dep = _dep(name="semgrep", version="1.161.0",
+               pin_style=PinStyle.EXACT)
+    now_iso = datetime.now(timezone.utc).isoformat().replace(
+        "+00:00", "Z")
+    # 2.0.0 crosses a major AND was published just now.
+    pypi = _StubPyPIClient(version="2.0.0", upload_iso=now_iso)
+    cand = _plan_one(
+        dep,
+        registries={"PyPI": pypi},
+        osv=_FakeOsv({"2.0.0": []}),
+        offline=False, allow_major=False,
+    )
+    assert cand.crosses_major is True
+    assert cand.status == "demoted_safety"
+    assert "recent_publish" in (cand.detail or "")
+
+
+def test_major_crossing_clean_target_still_review_required() -> None:
+    """Direction two: a major crossing whose safety evaluation finds
+    nothing keeps the review_required gate (appliable via the
+    operator's explicit --allow-major-without-review)."""
+    from datetime import datetime, timezone, timedelta
+
+    dep = _dep(name="semgrep", version="1.161.0",
+               pin_style=PinStyle.EXACT)
+    old_iso = (datetime.now(timezone.utc) - timedelta(days=400)) \
+        .isoformat().replace("+00:00", "Z")
+    pypi = _StubPyPIClient(version="2.0.0", upload_iso=old_iso)
+    cand = _plan_one(
+        dep,
+        registries={"PyPI": pypi},
+        osv=_FakeOsv({"2.0.0": []}),
+        offline=False, allow_major=False,
+    )
+    assert cand.status == "review_required"
+    assert "crosses a major boundary" in (cand.detail or "")
+
+
+# ---------------------------------------------------------------------------
+# --no-cache must actually bypass the OSV / KEV / EPSS disk caches
+# ---------------------------------------------------------------------------
+
+
+def test_no_cache_zeroes_lookup_ttls(tmp_path):
+    """`fix --harden --no-cache` must zero the OSV/KEV/EPSS TTLs so
+    every persisted entry is stale on read — substituting a fresh
+    JsonCache object alone left the default 24h TTLs serving day-old
+    advisory answers to the one flag whose documented purpose is
+    bypassing them (the scan / review / whatif paths already zero)."""
+    from core.json import JsonCache
+
+    from packages.sca.harden import _build_lookup_clients
+
+    class _NoHttp:
+        def get(self, *a, **k):  # pragma: no cover - never reached
+            raise AssertionError("no network in this test")
+
+    cache = JsonCache(root=tmp_path)
+    osv, kev, epss = _build_lookup_clients(
+        _NoHttp(), cache, offline=True, no_cache=True,
+    )
+    assert osv._query_ttl == 0
+    assert osv._inner._ttl == 0
+    assert kev._ttl == 0
+    assert epss._ttl == 0
+    # Cached runs keep the standard 24h freshness window.
+    osv, kev, epss = _build_lookup_clients(
+        _NoHttp(), cache, offline=True, no_cache=False,
+    )
+    assert osv._query_ttl == 24 * 3600
+    assert kev._ttl == 24 * 3600
+    assert epss._ttl == 24 * 3600
+
+
+# ---------------------------------------------------------------------------
+# Downgrade lane gate wiring: safety check + both-gates major crossing
+# ---------------------------------------------------------------------------
+
+
+def test_downgrade_target_gets_promotion_safety_check() -> None:
+    """A ``downgraded_safety`` write target is applied under
+    ``--allow-degraded`` exactly like a degraded promotion, so it must
+    pass the same supply-chain evaluation — a recently-published
+    downgrade target demotes instead of staying appliable."""
+    from datetime import datetime, timezone
+
+    class _StubDowngradePyPI:
+        ecosystem = "PyPI"
+
+        def list_versions(self, name):
+            return ["2.5", "2.7.0", "2.8"]
+
+        def get_metadata(self, name):
+            now_iso = datetime.now(timezone.utc).isoformat().replace(
+                "+00:00", "Z")
+            release = [{
+                "upload_time_iso_8601": now_iso,
+                "url": "https://example/x.whl",
+                "filename": "x.whl",
+                "digests": {"sha256": "abc"},
+                "size": 1234,
+                "packagetype": "bdist_wheel",
+                "python_version": "py3",
+                "yanked": False,
+            }]
+            return {
+                "info": {"yanked": False, "maintainer": "alice"},
+                "releases": {v: release for v in ("2.5", "2.7.0", "2.8")},
+            }
+
+    dep = replace(_dep(pin_style=PinStyle.EXACT, version="2.7.0"),
+                  version_floor="2.0")
+    osv = _FakeOsv({
+        "2.7.0": [_adv("CVE-B")],
+        "2.8": [_adv("CVE-C")],
+        # 2.5 absent => clean, below the pin → downgrade target.
+    })
+    cand = _plan_one(
+        dep,
+        registries={"PyPI": _StubDowngradePyPI()},
+        osv=osv, offline=False, allow_major=False,
+    )
+    assert cand.status == "demoted_safety", cand.status
+    assert "recent_publish" in (cand.detail or "")
+
+
+def test_major_crossing_downgrade_needs_both_gates() -> None:
+    """A major-crossing downgrade keeps ``downgraded_safety`` (its own
+    ``--allow-degraded`` gate) and additionally requires major consent
+    — previously the major gate rewrote it to ``review_required``, so
+    ``--allow-major-without-review`` alone applied it WITHOUT the
+    degraded opt-in (the two gates traded places)."""
+    from packages.sca.harden import _count_actionable
+
+    dep = replace(_dep(pin_style=PinStyle.EXACT, version="2.7.0"),
+                  version_floor="1.0")
+    osv = _FakeOsv({
+        "2.7.0": [_adv("CVE-B")],
+        "2.8": [_adv("CVE-C")],
+        # 1.5 absent => clean; only clean version is below the major.
+    })
+    cand = _plan_one(
+        dep,
+        registries={"PyPI": _FakeRegistry(["1.5", "2.7.0", "2.8"])},
+        osv=osv, offline=False, allow_major=False,
+    )
+    assert cand.status == "downgraded_safety", cand.status
+    assert cand.crosses_major is True
+    assert "--allow-degraded" in cand.detail
+
+    # Neither flag alone applies it; both together do.
+    assert _count_actionable([cand], allow_major_without_review=False,
+                             allow_degraded=True) == 0
+    assert _count_actionable([cand], allow_major_without_review=True,
+                             allow_degraded=False) == 0
+    assert _count_actionable([cand], allow_major_without_review=True,
+                             allow_degraded=True) == 1
+    # Planner-level --allow-major also counts as major consent.
+    assert _count_actionable([cand], allow_major_without_review=False,
+                             allow_degraded=True, allow_major=True) == 1
+
+
+def test_non_crossing_downgrade_still_applies_with_degraded_only() -> None:
+    """Other direction of the gate: a downgrade WITHIN the major needs
+    only ``--allow-degraded`` — the both-gates rule must not tighten
+    the pre-existing single-gate path."""
+    from packages.sca.harden import _count_actionable
+
+    dep = replace(_dep(pin_style=PinStyle.EXACT, version="2.7.0"),
+                  version_floor="2.0")
+    osv = _FakeOsv({
+        "2.7.0": [_adv("CVE-B")],
+        "2.8": [_adv("CVE-C")],
+    })
+    cand = _plan_one(
+        dep,
+        registries={"PyPI": _FakeRegistry(["2.5", "2.7.0", "2.8"])},
+        osv=osv, offline=False, allow_major=False,
+    )
+    assert cand.status == "downgraded_safety", cand.status
+    assert cand.crosses_major is False
+    assert _count_actionable([cand], allow_major_without_review=False,
+                             allow_degraded=True) == 1
+
+
+# ---------------------------------------------------------------------------
+# OSV-outage slots: a failed lookup is "unknown", never clean
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _OutageOsv(_FakeOsv):
+    """``_FakeOsv`` where lookups for the given versions FAILED
+    transiently. The real client's failed slots still yield empty
+    advisory lists in query results — only ``lookup_failed()``
+    distinguishes "no advisories" from "answer unknown"."""
+
+    failed_versions: frozenset = frozenset()
+
+    def lookup_failed(self, dep_key: str) -> bool:
+        return any(dep_key.endswith(f"@{v}") for v in self.failed_versions)
+
+
+def test_outage_slot_is_never_ranked_clean() -> None:
+    """With every candidate's OSV lookup failed, harden refuses to plan
+    the dep instead of promoting an advisory-invisible version."""
+    dep = _dep(version="1.0")
+    osv = _OutageOsv(failed_versions=frozenset({"1.5", "1.8"}))
+    cand = _plan_one(dep,
+                     registries={"PyPI": _FakeRegistry(["1.8", "1.5"])},
+                     osv=osv, offline=False, allow_major=False)
+    assert cand.status == "error"
+    assert "degraded" in cand.detail
+    assert cand.to_version is None
+    assert cand.candidates_lookup_failed == 2
+
+
+def test_outage_slot_loses_to_known_vulnerable_candidate() -> None:
+    """Mixed batch: 1.8's lookup failed, 1.5 carries a known medium.
+    The known-vulnerable candidate wins the least-worst pick (visible
+    residual advisories) — an unknown slot must never look clean or
+    outrank a candidate whose risk is actually known."""
+    dep = _dep(version="1.0")
+    osv = _OutageOsv(
+        advisories_by_version={"1.5": [_adv("GHSA-m", "medium")]},
+        failed_versions=frozenset({"1.8"}),
+    )
+    cand = _plan_one(dep,
+                     registries={"PyPI": _FakeRegistry(["1.8", "1.5"])},
+                     osv=osv, offline=False, allow_major=False)
+    assert cand.status == "degraded_safety"
+    assert cand.to_version == "1.5"
+    assert cand.cve_remaining == ["GHSA-m"]
+
+
+def test_check_mode_exits_2_when_osv_degraded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys,
+) -> None:
+    """``--check`` is a CI gate: exit 0 means "project is hardened".
+    Under a degraded OSV run that answer is unavailable — exit 2, never
+    a silent pass."""
+    from packages.sca import harden
+
+    (tmp_path / "requirements.txt").write_text(
+        "requests==2.30.0\n", encoding="utf-8")
+
+    class _DegradedOsv:
+        degraded = True
+        failed_lookups = 3
+        failed_dep_keys = ["PyPI:requests@2.30.0"]
+
+        def lookup_failed(self, dep_key: str) -> bool:
+            return True
+
+        def query_batch(self, deps):
+            return [OsvResult(dep_key=d.key(), advisories=[])
+                    for d in deps]
+
+    monkeypatch.setattr(harden, "_build_lookup_clients",
+                        lambda *a, **k: (_DegradedOsv(), None, None))
+    rc = harden.main([str(tmp_path), "--check", "--offline",
+                      "--out", str(tmp_path / "out")])
+    assert rc == 2
+    assert "degraded" in capsys.readouterr().err

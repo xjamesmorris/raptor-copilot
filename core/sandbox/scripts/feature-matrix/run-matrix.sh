@@ -9,7 +9,7 @@
 # Usage:
 #   run-matrix.sh [--repo PATH] [--ref REF] [--image 24|26|both]
 #                 [--lanes l1,l2,...] [--e2e | --full]
-#                 [--skip-build] [--lane-timeout SECS]
+#                 [--skip-build | --build-only] [--lane-timeout SECS]
 #                 [--py-version X.Y.Z] [--results DIR]
 #                 [--self-test]
 #
@@ -26,7 +26,15 @@
 #
 # --self-test: docker-free wiring check — generates the lane seccomp
 # profiles, runs the feature probe on the host, and exercises the
-# report aggregator on synthetic fixtures (clean + shape-diverged).
+# report aggregator on synthetic fixtures (clean + environment-degraded
+# + shape-diverged + test-failing).
+#
+# --build-only: build the selected images (with the sxv.reqhash label
+# and the same build args as a full run) and stop before any lane
+# executes. Single-sources the image recipe for publishers — the
+# GHCR publish workflow tags and pushes the local tags this leaves
+# behind — so a registry copy can never drift from what a full run
+# would have built. Mutually exclusive with --skip-build.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,7 +48,8 @@ if [ "${1:-}" = "--self-test" ]; then
     python3 "$HERE/profiles/make_profiles.py" --out "$TMP/profiles"
     python3 - "$TMP/profiles" <<'PYEOF'
 import json, sys, pathlib
-for name in ("no-landlock", "no-userns", "no-both"):
+for name in ("no-landlock", "no-mount", "restricted-userns",
+             "no-mount-nonet", "no-userns", "no-both"):
     p = json.loads((pathlib.Path(sys.argv[1]) / f"{name}.json").read_text())
     assert p["syscalls"], name
 print("profiles ok")
@@ -55,22 +64,31 @@ for key in ("landlock", "userns", "mount_in_userns",
     assert key in shape, key
 print("probe ok:", shape)
 PYEOF
-    echo "== report aggregates and gates on shape divergence"
-    for verdict in clean diverged; do
+    echo "== report aggregates, self-classifies degradations, gates divergence"
+    for verdict in clean degraded diverged; do
         L="$TMP/run-$verdict/u24/full"
         mkdir -p "$L"
         if [ "$verdict" = clean ]; then
-            cp "$TMP/probe.json" "$L/probe.json"
-            python3 - "$L/probe.json" "$HERE/profiles" <<'PYEOF'
+            # feature-complete host: every hard AND env feature nominal
+            python3 - "$L/probe.json" <<'PYEOF'
 import json, sys
-sys.path.insert(0, sys.argv[2])
-from lanes import _MNT
-d = json.load(open(sys.argv[1]))
-# match the dynamic lane expectation (host AppArmor sysctl is kernel-wide)
-d["shape"] = {"landlock": "present", "userns": "ok",
-              "mount_in_userns": _MNT, "proc_mount_in_userns": _MNT,
-              "pivot_root_in_userns": _MNT, "seccomp": "ok"}
-json.dump(d, open(sys.argv[1], "w"))
+json.dump({"shape": {"landlock": "present", "userns": "ok",
+                     "mount_in_userns": "ok",
+                     "proc_mount_in_userns": "ok",
+                     "pivot_root_in_userns": "ok", "seccomp": "ok"},
+           "landlock": {"abi": 8}}, open(sys.argv[1], "w"))
+PYEOF
+        elif [ "$verdict" = degraded ]; then
+            # GitHub-runner shape: hard features fine, mount capability
+            # denied inside the userns (environment-conditioned tier) —
+            # must be NAMED, must NOT fail the run
+            python3 - "$L/probe.json" <<'PYEOF'
+import json, sys
+json.dump({"shape": {"landlock": "present", "userns": "ok",
+                     "mount_in_userns": "fail",
+                     "proc_mount_in_userns": "fail",
+                     "pivot_root_in_userns": "fail", "seccomp": "ok"},
+           "landlock": {"abi": 7}}, open(sys.argv[1], "w"))
 PYEOF
         else
             python3 - "$L/probe.json" <<'PYEOF'
@@ -86,11 +104,77 @@ PYEOF
             > "$L/junit-1.xml"
         printf '{"rc": 0, "duration_s": 1}' > "$L/meta.json"
     done
-    python3 "$HERE/bin/report.py" "$TMP/run-clean" >/dev/null \
+    python3 "$HERE/bin/report.py" "$TMP/run-clean" > "$TMP/out-clean" \
         || { echo "self-test FAIL: clean fixture reported non-zero" >&2; exit 1; }
+    grep -q "as-intended" "$TMP/out-clean" \
+        || { echo "self-test FAIL: clean fixture not as-intended" >&2; exit 1; }
+    python3 "$HERE/bin/report.py" "$TMP/run-degraded" > "$TMP/out-degraded" \
+        || { echo "self-test FAIL: degraded shape must not fail the run" >&2; exit 1; }
+    grep -q "degraded(mnt,proc,pivot)" "$TMP/out-degraded" \
+        || { echo "self-test FAIL: degradation not self-classified" >&2; exit 1; }
     if python3 "$HERE/bin/report.py" "$TMP/run-diverged" >/dev/null; then
         echo "self-test FAIL: shape divergence not gated" >&2; exit 1
     fi
+    echo "== report gates unbound expect_bound tests (denied-lane binding guard)"
+    for bindcase in bound unbound; do
+        L="$TMP/run-bind-$bindcase/u24/no-userns"
+        mkdir -p "$L"
+        python3 - "$L/probe.json" <<'PYEOF'
+import json, sys
+json.dump({"shape": {"landlock": "present", "userns": "denied",
+                     "mount_in_userns": "fail",
+                     "proc_mount_in_userns": "fail",
+                     "pivot_root_in_userns": "fail", "seccomp": "ok"},
+           "landlock": {"abi": 8}}, open(sys.argv[1], "w"))
+PYEOF
+        if [ "$bindcase" = bound ]; then
+            EXTRA='<testcase classname="x" name="test_denied_matrix_lanes_bind_this_module"/>'
+        else
+            # present but SKIPPED — must gate exactly like absent
+            EXTRA='<testcase classname="x" name="test_denied_matrix_lanes_bind_this_module"><skipped message="vacuous"/></testcase>'
+        fi
+        printf '<testsuites><testsuite name="pytest" tests="2" failures="0" errors="0" skipped="0"><testcase classname="x" name="a"/>%s</testsuite></testsuites>' "$EXTRA" \
+            > "$L/junit-1.xml"
+        printf '{"rc": 0, "duration_s": 1}' > "$L/meta.json"
+    done
+    python3 "$HERE/bin/report.py" "$TMP/run-bind-bound" > "$TMP/out-bind-bound" \
+        || { echo "self-test FAIL: bound guard test must not fail the run" >&2; exit 1; }
+    if python3 "$HERE/bin/report.py" "$TMP/run-bind-unbound" > "$TMP/out-bind-unbound"; then
+        echo "self-test FAIL: skipped expect_bound test not gated" >&2; exit 1
+    fi
+    grep -q "BIND required-passing" "$TMP/out-bind-unbound" \
+        || { echo "self-test FAIL: unbound guard not named in failures" >&2; exit 1; }
+    echo "== report gates lane test failures and mirrors junit counts"
+    # Pins the direction that makes a green matrix run a machine
+    # verdict on "0 failures": a junit-recorded test failure must fail
+    # the report and be named, and the summary's pass/fail figures
+    # must be the junit-derived counts, not a transcription.
+    L="$TMP/run-failing/u24/full"
+    mkdir -p "$L"
+    python3 - "$L/probe.json" <<'PYEOF'
+import json, sys
+json.dump({"shape": {"landlock": "present", "userns": "ok",
+                     "mount_in_userns": "ok",
+                     "proc_mount_in_userns": "ok",
+                     "pivot_root_in_userns": "ok", "seccomp": "ok"},
+           "landlock": {"abi": 8}}, open(sys.argv[1], "w"))
+PYEOF
+    printf '<testsuites><testsuite name="pytest" tests="3" failures="1" errors="0" skipped="0"><testcase classname="x" name="a"/><testcase classname="x" name="b"/><testcase classname="x" name="test_denied_write"><failure message="boom"/></testcase></testsuite></testsuites>' \
+        > "$L/junit-1.xml"
+    printf '{"rc": 0, "duration_s": 1}' > "$L/meta.json"
+    if python3 "$HERE/bin/report.py" "$TMP/run-failing" > "$TMP/out-failing"; then
+        echo "self-test FAIL: lane test failure not gated" >&2; exit 1
+    fi
+    grep -q "FAIL x::test_denied_write" "$TMP/run-failing/failures.txt" \
+        || { echo "self-test FAIL: failed test not named in failures.txt" >&2; exit 1; }
+    python3 - "$TMP/run-failing/matrix.json" "$TMP/run-clean/matrix.json" <<'PYEOF'
+import json, sys
+failing = json.load(open(sys.argv[1]))[0]
+assert (failing["tests"], failing["failures"]) == (3, 1), failing
+clean = json.load(open(sys.argv[2]))[0]
+assert (clean["tests"], clean["failures"]) == (2, 0), clean
+print("junit-derived counts ok")
+PYEOF
     echo "== report gates empty and stray-lane runs"
     mkdir -p "$TMP/run-empty"
     if python3 "$HERE/bin/report.py" "$TMP/run-empty" >/dev/null 2>&1; then
@@ -126,6 +210,7 @@ IMAGE_SEL=both
 LANES="$(python3 "$HERE/profiles/lanes.py" list | paste -sd, -)"
 TIER=default
 SKIP_BUILD=0
+BUILD_ONLY=0
 LANE_TIMEOUT=3600
 PY_VERSION=3.14.7
 RESULTS_BASE="${RAPTOR_MATRIX_RESULTS:-${RUNNER_TEMP:-/tmp}/raptor-sandbox-matrix}"
@@ -138,10 +223,11 @@ while [ $# -gt 0 ]; do
         --e2e)          TIER=e2e; shift ;;
         --full)         TIER=full; shift ;;
         --skip-build)   SKIP_BUILD=1; shift ;;
+        --build-only)   BUILD_ONLY=1; shift ;;
         --lane-timeout) LANE_TIMEOUT="$2"; shift 2 ;;
         --py-version)   PY_VERSION="$2"; shift 2 ;;
         --results)      RESULTS_BASE="$2"; shift 2 ;;
-        -h|--help)      sed -n '2,30p' "$0"; exit 0 ;;
+        -h|--help)      sed -n '2,37p' "$0"; exit 0 ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
@@ -152,6 +238,11 @@ case "$IMAGE_SEL" in
     both) IMAGES=(u24 u26) ;;
     *) echo "--image must be 24|26|both" >&2; exit 2 ;;
 esac
+
+if [ "$BUILD_ONLY" = 1 ] && [ "$SKIP_BUILD" = 1 ]; then
+    echo "--build-only and --skip-build are mutually exclusive" >&2
+    exit 2
+fi
 
 # Validate every requested lane UP FRONT. A bogus lane name must abort
 # here: the per-lane `lanes.py args` call runs in a process
@@ -181,7 +272,7 @@ git clone -q --no-checkout "$REPO" "$RUN/repo"
 git -C "$RUN/repo" checkout -q --detach "$SHA"
 tar -C "$RUN/repo" -cf "$RUN/repo.tar" .
 
-REQHASH=$(cat "$RUN/repo/requirements.txt" "$RUN/repo/requirements-dev.txt" \
+REQHASH=$(cat "$RUN/repo/pyproject.toml" "$RUN/repo/uv.lock" \
           | sha256sum | cut -d' ' -f1)
 
 # ---- lane seccomp profiles ----------------------------------------------
@@ -211,7 +302,7 @@ raise SystemExit('no linux-24.04 x64 artifact for ' + want)
     mkdir -p "$CTX"
     cp "$HERE/images/rustup-proxy.c" "$CTX/"
     cp "$HERE/images/Dockerfile" "$HERE/images/Dockerfile.26" "$CTX/"
-    cp "$RUN/repo/requirements.txt" "$RUN/repo/requirements-dev.txt" "$CTX/"
+    cp "$RUN/repo/pyproject.toml" "$RUN/repo/uv.lock" "$CTX/"
     for img in "${IMAGES[@]}"; do
         echo "== building raptor-sandbox-matrix:$img (${DOCKERFILE[$img]})"
         docker build -t "raptor-sandbox-matrix:$img" \
@@ -227,6 +318,17 @@ raise SystemExit('no linux-24.04 x64 artifact for ' + want)
                  tail -30 "$RUN/build-$img.log" >&2; exit 3; }
     done
     rm -rf "$CTX"
+fi
+
+if [ "$BUILD_ONLY" = 1 ]; then
+    # keep only the build logs: the clone, tarball and lane profiles
+    # exist for lane runs that will never happen
+    rm -rf "$RUN/repo" "$RUN/repo.tar" "$RUN/profiles"
+    echo "== build-only: stopping before lane runs"
+    for img in "${IMAGES[@]}"; do
+        echo "== built raptor-sandbox-matrix:$img (sxv.reqhash=$REQHASH)"
+    done
+    exit 0
 fi
 
 # ---- lane runs -----------------------------------------------------------

@@ -19,6 +19,8 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
+
+from core.source import read_text_capped
 from typing import TYPE_CHECKING
 
 from core.json import load_json
@@ -43,12 +45,19 @@ def load_pack(name: str) -> DomainVocabulary | None:
 
     Returns None (with a logged warning) when the pack file is missing
     or malformed — checkers then run on seeds + learned vocab alone.
+    Failed loads are NOT cached, so a transient read failure does not
+    disable the pack for the rest of the process.
     """
     if name in _pack_cache:
         return _pack_cache[name]
     vocab = _load_pack_uncached(name)
-    _pack_cache[name] = vocab
+    if vocab is not None:
+        _pack_cache[name] = vocab
     return vocab
+
+
+class _MalformedPack(ValueError):
+    """A pack field has the wrong JSON shape."""
 
 
 def _load_pack_uncached(name: str) -> DomainVocabulary | None:
@@ -62,26 +71,44 @@ def _load_pack_uncached(name: str) -> DomainVocabulary | None:
     if not isinstance(raw, dict):
         logger.warning("vocab pack %s is not a JSON object; ignoring", path)
         return None
+    # Honour the documented None+warning contract for EVERY malformed
+    # shape: a string-valued name list would otherwise iterate into a
+    # frozenset of single characters, and a list-shaped auth_predicates
+    # would raise out of the loader into callers' broad excepts.
+    try:
+        return _build_vocabulary(raw, DomainVocabulary)
+    except _MalformedPack as exc:
+        logger.warning("vocab pack %s is malformed (%s); ignoring", path, exc)
+        return None
 
+
+def _build_vocabulary(raw: dict, vocab_cls: type) -> DomainVocabulary:
     def _names(key: str) -> frozenset:
-        return frozenset(
-            n for n in raw.get(key, []) if isinstance(n, str) and n
-        )
+        val = raw.get(key, [])
+        if not isinstance(val, list):
+            raise _MalformedPack(f"{key} must be a list of names")
+        return frozenset(n for n in val if isinstance(n, str) and n)
 
+    lock_raw = raw.get("lock_pairs", [])
+    if not isinstance(lock_raw, list):
+        raise _MalformedPack("lock_pairs must be a list of pairs")
     lock_pairs = frozenset(
         (str(a), str(r))
         for a, r in (
-            p for p in raw.get("lock_pairs", [])
+            p for p in lock_raw
             if isinstance(p, (list, tuple)) and len(p) == 2
         )
     )
+    auth_raw = raw.get("auth_predicates", {})
+    if not isinstance(auth_raw, dict):
+        raise _MalformedPack("auth_predicates must be an object")
     auth = frozenset(
         (str(k), str(v))
-        for k, v in raw.get("auth_predicates", {}).items()
+        for k, v in auth_raw.items()
         if isinstance(k, str) and k
     )
 
-    return DomainVocabulary(
+    return vocab_cls(
         allocators=_names("allocators"),
         deallocators=_names("deallocators"),
         lock_acquires=frozenset(a for a, _ in lock_pairs),
@@ -120,11 +147,9 @@ def is_kernel_tree(target_path: str | Path) -> bool:
             result = True
         else:
             makefile = root / "Makefile"
-            if makefile.is_file():
-                head = makefile.read_text(
-                    encoding="utf-8", errors="replace",
-                )[:65536]
-                result = bool(_KBUILD_OBJ_RE.search(head))
+            got = read_text_capped(makefile, 65536)
+            if got is not None:
+                result = bool(_KBUILD_OBJ_RE.search(got[0]))
     except OSError:
         result = False
 

@@ -16,7 +16,7 @@ from core.llm.throttle import (
 class _FakeMonotonic:
     """Deterministic clock for cooldown choreography — the real-time
     version flaked on loaded CI runners whenever scheduling delay
-    between a signal and its assert exceeded the 100ms cooldown."""
+    between a signal and its assert exceeded the sub-100ms cooldown."""
 
     def __init__(self) -> None:
         self.now = 1000.0
@@ -295,22 +295,56 @@ class TestAsyncAcquire:
         asyncio.run(run())
 
     def test_restore_unblocks_waiters(self):
-        """After cooldown, blocked waiters should proceed."""
-        t = AdaptiveThrottle(2, cooldown_s=0.05, auto_register=False)
-        t.signal_rate_limit()
-        assert t.effective_workers == 1
-        completed = [0]
+        """A cooldown restore must admit a parked waiter with NO slot
+        release: the holder pins the single post-429 slot for the whole
+        wait, so only the ramp-up (1 → 2 once the fake clock passes the
+        cooldown) can let the waiter through.  The fake clock also
+        makes the reduced-state checkpoint deterministic — a real
+        sub-100ms cooldown expired between the signal and the assert
+        on loaded runners."""
+        clk = _FakeMonotonic()
 
-        async def worker():
-            async with t.acquire():
-                await asyncio.sleep(0.01)
-                completed[0] += 1
+        async def scenario():
+            t = AdaptiveThrottle(
+                2, cooldown_s=60.0, auto_register=False, clock=clk,
+            )
+            t.signal_rate_limit()
+            assert t.effective_workers == 1
+            holder_in = asyncio.Event()
+            release_holder = asyncio.Event()
+            waiter_done = asyncio.Event()
 
-        async def run():
-            await asyncio.gather(*(worker() for _ in range(4)))
+            async def holder():
+                async with t.acquire():
+                    holder_in.set()
+                    await release_holder.wait()
 
-        asyncio.run(run())
-        assert completed[0] == 4
+            async def waiter():
+                async with t.acquire():
+                    waiter_done.set()
+
+            holder_task = asyncio.ensure_future(holder())
+            await asyncio.wait_for(holder_in.wait(), timeout=5.0)
+            waiter_task = asyncio.ensure_future(waiter())
+            # Let the waiter run to its parked state (slot check fails
+            # at in_flight == effective == 1, so it awaits the event).
+            for _ in range(5):
+                await asyncio.sleep(0)
+            # Deterministically still blocked: the clock is frozen, so
+            # no restore can have fired, and the holder holds the slot.
+            assert not waiter_task.done()
+            clk.advance(61.0)
+            # Property access is a production restore trigger — it must
+            # ramp 1 → 2 and wake the parked waiter without a release.
+            assert t.effective_workers == 2
+            await asyncio.wait_for(waiter_done.wait(), timeout=5.0)
+            release_holder.set()
+            await asyncio.wait_for(
+                asyncio.gather(holder_task, waiter_task), timeout=5.0,
+            )
+            assert t.in_flight == 0
+
+        asyncio.run(scenario())
 
 
 class TestAcquireLivelockAndMixedWakeups:
@@ -527,22 +561,59 @@ class TestAcquireSync:
         assert peak[0] <= 2
 
     def test_restore_unblocks(self):
-        t = AdaptiveThrottle(2, cooldown_s=0.05, auto_register=False)
+        """A cooldown restore must admit a blocked acquirer with NO
+        slot release: the holder pins the single post-429 slot for the
+        whole wait, so only the ramp-up (1 → 2 once the fake clock
+        passes the cooldown) can let the waiter through.  The fake
+        clock also makes the reduced-state checkpoint deterministic —
+        a real sub-100ms cooldown expired between the signal and the
+        assert on loaded runners."""
+        clk = _FakeMonotonic()
+        t = AdaptiveThrottle(2, cooldown_s=60.0, auto_register=False, clock=clk)
         t.signal_rate_limit()
         assert t.effective_workers == 1
-        completed = [0]
+        holder_in = threading.Event()
+        release_holder = threading.Event()
+        waiter_done = threading.Event()
 
-        def worker():
+        def holder():
             with t.acquire_sync():
-                time.sleep(0.01)
-                completed[0] += 1
+                holder_in.set()
+                release_holder.wait(timeout=10.0)
 
-        threads = [threading.Thread(target=worker) for _ in range(4)]
-        for th in threads:
-            th.start()
-        for th in threads:
-            th.join()
-        assert completed[0] == 4
+        def waiter():
+            with t.acquire_sync():
+                waiter_done.set()
+
+        th_holder = threading.Thread(target=holder)
+        th_holder.start()
+        assert holder_in.wait(timeout=5.0)
+        th_waiter = threading.Thread(target=waiter)
+        th_waiter.start()
+        # Positive blocked checkpoint: the waiter registers itself
+        # before parking, and with the clock frozen it can never take
+        # the slot (in_flight == effective == 1, no restore possible).
+        # Single read per check: ``_sync_waiters`` transiently drops to
+        # 0 on every bounded-wait cycle, so a separate re-read in the
+        # assert could land in the deregistered gap.
+        deadline = time.monotonic() + 5.0
+        observed = t._sync_waiters
+        while observed == 0 and time.monotonic() < deadline:
+            time.sleep(0.005)
+            observed = t._sync_waiters
+        assert observed == 1
+        assert not waiter_done.is_set()
+        clk.advance(61.0)
+        # The waiter's bounded condition-wait re-runs _maybe_restore,
+        # sees the elapsed cooldown, ramps 1 → 2, and admits itself —
+        # no slot was ever released.
+        assert waiter_done.wait(timeout=5.0)
+        release_holder.set()
+        th_holder.join(timeout=5.0)
+        th_waiter.join(timeout=5.0)
+        assert not th_holder.is_alive()
+        assert not th_waiter.is_alive()
+        assert t.effective_workers == 2
 
     def test_in_flight_tracking(self):
         t = AdaptiveThrottle(4, auto_register=False)
@@ -693,21 +764,34 @@ class TestRunParallel:
         assert results == [1, 2, 3, 4]
 
     def test_concurrent_execution(self):
-        """Multiple items run concurrently, not serially."""
+        """Multiple items run concurrently, not serially.
+
+        Overlap is proven structurally: each worker waits at a
+        2-party barrier, so a rendezvous can only complete when two
+        items are in flight AT THE SAME TIME. The former peak-counter
+        version relied on the scheduler overlapping two 50ms sleeps —
+        on a starved runner the items could legally run one at a
+        time, peak stayed 1, and the test false-failed. A serial
+        regression now breaks the barrier (timeout) instead: zero
+        rendezvous, deterministic failure.
+        """
         from core.llm.concurrency import run_parallel
 
-        peak = [0]
-        current = [0]
+        barrier = threading.Barrier(2)
+        met = [0]
         lock = threading.Lock()
 
         def _track(x):
+            try:
+                barrier.wait(timeout=30)
+            except threading.BrokenBarrierError:
+                return x
             with lock:
-                current[0] += 1
-                peak[0] = max(peak[0], current[0])
-            time.sleep(0.05)
-            with lock:
-                current[0] -= 1
+                met[0] += 1
             return x
 
         run_parallel(list(range(6)), _track, max_workers=3, label="conc-test")
-        assert peak[0] >= 2
+        assert met[0] >= 2, (
+            "no two items were ever in flight together — run_parallel "
+            "executed serially"
+        )

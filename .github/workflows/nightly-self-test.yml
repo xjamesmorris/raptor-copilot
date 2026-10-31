@@ -1,0 +1,112 @@
+name: Nightly (self-test)
+
+# Runs the tier-0 self-test suite — 51 process/kernel/filesystem/network
+# boundary cases that exercise the full command surface without any LLM
+# calls. Catches sandbox regressions, CLI contract breakage, tool-path
+# drift, SARIF plumbing failures, and boundary-probe violations that
+# unit tests (which fake those boundaries) cannot.
+#
+# Tier 0 only: the suite scrubs all API keys from child environments and
+# unroutes Ollama, so every pipeline takes its documented no-LLM path.
+# No API costs.
+
+on:
+  schedule:
+    # 07:30 UTC — staggered from the slow+integration nightly (07:00)
+    # and the shuffled-fast nightly (07:15).
+    - cron: '30 7 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: '3.14'
+  VENV_PATH: .venv
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  self-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Enable unprivileged user namespaces
+        uses: ./.github/actions/enable-userns
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Create venv and install deps
+        shell: bash
+        run: |
+          uv venv $VENV_PATH
+          source $VENV_PATH/bin/activate
+          uv export --locked --no-hashes | uv pip install -r -
+          uv tool install semgrep==1.177.0
+
+      - name: Install external tools (radare2 + gcc)
+        continue-on-error: true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends radare2 gcc
+
+      - name: Run self-test (tier 0)
+        env:
+          _RAPTOR_TRUSTED: '1'
+        run: |
+          source $VENV_PATH/bin/activate
+          python libexec/raptor-self-test \
+            --json "$RUNNER_TEMP/self-test-results.json" \
+            --timeout 600
+
+      # Backstop for the continue-on-error tool install above: the
+      # self-test's gcc/r2-dependent cases raise Skip when their
+      # binaries are absent and the suite's exit contract counts skips
+      # as pass, so a persistently broken install would read as a
+      # green self-test nightly with the binary-boundary families
+      # never executing (same rationale as nightly.yml's refuse step).
+      # Runs AFTER the self-test (and even when it failed) so the
+      # tool-independent signal is still collected either way; a
+      # broken mirror day costs the binary families only, never the
+      # whole run's diagnosis.
+      - name: Refuse a toolchain-less self-test nightly
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          missing=""
+          command -v r2 >/dev/null 2>&1 || missing="$missing radare2"
+          command -v gcc >/dev/null 2>&1 || missing="$missing gcc"
+          if [ -n "$missing" ]; then
+            echo "::error::self-test toolchain missing:${missing} —" \
+              "the gcc/r2 self-test cases above can only skip, so this" \
+              "nightly produced no binary-boundary signal. Check the" \
+              "external-tools install step's log."
+            exit 1
+          fi
+          echo "Toolchain present: r2 + gcc."
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: self-test-results
+          path: ${{ runner.temp }}/self-test-results.json
+          retention-days: 14
+          if-no-files-found: ignore

@@ -137,15 +137,15 @@ def corroborate_sample(
     """
     try:
         from core.audit.compiler_sweep import (
-            _clang_path,
-            _gcc_analyzer,
+            clang_path_available,
+            gcc_analyzer_available,
             run_compiler_analyzer_sweep,
         )
     except ImportError:
         return 0
 
     try:
-        if _gcc_analyzer() is None and _clang_path() is None:
+        if gcc_analyzer_available() is None and clang_path_available() is None:
             logger.debug(
                 "prefilter ledger: no compiler analyzer installed — "
                 "corroboration skipped",
@@ -223,17 +223,20 @@ def write_ledger(
     records: list[dict[str, Any]],
     out_dir: Path,
 ) -> Path | None:
-    """Write the ledger JSONL (summary row first). Best-effort."""
+    """Write the ledger JSONL (summary row first). Best-effort.
+
+    Atomic (tempfile + rename): the ledger is written once, whole —
+    an interrupt mid-write must not leave a torn line for the next
+    reader to trip over.
+    """
     if not records:
         return None
     try:
+        from core.atomic_fs import write_text_atomically
         path = Path(out_dir) / LEDGER_FILENAME
-        with path.open("w", encoding="utf-8") as fh:
-            fh.write(json.dumps(
-                {"summary": summarise(records)}, sort_keys=True,
-            ) + "\n")
-            for rec in records:
-                fh.write(json.dumps(rec, sort_keys=True) + "\n")
+        lines = [json.dumps({"summary": summarise(records)}, sort_keys=True)]
+        lines.extend(json.dumps(rec, sort_keys=True) for rec in records)
+        write_text_atomically(path, "\n".join(lines) + "\n")
         return path
     except Exception:
         logger.debug("prefilter ledger write failed", exc_info=True)

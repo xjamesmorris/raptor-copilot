@@ -37,10 +37,17 @@ def parse_export(path: Path) -> REDatabase:
     Raises:
         ValueError: If the JSON is malformed or missing required fields.
     """
+    # Bounded read at the shared RE-database ceiling: the export is
+    # produced by the sandboxed JVM while parsing a HOSTILE binary,
+    # which controls the document's size — an unbounded whole-document
+    # json.load in the trusted parent is a memory-exhaustion
+    # primitive (same artifact family, and same effective budget, as
+    # the re-database.json this export becomes).
+    from core.json.bounded import load_json_bounded
+    from core.json.utils import RE_DATABASE_MAX_BYTES
     try:
-        with open(path) as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, OSError) as e:
+        data = load_json_bounded(path, max_bytes=RE_DATABASE_MAX_BYTES)
+    except (json.JSONDecodeError, OSError, ValueError) as e:
         raise ValueError(f"failed to read Ghidra export: {e}") from e
 
     if not isinstance(data, dict):
@@ -57,6 +64,16 @@ def parse_export(path: Path) -> REDatabase:
         refine_import_provenance(db)
     except Exception:
         logger.debug("import-provenance refinement failed", exc_info=True)
+
+    # Mint normalized function identities: the export records the
+    # image base in metadata, so every function gets a base-relative
+    # fid (best-effort — an unreachable binary yields no module
+    # anchor and the records stay fid-free rather than mis-keyed).
+    try:
+        from core.binary.addrmap import stamp_redb_fids
+        stamp_redb_fids(db)
+    except Exception:
+        logger.debug("fid stamping failed", exc_info=True)
 
     return db
 

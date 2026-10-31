@@ -5,6 +5,7 @@ RAPTOR AFL++ Runner
 Orchestrates AFL++ fuzzing campaigns with parallel workers.
 """
 
+import contextlib
 import os
 import re
 import shutil
@@ -12,7 +13,9 @@ import signal
 import subprocess
 import threading
 
-# _run_trusted: read-only tools (strings, --help checks) — no namespace overhead.
+# _run_trusted: RAPTOR-chosen tool probes only (afl-fuzz --help
+# checks) — no namespace overhead. Tools that PARSE the target's
+# bytes (strings) go through core.binary.inspect (full sandbox).
 # Full sandbox for afl-showmap AND the afl-fuzz campaign itself (both
 # execute the untrusted target binary): network block + Landlock
 # (target=output=self.output_dir — AFL reads and writes the same
@@ -26,11 +29,20 @@ import time
 from pathlib import Path
 from typing import ClassVar
 
+from core.atomic_fs import (
+    open_exclusive_artifact,
+    write_new_bytes,
+    write_new_text,
+)
+from core.binary.inspect import inspect_binary as _inspect_binary
 from core.logging import get_logger
 from core.sandbox import SandboxSetupError
 from core.sandbox import run as _sandbox_run
 from core.sandbox import run_trusted as _run_trusted
+from core.security.log_sanitisation import sanitise_for_terminal
+from core.source import open_regular
 from packages.fuzzing.seed_corpus import prepare_builtin_seed_corpus
+from packages.fuzzing.smt_seed import ensure_real_seed_dir
 
 logger = get_logger()
 
@@ -53,6 +65,16 @@ _SHOWMAP_SUMMARY_RE = re.compile(
 )
 # One union-map entry per line: "edge_id" or "edge_id:hit_count".
 _SHOWMAP_EDGE_RE = re.compile(r"^\d+(?::\d+)?$")
+
+# Byte budgets for host-side reads of target-writable files. The fuzz
+# output dir is writable by the (attacker-built) target during the
+# campaign, so every file read back — logs, edge maps, fuzzer_stats —
+# must be bounded (the libFuzzer runner's _MAX_PARSE_BYTES and the
+# coverage bridge's _MAX_CAPTURE_BYTES are the sibling caps). Real
+# artifacts are orders of magnitude smaller than every cap here.
+_MAX_SHOWMAP_MAP_BYTES = 16 * 1024 * 1024
+_MAX_STATS_BYTES = 1024 * 1024
+_SHOWMAP_CONSOLE_TAIL_BYTES = 64 * 1024
 
 
 # Re-exported for callers/tests; implementation shared with the
@@ -123,8 +145,21 @@ class _SandboxedAFLInstance:
 
     def _run(self) -> None:
         try:
-            with open(self.stdout_path, "wb") as stdout_fp, \
-                    open(self.stderr_path, "wb") as stderr_fp:
+            # Exclusive-create the instance logs (lstat-honest
+            # pre-unlink + O_EXCL|O_NOFOLLOW): they live under
+            # output_dir/raptor-logs — inside every instance's
+            # sandbox write grant — so a master instance's live
+            # child can plant a symlink/FIFO at a secondary's
+            # predictable log names before this open runs. A bare
+            # "wb" open would follow the symlink (write laundering)
+            # or block on the FIFO.
+            with os.fdopen(
+                open_exclusive_artifact(self.stdout_path, replace=True),
+                "wb",
+            ) as stdout_fp, os.fdopen(
+                open_exclusive_artifact(self.stderr_path, replace=True),
+                "wb",
+            ) as stderr_fp:
                 extra = {}
                 if self.rootfs is not None:
                     extra["rootfs"] = str(self.rootfs)
@@ -146,7 +181,7 @@ class _SandboxedAFLInstance:
                     # (matches the afl-showmap call; smoke-verified in
                     # image-rootfs mode).
                     sanitise_host_fingerprint=True,
-                    **extra,
+                    **extra,  # type: ignore[arg-type]
                 )
         except BaseException as exc:  # noqa: BLE001 — surfaced by the monitor loop
             self.error = exc
@@ -237,6 +272,34 @@ class AFLRunner:
     binary_only_mode: str = "auto"
     _binary_only_support_dir: str | None = None
 
+    # Default per-exec memory cap (MB) for the fuzzed target, matching
+    # the 2048 the libFuzzer-family runners pass as -rss_limit_mb.
+    # AFL campaigns previously ran with no -m at all, and the sandbox
+    # rlimit default keeps RLIMIT_AS off (ASAN concession) — so a
+    # hostile or buggy target's allocations were unbounded.
+    # Scope: the cap bounds the COMMON failure — a non-adversarial,
+    # non-ASAN target hitting a runaway allocation path. It is NOT an
+    # adversarial boundary (see _detect_target_asan: the probe is
+    # target-steerable and the ASAN-side bound is best-effort); the
+    # detection-independent backstop is the sandbox itself. Both
+    # directions on the value:
+    #  * LOWER and legitimately large targets (image/video decoders,
+    #    template-heavy parsers with big working sets) start dying as
+    #    false OOM crashes at calibration;
+    #  * HIGHER (or 0 = off) and the cap stops bounding confined-code
+    #    memory — parallel instances can drive the host into swap from
+    #    inside the sandbox.
+    # 0 disables. Operators can also override per campaign: the flag
+    # is emitted BEFORE extra_afl_flags and afl-fuzz getopt takes the
+    # LAST occurrence, so `-m <n>` / `-m none` in extra flags wins.
+    mem_limit_mb: int = 2048
+    # Resolved per campaign by run_fuzzing (strings-based ASAN probe):
+    # ASAN targets cannot take the RLIMIT_AS-based -m (shadow VA
+    # reservation), so their cap moves to ASAN_OPTIONS
+    # hard_rss_limit_mb. Class default keeps __init__-bypass
+    # constructions on the plain capped path.
+    _target_has_asan: bool = False
+
     _VALID_POWER_SCHEDULES: ClassVar[set[str]] = {
         "explore", "exploit", "coe", "fast", "lin", "quad", "rare", "seek",
     }
@@ -263,6 +326,7 @@ class AFLRunner:
         binary_in_rootfs: str | None = None,
         afl_fuzz_path: str | None = None,
         cmplog_in_rootfs: str | None = None,
+        mem_limit_mb: int = 2048,
     ) -> None:
         self.binary = Path(binary_path).resolve()
         if not self.binary.exists():
@@ -333,6 +397,11 @@ class AFLRunner:
         self.power_schedule = power_schedule
         self.use_laf_intel = use_laf_intel
         self.deterministic = deterministic
+        if mem_limit_mb < 0:
+            msg = (f"mem_limit_mb must be >= 0 (0 disables the cap): "
+                   f"{mem_limit_mb}")
+            raise ValueError(msg)
+        self.mem_limit_mb = int(mem_limit_mb)
         self.custom_mutator = Path(custom_mutator).resolve() if custom_mutator else None
         if self.custom_mutator and not self.custom_mutator.exists():
             msg = f"Custom mutator not found: {custom_mutator}"
@@ -413,7 +482,7 @@ class AFLRunner:
             # the instance stderr logs.
         else:
             # Check AFL++ availability
-            self.afl_fuzz = shutil.which("afl-fuzz")
+            self.afl_fuzz = shutil.which("afl-fuzz")  # type: ignore[assignment]
             if not self.afl_fuzz:
                 msg = "AFL++ not found. Install with: sudo apt install afl++ (Ubuntu) or brew install afl++ (macOS)"
                 raise RuntimeError(msg)
@@ -455,7 +524,20 @@ class AFLRunner:
         files in ``<target>/out/corpus_default/``.
         """
         corpus = self.output_dir / "corpus_default"
-        corpus.mkdir(parents=True, exist_ok=True)
+        # Name containment BEFORE any create or write: the reused run
+        # dir was writable by the previous campaign's sandboxed
+        # target, and a symlink planted at this predictable name would
+        # otherwise receive every seed (mkdir's exist_ok tolerates a
+        # symlink to a directory). Raise — the emergency-seed fallback
+        # below must never write through a plant either.
+        refusal = ensure_real_seed_dir(corpus)
+        if refusal is not None:
+            msg = (
+                f"refusing default corpus dir "
+                f"{sanitise_for_terminal(str(corpus))}: "
+                f"{sanitise_for_terminal(refusal, max_len=200)}"
+            )
+            raise RuntimeError(msg)
         # No getattr fallback: seed_profile is assigned before corpus
         # resolution in __init__; a fallback here would silently mask a
         # regression in that ordering.
@@ -479,7 +561,11 @@ class AFLRunner:
                 b"GET / HTTP/1.0\r\n\r\n",
             ]
             for idx, seed in enumerate(seeds):
-                (corpus / f"seed{idx}").write_bytes(seed)
+                # Exclusive create with lstat-honest replace: the
+                # staged corpus sits under output_dir (reused,
+                # target-writable) and a planted symlink at these
+                # deterministic names must never route the write.
+                write_new_bytes(corpus / f"seed{idx}", seed, replace=True)
             logger.info("Created emergency default corpus with %d seeds", len(seeds))
         return corpus
 
@@ -542,16 +628,13 @@ class AFLRunner:
         # buffer). Cap at 60 seconds — well above what a
         # legitimate scan needs (a normal multi-MB binary
         # finishes in << 1 second).
-        try:
-            result = _run_trusted(
-                ["strings", str(self.binary)],
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
-        except subprocess.TimeoutExpired:
+        # Full sandbox via core.binary.inspect — the bytes strings
+        # parses are the target's. Never raises; a timeout or exec
+        # failure comes back as returncode None.
+        result = _inspect_binary("strings", (), self.binary, timeout=60)
+        if result.returncode is None:
             logger.warning(
-                "strings %s exceeded 60s — assuming not "
+                "strings %s failed or exceeded 60s — assuming not "
                 "AFL-instrumented (treat as needs a binary-only mode)",
                 self.binary,
             )
@@ -679,16 +762,12 @@ class AFLRunner:
         See `check_binary_instrumentation` for the timeout
         rationale — same 60s cap, same DoS class.
         """
-        try:
-            result = _run_trusted(
-                ["strings", str(self.binary)],
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
-        except subprocess.TimeoutExpired:
+        # Full sandbox via core.binary.inspect (see
+        # check_binary_instrumentation for the posture rationale).
+        result = _inspect_binary("strings", (), self.binary, timeout=60)
+        if result.returncode is None:
             logger.warning(
-                "strings %s exceeded 60s — sanitizer check "
+                "strings %s failed or exceeded 60s — sanitizer check "
                 "skipped, assuming none",
                 self.binary,
             )
@@ -709,6 +788,51 @@ class AFLRunner:
         logger.warning("  Consider recompiling with -fsanitize=address for better bug detection")
         return False
 
+    def _detect_target_asan(self) -> bool:
+        """ASAN linkage probe steering the memory-cap MODE
+        (RLIMIT_AS ``-m`` vs ASAN_OPTIONS hard_rss_limit_mb).
+
+        Same sandboxed strings inspection as check_binary_sanitizers,
+        but consumed mechanically (cap mode) rather than advisorily.
+
+        Scope honesty — this steers plumbing for the common,
+        non-adversarial runaway-allocation case; it is NOT a security
+        boundary. The probe reads strings out of the (untrusted)
+        target, so a hostile binary can steer its own classification
+        by embedding ASAN marker strings; and an ASAN target's
+        hard_rss_limit_mb is enforced by a runtime thread that does
+        not survive AFL++'s per-case forkserver fork(), so ASAN
+        campaigns are RSS-bounded only best-effort either way. The
+        containment backstop is the sandbox the campaign runs under,
+        not this probe (memory bounding there: declared cgroup
+        memory.max follow-up — the sandbox rlimit default keeps
+        RLIMIT_AS off as the ASAN concession).
+
+        Failure direction: any probe miss (exec failure/timeout,
+        nonzero rc, empty output) treats the target as UNsanitized
+        and the RLIMIT_AS -m cap stays ON — an over-capped ASAN
+        target then dies loudly at calibration (visible, diagnosable,
+        overridable), whereas dropping the cap on probe failure would
+        leave a runaway target unbounded silently.
+        """
+        result = _inspect_binary("strings", (), self.binary, timeout=60)
+        if result.returncode != 0 or not result.stdout.strip():
+            # Full probe-miss matrix, all loud + fail-toward-bounded:
+            # exec failure / timeout (returncode None), nonzero rc,
+            # and rc==0-with-empty-stdout all land here. Distrusting
+            # a partial strings run beats letting it steer the cap
+            # off.
+            logger.warning(
+                "strings %s failed, timed out, or produced no usable "
+                "output — assuming no ASAN; the AFL -m memory cap "
+                "stays on (an ASAN target will die at calibration: "
+                "pass `-m none` in extra AFL flags "
+                "to override)",
+                self.binary,
+            )
+            return False
+        return self._has_runtime_sanitizer(result.stdout.lower(), "asan")
+
     @staticmethod
     def _has_runtime_sanitizer(strings_output: str, sanitizer: str) -> bool:
         """Detect real sanitizer runtime linkage without AFL helper false positives."""
@@ -721,12 +845,12 @@ class AFLRunner:
             )
             weak_only = ("__asan_region_is_poisoned",)
         elif sanitizer == "ubsan":
-            strong_markers = (
+            strong_markers = (  # type: ignore[assignment]
                 "__ubsan_handle_",
                 "undefinedbehaviorsanitizer",
                 "ubsan_options",
             )
-            weak_only = ()
+            weak_only = ()  # type: ignore[assignment]
         else:
             return False
 
@@ -814,6 +938,19 @@ class AFLRunner:
 
         if self.recompile_guide:
             self.show_recompile_guide()
+
+        # Memory-cap mode resolution: AFL++ implements -m via
+        # RLIMIT_AS, which no ASAN target survives (the shadow-memory
+        # VA reservation alone exceeds any sane cap — same concession
+        # as memory_mb=0 in the sandbox rlimit defaults). ASAN targets
+        # take the cap as ASAN_OPTIONS hard_rss_limit_mb instead (set
+        # on afl_env below); everything else gets a plain -m.
+        # The ASAN-side bound is best-effort only: hard_rss_limit_mb
+        # is enforced by a runtime thread started at __asan_init, and
+        # threads do not survive the forkserver fork() each fuzz case
+        # runs under — the sandbox is the adversarial backstop.
+        self._target_has_asan = (
+            self.mem_limit_mb > 0 and self._detect_target_asan())
 
         # Start AFL instances — each one a blocking `core.sandbox.run`
         # on a supervising thread (see _SandboxedAFLInstance). Landlock
@@ -904,6 +1041,24 @@ class AFLRunner:
                 afl_env.setdefault("AFL_NO_AFFINITY", "1")
                 afl_env.setdefault("AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES", "1")
                 afl_env.setdefault("AFL_FORKSRV_INIT_TMOUT", "10000")
+                if self.mem_limit_mb > 0 and self._target_has_asan:
+                    # ASAN-side memory cap (see the mode resolution in
+                    # run_fuzzing: -m is RLIMIT_AS-based and would kill
+                    # the ASAN target at startup, hard_rss_limit_mb is
+                    # the RSS bound its runtime enforces itself —
+                    # best-effort under the forkserver, see run_fuzzing).
+                    # abort_on_error=1 and symbolize=0 are MANDATORY
+                    # companions: afl-fuzz FATALs on an ASAN_OPTIONS
+                    # that lacks them (it needs abort() for crash
+                    # detection and unsymbolized output for speed).
+                    # setdefault: get_safe_env strips ASAN_OPTIONS from
+                    # the inherited env, so an existing value can only
+                    # come from RAPTOR code that set it deliberately.
+                    afl_env.setdefault(
+                        "ASAN_OPTIONS",
+                        "abort_on_error=1:symbolize=0:"
+                        f"hard_rss_limit_mb={self.mem_limit_mb}",
+                    )
                 if self._binary_only_support_dir:
                     # afl-fuzz resolves its binary-only tracer via
                     # AFL_PATH when it is not adjacent to the afl-fuzz
@@ -919,7 +1074,15 @@ class AFLRunner:
 
                 stdout_path = log_dir / f"{instance_name}.stdout.log"
                 stderr_path = log_dir / f"{instance_name}.stderr.log"
-                (log_dir / f"{instance_name}.cmdline").write_text(" ".join(cmd) + "\n", encoding="utf-8")
+                # Exclusive create (see _SandboxedAFLInstance._run):
+                # by the time a secondary instance's records are
+                # written the master's sandboxed child is already
+                # live with write on this directory.
+                write_new_text(
+                    log_dir / f"{instance_name}.cmdline",
+                    " ".join(cmd) + "\n",
+                    replace=True,
+                )
 
                 instance = _SandboxedAFLInstance(
                     name=instance_name,
@@ -1004,7 +1167,7 @@ class AFLRunner:
                     else:
                         logger.info("Status: %.0fs elapsed (no stats available yet)", elapsed)
 
-                    last_status_time = current_time
+                    last_status_time = current_time  # type: ignore[assignment]
 
                 # Check if all instances are still running
                 running_instances = []
@@ -1126,8 +1289,8 @@ class AFLRunner:
             logger.info("=" * 70)
 
             if self.telemetry:
-                max_crash_execs = self._max_crash_execs(
-                    self.output_dir / "main" / "crashes"
+                max_crash_execs = self._max_crash_execs_all(
+                    self.output_dir
                 )
                 self.telemetry.update_stats(
                     total_executions=max(
@@ -1161,14 +1324,36 @@ class AFLRunner:
         return total_crashes, crashes_dir
 
     def _collect_all_crash_files(self) -> list[Path]:
-        """Collect crash files from main and all secondary instance directories."""
+        """Collect crash files from main and all secondary instance directories.
+
+        lstat-honest at every component below ``output_dir``: the
+        instance dirs and their ``crashes/`` contents sit inside the
+        sandboxed (attacker-built) target's write grant, while the
+        merge that consumes this list runs UNSANDBOXED after the
+        campaign with the full host filesystem view. A planted
+        symlink — at an instance dir, at a ``crashes`` dir, or at an
+        ``id:`` entry — would make the merge read (and so launder into
+        a REGULAR merged file) host files the campaign's mount
+        namespace never exposed to the target; every downstream
+        defense keyed on symlink-ness then passes on the copy.
+        """
         crash_files: list[Path] = []
         for sub in sorted(self.output_dir.iterdir()):
+            if sub.is_symlink() or not sub.is_dir():
+                continue
             crashes_dir = sub / "crashes"
-            if sub.is_dir() and crashes_dir.is_dir():
-                crash_files.extend(
-                    f for f in crashes_dir.iterdir() if f.name.startswith("id:")
-                )
+            if crashes_dir.is_symlink() or not crashes_dir.is_dir():
+                continue
+            for f in sorted(crashes_dir.iterdir()):
+                if not f.name.startswith("id:"):
+                    continue
+                if f.is_symlink() or not f.is_file():
+                    logger.warning(
+                        "crash merge: refusing non-regular crash entry %s",
+                        sanitise_for_terminal(str(f)),
+                    )
+                    continue
+                crash_files.append(f)
         return sorted(crash_files)
 
     def _merge_crash_files(self, crash_files: list[Path]) -> Path | None:
@@ -1198,24 +1383,78 @@ class AFLRunner:
         for f in crash_files:
             instance = f.parent.parent.name
             dest = merged / f"{f.name},instance:{instance}"
-            if dest.exists():
-                continue
+            # lstat, not exists(): merged_crashes sits inside the
+            # sandboxed (attacker-built) target's write grant, and a
+            # planted DANGLING symlink passes exists() == False — the
+            # copy fallback would then create the symlink's target at
+            # an attacker-chosen path. Anything already occupying the
+            # name, dangling links included, is skipped.
             try:
-                dest.hardlink_to(f)
-            except OSError:
-                shutil.copy2(f, dest)
+                dest.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                continue
+            # Source leg is fd-honest: ``hardlink_to``/``os.link``
+            # FOLLOW a source symlink, and a by-name ``open("rb")``
+            # does too — either launders a target-planted
+            # ``id:… -> <host file>`` into a REGULAR merged file. No
+            # hardlink fast path can be made swap-honest, so every
+            # merge goes through ``open_regular`` (O_NOFOLLOW +
+            # fstat(S_ISREG) on the OPENED fd, non-blocking so a
+            # planted FIFO cannot wedge the merge) into an
+            # exclusive-create destination. A plant swapped in
+            # between the enumeration's check and this open is
+            # refused here, not at the earlier by-name check.
+            src_fh = open_regular(f, "rb")
+            if src_fh is None:
+                logger.warning(
+                    "crash merge: refusing non-regular crash source %s",
+                    sanitise_for_terminal(str(f)),
+                )
+                continue
+            # Destination-side plant landing inside the lstat→create
+            # window makes open_exclusive_artifact raise
+            # (FileExistsError) — failing the merge loudly is the
+            # chosen behaviour: an active mid-merge attacker is a
+            # bigger finding than a lost merge.
+            with os.fdopen(
+                open_exclusive_artifact(dest), "wb",
+            ) as out_fh, src_fh:
+                shutil.copyfileobj(src_fh, out_fh)
+                out_fh.flush()
+                # The copy must carry the crash's timestamps — triage
+                # orders crashes by mtime. Metadata rides from the
+                # already-OPEN source fd onto the destination fd (a
+                # by-name copystat would follow a symlink swapped in
+                # after the fd-honest open). Best-effort: metadata
+                # loss never fails the merge.
+                with contextlib.suppress(OSError):
+                    st = os.fstat(src_fh.fileno())
+                    os.utime(
+                        out_fh.fileno(),
+                        ns=(st.st_atime_ns, st.st_mtime_ns),
+                    )
         return merged
 
     @staticmethod
     def _tail_file(path: Path, max_bytes: int = 4096) -> str:
+        # Seek-tail, never read-then-slice: the file is target-
+        # writable and can be arbitrarily large — materialising it
+        # whole for a 4 KiB tail is a memory sink (same idiom as
+        # LibFuzzerRunner._read_log_tail).
         try:
-            data = path.read_bytes()
+            with path.open("rb") as fh:
+                size = os.fstat(fh.fileno()).st_size
+                if size > max_bytes:
+                    fh.seek(size - max_bytes)
+                data = fh.read(max_bytes)
         except OSError:
             return ""
         # Tails are target/afl output relayed to the operator's
         # terminal — strip escape-injection vectors at this boundary.
         return strip_terminal_controls(
-            data[-max_bytes:].decode(errors="replace")
+            data.decode(errors="replace")
         ).strip()
 
     @staticmethod
@@ -1305,16 +1544,32 @@ class AFLRunner:
     @staticmethod
     def _max_crash_execs(crashes_dir: Path) -> int:
         """Use AFL crash filenames as lower-bound exec count when stats lag."""
-        if not crashes_dir.exists():
-            return 0
         max_execs = 0
-        for path in crashes_dir.iterdir():
+        try:
+            entries = list(crashes_dir.iterdir())
+        except OSError:
+            return 0
+        for path in entries:
             if not path.is_file() or not path.name.startswith("id:"):
                 continue
             match = _AFL_CRASH_EXECS_RE.search(path.name)
             if match:
                 max_execs = max(max_execs, int(match.group(1)))
         return max_execs
+
+    @classmethod
+    def _max_crash_execs_all(cls, output_dir: Path) -> int:
+        """Exec lower bound across ALL instance crash dirs — secondary
+        crashes count in the campaign totals, so a secondary's exec
+        metadata must reach telemetry's lower bound too, not just
+        main's."""
+        try:
+            crash_dirs = sorted(output_dir.glob("*/crashes"))
+        except OSError:
+            return 0
+        return max(
+            (cls._max_crash_execs(d) for d in crash_dirs), default=0,
+        )
 
     def _build_afl_command(
         self,
@@ -1334,6 +1589,11 @@ class AFLRunner:
           -d                   deterministic mutations off (faster startup)
           -X <mutator.so>      custom mutator library
           -x <dict>            dictionary for structured input
+          -m <MB> / -m none    per-exec memory cap (RLIMIT_AS; "none"
+                               for ASAN targets, whose cap moves to
+                               ASAN_OPTIONS hard_rss_limit_mb; bounds
+                               the common runaway-allocation case,
+                               not an adversarial boundary)
           -V <seconds>         self-terminate after the campaign duration
                                (the campaign runs as a blocking sandboxed
                                call — -V is its primary clock; the sandbox
@@ -1408,7 +1668,20 @@ class AFLRunner:
         if self.dict_path and self.dict_path.exists():
             cmd.extend(["-x", str(self.dict_path)])
 
+        # Per-exec memory cap for the fuzzed target (default rationale
+        # on the mem_limit_mb class attribute). AFL++'s -m is
+        # RLIMIT_AS-based, which no ASAN target survives — for those
+        # the cap rides ASAN_OPTIONS hard_rss_limit_mb (run_fuzzing)
+        # and -m is pinned to "none" explicitly so the command line
+        # documents the decision (and stays correct if AFL's default
+        # ever changes).
+        if self.mem_limit_mb > 0:
+            cmd.extend(["-m", "none" if self._target_has_asan
+                        else str(self.mem_limit_mb)])
+
         # Optional SAGE-derived or operator-supplied AFL++ flags (before ``--``).
+        # AFTER the -m default above: afl-fuzz getopt takes the LAST
+        # occurrence of a flag, so an operator -m here wins.
         if self.extra_afl_flags:
             cmd.extend(self.extra_afl_flags)
 
@@ -1430,22 +1703,26 @@ class AFLRunner:
     def get_stats(self) -> dict:
         """Get fuzzing statistics from AFL."""
         stats_file = self.output_dir / "main" / "fuzzer_stats"
-        stats = {}
+        stats: dict[str, str] = {}
         try:
-            with open(stats_file, encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    if ":" in line:
-                        key, value = line.strip().split(":", 1)
-                        # fuzzer_stats lives in the target-writable
-                        # output dir and its values are logged to the
-                        # operator's terminal — strip control chars at
-                        # the parse chokepoint (numeric consumers are
-                        # unaffected).
-                        stats[strip_terminal_controls(key.strip())] = (
-                            strip_terminal_controls(value.strip())
-                        )
-        except FileNotFoundError:
-            pass
+            # Byte-capped read: the file is target-writable, and one
+            # giant line would materialise whole through per-line
+            # iteration. Real fuzzer_stats is ~30 short lines.
+            with open(stats_file, "rb") as f:
+                data = f.read(_MAX_STATS_BYTES)
+        except OSError:
+            return stats
+        for line in data.decode("utf-8", errors="replace").splitlines():
+            if ":" in line:
+                key, value = line.strip().split(":", 1)
+                # fuzzer_stats lives in the target-writable
+                # output dir and its values are logged to the
+                # operator's terminal — strip control chars at
+                # the parse chokepoint (numeric consumers are
+                # unaffected).
+                stats[strip_terminal_controls(key.strip())] = (
+                    strip_terminal_controls(value.strip())
+                )
         return stats
 
     def run_showmap(self) -> dict:
@@ -1547,29 +1824,47 @@ class AFLRunner:
             extra = {}
             if self.sandbox_rootfs is not None:
                 extra["rootfs"] = str(self.sandbox_rootfs)
-            result = _sandbox_run(
-                showmap_cmd,
-                block_network=True,
-                target=str(self.output_dir),
-                output=str(self.output_dir),
-                readable_paths=readable_paths,
-                capture_output=True,
-                text=True,
-                cwd=str(self.output_dir),
-                env=env,
-                timeout=300,
-                sanitise_host_fingerprint=True,
-                **extra,
-            )
+            # Console streams go to a file, never an in-memory PIPE:
+            # the showmap child replays the (attacker-built) target,
+            # which inherits stderr and can flood it without limit.
+            # Both streams share one log — the summary banner sits at
+            # the end of the output, so a bounded tail is all the
+            # parser needs.
+            console_log = self.output_dir / "showmap-console.log"
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            # Exclusive create: the campaign's (attacker-built)
+            # target just ran with write on output_dir and can have
+            # left a symlink/FIFO at this predictable name — a bare
+            # "wb" open would follow / block on it.
+            with os.fdopen(
+                open_exclusive_artifact(console_log, replace=True), "wb",
+            ) as con_fh:
+                _sandbox_run(
+                    showmap_cmd,
+                    block_network=True,
+                    target=str(self.output_dir),
+                    output=str(self.output_dir),
+                    readable_paths=readable_paths,
+                    stdout=con_fh,
+                    stderr=con_fh,
+                    cwd=str(self.output_dir),
+                    env=env,
+                    timeout=300,
+                    sanitise_host_fingerprint=True,
+                    **extra,  # type: ignore[arg-type]
+                )
 
-            coverage = self._parse_showmap_output(
-                map_file,
-                (result.stdout or "") + "\n" + (result.stderr or ""),
-            )
+            console = self._tail_file(
+                self.output_dir / "showmap-console.log",
+                max_bytes=_SHOWMAP_CONSOLE_TAIL_BYTES)
+            coverage = self._parse_showmap_output(map_file, console)
             if coverage:
                 logger.info("Coverage analysis complete")
                 return coverage
-            logger.warning("afl-showmap failed: %s", result.stderr)
+            logger.warning(
+                "afl-showmap failed: %s",
+                self._tail_file(console_log, max_bytes=4096),
+            )
             return {}
 
         except SandboxSetupError:
@@ -1600,13 +1895,25 @@ class AFLRunner:
             coverage["inputs_processed"] = match.group(4)
             return coverage
         try:
-            edge_lines = [
-                line for line in map_file.read_text(
-                    encoding="utf-8", errors="replace").splitlines()
-                if _SHOWMAP_EDGE_RE.match(line)
-            ]
+            # Byte-capped read: the map lands in the target-writable
+            # output dir. A real union edge map is at most a few MB
+            # (one short line per edge); anything over the cap is a
+            # planted file — skip it loudly rather than count it.
+            with map_file.open(encoding="utf-8", errors="replace") as fh:
+                text = fh.read(_MAX_SHOWMAP_MAP_BYTES + 1)
         except OSError:
             return coverage
-        if edge_lines:
-            coverage["edges_covered"] = str(len(edge_lines))
+        if len(text) > _MAX_SHOWMAP_MAP_BYTES:
+            logger.warning(
+                "afl-showmap map %s exceeds the %d-byte cap "
+                "(target-writable file) — skipping the edge count",
+                map_file, _MAX_SHOWMAP_MAP_BYTES,
+            )
+            return coverage
+        edge_count = sum(
+            1 for line in text.splitlines()
+            if _SHOWMAP_EDGE_RE.match(line)
+        )
+        if edge_count:
+            coverage["edges_covered"] = str(edge_count)
         return coverage

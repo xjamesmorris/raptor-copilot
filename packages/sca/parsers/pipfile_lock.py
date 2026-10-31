@@ -30,10 +30,11 @@ from __future__ import annotations
 
 import json as _json
 import logging
-import re
 from typing import Any, TYPE_CHECKING
 
 from ..models import Confidence, Dependency, PinStyle
+from ..naming import pep503_name
+from ._base import PARSE_ESCAPE_ERRORS, build_purl, lockfile_confidence
 from . import _safe_read, register
 
 if TYPE_CHECKING:
@@ -59,7 +60,7 @@ def parse(path: Path) -> list[Dependency]:
 
     try:
         data = _json.loads(text)
-    except _json.JSONDecodeError as e:
+    except (_json.JSONDecodeError, *PARSE_ESCAPE_ERRORS) as e:  # type: ignore[misc]  # hostile-input escape classes
         logger.warning(
             "sca.parsers.pipfile_lock: JSON parse failed for %s: %s", path, e
         )
@@ -113,14 +114,14 @@ def _build_dep(
 
     return Dependency(
         ecosystem=ECOSYSTEM,
-        name=_normalise_name(name),
+        name=pep503_name(name),
         version=version,
         declared_in=path,
         scope=scope,
         is_lockfile=True,
         pin_style=pin_style,
         direct=False,
-        purl=_build_purl(name, version),
+        purl=build_purl("pypi", pep503_name(name), version),
         parser_confidence=_confidence(pin_style, version),
     )
 
@@ -134,34 +135,15 @@ def _strip_eq(value: Any) -> str | None:
     return v or None
 
 
-def _normalise_name(name: str) -> str:
-    return re.sub(r"[-_.]+", "-", name).lower()
-
-
-def _build_purl(name: str, version: str | None) -> str:
-    base = f"pkg:pypi/{_normalise_name(name)}"
-    if version:
-        return f"{base}@{version}"
-    return base
-
 
 def _confidence(pin_style: PinStyle, version: str | None) -> Confidence:
-    if pin_style is PinStyle.GIT:
-        return Confidence(
-            "medium",
-            reason="Pipfile.lock git source; ref recorded as version",
-        )
-    if pin_style is PinStyle.PATH:
-        return Confidence(
-            "medium",
-            reason="Pipfile.lock path/file source; no version",
-        )
-    if version is None:
-        return Confidence(
-            "low",
-            reason="Pipfile.lock entry without version",
-        )
-    return Confidence("high", reason="Pipfile.lock resolved entry")
+    return lockfile_confidence(
+        pin_style, version,
+        git_reason="Pipfile.lock git source; ref recorded as version",
+        path_reason="Pipfile.lock path/file source; no version",
+        unversioned_reason="Pipfile.lock entry without version",
+        resolved_reason="Pipfile.lock resolved entry",
+    )
 
 
 register(filenames=["Pipfile.lock"])(parse)

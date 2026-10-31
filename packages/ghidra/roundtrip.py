@@ -12,6 +12,8 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from core.run.finding_status import read_verdict
+
 logger = logging.getLogger(__name__)
 
 
@@ -63,8 +65,16 @@ def redb_cache_candidates(gpr_path: Path) -> List[Path]:
             )
     except Exception:  # noqa: BLE001
         logger.debug("failed to resolve project for redb cache candidates", exc_info=True)
+    # Configured out base, NOT the process CWD: a caller launched
+    # outside the repo root silently missed the cache (context
+    # injection disabled) from a bare Path("out").
+    try:
+        from core.config import RaptorConfig
+        out_base = RaptorConfig.get_out_dir()
+    except Exception:  # noqa: BLE001 — probe fallback only
+        out_base = Path("out")
     candidates.append(
-        Path(f"out/ghidra-import-{gpr_path.stem}") / "re-database.json")
+        out_base / f"ghidra-import-{gpr_path.stem}" / "re-database.json")
     return candidates
 
 
@@ -149,22 +159,12 @@ def _apply_findings(
 
     @contextlib.contextmanager
     def _slot_lock():
-        try:
-            import fcntl
-            import os as _os
-            fd = _os.open(str(export_dir / ".lock"),
-                          _os.O_WRONLY | _os.O_CREAT, 0o600)
-        except (ImportError, OSError):
+        from core.atomic_fs.fs_lock import sidecar_flock
+
+        with sidecar_flock(
+            export_dir / ".lock", subject="Ghidra export slot",
+        ):
             yield
-            return
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            yield
-        finally:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            finally:
-                _os.close(fd)
 
     with _slot_lock(), GhidraBridge(gpr_path) as bridge:
         out_gpr = bridge.export_enrichments(
@@ -202,9 +202,18 @@ def collect_agentic_findings(
             # degrade like a null analysis, not crash the collector
             # before healthy records are gathered.
             analysis = {}
-        tp = r.get("is_true_positive",
-                   analysis.get("is_true_positive"))
-        if tp and (r.get("is_exploitable") or r.get("exploitable")):
+        # Tri-state reads: only genuine True verdicts export — a
+        # junk shape in this operator-supplied JSON is a non-verdict,
+        # not an exploitable claim. The result-level field wins over
+        # the nested analysis copy when both carry a real verdict.
+        # The legacy ``exploitable`` alias follows the same
+        # genuine-bool rule (agentic_passes precedent): a truthy read
+        # exported junk strings like "no" as exploitable.
+        tp = read_verdict(r, "is_true_positive")
+        if tp is None:
+            tp = read_verdict(analysis, "is_true_positive")
+        if tp is True and (read_verdict(r, "is_exploitable") is True
+                           or r.get("exploitable") is True):
             exploitable.append(r)
 
     findings = []

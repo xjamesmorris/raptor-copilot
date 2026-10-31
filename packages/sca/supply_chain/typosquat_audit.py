@@ -41,6 +41,7 @@ from typing import NamedTuple
 from core.http import HttpClient
 from core.json import load_json_bounded
 from core.http.urllib_backend import UrllibClient
+from core.logging import configure_cli_logging
 
 from ..refresh_typosquat_lists import (
     _DEFAULT_TOP_N,
@@ -214,6 +215,21 @@ def audit(
     return results
 
 
+def _md_escape(name: str) -> str:
+    """Neutralise the characters that would break out of the
+    backtick-wrapped table cell in the auto-PR body.  Candidate names
+    come from the popularity feeds — remote input — so they must not
+    be able to inject markdown / table structure into the PR."""
+    escaped = (name.replace("`", "\\`")
+                   .replace("|", "\\|")
+                   .replace("\n", " ")
+                   .replace("\r", " "))
+    # Remote-feed names can carry control bytes too — match the
+    # sibling _md_escape chokepoints' escape_nonprintable grade.
+    from core.security.log_sanitisation import escape_nonprintable
+    return escape_nonprintable(escaped)
+
+
 def render_markdown(results: dict[str, list[Candidate]]) -> str:
     """Markdown for the refresh PR body. Returns ``""`` when nothing is pending
     (so the workflow can skip the nudge entirely)."""
@@ -239,8 +255,10 @@ def render_markdown(results: dict[str, list[Candidate]]) -> str:
         lines.append("")
         lines.append("| candidate | rank | near-twin | twin rank | dist |")
         lines.append("|---|--:|---|--:|--:|")
-        lines.extend(f"| `{c.name}` | {c.rank} | `{c.near_twin}` "
-                f"| {c.twin_rank} | {c.distance} |" for c in cands)
+        lines.extend(
+            f"| `{_md_escape(c.name)}` | {c.rank} "
+            f"| `{_md_escape(c.near_twin)}` "
+            f"| {c.twin_rank} | {c.distance} |" for c in cands)
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
@@ -287,7 +305,7 @@ def run_llm_triage(
     review queues for the human. Falls back to the list when no LLM is set."""
     from core.json import JsonCache
 
-    from .. import SCA_CACHE_ROOT, default_client
+    from .. import sca_cache_root, default_client
     from ..llm import get_llm_client
     from .typosquat_triage import (
         Disposition,
@@ -306,7 +324,7 @@ def run_llm_triage(
         # Duck-typed probe: client doubles may lack the config chain.
         pass
     http = default_client()
-    cache = JsonCache(root=SCA_CACHE_ROOT)
+    cache = JsonCache(root=sca_cache_root())
     clients = _registry_clients(http, cache)
     auto: list[str] = []
     confirm: list[str] = []
@@ -386,7 +404,7 @@ def run_reaudit(reviewed_legit_path: Path, *, use_llm: bool = False) -> str:
     nothing is flagged)."""
     from core.json import JsonCache
 
-    from .. import SCA_CACHE_ROOT, default_client
+    from .. import sca_cache_root, default_client
     from .typosquat_triage import (
         collect_evidence_rich,
         make_llm_verdict_fn,
@@ -395,7 +413,7 @@ def run_reaudit(reviewed_legit_path: Path, *, use_llm: bool = False) -> str:
         reaudit_reviewed_legit,
     )
     http = default_client()
-    cache = JsonCache(root=SCA_CACHE_ROOT)
+    cache = JsonCache(root=sca_cache_root())
     clients = _registry_clients(http, cache)
 
     def _gm(eco, name):
@@ -432,7 +450,7 @@ def run_reaudit(reviewed_legit_path: Path, *, use_llm: bool = False) -> str:
             cand = Candidate(name=name, near_twin=twin, rank=0, twin_rank=0,
                              distance=1)
             ev = collect_evidence_rich(cand, _eco, http,
-                                       _client.get_metadata if _client else None)
+                                       _client.get_metadata if _client else None)  # type: ignore[arg-type]
             verdict = _vfn(cand, ev)
             return (name, reason, verdict,
                     reaudit_recommendation(reason, verdict))
@@ -480,9 +498,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("-v", "--verbose", action="count", default=0)
     args = p.parse_args(argv if argv is not None else sys.argv[1:])
 
-    logging.basicConfig(
-        level=logging.WARNING - 10 * min(args.verbose, 2),
-        format="%(levelname)s %(name)s: %(message)s")
+    # Escaping console formatter — see core.logging.configure_cli_logging.
+    configure_cli_logging(logging.WARNING - 10 * min(args.verbose, 2))
 
     if args.reaudit:
         # Re-audit re-checks the reviewed-legit list, not the candidate feeds,

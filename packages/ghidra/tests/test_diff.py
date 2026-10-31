@@ -355,3 +355,33 @@ class TestFunctionChange:
         assert d["signature_old"] == "void f()"
         assert d["signature_new"] == "int f(int)"
         assert d["decompilation_changed"] is True
+
+
+class TestWriteJsonAtomic:
+    def test_write_json_routes_through_save_json(self, tmp_path):
+        """version-diff.json is read back by later runs
+        (diff_priority._find_version_diff) — the write must go
+        through the atomic save_json chokepoint, never a
+        truncate-in-place open('w')."""
+        from unittest.mock import patch
+
+        import core.json as core_json
+
+        real_save = core_json.save_json
+        calls = []
+
+        def spy(path, data, *args, **kwargs):
+            calls.append(path)
+            return real_save(path, data, *args, **kwargs)
+
+        diff = diff_databases(
+            _make_db([_make_func("f", 0x1000, 100)]),
+            _make_db([_make_func("f", 0x1000, 200)]),
+        )
+        out = tmp_path / "version-diff.json"
+        with patch.object(core_json, "save_json", side_effect=spy):
+            diff.write_json(out)
+
+        assert out in calls
+        data = json.loads(out.read_text())
+        assert len(data["changed"]) == 1

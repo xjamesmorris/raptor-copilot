@@ -135,6 +135,39 @@ class TestLoadVariantCandidates:
         )
         assert len(cands) == MAX_VARIANT_REVIEWS_PER_RUN
 
+    def test_matches_read_is_byte_bounded(self, tmp_path, monkeypatch):
+        """checker-matches.jsonl lives in the run dir, which is
+        target-writable during dynamic phases — the read pays a byte
+        budget (uncapped, a planted multi-GB file materialised twice:
+        text + splitlines). Records past the budget are dropped."""
+        import packages.llm_analysis.checker_followup as cf
+
+        first = _record(line=20, function="parse_header")
+        filler = _record(rationale="y" * 4096)
+        after = _record(line=50, function="parse_body")
+        _write_matches(tmp_path, [first, filler, after])
+        budget = len(json.dumps(first)) + 64
+        monkeypatch.setattr(cf, "_MAX_MATCHES_BYTES", budget)
+        cands = load_variant_candidates(
+            tmp_path, checklist=_checklist(), repo_root=tmp_path,
+        )
+        # Only the in-budget record survives; the truncated filler and
+        # everything after it are dropped, never crash the loader.
+        assert [c["metadata"]["name"] for c in cands] == ["parse_header"]
+
+    def test_matches_within_budget_read_whole(self, tmp_path):
+        # Two-direction: an ordinary-sized file loses nothing.
+        _write_matches(
+            tmp_path,
+            [_record(line=20), _record(line=50, function="parse_body")],
+        )
+        cands = load_variant_candidates(
+            tmp_path, checklist=_checklist(), repo_root=tmp_path,
+        )
+        assert {c["metadata"]["name"] for c in cands} == {
+            "parse_header", "parse_body",
+        }
+
     def test_duplicate_functions_collapse(self, tmp_path):
         _write_matches(tmp_path, [_record(line=15), _record(line=25)])
         cands = load_variant_candidates(
@@ -266,7 +299,7 @@ class TestReviewVariantMatches:
 
         captured = {}
 
-        def fake_analyze(vuln, extra_context_blocks=()):
+        def fake_analyze(vuln, extra_context_blocks=(), checklist=None):
             captured["vuln"] = vuln
             captured["blocks"] = extra_context_blocks
             vuln.exploitable = True
@@ -301,7 +334,7 @@ class TestReviewVariantMatches:
         agent = self._agent(tmp_path)
         _write_matches(agent.out_dir, [_record()])
 
-        def fake_analyze(vuln, extra_context_blocks=()):
+        def fake_analyze(vuln, extra_context_blocks=(), checklist=None):
             vuln.analysis = {"is_exploitable": False}
             return True
 
@@ -326,7 +359,7 @@ class TestReviewVariantMatches:
 
         calls = []
 
-        def flaky_analyze(vuln, extra_context_blocks=()):
+        def flaky_analyze(vuln, extra_context_blocks=(), checklist=None):
             calls.append(vuln.file_path)
             if len(calls) == 1:
                 raise RuntimeError("boom")

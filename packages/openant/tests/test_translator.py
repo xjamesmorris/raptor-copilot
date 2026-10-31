@@ -1,0 +1,541 @@
+"""Tests for OpenAnt → Raptor finding schema translator."""
+
+import sys
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parents[3]))  # repo root
+
+from packages.openant.translator import (
+    translate_pipeline_output,
+    deduplicate_with_sarif,
+    _compute_level,
+)
+
+
+def _finding(**kwargs) -> dict:
+    base = {
+        "id": "VULN-001",
+        "stage1_verdict": "vulnerable",
+        "stage2_verdict": "",
+        "location": {"file": "app/views.py", "function": "app/views.py:execute_query"},
+        "cwe_id": 89,
+        "cwe_name": "SQL Injection",
+        "description": "User input flows to SQL query",
+        "impact": "Remote attacker can read/write database",
+        "vulnerable_code": "cursor.execute(query % user_input)",
+    }
+    base.update(kwargs)
+    return base
+
+
+def _pipeline(findings=None) -> dict:
+    return {
+        "repository": {"name": "myapp", "language": "python"},
+        "findings": findings or [],
+    }
+
+
+class TestComputeLevel(unittest.TestCase):
+    def test_vulnerable_no_stage2(self):
+        self.assertEqual(_compute_level("vulnerable", {}), "warning")
+
+    def test_vulnerable_confirmed(self):
+        self.assertEqual(
+            _compute_level("vulnerable", {"stage2_verdict": "confirmed"}), "error"
+        )
+
+    def test_vulnerable_agreed(self):
+        self.assertEqual(
+            _compute_level("vulnerable", {"stage2_verdict": "agreed"}), "error"
+        )
+
+    def test_vulnerable_rejected(self):
+        self.assertEqual(
+            _compute_level("vulnerable", {"stage2_verdict": "rejected"}), "note"
+        )
+
+    def test_bypassable_no_stage2(self):
+        self.assertEqual(_compute_level("bypassable", {}), "note")
+
+    def test_safe_suppressed(self):
+        self.assertIsNone(_compute_level("safe", {}))
+
+    def test_protected_suppressed_to_note(self):
+        self.assertEqual(_compute_level("protected", {}), "note")
+
+    def test_inconclusive_note(self):
+        self.assertEqual(_compute_level("inconclusive", {}), "note")
+
+    def test_empty_verdict_kept_visible(self):
+        # A missing verdict must not behave like "safe" — kept at note.
+        self.assertEqual(_compute_level("", {}), "note")
+
+    def test_unknown_verdict_kept_visible(self):
+        # Schema drift (renamed verdict upstream) must not silently
+        # zero the run's findings — kept at note, warned with counts.
+        self.assertEqual(_compute_level("garbage", {}), "note")
+
+
+class TestTranslatePipelineOutput(unittest.TestCase):
+    def test_empty_input_returns_empty(self):
+        self.assertEqual(translate_pipeline_output({}), [])
+
+    def test_no_findings_returns_empty(self):
+        self.assertEqual(translate_pipeline_output(_pipeline([])), [])
+
+    def test_vulnerable_confirmed_gives_error(self):
+        f = _finding(stage1_verdict="vulnerable", stage2_verdict="confirmed")
+        results = translate_pipeline_output(_pipeline([f]))
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["level"], "error")
+        self.assertEqual(results[0]["tool"], "openant")
+
+    def test_safe_is_suppressed(self):
+        f = _finding(stage1_verdict="safe")
+        results = translate_pipeline_output(_pipeline([f]))
+        self.assertEqual(results, [])
+
+    def test_protected_included_as_note(self):
+        f = _finding(stage1_verdict="protected")
+        results = translate_pipeline_output(_pipeline([f]))
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["level"], "note")
+
+    def test_finding_id_uses_openant_id(self):
+        f = _finding(id="VULN-007")
+        results = translate_pipeline_output(_pipeline([f]))
+        self.assertEqual(results[0]["finding_id"], "openant:VULN-007")
+
+    def test_cwe_str_formatting(self):
+        f = _finding(cwe_id=78)
+        results = translate_pipeline_output(_pipeline([f]))
+        self.assertEqual(results[0]["cwe_id"], "CWE-78")
+        self.assertEqual(results[0]["rule_id"], "openant/CWE-78")
+
+    def test_file_propagated(self):
+        f = _finding(location={"file": "src/handler.py", "function": "src/handler.py:run"})
+        results = translate_pipeline_output(_pipeline([f]))
+        self.assertEqual(results[0]["file"], "src/handler.py")
+
+    def test_metadata_fields(self):
+        f = _finding(stage1_verdict="vulnerable", stage2_verdict="agreed")
+        results = translate_pipeline_output(_pipeline([f]))
+        meta = results[0]["metadata"]
+        self.assertEqual(meta["stage1_verdict"], "vulnerable")
+        self.assertEqual(meta["stage2_verdict"], "agreed")
+
+    def test_none_cwe_id(self):
+        f = _finding(cwe_id=None)
+        results = translate_pipeline_output(_pipeline([f]))
+        self.assertIsNone(results[0]["cwe_id"])
+        self.assertEqual(results[0]["rule_id"], "openant/unknown")
+
+    def test_multiple_findings(self):
+        findings = [
+            _finding(id="V-001", stage1_verdict="vulnerable"),
+            _finding(id="V-002", stage1_verdict="safe"),
+            _finding(id="V-003", stage1_verdict="bypassable"),
+        ]
+        results = translate_pipeline_output(_pipeline(findings))
+        self.assertEqual(len(results), 2)  # safe suppressed
+
+
+class TestDeduplicateWithSarif(unittest.TestCase):
+    def _raptor_finding(self, file, line, cwe):
+        return {"file": file, "startLine": line, "cwe_id": cwe, "tool": "semgrep"}
+
+    def _openant_finding(self, file, cwe):
+        return {"file": file, "cwe_id": cwe, "tool": "openant"}
+
+    def test_no_overlap_keeps_all(self):
+        sarif = [self._raptor_finding("a.py", 10, "CWE-89")]
+        oa = [self._openant_finding("b.py", "CWE-78")]
+        merged, dropped = deduplicate_with_sarif(oa, sarif)
+        self.assertEqual(dropped, 0)
+        self.assertEqual(len(merged), 2)
+
+    def test_same_file_same_cwe_drops_openant(self):
+        sarif = [self._raptor_finding("a.py", 10, "CWE-89")]
+        oa = [self._openant_finding("a.py", "CWE-89")]
+        merged, dropped = deduplicate_with_sarif(oa, sarif)
+        self.assertEqual(dropped, 1)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["tool"], "semgrep")
+
+    def test_different_cwe_keeps_both(self):
+        sarif = [self._raptor_finding("a.py", 10, "CWE-89")]
+        oa = [self._openant_finding("a.py", "CWE-78")]
+        merged, dropped = deduplicate_with_sarif(oa, sarif)
+        self.assertEqual(dropped, 0)
+        self.assertEqual(len(merged), 2)
+
+    def test_empty_openant(self):
+        sarif = [self._raptor_finding("a.py", 10, "CWE-89")]
+        merged, dropped = deduplicate_with_sarif([], sarif)
+        self.assertEqual(dropped, 0)
+        self.assertEqual(merged, sarif)
+
+    def test_empty_sarif(self):
+        oa = [self._openant_finding("a.py", "CWE-89")]
+        merged, dropped = deduplicate_with_sarif(oa, [])
+        self.assertEqual(dropped, 0)
+        self.assertEqual(len(merged), 1)
+
+
+class TestUnknownVerdictsStayVisible(unittest.TestCase):
+    """Only 'safe' suppresses. A verdict spelling the map does not
+    know (schema drift in a newer OpenAnt) must be kept at level=note
+    and warned — never silently dropped like 'safe'."""
+
+    def _pipeline(self, verdict):
+        return {"findings": [{
+            "id": "VULN-001",
+            "stage1_verdict": verdict,
+            "location": {"file": "a.py", "function": "f"},
+            "cwe_id": 78,
+            "description": "d",
+        }]}
+
+    def test_unknown_verdict_kept_at_note(self):
+        out = translate_pipeline_output(self._pipeline("exploitable_v2"))
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["level"], "note")
+
+    def test_missing_verdict_kept_at_note(self):
+        out = translate_pipeline_output(self._pipeline(""))
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["level"], "note")
+
+    def test_safe_still_suppresses(self):
+        out = translate_pipeline_output(self._pipeline("safe"))
+        self.assertEqual(out, [])
+
+    def test_known_verdicts_unchanged(self):
+        out = translate_pipeline_output(self._pipeline("vulnerable"))
+        self.assertEqual(out[0]["level"], "warning")
+
+
+class TestDedupKeyRelativisation(unittest.TestCase):
+    """SARIF findings carry absolute resolved URIs (CodeQL %SRCROOT%),
+    OpenAnt findings carry repo-relative paths — the dedup key must
+    relativise both sides or the join is vacuous (duplicates
+    double-reported)."""
+
+    def test_absolute_sarif_path_matches_relative_openant_path(self):
+        oa = [{"tool": "openant", "file": "src/app.py", "cwe_id": "CWE-78"}]
+        sarif = [{"tool": "codeql", "file": "/work/repo/src/app.py",
+                  "cwe_id": "CWE-78"}]
+        merged, dropped = deduplicate_with_sarif(oa, sarif,
+                                                 repo_path="/work/repo")
+        self.assertEqual(dropped, 1)
+        self.assertEqual([f["tool"] for f in merged], ["codeql"])
+
+    def test_outside_repo_sarif_path_never_matches(self):
+        oa = [{"tool": "openant", "file": "src/app.py", "cwe_id": "CWE-78"}]
+        sarif = [{"tool": "codeql", "file": "/elsewhere/src/app.py",
+                  "cwe_id": "CWE-78"}]
+        merged, dropped = deduplicate_with_sarif(oa, sarif,
+                                                 repo_path="/work/repo")
+        self.assertEqual(dropped, 0)
+        self.assertEqual(len(merged), 2)
+
+    def test_no_repo_path_keeps_relative_matching(self):
+        oa = [{"tool": "openant", "file": "src/app.py", "cwe_id": "CWE-78"}]
+        sarif = [{"tool": "codeql", "file": "src/app.py", "cwe_id": "CWE-78"}]
+        merged, dropped = deduplicate_with_sarif(oa, sarif)
+        self.assertEqual(dropped, 1)
+
+
+class TestDedupKeyUriNormalization(unittest.TestCase):
+    """CodeQL SARIF resolved against a file:// originalUriBaseIds base
+    (%SRCROOT% — the shape core/sarif's own tests model) keeps the
+    scheme in the finding's file field; the join must strip it (and
+    unquote percent-encoding) or the key populations never meet and
+    every CodeQL duplicate double-enters openant_findings.json and
+    /validate."""
+
+    def test_file_scheme_sarif_uri_matches_relative_openant_path(self):
+        oa = [{"tool": "openant", "file": "src/app.py", "cwe_id": "CWE-78"}]
+        sarif = [{"tool": "codeql",
+                  "file": "file:///work/repo/src/app.py",
+                  "cwe_id": "CWE-78"}]
+        merged, dropped = deduplicate_with_sarif(oa, sarif,
+                                                 repo_path="/work/repo")
+        self.assertEqual(dropped, 1)
+        self.assertEqual([f["tool"] for f in merged], ["codeql"])
+
+    def test_percent_encoded_sarif_uri_matches_decoded_path(self):
+        oa = [{"tool": "openant", "file": "src/my app.py",
+               "cwe_id": "CWE-78"}]
+        sarif = [{"tool": "codeql",
+                  "file": "file:///work/repo/src/my%20app.py",
+                  "cwe_id": "CWE-78"}]
+        merged, dropped = deduplicate_with_sarif(oa, sarif,
+                                                 repo_path="/work/repo")
+        self.assertEqual(dropped, 1)
+
+    def test_file_scheme_outside_repo_never_matches(self):
+        oa = [{"tool": "openant", "file": "src/app.py", "cwe_id": "CWE-78"}]
+        sarif = [{"tool": "codeql",
+                  "file": "file:///elsewhere/src/app.py",
+                  "cwe_id": "CWE-78"}]
+        merged, dropped = deduplicate_with_sarif(oa, sarif,
+                                                 repo_path="/work/repo")
+        self.assertEqual(dropped, 0)
+        self.assertEqual(len(merged), 2)
+
+    def test_dotdot_prefixed_name_is_inside_root(self):
+        """`..data/x.py` is a NAME, not a parent traversal — the old
+        startswith('..') test kept it absolute and then lstrip-mangled
+        it, voiding the join for that file both ways."""
+        from packages.openant.translator import _normalize_path
+        self.assertEqual(
+            _normalize_path("/repo/..data/x.py", Path("/repo")),
+            "..data/x.py")
+        oa = [{"tool": "openant", "file": "..data/x.py",
+               "cwe_id": "CWE-78"}]
+        sarif = [{"tool": "codeql", "file": "/repo/..data/x.py",
+                  "cwe_id": "CWE-78"}]
+        merged, dropped = deduplicate_with_sarif(oa, sarif,
+                                                 repo_path="/repo")
+        self.assertEqual(dropped, 1)
+
+    def test_genuine_parent_traversal_keeps_absolute_spelling(self):
+        """An outside-root path keeps its absolute spelling — the old
+        lstrip(os.sep) rewrote `/other/x.py` to `other/x.py`, a
+        manufactured collision with a genuinely relative name."""
+        from packages.openant.translator import _normalize_path
+        self.assertEqual(
+            _normalize_path("/other/x.py", Path("/repo")), "/other/x.py")
+
+
+class TestDedupKeyCweIntegrity(unittest.TestCase):
+    """The CWE half of the dedup key: missing CWEs must never join
+    (a ``""`` key is a wildcard bucket, loss direction), and the
+    OpenAnt side must canonicalise CWE spellings through the same
+    module the SARIF side uses."""
+
+    def test_cwe_less_findings_never_join(self):
+        oa = [{"tool": "openant", "file": "src/app.py", "cwe_id": None,
+               "message": "auth bypass"}]
+        sarif = [{"tool": "semgrep", "file": "src/app.py", "cwe_id": None,
+                  "message": "style nit"}]
+        merged, dropped = deduplicate_with_sarif(oa, sarif)
+        self.assertEqual(dropped, 0)
+        self.assertEqual(sorted(f["tool"] for f in merged),
+                         ["openant", "semgrep"])
+
+    def test_same_cwe_still_joins(self):
+        oa = [{"tool": "openant", "file": "src/app.py", "cwe_id": "CWE-78"}]
+        sarif = [{"tool": "semgrep", "file": "src/app.py",
+                  "cwe_id": "CWE-78"}]
+        merged, dropped = deduplicate_with_sarif(oa, sarif)
+        self.assertEqual(dropped, 1)
+
+    def test_string_shaped_cwe_id_canonicalised(self):
+        """LLM-shaped drift: cwe_id "CWE-78" minted CWE-CWE-78 /
+        openant/CWE-CWE-78 and voided the dedup join."""
+        out = translate_pipeline_output({"findings": [{
+            "id": "VULN-001",
+            "stage1_verdict": "vulnerable",
+            "location": {"file": "src/app.py", "function": "f"},
+            "cwe_id": "CWE-78",
+            "description": "d",
+        }]})
+        self.assertEqual(out[0]["cwe_id"], "CWE-78")
+        self.assertEqual(out[0]["rule_id"], "openant/CWE-78")
+        sarif = [{"tool": "semgrep", "file": "src/app.py",
+                  "cwe_id": "CWE-78"}]
+        merged, dropped = deduplicate_with_sarif(out, sarif)
+        self.assertEqual(dropped, 1)
+
+    def test_int_cwe_id_unchanged(self):
+        out = translate_pipeline_output({"findings": [{
+            "id": "VULN-001",
+            "stage1_verdict": "vulnerable",
+            "location": {"file": "src/app.py", "function": "f"},
+            "cwe_id": 78,
+            "description": "d",
+        }]})
+        self.assertEqual(out[0]["cwe_id"], "CWE-78")
+        self.assertEqual(out[0]["rule_id"], "openant/CWE-78")
+
+    def test_garbage_cwe_id_yields_unknown_rule(self):
+        out = translate_pipeline_output({"findings": [{
+            "id": "VULN-001",
+            "stage1_verdict": "vulnerable",
+            "location": {"file": "src/app.py", "function": "f"},
+            "cwe_id": "not-a-cwe",
+            "description": "d",
+        }]})
+        self.assertIsNone(out[0]["cwe_id"])
+        self.assertEqual(out[0]["rule_id"], "openant/unknown")
+
+
+class TestNeverRaisesOnShapeDrift(unittest.TestCase):
+    """The translator's never-raises contract must hold for shape
+    drift, not just value drift: the warn-not-refuse unpinned posture
+    makes drifted OpenAnt output an expected input, and under /agentic
+    a raising translator silently zeroed a paid run's findings behind
+    a blanket-except log line (with --openant-only the run then failed
+    with the WRONG reason)."""
+
+    def test_non_dict_pipeline_output_is_empty(self):
+        with self.assertLogs("raptor", level="WARNING"):
+            self.assertEqual(translate_pipeline_output(["oops"]), [])
+
+    def test_non_list_findings_is_empty(self):
+        with self.assertLogs("raptor", level="WARNING"):
+            self.assertEqual(
+                translate_pipeline_output({"findings": "abc"}), [])
+
+    def test_non_dict_entries_skipped_and_counted(self):
+        with self.assertLogs("raptor", level="WARNING") as cm:
+            out = translate_pipeline_output(
+                {"findings": ["oops", 42, None, {
+                    "id": "VULN-001",
+                    "stage1_verdict": "vulnerable",
+                    "location": {"file": "a.py", "function": "f"},
+                    "cwe_id": 78,
+                    "description": "d",
+                }]})
+        self.assertEqual(len(out), 1)
+        self.assertTrue(any("3 non-dict" in m for m in cm.output))
+
+    def test_non_dict_location_is_tolerated(self):
+        out = translate_pipeline_output({"findings": [{
+            "id": "VULN-001",
+            "stage1_verdict": "vulnerable",
+            "location": "nope",
+            "cwe_id": 78,
+            "description": "d",
+        }]})
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["file"], "")
+
+    def test_non_string_verdict_is_unknown_not_a_crash(self):
+        with self.assertLogs("raptor", level="WARNING"):
+            out = translate_pipeline_output({"findings": [{
+                "id": "VULN-001",
+                "stage1_verdict": 7,
+                "location": {"file": "a.py", "function": "f"},
+                "cwe_id": 78,
+                "description": "d",
+            }]})
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["level"], "note")
+
+    def test_dict_shaped_text_fields_coerced_empty(self):
+        out = translate_pipeline_output({"findings": [{
+            "id": {"e": 1},
+            "stage1_verdict": "vulnerable",
+            "stage2_verdict": {"e": 1},
+            "location": {"file": "a.py", "function": {"e": 1}},
+            "cwe_id": 78,
+            "description": {"e": 1},
+            "vulnerable_code": {"e": 1},
+            "name": {"e": 1},
+        }]})
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["snippet"], "")
+        self.assertEqual(out[0]["message"], "")
+        self.assertEqual(out[0]["metadata"]["vuln_name"], "")
+
+    def test_scalar_fields_stringified(self):
+        out = translate_pipeline_output({"findings": [{
+            "id": 12,
+            "stage1_verdict": "vulnerable",
+            "location": {"file": "a.py", "function": "f"},
+            "cwe_id": 78,
+            "description": "d",
+        }]})
+        self.assertEqual(out[0]["finding_id"], "openant:12")
+
+
+class TestMetadataCaps(unittest.TestCase):
+    """snippet/message were always capped; the metadata slots were
+    not — 100KB hostile-influenced impact/name/id fields flowed
+    verbatim into openant_findings.json and /validate's records."""
+
+    def test_hostile_long_fields_are_capped(self):
+        big = "A" * 100_000
+        out = translate_pipeline_output({"findings": [{
+            "id": big,
+            "stage1_verdict": "vulnerable",
+            "location": {"file": "a.py", "function": big},
+            "cwe_id": 78,
+            "description": big,
+            "impact": big,
+            "vulnerable_code": big,
+            "name": big,
+        }]})
+        self.assertEqual(len(out), 1)
+        f = out[0]
+        meta = f["metadata"]
+        self.assertLessEqual(len(f["snippet"]), 2000)
+        self.assertLessEqual(len(f["message"]), 4000)
+        self.assertLessEqual(len(meta["attack_vector"]), 4000)
+        self.assertLessEqual(len(meta["vuln_name"]), 500)
+        self.assertLessEqual(len(meta["function"]), 500)
+        self.assertLessEqual(len(meta["route_key"]), 500)
+        self.assertLessEqual(len(meta["openant_id"]), 200)
+        self.assertLessEqual(len(f["finding_id"]), 250)
+
+    def test_hostile_verdict_spellings_are_capped(self):
+        big = "V" * 100_000
+        with self.assertLogs("raptor", level="WARNING"):
+            out = translate_pipeline_output({"findings": [{
+                "id": "VULN-001",
+                "stage1_verdict": big,
+                "stage2_verdict": big,
+                "location": {"file": "a.py", "function": "f"},
+                "cwe_id": 78,
+                "description": "d",
+            }]})
+        meta = out[0]["metadata"]
+        self.assertLessEqual(len(meta["stage1_verdict"]), 200)
+        self.assertLessEqual(len(meta["stage2_verdict"]), 200)
+
+    def test_ordinary_fields_untouched(self):
+        out = translate_pipeline_output({"findings": [{
+            "id": "VULN-001",
+            "stage1_verdict": "vulnerable",
+            "location": {"file": "a.py", "function": "handler"},
+            "cwe_id": 78,
+            "description": "short description",
+            "impact": "short impact",
+            "name": "Command Injection",
+        }]})
+        meta = out[0]["metadata"]
+        self.assertEqual(meta["vuln_name"], "Command Injection")
+        self.assertEqual(meta["attack_vector"], "short impact")
+        self.assertEqual(meta["function"], "handler")
+
+
+class TestUnknownVerdictWarningBounded(unittest.TestCase):
+    """The drift warning interpolates hostile-influenced verdict
+    spellings — it must name a bounded sample, never every distinct
+    spelling."""
+
+    def test_sample_capped_at_five(self):
+        findings = [{
+            "id": f"VULN-{n:03d}",
+            "stage1_verdict": f"weird-verdict-{n}",
+            "location": {"file": "a.py", "function": "f"},
+            "cwe_id": 78,
+            "description": "d",
+        } for n in range(10)]
+        with self.assertLogs("raptor", level="WARNING") as cm:
+            out = translate_pipeline_output({"findings": findings})
+        self.assertEqual(len(out), 10)
+        drift = [m for m in cm.output if "schema drift" in m]
+        self.assertTrue(drift)
+        msg = drift[0]
+        named = sum(f"weird-verdict-{n}" in msg for n in range(10))
+        self.assertLessEqual(named, 5)
+        self.assertIn("more distinct spelling", msg)
+
+
+if __name__ == "__main__":
+    unittest.main()

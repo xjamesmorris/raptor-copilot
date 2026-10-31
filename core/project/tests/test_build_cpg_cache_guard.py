@@ -103,3 +103,39 @@ class TestNoProjectGuard:
         assert len(built) == 1
         # Cache lands in the project dir (the run dir's parent).
         assert built[0][1] == understand_dir.parent
+
+
+class TestTargetCorroboration:
+    """checklist.json is a mutable run artefact — the recovered
+    target_path must corroborate against the target sealed into
+    .raptor-run.json, or a tampered checklist steers joern-parse at an
+    arbitrary tree and poisons the project CPG cache."""
+
+    def test_tampered_checklist_refuses(self, cpg_cli, monkeypatch,
+                                        tmp_path: Path, capsys):
+        understand_dir = _make_understand_dir(tmp_path)
+        sealed_target = tmp_path / "sealed-src"
+        sealed_target.mkdir()
+        (understand_dir / ".raptor-run.json").write_text(
+            json.dumps({"target_path": str(sealed_target)}),
+            encoding="utf-8",
+        )
+        rc, built = _run_main(
+            cpg_cli, monkeypatch, understand_dir, is_project=True,
+        )
+        assert rc == 1
+        assert built == []
+        assert "does not match" in capsys.readouterr().err
+
+    def test_matching_sealed_target_builds(self, cpg_cli, monkeypatch,
+                                           tmp_path: Path):
+        understand_dir = _make_understand_dir(tmp_path)
+        (understand_dir / ".raptor-run.json").write_text(
+            json.dumps({"target_path": str(tmp_path / "src")}),
+            encoding="utf-8",
+        )
+        rc, built = _run_main(
+            cpg_cli, monkeypatch, understand_dir, is_project=True,
+        )
+        assert rc == 0
+        assert len(built) == 1

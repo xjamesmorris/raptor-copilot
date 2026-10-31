@@ -14,6 +14,7 @@ and ``OrchestratorConfig`` types to the substrate's ``SeedBug`` /
 from __future__ import annotations
 
 import logging
+import threading
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,6 +40,21 @@ MAX_ONDEMAND_SYNTHESIS_PER_RUN = 10
 # (observed: two consecutive 600s timeout kills on a 52-SLOC target).
 # Non-claudecode providers ignore the kwarg (SDK-timeout governed).
 SYNTHESIS_TIMEOUT_S = 1800
+
+_PREFILTER_PREFIX = "prefilter:"
+
+
+def _is_prefilter_sourced(evidence_tool: str) -> bool:
+    """True when every mechanical part of evidence_tool is a prefilter stamp.
+
+    The prefilter is a deterministic codebase-wide scanner — it already
+    found every instance of the pattern it knows.  Synthesising an
+    LLM-generated rule to re-discover the same pattern is redundant.
+    """
+    parts = [p.strip() for p in evidence_tool.split("+") if p.strip()]
+    if not parts:
+        return False
+    return all(p.startswith(_PREFILTER_PREFIX) for p in parts)
 
 
 @dataclass
@@ -139,22 +155,13 @@ def _hypothesis_self_classified_refuted(
     return all(_refuted(h) for h in entries)
 
 
-def _synthesis_class_cost(client: Any) -> float:
-    """Completed-call spend recorded for the checker_synthesis class.
-
-    The budget client is shared across audit phases, so deltas must be
-    read from the per-class history rather than ``total_cost`` (which
-    moves with every concurrent call class)."""
-    hist = getattr(client, "_call_cost_history", None) or {}
-    entry = hist.get("checker_synthesis")
-    return float(entry[1]) if entry else 0.0
-
-
 def _build_llm_callable(config: Any):
     """Build a ``packages.checker_synthesis.LLMCallable`` from /audit's
     LLM config. Returns ``(callable, client)`` or None when no LLM is
-    available. The caller reads ``client.total_cost`` after synthesis to
-    feed the cost back into the budget tracker."""
+    available. Spend is attributed per callable (each caller reads its
+    own ``cost_usd`` accumulator); the client rides along for identity
+    metadata (``model_name``), so sharing one client across callables
+    never double-counts."""
     try:
         from core.llm.task_types import TaskType
     except ImportError:
@@ -165,17 +172,63 @@ def _build_llm_callable(config: Any):
     # (pinned to the run's primary model) for library callers.
     client = getattr(config, "llm_budget_client", None)
     if client is None:
+        # One fresh client per CONFIG object, not per call: drain
+        # reaches synthesis once per backlog row against one shared
+        # config, and route bring-up (below) moves provider
+        # credentials out of the environment on the first call — a
+        # client rebuilt for row 2+ would resolve post-move and
+        # silently switch transport (or resolve no model at all).
+        client = getattr(config, "_synth_client_memo", None)
+    if client is None:
         try:
-            from core.llm.client import LLMClient
+            # Transcript seam: identical to LLMClient(...) with no
+            # session active.
+            from core.llm.transcript import build_llm_client
         except ImportError:
             return None
         model = None
         models = getattr(config, "models", None)
         if models and models[0] != "default":
             model = models[0]
-        client = LLMClient(pinned_model=model) if model else LLMClient()
+        try:
+            client = (build_llm_client(pinned_model=model) if model
+                      else build_llm_client())
+        except Exception as exc:  # noqa: BLE001 — unresolvable config is
+            # "no LLM available", not a per-row synthesis error: callers
+            # (drain's no-llm stop, the phase drivers) already own that
+            # verdict, and letting it raise here mislabels one transport
+            # fact as N row failures that burn retry attempts.
+            logger.warning("checker_synthesis: no LLM client: %s", exc)
+            return None
+        try:
+            config._synth_client_memo = client
+        except Exception:  # noqa: BLE001 — a config refusing attribute
+            # writes (frozen/slotted) keeps the per-call construction
+            # it always had; no such caller exists today.
+            pass
     if not hasattr(client, "generate_structured"):
         return None
+
+    # Dispatcher-only providers (Bedrock) need an in-process route.
+    # Pipeline runs already have one — from the parent launcher or the
+    # pipeline's own client bring-up (the gate no-ops on an existing
+    # socket) — but standalone entry points that reach synthesis
+    # directly — `raptor-audit backlog drain` — are
+    # their own parent and must bring it up here. Beside the client on
+    # purpose: bring-up moves provider credentials from the environment
+    # into the dispatcher's store, so a client resolved AFTER it may
+    # see no credentials at all — the client must exist first, the
+    # route second. Shared gate (never raises; no-op when a route
+    # exists or none is needed).
+    try:
+        from core.llm.dispatcher.lifecycle import ensure_route_for_client
+    except ImportError:  # no dispatcher machinery, no route to serve
+        pass
+    else:
+        ensure_route_for_client(
+            client, "checker-synthesis",
+            run_dir=getattr(config, "out_dir", None),
+        )
 
     # Persistent-auth fail-closed: the synthesis engine (packages.
     # checker_synthesis) catches exceptions around its LLM calls, so
@@ -185,6 +238,11 @@ def _build_llm_callable(config: Any):
     # rather than reporting refusal-shaped "no synthesis" as success.
     from core.llm.client import AuthFailureTracker
     auth_tracker = AuthFailureTracker("checker-synthesis")
+    # Per-callable spend accumulator: each phase driver builds its own
+    # callable, so summing THIS callable's per-call costs attributes
+    # spend exactly. (Reading the shared budget client's per-class
+    # history cross-attributed concurrent synthesis callers' spend.)
+    cost_lock = threading.Lock()
 
     def _call(prompt: str, schema: dict[str, Any], system_prompt: str):
         from core.security.prompt_framing import with_audit_framing
@@ -193,7 +251,7 @@ def _build_llm_callable(config: Any):
             # skip the network round trip; the phase driver raises.
             return None
         try:
-            data, _full = client.generate_structured(
+            resp = client.generate_structured(
                 prompt=prompt,
                 schema=schema,
                 # Audit-purpose framing at the audit boundary — the
@@ -210,6 +268,9 @@ def _build_llm_callable(config: Any):
                 # this call class before it completes.
                 timeout_s=SYNTHESIS_TIMEOUT_S,
             )
+            data, _raw = resp
+            with cost_lock:
+                _call.cost_usd += float(getattr(resp, "cost", 0.0) or 0.0)  # type: ignore[attr-defined]
             auth_tracker.note_success()
             return data
         except Exception as exc:  # noqa: BLE001 — any transport failure degrades to no-synthesis
@@ -217,7 +278,8 @@ def _build_llm_callable(config: Any):
             logger.debug("checker_synthesis LLM call failed: %s", exc)
             return None
 
-    _call.auth_tracker = auth_tracker
+    _call.auth_tracker = auth_tracker  # type: ignore[attr-defined]
+    _call.cost_usd = 0.0  # type: ignore[attr-defined]
     return _call, client
 
 
@@ -328,7 +390,7 @@ def _sage_replay_rule(
             )
             continue
         try:
-            body = rule_path.read_text(encoding="utf-8")
+            body = rule_path.read_text(encoding="utf-8")  # raw-open: RAPTOR rules-dir file; id charset-vetted, content hash-pinned below
         except OSError:
             continue
         digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
@@ -411,6 +473,17 @@ def synthesize_and_sweep(
         logger.debug("synthesis cap reached (%d/%d)", synthesis_count, max_per_run)
         return None
 
+    et = getattr(outcome, "evidence_tool", "") or ""
+    if _is_prefilter_sourced(et):
+        logger.debug(
+            "synthesis skipped for %s:%s — prefilter already covers "
+            "this pattern codebase-wide (%s)",
+            getattr(outcome, "file", "?"),
+            getattr(outcome, "function", "?"),
+            et,
+        )
+        return None
+
     seed = _seed_from_outcome(outcome)
     if seed is None:
         return None
@@ -428,7 +501,6 @@ def synthesize_and_sweep(
     if llm_pair is None:
         return None
     llm_callable, llm_client = llm_pair
-    cost_before = _synthesis_class_cost(llm_client)
 
     out_dir = getattr(config, "out_dir", None)
     target_path = getattr(config, "target_path", None)
@@ -468,7 +540,7 @@ def synthesize_and_sweep(
                     rule = SynthesisedRule(
                         engine=entry.engine,
                         rule_id=entry.rule_id,
-                        body=rule_path.read_text(encoding="utf-8"),
+                        body=rule_path.read_text(encoding="utf-8"),  # raw-open: RAPTOR rules-dir file, path from the vetted registry row
                         rationale=entry.rationale,
                     )
                     matches, errors = _run_engine(rule, rule_path, Path(target_path))
@@ -596,7 +668,7 @@ def synthesize_and_sweep(
         origin_file=file_path,
         origin_function=function,
         hits=new_hits,
-        cost_usd=_synthesis_class_cost(llm_client) - cost_before,
+        cost_usd=float(getattr(llm_callable, "cost_usd", 0.0)),
         dual_control=bool(cs_result.dual_control),
         rule_tier=getattr(cs_result, "rule_tier", "sweep_once"),
     )
@@ -640,7 +712,6 @@ def synthesize_from_external_seed(
     if llm_pair is None:
         return None
     llm_callable, llm_client = llm_pair
-    cost_before = _synthesis_class_cost(llm_client)
 
     positive = getattr(ext_seed, "positive_fixture", None)
     negative = getattr(ext_seed, "negative_fixture", None)
@@ -703,7 +774,7 @@ def synthesize_from_external_seed(
         origin_file=seed.file,
         origin_function=seed.function,
         hits=hits,
-        cost_usd=_synthesis_class_cost(llm_client) - cost_before,
+        cost_usd=float(getattr(llm_callable, "cost_usd", 0.0)),
         dual_control=bool(cs_result.dual_control),
         rule_tier=getattr(cs_result, "rule_tier", "sweep_once"),
     )
@@ -731,9 +802,10 @@ def ondemand_synthesis_refusal_reason(
 
     1. Not-tool-verifiable classes
        (``cwe_dispatch.CWE_NOT_TOOL_VERIFIABLE`` — CWE-778, CWE-1164,
-       CWE-316, CWE-323): properties whose adjudicating fact no
-       deterministic tool can observe, so a rule "confirming" the
-       hypothesis is always a shape assertion, never harm evidence.
+       CWE-316, CWE-323, CWE-223, CWE-1357): properties whose
+       adjudicating fact no deterministic tool can observe, so a rule
+       "confirming" the hypothesis is always a shape assertion, never
+       harm evidence.
 
     2. Harm gate: a placeholder or absent class (CWE-NOINFO, CWE-000,
        empty) must be backed by a stated harm — the review's
@@ -823,8 +895,9 @@ def synthesize_verification_rule(
     covered on later runs.
 
     Args:
-        outcome: ReviewOutcome — must be suspicious or finding, never
-            clean (verification money is for candidates only).
+        outcome: ReviewOutcome — must be candidate-grade (suspicious,
+            finding, or dark), never clean (verification money is for
+            candidates only).
         config: OrchestratorConfig with target_path, out_dir, models.
         cwe: Effective CWE (review-supplied or inferred); may be empty.
         source_snippet: The function source, when the caller already
@@ -845,7 +918,11 @@ def synthesize_verification_rule(
         return None
 
     status = getattr(outcome, "status", "")
-    if status not in ("suspicious", "finding"):
+    # Candidates only — verification money never re-checks a clean
+    # verdict. "dark" is candidate-grade too: a parked hypothesis no
+    # tool had a channel for is exactly what this lane exists to
+    # verify (the witness-backlog drain retargets it at backlog rows).
+    if status not in ("suspicious", "finding", "dark"):
         return None
 
     review = getattr(outcome, "review_result", None) or {}
@@ -892,7 +969,6 @@ def synthesize_verification_rule(
     if llm_pair is None:
         return None
     llm_callable, llm_client = llm_pair
-    cost_before = _synthesis_class_cost(llm_client)
 
     try:
         from packages.checker_synthesis import SeedBug
@@ -928,10 +1004,10 @@ def synthesize_verification_rule(
         )
         return OnDemandSynthesisResult(
             cwe=seed.cwe,
-            cost_usd=_synthesis_class_cost(llm_client) - cost_before,
+            cost_usd=float(getattr(llm_callable, "cost_usd", 0.0)),
         )
 
-    cost = _synthesis_class_cost(llm_client) - cost_before
+    cost = float(getattr(llm_callable, "cost_usd", 0.0))
     if cs.rule is None:
         logger.debug(
             "on-demand synthesis: no rule produced for %s:%s (errors: %s)",

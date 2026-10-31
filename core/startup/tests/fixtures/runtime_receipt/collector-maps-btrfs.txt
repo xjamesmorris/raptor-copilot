@@ -1,0 +1,4 @@
+0000000000001000-0000000000002000 r--p 00000000 00:34 101 /home/runner/dist/prebuilds/linux-x64/runtime.node
+0000000000002000-0000000000003000 r-xp 00001000 00:34 101 /home/runner/dist/prebuilds/linux-x64/runtime.node
+0000000000003000-0000000000004000 rw-p 00002000 00:34 101 /home/runner/dist/prebuilds/linux-x64/runtime.node
+0000000000005000-0000000000006000 r-xs 00000000 00:34 102 /home/runner/dist/prebuilds/linux-x64/cli-native.node

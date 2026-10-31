@@ -71,6 +71,23 @@ def test_health_result_as_row_failed() -> None:
     assert "http 503" in row
 
 
+def test_health_result_as_row_escapes_hostile_error_text() -> None:
+    """``detail`` / ``rate_limit`` carry live-network error text —
+    ANSI/OSC bytes from a proxied/MITM'd endpoint must not reach the
+    operator TTY raw (terminal-relay discipline; twin of the
+    cve_diff pin)."""
+    r = HealthResult(
+        "Bar", ok=False, latency_ms=12.0,
+        detail="\x1b]0;pwned\x07network: err\x1b[31m",
+        rate_limit="x\x1b[0m" + "y" * 200,
+    )
+    row = r.as_row()
+    assert "\x1b" not in row
+    assert "\x07" not in row
+    assert "network" in row
+    assert len(row) < 400
+
+
 # -- DNS canary -----------------------------------------------------------
 
 
@@ -406,3 +423,25 @@ def test_one_grounding_source_up_is_not_critical() -> None:
         HealthResult("OSV API", ok=True, latency_ms=1.0),
     ]
     assert has_critical_failure(nvd_down_only) is False
+
+
+def test_probe_token_resolver_uses_sanitised_env(monkeypatch) -> None:
+    """The gh-auth fork must run with the sanitised subprocess env like
+    its two sibling resolvers — an inherited HTTPS_PROXY or loader
+    pre-load var must not steer the token lookup."""
+    from types import SimpleNamespace
+
+    from cve_env.infra import service_health as sh
+    from cve_env.utils import run as run_mod
+
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    captured: dict = {}
+
+    def fake_run(argv, timeout=0, env=None, **kw):
+        captured["env"] = env
+        return SimpleNamespace(returncode=0, stdout="tok\n", stderr="")
+
+    monkeypatch.setattr(run_mod, "run_with_timeout", fake_run)
+    assert sh._resolve_github_token_for_probe() == "tok"
+    assert captured["env"] is not None, "must pass a sanitised env"
+    assert "LD_PRELOAD" not in captured["env"]

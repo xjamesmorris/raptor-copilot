@@ -31,7 +31,19 @@ Dangerous fields (block):
                hooks.<Event>[].hooks[].command (type == "command"), plus —
                fail-closed — any hook entry with an unrecognised type
                and any hooks/matcher value of an unrecognised shape
-               env.<KEY> for KEY in _DANGEROUS_ENV_VARS (LD_PRELOAD, EDITOR, ...)
+               env.<KEY> for KEY in _DANGEROUS_ENV_VARS (LD_PRELOAD, EDITOR, ...
+               unioned with the canonical credential-env family:
+               credential material, credential/config file pointers,
+               exec-redirect names — see core/security/credential_env.py)
+               env.<KEY> of credential-redirect SHAPE (*_TOKEN / *_KEY /
+               *_SECRET / *_PASSWORD / *_CONFIG_FILE / *_ASKPASS ... —
+               repo-supplied settings env has no legitimate reason to
+               set any credential-shaped name)
+               env.<KEY> of model-traffic-redirect SHAPE
+               (ANTHROPIC_*BASE_URL* / AWS_ENDPOINT_URL* /
+               CLAUDE_CODE_SKIP_* — per-provider endpoint variants and
+               auth-mode flips, same redirect primitive as the exact
+               ANTHROPIC_BASE_URL block)
                env.<PREFIX>* for PREFIX in _DANGEROUS_ENV_PREFIXES
                (RAPTOR_* / SAGE_* forge our own control env vars or
                repoint persistent memory; CLAUDE_CODE_USE_* /
@@ -44,16 +56,36 @@ Informational (no block):
     .mcp.json: url-only servers (sse/http transport)
 """
 
+import errno
 import json
 import logging
 import os
+import re
 import stat
-import unicodedata
-from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
-from core.security.capped_read import read_capped
+from core.security._trust_common import (
+    RAPTOR_DIR as _RAPTOR_DIR,
+    FileScan,
+    Finding,
+    is_registered_worktree_of_self as _is_registered_worktree_of_self,
+    mask as _mask,
+    read_trust_config as _read_capped,
+    render_scan_report,
+    resolve_supplied_target,
+    safe_text as _safe,
+    truncate as _truncate,
+)
+from core.security.credential_env import (
+    CONFIG_HOME_REDIRECT_ENV_VARS,
+    CREDENTIAL_ENV_FAMILY,
+    TOOLCHAIN_HOME_ENV_VARS,
+    fold_env_candidate,
+    is_credential_redirect_shaped,
+    is_function_injection_shaped,
+    is_model_traffic_redirect_shaped,
+)
 from urllib.parse import urlsplit
 
 # Plain stdlib logger — cc_trust runs at startup before
@@ -88,29 +120,37 @@ def is_trust_overridden() -> bool:
     return _trust_override_set
 
 
-@dataclass
-class Finding:
-    """One labelled row in the per-file findings table."""
-    label: str          # e.g. "apiKeyHelper", "SessionStart hook", "env LD_PRELOAD"
-    value: str          # e.g. the helper command, hook command, env value
-    blocking: bool      # True = blocks dispatch; False = info only (URL MCP)
+# Finding / FileScan result shapes ship from the shared trust-gate
+# helper layer (core/security/_trust_common.py), re-exported here for
+# this gate's callers.
 
-
-@dataclass
-class FileScan:
-    """Findings for one inspected file."""
-    path: Path
-    findings: list[Finding] = field(default_factory=list)
-
-    def has_blocking(self) -> bool:
-        return any(f.blocking for f in self.findings)
-
-
+# Commands CC executes to obtain/refresh credentials — the same
+# transcription discipline as the credential_env ecosystem surfaces
+# (every hand-picked universe carries source/transcribed/completeness
+# so drift is a dated claim, not a guess):
+#
+# source= Claude Code settings docs, "Available settings" full key
+#   walk (helper-executing keys: apiKeyHelper, awsAuthRefresh,
+#   awsCredentialExport, gcpAuthRefresh, proxyAuthHelper,
+#   otelHeadersHelper). `awsAuthHelper` (an earlier guess) does not
+#   exist — the executed-script key is `awsCredentialExport`;
+#   `proxyAuthHelper` produces proxy auth headers the same way.
+# transcribed= 2026-09-22; settings-doc key walk re-run against the
+#   docs current at that date. Re-walk on CC settings-doc updates —
+#   every past miss in this family (otelHeadersHelper, statusLine,
+#   permissions-widening) was a documented key the list lacked until
+#   someone noticed.
+# completeness= hooks / statusLine / permissions / env have their own
+#   scan arms below; `model`, output/style knobs and other documented
+#   inert-VALUE keys are deliberately out (unknown top-level keys are
+#   allow-by-default, pinned by test_non_helper_top_level_key_is_inert
+#   — flipping that posture is a separate adjudication). Repo-level
+#   plugin-configuration keys (marketplaces / enabled-plugins — the
+#   plugin spelling of hooks/commands/MCP) are NOT yet adjudicated:
+#   whether current CC honours them from a repo settings.json without
+#   a trust prompt needs a CC-version oracle; adjudicate on next
+#   transcription walk.
 _CREDENTIAL_HELPER_KEYS = (
-    # Commands CC executes to obtain/refresh credentials. These are
-    # the keys CC actually honours: `awsAuthHelper` (an earlier guess)
-    # does not exist — the executed-script key is `awsCredentialExport`
-    # — and `proxyAuthHelper` produces proxy auth headers the same way.
     "apiKeyHelper", "awsAuthRefresh", "awsCredentialExport",
     "gcpAuthRefresh", "proxyAuthHelper",
     # otelHeadersHelper is a command CC executes to produce telemetry
@@ -161,38 +201,104 @@ _COMPREHENSIVE_DANGEROUS_ENV_VARS = frozenset({
     # picks JAVA_TOOL_OPTIONS up unconditionally; -javaagent loads
     # arbitrary code at JVM startup. _JAVA_OPTIONS is the older
     # variant. CLASSPATH adds attacker .jar to load path.
-    "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "CLASSPATH",
-    "MAVEN_OPTS", "GRADLE_OPTS",
-    # Cargo / Ruby / Node module-resolution overrides.
-    "CARGO_HOME", "GEM_HOME", "GEM_PATH", "BUNDLE_GEMFILE",
+    "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS", "CLASSPATH",
+    # Build-tool names (MAVEN_OPTS, GRADLE_OPTS, CARGO_HOME, GEM_HOME,
+    # GEM_PATH, BUNDLE_GEMFILE and their per-ecosystem siblings) come
+    # from the ecosystem surfaces in core/security/credential_env.py
+    # via the CREDENTIAL_ENV_FAMILY union below — credential_env is
+    # stdlib-only and imports even where core.config cannot, so the
+    # standalone fallback keeps them without a private copy.
     "PYTHONUSERBASE", "PYTHONBREAKPOINT",
     # Git config redirection — an env-set GIT_CONFIG_GLOBAL points
     # git at an attacker config file with `alias = !sh`,
     # `core.editor = arbitrary binary`, `credential.helper = ...`
-    # firing on every fetch. GIT_SSH_COMMAND directly execs an
-    # attacker binary on every ssh-based git op.
+    # firing on every fetch. (GIT_SSH_COMMAND / GIT_SSH / GIT_ASKPASS /
+    # SSH_ASKPASS live in the credential-env family unioned below.)
     "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG",
-    "GIT_SSH_COMMAND", "GIT_SSH", "SSH_ASKPASS",
+    # Git helper/template redirection — an env-set GIT_EXEC_PATH
+    # substitutes every git-<cmd> helper binary; GIT_TEMPLATE_DIR
+    # plants per-repo hook executables at `git init`. Both are in
+    # RaptorConfig.DANGEROUS_ENV_VARS; the standalone fallback (used
+    # when core.config is unimportable) must carry them on its own —
+    # same degraded-install parity the proxy family got above.
+    "GIT_EXEC_PATH", "GIT_TEMPLATE_DIR",
     # OpenSSL config — .conf files can load ENGINE .so files
     # (arbitrary code in any process that initialises OpenSSL).
     "OPENSSL_CONF",
+    # ansible.cfg pointer — the pointed-to file names plugin dirs and
+    # callback/action plugins ansible EXECUTES; the config-file-
+    # pointer power class (AWS_CONFIG_FILE credential_process twin).
+    # Settings-scan lane only, like every member of this set.
+    "ANSIBLE_CONFIG",
     # TLS trust override — CA bundle / cert dir redirection makes
     # MITM trivial.
     "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
     "SSL_CERT_FILE", "SSL_CERT_DIR",
     "NODE_EXTRA_CA_CERTS", "SSLKEYLOGFILE",
-    # Kubernetes — `users[].user.exec` directive runs arbitrary
-    # command for credential acquisition.
-    "KUBECONFIG",
-    # Model-traffic redirect — CC honours these directly: BASE_URL
+    # Model-traffic redirect — CC honours this directly: BASE_URL
     # repoints every API call at an attacker endpoint (prompt +
-    # source-code exfiltration, poisoned completions), AUTH_TOKEN
-    # substitutes attacker credentials, CUSTOM_HEADERS rides secrets
-    # or auth overrides onto every request. Strictly stronger
-    # primitives than the HTTP_PROXY family already blocked above.
-    "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
-    "ANTHROPIC_CUSTOM_HEADERS",
-})
+    # source-code exfiltration, poisoned completions). A strictly
+    # stronger primitive than the HTTP_PROXY family already blocked
+    # above. The exact name alone is NOT enough: the CLI reads a
+    # DIFFERENT base-URL name per provider mode (a Bedrock install
+    # ignores ANTHROPIC_BASE_URL and reads the per-cloud
+    # ANTHROPIC_*_BASE_URL variants), the JS AWS SDK honours
+    # AWS_ENDPOINT_URL[_<SERVICE>], and CLAUDE_CODE_SKIP_* flips the
+    # CLI's auth mode at whatever endpoint won — so the scan ALSO
+    # applies is_model_traffic_redirect_shaped (the vocabulary's
+    # shape rule, shared with cc_adapter's proxy strip) to every env
+    # key. (ANTHROPIC_AUTH_TOKEN / ANTHROPIC_CUSTOM_HEADERS —
+    # attacker-credential substitution and header riding — live in
+    # the credential-env family unioned below.)
+    "ANTHROPIC_BASE_URL",
+    # Degraded-install parity with RaptorConfig.DANGEROUS_ENV_VARS.
+    # The union with core.config below makes any gap here invisible
+    # on a full install, but the standalone fallback (core.config
+    # unimportable — stripped-down CC install, partial repo) IS the
+    # scan set, and it silently lacked 27 members including
+    # exec-grade loaders. The closure test pins the real direction
+    # (RaptorConfig.DANGEROUS_ENV_VARS ⊆ this set), so future
+    # core/config additions fail CI until mirrored here.
+    #   loader / runtime injection:
+    "GCONV_PATH", "GLIBC_TUNABLES", "LD_DEBUG", "LD_PROFILE",
+    "LD_SHOW_AUXV", "DYLD_FRAMEWORK_PATH",
+    "PHPRC", "PHP_INI_SCAN_DIR", "EMACSLOADPATH",
+    #   allocator knobs (heap-behaviour tuning primitives):
+    "MALLOC_ARENA_MAX", "MALLOC_CHECK_", "MALLOC_CONF",
+    "MALLOC_MMAP_THRESHOLD_", "MALLOC_PERTURB_",
+    "MALLOC_TRIM_THRESHOLD_", "JE_MALLOC_CONF",
+    #   resolver / locale / auth redirection:
+    "HOSTALIASES", "LOCALDOMAIN", "RES_OPTIONS", "NLSPATH", "LOCPATH",
+    "KRB5_CONFIG", "KRB5CCNAME", "GNUTLS_SYSTEM_PRIORITY_FILE",
+    #   daemon / environment redirection:
+    "DOCKER_HOST", "TMPDIR", "VIRTUAL_ENV",
+}) | CREDENTIAL_ENV_FAMILY | TOOLCHAIN_HOME_ENV_VARS \
+    | CONFIG_HOME_REDIRECT_ENV_VARS
+# CONFIG_HOME_REDIRECT_ENV_VARS joins THIS scan set only, like the
+# toolchain-home class below it: CLAUDE_CONFIG_DIR repoints CC's own
+# config dir (attacker settings.json → apiKeyHelper/hooks/permissions
+# = exec), and the XDG_* homes are the freedesktop respelling of the
+# long-blocked HOME (git alias `!sh`, credential.helper, pip.conf).
+# Operators legitimately export XDG_* on their own hosts — only the
+# settings scan consumes the class.
+# TOOLCHAIN_HOME_ENV_VARS joins THIS scan set only (never the general
+# blocklists): a repo-supplied env.JAVA_HOME points the operator
+# session's next mvn/gradle/ant invocation at `<repo>/jvm/bin/java` —
+# repo binary executed at operator power. With env.PATH already
+# blocked above, the toolchain-home names are the surviving
+# launcher-redirect primitive on this lane. The traced-build lane's
+# own env_detect passthrough is untouched (it reads the HOST env, not
+# repo settings, and this set feeds only the settings scan).
+# The canonical credential-env family (core/security/credential_env.py)
+# joins the settings-scan blocklist wholesale: credential material
+# (CLAUDE_CODE_OAUTH_TOKEN — attacker-credential substitution, the same
+# rationale ANTHROPIC_AUTH_TOKEN is blocked for), credential/config
+# file pointers whose pointed-to file can name an executed helper
+# (AWS_CONFIG_FILE credential_process, KUBECONFIG users[].user.exec,
+# DOCKER_CONFIG credsStore — the identical primitive this scan always
+# blocked KUBECONFIG for), and exec-redirect names (GIT_ASKPASS,
+# RUSTC_WRAPPER). A repo-supplied settings env dict has no legitimate
+# reason to set ANY member.
 
 # Env-key PREFIXES flagged wholesale (compared case-folded, like the
 # name set above). RAPTOR_*/SAGE_* forge RAPTOR's own control env or
@@ -212,53 +318,15 @@ try:
 except ImportError:
     _DANGEROUS_ENV_VARS = _COMPREHENSIVE_DANGEROUS_ENV_VARS
 
-_MAX_CONFIG_BYTES = 1_000_000
+# Operator-facing subject for this gate's shared renderer / resolve
+# gate (core/security/_trust_common.py) — names what was scanned.
+_SCAN_SUBJECT = "Claude Code config"
 
-# RAPTOR repo root = core/security/cc_trust.py -> ../../
-_RAPTOR_DIR = Path(__file__).resolve().parents[2]
-
-# U+2028/U+2029 line-separators — Zl/Zp categories slip past Cc/Cf below
-# but terminals render them as newlines, which could split our output.
-_EXTRA_STRIP = frozenset({"\u2028", "\u2029"})
-
-
-def _safe(s: str) -> str:
-    """Strip Unicode control/format chars and line/paragraph separators.
-    Defends against ANSI escapes, Trojan Source bidi (CVE-2021-42574),
-    zero-width chars, and line-separator-driven output splitting."""
-    return "".join(
-        c if c == "\t" or (
-            c not in _EXTRA_STRIP
-            and unicodedata.category(c) not in ("Cc", "Cf")
-        ) else "?"
-        for c in s
-    )
-
-
-def _truncate(s: str, limit: int = 80) -> str:
-    safe = _safe(s)
-    return safe[:limit] + "..." if len(safe) > limit else safe
-
-
-def _mask(s: str, keep: int = 8) -> str:
-    """Render a secret-bearing config value without echoing it.
-
-    Scan output lands on stdout and from there in retained CI logs, so
-    credential-helper commands, env values, and MCP command lines must
-    not be printed verbatim — a leaked settings.json would otherwise
-    republish its secrets into every build log. Keep a short prefix
-    (enough to identify the binary/helper for triage), redact the tail,
-    and show the length so distinct values remain distinguishable.
-    ``keep=0`` fully redacts — used for env values, where the value IS
-    the secret and even a prefix is a partial leak.
-    """
-    safe = _safe(s)
-    if not safe:
-        return "(empty)"
-    # A prefix of a value no longer than ``keep`` IS the value —
-    # fully redact rather than echo it whole.
-    prefix = safe[:keep] if 0 < keep < len(safe) else ""
-    return f"{prefix}*** ({len(safe)} chars)"
+# _safe / _truncate / _mask (sanitise, bound, redact — the display
+# path every attacker-influencable value rides through), the U+2028/
+# U+2029 strip set, and _RAPTOR_DIR (repo-root self-scan skip) live in
+# the shared trust-gate helper layer; see core/security/
+# _trust_common.py for the threat model.
 
 
 def _mask_url(s: str) -> str:
@@ -274,12 +342,6 @@ def _mask_url(s: str) -> str:
     if parsed.scheme and host:
         return f"{parsed.scheme}://{host}/*** ({len(safe)} chars)"
     return _mask(safe)
-
-
-def _read_capped(path: Path) -> bytes | None:
-    """Read up to ``_MAX_CONFIG_BYTES``; delegates the hardened
-    open/read to :func:`core.security.capped_read.read_capped`."""
-    return read_capped(path, _MAX_CONFIG_BYTES)
 
 
 def _load_json(path: Path, raw: bytes | None = None) -> tuple[dict | None, bool]:
@@ -485,6 +547,15 @@ def _scan_settings(path: Path, raw: bytes | None = None) -> FileScan | None:
                     _truncate(repr(permissions)), True))
 
         env_cfg = data.get("env")
+        if env_cfg is not None and not isinstance(env_cfg, dict):
+            # Fail-closed like hooks/statusLine/permissions: env is
+            # the highest-value field this scan guards, and a shape a
+            # future CC accepts more leniently than this scanner (a
+            # KEY=VALUE list form, say) would otherwise carry every
+            # blocked member past the scan with zero findings.
+            fs.findings.append(Finding(
+                "env (unrecognised shape)",
+                _mask(repr(env_cfg)), True))
         if isinstance(env_cfg, dict):
             # Pre-fix the membership check was exact-match, so a target
             # setting `http_proxy` or `Https_Proxy` (both honoured by
@@ -494,15 +565,52 @@ def _scan_settings(path: Path, raw: bytes | None = None) -> FileScan | None:
             # mandate uppercase env vars; the case-insensitive proxy
             # convention is real and widely exploited. Compare against
             # an upper-case-folded view of the dangerous set.
+            # Candidates are matched through fold_env_candidate (case
+            # AND '-'→'_'): npm honours npm_config_script-shell as the
+            # same exec-redirect knob as NPM_CONFIG_SCRIPT_SHELL, so a
+            # one-character respelling bypassed the exact-name match.
+            # No blocked name is dash-bearing, so folding the candidate
+            # only widens what a hostile settings env can be caught
+            # setting — legitimate keys are unaffected.
             dangerous_upper = {v.upper() for v in _DANGEROUS_ENV_VARS}
             for env_key, env_val in env_cfg.items():
                 key_str = str(env_key)
-                key_upper = key_str.upper()
+                key_upper = fold_env_candidate(key_str)
+                # Fail closed on NON-IDENTIFIER keys before any name
+                # matching: legitimate env names are portable
+                # identifiers, and a key like "LD_PRELOAD=/e.so:"
+                # (value "") smuggles a dangerous assignment past
+                # every name test if a lenient consumer applies env
+                # as key+"="+value — the same '='-bearing-key class
+                # the container launcher refuses. NUL / newline /
+                # space-bearing keys ride the same gate.
+                if not re.fullmatch(r"[A-Z0-9_]+", key_upper):
+                    fs.findings.append(Finding(
+                        f"env {_truncate(key_str, limit=40)} "
+                        "(non-identifier key)",
+                        _mask(str(env_val), keep=0), True))
+                    continue
                 # Prefix families (RAPTOR_/SAGE_/CLAUDE_CODE_USE_/
                 # OTEL_EXPORTER_OTLP_) are flagged regardless of the
-                # specific var — see _DANGEROUS_ENV_PREFIXES.
+                # specific var — see _DANGEROUS_ENV_PREFIXES. The
+                # credential-redirect SHAPE rule is the belt over the
+                # name enumeration: a repo-supplied env key that looks
+                # like a credential / credential-config pointer
+                # (FOO_API_TOKEN, BAR_CONFIG_FILE) is credential
+                # substitution or redirect for whatever tool reads it,
+                # and settings.json env has no legitimate reason to
+                # carry one — fail closed on the shape.
                 if (key_upper in dangerous_upper
-                        or key_upper.startswith(_DANGEROUS_ENV_PREFIXES)):
+                        or key_upper.startswith(_DANGEROUS_ENV_PREFIXES)
+                        # Pager-exec class, derived by suffix rather
+                        # than per-tool names: PAGER itself is blocked
+                        # above, and consumers take their override as
+                        # <TOOL>_PAGER (GIT_PAGER, SYSTEMD_PAGER, ...)
+                        # — each one a command the tool executes.
+                        or key_upper.endswith("_PAGER")
+                        or is_credential_redirect_shaped(key_upper)
+                        or is_model_traffic_redirect_shaped(key_upper)
+                        or is_function_injection_shaped(key_upper)):
                     k = _truncate(key_str, limit=40)
                     # keep=0: the env VALUE is the secret — the key
                     # name alone carries the triage signal.
@@ -531,6 +639,13 @@ def _scan_mcp(path: Path, raw: bytes | None = None) -> FileScan | None:
     fs = FileScan(path=path)
     try:
         servers = data.get("mcpServers")
+        if servers is not None and not isinstance(servers, dict):
+            # Fail-closed twin of the settings env arm: an
+            # unrecognised mcpServers shape must surface loudly, not
+            # pass silently.
+            fs.findings.append(Finding(
+                "mcpServers (unrecognised shape)",
+                _mask(repr(servers)), True))
         if isinstance(servers, dict):
             for name, cfg in servers.items():
                 n = _truncate(str(name), limit=40)
@@ -574,12 +689,15 @@ def check_repo_claude_trust(repo_path: str, trust_override: bool | None = None) 
     """
     if not repo_path:
         return False
-    try:
-        resolved = str(Path(repo_path).resolve())
-    except (ValueError, OSError):
-        return False
     if trust_override is None:
         trust_override = _trust_override_set
+    # Fail-closed resolve+stat gate (shared helper layer): a SUPPLIED
+    # target the checker cannot resolve or stat is refused, not waved
+    # through; the trust override downgrades to warn-and-proceed.
+    resolved, refuse = resolve_supplied_target(
+        repo_path, trust_override, subject=_SCAN_SUBJECT)
+    if resolved is None:
+        return refuse
     scans, any_blocking = _scan_cached(resolved,
                                        _read_config_state(Path(resolved)))
     # Print side-effects live OUTSIDE the cache. Pre-fix the print() calls
@@ -591,7 +709,8 @@ def check_repo_claude_trust(repo_path: str, trust_override: bool | None = None) 
     # orchestrator that re-checks the same repo per finding).
     if scans:
         target = Path(resolved)
-        _render_scan_report(target, scans, any_blocking, trust_override)
+        render_scan_report(target, scans, any_blocking, trust_override,
+                           subject=_SCAN_SUBJECT)
     return any_blocking and not trust_override
 
 
@@ -631,8 +750,18 @@ def _read_config_state(target: Path) -> tuple:
     for _kind, p in _config_candidates(target):
         try:
             st = os.lstat(p)
-        except OSError:
-            entries.append(("absent",))
+        except OSError as e:
+            # Only "nothing there" means absent. Any other lstat
+            # failure (EACCES, EIO, ELOOP, ...) means a candidate
+            # EXISTS in some form the checker cannot see — and the CC
+            # session (same uid, a later moment, possibly changed
+            # modes) might read it fine. "absent" would wave that
+            # through; classify unreadable, which the scanner already
+            # treats as dangerous.
+            if e.errno in (errno.ENOENT, errno.ENOTDIR):
+                entries.append(("absent",))
+            else:
+                entries.append(("unreadable",))
             continue
         if stat.S_ISLNK(st.st_mode):
             try:
@@ -660,7 +789,32 @@ def _scan_cached(resolved_path: str,
     verdict. Side-effect free so repeated cache hits don't suppress
     operator-visible warnings (handled in the caller)."""
     target = Path(resolved_path)
-    if target == _RAPTOR_DIR:
+    # Skip RAPTOR's own repo — RAPTOR's own .claude config (hooks and
+    # helpers it legitimately ships) would always flag if scanned.
+    # Operator running RAPTOR against itself is implicitly trusted. A
+    # git worktree of RAPTOR itself (e.g. a pristine source-only
+    # checkout used as an audit target) is the same trust domain —
+    # recognised strictly from RAPTOR's OWN worktree registry plus a
+    # bidirectional link check, fail closed (the shared helper
+    # _trust_common.is_registered_worktree_of_self, same code as the
+    # codeql gate's skip). Cache note: the recognition input (RAPTOR's
+    # own .git/worktrees registry — trusted-side state only the
+    # operator's `git worktree add/remove` mutates, never the target)
+    # is not part of the cache key. A registry entry ADDED mid-process
+    # leaves an already-cached scan verdict in place (conservative:
+    # the operator's own worktree keeps being scanned until a new
+    # process). An entry PRUNED mid-process leaves a trusted verdict
+    # cached for that (path, config-bytes) pair — reusing it requires
+    # planting config files BYTE-IDENTICAL to the trusted worktree's
+    # own. The config BYTES were already trusted at that path, but the
+    # verdict attaches to the directory: relative hook/helper commands
+    # in those bytes would resolve against whatever non-config files
+    # sit beside them at the recaptured path. That exposure is
+    # strictly narrower than (same capability as) the stale-registry
+    # residual documented on the shared helper (operator control:
+    # `git worktree prune`).
+    if (target == _RAPTOR_DIR
+            or _is_registered_worktree_of_self(target, _RAPTOR_DIR)):
         return ((), False)
 
     candidates = _config_candidates(target)
@@ -693,28 +847,7 @@ def _scan_cached(resolved_path: str,
     return (tuple(scans), any_blocking)
 
 
-def _render_scan_report(target: Path, scans, any_blocking: bool,
-                        trust_override: bool) -> None:
-    """Pure rendering — separated from `_scan_cached` so the cache
-    doesn't suppress the operator-visible warning on re-invocation."""
-    safe_target = _safe(str(target))
-    if any_blocking:
-        if trust_override:
-            print(f"raptor: {safe_target} has dangerous Claude Code config "
-                  f"(trust override active):")
-        else:
-            print(f"raptor: {safe_target} has dangerous Claude Code config:")
-    else:
-        print(f"raptor: {safe_target} has Claude Code config:")
-
-    for fs in scans:
-        try:
-            rel = fs.path.relative_to(target)
-        except ValueError:
-            rel = fs.path
-        print(f"  {_safe(str(rel))}")
-        if not fs.findings:
-            continue
-        label_w = max(len(f.label) for f in fs.findings) + 2
-        for f in fs.findings:
-            print(f"    {f.label:<{label_w}}{f.value}")
+# Report rendering lives in the shared helper layer
+# (core.security._trust_common.render_scan_report) — kept OUTSIDE
+# `_scan_cached` so the cache doesn't suppress the operator-visible
+# warning on re-invocation.

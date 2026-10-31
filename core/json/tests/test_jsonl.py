@@ -48,6 +48,30 @@ class TestAppendJsonl:
             append_jsonl(link, {"evil": True})
         assert victim.read_text() == "do not touch\n"
 
+    @pytest.mark.skipif(
+        not hasattr(os, "mkfifo"), reason="mkfifo unavailable (non-POSIX)")
+    def test_refuses_readerless_fifo_without_blocking(self, tmp_path: Path):
+        """A planted reader-less FIFO must fail fast (ENXIO via
+        O_NONBLOCK), never wedge the appender on the open."""
+        p = tmp_path / "trail.jsonl"
+        os.mkfifo(p)
+        with pytest.raises(OSError):
+            append_jsonl(p, {"evil": True})
+
+    @pytest.mark.skipif(
+        not hasattr(os, "mkfifo"), reason="mkfifo unavailable (non-POSIX)")
+    def test_refuses_fifo_with_reader(self, tmp_path: Path):
+        """A FIFO that HAS a reader opens fine — the post-open fstat
+        regularity check is what refuses it."""
+        p = tmp_path / "trail.jsonl"
+        os.mkfifo(p)
+        reader = os.open(str(p), os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            with pytest.raises(OSError):
+                append_jsonl(p, {"evil": True})
+        finally:
+            os.close(reader)
+
     def test_raises_on_missing_parent(self, tmp_path: Path):
         with pytest.raises(OSError):
             append_jsonl(tmp_path / "no" / "such" / "dir.jsonl", {"a": 1})
@@ -96,6 +120,28 @@ class TestLoadJsonl:
         p = tmp_path / "trail.jsonl"
         p.write_text('{"ok": 1}\n\n{truncated\n{"ok": 2}\n')
         assert load_jsonl(p) == [{"ok": 1}, {"ok": 2}]
+
+    def test_invalid_utf8_line_skipped_not_raised(self, tmp_path: Path):
+        """One corrupt byte (torn write, foreign writer) must skip its
+        own line, never raise UnicodeDecodeError out of the never-raise
+        contract and lose every well-formed record in the trail."""
+        p = tmp_path / "trail.jsonl"
+        p.write_bytes(
+            b'{"ok": 1}\n'
+            b'{"bad": "\xff\xfe"}\n'   # invalid UTF-8 mid-record
+            b'\xc3\n'                  # truncated multi-byte sequence
+            b'{"ok": 2}\n'
+        )
+        assert load_jsonl(p) == [{"ok": 1}, {"ok": 2}]
+
+    def test_invalid_utf8_final_partial_line_keeps_earlier(
+        self, tmp_path: Path,
+    ):
+        """Writer killed mid-append leaving raw bytes: earlier records
+        survive."""
+        p = tmp_path / "trail.jsonl"
+        p.write_bytes(b'{"a": 1}\n{"b": "tru\x80')
+        assert load_jsonl(p) == [{"a": 1}]
 
     def test_non_dict_records_preserved(self, tmp_path: Path):
         p = tmp_path / "trail.jsonl"
@@ -204,16 +250,32 @@ class TestCallSiteHardeningConsistency:
             append_audit_log(tmp_path, {"action": "x"})
         assert victim.read_text() == ""
 
-    def test_audit_log_round_trip_unchanged(self, tmp_path: Path):
+    def test_audit_log_round_trip_modulo_stamp(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        # Row contract: the writer stamps every appended row with the
+        # per-purpose, run-bound `integrity` token, and loaded rows
+        # carry it verbatim — consumers treat it like any additive
+        # key. Everything else round-trips unchanged.
+        monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
         from core.audit.record import append_audit_log, load_audit_log
+        from core.coverage import journal_mac
         append_audit_log(tmp_path, {"action": "context", "n": 1})
         append_audit_log(tmp_path, {"action": "batch_flush"})
         recs = load_audit_log(tmp_path)
-        assert recs == [{"action": "context", "n": 1},
-                        {"action": "batch_flush"}]
+        stripped = [
+            {k: v for k, v in r.items() if k != journal_mac.TOKEN_KEY}
+            for r in recs
+        ]
+        assert stripped == [{"action": "context", "n": 1},
+                            {"action": "batch_flush"}]
+        binding = journal_mac.audit_log_run_binding(tmp_path)
+        for r in recs:
+            assert journal_mac.verify_audit_log_row(
+                r, r.get(journal_mac.TOKEN_KEY), binding)
         # compact separators preserved (telemetry-size parity)
         first = (tmp_path / ".audit-log.jsonl").read_text().splitlines()[0]
-        assert first == '{"action":"context","n":1}'
+        assert first.startswith('{"action":"context","n":1')
 
     def test_suppression_record_shape_unchanged(self, tmp_path: Path):
         from core.analysis.reach_chokepoint import record_suppression
@@ -290,6 +352,149 @@ class TestLoadJsonlBudgets:
         assert load_jsonl(p, max_line_bytes=10, max_total_bytes=10) == []
 
 
+class TestLoadJsonlOversizeTail:
+    """``oversize_tail=True``: an over-budget trail degrades to its
+    bounded newest tail instead of loading as ``[]`` — while the
+    budget keeps binding on hostile input (two-direction contract)."""
+
+    def _trail(self, tmp_path: Path, n: int = 200) -> Path:
+        p = tmp_path / "trail.jsonl"
+        for i in range(n):
+            append_jsonl(p, {"i": i}, compact=True)
+        return p
+
+    def test_tail_reads_newest_records(self, tmp_path: Path):
+        p = self._trail(tmp_path)
+        size = p.stat().st_size
+        records = load_jsonl(p, max_total_bytes=size // 4,
+                             oversize_tail=True)
+        # Legitimate-scale direction: the trail is no longer lost.
+        assert records, "over-budget trail must not load as []"
+        # Newest records win, in original order, ending at the true
+        # last record.
+        assert records[-1] == {"i": 199}
+        idx = [r["i"] for r in records]
+        assert idx == sorted(idx)
+        # Hostile direction: the budget still binds — the oldest
+        # records beyond the tail are NOT loaded.
+        assert {"i": 0} not in records
+        assert len(records) < 200
+
+    def test_tail_budget_bounds_bytes_read(self, tmp_path: Path):
+        p = self._trail(tmp_path)
+        budget = 64
+        records = load_jsonl(p, max_total_bytes=budget,
+                             oversize_tail=True)
+        # At most ``budget`` bytes past the seek survive: the memory
+        # bound a hostile multi-GiB plant meets.
+        assert records
+        line_bytes = sum(
+            len(json.dumps(r, separators=(",", ":"))) + 1
+            for r in records
+        )
+        assert line_bytes <= budget
+
+    def test_tail_discards_partial_first_line(self, tmp_path: Path):
+        p = self._trail(tmp_path)
+        size = p.stat().st_size
+        records = load_jsonl(p, max_total_bytes=size - 3,
+                             oversize_tail=True)
+        # The seek lands mid-line; the cut record must be skipped,
+        # not parsed as garbage, and everything after it survives.
+        assert all(isinstance(r, dict) and "i" in r for r in records)
+        assert records[-1] == {"i": 199}
+
+    def test_under_budget_identical_to_plain_load(self, tmp_path: Path):
+        p = self._trail(tmp_path, n=5)
+        size = p.stat().st_size
+        assert load_jsonl(p, max_total_bytes=size, oversize_tail=True) \
+            == load_jsonl(p)
+
+    def test_default_still_refuses_whole(self, tmp_path: Path):
+        p = self._trail(tmp_path)
+        assert load_jsonl(p, max_total_bytes=32) == []
+
+    def test_tail_warns(self, tmp_path: Path, caplog):
+        p = self._trail(tmp_path)
+        with caplog.at_level("WARNING", logger="core.json.jsonl"):
+            load_jsonl(p, max_total_bytes=64, oversize_tail=True)
+        assert any("over budget" in r.message for r in caplog.records)
+
+
+class TestLoadJsonlMaxRecords:
+    """``max_records``: newest-wins retained-count bound."""
+
+    def _trail(self, tmp_path: Path, n: int = 50) -> Path:
+        p = tmp_path / "trail.jsonl"
+        for i in range(n):
+            append_jsonl(p, {"i": i}, compact=True)
+        return p
+
+    def test_over_bound_keeps_newest(self, tmp_path: Path):
+        p = self._trail(tmp_path)
+        records = load_jsonl(p, max_records=10)
+        # Hostile direction: the count bound binds (object-overhead
+        # OOM defence the byte budgets cannot see).
+        assert len(records) == 10
+        # Newest-wins: last-row-per-key consumers still see the true
+        # last record.
+        assert records == [{"i": i} for i in range(40, 50)]
+
+    def test_under_bound_keeps_all(self, tmp_path: Path):
+        # Legitimate-scale direction: a trail within the bound loads
+        # complete and order-identical to the unbounded read.
+        p = self._trail(tmp_path, n=8)
+        assert load_jsonl(p, max_records=8) == load_jsonl(p)
+
+    def test_none_unbounded_unchanged(self, tmp_path: Path):
+        p = self._trail(tmp_path)
+        assert len(load_jsonl(p)) == 50
+
+    def test_eviction_warns(self, tmp_path: Path, caplog):
+        p = self._trail(tmp_path)
+        with caplog.at_level("WARNING", logger="core.json.jsonl"):
+            load_jsonl(p, max_records=10)
+        assert any("newest 10 of 50" in r.message for r in caplog.records)
+
+    def test_returns_plain_list(self, tmp_path: Path):
+        p = self._trail(tmp_path, n=3)
+        assert type(load_jsonl(p, max_records=2)) is list
+
+
+class TestNegativeBudgetsRejected:
+    """Budgets are caller constants, not trail data: negative values
+    raise ``ValueError`` BEFORE the file is opened (no fd to leak),
+    instead of arithmetic like ``seek(size - (-5))`` or a warning
+    rendering 'newest -5 bytes'."""
+
+    def _trail(self, tmp_path: Path) -> Path:
+        p = tmp_path / "trail.jsonl"
+        append_jsonl(p, {"i": 1}, compact=True)
+        return p
+
+    def test_negative_max_records_raises(self, tmp_path: Path):
+        p = self._trail(tmp_path)
+        with pytest.raises(ValueError):
+            load_jsonl(p, max_records=-1)
+
+    def test_negative_max_total_bytes_raises(self, tmp_path: Path):
+        p = self._trail(tmp_path)
+        with pytest.raises(ValueError, match="max_total_bytes"):
+            load_jsonl(p, max_total_bytes=-5)
+
+    def test_negative_max_line_bytes_raises(self, tmp_path: Path):
+        p = self._trail(tmp_path)
+        with pytest.raises(ValueError, match="max_line_bytes"):
+            load_jsonl(p, max_line_bytes=-1)
+
+    def test_zero_budgets_still_valid(self, tmp_path: Path):
+        # The boundary stays where it was: zero is a meaningful
+        # bound (retain/read nothing), only negatives are nonsense.
+        p = self._trail(tmp_path)
+        assert load_jsonl(p, max_records=0) == []
+        assert load_jsonl(p, max_total_bytes=0) == []
+
+
 def test_o_nofollow_available():
     # The hardening this module exists for requires O_NOFOLLOW on the
     # platforms RAPTOR supports (Linux/macOS).
@@ -314,3 +519,26 @@ class TestAppendNonFiniteParity:
         p = tmp_path / "trail.jsonl"
         append_jsonl(p, {"score": 0.5})
         assert load_jsonl(p) == [{"score": 0.5}]
+
+
+class TestLineSeparators:
+    """The byte-mode read iterates on ``\\n`` only; foreign-writer
+    files delimited by bare ``\\r`` parsed under the old text-mode
+    universal-newlines read and must keep parsing."""
+
+    def test_bare_cr_separators_still_load(self, tmp_path: Path):
+        p = tmp_path / "trail.jsonl"
+        p.write_bytes(b'{"a": 1}\r{"b": 2}')
+        assert load_jsonl(p) == [{"a": 1}, {"b": 2}]
+
+    def test_crlf_separators_still_load(self, tmp_path: Path):
+        p = tmp_path / "trail.jsonl"
+        p.write_bytes(b'{"a": 1}\r\n{"b": 2}\r\n')
+        assert load_jsonl(p) == [{"a": 1}, {"b": 2}]
+
+    def test_oversize_line_gate_applies_per_cr_segment(self, tmp_path: Path):
+        """A bare-CR file is ONE ``\\n``-iteration chunk; the byte
+        budget must gate each record, not the whole chunk."""
+        p = tmp_path / "trail.jsonl"
+        p.write_bytes(b'{"a": 1}\r{"pad": "' + b"x" * 64 + b'"}\r{"b": 2}')
+        assert load_jsonl(p, max_line_bytes=32) == [{"a": 1}, {"b": 2}]

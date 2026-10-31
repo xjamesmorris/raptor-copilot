@@ -358,7 +358,7 @@ def pick_strategies(
     # only if there's room and nothing else scored.
     if (
         not always_include_general and general is not None
-        and not out and len(out) < max_strategies
+        and not out and max_strategies > 0
     ):
         out.append(general)
 

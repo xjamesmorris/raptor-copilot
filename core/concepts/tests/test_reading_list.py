@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -62,6 +63,61 @@ class TestReadingListItem:
         assert item.source_file == "crypto/algif_aead.c"
         assert item.source_line == 244
         assert item.priority == Priority.HIGH
+
+    def test_null_str_fields_normalised_at_construction(self) -> None:
+        # Producers hand LLM-derived values into the str fields, and
+        # load() rehydrates persisted rows through this constructor:
+        # a present-but-null value must land as the field default, so
+        # a poisoned reading-list.json heals on load instead of
+        # crashing every consumer that trusts the str schema.
+        item = ReadingListItem(**{
+            "id": "rl-003",
+            "question": "what does sg_chain do?",
+            "source_command": "/audit",
+            "source_file": None,
+            "source_function": None,
+            "source_hash": None,
+            "context": None,
+        })
+        assert item.source_file == ""
+        assert item.source_function == ""
+        assert item.source_hash == ""
+        assert item.context == ""
+
+    def test_non_str_leaves_normalised_at_construction(self) -> None:
+        # One step past null in the same LLM drift class: int/list/
+        # dict leaves in the str-typed fields route like absent, and
+        # the enum-backed fields heal to their DEFAULTS (an empty
+        # string is not a valid Priority/Resolution — "" there would
+        # trade a None crash for a ValueError downstream).
+        item = ReadingListItem(**{
+            "id": "rl-004",
+            "question": 42,
+            "source_command": "/audit",
+            "source_file": 9,
+            "source_function": ["f"],
+            "context": {"k": 1},
+            "priority": None,
+            "resolution": None,
+        })
+        assert item.question == ""
+        assert item.source_file == ""
+        assert item.source_function == ""
+        assert item.context == ""
+        assert item.priority == "normal"
+        assert item.resolution == "identifier"
+        assert set(item._healed_fields) == {
+            "question", "source_file", "source_function", "context",
+            "priority", "resolution",
+        }
+
+    def test_clean_construction_heals_nothing(self) -> None:
+        item = ReadingListItem(
+            id="rl-005",
+            question="q?",
+            source_command="/audit",
+        )
+        assert item._healed_fields == ()
 
 
 # ------------------------------------------------------------------
@@ -270,6 +326,72 @@ class TestReadingListPersistence:
         loaded = ReadingList.load(p)
         assert len(loaded) == 0
 
+    def test_load_heals_persisted_null_fields(self, tmp_path: Path) -> None:
+        # A reading list already poisoned on disk (rows persisted with
+        # source_file/context null before writers normalised) must
+        # rehydrate with the nulls healed to "" — existing run
+        # artifacts recover on load, no re-write required.
+        import json
+        p = tmp_path / "reading-list.json"
+        p.write_text(json.dumps({"items": [{
+            "id": "study_unresolved_apr_pool.deadbeef1234",
+            "question": "What does `apr_pool_cleanup` guarantee?",
+            "source_command": "/understand --study",
+            "source_file": None,
+            "source_function": None,
+            "context": None,
+            "resolved": False,
+            "resolution": "identifier",
+        }]}))
+        loaded = ReadingList.load(p)
+        assert len(loaded) == 1
+        assert loaded.items[0].source_file == ""
+        assert loaded.items[0].context == ""
+
+    def test_load_warns_when_healing(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        # Once every writer normalises at construction, a healed
+        # field in a PERSISTED artifact is evidence — legacy poison
+        # or an external edit — and must not vanish silently.
+        import json
+        import logging
+        p = tmp_path / "reading-list.json"
+        p.write_text(json.dumps({"items": [{
+            "id": "rl-1",
+            "question": "q?",
+            "source_command": "/audit",
+            "source_file": None,
+            "context": 7,
+        }]}))
+        with caplog.at_level(logging.WARNING, logger="core.concepts.reading_list"):
+            loaded = ReadingList.load(p)
+        assert len(loaded) == 1
+        healed_lines = [
+            r.message for r in caplog.records if "healed" in r.message
+        ]
+        assert len(healed_lines) == 1
+        # Pin the count in its message context — the line also embeds
+        # a tmp path that can itself contain a bare "2".
+        assert "healed 2 null/non-str" in healed_lines[0]
+
+    def test_load_clean_artifact_no_heal_warning(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        import json
+        import logging
+        p = tmp_path / "reading-list.json"
+        p.write_text(json.dumps({"items": [{
+            "id": "rl-1",
+            "question": "q?",
+            "source_command": "/audit",
+        }]}))
+        with caplog.at_level(logging.WARNING, logger="core.concepts.reading_list"):
+            ReadingList.load(p)
+        assert not [
+            r for r in caplog.records if "healed" in r.message
+        ]
+
     def test_atomic_write(self, tmp_path: Path) -> None:
         p = tmp_path / "reading-list.json"
         rl = ReadingList()
@@ -392,3 +514,216 @@ class TestMultiConsumer:
 
         loaded = ReadingList.load(p)
         assert len(loaded.pending()) == 0
+
+
+# ------------------------------------------------------------------
+# Shared writer lock + merge-save
+# ------------------------------------------------------------------
+
+class TestSharedWriterLock:
+    """Every load-modify-save of one reading-list.json must serialize
+    on READING_LIST_WRITE_LOCK — a per-instance lock does nothing for
+    two writers holding separate instances of the same file."""
+
+    def test_save_merged_folds_in_concurrent_items(
+        self, tmp_path: Path,
+    ) -> None:
+        p = tmp_path / "reading-list.json"
+        mine = ReadingList.load(p)
+        mine.queue(_item("rl-mine", question="q-mine"))
+        # Another writer persisted while this instance was live: a
+        # plain save() would overwrite its item.
+        other = ReadingList.load(p)
+        other.queue(_item("rl-other", question="q-other"))
+        other.save(p)
+
+        mine.save_merged(p)
+        loaded = ReadingList.load(p)
+        assert {i.id for i in loaded.items} == {"rl-mine", "rl-other"}
+
+    def test_save_merged_own_mutations_win_for_known_ids(
+        self, tmp_path: Path,
+    ) -> None:
+        p = tmp_path / "reading-list.json"
+        seed = ReadingList.load(p)
+        seed.queue(_item("rl-x", question="q-x"))
+        seed.save(p)
+
+        mine = ReadingList.load(p)
+        mine.resolve("rl-x", "concept-1")
+        # A concurrent writer re-saved the still-unresolved rl-x plus
+        # its own new item after this instance loaded.
+        other = ReadingList.load(p)
+        other.queue(_item("rl-y", question="q-y"))
+        other.save(p)
+
+        mine.save_merged(p)
+        by_id = {i.id: i for i in ReadingList.load(p).items}
+        assert by_id["rl-x"].resolved
+        assert "rl-y" in by_id
+
+    def test_save_merged_runs_under_the_shared_lock(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from core.concepts import reading_list as rl_mod
+
+        p = tmp_path / "reading-list.json"
+        held: list[bool] = []
+        real_save = ReadingList.save
+
+        def checking_save(self, path=None):
+            held.append(rl_mod.READING_LIST_WRITE_LOCK.locked())
+            return real_save(self, path)
+
+        monkeypatch.setattr(ReadingList, "save", checking_save)
+        rl = ReadingList.load(p)
+        rl.queue(_item("rl-l", question="q-l"))
+        rl.save_merged(p)
+        assert held == [True]
+
+
+class TestQuestionScopedIdentity:
+    """Distinct questions never share an id; the persistence fold
+    keeps a concurrent writer's distinct question."""
+
+    def test_same_prefix_questions_get_distinct_ids(self):
+        from core.concepts.reading_list import question_scoped_id
+        prefix = "audit-a.c:fn:" + ("what governs the buffer siz"[:30])
+        q1 = "what governs the buffer size on the read path?"
+        q2 = "what governs the buffer size on the write path?"
+        assert question_scoped_id(prefix, q1) != \
+            question_scoped_id(prefix, q2)
+        # Deterministic: the same question always yields the same id.
+        assert question_scoped_id(prefix, q1) == \
+            question_scoped_id(prefix, q1)
+
+    def test_save_merged_keeps_concurrent_distinct_question(
+        self, tmp_path,
+    ):
+        """Two writers, same lossy id, different questions: the merge
+        must keep both (the dropped one previously left its assumption
+        unverified with NO record)."""
+        from core.concepts.reading_list import (
+            ReadingList,
+            ReadingListItem,
+        )
+        path = tmp_path / "reading-list.json"
+
+        # Writer A loads (empty), holds its instance.
+        a = ReadingList.load(path)
+        a.queue(ReadingListItem(
+            id="shared_id", question="Q1: is len checked on read?",
+            source_command="/audit"))
+
+        # Writer B persists a DIFFERENT question under the same id.
+        b = ReadingList.load(path)
+        b.queue(ReadingListItem(
+            id="shared_id", question="Q2: is len checked on write?",
+            source_command="/audit"))
+        b.save(path)
+
+        # A's merge-save must fold B's item in, not destroy it.
+        a.save_merged(path)
+        on_disk = ReadingList.load(path)
+        questions = {i.question for i in on_disk.items}
+        assert questions == {
+            "Q1: is len checked on read?",
+            "Q2: is len checked on write?",
+        }, f"concurrent writer's question dropped: {questions}"
+
+    def test_audit_queue_ids_distinct_for_same_prefix(self, tmp_path):
+        from core.concepts.audit_bridge import queue_reading_list_item
+        from core.concepts.reading_list import ReadingList
+        q_base = "does the ring buffer wrap check hold for "
+        assert queue_reading_list_item(
+            tmp_path, question=q_base + "reads?",
+            source_file="a.c", source_function="ring_read")
+        assert queue_reading_list_item(
+            tmp_path, question=q_base + "writes?",
+            source_file="a.c", source_function="ring_read")
+        rl = ReadingList.load(tmp_path / "reading-list.json")
+        assert len(rl.items) == 2
+        assert len({i.id for i in rl.items}) == 2
+
+
+def _rl_race_worker(args):
+    idx, path = args
+    from core.concepts.audit_bridge import queue_reading_list_item
+    from pathlib import Path as _P
+    for k in range(10):
+        queue_reading_list_item(
+            _P(path), question=f"worker {idx} question {k}?",
+            source_file="a.c", source_function=f"fn{idx}")
+    return idx
+
+
+class TestCrossProcessReadingList:
+    """Concurrent RUNS share the project-level reading list; the
+    load->mutate->save window holds a cross-process file lock so no
+    writer drops another's items."""
+
+    def test_lock_sibling_created(self, tmp_path):
+        from core.concepts.audit_bridge import queue_reading_list_item
+        queue_reading_list_item(
+            tmp_path, question="q?", source_file="a.c",
+            source_function="f")
+        assert (tmp_path / "reading-list.json.lock").is_file()
+
+    @pytest.mark.slow
+    @pytest.mark.skipif(sys.platform == "win32",
+                        reason="fork start method")
+    def test_concurrent_queuers_lose_no_items(self, tmp_path):
+        import multiprocessing as mp
+
+        n = 6
+        ctx = mp.get_context("fork")
+        with ctx.Pool(n) as pool:
+            pool.map(_rl_race_worker,
+                     [(i, str(tmp_path)) for i in range(n)])
+        from core.concepts.reading_list import ReadingList
+        rl = ReadingList.load(tmp_path / "reading-list.json")
+        questions = {i.question for i in rl.items}
+        expected = {f"worker {i} question {k}?"
+                    for i in range(n) for k in range(10)}
+        missing = expected - questions
+        assert not missing, f"lost {len(missing)} items: " \
+            f"{sorted(missing)[:5]}..."
+
+
+class TestLoadDegradesPerItem:
+    """load's degrade-to-empty contract extends to per-record shape:
+    non-dict entries and entries missing required fields are skipped
+    with a warning, never raised out of queueing."""
+
+    def _write(self, tmp_path, body):
+        import json as _json
+        p = tmp_path / "reading-list.json"
+        p.write_text(_json.dumps(body), encoding="utf-8")
+        return p
+
+    def test_non_dict_items_skipped(self, tmp_path):
+        p = self._write(tmp_path, {"items": ["oops", 42, {
+            "id": "ok", "question": "q?", "source_command": "/audit",
+        }]})
+        rl = ReadingList.load(p)
+        assert [i.id for i in rl.items] == ["ok"]
+
+    def test_missing_required_fields_skipped(self, tmp_path):
+        p = self._write(tmp_path, {"items": [
+            {"question": "no id or command"},
+            {"id": "ok", "question": "q?",
+             "source_command": "/audit"},
+        ]})
+        rl = ReadingList.load(p)
+        assert [i.id for i in rl.items] == ["ok"]
+
+    def test_non_list_items_degrades_empty(self, tmp_path):
+        p = self._write(tmp_path, {"items": {"id": "x"}})
+        assert ReadingList.load(p).items == []
+
+    def test_queue_survives_malformed_disk_state(self, tmp_path):
+        from core.concepts.audit_bridge import queue_reading_list_item
+        self._write(tmp_path, {"items": ["oops"]})
+        assert queue_reading_list_item(
+            tmp_path, question="q?", source_file="a.c",
+            source_function="f")

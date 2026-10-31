@@ -348,6 +348,21 @@ class TestIRISExtraSecurityNames:
         )
         assert len(seqs) == 1
 
+    def test_extra_names_match_method_chain_steps(self):
+        # Method-chain steps carry ".method"-shaped call names — the
+        # extra (learned) names must match the bare tail too, or the
+        # arm is dead for every chain-shaped sequence.
+        src = textwrap.dedent("""\
+            def process(data):
+                return data.frobnicate().whizzle()
+        """)
+        assert extract_transform_sequences({"app.py": src}) == []
+        seqs = extract_transform_sequences(
+            {"app.py": src},
+            extra_security_names=frozenset({"frobnicate", "whizzle"}),
+        )
+        assert len(seqs) == 1
+
 
 class TestFormatForPrompt:
     def test_empty(self):
@@ -365,3 +380,130 @@ class TestFormatForPrompt:
         assert "a.py:clean" in text
         assert "`strip`" in text
         assert "`encode`" in text
+
+
+class TestMethodChainDeduplication:
+    def test_chain_prefixes_not_emitted_separately(self):
+        """A >=3-step method chain used to yield the full chain PLUS
+        every prefix sub-chain — double-counted catalog violations and
+        inflated sibling counts."""
+        src = textwrap.dedent("""\
+            def clean(text):
+                return text.unquote().sanitize_a().sanitize_b()
+        """)
+        seqs = extract_transform_sequences({"util.py": src})
+        assert len(seqs) == 1
+        assert [s.call_name for s in seqs[0].steps] == [
+            ".unquote", ".sanitize_a", ".sanitize_b",
+        ]
+
+    def test_two_independent_chains_both_emitted(self):
+        src = textwrap.dedent("""\
+            def clean(a, b):
+                x = a.unquote().sanitize_a()
+                y = b.escape_html().decode_entities()
+                return x, y
+        """)
+        seqs = extract_transform_sequences({"util.py": src})
+        assert len(seqs) == 2
+
+
+class TestCRegexFallback:
+    """The tree-sitter-absent fallback must not treat bare call
+    statements as function headers (that reset discards chains)."""
+
+    def test_bare_call_statement_does_not_reset_chains(self):
+        from core.audit.transform_sequence import _extract_sequences_c_regex
+        src = textwrap.dedent("""\
+            int handle(char *p) {
+                char *x;
+                x = url_decode(p);
+                log_msg(x);
+                x = check_path(x);
+                return 0;
+            }
+        """)
+        seqs = _extract_sequences_c_regex("app.c", src)
+        assert len(seqs) == 1
+        assert seqs[0].function == "handle"
+        assert [s.call_name for s in seqs[0].steps] == [
+            "url_decode", "check_path",
+        ]
+
+    def test_brace_terminated_header_with_custom_type(self):
+        from core.audit.transform_sequence import _extract_sequences_c_regex
+        src = textwrap.dedent("""\
+            size_t copy_data(char *p) {
+                x = url_decode(p);
+                x = check_path(x);
+            }
+        """)
+        seqs = _extract_sequences_c_regex("app.c", src)
+        assert len(seqs) == 1
+        assert seqs[0].function == "copy_data"
+
+    def test_control_flow_brace_is_not_a_header(self):
+        from core.audit.transform_sequence import _extract_sequences_c_regex
+        src = textwrap.dedent("""\
+            int handle(char *p) {
+                x = url_decode(p);
+                if (x != 0) {
+                    log_it();
+                }
+                x = check_path(x);
+            }
+        """)
+        seqs = _extract_sequences_c_regex("app.c", src)
+        assert len(seqs) == 1
+        assert seqs[0].function == "handle"
+
+
+class TestAllDuplicatesReported:
+    def test_multiple_distinct_duplicates_all_reported(self):
+        """The check used to stop at the first duplicate per chain."""
+        src = textwrap.dedent("""\
+            def process(data):
+                data = custom_sanitize(data)
+                data = validate_input(data)
+                data = custom_sanitize(data)
+                data = validate_input(data)
+                return data
+        """)
+        violations = detect_transform_order_violations({"app.py": src})
+        dups = [
+            v for v in violations
+            if v.catalog_rule == "duplicate_transform"
+        ]
+        assert len(dups) == 2
+        names = " ".join(v.violation for v in dups)
+        assert "custom_sanitize" in names
+        assert "validate_input" in names
+
+
+class TestFuncHeaderQualifierRun:
+    def test_qualifier_word_run_is_fast(self):
+        """Hostile source line that is one long run of qualifier
+        words with no paren: the keyword and type loops overlap on
+        every word, so the unbounded spelling tried every split of
+        the run between them — worse than quadratic per line. The
+        bounded loops are linear."""
+        from core.audit.transform_sequence import _FUNC_HEADER_RE
+        from core.testing.wallclock import cpu_budget
+
+        with cpu_budget(1.0, what="qualifier-run header scan"):
+            assert _FUNC_HEADER_RE.match("static " * 40000) is None
+
+    def test_header_forms_still_match(self):
+        from core.audit.transform_sequence import _FUNC_HEADER_RE
+
+        for line, name in (
+            ("static int copy_data(char *p) {", "copy_data"),
+            ("func (s *Server) Handle(w http.ResponseWriter) {",
+             "Handle"),
+            ("  def process(self):", "process"),
+            ("export async function render(props) {", "render"),
+        ):
+            m = _FUNC_HEADER_RE.match(line)
+            assert m is not None, line
+            assert m.group(1) == name, line
+        assert _FUNC_HEADER_RE.match("log_msg(x);") is None

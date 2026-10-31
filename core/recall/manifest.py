@@ -50,6 +50,7 @@ never recall.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -59,6 +60,18 @@ SCHEMA_VERSION = 1
 
 #: Detection profiles the runner knows how to execute. Values document
 #: LLM usage so cost is visible before a run starts.
+#:
+#: CLOSED VOCABULARY, both directions. A profile name maps to exactly
+#: one argv shape (``build_pipeline_argv``'s if/elif) — never a
+#: passthrough: a generic per-manifest ``extra_args`` would let
+#: arbitrary flags into a measurement run's argv, so a report's
+#: ``profile`` stamp would no longer determine what actually ran and
+#: reports would stop being comparable across runs. Conversely, a new
+#: detector configuration worth measuring gets its OWN named profile
+#: (e.g. ``agentic-taint``) rather than mutating an existing one:
+#: baseline/candidate comparisons need both shapes to stay runnable
+#: side by side, and an unknown name must keep refusing loudly (a
+#: typo must never silently fall back to a different detector).
 PROFILES: dict[str, dict[str, Any]] = {
     "scan": {"uses_llm": False,
              "description": "semgrep + local rules via raptor.py scan"},
@@ -68,6 +81,12 @@ PROFILES: dict[str, dict[str, Any]] = {
                 "description": ("full scan -> dedup -> LLM analysis "
                                  "pipeline — every finding costs LLM "
                                  "tokens")},
+    "agentic-taint": {"uses_llm": True,
+                      "description": ("agentic plus the cross-file "
+                                      "taint engine (appends exactly "
+                                      "--taint-crossfile) — the "
+                                      "flip-gate candidate profile; "
+                                      "LLM cost as agentic")},
 }
 
 _CWE_RE = re.compile(r"^CWE-\d{1,5}$")
@@ -82,15 +101,22 @@ class ManifestError(ValueError):
 
 @dataclass(frozen=True)
 class Provenance:
-    kind: str  # "benchmark" | "cve"
+    kind: str  # "benchmark" | "cve" | "synthetic"
     suite: str | None = None
     case: str | None = None
     cve_id: str | None = None
     fix_commit: str | None = None
+    #: synthetic-kind fields: the in-tree generator that authored the
+    #: flaw (public by construction — the generator ships) plus the
+    #: seed that reproduces it. Kind-separated on purpose: synthetic
+    #: labels never masquerade as benchmark or CVE provenance.
+    generator: str | None = None
+    seed: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"kind": self.kind}
-        for k in ("suite", "case", "cve_id", "fix_commit"):
+        for k in ("suite", "case", "cve_id", "fix_commit",
+                  "generator", "seed"):
             v = getattr(self, k)
             if v is not None:
                 d[k] = v
@@ -142,6 +168,38 @@ class RecallManifest:
     tolerance: Tolerance = field(default_factory=Tolerance)
 
 
+def compute_label_digest(manifest: RecallManifest) -> str:
+    """Content digest over the label set a report was scored against.
+
+    Stamped on every recall report (``label_digest``) and pinned by
+    the flip gate on both sides: pruning ``clean_regions`` — or
+    editing any expected/clean label — between the baseline freeze and
+    the candidate run changes the digest and refuses the gate.
+    ``pinned_sha`` + ``expected_total`` alone cannot see a
+    clean-region edit, which would silently blind the FP ceiling.
+
+    Deliberately EXCLUDES the detection profile (the flip pair
+    differs there by design) and the machine-local naming fields
+    (``name``, ``repo_url``, ``local_path``). Order-sensitive on
+    purpose: a reordered label file is a changed label file — the
+    remedy is a re-freeze, never a guess.
+    """
+    from core.json import dumps_canonical
+
+    payload = {
+        "pinned_sha": manifest.pinned_sha,
+        "language": manifest.language,
+        "tolerance": {
+            "line_drift": manifest.tolerance.line_drift,
+            "cwe_family_match": manifest.tolerance.cwe_family_match,
+        },
+        "expected": [e.to_dict() for e in manifest.expected],
+        "clean_regions": [e.to_dict() for e in manifest.clean_regions],
+    }
+    blob = dumps_canonical(payload)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
 def _parse_provenance(raw: Any, where: str, errors: list[str]) -> Provenance:
     if not isinstance(raw, dict):
         errors.append(f"{where}: provenance missing or not an object")
@@ -162,10 +220,24 @@ def _parse_provenance(raw: Any, where: str, errors: list[str]) -> Provenance:
             errors.append(f"{where}: cve provenance needs a fix commit sha")
         return Provenance(kind="cve", cve_id=cve or None,
                           fix_commit=fix or None)
+    if kind == "synthetic":
+        if not raw.get("generator") or not raw.get("case"):
+            errors.append(
+                f"{where}: synthetic provenance needs generator and "
+                "case (the in-tree generator + the case it produced)")
+        seed = raw.get("seed")
+        if seed is not None and not isinstance(seed, int):
+            errors.append(
+                f"{where}: synthetic provenance seed must be an int")
+            seed = None
+        return Provenance(kind="synthetic",
+                          generator=raw.get("generator"),
+                          case=raw.get("case"), seed=seed)
     errors.append(
-        f"{where}: provenance.kind must be 'benchmark' or 'cve' — "
-        "recall labels require public provenance (no undisclosed "
-        "vulnerabilities in corpora)")
+        f"{where}: provenance.kind must be 'benchmark', 'cve', or "
+        "'synthetic' — recall labels require public provenance (no "
+        "undisclosed vulnerabilities in corpora; synthetic flaws are "
+        "generator-authored, public by construction)")
     return Provenance(kind=str(kind))
 
 

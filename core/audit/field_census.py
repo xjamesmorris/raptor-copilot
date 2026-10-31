@@ -48,7 +48,8 @@ from pathlib import Path
 from typing import Any
 from collections.abc import Iterable
 
-from core.json import dumps_artifact, load_json
+from core.json import load_json, save_json
+from core.source.lines import split_lines
 
 from .struct_accessor_index import _MIN_FIELD_LEN, _NOISE_FIELDS, _detect_lock
 
@@ -152,8 +153,8 @@ class FieldRecord:
     """All census sites for one field name."""
 
     field: str
-    writes: list[FieldWrite] = field(default_factory=list)
-    reads: list[FieldRead] = field(default_factory=list)
+    writes: list[FieldWrite] = field(default_factory=list)  # type: ignore[operator]
+    reads: list[FieldRead] = field(default_factory=list)  # type: ignore[operator]
     tier: str = TIER_TREE_SITTER
     sites_capped: bool = False
 
@@ -323,21 +324,41 @@ _WRITE_RE = re.compile(r"\b(\w+)\s*->\s*(\w+)\s*=(?![=>])")
 _ACCESS_RE = re.compile(r"\b(\w+)\s*->\s*(\w+)\b")
 _LOCAL_ALIAS_RE = re.compile(r"\b(\w+)\s*=\s*(\w+)\s*->\s*(\w+)\s*;")
 _CALL_AFTER_RE = re.compile(r"\A\s*\(")
+# Bounded windows on the newline-crossing spans. The head class and
+# the params class both cross newlines BY DESIGN (kernel-style
+# ``static void\nname(...)`` declarations and multi-line parameter
+# lists must keep matching), but the unbounded spelling made every
+# MULTILINE ``^`` restart re-scan the remaining text: a planted file
+# of prototype-shaped word lines with no ``(``/``)`` costs O(lines x
+# tail) — quadratic. Bound trade-off, both directions: larger keeps
+# pathological declarations matching but raises the per-anchor
+# re-scan ceiling; smaller is faster but a real head/params longer
+# than the bound stops matching. 256 head chars / 4096 params chars
+# sit far above real C (a dozen qualifiers / a hundred parameters)
+# while capping per-anchor work at a constant.
 _FUNC_DEF_RE = re.compile(
-    r"^(?P<head>[A-Za-z_][\w\s\*]*?)\b(?P<name>[A-Za-z_]\w*)\s*"
-    r"\((?P<params>[^;{)]*)\)\s*\{",
+    r"^(?P<head>[A-Za-z_][\w\s\*]{0,256}?)\b(?P<name>[A-Za-z_]\w*)\s*"
+    r"\((?P<params>[^;{)]{0,4096})\)\s*\{",
     re.MULTILINE,
 )
 _C_KEYWORDS = frozenset({
     "if", "for", "while", "switch", "return", "sizeof", "do", "else",
 })
 _NULL_TOKENS = frozenset({"NULL", "nullptr"})
-_CONST_RE = re.compile(r"\A(?:0[xX][0-9a-fA-F]+|\d+|\".*\"|'.')\s*;?\s*\Z")
-_IDENT_RE = re.compile(r"\A([A-Za-z_]\w*)\s*;?\s*\Z")
+# Tail semicolons gate their own whitespace ((?:;\s*)?) in the
+# three RHS classifiers: the naive ``\s*;?\s*\Z`` put two
+# whitespace spans around the optional semicolon — quadratic on an
+# RHS ending in a whitespace run, even anchored.
+_CONST_RE = re.compile(r"\A(?:0[xX][0-9a-fA-F]+|\d+|\".*\"|'.')\s*(?:;\s*)?\Z")
+_IDENT_RE = re.compile(r"\A([A-Za-z_]\w*)\s*(?:;\s*)?\Z")
 _CALL_RHS_RE = re.compile(r"\A\(?\s*(?:\([\w\s\*]+\)\s*)?([A-Za-z_]\w*)\s*\(")
+# The cast and ampersand atoms gate their own trailing whitespace —
+# the naive ``\s*(?:\(..\)\s*)?&?\s*`` chain put unbounded
+# whitespace spans around two optional atoms (quadratic even
+# anchored). Same match set.
 _FIELD_RHS_RE = re.compile(
-    r"\A\(?\s*(?:\([\w\s\*]+\)\s*)?&?\s*([A-Za-z_]\w*)\s*(?:->|\.)\s*"
-    r"([A-Za-z_]\w*)\s*;?\s*\Z"
+    r"\A\(?\s*(?:\([\w\s\*]+\)\s*)?(?:&\s*)?([A-Za-z_]\w*)\s*(?:->|\.)\s*"
+    r"([A-Za-z_]\w*)\s*(?:;\s*)?\Z"
 )
 
 
@@ -673,6 +694,7 @@ def build_field_census(
     budget_s: float = CENSUS_BUDGET_S,
     max_fields: int = MAX_CENSUS_FIELDS,
     max_sites_per_field: int = MAX_SITES_PER_FIELD,
+    out_dir: Path | str | None = None,
 ) -> FieldCensus:
     """Build the whole-target field-access census.
 
@@ -699,7 +721,12 @@ def build_field_census(
             return True
         return len(name) >= _MIN_FIELD_LEN and name not in _NOISE_FIELDS
 
-    for file_path in sorted(source_texts):
+    from .heartbeat import Heartbeat
+    hb = Heartbeat(out_dir, "field_census")
+    for visited, file_path in enumerate(sorted(source_texts)):
+        # Throttled + best-effort inside — liveness signal while the
+        # census parses a large tree with no other run-dir writes.
+        hb.beat(done=visited, total=len(source_texts))
         if time.monotonic() - t0 > budget_s:
             telemetry["budget_exceeded"] = True
             break
@@ -830,8 +857,11 @@ def build_field_census_cached(
                     len(census.fields), len(census.functions),
                 )
                 return census
+    # out_dir rides explicitly (heartbeat destination), never through
+    # **kwargs: it must not perturb the cache fingerprint above.
     census = build_field_census(
-        source_texts, priority_fields=priority_fields, **kwargs,
+        source_texts, priority_fields=priority_fields, out_dir=out_dir,
+        **kwargs,
     )
     if (
         out_dir is not None
@@ -868,7 +898,7 @@ def _scan_file_ts(
 ) -> list[FunctionSpan]:
     src = source.encode("utf-8", errors="replace")
     spans = _function_spans_ts(tree, source)
-    lines = source.splitlines()
+    lines = split_lines(source)
     lock_cache: dict[str, str] = {}
 
     def _lock_for(span: FunctionSpan | None) -> str:
@@ -952,7 +982,7 @@ def _scan_file_regex(
             lock_cache[span.name] = _detect_lock(segment)
         return lock_cache[span.name]
 
-    for lineno, text in enumerate(source.splitlines(), 1):
+    for lineno, text in enumerate(split_lines(source), 1):
         span = _span_for_line(spans, lineno)
         function = span.name if span else ""
         params = span.params if span else ()
@@ -1053,8 +1083,10 @@ def write_census_artifact(census: FieldCensus,
                           out_dir: Path) -> Path | None:
     """Persist ``field-census.json`` (mirrors ``return-census.json``)."""
     try:
+        # Atomic write (tempfile + rename via save_json): a torn write
+        # would leave a field-census.json that fails to parse.
         path = Path(out_dir) / ARTIFACT_NAME
-        path.write_text(dumps_artifact(census.to_dict(), indent=1))
+        save_json(path, census.to_dict())
         return path
     except OSError:
         logger.debug("field-census.json write failed", exc_info=True)

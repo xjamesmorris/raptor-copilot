@@ -358,14 +358,18 @@ def _build_vulnerabilities(
         analysis: dict[str, Any] = {}
         if f.reachability.verdict == "likely_called":
             analysis["state"] = "exploitable"
-            analysis["justification"] = "in_triage"
+            # No "justification": the CycloneDX impact-analysis
+            # justification enum only has not-affected reasons
+            # (code_not_reachable, requires_configuration, ...) —
+            # "in_triage" is a STATE, and emitting it as a
+            # justification made strict consumers (Dependency-Track,
+            # cyclonedx-cli validate) reject the whole BOM.
             analysis["detail"] = (
                 "function-level reachability: vulnerable symbol called "
                 "on a live execution path"
             )
         elif f.reachability.verdict == "imported":
             analysis["state"] = "exploitable"
-            analysis["justification"] = "in_triage"
             analysis["detail"] = (
                 "module-level reachability: imported in non-test source"
             )
@@ -390,11 +394,14 @@ def _build_vulnerabilities(
             # surfaces it for human review with the supporting
             # reason.
             analysis["state"] = "in_triage"
-            analysis["justification"] = "code_not_reachable"
+            # No "justification": the enum semantically pairs with
+            # not_affected only (the likely_called branch above
+            # documents the same rule) — the dead-code reasoning
+            # belongs in detail.
             analysis["detail"] = f.reachability.confidence.reason
         elif f.in_kev:
             analysis["state"] = "exploitable"
-            analysis["justification"] = "in_triage"
+            # No justification — see the reachability arms above.
             analysis["detail"] = "CVE listed in CISA KEV catalog"
         if f.epss is not None:
             entry.setdefault("properties", []).append({

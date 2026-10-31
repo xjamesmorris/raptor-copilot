@@ -31,18 +31,22 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import math
 import os
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from codeql_scope import (
+    SCAN_ROOTS,
     build_graph,
     discover_py_files,
     init_imports,
+    missing_graph_covered_py,
     transitive_dependents,
 )
 
@@ -83,6 +87,23 @@ TIERS: dict[str, dict] = {
         "test_dirs": ["packages/source_intel/tests"],
         "env": "source_intel",
         "env_reason": "needs coccinelle (spatch)",
+    },
+    # The whole engine/ root: rule-precision suites (semgrep ReDoS
+    # gate, per-rule coccinelle tests, vocab/api-pack renderers) that
+    # previously ran in NO CI lane — engine/ was outside SCAN_ROOTS,
+    # every tier's test_dirs, and the fast tier's core|packages bound,
+    # so an engine-only PR dispatched zero tiers and a rule regression
+    # merged green forever. Claimed as a directory (like sca's
+    # packages/sca) so future engine/<subsystem>/tests dirs are
+    # covered without a registry edit. The spatch-driven rule tests
+    # run for real on the container path (the CI deps image bakes in
+    # coccinelle — the source_intel precedent); the runner fallback
+    # and toolless hosts skip them via their shutil.which guards.
+    "engine": {
+        "test_dirs": ["engine"],
+        "env": "engine",
+        "env_reason": "needs coccinelle (spatch) + semgrep for the "
+                      "rule-precision gates",
     },
     "prompt_audit": {
         "test_files": ["core/security/tests/test_prompt_envelope_audit.py"],
@@ -130,12 +151,95 @@ TIERS: dict[str, dict] = {
         ],
         "outside_graph": True,
     },
+    "redos_census": {
+        # The ReDoS idiom census (.github/tests) asserts an invariant
+        # OVER runtime source: no blank-run-quadratic regex member
+        # under core/, packages/, engine/, libexec/. The change class
+        # that can ADD a member is therefore a runtime-source change —
+        # which never touches .github and so never fired ci_lint: a PR
+        # introducing a member merged green and the census fired at
+        # the next force_full event or unrelated .github change,
+        # misattributed and late. This tier routes the census's OWN
+        # universe to it (one test file, a few seconds) WITHOUT
+        # widening ci_lint to core/ — dragging the whole .github suite
+        # in for every runtime edit is exactly the scope erosion the
+        # ci_lint comment below forbids.
+        #
+        # Two-direction pin: the census itself asserts this trigger
+        # set covers every file its universe walk yields and carries
+        # no dead entry (test_dispatch_triggers_cover_the_universe),
+        # so a widened census universe fails CI until the triggers
+        # follow — the trigger set stays derived from the universe
+        # definition, never hand-drifted.
+        "test_files": [".github/tests/test_redos_idiom_census.py"],
+        "extra_triggers": [
+            "core", "packages", "engine", "libexec",
+            # The census universe also walks the coverage plugin's
+            # launcher and the repo-root entry scripts.
+            "plugins",
+            "raptor.py", "raptor_agentic.py", "raptor_codeql.py",
+            "raptor_fuzzing.py", "raptor_openant.py",
+        ],
+        "outside_graph": True,
+    },
     "ci_lint": {
         "test_dirs": [".github/tests", ".github/scripts/tests"],
-        "extra_triggers": [".github/scripts"],
+        # .github/tests asserts workflow CONTENT (lint.yml step shapes,
+        # workflow paths), pins CLAUDE.md / .claude/commands prose,
+        # ruff config in pyproject.toml, README's self-check section,
+        # README-Copilot's execution-wait doctrine, and the libexec//bin
+        # launcher-preamble identity templates — so edits to any of those
+        # must fire this tier too, not only .github/scripts changes;
+        # otherwise a breaking edit merges green and reddens the next
+        # scheduled full run, misattributed.
+        #
+        # Both directions: every entry here must be content-pinned by
+        # a test this tier runs (TestCiLintTriggerClosure derives the
+        # _read() targets mechanically); conversely, unpinned files
+        # (LICENSE, docs/...) must NOT be added — dragging the tier in
+        # for unrelated edits erodes the scoping this dispatch exists
+        # to provide.
+        "extra_triggers": [
+            ".github/scripts",
+            ".github/workflows",
+            ".github/copilot/settings.json",
+            ".gitignore",
+            "CLAUDE.md",
+            ".claude",
+            "plugins/agents",
+            "README.md",
+            "README-Copilot.md",
+            "pyproject.toml",
+            "libexec",
+            "bin",
+            # Content-pinned by the ci-controls doc-coverage gate:
+            # every workflow must keep its row in this doc, so editing
+            # the doc must re-fire the tier that asserts it.
+            "docs/ci-controls.md",
+        ],
         "outside_graph": True,
     },
 }
+
+#: Top-level data trees with no importable code of their own. Their
+#: consumers reference them by repo-relative path (packages/sca,
+#: llm_analysis, core/startup and core/inventory suites all read
+#: test/data/...), so neither the import graph nor any tier's
+#: test_dirs can claim their files — a corpus-label or fixture-
+#: manifest edit under test/ dispatched ZERO tiers and broke the
+#: consuming suite on the next unrelated run, misattributed. Every
+#: changed path under these roots (.py fixture files included — they
+#: carry no import-graph key) routes through the resource arms; since
+#: no mapping claims a repo-root data path, that is fail-toward-full
+#: dispatch, matching the design's unmappable rule.
+DATA_ROOTS = ("test",)
+
+
+def in_data_root(path: str) -> bool:
+    return any(
+        path == r or path.startswith(r + "/") for r in DATA_ROOTS
+    )
+
 
 FAST_TIER_IGNORES = {
     "core/sandbox/tests",
@@ -144,13 +248,98 @@ FAST_TIER_IGNORES = {
     "packages/llm_analysis/tests",
     "packages/cve_diff/tests",
     "packages/fuzzing/tests",
-    "packages/oss_forensics/tests",
     "packages/source_intel/tests",
     "packages/sca",
     "core/sage/tests",
     "core/orchestration/tests",
     "core/security/tests/test_prompt_envelope_audit.py",
 }
+
+
+#: Repo-relative paths of files that ARE the test harness — every
+#: tier's execution flows through them, so a change to any one must
+#: dispatch the FULL tier set.
+#:
+#: Root pytest harness (conftest.py, pytest.ini): every tier runs
+#: under their configuration (fixtures, emulation/egress guards,
+#: marker filters, addopts). The directory-tree conftest expansion
+#: cannot express that blast radius (the root's prefix "./" matches
+#: no relative path), pytest.ini is neither a .py file nor a
+#: requirements/pyproject infra trigger, and the preflight
+#: deliberately excludes conftest.py — so without this gate a PR
+#: touching only these files dispatched ZERO tiers and merged green
+#: with no tests run.
+#:
+#: CI dispatch harness (tests.yml / _tier.yml / preflight.yml and the
+#: scope scripts they run): these define every tier's pytest
+#: invocation, env guards, and gating. A PR touching only them fired
+#: ci_lint at most — but GHA only executes the jobs that gate ON,
+#: which was none, so a tier-command regression (wrong pytest args,
+#: dropped env guard, an under-dispatching scope bug) merged green
+#: and surfaced on the next real PR or the cron, misattributed —
+#: the same delayed-failure shape as the root pytest case above.
+ROOT_HARNESS_FILES = frozenset({
+    "conftest.py",
+    "pytest.ini",
+    ".github/workflows/tests.yml",
+    ".github/workflows/_tier.yml",
+    ".github/workflows/preflight.yml",
+    ".github/scripts/test_scope.py",
+    ".github/scripts/codeql_scope.py",
+    ".github/scripts/preflight_scope.py",
+})
+
+
+def is_dependency_manifest(path: str) -> bool:
+    """Root-level dependency manifests: requirements*.txt, pyproject.toml,
+    and uv.lock.
+
+    Every heavy tier installs from these files (the venv jobs and
+    _tier.yml key their caches on ``hashFiles('uv.lock')``), so a
+    manifest-only PR must dispatch the FULL tier set: scoping it to the
+    fast tier let a pin bump that broke a carved-out tier merge green and
+    redden that tier's next unrelated run, misattributed — the same
+    delayed-failure shape as the root-harness case. The sibling CodeQL
+    scoper already treats these files as full-scan-worthy. Root-level
+    only: manifests inside test fixture trees are test data, not the CI
+    install surface.
+
+    Trade-off of the root-level restriction: if the install surface
+    ever moves into a directory (e.g. a ``requirements/base.txt``
+    layout), this pattern dispatches NOTHING for it — widen the
+    pattern together with the workflows' hashFiles() keys when that
+    happens. The tie is oracle-tested: every root-level file the
+    workflows' hashFiles() expressions key caches on must be claimed
+    here (test_hashfiles_manifests_are_claimed), so moving the venv
+    cache keys without widening this pattern fails the suite.
+    """
+    return path in {"pyproject.toml", "uv.lock"} or (
+        "/" not in path and path.startswith("requirements")
+    )
+
+
+def expand_conftest(changed_py: set[Path], all_py: list[Path]) -> set[Path]:
+    """Files affected by changed conftest.py files.
+
+    A conftest applies to every test in its directory tree; the
+    repo-root conftest's tree is the whole repo. Tier-dispatch callers
+    additionally treat root-harness changes as full dispatch (see
+    ``ROOT_HARNESS_FILES``); this expansion still covers the root case
+    so import-graph consumers that skip that gate stay sound.
+    """
+    extra: set[Path] = set()
+    for f in changed_py:
+        if f.name != "conftest.py":
+            continue
+        pkg_dir = f.parent
+        if pkg_dir == Path("."):
+            extra.update(af for af in all_py if af != f)
+            continue
+        prefix = str(pkg_dir) + "/"
+        for af in all_py:
+            if af != f and str(af).startswith(prefix):
+                extra.add(af)
+    return extra
 
 
 def is_test_file(path: Path) -> bool:
@@ -199,8 +388,264 @@ def file_in_fast_tier(path: Path) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Non-Python resource files (runtime data, fixtures, templates)
+# ---------------------------------------------------------------------------
+
+_FIXTURE_DIR_NAMES = frozenset({"fixtures", "data", "testdata"})
+
+_FIXTURE_PATTERNS = (
+    "fixtures",
+    "data",
+    "testdata",
+    "FIXTURE",
+    "DATA_DIR",
+    "fixture_dir",
+    "data_dir",
+    "test_data",
+)
+
+
+def _resolve_path_div_chain(node: ast.expr) -> list[str]:
+    """Walk a ``Path(...) / "a" / "b"`` chain and return the string parts."""
+    parts: list[str] = []
+    while isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+        rhs = node.right
+        if isinstance(rhs, ast.Constant) and isinstance(rhs.value, str):
+            parts.append(rhs.value)
+        else:
+            break
+        node = node.left
+    parts.reverse()
+    return parts
+
+
+def _extract_fixture_dirs(path: Path, repo: Path) -> list[Path]:
+    """Find fixture/data directories referenced by a test file.
+
+    Parses the AST for ``Path(__file__).parent / "fixtures" / "sub"``
+    chains, resolving the deepest directory that exists on disk.
+    Falls back to scanning for sibling fixture directories when the
+    AST doesn't yield results.
+    """
+    try:
+        source = (repo / path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    if not any(p in source for p in _FIXTURE_PATTERNS):
+        return []
+
+    dirs: set[Path] = set()
+    test_dir = (repo / path).parent
+
+    try:
+        tree = ast.parse(source, filename=str(path))
+    except (SyntaxError, ValueError):
+        return []
+
+    # Collect BinOp / nodes that are NOT the left child of another /.
+    # This gives us only the outermost (longest) chain, not sub-chains.
+    inner_lefts: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+            inner_lefts.add(id(node.left))
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.BinOp) or not isinstance(node.op, ast.Div):
+            continue
+        if id(node) in inner_lefts:
+            continue
+        parts = _resolve_path_div_chain(node)
+        if not parts or parts[0] not in _FIXTURE_DIR_NAMES:
+            continue
+        candidate = test_dir
+        for part in parts:
+            candidate = candidate / part
+        if candidate.is_dir():
+            dirs.add(candidate)
+
+    if not dirs:
+        for name in _FIXTURE_DIR_NAMES:
+            candidate = test_dir / name
+            if candidate.is_dir() and name in source:
+                dirs.add(candidate)
+
+    return list(dirs)
+
+
+def _discover_data_files(dirs: list[Path], repo: Path) -> set[Path]:
+    """Collect all non-Python files under fixture directories."""
+    files: set[Path] = set()
+    for d in dirs:
+        if not d.is_dir():
+            continue
+        for p in d.rglob("*"):
+            if p.is_file() and p.suffix != ".py" and p.suffix != ".pyc":
+                try:
+                    files.add(p.relative_to(repo))
+                except ValueError:
+                    pass
+    return files
+
+
+def build_data_file_map(
+    test_files: list[Path], repo: Path,
+) -> dict[Path, set[Path]]:
+    """Map data files → test files that use them."""
+    data_to_tests: dict[Path, set[Path]] = defaultdict(set)
+    for tf in test_files:
+        fixture_dirs = _extract_fixture_dirs(tf, repo)
+        if not fixture_dirs:
+            continue
+        data_files = _discover_data_files(fixture_dirs, repo)
+        for df in data_files:
+            data_to_tests[df].add(tf)
+    return dict(data_to_tests)
+
+
+def _owning_package_seeds(path: Path, all_py: list[Path]) -> set[Path]:
+    """The .py files of the package that owns a resource file.
+
+    Walks up from the resource's directory to (but not including) its
+    scan root, returning every known .py file under the nearest
+    ancestor that has any: the code reading a bundled resource lives
+    beside it (``core/x/data/foo.json`` → ``core/x``'s modules), and
+    the import graph then finds that code's tests. Membership is
+    checked against the discovered file list, not the disk, so a
+    deleted resource whose directory went with it still resolves.
+
+    Empty result = no owning package below the scan root; the caller
+    must treat the file as unmappable.
+    """
+    for parent in path.parents:
+        s = str(parent)
+        if s == "." or s in SCAN_ROOTS:
+            break
+        prefix = s + "/"
+        seeds = {af for af in all_py if str(af).startswith(prefix)}
+        if seeds:
+            return seeds
+    return set()
+
+
+# ---------------------------------------------------------------------------
 # Dynamic batching
 # ---------------------------------------------------------------------------
+
+#: Env var naming a JSON file that maps test-file path (repo-relative,
+#: as emitted in the matrix) → total seconds. Produced by
+#: junit_durations.py from a full-run junit XML. Optional: when unset
+#: or unusable, batching stays count-based.
+DURATIONS_ENV = "RAPTOR_TEST_DURATIONS"
+
+
+def _load_duration_map() -> dict[str, float] | None:
+    """The ``RAPTOR_TEST_DURATIONS`` file→seconds map, or None.
+
+    Fail-open contract: this feeds a CI-critical path (an empty or
+    skewed matrix silently under-runs tests), so ANY defect — env
+    unset, file missing/unreadable, JSON malformed, wrong shape, a
+    non-numeric / negative / non-finite value — yields None and the
+    caller keeps the pre-existing count-based behavior EXACTLY. Every
+    fallback is logged loudly so a wiring regression is visible in the
+    job log instead of silently degrading batch balance.
+    """
+    env_val = os.environ.get(DURATIONS_ENV)
+    if not env_val:
+        return None
+    try:
+        with open(env_val, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, ValueError) as exc:
+        print(
+            f"::warning::{DURATIONS_ENV}={env_val} unusable ({exc}) — "
+            "falling back to count-based round-robin batching"
+        )
+        return None
+    if not isinstance(raw, dict):
+        print(
+            f"::warning::{DURATIONS_ENV}={env_val} is not a JSON object "
+            "— falling back to count-based round-robin batching"
+        )
+        return None
+    out: dict[str, float] = {}
+    for key, val in raw.items():
+        if (
+            not isinstance(key, str)
+            or isinstance(val, bool)
+            or not isinstance(val, (int, float))
+            or not math.isfinite(val)
+            or val < 0
+        ):
+            print(
+                f"::warning::{DURATIONS_ENV}={env_val} has a malformed "
+                f"entry ({key!r}: {val!r}) — falling back to count-based "
+                "round-robin batching"
+            )
+            return None
+        out[key] = float(val)
+    return out
+
+
+def _round_robin(sorted_files: list[str], n_batches: int) -> list[list[str]]:
+    """Count-based partition: batch sizes differ by at most 1
+    (26 files → 13+13, not 25+1)."""
+    batches: list[list[str]] = [[] for _ in range(n_batches)]
+    for i, f in enumerate(sorted_files):
+        batches[i % n_batches].append(f)
+    return batches
+
+
+def _lpt_partition(
+    sorted_files: list[str],
+    durations: dict[str, float],
+    n_batches: int,
+) -> list[list[str]]:
+    """Duration-aware partition: greedy LPT (longest processing time
+    first) — place each file, heaviest first, on the currently
+    lightest batch, so max-batch wallclock approaches total/n instead
+    of tracking whichever batch round-robin dealt the heavy files to.
+
+    Files absent from the duration map get the median of the mapped
+    files' durations: a neutral weight that neither hides a new heavy
+    file at zero cost nor lets one unknown dominate placement.
+
+    Tie-breaking is (load, count, index): with many zero/equal
+    durations a load-only minimum would keep feeding one batch and
+    could emit an EMPTY batch — an empty ``files`` matrix entry runs
+    pytest with no path args, i.e. the whole repo. The count term
+    spreads ties, and because an untouched batch always compares
+    lowest, the first ``n_batches`` placements land in distinct
+    batches — no batch is ever empty while ``len(files) >= n_batches``
+    (callers guarantee this via the ``n_batches`` formula; the
+    invariant is regression-pinned in the test suite).
+    """
+    import heapq
+
+    known = [durations[f] for f in sorted_files if f in durations]
+    if known:
+        default = sorted(known)[len(known) // 2]
+    else:
+        default = 1.0  # no overlap at all: uniform weights ≈ count-based
+    weighted = sorted(
+        ((durations.get(f, default), f) for f in sorted_files),
+        key=lambda pair: (-pair[0], pair[1]),
+    )
+    heap: list[tuple[float, int, int]] = [
+        (0.0, 0, i) for i in range(n_batches)
+    ]
+    heapq.heapify(heap)
+    batches: list[list[str]] = [[] for _ in range(n_batches)]
+    for dur, f in weighted:
+        load, count, idx = heapq.heappop(heap)
+        batches[idx].append(f)
+        heapq.heappush(heap, (load + dur, count + 1, idx))
+    print(
+        f"batch_matrix: duration-aware LPT over {n_batches} batches "
+        f"({len(known)}/{len(sorted_files)} files in duration map, "
+        f"default {default:.2f}s for the rest)"
+    )
+    return [sorted(b) for b in batches]
+
 
 def batch_matrix(
     files: list[Path],
@@ -213,17 +658,22 @@ def batch_matrix(
     Returns a list of ``{"batch": N, "files": "a.py b.py ..."}`` dicts
     suitable for ``strategy.matrix.include: ${{ fromJSON(...) }}``.
 
-    Uses round-robin distribution so batch sizes differ by at most 1
-    (26 files → 13+13, not 25+1).
+    Balance strategy: when ``RAPTOR_TEST_DURATIONS`` names a usable
+    per-file duration map (see ``_load_duration_map``), batches are
+    bin-packed by measured seconds (greedy LPT); otherwise — including
+    on ANY defect in the env var or file — distribution is count-based
+    round-robin, byte-identical to the historical behavior.
     """
     if not files:
         return []
     sorted_files = sorted(str(f) for f in files)
     n = len(sorted_files)
     n_batches = min(max_batches, max(1, math.ceil(n / target_per_batch)))
-    batches: list[list[str]] = [[] for _ in range(n_batches)]
-    for i, f in enumerate(sorted_files):
-        batches[i % n_batches].append(f)
+    durations = _load_duration_map()
+    if durations is None:
+        batches = _round_robin(sorted_files, n_batches)
+    else:
+        batches = _lpt_partition(sorted_files, durations, n_batches)
     return [
         {"batch": i + 1, "files": " ".join(b)}
         for i, b in enumerate(batches)
@@ -263,21 +713,89 @@ def compute_tier_dispatch(
     The ``python`` (fast) tier additionally includes a ``"matrix"``
     key with the ``batch_matrix()`` result.
     """
+    # Root harness files reconfigure every tier's run — full dispatch.
+    harness_hits = sorted(
+        f for f in changed_files if f in ROOT_HARNESS_FILES
+    )
+    if harness_hits:
+        print(
+            f"Root harness change ({', '.join(harness_hits)}) — "
+            "full tier dispatch (see ROOT_HARNESS_FILES)"
+        )
+        result = _force_all_dispatch(repo)
+        n_all = len(discover_py_files(repo))
+        result["_stats"] = {
+            "closure": n_all,
+            "total": n_all,
+            "changed": len(changed_files),
+            "dependents": 0,
+        }
+        return result
+
+    # Dependency manifests reconfigure what every tier installs —
+    # full dispatch, same rationale as the harness gate above (see
+    # ``is_dependency_manifest``).
+    manifest_hits = sorted(
+        f for f in changed_files if is_dependency_manifest(f)
+    )
+    if manifest_hits:
+        print(
+            f"Dependency manifest change ({', '.join(manifest_hits)}) — "
+            "every tier installs from these files; full tier dispatch"
+        )
+        result = _force_all_dispatch(repo)
+        n_all = len(discover_py_files(repo))
+        result["_stats"] = {
+            "closure": n_all,
+            "total": n_all,
+            "changed": len(changed_files),
+            "dependents": 0,
+        }
+        return result
+
+    # Deleted / renamed graph-covered modules: the reverse graph is
+    # keyed by on-disk files, so a changed .py that no longer exists
+    # (a deletion, or the OLD path of a rename) has no key — every
+    # importer the change broke drops out of the closure and the
+    # ``(repo / f).is_file()`` tier filter then discards the path
+    # itself, dispatching ZERO tiers for a PR that breaks its
+    # importers. Cannot map → full dispatch, mirroring the harness
+    # gate above.
+    missing_py = missing_graph_covered_py(
+        {Path(f) for f in changed_files if f.endswith(".py")}, repo
+    )
+    if missing_py:
+        print(
+            f"Changed Python file(s) missing from disk "
+            f"({', '.join(missing_py)}) — deleted or renamed modules "
+            "have no import-graph key, so their broken importers "
+            "cannot be resolved; failing toward full tier dispatch"
+        )
+        result = _force_all_dispatch(repo)
+        n_all = len(discover_py_files(repo))
+        result["_stats"] = {
+            "closure": n_all,
+            "total": n_all,
+            "changed": len(changed_files),
+            "dependents": 0,
+        }
+        return result
+
     all_py = discover_py_files(repo)
     total = len(all_py)
 
-    changed_py = {Path(f) for f in changed_files if f.endswith(".py")}
+    # Data-root paths never enter the .py/graph lane — a .py under
+    # test/ is fixture data with no import-graph key (seeding it would
+    # prove nothing and dispatch nothing); all of them join the
+    # resource routing below instead.
+    changed_py = {
+        Path(f) for f in changed_files
+        if f.endswith(".py") and not in_data_root(f)
+    }
     changed_non_py = [f for f in changed_files if not f.endswith(".py")]
 
     # conftest.py changes affect all tests in their directory tree.
-    conftest_extra: set[Path] = set()
-    for f in changed_py:
-        if f.name == "conftest.py":
-            pkg_dir = f.parent
-            for af in all_py:
-                if af != f and str(af).startswith(str(pkg_dir) + "/"):
-                    conftest_extra.add(af)
-    changed_py |= conftest_extra
+    changed_py |= expand_conftest(changed_py, all_py)
 
     # __init__.py expansion.
     changed_py |= init_imports(changed_py, all_py)
@@ -286,6 +804,70 @@ def compute_tier_dispatch(
     reverse_graph, parse_failures = build_graph(all_py, repo)
     if parse_failures:
         print(f"  Parse failures: {parse_failures}")
+
+    # Non-Python resource files under the scan roots are runtime
+    # inputs (detector data lists, parser packs, templates, fixtures)
+    # — a change to them must run the tests of the code that consumes
+    # them, not zero tiers. Top-level data roots (test/) join the same
+    # routing wholesale (see DATA_ROOTS). Route each one through the
+    # first mapping that claims it; a file NO mapping claims cannot be
+    # scoped, so fail toward full dispatch rather than toward zero.
+    resource_files = [
+        f for f in changed_non_py
+        if any(f.startswith(r + "/") for r in SCAN_ROOTS)
+    ] + [f for f in changed_files if in_data_root(f)]
+    forced_tiers: set[str] = set()
+    resource_seeds: set[Path] = set()
+    data_map: dict[Path, set[Path]] | None = None
+    unmapped: list[str] = []
+    for rf in resource_files:
+        rp = Path(rf)
+        # (1) Directory ownership: a resource inside a tier's test
+        # tree belongs to that tier (packages/sca/data/* → sca).
+        tier_hits = {
+            name for name, cfg in TIERS.items()
+            if any(file_in_dir(rp, d) for d in cfg.get("test_dirs", []))
+        }
+        if tier_hits:
+            forced_tiers |= tier_hits
+            continue
+        # (2) Fixture data: tests that reference the file's fixture
+        # directory (built lazily — it parses every test file).
+        if data_map is None:
+            data_map = build_data_file_map(
+                [f for f in all_py if is_test_file(f)], repo,
+            )
+        mapped_tests = data_map.get(rp)
+        if mapped_tests:
+            resource_seeds |= mapped_tests
+            continue
+        # (3) Owning package: seed the .py files beside the resource
+        # and let the import graph find their tests — but only when
+        # it actually reaches a test, otherwise the seed proves
+        # nothing and the file stays unmapped.
+        seeds = _owning_package_seeds(rp, all_py)
+        if seeds and any(
+            is_test_file(t)
+            for t in transitive_dependents(seeds, reverse_graph)
+        ):
+            resource_seeds |= seeds
+            continue
+        unmapped.append(rf)
+    if unmapped:
+        print(
+            f"Changed resource file(s) with no owning tests "
+            f"({', '.join(sorted(unmapped))}) — cannot scope a runtime "
+            "data change to a tier; failing toward full tier dispatch"
+        )
+        result = _force_all_dispatch(repo)
+        result["_stats"] = {
+            "closure": total,
+            "total": total,
+            "changed": len(changed_files),
+            "dependents": 0,
+        }
+        return result
+    changed_py |= resource_seeds
 
     closure = transitive_dependents(changed_py, reverse_graph)
 
@@ -327,15 +909,26 @@ def compute_tier_dispatch(
                         if file_matches_tier(f, tier_config)
                         and is_test_file(f)
                         and (repo / f).is_file()]
+            if tier_name in forced_tiers:
+                # A changed resource file lives in this tier's tree —
+                # the data could drive any of the tier's tests, so run
+                # them all (same shape as a full dispatch of the tier).
+                affected = sorted(
+                    set(affected) | set(_discover_tier_files(tier_config, repo))
+                )
             result[tier_name] = {"run": bool(affected), "files": affected}
 
     # Fast tier: tests in core/ and packages/ that aren't carved out.
+    # (Dependency manifests never reach this point — the
+    # is_dependency_manifest gate above already forced full dispatch;
+    # a fast-tier-only fallback here under-dispatched the carved-out
+    # tiers that install from the same files.)
     fast_files = [f for f in closure
                   if file_in_fast_tier(f) and (repo / f).is_file()]
     # Also trigger fast tier for non-Python changes that affect the
     # test infrastructure (requirements, pyproject.toml, etc.).
     infra_changed = any(
-        f.startswith("requirements") or f == "pyproject.toml"
+        f.startswith("requirements") or f in {"pyproject.toml", "uv.lock"}
         for f in changed_non_py
     )
     if infra_changed and not fast_files:

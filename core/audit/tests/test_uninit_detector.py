@@ -241,3 +241,33 @@ class TestInjectModePromptRendering:
         }
         prompt = format_context_for_prompt(ctx)
         assert "Pre-loop mechanical findings" not in prompt
+
+
+class TestCpgQueryAndReporting:
+    def test_underscored_sink_not_reported_under_plain_name(self, monkeypatch):
+        """"copy_to_user" is a substring of "__copy_to_user" — tuple
+        order used to misreport the underscored sink."""
+        import core.audit.uninit_detector as ud
+
+        def fake_run_query(server, query):
+            return [["buf___copy_to_user", "struct x", [10], False]]
+
+        monkeypatch.setattr(ud, "_run_query", fake_run_query)
+        results = ud.detect_uninit_leak_cpg("func", object())
+        assert len(results) == 1
+        assert results[0].sink_call == "__copy_to_user"
+
+    def test_local_name_never_interpolated_into_regex(self, monkeypatch):
+        """A variable name with regex metacharacters used to blow up
+        the Scala .matches at query runtime (whole CPG tier lost)."""
+        import core.audit.uninit_detector as ud
+        captured: dict[str, str] = {}
+
+        def fake_run_query(server, query):
+            captured["query"] = query
+            return []
+
+        monkeypatch.setattr(ud, "_run_query", fake_run_query)
+        ud.detect_uninit_leak_cpg("func", object())
+        assert '".*" + local.name' not in captured["query"]
+        assert ".contains(local.name)" in captured["query"]

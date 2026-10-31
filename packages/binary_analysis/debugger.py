@@ -83,18 +83,25 @@ class GDBDebugger:
         # inherits the binary's directory permissions, which
         # we control.
         # binary_dir resolves to the analyser's binary working
-        # area — same dir we already pass to landlock as a
-        # writable path (line 81 below).
+        # area — the same dir this module already passes to the
+        # sandbox as a writable path when running the debugger.
         binary_dir = self.binary.parent
         try:
             binary_dir.mkdir(parents=True, exist_ok=True)
         except OSError:
             pass
+        # The script must live in binary_dir BY DESIGN: the mount-ns
+        # sandbox gives the debugged child a fresh tmpfs at /tmp, so a
+        # host-/tmp script would be invisible inside the sandbox —
+        # binary_dir is the bind-mounted, sandbox-visible location.
+        # That same dir is target-writable, so the write goes through
+        # the fd mkstemp returned (O_EXCL-created, race-free): a
+        # close-then-reopen-by-path write_text would follow a symlink
+        # swapped in at the (leakable via /proc) tempfile name.
         fd, script_name = tempfile.mkstemp(
             prefix=".raptor_gdb_", suffix=".txt", dir=str(binary_dir),
         )
         script_file = Path(script_name)
-        os.close(fd)
         # mkstemp defaults to 0o600 on POSIX, but "defaults to" is a
         # platform contract that has shifted on edge cases (a custom
         # umask, a broken libc fallback, a future Python release that
@@ -103,14 +110,15 @@ class GDBDebugger:
         # host even briefly. Set the mode explicitly so the protection
         # holds regardless of platform defaults.
         try:
-            os.chmod(script_file, 0o600)
-        except OSError:
+            os.fchmod(fd, 0o600)
+        except (OSError, AttributeError):
             # Some non-Unix filesystems (FAT mounted /tmp on a USB,
             # Windows path under WSL) don't support POSIX modes;
             # the chmod failure isn't fatal.
             pass
         try:
-            script_file.write_text(gdb_script, encoding="utf-8")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(gdb_script)
         except BaseException:
             script_file.unlink(missing_ok=True)
             raise
@@ -120,7 +128,7 @@ class GDBDebugger:
         # when the binary was also placed in /tmp; we pass both for
         # coverage. Landlock allows reads everywhere (gcc includes etc.),
         # writes only to these.
-        binary_dir = str(self.binary.parent.resolve())
+        binary_dir_str = str(self.binary.parent.resolve())
         script_dir = str(script_file.parent.resolve())
 
         # Build GDB command
@@ -134,7 +142,7 @@ class GDBDebugger:
                 with Path(input_file).open("rb") as f:
                     result = _sandbox_run(
                         cmd, profile="debug",
-                        target=binary_dir, output=script_dir,
+                        target=binary_dir_str, output=script_dir,
                         stdin=f,
                         capture_output=True,
                         text=True,
@@ -144,7 +152,7 @@ class GDBDebugger:
             else:
                 result = _sandbox_run(
                     cmd, profile="debug",
-                    target=binary_dir, output=script_dir,
+                    target=binary_dir_str, output=script_dir,
                     capture_output=True,
                     text=True,
                     timeout=timeout,

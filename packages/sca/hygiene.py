@@ -33,6 +33,8 @@ import logging
 import re
 from collections import defaultdict
 
+from .kinds import HYGIENE_PREFIX
+from .parsers import _safe_read
 from .models import (
     Confidence,
     Dependency,
@@ -67,6 +69,15 @@ _EXPECTED_LOCKFILES: dict[str, tuple[str, ...]] = {
     # Maven (via gradle.lockfile or no lockfile at all): no expectation.
 }
 
+# Leading indent and the post ``-r`` gap are HORIZONTAL-only
+# ([^\S\n]): under MULTILINE the ``^\s*`` spelling re-scans a run of
+# blank lines from every line start inside it — quadratic on a
+# hostile requirements manifest (and ``-r\s+`` silently captured its
+# argument from a LATER line).
+_R_INCLUDE_RE = re.compile(
+    r"^[^\S\n]*-r[^\S\n]+(.+?)[^\S\n]*$", re.MULTILINE,
+)
+
 # Pin styles considered "loose" — the dep can update silently.
 _LOOSE_PINS: set[PinStyle] = {PinStyle.CARET, PinStyle.TILDE, PinStyle.RANGE}
 
@@ -77,12 +88,15 @@ _UNPINNED: set[PinStyle] = {PinStyle.WILDCARD, PinStyle.UNKNOWN}
 def evaluate(
     manifests: Iterable[Manifest],
     deps: Iterable[Dependency],
+    *,
+    root: Path | None = None,
 ) -> list[HygieneFinding]:
     """Run every hygiene check; return one finding list."""
     manifests_list = list(manifests)
     deps_list = list(deps)
     out: list[HygieneFinding] = []
-    out.extend(check_lockfile_missing(manifests_list, deps_list))
+    out.extend(check_lockfile_missing(manifests_list, deps_list,
+                                       root=root))
     out.extend(check_lockfile_drift(deps_list))
     out.extend(check_unpinned(deps_list))
     out.extend(check_loose_pin(deps_list))
@@ -94,9 +108,55 @@ def evaluate(
 # Individual checks
 # ---------------------------------------------------------------------------
 
+def _included_dir_has_lockfile(
+    manifest_path: Path,
+    expected: tuple[str, ...],
+    lockfile_dirs: set[tuple[str, Path]],
+    ecosystem: str,
+    root: Path | None = None,
+) -> bool:
+    """Check whether a pip ``-r`` include points to a directory that has
+    a lockfile sibling.  Resolves at most one level of ``-r`` to avoid
+    runaway chains in adversarial manifests.
+
+    ``root`` (the scanned target) bounds where an include may point:
+    the traversal "defence" here used to be a no-op (both arms of an
+    if/else were byte-identical), so a hostile ``-r ../../../...``
+    steered the lockfile probe anywhere on the host. Monorepo-style
+    ``-r ../common/requirements.txt`` includes must keep working, so
+    the rule is CONTAINMENT (resolved path stays under ``root``), not
+    a blanket ``..`` refusal. ``None`` (direct/legacy callers) keeps
+    the historic unbounded behaviour.
+    """
+    # Bounded read: a planted multi-hundred-MB requirements file must
+    # not buy unbounded memory + scan time (the package's scanned-tree
+    # reads route through this cap — pinned by the walker- and
+    # root-module bounded-read audits in test_walker_reads_bounded).
+    text = _safe_read.read_bounded(manifest_path)
+    if text is None:
+        return False
+    for m in _R_INCLUDE_RE.finditer(text):
+        rel = m.group(1)
+        included = (manifest_path.parent / rel).resolve()
+        if root is not None:
+            try:
+                included.relative_to(root.resolve())
+            except ValueError:
+                # Escapes the scanned target (traversal or absolute
+                # include, symlinks resolved) — never probe there.
+                continue
+        inc_dir = included.parent if included.is_file() else included
+        if (ecosystem, inc_dir) in lockfile_dirs:
+            return True
+        if any((inc_dir / lf).is_file() for lf in expected):
+            return True
+    return False
+
+
 def check_lockfile_missing(
     manifests: list[Manifest],
     deps: list[Dependency],
+    root: Path | None = None,
 ) -> list[HygieneFinding]:
     """Surface any manifest whose ecosystem expects a sibling lockfile."""
     out: list[HygieneFinding] = []
@@ -117,6 +177,13 @@ def check_lockfile_missing(
         # Some lockfile names (e.g. requirements.txt) are parsed with
         # is_lockfile=False — check physical presence as a fallback.
         if any((m.path.parent / lf).is_file() for lf in expected):
+            continue
+        # Follow pip ``-r`` includes: if this requirements file
+        # references another via ``-r <path>``, check the included
+        # file's directory for lockfile siblings too.
+        if m.ecosystem == "PyPI" and _included_dir_has_lockfile(
+            m.path, expected, lockfile_dirs, m.ecosystem, root=root,
+        ):
             continue
         # Use the first manifest dep for the finding's dep slot, to keep
         # the finding shape uniform. If no deps were parsed, synthesise
@@ -151,9 +218,9 @@ def check_lockfile_drift(
         bucket = "lockfile" if d.is_lockfile else "manifest"
         by_key[ws_key].setdefault(bucket, d)
 
-    for (eco, _ws, _name), bucket in by_key.items():
-        manifest = bucket.get("manifest")
-        lockfile = bucket.get("lockfile")
+    for (eco, _ws, _name), bucket in by_key.items():  # type: ignore[assignment]
+        manifest = bucket.get("manifest")  # type: ignore[attr-defined]
+        lockfile = bucket.get("lockfile")  # type: ignore[attr-defined]
         if manifest is None or lockfile is None:
             continue
         if manifest.pin_style is not PinStyle.EXACT:
@@ -328,7 +395,14 @@ def _manifest_role(path: Path) -> str:
         return "dev"
     if re.search(r"\btest\b", name):
         return "test"
-    if any(tok in name for tok in ("optional", "extras", "all-")):
+    # ``\ball\b`` (word-bounded) instead of the glued ``all-``
+    # spelling: ``requirements-all.txt`` never matched the token (its
+    # ``all`` is followed by ``.``), while substring matching without
+    # boundaries would over-match (``install``). Noise-direction
+    # only — misclassification here changes comparison grouping, not
+    # findings.
+    if (any(tok in name for tok in ("optional", "extras"))
+            or re.search(r"\ball\b", name)):
         return "optional"
     if name.startswith("requirements-") and name.endswith(".txt"):
         return "optional"
@@ -389,7 +463,7 @@ def _finding(
     confidence: Confidence,
 ) -> HygieneFinding:
     return HygieneFinding(
-        finding_id=f"sca:hygiene:{kind}:{dep.ecosystem}:{dep.name}:"
+        finding_id=f"{HYGIENE_PREFIX}{kind}:{dep.ecosystem}:{dep.name}:"
                     f"{dep.declared_in}",
         kind=kind,
         dependency=dep,

@@ -9,12 +9,15 @@ lifecycle-proper rewrite makes.
 
 import json
 import os
+import subprocess
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
 from core.orchestration.agentic_passes import (
+    prepare_native_context_prepass,
+    prepare_native_validate_postpass,
     run_understand_prepass,
     run_validate_postpass,
 )
@@ -29,11 +32,15 @@ import pytest
 # module.
 pytestmark = pytest.mark.usefixtures("cc_spawn_machinery_enabled")
 
+REPO_ROOT = Path(__file__).resolve().parents[3]
+
 # Assume interactive — these tests exercise pass mechanics, not Rule of Two.
 _interactive_patch = None
+_xdg_tmp: TemporaryDirectory | None = None
+_xdg_patch = None
 
 def setUpModule():
-    global _interactive_patch
+    global _interactive_patch, _xdg_tmp, _xdg_patch
     # Force the agentic-pass gate open: mock the human-terminal leg True so
     # the full pass path runs under CI/pytest (no controlling terminal).
     _interactive_patch = patch(
@@ -41,8 +48,18 @@ def setUpModule():
         return_value=True,
     )
     _interactive_patch.start()
+    # Checklist frames are MAC-stamped at the write chokepoint, keyed
+    # off $XDG_DATA_HOME/raptor/checklist-frame-mac.key. Pin the key
+    # dir for the whole module so (a) stamping never mints the
+    # developer's real key and (b) the per-test HOME patches don't
+    # move the key path between the stamp and the read.
+    _xdg_tmp = TemporaryDirectory(prefix="agentic-passes-xdg-")
+    _xdg_patch = patch.dict(os.environ, {"XDG_DATA_HOME": _xdg_tmp.name})
+    _xdg_patch.start()
 
 def tearDownModule():
+    _xdg_patch.stop()
+    _xdg_tmp.cleanup()
     _interactive_patch.stop()
 
 
@@ -58,15 +75,20 @@ def _make_target(tmp: Path) -> Path:
 
 def _make_agentic_out(tmp: Path, target: Path) -> Path:
     """Create a fake agentic out_dir with a checklist that references target."""
+    from core.inventory import save_checklist
+
     out_dir = tmp / "agentic_run"
     out_dir.mkdir()
-    (out_dir / "checklist.json").write_text(json.dumps({
+    # Write through the stamping chokepoint: a raw write_text frame
+    # carries no MAC token and every gated reader downstream (prepass
+    # reuse, bridge discovery) refuses it.
+    save_checklist(out_dir, {
         "target_path": str(target),
         "files": [{
             "path": "handler.py",
             "items": [{"name": "handle_request", "line": 1}],
         }],
-    }))
+    })
     # Mark this dir as command_type=agentic so infer_command_type works correctly.
     (out_dir / ".raptor-run.json").write_text(json.dumps({
         "command": "agentic",
@@ -133,7 +155,9 @@ class PrepassIntegrationTests(unittest.TestCase):
                  patch("core.orchestration.skill_dispatch.subprocess.run",
                        side_effect=sub_disp), \
                  patch("core.orchestration.skill_dispatch.run_untrusted_networked",
-                       side_effect=sbx_disp):
+                       side_effect=sbx_disp), \
+                 patch("core.llm.cc_probe.probe_cc_session_model",
+                       return_value="fake-model"):
                 result = run_understand_prepass(
                     target=target, agentic_out_dir=agentic_out,
                     claude_bin="/fake/claude",
@@ -204,7 +228,9 @@ class PrepassIntegrationTests(unittest.TestCase):
                  patch("core.orchestration.skill_dispatch.subprocess.run",
                        side_effect=sub_disp), \
                  patch("core.orchestration.skill_dispatch.run_untrusted_networked",
-                       side_effect=sbx_disp):
+                       side_effect=sbx_disp), \
+                 patch("core.llm.cc_probe.probe_cc_session_model",
+                       return_value="fake-model"):
                 prepass = run_understand_prepass(
                     target=target, agentic_out_dir=agentic_out,
                     claude_bin="/fake/claude",
@@ -268,7 +294,9 @@ class PrepassIntegrationTests(unittest.TestCase):
                  patch("core.orchestration.skill_dispatch.subprocess.run",
                        side_effect=sub_disp), \
                  patch("core.orchestration.skill_dispatch.run_untrusted_networked",
-                       side_effect=sbx_disp):
+                       side_effect=sbx_disp), \
+                 patch("core.llm.cc_probe.probe_cc_session_model",
+                       return_value="fake-model"):
                 result = run_understand_prepass(
                     target=target, agentic_out_dir=agentic_out,
                     claude_bin="/fake/claude",
@@ -326,7 +354,9 @@ class PostpassIntegrationTests(unittest.TestCase):
                  patch("core.orchestration.skill_dispatch.subprocess.run",
                        side_effect=sub_disp1), \
                  patch("core.orchestration.skill_dispatch.run_untrusted_networked",
-                       side_effect=sbx_disp1):
+                       side_effect=sbx_disp1), \
+                 patch("core.llm.cc_probe.probe_cc_session_model",
+                       return_value="fake-model"):
                 prepass = run_understand_prepass(
                     target=target, agentic_out_dir=agentic_out,
                     claude_bin="/fake/claude",
@@ -346,7 +376,9 @@ class PostpassIntegrationTests(unittest.TestCase):
                  patch("core.orchestration.skill_dispatch.subprocess.run",
                        side_effect=sub_disp2), \
                  patch("core.orchestration.skill_dispatch.run_untrusted_networked",
-                       side_effect=sbx_disp2):
+                       side_effect=sbx_disp2), \
+                 patch("core.llm.cc_probe.probe_cc_session_model",
+                       return_value="fake-model"):
                 postpass = run_validate_postpass(
                     target=target, agentic_out_dir=agentic_out,
                     analysis_report=report, claude_bin="/fake/claude",
@@ -409,6 +441,99 @@ class PostpassIntegrationTests(unittest.TestCase):
                              if d.is_dir() and d.name.startswith("validate_")]
             self.assertEqual(validate_dirs, [],
                              "no validate run dir should exist when no findings qualify")
+
+    def test_native_request_stage0_reenters_interrupted_run(self):
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            target = _make_target(tmp)
+            (tmp / "home").mkdir()
+            (tmp / "out").mkdir()
+            agentic_out = _make_agentic_out(tmp, target)
+            report = self._make_report(agentic_out, [{
+                "finding_id": "vuln-1",
+                "is_exploitable": True,
+                "confidence": "high",
+                "file_path": "handler.py",
+                "start_line": 1,
+                "reasoning": "Untrusted input reaches the sink.",
+                "ruling": "validated",
+            }])
+            env_patch = patch.dict(os.environ, {
+                "HOME": str(tmp / "home"),
+                "RAPTOR_OUT_DIR": str(tmp / "out"),
+                "_RAPTOR_TRUSTED": "1",
+            })
+            with env_patch:
+                handoff = prepare_native_validate_postpass(
+                    target=target,
+                    agentic_out_dir=agentic_out,
+                    analysis_report=report,
+                )
+
+                request = json.loads(handoff.request_path.read_text())
+                proc = subprocess.run(
+                    request["stage0_argv"],
+                    cwd=REPO_ROOT,
+                    env=os.environ.copy(),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            validate_dir = Path(request["validate_dir"])
+            metadata = json.loads(
+                (validate_dir / ".raptor-run.json").read_text(),
+            )
+            self.assertEqual(metadata["status"], "running")
+            findings = json.loads((validate_dir / "findings.json").read_text())
+            self.assertEqual(
+                [row["id"] for row in findings["findings"]],
+                ["FIND-1"],
+            )
+
+    def test_native_context_resume_reenters_same_run(self):
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            target = _make_target(tmp)
+            (tmp / "home").mkdir()
+            (tmp / "out").mkdir()
+            agentic_out = _make_agentic_out(tmp, target)
+            env_patch = patch.dict(os.environ, {
+                "HOME": str(tmp / "home"),
+                "RAPTOR_OUT_DIR": str(tmp / "out"),
+                "_RAPTOR_TRUSTED": "1",
+            })
+            with env_patch:
+                handoff = prepare_native_context_prepass(
+                    target=target,
+                    agentic_out_dir=agentic_out,
+                )
+                request = json.loads(handoff.request_path.read_text())
+                before = json.loads(
+                    (
+                        handoff.understand_dir / ".raptor-run.json"
+                    ).read_text()
+                )
+                proc = subprocess.run(
+                    request["resume_argv"],
+                    cwd=REPO_ROOT,
+                    env=os.environ.copy(),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+            self.assertEqual(before["status"], "interrupted")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(
+                f"OUTPUT_DIR={handoff.understand_dir}",
+                proc.stdout,
+            )
+            after = json.loads(
+                (handoff.understand_dir / ".raptor-run.json").read_text()
+            )
+            self.assertEqual(after["status"], "running")
 
 
 if __name__ == "__main__":

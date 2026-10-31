@@ -10,11 +10,11 @@ from pathlib import Path
 class TestPlannerTypeHints(unittest.TestCase):
     """Test planner type annotation fixes."""
 
-    def test_strategy_return_type_uses_any(self):
-        """select_fuzzing_strategy annotation uses Any, not any."""
+    def test_crash_priority_return_type_resolves(self):
+        """recommend_crash_priority annotations resolve cleanly."""
         from packages.autonomous.planner import FuzzingPlanner
 
-        hints = typing.get_type_hints(FuzzingPlanner.select_fuzzing_strategy)
+        hints = typing.get_type_hints(FuzzingPlanner.recommend_crash_priority)
         self.assertIn("return", hints)
 
     def test_binary_path_is_optional(self):
@@ -34,8 +34,7 @@ class TestPlannerTypeHints(unittest.TestCase):
 
         state = FuzzingState(
             start_time=time.time(),
-            current_time=time.time(),
-            binary_path=None
+            binary_path=None,
         )
         self.assertIsNone(state.binary_path)
 
@@ -44,8 +43,7 @@ class TestPlannerTypeHints(unittest.TestCase):
 
         state = FuzzingState(
             start_time=time.time(),
-            current_time=time.time(),
-            binary_path=Path("/usr/bin/test")
+            binary_path=Path("/usr/bin/test"),
         )
         self.assertEqual(state.binary_path, Path("/usr/bin/test"))
 

@@ -32,6 +32,7 @@ from typing import Any, TYPE_CHECKING
 
 from .findings import severity_rank
 from .models import REACHABILITY_LABELS, REACHABILITY_ORDER
+from .rows import FindingRow
 from .sarif import write_sarif
 
 from core.json import load_json
@@ -211,29 +212,21 @@ def _apply_reachability_filters(
 
     out: list[dict[str, Any]] = []
     for row in rows:
-        if not isinstance(row, dict):
-            # Hand-edited findings.json may contain stray non-dict
-            # elements; pass them through untouched (the renderers
-            # and the SARIF emitter each skip them defensively).
+        fr = FindingRow.from_row(row)
+        if fr is None or not fr.is_vulnerable_dependency:
+            # Non-vulnerability rows (and stray non-dict elements in a
+            # hand-edited findings.json) pass through untouched; the
+            # renderers and the SARIF emitter each skip malformed
+            # entries defensively.
             out.append(row)
             continue
-        if row.get("vuln_type") != "sca:vulnerable_dependency":
-            out.append(row)
-            continue
-        verdict = _row_reachability_verdict(row)
+        verdict = fr.reachability_verdict
         if allowed is not None and verdict not in allowed:
             continue
         if denied is not None and verdict in denied:
             continue
         out.append(row)
     return out
-
-
-def _row_reachability_verdict(row: dict[str, Any]) -> str:
-    sca = row.get("sca") or {}
-    reach = sca.get("reachability") or {}
-    verdict = reach.get("verdict")
-    return str(verdict) if verdict else "not_evaluated"
 
 
 # ---------------------------------------------------------------------------
@@ -263,31 +256,24 @@ def _cell(value: Any, *, max_chars: int = 200) -> str:
 
 def _render_markdown(rows: list[dict[str, Any]], *, target: Path) -> str:
     # Defensive — hand-edited findings.json may contain non-dict
-    # elements; filter them out rather than crash on `.get()`.
-    rows = [r for r in rows if isinstance(r, dict)]
-    vuln_rows = [r for r in rows
-                 if r.get("vuln_type") == "sca:vulnerable_dependency"]
-    hygiene_rows = [r for r in rows
-                    if isinstance(r.get("vuln_type"), str)
-                    and r["vuln_type"].startswith("sca:hygiene:")]
-    supply_rows = [r for r in rows
-                   if isinstance(r.get("vuln_type"), str)
-                   and r["vuln_type"].startswith("sca:supply_chain:")]
-    license_rows = [r for r in rows
-                    if isinstance(r.get("vuln_type"), str)
-                    and r["vuln_type"].startswith("sca:license:")]
+    # elements; ``from_row`` parses them to None, filtered here.
+    parsed = [fr for fr in map(FindingRow.from_row, rows) if fr is not None]
+    vuln_rows = [fr for fr in parsed if fr.is_vulnerable_dependency]
+    hygiene_rows = [fr for fr in parsed if fr.is_hygiene]
+    supply_rows = [fr for fr in parsed if fr.is_supply_chain]
+    license_rows = [fr for fr in parsed if fr.is_license]
 
-    suppressed_count = sum(1 for r in vuln_rows if r.get("suppressed"))
+    suppressed_count = sum(1 for r in vuln_rows if r.suppressed)
     severity_counts: Counter[str] = Counter()
     kev_count = 0
     for r in vuln_rows:
-        if r.get("suppressed"):
+        if r.suppressed:
             continue
         # Lowercase — LLM verdicts and hand-edited rows may capitalise
         # ("Critical", "HIGH"); a case-sensitive counter would drop
         # them from the summary while still surfacing them below.
-        severity_counts[(r.get("severity") or "info").lower()] += 1
-        if (r.get("sca") or {}).get("in_kev"):
+        severity_counts[r.severity.lower()] += 1
+        if r.sca.get("in_kev"):
             kev_count += 1
 
     buf = StringIO()
@@ -334,12 +320,12 @@ def _render_markdown(rows: list[dict[str, Any]], *, target: Path) -> str:
     return buf.getvalue()
 
 
-def _render_reachability_breakdown(rows: list[dict[str, Any]]) -> str:
+def _render_reachability_breakdown(rows: list[FindingRow]) -> str:
     counts: Counter[str] = Counter()
     for row in rows:
-        if row.get("suppressed"):
+        if row.suppressed:
             continue
-        counts[_row_reachability_verdict(row)] += 1
+        counts[row.reachability_verdict] += 1
     if not counts:
         return ""
     buf = StringIO()
@@ -357,30 +343,30 @@ def _render_reachability_breakdown(rows: list[dict[str, Any]]) -> str:
     return buf.getvalue()
 
 
-def _render_vuln_table(buf: StringIO, rows: list[dict[str, Any]]) -> None:
+def _render_vuln_table(buf: StringIO, rows: list[FindingRow]) -> None:
     ordered = sorted(
         rows,
         key=lambda r: (
-            -severity_rank(r.get("severity") or "info"),
-            not (r.get("sca") or {}).get("in_kev"),
-            -((r.get("sca") or {}).get("epss") or 0.0),
-            (r.get("sca") or {}).get("name") or "",
+            -severity_rank(r.severity),
+            not r.sca.get("in_kev"),
+            -(r.sca.get("epss") or 0.0),
+            r.sca.get("name") or "",
         ),
     )
     buf.write("| Severity | Dep | Advisory | Reachability | KEV | EPSS | Fix |\n")
     buf.write("|---|---|---|---|---|---|---|\n")
     for r in ordered:
-        sca = r.get("sca") or {}
-        adv = sca.get("advisory") or {}
-        sev = _cell((r.get("severity") or "info").title())
-        if r.get("suppressed"):
+        sca = r.sca
+        adv = r.advisory
+        sev = _cell(r.severity.title())
+        if r.suppressed:
             sev += " (suppressed)"
         dep = _cell(
             f"{sca.get('ecosystem','')}:{sca.get('name','')}"
             f"@{sca.get('version','')}"
         )
         aliases = adv.get("aliases") or []
-        adv_id = (adv.get("id") if isinstance(adv, dict) else "") or ""
+        adv_id = adv.get("id") or ""
         adv_label = _cell(adv_id + (
             f" ({aliases[0]})" if aliases else ""
         ))
@@ -389,8 +375,8 @@ def _render_vuln_table(buf: StringIO, rows: list[dict[str, Any]]) -> None:
         epss = f"{epss_val:.2f}" if isinstance(epss_val, (int, float)) else ""
         fix = _cell(sca.get("fixed_version") or "")
         reach = _cell(REACHABILITY_LABELS.get(
-            _row_reachability_verdict(r),
-            _row_reachability_verdict(r),
+            r.reachability_verdict,
+            r.reachability_verdict,
         ))
         buf.write(
             f"| {sev} | {dep} | {adv_label} | {reach} "
@@ -399,7 +385,7 @@ def _render_vuln_table(buf: StringIO, rows: list[dict[str, Any]]) -> None:
     buf.write("\n")
 
 
-def _render_kind_table(buf: StringIO, rows: list[dict[str, Any]]) -> None:
+def _render_kind_table(buf: StringIO, rows: list[FindingRow]) -> None:
     # Collapse identical (severity, kind, ecosystem, name) rows that
     # share the same detail — a dep loose-pinned across both
     # ``requirements.txt`` and ``requirements-dev.txt`` produces two
@@ -409,16 +395,15 @@ def _render_kind_table(buf: StringIO, rows: list[dict[str, Any]]) -> None:
     # detail is suffixed with `(in N manifests)`.
     from collections import defaultdict
 
-    groups: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
+    groups: dict[tuple[Any, ...], list[FindingRow]] = defaultdict(list)
     for r in rows:
-        sca = r.get("sca") or {}
         key = (
-            (r.get("severity") or "info").lower(),
-            r.get("vuln_type") or "",
-            sca.get("ecosystem") or "",
-            sca.get("name") or "",
-            (r.get("description") or ""),
-            bool(r.get("suppressed")),
+            r.severity.lower(),
+            r.vuln_type,
+            r.sca.get("ecosystem") or "",
+            r.sca.get("name") or "",
+            r.description,
+            r.suppressed,
         )
         groups[key].append(r)
 
@@ -432,13 +417,13 @@ def _render_kind_table(buf: StringIO, rows: list[dict[str, Any]]) -> None:
     for key in ordered_keys:
         members = groups[key]
         first = members[0]
-        sev = _cell((first.get("severity") or "info").title())
-        if first.get("suppressed"):
+        sev = _cell(first.severity.title())
+        if first.suppressed:
             sev += " (suppressed)"
-        kind = _cell((first.get("vuln_type") or "").rsplit(":", 1)[-1])
-        sca = first.get("sca") or {}
+        kind = _cell(first.vuln_type.rsplit(":", 1)[-1])
+        sca = first.sca
         dep = _cell(f"{sca.get('ecosystem','')}:{sca.get('name','')}")
-        detail = _cell(first.get("description") or "",
+        detail = _cell(first.description,
                        max_chars=_DETAIL_MAX_CHARS)
         if len(detail) > 90:
             detail = detail[:87] + "..."

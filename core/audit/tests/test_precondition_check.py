@@ -188,11 +188,77 @@ class TestCheckAttackerControl:
         assert result.verdict == "supported"
 
     def test_function_not_reachable(self):
-        ctx = {"entry_points": ["main"], "call_edges": []}
+        # helper's caller IS recorded in the map, so the exhausted
+        # walk is real evidence — and none of it reaches an entry
+        # point.  This is the legitimate demoting case.
+        ctx = {"entry_points": ["main"], "call_edges": [
+            {"caller": "orphan", "callee": "helper"},
+            {"caller": "main", "callee": "unrelated"},
+        ]}
         result = _check_attacker_control(
             "", "f.c", "helper", "", expect_absent=False, context_map=ctx,
         )
         assert result.verdict == "contradicted"
+
+    def test_absent_from_map_is_inconclusive(self):
+        # The map is LLM-authored /understand output and routinely
+        # incomplete: when no call edge names the function at all, an
+        # empty upward walk is graph incompleteness, not
+        # unreachability — it must not mint the only demoting verdict.
+        ctx = {"entry_points": ["main"], "call_edges": [
+            {"caller": "main", "callee": "other"},
+        ]}
+        result = _check_attacker_control(
+            "", "f.c", "helper", "", expect_absent=False, context_map=ctx,
+        )
+        assert result.verdict == "inconclusive"
+        assert "no call edge naming helper" in result.evidence
+
+    def test_absent_from_map_earns_no_absence_receipt(self):
+        # Two-direction guard: the same non-evidence must not earn a
+        # supported unreachability receipt for the absence claim
+        # either — "no pattern found" is not a positive receipt.
+        ctx = {"entry_points": ["main"], "call_edges": [
+            {"caller": "main", "callee": "other"},
+        ]}
+        result = _check_attacker_control(
+            "", "f.c", "helper", "", expect_absent=True, context_map=ctx,
+        )
+        assert result.verdict == "inconclusive"
+
+    def test_empty_edge_list_is_inconclusive(self):
+        # Degenerate incompleteness: a map with entry points but no
+        # edges at all records nothing about anyone.
+        ctx = {"entry_points": ["main"], "call_edges": []}
+        result = _check_attacker_control(
+            "", "f.c", "helper", "", expect_absent=False, context_map=ctx,
+        )
+        assert result.verdict == "inconclusive"
+
+    def test_combined_form_edge_matches_bare_hypothesis(self):
+        # Edges keyed "file:func" while the hypothesis carries the
+        # bare name: the edge must still be seen — mixed key shapes
+        # made real reachability invisible and the empty walk read as
+        # a refutation.
+        ctx = {"entry_points": ["main"], "call_edges": [
+            {"caller": "src/a.c:main", "callee": "src/a.c:helper"},
+        ]}
+        result = _check_attacker_control(
+            "", "f.c", "helper", "", expect_absent=False, context_map=ctx,
+        )
+        assert result.verdict == "supported"
+
+    def test_mixed_key_shapes_walk_across_hops(self):
+        # Bare and combined forms alternating along the chain must
+        # still chain up to the entry point.
+        ctx = {"entry_points": ["main"], "call_edges": [
+            {"caller": "main", "callee": "src/b.c:mid"},
+            {"caller": "src/b.c:mid", "callee": "helper"},
+        ]}
+        result = _check_attacker_control(
+            "", "f.c", "helper", "", expect_absent=False, context_map=ctx,
+        )
+        assert result.verdict == "supported"
 
     def test_no_context_map(self):
         result = _check_attacker_control("", "f.c", "fn", "", True, None)
@@ -358,6 +424,55 @@ class TestVerifyPreconditions:
         assert not verdict.any_contradicted
         assert verdict.checks[0].verdict == "inconclusive"
 
+    def test_traversal_path_is_inconclusive(self, tmp_path):
+        # location.file is LLM-authored: a ../ segment must not escape
+        # the analysed root (pinned across the contained-read helper
+        # migration).
+        target = tmp_path / "target"
+        target.mkdir()
+        (tmp_path / "outside.c").write_text(REQPARSE_C)
+        verdict = verify_preconditions([{
+            "assumption": "no bounds check",
+            "check_type": "caller_bounds_checks",
+            "location": {
+                "file": "../outside.c", "function": "handle_request",
+            },
+            "expect_absent": True,
+        }], target)
+        assert not verdict.any_contradicted
+        assert verdict.checks[0].verdict == "inconclusive"
+        assert "could not read" in verdict.checks[0].evidence
+
+    def test_absolute_path_is_inconclusive(self, tmp_path):
+        target = tmp_path / "target"
+        target.mkdir()
+        outside = tmp_path / "outside.c"
+        outside.write_text(REQPARSE_C)
+        verdict = verify_preconditions([{
+            "assumption": "no bounds check",
+            "check_type": "caller_bounds_checks",
+            "location": {
+                "file": str(outside), "function": "handle_request",
+            },
+            "expect_absent": True,
+        }], target)
+        assert not verdict.any_contradicted
+        assert verdict.checks[0].verdict == "inconclusive"
+
+    def test_nul_byte_path_is_inconclusive(self, target_dir):
+        # A NUL byte in the LLM-authored path must read as
+        # source-unavailable, not raise out of the verifier.
+        verdict = verify_preconditions([{
+            "assumption": "no bounds check",
+            "check_type": "caller_bounds_checks",
+            "location": {
+                "file": "req\x00parse.c", "function": "handle_request",
+            },
+            "expect_absent": True,
+        }], target_dir)
+        assert not verdict.any_contradicted
+        assert verdict.checks[0].verdict == "inconclusive"
+
     def test_multiple_preconditions_one_contradicted(self, target_dir):
         """If any precondition is contradicted, any_contradicted is True."""
         preconditions = [
@@ -469,3 +584,47 @@ class TestReachesSinkAbsenceTransitivity:
         )
         assert r.verdict == "inconclusive"
         assert "DOES reach" in r.evidence
+
+
+class TestTruncatedEdgeListDegrades:
+    """A capped call_edges list (call_edges_truncated marker from the
+    context-map callgraph enricher) is the same epistemic state as a
+    truncated walk: paths may exist past what the map records, so
+    no-path outcomes degrade to inconclusive, never contradicted."""
+
+    def test_truncated_edges_no_path_is_inconclusive(self):
+        ctx = {"entry_points": ["main"],
+               "call_edges": [
+                   {"caller": "orphan", "callee": "helper"},
+                   {"caller": "main", "callee": "unrelated"},
+               ],
+               "call_edges_truncated": True}
+        result = _check_attacker_control(
+            "", "f.c", "helper", "", expect_absent=False,
+            context_map=ctx,
+        )
+        assert result.verdict == "inconclusive"
+
+    def test_truncated_edges_cannot_support_unreachability(self):
+        ctx = {"entry_points": ["main"],
+               "call_edges": [
+                   {"caller": "orphan", "callee": "helper"},
+               ],
+               "call_edges_truncated": True}
+        result = _check_attacker_control(
+            "", "f.c", "helper", "", expect_absent=True,
+            context_map=ctx,
+        )
+        assert result.verdict == "inconclusive"
+
+    def test_positive_reach_still_wins_over_truncation(self):
+        ctx = {"entry_points": ["main"],
+               "call_edges": [
+                   {"caller": "main", "callee": "helper"},
+               ],
+               "call_edges_truncated": True}
+        result = _check_attacker_control(
+            "", "f.c", "helper", "", expect_absent=False,
+            context_map=ctx,
+        )
+        assert result.verdict == "supported"

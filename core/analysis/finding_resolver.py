@@ -152,6 +152,7 @@ def resolve_finding(
     finding: Mapping[str, Any],
     *,
     target_root: str | Path | None = None,
+    summary_memo: dict[str, Any] | None = None,
 ) -> Resolution:
     """Resolve a finding (any supported format) to a
     :class:`ResolvedFinding` ready for ``evaluate_finding``, or
@@ -172,11 +173,21 @@ def resolve_finding(
     Callers with the scanned root in scope should pass it; ``None``
     keeps the legacy contract (lexical ``..`` refusal only, absolute
     paths pass through) for call sites that predate the parameter.
+
+    ``summary_memo``, when provided, caches the per-source-text
+    module callgraph + taint summaries across calls (keyed by the
+    text's SHA-256). The scan postpass resolves the same file once
+    per finding × source candidate — up to four full Phase 12+13
+    rebuilds per finding without the memo. Callers own the dict's
+    lifetime (one per run); ``None`` keeps the build-per-call
+    behaviour.
     """
     parsed = _parse_input_format(finding)
     if isinstance(parsed, ResolutionFailure):
         return parsed
-    return _resolve_from_parsed(parsed, target_root=target_root)
+    return _resolve_from_parsed(
+        parsed, target_root=target_root, summary_memo=summary_memo,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +377,7 @@ def _read_finding_source(
     file: str,
     target_root: str | Path | None = None,
 ) -> str | ResolutionFailure:
-    """Containment-checked read of the source file named by a finding.
+    """Containment-checked, size-capped read of a finding's source file.
 
     The path comes verbatim from externally-produced analyser output
     (SARIF ``artifactLocation.uri``, Semgrep ``path``, native
@@ -404,18 +415,45 @@ def _read_finding_source(
                 ),
             )
         read_path = confined
+    # Size gate: the file lives inside the scanned repo and its size
+    # is attacker-controlled.  An unbounded read OOMs the process.
+    # Stat pre-check + capped binary read closes the stat/read
+    # growth race (house pattern, core/audit/context).
+    _MAX = 64 * 1024 * 1024
     try:
-        return read_path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError, ValueError) as e:
+        size = read_path.stat().st_size
+    except (OSError, ValueError) as e:
+        return ResolutionFailure(reason=f"cannot read {file}: {e}")
+    if size > _MAX:
+        return ResolutionFailure(
+            reason=f"refusing oversize source file {file!r} "
+                   f"({size} bytes > {_MAX})",
+        )
+    try:
+        with read_path.open("rb") as fh:
+            raw = fh.read(_MAX + 1)
+    except OSError as e:
+        return ResolutionFailure(reason=f"cannot read {file}: {e}")
+    if len(raw) > _MAX:
+        return ResolutionFailure(
+            reason=f"source file {file!r} grew past "
+                   f"{_MAX} bytes during read",
+        )
+    try:
+        return raw.decode("utf-8")
+    except (UnicodeDecodeError, ValueError) as e:
         return ResolutionFailure(reason=f"cannot read {file}: {e}")
 
 
 def _resolve_from_parsed(
     parsed: _ParsedFinding,
     target_root: str | Path | None = None,
+    summary_memo: dict[str, Any] | None = None,
 ) -> Resolution:
     if parsed.language == "python":
-        return _resolve_from_parsed_python(parsed, target_root)
+        return _resolve_from_parsed_python(
+            parsed, target_root, summary_memo,
+        )
     if parsed.language in ("c", "cpp"):
         return _resolve_from_parsed_cpp(parsed, target_root)
     if parsed.language == "java":
@@ -432,6 +470,7 @@ def _resolve_from_parsed(
 def _resolve_from_parsed_python(
     parsed: _ParsedFinding,
     target_root: str | Path | None = None,
+    summary_memo: dict[str, Any] | None = None,
 ) -> Resolution:
     source_text = _read_finding_source(parsed.file, target_root)
     if isinstance(source_text, ResolutionFailure):
@@ -455,7 +494,7 @@ def _resolve_from_parsed_python(
             ),
         )
 
-    cfg = build_python_cfg(source_text, fn.name)
+    cfg = build_python_cfg(source_text, fn.name, _module_tree=tree)
     if cfg is None:
         return ResolutionFailure(
             reason=f"CFG construction failed for {fn.name} in {parsed.file}",
@@ -490,7 +529,8 @@ def _resolve_from_parsed_python(
         )
 
     inter_proc = _inter_proc_bindings_python(
-        source_text, fn, cfg, parsed.cwe,
+        source_text, fn, cfg, parsed.cwe, summary_memo,
+        repo_root=str(target_root) if target_root is not None else None,
     )
 
     return ResolvedFinding(
@@ -514,6 +554,8 @@ def _inter_proc_bindings_python(
     fn: ast.FunctionDef | ast.AsyncFunctionDef,
     cfg: PythonCFG,
     cwe: str,
+    summary_memo: dict[str, Any] | None = None,
+    repo_root: str | None = None,
 ) -> frozenset:
     """Phase 14 — compute inter-procedural synthetic sanitizer
     bindings for a Python finding's enclosing function.
@@ -525,7 +567,13 @@ def _inter_proc_bindings_python(
     sanitizes. Returns an empty frozenset on any failure (best-effort
     — the intra-procedural verdict still stands). Imports are local
     so the Phase 12-14 modules aren't loaded for callers that never
-    resolve a Python finding."""
+    resolve a Python finding.
+
+    ``summary_memo`` caches ``sha256(source_text) → summaries`` so a
+    caller resolving many findings against the same file pays the
+    Phase 12+13 build once per file per run. Only successful builds
+    are cached; the per-finding binding synthesis (CWE-dependent)
+    always runs."""
     try:
         from core.analysis.python_module_callgraph import (
             build_python_module_callgraph,
@@ -538,13 +586,34 @@ def _inter_proc_bindings_python(
         )
     except ImportError:                                     # pragma: no cover
         return frozenset()
-    cg = build_python_module_callgraph(source_text)
-    if cg is None:
+    # Blanket catch, mirroring the Java analog: the graph/summary
+    # walks recurse on target-controlled AST depth, and the
+    # docstring's "empty frozenset on ANY failure" contract must be
+    # structural — a RecursionError escaping here aborts the whole
+    # gate evaluation instead of degrading to the intra-procedural
+    # verdict.
+    try:
+        summaries = None
+        memo_key = None
+        if summary_memo is not None:
+            import hashlib
+
+            memo_key = hashlib.sha256(
+                source_text.encode("utf-8", errors="replace"),
+            ).hexdigest()
+            summaries = summary_memo.get(memo_key)
+        if summaries is None:
+            cg = build_python_module_callgraph(source_text)
+            if cg is None:
+                return frozenset()
+            summaries = build_taint_summaries(cg, source_text)
+            if summary_memo is not None and memo_key is not None:
+                summary_memo[memo_key] = summaries
+        return synthetic_sanitizer_bindings(
+            cfg, fn, summaries, cwe, "python", repo_root=repo_root,
+        )
+    except Exception:                                       # noqa: BLE001
         return frozenset()
-    summaries = build_taint_summaries(cg, source_text)
-    return synthetic_sanitizer_bindings(
-        cfg, fn, summaries, cwe, "python",
-    )
 
 
 def _resolve_from_parsed_cpp(
@@ -570,7 +639,7 @@ def _resolve_from_parsed_cpp(
     if isinstance(source_text, ResolutionFailure):
         return source_text
 
-    fn_name, fn_start = _find_enclosing_function_cpp(
+    fn_name, fn_start, ts_tree = _find_enclosing_function_cpp(
         source_text, parsed.language, parsed.source_lineno,
         parsed.sink_lineno,
     )
@@ -586,6 +655,7 @@ def _resolve_from_parsed_cpp(
 
     cfg = build_cpp_intraproc_cfg(
         source_text, fn_name, language=parsed.language,
+        _ts_tree=ts_tree,
     )
     if cfg is None:
         return ResolutionFailure(
@@ -823,12 +893,26 @@ def _resolve_sink(
 
 
 def _node_at_lineno(cfg: PythonCFG, lineno: int) -> PyCFGNode | None:
+    """First node at ``lineno`` — refusing the line outright when TWO
+    OR MORE call-bearing nodes share it. First-match binding on a
+    multi-statement line hands the gate whichever statement parses
+    first ('y = log(html.escape(x)); os.system(x)' binds the
+    sanitizer-bearing assignment, not the sink) — an evasion-shaped
+    wrong-sink adjudication. The sibling Java machinery already
+    treats one-line co-location as a refusal class."""
+    first: PyCFGNode | None = None
+    call_bearing = 0
     for n in cfg.nodes():
         if not isinstance(n, PyCFGNode):
             continue
         if n.lineno == lineno:
-            return n
-    return None
+            if first is None:
+                first = n
+            if n.call_sites:
+                call_bearing += 1
+    if call_bearing >= 2:
+        return None
+    return first
 
 
 # ---------------------------------------------------------------------------
@@ -934,8 +1018,27 @@ def _resolve_from_parsed_java(
     if isinstance(source_text, ResolutionFailure):
         return source_text
 
+    from core.analysis.cfg_builder_java import (
+        _get_parser as _java_get_parser,
+    )
+
+    _java_parser = _java_get_parser()
+    if _java_parser is None:
+        return ResolutionFailure(
+            reason=(
+                f"no enclosing Java method for source line "
+                f"{parsed.source_lineno} / sink line {parsed.sink_lineno} "
+                f"in {parsed.file} (tree-sitter grammar missing or no "
+                "method declaration spans the range)"
+            ),
+        )
+    java_ts_tree = _java_parser.parse(
+        source_text.encode("utf-8", errors="replace"),
+    )
+
     fn_name, fn_start = find_enclosing_method(
         source_text, parsed.source_lineno, parsed.sink_lineno,
+        _ts_tree=java_ts_tree,
     )
     if fn_name is None:
         return ResolutionFailure(
@@ -950,6 +1053,7 @@ def _resolve_from_parsed_java(
     cfg = build_java_intraproc_cfg(
         source_text, fn_name,
         line_hint=(parsed.source_lineno, parsed.sink_lineno),
+        _ts_tree=java_ts_tree,
     )
     if cfg is None:
         return ResolutionFailure(
@@ -963,10 +1067,22 @@ def _resolve_from_parsed_java(
         )
 
     def node_at(lineno: int) -> JavaCFGNode | None:
+        # Two or more call-bearing nodes on one line refuse — a
+        # first-match bind could hand the gate a same-line
+        # sanitizer-bearing statement instead of the flagged one
+        # (one-line co-location is the sibling machinery's standing
+        # refusal class).
+        first: JavaCFGNode | None = None
+        call_bearing = 0
         for n in cfg.nodes():
             if isinstance(n, JavaCFGNode) and n.lineno == lineno:
-                return n
-        return None
+                if first is None:
+                    first = n
+                if n.call_sites:
+                    call_bearing += 1
+        if call_bearing >= 2:
+            return None
+        return first
 
     def node_at_or_statement_start(lineno: int) -> JavaCFGNode | None:
         """Exact-line node, retargeted to the enclosing statement's
@@ -993,7 +1109,7 @@ def _resolve_from_parsed_java(
     if parsed.source_lineno == fn_start:
         source_node, source_symbols = cfg.entry_node, frozenset(cfg.params)
     else:
-        source_node = node_at_or_statement_start(parsed.source_lineno)
+        source_node = node_at_or_statement_start(parsed.source_lineno)  # type: ignore[assignment]
         if source_node is None:
             return ResolutionFailure(
                 reason=(
@@ -1128,15 +1244,17 @@ def _inter_proc_bindings_java(
 
 def _find_enclosing_function_cpp(
     source_text: str, language: str, source_line: int, sink_line: int,
-) -> tuple[str | None, int]:
+) -> tuple[str | None, int, Any]:
     """Smallest C / C++ function_definition spanning [source, sink].
 
-    Returns ``(function_name, header_line)`` on success, ``(None, 0)``
-    on any failure (missing grammar, no spanning definition, function
-    has no resolvable name). ``header_line`` is the function's
-    start_point line (1-indexed) — the value Phase 11's
+    Returns ``(function_name, header_line, ts_tree)`` on success,
+    ``(None, 0, None)`` on any failure (missing grammar, no spanning
+    definition, function has no resolvable name). ``header_line`` is
+    the function's start_point line (1-indexed) — the value Phase 11's
     :func:`_resolve_source_cpp` compares against to spot the
-    "source == function entry" case.
+    "source == function entry" case.  ``ts_tree`` is the tree-sitter
+    parse tree, returned so the caller can forward it to
+    :func:`build_cpp_intraproc_cfg` and avoid a redundant re-parse.
 
     Smallest by end-line span so nested helpers / lambdas win over
     their enclosing function when both contain the range.
@@ -1152,7 +1270,7 @@ def _find_enclosing_function_cpp(
 
     parser = _cpp_get_parser(language)
     if parser is None:
-        return None, 0
+        return None, 0, None
     tree = parser.parse(source_text.encode("utf-8", errors="replace"))
     lo = min(source_line, sink_line)
     hi = max(source_line, sink_line)
@@ -1171,8 +1289,8 @@ def _find_enclosing_function_cpp(
                         best = (span, name, start)
         stack.extend(child for child in cur.children if child.is_named)
     if best is None:
-        return None, 0
-    return best[1], best[2]
+        return None, 0, None
+    return best[1], best[2], tree
 
 
 def _resolve_source_cpp(
@@ -1226,12 +1344,22 @@ def _resolve_sink_cpp(
 
 
 def _cpp_node_at_lineno(cfg: CPPCFG, lineno: int) -> CPPCFGNode | None:
+    """First node at ``lineno``, refusing lines shared by two or more
+    call-bearing nodes (see :func:`_node_at_lineno` — the same
+    same-line sanitizer-steals-the-sink-slot hazard)."""
+    first: CPPCFGNode | None = None
+    call_bearing = 0
     for n in cfg.nodes():
         if not isinstance(n, CPPCFGNode):
             continue
         if n.lineno == lineno:
-            return n
-    return None
+            if first is None:
+                first = n
+            if n.call_sites:
+                call_bearing += 1
+    if call_bearing >= 2:
+        return None
+    return first
 
 
 __all__ = [

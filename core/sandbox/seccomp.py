@@ -1,14 +1,44 @@
 """Seccomp-bpf syscall-level filter.
 
 Layered on top of Landlock to close escape vectors Landlock doesn't cover:
-AF_UNIX / AF_PACKET / AF_NETLINK socket() (docker.sock escape, raw packets),
+non-allowlisted socket() families (AF_UNIX → docker.sock escape, AF_PACKET
+raw packets, AF_VSOCK's per-VM transport reachable through an empty netns,
+AF_ALG and friends' capability-free kernel attack surface),
 ptrace (cross-process attacks on same-UID host processes when ptrace_scope=0),
 keyctl/bpf/user_faultfd/perf_event_open (weird-corner syscalls historically
-used in container escapes).
+used in container escapes),
+broadcast signal delivery (kill(-1)/rt_sigqueueinfo(-1) reach every
+same-UID host process on Landlock-only floors without a pid namespace;
+Landlock ABI v6 signal scoping is the primary fix on 6.12+ kernels,
+this deny is the pre-v6 tier and belt-and-braces above it).
 
-Blocklist not allowlist: RAPTOR runs arbitrary target builds, so default-
-deny would require per-tool syscall profiles. Blocklist has near-zero
-breakage risk because we only block things gcc/make/python/etc. don't use.
+SYSCALL axis: blocklist not allowlist — RAPTOR runs arbitrary target
+builds, so default-deny would require per-tool syscall profiles.
+Blocklist has near-zero breakage risk because we only block things
+gcc/make/python/etc. don't use.
+
+SOCKET-FAMILY axis: allowlist, deny-by-default (the inverse). The
+kernel's AF_* table is a moving population of module-autoloadable
+attack surface, and a family denylist fails open one live member at a
+time — AF_SMC and then AF_RXRPC each shipped kernel-internal INET
+transports that rode past Landlock's TCP-only connect hook / the
+caller-created-DGRAM-only UDP block until someone enumerated them.
+socket(2) is denied unless the family is in the small allowlist the
+sandboxed tool population actually uses (see
+_SOCKET_FAMILY_ALLOWLIST_BASE), so an unknown or future family gets
+EPERM without anyone having to enumerate it. Unlike the syscall axis,
+this default-deny needs no per-tool profiles: the family population
+in real use is tiny and stable.
+
+SOCKET-TYPE axis: allowlist as well, for the same reason PLUS a
+kernel remap the family axis cannot see: seccomp evaluates the
+caller's registers, but net/socket.c's __sock_create rewrites
+family==AF_INET + type==SOCK_PACKET into AF_PACKET afterwards, so
+the allowlisted AF_INET spelling minted a live packet-capture socket
+past the family rules. Only SOCK_STREAM / SOCK_DGRAM /
+SOCK_SEQPACKET are creatable (_SOCKET_TYPE_ALLOWLIST); SOCK_RAW,
+SOCK_PACKET, SOCK_RDM, SOCK_DCCP and every unassigned type value
+get EPERM in every profile, flag-garnished spellings included.
 
 Default action: ALLOW. Blocked syscalls return EPERM (not SIGSYS / kill)
 so processes fail gracefully — connect() returns -1, caller can handle it,
@@ -111,6 +141,7 @@ _OBSERVE_EXTRA_TRACE_SYSCALLS = (
 
 # libseccomp comparison ops (scmp_compare)
 _SCMP_CMP_EQ = 4         # equal to: arg == datum_a
+_SCMP_CMP_GE = 5         # greater or equal: arg >= datum_a (raw u64)
 
 # Namespace-creation clone flags (linux/sched.h). A sandboxed payload
 # that can create namespaces — a nested user namespace above all —
@@ -131,6 +162,15 @@ _SCMP_CMP_MASKED_EQ = 7  # masked equal: (arg & datum_a) == datum_b
 # connect(2) is ever issued, so address-based connect controls
 # (connect-scoping supervisor, Landlock CONNECT_TCP) never see it.
 _MSG_FASTOPEN = 0x20000000
+
+# AT_EMPTY_PATH (include/uapi/linux/fcntl.h) — arch-uniform. The
+# execveat(fd, "", ..., AT_EMPTY_PATH) spelling (glibc fexecve) execs
+# the FD ITSELF, no path involved, so neither Landlock (a memfd's
+# kernel-internal SB_NOUSER mount is exempt from its rules) nor any
+# path-based control ever evaluates. Denied under deny_fd_exec; a
+# path-carrying execveat (flags without AT_EMPTY_PATH) stays allowed —
+# it resolves a real path that Landlock checks like any execve.
+_AT_EMPTY_PATH = 0x1000
 
 # Linux extracts the socket type from the (type | flags) arg with this
 # mask (linux/socket.h SOCK_TYPE_MASK). Without it, exact-equality rules
@@ -197,13 +237,17 @@ _SECCOMP_BLOCK_ALWAYS = (
     # any future relaxation of the capability check would route around it.
     "open_by_handle_at", "name_to_handle_at",
 )
-# NOTE on namespace/mount syscalls: LANE-DEPENDENT. The subprocess/
-# preexec lanes do NOT block them — their filter installs before the
-# `unshare` CLI bootstrap execs, so blocking unshare(2) there kills
-# the sandbox's own setup. The FORK-BACKEND lane DOES block namespace
-# creation (block_ns_creation below): its filter installs in the
-# grandchild after every namespace the sandbox itself needs exists,
-# which removed the old constraint outright. mount/umount2/pivot_root
+# NOTE on namespace/mount syscalls: LANE-DEPENDENT. The unshare-CLI
+# subprocess lane does NOT block them — its filter installs before
+# the `unshare` CLI bootstrap execs, so blocking unshare(2) there
+# kills the sandbox's own setup (documented residual: that lane's
+# payload keeps kernel namespace-creation surface; the kernel's
+# unmapped-uid checks bound what a created ns can do). The
+# FORK-BACKEND lane and the PLAIN subprocess lane (no unshare
+# bootstrap — the payload execs directly under the filter) DO block
+# namespace creation (block_ns_creation below): the fork backend
+# installs in the grandchild after every namespace the sandbox itself
+# needs exists, and the plain lane never legitimately unshares. mount/umount2/pivot_root
 # stay unblocked at the seccomp layer on all lanes — a landlocked
 # process is already denied every mount(2) topology change
 # (Landlock's sb_mount hook), which is also why the grandchild mounts
@@ -219,9 +263,10 @@ _SECCOMP_BLOCK_ALWAYS = (
 # _make_seccomp_preexec).
 _SECCOMP_BLOCK_UNLESS_DEBUG = (
     "ptrace",
-    # gdb's read/write of the inferior's memory. Without these gdb
-    # has to fall back to /proc/PID/mem which has tighter Yama-policy
-    # constraints under non-init-userns.
+    # gdb's bulk read/write of the inferior's memory; its other
+    # route, /proc/PID/mem, sits behind the same ATTACH-class ptrace
+    # gate (Yama's scope-1 descendant exception passes for gdb's own
+    # inferior on either path).
     "process_vm_readv",
     "process_vm_writev",
 )
@@ -279,15 +324,106 @@ _AUDIT_HARD_DENY_SYSCALLS = frozenset({
     *_SECCOMP_BLOCK_ALWAYS,
 })
 
-# socket() family / type values we reject (via argument filter on arg 0 / 1).
-# AF_INET/AF_INET6 continue to be allowed — namespace --net removes the
-# interfaces anyway, so allowing AF_INET costs nothing and avoids breakage
-# for tools that create a socket and check if it works.
+# socket() family / type values used by the argument filters (arg 0 /
+# arg 1). AF_* values are arch-uniform on Linux
+# (include/linux/socket.h), so one value set covers every supported
+# arch. AF_INET/AF_INET6 are allowlisted — namespace --net removes
+# the interfaces anyway, so allowing AF_INET costs nothing and avoids
+# breakage for tools that create a socket and check if it works.
+# NOTE: an allowlisted family is NOT the whole verdict — the kernel
+# remaps AF_INET + SOCK_PACKET to AF_PACKET after seccomp ran, so
+# the TYPE allowlist below (_SOCKET_TYPE_ALLOWLIST) carries the
+# other half of the socket-creation contract.
 _AF_UNIX = 1
-_AF_NETLINK = 16
-_AF_PACKET = 17
+_AF_INET = 2
+_AF_INET6 = 10
+_SOCK_STREAM = 1
 _SOCK_RAW = 3
 _SOCK_DGRAM = 2
+
+# Socket-family ALLOWLIST — socket(2) is deny-by-default on the
+# family axis (see the module docstring). Every family NOT
+# allowlisted gets EPERM in every profile. The previous per-family
+# denylist (AF_NETLINK / AF_PACKET / AF_VSOCK / AF_ALG / AF_KEY /
+# AF_BLUETOOTH / AF_RDS / AF_TIPC / AF_SMC / AF_RXRPC / AF_XDP) kept
+# failing open one live member at a time: AF_SMC shipped a
+# kernel-internal TCP clcsock that Landlock's sk_is_tcp()-only
+# connect hook never evaluates, then AF_RXRPC shipped the
+# datagram-model sibling — a kernel-internal UDP transport the
+# caller-created-DGRAM-only block_udp rule never sees (live-verified
+# delivering attacker payload while UDP/UDPLITE/L2TP sockets were
+# EPERM). Families still creatable after BOTH fixes (AF_KCM /
+# AF_PPPOX / AF_APPLETALK / AF_ATMPVC / AF_ATMSVC / AF_NFC /
+# AF_QIPCRTR / AF_MCTP) were each open module-autoloadable kernel
+# attack surface that only an inversion closes by construction —
+# along with every family the kernel grows in the future. The old
+# denylist's per-family judgments (vsock's per-VM transport
+# reachable from an empty netns, ALG/KEY/BLUETOOTH's CVE-rich
+# message surfaces, XDP's capability-free setsockopt surface) all
+# still hold; they are now consequences of the default instead of
+# rows in a table.
+#
+# The membership is EMPIRICAL, not guessed: the sandboxed tool
+# population (compilers, build systems, interpreters, git, scanners,
+# fuzzers, HTTP/DNS clients) was instrumented across the full
+# core/sandbox test suite plus calibration workloads (C builds,
+# Python multiprocessing forkserver, git, urllib over an allowed TCP
+# port, getaddrinfo) and created exactly three families: AF_UNIX,
+# AF_INET, AF_INET6. AF_UNIX stays PROFILE-CONDITIONAL exactly as
+# before (mount-ns and frida lanes allow it, the preexec-only lane
+# denies it — see the allow_unix_sockets docstring), so it joins
+# per-call rather than sitting in this base tuple. AF_NETLINK is
+# deliberately absent: route/interface enumeration attempts (glibc
+# getifaddrs) degrade gracefully on EPERM, the whole suite is green
+# with it denied, and netlink's message parsers are CVE-rich kernel
+# attack surface.
+#
+# Rule construction (_family_deny_rule_material): one MASKED_EQ
+# EPERM rule per non-allowlisted family BELOW the allowlist ceiling,
+# plus one GE rule at the ceiling denying everything at or above it.
+# The GE compare reads the RAW 64-bit register, so a high-bit-
+# garnished value (fam | 1<<32 — which the kernel truncates to fam)
+# is denied fail-closed even when its low 32 bits spell an
+# allowlisted family; no legitimate caller garnishes the family
+# argument.
+_SOCKET_FAMILY_ALLOWLIST_BASE = (_AF_INET, _AF_INET6)
+
+# socketpair(2) family allowlist, same construction. The kernel
+# implements socketpair for more families than AF_UNIX (AF_TIPC has
+# ops->socketpair), and Linux permits sendto/sendmsg with an
+# EXPLICIT destination on a connected datagram-model socket — so a
+# non-UNIX socketpair half can recreate exactly the
+# destination-bearing primitive the socket(2) family denies exist to
+# remove, without any socket(2) reaching the filter. Only AF_UNIX
+# socketpair is a tool-population need (Rust std::process::Command,
+# Python multiprocessing — observed in the same instrumentation
+# corpus). Unconditional in every profile: unlike socket(AF_UNIX), a
+# UNIX socketpair names no external address, so no posture denies it
+# wholesale (the AF_UNIX+SOCK_DGRAM shape rule below stays
+# separately conditional).
+_SOCKETPAIR_FAMILY_ALLOWLIST = (_AF_UNIX,)
+
+
+def _family_deny_rule_material(
+        allowed: tuple[int, ...]) -> tuple[tuple[int, ...], int]:
+    """Deny-by-default rule material for a family allowlist.
+
+    Returns ``(deny_values, deny_floor)``: every family value below
+    ``deny_floor`` (= max(allowed) + 1) that is not allowlisted gets
+    its own MASKED_EQ EPERM rule, and one GE rule at ``deny_floor``
+    denies every raw 64-bit value at or above it — families newer
+    than any table plus high-bit-garnished spellings included. A
+    rule set built from this material permits EXACTLY the plain
+    allowlisted values and nothing else. (libseccomp accepts at most
+    one comparator per argument per rule, so "family in allowed set"
+    is not expressible as range compares — complement enumeration
+    below a ceiling plus the GE tail is the fail-closed equivalent.)
+    """
+    deny_floor = max(allowed) + 1
+    deny_values = tuple(
+        fam for fam in range(deny_floor) if fam not in allowed
+    )
+    return deny_values, deny_floor
 
 # Kernel-bypass stream transports (denied unconditionally, hard_deny).
 # Landlock's network rules cover IPPROTO_TCP only and the UDP block
@@ -317,15 +453,57 @@ _SOCK_DGRAM = 2
 _IPPROTO_SCTP = 132
 _IPPROTO_DCCP = 33
 _IPPROTO_MPTCP = 262
+# IPPROTO_SMC (kernel >= 6.4): socket(AF_INET[6], SOCK_STREAM,
+# IPPROTO_SMC) creates the SAME SMC socket the AF_SMC family
+# spelling does — family rule passes (INET), type rule passes
+# (STREAM), so without this protocol row the TCP-clcsock
+# fallback rides straight past Landlock's TCP-only connect hook
+# (live-verified: plain TCP connect EACCES under the degraded
+# deny while the IPPROTO_SMC connect succeeded).
+_IPPROTO_SMC = 256
 _SOCK_SEQPACKET = 5
 _SOCK_DCCP = 6
 
-# AF_INET / AF_INET6 constants — used by the UDP block. Only filtered
+# Socket-TYPE allowlist — socket(2)/socketpair(2) are deny-by-default
+# on the type axis (arg 1, masked to the kernel's SOCK_TYPE_MASK) in
+# every profile, mirroring the family inversion above. The family
+# axis alone is BYPASSABLE: net/socket.c's ``__sock_create`` remaps
+# ``family == PF_INET && type == SOCK_PACKET`` to PF_PACKET *after*
+# seccomp evaluated the registers, so ``socket(AF_INET, SOCK_PACKET,
+# htons(ETH_P_ALL))`` passed the family allowlist on its allowlisted
+# AF_INET spelling and returned a live AF_PACKET socket
+# (live-verified: SO_DOMAIN == 17 under the production ``full``
+# filter) — the packet_create kernel attack surface plus, on
+# shared-netns lanes, host/sibling traffic capture, behind a family
+# value the allowlist deliberately admits. A value-level
+# SOCK_PACKET deny would close that one remap; the inversion closes
+# the AXIS the same way the family inversion did, so a future
+# kernel-side type alias cannot reopen it.
+#
+# Membership is the same empirical adjudication as the family
+# allowlist: the instrumented tool population creates exactly
+# SOCK_STREAM (TCP, unix streams), SOCK_DGRAM (UDP/DNS, unix
+# datagrams where a profile permits them) and SOCK_SEQPACKET (unix
+# IPC — AF_INET* SEQPACKET stays denied by the family-scoped
+# SCTP-default rules above). Everything else is denied:
+# SOCK_RAW (3) is a raw-socket capability (denied pre-inversion
+# too), SOCK_RDM (4) has no INET/UNIX handler, SOCK_DCCP (6) is the
+# kernel-bypass transport, SOCK_PACKET (10) is the remap, and
+# 0/7-9/11-15 are unassigned — denied fail-closed so a future type
+# gets EPERM without enumeration. The MASKED_EQ compare bounds the
+# axis to 0..15 (flag bits SOCK_CLOEXEC/SOCK_NONBLOCK live above
+# the mask), so complement enumeration over range(16) is total —
+# no GE tail is needed, unlike the unbounded family axis.
+_SOCKET_TYPE_ALLOWLIST = (_SOCK_STREAM, _SOCK_DGRAM, _SOCK_SEQPACKET)
+_SOCKET_TYPE_DENIES = tuple(
+    sock_type for sock_type in range(16)
+    if sock_type not in _SOCKET_TYPE_ALLOWLIST
+)
+
+# The UDP block (AF_INET / AF_INET6 + SOCK_DGRAM) is only filtered
 # when the caller requests it (proxy mode); otherwise DNS via UDP/53
 # is needed for normal operation. Under proxy mode, the proxy resolves
 # on the child's behalf — DNS client-side is unnecessary.
-_AF_INET = 2
-_AF_INET6 = 10
 
 # ioctl command numbers we reject via argument filter on arg 1 (cmd).
 # Values are the asm-generic encodings used by x86_64, aarch64, riscv64,
@@ -358,6 +536,43 @@ _TIOCSCTTY = 0x540E
 _TIOCLINUX = 0x541C
 
 _BLOCKED_IOCTL_CMDS = (_TIOCSTI, _TIOCCONS, _TIOCSCTTY, _TIOCLINUX)
+
+# Broadcast signal delivery. kill(-1, sig) fans out to EVERY process
+# the caller's credentials permit — on the Landlock-only containment
+# floor (no pid namespace: unprivileged user namespaces blocked) that
+# is the operator's entire same-UID session. SIGKILL silences the
+# supervisor and loggers, SIGSTOP freezes the sandbox's own timeout
+# machinery so it never fires, SIGTERM nukes every session on the box.
+# Landlock ABI v6 signal scoping (landlock.py `scoped`) is the primary,
+# domain-semantic fix on kernels >= 6.12; this arg-filtered deny is the
+# pre-v6 tier and belt-and-braces above it. rt_sigqueueinfo rides
+# along: its pid == -1 spelling answers ESRCH on current kernels
+# (kill_proc_info has no broadcast arm — live-verified), so nothing
+# legitimate can be calling it and the deny keeps the spelling closed
+# if a future kernel ever grows one.
+#
+# Deliberately NOT denied, with reasons:
+#   * kill(0, sig) — the caller's OWN process group: legitimate job
+#     control (build/test harnesses), and sandbox children are session
+#     leaders of their own fresh group (_spawn.py start_new_session
+#     default), so the group is inside the sandbox tree. A sandboxed
+#     descendant cannot setpgid() into a host group either — setpgid
+#     is same-session-only.
+#   * kill(-pgid) — targeted, not broadcast; covered by Landlock
+#     signal scoping on v6+ kernels. Below v6 it stays a residual of
+#     the same class as a per-pid kill() sweep, which no argument
+#     filter can close (pids/pgids are ordinary positive integers).
+#   * tkill/tgkill/rt_tgsigqueueinfo — tid/tgid-targeted; -1 is
+#     EINVAL/ESRCH (tkill live-verified), no broadcast form exists.
+#   * pidfd_send_signal — targets via an fd; cannot broadcast by
+#     construction.
+_SIGNAL_BROADCAST_SYSCALLS = ("kill", "rt_sigqueueinfo")
+# The kernel reads the pid argument as a 32-bit pid_t, so -1 (the
+# broadcast value) is any register whose low 32 bits are all-ones:
+# MASKED_EQ on _ARG32_MASK matches both the sign-extended libc
+# spelling (0xFFFFFFFFFFFFFFFF) and a zero-extended raw-syscall
+# garnish (0x00000000FFFFFFFF) that the kernel still truncates to -1.
+_PID_BROADCAST_LOW32 = 0xFFFFFFFF
 
 # 32-bit argument mask for MASKED_EQ deny rules. The kernel truncates
 # socket()'s family and ioctl()'s cmd to int/unsigned int, but seccomp
@@ -479,7 +694,8 @@ def _make_seccomp_preexec(profile: str, block_udp: bool = False,
                           observe_mode: bool = False,
                           allow_unix_sockets: bool = False,
                           unix_scope_export_sock=None,
-                          block_ns_creation: bool = False):
+                          block_ns_creation: bool = False,
+                          deny_fd_exec: bool = False):
     """Create a preexec_fn that installs the seccomp filter for `profile`.
 
     Runs POST-fork in the child. Same fork-safety rules as Landlock: capture
@@ -513,8 +729,9 @@ def _make_seccomp_preexec(profile: str, block_udp: bool = False,
     filesystem + network audit coverage. EXCEPTION: the escape-primitive
     subset (_AUDIT_HARD_DENY_SYSCALLS — ptrace/process_vm_* plus the
     whole _SECCOMP_BLOCK_ALWAYS set), the blocked tty ioctls, AND the
-    socket()-argument rules (blocked families, SOCK_RAW, the
-    SCTP/DCCP/MPTCP kernel-bypass transports, the UDP block)
+    socket()-argument rules (the family allowlist's deny rules,
+    SOCK_RAW, the SCTP/DCCP/MPTCP kernel-bypass transports, the UDP
+    block)
     keep the ERRNO action under audit too; converting THOSE denials
     into allow-and-log would grant an audited child the very
     capabilities the sandbox exists to deny (e.g. socket(AF_UNIX) →
@@ -525,8 +742,8 @@ def _make_seccomp_preexec(profile: str, block_udp: bool = False,
     process. The caller (_spawn.py) is responsible for ensuring tracer
     is attached before any traced syscall fires.
 
-    `allow_unix_sockets=True` drops AF_UNIX from the socket-family
-    blocklist. Only pass this when BOTH isolation layers that make
+    `allow_unix_sockets=True` adds AF_UNIX to the socket-family
+    allowlist. Only pass this when BOTH isolation layers that make
     AF_UNIX harmless are engaged for this child: the mount namespace
     (fresh tmpfs over /run masks pathname sockets like docker.sock;
     pivot_root leaves the rest of the host read-only, and connect(2)
@@ -538,6 +755,61 @@ def _make_seccomp_preexec(profile: str, block_udp: bool = False,
     changed to forkserver, whose listener needs socket(AF_UNIX) —
     observed as the CodeQL python extractor dying with EPERM. The
     preexec-only path (no mount-ns) must keep the block.
+
+    ``deny_fd_exec=True`` closes the FILELESS-EXEC class for the
+    restricted-reads (untrusted / strict) posture — threaded from that
+    posture by every builder call site, never a profile field, so
+    trusted read-everywhere lanes keep a byte-identical filter:
+
+      * ``memfd_create`` is denied WHOLESALE (EPERM, no argument
+        gating — no memfd_create flag combination distinguishes exec
+        intent, and the MFD_* flags are attacker-chosen, so any
+        argument filter is bypassable by construction). This is the LOAD-BEARING memfd deny: a memfd's
+        inode lives on a kernel-internal SB_NOUSER mount that Landlock
+        exempts from ALL rules (live-verified), so
+        ``execve("/proc/self/fd/<memfd>")`` passes every Landlock
+        layer including a handled EXECUTE bit — seccomp cannot see the
+        path either, so refusing CREATION is the only sound
+        chokepoint. Nothing in the sandboxed tool population
+        (compilers, interpreters, scanners, PoCs) legitimately calls
+        memfd_create; RAPTOR's own memfd use (evidence.py
+        anonymous_fd) happens in the unsandboxed parent/tracer.
+      * ``execveat`` with AT_EMPTY_PATH in flags (arg 4, MASKED_EQ) is
+        denied — the fd-exec spelling (glibc fexecve) works below the
+        Landlock floor and on fds acquired without memfd_create.
+        Path-carrying execveat stays allowed.
+
+    Both are hard_deny under audit mode (escape-primitive class: an
+    allow-and-log would hand the audited child an unauditable
+    in-memory process image for the run's duration). On-filesystem
+    exec scoping (O_TMPFILE, unlinked files, non-allowlisted trees)
+    is Landlock's job — see landlock.py's EXECUTE handling.
+
+    FRIDA-PROFILE CARVE-OUT (threat model, stated): under
+    ``profile == "frida"`` the memfd_create arm is NOT installed; the
+    execveat AT_EMPTY_PATH arm still is. frida-core cannot function
+    without memfd: agent injection writes frida-agent.so into a memfd
+    (``frida_memory_file_descriptor_from_bytes``) and the target maps
+    it via dlopen("/proc/self/fd/N") — a wholesale memfd deny aborts
+    every sandboxed frida run at injection. Permitting memfd_create
+    here is a CONSENTED-INSTRUMENTATION capability, not a containment
+    loss: the frida profile already omits the ptrace /
+    process_vm_readv / process_vm_writev blocks (that is what the
+    profile IS — dynamic instrumentation injects and runs arbitrary
+    in-memory code in the target by design, the dynamic-validation
+    trust surface the operator opted into by running frida), so
+    "anonymous in-memory code" is this lane's granted capability
+    already, and an exec'd memfd image still inherits every OTHER
+    layer (seccomp filter survives execve, Landlock read/write
+    scoping, network policy, namespace-creation deny). What the
+    carve-out gives up is exactly the no-anonymous-process-image
+    AUDITABILITY property — unattainable in an instrumentation lane
+    by definition. The carve-out is keyed on the frida seccomp
+    profile string (explicit lane posture, selected only by
+    packages/frida/sandboxed.py; same precedent as the AF_UNIX and
+    dgram-socketpair carve-outs above) — never ambient state — and
+    every non-frida profile builds the full two-arm deny
+    byte-identically.
 
     `observe_mode=True` extends the trace set with stat-family syscalls
     (stat/lstat/newfstatat/access/faccessat/faccessat2) on top of the
@@ -577,7 +849,7 @@ def _make_seccomp_preexec(profile: str, block_udp: bool = False,
         return None
     if not check_seccomp_available():
         # A profile was REQUESTED but the filter cannot engage — the
-        # child runs without the socket-family blocklist (AF_UNIX →
+        # child runs without the socket-family allowlist (AF_UNIX →
         # docker.sock on Landlock-only hosts), the io_uring/keyring/bpf
         # escape-primitive blocks, and the UDP/DNS-exfil block. This
         # must never be silent. Refuse-vs-warn is decided PER POSTURE
@@ -596,9 +868,12 @@ def _make_seccomp_preexec(profile: str, block_udp: bool = False,
                 "Sandbox: seccomp profile %r was requested but "
                 "libseccomp is unavailable or non-functional — "
                 "children run WITHOUT the seccomp layer: the "
-                "socket-family blocklist (incl. AF_UNIX → "
+                "socket-family allowlist (incl. AF_UNIX → "
                 "docker.sock), the io_uring/keyring/bpf "
-                "escape-primitive blocks and the UDP block are all "
+                "escape-primitive blocks, the UDP block and the "
+                "fileless-exec deny (memfd_create + execveat "
+                "AT_EMPTY_PATH for restricted-reads children — "
+                "Landlock cannot cover the memfd spelling) are all "
                 "inactive. Install libseccomp (libseccomp2 package) "
                 "to restore the filter.", profile,
             )
@@ -668,6 +943,18 @@ def _make_seccomp_preexec(profile: str, block_udp: bool = False,
     # Sockets: filter by argument (family). Same syscall number, multiple rules.
     socket_num = _resolve("socket")
     socketpair_num = _resolve("socketpair")
+    # socketcall(2): the legacy multiplexer routes EVERY socket-API
+    # call through one syscall whose real arguments live in a
+    # user-memory array seccomp cannot dereference — on architectures
+    # that retain it (s390x among the supported set) an un-filtered
+    # socketcall would bypass every socket-argument rule below
+    # (family allowlist, SOCK_RAW, protocol/type denies, the UDP
+    # block, MSG_FASTOPEN). Resolves negative on arches without it
+    # (x86_64/aarch64 never had the multiplexer wired for 64-bit
+    # userspace); the install loop skips negative numbers, so the
+    # rule below is a no-op there and load-bearing exactly where the
+    # bypass exists.
+    socketcall_num = _resolve("socketcall")
     connect_num = (_resolve("connect")
                    if unix_scope_export_sock is not None else -1)
     # ioctl — filter only specific cmd numbers (TIOCSTI for tty injection).
@@ -681,11 +968,34 @@ def _make_seccomp_preexec(profile: str, block_udp: bool = False,
     send_flag_syscalls = [("sendto", _resolve("sendto"), 3),
                           ("sendmsg", _resolve("sendmsg"), 2),
                           ("sendmmsg", _resolve("sendmmsg"), 3)]
+    # Broadcast-signal deny (pid == -1) — see _SIGNAL_BROADCAST_SYSCALLS.
+    # Unconditional across profiles, debug/frida included: debuggers and
+    # instrumentation signal specific pids, never every process on the
+    # host, so no profile has a legitimate broadcast need.
+    signal_broadcast_syscalls = [(name, _resolve(name))
+                                 for name in _SIGNAL_BROADCAST_SYSCALLS]
+    # Fileless-exec deny (deny_fd_exec): memfd_create wholesale +
+    # execveat(AT_EMPTY_PATH). Resolved in the parent like everything
+    # else; the child fail-closes if either is unresolved while the
+    # deny was requested (same posture as block_udp's socket() check —
+    # a requested control must not silently vanish).
+    #
+    # "frida" profile carve-out: memfd_create stays PERMITTED (the
+    # execveat AT_EMPTY_PATH arm still installs). frida-core's agent
+    # injection is memfd-based — frida_memory_file_descriptor_from_
+    # bytes() memfd_creates the agent .so and the target dlopen-maps
+    # it from /proc/self/fd (never an exec of the fd) — so the
+    # wholesale memfd deny aborts every sandboxed spawn/attach at
+    # injection time. See the docstring for why this is a consented
+    # instrumentation capability, not a containment loss.
+    deny_memfd_create = deny_fd_exec and profile != "frida"
+    memfd_create_num = _resolve("memfd_create") if deny_memfd_create else -1
+    execveat_num = _resolve("execveat") if deny_fd_exec else -1
 
     # socketpair(AF_UNIX, SOCK_DGRAM) is denied exactly when the
     # matching socket(AF_UNIX, SOCK_DGRAM) is denied: either AF_UNIX
-    # is in the family blocklist (default posture) or connect scoping
-    # is engaged (AF_UNIX allowed but datagrams denied). A dgram
+    # is outside the family allowlist (default posture) or connect
+    # scoping is engaged (AF_UNIX allowed but datagrams denied). A dgram
     # socketpair half accepts sendto/sendmsg with an EXPLICIT
     # destination address, so leaving socketpair unfiltered recreates
     # the destination-bearing datagram primitive those denies exist
@@ -702,31 +1012,41 @@ def _make_seccomp_preexec(profile: str, block_udp: bool = False,
     # returns a negative value for unresolved names — RISC-V older cores
     # and some cross-compiled builds hit this for specific syscalls. We
     # name the missing ones so operators can decide if the gap is tolerable.
-    # (socketpair() is filtered only for the AF_UNIX+SOCK_DGRAM shape —
-    # see the rule-installation comment below — so it's reported as
-    # "missing" only when that rule was going to be installed.)
+    # (socketpair() now carries the family-allowlist deny rules in
+    # every posture, so an unresolved socketpair is always reported.)
     missing = [name for name, num in resolved_blocks if num < 0]
     if socket_num < 0:
         missing.append("socket")
     if ioctl_num < 0:
         missing.append("ioctl")
-    if deny_unix_dgram_socketpair and socketpair_num < 0:
+    if socketpair_num < 0:
         missing.append("socketpair")
     missing += [name for name, num, _arg in send_flag_syscalls
+                if num < 0]
+    missing += [name for name, num in signal_broadcast_syscalls
                 if num < 0]
     if missing and state.warn_once("_seccomp_arch_missing_warned"):
         logger.warning(
             "Sandbox: seccomp could not resolve syscall(s) %s on this architecture — those blocks are NOT installed. Likely harmless on x86_64/aarch64 (this should be empty); investigate on other architectures if any entries appear.", missing
         )
-    # Block AF_UNIX/NETLINK/PACKET via arg 0; block SOCK_RAW via arg 1.
-    # "frida" profile: allow AF_UNIX (frida-helper uses Unix sockets for
-    # its internal IPC with the target process) but keep NETLINK/PACKET
-    # and SOCK_RAW blocked.
+    # Socket-family allowlist (see _SOCKET_FAMILY_ALLOWLIST_BASE):
+    # deny-by-default on arg 0; type allowlist on arg 1 (see
+    # _SOCKET_TYPE_ALLOWLIST — closes the AF_INET+SOCK_PACKET
+    # kernel remap alongside SOCK_RAW). "frida"
+    # profile: AF_UNIX joins the allowlist (frida-helper uses Unix
+    # sockets for its internal IPC with the target process), exactly
+    # like the mount-ns lane's allow_unix_sockets — no profile widens
+    # the family set beyond that one trade.
     if profile == "frida" or allow_unix_sockets:
-        socket_family_blocks = [_AF_NETLINK, _AF_PACKET]
+        socket_allowed_families: tuple[int, ...] = (
+            _AF_UNIX, *_SOCKET_FAMILY_ALLOWLIST_BASE)
     else:
-        socket_family_blocks = [_AF_UNIX, _AF_NETLINK, _AF_PACKET]
-    socket_type_block = _SOCK_RAW
+        socket_allowed_families = _SOCKET_FAMILY_ALLOWLIST_BASE
+    socket_family_denies, socket_family_deny_floor = (
+        _family_deny_rule_material(socket_allowed_families))
+    socketpair_family_denies, socketpair_family_deny_floor = (
+        _family_deny_rule_material(_SOCKETPAIR_FAMILY_ALLOWLIST))
+    socket_type_denies = _SOCKET_TYPE_DENIES
 
     _os_write = os.write
 
@@ -886,18 +1206,102 @@ def _make_seccomp_preexec(profile: str, block_udp: bool = False,
                                          b" -- refusing to exec without filter\n")
                             os._exit(126)
 
-                # socket() with blocked family — one rule per family.
-                # MASKED_EQ on the low 32 bits, not EQ: the kernel
-                # truncates the family to int, so EQ misses
-                # `fam | 1<<32` while the kernel still sees `fam`.
+                # Fileless-exec deny (deny_fd_exec — see the docstring
+                # for the full rationale). memfd_create: wholesale,
+                # no argument comparators (argument gating is unsound
+                # here). execveat: MASKED_EQ on the flags argument —
+                # any flag combination containing AT_EMPTY_PATH is the
+                # fd-exec spelling; path-carrying calls don't match.
+                # hard_deny on both: escape-primitive class, never
+                # downgrades to allow-and-log under audit mode.
+                if deny_fd_exec:
+                    if ((deny_memfd_create and memfd_create_num < 0)
+                            or execveat_num < 0):
+                        # Requested control unresolvable on this arch —
+                        # fail-closed like block_udp's socket() check.
+                        _os_write(2, b"sandbox: seccomp fd-exec deny "
+                                     b"requested but memfd_create/execveat "
+                                     b"unresolved -- refusing to exec "
+                                     b"without filter\n")
+                        os._exit(126)
+                    # memfd rule skipped exactly on the frida-profile
+                    # carve-out (deny_memfd_create False); the
+                    # execveat AT_EMPTY_PATH rule below installs for
+                    # every deny_fd_exec build.
+                    if deny_memfd_create:
+                        null_args = ctypes.POINTER(_ScmpArgCmp)()
+                        ret = lib.seccomp_rule_add_array(
+                            ctx, hard_deny, memfd_create_num, 0, null_args,
+                        )
+                        if ret < 0:
+                            _os_write(2, b"sandbox: seccomp memfd_create "
+                                         b"rule failed -- refusing to exec "
+                                         b"without filter\n")
+                            os._exit(126)
+                    _ev = _ScmpArgCmp(arg=4, op=_SCMP_CMP_MASKED_EQ,
+                                      datum_a=_AT_EMPTY_PATH,
+                                      datum_b=_AT_EMPTY_PATH)
+                    _ev_arr = (_ScmpArgCmp * 1)(_ev)
+                    ret = lib.seccomp_rule_add_array(
+                        ctx, hard_deny, execveat_num, 1, _ev_arr,
+                    )
+                    if ret < 0:
+                        _os_write(2, b"sandbox: seccomp execveat "
+                                     b"AT_EMPTY_PATH rule failed -- "
+                                     b"refusing to exec without filter\n")
+                        os._exit(126)
+
+                # socketcall(2) — deny the legacy multiplexer with
+                # ENOSYS wherever the arch defines it (see the
+                # resolution comment in the parent). Its call number
+                # is arg 0 but the real socket()/connect()/sendto()
+                # arguments sit in a user-memory array no BPF filter
+                # can dereference, so argument-scoped filtering is
+                # impossible by construction — the only sound options
+                # are deny or blanket-allow, and blanket-allow would
+                # let a multiplexed socket() bypass every rule below.
+                # ENOSYS rather than EPERM, same treatment as clone3:
+                # libcs built for modern kernels use the direct
+                # socket syscalls (wired on s390 since kernel 4.3),
+                # and a caller that probes socketcall first treats
+                # ENOSYS as "multiplexer absent" and falls back to
+                # the direct, filterable spellings where every rule
+                # below applies. Unconditional across profiles and
+                # hard (never TRACE) under audit mode: a multiplexed
+                # socket call must never be more permissive than the
+                # direct one it wraps.
+                if socketcall_num >= 0:
+                    _errno_enosys_sc = 38
+                    null_args = ctypes.POINTER(_ScmpArgCmp)()
+                    ret = lib.seccomp_rule_add_array(
+                        ctx, _SCMP_ACT_ERRNO(_errno_enosys_sc),
+                        socketcall_num, 0, null_args,
+                    )
+                    if ret < 0:
+                        _os_write(2, b"sandbox: seccomp socketcall rule"
+                                     b" failed -- refusing to exec"
+                                     b" without filter\n")
+                        os._exit(126)
+
+                # socket() family allowlist, deny-by-default — one
+                # MASKED_EQ rule per non-allowlisted family below the
+                # allowlist ceiling, then one GE rule at the ceiling
+                # (see _family_deny_rule_material). MASKED_EQ on the
+                # low 32 bits, not EQ: the kernel truncates the
+                # family to int, so EQ misses `fam | 1<<32` while the
+                # kernel still sees `fam`. The GE compare reads the
+                # raw 64-bit register, so every value at or above the
+                # ceiling — unknown future families and garnished
+                # spellings included — is denied without enumeration.
                 # hard_deny (not deny): the socket-argument rules are
                 # escape primitives (docker.sock via AF_UNIX on
                 # Landlock-only hosts, host-traffic sniffing via
-                # AF_PACKET/SOCK_RAW) and must NOT downgrade to
+                # AF_PACKET/SOCK_RAW, kernel-internal transports like
+                # AF_SMC/AF_RXRPC) and must NOT downgrade to
                 # allow-and-log under audit mode — see the
                 # _AUDIT_HARD_DENY_SYSCALLS rationale.
                 if socket_num >= 0:
-                    for fam in socket_family_blocks:
+                    for fam in socket_family_denies:
                         arg = _ScmpArgCmp(arg=0, op=_SCMP_CMP_MASKED_EQ,
                                           datum_a=_ARG32_MASK, datum_b=fam)
                         arg_arr = (_ScmpArgCmp * 1)(arg)
@@ -908,28 +1312,49 @@ def _make_seccomp_preexec(profile: str, block_udp: bool = False,
                             _os_write(2, b"sandbox: seccomp socket family rule failed"
                                          b" -- refusing to exec without filter\n")
                             os._exit(126)
-
-                    # socket() with SOCK_RAW — argument 1 is type (with optional
-                    # SOCK_NONBLOCK/CLOEXEC bits). Use MASKED_EQ with the
-                    # kernel's SOCK_TYPE_MASK (0xf) so the rule matches the
-                    # bare `SOCK_RAW` and also `SOCK_RAW | SOCK_CLOEXEC` /
-                    # `SOCK_RAW | SOCK_NONBLOCK`. Raw sockets also require
-                    # CAP_NET_RAW on the host which the sandbox doesn't grant,
-                    # so this is belt-and-braces. Lives alongside the other
-                    # socket() rules (was previously nested inside the ioctl
-                    # block by accident — it depends on socket_num, not
-                    # ioctl_num).
-                    arg = _ScmpArgCmp(arg=1, op=_SCMP_CMP_MASKED_EQ,
-                                      datum_a=_SOCK_TYPE_MASK,
-                                      datum_b=socket_type_block)
+                    arg = _ScmpArgCmp(arg=0, op=_SCMP_CMP_GE,
+                                      datum_a=socket_family_deny_floor,
+                                      datum_b=0)
                     arg_arr = (_ScmpArgCmp * 1)(arg)
                     ret = lib.seccomp_rule_add_array(
                         ctx, hard_deny, socket_num, 1, arg_arr,
                     )
                     if ret < 0:
-                        _os_write(2, b"sandbox: seccomp SOCK_RAW rule failed -- "
-                                     b"refusing to exec without filter\n")
+                        _os_write(2, b"sandbox: seccomp socket family rule failed"
+                                     b" -- refusing to exec without filter\n")
                         os._exit(126)
+
+                    # socket() type allowlist, deny-by-default — one
+                    # MASKED_EQ rule per non-allowlisted type value
+                    # (see _SOCKET_TYPE_ALLOWLIST: only SOCK_STREAM /
+                    # SOCK_DGRAM / SOCK_SEQPACKET survive; SOCK_RAW,
+                    # SOCK_PACKET — which the kernel remaps to a live
+                    # AF_PACKET socket past the family allowlist —
+                    # SOCK_RDM and every unassigned value get EPERM).
+                    # Argument 1 is type with optional SOCK_NONBLOCK/
+                    # SOCK_CLOEXEC bits; MASKED_EQ with the kernel's
+                    # SOCK_TYPE_MASK (0xf) matches bare and
+                    # flag-garnished spellings alike, and bounds the
+                    # axis to 0..15 so the complement enumeration is
+                    # total. Raw sockets also require CAP_NET_RAW on
+                    # the host, but the sandbox's own userns grants
+                    # that over its netns — the type rules are a
+                    # primary control, not belt-and-braces. Lives
+                    # alongside the other socket() rules (depends on
+                    # socket_num, not ioctl_num).
+                    for sock_type in socket_type_denies:
+                        arg = _ScmpArgCmp(arg=1, op=_SCMP_CMP_MASKED_EQ,
+                                          datum_a=_SOCK_TYPE_MASK,
+                                          datum_b=sock_type)
+                        arg_arr = (_ScmpArgCmp * 1)(arg)
+                        ret = lib.seccomp_rule_add_array(
+                            ctx, hard_deny, socket_num, 1, arg_arr,
+                        )
+                        if ret < 0:
+                            _os_write(2, b"sandbox: seccomp socket type rule"
+                                         b" failed -- refusing to exec"
+                                         b" without filter\n")
+                            os._exit(126)
 
                     # Kernel-bypass stream transports — see the
                     # _IPPROTO_SCTP constant block for the full
@@ -943,7 +1368,7 @@ def _make_seccomp_preexec(profile: str, block_udp: bool = False,
                     # MASKED_EQ low-32 on arg 2 for the same
                     # high-bit-set reason as the family rules.
                     for proto in (_IPPROTO_SCTP, _IPPROTO_DCCP,
-                                  _IPPROTO_MPTCP):
+                                  _IPPROTO_MPTCP, _IPPROTO_SMC):
                         arg = _ScmpArgCmp(arg=2, op=_SCMP_CMP_MASKED_EQ,
                                           datum_a=_ARG32_MASK,
                                           datum_b=proto)
@@ -1030,8 +1455,12 @@ def _make_seccomp_preexec(profile: str, block_udp: bool = False,
                 # comparators but they're AND'd, so we'd need one rule
                 # per (family, type) combination — which is exactly
                 # what we do). Rejects AF_INET/AF_INET6 + SOCK_DGRAM.
-                # Allows UDP for other families (AF_UNIX/NETLINK etc.
-                # are already blocked above regardless of type).
+                # Datagram sockets of other families are covered by
+                # the family allowlist above: only AF_UNIX (per
+                # profile) survives it, so a family with a
+                # kernel-internal INET transport (AF_RXRPC was the
+                # live member under the old denylist) is denied by
+                # construction rather than by enumeration.
                 if block_udp and socket_num < 0:
                     # Fail-closed: caller asked for proxy-mode UDP block
                     # but we can't install the rule (socket() syscall
@@ -1070,13 +1499,73 @@ def _make_seccomp_preexec(profile: str, block_udp: bool = False,
                                          b" -- refusing to exec without filter\n")
                             os._exit(126)
 
-                # socketpair(): only the AF_UNIX + SOCK_DGRAM shape is
-                # filtered. SOCK_STREAM / SOCK_SEQPACKET socketpair is
-                # DELIBERATELY left alone: it returns two already-
-                # connected sockets with NO external address — the
-                # "peer" is the other half of the pair — and blocking
-                # it breaks Rust's std::process::Command (AF_UNIX
-                # socketpair for fork+exec error reporting) and Python
+                # socketpair() family allowlist — same deny-by-default
+                # construction as socket() above, AF_UNIX-only in
+                # every posture (see _SOCKETPAIR_FAMILY_ALLOWLIST:
+                # the kernel implements socketpair for non-UNIX
+                # families too — AF_TIPC — and a connected non-UNIX
+                # pair half takes destination-bearing sendto/sendmsg,
+                # recreating the primitive the socket() family denies
+                # remove without any socket(2) reaching the filter).
+                if socketpair_num >= 0:
+                    for fam in socketpair_family_denies:
+                        arg = _ScmpArgCmp(arg=0, op=_SCMP_CMP_MASKED_EQ,
+                                          datum_a=_ARG32_MASK,
+                                          datum_b=fam)
+                        arg_arr = (_ScmpArgCmp * 1)(arg)
+                        ret = lib.seccomp_rule_add_array(
+                            ctx, hard_deny, socketpair_num, 1, arg_arr,
+                        )
+                        if ret < 0:
+                            _os_write(2, b"sandbox: seccomp socketpair"
+                                         b" family rule failed -- refusing"
+                                         b" to exec without filter\n")
+                            os._exit(126)
+                    arg = _ScmpArgCmp(arg=0, op=_SCMP_CMP_GE,
+                                      datum_a=socketpair_family_deny_floor,
+                                      datum_b=0)
+                    arg_arr = (_ScmpArgCmp * 1)(arg)
+                    ret = lib.seccomp_rule_add_array(
+                        ctx, hard_deny, socketpair_num, 1, arg_arr,
+                    )
+                    if ret < 0:
+                        _os_write(2, b"sandbox: seccomp socketpair"
+                                     b" family rule failed -- refusing"
+                                     b" to exec without filter\n")
+                        os._exit(126)
+                    # socketpair() type allowlist — same deny-by-
+                    # default construction as socket() above. The
+                    # family allowlist already refuses AF_INET
+                    # socketpair (so the SOCK_PACKET remap cannot
+                    # fire through this entry today), but the remap
+                    # runs in the SHARED __sock_create path both
+                    # syscalls use — constraining the axis here too
+                    # keeps the pair of entry points symmetric so a
+                    # future family-allowlist widening cannot
+                    # silently reopen a type-level hole.
+                    for sock_type in socket_type_denies:
+                        arg = _ScmpArgCmp(arg=1, op=_SCMP_CMP_MASKED_EQ,
+                                          datum_a=_SOCK_TYPE_MASK,
+                                          datum_b=sock_type)
+                        arg_arr = (_ScmpArgCmp * 1)(arg)
+                        ret = lib.seccomp_rule_add_array(
+                            ctx, hard_deny, socketpair_num, 1, arg_arr,
+                        )
+                        if ret < 0:
+                            _os_write(2, b"sandbox: seccomp socketpair"
+                                         b" type rule failed -- refusing"
+                                         b" to exec without filter\n")
+                            os._exit(126)
+
+                # socketpair(AF_UNIX): only the SOCK_DGRAM shape is
+                # additionally filtered (conditionally — see
+                # deny_unix_dgram_socketpair). SOCK_STREAM /
+                # SOCK_SEQPACKET AF_UNIX socketpair is DELIBERATELY
+                # left alone: it returns two already-connected
+                # sockets with NO external address — the "peer" is
+                # the other half of the pair — and blocking it breaks
+                # Rust's std::process::Command (AF_UNIX socketpair
+                # for fork+exec error reporting) and Python
                 # multiprocessing. The DGRAM shape is different: Linux
                 # permits sendto/sendmsg with an EXPLICIT destination
                 # on a connected dgram socket, so a dgram socketpair
@@ -1138,6 +1627,35 @@ def _make_seccomp_preexec(profile: str, block_udp: bool = False,
                     if ret < 0:
                         _os_write(2, b"sandbox: seccomp MSG_FASTOPEN rule"
                                      b" failed -- refusing to exec"
+                                     b" without filter\n")
+                        os._exit(126)
+
+                # Broadcast-signal deny — kill(-1, sig) and
+                # rt_sigqueueinfo(-1, ...) get EPERM in every profile
+                # (see _SIGNAL_BROADCAST_SYSCALLS for the threat and
+                # the not-denied neighbours). MASKED_EQ on the low 32
+                # bits of the pid argument (arg 0): the kernel reads a
+                # 32-bit pid_t, so this matches the sign-extended libc
+                # spelling and zero-extended raw-syscall garnish alike
+                # while leaving every non-broadcast pid — positive,
+                # 0 (own group), negative pgids — completely unfiltered.
+                # hard_deny: a broadcast SIGKILL/SIGSTOP against the
+                # operator's session is not observable-then-harmless —
+                # allow-and-log under audit mode would execute the nuke
+                # while recording it (same class as TIOCSTI).
+                for _sb_name, _sb_num in signal_broadcast_syscalls:
+                    if _sb_num < 0:
+                        continue
+                    arg = _ScmpArgCmp(arg=0, op=_SCMP_CMP_MASKED_EQ,
+                                      datum_a=_ARG32_MASK,
+                                      datum_b=_PID_BROADCAST_LOW32)
+                    arg_arr = (_ScmpArgCmp * 1)(arg)
+                    ret = lib.seccomp_rule_add_array(
+                        ctx, hard_deny, _sb_num, 1, arg_arr,
+                    )
+                    if ret < 0:
+                        _os_write(2, b"sandbox: seccomp signal-broadcast"
+                                     b" rule failed -- refusing to exec"
                                      b" without filter\n")
                         os._exit(126)
 

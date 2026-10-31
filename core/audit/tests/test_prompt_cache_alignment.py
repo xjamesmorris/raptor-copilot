@@ -178,3 +178,26 @@ class TestKernelHeuristicCorroboration:
     def test_non_hinted_path_never_kernel(self):
         from core.audit.context import _is_kernel_c
         assert _is_kernel_c({"file": "src/app.c"}) is False
+
+    def test_cache_not_shared_across_targets(self, tmp_path):
+        # Same relative path under two different targets: the first
+        # target's verdict must not be served for the second (the
+        # cache was keyed by relative path only, so a kernel verdict
+        # from one in-process run bled into the next target).
+        from core.audit.context import _is_kernel_c, _kernel_file_cache
+        _kernel_file_cache.clear()
+        rel = "crypto/core.c"
+        kernel_tree = tmp_path / "kernel"
+        (kernel_tree / "crypto").mkdir(parents=True)
+        (kernel_tree / rel).write_text(
+            '#include <linux/module.h>\nMODULE_LICENSE("GPL");\n'
+        )
+        userland_tree = tmp_path / "openssl"
+        (userland_tree / "crypto").mkdir(parents=True)
+        (userland_tree / rel).write_text(
+            '#include <openssl/aes.h>\nint f(void){return 1;}\n'
+        )
+        assert _is_kernel_c(
+            {"file": rel, "target_path": str(kernel_tree)}) is True
+        assert _is_kernel_c(
+            {"file": rel, "target_path": str(userland_tree)}) is False

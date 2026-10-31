@@ -600,3 +600,70 @@ def test_deep_executor_typeerror_labelled_executor_error() -> None:
     assert not out["passed"]
     assert "executor error" in out["reason"]
     assert "invalid step arguments" not in out["reason"]
+
+
+# ── hostile plan headers must fold into a failed check, never raise ────
+
+
+def test_crlf_header_value_is_failed_check_not_crash() -> None:
+    # http.client's putheader validation raises ValueError on CRLF in
+    # a header value; plans are untrusted (LLM-authored / on-disk
+    # replay), so this must degrade to failures-are-data — pre-fix the
+    # ValueError escaped verify_plan and provision() re-raised.
+    out = ev.check_http_request(
+        host_ip="127.0.0.1", host_port=1, method="POST",
+        request_body="x", expected_response_contains="marker",
+        headers={"X-Evil": "a\r\nInjected: b"},
+    )
+    assert not out["passed"]
+    assert "invalid request shape" in out["reason"]
+
+
+def test_illegal_header_name_is_failed_check_not_crash() -> None:
+    out = ev.check_http_request(
+        host_ip="127.0.0.1", host_port=1, method="POST",
+        request_body="x", expected_response_contains="marker",
+        headers={"Bad Name\r\n": "v"},
+    )
+    assert not out["passed"]
+    assert "invalid request shape" in out["reason"]
+
+
+def test_verify_plan_survives_hostile_header_step() -> None:
+    h = FakeHandle()
+    step = {
+        "type": "http_request_check", "method": "POST",
+        "request_body": "x", "expected_response_contains": "marker",
+        "headers": {"X-Evil": "a\r\nInjected: b"},
+    }
+    out = ev.verify_plan(h, [{"type": "container_status"}, step],
+                         endpoint=("127.0.0.1", 1))
+    assert out["passed"] is False  # failed check, no exception
+    reasons = " ".join(str(r.get("reason", "")) for r in out["results"])
+    assert "invalid request shape" in reasons
+
+
+class TestPlanLengthCap:
+    """Plans are untrusted (LLM-authored / on-disk specs) and each
+    step may legally wait 300 s — an uncapped N-step plan is a
+    300·N wall-clock sink in the trusted parent."""
+
+    def test_oversized_plan_refused_loudly(self):
+        from core.env.verify import _MAX_PLAN_STEPS, verify_plan
+        plan = [{"type": "stability_wait", "wait_seconds": 300}] * (
+            _MAX_PLAN_STEPS + 1)
+        result = verify_plan(executors={}, plan=plan)
+        assert result["passed"] is False
+        assert "refusing plans over" in result["reason"]
+        assert result["results"] == []  # nothing ran
+
+    def test_cap_boundary_plan_still_runs(self):
+        from core.env.verify import _MAX_PLAN_STEPS, verify_plan
+
+        def _ok(**_kw):
+            return {"type": "container_status", "passed": True,
+                    "reason": "", "details": {}}
+        execs = {"container_status": _ok}
+        plan = [{"type": "container_status"}] * _MAX_PLAN_STEPS
+        result = verify_plan(executors=execs, plan=plan)
+        assert result["passed"] is True

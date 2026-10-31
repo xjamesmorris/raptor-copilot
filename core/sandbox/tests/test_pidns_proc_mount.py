@@ -39,7 +39,11 @@ import textwrap  # noqa: E402
 import unittest  # noqa: E402
 from pathlib import Path  # noqa: E402
 from unittest import mock  # noqa: E402
-from core.sandbox.tests.capability import requires_landlock, requires_userns
+from core.sandbox.tests.capability import (
+    requires_landlock,
+    requires_mount,
+    requires_userns,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -288,11 +292,16 @@ class TestPostureStampE2E(unittest.TestCase):
         self.assertNotIn("pidns_proc_mount_unavailable", r.sandbox_info)
 
     @requires_landlock
+    @requires_userns
+    # Exercises mount-delivered capability; hosts with userns but no mount capability degrade by design -> named SKIP, not a mid-flight mount failure.
+    @requires_mount
     def test_contract_lane_run_is_never_stamped_from_a_divergent_probe(self):
         """A require_fresh_procfs run that completed PROVED its procfs
         was fresh (a grandchild remount failure aborts before any
         result exists) — a divergent probe verdict must not mislabel
-        it degraded."""
+        it degraded. Needs the namespace backend for real: on a
+        userns-denied host the contract call refuses up front (the
+        containment floor, by design) instead of completing."""
         from core.sandbox import run, state
         state._pidns_fresh_proc_cache = False  # probe disagrees
         r = run(["true"], timeout=30,
@@ -304,6 +313,8 @@ class TestPostureStampE2E(unittest.TestCase):
 
 @requires_landlock
 @requires_userns
+# Exercises mount-delivered capability; hosts with userns but no mount capability degrade by design -> named SKIP, not a mid-flight mount failure.
+@requires_mount
 class TestNoWarningWhenRemountWorksE2E(unittest.TestCase):
     """On a host that CAN remount the fresh procfs, spawns must emit no
     proc-mount warning at all (the pre-Landlock mount ordering makes the

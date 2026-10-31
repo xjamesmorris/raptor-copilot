@@ -196,6 +196,105 @@ class TestExemptLine:
         assert not idx.exempt_line(6)
 
 
+class TestPositionalTracking:
+    def test_nonfresh_redeclaration_in_disjoint_block_untracks(self):
+        # Block 1's fresh 'a' dies at its brace; block 2 re-declares
+        # 'a' ALIASING another array. Consuming the declarator name
+        # unconditionally hid the re-alias from the leftover scan —
+        # the sink's read of the aliased array then counted as a
+        # tracked read with ZERO writes ("null default, not attacker
+        # data"). The collection leg already untracks this shape.
+        idx = _index(
+            "        String[] other = getOther();\n"
+            "        {\n"
+            '            String[] a = new String[]{"safe"};\n'
+            "        }\n"
+            "        {\n"
+            "            String[] a = other;\n"
+            "            out.println(a[0]);\n"
+            "        }\n"
+        )
+        assert not idx.tracked("a")
+
+    def test_dead_block_fresh_decl_does_not_vouch_field_reads(self):
+        # The fresh declarator's vouch window ends at its block; an
+        # access outside it resolves to a same-named FIELD (or outer
+        # binding) the fresh-array facts say nothing about. The index
+        # is built over the METHOD span (the production call shape),
+        # so the class-level field declaration is invisible to the
+        # leftover scan — only the positional window can refuse.
+        src = (
+            "import org.owasp.encoder.Encode;\n"
+            "public class T {\n"
+            "    static String[] a;\n"
+            "    public void handle(String x, int i, "
+            "java.io.PrintWriter out) {\n"
+            "        if (i > 0) {\n"
+            '            String[] a = new String[]{"safe"};\n'
+            "        }\n"
+            "        out.println(a[0]);\n"
+            "    }\n}\n"
+        )
+        from core.analysis.java_array_escape import (
+            build_local_array_index,
+        )
+        idx = build_local_array_index(src, (4, 9))
+        assert idx is not None and idx.ok
+        assert not idx.tracked("a")
+
+    def test_in_window_usage_stays_tracked(self):
+        # Control: ordinary single-block usage keeps tracking.
+        idx = _index(
+            '        String[] a = new String[]{"safe"};\n'
+            "        a[1] = Encode.forHtml(x);\n"
+            "        out.println(a[1]);\n"
+        )
+        assert idx.tracked("a")
+
+
+class TestArrayCreationInitializer:
+    CATALOG = {"org.owasp.encoder.Encode.forHtml"}
+
+    def test_creation_initializer_elements_are_writes(self):
+        # 'new String[]{taint}' writes taint to element 0 — invisible,
+        # the "every write is a catalog sanitizer" proof held over a
+        # hidden taint write (the not-overwritten path delivers it).
+        idx = _index(
+            "        String[] a = new String[]{x};\n"
+            "        if (i > 0) { a[0] = Encode.forHtml(x); }\n"
+            "        out.println(a[0]);\n"
+        )
+        writes = idx.element_writes("a", 0)
+        assert len(writes) == 2, (
+            "creation-initializer element write not recorded"
+        )
+        assert not all(
+            idx.write_is_catalog_call(w, self.CATALOG) for w in writes)
+
+    def test_creation_initializer_matches_bare_form(self):
+        # The bare '{x}' spelling already recorded the write — the
+        # 'new String[]{x}' spelling must behave identically.
+        bare = _index(
+            "        String[] a = {x};\n"
+            "        out.println(a[0]);\n"
+        )
+        creation = _index(
+            "        String[] a = new String[]{x};\n"
+            "        out.println(a[0]);\n"
+        )
+        assert len(bare.element_writes("a", 0)) \
+            == len(creation.element_writes("a", 0)) == 1
+
+    def test_dimension_only_creation_records_no_writes(self):
+        # Control: 'new String[2]' leaves elements at Java's null
+        # default — no element writes to record.
+        idx = _index(
+            "        String[] a = new String[2];\n"
+            "        out.println(a[0]);\n"
+        )
+        assert idx.element_writes("a", 0) == []
+
+
 class TestWriteIsCatalogCall:
     CATALOG = {"org.owasp.encoder.Encode.forHtml"}
 
@@ -206,6 +305,17 @@ class TestWriteIsCatalogCall:
         )
         (w,) = idx.element_writes("a", 0)
         assert idx.write_is_catalog_call(w, self.CATALOG)
+
+    def test_shadowing_local_receiver_rhs_refuses(self):
+        # A local named like the imported catalog class must not
+        # forge the catalog callable on the write's RHS.
+        idx = _index(
+            "        FakeEncoder Encode = new FakeEncoder();\n"
+            "        String[] a = new String[2];\n"
+            "        a[0] = Encode.forHtml(x);\n"
+        )
+        (w,) = idx.element_writes("a", 0)
+        assert not idx.write_is_catalog_call(w, self.CATALOG)
 
     def test_wrapped_sanitizer_rhs_refuses(self):
         # The OUTERMOST call decides: wrap(Encode.forHtml(x)) could

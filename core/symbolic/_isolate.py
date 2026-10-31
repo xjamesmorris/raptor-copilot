@@ -23,13 +23,23 @@ with precise diagnostics; isolation is the backstop.
 The child receives (module, function, kwargs) by name and returns
 the primitive's result via a pipe. Spawn (not fork): angr's native
 state does not survive forks reliably, and spawn gives the child a
-clean interpreter.
+clean interpreter. The parent decodes the returned bytes with a
+restricted unpickler (:class:`_RestrictedResultUnpickler`): the child
+is sandboxed precisely because its inputs are hostile, so its OUTPUT
+channel must not be a plain ``pickle.loads`` in the unsandboxed
+parent — a child compromised through a CLE/pyvex/z3 parsing bug could
+otherwise send a crafted pickle and execute code outside every
+sandbox layer this module builds.
 """
 from __future__ import annotations
 
 import importlib
+import io
 import multiprocessing as mp
-import shutil
+import os
+import pickle
+import selectors
+import struct
 import tempfile
 import time
 from typing import Any
@@ -43,6 +53,126 @@ GRACE_SECONDS = 15.0
 
 #: terminate → kill escalation gap.
 _KILL_GRACE_SECONDS = 5.0
+
+#: Upper bound on the child's serialized result. Trade-off, both
+#: directions: too low refuses legitimate results (concrete stdin
+#: witnesses are engine-capped well below 1 MiB, but overflow-engine
+#: metadata carries register/memory snapshots); too high lets a
+#: compromised child force the parent to buffer an allocation bomb.
+#: 64 MiB clears every legitimate result shape by orders of magnitude
+#: while keeping the worst-case parent allocation bounded.
+_MAX_RESULT_BYTES = 64 << 20
+
+
+class _RestrictedResultUnpickler(pickle.Unpickler):
+    """Unpickler that can construct ONLY :class:`SymbolicResult`.
+
+    Builtin scalars/containers (str, bytes, int, float, bool, None,
+    dict, list, tuple) are opcode-native and need no class lookup;
+    every other global reference — the vector by which a pickle
+    stream reaches ``os.system`` and friends — is refused. Calling
+    the one allowed class with attacker-chosen arguments constructs
+    an inert dataclass, nothing more.
+    """
+
+    _ALLOWED = {("core.symbolic._types", "SymbolicResult")}
+
+    def find_class(self, module: str, name: str) -> type:
+        if (module, name) in self._ALLOWED:
+            return SymbolicResult
+        raise pickle.UnpicklingError(
+            f"symex child result: refusing to unpickle {module}.{name}"
+        )
+
+
+def _loads_result(payload: bytes) -> SymbolicResult:
+    """Decode a child result under the restricted unpickler; the
+    decoded object must BE a SymbolicResult, not merely be built
+    from allowed pieces."""
+    obj = _RestrictedResultUnpickler(io.BytesIO(payload)).load()
+    if not isinstance(obj, SymbolicResult):
+        raise pickle.UnpicklingError(
+            "symex child result: expected SymbolicResult, got "
+            f"{type(obj).__name__}"
+        )
+    return obj
+
+
+class _FrameRefused(Exception):
+    """Result frame malformed or over the cap — hostile-child signal."""
+
+
+def _read_exact_deadline(
+    fd: int, n: int, deadline: float,
+) -> bytes | None:
+    """Read exactly ``n`` bytes from ``fd``, never blocking past
+    ``deadline`` (monotonic). Returns ``None`` when the deadline
+    expires mid-read; raises :class:`EOFError` on a closed pipe.
+
+    The wait uses :class:`selectors.DefaultSelector` (epoll/kqueue),
+    never ``select.select``: ``select()`` raises ``ValueError`` for
+    any fd >= FD_SETSIZE (1024), which a long-running many-fd
+    orchestrator reaches on a fully legitimate run — and an exception
+    escaping this read would skip the caller's kill escalation, the
+    one guarantee this module exists to provide. ``Connection.poll``
+    (the pre-read gate) has no such limit for the same reason.
+    """
+    buf = bytearray()
+    with selectors.DefaultSelector() as selector:
+        selector.register(fd, selectors.EVENT_READ)
+        while len(buf) < n:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            if not selector.select(remaining):
+                return None
+            chunk = os.read(fd, n - len(buf))
+            if not chunk:
+                raise EOFError(
+                    "symex child closed the result pipe mid-frame"
+                )
+            buf += chunk
+    return bytes(buf)
+
+
+def _recv_frame_deadline(
+    conn: Any, deadline: float, maxlength: int,
+) -> bytes | None:
+    """Deadline-bounded replacement for ``Connection.recv_bytes``.
+
+    ``poll()`` returns as soon as ONE byte is readable, but
+    ``recv_bytes`` then blocks until the whole length-prefixed frame
+    arrives — a compromised child (this module's stated adversary)
+    can write a partial header and sleep, parking the unsandboxed
+    parent forever and disarming the hard-kill budget, the one
+    guarantee this file exists to provide. Reading the frame in
+    ``select``-gated chunks keeps every wait bounded by ``deadline``.
+
+    Frame layout matches CPython's ``Connection._send_bytes``: a
+    4-byte ``!i`` length, with ``-1`` escaping to an 8-byte ``!Q``
+    length for >2 GiB payloads (always over our cap — refused without
+    reading further). Returns the payload bytes, ``None`` when the
+    deadline expired mid-frame (the caller's kill escalation then
+    fires), raises :class:`EOFError` on a closed pipe (child crash)
+    or :class:`_FrameRefused` on a malformed/over-cap header.
+    """
+    fd = conn.fileno()
+    header = _read_exact_deadline(fd, 4, deadline)
+    if header is None:
+        return None
+    (size,) = struct.unpack("!i", header)
+    if size == -1:
+        # 8-byte escape frame: legitimate only for >2 GiB payloads,
+        # which the result cap refuses categorically.
+        raise _FrameRefused("result frame declares a >2 GiB payload")
+    if size < 0:
+        raise _FrameRefused(f"result frame declares negative size {size}")
+    if size > maxlength:
+        raise _FrameRefused(
+            f"result frame declares {size} bytes (cap {maxlength})"
+        )
+    payload = _read_exact_deadline(fd, size, deadline)
+    return payload
 
 
 def _apply_symex_sandbox(private_tmp: str | None = None) -> None:
@@ -222,45 +352,32 @@ def _apply_symex_sandbox(private_tmp: str | None = None) -> None:
 def _remove_private_tmp(path: str) -> None:
     """Remove the child's private temp dir after the child exits.
 
-    Defeats permission griefing: a compromised child can leave a
-    mode-0 subdirectory inside its grant, which makes a plain
-    ``rmtree(ignore_errors=True)`` fail silently — the per-call dirs
-    would then accumulate without bound. Restore traversal
-    permissions top-down first (the walk chmods each subdirectory
-    before descending into it), then remove. Never raises.
+    Defeats permission griefing (a compromised child leaving a mode-0
+    subdirectory inside its grant defeats a plain
+    ``rmtree(ignore_errors=True)``): delegates to the shared
+    chmod-walk-then-rmtree helper. Never raises.
     """
-    import os
-    try:
-        for root, dirs, _files in os.walk(path):
-            for name in dirs:
-                entry = os.path.join(root, name)
-                # os.walk(followlinks=False) still LISTS a symlink-to-
-                # directory in dirnames (it just doesn't descend), and
-                # os.chmod follows symlinks (Linux has no lchmod) — so
-                # chmoding it would apply 0700 to the symlink's TARGET,
-                # which a hostile child can point anywhere OUTSIDE its
-                # private tmp. Skip links: rmtree below removes the
-                # link itself without descending, and a link needs no
-                # permission restore anyway.
-                if os.path.islink(entry):
-                    continue
-                try:
-                    os.chmod(entry, 0o700)
-                except OSError:
-                    pass
-    except OSError:
-        pass
-    shutil.rmtree(path, ignore_errors=True)
+    from core.atomic_fs import rmtree_hardened
+    rmtree_hardened(path)
+
+
+_SYMBOLIC_MODULE_PREFIX: str = "core.symbolic."
 
 
 def _child_entry(
-    conn,
+    conn: mp.connection.Connection,
     module_name: str,
     func_name: str,
-    kwargs: dict,
+    kwargs: dict[str, Any],
     private_tmp: str | None = None,
 ) -> None:
     """Child-side runner. Everything heavyweight imports here."""
+    if not module_name.startswith(_SYMBOLIC_MODULE_PREFIX):
+        raise SystemExit(
+            f"_child_entry: module {module_name!r} outside "
+            f"allowed prefix {_SYMBOLIC_MODULE_PREFIX!r}"
+        )
+
     import logging
 
     _apply_symex_sandbox(private_tmp)
@@ -269,19 +386,23 @@ def _child_entry(
     # missing; that is operator noise, not a result channel.
     for name in ("angr", "claripy", "cle", "pyvex"):
         logging.getLogger(name).setLevel(logging.CRITICAL)
+    # send_bytes (not send): the parent decodes with the restricted
+    # unpickler, so the pickling happens HERE, visibly, on the honest
+    # path — the parent side never calls Connection.recv's implicit
+    # pickle.loads on child-controlled bytes.
     try:
         module = importlib.import_module(module_name)
         result = getattr(module, func_name)(**kwargs)
-        conn.send(result)
+        conn.send_bytes(pickle.dumps(result))
     except BaseException as exc:  # noqa: BLE001 — one channel out
         try:
-            conn.send(SymbolicResult(
+            conn.send_bytes(pickle.dumps(SymbolicResult(
                 succeeded=False,
                 reason=f"primitive raised: {type(exc).__name__}: {exc}",
                 wall_seconds=0.0,
                 states_explored=0,
                 metadata={},
-            ))
+            )))
         except Exception:  # noqa: BLE001 — pipe gone; parent times out
             pass
     finally:
@@ -297,6 +418,11 @@ def run_isolated(
 ) -> SymbolicResult:
     """Run ``module_name.func_name(**kwargs)`` in a spawned child with
     a hard kill at ``timeout + GRACE_SECONDS``."""
+    if not module_name.startswith(_SYMBOLIC_MODULE_PREFIX):
+        raise ValueError(
+            f"run_isolated: module {module_name!r} outside "
+            f"allowed prefix {_SYMBOLIC_MODULE_PREFIX!r}"
+        )
     t0 = time.monotonic()
     # The child's entire writable world (see _apply_symex_sandbox).
     # Created here so the parent can remove it after the child exits
@@ -319,16 +445,47 @@ def run_isolated(
         child_conn.close()
 
         budget = timeout + GRACE_SECONDS
+        deadline = time.monotonic() + budget
         result: SymbolicResult | None = None
+        rejected_reason: str | None = None
         # A crashed child closes the pipe, so poll() returns promptly
-        # (EOF is readable) and recv() raises — timed_out separates
-        # "budget genuinely elapsed" from "child died with no result".
+        # (EOF is readable) and the frame read raises — timed_out
+        # separates "budget genuinely elapsed" from "child died with
+        # no result". The frame read itself is deadline-bounded
+        # (_recv_frame_deadline): poll() only proves ONE byte is
+        # readable, and a hostile child that writes a partial frame
+        # and sleeps must still hit the kill escalation below.
         timed_out = not parent_conn.poll(budget)
         if not timed_out:
             try:
-                result = parent_conn.recv()
-            except (EOFError, OSError):
+                payload = _recv_frame_deadline(
+                    parent_conn, deadline, _MAX_RESULT_BYTES,
+                )
+            except EOFError:
                 result = None
+            except (_FrameRefused, OSError):
+                # Oversized/malformed frame or a torn transport —
+                # either way the child produced no decodable result;
+                # fail closed with the cap named.
+                rejected_reason = (
+                    "child result payload unreadable or over the "
+                    f"{_MAX_RESULT_BYTES}-byte cap — refused"
+                )
+            else:
+                if payload is None:
+                    # Deadline expired mid-frame: a partial result is
+                    # a budget overrun (or a stalling hostile child),
+                    # handled by the timeout lane + kill escalation.
+                    timed_out = True
+                else:
+                    try:
+                        result = _loads_result(payload)
+                    except Exception as exc:  # noqa: BLE001 — hostile bytes
+                        rejected_reason = (
+                            "restricted result decoder refused the "
+                            f"child's payload ({type(exc).__name__}: "
+                            f"{str(exc)[:200]})"
+                        )
         parent_conn.close()
 
         proc.join(timeout=0.5)
@@ -344,6 +501,17 @@ def run_isolated(
 
     if result is not None:
         return result
+    if rejected_reason is not None:
+        # A payload the restricted decoder refused is a HOSTILE-CHILD
+        # signal (or a result-shape bug), never laundered into a
+        # timeout or crash report.
+        return SymbolicResult(
+            succeeded=False,
+            reason=rejected_reason,
+            wall_seconds=time.monotonic() - t0,
+            states_explored=0,
+            metadata={"isolated": True, "rejected_payload": True},
+        )
     if timed_out:
         return SymbolicResult(
             succeeded=False,

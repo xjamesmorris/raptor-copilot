@@ -72,6 +72,10 @@ class AuditPipelineOpts:
     models: list[str] | None = None
     max_cost_usd: float | None = None
     max_seconds: float | None = None
+    # Non-dollar resource governor (client-level; bounds free/local runs
+    # where the USD cap is inert). Off unless set.
+    max_calls: int | None = None
+    max_tokens: int | None = None
     budget: int | None = None
     strategy_filter: str | None = None
     review_passes: int = 1
@@ -86,11 +90,22 @@ class AuditPipelineOpts:
     validate: bool = True
     no_binary_oracle: bool = False
     binary_verdicts: dict[str, str] | None = None
+    # Auto-siblings composition (--no-auto-siblings to disable):
+    # binary targets only (``inventory['target_kind'] == 'binary'``;
+    # source targets never enter the pass). When a mapped sibling
+    # run exists for the audited binary, the sibling-consistency
+    # engine runs and its sibling-hypotheses.json is captured into
+    # the run dir for the normal hypothesis-seed intake. Failure
+    # degrades loudly to an unseeded audit (core.audit.auto_siblings).
+    auto_siblings: bool = True
     inventory: dict[str, Any] | None = None
     annotations_dir: Path | None = None
     codeql_db_path: str | None = None
     # Repeatable --codeql-db (one database per language).
     codeql_db_paths: list[str] | None = None
+    # Background database build started by run-start provisioning;
+    # the orchestrator joins it (bounded) before the CodeQL pre-sweep.
+    codeql_db_future: Any | None = None
     threat_model: dict[str, Any] | None = None
     joern_overrides: dict[str, Any] | None = None
     joern_server: Any | None = None
@@ -116,6 +131,16 @@ class AuditPipelineOpts:
     # Cross-function edge obligations (--edges): flag-gated review of
     # tier-1 edge contracts + tier-2 folded edge verdicts.
     edges: bool = False
+    # Cross-scope discovery (contract perspective): post-structured-pass
+    # analysis that finds contract mismatches across module boundaries.
+    open_discovery: bool = False
+    discovery_budget_fraction: float = 0.20
+    # Mid-run journal checkpoint tri-state: True/False = explicit
+    # per-run choice (--no-journal-checkpoint sets False); None =
+    # defer to the active project's 'journal-checkpoint' setting
+    # ('off' disables), else the default ON. Resolved via
+    # _resolve_journal_checkpoint at config build.
+    journal_checkpoint: bool | None = None
     # Ignore all prior review state — coverage records, the per-run
     # review journal, the project journal index, and recall caches —
     # so every scheduled function is re-reviewed. The corpus runner
@@ -135,6 +160,12 @@ class AuditPipelineOpts:
     # that a classifier skip can never exercise. Production default
     # unchanged (on).
     triage: bool = True
+    # Systemic-fault circuit breaker on the dispatch path
+    # (--no-environment-breaker to disable; see
+    # OrchestratorConfig.environment_breaker). Off is for
+    # deliberately abnormal environments (fault-injection harnesses,
+    # quota-testing rigs) where correlated failures are the point.
+    environment_breaker: bool = True
     # Vendored/generated-code triage tier (--no-vendored-triage to
     # disable): corroborated generator provenance → skip tier;
     # uncorroborated banners / vendored paths / generated-shape
@@ -211,6 +242,16 @@ class AuditPipelineOpts:
     # (--prior-journal, repeatable). Covers journals not yet merged
     # into the project index.
     prior_journal_dirs: list[Path] | None = None
+    # Explicit ``--hypothesis-seeds`` files (repeatable): external
+    # hypothesis-seed intake (core.audit.hypothesis_intake). A
+    # co-located sibling-hypotheses.json in the run dir is discovered
+    # without this. Hint-tier only — seeds never mint findings.
+    hypothesis_seed_paths: list[Path] | None = None
+    # --seed-rereview (default OFF — operator consent): seeds naming
+    # already-covered checklist functions are scheduled for a fresh
+    # review through the --pin hoist instead of recording as
+    # no_matching_gap misses. See OrchestratorConfig.seed_rereview.
+    seed_rereview: bool = False
     # Per-function cap on prior finding-grade claims in review context
     # (--prior-claims; 0 disables) and the per-claim body excerpt.
     prior_claims_per_function: int = 3
@@ -248,24 +289,58 @@ def _resolve_repo_trust(opts: AuditPipelineOpts) -> bool:
         return bool(opts.repo_trusted)
 
 
+def _resolve_journal_checkpoint(opts: AuditPipelineOpts) -> bool:
+    """Resolve the mid-run journal checkpoint: explicit per-run
+    choice wins; else the active project's ``journal-checkpoint``
+    setting (``off`` disables); else the default ON. Best-effort —
+    a project-substrate error must never break the audit (fails
+    toward the default, which is the pre-existing safe behaviour of
+    checkpointing spend-safe tiers only)."""
+    if opts.journal_checkpoint is not None:
+        return bool(opts.journal_checkpoint)
+    try:
+        from core.project.trust import active_project_journal_checkpoint
+        setting = active_project_journal_checkpoint(run_dir=opts.out_dir)
+    except Exception:  # noqa: BLE001 — settings read never blocks a run
+        return True
+    if setting == "off":
+        logger.info(
+            "journal checkpoint: disabled by the project "
+            "'journal-checkpoint' setting (per-run flags override)",
+        )
+        return False
+    return True
+
+
 def _make_llm_client(opts: AuditPipelineOpts):
     """Build the budget-capped LLM client both entry points share.
 
     Returns ``(client, models, primary_model)``.
     """
-    from core.llm.client import LLMClient
     from core.llm.config import LLMConfig
+    # Transcript seam: identical to LLMClient(...) with no session
+    # active.
+    from core.llm.transcript import build_llm_client
 
     models = opts.models or ["default"]
     primary_model = models[0] if models[0] != "default" else None
     max_cost = opts.max_cost_usd if opts.max_cost_usd is not None else float("inf")
 
     if primary_model:
-        client = LLMClient(pinned_model=primary_model)
+        client = build_llm_client(pinned_model=primary_model)
         client.config.max_cost_per_scan = max_cost
     else:
         llm_cfg = LLMConfig(max_cost_per_scan=max_cost)
-        client = LLMClient(config=llm_cfg)
+        client = build_llm_client(config=llm_cfg)
+    # Non-dollar governor caps (off unless set). ``max_seconds`` is also
+    # consumed by the orchestrator loop gate; setting it on the client
+    # additionally bounds the generate()/generate_structured() path.
+    if opts.max_seconds is not None:
+        client.config.max_seconds_per_scan = opts.max_seconds
+    if opts.max_calls is not None:
+        client.config.max_calls_per_scan = opts.max_calls
+    if opts.max_tokens is not None:
+        client.config.max_tokens_per_scan = opts.max_tokens
     _ensure_dispatcher_route(client, models, run_dir=opts.out_dir)
     return client, models, primary_model
 
@@ -349,7 +424,7 @@ def _build_orchestrator_config(
         max_seconds=opts.max_seconds,
         review_passes=opts.review_passes,
         subsystem_depth=opts.subsystem_depth,
-        **({"batch_sloc_threshold": opts.batch_sloc_threshold}
+        **({"batch_sloc_threshold": opts.batch_sloc_threshold}  # type: ignore[arg-type]
            if opts.batch_sloc_threshold is not None else {}),
         include_kinds=opts.include_kinds,
         max_propagation_depth=opts.max_propagation_depth,
@@ -359,6 +434,7 @@ def _build_orchestrator_config(
         inventory=opts.inventory,
         codeql_db_path=opts.codeql_db_path,
         codeql_db_paths=opts.codeql_db_paths,
+        codeql_db_future=opts.codeql_db_future,
         threat_model=opts.threat_model,
         annotations_dir=opts.annotations_dir,
         functions=opts.functions,
@@ -371,10 +447,14 @@ def _build_orchestrator_config(
         repo_trusted=_resolve_repo_trust(opts),
         verdict_reuse=opts.verdict_reuse,
         edges=opts.edges,
+        open_discovery=opts.open_discovery,
+        discovery_budget_fraction=opts.discovery_budget_fraction,
+        journal_checkpoint=_resolve_journal_checkpoint(opts),
         force=opts.force,
         prefilter_skip=opts.prefilter_skip,
         triage=opts.triage,
         vendored_triage=opts.vendored_triage,
+        environment_breaker=opts.environment_breaker,
         profile=opts.profile,
         iris=opts.iris,
         sage_recall=opts.sage_recall,
@@ -388,15 +468,17 @@ def _build_orchestrator_config(
         schedule=opts.schedule,
         on_demand_synthesis=opts.on_demand_synthesis,
         probe_determine_value=opts.probe_determine_value,
-        **({"deepen_reserve_fraction": opts.deepen_reserve_fraction}
+        **({"deepen_reserve_fraction": opts.deepen_reserve_fraction}  # type: ignore[arg-type]
            if opts.deepen_reserve_fraction is not None else {}),
-        **({"review_reserve_fraction": opts.review_reserve_fraction}
+        **({"review_reserve_fraction": opts.review_reserve_fraction}  # type: ignore[arg-type]
            if opts.review_reserve_fraction is not None else {}),
         same_run_reuse=opts.same_run_reuse,
         prior_cost_breakdown=opts.prior_cost_breakdown,
         prior_booked_spend_usd=opts.prior_booked_spend_usd,
         resume_segment=opts.resume_segment,
         prior_journal_dirs=opts.prior_journal_dirs,
+        hypothesis_seed_paths=opts.hypothesis_seed_paths,
+        seed_rereview=opts.seed_rereview,
         prior_claims_per_function=opts.prior_claims_per_function,
         prior_claim_excerpt_chars=opts.prior_claim_excerpt_chars,
         llm_budget_client=client,
@@ -416,6 +498,8 @@ def run_audit_pipeline(opts: AuditPipelineOpts, *, prep_cache=None):
 
     from core.audit.llm_review import make_review_fn
     from core.audit.orchestrator import run_orchestrator
+
+    _maybe_auto_siblings(opts)
 
     client, models, primary_model = _make_llm_client(opts)
 
@@ -444,6 +528,33 @@ def run_audit_pipeline(opts: AuditPipelineOpts, *, prep_cache=None):
     )
 
 
+def _maybe_auto_siblings(opts: AuditPipelineOpts) -> None:
+    """Auto-siblings pass for binary targets, before the review loop.
+
+    Gate: the flag (``--no-auto-siblings`` clears it) AND a binary
+    inventory (``target_kind == 'binary'`` — the checklist builder's
+    stamp). Source targets never reach the pass: no discovery, no
+    receipt, byte-identical behaviour. Callers that pass no inventory
+    (the corpus runner) are likewise untouched. Both ``run`` and
+    ``resume`` flow through here — a segment whose predecessor
+    already captured seeds reuses them (the pass is idempotent).
+    Best-effort belt: the pass never blocks the audit.
+    """
+    if not opts.auto_siblings:
+        return
+    inv = opts.inventory
+    if not (isinstance(inv, dict) and inv.get("target_kind") == "binary"):
+        return
+    try:
+        from core.audit.auto_siblings import run_auto_siblings
+        run_auto_siblings(opts.out_dir, opts.target_path)
+    except Exception:  # noqa: BLE001 — enrichment, never a gate
+        logger.warning(
+            "auto-siblings pass failed — the audit proceeds unseeded",
+            exc_info=True,
+        )
+
+
 # Max-alarm merge order. "dark" (claims present, no tool channel could
 # verify) sits between dormant and suspicious: it must survive a merge
 # against clean/dormant — leaving it unranked gave it the error rank
@@ -465,20 +576,16 @@ _NON_MECHANICAL = NON_MECHANICAL
 def _is_verification_evidence(ev: str) -> bool:
     """True when evidence is strong enough to break a merge tie.
 
-    Non-mechanical prefixes (prefilter, llm-claimed) are never
-    verification.  Coccinelle and SMT evidence is verification only
-    when the underlying rule/verb has verification role — detection-role
-    rules are too imprecise to override a clean verdict.
+    Thin delegate: verification-grade admission lives in ONE place —
+    :func:`core.audit.evidence_grade.is_verification_evidence` (the
+    exact-spelling registry, the fail-closed allowlist, the composite
+    parse, and the >=2-distinct-detection-namespaces
+    aggregation-promotion rule are all documented there). This name
+    stays for the merge tie-break below and the orchestrator's
+    demotion-gate wrapper import.
     """
-    if not ev or ev.startswith(_NON_MECHANICAL):
-        return False
-    # Import guard only: pipeline↔orchestrator is a potential import
-    # cycle; _is_detection_only itself is a pure string check.
-    with contextlib.suppress(ImportError):
-        from core.audit.orchestrator import _is_detection_only
-        if _is_detection_only(ev):
-            return False
-    return True
+    from core.audit.evidence_grade import is_verification_evidence
+    return is_verification_evidence(ev)
 
 
 def _has_any_mechanical_evidence(ev: str) -> bool:
@@ -544,13 +651,6 @@ def _get_hypothesis(item):
     if isinstance(item, dict):
         return item.get("hypothesis", "") or ""
     return getattr(item, "hypothesis", "") or ""
-
-
-def _get_counter(item):
-    if isinstance(item, dict):
-        return item.get("counter_hypothesis", "") or ""
-    rr = getattr(item, "review_result", None) or {}
-    return rr.get("counter_hypothesis", "") or ""
 
 
 def _get_bug_class_rr(item):
@@ -985,35 +1085,17 @@ def dampen_pileup_pre_export(result, config) -> None:
         )
 
 
-# -- Counter-hypothesis veto -----------------------------------------------
-
-COUNTER_PROTECTION_KW = (
-    "prevented by", "prevented because", "guaranteed by", "ensured by",
-    "enforced by", "validated by", "checked by", "protected by",
-    "constrained by", "bounded by", "limited by", "cannot occur because",
-    "impossible because", "initialization guarantees", "always set",
-    "always valid", "always non-null", "never null",
-    "invariant", "precondition", "postcondition",
-    "write_once", "rcu_read_lock", "spin_lock", "mutex_lock",
-    "bounds check", "length check", "size check", "range check",
-)
-_COUNTER_PROTECTION_KW = COUNTER_PROTECTION_KW
-
-
-COUNTER_VETO_EXEMPT_KW = (
-    "replay", "freshness", "nonce", "re-key", "rekey",
-    "sequence number", "credential", "privilege escalation",
-    "capability check", "capability bypass",
-)
-
+# -- Counter-hypothesis direction -------------------------------------------
+# Consumed by core/audit/llm_review's clean-counter escalation gate (the
+# prose fallback when the structured counter_direction field is absent).
 
 # Refutation-direction markers: the counter-hypothesis argues AGAINST
 # the vulnerability (supports clean), not for it. Direction matters —
 # a refuting counter is stuffed with vulnerability vocabulary
 # ("refcount", "use-after-free", "TOCTOU") because it names the
-# mechanisms it defeats, which fooled the vocabulary-only heuristics
-# on both sides of this gate (live corpus case: a review that refuted
-# an SMT check-early-release signal and every fresh mechanism was
+# mechanisms it defeats, which fooled the vocabulary-only escalation
+# heuristic (live corpus case: a review that refuted an SMT
+# check-early-release signal and every fresh mechanism was
 # re-escalated to suspicious off its own refuting counter).
 COUNTER_REFUTATION_KW = (
     "was refuted", "were refuted", "is refuted", "are refuted",
@@ -1034,127 +1116,3 @@ def counter_refutes_vulnerability(counter: str) -> bool:
     under-calls a real one."""
     lower = (counter or "").lower()
     return any(kw in lower for kw in COUNTER_REFUTATION_KW)
-
-
-def _get_counter_direction(item) -> str:
-    """Structured ``counter_direction`` emitted by the review model
-    (``supports_vuln`` / ``refutes_vuln``), or "" when absent."""
-    if isinstance(item, dict):
-        raw = item.get("counter_direction", "") or ""
-    else:
-        rr = getattr(item, "review_result", None) or {}
-        raw = rr.get("counter_direction", "") or ""
-    return str(raw).strip().lower()
-
-
-def counter_hypothesis_vetoes(item) -> bool:
-    """True when a strong counter-hypothesis should veto a speculative finding.
-
-    Works on both ReviewOutcome objects and plain dicts.
-    Conditions: (1) no mechanical evidence, (2) counter-hypothesis is
-    substantial and names a concrete protection mechanism,
-    (3) hypothesis does not name a security-primitive pattern that
-    counter-hypotheses are unreliable for.
-
-    The structured ``counter_direction`` field, when present, replaces
-    the prose re-derivation: refutes_vuln vetoes, supports_vuln never
-    does. The keyword paths remain as the fallback for responses
-    predating the field.
-    """
-    ev = _get_evidence(item)
-    if ev and not ev.startswith(NON_MECHANICAL):
-        return False
-
-    counter = _get_counter(item)
-    hyp = _get_hypothesis(item)
-
-    if not counter:
-        return False
-
-    hyp_lower = hyp.lower()
-    if any(kw in hyp_lower for kw in COUNTER_VETO_EXEMPT_KW):
-        return False
-
-    direction = _get_counter_direction(item)
-    if direction == "supports_vuln":
-        # The counter argues FOR the vulnerability — it corroborates
-        # rather than refutes; there is nothing to veto with.
-        return False
-    if direction == "refutes_vuln":
-        return True
-
-    if len(counter) < 40:
-        return False
-    if len(counter) < len(hyp) * 0.6:
-        return False
-
-    lower = counter.lower()
-    # A counter that asserts the hypothesis was refuted / is not a
-    # security issue vetoes just like one naming a concrete protection
-    # mechanism — both argue the speculative verdict is wrong in the
-    # clean direction.
-    return any(kw in lower for kw in COUNTER_PROTECTION_KW) or \
-        counter_refutes_vulnerability(lower)
-
-_counter_hypothesis_vetoes = counter_hypothesis_vetoes
-
-
-def apply_counter_hypothesis_veto(outcomes) -> int:
-    """Demote speculative findings/suspicious to clean via counter-hypothesis.
-
-    Works on both ReviewOutcome objects and plain dicts.
-    """
-    vetoed = 0
-    for o in outcomes:
-        if _get_status(o) not in ("finding", "suspicious"):
-            continue
-        if counter_hypothesis_vetoes(o):
-            _set_status(o, "clean")
-            vetoed += 1
-    return vetoed
-
-_apply_counter_hypothesis_veto = apply_counter_hypothesis_veto
-
-
-# -- Speculative-race gate --------------------------------------------------
-
-RACE_HYPOTHESIS_KW = (
-    "race condition", "toctou", "time-of-check", "time of check",
-    "concurrent", "concurrently", "data race",
-    "deadlock", "livelock",
-)
-
-RACE_EVIDENCE_ALLOWLIST = (
-    "smt:", "coccinelle:", "semgrep:", "codeql:", "joern:",
-    "sarif:", "prefilter:lock", "prefilter:race",
-)
-
-
-def is_speculative_race(item) -> bool:
-    """True when a race/TOCTOU hypothesis lacks mechanical backing."""
-    hyp = _get_hypothesis(item).lower()
-    if not any(kw in hyp for kw in RACE_HYPOTHESIS_KW):
-        return False
-
-    ev = _get_evidence(item)
-    return not (ev and any(ev.startswith(p) for p in RACE_EVIDENCE_ALLOWLIST))
-
-
-def apply_speculative_race_gate(outcomes) -> int:
-    """Demote evidence-free race/TOCTOU findings to suspicious.
-
-    Only touches ``finding`` → ``suspicious``.
-    Works on both ReviewOutcome objects and plain dicts.
-    """
-    gated = 0
-    for o in outcomes:
-        if _get_status(o) != "finding":
-            continue
-        if is_speculative_race(o):
-            _set_status(o, "suspicious")
-            gated += 1
-    return gated
-
-
-_apply_speculative_race_gate = apply_speculative_race_gate
-_is_speculative_race = is_speculative_race

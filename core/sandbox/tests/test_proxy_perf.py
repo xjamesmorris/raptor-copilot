@@ -2,7 +2,8 @@
 
   A. TTL'd DNS cache (skip getaddrinfo on repeat host).
   B. Happy-eyeballs dialer (race v6 + v4 instead of serial walk).
-  C. Module-top has_nonprintable import + lazy log formatting (smoke).
+  C. Non-printable scan lives with the confined parser + lazy log
+     formatting (smoke).
   D. Snapshot-based buffer fan-out (lock-free hot path; concurrent
      register/unregister/_record exercise).
 
@@ -24,6 +25,14 @@ from unittest.mock import patch
 import pytest
 
 from core.sandbox import proxy as proxy_mod
+
+
+@pytest.fixture(autouse=True)
+def _confined_parser_floor(confined_parser_floor: None) -> None:
+    """This file pins exact buffer contents (snapshot fan-out counts,
+    index-0 finalize target); on Landlock-less hosts the per-
+    registration degraded-floor marker would shift them (see
+    confined_parser_floor, conftest)."""
 
 
 @pytest.fixture
@@ -205,7 +214,10 @@ class TestHappyEyeballs:
 
             async def fake_open(host, port, family=None, **kwargs):
                 if family == socket.AF_INET6:
-                    await asyncio.sleep(2.0)
+                    # Far above the elapsed bound below so "waited for
+                    # v6" is unmistakable; a passing run never pays it
+                    # (v4 returns at ~250ms and the stall is cancelled).
+                    await asyncio.sleep(5.0)
                     return ("r6", "w6")
                 # v4 fast
                 return ("r4", "w4")
@@ -224,12 +236,17 @@ class TestHappyEyeballs:
             t0 = time.monotonic()
             _r, _w, ip = asyncio.run_coroutine_threadsafe(
                 driver(), proxy._loop,
-            ).result(timeout=5)
+            ).result(timeout=10)
             elapsed = time.monotonic() - t0
             assert ip == "1.2.3.4"
             # Must be quick: v4 starts after the 250ms gate, then
-            # connects instantly.
-            assert elapsed < 1.0, (
+            # connects instantly. Bound trade-off: it must stay well
+            # below the 5.0s mocked v6 stall (higher and a broken gate
+            # that waits out v6 passes undetected) but far above the
+            # ~250ms happy path (a 1.0s bound left ~750ms for two
+            # cross-thread run_coroutine_threadsafe hops plus event-
+            # loop scheduling and flaked on saturated xdist runners).
+            assert elapsed < 4.0, (
                 f"happy-eyeballs took {elapsed:.2f}s — v6 stall not "
                 f"bypassed?"
             )
@@ -499,20 +516,23 @@ class TestBufferSnapshot:
 
 
 # ---------------------------------------------------------------------------
-# C — module-top import + lazy log formatting (smoke)
+# C — parser-owned non-printable scan + lazy log formatting (smoke)
 # ---------------------------------------------------------------------------
 
 
 class TestImportAndLogging:
 
-    def test_has_nonprintable_imported_at_module_top(self):
-        """The hot-path inline import is gone — the symbol resolves
-        from the proxy module's own namespace."""
-        # Direct module attribute lookup; if the inline import was
-        # still in _serve_tunnel and the module-top one was removed,
-        # this would AttributeError.
-        assert hasattr(proxy_mod, "has_nonprintable")
+    def test_has_nonprintable_lives_in_the_request_head_parser(self):
+        """The non-printable CONNECT-target scan moved with the parse
+        into _request_head (run inside the confined parser worker);
+        the module-top import invariant — no per-CONNECT inline
+        import — is pinned there now. proxy.py no longer references
+        the symbol at all."""
+        from core.sandbox import _request_head
         from core.security.log_sanitisation import (
             has_nonprintable as canonical,
         )
-        assert proxy_mod.has_nonprintable is canonical
+        assert _request_head.has_nonprintable is canonical
+        assert not hasattr(proxy_mod, "has_nonprintable")
+        import inspect
+        assert "has_nonprintable" not in inspect.getsource(proxy_mod)

@@ -19,14 +19,22 @@ and JSON output. Callers add their own concerns on top:
     convenience run_rules() that runs sequentially.
 """
 
+import atexit
 import logging
+import os
 import shutil
 import subprocess
+import tempfile
+import threading
 import time
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from typing import TYPE_CHECKING
 
 from core.run.toolprobe import probe
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 from .models import (
     _MAX_TOOL_OUTPUT_BYTES,
@@ -40,6 +48,75 @@ logger = logging.getLogger(__name__)
 _SEMGREP_BIN = "semgrep"
 _DEFAULT_TIMEOUT = 900
 _DEFAULT_RULE_TIMEOUT = 60
+
+# --x-ignore-semgrepignore-files shipped in the osemgrep Pro sync around
+# semgrep 1.95 (Nov 2024).  Older CLIs reject it as unknown (rc=2).
+# Version-gated: below-floor scans omit the flag and log a warning.
+_SCOPE_ISOLATION_MIN_VERSION = (1, 95, 0)
+
+# RAPTOR-owned scan-scope baseline, passed as repeated ``--exclude``
+# args by build_cmd (gitignore-style patterns; trailing ``/`` = match
+# directories only — verified honoured on semgrep 1.172.0, skips
+# reported as ``cli_exclude_flags_match`` in paths.skipped).
+#
+# Why this exists: --x-ignore-semgrepignore-files (see build_cmd)
+# disables not only the target's .semgrepignore files but ALSO
+# semgrep's BUILT-IN default ignore set (which only applies when no
+# .semgrepignore exists). This list restores the useful part of that
+# default set from RAPTOR code, where a hostile target cannot edit it.
+#
+# Curation rule — Git's reserved metadata basename plus dependency /
+# build / artifact directories and generated files ONLY. Deliberately ABSENT
+# (diverging from semgrep's built-in defaults, probed on 1.172.0:
+# .env/ .npm/ .tox/ .venv/ .yarn/ build/ dist/ node_modules/ test/
+# tests/ vendor/):
+#   - test/, tests/ — first-party code; skipping by NAME hands the
+#     target a steerable hiding channel (mkdir tests/ && hide the bug;
+#     demonstrated empirically on 1.172.0). Same reasoning keeps
+#     examples/, docs/, scripts/ etc. out of this list.
+#   - .env/ — the bare name collides with ``.env`` secret FILES;
+#     excluding the pattern would blind secrets rules.
+# Both-direction rationale: beyond the reserved ``.git`` basename,
+# ADDING an entry re-opens a name-steerable hiding spot (any
+# first-party-plausible name is a hole a target can mkdir its way
+# into); REMOVING one buys back scan cost and finding noise on
+# third-party code RAPTOR does not report on anyway.
+# Operators extend per-run via extra_args --exclude / the scanner's
+# exclude-glob filter; entries here must clear the curation rule.
+SCOPE_EXCLUDE_BASELINE: tuple[str, ...] = (
+    # Git metadata, never application source. The bare gitignore-style
+    # basename matches root + nested .git directories AND worktree /
+    # submodule .git pointer files (verified on semgrep 1.172.0).
+    # Do not widen this to a hidden-path glob: .env and first-party
+    # dot-directories deliberately remain in scope.
+    ".git",
+    # dependency trees / package-manager state
+    "node_modules/",
+    "bower_components/",
+    ".yarn/",
+    ".npm/",
+    "vendor/",
+    "third_party/",
+    "site-packages/",
+    ".venv/",
+    ".tox/",
+    # build artifacts
+    "build/",
+    "dist/",
+    # generated / minified assets
+    "*.min.js",
+    "*.min.css",
+    # lockfiles (machine-written dependency manifests)
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "poetry.lock",
+    "Pipfile.lock",
+    "Cargo.lock",
+    "composer.lock",
+    "Gemfile.lock",
+    "go.sum",
+)
 
 
 def is_available() -> bool:
@@ -59,6 +136,22 @@ def version() -> str | None:
     return info.first_line if info is not None else None
 
 
+def scope_isolation_available() -> bool:
+    """True when semgrep supports ``--x-ignore-semgrepignore-files``.
+
+    Below-floor versions let hostile targets steer scan scope via
+    ``.semgrepignore`` files.  Callers should log a warning and pass
+    ``scope_isolation=False`` to :func:`build_cmd`.
+    """
+    info = probe(_SEMGREP_BIN)
+    if info is None:
+        return False
+    vt = info.version_tuple()
+    if vt is None:
+        return False
+    return vt >= _SCOPE_ISOLATION_MIN_VERSION
+
+
 def build_cmd(
     target: Path,
     config: str,
@@ -67,6 +160,8 @@ def build_cmd(
     rule_timeout: int = _DEFAULT_RULE_TIMEOUT,
     semgrep_bin: str | None = None,
     extra_args: list[str] | None = None,
+    extra_targets: "Sequence[Path]" = (),
+    scope_isolation: bool = True,
 ) -> list[str]:
     """Build the semgrep command argv.
 
@@ -82,6 +177,13 @@ def build_cmd(
         rule_timeout: Per-rule timeout in seconds.
         semgrep_bin: Override semgrep binary path. Defaults to PATH lookup.
         extra_args: Additional semgrep arguments to pass through.
+        extra_targets: Additional scan targets appended after ``target``.
+            Findings carry per-file artifact URIs, so callers can split
+            results back per target.
+        scope_isolation: Include ``--x-ignore-semgrepignore-files``.
+            Set to ``False`` on semgrep versions below
+            :data:`_SCOPE_ISOLATION_MIN_VERSION` — the flag is unknown
+            and would cause rc=2.
 
     Returns:
         argv list ready for subprocess.run.
@@ -91,7 +193,15 @@ def build_cmd(
         bin_path,
         "scan",
         "--config", config,
-        "--quiet",
+        # --verbose, not --quiet (the two are mutually exclusive):
+        # only verbose populates ``paths.skipped`` in the --json
+        # output — the record of every path the scan did NOT examine
+        # and why — which run_rule surfaces as skipped_summary.
+        # --quiet also swallowed semgrep's own skipped-paths notice,
+        # so scope suppression was doubly invisible. Verbose chatter
+        # goes to stderr; stdout stays pure SARIF (verified on
+        # semgrep 1.172.0).
+        "--verbose",
         "--metrics", "off",
         # Defaults ON upstream: fires an HTTP GET to semgrep.dev after
         # every scan. Its 1-day cache lives under XDG_CACHE_HOME —
@@ -102,14 +212,93 @@ def build_cmd(
         "--error",
         "--sarif",
         "--disable-nosem",
+        # Scan scope must be RAPTOR-owned, never target-owned. By
+        # default semgrep honours the SCANNED repo's ignore files —
+        # ``.semgrepignore`` (root and nested) and, inside a git
+        # repo, ``.gitignore`` — so a hostile target could ship one
+        # line of config and silently exempt its own subtrees from
+        # the scan (clean exit, empty findings). --disable-nosem
+        # above closes the inline suppression channel; these two
+        # close the file-level one. --no-git-ignore additionally
+        # stops semgrep shelling out to git inside the untrusted
+        # tree. Side effect (verified on 1.172.0): killing the
+        # .semgrepignore machinery also drops semgrep's BUILT-IN
+        # default ignore set (node_modules/, tests/, vendor/, ...),
+        # which only applies when no .semgrepignore file exists —
+        # the SCOPE_EXCLUDE_BASELINE --exclude args below restore Git
+        # metadata plus the dependency/build/artifact part of it from
+        # RAPTOR code; tests/-type first-party names stay deliberately
+        # IN scope.
+        # RAPTOR-owned scope control (--exclude/--include via
+        # extra_args, the scanner's exclude-glob filter) is
+        # unaffected. --x-ignore-semgrepignore-files is documented
+        # [INTERNAL] upstream: if a future semgrep removes it, every
+        # scan fails LOUDLY (unknown option, rc=2 — surfaced as an
+        # engine error by run_rule and the scanner) rather than
+        # silently reverting to target-steered scope. Version-gated
+        # via scope_isolation (see _SCOPE_ISOLATION_MIN_VERSION):
+        # below-floor CLIs don't know the flag; callers log a warning.
+        "--no-git-ignore",
         "--timeout", str(rule_timeout),
     ]
+    if scope_isolation:
+        cmd.insert(cmd.index("--no-git-ignore") + 1,
+                   "--x-ignore-semgrepignore-files")
+    for pattern in SCOPE_EXCLUDE_BASELINE:
+        cmd.extend(["--exclude", pattern])
     if json_output_path is not None:
         cmd.extend(["--json-output", str(json_output_path)])
     if extra_args:
         cmd.extend(extra_args)
     cmd.append(str(target))
+    cmd.extend(str(t) for t in extra_targets)
     return cmd
+
+
+# One sandbox scratch PARENT per process, one fake-HOME subdirectory
+# per invocation. The parent amortises the per-process cost (created
+# lazily, removed once at exit — its rmtree sweeps every invocation
+# subdir with it); the per-invocation mkdtemp subdir is what each
+# sandboxed child gets as its output/fake-HOME root. Per-invocation
+# isolation is load-bearing, not hygiene: a sandboxed child has write
+# access to ITS OWN output dir for its whole lifetime, so with a
+# SHARED dir a still-live compromised child of call A could rewrite
+# call B's ``.home`` between B's parent-side lstat sweep and makedirs
+# (core.sandbox.context's symlink-TOCTOU check-then-act) — regaining
+# the bounded parent-side write-outside escape that check exists to
+# stop — and a damaged shared ``.home`` would also poison every later
+# semgrep call in the process. With a fresh subdir per call, no child
+# ever holds write access to another call's scratch, and the
+# sandbox's fake-home materialisation validates each fresh ``.home``
+# tree per call exactly as before. Scan RESULTS come exclusively from
+# stdout SARIF and --json-output, both outside this dir.
+_SCRATCH_LOCK = threading.Lock()
+_scratch_parent: str | None = None
+
+
+def _sandbox_scratch_parent() -> str:
+    global _scratch_parent
+    with _SCRATCH_LOCK:
+        if _scratch_parent is None or not os.path.isdir(_scratch_parent):
+            _scratch_parent = tempfile.mkdtemp(prefix="semgrep-sbx-")
+            atexit.register(
+                shutil.rmtree, _scratch_parent, ignore_errors=True,
+            )
+        return _scratch_parent
+
+
+def _invocation_scratch_dir() -> str:
+    """Fresh per-invocation scratch under the process-shared parent."""
+    return tempfile.mkdtemp(prefix="inv-", dir=_sandbox_scratch_parent())
+
+
+def _reset_sandbox_scratch() -> None:
+    """Test hook: drop the shared scratch parent immediately."""
+    global _scratch_parent
+    with _SCRATCH_LOCK:
+        if _scratch_parent is not None:
+            shutil.rmtree(_scratch_parent, ignore_errors=True)
+        _scratch_parent = None
 
 
 def _default_sandbox_runner(target: Path, config: str):
@@ -121,8 +310,15 @@ def _default_sandbox_runner(target: Path, config: str):
     back to an unsandboxed subprocess.
 
     Registry configs (p/..., category/...) are fetched from semgrep.dev
-    at run time, so those keep network access (still Landlock-confined);
-    local rule paths run with the network blocked.
+    at run time, so those get network — routed through the RAPTOR
+    egress proxy with the shared semgrep hostname allowlist
+    (``packages.semgrep._proxy_hosts``, the same posture the
+    static-analysis scanner and the codeql pack-download lane carry:
+    UDP blocked, hostname-allowlisted, resolved-IP-screened). This
+    module's own threat statement is that semgrep parses
+    attacker-controlled source, so the registry lane must not hand a
+    compromised parser fully open egress. Local rule paths run with
+    the network blocked entirely.
     """
     try:
         from core.sandbox.context import run as sandbox_run
@@ -130,30 +326,39 @@ def _default_sandbox_runner(target: Path, config: str):
         return None
 
     needs_registry = str(config).startswith(("p/", "category/"))
+    if needs_registry:
+        from ._proxy_hosts import proxy_hosts_for_semgrep
+        net_kwargs: dict = {
+            "use_egress_proxy": True,
+            "proxy_hosts": proxy_hosts_for_semgrep(),
+        }
+    else:
+        net_kwargs = {"block_network": True}
 
     def _runner(cmd, **kwargs):
-        # Fake HOME in a per-call scratch dir: semgrep unconditionally
-        # appends to ``~/.semgrep/semgrep.log`` (and reads/writes
-        # ``~/.semgrep/settings.yml``); the operator's real HOME is
-        # not sandbox-writable, so every scan died rc=1 with
-        # "write outside allowed paths denied to ~/.semgrep/semgrep.log".
-        # fake_home requires output= (the Landlock-writable location
-        # the .home dir materialises under). The scratch dir — and the
-        # log noise semgrep writes there — is removed on return;
+        # Fake HOME in a per-invocation scratch dir: semgrep
+        # unconditionally appends to ``~/.semgrep/semgrep.log`` (and
+        # reads/writes ``~/.semgrep/settings.yml``); the operator's
+        # real HOME is not sandbox-writable, so every scan died rc=1
+        # with "write outside allowed paths denied to
+        # ~/.semgrep/semgrep.log". fake_home requires output= (the
+        # Landlock-writable location the .home dir materialises
+        # under). Each invocation gets a fresh mkdtemp subdir of the
+        # process-shared parent (see the _sandbox_scratch_parent
+        # comment for why sharing one dir across concurrent
+        # invocations would reopen the fake-home symlink-TOCTOU
+        # window); the parent's atexit rmtree reclaims them all, and
         # semgrep's stderr still carries any real failure.
-        import tempfile
-
-        with tempfile.TemporaryDirectory(prefix="semgrep-sbx-") as scratch:
-            return sandbox_run(
-                cmd,
-                block_network=not needs_registry,
-                target=str(target),
-                caller_label="semgrep-runner",
-                env_caller_filtered=True,
-                output=scratch,
-                fake_home=True,
-                **{k: v for k, v in kwargs.items() if k != "shell"},
-            )
+        return sandbox_run(
+            cmd,
+            target=str(target),
+            caller_label="semgrep-runner",
+            env_caller_filtered=True,
+            output=_invocation_scratch_dir(),
+            fake_home=True,
+            **net_kwargs,
+            **{k: v for k, v in kwargs.items() if k != "shell"},
+        )
 
     return _runner
 
@@ -179,6 +384,7 @@ def run_rule(
     extra_args: list[str] | None = None,
     subprocess_runner=None,
     unsandboxed: bool = False,
+    extra_targets: "Sequence[Path]" = (),
 ) -> SemgrepResult:
     """Run semgrep with one config against a target.
 
@@ -204,6 +410,10 @@ def run_rule(
             bare subprocess.run. For trusted input only. Ignored when
             subprocess_runner is given. Without it, run_rule REFUSES to
             execute when core.sandbox is unavailable.
+        extra_targets: Additional scan targets for the same invocation.
+            The result's findings cover ALL targets (each finding's
+            ``file`` names its origin) and the returncode follows the
+            combined scan — callers split per target themselves.
 
     Returns:
         SemgrepResult with parsed findings, files_examined, files_failed,
@@ -217,6 +427,17 @@ def run_rule(
             name=name, config=config, target=str(target),
             errors=["semgrep is not installed (semgrep binary not found on PATH)"],
             returncode=-1,
+        )
+
+    scope_ok = scope_isolation_available()
+    if not scope_ok:
+        v = version() or "unknown"
+        floor = ".".join(str(p) for p in _SCOPE_ISOLATION_MIN_VERSION)
+        logger.warning(
+            "semgrep %s < %s: --x-ignore-semgrepignore-files unavailable "
+            "— .semgrepignore files in the scanned repo can hide findings "
+            "(upgrade: pip install --upgrade semgrep)",
+            v, floor,
         )
 
     cleanup_json = False
@@ -239,6 +460,8 @@ def run_rule(
             rule_timeout=rule_timeout,
             semgrep_bin=semgrep_bin,
             extra_args=extra_args,
+            extra_targets=extra_targets,
+            scope_isolation=scope_ok,
         )
 
         if env is None:
@@ -300,9 +523,21 @@ def run_rule(
         # persist an attacker-sized payload.
         budget_errors: list[str] = []
         sarif_text = proc.stdout or ""
-        if len(sarif_text) > _MAX_TOOL_OUTPUT_BYTES:
+        # Measure BYTES, matching the budget's unit: len(str) counts
+        # characters, and UTF-8 encodes up to 4 bytes per char — a
+        # non-ASCII-heavy payload could weigh 4x the budget while
+        # passing a character-count gate. chars <= bytes always, so
+        # the cheap length check short-circuits the common case and
+        # the encode only runs on strings already under the budget
+        # in characters (bounded work).
+        sarif_bytes = (
+            len(sarif_text)
+            if len(sarif_text) > _MAX_TOOL_OUTPUT_BYTES
+            else len(sarif_text.encode("utf-8", errors="surrogatepass"))
+        )
+        if sarif_bytes > _MAX_TOOL_OUTPUT_BYTES:
             msg = (
-                f"semgrep SARIF output is {len(sarif_text)} characters"
+                f"semgrep SARIF output is at least {sarif_bytes} bytes"
                 f" — exceeds the {_MAX_TOOL_OUTPUT_BYTES}-byte budget;"
                 " scan results unavailable (failed scan, not a clean"
                 " one)"
@@ -354,6 +589,24 @@ def run_rule(
             + (f": {stderr_tail}" if stderr_tail else "")
         )
 
+    # Excluded scope said out loud: every skipped path is a path the
+    # scan did NOT examine, so an empty-findings result over a heavily
+    # skipped tree must not read as a clean verdict. Counts only in
+    # the log line — the sample paths are target-derived and stay on
+    # the result; reason strings come from semgrep's own enum but are
+    # escaped anyway before the operator's log stream.
+    skipped_summary: dict = parsed_json.get("skipped_summary") or {}
+    if skipped_summary:
+        from core.security.log_sanitisation import escape_nonprintable
+        per_reason = ", ".join(
+            f"{escape_nonprintable(reason)}={info.get('count', 0)}"
+            for reason, info in skipped_summary.get("reasons", {}).items()
+        )
+        logger.info(
+            "semgrep '%s': %d path(s) skipped, not scanned — %s",
+            name, skipped_summary.get("total", 0), per_reason,
+        )
+
     return SemgrepResult(
         name=name,
         config=config,
@@ -361,6 +614,7 @@ def run_rule(
         findings=findings,
         files_examined=parsed_json["files_examined"],
         files_failed=parsed_json["files_failed"],
+        skipped_summary=skipped_summary,
         semgrep_version=parsed_json["semgrep_version"],
         returncode=proc.returncode,
         stderr=proc.stderr or "",

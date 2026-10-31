@@ -250,8 +250,11 @@ class TestE2EIris:
         # is_exploitable preserved
         assert results_by_id["F-real"]["is_exploitable"] is True
 
-    def test_false_positive_refuted_and_downgraded(self, tmp_path):
-        """The sanitized case: CodeQL refutes via Tier 1 → Tier 2 fallthrough."""
+    def test_false_positive_refuted_flip_withheld(self, tmp_path):
+        """The sanitized case: CodeQL refutes via Tier 1 → Tier 2
+        fallthrough. Tier 2's predicates are LLM-authored, so the
+        refutation disputes and lowers confidence but may not flip the
+        verdict on its own."""
         from packages.hypothesis_validation.adapters.base import ToolEvidence
 
         repo, out_dir, db = _build_target_and_db(tmp_path)
@@ -266,6 +269,18 @@ class TestE2EIris:
             matches=[], summary="no matches",
         )
 
+        probe_hit = ToolEvidence(
+            tool="codeql", rule="<probe>", success=True,
+            matches=[{"file": "x.py", "line": 1, "message": "n"}],
+            summary="1 match",
+        )
+
+        def _adapter_run(rule, *a, **k):
+            # Vacuity probes see non-empty endpoint models so the
+            # zero-flow refutation stands (the vacuity control has
+            # its own tests in test_dataflow_validation).
+            return probe_hit if "IRIS is" in str(rule) else empty_evidence
+
         # LLM returns predicate bodies for Tier 2
         llm = MagicMock()
         llm.generate_structured.return_value = {
@@ -279,7 +294,7 @@ class TestE2EIris:
             return_value=True,
         ), patch(
             "packages.hypothesis_validation.adapters.CodeQLAdapter.run",
-            return_value=empty_evidence,
+            side_effect=_adapter_run,
         ), patch(
             "packages.llm_analysis.dataflow_validation.DispatchClient",
             return_value=llm,
@@ -304,19 +319,32 @@ class TestE2EIris:
         # Validation is non-destructive — is_exploitable still True
         assert results_by_id["F-fp"]["is_exploitable"] is True
         assert results_by_id["F-fp"]["dataflow_validation"]["recommends_downgrade"] is True
+        # The refuting query's predicates were LLM-authored (Tier 2
+        # template) — the honest method stamp records it.
+        assert results_by_id["F-fp"]["dataflow_validation"]["method"] == (
+            "codeql-iris-llm"
+        )
 
-        # Reconciliation applies the hard downgrade (no consensus disagrees)
+        # Reconciliation: the premises are LLM-authored, so the
+        # terminal flip is withheld — the refutation survives as a
+        # recorded dispute with lowered confidence (soft shape).
         recon = reconcile_dataflow_validation(results_by_id)
-        assert recon["n_hard_downgrades"] == 1
-        assert recon["n_soft_downgrades"] == 0
+        assert recon["n_hard_downgrades"] == 0
+        assert recon["n_soft_downgrades"] == 1
 
-        # Final state: downgraded, original preserved
-        assert results_by_id["F-fp"]["is_exploitable"] is False
-        assert results_by_id["F-fp"]["is_exploitable_pre_validation"] is True
-        assert "validation_downgrade_reason" in results_by_id["F-fp"]
+        # Final state: verdict retained, dispute + withheld reason on
+        # the record, confidence lowered.
+        assert results_by_id["F-fp"]["is_exploitable"] is True
+        assert "is_exploitable_pre_validation" not in results_by_id["F-fp"]
+        assert results_by_id["F-fp"]["validation_disputed"] is True
+        assert results_by_id["F-fp"]["validation_downgrade_withheld"] == (
+            "llm-authored-premises"
+        )
+        assert results_by_id["F-fp"]["confidence"] == "low"
 
     def test_mixed_findings_partial_downgrade(self, tmp_path):
-        """Both findings together: real one stays, FP gets downgraded."""
+        """Both findings together: real one stays untouched, the FP's
+        LLM-authored refutation lands as a dispute (flip withheld)."""
         from packages.hypothesis_validation.adapters.base import ToolEvidence
 
         repo, out_dir, db = _build_target_and_db(tmp_path)
@@ -339,7 +367,13 @@ class TestE2EIris:
             tool="codeql", rule="<gen>", success=True,
             matches=[], summary="no matches",
         )
-        # F-real: 1 call (Tier 1 confirms). F-fp: 2 calls (Tier 1 → Tier 2)
+        # F-real: 1 call (Tier 1 confirms). F-fp: 2 calls (Tier 1 →
+        # Tier 2) + 2 vacuity probes on the zero-flow refutation.
+        probe_hit = ToolEvidence(
+            tool="codeql", rule="<probe>", success=True,
+            matches=[{"file": "x.py", "line": 1, "message": "n"}],
+            summary="1 match",
+        )
         adapter_runs = [match_for_real, no_match, no_match]
 
         # LLM gives predicate bodies for F-fp's Tier 2 generation.
@@ -356,7 +390,8 @@ class TestE2EIris:
             return_value=True,
         ), patch(
             "packages.hypothesis_validation.adapters.CodeQLAdapter.run",
-            side_effect=lambda rule, target, **kwargs: adapter_runs.pop(0),
+            side_effect=lambda rule, *a, **kwargs: (
+                probe_hit if "IRIS is" in str(rule) else adapter_runs.pop(0)),
         ), patch(
             "packages.llm_analysis.dataflow_validation.DispatchClient",
             return_value=llm,
@@ -378,13 +413,19 @@ class TestE2EIris:
         assert metrics["n_recommended_downgrades"] == 1
 
         recon = reconcile_dataflow_validation(results_by_id)
-        assert recon["n_hard_downgrades"] == 1
-        assert recon["n_soft_downgrades"] == 0
+        assert recon["n_hard_downgrades"] == 0
+        assert recon["n_soft_downgrades"] == 1
 
-        # Final state: real one preserved, FP downgraded
+        # Final state: real one untouched; the FP's Tier-2 refutation
+        # (LLM-authored predicates) is recorded as a dispute — verdict
+        # retained, flip withheld.
         assert results_by_id["F-real"]["is_exploitable"] is True
-        assert results_by_id["F-fp"]["is_exploitable"] is False
-        assert results_by_id["F-fp"]["is_exploitable_pre_validation"] is True
+        assert "validation_disputed" not in results_by_id["F-real"]
+        assert results_by_id["F-fp"]["is_exploitable"] is True
+        assert results_by_id["F-fp"]["validation_disputed"] is True
+        assert results_by_id["F-fp"]["validation_downgrade_withheld"] == (
+            "llm-authored-premises"
+        )
 
     def test_consensus_disagreement_triggers_soft_downgrade(self, tmp_path):
         """When consensus said agreed but validation refuted, soft path applies."""
@@ -403,6 +444,18 @@ class TestE2EIris:
             matches=[], summary="no matches",
         )
 
+        probe_hit = ToolEvidence(
+            tool="codeql", rule="<probe>", success=True,
+            matches=[{"file": "x.py", "line": 1, "message": "n"}],
+            summary="1 match",
+        )
+
+        def _adapter_run(rule, *a, **k):
+            # Vacuity probes see non-empty endpoint models so the
+            # zero-flow refutation stands (the vacuity control has
+            # its own tests in test_dataflow_validation).
+            return probe_hit if "IRIS is" in str(rule) else empty_evidence
+
         llm = MagicMock()
         llm.generate_structured.return_value = {
             "source_predicate_body": "n instanceof X",
@@ -415,7 +468,7 @@ class TestE2EIris:
             return_value=True,
         ), patch(
             "packages.hypothesis_validation.adapters.CodeQLAdapter.run",
-            return_value=empty_evidence,
+            side_effect=_adapter_run,
         ), patch(
             "packages.llm_analysis.dataflow_validation.DispatchClient",
             return_value=llm,

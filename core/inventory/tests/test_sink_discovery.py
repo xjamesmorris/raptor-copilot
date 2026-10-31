@@ -566,6 +566,129 @@ class TestIterDiscoverySourceFiles:
                 sd.iter_discovery_source_files(tmp_path)]
         assert len(rels) == 1
 
+    def test_stats_admission_identical_to_break_path(
+        self, tmp_path, monkeypatch,
+    ):
+        """The fingerprint (no stats) and discovery (stats) paths must
+        admit the SAME file set under truncation — otherwise the prep
+        cache serves extractions for a different input set."""
+        import core.inventory.sink_discovery as sd
+        for name in ("a.py", "b.py", "c.py"):
+            (tmp_path / name).write_text("x = 1\n")
+        size = (tmp_path / "a.py").stat().st_size
+        # Budget fits exactly one file; the second permanently closes
+        # admission even though a same-size file would still "fit"
+        # nothing (and even a smaller one must not sneak in).
+        monkeypatch.setattr(sd, "_AGGREGATE_CAP", size)
+        plain = [rel for _p, rel, _l in
+                 sd.iter_discovery_source_files(tmp_path)]
+        stats: dict = {}
+        counted = [rel for _p, rel, _l in
+                   sd.iter_discovery_source_files(tmp_path, stats=stats)]
+        assert counted == plain
+        assert len(counted) == 1
+        assert stats["truncated"] is True
+        assert stats["admitted_files"] == 1
+        assert stats["admitted_bytes"] == size
+        assert stats["skipped_files"] == 2
+        assert stats["skipped_bytes"] == 2 * size
+        assert stats["budget_bytes"] == size
+
+    def test_stats_no_truncation_below_budget(self, tmp_path):
+        from core.inventory.sink_discovery import (
+            iter_discovery_source_files,
+        )
+        (tmp_path / "a.py").write_text("x = 1\n")
+        stats: dict = {}
+        rels = [rel for _p, rel, _l in
+                iter_discovery_source_files(tmp_path, stats=stats)]
+        assert rels == ["a.py"]
+        assert stats["truncated"] is False
+        assert stats["admitted_files"] == 1
+        assert stats["skipped_files"] == 0
+        assert stats["skipped_bytes"] == 0
+
+
+class TestDiscoveryTruncationMarker:
+    """Two directions of the aggregate byte budget's honest-incomplete
+    marker: below budget nothing changes; at/over budget the result
+    carries a structured truncation record, the marker rides both
+    serialisations, and no eligible=True verdict survives (a truncated
+    call graph must never mint sink-unreachable claims)."""
+
+    TAINTED = "import os\n\ndef handler(x):\n    os.system(x)\n"
+    LONELY = "def lonely():\n    print('x')\n"
+
+    def test_below_budget_no_marker_eligible_survives(self, tmp_path):
+        from core.inventory.sink_discovery import (
+            discover_sinks_for_target,
+        )
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "a.py").write_text(self.TAINTED)
+        (target / "b.py").write_text(self.LONELY)
+        result = discover_sinks_for_target(target)
+        assert result.truncation is None
+        assert "truncation" not in result.as_dict()
+        assert result.unreachable_eligible is not None
+        assert result.unreachable_eligible[("b.py", "lonely")].eligible
+
+    def test_truncation_marker_and_fail_closed_verdicts(
+        self, tmp_path, monkeypatch,
+    ):
+        import core.inventory.sink_discovery as sd
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "a.py").write_text(self.TAINTED)
+        (target / "b.py").write_text(self.LONELY)
+        (target / "c.py").write_text(self.TAINTED)
+        # Fits the first walked file only.
+        sizes = sorted(
+            p.stat().st_size for p in target.iterdir()
+        )
+        monkeypatch.setattr(sd, "_AGGREGATE_CAP", max(sizes))
+        result = sd.discover_sinks_for_target(target)
+
+        assert result.truncation is not None
+        assert result.truncation["reason"] == "aggregate_byte_budget"
+        assert result.truncation["skipped_files"] >= 1
+        assert result.truncation["skipped_bytes"] > 0
+        assert result.truncation["admitted_files"] >= 1
+        # The marker is in-band in BOTH serialisations.
+        assert result.as_dict()["truncation"] == result.truncation
+        assert result.to_full_dict()["truncation"] == result.truncation
+        # Fail-closed: no eligible=True verdict survives truncation.
+        assert result.unreachable_eligible is not None
+        for verdict in result.unreachable_eligible.values():
+            assert verdict.eligible is False
+
+    def test_truncation_round_trips_the_prep_cache_shape(
+        self, tmp_path, monkeypatch,
+    ):
+        import json as _json
+
+        import core.inventory.sink_discovery as sd
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "a.py").write_text(self.TAINTED)
+        (target / "b.py").write_text(self.TAINTED)
+        monkeypatch.setattr(
+            sd, "_AGGREGATE_CAP",
+            (target / "a.py").stat().st_size,
+        )
+        orig = sd.discover_sinks_for_target(target)
+        assert orig.truncation is not None
+        blob = _json.loads(_json.dumps(orig.to_full_dict()))
+        back = sd.SinkDiscoveryResult.from_full_dict(blob)
+        assert back.truncation == orig.truncation
+        assert back.to_full_dict() == orig.to_full_dict()
+
+    def test_untruncated_full_dict_round_trip_has_no_marker(self):
+        from core.inventory.sink_discovery import SinkDiscoveryResult
+        orig = SinkDiscoveryResult([], [], [], {})
+        back = SinkDiscoveryResult.from_full_dict(orig.to_full_dict())
+        assert back.truncation is None
+
 
 # ── discovery summary log ───────────────────────────────────────────
 
@@ -613,3 +736,221 @@ class TestDiscoverySummaryLog:
         # Fixture ground truth: lonely is eligible, cb_user is blocked.
         assert result.unreachable_eligible[("app.lua", "lonely")].eligible
         assert not result.unreachable_eligible[("cb.c", "cb_user")].eligible
+
+
+class TestJvmMobileLanguagesEnumerated:
+    """scala/kotlin/swift walkers exist and are builder-wired; the
+    discovery walk must not silently skip their files (zero sinks and
+    reach for those languages in /understand --map and audit review
+    selection)."""
+
+    @staticmethod
+    def _target(tmp_path):
+        (tmp_path / "A.kt").write_text(
+            'fun run(cmd: String) { ProcessBuilder(cmd).start() }\n',
+            encoding="utf-8",
+        )
+        (tmp_path / "B.scala").write_text(
+            'object B { def go(c: String): Unit = '
+            '{ Runtime.getRuntime().exec(c) } }\n',
+            encoding="utf-8",
+        )
+        (tmp_path / "C.swift").write_text(
+            'func launch() {\n    let p = Process()\n    p.launch()\n}\n',
+            encoding="utf-8",
+        )
+        return tmp_path
+
+    def test_discovery_walk_yields_jvm_mobile_files(self, tmp_path):
+        from core.inventory.sink_discovery import iter_discovery_source_files
+
+        target = self._target(tmp_path)
+        langs = {lang for _, _, lang in iter_discovery_source_files(target)}
+        assert {"kotlin", "scala", "swift"} <= langs
+
+    def test_kotlin_process_builder_is_a_direct_sink(self, tmp_path):
+        # The Kotlin walker is tree-sitter-only (no regex fallback):
+        # without the runtime + grammar wheel the file degrades to an
+        # empty call graph and contributes zero sinks by design. Skip
+        # on bare installs (CI's fast tier has no tree-sitter).
+        pytest.importorskip("tree_sitter")
+        pytest.importorskip("tree_sitter_kotlin")
+        from core.inventory.sink_discovery import discover_sinks_for_target
+
+        target = self._target(tmp_path)
+        result = discover_sinks_for_target(target, languages={"kotlin"})
+        assert any(
+            s.target == "ProcessBuilder" for s in result.direct_sinks
+        ), "kotlin file contributed no sinks"
+
+
+class TestCallGraphWiringClosure:
+    """The builder's call-graph dispatch and sink discovery's extractor
+    map are two hand-maintained enumerations over the SAME producer
+    registry (core.inventory.call_graph's extract_call_graph_*
+    walkers). A walker wired in one but not the other regrows the
+    defect this closure exists to pin: files of a whole language get
+    call graphs in the inventory but contribute zero sinks/reach to
+    discovery (or vice versa). Enumerate the real producers
+    mechanically and assert both consumers cover every one."""
+
+    @staticmethod
+    def _producers() -> set[str]:
+        import core.inventory.call_graph as cg
+
+        producers = {
+            name for name in dir(cg)
+            if name.startswith("extract_call_graph_")
+            and callable(getattr(cg, name))
+        }
+        assert len(producers) >= 14, "producer enumeration broke"
+        return producers
+
+    def test_discovery_extractors_cover_every_producer(self):
+        from functools import partial
+
+        from core.inventory.sink_discovery import (
+            _get_call_graph_extractors,
+        )
+
+        wired = set()
+        for fn in _get_call_graph_extractors().values():
+            target = fn.func if isinstance(fn, partial) else fn
+            wired.add(target.__name__)
+        missing = self._producers() - wired
+        assert not missing, (
+            f"call-graph producers not wired into sink discovery: "
+            f"{sorted(missing)} — their languages contribute zero "
+            f"sinks/reach"
+        )
+
+    def test_builder_dispatch_covers_every_producer(self):
+        from pathlib import Path
+
+        import core.inventory.builder as builder_mod
+
+        source = Path(builder_mod.__file__).read_text(encoding="utf-8")
+        missing = {
+            name for name in self._producers()
+            if f"{name}(" not in source
+        }
+        assert not missing, (
+            f"call-graph producers not invoked by the builder "
+            f"dispatch: {sorted(missing)} — their languages get empty "
+            f"call_graph records"
+        )
+
+
+# ── fn-pointer-field defense keyed on language, not suffix ──────────
+
+class TestIndirectFieldCallLanguageKey:
+    """A .h header routes to the C grammar and gets a C call graph;
+    the fn-pointer-field guard filtered on the .c suffix, so identical
+    ctx->cb(...) code earned sink_unreachable scope-narrowing in a
+    header but was blocked in a .c file — the exact triage-skip the
+    guard was landed to close, one file-extension outside it."""
+
+    @staticmethod
+    def _cb_graph():
+        return FileCallGraph(calls=[
+            CallSite(caller="run_cb", chain=["o", "cb"], line=2),
+        ])
+
+    def test_header_field_call_blocked_like_c_file(self):
+        res = discover_sinks({
+            "lib/helper.h": self._cb_graph(),
+            "lib/helper.c": self._cb_graph(),
+        })
+        for key in (("lib/helper.h", "run_cb"), ("lib/helper.c", "run_cb")):
+            v = res.unreachable_eligible[key]
+            assert not v.eligible
+            assert "function-pointer field" in v.reason
+
+    def test_resolved_language_map_wins_over_suffix(self):
+        # A header content-refined to cpp keeps the documented C++
+        # member-call decline (a.b() is an ordinary method call).
+        res = discover_sinks(
+            {"lib/helper.h": self._cb_graph()},
+            file_languages={"lib/helper.h": "cpp"},
+        )
+        v = res.unreachable_eligible[("lib/helper.h", "run_cb")]
+        assert v.eligible
+
+    def test_c_language_map_blocks(self):
+        res = discover_sinks(
+            {"lib/helper.h": self._cb_graph()},
+            file_languages={"lib/helper.h": "c"},
+        )
+        v = res.unreachable_eligible[("lib/helper.h", "run_cb")]
+        assert not v.eligible
+
+    def test_python_method_chain_still_eligible(self):
+        res = discover_sinks({"pkg/mod.py": FileCallGraph(calls=[
+            CallSite(caller="wrapper", chain=["self", "helper"], line=3),
+        ])})
+        v = res.unreachable_eligible[("pkg/mod.py", "wrapper")]
+        assert v.eligible
+
+
+class TestPerFileCapDisclosure:
+    """Two-direction pin on the per-file byte cap: an under-cap tree
+    walks whole with no warning; an over-cap file is skipped WITH a
+    loud once-per-walk disclosure naming the count and an example —
+    previously a silent skip, so an amalgamation-shaped file (sinks
+    and all) vanished from the context map with no trace. The
+    fingerprint consumer (budget_warning=False) stays silent by
+    design."""
+
+    TAINTED = "import os\n\ndef handler(x):\n    os.system(x)\n"
+
+    def test_under_cap_no_warning(self, tmp_path, caplog):
+        import logging
+
+        import core.inventory.sink_discovery as sd
+        (tmp_path / "a.py").write_text(self.TAINTED)
+        with caplog.at_level(
+            logging.WARNING, logger="core.inventory.sink_discovery",
+        ):
+            rels = [rel for _p, rel, _l in
+                    sd.iter_discovery_source_files(
+                        tmp_path, budget_warning=True)]
+        assert rels == ["a.py"]
+        assert "per-file byte cap" not in caplog.text
+
+    def test_over_cap_skip_warns_once_with_example(
+        self, tmp_path, caplog, monkeypatch,
+    ):
+        import logging
+
+        import core.inventory.sink_discovery as sd
+        monkeypatch.setattr(sd, "_PER_FILE_CAP", 64)
+        (tmp_path / "small.py").write_text(self.TAINTED)
+        (tmp_path / "big1.py").write_text("# " + "x" * 128 + "\n")
+        (tmp_path / "big2.py").write_text("# " + "y" * 128 + "\n")
+        with caplog.at_level(
+            logging.WARNING, logger="core.inventory.sink_discovery",
+        ):
+            rels = [rel for _p, rel, _l in
+                    sd.iter_discovery_source_files(
+                        tmp_path, budget_warning=True)]
+        assert rels == ["small.py"]
+        hits = [r for r in caplog.records
+                if "per-file byte cap" in r.getMessage()]
+        assert len(hits) == 1, "one disclosure per walk, not per file"
+        msg = hits[0].getMessage()
+        assert "2 file(s)" in msg
+        assert "big" in msg
+
+    def test_fingerprint_consumer_stays_silent(
+        self, tmp_path, caplog, monkeypatch,
+    ):
+        import logging
+
+        import core.inventory.sink_discovery as sd
+        monkeypatch.setattr(sd, "_PER_FILE_CAP", 64)
+        (tmp_path / "big.py").write_text("# " + "x" * 128 + "\n")
+        with caplog.at_level(
+            logging.WARNING, logger="core.inventory.sink_discovery",
+        ):
+            list(sd.iter_discovery_source_files(tmp_path))
+        assert "per-file byte cap" not in caplog.text

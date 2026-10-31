@@ -18,12 +18,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from pathlib import Path, PurePosixPath
+from pathlib import Path
+from typing import BinaryIO
 
 from core.paths import confine
 from core.run.scratch import scratch_dir
 from core.run.workdir import exec_workdir
 
+from ._resolve import binding_error
 from ._harness import (
     _CALL_MARKER_PREFIX,
     generate_c_harness,
@@ -73,8 +75,13 @@ _AUDIT_RUN_DIR: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 )
 
 
-_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
-_QUALIFIED_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_.:/]*$")
+_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*\Z")
+# Ruby method names may end in one `!` or `?` (`save!`, `valid?`) —
+# the plain identifier grammar refused every such finding outright.
+# The suffix is pasted into a ruby `.send(:name)`-style call site
+# only; it grants no new syntax beyond the method-name grammar.
+_RUBY_METHOD_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*[!?]?\Z")
+_QUALIFIED_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_.:/]*\Z")
 
 _DANGEROUS_INTERP_FUNCS = frozenset({
     "system", "exec", "eval", "open", "spawn",
@@ -88,7 +95,7 @@ _DANGEROUS_INTERP_FUNCS = frozenset({
 })
 
 _TYPE_RE = re.compile(
-    r"^[a-zA-Z_][a-zA-Z0-9_*&\[\]<>, .:]*$"
+    r"^[a-zA-Z_][a-zA-Z0-9_*&\[\]<>, .:]*\Z"
 )
 
 # require_path is pasted into JS/TS require(), Ruby require, PHP
@@ -96,7 +103,7 @@ _TYPE_RE = re.compile(
 # Keep it to plain path characters: anything outside this set (quotes,
 # backslashes, $, #, backticks, whitespace) has no business in a module
 # path and only shows up in injection attempts.
-_REQUIRE_PATH_RE = re.compile(r"^[a-zA-Z0-9_@./-]+$")
+_REQUIRE_PATH_RE = re.compile(r"^[a-zA-Z0-9_@./-]+\Z")
 
 
 def _module_ref_error(
@@ -139,7 +146,7 @@ def _module_ref_error(
 # Everything else — general calls, subscripts, lambdas, f-strings,
 # statement separators (fail the parse), comments, newlines — is a
 # validation error.
-_SUFFIXED_NUMBER_RE = re.compile(r"^-?\d+(?:\.\d+)?[a-zA-Z_][a-zA-Z0-9_]*$")
+_SUFFIXED_NUMBER_RE = re.compile(r"^-?\d+(?:\.\d+)?[a-zA-Z_][a-zA-Z0-9_]*\Z")
 
 # Return-value comparison is exact EXCEPT for cross-language boolean/nil
 # spellings (Python "True" vs Go/Ruby "true", "None" vs "nil"/"null"),
@@ -222,7 +229,14 @@ def _arg_expression_error(expr_s: str) -> str | None:
 # casts, derefs, control flow, preprocessor, multiple statements — is
 # a validation error (fail closed: the witness is dropped, never run).
 
-_C_STRING_LIT_RE = re.compile(r'"(?:\\.|[^"\\])*"')
+# Opener pinned to an UNESCAPED delimiter ((?<!\\)): an unterminated
+# literal whose interior repeats escaped delimiters (`"` + `\"`*n)
+# otherwise makes every embedded delimiter a fresh match attempt that
+# re-scans to the end of the line — quadratic on a hostile setup line
+# (measured exp 2.00; pinned, exp 1.0). On a well-formed token stream
+# no string opens at an escaped delimiter, so the masking is
+# unchanged; dropping the pin re-opens the quadratic.
+_C_STRING_LIT_RE = re.compile(r'(?<!\\)"(?:\\.|[^"\\])*"')
 _C_CHAR_LIT_RE = re.compile(r"'(?:\\.|[^'\\])'")
 
 # declarator: one-or-more type words, optional pointer stars, the
@@ -246,7 +260,7 @@ _C_DECL_LHS_RE = re.compile(
 # initializer after string/char literals were replaced by the inert
 # token `_S_`: numbers (incl. hex/suffixed), identifiers (NULL, other
 # setup vars), brace init-lists, commas, unary +/-, address-of.
-_C_INIT_RHS_RE = re.compile(r"^[A-Za-z0-9_+\-&,.{}\s]*$")
+_C_INIT_RHS_RE = re.compile(r"^[A-Za-z0-9_+\-&,.{}\s]*\Z")
 
 
 def _c_setup_line_error(line: str) -> str | None:
@@ -304,9 +318,12 @@ _RUST_LET_RE = re.compile(
 # captures, struct-init escape), `|` (closures), `=` `<` `>` (no
 # turbofish, no comparisons), `*` `/` `%` (no arithmetic-deref
 # smuggling), `#` (attributes), `?` (early return), `\\`.
-_RUST_EXPR_CHARSET_RE = re.compile(r"^[A-Za-z0-9_:.,&!;()\[\]\s+-]*$")
+_RUST_EXPR_CHARSET_RE = re.compile(r"^[A-Za-z0-9_:.,&!;()\[\]\s+-]*\Z")
 
-_RUST_MACRO_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*!")
+# \b pins the macro name to a word start: unanchored, every position
+# inside a long identifier is a fresh scan of the rest of the word —
+# quadratic. A mid-word start is a false token either way.
+_RUST_MACRO_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*!")
 
 # Prompt contract for Rust setup_lines: "NO unsafe blocks, NO
 # std::process". `unsafe` has no legitimate spelling in a literal /
@@ -320,7 +337,7 @@ _RUST_FORBIDDEN_TOKENS = ("unsafe", "process")
 # literal receiver is capability-free: no path to fs / io / env, so it
 # cannot reach the harness source or the process image.
 _RUST_LITERAL_METHOD_RE = re.compile(
-    r"^&?\s*b?_S_(?:\.[A-Za-z_][A-Za-z0-9_]*\(\))+$"
+    r"^&?\s*b?_S_(?:\.[A-Za-z_][A-Za-z0-9_]*\(\))+\Z"
 )
 
 
@@ -412,7 +429,7 @@ _SETUP_VALIDATORS = {
 # identifier path with an optional `static` prefix and `.*` suffix.
 _JAVA_IMPORT_RE = re.compile(
     r"^(?:static\s+)?[A-Za-z_$][A-Za-z0-9_$]*"
-    r"(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*(?:\.\*)?$"
+    r"(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*(?:\.\*)?\Z"
 )
 
 
@@ -428,11 +445,12 @@ def validate_spec(
     before code generation. When *target_root* is given, the load-path
     fields must also resolve inside it.
     """
-    if not _IDENTIFIER_RE.match(spec.function):
-        return f"invalid function name: {spec.function!r}"
     # Derive the language the same way execute_witness dispatches — a
     # spec with language unset must not skip the interpreter check.
     lang = spec.language or language_for_file(spec.file) or ""
+    name_re = _RUBY_METHOD_RE if lang == "ruby" else _IDENTIFIER_RE
+    if not name_re.match(spec.function):
+        return f"invalid function name: {spec.function!r}"
     if lang in ("python", "ruby", "php", "perl", "javascript", "typescript",
                 "lua") and spec.function.lower() in _DANGEROUS_INTERP_FUNCS:
         return f"dangerous builtin as function name: {spec.function!r}"
@@ -484,6 +502,19 @@ def validate_spec(
         if setup_err:
             return setup_err
 
+    if lang == "go":
+        # import_alias is pasted raw into the harness import block and
+        # the call prefix — a multiline alias is full Go code
+        # injection (an injected func init() could replay the sentinel
+        # and forge the token-bearing verdict epilogue, the channel
+        # the setup-lines grammar closed for the native lanes). The
+        # only production producer pins "target", but this validator
+        # is the shared pre-execution chokepoint whose contract is
+        # that EVERY code-bearing field passes a typed grammar.
+        alias = str(lc.get("import_alias", ""))
+        if alias and not _IDENTIFIER_RE.match(alias):
+            return f"invalid import_alias: {alias[:60]!r}"
+
     cn = lc.get("class_name", "")
     if cn and not _QUALIFIED_RE.match(cn):
         return f"invalid class_name: {cn!r}"
@@ -511,23 +542,12 @@ def validate_spec(
         # imports are pasted into `import <x>;` lines — allowlist to a
         # dotted identifier path (an embedded newline used to survive
         # the generator's ';' strip and inject top-level Java code).
+        # Binding the imports and class_name to the finding's file is
+        # the resolution engine's job (binding_error below).
         for imp in lc.get("imports", []):
             imp_s = str(imp).strip()
             if imp_s and not _JAVA_IMPORT_RE.match(imp_s):
                 return f"invalid java import: {imp_s[:60]!r}"
-        # Bind the harness to the finding's FILE: the compile classpath
-        # spans the whole target tree, so an unbound class_name reaches
-        # any class in the repo — a lookalike method on another class
-        # would mint a verdict for this finding. Java's public-class
-        # rule ties the file stem to the class; nested classes keep the
-        # stem as their outer prefix.
-        if cn:
-            stem = PurePosixPath(spec.file.replace("\\", "/")).stem
-            if cn != stem and not cn.startswith(stem + "."):
-                return (
-                    f"class_name {cn!r} not bound to the finding's file "
-                    f"({spec.file!r} implies {stem!r})"
-                )
 
     up = lc.get("use_path", "")
     if up:
@@ -547,7 +567,7 @@ def validate_spec(
 
     ip = lc.get("import_path", "")
     if ip:
-        if not re.match(r"^[a-zA-Z0-9_./-]+$", ip):
+        if not re.match(r"^[a-zA-Z0-9_./-]+\Z", ip):
             return f"invalid import_path: {ip!r}"
         err = _module_ref_error("import_path", ip, target_root)
         if err:
@@ -561,7 +581,11 @@ def validate_spec(
         if err:
             return err
 
-    return None
+    # Module binding holds in the RESOLUTION direction for every lane:
+    # the reference the harness will hand the loader must resolve to
+    # the finding's file under the loader's real rules, or the spec is
+    # refused (see core/audit/dark_verify/_resolve.py).
+    return binding_error(spec, lang, target_root)
 
 
 # ---------------------------------------------------------------------------
@@ -665,6 +689,77 @@ def execute_witness(
 # ---------------------------------------------------------------------------
 
 
+# Languages whose witness prompts define ``expected_exception`` as an
+# error-MESSAGE substring rather than an exception class/type token:
+# Lua's pcall and Perl's die carry no exception class, so their
+# harnesses report a fixed ``type`` token ("error" / "die") that holds
+# no signal — comparing the prediction against it would refute every
+# correctly-predicted error.
+_MESSAGE_MATCH_LANGS = frozenset({"lua", "perl"})
+
+
+def _pointer_return(spec: DarkWitnessSpec) -> bool:
+    """True when a C-family spec declares ANY pointer return.
+
+    The C harness prints every pointer return as %p pointer identity
+    (a %s dereference in the HARNESS could itself fault; see
+    ``_c_format_for_type``), so the printed value is an address a
+    predicted value can never match — for ``char *`` and equally for
+    ``const char *`` / ``void *`` / ``int *`` / every other pointer
+    spelling. Guarding only the exact ``char*`` spelling turned a
+    correct prediction on any other pointer-returning function into a
+    wrong authoritative refutation (the common "NULL" prediction vs
+    the %p rendering, which is itself platform-dependent).
+    """
+    rt = str(spec.lang_config.get("return_type", "")).strip()
+    return rt.endswith("*")
+
+
+class _DuplicateKeyError(ValueError):
+    """A witness status line carried a duplicate JSON key.
+
+    The harness epilogues emit each key exactly once, so a duplicate
+    can only come from injected text riding inside the authenticated
+    epilogue (``json.loads`` keeps the LAST duplicate — a smuggled
+    ``"status"``/``"value"`` pair would silently override the real
+    one). Belt behind the per-lane encoders: any lane that regresses
+    to raw interpolation fails here instead of minting a verdict.
+    """
+
+
+def _reject_duplicate_keys(pairs: list) -> dict:
+    """``object_pairs_hook`` that refuses duplicate keys."""
+    seen = set()
+    for key, _ in pairs:
+        if key in seen:
+            raise _DuplicateKeyError(key)
+        seen.add(key)
+    return dict(pairs)
+
+
+def _recover_token_line(
+    stdout: str, expected_token: str,
+) -> dict | None:
+    """The LAST stdout line that parses as a JSON object carrying the
+    harness token, or None. Scanned from the end (the epilogue prints
+    last); a line that repeats a key is skipped as tampered, exactly
+    like the whole-stdout path. Lines without the token are target
+    chatter — never candidates, whatever they parse as."""
+    for line in reversed(stdout.splitlines()):
+        line = line.strip()
+        if not line.startswith("{") or expected_token not in line:
+            continue
+        try:
+            candidate = json.loads(
+                line, object_pairs_hook=_reject_duplicate_keys)
+        except (_DuplicateKeyError, json.JSONDecodeError):
+            continue
+        if isinstance(candidate, dict) \
+                and candidate.get("token") == expected_token:
+            return candidate
+    return None
+
+
 def _classify_json_output(
     spec: DarkWitnessSpec,
     stdout: str,
@@ -692,13 +787,35 @@ def _classify_json_output(
         )
 
     try:
-        data = json.loads(stdout)
-    except json.JSONDecodeError:
+        data = json.loads(stdout, object_pairs_hook=_reject_duplicate_keys)
+    except _DuplicateKeyError as dup:
         return DarkVerifyResult(
             finding_key=spec.finding_key, verdict="inconclusive",
             language=language,
-            match_detail=f"unparseable output: {stdout[:200]}",
+            match_detail=(
+                f"duplicate JSON key {dup} in witness output — the "
+                f"harness epilogue never repeats a key; tampered line "
+                f"not accepted"
+            ),
         )
+    except json.JSONDecodeError:
+        # Chatty target: the function under test may print its own
+        # text around the harness epilogue's single JSON line, and a
+        # whole-stdout parse classified every such run inconclusive.
+        # Recover the epilogue line — AUTHENTICATED lane only: the
+        # token (minted in-process after the LLM response was parsed)
+        # is what distinguishes the harness's line from anything the
+        # target printed, so without an expected token there is
+        # nothing safe to recover from chatter.
+        data = None
+        if expected_token:
+            data = _recover_token_line(stdout, expected_token)
+        if data is None:
+            return DarkVerifyResult(
+                finding_key=spec.finding_key, verdict="inconclusive",
+                language=language,
+                match_detail=f"unparseable output: {stdout[:200]}",
+            )
 
     if expected_token and data.get("token") != expected_token:
         return DarkVerifyResult(
@@ -716,6 +833,38 @@ def _classify_json_output(
         return DarkVerifyResult(
             finding_key=spec.finding_key, verdict="error", language=language,
             match_detail=f"import failed: {data.get('message', '')}",
+            observed_status="import_error",
+        )
+
+    if status == "binding_error":
+        # The harness's post-load assertion found the loader bound a
+        # DIFFERENT artifact than the finding's file — whatever ran is
+        # not the code under test, so no verdict may be minted.
+        return DarkVerifyResult(
+            finding_key=spec.finding_key, verdict="error", language=language,
+            match_detail=(
+                f"module binding failed at load time: "
+                f"{data.get('message', '')}"
+            ),
+            observed_status="binding_error",
+        )
+
+    if status == "arg_binding_error":
+        # The arguments never bound the target's signature — the call
+        # boundary refused the vector before any target code ran, so
+        # the failure characterises the witness arguments, not the
+        # code under test. No verdict may be minted in EITHER
+        # direction: an expected TypeError must not read as confirmed
+        # off a mis-shaped vector, and a boundary refusal must never
+        # read as the function semantically rejecting the input.
+        return DarkVerifyResult(
+            finding_key=spec.finding_key, verdict="error",
+            language=language,
+            match_detail=(
+                f"arguments do not bind the target signature: "
+                f"{data.get('message', '')}"
+            ),
+            observed_status="arg_binding_error",
         )
 
     expected_exc = spec.expected_exception
@@ -724,18 +873,39 @@ def _classify_json_output(
         exc_type = data.get("type", "")
         exc_msg = data.get("message", "")
         if expected_exc:
+            if language in _MESSAGE_MATCH_LANGS:
+                if expected_exc in exc_msg:
+                    return DarkVerifyResult(
+                        finding_key=spec.finding_key, verdict="confirmed",
+                        language=language,
+                        actual_exception=f"{exc_type}: {exc_msg}",
+                        match_detail="error message contains prediction",
+                        observed_status="exception",
+                    )
+                return DarkVerifyResult(
+                    finding_key=spec.finding_key, verdict="refuted",
+                    language=language,
+                    actual_exception=f"{exc_type}: {exc_msg}",
+                    match_detail=(
+                        f"expected error message containing "
+                        f"{expected_exc!r}, got: {exc_msg[:200]}"
+                    ),
+                    observed_status="exception",
+                )
             if exc_type == expected_exc:
                 return DarkVerifyResult(
                     finding_key=spec.finding_key, verdict="confirmed",
                     language=language,
                     actual_exception=f"{exc_type}: {exc_msg}",
                     match_detail="exception type matches prediction",
+                    observed_status="exception",
                 )
             return DarkVerifyResult(
                 finding_key=spec.finding_key, verdict="refuted",
                 language=language,
                 actual_exception=f"{exc_type}: {exc_msg}",
                 match_detail=f"expected {expected_exc}, got {exc_type}",
+                observed_status="exception",
             )
         # No exception was predicted: an unexpected exception proves
         # the witness (arguments, import path, harness) is wrong about
@@ -749,6 +919,7 @@ def _classify_json_output(
                 "unexpected exception — witness stated no exception "
                 "expectation; not accepted as confirmation"
             ),
+            observed_status="exception",
         )
 
     if status == "returned":
@@ -761,6 +932,7 @@ def _classify_json_output(
                     f"expected {expected_exc} exception, "
                     f"but function returned normally"
                 ),
+                observed_status="returned",
             )
         # A return-value match may only confirm when the witness's
         # stated expectation IS a return-value check. A spec that
@@ -781,6 +953,7 @@ def _classify_json_output(
                         "carries no sanitizers, so the crash could not "
                         "have been observed; not a refutation"
                     ),
+                    observed_status="returned",
                 )
             return DarkVerifyResult(
                 finding_key=spec.finding_key, verdict="refuted",
@@ -789,8 +962,20 @@ def _classify_json_output(
                     "expected crash/sanitizer signal, but function "
                     "returned normally"
                 ),
+                observed_status="returned",
             )
         if spec.expected_return is not None:
+            if language in ("c", "cpp") and _pointer_return(spec):
+                return DarkVerifyResult(
+                    finding_key=spec.finding_key, verdict="inconclusive",
+                    language=language, actual_return=actual_repr,
+                    match_detail=(
+                        "pointer return is printed as pointer identity "
+                        "(see _c_format_for_type), so the predicted "
+                        "value cannot be compared; not a refutation"
+                    ),
+                    observed_status="returned",
+                )
             if language == "python":
                 # Python harness uses repr(), which includes quotes for strings
                 expected_repr = repr(spec.expected_return)
@@ -814,16 +999,19 @@ def _classify_json_output(
                     finding_key=spec.finding_key, verdict="confirmed",
                     language=language, actual_return=actual_repr,
                     match_detail="return value matches prediction",
+                    observed_status="returned",
                 )
             return DarkVerifyResult(
                 finding_key=spec.finding_key, verdict="refuted",
                 language=language, actual_return=actual_repr,
                 match_detail=f"expected {expected_repr}, got {actual_repr}",
+                observed_status="returned",
             )
         return DarkVerifyResult(
             finding_key=spec.finding_key, verdict="inconclusive",
             language=language, actual_return=actual_repr,
             match_detail="no expected value to compare against",
+            observed_status="returned",
         )
 
     return DarkVerifyResult(
@@ -880,6 +1068,39 @@ def _sandbox_refusal_result(
     )
 
 
+def floor_refusal_result(
+    spec: DarkWitnessSpec, language: str, exc: BaseException,
+) -> DarkVerifyResult:
+    """Error-shaped verdict for a containment-floor refusal.
+
+    The verification-seam mapping for ``SandboxFloorError``: the
+    sandbox refused to execute the witness at the tier the untrusted
+    contract requires, so the environment — not the hypothesis — is
+    the story. Vocabulary deliberately unchanged (``verdict="error"``,
+    no new enum value); the structured payload rides ``match_detail``
+    and ``oracle_reliability="unavailable"`` keeps the classifier's
+    authority honest. Raises ``TypeError`` when ``exc`` is not a
+    floor refusal — callers must only map the typed subtype
+    (record-then-raise: they re-raise ``exc`` after recording this).
+    """
+    from core.witness.sandbox_outcome import refusal_detail
+
+    detail = refusal_detail(exc)
+    if detail is None:
+        msg = f"not a containment-floor refusal: {type(exc).__name__}"
+        raise TypeError(msg)
+    remedies = detail["remedies"] or str(exc)
+    return DarkVerifyResult(
+        finding_key=spec.finding_key, verdict="error", language=language,
+        match_detail=(
+            f"{detail['status']}: containment floor {detail['floor']} "
+            f"required, {detail['achievable']} achievable — "
+            f"witness never executed; remedies: {remedies}"
+        ),
+        oracle_reliability="unavailable",
+    )
+
+
 _SYSTEM_TOOLCHAIN_PREFIXES = ("/usr/", "/lib/", "/lib64/", "/etc/", "/bin/", "/sbin/")
 
 
@@ -920,10 +1141,43 @@ _ANCHOR_SCAN_CHUNK = 1 << 20
 _SANITIZER_ANCHOR = b"Sanitizer"
 
 
+def _open_untrusted_regular(path: Path) -> BinaryIO | None:
+    """Open a child-writable artifact for reading, refusing plants.
+
+    The cap files live in the sandbox's child-writable output
+    directory: target-derived code runs there BY DESIGN and can
+    unlink the parent-created file and plant a symlink (exfiltrating
+    a foreign file into persisted witness stdout) or a FIFO (the
+    unsandboxed parent's ``open()`` then blocks forever).  Same
+    discipline as ``_read_child_tail_untrusted`` in
+    :mod:`core.audit.validate`: O_NOFOLLOW + O_NONBLOCK at open,
+    S_ISREG on the OPENED inode (fstat — no stat/open race), refusal
+    reads as an unreadable file.  O_NONBLOCK is inert once the inode
+    is verified regular.
+    """
+    import stat as _stat
+
+    try:
+        fd = os.open(
+            str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+    except OSError:
+        return None
+    try:
+        if not _stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            return None
+        return os.fdopen(fd, "rb")
+    except OSError:
+        os.close(fd)
+        return None
+
+
 def _scan_anchor_offsets(
-    path: Path, anchors: tuple[bytes, ...],
+    f: BinaryIO, anchors: tuple[bytes, ...],
 ) -> list[int]:
-    """Offsets of anchor-marker hits across the FULL stream.
+    """Offsets of anchor-marker hits across the FULL stream of the
+    already-vetted open file *f* (scanned from offset 0).
 
     Incremental chunked scan (bounded memory); per marker only the
     first and last ``_ANCHOR_HITS_KEPT`` hits are recorded so a stream
@@ -938,29 +1192,29 @@ def _scan_anchor_offsets(
     overlap = max(len(m) for m in anchors) - 1
     carry = b""
     pos = 0  # absolute offset of the next unread byte
-    with open(path, "rb") as f:
-        while True:
-            block = f.read(_ANCHOR_SCAN_CHUNK)
-            if not block:
-                break
-            buf = carry + block
-            base = pos - len(carry)
-            for m in anchors:
-                start = 0
-                while True:
-                    i = buf.find(m, start)
-                    if i < 0:
-                        break
-                    # A match ending inside the carry region was fully
-                    # visible last round — skip the double-count.
-                    if i + len(m) > len(carry):
-                        off = base + i
-                        if len(firsts[m]) < _ANCHOR_HITS_KEPT:
-                            firsts[m].append(off)
-                        lasts[m].append(off)
-                    start = i + 1
-            pos += len(block)
-            carry = buf[-overlap:] if overlap > 0 else b""
+    f.seek(0)
+    while True:
+        block = f.read(_ANCHOR_SCAN_CHUNK)
+        if not block:
+            break
+        buf = carry + block
+        base = pos - len(carry)
+        for m in anchors:
+            start = 0
+            while True:
+                i = buf.find(m, start)
+                if i < 0:
+                    break
+                # A match ending inside the carry region was fully
+                # visible last round — skip the double-count.
+                if i + len(m) > len(carry):
+                    off = base + i
+                    if len(firsts[m]) < _ANCHOR_HITS_KEPT:
+                        firsts[m].append(off)
+                    lasts[m].append(off)
+                start = i + 1
+        pos += len(block)
+        carry = buf[-overlap:] if overlap > 0 else b""
     offsets: set[int] = set()
     for m in anchors:
         for off in firsts[m]:
@@ -983,20 +1237,27 @@ def _read_capped(
     scanning the FULL stream — all in stream order, gaps replaced by
     ``_TRUNCATION_MARKER``. ``truncated`` is True when any byte of the
     stream was dropped.
+
+    The artifact sits in the child-writable capture directory, so the
+    open routes through :func:`_open_untrusted_regular` (symlink and
+    FIFO plants read as an unreadable file) and every pass — size,
+    anchor scan, interval reads — runs on that one vetted fd.
     """
+    f = _open_untrusted_regular(path)
+    if f is None:
+        return "", False
     try:
-        size = path.stat().st_size
-        with open(path, "rb") as f:
-            if size <= 2 * _CAPTURE_CAP_BYTES:
-                text = f.read(2 * _CAPTURE_CAP_BYTES).decode(
-                    "utf-8", errors="replace",
-                )
-                return text, False
+        size = os.fstat(f.fileno()).st_size
+        if size <= 2 * _CAPTURE_CAP_BYTES:
+            text = f.read(2 * _CAPTURE_CAP_BYTES).decode(
+                "utf-8", errors="replace",
+            )
+            return text, False
         intervals: list[tuple[int, int]] = [(0, _CAPTURE_CAP_BYTES)]
         if keep_tail:
             intervals.append((size - _CAPTURE_CAP_BYTES, size))
         if anchors:
-            for off in _scan_anchor_offsets(path, anchors):
+            for off in _scan_anchor_offsets(f, anchors):
                 lo = max(0, off - _ANCHOR_PRE_CONTEXT)
                 hi = min(size, off + _ANCHOR_POST_CONTEXT)
                 intervals.append((lo, hi))
@@ -1009,22 +1270,23 @@ def _read_capped(
                 merged.append([lo, hi])
         pieces: list[str] = []
         covered = 0
-        with open(path, "rb") as f:
-            prev_end = 0
-            for lo, hi in merged:
-                if lo > prev_end:
-                    pieces.append(_TRUNCATION_MARKER)
-                f.seek(lo)
-                pieces.append(
-                    f.read(hi - lo).decode("utf-8", errors="replace"),
-                )
-                covered += hi - lo
-                prev_end = hi
-            if prev_end < size:
+        prev_end = 0
+        for lo, hi in merged:
+            if lo > prev_end:
                 pieces.append(_TRUNCATION_MARKER)
+            f.seek(lo)
+            pieces.append(
+                f.read(hi - lo).decode("utf-8", errors="replace"),
+            )
+            covered += hi - lo
+            prev_end = hi
+        if prev_end < size:
+            pieces.append(_TRUNCATION_MARKER)
         return "".join(pieces), covered < size
     except OSError:
         return "", False
+    finally:
+        f.close()
 
 
 def _merge_capped_stderr_classification(proc, label: str) -> None:
@@ -1041,14 +1303,14 @@ def _merge_capped_stderr_classification(proc, label: str) -> None:
     if not stderr_text:
         return
     try:
-        from core.sandbox.observe import _interpret_result
+        from core.sandbox.observe import interpret_result
     except ImportError:
         return
     clone = subprocess.CompletedProcess(
         getattr(proc, "args", []), proc.returncode, None, stderr_text,
     )
     try:
-        _interpret_result(clone, label)
+        interpret_result(clone, label)
     except Exception:
         logger.debug(
             "capped stderr re-classification failed", exc_info=True,
@@ -1144,6 +1406,30 @@ def _sandbox_run_capped(
                 leftover.unlink()
 
 
+def _is_cargo_home(path: str) -> bool:
+    """True when *path* is the cargo home directory.
+
+    ``_resolve_rustc``'s fallback can hand back the ``bin/rustc``
+    proxy under the cargo home; granting that bin dir's PARENT would
+    expose the registry credential store (``credentials`` /
+    ``credentials.toml``) to target-derived code — the compile step
+    honours ``include_str!`` reads and witness stdout is persisted, so
+    that grant is a straight exfil channel. Recognise the cargo home
+    by its configured location ($CARGO_HOME, default ``~/.cargo``) or
+    by the credential files it directly holds; the bin dir grant alone
+    is enough to exec the proxy.
+    """
+    real = os.path.realpath(path)
+    cargo_home = os.environ.get("CARGO_HOME") or os.path.join(
+        os.path.expanduser("~"), ".cargo")
+    if real == os.path.realpath(cargo_home):
+        return True
+    return any(
+        os.path.isfile(os.path.join(real, name))
+        for name in ("credentials", "credentials.toml")
+    )
+
+
 def _toolchain_read_paths(binary: str | None) -> list[str]:
     """Read-allowance roots for a toolchain binary under restrict_reads.
 
@@ -1159,7 +1445,8 @@ def _toolchain_read_paths(binary: str | None) -> list[str]:
     binary's bin dir plus its parent (the runtime root holding the
     sibling lib/ tree).  ``$HOME`` itself — or any ancestor of it — is
     never granted: that would reopen the exact channel restrict_reads
-    closes.
+    closes.  Neither is the cargo home (see :func:`_is_cargo_home`):
+    its bin dir is grantable, the credential-holding root is not.
     """
     if not binary:
         return []
@@ -1180,6 +1467,8 @@ def _toolchain_read_paths(binary: str | None) -> list[str]:
                for p in _SYSTEM_TOOLCHAIN_PREFIXES):
             continue
         if cand in ("/", home) or home.startswith(cand + "/"):
+            continue
+        if _is_cargo_home(cand):
             continue
         if cand not in paths:
             paths.append(cand)
@@ -1930,6 +2219,39 @@ def _execute_cpp(spec: DarkWitnessSpec, target_root: Path, timeout_s: int) -> Da
     return _execute_native(spec, target_root, timeout_s, lang="cpp")
 
 
+def _read_splice_source(target_root: Path, rel_file: str) -> str:
+    """Contained, capped, fd-checked read of the target source that a
+    harness splices into its own compile.
+
+    ``rel_file`` is record-derived, so the join is containment-checked
+    (an absolute value replaces the base under pathlib semantics,
+    ``../`` escapes it); the open refuses FIFOs/devices instead of
+    blocking; and oversize files REFUSE rather than truncate — a
+    silently truncated source must never be compiled as if it were
+    the real one. Raises ``OSError`` so the executors' existing
+    error paths report the refusal.
+    """
+    from core.paths import confine
+    from core.source import read_text_capped
+
+    resolved = confine(target_root, rel_file)
+    if resolved is None:
+        msg = f"target source escapes the target root: {rel_file!r}"
+        raise OSError(msg)
+    got = read_text_capped(resolved, errors="strict")
+    if got is None:
+        msg = (
+            f"target source unreadable or not a regular file: "
+            f"{rel_file!r}"
+        )
+        raise OSError(msg)
+    text, truncated = got
+    if truncated:
+        msg = f"target source exceeds the read cap: {rel_file!r}"
+        raise OSError(msg)
+    return text
+
+
 def _execute_go(
     spec: DarkWitnessSpec,
     target_root: Path,
@@ -1952,8 +2274,11 @@ def _execute_go(
             go_package = spec.lang_config.get("package", "main")
             build_files = [str(harness_file)]
             if go_package == "main":
-                source_file = target_root / spec.file
-                src_text = source_file.read_text(encoding="utf-8")
+                # spec.file is record-derived: contained + capped +
+                # fd-checked regular. A truncated or escaping source
+                # must never be spliced into the harness compile —
+                # refuse via the existing error path (OSError shape).
+                src_text = _read_splice_source(target_root, spec.file)
                 src_text = re.sub(
                     r'(?m)^func\s+main\s*\(\s*\)\s*\{',
                     'func _original_main() {',
@@ -2104,9 +2429,11 @@ def _resolve_rustc() -> str | None:
         if any(resolved.startswith(p) for p in _SYSTEM_TOOLCHAIN_PREFIXES):
             return rustc
         try:
+            from core.config import RaptorConfig
             proc = subprocess.run(
                 [rustc, "--print", "sysroot"],
                 capture_output=True, text=True, timeout=_COMPILE_TIMEOUT_S,
+                env=RaptorConfig.get_safe_env(),
             )
         except (OSError, subprocess.SubprocessError):
             return rustc
@@ -2170,9 +2497,8 @@ def _execute_rust(
             # main so it cannot collide with the harness main once
             # spliced into the same crate (same idiom as the Go
             # executor).
-            source_file = target_root / spec.file
             source_copy = work_dir / "target_source.rs"
-            src_content = source_file.read_text(encoding="utf-8")
+            src_content = _read_splice_source(target_root, spec.file)
             src_content = re.sub(
                 r'(?m)^fn\s+main\s*\(\s*\)',
                 'fn _original_main()',

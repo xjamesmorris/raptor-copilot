@@ -249,6 +249,23 @@ class TestParseExport:
         assert len(db.functions) == 0
         assert db.source_tool == "ghidra"
 
+    def test_over_ceiling_export_refused(self, tmp_path, monkeypatch):
+        """The export document's size is controlled by the hostile
+        binary the sandboxed JVM analysed — the trusted parent must
+        not whole-document-parse it unbounded. parse_export binds the
+        shared ceiling at call time, so the constant's home is the
+        override point."""
+        monkeypatch.setattr("core.json.utils.RE_DATABASE_MAX_BYTES", 64)
+        p = tmp_path / "export.json"
+        p.write_text(json.dumps(
+            {"source_tool": "ghidra", "pad": "x" * 4096}),
+            encoding="utf-8")
+        try:
+            parse_export(p)
+            assert False, "should have raised"
+        except ValueError as e:
+            assert "failed to read" in str(e)
+
 
 class TestLooksAutoNamed:
     def test_ghidra_pattern(self):
@@ -269,3 +286,26 @@ class TestLooksAutoNamed:
 
     def test_empty(self):
         assert _looks_auto_named("") is True
+
+
+class TestExportReadBudget:
+    """parse_export materialises the attacker-influenced export FIRST,
+    in the unsandboxed parent — it must be budgeted like every sibling
+    reader of the same data class (which cap at 64 MiB), with a larger
+    named ceiling because --decompile exports can legitimately exceed
+    theirs."""
+
+    def test_bounded_export_parses(self, tmp_path):
+        from packages.ghidra.parser import parse_export
+        small = tmp_path / "export.json"
+        small.write_text(
+            '{"functions": [{"name": "f", "address": 4096, "size": 8}]}',
+        )
+        db = parse_export(small)
+        assert [f.name for f in db.functions] == ["f"]
+
+    def test_missing_export_still_raises_value_error(self, tmp_path):
+        import pytest
+        from packages.ghidra.parser import parse_export
+        with pytest.raises(ValueError, match="failed to read"):
+            parse_export(tmp_path / "absent.json")

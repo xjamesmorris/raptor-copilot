@@ -551,8 +551,141 @@ def test_resolver_env_is_minimal(tmp_path: Path) -> None:
     env = cco._resolver_env(tmp_path)
     assert set(env) == {"PATH", "HOME", "DOCKER_CONFIG"}
     assert env["PATH"] == cco._RESOLVER_PATH  # static, not the process PATH
-    assert env["HOME"].startswith(str(tmp_path))  # throwaway, inside staging
+    assert env["HOME"] == str(tmp_path)  # the caller-owned scratch home
     assert env["DOCKER_CONFIG"].startswith(env["HOME"])
+
+
+def _plant_hostile_resolver_home(source: Path) -> None:
+    """Repo-shipped ``.raptor-resolver-home`` — the attacker shape: a
+    docker CLI config whose ``cliPluginsExtraDirs`` points at a repo
+    directory carrying an executable ``docker-compose`` plugin."""
+    planted = source / ".raptor-resolver-home" / ".docker"
+    planted.mkdir(parents=True)
+    (planted / "config.json").write_text(
+        '{"cliPluginsExtraDirs": ["plugins"]}')
+    plugins = source / "plugins"
+    plugins.mkdir()
+    plugin = plugins / "docker-compose"
+    plugin.write_text("#!/bin/sh\nexit 0\n")
+    plugin.chmod(0o755)
+
+
+def test_resolver_home_never_inside_staging(tmp_path: Path) -> None:
+    """A hostile repo that SHIPS ``.raptor-resolver-home`` (docker CLI
+    config + plugin binary) must never have that copy become the
+    resolver's HOME/DOCKER_CONFIG — the resolver home is a fresh
+    RAPTOR-owned dir outside the staging tree, and it is torn down
+    after resolution."""
+    source = tmp_path / "repo"
+    source.mkdir()
+    _plant_hostile_resolver_home(source)
+    compose = source / "docker-compose.yml"
+    compose.write_text(yaml.safe_dump(
+        {"services": {"web": {"image": "img"}}}))
+
+    seen: dict[str, Any] = {}
+
+    def fake_run_resolver(argv: list[str], staging: Path,
+                          env: dict[str, str], **kw: Any) -> str:
+        seen["staging"] = staging
+        seen["env"] = dict(env)
+        seen["scratch_home"] = kw.get("scratch_home")
+        seen["home_existed"] = Path(env["HOME"]).is_dir()
+        seen["config_dir_existed"] = Path(env["DOCKER_CONFIG"]).is_dir()
+        seen["config_json"] = sorted(
+            p.name for p in Path(env["DOCKER_CONFIG"]).iterdir())
+        return "services: {}\n"
+
+    staged, staging = cco.rewrite_for_localhost(compose)
+    try:
+        with patch.object(cco, "_run_resolver", fake_run_resolver):
+            cco._resolve_effective_model(staged)
+    finally:
+        cco.cleanup_staging(staging)
+
+    home = Path(seen["env"]["HOME"])
+    staging_prefix = str(seen["staging"].resolve())
+    assert not str(home.resolve()).startswith(staging_prefix)
+    assert not str(
+        Path(seen["env"]["DOCKER_CONFIG"]).resolve()
+    ).startswith(staging_prefix)
+    # The resolver saw a fresh RAPTOR-owned home: real dirs, an EMPTY
+    # config dir (the planted config.json never aliases in), and the
+    # sandbox grant handle for it.
+    assert seen["home_existed"] and seen["config_dir_existed"]
+    assert seen["config_json"] == []
+    assert seen["scratch_home"] == home
+    # Torn down after resolution.
+    assert not home.exists()
+
+
+def test_planted_resolver_home_file_does_not_break_resolution(
+        tmp_path: Path) -> None:
+    """A repo shipping ``.raptor-resolver-home`` as a plain FILE used to
+    make the resolver-env mkdir raise a raw FileExistsError (escaping
+    the ComposeError contract). The name is now inert repo data."""
+    source = tmp_path / "repo"
+    source.mkdir()
+    (source / ".raptor-resolver-home").write_text("not a directory")
+    compose = source / "docker-compose.yml"
+    compose.write_text(yaml.safe_dump(
+        {"services": {"web": {"image": "img"}}}))
+
+    staged, staging = cco.rewrite_for_localhost(compose)
+    try:
+        with patch.object(cco, "_run_resolver",
+                          lambda *a, **kw: "services: {}\n"):
+            resolved = cco._resolve_effective_model(staged)
+    finally:
+        cco.cleanup_staging(staging)
+    assert resolved == {"services": {}}
+
+
+def test_resolver_scratch_home_cleaned_on_failure(tmp_path: Path) -> None:
+    """The scratch home is torn down on the resolution-failure path too
+    (fail closed must not strand tmpdirs)."""
+    compose = tmp_path / "docker-compose.yml"
+    compose.write_text(yaml.safe_dump(
+        {"services": {"web": {"image": "img"}}}))
+    seen: dict[str, Any] = {}
+
+    def failing_run_resolver(argv: list[str], staging: Path,
+                             env: dict[str, str], **kw: Any) -> str:
+        seen["home"] = Path(env["HOME"])
+        raise cco.ComposeError("config exploded")
+
+    with patch.object(cco, "_run_resolver", failing_run_resolver), \
+            pytest.raises(cco.ComposeError, match="config exploded"):
+        cco._resolve_effective_model(compose)
+    assert not seen["home"].exists()
+
+
+def test_resolver_sandbox_granted_scratch_home(tmp_path: Path) -> None:
+    """The sandbox leg confines reads to staging — the out-of-staging
+    scratch home must ride the read + write grants or docker's config
+    discovery fails under confinement."""
+    seen: dict[str, Any] = {}
+
+    def fake_sandbox_run(argv: list[str], **kw: Any):
+        seen.update(kw)
+
+        class _P:
+            returncode = 0
+            stdout = "services: {}\n"
+            stderr = ""
+            sandbox_info: dict[str, Any] = {}
+
+        return _P()
+
+    scratch = tmp_path / "scratch-home"
+    scratch.mkdir()
+    import core.sandbox as sb
+    with patch.object(sb, "run", fake_sandbox_run):
+        cco._run_resolver(["docker", "compose", "config"], tmp_path,
+                          cco._resolver_env(scratch),
+                          scratch_home=scratch)
+    assert seen.get("readable_paths") == [str(scratch)]
+    assert seen.get("writable_paths") == [str(scratch)]
 
 
 def test_resolver_failure_never_retried_unconfined(tmp_path: Path) -> None:
@@ -578,6 +711,36 @@ def test_resolver_failure_never_retried_unconfined(tmp_path: Path) -> None:
         cco._run_resolver(["docker", "compose", "config"], tmp_path,
                           cco._resolver_env(tmp_path))
     assert len(calls) == 1
+
+
+def test_resolver_fallback_refuses_truncated_output(tmp_path: Path) -> None:
+    """Unconfined-fallback leg: a tail-capped resolver stdout can still
+    be a VALID YAML document describing a subset stack — parsing it would
+    sanitize and launch a partial model as if complete. A truncated
+    outcome must refuse (fail closed); an untruncated one must keep
+    flowing (the refuse-good-runs direction)."""
+    from core.container.proc import RunOutcome
+    from core.sandbox import SandboxSetupError
+
+    import core.sandbox as sb
+
+    def _outcome(truncated: bool) -> RunOutcome:
+        return RunOutcome(returncode=0, stdout="services: {}\n",
+                          stderr="", timed_out=False, truncated=truncated)
+
+    with patch.object(sb, "run",
+                      side_effect=SandboxSetupError("no sandbox tier")):
+        with patch.object(cco, "run_cli",
+                          return_value=_outcome(truncated=True)), \
+             pytest.raises(cco.ComposeError, match="truncated"):
+            cco._run_resolver(["docker", "compose", "config"], tmp_path,
+                              cco._resolver_env(tmp_path))
+        with patch.object(cco, "run_cli",
+                          return_value=_outcome(truncated=False)):
+            raw = cco._run_resolver(
+                ["docker", "compose", "config"], tmp_path,
+                cco._resolver_env(tmp_path))
+        assert raw == "services: {}\n"
 
 
 def test_primary_compose_file_size_capped(tmp_path: Path) -> None:
@@ -901,3 +1064,193 @@ def test_staging_budget_refuses_oversized_source(
     # Direction 2: under budget passes silently.
     monkeypatch.setattr(cco, "_STAGING_MAX_BYTES", 1 << 20)
     cco._require_stageable_size(src)
+
+
+# -- bind-source TOCTOU (writable-bind overlap) -------------------------------
+# Sanitize-time realpath approves a bind source; dockerd re-resolves it
+# at every container START (and restart). A service with a writable
+# bind of a staging directory can therefore swap a path component for a
+# symlink after approval, steering a nested bind at a host path when
+# its container starts later. The stack-wide overlap pass refuses the
+# enabling layouts.
+
+
+def test_bind_under_cross_service_writable_bind_refused(tmp_path: Path) -> None:
+    """The demonstrated sequence: A binds the staging root rw, plants
+    staging/link -> /, B (ordered after A) binds ./link/etc — the
+    daemon would mount host /etc into B."""
+    with pytest.raises(cco.ComposeError, match="writable bind"):
+        _sanitize(tmp_path, {
+            "services": {
+                "planter": {"image": "x", "volumes": [".:/staging:rw"]},
+                "victim": {
+                    "image": "y",
+                    "depends_on": {
+                        "planter": {"condition": "service_healthy"}},
+                    "volumes": ["./link/etc:/host-etc"],
+                },
+            },
+        })
+
+
+def test_bind_under_cross_service_writable_dict_bind_refused(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "www").mkdir()
+    with pytest.raises(cco.ComposeError, match="writable bind"):
+        _sanitize(tmp_path, {
+            "services": {
+                "a": {"image": "x", "volumes": [
+                    {"type": "bind", "source": "./www", "target": "/w"}]},
+                "b": {"image": "y", "volumes": ["./www/html:/h:ro"]},
+            },
+        })
+
+
+def test_bind_under_readonly_parent_kept(tmp_path: Path) -> None:
+    """A read-only parent bind grants no write channel — no TOCTOU."""
+    (tmp_path / "www" / "html").mkdir(parents=True)
+    doc = _sanitize(tmp_path, {
+        "services": {
+            "a": {"image": "x", "volumes": ["./www:/w:ro"]},
+            "b": {"image": "y", "volumes": ["./www/html:/h"]},
+        },
+    })
+    assert "./www:/w:ro" in doc["services"]["a"]["volumes"]
+    assert "./www/html:/h" in doc["services"]["b"]["volumes"]
+
+
+def test_disjoint_and_equal_bind_sources_kept(tmp_path: Path) -> None:
+    """Equal sources and disjoint siblings cannot be re-pointed: a
+    writable bind grants writes INSIDE its source, and replacing the
+    source itself needs write access to its parent."""
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    doc = _sanitize(tmp_path, {
+        "services": {
+            "one": {"image": "x", "volumes": ["./a:/a", "./b:/b:ro"]},
+            "two": {"image": "y", "volumes": ["./a:/shared:ro"]},
+        },
+    })
+    assert "./a:/a" in doc["services"]["one"]["volumes"]
+    assert "./a:/shared:ro" in doc["services"]["two"]["volumes"]
+
+
+def test_same_service_overlap_without_restart_kept(tmp_path: Path) -> None:
+    """One service binding both ./www rw and a nested path has no
+    TOCTOU on its own: its mounts are resolved before its own code
+    runs, and nothing restarts it."""
+    (tmp_path / "www" / "conf").mkdir(parents=True)
+    doc = _sanitize(tmp_path, {
+        "services": {
+            "web": {"image": "x",
+                    "volumes": ["./www:/w", "./www/conf:/c:ro"]},
+        },
+    })
+    assert "./www:/w" in doc["services"]["web"]["volumes"]
+    assert "./www/conf:/c:ro" in doc["services"]["web"]["volumes"]
+
+
+def test_same_service_overlap_with_restart_refused(tmp_path: Path) -> None:
+    """With a restart policy the single-service replay works: tamper,
+    exit, the restart re-resolves the sibling mount through the
+    planted symlink (verified live against dockerd)."""
+    (tmp_path / "www" / "conf").mkdir(parents=True)
+    with pytest.raises(cco.ComposeError, match="writable bind"):
+        _sanitize(tmp_path, {
+            "services": {
+                "web": {"image": "x", "restart": "always",
+                        "volumes": ["./www:/w", "./www/conf:/c:ro"]},
+            },
+        })
+
+
+def test_secret_file_under_cross_service_writable_bind_refused(
+    tmp_path: Path,
+) -> None:
+    """Non-swarm compose implements file-based secrets/configs as bind
+    mounts re-resolved by the daemon at container start — the same
+    swap channel as volumes. A secret file nesting under another
+    service's writable bind must refuse like any other bind."""
+    (tmp_path / "dir").mkdir()
+    (tmp_path / "dir" / "tok").write_text("s")
+    with pytest.raises(cco.ComposeError, match="writable bind"):
+        _sanitize(tmp_path, {
+            "services": {
+                "a": {"image": "x", "volumes": ["./dir:/d"]},
+                "b": {"image": "y", "secrets": ["s1"],
+                      "depends_on": ["a"]},
+            },
+            "secrets": {"s1": {"file": "./dir/tok"}},
+        })
+
+
+def test_config_attachment_dict_form_under_writable_bind_refused(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "dir").mkdir()
+    (tmp_path / "dir" / "cfg").write_text("c")
+    with pytest.raises(cco.ComposeError, match="writable bind"):
+        _sanitize(tmp_path, {
+            "services": {
+                "a": {"image": "x", "volumes": ["./dir:/d"]},
+                "b": {"image": "y",
+                      "configs": [{"source": "c1", "target": "/c"}]},
+            },
+            "configs": {"c1": {"file": "./dir/cfg"}},
+        })
+
+
+def test_secret_file_outside_writable_binds_kept(tmp_path: Path) -> None:
+    (tmp_path / "dir").mkdir()
+    (tmp_path / "sec").mkdir()
+    (tmp_path / "sec" / "tok").write_text("s")
+    doc = _sanitize(tmp_path, {
+        "services": {
+            "a": {"image": "x", "volumes": ["./dir:/d"]},
+            "b": {"image": "y", "secrets": ["s1"]},
+        },
+        "secrets": {"s1": {"file": "./sec/tok"}},
+    })
+    assert doc["secrets"]["s1"]["file"] == "./sec/tok"
+    assert "s1" in doc["services"]["b"]["secrets"]
+
+
+class TestNamedVolumeDiscriminator:
+    """Any '/'-bearing volume source is a path, never a named volume
+    (compose names are [a-zA-Z0-9._-]) — `foo/../x:/x` must take the
+    bind lane so the staging containment does not depend on the
+    sanitizer running post-resolution."""
+
+    def test_relative_traversal_source_treated_as_bind(self, tmp_path: Path) -> None:
+        kept = cco._filter_volumes(["foo/../../etc:/x"], tmp_path)
+        assert kept == []
+
+    def test_relative_inside_staging_bind_kept(self, tmp_path: Path) -> None:
+        (tmp_path / "data").mkdir()
+        kept = cco._filter_volumes(["data/sub/..:/x"], tmp_path)
+        assert kept == ["data/sub/..:/x"]
+
+    def test_named_volume_still_named(self, tmp_path: Path) -> None:
+        kept = cco._filter_volumes(["pgdata:/var/lib/postgresql"], tmp_path)
+        assert kept == ["pgdata:/var/lib/postgresql"]
+
+
+class TestStagingEntryBudget:
+    """Bytes alone miss the inode axis: millions of zero-byte files
+    pass any byte cap while copytree exhausts tmpfs inodes."""
+
+    def test_entry_flood_refused(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setattr(cco, "_STAGING_MAX_ENTRIES", 10)
+        src = tmp_path / "ctx"
+        src.mkdir()
+        for i in range(12):
+            (src / f"z{i}").touch()  # zero bytes each
+        with pytest.raises(cco.ComposeError, match="entry staging budget"):
+            cco._require_stageable_size(src)
+
+    def test_small_tree_passes(self, tmp_path: Path) -> None:
+        src = tmp_path / "ctx"
+        (src / "sub").mkdir(parents=True)
+        (src / "sub" / "f").write_text("x")
+        cco._require_stageable_size(src)  # no raise

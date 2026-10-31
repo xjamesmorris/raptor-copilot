@@ -55,14 +55,73 @@ def _vendored():
     )
 
 
+class TestVendorDecisionStructured:
+    def test_reworded_reason_still_produces_audit_record(self):
+        """vendor_decision reads the structured vendor_tier field —
+        rewording the prose reason string must not silently stop
+        the suppressions.jsonl audit-trail records."""
+        import dataclasses
+
+        tr = classify_function(
+            file="gen/wire.c", function="f", sloc=3,
+            vendor_verdict=_generated(corroborated=True),
+        )
+        assert tr.bucket == TriageBucket.SKIP
+        reworded = dataclasses.replace(
+            tr, reasons=("provenance: generator artefact, skipped",),
+        )
+        assert vendor_decision(reworded) == "skip"
+
+    def test_non_vendor_result_stays_none(self):
+        tr = classify_function(
+            file="src/a.c", function="f", sloc=3,
+        )
+        assert tr.vendor_tier is None
+        assert vendor_decision(tr) is None
+
+    def test_vendor_tier_carries_the_verdict_kind(self):
+        gen = classify_function(
+            file="gen/wire.c", function="f", sloc=3,
+            vendor_verdict=_generated(corroborated=True),
+        )
+        assert gen.vendor_tier == KIND_GENERATED
+        ven = classify_function(
+            file="third_party/z.c", function="f", sloc=3,
+            vendor_verdict=_vendored(),
+        )
+        assert ven.vendor_tier == KIND_VENDORED
+
+
 class TestClassifyFunctionRouting:
     def test_corroborated_generated_skips(self):
+        # corroborated=True means TWO distinct signals agreed (banner
+        # + independent generated-shaped path/filename) — only that
+        # earns the skip tier.
         tr = classify_function(
             file="gen/wire.c", function="f", sloc=3,
             vendor_verdict=_generated(corroborated=True),
         )
         assert tr.bucket == TriageBucket.SKIP
         assert vendor_decision(tr) == "skip"
+
+    def test_extension_only_verdict_never_skips(self):
+        # End-to-end anti-evasion: the filename is the target's
+        # say-so. Renaming a backdoored helper's file to evil.pb.go
+        # must not route its functions to SKIP (zero review) — a
+        # bare suffix match is glance-tier like every other single
+        # target-controlled signal.
+        from core.audit.vendored_detector import classify_file
+
+        v = classify_file("evil.pb.go", "int f(void) { return 0; }\n")
+        assert v is not None
+        assert v.kind == KIND_GENERATED
+        assert v.corroborated is False
+        tr = classify_function(
+            file="evil.pb.go", function="helper", sloc=3,
+            vendor_verdict=v,
+        )
+        assert tr.bucket == TriageBucket.GLANCE
+        assert vendor_decision(tr) == "glance"
 
     def test_uncorroborated_banner_glances_never_skips(self):
         # Anti-evasion: the banner is target-controlled text — alone
@@ -73,6 +132,228 @@ class TestClassifyFunctionRouting:
         )
         assert tr.bucket == TriageBucket.GLANCE
         assert vendor_decision(tr) == "glance"
+
+    def test_corroborated_generated_with_dangerous_callees_glances(self):
+        # Anti-evasion: corroboration is two TARGET-plantable signals
+        # (banner + generated-shaped filename). A planted protoc-
+        # bannered evil.pb.go whose functions call dangerous APIs must
+        # not be skip-invisible — the code's own live signal demotes
+        # the skip to a glance.
+        tr = classify_function(
+            file="gen/wire.pb.go", function="Unmarshal", sloc=40,
+            has_dangerous_callees=True,
+            vendor_verdict=_generated(corroborated=True),
+        )
+        assert tr.bucket == TriageBucket.GLANCE
+        assert vendor_decision(tr) == "glance"
+        assert any("dangerous callees" in r for r in tr.reasons)
+
+    def test_corroborated_generated_on_taint_path_glances(self):
+        tr = classify_function(
+            file="gen/wire.pb.go", function="Unmarshal", sloc=40,
+            on_taint_path=True,
+            vendor_verdict=_generated(corroborated=True),
+        )
+        assert tr.bucket == TriageBucket.GLANCE
+        assert vendor_decision(tr) == "glance"
+        assert any("on taint path" in r for r in tr.reasons)
+
+    def test_generated_file_aliased_import_demotes_via_resolver(
+        self, tmp_path,
+    ):
+        # The per-function mechanical signals match SURFACE spellings:
+        # `import subprocess as sp; sp.run(...)` carries zero
+        # dangerous-callee evidence, so the surface-only demotion is
+        # evadable. The file-level import-RESOLVED check closes the
+        # class.
+        from core.audit.triage import classify_all
+
+        (tmp_path / "gen").mkdir()
+        (tmp_path / "gen" / "evil_pb2.py").write_text(
+            "import subprocess as sp\n"
+            "def unmarshal(b):\n"
+            "    return sp.run(b)\n",
+            encoding="utf-8",
+        )
+        res = classify_all(
+            [{"file": "gen/evil_pb2.py", "name": "unmarshal",
+              "line_start": 2, "line_end": 3, "sloc": 2}],
+            target_path=tmp_path,
+            vendor_verdicts={"gen/evil_pb2.py": _generated(True)},
+        )
+        tr = next(iter(res.values()))
+        assert tr.bucket == TriageBucket.GLANCE
+        assert any("import-resolved" in r for r in tr.reasons)
+
+    def test_generated_file_method_value_demotes_via_resolver(
+        self, tmp_path,
+    ):
+        # A dangerous function taken as a VALUE never emits a call
+        # site; the reference scan resolves it.
+        from core.audit.triage import classify_all
+
+        (tmp_path / "gen").mkdir()
+        (tmp_path / "gen" / "evil_pb2.py").write_text(
+            "import subprocess as sp\n"
+            "def unmarshal(b):\n"
+            "    cb = sp.run\n"
+            "    return cb(b)\n",
+            encoding="utf-8",
+        )
+        res = classify_all(
+            [{"file": "gen/evil_pb2.py", "name": "unmarshal",
+              "line_start": 2, "line_end": 4, "sloc": 3}],
+            target_path=tmp_path,
+            vendor_verdicts={"gen/evil_pb2.py": _generated(True)},
+        )
+        assert next(iter(res.values())).bucket == TriageBucket.GLANCE
+
+    def test_generated_file_benign_imports_still_skip(self, tmp_path):
+        # Both directions: a genuinely benign generated file keeps
+        # the skip tier through the resolver.
+        from core.audit.triage import classify_all
+
+        (tmp_path / "gen").mkdir()
+        (tmp_path / "gen" / "wire_pb2.py").write_text(
+            "import struct\n"
+            "def unmarshal(b):\n"
+            "    return struct.unpack('<I', b)\n",
+            encoding="utf-8",
+        )
+        res = classify_all(
+            [{"file": "gen/wire_pb2.py", "name": "unmarshal",
+              "line_start": 2, "line_end": 3, "sloc": 2}],
+            target_path=tmp_path,
+            vendor_verdicts={"gen/wire_pb2.py": _generated(True)},
+        )
+        assert next(iter(res.values())).bucket == TriageBucket.SKIP
+
+    def test_over_cap_generated_file_demotes_not_skips(
+        self, tmp_path, monkeypatch,
+    ):
+        # Plant-evasion: a "generated" file that pads the resolver's
+        # read cap BEFORE its dangerous import must not keep the
+        # corroborated skip — the resolver saw only the prefix, so
+        # its silence is not evidence. Truncated read = glance with
+        # the incompleteness named.
+        import core.audit.triage as triage_mod
+        from core.audit.triage import classify_all
+
+        real_read = triage_mod.read_text_capped
+        monkeypatch.setattr(
+            triage_mod, "read_text_capped",
+            lambda path, *a, **kw: real_read(path, 64),
+        )
+        (tmp_path / "gen").mkdir()
+        (tmp_path / "gen" / "evil_pb2.py").write_text(
+            "# " + "x" * 100 + "\n"
+            "import subprocess as sp\n"
+            "def unmarshal(b):\n"
+            "    return sp.run(b)\n",
+            encoding="utf-8",
+        )
+        res = classify_all(
+            [{"file": "gen/evil_pb2.py", "name": "unmarshal",
+              "line_start": 3, "line_end": 4, "sloc": 2}],
+            target_path=tmp_path,
+            vendor_verdicts={"gen/evil_pb2.py": _generated(True)},
+        )
+        tr = next(iter(res.values()))
+        assert tr.bucket == TriageBucket.GLANCE
+        assert any("resolver cap" in r for r in tr.reasons)
+
+    def test_within_cap_benign_file_still_skips(
+        self, tmp_path, monkeypatch,
+    ):
+        # Both directions: an in-cap benign generated file keeps the
+        # skip through the truncation rule.
+        import core.audit.triage as triage_mod
+        from core.audit.triage import classify_all
+
+        real_read = triage_mod.read_text_capped
+        monkeypatch.setattr(
+            triage_mod, "read_text_capped",
+            lambda path, *a, **kw: real_read(path, 4096),
+        )
+        (tmp_path / "gen").mkdir()
+        (tmp_path / "gen" / "wire_pb2.py").write_text(
+            "import struct\n"
+            "def unmarshal(b):\n"
+            "    return struct.unpack('<I', b)\n",
+            encoding="utf-8",
+        )
+        res = classify_all(
+            [{"file": "gen/wire_pb2.py", "name": "unmarshal",
+              "line_start": 2, "line_end": 3, "sloc": 2}],
+            target_path=tmp_path,
+            vendor_verdicts={"gen/wire_pb2.py": _generated(True)},
+        )
+        assert next(iter(res.values())).bucket == TriageBucket.SKIP
+
+    def test_go_aliased_import_resolves(self):
+        import pytest
+
+        pytest.importorskip("tree_sitter_go")
+        from core.audit.triage import _alias_resolved_dangerous
+
+        src = ('package gen\nimport zz "os/exec"\n'
+               'func Unmarshal(b []byte) { zz.Command(string(b)).Run() }\n')
+        assert _alias_resolved_dangerous(src, ".go") is True
+        mv = ('package gen\nimport zz "os/exec"\n'
+              'func Unmarshal(b []byte) { f := zz.Command; _ = f }\n')
+        assert _alias_resolved_dangerous(mv, ".go") is True
+
+    def test_go_dot_import_resolves(self):
+        # Dot import drops the qualifier: `Command(...)` is
+        # unqualified, and the extractor flags the wildcard but
+        # discards the module — the resolver recovers it lexically.
+        import pytest
+
+        pytest.importorskip("tree_sitter_go")
+        from core.audit.triage import _alias_resolved_dangerous
+
+        src = ('package gen\nimport . "os/exec"\n'
+               'func Unmarshal(b []byte) { Command(string(b)).Run() }\n')
+        assert _alias_resolved_dangerous(src, ".go") is True
+        benign = ('package gen\nimport . "strings"\n'
+                  'func F(s string) string { return ToUpper(s) }\n')
+        assert _alias_resolved_dangerous(benign, ".go") is False
+
+    def test_two_step_alias_resolves_one_hop(self):
+        from core.audit.triage import _alias_resolved_dangerous
+
+        src = ("import subprocess as sp\nq = sp\n"
+               "def unmarshal(b):\n    return q.run(b)\n")
+        assert _alias_resolved_dangerous(src, ".py") is True
+        benign = ("import math as m\nq = m\n"
+                  "def f(x):\n    return q.sqrt(x)\n")
+        assert _alias_resolved_dangerous(benign, ".py") is False
+
+    def test_python_star_import_resolves(self):
+        from core.audit.triage import _alias_resolved_dangerous
+
+        src = ("from subprocess import *\n"
+               "def unmarshal(b):\n    return run(b)\n")
+        assert _alias_resolved_dangerous(src, ".py") is True
+
+    def test_resolver_fail_direction_is_no_evidence(self):
+        from core.audit.triage import _alias_resolved_dangerous
+
+        # Unknown extension and unparseable source are no-evidence
+        # (skip stays), never an exception.
+        assert _alias_resolved_dangerous("anything", ".zig") is False
+        assert _alias_resolved_dangerous("def broken(:", ".py") is False
+
+    def test_corroborated_generated_no_live_signal_still_skips(self):
+        # Both directions: the demotion needs a live code signal —
+        # plain corroborated generated code keeps the skip tier
+        # (that is the whole point of the vendored/generated tier).
+        tr = classify_function(
+            file="gen/wire.pb.go", function="Unmarshal", sloc=40,
+            vendor_verdict=_generated(corroborated=True),
+        )
+        assert tr.bucket == TriageBucket.SKIP
+        assert vendor_decision(tr) == "skip"
 
     def test_generated_entry_point_glances(self):
         tr = classify_function(
@@ -402,3 +683,171 @@ class TestFlagThreading:
             vendored_triage=False,
         )
         assert self._build(opts).vendored_triage is False
+
+
+# ── Binary toolchain rows (composite file::name verdict keys) ─────────
+
+
+def _toolchain():
+    from core.audit.vendored_detector import SIGNAL_TOOLCHAIN
+
+    return VendorVerdict(
+        kind=KIND_VENDORED,
+        signal=SIGNAL_TOOLCHAIN,
+        detail="C++ implementation namespace (std::…) "
+               "[name provenance: demangled]",
+    )
+
+
+def _binary_gap(name, file="binary:libx", **kw):
+    g = {
+        "file": file,
+        "name": name,
+        "line_start": 0,
+        "line_end": 0,
+        "sloc": 0,
+        "kind": "function",
+        "metadata": {"name_provenance": "demangled"},
+    }
+    g.update(kw)
+    return g
+
+
+class TestToolchainRouting:
+    def test_toolchain_verdict_glances(self):
+        tr = classify_function(
+            file="binary:libx",
+            function="std::vector<int>::push_back(int const&)",
+            sloc=0,
+            vendor_verdict=_toolchain(),
+        )
+        assert tr.bucket == TriageBucket.GLANCE
+        assert vendor_decision(tr) == "glance"
+        assert tr.vendor_tier == KIND_VENDORED
+        assert tr.vendor_signal == "toolchain"
+
+    def test_toolchain_boundary_keeps_normal_routing(self):
+        tr = classify_function(
+            file="binary:libx",
+            function="std::vector<int>::push_back(int const&)",
+            sloc=0,
+            is_sink=True,
+            vendor_verdict=_toolchain(),
+        )
+        assert vendor_decision(tr) is None
+        assert tr.vendor_signal is None
+
+    def test_vendor_signal_stamped_on_every_vendor_route(self):
+        # The structured signal rides every vendor-routed result, not
+        # just toolchain rows (the executor exemption must be able to
+        # trust its absence as much as its presence).
+        tr_path = classify_function(
+            file="third_party/z.c", function="f", sloc=100,
+            vendor_verdict=_vendored(),
+        )
+        assert tr_path.vendor_signal == "path"
+        tr_gen = classify_function(
+            file="gen/wire.c", function="f", sloc=3,
+            vendor_verdict=_generated(corroborated=True),
+        )
+        assert tr_gen.vendor_signal == "banner"
+
+    def test_classify_all_composite_key_lookup(self):
+        gaps = [
+            _binary_gap("std::vector<int>::push_back(int const&)"),
+            _binary_gap("auparse_init"),
+        ]
+        verdicts = {
+            "binary:libx::std::vector<int>::push_back(int const&)":
+                _toolchain(),
+        }
+        results = classify_all(gaps, vendor_verdicts=verdicts)
+        stl = results[
+            "binary:libx:std::vector<int>::push_back(int const&):0"
+        ]
+        assert stl.bucket == TriageBucket.GLANCE
+        assert stl.vendor_signal == "toolchain"
+        first_party = results["binary:libx:auparse_init:0"]
+        assert first_party.vendor_tier is None
+        assert first_party.vendor_signal is None
+
+    def test_composite_lookup_gated_on_binary_prefix(self):
+        # A SOURCE gap must never match a FILE-keyed verdict whose
+        # (target-controlled) path happens to end ``::<name>`` — the
+        # composite fallback only runs for binary:* checklist rows.
+        gaps = [
+            {
+                "file": "x.c", "name": "evil", "line_start": 0,
+                "line_end": 0, "sloc": 5, "kind": "function",
+            },
+        ]
+        verdicts = {"x.c::evil": _generated(corroborated=True)}
+        results = classify_all(gaps, vendor_verdicts=verdicts)
+        tr = results["x.c:evil:0"]
+        assert vendor_decision(tr) is None
+        assert tr.vendor_tier is None
+        assert tr.vendor_signal is None
+
+    def test_recorder_composite_lookup_gated_on_binary_prefix(
+        self, tmp_path,
+    ):
+        from core.audit.orchestrator import _record_vendored_suppressions
+
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        gaps = [
+            {
+                "file": "x.c", "name": "evil", "line_start": 0,
+                "line_end": 0, "sloc": 5, "kind": "function",
+            },
+        ]
+        verdicts = {"x.c::evil": _generated(corroborated=True)}
+        triage = classify_all(gaps, vendor_verdicts=verdicts)
+        skipped, glanced = _record_vendored_suppressions(
+            gaps, triage, verdicts, out_dir,
+        )
+        assert (skipped, glanced) == (0, 0)
+        assert not (out_dir / "suppressions.jsonl").exists()
+
+    def test_pinned_binary_gap_exempt_from_composite_lookup(self):
+        gaps = [
+            _binary_gap(
+                "std::vector<int>::push_back(int const&)", pinned=True,
+            ),
+        ]
+        verdicts = {
+            "binary:libx::std::vector<int>::push_back(int const&)":
+                _toolchain(),
+        }
+        results = classify_all(gaps, vendor_verdicts=verdicts)
+        tr = results[
+            "binary:libx:std::vector<int>::push_back(int const&):0"
+        ]
+        assert vendor_decision(tr) is None
+        assert tr.vendor_signal is None
+
+    def test_composite_glance_decision_recorded(self, tmp_path):
+        from core.audit.orchestrator import _record_vendored_suppressions
+
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        gaps = [_binary_gap("std::vector<int>::push_back(int const&)")]
+        verdicts = {
+            "binary:libx::std::vector<int>::push_back(int const&)":
+                _toolchain(),
+        }
+        triage = classify_all(gaps, vendor_verdicts=verdicts)
+
+        skipped, glanced = _record_vendored_suppressions(
+            gaps, triage, verdicts, out_dir,
+        )
+        assert (skipped, glanced) == (0, 1)
+        rec = json.loads(
+            (out_dir / "suppressions.jsonl").read_text().splitlines()[0]
+        )
+        assert rec["verdict"] == "vendored_code"
+        assert rec["tier"] == "glance"
+        assert rec["signal"] == "toolchain"
+        assert rec["function"] == "std::vector<int>::push_back(int const&)"
+        assert rec["file_path"] == "binary:libx"
+        assert rec["dropped"] is False

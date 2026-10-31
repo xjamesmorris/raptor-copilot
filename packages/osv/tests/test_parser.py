@@ -78,11 +78,30 @@ def test_missing_id_raises() -> None:
         parse_record({"id": "", "summary": "empty id"})
 
 
+def test_upstream_field_parsed() -> None:
+    """Distro secdb records (Debian/Ubuntu) carry ``aliases: null`` and
+    the CVE identity ONLY in ``upstream`` — the field must survive
+    parsing or the CVE is lost for every distro base-image record."""
+    rec = parse_record({
+        "id": "DEBIAN-CVE-2024-6387",
+        "aliases": None,
+        "upstream": ["CVE-2024-6387"],
+    })
+    assert rec.aliases == ()
+    assert rec.upstream == ("CVE-2024-6387",)
+    # Bare-string upstream (same malformed-mirror shape as aliases) is
+    # ONE id; non-list/non-string drops to empty.
+    assert parse_record({"id": "X", "upstream": "CVE-2024-1"}).upstream \
+        == ("CVE-2024-1",)
+    assert parse_record({"id": "X", "upstream": 7}).upstream == ()
+
+
 def test_minimal_record() -> None:
     """Only ``id`` is required — everything else defaults to empty."""
     rec = parse_record({"id": "OSV-1"})
     assert rec.id == "OSV-1"
     assert rec.aliases == ()
+    assert rec.upstream == ()
     assert rec.summary == ""
     assert rec.details == ""
     assert rec.references == ()
@@ -286,3 +305,44 @@ def test_numeric_introduced_zero_is_kept() -> None:
     assert rec.affected[0].ranges[0].events == (
         {"introduced": "0"}, {"fixed": "2.0"},
     )
+
+
+# --- container-typed-wrong fields (hostile / malformed feeds) -------------
+
+def test_non_list_container_fields_never_raise() -> None:
+    """OSV records are user-submitted advisory data; a truthy non-list
+    where a list belongs (``"references": 7``) must degrade to empty
+    per the module contract ("A single malformed field never raises"),
+    not TypeError out of the iteration."""
+    rec = parse_record({
+        "id": "GHSA-x",
+        "references": 7,
+        "affected": 7,
+        "severity": 7,
+    })
+    assert rec.id == "GHSA-x"
+    assert rec.references == ()
+    assert rec.affected == ()
+    assert rec.severity == ()
+
+
+def test_non_list_nested_ranges_and_events_never_raise() -> None:
+    rec = parse_record({
+        "id": "GHSA-y",
+        "affected": [
+            {"package": {"name": "foo"}, "ranges": 7},
+            {"package": {"name": "bar"},
+             "ranges": [{"type": "SEMVER", "events": 7}]},
+        ],
+    })
+    assert rec.affected[0].ranges == ()
+    assert rec.affected[1].ranges[0].events == ()
+
+
+def test_non_string_id_raises_value_error() -> None:
+    """A non-string ``id`` must hit the existing malformed-id path —
+    str()-coercion minted junk ids like "{'a': 1}" that then keyed
+    caches and joined findings."""
+    for junk in ({"a": 1}, ["GHSA-z"], 42, None, ""):
+        with pytest.raises(ValueError, match="id"):
+            parse_record({"id": junk})

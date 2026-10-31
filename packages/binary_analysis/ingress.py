@@ -20,6 +20,8 @@ from typing import Any
 
 from core.evidence import BinaryEvidenceRecord, EvidenceTier, make_evidence
 
+from .manifest import platform_label
+
 logger = logging.getLogger(__name__)
 
 
@@ -93,6 +95,47 @@ _DRIVER_SYMBOLS = {
     "IRP_MJ_INTERNAL_DEVICE_CONTROL": ("ioctl_dispatch", "kernel_peer_ioctl", "kernel_boundary", 115),
 }
 
+# Windows service entry points: the Service Control Manager invokes
+# ServiceMain with SCM-supplied arguments on a privileged service —
+# a real process-boundary ingress beside WinMain/main. Matched
+# against exports AND recovered function names like the driver
+# symbols above.
+_WIN_SERVICE_SYMBOLS = {
+    "ServiceMain": ("service_entry", "service_control_manager", "process_boundary", 60),
+}
+
+# Mach-O XPC listener markers: a binary importing the listener setup
+# calls RECEIVES peer messages (the C-level sibling of the
+# listener:shouldAcceptNewConnection: Obj-C callback above, and
+# scored with it). Import names are matched exactly — these are
+# plain C exports.
+_MACHO_XPC_LISTENER_IMPORTS = {
+    "xpc_connection_set_event_handler",
+    "xpc_connection_create_mach_service",
+    "xpc_main",
+}
+
+# IOKit user-client dispatch on the KEXT side: IOUserClient
+# subclasses override externalMethod (C++-mangled in the symbol
+# table, so substring-matched against recovered function names).
+# The client-side IOConnectCall* imports are deliberately NOT
+# ingress — they are outbound calls, classified as device_control
+# sinks by surface_classification instead.
+_MACHO_IOKIT_DISPATCH_SUBSTRING = "externalMethod"
+
+# Per-binary cap on the HEURISTIC externalMethod substring match. A
+# real kext overrides externalMethod once per IOUserClient subclass
+# (single digits in practice), so name tables yielding more are
+# either template-heavy C++ images or a crafted symbol set flooding
+# the ranked queue with fake kernel-boundary entries. Too low and a
+# legitimate multi-client driver loses dispatch candidates; too high
+# and one hostile name table drowns every other ingress kind — 24
+# keeps generous headroom over observed drivers while bounding the
+# flood. Overflow is never silent: an aggregated evidence record
+# carries the full match count and a bounded skipped-name sample
+# (same pattern as exported_data_symbol).
+_MACHO_IOKIT_DISPATCH_CAP = 24
+
 _LINUX_DRIVER_SYMBOLS = {
     "module_init": ("driver_initialisation", "kernel_loader", "kernel_boundary", 40),
     "init_module": ("driver_initialisation", "kernel_loader", "kernel_boundary", 40),
@@ -100,6 +143,21 @@ _LINUX_DRIVER_SYMBOLS = {
     "compat_ioctl": ("ioctl_dispatch", "user_mode_ioctl", "kernel_boundary", 115),
     "proc_ioctl": ("ioctl_dispatch", "user_mode_ioctl", "kernel_boundary", 110),
 }
+
+def driver_entry_catalogs() -> dict[str, dict[str, tuple[str, str, str, int]]]:
+    """Read-only copies of the driver/kernel entry-symbol catalogs.
+
+    The engagement ledger's mechanical exposure features cite these
+    catalogs as their extractor — one curated vocabulary, shared with
+    :func:`recover_external_ingress`, never re-listed by a consumer.
+    Values are the ``(kind, external_control, boundary, score)``
+    tuples the ingress recovery uses.
+    """
+    return {
+        "pe": dict(_DRIVER_SYMBOLS),
+        "linux": dict(_LINUX_DRIVER_SYMBOLS),
+    }
+
 
 _PE_EXPORT_SKIP = {
     "DllMain",
@@ -109,21 +167,35 @@ _PE_EXPORT_SKIP = {
     "DllGetClassObject",
 }
 
+# Export-table symbol types (radare2 iEj, upper-cased) that mark a
+# data export. A global length-limit constant exported as OBJ is real
+# surface information, but it is not an API an external caller can
+# invoke — ranking it as ``exported_api`` pushes genuine function
+# exports down the ingress queue. Data-typed exports are DEMOTED to
+# the low-score ``exported_data`` kind, never dropped: the type byte
+# is attacker-controlled (a 2-byte st_info patch relabels a callable
+# export OBJECT while it stays dlopen/dlsym-callable), so suppression
+# would hand the binary an operator-invisible surface-hiding lever —
+# demotion keeps every export visible in candidates, graph and report.
+# Unknown or missing types stay ``exported_api`` (fail-open):
+# symbol-type coverage varies by binary format and r2 version, and
+# demoting a real API is worse than ranking a constant.
+_DATA_EXPORT_TYPES = frozenset({"OBJ", "OBJECT", "TLS", "COMMON"})
+
+# Score for demoted data exports — below every callable-API surface
+# (exported_api is 70/75) so a data export can never outrank a
+# function export, while staying present in the ranked output.
+_DATA_EXPORT_SCORE = 10
+
 
 def _id(*parts: Any) -> str:
     raw = "::".join(str(part) for part in parts)
     return f"BINGRESS-{hashlib.sha256(raw.encode('utf-8', 'surrogateescape')).hexdigest()[:12]}"
 
 
-def _platform(manifest: Any) -> str:
-    kind = str(getattr(manifest, "target_kind", "") or "")
-    if kind == "macho":
-        return "macos"
-    if kind.startswith("pe-"):
-        return "windows"
-    if kind in {"elf-linux", "elf-kmod"}:
-        return "linux"
-    return "generic"
+# Shared target_kind -> OS mapping (kept under the module-local name
+# the call sites use).
+_platform = platform_label
 
 
 def recover_external_ingress(
@@ -141,18 +213,21 @@ def recover_external_ingress(
         if isinstance(item, dict) and item.get("name")
     }
 
+    # Base-name fallback index, built once. Pre-fix every export not
+    # found by exact name linearly rescanned all interesting functions
+    # (2000+ PE-DLL exports x 10k functions = ~20M splits/compares —
+    # a multi-minute pure-CPU stall in recover_external_ingress).
+    # setdefault keeps the FIRST function per base name, matching the
+    # old scan's first-in-iteration-order semantics exactly.
+    functions_by_base: dict[str, dict[str, Any]] = {}
+    for function_name, item in functions.items():
+        functions_by_base.setdefault(function_name.split(".")[-1], item)
+
     def bind_function(name: str) -> tuple[str, str, str]:
         exact = functions.get(name)
         if exact is None:
             base = name.rsplit(".", maxsplit=1)[-1]
-            exact = next(
-                (
-                    item
-                    for function_name, item in functions.items()
-                    if function_name.split(".")[-1] == base
-                ),
-                None,
-            )
+            exact = functions_by_base.get(base)
         if exact is None:
             return "", "", ""
         return (
@@ -241,6 +316,8 @@ def recover_external_ingress(
             control = "kernel_loader"
             boundary = "kernel_boundary"
             score = 40
+        elif name in _WIN_SERVICE_SYMBOLS:
+            kind, control, boundary, score = _WIN_SERVICE_SYMBOLS[name]
         add(
             kind=kind,
             name=name,
@@ -338,14 +415,43 @@ def recover_external_ingress(
 
     exports = [str(item) for item in getattr(manifest, "exports", []) if item]
     export_names = set(exports)
+    export_types = {
+        str(name): str(value).upper()
+        for name, value in (getattr(manifest, "export_types", {}) or {}).items()
+    }
+    data_export_names: list[str] = []
 
     def symbol_provenance(name: str) -> tuple[str, EvidenceTier]:
         if name in export_names:
             return "export_table", EvidenceTier.HEADER_BACKED
         return "radare2_function_name", EvidenceTier.HEURISTIC
 
+    def is_data_export(name: str) -> bool:
+        return export_types.get(name, "") in _DATA_EXPORT_TYPES
+
+    def add_data_export(name: str) -> None:
+        """Demote a data-typed export: visible low-score candidate,
+        never an ``exported_api`` peer (see _DATA_EXPORT_TYPES)."""
+        data_export_names.append(name)
+        function_id, function_name, address = bind_function(name)
+        add(
+            kind="exported_data",
+            name=name,
+            source="export_table",
+            external_control="external_caller",
+            boundary="caller_to_library",
+            score=_DATA_EXPORT_SCORE,
+            tier=EvidenceTier.HEADER_BACKED,
+            confidence="candidate",
+            bound_function_id=function_id,
+            bound_function_name=function_name,
+            address=address,
+            details={"symbol_type": export_types.get(name, "")},
+        )
+
     if str(getattr(manifest, "target_kind", "")).startswith("pe-"):
-        for symbol, (kind, control, boundary, score) in _DRIVER_SYMBOLS.items():
+        for symbol, (kind, control, boundary, score) in {
+                **_DRIVER_SYMBOLS, **_WIN_SERVICE_SYMBOLS}.items():
             matches = sorted({
                 name
                 for name in [*exports, *functions]
@@ -372,6 +478,9 @@ def recover_external_ingress(
                 logger.info("PE DLL has %d exports", len(exports))
             for name in exports:
                 if name.split(".")[-1] in _PE_EXPORT_SKIP:
+                    continue
+                if is_data_export(name):
+                    add_data_export(name)
                     continue
                 function_id, function_name, address = bind_function(name)
                 add(
@@ -416,6 +525,9 @@ def recover_external_ingress(
         for name in exports:
             if name.split(".")[-1] in {"main", "_start"}:
                 continue
+            if is_data_export(name):
+                add_data_export(name)
+                continue
             function_id, function_name, address = bind_function(name)
             add(
                 kind="exported_api",
@@ -430,6 +542,108 @@ def recover_external_ingress(
                 bound_function_name=function_name,
                 address=address,
             )
+    elif getattr(manifest, "target_kind", "") == "macho":
+        # XPC listener markers from the import table: setup-call
+        # presence proves the binary RECEIVES peer messages, not
+        # which function handles them — capability-level ingress
+        # (import-table tier), scored with the Obj-C listener
+        # callback it is the C-level sibling of.
+        imports = {str(item) for item in
+                   getattr(manifest, "imports", []) if item}
+        xpc_markers = sorted(imports & _MACHO_XPC_LISTENER_IMPORTS)
+        if xpc_markers:
+            add(
+                kind="xpc_listener",
+                name="XPC service listener",
+                source="import_table",
+                external_control="peer_process",
+                boundary="process_boundary",
+                score=105,
+                tier=EvidenceTier.HEADER_BACKED,
+                confidence="candidate",
+                details={"symbols": xpc_markers},
+            )
+        # IOKit user-client dispatch (kext side): IOUserClient
+        # subclasses override externalMethod — C++-mangled, so the
+        # recovered function names are substring-matched. Client-
+        # side IOConnectCall* imports stay OUT of ingress (outbound
+        # calls; the sink catalog owns them).
+        dispatch_matches = [
+            name for name in sorted(functions)
+            if _MACHO_IOKIT_DISPATCH_SUBSTRING in name
+        ]
+        for name in dispatch_matches[:_MACHO_IOKIT_DISPATCH_CAP]:
+            function_id, function_name, address = bind_function(name)
+            add(
+                kind="iokit_external_method",
+                name=name,
+                source="radare2_function_name",
+                external_control="user_client_call",
+                boundary="kernel_boundary",
+                score=120,
+                tier=EvidenceTier.HEURISTIC,
+                confidence="candidate",
+                bound_function_id=function_id,
+                bound_function_name=function_name,
+                address=address,
+            )
+        skipped_dispatch = dispatch_matches[_MACHO_IOKIT_DISPATCH_CAP:]
+        if skipped_dispatch:
+            # Aggregated truncation record: the full count survives
+            # even when the name sample is bounded, so a flooded
+            # symbol table cannot push dispatch names out of the
+            # audit trail unnoticed.
+            records.append(make_evidence(
+                manifest.binary_sha256,
+                kind="iokit_dispatch_truncated",
+                source="radare2_function_name",
+                summary=(
+                    f"{len(dispatch_matches)} externalMethod-matching "
+                    f"function name(s) exceed the "
+                    f"{_MACHO_IOKIT_DISPATCH_CAP}-candidate cap; "
+                    f"{len(skipped_dispatch)} not ranked"
+                ),
+                tier=EvidenceTier.HEURISTIC,
+                confidence="confirmed",
+                reproducible=True,
+                tool="binary-ingress",
+                data={
+                    "count": len(dispatch_matches),
+                    "cap": _MACHO_IOKIT_DISPATCH_CAP,
+                    "skipped_names": skipped_dispatch[:200],
+                    "names_truncated": len(skipped_dispatch) > 200,
+                },
+            ))
+
+    if data_export_names:
+        # One aggregated record of the demotion decision, on top of
+        # the per-candidate evidence add() already emitted — the full
+        # count survives even when the name list is truncated, so a
+        # padded export table cannot push a demoted name out of the
+        # audit trail unnoticed.
+        truncated = len(data_export_names) > 200
+        records.append(make_evidence(
+            manifest.binary_sha256,
+            kind="exported_data_symbol",
+            source="export_table",
+            summary=(
+                f"{len(data_export_names)} exported data symbol(s) "
+                "demoted from exported_api to exported_data ingress"
+            ),
+            tier=EvidenceTier.HEADER_BACKED,
+            confidence="confirmed",
+            reproducible=True,
+            tool="binary-ingress",
+            location=manifest.binary_path,
+            data={
+                "kind": "exported_data",
+                "count": len(data_export_names),
+                # Bounded: a hostile export table must not balloon the
+                # evidence store through this record.
+                "names": sorted(data_export_names)[:200],
+                "names_truncated": truncated,
+            },
+        ))
 
     return [
         item.to_dict()
@@ -437,4 +651,8 @@ def recover_external_ingress(
     ], records
 
 
-__all__ = ["ExternalIngressCandidate", "recover_external_ingress"]
+__all__ = [
+    "ExternalIngressCandidate",
+    "driver_entry_catalogs",
+    "recover_external_ingress",
+]

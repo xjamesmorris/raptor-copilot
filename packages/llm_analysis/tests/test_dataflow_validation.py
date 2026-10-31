@@ -251,13 +251,46 @@ class TestDbFreshness:
         repo = tmp_path / "repo"
         repo.mkdir()
         (repo / "a.py").write_text("# old")
-        # DB created later — should be fresh
-        import time as _t
-        _t.sleep(0.05)
+        # DB created after the source; the 1-hour staleness grace
+        # makes sub-second creation-order skew irrelevant either way
+        # (the sibling tests pin ordering explicitly with os.utime).
         db = tmp_path / "db"
         db.mkdir()
         (db / "codeql-database.yml").write_text("")
         assert _db_is_stale(db, repo) is False
+
+    def test_skip_dirs_are_pruned_not_visited(self, tmp_path, monkeypatch):
+        """The docstring promises a bounded walk: skip dirs must be
+        PRUNED (never descended into), not merely filtered after a
+        full visit — pre-fix, rglob('*') lstat-walked every entry of
+        a packfile-heavy .git or giant node_modules before 200
+        countable files were found."""
+        import os as _os
+
+        import packages.llm_analysis.dataflow_validation as dv
+
+        db = tmp_path / "db"
+        db.mkdir()
+        (db / "codeql-database.yml").write_text("")
+        repo = tmp_path / "repo"
+        (repo / "node_modules" / "dep").mkdir(parents=True)
+        for i in range(50):
+            (repo / "node_modules" / "dep" / f"m{i}.js").write_text("x")
+        (repo / "src").mkdir()
+        (repo / "src" / "a.py").write_text("# src")
+
+        visited: list[str] = []
+        real_walk = _os.walk
+
+        def spy_walk(top, *a, **k):
+            for dirpath, dirnames, filenames in real_walk(top, *a, **k):
+                visited.append(str(dirpath))
+                yield dirpath, dirnames, filenames
+
+        monkeypatch.setattr(dv.os, "walk", spy_walk)
+        dv._db_is_stale(db, repo)
+        assert visited, "walk never ran"
+        assert not any("node_modules" in v for v in visited)
 
     def test_db_older_than_source_is_stale(self, tmp_path):
         # Create DB first, then touch source
@@ -272,6 +305,49 @@ class TestDbFreshness:
         import os
         # Make the source file far newer than the DB (beyond grace)
         future = src.stat().st_mtime + 7200  # 2 hours later
+        os.utime(src, (future, future))
+        assert _db_is_stale(db, repo) is True
+
+    def test_git_metadata_never_mints_staleness(self, tmp_path):
+        """Any git operation after the DB build touches `.git/`
+        objects — pre-fix the unfiltered first-200 rglob sample read
+        that as source freshness and warned on every post-build
+        fetch/gc/status."""
+        import os
+
+        db = tmp_path / "db"
+        db.mkdir()
+        (db / "codeql-database.yml").write_text("")
+        repo = tmp_path / "repo"
+        (repo / ".git" / "objects").mkdir(parents=True)
+        (repo / "a.py").write_text("# old")
+        git_obj = repo / ".git" / "objects" / "pack1"
+        git_obj.write_text("packed")
+        future = git_obj.stat().st_mtime + 7200
+        os.utime(git_obj, (future, future))
+        assert _db_is_stale(db, repo) is False
+
+    def test_deep_source_edit_still_sampled(self, tmp_path):
+        """Mirror direction: skipping metadata dirs frees the sample
+        budget for real source — a fresh edit under a skipped-dir
+        SIBLING must still classify stale even when `.git/` carries
+        more than the whole sample cap."""
+        import os
+
+        db = tmp_path / "db"
+        db.mkdir()
+        (db / "codeql-database.yml").write_text("")
+        repo = tmp_path / "repo"
+        (repo / ".git" / "objects").mkdir(parents=True)
+        # More .git entries than the 200-file cap: pre-fix these
+        # exhausted the sample before any source file was seen.
+        for i in range(250):
+            (repo / ".git" / "objects" / f"o{i:03d}").write_text("x")
+        deep = repo / "src" / "pkg" / "mod"
+        deep.mkdir(parents=True)
+        src = deep / "edited.py"
+        src.write_text("# fresh edit")
+        future = src.stat().st_mtime + 7200
         os.utime(src, (future, future))
         assert _db_is_stale(db, repo) is True
 
@@ -376,10 +452,21 @@ class TestTierSelection:
             matches=[{"file": "other_file.py", "line": 200}],
             summary="1 match in 1 file",
         )
-        # Tier 2 → no matches → refuted
-        adapter.run.return_value = ToolEvidence(
+        # Tier 2 → no matches → refuted. Vacuity probes see non-empty
+        # endpoint models so the refutation stands (the vacuity
+        # control has its own tests in TestTier2VacuityControl).
+        empty = ToolEvidence(
             tool="codeql", rule="<template>", success=True,
             matches=[], summary="no matches",
+        )
+        probe_hit = ToolEvidence(
+            tool="codeql", rule="<probe>", success=True,
+            matches=[{"file": "x.py", "line": 1, "message": "n"}],
+            summary="1 match",
+        )
+        adapter.run.side_effect = (
+            lambda rule, *a, **k:
+            probe_hit if "IRIS is" in str(rule) else empty
         )
 
         llm = MagicMock()
@@ -400,7 +487,8 @@ class TestTierSelection:
         assert tier == "template"
         assert result.verdict == "refuted"
         adapter.run_prebuilt_query.assert_called_once()
-        adapter.run.assert_called_once()
+        # Flow query + 2 vacuity probes on the zero-flow refutation.
+        assert adapter.run.call_count == 3
 
     def test_prebuilt_no_matches_falls_through_to_tier2(self):
         """Tier 1's source model may not cover the LLM's claim (e.g.
@@ -677,6 +765,106 @@ class TestTierSelection:
         assert adapter.run.call_count == 1
 
 
+class TestTier2VacuityControl:
+    """Zero-flow Tier 2 refutations must survive a predicate-vacuity
+    control: an LLM-written isSource/isSink body that selects zero
+    nodes anywhere makes 'no flow' vacuously true — the coverage gate
+    (file/function presence) cannot see that, and the refuted verdict
+    would drive recommends_downgrade into a hard downgrade."""
+
+    def _db(self, tmp_path):
+        import zipfile
+        db = tmp_path / "db"
+        db.mkdir()
+        (db / "codeql-database.yml").write_text("")
+        with zipfile.ZipFile(db / "src.zip", "w") as zf:
+            zf.writestr("repo/x.py", "def f():\n    pass\n")
+        from packages.llm_analysis.dataflow_validation import _db_indexed_files
+        _db_indexed_files.cache_clear()
+        return db
+
+    def _run(self, tmp_path, adapter_returns):
+        from packages.hypothesis_validation import Hypothesis
+        h = Hypothesis(claim="user input flows to sink",
+                       target=Path("/repo"), cwe="CWE-9999")
+        # No function name → layer-2 coverage passes; python → layer 3
+        # disabled: the coverage gate is POSITIVELY ok, so pre-fix the
+        # zero-match run minted "refuted".
+        f = {"file_path": "x.py", "start_line": 10, "tool": "semgrep"}
+        adapter = MagicMock()
+        adapter._database_path = self._db(tmp_path)
+        adapter.run.side_effect = adapter_returns
+        llm = MagicMock()
+        llm.generate_structured.return_value = {
+            "source_predicate_body": "none()",
+            "sink_predicate_body": "exists(Call c)",
+            "expected_evidence": "...", "reasoning": "...",
+        }
+        with patch(
+            "packages.llm_analysis.dataflow_validation.discover_prebuilt_query",
+            return_value=None,
+        ):
+            result, tier = _validate_one_hypothesis(
+                h, f, adapter, llm, deep_validate=True,
+            )
+        return result, tier, adapter
+
+    @staticmethod
+    def _ev(matches):
+        from packages.hypothesis_validation.adapters.base import ToolEvidence
+        return ToolEvidence(tool="codeql", rule="...", success=True,
+                            matches=matches, summary=f"{len(matches)} match(es)")
+
+    def test_vacuous_source_withholds_refutation(self, tmp_path):
+        result, tier, adapter = self._run(
+            tmp_path, [self._ev([]), self._ev([])],  # flow, isSource probe
+        )
+        assert tier == "template"
+        assert result.verdict == "inconclusive"
+        assert "vacuous source model" in result.reasoning
+        assert adapter.run.call_count == 2
+        probe_rule = adapter.run.call_args_list[1].args[0]
+        assert "IrisConfig::isSource(n)" in probe_rule
+
+    def test_vacuous_sink_withholds_refutation(self, tmp_path):
+        node = [{"file": "x.py", "line": 1, "message": "n"}]
+        result, tier, adapter = self._run(
+            tmp_path,
+            [self._ev([]), self._ev(node), self._ev([])],
+        )
+        assert result.verdict == "inconclusive"
+        assert "vacuous sink model" in result.reasoning
+        assert adapter.run.call_count == 3
+        assert "IrisConfig::isSink(n)" in adapter.run.call_args_list[2].args[0]
+
+    def test_nonvacuous_zero_flow_still_refutes(self, tmp_path):
+        # Two-direction: when both endpoint models demonstrably select
+        # nodes, the zero-flow refutation stands.
+        node = [{"file": "x.py", "line": 1, "message": "n"}]
+        result, tier, adapter = self._run(
+            tmp_path,
+            [self._ev([]), self._ev(node), self._ev(node)],
+        )
+        assert result.verdict == "refuted"
+        assert adapter.run.call_count == 3
+
+    def test_probe_failure_refuses_to_refute(self, tmp_path):
+        from packages.hypothesis_validation.adapters.base import ToolEvidence
+        failed = ToolEvidence(tool="codeql", rule="...", success=False,
+                              error="evaluator crashed", matches=[])
+        result, tier, adapter = self._run(
+            tmp_path, [self._ev([]), failed],
+        )
+        assert result.verdict == "inconclusive"
+        assert "vacuity probe failed" in result.reasoning
+
+    def test_confirmed_flow_pays_no_probe_cost(self, tmp_path):
+        match = [{"file": "x.py", "line": 10, "message": "flow"}]
+        result, tier, adapter = self._run(tmp_path, [self._ev(match)])
+        assert result.verdict == "confirmed"
+        assert adapter.run.call_count == 1
+
+
 class TestVerdictFromPrebuilt:
     def test_failed_tool_inconclusive(self):
         from packages.hypothesis_validation.adapters.base import ToolEvidence
@@ -839,11 +1027,14 @@ class TestVerdictFromPrebuilt:
         f = {"file_path": "x.py", "start_line": 10}
         assert _verdict_from_prebuilt(ev, f) == "inconclusive"
 
-    def test_basename_match_works(self):
-        """Path comparison uses basename, so absolute-vs-relative doesn't matter."""
+    def test_absolute_vs_relative_same_file_matches(self):
+        """Absolute-vs-relative spellings of the SAME file join on the
+        component-boundary suffix rule. (A bare basename match would
+        also accept a same-named file in a different directory — see
+        TestMatchAtFindingLocation.)"""
         from packages.hypothesis_validation.adapters.base import ToolEvidence
         ev = ToolEvidence(tool="codeql", rule="r", success=True,
-                          matches=[{"file": "/abs/path/to/x.py", "line": 10}])
+                          matches=[{"file": "/abs/path/src/x.py", "line": 10}])
         f = {"file_path": "src/x.py", "start_line": 10}
         assert _verdict_from_prebuilt(ev, f) == "confirmed"
 
@@ -1140,6 +1331,65 @@ class TestFindingFunctionInDb:
             )
         assert verdict == "no_check"
         mock_adapter_cls.assert_not_called()
+
+
+class TestDbSourceReadBudget:
+    """src.zip member reads serve a function-name word-boundary scan —
+    they get a scan-appropriate byte budget and a size-bounded memo,
+    not the substrate's general 64 MB cap retained 128 entries deep."""
+
+    def _fresh_cache(self, monkeypatch):
+        import packages.llm_analysis.dataflow_validation as dv
+        monkeypatch.setattr(dv, "_db_source_cache", {})
+        monkeypatch.setattr(dv, "_db_source_cache_chars", 0)
+        return dv
+
+    def _make_db(self, tmp_path, members):
+        import zipfile
+        db = tmp_path / "db"
+        db.mkdir()
+        with zipfile.ZipFile(db / "src.zip", "w") as zf:
+            for name, text in members.items():
+                # ZIP_STORED: keeps the oversized member's size honest
+                # (a deflated run of one byte would trip the
+                # compression-ratio check instead of the size budget).
+                zf.writestr(name, text, compress_type=zipfile.ZIP_STORED)
+        return db
+
+    def test_oversized_member_refuses_to_read(self, tmp_path, monkeypatch):
+        dv = self._fresh_cache(monkeypatch)
+        big = "x" * (dv._DB_SOURCE_MEMBER_CAP + 4096)
+        db = self._make_db(tmp_path, {"repo/big.c": big, "repo/ok.c": "int f;"})
+        assert dv._read_db_source(db, "repo/big.c") is None
+        # Two-direction: ordinary members still read.
+        assert dv._read_db_source(db, "repo/ok.c") == "int f;"
+
+    def test_oversized_member_blocks_refutation_not_confirmation(
+        self, tmp_path, monkeypatch,
+    ):
+        # The None read means 'can't verify' → the function-coverage
+        # layer conservatively passes (it blocks refutation only on
+        # POSITIVE evidence of absence) — no cascade-block.
+        import packages.llm_analysis.dataflow_validation as dv
+        self._fresh_cache(monkeypatch)
+        big = "x" * (dv._DB_SOURCE_MEMBER_CAP + 4096)
+        db = self._make_db(tmp_path, {"repo/big.c": big})
+        dv._db_indexed_files.cache_clear()
+        finding = {"file_path": "repo/big.c", "function_name": "handler"}
+        assert dv._finding_function_in_db(finding, db) is True
+
+    def test_memo_is_size_bounded(self, tmp_path, monkeypatch):
+        dv = self._fresh_cache(monkeypatch)
+        monkeypatch.setattr(dv, "_DB_SOURCE_CACHE_BUDGET", 2500)
+        members = {f"repo/f{i}.c": ("x" * 1000) for i in range(6)}
+        db = self._make_db(tmp_path, members)
+        for name in members:
+            assert dv._read_db_source(db, name) == "x" * 1000
+        retained = sum(
+            len(v) for v in dv._db_source_cache.values() if v
+        )
+        assert retained <= 2500 + 1000  # budget + at most the newest entry
+        assert len(dv._db_source_cache) < 6  # old entries evicted
 
 
 class TestCallableInventoryProbe:
@@ -1482,6 +1732,29 @@ class TestMatchAtFindingLocation:
         matches = [{"file": "vuln.c", "line": 42}]
         finding = {"file_path": "vuln.c", "start_line": 0}
         assert _any_match_at_finding_location(matches, finding)
+
+    def test_same_basename_other_directory_not_at_location(self):
+        # Two utils.py in a monorepo: a hit in the WRONG directory's
+        # file must not confirm the finding (pre-fix the comparison
+        # was basename-only, laundering an unrelated match into
+        # tool_backed corroboration).
+        matches = [{"file": "pkg_b/utils.py", "line": 100}]
+        finding = {"file_path": "pkg_a/utils.py", "start_line": 100}
+        assert not _any_match_at_finding_location(matches, finding)
+
+    def test_differently_rooted_same_file_still_matches(self):
+        # Project-relative finding vs repo-root-relative match of the
+        # SAME file joins on the component-boundary suffix rule.
+        matches = [{"file": "repo/src/app/utils.py", "line": 100}]
+        finding = {"file_path": "src/app/utils.py", "start_line": 100}
+        assert _any_match_at_finding_location(matches, finding)
+
+    def test_mid_component_suffix_not_a_match(self):
+        # webapp/main.py is NOT app/main.py — the suffix rule anchors
+        # to a path-component boundary.
+        matches = [{"file": "webapp/main.py", "line": 100}]
+        finding = {"file_path": "app/main.py", "start_line": 100}
+        assert not _any_match_at_finding_location(matches, finding)
 
 
 class TestSpecializedPromptGuidance:
@@ -1850,6 +2123,40 @@ class TestAttachResult:
         assert v["verdict"] == "inconclusive"
         assert v["recommends_downgrade"] is False
 
+    def test_llm_authored_tiers_stamp_llm_method(self):
+        # The method stamp must reflect the actual query author: Tier 2
+        # template, Tier 3 retry, and the legacy fallback all run
+        # LLM-WRITTEN queries through CodeQL — verification_tier must
+        # not read them as mechanically corroborated.
+        for tier in ("template", "retry", "template-failed", "fallback"):
+            analysis = {"is_exploitable": True}
+            _attach_result(
+                analysis, FakeValidationResult("refuted"), tier=tier,
+            )
+            v = analysis["dataflow_validation"]
+            assert v["method"] == "codeql-iris-llm", tier
+            assert v["tier"] == tier
+
+    def test_prebuilt_tier_stamps_mechanical_method(self):
+        for tier in ("prebuilt", "prebuilt-inconclusive", "skipped-deep"):
+            analysis = {"is_exploitable": True}
+            _attach_result(
+                analysis, FakeValidationResult("refuted"), tier=tier,
+            )
+            v = analysis["dataflow_validation"]
+            assert v["method"] == "codeql-iris", tier
+            assert v["tier"] == tier
+
+    def test_explicit_method_wins_over_tier_derivation(self):
+        analysis = {"is_exploitable": True}
+        _attach_result(
+            analysis, FakeValidationResult("refuted"),
+            method="structural-treesitter",
+        )
+        assert analysis["dataflow_validation"]["method"] == (
+            "structural-treesitter"
+        )
+
 
 class TestReconcileDataflowValidation:
     """reconcile_dataflow_validation() applies recommended downgrades after
@@ -1863,6 +2170,7 @@ class TestReconcileDataflowValidation:
                     "verdict": "refuted",
                     "reasoning": "no path",
                     "recommends_downgrade": True,
+                    "method": "codeql-iris",
                 },
             },
         }
@@ -1926,6 +2234,7 @@ class TestReconcileDataflowValidation:
                     "verdict": "refuted",
                     "reasoning": "no path",
                     "recommends_downgrade": True,
+                    "method": "codeql-iris",
                 },
             },
         }
@@ -1940,6 +2249,132 @@ class TestReconcileDataflowValidation:
         assert results_by_id["F1"]["validation_disputed"] is True
         assert "consensus" in results_by_id["F1"]["validation_disputed_by"]
 
+    def test_panel_verdict_without_votes_does_not_soften_downgrade(self):
+        """A bare consensus=="panel-verdict" stamp with no recorded
+        analyses carries no derivable model votes — no support, the
+        tool wins (hard). Genuine no-support stays hard."""
+        results_by_id = {
+            "F1": {
+                "is_exploitable": True,
+                "consensus": "panel-verdict",
+                "dataflow_validation": {
+                    "verdict": "refuted",
+                    "reasoning": "no path",
+                    "recommends_downgrade": True,
+                    "method": "codeql-iris",
+                },
+            },
+        }
+        m = reconcile_dataflow_validation(results_by_id)
+        assert m["n_hard_downgrades"] == 1
+        assert m["n_soft_downgrades"] == 0
+        assert results_by_id["F1"]["is_exploitable"] is False
+
+    def test_panel_verdict_two_votes_softens_downgrade(self):
+        """consensus=="panel-verdict" backed by two genuine True votes
+        is two model signals behind the current verdict — the same
+        weight as "agreed" (primary + one panel vote). Pre-fix the
+        stamp read as NO support and the finding hard-flipped while an
+        equal-support agreed finding took the soft path."""
+        results_by_id = {
+            "F1": {
+                "is_exploitable": True,
+                "consensus": "panel-verdict",
+                "consensus_analyses": [
+                    {"model": "m1", "is_exploitable": True,
+                     "reasoning": "r1"},
+                    {"model": "m2", "is_exploitable": True,
+                     "reasoning": "r2"},
+                ],
+                "confidence": "high",
+                "dataflow_validation": {
+                    "verdict": "refuted",
+                    "reasoning": "no path",
+                    "recommends_downgrade": True,
+                    "method": "codeql-iris",
+                },
+            },
+        }
+        m = reconcile_dataflow_validation(results_by_id)
+        assert m["n_hard_downgrades"] == 0
+        assert m["n_soft_downgrades"] == 1
+        assert results_by_id["F1"]["is_exploitable"] is True
+        assert results_by_id["F1"]["confidence"] == "low"
+        assert results_by_id["F1"]["validation_disputed"] is True
+        assert "consensus" in results_by_id["F1"]["validation_disputed_by"]
+
+    def test_panel_verdict_single_vote_stays_hard(self):
+        """A single-vote panel-verdict is one model's verdict with no
+        second signal — it loses to the tool exactly like an
+        unsupported primary."""
+        results_by_id = {
+            "F1": {
+                "is_exploitable": True,
+                "consensus": "panel-verdict",
+                "consensus_analyses": [
+                    {"model": "m1", "is_exploitable": True,
+                     "reasoning": "r1"},
+                ],
+                "dataflow_validation": {
+                    "verdict": "refuted",
+                    "reasoning": "no path",
+                    "recommends_downgrade": True,
+                    "method": "codeql-iris",
+                },
+            },
+        }
+        m = reconcile_dataflow_validation(results_by_id)
+        assert m["n_hard_downgrades"] == 1
+        assert m["n_soft_downgrades"] == 0
+        assert results_by_id["F1"]["is_exploitable"] is False
+
+    def test_panel_verdict_junk_votes_stay_hard(self):
+        """Junk / abstained entries in the recorded analyses are
+        non-votes (read_verdict) — a panel-verdict stamp cannot be
+        promoted to support by shapes that never voted."""
+        results_by_id = {
+            "F1": {
+                "is_exploitable": True,
+                "consensus": "panel-verdict",
+                "consensus_analyses": [
+                    {"model": "m1", "is_exploitable": "yes"},
+                    {"model": "m2", "is_exploitable": None},
+                    {"model": "m3", "is_exploitable": True},
+                ],
+                "dataflow_validation": {
+                    "verdict": "refuted",
+                    "reasoning": "no path",
+                    "recommends_downgrade": True,
+                    "method": "codeql-iris",
+                },
+            },
+        }
+        m = reconcile_dataflow_validation(results_by_id)
+        assert m["n_hard_downgrades"] == 1
+        assert m["n_soft_downgrades"] == 0
+
+    def test_judge_panel_verdict_two_votes_softens_downgrade(self):
+        results_by_id = {
+            "F1": {
+                "is_exploitable": True,
+                "judge": "panel-verdict",
+                "judge_analyses": [
+                    {"model": "j1", "is_exploitable": True},
+                    {"model": "j2", "is_exploitable": True},
+                ],
+                "dataflow_validation": {
+                    "verdict": "refuted",
+                    "reasoning": "no path",
+                    "recommends_downgrade": True,
+                    "method": "codeql-iris",
+                },
+            },
+        }
+        m = reconcile_dataflow_validation(results_by_id)
+        assert m["n_soft_downgrades"] == 1
+        assert results_by_id["F1"]["is_exploitable"] is True
+        assert results_by_id["F1"]["validation_disputed_by"] == ["judge"]
+
     def test_soft_downgrade_when_judge_agreed(self):
         results_by_id = {
             "F1": {
@@ -1950,6 +2385,7 @@ class TestReconcileDataflowValidation:
                     "verdict": "refuted",
                     "reasoning": "no path",
                     "recommends_downgrade": True,
+                    "method": "codeql-iris",
                 },
             },
         }
@@ -1968,6 +2404,7 @@ class TestReconcileDataflowValidation:
                     "verdict": "refuted",
                     "reasoning": "no path",
                     "recommends_downgrade": True,
+                    "method": "codeql-iris",
                 },
             },
         }
@@ -1987,6 +2424,7 @@ class TestReconcileDataflowValidation:
                     "verdict": "refuted",
                     "reasoning": "no path",
                     "recommends_downgrade": True,
+                    "method": "codeql-iris",
                 },
             },
         }
@@ -1995,6 +2433,135 @@ class TestReconcileDataflowValidation:
         assert results_by_id["F1"]["confidence"] == "low"
         # No pre_validation marker because we didn't change it
         assert "confidence_pre_validation" not in results_by_id["F1"]
+
+
+class TestReconcilePremiseHonesty:
+    """The HARD flip is reserved for validation verdicts whose query
+    premises were mechanical (dataflow_premises_mechanical — the same
+    predicate that grants tool_backed). An LLM-authored or unstamped
+    refutation keeps its full steering weight as a recorded dispute
+    with lowered confidence; only the terminal is_exploitable flip is
+    withheld."""
+
+    @staticmethod
+    def _finding(dv_extra: dict) -> dict:
+        dv = {
+            "verdict": "refuted",
+            "reasoning": "no path",
+            "recommends_downgrade": True,
+        }
+        dv.update(dv_extra)
+        return {
+            "is_exploitable": True,
+            "confidence": "high",
+            "dataflow_validation": dv,
+        }
+
+    def test_llm_authored_method_withholds_flip(self):
+        results_by_id = {
+            "F1": self._finding({"method": "codeql-iris-llm",
+                                 "tier": "template"}),
+        }
+        m = reconcile_dataflow_validation(results_by_id)
+        assert m["n_hard_downgrades"] == 0
+        assert m["n_soft_downgrades"] == 1
+        f = results_by_id["F1"]
+        # Verdict retained; the downgrade survives as a dispute.
+        assert f["is_exploitable"] is True
+        assert "is_exploitable_pre_validation" not in f
+        assert f["validation_disputed"] is True
+        assert f["validation_downgrade_withheld"] == "llm-authored-premises"
+        assert f["confidence"] == "low"
+        assert f["confidence_pre_validation"] == "high"
+
+    def test_llm_authored_tier_vetoes_miswired_mechanical_stamp(self):
+        """Belt-and-braces mirror of verification_tier: a method that
+        claims codeql-iris over an LLM-authored tier does not launder
+        the premises."""
+        results_by_id = {
+            "F1": self._finding({"method": "codeql-iris",
+                                 "tier": "retry"}),
+        }
+        m = reconcile_dataflow_validation(results_by_id)
+        assert m["n_hard_downgrades"] == 0
+        assert m["n_soft_downgrades"] == 1
+        f = results_by_id["F1"]
+        assert f["is_exploitable"] is True
+        assert f["validation_downgrade_withheld"] == "llm-authored-premises"
+
+    def test_missing_method_fails_closed(self):
+        results_by_id = {"F1": self._finding({})}
+        m = reconcile_dataflow_validation(results_by_id)
+        assert m["n_hard_downgrades"] == 0
+        assert m["n_soft_downgrades"] == 1
+        f = results_by_id["F1"]
+        assert f["is_exploitable"] is True
+        assert f["validation_downgrade_withheld"] == "missing-method"
+
+    def test_unrecognized_method_fails_closed(self):
+        results_by_id = {"F1": self._finding({"method": "future-lane"})}
+        m = reconcile_dataflow_validation(results_by_id)
+        assert m["n_hard_downgrades"] == 0
+        assert m["n_soft_downgrades"] == 1
+        assert results_by_id["F1"]["validation_downgrade_withheld"] == (
+            "unrecognized-method"
+        )
+
+    def test_mechanical_method_flips_byte_identical_otherwise(self):
+        """Preservation direction: the SAME finding with the mechanical
+        method stamp still takes the hard flip."""
+        results_by_id = {
+            "F1": self._finding({"method": "codeql-iris-llm",
+                                 "tier": "template"}),
+            "F2": self._finding({"method": "codeql-iris"}),
+        }
+        m = reconcile_dataflow_validation(results_by_id)
+        assert m["n_hard_downgrades"] == 1
+        assert m["n_soft_downgrades"] == 1
+        assert results_by_id["F1"]["is_exploitable"] is True
+        assert results_by_id["F2"]["is_exploitable"] is False
+        assert results_by_id["F2"]["is_exploitable_pre_validation"] is True
+
+    def test_structural_treesitter_keeps_hard_path(self):
+        results_by_id = {
+            "F1": self._finding({"method": "structural-treesitter"}),
+        }
+        m = reconcile_dataflow_validation(results_by_id)
+        assert m["n_hard_downgrades"] == 1
+        f = results_by_id["F1"]
+        assert f["is_exploitable"] is False
+        assert "Tree-sitter" in f["validation_downgrade_reason"]
+
+    def test_iris_tier1_keeps_hard_path(self):
+        results_by_id = {
+            "F1": self._finding({"method": "codeql-iris",
+                                 "tier": "iris_tier1"}),
+        }
+        m = reconcile_dataflow_validation(results_by_id)
+        assert m["n_hard_downgrades"] == 1
+        assert results_by_id["F1"]["is_exploitable"] is False
+
+    def test_consensus_soft_gate_still_first(self):
+        """An LLM-authored refutation on a consensus-affirmed finding
+        takes the existing consensus soft path (disputed_by recorded),
+        not the withheld annotation."""
+        f = self._finding({"method": "codeql-iris-llm", "tier": "template"})
+        f["consensus"] = "agreed"
+        results_by_id = {"F1": f}
+        m = reconcile_dataflow_validation(results_by_id)
+        assert m["n_soft_downgrades"] == 1
+        assert f["validation_disputed_by"] == ["consensus"]
+        assert "validation_downgrade_withheld" not in f
+
+    def test_withheld_path_never_drops_the_validation_block(self):
+        """Absence-of-authority direction: withholding annotates; it
+        never deletes the refutation record or its reasoning."""
+        results_by_id = {"F1": self._finding({"method": "codeql-iris-llm"})}
+        reconcile_dataflow_validation(results_by_id)
+        dv = results_by_id["F1"]["dataflow_validation"]
+        assert dv["verdict"] == "refuted"
+        assert dv["reasoning"] == "no path"
+        assert dv["recommends_downgrade"] is True
 
 
 # Budget guard ----------------------------------------------------------------
@@ -2178,6 +2745,20 @@ class TestValidateDataflowClaims:
             tool="codeql", rule="<r>", success=True,
             matches=[], summary="no matches",
         )
+        probe_hit = ToolEvidence(
+            tool="codeql", rule="<probe>", success=True,
+            matches=[{"file": "x.c", "line": 1, "message": "n"}],
+            summary="1 match",
+        )
+
+        def _adapter_run(rule, *a, **k):
+            # Vacuity probes see non-empty endpoint models so the
+            # zero-flow refutation stands (the vacuity control has
+            # its own tests in TestTier2VacuityControl).
+            if "IRIS is" in str(rule):
+                return probe_hit
+            return empty
+
         llm_client = MagicMock()
         llm_client.generate_structured.return_value = {
             "source_predicate_body": "n instanceof X",
@@ -2189,7 +2770,7 @@ class TestValidateDataflowClaims:
             return_value=True,
         ), patch(
             "packages.hypothesis_validation.adapters.CodeQLAdapter.run",
-            return_value=empty,
+            side_effect=_adapter_run,
         ):
             m = validate_dataflow_claims(
                 findings=[{"finding_id": "F1", "tool": "semgrep",
@@ -2223,6 +2804,17 @@ class TestValidateDataflowClaims:
         }
         ev = ToolEvidence(tool="codeql", rule="<r>", success=True,
                           matches=[], summary="no matches")
+        probe_hit = ToolEvidence(
+            tool="codeql", rule="<probe>", success=True,
+            matches=[{"file": "a.c", "line": 1, "message": "n"}],
+            summary="1 match",
+        )
+
+        def _adapter_run(rule, *a, **k):
+            # Non-vacuous endpoint models: the zero-flow refutation
+            # stands (vacuity control tested in TestTier2VacuityControl).
+            return probe_hit if "IRIS is" in str(rule) else ev
+
         llm_client = MagicMock()
         llm_client.generate_structured.return_value = {
             "source_predicate_body": "n instanceof X",
@@ -2241,7 +2833,7 @@ class TestValidateDataflowClaims:
             return_value=True,
         ), patch(
             "packages.hypothesis_validation.adapters.CodeQLAdapter.run",
-            return_value=ev,
+            side_effect=_adapter_run,
         ) as mock_run:
             m = validate_dataflow_claims(
                 findings=[
@@ -2256,8 +2848,9 @@ class TestValidateDataflowClaims:
                 llm_client=llm_client,
                 deep_validate=True,
             )
-        # F1: 1 Tier 2 call. F2: cache hit, 0 calls.
-        assert mock_run.call_count == 1
+        # F1: 1 Tier 2 flow call + 2 vacuity probes on its zero-flow
+        # refutation. F2: cache hit, 0 calls.
+        assert mock_run.call_count == 3
         assert m["n_validated"] == 1
         assert m["n_cache_hits"] == 1
         assert m["n_eligible"] == 2
@@ -2631,35 +3224,40 @@ class TestCrossFamilyResolution:
 class TestCLIFlag:
     """CLI flag wiring after the rename: --no-validate-dataflow opts
     OUT (default is on), --deep-validate opts INTO Tier 2/3 LLM tiers,
-    --deep-validate-budget caps Tier 2/3 LLM cost."""
+    --deep-validate-budget caps Tier 2/3 LLM cost.
+
+    Asserted against the REAL /agentic parser
+    (``raptor_agentic.build_parser``) — the previous tests declared
+    fresh look-alike parsers inline, certifying argparse itself while
+    RAPTOR's actual flag declarations went untested."""
+
+    @staticmethod
+    def _parse(*argv):
+        import raptor_agentic
+        return raptor_agentic.build_parser().parse_args(
+            ["--repo", "x", *argv],
+        )
 
     def test_no_validate_dataflow_flag_default_is_false(self):
-        import argparse
-        parser = argparse.ArgumentParser()
-        parser.add_argument("--no-validate-dataflow", action="store_true")
-        args = parser.parse_args([])
-        assert args.no_validate_dataflow is False
+        assert self._parse().no_validate_dataflow is False
 
     def test_no_validate_dataflow_flag_when_set_is_true(self):
-        import argparse
-        parser = argparse.ArgumentParser()
-        parser.add_argument("--no-validate-dataflow", action="store_true")
-        args = parser.parse_args(["--no-validate-dataflow"])
-        assert args.no_validate_dataflow is True
+        assert self._parse(
+            "--no-validate-dataflow").no_validate_dataflow is True
 
     def test_deep_validate_flag_default_is_false(self):
-        import argparse
-        parser = argparse.ArgumentParser()
-        parser.add_argument("--deep-validate", action="store_true")
-        args = parser.parse_args([])
+        args = self._parse()
         assert args.deep_validate is False
+        assert args.no_deep_validate is False
 
     def test_deep_validate_flag_when_set_is_true(self):
-        import argparse
-        parser = argparse.ArgumentParser()
-        parser.add_argument("--deep-validate", action="store_true")
-        args = parser.parse_args(["--deep-validate"])
-        assert args.deep_validate is True
+        assert self._parse("--deep-validate").deep_validate is True
+
+    def test_deep_validate_mutex_rejects_contradiction(self):
+        """--deep-validate + --no-deep-validate is argparse-rejected
+        (the mutex group), not silently resolved downstream."""
+        with pytest.raises(SystemExit):
+            self._parse("--deep-validate", "--no-deep-validate")
 
     def test_orchestrate_signature_accepts_new_flags(self):
         """orchestrate() must accept the new flag shape without TypeError."""
@@ -2688,26 +3286,10 @@ class TestOrchestratorIntegration:
     run_validation_pass and reconcile_dataflow_validation in the right
     order. Heavy mocking — full orchestration is too much surface."""
 
-    def test_validate_dataflow_false_skips_helpers(self, tmp_path):
-        """When validate_dataflow=False, neither helper should be called."""
-        # We can't easily mount a full orchestrate() call, but we can
-        # verify that a False flag doesn't trigger the import path.
-        # This is a smoke check; full integration is left to manual /agentic.
-        import packages.llm_analysis.dataflow_validation as dv
-        with patch.object(dv, "run_validation_pass") as mock_run, \
-             patch.object(dv, "reconcile_dataflow_validation") as mock_reconcile:
-            # Simulate: orchestrator gates on validate_dataflow before calling.
-            validate_dataflow = False
-            if validate_dataflow:  # pragma: no cover
-                dv.run_validation_pass(
-                    findings=[], results_by_id={}, out_dir=tmp_path,
-                    repo_path=tmp_path, dispatch_fn=MagicMock(),
-                    analysis_model=None, role_resolution={},
-                    dispatch_mode="external_llm",
-                )
-                dv.reconcile_dataflow_validation({})
-            mock_run.assert_not_called()
-            mock_reconcile.assert_not_called()
+    # The former "validate_dataflow=False skips helpers" test asserted
+    # mocks stayed uncalled after a test-local dead branch — vacuous.
+    # The real gate is now driven end-to-end through orchestrate() in
+    # test_orchestrator.py::TestDataflowValidationGate.
 
     def test_reconciliation_runs_after_validation(self, tmp_path):
         """Reconciliation must be applied AFTER all analysis-stage tasks
@@ -2722,6 +3304,7 @@ class TestOrchestratorIntegration:
                        "verdict": "refuted",
                        "reasoning": "no path",
                        "recommends_downgrade": True,
+                       "method": "codeql-iris",
                    }},
             # Consensus already flipped to False — reconciliation
             # must NOT double-apply
@@ -2730,6 +3313,7 @@ class TestOrchestratorIntegration:
                        "verdict": "refuted",
                        "reasoning": "no path",
                        "recommends_downgrade": True,
+                       "method": "codeql-iris",
                    }},
             # No validation block at all
             "F3": {"is_exploitable": True},
@@ -3228,16 +3812,29 @@ class TestUsageDrivenDeepValidate:
     Tri-state precedence: disabled > forced-on > auto."""
 
     def _decide(self, *, analysis, deep_validate=False, deep_validate_disabled=False):
-        """Mirror the production decision logic."""
-        if deep_validate_disabled:
-            return False
-        if deep_validate:
-            return True
-        nested_dv = (analysis or {}).get("dataflow_validation") or {}
-        return bool(
-            nested_dv.get("path_conditions")
-            or (analysis or {}).get("path_conditions")
+        """Drive the PRODUCTION tri-state gate (a local re-implementation
+        here previously asserted on its own copy — regressions in the
+        real precedence logic could not fire)."""
+        import packages.llm_analysis.dataflow_validation as dv
+        effective, _auto = dv._effective_deep_validate(
+            analysis,
+            deep_validate=deep_validate,
+            deep_validate_disabled=deep_validate_disabled,
         )
+        return effective
+
+    def test_auto_enable_flag_reported_only_for_auto(self):
+        """auto_enabled feeds the n_deep_validate_auto_enabled metric:
+        True only on the signal-driven path, never for forced-on."""
+        import packages.llm_analysis.dataflow_validation as dv
+        assert dv._effective_deep_validate(
+            {"path_conditions": ["x > 1"]},
+            deep_validate=False, deep_validate_disabled=False,
+        ) == (True, True)
+        assert dv._effective_deep_validate(
+            {"path_conditions": ["x > 1"]},
+            deep_validate=True, deep_validate_disabled=False,
+        ) == (True, False)
 
     def test_disabled_overrides_forced_on(self):
         """--no-deep-validate is the hard kill switch — wins even
@@ -3959,6 +4556,17 @@ class TestCacheKeyIncludesTierInputs:
         }
         ev = ToolEvidence(tool="codeql", rule="<r>", success=True,
                           matches=[], summary="no matches")
+        probe_hit = ToolEvidence(
+            tool="codeql", rule="<probe>", success=True,
+            matches=[{"file": "a.c", "line": 1, "message": "n"}],
+            summary="1 match",
+        )
+
+        def _adapter_run(rule, *a, **k):
+            # Non-vacuous endpoint models: the zero-flow refutation
+            # stands (vacuity control tested in TestTier2VacuityControl).
+            return probe_hit if "IRIS is" in str(rule) else ev
+
         llm_client = MagicMock()
         llm_client.generate_structured.return_value = {
             "source_predicate_body": "n instanceof X",
@@ -3973,7 +4581,7 @@ class TestCacheKeyIncludesTierInputs:
             return_value=True,
         ), patch(
             "packages.hypothesis_validation.adapters.CodeQLAdapter.run",
-            return_value=ev,
+            side_effect=_adapter_run,
         ) as mock_run:
             m = validate_dataflow_claims(
                 findings=[
@@ -3988,11 +4596,12 @@ class TestCacheKeyIncludesTierInputs:
                 llm_client=llm_client,
             )
         # F1: default gate off → Tier 2/3 skipped (no adapter.run).
-        # F2: auto-gate on (path_conditions) → its OWN Tier 2 run.
+        # F2: auto-gate on (path_conditions) → its OWN Tier 2 run
+        # (flow query + 2 vacuity probes on the zero-flow refutation).
         assert m["n_cache_hits"] == 0
         assert m["n_validated"] == 2
         assert m["n_deep_validate_auto_enabled"] == 1
-        assert mock_run.call_count == 1  # F2's tier 2 run only
+        assert mock_run.call_count == 3  # F2's tier 2 run only
 
     def test_smt_witness_attached_to_every_duplicate_finding(self, tmp_path):
         """Cache hits still get the per-finding Tier 4 side-band: the

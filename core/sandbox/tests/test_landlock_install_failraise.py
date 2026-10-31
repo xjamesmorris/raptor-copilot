@@ -108,6 +108,94 @@ def test_fail_raise_mode_raises_typed_error():
     assert "SYS_landlock_create_ruleset failed post-fork" in r.stderr
 
 
+def test_fail_raise_message_truthful_when_probe_failed():
+    """The builder is invoked on kernels whose probe FAILED too — when
+    the resolved containment floor requires the Landlock layer, _spawn
+    builds the ruleset regardless so the spawn fails closed instead of
+    delivering an unconsented weaker tier. The create-failure message
+    must tell that story: pre-fix it unconditionally claimed the
+    failure happened on 'a kernel whose probe succeeded', misdirecting
+    the operator toward a kernel anomaly on every Landlock-less host
+    (the no-Landlock lane shape) instead of naming the actual
+    fail-closed contract and its remedies."""
+    r = _run_driver("""
+        from core.sandbox import state as _state
+        from core.sandbox.landlock import (
+            LandlockInstallError, _make_landlock_preexec,
+        )
+        # This kernel's availability verdict: unavailable. On a host
+        # WITH Landlock the CDLL wrapper still fails the creation the
+        # same way the ENOSYS lane's kernel does; on a host without
+        # it, creation fails naturally.
+        _state._landlock_cache = -1
+        fn = _make_landlock_preexec(["/tmp"], fail_raise=True)
+        try:
+            fn()
+        except LandlockInstallError as e:
+            msg = str(e)
+            assert "probe succeeded" not in msg, msg
+            assert "containment floor requires" in msg, msg
+            assert "ns-only tier" in msg, msg
+            print("TRUTHFUL-PROBE-FAILED-MESSAGE")
+    """)
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert "TRUTHFUL-PROBE-FAILED-MESSAGE" in r.stdout
+    assert "SYS_landlock_create_ruleset failed post-fork" in r.stderr
+
+
+def test_fail_closed_message_names_the_wsl_consent_on_wsl():
+    """On a WSL host the fail-closed create-failure message
+    additionally names the standing host-scoped consent ceremony —
+    the refusal is the boundary where a WSL operator learns the
+    documented way out. The hint is resolved in the PARENT at build
+    time (fork-safety), so patching the detection before the builder
+    runs is exactly the real WSL shape."""
+    r = _run_driver("""
+        import core.startup.wsl as _wsl
+        _wsl.is_wsl = lambda kernel_id=None: True
+        from core.sandbox import state as _state
+        from core.sandbox.landlock import (
+            LandlockInstallError, _make_landlock_preexec,
+        )
+        _state._landlock_cache = -1
+        fn = _make_landlock_preexec(["/tmp"], fail_raise=True)
+        try:
+            fn()
+        except LandlockInstallError as e:
+            msg = str(e)
+            assert "wsl-consent grant" in msg, msg
+            assert "TTY-gated" in msg, msg
+            assert "docs/wsl.md" in msg, msg
+            print("WSL-HINT-PRESENT")
+    """)
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert "WSL-HINT-PRESENT" in r.stdout
+
+
+def test_fail_closed_message_has_no_wsl_hint_off_wsl():
+    """Off WSL the message keeps its exact generic shape — no
+    misdirecting consent hint on ordinary Landlock-less hosts."""
+    r = _run_driver("""
+        import core.startup.wsl as _wsl
+        _wsl.is_wsl = lambda kernel_id=None: False
+        from core.sandbox import state as _state
+        from core.sandbox.landlock import (
+            LandlockInstallError, _make_landlock_preexec,
+        )
+        _state._landlock_cache = -1
+        fn = _make_landlock_preexec(["/tmp"], fail_raise=True)
+        try:
+            fn()
+        except LandlockInstallError as e:
+            msg = str(e)
+            assert "wsl-consent" not in msg, msg
+            assert msg.endswith("admits the ns-only tier."), msg
+            print("NO-WSL-HINT")
+    """)
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert "NO-WSL-HINT" in r.stdout
+
+
 def test_default_mode_keeps_fork_safe_exit():
     """fail_raise omitted (preexec_fn lane): the same failure keeps the
     documented os._exit(126) + one-line stderr shape."""

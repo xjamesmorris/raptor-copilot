@@ -264,6 +264,29 @@ class TestBudget:
         assert stats["examined"] == 0
         assert not (out / "suppressions.jsonl").exists()
 
+    @requires_ts("java")
+    def test_budget_expiry_inside_candidate_loop_skips_finding(
+            self, tmp_path, monkeypatch):
+        """The wall budget is consulted PER CANDIDATE too: a finding
+        whose evaluation is in flight when the budget runs out is
+        skipped (never suppressed on partial candidate verdicts).
+        Clock: 0 at start and the finding-level check, expired from
+        the first candidate check on."""
+        import core.analysis.sanitizer_cut_postpass as scp
+        repo, _, sarif_path, out = _write(tmp_path, _SAFE_JAVA)
+        ticks = iter([0.0, 0.0])
+
+        def fake_monotonic():
+            return next(ticks, 1e9)
+
+        monkeypatch.setattr(scp.time, "monotonic", fake_monotonic)
+        stats = run_postpass([sarif_path], repo, out,
+                             budget_seconds=180.0)
+        assert stats["budget_exhausted_skips"] == 1
+        assert stats["recorded_suppress"] == 0
+        assert stats["enforced"] == 0
+        assert not (out / "suppressions.jsonl").exists()
+
 
 class TestScannerWiring:
     def test_flag_and_gate_present(self):
@@ -359,6 +382,7 @@ class TestGrammarAbsentDegradation:
         repo.mkdir()
         src = repo / "app.py"
         src.write_text(
+            "import html\n"
             "def handle():\n"
             "    x = request.args.get('q')\n"
             "    y = html.escape(x)\n"
@@ -366,7 +390,7 @@ class TestGrammarAbsentDegradation:
             encoding="utf-8",
         )
         sarif_path = tmp_path / "scan.sarif"
-        sarif_path.write_text(json.dumps(_sarif(src, sink_line=4)))
+        sarif_path.write_text(json.dumps(_sarif(src, sink_line=5)))
         out = tmp_path / "out"
         out.mkdir()
         stats = run_postpass([sarif_path], repo, out)
@@ -494,6 +518,74 @@ class TestTfSystemReadBan:
         assert stats["examined"] == 1
         assert stats["recorded_suppress"] == 0
 
+    def test_trace_env_source_banned_in_source_dense_file(self, tmp_path):
+        # The trace-classification lookup must not ride the candidate
+        # cap: with more than _MAX_CANDIDATE_SOURCES source-shaped
+        # lines in the file, the capped view returns nothing, the
+        # trace's getenv line classifies as no kind, and the TF tier
+        # discharges the finding's own source — the b42 failure mode,
+        # back through the trace door.
+        env_dense = """public class Test {
+    void run() {
+        String data = System.getenv("ADD");
+        java.io.File f = new java.io.File(data);
+    }
+    void other(javax.servlet.http.HttpServletRequest r) {
+        String a1 = r.getParameter("a1");
+        String a2 = r.getParameter("a2");
+        String a3 = r.getParameter("a3");
+        String a4 = r.getParameter("a4");
+        String a5 = r.getParameter("a5");
+    }
+}
+"""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        src = repo / "Test.java"
+        src.write_text(env_dense)
+        sarif = _sarif(src, cwe="cwe-22", sink_line=4, rule_id="pathtrav")
+        result = sarif["runs"][0]["results"][0]
+        result["codeFlows"] = [{"threadFlows": [{"locations": [
+            {"location": {"physicalLocation": {
+                "artifactLocation": {"uri": str(src)},
+                "region": {"startLine": 3}}}},
+            {"location": {"physicalLocation": {
+                "artifactLocation": {"uri": str(src)},
+                "region": {"startLine": 4}}}},
+        ]}]}]
+        sarif_path = tmp_path / "scan.sarif"
+        sarif_path.write_text(json.dumps(sarif))
+        out = tmp_path / "out"
+        out.mkdir()
+        stats = run_postpass([sarif_path], repo, out)
+        assert stats["examined"] == 1
+        assert stats["recorded_suppress"] == 0
+        assert stats["mechanism_counts"].get(
+            "taint-free:banned-system-read-source") == 1
+
+    def test_candidate_cap_still_bounds_traceless_findings(self, tmp_path):
+        # Other direction of the threshold: without a trace, the same
+        # source-dense file still refuses on candidate fan-out — the
+        # single-line classification fix must not widen enumeration.
+        dense = """public class Test {
+    void run(javax.servlet.http.HttpServletRequest r) {
+        String a1 = r.getParameter("a1");
+        String a2 = r.getParameter("a2");
+        String a3 = r.getParameter("a3");
+        String a4 = r.getParameter("a4");
+        String a5 = r.getParameter("a5");
+        java.io.File f = new java.io.File(a1);
+    }
+}
+"""
+        repo, _, sarif_path, out = _write(
+            tmp_path, dense,
+            {"cwe": "cwe-22", "sink_line": 8, "rule_id": "pathtrav"},
+        )
+        stats = run_postpass([sarif_path], repo, out)
+        assert stats["examined"] == 1
+        assert stats["refused_reasons"].get("no-source-candidates") == 1
+
     def test_non_source_tf_union_still_suppresses(self, tmp_path):
         # File.separator is never a locator source kind: a servlet-
         # source finding whose sink value unions {separator, "/opt"}
@@ -519,10 +611,17 @@ class TestEnforcementBoundaries:
     2026-08-19): candidates can never enforce; the SARIF filter is
     conservative and no-op-on-failure."""
 
+    @requires_ts("java")
     def test_candidate_only_never_enforces(self, tmp_path):
         # A candidate_only verdict must record dropped: false even with
         # enforcement on — the enforce=True call is structurally
         # reachable only from the full-proof suppress branch.
+        #
+        # The fixture must PROVABLY land on candidate_only: the array
+        # escapes to an unknown callee between sanitisation and sink,
+        # so the cleaned value's identity at the sink is unprovable
+        # (the earlier element-direct-read shape graduated to full
+        # suppress, which silently skipped every assertion below).
         src = """import javax.servlet.http.HttpServletRequest;
 import org.owasp.encoder.Encode;
 public class Test {
@@ -530,22 +629,30 @@ public class Test {
         String p = request.getParameter("q");
         String[] arr = new String[2];
         arr[0] = Encode.forHtml(p);
+        helper(arr);
         out.println(arr[0]);
     }
+    void helper(String[] a) { }
 }
 """
-        repo, _, sarif_path, out = _write(tmp_path, src, {"sink_line": 8})
+        repo, _, sarif_path, out = _write(tmp_path, src, {"sink_line": 9})
         stats = run_postpass([sarif_path], repo, out, enforce=True)
-        if stats["recorded_candidate"]:
-            import json as _json
-            recs = [
-                _json.loads(line) for line in
-                (out / "suppressions.jsonl").read_text().splitlines()
-            ]
-            assert all(r["dropped"] is False for r in recs)
-            assert all(r["enforced"] is False for r in recs)
-        assert stats["enforced_findings"] == [] or stats["enforced"] == len(
-            stats["enforced_findings"])
+        # Precondition, asserted so a gate graduation can never make
+        # this test vacuous again.
+        assert stats["recorded_candidate"] == 1, (
+            f"fixture no longer lands on candidate_only: {stats}"
+        )
+        assert stats["recorded_suppress"] == 0
+        assert stats["enforced"] == 0
+        assert stats["enforced_findings"] == []
+        import json as _json
+        recs = [
+            _json.loads(line) for line in
+            (out / "suppressions.jsonl").read_text().splitlines()
+        ]
+        assert recs, "candidate_only verdict must still be recorded"
+        assert all(r["dropped"] is False for r in recs)
+        assert all(r["enforced"] is False for r in recs)
 
     def test_filter_removes_exact_match_only(self, tmp_path):
         import json as _json
@@ -575,6 +682,69 @@ public class Test {
                  r["locations"][0]["physicalLocation"]["region"]["startLine"])
                 for r in kept} == {("r1", 9), ("r2", 8)}
 
+    def test_filter_bare_basename_never_matches_across_dirs(
+            self, tmp_path):
+        """Both directions of the suffix-tolerance trade-off. A
+        same-rule same-line namesake in a DIFFERENT directory must
+        survive when either side is a bare basename — enforcement
+        removal is a finding-drop. Legitimate abs-vs-relative drift
+        (multi-component suffix) must still match."""
+        import json as _json
+        from core.analysis.sanitizer_cut_postpass import (
+            filter_enforced_from_sarif,
+        )
+        sarif = tmp_path / "combined.sarif"
+        results = [
+            # Bare-basename uri, namesake of the enforced x/util.java.
+            {"ruleId": "r1", "locations": [{"physicalLocation": {
+                "artifactLocation": {"uri": "util.java"},
+                "region": {"startLine": 8}}}]},
+            # Different-dir namesake of the enforced file.
+            {"ruleId": "r1", "locations": [{"physicalLocation": {
+                "artifactLocation": {"uri": "other/util.java"},
+                "region": {"startLine": 8}}}]},
+            # Legitimate deeper-path form of the enforced identity.
+            {"ruleId": "r1", "locations": [{"physicalLocation": {
+                "artifactLocation": {"uri": "/repo/x/util.java"},
+                "region": {"startLine": 8}}}]},
+        ]
+        sarif.write_text(_json.dumps(
+            {"runs": [{"results": results}]}), encoding="utf-8")
+        removed = filter_enforced_from_sarif(
+            sarif, [{"rule_id": "r1", "file": "x/util.java", "line": 8}])
+        assert removed == 1
+        kept = _json.loads(sarif.read_text())["runs"][0]["results"]
+        uris = {r["locations"][0]["physicalLocation"]
+                ["artifactLocation"]["uri"] for r in kept}
+        assert uris == {"util.java", "other/util.java"}
+
+    def test_filter_bare_basename_identity_requires_equality(
+            self, tmp_path):
+        # The reverse arm: an enforced identity recorded as a bare
+        # basename must not remove same-named results across dirs —
+        # only the exact-equality arm may fire for it.
+        import json as _json
+        from core.analysis.sanitizer_cut_postpass import (
+            filter_enforced_from_sarif,
+        )
+        sarif = tmp_path / "combined.sarif"
+        results = [
+            {"ruleId": "r1", "locations": [{"physicalLocation": {
+                "artifactLocation": {"uri": "x/util.java"},
+                "region": {"startLine": 8}}}]},
+            {"ruleId": "r1", "locations": [{"physicalLocation": {
+                "artifactLocation": {"uri": "util.java"},
+                "region": {"startLine": 8}}}]},
+        ]
+        sarif.write_text(_json.dumps(
+            {"runs": [{"results": results}]}), encoding="utf-8")
+        removed = filter_enforced_from_sarif(
+            sarif, [{"rule_id": "r1", "file": "util.java", "line": 8}])
+        assert removed == 1
+        kept = _json.loads(sarif.read_text())["runs"][0]["results"]
+        assert (kept[0]["locations"][0]["physicalLocation"]
+                ["artifactLocation"]["uri"]) == "x/util.java"
+
     def test_filter_noop_on_malformed_sarif(self, tmp_path):
         from core.analysis.sanitizer_cut_postpass import (
             filter_enforced_from_sarif,
@@ -592,3 +762,68 @@ public class Test {
         sarif = tmp_path / "combined.sarif"
         sarif.write_text("{}", encoding="utf-8")
         assert filter_enforced_from_sarif(sarif, []) == 0
+
+
+_TWO_CANDIDATE_SAFE = """import org.owasp.encoder.Encode;
+import javax.servlet.http.HttpServletRequest;
+import java.io.PrintWriter;
+public class Test {
+    void doPost(HttpServletRequest request, PrintWriter out) {
+        String a = request.getParameter("a");
+        a = a + request.getParameter("b");
+        String y = Encode.forHtml(a);
+        out.println(y);
+    }
+}
+"""
+
+
+class TestMultiCandidateWitness:
+    def test_full_proof_record_carries_every_candidate(self, tmp_path):
+        # Two source candidates, both individually proven: the single
+        # suppression record used to carry only the LAST candidate's
+        # evidence as the whole finding's witness. The aggregate keeps
+        # each candidate's source line attributable.
+        repo, _, sarif_path, out = _write(
+            tmp_path, _TWO_CANDIDATE_SAFE, {"sink_line": 9},
+        )
+        stats = run_postpass([sarif_path], repo, out)
+        assert stats["recorded_suppress"] == 1
+        recs = [
+            json.loads(line) for line in
+            (out / "suppressions.jsonl").read_text().splitlines()
+        ]
+        rec = next(r for r in recs if r["verdict"] == "sanitizer_dominated")
+        srcs = rec.get("candidate_sources")
+        assert srcs and len(srcs) == 2
+        assert {c["source_line"] for c in srcs} == {6, 7}
+        assert all(c["reason"] for c in srcs)
+
+    def test_single_candidate_record_stays_flat(self, tmp_path):
+        repo, _, sarif_path, out = _write(tmp_path, _SAFE_JAVA)
+        run_postpass([sarif_path], repo, out)
+        recs = [
+            json.loads(line) for line in
+            (out / "suppressions.jsonl").read_text().splitlines()
+        ]
+        rec = next(r for r in recs if r["verdict"] == "sanitizer_dominated")
+        assert "candidate_sources" not in rec
+
+
+class TestCappedReads:
+    def test_oversized_file_reads_as_unreadable(self, tmp_path,
+                                                monkeypatch):
+        import core.analysis.sanitizer_cut_postpass as scp
+        monkeypatch.setattr(scp, "_MAX_SOURCE_READ_BYTES", 64)
+        big = tmp_path / "big.java"
+        big.write_text("x" * 65)
+        assert scp._read_source_capped(big) is None
+        # And the kinds scan degrades to the unreadable path (None),
+        # which the candidate locator turns into a refusal.
+        assert scp._scan_file_for_kinds(big, "java", ()) is None
+
+    def test_in_cap_file_reads_normally(self, tmp_path):
+        import core.analysis.sanitizer_cut_postpass as scp
+        small = tmp_path / "s.java"
+        small.write_text("class A {}")
+        assert scp._read_source_capped(small) == "class A {}"

@@ -48,12 +48,36 @@ _NVD_KEY_RE = re.compile(
 
 _NVD_CACHE_MISSING: dict[str, str] = {"_sentinel": "nvd_missing"}
 
+# In-process marker for a TRANSIENT lookup failure (quota exhaustion,
+# outage, network error). Distinct from a definitive miss so callers
+# minting verdicts can tell "NVD says this CVE does not exist" apart
+# from "the lookup failed". Never written to the disk cache.
+_NVD_TRANSIENT_MISS: dict[str, str] = {"_sentinel": "nvd_transient"}
+
+
+class NvdLookupError(Exception):
+    """A per-CVE lookup failed for a NON-definitive reason.
+
+    Raised (opt-in, see :meth:`NvdClient.get_payload`) for network
+    failures, quota exhaustion, and non-resource-missing HTTP errors —
+    everything where "NVD has no record" would be the wrong conclusion.
+    A definitive miss (4xx resource-missing classes) stays ``None``:
+    that IS NVD's authoritative "no such record".
+
+    Never disk-cached: transient failures are remembered in-process
+    only, so an outage can't be replayed as an authoritative answer.
+    """
+
 # CVE ids are `CVE-<year>-<4+ digits>`. `cve_id` values reach this
 # client from advisory-derived data, not just operator input — validate
 # the shape before the value joins a cache key or the request URL, so a
 # crafted "id" can't smuggle extra query parameters, path separators,
-# or control bytes into either.
-_CVE_ID_RE = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
+# or control bytes into either. ``re.ASCII`` pins ``\d`` to 0-9 (keep
+# in sync with the core/cve epss / vulnrichment / cwe regexes) — a
+# non-ASCII decimal digit would otherwise mint a junk cache key and
+# URL. ``\A..\Z`` instead of ``^..$``: ``$`` tolerates a trailing
+# newline (regex hygiene; ``get_payload`` strips before matching).
+_CVE_ID_RE = re.compile(r"\ACVE-\d{4}-\d{4,}\Z", re.IGNORECASE | re.ASCII)
 
 _SENTINEL_USE_DEFAULT = object()
 
@@ -86,15 +110,39 @@ class NvdClient:
         if self.cache_enabled and self.disk_cache_dir is not None and self._disk is None:
             self._disk = JsonCache(self.disk_cache_dir)
 
-    def get_payload(self, cve_id: str) -> dict[str, Any] | None:
-        """Return the full NVD 2.0 JSON for *cve_id*, or ``None``."""
+    def get_payload(
+        self, cve_id: str, *, raise_on_transient: bool = False,
+    ) -> dict[str, Any] | None:
+        """Return the full NVD 2.0 JSON for *cve_id*, or ``None``.
+
+        With ``raise_on_transient=True``, non-definitive failures
+        (network error, quota exhaustion, non-resource-missing HTTP
+        errors) raise :class:`NvdLookupError` instead of degrading to
+        ``None`` — callers minting verdicts must not read a transient
+        outage as "NVD has no record". The default keeps the historical
+        swallow-to-``None`` shape for aggregating callers.
+        """
         cve_id = (cve_id or "").strip()
         if not _CVE_ID_RE.match(cve_id):
             # Not a CVE id — never let the value reach the cache keys
-            # or the request URL.
+            # or the request URL. Definitive: the id shape itself is
+            # wrong, retrying can't help.
             return None
+        # Case-fold AFTER the shape check: CVE ids are case-
+        # insensitive, and raw-case keys split both the in-memory and
+        # 7-day disk caches — duplicate fetches against NVD's public
+        # 5-req/30s quota, and a definitive miss negative-cached under
+        # one spelling only. Same normalisation as the core/cve
+        # sibling clients.
+        cve_id = cve_id.upper()
         if self.cache_enabled and cve_id in self._cache:
-            return self._cache[cve_id]
+            hit = self._cache[cve_id]
+            if hit is _NVD_TRANSIENT_MISS:
+                if raise_on_transient:
+                    msg = f"NVD lookup for {cve_id} failed earlier this run (transient)"
+                    raise NvdLookupError(msg)
+                return None
+            return hit
         if self.cache_enabled and self._disk is not None:
             hit = self._disk.get(f"nvd/{cve_id}", ttl_seconds=_CACHE_TTL)
             if hit is not None:
@@ -114,7 +162,10 @@ class NvdClient:
                 # hammer a downed NVD, but never write the 7-day disk
                 # sentinel — that would misreport the CVE as nonexistent
                 # to every later run sharing the cache until TTL expiry.
-                self._cache[cve_id] = None
+                self._cache[cve_id] = _NVD_TRANSIENT_MISS
+        if payload is None and not definitive and raise_on_transient:
+            msg = f"NVD lookup for {cve_id} failed (transient)"
+            raise NvdLookupError(msg)
         return payload
 
     def _fetch_with_retry(self, cve_id: str) -> tuple[dict[str, Any] | None, bool]:

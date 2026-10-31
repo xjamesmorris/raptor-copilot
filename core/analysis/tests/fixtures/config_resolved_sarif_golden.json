@@ -1,0 +1,117 @@
+{
+  "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "raptor-config-resolved",
+          "rules": [
+            {
+              "id": "weak-cipher-config",
+              "name": "weak-cipher-config",
+              "shortDescription": {
+                "text": "weak-cipher-config"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "properties": {
+                "tags": [
+                  "security",
+                  "external/cwe/CWE-327"
+                ],
+                "provenance": "config-resolved"
+              }
+            },
+            {
+              "id": "weak-hash-config",
+              "name": "weak-hash-config",
+              "shortDescription": {
+                "text": "weak-hash-config"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "properties": {
+                "tags": [
+                  "security",
+                  "external/cwe/CWE-328"
+                ],
+                "provenance": "config-resolved"
+              }
+            }
+          ]
+        }
+      },
+      "results": [
+        {
+          "ruleId": "weak-cipher-config",
+          "level": "warning",
+          "message": {
+            "text": "weak algorithm selected via configuration: key 'cipher'"
+          },
+          "properties": {
+            "provenance": "config-resolved"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/conf/A.java"
+                },
+                "region": {
+                  "startLine": 14
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "weak-cipher-config",
+          "level": "warning",
+          "message": {
+            "text": "second hit, relative path"
+          },
+          "properties": {
+            "provenance": "config-resolved"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/conf/B.java"
+                },
+                "region": {
+                  "startLine": 3
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "weak-hash-config",
+          "level": "warning",
+          "message": {
+            "text": "outside the repo root"
+          },
+          "properties": {
+            "provenance": "config-resolved"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "/elsewhere/C.java"
+                },
+                "region": {
+                  "startLine": 9
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

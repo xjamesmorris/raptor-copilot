@@ -85,6 +85,11 @@ class BypassFinding:
     caller_function: str
     missing_enforcer: str = ""
     via_intermediate: str | None = None
+    #: File defining the intermediate (best-known key from the call
+    #: graph). The intermediate is a DIFFERENT function from the
+    #: caller — filing it under caller_file made downstream source
+    #: reads (synthesis context) open the wrong file.
+    via_intermediate_file: str = ""
     is_transitive: bool = False
     ordering_violation: bool = False
     line_info: dict[str, int] = field(default_factory=dict)
@@ -95,6 +100,7 @@ class BypassFinding:
             "caller_file": self.caller_file,
             "caller_function": self.caller_function,
             "missing_enforcer": self.missing_enforcer,
+            "via_intermediate_file": self.via_intermediate_file,
             "is_transitive": self.is_transitive,
             "ordering_violation": self.ordering_violation,
             "evidence_tier": self.evidence_tier.value,
@@ -179,6 +185,10 @@ def assumption_from_dict(d: dict[str, Any]) -> SafetyAssumption:
         except (TypeError, ValueError):
             continue
 
+    # Same clamp as the spec twin (specs._safe_confidence): an LLM
+    # string/None confidence must not round-trip the store unclamped.
+    from .specs import _safe_confidence
+
     return SafetyAssumption(
         target=d.get("target", ""),
         file=d.get("file", ""),
@@ -187,7 +197,7 @@ def assumption_from_dict(d: dict[str, Any]) -> SafetyAssumption:
         enforced_by=raw_enforced,
         bug_class=d.get("bug_class", ""),
         params_affected=params_affected,
-        confidence=d.get("confidence", 0.5),
+        confidence=_safe_confidence(d.get("confidence", 0.5)),
         evidence_tier=tier,
         source=d.get("source", ""),
         underminer=d.get("underminer"),
@@ -210,7 +220,12 @@ def merge_assumptions(
 ) -> list[SafetyAssumption]:
     """Merge new assumptions into existing, dedup by key.
 
-    Higher evidence tier wins.  If equal, new wins (fresher).
+    Higher evidence tier wins.  If equal, new wins (fresher) — unless
+    the existing assumption is operator-confirmed
+    (``source == "operator_confirmed"``), which stays sticky on
+    equal-tier merges. Same tie-break as ``store.merge_specs``: a
+    fresh same-tier LLM row must not silently replace an operator-era
+    one and launder away its ``source`` provenance.
     """
     from core.evidence import stronger
 
@@ -225,7 +240,10 @@ def merge_assumptions(
             by_key[key] = a
         else:
             winner_tier = stronger(old.evidence_tier, a.evidence_tier)
-            if winner_tier != old.evidence_tier or winner_tier == a.evidence_tier:
+            if winner_tier != old.evidence_tier or (
+                winner_tier == a.evidence_tier
+                and old.source != "operator_confirmed"
+            ):
                 by_key[key] = a
     return list(by_key.values())
 
@@ -236,8 +254,20 @@ def evict_stale_assumptions(
     *,
     keep_above: EvidenceTier = EvidenceTier.XREF_BACKED,
 ) -> list[SafetyAssumption]:
-    """Remove assumptions for files no longer in the project."""
+    """Remove assumptions for files no longer in the project.
+
+    Mirrors the spec twin (``core.iris.store.evict_stale``): high-tier
+    rows survive a missing file (a rename may be a refactor), and rows
+    with an EMPTY ``file`` field (accepted at parse time when the LLM
+    omits it) carry nothing to be stale against — evicting them would
+    churn away accumulated assumptions on every persist, the exact
+    defect the spec twin's exemption records fixing.
+    """
     from core.evidence import TIER_RANK
 
-    kept = [a for a in assumptions if a.file in current_files or TIER_RANK.get(a.evidence_tier, 0) >= TIER_RANK.get(keep_above, 0)]
-    return kept
+    return [
+        a for a in assumptions
+        if (not a.file or a.file in current_files
+            or TIER_RANK.get(a.evidence_tier, 0)
+            >= TIER_RANK.get(keep_above, 0))
+    ]

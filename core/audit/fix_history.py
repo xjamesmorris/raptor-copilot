@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any
 
 from core.json import save_json
+from core.source.lines import split_lines
 
 logger = logging.getLogger(__name__)
 
@@ -202,6 +203,29 @@ def mine_security_fixes(
     return fixes
 
 
+def _read_target_text(full: Path) -> str:
+    """Capped read of a target source file for the sweep heuristics.
+
+    Capped like every migrated core/audit sibling: the sweep read
+    whole files at five sites, so a planted multi-hundred-MB file
+    cost its full size in peak memory per site. Oversized files
+    raise ``OSError`` (routing into each call site's existing
+    unreadable-file degradation) rather than returning a truncated
+    prefix — a prefix could claim fix lines vanished, or hide guard
+    context, when the content merely lies past the cap.
+    """
+    from core.source import read_text_capped
+    # newline="": callers pair this text with fix-commit/git line
+    # coordinates (raw-byte \n model) — a bare \r must stay in-line.
+    got = read_text_capped(full, errors="replace", newline="")
+    if got is None:
+        raise OSError(f"unreadable: {full}")
+    text, truncated = got
+    if truncated:
+        raise OSError(f"exceeds source read cap: {full}")
+    return text
+
+
 def _significant(text: str) -> bool:
     """Is a diff line meaningful enough to anchor analysis?"""
     stripped = text.strip()
@@ -273,9 +297,7 @@ def _callee_near_added_guard(
         try:
             full = (target / file_path).resolve()
             full.relative_to(target)
-            lines = full.read_text(
-                encoding="utf-8", errors="replace",
-            ).splitlines()
+            lines = split_lines(_read_target_text(full))
         except (ValueError, OSError):
             continue
         for ln, text in added:
@@ -378,10 +400,10 @@ def _sweep_callee_sites(
         try:
             full = (target / rel).resolve()
             full.relative_to(target)
-            text = full.read_text(encoding="utf-8", errors="replace")
+            text = _read_target_text(full)
         except (ValueError, OSError):
             continue
-        for i, line_text in enumerate(text.splitlines(), start=1):
+        for i, line_text in enumerate(split_lines(text), start=1):
             if pattern.search(line_text):
                 sites.append((rel, i))
     return sites
@@ -395,9 +417,7 @@ def _window_has_guard(
         target = Path(target_path).resolve()
         full = (target / file_path).resolve()
         full.relative_to(target)
-        lines = full.read_text(
-            encoding="utf-8", errors="replace",
-        ).splitlines()
+        lines = split_lines(_read_target_text(full))
     except (ValueError, OSError):
         return False
     lo = max(0, line - 1 - _GUARD_WINDOW)
@@ -500,9 +520,7 @@ def regression_gaps(
             try:
                 full = (target / file_path).resolve()
                 full.relative_to(target)
-                current = full.read_text(
-                    encoding="utf-8", errors="replace",
-                )
+                current = _read_target_text(full)
             except (ValueError, OSError):
                 # File itself gone/renamed — different signal (churn),
                 # not a resolvable regression hypothesis.
@@ -568,9 +586,7 @@ def _fixed_region(
             try:
                 full = (target / file_path).resolve()
                 full.relative_to(target)
-                lines = full.read_text(
-                    encoding="utf-8", errors="replace",
-                ).splitlines()
+                lines = split_lines(_read_target_text(full))
             except (ValueError, OSError):
                 continue
             lo = max(0, ln - 1 - _REGION_WINDOW)

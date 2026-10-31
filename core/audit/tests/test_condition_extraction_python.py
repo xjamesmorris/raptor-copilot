@@ -65,7 +65,9 @@ eval("import os")
 
 
 class TestEarlyReturnGuard:
-    """Early-return patterns produce 'excluded' polarity."""
+    """Early-return patterns produce 'negated_guard' polarity — the
+    NEGATED condition protects the sink (distinct from 'excluded',
+    whose check protects a different path and is discarded)."""
 
     SINKS = frozenset({"eval", "exec", "system"})
 
@@ -80,7 +82,7 @@ def run(cmd, user):
         assert len(guards) == 1
         sg = guards[0]
         assert len(sg.guards) == 1
-        assert sg.guards[0].polarity == "excluded"
+        assert sg.guards[0].polarity == "negated_guard"
 
     def test_if_not_raise(self):
         source = """\
@@ -92,7 +94,7 @@ def run(cmd, user):
         guards = extract_sink_guards_python(source, "x.py", sink_names=self.SINKS)
         assert len(guards) == 1
         sg = guards[0]
-        assert sg.guards[0].polarity == "excluded"
+        assert sg.guards[0].polarity == "negated_guard"
 
     def test_else_branch(self):
         source = """\

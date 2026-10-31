@@ -26,15 +26,42 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from core.llm.accounting import (
+    AccountingSummary,
+    CostBasis,
+    CostObservation,
+    format_accounting_summary,
+)
 
 logger = logging.getLogger(__name__)
 
 TELEMETRY_FILENAME = "llm-telemetry.jsonl"
+
+
+def _json_writable(rec: dict[str, Any]) -> dict[str, Any]:
+    """Best-effort record for the strict JSONL writer: non-finite
+    floats and non-JSON values become strings (per value; nested
+    containers that still fail serialisation degrade whole)."""
+    out: dict[str, Any] = {}
+    for key, value in rec.items():
+        if isinstance(value, float) and not math.isfinite(value):
+            out[str(key)] = str(value)
+        elif value is None or isinstance(value, (str, int, float, bool)):
+            out[str(key)] = value
+        else:
+            try:
+                json.dumps(value, allow_nan=False)
+                out[str(key)] = value
+            except (TypeError, ValueError):
+                out[str(key)] = str(value)
+    return out
 
 
 @dataclass
@@ -46,12 +73,23 @@ class _ClassStats:
     failed_attempts: int = 0
     timeouts: int = 0
     blocked: int = 0
+    consumed: int = 0
     cost_usd: float = 0.0
+    # Spend carried by attempt_failed records (paid generations whose
+    # response the shape/truncation guards rejected). Separate from
+    # cost_usd so mean_call_cost — which sizes budget reservations
+    # from COMPLETED calls — never inflates on a failure burst.
+    failed_cost_usd: float = 0.0
+    priced_calls: int = 0
+    priced_call_cost_usd: float = 0.0
     duration_s: float = 0.0
     tokens_in: int = 0
     tokens_out: int = 0
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
+    accounting: AccountingSummary = field(
+        default_factory=AccountingSummary,
+    )
 
 
 class TelemetrySink:
@@ -66,7 +104,12 @@ class TelemetrySink:
     # ── Recording ─────────────────────────────────────────────────
 
     def record(self, rec: dict[str, Any]) -> None:
-        """Append one record; update aggregates. Never raises."""
+        """Append one record; update aggregates.
+
+        The WRITE path never raises (one-warning latch below), but
+        ``_aggregate`` coerces caller-typed fields first and CAN raise
+        on junk values — the never-raises guarantee callers rely on
+        lives on :func:`emit`, the guarded production entry point."""
         rec.setdefault("ts", time.time())
         with self._lock:
             self._aggregate(rec)
@@ -74,9 +117,28 @@ class TelemetrySink:
                 return
             try:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
-                line = json.dumps(rec, separators=(",", ":"), default=str)
-                with open(self.path, "a", encoding="utf-8") as f:
-                    f.write(line + "\n")
+                # append_jsonl, not a bare open("a"): the trail sits at
+                # a predictable name inside the run output dir, and a
+                # run-dir-writable child could plant a symlink there to
+                # redirect same-UID appends onto an arbitrary file.
+                # O_NOFOLLOW refuses the plant (same threat call the
+                # dispatcher audit trail beside this one made when it
+                # adopted the chokepoint); 0o600 keeps the trail
+                # owner-only; the single os.write is also line-atomic
+                # cross-process, which the buffered writer was not.
+                from core.json.jsonl import append_jsonl
+                try:
+                    append_jsonl(self.path, rec, compact=True, mode=0o600)
+                except (TypeError, ValueError):
+                    # Non-serialisable or non-finite values degrade to
+                    # strings for THIS record (the previous writer's
+                    # default=str parity) instead of tripping the
+                    # one-warning latch and disabling telemetry for
+                    # the rest of the run.
+                    append_jsonl(
+                        self.path, _json_writable(rec),
+                        compact=True, mode=0o600,
+                    )
             except Exception:
                 # One warning, then stay silent — aggregation still
                 # works so the end-of-run summary line survives a
@@ -92,17 +154,37 @@ class TelemetrySink:
         cls = str(rec.get("call_class") or "unclassified")
         st = self._by_class.setdefault(cls, _ClassStats())
         event = rec.get("event")
+        is_cache_hit = rec.get("disposition") == "cache_hit"
+        observation = self._record_observation(rec)
         if event == "attempt_failed":
             st.failed_attempts += 1
             if rec.get("disposition") == "timeout":
                 st.timeouts += 1
             elif rec.get("disposition") == "blocked":
                 st.blocked += 1
-        elif rec.get("disposition") == "cache_hit":
+            elif rec.get("disposition") == "consumed":
+                st.consumed += 1
+            if observation.basis is CostBasis.UNKNOWN:
+                retained = self._safe_nonnegative(
+                    rec.get("retained_reservation_estimate_usd"),
+                )
+                st.accounting = st.accounting.add_unknown_failure(
+                    retained_reservation_estimate_usd=retained or 0.0,
+                )
+            else:
+                st.accounting = st.accounting.add(observation)
+                st.failed_cost_usd += observation.legacy_cost_usd
+        elif is_cache_hit:
             st.cache_hits += 1
         else:
             st.calls += 1
-        st.cost_usd += float(rec.get("cost_usd") or 0.0)
+            st.accounting = st.accounting.add(observation)
+            st.cost_usd += observation.legacy_cost_usd
+            if observation.has_numeric_usd:
+                st.priced_calls += 1
+                st.priced_call_cost_usd += (
+                    observation.legacy_cost_usd
+                )
         st.duration_s += float(rec.get("duration_s") or 0.0)
         st.tokens_in += int(rec.get("tokens_in") or 0)
         st.tokens_out += int(rec.get("tokens_out") or 0)
@@ -115,13 +197,13 @@ class TelemetrySink:
         """Mean cost of completed calls in ``call_class``, or None when
         the class has no completed calls yet. Feeds the LLM client's
         per-call budget reservation estimate (cache hits count no call
-        and ~zero cost; failed attempts carry no ``cost_usd`` record —
-        neither skews the mean)."""
+        and ~zero cost; failed-attempt spend books into
+        ``failed_cost_usd`` — neither skews the mean)."""
         with self._lock:
             st = self._by_class.get(str(call_class))
-            if st is None or st.calls <= 0:
+            if st is None or st.priced_calls <= 0:
                 return None
-            return st.cost_usd / st.calls
+            return st.priced_call_cost_usd / st.priced_calls
 
     def class_costs(self) -> dict[str, tuple[int, float]]:
         """Snapshot of per-class completed-call counts and spend:
@@ -129,16 +211,43 @@ class TelemetrySink:
         reconciliation to book call classes no phase captured."""
         with self._lock:
             return {
-                cls: (s.calls, s.cost_usd)
+                cls: (s.priced_calls, s.priced_call_cost_usd)
                 for cls, s in self._by_class.items()
             }
 
-    def total_cost_usd(self) -> float:
-        """Total spend across every class (completed calls; failed
-        attempts and cache hits contribute whatever ``cost_usd`` their
-        records carried, usually zero)."""
+    def failed_class_costs(self) -> dict[str, tuple[int, float]]:
+        """Per-class failed-attempt counts and the spend those
+        attempts carried: ``{call_class: (failed_attempts,
+        failed_cost_usd)}``. The count covers every failed attempt;
+        the cost covers only attempts whose record carried paid usage
+        (a guard-rejected completed generation). End-of-run
+        reconciliation books this into the cost breakdown so a burn
+        loop is itemised instead of invisible."""
         with self._lock:
-            return sum(s.cost_usd for s in self._by_class.values())
+            return {
+                cls: (s.failed_attempts, s.failed_cost_usd)
+                for cls, s in self._by_class.items()
+                if s.failed_attempts or s.failed_cost_usd
+            }
+
+    def total_cost_usd(self) -> float:
+        """Total money across every class — completed calls plus the
+        paid spend failed-attempt records carried. This is the "money
+        actually gone" figure the end-of-run reconciliation compares
+        against the summary ledger (which also books both)."""
+        with self._lock:
+            return sum(
+                s.cost_usd + s.failed_cost_usd
+                for s in self._by_class.values()
+            )
+
+    def accounting_summary(self) -> AccountingSummary:
+        """Snapshot the complete per-basis telemetry aggregate."""
+        with self._lock:
+            summary = AccountingSummary()
+            for stats in self._by_class.values():
+                summary = summary.merge(stats.accounting)
+            return summary
 
     @property
     def total_records(self) -> int:
@@ -160,14 +269,21 @@ class TelemetrySink:
             failed = sum(s.failed_attempts for s in self._by_class.values())
             timeouts = sum(s.timeouts for s in self._by_class.values())
             blocked = sum(s.blocked for s in self._by_class.values())
-            cost = sum(s.cost_usd for s in self._by_class.values())
+            consumed = sum(s.consumed for s in self._by_class.values())
+            failed_cost = sum(
+                s.failed_cost_usd for s in self._by_class.values()
+            )
+            accounting = AccountingSummary()
+            for stats in self._by_class.values():
+                accounting = accounting.merge(stats.accounting)
             tin = sum(s.tokens_in for s in self._by_class.values())
             tout = sum(s.tokens_out for s in self._by_class.values())
             cread = sum(s.cache_read_tokens for s in self._by_class.values())
             cwrite = sum(s.cache_write_tokens for s in self._by_class.values())
 
             parts = [
-                (f"llm telemetry: {calls} calls (${cost:.2f}, "
+                (f"llm telemetry: {calls} calls "
+                 f"({format_accounting_summary(accounting)}, "
                  f"{_k(tin)} in / {_k(tout)} out)"),
             ]
             if cread or cwrite:
@@ -186,17 +302,86 @@ class TelemetrySink:
                     # lumping them in with retryable infrastructure
                     # noise.
                     breakdown += f", {blocked} blocked"
+                if consumed:
+                    # Mid-response deaths the spend-aware retry gate
+                    # refused to re-send — each one a generation
+                    # billed upstream but never received. Called out
+                    # so an operator can spot a flaky-provider day
+                    # from the rollup and weigh the
+                    # RAPTOR_LLM_RETRY_CONSUMED=1 trade consciously.
+                    breakdown += f", {consumed} consumed"
+                if failed_cost > 0:
+                    # Paid generations whose response the guards
+                    # rejected — real money with zero yield. Surfaced
+                    # in dollars so a burn loop reads as spend, not
+                    # as free retry noise.
+                    breakdown += f", ${failed_cost:.2f} paid"
                 parts.append(
                     f"{failed} failed attempts ({breakdown})"
                 )
+            # Per-class failure RATE, not just counts: a class failing
+            # half its calls interleaved with successes never trips
+            # any consecutive-failure breaker, and absolute counts
+            # bury the signal on long runs — the ratio is what tells
+            # an operator one call class is systematically sick.
             per_class = ", ".join(
                 f"{cls}={s.calls}/${s.cost_usd:.2f}"
+                + (
+                    f" ({s.failed_attempts} failed"
+                    + (f"/${s.failed_cost_usd:.2f}"
+                       if s.failed_cost_usd > 0 else "")
+                    + f", {s.failed_attempts / (s.calls + s.failed_attempts):.0%} of attempts)"
+                    if s.failed_attempts else ""
+                )
                 for cls, s in sorted(self._by_class.items())
-                if s.calls
+                if s.calls or s.failed_attempts
             )
             if per_class:
                 parts.append(f"classes: {per_class}")
             return "; ".join(parts)
+
+    @staticmethod
+    def _safe_nonnegative(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            amount = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(amount) or amount < 0:
+            return None
+        return amount
+
+    @classmethod
+    def _record_observation(
+        cls, rec: dict[str, Any],
+    ) -> CostObservation:
+        raw_basis = rec.get("cost_basis")
+        if raw_basis is None:
+            basis = CostBasis.CONFIGURED_RATE
+        else:
+            try:
+                basis = CostBasis(raw_basis)
+            except (TypeError, ValueError):
+                basis = CostBasis.UNKNOWN
+        amount = cls._safe_nonnegative(rec.get("cost_usd"))
+        if basis is CostBasis.PROVIDER_BILLED and amount is not None:
+            return CostObservation.provider_billed(amount)
+        if basis is CostBasis.CATALOG_PRICED and amount is not None:
+            catalog_version = rec.get("catalog_version")
+            if catalog_version:
+                return CostObservation.catalog_priced(
+                    amount,
+                    catalog_version=str(catalog_version),
+                )
+            return CostObservation.catalog_priced(amount)
+        if basis is CostBasis.CONFIGURED_RATE and amount is not None:
+            return CostObservation.configured_rate(amount)
+        if basis is CostBasis.CLI_REPORTED and amount is not None:
+            return CostObservation.cli_reported(amount)
+        if basis is CostBasis.SUBSCRIPTION:
+            return CostObservation.subscription()
+        return CostObservation.unknown()
 
 
 # ── Module-level sink registry ────────────────────────────────────────

@@ -143,9 +143,18 @@ _DEFAULT_MAX_COMMITS_WALKED = 100
 # rebases of pre-existing work + clock-skewed forgeries while
 # tolerating normal release-branch churn.
 _DEFAULT_DATE_SKEW_DAYS = 90
-# Signature statuses that count as "not signed" (worth flagging).
-# Mirrors :data:`workflow_signing._SIGNED_STATUSES`.
-_UNSIGNED_STATUSES = frozenset({"N", "E"})
+# Signature statuses that PROVE the committer held a signing key —
+# the only two that exempt a commit from the forgery conjunction.
+# ``git log %G?``: G = good, U = good but untrusted key.  Everything
+# else (N = none, E = cannot check, B = BAD signature, X/Y = expired,
+# R = revoked — and any status a future git may add) stays eligible:
+# a forged bot commit carrying garbage signature bytes must not
+# short-circuit past the detector, and an unrecognized status must
+# fail toward "not validly signed", never toward "signed".  (This
+# deliberately does NOT mirror ``workflow_signing._SIGNED_STATUSES``,
+# whose "signed" set answers a different question — whether signing
+# ACTIVITY exists in the repo's history, where B/X/Y/R still count.)
+_VALID_SIGNATURE_STATUSES = frozenset({"G", "U"})
 
 
 @dataclass(frozen=True)
@@ -219,7 +228,7 @@ def _classify(
     author_name = row["author_name"]
     author_email = row["author_email"]
 
-    if sig_status not in _UNSIGNED_STATUSES:
+    if sig_status in _VALID_SIGNATURE_STATUSES:
         return None
     bot_claim = _classify_bot_claim(author_name, author_email)
     if bot_claim == "none":

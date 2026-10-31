@@ -24,7 +24,10 @@ Output: markdown to stdout (or ``--out``). Exit code:
          resolves all.
     1  — non-trivial trade-off: some advisories regressed, or no
          candidate fully resolves the open set.
-    2  — invalid arguments.
+    2  — invalid arguments, or verdict unavailable: the OSV lookup
+         degraded (network outage, registry error) and the report
+         carries a "verdict unavailable" section — never a wrong
+         exit 0/1 minted from missing data.
 """
 
 from __future__ import annotations
@@ -36,11 +39,13 @@ from io import StringIO
 from pathlib import Path
 
 from core.cve import EpssClient, KevClient
+from core.atomic_fs import write_text_atomically
 from core.json import JsonCache
 from core.security.log_sanitisation import escape_nonprintable
 from core.security.prompt_output_sanitise import sanitise_string
 
-from . import SCA_CACHE_ROOT, default_client
+from . import sca_cache_root, default_client
+from ._md import neutralize_inline
 from .findings import build_vuln_findings, severity_rank
 from .models import (
     Advisory,
@@ -86,7 +91,7 @@ def main(
         args.ecosystem = canonical_eco
 
     if cache is None:
-        cache = JsonCache(root=Path(args.cache_root) if args.cache_root else SCA_CACHE_ROOT)
+        cache = JsonCache(root=Path(args.cache_root) if args.cache_root else sca_cache_root())
     if http is None:
         http = default_client(offline=args.offline)
 
@@ -126,10 +131,30 @@ def main(
         if explain_section:
             report += explain_section
 
+    if osv.degraded:
+        # A transient OSV failure must never read as "no known
+        # advisories" with exit 0 — a network outage would wave a
+        # vulnerable upgrade through any CI gate built on this
+        # command. Refuse to conclude instead.
+        sample = ", ".join(
+            neutralize_inline(k, limit=60)
+            for k in osv.failed_dep_keys[:5]
+        )
+        report += (
+            "\n## OSV lookups degraded — verdict unavailable\n\n"
+            f"{osv.failed_lookups} advisory lookup(s) failed "
+            "transiently"
+            + (f" (e.g. {sample})" if sample else "")
+            + "; the advisory counts above may be incomplete. "
+            "Re-run when the network/OSV recovers.\n"
+        )
+        exit_code = 2
+
     if args.out:
         out = Path(args.out).resolve()
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(report, encoding="utf-8")
+        # Atomic — a crash mid-write must not leave a truncated report.
+        write_text_atomically(out, report)
     sys.stdout.write(report)
     sys.stdout.flush()
     return exit_code
@@ -292,10 +317,14 @@ def _modal_report(
             advs = _query_one(osv, eco, name, ver)
             if advs:
                 has_introduced = True
+                # osv_id is remote registry content headed for
+                # markdown/stdout — same neutralisation as report.py.
+                ids = ", ".join(
+                    neutralize_inline(a.osv_id, limit=60) for a in advs)
                 lines.append(
                     f"- ⚠ **{eco}:{name}@{ver}** would introduce "
                     f"{len(advs)} advisor{'y' if len(advs) == 1 else 'ies'}: "
-                    f"{', '.join(a.osv_id for a in advs)}"
+                    f"{ids}"
                 )
             else:
                 lines.append(
@@ -312,7 +341,8 @@ def _modal_report(
             if advs:
                 lines.append(
                     f"- removing **{eco}:{name}** would clear "
-                    f"{len(advs)} finding(s): {', '.join(advs)}"
+                    f"{len(advs)} finding(s): "
+                    f"{', '.join(neutralize_inline(a, limit=60) for a in advs)}"
                 )
             else:
                 lines.append(
@@ -378,6 +408,11 @@ def _findings_clearing(
         # byte-budget refusal.
         rows = load_json_bounded(Path(findings_path), max_bytes=64 * 1024 * 1024)
     except (OSError, ValueError):
+        return {}
+    if not isinstance(rows, list):
+        # A dict silently iterates its keys; a scalar crashes the
+        # arm. Hand-edited / foreign findings documents read as "no
+        # advisory map".
         return {}
     remove_set = {r[:2] for r in removes}
     adv_to_deps: dict = {}
@@ -547,7 +582,9 @@ def _candidates_report(
         base_ids.items(),
         key=lambda kv: -severity_rank(kv[1].severity),
     ):
-        buf.write(f"| {adv_id} | {base_finding.severity.title()} |")
+        buf.write(
+            f"| {neutralize_inline(adv_id, limit=60)} "
+            f"| {base_finding.severity.title()} |")
         for cand in candidates:
             mark = "✓" if resolution_table[adv_id][cand] else "—"
             buf.write(f" {mark} |")
@@ -687,16 +724,21 @@ def _explain_upgrade(
         f"**Confidence:** {verdict.confidence}",
     ]
     if verdict.summary:
-        lines.append(f"\n{verdict.summary}")
+        # LLM output over hostile-influenceable inputs (changelogs,
+        # call sites) — defang before it reaches markdown/stdout.
+        lines.append(f"\n{sanitise_string(verdict.summary)}")
 
     if verdict.breaking_changes:
         lines.append("")
         lines.append("### Breaking changes")
         lines.append("")
         for bc in verdict.breaking_changes:
-            lines.append(f"- **{bc.site}**: {bc.what_breaks}")
+            lines.append(
+                f"- **{neutralize_inline(bc.site, limit=120)}**: "
+                f"{neutralize_inline(bc.what_breaks)}")
             if bc.suggested_fix:
-                lines.append(f"  - Fix: {bc.suggested_fix}")
+                lines.append(
+                    f"  - Fix: {neutralize_inline(bc.suggested_fix)}")
 
     lines.append("")
     return "\n".join(lines)

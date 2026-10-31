@@ -413,3 +413,15 @@ class TestRealTreeContract:
         new = {det.finding_key(f) for f in findings} - set(baseline)
         assert ("substrate_dumps_flows_to_hash:core/newmod.py:_injected"
                 ) in new
+
+
+class TestDefaultRoot:
+    def test_default_root_is_script_anchored(
+            self, det, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """--root must default to the repo containing the script, not the
+        ambient cwd — a wrong-cwd invocation used to scan an empty tree
+        and exit 0 vacuously."""
+        monkeypatch.chdir(tmp_path)
+        assert det._default_root() == _REPO_ROOT
+        assert det._default_root() != Path.cwd()

@@ -24,6 +24,12 @@ deliberately don't execute it. We regex-parse the most common forms:
 Anything that requires evaluating Ruby control flow (``if``, ``unless``,
 loops) gets ``parser_confidence=Confidence("medium", reason="Gemfile DSL
 — heuristic regex")`` because we may miss conditionally-included gems.
+More broadly: a Gemfile can construct ``gem`` declarations entirely at
+runtime (string interpolation, loops over data, ``eval``), and those
+are invisible to ANY static parse — coverage here is best-effort over
+the common literal forms, never complete. Bundler itself only knows
+the true set by executing the file, which we refuse to do on
+untrusted trees.
 
 ``Gemfile.lock`` is a structured plain-text format with a ``GEM``
 section listing resolved versions and their dependencies. We extract
@@ -36,6 +42,7 @@ import logging
 import re
 
 from ..models import Confidence, Dependency, PinStyle
+from ._base import build_purl
 from . import _safe_read, register
 from typing import TYPE_CHECKING
 
@@ -88,8 +95,11 @@ def parse_manifest(path: Path) -> list[Dependency]:
 
     out: list[Dependency] = []
     seen_keys: set = set()
+    # Leading indent is HORIZONTAL-only ([^\S\n]): under MULTILINE the
+    # ``^\s*`` spelling re-scans a run of blank lines from every line
+    # start inside it — quadratic on a hostile Gemfile.
     has_control_flow = bool(
-        re.search(r"(?:^\s*(?:if|unless|case|while|for|until)\b|\b(?:if|unless)\s+\S)", text, re.MULTILINE))
+        re.search(r"(?:^[^\S\n]*(?:if|unless|case|while|for|until)\b|\b(?:if|unless)\s+\S)", text, re.MULTILINE))
     confidence_level = "medium" if has_control_flow else "high"
     reason = ("Gemfile DSL — heuristic regex" if has_control_flow
               else "Gemfile DSL — straight-line script")
@@ -187,7 +197,7 @@ def parse_lockfile(path: Path) -> list[Dependency]:
             is_lockfile=True,
             pin_style=PinStyle.EXACT,
             direct=False,                    # join layer flips when matched
-            purl=_build_purl(name, version),
+            purl=build_purl(_PURL_TYPE, name, version),
             parser_confidence=Confidence(
                 "high",
                 reason="Gemfile.lock plain-text — deterministic structure",
@@ -224,6 +234,8 @@ def _build_dep(
     rest_clean = rest.strip().lstrip(",").strip()
     pin_style = PinStyle.WILDCARD
     version: str | None = None
+    version_floor: str | None = None
+    version_ceiling: str | None = None
 
     # Git / path / github overrides — checked first, they win.
     if re.search(r"\bgit\s*:\s*(['\"])", rest_clean) or re.search(r"\bgithub\s*:\s*(['\"])", rest_clean) or re.search(r"\bgitlab\s*:\s*(['\"])", rest_clean):
@@ -231,9 +243,11 @@ def _build_dep(
     elif re.search(r"\bpath\s*:\s*(['\"])", rest_clean):
         pin_style = PinStyle.PATH
     else:
-        pin_style, version = _parse_version_specs(rest_clean)
+        pin_style, version, version_floor, version_ceiling = (
+            _parse_version_specs(rest_clean)
+        )
 
-    purl = _build_purl(name, version)
+    purl = build_purl(_PURL_TYPE, name, version)
     return Dependency(
         ecosystem=ECOSYSTEM,
         name=name,
@@ -249,22 +263,52 @@ def _build_dep(
             reason=reason,
         ),
         source_kind="manifest",
+        version_floor=version_floor,
+        version_ceiling=version_ceiling,
     )
 
 
-def _parse_version_specs(rest: str) -> tuple[PinStyle, str | None]:
-    """Find one or more version-spec tokens in the tail of a gem line."""
+def _release_key(ver: str) -> tuple[int, ...]:
+    """Tolerant numeric sort key for picking the TIGHTEST corridor
+    bound among several same-direction specs (digit groups only —
+    prerelease tags don't participate; ties keep the first seen)."""
+    return tuple(int(p) for p in re.findall(r"\d+", ver)) or (0,)
+
+
+def _corridor(
+    specs: list[tuple[str, str]],
+) -> tuple[str | None, str | None]:
+    """``(floor, ceiling)`` from ``(op, version)`` pairs — the tightest
+    lower (``>=`` / ``>``) and upper (``<`` / ``<=``) bounds, matching
+    the corridor convention of the pyproject / requirements /
+    pip-inline parsers so harden's clamp sees Gemfile ranges too."""
+    lowers = [v for op, v in specs if op in (">=", ">")]
+    uppers = [v for op, v in specs if op in ("<", "<=")]
+    floor = max(lowers, key=_release_key) if lowers else None
+    ceiling = min(uppers, key=_release_key) if uppers else None
+    return floor, ceiling
+
+
+def _parse_version_specs(
+    rest: str,
+) -> tuple[PinStyle, str | None, str | None, str | None]:
+    """Find one or more version-spec tokens in the tail of a gem line.
+    Returns ``(pin_style, version, version_floor, version_ceiling)``."""
     if len(rest) > _MAX_SPEC_TAIL_LEN:
         rest = rest[:_MAX_SPEC_TAIL_LEN]
     matches = list(_VERSION_SPEC_RE.finditer(rest))
     if not matches:
-        return PinStyle.WILDCARD, None
+        return PinStyle.WILDCARD, None, None, None
     if len(matches) > 1:
-        valid = [m for m in matches
+        valid = [(m.group("op") or "=", m.group("ver")) for m in matches
                  if m.group("ver") and m.group("ver")[0].isdigit()]
         if not valid:
-            return PinStyle.WILDCARD, None
-        return PinStyle.RANGE, None
+            return PinStyle.WILDCARD, None, None, None
+        # Multi-spec ranges (``'>= 6.0', '< 7.1'``) carry no single
+        # version but DO bound a corridor — without it, Gemfile
+        # ranges never got harden's corridor clamp.
+        floor, ceiling = _corridor(valid)
+        return PinStyle.RANGE, None, floor, ceiling
     m = matches[0]
     op = m.group("op") or "="
     ver = m.group("ver")
@@ -274,21 +318,16 @@ def _parse_version_specs(rest: str) -> tuple[PinStyle, str | None]:
     # emitted as version "IBM_DB" and 404 on every registry lookup. Reject
     # anything that isn't version-shaped — treat the gem as unpinned.
     if not (ver and ver[0].isdigit()):
-        return PinStyle.WILDCARD, None
+        return PinStyle.WILDCARD, None, None, None
     if op in ("=",):
-        return PinStyle.EXACT, ver
+        return PinStyle.EXACT, ver, None, None
     if op == "~>":
-        return PinStyle.TILDE, ver
+        return PinStyle.TILDE, ver, None, None
     if op == "^":
-        return PinStyle.CARET, ver
-    return PinStyle.RANGE, ver
+        return PinStyle.CARET, ver, None, None
+    floor, ceiling = _corridor([(op, ver)])
+    return PinStyle.RANGE, ver, floor, ceiling
 
-
-def _build_purl(name: str, version: str | None) -> str:
-    base = f"pkg:{_PURL_TYPE}/{name}"
-    if version:
-        return f"{base}@{version}"
-    return base
 
 
 __all__ = ["parse_lockfile", "parse_manifest"]

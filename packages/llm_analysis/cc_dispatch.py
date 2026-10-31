@@ -15,6 +15,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from core.llm.accounting import RouteIdentity, cli_cost_observation
 from core.llm.cc_adapter import (
     CCDispatchConfig,
     build_cc_command,
@@ -91,12 +92,22 @@ def invoke_cc_simple(prompt, schema, repo_path, claude_bin, out_dir,
         # needs the same conversion or the CLI receives a document a
         # JSON-Schema validator treats as annotation-only (type/enum/
         # required all unenforced) or rejects outright. Reuse the one
-        # canonical converter so both lanes constrain identically; it
-        # passes already-normalised schemas through unchanged.
+        # canonical converter so both lanes constrain identically. Advanced
+        # roots pass through; ordinary property-object schemas gain the root
+        # type Claude's strict transport requires.
         from core.llm.providers import _normalize_schema
         effective_schema = _normalize_schema(effective_schema)
     config = CCDispatchConfig(
         claude_bin=claude_bin,
+        # Read-only tool allowlist — LOAD-BEARING beyond least
+        # privilege: this child receives the agent's out_dir
+        # (autonomous/) as its OS-level write grant below, and
+        # autonomous/ is a trusted review-record home at the coverage
+        # load chokepoint (core/coverage/record.py,
+        # _REVIEW_RECORD_SUBDIRS). No Write/Edit/Bash means the child
+        # cannot mint coverage records there; widening this allowlist
+        # requires moving that entry behind the refusal first. Pinned
+        # by core/coverage/tests/test_record_subdir_policy.py.
         tools="Read,Grep,Glob",
         add_dirs=(str(repo_path),),
         budget_usd=CC_BUDGET_PER_FINDING,
@@ -160,6 +171,10 @@ def invoke_cc_simple(prompt, schema, repo_path, claude_bin, out_dir,
                 readable_paths=readable_paths,
                 proxy_hosts=proxy_hosts_for_cc_dispatch(claude_bin),
                 caller_label="claude-sub-agent",
+                # out_dir is frequently a run-dir root, and that is
+                # this lane's contract: the dispatched agent's job is
+                # to write the run's own analysis artifacts there.
+                output_run_root_ok=True,
             )
     except subprocess.TimeoutExpired:
         return DispatchResult(result={"error": f"timeout after {timeout}s"})
@@ -205,7 +220,7 @@ def invoke_cc_simple(prompt, schema, repo_path, claude_bin, out_dir,
     # traceback. write_debug here gives them the raw
     # stdout/stderr to diagnose.
     try:
-        if schema:
+        if schema is not None:
             parsed = parse_cc_structured(proc.stdout, proc.stderr, "unknown")
         else:
             parsed = parse_cc_freeform(proc.stdout, proc.stderr)
@@ -216,12 +231,23 @@ def invoke_cc_simple(prompt, schema, repo_path, claude_bin, out_dir,
         return DispatchResult(result=result)
 
     cost = parsed.pop("cost_usd", 0)
+    cost_reported = bool(parsed.pop("cost_reported", False))
     tokens = parsed.pop("_tokens", 0)
     model = parsed.pop("analysed_by", "claude-code")
     duration = parsed.pop("duration_seconds", 0)
+    cost_observation = cli_cost_observation(
+        cost_usd=cost,
+        cost_reported=cost_reported,
+        route=RouteIdentity("claudecode", model),
+    )
 
     quality = 1.0
-    if schema and isinstance(parsed, dict) and "error" not in parsed:
+    if (
+        schema is not None
+        and isinstance(effective_schema, dict)
+        and isinstance(parsed, dict)
+        and "error" not in parsed
+    ):
         from core.llm.response_validation import (
             unknown_response_fields,
             validate_structured_response,
@@ -263,7 +289,8 @@ def invoke_cc_simple(prompt, schema, repo_path, claude_bin, out_dir,
                            validated.quality, validated.incomplete)
 
     return DispatchResult(result=parsed, cost=cost, tokens=tokens, model=model,
-                          duration=duration, quality=quality)
+                          duration=duration, quality=quality,
+                          cost_observation=cost_observation)
 
 
 _SAFE_ID_RE = re.compile(r"[^A-Za-z0-9._-]")
@@ -372,7 +399,7 @@ def build_schema(no_exploits: bool = False, no_patches: bool = False) -> dict[st
     """Build JSON Schema for CC output, excluding fields the user didn't ask for."""
     schema = copy.deepcopy(FINDING_RESULT_SCHEMA)
     if no_exploits:
-        schema["properties"].pop("exploit_code", None)
+        schema["properties"].pop("exploit_code", None)  # type: ignore[attr-defined]
     if no_patches:
-        schema["properties"].pop("patch_code", None)
+        schema["properties"].pop("patch_code", None)  # type: ignore[attr-defined]
     return schema

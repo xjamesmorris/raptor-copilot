@@ -417,8 +417,9 @@ class TestLoopStreaming:
     def test_streaming_non_dict_tool_json(self, raw: str):
         """Valid JSON that isn't an object ('null', '[]', '\"str\"')
         parses cleanly but can't be a tool-args dict — it must be
-        treated exactly like malformed JSON (empty input), not flow
-        into ``ToolCall.input`` and crash handler dispatch."""
+        treated exactly like malformed JSON (parse-failed, never
+        dispatched), not flow into ``ToolCall.input`` and crash
+        handler dispatch."""
         chunks = [
             StreamChunk(
                 type="tool_call_start",
@@ -456,7 +457,9 @@ class TestLoopStreaming:
         result = loop.run("test")
         assert result.tool_calls_made == 1
         assert result.terminated_by == "complete"
-        assert seen_inputs == [{}]
+        # Parse-failed calls are never dispatched — the handler must
+        # not run on arguments the model never authored.
+        assert seen_inputs == []
 
     def test_streaming_valid_dict_tool_json_unchanged(self):
         """The non-dict guard must not disturb well-formed object
@@ -513,6 +516,120 @@ class TestLoopStreaming:
 
 
 # ---------------------------------------------------------------------------
+# Truncated / unparseable tool-call containment
+# ---------------------------------------------------------------------------
+
+
+class TestTruncatedToolCallContainment:
+    """A tool call whose streamed JSON arguments never parsed (per-turn
+    max_tokens truncation is the routine cause) must not be dispatched
+    with ``input={}`` — that invokes a side-effectful handler, or
+    'submits' a terminal tool, with arguments the model never
+    authored. The loop synthesises an ``is_error`` result telling the
+    model to re-issue instead."""
+
+    def _truncated_call_chunks(
+        self, name: str = "echo", raw: str = '{"msg": "trunca',
+    ) -> list[StreamChunk]:
+        return [
+            StreamChunk(
+                type="tool_call_start",
+                tool_call_id="tc_1",
+                tool_call_name=name,
+            ),
+            StreamChunk(
+                type="tool_call_delta",
+                tool_call_id="tc_1",
+                tool_call_input_delta=raw,
+            ),
+            StreamChunk(type="tool_call_end", tool_call_id="tc_1"),
+            StreamChunk(type="usage", input_tokens=10, output_tokens=4096),
+            StreamChunk(type="done", stop_reason=StopReason.MAX_TOKENS),
+        ]
+
+    def _complete_chunks(self) -> list[StreamChunk]:
+        return [
+            StreamChunk(type="text_delta", text="recovered"),
+            StreamChunk(type="usage", input_tokens=5, output_tokens=2),
+            StreamChunk(type="done", stop_reason=StopReason.COMPLETE),
+        ]
+
+    def test_parse_failed_call_never_reaches_handler(self):
+        invocations: list[dict] = []
+
+        def handler(args: dict) -> str:
+            invocations.append(args)
+            return "ok"
+
+        tool = ToolDef(
+            name="echo", description="d",
+            input_schema={"type": "object"},
+            handler=handler,
+        )
+        provider = FakeStreamingProvider([
+            self._truncated_call_chunks(),
+            self._complete_chunks(),
+        ])
+        loop = ToolUseLoop(provider, [tool], stream=True, max_iterations=3)
+        result = loop.run("go")
+        assert invocations == []
+        assert result.terminated_by == "complete"
+
+    def test_model_receives_reissue_error_result(self):
+        from core.llm.tool_use.types import ToolResult
+
+        provider = FakeStreamingProvider([
+            self._truncated_call_chunks(),
+            self._complete_chunks(),
+        ])
+        loop = ToolUseLoop(
+            provider, [_echo_tool()], stream=True, max_iterations=3,
+        )
+        result = loop.run("go")
+        error_results = [
+            b
+            for m in result.messages if m.role == "user"
+            for b in m.content
+            if isinstance(b, ToolResult) and b.is_error
+        ]
+        assert len(error_results) == 1
+        assert error_results[0].tool_use_id == "tc_1"
+        assert "truncated" in error_results[0].content
+
+    def test_truncated_terminal_tool_never_submits(self):
+        invocations: list[dict] = []
+
+        def submit_handler(args: dict) -> str:
+            invocations.append(args)
+            return "submitted"
+
+        submit = ToolDef(
+            name="submit", description="final answer",
+            input_schema={
+                "type": "object",
+                "properties": {"verdict": {"type": "string"}},
+            },
+            handler=submit_handler,
+        )
+        provider = FakeStreamingProvider([
+            self._truncated_call_chunks(
+                name="submit", raw='{"verdict": "exploi',
+            ),
+            self._complete_chunks(),
+        ])
+        loop = ToolUseLoop(
+            provider, [submit], terminal_tool="submit",
+            stream=True, max_iterations=3,
+        )
+        result = loop.run("go")
+        # A parse-failed call must never set terminal_tool_input —
+        # a {} 'submission' the model never authored.
+        assert invocations == []
+        assert result.terminal_tool_input is None
+        assert result.terminated_by != "terminal_tool"
+
+
+# ---------------------------------------------------------------------------
 # Stream-failure containment
 # ---------------------------------------------------------------------------
 
@@ -545,8 +662,13 @@ class _ScriptedFailureProvider(_FakeBase):
             msg = "stream failed mid-turn (ConnectionResetError): boom"
             raise RuntimeError(msg)
         if step == "fail_credit":
+            # SDK billing errors carry the HTTP status; the credit
+            # classifier requires that transport corroboration (a
+            # bare message is an uncorroborated content match).
             msg = "400 your credit balance is too low"
-            raise RuntimeError(msg)
+            err = RuntimeError(msg)
+            err.status_code = 400  # type: ignore[attr-defined]
+            raise err
         if step == "fail_mid":
             yield StreamChunk(type="text_delta", text="partial")
             msg = "stream failed mid-turn (ConnectionResetError): boom"
@@ -607,3 +729,83 @@ class TestStreamFailureContainment:
         assert out.terminated_by == "complete"
         assert out.final_text == "final"
         assert p.calls == 1
+
+
+class TestUsageChunkRetryContainment:
+    """A stream that yields its usage chunk BEFORE failing pre-content
+    must not be silently retried: the usage StreamDelta was already
+    emitted to subscribers, so a retry double-emits it and a
+    delta-summing subscriber double-counts tokens against the loop's
+    own accounting. No in-repo provider emits usage before content
+    (all three accumulate and emit post-content), so this costs no
+    retries today — it is the loop-contract guard for any future
+    provider that does."""
+
+    def test_usage_chunk_marks_content_seen(self):
+        attempt = [0]
+
+        class UsageThenDropProvider(_FakeBase):
+            def supports_streaming(self):
+                return True
+
+            def turn(self, messages, tools, **kw):
+                raise NotImplementedError
+
+            def turn_stream(self, messages, tools, **kw):
+                attempt[0] += 1
+                yield StreamChunk(
+                    type="usage", input_tokens=1000, output_tokens=0,
+                )
+                if attempt[0] == 1:
+                    raise ConnectionError("transient drop before content")
+                yield StreamChunk(type="text_delta", text="done")
+                yield StreamChunk(
+                    type="done", stop_reason=StopReason.COMPLETE,
+                )
+
+        usage_events: list[int] = []
+
+        def events(ev):
+            if isinstance(ev, StreamDelta) and ev.chunk.type == "usage":
+                usage_events.append(ev.chunk.input_tokens)
+
+        loop = ToolUseLoop(
+            UsageThenDropProvider(_cfg()), [_echo_tool()],
+            stream=True, events=events, max_iterations=2,
+        )
+        with pytest.raises(Exception):
+            loop.run("go")
+        # The failed attempt emitted exactly one usage delta and was
+        # NOT retried — subscribers never see a duplicate.
+        assert usage_events == [1000]
+        assert attempt[0] == 1
+
+    def test_pre_usage_failure_still_retries(self):
+        attempt = [0]
+
+        class DropThenHealthyProvider(_FakeBase):
+            def supports_streaming(self):
+                return True
+
+            def turn(self, messages, tools, **kw):
+                raise NotImplementedError
+
+            def turn_stream(self, messages, tools, **kw):
+                attempt[0] += 1
+                if attempt[0] == 1:
+                    raise ConnectionError("drop before ANY chunk")
+                yield StreamChunk(type="text_delta", text="done")
+                yield StreamChunk(
+                    type="usage", input_tokens=10, output_tokens=2,
+                )
+                yield StreamChunk(
+                    type="done", stop_reason=StopReason.COMPLETE,
+                )
+
+        loop = ToolUseLoop(
+            DropThenHealthyProvider(_cfg()), [_echo_tool()],
+            stream=True, max_iterations=2,
+        )
+        result = loop.run("go")
+        assert result.terminated_by == "complete"
+        assert attempt[0] == 2

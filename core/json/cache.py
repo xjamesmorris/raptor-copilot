@@ -35,6 +35,23 @@ Caller TTL semantics:
   effectively shorten the TTL of pre-existing entries (e.g.
   ``--offline`` mode might decide that a 24h-old entry is now
   stale even though it was written with a 7d TTL).
+
+mtime caveat (WSL drvfs/9p, no behaviour change):
+  TTL freshness is judged from the envelope's ``written_at`` field
+  (``CacheEnvelope.is_fresh``), never from mtimes — 9p attribute
+  staleness cannot expire or revive an entry (cross-client
+  ``written_at`` disagreement is ordinary clock skew, not the
+  attribute cache). The module's actual mtime readers are the
+  in-process memo revalidation (stat mtime/size), the tempfile
+  reaper's is-someone-still-writing freshness window, and the
+  reap-sentinel rate limit. On a Windows-interop mount those mtimes
+  pass through the 9p attribute cache: same-distro views stay
+  coherent, while ANOTHER client's writes (Windows side, another
+  distro) can surface late — the memo may serve its memoised copy of
+  an externally rewritten entry for the cache window (bounded extra
+  staleness only; disk re-reads still parse the new bytes), and the
+  reaper's freshness window loses precision against cross-client
+  in-flight writers. See docs/wsl.md.
 """
 
 from __future__ import annotations
@@ -395,6 +412,16 @@ class JsonCache:
             payload=payload, mtime=mtime, size=size,
         )
         self._memo_bytes += size
+        # The just-inserted entry is kept even when it ALONE exceeds
+        # the whole memo budget (the floor is one entry, not zero):
+        # evicting it would make every over-budget payload a
+        # guaranteed re-read-per-hit while still paying the insert.
+        # The cost is one resident over-budget envelope until the
+        # next insert evicts it in turn — bounded by the largest
+        # single payload, which the disk-side envelope already
+        # bounds. A hard per-entry cap would instead silently drop
+        # memoisation for exactly the payloads that are most
+        # expensive to re-parse.
         while (
             self._memo_bytes > self._memo_budget
             and len(self._memo) > 1  # keep the just-inserted entry
@@ -457,7 +484,12 @@ class JsonCache:
             st = path.stat()
             file_mtime: float | None = st.st_mtime
             file_size = st.st_size
-        except OSError:
+        except (OSError, ValueError):
+            # ValueError: an embedded NUL in the key survives
+            # _path_for's segment sanitisation (it aliases nothing —
+            # the path simply cannot exist) but raises from the lstat
+            # itself. Keys carry externally-influenced package names,
+            # and the cache degrades — it never crashes the consumer.
             file_mtime = None
             file_size = 0
         if file_mtime is None:
@@ -565,12 +597,14 @@ class JsonCache:
         # with the envelope JSON.
         try:
             write_text_atomically(path, payload)
-        except OSError as e:
+        except (OSError, ValueError) as e:
             # Disk full, permission denied (including a cache subdir
             # turned read-only AFTER construction — the constructor's
             # writability probe only covers construction time), tmp
-            # squat refused by O_EXCL. All degrade to no-cache with a
-            # warning instead of crashing the consumer.
+            # squat refused by O_EXCL, or ValueError from an embedded
+            # NUL in a key-derived path component (externally
+            # influenced package names reach keys). All degrade to
+            # no-cache with a warning instead of crashing the consumer.
             logger.warning("core.json.cache: failed to write %s: %s", path, e)
 
     def invalidate(self, key: str) -> None:
@@ -582,7 +616,9 @@ class JsonCache:
         path = self._path_for(key)
         try:
             path.unlink(missing_ok=True)
-        except OSError as e:
+        except (OSError, ValueError) as e:
+            # ValueError: embedded NUL in a key-derived component
+            # (same degrade rationale as try_get / put).
             logger.debug("core.json.cache: failed to remove %s: %s", path, e)
 
     # ------------------------------------------------------------------

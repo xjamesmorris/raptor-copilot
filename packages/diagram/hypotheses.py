@@ -3,7 +3,7 @@ Mermaid diagram generator for hypotheses.json (produced by /validate Stage B).
 
 Shows the evidence chain: finding → hypothesis → predictions → results.
 This is the diagram to look at when deciding whether something is exploitable
-enough to write a PoC for,it shows the concrete predictions and their
+enough to write a PoC for — it shows the concrete predictions and their
 outcomes, not just whether a node is "confirmed".
 """
 
@@ -12,7 +12,17 @@ from __future__ import annotations
 from typing import Any, TYPE_CHECKING
 
 from core.json import load_json
+
+from .caps import DEFAULT_CAP, cap_elements, truncation_marker_lines
+from .envelope import unwrap_list
 from .sanitize import sanitize as _sanitize, sanitize_id as _sid
+
+# Shared flow_trace rationale (see packages.diagram.caps): hypotheses
+# and their predictions come from LLM/run artifacts with no upstream
+# bound. Predictions are per-hypothesis leaf nodes — 50 keeps a
+# pathological fan-out readable while real hypotheses carry a handful.
+_MAX_HYPOTHESES = DEFAULT_CAP
+_MAX_PREDICTIONS_PER_HYP = 50
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -60,6 +70,13 @@ def generate(hypotheses: list[dict[str, Any]]) -> str:
     if not hypotheses:
         return 'flowchart TD\n    EMPTY["No hypotheses"]'
 
+    # flow_trace's ingestion idiom: malformed elements drop, the rest
+    # still renders (the renderer's per-section try/except otherwise
+    # loses the WHOLE section to one junk element).
+    hypotheses = [h for h in hypotheses if isinstance(h, dict)]
+    hypotheses, dropped_hyps = cap_elements(hypotheses, _MAX_HYPOTHESES)
+    dropped_preds = 0
+
     # Group by finding
     by_finding: dict[str, list[dict]] = {}
     ungrouped: list[dict] = []
@@ -95,8 +112,15 @@ def generate(hypotheses: list[dict[str, Any]]) -> str:
         else:
             lines.append(f'{indent}{nid}{{"{label}"}}')
 
-        # Predictions
-        for pred in hyp.get("predictions", []):
+        # Predictions — same drop-malformed idiom as the top-level list.
+        nonlocal dropped_preds
+        preds = hyp.get("predictions", [])
+        if not isinstance(preds, list):
+            preds = []
+        preds = [p for p in preds if isinstance(p, dict)]
+        preds, over = cap_elements(preds, _MAX_PREDICTIONS_PER_HYP)
+        dropped_preds += over
+        for pred in preds:
             pnid = next_id("PN")
             plabel = _prediction_label(pred)
             pstatus = _sanitize(pred.get("status", "testing"))
@@ -136,16 +160,16 @@ def generate(hypotheses: list[dict[str, Any]]) -> str:
     testing_nodes: list[str] = []
 
     for hyp in hypotheses:
-        nid = hyp_node_ids.get(id(hyp))
-        if not nid:
+        node_id = hyp_node_ids.get(id(hyp))
+        if not node_id:
             continue
         status = _sanitize(hyp.get("status", "testing"))
         if status == "confirmed":
-            confirmed_nodes.append(nid)
+            confirmed_nodes.append(node_id)
         elif status == "disproven":
-            disproven_nodes.append(nid)
+            disproven_nodes.append(node_id)
         else:
-            testing_nodes.append(nid)
+            testing_nodes.append(node_id)
 
     lines.append("")
     lines.append("    classDef confirmed fill:#dcfce7,stroke:#16a34a,color:#14532d")
@@ -170,6 +194,12 @@ def generate(hypotheses: list[dict[str, Any]]) -> str:
     for cls, ids in pred_by_status.items():
         lines.append(f"    class {','.join(ids)} {cls}")
 
+    lines.extend(truncation_marker_lines(
+        "TRUNC", dropped_hyps, "hypotheses", _MAX_HYPOTHESES))
+    lines.extend(truncation_marker_lines(
+        "TRUNCPR", dropped_preds, "predictions",
+        _MAX_PREDICTIONS_PER_HYP))
+
     return "\n".join(lines)
 
 
@@ -178,6 +208,4 @@ def generate_from_file(path: Path) -> str:
     if data is None:
         msg = f"Failed to load {path}"
         raise ValueError(msg)
-    if isinstance(data, dict):
-        data = data.get("hypotheses", list(data.values())[0] if data else [])
-    return generate(data if isinstance(data, list) else [])
+    return generate(unwrap_list(data, keys=("hypotheses",)) or [])

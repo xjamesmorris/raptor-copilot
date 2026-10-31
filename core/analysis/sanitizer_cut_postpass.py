@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from core.analysis import threat_model_java as _tm
+from core.source.lines import split_lines
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
@@ -220,6 +221,30 @@ class PostpassStats:
         }
 
 
+# Per-file read cap for the postpass's own text loads. The wall
+# budget bounds TIME, not memory: the per-run text/source caches held
+# every examined file's full content, so a repo of huge files (or one
+# planted multi-GB source) grew the caches unboundedly. Oversized
+# files read as unreadable — the refusal direction (a finding on such
+# a file loses suppression evidence, never gains it).
+_MAX_SOURCE_READ_BYTES = 10 * 1024 * 1024
+
+
+def _read_source_capped(path: Path) -> str | None:
+    """Capped best-effort source read: None on IO failure or when the
+    file exceeds :data:`_MAX_SOURCE_READ_BYTES`."""
+    try:
+        if path.stat().st_size > _MAX_SOURCE_READ_BYTES:
+            logger.debug(
+                "sanitizer-cut post-pass: %s exceeds %d bytes; "
+                "treating as unreadable", path, _MAX_SOURCE_READ_BYTES,
+            )
+            return None
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
 def _sink_method_span(
     resolved_path: Path,
     sink_line: int,
@@ -232,9 +257,9 @@ def _sink_method_span(
     """
     try:
         if resolved_path not in text_cache:
-            text_cache[resolved_path] = resolved_path.read_text(
-                encoding="utf-8", errors="replace",
-            )
+            text_cache[resolved_path] = _read_source_capped(
+                resolved_path,
+            ) or ""
         text = text_cache[resolved_path]
         if not text:
             return None
@@ -306,6 +331,17 @@ def _grammar_ok(language: str, cache: dict[str, bool]) -> bool:
 # the sink is refused outright — evaluating the gate from each
 # candidate stays sound at any count, but the cost is per-candidate
 # and unbounded fan-out is a DoS surface on hostile input.
+#
+# Both directions of the threshold: RAISING it multiplies the
+# all-must-suppress evaluation cost per finding (each candidate is a
+# full resolver+gate run — the DoS surface this cap exists to bound)
+# for marginal extra suppression coverage in source-dense files;
+# LOWERING it refuses more findings outright, losing legitimate
+# suppressions in ordinary multi-source methods. The cap bounds
+# candidate ENUMERATION only — classifying ONE already-known trace
+# line has no fan-out and must never be gated on it (see
+# _kinds_for_line), or the b42 circularity ban silently evaporates in
+# source-dense files.
 _MAX_CANDIDATE_SOURCES = 4
 
 
@@ -320,9 +356,8 @@ def _scan_file_for_kinds(
     kinds_table = _SOURCE_KINDS.get(language) or {}
     if not kinds_table and not extra_patterns:
         return []
-    try:
-        text = file_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    text = _read_source_capped(file_path)
+    if text is None:
         return None
 
     active: dict[str, dict[str, Any]] = {}
@@ -340,7 +375,7 @@ def _scan_file_for_kinds(
     resolver = None
     resolver_built = False
     out: list[tuple] = []
-    for i, line in enumerate(text.splitlines()):
+    for i, line in enumerate(split_lines(text)):
         lineno = i + 1
         kinds = set()
         for kind, spec in active.items():
@@ -384,6 +419,8 @@ def _candidate_source_lines_with_kinds(
     file_path: Path, sink_line: int, language: str,
     _cache: dict[Path, list[tuple] | None],
     extra_patterns: tuple = (),
+    method_span: tuple[int, int] | None = None,
+    on_scoped=None,
 ) -> list[tuple]:
     """Source-shaped lines before the sink with their source kinds.
 
@@ -393,6 +430,14 @@ def _candidate_source_lines_with_kinds(
     caller enforces all-must-suppress. Zero candidates, an unreadable
     file, or more than :data:`_MAX_CANDIDATE_SOURCES` return ``[]``
     (refusal).
+
+    ``method_span`` (sink method's ``(start_line, end_line)``) scopes
+    the candidate set BEFORE the cap: a candidate outside the sink's
+    enclosing method cannot be the withheld source (traceless
+    findings are intra-procedural), and cap-then-scope refused
+    exactly the source-dense files (Juliet-style batteries) the
+    scoping exists to serve. ``on_scoped`` is called once per
+    scoped-out candidate so the caller's telemetry survives the move.
     """
     if file_path not in _cache:
         _cache[file_path] = _scan_file_for_kinds(
@@ -401,9 +446,47 @@ def _candidate_source_lines_with_kinds(
     if entries is None:
         return []
     before_sink = [(ln, kinds) for ln, kinds in entries if ln < sink_line]
+    if method_span is not None:
+        span_start, span_end = method_span
+        in_method = [
+            (ln, kinds) for ln, kinds in before_sink
+            if span_start <= ln <= span_end
+        ]
+        if on_scoped is not None:
+            for _ in range(len(before_sink) - len(in_method)):
+                on_scoped()
+        before_sink = in_method
     if not before_sink or len(before_sink) > _MAX_CANDIDATE_SOURCES:
         return []
     return before_sink
+
+
+def _kinds_for_line(
+    file_path: Path, line: int, language: str,
+    _cache: dict[Path, list[tuple] | None],
+    extra_patterns: tuple = (),
+) -> frozenset[str]:
+    """Source kinds of ONE known line, from the uncapped scan cache.
+
+    Trace-carrying findings name their source line outright — no
+    candidate enumeration happens, so the _MAX_CANDIDATE_SOURCES
+    refusal (a bound on per-candidate gate fan-out) must not apply.
+    Routing this lookup through the capped candidate view silently
+    returned no kinds for files with more source-shaped lines than
+    the cap, and with it the b42 circularity ban — the
+    false-suppression direction, in exactly the source-dense files
+    (Juliet-style batteries) where the ban matters.
+    """
+    if file_path not in _cache:
+        _cache[file_path] = _scan_file_for_kinds(
+            file_path, language, extra_patterns)
+    entries = _cache[file_path]
+    if entries is None:
+        return frozenset()
+    for ln, kinds in entries:
+        if ln == line:
+            return frozenset(kinds)
+    return frozenset()
 
 
 def _candidate_source_lines(
@@ -418,7 +501,7 @@ def _candidate_source_lines(
 
 def _locate_unique_source_line(
     file_path: Path, sink_line: int, language: str,
-    _cache: dict[Path, list[int] | None],
+    _cache: dict[Path, list[tuple] | None],
     extra_patterns: tuple = (),
 ) -> int | None:
     """Back-compat single-source form: the file's single source-shaped
@@ -437,6 +520,37 @@ def _dataflow_source_line(finding: Mapping[str, Any]) -> int | None:
     if isinstance(line, int) and line > 0:
         return line
     return None
+
+
+def _dataflow_source_file(finding: Mapping[str, Any]) -> str:
+    """The trace source step's file, or ``""`` when the step carries
+    no usable file string (line-only traces keep the pre-existing
+    same-file assumption)."""
+    path = finding.get("dataflow_path") or {}
+    source = path.get("source") or {}
+    file = source.get("file")
+    return file if isinstance(file, str) else ""
+
+
+def _trace_source_is_cross_file(
+    trace_file: str, sink_resolved: Path, repo_root: Path,
+) -> bool:
+    """True when the trace's source step names a DIFFERENT file than
+    the finding's sink file.
+
+    The trace line is only meaningful as a local anchor in the file it
+    was reported against: evaluating a cross-file trace's source line
+    against the SINK file's text classifies the wrong file's lines and
+    can suppress a real cross-file flow. Unresolvable paths count as
+    cross-file — the refusal direction (the finding loses suppression
+    evidence, never gains it)."""
+    p = Path(trace_file)
+    if not p.is_absolute():
+        p = repo_root / trace_file
+    try:
+        return p.resolve() != sink_resolved.resolve()
+    except (OSError, ValueError):
+        return True
 
 
 # Learned source-method names must be plain Java identifiers before
@@ -502,9 +616,14 @@ def run_postpass(
     learned_patterns = _compile_extra_source_patterns(extra_source_patterns)
     if learned_patterns:
         stats.mechanism_counts["learned-source-patterns"] = len(learned_patterns)
-    source_cache: dict[Path, list[int] | None] = {}
+    source_cache: dict[Path, list[tuple] | None] = {}
     text_cache: dict[Path, str] = {}
     grammar_cache: dict[str, bool] = {}
+    # Per-run Phase 12+13 memo (sha256(text) → taint summaries): the
+    # resolver otherwise rebuilds the module callgraph + summary
+    # fixed point once per finding × source candidate on the SAME
+    # file — up to four rebuilds per finding.
+    summary_memo: dict[str, Any] = {}
     repo_root = Path(repo_root).resolve()
 
     findings: list[dict[str, Any]] = []
@@ -567,64 +686,67 @@ def run_postpass(
         finding_kinds: set = set()
         trace_line = _dataflow_source_line(finding)
         if trace_line is not None:
+            # Same-file guard: a trace whose SOURCE step lives in a
+            # different file than the sink cannot anchor the
+            # value-bound evaluation — its line indexes the wrong
+            # file's text, and the traceless candidate enumeration
+            # below assumes intra-procedural producers, so neither
+            # path is sound for it. Skip with an enumerated refusal.
+            trace_file = _dataflow_source_file(finding)
+            if trace_file and _trace_source_is_cross_file(
+                    trace_file, resolved_path, repo_root):
+                stats.refuse("trace-source-cross-file")
+                continue
             source_lines = [trace_line]
             stats.source_kind("trace")
             # Classify the trace's own source line so the circularity
             # ban (below) covers trace-carrying findings too: a
             # CodeQL flow that STARTS at a system read must not have
-            # that read discharged as taint-free.
+            # that read discharged as taint-free. Looked up in the
+            # uncapped scan cache — the candidate cap bounds
+            # enumeration fan-out, not single-line classification.
             if language == "java":
-                tk = _candidate_source_lines_with_kinds(
-                    resolved_path, int(sink_line) + 10**9, language,
-                    source_cache,
-                    learned_patterns if language == "java" else (),
+                finding_kinds |= _kinds_for_line(
+                    resolved_path, trace_line, language,
+                    source_cache, learned_patterns,
                 )
-                for ln, ks in tk:
-                    if ln == trace_line:
-                        finding_kinds |= set(ks)
         else:
-            with_kinds = _candidate_source_lines_with_kinds(
-                resolved_path, int(sink_line), language, source_cache,
-                learned_patterns if language == "java" else (),
-            )
-            source_lines = [ln for ln, _ in with_kinds]
-            for kind in sorted({k for _, ks in with_kinds for k in ks}):
-                stats.source_kind(kind)
-            if language == "java" and source_lines:
-                # Traceless findings come from intra-procedural taint
-                # (trace-capable producers emit traces, which take the
-                # branch above), so a candidate outside the sink's
-                # enclosing method cannot be the withheld source —
-                # scope it out. See core.analysis.cross_method_java.
+            # Traceless findings come from intra-procedural taint
+            # (trace-capable producers emit traces, which take the
+            # branch above), so a candidate outside the sink's
+            # enclosing method cannot be the withheld source — scope
+            # it out BEFORE the candidate cap (cap-then-scope refused
+            # exactly the source-dense files the scoping serves). See
+            # core.analysis.cross_method_java.
+            method_span = None
+            if language == "java":
                 span = _sink_method_span(
                     resolved_path, int(sink_line), text_cache,
                 )
                 if span is not None:
                     _name, span_start, span_end = span
-                    in_method = [
-                        ln for ln in source_lines
-                        if span_start <= ln <= span_end
-                    ]
-                    scoped_out = len(source_lines) - len(in_method)
-                    if scoped_out:
-                        for _i in range(scoped_out):
-                            stats.mechanism("cross-method:candidate-scoped")
-                        source_lines = in_method
-            surviving = set(source_lines)
-            for ln, ks in with_kinds:
-                if ln in surviving:
-                    finding_kinds |= set(ks)
-                    # Caller-mediated taint needs no extra candidate:
-                    # the gate's definer-exclusivity condition is
-                    # source-agnostic, so a sink argument reachable
-                    # from a method parameter fails condition 3 under
-                    # EVERY candidate (pinned by
-                    # test_params_entry_redundant_with_condition3).
+                    method_span = (span_start, span_end)
+            with_kinds = _candidate_source_lines_with_kinds(
+                resolved_path, int(sink_line), language, source_cache,
+                learned_patterns if language == "java" else (),
+                method_span=method_span,
+                on_scoped=lambda: stats.mechanism(
+                    "cross-method:candidate-scoped"),
+            )
+            source_lines = [ln for ln, _ in with_kinds]
+            for kind in sorted({k for _, ks in with_kinds for k in ks}):
+                stats.source_kind(kind)
+            for _ln, ks in with_kinds:
+                finding_kinds |= set(ks)
+                # Caller-mediated taint needs no extra candidate:
+                # the gate's definer-exclusivity condition is
+                # source-agnostic, so a sink argument reachable
+                # from a method parameter fails condition 3 under
+                # EVERY candidate (pinned by
+                # test_params_entry_redundant_with_condition3).
         if not source_lines:
             stats.refuse("no-source-candidates")
             continue
-        if finding_kinds & _TF_COLLIDING_KINDS:
-            stats.mechanism("taint-free:banned-system-read-source")
 
         # Evaluate from EVERY candidate source. Suppress only when
         # all candidates suppress (the withheld taint trace started at
@@ -634,7 +756,17 @@ def run_postpass(
         # on any candidate — refuses the whole finding.
         verdicts: list[str] = []
         native = None
+        evaluated: list[tuple[dict, Any]] = []
         for source_line in source_lines:
+            # Wall budget INSIDE the candidate loop too: the
+            # top-of-loop check bounds findings, but one finding's
+            # all-must-suppress candidate fan-out (× a hostile file's
+            # summary build) could run unbounded past the budget.
+            # Partial candidate verdicts must not decide — the
+            # finding is skipped, never suppressed.
+            if time.monotonic() - started > budget_seconds:
+                verdicts = ["budget-exhausted"]
+                break
             native = {
                 "cwe": cwe,
                 "file_path": str(resolved_path),
@@ -653,18 +785,18 @@ def run_postpass(
                 # repo_root confines the resolver's own read too —
                 # belt-and-braces behind the pre-check above (which a
                 # later refactor could bypass).
-                resolved = resolve_finding(native, target_root=repo_root)
+                resolved = resolve_finding(
+                    native, target_root=repo_root,
+                    summary_memo=summary_memo,
+                )
                 if not isinstance(resolved, ResolvedFinding):
                     verdicts = ["resolver-refused"]
                     break
                 if language == "java":
                     if resolved_path not in text_cache:
-                        try:
-                            text_cache[resolved_path] = resolved_path.read_text(
-                                encoding="utf-8", errors="replace",
-                            )
-                        except OSError:
-                            text_cache[resolved_path] = ""
+                        text_cache[resolved_path] = _read_source_capped(
+                            resolved_path,
+                        ) or ""
                     java_text = text_cache[resolved_path] or None
                 else:
                     java_text = None
@@ -708,13 +840,23 @@ def run_postpass(
             if "returns-taint-free helper union" in reason_text:
                 stats.mechanism("taint-free:helper-summary")
             verdicts.append(result.verdict)
+            evaluated.append((native, result))
 
+        if verdicts == ["budget-exhausted"]:
+            stats.budget_exhausted_skips += 1
+            continue
         if verdicts == ["resolver-refused"]:
             stats.refuse("resolver-refused")
             continue
         if verdicts == ["gate-error"]:
             stats.refuse("gate-error")
             continue
+        if finding_kinds & _TF_COLLIDING_KINDS:
+            # Counted only for findings the gate actually evaluated —
+            # incrementing before the verdict loop tallied the ban for
+            # resolver-refused / gate-error findings it never armed a
+            # decision on.
+            stats.mechanism("taint-free:banned-system-read-source")
         full_proof = all(v == VERDICT_SUPPRESS for v in verdicts)
         if full_proof:
             stats.recorded_suppress += 1
@@ -729,6 +871,25 @@ def run_postpass(
         else:
             stats.refuse("no-suppress-verdict")
             continue
+        # Multi-candidate full proof: the single record carries the
+        # LAST candidate's native/result, so aggregate every
+        # candidate's witness into the record — one candidate's
+        # bindings must not stand in for the others' (the mixed
+        # candidate_only case skips recording for exactly this
+        # misattribution reason).
+        extra_fields = None
+        if full_proof and len(evaluated) > 1:
+            extra_fields = {"candidate_sources": [
+                {
+                    "source_line": int(nat["source_line"]),
+                    "reason": getattr(res, "reason", "") or "",
+                    "sink_arg": getattr(res, "sink_arg", "") or "",
+                    "witness_lines": sorted({
+                        b.lineno for b in res.all_matched_bindings
+                    }),
+                }
+                for nat, res in evaluated
+            ]}
         try:
             # Enforcement is structurally limited to FULL-PROOF suppress
             # verdicts (every source candidate individually proven):
@@ -736,7 +897,8 @@ def run_postpass(
             # call — pinned by test_candidate_only_never_enforces.
             if full_proof and enforce_live:
                 record_sanitizer_cut_suppression(
-                    out_dir, native, result, enforce=True,
+                    out_dir, native, result, enforce=True,  # type: ignore[arg-type]
+                    extra_fields=extra_fields,
                 )
                 stats.enforced += 1
                 stats.enforced_findings.append({
@@ -745,7 +907,9 @@ def run_postpass(
                     "line": int(sink_line),
                 })
             else:
-                record_sanitizer_cut_suppression(out_dir, native, result)
+                record_sanitizer_cut_suppression(
+                    out_dir, native, result, extra_fields=extra_fields,  # type: ignore[arg-type]
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning("sanitizer-cut post-pass: record failed: %s", exc)
 
@@ -783,6 +947,18 @@ def filter_enforced_from_sarif(
     def _norm(s: str) -> str:
         return str(s or "").replace("\\", "/").lstrip("./")
 
+    def _suffix_ok(longer: str, shorter: str) -> bool:
+        # Anchored suffix agreement for abs-vs-relative drift, with a
+        # component minimum: the shorter side must itself carry a
+        # directory component. Both directions of the trade-off: with
+        # no minimum, a bare-basename identity ("util.java") removed a
+        # same-rule same-line namesake in a DIFFERENT directory —
+        # enforcement removal is a finding-drop, the expensive
+        # direction; requiring full-path equality instead would stop
+        # matching the legitimate absolute-uri vs repo-relative-record
+        # drift this arm exists for.
+        return "/" in shorter and longer.endswith("/" + shorter)
+
     keys = [
         ((e.get("rule_id") or ""), _norm(e.get("file") or ""),
          int(e.get("line") or 0))
@@ -811,8 +987,8 @@ def filter_enforced_from_sarif(
                     continue
                 hit = any(
                     rule == k_rule and line == k_line
-                    and (uri == k_file or uri.endswith("/" + k_file)
-                         or k_file.endswith("/" + uri))
+                    and (uri == k_file or _suffix_ok(uri, k_file)
+                         or _suffix_ok(k_file, uri))
                     for (k_rule, k_file, k_line) in keys
                 )
                 if hit:

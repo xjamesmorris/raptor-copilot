@@ -296,13 +296,15 @@ class TestTotalTimeout:
         with pytest.raises(HttpError):
             client.get_json("https://example.com/api", total_timeout=1)
         elapsed = _time.monotonic() - t0
-        # Cap is 1s; allow generous slop for sleep granularity but well
-        # under 5s (which is where the previous bug would have led with
-        # default per-attempt timeout=30). The pre-fix max() would have
-        # let this run through the full backoff schedule.
-        assert elapsed < 5, (
-            f"total_timeout=1 took {elapsed:.1f}s — "
-            f"deadline computation may have regressed to max(total, timeout)"
+        # Cap is 1s; the assert bound carries seconds of load headroom
+        # while the code-side bound a regression would serve (the full
+        # backoff schedule under the default per-attempt timeout=30)
+        # sits far past it — the separation contract the wallclock
+        # chokepoint enforces.
+        from core.testing.wallclock import check_wall_deadline
+        check_wall_deadline(
+            elapsed, 5, code_bound_s=30,
+            what="get_json with total_timeout=1",
         )
 
 
@@ -404,6 +406,44 @@ class TestStreamBytes:
             for _ in client.stream_bytes("https://example.com/big", max_bytes=100):
                 pass
         resp.release_conn.assert_called_once()  # finally fires on exception
+
+    def test_wallclock_abort_is_httperror(self, monkeypatch):
+        """The slowloris wallclock abort must raise an HttpError
+        subclass: both real consumers (OCI blob pull, web_fetch's
+        best-effort body) wrap iteration in `except HttpError` only —
+        a builtin TimeoutError escaped their degradation entirely on
+        exactly the paths the cap protects."""
+        from core.http import HttpError as _HttpError
+        from core.http import StreamWallclockExceeded
+
+        def _dripping(cs, decode_content=True):
+            while True:
+                yield b"x"
+
+        resp = MagicMock()
+        resp.status = 200
+        resp.headers = {}
+        resp.stream = _dripping
+        resp.release_conn = MagicMock()
+        client = UrllibClient(
+            _http=MagicMock(request=MagicMock(return_value=resp)),
+        )
+        # Advance the stream's clock past the cap deterministically:
+        # the generator reads time.monotonic per chunk.
+        import time as _stdlib_time
+        real_monotonic = _stdlib_time.monotonic
+        clock = {"skew": 0.0}
+        monkeypatch.setattr(
+            _stdlib_time, "monotonic",
+            lambda: real_monotonic() + clock["skew"],
+        )
+        with pytest.raises(StreamWallclockExceeded) as exc_info:
+            for _ in client.stream_bytes(
+                "https://example.com/slow", total_timeout=5,
+            ):
+                clock["skew"] += 10.0  # a chunk "took" 10s
+        assert isinstance(exc_info.value, _HttpError)
+        resp.release_conn.assert_called_once()
 
     def test_url_validation_at_call_time(self):
         """URL validation must fail at call time, not deferred to
@@ -858,27 +898,43 @@ class TestRetriesOptOut:
             client.get_json("https://example.com/api", retries=3)
         assert pool.request.call_count == 4
 
-    def test_no_sleep_after_final_attempt(self):
+    def test_no_sleep_after_final_attempt(self, monkeypatch):
         """REGRESSION: each schedule slot owns the sleep AFTER its
         attempt. The final slot has no next attempt, so we MUST NOT
         sleep before raising 'Exhausted retries' — otherwise retries=0
         + 503 sleeps schedule[0] (1s), and a default-config full
         failure burns the trailing 300s slot for nothing.
+
+        Asserted on the sleep CALL itself (recorded via a time-module
+        shim), not on wall clock: the old elapsed < 0.5 bound sat one
+        scheduler stall away from the buggy 1s sleep it distinguished.
         """
         import time as _time
+        import core.http.urllib_backend as _backend
+
+        class _RecordingTime:
+            """Delegates to the real time module; records sleeps."""
+
+            def __init__(self) -> None:
+                self.sleeps: list[float] = []
+
+            def sleep(self, seconds: float) -> None:
+                self.sleeps.append(seconds)
+
+            def __getattr__(self, name):
+                return getattr(_time, name)
+
+        shim = _RecordingTime()
+        monkeypatch.setattr(_backend, "time", shim)
         pool = MagicMock()
         pool.request.return_value = _stub_response(b"", status=503)
         client = UrllibClient(_http=pool)
 
-        t0 = _time.monotonic()
         with pytest.raises(HttpError):
             client.get_json("https://example.com/api", retries=0)
-        elapsed = _time.monotonic() - t0
-        # Real wall-clock — well under schedule[0]=1s. Slop allows
-        # for slow CI scheduling but well below the buggy 1s sleep.
-        assert elapsed < 0.5, (
-            f"retries=0 took {elapsed:.2f}s — likely slept the final "
-            f"schedule slot before raising"
+        assert shim.sleeps == [], (
+            f"retries=0 slept {shim.sleeps} — the final schedule slot "
+            f"must not sleep before raising"
         )
 
     def test_post_json_documents_idempotency(self):
@@ -1406,9 +1462,11 @@ def test_circuit_break_attribute_on_pre_request_check(_mock_sleep):
     assert pool.request.call_count == 0
 
 @patch("core.http.urllib_backend.time.sleep")
-def test_circuit_break_attribute_on_mid_retry_abort(_mock_sleep):
-    """When a retry loop trips the breaker, the mid-loop abort
-    raises HttpError with circuit_break=True."""
+def test_circuit_break_attribute_belongs_to_next_request(_mock_sleep):
+    """A request whose own failures open the breaker completes its
+    retry schedule and raises the ordinary exhausted-retries error —
+    the ``circuit_break=True`` marker belongs to the NEXT request's
+    entry fail-fast, never to a mid-schedule abort."""
     cb = _HostCircuitBreaker(threshold=2, cooldown=120.0)
     r429 = _stub_response(b"", status=429, reason="Too Many")
     pool = MagicMock()
@@ -1419,7 +1477,14 @@ def test_circuit_break_attribute_on_mid_retry_abort(_mock_sleep):
             "https://tripped.example.com/x",
             total_timeout=60, retries=2,
         )
-    assert exc_info.value.circuit_break is True
+    assert not exc_info.value.circuit_break
+
+    with pytest.raises(HttpError) as exc_next:
+        client.get_json(
+            "https://tripped.example.com/y",
+            total_timeout=60, retries=2,
+        )
+    assert exc_next.value.circuit_break is True
 
 
 class TestOperatorProxyEnv:
@@ -1744,3 +1809,117 @@ class TestStreamExceptionTranslation:
             for chunk in it:
                 collected.append(chunk)
         assert collected == [b"first"]
+
+
+# ---------------------------------------------------------------------------
+# Circuit breaker vs backoff schedule — per-request granularity
+# ---------------------------------------------------------------------------
+
+
+class TestBreakerPerRequestGranularity:
+    """The breaker fail-fasts SUBSEQUENT requests; a request already in
+    flight completes its documented backoff schedule. Both directions
+    pinned: schedule reachable for status-driven failures AND hard-down
+    hosts still bounded to one request's budget + cooldown."""
+
+    @patch("core.http.urllib_backend.time.sleep")
+    def test_in_flight_request_completes_schedule_despite_open_breaker(
+        self, _mock_sleep,
+    ):
+        """Default threshold (2) opens the circuit on the 2nd 429 of a
+        single request — the in-flight request must still fire every
+        remaining schedule slot instead of being capped at one retry."""
+        cb = _HostCircuitBreaker(threshold=2, cooldown=120.0)
+        r429 = _stub_response(b"", status=429, reason="Too Many Requests")
+        pool = MagicMock()
+        pool.request.return_value = r429
+        client = UrllibClient(_http=pool, circuit_breaker=cb)
+        with pytest.raises(HttpError, match="Exhausted retries"):
+            client.get_json(
+                "https://rate-limited.example.com/x",
+                total_timeout=600, retries=4,
+            )
+        # All 5 attempts (initial + 4 retries) reached the pool.
+        assert pool.request.call_count == 5
+
+        # ...and the breaker still protects the NEXT request.
+        assert cb.is_open("rate-limited.example.com", 443)[0] is True
+        pool.request.reset_mock()
+        with pytest.raises(HttpError, match="Circuit open"):
+            client.get_json("https://rate-limited.example.com/y")
+        assert pool.request.call_count == 0
+
+    @patch("core.http.urllib_backend.time.sleep")
+    def test_retry_after_honoured_beyond_first_retry(self, mock_sleep):
+        """Retry-After steers EVERY slot's sleep — pre-fix the breaker
+        aborted after the second 429, so a host asking for a pause was
+        blocklisted instead of retried per its own instruction; a
+        mid-schedule success must also close the circuit again."""
+        cb = _HostCircuitBreaker(threshold=2, cooldown=120.0)
+        r429 = _stub_response(
+            b"", status=429, reason="Too Many Requests",
+            extra_headers={"Retry-After": "7"},
+        )
+        ok = _stub_response(b'{"ok": 1}')
+        pool = MagicMock()
+        pool.request.side_effect = [r429, r429, r429, ok]
+        client = UrllibClient(_http=pool, circuit_breaker=cb)
+        result = client.get_json(
+            "https://flaky.example.com/x", total_timeout=600, retries=3,
+        )
+        assert result == {"ok": 1}
+        sleeps = [c.args[0] for c in mock_sleep.call_args_list]
+        assert sleeps == [7, 7, 7]
+        assert cb.is_open("flaky.example.com", 443)[0] is False
+
+
+class TestStreamErrorBodyReadTranslation:
+    """A server that answers 4xx/5xx headers then stalls or resets
+    during the bounded error-body read raises raw urllib3 types from
+    resp.read() — those must translate to HttpError like the mid-body
+    loop (consumers guard the stream with ``except HttpError`` only)."""
+
+    def test_4xx_snippet_read_timeout_translates_to_httperror(self):
+        import urllib3.exceptions as u3e
+
+        resp = _stub_response(b"", status=503,
+                              reason="Service Unavailable", final_url="")
+
+        def _raise(*a, **kw):
+            raise u3e.ReadTimeoutError(None, "https://example.com/blob",
+                                       "Read timed out.")
+
+        resp.read = _raise
+        client, _pool = _client_with_mock_pool(resp)
+        it = client.stream_bytes("https://example.com/blob")
+        with pytest.raises(HttpError) as excinfo:
+            next(it)
+        assert excinfo.value.status == 503
+        assert "error-body read failed" in str(excinfo.value)
+
+    def test_4xx_snippet_protocol_error_translates_to_httperror(self):
+        import urllib3.exceptions as u3e
+
+        resp = _stub_response(b"", status=404,
+                              reason="Not Found", final_url="")
+
+        def _raise(*a, **kw):
+            raise u3e.ProtocolError("Connection broken: reset")
+
+        resp.read = _raise
+        client, _pool = _client_with_mock_pool(resp)
+        it = client.stream_bytes("https://example.com/blob")
+        with pytest.raises(HttpError):
+            next(it)
+
+    def test_4xx_snippet_normal_read_still_reports_status(self):
+        # Two-direction: the happy 4xx path (readable error body)
+        # keeps its status + redacted-snippet shape.
+        resp = _stub_response(b"nope", status=418,
+                              reason="Teapot", final_url="")
+        client, _pool = _client_with_mock_pool(resp)
+        it = client.stream_bytes("https://example.com/blob")
+        with pytest.raises(HttpError) as excinfo:
+            next(it)
+        assert excinfo.value.status == 418
+        assert "418" in str(excinfo.value)

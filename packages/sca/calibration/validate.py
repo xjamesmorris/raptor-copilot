@@ -34,6 +34,22 @@ from typing import Any, TYPE_CHECKING
 
 from core.json import load_json, save_json
 
+
+def _ground_truth_files() -> tuple[str, ...]:
+    """Locator for the ground-truth label sources — the single list
+    shared by the exploited-set loader and the provenance block so the
+    two can never drift apart. Each file is parsed with ``load_json``
+    by both callers.
+    """
+    return (
+        "kev_signals.json",
+        "exploitdb_signals.json",
+        "metasploit_signals.json",
+        "github_poc_signals.json",
+        "osv_evidence_signals.json",
+        "vulnrichment_signals.json",
+    )
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -66,19 +82,33 @@ def validate_corpus(
     corpus_dir: Path,
     *,
     out_path: Path | None = None,
+    update_snapshot: bool = False,
     threshold_top_20: float = 0.5,
     threshold_spearman: float = 0.4,
 ) -> ValidationReport:
-    """Compute metrics + emit a validation report.
+    """Compute metrics + return a validation report.
 
     ``corpus_dir`` is the calibration data directory containing
     ``kev_signals.json`` / ``exploitdb_signals.json`` /
     ``metasploit_signals.json`` plus a ``project_samples/`` tree.
 
+    Report emission is caller-directed: ``out_path`` writes the
+    report to an explicit file; ``update_snapshot=True`` writes the
+    dated snapshot under ``<corpus_dir>/validation/`` AND prunes
+    that directory to its retention window — that dir is
+    repo-committed, so only the refresh workflow (whose job is to
+    commit a new snapshot) passes it. With neither, no file is
+    written: the natural "verify the committed report reproduces"
+    invocation must not overwrite the committed same-day snapshot
+    or prune committed history as a side effect of reading metrics.
+
     Thresholds: top-20 precision ≥ 0.5 (half of top-20 findings
     have exploit evidence) AND Spearman ρ ≥ 0.4 (moderate positive
     correlation). Below either ⇒ verdict = ``needs_retune``.
     """
+    if out_path is not None and update_snapshot:
+        msg = "out_path and update_snapshot are mutually exclusive"
+        raise ValueError(msg)
     snapshot = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     signals = _load_ground_truth(corpus_dir)
     samples = _load_project_samples(corpus_dir / "project_samples")
@@ -87,6 +117,13 @@ def validate_corpus(
     # ecosystem breakdown separately.
     all_findings: list[tuple[str, float, bool]] = []   # (eco, score, exploited)
     by_eco: dict[str, list[tuple[float, bool]]] = {}
+    # Per-ecosystem count of findings whose advisory yields ≥1 CVE
+    # join key. ``with_signal`` alone can't distinguish "nothing in
+    # this ecosystem is exploited" from "nothing in this ecosystem
+    # can even JOIN the ground truth" — the latter is a label-
+    # coverage collapse (the distro-primary-id family spent months
+    # at with_cve=0 while the report only showed with_signal=0).
+    with_cve_by_eco: dict[str, int] = {}
     for sample in samples:
         for f in sample["findings"]:
             if not isinstance(f, dict):
@@ -100,6 +137,8 @@ def validate_corpus(
             exploited = any(c in signals for c in cve_ids)
             all_findings.append((eco, float(score), exploited))
             by_eco.setdefault(eco, []).append((float(score), exploited))
+            if cve_ids:
+                with_cve_by_eco[eco] = with_cve_by_eco.get(eco, 0) + 1
 
     # Counts.
     total = sum(len(s["findings"]) for s in samples)
@@ -123,6 +162,7 @@ def validate_corpus(
         sorted_rows = sorted(rows, key=lambda t: -t[0])
         eco_breakdown[eco] = {
             "total": len(rows),
+            "with_cve": with_cve_by_eco.get(eco, 0),
             "with_signal": sum(1 for _, ex in rows if ex),
             "top_20_precision": _top_n_precision_2(sorted_rows, n=20),
             "spearman_rho": _spearman_rho(
@@ -154,18 +194,29 @@ def validate_corpus(
     )
 
     prune_dir: Path | None = None
-    if out_path is None:
+    if update_snapshot:
         validation_dir = corpus_dir / "validation"
         validation_dir.mkdir(parents=True, exist_ok=True)
         out_path = validation_dir / f"{snapshot}.json"
         prune_dir = validation_dir
+    elif out_path is None:
+        # Metrics-only run — report returned, nothing written.
+        logger.info(
+            "sca.calibration.validate: metrics-only run (no out_path; "
+            "pass update_snapshot=True to write the committed dated "
+            "snapshot)",
+        )
+        return report
     else:
         out_path.parent.mkdir(parents=True, exist_ok=True)
     save_json(out_path, report.to_dict(), sort_keys=True)
     if prune_dir is not None:
         # Retention: the dated snapshots accumulate one file per run
         # with no other pruning mechanism; keep the consumer-visible
-        # window (~6 months of weekly history) bounded.
+        # window (~6 months of weekly history) bounded. Pruning only
+        # runs on the explicit snapshot-update path — it deletes
+        # committed history, so it must never ride along on a local
+        # verification run.
         from ._snapshots import VALIDATION_KEEP, prune_dated_snapshots
         prune_dated_snapshots(prune_dir, keep=VALIDATION_KEEP)
     return report
@@ -186,10 +237,7 @@ def _load_ground_truth(corpus_dir: Path) -> set[str]:
     have skewed the precision metric vs the metric refit optimises.
     """
     exploited: set[str] = set()
-    for fname in ("kev_signals.json", "exploitdb_signals.json",
-                   "metasploit_signals.json", "github_poc_signals.json",
-                   "osv_evidence_signals.json",
-                   "vulnrichment_signals.json"):
+    for fname in _ground_truth_files():
         path = corpus_dir / fname
         if not path.is_file():
             continue
@@ -236,8 +284,19 @@ def _extract_cve_ids(advisory: dict[str, Any]) -> list[str]:
     vulnerabilities — including their CVE aliases in the
     ground-truth ``signals`` set would mark hundreds of
     non-security findings as ``exploited`` and depress
-    Spearman ρ. Validator (and refit) skip them entirely so the
-    metric measures actual exploitation signal only."""
+    Spearman ρ. The rows themselves stay in the metric population
+    as negatives (only their CVE ids are excluded from the
+    exploited join); see :func:`validate_corpus`.
+
+    Every id resolves through ``models.canonical_cve_id`` — the
+    single owner of the CVE-join key shape — so the corpus label
+    join and the live KEV / EPSS / SSVC enrichment join can never
+    drift: distro-namespaced ``<DISTRO>-CVE-*`` primary ids
+    (Debian / Ubuntu / Alpine secdb, empty alias lists) and
+    lowercase feed spellings both land on the canonical uppercase
+    CVE key here exactly as they do at scan time."""
+    from ..models import canonical_cve_id
+
     out: list[str] = []
     if not isinstance(advisory, dict):
         return out
@@ -245,15 +304,19 @@ def _extract_cve_ids(advisory: dict[str, Any]) -> list[str]:
         return out
     aliases = advisory.get("aliases") or []
     if isinstance(aliases, list):
-        out.extend(a for a in aliases if isinstance(a, str) and a.startswith("CVE-"))
+        for a in aliases:
+            canonical = canonical_cve_id(a)
+            if canonical is not None and canonical not in out:
+                out.append(canonical)
     # ``findings.py::_advisory_summary`` archives the primary OSV
     # record id under ``id``; ``osv_id`` is kept as a fallback for
     # rows/fixtures written before the key settled. Without the
     # ``id`` read, a CVE-primary OSV record with no CVE alias lost
     # its exploited label entirely.
     primary = advisory.get("id") or advisory.get("osv_id") or ""
-    if isinstance(primary, str) and primary.startswith("CVE-"):
-        out.append(primary)
+    canonical = canonical_cve_id(primary)
+    if canonical is not None and canonical not in out:
+        out.append(canonical)
     return out
 
 
@@ -285,10 +348,11 @@ def _spearman_rho(
 ) -> float | None:
     """Spearman rank correlation, hand-rolled (no scipy).
 
-    ρ = 1 - (6 · Σd²) / (n · (n² - 1))
-
-    Where d is the difference between ranks of paired values.
-    Tied ranks use the average-rank convention.
+    Computed as the Pearson correlation of the average ranks —
+    the correct general form under ties. (The textbook
+    ``1 − 6·Σd² / (n·(n² − 1))`` shortcut is equivalent only when
+    there are NO ties; our binary exploited labels are almost all
+    ties, so the shortcut would be wrong here.)
 
     Returns None when there are fewer than 2 paired values (not
     enough to compute a meaningful correlation) or all-x or all-y
@@ -311,7 +375,7 @@ def _spearman_rho(
     return num / (den_x * den_y)
 
 
-def _ranks(values: list[float]) -> list[float]:
+def _ranks(values: list[int] | list[float]) -> list[float]:
     """Average-rank ranking (handles ties)."""
     indexed = sorted(range(len(values)), key=lambda i: values[i])
     ranks = [0.0] * len(values)
@@ -374,8 +438,11 @@ def _provenance_summary(corpus_dir: Path) -> dict[str, str]:
     when validation ran. Lets reviewers reproduce metrics
     against the same corpus state."""
     out: dict[str, str] = {}
-    for fname in ("kev_signals.json", "epss_signals.json",
-                   "exploitdb_signals.json", "metasploit_signals.json"):
+    # Every source _load_ground_truth unions, plus epss (a scoring
+    # signal with its own snapshot) — pre-fix the dominant label source
+    # (vulnrichment, ~29k labels) was missing from the provenance
+    # block, making metric shifts unattributable.
+    for fname in _ground_truth_files() + ("epss_signals.json",):
         path = corpus_dir / fname
         if not path.is_file():
             continue

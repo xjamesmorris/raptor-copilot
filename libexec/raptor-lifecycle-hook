@@ -45,6 +45,7 @@ FAILURE_MARKER = ".raptor-tool-failure"
 
 # .raptor-run.json metadata files are tiny.
 _MAX_META_BYTES = 8 * 1024 * 1024
+_MAX_HOOK_EVENT_BYTES = 1 * 1024 * 1024
 
 # Multi-turn commands where the LLM orchestrates across separate tool
 # calls.  tool_pid from start_run is dead by the next turn, so Stop
@@ -61,6 +62,308 @@ _MAX_META_BYTES = 8 * 1024 * 1024
 _MULTI_TURN_COMMANDS = frozenset({"validate", "understand", "audit"})
 
 
+# A raptor dispatch INVOCATION: `libexec/raptor-<name>` (optionally
+# behind an absolute / "$CLAUDE_PROJECT_DIR" path prefix) in COMMAND
+# position — start of string, or right after a shell command separator
+# (;, &, &&, |, ||, subshell paren, newline). A bare substring match
+# stamped the marker for commands that merely MENTION the surface:
+# the documented `ls libexec/raptor-<name>*` dispatch probe exits 2
+# on a glob miss, and grep/cat over a script path behaves the same —
+# each flipped an unrelated successful run to Failed at the next
+# Stop. Not matched (accepted, per the fail direction below):
+# interpreter/wrapper/env-var prefixes (`bash x`, `timeout 60 x`,
+# `VAR=y x`) — EXECUTION RULES forbid those spellings for dispatch.
+# Both interior spans are bounded: unbounded, a command string that
+# repeats separators (each anchoring an attempt whose `\s*` or `\S*`
+# re-scans the rest of the string) is quadratic (measured exp 2.02;
+# bounded, exp 1.0).  Both directions: raising the bounds re-opens
+# per-separator rescan cost; lowering them drops real spellings —
+# 64 covers any sane indent after a separator, 512 any real path
+# prefix ending in `/`.
+import re  # noqa: E402
+
+_RAPTOR_INVOCATION_RE = re.compile(
+    r'(?:\A|[;&|(]|\n)\s{0,64}(?:\S{0,512}/)?libexec/raptor-[A-Za-z0-9._-]+'
+)
+
+
+def _read_hook_payload(stream, *, copilot: bool, event: str) -> dict | None:
+    """Read one bounded fixed-profile hook payload into canonical keys.
+
+    The hook command and verified session host select the profile; payload
+    bytes never select it. Mixed snake/camel aliases are refused rather than
+    applying precedence to attacker-influenced event data.
+    """
+    from core.json import loads_bounded
+
+    try:
+        reader = getattr(stream, "buffer", stream)
+        raw = reader.read(_MAX_HOOK_EVENT_BYTES + 1)
+    except (OSError, ValueError):
+        return None
+    if isinstance(raw, str):
+        try:
+            raw = raw.encode("utf-8")
+        except UnicodeEncodeError:
+            return None
+    if not isinstance(raw, bytes) or len(raw) > _MAX_HOOK_EVENT_BYTES:
+        return None
+    try:
+        payload = loads_bounded(
+            raw,
+            max_bytes=_MAX_HOOK_EVENT_BYTES,
+            reject_duplicate_keys=True,
+        )
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    camel = {
+        "hook_event_name": "hookEventName",
+        "session_id": "sessionId",
+        "tool_name": "toolName",
+        "tool_input": "toolArgs",
+        "reason": "reason",
+    }
+    snake = {
+        "hook_event_name": "hook_event_name",
+        "session_id": "session_id",
+        "tool_name": "tool_name",
+        "tool_input": "tool_input",
+        "reason": "reason",
+    }
+    camel_unique = {"hookEventName", "sessionId", "toolName", "toolArgs"}
+    snake_unique = {"hook_event_name", "session_id", "tool_name", "tool_input"}
+
+    if copilot:
+        # Copilot's programmatic/internal event is camelCase, while a
+        # PascalCase command-hook registration is translated to the VS Code
+        # compatible snake_case envelope. The verified host plus fixed hook
+        # command selects these two known profiles; payload bytes may choose
+        # only one complete spelling, never mix aliases.
+        has_camel = any(key in payload for key in camel_unique)
+        has_snake = any(key in payload for key in snake_unique)
+        if has_camel and has_snake:
+            return None
+        if has_snake:
+            selected = snake
+            forbidden = camel_unique
+            expected_kind = {
+                "tool-failure": "PostToolUseFailure",
+                "session-end": "SessionEnd",
+            }.get(event)
+        else:
+            selected = camel
+            forbidden = snake_unique
+            expected_kind = {
+                "tool-failure": "postToolUseFailure",
+                "session-end": "sessionEnd",
+            }.get(event)
+    else:
+        selected = snake
+        forbidden = camel_unique
+        expected_kind = {
+            "tool-failure": "PostToolUseFailure",
+            "session-end": "SessionEnd",
+        }.get(event)
+
+    if any(key in payload for key in forbidden):
+        return None
+    declared = payload.get(selected["hook_event_name"])
+    if declared is not None and declared != expected_kind:
+        return None
+    canonical = {}
+    for name, key in selected.items():
+        if key in payload:
+            canonical[name] = payload[key]
+    for name in ("hook_event_name", "session_id", "tool_name", "reason"):
+        if name in canonical and not isinstance(canonical[name], str):
+            return None
+    if "tool_input" in canonical and not isinstance(canonical["tool_input"], dict):
+        return None
+    if copilot and canonical.get("tool_name") == "shell":
+        canonical["tool_name"] = "Bash"
+    return canonical
+
+
+def _tool_failure_command(payload: object) -> str | None:
+    """The failing Bash command when it is a RAPTOR pipeline
+    invocation, else ``None`` — only such failures mark a live run.
+
+    settings.json registers the tool-failure hook with a ``Bash``
+    matcher, but tool-NAME matching alone would stamp the failure
+    marker for ANY failed Bash call in the session (a typo'd grep,
+    an unrelated build command) — the next Stop then finalizes a
+    SUCCESSFUL run as failed. Command-string filtering isn't a
+    supported hook-config field, so require a canonical Bash tool_input
+    whose command INVOKES the
+    ``libexec/raptor-`` dispatch surface (see the regex above).
+
+    Fail direction (both-directions trade-off): unreadable, malformed,
+    or non-matching stdin → NOT relevant, no marker. A spurious marker
+    flips a successful run to Failed at the next Stop; a missed marker
+    merely restores the pre-marker behaviour (run completes; the
+    command's own error handling still reports the failure).
+    """
+    if not isinstance(payload, dict) and hasattr(payload, "read"):
+        payload = _read_hook_payload(
+            payload,
+            copilot=False,
+            event="tool-failure",
+        )
+    if not isinstance(payload, dict) or payload.get("tool_name") != "Bash":
+        return None
+    tool_input = payload.get("tool_input")
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    if isinstance(command, str) and _RAPTOR_INVOCATION_RE.search(command):
+        return command
+    return None
+
+
+# SessionEnd ``reason`` values after which the OWNER PROCESS SURVIVES
+# the event: /clear and resume-away retire the *session id* while the
+# claude process — and any background orchestrator it hosts — keeps
+# running and may still finalize its in-flight runs. Only these
+# provably-survives reasons skip the owner-end finalization; an
+# unknown or absent reason finalizes (the reason enum may grow, and a
+# missed skip is recoverable via the abandon-sweep marker, while a
+# standing skip re-opens the never-reaped orphan this path closes).
+_SESSION_SURVIVES_REASONS = ("clear", "resume")
+
+
+def _session_end_payload(
+    payload: object,
+) -> "tuple[str | None, str | None]":
+    """``(session_id, reason)`` from the SessionEnd hook payload.
+
+    Canonicalized Claude/Copilot hook payloads carry the FIRING session's
+    own ``session_id``; run metadata records the owning session's id at
+    start_run (from the env the frontend injects into tool calls). A match
+    therefore proves the ending session IS the run's owner. A nested
+    subagent's SessionEnd carries the subagent's own id, which never matches
+    a run the parent session stamped.
+    ``reason`` (this CLI's enum: clear / resume / logout /
+    prompt_input_exit / other) qualifies the match — see
+    ``_SESSION_SURVIVES_REASONS``.
+
+    Fail direction: unreadable, malformed, or non-uuid-shaped payload
+    → ``(None, None)``, which keeps the liveness-gated (skip)
+    behaviour — a missed match merely defers the reap to the next
+    start_run sweep, while a spurious match would fail a live run.
+    """
+    if not isinstance(payload, dict) and hasattr(payload, "read"):
+        payload = _read_hook_payload(
+            payload,
+            copilot=False,
+            event="session-end",
+        )
+    if not isinstance(payload, dict):
+        return None, None
+    raw_reason = payload.get("reason")
+    if raw_reason is None:
+        reason = None
+    elif (
+        isinstance(raw_reason, str)
+        and len(raw_reason) <= 128
+        and raw_reason.isascii()
+        and raw_reason.isprintable()
+    ):
+        reason = raw_reason
+    else:
+        return None, None
+    sid = payload.get("session_id")
+    from core.run.metadata import _SESSION_ID_RE
+    if isinstance(sid, str) and _SESSION_ID_RE.fullmatch(sid):
+        return sid, reason
+    return None, reason
+
+
+def _copilot_run_matches_binding(
+    run_dir: Path,
+    meta: dict,
+    session_pid: int,
+    binding: "tuple[str | None, str]",
+) -> bool:
+    """Require one exact current project pin for a Copilot ledger run."""
+    project, state = binding
+    if state not in ("bound", "none"):
+        return False
+    recorded_project = meta.get("project")
+    if project is None:
+        if recorded_project is not None:
+            return False
+    elif recorded_project != project:
+        return False
+    try:
+        from core.project.sessions import ledger_pin_witness
+
+        found, witnessed_project, _source = ledger_pin_witness(
+            run_dir,
+            pid=session_pid,
+        )
+    except Exception:  # noqa: BLE001 — exact project authority fails closed
+        return False
+    return found and witnessed_project == project
+
+
+def _pick_failure_run(matching: list, command: str) -> "Path | None":
+    """Attribute a tool failure to ONE running run.
+
+    Stamping every running run of the session let a failed read-only
+    query poison an unrelated in-flight run (the next Stop then
+    fail_run's it). Prefer the run whose directory the failing
+    command names (longest path match — lifecycle-managed commands
+    carry their OUTPUT_DIR); otherwise the newest running run, which
+    is the one a just-failed single-call command belongs to.
+
+    ``matching`` holds ``(run_dir, metadata)`` pairs.
+    """
+    named = [d for d, _m in matching if str(d) in command]
+    if named:
+        return max(named, key=lambda d: len(str(d)))
+
+    def _started(pair):
+        ts = pair[1].get("timestamp")
+        return ts if isinstance(ts, str) else ""
+
+    newest = max(matching, key=_started, default=None)
+    return newest[0] if newest else None
+
+
+def _too_young_to_judge(meta: dict) -> bool:
+    """True when the run started so recently that the Stop path must
+    not judge it yet.
+
+    The Stop finalisation is a heuristic: it infers "the tool call
+    ended" from the recorded worker credential reading dead. On a run
+    that JUST started, that inference is at its weakest — the pipeline
+    may still be mid-flight (its own finaliser milliseconds away) while
+    the recorded parent shell has already been replaced. Reuse the
+    abandon-sweep freshness floor: within it, skip and let the run's
+    own finaliser (or a later Stop / the SessionEnd reap) settle it.
+
+    Fail direction: a missing/unparseable/future-dated timestamp is
+    NOT young — the hook may act, so a corrupt stamp can never park a
+    run in ``running`` forever.
+    """
+    from datetime import datetime, timezone
+
+    from core.run.metadata import _ABANDON_FRESHNESS_S
+
+    ts = meta.get("timestamp")
+    if not isinstance(ts, str):
+        return False
+    try:
+        started = datetime.fromisoformat(ts)
+    except ValueError:
+        return False
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    age_s = (datetime.now(timezone.utc) - started).total_seconds()
+    return 0 <= age_s < _ABANDON_FRESHNESS_S
+
+
 def main():
     if len(sys.argv) < 2 or sys.argv[1] not in ("stop", "session-end", "tool-failure"):
         print(f"Usage: {Path(__file__).name} stop|session-end|tool-failure",
@@ -71,8 +374,9 @@ def main():
 
     from core.json import load_json
     from core.run.metadata import (
-        _get_session_pid, _pid_alive, complete_run, fail_run,
-        RUN_METADATA_FILE, STATUS_RUNNING,
+        _get_session_pid, _metadata_owned_by_session, _session_alive_for_meta,
+        complete_run, fail_run, RUN_METADATA_FILE, STATUS_RUNNING,
+        worker_liveness_for_meta,
     )
 
     # The ONE shared resolver (env credential first, claude-ancestor
@@ -92,16 +396,49 @@ def main():
         # happened.
         #
         # Two-tier emit: stderr breadcrumb (one short line, won't
-        # spam interactive sessions because legitimate Claude Code
-        # invocations always find the ancestor) + non-zero exit
-        # code 0 (the hook ran successfully — there was just
-        # nothing to do; failing here would surface in Claude Code
-        # as a hook error and confuse the operator).
+        # spam interactive sessions because legitimate launcher
+        # invocations carry a verified owner credential) + exit code
+        # 0 (the hook ran successfully — there was just nothing to
+        # do; failing here would surface as a hook error and confuse
+        # the operator).
         sys.stderr.write(
-            f"raptor-lifecycle-hook[{event}]: no claude-code ancestor "
-            f"in pid tree from pid {os.getpid()}; nothing to do\n"
+            f"raptor-lifecycle-hook[{event}]: no verified RAPTOR "
+            f"session owner from pid {os.getpid()}; nothing to do\n"
         )
         return
+
+    # Only a verified strong Copilot owner activates the camelCase profile.
+    # Legacy or host-less sessions retain the exact Claude payload contract.
+    copilot_event = False
+    copilot_binding: tuple[str | None, str] = (None, "absent")
+    try:
+        from core.project.sessions import session_binding, session_host_claim
+        from core.startup.host import Frontend
+        claim = session_host_claim(session_pid)
+        copilot_event = claim is not None and claim.frontend is Frontend.COPILOT
+        if copilot_event:
+            copilot_binding = session_binding(session_pid)
+    except Exception:  # noqa: BLE001 — profile selection fails closed
+        pass
+
+    hook_payload = None
+    if event in ("tool-failure", "session-end"):
+        hook_payload = _read_hook_payload(
+            sys.stdin,
+            copilot=copilot_event,
+            event=event,
+        )
+
+    failing_command = None
+    if event == "tool-failure":
+        failing_command = _tool_failure_command(hook_payload)
+        if failing_command is None:
+            return
+
+    end_session_id = None
+    end_reason = None
+    if event == "session-end":
+        end_session_id, end_reason = _session_end_payload(hook_payload)
 
     # PRIMARY discovery: the session's run ledger (exact — the records
     # were written by this session's own lifecycle starts). The
@@ -159,21 +496,30 @@ def main():
         if key not in seen:
             seen.add(key)
             candidates.append(d)
-    for parent in scan_dirs:
-        try:
-            children = list(parent.iterdir())
-        except OSError:
-            continue
-        for d in children:
+    # A strong Copilot launch has an isolated owner-authored ledger. Keep it
+    # as the sole discovery surface: directory fallback could otherwise
+    # sweep copied metadata from another registry/project whose numeric pid
+    # happens to match. Claude retains its pre-ledger fallback semantics.
+    if not copilot_event:
+        for parent in scan_dirs:
             try:
-                if not d.is_dir() or d.name.startswith((".", "_")):
-                    continue
+                children = list(parent.iterdir())
             except OSError:
                 continue
-            key = str(d)
-            if key not in seen:
-                seen.add(key)
-                candidates.append(d)
+            for d in children:
+                try:
+                    if not d.is_dir() or d.name.startswith((".", "_")):
+                        continue
+                except OSError:
+                    continue
+                key = str(d)
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append(d)
+
+    # tool-failure: collect this session's running runs, then stamp
+    # exactly ONE below (see _pick_failure_run).
+    failure_candidates = []
 
     for d in candidates:
             try:
@@ -188,33 +534,63 @@ def main():
             if not isinstance(meta, dict):
                 meta = {}
             if (meta.get("status") != STATUS_RUNNING
-                    or meta.get("session_pid") != session_pid):
+                    or not _metadata_owned_by_session(meta, session_pid)):
+                continue
+            if (
+                copilot_event
+                and not _copilot_run_matches_binding(
+                    d,
+                    meta,
+                    session_pid,
+                    copilot_binding,
+                )
+            ):
                 continue
 
             if event == "tool-failure":
-                try:
-                    (d / FAILURE_MARKER).write_text("")
-                except OSError:
-                    pass
+                failure_candidates.append((d, meta))
                 continue
 
-            tool_pid = meta.get("tool_pid")
             command = meta.get("command", "")
 
             if event == "stop":
                 if command in _MULTI_TURN_COMMANDS:
                     continue
-                if tool_pid and _pid_alive(tool_pid):
+                # Worker liveness through the shared chokepoint: full
+                # (pid, starttime) identity for stamped records, so a
+                # recycled pid never blocks the finalize, and a pid-1
+                # legacy record never blocks it forever. (The previous
+                # _pid_alive call was the SESSION checker — its
+                # claude-comm cross-check read every live non-claude
+                # worker as dead, finalizing runs whose worker still
+                # ran.)
+                if worker_liveness_for_meta(meta)[0]:
+                    continue
+                # Freshness floor: a run this young is judged from the
+                # weakest evidence (see _too_young_to_judge) — leave it
+                # for its own finaliser or a later Stop/SessionEnd.
+                if _too_young_to_judge(meta):
                     continue
                 try:
                     has_failure = (d / FAILURE_MARKER).exists()
                 except OSError:
                     has_failure = False
                 try:
+                    # ``hook_finalize`` marks this as a heuristic
+                    # verdict: if the liveness inference misjudged (the
+                    # run was in fact mid-flight), the run's real
+                    # finaliser overrides the stamped status — see the
+                    # recovery clause in
+                    # core.run.metadata._update_status, which pops the
+                    # marker and the error on override. Unmarked, a
+                    # wrong Stop-path ``completed`` was FINAL: the
+                    # terminal guard then refused the owner's genuine
+                    # fail_run and a failed scan read Completed forever.
                     if has_failure:
-                        fail_run(d, "tool exited with error")
+                        fail_run(d, "tool exited with error",
+                                 extra={"hook_finalize": True})
                     else:
-                        complete_run(d)
+                        complete_run(d, extra={"hook_finalize": True})
                     (d / FAILURE_MARKER).unlink(missing_ok=True)
                 except (OSError, ValueError) as e:
                     # Missing/malformed .raptor-run.json or an unlink
@@ -222,14 +598,98 @@ def main():
                     print(f"lifecycle-hook: failed to finalize {d}: {e}",
                           file=sys.stderr)
             else:  # session-end
+                # A SessionEnd event does not prove the RECORDED
+                # session died: nested subagents inherit the parent
+                # session's identity env, so their own session-end
+                # resolves to the parent's pid and matched the
+                # parent's live in-flight runs here — the reap failed
+                # a run whose owner was alive and mid-pipeline. When
+                # the meta carries the identity stamp (session_start +
+                # session_boot_id, written by start_run), require
+                # proof of death via the full identity check (pid +
+                # starttime + boot id + pid namespace — a live pid
+                # with a mismatching stamp is a recycled pid, i.e. a
+                # dead owner, and still reaps). A session alive by
+                # that proof covers BOTH a subagent/child exit AND the
+                # owner's own graceful end (this hook runs as a child
+                # of the still-alive owner process) — which retired
+                # the immediate reap for stamped metas entirely.
+                #
+                # OWNER-END PROOF restores it: when the SessionEnd
+                # payload's session_id matches the id start_run
+                # recorded (``session_id``, from the env the harness
+                # injects into tool calls), the ending session IS the
+                # run's owner — its own graceful end leaves the run
+                # genuinely unowned, so finalize now even though the
+                # owner process still breathes during hook execution.
+                # A nested subagent's SessionEnd carries the
+                # subagent's OWN id and never matches; a mismatching
+                # or absent payload/stamp keeps the liveness-gated
+                # skip (orphans then wait for the next start_run
+                # sweep — hard-killed sessions never fired SessionEnd
+                # anyway). Unstamped legacy metas offer no proof
+                # either way and keep the unconditional reap.
+                recorded_sid = meta.get("session_id")
+                owner_end = (
+                    end_session_id is not None
+                    and isinstance(recorded_sid, str)
+                    and recorded_sid == end_session_id
+                    # /clear and resume-away retire the session id but
+                    # the owner PROCESS survives (a background
+                    # orchestrator may still finalize) — those two
+                    # reasons keep the liveness-gated skip.
+                    and end_reason not in _SESSION_SURVIVES_REASONS
+                )
+                if (not owner_end
+                        and meta.get("session_start")
+                        and meta.get("session_boot_id")
+                        and _session_alive_for_meta(meta)):
+                    print(
+                        f"lifecycle-hook: session-end for {d} but the "
+                        f"recorded session (pid {session_pid}) is "
+                        "still alive (own graceful end or subagent "
+                        "exit) — leaving the run for its finaliser or "
+                        "the next start_run sweep",
+                        file=sys.stderr,
+                    )
+                    continue
                 try:
-                    fail_run(d, "session ended without explicit completion")
+                    if owner_end:
+                        # Exact payload/session/project/ledger ownership is a
+                        # terminal SessionEnd verdict, not an abandon guess.
+                        extra = {"session_end_cleanup": True}
+                        if end_reason is not None:
+                            extra["session_end_reason"] = end_reason
+                    else:
+                        # ``abandon_sweep`` marks a liveness-derived
+                        # heuristic verdict. A real finaliser may override it
+                        # through metadata's recovery clause.
+                        extra = {"abandon_sweep": True}
+                    fail_run(
+                        d,
+                        "session ended without explicit completion",
+                        extra=extra,
+                    )
                     (d / FAILURE_MARKER).unlink(missing_ok=True)
                 except (OSError, ValueError) as e:
                     # Missing/malformed .raptor-run.json or an unlink
                     # failure — report and keep scanning other runs.
                     print(f"lifecycle-hook: failed to finalize {d}: {e}",
                           file=sys.stderr)
+
+    if event == "tool-failure" and failure_candidates:
+        target = _pick_failure_run(failure_candidates, failing_command or "")
+        if target is not None:
+            try:
+                # Exclusive create: the run dir is sandbox-writable —
+                # a bare write_text at the predictable marker name
+                # follows a planted symlink. An already-present
+                # marker (FileExistsError) means the run is already
+                # flagged; same best-effort swallow as before.
+                from core.atomic_fs import write_new_text
+                write_new_text(target / FAILURE_MARKER, "")
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":

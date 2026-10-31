@@ -15,8 +15,9 @@ Phase 1 of the consistency programme upgrades the per-site boolean
   is never consulted before rebinding/exit;
 * ``discarded`` — bare expression statement;
 * ``acknowledged`` — explicit-discard idioms (C/C++ ``(void)f()``,
-  Rust ``let _ =``, Python ``_ =``): the author demonstrably saw the
-  return, so the site refutes rather than supports a deviation;
+  Rust ``let _ =``, Python ``_ =``, Swift ``_ =``): the author
+  demonstrably saw the return, so the site refutes rather than
+  supports a deviation;
 * ``propagated`` — ``return f()`` / ``yield f()``: the caller inherits
   the obligation.
 
@@ -25,8 +26,9 @@ The per-callee aggregate is a first-class artifact
 ``consistency`` verification channel, ``spec_inference`` (one majority
 computation in the tree) and the flag/mode comparator.
 
-Intellectual ancestor: Engler et al., "Bugs as Deviant Behavior"
-(SOSP 2001; see docs/references.md).
+Intellectual ancestor: Engler et al., "Bugs as Deviant Behavior: A
+General Approach to Inferring Errors in Systems Code" (SOSP 2001,
+doi:10.1145/502034.502041).
 """
 
 from __future__ import annotations
@@ -41,6 +43,7 @@ from typing import Any
 
 from .prompt_defence import sanitise_for_prompt
 from typing import TYPE_CHECKING
+from core.source.lines import split_lines
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -71,6 +74,16 @@ except ImportError:
 # Data model
 # ---------------------------------------------------------------------------
 
+# Lead-path floors (registered in core.audit.consistency_stats —
+# the enumerable floors table references these constants; per-run
+# overrides never reach this legacy deviation-lead path).
+# Trade-off, both directions: LOWER min sites / threshold surfaces
+# deviants from tiny families whose "majority" is two or three
+# accidental agreements (lead noise the 40-lead cap then spends on);
+# HIGHER hides real deviants in mid-size families — a 3-site family
+# with 2 checks is exactly the smallest census Engler-style inference
+# can speak about, and 0.75 keeps a single dissenting site from
+# dissolving a 3/4 convention.
 MIN_CALL_SITES = 3
 MAJORITY_THRESHOLD = 0.75
 
@@ -95,7 +108,16 @@ ALL_USAGES = (
 DEVIANT_USAGES = frozenset({USAGE_DISCARDED, USAGE_CAPTURED_UNUSED})
 
 # Contract-source "majority" thresholds (§2.2.5 — the exact
-# spec_inference._infer_from_caller_usage floor).
+# spec_inference._infer_from_caller_usage floor). Registered in
+# core.audit.consistency_stats; a run-config override reaches them
+# through the per-census fields below.
+# Trade-off, both directions: LOWER lets small/weak majorities mint
+# contract-grade premises (majority_says_check) AND definitive
+# discard-ok refutations (majority_says_discard_ok) — the refutation
+# direction is suppression-adjacent, a stuffed discard-majority
+# clears real deviants; HIGHER withholds the discard-ok refutation
+# from honest printf-class callees, flooding leads with noise the
+# convention already answers.
 MAJORITY_CONTRACT_MIN_SITES = 4
 MAJORITY_CONTRACT_RATIO = 0.8
 
@@ -108,20 +130,60 @@ _SECURITY_CALLEE_RE = re.compile(
     re.IGNORECASE,
 )
 
-_STRING_OR_BLOCK_COMMENT_RE = re.compile(
-    r'"(?:[^"\\]|\\.)*"'
-    r"|'(?:[^'\\]|\\.)*'"
-    r"|/\*.*?\*/",
-    re.DOTALL,
+# String tokens plus the block-comment OPENER only: the closer is
+# located with str.find below. The previous single-regex spelling
+# (`/\*.*?\*/` in the alternation) re-scanned the rest of the file
+# from every ``/*`` that never closes — quadratic on hostile source.
+# The string openers are pinned to UNESCAPED delimiters ((?<!\\)):
+# an unterminated literal whose interior repeats escaped delimiters
+# (`"` + `\"`*n) otherwise makes every embedded delimiter a fresh
+# match attempt that re-scans to end-of-file — quadratic on hostile
+# source (measured exp 2.0; pinned, exp 1.0). Both directions: on a
+# well-formed token stream no string opens at an escaped delimiter,
+# so matches are unchanged (repo-corpus differential: divergences
+# only where the old scan opened a string at a `\"`/`\'` pair, a
+# tokenization no real lexer produces); dropping the pin re-opens
+# the quadratic.
+_STRING_OR_COMMENT_OPEN_RE = re.compile(
+    r'(?<!\\)"(?:[^"\\]|\\.)*"'
+    r"|(?<!\\)'(?:[^'\\]|\\.)*'"
+    r"|/\*",
+    re.DOTALL,  # an escape may consume a newline (line continuation)
 )
 
 
 def _strip_block_comments(source: str) -> str:
-    def _repl(m: re.Match) -> str:
-        if m.group().startswith("/*"):
-            return ""
-        return m.group()
-    return _STRING_OR_BLOCK_COMMENT_RE.sub(_repl, source)
+    """Remove ``/* ... */`` comments; string literals are matched so
+    a comment-lookalike inside one is kept verbatim.
+
+    Single left-to-right token scan: each character is visited once,
+    a ``/*`` looks up its closer with ``str.find``, and once one
+    opener has no closer no later opener can have one either, so the
+    failed end-of-file lookup happens at most once.
+    """
+    out: list[str] = []
+    pos = 0
+    no_closer = False
+    while True:
+        m = _STRING_OR_COMMENT_OPEN_RE.search(source, pos)
+        if m is None:
+            out.append(source[pos:])
+            return "".join(out)
+        out.append(source[pos : m.start()])
+        token = m.group()
+        if token != "/*":
+            out.append(token)  # string literal: kept verbatim
+            pos = m.end()
+            continue
+        end = -1 if no_closer else source.find("*/", m.end())
+        if end == -1:
+            # Never closes: not a comment. Keep the chars and keep
+            # scanning after the opener (no token starts at '*').
+            no_closer = True
+            out.append(token)
+            pos = m.end()
+        else:
+            pos = end + 2  # drop the comment
 
 
 _KEYWORDS = frozenset({
@@ -244,6 +306,15 @@ class CalleeCensus:
     # majority statistics are computed over PARTIAL data and must not
     # mint definitive verdicts (census_verdict gates on this).
     truncated: bool = False
+    #: Effective contract-majority floors for THIS census. Default to
+    #: the module constants (identical behaviour); the prepass stamps
+    #: run-config overrides here so majority_says_check /
+    #: majority_says_discard_ok and every consumer taking a census
+    #: entry (return-contract binding included) read one value.
+    #: Deliberately not serialised: floors are per-run, and a
+    #: cache-reloaded census is re-stamped by the run that loads it.
+    contract_min_sites: int = MAJORITY_CONTRACT_MIN_SITES
+    contract_ratio: float = MAJORITY_CONTRACT_RATIO
 
     def __post_init__(self) -> None:
         if not self.security_relevant:
@@ -309,8 +380,8 @@ class CalleeCensus:
     def majority_says_check(self) -> bool:
         """§2.2.5 majority evidence: the project's own convention."""
         return (
-            self.considered >= MAJORITY_CONTRACT_MIN_SITES
-            and self.check_ratio >= MAJORITY_CONTRACT_RATIO
+            self.considered >= self.contract_min_sites
+            and self.check_ratio >= self.contract_ratio
         )
 
     @property
@@ -319,8 +390,8 @@ class CalleeCensus:
         discard-ok — printf-class noise suppressed without any
         hardcoded ignore list."""
         return (
-            self.considered >= MAJORITY_CONTRACT_MIN_SITES
-            and self.discard_ratio >= MAJORITY_CONTRACT_RATIO
+            self.considered >= self.contract_min_sites
+            and self.discard_ratio >= self.contract_ratio
         )
 
     @property
@@ -432,7 +503,11 @@ def parse_source_cached(file_path: str, source: str):
         result = (None, None)
     else:
         src_bytes = source.encode("utf-8", errors="replace")
-        result = (parser.parse(src_bytes), lang)
+        # parse_origin: a budget-abandoned parse must name this
+        # file on the run's analysis-gap trail.
+        from core.run.gaps import parse_origin
+        with parse_origin(file_path):
+            result = (parser.parse(src_bytes), lang)  # type: ignore[assignment]
     if len(_parse_cache) >= _PARSE_CACHE_MAX:
         _parse_cache.popitem(last=False)
     _parse_cache[key] = result
@@ -865,6 +940,30 @@ def _parse_file(source: str, file_path: str):
 # (partial majority statistics may hint, never mint definitive
 # verdicts).
 _CENSUS_BUDGET_S = 30.0
+# Derived-budget parameters (budget_s=None): the fixed 30s default
+# covered ~18% of a kernel-scale scope (measured 28.2 ms/file on
+# linux-7.2 mm/fs/kernel slices -> ~166 s for the 5,903-file scoped
+# census; every segment logged 'census deadline exceeded'). The
+# derivation allows 50 ms/file (~1.8x measured headroom), floored at
+# the old default and ceilinged hard. Both directions: LOWER ceiling
+# re-creates kernel-scale truncation (partial majority statistics);
+# HIGHER lets a pathological/hostile tree hold the prep phase — the
+# ceiling is the DoS backstop the fixed default used to be. At the
+# ceiling the census still stamps ``truncated`` and verdicts stay
+# hint-tier, exactly as before.
+#: Sentinel default: budget derives from the census size. Explicit
+#: floats (and explicit None = unlimited) are honoured verbatim.
+_DERIVE_BUDGET = object()
+
+_CENSUS_PER_FILE_S = 0.05
+_CENSUS_BUDGET_CEILING_S = 600.0
+
+
+def _derive_census_budget_s(n_files: int) -> float:
+    return min(
+        max(_CENSUS_BUDGET_S, _CENSUS_PER_FILE_S * n_files),
+        _CENSUS_BUDGET_CEILING_S,
+    )
 # Trade-off, both directions: HIGHER admits honest large first-party
 # modules whole (a 24k-line module with >2000 sites used to truncate,
 # degrading cross-file majority statistics to partial data); LOWER
@@ -952,18 +1051,30 @@ def _extract_callsites_ts(
 # keeps today's coarse classes"; no read-scan without a tree).
 # ---------------------------------------------------------------------------
 
+# The modifier branch pins its whitespace run with (?=\S) — the run
+# must end where the non-whitespace tail begins (same language: the
+# lazy tail absorbed any remainder) — and \b pins the name group to
+# a word start. The naive ``\s+.*?(\w+)`` let the run split against
+# the lazy tail and the tail split against the name — quadratic even
+# at the anchored match call.
 _FUNC_HEADER_RE = re.compile(
     r"\s*(?:"
     r"(?:def|func|function|fn)\s+"
     r"(?:\([^)]*\)\s+)?"
     r"(\w+)"
     r"|(?:public|private|protected|static|async|export|default)\s+"
-    r".*?(\w+)\s*\("
+    r"(?=\S).*?\b(\w+)\s*\("
     r")",
 )
 
+# \b keeps the unanchored scan from restarting inside an identifier
+# run (quadratic); earliest-start matches and captures unchanged.
+# The dotted chain is bounded: a ".a"-unit storm makes every
+# component start re-walk the run when no call paren follows —
+# quadratic in the line.  Real call chains sit far inside 32
+# links (beyond it, the match binds the last 32 components).
 _CALL_IN_LINE_RE = re.compile(
-    r"(\w+(?:\.\w+)*)\s*\(",
+    r"\b(\w+(?:\.\w+){0,32})\s*\(",
 )
 
 # C/C++-style function definition or prototype: type token(s), then
@@ -1015,6 +1126,13 @@ _GO_BLANK_ASSIGN_RE = re.compile(
 _C_VOID_CAST_RE = re.compile(r"^\s*\(\s*void\s*\)")
 _RUST_LET_UNDERSCORE_RE = re.compile(r"^\s*let\s+_\s*=")
 _PY_UNDERSCORE_ASSIGN_RE = re.compile(r"^\s*_\s*=[^=]")
+# Swift wildcard assignment — covers `_ = f()` and `_ = try? f()`
+# (the `let _ =` spelling rides _RUST_LET_UNDERSCORE_RE's shape).
+# This lives ONLY in the regex table: the census has no swift entry in
+# ts_extract._CALL_TYPES, so .swift files always take this fallback —
+# an acknowledged verdict here is what lets a security-role callee's
+# census refutation hand off to the fail_open try?-erasure leg (§2.3).
+_SWIFT_UNDERSCORE_ASSIGN_RE = re.compile(r"^\s*(?:let\s+)?_\s*=[^=]")
 
 
 def _extract_callsites_regex(
@@ -1029,7 +1147,7 @@ def _extract_callsites_regex(
     ONLY extractor) is exactly where an unbounded walk would bite.
     """
     sites: list[CallSite] = []
-    lines = source.splitlines()
+    lines = split_lines(source)
     current_func = "<module>"
 
     for lineno_0, line in enumerate(lines):
@@ -1067,6 +1185,8 @@ def _extract_callsites_regex(
             or _RUST_LET_UNDERSCORE_RE.match(stripped)
             or (file_path.endswith(".py")
                 and _PY_UNDERSCORE_ASSIGN_RE.match(stripped))
+            or (file_path.endswith(".swift")
+                and _SWIFT_UNDERSCORE_ASSIGN_RE.match(stripped))
         )
         is_assign = bool(_ASSIGN_LINE_RE.match(stripped))
         is_return = bool(_RETURN_LINE_RE.match(stripped))
@@ -1114,7 +1234,7 @@ def build_return_census(
     source_texts: dict[str, str],
     *,
     joern_server=None,
-    budget_s: float | None = _CENSUS_BUDGET_S,
+    budget_s: "float | None | object" = _DERIVE_BUDGET,
     max_sites_per_file: int = _CENSUS_MAX_SITES_PER_FILE,
 ) -> dict[str, CalleeCensus]:
     """One parse per file → per-callee usage census (§2.1).
@@ -1130,8 +1250,10 @@ def build_return_census(
     complete census downstream.
     """
     all_sites: list[CallSite] = []
+    if budget_s is _DERIVE_BUDGET:
+        budget_s = _derive_census_budget_s(len(source_texts))
     limiter = _CensusLimiter(
-        (time.monotonic() + budget_s) if budget_s is not None else None,
+        (time.monotonic() + budget_s) if budget_s is not None else None,  # type: ignore[operator]
         max_sites_per_file,
     )
     truncated = False

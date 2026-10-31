@@ -404,7 +404,7 @@ def _build_fmtstr_write(spec: dict, bindings: dict) -> bytes:
     offset = spec.get("offset")
     if isinstance(offset, str):
         offset = _safe_eval(offset, bindings)
-    offset = int(offset)
+    offset = int(offset)  # type: ignore[arg-type]
     numbwritten = spec.get("numbwritten", 0)
     if isinstance(numbwritten, str):
         numbwritten = _safe_eval(numbwritten, bindings)
@@ -467,8 +467,21 @@ def _render_compose(chunks, recvs):
             if not tok:
                 msg = f"recv_le64: recvs[{idx}] is empty after tokenization"
                 raise ValueError(msg)
-            value = int(tok, 16)
-            out += _struct.pack("<Q", value & 0xFFFFFFFFFFFFFFFF)
+            # Budget the parse the way _parse_bytes_to_int does: hex
+            # is EXEMPT from CPython's int_max_str_digits guard and
+            # the token can be as long as the capture cap, so a
+            # hostile target minting megabytes of hex used to cost a
+            # multi-megabit int materialisation per chunk before the
+            # 64-bit mask discarded it. Only 64 bits survive the LE64
+            # pack and 16 hex digits carry exactly those bits —
+            # validating the whole token then parsing its last 16
+            # digits is value-identical to the unbounded parse+mask
+            # (and non-hex input still raises, as int() did).
+            if re.fullmatch(r"[0-9a-fA-F]+", tok) is None:
+                msg = (f"recv_le64: recvs[{idx}] first token is not "
+                       f"a hex integer")
+                raise ValueError(msg)
+            out += _struct.pack("<Q", int(tok[-16:], 16))
         else:
             msg = f"unknown compose chunk kind: {kind!r}"
             raise ValueError(msg)
@@ -476,17 +489,27 @@ def _render_compose(chunks, recvs):
 
 
 def _recv_until(proc, terminator, per_recv_timeout: float,
-                max_bytes: int | None = None) -> bytes:
+                max_bytes: int | None = None,
+                pushback: bytearray | None = None) -> bytes:
     """Bounded step-recv; retains at most ``max_bytes`` (default
     ``_MAX_CAPTURE_BYTES``). Reading stops at the cap — unread bytes
     stay in the pipe for the end-of-request drain, which discards
-    them (bounded) and reports the truncation."""
+    them (bounded) and reports the truncation.
+
+    ``pushback``: stdout bytes ``_send_capped`` drained while a send
+    was in flight. They are consumed FIRST (they arrived before
+    anything still in the pipe); the unconsumed remainder is left in
+    the bytearray for the next step or the end-of-request drain."""
     cap = _MAX_CAPTURE_BYTES if max_bytes is None else max(max_bytes, 0)
     deadline = time.monotonic() + per_recv_timeout
     buf = b""
     fd = proc.stdout.fileno()
 
     def _read_bounded(max_chunk: int) -> bytes | None:
+        if pushback:
+            chunk = bytes(pushback[:max_chunk])
+            del pushback[:max_chunk]
+            return chunk
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return None
@@ -580,8 +603,8 @@ def _communicate_capped(
         exc = subprocess.TimeoutExpired(
             proc.args, timeout, output=_got(out_fd), stderr=_got(err_fd),
         )
-        exc.stdout_truncated = _truncated(out_fd)
-        exc.stderr_truncated = _truncated(err_fd)
+        exc.stdout_truncated = _truncated(out_fd)  # type: ignore[attr-defined]
+        exc.stderr_truncated = _truncated(err_fd)  # type: ignore[attr-defined]
         return exc
 
     in_file = proc.stdin if (
@@ -626,7 +649,7 @@ def _communicate_capped(
                 trunc[fd] = True
         if w:
             try:
-                n = os.write(in_file.fileno(), view[:65536])
+                n = os.write(in_file.fileno(), view[:65536])  # type: ignore[union-attr]
                 view = view[n:]
             except BlockingIOError:
                 pass
@@ -641,6 +664,105 @@ def _communicate_capped(
         raise _timeout_exc() from None
     return (_got(out_fd), _got(err_fd),
             _truncated(out_fd), _truncated(err_fd))
+
+
+def _classify_exit(rc: "int | None", target_stderr: bytes,
+                   timed_out: bool) -> str:
+    """One exit-class vocabulary for BOTH daemon verbs (probe and
+    conversation): clean / exit:N / signal:<NAME> / stack_smashing /
+    timeout. The verbs used to disagree — the probe emitted numeric
+    ``signal:{-rc}`` and had no canary check, so a consumer keying on
+    either spelling missed the other verb's runs and probe runs never
+    classified stack smashing. The canary overrides every other class
+    (a smashed stack is the verdict whether the process was reaped,
+    exited "cleanly" through a handler, or timed out)."""
+    if _CANARY_ABORT_SIGNAL in (target_stderr or b""):
+        return "stack_smashing"
+    if timed_out:
+        return "timeout"
+    if rc == 0:
+        return "clean"
+    if rc is not None and rc < 0:
+        try:
+            name = signal.Signals(-rc).name
+        except (ValueError, AttributeError):
+            name = f"UNKNOWN({-rc})"
+        return f"signal:{name}"
+    return f"exit:{rc}"
+
+
+def _send_capped(
+    proc: subprocess.Popen,
+    data: bytes,
+    timeout: float,
+    drain_cap: int,
+) -> tuple[bytes, bool, int]:
+    """Bounded, non-blocking send of ``data`` to the target's stdin.
+
+    A plain blocking ``proc.stdin.write`` of more than the pipe
+    buffer stalls the single-threaded daemon in write(2) while the
+    target waits for its stdout to be drained — the mutual-blocking
+    deadlock ``_communicate_capped`` closes for the spawn verb. Here
+    the write is select-driven and the target's stdout is drained
+    CONCURRENTLY, so a legitimate large send to a chatty target
+    completes instead of deadlocking; whatever stdout arrives during
+    the send is returned for the caller to consume ahead of its next
+    recv (``_recv_until``'s pushback). At most ``drain_cap`` drained
+    bytes are retained — beyond that they are still read (the target
+    never blocks) but discarded, with the truncated flag reporting
+    the loss, mirroring ``_communicate_capped``'s cap semantics.
+
+    Bytes still undelivered at the deadline, or after the target
+    closes its stdin, are dropped — but never silently: the count is
+    returned so callers can flag the reply. Deadline truncation
+    against a live slow reader means the target ran on a PARTIAL
+    stimulus, and a verdict drawn from such a run is only sound when
+    the reply says so.
+
+    Returns ``(drained_stdout, drained_truncated, undelivered)`` —
+    ``undelivered`` is the number of ``data`` bytes NOT written to
+    the target's stdin.
+    """
+    drained = bytearray()
+    truncated = False
+    if proc.stdin is None or proc.stdin.closed or not data:
+        return bytes(drained), truncated, len(data)
+    in_fd = proc.stdin.fileno()
+    out_fd = None
+    if proc.stdout is not None and not proc.stdout.closed:
+        out_fd = proc.stdout.fileno()
+    os.set_blocking(in_fd, False)
+    view = memoryview(data)
+    deadline = time.monotonic() + timeout
+    while view:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        rlist = [out_fd] if out_fd is not None else []
+        r, w, _ = select.select(rlist, [in_fd], [], remaining)
+        if not r and not w:
+            break
+        if r:
+            chunk = os.read(out_fd, 65536)  # type: ignore[arg-type]
+            if not chunk:
+                # stdout EOF — stop watching it so a closed pipe
+                # doesn't spin the select loop.
+                out_fd = None
+            else:
+                room = drain_cap - len(drained)
+                if room > 0:
+                    drained += chunk[:room]
+                if len(chunk) > room:
+                    truncated = True
+        if w:
+            try:
+                n = os.write(in_fd, view[:65536])
+                view = view[n:]
+            except BlockingIOError:
+                pass
+            except (BrokenPipeError, OSError):
+                break
+    return bytes(drained), truncated, len(view)
 
 
 def _drain_target(
@@ -822,6 +944,15 @@ def _handle_probe(payload: dict) -> dict:
     stdout_budget = _MAX_CAPTURE_BYTES
     stdout_trunc = False
     stderr_trunc = False
+    # stdout bytes _send_capped drained while a send was in flight;
+    # consumed ahead of the pipe by _recv_until, flushed into
+    # stdout_buf before the end-of-request drain.
+    pushback = bytearray()
+    pushback_trunc = False
+    # stdin bytes _send_capped could not deliver (deadline against a
+    # live slow reader, or target closed stdin): the target ran on a
+    # partial stimulus and the reply must say so.
+    stdin_dropped = 0
     steps_completed = 0
     exit_class = "unknown"
     proc = _spawn_request_target(target_argv)
@@ -888,17 +1019,20 @@ def _handle_probe(payload: dict) -> dict:
                             "steps_completed": steps_completed}
 
             if send_bytes is not None:
-                try:
-                    proc.stdin.write(send_bytes)
-                    proc.stdin.flush()
-                except (BrokenPipeError, OSError):
-                    pass
+                drained, dtrunc, undelivered = _send_capped(
+                    proc, send_bytes, per_recv_timeout,
+                    max(stdout_budget - len(pushback), 0),
+                )
+                pushback += drained
+                pushback_trunc = pushback_trunc or dtrunc
+                stdin_dropped += undelivered
 
             recv_until = step.get("recv_until")
             got = b""
             if recv_until is not None:
                 got = _recv_until(proc, recv_until, per_recv_timeout,
-                                  max_bytes=stdout_budget)
+                                  max_bytes=stdout_budget,
+                                  pushback=pushback)
                 stdout_budget -= len(got)
                 stdout_buf += got
                 name = step.get("bind_as")
@@ -910,22 +1044,25 @@ def _handle_probe(payload: dict) -> dict:
             steps_completed += 1
 
         try:
-            proc.stdin.close()
+            proc.stdin.close()  # type: ignore[union-attr]
         except (BrokenPipeError, OSError):
             pass
+        # Pushback the steps didn't consume: chronologically it
+        # precedes anything still in the pipe, so flush it into
+        # stdout_buf (budget-capped) before the drain's tail.
+        if pushback:
+            keep = bytes(pushback[:max(stdout_budget, 0)])
+            if len(pushback) > len(keep):
+                pushback_trunc = True
+            del pushback[:]
+            stdout_budget -= len(keep)
+            stdout_buf += keep
         tail_stdout, target_stderr, stdout_trunc, stderr_trunc, timed_out = \
             _drain_target(proc, total_wait_seconds, stdout_budget)
+        stdout_trunc = stdout_trunc or pushback_trunc
         stdout_buf += tail_stdout
-        if timed_out:
-            exit_class = "timeout"
-        else:
-            rc = proc.returncode
-            if rc == 0:
-                exit_class = "clean"
-            elif rc is not None and rc < 0:
-                exit_class = f"signal:{-rc}"
-            else:
-                exit_class = f"exit:{rc}"
+        exit_class = _classify_exit(
+            proc.returncode, target_stderr, timed_out)
     finally:
         _kill_request_group(proc)
 
@@ -958,6 +1095,11 @@ def _handle_probe(payload: dict) -> dict:
         "stdout_truncated": stdout_trunc,
         "stderr_truncated": stderr_trunc,
         "stdout_bytes_kept": len(stdout_buf),
+        # Send-side integrity: true when any step's stimulus was only
+        # partially delivered — the target never received these bytes,
+        # so verdicts must account for the incomplete input.
+        "sends_truncated": stdin_dropped > 0,
+        "stdin_bytes_dropped": stdin_dropped,
         "target_exit": exit_class,
         "wall_seconds": wall,
     }
@@ -1033,6 +1175,15 @@ def _handle_conversation(payload: dict) -> dict:
     stdout_budget = _MAX_CAPTURE_BYTES
     stdout_trunc = False
     stderr_trunc = False
+    # stdout bytes _send_capped drained while a send was in flight;
+    # consumed ahead of the pipe by _recv_until, flushed into
+    # stdout_buf before the end-of-request drain.
+    pushback = bytearray()
+    pushback_trunc = False
+    # stdin bytes _send_capped could not deliver (deadline against a
+    # live slow reader, or target closed stdin): the target ran on a
+    # partial stimulus and the reply must say so.
+    stdin_dropped = 0
     exit_class = "unknown"
     target_stderr = b""
     proc = _spawn_request_target(target_argv)
@@ -1054,42 +1205,43 @@ def _handle_conversation(payload: dict) -> dict:
                             "error": (f"sends[{i}] rendered "
                                       f"{len(send_bytes)} > "
                                       f"{_MAX_SEND_BYTES}")}
-            try:
-                proc.stdin.write(send_bytes)
-                proc.stdin.flush()
-            except (BrokenPipeError, OSError):
-                # Target already exited — subsequent recv still runs
-                # so any tail-of-stdout is captured.
-                pass
+            # A target that already exited surfaces as BrokenPipeError
+            # inside the helper (send bytes dropped) — the subsequent
+            # recv still runs so any tail-of-stdout is captured.
+            drained, dtrunc, undelivered = _send_capped(
+                proc, send_bytes, per_recv_timeout,
+                max(stdout_budget - len(pushback), 0),
+            )
+            pushback += drained
+            pushback_trunc = pushback_trunc or dtrunc
+            stdin_dropped += undelivered
             got = _recv_until(proc, terminator, per_recv_timeout,
-                              max_bytes=stdout_budget)
+                              max_bytes=stdout_budget,
+                              pushback=pushback)
             stdout_budget -= len(got)
             recvs.append(got)
             stdout_buf += got
         if close_after:
             try:
-                proc.stdin.close()
+                proc.stdin.close()  # type: ignore[union-attr]
             except (BrokenPipeError, OSError):
                 pass
+        # Pushback the steps didn't consume: chronologically it
+        # precedes anything still in the pipe, so flush it into
+        # stdout_buf (budget-capped) before the drain's tail.
+        if pushback:
+            keep = bytes(pushback[:max(stdout_budget, 0)])
+            if len(pushback) > len(keep):
+                pushback_trunc = True
+            del pushback[:]
+            stdout_budget -= len(keep)
+            stdout_buf += keep
         tail_stdout, target_stderr, stdout_trunc, stderr_trunc, timed_out = \
             _drain_target(proc, total_wait_seconds, stdout_budget)
+        stdout_trunc = stdout_trunc or pushback_trunc
         stdout_buf += tail_stdout
-        if timed_out:
-            exit_class = "timeout"
-        else:
-            rc = proc.returncode
-            if rc == 0:
-                exit_class = "clean"
-            elif rc is not None and rc < 0:
-                try:
-                    name = signal.Signals(-rc).name
-                except (ValueError, AttributeError):
-                    name = f"UNKNOWN({-rc})"
-                exit_class = f"signal:{name}"
-            else:
-                exit_class = f"exit:{rc}"
-        if _CANARY_ABORT_SIGNAL in (target_stderr or b""):
-            exit_class = "stack_smashing"
+        exit_class = _classify_exit(
+            proc.returncode, target_stderr, timed_out)
     finally:
         _kill_request_group(proc)
 
@@ -1103,6 +1255,11 @@ def _handle_conversation(payload: dict) -> dict:
         "stdout_truncated": stdout_trunc,
         "stderr_truncated": stderr_trunc,
         "stdout_bytes_kept": len(stdout_buf),
+        # Send-side integrity: true when any send was only partially
+        # delivered — the target never received these bytes, so
+        # verdicts must account for the incomplete input.
+        "sends_truncated": stdin_dropped > 0,
+        "stdin_bytes_dropped": stdin_dropped,
         "target_exit": exit_class,
         "wall_seconds": wall,
     }
@@ -1203,7 +1360,7 @@ def _run_one_shot() -> int:
         _write_frame(out_fd, {"ok": False, "error": "empty stdin"})
         return 1
     cmd = frame.get("cmd")
-    handler = DISPATCH.get(cmd)
+    handler = DISPATCH.get(cmd)  # type: ignore[arg-type]
     if handler is None:
         _write_frame(out_fd, _echo_rid(frame, {
             "ok": False, "error": f"unknown cmd {cmd!r}"}))
@@ -1282,7 +1439,7 @@ def main() -> int:
                 _write_frame(out_fd, _echo_rid(frame, {"ok": True,
                                                        "closed": True}))
                 return 0
-            handler = DISPATCH.get(cmd)
+            handler = DISPATCH.get(cmd)  # type: ignore[arg-type]
             if handler is None:
                 _write_frame(out_fd, _echo_rid(frame, {
                     "ok": False, "error": f"unknown cmd {cmd!r}"}))

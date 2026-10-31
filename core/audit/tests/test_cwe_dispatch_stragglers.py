@@ -72,14 +72,19 @@ class TestCwe377InsecureTempFile:
         assert "mktemp" in text
         assert "mkstemp" in text
 
-    def test_fallback_chain(self):
+    def test_fallback_chain(self, monkeypatch):
+        # The dispatch table's codeql value is a pack query ID
+        # ("py/insecure-temporary-file"): it reaches the chain only
+        # when the id resolver maps it to an installed pack query
+        # (stubbed unresolvable here so the assertion is hermetic on
+        # hosts with the packs installed) — honest degradation
+        # instead of an error on every dispatch.
+        monkeypatch.setattr(
+            "core.audit.codeql_query_resolver.resolve_query_id",
+            lambda qid: None,
+        )
         types = {e["type"] for e in _cwe_fallback_chain("CWE-377")}
         assert "coccinelle" in types
-        # The dispatch table's codeql value is a pack query ID
-        # ("py/insecure-temporary-file") no resolver in this codebase
-        # maps to a query file — run_codeql_sweep requires a file, so
-        # the entry is not emitted (honest degradation instead of an
-        # error on every dispatch).
         assert "codeql" not in types
 
     def test_keyword_inference(self):

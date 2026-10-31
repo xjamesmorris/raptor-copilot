@@ -60,11 +60,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from core.atomic_fs import write_text_atomically
 from core.json import JsonCache, save_json
+from core.logging import configure_cli_logging
 
-from . import SCA_CACHE_ROOT, default_client
+from . import sca_cache_root, default_client
 from .discovery import find_manifests
-from .models import Dependency, PinStyle
+from .models import Dependency, PinStyle, canonical_cve_id, cve_ids
 from .osv import OsvClient
 from .parsers import parse_manifest
 from .parsers._safe_read import scan_root_context
@@ -103,13 +105,23 @@ class HardenCandidate:
       - ``promoted``         — version pinned, change emitted
       - ``degraded_safety``  — no fully-clean version exists; promoted
                                 the version with fewest residual
-                                advisories (gated behind ``--allow-degraded``)
+                                advisories (gated behind ``--allow-degraded``;
+                                a major-crossing target ALSO needs
+                                ``--allow-major`` /
+                                ``--allow-major-without-review``)
       - ``downgraded_safety`` — no clean version exists at/above the pin;
                                 bounded downgrade to the highest clean
                                 version >= the recorded corridor floor
-                                (gated behind ``--allow-degraded``)
+                                (same gating as ``degraded_safety``)
       - ``up_to_date``       — already at latest safe in range
-      - ``review_required``  — bump exists but crosses a major (gated)
+      - ``review_required``  — bump exists but crosses a major (gated;
+                                appliable only via
+                                ``--allow-major-without-review``)
+      - ``demoted_safety``   — the promotion-safety check found
+                                supply-chain findings (recent publish,
+                                suspicious install hook, platform
+                                regression); NEVER auto-applied by any
+                                flag — the operator resolves it by hand
       - ``skipped_loose_pin`` — ``--pin-only`` set + dep is loose
       - ``unsupported_manifest`` — registry has versions but the
                                 manifest format has no rewriter (e.g.,
@@ -138,6 +150,11 @@ class HardenCandidate:
     cve_remaining: list[str] = field(default_factory=list)
     candidates_considered: int = 0
     candidates_rejected_for_cve: int = 0
+    # Candidate versions whose OSV lookup failed transiently this run —
+    # their safety is UNKNOWN, so they are excluded from both the clean
+    # pool and ``candidates_rejected_for_cve`` (which counts versions
+    # with KNOWN advisories only).
+    candidates_lookup_failed: int = 0
     status: str = "error"
     detail: str = ""
     # Version-selection posture. ``highest_safe`` (default, application
@@ -157,11 +174,38 @@ class HardenCandidate:
     # by ``_apply`` when building the ``_PlanEntry`` so the rewrite is
     # routed to the right file. ``None`` for inline / non-central deps.
     resolved_in: str | None = None
+    # npm alias spelling (``Dependency.alias_name``). ``name`` is the
+    # installed package; the manifest keys the spec under the alias, so
+    # ``_apply`` carries this onto the ``_PlanEntry`` for the rewriter.
+    alias_name: str | None = None
 
 
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
+
+def _build_lookup_clients(
+    http, cache: JsonCache | None, *, offline: bool, no_cache: bool,
+):
+    """Construct the OSV / KEV / EPSS clients for one harden run.
+
+    The three clients need a JsonCache instance either way, so
+    ``--no-cache`` is honoured by zeroing their TTLs (the scan /
+    review / whatif shape), making every persisted entry stale on
+    read — substituting a fresh cache object alone left the default
+    24h TTLs serving day-old advisory / KEV / EPSS answers to the one
+    flag whose documented purpose is bypassing them.
+    """
+    from core.cve import EpssClient, KevClient
+    ttl = 0 if no_cache else 24 * 3600
+    osv = OsvClient(http, cache or JsonCache(root=sca_cache_root()),
+                    offline=offline, query_ttl=ttl, vuln_ttl=ttl)
+    kev = KevClient(http, cache or JsonCache(root=sca_cache_root()),
+                    offline=offline, ttl_seconds=ttl)
+    epss = EpssClient(http, cache or JsonCache(root=sca_cache_root()),
+                      offline=offline, ttl_seconds=ttl)
+    return osv, kev, epss
+
 
 def main(argv: Sequence[str]) -> int:
     args = _parse_args(argv)
@@ -206,12 +250,10 @@ def main(argv: Sequence[str]) -> int:
 
     http = default_client(offline=args.offline)
     cache = (None if args.no_cache else
-             JsonCache(root=Path(args.cache_root) if args.cache_root else SCA_CACHE_ROOT))
-    osv = OsvClient(http, cache or JsonCache(root=SCA_CACHE_ROOT),
-                    offline=args.offline)
-    from core.cve import EpssClient, KevClient
-    kev = KevClient(http, cache or JsonCache(root=SCA_CACHE_ROOT), offline=args.offline)
-    epss = EpssClient(http, cache or JsonCache(root=SCA_CACHE_ROOT), offline=args.offline)
+             JsonCache(root=Path(args.cache_root) if args.cache_root else sca_cache_root()))
+    osv, kev, epss = _build_lookup_clients(
+        http, cache, offline=args.offline, no_cache=args.no_cache,
+    )
     registries = {
         "PyPI": PyPIClient(http, cache, offline=args.offline),
         "npm": NpmClient(http, cache, offline=args.offline),
@@ -280,9 +322,9 @@ def main(argv: Sequence[str]) -> int:
     if args.check:
         actionable = _count_actionable(
             candidates,
-            allow_major=args.allow_major,
             allow_major_without_review=args.allow_major_without_review,
             allow_degraded=args.allow_degraded,
+            allow_major=args.allow_major,
             ecosystem_allowlist=ecosystem_allowlist,
         )
         _write_report(out_dir / "report.md", candidates, [],
@@ -291,6 +333,21 @@ def main(argv: Sequence[str]) -> int:
         _print_summary(candidates, [], out_dir, target_kind=target_kind,
                        excluded_surfaces=excluded_surfaces,
                        exclude_patterns=args.exclude, target=target)
+        if osv.degraded:
+            # Gate contract: exit 0 asserts "project is hardened".
+            # Under a degraded OSV run that assertion is unavailable
+            # — some deps' safety answers are missing, so neither
+            # "hardened" nor an accurate actionable count can be
+            # minted. Exit 2 (the whatif degraded-refusal shape) so a
+            # CI gate fails toward visibility instead of open.
+            print(
+                f"raptor-sca fix --harden --check: OSV lookups "
+                f"degraded ({osv.failed_lookups} query slot(s) failed "
+                f"transiently) — verdict unavailable; re-run when the "
+                f"network/OSV recovers.",
+                file=sys.stderr,
+            )
+            return 2
         if actionable:
             print(f"raptor-sca fix --harden --check: {actionable} candidate(s) would be "
                   f"applied; rerun without --check to apply.")
@@ -302,6 +359,7 @@ def main(argv: Sequence[str]) -> int:
     changes = _apply(candidates, target=target, out_dir=out_dir,
                      allow_major_without_review=args.allow_major_without_review,
                      allow_degraded=args.allow_degraded,
+                     allow_major=args.allow_major,
                      ecosystem_allowlist=ecosystem_allowlist)
     applied = [c for c in changes if c.skipped_reason is None]
     want_patch = args.git_patch or args.apply
@@ -346,6 +404,17 @@ def main(argv: Sequence[str]) -> int:
     _print_summary(candidates, changes, out_dir, target_kind=target_kind,
                    excluded_surfaces=excluded_surfaces,
                    exclude_patterns=args.exclude, target=target)
+    if osv.degraded:
+        # Per-candidate refusals already prevent planning/pinning any
+        # version whose advisories are invisible; this banner makes the
+        # run-level degradation operator-visible next to the summary.
+        print(
+            f"raptor-sca fix --harden: OSV lookups degraded "
+            f"({osv.failed_lookups} query slot(s) failed transiently) — "
+            f"affected deps were refused, not treated as clean; re-run "
+            f"when the network/OSV recovers.",
+            file=sys.stderr,
+        )
     return 0
 
 
@@ -550,7 +619,8 @@ def _baseline_is_clean(dep: Dependency, baseline: str | None, *,
             candidates=[baseline], osv=osv, kev=kev, epss=epss)
     except Exception:                                    # noqa: BLE001
         return False
-    return bool(ranked) and not ranked[0].advisory_ids
+    return (bool(ranked) and not ranked[0].advisory_ids
+            and not ranked[0].lookup_failed)
 
 
 def _plan_one(
@@ -585,6 +655,7 @@ def _plan_one(
         to_version=None,
         crosses_major=False,
         resolved_in=resolved_in,
+        alias_name=dep.alias_name,
     )
 
     # ``--pin-only``: skip loose pins entirely (don't convert ``>=X`` to
@@ -732,8 +803,15 @@ def _plan_one(
         ecosystem=dep.ecosystem, name=dep.name,
         candidates=filtered, osv=osv, kev=kev, epss=epss,
     )
-    clean = [r for r in ranked if not r.advisory_ids]
-    cand.candidates_rejected_for_cve = len(ranked) - len(clean)
+    # A candidate whose OSV lookup failed is "unknown", never clean —
+    # its empty advisory list means "no answer", not "no advisories".
+    lookup_failed_n = sum(1 for r in ranked if r.lookup_failed)
+    clean = [r for r in ranked
+             if not r.advisory_ids and not r.lookup_failed]
+    cand.candidates_lookup_failed = lookup_failed_n
+    cand.candidates_rejected_for_cve = (
+        len(ranked) - len(clean) - lookup_failed_n
+    )
 
     if clean:
         # Fully-safe path. Applications pin to the NEWEST clean version
@@ -802,15 +880,23 @@ def _plan_one(
             # max_epss, count, idx). KEV-listed advisories are actively
             # exploited and outrank everything; CVSS severity outranks
             # EPSS; EPSS outranks raw count; idx breaks ties newest-first.
-            ranked_sorted = sorted(
-                enumerate(ranked),
-                key=lambda kv: (int(kv[1].any_in_kev),
-                                kv[1].max_severity,
-                                kv[1].max_epss,
-                                len(kv[1].advisory_ids),
-                                kv[0]),
-            )
+            ranked_sorted = sorted(enumerate(ranked), key=_rank_key)
             best = ranked_sorted[0][1]
+            if best.lookup_failed:
+                # Sorting demotes failed-lookup slots below every
+                # candidate whose risk is known, so the best pick is a
+                # failed slot only when EVERY candidate's lookup
+                # failed: nothing here has a known safety answer.
+                # Refuse to plan rather than pin a version whose
+                # advisories are invisible behind a transient outage.
+                cand.status = "error"
+                cand.detail = (
+                    f"OSV lookups degraded for all "
+                    f"{len(ranked)} candidate version(s) — safety "
+                    "unknown; refusing to plan. Re-run when the "
+                    "network/OSV recovers."
+                )
+                return cand
             target_version = best.version
             residual_advs = list(best.advisory_ids)
             target_status = "degraded_safety"
@@ -838,18 +924,16 @@ def _plan_one(
 
     # Determine major crossing — applies to both promoted and
     # degraded_safety (a degraded promotion that crosses a major needs
-    # review *and* impact analysis).
+    # review *and* impact analysis). The gate itself is applied AFTER
+    # the promotion-safety check below: an early return here used to
+    # skip that check entirely, so ``--allow-major-without-review``
+    # force-applied major bumps whose recent-publish / install-hook
+    # evaluation never executed — the exact scenario the check exists
+    # to block, on a command named "harden".
+    crosses = False
     if dep.version is not None:
         crosses = _crosses_major(dep.ecosystem, dep.version, target_version)
         cand.crosses_major = crosses
-        if crosses and not allow_major:
-            cand.status = "review_required"
-            cand.detail = (
-                f"latest safe ({target_version}) crosses a major boundary "
-                f"from {dep.version}; rerun with --allow-major or wait for "
-                f"LLM impact analysis"
-            )
-            return cand
 
     cand.status = target_status
     if target_status == "degraded_safety":
@@ -891,7 +975,19 @@ def _plan_one(
     # operators who want the pure vuln-only path have
     # ``raptor-sca fix --cve-only``; a fast-flag here would just be
     # a footgun on a command named "harden".
-    if (target_status in ("promoted", "degraded_safety")
+    # Trade-off, both directions: running this BEFORE the major gate
+    # means major-crossing candidates now pay the per-dep registry-
+    # metadata cost even when the operator never applies them; the
+    # alternative (evaluate at apply time only) would split the safety
+    # authority across two phases and reintroduce the skipped-check
+    # window on any future apply path. The per-dep cost is the same
+    # ~30-60s/week figure the check's design already accepts.
+    # ``downgraded_safety`` is included: a downgrade target is applied
+    # under ``--allow-degraded`` exactly like a degraded promotion, so
+    # it gets the same suspicious-install-hook / platform-regression
+    # evaluation — the write target is what matters, not the direction.
+    if (target_status in (
+            "promoted", "degraded_safety", "downgraded_safety")
             and not offline):
         sc_findings = _evaluate_promotion_safety(
             dep=dep, target_version=target_version,
@@ -900,13 +996,46 @@ def _plan_one(
         )
         if sc_findings:
             kinds = sorted({f.kind for f in sc_findings})
-            cand.status = "review_required"
+            # Distinct status: a supply-chain demotion must never be
+            # force-appliable. It previously shared "review_required"
+            # with the major-crossing gate, so
+            # ``--allow-major-without-review`` — a flag about MAJOR
+            # BUMPS — silently applied candidates the safety check
+            # had demoted.
+            cand.status = "demoted_safety"
             existing_detail = cand.detail or ""
             cand.detail = (
                 (existing_detail + "; " if existing_detail else "")
                 + f"promotion to {target_version} would emit "
                 f"{len(sc_findings)} supply-chain finding(s) "
                 f"({', '.join(kinds)}); operator review required"
+            )
+            return cand
+
+    if crosses and not allow_major:
+        if cand.status in ("degraded_safety", "downgraded_safety"):
+            # Keep the safety-lane status: overwriting it to
+            # ``review_required`` swapped the two opt-in gates —
+            # ``--allow-major-without-review`` (a flag about major
+            # BUMPS) applied a residual-advisory promotion or a
+            # major-crossing DOWNGRADE without ``--allow-degraded``,
+            # and the degraded/downgraded detail text was lost. The
+            # recorded ``crosses_major`` makes apply require major
+            # consent AS WELL (both gates, not either — see
+            # ``_count_actionable`` / ``_apply``).
+            cand.detail = (
+                (cand.detail + "; " if cand.detail else "")
+                + f"also crosses a major boundary from {dep.version} — "
+                "applying requires --allow-major or "
+                "--allow-major-without-review in addition to "
+                "--allow-degraded"
+            )
+        else:
+            cand.status = "review_required"
+            cand.detail = (
+                f"latest safe ({target_version}) crosses a major boundary "
+                f"from {dep.version}; rerun with --allow-major or wait for "
+                f"LLM impact analysis"
             )
     return cand
 
@@ -999,13 +1128,14 @@ def _bounded_downgrade(
         ecosystem=eco, name=dep.name,
         candidates=pool, osv=osv, kev=kev, epss=epss,
     )
-    clean = [r.version for r in ranked if not r.advisory_ids]
+    clean = [r.version for r in ranked
+             if not r.advisory_ids and not r.lookup_failed]
     if not clean:
         return None
     import functools
     # Highest clean version (descending per the ecosystem's comparator).
     return max(clean, key=functools.cmp_to_key(
-        lambda a, b: version_compare(eco, a, b)))
+        lambda a, b: version_compare(eco, a, b)))  # type: ignore[arg-type]
 
 
 # Severity ordinal: lower is less bad. ``None`` (advisory has no scored
@@ -1037,6 +1167,12 @@ class _RankedCandidate:
     max_severity: int        # ``_SEVERITY_ORDINAL`` value; 0 if no advs
     any_in_kev: bool         # at least one advisory is KEV-listed
     max_epss: float          # 0.0 if no EPSS data or no advs
+    # True when the candidate's OSV lookup failed transiently: the
+    # advisory list above is UNKNOWN, not empty. Such a candidate is
+    # never "clean" and sorts behind every candidate whose risk is
+    # actually known — otherwise one OSV blip promotes (and
+    # ``--apply`` pins) an advisory-invisible version.
+    lookup_failed: bool = False
 
 
 def _max_severity(advisories) -> int:
@@ -1052,23 +1188,22 @@ def _max_severity(advisories) -> int:
 
 def _cve_aliases(advisory) -> list[str]:
     """All CVE-shaped IDs for an advisory (its osv_id + aliases)."""
-    out: list[str] = []
-    osv_id = getattr(advisory, "osv_id", None)
-    if isinstance(osv_id, str) and osv_id.upper().startswith("CVE-"):
-        out.append(osv_id)
-    out.extend(a for a in getattr(advisory, "aliases", None) or [] if isinstance(a, str) and a.upper().startswith("CVE-"))
-    return out
+    return cve_ids(advisory)
 
 
 def _advisory_in_kev(advisory, kev) -> bool:
-    """True if any of the advisory's IDs are in CISA KEV."""
+    """True if any of the advisory's CVE ids are in CISA KEV.
+
+    Ids resolve through ``canonical_cve_id`` so distro-namespaced
+    primaries (``UBUNTU-CVE-*`` with empty alias lists) join the
+    CVE-keyed KEV catalog like every other enrichment consumer.
+    """
     if kev is None:
         return False
-    osv_id = getattr(advisory, "osv_id", None) or ""
-    if osv_id and kev.contains(osv_id):
-        return True
-    for a in getattr(advisory, "aliases", None) or []:
-        if isinstance(a, str) and kev.contains(a):
+    for cand in (getattr(advisory, "osv_id", None),
+                 *(getattr(advisory, "aliases", None) or [])):
+        canonical = canonical_cve_id(cand)
+        if canonical is not None and kev.contains(canonical):
             return True
     return False
 
@@ -1138,6 +1273,10 @@ def _rank_candidates_by_safety(
             max_severity=_max_severity(advs),
             any_in_kev=any(_advisory_in_kev(a, kev) for a in advs),
             max_epss=_max_epss(advs, epss_scores),
+            # A failed slot yields the same empty advisory list a
+            # genuinely clean version does; carry the distinction so
+            # no consumer reads "lookup failed" as "no advisories".
+            lookup_failed=osv.lookup_failed(d.key()),
         ))
     return out
 
@@ -1393,9 +1532,9 @@ def _run_self_test(
         )
         post_actionable = _count_actionable(
             post_candidates,
-            allow_major=allow_major,
             allow_major_without_review=allow_major_without_review,
             allow_degraded=allow_degraded,
+            allow_major=allow_major,
             ecosystem_allowlist=ecosystem_allowlist,
         )
 
@@ -1442,29 +1581,81 @@ def _run_self_test(
         _scratch.close()
 
 
+
+def _rank_key(kv: tuple[int, Any]) -> tuple[int, int, int, float, int, int]:
+    """Least-worst candidate ordering: (lookup_failed, any_in_kev,
+    max_severity, max_epss, advisory count, original idx). A candidate
+    whose OSV lookup failed sorts behind EVERYTHING — its risk is
+    unknown, and unknown must never look better than a known residual
+    advisory. Then: KEV-listed advisories are actively exploited and
+    outrank everything; CVSS severity outranks EPSS; EPSS outranks raw
+    count; idx breaks ties newest-first.
+
+    Named (not an inline lambda) so the ranking-semantics tests sort
+    with the PRODUCTION key — a local test copy silently kept passing
+    when this ordering drifted.
+    """
+    idx, c = kv
+    return (int(c.lookup_failed), int(c.any_in_kev), c.max_severity,
+            c.max_epss, len(c.advisory_ids), idx)
+
+
+def _safety_lane_appliable(
+    c: HardenCandidate, *,
+    allow_degraded: bool,
+    allow_major: bool,
+    allow_major_without_review: bool,
+) -> bool:
+    """Gate for ``degraded_safety`` / ``downgraded_safety`` candidates.
+
+    ``--allow-degraded`` is the lane's own opt-in; a candidate that
+    ALSO crosses a major boundary additionally needs major consent
+    (``--allow-major`` or ``--allow-major-without-review``) — BOTH
+    gates, never either. Trade-off, both directions: requiring only
+    the degraded flag would let a major-crossing downgrade in without
+    any major consent; letting the major flag alone through re-opens
+    the gate-swap where a flag about major bumps applied
+    residual-advisory / downgrade targets.
+    """
+    if c.status not in ("degraded_safety", "downgraded_safety"):
+        return False
+    if not allow_degraded:
+        return False
+    if c.crosses_major and not (allow_major or allow_major_without_review):
+        return False
+    return True
+
+
 def _count_actionable(
     candidates: list[HardenCandidate],
     *,
-    allow_major: bool,
     allow_major_without_review: bool,
     allow_degraded: bool,
+    allow_major: bool = False,
     ecosystem_allowlist: set | None = None,
 ) -> int:
     """Number of candidates that *would* be applied at current flag levels.
 
     Used by ``--check`` to decide its exit code. Mirrors the gating in
     ``_apply``: ``promoted`` always counts; ``review_required`` only if
-    the operator's flags would let it through; ``degraded_safety`` only
-    if the operator opted in. ``ecosystem_allowlist`` (from
-    ``--ecosystems``) further filters by ecosystem.
+    the operator's flags would let it through; ``degraded_safety`` /
+    ``downgraded_safety`` only if the operator opted in (plus major
+    consent when the target also crosses a major boundary).
+    ``ecosystem_allowlist`` (from ``--ecosystems``) further filters by
+    ecosystem.
     """
     total = 0
     for c in candidates:
         if (ecosystem_allowlist is not None
                 and c.ecosystem not in ecosystem_allowlist):
             continue
-        if c.status == "promoted" or (c.status == "review_required" and allow_major_without_review) or (c.status in ("degraded_safety", "downgraded_safety")
-              and allow_degraded):
+        if (c.status == "promoted"
+                or (c.status == "review_required"
+                    and allow_major_without_review)
+                or _safety_lane_appliable(
+                    c, allow_degraded=allow_degraded,
+                    allow_major=allow_major,
+                    allow_major_without_review=allow_major_without_review)):
             total += 1
     return total
 
@@ -1476,6 +1667,7 @@ def _apply(
     out_dir: Path,
     allow_major_without_review: bool,
     allow_degraded: bool,
+    allow_major: bool = False,
     ecosystem_allowlist: set | None = None,
 ) -> list[UpgradeChange]:
     """Build _PlanEntry for every applicable candidate and run the same
@@ -1488,9 +1680,13 @@ def _apply(
         if (ecosystem_allowlist is not None
                 and cand.ecosystem not in ecosystem_allowlist):
             continue
-        if cand.status == "promoted" or (cand.status == "review_required" and
-              allow_major_without_review and cand.to_version) or (cand.status in ("degraded_safety", "downgraded_safety") and
-              allow_degraded and cand.to_version):
+        if (cand.status == "promoted"
+                or (cand.status == "review_required"
+                    and allow_major_without_review and cand.to_version)
+                or (cand.to_version and _safety_lane_appliable(
+                    cand, allow_degraded=allow_degraded,
+                    allow_major=allow_major,
+                    allow_major_without_review=allow_major_without_review))):
             pass
         else:
             continue
@@ -1521,6 +1717,7 @@ def _apply(
             # Library posture: the rewriter raises the floor to a range
             # (``>=target``) instead of corridor-pinning ``==target``.
             floor_raise=(cand.selection == "library_minimal"),
+            alias_name=cand.alias_name,
         )
     if not plans:
         return []
@@ -1661,7 +1858,8 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 def _configure_logging(verbose: int) -> None:
     level = logging.WARNING - 10 * min(verbose, 2)
-    logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
+    # Escaping console formatter — see core.logging.configure_cli_logging.
+    configure_cli_logging(level)
 
 
 def _default_out_dir(target: Path) -> Path:
@@ -1672,6 +1870,22 @@ def _default_out_dir(target: Path) -> Path:
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
+
+def _md_pkg(c: HardenCandidate) -> str:
+    """eco:name for markdown — the name is an attacker-authored
+    manifest key; every renderer fragment shares one neutraliser."""
+    return _neut(f"{c.ecosystem}:{c.name}", limit=120)
+
+
+def _md_code(value: object) -> str:
+    from ._md import inline_code
+    return inline_code(value, limit=120)
+
+
+def _neut(value: object, limit: int = 300) -> str:
+    from ._md import neutralize_inline
+    return neutralize_inline(value, limit=limit)
+
 
 def _write_report(
     path: Path,
@@ -1712,7 +1926,7 @@ def _write_report(
     lines.append("|---|---|")
     lines.extend(f"| {status} | {len(by_status[status])} |" for status in (
         "promoted", "degraded_safety", "downgraded_safety",
-        "review_required", "up_to_date",
+        "review_required", "demoted_safety", "up_to_date",
         "skipped_loose_pin", "unsupported_manifest",
         "library_floor_raise_unsupported",
         "pinning_deferred",
@@ -1732,22 +1946,35 @@ def _write_report(
         lines.append("")
         for c in by_status["promoted"]:
             cleared = (
-                f" — clears {', '.join(c.cve_cleared)}"
+                " — clears "
+                + ", ".join(_neut(a, limit=60) for a in c.cve_cleared)
                 if c.cve_cleared else ""
             )
             lines.append(
-                f"- **{c.ecosystem}:{c.name}** "
-                f"`{c.from_version or '*'}` → `{c.to_version}` "
-                f"in `{c.manifest}`{cleared}"
+                f"- **{_md_pkg(c)}** "
+                f"{_md_code(c.from_version or '*')} → "
+                f"{_md_code(c.to_version)} "
+                f"in {_md_code(c.manifest)}{cleared}"
             )
         lines.append("")
 
     if "review_required" in by_status:
         lines.append("## Review required (major bump — LLM impact analysis pending)")
         lines.append("")
-        lines.extend(f"- **{c.ecosystem}:{c.name}** "
-                f"`{c.from_version or '*'}` → `{c.to_version}` "
-                f"in `{c.manifest}` — {c.detail}" for c in by_status["review_required"])
+        lines.extend(f"- **{_md_pkg(c)}** "
+                f"{_md_code(c.from_version or '*')} → {_md_code(c.to_version)} "
+                f"in {_md_code(c.manifest)} — {_neut(c.detail)}"
+                for c in by_status["review_required"])
+        lines.append("")
+
+    if "demoted_safety" in by_status:
+        lines.append(
+            "## Demoted by promotion-safety signals (never auto-applied)")
+        lines.append("")
+        lines.extend(f"- **{_md_pkg(c)}** "
+                f"{_md_code(c.from_version or '*')} → {_md_code(c.to_version)} "
+                f"in {_md_code(c.manifest)} — {_neut(c.detail)}"
+                for c in by_status["demoted_safety"])
         lines.append("")
 
     if "library_floor_raise_unsupported" in by_status:
@@ -1762,10 +1989,11 @@ def _write_report(
                      "(`RAPTOR_TARGET_KIND=application`).")
         lines.append("")
         for c in by_status["library_floor_raise_unsupported"]:
-            tgt = f"would-be → `{c.to_version}`" if c.to_version else "no safe target"
+            tgt = (f"would-be → {_md_code(c.to_version)}"
+                   if c.to_version else "no safe target")
             lines.append(
-                f"- **{c.ecosystem}:{c.name}** `{c.from_version or '*'}` "
-                f"({tgt}) in `{c.manifest}` — {c.detail}"
+                f"- **{_md_pkg(c)}** {_md_code(c.from_version or '*')} "
+                f"({tgt}) in {_md_code(c.manifest)} — {_neut(c.detail)}"
             )
         lines.append("")
 
@@ -1779,11 +2007,13 @@ def _write_report(
                      "acceptable for the project.")
         lines.append("")
         for c in by_status["degraded_safety"]:
-            residuals = ", ".join(c.cve_remaining)
+            residuals = ", ".join(
+                _neut(a, limit=60) for a in c.cve_remaining)
             lines.append(
-                f"- **{c.ecosystem}:{c.name}** "
-                f"`{c.from_version or '*'}` → `{c.to_version}` "
-                f"in `{c.manifest}` — residuals: {residuals}"
+                f"- **{_md_pkg(c)}** "
+                f"{_md_code(c.from_version or '*')} → "
+                f"{_md_code(c.to_version)} "
+                f"in {_md_code(c.manifest)} — residuals: {residuals}"
             )
         lines.append("")
 
@@ -1795,12 +2025,15 @@ def _write_report(
                      "version within the recorded floor corridor. Apply with "
                      "`--allow-degraded` if the version regression is acceptable.")
         lines.append("")
-        lines.extend(f"- **{c.ecosystem}:{c.name}** "
-                f"`{c.from_version or '*'}` → `{c.to_version}` "
-                f"in `{c.manifest}` — {c.detail}" for c in by_status["downgraded_safety"])
+        lines.extend(f"- **{_md_pkg(c)}** "
+                f"{_md_code(c.from_version or '*')} → {_md_code(c.to_version)} "
+                f"in {_md_code(c.manifest)} — {_neut(c.detail)}"
+                for c in by_status["downgraded_safety"])
         lines.append("")
 
-    path.write_text("\n".join(lines), encoding="utf-8")
+    # Atomic like the sibling JSON artifacts — a crash mid-write must
+    # not leave a truncated report.
+    write_text_atomically(path, "\n".join(lines))
 
 
 def _print_summary(

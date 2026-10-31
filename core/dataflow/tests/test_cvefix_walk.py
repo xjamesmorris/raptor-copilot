@@ -366,7 +366,9 @@ def test_codeql_tunables_from_tuning_resolves_central_defaults(monkeypatch):
         codeql_max_disk_cache_mb=0,
         joern_enabled=True,
         joern_heap_mb=2048,
+        joern_heap_ceiling_mb=65536,
         joern_cpg_timeout_s=300,
+        joern_import_timeout_s=900,
         joern_query_timeout_s=300,
         max_semgrep_workers=4, max_codeql_workers=2,
         max_fuzz_parallel=4,
@@ -390,7 +392,9 @@ def test_codeql_tunables_from_tuning_operator_override_wins(monkeypatch):
         codeql_max_disk_cache_mb=0,
         joern_enabled=True,
         joern_heap_mb=2048,
+        joern_heap_ceiling_mb=65536,
         joern_cpg_timeout_s=300,
+        joern_import_timeout_s=900,
         joern_query_timeout_s=300,
         max_semgrep_workers=4, max_codeql_workers=2,
         max_fuzz_parallel=4,
@@ -456,8 +460,14 @@ def test_process_pair_finally_cleans_go_caches_after_each_pair(
     py = CveFixPair("CVE-P", "CWE-89", "https://github.com/o/p", "Python", "fP", "pP")
     process_pair(go, work_dir=tmp_path)
     process_pair(py, work_dir=tmp_path)
-    # Go pair triggers cleanup; Python pair does not.
-    assert cleaned == [("go", tmp_path)], cleaned
+    # Go pair triggers cleanup (per-invocation scratch first, then the
+    # shared work dir for pre-scratch-layout leftovers); Python pair
+    # does not.
+    assert [t[0] for t in cleaned] == ["go", "go"], cleaned
+    scratch = cleaned[0][1]
+    assert scratch.parent == tmp_path
+    assert scratch.name.startswith("pair-")
+    assert cleaned[1] == ("go", tmp_path)
 
 
 def test_walk_dedups_same_commit_cwe_across_cves(monkeypatch, tmp_path: Path):
@@ -701,3 +711,50 @@ def test_fetch_pair_functional_outputs_unchanged(monkeypatch, tmp_path: Path):
     assert (dest / "a.py").read_text() == "x = 1\n"
     assert cvefix_walk._run_git(["-C", str(dest), "checkout", "-q", fix], 30)
     assert (dest / "a.py").read_text() == "x = 2\n"
+
+
+class TestNoMachineSpecificDefaults:
+    """The corpus CLIs must not carry one host's /data/corpus layout
+    as repo defaults — paths are required, refused loudly if absent."""
+
+    def test_walk_cli_requires_paths(self, capsys):
+        import pytest as _pytest
+
+        from core.dataflow import cvefix_walk
+
+        with _pytest.raises(SystemExit) as exc:
+            cvefix_walk.main([])
+        assert exc.value.code == 2
+        assert "required" in capsys.readouterr().err
+
+    def test_no_data_corpus_literals(self):
+        root = Path(__file__).resolve().parents[1]
+        for name in ("cvefix_walk.py", "cvefix_bridge.py",
+                     "trust_corpus_report.py"):
+            src = (root / name).read_text(encoding="utf-8")
+            for line in src.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("#"):
+                    continue
+                assert "/data/corpus" not in line, (name, line)
+
+
+def test_process_pair_scratch_dirs_are_disjoint(monkeypatch, tmp_path: Path):
+    """Two invocations sharing a work dir must never share clone/DB
+    paths — the fixed subpath names let concurrent walkers interleave
+    build state and persist wrong-commit counts as normal rows."""
+    seen: list = []
+
+    def fake_fetch(url, fix_hash, dest, timeout):
+        seen.append(dest)
+        return False  # stop early; only the path layout is under test
+
+    monkeypatch.setattr(cvefix_walk, "_fetch_pair", fake_fetch)
+    pair = CveFixPair("CVE-X", "CWE-89", "https://github.com/o/r", "Python",
+                      "fX", "pX")
+    process_pair(pair, work_dir=tmp_path)
+    process_pair(pair, work_dir=tmp_path)
+    assert len(seen) == 2
+    assert seen[0] != seen[1]
+    for dest in seen:
+        assert dest.parent.parent == tmp_path

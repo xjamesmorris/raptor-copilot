@@ -85,7 +85,7 @@ def _restamp_scores(ranked_items: list[dict[str, Any]]) -> None:
     ]
     if not scores:
         return
-    ordered = sorted((float(s) for s in scores), reverse=True)
+    ordered = sorted((float(s) for s in scores if s is not None), reverse=True)
     it = iter(ordered)
     for gap in ranked_items:
         if isinstance(gap, dict) and gap.get("priority_score") is not None:
@@ -129,8 +129,11 @@ def rank_gap_queue(
         from core.llm.ranking import rank_items
 
         if client is None:
-            from core.llm.client import LLMClient
-            client = LLMClient(pinned_model=model) if model else LLMClient()
+            # Transcript seam: identical to LLMClient(...) with no
+            # session active.
+            from core.llm.transcript import build_llm_client
+            client = (build_llm_client(pinned_model=model) if model
+                      else build_llm_client())
 
         out: list[dict[str, Any]] = []
         budget = head

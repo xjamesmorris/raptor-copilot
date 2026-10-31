@@ -51,9 +51,7 @@ jobs:
         # build systems through the mount-ns sandbox substrate, which
         # needs unprivileged user namespaces (blocked by AppArmor on
         # ubuntu-24.04 runners by default) plus newuidmap/newgidmap.
-        run: |
-          sudo apt-get install -y --no-install-recommends uidmap
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        uses: ./.github/actions/enable-userns
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -61,16 +59,14 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
         with:
           enable-cache: true
-          cache-dependency-glob: "requirements*.txt"
+          cache-dependency-glob: "uv.lock"
 
       - name: Create venv and install deps
         run: |
-          uv venv $VENV_PATH
-          source $VENV_PATH/bin/activate
-          uv pip install -r requirements-dev.txt
+          uv sync --locked
 
       - name: Install binary-analysis toolchain (radare2 + LLVM 21)
         continue-on-error: true
@@ -95,7 +91,7 @@ jobs:
       - name: Run corpus-scale drivers
         run: |
           source $VENV_PATH/bin/activate
-          python -m pytest -m corpus core packages -q --durations=25 \
+          python -m pytest -m corpus core packages engine -q --durations=25 \
             --junitxml="$RUNNER_TEMP/corpus-results.xml"
 
       - name: Refuse an all-skipped measurement run
@@ -129,7 +125,7 @@ jobs:
 
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: weekly-corpus-results
           path: ${{ runner.temp }}/corpus-results.xml

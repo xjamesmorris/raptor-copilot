@@ -16,6 +16,7 @@ import argparse
 import logging
 import sys
 from pathlib import Path
+from typing import Any
 
 # ─── trust-marker check (do not import; inline by design) ───
 # fmt: off
@@ -33,8 +34,13 @@ if not (os.environ.get("CLAUDECODE")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import core.startup.process_init  # noqa: E402,F401
+from core.logging import configure_cli_logging  # noqa: E402
 
 from core.concepts.study import run_study  # noqa: E402
+from core.concepts.study_failure import (  # noqa: E402
+    clear_study_failure,
+    write_study_failure,
+)
 
 logger = logging.getLogger("raptor-study-run")
 
@@ -43,24 +49,48 @@ def _progress(phase: str, message: str) -> None:
     print(f"study-run[{phase}]: {message}", file=sys.stderr, flush=True)
 
 
+def _write_spend_record(client: Any, output_dir: Path) -> None:
+    """Persist this leg's actual LLM spend as ``study-cost.json``.
 
-
-def _ensure_llm_dispatcher(client, label: str) -> None:
-    """Self-serve the in-process LLM dispatcher for Bedrock-routed
-    models. Pipeline runs inherit one from their parent; a standalone
-    CLI is its own parent — without this every Bedrock call dies with
-    "requires the RAPTOR LLM dispatcher". Shared gate with
-    raptor-llm-ask; no-op when a route exists or none is needed.
+    Multi-pass drivers (raptor-binary-study) subtract it from their
+    total budget between passes. Written on failure paths too — a
+    failed leg's spend is still money gone. Best-effort: bookkeeping
+    must never mask the study result.
     """
     try:
-        from core.llm.dispatcher.lifecycle import (
-            ensure_route_for_model_configs,
+        spent = max(
+            float(getattr(client, "total_cost", 0.0) or 0.0),
+            float(getattr(client, "provider_spend_usd", 0.0) or 0.0),
         )
-        configs = [getattr(client.config, "primary_model", None)]
-        configs += list(getattr(client.config, "fallback_models", []) or [])
-        ensure_route_for_model_configs(configs, label=label)
-    except Exception:  # noqa: BLE001 — provider errors surface at call time
-        pass
+    except (TypeError, ValueError):
+        spent = 0.0
+    try:
+        from core.json import save_json
+        save_json(output_dir / "study-cost.json",
+                  {"cost_usd": round(spent, 6)})
+    except Exception:  # noqa: BLE001 — see docstring
+        logger.warning("could not write study-cost.json",
+                       exc_info=True)
+
+
+
+
+def _ensure_llm_dispatcher(client, label: str,
+                           run_dir: Path | None = None) -> None:
+    """Self-serve the in-process LLM dispatcher for Bedrock-routed
+    models — delegates to the shared gate
+    (core.llm.dispatcher.lifecycle.ensure_route_for_client, which
+    never raises). Kept as a local name: it is this script's test
+    seam, and the lazy import keeps dispatcher machinery off the
+    no-LLM startup path. ``run_dir`` places the dispatcher's L5 audit
+    JSONL in the run's output directory instead of the in-memory
+    default.
+    """
+    try:
+        from core.llm.dispatcher.lifecycle import ensure_route_for_client
+    except ImportError:  # no dispatcher machinery, no route to serve
+        return
+    ensure_route_for_client(client, label, run_dir=run_dir)
 
 
 def main() -> int:
@@ -71,17 +101,38 @@ def main() -> int:
     ap.add_argument("output_dir", help="Directory with study-list.json.")
     ap.add_argument("--model", default=None,
                     help="LLM model override (e.g. claude-sonnet-4-6).")
-    ap.add_argument("--batch-target", type=int, default=80,
-                    help="Items per Phase-2 LLM batch (default 80). "
-                         "Lower it for slow/thinking models whose "
-                         "single-batch responses outlive transport "
-                         "read timeouts.")
+    ap.add_argument("--batch-target", type=int, default=None,
+                    help="Items per Phase-2 LLM batch (default: "
+                         "computed within the per-call output-budget "
+                         "ceiling). Lower it for slow/thinking models "
+                         "whose single-batch responses outlive "
+                         "transport read timeouts.")
+    ap.add_argument("--max-cost", type=float, default=None,
+                    metavar="USD",
+                    help="Maximum LLM cost in USD before stopping — "
+                         "for THIS invocation (one study leg; "
+                         "multi-pass drivers divide their total "
+                         "across legs). When the cap trips the batch "
+                         "loop stops cleanly and keeps the partial "
+                         "results. Default: the LLM config's "
+                         "per-scan cap.")
     ap.add_argument("-v", "--verbose", action="store_true")
     parsed = ap.parse_args()
 
-    logging.basicConfig(
-        level=logging.DEBUG if parsed.verbose else logging.INFO,
-        format="%(name)s: %(message)s",
+    # isfinite: argparse's float() accepts "nan"/"inf", and NaN
+    # passes a naive `<= 0` gate — the cap then never trips
+    # (`spent > nan` is always False), silently unlimited.
+    import math
+    if parsed.max_cost is not None and (
+            not math.isfinite(parsed.max_cost) or parsed.max_cost <= 0):
+        print("study-run: --max-cost must be a positive finite "
+              "dollar amount", file=sys.stderr)
+        return 1
+
+    # Escaping console formatter — see core.logging.configure_cli_logging.
+    configure_cli_logging(
+        logging.DEBUG if parsed.verbose else logging.INFO,
+        fmt="%(name)s: %(message)s",
     )
     for _noisy in ("httpx", "httpcore", "urllib3"):
         logging.getLogger(_noisy).setLevel(logging.WARNING)
@@ -130,16 +181,62 @@ def main() -> int:
     # Both client paths need the route bootstrap: the default config
     # can resolve to a dispatcher-only (Bedrock-routed) primary model
     # just as easily as an explicit --model pin.
-    _ensure_llm_dispatcher(client, "raptor-study-run")
+    _ensure_llm_dispatcher(client, "raptor-study-run", run_dir=output_dir)
+
+    if parsed.max_cost is not None:
+        # The client enforces config.max_cost_per_scan live on every
+        # dispatch, so post-construction assignment is the one
+        # chokepoint that covers both client paths.
+        cfg_obj = getattr(client, "config", None)
+        if cfg_obj is not None:
+            cfg_obj.max_cost_per_scan = parsed.max_cost
+
+    # This run's outcome supersedes any earlier failure record — a
+    # stale one must never be read as THIS run's diagnosis.
+    clear_study_failure(output_dir)
 
     _progress("start", f"Reading {study_list}")
-    model = run_study(
-        study_list,
-        output_dir,
-        client,
-        on_progress=_progress,
-        batch_target=parsed.batch_target,
-    )
+    try:
+        model = run_study(
+            study_list,
+            output_dir,
+            client,
+            on_progress=_progress,
+            batch_target=parsed.batch_target,
+        )
+    except Exception as exc:  # noqa: BLE001 — exit-contract chokepoint
+        # Fail loudly AT the root cause: nonzero exit plus a
+        # machine-readable record naming why no domain model exists,
+        # so downstream consumers (the engagement chain) report the
+        # actual cause instead of "exited 0 but wrote no model" one
+        # stage later. KeyboardInterrupt/SystemExit still propagate.
+        budget = bool(getattr(exc, "budget_exhausted", False))
+        if not budget:
+            try:
+                from core.llm.client import is_budget_exceeded_error
+                budget = is_budget_exceeded_error(exc)
+            except ImportError:
+                pass
+        write_study_failure(
+            output_dir,
+            "llm_budget_exhausted" if budget else "study_error",
+            detail=str(exc),
+        )
+        # The escaping console formatter renders any target-derived
+        # bytes in the message inert (multi-line tracebacks included).
+        if budget:
+            # A budget stop is a chosen limit, not a bug — one line.
+            logger.error("study failed — %s: %s",
+                         type(exc).__name__, exc)
+        else:
+            # A genuine failure keeps its full traceback: the record
+            # bounds its detail to the cause, so this log line is the
+            # only artifact that preserves the crash site.
+            logger.error("study failed — %s: %s",
+                         type(exc).__name__, exc, exc_info=True)
+        return 1
+    finally:
+        _write_spend_record(client, output_dir)
 
     print(
         f"study-run: domain model written — "

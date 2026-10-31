@@ -345,6 +345,52 @@ def _resolve_device(frida_mod: Any, cfg: RunConfig):
     return frida_mod.get_local_device()
 
 
+def _spawn_env() -> dict[str, str]:
+    """Environment handed to a spawned TARGET process.
+
+    Based on ``RaptorConfig.get_safe_env()``, never a raw
+    ``os.environ`` copy: in the default lane the frida CLI already
+    runs under the sandbox's minimal env, but in ``--unsafe-attach`` /
+    direct-CLI mode the driver carries the operator's full environment
+    (API keys, cloud credentials, tokens) and the spawned binary is
+    untrusted target code that can simply ``getenv()`` them. The
+    allowlist keeps what a desktop target legitimately needs
+    (PATH / HOME / LANG / TERM, DISPLAY, XDG_*). On top, subtract the
+    target-facing strip set (trust markers + session credential):
+    several of its members sit on the safe-env allowlist for RAPTOR's
+    own tooling but must never reach target code. Mirrors
+    ``packages.frida.active._safe_env``.
+    """
+    try:
+        from core.config import RaptorConfig
+        env = RaptorConfig.get_safe_env()
+    except (ImportError, AttributeError, TypeError):
+        # Config unavailable (bare test env) — minimal fallback, never
+        # a fall-open to the full operator environment.
+        env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": os.environ.get("HOME", "/tmp"),
+            "LANG": os.environ.get("LANG", "C.UTF-8"),
+            "TERM": "dumb",
+        }
+    try:
+        from core.config import RaptorConfig as _RC
+        # Strip set PLUS the whole RAPTOR_* marker family: allowlist
+        # survivors like RAPTOR_EF_* / RAPTOR_CI serve RAPTOR's own
+        # tool children, but to the spawned TARGET each is a
+        # one-getenv "you are inside RAPTOR" anti-analysis tell.
+        return _RC.strip_target_exec_markers(env)
+    except (ImportError, AttributeError):
+        strip = ("CLAUDECODE", "_RAPTOR_TRUSTED",
+                 "RAPTOR_SESSION_PID", "RAPTOR_SESSION_TOKEN")
+        for _k in strip:
+            env.pop(_k, None)
+        return {
+            k: v for k, v in env.items()
+            if not k.startswith(("RAPTOR_", "_RAPTOR"))
+        }
+
+
 def _attach_or_spawn(_frida_mod: Any, device: Any, cfg: RunConfig
                      ) -> tuple[Any, int]:
     """Return (session, pid). Spawned processes start suspended;
@@ -354,25 +400,27 @@ def _attach_or_spawn(_frida_mod: Any, device: Any, cfg: RunConfig
     if t.binary or cfg.spawn:
         # Spawn: argv0 = binary. No further args supported in v1 -
         # operator can wrap with a shell script if they need them.
-        # env: the spawned process is TARGET code — subtract the
-        # target-facing strip set (trust markers + session credential)
-        # the frida DRIVER itself legitimately carries. frida's spawn
-        # inherits the driver env unless told otherwise.
+        # env: the spawned process is TARGET code — allowlist-derived,
+        # see _spawn_env. frida's spawn inherits the driver env unless
+        # told otherwise.
         binary = t.binary or t.raw
-        child_env = dict(os.environ)
-        try:
-            from core.config import RaptorConfig as _RC
-            for _k in _RC.TARGET_ENV_STRIP_SET:
-                child_env.pop(_k, None)
-        except Exception:  # noqa: BLE001 — strip set unavailable
-            for _k in ("CLAUDECODE", "_RAPTOR_TRUSTED",
-                       "RAPTOR_SESSION_PID", "RAPTOR_SESSION_TOKEN"):
-                child_env.pop(_k, None)
+        child_env = _spawn_env()
         try:
             pid = device.spawn([binary], env=child_env)
-        except TypeError:
-            # Older frida bindings without the env kwarg.
-            pid = device.spawn([binary])
+        except TypeError as e:
+            # Older frida bindings without the env kwarg. Spawning
+            # WITHOUT env control would hand the target the driver's
+            # full environment (credentials included) — the exact leak
+            # _spawn_env exists to stop. Fail closed: the target is
+            # untrusted code, so no spawn without a curated env.
+            msg = (
+                "frida bindings too old to control the spawned "
+                "target's environment (device.spawn lacks the env "
+                "kwarg); refusing to spawn the untrusted target with "
+                "the driver's full environment. Upgrade the frida "
+                "python bindings (>= 12 supports env=)."
+            )
+            raise RuntimeError(msg) from e
         session = device.attach(pid)
         return session, pid
     if t.pid is not None:
@@ -776,7 +824,8 @@ def _write_report(cfg: RunConfig, result: RunResult) -> None:
     status = "Ok" if result.ok else "Failed"
     lines.append(f"**Status:** {status}")
     if result.error:
-        lines.append(f"**Error:** `{result.error}`")
+        from core.security.prompt_output_sanitise import sanitise_inline
+        lines.append(f"**Error:** `{sanitise_inline(result.error, max_chars=500)}`")
     lines.append(f"**Target:** `{cfg.target.raw}` ({cfg.target.kind})")
     if result.resolved_pid:
         lines.append(f"**PID:** {result.resolved_pid}")

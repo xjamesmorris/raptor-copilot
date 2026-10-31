@@ -16,7 +16,9 @@ from typing import Any, TYPE_CHECKING
 
 from core.analysis.summaries import FunctionSummary, Precondition, TaintRule
 from core.evidence import EvidenceTier
+from core.orchestration.llm_json import strip_json_fences
 from core.security.prompt_framing import with_audit_framing
+from core.source.lines import split_lines
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -110,7 +112,15 @@ def build_summary_prompt(
 # Cap source length to keep LLM cost reasonable per function.
 _MAX_SOURCE_CHARS = 8000
 
-# Cap how many functions get the LLM summary pass.
+# Cap how many functions get the LLM summary pass. Both directions:
+# every candidate is one paid LLM call, so RAISING it buys spend
+# linearly (and candidate count is target-derived — a hostile,
+# densely-connected checklist must not buy an unbounded LLM bill;
+# this is a real spend bound, so it is DISCLOSED when it binds, not
+# scale-derived). LOWERING it starves the taint pass of summaries on
+# ordinary connected targets. Selection is priority-ordered, so the
+# slice keeps the highest-priority functions; when it binds,
+# identify_summary_candidates warns with the selection ratio.
 _MAX_FUNCTIONS = 80
 
 
@@ -197,7 +207,7 @@ def identify_summary_candidates(
     for key in connected:
         if key in existing:
             continue
-        gap = queue_by_key.get(key)
+        gap = queue_by_key.get(key)  # type: ignore[assignment]
         if gap is None:
             continue
         candidates.append(gap)
@@ -205,6 +215,16 @@ def identify_summary_candidates(
     candidates.sort(
         key=lambda g: g.get("priority_score", 0.0), reverse=True,
     )
+    if len(candidates) > _MAX_FUNCTIONS:
+        # Coverage-carrying disclosure: unsummarised functions look
+        # opaque to the taint pass, so the depth downgrade must be
+        # visible, not a silent slice.
+        logger.warning(
+            "LLM summary pass capped: %d of %d connected candidates "
+            "selected (highest priority_score first) — the taint pass "
+            "runs without summaries for the remainder",
+            _MAX_FUNCTIONS, len(candidates),
+        )
     return candidates[:_MAX_FUNCTIONS]
 
 
@@ -225,8 +245,10 @@ def run_llm_summary_pass(
         # enters the run ledger and the per-call reservation gate.
         client = getattr(config, "llm_budget_client", None)
         if client is None:
-            from core.llm.client import LLMClient
-            client = LLMClient()
+            # Transcript seam: identical to LLMClient() with no
+            # session active.
+            from core.llm.transcript import build_llm_client
+            client = build_llm_client()
     except Exception:
         logger.debug("LLM client unavailable for summary pass", exc_info=True)
         return {}
@@ -243,8 +265,25 @@ def run_llm_summary_pass(
     if not items_with_source:
         return {}
 
+    # Budget-stop classification (run_parallel's documented exception
+    # contract: EVERY exception from fn — including the typed terminal
+    # LLMBudgetExceededError — becomes the item's on_error result, so
+    # budget-stop semantics must be classified here). Without it, a
+    # mid-pass exhaustion left every remaining candidate making a
+    # doomed reservation-gated call, each swallowed as a per-item
+    # failure and misattributed as an extraction failure.
+    import threading
+
+    budget_stop = threading.Event()
+    budget_skipped = [0]
+    skip_lock = threading.Lock()
+
     def _do_one(item: tuple) -> tuple | None:
         file_path, function_name, source = item
+        if budget_stop.is_set():
+            with skip_lock:
+                budget_skipped[0] += 1
+            return None
         # Injection preflight over the source BEFORE choosing the
         # rendering: the summary class defaults to a plaintext payload
         # (see build_summary_prompt), so a source carrying known
@@ -283,13 +322,22 @@ def run_llm_summary_pass(
         # one — a short call's timeout is usually transient, and an
         # identical retry is cheap.
         from core.audit.llm_review import SHORT_CALL_TIMEOUT_S
-        response = client.generate(
-            prompt,
-            system_prompt=system_prompt,
-            task_type="audit",
-            timeout_s=SHORT_CALL_TIMEOUT_S,
-            call_class="summary",
-        )
+        try:
+            response = client.generate(
+                prompt,
+                system_prompt=system_prompt,
+                task_type="audit",
+                timeout_s=SHORT_CALL_TIMEOUT_S,
+                call_class="summary",
+            )
+        except Exception as exc:
+            from core.llm.client import is_budget_exceeded_error
+            if is_budget_exceeded_error(exc):
+                # Terminal for the run: stop dispatching, don't count
+                # the exhaustion as an extraction failure.
+                budget_stop.set()
+                return None
+            raise
         # LLMResponse carries output in ``content`` (no ``text``
         # attribute); str(response) is the dataclass repr, which the
         # summary parser cannot read.
@@ -317,6 +365,12 @@ def run_llm_summary_pass(
         if r is not None:
             results[r[0]] = r[1]
 
+    if budget_stop.is_set():
+        logger.warning(
+            "llm_summary_pass stopped: run budget exhausted — %d "
+            "candidate(s) skipped without dispatch",
+            budget_skipped[0],
+        )
     if results:
         logger.info(
             "llm_summary_pass: %d summaries extracted (%d failed) from %d candidates",
@@ -354,18 +408,35 @@ def _read_source(
     if not full_path.is_file():
         return None
 
-    try:
-        text = full_path.read_text(errors="replace")
-    except OSError:
+    # Bounded read: the previous read_text + post-hoc length refusal
+    # buffered a planted multi-hundred-MB file whole before deciding.
+    # Same contract (files over the summary budget read as
+    # unavailable), bounded memory.
+    from core.source import read_text_capped
+
+    got = read_text_capped(full_path, 500_000)
+    if got is None:
+        return None
+    text, truncated = got
+    if truncated:
         return None
 
-    if len(text) > 500_000:
-        return None
-
-    if line_start and line_end and line_start > 0:
-        lines = text.splitlines()
+    if line_start and line_start > 0:
+        if line_end and line_end < line_start:
+            # Inverted span: corrupt gap metadata. The empty slice it
+            # used to yield was silently dropped by the caller; skip
+            # loudly instead of guessing at a slice.
+            logger.warning(
+                "_read_source: inverted span %s:%s-%s — skipping",
+                file_path, line_start, line_end,
+            )
+            return None
+        lines = split_lines(text)
         start = max(0, line_start - 1)
-        end = min(len(lines), line_end)
+        # A missing/zero line_end clamps to the start line rather than
+        # falling through to the whole file (up to 500KB into the
+        # summary prompt path).
+        end = min(len(lines), max(line_end or line_start, line_start))
         return "\n".join(lines[start:end])
 
     return text
@@ -402,13 +473,22 @@ def _ground_summary(
     from the source", so this drops hallucinations too); error paths
     must literally occur in it. A prompt-injected response can then
     at worst SUPPRESS true facts (the same failure mode as a refusal,
-    handled by the mechanical fallback) — it cannot insert a
-    fabricated flow, precondition, or callee that survives into the
-    audit context.
+    handled by the mechanical fallback) — it cannot fabricate a flow,
+    a callee, or a precondition on a nonexistent parameter.
 
-    State transitions are free prose consumed as descriptive context
-    only; they carry no identifiers to check and ground no decisions,
-    so they pass through.
+    Precondition CONDITIONS text is prose-tier and cannot be
+    content-grounded: legitimate assumptions paraphrase ("non-NULL"
+    for `if (buf == NULL)`) and reference caller-context names absent
+    from this source ("must be <= sizeof(buf)"). What IS enforced is
+    STRUCTURE containment — each entry is newline-flattened here
+    (embedded newlines defeated the per-line `- param …` framing and
+    minted forged headings in OTHER functions' prompts), and every
+    rendered field additionally passes through defend_prompt_field in
+    ``FunctionSummary.format_for_context`` with a hard length cap.
+    Residual: instruction-flavoured PROSE inside a condition survives
+    as inline data — the same declared residual as state transitions,
+    which pass through here by design (free prose, descriptive
+    context only, same render defence).
     """
     idents = set(_IDENT_RE.findall(source))
 
@@ -422,9 +502,17 @@ def _ground_summary(
         t for t in summary.taint_rules
         if t.source_param in idents and _known_name(t.sink_call)
     ]
-    summary.preconditions = [
-        p for p in summary.preconditions if p.param in idents
-    ]
+    grounded_pres = []
+    for p in summary.preconditions:
+        if p.param not in idents:
+            continue
+        p.conditions = [
+            " ".join(str(c).split())
+            for c in (p.conditions or [])
+            if str(c).strip()
+        ]
+        grounded_pres.append(p)
+    summary.preconditions = grounded_pres
     summary.callees = [c for c in summary.callees if _known_name(c)]
     summary.callers = [c for c in summary.callers if _known_name(c)]
     summary.error_paths = [
@@ -456,10 +544,7 @@ def _parse_summary_response(
             file, function,
         )
         return None
-    if text.startswith("```"):
-        lines = text.splitlines()
-        lines = [ln for ln in lines if not ln.startswith("```")]
-        text = "\n".join(lines)
+    text = strip_json_fences(text)
 
     try:
         data = json.loads(text)

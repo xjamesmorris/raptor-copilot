@@ -95,16 +95,39 @@ logger = logging.getLogger(__name__)
 # module docstring's threat model). Legacy pickle entries are ignored
 # — different fingerprint (the version salts it), different suffix,
 # different magic — and regenerated.
-_CACHE_VERSION = 10
+# V11 (2026-09-14): extractor identity now probes grammars by actual
+# import (the extractor's own probe) instead of find_spec. find_spec
+# succeeds on any FINDABLE module — including import-time-failing
+# stubs and broken wheels — so a degraded-extraction index could be
+# persisted under the full-toolchain fingerprint and served to later
+# full-toolchain runs. Bump flushes any entry persisted under an
+# over-claimed identity.
+_CACHE_VERSION = 12
 
-_CACHE_DIR = Path.home() / ".cache" / "raptor" / "reachability"
+# Test-override seam: when set (tests monkeypatch a tmp dir here) it
+# wins over the env-derived default. Production leaves it None so
+# ``_cache_dir()`` re-reads ``XDG_CACHE_HOME`` on every call — an env
+# pin installed AFTER this module is imported (test harness, sandboxed
+# run) still redirects the cache instead of being silently ignored by
+# an import-time snapshot.
+_CACHE_DIR: Path | None = None
+
+
+def _cache_dir() -> Path:
+    """Cache root, resolved at call time: ``$XDG_CACHE_HOME/raptor/
+    reachability`` (default ``~/.cache/raptor/reachability``)."""
+    if _CACHE_DIR is not None:
+        return _CACHE_DIR
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".cache"
+    return base / "raptor" / "reachability"
 
 # A short header sentinel prefixed to each cache entry. Lets us
 # version-bump the on-disk format without colliding with a stale
 # entry of the same name. Also doubles as a cheap "is this a raptor
 # cache file" check before handing bytes to the JSON decoder. The
 # numeric suffix tracks ``_CACHE_VERSION``.
-_HEADER_MAGIC = b"RAPTOR-REACHABILITY-CACHE-V10\n"
+_HEADER_MAGIC = b"RAPTOR-REACHABILITY-CACHE-V12\n"
 
 # Suffix of current-format entries. Legacy ``.pickle`` entries are
 # never loaded, but eviction / clearing still sweeps them so retired
@@ -129,7 +152,6 @@ _MAX_CACHE_ENTRIES = 32
 # Their availability determines extraction QUALITY for the same source
 # bytes: without a grammar a language's files get empty call graphs.
 _GRAMMAR_MODULES: tuple[str, ...] = (
-    "tree_sitter",
     "tree_sitter_c",
     "tree_sitter_c_sharp",
     "tree_sitter_cpp",
@@ -147,8 +169,8 @@ _GRAMMAR_MODULES: tuple[str, ...] = (
 )
 
 # Computed once per process — grammar availability doesn't change
-# mid-process (imports are cached), and find_spec costs a path probe
-# per module.
+# mid-process (imports are cached), and the probe performs real
+# grammar imports through the shared failure-caching importer.
 _EXTRACTOR_IDENTITY: str | None = None
 
 
@@ -165,14 +187,33 @@ def _extractor_identity() -> str:
     global _EXTRACTOR_IDENTITY
     if _EXTRACTOR_IDENTITY is not None:
         return _EXTRACTOR_IDENTITY
-    import importlib.util
-    available: list[str] = []
+    # Probe by ACTUAL import via the extractor's own shared,
+    # failure-caching importer — not importlib.util.find_spec.
+    # find_spec answers "is a module by this name findable?", which is
+    # true for import-time-failing stubs and broken wheels alike; the
+    # extractor only gets call graphs from grammars it can IMPORT. A
+    # findable-but-unimportable grammar would make the identity claim
+    # a toolchain the extraction never had, letting a degraded index
+    # be persisted under (and served from) the full-toolchain
+    # fingerprint. Sharing import_grammar makes this signature
+    # definitionally the set the extractors saw in this process.
+    from core.inventory._ts_cache import import_grammar
+    available = []
     for mod in _GRAMMAR_MODULES:
         try:
-            found = importlib.util.find_spec(mod) is not None
-        except (ImportError, ValueError):
-            found = False
-        if found:
+            ok = import_grammar(mod) is not None
+        except Exception:  # noqa: BLE001 — corrupted wheel: degrade, never crash
+            # import_grammar catches (and failure-caches) ImportError
+            # only; a findable module raising anything else at import
+            # time — a corrupted pure-python wheel raising
+            # SyntaxError is the canonical shape — would otherwise
+            # propagate through compute_fingerprint and crash every
+            # reachability consumer out of its documented degrade
+            # path. Extraction fail-softs per file on the same wheel,
+            # so "unavailable" is exactly the identity the extractors
+            # will effectively have.
+            ok = False
+        if ok:
             available.append(mod)
     _EXTRACTOR_IDENTITY = ",".join(available)
     return _EXTRACTOR_IDENTITY
@@ -240,7 +281,7 @@ def _cache_path_for(fingerprint: str) -> Path | None:
             fingerprint,
         )
         return None
-    return _CACHE_DIR / f"{fingerprint}{_CACHE_SUFFIX}"
+    return _cache_dir() / f"{fingerprint}{_CACHE_SUFFIX}"
 
 
 # ---------------------------------------------------------------------------
@@ -273,9 +314,13 @@ def _index_to_jsonable(index: "_AdjacencyIndex") -> dict[str, Any]:
             [enc(dst), [enc(s) for s in srcs]]
             for dst, srcs in index.reverse.items()
         ],
-        "uncertain_callers_by_tail": [
-            [tail, [[enc(fn), ctx] for fn, ctx in pairs]]
-            for tail, pairs in index.uncertain_callers_by_tail.items()
+        "uncertain_tail_paths": [
+            [tail, sorted(paths)]
+            for tail, paths in index.uncertain_tail_paths.items()
+        ],
+        "masked_file_callers": [
+            [path, flag, [enc(fn) for fn in fns]]
+            for path, (flag, fns) in index.masked_file_callers.items()
         ],
         "method_match": [
             [tail, [[enc(fn), cls] for fn, cls in pairs]]
@@ -322,7 +367,8 @@ def _index_to_jsonable(index: "_AdjacencyIndex") -> dict[str, Any]:
 # Every field _index_to_jsonable writes. A well-formed cache entry
 # carries all of them; anything less is foreign/corrupt → miss.
 _MANDATORY_INDEX_FIELDS = frozenset({
-    "forward", "reverse", "uncertain_callers_by_tail", "method_match",
+    "forward", "reverse", "uncertain_tail_paths",
+    "masked_file_callers", "method_match",
     "uncertain_callees", "has_method_dispatch", "definitions",
     "class_of_method", "class_bases", "override_methods",
     "framework_callable", "framework_registered",
@@ -393,11 +439,16 @@ def _index_from_jsonable(data: dict[str, Any]) -> "_AdjacencyIndex":
             dec_node(dst): {dec_internal(s) for s in srcs}
             for dst, srcs in rows("reverse")
         },
-        uncertain_callers_by_tail={
-            str_only(tail): {
-                (dec_internal(fn), str_only(ctx)) for fn, ctx in pairs
-            }
-            for tail, pairs in rows("uncertain_callers_by_tail")
+        uncertain_tail_paths={
+            str_only(tail): {str_only(pp) for pp in paths}
+            for tail, paths in rows("uncertain_tail_paths")
+        },
+        masked_file_callers={
+            str_only(path): (
+                str_only(flag),
+                tuple(dec_internal(fn) for fn in fns),
+            )
+            for path, flag, fns in rows("masked_file_callers")
         },
         method_match={
             str_only(tail): {
@@ -610,8 +661,9 @@ def save_index(
     if path is None:
         return
     try:
-        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        os.chmod(_CACHE_DIR, 0o700)
+        cache_root = _cache_dir()
+        cache_root.mkdir(parents=True, exist_ok=True)
+        os.chmod(cache_root, 0o700)
     except OSError as exc:
         logger.debug("reach_cache: dir setup failed: %s", exc)
         return
@@ -650,8 +702,9 @@ def _cache_entries() -> list:
     legacy suffixes (never loaded, but swept by eviction/clearing
     so they don't squat the cache dir forever)."""
     entries: list = []
+    cache_root = _cache_dir()
     for suffix in (_CACHE_SUFFIX, *_LEGACY_SUFFIXES):
-        entries.extend(_CACHE_DIR.glob(f"*{suffix}"))
+        entries.extend(cache_root.glob(f"*{suffix}"))
     return entries
 
 
@@ -686,7 +739,7 @@ def _evict_oldest() -> None:
 
 def clear_cache() -> int:
     """Delete every cache entry; return the count removed."""
-    if not _CACHE_DIR.exists():
+    if not _cache_dir().exists():
         return 0
     n = 0
     for p in _cache_entries():
@@ -699,8 +752,8 @@ def clear_cache() -> int:
 
 
 def cache_dir() -> Path:
-    """Public accessor for the cache root."""
-    return _CACHE_DIR
+    """Public accessor for the cache root (call-time resolution)."""
+    return _cache_dir()
 
 
 __all__ = [

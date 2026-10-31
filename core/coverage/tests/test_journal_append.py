@@ -219,18 +219,480 @@ class TestCorruptLineCounting:
         ]
         assert agg, "aggregate corrupt-line warning expected"
 
+    def test_planted_unknown_schema_version_row_quarantined(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        # The journal lives inside the run dir — SANDBOX-WRITABLE —
+        # so a planted schema_version!=1 row must be skipped with a
+        # warning. Pre-fix _entry_from_dict's ValueError escaped
+        # load_entries and persistently crashed every journal
+        # consumer (audit resume, reports, completion merge).
+        append_entry(tmp_path, _entry(1))
+        journal = tmp_path / "review-journal.jsonl"
+        with open(journal, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"schema_version": 999}) + "\n")
+        append_entry(tmp_path, _entry(2))
+
+        with caplog.at_level(logging.WARNING, logger="core.coverage.journal"):
+            entries = load_entries(tmp_path)
+
+        assert len(entries) == 2
+        assert any(
+            "skipping malformed entry" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_planted_non_dict_json_rows_quarantined(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        # Valid JSON that is NOT a dict (null / list / string / bare
+        # number) parses fine but has no .get — pre-gate it raised
+        # AttributeError past the per-row except tuple and crashed
+        # load_entries. All four shapes must quarantine per-row.
+        append_entry(tmp_path, _entry(1))
+        journal = tmp_path / "review-journal.jsonl"
+        with open(journal, "a", encoding="utf-8") as f:
+            for planted in ("null", "[1, 2, 3]", '"x"', "12345"):
+                f.write(planted + "\n")
+        append_entry(tmp_path, _entry(2))
+
+        with caplog.at_level(logging.WARNING, logger="core.coverage.journal"):
+            entries = load_entries(tmp_path)
+
+        assert len(entries) == 2
+        non_dict = [
+            r for r in caplog.records
+            if "skipping non-dict entry" in r.getMessage()
+        ]
+        assert len(non_dict) == 4
+
+    def test_planted_null_row_never_persistently_crashes_consumers(
+        self, tmp_path: Path,
+    ) -> None:
+        # The journal lives inside the sandbox-writable run dir: one
+        # planted 5-byte row ("null\n") must not wedge the journal —
+        # every subsequent load AND append must keep working, with the
+        # legit rows intact.
+        append_entry(tmp_path, _entry(1))
+        journal = tmp_path / "review-journal.jsonl"
+        with open(journal, "a", encoding="utf-8") as f:
+            f.write("null\n")
+
+        assert len(load_entries(tmp_path)) == 1
+        append_entry(tmp_path, _entry(2))
+        assert len(load_entries(tmp_path)) == 2
+        assert len(load_entries(tmp_path)) == 2
+
+
+def _base_row() -> dict:
+    """A minimal well-shaped dict row (passes every gate as written)."""
+    return {
+        "ts": now_iso(),
+        "run_id": "r-planted",
+        "file": "src/p.c",
+        "function": "pf",
+        "verdict": "clean",
+        "schema_version": 1,
+    }
+
+
+_TYPED_FIELDS = sorted(
+    name for name in journal_mod._field_types()
+    if name not in journal_mod._CLAMPED_FIELDS
+    and name != "schema_version"
+)
+
+_LIST_FIELDS = sorted(
+    name for name in _TYPED_FIELDS
+    if journal_mod._value_matches([], journal_mod._field_types()[name])
+)
+
+
+class TestPlantedTypedFieldRows:
+    """Wrong-TYPED fields inside a well-shaped dict row must quarantine.
+
+    The non-dict gate above contains bad row SHAPES; these pin the
+    field-TYPE boundary one enumeration step further out: a dict row
+    with ``"file": 5`` crashed ``encode_key_file`` inside every
+    ``reviewed_set()`` call, and an int ``ts`` crashed the ordering
+    compares in ``latest_entries`` and ``merge_into_index``. The
+    parametrization enumerates the WHOLE dataclass schema, so a field
+    added later is covered from birth.
+    """
+
+    def _plant(self, tmp_path: Path, row: dict) -> None:
+        append_entry(tmp_path, _entry(1))
+        journal = tmp_path / "review-journal.jsonl"
+        with open(journal, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row) + "\n")
+        append_entry(tmp_path, _entry(2))
+
+    @pytest.mark.parametrize("field_name", _TYPED_FIELDS)
+    def test_wrong_typed_field_quarantines_row(
+        self, tmp_path: Path, caplog, field_name: str,
+    ) -> None:
+        # Per-field wrong-typed probe: {} mismatches every scalar and
+        # list annotation, but dict-typed fields (``body_offload``)
+        # accept it — those take an int probe instead. Self-check the
+        # premise so a future annotation shape with no mismatching
+        # candidate fails loudly instead of making its own
+        # parametrization vacuous.
+        expected = journal_mod._field_types()[field_name]
+        probe: object = next(
+            (p for p in ({}, 5) if not journal_mod._value_matches(
+                p, expected)), None)
+        assert probe is not None, (
+            f"no wrong-typed probe candidate for {expected}")
+
+        row = _base_row()
+        row[field_name] = probe
+        self._plant(tmp_path, row)
+
+        with caplog.at_level(logging.WARNING, logger="core.coverage.journal"):
+            entries = load_entries(tmp_path)
+
+        assert len(entries) == 2
+        assert any(
+            "skipping malformed entry" in r.getMessage()
+            and repr(field_name) in r.getMessage()
+            for r in caplog.records
+        )
+
+    @pytest.mark.parametrize("field_name", _LIST_FIELDS)
+    def test_wrong_typed_list_element_quarantines_row(
+        self, tmp_path: Path, caplog, field_name: str,
+    ) -> None:
+        # Element depth matters: a non-str element in strategies
+        # crashes _canonical_strategy_hash's sorted-join inside
+        # index_key at merge time; a non-dict hypothesis element
+        # crashes consumers keying h.get(...).
+        expected = journal_mod._field_types()[field_name]
+        assert not journal_mod._value_matches([5], expected)
+
+        row = _base_row()
+        row[field_name] = [5]
+        self._plant(tmp_path, row)
+
+        with caplog.at_level(logging.WARNING, logger="core.coverage.journal"):
+            entries = load_entries(tmp_path)
+
+        assert len(entries) == 2
+
+    def test_dict_element_values_stay_free_form(self, tmp_path: Path) -> None:
+        # Both-directions boundary: dict VALUES inside list elements
+        # are LLM-derived free-form (consumers guard/format them) —
+        # over-strictening here would retroactively quarantine
+        # legitimate historical rows.
+        row = _base_row()
+        row["hypotheses"] = [{"mechanism": "m", "confidence": 0.7}]
+        row["study_receipts"] = [{"question": "q", "tier": 1}]
+        self._plant(tmp_path, row)
+
+        assert len(load_entries(tmp_path)) == 3
+
+    def test_int_accepted_where_float_expected(self, tmp_path: Path) -> None:
+        # JSON has a single number type: a writer emitting 1 for a
+        # float field must keep loading.
+        row = _base_row()
+        row["confidence"] = 1
+        row["cost_usd"] = 2
+        self._plant(tmp_path, row)
+
+        assert len(load_entries(tmp_path)) == 3
+
+    def test_bool_rejected_where_int_expected(self, tmp_path: Path) -> None:
+        # isinstance(True, int) holds — a bool token_budget is a
+        # planted shape, not a number.
+        row = _base_row()
+        row["token_budget"] = True
+        self._plant(tmp_path, row)
+
+        assert len(load_entries(tmp_path)) == 2
+
+    def test_wrong_typed_span_fields_clamp_not_quarantine(
+        self, tmp_path: Path,
+    ) -> None:
+        # Span fields keep their pre-existing containment discipline:
+        # a forged/wrong-typed span is CLAMPED while the rest of the
+        # row's evidence is kept (see _entry_from_dict).
+        row = _base_row()
+        row["line_start"] = "9"
+        row["line_end"] = {}
+        self._plant(tmp_path, row)
+
+        entries = load_entries(tmp_path)
+        assert len(entries) == 3
+        planted = [e for e in entries if e.run_id == "r-planted"]
+        assert planted[0].line_start == 0
+        assert planted[0].line_end is None
+
+    def test_planted_typed_rows_never_persistently_crash_consumers(
+        self, tmp_path: Path,
+    ) -> None:
+        # The finding's exact repro rows: "file": 5 (crashed
+        # reviewed_set via encode_key_file) and an int ts sharing a
+        # key with a real row (crashed the ts ordering compares in
+        # latest_entries AND merge_into_index). All consumers must
+        # keep working on every subsequent load.
+        append_entry(tmp_path, _entry(1))
+        journal = tmp_path / "review-journal.jsonl"
+        real = load_entries(tmp_path)[0]
+        with open(journal, "a", encoding="utf-8") as f:
+            row = _base_row()
+            row["file"] = 5
+            f.write(json.dumps(row) + "\n")
+            f.write(json.dumps({
+                "ts": 7, "run_id": "r", "file": real.file,
+                "function": real.function, "verdict": "clean",
+                "schema_version": 1,
+            }) + "\n")
+
+        assert journal_mod.reviewed_set(tmp_path) == {real.key}
+        assert set(journal_mod.latest_entries(tmp_path)) == {real.key}
+        project = tmp_path / "project"
+        assert journal_mod.merge_into_index(project, tmp_path) == 1
+        append_entry(tmp_path, _entry(2))
+        assert len(load_entries(tmp_path)) == 2
+
+
+class TestSchemaValidatorClosure:
+    """Every dataclass field's annotation must be handled by the
+    validator — a new field with an unsupported type fails HERE at
+    development time instead of quarantining every row that carries
+    it in production (the validator fails closed on unknown types)."""
+
+    @staticmethod
+    def _sample(expected):
+        import types as _types
+        import typing as _typing
+        origin = _typing.get_origin(expected)
+        if origin in (_typing.Union, _types.UnionType):
+            args = [
+                a for a in _typing.get_args(expected) if a is not type(None)
+            ]
+            return TestSchemaValidatorClosure._sample(args[0])
+        if origin is list or expected is list:
+            args = _typing.get_args(expected)
+            if not args:
+                return []
+            return [TestSchemaValidatorClosure._sample(args[0])]
+        if origin is dict or expected is dict:
+            return {}
+        if expected is bool:
+            return True
+        if expected is int:
+            return 1
+        if expected is float:
+            return 1.0
+        if expected is str:
+            return "x"
+        msg = f"no sample generator for annotation {expected!r} — extend _value_matches AND this generator"
+        raise AssertionError(msg)
+
+    def test_every_field_annotation_has_a_validator_arm(self) -> None:
+        import dataclasses
+        hints = journal_mod._field_types()
+        field_names = {
+            f.name for f in dataclasses.fields(ReviewJournalEntry)
+        }
+        assert set(hints) == field_names
+        for name, expected in hints.items():
+            conforming = self._sample(expected)
+            assert journal_mod._value_matches(conforming, expected), (
+                f"conforming sample rejected for field {name!r} "
+                f"({expected!r})"
+            )
+            assert not journal_mod._value_matches(object(), expected), (
+                f"arbitrary object accepted for field {name!r} "
+                f"({expected!r}) — validator arm missing/too wide"
+            )
+
+
+class TestSerializationHostility:
+    """Typed-VALID but content-hostile values must quarantine at row
+    acceptance.
+
+    A lone surrogate inside a str field (pure-ASCII ``\\ud800`` escape
+    on the wire) and a float that overflowed to ``inf`` at parse
+    (``1e400`` — ``parse_constant`` fires only on the literal
+    ``NaN``/``Infinity`` tokens) both pass the TYPE arms and detonate
+    at the write boundary — ``save_json`` inside the merge flock — on
+    stdlib-json environments. orjson refuses both shapes at parse, but
+    orjson is optional, so these force the stdlib arm explicitly; the
+    unpatched tests pin the natural arm's containment too.
+    """
+
+    _SURROGATE_LINE = (
+        '{"ts": "2099-01-01T00:00:00.000001+00:00", "run_id": "r-pl", '
+        '"file": "src/p.c", "function": "pf", "verdict": "clean", '
+        '"schema_version": 1, "body": "\\ud800evil"}'
+    )
+    _INF_LINE = (
+        '{"ts": "2099-01-01T00:00:00.000001+00:00", "run_id": "r-pl", '
+        '"file": "src/p.c", "function": "pf", "verdict": "clean", '
+        '"schema_version": 1, "confidence": 1e400}'
+    )
+
+    @staticmethod
+    def _force_stdlib_json(monkeypatch) -> None:
+        # Two namespaces on purpose. journal.py's function-local
+        # imports resolve through sys.modules at call time (the
+        # setattr covers those), but its module-level ``loads`` /
+        # ``load_json`` bindings keep reading the module object they
+        # were imported from — after a sibling suite purges
+        # core.json.* from sys.modules that object is detached, a
+        # sys.modules-only patch misses it, and where orjson is
+        # installed this pin silently exercises the orjson arm. The
+        # setitem through the held function's globals covers the
+        # detached copy.
+        import core.json.utils as json_utils
+        monkeypatch.setattr(json_utils, "_orjson", None)
+        monkeypatch.setitem(journal_mod.loads.__globals__, "_orjson", None)
+
+    def _plant(self, tmp_path: Path, line: str) -> None:
+        append_entry(tmp_path, _entry(1))
+        journal = tmp_path / "review-journal.jsonl"
+        with open(journal, "a", encoding="ascii") as f:
+            f.write(line + "\n")
+        append_entry(tmp_path, _entry(2))
+
+    @pytest.mark.parametrize("line", [_SURROGATE_LINE, _INF_LINE])
+    def test_hostile_row_quarantined_on_stdlib_arm(
+        self, tmp_path: Path, monkeypatch, line: str,
+    ) -> None:
+        self._force_stdlib_json(monkeypatch)
+        self._plant(tmp_path, line)
+
+        entries = load_entries(tmp_path)
+
+        assert len(entries) == 2
+        assert all(e.run_id == "run-1" for e in entries)
+
+    @pytest.mark.parametrize("line", [_SURROGATE_LINE, _INF_LINE])
+    def test_hostile_row_contained_on_natural_arm(
+        self, tmp_path: Path, line: str,
+    ) -> None:
+        # No arm forced: with orjson installed the planted line is
+        # refused at parse (corrupt-line skip); without it the row
+        # quarantines at validation. Both arms: siblings load.
+        self._plant(tmp_path, line)
+
+        assert len(load_entries(tmp_path)) == 2
+
+    @pytest.mark.parametrize("line", [_SURROGATE_LINE, _INF_LINE])
+    def test_planted_row_never_persistently_crashes_merge(
+        self, tmp_path: Path, monkeypatch, line: str,
+    ) -> None:
+        # The write-boundary repro: pre-fix, the planted row was
+        # ACCEPTED by the loader and every run-completion merge then
+        # crashed inside the flock at save_json (UnicodeEncodeError /
+        # allow_nan=False ValueError) — on EVERY retry.
+        self._force_stdlib_json(monkeypatch)
+        self._plant(tmp_path, line)
+        project = tmp_path / "project"
+
+        assert journal_mod.merge_run_into_index(project, tmp_path) == 2
+        # Retry parity: the merge stays alive on every subsequent run.
+        assert journal_mod.merge_run_into_index(project, tmp_path) == 0
+        index = journal_mod.load_index(project)
+        assert {e.run_id for e in index.values()} == {"run-1"}
+
+    def test_serializer_roundtrip_is_the_invariant(self) -> None:
+        # Class closure: the validator delegates to the serializer's
+        # own strictness pins, not an enumerated hostile-value list.
+        with pytest.raises(ValueError, match="round-trip"):
+            journal_mod._validate_serializable({"body": "\ud800evil"})
+        with pytest.raises(ValueError, match="round-trip"):
+            journal_mod._validate_serializable({"confidence": float("inf")})
+        with pytest.raises(ValueError, match="round-trip"):
+            journal_mod._validate_serializable(
+                {"hypotheses": [{"note": float("nan")}]},
+            )
+        journal_mod._validate_serializable({"body": "café", "ok": 1.0})
+
+    @pytest.mark.parametrize("version", ["true", "1.0"])
+    def test_non_int_schema_version_quarantines(
+        self, tmp_path: Path, version: str,
+    ) -> None:
+        # True == 1 and 1.0 == 1 both slip a bare equality compare —
+        # the version marker must be a genuine int.
+        row_json = (
+            '{"ts": "2099-01-01T00:00:00.000001+00:00", "run_id": "r-pl", '
+            '"file": "src/p.c", "function": "pf", "verdict": "clean", '
+            '"schema_version": ' + version + "}"
+        )
+        self._plant(tmp_path, row_json)
+
+        assert len(load_entries(tmp_path)) == 2
+
 
 class TestJournalByteBudget:
-    """Journal + index loads are size-gated before any read."""
+    """Journal loads are memory-bounded but NEVER fail open: an
+    over-budget journal keeps loading what fits (duplicate
+    re-emissions pruned losslessly first), the load flags incomplete
+    when rows were actually lost, and spend-authorizing consumers
+    refuse an incomplete load instead of reading a partial journal
+    as 'nothing was reviewed' (the old size gate returned [] and a
+    resume re-bought every prior verdict)."""
 
-    def test_oversize_journal_loads_empty(
+    def test_over_budget_journal_still_loads_flagged_incomplete(
         self, tmp_path: Path, monkeypatch,
     ) -> None:
         append_entry(tmp_path, _entry(1))
         append_entry(tmp_path, _entry(2))
         size = (tmp_path / "review-journal.jsonl").stat().st_size
         monkeypatch.setattr(journal_mod, "_MAX_JOURNAL_BYTES", size - 1)
-        assert load_entries(tmp_path) == []
+        loaded = journal_mod.load_entries_checked(tmp_path)
+        # Distinct live rows cannot prune, so the load is partial —
+        # but everything read up to the stop IS returned.
+        assert loaded.entries, "over-budget journal read as empty"
+        assert not loaded.complete
+        assert load_entries(tmp_path) == loaded.entries
+
+    def test_incomplete_load_refused_for_spend_callers(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        append_entry(tmp_path, _entry(1))
+        append_entry(tmp_path, _entry(2))
+        size = (tmp_path / "review-journal.jsonl").stat().st_size
+        monkeypatch.setattr(journal_mod, "_MAX_JOURNAL_BYTES", size - 1)
+        with pytest.raises(journal_mod.JournalIncomplete) as exc_info:
+            journal_mod.require_complete_entries(tmp_path)
+        # The refusal names the operator remedy.
+        assert "journal compact" in str(exc_info.value)
+
+    def test_complete_load_passes_spend_callers(
+        self, tmp_path: Path,
+    ) -> None:
+        append_entry(tmp_path, _entry(1))
+        entries = journal_mod.require_complete_entries(tmp_path)
+        assert [e.function for e in entries] == ["fn1"]
+
+    def test_reemission_rows_prune_within_budget(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """A journal dominated by duplicate reused re-emissions (the
+        resume-segment shape) loads COMPLETE past the byte budget:
+        pruning keeps the newest row per identity and loses no
+        verdict, key, or spend evidence."""
+        live = _entry(1)
+        live.cost_usd = 0.42
+        append_entry(tmp_path, live)
+        for _ in range(6):
+            dup = _entry(1)
+            dup.reused = True
+            dup.reused_from_run = "run-0"
+            dup.cost_usd = 0.0
+            append_entry(tmp_path, dup)
+        size = (tmp_path / "review-journal.jsonl").stat().st_size
+        monkeypatch.setattr(journal_mod, "_MAX_JOURNAL_BYTES", size // 2)
+        loaded = journal_mod.load_entries_checked(tmp_path)
+        assert loaded.complete
+        assert loaded.pruned > 0
+        # The newest reused row and the $-bearing live row survive.
+        assert sum(1 for e in loaded.entries if e.reused) == 1
+        assert any(e.cost_usd == 0.42 for e in loaded.entries)
+        assert {e.key for e in loaded.entries} == {"src/f1.c:fn1"}
 
     def test_journal_at_cap_still_loads(
         self, tmp_path: Path, monkeypatch,
@@ -239,6 +701,42 @@ class TestJournalByteBudget:
         size = (tmp_path / "review-journal.jsonl").stat().st_size
         monkeypatch.setattr(journal_mod, "_MAX_JOURNAL_BYTES", size)
         assert len(load_entries(tmp_path)) == 1
+
+    def test_overlong_line_quarantined_neighbours_load(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """A single line past the per-line bound quarantines as a row
+        (streamed past, never buffered) while its neighbours load."""
+        append_entry(tmp_path, _entry(1))
+        journal = tmp_path / "review-journal.jsonl"
+        with journal.open("ab") as fh:
+            fh.write(b'{"pad": "' + b"A" * 4096 + b'"}\n')
+        append_entry(tmp_path, _entry(2))
+        monkeypatch.setattr(journal_mod, "_MAX_JOURNAL_LINE_BYTES", 1024)
+        loaded = journal_mod.load_entries_checked(tmp_path)
+        assert [e.function for e in loaded.entries] == ["fn1", "fn2"]
+        assert loaded.complete
+
+    def test_retained_entry_count_bounded(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """A flood of distinct minimal rows under the byte budget is
+        bounded by the COUNT cap (per-entry object overhead is what
+        OOMs the reader, not raw bytes) and flags incomplete."""
+        journal = tmp_path / "review-journal.jsonl"
+        rows = b"".join(
+            json.dumps({
+                "ts": now_iso(), "run_id": "r", "file": f"h{i}.c",
+                "function": f"h{i}", "verdict": "clean",
+                "schema_version": 1,
+            }).encode() + b"\n"
+            for i in range(50)
+        )
+        journal.write_bytes(rows)
+        monkeypatch.setattr(journal_mod, "_MAX_RETAINED_ENTRIES", 20)
+        loaded = journal_mod.load_entries_checked(tmp_path)
+        assert not loaded.complete
+        assert len(loaded.entries) <= 22
 
     def test_oversize_index_starts_fresh(
         self, tmp_path: Path, monkeypatch,
@@ -252,6 +750,153 @@ class TestJournalByteBudget:
         assert journal_mod._load_index(index_path) == {}
         monkeypatch.setattr(journal_mod, "_MAX_JOURNAL_BYTES", 1 << 20)
         assert "k" in journal_mod._load_index(index_path)
+
+
+class TestIndexShapeGuards:
+    """Index-side twins of the journal reader's shape gates.
+
+    The index is reachable via a /project archive import, so its
+    "entries" value and every entry value are attacker-shapeable: a
+    list/null "entries" passed the top-level dict gate and crashed
+    every consumer's .items()/.get, and the writer path crashed
+    INSIDE the merge flock — every run-completion merge against such
+    an index failed with a raw traceback instead of the designed
+    loud refusal.
+    """
+
+    def _run_with_entry(self, tmp_path: Path, i: int = 1) -> Path:
+        run = tmp_path / f"run{i}"
+        run.mkdir(exist_ok=True)
+        append_entry(run, _entry(i))
+        return run
+
+    @pytest.mark.parametrize("planted", ["[1, 2]", "null", '"x"', "7"])
+    def test_non_object_entries_reads_empty(
+        self, tmp_path: Path, caplog, planted: str,
+    ) -> None:
+        index_path = tmp_path / journal_mod.INDEX_FILENAME
+        index_path.write_text('{"entries": ' + planted + "}")
+
+        with caplog.at_level(logging.WARNING, logger="core.coverage.journal"):
+            assert journal_mod.load_index_full(tmp_path) == {}
+
+        assert any(
+            "non-object 'entries'" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_non_object_entries_refuses_merge_file_untouched(
+        self, tmp_path: Path,
+    ) -> None:
+        # Writer discipline: IndexUnreadable, never a rewrite — the
+        # unknown content might be history a newer schema wrote.
+        index_path = tmp_path / journal_mod.INDEX_FILENAME
+        index_path.write_text('{"entries": [1, 2]}')
+        run = self._run_with_entry(tmp_path)
+
+        assert journal_mod.merge_into_index(tmp_path, run) == 0
+        assert index_path.read_text() == '{"entries": [1, 2]}'
+
+    @pytest.mark.parametrize("planted", ["null", "[1]", '"x"', "7"])
+    def test_non_object_entry_value_skipped_by_reader(
+        self, tmp_path: Path, caplog, planted: str,
+    ) -> None:
+        index_path = tmp_path / journal_mod.INDEX_FILENAME
+        index_path.write_text('{"entries": {"k": ' + planted + "}}")
+
+        with caplog.at_level(logging.WARNING, logger="core.coverage.journal"):
+            assert journal_mod.load_index_full(tmp_path) == {}
+
+        assert any(
+            "skipping k: not an object" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_non_object_entry_value_left_in_place_by_merge(
+        self, tmp_path: Path,
+    ) -> None:
+        # Row-level disposition mirrors the unparseable-dict-row rule:
+        # leave in place, never drop — but the merge itself (and the
+        # re-home walk over the planted key) must proceed.
+        index_path = tmp_path / journal_mod.INDEX_FILENAME
+        index_path.write_text('{"entries": {"k": null}}')
+        run = self._run_with_entry(tmp_path)
+
+        assert journal_mod.merge_into_index(tmp_path, run) == 1
+
+        entries = json.loads(index_path.read_text())["entries"]
+        assert "k" in entries and entries["k"] is None
+        assert len(entries) == 2
+
+    def test_occupied_key_with_non_str_ts_loses_without_crash(
+        self, tmp_path: Path,
+    ) -> None:
+        # A planted dict row with an int ts at the exact index_key of
+        # an incoming entry crashed the `>` compare inside the flock;
+        # garbage ts must read as "" (older than every real stamp).
+        run = self._run_with_entry(tmp_path)
+        assert journal_mod.merge_into_index(tmp_path, run) == 1
+        index_path = tmp_path / journal_mod.INDEX_FILENAME
+        data = json.loads(index_path.read_text())
+        key = next(iter(data["entries"]))
+        data["entries"][key]["ts"] = 7
+        index_path.write_text(json.dumps(data))
+
+        run2 = tmp_path / "run2"
+        run2.mkdir()
+        newer = _entry(1)
+        newer.verdict = "finding"
+        append_entry(run2, newer)
+
+        assert journal_mod.merge_into_index(tmp_path, run2) == 1
+        assert journal_mod.load_index(tmp_path)[newer.key].verdict == "finding"
+
+    _HOSTILE_INDEXES = [
+        # Lone surrogate inside a preserved row (pure-ASCII bytes).
+        '{"entries": {"k": {"body": "\\ud800evil"}}}',
+        # Overflow-to-inf float (1e400 parses to inf on stdlib json;
+        # parse_constant fires only on literal NaN/Infinity tokens).
+        '{"entries": {"k": {"confidence": 1e400}}}',
+    ]
+
+    @pytest.mark.parametrize("planted", _HOSTILE_INDEXES)
+    def test_content_hostile_preserved_row_refuses_merge_file_untouched(
+        self, tmp_path: Path, monkeypatch, planted: str,
+    ) -> None:
+        # Write-boundary class: never-drop keeps rows that fail row
+        # validation, and the writer serializes the WHOLE entries
+        # dict — pre-fix, a planted row the serializer refuses
+        # (UnicodeEncodeError at the utf-8 encode / allow_nan=False
+        # ValueError) crashed save_json inside the merge flock on
+        # EVERY retry. The writer must refuse loudly instead, file
+        # untouched — parity with orjson environments, where the same
+        # planted index refuses at parse. Dual-namespace forcing for
+        # the same reason as TestSerializationHostility's helper.
+        TestSerializationHostility._force_stdlib_json(monkeypatch)
+        index_path = tmp_path / journal_mod.INDEX_FILENAME
+        index_path.write_text(planted, encoding="ascii")
+        run = self._run_with_entry(tmp_path)
+
+        assert journal_mod.merge_into_index(tmp_path, run) == 0
+        # Retry parity — refusal, never a crash, on every attempt.
+        assert journal_mod.merge_into_index(tmp_path, run) == 0
+        assert index_path.read_text(encoding="ascii") == planted
+        # The reader side degrades row-by-row, never crashes.
+        assert journal_mod.load_index_full(tmp_path) == {}
+
+    @pytest.mark.parametrize("planted", _HOSTILE_INDEXES)
+    def test_content_hostile_index_contained_on_natural_arm(
+        self, tmp_path: Path, planted: str,
+    ) -> None:
+        # No arm forced: orjson refuses the planted bytes at parse
+        # (unreadable-index refusal); stdlib refuses at the new
+        # write-boundary proof. Both arms: merge 0, file untouched.
+        index_path = tmp_path / journal_mod.INDEX_FILENAME
+        index_path.write_text(planted, encoding="ascii")
+        run = self._run_with_entry(tmp_path)
+
+        assert journal_mod.merge_into_index(tmp_path, run) == 0
+        assert index_path.read_text(encoding="ascii") == planted
 
 
 class TestNonFiniteWriteParity:
@@ -274,3 +919,196 @@ class TestNonFiniteWriteParity:
         loaded = load_entries(tmp_path)
         assert len(loaded) == 1
         assert loaded[0].confidence == 0.75
+
+
+class TestDomainSliceHashField:
+    """``domain_slice_hash`` round-trips like every additive field."""
+
+    def test_round_trips_and_stays_mac_verified(
+        self, tmp_path: Path,
+    ) -> None:
+        from core.coverage.journal_mac import ROW_VERIFIED, entry_provenance
+        entry = _entry(1)
+        entry.domain_slice_hash = "ab" * 32
+        append_entry(tmp_path, entry)
+        loaded = load_entries(tmp_path)
+        assert len(loaded) == 1
+        assert loaded[0].domain_slice_hash == "ab" * 32
+        # The stamp is MAC-covered row content: a verified row's slice
+        # stamp is as authentic as its verdict.
+        assert entry_provenance(loaded[0]) == ROW_VERIFIED
+
+    def test_absent_on_legacy_rows(self, tmp_path: Path) -> None:
+        append_entry(tmp_path, _entry(2))
+        loaded = load_entries(tmp_path)
+        assert loaded[0].domain_slice_hash is None
+        assert "domain_slice_hash" not in loaded[0].to_dict()
+
+    def test_survives_index_merge(self, tmp_path: Path) -> None:
+        from core.coverage.journal import load_index_full, merge_into_index
+        project = tmp_path / "project"
+        run_dir = project / "run-1"
+        run_dir.mkdir(parents=True)
+        entry = _entry(3)
+        entry.domain_slice_hash = "cd" * 32
+        append_entry(run_dir, entry)
+        merge_into_index(project, run_dir)
+        merged = list(load_index_full(project).values())
+        assert len(merged) == 1
+        assert merged[0].domain_slice_hash == "cd" * 32
+
+    def test_tampered_stamp_demotes_row(self, tmp_path: Path) -> None:
+        # Editing the stamp on a stamped row must break the MAC —
+        # the reuse gate only ever sees verified rows, so a rewritten
+        # slice stamp cannot buy reuse authority.
+        from core.coverage.journal_mac import ROW_TAMPERED, entry_provenance
+        entry = _entry(4)
+        entry.domain_slice_hash = "ef" * 32
+        append_entry(tmp_path, entry)
+        journal = tmp_path / "review-journal.jsonl"
+        text = journal.read_text(encoding="utf-8")
+        journal.write_text(
+            text.replace("ef" * 32, "00" * 32), encoding="utf-8")
+        loaded = load_entries(tmp_path)
+        assert loaded[0].domain_slice_hash == "00" * 32
+        assert entry_provenance(loaded[0]) == ROW_TAMPERED
+
+
+class TestReemissionPruneElection:
+    """The load prune must keep, per identity, the row the
+    latest-wins consumers elect (strict ``ts >``, first-in-file on a
+    tie) — never the last row by file position. A position-based
+    election can change which row wins a key's latest election when
+    re-emission ``ts`` order disagrees with append order (journals
+    merged from concurrent segments, cross-shard concatenation)."""
+
+    @staticmethod
+    def _twin(ts: str, run_id: str) -> ReviewJournalEntry:
+        e = _entry(1)
+        e.ts = ts
+        e.run_id = run_id  # non-identity marker: shows which twin survived
+        e.reused = True
+        e.reused_from_run = "run-0"
+        e.cost_usd = 0.0
+        return e
+
+    @staticmethod
+    def _consumer_latest(
+        entries: list[ReviewJournalEntry],
+    ) -> dict[str, ReviewJournalEntry]:
+        # Mirror of the latest_entries election (strict ``ts >``,
+        # first-in-file tie) — the oracle the prune must not disturb.
+        best: dict[str, ReviewJournalEntry] = {}
+        for entry in entries:
+            existing = best.get(entry.key)
+            if existing is None or entry.ts > existing.ts:
+                best[entry.key] = entry
+        return best
+
+    def test_ts_straddle_prune_is_invisible_to_latest_election(
+        self,
+    ) -> None:
+        # The twins straddle a live row's ts, max-ts twin FIRST in
+        # file: a position election drops it and hands the key's
+        # latest election to the live row in the middle.
+        high = self._twin("2099-01-01T00:00:00.000005+00:00", "seg-2")
+        low = self._twin("2099-01-01T00:00:00.000001+00:00", "seg-1")
+        live = _entry(1)
+        live.ts = "2099-01-01T00:00:00.000003+00:00"
+        live.run_id = "live"
+        live.cost_usd = 0.10
+        entries = [high, live, low]
+        sizes = [100, 100, 100]
+        before = self._consumer_latest(entries)[high.key]
+        freed_rows, freed_bytes = journal_mod._prune_reemission_rows(
+            entries, sizes)
+        assert (freed_rows, freed_bytes) == (1, 100)
+        after = self._consumer_latest(entries)[high.key]
+        assert before.run_id == after.run_id == "seg-2"
+        assert [e.run_id for e in entries] == ["seg-2", "live"]
+        assert sizes == [100, 100]
+
+    def test_ts_tie_keeps_first_in_file(self) -> None:
+        ts = "2099-01-01T00:00:00.000001+00:00"
+        entries = [self._twin(ts, "seg-1"), self._twin(ts, "seg-2")]
+        sizes = [10, 20]
+        freed_rows, freed_bytes = journal_mod._prune_reemission_rows(
+            entries, sizes)
+        assert (freed_rows, freed_bytes) == (1, 20)
+        assert [e.run_id for e in entries] == ["seg-1"]
+
+    def test_append_order_control_keeps_newest(self) -> None:
+        # Normal single-writer shape: ts increases with position, so
+        # last-in-file IS the max-ts row — behavior unchanged.
+        entries = [
+            self._twin(
+                f"2099-01-01T00:00:00.00000{i}+00:00", f"seg-{i}",
+            )
+            for i in range(1, 4)
+        ]
+        sizes = [10, 20, 30]
+        freed_rows, freed_bytes = journal_mod._prune_reemission_rows(
+            entries, sizes)
+        assert (freed_rows, freed_bytes) == (2, 30)
+        assert [e.run_id for e in entries] == ["seg-3"]
+
+    def test_loader_prune_elects_by_ts(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        # File-level wiring through the real budget prune: with
+        # out-of-order ts the survivor is the max-ts twin, not the
+        # last-appended one.
+        append_entry(
+            tmp_path,
+            self._twin("2099-01-01T00:00:00.000009+00:00", "seg-9"),
+        )
+        for i in range(1, 7):
+            append_entry(
+                tmp_path,
+                self._twin(
+                    f"2099-01-01T00:00:00.00000{i}+00:00", f"seg-{i}",
+                ),
+            )
+        size = (tmp_path / "review-journal.jsonl").stat().st_size
+        monkeypatch.setattr(journal_mod, "_MAX_JOURNAL_BYTES", size // 2)
+        loaded = journal_mod.load_entries_checked(tmp_path)
+        assert loaded.complete
+        assert loaded.pruned > 0
+        reused = [e for e in loaded.entries if e.reused]
+        assert [e.run_id for e in reused] == ["seg-9"]
+
+
+class TestWeaknessRoundTrip:
+    """weakness dict survives journal write → read."""
+
+    def test_weaknesses_round_trip(self, tmp_path: Path) -> None:
+        ws = [
+            {
+                "guard_type": "bounds",
+                "assumed_property": "length capped by caller",
+                "assumed_by": "parse_header",
+                "guarded_by": ["validate_input"],
+                "source": "hypothesis",
+            },
+        ]
+        e = ReviewJournalEntry(
+            ts=now_iso(),
+            run_id="run-rt",
+            file="src/a.c",
+            function="fn_a",
+            verdict="clean",
+            source_hash="abc",
+            weaknesses=ws,
+        )
+        append_entry(tmp_path, e)
+        loaded = load_entries(tmp_path)
+        assert len(loaded) == 1
+        assert loaded[0].weaknesses == ws
+
+    def test_missing_weaknesses_deserialises_as_none(
+        self, tmp_path: Path,
+    ) -> None:
+        e = _entry(1)
+        append_entry(tmp_path, e)
+        loaded = load_entries(tmp_path)
+        assert loaded[0].weaknesses is None

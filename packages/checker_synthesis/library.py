@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import re
 import threading
 from dataclasses import dataclass, field
@@ -34,6 +35,7 @@ from typing import Any, TYPE_CHECKING
 
 from core.atomic_fs import write_bytes_atomically, write_text_atomically
 from core.json import load_json, save_json
+from core.sage.hooks import RULE_REPLAY_MIN_TARGETS
 
 from .cwe_families import cwe_siblings
 
@@ -42,11 +44,28 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_LIBRARY_DIR = Path("out/rule-library")
+def _default_library_dir() -> Path:
+    """Default rule-library location.
+
+    Anchored at the RAPTOR install when the launcher exported
+    RAPTOR_DIR; else the process cwd (bare test / dev runs). A purely
+    cwd-relative default keyed the library to whatever directory the
+    caller happened to run from — two callers with different cwds
+    silently read/write two different libraries.
+    """
+    base = os.environ.get("RAPTOR_DIR")
+    return (Path(base) if base else Path.cwd()) / "out" / "rule-library"
 
 _REPLAY_TP_THRESHOLD = 0.80
 _MIN_TARGETS_FOR_PRUNE = 3
-_MIN_TARGETS_FOR_REPLAY = 1
+# Replay floor sourced from the SAGE lane's constant so the two
+# replay gates cannot drift apart again: with the disk library at a
+# lower floor than ``should_replay_rule``, rules replayed here kept
+# accruing ``targets`` records below the stronger lane's gate and
+# eventually cleared it on evidence the stronger lane would have
+# refused to act on. See RULE_REPLAY_MIN_TARGETS for the
+# both-directions rationale on the value itself.
+_MIN_TARGETS_FOR_REPLAY = RULE_REPLAY_MIN_TARGETS
 
 
 def _body_hash(body: str) -> str:
@@ -106,6 +125,12 @@ class TargetRecord:
     variants: int
     tp_rate: float | None
     target_profile: str = ""
+    # How many of `matches` the triage actually CLASSIFIED
+    # (variant/false_positive). `tp_rate` is a rate over this subset,
+    # so this is the record's verdict-backed evidence count — a
+    # partially-classified triage (1 verdict + 5 uncertain over 6
+    # matches) carries ONE sample of evidence, not six.
+    classified: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -114,6 +139,7 @@ class TargetRecord:
             "matches": self.matches,
             "variants": self.variants,
             "tp_rate": self.tp_rate,
+            "classified": self.classified,
         }
         if self.target_profile:
             d["target_profile"] = self.target_profile
@@ -121,13 +147,24 @@ class TargetRecord:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> TargetRecord:
+        tp_rate = d.get("tp_rate")
+        classified = d.get("classified")
+        if classified is None:
+            # Legacy manifests predate the field. A rated legacy
+            # record's true classified count is unknown; defaulting
+            # to `matches` preserves the exact pre-field evidence
+            # weight (retire/aggregate behaviour unchanged for old
+            # data), while an unrated record carried no verdicts by
+            # definition.
+            classified = d.get("matches", 0) if tp_rate is not None else 0
         return cls(
             target_hash=d["target_hash"],
             ts=d.get("ts", ""),
             matches=d.get("matches", 0),
             variants=d.get("variants", 0),
-            tp_rate=d.get("tp_rate"),
+            tp_rate=tp_rate,
             target_profile=d.get("target_profile", ""),
+            classified=classified,
         )
 
 
@@ -224,23 +261,61 @@ class LibraryEntry:
         )
 
 
+def rule_join_key(entry: LibraryEntry) -> str:
+    """THE mutation-API join key for a library entry — its body hash.
+
+    ``rule_id`` is documented-non-unique: two different bodies can
+    legitimately share a rule id (same seed re-synthesised across runs
+    or CVEs, and the cve_bridge's empty-function seeds all slug to the
+    same id). ``body_hash`` is the store's actual identity — promote()
+    dedups by it. Callers that hold a ``LibraryEntry`` must key
+    ``update()`` through this constructor; keying on the raw rule_id
+    resolved the FIRST manifest entry and recorded one rule's replay
+    verdicts, targets and coverage onto a different rule's precision.
+    """
+    return entry.body_hash
+
+
+def graduated_stem(rule_id: str) -> str:
+    """THE file-stem join key for graduated rule copies.
+
+    ``graduate()`` names the engine-rules file with this sanitised
+    stem, and every consumer that joins a graduated file or finding
+    back to the library (sweep dedup, precision feedback) must compare
+    stems through the same constructor — comparing a stem against the
+    raw rule_id silently never matches ids that sanitisation changed.
+    """
+    return _safe_component(rule_id, what="rule id")
+
+
 def _compute_rates(
     triage: list[MatchTriage],
-) -> tuple[float, float, int]:
+) -> tuple[float, float, int, int]:
+    """Rates over the CLASSIFIED subset plus the classified count.
+
+    ``uncertain``/``skipped`` rows are excluded from the denominator,
+    so a triage that classified NOTHING (LLM transport failure stamps
+    every match ``uncertain``) carries no rate at all — the returned
+    classified count is what callers must gate their ``tp_rate``
+    persistence on. A truthiness check on the triage LIST minted an
+    outage as matches-weighted 0% precision, dragging the aggregate
+    toward the replay gate and retirement for rules whose mechanical
+    controls all passed.
+    """
     classified = [t for t in triage if t.status in ("variant", "false_positive")]
     if not classified:
-        return 0.0, 0.0, 0
+        return 0.0, 0.0, 0, 0
     variants = sum(1 for t in classified if t.status == "variant")
     fps = sum(1 for t in classified if t.status == "false_positive")
     total = len(classified)
-    return variants / total, fps / total, variants
+    return variants / total, fps / total, variants, total
 
 
 class RuleLibrary:
     """Persistent rule library backed by a manifest.json file."""
 
     def __init__(self, library_dir: Path | None = None) -> None:
-        self._dir = Path(library_dir) if library_dir else _DEFAULT_LIBRARY_DIR
+        self._dir = Path(library_dir) if library_dir else _default_library_dir()
         self._manifest_path = self._dir / "manifest.json"
         self._entries: list[LibraryEntry] | None = None
         self._lock = threading.Lock()
@@ -316,14 +391,26 @@ class RuleLibrary:
     def find_replayable(self, cwe: str, engine: str) -> list[LibraryEntry]:
         """Find rules suitable for replay (high TP, enough targets).
 
-        Sorted by TP rate descending, then by number of targets tested
-        (more evidence = higher confidence). Caller typically takes [0].
+        Requires the full mechanical-control tier (dual_control AND
+        rule_tier="library"), the same doctrine as :meth:`graduate`:
+        precision statistics cannot substitute for the fix-mutant
+        control, and an add_rule entry with dual_control=True but a
+        failed fix-mutant control never proved it distinguishes fixed
+        from unfixed code. Sorted by TP rate descending, then by
+        number of targets tested (more evidence = higher confidence).
+        Caller typically takes [0].
         """
         candidates = [
             e for e in self.find(cwe, engine)
             if e.tp_rate >= _REPLAY_TP_THRESHOLD
-            and len(e.targets) >= _MIN_TARGETS_FOR_REPLAY
+            # Distinct target identities, not records: the machinery
+            # writers dedup by target_hash on append, but the floor
+            # must hold against a manifest whose records repeat one
+            # hash — duplicate records are one target's evidence.
+            and len({t.target_hash for t in e.targets})
+            >= _MIN_TARGETS_FOR_REPLAY
             and e.dual_control
+            and e.rule_tier == "library"
         ]
         candidates.sort(key=lambda e: (e.tp_rate, len(e.targets)), reverse=True)
         return candidates
@@ -428,6 +515,7 @@ class RuleLibrary:
     ) -> LibraryEntry | None:
         self._ensure_dirs()
         rule = result.rule
+        assert rule is not None
         bh = _body_hash(rule.body)
 
         existing = self.get_by_body_hash(bh)
@@ -461,7 +549,7 @@ class RuleLibrary:
         else:
             write_text_atomically(dest, rule.body, tmp_prefix=".rule-")
 
-        tp_rate, fp_rate, variant_count = _compute_rates(result.triage)
+        tp_rate, fp_rate, variant_count, classified = _compute_rates(result.triage)
 
         targets: list[TargetRecord] = []
         if target_hash:
@@ -470,7 +558,8 @@ class RuleLibrary:
                 ts=timestamp,
                 matches=len(result.matches),
                 variants=variant_count,
-                tp_rate=tp_rate if result.triage else None,
+                tp_rate=tp_rate if classified else None,
+                classified=classified,
             ))
 
         entry = LibraryEntry(
@@ -484,6 +573,14 @@ class RuleLibrary:
             seed_function=result.seed.function,
             dual_control=True,
             promoted_at=timestamp,
+            # When triage classified nothing (LLM outage stamps every
+            # match uncertain) these are 0.0/0.0 — a neutral
+            # placeholder, NOT measured 0% precision. The target
+            # record above already carries tp_rate=None for that
+            # case; retirement and auto-archive weigh only
+            # verdict-backed evidence, so the placeholder can never
+            # retire the rule, and the first rated update heals it
+            # via _recompute_aggregate.
             tp_rate=tp_rate,
             fp_rate=fp_rate,
             total_variants=variant_count,
@@ -496,8 +593,9 @@ class RuleLibrary:
         self._load().append(entry)
         self._save()
         logger.info(
-            "promoted rule %s to library (cwe=%s, engine=%s, tp=%.0f%%)",
-            rule.rule_id, result.seed.cwe, rule.engine, tp_rate * 100,
+            "promoted rule %s to library (cwe=%s, engine=%s, tp=%s)",
+            rule.rule_id, result.seed.cwe, rule.engine,
+            f"{tp_rate * 100:.0f}%" if classified else "no verdicts",
         )
         return entry
 
@@ -508,19 +606,28 @@ class RuleLibrary:
         target_hash: str,
         timestamp: str,
     ) -> None:
-        tp_rate, _fp_rate, variant_count = _compute_rates(result.triage)
+        tp_rate, _fp_rate, variant_count, classified = _compute_rates(result.triage)
+        # The totals follow the TargetRecord dedup: a re-run on an
+        # already-recorded target must not inflate them (the per-
+        # target record is first-write-wins, so the totals would
+        # otherwise double-count what the records refuse to). With no
+        # target_hash there is nothing to dedup on — count as before.
+        counted = True
         if target_hash:
             already = {t.target_hash for t in entry.targets}
-            if target_hash not in already:
+            counted = target_hash not in already
+            if counted:
                 entry.targets.append(TargetRecord(
                     target_hash=target_hash,
                     ts=timestamp,
                     matches=len(result.matches),
                     variants=variant_count,
-                    tp_rate=tp_rate if result.triage else None,
+                    tp_rate=tp_rate if classified else None,
+                    classified=classified,
                 ))
-        entry.total_variants += variant_count
-        entry.total_matches += len(result.matches)
+        if counted:
+            entry.total_variants += variant_count
+            entry.total_matches += len(result.matches)
         # Only called from the promote() path, whose gate already
         # required every mechanical control — an existing add_rule
         # (sweep_once) copy of the same body is upgraded in place.
@@ -530,13 +637,20 @@ class RuleLibrary:
 
     def update(
         self,
-        rule_id: str,
+        key: str,
         target_hash: str,
         matches: list[Match],
         triage: list[MatchTriage],
         timestamp: str = "",
     ) -> LibraryEntry | None:
         """Update effectiveness after replaying a library rule.
+
+        *key* is :func:`rule_join_key` (the entry's body hash) —
+        callers replaying a specific entry always hold it. A raw
+        rule_id is still resolved while it is UNAMBIGUOUS; a rule_id
+        shared by several entries is refused (None + warning) rather
+        than resolved first-entry-wins, which recorded one rule's
+        verdicts and targets onto a different rule's precision.
 
         Locked like promote/add_rule/record_match: this is a
         read-modify-write over shared entry state, and an unlocked
@@ -547,35 +661,59 @@ class RuleLibrary:
         """
         with self._lock:
             entries = self._load()
-            entry = next((e for e in entries if e.rule_id == rule_id), None)
+            entry = next((e for e in entries if e.body_hash == key), None)
+            if entry is None:
+                by_id = [e for e in entries if e.rule_id == key]
+                if len(by_id) > 1:
+                    logger.warning(
+                        "rule library: update(%r) is ambiguous — %d "
+                        "entries share the rule id; pass "
+                        "rule_join_key(entry) instead. Nothing recorded.",
+                        key, len(by_id),
+                    )
+                    return None
+                entry = by_id[0] if by_id else None
             if entry is None:
                 return None
 
-            tp_rate, _fp_rate, variant_count = _compute_rates(triage)
+            tp_rate, _fp_rate, variant_count, classified = _compute_rates(triage)
+            # Totals follow the TargetRecord dedup — see _update_entry.
             already = {t.target_hash for t in entry.targets}
+            counted = not target_hash or target_hash not in already
             if target_hash and target_hash not in already:
                 entry.targets.append(TargetRecord(
                     target_hash=target_hash,
                     ts=timestamp,
                     matches=len(matches),
                     variants=variant_count,
-                    tp_rate=tp_rate if triage else None,
+                    tp_rate=tp_rate if classified else None,
+                    classified=classified,
                 ))
-            entry.total_variants += variant_count
-            entry.total_matches += len(matches)
+            if counted:
+                entry.total_variants += variant_count
+                entry.total_matches += len(matches)
             self._recompute_aggregate(entry)
             self._auto_archive(entry)
             self._save()
             return entry
 
     def _recompute_aggregate(self, entry: LibraryEntry) -> None:
-        # Per-target triage rates weighted by match count, blended
-        # with record_match feedback as one-verdict samples. Including
-        # the feedback counters here means a later update() no longer
-        # silently discards previously recorded feedback.
+        # Per-target triage rates weighted by CLASSIFIED count,
+        # blended with record_match feedback as one-verdict samples.
+        # tp_rate is a rate over the classified subset, so weighting
+        # by raw match count let a partially-classified target (one
+        # false_positive verdict + five uncertain over six matches)
+        # drag the aggregate with six matches' worth of weight off a
+        # single verdict. classified * tp_rate is the target's
+        # variant count — verdict-for-verdict blending, same unit as
+        # the feedback counters. (Legacy records deserialise with
+        # classified=matches when rated, so old aggregates are
+        # unchanged.) Including the feedback counters here means a
+        # later update() no longer silently discards previously
+        # recorded feedback.
         rated = [t for t in entry.targets if t.tp_rate is not None]
-        weight = sum(t.matches for t in rated)
-        weighted_tp = sum(t.tp_rate * t.matches for t in rated)
+        weight = sum(t.classified for t in rated)
+        weighted_tp = sum(t.tp_rate * t.classified for t in rated)  # type: ignore[operator, misc]
         denominator = weight + entry.feedback_classified
         if denominator <= 0:
             return
@@ -585,13 +723,24 @@ class RuleLibrary:
         entry.fp_rate = 1.0 - entry.tp_rate
 
     def _auto_archive(self, entry: LibraryEntry) -> None:
-        if len(entry.targets) < _MIN_TARGETS_FOR_PRUNE:
+        # Only evidence-bearing targets advance the archive counter:
+        # a zero-match target is deliberate negative evidence (the
+        # rule found nothing), and a rated target carries verdicts.
+        # An outage-shaped target (matches present, triage classified
+        # nothing → tp_rate=None) is NO evidence — counting it let a
+        # rule promoted during an LLM outage plus two more outage-time
+        # replays be archived as "0 variants across 3 targets".
+        evidential = [
+            t for t in entry.targets
+            if t.matches == 0 or t.tp_rate is not None
+        ]
+        if len(evidential) < _MIN_TARGETS_FOR_PRUNE:
             return
         if entry.total_variants == 0:
             entry.archived = True
             logger.info(
                 "archived rule %s: 0 variants across %d targets",
-                entry.rule_id, len(entry.targets),
+                entry.rule_id, len(evidential),
             )
 
     def rule_path(self, entry: LibraryEntry) -> Path:
@@ -689,10 +838,29 @@ class RuleLibrary:
         count by ``total_matches`` instead (which also counts untriaged
         sweep hits) let a single true-positive report collapse a proven
         rule's tp_rate below the replay and retirement thresholds.
+
+        Callers only ever hold a rule_id here — usually the graduated
+        FILE STEM (``synthesized:<stem>`` findings), so the join also
+        accepts :func:`graduated_stem` spellings. A rule_id/stem shared
+        by several entries is refused with a warning: feedback about an
+        unidentifiable rule must not move a different rule's precision
+        toward retirement or replay.
         """
         with self._lock:
             entries = self._load()
-            entry = next((e for e in entries if e.rule_id == rule_id), None)
+            matched = [
+                e for e in entries
+                if e.rule_id == rule_id
+                or graduated_stem(e.rule_id) == rule_id
+            ]
+            if len(matched) > 1:
+                logger.warning(
+                    "rule library: record_match(%r) is ambiguous — %d "
+                    "entries share the rule id/stem. Nothing recorded.",
+                    rule_id, len(matched),
+                )
+                return
+            entry = matched[0] if matched else None
             if entry is None:
                 return
             entry.total_matches += 1
@@ -708,17 +876,39 @@ class RuleLibrary:
     ) -> list[str]:
         """Archive rules below the precision threshold.
 
-        Only considers rules with enough evidence (total matches across
-        targets). Returns list of archived rule_ids. Locked — this is a
-        read-modify-write over shared entry state (see :meth:`update`).
+        Only considers rules with enough VERDICT-BACKED evidence:
+        each target contributes its CLASSIFIED count — the matches
+        its triage actually ruled variant/false_positive. An
+        outage-shaped target (matches present, every triage row
+        uncertain/skipped) contributes nothing — counting its matches
+        toward ``min_evidence`` let the promote-time 0.0 placeholder
+        rate retire a rule whose mechanical controls all passed, off
+        one LLM transport outage — and a PARTIAL outage (one verdict,
+        five uncertain over six matches) contributes exactly its one
+        verdict, not six. Returns list of archived rule_ids.
+        Locked — this is a read-modify-write over shared entry state
+        (see :meth:`update`).
         """
         retired: list[str] = []
         with self._lock:
             for entry in self._load():
                 if entry.archived:
                     continue
-                total_matches = sum(t.matches for t in entry.targets)
-                if total_matches < min_evidence:
+                # Verdict-coverage floor: min_evidence counts
+                # verdicts, not matches. Trade-off, both directions:
+                # counting matches lets one verdict over a mostly-
+                # uncertain triage retire a proven rule (partial-
+                # outage skew); counting verdicts means a rule whose
+                # triages are chronically partial needs more targets
+                # before genuine low precision retires it — the
+                # conservative direction for a destructive,
+                # hard-to-reverse action (retirement archives the
+                # rule; nothing un-archives it mechanically).
+                classified_evidence = sum(
+                    t.classified for t in entry.targets
+                    if t.tp_rate is not None
+                )
+                if classified_evidence < min_evidence:
                     continue
                 if entry.tp_rate < threshold:
                     entry.archived = True
@@ -759,8 +949,10 @@ class RuleLibrary:
             # rule_id / engine come from the persisted manifest, which
             # is not re-validated on load — confine them to single
             # path components and require the final destination to
-            # stay inside the engine rules dir before writing.
-            rule_id = _safe_component(entry.rule_id, what="rule id")
+            # stay inside the engine rules dir before writing. The
+            # stem constructor is the join contract: sweep dedup and
+            # record_match resolve graduated files back through it.
+            rule_id = graduated_stem(entry.rule_id)
             engine = _safe_component(entry.engine, what="engine")
             if entry.engine == "semgrep":
                 dest = engine_rules_dir / "semgrep" / "rules" / f"{rule_id}.yaml"
@@ -816,17 +1008,35 @@ class RuleLibrary:
         archived = len(entries) - len(active)
         if not entries:
             return "Rule library: empty"
+        # Same rated-only denominator as stats()["avg_tp_rate"] — the
+        # two operator surfaces must agree. With no rated entry there
+        # is no precision figure to print: "avg precision 0%" on a
+        # never-replayed library reads as a precision collapse when
+        # there is simply no data yet.
         rated = [e for e in active if e.tp_rate > 0]
-        avg = sum(e.tp_rate for e in rated) / len(rated) if rated else 0.0
+        if rated:
+            avg = sum(e.tp_rate for e in rated) / len(rated)
+            precision = f"avg precision {avg:.0%}"
+        else:
+            precision = "no replay data yet"
         return (
             f"Rule library: {len(active)} active, {archived} archived, "
-            f"avg precision {avg:.0%}"
+            f"{precision}"
         )
 
     def stats(self) -> dict[str, Any]:
-        """Summary statistics for /sage status or reports."""
+        """Summary statistics for /sage status or reports.
+
+        ``avg_tp_rate`` averages over RATED entries (tp_rate > 0) —
+        the same denominator as :meth:`summary`'s "avg precision", so
+        the two operator surfaces cannot disagree. Unrated entries sit
+        at 0.0 (a float field cannot distinguish "unmeasured" from
+        "measured at zero"), and folding them in read as a precision
+        collapse on libraries full of not-yet-replayed rules.
+        """
         entries = self._load()
         active = [e for e in entries if not e.archived]
+        rated = [e for e in active if e.tp_rate > 0]
         return {
             "total_rules": len(entries),
             "active_rules": len(active),
@@ -836,8 +1046,9 @@ class RuleLibrary:
                 "coccinelle": sum(1 for e in active if e.engine == "coccinelle"),
             },
             "total_variants_found": sum(e.total_variants for e in active),
+            "rated_rules": len(rated),
             "avg_tp_rate": (
-                sum(e.tp_rate for e in active) / len(active)
-                if active else 0.0
+                sum(e.tp_rate for e in rated) / len(rated)
+                if rated else 0.0
             ),
         }

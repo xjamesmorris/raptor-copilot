@@ -174,6 +174,26 @@ def test_check_llm_keeps_no_external_when_seam_empty(
     assert lines == ["   llm: no external LLM configured"]
 
 
+def test_copilot_does_not_advertise_installed_claude_as_an_authorized_transport(
+    isolated_home, monkeypatch,
+) -> None:
+    monkeypatch.setenv("RAPTOR_FRONTEND", "copilot")
+    monkeypatch.setattr(
+        startup_init, "_resolve_primary_transport", lambda: None,
+    )
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: "/usr/bin/claude" if name == "claude" else None,
+    )
+
+    lines, warnings = startup_init.check_llm()
+
+    assert lines == [
+        "   llm: Copilot session only (standalone providers blocked)",
+    ]
+    assert any("saved credentials are not consent" in warning for warning in warnings)
+
+
 def test_check_llm_parses_commented_models_json(
     isolated_home, monkeypatch,
 ) -> None:
@@ -243,3 +263,35 @@ def test_check_llm_defaulted_config_entry_not_listed_twice(
     )
     assert sum("anthropic" in line for line in lines) == 1
     assert not any("unknown" in line for line in lines)
+
+
+def test_check_llm_escapes_hostile_config_values(
+    isolated_home, monkeypatch,
+) -> None:
+    # models.json values render into the terminal banner - the same
+    # operator-config trust class as the env values check_environment
+    # escapes with an explicit rationale: ANSI blanks the terminal,
+    # CR/LF splits lines.
+    cfg_dir = isolated_home / ".config" / "raptor"
+    cfg_dir.mkdir(parents=True)
+    cfg = cfg_dir / "models.json"
+    cfg.write_text(
+        '{"models": ['
+        '{"provider": "bed\u001b[2Jrock", "model": "claude\r\nX"},'
+        '{"provider": "gemini", "model": "gem\u001b[2Jini-x",'
+        ' "role": "fall\u001b[2Jback", "api_key": "k"}'
+        ']}\n',
+        encoding="utf-8",
+    )
+    cfg.chmod(0o600)
+    monkeypatch.setattr(
+        startup_init, "_resolve_primary_transport",
+        lambda: ("bed\x1b[2Jrock", "claude\r\nX", "via models.json"),
+    )
+    monkeypatch.setattr(startup_init, "_validator_available",
+                        lambda: False)
+    lines, _warnings = startup_init.check_llm()
+    banner = "\n".join(lines)
+    assert "\x1b" not in banner
+    assert "\r" not in banner
+    assert "\\x1b" in banner  # escaped literal, value still visible

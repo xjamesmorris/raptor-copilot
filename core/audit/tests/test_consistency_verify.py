@@ -21,6 +21,7 @@ import pytest
 
 from core.audit.callsite_consistency import build_return_census
 from core.audit.consistency_verify import (
+    REASON_CENSUS_MISS,
     REASON_CONTRACT_UNRESOLVED,
     REASON_DEVIANT_ON_ERROR_PATH,
     REASON_GROUP_TOO_SMALL,
@@ -384,6 +385,19 @@ class TestHypothesisAdjudication:
         res = run_consistency_check(
             target, "src/callers.c", "u0",
             "9/10 callers behave differently somehow",
+        )
+        assert res.outcome == "inconclusive"
+        # Prose words extract as candidates but none exists in the
+        # census — the structured census-miss code (the orchestrator's
+        # rebuild-retry key), distinct from hypothesis-unbindable
+        # (no candidates at all, where a retry cannot help).
+        assert res.reason.startswith(REASON_CENSUS_MISS)
+
+    def test_no_candidates_at_all_is_unbindable(self, tmp_path):
+        target = self._tree(tmp_path, wur=False)
+        res = run_consistency_check(
+            target, "src/callers.c", "u0",
+            "it is",
         )
         assert res.outcome == "inconclusive"
         assert res.reason.startswith(REASON_HYPOTHESIS_UNBINDABLE)

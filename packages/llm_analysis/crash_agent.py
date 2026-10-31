@@ -18,6 +18,7 @@ from core.llm.methodology import load_methodology
 from core.llm.providers import ClaudeCodeProvider
 from core.llm.task_types import TaskType
 from core.logging import get_logger
+from core.run.finding_status import read_verdict
 from core.security.prompt_defense_profiles import CONSERVATIVE
 from core.security.prompt_envelope import (
     PromptBundle,
@@ -43,6 +44,24 @@ def exploit_artifact_path(out_dir: Path, crash_id: str) -> Path:
     never written and the consumer silently finds nothing).
     """
     return Path(out_dir) / "exploits" / f"{_safe_id(crash_id)}_exploit.cpp"
+
+
+def refined_exploit_artifact_path(
+    out_dir: Path, crash_id: str, *, validated: bool
+) -> Path:
+    """Canonical on-disk location of a refined exploit for ``crash_id``.
+
+    Same contract as :func:`exploit_artifact_path`: the id is routed
+    through ``_safe_id`` (AFL crash ids contain ``:`` and ``,``), so
+    the validate-and-refine writer and any consumer derive the path
+    here, never by interpolating the raw crash id.
+
+    ``validated=True`` names the refinement that passed
+    validate-and-refine; ``validated=False`` names the best attempt
+    kept when refinement did not validate.
+    """
+    suffix = "_exploit_validated.c" if validated else "_exploit_best_attempt.c"
+    return Path(out_dir) / "exploits" / f"{_safe_id(crash_id)}{suffix}"
 
 
 def _input_file_size_str(input_file: Path) -> str:
@@ -100,7 +119,7 @@ Analyse this crash and provide:
 **Additional Context:**
 - Consider modern exploit mitigations (ASLR, DEP, stack canaries)
 - Consider CPU architecture specifics (x86-64 calling conventions, register usage)
-- Be realistic about real-world exploit feasibility. You are Mark Dowd or Charlie Miller. Do not guess wildly.
+- Be realistic about real-world exploit feasibility. Reason like a rigorous exploit developer; do not guess wildly.
 
 Focus on:
 - Can we control PC/RIP despite protections?
@@ -453,7 +472,7 @@ class CrashAnalysisAgent:
     """LLM-powered crash analysis agent."""
 
     def __init__(self, binary_path: Path, out_dir: Path,
-                 llm_config: LLMConfig = None,
+                 llm_config: LLMConfig | None = None,
                  verify_exploits: bool = True,
                  judge_intent: bool = True,
                  record_witnesses: bool = True,
@@ -478,14 +497,16 @@ class CrashAnalysisAgent:
         # ``raptor_fuzzing.py``). Mirrors the
         # ``AutonomousSecurityAgentV2`` contract.
         self.judge_intent = judge_intent
-        # Record each LLM-emitted exploit as a canonical Witness
-        # alongside the fuzz-crash witnesses that
-        # ``raptor_fuzzing.py`` already records. Same data path,
-        # same WitnessStore root — the bytes_hash deduplicates if
-        # an exploit ever matches a real crash input. Default on;
-        # opt out via ``--no-record-witnesses``. Lazy store open
-        # (filesystem untouched on prep-only / failed runs);
-        # failures are non-fatal.
+        # Record each LLM-emitted exploit as a canonical Witness.
+        # Sibling store to the fuzz-crash witnesses: raptor_fuzzing.py
+        # records crashes under ``<run>/witnesses`` while this agent
+        # (constructed with ``out_dir=<run>/analysis``) lazy-opens its
+        # store at ``self.out_dir / "witnesses"`` =
+        # ``<run>/analysis/witnesses`` — two run-local roots, both
+        # surfaced by the fuzzing summary. Default on; opt out via
+        # ``--no-record-witnesses``. Lazy store open (filesystem
+        # untouched on prep-only / failed runs); failures are
+        # non-fatal.
         self.record_witnesses = record_witnesses
         self._witness_store = None  # lazy
         # Execute the LLM-emitted exploit against the fuzzed binary
@@ -522,15 +543,15 @@ class CrashAnalysisAgent:
             logger.info("RAPTOR Crash Analysis Agent initialized")
             logger.info("Binary: %s", binary_path)
             logger.info("Output: %s", out_dir)
-            logger.info("LLM: %s/%s", self.llm_config.primary_model.provider, self.llm_config.primary_model.model_name)
+            logger.info("LLM: %s/%s", self.llm_config.primary_model.provider, self.llm_config.primary_model.model_name)  # type: ignore[union-attr]
 
-            print(f"\n Using LLM: {self.llm_config.primary_model.provider}/{self.llm_config.primary_model.model_name}")
-            if self.llm_config.primary_model.cost_per_1k_tokens > 0:
-                print(f"Cost: ${self.llm_config.primary_model.cost_per_1k_tokens:.4f} per 1K tokens")
+            print(f"\n Using LLM: {self.llm_config.primary_model.provider}/{self.llm_config.primary_model.model_name}")  # type: ignore[union-attr]
+            if self.llm_config.primary_model.cost_per_1k_tokens > 0:  # type: ignore[union-attr]
+                print(f"Cost: ${self.llm_config.primary_model.cost_per_1k_tokens:.4f} per 1K tokens")  # type: ignore[union-attr]
             else:
                 print("Cost: FREE (self-hosted model)")
 
-            if "ollama" in self.llm_config.primary_model.provider.lower():
+            if "ollama" in self.llm_config.primary_model.provider.lower():  # type: ignore[union-attr]
                 print()
                 print("IMPORTANT: You are using an Ollama model.")
                 print("   • Crash analysis and triage: Works well with Ollama models")
@@ -542,8 +563,8 @@ class CrashAnalysisAgent:
                 print("     export OPENAI_API_KEY=your_key")
             print()
         else:
-            self.llm_config = None
-            self.llm = ClaudeCodeProvider()
+            self.llm_config = None  # type: ignore[assignment]
+            self.llm = ClaudeCodeProvider()  # type: ignore[assignment]
 
             logger.info("RAPTOR Crash Analysis Agent initialized (prep-only mode)")
             logger.info("Binary: %s", binary_path)
@@ -654,8 +675,21 @@ class CrashAnalysisAgent:
                     validated.quality, validated.incomplete,
                 )
 
-            # Update crash context
-            crash_context.exploitability = "exploitable" if analysis.get("is_exploitable") else "not_exploitable"
+            # Update crash context. Response validation nulls a
+            # missing/malformed is_exploitable — an abstention, not a
+            # verdict. The old positive ternary coerced that None to
+            # the definitive "not_exploitable" string on the crash
+            # report surface; keep the dataclass's honest "unknown"
+            # instead (exploit generation already gates on the exact
+            # "exploitable" string, so the skip behaviour is
+            # unchanged — only the minted verdict is).
+            _exploitable = analysis.get("is_exploitable")
+            if _exploitable is True:
+                crash_context.exploitability = "exploitable"
+            elif _exploitable is False:
+                crash_context.exploitability = "not_exploitable"
+            else:
+                crash_context.exploitability = "unknown"
             crash_context.crash_type = analysis.get("crash_type", "unknown")
             # Read the canonical name first, fall back to legacy
             # for back-compat with cached analyses still using
@@ -670,8 +704,8 @@ class CrashAnalysisAgent:
             crash_context.analysis = analysis
 
             logger.info("✓ LLM analysis complete:")
-            logger.info("  True Positive: %s", analysis.get('is_true_positive', False))
-            logger.info("  Exploitable: %s", analysis.get('is_exploitable', False))
+            logger.info("  True Positive: %s", read_verdict(analysis, "is_true_positive"))
+            logger.info("  Exploitable: %s", read_verdict(analysis, "is_exploitable"))
             logger.info("  Crash Type: %s", analysis.get('crash_type', 'unknown'))
             logger.info("  Severity: %s", analysis.get('severity_assessment', 'unknown'))
             logger.info(
@@ -691,22 +725,10 @@ class CrashAnalysisAgent:
                 # logging line is a poor failure mode.
                 logger.info("  Attack: %s...", str(attack_scenario)[:150])
             
-            # Log some reasoning from the full response
-            if full_response:
-                # Extract reasoning (look for common patterns in LLM responses)
-                reasoning_lines = []
-                for line in full_response.split('\n')[:10]:  # First 10 lines
-                    line = line.strip()
-                    if line and not line.startswith('{') and not line.startswith('```') and len(line) > 20:
-                        reasoning_lines.append(line[:200])  # Truncate long lines
-                
-                if reasoning_lines:
-                    logger.info("  Reasoning: %s", " | ".join(reasoning_lines[:3]))  # Show first 3 reasoning lines
-            
-            # Log summary of LLM reasoning
+            # Log a short reasoning preview (one block — this used to
+            # be two near-identical back-to-back blocks).
             if full_response:
                 logger.info("  Full reasoning saved (%d chars)", len(full_response))
-                # Show first few lines of reasoning for context
                 reasoning_preview = full_response[:200].replace('\n', ' ').strip()
                 if len(full_response) > 200:
                     reasoning_preview += "..."
@@ -742,7 +764,7 @@ class CrashAnalysisAgent:
                 # Include ASCII representation for readability
                 input_info["input_content_ascii"] = input_data[:500].decode('ascii', errors='replace')
                 if len(input_data) > 500:
-                    input_info["input_content_ascii"] += "... (truncated)"
+                    input_info["input_content_ascii"] += "... (truncated)"  # type: ignore[operator]
             except Exception as e:  # noqa: BLE001
                 input_info["input_content_error"] = str(e)
             
@@ -840,77 +862,96 @@ class CrashAnalysisAgent:
                 logger.debug("Response keys: %s", exploit_data.keys())
                 return False
 
-            if exploit_code:
-                crash_context.exploit_code = exploit_code
+            crash_context.exploit_code = exploit_code
 
-                # Save exploit with full response for debugging.
-                # Path derived via the module-level helper so writer
-                # and readers can never drift on the filename shape
-                # (sanitised id + .cpp extension).
-                exploit_file = exploit_artifact_path(
-                    self.out_dir, crash_context.crash_id,
+            # Save exploit with full response for debugging.
+            # Path derived via the module-level helper so writer
+            # and readers can never drift on the filename shape
+            # (sanitised id + .cpp extension).
+            exploit_file = exploit_artifact_path(
+                self.out_dir, crash_context.crash_id,
+            )
+            exploit_file.parent.mkdir(parents=True, exist_ok=True)
+            exploit_file.write_text(exploit_code, encoding="utf-8")
+
+            # Save full response for analysis. Raw LLM output gets
+            # the same targeted treatment as agent.py's patch
+            # artifact body: autofetch-markup stripping (the
+            # documented exfil vector if the .txt is ever re-ingested
+            # or rendered) + control/ANSI/BIDI byte escaping so a
+            # `cat` of the artifact can't drive the terminal — plus a
+            # size cap. No markdown defang: it's a plain-text
+            # debugging sidecar and reasoning/code punctuation must
+            # survive readable.
+            from core.security.log_sanitisation import escape_nonprintable
+            from core.security.prompt_envelope import (
+                _strip_autofetch_markup,
+            )
+
+            def _sanitise_artifact_text(text: object, cap: int) -> str:
+                out = escape_nonprintable(
+                    _strip_autofetch_markup(str(text or "")),
+                    preserve_newlines=True,
                 )
-                exploit_file.parent.mkdir(parents=True, exist_ok=True)
-                exploit_file.write_text(exploit_code, encoding="utf-8")
+                return out[:cap]
 
-                # Save full response for analysis
-                response_file = self.out_dir / "exploits" / f"{_safe_id(crash_context.crash_id)}_exploit_response.txt"
-                response_content = f"""REASONING:
-{reasoning}
+            response_file = self.out_dir / "exploits" / f"{_safe_id(crash_context.crash_id)}_exploit_response.txt"
+            response_content = f"""REASONING:
+{_sanitise_artifact_text(reasoning, 50_000)}
 
 FULL LLM RESPONSE:
-{full_response}"""
-                response_file.write_text(response_content, encoding="utf-8")
+{_sanitise_artifact_text(full_response, 200_000)}"""
+            response_file.write_text(response_content, encoding="utf-8")
 
-                logger.info("   ✓ Exploit generated: %d bytes", len(exploit_code))
-                logger.info("   ✓ Saved to: %s", exploit_file.name)
+            logger.info("   ✓ Exploit generated: %d bytes", len(exploit_code))
+            logger.info("   ✓ Saved to: %s", exploit_file.name)
 
-                # Compile-verify the LLM's output. Same pattern as
-                # the /agentic path landed in PR #572 — populates
-                # ``crash_context.exploit_compiled`` /
-                # ``exploit_compile_errors`` via the shared
-                # ``exploit_verify.compile_verify`` helper. The
-                # language gate uses the crash's source location
-                # (file:line from addr2line) when available; if
-                # source_location is empty the helper attempts gcc
-                # unconditionally, which is right for the typical
-                # /crash-analysis case of native binaries built from
-                # C/C++. Gated on ``self.verify_exploits`` so
-                # operators can opt out for time-sensitive runs.
-                # When ``execute_exploits`` is on, we use the
-                # unified compile-and-execute path instead so the
-                # binary is reachable for the run before tempdir
-                # cleanup. Execution requires compile-verify (no
-                # binary → no run), so the flag combination
-                # ``execute_exploits=True, verify_exploits=False``
-                # silently falls back to compile-only — operator
-                # opted out of the prerequisite.
-                if self.verify_exploits and self.execute_exploits:
-                    self._compile_and_execute_exploit(
-                        crash_context, exploit_code,
-                    )
-                elif self.verify_exploits:
-                    self._verify_exploit_compiles(crash_context, exploit_code)
+            # Compile-verify the LLM's output. Same pattern as
+            # the /agentic path landed in PR #572 — populates
+            # ``crash_context.exploit_compiled`` /
+            # ``exploit_compile_errors`` via the shared
+            # ``exploit_verify.compile_verify`` helper. The
+            # language gate uses the crash's source location
+            # (file:line from addr2line) when available; if
+            # source_location is empty the helper attempts gcc
+            # unconditionally, which is right for the typical
+            # /crash-analysis case of native binaries built from
+            # C/C++. Gated on ``self.verify_exploits`` so
+            # operators can opt out for time-sensitive runs.
+            # When ``execute_exploits`` is on, we use the
+            # unified compile-and-execute path instead so the
+            # binary is reachable for the run before tempdir
+            # cleanup. Execution requires compile-verify (no
+            # binary → no run), so the flag combination
+            # ``execute_exploits=True, verify_exploits=False``
+            # silently falls back to compile-only — operator
+            # opted out of the prerequisite.
+            if self.verify_exploits and self.execute_exploits:
+                self._compile_and_execute_exploit(
+                    crash_context, exploit_code,
+                )
+            elif self.verify_exploits:
+                self._verify_exploit_compiles(crash_context, exploit_code)
 
-                # Intent-match judgement on the (possibly compile-
-                # verified) exploit. Same heuristic-first / LLM-
-                # tiebreak pattern as the /agentic path. Failures
-                # are non-fatal — the verdict stays as ``uncertain``
-                # with the error captured.
-                if self.judge_intent:
-                    self._judge_exploit_intent(crash_context, exploit_code)
+            # Intent-match judgement on the (possibly compile-
+            # verified) exploit. Same heuristic-first / LLM-
+            # tiebreak pattern as the /agentic path. Failures
+            # are non-fatal — the verdict stays as ``uncertain``
+            # with the error captured.
+            if self.judge_intent:
+                self._judge_exploit_intent(crash_context, exploit_code)
 
-                # Record the LLM-emitted exploit as a canonical
-                # Witness alongside the fuzz-crash witnesses from
-                # ``raptor_fuzzing.py``. Same store, same source=
-                # LLM_EMIT_RUN, outcome=NOT_RUN encoding as the
-                # /agentic path. Failures are non-fatal.
-                if self.record_witnesses:
-                    self._record_exploit_witness(crash_context, exploit_code)
+            # Record the LLM-emitted exploit as a canonical
+            # Witness in this agent's own store
+            # (``<run>/analysis/witnesses`` — the fuzz-crash
+            # witnesses from ``raptor_fuzzing.py`` live in the
+            # sibling ``<run>/witnesses``). Same source=
+            # LLM_EMIT_RUN, outcome=NOT_RUN encoding as the
+            # /agentic path. Failures are non-fatal.
+            if self.record_witnesses:
+                self._record_exploit_witness(crash_context, exploit_code)
 
-                return True
-            logger.warning("   ✗ LLM response did not contain valid code")
-            return False
+            return True
 
         except Exception as e:  # noqa: BLE001
             logger.error("   ✗ Exploit generation failed: %s", e)
@@ -978,6 +1019,9 @@ FULL LLM RESPONSE:
         return shape — any of these leave ``execute_outcome=None``
         and the witness ends up ``NOT_RUN`` as if execution had
         been opted out. The exploit file on disk is unaffected.
+        One deliberate exception: a ``SandboxFloorError`` (containment
+        floor unmet) stamps the structured unverifiable-environment
+        verdict on the crash record and re-raises (record-then-raise).
         """
         from packages.llm_analysis.exploit_verify import compile_and_execute
 
@@ -987,15 +1031,28 @@ FULL LLM RESPONSE:
                 ":", 1
             )[0]
 
-        compiled, errors, outcome, detail = compile_and_execute(
-            exploit_code,
-            target_file_path,
-            crash_context.crash_id,
-            target_binary_path=self.binary,
-            timeout=self.execute_timeout,
-            logger=logger,
-            sanitizers=self.execute_sanitizers,
-        )
+        from core.sandbox import SandboxFloorError
+        from core.witness import WitnessOutcome, refusal_detail
+
+        try:
+            compiled, errors, outcome, detail = compile_and_execute(
+                exploit_code,
+                target_file_path,
+                crash_context.crash_id,
+                target_binary_path=self.binary,
+                timeout=self.execute_timeout,
+                logger=logger,
+                sanitizers=self.execute_sanitizers,
+            )
+        except SandboxFloorError as exc:
+            # Record-then-raise: stamp the structured unverifiable-
+            # environment verdict on THIS crash's record (UNKNOWN =
+            # "couldn't even run the sandbox" — an environment
+            # verdict, never a negative result), then re-raise so the
+            # host misconfiguration fails the run loudly exactly once.
+            crash_context.execute_outcome = WitnessOutcome.UNKNOWN.value
+            crash_context.execute_detail = refusal_detail(exc) or {}
+            raise
         crash_context.exploit_compiled = compiled
         crash_context.exploit_compile_errors = errors
         if outcome is not None:
@@ -1098,7 +1155,7 @@ FULL LLM RESPONSE:
         try:
             if self._witness_store is None:
                 from core.witness import WitnessStore
-                self._witness_store = WitnessStore(
+                self._witness_store = WitnessStore(  # type: ignore[assignment]
                     self.out_dir / "witnesses"
                 )
             from packages.llm_analysis.witness_adapter import (
@@ -1157,7 +1214,7 @@ FULL LLM RESPONSE:
                 ),
                 produced_by="crash-agent",
             )
-            self._witness_store.put(witness, data)
+            self._witness_store.put(witness, data)  # type: ignore[attr-defined]
             logger.debug(
                 "   · Recorded witness %s (%sB)", witness.bytes_hash[:12], witness.bytes_len
             )

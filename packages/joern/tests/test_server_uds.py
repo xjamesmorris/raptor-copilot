@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import socketserver
 import subprocess
 import sys
@@ -18,6 +19,7 @@ import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
+from typing import Iterator
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -71,19 +73,20 @@ class _StubHandler(BaseHTTPRequestHandler):
 
 
 @pytest.fixture
-def stub_uds():
+def stub_uds(
+    uds_dir: str,
+) -> Iterator[tuple[str, list[dict[str, str | None]]]]:
     """(socket_path, seen-requests list) for a running stub server."""
-    with tempfile.TemporaryDirectory(prefix="raptor-joern-uds-test-") as d:
-        path = os.path.join(d, "joern.sock")
-        handler = type("Handler", (_StubHandler,), {"seen": []})
-        srv = _UnixHTTPServer(path, handler)
-        t = threading.Thread(target=srv.serve_forever, daemon=True)
-        t.start()
-        try:
-            yield path, handler.seen
-        finally:
-            srv.shutdown()
-            srv.server_close()
+    path = os.path.join(uds_dir, "joern.sock")
+    handler = type("Handler", (_StubHandler,), {"seen": []})
+    srv = _UnixHTTPServer(path, handler)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        yield path, handler.seen
+    finally:
+        srv.shutdown()
+        srv.server_close()
 
 
 def _uds_server(path: str) -> JoernServer:
@@ -139,17 +142,21 @@ class TestUdsClientShim:
         assert srv.health_check() is True
         assert seen[-1]["path"] == "/query-sync"
 
-    def test_missing_socket_classified_as_connection_failure(self, tmp_path):
-        srv = _uds_server(str(tmp_path / "gone.sock"))
+    def test_missing_socket_classified_as_connection_failure(
+        self, uds_dir: str,
+    ):
+        srv = _uds_server(os.path.join(uds_dir, "gone.sock"))
         assert srv._post_sync("1+1", timeout=5) is None
         assert srv._last_post_error.startswith("connection failed:")
 
-    def test_unresponsive_socket_classified_as_timeout(self, tmp_path):
+    def test_unresponsive_socket_classified_as_timeout(
+        self, uds_dir: str,
+    ):
         """query() keys its stuck-REPL restart on "timed out" — the
         socket tier must classify a stalled read the same way."""
         import socket as socket_mod
 
-        path = str(tmp_path / "stall.sock")
+        path = os.path.join(uds_dir, "stall.sock")
         listener = socket_mod.socket(socket_mod.AF_UNIX,
                                      socket_mod.SOCK_STREAM)
         listener.bind(path)
@@ -167,13 +174,14 @@ class TestUdsClientShim:
 
 class TestTierSelection:
     @staticmethod
-    def _boot(srv: JoernServer, *, netns: bool) -> list[str]:
+    def _boot(srv: JoernServer, *, netns: bool,
+              pidns: bool = False) -> list[str]:
         captured: list[str] = []
 
         def fake_popen(cmd, **kwargs):
             captured.extend(cmd)
             proc = MagicMock()
-            proc.pid = 12345
+            proc.pid = 2_000_000_000  # inert: beyond pid_max
             proc.poll.return_value = None
             proc.stderr = MagicMock()
             proc.wait = MagicMock()
@@ -183,6 +191,10 @@ class TestTierSelection:
             patch("packages.joern.prereqs._java_version", return_value=21),
             patch("packages.joern.server._netns_isolation_available",
                   return_value=netns),
+            # Patched even where the test never asks for the pidns
+            # tier: the real probe spawns a subprocess.
+            patch("packages.joern.server._pidns_supervision_available",
+                  return_value=pidns),
             patch("packages.joern.server._server_auth_supported",
                   return_value=True),
             patch("packages.joern.server._repl_bridge_path",
@@ -286,11 +298,105 @@ class TestMakeUdsDir:
         d = server_mod._make_uds_dir()
         try:
             sock = os.path.join(d, "joern.sock")
-            assert len(sock) <= server_mod._SUN_PATH_MAX_SAFE
+            # Bytes, not characters: sun_path caps the fsencoded form.
+            assert len(os.fsencode(sock)) <= server_mod._SUN_PATH_MAX_SAFE
             assert d.startswith("/tmp/")
         finally:
             os.rmdir(d)
         assert not any(long_root.iterdir())  # long candidate cleaned up
+
+    def test_multibyte_tmpdir_budgeted_in_bytes(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        request: pytest.FixtureRequest,
+    ) -> None:
+        """The ceiling is a BYTE budget: a TMPDIR that fits in str
+        characters but not in fsencoded bytes must trigger the /tmp
+        fallback — a character count admits it and every later
+        ``bind()`` fails with a confusing error instead."""
+        base = tempfile.mkdtemp(prefix="jm", dir="/tmp")
+        request.addfinalizer(lambda: shutil.rmtree(base, ignore_errors=True))
+        # 30 two-byte characters: the root fits the ceiling counted in
+        # characters (worst-case socket path 83 <= 100) but not in
+        # bytes ("/raptor-joern-uds-XXXXXXXX" adds 26, "/joern.sock"
+        # adds 11 on top of the 76-byte root: 113 > 100).
+        multi_root = os.path.join(base, "é" * 30)
+        os.mkdir(multi_root)
+        assert len(multi_root) + 26 + 11 <= server_mod._SUN_PATH_MAX_SAFE
+        assert (
+            len(os.fsencode(multi_root)) + 26 + 11
+            > server_mod._SUN_PATH_MAX_SAFE
+        )
+        real_mkdtemp = tempfile.mkdtemp
+
+        def fake_mkdtemp(prefix: str, dir: str | None = None) -> str:
+            # No explicit dir = the TMPDIR-honouring call.
+            if dir is None:
+                dir = multi_root
+            return real_mkdtemp(prefix=prefix, dir=dir)
+
+        monkeypatch.setattr(server_mod.tempfile, "mkdtemp", fake_mkdtemp)
+        d = server_mod._make_uds_dir()
+        try:
+            sock = os.path.join(d, "joern.sock")
+            assert len(os.fsencode(sock)) <= server_mod._SUN_PATH_MAX_SAFE
+            assert d.startswith("/tmp/")
+            assert not d.startswith(multi_root)
+        finally:
+            os.rmdir(d)
+        assert not any(os.scandir(multi_root))  # candidate cleaned up
+
+    def test_surrogate_escaped_tmpdir_does_not_crash(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        request: pytest.FixtureRequest,
+    ) -> None:
+        """A TMPDIR carrying undecodable bytes reaches Python as
+        surrogate-escaped str; ``os.fsencode`` round-trips it where
+        ``str.encode("utf-8")`` raises UnicodeEncodeError. The budget
+        check must survive such roots and keep counting exactly: an
+        under-budget one is used as-is, an over-budget one still
+        diverts to the /tmp fallback instead of crashing."""
+        base = tempfile.mkdtemp(prefix="js", dir="/tmp")
+        request.addfinalizer(lambda: shutil.rmtree(base, ignore_errors=True))
+        # One raw \x80 byte -> '\udc80' after fsdecode; encoding it
+        # back is exactly the step a str.encode() regression breaks.
+        sur_ok = os.fsdecode(os.path.join(os.fsencode(base), b"x\x80y"))
+        os.mkdir(sur_ok)
+        assert (
+            len(os.fsencode(sur_ok)) + 26 + 11
+            <= server_mod._SUN_PATH_MAX_SAFE
+        )
+        sur_over = os.fsdecode(os.path.join(os.fsencode(base), b"\x80" * 60))
+        os.mkdir(sur_over)
+        assert (
+            len(os.fsencode(sur_over)) + 26 + 11
+            > server_mod._SUN_PATH_MAX_SAFE
+        )
+        real_mkdtemp = tempfile.mkdtemp
+        target = sur_ok
+
+        def fake_mkdtemp(prefix: str, dir: str | None = None) -> str:
+            # No explicit dir = the TMPDIR-honouring call.
+            if dir is None:
+                dir = target
+            return real_mkdtemp(prefix=prefix, dir=dir)
+
+        monkeypatch.setattr(server_mod.tempfile, "mkdtemp", fake_mkdtemp)
+        d = server_mod._make_uds_dir()
+        try:
+            assert d.startswith(sur_ok)  # fits in bytes: used as-is
+        finally:
+            os.rmdir(d)
+
+        target = sur_over
+        d = server_mod._make_uds_dir()
+        try:
+            assert d.startswith("/tmp/")
+            assert not d.startswith(sur_over)
+        finally:
+            os.rmdir(d)
+        assert not any(os.scandir(sur_over))  # candidate cleaned up
 
 
 class TestNetnsProbeCache:

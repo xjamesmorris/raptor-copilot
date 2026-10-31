@@ -16,7 +16,8 @@ This command is mode-routed — there is no single CLI to call blindly:
 | Case | Route |
 |------|-------|
 | `<target>` is a compiled artefact (ELF/Mach-O/PE/JAR/APK/...) with `--map` | `libexec/raptor-understand --map --target <t> --out "$OUTPUT_DIR"` (mechanical, no LLM) |
-| `<target>` is a compiled artefact (or `.gpr` / `re-database.json` / a binary run dir) with `--study` | `libexec/raptor-binary-study <t> "$OUTPUT_DIR" [--identifier ...] [--concept ...] [--model M \| --prep-only]` (decomp-tree + standard study pipeline) |
+| `<target>` is a `.gpr` / `re-database.json` / a binary run dir (or a binary whose RE database already exists) with `--study` | `libexec/raptor-binary-study <t> "$OUTPUT_DIR" [--identifier ...] [--concept ...] [--model M \| --prep-only]` (decomp-tree + standard study pipeline) |
+| `<target>` is a RAW BINARY with `--study` and NO RE database exists yet | `libexec/raptor-binary-study-oneshot <t> "$OUTPUT_DIR" [same flags]` (one lifecycle: onramp/import → deep study — see Binary `--study` below) |
 | `--model` passed with `--hunt` or `--trace` | `libexec/raptor-understand` (multi-model substrate) |
 | Everything else — source-tree `--map`, `--trace`, `--hunt`, `--teach`, `--study` | **In-session workflow below** (you are the LLM); `libexec/raptor-understand` rejects source-tree `--map` by design |
 
@@ -65,6 +66,41 @@ file per call-graph community, a synthesized `types.h`, and a
 `function@address`), then drives the STANDARD study pipeline over
 it. `domain-model.json` comes out schema-identical, so /audit's
 vocabulary, IRIS, and every other consumer work unchanged.
+
+**One-shot raw-binary route.** When the input is a RAW BINARY and no
+RE database resolves for it yet, do NOT run `raptor-binary-study`
+directly (it refuses by design — it never imports the hostile bundle
+itself). Dispatch the one-shot orchestrator instead, under the same
+single run lifecycle you already started:
+
+```bash
+libexec/raptor-binary-study-oneshot <resolved_target> "$OUTPUT_DIR" \
+    [--identifier ...] [--concept ...] [--model M] [--max-cost USD]
+```
+
+It sequences the EXISTING tools: `raptor-ghidra import <binary>
+--decompile-all` (the landed raw-binary onramp — creates the Ghidra
+project via analyzeHeadless, or degrades to the r2/objdump fallback
+importers when no Ghidra install exists) into
+`$OUTPUT_DIR/ghidra-import/`, then `raptor-binary-study` over the
+produced database, passing the created `.gpr` for between-pass
+incremental decompilation. A cached database (a prior import of the
+same binary) is reused without re-importing. Failure modes: an
+OCCUPIED import destination is terminal per the landed semantics —
+the error names the operator's two options (pass the existing `.gpr`
+to `raptor-binary-study` directly, or remove the directory); a
+degraded (Ghidra-less) import produces a symbols-only database and
+the study warns it sees call structure and types only.
+
+**Map→study bridge.** Pass 1 of every binary study is mechanically
+seeded from a prior binary `--map` run (and `binary-hunt-*.json`
+artifacts) when one is discoverable — co-located `--out`, project
+sibling, or global `out/`, identity-gated by the binary's content
+anchor. Seeds enter at the distinct `bridge_seed` tier BELOW
+operator identifiers, are jointly budget-capped with SAGE prior
+recall, and are listed (with why + the "seed selection is
+target-influenced" honesty line) in the study report's Seed
+Provenance table. `--no-bridge-seeds` opts out.
 
 Running phase 2:
 - default (no flag): the full study loop runs mechanically via the
@@ -157,13 +193,36 @@ The shim writes `hunt-result.json` or `trace-result.json` to `$OUTPUT_DIR`
 and prints a one-screen summary. After it returns, surface the summary
 to the user and point them at the result file.
 
+**Resume (multi-model `--hunt`/`--trace` only):** the shim pins the run's
+resolved options (`understand-run-config.json`, plus a traces snapshot for
+`--trace`) and checkpoints each model's finished result as produced
+(`understand-checkpoints/`). If the run is interrupted (SIGTERM/Ctrl-C exits
+130 and marks the lifecycle `interrupted`; a hard kill leaves `running` with a
+dead worker, which resume also accepts), re-enter it as the SAME run:
+
+```bash
+libexec/raptor-understand --resume "$OUTPUT_DIR"
+```
+
+Checkpointed models return their persisted results at no new cost (their
+recorded spend carries into the resumed run's continuous accounting); only the
+remaining models dispatch, capped by the original budget minus booked spend.
+Configuration comes from the pinned config — do not pass `--target`, `--out`,
+or `--model`. Gates: a completed run is never resumed (`--reopen` handles the
+contradicted case where `completed` was stamped without a `*-result.json`);
+target files referenced by checkpoints are re-hashed against the tree NOW, and
+any drift refuses the resume unless `--allow-drift` (which carries the results
+loudly and stamps `resumed_with_drift` into the payload). A successful resume
+completes the run's lifecycle itself — do not run the Step 5 `complete` stub
+after `--resume`.
+
 **In-session path (no `--model`, or `--map` / `--teach`):**
 
 **Step 1: Start the run and build inventory:**
 ```bash
 libexec/raptor-run-lifecycle start understand --target <resolved_target>
 ```
-The last line of output is `OUTPUT_DIR=<path>` — use that for all subsequent steps.
+Use the first `OUTPUT_DIR=<path>` line printed by the lifecycle stub for all subsequent steps.
 
 ```bash
 libexec/raptor-build-checklist <resolved_target> "$OUTPUT_DIR"
@@ -172,15 +231,10 @@ libexec/raptor-build-checklist <resolved_target> "$OUTPUT_DIR"
 **Step 1.5: Load threat model context** (if a project threat model exists):
 
 ```bash
-python3 -c "
-import sys, os; sys.path.insert(0, os.environ['RAPTOR_DIR'])
-from pathlib import Path
-from core.threat_model import threat_model_prompt_block
-block = threat_model_prompt_block(Path('<resolved_target>'))
-if block: print(block)
-else: print('No project threat model found.')
-"
+libexec/raptor-threat-model prompt-block <resolved_target>
 ```
+
+The target path rides as argv data — never paste it into a `python3 -c` program (the shell expands `$(...)` inside a double-quoted block before python runs). It prints the prompt block, or `No project threat model found.`
 
 When present, use it as operator-owned context during analysis:
 - For `--hunt`: use `known_bug_shapes` to seed variant patterns and `focus_areas` to prioritise search locations
@@ -192,9 +246,9 @@ When present, use it as operator-owned context during analysis:
 
 **Step 3: Record coverage** (for `--map` — list every item you examined):
 
-Write a JSON file listing every function, global, struct, and macro you analysed, then pass it to the coverage tool:
+Write a JSON file listing every function, global, struct, and macro you examined, then pass it to the coverage tool **with `--map-grade`**:
 ```json
-// $OUTPUT_DIR/reviewed-items.json
+// $OUTPUT_DIR/map-examined-items.json
 [
   {"file": "src/auth.c", "item": "check_pw"},
   {"file": "src/auth.c", "item": "credentials"},
@@ -202,8 +256,15 @@ Write a JSON file listing every function, global, struct, and macro you analysed
 ]
 ```
 ```bash
-libexec/raptor-coverage-summary "$OUTPUT_DIR" --mark-file "$OUTPUT_DIR/reviewed-items.json"
+libexec/raptor-coverage-summary "$OUTPUT_DIR" --mark-file "$OUTPUT_DIR/map-examined-items.json" --map-grade
 ```
+
+`--map-grade` is mandatory for map-phase recording: it stores the marks on
+the `understand` coverage record (examination evidence, scanned depth), so
+`/project coverage` shows what was examined WITHOUT granting review credit.
+A plain `--mark`/`--mark-file` from the map phase would count every mapped
+function as reviewed and exclude it from later audit review plans — mapped
+functions must stay in the review gap until an actual review pass covers them.
 
 **Step 4: Generate diagrams** (for `--map` or `--trace`):
 ```bash
@@ -234,7 +295,7 @@ libexec/raptor-run-lifecycle fail "$OUTPUT_DIR" "error description" --command un
 
 Modes combine and run in order: map → trace → hunt → teach. This matches the natural attack progression, so build context first, then trace a specific flow, then hunt for variants. Running `--map --trace EP-001` first maps, then traces the specified entry point.
 
-`--study` runs independently — it is a separate pipeline (study-prep → LLM extraction → synthesis) that produces `domain-model.json`. Its output feeds into `--teach` via SAGE or local file lookup. Do not combine `--study` with other modes in a single invocation. Study is multi-language: C/C++ resolve through the study-prep corpus; Python, Go, Java, JavaScript/TypeScript, and Rust identifiers resolve in-process (unresolvable identifiers are returned as unresolved with a reason, never guessed).
+`--study` runs independently — it is a separate pipeline (study-prep → LLM extraction → synthesis) that produces `domain-model.json`. Its output feeds into `--teach` via SAGE or local file lookup. Do not combine `--study` with other modes in a single invocation. Study is multi-language: C/C++ resolve through the study-prep corpus; Python, Go, Java, JavaScript/TypeScript, Rust, PHP, Kotlin, C#, and Swift identifiers resolve in-process (unresolvable identifiers are returned as unresolved with a reason, never guessed).
 
 ## Examples
 

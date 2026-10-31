@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -237,6 +238,188 @@ class TestRefuteByArchitecture:
         r = _refute_by_architecture(outcome, dm, None, _Config())
         assert r is not None
         assert r.demote_to == "clean"
+
+    def test_kernel_primitive_vetoes_claim(self, tmp_path):
+        """Kernel concurrency contexts (kthreads, workqueues, timers)
+        must veto a single_threaded claim exactly like pthread_create
+        — on a kernel tree the userspace-only seed never fired and
+        wrong race demotions stood."""
+        import core.audit.refutation as refutation_mod
+        (tmp_path / "drv.c").write_text(
+            "static int init(void) {\n"
+            "    task = kthread_run(worker, NULL, \"drv\");\n"
+            "    queue_work(wq, &work);\n"
+            "    return 0;\n"
+            "}\n")
+        refutation_mod._threading_seen_cache.clear()
+        outcome = _Outcome(
+            hypothesis="data race on drv state between open and ioctl",
+        )
+        dm = _domain_model(
+            architecture={"threading_model": "single_threaded"},
+        )
+        try:
+            r = _refute_by_architecture(
+                outcome, dm, None, _Config(target_path=tmp_path))
+        finally:
+            refutation_mod._threading_seen_cache.clear()
+        assert r is None
+
+    def test_sync_only_source_does_not_false_veto(self, tmp_path):
+        """Bare synchronisation spellings (spin_lock / atomic_*) in a
+        vendored kernel-style header must NOT veto: they mark
+        shared-state discipline, not concurrent execution — a
+        genuinely single-threaded userspace target keeps its
+        demotion. Same rule for a bare ``add_timer``: userspace event
+        loops define one for same-thread callbacks (kernel timers are
+        still caught via timer_setup / mod_timer)."""
+        import core.audit.refutation as refutation_mod
+        (tmp_path / "shim.h").write_text(
+            "#define spin_lock(l) ((void)(l))\n"
+            "static inline void atomic_inc(int *v) { ++*v; }\n"
+            "void rcu_read_lock(void);\n")
+        (tmp_path / "loop.c").write_text(
+            "int add_timer(int ms, void (*cb)(void)) { return 0; }\n")
+        refutation_mod._threading_seen_cache.clear()
+        outcome = _Outcome(
+            hypothesis="data race in refcount concurrent update",
+        )
+        dm = _domain_model(
+            architecture={"threading_model": "single_threaded"},
+        )
+        try:
+            r = _refute_by_architecture(
+                outcome, dm, None, _Config(target_path=tmp_path))
+        finally:
+            refutation_mod._threading_seen_cache.clear()
+        assert r is not None
+        assert r.gate == "architecture"
+
+    def test_partial_scan_demotion_carries_marker(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        """When the veto scan's file budget binds before the tree is
+        covered, the demotion must not claim full confidence — the
+        reason carries the partial-scan marker and the scan warns."""
+        import logging
+
+        import core.audit.refutation as refutation_mod
+        for i in range(3):
+            (tmp_path / f"f{i}.c").write_text("int main(void){return 0;}\n")
+        monkeypatch.setattr(
+            refutation_mod, "_veto_scan_budget", lambda checklist: 1,
+        )
+        refutation_mod._threading_seen_cache.clear()
+        outcome = _Outcome(
+            hypothesis="data race in newaddress concurrent modification",
+        )
+        dm = _domain_model(
+            architecture={"threading_model": "single_threaded"},
+        )
+        try:
+            with caplog.at_level(
+                logging.WARNING, logger="core.audit.refutation",
+            ):
+                r = _refute_by_architecture(
+                    outcome, dm, None, _Config(target_path=tmp_path))
+        finally:
+            refutation_mod._threading_seen_cache.clear()
+        assert r is not None
+        assert "veto scan partial" in r.reason
+        assert any("veto scan PARTIAL" in rec.getMessage()
+                   for rec in caplog.records)
+
+    def test_full_scan_demotion_carries_no_marker(self, tmp_path):
+        """A scan that covered the tree keeps the unqualified reason."""
+        import core.audit.refutation as refutation_mod
+        (tmp_path / "main.c").write_text("int main(void){return 0;}\n")
+        refutation_mod._threading_seen_cache.clear()
+        outcome = _Outcome(
+            hypothesis="data race in newaddress concurrent modification",
+        )
+        dm = _domain_model(
+            architecture={"threading_model": "single_threaded"},
+        )
+        try:
+            r = _refute_by_architecture(
+                outcome, dm, None, _Config(target_path=tmp_path))
+        finally:
+            refutation_mod._threading_seen_cache.clear()
+        assert r is not None
+        assert "veto scan partial" not in r.reason
+
+    def test_decisive_hit_under_budget_is_not_partial(self, tmp_path):
+        """A primitive hit inside the budget is decisive: the veto
+        fires and no partiality is claimed even though the budget
+        would have bound."""
+        import core.audit.refutation as refutation_mod
+        # The primitive file sits alone in the walk root; the decoys
+        # live in a subdirectory os.walk visits afterwards — the hit
+        # is found on the first (and only budgeted) file regardless
+        # of directory-entry order.
+        (tmp_path / "worker.c").write_text(
+            "void s(void){ pthread_create(&t, 0, run, 0); }\n")
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        for i in range(3):
+            (sub / f"z{i}.c").write_text("int f(void){return 0;}\n")
+        refutation_mod._threading_seen_cache.clear()
+        try:
+            scan = refutation_mod._threading_primitives_seen(
+                tmp_path, max_files=1,
+            )
+        finally:
+            refutation_mod._threading_seen_cache.clear()
+        assert scan.seen is True
+        assert scan.partial is False
+
+
+class TestVetoScanBudget:
+    """Two-direction regression tests for the checklist-derived veto
+    scan budget: it must scale UP with checklist size (the fixed 2,000
+    left kernel trees ~96% unscanned) and must stop at the absolute
+    ceiling (the budget is wall-time, paid once per run per target)."""
+
+    def test_floor_without_checklist(self):
+        from core.audit.refutation import (
+            _VETO_SCAN_FLOOR_FILES,
+            _veto_scan_budget,
+        )
+
+        assert _veto_scan_budget(None) == _VETO_SCAN_FLOOR_FILES
+        assert _veto_scan_budget({}) == _VETO_SCAN_FLOOR_FILES
+        assert _veto_scan_budget(
+            {"files": "not-a-list"},
+        ) == _VETO_SCAN_FLOOR_FILES
+
+    def test_floor_on_small_checklist(self):
+        from core.audit.refutation import (
+            _VETO_SCAN_FLOOR_FILES,
+            _veto_scan_budget,
+        )
+
+        small = {"files": [{"path": f"f{i}.c"} for i in range(100)]}
+        assert _veto_scan_budget(small) == _VETO_SCAN_FLOOR_FILES
+
+    def test_budget_scales_with_checklist(self):
+        from core.audit.refutation import (
+            _VETO_SCAN_FILES_PER_CHECKLIST_FILE,
+            _veto_scan_budget,
+        )
+
+        mid = {"files": [{"path": f"f{i}.c"} for i in range(6002)]}
+        assert _veto_scan_budget(mid) == (
+            6002 * _VETO_SCAN_FILES_PER_CHECKLIST_FILE
+        )
+
+    def test_ceiling_binds(self):
+        from core.audit.refutation import (
+            _VETO_SCAN_CEILING_FILES,
+            _veto_scan_budget,
+        )
+
+        huge = {"files": [{"path": f"f{i}.c"} for i in range(50_000)]}
+        assert _veto_scan_budget(huge) == _VETO_SCAN_CEILING_FILES
 
 
 # ===================================================================
@@ -502,6 +685,35 @@ class TestRefuteByKnownReturnType:
         r = _refute_by_known_return_type(outcome, _Config())
         assert r is None
 
+    def test_embedded_libc_name_not_refuted(self):
+        """A custom identifier merely EMBEDDING a bounded libc name
+        (utf8_tolower, net_ntohs_unaligned) carries none of the libc
+        return-range guarantee — the gate must stand down, not
+        proof-refute on a range that says nothing about the custom
+        function."""
+        for hyp in (
+            "utf8_tolower() return value causes arithmetic overflow "
+            "when stored in the int loop counter",
+            "integer wraparound: net_ntohs_unaligned() return value "
+            "used in arithmetic that overflows the loop counter",
+        ):
+            outcome = _Outcome(hypothesis=hyp)
+            assert _refute_by_known_return_type(outcome, _Config()) \
+                is None, hyp
+
+    def test_bare_call_with_argument_still_refuted(self):
+        """The token match keeps matching a real call shape with an
+        argument (``ntohs(x)``), not just the bare name."""
+        outcome = _Outcome(
+            hypothesis=(
+                "integer wraparound: ntohs(x) return value used in "
+                "arithmetic that overflows the loop counter"
+            ),
+        )
+        r = _refute_by_known_return_type(outcome, _Config())
+        assert r is not None
+        assert r.gate == "input_bound_t0"
+
     def test_cwe_190_triggers_without_keywords(self):
         """CWE-190 in review_result triggers even without keywords."""
         outcome = _Outcome(
@@ -659,6 +871,46 @@ class TestRefuteByKnownReturnType:
             )
             assert _refute_by_known_return_type(outcome, _Config()) \
                 is None, hyp
+
+    def test_narrowing_store_spellings_not_refuted(self):
+        """A narrowing STORE spelled without truncate/cast vocabulary
+        ("stored into a uint8_t field") is the same wrap class — the
+        destination-type net must stand the gate down."""
+        for hyp in (
+            "CWE-190: the length from ntohs() is stored into a "
+            "uint8_t field, causing wraparound of the value",
+            "CWE-190: ntohs() result assigned to an unsigned char "
+            "member wraps around",
+            "CWE-190: the ntohs() value is written into a u8 length "
+            "field and wraps",
+            "CWE-190: the ntohs() length lands in a short and the "
+            "sign flips",
+            "CWE-190: the ntohs() count is kept in an 8-bit counter "
+            "which wraps",
+        ):
+            outcome = _Outcome(
+                hypothesis=hyp, review_result={"cwe": "CWE-190"},
+            )
+            assert _refute_by_known_return_type(outcome, _Config()) \
+                is None, hyp
+
+    def test_wide_enough_destination_still_refuted(self):
+        """A destination that HOLDS the entry's range keeps the
+        refutation — the cited range argument is intact there."""
+        for hyp in (
+            "CWE-190: the ntohs() length is stored into a uint32_t "
+            "counter and wraps it",
+            "CWE-190: the ntohs() value is kept in a uint16_t field "
+            "and overflows",
+            "CWE-190: the 16-bit ntohs() length overflows the "
+            "computation",
+        ):
+            outcome = _Outcome(
+                hypothesis=hyp, review_result={"cwe": "CWE-190"},
+            )
+            verdict = _refute_by_known_return_type(outcome, _Config())
+            assert verdict is not None, hyp
+            assert verdict.refuter_grade == "proof", hyp
 
     def test_identifier_adjacent_unspaced_ops_not_refuted(self):
         """Verifier hypotheses quote C verbatim: unspaced
@@ -1226,6 +1478,89 @@ class TestRescueSelfRefuted:
         r = rescue_self_refuted(outcome)
         assert r is None
 
+    def test_rescues_cross_function_refutation(self):
+        """Refutation citing a cross-function guarantee → suspicious.
+
+        CWE-120 is NOT in _SELF_REFUTATION_CWES, but a cross-function
+        refutation is unverifiable from the local review alone — the
+        scope arm catches it regardless of CWE.
+        """
+        outcome = _Outcome(
+            status="clean",
+            hypotheses=[{
+                "mechanism": "CWE-120 strcpy overflow in parse_input",
+                "confidence": "refuted",
+                "counter": "the caller validates the format string length",
+                "counter_scope": "cross_function",
+            }],
+        )
+        r = rescue_self_refuted(outcome)
+        assert r is not None
+        assert r.gate == "anti_self_refutation"
+        assert r.demote_to == "suspicious"
+        assert "cross-function" in r.reason
+
+    def test_no_rescue_for_local_scope_non_race_cwe(self):
+        """Local-scope refutation on a non-race CWE stays clean."""
+        outcome = _Outcome(
+            status="clean",
+            hypotheses=[{
+                "mechanism": "CWE-120 buffer overflow in format handler",
+                "confidence": "refuted",
+                "counter": "the length is checked at line 42",
+                "counter_scope": "local",
+            }],
+        )
+        r = rescue_self_refuted(outcome)
+        assert r is None
+
+    def test_rescues_cross_function_keyword_fallback(self):
+        """Missing counter_scope but counter text names a caller → rescue."""
+        outcome = _Outcome(
+            status="clean",
+            hypotheses=[{
+                "mechanism": "CWE-120 buffer overflow in parse_data",
+                "confidence": "refuted",
+                "counter": (
+                    "the caller validate_input() ensures the buffer "
+                    "length is within bounds before passing it here"
+                ),
+            }],
+        )
+        r = rescue_self_refuted(outcome)
+        assert r is not None
+        assert r.gate == "anti_self_refutation"
+        assert r.demote_to == "suspicious"
+        assert "cross-function" in r.reason
+
+    def test_no_rescue_keyword_fallback_local_code(self):
+        """Counter text about local code with no external premise → no rescue."""
+        outcome = _Outcome(
+            status="clean",
+            hypotheses=[{
+                "mechanism": "CWE-120 buffer overflow",
+                "confidence": "refuted",
+                "counter": "the length is bounded by the static array size",
+            }],
+        )
+        r = rescue_self_refuted(outcome)
+        assert r is None
+
+    def test_cross_function_not_rescued_when_tool_evidence(self):
+        """Tool already spoke — cross-function scope doesn't override."""
+        outcome = _Outcome(
+            status="clean",
+            evidence_tool="joern:taint",
+            hypotheses=[{
+                "mechanism": "CWE-120 overflow via strcpy",
+                "confidence": "refuted",
+                "counter": "caller caps the buffer",
+                "counter_scope": "cross_function",
+            }],
+        )
+        r = rescue_self_refuted(outcome)
+        assert r is None
+
 
 class TestRaceProtectedSelfRefutation:
     """A race-family self-refutation corroborated by mechanical lock
@@ -1256,9 +1591,67 @@ class TestRaceProtectedSelfRefutation:
             }],
         )
 
-    def test_protected_source_accepts_refutation(self):
-        r = rescue_self_refuted(self._race_outcome(), source=self._LOCKED_C)
+    def test_protected_source_accepts_refutation(self, tmp_path):
+        r = rescue_self_refuted(
+            self._race_outcome(), source=self._LOCKED_C, out_dir=tmp_path,
+        )
         assert r is None
+
+    def test_accepted_discharge_writes_durable_record(self, tmp_path):
+        # Accept-with-record doctrine: the witness overrides the
+        # CWE-allowlist floor, so the discharged dismissal must land
+        # as a durable dropped:false row operators can grep.
+        r = rescue_self_refuted(
+            self._race_outcome(), source=self._LOCKED_C, out_dir=tmp_path,
+        )
+        assert r is None
+        rows = [
+            json.loads(line)
+            for line in (tmp_path / "suppressions.jsonl")
+            .read_text(encoding="utf-8").splitlines()
+        ]
+        row = rows[-1]
+        assert row["verdict"] == "in_function_witness_corroborates_dismissal"
+        assert row["dropped"] is False
+        assert row["rule_id"] == "audit:in-function-witness"
+        assert row["witness"] == "in_function"
+        assert row["floor_gate"] == "cwe_allowlist"
+        assert "race: full lock protection" in row["reason"]
+
+    def test_unrecordable_discharge_refused_floor_stands(self):
+        # No out_dir anywhere → the record cannot be written → the
+        # discharge is refused and the floor stands (record-or-refuse:
+        # an unrecorded override would be silent).
+        r = rescue_self_refuted(self._race_outcome(), source=self._LOCKED_C)
+        assert r is not None
+        assert r.demote_to == "suspicious"
+
+    def test_unwritable_out_dir_refuses_discharge(self, tmp_path):
+        # out_dir present but UNWRITABLE: record_suppression swallows
+        # the IO error by contract (best-effort, never propagates), so
+        # a clean return from it is NOT evidence the row landed. The
+        # lane must verify durability itself — read the appended
+        # region back — and refuse the discharge when the record
+        # demonstrably didn't land, else the floor override is silent.
+        import os
+
+        import pytest
+
+        if os.geteuid() == 0:
+            pytest.skip("root bypasses permission checks")
+        out_dir = tmp_path / "run"
+        out_dir.mkdir()
+        out_dir.chmod(0o500)
+        try:
+            r = rescue_self_refuted(
+                self._race_outcome(), source=self._LOCKED_C,
+                out_dir=out_dir,
+            )
+        finally:
+            out_dir.chmod(0o700)
+        assert r is not None
+        assert r.demote_to == "suspicious"
+        assert not (out_dir / "suppressions.jsonl").exists()
 
     def test_without_source_still_floors(self):
         r = rescue_self_refuted(self._race_outcome())
@@ -1276,7 +1669,8 @@ class TestRaceProtectedSelfRefutation:
         r = rescue_self_refuted(self._race_outcome(), source=unlocked)
         assert r is not None
 
-    def test_uaf_refutation_accepted_when_locked_and_nothing_freed(self):
+    def test_uaf_refutation_accepted_when_locked_and_nothing_freed(
+            self, tmp_path):
         # Doctrine update (corpus-verified): a lifetime self-refutation
         # on FULLY lock-protected source that frees NOTHING is
         # mechanically corroborated — the claimed hazard has no local
@@ -1293,7 +1687,9 @@ class TestRaceProtectedSelfRefutation:
                 "counter": "reference held by caller",
             }],
         )
-        r = rescue_self_refuted(outcome, source=self._LOCKED_C)
+        r = rescue_self_refuted(
+            outcome, source=self._LOCKED_C, out_dir=tmp_path,
+        )
         assert r is None
 
     _BARE_FREE_C = (
@@ -1351,7 +1747,8 @@ class TestRaceProtectedSelfRefutation:
         "}\n"
     )
 
-    def test_uaf_refutation_accepted_over_waiting_teardown(self):
+    def test_uaf_refutation_accepted_over_waiting_teardown(
+            self, tmp_path):
         # Waiting cancel + RCU-deferred reclamation corroborate the
         # reviewer's lifetime self-refutation.
         outcome = _Outcome(
@@ -1362,7 +1759,9 @@ class TestRaceProtectedSelfRefutation:
                 "counter": "hrtimer_cancel waits; kfree_rcu defers",
             }],
         )
-        r = rescue_self_refuted(outcome, source=self._SYNC_TEARDOWN_C)
+        r = rescue_self_refuted(
+            outcome, source=self._SYNC_TEARDOWN_C, out_dir=tmp_path,
+        )
         assert r is None
 
 
@@ -1720,11 +2119,24 @@ class TestDiagnoseRescue:
             hypotheses=[{
                 "mechanism": "CWE-190 integer overflow in size",
                 "confidence": "refuted",
-                "counter": "value bounded by caller",
+                "counter": "value bounded by the static array size",
             }],
         )
         d = diagnose_rescue(outcome, negative_space=[self._RECEIPT])
         assert d["blocked_on"] == "no_matching_receipt_or_cwe"
+
+    def test_cross_function_scope_means_gate_would_fire(self):
+        from core.audit.refutation import diagnose_rescue
+        outcome = _Outcome(
+            status="clean",
+            hypotheses=[{
+                "mechanism": "CWE-120 strcpy overflow",
+                "confidence": "refuted",
+                "counter": "the caller validates the length",
+                "counter_scope": "cross_function",
+            }],
+        )
+        assert diagnose_rescue(outcome) is None
 
     def test_receipt_on_other_function_not_counted(self):
         from core.audit.refutation import diagnose_rescue
@@ -2062,7 +2474,7 @@ class TestReturnDomainFamilyDismissal:
                     "`== -1` check"
                 ),
                 "confidence": conf,
-                "counter": "the callee only ever returns 0 or -1",
+                "counter": "the return-value check covers all documented error codes",
             }],
         )
 
@@ -2118,3 +2530,33 @@ class TestReturnDomainFamilyDismissal:
     def test_no_receipt_no_rescue(self):
         r = rescue_self_refuted(self._outcome())
         assert r is None
+
+
+class TestBoundedNameNearOverflowClaim:
+    """_bounded_name_near_overflow_claim — every token occurrence
+    gets the proximity window, not just the first."""
+
+    def test_later_occurrence_near_claim_matches(self):
+        from core.audit.refutation import _bounded_name_near_overflow_claim
+        filler = "the parser validates the header fields carefully " * 4
+        mech = (
+            "ntohs is used for byte order here. "  # far occurrence
+            + filler
+            + "the length from ntohs wraps: integer overflow follows."
+        )
+        assert _bounded_name_near_overflow_claim(mech.lower()) is True
+
+    def test_no_occurrence_near_claim_refuses(self):
+        from core.audit.refutation import _bounded_name_near_overflow_claim
+        filler = "the parser validates the header fields carefully " * 4
+        mech = (
+            "ntohs is used for byte order here. "
+            + filler
+            + "later a length computation shows integer overflow."
+        )
+        assert _bounded_name_near_overflow_claim(mech.lower()) is False
+
+    def test_embedded_identifier_never_matches(self):
+        from core.audit.refutation import _bounded_name_near_overflow_claim
+        mech = "net_ntohs_unaligned() result causes integer overflow"
+        assert _bounded_name_near_overflow_claim(mech.lower()) is False

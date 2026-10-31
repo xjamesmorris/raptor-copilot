@@ -61,7 +61,7 @@ Semgrep pass (`--expanded-semgrep`).
 | `--extra-config <path>` | none | Additional Semgrep rule source path (repeatable) |
 | `--show-suppressed` | off | Include `nosemgrep`-suppressed findings in output summary |
 | `--sandbox <profile>` | full | [Sandbox](sandbox.md) profile (`full` / `strict` / `debug` / `target_run` / `frida` / `network-only` / `none`) |
-| `--no-sandbox` | off | Alias for `--sandbox none` |
+| `--no-sandbox` | off | Alias for `--sandbox none` (consent-gated — see [Sandbox](sandbox.md#disabling-the-sandbox)) |
 | `--audit` | off | Engage [sandbox](sandbox.md) audit mode |
 | `--audit-verbose` | off | Log every traced syscall (requires `--audit`) |
 | `--audit-budget <n>` | 10000 | Override audit-record cap |
@@ -264,6 +264,26 @@ is the default: suppress-verdict findings are removed from
 `suppressions.jsonl`.  Per-tool SARIFs are never filtered in any mode.
 `--no-sanitizer-cut-enforce` keeps the verdicts record-only;
 `--no-sanitizer-cut-postpass` skips the pass entirely.
+
+### Sanitizer-recognition contract
+
+Across the rule engines, multi-step sanitizer chains are recognized
+only within a single expression. A sanitization sequence written as
+one chained expression (`value.replace('\r', '').replace('\n', '')`)
+is recognized; the identical sequence split across statements
+(`v = v.replace('\r', ''); v = v.replace('\n', '')`) is not — the
+finding is still reported. This is deliberate:
+
+- Every miss in this class is FP-direction: the code is still
+  flagged and downstream validation adjudicates. Nothing is ever
+  silently suppressed by the contract.
+- A statement-chain upgrade is per-engine dataflow work (a CodeQL
+  local-flow join; Semgrep cannot express it outside
+  `by-side-effect`) with no observed FP burden justifying it.
+- Recognitions that carry SUPPRESSION authority must be either
+  single-call sanitizers (one call is complete — most rules) or
+  proof-gated (the SMT barrier validator only claims a barrier when
+  a solver proof backs it).
 
 ### Metrics
 

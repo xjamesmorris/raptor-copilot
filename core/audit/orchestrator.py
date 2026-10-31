@@ -32,7 +32,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, TYPE_CHECKING
+from typing import Any, Callable, NoReturn, TYPE_CHECKING
 
 from core.analysis.reachability_gates import (
     GUARD_UNAVAILABLE,
@@ -40,17 +40,18 @@ from core.analysis.reachability_gates import (
     check_sink_guarded,
     compute_demotion_verdict,
 )
+from core.atomic_fs import write_text_atomically
 from core.evidence import (
     EvidenceRecord,
     build_evidence_index,
     format_evidence_prose,
-    format_evidence_structured,
 )
 from core.json import load_json, save_json
 from core.smt_solver.availability import Z3_ERRORS
 from packages.checker_synthesis.library import RuleLibrary
 
 from ._util import extract_context_map_set
+from ._util import is_valid_identifier as _jv_is_valid_identifier
 from .codeql_backend import (
     build_sink_results as _build_sink_results_raw,
 )
@@ -85,6 +86,9 @@ from .diagnostics import (
 from .diagnostics import (
     iris_candidate_to_spec as _iris_candidate_to_spec,
 )
+from .diagnostics import (
+    tally_substrate_skip_language as _tally_substrate_language,
+)
 from .exploit_feedback import (
     FeedbackState,
     format_feedback_for_context,
@@ -92,6 +96,19 @@ from .exploit_feedback import (
     load_feedback_state,
 )
 from .findings import write_findings
+from .substrate import (
+    classify_sweep_outcome as _classify_sweep_outcome,
+)
+from .substrate import (
+    file_substrate_coverage as _substrate_file_coverage,
+)
+from .substrate import (
+    registered_scope as _substrate_registered_scope,
+)
+from .environment import (
+    make_dispatch_gate as _make_dispatch_gate,
+    make_executor_on_tick as _make_executor_on_tick,
+)
 from .gaps import (
     compute_gaps,
     gap_for_site,
@@ -99,6 +116,7 @@ from .gaps import (
     hydrate_live_gaps_for_detectors,
     load_checklist,
     load_context_map,
+    merge_rereview_pins,
     truncate_gaps_to_budget,
     write_gaps,
 )
@@ -127,6 +145,12 @@ from .joern_backend import (
     import_sibling_joern_flows as _import_sibling_joern_flows_raw,
 )
 from .joern_backend import (
+    joern_function_in_cpg as _joern_function_in_cpg,
+)
+from .joern_backend import (
+    joern_name_queryable as _joern_name_queryable,
+)
+from .joern_backend import (
     joern_live_query as _joern_live_query,
 )
 from .joern_backend import (
@@ -143,6 +167,9 @@ from .joern_backend import (
 )
 from .joern_backend import (
     run_exclude_dirs as _run_exclude_dirs,
+)
+from .joern_backend import (
+    scope_complement_exclude_dirs as _scope_complement_exclude_dirs,
 )
 from .joern_backend import (
     start_joern_server as _start_joern_server_raw,
@@ -193,15 +220,48 @@ from .record import (
 )
 from .record import (
     append_audit_log,
-    load_audit_log,
+    load_audit_log_disclosed,
+    load_verified_audit_log,
+)
+# Fail-soft by contract: every scorecard_events entry point catches
+# internally, so the call sites below never need their own guard.
+from .scorecard_events import (
+    buffer_confirmed_findings as _sc_buffer_confirmed_findings,
+    flush_scorecard_events as _sc_flush_events,
+    is_reconcilable as _sc_is_reconcilable,
+    outcome_key as _sc_outcome_key,
+    record_adversarial_outcome as _sc_record_adversarial,
+    record_mechanical_refutation as _sc_record_refutation,
+    record_self_consistency_violation as _sc_record_self_consistency,
+    resolve_scorecard_store as _sc_resolve_store,
 )
 from .shared_state import SharedState
+# Hoisted (not lazy): the caller-gate crash handler must be able to
+# construct a fail-closed hold decision even when a lazy import of
+# this module is the failure itself — a broken module fails loudly at
+# orchestrator import instead of taking down the sweep-promotion
+# phase mid-run.  evaluate_caller_gate stays lazily imported at the
+# consult site so tests can monkeypatch the module attribute.
+from .smt_promotion_gate import (
+    GATE_VERDICT as _SMT_CALLER_GATE_VERDICT,
+    CallerGateDecision,
+)
 from .sweep import (
     SarifCache,
+    run_coccinelle_file_sweep,
     run_coccinelle_sweep,
     run_semgrep_sweep,
     run_smt_verb_direct,
+    scope_coccinelle_result,
 )
+from .joern_health import (
+    JoernChannelHealth,
+    channel_unhealthy as _joern_channel_unhealthy,
+    dispatch_blocked as _joern_dispatch_blocked,
+    health_snapshot as _channel_health_snapshot,
+    record_outcome as _record_joern_outcome,
+)
+from .sweep_memo import SweepMemo, hash_file as _memo_hash_file, hash_text as _memo_hash_text
 from .topo_order import topological_sort as _topological_sort
 from .triage import TriageBucket, classify_all, format_triage_summary
 
@@ -209,9 +269,45 @@ from core.inventory.binary_builder import BINARY_PATH_PREFIX
 
 if TYPE_CHECKING:
     from concurrent.futures import Future
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
+
+    from .run_memo import BoundedMemo
+    from core.audit.environment import EnvironmentGuard
 
 logger = logging.getLogger(__name__)
+
+
+def _default_codeql_memo() -> "BoundedMemo":
+    """Fresh per-run whole-DB CodeQL memo at the sweep layer's cap."""
+    from .run_memo import BoundedMemo as _BoundedMemo
+    from .sweep import _CODEQL_MEMO_MAX_ENTRIES
+
+    return _BoundedMemo(_CODEQL_MEMO_MAX_ENTRIES)
+
+
+def _default_hypothesis_source_memo() -> "BoundedMemo":
+    """Fresh per-run memo for the resource-bounds / protocol-state
+    source census and state-field index. Both are pure functions of
+    the target tree (+ primary file for the index) that were re-paid
+    on every hypothesis dispatch: a full-tree walk incl. .git per
+    call. Run-scoped like codeql_memo — the read-only-target-tree
+    contract bounds correctness to one run."""
+    from .run_memo import BoundedMemo as _BoundedMemo
+
+    return _BoundedMemo(16)
+
+
+def _default_tu_cache() -> "BoundedMemo":
+    """Fresh per-run compiler cache at the sweep layer's cap.
+
+    Shared factory for ``tu_cache`` and ``include_dirs_memo`` — the
+    include-dir memo deliberately rides the TU cache's bound (small
+    path-list entries under the same lifetime argument).
+    """
+    from .compiler_sweep import _TU_CACHE_MAX_ENTRIES
+    from .run_memo import BoundedMemo as _BoundedMemo
+
+    return _BoundedMemo(_TU_CACHE_MAX_ENTRIES)
 
 # Single-entry cache for per-run call-graph extraction: three phases
 # (IRIS compositional analysis, the postcondition tier, structural
@@ -221,6 +317,7 @@ logger = logging.getLogger(__name__)
 # entry suffices; keyed on the checklist's identity fields so a
 # rebuilt inventory refreshes it.
 _call_graphs_cache: dict[tuple[str, Any, Any], dict[str, Any]] = {}
+_call_graphs_lock = _threading.Lock()
 
 
 def _load_call_graphs_cached(
@@ -233,12 +330,14 @@ def _load_call_graphs_cached(
         (checklist or {}).get("generated_at"),
         (checklist or {}).get("total_files"),
     )
-    hit = _call_graphs_cache.get(key)
-    if hit is not None:
-        return hit
+    with _call_graphs_lock:
+        hit = _call_graphs_cache.get(key)
+        if hit is not None:
+            return hit
     graphs = load_call_graphs(target_path, checklist)
-    _call_graphs_cache.clear()
-    _call_graphs_cache[key] = graphs
+    with _call_graphs_lock:
+        _call_graphs_cache.clear()
+        _call_graphs_cache[key] = graphs
     return graphs
 
 # Byte budgets for the orchestrator's own artifact reads: 8 MiB for
@@ -268,6 +367,23 @@ def _pinned_or_parent_project_dir(out_dir):
     if (out_dir / ".raptor-run.json").exists():
         return out_dir.parent
     return None
+
+
+def _resolved_run_id(out_dir: Path | None) -> str:
+    """Run-attribution identity for journal rows — delegates to the
+    shared resolver (:func:`core.coverage.journal.resolved_run_id`):
+    the RESOLVED run-dir basename, falling back toward the
+    no-attribution sentinel when the name is genuinely unresolvable
+    and keeping the historical empty stamp for ``None``.
+
+    Kept as the orchestrator's one importable spelling: every
+    orchestrator journal-writer stamps ``run_id`` through this
+    helper, and the write-site census
+    (core/audit/tests/test_run_id_stamp_census.py) trips on any new
+    direct derivation from ``out_dir``.
+    """
+    from core.coverage.journal import resolved_run_id
+    return resolved_run_id(out_dir)
 
 
 # ── Narrowed exception sets for best-effort blocks ──────────────────
@@ -334,6 +450,69 @@ def _run_sigterm_flush_hooks() -> None:
             logger.debug("sigterm flush hook failed", exc_info=True)
 
 
+def _register_private_joern_reap_hook(
+    joern_server: Any,
+    *,
+    caller_owns: bool,
+    lifecycle_shared: bool,
+) -> bool:
+    """Arm a forced-exit teardown for the Joern pair THIS RUN started.
+
+    The graceful ``finally`` in :func:`run_orchestrator` stops the
+    server, but the FORCED-exit paths (SIGTERM-grace watchdog expiry,
+    second TERM) run only ``_sigterm_flush_hooks`` before
+    ``os._exit`` — without an entry here the netns forwarder detaches
+    to init with its JVM and squats on the heap until its own 8h
+    orphan TTL. Registered only for run-private servers (lifecycle
+    acquire failed, so no state-file record exists): their ``_proc``
+    handle is ours and no other session can reference them. The
+    bounded joern release also rides the flush-hook registry, but
+    behind an exactly-once lock: a watchdog expiring while the
+    graceful release is still mid-ladder finds that lock held, no-ops,
+    and can ``os._exit`` between the ladder's TERM and KILL — this
+    UNGUARDED, idempotent ``stop_fast`` backstop is what closes that
+    window. Refused classes:
+
+    * caller-owned servers are the caller's lifecycle;
+    * lifecycle-managed servers (``_lifecycle_token`` set) — another
+      session may hold a refcount; the bounded release on the flush-
+      hook registry handles these through ``joern_release``;
+    * reuse handles (no ``_proc``) — another session's process,
+      never ours to signal.
+
+    Returns True when a hook was registered. The hook is
+    exception-guarded and idempotent against the graceful path: the
+    ``finally`` clears the hook registry once its own release is
+    done, and a double-fire in that window only re-signals an
+    already-dead corroborated group (``stop_fast`` mutates no
+    instance state). Teardown reuses the server's own tier-aware
+    stop machinery — the supervision tier (``_supervision_tier``,
+    ``"group"`` when unstamped) is read here only to attribute the
+    reap in the log; ``stop_fast`` itself implements the per-tier
+    kill rules and stays within its existing bounded grace.
+    """
+    if joern_server is None or caller_owns or lifecycle_shared:
+        return False
+    if getattr(joern_server, "_proc", None) is None:
+        return False
+
+    def _reap_owned_joern_on_forced_exit() -> None:
+        try:
+            tier: str = getattr(joern_server, "_supervision_tier", "group")
+            logger.info(
+                "forced-exit joern reap: stopping the run-started "
+                "forwarder+JVM pair (supervision tier=%s)", tier,
+            )
+            joern_server.stop_fast()
+        except Exception:  # noqa: BLE001 — flush hooks must never raise
+            logger.debug(
+                "forced-exit joern reap failed", exc_info=True,
+            )
+
+    _sigterm_flush_hooks.append(_reap_owned_joern_on_forced_exit)
+    return True
+
+
 def _sigterm_watchdog(grace_s: float) -> None:
     time.sleep(grace_s)
     logger.warning(
@@ -382,11 +561,57 @@ def install_sigterm_grace() -> bool:
         return False
     import signal as _signal
     try:
+        prev = _signal.getsignal(_signal.SIGTERM)
         _signal.signal(_signal.SIGTERM, _handle_sigterm)
     except (ValueError, OSError):
         logger.debug("SIGTERM handler installation failed", exc_info=True)
         return False
+    _sigterm_state["prev"] = prev
     _sigterm_state["installed"] = True
+    return True
+
+
+def uninstall_sigterm_grace() -> bool:
+    """Restore the pre-install SIGTERM disposition — main thread, and
+    only while the installed handler is still ours.
+
+    The handler is PROCESS-WIDE state. The CLI process never needs to
+    undo it, but in-process embedders and tests do: a leaked salvage
+    handler is inherited by every later fork child of the host
+    process, where SIGTERM then starts a salvage drain instead of
+    killing the child — signal-sensitive work elsewhere in the
+    process (pool teardown escalation, subprocess supervision)
+    misreads that as an unresponsive process and SIGKILLs. Install /
+    uninstall must stay symmetric so hosts can scope the salvage
+    semantics to the run.
+
+    Returns True when the uninstall completed — the disposition was
+    restored, or a foreign current handler (someone installed over
+    us) was deliberately left in place with only the bookkeeping
+    cleared. False when nothing was installed or the restore failed.
+    """
+    if not _sigterm_state["installed"]:
+        return False
+    if _threading.current_thread() is not _threading.main_thread():
+        return False
+    import signal as _signal
+    try:
+        if _signal.getsignal(_signal.SIGTERM) is _handle_sigterm:
+            # ``prev`` can be None: getsignal() reports None for a
+            # handler installed by non-Python (C-level) means — the
+            # embedder case this API exists for. signal.signal()
+            # cannot re-install that; fall back to the default
+            # disposition rather than raising TypeError mid-teardown.
+            prev = _sigterm_state.get("prev")
+            if prev is None:
+                prev = _signal.SIG_DFL
+            _signal.signal(_signal.SIGTERM, prev)
+    except (TypeError, ValueError, OSError):
+        # TypeError: exotic non-handler value slipped into ``prev``.
+        logger.debug("SIGTERM handler restore failed", exc_info=True)
+        return False
+    _sigterm_state["installed"] = False
+    _sigterm_state.pop("prev", None)
     return True
 
 
@@ -408,7 +633,59 @@ def _reset_shutdown_state() -> None:
     _sigterm_state["count"] = 0
 
 
-def _update_run_progress(out_dir: Path, result: Any) -> None:
+# Hard bound on the joern server release during a SIGTERM salvage or
+# forced exit. Not lower: ``joern_release`` serialises on a
+# cross-process file lock, and a healthy sibling holding it briefly
+# (registering or releasing its own server) legitimately takes a few
+# seconds — a ~1s bound would abandon releases that were about to
+# succeed and leak the JVM anyway. Not higher: this wait sits inside
+# the ~30s SIGTERM grace shared with the ledger/journal flush and the
+# salvage export; letting the release consume most of that window
+# trades a JVM the operator can reap by hand for salvage artifacts
+# nothing can recreate.
+_JOERN_EXIT_STOP_TIMEOUT_S = 10.0
+
+
+def _bounded_joern_exit_release(release: Callable[[], None]) -> None:
+    """Run *release* with a hard time bound, then abandon it.
+
+    Exit paths only (SIGTERM salvage conclusion, watchdog expiry,
+    second TERM): ``joern_release`` can block on its cross-process
+    file lock, and an exiting process must not hang there — a leaked
+    forwarder+JVM pair is recoverable, a wedged salvage is not. The
+    worker thread is daemonic, so an expired bound never delays the
+    interpreter's exit.
+    """
+    worker = _threading.Thread(
+        target=release, daemon=True, name="joern-exit-release",
+    )
+    worker.start()
+    worker.join(_JOERN_EXIT_STOP_TIMEOUT_S)
+    if worker.is_alive():
+        logger.warning(
+            "joern server release did not finish within %.0fs during "
+            "exit — abandoning it (the forwarder/JVM pair may outlive "
+            "this process; reap it manually if it does)",
+            _JOERN_EXIT_STOP_TIMEOUT_S,
+        )
+
+
+# Seconds between progress-checkpoint writes from the study consumer.
+# Mirrors the executor's identically named constant (imported lazily
+# from THIS module by the executor, so importing it back would be
+# circular) — a sync test asserts they stay equal. Both directions
+# hurt: shorter churns the metadata lock + an atomic rewrite of
+# .raptor-run.json after nearly every batch; longer leaves operators
+# staring at a stale progress record on multi-hour drains.
+_PROGRESS_CHECKPOINT_INTERVAL = 60.0
+
+
+def _update_run_progress(
+    out_dir: Path,
+    result: Any,
+    *,
+    study: dict[str, int] | None = None,
+) -> None:
     """Update run metadata with progress checkpoint.
 
     Atomic + locked like every other ``.raptor-run.json`` writer
@@ -419,9 +696,20 @@ def _update_run_progress(out_dir: Path, result: Any) -> None:
     update (a SIGTERM drain marking the run ``interrupted`` could be
     clobbered back to ``running`` by a checkpoint that loaded the
     stale status a moment earlier).
+
+    ``study``: optional study-drain fields, stored under
+    ``progress["study"]``. The progress record is merge-updated, not
+    replaced: the executor's review checkpoints (no ``study``) and
+    the study consumer's drain checkpoints run concurrently, and each
+    writer must not erase the other's fields. ``completed`` keeps its
+    meaning (reviews completed) on every write, and every write
+    stamps ``updated_at`` (ISO-8601 UTC) so readers can tell a live
+    run from a stalled one.
     """
     meta_path = out_dir / ".raptor-run.json"
     try:
+        from datetime import datetime, timezone
+
         from core.json import load_json, save_json
         from core.run.metadata import _metadata_lock
 
@@ -429,11 +717,20 @@ def _update_run_progress(out_dir: Path, result: Any) -> None:
             meta = load_json(meta_path)
             if not isinstance(meta, dict):
                 return
-            meta.setdefault("extra", {})["progress"] = {
-                # OrchestratorResult counts completed reviews in
-                # ``reviewed`` (it has no ``completed`` field).
-                "completed": getattr(result, "reviewed", 0),
-            }
+            extra = meta.setdefault("extra", {})
+            prev = extra.get("progress")
+            progress: dict[str, Any] = (
+                dict(prev) if isinstance(prev, dict) else {}
+            )
+            # OrchestratorResult counts completed reviews in
+            # ``reviewed`` (it has no ``completed`` field).
+            progress["completed"] = getattr(result, "reviewed", 0)
+            if study is not None:
+                progress["study"] = dict(study)
+            progress["updated_at"] = (
+                datetime.now(timezone.utc).isoformat()
+            )
+            extra["progress"] = progress
             save_json(meta_path, meta)
     except Exception:
         logger.debug("progress checkpoint write failed", exc_info=True)
@@ -464,6 +761,25 @@ class OrchestratorConfig:
     # (core.audit.gap_ranking) before pins/budget. Ordering only.
     rank_gaps: bool = False
     critique_interval: int = 10
+    # Run the mechanical promotion resolution on the critique cadence
+    # (every ``critique_interval`` reviews) over the outcomes
+    # accumulated since the last tick, journaling promotions
+    # immediately with ``provisional: true``; the post-loop pass
+    # finalizes (confirms or retracts). On: the first finding reaches
+    # the journal/findings.json minutes after its evidence exists
+    # instead of at end of run, and a SIGTERM'd run keeps its
+    # provisional findings; the cost is re-deriving the (memo-cheap)
+    # tool chains post-loop for items the tick could not promote,
+    # plus non-memoized channels (joern, cocci-with-vocab) possibly
+    # running twice for those items, and the ticking review worker
+    # staying occupied for the whole mechanical pass (its window's
+    # tool chains run inline on that worker before it takes the next
+    # review). Off: exact pre-cadence behavior —
+    # all promotion resolution deferred to the post-loop pass, first
+    # journal-visible finding lands only in the run's final minutes.
+    # LLM-backed steps (on-demand checker synthesis) NEVER run on the
+    # cadence in either setting — they are finalization-only.
+    incremental_promotion: bool = True
     max_cost_usd: float | None = None
     max_seconds: float | None = None
     resume: bool = True
@@ -483,6 +799,10 @@ class OrchestratorConfig:
     codeql_db_paths: list[str] | None = None
     # Derived at run start (never set by callers).
     codeql_db_router: Any | None = None
+    # Background database build from run-start provisioning; joined
+    # (bounded) right before the CodeQL pre-sweep, so the build
+    # overlaps inventory/prep instead of blocking run start.
+    codeql_db_future: Any | None = None
     threat_model: dict[str, Any] | None = None
     validate: bool = True
     prefilter: bool = True
@@ -506,6 +826,35 @@ class OrchestratorConfig:
     # writes a suppressions.jsonl record; pinned gaps are exempt.
     vendored_triage: bool = True
     sweep_validate_findings: bool = True
+    # Caller-side gate on clean-refuted SMT promotions: before an SMT
+    # receipt earned against a self-refuted hypothesis lifts a clean
+    # outcome to finding, re-derive the receipt's own precondition
+    # (the callee parameter the verb solved over) and adjudicate it at
+    # the in-repo call sites via the api_boundary channel (see
+    # core.audit.smt_promotion_gate). On: a receipt whose flagged
+    # state every enumerated caller upholds — pinned constants,
+    # sizeof-bounded lengths, range checks above the call — stays
+    # suspicious-with-receipt instead of minting a finding; the
+    # intra-procedural solver cannot see caller invariants, and this
+    # lane's confirms are exactly the shape that over-promotes on
+    # them. Off: every SMT confirm in the lane promotes directly —
+    # maximum recall for trees whose in-repo call sites are not
+    # representative of the real consumers (exported-API libraries
+    # with hostile out-of-tree callers), at the cost of caller-proof
+    # false positives shipping as findings. Never demotes below
+    # suspicious in either setting.
+    smt_promotion_caller_gate: bool = True
+    # Wall-time bound for the zero-dispatch re-sweep: the post-loop
+    # receipt-supply pass that dispatches the CWE-mapped mechanical
+    # chain for every suspicious outcome whose review dispatched no
+    # tools. Purely mechanical ($0 LLM). Too small and a large
+    # suspicious pile keeps its zero-receipt journal rows — the exact
+    # starvation the pass exists to close; too large and a target
+    # with slow spatch/codeql chains holds the run's tail hostage to
+    # an enrichment pass (the promotion pass re-derives memoizable
+    # steps for free, but coccinelle-with-vocab, flow legs and joern
+    # re-run — overshoot pays those twice). 0 disables the pass.
+    zero_dispatch_resweep_seconds: float = 300.0
     deepen_suspicious: bool = True
     # Slice of the LLM cost cap held back from the discovery loop so
     # the deepen phase can actually execute the re-reviews it
@@ -514,6 +863,19 @@ class OrchestratorConfig:
     # the deepen phase starts (or immediately when deepen has nothing
     # to do). 0 disables the reserve.
     deepen_reserve_fraction: float = 0.15
+    # Slice of the LLM cost cap held back for the study consumer's
+    # end-of-run drain (question resolutions + study-enriched
+    # re-reviews). Held TOGETHER with the deepen slice before the main
+    # loop and handed back at the drain boundary, so the priority
+    # order is enforced by construction: main reviews (and their
+    # refinement rounds) gate against cap - (deepen + study), the
+    # drain gates against cap - deepen, and the deepen phase gets its
+    # own slice last-released. Too small and a spend-to-cap run
+    # abandons its entire pending study backlog with zero re-reviews
+    # while refinement spends freely from the shared pool; too large
+    # and discovery reviews — the run's primary product — give up
+    # real budget to an enrichment pass. 0 disables the slice.
+    study_reserve_fraction: float = 0.05
     # Slice of the LLM cost cap held back from the PRE-review bulk
     # passes (prep, study, synthesis, summaries) so the per-function
     # review loop is guaranteed headroom. Held on the budget client at
@@ -578,6 +940,18 @@ class OrchestratorConfig:
     # function loop, and fold tier-2 edge contracts into caller
     # reviews. Default off.
     edges: bool = False
+    open_discovery: bool = False
+    discovery_budget_fraction: float = 0.20
+    # Mid-run journal checkpoint (core.coverage.journal_checkpoint):
+    # when the journal's largest shard crosses the retained-size
+    # trigger, quiesce the review workers and compact (dedup +
+    # supersede, spend-safe tiers only) synchronously at the next
+    # dispatch point / segment boundary — the run pauses for seconds
+    # instead of hitting the loader-budget wall and paying a manual
+    # drain/compact/resume cycle. Default ON; per-run
+    # --no-journal-checkpoint or the project 'journal-checkpoint'
+    # setting ('off') disables the automatic tier for the run.
+    journal_checkpoint: bool = True
     # Set by the end-of-run corrective passes: once final statuses are
     # re-journaled/re-logged, any straggler commit (an abandoned study
     # re-review finishing after the drain gave up on it) must not
@@ -642,6 +1016,14 @@ class OrchestratorConfig:
     # untouched, finding still exported); never touches
     # tool-confirmed outcomes.
     caller_contract_demotion: bool = True
+    # Post-review gadget-absence confidence demotion: an outcome whose
+    # every live hypothesis is gadget-dependent, against a tree the
+    # gadget oracle refuted with its one corpus-earned absence shape
+    # (complete census, zero POP trigger surface), exports at
+    # confidence=low with receipts.  Never suppresses (status
+    # untouched, finding still exported); never touches tool-confirmed
+    # outcomes.
+    gadget_absence_demotion: bool = True
     # Review scheduling with >1 worker: "cost" (default) dispatches
     # predicted-longest reviews first (LPT makespan packing);
     # "priority" keeps the highest-priority-first order (better
@@ -658,6 +1040,23 @@ class OrchestratorConfig:
     # timeouts (Joern) clamp to the remaining budget so one stuck
     # query can't hold a worker past the run's end.
     run_deadline_monotonic: float | None = None
+    # Systemic-fault circuit breaker on the dispatch path
+    # (core.audit.environment). On (default): when most of the recent
+    # terminal dispatch failures across distinct functions share one
+    # systemic class (disk/fd/memory errno, auth refusal,
+    # connection/DNS), dispatch pauses, a direct probe runs, and the
+    # run resumes or concludes resumably. Off: every environmental
+    # failure is handled as an independent per-function error — a
+    # persistent fault then fails every remaining dispatch
+    # identically for the rest of the run. Disable only when the
+    # environment is deliberately abnormal (fault-injection
+    # harnesses, quota-testing rigs).
+    environment_breaker: bool = True
+    # The run's EnvironmentGuard (core.audit.environment): resource
+    # watchdog + circuit breaker on the executor tick, graceful
+    # conclude via the stop rails. Derived at run start (never set by
+    # callers).
+    environment_guard_state: EnvironmentGuard | None = None
     # On-demand Mode-2 checker synthesis for chain-less hypotheses:
     # when a suspicious outcome's (possibly inferred) CWE yields no
     # tool-chain entry and no cheap channel binds the hypothesis, a
@@ -710,6 +1109,31 @@ class OrchestratorConfig:
     # /agentic post-pass launches the audit BEFORE the parent run
     # completes (the lifecycle merge happens at completion).
     prior_journal_dirs: list[Path] | None = None
+    # Explicit ``--hypothesis-seeds`` files (repeatable): external
+    # hypothesis-seed intake (core.audit.hypothesis_intake) — seeds
+    # boost matching gap-queue entries and ride into review context
+    # as hint-tier blocks. A co-located sibling-hypotheses.json in
+    # the run dir is discovered without this. Seeds never mint
+    # findings; the bookmarks bridge stays the only
+    # pre-identified-finding lane.
+    hypothesis_seed_paths: list[Path] | None = None
+    # ``--seed-rereview`` (default OFF — operator consent to re-open
+    # spend on covered functions): a seed that resolves to a
+    # checklist function the coverage/journal/reuse folds would
+    # suppress is scheduled for a FRESH review instead — hoisted
+    # through the --pin mechanism (ahead of the --budget cut with
+    # inherited --pin semantics: on a bounded run scheduled
+    # re-reviews claim slots first and can displace never-reviewed
+    # gaps into not-attempted.json; excess scheduled items beyond
+    # the budget are themselves cut and recorded; plus the pinned
+    # triage-skip override), seed context injected at the same
+    # review seam as matched gaps, verdict-reuse import refused for
+    # it, journal row marked ``seed_rereview`` — which also caps the
+    # consent at ONE fresh review: later segments of the same run
+    # see the marker row and do not re-schedule. Never mints
+    # findings and never bypasses --max-cost/--budget; a seed for a
+    # function absent from the checklist stays a miss.
+    seed_rereview: bool = False
     # Derived at run start (never set by callers): ``file:function`` →
     # newest-first finding-grade journal entries, consumed by
     # ``_build_context`` as prior claims. Kind-gated OUT of coverage
@@ -721,6 +1145,75 @@ class OrchestratorConfig:
     # measured optima — tune per target density.
     prior_claims_per_function: int = 3
     prior_claim_excerpt_chars: int = 600
+    # Per-run memo for deterministic tool-chain sweep steps (semgrep /
+    # coccinelle / codeql / smt / compiler): identical dispatches
+    # recurring across hypotheses, critique/promotion re-checks and
+    # reused verdicts return the cached result instead of re-spawning
+    # the subprocess. Keys are content hashes of the steering inputs;
+    # see core.audit.sweep_memo for the soundness contract. One memo
+    # per run — never share across runs (the run-lifetime bound is
+    # part of the key contract).
+    sweep_memo: SweepMemo = field(default_factory=SweepMemo, repr=False)
+    # Per-run instances of the coarser backend caches, same lifetime
+    # rationale as sweep_memo: their keys pin what they can hash (DB
+    # manifest, TU content) and rely on the run's read-only-target-
+    # tree contract for the rest (DB row data, #include closure), so
+    # correctness is RUN-scoped — a process-lifetime cache would serve
+    # stale results after an between-runs tree edit. The sweep
+    # functions fall back to module-level instances only for direct
+    # callers/tests.
+    codeql_memo: "BoundedMemo" = field(
+        default_factory=_default_codeql_memo, repr=False,
+    )
+    hypothesis_source_memo: "BoundedMemo" = field(
+        default_factory=_default_hypothesis_source_memo, repr=False,
+    )
+    tu_cache: "BoundedMemo" = field(
+        default_factory=_default_tu_cache, repr=False,
+    )
+    include_dirs_memo: "BoundedMemo" = field(
+        default_factory=_default_tu_cache, repr=False,
+    )
+    # Run-scoped joern channel health gate: consecutive dispatch
+    # failures trip it, dispatch sites then skip joern steps instead
+    # of dialing a dead/restarting server for the rest of the run.
+    # See core.audit.joern_health for the trip semantics.
+    joern_health: JoernChannelHealth = field(
+        default_factory=JoernChannelHealth, repr=False,
+    )
+    # Tool-chain early exit: once a chain step yields a receipt the
+    # dispatching site would accept as promotion-grade (G2's
+    # is_tool_evidence class, non-detection-role, unblocked by the
+    # site's premise/synth gates), the remaining subprocess-tier steps
+    # of that chain are skipped. Trade-off, both directions: exiting
+    # early saves minutes of semgrep/spatch/codeql/compiler subprocess
+    # time per confirmed hypothesis; running the full chain collects
+    # corroborating receipts that evidence fusion and the calibrated
+    # merge may weight (a single qualifying receipt already satisfies
+    # every verdict gate — extra receipts strengthen prose and prompt
+    # context only). In-process channels always run: their refuted/
+    # confirmed receipts feed the refutation floors and merge fence.
+    tool_chain_early_exit: bool = True
+    # Derived at run start (never set by callers): the consistency
+    # prepass's return census ({callee: CalleeCensus}) and the source
+    # texts it was built over, threaded to the in-chain consistency
+    # channel so each hypothesis dispatch reuses the standing census
+    # instead of re-walking the tree. The channel keeps its own
+    # bounded rebuild as fallback when prep produced none.
+    consistency_census: dict[str, Any] | None = None
+    consistency_source_texts: dict[str, str] | None = None
+    # Reuse-guard facts frozen when the census is stashed: the
+    # coverage-key snapshot (immune to later growth of any live
+    # text dict) and cache-reload provenance (a reloaded census may
+    # lack the Joern supplement a fresh build would get).
+    consistency_census_keys: frozenset[str] | None = None
+    consistency_census_cached: bool = False
+    # The prepass's harvested wur contract witnesses (source texts +
+    # target headers). Must travel with the census: the chain-side
+    # harvest only sees source_texts, and header-declared contracts
+    # would otherwise downgrade registry-grade receipts to
+    # majority-only.
+    consistency_wur_functions: frozenset[str] | None = None
 
 
 @dataclass
@@ -764,6 +1257,13 @@ class ReviewOutcome:
     # ``reused_from_run`` names the ORIGINAL producing run.
     reused: bool = False
     reused_from_run: str = ""
+    # True while a cadence-tick promotion (mid-loop, journal-visible)
+    # awaits the post-loop finalization that confirms it (mark
+    # cleared) or retracts it (the demotion paths replace the object,
+    # dropping the mark with it). Rides into the journal row and the
+    # findings exports so an interrupted run's report can say
+    # "provisional at time of writing".
+    provisional: bool = False
     verification_tier: str = "speculative"
     tools_dispatched: set | None = field(default=None, repr=False)
     # Chain step types that errored or timed out while verifying THIS
@@ -771,15 +1271,34 @@ class ReviewOutcome:
     # gate-resolution pass must not count it as class coverage (a
     # Joern query timeout is a failure, not a refutation).
     tools_errored: set | None = field(default=None, repr=False)
+    # Chain step types that did NOT look for this function: the
+    # tool-chain early exit after a promotion-grade receipt, the
+    # joern health/coverage gates, codeql database-membership misses,
+    # definitional (unqueryable-name) skips, and substrate skips
+    # (target language outside the tier's model). Distinct from
+    # errored (the channel was healthy) and excluded from
+    # tools_dispatched (the channel did not look — coverage and
+    # critique must not read the skip as a silent tool or as a bug).
+    tools_skipped: set | None = field(default=None, repr=False)
     semantic_confidence: str = ""
     provenance_all_trusted: bool = False
     caller_attributed: bool = False
     attributed_caller: str = ""
     _propagated: bool = field(default=False, repr=False)
+    # Transient bookkeeping: this outcome was already offered to an
+    # incremental-promotion cadence tick. Identity-keyed on the
+    # object (never an index) because chain re-reviews REMOVE list
+    # entries mid-loop — an index window rescans shifted items
+    # (duplicate non-memoized tool dispatch) or skips fresh ones.
+    _incr_ticked: bool = field(default=False, repr=False, compare=False)
+    weaknesses: list[dict[str, Any]] | None = None
 
     _CONFIRMED_EVIDENCE = frozenset({
         "dark_verify:confirmed", "dynamic:crash", "frida:runtime",
         "validate:observed_runtime", "validate:replayed_crash",
+        # Differential family execution: sandboxed member runs
+        # compared under an explicit contract — executed evidence.
+        "differential:confirmed", "differential:relation-violation",
     })
 
     def compute_tier(self) -> str:
@@ -850,6 +1369,20 @@ class TierCounters:
     inconclusive: int = 0
     skipped: int = 0
     errors: int = 0
+    # Substrate skips (sub-count of ``skipped``): dispatches withheld
+    # because the tier's substrate provably cannot model the target
+    # (e.g. coccinelle on a PHP file). The per-language tally feeds
+    # the report's honesty block, so a run against an unmodeled
+    # language is diagnosable at a glance.
+    skipped_substrate: int = 0
+    substrate_skip_languages: dict[str, int] = field(default_factory=dict)
+    # Items the tier examined and declined WITHOUT dispatching (claim
+    # outside its trigger taxonomy). Distinct from ``skipped`` (wanted
+    # to look, could not): a tier whose every eligible item lands here
+    # is engaged-but-not-matching, which must be diagnosable against
+    # a tier that never saw an eligible item at all — three binary
+    # audits shipped indistinguishable all-zero disasm_xcheck stanzas.
+    no_trigger: int = 0
     wall_time_s: float = 0.0
     cpg_build_s: float = 0.0
 
@@ -890,8 +1423,25 @@ def _make_tier_counters() -> dict[str, TierCounters]:
         "joern_flow": TierCounters(),
         "coccinelle_flow": TierCounters(),
         "joern_dominance": TierCounters(),
+        # Cross-function Joern verify leg (cross_function_verify).
+        "joern_xf": TierCounters(),
         "ptr_lifecycle": TierCounters(),
         "lock_region": TierCounters(),
+        # RE-context chain sweeps (Ghidra xref/type enrichment).
+        "integer_truncation": TierCounters(),
+        "proto_length": TierCounters(),
+        "struct_field": TierCounters(),
+        # Sanitizer-witness chain channel.
+        "sanwit": TierCounters(),
+        # PHP gadget-chain oracle channel (confirmed / skipped /
+        # errors / inconclusive, plus the defensive refuted booking
+        # that is unreachable by module contract).
+        "gadget_oracle": TierCounters(),
+        # Binary-only gate; registered unconditionally like every
+        # tier — the diagnostics renderer suppresses all-zero tiers
+        # (format_tier_diagnostics), so source-only runs never print
+        # a dead disasm stanza.
+        "disasm_xcheck": TierCounters(),
     }
 
 
@@ -934,6 +1484,10 @@ class OrchestratorResult:
     llm_spend_usd: float = 0.0
     total_duration_s: float = 0.0
     terminated_by: str = "complete"
+    # Human-readable cause when terminated_by == "environment" (the
+    # guard's conclude reason — resource pressure or a systemic
+    # dispatch fault). Empty otherwise.
+    environment_fault: str = ""
     prefilter_skipped: int = 0
     prefilter_hits: int = 0
     # Vendored/generated triage decisions (run-summary counters;
@@ -959,8 +1513,14 @@ class OrchestratorResult:
     # but the combined posterior crossed the promote threshold).
     aggregation_promoted: int = 0
     # Glance-suspicious outcomes escalated to a full individual review
-    # instead of committing the 500-token guess (capped per run).
+    # instead of committing the 500-token guess (capped per run; cap
+    # derived from checklist size in core.audit.executor).
     glance_escalated: int = 0
+    # Glance-suspicious outcomes that WOULD have escalated but hit the
+    # per-run cap — their glance verdict committed as final. Run-summary
+    # counter; per-function records live in suppressions.jsonl
+    # (verdict=glance_escalation_capped, dropped=false).
+    glance_escalation_capped: int = 0
     # Non-primary medium/high-confidence hypotheses that a mechanical
     # tool confirmed (secondary-hypothesis dispatch lane).
     secondary_confirmed: int = 0
@@ -973,6 +1533,10 @@ class OrchestratorResult:
     refinement_rounds: int = 0
     clean_checks: int = 0
     clean_check_rescues: int = 0
+    # Clean-check flow sweeps whose evidence reached the FIRST review
+    # prompt (pre-run) — those functions need no post-verdict rescue
+    # call.
+    clean_check_preruns: int = 0
     sarif_clean_resolved: int = 0
     outcomes: list[ReviewOutcome] = field(default_factory=list)
     # Structured prefilter/triage kill records (see
@@ -994,10 +1558,49 @@ class OrchestratorResult:
         default_factory=_make_tier_counters,
     )
     cost_tracker: PhaseCostLedger = field(default_factory=PhaseCostLedger)
+    # ``file:function`` keys the incremental-promotion cadence
+    # journaled as provisional findings; the finalization pass
+    # resolves each to confirmed or retracted at end of run.
+    provisional_promoted_keys: list[str] = field(default_factory=list)
+    # Pending per-model reliability events (``scorecard_events``
+    # producer shape) buffered at the run's graded adjudication
+    # points and flushed ONCE at end of run — one batched sidecar
+    # write, nothing on the per-function hot path. Plain
+    # ``list.append`` from parallel workers is atomic under the GIL.
+    scorecard_events: list[dict[str, Any]] = field(default_factory=list)
+    # Incremental scorecard-flush bookkeeping (see
+    # ``_flush_scorecard_events_now``): monotonic throttle mark,
+    # the cross-flush dedup set, and the single-flight guard that
+    # keeps concurrent flushes off that shared set while the sidecar
+    # write happens outside ``_lock``.
+    _scorecard_flushed_at: float = field(default=0.0, repr=False)
+    _scorecard_flush_seen: set[tuple[str, str, str, str, str]] = field(
+        default_factory=set,
+        repr=False,
+    )
+    _scorecard_flush_lock: _threading.Lock = field(
+        default_factory=_threading.Lock,
+        repr=False,
+    )
     _lock: _threading.Lock = field(
         default_factory=_threading.Lock,
         repr=False,
     )
+    # Incremental-promotion cadence state: a single-flight guard so
+    # overlapping critique boundaries from parallel workers never run
+    # two ticks at once (a busy tick's window folds into the next —
+    # per-outcome ``_incr_ticked`` markers key the window, so nothing
+    # is lost or rescanned when the list mutates between ticks).
+    _incremental_tick_lock: _threading.Lock = field(
+        default_factory=_threading.Lock,
+        repr=False,
+    )
+
+    def counter_lock(self) -> _threading.Lock:
+        """Public handle on the counter lock, for cross-module tallies
+        (verdict_reuse's sweep re-validation counters) — result
+        counters are mutated from parallel workers."""
+        return self._lock
 
 
 class _LockedOutcomes:
@@ -1055,6 +1658,33 @@ def _joern_target(config: OrchestratorConfig) -> Path:
     if not common:
         return config.target_path
 
+    # Dot-arm escape hatch: when some scope entry IS the common prefix,
+    # the narrowed root would BE that scope's leaf — and the gap
+    # selector's `sc + "."` arm still reviews sibling entries named
+    # `<leaf>.<anything>` (the dir ipc.d/, the file ipc.c), which sit
+    # OUTSIDE the narrowed root and so outside the graph entirely; the
+    # scope-complement walk never sees them and cannot keep them. Back
+    # off one level per dot-sibling-bearing leaf so the complement
+    # (which mirrors the arm) owns the decision. Costs one directory
+    # level of complement excludes, never a full-tree build, and only
+    # when a dot-sibling actually exists.
+    def _has_dot_sibling(leaf: Path) -> bool:
+        try:
+            entries = os.listdir(leaf.parent)
+        except OSError:
+            return True  # unreadable parent: fail toward the wider root
+        want = leaf.name + "."
+        return any(e.startswith(want) for e in entries)
+
+    while common:
+        if not any(parts == tuple(common) for parts in parts_list):
+            break
+        if not _has_dot_sibling(config.target_path / Path(*common)):
+            break
+        common.pop()
+    if not common:
+        return config.target_path
+
     candidate = config.target_path / Path(*common)
     if candidate.is_dir():
         return candidate
@@ -1071,6 +1701,28 @@ def _gap_sloc(gap: dict[str, Any]) -> int:
     """
     return gap.get("sloc") or max(
         0, (gap.get("line_end") or 0) - (gap.get("line_start") or 0),
+    )
+
+
+def _compose_joern_wall_s(cpg_timeout_s: int, query_timeout_s: int) -> int:
+    """Compose the Joern idle-stall / post-loop wall from BOTH halves.
+
+    The query half is the DERIVED pre-sweep maximum (import slope
+    included), not the bare query timeout: the pre-sweep re-queue loop
+    raises its window up to that ceiling, and the serverless path runs
+    importCpg + query under one wall — a single legitimate kernel-scale
+    window can sit silent (no progress callbacks) for the whole of it.
+    Composing from the bare value made the idle-stall detector cancel
+    exactly those windows. Too wide costs only a longer wait on a
+    genuinely wedged future (review dispatch continues regardless);
+    too narrow loses the whole taint tier — so the wall tracks the
+    widest window the sweep is allowed to run, and an operator
+    query-timeout override above the cap widens it further, never
+    narrower than cpg + query.
+    """
+    from core.tuning import derived_max_joern_presweep_timeout_s
+    return cpg_timeout_s + derived_max_joern_presweep_timeout_s(
+        query_timeout_s, include_import=True,
     )
 
 
@@ -1109,6 +1761,39 @@ def _await_joern_build(
     return joern_future
 
 
+def _discard_presweep_future(
+    future: "Future | None",
+    abort_event: "_threading.Event | None" = None,
+) -> None:
+    """Discard a server-start pre-sweep future nobody will consume.
+
+    The 1-worker executor starts the task at submit, so ``cancel()``
+    essentially never lands — the real interrupt is ``abort_event``,
+    polled by ``build_joern_evidence`` at its step boundaries, which
+    stops the build instead of paying a full pre-sweep (and, in
+    subprocess mode, a CPG build on a non-daemon worker that delays
+    interpreter exit) for a result nobody reads. A running future
+    additionally gets a callback so a failure is at least logged
+    instead of vanishing with the unobserved future.
+    """
+    if future is None:
+        return
+    if abort_event is not None:
+        abort_event.set()
+    if future.cancel():
+        return
+
+    def _log_result(fut: Future) -> None:
+        try:
+            fut.result(timeout=0)
+        except Exception:
+            logger.debug(
+                "discarded joern pre-sweep failed", exc_info=True,
+            )
+
+    future.add_done_callback(_log_result)
+
+
 def _get_dangerous_flows(approx) -> dict | None:
     """Extract dangerous_flows from a TaintApprox object or dict.
 
@@ -1136,7 +1821,11 @@ def _taint_approx_has_flow(approx) -> bool:
             approx.get("dangerous_flows") or approx.get("direct_flows")
         )
     return bool(
-        getattr(approx, "has_any_dangerous_flow", lambda: False)()
+        # CTaintApprox spells the probe has_any_dangerous — a wrong
+        # name in this getattr is masked whenever every dangerous
+        # position is also a direct one, so it must match the real
+        # method exactly.
+        getattr(approx, "has_any_dangerous", lambda: False)()
         or getattr(approx, "direct_flows", None)
     )
 
@@ -1149,12 +1838,53 @@ def get_reviewed_set(out_dir: Path) -> set:
 
     Error statuses are excluded — they represent transient failures
     (budget exceeded, API error, truncation) and must be retried on
-    the next run, not suppressed as "already reviewed".
+    the next run, not suppressed as "already reviewed". ``dark`` is
+    excluded too: it is the gate-resolution bucket ("tool-blind,
+    needs concrete verification"), resolved by the POST-loop dark
+    pass — an interrupt between the mid-loop flush and that pass
+    persists authority-bearing dark rows, and the resumed segment's
+    dark pass only walks its own outcomes, so a suppressed dark key
+    rested at "needs verification" forever. Dark functions re-enter
+    the queue instead (the hash-gated journal fold still supplies
+    their prior context at reuse cost).
+
+    Suppression requires row integrity: the log lives in the
+    target-writable run dir and record.py declares its rows telemetry,
+    yet this set silently drops functions from the workqueue — the
+    exact forged-clean-row lever the journal MAC closed, one file
+    over. A row joins the set only when its per-purpose HMAC token
+    verifies (``journal_mac.verify_audit_log_row`` — same key
+    mechanism as the journal's row MAC, audit-log domain, RUN-BOUND
+    to THIS directory's identity so a row replayed from a sibling
+    run's log never suppresses here). Unstamped (pre-MAC legacy or
+    forged), tampered, and cross-run-replayed rows all fail toward
+    NOT-suppressing: the function re-reviews, mirroring the journal
+    fold's unstamped tier, which grants no verdict authority either.
     """
+    from core.coverage import journal_mac
+
+    binding = journal_mac.audit_log_run_binding(out_dir)
     reviewed = set()
-    for entry in load_audit_log(out_dir):
+    unverified = 0
+    entries, disclosure = load_audit_log_disclosed(out_dir)
+    if not disclosure.complete:
+        # Partial trail (over-budget shard tail-read / row-cap /
+        # missing interior shard): rows beyond the loaded newest tail
+        # cannot suppress, so their functions re-enter the workqueue
+        # — over-review, the safe-but-paid direction. Loud so a
+        # resumed mega-run's operator knows why segment dedup shrank
+        # and that the audit-log rotate remedy restores it.
+        logger.warning(
+            "resume: audit log loaded incomplete (%s) — the "
+            "review-suppression set covers only the loaded rows; "
+            "functions whose review record was not loaded re-review",
+            disclosure.reason,
+        )
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
         if entry.get("action") in ("record", "orchestrator_review"):
-            if entry.get("status") == "error":
+            if entry.get("status") in ("error", "dark"):
                 continue
             if entry.get("edge_callee"):
                 # Edge-contract records review one outgoing EDGE, not
@@ -1162,11 +1892,23 @@ def get_reviewed_set(out_dir: Path) -> set:
                 # caller's own function review.
                 continue
             key = entry.get("key", "")
-            if key:
-                reviewed.add(key)
-                head, _, tail = key.rpartition(":")
-                if head and tail.isdigit():
-                    reviewed.add(head)
+            if not key:
+                continue
+            if not journal_mac.verify_audit_log_row(
+                entry, entry.get(journal_mac.TOKEN_KEY), binding,
+            ):
+                unverified += 1
+                continue
+            reviewed.add(key)
+            head, _, tail = key.rpartition(":")
+            if head and tail.isdigit():
+                reviewed.add(head)
+    if unverified:
+        logger.warning(
+            "resume: %d audit-log review row(s) without a verifying "
+            "integrity token — not suppressing those functions "
+            "(they re-review)", unverified,
+        )
     return reviewed
 
 
@@ -1345,6 +2087,23 @@ def run_orchestrator(
         if prep_cache is not None:
             prep_cache["_caches_cleared"] = True
 
+    # ── Environment preflight ──────────────────────────────────────
+    # Refuse the run start when TMPDIR (every dispatch stages files
+    # there) or the run output dir is already under the refuse floor
+    # — starting anyway guarantees a run where every dispatch fails
+    # identically. Runs BEFORE the claudecode probe warm-up below so
+    # "refuses before any LLM spend" holds literally (the probe is a
+    # paid call when its cache is cold).
+    from .environment import (
+        EnvironmentGuard,
+        effective_tmp_dir,
+        preflight_environment,
+    )
+    _env_dirs: list[Path] = [effective_tmp_dir()]
+    if config.out_dir:
+        _env_dirs.append(Path(config.out_dir))
+    preflight_environment(_env_dirs)
+
     # Warm the claudecode probe cache before any workers are derived
     # or dispatched — one tiny disk-cached call resolving the
     # backend's real model identity. Best-effort and non-fatal; the
@@ -1357,10 +2116,30 @@ def run_orchestrator(
     if config.max_seconds:
         config.run_deadline_monotonic = start_time + config.max_seconds
 
+    # ── Environment guard ──────────────────────────────────────────
+    # Keeps watching the preflighted filesystems from the executor
+    # tick. Constructed AFTER the deadline stamp: every pause/probe
+    # wait is clamped to the run deadline minus the drain margin, so
+    # a pause entered near the wall cap still concludes, drains, and
+    # reports inside the budget.
+    config.environment_guard_state = EnvironmentGuard(
+        tmp_dir=_env_dirs[0],
+        out_dir=Path(config.out_dir) if config.out_dir else None,
+        breaker_enabled=config.environment_breaker,
+        abort_check=is_shutdown_requested,
+        deadline_monotonic=config.run_deadline_monotonic,
+    )
+
     result = OrchestratorResult()
     _jt = _joern_tunables(overrides=config.joern_overrides)
     if _jt is not None:
-        joern_timeout_s = _jt.cpg_timeout_s + _jt.query_timeout_s
+        # Rationale for the composition lives on _compose_joern_wall_s
+        # — every joern_timeout_s producer MUST go through it, or one
+        # call site re-narrows the stall wall below a legitimate
+        # derived pre-sweep window.
+        joern_timeout_s = _compose_joern_wall_s(
+            _jt.cpg_timeout_s, _jt.query_timeout_s,
+        )
     else:
         joern_timeout_s = 600
 
@@ -1375,20 +2154,155 @@ def run_orchestrator(
         _joern_lifecycle = False
     else:
         _joern_path = _joern_target(config)
+        # The --scope complement: directories deliberately outside
+        # the audited scope are excluded from the CPG build (and key
+        # the cache slot), so a scoped audit no longer builds — and
+        # pays the wall/heap for — the full tree. Any normalisation
+        # anomaly degrades to () = today's full-tree build.
+        _joern_scope_excludes = _scope_complement_exclude_dirs(
+            _joern_path, config.scope, config.target_path,
+        )
+        if _jt is not None and getattr(_jt, "cpg_timeout_auto", False):
+            # A derived ("auto") CPG timeout resolves against the
+            # narrowed joern target here so the post-loop build wait
+            # (_await_joern_build) matches the wall the build itself
+            # runs under — the from_tuning fallback number can be
+            # smaller than the scope-derived wall on large targets.
+            from packages.joern.tunables import resolve_cpg_timeout_s
+            # Same composition rule: the refined (scope-derived) build
+            # wall re-composes through the helper so it never
+            # re-narrows the window half back to the bare query
+            # timeout.
+            joern_timeout_s = _compose_joern_wall_s(
+                resolve_cpg_timeout_s(
+                    _jt, _joern_path,
+                    exclude_dirs=_run_exclude_dirs(
+                        config.out_dir, _joern_path,
+                    ) + _joern_scope_excludes,
+                ),
+                _jt.query_timeout_s,
+            )
+        _joern_timings: dict[str, float] = {}
         joern_server = _start_joern_server_raw(
             _joern_path, config.joern_overrides, _jt,
+            # out_dir is the CPG status-record destination (and the
+            # IRIS store pin): without it every build/import outcome
+            # on the audit's own server-start path was recordless —
+            # the report could not name a lost channel the log
+            # shouted about.
+            out_dir=config.out_dir,
             # Keep an in-target run output dir out of the CPG content
             # key and graph — its artifacts change every segment, and
             # a flapping key re-buys a full CPG rebuild per resume.
             exclude_dirs=_run_exclude_dirs(
                 config.out_dir, _joern_path,
             ),
+            scope_exclude_dirs=_joern_scope_excludes,
+            timings_out=_joern_timings,
         )
+        # Cold-vs-warm start visibility: the CPG build/import wall time
+        # lands on the joern tier's diagnostics.
+        if _joern_timings.get("cpg_build_s"):
+            result.tier_counters["joern"].cpg_build_s = (
+                _joern_timings["cpg_build_s"]
+            )
         _joern_lifecycle = (
             joern_server is not None
-            and hasattr(joern_server, "_proc")
-            and joern_server._proc is None
+            and getattr(joern_server, "_lifecycle_token", None) is not None
         )
+
+    # Forced-exit reap for run-private servers only (lifecycle acquire
+    # failed — no state-file record, so no other session can reference
+    # them). Lifecycle-managed servers are released through the bounded
+    # joern_release registered just below; a stop_fast here would kill
+    # the process under another session's refcount.
+    _register_private_joern_reap_hook(
+        joern_server,
+        caller_owns=_caller_owns_joern,
+        lifecycle_shared=_joern_lifecycle,
+    )
+
+    # --- Joern release for every exit shape ---
+    # The graceful ``finally`` below is the normal release; the FORCED
+    # exits (watchdog expiry, second TERM) bypass it via os._exit and
+    # used to leak the forwarder+JVM pair, so the same release rides
+    # the flush-hook registry, time-bounded. Idempotent by lock: the
+    # hook and the ``finally`` may both fire (watchdog racing
+    # teardown) and the server must be released exactly once. Acts on
+    # the lifecycle handle THIS run holds (server object + its
+    # lifecycle token) — never on child-process assumptions, and never
+    # on the heap ledger (its rows self-evict on pid identity).
+    _joern_release_guard = _threading.Lock()
+
+    def _release_joern_for_exit() -> None:
+        if _caller_owns_joern:
+            return  # the embedder owns the server's lifetime
+        if not _joern_release_guard.acquire(blocking=False):
+            return  # already released (or being released) elsewhere
+        if _joern_lifecycle:
+            try:
+                from packages.joern.lifecycle import joern_release
+
+                joern_release(
+                    token=getattr(
+                        joern_server, "_lifecycle_token", None,
+                    ),
+                    srv=joern_server,
+                )
+            except Exception:
+                logger.debug(
+                    "joern lifecycle release failed", exc_info=True,
+                )
+        else:
+            _stop_joern_server(joern_server)
+
+    if joern_server is not None and not _caller_owns_joern:
+        _sigterm_flush_hooks.append(
+            lambda: _bounded_joern_exit_release(_release_joern_for_exit),
+        )
+
+    # --- Joern pre-sweep future: submitted at server start ---
+    # build_joern_evidence depends only on target/out_dir/server (its
+    # cache and interruption-status identity is CPG-content +
+    # sink-list keyed, never gap-keyed), but its future used to be
+    # submitted mid-prep gated on ``if gaps:`` — the whole prep
+    # duration was lost from the pre-sweep window and every
+    # early-dispatched gap landed in reviewed_before_joern (a paid
+    # re-review later). Prep consumes this future through the same
+    # ``if gaps:`` seam; an empty-gaps run discards it there.
+    joern_presweep_future: Future | None = None
+    joern_presweep_activity = [time.monotonic()]
+    joern_presweep_abort = _threading.Event()
+    if not config.target_path.is_file():
+        from .heartbeat import Heartbeat
+        _presweep_hb = Heartbeat(config.out_dir, "joern_presweep")
+
+        def _presweep_progress(msg: str) -> None:
+            joern_presweep_activity[0] = time.monotonic()
+            # Throttled + best-effort inside — progress visibility for
+            # a pre-sweep that can otherwise run hours writing nothing.
+            _presweep_hb.beat(detail=msg)
+            if on_progress:
+                on_progress(-1, 0, ReviewOutcome(
+                    file="", function="", status="clean", body=msg,
+                ))
+
+        _presweep_root = _joern_target(config)
+        _flows_unused, joern_presweep_future = _resolve_joern_evidence_raw(
+            _presweep_root,
+            joern_overrides=config.joern_overrides,
+            on_joern_progress=_presweep_progress,
+            joern_server=joern_server,
+            out_dir=config.out_dir,
+            abort_event=joern_presweep_abort,
+            # Scope-complement parity with the server's CPG: the
+            # sweep's cache identity and any fallback build must
+            # describe the same coverage the run analyses.
+            scope_exclude_dirs=_scope_complement_exclude_dirs(
+                _presweep_root, config.scope, config.target_path,
+            ),
+        )
+
     # Per-call LLM telemetry: one JSONL record per provider round-trip
     # (call class, duration, tokens, cache read/write counters,
     # timeout/retry disposition) in the run directory. Diagnostics
@@ -1414,35 +2328,42 @@ def run_orchestrator(
             joern_server=joern_server,
             joern_timeout_s=joern_timeout_s,
             prep_cache=prep_cache,
+            joern_presweep_future=joern_presweep_future,
+            joern_presweep_activity=joern_presweep_activity,
+            joern_presweep_abort=joern_presweep_abort,
         )
     finally:
-        # This run's flush hooks must not outlive it (a later run in
-        # the same process registers its own).
-        _sigterm_flush_hooks.clear()
-        if _telemetry_sink is not None:
-            try:
-                from core.llm.telemetry import set_sink
-                set_sink(None)
-                if _telemetry_sink.total_records:
-                    logger.info(_telemetry_sink.summary_line())
-            except Exception:
-                logger.debug(
-                    "llm telemetry summary failed", exc_info=True,
-                )
-        from core.analysis.reach_audit import set_joern_server
+        try:
+            if _telemetry_sink is not None:
+                try:
+                    from core.llm.telemetry import set_sink
+                    set_sink(None)
+                    if _telemetry_sink.total_records:
+                        logger.info(_telemetry_sink.summary_line())
+                except Exception:
+                    logger.debug(
+                        "llm telemetry summary failed", exc_info=True,
+                    )
+            from core.analysis.reach_audit import set_joern_server
 
-        set_joern_server(None)
-        if _caller_owns_joern:
-            pass
-        elif _joern_lifecycle:
-            try:
-                from packages.joern.lifecycle import joern_release
-
-                joern_release()
-            except Exception:
-                logger.debug("joern lifecycle release failed", exc_info=True)
-        else:
-            _stop_joern_server(joern_server)
+            set_joern_server(None)
+            if is_sigterm_requested():
+                # Salvage conclusion: joern_release can block on its
+                # cross-process file lock, and the ~30s grace budget
+                # belongs to the ledger/journal flush and the salvage
+                # export — bound the release and abandon it if it
+                # stalls, exactly like the forced-exit hook.
+                _bounded_joern_exit_release(_release_joern_for_exit)
+            else:
+                _release_joern_for_exit()
+        finally:
+            # Cleared AFTER the release (this run's hooks must not
+            # outlive it — a later run registers its own): clearing
+            # first re-opened the leak this closes, a watchdog firing
+            # during teardown found an empty registry and force-exited
+            # past the still-running release. The release guard makes
+            # the hook + finally double-fire benign.
+            _sigterm_flush_hooks.clear()
 
 
 # (target_path, library) → detected version or None. Manifest parsing
@@ -1472,6 +2393,109 @@ def _target_library_version(target_path, library: str) -> str | None:
     return _target_lib_version_memo[key]
 
 
+def _supersede_prior_outcome(
+    result: OrchestratorResult,
+    reviewed_outcomes: Any,
+    gap_key: str,
+) -> ReviewOutcome | None:
+    """Remove and un-tally the prior outcome for a chain re-review.
+
+    The tracked object can be STALE: a mid-loop promotion (cadence
+    tick / critique) replaces the outcomes-list slot with a NEW
+    object after ``reviewed_outcomes`` recorded this one. Removing
+    nothing while un-tallying the stale status skewed the verdict
+    counters negative and left the promoted object as an orphan
+    finding beside the re-review's fresh outcome — so on an identity
+    miss, the CURRENT object at the same site is superseded instead,
+    and its ACTUAL status is what gets un-tallied. Returns the
+    outcome actually removed (the chain-status-change observation
+    compares against it), or ``None`` when nothing was superseded
+    (another pass already removed the outcome — un-tallying then
+    would skew counters for an outcome no longer in the tally).
+    """
+    prior = reviewed_outcomes.get(gap_key)
+    if prior is None:
+        return None
+    removed = False
+    with result._lock:
+        try:
+            result.outcomes.remove(prior)
+            removed = True
+        except ValueError:
+            for j, cur in enumerate(result.outcomes):
+                if (
+                    cur.file == prior.file
+                    and cur.function == prior.function
+                    and (cur.line or 0) == (prior.line or 0)
+                ):
+                    prior = result.outcomes.pop(j)
+                    removed = True
+                    break
+    if not removed:
+        return None
+    _untally_outcome(result, prior)
+    return prior
+
+
+#: Line-scan bound for matching a stored finding-window hash inside a
+#: function span. Store-side hashes are windowed around the FINDING
+#: line, so matching tries one candidate line each; the full-file fold
+#: hash is hoisted and the span hashes batch over a single file read
+#: (core.sage.hooks.finding_source_hashes), so a full scan costs one
+#: file read + one short hash per line — low single-digit ms at this
+#: bound. Too low: FP primers for findings deep inside very long
+#: functions never match and the hint is lost (safe — the review just
+#: runs unprimed). Too high: a pathological generated-code "function"
+#: spans tens of thousands of lines and the per-review pre-pass grows
+#: past prompt-build cost for hints of marginal value that deep.
+_FP_RECALL_MAX_SCAN_LINES = 400
+
+
+def _match_fp_verdict_to_source(
+    rows: list[dict[str, Any]],
+    target_path: Path,
+    gap: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Recalled FP verdicts whose stored source window still matches
+    the current source; ``[]`` when none does.
+
+    The store side (/analyze) hashes the window around the FINDING
+    line plus the full file; the function-grade caller does not know
+    that line, so every candidate line of the function span is hashed
+    ONCE (batched, single file read) and each row's stored hash is
+    matched against the set. No match means the source drifted (or
+    the finding lay outside this span) — the fail direction is always
+    re-test, never stale reliance.
+    """
+    line_start = int(gap.get("line_start", 0) or 0)
+    if not rows or line_start <= 0:
+        return []
+    line_end = int(gap.get("line_end") or line_start)
+    line_end = min(line_end, line_start + _FP_RECALL_MAX_SCAN_LINES - 1)
+    try:
+        from core.sage.hooks import finding_source_hashes
+    except ImportError:
+        return []
+    from core.paths import confine
+
+    # Confined join: the gap's file field is LLM-writable, and an
+    # escaping path would hash arbitrary host files into the
+    # staleness match.
+    hash_path = confine(target_path, gap.get("file", ""))
+    if hash_path is None:
+        return []
+    try:
+        hashes = finding_source_hashes(hash_path, line_start, line_end)
+    except Exception:  # noqa: BLE001 — staleness probe must never break the review
+        return []
+    if not hashes:
+        return []
+    return [
+        row for row in rows
+        if row.get("source_hash") and row["source_hash"] in hashes
+    ]
+
+
 def review_one_function(
     gap: dict,
     shared,
@@ -1491,6 +2515,7 @@ def review_one_function(
     collector=None,
     graph=None,
     reviewed_outcomes=None,
+    batch_context: list[str] | None = None,
 ):
     """Review a single function gap and return the outcome.
 
@@ -1566,14 +2591,9 @@ def review_one_function(
     # ── Chain re-review: un-tally the prior outcome ──────────────────
     _prior_outcome = None
     if gap.get("force_review") and reviewed_outcomes:
-        _prior_outcome = reviewed_outcomes.get(gap_key)
-        if _prior_outcome is not None:
-            with result._lock:
-                try:
-                    result.outcomes.remove(_prior_outcome)
-                except ValueError:
-                    pass
-            _untally_outcome(result, _prior_outcome)
+        _prior_outcome = _supersede_prior_outcome(
+            result, reviewed_outcomes, gap_key,
+        )
 
     # ── Triage skip ───────────────────────────────────────────────────
     triage = triage_results.get(gap_key_lined) or triage_results.get(gap_key)
@@ -1595,11 +2615,30 @@ def review_one_function(
         # triage skips entirely. Loud: the operator asked for this
         # function by name; silently recording a classifier skip as
         # "clean" is how a pinned real finding got dropped.
-        logger.warning(
-            "--pin override: %s:%s was triage-SKIP (%s) — operator pin "
-            "forces LLM review",
-            gap["file"], gap["name"], ", ".join(triage.reasons),
+        # Attribution branches on the pin's ORIGIN (a --seed-rereview
+        # gap rides the same pinned mechanism but is not an operator
+        # pin), and file/name are escaped+bounded at site: the seed
+        # lane routes checklist-derived (target-controlled) names
+        # through this line, where operator pins were operator-typed.
+        from core.security.log_sanitisation import (
+            sanitise_for_terminal as _pin_st,
         )
+        if gap.get("seed_rereview"):
+            logger.warning(
+                "seed re-review override: %s:%s was triage-SKIP (%s) "
+                "— seed-scheduled re-review forces LLM review",
+                _pin_st(gap["file"], max_len=256),
+                _pin_st(gap["name"], max_len=256),
+                ", ".join(triage.reasons),
+            )
+        else:
+            logger.warning(
+                "--pin override: %s:%s was triage-SKIP (%s) — "
+                "operator pin forces LLM review",
+                _pin_st(gap["file"], max_len=256),
+                _pin_st(gap["name"], max_len=256),
+                ", ".join(triage.reasons),
+            )
         triage = None
     if triage and triage.bucket == TriageBucket.SKIP and not gap.get("force_review"):
         _increment_tier(result, "triage_skip", "confirmed")
@@ -1666,17 +2705,27 @@ def review_one_function(
 
     # ── Dead-code gate (G7): skip LLM for provably dead functions ────
     _dead_reason = _dead_code_reason(gap)
-    if not _dead_reason and config.binary_verdicts:
+    if not _dead_reason and (
+        config.binary_verdicts
+        or (
+            isinstance(config.inventory, dict)
+            and config.inventory.get("binary_oracle")
+        )
+    ):
         _fn_name = gap.get("name", "")
-        _bo_verdict = config.binary_verdicts.get(_fn_name, "")
         _is_header_inline = (
             gap["file"].endswith(".h")
             and "static" in gap.get("source", "")[:200]
         )
         if (
-            _bo_verdict == "absent"
-            and gap_key not in entry_points
+            gap_key not in entry_points
             and not _is_header_inline
+            # File+line join preferred over the flat name-keyed map —
+            # see _binary_absent_verdict.
+            and _binary_absent_verdict(
+                config, gap.get("file", ""), _fn_name,
+                gap.get("line_start", 0) or 0,
+            )
         ):
             _dead_reason = "binary_oracle_absent (not present in compiled binary)"
     if _dead_reason:
@@ -1742,15 +2791,20 @@ def review_one_function(
     with contextlib.suppress(OSError):
         from core.sage.hooks import compute_finding_source_hash
 
+        from core.paths import confine as _confine
+
         line_start = gap.get("line_start", 0)
-        if line_start:
+        # Confined join: the gap's file field is LLM-writable; an
+        # escaping path would hash host files into the recall key.
+        _hash_path = _confine(config.target_path, gap["file"])
+        if line_start and _hash_path is not None:
             # Whole-function span: the gap carries the function bounds,
             # so hash line_start..line_end rather than a ±10 window —
             # a change anywhere in the function invalidates the prior
             # verdict (compute_finding_source_hash also folds in the
             # full file content).
             src_hash = compute_finding_source_hash(
-                config.target_path / gap["file"],
+                _hash_path,
                 line_start,
                 line_end=gap.get("line_end") or None,
             )
@@ -1776,6 +2830,24 @@ def review_one_function(
                 source_hash=gap["_sage_source_hash"],
             )
         except Exception:  # noqa: BLE001
+            prior = None
+        if (
+            prior
+            and prior.get("status") in ("clean", "dormant")
+            and _validate_confirmed_gap(evidence_index, gap_key)
+        ):
+            # Never-skip-validate-confirmed floor — the same rung the
+            # prefilter skip lane and the triage classifier enforce. A
+            # /validate run CONFIRMED a defect here; a stored clean
+            # verdict whose source hash still matches is exactly what
+            # a pre-validate recall looks like, and this was the one
+            # mechanical-clean lane that could override runtime-
+            # confirmed evidence. Fall through to a real review.
+            logger.info(
+                "SAGE recall skip overridden for %s — /validate-"
+                "confirmed defect forces a full review",
+                gap_key,
+            )
             prior = None
         if prior and prior.get("status") in ("clean", "dormant"):
             prior_status = prior["status"]
@@ -1814,6 +2886,48 @@ def review_one_function(
                 on_progress(review_idx, total, outcome)
             return outcome
 
+    # ── SAGE: prior finding-verdict FP primers (hint tier) ───────────
+    # Cross-run memory of /analyze adjudications: a prior
+    # false_positive / not_exploitable verdict for a scanner finding
+    # located in this function, whose stored source window still
+    # matches current source, is injected into the review context as
+    # a PRIMER — the same shape as prior finding-grade claims. The
+    # review always runs and the verdict is the reviewer's own: a
+    # finding-scoped adjudication (one rule at one site) says nothing
+    # about bug classes it never examined, so it must never skip or
+    # pre-decide a function-grade review (the sibling hypothesis-recall
+    # gate above deliberately refuses to skip on prior FINDING-grade
+    # verdicts for the same reason). not_exploitable renders as a
+    # dormant-leaning hint — it records a REAL defect judged
+    # unexploitable, never a clean. Same gates as the hypothesis
+    # recall (config.sage_recall, force, force_review); the
+    # RAPTOR_SAGE_FP_SUPPRESS kill switch and MAC/TTL screens live in
+    # the hook. Cost note: this is a second SAGE query per reviewed
+    # function on top of the hypothesis recall (~2x recall traffic);
+    # both degrade to no-ops without a SAGE client.
+    _sage_fp_priors: list[dict[str, Any]] = []
+    if (
+        getattr(config, "sage_recall", True)
+        and not config.force
+        and not gap.get("force_review")
+    ):
+        try:
+            from core.sage.hooks import recall_prior_fp_verdicts
+
+            _fp_rows = recall_prior_fp_verdicts(
+                repo_path=str(config.target_path),
+                file_path=gap["file"],
+                function=gap["name"],
+            )
+        except Exception:  # noqa: BLE001
+            _fp_rows = []
+        for _hit in _match_fp_verdict_to_source(
+            _fp_rows, config.target_path, gap,
+        ):
+            _sage_fp_priors.append({
+                "verdict": str(_hit.get("verdict") or ""),
+                "rule": str(_hit.get("rule") or ""),
+            })
     # ── Build context ─────────────────────────────────────────────────
     ctx = _build_context(
         config,
@@ -1824,6 +2938,52 @@ def review_one_function(
         discovered_evidence=discovered_evidence,
         blind=config.blind_first_pass,
     )
+
+    _fp_priors_injected = bool(_sage_fp_priors) and not config.blind_first_pass
+    if _fp_priors_injected:
+        # Withheld in blind mode like the prior-claims section — the
+        # blind first pass sees no external adjudications by design.
+        ctx["sage_fp_priors"] = _sage_fp_priors
+
+    if _sage_fp_priors and config.out_dir:
+        # Hint-tier provenance trail, written AFTER the injection
+        # decision so the record states what actually happened:
+        # ``injected`` is False when the blind first pass withheld
+        # the primer. Nothing is ever dropped — the review runs.
+        try:
+            from core.analysis.reach_chokepoint import record_suppression
+
+            for _pr in _sage_fp_priors:
+                record_suppression(
+                    config.out_dir,
+                    finding={
+                        "finding_id": (
+                            f"audit-sage-fp:{gap['file']}:"
+                            f"{gap['name']}:{gap.get('line_start', 0)}"
+                        ),
+                        "rule_id": (
+                            _pr["rule"] or "audit:sage-fp-primer"
+                        ),
+                        "file_path": gap["file"],
+                        "line": gap.get("line_start", 0),
+                        "function": gap["name"],
+                    },
+                    verdict=f"sage_{_pr['verdict']}",
+                    reason=(
+                        "prior-verdict FP primer matched (source "
+                        "unchanged) — hint tier, review always runs"
+                    ),
+                    dropped=False,
+                    extra={
+                        "stage": "audit-review-primer",
+                        "injected": _fp_priors_injected,
+                    },
+                )
+        except Exception:  # noqa: BLE001 — provenance trail must never block the review
+            logger.debug(
+                "FP-primer suppression record failed for %s:%s",
+                gap["file"], gap["name"], exc_info=True,
+            )
 
     if triage:
         ctx["triage_bucket"] = triage.bucket.value
@@ -1848,6 +3008,11 @@ def review_one_function(
     if gap.get("consistency_leads"):
         ctx["consistency_leads"] = list(gap["consistency_leads"])
 
+    # Uniform-absence hint records (same pattern; the renderer frames
+    # them as review context that must never classify alone).
+    if gap.get("uniform_absence"):
+        ctx["uniform_absence"] = list(gap["uniform_absence"])
+
     # Fail-open census leads (same pattern): the renderer turns each
     # into a hypothesize-or-discharge obligation.
     if gap.get("fail_open_leads"):
@@ -1867,12 +3032,25 @@ def review_one_function(
     if gap_key_mech in feeds_security_keys:
         ctx["feeds_security_decision"] = True
 
-    if ctx.get("source") and gap.get("file", "").endswith(".py"):
+    # Gates D / E-4 are AST-based: ctx["source"] is the PROMPT
+    # rendering — every line carries a "{n:4d}  " number prefix
+    # (context._read_source) that ast.parse rejects, so feeding it
+    # made both gates silently return []. Hand them the raw span
+    # (the gap's own extracted source, else the disk read the
+    # structural checkers use).
+    _gate_raw_src = gap.get("source") or _read_raw_source(
+        config.target_path,
+        gap.get("file", ""),
+        gap.get("line_start", 0),
+        gap.get("line_end"),
+    )
+
+    if _gate_raw_src and gap.get("file", "").endswith(".py"):
         with contextlib.suppress(*_ENRICH_ERRORS):
             from .mechanical_gates import detect_constant_dangerous_calls
 
             const_calls = detect_constant_dangerous_calls(
-                ctx["source"],
+                _gate_raw_src,
                 gap["file"],
             )
             if const_calls:
@@ -1880,16 +3058,34 @@ def review_one_function(
 
     if ctx.get("callers"):
         with contextlib.suppress(*_ENRICH_ERRORS):
-            from .mechanical_gates import sort_callers_by_constraint
+            from .mechanical_gates import (
+                dedup_callers,
+                detect_universal_preconditions,
+                sort_callers_by_constraint,
+            )
 
-            ctx["callers"] = sort_callers_by_constraint(ctx["callers"])
+            # Gate E chain: dedup by call-site pattern, then sort by
+            # constraint. sort_callers_by_constraint is a no-op
+            # without the taint summaries (it reads
+            # preconditions/error_paths off them), so the summaries
+            # must be passed — the bare call was pure passthrough.
+            ctx["callers"] = sort_callers_by_constraint(
+                dedup_callers(ctx["callers"]),
+                taint_summary_results or None,
+            )
+            if taint_summary_results:
+                up = detect_universal_preconditions(
+                    ctx["callers"], taint_summary_results,
+                )
+                if up:
+                    ctx["universal_preconditions"] = up
 
-    if ctx.get("source"):
+    if _gate_raw_src:
         with contextlib.suppress(*_ENRICH_ERRORS):
             from .mechanical_gates import extract_type_constraints
 
             tc = extract_type_constraints(
-                ctx["source"],
+                _gate_raw_src,
                 gap.get("file", ""),
                 gap.get("name", ""),
             )
@@ -2032,23 +3228,13 @@ def review_one_function(
             or gap.get("priority_score", 0) >= 0.7
         )
         if is_high_value and gap_with_source.get("source"):
-            try:
-                from .spec_inference import infer_spec_with_llm_sync
-
-                llm_spec = infer_spec_with_llm_sync(
-                    gap_with_source,
-                    mechanical_spec=ctx.get("inferred_spec"),
-                    client=getattr(config, "llm_budget_client", None),
-                )
-                if llm_spec and llm_spec.intent:
-                    ctx["inferred_spec"] = llm_spec
-            except Exception:
-                logger.debug(
-                    "llm spec_inference failed for %s:%s",
-                    gap.get("file"),
-                    gap.get("name"),
-                    exc_info=True,
-                )
+            # Folded spec inference: the contract-inference task rides
+            # the main review call (a spec_infer prompt section plus
+            # the response's inferred_spec field) instead of a
+            # separate serial LLM round-trip per high-value function.
+            # Same qualification gate as the standalone call this
+            # replaces; the merge-back happens right after the review.
+            ctx["spec_infer_request"] = True
 
     if typestate_models and ctx.get("source"):
         try:
@@ -2060,6 +3246,17 @@ def review_one_function(
             )
             if ts_violations:
                 ctx["typestate_violations"] = ts_violations
+                # Mirror the negative_space recording above: the
+                # export layer grades the model's typestate_violation
+                # claim as corroborated only when the pipeline can
+                # attest typestate context was injected for this
+                # function.
+                _ts_key = f"{gap.get('file', '')}:{gap.get('name', '')}"
+                if _ts_key in evidence_index:
+                    with shared._evidence_lock:
+                        evidence_index[_ts_key].typestate_violations = (
+                            ts_violations
+                        )
         except Exception:
             logger.debug(
                 "typestate check failed for %s:%s",
@@ -2102,14 +3299,14 @@ def review_one_function(
         )
         if gap.get("file", "").endswith(".go"):
             _swr_gap = dict(_structural_gap)
-            with contextlib.suppress(OSError):
-                _fp = config.target_path / gap.get("file", "")
-                if _fp.is_file():
-                    # Whole-file source: the receiver struct decl and
-                    # method bodies live outside the function span.
-                    _swr_gap["file_source"] = _fp.read_text(
-                        errors="replace",
-                    )
+            # Whole-file source: the receiver struct decl and method
+            # bodies live outside the function span. Confined join —
+            # the gap's file field is LLM-writable.
+            _swr_source = _contained_source_text(
+                config.target_path, gap.get("file", ""),
+            )
+            if _swr_source is not None:
+                _swr_gap["file_source"] = _swr_source
             auth_mode_findings.extend(
                 check_shared_writer_race(
                     _swr_gap, target_path=config.target_path,
@@ -2196,6 +3393,8 @@ def review_one_function(
             gap["file"],
             gap["name"],
         )
+    if batch_context:
+        ctx["batch_context"] = batch_context
 
     if gap_key in widely_used_keys:
         ctx["widely_used"] = True
@@ -2388,6 +3587,53 @@ def review_one_function(
 
     _fuse_all_evidence(ctx)
 
+    # ── Clean-check pre-run ───────────────────────────────────────────
+    # For functions in the clean-check population (same gate as the
+    # post-verdict rescue, minus the verdict), run the rescue's
+    # mechanical flow sweep BEFORE the first review call and surface
+    # the flows in the first prompt — a clean verdict then needs no
+    # second full review call re-presenting the same evidence. Skipped
+    # when the Joern CPG is still building (the index can gain flows
+    # mid-review; the rescue keeps its current behaviour there) and in
+    # blind first passes (mechanical evidence is deliberately withheld
+    # from the first prompt).
+    cc_preran = False
+    if (
+        config.clean_check
+        and not config.blind_first_pass
+        and not gap.get("_joern_pending")
+    ):
+        try:
+            from .refinement import (
+                build_flow_preview_prompt,
+                clean_check_applicable,
+            )
+
+            _cc_bucket = triage.bucket.value if triage else "investigate"
+            if clean_check_applicable(
+                _cc_bucket,
+                gap_key in entry_points,
+                gap_key in sinks_set,
+                sloc=gap.get("sloc", 0),
+            ):
+                _cc_flows = _clean_check_flows(
+                    gap["file"], gap["name"], evidence_index,
+                )
+                cc_preran = True
+                if _cc_flows:
+                    ctx["flow_preview"] = build_flow_preview_prompt(
+                        _cc_flows,
+                    )
+                    with result._lock:
+                        result.clean_check_preruns += 1
+        except Exception:
+            logger.debug(
+                "clean-check pre-run failed for %s:%s",
+                gap.get("file"),
+                gap.get("name"),
+                exc_info=True,
+            )
+
     # ── LLM review ────────────────────────────────────────────────────
     review_start = time.monotonic()
     # Failed attempts are counted (failed_calls) but carry NO per-call
@@ -2445,7 +3691,7 @@ def review_one_function(
                 gap["name"],
                 exc,
             )
-            if _classify_error(exc) == "timeout" and not _check_budget(
+            if _classify_error(exc, config) == "timeout" and not _check_budget(
                 config, start_time, result,
             ):
                 # First timeout for this function: one immediate
@@ -2454,7 +3700,13 @@ def review_one_function(
                     gap, ctx, exc, review_fn, config,
                 )
             else:
-                outcome = _error_outcome(gap, exc)
+                # Terminal for this function — let the breaker
+                # correlate it with other functions' failures.
+                from .environment import note_dispatch_failure
+                note_dispatch_failure(
+                    config, f"{gap['file']}:{gap['name']}", exc,
+                )
+                outcome = _error_outcome(gap, exc, config)
 
     outcome.line = gap.get("line_start", 0)
     result.cost_tracker.record_call(
@@ -2466,6 +3718,43 @@ def review_one_function(
         cache_write_tokens=getattr(outcome, "cache_write_tokens", 0),
         wall_time_s=time.monotonic() - review_start,
     )
+
+    # ── Folded spec inference: merge the response's contract ─────────
+    # Continuation calls (clean-check, refinement) rebuild their
+    # prompts from ctx, so the merged spec reaches them exactly as the
+    # standalone spec call's output used to.
+    if ctx.get("spec_infer_request"):
+        _spec_payload = (outcome.review_result or {}).get("inferred_spec")
+        if _spec_payload:
+            try:
+                from .spec_inference import folded_spec_from_review
+
+                _folded_spec = folded_spec_from_review(
+                    _spec_payload,
+                    ctx.get("inferred_spec"),
+                    function_name=gap.get("name", ""),
+                    file_path=gap.get("file", ""),
+                    # Anchor-grounding corpus = ctx["source"], the
+                    # EXACT slice the review prompt rendered (fenced
+                    # at priority 0, never shed or truncated —
+                    # format_context_for_prompt). gap["source"] can
+                    # differ from it (pre-defence text, binary
+                    # decompilation), so it is only the fallback when
+                    # no prompt rendering exists.
+                    source=(
+                        ctx.get("source")
+                        or gap_with_source.get("source", "")
+                    ),
+                )
+                if _folded_spec is not None and _folded_spec.intent:
+                    ctx["inferred_spec"] = _folded_spec
+            except Exception:
+                logger.debug(
+                    "folded spec merge failed for %s:%s",
+                    gap.get("file"),
+                    gap.get("name"),
+                    exc_info=True,
+                )
 
     # ── Post-review: structural prefilter override ────────────────────
     if (
@@ -2595,7 +3884,14 @@ def review_one_function(
             if _should_cc(outcome, bucket_val, is_ep, is_sk, sloc=gap_sloc):
                 with result._lock:
                     result.clean_checks += 1
-                cc_flows = _run_clean_check_sweep(
+                # Consume the pre-run: when the sweep already ran at
+                # context time, its flows were in the first prompt (or
+                # it found none) — re-reading the index and firing a
+                # second full review call re-presents evidence the
+                # model just saw. The rescue only fires when the
+                # pre-run could not run (CPG pending at dispatch,
+                # blind first pass, sweep error).
+                cc_flows = None if cc_preran else _run_clean_check_sweep(
                     outcome,
                     config,
                     evidence_index,
@@ -2612,7 +3908,8 @@ def review_one_function(
                         # the journal, but the outcome-level booking
                         # already happened — without this the second
                         # call of every two-call review vanished from
-                        # the phase ledger ($8.93 on one measured run).
+                        # the phase ledger (a material under-report on
+                        # one measured run).
                         result.cost_tracker.record_call(
                             "clean_check",
                             cost_usd=revised.cost_usd,
@@ -2662,6 +3959,21 @@ def review_one_function(
                 result.sweep_validated += 1
             else:
                 result.sweep_demoted += 1
+        if pre_sweep_status == "finding" and outcome.status != "finding":
+            # Graded adjudication ONLY for the sweep's receipted
+            # refutation (Z3 UNSAT disproof; the reason is the body's
+            # bracketed prefix line). The hypothesis-less demotion is
+            # schema discipline — no tool ran, nothing was refuted —
+            # so it carries no grade; any future non-receipted sweep
+            # transition stays ungraded by the same allowlist.
+            _sweep_reason = (outcome.body or "").split("\n", 1)[0][:200]  # line-model: journal entry body (RAPTOR/LLM text)
+            if _sweep_reason.startswith("[smt-disproof:"):
+                _sc_record_refutation(
+                    result.scorecard_events, outcome,
+                    gate="sweep-validate",
+                    reason=_sweep_reason,
+                    models=config.models,
+                )
 
     # ── Proactive validation ──────────────────────────────────────────
     if outcome.status in ("finding", "suspicious") and not config.blind_first_pass:
@@ -2781,6 +4093,15 @@ def review_one_function(
         except ImportError:
             pass
 
+    # ── Screen-receipt restoration ────────────────────────────────────
+    # The pre-loop screen's confirming receipt reaches the model only
+    # as prompt context; the model's restatement of the tool lands
+    # (correctly) under llm-claimed:. Re-stamp the run's own receipt
+    # so the row's provenance is the tool run, not the restatement.
+    outcome = _restore_screen_receipt(
+        outcome, gap.get("_smt_pre_evidence", ""),
+    )
+
     # ── Provenance annotation ────────────────────────────────────────
     if provenance_map and gap_key_mech in provenance_map:
         prov_entries = provenance_map[gap_key_mech]
@@ -2869,6 +4190,7 @@ def review_one_function(
                 checklist=checklist,
                 config=config,
                 joern_server=joern_server,
+                tier_counters=result.tier_counters,
             )
             if rv is not None:
                 append_audit_log(config.out_dir, {
@@ -2891,6 +4213,18 @@ def review_one_function(
                     outcome, f"[{rv.gate}: {rv.reason}]",
                 )
                 outcome.status = rv.demote_to
+                # Graded adjudication ONLY for proof-grade refuters
+                # (mechanically true regardless of hypothesis
+                # interpretation). Heuristic-grade gates rest on
+                # keyword/partial-graph/unverified-claim refuters —
+                # their demotion is pipeline policy, not ground
+                # truth, and never grades the model.
+                if getattr(rv, "refuter_grade", "heuristic") == "proof":
+                    _sc_record_refutation(
+                        result.scorecard_events, outcome,
+                        gate=str(rv.gate), reason=str(rv.reason),
+                        models=config.models,
+                    )
         except Exception:
             logger.debug(
                 "refutation gate error for %s:%s",
@@ -2944,6 +4278,23 @@ def review_one_function(
                         )
                 elif dyn_result and dyn_result.evidence_strength == "refuted":
                     outcome = _demote_outcome(outcome, "[dynamic: refuted]")
+                    # Graded adjudication: the dynamic harness executed
+                    # and refuted the model's hypothesis. NOTE: the
+                    # dynamic_sweep evidence_strength vocabulary
+                    # (sanitizer/crash/exception/inconclusive) has no
+                    # "refuted" today, so this whole branch — the
+                    # demotion and this grade — is currently
+                    # unreachable. If the vocabulary ever grows a
+                    # refuted verdict, re-examine whether it is a
+                    # deterministic refutation (grades) or a
+                    # didn't-reproduce (must not — same distinction as
+                    # the dark-verify site).
+                    _sc_record_refutation(
+                        result.scorecard_events, outcome,
+                        gate="dynamic-sweep",
+                        reason="dynamic harness refuted the hypothesis",
+                        models=config.models,
+                    )
         except Exception:
             logger.debug(
                 "dynamic sweep failed for %s:%s",
@@ -2999,12 +4350,17 @@ def review_one_function(
             seen_keys = (reviewed_set or set()) | {
                 f"{g['file']}:{g['name']}" for g in (workqueue or [])
             }
+            # Writers mutate quarantined_rules under _rule_triage_lock;
+            # copy under the same lock or a concurrent quarantine can
+            # raise "set changed size during iteration" here.
+            with shared._rule_triage_lock:
+                quarantined_snapshot = set(shared.quarantined_rules)
             synth = synthesize_and_sweep(
                 outcome,
                 config,
                 seen_keys,
                 synthesis_count=result.synthesis_amplified,
-                quarantined_rules=set(shared.quarantined_rules),
+                quarantined_rules=quarantined_snapshot,
             )
             if synth and synth.cost_usd:
                 result.cost_tracker.record_call(
@@ -3013,8 +4369,8 @@ def review_one_function(
                 with result._lock:
                     result.total_cost_usd += synth.cost_usd
             if synth and synth.hits:
-                for hit in synth.hits:
-                    hit.setdefault("priority_score", 0.8)
+                for hit in synth.hits:  # type: ignore[assignment]
+                    hit.setdefault("priority_score", 0.8)  # type: ignore[attr-defined]
                     shared.synthesis_queue.append(hit)
                 with result._lock:
                     result.synthesis_amplified += len(synth.hits)
@@ -3147,7 +4503,12 @@ def review_one_function(
         sq = getattr(shared, "study_queue", None)
         if sq is not None:
             for rl_item in review_result["reading_list"]:
-                if isinstance(rl_item, dict) and rl_item.get("question"):
+                # A present-but-null / non-str question is not a
+                # study request; StudyRequest.__post_init__ heals the
+                # remaining leaves.
+                if (isinstance(rl_item, dict)
+                        and isinstance(rl_item.get("question"), str)
+                        and rl_item.get("question")):
                     sq.enqueue(StudyRequest(
                         question=rl_item["question"],
                         source_file=gap["file"],
@@ -3200,7 +4561,33 @@ def review_one_function(
         and review_idx > 0
         and review_idx % config.critique_interval == 0
     ):
-        _run_critique(result, config, sarif_cache, joern_server=joern_server)
+        _run_critique(
+            result, config, sarif_cache,
+            joern_server=joern_server,
+            reviewed_outcomes=reviewed_outcomes,
+        )
+        # Incremental promotion rides the same cadence: mechanical
+        # promotion resolution over the outcomes accumulated since the
+        # last tick, journaled provisionally (finalized post-loop).
+        # Same master switch as the post-loop pass; never allowed to
+        # break a review.
+        if (
+            getattr(config, "incremental_promotion", True)
+            and config.sweep_validate_findings
+        ):
+            try:
+                _incremental_promotion_tick(
+                    result, config,
+                    sarif_cache=sarif_cache,
+                    checklist=checklist,
+                    joern_server=joern_server,
+                    mechanical_findings=mechanical_findings,
+                    reviewed_outcomes=reviewed_outcomes,
+                )
+            except Exception:
+                logger.debug(
+                    "incremental promotion tick failed", exc_info=True,
+                )
 
     if on_progress:
         on_progress(review_idx, total, outcome)
@@ -3244,7 +4631,7 @@ def _binary_absent_gap_keys(
     absent_fn = None
     if inventory is not None:
         try:
-            from core.analysis.reachability import (
+            from core.analysis.reachability import (  # type: ignore[assignment]
                 binary_oracle_absent as absent_fn,
             )
         except ImportError:
@@ -3343,7 +4730,11 @@ def _vendored_triage_verdicts(
         return {}
     vendor_verdicts: dict[str, Any] = {}
     try:
-        from .vendored_detector import KIND_GENERATED, detect_vendored_files
+        from .vendored_detector import (
+            KIND_GENERATED,
+            SIGNAL_TOOLCHAIN,
+            detect_vendored_files,
+        )
 
         vendor_verdicts = detect_vendored_files(
             gaps, target_path=config.target_path, checklist=checklist,
@@ -3354,13 +4745,21 @@ def _vendored_triage_verdicts(
         )
         return {}
     if vendor_verdicts:
+        # Binary rows are keyed per function (binary:<stem>::<name>);
+        # counting them as "files" would be untrue at any scale.
+        _n_toolchain = sum(
+            1 for v in vendor_verdicts.values()
+            if getattr(v, "signal", "") == SIGNAL_TOOLCHAIN
+        )
+        _n_files = len(vendor_verdicts) - _n_toolchain
         _n_gen = sum(
             1 for v in vendor_verdicts.values() if v.kind == KIND_GENERATED
         )
         logger.info(
             "vendored/generated triage: %d files detected "
-            "(%d generated, %d vendored)",
-            len(vendor_verdicts), _n_gen, len(vendor_verdicts) - _n_gen,
+            "(%d generated, %d vendored) + %d binary toolchain "
+            "function(s)",
+            _n_files, _n_gen, _n_files - _n_gen, _n_toolchain,
         )
     return vendor_verdicts
 
@@ -3392,6 +4791,14 @@ def _record_vendored_suppressions(
     skipped = glanced = 0
     for gap in gaps:
         verdict = vendor_verdicts.get(gap["file"])
+        if verdict is None and gap["file"].startswith(BINARY_PATH_PREFIX):
+            # Binary rows ONLY: toolchain verdicts are keyed per
+            # function (same joiner as
+            # vendored_detector.toolchain_verdict_key) — the shared
+            # binary:<stem> file key never carries one. The prefix
+            # gate keeps a source gap from matching a FILE-keyed
+            # verdict whose path happens to end ``::<name>``.
+            verdict = vendor_verdicts.get(f"{gap['file']}::{gap['name']}")
         if verdict is None:
             continue
         key = f"{gap['file']}:{gap['name']}"
@@ -3466,10 +4873,15 @@ def _iris_prep_specs(
             iris_taint_specs = [_iris_candidate_to_spec(c) for c in iris_candidates]
             if iris_taint_specs and config.out_dir:
                 spec_path = config.out_dir / "iris-taint-specs.json"
-                spec_path.write_text(specs_to_json(iris_taint_specs))
+                # Atomic writes: predictable artifact names in the
+                # reused, sandbox-writable run dir — a bare
+                # write_text follows a planted symlink.
+                write_text_atomically(
+                    spec_path, specs_to_json(iris_taint_specs))
                 joern_cfg = compile_joern_config(iris_taint_specs)
                 if joern_cfg.strip():
-                    (config.out_dir / "iris-joern.scala").write_text(joern_cfg)
+                    write_text_atomically(
+                        config.out_dir / "iris-joern.scala", joern_cfg)
                 logger.info(
                     "IRIS: synthesised %d taint specs (%d sources, %d sinks, "
                     "%d sanitisers, %d propagators)",
@@ -3562,17 +4974,377 @@ def _sarif_clean_files_from_cache(
     return clean
 
 
-def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
+def _resolve_max_workers(config: OrchestratorConfig) -> int:
+    """Worker count for LLM fan-out: the operator's ``--max-workers``
+    when set, else derived from the primary model's rate limit."""
+    if config.max_workers:
+        return config.max_workers
+    from core.llm.concurrency import derive_max_workers
+
+    return derive_max_workers(config.models[0] if config.models else "default")
+
+
+class EmptyInventoryError(RuntimeError):
+    """The run's checklist holds ZERO reviewable items.
+
+    Raised by :func:`_compute_audit_prep` so ``run_orchestrator`` can
+    refuse at startup instead of running an empty review loop to a
+    clean "complete" conclusion — a silent no-op whose "0 findings"
+    summary is indistinguishable from a genuine clean bill of health.
+    Distinct from the missing-checklist ``None`` return (the file
+    exists but describes nothing) and from a genuinely-full-coverage
+    run (items exist, ``compute_gaps`` legitimately returns zero
+    gaps — that run still completes as before).
+    """
+
+
+def _reviewable_item_count(
+    checklist: dict[str, Any],
+    include_kinds: set | None = None,
+) -> int:
+    """Count the checklist items the review loop could dispatch.
+
+    Counted directly from ``files[].items`` (with the legacy
+    ``functions`` key fallback) rather than trusting the top-level
+    ``total_items`` field, which is builder-stamped and can be absent
+    or stale on inherited/edited checklists.
+
+    Kind-filtered through the review loop's own vocabulary
+    (:func:`core.audit.gaps._resolve_reviewable_kinds`, honouring the
+    run's ``--include-kinds``), so extraction-artifact kinds the loop
+    never dispatches under this configuration — ``declaration`` and
+    ``constant_macro`` by default — cannot make an inventory look
+    non-empty (a checklist of only those would still no-op silently).
+    A positive ``--include-kinds`` entry naming them counts them
+    again, exactly as the loop would then dispatch them.
+
+    Interstitial items consult the builder-persisted
+    ``script_handler`` stamp when present — a free dict read, so the
+    count matches what gap selection would dispatch (stamped-False
+    wiring no longer holds the count above zero). Stamp ABSENT
+    (pre-stamp checklist) keeps the deliberate over-count (fail-open
+    toward PROCEEDING, both directions documented): the per-item
+    content gate is a source read this cheap pre-check must not
+    replicate, and refusing a checklist whose interstitials WOULD
+    dispatch is the worse error. The residual under-refusal (yaml
+    workflow ``job:`` items, and unstamped content-rejected
+    interstitials, can still hold the count above zero) is accepted
+    and documented.
+    """
+    from core.inventory.script_handler import script_handler_stamp
+
+    from .gaps import (
+        _resolve_reviewable_kinds,
+        _script_interstitials_enabled,
+    )
+    kinds = _resolve_reviewable_kinds(include_kinds)
+    interstitials = _script_interstitials_enabled(include_kinds)
+    count = 0
+    for file_entry in checklist.get("files") or []:
+        if not isinstance(file_entry, dict):
+            continue
+        items = file_entry.get("items", file_entry.get("functions")) or []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            kind = item.get("kind", "")
+            if kind in kinds or (
+                kind == "interstitial" and interstitials
+                and script_handler_stamp(item) is not False
+            ):
+                count += 1
+    return count
+
+
+def _call_edges_need_bootstrap(context_map: dict[str, Any]) -> bool:
+    """True when the audit should build call edges in memory.
+
+    Two shapes qualify: the map was never enriched (``call_edges``
+    absent) OR the size-budget degradation shed the array (empty list
+    plus the ``call_edges_shed`` marker — exactly the very-large
+    targets where reachability needs the edges most). An empty list
+    WITHOUT the marker means the enricher ran and genuinely found no
+    edges — re-running would find none again. The bootstrap is
+    in-memory only: the on-disk map is not re-saved, so an over-budget
+    artifact is not re-inflated.
+    """
+    if "call_edges" not in context_map:
+        return True
+    return (context_map.get("call_edges") == []
+            and "call_edges_shed" in context_map)
+
+
+# Single-slot memo for the resolved store path: the precondition
+# gates call per outcome and resolution scans the project registry.
+# One (out_dir, target) pair is live per run; a stale slot only costs
+# a recompute.
+_GRAPH_STORE_MEMO: dict[tuple[str, str], Path | None] = {}
+
+
+def _graph_store_for_config(config) -> Path | None:
+    """The graph-store path this run's consumers query, or None when
+    resolution fails. Resolution rides ``graph_path_for_run`` (project
+    store when the run belongs to a project, run-local otherwise); a
+    missing store file is fine — every consumer treats it as
+    no-lane."""
+    key = (str(config.out_dir), str(config.target_path or ""))
+    if key in _GRAPH_STORE_MEMO:
+        return _GRAPH_STORE_MEMO[key]
+    try:
+        from core.understand_graph.store import graph_path_for_run
+
+        resolved = graph_path_for_run(
+            Path(config.out_dir),
+            str(config.target_path) if config.target_path else None,
+        )
+    except Exception:
+        logger.debug("graph store resolution failed", exc_info=True)
+        resolved = None
+    _GRAPH_STORE_MEMO.clear()  # single slot
+    _GRAPH_STORE_MEMO[key] = resolved
+    return resolved
+
+
+def _load_call_edges_from_store(
+    context_map: dict[str, Any],
+    config,
+    *,
+    bootstrap: Callable[[], Any] | None = None,
+) -> bool:
+    """Load the graph store's verified mechanical call-edge set into
+    the in-memory map (in-memory only — the on-disk map is not
+    re-saved, mirroring the checklist bootstrap).
+
+    The map's ``call_edges_store`` marker (written by the call-edge
+    enricher's project-mode routing, small enough to survive the
+    size-budget shed) names the snapshot; only
+    ``provenance='mechanical'`` rows whose run-bound token verifies
+    are loaded. A COMPLETE verified set replaces the map's list (the
+    in-artifact list is a capped prefix view of the same mechanical
+    set — note the full set is 10^5-10^6 edge dicts in memory at
+    very-large-target scale; whole-run consumer RSS is measured-first
+    scalability work, not this seam's) and lifts the truncation/shed
+    markers. An INCOMPLETE set (tampered/deleted rows) first runs
+    *bootstrap* (the caller's pre-existing checklist bootstrap) when
+    the map still needs one — so the hint-tier coverage today's
+    shed-map path derives is never LOST to a degraded lane — then
+    unions the verified rows in and keeps ``call_edges_truncated``:
+    negative reachability stays inconclusive. Returns True when the
+    store supplied edges; False (store absent, no marker, unverifiable
+    lane) leaves the map untouched and the caller falls through to
+    today's paths — the store-absent → inconclusive floor: absence
+    asserts nothing.
+    """
+    marker = context_map.get("call_edges_store")
+    if not isinstance(marker, dict):
+        return False
+    snapshot = marker.get("snapshot")
+    if not isinstance(snapshot, str) or not snapshot:
+        return False
+    graph_store = _graph_store_for_config(config)
+    if graph_store is None:
+        return False
+    try:
+        from core.understand_graph.queries import (
+            verified_mechanical_call_edges,
+        )
+
+        lane = verified_mechanical_call_edges(
+            graph_store, snapshot,
+            str(config.target_path) if config.target_path else None,
+        )
+    except Exception:
+        logger.debug("call-edge store lane unavailable", exc_info=True)
+        return False
+    if not lane or not lane.get("edges"):
+        return False
+    if lane.get("complete"):
+        context_map["call_edges"] = lane["edges"]
+        context_map.pop("call_edges_truncated", None)
+        context_map.pop("call_edges_shed", None)
+        logger.info(
+            "call edges: %d verified mechanical edge(s) loaded from the "
+            "project graph store (complete set)", len(lane["edges"]),
+        )
+    else:
+        if bootstrap is not None and _call_edges_need_bootstrap(context_map):
+            try:
+                bootstrap()
+            except Exception:
+                logger.debug(
+                    "call-edge bootstrap under incomplete store lane "
+                    "failed", exc_info=True,
+                )
+            # A ROUTED bootstrap ingests a NEW snapshot and writes
+            # its own fresh marker — restoring the old one over it
+            # would point every later consult at a superseded
+            # generation (the store answers None for non-latest
+            # snapshots), killing the replay on exactly the
+            # incomplete-lane path it serves. Only restore when the
+            # bootstrap wrote none (storeless bootstrap / no lane).
+            context_map.setdefault("call_edges_store", marker)
+        # Union, never replace: an incomplete verified subset may be
+        # smaller than the map's own hint-tier list, and negative
+        # reachability stays inconclusive under the truncation marker
+        # regardless — dropping hint edges would only cost the
+        # non-verdict consumers. Deduplicated: a repeated consult
+        # must not double the lane (at kernel scale a duplicate
+        # union retains ~2x the lean rows for the whole run).
+        existing = context_map.get("call_edges") or []
+        seen = {
+            (e.get("caller_file"), e.get("caller"),
+             e.get("callee"), e.get("callee_file"))
+            for e in existing if isinstance(e, dict)
+        }
+        merged = list(existing)
+        for e in lane["edges"]:
+            key = (e.get("caller_file"), e.get("caller"),
+                   e.get("callee"), e.get("callee_file"))
+            if key not in seen:
+                seen.add(key)
+                merged.append(e)
+        context_map["call_edges"] = merged
+        context_map["call_edges_truncated"] = True
+        logger.warning(
+            "call edges: only %d of %d minted mechanical edge row(s) "
+            "verified from the project graph store (%d failed "
+            "verification) — treating the set as truncated; negative "
+            "reachability stays inconclusive",
+            len(lane["edges"]), lane.get("total", 0),
+            lane.get("unverified", 0),
+        )
+    return True
+
+
+def _reusable_prepass_census(config, source_texts, *,
+                             joern_server=None):
+    """The prepass census, iff valid for *source_texts* — else None.
+
+    Validity is three-fold; None = the battery rebuilds, exactly as
+    before the reuse existed.
+
+    COVERAGE: the census only stands in for a fresh build when it was
+    built over a superset of the battery's text set (compared against
+    the coverage-key snapshot frozen at build time — never against a
+    live dict that may have grown since). An under-covering census
+    under-counts sites per callee and skews the majority statistics
+    toward false deviations; a superset census only ADDS sites
+    (richer majorities, same direction).
+
+    COMPLETENESS: a census whose build hit its site cap / deadline
+    carries partial per-callee counts — its majorities must not
+    replace the battery's own build.
+
+    PROVENANCE: with a live Joern server, a prep-cache-reloaded
+    census may lack the cross-file supplement a fresh build would
+    get; the battery's build (which WOULD be supplemented) wins.
+    """
+    prep_census = getattr(config, "consistency_census", None)
+    prep_keys = getattr(config, "consistency_census_keys", None)
+    if not prep_census or prep_keys is None:
+        return None
+    if not prep_keys >= set(source_texts):
+        return None
+    if any(getattr(c, "truncated", False)
+           for c in prep_census.values()):
+        return None
+    if joern_server is not None and getattr(
+            config, "consistency_census_cached", False):
+        return None
+    return prep_census
+
+
+def _prep_call_edges(context_map: dict[str, Any], config,
+                     checklist: dict[str, Any] | None) -> None:
+    """The prep seam's call-edge flow, in one testable unit.
+
+    Order matters and is behavior: (1) store lane first — an existing
+    marker's complete verified set replaces any capped list before a
+    bootstrap is even considered; (2) the checklist bootstrap (either
+    the store-lane callback or the storeless fallback) ROUTES to the
+    graph store — the audit's in-memory bootstrap was the one
+    producer that never ingested, so an audit-built map carried the
+    capped 26% of a kernel graph forever; (3) consult LAST, after
+    whichever bootstrap ran — a bootstrap that just ingested leaves
+    the fresh marker beside a still-capped in-memory list, and a
+    consult placed only inside the first block never fired on exactly
+    the fresh-map kernel scenario this seam exists for. The complete
+    verified lane replaces the capped list and lifts the truncation
+    markers for every in-audit consumer; an incomplete lane unions
+    (deduplicated) and keeps truncation semantics.
+    """
+    if _call_edges_need_bootstrap(context_map) or context_map.get(
+        "call_edges_truncated"
+    ):
+        from core.orchestration.context_map_callgraph import (
+            enrich_with_call_edges as _enrich_call_edges,
+        )
+
+        _cg_store = _graph_store_for_config(config)
+
+        def _routed_bootstrap() -> int:
+            return _enrich_call_edges(
+                context_map, checklist=checklist,
+                graph_store=_cg_store, run_dir=config.out_dir,
+                target_path=str(config.target_path or ""),
+            )
+
+        _load_call_edges_from_store(
+            context_map, config, bootstrap=_routed_bootstrap,
+        )
+    if _call_edges_need_bootstrap(context_map):
+        from core.orchestration.context_map_callgraph import (
+            enrich_with_call_edges,
+        )
+
+        edge_count = enrich_with_call_edges(
+            context_map,
+            checklist=checklist,
+            graph_store=_graph_store_for_config(config),
+            run_dir=config.out_dir,
+            target_path=str(config.target_path or ""),
+        )
+        if edge_count:
+            logger.debug(
+                "bootstrapped %d call edges from checklist", edge_count)
+    if context_map.get("call_edges_store") and context_map.get(
+        "call_edges_truncated"
+    ):
+        _load_call_edges_from_store(context_map, config)
+
+
+def _compute_audit_prep(config, *, joern_server=None, on_progress=None,
+                        presweep_future=None, presweep_activity=None,
+                        presweep_abort=None, cost_ledger=None):
     """Compute all mode-independent prep for the audit loop.
 
     Returns a dict of prep results, or None if checklist is missing.
     In ensemble mode, this is called once and the result shared across
     both passes — all computation here is mode-independent.
+
+    ``presweep_future`` / ``presweep_activity``: the Joern pre-sweep
+    future run_orchestrator submitted at server start (and the
+    last-activity stamp its progress callback updates). When present
+    they replace the historical mid-prep submission; an empty-gaps run
+    discards the future. Direct callers without them keep the mid-prep
+    submission path.
+
+    ``cost_ledger``: the run's PhaseCostLedger. Sub-pass boundaries
+    are marked with sequential ``start_phase`` calls (single-slot:
+    each marker closes the previous phase) so cost-breakdown.json
+    attributes prep wall time per pass. Prep runs serially on this
+    thread — the marker discipline the ledger requires.
     """
+    def _phase(name: str) -> None:
+        if cost_ledger is not None:
+            cost_ledger.start_phase(name)
+
     checklist = load_checklist(config.out_dir)
     if not checklist:
         logger.error("no checklist.json in %s", config.out_dir)
         return None
+
+    _phase("prep_macro_recovery")
 
     # Binary targets: the checklist speaks address space and the
     # target is a compiled artifact — source-tree pre-passes (macro
@@ -3623,20 +5395,47 @@ def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
         except Exception:
             logger.debug("macro-function recovery failed", exc_info=True)
 
+    # Empty-inventory refusal. Checked AFTER macro recovery (it can
+    # only ADD items, so a generator-macro-only file set it rescues
+    # still proceeds). Zero items means every downstream stage is
+    # vacuous: compute_gaps returns zero gaps for the wrong reason
+    # (nothing to review, not everything reviewed) and the run would
+    # conclude "complete, 0 findings" — a silent no-op. Genuinely-full
+    # coverage is the OTHER zero-gaps case (items > 0, all covered)
+    # and is untouched by this guard.
+    _item_count = _reviewable_item_count(
+        checklist, getattr(config, "include_kinds", None),
+    )
+    if _item_count == 0:
+        _cl_path = config.out_dir / "checklist.json"
+        _raw_count = sum(
+            sum(1 for it in (fe.get("items", fe.get("functions")) or [])
+                if isinstance(it, dict))
+            for fe in checklist.get("files") or []
+            if isinstance(fe, dict)
+        )
+        raise EmptyInventoryError(
+            f"empty inventory: {_cl_path} holds {_item_count} reviewable "
+            f"items ({_raw_count} raw items, none dispatchable under "
+            f"this run's --include-kinds; recorded target_path: "
+            f"{checklist.get('target_path') or '<none recorded>'}) — "
+            "refusing to run a review loop that would complete as a "
+            "silent no-op. Likely causes: wrong target kind (e.g. a "
+            "binary or generated tree inventoried as source), a binary "
+            "target with no RE database attached, or a stale checklist "
+            "inherited from a different target. Rebuild with: "
+            "libexec/raptor-build-checklist <target> <out_dir>, or "
+            "re-run against the intended target."
+        )
+
+    _phase("prep_context_map")
     context_map = load_context_map(config.out_dir)
     if context_map is None:
         context_map = _try_understand_bridge(config)
     if context_map is None:
         context_map = {}
-    if "call_edges" not in context_map and not binary_mode:
-        from core.orchestration.context_map_callgraph import enrich_with_call_edges
-
-        edge_count = enrich_with_call_edges(
-            context_map,
-            checklist=checklist,
-        )
-        if edge_count:
-            logger.debug("bootstrapped %d call edges from checklist", edge_count)
+    if not binary_mode:
+        _prep_call_edges(context_map, config, checklist)
     if not context_map.get("crypto_inventory"):
         # Bare-audit fallback (A9): without a prior /understand map the
         # crypto API packs never fed the audit — per-function contexts
@@ -3662,6 +5461,7 @@ def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
             logger.debug(
                 "crypto inventory bootstrap failed", exc_info=True,
             )
+    _phase("prep_artifact_import")
     flow_traces = load_flow_traces(config.out_dir)
 
     variant_targets = _load_variants(config.out_dir)
@@ -3711,6 +5511,45 @@ def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
         except Exception:
             logger.debug("baseline pre-scan failed", exc_info=True)
 
+    if getattr(config, "codeql_db_future", None) is not None:
+        # Run-start provisioning kicked off a background database
+        # build; join it here — the last moment before the first
+        # CodeQL consumer — so the build overlapped everything above.
+        # The join polls the shutdown rails and clamps to the run
+        # deadline: SIGTERM salvage and a supervisor bound must never
+        # sit behind a blocking multi-minute wait.
+        from .codeql_provision import (
+            await_provisioned_dbs,
+            stamp_run_config_dbs,
+        )
+
+        def _abort_wait() -> bool:
+            if is_sigterm_requested():
+                return True
+            _g = getattr(config, "environment_guard_state", None)
+            return _g is not None and _g.concluded
+
+        _built_dbs = await_provisioned_dbs(
+            config.codeql_db_future, out_dir=config.out_dir,
+            deadline_monotonic=getattr(
+                config, "run_deadline_monotonic", None,
+            ),
+            should_abort=_abort_wait,
+        )
+        config.codeql_db_future = None
+        if _built_dbs:
+            from .codeql_dbs import CodeqlDbRouter
+            config.codeql_db_router = CodeqlDbRouter(
+                list(config.codeql_db_paths or []) + _built_dbs,
+            )
+            config.codeql_db_paths = config.codeql_db_router.paths or None
+            config.codeql_db_path = config.codeql_db_router.primary
+            if config.out_dir:
+                # A resumed segment reads the run config — it must
+                # see databases the background build delivered after
+                # the config was first persisted.
+                stamp_run_config_dbs(config.out_dir, _built_dbs)
+
     if config.codeql_db_paths and not sarif_cache:
         # One suite per database; run_suite writes per-language SARIF
         # (codeql_<language>.sarif), so multi-database runs don't
@@ -3727,6 +5566,7 @@ def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
             len(sarif_clean_files) + len(sarif_cache._by_file),
         )
 
+    _phase("prep_taint_passes")
     taint_approx_results = _load_or_build_taint_approx_raw(
         config.target_path, config.out_dir,
         scope=config.scope,
@@ -3747,6 +5587,7 @@ def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
 
         _populate_sinks_array(context_map, sink_results)
 
+    _phase("prep_evidence_index")
     joern_future: Future | None = None
     joern_flows: dict[str, list] | None = None
 
@@ -3866,6 +5707,7 @@ def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
     except Exception:
         logger.debug("binary layer0 pre-sweep failed", exc_info=True)
 
+    _phase("prep_capability_probe")
     from .capabilities import probe_capabilities
     from .degradation import assess_degradation, format_degradation_report
 
@@ -3986,6 +5828,7 @@ def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
     except Exception:
         logger.debug("typestate model extraction failed", exc_info=True)
 
+    _phase("prep_gap_compute")
     coverage_records = _load_coverage_records(config.out_dir)
     # Per-function fuzz coverage: this run's own artifact, else the
     # newest sibling /fuzz run in the same project (the producer
@@ -4049,6 +5892,23 @@ def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
         )
     except Exception:
         logger.debug("inventory-diff materialisation failed", exc_info=True)
+    # ``--seed-rereview`` resolution pass: resolve this run's seed
+    # files against the FULL checklist inventory so compute_gaps can
+    # un-suppress covered functions the seeds name (fresh review;
+    # reuse import refused). Flag-gated and best-effort — with the
+    # flag off compute_gaps sees None and behaves byte-identically.
+    _seed_rereview_keys: set | None = None
+    if getattr(config, "seed_rereview", False):
+        try:
+            from .hypothesis_intake import rereview_candidate_keys
+            _seed_rereview_keys = rereview_candidate_keys(
+                checklist, config.out_dir,
+                getattr(config, "hypothesis_seed_paths", None),
+            )
+        except Exception:  # noqa: BLE001 — enrichment, never a gate
+            logger.warning(
+                "--seed-rereview resolution skipped", exc_info=True,
+            )
     gaps = compute_gaps(
         checklist,
         [] if config.force else coverage_records,
@@ -4063,30 +5923,49 @@ def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
         current_model=_primary_model,
         own_run_reuse=_same_run_reuse,
         reuse_stats=reuse_blocked_stats,
+        seed_rereview_keys=_seed_rereview_keys,
     )
 
-    _joern_last_activity = [time.monotonic()]
+    _joern_last_activity = (
+        presweep_activity if presweep_activity is not None
+        else [time.monotonic()]
+    )
 
     if gaps:
+        if presweep_future is not None:
+            # Submitted at server start (run_orchestrator) — the
+            # pre-sweep has been running for the whole prep duration
+            # already; just adopt it.
+            joern_future = presweep_future
+        else:
 
-        def _joern_progress_cb(msg: str) -> None:
-            _joern_last_activity[0] = time.monotonic()
-            if on_progress:
-                placeholder = ReviewOutcome(
-                    file="",
-                    function="",
-                    status="clean",
-                    body=msg,
-                )
-                on_progress(-1, 0, placeholder)
+            def _joern_progress_cb(msg: str) -> None:
+                _joern_last_activity[0] = time.monotonic()
+                if on_progress:
+                    placeholder = ReviewOutcome(
+                        file="",
+                        function="",
+                        status="clean",
+                        body=msg,
+                    )
+                    on_progress(-1, 0, placeholder)
 
-        joern_flows, joern_future = _resolve_joern_evidence_raw(
-            _joern_target(config),
-            joern_overrides=config.joern_overrides,
-            on_joern_progress=_joern_progress_cb,
-            joern_server=joern_server,
-            out_dir=config.out_dir,
-        )
+            _sweep_root = _joern_target(config)
+            joern_flows, joern_future = _resolve_joern_evidence_raw(
+                _sweep_root,
+                joern_overrides=config.joern_overrides,
+                on_joern_progress=_joern_progress_cb,
+                joern_server=joern_server,
+                deadline_monotonic=getattr(
+                    config, "run_deadline_monotonic", None,
+                ),
+                out_dir=config.out_dir,
+                # Scope-complement parity with the server's CPG (see
+                # the run_orchestrator submission).
+                scope_exclude_dirs=_scope_complement_exclude_dirs(
+                    _sweep_root, config.scope, config.target_path,
+                ),
+            )
 
         if joern_flows is not None:
             evidence_index = _merge_joern_flows(
@@ -4101,7 +5980,13 @@ def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
                     joern_flows,
                     taint_summary_results,
                 )
+    elif presweep_future is not None:
+        # Empty-gaps run: nothing will consume the server-start
+        # pre-sweep — discard it (historical behaviour submitted
+        # nothing here at all).
+        _discard_presweep_future(presweep_future, abort_event=presweep_abort)
 
+    _phase("prep_iris_specs")
     iris_taint_specs, project_sinks = _iris_prep_specs(
         config, gaps, taint_summary_results,
     )
@@ -4111,6 +5996,7 @@ def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
         if ann_dir is not None:
             gaps = _merge_stale(gaps, ann_dir, config.target_path)
 
+    _phase("prep_edge_pass")
     _edge_pass_summary: dict[str, Any] = {}
     if config.edges:
         # Cross-function edge obligations (--edges): scope the tiered
@@ -4126,6 +6012,7 @@ def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
                 config, checklist, context_map,
                 commit_fn=_commit_outcome,
                 on_progress=on_progress,
+                max_workers=_resolve_max_workers(config),
             )
             _edge_pass_summary = edge_summary
             logger.info(
@@ -4150,6 +6037,7 @@ def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
                 "function-only audit", exc_info=True,
             )
 
+    _phase("prep_gap_scoring")
     prior_constraints = load_constraints(config.out_dir)
     open_keys = (
         {f"{c.file}:{c.function}" for c in open_constraints(prior_constraints)}
@@ -4200,6 +6088,16 @@ def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
     except Exception:
         logger.debug("binary-absent gap key scan failed", exc_info=True)
 
+    # Tree-class demotion map (path-only — the vendored verdicts are
+    # built after scoring; path/filename signals carry the demotion).
+    # Weighting only, never a skip; None restores pre-tag scoring.
+    tree_classes: dict[str, str] | None = None
+    try:
+        from .tree_class import tree_class_map
+        tree_classes = tree_class_map(g["file"] for g in gaps)
+    except Exception:
+        logger.debug("tree-class map failed", exc_info=True)
+
     gaps = score_functions(
         gaps,
         context_map=context_map,
@@ -4216,6 +6114,7 @@ def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
         validate_confirmed_keys=validate_confirmed_keys,
         validate_ruled_out_keys=validate_ruled_out_keys,
         binary_absent_keys=binary_absent_keys or None,
+        tree_classes=tree_classes,
     )
 
     # Fix-history mining: the target's past security fixes become
@@ -4278,6 +6177,79 @@ def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
     # between segments. Dispatches through the run's budget-governed
     # client (the _run_llm_client doctrine) so spend lands on the
     # --max-cost ledger.
+
+    # Graph store: boost gap-queue items connected to prior findings/hypotheses.
+    # Bumps priority_score AFTER the sort that fixed the budget cut,
+    # so membership in the cut is unchanged — the bump steers review
+    # ORDER (workqueue topological tiebreak, subsystem grouping,
+    # schedule=priority) and crosses the folded spec-inference gate
+    # (priority_score >= 0.7). Deliberately NOT re-sorted: a
+    # post-boost re-sort would let graph/seed signals displace
+    # unboosted gaps out of the cut (see the both-directions
+    # rationale at SEED_PRIORITY_BOOST — the shared magnitude for
+    # this site and the file-seed intake below; change both or
+    # neither).
+    try:
+        from core.understand_graph import graph_path_for_run, hypothesis_seeds
+
+        from .hypothesis_intake import SEED_PRIORITY_BOOST as _seed_boost
+        _gp = graph_path_for_run(config.out_dir, str(config.target_path or ""))
+        if _gp.exists():
+            # Target-scoped: an unscoped call answers with whatever
+            # codebase was ingested most recently.
+            seeds = hypothesis_seeds(_gp, str(config.target_path or "") or None)
+            if seeds:
+                _seed_keys = {(s["file"], s["function"]) for s in seeds}
+                _boosted = 0
+                for gap in gaps:
+                    if (gap.get("file", ""), gap.get("name", "")) in _seed_keys:
+                        gap["priority_score"] = (
+                            gap.get("priority_score", 0) + _seed_boost
+                        )
+                        _boosted += 1
+                if _boosted:
+                    logger.info("graph store: boosted %d/%d gaps from %d hypothesis seeds",
+                                _boosted, len(gaps), len(seeds))
+    # Broad except: the graph boost is best-effort by design (sibling
+    # graph-enrichment sites use the same spelling). Opening the store
+    # mkdirs the graph dir and reads artifact-shaped rows, so the
+    # failure surface spans OSError, sqlite errors, shape errors, and
+    # bind overflows — any of them must degrade to this warning lane
+    # instead of crashing prep for an optional signal.
+    except Exception as _gexc:
+        logger.warning("graph hypothesis_seeds skipped: %s", _gexc)
+        logger.debug("graph hypothesis_seeds skipped", exc_info=True)
+
+    # File-based hypothesis-seed intake (sibling-hypotheses.json +
+    # --hypothesis-seeds): the second consumer of the same boost
+    # semantics as the graph seeds above — matched gaps get one
+    # bounded priority_score bump (SEED_PRIORITY_BOOST, the shared
+    # constant) and the seed claims are stamped for the hint-tier
+    # review context block. Like the graph sibling, the bump lands
+    # after the budget-cut sort: it steers review ORDER and the
+    # spec-inference gate, never cut membership (both-directions
+    # rationale at the constant). ONE consented exception, and it is
+    # not the boost: under --seed-rereview the SCHEDULED RE-REVIEW
+    # lane rides the pin hoist below, and on a bounded run those
+    # pinned re-reviews claim budget slots first — never-reviewed
+    # gaps can be displaced into not-attempted.json (flag-gated,
+    # operator-consented, bounded by MAX_SEED_RECORDS). Placed with
+    # its sibling: after the mechanical re-sorts, before
+    # rank_gaps/hoist_pins/budget. Best-effort by design — a hostile
+    # or malformed seed file must cost only its own records, never
+    # prep.
+    try:
+        from .hypothesis_intake import apply_hypothesis_seeds
+        apply_hypothesis_seeds(
+            gaps, config.out_dir,
+            getattr(config, "hypothesis_seed_paths", None),
+            rereview=getattr(config, "seed_rereview", False),
+            checklist=checklist,
+        )
+    except Exception as _sexc:  # noqa: BLE001 — enrichment, never a gate
+        logger.warning("hypothesis-seed intake skipped: %s", _sexc)
+        logger.debug("hypothesis-seed intake skipped", exc_info=True)
+
     if getattr(config, "rank_gaps", False):
         try:
             import zlib
@@ -4297,8 +6269,16 @@ def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
     # Operator pins (``--pin file:function``): guaranteed review slots,
     # hoisted ahead of the budget cut. See gaps.hoist_pins. The
     # checklist classifies any unmatched pin's cause in the warning.
+    # ``--seed-rereview`` gaps ride the SAME mechanism: their keys
+    # join the pin list (gaps.merge_rereview_pins), so a seed-forced
+    # re-review gets the identical guarantees a --pin does (hoist
+    # ahead of the --budget cut, ``pinned`` triage-skip override)
+    # without a second scheduling path. Flag off → no gap carries the
+    # marker → the pin list is exactly the operator's.
     gaps = hoist_pins(
-        gaps, getattr(config, "pins", None), checklist=checklist,
+        gaps,
+        merge_rereview_pins(getattr(config, "pins", None), gaps),
+        checklist=checklist,
     )
 
     if config.budget and config.budget > 0:
@@ -4312,21 +6292,33 @@ def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
             scope_floor=getattr(config, "scope_floor", True),
         )
 
+    _phase("prep_context_sets")
     entry_points = extract_context_map_set(context_map, "entry_points")
+
+    # ── Shared prep source-text map ──────────────────────────────────
+    # Five prep channels each built their own {file: text} dict over
+    # the same gap files (one retained run-long as
+    # config.consistency_source_texts) — several redundant in-memory
+    # copies of every gap file. One shared read-through map instead,
+    # topped up on demand as the gap list evolves between phases.
+    _prep_source_texts: dict[str, str] = {}
+
+    def _gap_source_texts() -> dict[str, str]:
+        for _gsrc_gap in gaps:
+            _gsrc_fp = _gsrc_gap.get("file", "")
+            if _gsrc_fp and _gsrc_fp not in _prep_source_texts:
+                _gsrc_text = _contained_source_text(
+                    config.target_path, _gsrc_fp,
+                )
+                if _gsrc_text is not None:
+                    _prep_source_texts[_gsrc_fp] = _gsrc_text
+        return _prep_source_texts
 
     _ops_eps: set = set()
     try:
         from .ops_struct import collect_ops_entry_points
 
-        _ops_srcs: dict[str, str] = {}
-        for gap in gaps:
-            fp = gap.get("file", "")
-            if fp and fp not in _ops_srcs:
-                with contextlib.suppress(OSError):
-                    sp = config.target_path / fp
-                    if sp.is_file():
-                        _ops_srcs[fp] = sp.read_text(errors="replace")
-        _ops_eps = collect_ops_entry_points(_ops_srcs)
+        _ops_eps = collect_ops_entry_points(_gap_source_texts())
         if _ops_eps:
             entry_points = entry_points | _ops_eps
             logger.info(
@@ -4414,6 +6406,7 @@ def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
             )
     except Exception:
         logger.debug("dispatch-table extraction failed", exc_info=True)
+    _phase("prep_triage")
     triage_results = classify_all(
         gaps,
         entry_points=frozenset(entry_points),
@@ -4445,9 +6438,18 @@ def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
         logger.debug("triage suppression records failed", exc_info=True)
     # MANDATORY audit trail: every vendored/generated skip/glance
     # decision leaves one suppressions.jsonl record — nothing is
-    # silently dropped. Counts surface in the run summary.
+    # silently dropped. Counts surface in the run summary. Binary
+    # toolchain verdicts are per-FUNCTION keys — counted apart so
+    # "files" stays true.
+    from core.audit.vendored_detector import SIGNAL_TOOLCHAIN as _SIG_TC
+    _n_tc = sum(
+        1 for v in vendor_verdicts.values()
+        if getattr(v, "signal", "") == _SIG_TC
+    )
     vendored_triage_counts = {
-        "files": len(vendor_verdicts), "skipped": 0, "glanced": 0,
+        "files": len(vendor_verdicts) - _n_tc,
+        "toolchain_functions": _n_tc,
+        "skipped": 0, "glanced": 0,
     }
     try:
         _n_vskip, _n_vglance = _record_vendored_suppressions(
@@ -4464,6 +6466,7 @@ def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
     except Exception:
         logger.debug("vendored suppression records failed", exc_info=True)
 
+    _phase("prep_peer_groups")
     from .negative_space import (
         check_sibling_negative_space,
         discover_conventions,
@@ -4558,15 +6561,94 @@ def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
             exc_info=True,
         )
 
-    peer_groups = resolve_peer_groups(
-        gap_func_dicts,
-        joern_server=joern_server,
-        binary_edge_index=prep_binary_edge_index,
-        dispatch_tables=prep_dispatch_tables or None,
-        domain_model=prep_domain_model,
-        type_ref_index=prep_type_ref_index,
-        checklist=checklist,
-    )
+    # L10: route models — a co-located route-models.json from a prior
+    # run wins, else built from the checklist's per-file registration
+    # facts (Python targets only populate them; everything else →
+    # None → the layer stays empty, equivalence pinned).
+    prep_route_models = None
+    try:
+        from core.analysis.peer_groups import route_models_for_prep
+
+        prep_route_models = route_models_for_prep(
+            checklist,
+            config.inventory,
+            out_dir=config.out_dir,
+        )
+    except Exception:
+        logger.debug(
+            "route-model build for peer groups failed", exc_info=True,
+        )
+
+    # L7: interface-slot census — ops-struct slot families from the
+    # gap source texts (the extractor the reachability exemption
+    # already trusts) plus subclass-override sets from checklist
+    # metadata. No family → None → the layer stays empty
+    # (equivalence pin).
+    prep_interface_slots = None
+    try:
+        from core.analysis.interface_slots import (
+            interface_slot_families,
+        )
+
+        prep_interface_slots = interface_slot_families(
+            _gap_source_texts(), checklist,
+        )
+    except Exception:
+        logger.debug(
+            "interface-slot census for peer groups failed",
+            exc_info=True,
+        )
+
+    # L8: enum-switch cohorts from the enum census (C/C++ sources).
+    # Nothing joins → None → the layer stays empty (equivalence pin).
+    prep_enum_cohorts = None
+    try:
+        from .enum_switch import enum_switch_cohorts
+
+        prep_enum_cohorts = enum_switch_cohorts(_gap_source_texts())
+    except Exception:
+        logger.debug(
+            "enum-switch cohorts for peer groups failed",
+            exc_info=True,
+        )
+
+    # L9: standing clone-family index — cached in the run directory
+    # keyed on source fingerprint + index version, so re-runs and
+    # resumes reload instead of re-winnowing. No family → None →
+    # the layer stays empty (equivalence pin).
+    prep_clone_index = None
+    try:
+        from core.analysis.clone_index import load_or_build_clone_index
+
+        prep_clone_index = load_or_build_clone_index(
+            _gap_source_texts(), out_dir=config.out_dir,
+        )
+    except Exception:
+        logger.debug(
+            "clone index build for peer groups failed", exc_info=True,
+        )
+
+    # Fail-soft like the sibling prep blocks above: the resolver
+    # consumes producer-controlled inputs (checklist metadata is
+    # LLM-enrichable), and peer groups are an enrichment layer — one
+    # malformed input must cost the layer, never the prep phase.
+    try:
+        peer_groups = resolve_peer_groups(
+            gap_func_dicts,
+            joern_server=joern_server,
+            binary_edge_index=prep_binary_edge_index,
+            dispatch_tables=prep_dispatch_tables or None,
+            domain_model=prep_domain_model,
+            type_ref_index=prep_type_ref_index,
+            checklist=checklist,
+            route_models=prep_route_models,
+            interface_slots=prep_interface_slots,
+            enum_cohorts=prep_enum_cohorts,
+            clone_index=prep_clone_index,
+        )
+    except Exception:
+        peer_groups = []
+        logger.debug("peer-group resolution failed", exc_info=True)
 
     sibling_ns_findings = (
         check_sibling_negative_space(
@@ -4648,6 +6730,67 @@ def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
     except Exception:
         logger.debug("semantic consistency check failed", exc_info=True)
 
+    # Standing consistency pre-pass (§2.3/§2.4): usage-enum census +
+    # return-census.json, LLM-free verdicts on census deviants,
+    # flag/mode + cleanup comparators, capped checklist leads, and the
+    # acknowledged-discard → fail_open handoff hypotheses. Runs
+    # BEFORE the mechanical-detector battery so the battery's
+    # callsite-consistency detector can reuse the census it builds
+    # (one census per prep). Its lead/handoff seeding stays AFTER the
+    # battery: seeding grows the gap set, and the battery reviews the
+    # pre-seed set by design.
+    _phase("prep_consistency_prepass")
+    consistency_prepass: dict[str, Any] = {}
+    try:
+        from .consistency_prepass import run_consistency_prepass
+
+        prepass_texts = _gap_source_texts()
+        if prepass_texts:
+            consistency_prepass = run_consistency_prepass(
+                prepass_texts,
+                target_path=config.target_path,
+                out_dir=config.out_dir,
+                annotations_dir=getattr(config, "annotations_dir", None),
+                inventory=getattr(config, "inventory", None),
+                context_map=context_map,
+                domain_model=prep_domain_model,
+                joern_server=joern_server,
+                # Interface-implementor parity consumes the
+                # resolver's mechanical layers (L2 dispatch-site, L4
+                # type-cohort) — groups already built above.
+                peer_groups=peer_groups,
+            )
+            # Thread the standing census (and the texts it was built
+            # over — census_verdict needs them for exhibits, snippets
+            # and the wur harvest) to the battery's reuse seam and
+            # the in-chain consistency dispatch. An empty census
+            # (build failed / budget) stays None so the channel's
+            # bounded rebuild fallback applies.
+            config.consistency_census = (
+                consistency_prepass.get("census") or None
+            )
+            if config.consistency_census is not None:
+                config.consistency_source_texts = prepass_texts
+                # Reuse-guard facts, frozen at build time: the
+                # coverage-key snapshot must not track later growth
+                # of any live dict, and cache-reload provenance
+                # gates reuse when a live Joern server would have
+                # supplemented a fresh build.
+                config.consistency_census_keys = frozenset(
+                    prepass_texts,
+                )
+                config.consistency_census_cached = bool(
+                    consistency_prepass.get("census_cached", False),
+                )
+                _prep_wur = consistency_prepass.get("wur_functions")
+                if _prep_wur:
+                    config.consistency_wur_functions = frozenset(
+                        _prep_wur,
+                    )
+    except Exception:
+        logger.debug("consistency prepass failed", exc_info=True)
+
+    _phase("prep_mechanical_detectors")
     mechanical_findings: dict[str, list[dict[str, Any]]] = {}
     guard_clean_keys: set[str] = set()
     try:
@@ -4702,43 +6845,19 @@ def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
     except Exception:
         logger.debug("perlasm asm-check routing failed", exc_info=True)
 
-    # Standing consistency pre-pass (§2.3/§2.4): usage-enum census +
-    # return-census.json, LLM-free verdicts on census deviants,
-    # flag/mode + cleanup comparators, capped checklist leads, and the
-    # acknowledged-discard → fail_open handoff hypotheses.
-    consistency_prepass: dict[str, Any] = {}
+    # Consistency-prepass result routing + gap seeding. The prepass
+    # itself ran BEFORE the battery (census reuse); everything that
+    # grows or annotates the gap set — and the mechanical-record
+    # routing, which needs the battery's mechanical_findings dict —
+    # lands here, exactly where it always did.
+    _phase("prep_consistency_seeding")
     try:
         from .consistency_prepass import (
-            run_consistency_prepass,
             seed_consistency_leads,
             seed_fail_open_handoffs,
         )
 
-        prepass_texts: dict[str, str] = {}
-        for gap in gaps:
-            fp = gap.get("file", "")
-            if fp and fp not in prepass_texts:
-                with contextlib.suppress(OSError):
-                    src_path = config.target_path / fp
-                    if src_path.is_file():
-                        prepass_texts[fp] = src_path.read_text(
-                            errors="replace",
-                        )
-        if prepass_texts:
-            consistency_prepass = run_consistency_prepass(
-                prepass_texts,
-                target_path=config.target_path,
-                out_dir=config.out_dir,
-                annotations_dir=getattr(config, "annotations_dir", None),
-                inventory=getattr(config, "inventory", None),
-                context_map=context_map,
-                domain_model=prep_domain_model,
-                joern_server=joern_server,
-                # Interface-implementor parity consumes the
-                # resolver's mechanical layers (L2 dispatch-site, L4
-                # type-cohort) — groups already built above.
-                peer_groups=peer_groups,
-            )
+        if consistency_prepass:
             for mf in consistency_prepass.get("mechanical", []):
                 key = f"{mf['file']}:{mf['function']}"
                 mechanical_findings.setdefault(key, []).append(mf)
@@ -4754,6 +6873,24 @@ def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
                     "fail-open handoff hypotheses injected",
                     n_leads, n_handoffs,
                 )
+            # Uniformly-weak family records (hint tier — review
+            # context on the member gaps, no priority movement).
+            try:
+                from .uniform_absence import seed_uniform_absence
+
+                n_ua = seed_uniform_absence(
+                    gaps,
+                    consistency_prepass.get("uniform_absence", []),
+                )
+                if n_ua:
+                    logger.info(
+                        "uniform-absence: %d hint record(s) attached "
+                        "to member gaps", n_ua,
+                    )
+            except Exception:
+                logger.debug(
+                    "uniform-absence seeding failed", exc_info=True,
+                )
             if config.out_dir:
                 with contextlib.suppress(OSError, ValueError):
                     append_audit_log(config.out_dir, {
@@ -4761,7 +6898,28 @@ def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
                         **(consistency_prepass.get("telemetry") or {}),
                     })
     except Exception:
-        logger.debug("consistency prepass failed", exc_info=True)
+        logger.debug("consistency prepass seeding failed",
+                     exc_info=True)
+
+    # Context-map sink seeding: the map phase records sink details
+    # whose reachability prose can state a finding in all but name
+    # (a redirect sink noting client-controllable headers reaching
+    # the redirect base). Convert them into hint-tier injected
+    # hypotheses on the matching gaps — hypotheses are cheap and
+    # verdicts stay with the tools, so the map's own signal can no
+    # longer die unread in context-map.json when its function is
+    # never otherwise prioritised.
+    try:
+        from .map_seeds import seed_map_sink_hypotheses
+
+        n_map_seeds = seed_map_sink_hypotheses(gaps, context_map)
+        if n_map_seeds:
+            logger.info(
+                "context-map sink seeding: %d hypothesis(es) "
+                "injected onto gaps", n_map_seeds,
+            )
+    except Exception:
+        logger.debug("map-sink seeding failed", exc_info=True)
 
     # Fail-open census pre-pass: detection-grade leg-1 x
     # leg-2 sweep over the handler-outcome family; leads land on gap
@@ -4769,6 +6927,7 @@ def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
     # obligation. The phase-1 field runs had a quiet fail_open tier —
     # seeding generates the candidates instead of waiting for the LLM
     # to phrase one.
+    _phase("prep_fail_open_census")
     fail_open_census: dict[str, Any] = {}
     try:
         from .fail_open_census import (
@@ -4776,16 +6935,7 @@ def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
             seed_fail_open_leads,
         )
 
-        fo_texts: dict[str, str] = {}
-        for gap in gaps:
-            fp = gap.get("file", "")
-            if fp and fp not in fo_texts:
-                with contextlib.suppress(Exception):
-                    src_path = config.target_path / fp
-                    if src_path.is_file():
-                        fo_texts[fp] = src_path.read_text(
-                            errors="replace",
-                        )
+        fo_texts = _gap_source_texts()
         if fo_texts:
             fail_open_census = run_fail_open_census(
                 fo_texts,
@@ -4818,6 +6968,7 @@ def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
     # lock_region callback-under-lock candidates. Mechanical entries
     # and injected hypotheses only — verdicts stay with the dispatch
     # channels (G1 holds: the hypothesis exists before any finding).
+    _phase("prep_lifecycle_channels")
     try:
         from .condition_smt import DomainVocabulary
         from .fail_open_roles import RoleContext as _CensusRoleCtx
@@ -4830,16 +6981,7 @@ def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
         from .lock_region import run_lock_region_prepass
         from .ptr_lifecycle import run_ptr_lifecycle_prepass
 
-        census_texts: dict[str, str] = {}
-        for gap in gaps:
-            fp = gap.get("file", "")
-            if fp and fp not in census_texts:
-                with contextlib.suppress(Exception):
-                    src_path = config.target_path / fp
-                    if src_path.is_file():
-                        census_texts[fp] = src_path.read_text(
-                            errors="replace",
-                        )
+        census_texts = _gap_source_texts()
         if census_texts:
             channel_vocab = DomainVocabulary.from_domain_model(
                 prep_domain_model, target_path=config.target_path,
@@ -4933,6 +7075,7 @@ def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
     # mechanically-injected-hypothesis precedent), and appends its
     # telemetry to the audit log. Channel list grows per landed
     # channel; every entry degrades independently.
+    _phase("prep_channel_prepasses")
     _channel_prepasses: list[tuple[str, str]] = [
         ("resource_bounds", "run_resource_bounds_prepass"),
         ("release_order", "run_release_order_prepass"),
@@ -4946,16 +7089,7 @@ def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
             )
             _ch_run = getattr(_ch_mod, _ch_fn)
 
-            _ch_texts: dict[str, str] = {}
-            for gap in gaps:
-                fp = gap.get("file", "")
-                if fp and fp not in _ch_texts:
-                    with contextlib.suppress(Exception):
-                        src_path = config.target_path / fp
-                        if src_path.is_file():
-                            _ch_texts[fp] = src_path.read_text(
-                                errors="replace",
-                            )
+            _ch_texts = _gap_source_texts()
             if not _ch_texts:
                 continue
             from .fail_open_roles import RoleContext as _ChRoleCtx
@@ -5012,6 +7146,7 @@ def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
                 _ch_name, exc_info=True,
             )
 
+    _phase("prep_finalize")
     if mechanical_findings and config.out_dir:
         try:
             mech_path = config.out_dir / "mechanical-findings.json"
@@ -5032,6 +7167,9 @@ def _compute_audit_prep(config, *, joern_server=None, on_progress=None):
         widely_used_keys = detect_widely_used(checklist)
     except Exception:
         logger.debug("detect_widely_used failed", exc_info=True)
+
+    if cost_ledger is not None:
+        cost_ledger.end_phase()
 
     return {
         "checklist": checklist,
@@ -5132,7 +7270,9 @@ def _review_duration_hints(
 _IRIS_JOERN_PAIR_BUDGET = 64
 
 
-def _make_iris_joern_tool_runner(joern_server) -> Callable:
+def _make_iris_joern_tool_runner(
+    joern_server, config: "OrchestratorConfig | None" = None,
+) -> Callable:
     """Build the IRIS refinement ToolRunner backed by the live Joern server.
 
     Mirrors ``core.iris.codeql_runner.make_codeql_tool_runner``: the
@@ -5142,6 +7282,11 @@ def _make_iris_joern_tool_runner(joern_server) -> Callable:
     pairwise against sink specs via targeted live taint queries; a
     flow confirms both endpoints.  The pair walk is budgeted so a
     spec-heavy round cannot monopolise the single-threaded REPL.
+
+    Per-pair outcomes feed the channel-health gate when *config* is
+    provided, and the walk stops as soon as the gate reports the
+    channel down — a dead server must not consume the whole pair
+    budget one timeout at a time.
     """
 
     def joern_tool_runner(specs):
@@ -5164,6 +7309,10 @@ def _make_iris_joern_tool_runner(joern_server) -> Callable:
             for snk in sinks:
                 if budget <= 0:
                     break
+                if config is not None and _joern_channel_unhealthy(config):
+                    errors.append("joern channel health gate tripped")
+                    budget = 0
+                    break
                 budget -= 1
                 attempts += 1
                 # Per-pair error accounting: an empty flow list with a
@@ -5182,7 +7331,13 @@ def _make_iris_joern_tool_runner(joern_server) -> Callable:
                 )
                 if flows or not pair_errors:
                     successes += 1
+                    _record_joern_outcome(config, error=False)
                 if pair_errors:
+                    _record_joern_outcome(
+                        config, error=True,
+                        detail="; ".join(str(e) for e in pair_errors),
+                        key=f"iris:{src.function}->{snk.function}",
+                    )
                     errors.extend(str(e) for e in pair_errors)
                 if not flows:
                     continue
@@ -5412,12 +7567,18 @@ def _bypass_findings_to_gaps(
 def _fail_open_adjudicated_sites(out_dir: Path | None) -> set:
     """(file, line) pairs the fail_open channel already adjudicated —
     the CWE-252 premise-split dedup: the census defers, the
-    fail_open verdict wins (deeper role+fallibility receipts)."""
+    fail_open verdict wins (deeper role+fallibility receipts).
+
+    Verified rows only: deferral SUPPRESSES census sites, so a
+    planted ``fail_open_check`` row in a reused/resumed out_dir would
+    silence real CWE-252 findings — the same forged-row lever the
+    resume reader closed. An unverified row fails toward NOT
+    deferring (the census reviews the site)."""
     sites: set = set()
     if not out_dir:
         return sites
     try:
-        for record in load_audit_log(out_dir):
+        for record in load_verified_audit_log(out_dir):
             if record.get("action") != "fail_open_check":
                 continue
             if record.get("outcome") not in ("confirmed", "refuted"):
@@ -5590,18 +7751,20 @@ def _checklist_function_line(
     file_path: str,
     function_name: str,
 ) -> int:
-    """Declaration line of *function_name* in *file_path*, or 0."""
-    for f in checklist.get("files", []):
-        if f.get("path") != file_path:
-            continue
-        items = f.get("items", f.get("functions", [])) or []
-        for item in items:
-            if item.get("name") == function_name:
-                try:
-                    return int(item.get("line_start") or 0)
-                except (TypeError, ValueError):
-                    return 0
-    return 0
+    """Declaration line of *function_name* in *file_path*, or 0.
+
+    Memoised-index lookup (:func:`_checklist_item_index`) — one shared
+    walk instead of a per-call hand-rolled copy.
+    """
+    hit = _checklist_item_index(checklist).get(
+        (file_path, function_name),
+    )
+    if hit is None:
+        return 0
+    try:
+        return int(hit[1].get("line_start") or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _bypass_export_outcomes(
@@ -5664,7 +7827,7 @@ def _attach_bypass_evidence(
         disc = finding.get("discovery", {})
         if disc.get("discovered_by") != "iris_bypass":
             continue
-        plf = by_key.get((finding.get("file", ""), finding.get("function", "")))
+        plf = by_key.get((finding.get("file", ""), finding.get("function", "")))  # type: ignore[assignment]
         if not plf:
             continue
         chain = finding.setdefault("evidence_chain", [])
@@ -5922,9 +8085,44 @@ def _iris_refine_and_bypass(
             taint_chain_callees=taint_chain_callees_post,
         )
         if iris_candidates:
+            # Spend gate: the refine loop pays LLM money to produce
+            # specs whose receipts come from the joern/codeql tool
+            # runners. With no healthy mechanical consumer — joern
+            # absent or health-gate tripped, and no CodeQL database —
+            # every dollar buys specs no tool will ever evaluate this
+            # run, so skip the paid phase outright, book the decision
+            # at $0, and surface it in the report. A healthy CodeQL
+            # runner keeps the phase paid even when joern is down.
+            _joern_consumer_up = (
+                joern_server is not None
+                and not _joern_channel_unhealthy(config)
+            )
+            if not _joern_consumer_up and not config.codeql_db_path:
+                reason = (
+                    "joern channel health gate tripped"
+                    if joern_server is not None
+                    else "no joern server"
+                )
+                logger.warning(
+                    "IRIS refinement skipped — no healthy mechanical "
+                    "consumer (%s, no CodeQL database); $0 spent",
+                    reason,
+                )
+                health = getattr(config, "joern_health", None)
+                if health is not None:
+                    health.note_gated_spend("iris_refinement")
+                tracker = getattr(result, "cost_tracker", None)
+                if tracker is not None:
+                    tracker.record_call(
+                        "iris_refinement_skipped", cost_usd=0.0,
+                    )
+                return None, []
+
             joern_tool_runner = None
-            if joern_server is not None:
-                joern_tool_runner = _make_iris_joern_tool_runner(joern_server)
+            if _joern_consumer_up:
+                joern_tool_runner = _make_iris_joern_tool_runner(
+                    joern_server, config=config,
+                )
 
             bypass_runner = None
             try:
@@ -5978,7 +8176,17 @@ def _iris_refine_and_bypass(
                         out_dir=config.out_dir,
                     )
                 except Exception:
-                    logger.debug("IRIS CodeQL runner init failed", exc_info=True)
+                    # make_codeql_tool_runner degrades to None for every
+                    # EXPECTED unavailability (no CLI, no db); an
+                    # exception here is a construction bug that silently
+                    # kills the CodeQL-backed XREF_BACKED lane for the
+                    # whole run — that must be operator-visible, not
+                    # DEBUG-buried.
+                    logger.warning(
+                        "IRIS CodeQL runner init failed — CodeQL-backed "
+                        "confirmation lane disabled for this run",
+                        exc_info=True,
+                    )
 
             iris_tool_runner = _composite_tool_runner(
                 joern_tool_runner,
@@ -6031,7 +8239,7 @@ def _iris_refine_and_bypass(
                     "IRIS prior-spec load failed", exc_info=True,
                 )
             refined_specs, history, assumptions, bypass_findings = iris_refine_loop(
-                iris_candidates,
+                iris_candidates,  # type: ignore[arg-type]
                 llm_client=iris_llm,
                 tool_runner=iris_tool_runner,
                 prior_specs=prior_specs,
@@ -6049,7 +8257,10 @@ def _iris_refine_and_bypass(
                 )
                 if config.out_dir:
                     spec_path = config.out_dir / "iris-taint-specs-refined.json"
-                    spec_path.write_text(specs_to_json(refined_specs))
+                    # Atomic write — same planted-symlink rationale
+                    # as the initial spec emission.
+                    write_text_atomically(
+                        spec_path, specs_to_json(refined_specs))  # type: ignore[arg-type]
                     # Caller-persist step: merge the refined specs
                     # into the persistent project store (evidence
                     # tiers carried through; envelope metadata —
@@ -6133,6 +8344,9 @@ def _run_audit_body(
     joern_server,
     joern_timeout_s,
     prep_cache=None,
+    joern_presweep_future=None,
+    joern_presweep_activity=None,
+    joern_presweep_abort=None,
 ):
     """Inner orchestrator body, always wrapped in try/finally for server cleanup."""
     global _active_target_path
@@ -6179,10 +8393,22 @@ def _run_audit_body(
                 logger.info("ensemble prep: reusing cached prep (waited)")
 
     if _prep is None:
+        _empty_inventory = False
         try:
             _prep = _compute_audit_prep(
                 config, joern_server=joern_server, on_progress=on_progress,
+                presweep_future=joern_presweep_future,
+                presweep_activity=joern_presweep_activity,
+                presweep_abort=joern_presweep_abort,
+                cost_ledger=result.cost_tracker,
             )
+        except EmptyInventoryError as exc:
+            # Startup refusal, not a crash: mirror the missing-checklist
+            # early return (same presweep cleanup) under its own stop
+            # reason so the CLI can fail the lifecycle and exit nonzero
+            # instead of stamping a completed "0 findings" run.
+            logger.error("%s", exc)
+            _empty_inventory = True
         finally:
             if _prep_event is not None:
                 if _prep is not None:
@@ -6190,8 +8416,19 @@ def _run_audit_body(
                     prep_cache["_ready"] = True
                 _prep_event.set()
         if _prep is None:
-            result.terminated_by = "no_checklist"
+            result.terminated_by = (
+                "empty_inventory" if _empty_inventory else "no_checklist"
+            )
+            _discard_presweep_future(
+                joern_presweep_future, abort_event=joern_presweep_abort,
+            )
             return result
+    elif joern_presweep_future is not None:
+        # Prep reused from the ensemble cache: this pass's own
+        # server-start submission has no consumer — discard it.
+        _discard_presweep_future(
+            joern_presweep_future, abort_event=joern_presweep_abort,
+        )
 
     checklist = _prep["checklist"]
     context_map = _prep["context_map"]
@@ -6305,7 +8542,7 @@ def _run_audit_body(
         if config.resume
         else set()
     )
-    audit_log = load_audit_log(config.out_dir) if config.resume else []
+    audit_log = _g3_prior_review_rows(config)
 
     workqueue = []
     fn_filter = None
@@ -6628,7 +8865,7 @@ def _run_audit_body(
         collector = Collector(
             out_dir=config.out_dir,
             target_path=config.target_path,
-            run_id=config.out_dir.name if config.out_dir else "",
+            run_id=_resolved_run_id(config.out_dir),
         )
         # Buffered audit-log rows must survive a FORCED SIGTERM exit
         # (watchdog expiry / second TERM) — journal rows are appended
@@ -6746,22 +8983,36 @@ def _run_audit_body(
     shared.reviewed_before_joern = reviewed_before_joern
     shared.live_classifications = live_classifications
 
-    # --- Executor config ---
-    from core.llm.concurrency import derive_max_workers
+    # --- Background CodeQL warm-up ---
+    # One whole-run ``database analyze`` per database over every
+    # statically dispatchable query, pre-filling config.codeql_memo so
+    # mid-loop run_codeql_sweep lookups hit. Dispatches that arrive
+    # before it finishes fall through to the existing per-query path
+    # unchanged (distinct memo keys never block each other).
+    _launch_codeql_warmup(config)
 
+    # --- Executor config ---
     from .executor import ExecutorConfig, run_executor_sync
     from .task_graph import TaskGraph
 
+    resolved_workers = _resolve_max_workers(config)
     if config.max_workers == 0:
-        model = config.models[0] if config.models else "default"
-        resolved_workers = derive_max_workers(model)
+        from core.llm.concurrency import (
+            emit_llm_sibling_banner,
+            read_tuning_llm_account_posture,
+        )
+        _posture = read_tuning_llm_account_posture()
         logger.info(
-            "auto workers: model=%s → max_workers=%d",
-            model,
+            "auto workers: model=%s posture=%s → max_workers=%d",
+            config.models[0] if config.models else "default",
+            _posture,
             resolved_workers,
         )
-    else:
-        resolved_workers = config.max_workers
+        # Sibling observation: an honest banner about who else is on
+        # the account right now — a heuristic, never a gate, and
+        # contained (a poisoned sibling must not abort startup).
+        emit_llm_sibling_banner(_posture, resolved_workers,
+                                self_run_dir=config.out_dir, log=logger)
     executor_config = ExecutorConfig(max_workers=resolved_workers)
 
     layer_disagreements: list[Any] = []
@@ -6807,7 +9058,27 @@ def _run_audit_body(
                 joern_state["submit_time"] = None
 
         if joern_state["future"] is not None:
+            # Gap-extra-key marker consumed by the clean-check pre-run:
+            # the CPG can still enrich the (in-place-mutated) evidence
+            # index between this gap's context assembly and its
+            # verdict, so the pre-run must not claim to have seen the
+            # rescue's evidence.
+            gap["_joern_pending"] = True
             shared.reviewed_before_joern.append(gap)
+
+    # --- Environment tick: pause/conclude gate before dispatch ---
+    # Runs FIRST: while the guard pauses (resource pressure) or
+    # probes (systemic-fault breaker), the Joern drain waits with
+    # everything else. The tick blocks the dispatch loop's own
+    # thread, which is the pause mechanism — no new task dispatches
+    # until it returns; in-flight reviews finish on their worker
+    # threads and are harvested afterwards.
+    _env_guard = getattr(config, "environment_guard_state", None)
+
+    def _executor_tick(gap: dict) -> None:
+        if _env_guard is not None:
+            _env_guard.tick()
+        _joern_tick(gap)
 
     # --- Main executor pass ---
     # Schedule: with >1 worker, most-expensive-first (LPT) packing
@@ -6881,9 +9152,9 @@ def _run_audit_body(
 
     # --- Start incremental study consumer (Thread B) ---
     # The study loop resolves assumptions in C/C++ (via the study-prep
-    # corpus) and in Python/Go/Java/JS-TS/Rust (via in-process
-    # lang_resolve dispatch); reviews of any of those languages may
-    # emit reading_list items.
+    # corpus) and in Python/Go/Java/JS-TS/Rust/PHP/Kotlin/C#/Swift
+    # (via in-process lang_resolve dispatch); reviews of any of those
+    # languages may emit reading_list items.
     from core.concepts.lang_resolve import is_study_supported_path
     _has_study_files = any(
         is_study_supported_path(g["file"]) for g in workqueue
@@ -6926,14 +9197,39 @@ def _run_audit_body(
         study_consumer_thread.start()
         logger.info("study-consumer: started")
 
-    # --- Deepen budget reserve ---
-    # Hold back a slice of the cost cap so the deepen phase can
-    # execute the re-reviews it announces; the discovery loop (and the
-    # study/synthesis passes that run before deepen) gate against
-    # cap - reserve. Released right before the deepen phase.
+    # --- Journal-checkpoint quiescer ---
+    # One state machine for every checkpoint call site in this run:
+    # the executor's mid-pass quiesce points (threaded into
+    # run_executor_sync below), and the segment-boundary calls after
+    # the study drain and after the post-loop passes. Constructed
+    # AFTER the study consumer so it can park/resume that thread;
+    # SIGTERM-aware so a drain never contends with a checkpoint.
+    journal_quiescer = None
+    try:
+        from .journal_quiesce import JournalCheckpointQuiescer
+        journal_quiescer = JournalCheckpointQuiescer(
+            config.out_dir,
+            enabled=getattr(config, "journal_checkpoint", True),
+            collector=collector,
+            study_queue=study_queue,
+            should_abort=is_sigterm_requested,
+        )
+    except Exception:  # noqa: BLE001 — hygiene must never cost the run
+        logger.debug("journal quiescer init failed", exc_info=True)
+
+    # --- Deepen + study budget reserve ---
+    # Hold back the end-of-run consumers' slices so they can execute
+    # the work they announce; the discovery loop AND its refinement
+    # rounds gate against cap - (deepen + study). The study slice is
+    # handed back at the drain boundary, deepen's right before the
+    # deepen phase — enforcing main reviews > deepen > study by
+    # construction (each phase can only reach money the phases above
+    # it already could not touch).
     if review_reserve_held:
         _release_review_reserve(config)
-    deepen_reserve_held = _hold_deepen_reserve(config)
+    deepen_reserve_held = _hold_deepen_reserve(
+        config, study_active=study_consumer_thread is not None,
+    )
 
     try:
         executor_stats = run_executor_sync(
@@ -6952,11 +9248,12 @@ def _run_audit_body(
             on_progress=on_progress,
             collector=collector,
             budget_check=lambda: _check_budget(config, start_time, result),
-            on_tick=_joern_tick,
+            on_tick=_executor_tick,
             reviewed_outcomes=reviewed_outcomes,
             throttle=throttle,
             study_queue=study_queue,
             concept_index_ref=concept_index_ref,
+            quiescer=journal_quiescer,
         )
     except BaseException:
         # Exception-path cleanup mirroring the success path below:
@@ -6991,6 +9288,11 @@ def _run_audit_body(
             wait,
         )
 
+        # Environment gate at the same worker-entry point as the rail
+        # check: the tick pauses batch dispatch on resource pressure
+        # and a conclusion surfaces through the rails poll after it.
+        _env_gate = _make_dispatch_gate(config)
+
         def _review_batch(batch):
             # Pre-execution rail check: every batch is submitted to the
             # pool up front, so a QUEUED batch must re-check the budget
@@ -6998,19 +9300,28 @@ def _run_audit_body(
             # batches: after the rails tripped, the pool kept executing
             # the entire pre-submitted backlog (observed live: many
             # hours of post-exhaustion reviews on one run).
+            if _env_gate is not None:
+                _env_gate()
             if _check_budget(config, start_time, result):
                 return None, batch
-            return _review_items(
-                batch,
-                config,
-                review_fn,
-                checklist,
-                context_map,
-                fuzz_coverage,
-                evidence_index,
-                discovered_evidence=discovered_evidence,
-                domain_model=domain_model,
-            ), batch
+            from .executor import review_work_active
+            with review_work_active():
+                return _review_items(
+                    batch,
+                    shared,
+                    config,
+                    review_fn,
+                    result,
+                    joern_server=joern_server,
+                    audit_log=audit_log,
+                    workqueue=workqueue,
+                    reviewed_set=reviewed_set,
+                    start_time=start_time,
+                    layer_disagreements=layer_disagreements,
+                    collector=collector,
+                    graph=graph,
+                    reviewed_outcomes=reviewed_outcomes,
+                ), batch
 
         review_idx = 0
         batch_stop = False
@@ -7040,33 +9351,11 @@ def _run_audit_body(
                         # Worker-side rail refusal — nothing was
                         # dispatched.
                         continue
-                    # Tally BEFORE the stop decision: these outcomes
-                    # are paid work. Pre-fix the consumption loop broke
-                    # on the rail check and every outcome the workers
-                    # completed after that vanished from the result
-                    # (journal had them; result.total_cost_usd froze,
-                    # blinding the cost-cap rail itself).
-                    for outcome, gap in zip(batch_outcomes, batch):
-                        outcome.line = gap.get("line_start", 0)
-                        # Phase-book batched reviews like the
-                        # single-review path does — pre-fix only that
-                        # path booked, so every batched review's spend
-                        # surfaced as "unattributed" in the run cost
-                        # summary (measured as the large majority of
-                        # one run's spend; same class of miss as the
-                        # two-call continuation booking above).
-                        result.cost_tracker.record_call(
-                            "review",
-                            cost_usd=outcome.cost_usd,
-                            tokens_in=getattr(outcome, "tokens_in", 0),
-                            tokens_out=getattr(outcome, "tokens_out", 0),
-                            cache_read_tokens=getattr(
-                                outcome, "cache_read_tokens", 0),
-                            cache_write_tokens=getattr(
-                                outcome, "cache_write_tokens", 0),
-                            wall_time_s=getattr(outcome, "duration_s", 0.0),
-                        )
-                        _tally_outcome(result, outcome)
+                    # review_one_function (called by _review_items)
+                    # already handles cost booking, tally, and commit
+                    # for each outcome.  The consumption loop only
+                    # tracks progress and the budget rail.
+                    for outcome in batch_outcomes:
                         if on_progress:
                             on_progress(review_idx, total, outcome)
                         review_idx += 1
@@ -7088,18 +9377,11 @@ def _run_audit_body(
                 "exhaustion — pending batches cancelled",
             )
 
-    # --- Drain study consumer ---
-    if study_queue is not None:
-        study_queue.signal_producer_done()
-    if study_consumer_thread is not None:
-        _drain_study_consumer(
-            study_consumer_thread,
-            study_queue,
-            budget_exhausted=bool(
-                executor_stats.budget_stopped
-                or _check_budget(config, start_time, result)
-            ),
-        )
+    # --- Drain study consumer (reserve handover inside) ---
+    deepen_reserve_held = _drain_study_with_reserve_handover(
+        config, study_queue, study_consumer_thread,
+        deepen_reserve_held, start_time, result,
+    )
 
     # --- SIGTERM salvage: skip every optional post pass ---
     # In-flight completions are already harvested (the executor's
@@ -7110,6 +9392,15 @@ def _run_audit_body(
     # interrupted.
     if is_sigterm_requested():
         return _sigterm_salvage(result, config, collector, start_time)
+
+    # --- Journal checkpoint: post-review-drain segment boundary ---
+    # The executor has returned, the batched pass joined its pool,
+    # and the study consumer is drained (or stop-requested — the
+    # quiescer's park protocol outwaits/asserts the residue). Runs
+    # synchronously on this thread; a skipped or aborted checkpoint
+    # costs nothing (the journal stands).
+    if journal_quiescer is not None:
+        journal_quiescer.run_at_boundary("post-review-drain")
 
     # --- Concept discovery: mine outcomes for invariants ---
     try:
@@ -7195,6 +9486,9 @@ def _run_audit_body(
                 on_progress=on_progress,
                 collector=collector,
                 budget_check=lambda: _check_budget(config, start_time, result),
+                # Environment tick per dispatch — the executor's own
+                # post-tick budget_check re-check handles a conclusion.
+                on_tick=_make_executor_on_tick(config),
             )
     except Exception as exc:
         logger.warning(
@@ -7319,8 +9613,16 @@ def _run_audit_body(
             max_workers=resolved_workers,
         )
 
+    # Post-loop pass wall-clock phases: one start/end per pass at its
+    # outermost boundary, adjacent to the existing breadcrumbs. All
+    # passes run serially on this thread (the ledger's single-slot
+    # marker discipline); parallelism inside a pass books through
+    # record_call, which is independent of the phase slot.
+    _pass_ledger = result.cost_tracker
+
     if config.deepen_suspicious:
         logger.debug("entering post-deepen mechanical sweep")
+        _pass_ledger.start_phase("post_deepen_sweep")
         sink_reachable = build_sink_reachable_set(context_map)
         new_outcomes = []
         for outcome in result.outcomes:
@@ -7366,14 +9668,42 @@ def _run_audit_body(
                         result.findings -= 1
                         result.suspicious += 1
                         new_outcomes.append(demoted)
+                        # Grade by what the reason actually proves:
+                        # guarded-sink (Joern dominator receipt) and
+                        # SMT UNSAT refute the hypothesis itself →
+                        # tool_evidence; safety-self-contradiction is
+                        # the model contradicting its own finding
+                        # body → consistency axis; reachability
+                        # reasons (entry/sink-unreachability) are
+                        # triage facts about the call graph — the bug
+                        # may be real — and grade nothing.
+                        _r = str(reason)
+                        if _r.startswith((
+                            "[guarded-sink:",
+                            "[smt-infeasible:",
+                            "[smt-disproof:",
+                        )):
+                            _sc_record_refutation(
+                                result.scorecard_events, demoted,
+                                gate="post-deepen-sweep", reason=_r,
+                                models=config.models,
+                            )
+                        elif _r.startswith("[self-contradiction:"):
+                            _sc_record_self_consistency(
+                                result.scorecard_events, demoted,
+                                detail=_r,
+                                models=config.models,
+                            )
                     else:
                         new_outcomes.append(checked)
             else:
                 new_outcomes.append(outcome)
         result.outcomes = new_outcomes
+        _pass_ledger.end_phase()
         logger.debug("exited post-deepen mechanical sweep")
 
     logger.debug("entering _iterative_re_review")
+    _pass_ledger.start_phase("iterative_re_review")
     result = _iterative_re_review(
         result,
         config,
@@ -7394,10 +9724,12 @@ def _run_audit_body(
         joern_server=joern_server,
         max_workers=resolved_workers,
     )
+    _pass_ledger.end_phase()
     logger.debug("exited _iterative_re_review")
 
     # --- Live-sink expansion + re-queue ---
     if live_classifications is not None and live_classifications.sinks:
+        _pass_ledger.start_phase("live_sink_requeue")
         try:
             expand_wrapper_sinks(
                 live_classifications,
@@ -7449,8 +9781,22 @@ def _run_audit_body(
                     )
                     ls_prepared.append((len(ls_prepared), target_gap, prior, ctx))
 
+                # Environment gate at worker entry: this pass
+                # pre-submits every future and its only stop check
+                # runs at harvest (cancellation cannot stop an item a
+                # worker already picked up), so without the gate a
+                # pause/conclusion never stops new live-sink
+                # dispatches. Same seam as the re-review driver.
+                _ls_env_gate = _make_dispatch_gate(config)
+
                 def _do_ls_review(item):
                     idx, _gap, _prior, ctx = item
+                    if _ls_env_gate is not None:
+                        _ls_env_gate()
+                        if _check_budget(config, start_time, result):
+                            # Never dispatched — dropped like a
+                            # cancelled future (idx, None, None).
+                            return (idx, None, None)
                     try:
                         outcome = review_fn(ctx, config)
                         return (idx, outcome, None)
@@ -7460,6 +9806,8 @@ def _run_audit_body(
                 if effective_ls_workers <= 1:
                     ls_raw = []
                     for item in ls_prepared:
+                        if _ls_env_gate is not None:
+                            _ls_env_gate()
                         if _check_budget(config, start_time, result):
                             break
                         ls_raw.append(_do_ls_review(item))
@@ -7483,8 +9831,10 @@ def _run_audit_body(
                                     f.cancel()
                                 break
 
-                for idx, outcome, exc in sorted(ls_raw, key=lambda r: r[0]):
+                for idx, outcome, exc in sorted(ls_raw, key=lambda r: r[0]):  # type: ignore[misc]
                     _, target_gap, prior, _ctx = ls_prepared[idx]
+                    if outcome is None and exc is None:
+                        continue  # gate-skipped — never dispatched
                     if exc is not None:
                         logger.warning(
                             "live-sink re-review failed for %s:%s: %s",
@@ -7507,15 +9857,36 @@ def _run_audit_body(
         except Exception:
             logger.debug("live-sink expansion failed", exc_info=True)
 
+    _pass_ledger.end_phase()  # live_sink_requeue (when it ran)
+
     if config.sweep_validate_findings:
+        _pass_ledger.start_phase("sweep_promotion")
         pre_sweep = {
             (o.file, o.function): o.status for o in result.outcomes
         }
+        # Receipt supply first: give every zero-dispatch suspicious
+        # outcome its mechanical chain (and warm the sweep memo), so
+        # the promotion pass below consumes real receipts through its
+        # existing gates instead of leaving the pile unexamined.
+        logger.debug("entering _resweep_zero_dispatch_suspicious")
+        try:
+            _resweep_zero_dispatch_suspicious(
+                result, config,
+                sarif_cache=sarif_cache,
+                checklist=checklist,
+                joern_server=joern_server,
+                max_workers=resolved_workers,
+            )
+        except Exception:
+            logger.debug("zero-dispatch re-sweep failed", exc_info=True)
+        logger.debug("exited _resweep_zero_dispatch_suspicious")
+
         logger.debug("entering _promote_suspicious")
         _promote_suspicious(
             result, config, sarif_cache, checklist,
             joern_server=joern_server,
             mechanical_findings=mechanical_findings,
+            max_workers=resolved_workers,
         )
         logger.debug("exited _promote_suspicious")
 
@@ -7578,6 +9949,7 @@ def _run_audit_body(
                     checklist=checklist,
                     config=config,
                     joern_server=joern_server,
+                    tier_counters=result.tier_counters,
                 )
                 if rv is not None:
                     append_audit_log(config.out_dir, {
@@ -7637,13 +10009,17 @@ def _run_audit_body(
                     entry["function_qualified"] = outcome.function_qualified
                 append_audit_log(config.out_dir, entry)
 
+    _pass_ledger.end_phase()  # sweep_promotion (when it ran)
+
     if config.adversarial:
         logger.debug("entering _adversarial_refute_pass")
+        _pass_ledger.start_phase("adversarial_refute")
         try:
             _adversarial_refute_pass(
                 result, config, checklist,
                 joern_server=joern_server,
                 start_time=start_time,
+                max_workers=resolved_workers,
             )
         except Exception:
             logger.warning(
@@ -7651,8 +10027,10 @@ def _run_audit_body(
                 "keep their verdicts",
                 exc_info=True,
             )
+        _pass_ledger.end_phase()
         logger.debug("exited _adversarial_refute_pass")
 
+    _pass_ledger.start_phase("confidence_propagation")
     try:
         from .propagation import propagate_confidence
         edge_index = shared.call_edge_index if shared else {}
@@ -7670,19 +10048,30 @@ def _run_audit_body(
         logger.debug("confidence propagation failed", exc_info=True)
 
     logger.debug("entering _resolve_gate_demoted")
+    _pass_ledger.start_phase("resolve_gate_demoted")
+    # A mid-run health-gate trip means joern stopped looking: mark it
+    # unavailable so is_class_covered discards it from any stale
+    # dispatch record (belt-and-braces behind the skipped_types fix —
+    # phantom coverage must not demote suspicious to clean).
+    _gate_caps = dict(tool_capabilities or {})
+    if _joern_channel_unhealthy(config):
+        _gate_caps["joern"] = False
     _resolve_gate_demoted(
         result,
         config,
         sarif_cache,
         checklist,
         domain_model=domain_model,
-        available_tools=tool_capabilities,
+        available_tools=_gate_caps,
         mechanical_findings=mechanical_findings,
     )
+    _pass_ledger.end_phase()
     logger.debug("exited _resolve_gate_demoted")
 
     logger.debug("entering _auto_synthesize_rules")
+    _pass_ledger.start_phase("auto_synthesize_rules")
     _auto_synthesize_rules(result, config)
+    _pass_ledger.end_phase()
     logger.debug("exited _auto_synthesize_rules")
 
     retired = checker_library.retire_low_precision()
@@ -7746,6 +10135,7 @@ def _run_audit_body(
         except Exception:
             logger.debug("layer disagreement persistence failed", exc_info=True)
 
+    _pass_ledger.start_phase("flow_trace_review")
     result = _review_flow_traces(
         result,
         config,
@@ -7759,11 +10149,20 @@ def _run_audit_body(
         start_time=start_time,
     )
 
+    _pass_ledger.end_phase()  # flow_trace_review
+
     if result.findings > 0:
         logger.debug("entering _persist_findings")
-        _persist_findings(result, config)
+        _persist_findings(
+            result, config,
+            vendor_verdicts=_prep.get("vendor_verdicts") or None,
+        )
 
-    if iris_taint_specs and joern_server is not None and result.findings > 0:
+    if (
+        iris_taint_specs and joern_server is not None
+        and result.findings > 0
+        and not _joern_channel_unhealthy(config)
+    ):
         try:
             from .iris_specs import compile_joern_config
 
@@ -7814,9 +10213,17 @@ def _run_audit_body(
             if chains:
                 write_attack_chains(chains, config.out_dir)
                 logger.info(format_chains_summary(chains))
-        except Exception:
-            logger.debug("attacker synthesis failed", exc_info=True)
+        except Exception as exc:  # noqa: BLE001 — synthesis is additive; a crash must not kill the run tail
+            # Loud, not silent: a debug-level swallow hid a
+            # producer/consumer shape mismatch that kept chain
+            # synthesis dead on every run with a callgraph-enriched
+            # context map.
+            logger.warning(
+                "attacker synthesis failed — attack-chains.json not "
+                "written: %s", exc, exc_info=True,
+            )
 
+    _pass_ledger.start_phase("post_loop_checks")
     post_loop_findings: list[dict] = []
     generated: list = []
 
@@ -7878,12 +10285,12 @@ def _run_audit_body(
             post_loop_findings.extend(nf.to_dict() for nf in check_url_boundary_composition(g, target_path=tp))
             if (g.get("file") or "").endswith(".go"):
                 _swr_g = dict(g)
-                with contextlib.suppress(OSError):
-                    _gfp = tp / (g.get("file") or "")
-                    if _gfp.is_file():
-                        _swr_g["file_source"] = _gfp.read_text(
-                            errors="replace",
-                        )
+                # gap-record path (LLM-writable): contained + capped
+                # + fd-checked regular, never a bare join + raw read.
+                from core.source import read_contained as _read_contained
+                _swr_src = _read_contained(tp, g.get("file") or "")
+                if _swr_src is not None:
+                    _swr_g["file_source"] = _swr_src
                 post_loop_findings.extend(nf.to_dict() for nf in check_shared_writer_race(_swr_g))
         post_loop_findings.extend(nf.to_dict() for nf in check_missing_app_features(gaps, target_path=tp))
         post_loop_findings.extend(nf.to_dict() for nf in check_signal_safety(
@@ -7940,6 +10347,35 @@ def _run_audit_body(
     except Exception:
         logger.debug("generated-file detection failed", exc_info=True)
 
+    # Tree-wide decompiler Semgrep sweep (binary targets only — the
+    # module returns None for source runs): the per-hypothesis
+    # decompiler lane only sees functions the review loop visited;
+    # this pass runs the curated decompiler rule corpus over the
+    # WHOLE decomp-tree, mapping matches back to function@address+fid
+    # and journaling them as mechanical echo rows. Missing tree /
+    # re-database is a LOUD skip recorded in decomp-sweep.json, never
+    # a silent no-sweep — hence warning, not debug, on a crash here.
+    try:
+        from .decomp_sweep import run_decomp_tree_sweep
+
+        _ds_record = run_decomp_tree_sweep(
+            target_path=Path(config.target_path),
+            out_dir=config.out_dir,
+            gaps=gaps,
+            run_id=_resolved_run_id(config.out_dir),
+        )
+        # Journalled but NOT tallied as reviewed — counted like the
+        # other mechanical-row writers so the console summary's
+        # "(+N mechanical post-loop)" line matches the journal.
+        _ds_rows = int((_ds_record or {}).get("journal_rows", 0) or 0)
+        if _ds_rows:
+            with result._lock:
+                result.post_loop_mechanical += _ds_rows
+    except Exception:
+        logger.warning("decomp-tree sweep failed", exc_info=True)
+
+    _pass_ledger.end_phase()  # post_loop_checks
+
     if post_loop_findings:
         logger.info(
             "Post-loop pattern checks: %d findings",
@@ -7992,7 +10428,7 @@ def _run_audit_body(
                 append_journal_for_outcome(
                     out_dir=config.out_dir,
                     target_path=config.target_path,
-                    run_id=(config.out_dir.name if config.out_dir else ""),
+                    run_id=_resolved_run_id(config.out_dir),
                     outcome=_o,
                     gap={
                         "line_start": plf.get("line_start", 0),
@@ -8013,6 +10449,139 @@ def _run_audit_body(
                     plf_func,
                     exc_info=True,
                 )
+
+    # --- Cross-scope contract discovery (--open-discovery) ---
+    if config.open_discovery:
+        try:
+            from .discovery import (
+                build_seam_bundles,
+                build_state_machine_bundles,
+                detect_single_threaded,
+                run_contract_discovery,
+                run_state_machine_discovery,
+                write_discovery_weaknesses,
+            )
+
+            _disc_entry_points: set[str] = set()
+            if context_map:
+                _disc_entry_points = entry_points
+
+            _disc_weakness_fids: set[str] = set()
+            try:
+                from .composition import build_weakness_inventory
+                _disc_inv = build_weakness_inventory(config.out_dir)
+                _disc_weakness_fids = {w.fid for w in _disc_inv}
+            except Exception:
+                pass
+
+            _disc_run_id = _resolved_run_id(config.out_dir)
+            _disc_bundles = build_seam_bundles(
+                checklist,
+                context_map,
+                _disc_entry_points,
+                target_path=config.target_path,
+                weakness_fids=_disc_weakness_fids,
+            )
+            if _disc_bundles:
+                _disc_budget = (
+                    (config.max_cost_usd or 50.0)
+                    * config.discovery_budget_fraction
+                )
+
+                _disc_client = _run_llm_client(config)
+
+                def _disc_review_fn(
+                    system: str, prompt: str,
+                ) -> tuple[str, float]:
+                    resp = _disc_client.generate(
+                        prompt, system_prompt=system,
+                    )
+                    return resp.content, resp.cost
+
+                _disc_results = run_contract_discovery(
+                    _disc_bundles,
+                    review_fn=_disc_review_fn,
+                    max_cost_usd=_disc_budget,
+                )
+                _disc_total_w = 0
+                for dr in _disc_results:
+                    callee_fid = dr.seam_or_field.split("->")[-1].strip()
+                    if callee_fid and dr.weaknesses:
+                        write_discovery_weaknesses(
+                            config.out_dir,
+                            callee_fid,
+                            dr.weaknesses,
+                            run_id=_disc_run_id,
+                            cost_usd=dr.cost_usd,
+                        )
+                        _disc_total_w += len(dr.weaknesses)
+                if _disc_total_w:
+                    logger.info(
+                        "open discovery: %d contract weaknesses from "
+                        "%d seams",
+                        _disc_total_w, len(_disc_results),
+                    )
+
+            # state machine discovery
+            _fc_path = config.out_dir / "field-census.json"
+            if _fc_path.exists():
+                _fc = json.loads(
+                    _fc_path.read_text()  # raw-open: RAPTOR run-dir artifact, not target source
+                )
+                _sm_bundles = build_state_machine_bundles(
+                    _fc,
+                    target_path=config.target_path,
+                )
+                if _sm_bundles:
+                    _sm_budget = (
+                        (config.max_cost_usd or 50.0)
+                        * config.discovery_budget_fraction
+                        * 0.3
+                    )
+                    if not _disc_bundles:
+                        _sm_budget = (
+                            (config.max_cost_usd or 50.0)
+                            * config.discovery_budget_fraction
+                        )
+
+                    _sm_st = detect_single_threaded(config.target_path)
+                    _sm_client = _run_llm_client(config)
+
+                    def _sm_review_fn(
+                        system: str, prompt: str,
+                    ) -> tuple[str, float]:
+                        resp = _sm_client.generate(
+                            prompt, system_prompt=system,
+                        )
+                        return resp.content, resp.cost
+
+                    _sm_results = run_state_machine_discovery(
+                        _sm_bundles,
+                        review_fn=_sm_review_fn,
+                        max_cost_usd=_sm_budget,
+                        single_threaded=_sm_st,
+                    )
+                    _sm_total_w = 0
+                    for sr in _sm_results:
+                        if sr.weaknesses:
+                            write_discovery_weaknesses(
+                                config.out_dir,
+                                sr.seam_or_field,
+                                sr.weaknesses,
+                                run_id=_disc_run_id,
+                                cost_usd=sr.cost_usd,
+                            )
+                            _sm_total_w += len(sr.weaknesses)
+                    if _sm_total_w:
+                        logger.info(
+                            "open discovery: %d state machine weaknesses "
+                            "from %d fields",
+                            _sm_total_w, len(_sm_results),
+                        )
+        except Exception:
+            logger.warning(
+                "open discovery failed", exc_info=True,
+            )
 
     # --- Structural-receipt rescue composition (post-loop) ---
     #
@@ -8055,7 +10624,7 @@ def _run_audit_body(
                 append_journal_for_outcome(
                     out_dir=config.out_dir,
                     target_path=config.target_path,
-                    run_id=(config.out_dir.name if config.out_dir else ""),
+                    run_id=_resolved_run_id(config.out_dir),
                     outcome=co,
                     gap={
                         "line_start": co.line,
@@ -8132,6 +10701,9 @@ def _run_audit_body(
                 on_progress=on_progress,
                 collector=collector,
                 budget_check=lambda: _check_budget(config, start_time, result),
+                # Environment tick per dispatch — the executor's own
+                # post-tick budget_check re-check handles a conclusion.
+                on_tick=_make_executor_on_tick(config),
             )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
@@ -8182,9 +10754,40 @@ def _run_audit_body(
                 ).content
             ),
             start_time=start_time,
+            max_workers=resolved_workers,
         )
     except Exception:
         logger.debug("dark verification pass failed", exc_info=True)
+
+    # --- Differential family execution (census leads) ---
+    # Peer-vs-deviant witness runs over the consistency pre-pass's
+    # surviving leads, plus the metamorphic relation witness on the
+    # deviant alone. Own execution namespace ("differential") so a
+    # divergence receipt and a consistency receipt never corroborate
+    # each other as independent tools; the fold never demotes. Before
+    # the absent-promotion demoter so differential-confirmed outcomes
+    # carry the runtime evidence that vetoes the absent verdict.
+    differential_outcomes: list[Any] = []
+    try:
+        _pass_ledger.start_phase("differential")
+        _diff_client = _run_llm_client(config)
+        differential_outcomes = _run_differential_verification(
+            result,
+            config,
+            consistency_prepass,
+            llm_client=lambda p, s: (
+                _diff_client.generate(
+                    p,
+                    system_prompt=s or None,
+                ).content
+            ),
+            start_time=start_time,
+        )
+    except Exception:
+        logger.debug(
+            "differential verification pass failed", exc_info=True,
+        )
+    _pass_ledger.start_phase("post_loop_checks")
 
     # --- Binary-oracle demotion of promotions in absent functions ---
     # After dark verification so witness-confirmed outcomes carry the
@@ -8204,6 +10807,24 @@ def _run_audit_body(
     if config.mode.has_security_phase:
         _run_phase2(result, config)
 
+    # --- Terminal environment-stop sweep ---
+    # The passes behind the flag-stop gates (edge review during prep,
+    # concept discovery) rely on a LATER rails poll to book their
+    # conclusion, but every later pass is conditional (candidates
+    # present, mode flags, opt-ins) — the compound short-circuits can
+    # skip every remaining _check_budget on a sparse run, shipping the
+    # fault as terminated_by="complete" (exit 0, lifecycle clean, no
+    # resume hint). One unconditional booking here closes that for
+    # every current AND later-added pass.
+    _environment_stop_booked(config, result)
+
+    # Close the reopened post_loop_checks slot: the run body returns
+    # from here on (flushes, journal checkpoint, diagnostics — run
+    # bookkeeping, not pass work), and a phase left open at return
+    # never books its pass wall and reads as a dangling in-flight
+    # pass in the reconciled cost breakdown.
+    _pass_ledger.end_phase()  # post_loop_checks (differential tail)
+
     result.total_duration_s = time.monotonic() - start_time
 
     # --- Collector flush: write all buffered state to disk ---
@@ -8212,6 +10833,14 @@ def _run_audit_body(
             collector.flush()
         except Exception:
             logger.debug("collector flush failed", exc_info=True)
+
+    # --- Journal checkpoint: post-loop-passes segment boundary ---
+    # Every review-dispatching pass (deepen, re-review sweeps, IRIS
+    # refinement, bypass pass) has completed and the collector just
+    # flushed: last chance to leave a within-budget journal for the
+    # completion merge and the next segment's resume.
+    if journal_quiescer is not None:
+        journal_quiescer.run_at_boundary("post-loop-passes")
 
     _persist_project_learnings(
         config.out_dir,
@@ -8228,7 +10857,10 @@ def _run_audit_body(
             logger.debug("fp_feedback: save failed", exc_info=True)
 
     try:
-        write_tier_diagnostics(result.tier_counters, config.out_dir)
+        write_tier_diagnostics(
+            result.tier_counters, config.out_dir,
+            channel_health=_channel_health_snapshot(config),
+        )
         diag_text = format_tier_diagnostics(result.tier_counters)
         if diag_text.count("\n") > 1:
             logger.info(diag_text)
@@ -8292,6 +10924,19 @@ def _run_audit_body(
             "caller-contract demotion pass failed", exc_info=True,
         )
 
+    # Gadget-absence confidence demotion: gadget-chain hypotheses
+    # against a tree with zero POP trigger surface (complete census,
+    # corpus-earned tier) export at confidence=low with receipts
+    # (status untouched — never suppression). Same seam as the
+    # caller-contract pass, for the same journal/export/summary
+    # agreement.
+    try:
+        _gadget_absence_demotion_pass(result, config)
+    except Exception:
+        logger.debug(
+            "gadget-absence demotion pass failed", exc_info=True,
+        )
+
     # Pre-export hooks: outcome-level post-processing (e.g. the ensemble
     # pipeline's file-pile-up dampener) runs BEFORE the journal
     # correction pass and the graded export so stats, journal and
@@ -8302,6 +10947,18 @@ def _run_audit_body(
         except Exception:
             logger.debug("pre-export hook failed", exc_info=True)
 
+    # Cadence-tick promotions are settled now: every demotion pass has
+    # run, so surviving provisional marks are confirmed (cleared) here
+    # — before the findings persist, the corrective journal pass and
+    # the export, which then all ship non-provisional rows. A run
+    # killed before this point keeps the marks (the salvage path never
+    # finalizes), which is what the report's "provisional at time of
+    # writing" note keys off.
+    try:
+        _finalize_provisional_promotions(result, config)
+    except Exception:
+        logger.debug("provisional finalization failed", exc_info=True)
+
     # Re-persist findings.json now that every status-mutating pass
     # (receipt rescue, validate, error retry, dark verification,
     # absent demotion, phase 2, pre-export hooks) has run: the
@@ -8310,7 +10967,10 @@ def _run_audit_body(
     # findings>0 gate) so a retract-to-zero run empties the file.
     if config.out_dir:
         try:
-            _persist_findings(result, config)
+            _persist_findings(
+                result, config,
+                vendor_verdicts=_prep.get("vendor_verdicts") or None,
+            )
         except Exception:
             logger.debug("final findings persist failed", exc_info=True)
 
@@ -8346,6 +11006,12 @@ def _run_audit_body(
         except Exception:
             logger.debug(
                 "consistency export outcomes failed", exc_info=True,
+            )
+        try:
+            export_outcomes.extend(differential_outcomes)
+        except Exception:
+            logger.debug(
+                "differential export outcomes failed", exc_info=True,
             )
         graded = export_findings(
             export_outcomes,
@@ -8451,6 +11117,31 @@ def _run_audit_body(
         except Exception:
             logger.debug("summaries.json write failed", exc_info=True)
 
+    # Per-model reliability events: add the confirmed direction (every
+    # shipped finding backed by a promotion-grade receipt grades its
+    # model's hypothesis correct), then flush the whole run's buffered
+    # events in ONE batched sidecar write. Statuses settled long ago
+    # (finalization), so the flush reconciles both grade directions
+    # against the final finding set. Placed AFTER the findings persist,
+    # journal correction and graded export: the sidecar write takes a
+    # cross-process flock, and a wedged lock-holder must be able to
+    # stall only this telemetry, never the run's primary artifacts.
+    # Fail-soft by module contract; the extra guard keeps even a
+    # broken import from touching the ledger reconciliation below.
+    try:
+        _sc_buffer_confirmed_findings(
+            result.scorecard_events, result.outcomes,
+            models=config.models,
+            receipt_check=_promotion_grade_receipt,
+        )
+        # Final flush: everything the incremental budget-poll flushes
+        # have not shipped yet — the reconcilable tool_evidence grades
+        # held for end-of-run finding-set reconciliation, plus any
+        # events buffered since the last incremental slot.
+        _flush_scorecard_events_now(config, result, final=True)
+    except Exception:
+        logger.debug("audit scorecard flush failed", exc_info=True)
+
     try:
         _reconcile_cost_ledgers(config, result)
     except Exception:
@@ -8462,13 +11153,37 @@ def _run_audit_body(
         invoked = list(result.cost_tracker.phases.keys())
         unsandboxed = validate_all_tools_sandboxed(invoked)
         if unsandboxed:
+            # Advisory reference-table gap, not an enforcement result:
+            # these are cost-ledger phase names, and tool isolation is
+            # enforced at the core.sandbox spawn layer regardless.
             logger.warning(
-                "sandbox policy: %d tools invoked without policy: %s",
+                "sandbox policy (advisory): %d cost-ledger phase name(s) "
+                "have no policy/allowlist entry: %s — likely a new LLM "
+                "spend class missing from _LLM_PHASES, not an "
+                "unsandboxed tool",
                 len(unsandboxed),
                 ", ".join(unsandboxed),
             )
     except Exception:
         logger.debug("sandbox policy validation failed", exc_info=True)
+
+    # Graph store enrichment — ingest audit hypotheses + scan findings.
+    if config.out_dir:
+        try:
+            from core.understand_graph import ingest_audit_hypotheses, ingest_scan_findings
+            _tgt = str(config.target_path or "")
+            ingest_audit_hypotheses(config.out_dir, _tgt)
+            ingest_scan_findings(config.out_dir, _tgt)
+        # Broad except: enrichment is best-effort by design (sibling
+        # graph-enrichment sites use the same spelling). The ingest
+        # mkdirs the graph dir and binds artifact-derived values, so
+        # the failure surface spans OSError, sqlite errors, shape
+        # errors, and bind overflows — any of them must degrade to
+        # this warning lane, not revoke an otherwise-successful audit
+        # at its final optional step.
+        except Exception as _gexc:
+            logger.warning("graph store enrichment skipped: %s", _gexc)
+            logger.debug("graph store enrichment skipped", exc_info=True)
 
     return result
 
@@ -8526,7 +11241,10 @@ def _sigterm_salvage(
         logger.debug("salvage: graded export failed", exc_info=True)
 
     try:
-        write_tier_diagnostics(result.tier_counters, config.out_dir)
+        write_tier_diagnostics(
+            result.tier_counters, config.out_dir,
+            channel_health=_channel_health_snapshot(config),
+        )
     except Exception:
         logger.debug("salvage: tier diagnostics failed", exc_info=True)
 
@@ -8547,16 +11265,17 @@ def _reconcile_cost_ledgers(config, result) -> None:
     totals.total_spend_usd / failed_attempts_cost_usd /
     unattributed_cost_usd, and stash it on the result for the
     operator-facing "Cost:" summary line. Without this, one run
-    produced three unexplained numbers: $8.08 (client), $4.52 (review
-    phase), $2.82 (summary).
+    produced three unexplained numbers — the client ledger, the review
+    phase and the summary each reported a different total for the same
+    money.
 
     Before injecting, book call classes no phase captured (audit,
     iris, summary, glance_batch, …) from the telemetry sink's
     per-class ledger. Pre-fix their spend either printed under
     "failed/timed-out" (budget-client spend the phases missed) or
     vanished from the summary entirely (standalone-client spend
-    outside the budget ledger — one run reported $36.85 while
-    telemetry showed $38.84). Afterwards, assert the telemetry ledger
+    outside the budget ledger — one run's report fell measurably
+    short of its telemetry total). Afterwards, assert the telemetry ledger
     and the summary ledger describe the same money: warn when they
     diverge by more than 1% (unbooked or double-booked spend).
     """
@@ -8576,6 +11295,37 @@ def _reconcile_cost_ledgers(config, result) -> None:
                     f"{c}=${v:.2f}" for c, v in sorted(booked.items())
                 ),
             )
+        # Failed-attempt spend, itemised per class: paid generations
+        # whose response the shape/truncation guards rejected carry
+        # their cost on the telemetry record (the guard books the
+        # provider ledger and stamps the row). Booking it here puts a
+        # burn loop's real money into cost-breakdown.json as its own
+        # line instead of leaving it as an unattributed gap between
+        # the telemetry and summary ledgers. count_call=False: the
+        # attempts are itemised in telemetry, and call-site bookings
+        # (the review path's per-failure record) already count them.
+        # getattr-probed like every telemetry read — a test double
+        # installed as the sink is not obliged to grow new methods.
+        _fcc = getattr(sink, "failed_class_costs", None)
+        failed_costs = _fcc() if callable(_fcc) else {}
+        _failed_booked = 0.0
+        for cls, (_n, cost) in sorted(failed_costs.items()):
+            if cost > 0:
+                result.cost_tracker.record_failed_attempt(
+                    cls, cost_usd=cost, count_call=False,
+                )
+                _failed_booked += cost
+        if _failed_booked > 0:
+            logger.info(
+                "cost: booked $%.2f failed-attempt spend from "
+                "telemetry: %s",
+                _failed_booked,
+                ", ".join(
+                    f"{c}=${v:.2f} ({n} attempts)"
+                    for c, (n, v) in sorted(failed_costs.items())
+                    if v > 0
+                ),
+            )
     # Same-run resume: book the prior segments' spend BEFORE injecting
     # this segment's client ledger, so the rewritten
     # cost-breakdown.json covers the whole run (the budget client only
@@ -8585,7 +11335,8 @@ def _reconcile_cost_ledgers(config, result) -> None:
     # reconciling (no prior ledger dict), where booking only the dict
     # dropped every segment before the immediately-prior one — the
     # final ledger then under-reported the run by the whole early
-    # spend (observed live: $47.29 booked of ~$4,534).
+    # spend (observed live: segment 4 booked only its own sliver of
+    # the run's spend — a ~99% under-report).
     prior_breakdown = getattr(config, "prior_cost_breakdown", None)
     prior_booked = max(
         0.0,
@@ -8763,7 +11514,7 @@ def _run_invariant_prescreening(
             continue
 
         try:
-            body = rule_path.read_text(encoding="utf-8")
+            body = rule_path.read_text(encoding="utf-8")  # raw-open: RAPTOR rules-dir file recorded by the synthesis registry
         except OSError:
             continue
 
@@ -8874,10 +11625,29 @@ def _run_concept_discovery(
     from core.concepts.model import Invariant
     from packages.checker_synthesis.languages import fallback_engine
 
+    # Environment gate per compilation dispatch (each is an LLM call,
+    # sometimes two with the engine fallback). This pass carries no
+    # result to book against — conclusion-flagged; the next rails
+    # poll (every later post-loop pass) books the stop.
+    _env_gate = _make_dispatch_gate(config)
+
     compiled_count = 0
     for entry in new_entries:
+        if _env_gate is not None and _env_gate():
+            logger.info(
+                "concept discovery stopped — environment guard "
+                "concluded (%d/%d invariants compiled; the rest stay "
+                "uncompiled model entries)",
+                compiled_count, len(new_entries),
+            )
+            break
         inv = Invariant(
             id=entry["id"],
+            # Discovered invariants are self-named: the id doubles as
+            # the concept binding. Omitting the (required) field
+            # TypeError'd the loop at its first entry — swallowed by
+            # the caller's broad handler, so no rule ever compiled.
+            concept=entry.get("concept") or entry["id"],
             statement=entry["statement"],
             negation=entry["negation"],
             description=entry.get("description", ""),
@@ -9005,7 +11775,7 @@ class _InjectModeResolver:
 
         if self._check_lock_domain is not None and (is_c or is_go):
             try:
-                ldr = self._check_lock_domain(src, self._vocab)
+                ldr = self._check_lock_domain(src, self._vocab)  # type: ignore[arg-type]
                 if ldr.mismatch_found:
                     findings.append({
                         "file": file,
@@ -9122,7 +11892,13 @@ def _run_mechanical_detectors(
       2. A set of "file:function" keys that are mechanically clean — all
          sinks had sufficient guards with no detector findings.
 
-    Design ref: ~/design/audit.md lines 782-813.
+    Results ride the cross-run detector cache
+    (:mod:`core.audit.detector_cache`): per-file condition/cocci
+    entries and per-detector structural records reload when their
+    content hashes and lane input digests match, so an unchanged tree
+    collapses this pass to hash checks + cache loads. Anything a
+    fingerprint cannot cover (a live Joern server's CPG, the
+    return-domain root walks) recomputes every run.
     """
     mechanical_findings: dict[str, list[dict[str, Any]]] = {}
     guard_clean_keys: set[str] = set()
@@ -9136,10 +11912,9 @@ def _run_mechanical_detectors(
     for gap in gaps:
         fp = gap.get("file", "")
         if fp and fp not in source_texts:
-            with contextlib.suppress(OSError):
-                src_path = config.target_path / fp
-                if src_path.is_file():
-                    source_texts[fp] = src_path.read_text(errors="replace")
+            _md_text = _contained_source_text(config.target_path, fp)
+            if _md_text is not None:
+                source_texts[fp] = _md_text
 
     if not source_texts:
         return mechanical_findings, guard_clean_keys
@@ -9164,6 +11939,26 @@ def _run_mechanical_detectors(
 
         sinks_set = frozenset(extract_context_map_set(context_map, "sinks"))
 
+    from .detector_cache import (
+        MechanicalDetectorCache,
+        call_graph_inputs_fingerprint,
+        digest_strings,
+        file_content_sha,
+        gap_spans_digest,
+        source_fingerprint,
+        spatch_marker,
+        tree_sitter_marker,
+        vocabulary_digest,
+        z3_marker,
+    )
+
+    det_cache = MechanicalDetectorCache.open(  # raw-open: not a filesystem open — detector cache constructor
+        getattr(config, "out_dir", None),
+    )
+    content_shas = {
+        fp: file_content_sha(src) for fp, src in source_texts.items()
+    }
+
     # --- L0/L1/L2/L3: condition chain (parallelised per file) ---
     guard_cache: dict[str, list] = {}
     _extract_sg = None
@@ -9175,20 +11970,20 @@ def _run_mechanical_detectors(
     _cpg_verify = None
 
     try:
-        from .condition_adequacy import assess_file_guards as _assess_guards
-        from .condition_binding import check_all_bindings as _check_bindings
-        from .condition_extraction import extract_sink_guards as _extract_sg
+        from .condition_adequacy import assess_file_guards as _assess_guards  # type: ignore[assignment]
+        from .condition_binding import check_all_bindings as _check_bindings  # type: ignore[assignment]
+        from .condition_extraction import extract_sink_guards as _extract_sg  # type: ignore[assignment]
     except Exception:
         logger.debug("mechanical: condition chain import failed", exc_info=True)
 
     try:
-        from .condition_smt import (
+        from .condition_smt import (  # type: ignore[assignment]
             check_all_sufficiency as _check_sufficiency,
         )
-        from .condition_smt import (
+        from .condition_smt import (  # type: ignore[assignment]
             check_path_feasibility as _check_pf,
         )
-        from .condition_smt import (
+        from .condition_smt import (  # type: ignore[assignment]
             check_signed_mismatch as _check_sm,
         )
     except Exception:
@@ -9196,7 +11991,7 @@ def _run_mechanical_detectors(
 
     if joern_server is not None:
         try:
-            from .condition_cpg import verify_guard_relevance_cpg as _cpg_verify
+            from .condition_cpg import verify_guard_relevance_cpg as _cpg_verify  # type: ignore[assignment]
         except Exception:
             logger.debug("mechanical: condition_cpg import failed", exc_info=True)
 
@@ -9213,18 +12008,36 @@ def _run_mechanical_detectors(
                 guard_cache[fp] = []
         return guard_cache[fp]
 
-    def _process_file_conditions(fp, src):
-        findings = []
+    def _process_file_conditions(fp: str, src: str) -> dict[str, Any]:
+        """Per-file condition-chain entry: replayable finding records
+        plus this file's guard bookkeeping (keys are ``fp``-prefixed,
+        so per-file merges can never collide across files)."""
+        findings: list[Any] = []
+        file_guarded: set[str] = set()
+        file_sufficient: dict[str, bool] = {}
+        file_decorative: set[str] = set()
+        file_smt_insufficient: set[str] = set()
+
+        def _entry() -> dict[str, Any]:
+            return {
+                "content": content_shas[fp],
+                "findings": findings,
+                "guarded": sorted(file_guarded),
+                "sufficient": file_sufficient,
+                "decorative": sorted(file_decorative),
+                "smt_insufficient": sorted(file_smt_insufficient),
+            }
+
         guards = _guards_for(fp, src)
         if not guards:
-            return findings
+            return _entry()
 
         for sg in guards:
             if sg.guards:
                 gkey = f"{fp}:{sg.sink_function}"
-                _guarded_funcs.add(gkey)
-                if gkey not in _sufficient_funcs:
-                    _sufficient_funcs[gkey] = True
+                file_guarded.add(gkey)
+                if gkey not in file_sufficient:
+                    file_sufficient[gkey] = True
 
         if _assess_guards is not None:
             try:
@@ -9235,7 +12048,7 @@ def _run_mechanical_detectors(
                         v = v.value
                     gkey = f"{fp}:{sg.sink_function}"
                     if v != "sufficient":
-                        _sufficient_funcs[gkey] = False
+                        file_sufficient[gkey] = False
                     if v in ("irrelevant", "insufficient", "unknown"):
                         notes = "; ".join(ar.notes) if ar.notes else ""
                         findings.append((
@@ -9261,7 +12074,7 @@ def _run_mechanical_detectors(
                 for sg, ba in zip(guards, binding_analyses):
                     if ba.all_guards_decorative:
                         gkey = f"{fp}:{sg.sink_function}"
-                        _decorative_funcs.add(gkey)
+                        file_decorative.add(gkey)
                         findings.append((
                             fp, sg.sink_function, "unbound_guard",
                             sg.sink_line,
@@ -9274,7 +12087,7 @@ def _run_mechanical_detectors(
                 logger.debug("condition binding failed for %s", fp, exc_info=True)
 
         # SMT first — proven-sufficient guards skip the expensive CPG round
-        _smt_cleared = set()
+        _smt_cleared: set[int] = set()
         if _check_sufficiency is not None:
             try:
                 smt_per_guard = _check_sufficiency(guards)
@@ -9284,7 +12097,7 @@ def _run_mechanical_detectors(
                         if sr.feasible is True:
                             has_insufficient = True
                             gkey = f"{fp}:{sg.sink_function}"
-                            _smt_insufficient_funcs.add(gkey)
+                            file_smt_insufficient.add(gkey)
                             detail = sr.reasoning or ""
                             if sr.concrete_values:
                                 vals = ", ".join(
@@ -9373,96 +12186,215 @@ def _run_mechanical_detectors(
             except Exception:
                 logger.debug("condition_smt L3b failed for %s", fp, exc_info=True)
 
-        return findings
+        return _entry()
+
+    # A live Joern server adds whole-program CPG verdicts no content
+    # fingerprint can cover — under Joern the lane recomputes and
+    # stores nothing.
+    condition_key = digest_strings([
+        "sinks", *sorted(sinks_set),
+        "caps",
+        str(_extract_sg is not None), str(_assess_guards is not None),
+        str(_check_bindings is not None),
+        str(_check_sufficiency is not None),
+        str(_check_pf is not None), str(_check_sm is not None),
+        tree_sitter_marker(), z3_marker(),
+    ])
+    condition_cacheable = det_cache.enabled and joern_server is None
 
     if _extract_sg is not None:
         from concurrent.futures import ThreadPoolExecutor
 
         file_items = list(source_texts.items())
-        with ThreadPoolExecutor(max_workers=min(8, len(file_items) or 1)) as pool:
-            futures = {
-                pool.submit(_process_file_conditions, fp, src): fp
-                for fp, src in file_items
-            }
-            for fut, fut_fp in futures.items():
-                try:
-                    for finding_tuple in fut.result():
-                        _add(*finding_tuple)
-                except Exception:
-                    fp = fut_fp
-                    logger.debug("condition chain failed for %s", fp, exc_info=True)
+        condition_entries: dict[str, dict[str, Any]] = {}
+        to_compute: list[tuple[str, str]] = []
+        for fp, src in file_items:
+            cached_entry = (
+                det_cache.cached_condition(
+                    condition_key, fp, content_shas[fp],
+                ) if condition_cacheable else None
+            )
+            if cached_entry is not None:
+                condition_entries[fp] = cached_entry
+            else:
+                to_compute.append((fp, src))
+        if to_compute:
+            with ThreadPoolExecutor(
+                max_workers=min(8, len(to_compute)),
+            ) as pool:
+                futures = {
+                    pool.submit(_process_file_conditions, fp, src): fp
+                    for fp, src in to_compute
+                }
+                for fut, fut_fp in futures.items():
+                    try:
+                        condition_entries[fut_fp] = fut.result()
+                    except Exception:
+                        logger.debug(
+                            "condition chain failed for %s",
+                            fut_fp, exc_info=True,
+                        )
+        # Merge in file order (matching the fresh path's submission
+        # order) so hit/miss mixes reproduce a fully-fresh run's
+        # finding order byte-for-byte.
+        for fp, _src in file_items:
+            entry = condition_entries.get(fp)
+            if entry is None:
+                continue
+            for finding_tuple in entry["findings"]:
+                _add(*finding_tuple)
+            _guarded_funcs.update(entry["guarded"])
+            _sufficient_funcs.update(entry["sufficient"])
+            _decorative_funcs.update(entry["decorative"])
+            _smt_insufficient_funcs.update(entry["smt_insufficient"])
+            if condition_cacheable:
+                det_cache.store_condition(condition_key, fp, entry)
 
     # --- Structural detectors ---
-    call_graphs = None
     # Pure-AST extraction over hostile source: IO errors, parse quirks
     # and pathological nesting are the legitimate set. The checklist
     # bounds extraction to in-scope files (a bare tree walk loses
-    # in-scope files to the file cap on large targets).
-    with contextlib.suppress(OSError, ValueError, RecursionError):
-        call_graphs = _load_call_graphs_cached(config.target_path, checklist)
+    # in-scope files to the file cap on large targets). Lazy: on a
+    # full structural cache hit no detector block runs and the graphs
+    # are never parsed (the cache key covers their input BYTES via
+    # call_graph_inputs_fingerprint, which is a plain read + hash).
+    _cg_state: dict[str, Any] = {}
 
+    def _get_call_graphs() -> dict[str, Any] | None:
+        if "graphs" not in _cg_state:
+            graphs = None
+            with contextlib.suppress(OSError, ValueError, RecursionError):
+                graphs = _load_call_graphs_cached(
+                    config.target_path, checklist,
+                )
+            _cg_state["graphs"] = graphs
+        return _cg_state["graphs"]
+
+    # Callback-lifetime vocabulary up front: its digest is part of the
+    # structural lane's cache key. A failed build is distinguished
+    # from a legitimately-empty vocabulary — the run skips the
+    # callback block (pre-cache behaviour), so serving records that
+    # were computed WITH a vocabulary would diverge from fresh.
+    cb_vocab = None
+    cb_vocab_failed = False
     try:
+        from .condition_smt import DomainVocabulary
+        cb_vocab = DomainVocabulary.from_domain_model(
+            _load_domain_model(config),
+            target_path=config.target_path,
+        )
+    except OSError:
+        pass
+    except Exception:
+        cb_vocab_failed = True
+        logger.debug(
+            "mechanical: callback-lifetime vocabulary build failed",
+            exc_info=True,
+        )
+
+    structural_key: str | None = None
+    if det_cache.enabled:
+        _cg_fp = call_graph_inputs_fingerprint(
+            config.target_path, checklist,
+        )
+        # An undigestable vocabulary (digest None) keeps the lane
+        # uncacheable this run — a failure constant in its place would
+        # collide two DIFFERENT undigestable vocabularies into one key
+        # component. A build failure is a distinguished marker: the
+        # callback block skips, so its records are never stored, and
+        # the other detectors' results do not depend on the vocab.
+        _vocab_component = (
+            "vocab:error" if cb_vocab_failed
+            else vocabulary_digest(cb_vocab)
+        )
+        if _cg_fp is not None and _vocab_component is not None:
+            structural_key = digest_strings([
+                "sources", source_fingerprint(source_texts),
+                "gaps", gap_spans_digest(gaps),
+                "call-graphs", _cg_fp,
+                "vocab", _vocab_component,
+                tree_sitter_marker(),
+            ])
+
+    def _det_sentinel_collapse() -> list[Any]:
         from .sentinel_collapse import detect_sentinel_collapses
 
-        for sc in detect_sentinel_collapses(source_texts, call_graphs):
-            _add(
+        return [
+            (
                 sc.file,
                 sc.function,
                 "sentinel_collapse",
                 sc.line,
-                f"{sc.write_value} coerced via {sc.read_coercion}: {sc.semantic_loss}",
+                f"{sc.write_value} coerced via {sc.read_coercion}: "
+                f"{sc.semantic_loss}",
             )
-    except Exception:
-        logger.debug("mechanical: sentinel_collapse failed", exc_info=True)
+            for sc in detect_sentinel_collapses(
+                source_texts, _get_call_graphs(),
+            )
+        ]
 
-    try:
+    def _det_fail_open() -> list[Any]:
         from .fail_open_detector import detect_fail_open_patterns
 
-        for fo in detect_fail_open_patterns(source_texts, call_graphs):
-            _add(fo.file, fo.function, "fail_open", fo.line, fo.description)
-    except Exception:
-        logger.debug("mechanical: fail_open failed", exc_info=True)
+        return [
+            (fo.file, fo.function, "fail_open", fo.line, fo.description)
+            for fo in detect_fail_open_patterns(
+                source_texts, _get_call_graphs(),
+            )
+        ]
 
-    try:
+    def _det_return_domain() -> list[Any]:
         from .return_domain import detect_return_domain_mismatches
 
         _rd_roots = [config.target_path]
         if getattr(config, "study_root", None):
-            _rd_roots.append(Path(config.study_root))
-        for rdm in detect_return_domain_mismatches(
-            source_texts, roots=_rd_roots,
-        ):
-            _add(
+            _rd_roots.append(Path(config.study_root))  # type: ignore[arg-type]
+        return [
+            (
                 rdm.file,
                 rdm.function,
                 "return_domain",
                 rdm.line,
                 rdm.description,
             )
-    except Exception:
-        logger.debug("mechanical: return_domain failed", exc_info=True)
+            for rdm in detect_return_domain_mismatches(
+                source_texts, roots=_rd_roots,
+            )
+        ]
 
-    try:
+    def _det_pattern_completeness() -> list[Any]:
         from .pattern_completeness import detect_pattern_gaps
 
-        for pg in detect_pattern_gaps(source_texts):
-            _add(
+        return [
+            (
                 pg.file,
                 pg.function,
                 "pattern_gap",
                 pg.line,
                 f"{pg.gap_type}: {pg.pattern} — {pg.suggestion}",
             )
-    except Exception:
-        logger.debug("mechanical: pattern_completeness failed", exc_info=True)
+            for pg in detect_pattern_gaps(source_texts)
+        ]
 
-    try:
+    def _det_callsite_consistency() -> list[Any]:
         from .callsite_consistency import detect_callsite_deviations
 
-        for cd in detect_callsite_deviations(
-            source_texts, joern_server=joern_server,
-        ):
-            _add(
+        # Census reuse: the consistency prepass already built (and
+        # cached) a census for this run — rebuilding here paid the
+        # whole per-site scope-walk cost a second time per run (at
+        # kernel scale, minutes). Reuse is gated on coverage,
+        # completeness, and cache provenance (see
+        # _reusable_prepass_census). A superset census can carry
+        # deviations for files OUTSIDE the battery's text set: those
+        # are the prepass's business (already routed by its own
+        # channel) and must not enter this detector's records — the
+        # in-set filter below keeps the reuse path's output domain
+        # identical to a fresh build over source_texts.
+        _reuse_census = _reusable_prepass_census(
+            config, source_texts, joern_server=joern_server,
+        )
+        return [
+            (
                 cd.file,
                 cd.enclosing_function,
                 "callsite_deviation",
@@ -9470,14 +12402,20 @@ def _run_mechanical_detectors(
                 f"{cd.callee}: {cd.discarded_count}/{cd.total_sites} "
                 f"sites discard return value",
             )
-    except Exception:
-        logger.debug("mechanical: callsite_consistency failed", exc_info=True)
+            for cd in detect_callsite_deviations(
+                source_texts, joern_server=joern_server,
+                census=_reuse_census,
+            )
+            if _reuse_census is None or cd.file in source_texts
+        ]
 
-    try:
-        from .block_sibling_analysis import detect_block_sibling_asymmetries
+    def _det_block_sibling() -> list[Any]:
+        from .block_sibling_analysis import (
+            detect_block_sibling_asymmetries,
+        )
 
-        for bs in detect_block_sibling_asymmetries(source_texts):
-            _add(
+        return [
+            (
                 bs.file,
                 bs.function,
                 "block_sibling",
@@ -9485,17 +12423,14 @@ def _run_mechanical_detectors(
                 f"branch '{bs.branch_label}' deviates from its "
                 f"siblings: {bs.explanation}",
             )
-    except Exception:
-        logger.debug("mechanical: block_sibling failed", exc_info=True)
+            for bs in detect_block_sibling_asymmetries(source_texts)
+        ]
 
-    try:
+    def _det_dispatch_completeness() -> list[Any]:
         from .dispatch_completeness import find_dispatch_gaps
 
-        for dg in find_dispatch_gaps(
-            call_graphs or {}, source_texts,
-            target_root=config.target_path,
-        ):
-            _add(
+        return [
+            (
                 dg.table.file,
                 dg.table.function,
                 "dispatch_gap",
@@ -9504,64 +12439,68 @@ def _run_mechanical_detectors(
                 f"produced at {dg.produced_by} "
                 f"(confidence {dg.confidence})",
             )
-    except Exception:
-        logger.debug("mechanical: dispatch_completeness failed", exc_info=True)
+            for dg in find_dispatch_gaps(
+                _get_call_graphs() or {}, source_texts,
+                target_root=config.target_path,
+            )
+        ]
 
-    try:
+    def _det_transform_sequence() -> list[Any]:
         from .transform_sequence import detect_transform_order_violations
 
-        for tv in detect_transform_order_violations(source_texts):
-            _add(
+        return [
+            (
                 tv.file,
                 tv.function,
                 "transform_order",
                 tv.line,
                 f"{tv.violation} — fix: {tv.fix}",
             )
-    except Exception:
-        logger.debug("mechanical: transform_sequence failed", exc_info=True)
+            for tv in detect_transform_order_violations(source_texts)
+        ]
 
-    try:
+    def _det_value_space_checker() -> list[Any]:
         from .value_space_checker import detect_value_space_mismatches
 
-        for vm in detect_value_space_mismatches(source_texts, call_graphs):
+        records: list[Any] = []
+        for vm in detect_value_space_mismatches(
+            source_texts, _get_call_graphs(),
+        ):
             unhandled = ", ".join(vm.unhandled[:5])
-            _add(
+            records.append((
                 vm.consumer_file,
                 vm.consumer_function,
                 "value_space_mismatch",
                 0,
                 f"producer {vm.producer_function} emits values "
                 f"not handled by consumer: [{unhandled}]",
-            )
-    except Exception:
-        logger.debug("mechanical: value_space_checker failed", exc_info=True)
+            ))
+        return records
 
-    try:
+    def _det_type_confusion() -> list[Any]:
         from .type_confusion import detect_type_confusion
 
-        for tcf in detect_type_confusion(source_texts, call_graphs, joern_server):
-            _add(
+        return [
+            (
                 tcf.file,
                 tcf.function,
                 "type_confusion",
                 tcf.line,
                 tcf.describe(),
             )
-    except Exception:
-        logger.debug("mechanical: type_confusion failed", exc_info=True)
+            for tcf in detect_type_confusion(
+                source_texts, _get_call_graphs(), joern_server,
+            )
+        ]
 
-    try:
+    def _det_callback_lifetime() -> list[Any]:
+        if cb_vocab_failed:
+            raise RuntimeError(
+                "callback-lifetime vocabulary build failed",
+            )
         from .callback_lifetime import check_callback_lifetime_local
 
-        cb_vocab = None
-        with contextlib.suppress(OSError):
-            from .condition_smt import DomainVocabulary
-            cb_vocab = DomainVocabulary.from_domain_model(
-                _load_domain_model(config),
-                target_path=config.target_path,
-            )
-
+        records: list[Any] = []
         for fp in source_texts:
             if not any(fp.endswith(ext) for ext in _C_EXTS):
                 continue
@@ -9582,37 +12521,37 @@ def _run_mechanical_detectors(
                     detector = "callback_lifetime_local"
                     if clr.rcu_kfree_mismatch:
                         detector = "rcu_kfree_mismatch"
-                    _add(fp, func_name, detector, line_start, desc)
-    except Exception:
-        logger.debug("mechanical: callback_lifetime failed", exc_info=True)
+                    records.append(
+                        (fp, func_name, detector, line_start, desc),
+                    )
+        return records
 
-    # --- Auth-dismissal witnesses (Java) ---
-    try:
+    def _det_auth_witnesses() -> list[Any]:
+        # Auth-dismissal witnesses (Java).
         from .auth_witnesses import scan_gaps as _authw_scan
 
-        for aw in _authw_scan(gaps, source_texts):
-            _add(aw.file, aw.function, aw.detector, aw.line, aw.description)
-    except Exception:
-        logger.debug("mechanical: auth_witnesses failed", exc_info=True)
+        return [
+            (aw.file, aw.function, aw.detector, aw.line, aw.description)
+            for aw in _authw_scan(gaps, source_texts)
+        ]
 
-    # --- Check-then-create compound (keyed registration race) ---
-    try:
+    def _det_check_then_create() -> list[Any]:
+        # Check-then-create compound (keyed registration race).
         from .check_then_create import scan_gaps as _ctc_scan
 
-        for cf in _ctc_scan(gaps, source_texts):
-            _add(
+        return [
+            (
                 cf.file, cf.function, "check_then_create",
                 cf.write_line, cf.description(),
             )
-    except Exception:
-        logger.debug(
-            "mechanical: check_then_create failed", exc_info=True,
-        )
+            for cf in _ctc_scan(gaps, source_texts)
+        ]
 
-    # --- ASN.1 template declared-vs-accessed type witness ---
-    try:
+    def _det_asn1_template_mismatch() -> list[Any]:
+        # ASN.1 template declared-vs-accessed type witness.
         from .asn1_template_mismatch import scan_sources as _asn1_scan
 
+        records: list[Any] = []
         for am in _asn1_scan(source_texts):
             func_name = ""
             for gap in gaps:
@@ -9624,14 +12563,62 @@ def _run_mechanical_detectors(
                     func_name = gap.get("name", "")
                     break
             if func_name:
-                _add(
+                records.append((
                     am.file, func_name, "asn1_template_mismatch",
                     am.line, am.description(),
-                )
-    except Exception:
-        logger.debug(
-            "mechanical: asn1_template_mismatch failed", exc_info=True,
+                ))
+        return records
+
+    # Battery order is replay order — cached and fresh records must
+    # interleave exactly as a fully-fresh run would emit them. The
+    # cache_ok flags mark what a fingerprint can honestly cover:
+    # return_domain walks every root on its own wall-clock budget
+    # (inputs outside any fingerprint) so it always recomputes;
+    # callsite_consistency and type_confusion consult the live Joern
+    # CPG when a server is present, so they cache only without one.
+    battery: list[tuple[str, bool, Callable[[], list[Any]]]] = [
+        ("sentinel_collapse", True, _det_sentinel_collapse),
+        ("fail_open", True, _det_fail_open),
+        ("return_domain", False, _det_return_domain),
+        ("pattern_completeness", True, _det_pattern_completeness),
+        (
+            "callsite_consistency", joern_server is None,
+            _det_callsite_consistency,
+        ),
+        ("block_sibling", True, _det_block_sibling),
+        ("dispatch_completeness", True, _det_dispatch_completeness),
+        ("transform_sequence", True, _det_transform_sequence),
+        ("value_space_checker", True, _det_value_space_checker),
+        ("type_confusion", joern_server is None, _det_type_confusion),
+        ("callback_lifetime", True, _det_callback_lifetime),
+        ("auth_witnesses", True, _det_auth_witnesses),
+        ("check_then_create", True, _det_check_then_create),
+        (
+            "asn1_template_mismatch", True,
+            _det_asn1_template_mismatch,
+        ),
+    ]
+    for det_name, cache_ok, det_block in battery:
+        cache_key = structural_key if cache_ok else None
+        records = (
+            det_cache.cached_structural(cache_key, det_name)
+            if cache_key is not None else None
         )
+        if records is None:
+            try:
+                records = det_block()
+            except Exception:
+                # A raised block stores nothing: freezing a transient
+                # failure's empty result into the cache would turn it
+                # into a silent skip on every later run.
+                logger.debug(
+                    "mechanical: %s failed", det_name, exc_info=True,
+                )
+                continue
+        for rec in records:
+            _add(*rec)
+        if cache_key is not None:
+            det_cache.store_structural(cache_key, det_name, records)
 
     # --- Standing Coccinelle templates ---
     try:
@@ -9662,14 +12649,51 @@ def _run_mechanical_detectors(
                     if rule_path.is_file():
                         standing_rules.add(str(rule_path))
             if standing_rules:
+                cocci_key: str | None = None
+                if det_cache.enabled:
+                    from .prep_cache import content_fingerprint
+
+                    def _rule_bytes(rule_path_str: str) -> bytes:
+                        try:
+                            return Path(rule_path_str).read_bytes()  # raw-open: RAPTOR rules-dir file, hashed for the memo key
+                        except OSError:
+                            return b"<unreadable>"
+
+                    cocci_key = digest_strings([
+                        "rules",
+                        content_fingerprint(
+                            (p, _rule_bytes(p))
+                            for p in sorted(standing_rules)
+                        ),
+                        spatch_marker(),
+                    ])
                 c_files = [
-                    config.target_path / fp
+                    (fp, config.target_path / fp)
                     for fp in source_texts
                     if any(fp.endswith(ext) for ext in _C_EXTS)
                 ]
-                for c_file in c_files:
+                for src_fp, c_file in c_files:
                     if not c_file.is_file():
                         continue
+                    file_gaps_sha = gap_spans_digest(
+                        g for g in gaps if g.get("file") == src_fp
+                    )
+                    if cocci_key is not None:
+                        cached_recs = det_cache.cached_cocci(
+                            cocci_key, src_fp,
+                            content_shas[src_fp], file_gaps_sha,
+                        )
+                        if cached_recs is not None:
+                            for rec in cached_recs:
+                                _add(*rec)
+                            det_cache.store_cocci(
+                                cocci_key, src_fp,
+                                content_shas[src_fp], file_gaps_sha,
+                                cached_recs,
+                            )
+                            continue
+                    file_records: list[Any] = []
+                    file_complete = True
                     for rule_path_str in sorted(standing_rules):
                         sr = _run_cocci_rule(
                             c_file, Path(rule_path_str),
@@ -9678,6 +12702,12 @@ def _run_mechanical_detectors(
                             # (code trust) — @script:python trusted.
                             allow_scripting=True,
                         )
+                        if sr.errors:
+                            # Timeout partials / spatch errors are not
+                            # a stable result — cache nothing so the
+                            # next run retries instead of replaying a
+                            # truncated match set.
+                            file_complete = False
                         for match in sr.matches:
                             f_file = match.file or str(c_file)
                             f_line = match.line or 0
@@ -9699,12 +12729,22 @@ def _run_mechanical_detectors(
                                     break
                             if func_name:
                                 desc = match.message or str(match)
-                                _add(
+                                rec = (
                                     rel, func_name,
                                     f"cocci:{f_rule}", f_line, desc,
                                 )
+                                file_records.append(rec)
+                                _add(*rec)
+                    if cocci_key is not None and file_complete:
+                        det_cache.store_cocci(
+                            cocci_key, src_fp,
+                            content_shas[src_fp], file_gaps_sha,
+                            file_records,
+                        )
     except Exception:
         logger.debug("mechanical: standing_cocci failed", exc_info=True)
+
+    det_cache.save()
 
     # inject-mode detectors moved to lazy evaluation — see _InjectModeResolver
 
@@ -9756,16 +12796,179 @@ def _merge_stale(
     return gaps
 
 
+#: Database language (codeql_dbs canonical form) → the dispatch
+#: table's query-ID pack prefix. Languages without dispatch-table
+#: CodeQL entries have nothing to warm.
+_CODEQL_PACK_FOR_LANGUAGE = {
+    "cpp": "cpp",
+    "python": "py",
+    "javascript": "js",
+}
+
+
+def _launch_codeql_warmup(config: "OrchestratorConfig") -> None:
+    """Launch the background whole-run CodeQL warm-up (one thread).
+
+    Enumerates the dispatch table's query universe for each database's
+    language, resolves each spec through the SAME dispatchability gate
+    the chain producers apply (``_codeql_query_file`` — on-disk file
+    passthrough, else pack-ID resolution), and hands the RESOLVED
+    on-disk paths — the exact ``query_path`` values the dispatch site
+    later feeds ``run_codeql_sweep``, so the memo keys line up — to
+    :func:`core.audit.sweep.warm_codeql_memo` — one database at a
+    time on a single daemon thread (concurrent analyze on ONE db dies
+    on codeql's exclusive disk-cache lock; concurrent JVMs across dbs
+    would stack heap against the review loop). Each analyze runs
+    through the sandboxed runner inside warm_codeql_memo, and the
+    run's environment guard is consulted before launch and between
+    databases — a concluded or pressure-holding guard stops the
+    warm-up (background work must not keep writing evaluator cache
+    through a disk-pressure pause). Daemon: a run that ends first must
+    not be held open by a warm-up nobody will consume. Best-effort
+    throughout; every failure degrades to the per-query dispatch path.
+    """
+    db_paths = list(getattr(config, "codeql_db_paths", None) or [])
+    if not db_paths:
+        return
+    guard = getattr(config, "environment_guard_state", None)
+    if guard is not None and guard.holdoff():
+        logger.debug("codeql warm-up: environment guard holdoff — "
+                     "not launching")
+        return
+    try:
+        from .codeql_dbs import database_language
+        from .cwe_dispatch import codeql_query_ids_by_pack
+    except ImportError:
+        return
+    ids_by_pack = codeql_query_ids_by_pack()
+    memo = getattr(config, "codeql_memo", None)
+
+    work: list[tuple[str, list[str]]] = []
+    for db in db_paths:
+        try:
+            lang = database_language(Path(db))
+        except Exception:
+            logger.debug("codeql warm-up: language probe failed for %s",
+                         db, exc_info=True)
+            continue
+        pack = _CODEQL_PACK_FOR_LANGUAGE.get(lang or "")
+        if pack is None:
+            continue
+        # Hand the RESOLVED paths onward: warm_codeql_memo (like
+        # run_codeql_sweep) only accepts on-disk query files, so a
+        # pack ID passed raw would be silently dropped there and the
+        # warm-up would stay vacuous for every table entry the
+        # resolver just activated.
+        queries = [
+            resolved
+            for q in ids_by_pack.get(pack, ())
+            if (resolved := _codeql_query_file(q))
+        ]
+        if not queries:
+            logger.debug(
+                "codeql warm-up: no dispatchable on-disk query files "
+                "for %s (%s) — nothing to warm", db, lang,
+            )
+            continue
+        work.append((db, queries))
+
+    if not work:
+        return
+
+    # The warm-up thread outlives this call and, left to itself, its
+    # sandboxed runner would resolve its spawn seam
+    # (``core.sandbox.run``) lazily at each spawn — picking up
+    # whatever is globally live at that instant, including a
+    # transient process-wide patch some OTHER code in this process
+    # has installed by then (test fixtures monkeypatch that seam; a
+    # non-executing fake would feed the memo fabricated verdicts, a
+    # kwarg-swallowing one would drop the confinement). Resolve the
+    # spawn callable NOW, while this caller's context is
+    # authoritative, and pin it for the thread. Resolution failure
+    # keeps the original surface — lazily, inside the thread, at
+    # first spawn.
+    pinned_sandbox_run: Callable[..., Any] | None
+    try:
+        from core.sandbox import run as pinned_sandbox_run
+    except Exception:  # noqa: BLE001 — fail exactly where the lazy seam would
+        pinned_sandbox_run = None
+
+    def _warm_all() -> None:
+        from .sweep import warm_codeql_memo
+
+        for db, queries in work:
+            if guard is not None and guard.holdoff():
+                logger.debug(
+                    "codeql warm-up: environment guard holdoff — "
+                    "stopping before %s", db,
+                )
+                return
+            try:
+                stats = warm_codeql_memo(
+                    db, queries, memo, sandbox_run=pinned_sandbox_run,
+                )
+                if stats:
+                    logger.info(
+                        "codeql warm-up: %d/%d memo entries pre-filled "
+                        "for %s",
+                        stats.get("prefilled", 0),
+                        stats.get("queries", 0),
+                        db,
+                    )
+            except Exception:
+                logger.debug(
+                    "codeql warm-up failed for %s", db, exc_info=True,
+                )
+
+    _threading.Thread(
+        target=_warm_all, name="codeql-warmup", daemon=True,
+    ).start()
+
+
 def _codeql_db_for(config, file_path):
     """CodeQL database for ``file_path`` via the run's router.
+
+    Extensions the router's table cannot map (.inc fragments, niche
+    suffixes) get a language hint from the run's inventory, whose
+    checklist content-routes such files (``.inc`` → php/c/asm). Known
+    extensions never consult the inventory — the table is authoritative
+    there, so the hint costs nothing on the common path.
 
     Falls back to the single configured path when the router is absent
     (unit tests driving internals without run_orchestrator's
     normalisation)."""
     router = getattr(config, "codeql_db_router", None)
-    if router is not None:
-        return router.for_file(file_path)
-    return config.codeql_db_path
+    if router is None:
+        return config.codeql_db_path
+    from .codeql_dbs import CODEQL_EXT_LANGUAGE
+    hint = None
+    if file_path and (
+            Path(file_path).suffix.lower() not in CODEQL_EXT_LANGUAGE):
+        hint = _inventory_language_hint(config, file_path)
+    return router.for_file(file_path, language_hint=hint)
+
+
+def _inventory_language_hint(config, file_path: str) -> str | None:
+    """The inventory's recorded language for ``file_path``, or None.
+
+    Best-effort: a run without an inventory (or a path the checklist
+    does not carry) simply yields no hint — routing then behaves
+    exactly as before the hint existed."""
+    inventory = getattr(config, "inventory", None)
+    if not isinstance(inventory, dict) or not inventory.get("files"):
+        return None
+    try:
+        from core.inventory.lookup import lookup_file_language
+        return lookup_file_language(
+            inventory, file_path,
+            str(getattr(config, "target_path", "") or ""),
+        )
+    except Exception:  # noqa: BLE001 — a hint failure must not cost the dispatch
+        logger.debug(
+            "inventory language hint failed for %s", file_path,
+            exc_info=True,
+        )
+        return None
 
 
 def _build_prior_finding_analyses(
@@ -9874,8 +13077,10 @@ def _build_context(
         key = f"{gap['file']}:{gap['name']}"
         rec = evidence_index.get(key)
         if not blind and rec and rec.has_any_evidence():
+            # The prose rendering is the prompt form; the structured
+            # twin (format_evidence_structured) had no renderer and
+            # no other consumer — computing it was paid dead work.
             ctx["mechanical_evidence"] = format_evidence_prose(rec)
-            ctx["mechanical_evidence_structured"] = format_evidence_structured(rec)
 
             from .evidence_grade import grade_evidence_record
 
@@ -9943,6 +13148,14 @@ def _build_context(
         # fix-history mining) ride the gap into the review prompt.
         ctx["injected_hypotheses"] = list(gap["injected_hypotheses"])
 
+    if not blind and gap.get("seed_hypotheses"):
+        # External hypothesis seeds (core.audit.hypothesis_intake)
+        # stamped at prep time: claim + disproof recipe rendered as a
+        # hint-tier enveloped block. Withheld in blind mode like the
+        # other advisory prior claims — the seed is external context,
+        # not code.
+        ctx["seed_hypotheses"] = list(gap["seed_hypotheses"])
+
     if not blind and config.prior_finding_analyses:
         # Prior finding-grade claims (/agentic per-finding analyses of
         # scanner findings located in this function). Advisory prior
@@ -9993,12 +13206,13 @@ def _commit_outcome(
 
     from .collector import append_journal_for_outcome
 
-    # ``run_id`` derived from the run-dir basename to match Collector's
-    # convention (see Collector construction ~orchestrator.py:1810).
-    # Without this every ``_commit_outcome`` journal entry would carry
-    # an empty ``run_id``, breaking cross-run queries and the project
-    # index's provenance.
-    run_id = config.out_dir.name if config.out_dir else ""
+    # ``run_id`` derived from the RESOLVED run-dir basename — the
+    # shared ``_resolved_run_id`` identity every journal writer (and
+    # the Collector construction) stamps. Without it every
+    # ``_commit_outcome`` journal entry would carry an empty
+    # ``run_id``, breaking cross-run queries and the project index's
+    # provenance.
+    run_id = _resolved_run_id(config.out_dir)
     append_journal_for_outcome(
         out_dir=config.out_dir,
         target_path=config.target_path,
@@ -10020,6 +13234,11 @@ def _commit_outcome(
         "cost_usd": outcome.cost_usd,
         "duration_s": outcome.duration_s,
     }
+    if outcome.status == "error" and outcome.error_class:
+        # Machine-readable failure class: lets readers separate
+        # environment-caused non-reviews from genuine per-function
+        # review errors without parsing the body text.
+        entry["error_class"] = outcome.error_class
     if gap.get("edge_callee"):
         # Tier-1 edge-contract reviews journal under an edge-suffixed
         # key, but this audit-log record's key is the caller's plain
@@ -10048,6 +13267,11 @@ def _commit_outcome(
         entry["preconditions"] = outcome.review_result["preconditions"]
     if outcome.review_result and outcome.review_result.get("intent_trace"):
         entry["intent_trace"] = outcome.review_result["intent_trace"]
+    if rr.get("prompt_budget_event"):
+        # Prompt-budget disclosure (priority-0 elision / residual
+        # overshoot) rides the same per-row audit-log channel as
+        # preconditions/intent_trace.
+        entry["prompt_budget"] = rr["prompt_budget_event"]
     if rr.get("relies_on"):
         entry["relies_on"] = rr["relies_on"]
     strategies = gap.get("strategies")
@@ -10146,6 +13370,76 @@ def _resolve_hypothesis(outcome: ReviewOutcome) -> str:
     from .invariant_gate import resolve_hypothesis
 
     return resolve_hypothesis(outcome)
+
+
+def _hypothesis_source_texts(
+    config, target: Path, file_path: str,
+) -> dict[str, str] | None:
+    """Per-run memoised source intake for the resource-bounds /
+    protocol-state channels. The census walk is a pure function of
+    the target tree — memoised once per run; only the hypothesis's
+    primary-file overlay varies per dispatch (cheap: one contained
+    read). None for non-C/C++ primaries: both checks bail on those
+    before gathering, so eager intake would be pure waste."""
+    from .resource_bounds import (
+        _SOURCE_SUFFIXES,
+        _gather_source_texts,
+        _source_census,
+    )
+
+    if not file_path.endswith(_SOURCE_SUFFIXES):
+        return None
+    memo = getattr(config, "hypothesis_source_memo", None)
+    if memo is None:
+        # Duck-typed configs (tests, direct callers) without the
+        # per-run memo: compute uncached — the old per-dispatch cost,
+        # never a refusal.
+        census = _source_census(Path(target))
+    else:
+        census, _ = memo.get_or_compute(
+            ("source_census", str(target)),
+            lambda: _source_census(Path(target)),
+        )
+    return _gather_source_texts(Path(target), file_path, census=census)
+
+
+def _hypothesis_state_index(
+    config, target: Path, file_path: str,
+    source_texts: dict[str, str] | None,
+) -> dict[str, Any] | None:
+    """Per-run memoised state-field index (pure function of the
+    source texts; keyed on the primary file because its overlay
+    joins the indexed set). None when there is no intake."""
+    from .protocol_state import build_state_field_index
+
+    if source_texts is None:
+        return None
+    memo = getattr(config, "hypothesis_source_memo", None)
+    if memo is None:
+        return build_state_field_index(source_texts)
+    index, _ = memo.get_or_compute(
+        ("state_field_index", str(target), file_path),
+        lambda: build_state_field_index(source_texts),
+    )
+    return index
+
+
+def _g3_prior_review_rows(config) -> list[dict[str, Any]]:
+    """Prior-review rows feeding :func:`_check_finding_gates`' G3
+    re-recording check on a resumed run ([] otherwise).
+
+    Verified rows only — authority, not telemetry: a prior
+    "finding/suspicious" row DEMOTES a genuine finding as a gate
+    violation, and the audit log lives in the target-writable run
+    dir, so a planted row must never earn that. Unverified rows drop
+    (no prior record → no G3 demotion → the finding stands: fail
+    toward not-suppressing). Behaviorally pinned by the forged-row
+    test beside the other authority consumers — the substring census
+    alone cannot see a revert to the tolerant loader.
+    """
+    if not config.resume:
+        return []
+    return load_verified_audit_log(config.out_dir)
 
 
 def _check_finding_gates(
@@ -10248,15 +13542,6 @@ def _check_finding_gates(
 
 class _ContentFilterError(Exception):
     """Raised when the LLM response is blocked by a content filter."""
-
-
-_STATUS_SEVERITY = {
-    "finding": 3,
-    "suspicious": 2,
-    "dormant": 1,
-    "clean": 0,
-    "error": -1,
-}
 
 
 class _ClientBudgetGate:
@@ -10445,7 +13730,7 @@ def _multi_pass_review(
                 refute_fn=refute_fn,
                 cost_gate=cost_gate,
                 scorecard=scorecard,
-                priors_by_class=priors_by_class,
+                priors_by_class=priors_by_class,  # type: ignore[arg-type]
             )
 
             if not mr_result.items:
@@ -10651,17 +13936,62 @@ def _multi_pass_review(
 # class ceiling) — because by end of run a transport brownout has
 # usually cleared, and without the re-queue a single timeout
 # permanently errors the function's review.
+#
+# ``environment`` (disk/fd/memory errnos; any systemic class once the
+# breaker has concluded) is deliberately absent: an in-run retry
+# re-dispatches into the same faulted environment. The rows stay
+# error verdicts — excluded from the reviewed set, the coverage
+# import, and verdict reuse — so the functions re-enter the gap set
+# on the next run. Sub-threshold network/auth failures do NOT map to
+# ``environment`` (see _classify_error): a scattered transport blip
+# keeps its recoverable lane here.
 _RECOVERABLE_ERROR_CLASSES = frozenset(
     {"json_parse", "truncation", "api_error", "timeout"},
 )
 
 
-def _classify_error(exc: Exception) -> str:
+def _classify_error(
+    exc: Exception, config: OrchestratorConfig | None = None,
+) -> str:
     msg = str(exc).lower()
     if "content filter" in msg or "blocked" in msg:
         return "content_filter"
-    if "budget exceeded" in msg:
+    # Chokepoint, not a bare substring: exception text can quote
+    # model-chosen content, and the "budget" class drops the row from
+    # the recoverable retry lanes — the classifier vetoes shape
+    # failures on the causal chain.
+    from core.llm.client import is_budget_exceeded_error
+    if is_budget_exceeded_error(exc):
         return "budget"
+    # Environmental failures (see environment.marks_row_environment:
+    # chain-walked disk/fd/memory errnos always; network/auth only
+    # once the run's breaker has CONCLUDED) get their own class so
+    # journal readers can tell "the environment failed" from "this
+    # review failed". Deliberately NOT in _RECOVERABLE_ERROR_CLASSES:
+    # the end-of-run retry would re-dispatch into the same faulted
+    # environment; the next run (whose gap fold excludes error
+    # verdicts) retries the function instead. Checked before the
+    # message-text classes below — a systemic errno anywhere in the
+    # chain makes the whole failure environmental regardless of the
+    # outer wrapper. Sub-threshold network blips deliberately fall
+    # THROUGH to the recoverable classes below (they still feed the
+    # breaker window at the failure writers): marking scattered
+    # transients "environment" would permanently error those
+    # functions' reviews.
+    try:
+        from .environment import CLASS_NETWORK, marks_row_environment
+        from .environment import classify_systemic as _systemic
+        if marks_row_environment(
+            exc, getattr(config, "environment_guard_state", None),
+        ):
+            return "environment"
+        if _systemic(exc) == CLASS_NETWORK:
+            # A causal connection/DNS failure is a transport brownout:
+            # the recoverable api_error lane (end-of-run re-queue)
+            # owns it, whatever the outer wrapper's message says.
+            return "api_error"
+    except ImportError:
+        pass
     if "truncated" in msg or "output token limit" in msg:
         return "truncation"
     if isinstance(exc, json.JSONDecodeError):
@@ -10705,13 +14035,17 @@ def _classify_error(exc: Exception) -> str:
     return "internal"
 
 
-def _error_outcome(gap: dict[str, Any], exc: Exception) -> ReviewOutcome:
+def _error_outcome(
+    gap: dict[str, Any],
+    exc: Exception,
+    config: OrchestratorConfig | None = None,
+) -> ReviewOutcome:
     return ReviewOutcome(
         file=gap["file"],
         function=gap["name"],
         status="error",
         body=f"orchestrator: review_fn raised {type(exc).__name__}: {exc}",
-        error_class=_classify_error(exc),
+        error_class=_classify_error(exc, config),
     )
 
 
@@ -10757,7 +14091,6 @@ def _timeout_reduced_retry(
     )
     for key in _TRUNCATION_STRIP_KEYS:
         ctx.pop(key, None)
-    ctx["error_retry"] = True
     ctx["timeout_s"] = _TIMEOUT_RETRY_TIMEOUT_S
     try:
         outcome = review_fn(ctx, config)
@@ -10775,7 +14108,7 @@ def _timeout_reduced_retry(
         # Report the ORIGINAL timeout: its classification routes the
         # outcome into the end-of-run retry pass's timeout handling
         # (reduced context + capped per-call timeout).
-        return _error_outcome(gap, exc)
+        return _error_outcome(gap, exc, config)
     outcome.context_reduced = True
     if outcome.review_result is not None:
         outcome.review_result["context_reduced"] = True
@@ -10807,7 +14140,15 @@ def _retry_error_outcomes(
     if not error_outcomes:
         return result
 
+    # Environment gate before each retry dispatch: the tick pauses on
+    # resource pressure and the rails poll right after it observes a
+    # conclusion — retrying error outcomes into the very environment
+    # that errored them is the pass this gate exists for.
+    _env_gate = _make_dispatch_gate(config)
+
     for outcome in error_outcomes:
+        if _env_gate is not None:
+            _env_gate()
         if _check_budget(config, start_time, result):
             break
 
@@ -10844,7 +14185,6 @@ def _retry_error_outcomes(
             # (per-call caps are honoured by the claudecode
             # transport; SDK providers keep their own class ceiling).
             ctx["timeout_s"] = _TIMEOUT_RETRY_TIMEOUT_S
-        ctx["error_retry"] = True
 
         try:
             new_outcome = review_fn(ctx, config)
@@ -10961,15 +14301,29 @@ def _release_review_reserve(config: OrchestratorConfig) -> None:
         logger.debug("review reserve release failed", exc_info=True)
 
 
-def _hold_deepen_reserve(config: OrchestratorConfig) -> float:
-    """Hold the deepen phase's budget slice on the run's budget client.
+def _hold_deepen_reserve(
+    config: OrchestratorConfig, *, study_active: bool = False,
+) -> float:
+    """Hold the end-of-run consumers' budget slice on the budget client.
 
-    Only when deepen is enabled AND reachable (a budget client with a
-    finite cap exists and the fraction is positive). Returns the amount
-    held (0.0 when no reserve was taken)."""
-    if not config.deepen_suspicious:
-        return 0.0
-    fraction = getattr(config, "deepen_reserve_fraction", 0.0) or 0.0
+    The client holds ONE reserve at a time (a new hold replaces the
+    previous), so the priority chain is enforced by handover: before
+    the main loop this holds deepen + study together (reviews and
+    their refinement rounds gate against ``cap - both``); at the study
+    drain the caller re-holds deepen-only, releasing exactly the study
+    slice to the drain; the deepen phase releases the rest when it
+    starts. Returns the amount held (0.0 when no reserve was taken).
+    """
+    fraction = 0.0
+    if config.deepen_suspicious:
+        fraction += max(
+            0.0, getattr(config, "deepen_reserve_fraction", 0.0) or 0.0,
+        )
+    if study_active:
+        fraction += max(
+            0.0, getattr(config, "study_reserve_fraction", 0.0) or 0.0,
+        )
+    fraction = min(fraction, 0.9)
     if fraction <= 0:
         return 0.0
     client = getattr(config, "llm_budget_client", None)
@@ -10981,17 +14335,57 @@ def _hold_deepen_reserve(config: OrchestratorConfig) -> float:
         ) or 0
         if not cap or cap == float("inf"):
             return 0.0
-        held = client.hold_budget_reserve(cap * min(fraction, 0.9))
+        held = client.hold_budget_reserve(cap * fraction)
         if held:
             logger.info(
-                "deepen: holding $%.2f (%.0f%% of the $%.2f cap) in "
-                "reserve so announced re-reviews can execute",
-                held, 100.0 * min(fraction, 0.9), cap,
+                "deepen%s: holding $%.2f (%.0f%% of the $%.2f cap) in "
+                "reserve so announced re-reviews%s can execute",
+                "+study" if study_active else "",
+                held, 100.0 * fraction, cap,
+                " and pending study questions" if study_active else "",
             )
         return held
     except Exception:  # reserve is an optimisation, never fatal
         logger.debug("deepen reserve hold failed", exc_info=True)
         return 0.0
+
+
+def _drain_study_with_reserve_handover(
+    config: OrchestratorConfig,
+    study_queue: Any,
+    study_consumer_thread: Any,
+    deepen_reserve_held: float,
+    start_time: float,
+    result: "OrchestratorResult",
+) -> float:
+    """Drain-boundary step: hand the study slice back, then drain.
+
+    The budget client holds ONE reserve at a time, so re-holding
+    deepen-only here releases exactly the study slice to the drain
+    (and when deepen holds nothing of its own, the whole reserve is
+    released). The drain's exhaustion flag is re-evaluated against
+    the post-handover cap — the executor's sticky budget-stop flag
+    describes the OLD cap and would abandon the pending study
+    questions the slice exists to pay for; ``_check_budget``
+    re-checks every rail, including SIGTERM and wall clock, so
+    nothing weakens. Returns the updated deepen hold.
+    """
+    if study_queue is not None:
+        study_queue.signal_producer_done()
+    if study_consumer_thread is None:
+        return deepen_reserve_held
+    if deepen_reserve_held:
+        deepen_reserve_held = _hold_deepen_reserve(config)
+        if not deepen_reserve_held:
+            _release_deepen_reserve(config)
+    _drain_study_consumer(
+        study_consumer_thread,
+        study_queue,
+        budget_exhausted=bool(
+            _check_budget(config, start_time, result)
+        ),
+    )
+    return deepen_reserve_held
 
 
 def _release_deepen_reserve(config: OrchestratorConfig) -> None:
@@ -11028,7 +14422,7 @@ def _run_llm_client(config: OrchestratorConfig) -> Any:
     ledger enforces --max-cost: a fresh ``LLMClient()`` carries its own
     (default) cap, so its calls bypass the per-call reservation gate
     AND never reach the run's authoritative spend ledger — one measured
-    run booked $24.10 while telemetry showed $29.18 because iris /
+    run's ledger fell well short of its telemetry total because iris /
     spec_inference / post-loop classes each built private clients.
 
     Falls back to a fresh client (pinned to the run's primary model)
@@ -11037,14 +14431,16 @@ def _run_llm_client(config: OrchestratorConfig) -> Any:
     client = getattr(config, "llm_budget_client", None)
     if client is not None:
         return client
-    from core.llm.client import LLMClient
+    # Transcript seam: identical to LLMClient(...) with no session
+    # active.
+    from core.llm.transcript import build_llm_client
 
     model = (
         config.models[0]
         if config.models and config.models[0] != "default"
         else None
     )
-    return LLMClient(pinned_model=model) if model else LLMClient()
+    return build_llm_client(pinned_model=model) if model else build_llm_client()
 
 
 #: Seconds between incremental spend-floor writes from the budget
@@ -11076,7 +14472,7 @@ def _persist_spend_floor(
             last = getattr(result, "_spend_floor_written_at", 0.0)
             if not force and now - last < _SPEND_FLOOR_INTERVAL_S:
                 return
-            result._spend_floor_written_at = now
+            result._spend_floor_written_at = now  # type: ignore[attr-defined]
             spend = float(result.total_cost_usd or 0.0)
         client = getattr(config, "llm_budget_client", None)
         if client is not None:
@@ -11107,6 +14503,156 @@ def _persist_spend_floor(
         logger.debug("spend floor persist failed", exc_info=True)
 
 
+_SCORECARD_FLUSH_INTERVAL_S = 60.0
+
+
+def _flush_scorecard_events_now(
+    config: OrchestratorConfig,
+    result: OrchestratorResult,
+    *,
+    final: bool,
+) -> int:
+    """Ship pending scorecard events to the sidecar. Never raises.
+
+    ``final=False`` (incremental) ships only events the flush never
+    reconciles against the finding set (consistency-axis events and
+    refuter grades — see ``scorecard_events.is_reconcilable``);
+    reconcilable ``tool_evidence`` grades are held for the final
+    flush, because reconciliation (dropping a buffered refutation
+    when the function ends the run as a finding, and vice versa) is
+    only decidable at end of run. ``final=True`` ships everything
+    still pending, with the finding-set reconciliation.
+
+    Cross-flush duplicate defence is two-layered: shipped (or
+    deliberately dropped) event dicts are marked ``_flushed`` so no
+    later flush re-selects them, and the run-scoped dedup set rides
+    into every flush so a later event for an already-written cell is
+    dropped even though the earlier dict is no longer in the batch.
+    A failed batch write rolls the marks back so the events stay
+    retryable. Returns the number of events written.
+    """
+    try:
+        # Single-flight: flushes select-and-mark under ``result._lock``
+        # but write the sidecar OUTSIDE it (the write takes a
+        # cross-process flock and must never stall the tally hot
+        # path); this guard keeps two concurrent flushes from racing
+        # the shared cross-flush dedup set around that unlocked
+        # write. An incremental flush racing another flush just skips
+        # its slot; the final flush must wait and ship the remainder.
+        guard = result._scorecard_flush_lock
+        if not guard.acquire(blocking=final):
+            return 0
+        try:
+            # Resolve the store BEFORE claiming any events: a disabled
+            # scorecard writes nothing, and returning between the mark
+            # and the write would strand ``_flushed`` claims with no
+            # rollback — harmless while ``scorecard_enabled`` is
+            # per-run-static, but the claim/rollback invariant should
+            # not depend on that staying true.
+            store, disabled = _sc_resolve_store(
+                config.llm_client or config.llm_budget_client,
+            )
+            if disabled:
+                return 0
+            seen = result._scorecard_flush_seen
+            with result._lock:
+                batch = [
+                    ev for ev in result.scorecard_events
+                    if isinstance(ev, dict)
+                    and not ev.get("_flushed")
+                    and (final or not _sc_is_reconcilable(ev))
+                ]
+                if not batch:
+                    return 0
+                for ev in batch:
+                    ev["_flushed"] = True
+            # Same capped key builder the events buffered with — a raw
+            # f-string here would stop matching any function whose
+            # file:function exceeds the key cap, silently breaking
+            # reconciliation in BOTH grade directions.
+            finding_keys = (
+                {
+                    _sc_outcome_key(o)
+                    for o in result.outcomes
+                    if o.status == "finding"
+                }
+                if final
+                else frozenset()
+            )
+            written = _sc_flush_events(
+                batch,
+                finding_keys=finding_keys,
+                scorecard=store,
+                seen=seen,
+            )
+            if not written:
+                # Nothing landed (write failure, or every entry was a
+                # dedup/validation drop): roll the claim back so the
+                # final flush re-adjudicates the batch.
+                with result._lock:
+                    for ev in batch:
+                        ev.pop("_flushed", None)
+            return written
+        finally:
+            guard.release()
+    except Exception:  # noqa: BLE001 — telemetry must never break the run
+        logger.debug("scorecard flush failed", exc_info=True)
+        return 0
+
+
+def _flush_scorecard_events_incremental(
+    config: OrchestratorConfig,
+    result: OrchestratorResult,
+    *,
+    force: bool = False,
+) -> None:
+    """Throttled incremental flush of settled scorecard events.
+
+    The single end-of-run flush lost the whole run's graded events
+    whenever a segment was hard-killed (SIGKILL, OOM) before the
+    post-artifact finalize seam. Riding the budget poll (the same
+    seam as ``_persist_spend_floor``) keeps the never-reconciled
+    majority of the buffer at most an interval stale on disk;
+    reconcilable grades still wait for the final flush so the
+    reconciliation contract is preserved exactly. Never raises.
+    """
+    try:
+        now = time.monotonic()
+        with result._lock:
+            last = result._scorecard_flushed_at
+            if not force and now - last < _SCORECARD_FLUSH_INTERVAL_S:
+                return
+            result._scorecard_flushed_at = now
+        _flush_scorecard_events_now(config, result, final=False)
+    except Exception:  # noqa: BLE001 — telemetry must never break the run
+        logger.debug("incremental scorecard flush failed", exc_info=True)
+
+
+def _environment_stop_booked(
+    config: OrchestratorConfig,
+    result: OrchestratorResult,
+) -> bool:
+    """True when the run's environment guard has concluded, BOOKING
+    the terminal fields as it reports.
+
+    The single chokepoint for the environment stop: ``_check_budget``
+    routes its environment arm here, and every conclusion-flagged
+    dispatch gate uses it as its post-tick stop check. A conclusion
+    detected at a gate must never leave ``terminated_by ==
+    "complete"`` — the run would report success, the lifecycle would
+    close clean, and the resume hint would never print (dark
+    verification and Phase 2 run after the last full rails poll, so
+    nothing downstream would re-book it).
+    """
+    guard = getattr(config, "environment_guard_state", None)
+    if guard is None or not guard.concluded:
+        return False
+    result.terminated_by = "environment"
+    if not result.environment_fault:
+        result.environment_fault = guard.conclude_reason
+    return True
+
+
 def _check_budget(
     config: OrchestratorConfig,
     start_time: float,
@@ -11127,12 +14673,24 @@ def _check_budget(
     # rails — this is what books a hard-killed segment's spend for
     # the next resume segment.
     _persist_spend_floor(config, result)
+    # Same seam, same rationale: keep the sidecar's settled
+    # (never-reconciled) scorecard events fresh so a hard-killed
+    # segment doesn't lose the whole run's graded telemetry.
+    _flush_scorecard_events_incremental(config, result)
     # SIGTERM rides the budget-exhaustion rails: every loop and
     # post-loop pass that polls this stops dispatching, and the study
     # consumer's state-aware drain sees "exhausted" and stops too.
     if is_sigterm_requested():
         result.terminated_by = "sigterm"
         _persist_spend_floor(config, result, force=True)
+        _flush_scorecard_events_incremental(config, result, force=True)
+        return True
+    # Environment guard conclusion rides the same rails: every loop
+    # that polls the budget (executor, study consumer, deepen, error
+    # retry, trivial batches) stops dispatching into a faulted
+    # environment, and the run concludes through the normal
+    # drain/report path with a resume hint.
+    if _environment_stop_booked(config, result):
         return True
     if (
         not skip_max_seconds
@@ -11162,6 +14720,7 @@ _BUDGET_STOP_REASONS = {
     "llm_budget_exceeded": "budget exhausted",
     "max_cost_usd": "budget exhausted",
     "max_seconds": "time budget exhausted",
+    "environment": "environment fault",
 }
 
 
@@ -11215,6 +14774,23 @@ class StudyRequest:
     resolution: str = "identifier"
     context: str = ""
 
+    def __post_init__(self) -> None:
+        # Enqueue sites feed LLM review output straight into these
+        # fields; present-but-null and non-str leaves must route like
+        # absent BEFORE the Path()/.strip() consumers
+        # (_partition_study_batch, scope derivation) see them — a bad
+        # leaf here crashes the study consumer thread, not one item.
+        # Enum-backed fields heal to their defaults ("" is not a
+        # valid priority/resolution).
+        for field_name in ("question", "source_file",
+                           "source_function", "context"):
+            if not isinstance(getattr(self, field_name), str):
+                setattr(self, field_name, "")
+        if not isinstance(self.priority, str) or not self.priority:
+            self.priority = "normal"
+        if not isinstance(self.resolution, str) or not self.resolution:
+            self.resolution = "identifier"
+
 
 # C/C++ suffixes route to the study-prep corpus; the other supported
 # languages (core.concepts.lang_resolve.STUDY_LANGUAGES) resolve
@@ -11254,10 +14830,39 @@ class StudyQueue:
         self._progress = 0
         self._working = False
         self._inflight_proc: Any = None
+        # Journal-checkpoint quiesce seam: while a pause is requested,
+        # dequeue_batch returns empty (the consumer parks in its wait
+        # instead of starting new batches) and the quiescer waits for
+        # "paused and not working" — a state that can only hold until
+        # resume, because the dequeue gate is what would flip working
+        # back on. Cooperative and side-effect-free: pause never
+        # cancels a mid-batch step, it just outwaits it (bounded by
+        # the quiescer's own deadline).
+        self._pause_requested = False
 
     def enqueue(self, item: StudyRequest) -> None:
         concept = _extract_concept_from_question(item.question)
         with self._not_empty:
+            if self._consumer_done:
+                # The consumer has exited — nothing will ever dequeue
+                # this item, and (pre-fix) its concept still entered
+                # _pending_concepts, where it re-armed the executor's
+                # suppression gate FOREVER: the all-work-held wait
+                # released held tasks (consumer done) only for the
+                # dispatch path to re-hold them against a pending set
+                # nobody could ever study — a zero-CPU release/re-hold
+                # livelock. Reviews completing after the consumer's
+                # early exit (stale batches, budget, drain) are the
+                # producers. Drop with a debug note —
+                # behaviour-equivalent for study (the question would
+                # never have been studied either way) and
+                # side-effect-free for liveness.
+                logger.debug(
+                    "study-queue: dropping question enqueued after "
+                    "consumer exit (nothing will study it): %s",
+                    item.question,
+                )
+                return
             if concept and concept.lower() in self._studied_concepts:
                 # Already studied: re-adding would re-arm the
                 # executor's suppression hold for a concept study can
@@ -11282,12 +14887,26 @@ class StudyQueue:
         with self._not_empty:
             if self._stop_requested:
                 return []
+            if self._pause_requested:
+                # Parked: wait for resume (or stop) up to the poll
+                # timeout, then hand the consumer an empty batch — its
+                # loop re-runs the budget/stop checks each cycle, so
+                # the pause never blinds them.
+                self._not_empty.wait(timeout=timeout)
+                return []
             if not self._queue and not self._producer_done:
                 self._not_empty.wait(timeout=timeout)
-            if self._stop_requested:
+            if self._stop_requested or self._pause_requested:
                 return []
             batch = self._queue[:max_items]
             del self._queue[:max_items]
+            if batch:
+                # Atomic dequeue→working transition: the quiescer's
+                # "paused and not working" proof must never observe a
+                # dequeued-but-not-yet-working batch (the consumer's
+                # own set_working(True) lands a few lines later and is
+                # then an idempotent no-op).
+                self._working = True
             return batch
 
     def signal_producer_done(self) -> None:
@@ -11345,9 +14964,43 @@ class StudyQueue:
 
     def set_working(self, working: bool) -> None:
         """Mark whether the consumer is mid-batch (prep / study /
-        re-review) as opposed to idle on the queue."""
+        re-review) as opposed to idle on the queue. Notifies the
+        condition: the quiesce waiter parks on it for the
+        working→idle transition."""
         with self._not_empty:
             self._working = working
+            self._not_empty.notify_all()
+
+    def request_pause(self) -> None:
+        """Journal-checkpoint quiesce: gate new batch dequeues (the
+        consumer parks in its dequeue wait) without cancelling a
+        mid-batch step. Idempotent; pair with
+        :meth:`resume_from_pause`."""
+        with self._not_empty:
+            self._pause_requested = True
+            self._not_empty.notify_all()
+
+    def resume_from_pause(self) -> None:
+        """Lift the quiesce pause and wake a parked consumer."""
+        with self._not_empty:
+            self._pause_requested = False
+            self._not_empty.notify_all()
+
+    def wait_quiescent(self, timeout: float) -> bool:
+        """Block until the consumer is provably parked — pause
+        requested and not mid-batch (dequeues are gated, so the state
+        holds until resume) — or done. False on timeout: the caller
+        aborts its checkpoint attempt and resumes dispatch."""
+        deadline = time.monotonic() + timeout
+        with self._not_empty:
+            while True:
+                if self._consumer_done or (
+                        self._pause_requested and not self._working):
+                    return True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._not_empty.wait(timeout=min(remaining, 1.0))
 
     def drain_state(self) -> tuple[int, bool, bool]:
         """Snapshot for the drain loop: (progress, queue_empty, working)."""
@@ -11367,6 +15020,19 @@ class StudyQueue:
     def signal_consumer_done(self) -> None:
         with self._not_empty:
             self._consumer_done = True
+            # Concepts still pending at consumer exit are TERMINAL —
+            # nothing will ever study them — so they fold into the
+            # studied set rather than merely clearing: the enqueue
+            # drop-check then refuses later re-asks of the same
+            # concepts (quarantined-answer questions stay pending in
+            # the reading-list ledger by design and are re-asked by
+            # re-reviews every segment; a batch the consumer never
+            # dequeued before its early exit never entered the studied
+            # set either). A bare clear left those re-asks free to
+            # re-populate the pending set after this signal — the
+            # zombie state behind the executor's release/re-hold
+            # livelock.
+            self._studied_concepts |= self._pending_concepts
             self._pending_concepts.clear()
         self._notify_executor()
 
@@ -11475,6 +15141,63 @@ _STUDY_MAX_RE_REVIEWS = 50
 _STUDY_RE_REVIEW_PER_CYCLE = 10
 _STUDY_MAX_STALE_BATCHES = 3
 
+# Burn breaker for the incremental study consumer. Each run_study
+# invocation is a fresh phase with fresh abort counters, so a
+# deterministic failure (output budget vs model, dead study corpus)
+# that kills every invocation was never terminal: the consumer warned,
+# marked the batch studied, and bought the next batch's failing calls
+# — observed live as hours of full-price zero-yield study calls after
+# the phase's own abort line. Three trips, all of which disable the
+# lane loudly (no NEW concepts; reviews keep any already-extracted
+# domain model on disk):
+# * config-shaped (the phase says the same configuration re-buys the
+#   same failure) — disable on sight;
+# * consecutive whole-invocation failures — provider/corpus death;
+# * failure RATE over a minimum sample — a lane failing half its
+#   invocations interleaved with successes never trips a consecutive
+#   counter (observed live at ~50% failure for two hours) yet burns
+#   half its spend on nothing. Both directions hurt: trip too early
+#   and a transient provider brownout kills study for an otherwise
+#   healthy run (the consecutive limit already tolerates two); too
+#   late and the lane keeps paying for a systemic failure.
+_STUDY_RUN_CONSEC_FAIL_LIMIT = 3
+_STUDY_RUN_RATE_MIN_SAMPLE = 8
+_STUDY_RUN_RATE_LIMIT = 0.5
+
+# Lane-cumulative truncation-failure budget, independent of the
+# per-invocation cap: an invocation that partially succeeds with a
+# few truncation failures resets the consecutive counter and is
+# invisible to the rate arm (it counts as a success), so sub-cap
+# churn — a handful of full-price zero-yield calls EVERY invocation —
+# never tripped anything. The consumer accumulates
+# phase_stats["truncation_failures"] across invocations and disables
+# the lane at this budget. The stat's unit is per-ITEM: a salvaged
+# invocation contributes one count per item its split ladder
+# terminally discarded (recorded only at the discarding leaf, so the
+# count is independent of batch size and ladder depth), and an
+# invocation whose batch failed terminally contributes one per failed
+# batch. Both directions hurt: too LOW and a target
+# with genuinely oversized items spread across invocations loses the
+# lane while the split ladder was handling them item-by-item (each
+# discarded item is one truncation failure); too HIGH and sub-cap
+# churn buys that many zero-yield calls before the lane concedes.
+# Twice the per-invocation cap: room for two capped invocations'
+# worth of legitimate per-item discards across the whole lane.
+_STUDY_LANE_TRUNCATION_BUDGET = 12
+
+
+def _is_config_shaped_study_failure(exc: BaseException) -> bool:
+    """Chain-walked probe for the study phase's deterministic-config
+    marker (persistent output truncation past the phase cap)."""
+    try:
+        from core.llm.client import _exception_chain
+        return any(
+            getattr(e, "config_shaped", False)
+            for e in _exception_chain(exc)
+        )
+    except ImportError:
+        return bool(getattr(exc, "config_shaped", False))
+
 
 def _diff_new_concepts(
     seen_concepts: set,
@@ -11552,8 +15275,9 @@ def _partition_study_batch(
 
     Returns ``(c_reqs, ml_reqs, unsupported)``: C/C++ questions resolve
     against the study-prep corpus, ``ml_reqs`` (Python/Go/Java/JS-TS/
-    Rust) resolve in-process, and ``unsupported`` languages have no
-    resolver — those items are marked unresolvable, never guessed.
+    Rust/PHP/Kotlin/C#/Swift) resolve in-process, and ``unsupported``
+    languages have no resolver — those items are marked unresolvable,
+    never guessed.
     Requests without a source file stay on the C path (legacy shape).
     """
     from core.concepts.lang_resolve import language_for_path
@@ -11616,28 +15340,41 @@ def _mark_unsupported_unresolvable(
     unresolvable — they must not be studied, retried, or reported as
     resolved-clean."""
     try:
-        from core.concepts.reading_list import ReadingList
+        from core.concepts.reading_list import (
+            READING_LIST_WRITE_LOCK,
+            ReadingList,
+        )
+
+        from core.atomic_fs.fs_lock import artifact_lock
 
         rl_path = out_dir / "reading-list.json"
-        rl = ReadingList.load(rl_path)
-        changed = False
-        for req in reqs:
-            suffix = Path(req.source_file or "").suffix or "?"
-            reason = (
-                f"study loop has no resolver for '{suffix}' sources"
-            )
-            for item in rl.items:
-                if (
-                    item.question == req.question
-                    and not item.resolved
-                    and not item.unresolvable
-                ):
-                    item.mark_unresolvable(reason)
-                    changed = True
-                    _warn_critical_unresolvable(req, reason)
-                    break
-        if changed:
-            rl.save(rl_path)
+        # Load-modify-save cycle: hold the shared writer lock end to
+        # end so concurrent queuers (premise questions, audit_bridge)
+        # cannot be overwritten by this save, plus the file lock for
+        # concurrent runs on a project-level list (thread lock outer,
+        # file lock inner — one order everywhere).
+        with READING_LIST_WRITE_LOCK, artifact_lock(
+            rl_path, subject="reading list",
+        ):
+            rl = ReadingList.load(rl_path)
+            changed = False
+            for req in reqs:
+                suffix = Path(req.source_file or "").suffix or "?"
+                reason = (
+                    f"study loop has no resolver for '{suffix}' sources"
+                )
+                for item in rl.items:
+                    if (
+                        item.question == req.question
+                        and not item.resolved
+                        and not item.unresolvable
+                    ):
+                        item.mark_unresolvable(reason)
+                        changed = True
+                        _warn_critical_unresolvable(req, reason)
+                        break
+            if changed:
+                rl.save(rl_path)
     except Exception:
         logger.debug(
             "study-consumer: unsupported-language marking failed",
@@ -11897,14 +15634,12 @@ def _record_study_scorecard(
     (study_question decision class).  Best-effort — never blocks the
     consumer."""
     try:
+        # Shared resolver — honours RAPTOR_SCORECARD_PATH so isolated
+        # runs never write study events into the real install ledger.
+        from core.llm.scorecard.paths import default_scorecard_path
         from core.llm.scorecard.scorecard import EventType, ModelScorecard
 
-        raptor_dir = os.environ.get("RAPTOR_DIR")
-        path = (
-            Path(raptor_dir) / "out" / "llm_scorecard.json"
-            if raptor_dir else Path("out/llm_scorecard.json")
-        )
-        sc = ModelScorecard(path)
+        sc = ModelScorecard(default_scorecard_path())
         sc.record_event(
             "study_question",
             model or "default",
@@ -11920,13 +15655,12 @@ def _record_study_flip(config: OrchestratorConfig, outcome: Any) -> None:
     """Register a study-answer-driven verdict flip on the scorecard
     (volume signal under the study_question decision class)."""
     try:
+        # Shared resolver — same override contract as
+        # ``_record_study_scorecard`` above.
+        from core.llm.scorecard.paths import default_scorecard_path
         from core.llm.scorecard.scorecard import ModelScorecard
 
-        raptor_dir = os.environ.get("RAPTOR_DIR")
-        path = (
-            Path(raptor_dir) / "out" / "llm_scorecard.json"
-            if raptor_dir else Path("out/llm_scorecard.json")
-        )
+        path = default_scorecard_path()
         model = (
             getattr(outcome, "model", "")
             or (config.models[0] if config.models else "default")
@@ -12252,7 +15986,7 @@ def _mark_batch_reading_list(
                 )
                 _record_study_scorecard(
                     scorecard_model, False,
-                    agreement.get("reason") or "",
+                    str(agreement.get("reason") or ""),
                 )
                 ledger.append(StudyAnswer(
                     question=req.question,
@@ -12263,7 +15997,7 @@ def _mark_batch_reading_list(
                     tier="mechanical",
                     receipt=spot.receipt.to_dict(),
                     status="inconclusive",
-                    reason=agreement.get("reason") or "",
+                    reason=str(agreement.get("reason") or ""),
                     spot_check_override=overrode,
                     agreement=agreement,
                 ))
@@ -12368,7 +16102,7 @@ def _mark_batch_reading_list(
             _record_study_scorecard(
                 scorecard_model,
                 bool(agreement.get("agreed")),
-                agreement.get("reason") or "",
+                str(agreement.get("reason") or ""),
             )
         if not agreement.get("agreed"):
             logger.info(
@@ -12384,7 +16118,7 @@ def _mark_batch_reading_list(
                 tier=provenance,
                 receipt=receipt,
                 status="inconclusive",
-                reason=agreement.get("reason") or "",
+                reason=str(agreement.get("reason") or ""),
                 agreement=agreement,
                 probe_note=probe_note,
             ))
@@ -12408,7 +16142,10 @@ def _mark_batch_reading_list(
         ))
 
     if changed:
-        rl.save(rl_path)
+        # Merge-save under the shared writer lock: items queued by
+        # other writers while this instance processed answers must
+        # survive its save.
+        rl.save_merged(rl_path)
     if ledger:
         try:
             append_answers(out_dir, ledger)
@@ -12421,7 +16158,16 @@ def _mark_batch_reading_list(
 
 
 # Drain policy for the study consumer (all seconds):
-# hard ceiling on the wait — unchanged from the historical join(600);
+# FLOOR for the hard ceiling on the wait — the historical join(600).
+# The effective ceiling (``_study_drain_timeout_s``) raises this
+# floor to the longest wall a single study batch attempt can
+# legitimately hold (the escalated retry's stretched wall — 990s at
+# the shipped multiplier): a ceiling below that wall abandons a
+# healthy consumer mid-escalated-call after its tokens were billed,
+# and widens the post-drain daemon-unwind window by the difference; a
+# fixed constant ABOVE the max wall would make every genuinely wedged
+# drain wait that much longer for nothing, so the ceiling is derived,
+# not hardcoded.
 _STUDY_DRAIN_TIMEOUT_S = 600.0
 # how often the drain loop re-samples the consumer's state;
 _STUDY_DRAIN_POLL_S = 2.0
@@ -12436,12 +16182,25 @@ _STUDY_DRAIN_NO_PROGRESS_S = 60.0
 _STUDY_DRAIN_STOP_GRACE_S = 30.0
 
 
+def _study_drain_timeout_s() -> float:
+    """Effective drain ceiling: the floor raised to the longest wall
+    a single batch attempt can hold (see ``_STUDY_DRAIN_TIMEOUT_S``).
+    Resolved at call time so the study module's multiplier governs;
+    without the study module the historical floor stands.
+    """
+    try:
+        from core.concepts.study import _max_batch_wall_timeout
+    except ImportError:
+        return _STUDY_DRAIN_TIMEOUT_S
+    return max(_STUDY_DRAIN_TIMEOUT_S, _max_batch_wall_timeout())
+
+
 def _drain_study_consumer(
     thread: _threading.Thread,
     study_queue: StudyQueue | None,
     *,
     budget_exhausted: bool,
-    timeout_s: float = _STUDY_DRAIN_TIMEOUT_S,
+    timeout_s: float | None = None,
     no_progress_grace_s: float = _STUDY_DRAIN_NO_PROGRESS_S,
     stop_grace_s: float = _STUDY_DRAIN_STOP_GRACE_S,
     poll_s: float = _STUDY_DRAIN_POLL_S,
@@ -12468,7 +16227,14 @@ def _drain_study_consumer(
     Loud-degradation semantics are kept: abandoning a still-alive
     thread emits an operator-visible warning, and a forced stop is
     announced once.
+
+    ``timeout_s`` defaults (None) to ``_study_drain_timeout_s()`` —
+    the historical 600s floor raised to cover the longest single
+    batch attempt, so a healthy escalated retry is never abandoned by
+    the drain bound itself.
     """
+    if timeout_s is None:
+        timeout_s = _study_drain_timeout_s()
     stop_sent = False
     drain_start = time.monotonic()
     deadline = drain_start + timeout_s
@@ -12588,6 +16354,22 @@ def _study_consumer(
                 "seen_concepts": seen_concepts,
             },
         )
+    except Exception as exc:
+        # The loop's per-step shells catch what they can; anything
+        # escaping to here would otherwise kill the daemon thread
+        # with only a threading-excepthook traceback — the run then
+        # degrades SILENTLY, the exact failure _announce_study_disabled
+        # exists to make loud. Exception text can quote hostile
+        # target bytes: length up front (out-of-band authority),
+        # bounded, terminal-scrubbed.
+        from core.security.log_sanitisation import escape_nonprintable
+        logger.error("study-consumer: crashed", exc_info=True)
+        _msg = str(exc)
+        _announce_study_disabled(
+            f"study consumer crashed: {type(exc).__name__} "
+            f"({len(_msg)} chars): "
+            f"{escape_nonprintable(_msg[:200])}",
+        )
     finally:
         study_queue.signal_consumer_done()
 
@@ -12661,6 +16443,9 @@ def _run_study_prep(
                 cmd, proc.returncode, stdout=stdout, stderr=stderr,
             )
     finally:
+        for pipe in (proc.stdout, proc.stderr):
+            if pipe is not None and not pipe.closed:
+                pipe.close()
         if study_queue is not None:
             study_queue.clear_inflight()
 
@@ -12729,12 +16514,18 @@ def _study_prep_timeout_s(checklist: dict | None = None) -> int:
 
 def _announce_study_disabled(reason: str) -> None:
     """ONE operator-visible line when the domain-model subsystem is
-    disabled for the rest of the run. Reviews continue without domain
-    concepts — but the operator must be able to see that the run
-    degraded, not discover it from a silent absence of concepts."""
+    disabled for the rest of the run. Disabling stops NEW learning
+    only — briefing-side concept injection reads domain-model.json
+    from disk and keeps supplying already-extracted concepts — but
+    the operator must be able to see that the run degraded, not
+    discover it from a silent absence of concepts. The line must not
+    claim more than the loss: "reviews continue without domain
+    concepts" was false whenever a model file existed, and steered
+    operators to treat prior verdicts as concept-blind."""
     logger.warning(
         "study-consumer: %s — domain-model subsystem DISABLED for "
-        "this run (reviews continue without domain concepts)",
+        "this run (no NEW concepts will be learned; reviews keep "
+        "reading any already-extracted domain model on disk)",
         reason,
     )
 
@@ -12814,6 +16605,47 @@ def _study_consumer_loop(
     re_review_count = st.get("re_review_count", 0)
     stale_batches = st.get("stale_batches", 0)
     seen_concepts = st.get("seen_concepts", set())
+    # Burn-breaker accounting across run_study invocations (each
+    # invocation resets the phase's own counters — see the module
+    # constants above the consumer).
+    runstudy_ok = 0
+    runstudy_failed = 0
+    runstudy_consec_failed = 0
+    lane_truncation_failures = 0
+    # Study-drain progress checkpointing: same interval discipline as
+    # the executor's review loops. Resolved-question accounting is
+    # cumulative over each batch's eligible keys (the cheap number
+    # this loop already computes); a pending count would need a full
+    # reading-list scan per batch.
+    study_questions_resolved = 0
+    _last_progress_checkpoint = time.monotonic()
+
+    def _study_checkpoint(*, force: bool = False) -> None:
+        """Progress checkpoint: reviews completed (the executor's
+        field, unchanged meaning) plus this drain's study fields.
+        Interval-gated unless forced. Called after every run_study
+        invocation — failures included: an all-failing drain must
+        still advance ``updated_at`` (the frozen-record signal this
+        checkpointing exists to fix) and record its failure counts —
+        and forced once at loop exit so the counters' final state is
+        never lost to the interval gate.
+        """
+        nonlocal _last_progress_checkpoint
+        _now = time.monotonic()
+        if (not force
+                and _now - _last_progress_checkpoint
+                < _PROGRESS_CHECKPOINT_INTERVAL):
+            return
+        _update_run_progress(
+            config.out_dir, result,
+            study={
+                "batches_completed": runstudy_ok,
+                "batches_failed": runstudy_failed,
+                "questions_resolved": study_questions_resolved,
+                "re_reviews": re_review_count,
+            },
+        )
+        _last_progress_checkpoint = _now
     # Compile-probe cap is per RUN, shared across batches.
     probe_budget = st.get("probe_budget")
     if probe_budget is None:
@@ -12842,6 +16674,20 @@ def _study_consumer_loop(
 
     _requeue_pending_study(config, study_queue)
 
+    # Environment gate: the tick pauses new batch dequeues under
+    # resource pressure, and its stop check BOOKS a conclusion — the
+    # consumer can outlive every rails-polling pass (post-loop drain),
+    # so a conclusion observed only here must not leave the run
+    # reporting complete. The tick holds no lock across its pause —
+    # the consumer keeps its low-priority character: while paused it
+    # holds no throttle slot, no queue lock, nothing the main pass
+    # could block on. (``result`` is rebound by the re-review calls
+    # below; the late-binding closure books against the current one.)
+    _env_gate = _make_dispatch_gate(
+        config,
+        stop_check=lambda: _environment_stop_booked(config, result),
+    )
+
     while not study_queue.is_done():
         # Idle at the top of every iteration: the drain path uses the
         # working flag to tell "mid-batch, let it finish" apart from
@@ -12858,6 +16704,8 @@ def _study_consumer_loop(
         # results (a four-segment run got zero study output this way
         # — every segment's supervisor bound was spent before the
         # consumer's first batch). Cost caps stay absolute.
+        if _env_gate is not None:
+            _env_gate()
         if _check_budget(
             config, start_time, result,
             skip_max_seconds=not study_queue.producer_done(),
@@ -12914,9 +16762,10 @@ def _study_consumer_loop(
             continue
 
         # Language dispatch: C/C++ questions resolve against the
-        # study-prep corpus; Python/Go/Java/JS-TS/Rust resolve
-        # in-process per batch; languages with no resolver are marked
-        # unresolvable up front — never studied, never resolved-clean.
+        # study-prep corpus; Python/Go/Java/JS-TS/Rust/PHP/Kotlin/
+        # C#/Swift resolve in-process per batch; languages with no
+        # resolver are marked unresolvable up front — never studied,
+        # never resolved-clean.
         c_reqs, ml_reqs, unsupported = _partition_study_batch(fresh)
         if unsupported:
             _mark_unsupported_unresolvable(config.out_dir, unsupported)
@@ -12969,7 +16818,31 @@ def _study_consumer_loop(
                     study_queue=study_queue,
                 )
                 if prep_result.returncode != 0:
-                    _stderr_tail = (prep_result.stderr or "").strip()[:200]
+                    # study-prep parses the hostile target: its stderr
+                    # can quote target-derived bytes (paths, source
+                    # excerpts in parse errors) — terminal-scrub the
+                    # tail before it reaches the operator log stream.
+                    from core.security.log_sanitisation import (
+                        escape_nonprintable,
+                    )
+                    # The TAIL: a Python child's diagnosis (the
+                    # traceback's final frame + error) sits at the
+                    # END of stderr — a head slice keeps the banner
+                    # and drops the one line that names the failure.
+                    # The elision fact travels in the TRUSTED prefix
+                    # (a length count), never as an in-band marker:
+                    # hostile stderr can forge any marker text, and
+                    # log_sanitisation's contract wants authority
+                    # out-of-band.
+                    _stderr = (prep_result.stderr or "").strip()
+                    if len(_stderr) > 200:
+                        _stderr_tail = (
+                            f"stderr tail (last 200 of "
+                            f"{len(_stderr)} chars): "
+                            + escape_nonprintable(_stderr[-200:])
+                        )
+                    else:
+                        _stderr_tail = escape_nonprintable(_stderr)
                     _announce_study_disabled(
                         f"study-prep failed "
                         f"(exit {prep_result.returncode}): {_stderr_tail}",
@@ -13057,7 +16930,35 @@ def _study_consumer_loop(
                 "study-run",
             )
             break
+        # Second gate at the batch's own LLM dispatch point: the
+        # top-of-iteration tick ran before dedup/flush/prep, so a
+        # fault arising during those steps would otherwise still buy
+        # this batch's study call.
+        if _env_gate is not None:
+            if _env_gate():
+                logger.info(
+                    "study-consumer: environment guard concluded — "
+                    "exiting before study-run",
+                )
+                break
+            # The gate may have paused for minutes: a drain-
+            # abandonment stop (or a budget/SIGTERM trip) arriving
+            # DURING that pause was invisible to the checkpoint above,
+            # and nothing else re-checks before the paid study call —
+            # a full batch then dispatched after the run was over.
+            # Guard-scoped, so guard-less runs keep the pre-existing
+            # path byte-for-byte.
+            if study_queue.stop_requested or _check_budget(
+                config, start_time, result,
+                skip_max_seconds=not study_queue.producer_done(),
+            ):
+                logger.info(
+                    "study-consumer: stop arrived during the "
+                    "environment gate — exiting before study-run",
+                )
+                break
         n_before = len(dm.get("concepts", [])) if dm else 0
+        phase_stats: dict = {}
         try:
             from core.concepts.study import run_study
 
@@ -13067,6 +16968,11 @@ def _study_consumer_loop(
             # is shared with concurrent review calls.
             study_client = _run_llm_client(config)
             _study_before = _client_class_cost(study_client, "study")
+            # The queue's cooperative-stop flag reaches INTO the
+            # phase: pre-fix the drain path's request_stop could not
+            # interrupt a running run_study, and an abandoned daemon
+            # thread kept buying batches until process exit.
+            _phase_stop = lambda: study_queue.stop_requested  # noqa: E731
             try:
                 if throttle is not None:
                     # Low priority: study batches yield the contended
@@ -13074,22 +16980,27 @@ def _study_consumer_loop(
                     # enrichment must not starve the main loop.
                     with throttle.acquire_sync(low_priority=True):
                         run_study(
-                            study_list_path,
+                            study_list_path,  # type: ignore[arg-type]
                             config.out_dir,
                             study_client,
+                            should_stop=_phase_stop,
+                            phase_stats=phase_stats,
                         )
                 else:
                     run_study(
-                        study_list_path,
+                        study_list_path,  # type: ignore[arg-type]
                         config.out_dir,
                         study_client,
+                        should_stop=_phase_stop,
+                        phase_stats=phase_stats,
                     )
             finally:
                 # The study client's spend previously vanished: the
                 # report's Cost line AND the --max-cost gate read
                 # result.total_cost_usd, so a run under-reported (and
                 # under-enforced) by every Phase 2/3 study call —
-                # observed $2.87 reported vs $6.16 scorecard actual.
+                # one observed run reported well under half of its
+                # scorecard actual.
                 # Delta over the client's per-class ledger: the shared
                 # budget client also carries review/iris spend, so
                 # reading total_cost here would book the whole run
@@ -13106,12 +17017,58 @@ def _study_consumer_loop(
                     result.cost_tracker.record_call(
                         "study", cost_usd=spent,
                     )
-        except Exception:
+        except Exception as run_exc:
             logger.warning(
                 "study-consumer: study-run failed", exc_info=True,
             )
             _mark_concepts_studied(study_queue, fresh)
+            runstudy_failed += 1
+            runstudy_consec_failed += 1
+            lane_truncation_failures += int(
+                phase_stats.get("truncation_failures") or 0)
+            # Failed invocations checkpoint too (interval-gated):
+            # without this an all-failing drain never writes progress
+            # and looks identical to a hung one. The breaker breaks
+            # below fall through to the loop-exit flush.
+            _study_checkpoint()
+            total_runs = runstudy_ok + runstudy_failed
+            if _is_config_shaped_study_failure(run_exc):
+                # The phase itself concluded the failure is
+                # deterministic for this configuration — every future
+                # invocation re-buys it; no strike-counting.
+                _announce_study_disabled(
+                    "study-run failure is config-shaped (persistent "
+                    "output truncation) — the same configuration "
+                    "re-buys the same failure",
+                )
+                break
+            if lane_truncation_failures >= _STUDY_LANE_TRUNCATION_BUDGET:
+                _announce_study_disabled(
+                    f"{lane_truncation_failures} output-truncation "
+                    "failures accumulated across study-run "
+                    "invocations — sub-cap churn budget exhausted",
+                )
+                break
+            if runstudy_consec_failed >= _STUDY_RUN_CONSEC_FAIL_LIMIT:
+                _announce_study_disabled(
+                    f"{runstudy_consec_failed} consecutive study-run "
+                    "failures",
+                )
+                break
+            if (total_runs >= _STUDY_RUN_RATE_MIN_SAMPLE
+                    and runstudy_failed / total_runs
+                    >= _STUDY_RUN_RATE_LIMIT):
+                _announce_study_disabled(
+                    f"{runstudy_failed}/{total_runs} study-run "
+                    "invocations failed — burn rate at or above "
+                    f"{_STUDY_RUN_RATE_LIMIT:.0%}",
+                )
+                break
             continue
+        runstudy_ok += 1
+        runstudy_consec_failed = 0
+        lane_truncation_failures += int(
+            phase_stats.get("truncation_failures") or 0)
         study_queue.note_progress()
 
         # Reload domain model
@@ -13163,6 +17120,39 @@ def _study_consumer_loop(
                 "study-consumer: reading-list resolve failed",
                 exc_info=True,
             )
+        study_questions_resolved += len(eligible_keys)
+
+        _study_checkpoint()
+
+        if (lane_truncation_failures >= _STUDY_LANE_TRUNCATION_BUDGET
+                and not phase_stats.get("truncation_capped")):
+            # Sub-cap churn: every invocation "succeeds" while paying
+            # for a few zero-yield truncated calls — invisible to the
+            # consecutive counter (reset on success) and the rate arm
+            # (counted as success). The lane budget is the arm that
+            # sees it. Bookkeeping above already banked this
+            # invocation's results.
+            _announce_study_disabled(
+                f"{lane_truncation_failures} output-truncation "
+                "failures accumulated across study-run invocations — "
+                "sub-cap churn budget exhausted",
+            )
+            break
+
+        if phase_stats.get("truncation_capped"):
+            # The phase salvaged some batches but hit its cumulative
+            # output-truncation cap — config-shaped like the
+            # all-failed case (the interleaved-successes variant,
+            # observed live at ~50% failure for hours): every further
+            # invocation re-buys the same per-batch burn. This
+            # invocation's results were kept and booked above.
+            _announce_study_disabled(
+                f"study phase hit the output-truncation cap "
+                f"({phase_stats.get('truncation_failures')} full-price "
+                "zero-yield calls) — output budget misconfigured for "
+                "this model",
+            )
+            break
 
         # Starvation guard
         if n_after == n_before:
@@ -13266,6 +17256,14 @@ def _study_consumer_loop(
         )
         re_review_count += len(to_review)
         study_queue.note_progress()
+
+    if runstudy_ok + runstudy_failed:
+        # Final flush: every exit path (drained queue, stop request,
+        # breaker trip) lands here, and the interval gate may have
+        # swallowed the last batches' outcome. Guarded so a loop that
+        # never ran a study invocation writes nothing (no progress
+        # record to go stale, nothing to report).
+        _study_checkpoint(force=True)
 
     logger.info(
         "study-consumer: done (re-reviews=%d, stale_batches=%d)",
@@ -13371,6 +17369,10 @@ def _flatten_checklist_with_source(
     path discards the base under ``/`` semantics and ``../`` segments
     escape it (CWE-22).  Escaping entries keep their metadata but get
     no source body.
+
+    Kept as a bespoke walk (not :func:`_iter_checklist_items`): it
+    reads inventory-written checklists only (strict ``path``/``items``
+    keys) and interleaves the per-file source cache with the walk.
     """
     from pathlib import Path as _Path
 
@@ -13402,13 +17404,14 @@ def _flatten_checklist_with_source(
                             )
                             src_cache[rel_path] = []
                         else:
-                            try:
-                                src_cache[rel_path] = (
-                                    src_file.read_text(errors="replace")
-                                    .splitlines()
-                                )
-                            except OSError:
-                                src_cache[rel_path] = []
+                            from core.source import (
+                                read_text_capped as _rtc,
+                            )
+                            _got = _rtc(src_file)
+                            src_cache[rel_path] = (
+                                [] if _got is None
+                                else _got[0].splitlines()
+                            )
                     lines = src_cache[rel_path]
                     source = "\n".join(lines[ls - 1:le])
             result.append({
@@ -13906,222 +17909,63 @@ def _write_unresolved_synthesis_hits(
 
 def _review_items(
     batch: list[dict[str, Any]],
+    shared: Any,
     config: OrchestratorConfig,
     review_fn: Callable,
-    checklist: dict[str, Any],
-    context_map: dict[str, Any] | None,
-    fuzz_coverage: dict[str, Any] | None,
-    evidence_index: dict[str, EvidenceRecord] | None = None,
-    discovered_evidence: dict[str, Any] | None = None,
-    domain_model: dict[str, Any] | None = None,
+    result: Any,
+    *,
+    joern_server: Any = None,
+    audit_log: Any = None,
+    workqueue: list[dict[str, Any]] | None = None,
+    reviewed_set: set[str] | None = None,
+    start_time: float = 0.0,
+    layer_disagreements: list[Any] | None = None,
+    collector: Any = None,
+    graph: Any = None,
+    reviewed_outcomes: Any = None,
 ) -> list[ReviewOutcome]:
-    """Review a group of trivial functions from the same file individually."""
-    outcomes = []
+    """Review a batch of trivial functions through the full pipeline.
+
+    Delegates to ``review_one_function`` so batched outcomes receive the
+    same post-review verification (sweep validation, proactive validation,
+    refinement, chain injection, etc.) as individually reviewed functions.
+    """
+    from core.llm.client import LLMBudgetExceededError
+
+    siblings = [
+        f"{g['name']} (L{g.get('line_start', '?')}-{g.get('line_end', '?')})"
+        for g in batch
+    ]
+    outcomes: list[ReviewOutcome] = []
     for gap in batch:
-        dead_reason = _dead_code_reason(gap)
-        if dead_reason:
-            outcome = ReviewOutcome(
-                file=gap["file"],
-                function=gap["name"],
-                status="dormant",
-                body=(
-                    f"[dead-code gate: {dead_reason}] "
-                    f"Function is in provably dead code — skipped LLM review."
-                ),
-                evidence_tool="reachability:dead_code",
-            )
-            outcome.line = gap.get("line_start", 0)
-            try:
-                _commit_outcome(config, outcome, gap, batch=True)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "commit failed for %s:%s: %s",
-                    gap["file"],
-                    gap["name"],
-                    exc,
-                )
-            outcomes.append(outcome)
-            continue
-
-        ctx = _build_context(
-            config,
-            gap,
-            checklist,
-            context_map,
-            evidence_index,
-            discovered_evidence=discovered_evidence,
-            blind=config.blind_first_pass,
-        )
-        if fuzz_coverage:
-            ctx["fuzz_coverage"] = _fuzz_coverage_for(
-                fuzz_coverage,
-                gap["file"],
-                gap["name"],
-            )
-        ctx["batch_context"] = [
-            f"{g['name']} (L{g.get('line_start', '?')}-{g.get('line_end', '?')})"
-            for g in batch
-        ]
         try:
-            outcome = review_fn(ctx, config)
-        except _ContentFilterError:
-            outcome = ReviewOutcome(
-                file=gap["file"],
-                function=gap["name"],
-                status="error",
-                body="blocked by content filter",
+            outcome = review_one_function(
+                gap,
+                shared,
+                config,
+                review_fn,
+                result,
+                joern_server=joern_server,
+                audit_log=audit_log,
+                workqueue=workqueue,
+                reviewed_set=reviewed_set,
+                start_time=start_time,
+                layer_disagreements=layer_disagreements,
+                on_progress=None,
+                review_idx=0,
+                total=0,
+                collector=collector,
+                graph=graph,
+                reviewed_outcomes=reviewed_outcomes,
+                batch_context=siblings,
             )
-        except Exception as exc:  # noqa: BLE001
-            from core.llm.client import is_budget_exceeded_error
-
-            if is_budget_exceeded_error(exc):
-                # Terminal: stop the batch and return what completed.
-                # The budget-killed function is NOT journaled, so it
-                # stays gap-eligible for a future run.
-                logger.warning(
-                    "batch review stopped at %s:%s — LLM budget exhausted "
-                    "(%d/%d reviewed; rest stay gaps)",
-                    gap["file"], gap["name"], len(outcomes), len(batch),
-                )
-                break
+        except LLMBudgetExceededError:
             logger.warning(
-                "review_fn failed for %s:%s: %s",
-                gap["file"],
-                gap["name"],
-                exc,
+                "batch review stopped at %s:%s — LLM budget exhausted "
+                "(%d/%d reviewed; rest stay gaps)",
+                gap["file"], gap["name"], len(outcomes), len(batch),
             )
-            outcome = _error_outcome(gap, exc)
-
-        if outcome.status == "finding":
-            gate_violations = _check_finding_gates(outcome, mode=config.mode)
-            if gate_violations:
-                for v in gate_violations:
-                    logger.warning(
-                        "gate violation %s:%s: %s — demoted to suspicious",
-                        outcome.file,
-                        outcome.function,
-                        v,
-                    )
-                outcome = _demote_outcome(
-                    outcome,
-                    f"[gate violation: {'; '.join(gate_violations)}]",
-                )
-
-        # ── Refutation gates (batch path) ─────────────────────────
-        if outcome.status in ("finding", "suspicious"):
-            # Own try: records only, must never skip refutation.
-            try:
-                from .binary_honesty import record_gate_engagement
-
-                record_gate_engagement(
-                    config.out_dir,
-                    outcome,
-                    domain_model=domain_model,
-                    checklist=checklist,
-                    line_start=gap.get("line_start", 0),
-                    phase="review_batch",
-                )
-            except Exception:
-                logger.debug(
-                    "gate-engagement record skipped (batch)",
-                    exc_info=True,
-                )
-
-            try:
-                from .refutation import refute_hypothesis
-
-                rv = refute_hypothesis(
-                    outcome,
-                    domain_model=domain_model,
-                    checklist=checklist,
-                    config=config,
-                )
-                if rv is not None:
-                    append_audit_log(config.out_dir, {
-                        "action": "refutation_gate",
-                        "gate": rv.gate,
-                        "key": f"{outcome.file}:{outcome.function}:{gap.get('line_start', 0)}",
-                        "file": outcome.file,
-                        "function": outcome.function,
-                        "reason": rv.reason,
-                        "demote_to": rv.demote_to,
-                        "original_status": outcome.status,
-                        "applied": True,
-                        "batch": True,
-                    })
-                    logger.info(
-                        "refutation gate [%s] %s:%s — %s → %s (batch)",
-                        rv.gate, outcome.file, outcome.function,
-                        rv.reason, rv.demote_to,
-                    )
-                    outcome = _demote_outcome(
-                        outcome, f"[{rv.gate}: {rv.reason}]",
-                    )
-                    outcome.status = rv.demote_to
-            except Exception:
-                logger.debug(
-                    "refutation gate error for %s:%s (batch)",
-                    gap.get("file"), gap.get("name"),
-                    exc_info=True,
-                )
-
-        # ── Anti-self-refutation (batch path) ────────────────────
-        if outcome.status == "clean":
-            try:
-                from .refutation import rescue_self_refuted
-
-                rv = rescue_self_refuted(
-                    outcome,
-                    config=config,
-                    source=_read_raw_source(
-                        config.target_path,
-                        gap.get("file", ""),
-                        gap.get("line_start", 0),
-                        gap.get("line_end"),
-                    ) or None,
-                    pre_evidence=gap.get("_smt_pre_evidence"),
-                    target_path=config.target_path,
-                    out_dir=config.out_dir,
-                    repo_trusted=config.repo_trusted,
-                )
-                if rv is not None:
-                    append_audit_log(config.out_dir, {
-                        "action": "refutation_gate",
-                        "gate": rv.gate,
-                        "key": f"{outcome.file}:{outcome.function}:{gap.get('line_start', 0)}",
-                        "file": outcome.file,
-                        "function": outcome.function,
-                        "reason": rv.reason,
-                        "demote_to": rv.demote_to,
-                        "original_status": outcome.status,
-                        "applied": True,
-                        "batch": True,
-                    })
-                    logger.info(
-                        "anti-self-refutation %s:%s — %s → %s (batch)",
-                        outcome.file, outcome.function,
-                        rv.reason, rv.demote_to,
-                    )
-                    outcome.status = rv.demote_to
-                    outcome.body = (
-                        f"[{rv.gate}: {rv.reason}]\n\n" + outcome.body
-                    )
-            except Exception:
-                logger.debug(
-                    "anti-self-refutation error for %s:%s (batch)",
-                    gap.get("file"), gap.get("name"),
-                    exc_info=True,
-                )
-
-        try:
-            _commit_outcome(config, outcome, gap, batch=True)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "commit failed for %s:%s: %s",
-                gap["file"],
-                gap["name"],
-                exc,
-            )
+            break
         outcomes.append(outcome)
     return outcomes
 
@@ -14136,6 +17980,41 @@ def _dead_code_reason(gap: dict[str, Any]) -> str | None:
     if gap.get("build_excluded"):
         return "build_excluded (file excluded from compilation)"
     return None
+
+
+def _binary_absent_verdict(
+    config: OrchestratorConfig,
+    file_path: str,
+    name: str,
+    line: int = 0,
+) -> bool:
+    """Absent verdict for the review-time gates (G7, reachability).
+
+    Prefers the file+line join over the enriched inventory
+    (``core.analysis.reachability.binary_oracle_absent``) — the flat
+    name-keyed ``config.binary_verdicts`` map collapses same-named
+    static functions across translation units, so a LIVE function
+    could be demoted because a dead namesake in another TU carried
+    the verdict. The flat map remains the no-inventory fallback
+    (``extract_verdicts`` already withholds ``absent`` without a
+    full-tier contributor).
+    """
+    inventory = config.inventory
+    if isinstance(inventory, dict) and inventory.get("binary_oracle"):
+        try:
+            from core.analysis.reachability import binary_oracle_absent
+            return binary_oracle_absent(
+                inventory, file_path, name, line or 0,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "binary_oracle_absent join failed for %s:%s",
+                file_path, name, exc_info=True,
+            )
+            return False
+    if config.binary_verdicts:
+        return config.binary_verdicts.get(name, "") == "absent"
+    return False
 
 
 def _apply_reachability_gate(
@@ -14170,8 +18049,10 @@ def _apply_reachability_gate(
     if is_sink:
         return outcome
 
-    if config.binary_verdicts:
-        verdict = config.binary_verdicts.get(outcome.function, "")
+    if config.binary_verdicts or (
+        isinstance(config.inventory, dict)
+        and config.inventory.get("binary_oracle")
+    ):
         _is_header_inline = (
             outcome.file.endswith(".h")
             and "static" in (ctx.get("source", "") or "")[:200]
@@ -14181,10 +18062,15 @@ def _apply_reachability_gate(
             and outcome.evidence_tool != "reachability:dead_code"
         )
         if (
-            verdict == "absent"
-            and not is_entry
+            not is_entry
             and not _is_header_inline
             and not _has_tool_evidence
+            # File+line join preferred over the flat name-keyed map —
+            # see _binary_absent_verdict.
+            and _binary_absent_verdict(
+                config, outcome.file, outcome.function,
+                outcome.line or 0,
+            )
         ):
             logger.info(
                 "reachability gate: %s demoted to dormant (binary: absent)",
@@ -14489,6 +18375,24 @@ def _clear_file_lines_cache() -> None:
 _parse_wrapper_cache: dict[str, frozenset] = {}
 
 
+def _contained_source_text(target_path: Path, file_path: str) -> str | None:
+    """Containment-checked, capped whole-file read of an artifact path.
+
+    Whole-file sibling of :func:`_read_raw_source` for the prep loops,
+    post-loop verifiers and prompt-context builders: ``file_path``
+    comes from checklist/gap/outcome records (LLM-writable), so the
+    join is confined and the read capped
+    (``core.source.read_contained``). ``None`` — escaping, missing, or
+    unreadable — degrades to each caller's existing no-source path
+    (map entry skipped, hint not built, tool sees empty source).
+    """
+    if not file_path:
+        return None
+    from core.source import read_contained
+
+    return read_contained(target_path, file_path)
+
+
 def _read_raw_source(
     target_path: Path,
     file_path: str,
@@ -14525,11 +18429,12 @@ def _read_raw_source(
             _file_lines_cache.move_to_end(cache_key)
             lines = _file_lines_cache[cache_key]
         else:
-            lines = None
-            try:
-                lines = full_path.read_text(errors="replace").splitlines()
-            except OSError:
-                lines = None
+            # Capped fd read — the cache weighed st_size only AFTER
+            # a raw read had already buffered the file whole; the cap
+            # bounds the read itself (FIFO plants refuse at the open).
+            from core.source import read_text_capped as _rtc
+            _got = _rtc(full_path)
+            lines = None if _got is None else _got[0].splitlines()
             # Byte-weighted admission + eviction: the key's st_size is
             # the entry's weight (splitlines memory is proportional to
             # it). Oversized files are returned uncached.
@@ -14791,6 +18696,7 @@ def _hypothesis_to_tool_chain(
     hypothesis: str,
     file_path: str,
     cwe: str = "",
+    language: str | None = None,
 ) -> list[dict[str, Any]]:
     """Build an ordered list of tools to try for a hypothesis.
 
@@ -14803,12 +18709,17 @@ def _hypothesis_to_tool_chain(
     CWE-based dispatch seeds the chain first (strongest, most stable
     signal), then string-matched tools augment with hypothesis-specific
     patterns.
+
+    ``language`` is the inventory's recorded language for the file
+    (``_inventory_language_hint``): content-probed unknown extensions
+    can satisfy the curated-semgrep leg's language gate where the
+    extension cannot (see ``resolve_semgrep_rule_for_cwe``).
     """
     chain: list[dict[str, Any]] = []
     seen_types: set = set()
 
     if cwe:
-        cwe_chain = _cwe_fallback_chain(cwe, hypothesis)
+        cwe_chain = _cwe_fallback_chain(cwe, hypothesis, file_path, language)
         for entry in cwe_chain:
             chain.append(entry)
             seen_types.add(entry["type"])
@@ -15034,7 +18945,7 @@ def _hypothesis_to_tool_chain(
         except ImportError:
             pass
         else:
-            if joern_applicable(cwe):
+            if joern_applicable(cwe, file_path):
                 sinks = sinks_for_cwe(cwe)
                 if sinks:
                     chain.append({"type": "joern", "config": {"sinks": sinks}})
@@ -15046,11 +18957,11 @@ def _hypothesis_to_tool_chain(
         except ImportError:
             pass
         else:
-            codeql_query = codeql_query_for_cwe(cwe)
-            if codeql_query and _codeql_query_file(codeql_query):
+            codeql_query = _resolved_codeql_query(
+                codeql_query_for_cwe(cwe) or "",
+            )
+            if codeql_query:
                 chain.append({"type": "codeql", "config": {"query": codeql_query}})
-            elif codeql_query:
-                _note_codeql_unsupported_query_id(codeql_query)
 
     if "integer_truncation" not in seen_types:
         try:
@@ -15083,6 +18994,56 @@ def _hypothesis_to_tool_chain(
             if is_struct_field_hypothesis(hypothesis):
                 chain.append({"type": "struct_field", "config": {}})
                 seen_types.add("struct_field")
+
+    # Sanitizer-sufficiency hypotheses ("escapeshellcmd does not quote
+    # argument boundaries", "htmlspecialchars without ENT_QUOTES
+    # leaves the attribute breakable"): the sanwit channel executes
+    # the extracted chain against the sink context's breakout corpus
+    # in a sandboxed interpreter. Appended — pre-existing chain order
+    # is unchanged. Language-gated at BUILD time (not just at the
+    # substrate seam): the leg's existence feeds the empty-dispatch
+    # synthesis routing, which must not change for non-PHP files.
+    if "sanwit" not in seen_types:
+        try:
+            from .sanwit import (
+                is_sanwit_hypothesis,
+                sanwit_language_permitted,
+            )
+        except ImportError:
+            pass
+        else:
+            if is_sanwit_hypothesis(hypothesis) and (
+                sanwit_language_permitted(file_path, language)
+            ):
+                chain.append({"type": "sanwit", "config": {}})
+                seen_types.add("sanwit")
+
+    # Deserialization-gadget hypotheses ("no magic-method gadgets in
+    # tree", "POP chain through __destruct"): the gadget oracle
+    # enumerates PHP magic methods and property→sink flows across the
+    # whole tree — a found chain exhibits (detection-grade stamp),
+    # ordinary absence renders census-qualified inconclusive, and the
+    # one corpus-earned shape (complete census, zero POP trigger
+    # surface) refutes; the refutation's sole downstream authority is
+    # the post-review confidence clamp (_apply_gadget_absence_gate),
+    # never a status change. Appended — pre-existing chain order is
+    # unchanged. Language-gated at BUILD time like sanwit: the leg's
+    # existence feeds the empty-dispatch synthesis routing, which
+    # must not change for non-PHP files.
+    if "gadget_oracle" not in seen_types:
+        try:
+            from core.analysis.gadget_oracle import (
+                gadget_language_permitted,
+                is_gadget_hypothesis,
+            )
+        except ImportError:
+            pass
+        else:
+            if is_gadget_hypothesis(hypothesis) and (
+                gadget_language_permitted(file_path, language)
+            ):
+                chain.append({"type": "gadget_oracle", "config": {}})
+                seen_types.add("gadget_oracle")
 
     return chain
 
@@ -15293,6 +19254,244 @@ def _caller_contract_demotion_pass(
         )
 
 
+_GADGET_ABSENCE_MARKER = "[gadget-absence:"
+
+#: Distinct suppressions.jsonl verdict for the post-review clamp row —
+#: never shared with the channel's record-only absence rows
+#: (``gadget_oracle_no_gadgets``) or the caller-contract rows.
+_GADGET_ABSENCE_VERDICT = "gadget_absence_refuted"
+
+
+def _recognized_gadget_absence_record(record: Any) -> bool:
+    """A ``gadget_absence`` record this gate itself wrote: the exact
+    rule/outcome/reason stamps plus the demotion clamp. Anything else
+    is unrecognized — ``review_result`` rides back from the model
+    review, so the key can be PLANTED, and the export clamp must
+    never fire without oracle authority. Unrecognized pre-existing
+    records are dropped and re-derived by the gate."""
+    if not isinstance(record, dict):
+        return False
+    from core.analysis.gadget_oracle import (
+        REASON_NO_SURFACE_COMPLETE,
+        RULE_NO_SURFACE,
+    )
+    demotion = record.get("demotion")
+    return (
+        record.get("rule_id") == RULE_NO_SURFACE
+        and record.get("outcome") == "refuted"
+        and record.get("reason") == REASON_NO_SURFACE_COMPLETE
+        and isinstance(demotion, dict)
+        and demotion.get("confidence_clamp") == "low"
+    )
+
+
+def _apply_gadget_absence_gate(
+    outcome: ReviewOutcome,
+    config: OrchestratorConfig,
+) -> bool:
+    """Adjudicate one gadget-dependent outcome against the corpus-
+    earned absence refutation and, when it holds, demote the exported
+    confidence (the ``_apply_caller_contract_gate`` precedent).
+
+    Demotion requires ALL of: status finding/suspicious; no
+    confirming-role tool evidence; a gadget-shaped primary hypothesis
+    with EVERY live sibling hypothesis also gadget-dependent (the
+    exported confidence covers the whole finding); the channel's
+    ``refuted`` verdict (``absence_earns_suppression``: complete
+    census AND zero POP trigger surface — any census gap, any surface
+    method, any ``Serializable`` implementation, any dynamic-
+    definition site, any autoload-family registration declines at
+    the channel); and the persisted
+    artifact passing ``report_matches_target`` against this run's
+    target (one-target rule, fail-closed — no artifact, no demotion).
+
+    On demotion: body gains the ``[gadget-absence: ...]`` prefix,
+    ``review_result`` gains a structured ``gadget_absence`` record
+    (exported next to ``caller_evidence`` and enforced as a
+    confidence clamp by ``findings_export.build_graded_finding``),
+    and a ``dropped: false`` row lands in suppressions.jsonl with the
+    distinct :data:`_GADGET_ABSENCE_VERDICT`. Status is NEVER
+    changed: zero in-tree trigger surface refutes the gadget-chain
+    mechanism against THIS tree — the deserialization-of-untrusted-
+    input observation still ships at confidence=low.
+    """
+    review = outcome.review_result
+    if isinstance(review, dict) and "gadget_absence" in review:
+        if (_recognized_gadget_absence_record(review.get("gadget_absence"))
+                and _GADGET_ABSENCE_MARKER in (outcome.body or "")):
+            # Already gated (resume / replay idempotence): the gate's
+            # own record shape AND its body receipt are both present.
+            return False
+        # Any other pre-existing key was not written by this gate —
+        # review_result rides back from the model review, so the key
+        # can be planted. Drop it and re-derive: the export clamp
+        # must never fire without oracle authority, and a genuinely
+        # earning tree gets a fresh oracle-derived record below. The
+        # pop happens BEFORE every eligibility return on purpose: an
+        # outcome this gate declines to adjudicate (wrong status,
+        # binary path, tool-confirmed evidence) must not ship a
+        # planted record into the export as a cosmetic receipt
+        # either. (A planted record that byte-perfectly forges BOTH
+        # the record shape and the body marker still only
+        # self-demotes — the model already controls its own
+        # confidence field.)
+        review.pop("gadget_absence", None)
+    if outcome.status not in ("finding", "suspicious"):
+        return False
+    if outcome.file.startswith(BINARY_PATH_PREFIX):
+        return False
+    if _is_tool_confirmed(outcome.evidence_tool):
+        return False
+    if review is not None and not isinstance(review, dict):
+        # Exotic review_result shapes cannot carry the gadget_absence
+        # record — decline rather than half-demote (caller-contract
+        # precedent).
+        return False
+    hypothesis = _resolve_hypothesis(outcome)
+    if not hypothesis or _GADGET_ABSENCE_MARKER in (outcome.body or ""):
+        return False
+    from core.analysis.gadget_oracle import (
+        absence_earns_suppression,
+        is_gadget_hypothesis,
+        load_gadget_report,
+        report_matches_target,
+        run_gadget_oracle_check,
+    )
+    if not is_gadget_hypothesis(hypothesis):
+        return False
+    # Multi-hypothesis outcomes: zero gadget surface says nothing
+    # about a live sibling mechanism ("also, the upload path is
+    # traversable") — demote only when every live hypothesis is
+    # gadget-dependent (the all-live-hypotheses discipline of the
+    # caller-contract gate).
+    for h in outcome.hypotheses or []:
+        if not isinstance(h, dict):
+            continue
+        mech = h.get("mechanism") or ""
+        if (h.get("confidence") or "").lower() == "refuted":
+            continue
+        if mech and not is_gadget_hypothesis(mech):
+            return False
+    # One-target rule vehicle: the artifact. Without a run dir there
+    # is no report to hold against the target — fail closed.
+    if not config.out_dir:
+        return False
+    go_res = run_gadget_oracle_check(
+        config.target_path,
+        outcome.file,
+        outcome.function,
+        hypothesis,
+        output_dir=config.out_dir,
+    )
+    _record_channel_receipt(
+        config, "gadget_absence_gate", outcome.file, outcome.function,
+        go_res,
+    )
+    if go_res.outcome != "refuted":
+        return False
+    report = load_gadget_report(config.out_dir)
+    if report is None or not report_matches_target(
+            report, config.target_path):
+        return False
+    if not absence_earns_suppression(report):
+        return False
+
+    prefix = (
+        "[gadget-absence: zero POP trigger surface in tree "
+        "(complete census)]"
+    )
+    outcome.body = f"{prefix}\n\n{outcome.body or ''}"
+    record: dict[str, Any] = {
+        "rule_id": go_res.rule_id,
+        "outcome": go_res.outcome,
+        "reason": go_res.reason,
+        "absence_tier": go_res.absence_tier,
+        "census": dict(go_res.census),
+        "qualifier": go_res.qualifier,
+        "demotion": {
+            "confidence_clamp": "low",
+            "status": outcome.status,  # unchanged — never suppresses
+        },
+    }
+    if isinstance(outcome.review_result, dict):
+        outcome.review_result["gadget_absence"] = record
+    else:
+        # review_result is None here (non-dict shapes declined above).
+        # Slotted or frozen outcome objects reject the attribute — the
+        # export clamp then simply never sees the record (fail-open to
+        # the un-demoted state).
+        with contextlib.suppress(AttributeError):
+            outcome.review_result = {"gadget_absence": record}
+    try:
+        from core.analysis.reach_chokepoint import record_suppression
+
+        record_suppression(
+            Path(config.out_dir),
+            finding={
+                "id": (
+                    f"{outcome.file}:{outcome.function}:"
+                    f"{outcome.line}"
+                ),
+                "rule_id": go_res.rule_id,
+                "file_path": outcome.file,
+                "line": outcome.line,
+                "function": outcome.function,
+            },
+            verdict=_GADGET_ABSENCE_VERDICT,
+            reason=(
+                f"gadget-absence gate: {go_res.reason} — confidence "
+                "clamped to low; finding still exported. The absence "
+                "claim holds against this tree only: a gadget class "
+                "shipped outside the scanned tree is outside it by "
+                "design."
+            ),
+            dropped=False,
+            extra={
+                "absence_tier": go_res.absence_tier,
+                "confidence_clamp": "low",
+            },
+        )
+    except Exception:
+        logger.debug(
+            "gadget-absence suppression row failed", exc_info=True,
+        )
+    logger.info(
+        "gadget-absence gate: %s:%s confidence→low — %s",
+        outcome.file, outcome.function, go_res.reason,
+    )
+    return True
+
+
+def _gadget_absence_demotion_pass(
+    result: Any,
+    config: OrchestratorConfig,
+) -> None:
+    """Post-review gadget-absence confidence demotion over the final
+    outcome list (see ``_apply_gadget_absence_gate`` for the per-
+    outcome contract).  Runs beside the caller-contract pass, before
+    the journal correction pass and the graded export so journal,
+    export, and summary agree."""
+    if not getattr(config, "gadget_absence_demotion", True):
+        return
+    demoted = 0
+    for outcome in result.outcomes:
+        try:
+            if _apply_gadget_absence_gate(outcome, config):
+                demoted += 1
+        except Exception:
+            logger.debug(
+                "gadget-absence gate failed for %s:%s",
+                outcome.file, outcome.function, exc_info=True,
+            )
+    if demoted:
+        logger.info(
+            "gadget-absence gate: %d outcome(s) demoted to "
+            "confidence=low (corpus-earned zero-POP-surface absence; "
+            "receipts in suppressions.jsonl)",
+            demoted,
+        )
+
+
 def _record_fail_open_receipt(
     config: OrchestratorConfig,
     file_path: str,
@@ -15391,54 +19590,152 @@ def _record_invariant_receipt(
 
 # Whether the codeql-tier degradation skip was already announced (log
 # once per process, then debug — every CWE-seeded chain would
-# otherwise repeat the same line).
+# otherwise repeat the same line). The list stays the reset unit
+# (tests swap in a fresh [False]); the lock closes the check-then-set
+# window, since parallel review workers hit the first skip together.
 _CODEQL_DEGRADED_LOGGED: list[bool] = [False]
+_CODEQL_DEGRADED_LOCK = _threading.Lock()
 
 
-def _note_codeql_degraded_skip(file_path: str, function_name: str) -> None:
+def _note_codeql_degraded_skip(
+    file_path: str, function_name: str,
+    reason: str = "no CodeQL database",
+) -> None:
     """One loud line the first time a codeql chain step is skipped
-    because the tier degraded at startup (no database), debug after."""
-    if not _CODEQL_DEGRADED_LOGGED[0]:
+    with no database to serve it, debug after.
+
+    ``reason`` distinguishes a run with no database at all from a run
+    whose database(s) simply do not cover this file's language — the
+    old fixed wording blamed startup degradation for router misses.
+    """
+    with _CODEQL_DEGRADED_LOCK:
+        first = not _CODEQL_DEGRADED_LOGGED[0]
         _CODEQL_DEGRADED_LOGGED[0] = True
+    if first:
         logger.info(
-            "codeql tier degraded at startup (no CodeQL database) — "
-            "codeql chain steps are skipped for this run; fallback "
-            "channels (semgrep/joern/smt) cover their claims",
+            "codeql chain steps skipped (%s) — fallback channels "
+            "(semgrep/joern/smt) cover their claims",
+            reason,
         )
     logger.debug(
-        "tool_chain codeql skipped %s:%s — tier degraded (no database)",
-        file_path, function_name,
+        "tool_chain codeql skipped %s:%s — %s",
+        file_path, function_name, reason,
     )
 
 
+def _substrate_tree_languages(
+    config: OrchestratorConfig,
+) -> frozenset[str] | None:
+    """Canonical language mix of the run's inventory, or None."""
+    from .substrate import tree_language_set
+
+    return tree_language_set(getattr(config, "inventory", None))
+
+
+def _note_substrate_skip(
+    config: OrchestratorConfig,
+    tier_counters: dict[str, TierCounters] | None,
+    tool_type: str,
+    file_path: str,
+    function_name: str,
+    *,
+    reason: str,
+    language: str | None,
+    receipt: dict[str, Any] | None,
+) -> None:
+    """Book one substrate skip: the skip + substrate counters, the
+    per-language tally the report's honesty block reads, and a
+    journal row. Accounting must never cost the dispatch, so the
+    journal write degrades to a debug line."""
+    if tier_counters:
+        _increment_tier_dict(tier_counters, tool_type, "skipped")
+        _increment_tier_dict(tier_counters, tool_type, "skipped_substrate")
+        _tally_substrate_language(tier_counters, tool_type, language)
+    logger.debug(
+        "substrate skip: %s did not look at %s:%s — %s",
+        tool_type, file_path, function_name, reason,
+    )
+    if not config.out_dir:
+        return
+    try:
+        row: dict[str, Any] = {
+            "action": "substrate_skip",
+            "key": f"{file_path}:{function_name}",
+            "file": file_path,
+            "function": function_name,
+            "tool": tool_type,
+            "reason": reason,
+        }
+        if receipt:
+            row["substrate"] = receipt
+        append_audit_log(config.out_dir, row)
+    except Exception:
+        logger.debug("substrate-skip journal row failed", exc_info=True)
+
+
 # Query IDs already reported as unsupported (log once per id, not once
-# per dispatch — a hot CWE class would otherwise spam the log).
+# per dispatch — a hot CWE class would otherwise spam the log). The
+# set stays the reset unit (tests swap in a fresh set()); the lock
+# closes the check-then-add window, since parallel review workers
+# dispatching the same hot CWE class hit an id's first miss together.
 _CODEQL_UNSUPPORTED_IDS_LOGGED: set[str] = set()
+_CODEQL_UNSUPPORTED_IDS_LOCK = _threading.Lock()
 
 
-def _codeql_query_file(query: str) -> bool:
-    """Whether a chain codeql query spec is dispatchable.
+def _codeql_query_file(query: str) -> str | None:
+    """THE shared lookup surface for chain codeql query specs.
 
-    ``run_codeql_sweep`` requires an existing on-disk query file; the
-    CWE dispatch table carries pack query IDs (``cpp/overflow-buffer``)
-    that nothing in this codebase resolves to a file — dispatching one
-    errors unconditionally.
+    Both the dispatch gate and pack-wide enumeration consumers
+    consult this one function, so a spec class it accepts activates
+    everywhere at once. Returns the dispatchable on-disk ``.ql`` path:
+    an existing file path passes through; a pack query ID
+    (``cpp/overflow-buffer``) resolves against the installed packs'
+    ``@id`` index (core.audit.codeql_query_resolver, cached per
+    process). None = not dispatchable (``run_codeql_sweep`` requires
+    a query file). Truthiness-compatible with the old boolean gate.
     """
-    return bool(query) and Path(query).exists()
+    if not query:
+        return None
+    if Path(query).exists():
+        return query
+    try:
+        from .codeql_query_resolver import resolve_query_id
+        return resolve_query_id(query)
+    except Exception:  # noqa: BLE001 — resolution is best-effort
+        logger.debug(
+            "codeql id resolution failed for %r", query, exc_info=True,
+        )
+        return None
+
+
+def _resolved_codeql_query(query: str) -> str | None:
+    """Producer-side wrapper over :func:`_codeql_query_file`: same
+    lookup, plus the loud-once note when a spec is unresolvable so
+    the chain's codeql slot stays honestly empty."""
+    resolved = _codeql_query_file(query)
+    if resolved:
+        return resolved
+    if query:
+        _note_codeql_unsupported_query_id(query)
+    return None
 
 
 def _note_codeql_unsupported_query_id(
     query: str, file_path: str = "", function_name: str = "",
 ) -> None:
     """One loud line per query id when a codeql step names a query ID
-    instead of an on-disk query file, debug after — honest degradation
-    instead of a permanently erroring dispatch."""
-    if query not in _CODEQL_UNSUPPORTED_IDS_LOGGED:
+    that is neither an on-disk query file nor resolvable against the
+    installed packs, debug after — honest degradation instead of a
+    permanently erroring dispatch."""
+    with _CODEQL_UNSUPPORTED_IDS_LOCK:
+        first = query not in _CODEQL_UNSUPPORTED_IDS_LOGGED
         _CODEQL_UNSUPPORTED_IDS_LOGGED.add(query)
+    if first:
         logger.info(
-            "codeql chain step unsupported: codeql query id %r is not "
-            "an on-disk query file and no resolver exists — skipping "
-            "(fallback channels cover the claim)",
+            "codeql chain step unsupported: query id %r is not an "
+            "on-disk query file and did not resolve to an installed "
+            "pack query — skipping (fallback channels cover the "
+            "claim)",
             query,
         )
     logger.debug(
@@ -15492,7 +19789,10 @@ def _warn_unmapped_cwe(cwe: str) -> None:
     an empty chain and the claim is never mechanically tested.
     Policy-parked classes get their own line: they are unmapped by
     decision, and their suspicious verdicts do NOT become synthesis
-    candidates.
+    candidates. Synthesis-owned classes (dispatch entries carrying the
+    ``synthesis_owned`` marker) also get their own info line: their
+    empty chain is the adjudicated design and the synthesis lane IS
+    the verifier.
     """
     norm = cwe.upper().strip()
     if not norm.startswith("CWE-"):
@@ -15501,11 +19801,13 @@ def _warn_unmapped_cwe(cwe: str) -> None:
         return
     _UNMAPPED_CWES_LOGGED.add(norm)
     try:
-        from .cwe_dispatch import not_tool_verifiable_reason
+        from .cwe_dispatch import not_tool_verifiable_reason, synthesis_owned
     except ImportError:
         policy_reason = ""
+        owned = False
     else:
         policy_reason = not_tool_verifiable_reason(norm)
+        owned = synthesis_owned(norm)
     if policy_reason:
         logger.info(
             "review emitted %s — class is not tool-verifiable by "
@@ -15515,8 +19817,22 @@ def _warn_unmapped_cwe(cwe: str) -> None:
             norm, policy_reason,
         )
         return
+    if owned:
+        # Adjudicated synthesis-owned class (dispatch entry with the
+        # synthesis_owned marker): the empty chain is deliberate — the
+        # per-hypothesis synthesized checker is the designed verifier,
+        # so this is routing information, not a coverage gap.
+        logger.info(
+            "review emitted %s — class is synthesis-owned by "
+            "adjudication (no stock tool states its harm mechanism); "
+            "suspicious verdicts become on-demand checker-synthesis "
+            "candidates in the post-loop sweep",
+            norm,
+        )
+        return
     logger.warning(
-        "review emitted %s but no tool-chain dispatch entry exists — "
+        "review emitted %s but no tool-chain dispatch entry exists, "
+        "or its legs were dropped for this target's language — "
         "CWE-seeded verification will not run for this class "
         "(hypothesis-keyword channels may still fire; suspicious "
         "verdicts in this family become on-demand checker-synthesis "
@@ -15528,24 +19844,45 @@ def _warn_unmapped_cwe(cwe: str) -> None:
 def _cwe_fallback_chain(
     cwe: str,
     hypothesis: str = "",
+    file_path: str = "",
+    language: str | None = None,
 ) -> list[dict[str, Any]]:
     """Generate tool chain from CWE dispatch when string matching fails.
 
     ``hypothesis`` gates the caller-conditional part of the
     api_boundary dispatch (CWE-415/416/476 route to the channel only
-    when the phrasing conditions on caller behaviour).
+    when the phrasing conditions on caller behaviour). ``file_path``
+    gates the curated-semgrep leg: dispatch entries that carry a rule
+    file declare the languages it can adjudicate, and the leg is
+    dropped for other targets (the rule would scan nothing and its
+    dead entry would shadow the keyword-mapped semgrep leg).
+    ``language`` (inventory hint) lets a content-probed unknown
+    extension satisfy that gate — the executed sweep then scans the
+    file via ``--scan-unknown-extensions``.
     """
     chain: list[dict[str, Any]] = []
     try:
         from .cwe_dispatch import (
-            cocci_rules_for_cwe,
             codeql_query_for_cwe,
             joern_applicable,
+            resolve_cocci_rules_for_cwe,
+            resolve_semgrep_rule_for_cwe,
             sinks_for_cwe,
             smt_verb_for_cwe,
         )
     except ImportError:
         return chain
+
+    # Curated per-class semgrep rule (language-gated in the resolver):
+    # the cheapest deterministic leg, seeded first. No "keyword" in
+    # the config — the identifier-consistency and negative-control
+    # gates are for generated presence patterns; curated rules carry
+    # their own sanitizer/anchor precision (see run_tool_chain).
+    semgrep_rule = resolve_semgrep_rule_for_cwe(
+        cwe, file_path, language=language,
+    )
+    if semgrep_rule:
+        chain.append({"type": "semgrep", "config": {"rule": semgrep_rule}})
 
     try:
         from .compiler_sweep import compiler_applicable
@@ -15631,15 +19968,21 @@ def _cwe_fallback_chain(
     if smt_verb:
         chain.append({"type": "smt", "config": {"verb": smt_verb}})
 
-    chain.extend({"type": "coccinelle", "config": {"rule": cocci_rule}} for cocci_rule in cocci_rules_for_cwe(cwe))
+    # resolve_cocci_rules_for_cwe returns absolute on-disk paths and
+    # drops missing rules: a bare table filename resolves against the
+    # process CWD at spatch time (deterministic dispatch error), and a
+    # dead entry here shadows the keyword-mapped coccinelle leg via
+    # the chain's seen-types dedup.
+    chain.extend(
+        {"type": "coccinelle", "config": {"rule": cocci_rule}}
+        for cocci_rule in resolve_cocci_rules_for_cwe(cwe)
+    )
 
-    codeql_query = codeql_query_for_cwe(cwe)
-    if codeql_query and _codeql_query_file(codeql_query):
+    codeql_query = _resolved_codeql_query(codeql_query_for_cwe(cwe) or "")
+    if codeql_query:
         chain.append({"type": "codeql", "config": {"query": codeql_query}})
-    elif codeql_query:
-        _note_codeql_unsupported_query_id(codeql_query)
 
-    if joern_applicable(cwe):
+    if joern_applicable(cwe, file_path):
         sinks = sinks_for_cwe(cwe)
         if sinks:
             chain.append({"type": "joern", "config": {"sinks": sinks}})
@@ -15652,7 +19995,7 @@ def _cwe_fallback_chain(
         guard_entry = guard_chain_entry(cwe)
         if guard_entry:
             chain.append(guard_entry)
-        flow_entry = flow_chain_entry(cwe)
+        flow_entry = flow_chain_entry(cwe, file_path)
         if flow_entry:
             chain.append(flow_entry)
 
@@ -15712,6 +20055,46 @@ def _cwe_fallback_chain(
         if struct_field_applicable(cwe):
             chain.append({"type": "struct_field", "config": {}})
 
+    try:
+        from .sanwit import (
+            sanwit_cwe_applicable,
+            sanwit_language_permitted,
+        )
+    except ImportError:
+        pass
+    else:
+        # Sanitizer-sufficiency families (SANWIT_CWES — CWE-78/77/88
+        # shell, CWE-79/116 html): the witness executes the extracted
+        # chain against the context's breakout corpus. Gated on a
+        # NAMED family sanitizer in the hypothesis (extraction cannot
+        # anchor otherwise) AND on the file's language at build time
+        # (the leg's existence feeds empty-dispatch synthesis
+        # routing); the substrate seam re-gates at dispatch.
+        if sanwit_cwe_applicable(cwe, hypothesis) and (
+            sanwit_language_permitted(file_path, language)
+        ):
+            chain.append({"type": "sanwit", "config": {}})
+
+    try:
+        from core.analysis.gadget_oracle import (
+            gadget_language_permitted,
+            gadget_oracle_applicable,
+        )
+    except ImportError:
+        pass
+    else:
+        # Deserialization family (GADGET_ORACLE_CWES — CWE-502): the
+        # gadget oracle joins the chain additively for PHP targets.
+        # Both directions of its output are detection-grade — a found
+        # chain is a witness exhibit, absence is census-qualified
+        # hint evidence, and the channel never emits ``refuted``
+        # (absence-as-suppression is a corpus-gated follow-up).
+        # Language-gated at build time (the sanwit precedent).
+        if gadget_oracle_applicable(cwe) and (
+            gadget_language_permitted(file_path, language)
+        ):
+            chain.append({"type": "gadget_oracle", "config": {}})
+
     if cwe and not chain:
         _warn_unmapped_cwe(cwe)
 
@@ -15731,6 +20114,10 @@ def _checklist_line_end(
     50 of a long function were dropped. The checklist carries real
     bounds — use them. Returns 0 when unresolvable (callers keep their
     +50 fallback).
+
+    Walks ``config.inventory`` (a different artifact from the review
+    checklist the shared :func:`_checklist_item_index` serves) and has
+    its own cross-target result cache — kept bespoke.
     """
     # Keyed by target as well: the corpus runner calls the pipeline
     # repeatedly in-process, and two targets sharing a relative path +
@@ -15784,6 +20171,74 @@ def _joern_budget_timeout_s(config: OrchestratorConfig) -> int | None:
     except ImportError:
         default = 300
     return max(1, min(default, int(remaining)))
+
+
+# Per-pair live-query budget: the callee's 30s default is sized for a
+# small CPG. On a large graph a healthy per-pair dataflow solve can
+# exceed it, and each such timeout feeds the health gate as a failure
+# — a slow-but-healthy server would trip the gate on latency alone.
+# One extra base multiple per step of serialized CPG, capped: enough
+# headroom for graphs several times larger, while a wedged query
+# still cannot hold a worker past the run-deadline clamp.
+_JOERN_LIVE_QUERY_BASE_S = 30
+_JOERN_LIVE_CPG_BYTES_PER_STEP = 256 * 1024 * 1024
+_JOERN_LIVE_TIMEOUT_MAX_MULTIPLE = 4
+
+
+def _joern_live_timeout_s(
+    config: OrchestratorConfig, joern_server: Any,
+) -> int:
+    """CPG-scaled, deadline-clamped budget for one live taint query.
+
+    Returns 0 when the remaining run budget is too small to dispatch
+    (callers skip, mirroring :func:`_joern_budget_timeout_s`).
+    """
+    clamp = _joern_budget_timeout_s(config)
+    if clamp == 0:
+        return 0
+    cpg_bytes: int | None = None
+    _size_fn = getattr(joern_server, "cpg_size_bytes", None)
+    if callable(_size_fn):
+        try:
+            cpg_bytes = _size_fn()
+        except Exception:  # noqa: BLE001 — size is advisory only
+            cpg_bytes = None
+    steps = int((cpg_bytes or 0) // _JOERN_LIVE_CPG_BYTES_PER_STEP)
+    scaled = _JOERN_LIVE_QUERY_BASE_S * min(
+        1 + steps, _JOERN_LIVE_TIMEOUT_MAX_MULTIPLE,
+    )
+    if clamp is not None:
+        return min(scaled, clamp)
+    return scaled
+
+
+def _joern_coverage_probe(
+    joern_server: Any,
+    function_name: str,
+    file_path: str,
+    timeout: int,
+    errors_out: list,
+) -> bool | None:
+    """The ONE home for the verdict legs' CPG coverage probes.
+
+    File-bound, always: a same-named definition (or a declared
+    prototype) ANYWHERE else in the CPG — common-name C static
+    helpers across TUs — is not coverage of THIS item.  An unbound
+    probe answers True off the cross-file namesake, which licenses
+    refutation-grade silence (the live query never modelled the
+    item's file) and keeps the channel in the dispatch record as
+    phantom class coverage feeding the suspicious→clean gate.  Both
+    consumers (the tool-chain leg and the CWE-dispatch leg) route
+    through this builder so the binding cannot drift per-site: a new
+    call site must supply the item's file.  The probe memo already
+    keys on ``(function_name, file_path)``.
+    """
+    return _joern_function_in_cpg(
+        joern_server, function_name,
+        file_path=file_path,
+        timeout=timeout,
+        errors_out=errors_out,
+    )
 
 
 _MAX_XREF_BYTES = 16384
@@ -15849,6 +20304,82 @@ def _ghidra_re_context(
     return re_types, xref_source
 
 
+# Chain step types the early exit may skip once a promotion-grade
+# receipt stands: the subprocess/server-tier engines whose refuted
+# outcomes land only in tier diagnostics (no per-function refutation
+# receipt feeds the refutation floors or the merge fence from these
+# branches), so skipping them after a qualifying confirmation can only
+# lose corroborating receipts — never flip a verdict. In-process
+# channels (consistency, fail_open, ptr_lifecycle, ...) are NEVER
+# skipped: their confirmed/refuted results are recorded as per-function
+# channel receipts, and the smt step's refutation clears prior smt
+# confirmations.
+_EARLY_EXIT_SKIPPABLE_TYPES: frozenset[str] = frozenset({
+    "semgrep", "coccinelle", "coccinelle_flow", "codeql", "compiler",
+    "joern", "joern_guard", "joern_flow",
+})
+
+
+def _promotion_grade_receipt(receipt: str) -> bool:
+    """Would this single receipt promote at the dispatching sites?
+
+    The G2 evidence-grade firewall (``is_tool_evidence``) AND the
+    detection-role classifier must both pass: a detection-role stamp
+    corroborates via aggregation and may not end the chain (later
+    channels are exactly what aggregation needs).
+    """
+    from .evidence_grade import is_tool_evidence
+
+    return is_tool_evidence(receipt) and not _is_detection_only(receipt)
+
+
+def _memoized_sweep_step(
+    config: OrchestratorConfig,
+    tool: str,
+    key_parts: dict[str, str | int | None],
+    runner: Callable[[], Any],
+) -> Any:
+    """Route one memo-eligible sweep step through the per-run memo.
+
+    Falls back to a direct run when the config carries no memo (test
+    stand-ins) or when any key part is un-hashable (``None`` value —
+    see :meth:`SweepMemo.make_key`).
+
+    Checkpointable step types (coccinelle — see
+    ``core.audit.sweep_checkpoint``) additionally consult the run
+    directory's durable trail, so a drained-and-resumed segment
+    replays completed (rule, file) sweeps instead of re-running
+    spatch from file zero. Order: in-process memo, then the durable
+    trail (a replay is promoted into the memo), then the runner (its
+    result lands in both layers). Every checkpoint failure mode
+    degrades to "run it" — never to "skip it".
+    """
+    memo = getattr(config, "sweep_memo", None)
+    if memo is None:
+        return runner()
+    key = SweepMemo.make_key(tool, key_parts)
+    if key is None:
+        return memo.get_or_run(key, runner)
+    from .sweep_checkpoint import checkpoint_for_run, tool_checkpointable
+    checkpoint = (
+        checkpoint_for_run(getattr(config, "out_dir", None))
+        if tool_checkpointable(tool) else None
+    )
+    if checkpoint is None:
+        return memo.get_or_run(key, runner)
+    cached = memo.get(key)
+    if cached is not None:
+        return cached
+    replayed = checkpoint.lookup(key)
+    if replayed is not None:
+        memo.put(key, replayed)
+        return replayed
+    result = runner()
+    memo.put(key, result)
+    checkpoint.record(key, result)
+    return result
+
+
 def _run_tool_chain(
     chain: list[dict[str, Any]],
     *,
@@ -15866,6 +20397,8 @@ def _run_tool_chain(
     domain_vocab: Any = None,
     cwe: str = "",
     errored_types: set | None = None,
+    early_exit_check: Callable[[str], bool] | None = None,
+    skipped_types: set | None = None,
 ) -> list[str]:
     """Run tools from *chain* in order, collecting all confirmations.
 
@@ -15877,6 +20410,17 @@ def _run_tool_chain(
     collected into it so callers can record per-function tool failures
     (a channel that errored did not meaningfully run).
 
+    When *early_exit_check* is provided AND
+    ``config.tool_chain_early_exit`` is on, each collected confirmation
+    is tested against it; once one qualifies (the dispatching site
+    would promote on that receipt alone), the remaining
+    ``_EARLY_EXIT_SKIPPABLE_TYPES`` steps are skipped.  Skipped step
+    types are collected into *skipped_types* and journaled, so
+    coverage/critique readers can distinguish "did not look (early
+    exit)" from "looked and stayed silent".  In-process channels and
+    the smt step still run — their receipts feed the refutation
+    machinery.
+
     When *sarif_cache* is provided, semgrep sweeps check for prior
     SARIF results before spawning a subprocess.  Cached SARIF hits
     only count as confirmation when their rule family correlates with
@@ -15885,6 +20429,12 @@ def _run_tool_chain(
     """
     effective_target = target_path_override or config.target_path
     confirmed: list[str] = []
+
+    # Inventory language hint for the audited file: the semgrep leg
+    # consumes it so a content-probed unknown extension is actually
+    # scanned (--scan-unknown-extensions) instead of silently skipped.
+    # Best-effort — None on ordinary targets, where nothing changes.
+    _probed_language = _inventory_language_hint(config, file_path)
 
     if domain_vocab is None and config.out_dir:
         with contextlib.suppress(OSError):
@@ -15896,9 +20446,83 @@ def _run_tool_chain(
             if not domain_vocab.has_content:
                 domain_vocab = None
 
+    _early_exit_enabled = (
+        early_exit_check is not None
+        and getattr(config, "tool_chain_early_exit", True)
+    )
+    _exit_receipt: str | None = None
+    _exit_skipped: list[str] = []
+    _ran_types: set = set()
+
     for entry in chain:
         tool_type = entry["type"]
         tool_cfg = entry["config"]
+
+        if (
+            _early_exit_enabled
+            and early_exit_check is not None
+            and _exit_receipt is None
+        ):
+            for _c in confirmed:
+                try:
+                    if early_exit_check(_c):
+                        _exit_receipt = _c
+                        break
+                except Exception:  # noqa: BLE001 — a predicate error
+                    # must never kill the chain; the receipt simply
+                    # does not qualify and the chain runs in full.
+                    logger.debug(
+                        "early-exit predicate failed on %s", _c,
+                        exc_info=True,
+                    )
+        if _exit_receipt is not None \
+                and tool_type in _EARLY_EXIT_SKIPPABLE_TYPES:
+            _exit_skipped.append(tool_type)
+            # A chain may carry several entries of one type (binary
+            # decompiler rules append extra semgrep entries): a type
+            # that already EXECUTED in this call stays dispatched —
+            # the tool did look, and dropping it from the dispatch
+            # record would demote the confirming receipt's
+            # verification tier.
+            if skipped_types is not None and tool_type not in _ran_types:
+                skipped_types.add(tool_type)
+            logger.info(
+                "tool_chain early exit: %s skipped for %s:%s — "
+                "promotion-grade receipt %s already stands",
+                tool_type, file_path, function_name, _exit_receipt,
+            )
+            continue
+
+        # Substrate gate (pre-dispatch): a registered tier whose
+        # substrate provably cannot model this file skips before the
+        # tool spawns — its silence would be booked with verdict
+        # weight otherwise. The sweep layer holds the same license
+        # (belt-and-braces) for callers that bypass this dispatcher.
+        # The whole-tree coccinelle entry is deliberately gated on
+        # the SUBJECT file here: tree-scoped evidence licenses only
+        # its "<codebase>" result inside the sweep — a stray C file
+        # elsewhere must not license a refutation against a non-C
+        # hypothesis file (conjunct, not replacement).
+        if _substrate_registered_scope(tool_type) == "file":
+            _sub_cov = _substrate_file_coverage(
+                tool_type,
+                target_path=effective_target,
+                file_path=file_path,
+                language=_inventory_language_hint(config, file_path),
+            )
+            if _sub_cov is not None and _sub_cov.covered is False:
+                if skipped_types is not None and tool_type not in _ran_types:
+                    skipped_types.add(tool_type)
+                _note_substrate_skip(
+                    config, tier_counters, tool_type,
+                    file_path, function_name,
+                    reason=_sub_cov.reason,
+                    language=_sub_cov.evidence.get("language"),
+                    receipt=_sub_cov.as_receipt(),
+                )
+                continue
+
+        _ran_types.add(tool_type)
 
         # Wall-clock bracket for tier diagnostics: tier-diagnostics
         # wall_time_s was declared on TierCounters but never
@@ -15990,18 +20614,40 @@ def _run_tool_chain(
                 # those get the identifier-consistency and
                 # negative-control gates (stock rules are curated).
                 rule_keyword = tool_cfg.get("keyword") or ""
+                _sg_line_end = _checklist_line_end(
+                    config, file_path, function_name,
+                ) or (line_start + 50 if line_start else 0)
+                _sg_hypothesis = hypothesis if rule_keyword else ""
                 try:
-                    sweep = run_semgrep_sweep(
-                        target_path=effective_target,
-                        file_path=file_path,
-                        function_name=function_name,
-                        rule_config=rule_path,
-                        line_start=line_start,
-                        line_end=_checklist_line_end(
-                            config, file_path, function_name)
-                        or (line_start + 50 if line_start else 0),
-                        hypothesis=hypothesis if rule_keyword else "",
-                        rule_keyword=rule_keyword,
+                    sweep = _memoized_sweep_step(
+                        config,
+                        "semgrep",
+                        {
+                            "rule": _memo_hash_file(rule_path),
+                            "file": _memo_hash_file(
+                                effective_target / file_path),
+                            "path": file_path,
+                            "function": function_name,
+                            "line_start": line_start,
+                            "line_end": _sg_line_end,
+                            "hypothesis": _memo_hash_text(_sg_hypothesis),
+                            "keyword": rule_keyword,
+                            # The hint changes the executed command
+                            # (--scan-unknown-extensions), so it joins
+                            # the memo key.
+                            "language": _probed_language or "",
+                        },
+                        lambda: run_semgrep_sweep(
+                            target_path=effective_target,
+                            file_path=file_path,
+                            function_name=function_name,
+                            rule_config=rule_path,
+                            line_start=line_start,
+                            line_end=_sg_line_end,
+                            hypothesis=_sg_hypothesis,
+                            rule_keyword=rule_keyword,
+                            language=_probed_language,
+                        ),
                     )
                 finally:
                     if rule_path and os.path.basename(rule_path).startswith("audit_sweep_"):
@@ -16009,11 +20655,16 @@ def _run_tool_chain(
                             os.unlink(rule_path)
                         except OSError:
                             pass
-                if sweep.outcome == "confirmed":
+                # Normalized outcome dispatch: only an explicit
+                # refuted may reach the refuted counter — a skipped
+                # (did not look) or novel outcome falling into a bare
+                # else would be silently miscounted as refutation.
+                _sg_oc = _classify_sweep_outcome(sweep)
+                if _sg_oc == "confirmed":
                     confirmed.append(f"semgrep:{sweep.rule_id or 'hypothesis'}")
                     if tier_counters:
                         _increment_tier_dict(tier_counters, "semgrep", "confirmed")
-                elif sweep.outcome == "error":
+                elif _sg_oc == "error":
                     logger.debug(
                         "tool_chain semgrep error %s:%s: %s",
                         file_path,
@@ -16024,7 +20675,7 @@ def _run_tool_chain(
                         errored_types.add(tool_type)
                     if tier_counters:
                         _increment_tier_dict(tier_counters, "semgrep", "errors")
-                elif sweep.outcome == "inconclusive":
+                elif _sg_oc == "inconclusive":
                     logger.info(
                         "tool_chain semgrep inconclusive %s:%s: %s",
                         file_path,
@@ -16035,23 +20686,48 @@ def _run_tool_chain(
                         _increment_tier_dict(
                             tier_counters, "semgrep", "inconclusive",
                         )
-                elif tier_counters:
+                elif _sg_oc == "skipped":
+                    # Did not look: out of the dispatch record, never
+                    # the refuted counter (phantom-coverage rule).
+                    if skipped_types is not None:
+                        skipped_types.add(tool_type)
+                    if tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "semgrep", "skipped",
+                        )
+                elif _sg_oc == "refuted" and tier_counters:
                     _increment_tier_dict(tier_counters, "semgrep", "refuted")
 
             elif tool_type == "smt":
-                smt_result = run_smt_verb_direct(
-                    file_path=file_path,
-                    function_name=function_name,
-                    verb=tool_cfg["verb"],
-                    source=source or "",
-                    hypothesis=hypothesis,
-                    target_path=str(effective_target),
+                # target_path is a semantic input here (it selects the
+                # target-kind vocab packs), not a staleness proxy — the
+                # analysed text travels in ``source``.
+                smt_result = _memoized_sweep_step(
+                    config,
+                    "smt",
+                    {
+                        "verb": tool_cfg["verb"],
+                        "source": _memo_hash_text(source or ""),
+                        "hypothesis": _memo_hash_text(hypothesis),
+                        "path": file_path,
+                        "function": function_name,
+                        "target": str(effective_target),
+                    },
+                    lambda: run_smt_verb_direct(
+                        file_path=file_path,
+                        function_name=function_name,
+                        verb=tool_cfg["verb"],
+                        source=source or "",
+                        hypothesis=hypothesis,
+                        target_path=str(effective_target),
+                    ),
                 )
-                if smt_result.outcome == "confirmed":
+                _smt_oc = _classify_sweep_outcome(smt_result)
+                if _smt_oc == "confirmed":
                     confirmed.append(f"smt:{tool_cfg['verb']}")
                     if tier_counters:
                         _increment_tier_dict(tier_counters, "smt", "confirmed")
-                elif smt_result.outcome == "error":
+                elif _smt_oc == "error":
                     logger.debug(
                         "tool_chain smt error %s:%s: %s",
                         file_path,
@@ -16062,7 +20738,15 @@ def _run_tool_chain(
                         errored_types.add(tool_type)
                     if tier_counters:
                         _increment_tier_dict(tier_counters, "smt", "errors")
-                elif smt_result.outcome == "inconclusive":
+                elif _smt_oc == "skipped":
+                    # Did not look: no refuted count, no clearing of
+                    # prior smt confirmations, out of the dispatch
+                    # record.
+                    if skipped_types is not None:
+                        skipped_types.add(tool_type)
+                    if tier_counters:
+                        _increment_tier_dict(tier_counters, "smt", "skipped")
+                elif _smt_oc == "inconclusive":
                     # Inconclusive (e.g. vacuous SAT on an
                     # unconstrained-arithmetic verb, missing operands,
                     # Z3 unavailable) is NOT a refutation — it must
@@ -16072,8 +20756,27 @@ def _run_tool_chain(
                         _increment_tier_dict(
                             tier_counters, "smt", "inconclusive",
                         )
-                else:
+                elif _smt_oc == "refuted":
                     smt_confirmations = [c for c in confirmed if c.startswith("smt:")]
+                    # Early-exit invariant, pinned: an armed exit
+                    # receipt is never revalidated after arming, so
+                    # clearing receipts here must not be able to pull
+                    # one out from under the exit. Verification-role
+                    # smt receipts ("smt:check-oob" and friends) ARE
+                    # promotion-grade and can arm — the invariant
+                    # rests solely on the one-smt-slot-per-chain
+                    # dedup (seen_types; smt_invariant is a separate,
+                    # later, detection-role type): a single smt step
+                    # either confirms or refutes, so at refute time
+                    # there is no earlier smt confirmation in
+                    # ``confirmed`` to clear, armed or otherwise. If
+                    # chains ever gain a second smt slot, re-check
+                    # _exit_receipt here.
+                    assert _exit_receipt is None \
+                        or _exit_receipt not in smt_confirmations, (
+                        "smt refutation would clear the armed "
+                        "early-exit receipt"
+                    )
                     if smt_confirmations:
                         logger.info(
                             "smt refuted %s:%s — clearing %d smt confirmations (%s); keeping %d pattern-match confirmations",
@@ -16107,7 +20810,8 @@ def _run_tool_chain(
                 _record_api_boundary_receipt(
                     config, file_path, function_name, ab_res,
                 )
-                if ab_res.outcome == "confirmed":
+                _ch_oc = _classify_sweep_outcome(ab_res)
+                if _ch_oc == "confirmed":
                     confirmed.append("api_boundary:caller-contract")
                     logger.info(
                         "api-boundary confirmed %s:%s — %s",
@@ -16117,7 +20821,7 @@ def _run_tool_chain(
                         _increment_tier_dict(
                             tier_counters, "api_boundary", "confirmed",
                         )
-                elif ab_res.outcome == "refuted":
+                elif _ch_oc == "refuted":
                     logger.info(
                         "api-boundary refuted %s:%s — %s",
                         file_path, function_name, ab_res.reason,
@@ -16125,6 +20829,24 @@ def _run_tool_chain(
                     if tier_counters:
                         _increment_tier_dict(
                             tier_counters, "api_boundary", "refuted",
+                        )
+                elif _ch_oc == "skipped":
+                    # Did not look: out of the dispatch record, never
+                    # the refuted counter.
+                    if skipped_types is not None:
+                        skipped_types.add(tool_type)
+                    if tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "api_boundary", "skipped",
+                        )
+                elif _ch_oc == "error":
+                    # Novel outcome shapes land in error accounting,
+                    # never the refuted counter.
+                    if errored_types is not None:
+                        errored_types.add(tool_type)
+                    if tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "api_boundary", "errors",
                         )
                 else:
                     logger.info(
@@ -16143,7 +20865,7 @@ def _run_tool_chain(
 
                 _fo_roots: tuple = (Path(effective_target),)
                 if getattr(config, "study_root", None):
-                    _fo_roots += (Path(config.study_root),)
+                    _fo_roots += (Path(config.study_root),)  # type: ignore[arg-type]
                 fo_ctx = RoleContext(
                     out_dir=config.out_dir,
                     annotations_dir=getattr(
@@ -16178,7 +20900,8 @@ def _run_tool_chain(
                 _record_fail_open_receipt(
                     config, file_path, function_name, fo_res,
                 )
-                if fo_res.outcome == "confirmed":
+                _ch_oc = _classify_sweep_outcome(fo_res)
+                if _ch_oc == "confirmed":
                     confirmed.append(fo_res.rule_id)
                     logger.info(
                         "fail-open confirmed %s:%s — %s",
@@ -16188,7 +20911,7 @@ def _run_tool_chain(
                         _increment_tier_dict(
                             tier_counters, "fail_open", "confirmed",
                         )
-                elif fo_res.outcome == "refuted":
+                elif _ch_oc == "refuted":
                     logger.info(
                         "fail-open refuted %s:%s — %s",
                         file_path, function_name, fo_res.reason,
@@ -16196,6 +20919,24 @@ def _run_tool_chain(
                     if tier_counters:
                         _increment_tier_dict(
                             tier_counters, "fail_open", "refuted",
+                        )
+                elif _ch_oc == "skipped":
+                    # Did not look: out of the dispatch record, never
+                    # the refuted counter.
+                    if skipped_types is not None:
+                        skipped_types.add(tool_type)
+                    if tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "fail_open", "skipped",
+                        )
+                elif _ch_oc == "error":
+                    # Novel outcome shapes land in error accounting,
+                    # never the refuted counter.
+                    if errored_types is not None:
+                        errored_types.add(tool_type)
+                    if tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "fail_open", "errors",
                         )
                 else:
                     logger.info(
@@ -16219,6 +20960,38 @@ def _run_tool_chain(
                     ),
                     inventory=getattr(config, "inventory", None),
                 )
+                # Standing prep census pass-through: the prepass
+                # already computed {callee: CalleeCensus} over the gap
+                # files, so the per-hypothesis rebuild (an rglob +
+                # bounded tree read PER dispatch) is only the fallback.
+                # The prep texts travel with the census — the verdict
+                # needs them for exhibits/snippets and the wur harvest,
+                # and census sites are only meaningful against the
+                # texts they were counted over. Never used against an
+                # overridden target (binary decompilation tmpdirs): the
+                # prep census describes the real tree, not the excerpt.
+                _cs_census = None
+                _cs_texts = None
+                if target_path_override is None:
+                    _cs_census = getattr(
+                        config, "consistency_census", None,
+                    ) or None
+                    if _cs_census is not None:
+                        _cs_texts = getattr(
+                            config, "consistency_source_texts", None,
+                        ) or None
+                        # The prep-harvested contract witnesses ride
+                        # with the census (header-declared wur is
+                        # invisible to the chain-side source_texts
+                        # harvest).
+                        _cs_wur = getattr(
+                            config, "consistency_wur_functions", None,
+                        )
+                        if _cs_wur:
+                            cs_ctx.wur_functions = (
+                                frozenset(cs_ctx.wur_functions)
+                                | _cs_wur
+                            )
                 cs_res = run_consistency_check(
                     effective_target,
                     file_path,
@@ -16226,11 +20999,47 @@ def _run_tool_chain(
                     hypothesis,
                     inventory=getattr(config, "inventory", None),
                     context=cs_ctx,
+                    source_texts=_cs_texts,
+                    census=_cs_census,
                     # Joern-flow escalator (outcome-gated inside the
                     # verdict): one bounded caller-closure query when
                     # the cheap reachability leg answers unknown.
                     joern_server=joern_server,
                 )
+                from .consistency_verify import REASON_CENSUS_MISS
+                if (
+                    _cs_census is not None
+                    and cs_res.outcome == "inconclusive"
+                    and (cs_res.reason or "").startswith(
+                        REASON_CENSUS_MISS,
+                    )
+                ):
+                    # The prep census covers the checklist's files;
+                    # a hypothesis callee living outside them has no
+                    # entry there. Retry on the channel's own bounded
+                    # rebuild (callee-mention tree scan) so the
+                    # pass-through never narrows what the rebuild
+                    # could bind. Keyed on the channel's structured
+                    # reason code — never its prose detail.
+                    #
+                    # Corpus caveat: this retry only fires on a MISS.
+                    # For callees that DO have a prep entry, the two
+                    # paths count over different corpora — the prep
+                    # census over the checklist's files, the rebuild
+                    # over up to 40 callee-mentioning files tree-wide
+                    # — so majority ratios (and with them a
+                    # detection-role consistency verdict) can differ
+                    # between them. Registry-grade wur receipts are
+                    # corpus-independent and ride along unchanged.
+                    cs_res = run_consistency_check(
+                        effective_target,
+                        file_path,
+                        function_name,
+                        hypothesis,
+                        inventory=getattr(config, "inventory", None),
+                        context=cs_ctx,
+                        joern_server=joern_server,
+                    )
                 # Receipts already earned by earlier chain steps
                 # corroborate (compiler -Wunused-result, cocci,
                 # fail_open confirmations on the same claim).
@@ -16241,7 +21050,8 @@ def _run_tool_chain(
                 _record_consistency_receipt(
                     config, file_path, function_name, cs_res,
                 )
-                if cs_res.outcome == "confirmed":
+                _ch_oc = _classify_sweep_outcome(cs_res)
+                if _ch_oc == "confirmed":
                     confirmed.append(cs_res.rule_id)
                     logger.info(
                         "consistency confirmed %s:%s — %s",
@@ -16251,7 +21061,7 @@ def _run_tool_chain(
                         _increment_tier_dict(
                             tier_counters, "consistency", "confirmed",
                         )
-                elif cs_res.outcome == "refuted":
+                elif _ch_oc == "refuted":
                     logger.info(
                         "consistency refuted %s:%s — %s",
                         file_path, function_name, cs_res.reason,
@@ -16259,6 +21069,24 @@ def _run_tool_chain(
                     if tier_counters:
                         _increment_tier_dict(
                             tier_counters, "consistency", "refuted",
+                        )
+                elif _ch_oc == "skipped":
+                    # Did not look: out of the dispatch record, never
+                    # the refuted counter.
+                    if skipped_types is not None:
+                        skipped_types.add(tool_type)
+                    if tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "consistency", "skipped",
+                        )
+                elif _ch_oc == "error":
+                    # Novel outcome shapes land in error accounting,
+                    # never the refuted counter.
+                    if errored_types is not None:
+                        errored_types.add(tool_type)
+                    if tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "consistency", "errors",
                         )
                 else:
                     logger.info(
@@ -16302,7 +21130,8 @@ def _run_tool_chain(
                     config, "ptr_lifecycle_check", file_path,
                     function_name, pl_res,
                 )
-                if pl_res.outcome == "confirmed":
+                _ch_oc = _classify_sweep_outcome(pl_res)
+                if _ch_oc == "confirmed":
                     confirmed.append(pl_res.rule_id)
                     logger.info(
                         "ptr-lifecycle confirmed %s:%s — %s",
@@ -16312,7 +21141,7 @@ def _run_tool_chain(
                         _increment_tier_dict(
                             tier_counters, "ptr_lifecycle", "confirmed",
                         )
-                elif pl_res.outcome == "refuted":
+                elif _ch_oc == "refuted":
                     logger.info(
                         "ptr-lifecycle refuted %s:%s — %s",
                         file_path, function_name, pl_res.reason,
@@ -16320,6 +21149,24 @@ def _run_tool_chain(
                     if tier_counters:
                         _increment_tier_dict(
                             tier_counters, "ptr_lifecycle", "refuted",
+                        )
+                elif _ch_oc == "skipped":
+                    # Did not look: out of the dispatch record, never
+                    # the refuted counter.
+                    if skipped_types is not None:
+                        skipped_types.add(tool_type)
+                    if tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "ptr_lifecycle", "skipped",
+                        )
+                elif _ch_oc == "error":
+                    # Novel outcome shapes land in error accounting,
+                    # never the refuted counter.
+                    if errored_types is not None:
+                        errored_types.add(tool_type)
+                    if tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "ptr_lifecycle", "errors",
                         )
                 else:
                     logger.info(
@@ -16363,7 +21210,8 @@ def _run_tool_chain(
                     config, "lock_region_check", file_path,
                     function_name, lr_res,
                 )
-                if lr_res.outcome == "confirmed":
+                _ch_oc = _classify_sweep_outcome(lr_res)
+                if _ch_oc == "confirmed":
                     confirmed.append(lr_res.rule_id)
                     logger.info(
                         "lock-region confirmed %s:%s — %s",
@@ -16382,7 +21230,7 @@ def _run_tool_chain(
                     )
                     if cocci_stamp and cocci_stamp not in confirmed:
                         confirmed.append(cocci_stamp)
-                elif lr_res.outcome == "refuted":
+                elif _ch_oc == "refuted":
                     logger.info(
                         "lock-region refuted %s:%s — %s",
                         file_path, function_name, lr_res.reason,
@@ -16390,6 +21238,24 @@ def _run_tool_chain(
                     if tier_counters:
                         _increment_tier_dict(
                             tier_counters, "lock_region", "refuted",
+                        )
+                elif _ch_oc == "skipped":
+                    # Did not look: out of the dispatch record, never
+                    # the refuted counter.
+                    if skipped_types is not None:
+                        skipped_types.add(tool_type)
+                    if tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "lock_region", "skipped",
+                        )
+                elif _ch_oc == "error":
+                    # Novel outcome shapes land in error accounting,
+                    # never the refuted counter.
+                    if errored_types is not None:
+                        errored_types.add(tool_type)
+                    if tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "lock_region", "errors",
                         )
                 else:
                     logger.info(
@@ -16426,6 +21292,9 @@ def _run_tool_chain(
                     inventory=getattr(config, "inventory", None),
                     context=rb_ctx,
                     domain_model=rb_dm,
+                    source_texts=_hypothesis_source_texts(
+                        config, effective_target, file_path,
+                    ),
                 )
                 # Receipts already earned by earlier chain steps
                 # corroborate (the fail_open convention).
@@ -16437,7 +21306,8 @@ def _run_tool_chain(
                     config, "resource_bounds_check", file_path,
                     function_name, rb_res,
                 )
-                if rb_res.outcome == "confirmed":
+                _ch_oc = _classify_sweep_outcome(rb_res)
+                if _ch_oc == "confirmed":
                     confirmed.append(rb_res.rule_id)
                     logger.info(
                         "resource-bounds confirmed %s:%s — %s",
@@ -16448,7 +21318,7 @@ def _run_tool_chain(
                             tier_counters, "resource_bounds",
                             "confirmed",
                         )
-                elif rb_res.outcome == "refuted":
+                elif _ch_oc == "refuted":
                     logger.info(
                         "resource-bounds refuted %s:%s — %s",
                         file_path, function_name, rb_res.reason,
@@ -16457,6 +21327,24 @@ def _run_tool_chain(
                         _increment_tier_dict(
                             tier_counters, "resource_bounds",
                             "refuted",
+                        )
+                elif _ch_oc == "skipped":
+                    # Did not look: out of the dispatch record, never
+                    # the refuted counter.
+                    if skipped_types is not None:
+                        skipped_types.add(tool_type)
+                    if tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "resource_bounds", "skipped",
+                        )
+                elif _ch_oc == "error":
+                    # Novel outcome shapes land in error accounting,
+                    # never the refuted counter.
+                    if errored_types is not None:
+                        errored_types.add(tool_type)
+                    if tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "resource_bounds", "errors",
                         )
                 else:
                     logger.info(
@@ -16506,7 +21394,8 @@ def _run_tool_chain(
                     config, "release_order_check", file_path,
                     function_name, ro_res,
                 )
-                if ro_res.outcome == "confirmed":
+                _ch_oc = _classify_sweep_outcome(ro_res)
+                if _ch_oc == "confirmed":
                     confirmed.append(ro_res.rule_id)
                     logger.info(
                         "release-order confirmed %s:%s — %s",
@@ -16517,7 +21406,7 @@ def _run_tool_chain(
                             tier_counters, "release_order",
                             "confirmed",
                         )
-                elif ro_res.outcome == "refuted":
+                elif _ch_oc == "refuted":
                     logger.info(
                         "release-order refuted %s:%s — %s",
                         file_path, function_name, ro_res.reason,
@@ -16525,6 +21414,24 @@ def _run_tool_chain(
                     if tier_counters:
                         _increment_tier_dict(
                             tier_counters, "release_order", "refuted",
+                        )
+                elif _ch_oc == "skipped":
+                    # Did not look: out of the dispatch record, never
+                    # the refuted counter.
+                    if skipped_types is not None:
+                        skipped_types.add(tool_type)
+                    if tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "release_order", "skipped",
+                        )
+                elif _ch_oc == "error":
+                    # Novel outcome shapes land in error accounting,
+                    # never the refuted counter.
+                    if errored_types is not None:
+                        errored_types.add(tool_type)
+                    if tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "release_order", "errors",
                         )
                 else:
                     logger.info(
@@ -16553,6 +21460,9 @@ def _run_tool_chain(
                     inventory=getattr(config, "inventory", None),
                     context_map=getattr(config, "context_map", None),
                 )
+                ps_texts = _hypothesis_source_texts(
+                    config, effective_target, file_path,
+                )
                 ps_res = run_protocol_state_check(
                     effective_target,
                     file_path,
@@ -16562,6 +21472,10 @@ def _run_tool_chain(
                     context=ps_ctx,
                     domain_model=ps_dm,
                     invariant=tool_cfg.get("invariant") or None,
+                    source_texts=ps_texts,
+                    state_index=_hypothesis_state_index(
+                        config, effective_target, file_path, ps_texts,
+                    ),
                 )
                 ps_res.corroboration.extend(
                     c for c in confirmed
@@ -16571,7 +21485,8 @@ def _run_tool_chain(
                     config, "protocol_state_check", file_path,
                     function_name, ps_res,
                 )
-                if ps_res.outcome == "confirmed":
+                _ch_oc = _classify_sweep_outcome(ps_res)
+                if _ch_oc == "confirmed":
                     confirmed.append(ps_res.rule_id)
                     logger.info(
                         "protocol-state confirmed %s:%s — %s",
@@ -16582,7 +21497,7 @@ def _run_tool_chain(
                             tier_counters, "protocol_state",
                             "confirmed",
                         )
-                elif ps_res.outcome == "refuted":
+                elif _ch_oc == "refuted":
                     logger.info(
                         "protocol-state refuted %s:%s — %s",
                         file_path, function_name, ps_res.reason,
@@ -16591,6 +21506,24 @@ def _run_tool_chain(
                         _increment_tier_dict(
                             tier_counters, "protocol_state",
                             "refuted",
+                        )
+                elif _ch_oc == "skipped":
+                    # Did not look: out of the dispatch record, never
+                    # the refuted counter.
+                    if skipped_types is not None:
+                        skipped_types.add(tool_type)
+                    if tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "protocol_state", "skipped",
+                        )
+                elif _ch_oc == "error":
+                    # Novel outcome shapes land in error accounting,
+                    # never the refuted counter.
+                    if errored_types is not None:
+                        errored_types.add(tool_type)
+                    if tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "protocol_state", "errors",
                         )
                 else:
                     logger.info(
@@ -16660,27 +21593,156 @@ def _run_tool_chain(
                         function_name=function_name,
                         cocci_rule=tool_cfg["rule"],
                         domain_vocab=domain_vocab,
+                        # Tree-scoped license context for the
+                        # "<codebase>" result (the subject-file gate
+                        # already ran at dispatch).
+                        tree_languages=_substrate_tree_languages(config),
                     )
                 else:
-                    cocci_result = run_coccinelle_sweep(
-                        target_path=effective_target,
-                        file_path=file_path,
-                        function_name=function_name,
-                        cocci_rule=tool_cfg["rule"],
-                        line_start=line_start or None,
-                        # Real function bound from the checklist (same
-                        # source the semgrep leg uses); the sweep falls
-                        # back to a +50 window when unresolvable.
-                        line_end=_checklist_line_end(
-                            config, file_path, function_name,
-                        ) or None,
-                        domain_vocab=domain_vocab,
+                    _cc_line_end = _checklist_line_end(
+                        config, file_path, function_name,
+                    ) or None
+                    # Inventory-stamped language (canonical); None
+                    # lets the sweep detect it. Run-stable either
+                    # way, so the memo key needs no language
+                    # dimension.
+                    _cc_language = _inventory_language_hint(
+                        config, file_path,
                     )
-                if cocci_result.outcome == "confirmed":
+
+                    # spatch scans the whole file regardless of which
+                    # function is under audit, so the memo unit is the
+                    # FILE sweep: one spatch run per (rule content,
+                    # file content) serves every function in the file,
+                    # and the per-function range filter + outcome
+                    # classification run AFTER retrieval.
+                    _cc_rendered: Path | None = None
+                    _cc_pass_vocab: Any = None
+                    if domain_vocab is None:
+                        _cc_rule_hash = _memo_hash_file(tool_cfg["rule"])
+                    else:
+                        # Render ONCE up front so the rendered bytes
+                        # (seed rule + spliced vocabulary) become the
+                        # memo's rule identity: dispatches sharing a
+                        # vocabulary hash alike, a vocabulary change
+                        # misses. The rendered tempfile is passed down
+                        # so the sweep does not render a second time.
+                        try:
+                            from engine.coccinelle.vocab_renderer import (
+                                render as _render_cocci_rule,
+                            )
+                            _cc_rendered = _render_cocci_rule(
+                                Path(tool_cfg["rule"]), domain_vocab,
+                            )
+                        except (OSError, ValueError):
+                            # Render failed here — run unmemoized and
+                            # let the sweep retry its own render (its
+                            # failure path runs the seed rule).
+                            _cc_rule_hash = None
+                            _cc_pass_vocab = domain_vocab
+                        else:
+                            # render() returns None when the rule has
+                            # no @vocab marker or nothing spliced —
+                            # the seed rule runs as-is.
+                            _cc_rule_hash = _memo_hash_file(
+                                _cc_rendered
+                                if _cc_rendered is not None
+                                else tool_cfg["rule"],
+                            )
+
+                    def _run_cocci_file() -> Any:
+                        return run_coccinelle_file_sweep(
+                            target_path=effective_target,
+                            file_path=file_path,
+                            cocci_rule=tool_cfg["rule"],
+                            domain_vocab=_cc_pass_vocab,
+                            rendered_rule=(
+                                str(_cc_rendered)
+                                if _cc_rendered is not None
+                                else None
+                            ),
+                            language=_cc_language,
+                        )
+
+                    # Lookahead prewarm (caller-side of the memo
+                    # seam): once a few distinct files have missed on
+                    # this rendered rule, batch upcoming inventory
+                    # files through directory-chunked multi-file
+                    # spatch invocations and pin their file-scope
+                    # verdicts into the sweep memo — the memoized
+                    # step below then hits. Advisory and
+                    # failure-inert: any error (import included)
+                    # leaves this dispatch on the plain path.
+                    if _cc_rule_hash is not None:
+                        try:
+                            from .cocci_prewarm import (
+                                maybe_prewarm as _cc_prewarm,
+                            )
+                            _cc_prewarm(
+                                config,
+                                effective_target=effective_target,
+                                file_path=file_path,
+                                rule_source=tool_cfg["rule"],
+                                exec_rule=(
+                                    str(_cc_rendered)
+                                    if _cc_rendered is not None
+                                    else tool_cfg["rule"]
+                                ),
+                                rule_hash=_cc_rule_hash,
+                            )
+                        except Exception:  # noqa: BLE001
+                            logger.debug(
+                                "cocci prewarm hook failed; serial "
+                                "path continues", exc_info=True,
+                            )
+
+                    try:
+                        _cc_file_result = _memoized_sweep_step(
+                            config,
+                            "coccinelle",
+                            {
+                                "rule": _cc_rule_hash,
+                                "file": _memo_hash_file(
+                                    effective_target / file_path),
+                                "path": file_path,
+                                # spatch -D defines steer what the
+                                # rule matches, so they are a key
+                                # dimension: a stable rendering of the
+                                # sorted (name, value) pairs — empty
+                                # because this leg passes no defines.
+                                # Any caller that routes defines
+                                # through the memoized path MUST fold
+                                # them into this part.
+                                "defines": "",
+                            },
+                            _run_cocci_file,
+                        )
+                    finally:
+                        # The rendered tempfile never outlives this
+                        # step: the memoized result records only the
+                        # source rule path (rule_id), so a later memo
+                        # hit never dereferences a dead tempfile.
+                        if _cc_rendered is not None:
+                            _cc_rendered.unlink(missing_ok=True)
+
+                    cocci_result = scope_coccinelle_result(
+                        _cc_file_result,
+                        target_path=effective_target,
+                        function_name=function_name,
+                        line_start=line_start or None,
+                        # Real function bound from the checklist
+                        # (same source the semgrep leg uses); the
+                        # scoper falls back to a +50 window when
+                        # unresolvable.
+                        line_end=_cc_line_end,
+                        language=_cc_language,
+                    )
+                _cc_oc = _classify_sweep_outcome(cocci_result)
+                if _cc_oc == "confirmed":
                     confirmed.append(f"coccinelle:{Path(tool_cfg['rule']).stem}")
                     if tier_counters:
                         _increment_tier_dict(tier_counters, "coccinelle", "confirmed")
-                elif cocci_result.outcome == "error":
+                elif _cc_oc == "error":
                     logger.debug(
                         "tool_chain coccinelle error %s:%s: %s",
                         file_path,
@@ -16691,7 +21753,37 @@ def _run_tool_chain(
                         errored_types.add(tool_type)
                     if tier_counters:
                         _increment_tier_dict(tier_counters, "coccinelle", "errors")
-                elif tier_counters:
+                elif _cc_oc == "skipped":
+                    # Substrate license withheld in the sweep layer
+                    # (unmodeled language / no C substrate in tree) —
+                    # the channel did not look. Same phantom-coverage
+                    # rule as the codeql/joern skips.
+                    if skipped_types is not None:
+                        skipped_types.add(tool_type)
+                    _cc_details = cocci_result.details or {}
+                    _cc_receipt = _cc_details.get("substrate")
+                    if _cc_receipt:
+                        _note_substrate_skip(
+                            config, tier_counters, "coccinelle",
+                            file_path, function_name,
+                            reason=_cc_details.get(
+                                "reason", "substrate not modeled",
+                            ),
+                            language=(
+                                _cc_receipt.get("evidence") or {}
+                            ).get("language"),
+                            receipt=_cc_receipt,
+                        )
+                    elif tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "coccinelle", "skipped",
+                        )
+                elif _cc_oc == "inconclusive":
+                    if tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "coccinelle", "inconclusive",
+                        )
+                elif _cc_oc == "refuted" and tier_counters:
                     _increment_tier_dict(tier_counters, "coccinelle", "refuted")
 
             elif tool_type == "joern":
@@ -16707,18 +21799,63 @@ def _run_tool_chain(
                         pre_hit = True
                         joern_hit = True
 
-                if not pre_hit and joern_server is not None:
+                if (
+                    not pre_hit
+                    and joern_server is not None
+                    and not _joern_dispatch_blocked(config)
+                ):
                     sinks = tool_cfg.get("sinks", [])
+                    if not sinks:
+                        # Nothing to ask: an empty sink menu makes the
+                        # live query vacuously silent, and vacuous
+                        # silence must not book a refutation even for
+                        # a CPG-covered function.
+                        if skipped_types is not None:
+                            skipped_types.add(tool_type)
+                        if tier_counters:
+                            _increment_tier_dict(
+                                tier_counters, "joern", "skipped",
+                            )
+                        continue
+                    if not _joern_name_queryable(function_name):
+                        # Unqueryable name (qualified/operator/dynamic
+                        # shapes outside the substitution allowlist):
+                        # the query would return empty without dialing
+                        # the server — a definitional skip, not a
+                        # health-accountable round trip.
+                        if skipped_types is not None:
+                            skipped_types.add(tool_type)
+                        if tier_counters:
+                            _increment_tier_dict(
+                                tier_counters, "joern", "skipped",
+                            )
+                        continue
                     _live_errors: list = []
+                    _cov_errors: list = []
+                    _live_timeout = _joern_live_timeout_s(
+                        config, joern_server,
+                    )
+                    if _live_timeout == 0:
+                        # Remaining run budget too small — skip, and
+                        # keep the channel out of the dispatch record.
+                        if skipped_types is not None:
+                            skipped_types.add(tool_type)
+                        if tier_counters:
+                            _increment_tier_dict(
+                                tier_counters, "joern", "skipped",
+                            )
+                        continue
                     live_hits = _joern_live_query(
                         joern_server,
                         function_name,
                         sinks,
+                        timeout=_live_timeout,
                         errors_out=_live_errors,
                     )
                     if live_hits:
                         confirmed.append("joern:live")
                         joern_hit = True
+                        _record_joern_outcome(config, error=False)
                         if tier_counters:
                             _increment_tier_dict(tier_counters, "joern", "confirmed")
                     elif _live_errors:
@@ -16728,14 +21865,84 @@ def _run_tool_chain(
                             "tool_chain joern error %s:%s: %s",
                             file_path, function_name, _live_errors,
                         )
+                        _record_joern_outcome(
+                            config, error=True,
+                            detail="; ".join(str(e) for e in _live_errors),
+                            key=f"{file_path}:{function_name}",
+                        )
                         if errored_types is not None:
                             errored_types.add(tool_type)
                         if tier_counters:
                             _increment_tier_dict(tier_counters, "joern", "errors")
-                    elif tier_counters:
-                        _increment_tier_dict(tier_counters, "joern", "refuted")
-                elif not pre_hit and tier_counters:
-                    _increment_tier_dict(tier_counters, "joern", "skipped")
+                    elif (_cov := _joern_coverage_probe(
+                        joern_server, function_name, file_path,
+                        # Same CPG-scaled, deadline-clamped budget as
+                        # the live query this probe gates: the 10s
+                        # def-time default times out on a loaded
+                        # shared REPL, and each per-function timeout
+                        # books a channel error — 8 distinct keys
+                        # trip the health gate and the whole joern
+                        # lane goes dark for the run.
+                        timeout=_live_timeout,
+                        errors_out=_cov_errors,
+                    )):
+                        _record_joern_outcome(config, error=False)
+                        if tier_counters:
+                            _increment_tier_dict(tier_counters, "joern", "refuted")
+                    else:
+                        # Silence from a CPG that does not model the
+                        # function (no frontend for the file's
+                        # language, extraction miss, unanswerable
+                        # probe) is vacuous — the channel did NOT
+                        # look. Same phantom-coverage rule as the
+                        # gated skips below: keep it out of the
+                        # dispatch record so gate resolution cannot
+                        # demote suspicious → clean on it.
+                        if _cov is False:
+                            # The probe ANSWERED — a healthy round
+                            # trip for the channel-health gate, same
+                            # as pre-gate silence accounting.
+                            _record_joern_outcome(config, error=False)
+                        elif any("timed out" in str(_e)
+                                 for _e in _cov_errors):
+                            # Probe timeout = REPL contention, not
+                            # channel sickness: a stuck/dead channel
+                            # already feeds the gate through the live
+                            # queries' own timeouts. Booking one error
+                            # per probed function here tripped the
+                            # gate off a healthy-but-busy server and
+                            # took the whole joern lane dark for the
+                            # run. The step still skips (no verdict);
+                            # the health gate just doesn't hear it.
+                            logger.debug(
+                                "joern coverage probe timed out for "
+                                "%s:%s — skipping without a health "
+                                "booking", file_path, function_name,
+                            )
+                        else:
+                            _record_joern_outcome(
+                                config, error=True,
+                                detail="coverage probe unanswerable",
+                                key=f"{file_path}:{function_name}",
+                            )
+                        if skipped_types is not None:
+                            skipped_types.add(tool_type)
+                        if tier_counters:
+                            _increment_tier_dict(
+                                tier_counters, "joern", "skipped",
+                            )
+                elif not pre_hit:
+                    # No server, or the channel-health gate tripped —
+                    # the channel did NOT look. Record it in
+                    # skipped_types so callers drop it from the
+                    # dispatch record: a gated channel left in
+                    # tools_dispatched reads as "covering channel ran
+                    # silent" and lets the gate-resolution pass demote
+                    # suspicious → clean on phantom coverage.
+                    if skipped_types is not None:
+                        skipped_types.add(tool_type)
+                    if tier_counters:
+                        _increment_tier_dict(tier_counters, "joern", "skipped")
 
                 if joern_hit and joern_server is not None:
                     _enrich_joern_evidence(
@@ -16749,27 +21956,48 @@ def _run_tool_chain(
             elif tool_type == "codeql":
                 _tool_db = _codeql_db_for(config, file_path)
                 if not _tool_db:
-                    # Startup already recorded this degradation
-                    # (codeql → semgrep taint mode); honour it at
-                    # dispatch instead of erroring at run time — the
-                    # rest of the chain (semgrep/joern/smt) covers the
-                    # claim. Loud once per run, then debug.
+                    # Either the tier degraded at startup (no database
+                    # at all) or the router has no database for this
+                    # file's language; honour it at dispatch instead
+                    # of erroring at run time — the rest of the chain
+                    # (semgrep/joern/smt) covers the claim. Loud once
+                    # per run, then debug.
+                    _has_any_db = bool(
+                        getattr(getattr(config, "codeql_db_router", None),
+                                "paths", None)
+                        or config.codeql_db_path,
+                    )
                     _note_codeql_degraded_skip(
                         file_path, function_name,
+                        reason=(
+                            "no database for this file's language"
+                            if _has_any_db else "no CodeQL database"
+                        ),
                     )
+                    # Skipped = did not look: keep it out of the
+                    # dispatch record (same phantom-coverage rule as
+                    # the gated joern skips).
+                    if skipped_types is not None:
+                        skipped_types.add(tool_type)
                     if tier_counters:
                         _increment_tier_dict(
                             tier_counters, "codeql", "skipped",
                         )
                     continue
-                if not _codeql_query_file(tool_cfg.get("query") or ""):
+                _cq_query = _codeql_query_file(
+                    tool_cfg.get("query") or "",
+                )
+                if not _cq_query:
                     # Defense in depth behind the producers' filter: a
-                    # query ID (not an on-disk file) would error on
-                    # every dispatch inside run_codeql_sweep.
+                    # spec that is neither an on-disk file nor a
+                    # resolvable pack ID would error on every dispatch
+                    # inside run_codeql_sweep.
                     _note_codeql_unsupported_query_id(
                         tool_cfg.get("query") or "",
                         file_path, function_name,
                     )
+                    if skipped_types is not None:
+                        skipped_types.add(tool_type)
                     if tier_counters:
                         _increment_tier_dict(
                             tier_counters, "codeql", "skipped",
@@ -16777,22 +22005,70 @@ def _run_tool_chain(
                     continue
                 from .sweep import run_codeql_sweep
 
-                codeql_result = run_codeql_sweep(
-                    target_path=effective_target,
-                    file_path=file_path,
-                    function_name=function_name,
-                    query_path=tool_cfg["query"],
-                    database_path=_tool_db,
-                    line_start=line_start,
-                    line_end=_checklist_line_end(
-                        config, file_path, function_name)
-                    or (line_start + 50 if line_start else 0),
+                _cq_line_end = _checklist_line_end(
+                    config, file_path, function_name,
+                ) or (line_start + 50 if line_start else 0)
+                codeql_result = _memoized_sweep_step(
+                    config,
+                    "codeql",
+                    {
+                        "query": _memo_hash_file(_cq_query),
+                        # The database's row data is too large to hash;
+                        # its metadata file pins the build identity and
+                        # the memo's run lifetime bounds the rest (the
+                        # DB is built once per run). Missing metadata
+                        # → un-hashable → unmemoized.
+                        "db_meta": _memo_hash_file(
+                            Path(_tool_db) / "codeql-database.yml"),
+                        "db": str(_tool_db),
+                        "file": _memo_hash_file(
+                            effective_target / file_path),
+                        "path": file_path,
+                        "function": function_name,
+                        "line_start": line_start,
+                        "line_end": _cq_line_end,
+                    },
+                    lambda: run_codeql_sweep(
+                        target_path=effective_target,
+                        file_path=file_path,
+                        function_name=function_name,
+                        query_path=_cq_query,
+                        database_path=_tool_db,
+                        line_start=line_start,
+                        line_end=_cq_line_end,
+                        # Whole-DB memo scoped to THIS run (test
+                        # stand-in configs without the field fall back
+                        # to the sweep layer's module default).
+                        memo=getattr(config, "codeql_memo", None),
+                    ),
                 )
-                if codeql_result.outcome == "confirmed":
+                _cq_oc = _classify_sweep_outcome(codeql_result)
+                if _cq_oc == "confirmed":
                     confirmed.append(f"codeql:{Path(tool_cfg['query']).stem}")
                     if tier_counters:
                         _increment_tier_dict(tier_counters, "codeql", "confirmed")
-                elif codeql_result.outcome == "error":
+                elif _cq_oc == "skipped":
+                    # The database never ingested this file (source-
+                    # archive membership gate in run_codeql_sweep) —
+                    # the channel could not look. Same phantom-
+                    # coverage rule as the router miss above: left in
+                    # the dispatch record, the gate-resolution pass
+                    # would demote suspicious → clean on a channel
+                    # that saw nothing.
+                    _note_codeql_degraded_skip(
+                        file_path, function_name,
+                        reason=(
+                            (codeql_result.details or {}).get("reason")
+                            or "file not in this database"
+                        ),
+                    )
+                    if skipped_types is not None:
+                        skipped_types.add(tool_type)
+                    if tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "codeql", "skipped",
+                        )
+                elif _cq_oc == "error":
                     logger.debug(
                         "tool_chain codeql error %s:%s: %s",
                         file_path,
@@ -16803,27 +22079,57 @@ def _run_tool_chain(
                         errored_types.add(tool_type)
                     if tier_counters:
                         _increment_tier_dict(tier_counters, "codeql", "errors")
-                elif tier_counters:
+                elif _cq_oc == "inconclusive":
+                    if tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "codeql", "inconclusive",
+                        )
+                elif _cq_oc == "refuted" and tier_counters:
                     _increment_tier_dict(tier_counters, "codeql", "refuted")
 
             elif tool_type == "compiler":
                 from .compiler_sweep import run_compiler_analyzer_sweep
 
-                comp_result = run_compiler_analyzer_sweep(
-                    target_path=effective_target,
-                    file_path=file_path,
-                    function_name=function_name,
-                    hypothesis=hypothesis,
-                    cwe=tool_cfg.get("cwe", ""),
-                    line_start=line_start,
-                    line_end=line_start + 50 if line_start else 0,
-                    out_dir=config.out_dir,
+                # The TU's #include closure is not hashed — the memo's
+                # single-run lifetime over a read-only target tree
+                # bounds it (see core.audit.sweep_memo).
+                comp_result = _memoized_sweep_step(
+                    config,
+                    "compiler",
+                    {
+                        "file": _memo_hash_file(
+                            effective_target / file_path),
+                        "path": file_path,
+                        "function": function_name,
+                        "hypothesis": _memo_hash_text(hypothesis),
+                        "cwe": tool_cfg.get("cwe", ""),
+                        "line_start": line_start,
+                        "target": str(effective_target),
+                    },
+                    lambda: run_compiler_analyzer_sweep(
+                        target_path=effective_target,
+                        file_path=file_path,
+                        function_name=function_name,
+                        hypothesis=hypothesis,
+                        cwe=tool_cfg.get("cwe", ""),
+                        line_start=line_start,
+                        line_end=line_start + 50 if line_start else 0,
+                        out_dir=config.out_dir,
+                        # TU/include caches scoped to THIS run (test
+                        # stand-in configs without the fields fall
+                        # back to the module defaults).
+                        tu_cache=getattr(config, "tu_cache", None),
+                        include_dirs_memo=getattr(
+                            config, "include_dirs_memo", None,
+                        ),
+                    ),
                 )
-                if comp_result.outcome == "confirmed":
+                _cp_oc = _classify_sweep_outcome(comp_result)
+                if _cp_oc == "confirmed":
                     confirmed.append(comp_result.rule_id or "compiler:analyzer")
                     if tier_counters:
                         _increment_tier_dict(tier_counters, "compiler", "confirmed")
-                elif comp_result.outcome == "error":
+                elif _cp_oc == "error":
                     logger.debug(
                         "tool_chain compiler error %s:%s: %s",
                         file_path,
@@ -16834,9 +22140,16 @@ def _run_tool_chain(
                         errored_types.add(tool_type)
                     if tier_counters:
                         _increment_tier_dict(tier_counters, "compiler", "errors")
-                elif comp_result.outcome == "refuted":
+                elif _cp_oc == "refuted":
                     if tier_counters:
                         _increment_tier_dict(tier_counters, "compiler", "refuted")
+                elif _cp_oc == "skipped":
+                    # Did not look: out of the dispatch record, never
+                    # the refuted counter.
+                    if skipped_types is not None:
+                        skipped_types.add(tool_type)
+                    if tier_counters:
+                        _increment_tier_dict(tier_counters, "compiler", "skipped")
                 elif tier_counters:
                     _increment_tier_dict(tier_counters, "compiler", "inconclusive")
 
@@ -16845,6 +22158,8 @@ def _run_tool_chain(
                 from .joern_verify import (
                     extract_flow_endpoints,
                     extract_guard_target,
+                    flow_sanitizer_names,
+                    guard_check_kind,
                     run_flow_reachability_check,
                     run_guard_dominance_check,
                 )
@@ -16856,9 +22171,25 @@ def _run_tool_chain(
                     ident, sink = extract_flow_endpoints(hypothesis, sinks)
 
                 jv_timeout = _joern_budget_timeout_s(config)
-                if not ident or not sink or joern_server is None:
-                    # No binding (identifier-consistency control) or no
-                    # live server — decline, don't guess.
+                if (
+                    not ident or not sink or joern_server is None
+                    or _joern_dispatch_blocked(config)
+                    or not _jv_is_valid_identifier(function_name)
+                ):
+                    # No binding (identifier-consistency control), no
+                    # live server, the channel-health gate tripped, or
+                    # a name the check functions themselves reject —
+                    # their precondition is the BARE identifier shape
+                    # (stricter than the query-substitution allowlist,
+                    # which admits dotted qualified names): a
+                    # qualified/operator/dynamic name returns
+                    # outcome=error from _validate_common and farms
+                    # the health breaker on ordinary C++/Python
+                    # inventories. Decline, don't guess. The channel
+                    # did not look, so it must leave the dispatch
+                    # record too.
+                    if skipped_types is not None:
+                        skipped_types.add(tool_type)
                     if tier_counters:
                         _increment_tier_dict(tier_counters, tool_type, "skipped")
                 elif jv_timeout == 0:
@@ -16870,6 +22201,8 @@ def _run_tool_chain(
                         "nearly exhausted",
                         tool_type, file_path, function_name,
                     )
+                    if skipped_types is not None:
+                        skipped_types.add(tool_type)
                     if tier_counters:
                         _increment_tier_dict(tier_counters, tool_type, "skipped")
                 else:
@@ -16882,6 +22215,12 @@ def _run_tool_chain(
                             sink_call=sink,
                             server=joern_server,
                             timeout=jv_timeout,
+                            # Bind the refutation to the check kind
+                            # the hypothesis CWE asserts is missing —
+                            # a dominating mere USE of the identifier
+                            # must abstain, not refute.
+                            check_kind=guard_check_kind(
+                                tool_cfg.get("cwe", "")),
                         )
                     else:
                         jv_result = run_flow_reachability_check(
@@ -16892,30 +22231,63 @@ def _run_tool_chain(
                             sink_call=sink,
                             server=joern_server,
                             timeout=jv_timeout,
+                            # Arms the sanitizer-aware lane only for
+                            # classes whose chain entry carries
+                            # sanitizer_classes (CWE-116); empty for
+                            # every other family.
+                            sanitizer_names=flow_sanitizer_names(
+                                tool_cfg.get("sanitizer_classes") or (),
+                                file_path,
+                                getattr(config, "out_dir", None),
+                            ),
                         )
-                    if jv_result.outcome == "confirmed":
+                    _jv_oc = _classify_sweep_outcome(jv_result)
+                    if _jv_oc == "confirmed":
                         confirmed.append(jv_result.rule_id or f"joern:{tool_type}")
+                        _record_joern_outcome(config, error=False)
                         if tier_counters:
                             _increment_tier_dict(tier_counters, tool_type, "confirmed")
-                    elif jv_result.outcome == "error":
+                    elif _jv_oc == "error":
                         logger.debug(
                             "tool_chain %s error %s:%s: %s",
                             tool_type, file_path, function_name,
                             jv_result.errors,
                         )
+                        _record_joern_outcome(
+                            config, error=True,
+                            detail="; ".join(
+                                str(e) for e in (jv_result.errors or [])
+                            ),
+                            key=f"{file_path}:{function_name}",
+                        )
                         if errored_types is not None:
                             errored_types.add(tool_type)
                         if tier_counters:
                             _increment_tier_dict(tier_counters, tool_type, "errors")
-                    elif jv_result.outcome == "refuted":
+                    elif _jv_oc == "refuted":
                         # Mechanical refutation (dominating check found /
                         # no flow with endpoints present).  The chain
                         # contract returns confirmations only; the
                         # refutation evidence stays in the sweep log.
+                        _record_joern_outcome(config, error=False)
                         if tier_counters:
                             _increment_tier_dict(tier_counters, tool_type, "refuted")
-                    elif tier_counters:
-                        _increment_tier_dict(tier_counters, tool_type, "inconclusive")
+                    elif _jv_oc == "skipped":
+                        # Did not look: out of the dispatch record,
+                        # never the refuted counter; no health
+                        # accounting (the tool was never dialed).
+                        if skipped_types is not None:
+                            skipped_types.add(tool_type)
+                        if tier_counters:
+                            _increment_tier_dict(
+                                tier_counters, tool_type, "skipped",
+                            )
+                    else:
+                        # Inconclusive still reached the server — a
+                        # completed round trip for health purposes.
+                        _record_joern_outcome(config, error=False)
+                        if tier_counters:
+                            _increment_tier_dict(tier_counters, tool_type, "inconclusive")
 
             elif tool_type == "coccinelle_flow":
                 from .cocci_flow import run_flow_cocci_sweep
@@ -16928,15 +22300,17 @@ def _run_tool_chain(
                     template=tool_cfg.get("template"),
                     line_start=line_start or None,
                     line_end=None,
+                    language=_inventory_language_hint(config, file_path),
                 )
-                if cf_result.outcome == "confirmed":
+                _cf_oc = _classify_sweep_outcome(cf_result)
+                if _cf_oc == "confirmed":
                     template_id = (cf_result.rule_id or "cocci-flow").split(":")[-1]
                     confirmed.append(f"coccinelle:flow-{template_id}")
                     if tier_counters:
                         _increment_tier_dict(
                             tier_counters, "coccinelle_flow", "confirmed",
                         )
-                elif cf_result.outcome == "error":
+                elif _cf_oc == "error":
                     logger.debug(
                         "tool_chain coccinelle_flow error %s:%s: %s",
                         file_path,
@@ -16949,10 +22323,33 @@ def _run_tool_chain(
                         _increment_tier_dict(
                             tier_counters, "coccinelle_flow", "errors",
                         )
-                elif cf_result.outcome == "refuted":
+                elif _cf_oc == "refuted":
                     if tier_counters:
                         _increment_tier_dict(
                             tier_counters, "coccinelle_flow", "refuted",
+                        )
+                elif _cf_oc == "skipped":
+                    # Substrate license withheld in the sweep layer —
+                    # the channel did not look (phantom-coverage rule).
+                    if skipped_types is not None:
+                        skipped_types.add(tool_type)
+                    _cf_details = cf_result.details or {}
+                    _cf_receipt = _cf_details.get("substrate")
+                    if _cf_receipt:
+                        _note_substrate_skip(
+                            config, tier_counters, "coccinelle_flow",
+                            file_path, function_name,
+                            reason=_cf_details.get(
+                                "reason", "substrate not modeled",
+                            ),
+                            language=(
+                                _cf_receipt.get("evidence") or {}
+                            ).get("language"),
+                            receipt=_cf_receipt,
+                        )
+                    elif tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "coccinelle_flow", "skipped",
                         )
                 elif tier_counters:
                     _increment_tier_dict(
@@ -16997,7 +22394,8 @@ def _run_tool_chain(
                         xref_source=_xref_src,
                     )
 
-                if _bc_res.outcome == "confirmed":
+                _bc_oc = _classify_sweep_outcome(_bc_res)
+                if _bc_oc == "confirmed":
                     confirmed.append(
                         f"{tool_type}:{_bc_res.rule_id}")
                     if tier_counters:
@@ -17005,7 +22403,7 @@ def _run_tool_chain(
                             tier_counters, tool_type,
                             "confirmed",
                         )
-                elif _bc_res.outcome == "error":
+                elif _bc_oc == "error":
                     logger.debug(
                         "tool_chain %s error %s:%s: %s",
                         tool_type,
@@ -17017,11 +22415,173 @@ def _run_tool_chain(
                         _increment_tier_dict(
                             tier_counters, tool_type, "errors",
                         )
-                elif tier_counters:
+                elif _bc_oc == "skipped":
+                    # Did not look: out of the dispatch record, never
+                    # the refuted counter.
+                    if skipped_types is not None:
+                        skipped_types.add(tool_type)
+                    if tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, tool_type, "skipped",
+                        )
+                elif _bc_oc == "inconclusive":
+                    # CWE outside the checker's scope: the checker
+                    # declined — an inconclusive counted as refuted
+                    # here overstated the checkers' refutation power.
+                    if tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, tool_type, "inconclusive",
+                        )
+                elif _bc_oc == "refuted" and tier_counters:
                     _increment_tier_dict(
                         tier_counters, tool_type, "refuted",
                     )
 
+            elif tool_type == "sanwit":
+                from .sanwit import run_sanwit_check
+
+                sw_res = run_sanwit_check(
+                    effective_target,
+                    file_path,
+                    function_name,
+                    hypothesis,
+                    source=source or "",
+                    cwe=cwe,
+                    audit_run_dir=config.out_dir,
+                )
+                _record_channel_receipt(
+                    config, "sanwit_check", file_path, function_name,
+                    sw_res,
+                )
+                _sw_oc = _classify_sweep_outcome(sw_res)
+                if _sw_oc == "confirmed":
+                    confirmed.append(sw_res.rule_id)
+                    logger.info(
+                        "sanwit insufficient %s:%s — %s",
+                        file_path, function_name, sw_res.reason,
+                    )
+                    if tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "sanwit", "confirmed",
+                        )
+                elif _sw_oc == "skipped":
+                    # Did not look (extraction refused / context not
+                    # determinable / interpreter absent): out of the
+                    # dispatch record, never the refuted counter. The
+                    # receipt above records the reason.
+                    if skipped_types is not None:
+                        skipped_types.add(tool_type)
+                    if tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "sanwit", "skipped",
+                        )
+                elif _sw_oc == "error":
+                    logger.debug(
+                        "sanwit error %s:%s: %s",
+                        file_path, function_name, sw_res.reason,
+                    )
+                    if errored_types is not None:
+                        errored_types.add(tool_type)
+                    if tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "sanwit", "errors",
+                        )
+                elif _sw_oc == "refuted" and tier_counters:
+                    # Unreachable by module contract (sanwit emits no
+                    # refutations); booked defensively so a future
+                    # variant cannot be miscounted.
+                    _increment_tier_dict(
+                        tier_counters, "sanwit", "refuted",
+                    )
+                else:
+                    # "sufficient" lands here: steer-tier receipt,
+                    # never a clean resolution.
+                    logger.info(
+                        "sanwit inconclusive %s:%s — %s",
+                        file_path, function_name, sw_res.reason,
+                    )
+                    if tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "sanwit", "inconclusive",
+                        )
+
+            elif tool_type == "gadget_oracle":
+                from core.analysis.gadget_oracle import (
+                    run_gadget_oracle_check,
+                )
+
+                go_res = run_gadget_oracle_check(
+                    effective_target,
+                    file_path,
+                    function_name,
+                    hypothesis,
+                    output_dir=config.out_dir,
+                )
+                go_res.corroboration.extend(
+                    c for c in confirmed
+                    if not c.startswith("gadget_oracle")
+                )
+                _record_channel_receipt(
+                    config, "gadget_oracle_check", file_path,
+                    function_name, go_res,
+                )
+                _go_oc = _classify_sweep_outcome(go_res)
+                if _go_oc == "confirmed":
+                    confirmed.append(go_res.rule_id)
+                    logger.info(
+                        "gadget-oracle chain %s:%s — %s",
+                        file_path, function_name, go_res.reason,
+                    )
+                    if tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "gadget_oracle",
+                            "confirmed",
+                        )
+                elif _go_oc == "skipped":
+                    # Did not look (grammar absent / non-PHP /
+                    # unusable target): out of the dispatch record,
+                    # never the refuted counter. The receipt above
+                    # records the capability gap.
+                    if skipped_types is not None:
+                        skipped_types.add(tool_type)
+                    if tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "gadget_oracle", "skipped",
+                        )
+                elif _go_oc == "error":
+                    if errored_types is not None:
+                        errored_types.add(tool_type)
+                    if tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "gadget_oracle", "errors",
+                        )
+                elif _go_oc == "refuted":
+                    # The corpus-earned absence refutation (complete
+                    # census, zero POP trigger surface — see
+                    # gadget_oracle.absence_earns_suppression). Its
+                    # authority is the post-review confidence clamp
+                    # (_apply_gadget_absence_gate); here it only
+                    # books and logs.
+                    logger.info(
+                        "gadget-oracle refuted %s:%s — %s",
+                        file_path, function_name, go_res.reason,
+                    )
+                    if tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "gadget_oracle", "refuted",
+                        )
+                else:
+                    # Census-qualified absence lands here: strong
+                    # steer-tier evidence, never a clean resolution.
+                    logger.info(
+                        "gadget-oracle inconclusive %s:%s — %s",
+                        file_path, function_name, go_res.reason,
+                    )
+                    if tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "gadget_oracle",
+                            "inconclusive",
+                        )
 
         except Exception as exc:  # noqa: BLE001
             logger.debug(
@@ -17041,6 +22601,23 @@ def _run_tool_chain(
                     "wall_time_s",
                     time.monotonic() - _tier_t0,
                 )
+
+    if _exit_skipped and config.out_dir:
+        try:
+            append_audit_log(config.out_dir, {
+                "action": "tool_chain_early_exit",
+                "key": f"{file_path}:{function_name}",
+                "file": file_path,
+                "function": function_name,
+                "confirming_receipt": _exit_receipt,
+                "tools_skipped": sorted(set(_exit_skipped)),
+                "hypothesis": hypothesis[:200],
+            })
+        except Exception:
+            logger.debug(
+                "tool_chain early-exit journal row failed",
+                exc_info=True,
+            )
 
     return confirmed
 
@@ -17104,6 +22681,7 @@ def _check_preconditions(
             preconditions,
             target_path=config.target_path,
             context_map=context_map,
+            graph_store=_graph_store_for_config(config),
         )
 
         if verdict.any_contradicted:
@@ -17293,7 +22871,10 @@ def _sweep_validate(
                         ",".join(h.rule_id for h in pf.hits[:3]),
                     )
 
-        chain = _hypothesis_to_tool_chain(hypothesis, effective_file, cwe=cwe)
+        chain = _hypothesis_to_tool_chain(
+            hypothesis, effective_file, cwe=cwe,
+            language=_inventory_language_hint(config, effective_file),
+        )
 
         if is_binary:
             try:
@@ -17305,6 +22886,7 @@ def _sweep_validate(
 
         dispatched = {step.get("type") for step in chain if step.get("type")}
         errored: set = set()
+        skipped: set = set()
 
         confirmed = _run_tool_chain(
             chain,
@@ -17321,7 +22903,19 @@ def _sweep_validate(
             target_path_override=_decomp_tmp_dir if is_binary and _decomp_tmp_dir else None,
             cwe=cwe,
             errored_types=errored,
+            # Exit only on a receipt THIS site would stamp on its own:
+            # promotion-grade AND not premise-blocked (a function-local
+            # confirm under a cross-function counter falls through, so
+            # a later cross-function channel must still get its turn).
+            early_exit_check=lambda c: (
+                _promotion_grade_receipt(c)
+                and not _premise_blocks_confirm(premise_h, [c])
+            ),
+            skipped_types=skipped,
         )
+        # A skipped channel did not look — it must not claim class
+        # coverage in the gate-resolution pass.
+        dispatched -= skipped
 
         # No Frida auto-launch here — an earlier last-resort path gated
         # on a never-set ``config._binary_path`` attribute was dead code
@@ -17333,6 +22927,8 @@ def _sweep_validate(
         outcome.tools_dispatched = (outcome.tools_dispatched or set()) | dispatched
         if errored:
             outcome.tools_errored = (outcome.tools_errored or set()) | errored
+        if skipped:
+            outcome.tools_skipped = (outcome.tools_skipped or set()) | skipped
         if confirmed and _premise_blocks_confirm(premise_h, confirmed):
             _note_premise_blocked_validation(
                 outcome, premise_h, confirmed, config, tier_counters,
@@ -17493,7 +23089,24 @@ def _run_clean_check_sweep(
     Checks the evidence index for any flows the LLM may have missed.
     Returns a text description of discovered flows, or None.
     """
-    key = f"{outcome.file}:{outcome.function}"
+    return _clean_check_flows(
+        outcome.file, outcome.function, evidence_index,
+    )
+
+
+def _clean_check_flows(
+    file_path: str,
+    function_name: str,
+    evidence_index: dict[str, EvidenceRecord] | None = None,
+) -> str | None:
+    """Collect the clean-check sweep's flow evidence for one function.
+
+    Shared by the post-verdict rescue and the pre-review flow preview
+    — the same evidence-index read, so a pre-run that already surfaced
+    these flows in the first prompt makes the rescue's re-read (and
+    its second review call) redundant.
+    """
+    key = f"{file_path}:{function_name}"
 
     if evidence_index:
         rec = evidence_index.get(key)
@@ -17597,22 +23210,21 @@ def _proactive_validate(
 
     confirmed_tools = []
     # Per-function dispatch record: which channels actually RAN here
-    # (and which errored). Gate resolution's covered==ran check reads
-    # these off the outcome — an installed-but-never-dispatched tool
-    # must not count as class coverage.
+    # (and which errored or were skipped). Gate resolution's
+    # covered==ran check reads these off the outcome — an
+    # installed-but-never-dispatched tool must not count as class
+    # coverage, and a channel whose silence was vacuous (the CPG
+    # never modelled the function) must be REMOVED from the record.
     ran: set = set()
     errored: set = set()
+    skipped: set = set()
 
     smt_verb = smt_verb_for_cwe(cwe) if _has_cwe_dispatch else None
     if smt_verb and "smt" not in dispatched:
         try:
-            source_text = ""
-            try:
-                src_path = config.target_path / outcome.file
-                if src_path.is_file():
-                    source_text = src_path.read_text(errors="replace")
-            except OSError:
-                pass
+            source_text = _contained_source_text(
+                config.target_path, outcome.file,
+            ) or ""
             ran.add("smt")
             smt_result = run_smt_verb_direct(
                 verb=smt_verb,
@@ -17622,22 +23234,29 @@ def _proactive_validate(
                 hypothesis=outcome.hypothesis or "",
                 target_path=str(config.target_path),
             )
-            if smt_result.outcome == "confirmed":
+            _pv_smt_oc = _classify_sweep_outcome(smt_result)
+            if _pv_smt_oc == "confirmed":
                 confirmed_tools.append(f"smt:{smt_verb}")
                 if tier_counters:
                     _increment_tier_dict(tier_counters, "smt", "confirmed")
-            elif smt_result.outcome == "refuted":
+            elif _pv_smt_oc == "refuted":
                 if tier_counters:
                     _increment_tier_dict(tier_counters, "smt", "refuted")
+            elif _pv_smt_oc == "skipped":
+                # Did not look — it entered the dispatch record before
+                # the run, so scrub it (phantom-coverage rule).
+                ran.discard("smt")
+                if tier_counters:
+                    _increment_tier_dict(tier_counters, "smt", "skipped")
             else:
                 # inconclusive / error — count separately so the
                 # diagnostics don't overstate SMT's refutation power.
-                if smt_result.outcome == "error":
+                if _pv_smt_oc == "error":
                     errored.add("smt")
                 if tier_counters:
                     _increment_tier_dict(
                         tier_counters, "smt",
-                        "errors" if smt_result.outcome == "error"
+                        "errors" if _pv_smt_oc == "error"
                         else "inconclusive",
                     )
         except Exception:
@@ -17646,7 +23265,7 @@ def _proactive_validate(
             if tier_counters:
                 _increment_tier_dict(tier_counters, "smt", "errors")
 
-    if _has_cwe_dispatch and joern_applicable(cwe) and "joern" not in dispatched:
+    if _has_cwe_dispatch and joern_applicable(cwe, outcome.file) and "joern" not in dispatched:
         sinks = sinks_for_cwe(cwe)
         pre_hit = False
         if sinks and evidence_index:
@@ -17659,30 +23278,105 @@ def _proactive_validate(
                     _increment_tier_dict(tier_counters, "joern", "confirmed")
                 pre_hit = True
 
-        if not pre_hit and sinks and joern_server is not None:
-            ran.add("joern")
-            _live_errors: list = []
-            live_hits = _joern_live_query(
-                joern_server,
-                outcome.function,
-                sinks,
-                errors_out=_live_errors,
-            )
-            if live_hits:
-                confirmed_tools.append("joern:live")
+        if (
+            not pre_hit and sinks and joern_server is not None
+            and not _joern_dispatch_blocked(config)
+        ):
+            _live_timeout = _joern_live_timeout_s(config, joern_server)
+            if _live_timeout == 0:
                 if tier_counters:
-                    _increment_tier_dict(tier_counters, "joern", "confirmed")
-            elif _live_errors:
-                # Degraded query — unanswered, not refuted.
-                logger.debug(
-                    "cwe-dispatch joern error %s:%s: %s",
-                    outcome.file, outcome.function, _live_errors,
+                    _increment_tier_dict(tier_counters, "joern", "skipped")
+            elif not _joern_name_queryable(outcome.function):
+                # Unqueryable name — definitional skip, never a
+                # health-accountable round trip (see the tool-chain
+                # leg).
+                if tier_counters:
+                    _increment_tier_dict(tier_counters, "joern", "skipped")
+            else:
+                ran.add("joern")
+                _live_errors: list = []
+                _cov_errors: list = []
+                live_hits = _joern_live_query(
+                    joern_server,
+                    outcome.function,
+                    sinks,
+                    timeout=_live_timeout,
+                    errors_out=_live_errors,
                 )
-                errored.add("joern")
-                if tier_counters:
-                    _increment_tier_dict(tier_counters, "joern", "errors")
-            elif tier_counters:
-                _increment_tier_dict(tier_counters, "joern", "refuted")
+                if live_hits:
+                    confirmed_tools.append("joern:live")
+                    _record_joern_outcome(config, error=False)
+                    if tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "joern", "confirmed",
+                        )
+                elif _live_errors:
+                    # Degraded query — unanswered, not refuted.
+                    logger.debug(
+                        "cwe-dispatch joern error %s:%s: %s",
+                        outcome.file, outcome.function, _live_errors,
+                    )
+                    _record_joern_outcome(
+                        config, error=True,
+                        detail="; ".join(str(e) for e in _live_errors),
+                        key=f"{outcome.file}:{outcome.function}",
+                    )
+                    errored.add("joern")
+                    if tier_counters:
+                        _increment_tier_dict(tier_counters, "joern", "errors")
+                elif (_cov := _joern_coverage_probe(
+                    joern_server, outcome.function, outcome.file,
+                    # Same CPG-scaled, deadline-clamped budget as the
+                    # live query this probe gates — mirror of the
+                    # tool-chain leg (the def-time 10s default times
+                    # out on a loaded shared REPL).
+                    timeout=_live_timeout,
+                    errors_out=_cov_errors,
+                )):
+                    _record_joern_outcome(config, error=False)
+                    if tier_counters:
+                        _increment_tier_dict(tier_counters, "joern", "refuted")
+                else:
+                    # Silence from a CPG that does not model the
+                    # function is vacuous — the channel did NOT look.
+                    # It was added to the dispatch record before the
+                    # query, so remove it: gate resolution must not
+                    # read vacuous silence as a covering channel that
+                    # ran silent. (Same rule as the tool_chain leg.)
+                    ran.discard("joern")
+                    skipped.add("joern")
+                    if _cov is False:
+                        # The probe ANSWERED — a healthy round trip.
+                        _record_joern_outcome(config, error=False)
+                    elif any("timed out" in str(_e)
+                             for _e in _cov_errors):
+                        # Probe timeout = REPL contention, not channel
+                        # sickness — same carve-out as the tool-chain
+                        # leg: a stuck channel already feeds the gate
+                        # through the live queries' own timeouts, and
+                        # booking one error per probed function here
+                        # would trip the gate off a healthy-but-busy
+                        # server through THIS leg too.
+                        logger.debug(
+                            "cwe-dispatch coverage probe timed out "
+                            "for %s:%s — skipping without a health "
+                            "booking", outcome.file, outcome.function,
+                        )
+                    else:
+                        _record_joern_outcome(
+                            config, error=True,
+                            detail="coverage probe unanswerable",
+                            key=f"{outcome.file}:{outcome.function}",
+                        )
+                    if tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "joern", "skipped",
+                        )
+        elif not pre_hit and sinks and joern_server is not None:
+            # Health gate tripped: the channel does not look — do NOT
+            # add it to the ran/dispatch record (phantom coverage).
+            if tier_counters:
+                _increment_tier_dict(tier_counters, "joern", "skipped")
 
     _cwe_db = _codeql_db_for(config, outcome.file)
     if _has_cwe_dispatch and "codeql" not in dispatched and _cwe_db:
@@ -17720,6 +23414,11 @@ def _proactive_validate(
                     line_end=_checklist_line_end(
                         config, outcome.file, outcome.function,
                     ) or None,
+                    # Inventory-stamped language (canonical); None
+                    # lets the sweep detect it.
+                    language=_inventory_language_hint(
+                        config, outcome.file,
+                    ),
                 )
                 if cocci_result.outcome == "confirmed":
                     confirmed_tools.append(f"coccinelle:{Path(cocci_rule).stem}")
@@ -17738,11 +23437,40 @@ def _proactive_validate(
                                     "consistency violation at"
                                     f" {m_file}:{match.get('line', '?')}",
                                 )
-                elif cocci_result.outcome == "error":
+                elif _classify_sweep_outcome(cocci_result) == "error":
                     errored.add("coccinelle")
                     if tier_counters:
                         _increment_tier_dict(tier_counters, "coccinelle", "errors")
-                elif tier_counters:
+                elif cocci_result.outcome == "skipped":
+                    # Substrate license withheld in the sweep layer —
+                    # the leg entered the dispatch record before the
+                    # run, so scrub it (same rule as the joern leg's
+                    # vacuous-silence scrub).
+                    ran.discard("coccinelle")
+                    _pv_details = cocci_result.details or {}
+                    _pv_receipt = _pv_details.get("substrate")
+                    if _pv_receipt:
+                        _note_substrate_skip(
+                            config, tier_counters, "coccinelle",
+                            outcome.file, outcome.function,
+                            reason=_pv_details.get(
+                                "reason", "substrate not modeled",
+                            ),
+                            language=(
+                                _pv_receipt.get("evidence") or {}
+                            ).get("language"),
+                            receipt=_pv_receipt,
+                        )
+                    elif tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "coccinelle", "skipped",
+                        )
+                elif cocci_result.outcome == "inconclusive":
+                    if tier_counters:
+                        _increment_tier_dict(
+                            tier_counters, "coccinelle", "inconclusive",
+                        )
+                elif cocci_result.outcome == "refuted" and tier_counters:
                     _increment_tier_dict(tier_counters, "coccinelle", "refuted")
             except Exception:
                 logger.debug("proactive Coccinelle failed for %s", cwe, exc_info=True)
@@ -17756,13 +23484,31 @@ def _proactive_validate(
         try:
             from .cross_function_verify import cross_function_verify
             ran.add("cross_function")
+            _xf_parts = []
+            for _h in getattr(outcome, "hypotheses", None) or []:
+                if _refutation_scope_cross_function(_h):
+                    _c = (_h.get("counter") or "").strip()
+                    if _c:
+                        _xf_parts.append(_c)
+            _xf_counter = "\n".join(_xf_parts)
             xf_result = cross_function_verify(
                 function_name=outcome.function,
                 file_path=outcome.file,
                 hypothesis=outcome.hypothesis or "",
                 server=joern_server,
+                counter=_xf_counter,
             )
-            if xf_result is not None and xf_result.verified:
+            if xf_result is None:
+                # Inconclusive — no verifier decided anything.
+                # tool_coverage maps cross_function → joern, so
+                # leaving it in the dispatch record is phantom class
+                # coverage (the suspicious→clean demotion reads it as
+                # "covering channel ran silent").
+                ran.discard("cross_function")
+                skipped.add("cross_function")
+                if tier_counters:
+                    _increment_tier_dict(tier_counters, "joern_xf", "skipped")
+            elif xf_result.verified:
                 confirmed_tools.append(f"joern:xf:{xf_result.verifier_name}")
                 if tier_counters:
                     _increment_tier_dict(tier_counters, "joern_xf", "confirmed")
@@ -17774,7 +23520,7 @@ def _proactive_validate(
                         f"joern:xf:{xf_result.verifier_name}",
                         xf_result.evidence,
                     )
-            elif tier_counters and xf_result is not None:
+            elif tier_counters:
                 _increment_tier_dict(tier_counters, "joern_xf", "refuted")
         except Exception:
             logger.debug(
@@ -17791,6 +23537,8 @@ def _proactive_validate(
         outcome.tools_dispatched = (outcome.tools_dispatched or set()) | ran
     if errored:
         outcome.tools_errored = (outcome.tools_errored or set()) | errored
+    if skipped:
+        outcome.tools_skipped = (outcome.tools_skipped or set()) | skipped
 
     # Path feasibility: check whether flow trace conditions are jointly
     # satisfiable (strengthens or refutes the finding's reachability claim)
@@ -17841,13 +23589,9 @@ def _proactive_validate(
             format_lifecycle_evidence,
         )
 
-        source_text = ""
-        try:
-            src_path = config.target_path / outcome.file
-            if src_path.is_file():
-                source_text = src_path.read_text(errors="replace")
-        except OSError:
-            pass
+        source_text = _contained_source_text(
+            config.target_path, outcome.file,
+        ) or ""
         lc_findings = check_lifecycle_at_function(
             file_path=outcome.file,
             function_name=outcome.function,
@@ -17961,11 +23705,290 @@ def _auto_synthesize_rules(
     _clear_phase_abort(config, "checker-synthesis", result=result)
 
 
+def _track_promoted(
+    reviewed_outcomes: Any,
+    old: ReviewOutcome,
+    promoted: ReviewOutcome,
+) -> None:
+    """Point the executor's reviewed_outcomes map at the live object.
+
+    Mid-loop promotions REPLACE the outcome object; the chain
+    re-review preamble later fetches the tracked object to supersede
+    it, and a stale entry there forces the preamble onto its
+    site-scan fallback. Only swaps when the map still tracks the
+    pre-promotion object — a newer entry (a re-review that already
+    completed) is never clobbered. get/set race with a concurrent
+    re-review is benign: the loser leaves a stale entry, which the
+    preamble fallback resolves.
+    """
+    if reviewed_outcomes is None:
+        return
+    key = f"{promoted.file}:{promoted.function}"
+    try:
+        if reviewed_outcomes.get(key) is old:
+            reviewed_outcomes[key] = promoted
+    except Exception:
+        logger.debug("promotion tracking failed for %s", key, exc_info=True)
+
+
+def _journal_provisional_promotion(
+    result: OrchestratorResult,
+    config: OrchestratorConfig,
+    outcome: ReviewOutcome,
+    checklist: dict[str, Any] | None = None,
+) -> None:
+    """Journal a cadence-tick promotion immediately, marked provisional.
+
+    The mid-loop journal row for this function said ``suspicious``;
+    without this append the first finding-grade row lands only in the
+    end-of-run corrective pass — hours after the promoting evidence
+    existed on long runs, and never on a run killed before it. The row
+    carries ``provisional: true``; finalization appends the confirming
+    row (mark dropped) or the demotion paths retract the status. One
+    audit-log record mirrors the sweep-promotion entry shape.
+    Best-effort throughout: a journaling failure must never break the
+    cadence hook (the corrective end-of-run passes still run).
+    """
+    if not config.out_dir:
+        return
+    key = f"{outcome.file}:{outcome.function}"
+    with result._lock:
+        result.provisional_promoted_keys.append(key)
+    gap = None
+    if checklist:
+        try:
+            gap = _find_gap_in_checklist(
+                checklist, outcome.file, outcome.function,
+            )
+        except Exception:
+            gap = None
+    jgap: dict[str, Any] = {"line_start": outcome.line or 0}
+    if gap:
+        jgap = {
+            "line_start": gap.get("line_start", outcome.line or 0),
+            "line_end": gap.get("line_end"),
+            "strategies": list(gap.get("strategies") or []),
+        }
+        if gap.get("qualified_name"):
+            jgap["qualified_name"] = gap["qualified_name"]
+    try:
+        from .collector import append_journal_for_outcome
+
+        append_journal_for_outcome(
+            out_dir=config.out_dir,
+            target_path=config.target_path,
+            run_id=_resolved_run_id(config.out_dir),
+            outcome=outcome,
+            gap=jgap,
+        )
+    except Exception:
+        logger.debug(
+            "provisional journal append failed for %s", key, exc_info=True,
+        )
+    try:
+        entry: dict[str, Any] = {
+            "action": "incremental_promotion",
+            "key": f"{key}:{outcome.line or 0}",
+            "status": outcome.status,
+            "prior_status": "suspicious",
+            "provisional": True,
+            "cost_usd": 0.0,
+            "duration_s": 0.0,
+        }
+        entry["evidence_tool"] = outcome.evidence_tool or ""
+        entry["model"] = outcome.model or ""
+        entry["hypothesis"] = outcome.hypothesis or ""
+        if getattr(outcome, "function_qualified", ""):
+            entry["function_qualified"] = outcome.function_qualified
+        append_audit_log(config.out_dir, entry)
+    except Exception:
+        logger.debug(
+            "incremental promotion log failed for %s", key, exc_info=True,
+        )
+
+
+def _incremental_promotion_tick(
+    result: OrchestratorResult,
+    config: OrchestratorConfig,
+    *,
+    sarif_cache: SarifCache | None = None,
+    checklist: dict[str, Any] | None = None,
+    joern_server=None,
+    mechanical_findings: dict[str, list[dict[str, Any]]] | None = None,
+    reviewed_outcomes: Any = None,
+) -> int:
+    """Mid-loop promotion resolution on the critique cadence.
+
+    Runs the same mechanical promotion pass the post-loop sweep runs
+    (:func:`_promote_suspicious_one`: prep-detector correlation,
+    prefilter, hypothesis tool chains, aggregation — all $0 LLM, all
+    behind the same sink-guard/premise/synth-receipt gates) over the
+    suspicious outcomes accumulated since the last tick, so a finding
+    whose evidence exists at review N is journal-visible at the next
+    cadence boundary instead of in the run's final minutes.
+
+    Divisions of labor with the post-loop chain:
+
+    * Promotions here are PROVISIONAL (journaled with the mark); the
+      post-loop pass confirms via :func:`_finalize_provisional_promotions`
+      or retracts through the existing demotion paths (refutation
+      gates, binary-oracle absent demotion, adversarial refute).
+    * On-demand checker synthesis is LLM-backed and per-run-capped —
+      finalization-only. Chain-less hypotheses are parked (discarded
+      queue); the item stays suspicious and the post-loop pass routes
+      it to synthesis exactly as before.
+    * The counter-escalation floor stays finalization-only by its own
+      precondition (machine-raised rows resolve to clean only after
+      deepen/verification had their chance); the tick handles such
+      rows exactly like the post-loop sweep does — a verification
+      receipt promotes, silence leaves them for the floor.
+
+    Single-flight: overlapping critique boundaries from parallel
+    workers skip instead of racing; the skipped window folds into the
+    next tick (and the post-loop pass is the backstop for the last
+    partial window). Returns the number of promotions committed.
+    """
+    if not result._incremental_tick_lock.acquire(blocking=False):
+        return 0
+    try:
+        with result._lock:
+            # Marker-keyed window (never an index range): chain
+            # re-reviews remove() entries mid-loop, so index windows
+            # drift — rescanning already-ticked items (duplicate
+            # non-memoized tool dispatch) or skipping fresh ones.
+            # Marked at snapshot time: an item the tick then fails or
+            # breaks out on is not retried by later ticks — the
+            # post-loop sweep is the backstop, exactly as for the
+            # window a busy tick skips.
+            candidates = [
+                (j, o)
+                for j, o in enumerate(result.outcomes)
+                if o.status == "suspicious"
+                and not o._incr_ticked
+            ]
+            for _j, _o in candidates:
+                _o._incr_ticked = True
+        promoted_n = 0
+        # On-demand synthesis requests are collected and DISCARDED:
+        # the LLM-backed step must fire once, at finalization, under
+        # its in-order per-run cap.
+        parked_synthesis: list[tuple[int, ReviewOutcome, str, str, str]] = []
+        for j, outcome in candidates:
+            if is_sigterm_requested():
+                break
+            # holdoff(), not just concluded: the tick runs on a review
+            # worker thread the guard's dispatch pause cannot block,
+            # and its tool chains spawn subprocesses that write into
+            # the pressured TMPDIR — stand down while the guard is
+            # paused too; the post-loop sweep is the backstop.
+            _guard = getattr(config, "environment_guard_state", None)
+            if _guard is not None and _guard.holdoff():
+                break
+            try:
+                promoted = _promote_suspicious_one(
+                    result, config, j, outcome,
+                    sarif_cache=sarif_cache,
+                    checklist=checklist,
+                    joern_server=joern_server,
+                    mechanical_findings=mechanical_findings,
+                    synthesis_queue=parked_synthesis,
+                    provisional=True,
+                )
+            except Exception:
+                logger.debug(
+                    "incremental promotion failed for %s:%s",
+                    outcome.file, outcome.function, exc_info=True,
+                )
+                continue
+            if promoted is not None:
+                promoted_n += 1
+                _track_promoted(reviewed_outcomes, outcome, promoted)
+                _journal_provisional_promotion(
+                    result, config, promoted, checklist=checklist,
+                )
+        if promoted_n:
+            logger.info(
+                "incremental promotion: %d provisional finding(s) "
+                "journaled at the cadence tick",
+                promoted_n,
+            )
+            # findings.json rides along so an interrupted run's report
+            # (which joins findings.json with the journal) can show the
+            # provisional finding too. Atomic idempotent rewrite.
+            try:
+                _persist_findings(result, config)
+            except Exception:
+                logger.debug(
+                    "incremental findings persist failed", exc_info=True,
+                )
+        return promoted_n
+    finally:
+        result._incremental_tick_lock.release()
+
+
+def _finalize_provisional_promotions(
+    result: OrchestratorResult,
+    config: OrchestratorConfig,
+) -> int:
+    """Resolve cadence-tick provisional marks after post-loop passes.
+
+    Runs once, after every status-mutating pass (sweep, refutation
+    gates, dark verification, binary-oracle absent demotion, phase 2,
+    pre-export hooks) and BEFORE the final findings persist, the
+    corrective journal pass and the graded export — so all three
+    surfaces ship settled rows. Clearing the mark is what makes
+    ``_rejournal_final_statuses`` append the confirming row (same
+    verdict, mark dropped); retractions already re-journal through the
+    ordinary status-drift test. Exactly-once promotion side-effects
+    (checker synthesis, /validate selection) key off the post-loop
+    surfaces, not this mark — see the incremental tick's docstring.
+    Returns the number of still-provisional outcomes resolved.
+    """
+    resolved = 0
+    for outcome in result.outcomes:
+        if not getattr(outcome, "provisional", False):
+            continue
+        outcome.provisional = False
+        resolved += 1
+    if not (resolved or result.provisional_promoted_keys):
+        return 0
+    # Resolution label semantics: "confirmed" means the function ends
+    # the run as a finding — including a tick promotion that was
+    # retracted and later RE-EARNED by a post-loop pass. That is the
+    # honest end-state answer; per-transition history stays in the
+    # audit log's individual demotion/promotion records.
+    finding_keys = {
+        f"{o.file}:{o.function}"
+        for o in result.outcomes
+        if o.status == "finding"
+    }
+    if config.out_dir:
+        for key in dict.fromkeys(result.provisional_promoted_keys):
+            resolution = (
+                "confirmed" if key in finding_keys else "retracted"
+            )
+            try:
+                append_audit_log(config.out_dir, {
+                    "action": "provisional_promotion_resolved",
+                    "key": key,
+                    "resolution": resolution,
+                    "cost_usd": 0.0,
+                    "duration_s": 0.0,
+                })
+            except Exception:
+                logger.debug(
+                    "provisional resolution log failed for %s",
+                    key, exc_info=True,
+                )
+    return resolved
+
+
 def _run_critique(
     result: OrchestratorResult,
     config: OrchestratorConfig,
     sarif_cache: SarifCache | None = None,
     joern_server=None,
+    reviewed_outcomes: Any = None,
 ) -> None:
     """Periodic tool-grounded re-evaluation of recent findings.
 
@@ -17973,11 +23996,11 @@ def _run_critique(
     suspicious items haven't gained new tool evidence since emission.
     Runs every critique_interval functions.
     """
-    # Interrupted pre-sweep awareness (once per run): when the Joern
-    # pre-sweep window was lost to a server restart, critique's
-    # taint-tier evidence base is incomplete — absence of flows means
-    # "not swept", not "no flows". Surface it on the critique cadence,
-    # not just as a startup log line.
+    # Degraded pre-sweep awareness (once per run): when the Joern
+    # pre-sweep window was lost to a server restart OR the taint query
+    # errored, critique's taint-tier evidence base is incomplete —
+    # absence of flows means "not swept", not "no flows". Surface it
+    # on the critique cadence, not just as a startup log line.
     if not getattr(config, "_presweep_loss_warned", False) and config.out_dir:
         try:
             from .joern_backend import load_presweep_status
@@ -17985,15 +24008,37 @@ def _run_critique(
         except Exception:  # noqa: BLE001 — critique must not fail on bookkeeping
             presweep = None
         if presweep and not presweep.get("recovered"):
-            logger.warning(
-                "critique: Joern pre-sweep window was LOST to a server "
-                "restart (%d re-queue attempt(s) failed) — taint-flow "
-                "evidence for this run is incomplete; treating missing "
-                "flows as 'not swept'",
-                presweep.get("requeued", 0),
-            )
+            # reason / query_timeout_s are ADDITIVE status fields — a
+            # pre-change record renders the original wording with an
+            # empty suffix.
+            _psw_reason = presweep.get("reason")
+            _psw_detail = ""
+            if _psw_reason:
+                _psw_detail = f" [reason: {_psw_reason}"
+                _psw_window = presweep.get("query_timeout_s")
+                if _psw_reason == "query_timeout" and _psw_window:
+                    _psw_detail += f", window {_psw_window}s"
+                _psw_detail += "]"
+            if presweep.get("interrupted"):
+                logger.warning(
+                    "critique: Joern pre-sweep window was LOST to a "
+                    "server restart (%d re-queue attempt(s) failed)%s — "
+                    "taint-flow evidence for this run is incomplete; "
+                    "treating missing flows as 'not swept'",
+                    presweep.get("requeued", 0),
+                    _psw_detail,
+                )
+            else:
+                logger.warning(
+                    "critique: Joern pre-sweep query ERRORED "
+                    "(%d error(s))%s — taint-flow evidence for this run "
+                    "is incomplete; treating missing flows as "
+                    "'not swept'",
+                    len(presweep.get("errors") or []),
+                    _psw_detail,
+                )
         if presweep is not None:
-            config._presweep_loss_warned = True
+            config._presweep_loss_warned = True  # type: ignore[attr-defined]
 
     recent_findings = [
         o for o in result.outcomes[-config.critique_interval :] if o.status == "finding"
@@ -18059,7 +24104,10 @@ def _run_critique(
         if _has_refuting_counter(outcome):
             continue
         cwe = _effective_cwe(outcome, result.tier_counters)
-        chain = _hypothesis_to_tool_chain(outcome.hypothesis, outcome.file, cwe=cwe)
+        chain = _hypothesis_to_tool_chain(
+            outcome.hypothesis, outcome.file, cwe=cwe,
+            language=_inventory_language_hint(config, outcome.file),
+        )
         if not chain:
             continue
         source = _read_raw_source(
@@ -18080,6 +24128,10 @@ def _run_critique(
             tier_counters=result.tier_counters,
             joern_server=joern_server,
             cwe=cwe,
+            # This site promotes on the first verification-role
+            # receipt (the sink-guard veto below is receipt-
+            # independent), so one qualifying receipt ends the chain.
+            early_exit_check=_promotion_grade_receipt,
         )
         if confirmed:
             # Same promotion discipline as _promote_suspicious: only
@@ -18097,7 +24149,8 @@ def _run_critique(
                 )
                 continue
             _gblk = _guard_blocks_promotion(
-                outcome.function, joern_server, result.tier_counters)
+                outcome.function, joern_server, result.tier_counters,
+                config=config)
             if _gblk:
                 logger.info(
                     "critique promotion blocked %s:%s — sink-guard veto: %s",
@@ -18105,6 +24158,11 @@ def _run_critique(
                 )
                 continue
             tool = "+".join(high_prec)
+            # Mid-loop promotions are provisional: the post-loop
+            # finalization confirms them once every demotion pass has
+            # had its chance (knob-gated so the off position restores
+            # the exact deferred-journal behavior).
+            _incr = bool(getattr(config, "incremental_promotion", True))
             # _run_critique runs from concurrent review workers —
             # mutate outcomes/counters under the result lock (like
             # _tally_outcome) and skip outcomes another worker already
@@ -18114,12 +24172,18 @@ def _run_critique(
                 if outcome not in result.outcomes:
                     continue
                 idx = result.outcomes.index(outcome)
-                result.outcomes[idx] = _promote_outcome(
-                    outcome, f"critique:{tool}",
+                promoted_now = _promote_outcome(
+                    outcome, f"critique:{tool}", provisional=_incr,
                 )
+                result.outcomes[idx] = promoted_now
                 result.sweep_promoted += 1
                 result.suspicious -= 1
                 result.findings += 1
+            _track_promoted(reviewed_outcomes, outcome, promoted_now)
+            if _incr:
+                _journal_provisional_promotion(
+                    result, config, promoted_now,
+                )
             logger.info(
                 "critique: promoted %s:%s via %s",
                 outcome.file,
@@ -18145,7 +24209,10 @@ def _run_critique(
                     " found something but was dismissed"
                     " — recheck"
                 )
-                chain = _hypothesis_to_tool_chain(new_hyp, outcome.file, cwe="")
+                chain = _hypothesis_to_tool_chain(
+                    new_hyp, outcome.file, cwe="",
+                    language=_inventory_language_hint(config, outcome.file),
+                )
                 if chain:
                     source = _read_raw_source(
                         config.target_path,
@@ -18164,6 +24231,10 @@ def _run_critique(
                         sarif_cache=sarif_cache,
                         tier_counters=result.tier_counters,
                         joern_server=joern_server,
+                        # The recheck only logs "unresolved evidence"
+                        # on ANY confirmation; a qualifying receipt
+                        # already satisfies that.
+                        early_exit_check=_promotion_grade_receipt,
                     )
                     if confirmed:
                         logger.info(
@@ -18179,6 +24250,12 @@ def _run_critique(
 _MIN_SLOC_FOR_DEEPEN = 20
 
 
+#: ``_collect_reviews_until_budget`` worker-entry sentinel: the item's
+#: dispatch gate refused it before anything was sent, so its slot is
+#: dropped exactly like a harvest-time-cancelled future.
+_GATE_SKIPPED: Any = object()
+
+
 def _collect_reviews_until_budget(
     prepared: list,
     do_review: Callable,
@@ -18186,6 +24263,7 @@ def _collect_reviews_until_budget(
     max_workers: int,
     *,
     phase_label: str,
+    dispatch_gate: Callable[[], bool] | None = None,
 ) -> list:
     """Dispatch *prepared* re-review items, harvesting EVERY completed
     call even when the budget cap fires mid-flight.
@@ -18202,18 +24280,49 @@ def _collect_reviews_until_budget(
       collected and flows into the caller's booking/journal loop. The
       money is spent and the text is paid for; pre-fix the check ran
       before the harvest and ``break`` threw away completed-at/after-
-      cap results ($10.25 of finished deepen re-reviews discarded,
+      cap results (finished, paid-for deepen re-reviews discarded,
       journal-less, in the final comparison audit).
+
+    *dispatch_gate* (``environment.make_dispatch_gate(config,
+    stop_check=should_stop)``) replaces the pre-dispatch check when
+    given: it runs the environment guard's tick and then the same
+    ``should_stop`` rails. On the serial path it takes over the
+    per-item gate; on the parallel path it runs at WORKER ENTRY —
+    futures are all submitted up front, so the moment a worker picks
+    an item up is this driver's real dispatch point, and a guard
+    pause/conclusion must be observed there or idle workers would
+    keep starting new items straight through it. Gate-refused items
+    are dropped exactly like cancelled futures (never dispatched,
+    nothing spent). ``None`` (guard-less run) keeps the pre-existing
+    paths byte-equivalent.
     """
+    # Inflight accounting for the journal checkpoint's precondition
+    # guard: phase-pool re-reviews are review work exactly like the
+    # main executor's (they append journal rows through the same
+    # commit path).
+    from .executor import counted_review_call
+    do_review = counted_review_call(do_review)
+
+    pre_dispatch_stop = (
+        dispatch_gate if dispatch_gate is not None else should_stop
+    )
     if max_workers <= 1:
         collected = []
         for item in prepared:
-            if should_stop():
+            if pre_dispatch_stop():
                 break
             collected.append(do_review(item))
         return collected
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    if dispatch_gate is None:
+        run_item = do_review
+    else:
+        def run_item(item: Any) -> Any:
+            if dispatch_gate():
+                return _GATE_SKIPPED
+            return do_review(item)
 
     collected = []
     stopped = False
@@ -18221,7 +24330,7 @@ def _collect_reviews_until_budget(
         future_to_item = {}
         try:
             for item in prepared:
-                future_to_item[pool.submit(do_review, item)] = item
+                future_to_item[pool.submit(run_item, item)] = item
         except RuntimeError:
             # Interpreter shutdown between the budget check and
             # dispatch: the run is tearing down while a background
@@ -18238,9 +24347,12 @@ def _collect_reviews_until_budget(
         for fut in as_completed(future_to_item):
             # Harvest first: a future yielded here has finished (or
             # was cancelled while pending). Cancelled == never
-            # dispatched — the only class that may be dropped.
+            # dispatched, gate-skipped == refused at worker entry —
+            # the only classes that may be dropped.
             if not fut.cancelled():
-                collected.append(fut.result())
+                item_result = fut.result()
+                if item_result is not _GATE_SKIPPED:
+                    collected.append(item_result)
             if stopped:
                 continue
             if should_stop():
@@ -18271,6 +24383,89 @@ def _prior_hypotheses_for(outcome: ReviewOutcome) -> list[dict[str, Any]]:
         h for h in hyps
         if isinstance(h, dict) and (h.get("mechanism") or "").strip()
     ]
+
+
+#: Stamp reason for a deepen dispatch that raised a non-budget error.
+#: Reasons on the unadjudicated stamp are always module constants or
+#: the rail values ``_check_budget`` books — never exception text: the
+#: marker embeds the reason in body prose.
+_DEEPEN_DISPATCH_ERROR: str = "dispatch_error"
+
+
+def _mark_deepen_unadjudicated(outcome: ReviewOutcome, reason: str) -> None:
+    """Stamp a deepen target the phase announced but never adjudicated.
+
+    ``reason`` is the stop cause that stranded the re-review (the
+    booked ``result.terminated_by`` when the rails recorded one,
+    ``_DEEPEN_DISPATCH_ERROR`` for a dispatched call that raised a
+    non-budget error, else ``budget_exhausted``). The stamp is the
+    run-output surface for the
+    stranding: the ``review_result`` key rides into the graded
+    findings export, and the body marker names the cause on the
+    verdict itself. The marker is APPENDED, never prepended — body
+    prefixes are load-bearing provenance (counter-escalation and
+    gate-demotion checks read ``startswith``). Idempotent so a resumed
+    run's second deepen pass never stacks duplicate markers.
+    """
+    if outcome.review_result is None:
+        outcome.review_result = {}
+    outcome.review_result["deepen_unadjudicated"] = reason
+    marker = (
+        f"[deepen unadjudicated: {reason} — the announced re-review "
+        "never ran; the verdict stands without deepen adjudication]"
+    )
+    body = outcome.body or ""
+    if marker not in body:
+        outcome.body = f"{body}\n\n{marker}" if body else marker
+
+
+#: Human-readable body markers per deepen-selection stranding reason.
+_DEEPEN_STRANDED_MARKERS: dict[str, str] = {
+    "below_sloc_floor": (
+        f"[deepen stranded: function below the {_MIN_SLOC_FOR_DEEPEN}-SLOC "
+        "deepen floor with no tool evidence — the verdict finishes the "
+        "run without a deepen re-review]"
+    ),
+    "duplicate_hypothesis": (
+        "[deepen stranded: an identical hypothesis for this function "
+        "already went through deepen selection — the verdict finishes "
+        "the run without a deepen re-review]"
+    ),
+}
+
+
+def _mark_deepen_stranded(outcome: ReviewOutcome, reason: str) -> None:
+    """Stamp a verdict the deepen selection stranded outside the pass.
+
+    ``reason`` is a ``_DEEPEN_STRANDED_MARKERS`` key. Same output
+    surfaces and same append-only body discipline as
+    :func:`_mark_deepen_unadjudicated`: the ``review_result`` key
+    rides into the graded findings export, the marker is appended
+    (body prefixes are load-bearing provenance), and the stamp is
+    idempotent across resumed passes.
+    """
+    if outcome.review_result is None:
+        outcome.review_result = {}
+    outcome.review_result["deepen_stranded"] = reason
+    marker = _DEEPEN_STRANDED_MARKERS[reason]
+    body = outcome.body or ""
+    if marker not in body:
+        outcome.body = f"{body}\n\n{marker}" if body else marker
+
+
+def _deepen_stop_reason(result: OrchestratorResult) -> str:
+    """Name the stop cause that stranded un-run deepen re-reviews.
+
+    ``_check_budget`` books the specific rail on
+    ``result.terminated_by`` (``max_cost_usd``,
+    ``llm_budget_exceeded``, ``max_seconds``, ``sigterm``); when
+    nothing was booked (a client that raised budget-exceeded before
+    the rails polled again), the cause is budget exhaustion.
+    """
+    terminated_by = getattr(result, "terminated_by", "") or ""
+    if terminated_by and terminated_by != "complete":
+        return terminated_by
+    return "budget_exhausted"
 
 
 def _deepen_suspicious(
@@ -18307,7 +24502,17 @@ def _deepen_suspicious(
     suspicious = [
         o
         for o in result.outcomes
-        if o.status == "suspicious"
+        # Provisional (cadence-tick promoted) findings deepen too:
+        # pre-cadence, these items were still suspicious here and got
+        # this enriched-context refutation chance before the sweep
+        # promoted them — the early promotion must not narrow the
+        # retraction funnel. Same spend as the pre-cadence pass; the
+        # deepen verdict supersedes (untally uses the finding status,
+        # the fresh outcome carries no provisional mark).
+        if (
+            o.status == "suspicious"
+            or (o.status == "finding" and getattr(o, "provisional", False))
+        )
         and (o.review_result or {}).get("body")
         and not o.body.startswith("[gate violation:")
     ]
@@ -18329,6 +24534,13 @@ def _deepen_suspicious(
 
     seen_hypotheses: dict[str, str] = {}
     targets = []
+    # Selection stranding account: a withheld all-refuted outcome on a
+    # tiny function (or a dedup'd repeat hypothesis) never reaches the
+    # deepen lane and finishes the run suspicious-unverified — stamp
+    # each stranded verdict so the run's output names it instead of
+    # dropping it silently.
+    _stranded_dup = 0
+    _stranded_sloc = 0
     for o in suspicious:
         gap = _find_gap_in_checklist(checklist, o.file, o.function)
         if not gap:
@@ -18340,6 +24552,8 @@ def _deepen_suspicious(
         key = f"{o.file}:{o.function}"
         hyp = (o.hypothesis or "").strip()[:200]
         if key in seen_hypotheses and hyp and hyp == seen_hypotheses[key]:
+            _mark_deepen_stranded(o, "duplicate_hypothesis")
+            _stranded_dup += 1
             continue
         if hyp:
             seen_hypotheses[key] = hyp
@@ -18351,8 +24565,22 @@ def _deepen_suspicious(
             # Reduced-context outcomes bypass the SLOC gate: the
             # whole point of the tag is a guaranteed full-context
             # re-review.
+            _mark_deepen_stranded(o, "below_sloc_floor")
+            _stranded_sloc += 1
             continue
         targets.append((o, gap))
+
+    if _stranded_sloc or _stranded_dup:
+        logger.info(
+            "deepen: %d verdict(s) stranded outside the deepen pass "
+            "(%d below the %d-SLOC floor without tool evidence, %d "
+            "duplicate hypotheses) — they finish the run without a "
+            "deepen re-review",
+            _stranded_sloc + _stranded_dup,
+            _stranded_sloc,
+            _MIN_SLOC_FOR_DEEPEN,
+            _stranded_dup,
+        )
 
     if not targets:
         return result
@@ -18418,16 +24646,27 @@ def _deepen_suspicious(
         except Exception as exc:  # noqa: BLE001
             return (idx, None, exc)
 
+    def _stop_rails() -> bool:
+        return _check_budget(config, start_time, result)
+
     raw_results = _collect_reviews_until_budget(
         prepared,
         _do_review,
-        lambda: _check_budget(config, start_time, result),
+        _stop_rails,
         effective_workers,
         phase_label="deepen",
+        dispatch_gate=_make_dispatch_gate(config, stop_check=_stop_rails),
     )
 
     # --- Process results (always in main thread) ---
     idx_to_prepared = {item[0]: item for item in prepared}
+    # Deepen targets the phase never adjudicated: dispatched calls
+    # that died (budget cap, or any other dispatch error) collect
+    # here in the loop; items that never returned a result at all
+    # (serial pre-dispatch stop, cancelled futures, gate refusals)
+    # join after it. The third field is the stamp reason — ``None``
+    # means "use the phase stop cause", set at stamp time.
+    _unadjudicated: list[tuple[ReviewOutcome, dict[str, Any], str | None]] = []
     for idx, outcome, exc in sorted(raw_results, key=lambda r: r[0]):
         _, prior_outcome, gap, ctx = idx_to_prepared[idx]
 
@@ -18442,12 +24681,20 @@ def _deepen_suspicious(
                     "deepen skipped for %s:%s: LLM budget exhausted",
                     gap["file"], gap["name"],
                 )
+                _unadjudicated.append((prior_outcome, gap, None))
                 continue
             logger.warning(
                 "deepen failed for %s:%s: %s",
                 gap["file"],
                 gap["name"],
                 exc,
+            )
+            # A failed dispatch strands the announced re-review just
+            # like a rail stop does — the prior verdict stands, and
+            # the stamp (a constant, never the exception text) names
+            # it in the run output instead of only in the log.
+            _unadjudicated.append(
+                (prior_outcome, gap, _DEEPEN_DISPATCH_ERROR),
             )
             continue
 
@@ -18555,6 +24802,25 @@ def _deepen_suspicious(
                             f"[gate violation: {'; '.join(gate_violations)}]",
                         )
 
+            # A genuine receipt on the prior row survives the replace:
+            # the deepen re-review is an LLM pass whose (sanitised)
+            # restated evidence would otherwise erase mechanical
+            # provenance the run already earned for this same
+            # still-standing verdict. A deepen outcome that earned its
+            # own tool stamp (e.g. sweep-validated finding) keeps it.
+            if (
+                outcome.status in ("finding", "suspicious")
+                and prior_outcome.status in ("finding", "suspicious")
+                and prior_outcome.evidence_tool
+                and _is_tool_confirmed(prior_outcome.evidence_tool)
+                and not _is_tool_confirmed(outcome.evidence_tool or "")
+            ):
+                outcome.tools_dispatched = (
+                    set(outcome.tools_dispatched or set())
+                    | set(prior_outcome.tools_dispatched or set())
+                )
+                _stamp_evidence(outcome, prior_outcome.evidence_tool)
+
             _untally_outcome(result, prior_outcome)
             _outcomes_to_remove.add(id(prior_outcome))
 
@@ -18588,6 +24854,33 @@ def _deepen_suspicious(
                 prior_outcome.status,
                 outcome.status,
             )
+
+    # Announced re-reviews that returned no result were never
+    # dispatched (budget/SIGTERM rails, cancelled futures, gate
+    # refusals, executor shutdown) — their prior verdicts stand.
+    # Name the stranding in the run's output instead of finishing
+    # silently: withheld all-refuted demotions rely on this pass as
+    # their verification lane, so an exhausted reserve otherwise
+    # leaves the withhold marker un-adjudicated with no trace of why.
+    _returned = {r[0] for r in raw_results}
+    _unadjudicated.extend(
+        (item[1], item[2], None)
+        for idx, item in idx_to_prepared.items()
+        if idx not in _returned
+    )
+    if _unadjudicated:
+        _stop_reason = _deepen_stop_reason(result)
+        for _prior, _gap, _reason in _unadjudicated:
+            _mark_deepen_unadjudicated(_prior, _reason or _stop_reason)
+        _reasons = ", ".join(
+            sorted({_r or _stop_reason for _, _, _r in _unadjudicated}),
+        )
+        logger.warning(
+            "deepen: %d of %d announced re-review(s) unadjudicated "
+            "(%s) — the prior verdicts stand, with any withhold "
+            "markers unresolved",
+            len(_unadjudicated), len(targets), _reasons,
+        )
 
     if _outcomes_to_remove:
         result.outcomes = [
@@ -18624,7 +24917,7 @@ def _re_review_disagreements(
     outcome_by_key = {f"{o.file}:{o.function}": o for o in result.outcomes}
     gap_by_key = _gap_index(checklist)
 
-    prepared = []
+    prepared: list[Any] = []
     for d in disagreements:
         key = f"{d.file}:{d.function}"
         prior = outcome_by_key.get(key)
@@ -18675,12 +24968,16 @@ def _re_review_disagreements(
         except Exception as exc:  # noqa: BLE001
             return (idx, None, exc)
 
+    def _stop_rails() -> bool:
+        return _check_budget(config, start_time, result)
+
     raw_results = _collect_reviews_until_budget(
         prepared,
         _do_review,
-        lambda: _check_budget(config, start_time, result),
+        _stop_rails,
         effective_workers,
         phase_label="disagreement re-review",
+        dispatch_gate=_make_dispatch_gate(config, stop_check=_stop_rails),
     )
 
     re_reviewed = 0
@@ -18716,6 +25013,12 @@ def _re_review_disagreements(
                     _untally_outcome(result, prior)
                     _tally_outcome(result, outcome, append=False)
                     break
+        else:
+            # Kept the prior verdict — the re-review call still spent
+            # real money; changed verdicts book it via _tally_outcome
+            # above (deepen's dominated branch is the template).
+            with result._lock:
+                result.total_cost_usd += outcome.cost_usd
 
     if re_reviewed:
         logger.info(
@@ -18724,24 +25027,94 @@ def _re_review_disagreements(
     return result
 
 
+def _iter_checklist_items(
+    checklist: dict[str, Any],
+) -> "Iterator[tuple[str, dict[str, Any], dict[str, Any]]]":
+    """Walk ``checklist["files"][*]`` items via the shared walker.
+
+    Yields ``(file_path, file_info, item)``. The shape authority is
+    ``core.inventory.iter_checklist_items`` — the checklist producer's
+    package — so the ``path``/``file`` and ``items``/``functions`` key
+    fallbacks cannot drift between hand-rolled copies (the per-pass
+    copies had already diverged on both before this was consolidated).
+    """
+    from core.inventory import iter_checklist_items
+
+    yield from iter_checklist_items(checklist)
+
+
+#: Memoised checklist item index, keyed by the identity of the
+#: checklist's ``files`` list. Each entry pins that list object with a
+#: strong reference, so an ``id()`` hit can never be a recycled
+#: address (the pinned object stays alive); the fingerprint (files
+#: count + total item count) invalidates on in-place growth at either
+#: level. In-place item RENAMES with unchanged counts would still
+#: serve a stale lookup — no such mutation exists in the run loop.
+#: Clear-on-overflow bounds the map across long in-process sessions
+#: (corpus runner). Thread-safe enough for the parallel passes: dict
+#: get/set are GIL-atomic and a lost race only costs a duplicate
+#: build.
+_CHECKLIST_INDEX_MEMO: dict[
+    int,
+    tuple[list, tuple[int, int], dict[tuple[str, str], tuple[str, dict[str, Any]]]],
+] = {}
+_CHECKLIST_INDEX_MEMO_MAX = 8
+
+
+def _checklist_item_index(
+    checklist: dict[str, Any],
+) -> dict[tuple[str, str], tuple[str, dict[str, Any]]]:
+    """``(file, function)`` → ``(file_path, item)`` for every checklist item.
+
+    TUPLE keys, not a ``file:name`` join — a colon-bearing file path
+    would alias a different (file, function) pair under the joined
+    spelling. First match wins (files order, then item order) — the
+    walkers this index replaces returned the first hit. Memoised per
+    checklist identity: the post-loop passes look an outcome up once
+    each, and the per-call full walk was the cost the index removes.
+    """
+    files = checklist.get("files", []) or []
+    key = id(files)
+    fingerprint = (
+        len(files),
+        sum(
+            len(f.get("items", f.get("functions", [])) or [])
+            for f in files
+            if isinstance(f, dict)
+        ),
+    )
+    cached = _CHECKLIST_INDEX_MEMO.get(key)
+    if (
+        cached is not None
+        and cached[0] is files
+        and cached[1] == fingerprint
+    ):
+        return cached[2]
+    index: dict[tuple[str, str], tuple[str, dict[str, Any]]] = {}
+    for file_path, _file_info, item in _iter_checklist_items(checklist):
+        index.setdefault(
+            (file_path, item.get("name", "")), (file_path, item),
+        )
+    if len(_CHECKLIST_INDEX_MEMO) >= _CHECKLIST_INDEX_MEMO_MAX:
+        _CHECKLIST_INDEX_MEMO.clear()
+    _CHECKLIST_INDEX_MEMO[key] = (files, fingerprint, index)
+    return index
+
+
 def _gap_index(checklist: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """Build file:function → gap dict from checklist."""
     index: dict[str, dict[str, Any]] = {}
-    for item in checklist.get("files", []):
-        # Checklist file records carry "path" (see the inventory
-        # builder and _find_gap_in_checklist) — not "file".
-        file_path = item.get("path", item.get("file", ""))
-        for func in item.get("items", item.get("functions", [])):
-            key = f"{file_path}:{func.get('name', '')}"
-            index[key] = {
-                "file": file_path,
-                "name": func.get("name", ""),
-                "line": func.get("line", 0),
-                "line_start": func.get("line_start", 0),
-                "line_end": func.get("line_end", 0),
-                "source": func.get("source", ""),
-                "language": item.get("language", ""),
-            }
+    for file_path, file_info, func in _iter_checklist_items(checklist):
+        key = f"{file_path}:{func.get('name', '')}"
+        index[key] = {
+            "file": file_path,
+            "name": func.get("name", ""),
+            "line": func.get("line", 0),
+            "line_start": func.get("line_start", 0),
+            "line_end": func.get("line_end", 0),
+            "source": func.get("source", ""),
+            "language": file_info.get("language", ""),
+        }
     return index
 
 
@@ -18842,7 +25215,7 @@ def _iterative_re_review(
         )
 
         # --- Build all contexts up-front for this iteration ---
-        prepared = []
+        prepared: list[Any] = []
         for target in re_review_targets:
             gap = target["gap"]
             callee_findings = target["callee_findings"]
@@ -18908,12 +25281,18 @@ def _iterative_re_review(
             except Exception as review_exc:  # noqa: BLE001
                 return (idx, None, review_exc)
 
+        def _stop_rails() -> bool:
+            return _check_budget(config, start_time, result)
+
         raw_results = _collect_reviews_until_budget(
             prepared,
             _do_review,
-            lambda: _check_budget(config, start_time, result),
+            _stop_rails,
             effective_workers,
             phase_label="iterative re-review",
+            dispatch_gate=_make_dispatch_gate(
+                config, stop_check=_stop_rails,
+            ),
         )
 
         # --- Process results in main thread ---
@@ -19143,31 +25522,50 @@ def _find_gap_in_checklist(
     file_path: str,
     function_name: str,
 ) -> dict[str, Any] | None:
-    """Find a checklist item by file + function name."""
-    for file_info in checklist.get("files", []):
-        if file_info.get("path") != file_path:
-            continue
-        for item in file_info.get("items", file_info.get("functions", [])):
-            if item.get("name") == function_name:
-                return {
-                    "file": file_path,
-                    "name": function_name,
-                    "line_start": item.get("line_start", 0),
-                    "line_end": item.get("line_end"),
-                }
-    return None
+    """Find a checklist item by file + function name.
+
+    Memoised-index lookup (:func:`_checklist_item_index`): several
+    post-loop passes call this once per outcome, and each call walked
+    the whole checklist. Returns the same four-key dict the walk
+    returned.
+    """
+    hit = _checklist_item_index(checklist).get(
+        (file_path, function_name),
+    )
+    if hit is None:
+        return None
+    _fp, item = hit
+    return {
+        "file": file_path,
+        "name": function_name,
+        "line_start": item.get("line_start", 0),
+        "line_end": item.get("line_end"),
+    }
 
 
 def _run_phase2(result, config) -> None:
     """Phase 2 security classification + Phase 2b chaining (bug_first mode)."""
-    from core.llm.client import LLMClient as _P2Client
-
     _p2_model = (
         config.models[0]
         if config.models and config.models[0] != "default"
         else None
     )
-    _p2_client = _P2Client(pinned_model=_p2_model) if _p2_model else _P2Client()
+    # The run's budget-governed client (see _run_llm_client): a private
+    # LLMClient here carried its own default cap, so the whole
+    # Phase-2/2b spend bypassed the --max-cost reservation gate and the
+    # run's spend ledger. Model pinning rides model_name= on each call;
+    # the no-budget-client fallback pins the run's primary model.
+    _p2_client = _run_llm_client(config)
+
+    # Environment gate for both phase loops (classification and chain
+    # evaluation dispatch one LLM call per item). This phase runs
+    # after the last full rails poll, so the gate carries the booking
+    # stop check: a conclusion here must book the environment stop —
+    # nothing downstream would re-book it.
+    _env_gate = _make_dispatch_gate(
+        config,
+        stop_check=lambda: _environment_stop_booked(config, result),
+    )
 
     classifications = {}
     try:
@@ -19175,6 +25573,7 @@ def _run_phase2(result, config) -> None:
         classifications = classify_security_impact(
             result.outcomes, config.out_dir, _p2_client,
             model_name=_p2_model,
+            should_stop=_env_gate,
         )
         if classifications:
             logger.info(
@@ -19198,19 +25597,51 @@ def _run_phase2(result, config) -> None:
             )
             chains = evaluate_chains(
                 candidates, _p2_client, model_name=_p2_model,
+                should_stop=_env_gate,
             )
             if chains:
+                from .evidence_grade import is_tool_evidence
                 chains_path = config.out_dir / "bug-chains.json"
                 save_json(chains_path, chains)
+                outcome_index = {
+                    f"{o.file}:{o.function}": o for o in result.outcomes
+                }
+                confirmed = 0
                 for chain in chains:
                     bug_a_func = chain["bug_a"].rsplit(":", 1)[-1]
+                    # Chain composition is an LLM judgement
+                    # (evaluate_chains is a model call), so the chain
+                    # outcome may claim ``finding`` only when it can
+                    # carry its constituents' REAL tool receipts: both
+                    # bugs receipt-backed and the joined stamp itself
+                    # passing the evidence-grade firewall. Anything
+                    # less commits as ``suspicious`` (the designed
+                    # LLM-guess bucket) with the pure-provenance
+                    # ``chain_detector`` stamp — an unconditional
+                    # ``finding`` here fired the CRITICAL
+                    # promotion-without-tool-evidence alarm (a channel
+                    # documented EMPTY on legitimate runs) and was
+                    # demoted at export while already counted.
+                    receipts = [
+                        getattr(outcome_index.get(k), "evidence_tool", "")
+                        or ""
+                        for k in (chain["bug_a"], chain["bug_b"])
+                    ]
+                    composite = "+".join(r for r in receipts if r)
+                    if (
+                        all(is_tool_evidence(r) for r in receipts)
+                        and is_tool_evidence(composite)
+                    ):
+                        status, stamp = "finding", composite
+                    else:
+                        status, stamp = "suspicious", "chain_detector"
                     chain_outcome = ReviewOutcome(
                         file=chain["bug_a"].rsplit(":", 1)[0],
                         function=bug_a_func,
-                        status="finding",
+                        status=status,
                         body=chain.get("chain_description", ""),
                         hypothesis=chain.get("chain_description", ""),
-                        evidence_tool="chain_detector",
+                        evidence_tool=stamp,
                         review_result={
                             "chain": True,
                             "bug_a": chain["bug_a"],
@@ -19220,8 +25651,13 @@ def _run_phase2(result, config) -> None:
                         },
                     )
                     result.outcomes.append(chain_outcome)
-                    result.findings += 1
-                logger.info("Phase 2b: %d chains confirmed", len(chains))
+                    if status == "finding":
+                        result.findings += 1
+                        confirmed += 1
+                logger.info(
+                    "Phase 2b: %d chain(s) recorded (%d receipt-backed)",
+                    len(chains), confirmed,
+                )
     except Exception:
         logger.debug("Phase 2b chaining failed", exc_info=True)
 
@@ -19372,8 +25808,8 @@ def _untally_outcome(result: OrchestratorResult, outcome: ReviewOutcome) -> None
     outcome, but the original call's money was still spent. Subtracting
     it made ``result.total_cost_usd`` a "cost of surviving outcomes"
     number that drifted below both the phase ledger and the LLM
-    client's ledger (observed $2.82 vs $4.52 vs $8.08 for one run) and
-    under-enforced the --max-cost gate.
+    client's ledger (one observed run showed three diverging totals
+    for the same money) and under-enforced the --max-cost gate.
     """
     with result._lock:
         if outcome.status == "finding":
@@ -19388,7 +25824,15 @@ def _untally_outcome(result: OrchestratorResult, outcome: ReviewOutcome) -> None
             result.errors -= 1
             if outcome.error_class and outcome.error_class in result.error_counts:
                 result.error_counts[outcome.error_class] -= 1
-        result.reviewed -= 1
+        if outcome.reused:
+            # Imported prior verdict — tallied into reused_from_prior,
+            # never reviewed (mirror of _tally_outcome's reused
+            # branch): decrementing reviewed here drifted it below
+            # truth (negative on reuse-heavy resume segments) every
+            # time a re-review pass superseded a reused outcome.
+            result.reused_from_prior -= 1
+        else:
+            result.reviewed -= 1
 
 
 _DISMISSIVE_COUNTERS = frozenset(
@@ -19449,14 +25893,15 @@ def _check_sink_guarded_cached(function_name: str, joern_server) -> str:
         return _sink_guard_cache[function_name]
     verdict = check_sink_guarded(function_name, joern_server)
     if verdict != GUARD_UNAVAILABLE:
-        _sink_guard_cache[function_name] = verdict
-    return verdict
+        _sink_guard_cache[function_name] = verdict  # type: ignore[assignment]
+    return verdict  # type: ignore[return-value]
 
 
 def _guard_blocks_promotion(
     function_name: str,
     joern_server,
     tier_counters: dict | None = None,
+    config: OrchestratorConfig | None = None,
 ) -> str | None:
     """Consult the guarded-sink veto for a promotion decision.
 
@@ -19473,13 +25918,30 @@ def _guard_blocks_promotion(
     flaps keyed to server state).  Runs without a Joern lane are
     unaffected (``None`` from the gate, promotion proceeds as before).
     """
+    if config is not None and _joern_channel_unhealthy(config):
+        # A tripped channel cannot answer the veto, and dialing it
+        # burns a full client timeout per uncached function before
+        # returning the same GUARD_UNAVAILABLE. Same fail-closed
+        # doctrine as below, decided without the doomed round trip
+        # (read-only check — the half-open probe belongs to the
+        # verification chains, not the veto).
+        return "guard-unavailable"
     verdict = _check_sink_guarded_cached(function_name, joern_server)
     if verdict == "guarded":
+        _record_joern_outcome(config, error=False)
         return "guarded"
     if verdict == GUARD_UNAVAILABLE:
+        # Feed the health gate: a degraded veto consultation is a
+        # failed joern round trip like any other.
+        _record_joern_outcome(
+            config, error=True, detail="guard-unavailable",
+            key=f"guard:{function_name}",
+        )
         if tier_counters is not None:
             _increment_tier_dict(tier_counters, "joern_guard", "errors")
         return "guard-unavailable"
+    if verdict is not None and joern_server is not None:
+        _record_joern_outcome(config, error=False)
     return None
 
 
@@ -19604,6 +26066,710 @@ def _synth_receipt_promotion_block_reason(
     return ""
 
 
+# Cap for passes whose per-item work consults the Joern query server
+# (sink-guard veto, joern tool-chain steps): the server is a single
+# JVM pipeline, so workers past 2 mostly queue inside it and raise the
+# odds of a queue-induced query timeout — which costs a full server
+# restart — while 2 still overlaps one query with another item's
+# subprocess/tool work.
+_JOERN_PASS_MAX_WORKERS = 2
+
+
+def _commit_promotion(
+    result: OrchestratorResult,
+    i: int,
+    outcome: ReviewOutcome,
+    promoted: ReviewOutcome,
+    *,
+    aggregated: bool = False,
+) -> bool:
+    """Replace ``outcomes[i]`` with *promoted* iff the slot still holds
+    *outcome*, adjusting the verdict counters under the result lock.
+
+    Identity-checked because the incremental cadence runs promotion
+    while the review loop is still mutating ``result.outcomes``: chain
+    re-reviews REMOVE entries (indices shift) and the critique pass
+    replaces objects. A drifted slot is re-resolved by identity scan;
+    an outcome no longer in the list was superseded, so the promotion
+    is dropped (returns False, counters untouched). Post-loop callers
+    always pass a stable slot and never hit either branch.
+    """
+    with result._lock:
+        if not (0 <= i < len(result.outcomes)) \
+                or result.outcomes[i] is not outcome:
+            i = next(
+                (j for j, o in enumerate(result.outcomes) if o is outcome),
+                -1,
+            )
+            if i < 0:
+                return False
+        result.outcomes[i] = promoted
+        result.sweep_promoted += 1
+        if aggregated:
+            result.aggregation_promoted += 1
+        result.suspicious -= 1
+        result.findings += 1
+    return True
+
+
+def _promote_suspicious_one(
+    result: OrchestratorResult,
+    config: OrchestratorConfig,
+    i: int,
+    outcome: ReviewOutcome,
+    *,
+    sarif_cache: SarifCache | None = None,
+    checklist: dict[str, Any] | None = None,
+    joern_server=None,
+    mechanical_findings: dict[str, list[dict[str, Any]]] | None = None,
+    synthesis_queue: list[tuple[int, ReviewOutcome, str, str, str]] | None = None,
+    provisional: bool = False,
+) -> ReviewOutcome | None:
+    """Sweep one suspicious outcome (see :func:`_promote_suspicious`).
+
+    Safe to run concurrently for distinct *i*: the body writes only its
+    own ``result.outcomes[i]`` slot and its own outcome object, and the
+    shared verdict counters are updated under ``result._lock``. When
+    *synthesis_queue* is provided, chain-less hypotheses are queued as
+    ``(i, outcome, hypothesis, cwe, source)`` instead of synthesized
+    inline: on-demand synthesis is LLM-backed and capped per run, so
+    the cap must be consumed in item order, not completion order.
+
+    ``provisional`` marks any promotion as awaiting finalization (the
+    incremental cadence path). Returns the promoted outcome when a
+    promotion was committed, ``None`` otherwise — so the cadence tick
+    can journal exactly what it promoted.
+    """
+    if outcome.body.startswith(_GATE_DEMOTION_BODY_PREFIXES):
+        logger.debug(
+            "sweep skipped %s:%s — mechanical gate demotion is authoritative",
+            outcome.file,
+            outcome.function,
+        )
+        return None
+
+    review = outcome.review_result or {}
+    hypothesis = review.get("hypothesis") or outcome.hypothesis or ""
+    if not hypothesis:
+        return None
+
+    refuting_counter = _has_refuting_counter(outcome)
+
+    # Premise binding for the primary hypothesis, same rule as the
+    # secondary sweep below: a function-local confirm cannot
+    # adjudicate a counter that rests on a cross-function premise
+    # — it re-proves the lexical shape the reviewer already saw
+    # and weighed. Blocked promotions stay suspicious and park the
+    # premise on the reading list.
+    premise_h = _primary_hypothesis_entry(outcome, hypothesis)
+
+    gap = _find_gap_in_checklist(checklist or {}, outcome.file, outcome.function)
+    line_end = gap.get("line_end") if gap else None
+
+    source = _read_raw_source(
+        config.target_path,
+        outcome.file,
+        outcome.line,
+        line_end,
+    )
+
+    cwe = _effective_cwe(outcome, result.tier_counters)
+
+    if refuting_counter:
+        _rc_chain = _hypothesis_to_tool_chain(
+            hypothesis, outcome.file, cwe=cwe,
+            language=_inventory_language_hint(config, outcome.file),
+        )
+        if _rc_chain and all(
+            entry.get("type") == "sanwit" for entry in _rc_chain
+        ):
+            # A leg counts as dispatch only when it can actually
+            # run: sanwit refuses statically (context/extraction/
+            # binding/interpreter) far more often than the other
+            # channels, and a sanwit-only chain whose prechecks fail
+            # would otherwise swallow the empty-dispatch synthesis
+            # routing this family relied on.
+            try:
+                from .sanwit import sanwit_can_adjudicate
+            except ImportError:
+                _rc_chain = []
+            else:
+                if not sanwit_can_adjudicate(
+                    config.target_path, outcome.file, hypothesis,
+                    source=source or "", cwe=cwe,
+                ):
+                    _rc_chain = []
+        if _rc_chain:
+            logger.debug(
+                "sweep skipped %s:%s — LLM counter-hypothesis present",
+                outcome.file,
+                outcome.function,
+            )
+            return None
+        # Empty-dispatch family: no static channel exists that
+        # could adjudicate this hypothesis OR its counter, so the
+        # only possible mechanical evidence is a synthesized
+        # checker (full dual controls + guarded-sink gate apply
+        # inside). Route the family to on-demand synthesis instead
+        # of letting it die unverified.
+        synth_hyp = _synthesis_hypothesis_for_cwe(outcome, cwe, hypothesis)
+        if synthesis_queue is not None:
+            synthesis_queue.append((i, outcome, synth_hyp, cwe, source))
+        else:
+            _synthesize_unmapped_suspicious(
+                result, config, i, outcome,
+                synth_hyp,
+                cwe, source,
+                joern_server=joern_server,
+            )
+        return None
+
+    mech_tool = _correlated_mech_detector_tool(
+        outcome, hypothesis, cwe, mechanical_findings,
+    )
+    if mech_tool:
+        _gblk = _guard_blocks_promotion(
+            outcome.function, joern_server, result.tier_counters,
+            config=config)
+        if _gblk:
+            logger.info(
+                "sweep promotion blocked %s:%s via %s — sink-guard veto: %s",
+                outcome.file,
+                outcome.function,
+                mech_tool,
+                _gblk,
+            )
+        elif _premise_blocks_confirm(premise_h, [mech_tool]):
+            _note_premise_blocked_validation(
+                outcome, premise_h, [mech_tool],
+                config, result.tier_counters,
+                lane="sweep promotion", tier="primary_sweep",
+            )
+        else:
+            promoted = _promote_outcome(
+                outcome, mech_tool, provisional=provisional,
+            )
+            if not _commit_promotion(result, i, outcome, promoted):
+                return None
+            logger.info(
+                "sweep promoted %s:%s via %s (prep-phase detector hit)",
+                outcome.file,
+                outcome.function,
+                mech_tool,
+            )
+            return promoted
+
+    pf = run_prefilter(
+        target_path=config.target_path,
+        file_path=outcome.file,
+        function_name=outcome.function,
+        source=source,
+        line_start=outcome.line,
+        project_sinks=config.project_sinks,
+    )
+    if pf.hits:
+        if line_end:
+            pf.hits = [
+                h
+                for h in pf.hits
+                if not h.line or outcome.line <= h.line <= line_end
+            ]
+        # Promotion needs evidence in the hypothesis's family; an
+        # unrelated pattern hit stays context and falls through to
+        # the hypothesis-specific tool chain.
+        correlated = [
+            h for h in pf.hits
+            if evidence_matches_hypothesis(
+                family_for_rule(h.rule_id), hypothesis, cwe,
+            )
+        ]
+        if correlated:
+            tool = f"prefilter:{correlated[0].rule_id}"
+            # Same sink-guard veto as every other promotion lane
+            # (mech-detector above, critique, secondary sweep).
+            _pf_gblk = _guard_blocks_promotion(
+                outcome.function, joern_server, result.tier_counters,
+                config=config)
+            if _pf_gblk:
+                logger.info(
+                    "sweep promotion blocked %s:%s via %s — "
+                    "sink-guard veto: %s",
+                    outcome.file,
+                    outcome.function,
+                    tool,
+                    _pf_gblk,
+                )
+            elif _premise_blocks_confirm(premise_h, [tool]):
+                _note_premise_blocked_validation(
+                    outcome, premise_h, [tool],
+                    config, result.tier_counters,
+                    lane="sweep promotion", tier="primary_sweep",
+                )
+            else:
+                promoted = _promote_outcome(
+                    outcome, tool, provisional=provisional,
+                )
+                if not _commit_promotion(result, i, outcome, promoted):
+                    return None
+                logger.info(
+                    "sweep promoted %s:%s via %s",
+                    outcome.file,
+                    outcome.function,
+                    tool,
+                )
+                return promoted
+        if pf.hits and not correlated:
+            _record_uncorrelated_hits(outcome, pf.hits)
+            logger.info(
+                "sweep promotion withheld %s:%s — prefilter hits (%s) "
+                "uncorrelated with hypothesis",
+                outcome.file,
+                outcome.function,
+                ",".join(h.rule_id for h in pf.hits[:3]),
+            )
+
+    def _route_to_synthesis() -> None:
+        # No adjudication-capable static channel binds this
+        # hypothesis — the dispatch table has nothing to test it
+        # with. On-demand Mode-2 synthesis generates a one-off,
+        # negatively-controlled rule instead of letting the
+        # hypothesis die untested.
+        synth_hyp = _synthesis_hypothesis_for_cwe(outcome, cwe, hypothesis)
+        if synthesis_queue is not None:
+            synthesis_queue.append((i, outcome, synth_hyp, cwe, source))
+        else:
+            _synthesize_unmapped_suspicious(
+                result, config, i, outcome,
+                synth_hyp,
+                cwe, source,
+                joern_server=joern_server,
+            )
+
+    chain = _hypothesis_to_tool_chain(
+        hypothesis, outcome.file, cwe=cwe,
+        language=_inventory_language_hint(config, outcome.file),
+    )
+    if not chain:
+        _route_to_synthesis()
+        return None
+    _sweep_skipped: set = set()
+    _sweep_errored: set = set()
+    confirmed = _run_tool_chain(
+        chain,
+        config=config,
+        file_path=outcome.file,
+        function_name=outcome.function,
+        source=source,
+        hypothesis=hypothesis,
+        line_start=outcome.line,
+        sarif_cache=sarif_cache,
+        tier_counters=result.tier_counters,
+        joern_server=joern_server,
+        cwe=cwe,
+        # Exit only on a receipt THIS site would promote on alone:
+        # promotion-grade, not synth-excluded (an excluded synth
+        # receipt is dropped below and other channels must still
+        # get their turn), not premise-blocked.
+        early_exit_check=lambda c: (
+            _promotion_grade_receipt(c)
+            and not _synth_receipt_promotion_block_reason(
+                c, outcome, cwe, config,
+            )
+            and not _premise_blocks_confirm(premise_h, [c])
+        ),
+        skipped_types=_sweep_skipped,
+        errored_types=_sweep_errored,
+    )
+    if not confirmed:
+        _chain_types = {entry.get("type") for entry in chain}
+        if _chain_types and _chain_types <= (
+            _sweep_skipped | _sweep_errored
+        ):
+            # Every leg either declined to look (substrate skip /
+            # channel not-executable) or malfunctioned — and no
+            # other leg adjudicated. An error adjudicated nothing,
+            # so a skip-or-error-only chain is the empty-dispatch
+            # case: the routing must not be swallowed by legs that
+            # never produced evidence (the channel-refusal and
+            # planted-runtime-error shapes alike). A chain where
+            # any leg actually RAN (dispatched and stayed silent)
+            # does not re-route — that silence is an adjudication.
+            _route_to_synthesis()
+            return None
+
+    if confirmed:
+        _synth_blocked = {
+            t: reason for t in confirmed
+            if (reason := _synth_receipt_promotion_block_reason(
+                t, outcome, cwe, config,
+            ))
+        }
+        if _synth_blocked:
+            for _t, _reason in _synth_blocked.items():
+                logger.info(
+                    "sweep promotion: synth receipt %s excluded for "
+                    "%s:%s — %s",
+                    _t, outcome.file, outcome.function, _reason,
+                )
+            confirmed = [t for t in confirmed if t not in _synth_blocked]
+            if not confirmed:
+                _increment_tier_dict(
+                    result.tier_counters, "adapter_aggregation",
+                    "inconclusive",
+                )
+                return None
+        if _premise_blocks_confirm(premise_h, confirmed):
+            _note_premise_blocked_validation(
+                outcome, premise_h, list(confirmed),
+                config, result.tier_counters,
+                lane="sweep promotion", tier="primary_sweep",
+            )
+            return None
+        high_prec = [
+            t for t in confirmed
+            if not _is_detection_only(t)
+        ]
+        if not high_prec:
+            # Bayesian multi-channel aggregation: independent
+            # detection-role channels agreeing on the hypothesis
+            # can jointly cross the promote threshold even though
+            # no single receipt is perfect.
+            agg_channels, post_mean = _aggregate_channel_confirmations(
+                confirmed,
+            )
+            if agg_channels and not _guard_blocks_promotion(
+                    outcome.function, joern_server,
+                    result.tier_counters, config=config):
+                tool = "+".join(confirmed)
+                promoted = _promote_outcome(
+                    outcome, tool, provisional=provisional,
+                )
+                _record_aggregated_promotion(
+                    promoted, agg_channels, post_mean, confirmed,
+                )
+                if not _commit_promotion(
+                        result, i, outcome, promoted, aggregated=True):
+                    return None
+                _increment_tier_dict(
+                    result.tier_counters, "adapter_aggregation",
+                    "confirmed",
+                )
+                logger.info(
+                    "sweep promoted %s:%s via aggregated channels %s "
+                    "(posterior %.2f > %.2f)",
+                    outcome.file, outcome.function,
+                    "+".join(agg_channels), post_mean,
+                    _AGGREGATION_CONFIRM_THRESHOLD,
+                )
+                return promoted
+            _increment_tier_dict(
+                result.tier_counters, "adapter_aggregation",
+                "inconclusive",
+            )
+            logger.info(
+                "sweep promotion blocked %s:%s — only detection-role "
+                "rules (%s)",
+                outcome.file, outcome.function, "+".join(confirmed),
+            )
+            return None
+        _gblk = _guard_blocks_promotion(
+            outcome.function, joern_server, result.tier_counters,
+            config=config)
+        if _gblk:
+            logger.info(
+                "sweep promotion blocked %s:%s via %s — sink-guard veto: %s",
+                outcome.file,
+                outcome.function,
+                "+".join(confirmed),
+                _gblk,
+            )
+            return None
+        tool = "+".join(high_prec)
+        promoted = _promote_outcome(outcome, tool, provisional=provisional)
+        if not _commit_promotion(result, i, outcome, promoted):
+            return None
+        logger.info(
+            "sweep promoted %s:%s via %s",
+            outcome.file,
+            outcome.function,
+            tool,
+        )
+        return promoted
+    return None
+
+
+# Bodies stamped by an authoritative mechanical gate demotion: the
+# promotion pass refuses to sweep them (the gate's verdict stands),
+# so dispatching chains at them buys receipts nothing consumes.
+# Single authority: the zero-dispatch re-sweep, precondition
+# promotion, secondary-hypothesis dispatch, and adversarial-refute
+# passes all read THIS tuple — a new gate prefix added here reaches
+# every consumer (verbatim inline copies drifted apart before).
+_GATE_DEMOTION_BODY_PREFIXES = (
+    "[gate violation:",
+    "[sink-unreachability:",
+    "[guarded-sink:",
+    "[smt-infeasible:",
+    "[entry-unreachability:",
+    "[self-contradiction:",
+)
+
+
+# Concurrency ceiling for the zero-dispatch re-sweep's per-item
+# tool-chain fan-out. The pass is subprocess-bound (sandboxed spatch /
+# semgrep children), not LLM-bound, so the caller's LLM worker count
+# is only an upper input. Raising the cap multiplies concurrent
+# sandboxed scanner processes (fork + memory pressure on large files)
+# and widens wall-bound overshoot — the bound is checked between
+# items, so every in-flight item still runs to completion after it
+# trips. Lowering it serialises the pass, so fewer outcomes earn
+# receipts before the wall bound stops it.
+_RESWEEP_SUBPROCESS_MAX_WORKERS = 4
+
+
+def _resweep_zero_dispatch_suspicious(
+    result: OrchestratorResult,
+    config: OrchestratorConfig,
+    *,
+    sarif_cache: SarifCache | None = None,
+    checklist: dict[str, Any] | None = None,
+    joern_server=None,
+    max_workers: int = 1,
+) -> None:
+    """Receipt supply for the zero-dispatch suspicious pile.
+
+    A suspicious verdict whose review dispatched no mechanical tool is
+    an unpaid claim: the journal row says "no tool looked", and the
+    doctrine that tool output is the verdict has nothing to consume.
+    This pass dispatches each such outcome's CWE-mapped mechanical
+    chain (semgrep/coccinelle/codeql/smt/joern — $0 LLM), stamps
+    ``tools_dispatched``/``tools_errored``/``tools_skipped`` on the
+    outcome, and appends one audit-log record per outcome in the
+    sweep-record shape.
+
+    NO verdict changes happen here. The promotion pass that runs next
+    re-derives the same chain steps and flips status only through its
+    own gates; refutations keep flowing through the refutation
+    lattice. The re-derivation is memo-cheap for the memoizable step
+    types (semgrep/codeql/smt/compiler, and coccinelle — memoized at
+    file scope, vocab-rendered rules included) and an accepted
+    double-run for the rest (flow/cross-file legs, joern) — the wall
+    bound prices that honestly. Tier counters are NOT fed from this
+    pass: the promotion pass's re-derivation counts them, so feeding
+    both would double-book every channel receipt in tier-diagnostics;
+    this pass's per-outcome audit-log records carry its results
+    instead. Outcomes the promotion pass will never sweep
+    (authoritative gate demotions, counter-fenced hypotheses) are
+    excluded up front — their chains would burn wall budget on
+    receipts nothing consumes. Joern participation inherits the
+    channel-health gate and budget clamps inside ``_run_tool_chain``.
+    Wall-time bounded by ``config.zero_dispatch_resweep_seconds``;
+    SIGTERM and a concluded environment guard stop it between items.
+
+    Items are independent — each writes only its own outcome's
+    receipt slots, tier counters stay unfed, and the audit log is
+    append-atomic — so with ``max_workers > 1`` the subprocess-bound
+    tool chains fan out across threads (clamped to
+    ``_RESWEEP_SUBPROCESS_MAX_WORKERS``, and to
+    ``_JOERN_PASS_MAX_WORKERS`` when a joern server is attached).
+    The wall/SIGTERM/guard stops stay between-item: a tripped stop
+    lets in-flight items finish and starts no new ones.
+    """
+    budget_s = float(
+        getattr(config, "zero_dispatch_resweep_seconds", 0.0) or 0.0,
+    )
+    if budget_s <= 0:
+        return
+    candidates = [
+        (i, o) for i, o in enumerate(result.outcomes)
+        if o.status == "suspicious" and not (o.tools_dispatched or set())
+    ]
+    if not candidates:
+        return
+    logger.info(
+        "zero-dispatch re-sweep: %d suspicious outcome(s) carry no "
+        "tool receipts (wall bound %.0fs)",
+        len(candidates), budget_s,
+    )
+    pass_start = time.monotonic()
+    swept = 0
+    attempted = 0
+    swept_lock = _threading.Lock()
+    stop = _threading.Event()
+    from .heartbeat import Heartbeat
+    _hb = Heartbeat(config.out_dir, "zero_dispatch_resweep")
+    _hb.beat(done=0, total=len(candidates))
+
+    def _sweep_one(item: tuple[int, ReviewOutcome]) -> None:
+        nonlocal swept, attempted
+        _i, outcome = item
+        if stop.is_set():
+            return
+        if time.monotonic() - pass_start >= budget_s:
+            if not stop.is_set():
+                stop.set()
+                logger.info(
+                    "zero-dispatch re-sweep stopped at its %.0fs wall "
+                    "bound — %d/%d outcome(s) swept",
+                    budget_s, swept, len(candidates),
+                )
+            return
+        if is_sigterm_requested():
+            stop.set()
+            return
+        _guard = getattr(config, "environment_guard_state", None)
+        if _guard is not None and _guard.concluded:
+            stop.set()
+            return
+        review = outcome.review_result or {}
+        hypothesis = review.get("hypothesis") or outcome.hypothesis or ""
+        record: dict[str, Any] = {
+            "action": "zero_dispatch_resweep",
+            "key": f"{outcome.file}:{outcome.function}:{outcome.line or 0}",
+            "status": outcome.status,
+            "model": "",
+            "cost_usd": 0.0,
+            "duration_s": 0.0,
+            "hypothesis": hypothesis,
+        }
+        try:
+            if not hypothesis:
+                record["skip_reason"] = "no-hypothesis"
+                return
+            if outcome.body.startswith(_GATE_DEMOTION_BODY_PREFIXES):
+                record["skip_reason"] = "mechanical-gate-demotion"
+                return
+            if _has_refuting_counter(outcome):
+                # The promotion pass diverts counter-fenced outcomes
+                # to synthesis and never consumes chain receipts for
+                # them — receipt supply here would be pure burn.
+                record["skip_reason"] = "counter-fenced"
+                return
+            cwe = _effective_cwe(outcome, result.tier_counters)
+            chain = _hypothesis_to_tool_chain(
+                hypothesis, outcome.file, cwe=cwe,
+                language=_inventory_language_hint(config, outcome.file),
+            )
+            if not chain:
+                record["skip_reason"] = "no-mechanical-chain"
+                return
+            gap = _find_gap_in_checklist(
+                checklist or {}, outcome.file, outcome.function,
+            )
+            line_end = gap.get("line_end") if gap else None
+            source = _read_raw_source(
+                config.target_path, outcome.file, outcome.line, line_end,
+            )
+            step_start = time.monotonic()
+            errored: set = set()
+            skipped: set = set()
+            premise_h = _primary_hypothesis_entry(outcome, hypothesis)
+            confirmed = _run_tool_chain(
+                chain,
+                config=config,
+                file_path=outcome.file,
+                function_name=outcome.function,
+                source=source,
+                hypothesis=hypothesis,
+                line_start=outcome.line,
+                sarif_cache=sarif_cache,
+                # None: the promotion pass's re-derivation feeds the
+                # tier counters — see the docstring's dedupe note.
+                tier_counters=None,
+                joern_server=joern_server,
+                cwe=cwe,
+                errored_types=errored,
+                skipped_types=skipped,
+                # Promotion-site parity: exit only on a receipt the
+                # promotion pass would accept on its own.
+                early_exit_check=lambda c: (
+                    _promotion_grade_receipt(c)
+                    and not _synth_receipt_promotion_block_reason(
+                        c, outcome, cwe, config,
+                    )
+                    and not _premise_blocks_confirm(premise_h, [c])
+                ),
+            )
+            dispatched = {
+                step.get("type") for step in chain if step.get("type")
+            } - skipped
+            outcome.tools_dispatched = (
+                (outcome.tools_dispatched or set()) | dispatched
+            )
+            if errored:
+                outcome.tools_errored = (
+                    (outcome.tools_errored or set()) | errored
+                )
+            if skipped:
+                outcome.tools_skipped = (
+                    (outcome.tools_skipped or set()) | skipped
+                )
+            with swept_lock:
+                swept += 1
+            record["duration_s"] = round(time.monotonic() - step_start, 3)
+            record["tools_dispatched"] = sorted(
+                str(t) for t in dispatched
+            )
+            if errored:
+                record["tools_errored"] = sorted(str(t) for t in errored)
+            if skipped:
+                record["tools_skipped"] = sorted(str(t) for t in skipped)
+            if confirmed:
+                record["confirmed"] = sorted(confirmed)
+        except Exception:  # noqa: BLE001 — receipt supply, never fatal
+            record["skip_reason"] = "error"
+            logger.debug(
+                "zero-dispatch re-sweep failed for %s:%s",
+                outcome.file, outcome.function, exc_info=True,
+            )
+        finally:
+            with swept_lock:
+                attempted += 1
+                _done = attempted
+            # Throttled + best-effort inside; safe from worker threads.
+            _hb.beat(done=_done, total=len(candidates))
+            if config.out_dir:
+                # O_APPEND line-atomic — safe from worker threads.
+                append_audit_log(config.out_dir, record)
+
+    workers = min(
+        max(1, int(max_workers or 1)), _RESWEEP_SUBPROCESS_MAX_WORKERS,
+    )
+    if joern_server is not None:
+        workers = min(workers, _JOERN_PASS_MAX_WORKERS)
+
+    if workers <= 1 or len(candidates) <= 1:
+        for entry in candidates:
+            if stop.is_set():
+                break
+            _sweep_one(entry)
+    else:
+        from core.llm.concurrency import run_parallel
+
+        def _on_error(
+            item: tuple[int, ReviewOutcome], exc: Exception,
+        ) -> None:
+            # Best-effort pass by contract: a failed item loses only
+            # its own receipts.
+            logger.debug(
+                "zero-dispatch re-sweep item failed for %s:%s: %s",
+                item[1].file, item[1].function, exc, exc_info=True,
+            )
+
+        run_parallel(
+            candidates, _sweep_one,
+            max_workers=workers,
+            label="zero-dispatch-resweep",
+            on_error=_on_error,
+        )
+    if swept:
+        logger.info(
+            "zero-dispatch re-sweep: %d/%d outcome(s) received "
+            "mechanical receipts",
+            swept, len(candidates),
+        )
+
+
 def _promote_suspicious(
     result: OrchestratorResult,
     config: OrchestratorConfig,
@@ -19611,6 +26777,7 @@ def _promote_suspicious(
     checklist: dict[str, Any] | None = None,
     joern_server=None,
     mechanical_findings: dict[str, list[dict[str, Any]]] | None = None,
+    max_workers: int = 1,
 ) -> None:
     """Post-loop pass: try sweep tools on suspicious items with hypotheses.
 
@@ -19618,308 +26785,104 @@ def _promote_suspicious(
     Uses the tool chain with fallback — if the first-choice tool is
     unavailable or errors, the next tool in the chain is tried.
     Mutates result.outcomes in place and adjusts counters.
-    No LLM calls — purely mechanical.
+    No LLM calls in the sweep itself — purely mechanical (deferred
+    on-demand synthesis is the one LLM-backed step and runs serially).
 
     Skips promotion when the LLM provided a specific counter-hypothesis
     explaining why the function should stay suspicious — syntactic tools
     cannot refute architectural constraints like threading models or
     caller-side bounds checks.
+
+    Items are independent (each writes only its own outcome slot), so
+    with ``max_workers > 1`` the per-item tool chains fan out across
+    threads; the on-demand synthesis step is collected and applied in
+    item order afterwards so its per-run cap binds deterministically.
     """
-    for i, outcome in enumerate(result.outcomes):
-        if outcome.status != "suspicious":
-            continue
+    candidates = [
+        (i, o) for i, o in enumerate(result.outcomes)
+        if o.status == "suspicious"
+    ]
+    if not candidates:
+        return
 
-        if outcome.body.startswith(
-            (
-                "[gate violation:",
-                "[sink-unreachability:",
-                "[guarded-sink:",
-                "[smt-infeasible:",
-                "[entry-unreachability:",
-                "[self-contradiction:",
-            )
-        ):
-            logger.debug(
-                "sweep skipped %s:%s — mechanical gate demotion is authoritative",
-                outcome.file,
-                outcome.function,
-            )
-            continue
+    workers = max(1, max_workers)
+    if joern_server is not None:
+        workers = min(workers, _JOERN_PASS_MAX_WORKERS)
 
-        review = outcome.review_result or {}
-        hypothesis = review.get("hypothesis") or outcome.hypothesis or ""
-        if not hypothesis:
-            continue
+    from .heartbeat import Heartbeat
+    _hb = Heartbeat(config.out_dir, "sweep_promotion")
+    _hb.beat(done=0, total=len(candidates))
+    _hb_done = [0]
+    _hb_lock = _threading.Lock()
 
-        refuting_counter = _has_refuting_counter(outcome)
+    def _hb_tick() -> None:
+        # Throttled + best-effort inside; safe from worker threads.
+        with _hb_lock:
+            _hb_done[0] += 1
+            _done = _hb_done[0]
+        _hb.beat(done=_done, total=len(candidates))
 
-        # Premise binding for the primary hypothesis, same rule as the
-        # secondary sweep below: a function-local confirm cannot
-        # adjudicate a counter that rests on a cross-function premise
-        # — it re-proves the lexical shape the reviewer already saw
-        # and weighed. Blocked promotions stay suspicious and park the
-        # premise on the reading list.
-        premise_h = _primary_hypothesis_entry(outcome, hypothesis)
-
-        gap = _find_gap_in_checklist(checklist or {}, outcome.file, outcome.function)
-        line_end = gap.get("line_end") if gap else None
-
-        source = _read_raw_source(
-            config.target_path,
-            outcome.file,
-            outcome.line,
-            line_end,
-        )
-
-        cwe = _effective_cwe(outcome, result.tier_counters)
-
-        if refuting_counter:
-            if _hypothesis_to_tool_chain(hypothesis, outcome.file, cwe=cwe):
-                logger.debug(
-                    "sweep skipped %s:%s — LLM counter-hypothesis present",
-                    outcome.file,
-                    outcome.function,
-                )
-                continue
-            # Empty-dispatch family: no static channel exists that
-            # could adjudicate this hypothesis OR its counter, so the
-            # only possible mechanical evidence is a synthesized
-            # checker (full dual controls + guarded-sink gate apply
-            # inside). Route the family to on-demand synthesis instead
-            # of letting it die unverified.
-            _synthesize_unmapped_suspicious(
+    if workers <= 1 or len(candidates) <= 1:
+        for i, outcome in candidates:
+            _promote_suspicious_one(
                 result, config, i, outcome,
-                _synthesis_hypothesis_for_cwe(outcome, cwe, hypothesis),
-                cwe, source,
+                sarif_cache=sarif_cache,
+                checklist=checklist,
                 joern_server=joern_server,
+                mechanical_findings=mechanical_findings,
             )
-            continue
+            _hb_tick()
+        return
 
-        mech_tool = _correlated_mech_detector_tool(
-            outcome, hypothesis, cwe, mechanical_findings,
-        )
-        if mech_tool:
-            _gblk = _guard_blocks_promotion(
-                outcome.function, joern_server, result.tier_counters)
-            if _gblk:
-                logger.info(
-                    "sweep promotion blocked %s:%s via %s — sink-guard veto: %s",
-                    outcome.file,
-                    outcome.function,
-                    mech_tool,
-                    _gblk,
-                )
-            elif _premise_blocks_confirm(premise_h, [mech_tool]):
-                _note_premise_blocked_validation(
-                    outcome, premise_h, [mech_tool],
-                    config, result.tier_counters,
-                    lane="sweep promotion", tier="primary_sweep",
-                )
-            else:
-                result.outcomes[i] = _promote_outcome(outcome, mech_tool)
-                result.sweep_promoted += 1
-                result.suspicious -= 1
-                result.findings += 1
-                logger.info(
-                    "sweep promoted %s:%s via %s (prep-phase detector hit)",
-                    outcome.file,
-                    outcome.function,
-                    mech_tool,
-                )
-                continue
+    synthesis_queue: list[tuple[int, ReviewOutcome, str, str, str]] = []
 
-        pf = run_prefilter(
-            target_path=config.target_path,
-            file_path=outcome.file,
-            function_name=outcome.function,
-            source=source,
-            line_start=outcome.line,
-            project_sinks=config.project_sinks,
-        )
-        if pf.hits:
-            if line_end:
-                pf.hits = [
-                    h
-                    for h in pf.hits
-                    if not h.line or outcome.line <= h.line <= line_end
-                ]
-            # Promotion needs evidence in the hypothesis's family; an
-            # unrelated pattern hit stays context and falls through to
-            # the hypothesis-specific tool chain.
-            correlated = [
-                h for h in pf.hits
-                if evidence_matches_hypothesis(
-                    family_for_rule(h.rule_id), hypothesis, cwe,
-                )
-            ]
-            if correlated:
-                tool = f"prefilter:{correlated[0].rule_id}"
-                # Same sink-guard veto as every other promotion lane
-                # (mech-detector above, critique, secondary sweep).
-                _pf_gblk = _guard_blocks_promotion(
-                    outcome.function, joern_server, result.tier_counters)
-                if _pf_gblk:
-                    logger.info(
-                        "sweep promotion blocked %s:%s via %s — "
-                        "sink-guard veto: %s",
-                        outcome.file,
-                        outcome.function,
-                        tool,
-                        _pf_gblk,
-                    )
-                elif _premise_blocks_confirm(premise_h, [tool]):
-                    _note_premise_blocked_validation(
-                        outcome, premise_h, [tool],
-                        config, result.tier_counters,
-                        lane="sweep promotion", tier="primary_sweep",
-                    )
-                else:
-                    result.outcomes[i] = _promote_outcome(outcome, tool)
-                    result.sweep_promoted += 1
-                    result.suspicious -= 1
-                    result.findings += 1
-                    logger.info(
-                        "sweep promoted %s:%s via %s",
-                        outcome.file,
-                        outcome.function,
-                        tool,
-                    )
-                    continue
-            if pf.hits and not correlated:
-                _record_uncorrelated_hits(outcome, pf.hits)
-                logger.info(
-                    "sweep promotion withheld %s:%s — prefilter hits (%s) "
-                    "uncorrelated with hypothesis",
-                    outcome.file,
-                    outcome.function,
-                    ",".join(h.rule_id for h in pf.hits[:3]),
-                )
-
-        chain = _hypothesis_to_tool_chain(hypothesis, outcome.file, cwe=cwe)
-        if not chain:
-            # No CWE dispatch entry and no cheap channel binds this
-            # hypothesis — the static dispatch table has nothing to
-            # test it with. On-demand Mode-2 synthesis generates a
-            # one-off, negatively-controlled rule instead of letting
-            # the hypothesis die untested.
-            _synthesize_unmapped_suspicious(
+    def _one(item: tuple[int, ReviewOutcome]) -> None:
+        i, outcome = item
+        try:
+            _promote_suspicious_one(
                 result, config, i, outcome,
-                _synthesis_hypothesis_for_cwe(outcome, cwe, hypothesis),
-                cwe, source,
+                sarif_cache=sarif_cache,
+                checklist=checklist,
                 joern_server=joern_server,
+                mechanical_findings=mechanical_findings,
+                synthesis_queue=synthesis_queue,
             )
-            continue
-        confirmed = _run_tool_chain(
-            chain,
-            config=config,
-            file_path=outcome.file,
-            function_name=outcome.function,
-            source=source,
-            hypothesis=hypothesis,
-            line_start=outcome.line,
-            sarif_cache=sarif_cache,
-            tier_counters=result.tier_counters,
+        finally:
+            _hb_tick()
+
+    from core.llm.concurrency import run_parallel
+
+    item_errors: list[tuple[int, Exception]] = []
+
+    def _on_error(item: tuple[int, ReviewOutcome], exc: Exception) -> None:
+        item_errors.append((item[0], exc))
+
+    logger.info(
+        "sweep promotion: %d suspicious outcomes (workers=%d)",
+        len(candidates), workers,
+    )
+    run_parallel(
+        candidates, _one,
+        max_workers=workers,
+        label="sweep-promote",
+        on_error=_on_error,
+    )
+    if item_errors:
+        # An unexpected per-item failure aborts the pass instead of
+        # silently dropping the item from the sweep — same abort
+        # posture as the serial loop, but conservatively COARSER on
+        # synthesis: the whole deferred synthesis queue is skipped,
+        # including items collected before the failure, whereas the
+        # serial loop would already have synthesized inline for the
+        # items it got through before raising.
+        item_errors.sort(key=lambda t: t[0])
+        raise item_errors[0][1]
+    for i, outcome, synth_hyp, cwe, source in sorted(
+            synthesis_queue, key=lambda t: t[0]):
+        _synthesize_unmapped_suspicious(
+            result, config, i, outcome, synth_hyp, cwe, source,
             joern_server=joern_server,
-            cwe=cwe,
         )
-
-        if confirmed:
-            _synth_blocked = {
-                t: reason for t in confirmed
-                if (reason := _synth_receipt_promotion_block_reason(
-                    t, outcome, cwe, config,
-                ))
-            }
-            if _synth_blocked:
-                for _t, _reason in _synth_blocked.items():
-                    logger.info(
-                        "sweep promotion: synth receipt %s excluded for "
-                        "%s:%s — %s",
-                        _t, outcome.file, outcome.function, _reason,
-                    )
-                confirmed = [t for t in confirmed if t not in _synth_blocked]
-                if not confirmed:
-                    _increment_tier_dict(
-                        result.tier_counters, "adapter_aggregation",
-                        "inconclusive",
-                    )
-                    continue
-            if _premise_blocks_confirm(premise_h, confirmed):
-                _note_premise_blocked_validation(
-                    outcome, premise_h, list(confirmed),
-                    config, result.tier_counters,
-                    lane="sweep promotion", tier="primary_sweep",
-                )
-                continue
-            high_prec = [
-                t for t in confirmed
-                if not _is_detection_only(t)
-            ]
-            if not high_prec:
-                # Bayesian multi-channel aggregation: independent
-                # detection-role channels agreeing on the hypothesis
-                # can jointly cross the promote threshold even though
-                # no single receipt is perfect.
-                agg_channels, post_mean = _aggregate_channel_confirmations(
-                    confirmed,
-                )
-                if agg_channels and not _guard_blocks_promotion(
-                        outcome.function, joern_server,
-                        result.tier_counters):
-                    tool = "+".join(confirmed)
-                    promoted = _promote_outcome(outcome, tool)
-                    _record_aggregated_promotion(
-                        promoted, agg_channels, post_mean, confirmed,
-                    )
-                    result.outcomes[i] = promoted
-                    result.sweep_promoted += 1
-                    result.aggregation_promoted += 1
-                    result.suspicious -= 1
-                    result.findings += 1
-                    _increment_tier_dict(
-                        result.tier_counters, "adapter_aggregation",
-                        "confirmed",
-                    )
-                    logger.info(
-                        "sweep promoted %s:%s via aggregated channels %s "
-                        "(posterior %.2f > %.2f)",
-                        outcome.file, outcome.function,
-                        "+".join(agg_channels), post_mean,
-                        _AGGREGATION_CONFIRM_THRESHOLD,
-                    )
-                    continue
-                _increment_tier_dict(
-                    result.tier_counters, "adapter_aggregation",
-                    "inconclusive",
-                )
-                logger.info(
-                    "sweep promotion blocked %s:%s — only detection-role "
-                    "rules (%s)",
-                    outcome.file, outcome.function, "+".join(confirmed),
-                )
-                continue
-            _gblk = _guard_blocks_promotion(
-                outcome.function, joern_server, result.tier_counters)
-            if _gblk:
-                logger.info(
-                    "sweep promotion blocked %s:%s via %s — sink-guard veto: %s",
-                    outcome.file,
-                    outcome.function,
-                    "+".join(confirmed),
-                    _gblk,
-                )
-                continue
-            tool = "+".join(high_prec)
-            result.outcomes[i] = _promote_outcome(outcome, tool)
-            result.sweep_promoted += 1
-            result.suspicious -= 1
-            result.findings += 1
-            logger.info(
-                "sweep promoted %s:%s via %s",
-                outcome.file,
-                outcome.function,
-                tool,
-            )
 
 
 def _record_synthesis_refusal(
@@ -20111,7 +27074,8 @@ def _synthesize_unmapped_suspicious(
         )
         return
     _gblk = _guard_blocks_promotion(
-        outcome.function, joern_server, result.tier_counters)
+        outcome.function, joern_server, result.tier_counters,
+        config=config)
     if _gblk:
         _increment_tier_dict(
             result.tier_counters, "synthesis_on_demand", "inconclusive",
@@ -20205,16 +27169,7 @@ def _promote_suspicious_preconditions(
         if outcome.status != "suspicious":
             continue
 
-        if outcome.body.startswith(
-            (
-                "[gate violation:",
-                "[sink-unreachability:",
-                "[guarded-sink:",
-                "[smt-infeasible:",
-                "[entry-unreachability:",
-                "[self-contradiction:",
-            )
-        ):
+        if outcome.body.startswith(_GATE_DEMOTION_BODY_PREFIXES):
             continue
 
         review = outcome.review_result or {}
@@ -20233,6 +27188,7 @@ def _promote_suspicious_preconditions(
                 preconditions,
                 target_path=config.target_path,
                 context_map=context_map,
+                graph_store=_graph_store_for_config(config),
             )
         except Exception:
             logger.debug(
@@ -20342,6 +27298,7 @@ def _promote_suspicious_preconditions(
             (outcome.tools_dispatched or set()) | {"precondition"}
         )
         promoted.tools_errored = outcome.tools_errored
+        promoted.tools_skipped = outcome.tools_skipped
         promoted.semantic_confidence = outcome.semantic_confidence
         if promoted.review_result is not None:
             promoted.review_result["evidence_tool"] = tool
@@ -20460,8 +27417,17 @@ def _is_detection_only(tool_id: str) -> bool:
     """
     if tool_id.startswith("coccinelle:"):
         rule_name = tool_id.split("coccinelle:", 1)[1]
+        try:
+            raptor_dir = os.environ["RAPTOR_DIR"]
+        except KeyError:
+            # No repo root — a stock rule cannot be told apart from a
+            # dynamic per-hypothesis one, so fail CLOSED (detection
+            # role, no promotion). The old "." fallback resolved
+            # against CWD, missed the isfile check, and read stock
+            # detection rules as promotion-grade.
+            return True
         rule_path = os.path.join(
-            os.environ.get("RAPTOR_DIR", "."),
+            raptor_dir,
             "engine", "coccinelle", "rules", f"{rule_name}.cocci",
         )
         if not os.path.isfile(rule_path):
@@ -20507,7 +27473,7 @@ def _is_detection_only(tool_id: str) -> bool:
         # (The ptr_lifecycle field-parity leg emits under this
         # namespace by construction — the same rule applies to it
         # with zero extra code.)
-        from core.audit.peer_evidence import is_detection_rule_id
+        from core.audit.peer_evidence import is_detection_rule_id  # type: ignore[assignment]
         return is_detection_rule_id(tool_id)
 
     if tool_id.startswith("ptr_lifecycle:"):
@@ -20547,6 +27513,20 @@ def _is_detection_only(tool_id: str) -> bool:
         from core.audit.protocol_state import is_detection_rule_id
         return is_detection_rule_id(tool_id)
 
+    # Exact-spelling registry namespaces (core.audit.evidence_grade):
+    # the enumerated role decides, and an unlisted spelling under an
+    # owned namespace fails CLOSED (detection role, no promotion) —
+    # ownership means every promotion-grade spelling is listed
+    # explicitly, so an unknown variant may corroborate but never
+    # convict on its own.
+    from core.audit.evidence_grade import (
+        _ROLE_VERIFICATION,
+        registered_spelling_role,
+        registry_owns,
+    )
+    if registry_owns(tool_id):
+        return registered_spelling_role(tool_id) != _ROLE_VERIFICATION
+
     return False
 
 
@@ -20565,8 +27545,48 @@ def _source_has_arithmetic(source: str) -> bool:
     actual arithmetic in the source, the check is vacuously true.
     """
     import re
-    cleaned = re.sub(r'//[^\n]*|/\*.*?\*/|"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'',
-                     " ", source, flags=re.DOTALL)
+    # Token scan instead of one sub(): the single-regex spelling
+    # (`/\*.*?\*/` in the alternation) re-scanned the rest of the
+    # file from every ``/*`` that never closes — quadratic on
+    # hostile source. Each character is visited once; a ``/*`` looks
+    # up its closer with str.find, and once one opener has no closer
+    # no later opener can have one either, so the failed lookup
+    # happens at most once.  String openers pinned to UNESCAPED
+    # delimiters ((?<!\\)): an unterminated literal whose interior
+    # repeats escaped delimiters (`"` + `\"`*n) otherwise makes
+    # every embedded delimiter a fresh match attempt that re-scans
+    # to end-of-file — quadratic on hostile source (measured exp
+    # 2.03; pinned, exp 1.0).  On a well-formed token stream no
+    # string opens at an escaped delimiter, so the scan is
+    # unchanged; dropping the pin re-opens the quadratic.
+    token_re = re.compile(
+        r'//[^\n]*|/\*|(?<!\\)"(?:[^"\\]|\\.)*"'
+        + r"|(?<!\\)'(?:[^'\\]|\\.)*'",
+        re.DOTALL)  # an escape may consume a newline
+    parts: list[str] = []
+    pos = 0
+    no_closer = False
+    while True:
+        m = token_re.search(source, pos)
+        if m is None:
+            parts.append(source[pos:])
+            break
+        parts.append(source[pos : m.start()])
+        if m.group() != "/*":
+            parts.append(" ")
+            pos = m.end()
+            continue
+        end = -1 if no_closer else source.find("*/", m.end())
+        if end == -1:
+            # Never closes: not a comment. Keep the chars and keep
+            # scanning after the opener (no token starts at '*').
+            no_closer = True
+            parts.append("/*")
+            pos = m.end()
+        else:
+            parts.append(" ")
+            pos = end + 2
+    cleaned = "".join(parts)
     return bool(_ARITHMETIC_RE.search(cleaned))
 
 
@@ -20712,6 +27732,15 @@ def _premise_blocks_confirm(
     return not any(_tool_sees_cross_function(t) for t in confirmed)
 
 
+# Reading-list updates are load-modify-save cycles on one JSON file
+# with writers all over the process (premise questions from parallel
+# review/post-loop passes, audit_bridge queueing, the study
+# consumer). ALL of them serialize on the shared lock owned by
+# core.concepts.reading_list — a writer-local lock here only covered
+# this module's premise-question writers and did nothing against the
+# other writers' concurrent cycles.
+
+
 def _queue_premise_study_question(
     config: OrchestratorConfig,
     outcome: ReviewOutcome,
@@ -20724,29 +27753,38 @@ def _queue_premise_study_question(
     try:
         import uuid
 
-        from core.concepts.reading_list import ReadingList, ReadingListItem
+        from core.concepts.reading_list import (
+            READING_LIST_WRITE_LOCK,
+            ReadingList,
+            ReadingListItem,
+        )
 
         counter = (h.get("counter") or "").strip()
         if not counter or config.out_dir is None:
             return
+        from core.atomic_fs.fs_lock import artifact_lock
+
         rl_path = config.out_dir / "reading-list.json"
-        rl = ReadingList.load(rl_path)
         question = (
             f"Does this hold: {counter[:400]} "
             f"(refutation premise for {outcome.function})?"
         )
-        if any(it.question == question for it in rl.items):
-            return
-        rl.queue(ReadingListItem(
-            id=f"premise-{uuid.uuid4().hex[:12]}",
-            question=question,
-            source_command="/audit",
-            source_file=outcome.file,
-            source_function=outcome.function,
-            priority="high",
-            context=(h.get("mechanism") or "")[:200],
-        ))
-        rl.save(rl_path)
+        with READING_LIST_WRITE_LOCK, artifact_lock(
+            rl_path, subject="reading list",
+        ):
+            rl = ReadingList.load(rl_path)
+            if any(it.question == question for it in rl.items):
+                return
+            rl.queue(ReadingListItem(
+                id=f"premise-{uuid.uuid4().hex[:12]}",
+                question=question,
+                source_command="/audit",
+                source_file=outcome.file,
+                source_function=outcome.function,
+                priority="high",
+                context=(h.get("mechanism") or "")[:200],
+            ))
+            rl.save(rl_path)
     except Exception:
         logger.debug("premise study-question queueing failed", exc_info=True)
 
@@ -20820,6 +27858,188 @@ def _note_premise_blocked_validation(
     _queue_premise_study_question(config, outcome, h)
 
 
+def _smt_caller_gate_decision(
+    config: OrchestratorConfig,
+    outcome: ReviewOutcome,
+    verb: str,
+    mechanism: str,
+    source: str,
+    *,
+    line_end: int | None = None,
+) -> CallerGateDecision | None:
+    """Caller-side gate consult for one clean-refuted SMT confirm.
+
+    Returns the gate decision, or ``None`` ONLY when the gate is
+    disabled by config — ``None`` restores the pre-gate direct
+    promotion.  Errors fail CLOSED: the evaluator returns an
+    error-class hold itself, and this wrapper's own belt-and-braces
+    catch converts any remaining crash into the same hold — an errored
+    caller-side check leaves the receipt with no counter-evidence
+    channel in either direction, and on this lane a wrong promotion
+    mints a false finding while a wrong hold keeps everything at
+    suspicious-with-receipt.  The errored consult is stamped with its
+    error class (body marker, audit log, suppressions record), so an
+    errored-gate outcome is never artifact-identical to a knob-off
+    run.
+    """
+    if not getattr(config, "smt_promotion_caller_gate", True):
+        return None
+    try:
+        from .smt_promotion_gate import evaluate_caller_gate
+
+        return evaluate_caller_gate(
+            config.target_path,
+            outcome.file,
+            outcome.function,
+            verb,
+            mechanism,
+            source=source or "",
+            def_span=(
+                (outcome.line, line_end)
+                if outcome.line and line_end else None
+            ),
+            inventory=getattr(config, "inventory", None),
+        )
+    except Exception as e:
+        logger.warning(
+            "smt caller gate errored for %s:%s — holding the "
+            "promotion (fail-closed)",
+            outcome.file, outcome.function, exc_info=True,
+        )
+        # CallerGateDecision comes from the module-top import: this
+        # handler must work even when the lazy import above IS the
+        # failure (a re-import here would re-raise and take down the
+        # whole sweep-promotion phase).
+        return CallerGateDecision(
+            action="hold",
+            reason=(
+                f"caller-contract gate: evaluation errored "
+                f"({type(e).__name__}) — receipt held at suspicious; "
+                "an errored check is not caller evidence in either "
+                "direction"
+            ),
+            channel_outcome="error",
+            error_class=type(e).__name__,
+        )
+
+
+def _hold_smt_promotion(
+    result: OrchestratorResult,
+    config: OrchestratorConfig,
+    i: int,
+    outcome: ReviewOutcome,
+    tool: str,
+    mechanism: str,
+    gate: CallerGateDecision,
+) -> None:
+    """Hold one clean-refuted SMT promotion at suspicious-with-receipt.
+
+    The receipt is preserved verbatim (``clean-refuted:<tool>`` stays
+    the evidence stamp — a mechanical receipt is never talked away),
+    the journal body carries the gate's caller-side reason, and the
+    held promotion is recorded through the suppressions.jsonl
+    chokepoint with ``dropped: false`` so the decision is auditable.
+    Promotion-only by construction: clean → suspicious, never below.
+    A later hypothesis of the same function may hold again (markers
+    accumulate on the body; verdict counters move only on the first
+    clean → suspicious transition).
+    """
+    stamp = f"clean-refuted:{tool}"
+    base = result.outcomes[i]
+    prior_status = base.status
+    held = ReviewOutcome(
+        file=outcome.file,
+        function=outcome.function,
+        status="suspicious",
+        body=(
+            f"[smt-caller-gate: {gate.reason}] "
+            f"LLM self-refuted this hypothesis; {tool} confirmed it "
+            f"intra-procedurally; the caller-side check held the "
+            f"promotion: {mechanism[:200]}\n\n{base.body}"
+        ),
+        hypothesis=mechanism,
+        hypotheses=outcome.hypotheses,
+        evidence_tool=stamp,
+        cost_usd=outcome.cost_usd,
+        model=outcome.model,
+        duration_s=outcome.duration_s,
+        review_result=outcome.review_result,
+        line=outcome.line,
+    )
+    held.tools_dispatched = outcome.tools_dispatched
+    held.tools_errored = outcome.tools_errored
+    held.tools_skipped = outcome.tools_skipped
+    held.semantic_confidence = outcome.semantic_confidence
+    held.function_qualified = getattr(outcome, "function_qualified", "")
+    if held.review_result is not None:
+        held.review_result["evidence_tool"] = stamp
+        held.review_result["smt_caller_gate"] = {
+            "action": "hold",
+            "reason": gate.reason,
+            "precondition": gate.precondition,
+            "site_count": gate.site_count,
+            "channel_outcome": gate.channel_outcome,
+            "error_class": gate.error_class,
+        }
+    result.outcomes[i] = held
+    if prior_status == "clean":
+        result.refuted_rescued += 1
+        result.clean -= 1
+        result.suspicious += 1
+    _increment_tier_dict(
+        result.tier_counters, "refuted_sweep", "caller_gate_held",
+    )
+    append_audit_log(config.out_dir, {
+        "action": "smt_promotion_caller_gate_held",
+        "key": f"{outcome.file}:{outcome.function}:{outcome.line or 0}",
+        "file": outcome.file,
+        "function": outcome.function,
+        "status": "suspicious",
+        "prior_status": prior_status,
+        "evidence_tool": stamp,
+        "hypothesis": mechanism,
+        # site_count and error_class travel on the suppressions.jsonl
+        # record; the gate reason here already names both in prose.
+        "reason": gate.reason,
+    })
+    try:
+        from core.analysis.reach_chokepoint import record_suppression
+
+        record_suppression(
+            Path(config.out_dir),
+            finding={
+                "finding_id": (
+                    f"audit-smt-caller-gate:{outcome.file}:"
+                    f"{outcome.function}:{outcome.line or 0}"
+                ),
+                "rule_id": stamp,
+                "file_path": outcome.file,
+                "line": outcome.line or 0,
+                "function": outcome.function,
+            },
+            verdict=_SMT_CALLER_GATE_VERDICT,
+            reason=gate.reason,
+            dropped=False,
+            extra={
+                "stage": "clean-refuted-promotion",
+                "precondition": gate.precondition,
+                "site_count": gate.site_count,
+                "channel_outcome": gate.channel_outcome,
+                "error_class": gate.error_class,
+                "held_at": "suspicious",
+            },
+        )
+    except Exception:
+        logger.debug(
+            "smt caller gate suppression record failed", exc_info=True,
+        )
+    logger.info(
+        "clean-refuted promotion held %s:%s via %s — %s "
+        "(clean → suspicious with receipt)",
+        outcome.file, outcome.function, tool, gate.reason,
+    )
+
+
 def _promote_clean_refuted(
     result: OrchestratorResult,
     config: OrchestratorConfig,
@@ -20835,7 +28055,13 @@ def _promote_clean_refuted(
     per function, ranked by mechanism specificity):
 
     1. SMT verification-role verb (the historical lane): a confirm is
-       strong enough to promote clean → finding.
+       strong enough to promote clean → finding, subject to the
+       caller-side gate (``config.smt_promotion_caller_gate``): the
+       receipt's own precondition is adjudicated at the in-repo call
+       sites, and a receipt every caller upholds — or one that binds
+       no caller-checkable precondition — holds at
+       suspicious-with-receipt instead (see
+       :mod:`core.audit.smt_promotion_gate`).
     2. Cheap-channel tool chain (semgrep/SMT/coccinelle/compiler; the
        expensive Joern/CodeQL channels are included only when the
        refutation is NOT high-confidence): a confirm on a self-refuted
@@ -20951,7 +28177,7 @@ def _promote_clean_refuted(
                         continue
                     _gblk = _guard_blocks_promotion(
                         outcome.function, joern_server,
-                        result.tier_counters)
+                        result.tier_counters, config=config)
                     if _gblk:
                         logger.info(
                             "clean-refuted promotion blocked %s:%s via %s "
@@ -20962,11 +28188,62 @@ def _promote_clean_refuted(
                         continue
 
                     tool = "+".join(confirmed)
-                    result.outcomes[i] = _promote_outcome(
+                    gate = _smt_caller_gate_decision(
+                        config, outcome, smt_verb, mechanism, source,
+                        line_end=line_end,
+                    )
+                    if gate is not None and gate.action == "hold":
+                        _hold_smt_promotion(
+                            result, config, i, outcome, tool,
+                            mechanism, gate,
+                        )
+                        # A hold resolves only THIS receipt — the
+                        # remaining ranked hypotheses (one may carry
+                        # a caller-VIOLATING precondition) keep both
+                        # lanes; only a genuine promotion
+                        # short-circuits the function.  Lane 2 for
+                        # the SAME hypothesis is skipped: its SMT
+                        # receipt already stands on the held outcome,
+                        # and a cheap-channel rescue would overwrite
+                        # that stamp with a weaker one.
+                        continue
+                    promoted_outcome = _promote_outcome(
                         outcome, f"clean-refuted:{tool}",
                     )
+                    if gate is not None and gate.citation:
+                        promoted_outcome.body = (
+                            f"[smt-caller-gate: {gate.citation}]\n\n"
+                            f"{promoted_outcome.body}"
+                        )
+                    # The gate record must describe THIS promotion —
+                    # an earlier hypothesis' hold record surviving on
+                    # a status=finding outcome would contradict the
+                    # verdict for every consumer of review_result.
+                    if isinstance(promoted_outcome.review_result, dict):
+                        if gate is not None:
+                            promoted_outcome.review_result[
+                                "smt_caller_gate"
+                            ] = {
+                                "action": "promote",
+                                "reason": gate.reason,
+                                "precondition": gate.precondition,
+                                "site_count": gate.site_count,
+                                "channel_outcome": gate.channel_outcome,
+                                "error_class": gate.error_class,
+                            }
+                        else:
+                            promoted_outcome.review_result.pop(
+                                "smt_caller_gate", None,
+                            )
+                    # An earlier hypothesis' gate hold may have moved
+                    # this slot to suspicious already.
+                    prior_status = result.outcomes[i].status
+                    result.outcomes[i] = promoted_outcome
                     result.sweep_promoted += 1
-                    result.clean -= 1
+                    if prior_status == "suspicious":
+                        result.suspicious -= 1
+                    else:
+                        result.clean -= 1
                     result.findings += 1
                     logger.info(
                         "clean-refuted promoted %s:%s via %s (LLM refuted, SMT confirmed)",
@@ -20976,7 +28253,10 @@ def _promote_clean_refuted(
                     continue
 
             # ── Lane 2: cheap-channel chain (new) ──────────────────
-            chain = _hypothesis_to_tool_chain(mechanism, outcome.file, cwe=cwe)
+            chain = _hypothesis_to_tool_chain(
+                mechanism, outcome.file, cwe=cwe,
+                language=_inventory_language_hint(config, outcome.file),
+            )
             # SMT already dispatched above for this hypothesis; don't
             # re-run it inside the chain.
             if smt_verb:
@@ -21043,7 +28323,8 @@ def _promote_clean_refuted(
                 _queue_premise_study_question(config, outcome, h)
                 continue
             _gblk = _guard_blocks_promotion(
-                outcome.function, joern_server, result.tier_counters)
+                outcome.function, joern_server, result.tier_counters,
+                config=config)
             if _gblk:
                 logger.info(
                     "refuted-hypothesis promotion blocked %s:%s via %s — "
@@ -21054,6 +28335,30 @@ def _promote_clean_refuted(
                 continue
 
             tool = "+".join(high_prec)
+            # An earlier hypothesis' caller-gate hold may have moved
+            # this slot to suspicious already: build on the current
+            # body (markers accumulate) and move the verdict counters
+            # only on a genuine clean → suspicious transition.
+            _l2_base = result.outcomes[i]
+            _l2_prior = _l2_base.status
+            # A standing tool receipt on the slot (e.g. the held
+            # verification-role clean-refuted stamp) must not be
+            # displaced by a cheap-channel confirm for a different
+            # hypothesis: provenance-append instead — the stronger
+            # stamp keeps grading, the new channel stays visible.
+            _l2_stamp = tool
+            if (
+                _l2_base.evidence_tool
+                and _l2_base.evidence_tool != tool
+            ):
+                from .evidence_grade import is_tool_evidence
+                if is_tool_evidence(_l2_base.evidence_tool):
+                    _l2_parts = _l2_base.evidence_tool.split("+")
+                    _l2_stamp = "+".join(
+                        _l2_parts
+                        + [p for p in tool.split("+")
+                           if p not in _l2_parts],
+                    )
             rescued = ReviewOutcome(
                 file=outcome.file,
                 function=outcome.function,
@@ -21062,11 +28367,11 @@ def _promote_clean_refuted(
                     f"[refuted-hypothesis-confirmed via {tool}] "
                     f"LLM self-refuted this hypothesis; a mechanical "
                     f"tool confirmed it: {mechanism[:200]}\n\n"
-                    f"{outcome.body}"
+                    f"{_l2_base.body}"
                 ),
                 hypothesis=mechanism,
                 hypotheses=outcome.hypotheses,
-                evidence_tool=tool,
+                evidence_tool=_l2_stamp,
                 cost_usd=outcome.cost_usd,
                 model=outcome.model,
                 duration_s=outcome.duration_s,
@@ -21077,20 +28382,23 @@ def _promote_clean_refuted(
                 outcome, "function_qualified", "",
             )
             if rescued.review_result is not None:
-                rescued.review_result["evidence_tool"] = tool
+                rescued.review_result["evidence_tool"] = _l2_stamp
                 rescued.review_result["refuted_hypothesis_confirmed"] = True
             result.outcomes[i] = rescued
-            result.refuted_rescued += 1
-            result.clean -= 1
-            result.suspicious += 1
+            if _l2_prior == "clean":
+                # A slot an earlier gate hold already rescued to
+                # suspicious counts once.
+                result.refuted_rescued += 1
+                result.clean -= 1
+                result.suspicious += 1
             append_audit_log(config.out_dir, {
                 "action": "refuted_hypothesis_confirmed",
                 "key": f"{outcome.file}:{outcome.function}:{outcome.line or 0}",
                 "file": outcome.file,
                 "function": outcome.function,
                 "status": "suspicious",
-                "prior_status": "clean",
-                "evidence_tool": tool,
+                "prior_status": _l2_prior,
+                "evidence_tool": _l2_stamp,
                 "hypothesis": mechanism,
             })
             logger.info(
@@ -21141,16 +28449,7 @@ def _dispatch_secondary_hypotheses(
     for i, outcome in enumerate(result.outcomes):
         if outcome.status not in ("finding", "suspicious"):
             continue
-        if outcome.body.startswith(
-            (
-                "[gate violation:",
-                "[sink-unreachability:",
-                "[guarded-sink:",
-                "[smt-infeasible:",
-                "[entry-unreachability:",
-                "[self-contradiction:",
-            )
-        ):
+        if outcome.body.startswith(_GATE_DEMOTION_BODY_PREFIXES):
             continue
 
         hypotheses = getattr(outcome, "hypotheses", None) or []
@@ -21219,7 +28518,10 @@ def _dispatch_secondary_hypotheses(
             if not cwe:
                 cwe = fallback_cwe
 
-            chain = _hypothesis_to_tool_chain(mechanism, outcome.file, cwe=cwe)
+            chain = _hypothesis_to_tool_chain(
+                mechanism, outcome.file, cwe=cwe,
+                language=_inventory_language_hint(config, outcome.file),
+            )
             if not chain:
                 _increment_tier_dict(
                     result.tier_counters, "secondary_sweep", "skipped",
@@ -21238,6 +28540,13 @@ def _dispatch_secondary_hypotheses(
                 tier_counters=result.tier_counters,
                 joern_server=joern_server,
                 cwe=cwe,
+                # Exit only on a receipt this site would accept alone:
+                # promotion-grade and not blocked by the secondary
+                # hypothesis's own cross-function counter premise.
+                early_exit_check=lambda c: (
+                    _promotion_grade_receipt(c)
+                    and not _premise_blocks_confirm(h, [c])
+                ),
             )
             _increment_tier_dict(
                 result.tier_counters, "secondary_sweep",
@@ -21255,7 +28564,8 @@ def _dispatch_secondary_hypotheses(
                 )
                 continue
             _gblk = _guard_blocks_promotion(
-                outcome.function, joern_server, result.tier_counters)
+                outcome.function, joern_server, result.tier_counters,
+                config=config)
             if _gblk:
                 logger.info(
                     "secondary-hypothesis promotion blocked %s:%s via %s — "
@@ -21334,6 +28644,7 @@ def _dispatch_secondary_hypotheses(
             )
             rescued.tools_dispatched = outcome.tools_dispatched
             rescued.tools_errored = outcome.tools_errored
+            rescued.tools_skipped = outcome.tools_skipped
             rescued.semantic_confidence = outcome.semantic_confidence
             if rescued.review_result is not None:
                 rescued.review_result["evidence_tool"] = tool
@@ -21364,18 +28675,6 @@ def _dispatch_secondary_hypotheses(
 # finding/suspicious outcomes are attacked per run.
 _MAX_ADVERSARIAL_REFUTATIONS = 64
 
-# Sweep/gate body markers whose outcomes already carry a mechanical
-# resolution — re-attacking them wastes refuter budget.
-_ADVERSARIAL_SKIP_PREFIXES = (
-    "[gate violation:",
-    "[sink-unreachability:",
-    "[guarded-sink:",
-    "[smt-infeasible:",
-    "[entry-unreachability:",
-    "[self-contradiction:",
-)
-
-
 def _adversarial_refute_pass(
     result: OrchestratorResult,
     config: OrchestratorConfig,
@@ -21383,6 +28682,7 @@ def _adversarial_refute_pass(
     *,
     joern_server=None,
     start_time: float | None = None,
+    max_workers: int = 1,
 ) -> None:
     """Post-loop pass: genuinely attack finding/suspicious hypotheses.
 
@@ -21407,6 +28707,13 @@ def _adversarial_refute_pass(
     prompt); multi-model runs prefer a refuter model different from the
     producer. Refuter failures are no-ops — an errored refutation must
     never demote anything.
+
+    Refutations are independent per outcome (each writes only its own
+    outcome slot; shared counters update under the result lock), so
+    with ``max_workers > 1`` they fan out across threads. A budget or
+    SIGTERM trip stops further dispatch — calls already in flight
+    finish and their verdicts are folded. Single-worker and
+    single-item runs keep the plain serial loop.
     """
     from .adversarial_refute import (
         VERDICT_NEEDS_EVIDENCE,
@@ -21433,11 +28740,13 @@ def _adversarial_refute_pass(
     from core.llm.client import AuthFailureTracker
     auth_tracker = AuthFailureTracker("adversarial-refute")
 
-    dispatched = 0
+    candidates: list[tuple[int, ReviewOutcome, str]] = []
     for i, outcome in enumerate(result.outcomes):
         if outcome.status not in ("finding", "suspicious"):
             continue
-        if outcome.body.startswith(_ADVERSARIAL_SKIP_PREFIXES):
+        # Gate-stamped bodies already carry a mechanical resolution —
+        # re-attacking them wastes refuter budget.
+        if outcome.body.startswith(_GATE_DEMOTION_BODY_PREFIXES):
             continue
         review = outcome.review_result or {}
         if review.get("adversarial_review"):
@@ -21445,15 +28754,48 @@ def _adversarial_refute_pass(
         hypothesis = (outcome.hypothesis or "").strip()
         if not hypothesis:
             continue
-        if dispatched >= _MAX_ADVERSARIAL_REFUTATIONS:
-            logger.info(
-                "adversarial refutation cap reached (%d) — remaining "
-                "positive outcomes keep their verdicts",
-                _MAX_ADVERSARIAL_REFUTATIONS,
-            )
-            break
-        if start_time is not None and _check_budget(config, start_time, result):
-            break
+        candidates.append((i, outcome, hypothesis))
+
+    if len(candidates) > _MAX_ADVERSARIAL_REFUTATIONS:
+        logger.info(
+            "adversarial refutation cap reached (%d) — remaining "
+            "positive outcomes keep their verdicts",
+            _MAX_ADVERSARIAL_REFUTATIONS,
+        )
+        candidates = candidates[:_MAX_ADVERSARIAL_REFUTATIONS]
+
+    # Budget/SIGTERM stop, sticky across workers: once set, no further
+    # refutations dispatch; calls already in flight finish and their
+    # verdicts are folded (the money is spent either way).
+    stop = _threading.Event()
+    # Auth-abort bookkeeping — recorded exactly once even when several
+    # workers observe the tripped tracker at the same time.
+    abort_state: dict[str, bool] = {}
+    abort_lock = _threading.Lock()
+    # Environment gate at the same per-item dispatch point as the
+    # budget poll below: the tick may pause the worker (in-flight
+    # refutations finish; nothing new starts) and a conclusion stops
+    # the pass WITH the terminal booking budget exhaustion gets —
+    # the rails poll below is conditional on start_time, so without
+    # the booking stop check a conclusion here on a start_time-less
+    # call would leave terminated_by="complete" over a faulted run.
+    _env_gate = _make_dispatch_gate(
+        config,
+        stop_check=lambda: _environment_stop_booked(config, result),
+    )
+
+    def _refute_one(item: tuple[int, ReviewOutcome, str]) -> None:
+        i, outcome, hypothesis = item
+        if stop.is_set() or auth_tracker.tripped:
+            return
+        if _env_gate is not None and _env_gate():
+            stop.set()
+            return
+        if start_time is not None and _check_budget(
+            config, start_time, result,
+        ):
+            stop.set()
+            return
 
         gap = _find_gap_in_checklist(
             checklist or {}, outcome.file, outcome.function,
@@ -21468,7 +28810,6 @@ def _adversarial_refute_pass(
         refuter_model = pick_refuter_model(
             config.models, outcome.model or "",
         )
-        dispatched += 1
         ref = run_refutation(
             llm_client,
             file=outcome.file,
@@ -21488,12 +28829,15 @@ def _adversarial_refute_pass(
                 # is refusing every call. Abort the pass loudly; a
                 # silently no-op'd adversarial pass ships findings
                 # unchallenged while claiming they were attacked.
-                try:
-                    auth_tracker.raise_if_tripped()
-                except Exception as exc:  # noqa: BLE001 — typed abort from the tracker
-                    _record_phase_abort(config, result, exc)
-                return
-            continue
+                with abort_lock:
+                    if not abort_state:
+                        try:
+                            auth_tracker.raise_if_tripped()
+                        except Exception as exc:  # noqa: BLE001 — typed abort from the tracker
+                            _record_phase_abort(config, result, exc)
+                        abort_state["aborted"] = True
+                stop.set()
+            return
 
         result.cost_tracker.record_call(
             "adversarial", cost_usd=ref.cost_usd,
@@ -21522,12 +28866,24 @@ def _adversarial_refute_pass(
         }
 
         if ref.verdict == VERDICT_STANDS:
-            result.adversarial_stands += 1
+            with result._lock:
+                result.adversarial_stands += 1
             _increment_tier_dict(
                 result.tier_counters, "adversarial_refute", "inconclusive",
             )
+            # The refuter attacked the verdict and upheld it. No
+            # receipt settled anything, so this records on a
+            # consistency axis (self_consistency held /
+            # cross_family_consistency upheld), never a merge weight.
+            _sc_record_adversarial(
+                result.scorecard_events, outcome,
+                producer_model=outcome.model or "",
+                refuter_model=ref.model or refuter_model or "",
+                verdict="stands",
+                models=config.models,
+            )
             append_audit_log(config.out_dir, log_entry)
-            continue
+            return
 
         if ref.verdict == VERDICT_NEEDS_EVIDENCE:
             # Route to dark verification — the dark pass runs after
@@ -21537,7 +28893,7 @@ def _adversarial_refute_pass(
                 result.tier_counters, "adversarial_refute", "skipped",
             )
             append_audit_log(config.out_dir, log_entry)
-            continue
+            return
 
         # ── verdict == refuted ─────────────────────────────────────
         # Named mechanical evidence: give the tools the last word.
@@ -21547,12 +28903,13 @@ def _adversarial_refute_pass(
         overturned = False
         if named_evidence:
             cwe = _effective_cwe(outcome, result.tier_counters)
+            _hint = _inventory_language_hint(config, outcome.file)
             chain = _hypothesis_to_tool_chain(
-                hypothesis, outcome.file, cwe=cwe,
+                hypothesis, outcome.file, cwe=cwe, language=_hint,
             )
             if not chain:
                 chain = _hypothesis_to_tool_chain(
-                    named_evidence, outcome.file, cwe=cwe,
+                    named_evidence, outcome.file, cwe=cwe, language=_hint,
                 )
             if chain:
                 confirmed = _run_tool_chain(
@@ -21567,6 +28924,9 @@ def _adversarial_refute_pass(
                     tier_counters=result.tier_counters,
                     joern_server=joern_server,
                     cwe=cwe,
+                    # One verification-role receipt overturns the
+                    # textual refutation on its own.
+                    early_exit_check=_promotion_grade_receipt,
                 )
                 high_prec = [
                     t for t in (confirmed or [])
@@ -21580,13 +28940,29 @@ def _adversarial_refute_pass(
                         outcome.review_result["evidence_tool"] = tool
                     outcome.review_result["adversarial_review"][
                         "overturned_by"] = tool
-                    result.adversarial_stands += 1
+                    with result._lock:
+                        result.adversarial_stands += 1
                     _increment_tier_dict(
                         result.tier_counters, "adversarial_refute",
                         "confirmed",
                     )
                     log_entry["verdict"] = "refutation_overturned"
                     log_entry["evidence_tool"] = tool
+                    # Graded adjudication, both sides: the receipt
+                    # confirmed the producer's hypothesis and
+                    # contradicted the refuter's refutation claim.
+                    _sc_record_adversarial(
+                        result.scorecard_events, outcome,
+                        producer_model=outcome.model or "",
+                        refuter_model=ref.model or refuter_model or "",
+                        verdict="refuted",
+                        defeating_mechanism=(
+                            ref.defeating_mechanism
+                            or ref.counter_argument or ""
+                        ),
+                        overturned_by=tool,
+                        models=config.models,
+                    )
                     append_audit_log(config.out_dir, log_entry)
                     logger.info(
                         "adversarial refutation overturned %s:%s — tool "
@@ -21594,7 +28970,7 @@ def _adversarial_refute_pass(
                         outcome.file, outcome.function, tool,
                     )
         if overturned:
-            continue
+            return
 
         # Demote one level, never silently below a tool receipt.
         reason = (
@@ -21605,10 +28981,11 @@ def _adversarial_refute_pass(
         if outcome.status == "finding":
             demoted = _demote_outcome(outcome, reason)
             demoted.review_result = outcome.review_result
-            result.outcomes[i] = demoted
-            result.findings -= 1
-            result.suspicious += 1
-            result.adversarial_refuted += 1
+            with result._lock:
+                result.outcomes[i] = demoted
+                result.findings -= 1
+                result.suspicious += 1
+                result.adversarial_refuted += 1
             log_entry["status"] = "suspicious"
         elif tool_backed:
             # suspicious + mechanical receipt: record the refutation,
@@ -21632,12 +29009,32 @@ def _adversarial_refute_pass(
             )
             cleaned.tools_dispatched = outcome.tools_dispatched
             cleaned.tools_errored = outcome.tools_errored
-            result.outcomes[i] = cleaned
-            result.suspicious -= 1
-            result.clean += 1
-            result.adversarial_refuted += 1
+            cleaned.tools_skipped = outcome.tools_skipped
+            with result._lock:
+                result.outcomes[i] = cleaned
+                result.suspicious -= 1
+                result.clean += 1
+                result.adversarial_refuted += 1
             log_entry["status"] = "clean"
 
+        # The refuter overruled the verdict and the pipeline demoted
+        # on its ruling — but a 1-vs-1 LLM ruling is policy, not
+        # ground truth, so this records on a consistency axis
+        # (self_consistency flipped / cross_family_consistency
+        # disputed), never a merge weight. Receipt-floored outcomes
+        # (tool_backed) stay ungraded entirely — the refutation and
+        # the receipt conflict and re-review owns the resolution.
+        if not tool_backed:
+            _sc_record_adversarial(
+                result.scorecard_events, outcome,
+                producer_model=outcome.model or "",
+                refuter_model=ref.model or refuter_model or "",
+                verdict="refuted",
+                defeating_mechanism=(
+                    ref.defeating_mechanism or ref.counter_argument or ""
+                ),
+                models=config.models,
+            )
         _increment_tier_dict(
             result.tier_counters, "adversarial_refute", "refuted",
         )
@@ -21648,6 +29045,42 @@ def _adversarial_refute_pass(
             log_entry["prior_status"], log_entry["status"],
             (ref.defeating_mechanism or ref.counter_argument)[:120],
         )
+
+    workers = max(1, max_workers)
+    if joern_server is not None:
+        # Refuted-verdict routing can dispatch a per-item tool chain
+        # through the Joern lane — same single-JVM cap as the sweep.
+        workers = min(workers, _JOERN_PASS_MAX_WORKERS)
+
+    if workers <= 1 or len(candidates) <= 1:
+        for item in candidates:
+            _refute_one(item)
+            if stop.is_set() or abort_state:
+                break
+    else:
+        from core.llm.concurrency import run_parallel
+
+        item_errors: list[tuple[int, Exception]] = []
+
+        def _on_error(
+            item: tuple[int, ReviewOutcome, str], exc: Exception,
+        ) -> None:
+            item_errors.append((item[0], exc))
+
+        run_parallel(
+            candidates, _refute_one,
+            max_workers=workers,
+            label="adversarial-refute",
+            on_error=_on_error,
+        )
+        if item_errors:
+            # Serial parity: an unexpected per-item failure aborts the
+            # pass (the call site logs it and keeps every verdict).
+            item_errors.sort(key=lambda t: t[0])
+            raise item_errors[0][1]
+
+    if abort_state:
+        return
 
     # Completed without an auth abort (the abort path returns early):
     # supersede any stale sidecar record from a prior segment.
@@ -21693,8 +29126,8 @@ def _pre_loop_smt_screen(
     _extract_sg = None
     _check_pf = None
     with contextlib.suppress(ImportError):
-        from .condition_extraction import extract_sink_guards as _extract_sg
-        from .condition_smt import check_path_feasibility as _check_pf
+        from .condition_extraction import extract_sink_guards as _extract_sg  # type: ignore[assignment]
+        from .condition_smt import check_path_feasibility as _check_pf  # type: ignore[assignment]
 
     dm = None
     if getattr(config, "out_dir", None):
@@ -21725,7 +29158,7 @@ def _pre_loop_smt_screen(
             continue
 
         tool_hit = ""
-        with contextlib.suppress(*_SMT_SCREEN_ERRORS):
+        with contextlib.suppress(*_SMT_SCREEN_ERRORS):  # type: ignore[arg-type]
             abr = check_auth_bypass(source, vocab)
             if abr.bypass_found:
                 tool_hit = "smt:check-auth-bypass"
@@ -21733,7 +29166,7 @@ def _pre_loop_smt_screen(
                     tool_hit += ":witness"
 
         if not tool_hit and is_c:
-            with contextlib.suppress(*_SMT_SCREEN_ERRORS):
+            with contextlib.suppress(*_SMT_SCREEN_ERRORS):  # type: ignore[arg-type]
                 ldr = check_lock_discipline(source, vocab)
                 if ldr.violation_found:
                     tool_hit = "smt:check-lock-discipline"
@@ -21741,7 +29174,7 @@ def _pre_loop_smt_screen(
                         tool_hit += ":witness"
 
         if not tool_hit and is_c:
-            with contextlib.suppress(*_SMT_SCREEN_ERRORS):
+            with contextlib.suppress(*_SMT_SCREEN_ERRORS):  # type: ignore[arg-type]
                 rlr = check_resource_leak(source, vocab)
                 if rlr.leak_found:
                     tool_hit = "smt:check-resource-leak"
@@ -21749,13 +29182,13 @@ def _pre_loop_smt_screen(
                         tool_hit += ":witness"
 
         if not tool_hit and is_c:
-            with contextlib.suppress(*_SMT_SCREEN_ERRORS):
+            with contextlib.suppress(*_SMT_SCREEN_ERRORS):  # type: ignore[arg-type]
                 npr = check_null_propagation(source, vocab)
                 if npr.null_deref_found:
                     tool_hit = "smt:check-null-propagation"
 
         if not tool_hit and is_c_or_go:
-            with contextlib.suppress(*_SMT_SCREEN_ERRORS):
+            with contextlib.suppress(*_SMT_SCREEN_ERRORS):  # type: ignore[arg-type]
                 inr = check_integer_narrowing(source)
                 if inr.narrowing_found:
                     tool_hit = "smt:check-integer-narrowing"
@@ -21763,7 +29196,7 @@ def _pre_loop_smt_screen(
                         tool_hit += ":witness"
 
         if not tool_hit and is_c_or_go:
-            with contextlib.suppress(*_SMT_SCREEN_ERRORS):
+            with contextlib.suppress(*_SMT_SCREEN_ERRORS):  # type: ignore[arg-type]
                 # Same-file parse wrappers (the stdlib idiom puts the
                 # strconv call one helper away from the consumer):
                 # derived once per file, mechanically, from the file
@@ -21785,13 +29218,13 @@ def _pre_loop_smt_screen(
                     tool_hit = "smt:check-parsed-int-contract"
 
         if not tool_hit and is_c_or_go:
-            with contextlib.suppress(*_SMT_SCREEN_ERRORS):
+            with contextlib.suppress(*_SMT_SCREEN_ERRORS):  # type: ignore[arg-type]
                 err = check_early_release(source, vocab)
                 if err.early_release_found:
                     tool_hit = "smt:check-early-release"
 
         if not tool_hit and is_c:
-            with contextlib.suppress(*_SMT_SCREEN_ERRORS):
+            with contextlib.suppress(*_SMT_SCREEN_ERRORS):  # type: ignore[arg-type]
                 from .callback_lifetime import check_callback_lifetime_local
                 clr = check_callback_lifetime_local(source, vocab)
                 if clr.violation_found:
@@ -21802,7 +29235,7 @@ def _pre_loop_smt_screen(
         # instead — results go to the LLM as context, not as verdicts.
 
         if not tool_hit and is_c:
-            with contextlib.suppress(*_SMT_SCREEN_ERRORS):
+            with contextlib.suppress(*_SMT_SCREEN_ERRORS):  # type: ignore[arg-type]
                 ttr = check_toctou(source)
                 if ttr.toctou_found:
                     tool_hit = "smt:check-toctou"
@@ -21851,7 +29284,7 @@ def _pre_loop_smt_screen(
                         continue
 
         if is_c and not tool_hit:
-            with contextlib.suppress(*_SMT_SCREEN_ERRORS):
+            with contextlib.suppress(*_SMT_SCREEN_ERRORS):  # type: ignore[arg-type]
                 from .condition_smt import check_race_protection
                 rpr = check_race_protection(source, vocab)
                 if rpr.protected:
@@ -21902,8 +29335,18 @@ def _promote_smt_clean(
         dm, target_path=config.target_path,
     )
 
+    binary_skipped = 0
     for i, outcome in enumerate(result.outcomes):
         if outcome.status != "clean":
+            continue
+
+        if outcome.file.startswith(BINARY_PATH_PREFIX):
+            # Binary outcomes carry no source path or line geometry:
+            # _read_raw_source can never resolve them, so the checks
+            # below are unreachable — without this gate the line=0
+            # warning fires once per binary function on the way to
+            # that dead end.
+            binary_skipped += 1
             continue
 
         is_c = any(outcome.file.endswith(ext) for ext in _C_EXTS)
@@ -22071,6 +29514,12 @@ def _promote_smt_clean(
                 outcome.file, outcome.function, tool_hit,
             )
 
+    if binary_skipped:
+        logger.debug(
+            "smt-clean: %d binary outcome(s) skipped — no source "
+            "geometry for the source-SMT checks", binary_skipped,
+        )
+
 
 def _demote_self_contradictions(result: OrchestratorResult) -> None:
     """Demote suspicious outcomes where every hypothesis is refuted.
@@ -22079,14 +29528,34 @@ def _demote_self_contradictions(result: OrchestratorResult) -> None:
     'suspicious' with no tool evidence, the verdict is self-
     contradictory.  Verified safe: all corpus TPs with no evidence
     have at least one unrefuted hypothesis.
+
+    Grounding gate (mirrors the in-review all-refuted block): the
+    demotion fires only when every refutation is grounded in a local,
+    non-delegated counter. Outcomes the review already withheld
+    (``all_refuted_demotion_withheld``) and machine-raised
+    counter-escalations stay suspicious — their refutations are
+    unverified claims routed to the verification lane, and this
+    post-loop net must not silently erase what the in-review gate
+    deliberately kept alive.
     """
     from .evidence_grade import is_tool_evidence
+    from .llm_review import _refutation_grounded
     for i, outcome in enumerate(result.outcomes):
         if outcome.status != "suspicious":
             continue
         # Truthiness let "llm-claimed:X" (the LLM's own assertion)
         # shield the outcome from its own self-contradiction check.
         if is_tool_evidence(outcome.evidence_tool or ""):
+            continue
+        # Counter-escalation evidence floor: a machine-raised
+        # suspicious (the model concluded clean) is un-raised only by
+        # a verification-grade receipt, never by the model's own
+        # refutation record — and nothing reaching this point carries
+        # a receipt (the firewall check above skipped those).
+        if _is_counter_escalated(outcome):
+            continue
+        rr = outcome.review_result or {}
+        if rr.get("all_refuted_demotion_withheld"):
             continue
 
         hypotheses = outcome.hypotheses or []
@@ -22101,6 +29570,8 @@ def _demote_self_contradictions(result: OrchestratorResult) -> None:
             for h in hypotheses
         )
         if not all_refuted:
+            continue
+        if not all(_refutation_grounded(h) for h in hypotheses):
             continue
 
         result.outcomes[i] = ReviewOutcome(
@@ -22119,6 +29590,15 @@ def _demote_self_contradictions(result: OrchestratorResult) -> None:
         )
         result.suspicious -= 1
         result.clean += 1
+        # Graded adjudication: the verdict contradicted the model's
+        # own hypothesis record (consistency axis, not correctness).
+        _sc_record_self_consistency(
+            result.scorecard_events, outcome,
+            detail=(
+                f"all {len(hypotheses)} hypotheses marked refuted yet "
+                "the verdict was suspicious"
+            ),
+        )
         logger.info(
             "self-contradiction demotion: %s:%s — all %d hypotheses refuted",
             outcome.file, outcome.function, len(hypotheses),
@@ -22183,6 +29663,15 @@ def _promote_hypothesis_inconsistent(result: OrchestratorResult) -> None:
         result.outcomes[i] = promoted
         result.clean -= 1
         result.suspicious += 1
+        # Graded adjudication: the clean verdict contradicted the
+        # model's own live hypotheses (consistency axis).
+        _sc_record_self_consistency(
+            result.scorecard_events, outcome,
+            detail=(
+                f"clean verdict despite {len(unrefuted)} unrefuted "
+                f"high/medium-confidence hypothesis(es): {mechanism}"
+            ),
+        )
         logger.info(
             "hypothesis-consistency promotion: %s:%s — %d unrefuted "
             "high-confidence hypothesis(es) despite clean verdict (%s)",
@@ -22276,6 +29765,7 @@ def _demote_absent_promotions(
         )
         demoted.tools_dispatched = outcome.tools_dispatched
         demoted.tools_errored = outcome.tools_errored
+        demoted.tools_skipped = outcome.tools_skipped
         # Pure in-repo grading over constant inputs — only a partial
         # install (import failure) can legitimately fail here.
         with contextlib.suppress(ImportError):
@@ -22328,8 +29818,17 @@ def _demote_absent_promotions(
     return demoted_count
 
 
-def _promote_outcome(outcome: ReviewOutcome, tool: str) -> ReviewOutcome:
-    """Promote a suspicious item to finding with tool evidence."""
+def _promote_outcome(
+    outcome: ReviewOutcome,
+    tool: str,
+    *,
+    provisional: bool = False,
+) -> ReviewOutcome:
+    """Promote a suspicious item to finding with tool evidence.
+
+    ``provisional`` marks a cadence-tick promotion the post-loop
+    finalization must still confirm or retract.
+    """
     promoted = ReviewOutcome(
         file=outcome.file,
         function=outcome.function,
@@ -22346,10 +29845,12 @@ def _promote_outcome(outcome: ReviewOutcome, tool: str) -> ReviewOutcome:
     )
     promoted.tools_dispatched = outcome.tools_dispatched
     promoted.tools_errored = outcome.tools_errored
+    promoted.tools_skipped = outcome.tools_skipped
     promoted.semantic_confidence = outcome.semantic_confidence
     promoted.function_qualified = getattr(
         outcome, "function_qualified", "",
     )
+    promoted.provisional = provisional
     if promoted.review_result:
         promoted.review_result["evidence_tool"] = tool
     return promoted
@@ -22770,7 +30271,17 @@ def _rejournal_final_statuses(
             continue
         key = make_function_key(outcome.file, outcome.function)
         prior = entries.get(key)
-        if prior is None or prior.verdict == outcome.status:
+        if prior is None:
+            continue
+        # A latest row still marked provisional needs a confirming
+        # corrective row even when the verdict itself did not drift —
+        # finalization cleared the outcome's mark, and without the
+        # append the durable journal would forever claim the finding
+        # is unsettled (verdict reuse refuses provisional rows).
+        _confirm_provisional = bool(
+            getattr(prior, "provisional", False),
+        ) and not getattr(outcome, "provisional", False)
+        if prior.verdict == outcome.status and not _confirm_provisional:
             continue
         # Carry the corrected entry's span AND strategy record
         # forward. The old minimal gap ({"line_start": line})
@@ -22801,7 +30312,7 @@ def _rejournal_final_statuses(
             append_journal_for_outcome(
                 out_dir=config.out_dir,
                 target_path=config.target_path,
-                run_id=(config.out_dir.name if config.out_dir else ""),
+                run_id=_resolved_run_id(config.out_dir),
                 outcome=outcome,
                 gap=gap,
             )
@@ -22837,12 +30348,20 @@ def _relog_final_statuses(
     ``strategies`` so strategy_stats never double-counts a function.
     Must run AFTER the collector flush — the buffered mid-loop rows
     have to land first for last-row-wins ordering to hold.
+
+    The join reads VERIFIED rows only: it decides which corrective
+    rows reach the log, so a planted last row matching the final
+    status would suppress the correction and leave the forged row as
+    the last word for every last-row-per-key consumer. An unverified
+    row is invisible to the join — correction decisions come from
+    genuine history alone (a legacy unstamped trail simply gets no
+    corrections, the never-logged shape).
     """
     if not config.out_dir:
         return 0
     try:
         last_status: dict[str, str] = {}
-        for entry in load_audit_log(config.out_dir):
+        for entry in load_verified_audit_log(config.out_dir):
             if entry.get("action") not in (
                 "orchestrator_review", "sweep_promotion",
             ):
@@ -22945,9 +30464,21 @@ def _resolve_gate_demoted(
     No LLM calls.
     """
     joern_up = bool((available_tools or {}).get("joern"))
+    from .promotion_alarm import is_reuse_exempt
 
     for i, outcome in enumerate(result.outcomes):
         if outcome.status != "suspicious":
+            continue
+        if is_reuse_exempt(outcome):
+            # Cross-run reused verdict: the origin run's already-gated
+            # suspicious, re-asserted at $0 with its evidence
+            # deliberately downgraded to ``journal:recall:<run>``
+            # provenance (verdict_reuse doctrine — the LLM_ONLY tier
+            # cap is the designed penalty, not erasure). Resolving it
+            # here off THIS run's silence would decay every reused
+            # suspicious toward clean/dark on each import — the same
+            # one-way decay the promotion-alarm chokepoints exempt
+            # reuse for, and no lane in this run adjudicated the row.
             continue
         gate_demoted = outcome.body.startswith(_GATE_DEMOTED_PREFIXES)
         if not gate_demoted and _is_machine_raised(outcome):
@@ -23006,6 +30537,7 @@ def _resolve_gate_demoted(
             )
             resolved.tools_dispatched = outcome.tools_dispatched
             resolved.tools_errored = outcome.tools_errored
+            resolved.tools_skipped = outcome.tools_skipped
             result.outcomes[i] = resolved
             result.suspicious -= 1
             result.clean += 1
@@ -23137,6 +30669,7 @@ def _resolve_gate_demoted(
             )
             resolved.tools_dispatched = outcome.tools_dispatched
             resolved.tools_errored = outcome.tools_errored
+            resolved.tools_skipped = outcome.tools_skipped
             result.outcomes[i] = resolved
             result.suspicious -= 1
             result.clean += 1
@@ -23163,6 +30696,7 @@ def _resolve_gate_demoted(
             )
             resolved.tools_dispatched = outcome.tools_dispatched
             resolved.tools_errored = outcome.tools_errored
+            resolved.tools_skipped = outcome.tools_skipped
             result.outcomes[i] = resolved
             result.suspicious -= 1
             result.dormant += 1
@@ -23191,11 +30725,10 @@ def _try_block_level_context(
         try_build_cfg,
     )
 
-    full_path = config.target_path / gap["file"]
-    try:
-        raw_source = full_path.read_text(errors="replace") if full_path.exists() else ""
-    except OSError:
-        raw_source = ""
+    # Confined: the derived text lands in a priority-0 prompt section,
+    # so an escaping gap path would quote arbitrary host files at the
+    # reviewer (defend_repo_text sanitises but does not stop the read).
+    raw_source = _contained_source_text(config.target_path, gap["file"]) or ""
 
     cfg = try_build_cfg(
         gap["file"],
@@ -23326,8 +30859,19 @@ def _review_flow_traces(
         f"{o.file}:{o.function}" for o in result.outcomes if o.status == "clean"
     }
 
+    # Environment gate per trace dispatch: the rails poll below is
+    # conditional on start_time, so the gate carries the booking stop
+    # check — a conclusion detected here must book the environment
+    # stop, not leave the run reporting complete.
+    _env_gate = _make_dispatch_gate(
+        config,
+        stop_check=lambda: _environment_stop_booked(config, result),
+    )
+
     traces_reviewed = 0
     for trace_file in trace_files[:10]:
+        if _env_gate is not None and _env_gate():
+            break
         if start_time and _check_budget(config, start_time, result):
             break
 
@@ -23380,7 +30924,9 @@ def _review_flow_traces(
             "file": sf or skf,
             "function": f"flow:{source.get('name', '?')}→{sink.get('name', '?')}",
             "source": source.get("source", ""),
-            "flow_trace": trace,
+            # The hop summaries are the rendered flow context; the
+            # raw trace artifact had no consumer downstream of this
+            # dict.
             "flow_hops": hop_summaries,
             "review_mode": "flow",
             "trace_id": trace.get("id", trace_file.stem),
@@ -23429,9 +30975,195 @@ def _review_flow_traces(
     return result
 
 
+def _journal_finding_outcomes(
+    local_outcomes: list[ReviewOutcome],
+    config: OrchestratorConfig,
+) -> list[ReviewOutcome]:
+    """Prior-segment findings re-materialised from this run's own journal.
+
+    ``result.outcomes`` holds only THIS segment's reviews; a resumed
+    run's earlier segments live in the journal alone. The findings
+    persist is an idempotent full rewrite, so a finalize-only resume
+    segment (verdict re-import screened out, or a $0 finalize budget)
+    rewrote findings.json down to its segment-local outcomes — erasing
+    every prior-segment finding the journal still asserted. Journal
+    authority mirrors the report join
+    (``report._apply_journal_verdict_overrides``): the latest
+    function-grade, non-mechanical-echo row per site decides, so a
+    site whose finding a later correction row demoted stays out.
+    Functions with ANY outcome in this segment are skipped — the live
+    outcome (including a post-pass demotion not yet re-journalled)
+    supersedes its own earlier journal rows. Never raises.
+
+    Transport tiering (row MAC + run scope, the journal export's
+    contract — see ``findings_export``): the journal lives in the
+    target-writable run dir, and this seam re-materialises rows
+    straight into ``findings.json``, so a planted "finding" line
+    shipped a phantom finding on every resumed finalize segment.
+    Unstamped/tampered rows are refused outright — and the gap fold
+    denies hash-tier review credit to finding-class rows, so a
+    refused honest row's function genuinely re-reviews next segment
+    (the two gates agree; neither silent loss nor a phantom).
+    Verified rows are NEVER refused for scope — a verified row
+    cannot be attacker-minted — but raw tool receipts require a
+    MAC-covered ``run_path`` matching THIS resolved run dir
+    (basenames collide across projects; a byte-copied same-named
+    sibling journal must not resurrect receipts minted against a
+    different codebase). Everything else verified — unattributed
+    legacy rows, renamed/relocated own runs, sibling rows — keeps
+    the finding but re-imports receipt-less: each
+    ``evidence_tools`` element rides per-"+"-part through the
+    LLM-tier sanitizer so it can never pass ``_is_tool_confirmed``
+    and mint ``confirmed_by`` receipts downstream.
+    """
+    out_dir = getattr(config, "out_dir", None)
+    if not out_dir:
+        return []
+    try:
+        from core.coverage import journal_mac
+        from core.coverage.journal import (
+            RUN_ID_UNATTRIBUTED,
+            latest_function_grade_collapse,
+        )
+
+        from .journal import is_mechanical_echo, load_entries
+
+        entries = [
+            e for e in load_entries(Path(out_dir))
+            if not is_mechanical_echo(e)
+        ]
+        if not entries:
+            return []
+        # The re-importing run's identity: the FULL resolved run-dir
+        # path, matching what ``append_entry`` stamps into the MAC-
+        # covered ``run_path`` field at write time. Basenames collide
+        # across projects (operator-chosen ``--out`` names), so raw
+        # receipts key on the full path — and resolving on BOTH sides
+        # keeps a symlinked ``--out`` spelling (writer) and its
+        # resolved form (reader) in agreement.
+        try:
+            run_path_identity = str(Path(out_dir).resolve())
+        except OSError:
+            run_path_identity = str(out_dir)
+        local_keys = {(o.file, o.function) for o in local_outcomes}
+        collapsed = latest_function_grade_collapse(entries)
+        outcomes: list[ReviewOutcome] = []
+        refused_unverified = 0
+        demoted_foreign = 0
+        for site_key in sorted(collapsed):
+            entry = collapsed[site_key]
+            if entry.verdict != "finding":
+                continue
+            # Deliberately COARSE (file, function) dedup against the
+            # segment-local outcomes, while the collapse above is
+            # per-site. Trade-off, both directions weighed:
+            # site-exact dedup would preserve a twin site's journal
+            # finding when this segment re-reviewed only its
+            # same-named sibling (macro redefinition / C++ overload),
+            # but ``outcome.line`` and the journal's ``line_start``
+            # are not guaranteed to agree (re-review after drift,
+            # line-less outcomes), so a site-joined key would
+            # DUPLICATE one finding — once from the live outcome,
+            # once from its own stale journal row. A dropped
+            # twin-site finding resurfaces on the next segment's
+            # re-review; a duplicated finding ships a phantom. Fail
+            # toward the recoverable direction.
+            if (entry.file, entry.function) in local_keys:
+                continue
+            if (journal_mac.entry_provenance(entry)
+                    != journal_mac.ROW_VERIFIED):
+                refused_unverified += 1
+                logger.debug(
+                    "journal finding re-import: refusing %s:%s "
+                    "(unstamped/tampered row)",
+                    entry.file, entry.function,
+                )
+                continue
+            run_scoped = bool(
+                run_path_identity
+                and entry.run_path == run_path_identity
+            )
+            hypotheses = [
+                h for h in (entry.hypotheses or [])
+                if isinstance(h, dict) and h.get("mechanism")
+            ]
+            if run_scoped:
+                # This run's own MAC-covered record — the in-session
+                # record gate enforced tool grounding at record time,
+                # so the journaled receipt stamp rides through whole.
+                evidence_tool = "+".join(entry.evidence_tools or [])
+            else:
+                # Verified but not THIS run dir: unattributed
+                # grandfather, a renamed/relocated own run, or a
+                # same-key sibling row. The finding survives — a
+                # verified row cannot be attacker-minted — but the
+                # receipts do not: tool receipts assert "these tools
+                # ran HERE against THIS target", which only a full-
+                # path match proves. Attributed-elsewhere rows are
+                # counted for the summary warning; sanitisation is
+                # per "+"-PART within each element (a composite
+                # legacy element like "note+dynamic:sanitizer" must
+                # not leak a raw verification-grade part to
+                # split-on-"+" consumers such as
+                # _is_verification_evidence_for_gate).
+                if entry.run_path or (
+                    entry.run_id
+                    and entry.run_id != RUN_ID_UNATTRIBUTED
+                ):
+                    demoted_foreign += 1
+                    logger.debug(
+                        "journal finding re-import: %s:%s verified "
+                        "but attributed elsewhere (run_path=%r) — "
+                        "re-imported receipt-less",
+                        entry.file, entry.function, entry.run_path,
+                    )
+                evidence_tool = "+".join(
+                    p
+                    for t in (entry.evidence_tools or [])
+                    for p in (
+                        _sanitize_llm_et(part.strip())
+                        for part in str(t).split("+")
+                    )
+                    if p
+                )
+            outcome = ReviewOutcome(
+                file=entry.file,
+                function=entry.function,
+                status="finding",
+                body=entry.body or "",
+                hypothesis=hypotheses[0]["mechanism"] if hypotheses else "",
+                hypotheses=hypotheses or None,
+                evidence_tool=evidence_tool,
+                model=entry.model or "",
+            )
+            outcome.line = entry.line_start or 0
+            outcome.provisional = bool(entry.provisional)
+            outcomes.append(outcome)
+        if refused_unverified or demoted_foreign:
+            logger.warning(
+                "journal finding re-import: refused %d unstamped/"
+                "tampered finding row(s) (not re-materialised into "
+                "findings.json; the gap fold denies hash-tier credit "
+                "to finding-class rows, so an honest refused row's "
+                "function re-reviews next segment) and re-imported "
+                "%d verified row(s) attributed to another run dir "
+                "receipt-less (finding kept, tool receipts demoted "
+                "to the llm-claimed tier)",
+                refused_unverified, demoted_foreign,
+            )
+        return outcomes
+    except Exception:
+        logger.debug(
+            "journal finding re-import for findings persist failed",
+            exc_info=True,
+        )
+        return []
+
+
 def _persist_findings(
     result: OrchestratorResult,
     config: OrchestratorConfig,
+    vendor_verdicts: dict[str, Any] | None = None,
 ) -> None:
     """Write all findings to findings.json so they survive even without /validate.
 
@@ -23439,10 +31171,39 @@ def _persist_findings(
     after status-mutating post passes — late-minted findings appear,
     retracted ones disappear.  A run with zero findings only rewrites
     an EXISTING findings.json (to empty); it never creates one.
+
+    ``vendor_verdicts``: the prep-time per-file vendored/generated map
+    when the caller has one (the _run_audit_body persists thread it);
+    absent — the incremental-promotion tick's mid-run ride-along — the
+    tree-class stamp falls back to path-only classification, and the
+    final unconditional re-persist converges the records on the
+    verdict-refined value.
     """
+    from .findings import stamp_function_attribution
+    from .gaps import load_checklist
+    from .tree_class import classify_tree_class
+
+    # Attribution chokepoint input: the row seam validates each
+    # outcome's function name against the checklist (a phantom
+    # extractor item can carry a CALLEE name — see
+    # resolve_function_attribution). Loaded once per persist; the
+    # journal/coverage layers keep the AS-REVIEWED name, only the
+    # export row is corrected.
+    checklist = load_checklist(config.out_dir) if config.out_dir else {}
+
     findings_dicts = []
+    # Snapshot: the incremental-promotion tick calls this mid-loop
+    # while review workers are still appending outcomes.
+    local_outcomes = list(result.outcomes)
+    # Prior-segment findings whose FINAL journal verdict still stands
+    # ride through the SAME dict builder below (identical tree-class
+    # stamping, receipt recording and provisional handling) — never a
+    # second, weaker persist lane.
+    all_outcomes = local_outcomes + _journal_finding_outcomes(
+        local_outcomes, config,
+    )
     for seq, outcome in enumerate(
-        (o for o in result.outcomes if o.status == "finding"),
+        (o for o in all_outcomes if o.status == "finding"),
         start=1,
     ):
         finding: dict[str, Any] = {
@@ -23454,11 +31215,29 @@ def _persist_findings(
             "description": outcome.body,
             "severity": "medium",
             "source": "audit",
+            # Tree class (core.audit.tree_class vocabulary) — always
+            # stamped, matching emit_finding and the graded export.
+            # This writer was the one findings.json emission path
+            # without the tag, so every finding it persisted (the
+            # in-session audit loop's regular, sweep-promoted, and
+            # tick-provisional findings alike) shipped untagged and
+            # readers fell back to reclassifying per consumer.
+            "tree_class": classify_tree_class(
+                str(outcome.file or ""), vendor_verdicts,
+            ),
         }
         if outcome.evidence_tool:
             finding["evidence_tool"] = outcome.evidence_tool
         if outcome.hypothesis:
             finding["hypothesis"] = outcome.hypothesis
+        if getattr(outcome, "provisional", False):
+            # Cadence-tick promotion not yet finalized — present only
+            # in mid-run persists and in runs interrupted before the
+            # post-loop confirmation pass.
+            finding["provisional"] = True
+        stamp_function_attribution(
+            finding, checklist, target_path=config.target_path,
+        )
         findings_dicts.append(finding)
 
     if not findings_dicts and not (
@@ -23555,7 +31334,12 @@ def _is_verification_evidence_for_gate(outcome: ReviewOutcome) -> bool:
 
     Returns True when the outcome carries evidence strong enough to
     prevent the suspicious→clean demotion.  Delegates to the pipeline's
-    _is_verification_evidence which handles role checks.
+    _is_verification_evidence, which handles role checks AND the
+    composite parse itself (per-``+``-part allowlist scan that stops
+    at the first ``llm-claimed:`` part).  Splitting here and passing
+    parts individually would defeat that boundary: the tail of a
+    sanitized model claim (``llm-claimed:smt+joern`` → ``joern``)
+    arrived as a standalone part and qualified as a receipt.
     """
     ev = outcome.evidence_tool or ""
     if not ev:
@@ -23573,7 +31357,7 @@ def _is_verification_evidence_for_gate(outcome: ReviewOutcome) -> bool:
     if not ev:
         return False
     from .pipeline import _is_verification_evidence
-    return any(_is_verification_evidence(part.strip()) for part in ev.split("+"))
+    return _is_verification_evidence(ev)
 
 
 _COUNTER_ESCALATION_PREFIX = "[counter-hypothesis escalation:"
@@ -23704,6 +31488,113 @@ def _stamp_evidence(outcome: ReviewOutcome, tool: str) -> ReviewOutcome:
     outcome.evidence_tool = tool
     if outcome.review_result:
         outcome.review_result["evidence_tool"] = tool
+    return outcome
+
+
+# The pre-loop screen's confirming receipt kinds — the exact verbs
+# whose hits `_pre_loop_smt_screen` injects as `_smt_pre_evidence`
+# (`smt:<verb>`, optionally `:witness`-suffixed). Restoration is
+# allowlist-gated in BOTH directions: a receipt kind this table does
+# not name is NEVER re-stamped over a model restatement (a
+# non-confirming or unknown receipt granting tool provenance would be
+# the inverse of the laundering this helper exists to stop — the
+# screen's own `smt:dead-path` infeasibility observation is the
+# standing example), and a new screen check that mints a new receipt
+# verb must be added here or its receipt stays prompt-only (the
+# unknown-verb regression test pins that direction). A stale entry
+# for a removed check is harmless: no producer mints the receipt.
+_SCREEN_CONFIRMING_VERBS = frozenset({
+    "check-auth-bypass",
+    "check-lock-discipline",
+    "check-resource-leak",
+    "check-null-propagation",
+    "check-integer-narrowing",
+    "check-parsed-int-contract",
+    "check-early-release",
+    "check-callback-lifetime",
+    "check-toctou",
+    # check-lock-domain runs in inject-mode only (_run_mechanical_
+    # detectors context, "too noisy for hard-classify") — the screen
+    # never mints its receipt today, so this entry is dormant until a
+    # screen check is (re-)added for the verb.
+    "check-lock-domain",
+})
+
+
+def _screen_receipt_confirms(receipt: str) -> bool:
+    """True only for a receipt shape the screen mints as a confirming
+    hit: ``smt:<allowlisted verb>`` with an optional ``:witness``
+    suffix. Anything else — ``smt:dead-path``, an unknown future verb,
+    a non-smt namespace, extra segments — fails closed (no restore)."""
+    low = receipt.lower()
+    if not low.startswith("smt:"):
+        return False
+    rest = low[len("smt:"):]
+    if rest.endswith(":witness"):
+        rest = rest[: -len(":witness")]
+    return rest in _SCREEN_CONFIRMING_VERBS
+
+
+def _restore_screen_receipt(
+    outcome: ReviewOutcome,
+    pre_evidence: str,
+) -> ReviewOutcome:
+    """Re-stamp the pre-loop screen's confirming receipt over a
+    model restatement of the same tool.
+
+    The screen runs its checks mechanically and injects a confirming
+    receipt into the review prompt as context. The model then restates
+    the tool in its evidence_tool answer, and sanitisation (correctly)
+    namespaces that restatement to ``llm-claimed:*`` — but nothing
+    wrote the run's own receipt back onto the non-clean outcome (the
+    clean rescue path is the only pre_evidence consumer), so the row
+    travelled tool-less and lost the verification-evidence exemptions
+    downstream. Restore the receipt when ALL of:
+
+    - the outcome is finding/suspicious (clean outcomes have their own
+      pre_evidence consumer: ``rescue_self_refuted``);
+    - the screen receipt is an allowlisted confirming kind
+      (``_screen_receipt_confirms`` — ``smt:dead-path``, unknown
+      future receipt kinds, and malformed shapes all fail closed);
+    - the current evidence is not already a genuine tool stamp; and
+    - the model's evidence restates the receipt's tool family. The
+      family grammar matches ``_probe_backed_suspicious``'s parse
+      (``claimed.split(":", 1)[0]``), but the comparison here is
+      STRICTER: exact equality with the receipt's family, where the
+      dispatch-witness check accepts a ``startswith`` match against
+      the dispatch record.
+
+    A claim with no matching receipt in the run's own records stays
+    under ``llm-claimed:``: this never grants tool-evidence status to
+    a tool the run did not actually run.
+    """
+    if outcome.status not in ("finding", "suspicious"):
+        return outcome
+    receipt = (pre_evidence or "").strip()
+    if not receipt or not _screen_receipt_confirms(receipt):
+        return outcome
+    ev = outcome.evidence_tool or ""
+    if _is_tool_confirmed(ev):
+        return outcome
+
+    from .evidence_grade import LLM_CLAIM_PREFIX
+
+    receipt_family = receipt.lower().split(":", 1)[0].strip()
+    for part in (p.strip() for p in ev.split("+")):
+        if not part.lower().startswith(LLM_CLAIM_PREFIX):
+            continue
+        claimed = part[len(LLM_CLAIM_PREFIX):].strip().lower()
+        fam = claimed.split(":", 1)[0].strip()
+        if fam and fam == receipt_family:
+            outcome.tools_dispatched = (
+                set(outcome.tools_dispatched or set()) | {receipt_family}
+            )
+            logger.info(
+                "screen-receipt restore %s:%s — %r was restated as %r; "
+                "stamping the run's own receipt",
+                outcome.file, outcome.function, receipt, part,
+            )
+            return _stamp_evidence(outcome, receipt)
     return outcome
 
 
@@ -23885,6 +31776,7 @@ def _demote_outcome(outcome: ReviewOutcome, reason: str) -> ReviewOutcome:
     )
     demoted.tools_dispatched = outcome.tools_dispatched
     demoted.tools_errored = outcome.tools_errored
+    demoted.tools_skipped = outcome.tools_skipped
     demoted.semantic_confidence = outcome.semantic_confidence
     demoted.provenance_all_trusted = outcome.provenance_all_trusted
     demoted.function_qualified = getattr(
@@ -23923,7 +31815,7 @@ def _extract_and_propagate(
 
     while pending and rounds < _MAX_PROPAGATION_ROUNDS:
         rounds += 1
-        next_pending = []
+        next_pending: list[Any] = []
 
         for c in pending:
             try:
@@ -23939,12 +31831,14 @@ def _extract_and_propagate(
                 elif result.resolved and result.resolution == "depth_limited":
                     c.status = "depth_limited"
                     c.depth_reached = prop_config.max_depth
-                elif not result.resolved:
-                    derived = getattr(result, "derived_constraints", [])
-                    for dc in derived:
-                        constraints = merge_constraint(constraints, dc)
-                    new_open = list(open_constraints(derived))
-                    next_pending.extend(new_open)
+                # "confirmed" resolutions stay evidence-only (see the
+                # consumption contract in core/audit/propagation.py) —
+                # consuming them as a verdict change would be a new
+                # promotion path outside the tool-verdict chokepoints.
+                # Unresolved results carry only advisory
+                # callers_scheduled; no resolver derives child
+                # constraints, so there is nothing to feed later
+                # rounds and the loop drains in a single pass today.
             except Exception:
                 logger.debug(
                     "propagation failed for %s:%s",
@@ -24067,7 +31961,7 @@ def _re_review_joern_enriched(
     )
 
     # --- Build all contexts up-front ---
-    prepared = []
+    prepared: list[Any] = []
     for gap, prior_outcome in candidates:
         ctx = _build_context(
             config,
@@ -24083,7 +31977,6 @@ def _re_review_joern_enriched(
                 gap["file"],
                 gap["name"],
             )
-        ctx["joern_re_review"] = True
         prior_hyps = _prior_hypotheses_for(prior_outcome)
         if prior_hyps:
             ctx["prior_hypotheses"] = prior_hyps
@@ -24097,12 +31990,16 @@ def _re_review_joern_enriched(
         except Exception as exc:  # noqa: BLE001
             return (idx, None, exc)
 
+    def _stop_rails() -> bool:
+        return _check_budget(config, start_time, result)
+
     raw_results = _collect_reviews_until_budget(
         prepared,
         _do_review,
-        lambda: _check_budget(config, start_time, result),
+        _stop_rails,
         effective_workers,
         phase_label="joern re-review",
+        dispatch_gate=_make_dispatch_gate(config, stop_check=_stop_rails),
     )
 
     # --- Process results in main thread ---
@@ -24120,6 +32017,13 @@ def _re_review_joern_enriched(
             continue
 
         outcome.line = gap.get("line_start", 0)
+        # Phase ledger — the call cost money whether or not the
+        # verdict changed (deepen's booking is the template).
+        result.cost_tracker.record_call(
+            "re_review",
+            cost_usd=outcome.cost_usd,
+            wall_time_s=outcome.duration_s,
+        )
 
         if outcome.status in ("finding", "suspicious"):
             if outcome.status == "finding" and config.sweep_validate_findings:
@@ -24190,6 +32094,12 @@ def _re_review_joern_enriched(
                 gap["name"],
                 outcome.status,
             )
+        else:
+            # Kept the prior verdict — the re-review call still spent
+            # real money; accepted verdicts book it via _tally_outcome
+            # above (deepen's dominated branch is the template).
+            with result._lock:
+                result.total_cost_usd += outcome.cost_usd
 
     return result
 
@@ -24260,22 +32170,14 @@ def _callee_contract_requeue(
     )
 
     effective_workers = max(1, max_workers)
-    prepared = []
+    prepared: list[Any] = []
     cl = checklist if isinstance(checklist, dict) else {}
-    cl_entries = [
-        {**item, "file": fi.get("path", "")}
-        for fi in cl.get("files", [])
-        for item in fi.get("items", [])
-    ] if cl else []
+    cl_index = _checklist_item_index(cl) if cl else {}
     for caller_outcome, callee_name, assumption, callee_outcome in candidates:
-        gap = next(
-            (
-                e for e in cl_entries
-                if e.get("file") == caller_outcome.file
-                and e.get("name") == caller_outcome.function
-            ),
-            None,
+        hit = cl_index.get(
+            (caller_outcome.file, caller_outcome.function),
         )
+        gap = {**hit[1], "file": hit[0]} if hit is not None else None
         if gap is None:
             gap = {
                 "file": caller_outcome.file,
@@ -24299,14 +32201,20 @@ def _callee_contract_requeue(
             "callee_status": callee_outcome.status,
             "callee_hypothesis": callee_outcome.hypothesis or "",
         }
-        ctx["force_review"] = True
         prepared.append((len(prepared), gap, caller_outcome, ctx))
+
+    # Environment gate shares the per-item dispatch points with the
+    # rails polls below: tick (pause/probe) first, then the rails —
+    # a conclusion surfaces through _check_budget.
+    _env_gate = _make_dispatch_gate(config)
 
     def _do_review(item):
         idx, _gap, _prior, ctx = item
         # Poll the budget/SIGTERM rails before EACH dispatch — this
         # pass runs after the main loop, exactly where a budget-
         # stopped run would otherwise overrun the drain margin.
+        if _env_gate is not None:
+            _env_gate()
         if _check_budget(config, start_time, result):
             return (idx, None, None)
         try:
@@ -24318,6 +32226,8 @@ def _callee_contract_requeue(
     if effective_workers <= 1:
         raw_results = []
         for item in prepared:
+            if _env_gate is not None:
+                _env_gate()
             if _check_budget(config, start_time, result):
                 break
             raw_results.append(_do_review(item))
@@ -24343,6 +32253,13 @@ def _callee_contract_requeue(
             )
             continue
         outcome.line = gap.get("line_start", 0)
+        # Phase ledger — the call cost money whether or not the
+        # verdict changed (deepen's booking is the template).
+        result.cost_tracker.record_call(
+            "re_review",
+            cost_usd=outcome.cost_usd,
+            wall_time_s=outcome.duration_s,
+        )
         if outcome.status in ("finding", "suspicious"):
             _untally_outcome(result, prior_outcome)
             try:
@@ -24366,6 +32283,12 @@ def _callee_contract_requeue(
                 _ctx.get("callee_contract_violation", {}).get("callee_status"),
             )
             re_reviewed += 1
+        else:
+            # Kept the prior verdict — the re-review call still spent
+            # real money; accepted verdicts book it via _tally_outcome
+            # above (deepen's dominated branch is the template).
+            with result._lock:
+                result.total_cost_usd += outcome.cost_usd
 
     return re_reviewed
 
@@ -24454,7 +32377,7 @@ def _re_review_study_enriched(
     )
 
     # --- Build all contexts up-front ---
-    prepared = []
+    prepared: list[Any] = []
     for gap, prior_outcome in candidates:
         ctx = _build_context(
             config,
@@ -24515,12 +32438,16 @@ def _re_review_study_enriched(
         except Exception as exc:  # noqa: BLE001
             return (idx, None, exc)
 
+    def _stop_rails() -> bool:
+        return _check_budget(config, start_time, result)
+
     raw_results = _collect_reviews_until_budget(
         prepared,
         _do_review,
-        lambda: _check_budget(config, start_time, result),
+        _stop_rails,
         effective_workers,
         phase_label="study re-review",
+        dispatch_gate=_make_dispatch_gate(config, stop_check=_stop_rails),
     )
 
     # --- Process results in main thread ---
@@ -24538,6 +32465,13 @@ def _re_review_study_enriched(
             continue
 
         outcome.line = gap.get("line_start", 0)
+        # Phase ledger — the call cost money whether or not the
+        # verdict changed (deepen's booking is the template).
+        result.cost_tracker.record_call(
+            "re_review",
+            cost_usd=outcome.cost_usd,
+            wall_time_s=outcome.duration_s,
+        )
 
         # Receipt threading: a verdict whose re-review was triggered
         # by study answers embeds their receipts in its evidence
@@ -24633,6 +32567,12 @@ def _re_review_study_enriched(
             )
             if ctx.get("study_answers"):
                 _record_study_flip(config, outcome)
+        else:
+            # Kept the prior verdict — the re-review call still spent
+            # real money; changed verdicts book it via _tally_outcome
+            # above (deepen's dominated branch is the template).
+            with result._lock:
+                result.total_cost_usd += outcome.cost_usd
 
     return result
 
@@ -24698,7 +32638,7 @@ def _fuse_all_evidence(ctx: dict[str, Any]) -> None:
     cross-source fusion to corroborate signals before the LLM review.
     Populates ctx["fused_evidence"] with the rendered text.
     """
-    from .evidence_fusion import format_fused_evidence, fuse_evidence
+    from .evidence_fusion import fuse_evidence
     from .evidence_grade import Confidence, EvidenceSource, GradedEvidence
 
     mechanical = ctx.pop("_graded_mechanical", [])
@@ -24755,15 +32695,47 @@ def _fuse_all_evidence(ctx: dict[str, Any]) -> None:
     if total < 2:
         if mechanical:
             fused = fuse_evidence(mechanical, [], [], [], [])
-            fused_text = format_fused_evidence(fused)
-            if fused_text:
-                ctx["fused_evidence"] = fused_text
+            _store_fused_evidence(ctx, fused)
         return
 
     fused = fuse_evidence(mechanical, spec_ev, ns_ev, contract_ev, ts_ev)
+    _store_fused_evidence(ctx, fused)
+
+
+def _store_fused_evidence(ctx: dict[str, Any], fused: list) -> None:
+    """Render + defend the fused-evidence block and attach it to ctx.
+
+    ``fused_evidence`` is consumed by the prompt assembly
+    (core/audit/context.py) as its own section. The rendered lines
+    embed tool/spec descriptions that quote repo-derived text, so the
+    block rides the same prompt-defence chokepoint as every other
+    repo-derived context block (control-char sanitisation + injection
+    scan feeding ctx['injection_warnings']) before it is stored.
+    """
+    from .evidence_fusion import (
+        compute_injection_priority,
+        format_fused_evidence,
+    )
+
     fused_text = format_fused_evidence(fused)
-    if fused_text:
-        ctx["fused_evidence"] = fused_text
+    if not fused_text:
+        return
+    from .context import defend_repo_text
+    ctx["fused_evidence"] = defend_repo_text(
+        ctx, fused_text,
+        location=f"{ctx.get('file', '?')}:{ctx.get('function', '?')} "
+                 "(fused evidence)",
+    )
+    # The fusion module's own PromptSection priority contract: the
+    # block sheds at the tier of its STRONGEST item (corroborated /
+    # high-confidence evidence is the point of fusion and must not
+    # shed with the low-tier enrichment blocks).
+    ctx["fused_evidence_priority"] = min(
+        (compute_injection_priority(
+            f.confidence, f.corroboration_count > 1)
+         for f in fused),
+        default=2,
+    )
 
 
 def _merge_validate_evidence(bridge_result, evidence_index) -> None:
@@ -24786,6 +32758,7 @@ def _run_dark_verification(
     config: OrchestratorConfig,
     llm_client: Callable | None = None,
     start_time: float | None = None,
+    max_workers: int = 1,
 ) -> None:
     """Run dark-verification pass on eligible outcomes.
 
@@ -24796,13 +32769,43 @@ def _run_dark_verification(
 
     Confirmed witnesses upgrade the outcome to ``"finding"``; refuted
     witnesses downgrade to ``"clean"``.
+
+    Witness probes (one LLM call + one sandboxed execution each) are
+    independent per outcome, so with ``max_workers > 1`` they fan out
+    across threads; verdicts are folded back in item order on the
+    calling thread. A budget/SIGTERM trip stops further probe
+    dispatch — probes already in flight finish and their verdicts are
+    still applied. Single-worker and single-item runs keep the plain
+    serial loop.
+
+    A containment-floor refusal keeps its record-then-raise contract
+    in both worlds: the probe maps the typed refusal to a sentinel
+    (never touching shared state from a worker), further probe
+    dispatch stops, and the calling thread folds verdicts in item
+    order until the first refusal — which records exactly one
+    unverifiable-environment row, persists, and re-raises.
     """
     if llm_client is None:
         return
 
+    from core.witness.sandbox_outcome import (
+        refusal_detail,
+        refusal_summary_line,
+    )
+
+    # ``except ()`` matches nothing: on a core.sandbox-less install the
+    # executors already fail closed (verdict="error", no execution) and
+    # a floor refusal cannot occur, so the arm simply never fires.
+    try:
+        from core.sandbox import SandboxFloorError
+        _floor_errors: tuple[type[BaseException], ...] = (SandboxFloorError,)
+    except ImportError:
+        _floor_errors = ()
+
     from .dark_verify import (
         build_witness_prompt,
         execute_witness,
+        floor_refusal_result,
         language_for_file,
         parse_witness_response,
     )
@@ -24810,10 +32813,10 @@ def _run_dark_verification(
     try:
         from .cwe_dispatch import dark_verify_applicable, dark_verify_statuses
     except ImportError:
-        def dark_verify_applicable(_cwe) -> bool:
+        def dark_verify_applicable(_cwe) -> bool:  # type: ignore[misc]
             return False
 
-        def dark_verify_statuses(_cwe) -> None:
+        def dark_verify_statuses(_cwe) -> None:  # type: ignore[misc]
             return None
 
     def _eligible(o: ReviewOutcome) -> bool:
@@ -24841,26 +32844,27 @@ def _run_dark_verification(
     if not dark_outcomes:
         return
 
-    records: list[dict[str, Any]] = []
+    class _FloorRefusal:
+        """Typed carrier for a containment-floor refusal seen inside a
+        probe: the error-shaped verdict plus the original exception.
+        Folded record-then-raise on the calling thread, so the record
+        lands exactly once and deterministically even when probes
+        fanned out across workers."""
 
-    for outcome in dark_outcomes:
-        # Poll the budget/SIGTERM rails before each witness dispatch:
-        # this post-loop pass multiplies with the expanded CWE
-        # eligibility, and without polling neither the SIGTERM drain
-        # nor max_seconds could stop it — budget exhaustion just made
-        # every remaining iteration a failed LLM call.
-        if start_time is not None and _check_budget(
-            config, start_time, result,
-        ):
-            logger.info(
-                "dark verification stopped — budget/deadline exhausted "
-                "(%d/%d outcomes verified)",
-                len(records), len(dark_outcomes),
-            )
-            break
+        __slots__ = ("exc", "result")
+
+        def __init__(self, result: Any, exc: BaseException) -> None:
+            self.result = result
+            self.exc = exc
+
+    def _probe(outcome: ReviewOutcome) -> Any | None:
+        """Witness generation (LLM) + sandboxed execution for one
+        outcome. Writes no shared state — verdict application happens
+        in item order on the caller's thread — so probes can fan out
+        across workers."""
         lang = language_for_file(outcome.file)
         if lang is None:
-            continue
+            return None
 
         prompt, system = build_witness_prompt(
             file=outcome.file,
@@ -24879,8 +32883,8 @@ def _run_dark_verification(
             llm_response = llm_client(prompt, system)
         # Silent skip is intentional: an LLM failure just drops this
         # outcome from dark verification.
-        except Exception:  # noqa: BLE001, S112
-            continue
+        except Exception:  # noqa: BLE001
+            return None
 
         spec = parse_witness_response(
             llm_response,
@@ -24890,19 +32894,48 @@ def _run_dark_verification(
             language=lang,
         )
         if spec is None:
-            continue
+            return None
 
         # The run dir keeps sandbox --audit evidence for the witness's
         # compile/run steps persistent — without it the tracer writes
         # into the step's throwaway scratch dir, swept on completion.
-        verify_result = execute_witness(
-            spec, config.target_path, audit_run_dir=config.out_dir,
-        )
+        try:
+            return execute_witness(
+                spec, config.target_path, audit_run_dir=config.out_dir,
+            )
+        except _floor_errors as exc:
+            # Containment floor unmet — the witness never executed, so
+            # this is an environment verdict, not a hypothesis verdict
+            # (the outcome's status is left untouched). The probe stays
+            # side-effect-free: map the refusal to its error-shaped
+            # verdict HERE (``spec`` and ``lang`` are only in scope
+            # here) and hand it back as a typed sentinel — the
+            # record-then-raise itself happens on the calling thread,
+            # in item order, exactly once, never from a worker. Only
+            # the typed floor subtype is mapped — any other
+            # SandboxSetupError keeps its BaseException flight path
+            # (record-free, aborts the pass in the serial AND parallel
+            # worlds: run_parallel catches only ``Exception``).
+            return _FloorRefusal(floor_refusal_result(spec, lang, exc), exc)
 
+    def _apply(outcome: ReviewOutcome, verify_result: Any) -> dict[str, Any]:
+        """Fold one witness verdict into the outcome + counters."""
         prior = outcome.status
         if verify_result.verdict == "confirmed":
+            from .evidence_grade import is_tool_evidence as _is_tool_ev
+
             outcome.status = "finding"
-            outcome.evidence_tool = "dark_verify:confirmed"
+            # EXTEND the receipt chain, never replace it: the refuted
+            # branch already preserves a prior deterministic receipt
+            # ("+dark_verify:refuted"), while a plain assignment here
+            # erased engine provenance from the exported record.
+            _prior_ev = outcome.evidence_tool or ""
+            if "dark_verify:confirmed" in _prior_ev:
+                pass
+            elif _prior_ev and _is_tool_ev(_prior_ev):
+                outcome.evidence_tool = f"{_prior_ev}+dark_verify:confirmed"
+            else:
+                outcome.evidence_tool = "dark_verify:confirmed"
             if prior != "finding":
                 result.findings += 1
                 if prior in ("dark", "dormant"):
@@ -24942,6 +32975,30 @@ def _run_dark_verification(
             else:
                 outcome.status = "clean"
                 outcome.evidence_tool = "dark_verify:refuted"
+                # An executed witness is ONE LLM-guessed input: it
+                # refutes its own prediction, not the hypothesis. It
+                # grades the model only when the outcome retained no
+                # deterministic stamp of ANY role — a detection-role
+                # receipt below the is_tool_evidence bar (which routed
+                # us into this branch) still contradicts the demotion,
+                # so those stay ungraded like the receipt-capped
+                # branch above.
+                _pe = (prior_evidence or "").strip().lower()
+                if prior in ("finding", "suspicious") and (
+                    not _pe
+                    or _pe == "none"
+                    or _pe.startswith("llm-claimed:")
+                ):
+                    _sc_record_refutation(
+                        result.scorecard_events, outcome,
+                        gate="dark-verify",
+                        reason=(
+                            "executed witness refuted the predicted "
+                            "signal and no deterministic receipt was "
+                            "retained"
+                        ),
+                        models=config.models,
+                    )
                 if prior != "clean":
                     result.clean += 1
                     if prior in ("dark", "dormant"):
@@ -24953,17 +33010,770 @@ def _run_dark_verification(
                     elif prior == "error":
                         result.errors -= 1
 
-        records.append(
-            {
-                "file": outcome.file,
-                "function": outcome.function,
-                "status": outcome.status,
-                "evidence_tool": outcome.evidence_tool,
-                "verdict": verify_result.verdict,
-                "match_detail": verify_result.match_detail,
-            }
+        return {
+            "file": outcome.file,
+            "function": outcome.function,
+            "status": outcome.status,
+            "evidence_tool": outcome.evidence_tool,
+            "verdict": verify_result.verdict,
+            "match_detail": verify_result.match_detail,
+        }
+
+    records: list[dict[str, Any]] = []
+    workers = max(1, max_workers)
+    # Environment gate at the same per-probe dispatch point as the
+    # budget poll: a pause defers the next witness (in-flight probes
+    # finish, verdicts still fold) and a conclusion stops the pass
+    # WITH the terminal booking budget exhaustion gets — this pass
+    # runs after the last full rails poll, so an unbooked conclusion
+    # here would ship terminated_by="complete" (exit 0, lifecycle
+    # complete, no resume hint) over a faulted run. The rails poll
+    # below stays conditional on start_time (library callers pass
+    # none and keep the unpolled budget behaviour); the environment
+    # stop must not be, hence the booking stop check on the gate.
+    _env_gate = _make_dispatch_gate(
+        config,
+        stop_check=lambda: _environment_stop_booked(config, result),
+    )
+
+    def _record_floor_refusal(
+        outcome: ReviewOutcome, refusal: _FloorRefusal,
+    ) -> NoReturn:
+        # Record-then-raise: the refusal is host-deterministic (every
+        # later witness would refuse identically), so record the
+        # structured unverifiable-environment verdict on THIS finding,
+        # persist what the pass has, and re-raise — a misconfigured
+        # host fails the run loudly once instead of minting N
+        # benign-looking "error" rows. Runs on the calling thread
+        # only, so the record lands exactly once and in item order
+        # even when probes fanned out across workers.
+        records.append({
+            "file": outcome.file,
+            "function": outcome.function,
+            "status": outcome.status,
+            "evidence_tool": outcome.evidence_tool,
+            "verdict": refusal.result.verdict,
+            "match_detail": refusal.result.match_detail,
+        })
+        save_json(config.out_dir / "dark-verify-results.json", records)
+        logger.error(
+            "dark verification refused: %s",
+            refusal_summary_line(refusal_detail(refusal.exc) or {}),
         )
+        raise refusal.exc
+
+    if workers <= 1 or len(dark_outcomes) <= 1:
+        for outcome in dark_outcomes:
+            # Poll the budget/SIGTERM rails before each witness
+            # dispatch: this post-loop pass multiplies with the
+            # expanded CWE eligibility, and without polling neither the
+            # SIGTERM drain nor max_seconds could stop it — budget
+            # exhaustion just made every remaining iteration a failed
+            # LLM call.
+            if (_env_gate is not None and _env_gate()) or (
+                start_time is not None and _check_budget(
+                    config, start_time, result,
+                )
+            ):
+                logger.info(
+                    "dark verification stopped — budget/deadline/"
+                    "environment exhausted (%d/%d outcomes verified)",
+                    len(records), len(dark_outcomes),
+                )
+                break
+            verify_result = _probe(outcome)
+            if verify_result is None:
+                continue
+            if isinstance(verify_result, _FloorRefusal):
+                _record_floor_refusal(outcome, verify_result)
+            records.append(_apply(outcome, verify_result))
+    else:
+        stop = _threading.Event()
+
+        def _probe_gated(outcome: ReviewOutcome) -> Any | None:
+            # Same budget/SIGTERM poll as the serial loop, sticky
+            # across workers: once tripped, no further witness work
+            # starts; probes already in flight finish and their
+            # verdicts are still applied below.
+            if stop.is_set():
+                return None
+            if _env_gate is not None and _env_gate():
+                stop.set()
+                return None
+            if start_time is not None and _check_budget(
+                config, start_time, result,
+            ):
+                stop.set()
+                return None
+            probe_result = _probe(outcome)
+            if isinstance(probe_result, _FloorRefusal):
+                # Host-deterministic refusal: every later witness
+                # would refuse identically, so stop dispatching
+                # further probes. The sentinel itself is folded
+                # (record-then-raise) in item order below.
+                stop.set()
+            return probe_result
+
+        from core.llm.concurrency import run_parallel
+
+        # No on_error: an unexpected probe exception fills the slot
+        # with None and the pass CONTINUES past it — conservatively
+        # different from the serial loop, where the same exception
+        # would abort the whole pass. The failed outcome just keeps
+        # its prior verdict (identical to the probe's own None-return
+        # skip paths).
+        probe_results: list[Any | None] = run_parallel(
+            dark_outcomes, _probe_gated,
+            max_workers=workers,
+            label="dark-verify",
+        )
+        # Apply in item order on this thread — verdict folding stays
+        # deterministic and the counters need no locking.
+        for outcome, verify_result in zip(dark_outcomes, probe_results):
+            if verify_result is None:
+                continue
+            if isinstance(verify_result, _FloorRefusal):
+                # The first refusal in item order records and
+                # re-raises; verdicts already folded stay applied,
+                # later slots are discarded — matching the serial
+                # pass, which never probes past the refusal.
+                _record_floor_refusal(outcome, verify_result)
+            records.append(_apply(outcome, verify_result))
+        if stop.is_set():
+            logger.info(
+                "dark verification stopped — budget/deadline/"
+                "environment exhausted (%d/%d outcomes verified)",
+                len(records), len(dark_outcomes),
+            )
 
     if records:
         results_path = config.out_dir / "dark-verify-results.json"
         save_json(results_path, records)
+
+
+def _run_differential_verification(
+    result: OrchestratorResult,
+    config: OrchestratorConfig,
+    consistency_prepass: dict[str, Any],
+    llm_client: Callable | None = None,
+    start_time: float | None = None,
+) -> list[Any]:
+    """Differential family execution over the census pre-pass's leads.
+
+    For each eligible lead (dimension/family-keyed gate — NOT the CWE
+    dispatch table), the LLM proposes shared argument vectors and a
+    comparison contract; the deviant and its conforming family members
+    then execute the IDENTICAL vector in separate sandboxed witness
+    processes, and the classifier compares the authenticated protocol
+    observations. When the family comparison finds no direction, a
+    triple-controlled metamorphic relation witness gets one shot at
+    the deviant.
+
+    Verdict integrity — the properties every consumer relies on:
+
+    - The fold NEVER demotes. ``family-agrees`` and ``relation-holds``
+      are failures to promote and nothing more (agreement on a handful
+      of vectors is not absence of the bug); ``inconclusive`` verdicts
+      are fail-closed records. The only outcome writes are promotions.
+    - Promotion never comes from majority statistics. The two
+      promote-capable verdicts are directional confirmation (deviant
+      accepts what every executed conforming peer rejects, under an
+      acceptance contract, with the census family floor met by the
+      EXECUTED conforming set) and a family-validated relation
+      violation (channel controls passed on the target AND the
+      deciding pair held on every executed conforming peer — a
+      relation only the proposer vouches for never promotes).
+    - One execution namespace: every stamp this pass mints is
+      ``differential:*``. A divergence receipt and a consistency
+      receipt must never corroborate each other as independent tools,
+      so the namespace is deliberately disjoint from ``consistency``.
+    - Relations and vectors are run-scoped: nothing here persists
+      them beyond the run records.
+
+    Promoted leads with no existing outcome become synthesized
+    outcomes (the census pre-pass precedent — the hypothesis exists in
+    the lead before the finding, so G1 holds); the returned list is
+    merged into the graded export by the caller. Records land in
+    ``differential-results.json``; a containment-floor refusal keeps
+    the record-then-raise contract (one unverifiable-environment row,
+    persist, re-raise).
+    """
+    if llm_client is None:
+        return []
+    leads = (consistency_prepass or {}).get("leads") or []
+    if not leads:
+        return []
+
+    from core.witness.sandbox_outcome import (
+        refusal_detail,
+        refusal_summary_line,
+    )
+
+    # ``except ()`` matches nothing: on a core.sandbox-less install the
+    # executors already fail closed (verdict="error", no execution) and
+    # a floor refusal cannot occur, so the arm simply never fires.
+    try:
+        from core.sandbox import SandboxFloorError
+        _floor_errors: tuple[type[BaseException], ...] = (SandboxFloorError,)
+    except ImportError:
+        _floor_errors = ()
+
+    from .consistency_stats import (
+        floor_overrides_from_run_config,
+        resolve_floors,
+    )
+    from .dark_verify import (
+        execute_witness,
+        floor_refusal_result,
+        language_for_file,
+    )
+    from .differential import (
+        DIMENSION_FLOOR_KEY,
+        MAX_CONFORMING_EXECUTED,
+        MIN_CONFORMING_EXECUTED,
+        OBS_ERROR,
+        VERDICT_CONFIRMED,
+        VERDICT_FAMILY_AGREES,
+        VERDICT_INCONCLUSIVE,
+        VERDICT_NONDIRECTIONAL,
+        VERDICT_RELATION_VIOLATED,
+        DifferentialBudget,
+        DifferentialVector,
+        MemberObservation,
+        VectorVerdict,
+        build_member_spec,
+        build_relation_prompt,
+        build_vector_prompt,
+        classify_lead,
+        classify_relation,
+        classify_vector,
+        differential_applicable,
+        observation_from_result,
+        parse_relation_response,
+        parse_vector_response,
+        usable_family,
+        validate_relation_on_family,
+    )
+
+    # Eligibility gate: dimension/family-keyed, refusals recorded so
+    # telemetry can say why leads were skipped.
+    eligible: list[dict[str, Any]] = []
+    skipped: list[dict[str, str]] = []
+    for lead in leads:
+        if not isinstance(lead, dict):
+            continue
+        ok, reason = differential_applicable(lead)
+        if ok:
+            eligible.append(lead)
+        else:
+            skipped.append({
+                "file": str(lead.get("file") or ""),
+                "function": str(lead.get("function") or ""),
+                "dimension": str(lead.get("dimension") or ""),
+                "reason": reason,
+            })
+
+    # Per-dimension family floors: registry defaults unless the audit
+    # run-config carries validated overrides — same override surface
+    # and same loud fall-back-to-defaults as the census pre-pass (the
+    # promotion gate and the pre-pass must hold one lead to ONE floor).
+    try:
+        floors = resolve_floors(
+            floor_overrides_from_run_config(config.out_dir)
+            if config.out_dir is not None else None,
+        )
+    except ValueError as exc:
+        logger.warning(
+            "differential floors: override rejected (%s) — defaults "
+            "apply", exc,
+        )
+        floors = resolve_floors(None)
+
+    model_id = (
+        config.models[0]
+        if config.models and config.models[0] != "default"
+        else ""
+    )
+    budget = DifferentialBudget()
+    _env_gate = _make_dispatch_gate(
+        config,
+        stop_check=lambda: _environment_stop_booked(config, result),
+    )
+
+    def _stopped() -> bool:
+        # Environment gate + budget rails at every LLM/witness
+        # dispatch point, same poll the dark-verify pass runs.
+        return (_env_gate is not None and _env_gate()) or (
+            start_time is not None
+            and _check_budget(config, start_time, result)
+        )
+
+    records: list[dict[str, Any]] = []
+
+    def _record_floor_refusal(spec: Any, exc: BaseException) -> NoReturn:
+        # Record-then-raise: the refusal is host-deterministic (every
+        # later member execution would refuse identically), so record
+        # one structured unverifiable-environment row, persist what
+        # the pass has, and re-raise — a misconfigured host fails the
+        # run loudly once instead of minting N inconclusive vectors.
+        refusal = floor_refusal_result(spec, spec.language, exc)
+        records.append({
+            "kind": "floor-refusal",
+            "file": spec.file,
+            "function": spec.function,
+            "verdict": refusal.verdict,
+            "match_detail": refusal.match_detail,
+        })
+        if config.out_dir is not None:
+            save_json(
+                config.out_dir / "differential-results.json", records,
+            )
+        logger.error(
+            "differential execution refused: %s",
+            refusal_summary_line(refusal_detail(exc) or {}),
+        )
+        raise exc
+
+    def _observe(
+        spec: Any, *, member: str, file: str,
+    ) -> MemberObservation:
+        """One member execution → its authenticated observation."""
+        try:
+            witness_result = execute_witness(
+                spec, config.target_path, audit_run_dir=config.out_dir,
+            )
+        except _floor_errors as exc:
+            _record_floor_refusal(spec, exc)
+        return observation_from_result(
+            witness_result, member=member, file=file,
+        )
+
+    def _build_spec(
+        file: str, function: str, lang: str, vector: DifferentialVector,
+    ) -> Any | None:
+        return build_member_spec(
+            finding_key=f"{file}:{function}",
+            file=file,
+            function=function,
+            language=lang,
+            vector=vector,
+            target_root=config.target_path,
+        )
+
+    # First outcome per (file, function): the fold's single write
+    # target for a promoted deviant.
+    by_key: dict[tuple[str, str], Any] = {}
+    for o in result.outcomes:
+        by_key.setdefault((o.file, o.function), o)
+
+    synthesized: list[Any] = []
+
+    def _promote(
+        lead: dict[str, Any], stamp: str, *, checked_by: str,
+    ) -> dict[str, str]:
+        """The ONE write path this pass has into outcome state.
+
+        Chain-extends the deviant's receipt (never replacing engine
+        provenance) and promotes to finding; when the review loop
+        produced no outcome for the deviant, synthesizes one — the
+        lead's hypothesis existed before the finding, so G1 holds.
+        There is deliberately NO demote counterpart anywhere in this
+        pass.
+        """
+        from .evidence_grade import is_tool_evidence as _is_tool_ev
+
+        file = str(lead.get("file") or "")
+        function = str(lead.get("function") or "")
+        outcome = by_key.get((file, function))
+        if outcome is not None:
+            prior = getattr(outcome, "status", "")
+            outcome.status = "finding"
+            _prior_ev = getattr(outcome, "evidence_tool", "") or ""
+            if stamp in _prior_ev:
+                pass
+            elif _prior_ev and _is_tool_ev(_prior_ev):
+                outcome.evidence_tool = f"{_prior_ev}+{stamp}"
+            else:
+                outcome.evidence_tool = stamp
+            if prior != "finding":
+                result.findings += 1
+                if prior in ("dark", "dormant"):
+                    result.dormant -= 1
+                elif prior == "suspicious":
+                    result.suspicious -= 1
+                elif prior == "clean":
+                    result.clean -= 1
+                elif prior == "error":
+                    result.errors -= 1
+            return {"applied": "chain-extend", "prior_status": prior}
+
+        description = str(lead.get("description") or "")
+        co = SimpleNamespace(
+            file=file,
+            function=function,
+            line=int(lead.get("line") or 0),
+            status="finding",
+            body=(
+                f"[differential:{lead.get('dimension', '')}] "
+                f"{description}"
+            ),
+            hypothesis=description,
+            hypotheses=None,
+            review_result={
+                "hypothesis": description,
+                "cwe_class": str(lead.get("cwe") or ""),
+            },
+            evidence_tool=stamp,
+            tools_dispatched={"differential"},
+            discovered_by="differential_execution",
+            model="",
+            cost_usd=0.0,
+            duration_s=0.0,
+        )
+        by_key[(file, function)] = co
+        synthesized.append(co)
+        try:
+            from .collector import append_journal_for_outcome
+
+            append_journal_for_outcome(
+                out_dir=config.out_dir,
+                target_path=config.target_path,
+                run_id=_resolved_run_id(config.out_dir),
+                outcome=co,
+                gap={
+                    "line_start": co.line,
+                    "line_end": None,
+                    "strategies": ["differential-execution"],
+                },
+                checked_by=[checked_by],
+            )
+            with result._lock:
+                result.post_loop_mechanical += 1
+        except Exception:
+            logger.debug(
+                "differential journal append failed for %s:%s",
+                file, function, exc_info=True,
+            )
+        return {"applied": "synthesized", "prior_status": ""}
+
+    n_confirmed = 0
+    n_relation_violations = 0
+    executed_leads = 0
+    stopped_reason = ""
+
+    for lead in eligible:
+        if _stopped():
+            stopped_reason = "budget/deadline/environment exhausted"
+            break
+        over = budget.over_reason()
+        if over is not None:
+            stopped_reason = over
+            break
+
+        file = str(lead.get("file") or "")
+        function = str(lead.get("function") or "")
+        dimension = str(lead.get("dimension") or "")
+        lang = language_for_file(file) or ""
+        family_floor = int(floors.value(DIMENSION_FLOOR_KEY[dimension]))
+        executed_leads += 1
+
+        members = usable_family(lead)
+        executed_members = members[:MAX_CONFORMING_EXECUTED]
+        # Members selected out before execution: the verdict never
+        # extends to them, and the record says so.
+        excluded = [
+            {
+                "member": str(m.get("function") or ""),
+                "reason": "over family cap",
+            }
+            for m in members[MAX_CONFORMING_EXECUTED:]
+        ]
+
+        prompt, system = build_vector_prompt(
+            lead, executed_members, model_id=model_id,
+        )
+        try:
+            response = llm_client(prompt, system)
+        # Silent skip is intentional: an LLM failure just drops this
+        # lead from differential execution.
+        except Exception:  # noqa: BLE001
+            continue
+        parsed = parse_vector_response(response)
+        if parsed is None:
+            records.append({
+                "kind": "family-differential",
+                "file": file,
+                "function": function,
+                "dimension": dimension,
+                "verdict": VERDICT_INCONCLUSIVE,
+                "reason": "no usable vector proposal",
+            })
+            continue
+        contract, vectors = parsed
+
+        vector_verdicts: list[VectorVerdict] = []
+        # Members whose spec never built (unresolvable module path,
+        # kwargs outside Python): named in the excluded rows so the
+        # record says the verdict never extended to them — silence
+        # would read as "executed and conformed".
+        spec_failed: dict[str, str] = {}
+        for i, vector in enumerate(vectors):
+            if _stopped():
+                stopped_reason = "budget/deadline/environment exhausted"
+                break
+            deviant_spec = _build_spec(file, function, lang, vector)
+            if deviant_spec is None:
+                # The vector cannot execute faithfully on this lane
+                # (e.g. kwargs outside Python) — inconclusive, and no
+                # execution is charged.
+                vector_verdicts.append(classify_vector(
+                    contract, None, [], vector_index=i,
+                ))
+                continue
+            member_specs: list[tuple[str, str, Any]] = []
+            for m in executed_members:
+                m_file = str(m.get("file") or "")
+                m_func = str(m.get("function") or "")
+                spec = _build_spec(m_file, m_func, lang, vector)
+                if spec is not None:
+                    member_specs.append((m_func, m_file, spec))
+                else:
+                    spec_failed.setdefault(m_func, "spec-build-failed")
+
+            # Charge-before-run, staged: the deviant first — an
+            # invalid deviant poisons the vector and its peers are
+            # never spent on it.
+            if not budget.try_charge(1):
+                stopped_reason = budget.over_reason() or ""
+                break
+            deviant_obs = _observe(
+                deviant_spec, member=function, file=file,
+            )
+            if deviant_obs.kind == OBS_ERROR:
+                vector_verdicts.append(classify_vector(
+                    contract, deviant_obs, [], vector_index=i,
+                ))
+                continue
+            if not budget.try_charge(len(member_specs)):
+                stopped_reason = budget.over_reason() or ""
+                break
+            conforming_obs = [
+                _observe(spec, member=m_func, file=m_file)
+                for m_func, m_file, spec in member_specs
+            ]
+            vector_verdicts.append(classify_vector(
+                contract, deviant_obs, conforming_obs, vector_index=i,
+            ))
+
+        lead_verdict = classify_lead(
+            contract, vector_verdicts,
+            family_floor=family_floor,
+            excluded=excluded + [
+                {"member": m_func, "reason": reason}
+                for m_func, reason in spec_failed.items()
+            ],
+        )
+        rec: dict[str, Any] = {
+            "kind": "family-differential",
+            "file": file,
+            "function": function,
+            "dimension": dimension,
+        }
+        rec.update(lead_verdict.to_dict())
+        promoted = False
+        if (
+            lead_verdict.verdict == VERDICT_CONFIRMED
+            and lead_verdict.meets_family_floor
+        ):
+            rec["fold"] = _promote(
+                lead, "differential:confirmed",
+                checked_by="differential:family",
+            )
+            promoted = True
+            n_confirmed += 1
+        elif lead_verdict.verdict == VERDICT_CONFIRMED:
+            # Directional, but the executed conforming set is below
+            # the census family floor: recorded, never promoted (and
+            # never demoted — nothing in this pass demotes).
+            rec["fold"] = {
+                "applied": "none",
+                "reason": (
+                    "census family floor not met by the executed "
+                    "conforming set"
+                ),
+            }
+        rec["promoted"] = promoted
+        records.append(rec)
+        if stopped_reason:
+            break
+        if promoted:
+            continue
+
+        # Metamorphic relation witness: one shot at the deviant alone,
+        # only when the family comparison executed validly but found
+        # no direction (an inconclusive family means the deviant
+        # itself is unlikely to execute — no budget is spent re-proving
+        # that).
+        if lead_verdict.verdict not in (
+            VERDICT_NONDIRECTIONAL, VERDICT_FAMILY_AGREES,
+        ):
+            continue
+        if _stopped():
+            stopped_reason = "budget/deadline/environment exhausted"
+            break
+        prompt, system = build_relation_prompt(lead, model_id=model_id)
+        try:
+            response = llm_client(prompt, system)
+        except Exception:  # noqa: BLE001
+            continue
+        relation = parse_relation_response(response)
+        if relation is None or relation.differ is None:
+            records.append({
+                "kind": "metamorphic",
+                "file": file,
+                "function": function,
+                "dimension": dimension,
+                "verdict": VERDICT_INCONCLUSIVE,
+                "reason": "no usable relation proposal",
+            })
+            continue
+
+        # Execution plan: determinism control (the first equivalence
+        # pair's left vector, twice), sensitivity control (the
+        # should-differ pair), then the equivalence pairs. All specs
+        # build before anything is charged or run — a partially
+        # executable relation could never classify.
+        det_vec = relation.pairs[0][0]
+        plan: list[DifferentialVector] = [
+            det_vec, det_vec, relation.differ[0], relation.differ[1],
+        ]
+        for left, right in relation.pairs:
+            plan.extend((left, right))
+        specs = [_build_spec(file, function, lang, v) for v in plan]
+        if any(s is None for s in specs):
+            records.append({
+                "kind": "metamorphic",
+                "file": file,
+                "function": function,
+                "dimension": dimension,
+                "verdict": VERDICT_INCONCLUSIVE,
+                "reason": "relation vector not executable on this lane",
+            })
+            continue
+        if not budget.try_charge(len(specs)):
+            stopped_reason = budget.over_reason() or ""
+            records.append({
+                "kind": "metamorphic",
+                "file": file,
+                "function": function,
+                "dimension": dimension,
+                "verdict": VERDICT_INCONCLUSIVE,
+                "reason": f"skipped over budget: {stopped_reason}",
+            })
+            break
+        obs = [
+            _observe(s, member=function, file=file) for s in specs
+        ]
+        relation_verdict = classify_relation(
+            relation,
+            determinism=(obs[0], obs[1]),
+            sensitivity=(obs[2], obs[3]),
+            pairs=[
+                (obs[4 + 2 * j], obs[5 + 2 * j])
+                for j in range(len(relation.pairs))
+            ],
+        )
+        if (
+            relation_verdict.verdict == VERDICT_RELATION_VIOLATED
+            and relation_verdict.controls_passed
+        ):
+            # Relation-validity control: the channel controls proved
+            # the comparison can see differences on the target — never
+            # that the proposed equivalence is a true invariant. The
+            # deciding pair re-executes over the conforming peers; a
+            # relation the family also violates is a false relation
+            # and poisons the witness instead of promoting.
+            deciding = relation.pairs[relation_verdict.pair_index]
+            peer_specs: list[tuple[str, str, Any, Any]] = []
+            for m in executed_members:
+                m_file = str(m.get("file") or "")
+                m_func = str(m.get("function") or "")
+                left_spec = _build_spec(m_file, m_func, lang, deciding[0])
+                right_spec = _build_spec(m_file, m_func, lang, deciding[1])
+                if left_spec is not None and right_spec is not None:
+                    peer_specs.append(
+                        (m_func, m_file, left_spec, right_spec),
+                    )
+            # All-or-nothing charge: a partially validated family
+            # could never vouch for the relation.
+            if not budget.try_charge(2 * len(peer_specs)):
+                stopped_reason = budget.over_reason() or ""
+                records.append({
+                    "kind": "metamorphic",
+                    "file": file,
+                    "function": function,
+                    "dimension": dimension,
+                    "verdict": VERDICT_INCONCLUSIVE,
+                    "reason": (
+                        f"relation validation skipped over budget: "
+                        f"{stopped_reason}"
+                    ),
+                })
+                break
+            peer_pairs = [
+                (
+                    _observe(left_spec, member=m_func, file=m_file),
+                    _observe(right_spec, member=m_func, file=m_file),
+                )
+                for m_func, m_file, left_spec, right_spec in peer_specs
+            ]
+            relation_verdict = validate_relation_on_family(
+                relation_verdict, peer_pairs,
+                quorum=MIN_CONFORMING_EXECUTED,
+            )
+
+        m_rec: dict[str, Any] = {
+            "kind": "metamorphic",
+            "file": file,
+            "function": function,
+            "dimension": dimension,
+        }
+        m_rec.update(relation_verdict.to_dict())
+        m_promoted = False
+        if (
+            relation_verdict.verdict == VERDICT_RELATION_VIOLATED
+            and relation_verdict.controls_passed
+            and relation_verdict.family_validated
+        ):
+            m_rec["fold"] = _promote(
+                lead, "differential:relation-violation",
+                checked_by="differential:metamorphic",
+            )
+            m_promoted = True
+            n_relation_violations += 1
+        m_rec["promoted"] = m_promoted
+        records.append(m_rec)
+
+    if stopped_reason:
+        logger.info(
+            "differential verification stopped — %s (%d/%d leads "
+            "executed)",
+            stopped_reason, executed_leads, len(eligible),
+        )
+
+    if records and config.out_dir is not None:
+        save_json(config.out_dir / "differential-results.json", records)
+    if config.out_dir is not None:
+        with contextlib.suppress(Exception):
+            append_audit_log(config.out_dir, {
+                "action": "differential_verification",
+                "leads_total": len(leads),
+                "leads_eligible": len(eligible),
+                "leads_executed": executed_leads,
+                "executions": budget.executions,
+                "confirmed": n_confirmed,
+                "relation_violations": n_relation_violations,
+                "stopped": stopped_reason,
+                "skipped_ineligible": skipped[:20],
+            })
+    return synthesized

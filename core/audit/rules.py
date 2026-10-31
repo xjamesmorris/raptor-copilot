@@ -16,8 +16,8 @@ files (coccinelle).
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, TYPE_CHECKING
-from pathlib import Path
 
 from core.json import load_json, save_json
 
@@ -68,7 +68,10 @@ def save_rule(
 
     ext = ".yaml" if tool == "semgrep" else ".cocci"
     rule_path = (rules_dir / f"{rule_id}{ext}").resolve()
-    if not str(rule_path).startswith(str(rules_dir.resolve())):
+    # Trailing separator keeps a sibling like "<out>/rules-evil/" from
+    # passing the prefix test — unreachable today (rule_id rejects all
+    # separators above), belt-and-braces for future callers.
+    if not str(rule_path).startswith(str(rules_dir.resolve()) + os.sep):
         msg = f"invalid rule_id {rule_id!r}: resolved path escapes rules directory"
         raise ValueError(msg)
     # Atomic like the manifest write below: rules are cross-run
@@ -77,6 +80,11 @@ def save_rule(
     from core.atomic_fs import write_text_atomically
     write_text_atomically(rule_path, content)
 
+    # Manifest read-modify-write is unlocked: callers are the /audit
+    # checker-synthesis path and the operator CLI, one process at a
+    # time per run directory. Concurrent writers would last-writer-win
+    # a whole manifest (losing the other's entry) — acceptable within
+    # that contract; revisit with a lock if a parallel writer appears.
     manifest = _load_manifest(out_dir)
     manifest[rule_id] = {
         "tool": tool,
@@ -97,7 +105,7 @@ def list_rules(out_dir: Path) -> list[dict[str, Any]]:
     manifest = _load_manifest(out_dir)
     rules = []
     for rule_id, meta in manifest.items():
-        entry = {"rule_id": rule_id}
+        entry: dict[str, Any] = {"rule_id": rule_id}
         entry.update(meta)
         rule_path = out_dir / meta.get("file", "")
         entry["exists"] = rule_path.exists() if rule_path.name else False
@@ -117,7 +125,7 @@ def get_rule(out_dir: Path, rule_id: str) -> dict[str, Any] | None:
 
     rule_path = out_dir / meta.get("file", "")
     if rule_path.exists():
-        result["content"] = rule_path.read_text()
+        result["content"] = rule_path.read_text()  # raw-open: run-dir rule named by the RAPTOR-written manifest
     return result
 
 
@@ -202,7 +210,7 @@ def _run_coccinelle_rule(rule_path: Path, target_path: Path) -> dict[str, Any]:
         if not is_available():
             return {"error": "coccinelle (spatch) not installed"}
 
-        result = run_rule(target_path, str(rule_path), timeout=300)
+        result = run_rule(target_path, rule_path, timeout=300)
         # ``SpatchResult`` carries ``matches`` (SpatchMatch dataclasses),
         # not ``findings`` — the old attribute raised AttributeError on
         # every sweep of a saved coccinelle rule.

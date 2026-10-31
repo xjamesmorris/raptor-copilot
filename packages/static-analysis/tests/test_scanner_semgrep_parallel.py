@@ -15,6 +15,9 @@ hard-codes the registry id would otherwise fail post-#196.
 from __future__ import annotations
 
 import importlib.util
+import json
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -45,6 +48,14 @@ _spec.loader.exec_module(_scanner_mod)
 semgrep_scan_parallel = _scanner_mod.semgrep_scan_parallel
 semgrep_scan_sequential = _scanner_mod.semgrep_scan_sequential
 
+from packages.semgrep.tests.scope_fixture import (  # noqa: E402
+    EXPECTED_SCOPE_FINDINGS,
+    GIT_NEAR_MISS_FINDINGS,
+    create_git_scope_fixture,
+    relative_scope_path,
+    write_scope_rule,
+)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -62,6 +73,167 @@ def _stub_run_single(name, config, repo_path, out_dir, timeout,
     if progress_callback:
         progress_callback(f"Scanning with {name}")
     return str(sarif), True
+
+
+def _run_real_semgrep(cmd, timeout=None, env=None, output=None, **_ignored):
+    """subprocess-shaped scanner seam for local-rule live tests.
+
+    The production scanner supplies a sandbox-backed fake HOME. This test
+    replaces only that executor, so recreate its local write roots under the
+    disposable fixture rather than touching the operator's HOME or /tmp.
+    """
+    output_dir = Path(output)
+    home = output_dir / "test-home"
+    temp = output_dir / "test-tmp"
+    xdg = {
+        "XDG_CONFIG_HOME": home / "config",
+        "XDG_DATA_HOME": home / "data",
+        "XDG_CACHE_HOME": home / "cache",
+        "XDG_STATE_HOME": home / "state",
+    }
+    for path in (home, temp, *xdg.values()):
+        path.mkdir(parents=True, exist_ok=True)
+    child_env = dict(env or {})
+    child_env.update({
+        "HOME": str(home),
+        "TMPDIR": str(temp),
+        **{name: str(path) for name, path in xdg.items()},
+    })
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=child_env,
+        check=False,
+    )
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def _sarif_result_paths(sarif_path: Path, target: Path) -> list[str]:
+    data = json.loads(sarif_path.read_text(encoding="utf-8"))
+    paths = []
+    for run_data in data.get("runs", []):
+        for result in run_data.get("results", []):
+            raw_path = (
+                result.get("locations", [{}])[0]
+                .get("physicalLocation", {})
+                .get("artifactLocation", {})
+                .get("uri")
+            )
+            if raw_path:
+                paths.append(relative_scope_path(raw_path, target))
+    return sorted(paths)
+
+
+def _scanner_scope_observation(out_dir: Path, target: Path) -> dict:
+    sarif_paths = list(out_dir.glob("semgrep_*.sarif"))
+    json_paths = list(out_dir.glob("semgrep_*.json"))
+    assert len(sarif_paths) == 1
+    assert len(json_paths) == 1
+
+    metadata = json.loads(json_paths[0].read_text(encoding="utf-8"))
+    errors = metadata.get("errors", [])
+    skipped = metadata.get("paths", {}).get("skipped", [])
+    return {
+        "findings": _sarif_result_paths(sarif_paths[0], target),
+        "files_failed": sorted(
+            relative_scope_path(entry["path"], target)
+            for entry in errors
+            if entry.get("path")
+        ),
+        "git_skips": sorted(
+            relative_scope_path(entry["path"], target)
+            for entry in skipped
+            if entry.get("reason") == "cli_exclude_flags_match"
+            and Path(entry.get("path", "")).name == ".git"
+        ),
+    }
+
+
+@pytest.mark.skipif(shutil.which("semgrep") is None, reason="semgrep not installed")
+@pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+@pytest.mark.skipif(
+    shutil.which("semgrep") is not None
+    and not _scanner_mod.semgrep_pkg.scope_isolation_available(),
+    reason="semgrep below scope-isolation floor",
+)
+class TestSemgrepScopeLiveParity:
+    """The package runner and both scanner dispatch modes share one scope policy."""
+
+    def test_runner_parallel_and_sequential_exact_git_scope_agree(self, tmp_path):
+        rule = write_scope_rule(tmp_path)
+        target = create_git_scope_fixture(tmp_path)
+
+        package_result = _scanner_mod.semgrep_pkg.run_rule(
+            target,
+            str(rule),
+            timeout=120,
+            unsandboxed=True,
+        )
+        assert package_result.ok, package_result.errors
+        cli_skips = (
+            package_result.skipped_summary
+            .get("reasons", {})
+            .get("cli_exclude_flags_match", {})
+            .get("sample", [])
+        )
+        expected = {
+            "findings": sorted(
+                relative_scope_path(f.file, target)
+                for f in package_result.findings
+            ),
+            "files_failed": sorted(
+                relative_scope_path(entry["path"], target)
+                for entry in package_result.files_failed
+            ),
+            "git_skips": sorted(
+                relative_scope_path(path, target)
+                for path in cli_skips
+                if Path(path).name == ".git"
+            ),
+        }
+        assert expected == {
+            "findings": list(EXPECTED_SCOPE_FINDINGS),
+            "files_failed": ["broken.sh"],
+            "git_skips": [
+                ".git",
+                "nested-repo/.git",
+                "submodule/.git",
+                "worktree/.git",
+            ],
+        }
+
+        observations = {}
+        for mode, scan in (
+            ("sequential", semgrep_scan_sequential),
+            ("parallel", semgrep_scan_parallel),
+        ):
+            out_dir = tmp_path / mode
+            with patch.object(
+                _scanner_mod,
+                "run",
+                side_effect=_run_real_semgrep,
+            ), patch.object(_scanner_mod, "validate_sarif", return_value=True):
+                sarif_paths, failed = scan(
+                    repo_path=target,
+                    rules_dirs=[],
+                    out_dir=out_dir,
+                    timeout=120,
+                    baseline_packs=[],
+                    extra_configs=[str(rule)],
+                )
+            assert failed == []
+            assert len(sarif_paths) == 1
+            observations[mode] = _scanner_scope_observation(out_dir, target)
+            assert set(GIT_NEAR_MISS_FINDINGS).issubset(
+                observations[mode]["findings"],
+            )
+
+        assert observations == {
+            "sequential": expected,
+            "parallel": expected,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -554,6 +726,53 @@ class TestSemgrepDroppedFiles:
         bad = tmp_path / "bad.json"
         bad.write_text("{not json")
         assert _scanner_mod._semgrep_dropped_files([bad]) == {}
+
+
+class TestSemgrepSkippedPaths:
+    """Cross-pack ``paths.skipped`` aggregation: unique paths per
+    reason (every pack walks the same tree, so the same skip repeats
+    once per pack — counts must mean paths, not paths x packs)."""
+
+    def _write(self, tmp_path, name, skipped):
+        import json as _json
+        p = tmp_path / name
+        p.write_text(_json.dumps({"paths": {"scanned": ["a.c"],
+                                            "skipped": skipped},
+                                  "errors": []}))
+        return p
+
+    def test_dedupes_across_packs_counts_unique_paths(self, tmp_path):
+        j1 = self._write(tmp_path, "p1.json", [
+            {"path": "node_modules/x.js", "reason": "cli_exclude_flags_match"},
+            {"path": "node_modules/y.js", "reason": "cli_exclude_flags_match"},
+            {"path": "big.c", "reason": "exceeded_size_limit"},
+        ])
+        j2 = self._write(tmp_path, "p2.json", [
+            # same tree, second pack — identical skips must not double
+            {"path": "node_modules/x.js", "reason": "cli_exclude_flags_match"},
+            {"path": "node_modules/y.js", "reason": "cli_exclude_flags_match"},
+            {"path": "big.c", "reason": "exceeded_size_limit"},
+        ])
+        assert _scanner_mod._semgrep_skipped_paths([j1, j2]) == {
+            "cli_exclude_flags_match": 2,
+            "exceeded_size_limit": 1,
+        }
+
+    def test_malformed_entries_and_missing_reason(self, tmp_path):
+        j = self._write(tmp_path, "p.json", [
+            "bogus", None,
+            {"reason": "exceeded_size_limit"},   # no path → not counted
+            {"path": "a.c"},                     # no reason → unspecified
+        ])
+        assert _scanner_mod._semgrep_skipped_paths([j]) == {
+            "unspecified": 1,
+        }
+
+    def test_unreadable_json_and_no_skips(self, tmp_path):
+        bad = tmp_path / "bad.json"
+        bad.write_text("{not json")
+        empty = self._write(tmp_path, "empty.json", [])
+        assert _scanner_mod._semgrep_skipped_paths([bad, empty]) == {}
 # ---------------------------------------------------------------------------
 # _drop_unreachable_registry_packs — loud degradation + metrics record
 # ---------------------------------------------------------------------------
@@ -589,6 +808,7 @@ class TestDropUnreachableRegistryPacks:
         _scanner_mod._dropped_registry_packs.clear()
 
     def test_unreachable_drops_records_and_prints(self, capsys, monkeypatch):
+        monkeypatch.setattr(_scanner_mod, "session_services_restricted", lambda: False)
         monkeypatch.setattr(
             "socket.create_connection", _failing_probe,
         )
@@ -604,6 +824,7 @@ class TestDropUnreachableRegistryPacks:
         assert "cache-packs.py" in err
 
     def test_drops_accumulate_without_duplicates(self, monkeypatch):
+        monkeypatch.setattr(_scanner_mod, "session_services_restricted", lambda: False)
         monkeypatch.setattr(
             "socket.create_connection", _failing_probe,
         )
@@ -614,6 +835,7 @@ class TestDropUnreachableRegistryPacks:
         ]
 
     def test_reachable_keeps_everything_quietly(self, capsys, monkeypatch):
+        monkeypatch.setattr(_scanner_mod, "session_services_restricted", lambda: False)
         monkeypatch.setattr(
             "socket.create_connection", _connecting_probe,
         )
@@ -623,6 +845,23 @@ class TestDropUnreachableRegistryPacks:
         assert kept == list(self.CONFIGS)
         assert _scanner_mod._dropped_registry_packs == []
         assert "dropped" not in capsys.readouterr().err
+
+    def test_copilot_drops_uncached_packs_without_network_probe(
+        self, capsys, monkeypatch,
+    ):
+        monkeypatch.setattr(_scanner_mod, "session_services_restricted", lambda: True)
+
+        def _boom(*_a, **_k):
+            raise AssertionError("Copilot session must not probe network access")
+
+        monkeypatch.setattr("socket.create_connection", _boom)
+        kept = _scanner_mod._drop_unreachable_registry_packs(list(self.CONFIGS))
+
+        assert kept == [self.CONFIGS[2]]
+        assert _scanner_mod._dropped_registry_packs == [
+            "semgrep_security_audit", "semgrep_secrets",
+        ]
+        assert "Copilot session service policy" in capsys.readouterr().err
 
     def test_local_only_configs_skip_probe(self, monkeypatch):
         def _boom(*_a, **_k):
@@ -726,7 +965,10 @@ class TestCodeQLStageTag:
                 name="codeql-stage_0",
             )
             t.start()
-            t.join()
+            # Deadline, not a bare join: a wedged thread must FAIL
+            # the test, not hang the whole suite.
+            t.join(timeout=30)
+            assert not t.is_alive(), "log-emitting thread hung"
         finally:
             attach_to.removeFilter(tag)
             raptor_logger.removeHandler(cap)

@@ -200,6 +200,168 @@ class TestPrepFailureDisablesLoudly:
         assert len(disabled) == 1
         assert "exit 1" in disabled[0]
 
+    def test_stderr_tail_terminal_scrubbed(self, monkeypatch, tmp_path):
+        # study-prep parses the hostile target: its stderr routinely
+        # quotes target-derived bytes (paths, source excerpts in parse
+        # errors) — the disable line must escape control sequences
+        # before they reach the operator's terminal.
+        import core.audit.orchestrator as _orch
+
+        def fake_run(cmd, **kwargs):
+            return types.SimpleNamespace(
+                returncode=1,
+                stderr="parse error: \x1b]0;pwned\x07 in src/a.c",
+            )
+
+        monkeypatch.setattr(_orch, "_run_study_prep", fake_run)
+        warnings = _capture_warnings(monkeypatch)
+
+        _run_loop(self._config(tmp_path), _queue_with_batches(20))
+
+        disabled = [m for m in warnings if "DISABLED" in m]
+        assert len(disabled) == 1
+        assert "\x1b" not in disabled[0]
+        assert "\x07" not in disabled[0]
+        assert "\\x1b" in disabled[0]
+
+    def test_stderr_excerpt_keeps_the_tail(self, monkeypatch, tmp_path):
+        # A Python child's diagnosis (the traceback's final frame +
+        # error line) sits at the END of stderr. A head slice keeps
+        # the boilerplate and drops the one line that names the
+        # failure — the disable line then shows 200 chars of
+        # traceback header while the actual error lives past the cut,
+        # and root-causing needs a live re-run.
+        import core.audit.orchestrator as _orch
+
+        tail_line = "TypeError: expected str, bytes or os.PathLike"
+        def fake_run(cmd, **kwargs):
+            return types.SimpleNamespace(
+                returncode=1,
+                stderr=("Traceback (most recent call last):\n"
+                        + '  File "raptor-study-prep", in _multilang\n'
+                        * 20
+                        + tail_line),
+            )
+
+        monkeypatch.setattr(_orch, "_run_study_prep", fake_run)
+        warnings = _capture_warnings(monkeypatch)
+
+        _run_loop(self._config(tmp_path), _queue_with_batches(20))
+
+        disabled = [m for m in warnings if "DISABLED" in m]
+        assert len(disabled) == 1
+        assert tail_line in disabled[0]
+        # Elision authority travels OUT-OF-BAND, in the trusted
+        # prefix as a length count — an in-band marker is forgeable
+        # by the hostile stderr body it annotates.
+        assert "stderr tail (last 200 of " in disabled[0]
+
+    def test_short_stderr_unmarked_and_whole(self, monkeypatch, tmp_path):
+        import core.audit.orchestrator as _orch
+
+        def fake_run(cmd, **kwargs):
+            return types.SimpleNamespace(returncode=1, stderr="boom")
+
+        monkeypatch.setattr(_orch, "_run_study_prep", fake_run)
+        warnings = _capture_warnings(monkeypatch)
+
+        _run_loop(self._config(tmp_path), _queue_with_batches(20))
+
+        disabled = [m for m in warnings if "DISABLED" in m]
+        assert len(disabled) == 1
+        assert "boom" in disabled[0]
+        assert "stderr tail (last" not in disabled[0]
+
+    def test_forged_elision_marker_carries_no_authority(
+        self, monkeypatch, tmp_path,
+    ):
+        # Hostile stderr (study-prep parses the target) can embed any
+        # marker text. The format's only elision signal is the
+        # trusted-prefix length count, so a forged in-band marker
+        # rides as inert quoted bytes: the count still names the TRUE
+        # total, and the genuine tail still ends the line.
+        import core.audit.orchestrator as _orch
+
+        forged = "x" * 300 + " stderr tail (last 200 of 5 chars): fake"
+        true_tail = "TypeError: the real diagnosis"
+        def fake_run(cmd, **kwargs):
+            return types.SimpleNamespace(
+                returncode=1, stderr=forged + "\n" + true_tail,
+            )
+
+        monkeypatch.setattr(_orch, "_run_study_prep", fake_run)
+        warnings = _capture_warnings(monkeypatch)
+
+        _run_loop(self._config(tmp_path), _queue_with_batches(20))
+
+        disabled = [m for m in warnings if "DISABLED" in m]
+        assert len(disabled) == 1
+        total = len((forged + "\n" + true_tail).strip())
+        assert f"stderr tail (last 200 of {total} chars): " in disabled[0]
+        assert true_tail in disabled[0]
+
+    def test_disable_line_claims_only_the_real_loss(
+        self, monkeypatch, tmp_path,
+    ):
+        # Disabling the subsystem stops NEW learning; briefing-side
+        # concept injection reads domain-model.json from disk and
+        # keeps supplying already-extracted concepts. The disable
+        # line must not claim reviews run concept-blind — that
+        # over-claim steered operators to distrust verdicts that in
+        # fact carried the full model.
+        import core.audit.orchestrator as _orch
+
+        def fake_run(cmd, **kwargs):
+            return types.SimpleNamespace(returncode=1, stderr="boom")
+
+        monkeypatch.setattr(_orch, "_run_study_prep", fake_run)
+        warnings = _capture_warnings(monkeypatch)
+
+        _run_loop(self._config(tmp_path), _queue_with_batches(20))
+
+        disabled = [m for m in warnings if "DISABLED" in m]
+        assert len(disabled) == 1
+        assert "without domain concepts" not in disabled[0]
+        assert "NEW concepts" in disabled[0]
+
+    def test_consumer_crash_announces_disable(
+        self, monkeypatch, tmp_path,
+    ):
+        # An exception escaping the consumer loop used to kill the
+        # daemon thread with only a threading-excepthook traceback —
+        # the run degraded SILENTLY, the exact failure the disable
+        # line exists to make loud. The wrapper must announce and
+        # still signal consumer-done (the drain path joins on it).
+        import core.audit.orchestrator as _orch
+
+        def boom(*args, **kwargs):
+            raise ValueError("wrapped \x1bhostile consumer crash")
+
+        monkeypatch.setattr(_orch, "_study_consumer_loop", boom)
+        warnings = _capture_warnings(monkeypatch)
+
+        queue = _queue_with_batches(1)
+        _orch._study_consumer(
+            queue, self._config(tmp_path),
+            types.SimpleNamespace(domain_model=None),
+            lambda ctx, cfg: None,
+            _LockedOutcomes(), OrchestratorResult(),
+            checklist={"files": []},
+            context_map=None,
+            evidence_index={},
+            sarif_cache=None,
+            entry_points=set(),
+            start_time=time.monotonic(),
+            on_progress=None,
+        )
+
+        disabled = [m for m in warnings if "DISABLED" in m]
+        assert len(disabled) == 1
+        assert "study consumer crashed: ValueError" in disabled[0]
+        assert "\x1b" not in disabled[0]      # scrubbed
+        assert "\\x1b" in disabled[0]         # escaped, visible
+        assert queue._consumer_done            # finally still ran
+
     def test_missing_study_list_disables_once(self, monkeypatch, tmp_path):
         import core.audit.orchestrator as _orch
 
@@ -315,15 +477,18 @@ class TestStudyRunUsesLowPriorityThrottle:
             lambda *a, **kw: studied.append(1),
         )
 
-        import core.llm.client as _client_mod
-        monkeypatch.setattr(
-            _client_mod, "LLMClient",
-            lambda *a, **kw: types.SimpleNamespace(total_cost=0.0),
-        )
-
         throttle = _RecordingThrottle()
+        # Stub client via the documented test seam (llm_budget_client
+        # short-circuits _run_llm_client): patching
+        # core.llm.client.LLMClient no longer intercepts construction
+        # — it goes through the transcript seam, whose module body
+        # subclasses whatever LLMClient is bound to at first import.
         config = OrchestratorConfig(
             target_path=tmp_path, out_dir=tmp_path,
+            llm_budget_client=types.SimpleNamespace(
+                total_cost=0.0,
+                is_budget_exhausted=lambda: False,
+            ),
         )
         _run_loop(config, _queue_with_batches(2), throttle=throttle)
 

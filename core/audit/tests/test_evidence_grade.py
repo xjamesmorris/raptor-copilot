@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+
+import pytest
 
 from core.audit.evidence_grade import (
     VALID_EVIDENCE_TOOLS,
@@ -16,6 +20,7 @@ from core.audit.evidence_grade import (
     grade_evidence_record,
     grade_review_result,
     is_tool_evidence,
+    is_verification_evidence,
     sanitize_llm_evidence_tool,
 )
 
@@ -215,7 +220,11 @@ class TestGradeReviewResult:
         })
         assert any(e.source == EvidenceSource.LLM_SPEC for e in items)
 
-    def test_typestate_confirmed(self):
+    def test_typestate_confirmed_without_context_is_llm_inferred(self):
+        # ``typestate_violation`` is parsed model JSON. Without the
+        # pipeline confirming typestate context was injected for this
+        # function, a fabricated ``confirmed: true`` must not mint a
+        # ``mechanical:`` namespace item nor HIGH confidence.
         items = grade_review_result({
             "typestate_violation": {
                 "confirmed": True,
@@ -223,9 +232,50 @@ class TestGradeReviewResult:
                 "type_name": "malloc/free",
             },
         })
-        ts = [e for e in items if e.source == EvidenceSource.TYPESTATE]
+        assert not any(e.source == EvidenceSource.TYPESTATE for e in items)
+        assert not any(e.confidence == Confidence.HIGH for e in items)
+        ts = [e for e in items if "double_free" in e.description]
         assert len(ts) == 1
-        assert ts[0].confidence == Confidence.HIGH
+        assert ts[0].source == EvidenceSource.LLM_INFERRED
+
+    def test_typestate_confirmed_with_matching_context_corroborated(self):
+        ctx = [SimpleNamespace(
+            type_name="malloc/free", violation_kind="double_free",
+        )]
+        items = grade_review_result(
+            {
+                "typestate_violation": {
+                    "confirmed": True,
+                    "violation_kind": "double_free",
+                    "type_name": "malloc/free",
+                },
+            },
+            typestate_context=ctx,
+        )
+        ts = [e for e in items if "double_free" in e.description]
+        assert len(ts) == 1
+        assert ts[0].source == EvidenceSource.LLM_CORROBORATED
+        assert ts[0].confidence == Confidence.MEDIUM
+
+    def test_typestate_confirmed_type_mismatch_not_corroborated(self):
+        # Context was injected, but for a DIFFERENT resource type than
+        # the model's claim names — no corroboration.
+        ctx = [SimpleNamespace(
+            type_name="fopen/fclose", violation_kind="missing_cleanup",
+        )]
+        items = grade_review_result(
+            {
+                "typestate_violation": {
+                    "confirmed": True,
+                    "violation_kind": "double_free",
+                    "type_name": "malloc/free",
+                },
+            },
+            typestate_context=ctx,
+        )
+        ts = [e for e in items if "double_free" in e.description]
+        assert len(ts) == 1
+        assert ts[0].source == EvidenceSource.LLM_INFERRED
 
     def test_typestate_unconfirmed_skipped(self):
         items = grade_review_result({
@@ -642,3 +692,657 @@ class TestCompositePolicy:
             "consistency:return-check-majority"
             "+consistency:flag-mode-majority",
         )
+
+
+class TestSanitizedCompositeOrdering:
+    """A model-claimed multi-tool composite stays claim-tier under
+    EVERY sanitize ordering a consumer can apply — and the sanitized
+    form stays displayable (never silently dropped).
+
+    sanitize_llm_evidence_tool is applied whole-string by some
+    consumers and per-"+"-part by others, and downstream code
+    re-splits and re-joins stamps. No ordering of those operations may
+    launder the claim back to verification grade: the prefix-lead
+    rule, the claim-tail break, and the contaminated-composite rule
+    each close one ordering, and these pins hold all three shut.
+    """
+
+    # A claim whose text names a genuine verification receipt plus a
+    # detection variant — raw, the receipt part would qualify.
+    CLAIMED_MIXED = "smt:check-integer-narrowing+consistency:return-check-majority"
+    # A claim shaped exactly like the aggregation-promotion receipt —
+    # raw, two distinct detection namespaces qualify.
+    CLAIMED_AGGREGATION = (
+        "consistency:return-check-majority"
+        "+fail_open:handler-outcome-naming"
+    )
+
+    def test_raw_shapes_would_qualify(self):
+        # Control: the pins below prove sanitization is what demotes
+        # these composites, not that the spellings were worthless.
+        assert is_verification_evidence(self.CLAIMED_MIXED)
+        assert is_verification_evidence(self.CLAIMED_AGGREGATION)
+
+    def test_whole_string_sanitize_never_verifies(self):
+        for raw in (self.CLAIMED_MIXED, self.CLAIMED_AGGREGATION):
+            sanitized = sanitize_llm_evidence_tool(raw)
+            assert not is_verification_evidence(sanitized)
+            assert not is_tool_evidence(sanitized)
+            # Displayable, not dropped: the claim text survives under
+            # the llm-claimed: namespace.
+            assert sanitized == f"llm-claimed:{raw}"
+
+    def test_per_part_sanitize_never_verifies(self):
+        for raw in (self.CLAIMED_MIXED, self.CLAIMED_AGGREGATION):
+            sanitized = "+".join(
+                p for p in (
+                    sanitize_llm_evidence_tool(part.strip())
+                    for part in raw.split("+")
+                ) if p
+            )
+            assert not is_verification_evidence(sanitized)
+            assert not is_tool_evidence(sanitized)
+            assert all(
+                part.startswith("llm-claimed:")
+                for part in sanitized.split("+")
+            )
+
+    def test_resplit_reorder_never_verifies(self):
+        # A consumer that splits a whole-string-sanitized stamp on "+"
+        # and re-joins in any order must not surface an un-prefixed
+        # tail part ahead of the claim marker.
+        for raw in (self.CLAIMED_MIXED, self.CLAIMED_AGGREGATION):
+            parts = sanitize_llm_evidence_tool(raw).split("+")
+            reordered = "+".join(reversed(parts))
+            assert not is_verification_evidence(reordered)
+            # And the individual tail parts earn nothing alone.
+            for part in parts:
+                if not part.startswith("llm-claimed:"):
+                    assert not is_verification_evidence(part)
+
+    def test_genuine_receipt_before_claim_marker_still_verifies(self):
+        # The documented evidence-combine shape stays open: a PIPELINE
+        # receipt joined ahead of a sanitized claim keeps its status.
+        assert is_verification_evidence(
+            "smt:check-integer-narrowing+llm-claimed:smt",
+        )
+
+
+class TestProducerStampClosure:
+    """Mechanical closure of pipeline evidence_tool producers against
+    the evidence-grade firewall.
+
+    Every stamp a pipeline producer can commit on a ``finding``-status
+    outcome must satisfy ``is_tool_evidence`` — a producer outside the
+    registry fires the CRITICAL promotion alarm on legitimate runs and
+    is demoted at export (the same enumeration-boundary shape has now
+    produced firewall gaps twice). The sweep enumerates the real
+    producers from source: constructor keywords, promotion/stamp
+    helpers, and attribute assignments, resolving function-local
+    constant bindings (including paired ``status, stamp = ...`` tuple
+    assigns, so a stamp only ever committed with a non-``finding``
+    status is not a violation)."""
+
+    _AUDIT_ROOT = Path(__file__).resolve().parents[1]
+
+    # Stamps a producer deliberately commits only on demotable /
+    # non-finding outcomes. Additions require a behavioral test
+    # proving the stamp never rides a "finding" status.
+    _DELIBERATELY_DEMOTABLE: frozenset = frozenset()
+
+    @classmethod
+    def _modules(cls):
+        import ast as _ast
+
+        for path in sorted(cls._AUDIT_ROOT.rglob("*.py")):
+            parts = path.relative_to(cls._AUDIT_ROOT).parts
+            if "tests" in parts or "scripts" in parts:
+                continue
+            yield path, _ast.parse(path.read_text())
+
+    @staticmethod
+    def _scopes(tree):
+        """Yield (scope_node, body_statements) for the module and each
+        function, so constant resolution stays function-local."""
+        import ast as _ast
+
+        yield tree, tree.body
+        for node in _ast.walk(tree):
+            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                yield node, node.body
+
+    @staticmethod
+    def _scope_local_nodes(scope_node):
+        """Walk scope_node's subtree WITHOUT descending into nested
+        scopes (functions, classes, lambdas): a class-body field
+        default like ``evidence_tool: str = ""`` is a binding in the
+        CLASS namespace, not the module's — letting it leak into the
+        module pass resolves unrelated function-local Names against
+        it and fabricates violations.
+
+        The narrowing loses cross-scope resolution (a call reading a
+        closure variable bound in an enclosing function is no longer
+        resolved), which is the documented trade: scope-local truth
+        over an over-approximation that manufactures bindings no
+        producer ever commits."""
+        import ast as _ast
+
+        _NESTED = (
+            _ast.FunctionDef, _ast.AsyncFunctionDef,
+            _ast.ClassDef, _ast.Lambda,
+        )
+        stack = list(_ast.iter_child_nodes(scope_node))
+        while stack:
+            node = stack.pop()
+            yield node
+            if not isinstance(node, _NESTED):
+                stack.extend(_ast.iter_child_nodes(node))
+
+    @classmethod
+    def _local_bindings(cls, scope_node):
+        """name -> set of str constants assigned in this scope, plus
+        the list of paired tuple-assign bindings ({name: const|None}).
+
+        Nested scopes are pruned via ``_scope_local_nodes``: a
+        class-level assignment is a field/attribute default (e.g. a
+        dataclass's ``evidence_tool: str = ""``), not a binding of
+        the like-named LOCAL at a producer call site — resolving it
+        minted a phantom empty stamp for a call whose actual argument
+        is a runtime-computed local. Nothing real is lost to the
+        prune: a class attribute used at a call site is an
+        ``Attribute`` node (never a bare ``Name``), and nested
+        functions still get their own scope pass via ``_scopes``.
+        """
+        import ast as _ast
+
+        consts: dict = {}
+        pairs: list = []
+        for node in cls._scope_local_nodes(scope_node):
+            if isinstance(node, _ast.Assign):
+                for target in node.targets:
+                    if (
+                        isinstance(target, _ast.Tuple)
+                        and isinstance(node.value, _ast.Tuple)
+                        and len(target.elts) == len(node.value.elts)
+                        and all(isinstance(t, _ast.Name) for t in target.elts)
+                    ):
+                        pair = {}
+                        for t, v in zip(target.elts, node.value.elts):
+                            val = (
+                                v.value
+                                if isinstance(v, _ast.Constant)
+                                and isinstance(v.value, str) else None
+                            )
+                            pair[t.id] = val
+                            if val is not None:
+                                consts.setdefault(t.id, set()).add(val)
+                        pairs.append(pair)
+                    elif isinstance(target, _ast.Name) and isinstance(
+                        node.value, _ast.Constant,
+                    ) and isinstance(node.value.value, str):
+                        consts.setdefault(target.id, set()).add(
+                            node.value.value,
+                        )
+            elif isinstance(node, _ast.AnnAssign) and isinstance(
+                node.target, _ast.Name,
+            ) and isinstance(node.value, _ast.Constant) and isinstance(
+                node.value.value, str,
+            ):
+                consts.setdefault(node.target.id, set()).add(
+                    node.value.value,
+                )
+        return consts, pairs
+
+    @classmethod
+    def _finding_stamps(cls):
+        """Enumerate (location, stamp) for every constant-resolvable
+        stamp a producer can commit alongside status="finding"."""
+        import ast as _ast
+
+        found: list = []
+        call_sites = 0
+        for path, tree in cls._modules():
+            rel = path.relative_to(cls._AUDIT_ROOT)
+            for scope, _body in cls._scopes(tree):
+                consts, pairs = cls._local_bindings(scope)
+                for node in _ast.walk(scope):
+                    if not isinstance(node, _ast.Call):
+                        continue
+                    kw = {k.arg: k.value for k in node.keywords if k.arg}
+                    fn = node.func
+                    fn_name = (
+                        fn.id if isinstance(fn, _ast.Name)
+                        else fn.attr if isinstance(fn, _ast.Attribute)
+                        else ""
+                    )
+                    # Promotion / stamping helpers: the tool argument
+                    # becomes the receipt of a finding-status outcome.
+                    if fn_name in ("_promote_outcome", "_stamp_evidence"):
+                        args = list(node.args)
+                        tool = args[1] if len(args) > 1 else kw.get("tool")
+                        if isinstance(tool, _ast.Constant) and isinstance(
+                            tool.value, str,
+                        ):
+                            found.append((f"{rel}:{node.lineno}", tool.value))
+                        elif isinstance(tool, _ast.JoinedStr) and tool.values:
+                            first = tool.values[0]
+                            if isinstance(first, _ast.Constant):
+                                # A prefixed receipt: the prefix must be
+                                # a known namespace or a provenance
+                                # wrapper (judged at runtime on the
+                                # wrapped receipt).
+                                found.append((
+                                    f"{rel}:{node.lineno}",
+                                    ("prefix", str(first.value)),
+                                ))
+                        continue
+                    if "evidence_tool" not in kw or "status" not in kw:
+                        continue
+                    call_sites += 1
+                    status_node, ev_node = kw["status"], kw["evidence_tool"]
+
+                    def _resolve(n):
+                        if isinstance(n, _ast.Constant) and isinstance(
+                            n.value, str,
+                        ):
+                            return {n.value}, None
+                        if isinstance(n, _ast.Name):
+                            return set(consts.get(n.id, ())), n.id
+                        return set(), None
+
+                    status_vals, status_name = _resolve(status_node)
+                    ev_vals, ev_name = _resolve(ev_node)
+                    if "finding" not in status_vals:
+                        continue
+                    if status_name and ev_name:
+                        # Paired tuple assigns bind status and stamp
+                        # together — only stamps paired with "finding"
+                        # are commitments the firewall must accept.
+                        paired = [
+                            p for p in pairs
+                            if status_name in p and ev_name in p
+                        ]
+                        if paired:
+                            for p in paired:
+                                if p[status_name] == "finding" and p[
+                                    ev_name
+                                ] is not None:
+                                    found.append((
+                                        f"{rel}:{node.lineno}", p[ev_name],
+                                    ))
+                            continue
+                    for stamp in ev_vals:
+                        found.append((f"{rel}:{node.lineno}", stamp))
+        return found, call_sites
+
+    # Full AST parse + producer-site walk of every core/audit runtime
+    # module with function-local constant resolution — genuinely heavy;
+    # over the fast tier's budget. The attribute-writer sibling keeps a
+    # sweep of the same closure in the default tier.
+    @pytest.mark.slow
+    def test_every_finding_producer_stamp_passes_the_firewall(self):
+        from core.audit.evidence_grade import (
+            _PROVENANCE_WRAPPERS,
+            _TOOL_NAMESPACES,
+        )
+
+        found, call_sites = self._finding_stamps()
+        # Non-vacuity: the sweep must actually see the producer
+        # surface (helper literals and constructor sites both exist).
+        assert call_sites >= 3, "sweep no longer sees producer calls"
+        assert len(found) >= 2, "sweep no longer resolves any stamps"
+        violations = []
+        for loc, stamp in found:
+            if isinstance(stamp, tuple):  # ("prefix", value)
+                prefix = stamp[1]
+                ns = prefix.split(":", 1)[0]
+                if ns not in _TOOL_NAMESPACES and not any(
+                    prefix.startswith(w) or w.startswith(prefix)
+                    for w in _PROVENANCE_WRAPPERS
+                ):
+                    violations.append((loc, prefix))
+                continue
+            if stamp in self._DELIBERATELY_DEMOTABLE:
+                continue
+            if not is_tool_evidence(stamp):
+                violations.append((loc, stamp))
+        assert not violations, (
+            "finding-status producers commit stamps the evidence-grade "
+            f"firewall rejects (CRITICAL-alarm + export demotion): "
+            f"{violations}"
+        )
+
+    def test_class_field_default_does_not_bind_at_module_scope(self):
+        """Regression: the module pass once collected bindings with a
+        full-subtree walk, so a dataclass field default (class-body
+        ``evidence_tool: str = ""``) bound as a module constant and
+        resolved an unrelated function-local ``evidence_tool`` Name to
+        "" — fabricating a receipt-less stamp at a producer whose
+        runtime value is a joined tool list."""
+        import ast as _ast
+        import textwrap
+
+        tree = _ast.parse(textwrap.dedent('''
+            MOD_TOOL = "joern"
+
+            class Outcome:
+                evidence_tool: str = ""
+                other = "llm"
+
+            def producer(entry):
+                evidence_tool = "+".join(entry.tools)
+                emit(status="finding", evidence_tool=evidence_tool)
+
+            def local_producer():
+                local_tool = "semgrep"
+                emit(status="finding", evidence_tool=local_tool)
+        '''))
+        consts, _pairs = self._local_bindings(tree)
+        assert consts.get("MOD_TOOL") == {"joern"}
+        assert "evidence_tool" not in consts
+        assert "other" not in consts
+        funcs = {
+            n.name: n for n in _ast.walk(tree)
+            if isinstance(n, _ast.FunctionDef)
+        }
+        fconsts, _ = self._local_bindings(funcs["local_producer"])
+        assert fconsts.get("local_tool") == {"semgrep"}
+
+    def test_attribute_stamp_writers_pass_the_firewall(self):
+        """Promotion paths that stamp via ``outcome.evidence_tool = X``
+        (dynamic sweep, dark-verify) — every constant they can write
+        must be firewall-known or deliberately demotable."""
+        import ast as _ast
+
+        found = []
+        for path, tree in self._modules():
+            rel = path.relative_to(self._AUDIT_ROOT)
+            for node in _ast.walk(tree):
+                if not isinstance(node, _ast.Assign):
+                    continue
+                for target in node.targets:
+                    if (
+                        isinstance(target, _ast.Attribute)
+                        and target.attr == "evidence_tool"
+                        and isinstance(node.value, _ast.Constant)
+                        and isinstance(node.value.value, str)
+                        and node.value.value
+                    ):
+                        found.append(
+                            (f"{rel}:{node.lineno}", node.value.value),
+                        )
+        assert found, "sweep no longer sees attribute stamp writers"
+        violations = [
+            (loc, stamp) for loc, stamp in found
+            if stamp not in self._DELIBERATELY_DEMOTABLE
+            and not is_tool_evidence(stamp)
+        ]
+        assert not violations, (
+            "attribute stamp writers emit firewall-rejected stamps: "
+            f"{violations}"
+        )
+
+
+class TestStampPartOrderClosure:
+    """Mechanical closure of stamp-part consumers against positional
+    trust.
+
+    ``is_verification_evidence`` stops scanning at the first
+    ``llm-claimed:`` part — everything after the claim marker is
+    quarantined by POSITION in the composite. A consumer that splits an
+    ``evidence_tool`` composite on ``"+"`` and sorts, set-dedups, or
+    otherwise re-orders the parts before rejoining could surface a
+    quarantined tail part ahead of the claim marker and mint
+    verification grade from a model claim. This census enumerates every
+    runtime ``.split("+")`` site under core/ and packages/ and asserts
+    none feeds ``sorted()``/``set()``/``frozenset()``/``reversed()``
+    (or an in-place ``.sort()``, or a set-shaped comprehension) into a
+    ``"+".join``. Order-preserving rejoins (plain lists, strip
+    comprehensions, generator expressions) stay open — only re-ordering
+    shapes are violations.
+    """
+
+    _REPO_ROOT = Path(__file__).resolve().parents[3]
+    _REORDERERS = ("sorted", "set", "frozenset", "reversed")
+
+    @classmethod
+    def _runtime_modules(cls):
+        for top in ("core", "packages"):
+            for path in sorted((cls._REPO_ROOT / top).rglob("*.py")):
+                parts = path.relative_to(cls._REPO_ROOT).parts
+                if "tests" in parts or "scripts" in parts:
+                    continue
+                yield path
+
+    @staticmethod
+    def _scopes(tree):
+        import ast as _ast
+
+        yield tree
+        for node in _ast.walk(tree):
+            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                yield node
+
+    @staticmethod
+    def _scope_nodes(scope_node):
+        """Walk *scope_node* without descending into nested scopes
+        (same per-scope narrowing as TestProducerStampClosure)."""
+        import ast as _ast
+
+        for child in _ast.iter_child_nodes(scope_node):
+            if isinstance(child, (
+                _ast.FunctionDef, _ast.AsyncFunctionDef,
+                _ast.ClassDef, _ast.Lambda,
+            )):
+                continue
+            yield child
+            yield from TestStampPartOrderClosure._scope_nodes(child)
+
+    @classmethod
+    def _is_split_call(cls, node) -> bool:
+        import ast as _ast
+
+        return (
+            isinstance(node, _ast.Call)
+            and isinstance(node.func, _ast.Attribute)
+            and node.func.attr == "split"
+            and len(node.args) >= 1
+            and isinstance(node.args[0], _ast.Constant)
+            and node.args[0].value == "+"
+        )
+
+    @classmethod
+    def _is_parts_expr(cls, node, parts_names: set) -> bool:
+        """Expression yielding split-on-plus parts (order preserved)."""
+        import ast as _ast
+
+        if cls._is_split_call(node):
+            return True
+        if isinstance(node, _ast.Name):
+            return node.id in parts_names
+        if isinstance(node, (_ast.ListComp, _ast.GeneratorExp)):
+            return any(
+                cls._is_parts_expr(g.iter, parts_names)
+                for g in node.generators
+            )
+        if (
+            isinstance(node, _ast.Call)
+            and isinstance(node.func, _ast.Name)
+            and node.func.id in ("list", "tuple")
+        ):
+            return bool(node.args) and cls._is_parts_expr(
+                node.args[0], parts_names,
+            )
+        return False
+
+    @classmethod
+    def _is_reordered_parts(
+        cls, node, parts_names: set, reorder_names: set,
+    ) -> bool:
+        """Expression yielding split parts in a DIFFERENT order."""
+        import ast as _ast
+
+        if isinstance(node, _ast.Name):
+            return node.id in reorder_names
+        if (
+            isinstance(node, _ast.Call)
+            and isinstance(node.func, _ast.Name)
+            and node.func.id in cls._REORDERERS
+        ):
+            return bool(node.args) and cls._is_parts_expr(
+                node.args[0], parts_names,
+            )
+        if isinstance(node, _ast.SetComp):
+            return any(
+                cls._is_parts_expr(g.iter, parts_names)
+                for g in node.generators
+            )
+        return False
+
+    @classmethod
+    def _scope_violations(cls, scope, rel) -> tuple:
+        import ast as _ast
+
+        nodes = list(cls._scope_nodes(scope))
+        split_sites = sum(1 for n in nodes if cls._is_split_call(n))
+        parts_names: set = set()
+        reorder_names: set = set()
+        # Two passes give one-hop transitivity (parts -> alias ->
+        # reordered alias) without a full fixpoint.
+        for _ in range(2):
+            for node in nodes:
+                target = None
+                if isinstance(node, _ast.Assign) and len(
+                    node.targets,
+                ) == 1 and isinstance(node.targets[0], _ast.Name):
+                    target = node.targets[0].id
+                elif isinstance(node, _ast.AnnAssign) and isinstance(
+                    node.target, _ast.Name,
+                ) and node.value is not None:
+                    target = node.target.id
+                if target is None:
+                    continue
+                if cls._is_parts_expr(node.value, parts_names):
+                    parts_names.add(target)
+                elif cls._is_reordered_parts(
+                    node.value, parts_names, reorder_names,
+                ):
+                    reorder_names.add(target)
+        violations = []
+        for node in nodes:
+            if not isinstance(node, _ast.Call):
+                continue
+            fn = node.func
+            if not isinstance(fn, _ast.Attribute):
+                continue
+            if (
+                fn.attr == "join"
+                and isinstance(fn.value, _ast.Constant)
+                and fn.value.value == "+"
+                and node.args
+                and cls._is_reordered_parts(
+                    node.args[0], parts_names, reorder_names,
+                )
+            ):
+                violations.append((
+                    f"{rel}:{node.lineno}",
+                    "re-ordered split('+') parts rejoined with '+'",
+                ))
+            elif (
+                fn.attr == "sort"
+                and isinstance(fn.value, _ast.Name)
+                and fn.value.id in parts_names
+            ):
+                violations.append((
+                    f"{rel}:{node.lineno}",
+                    "in-place sort of split('+') parts",
+                ))
+        return violations, split_sites
+
+    @classmethod
+    def _census(cls) -> tuple:
+        import ast as _ast
+
+        violations: list = []
+        split_sites = 0
+        for path in cls._runtime_modules():
+            text = path.read_text(encoding="utf-8", errors="replace")
+            if '.split("+")' not in text and ".split('+')" not in text:
+                continue
+            rel = path.relative_to(cls._REPO_ROOT)
+            for scope in cls._scopes(_ast.parse(text)):
+                v, s = cls._scope_violations(scope, rel)
+                violations.extend(v)
+                split_sites += s
+        return violations, split_sites
+
+    def test_no_runtime_consumer_reorders_stamp_parts(self):
+        violations, split_sites = self._census()
+        # Non-vacuity: the census must actually see the consumer
+        # surface (evidence_grade, llm_review, orchestrator, export
+        # all split composites today).
+        assert split_sites >= 10, (
+            "census no longer sees split('+') consumer sites"
+        )
+        assert not violations, (
+            "stamp-part consumers re-order '+'-joined parts before "
+            "rejoining — part order is load-bearing (the first "
+            "llm-claimed: part quarantines everything after it): "
+            f"{violations}"
+        )
+
+    def test_detector_catches_reorder_shapes(self):
+        import ast as _ast
+
+        bad_snippets = (
+            'def f(ev):\n'
+            '    return "+".join(sorted(ev.split("+")))\n',
+
+            'def f(ev):\n'
+            '    return "+".join(set(ev.split("+")))\n',
+
+            'def f(ev):\n'
+            '    parts = [p.strip() for p in ev.split("+")]\n'
+            '    ordered = sorted(parts)\n'
+            '    return "+".join(ordered)\n',
+
+            'def f(ev):\n'
+            '    parts = ev.split("+")\n'
+            '    parts.sort()\n'
+            '    return "+".join(parts)\n',
+
+            'def f(ev):\n'
+            '    return "+".join({p.strip() for p in ev.split("+")})\n',
+        )
+        for snippet in bad_snippets:
+            hits = [
+                v
+                for scope in self._scopes(_ast.parse(snippet))
+                for v in self._scope_violations(scope, "synthetic.py")[0]
+            ]
+            assert hits, f"detector missed a reorder shape:\n{snippet}"
+
+    def test_detector_ignores_order_preserving_consumers(self):
+        import ast as _ast
+
+        ok_snippets = (
+            # Fresh collections (not split parts) may sort freely.
+            'def f(a, b):\n'
+            '    return "+".join(sorted({a, b}))\n',
+
+            # Order-preserving rejoin of split parts.
+            'def f(ev):\n'
+            '    parts = ev.split("+")\n'
+            '    return "+".join(parts)\n',
+
+            # The documented strip-and-rejoin hygiene shape.
+            'def f(ev):\n'
+            '    return "+".join(p.strip() for p in ev.split("+"))\n',
+        )
+        for snippet in ok_snippets:
+            hits = [
+                v
+                for scope in self._scopes(_ast.parse(snippet))
+                for v in self._scope_violations(scope, "synthetic.py")[0]
+            ]
+            assert not hits, f"detector over-flags a benign shape:\n{snippet}"

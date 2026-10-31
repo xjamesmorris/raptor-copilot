@@ -9,11 +9,21 @@ lives in ``sources.json`` (see ``core.audit.corpus.sources``).
 
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 from core.json import load_json
+
+
+# Channel tags share the mechanism-token charset (the ``[a-z0-9_]``
+# vocabulary attribution's gate markers use). One compiled pattern is
+# shared with ``core.audit.corpus.channels`` so the two validators
+# cannot drift; both apply it with ``fullmatch`` — ``re.match`` with a
+# ``$`` anchor still accepts a trailing newline, which a directory or
+# JSON-sourced name can carry.
+CHANNEL_RE = re.compile(r"[a-z0-9_]+")
 
 
 SCHEMA_VERSION = 1
@@ -22,7 +32,18 @@ VALID_BUG_CLASSES = frozenset({
     "aliasing", "lifecycle", "variant",
     "auth", "clean", "concurrency", "integer",
     "trap", "uninitialised", "fail_open",
+    "consistency",
 })
+
+# Label provenance kinds.  ``""`` (default) is a real-world label —
+# public provenance lives in cve/fix_commit.  ``synthetic_mutant``
+# marks a mutation-generated label (see ``core.audit.corpus.mutation``
+# for the spec, the honesty contract, and application mechanics):
+# synthetic labels are declared, never laundered — the provenance
+# lint's no-cve/fix_commit warning is carved out ONLY on this kind,
+# and the runner/history store partition on it so mutant regression
+# floors never read as real-bug recall.
+VALID_PROVENANCE_KINDS = frozenset({"", "synthetic_mutant"})
 
 # ``suspicious`` labels a REAL defect whose correct grade at the
 # pinned tree sits below finding: the flaw is present and must never
@@ -123,8 +144,24 @@ class FunctionLabel:
     schema_version: int = SCHEMA_VERSION
     cwe: str = ""
     cve: str = ""
+    # Public provenance anchor when no CVE exists: the upstream fix
+    # commit (URL or sha) proving the flaw is publicly known. The lint
+    # warns when a vulnerable-class label carries neither cve nor
+    # fix_commit — finding labels need public provenance.
+    fix_commit: str = ""
     expected_mechanism: str = ""
     excerpt_scope: str = "function"
+    # Provenance kind (see VALID_PROVENANCE_KINDS).  Synthetic mutants
+    # additionally require a ``mutation`` spec and a content-addressed
+    # parent pin (``source.span_sha``), and must NOT carry cve /
+    # fix_commit — synthetic labels are declared, never dressed up
+    # with public-provenance anchors they do not have.
+    provenance_kind: str = ""
+    # Mutation spec (synthetic_mutant only): operator, site, edits,
+    # and the content hash of the applied result.  Validated by
+    # ``core.audit.corpus.mutation.validate_mutation_spec``; the
+    # SourcePin stays the UNMUTATED parent ref by design.
+    mutation: dict[str, Any] = field(default_factory=dict)
     expected_mode_results: dict[str, str] = field(default_factory=dict)
     # Optional per-engine exact-rule expectations for the mechanical
     # rule-verification runner (``rule_eval``): engine name -> list of
@@ -134,6 +171,14 @@ class FunctionLabel:
     # Validation is deliberately lenient — shape only — so labels can
     # pin rules from engines (or rule sets) this checkout doesn't ship.
     expected_rule_hits: dict[str, list[str]] = field(default_factory=dict)
+    # Optional audit-channel tag for per-channel micro-corpora (see
+    # ``core.audit.corpus.channels``): the pipeline channel this label
+    # exercises (e.g. an orchestrator channel or refutation gate name,
+    # the same token vocabulary ``expected_mechanism`` draws from).
+    # Charset-validated only — channels grow with the pipeline, so no
+    # enum is pinned here; the channels loader cross-checks the tag
+    # against the label's channel directory.
+    channel: str = ""
 
     def __post_init__(self) -> None:
         if self.bug_class not in VALID_BUG_CLASSES:
@@ -154,6 +199,63 @@ class FunctionLabel:
                 f"must be one of {sorted(VALID_EXCERPT_SCOPES)}"
             )
             raise ValueError(msg)
+        if self.provenance_kind not in VALID_PROVENANCE_KINDS:
+            msg = (
+                f"Invalid provenance_kind {self.provenance_kind!r}; "
+                f"must be one of {sorted(VALID_PROVENANCE_KINDS)}"
+            )
+            raise ValueError(msg)
+        if self.provenance_kind == "synthetic_mutant":
+            from .mutation import validate_mutation_spec
+
+            spec_errors = validate_mutation_spec(
+                self.mutation,
+                span=(self.source.line_start, self.source.line_end),
+            )
+            if spec_errors:
+                msg = (
+                    "Invalid synthetic_mutant label: "
+                    + "; ".join(spec_errors)
+                )
+                raise ValueError(msg)
+            if not self.source.span_sha:
+                msg = (
+                    "synthetic_mutant label requires a content-"
+                    "addressed parent pin (source.span_sha) — "
+                    "application must verify the clean upstream span"
+                )
+                raise ValueError(msg)
+            if (
+                self.mutation.get("mutated_span_sha")
+                == self.source.span_sha
+                and self.mutation.get("mutated_line_end")
+                == self.source.line_end
+            ):
+                # Edits are span-contained, so an equal span hash over
+                # the unchanged range means the spec is a no-op — a
+                # hand-crafted no-op label could declare pristine
+                # upstream code carrying a REAL bug as "synthetic".
+                msg = (
+                    "no-op mutation spec: mutated_span_sha equals the "
+                    "parent pin over the same range — a synthetic "
+                    "label must introduce its own defect, never "
+                    "re-declare upstream code"
+                )
+                raise ValueError(msg)
+            if self.cve.strip() or self.fix_commit.strip():
+                msg = (
+                    "synthetic_mutant label must not carry cve/"
+                    "fix_commit — synthetic provenance is declared, "
+                    "never dressed as public provenance"
+                )
+                raise ValueError(msg)
+        elif self.mutation:
+            msg = (
+                "mutation spec present without "
+                "provenance_kind='synthetic_mutant' — a mutated label "
+                "must declare its kind"
+            )
+            raise ValueError(msg)
         for mode, status in self.expected_mode_results.items():
             if mode not in VALID_REVIEW_MODES:
                 msg = (
@@ -168,6 +270,13 @@ class FunctionLabel:
                     f"must be one of {sorted(VALID_EXPECTED_STATUSES)}"
                 )
                 raise ValueError(msg)
+        if self.channel and not CHANNEL_RE.fullmatch(self.channel):
+            msg = (
+                f"Invalid channel {self.channel!r}; must fully match "
+                f"{CHANNEL_RE.pattern} (lowercase mechanism-token "
+                "charset)"
+            )
+            raise ValueError(msg)
         for engine, rule_ids in self.expected_rule_hits.items():
             if not isinstance(engine, str) or not engine:
                 msg = (
@@ -205,10 +314,14 @@ def load_label(path: Path) -> FunctionLabel:
         labeled_at=raw["labeled_at"],
         cwe=raw.get("cwe", ""),
         cve=raw.get("cve", ""),
+        fix_commit=raw.get("fix_commit", ""),
         expected_mechanism=raw.get("expected_mechanism", ""),
         excerpt_scope=raw.get("excerpt_scope", "function"),
+        provenance_kind=raw.get("provenance_kind", ""),
+        mutation=raw.get("mutation", {}),
         expected_mode_results=raw.get("expected_mode_results", {}),
         expected_rule_hits=raw.get("expected_rule_hits", {}),
+        channel=raw.get("channel", ""),
     )
 
 

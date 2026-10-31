@@ -16,6 +16,10 @@ files ending in ``.lock`` (``poetry.lock``, ``yarn.lock``,
 ``Gemfile.lock``) are not swallowed by IGNORE_SUFFIXES.
 """
 
+import logging
+import os
+import shutil
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -25,10 +29,54 @@ from packages.codeql import language_detector as ld_mod
 from packages.codeql.language_detector import LanguageDetector
 
 
+@pytest.fixture(autouse=True)
+def _raptor_logger_propagates():
+    """Let caplog see records from the 'raptor' logger.
+
+    RaptorLogger sets propagate=False on logging.getLogger('raptor'),
+    so records never reach root where pytest's caplog handler lives.
+    """
+    raptor = logging.getLogger("raptor")
+    orig = raptor.propagate
+    raptor.propagate = True
+    yield
+    raptor.propagate = orig
+
+
 def _write(repo: Path, rel: str, content: str = "") -> None:
     p = repo / rel
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
+
+
+def _git_env(repo: Path) -> dict:
+    """Hermetic git env — host/global/system config must not steer
+    the fixture repo (hooks templates, fsmonitor, ignore files)."""
+    return {
+        **os.environ,
+        "HOME": str(repo),
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+    }
+
+
+def _git(repo: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True, capture_output=True, env=_git_env(repo),
+    )
+
+
+def _init_commit_all(repo: Path) -> None:
+    subprocess.run(
+        ["git", "init", "-q", str(repo)],
+        check=True, capture_output=True, env=_git_env(repo),
+    )
+    _git(repo, "add", "-A")
+    _git(
+        repo, "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+        "commit", "-qm", "init", "--no-gpg-sign",
+    )
 
 
 class TestBuildManifestPromotion:
@@ -267,6 +315,70 @@ class TestFloorFallback:
         assert any(
             "Floor-tier include python" in w for w in warns
         ), f"expected loud floor-include WARN for python; got: {warns}"
+
+
+class TestTieredDetection:
+    """detect_languages_tiered() consolidates the three-tier cascade."""
+
+    def test_single_file_c_detected(self, tmp_path: Path):
+        _write(tmp_path, "vuln.c", "int main() {}")
+
+        det = LanguageDetector(tmp_path)
+        assert det.detect_languages(min_files=3) == {}, (
+            "strict tier must reject a single-file target"
+        )
+
+        tiered = det.detect_languages_tiered(min_files=3)
+        assert "cpp" in tiered, (
+            f"tiered cascade must find C via min_files=1 fallback; "
+            f"got {sorted(tiered.keys())}"
+        )
+
+    def test_walks_once(self, tmp_path: Path, monkeypatch):
+        _write(tmp_path, "a.c", "")
+
+        det = LanguageDetector(tmp_path)
+        walks: list[int] = []
+        original = det._scan_repository
+
+        def counting():
+            walks.append(1)
+            return original()
+
+        monkeypatch.setattr(det, "_scan_repository", counting)
+
+        det.detect_languages_tiered(min_files=3)
+
+        assert len(walks) == 1, (
+            "tiered detection must reuse the first scan"
+        )
+
+    def test_codeql_filter_applied_per_tier(self, tmp_path: Path, monkeypatch):
+        for i in range(5):
+            _write(tmp_path, f"a{i}.php", "<?php\n")
+
+        det = LanguageDetector(tmp_path)
+
+        unfiltered = det.detect_languages_tiered(min_files=3, codeql_filter=False)
+        filtered = det.detect_languages_tiered(min_files=3, codeql_filter=True)
+
+        if "php" in unfiltered:
+            assert "php" not in filtered, (
+                "codeql_filter=True must remove unsupported languages"
+            )
+
+    def test_tier1_wins_when_sufficient(self, tmp_path: Path):
+        for i in range(5):
+            _write(tmp_path, f"a{i}.py", "")
+        _write(tmp_path, "requirements.txt", "")
+
+        det = LanguageDetector(tmp_path)
+        strict = det.detect_languages(min_files=3)
+        tiered = det.detect_languages_tiered(min_files=3)
+
+        assert strict.keys() == tiered.keys(), (
+            "when tier 1 succeeds, tiered must return the same result"
+        )
 
 
 class TestPrunedDirIndicators:
@@ -626,3 +738,589 @@ class TestExtractorProbeCliResolution:
             assert det._extractor_available("rust") is False
         finally:
             self._reset_probe_cache()
+
+
+class TestHumanBranchScrub:
+    def test_human_branch_escapes_hostile_build_file_names(
+            self, tmp_path: Path, capsys, monkeypatch):
+        """The --json lane was given ensure_ascii for exactly these
+        scanned-repo names; the human branch prints the same
+        build_files_found field and must escape it too (suffix-match
+        admission keeps the full hostile basename on .csproj hits)."""
+        from packages.codeql.language_detector import main
+        _write(tmp_path, "evil\x1b]0;pwned\x07.csproj", "<Project/>\n")
+        _write(tmp_path, "a.cs", "class A {}\n")
+        _write(tmp_path, "b.cs", "class B {}\n")
+        _write(tmp_path, "c.cs", "class C {}\n")
+        monkeypatch.setattr(
+            "sys.argv",
+            ["language_detector", "--repo", str(tmp_path)])
+        main()
+        out = capsys.readouterr().out
+        assert "Build files:" in out
+        for raw in ("\x1b", "\x07"):
+            assert raw not in out
+
+
+class TestUnsupportedPrimaryBanner:
+    """A repo dominated by a language CodeQL cannot extract must say
+    so: the per-language Detected/Skipping lines only ever mention
+    extractor languages, so a PHP or Perl codebase read as
+    clean-by-silence otherwise."""
+
+    def _warnings(self, mock_logger):
+        return [
+            c.args[0] % tuple(c.args[1:]) if c.args[1:] else c.args[0]
+            for c in mock_logger.warning.call_args_list
+        ]
+
+    def test_php_majority_warns_and_names_covered_sliver(
+            self, tmp_path: Path, monkeypatch):
+        for i in range(12):
+            _write(tmp_path, f"src/page{i}.php", "<?php\n")
+        for i in range(3):
+            _write(tmp_path, f"native/helper{i}.c", "int f(void){}\n")
+        mock_logger = MagicMock()
+        monkeypatch.setattr(ld_mod, "logger", mock_logger)
+
+        LanguageDetector(tmp_path).detect_languages()
+
+        msgs = self._warnings(mock_logger)
+        banner = [m for m in msgs if "no extractor" in m]
+        assert banner, f"expected unsupported-primary banner; got {msgs}"
+        assert "php (12 files)" in banner[0]
+        assert "cpp (3 files)" in banner[0]
+
+    def test_detected_majority_stays_quiet(
+            self, tmp_path: Path, monkeypatch):
+        for i in range(5):
+            _write(tmp_path, f"src/mod{i}.py", "x = 1\n")
+        _write(tmp_path, "tools/one.php", "<?php\n")
+        mock_logger = MagicMock()
+        monkeypatch.setattr(ld_mod, "logger", mock_logger)
+
+        LanguageDetector(tmp_path).detect_languages()
+
+        msgs = self._warnings(mock_logger)
+        assert not any("no extractor" in m for m in msgs), msgs
+
+    def test_no_unsupported_files_stays_quiet(
+            self, tmp_path: Path, monkeypatch):
+        for i in range(4):
+            _write(tmp_path, f"src/mod{i}.py", "x = 1\n")
+        mock_logger = MagicMock()
+        monkeypatch.setattr(ld_mod, "logger", mock_logger)
+
+        LanguageDetector(tmp_path).detect_languages()
+
+        msgs = self._warnings(mock_logger)
+        assert not any("no extractor" in m for m in msgs), msgs
+
+
+class TestScanReuseAcrossTiers:
+    """A walk shared via ``scan=`` must not re-walk or re-announce; an
+    independent call (separate run) must keep doing both — repo state
+    can change between runs, so nothing may be memoised past the
+    caller's own dict."""
+
+    def _sparse_php_repo(self, tmp_path: Path) -> Path:
+        # Unsupported-primary shape: no extractor language passes any
+        # tier, so a caller runs all three tiers back to back.
+        for i in range(12):
+            _write(tmp_path, f"src/page{i}.php", "<?php\n")
+        return tmp_path
+
+    def _instrument(self, detector, monkeypatch):
+        walks = []
+        original = detector._scan_repository
+
+        def counting():
+            walks.append(1)
+            return original()
+
+        monkeypatch.setattr(detector, "_scan_repository", counting)
+        mock_logger = MagicMock()
+        monkeypatch.setattr(ld_mod, "logger", mock_logger)
+        return walks, mock_logger
+
+    def _banners(self, mock_logger):
+        msgs = [
+            c.args[0] % tuple(c.args[1:]) if c.args[1:] else c.args[0]
+            for c in mock_logger.warning.call_args_list
+        ]
+        return [m for m in msgs if "no extractor" in m]
+
+    def test_shared_scan_walks_once_and_announces_once(
+            self, tmp_path: Path, monkeypatch):
+        detector = LanguageDetector(self._sparse_php_repo(tmp_path))
+        walks, mock_logger = self._instrument(detector, monkeypatch)
+
+        scan = detector.scan_repository()
+        assert not detector.detect_languages(min_files=3, scan=scan)
+        assert not detector.detect_languages(min_files=1, scan=scan)
+        assert not detector.detect_languages_floor(floor=2, scan=scan)
+
+        assert len(walks) == 1, "shared scan must not re-walk the repo"
+        assert len(self._banners(mock_logger)) == 1, (
+            "unsupported-primary banner must announce once per walk"
+        )
+
+    def test_independent_calls_each_walk_and_announce(
+            self, tmp_path: Path, monkeypatch):
+        detector = LanguageDetector(self._sparse_php_repo(tmp_path))
+        walks, mock_logger = self._instrument(detector, monkeypatch)
+
+        assert not detector.detect_languages(min_files=3)
+        assert not detector.detect_languages(min_files=3)
+
+        assert len(walks) == 2, (
+            "independent runs must re-walk — repo state can change"
+        )
+        assert len(self._banners(mock_logger)) == 2
+
+class TestSuffixCaseFolding:
+    """Extension counting is case-folded: uppercase spellings
+    (.C/.CPP/.PY — legacy C++ and Windows-authored trees) must be
+    visible to detection; the membership tests against
+    LANGUAGE_PATTERNS are case-sensitive on lowercase keys."""
+
+    def test_pure_uppercase_c_repo_detects_cpp(self, tmp_path: Path):
+        for i in range(3):
+            _write(tmp_path, f"src/mod{i}.C", "int f() { return 0; }\n")
+        detected = LanguageDetector(tmp_path).detect_languages(min_files=1)
+        assert "cpp" in detected
+
+    def test_uppercase_c_repo_clears_floor_tier(self, tmp_path: Path):
+        for i in range(3):
+            _write(tmp_path, f"src/mod{i}.C", "int f() { return 0; }\n")
+        floor = LanguageDetector(tmp_path).detect_languages_floor(floor=2)
+        assert "cpp" in floor
+
+    def test_mixed_repo_keeps_the_cpp_bulk(self, tmp_path: Path):
+        """Worst pre-fix case: the CodeQL lane silently omitted the
+        C++ bulk of a mixed repo AND no unsupported-primary warning
+        could fire — coverage read clean."""
+        for i in range(3):
+            _write(tmp_path, f"native/mod{i}.C", "int f() { return 0; }\n")
+        for i in range(3):
+            _write(tmp_path, f"py/mod{i}.py", "x = 1\n")
+        detected = LanguageDetector(tmp_path).detect_languages(min_files=1)
+        assert "python" in detected
+        assert "cpp" in detected
+
+
+class TestModernTsJsSpellings:
+    def test_mts_cts_count_as_typescript(self, tmp_path: Path):
+        _write(tmp_path, "package.json", "{}")
+        _write(tmp_path, "tsconfig.json", "{}")
+        for i in range(2):
+            _write(tmp_path, f"src/m{i}.mts", "export const x = 1;\n")
+        _write(tmp_path, "src/c.cts", "export const y = 2;\n")
+        detected = LanguageDetector(tmp_path).detect_languages(min_files=1)
+        assert "typescript" in detected
+
+    def test_vue_counts_as_javascript(self, tmp_path: Path):
+        _write(tmp_path, "package.json", "{}")
+        for i in range(3):
+            _write(tmp_path, f"src/App{i}.vue", "<template></template>\n")
+        detected = LanguageDetector(tmp_path).detect_languages(min_files=1)
+        assert "javascript" in detected
+
+
+class TestExtractorProbeFailureNotCached:
+    """A transient `codeql resolve languages` failure must not lock
+    in an empty extractor set for the process lifetime — pre-fix a
+    single failed probe silently dropped rust for the whole run."""
+
+    def _reset(self):
+        LanguageDetector._extractor_langs = None
+
+    def _cli(self, tmp_path: Path, ok: bool) -> Path:
+        stub = tmp_path / ("codeql-ok" if ok else "codeql-bad")
+        if ok:
+            stub.write_text(
+                "#!/bin/sh\necho 'rust (/opt/bundle/rust)'\n",
+            )
+        else:
+            stub.write_text("#!/bin/sh\nexit 1\n")
+        stub.chmod(0o755)
+        return stub
+
+    def test_failed_probe_reprobes_next_call(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        self._reset()
+        try:
+            det = LanguageDetector(tmp_path)
+            monkeypatch.setenv("CODEQL_CLI", str(self._cli(tmp_path, ok=False)))
+            # Failed probe: conservative answer, nothing cached.
+            assert det._extractor_available("rust") is False
+            assert LanguageDetector._extractor_langs is None
+            # Transient failure cleared — the next call recovers.
+            monkeypatch.setenv("CODEQL_CLI", str(self._cli(tmp_path, ok=True)))
+            assert det._extractor_available("rust") is True
+            assert LanguageDetector._extractor_langs == frozenset({"rust"})
+        finally:
+            self._reset()
+
+    def test_successful_probe_still_cached(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        self._reset()
+        try:
+            good = self._cli(tmp_path, ok=True)
+            monkeypatch.setenv("CODEQL_CLI", str(good))
+            det = LanguageDetector(tmp_path)
+            assert det._extractor_available("rust") is True
+            # Cached — swapping the CLI away no longer changes the answer.
+            monkeypatch.setenv("CODEQL_CLI", str(self._cli(tmp_path, ok=False)))
+            assert det._extractor_available("rust") is True
+        finally:
+            self._reset()
+
+
+class TestNoExtractorUnambiguousMembers:
+    def test_scala_primary_repo_warns_not_silent(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """A Scala-primary repo must trip the unsupported-primary
+        warning — the enumerated NO_EXTRACTOR set silently omitted
+        several unambiguous no-extractor languages, so such repos
+        read clean-by-silence."""
+        for i in range(5):
+            _write(tmp_path, f"src/M{i}.scala", "object M {}\n")
+        _write(tmp_path, "util.py", "x = 1\n")
+        det = LanguageDetector(tmp_path)
+        mock_logger = MagicMock()
+        monkeypatch.setattr(ld_mod, "logger", mock_logger)
+        det.detect_languages(min_files=1)
+        warning_calls = [
+            c.args[0] % c.args[1:] if c.args[1:] else c.args[0]
+            for c in mock_logger.warning.call_args_list
+        ]
+        assert any("scala" in m for m in warning_calls), (
+            f"scala-primary repo produced no unsupported-primary "
+            f"warning; got: {warning_calls}"
+        )
+
+    def test_new_members_mapped(self):
+        for ext, lang in ((".scala", "scala"), (".groovy", "groovy"),
+                          (".clj", "clojure"), (".zig", "zig"),
+                          (".nim", "nim"), (".jl", "julia"),
+                          (".f90", "fortran")):
+            assert LanguageDetector.NO_EXTRACTOR_EXTENSIONS[ext] == lang
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+class TestGitTrackedBaseline:
+    """Git targets census the TRACKED baseline, not the raw walk.
+
+    A raw walk also counts untracked content nested inside the target
+    — run-output directories, clone caches, scratch worktrees — whose
+    names no ignore-list can enumerate. Those files inflated per-
+    language file counts and distorted the confidence ratios the
+    file-count / build-file / confidence gates reason over. Directions:
+    a git repo with untracked scratch counts tracked files only; a
+    non-git tree (and a git dir with an empty index) keeps the walk
+    census unchanged.
+    """
+
+    def _tracked_python_with_untracked_go_scratch(self, tmp_path: Path,
+                                                  *, git: bool) -> Path:
+        # Tracked (or plain, in the non-git direction): a Python repo.
+        for i in range(3):
+            _write(tmp_path, f"src/mod{i}.py", "x = 1\n")
+        _write(tmp_path, "pyproject.toml", "[project]\nname='x'\n")
+        if git:
+            _init_commit_all(tmp_path)
+        # Untracked scratch under an arbitrary name no ignore-list
+        # knows — the clone-cache / run-dir shape.
+        for i in range(10):
+            _write(tmp_path, f"scratch-clone/pkg/m{i}.go", "package m\n")
+        _write(tmp_path, "scratch-clone/go.mod", "module m\n")
+        return tmp_path
+
+    def test_untracked_scratch_not_counted_in_git_repo(self, tmp_path: Path):
+        repo = self._tracked_python_with_untracked_go_scratch(
+            tmp_path, git=True,
+        )
+        det = LanguageDetector(repo)
+        stats = det._scan_repository()
+        detected = det.detect_languages(scan=stats)
+
+        assert "python" in detected
+        assert detected["python"].file_count == 3
+        # The untracked go module must be fully invisible: no file
+        # count, and its go.mod must not register as build evidence.
+        assert "go" not in detected
+        assert "go.mod" not in stats["build_files"]
+        assert stats["extensions"].get(".go", 0) == 0
+
+    def test_non_git_tree_keeps_walk_census(self, tmp_path: Path):
+        # Same tree WITHOUT git — current walk behavior preserved:
+        # the go module is real content and must be detected.
+        repo = self._tracked_python_with_untracked_go_scratch(
+            tmp_path, git=False,
+        )
+        detected = LanguageDetector(repo).detect_languages()
+
+        assert "python" in detected
+        assert "go" in detected
+        assert detected["go"].file_count == 10
+
+    def test_empty_index_falls_back_to_walk(self, tmp_path: Path):
+        # `git init` over a source dump: nothing tracked yet — the
+        # walk is the only census signal and must still be used.
+        for i in range(3):
+            _write(tmp_path, f"m{i}.py", "x = 1\n")
+        subprocess.run(
+            ["git", "init", "-q", str(tmp_path)],
+            check=True, capture_output=True, env=_git_env(tmp_path),
+        )
+
+        det = LanguageDetector(tmp_path)
+        assert det._git_tracked_files() is None
+        assert "python" in det.detect_languages()
+
+    def test_non_git_dir_has_no_baseline(self, tmp_path: Path):
+        _write(tmp_path, "a.py", "")
+        assert LanguageDetector(tmp_path)._git_tracked_files() is None
+
+    def test_tracked_listing_matches_index(self, tmp_path: Path):
+        _write(tmp_path, "a.py", "")
+        _write(tmp_path, "src/b.py", "")
+        _init_commit_all(tmp_path)
+        _write(tmp_path, "untracked.py", "")
+
+        entries = LanguageDetector(tmp_path)._git_tracked_files()
+        assert entries is not None
+        assert sorted(entries) == ["a.py", "src/b.py"]
+
+    def test_tracked_ignore_dirs_pruned_with_indicator_evidence(
+            self, tmp_path: Path):
+        # Tracked content under an IGNORE_DIRS segment keeps the
+        # walk's policy: excluded from counts, but its presence still
+        # registers as pruned-dir structural evidence.
+        _write(tmp_path, "a.js", "// js\n")
+        _write(tmp_path, "b.js", "// js\n")
+        _write(tmp_path, "node_modules/lodash/lodash.js", "// vendored\n")
+        _init_commit_all(tmp_path)
+
+        stats = LanguageDetector(tmp_path)._scan_repository()
+
+        assert "node_modules/" in stats["indicators"]
+        assert stats["scanned_files"] == 2
+
+    def test_tracked_declared_lock_build_file_kept(self, tmp_path: Path):
+        # IGNORE_SUFFIXES parity on the tracked lane: declared *.lock
+        # manifests survive; undeclared lock files stay ignored.
+        _write(tmp_path, "poetry.lock", "[[package]]\n")
+        _write(tmp_path, "flake.lock", "{}")
+        _write(tmp_path, "app.py", "")
+        _init_commit_all(tmp_path)
+
+        stats = LanguageDetector(tmp_path)._scan_repository()
+
+        assert "poetry.lock" in stats["build_files"]
+        assert "flake.lock" not in stats["build_files"]
+
+    def test_tracked_path_deleted_from_worktree_not_counted(
+            self, tmp_path: Path):
+        _write(tmp_path, "a.py", "")
+        _write(tmp_path, "b.py", "")
+        _write(tmp_path, "gone.py", "")
+        _init_commit_all(tmp_path)
+        (tmp_path / "gone.py").unlink()
+
+        stats = LanguageDetector(tmp_path)._scan_repository()
+
+        assert stats["extensions"][".py"] == 2
+
+    def test_untracked_ignored_build_dirs_still_register_indicators(
+            self, tmp_path: Path):
+        # A clean fully-committed BUILT checkout: bin/ and obj/ are
+        # gitignored build outputs — never in ls-files — but they are
+        # the csharp structural indicators. The tracked lane must
+        # still register their PRESENCE (dir-only probe), or a real
+        # C# module loses its indicator boost and the detection flips.
+        for i in range(100):
+            _write(tmp_path, f"py/mod{i}.py", "x = 1\n")
+        for i in range(5):
+            _write(tmp_path, f"App/Class{i}.cs", "class C {}\n")
+        _write(tmp_path, "App/App.csproj", "<Project/>")
+        _write(tmp_path, ".gitignore", "bin/\nobj/\n")
+        _init_commit_all(tmp_path)
+        # Untracked (ignored) build outputs.
+        _write(tmp_path, "App/bin/Debug/app.dll", "")
+        _write(tmp_path, "App/obj/project.assets.json", "{}")
+
+        det = LanguageDetector(tmp_path)
+        stats = det._scan_repository()
+        detected = det.detect_languages(scan=stats)
+
+        assert {"bin/", "obj/"} <= stats["indicators"]
+        assert "csharp" in detected
+        assert detected["csharp"].file_count == 5
+        # Presence only — nothing under the ignored dirs is counted.
+        assert stats["extensions"].get(".dll", 0) == 0
+
+    def test_unmerged_paths_counted_once(self, tmp_path: Path):
+        # Mid-merge, a conflicted path holds three index stages and
+        # plain `ls-files` prints the name once per stage — the census
+        # must count the file once.
+        _write(tmp_path, "a.py", "base = 1\n")
+        subprocess.run(
+            ["git", "init", "-q", "-b", "main", str(tmp_path)],
+            check=True, capture_output=True, env=_git_env(tmp_path),
+        )
+        _git(tmp_path, "add", "-A")
+        commit = ["-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                  "commit", "-aqm", "c", "--no-gpg-sign"]
+        _git(tmp_path, *commit)
+        _git(tmp_path, "checkout", "-q", "-b", "side")
+        _write(tmp_path, "a.py", "side = 1\n")
+        _git(tmp_path, *commit)
+        _git(tmp_path, "checkout", "-q", "main")
+        _write(tmp_path, "a.py", "main = 1\n")
+        _git(tmp_path, *commit)
+        merge = subprocess.run(
+            ["git", "-C", str(tmp_path), "-c", "user.name=t",
+             "-c", "user.email=t@example.invalid", "merge", "side"],
+            check=False, capture_output=True, env=_git_env(tmp_path),
+        )
+        assert merge.returncode != 0, "fixture must be mid-conflict"
+        unmerged = subprocess.run(
+            ["git", "-C", str(tmp_path), "ls-files", "-u"],
+            check=True, capture_output=True, env=_git_env(tmp_path),
+        )
+        assert unmerged.stdout, "fixture must hold unmerged index stages"
+
+        det = LanguageDetector(tmp_path)
+        entries = det._git_tracked_files()
+        assert entries is not None
+        assert entries.count("a.py") == 1
+        assert det._scan_repository()["extensions"][".py"] == 1
+
+    def test_probe_timeout_falls_back_to_walk(
+            self, tmp_path: Path, monkeypatch):
+        _write(tmp_path, "a.py", "")
+        _write(tmp_path, "b.py", "")
+        _write(tmp_path, "c.py", "")
+        _init_commit_all(tmp_path)
+
+        def _raise(*_a, **_k):
+            raise subprocess.TimeoutExpired(cmd="git", timeout=1)
+
+        monkeypatch.setattr(subprocess, "run", _raise)
+        det = LanguageDetector(tmp_path)
+        assert det._git_tracked_files() is None
+        assert "python" in det.detect_languages()
+
+    def test_git_binary_absent_falls_back_to_walk(
+            self, tmp_path: Path, monkeypatch):
+        _write(tmp_path, "a.py", "")
+        _write(tmp_path, "b.py", "")
+        _write(tmp_path, "c.py", "")
+        _init_commit_all(tmp_path)
+
+        def _raise(*_a, **_k):
+            raise FileNotFoundError("git")
+
+        monkeypatch.setattr(subprocess, "run", _raise)
+        det = LanguageDetector(tmp_path)
+        assert det._git_tracked_files() is None
+        assert "python" in det.detect_languages()
+
+    def test_probe_failure_on_gitdir_target_warns(
+            self, tmp_path: Path, monkeypatch):
+        # A target CARRYING a .git entry whose baseline probe fails is
+        # a downgrade a hostile repo can trigger — it must be loud,
+        # unlike the legit non-git-target case (debug only).
+        _write(tmp_path, "a.py", "")
+        (tmp_path / ".git").mkdir()  # structurally invalid repo
+
+        mock_logger = MagicMock()
+        monkeypatch.setattr(ld_mod, "logger", mock_logger)
+
+        assert LanguageDetector(tmp_path)._git_tracked_files() is None
+        warns = [str(c.args[0]) for c in mock_logger.warning.call_args_list]
+        assert any("baseline" in w for w in warns), (
+            f"expected loud baseline-degrade WARN; got: {warns}"
+        )
+
+    def test_untracked_source_exclusion_warns(
+            self, tmp_path: Path, monkeypatch):
+        # Dirty-tree visibility: untracked source never enters the
+        # census, but its exclusion must be loud — and an untracked
+        # build manifest gets its own line (a manifest steers the
+        # build-file gate, so dropping it can flip a detection).
+        for i in range(3):
+            _write(tmp_path, f"m{i}.py", "x = 1\n")
+        _init_commit_all(tmp_path)
+        _write(tmp_path, "newmod/go.mod", "module m\n")
+        _write(tmp_path, "newmod/main.go", "package main\n")
+
+        mock_logger = MagicMock()
+        monkeypatch.setattr(ld_mod, "logger", mock_logger)
+
+        LanguageDetector(tmp_path).detect_languages()
+
+        warns = [
+            c.args[0] % tuple(c.args[1:]) if c.args[1:] else c.args[0]
+            for c in mock_logger.warning.call_args_list
+        ]
+        assert any("untracked source" in w for w in warns), (
+            f"expected untracked-source-exclusion WARN; got: {warns}"
+        )
+        assert any("go.mod" in w for w in warns), (
+            f"expected untracked-manifest WARN naming go.mod; got: {warns}"
+        )
+
+    def test_census_info_logs_post_filter_count(
+            self, tmp_path: Path, monkeypatch):
+        # The census banner must report what is COUNTED, not the raw
+        # listing size (which includes entries the ignore policy then
+        # drops).
+        _write(tmp_path, "a.py", "")
+        _write(tmp_path, "b.py", "")
+        _write(tmp_path, "node_modules/lodash/lodash.js", "")
+        _init_commit_all(tmp_path)
+
+        mock_logger = MagicMock()
+        monkeypatch.setattr(ld_mod, "logger", mock_logger)
+
+        LanguageDetector(tmp_path)._scan_repository()
+
+        banner = [
+            c.args for c in mock_logger.info.call_args_list
+            if "tracked baseline" in str(c.args[0])
+        ]
+        assert banner, "census banner missing"
+        assert banner[0][1] == 2, (
+            f"banner must carry the post-filter count (2), got {banner[0][1]}"
+        )
+
+
+class TestScanCapDerivation:
+    """The scan is name-statistics only (~24 us/file measured); the
+    old 10k cap sampled big trees in walk order and distorted the
+    extension counts feeding confidence. Directions: default covers a
+    kernel-scale tree whole; explicit caps are honoured verbatim."""
+
+    def test_default_covers_kernel_scale_counts(self, tmp_path):
+        from packages.codeql.language_detector import LanguageDetector
+        det = LanguageDetector(tmp_path)
+        assert det.max_files == LanguageDetector._MAX_SCAN_FILES
+        assert det.max_files >= 100_000  # a 94k-file tree walks whole
+
+    def test_explicit_cap_honoured_and_warns_with_sample_wording(
+            self, tmp_path, caplog):
+        import logging
+        from packages.codeql.language_detector import LanguageDetector
+        for i in range(12):
+            (tmp_path / f"f{i}.c").write_text("int x;\n")
+        det = LanguageDetector(tmp_path, max_files=5)
+        with caplog.at_level(logging.WARNING, logger="raptor"):
+            stats = det._scan_repository()
+        assert stats["scanned_files"] == 5
+        assert "walk-order sample" in caplog.text

@@ -57,10 +57,21 @@ def _init_dispatch() -> None:
 
         (re.compile(
             r"unsaniti[sz]ed\s+(?:input|data|header|value|filename)"
-            r"|(?:user|attacker|external)[\w\s-]*(?:control|suppli|provid)\w*\s+(?:data|input|value).*(?:sink|output|render|inject|interpolat)"
+            # (?=\S) pins each whitespace run to end where the
+            # non-whitespace tail begins (same language — the
+            # dot-star absorbed any remainder); the naive runs split
+            # against the lazy fillers, quadratic on hypothesis text
+            # ending in a whitespace run.
+            # Filler spans and keyword gaps are bounded: unbounded, every
+            # occurrence of the head keyword re-scans the rest of the
+            # hypothesis text for the tail — quadratic-or-worse on
+            # hostile-shaped text. Real hypothesis prose keeps the pair
+            # within a phrase; beyond the bound the verifier does not
+            # dispatch.
+            r"|(?:user|attacker|external)[\w\s-]{0,100}(?:control|suppli|provid)\w{0,64}\s+(?:data|input|value)(?=\s|$|\W).{0,100}(?:sink|output|render|inject|interpolat)"
             r"|(?:host|header|query|path|url)\s+(?:value\s+)?(?:directly|without)"
-            r"|taint(?:ed)?\s+.*(?:sink|output|render)"
-            r"|unsaniti[sz]ed\s+\w+\s+.*(?:path|directory|travers)"
+            r"|taint(?:ed)?\s+(?=\S).{0,100}(?:sink|output|render)"
+            r"|unsaniti[sz]ed\s+\w{1,64}\s+(?=\S).{0,100}(?:path|directory|travers)"
             r"|(?:\.\./|path\s+travers|directory\s+travers)",
             re.IGNORECASE,
         ), "taint_source_sink"),
@@ -70,16 +81,28 @@ def _init_dispatch() -> None:
             r"|(?:without|no)\s+(?:holding|acquiring)\s+(?:the\s+)?(?:necessary\s+)?lock"
             r"|precondition\s+(?:not\s+)?(?:met|check|enforc)"
             r"|lock\s+(?:not\s+)?held"
-            r"|after\s+(?:sleeping|releasing|dropping)\s+(?:and\s+)?(?:releasing\s+)?(?:\w+\s+)*(?:lock|mutex|sem|rwsem)",
+            # The pre-lock word run is iteration-bounded (same rationale
+            # as the bounded gaps above).
+            r"|after\s+(?:sleeping|releasing|dropping)\s+(?:and\s+)?(?:releasing\s+)?(?:\w+\s+){0,8}(?:lock|mutex|sem|rwsem)"
+            # Counter-side: the refutation claims callers enforce a
+            # guarantee the reviewer never checked.  Bounded gap
+            # between "caller(s)" and the guarantee verb (same
+            # rationale as the lock pattern above).
+            r"|caller(?:s)?\s+(?:\w+\s+){0,8}(?:guarante|validat|ensur|verif|sanitiz|sanitise)\w{0,20}"
+            r"|null.terminat\w{0,10}"
+            r"|bounds?\s+check",
             re.IGNORECASE,
         ), "caller_constraint"),
 
         (re.compile(
             r"integer\s+(?:overflow|underflow|truncat|wrap|narrow)"
             r"|arithmetic\s+(?:overflow|underflow)"
-            r"|(?:size|length|count|offset)\s+.*(?:overflow|truncat|wrap)"
-            r"|(?:multiply|shift|add)\s+.*(?:alloc|size|length)"
-            r"|truncat\w+\s+.*(?:int|u32|u16|size_t)",
+            # (?=\S)-pinned whitespace runs (same language), as in
+            # the taint patterns above.
+            # Bounded keyword gaps (same rationale as taint_source_sink).
+            r"|(?:size|length|count|offset)\s+(?=\S).{0,100}(?:overflow|truncat|wrap)"
+            r"|(?:multiply|shift|add)\s+(?=\S).{0,100}(?:alloc|size|length)"
+            r"|truncat\w{1,64}\s+(?=\S).{0,100}(?:int|u32|u16|size_t)",
             re.IGNORECASE,
         ), "taint_to_arithmetic"),
 
@@ -90,8 +113,10 @@ def _init_dispatch() -> None:
             r"|missing\s+(?:clean|free|release)"
             r"|omit(?:s|ted)?\s+(?:clean|free|release)"
             r"|incomplete\s+(?:clean|teardown|shutdown|release)"
-            r"|(?:freed|free)\s+.*(?:pointer|reference)\s+.*(?:remains|dangling|stale)"
-            r"|(?:pointer|reference)\s+.*(?:remains|dangling|stale)",
+            # (?=\S)-pinned whitespace runs (same language), as in
+            # the taint patterns above.
+            r"|(?:freed|free)\s+(?=\S).{0,100}(?:pointer|reference)\s+(?=\S).{0,100}(?:remains|dangling|stale)"
+            r"|(?:pointer|reference)\s+(?=\S).{0,100}(?:remains|dangling|stale)",
             re.IGNORECASE,
         ), "incomplete_cleanup"),
     ]
@@ -166,7 +191,9 @@ def _verify_unchecked_return(
 def _extract_callee_from_hypothesis(hypothesis: str) -> str | None:
     """Extract a callee function name from hypothesis text."""
     patterns = [
-        re.compile(r"ignor\w+\s+(?:the\s+)?(?:return|error|failure)\s+(?:value\s+)?(?:of\s+)?[`'\"]?(\w+)[`'\"]?"),
+        # \w run after "ignor" bounded: unbounded, every "ignor" inside
+        # one hostile word re-scans the word's remainder — quadratic.
+        re.compile(r"ignor\w{1,64}\s+(?:the\s+)?(?:return|error|failure)\s+(?:value\s+)?(?:of\s+)?[`'\"]?(\w+)[`'\"]?"),
         re.compile(r"[`'\"](\w+)[`'\"]?\s*\(\)\s*(?:return|error|failure|result)\s+(?:is\s+)?(?:not\s+)?check"),
         re.compile(r"return\s+value\s+of\s+[`'\"]?(\w+)[`'\"]?"),
         re.compile(r"[`'\"](\w+)[`'\"]?\s+(?:return|error)\s+(?:is\s+)?(?:ignored|unchecked|discarded)"),
@@ -268,17 +295,23 @@ def _verify_caller_constraint(
     function_name: str,
     hypothesis: str,
     server: Any,
+    *,
+    counter: str = "",
 ) -> CrossFunctionVerdict | None:
     """Check whether all callers hold a required lock or call a guard before F.
 
-    Extracts the required guard/lock from the hypothesis, then checks
-    every caller for dominance of that guard over the call to F.
+    Extracts the required guard/lock from the hypothesis (or counter),
+    then checks every caller for presence of that guard.  When
+    *counter* is set and no specific guard is found, falls back to
+    length/bounds-checking function patterns instead of lock patterns.
     """
     safe_fn = _safe_name(function_name)
     if safe_fn is None:
         return None
 
     guard = _extract_guard_from_hypothesis(hypothesis)
+    if not guard and counter:
+        guard = _extract_guard_from_hypothesis(counter)
 
     callers_query = (
         f'cpg.method.name("{safe_fn}")'
@@ -318,6 +351,13 @@ def _verify_caller_constraint(
                 f'.ast.isCall.name("(.*_)?{safe_guard}(_.*)?")'
                 f".l.nonEmpty"
             )
+        elif counter:
+            guard_query = (
+                f'cpg.method.name("{safe_caller}")'
+                f'.ast.isCall.name("(.*_)?(strlen|strnlen|strlcpy|strlcat'
+                f'|snprintf|stpncpy|memchr)(_.*)?")'
+                f".l.nonEmpty"
+            )
         else:
             guard_query = (
                 f'cpg.method.name("{safe_caller}")'
@@ -336,7 +376,7 @@ def _verify_caller_constraint(
         return None
 
     if unguarded:
-        guard_desc = guard or "required lock/guard"
+        guard_desc = guard or ("input validation" if counter else "required lock/guard")
         evidence = (
             f"{len(unguarded)}/{len(unguarded) + len(guarded)} callers of "
             f"{function_name} lack {guard_desc}: "
@@ -407,7 +447,11 @@ def _verify_taint_to_arithmetic(
         "kmalloc|kzalloc|vmalloc|krealloc|__get_free_pages"
         "|malloc|calloc|realloc|alloca"
         "|memcpy|memmove|copy_from_user|copy_to_user"
-        "|make\\\\(|append\\\\(|len\\\\("
+        # Go builtins: bare NAMES — this alternation is matched
+        # against Joern call names, which never contain "(", so the
+        # old paren-suffixed arms (make\(, append\(, len\() were
+        # unmatchable and the verifier was silently C-only.
+        "|make|append|len"
     )
 
     query = (
@@ -553,24 +597,19 @@ def _verify_incomplete_cleanup(
             },
         )
 
-    if len(uncleaned) > 0 and len(cleaned_fields) >= 2:
-        evidence = (
-            f"Potential cleanup gap in {function_name}: "
-            f"{len(uncleaned)} fields accessed but not cleaned "
-            f"({', '.join(sorted(uncleaned)[:5])}), "
-            f"while {len(cleaned_fields)} are cleaned "
-            f"({', '.join(sorted(cleaned_fields)[:5])})"
+    # A bare set-difference (fields accessed but never passed to a
+    # cleanup call) is NOT confirmation: teardown legitimately reads
+    # flag/count/state fields it never frees, so without the
+    # hypothesis-named field the "gap" is noise — and a verified=True
+    # here promotes the finding through the merge layer. Confirmation
+    # requires the hypothesis-named field (branch above); anything
+    # weaker stays inconclusive (None), never verified.
+    if uncleaned:
+        logger.debug(
+            "incomplete_cleanup: set-difference gap in %s (%s) without "
+            "a hypothesis-field match — inconclusive",
+            function_name, ", ".join(sorted(uncleaned)[:5]),
         )
-        return CrossFunctionVerdict(
-            verified=True,
-            verifier_name="incomplete_cleanup",
-            evidence=evidence,
-            details={
-                "uncleaned": sorted(uncleaned),
-                "cleaned": sorted(cleaned_fields),
-            },
-        )
-
     return None
 
 
@@ -607,18 +646,34 @@ def cross_function_verify(
     file_path: str,
     hypothesis: str,
     server: Any,
+    *,
+    counter: str = "",
 ) -> CrossFunctionVerdict | None:
     """Dispatch cross-function verifiers based on hypothesis keywords.
 
     Tries up to _MAX_VERIFIERS_PER_FUNCTION matching verifiers in
     dispatch order.  Returns the first positive verification, or
     None if no verifier matches or none confirms.
+
+    When *counter* is provided (the cross-function refutation text),
+    the dispatch also matches against counter keywords so that
+    counter-side phrases ("callers guarantee null-termination") can
+    trigger the appropriate verifier even when the hypothesis itself
+    contains no cross-function keywords.
+
+    Confirmation-only contract: verified=False verdicts from the
+    individual verifiers are intentionally NOT returned.  These are
+    keyword-dispatched heuristic CPG queries, so a non-confirmation is
+    weak negative evidence — it must not flow out as a mechanical
+    refutation that demotes findings.  Callers treat None as "no
+    mechanical signal"; refutation stays the job of the dedicated
+    refutation passes.
     """
     _init_dispatch()
 
     matched = []
     for pattern, verifier_name in _VERIFIER_DISPATCH:
-        if pattern.search(hypothesis):
+        if pattern.search(hypothesis) or (counter and pattern.search(counter)):
             matched.append(verifier_name)
             if len(matched) >= _MAX_VERIFIERS_PER_FUNCTION:
                 break
@@ -631,7 +686,12 @@ def cross_function_verify(
         if fn is None:
             continue
         try:
-            verdict = fn(function_name, hypothesis, server)
+            if vname == "caller_constraint":
+                verdict = _verify_caller_constraint(
+                    function_name, hypothesis, server, counter=counter,
+                )
+            else:
+                verdict = fn(function_name, hypothesis, server)
             if verdict is not None and verdict.verified:
                 return verdict
         except Exception:

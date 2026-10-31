@@ -20,7 +20,7 @@ Both wrap their ``git`` subprocess in ``core.sandbox.run_untrusted_networked``
     the target / repo directory;
   - sanitised env (``RaptorConfig.get_git_env()`` — clears
     HTTP_PROXY / NO_PROXY etc., sets GIT_TERMINAL_PROMPT=0 and
-    GIT_ASKPASS=true so a malformed-credential prompt can't hang
+    GIT_ASKPASS=/usr/bin/true so a malformed-credential prompt can't hang
     the run);
   - bounded timeout (``RaptorConfig.GIT_CLONE_TIMEOUT``).
 
@@ -40,6 +40,7 @@ from urllib.parse import urlparse
 from core.config import RaptorConfig
 from core.git.validate import validate_repo_url
 from core.logging import log_security_event as _log_security_event
+from core.security.log_sanitisation import escape_nonprintable
 from core.security.redaction import redact_url_secrets_only
 
 # Backwards-compat re-export — historical callers + tests reference
@@ -176,11 +177,30 @@ def get_safe_git_env(*, preserve_proxy: bool = False) -> dict[str, str]:
 # al.) cannot be blanket-neutralised here: the driver names are
 # repo-chosen, so there is no finite `-c` list that covers them. Any
 # git operation that (re)hashes worktree content — `git status`'s
-# index refresh, `git add`, checkout — runs them. Callers probing a
-# target repo must therefore stick to plumbing that never re-hashes
-# worktree files: `rev-parse`, `diff-index` WITHOUT a preceding
-# refresh (stat-cache comparison only), `ls-files`. See
-# core.run.provenance.target_snapshot for the pattern.
+# index refresh, `git add`, checkout, and ALSO the racily-clean
+# re-verification inside worktree-side plumbing (`diff-index HEAD`,
+# `diff-files`, `ls-files -m`; the hostile repo ships its own index,
+# so every entry can be crafted racy) — runs them. Callers probing a
+# target repo must therefore stick to commands that never open
+# worktree files: `rev-parse`, `rev-list`, `log`, `ls-tree`,
+# `diff-index --cached` (index-vs-tree only), `ls-files` index dumps,
+# and the `ls-files --others` directory walk. For working-tree
+# dirtiness use core.git.dirty.probe_worktree_dirt — it compares
+# index stat data against os.lstat in Python instead of letting git
+# do the worktree side.
+#
+# KNOWN LIMIT — the same repo-chosen-key-name problem covers the
+# TRANSPORT class: `url.<base>.insteadOf` (rewrites any fetch URL),
+# `http.<url>.*` (URL-scoped proxy / sslVerify / sslCAInfo /
+# extraHeader — URL specificity beats a `-c http.<key>` pin), and
+# `credential.<url>.helper`. `http.proxy` is additionally
+# value-unpinnable: an empty value tells curl to DISABLE proxying,
+# which would sever the sandbox's env-based egress proxy. Network
+# operations therefore never trust a pre-existing repo's local
+# config — fetch_commit audits it against the keys it writes itself
+# (see ``_foreign_local_config_keys``) and refuses to fetch over
+# anything else; clone_repository and ls_remote have no pre-existing
+# local config in scope.
 #
 # Use `safe_git_command(*args)` below instead of building bare
 # `["git", ...]` lists when operating on a target repo.
@@ -199,12 +219,23 @@ _SAFE_GIT_OVERRIDES = (
     "-c", "gpg.x509.program=true",
     "-c", "gpg.ssh.program=true",
     "-c", "diff.external=",
+    # Replace refs substitute arbitrary pre-planted objects behind a
+    # real OID at the object-read layer: with ``refs/replace/<sha>``
+    # present, ``git show``/``log``/``diff`` return the replacement
+    # content while ref resolution (and a fetched SHA's verification)
+    # still reports the requested OID. Git honours them by DEFAULT, so
+    # a hostile pre-existing ``.git`` can lie to every reader without
+    # touching config. Pinned off for every target-repo operation.
+    # (``info/grafts`` forges history similarly but has NO config key —
+    # fetch_commit refuses pre-existing repos that carry either; see
+    # ``_hostile_history_rewrite_reason``.)
+    "-c", "core.useReplaceRefs=false",
 )
 
 
 # STRICT variant for READ-ONLY operations on target repos (log,
-# rev-parse, rev-list, diff-index, ls-files, ...). Read-only ops never
-# need a remote, so every transport can be refused wholesale:
+# rev-parse, rev-list, diff-index --cached, ls-files, ...). Read-only
+# ops never need a remote, so every transport can be refused wholesale:
 #
 #   - protocol.allow=never: one config kills file://, ext::, ssh://,
 #     git://, http(s):// in a single stroke. Stronger than the
@@ -235,8 +266,9 @@ _SAFE_GIT_OVERRIDES = (
 # variant: filter drivers have repo-chosen names, so no finite `-c`
 # list neutralises them. protocol.allow=never does NOT protect
 # worktree-rehashing operations — strict callers must still stick to
-# plumbing that never re-hashes worktree files (`rev-parse`,
-# `rev-list`, `log`, `diff-index` without a refresh, `ls-files`).
+# commands that never open worktree files (`rev-parse`, `rev-list`,
+# `log`, `ls-tree`, `diff-index --cached`, `ls-files` index dumps /
+# `--others` walks; dirtiness goes through core.git.dirty).
 _STRICT_READONLY_EXTRA_OVERRIDES = (
     "-c", "protocol.allow=never",
     "-c", "protocol.file.allow=never",
@@ -280,8 +312,8 @@ def safe_git_readonly_command(*args: str) -> list:
 
     Use for git commands that READ a target repository (cloned from an
     untrusted source) and never need a remote: ``log``, ``rev-parse``,
-    ``rev-list``, ``diff-index``, ``ls-files``, local ``checkout`` /
-    ``init`` / ``remote add`` steps, etc. On top of the
+    ``rev-list``, ``diff-index --cached``, ``ls-files``, local
+    ``checkout`` / ``init`` / ``remote add`` steps, etc. On top of the
     :func:`safe_git_command` posture this refuses every transport
     (``protocol.allow=never``, with the per-protocol ``file`` pin
     re-closed — see :data:`_STRICT_READONLY_EXTRA_OVERRIDES`) and pins
@@ -299,8 +331,10 @@ def safe_git_readonly_command(*args: str) -> list:
     that consult a different pager config key).
 
     KNOWN LIMIT (same as :data:`_SAFE_GIT_OVERRIDES`): clean/smudge
-    filter drivers cannot be blanket-neutralised — stick to plumbing
-    that never re-hashes worktree content.
+    filter drivers cannot be blanket-neutralised — stick to commands
+    that never open worktree files (racily-clean re-verification makes
+    even ``diff-index HEAD`` / ``ls-files -m`` re-hash content;
+    dirtiness goes through ``core.git.dirty``).
 
     Example::
 
@@ -360,7 +394,10 @@ def _validate_writable_path(p: Path, *, role: str) -> None:
       - direct children of root (``/foo``, ``/etc``, …) where parent
         is still ``/``;
       - paths under system pseudo-fs prefixes (``/dev/``, ``/proc/``,
-        ``/sys/``, ``/run/``) — see the denylist commentary below.
+        ``/sys/``, ``/run/``) and persistent system-state prefixes
+        (``/etc/``, ``/boot/``, ``/usr/``, ``/var/`` — excepting
+        children of ``/var/tmp/``) — see the denylist commentary
+        below.
     """
     if not p.is_absolute():
         msg = (
@@ -388,9 +425,33 @@ def _validate_writable_path(p: Path, *, role: str) -> None:
     #                        sandbox writes here can collide with
     #                        systemd / docker / similar.
     #
+    # The same reasoning covers persistent SYSTEM STATE — the sandbox
+    # writable scope is ``p.parent``, so accepting a target under
+    # these hands a compromised git server write access to host
+    # configuration with the rest of the isolation engaged:
+    #
+    #   /etc/...           — target=/etc/clone makes /etc writable
+    #                        (cron.d, ld.so.conf.d, sudoers.d).
+    #   /boot/...          — kernels / bootloader config.
+    #   /usr/...           — system binaries and libraries.
+    #   /var/...           — spool/cron, log, lib service state —
+    #                        EXCEPT /var/tmp/<child>, the documented
+    #                        operator scratch location (a target
+    #                        directly AT /var/tmp still refuses:
+    #                        its parent — the writable scope — is
+    #                        /var itself).
+    #   /opt/...           — add-on package trees (root-owned per
+    #                        FHS); a workspace under /opt is
+    #                        conceivable but the documented scratch
+    #                        locations cover the legitimate cases, so
+    #                        the system-state reading wins.
+    #   /srv/...           — served content (web roots, ftp trees).
+    #   /root/...          — the superuser home: dotfiles, keys,
+    #                        cron-adjacent state.
+    #
     # Reject these prefixes outright. Operator-legitimate sandbox
     # work belongs under /tmp, /var/tmp, $HOME, or a dedicated
-    # workspace — not in system pseudo-fs locations.
+    # workspace — not in system pseudo-fs or system-state locations.
     #
     # Checked on BOTH the literal spelling and the resolved path: the
     # literal-only check was defeated by ``..`` traversal
@@ -400,15 +461,22 @@ def _validate_writable_path(p: Path, *, role: str) -> None:
     # the root checks below: a literal ``/run/...`` spelling is
     # refused whatever it resolves to).
     resolved = p.resolve()
-    _DENY_PREFIXES = ("/dev/", "/proc/", "/sys/", "/run/")
+    _DENY_PREFIXES = (
+        "/dev/", "/proc/", "/sys/", "/run/",
+        "/etc/", "/boot/", "/usr/", "/var/",
+        "/opt/", "/srv/", "/root/",
+    )
+    _DENY_EXEMPT_PREFIXES = ("/var/tmp/",)
     for candidate in (str(p), str(resolved)):
+        if any(candidate.startswith(ex) for ex in _DENY_EXEMPT_PREFIXES):
+            continue
         for prefix in _DENY_PREFIXES:
             if candidate.startswith(prefix) or candidate == prefix.rstrip("/"):
                 msg = (
-                    f"{role}={str(p)!r} is under a system pseudo-fs prefix "
-                    f"({prefix}); refusing to grant the sandbox write "
-                    f"access. Use /tmp, /var/tmp, $HOME, or a dedicated "
-                    f"workspace path instead."
+                    f"{role}={str(p)!r} is under a system pseudo-fs or "
+                    f"system-state prefix ({prefix}); refusing to grant "
+                    f"the sandbox write access. Use /tmp, /var/tmp, "
+                    f"$HOME, or a dedicated workspace path instead."
                 )
                 raise ValueError(msg)
     # Two checks against root, both required:
@@ -428,15 +496,15 @@ def _validate_writable_path(p: Path, *, role: str) -> None:
     #
     # Either form being root → reject. Caught by core/sandbox/tests/
     # — first surfaced when the sandbox suite ran on macOS.
-    for label, candidate in (("resolved", resolved), ("literal", p)):
-        if candidate.parent == candidate:
+    for label, candidate in (("resolved", resolved), ("literal", p)):  # type: ignore[assignment]
+        if candidate.parent == candidate:  # type: ignore[attr-defined]
             msg = (
                 f"{role}={str(p)!r} {label}-form is the filesystem "
                 f"root; refusing to grant the sandbox write access "
                 f"to the entire filesystem"
             )
             raise ValueError(msg)
-        if candidate.parent == Path(candidate.anchor):
+        if candidate.parent == Path(candidate.anchor):  # type: ignore[attr-defined]
             msg = (
                 f"{role}={str(p)!r} {label}-form has filesystem root "
                 f"as its parent. Sandbox writable scope "
@@ -445,8 +513,170 @@ def _validate_writable_path(p: Path, *, role: str) -> None:
             raise ValueError(msg)
 
 
+# fetch_commit OWNS the shape of the repos it fetches into: it creates
+# them via ``git init`` and configures exactly one remote. The local
+# config of a PRE-EXISTING ``repo_dir`` is therefore verifiable against
+# the keys those two steps write — anything else was planted by someone
+# other than us and gets the fetch refused.
+#
+# Why an allowlist and not more ``-c`` pins: an entire CLASS of
+# transport-altering config keys carries a repo-chosen component in the
+# key NAME, so no finite ``-c`` list can neutralise them (same shape as
+# the clean/smudge KNOWN LIMIT above):
+#
+#   - ``url.<base>.insteadOf`` rewrites ANY fetch URL — including to a
+#     different allowlisted host serving attacker content;
+#   - ``http.<url>.*`` scopes every http key (``proxy``, ``sslVerify``,
+#     ``sslCAInfo``, ``extraHeader``, …) by URL, and URL-scoped config
+#     is MORE SPECIFIC than a ``-c http.<key>`` pin, so it wins
+#     regardless of `-c`'s file-precedence;
+#   - ``credential.<url>.helper`` re-opens the credential-helper RCE
+#     behind a URL-scoped key;
+#   - ``remote.<name>.proxy`` / ``.vcs`` / ``.uploadpack`` alter
+#     transport per remote name.
+#
+# ``http.proxy`` itself is value-unpinnable too: git hands the value to
+# curl, and an EMPTY value disables proxying outright — including the
+# env-based egress proxy the sandbox injects — so `-c http.proxy=`
+# would break every sandboxed fetch instead of protecting it.
+#
+# The exec-vector keys (`core.fsmonitor`, hooks, editor, pager, gpg,
+# filter/diff drivers, …) stay pinned or refused via
+# ``_SAFE_GIT_OVERRIDES``; this audit closes the transport-CONFIG
+# class by refusing to run the NETWORK step over a config we didn't
+# write. Config is NOT the whole pre-existing-plant surface: replace
+# refs and grafts substitute planted objects behind a correctly-
+# verified fetch with a clean config, so the audit pairs with
+# ``_hostile_history_rewrite_reason`` (both run before the network
+# step) — neither alone closes the class.
+#
+# Trade-off, both directions: an allowlist FAILS LOUD if a future git
+# version's ``init`` writes a new default key (extend the set — the
+# error names the key); a denylist would instead FAIL OPEN on the next
+# transport key git grows, which is the direction this audit exists to
+# prevent.
+_FETCH_LOCAL_CONFIG_BENIGN = frozenset({
+    # `git init` defaults (platform-dependent members included).
+    "core.repositoryformatversion",
+    "core.filemode",
+    "core.bare",
+    "core.logallrefupdates",
+    "core.ignorecase",
+    "core.precomposeunicode",
+    "core.symlinks",
+})
+
+
+def _proc_error_detail(proc) -> str:
+    """stderr-or-stdout detail for git failure messages, neutralised at
+    the message-builder: git relays server-controlled ``remote:`` banner
+    lines verbatim into stderr, so ESC/C1 control bytes would otherwise
+    ride the RuntimeError into whichever consumer prints it (consumers
+    forward ``str(exc)`` onward). Escaping HERE means every present and
+    future consumer inherits the scrub; newlines are preserved for
+    multi-line git errors and the result is length-capped (a hostile
+    banner can be arbitrarily long)."""
+    stderr = (proc.stderr or "").strip()
+    stdout = (proc.stdout or "").strip()
+    detail = stderr or stdout or "unknown error"
+    return escape_nonprintable(detail, preserve_newlines=True)[:2000]
+
+
+def _foreign_local_config_keys(listing_nul: str) -> list:
+    """Keys in a ``git config --local -z --list`` dump that fetch_commit's
+    own init/remote-add steps would never write.
+
+    ``-z`` output is ``key\\n[value]\\0`` per entry — NUL framing means a
+    hostile VALUE containing newlines cannot forge or hide an entry
+    (line-wise parsing of the non-``-z`` form could be steered by a
+    value line that looks like a key). Keys are matched lowercased;
+    git already lowercases section and variable names, and the only
+    case-preserved part (subsection) is never load-bearing here.
+    """
+    foreign = set()
+    for entry in listing_nul.split("\0"):
+        if not entry:
+            continue
+        key = entry.split("\n", 1)[0].strip().lower()  # line-model: git -z config listing; key strip()-normalised
+        if not key or key in _FETCH_LOCAL_CONFIG_BENIGN:
+            continue
+        parts = key.split(".")
+        # remote.origin.url / remote.origin.fetch are fetch_commit's
+        # own ``remote add`` footprint (url is re-pinned via set-url
+        # before every fetch, so a pre-existing value cannot steer the
+        # remote). ORIGIN ONLY: fetch_commit never writes any other
+        # remote, and a planted foreign-remote ``ext::`` URL — inert
+        # for our explicit ``fetch origin <sha>`` — would lie in wait
+        # for any out-of-band ``git fetch --all`` in the same dir.
+        if (parts[0] == "remote" and parts[1:-1] == ["origin"]
+                and parts[-1] in ("url", "fetch")):
+            continue
+        foreign.add(key)
+    return sorted(foreign)
+
+
+def _hostile_history_rewrite_reason(repo_dir: Path, run) -> str | None:
+    """Refusal reason when a pre-existing ``repo_dir`` carries git
+    history-rewrite state fetch_commit never writes, else ``None``.
+
+    Two mechanisms substitute attacker content behind a correctly-
+    verified fetch WITHOUT any config key — so the config audit alone
+    cannot see them:
+
+      - ``refs/replace/<sha>`` (loose or packed): object substitution
+        at the read layer.  ``core.useReplaceRefs=false`` pins our own
+        commands, but the fetched repo outlives this function and any
+        consumer reading it without the pin gets the replacement.
+      - ``info/grafts``: parent-link rewriting (deprecated but still
+        honoured by default; NO config equivalent exists).
+
+    ``run`` is fetch_commit's local sandboxed runner — git plumbing
+    (not raw path checks) so packed replace refs and ``.git``-file
+    worktree pointers are covered.  Fail closed: an audit step that
+    cannot be read refuses like the unreadable-config arm.
+    """
+    refs = run(
+        safe_git_readonly_command(
+            "-C", str(repo_dir), "for-each-ref", "--count=1",
+            "refs/replace/",
+        ),
+    )
+    if refs.returncode != 0:
+        return (
+            "replace-ref audit unreadable — refusing to fetch over an "
+            f"unverifiable repository: {_proc_error_detail(refs)}"
+        )
+    if (refs.stdout or "").strip():
+        return (
+            "pre-existing repo_dir carries refs/replace/* — replace "
+            "refs substitute planted objects behind a correctly-"
+            "verified SHA for every reader"
+        )
+    grafts = run(
+        safe_git_readonly_command(
+            "-C", str(repo_dir), "rev-parse", "--git-path", "info/grafts",
+        ),
+    )
+    if grafts.returncode != 0:
+        return (
+            "grafts audit unreadable — refusing to fetch over an "
+            f"unverifiable repository: {_proc_error_detail(grafts)}"
+        )
+    grafts_path = Path((grafts.stdout or "").strip() or "info/grafts")
+    if not grafts_path.is_absolute():
+        grafts_path = repo_dir / grafts_path
+    if grafts_path.exists():
+        return (
+            "pre-existing repo_dir carries info/grafts — grafts "
+            "rewrite parent links for every reader and have no "
+            "config off-switch"
+        )
+    return None
+
+
 def clone_repository(
     url: str, target: Path, depth: int | None = 1,
+    mirror: bool = False,
 ) -> bool:
     """Shallow-clone ``url`` into ``target`` via the sandboxed runner.
 
@@ -456,13 +686,21 @@ def clone_repository(
             this as the only writable path.
         depth: shallow-clone depth (default 1). Pass ``None`` to clone
             full history.
+        mirror: pass ``--mirror`` (all refs, bare repository) — the
+            git-forensics shape: dangling / force-pushed history
+            needs refs a plain clone never fetches. Mutually
+            exclusive with ``depth``.
 
     Raises:
-        ValueError: URL fails the allowlist, or ``target`` fails the
+        ValueError: URL fails the allowlist, ``target`` fails the
             writable-path check (relative, filesystem root, or
-            direct child of root — see ``_validate_writable_path``).
+            direct child of root — see ``_validate_writable_path``),
+            or ``mirror`` is combined with a ``depth``.
         RuntimeError: ``git clone`` exited non-zero.
     """
+    if mirror and depth is not None:
+        msg = "mirror clones are full history; pass depth=None"
+        raise ValueError(msg)
     if not validate_repo_url(url):
         # Security-event stream (restored from the pre-restructure
         # core/git.py emitter, commit c1af3314): record the rejection
@@ -484,9 +722,15 @@ def clone_repository(
     # transport is https, which every pin is compatible with, and the
     # pins also govern the post-transfer checkout of the untrusted tree.
     cmd = safe_git_command("clone")
-    if depth is not None:
+    if mirror:
+        cmd.append("--mirror")
+    elif depth is not None:
         cmd.extend(["--depth", str(depth), "--no-tags"])
-    cmd.extend([url, str(target)])
+    # "--" before the URL, same as the ls-remote path: unexploitable
+    # today (validate_repo_url fullmatch-allowlists the shape) but the
+    # option/positional boundary must not silently re-open on any
+    # future allowlist widening.
+    cmd.extend(["--", url, str(target)])
 
     # Redact any embedded credentials in the URL before logging.
     # ``validate_repo_url`` rejects userinfo upstream, but a future
@@ -516,9 +760,7 @@ def clone_repository(
         text=True,
     )
     if proc.returncode != 0:
-        stderr = (proc.stderr or "").strip()
-        stdout = (proc.stdout or "").strip()
-        msg = f"git clone failed: {stderr or stdout or 'unknown error'}"
+        msg = f"git clone failed: {_proc_error_detail(proc)}"
         raise RuntimeError(msg)
     # Host-side materialisation check. git's exit status reports what
     # happened INSIDE the sandbox — under the mount-ns backend the
@@ -635,10 +877,59 @@ def fetch_commit(
         }
         if network:
             return run_untrusted_networked(
-                cmd, proxy_hosts=proxy_hosts, fake_home=True, **kwargs)
-        return run_untrusted(cmd, **kwargs)
+                cmd, proxy_hosts=proxy_hosts, fake_home=True, **kwargs)  # type: ignore[arg-type]
+        return run_untrusted(cmd, **kwargs)  # type: ignore[arg-type]
 
     is_repo = (repo_dir / ".git").exists()
+    if is_repo:
+        # PRE-EXISTING repo: its .git/config is untrusted, and the
+        # network step below honours transport-altering keys that no
+        # finite ``-c`` pin list can neutralise (URL-scoped
+        # ``url.<base>.insteadOf`` / ``http.<url>.*`` /
+        # ``credential.<url>.*``, per-remote proxy/vcs — see the
+        # closure commentary on ``_foreign_local_config_keys``).
+        # Refuse to fetch over a local config we didn't write — and
+        # over history-rewrite state (replace refs / grafts) that
+        # substitutes planted objects behind a correctly-verified
+        # fetch without touching config (see
+        # ``_hostile_history_rewrite_reason``).
+        listing = _run(
+            safe_git_readonly_command(
+                "-C", str(repo_dir), "config", "--local", "-z", "--list",
+            ),
+            network=False,
+        )
+        if listing.returncode != 0:
+            msg = (
+                "pre-existing repo_dir local config unreadable — "
+                "refusing to fetch over an unverifiable configuration: "
+                f"{_proc_error_detail(listing)}"
+            )
+            raise RuntimeError(msg)
+        foreign = _foreign_local_config_keys(listing.stdout or "")
+        if foreign:
+            shown = ", ".join(
+                escape_nonprintable(k)[:80] for k in foreign[:8]
+            )
+            msg = (
+                f"pre-existing repo_dir carries local git config keys "
+                f"fetch_commit never writes ({shown}) — a planted "
+                f"config can redirect or proxy the fetch "
+                f"(url.*.insteadOf, http.*), so the network step "
+                f"refuses to run over it. Re-create {str(repo_dir)!r} "
+                f"fresh (empty dir) to fetch."
+            )
+            raise RuntimeError(msg)
+        rewrite_reason = _hostile_history_rewrite_reason(
+            repo_dir, lambda cmd: _run(cmd, network=False),
+        )
+        if rewrite_reason is not None:
+            msg = (
+                f"{rewrite_reason} — the network step refuses to run "
+                f"over it. Re-create {str(repo_dir)!r} fresh (empty "
+                f"dir) to fetch."
+            )
+            raise RuntimeError(msg)
     if not is_repo:
         logger.info("git init: %s", repo_dir)
         proc = _run(
@@ -649,10 +940,7 @@ def fetch_commit(
             network=False,
         )
         if proc.returncode != 0:
-            msg = (
-                f"git init failed: "
-                f"{(proc.stderr or proc.stdout or 'unknown error').strip()}"
-            )
+            msg = f"git init failed: {_proc_error_detail(proc)}"
             raise RuntimeError(msg)
 
     # ``remote add`` is idempotent-ish — if origin already exists we
@@ -675,12 +963,10 @@ def fetch_commit(
             network=False,
         )
         if set_proc.returncode != 0:
-            add_msg = (add_proc.stderr or add_proc.stdout or "").strip()
-            set_msg = (set_proc.stderr or set_proc.stdout or "").strip()
             msg = (
                 f"git remote add/set-url failed: "
-                f"add={add_msg or 'unknown error'}; "
-                f"set-url={set_msg or 'unknown error'}"
+                f"add={_proc_error_detail(add_proc)}; "
+                f"set-url={_proc_error_detail(set_proc)}"
             )
             raise RuntimeError(msg)
 
@@ -699,10 +985,7 @@ def fetch_commit(
         network=True,
     )
     if proc.returncode != 0:
-        msg = (
-            f"git fetch failed: "
-            f"{(proc.stderr or proc.stdout or 'unknown error').strip()}"
-        )
+        msg = f"git fetch failed: {_proc_error_detail(proc)}"
         raise RuntimeError(msg)
 
     # Verify WHAT the remote actually sent. A zero exit only proves
@@ -724,7 +1007,7 @@ def fetch_commit(
         logger.warning(
             "git fetch reported success but FETCH_HEAD does not "
             "resolve to a commit: %s",
-            (verify.stderr or verify.stdout or "unknown error").strip(),
+            _proc_error_detail(verify),
         )
         return False
     resolved = (verify.stdout or "").strip().lower()
@@ -968,9 +1251,7 @@ def ls_remote(
         )
 
     if proc.returncode != 0:
-        stderr = (proc.stderr or "").strip()
-        stdout = (proc.stdout or "").strip()
-        msg = f"git ls-remote failed: {stderr or stdout or 'unknown error'}"
+        msg = f"git ls-remote failed: {_proc_error_detail(proc)}"
         raise RuntimeError(msg)
 
     refs: list[tuple[str, str]] = []

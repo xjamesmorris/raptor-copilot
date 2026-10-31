@@ -50,14 +50,30 @@ from typing import Any
 # decode error otherwise false-positives. The context arm accepts an
 # optional colon (`\s*:?\s*`): the genuine SDK shape is
 # ``Error code: 401 - ...`` and a plain `\s+` never matched it.
-_STATUS_40X = r"(?:http|status|code)\s*:?\s*40[13]\b"
+# The optional colon gates its own trailing whitespace — the naive
+# ``\s*:?\s*`` put two whitespace spans around it, quadratic on a
+# status token followed by a whitespace run.
+_STATUS_40X = r"(?:http|status|code)\s*(?::\s*)?40[13]\b"
+# google-genai renders errors as ``"<code> <STATUS>. {...}"`` —
+# message-leading status position plus the gRPC SCREAMING_SNAKE
+# reason vocabulary ("401 UNAUTHENTICATED", "403 PERMISSION_DENIED").
+# Mirrors the sibling anchors that already model this SDK shape:
+# RATE_LIMIT_KEYWORDS_RE's ``^\s*429\b`` arm and _HTTP_500_STATUS_RE's
+# ``500 INTERNAL`` arm in client.py. Kept OUTSIDE the ``\b(...)\b``
+# wrapper below — a leading ``\b`` never matches before ``^``.
+_STATUS_40X_LEADING = r"^\s*40[13]\b"
+_AUTH_40X_REASONS = (
+    r"40[13]\s+(?:unauthorized|forbidden|unauthenticated|"
+    r"permission[_ ]denied)"
+)
 
 AUTH_KEYWORDS_RE = re.compile(
-    r"\b(" + _STATUS_40X + r"|"
-    r"40[13]\s+(?:unauthorized|forbidden)|"
-    r"authentication|unauthorized|invalid api key|billing|"
+    r"\b(" + _STATUS_40X + r"|" + _AUTH_40X_REASONS + r"|"
+    r"authentication|unauthorized|unauthenticated|invalid api key|"
+    r"billing|"
     r"quota|rate limit|insufficient_quota|credits?|"
-    r"api[_ ]?key (?:invalid|expired|missing))\b",
+    r"api[_ ]?key (?:invalid|expired|missing))\b"
+    r"|" + _STATUS_40X_LEADING,
     re.IGNORECASE,
 )
 
@@ -67,13 +83,13 @@ AUTH_KEYWORDS_RE = re.compile(
 # tracker) must not trip on a burst of 429s or a billing cap, which
 # are transient/budget classes with their own handling.
 AUTH_STATUS_RE = re.compile(
-    r"\b(" + _STATUS_40X + r"|"
-    r"40[13]\s+(?:unauthorized|forbidden)|"
-    r"authentication(?:[_ ]error)?|unauthorized|"
-    r"permission denied|access denied|"
+    r"\b(" + _STATUS_40X + r"|" + _AUTH_40X_REASONS + r"|"
+    r"authentication(?:[_ ]error)?|unauthorized|unauthenticated|"
+    r"permission[_ ]denied|access denied|"
     r"invalid (?:api[_ ]?key|x-api-key)|"
     r"api[_ ]?key (?:invalid|expired|missing|not valid)|"
-    r"incorrect api key)\b",
+    r"incorrect api key)\b"
+    r"|" + _STATUS_40X_LEADING,
     re.IGNORECASE,
 )
 
@@ -93,17 +109,23 @@ TIMEOUT_KEYWORDS_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Rate-limit shapes AUTH_KEYWORDS_RE misses: the underscored provider
-# error type (``rate_limit_error`` — "rate limit" with a space never
-# matches it) and a 429 status. The 429 arm is boundary-anchored AND
-# context-anchored (status-context word, message-leading position, or
-# the canonical reason phrases) so unrelated numerics like stack-trace
-# "line 429, in foo" don't classify as a limit.
+# Rate-limit shapes AUTH_KEYWORDS_RE misses: the underscored/hyphened
+# provider error type and inflections (``rate_limit_error``,
+# ``rate-limit``, "rate limiting in effect", "exceeded your rate
+# limits" — real provider phrasings), and a 429 status. The 429 arm
+# is boundary-anchored AND context-anchored (status-context word —
+# including the "HTTP error 429" / bare "API Error: 429" phrasings
+# wrappers emit — message-leading position, or the canonical reason
+# phrases, colon-separated or not) so unrelated numerics like
+# stack-trace "line 429, in foo" don't classify as a limit.
+# Optional colons gate their own trailing whitespace (the
+# ``\s*:?\s*`` chains were quadratic on whitespace runs).
 RATE_LIMIT_KEYWORDS_RE = re.compile(
-    r"rate[_ ]limit(?:_error|ed)?\b"
-    r"|\b(?:http|status|code)\s*:?\s*429\b"
+    r"rate[_ -]limit(?:_error|ed|ing|s)?\b"
+    r"|\b(?:http|status|code|api\s+error)\s*(?::\s*)?429\b"
+    r"|\b(?:http|status|code)\s*error\s*(?::\s*)?429\b"
     r"|^\s*429\b"
-    r"|\b429\s+(?:too many requests|resource_exhausted)\b",
+    r"|\b429(?:\s*:\s+|\s+)(?:too many requests|resource_exhausted)\b",
     re.IGNORECASE,
 )
 
@@ -216,15 +238,19 @@ def unwrap_structured_response(
     tuple. ``empty_result`` is what ``result`` becomes when the
     response is falsy or unsubscriptable (callers pick their own
     sentinel: an error dict, ``None``, ...).
+
+    Result extraction DELEGATES to
+    :func:`core.llm.coerce.structured_result` — the one spelling of
+    the ``.result``-or-``(result, raw)`` tolerance — so the two
+    helpers cannot drift on shape semantics (pre-unification a bare
+    dict unwrapped fine through one and became ``empty_result``
+    through the other). This wrapper adds only the cost/model/usage
+    view; callers that need the result alone should use
+    ``structured_result`` directly.
     """
-    result = empty_result
-    if hasattr(response, "result"):
-        result = response.result
-    elif response:
-        try:
-            result = response[0]
-        except (TypeError, KeyError, IndexError):
-            result = empty_result
+    from core.llm.coerce import structured_result
+
+    result = structured_result(response, default=empty_result)
     try:
         cost = float(getattr(response, "cost", 0.0) or 0.0)
     except (TypeError, ValueError):
@@ -246,12 +272,17 @@ def unwrap_structured_response(
 
 __all__ = [
     "AUTH_KEYWORDS_RE",
+    "AUTH_STATUS_RE",
     "BLOCKED_KEYWORDS_RE",
     "RATE_LIMIT_KEYWORDS_RE",
+    "REFUSAL_TEXT_RE",
     "TIMEOUT_KEYWORDS_RE",
     "StructuredCallResult",
     "classify_error_text",
     "is_auth_error_text",
+    "is_auth_status_text",
+    "is_content_filter_error",
     "is_content_filter_text",
+    "is_refusal_error",
     "unwrap_structured_response",
 ]

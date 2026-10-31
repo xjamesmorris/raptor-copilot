@@ -37,6 +37,29 @@ class TestVerdictFromAnalysis:
     def test_not_analyzed(self):
         assert _verdict_from_analysis({}) == "not_analyzed"
 
+    def test_junk_alias_is_not_exploitable(self):
+        # Genuine-bool rule on the legacy alias: a junk shape ("no",
+        # 1) is a non-verdict — pre-fix the truthy read displayed it
+        # as the exploitable verdict. Today's producers are bool-typed
+        # so junk cannot reach this lane; the rule keeps the display
+        # honest if that ever changes.
+        for junk in ("no", "yes", 1, [1]):
+            f = {"exploitable": junk,
+                 "analysis": {"is_true_positive": False}}
+            assert _verdict_from_analysis(f) == "ruled_out", junk
+
+    def test_junk_alias_props_stay_consistent(self):
+        # Props-level repro: pre-fix this record exported
+        # verdict="exploitable" while is_exploitable was (correctly)
+        # omitted from props — an internally inconsistent SARIF whose
+        # headline verdict was junk-derived.
+        from core.sarif.enriched_writer import _build_raptor_properties
+        verdict, props = _build_raptor_properties(
+            {"exploitable": "yes", "analysis": {"is_exploitable": "yes"}},
+        )
+        assert verdict == "not_analyzed"
+        assert "is_exploitable" not in props
+
     def test_suppressed_beats_exploitable(self):
         f = {
             "exploitable": True,
@@ -129,6 +152,14 @@ class TestBuildRaptorProperties:
         f = {"analysis": {"is_exploitable": False}}
         _, props = _build_raptor_properties(f)
         assert props["is_exploitable"] is False
+
+    def test_is_exploitable_junk_shape_omitted(self):
+        # A non-bool shape is a non-verdict: exporting it stamped a
+        # junk value into the SARIF property bag as if it were a
+        # verdict (tri-state accessor rule — abstention is omitted).
+        f = {"analysis": {"is_exploitable": "yes"}}
+        _, props = _build_raptor_properties(f)
+        assert "is_exploitable" not in props
 
     def test_analysis_none_handled(self):
         f = {"analysis": None}
@@ -415,3 +446,116 @@ class TestAtomicWrite:
         assert n == 2
         doc = json.loads(out.read_text())
         assert len(doc["runs"][0]["results"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# Untrusted row shapes — one junk row never kills the export
+# ---------------------------------------------------------------------------
+
+class TestUntrustedRowShapes:
+    """findings.json rows read back from run directories carry
+    string-typed numerics and junk shapes; the writer must coerce
+    what it can and degrade the rest to a recorded per-row skip —
+    never an export-fatal exception."""
+
+    def _good(self, **overrides):
+        base = {
+            "rule_id": "r-good", "file_path": "src/a.c",
+            "start_line": 3, "message": "ok", "tool": "semgrep",
+        }
+        base.update(overrides)
+        return base
+
+    def test_string_line_keeps_its_value(self):
+        doc = build_enriched_sarif([self._good(start_line="12")])
+        region = (doc["runs"][0]["results"][0]["locations"][0]
+                  ["physicalLocation"]["region"])
+        assert region["startLine"] == 12
+
+    def test_junk_line_falls_back(self):
+        doc = build_enriched_sarif([self._good(start_line="not-a-line")])
+        region = (doc["runs"][0]["results"][0]["locations"][0]
+                  ["physicalLocation"]["region"])
+        assert region["startLine"] == 1
+
+    def test_string_score_exported_as_float(self):
+        doc = build_enriched_sarif(
+            [self._good(exploitability_score="9.8")])
+        props = (doc["runs"][0]["results"][0]["properties"]["raptor"])
+        assert props["exploitability_score"] == 9.8
+
+    def test_junk_score_omitted_not_fatal(self):
+        doc = build_enriched_sarif(
+            [self._good(exploitability_score="high")])
+        props = (doc["runs"][0]["results"][0]["properties"]["raptor"])
+        assert "exploitability_score" not in props
+
+    def test_poison_row_skipped_with_record_others_survive(self):
+        poison = self._good(rule_id="r-bad", analysis="not-a-dict")
+        doc = build_enriched_sarif(
+            [self._good(), poison, self._good(rule_id="r-2")])
+        run = doc["runs"][0]
+        exported_rules = {r["ruleId"] for r in run["results"]}
+        assert "r-good" in exported_rules
+        assert "r-2" in exported_rules
+        assert "r-bad" not in exported_rules
+        notes = run["invocations"][0]["toolExecutionNotifications"]
+        assert len(notes) == 1
+        assert "r-bad" in notes[0]["message"]["text"]
+
+    def test_non_dict_row_skipped_with_record(self):
+        # A non-dict row cannot name its tool, so its skip record
+        # lands on the default-tool run.
+        doc = build_enriched_sarif([self._good(), "junk-row"])
+        results = [r for run in doc["runs"] for r in run["results"]]
+        assert len(results) == 1
+        notes = [
+            n
+            for run in doc["runs"]
+            for inv in run["invocations"]
+            for n in inv.get("toolExecutionNotifications", [])
+        ]
+        assert len(notes) == 1
+
+    def test_clean_export_has_no_notifications(self):
+        doc = build_enriched_sarif([self._good()])
+        invocation = doc["runs"][0]["invocations"][0]
+        assert "toolExecutionNotifications" not in invocation
+        assert invocation["executionSuccessful"] is True
+
+    def test_unhashable_rule_id_skipped_not_fatal(self):
+        # The rule-registry bookkeeping runs after a successful row
+        # build — a list-shaped rule_id must not crash the dict
+        # membership test there.
+        doc = build_enriched_sarif(
+            [self._good(), self._good(rule_id=["x"])])
+        results = [r for run in doc["runs"] for r in run["results"]]
+        assert len(results) == 2
+        rules = {
+            r["id"]
+            for run in doc["runs"]
+            for r in run["tool"]["driver"]["rules"]
+        }
+        assert "unknown" in rules
+
+    def test_unhashable_tool_value_not_fatal(self):
+        # The tool key is used for dict bookkeeping BEFORE the guarded
+        # row build — a dict-shaped tool must degrade to the default
+        # tool, not kill the export.
+        doc = build_enriched_sarif(
+            [self._good(), self._good(rule_id="r-2", tool={"a": 1})])
+        results = [r for run in doc["runs"] for r in run["results"]]
+        assert len(results) == 2
+
+    def test_skip_record_text_escaped(self):
+        poison = self._good(
+            rule_id="r-\x1b[2Jbad", analysis="not-a-dict")
+        doc = build_enriched_sarif([poison])
+        notes = [
+            n
+            for run in doc["runs"]
+            for inv in run["invocations"]
+            for n in inv.get("toolExecutionNotifications", [])
+        ]
+        assert len(notes) == 1
+        assert "\x1b" not in notes[0]["message"]["text"]

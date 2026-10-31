@@ -315,6 +315,20 @@ def _get_bo_item_index(
     return idx
 
 
+# Dotted-prefix fan-out cap for one import bound. Materialising every
+# prefix of a bound with L segments allocates O(L²) characters — one
+# planted 80KB import line (20k single-letter segments) cost 1.6GB of
+# peak allocation at index build, and the growth is quadratic in the
+# line length (hostile-repo OOM of the analysis process). Real module
+# paths sit far below 32 segments; a bound past the cap indexes its
+# first 32 prefixes + the full bound + the tail AND joins the
+# always-considered masking bucket so index narrowing can never hide
+# the file from a deeper-prefix lookup (over-inclusive — the per-file
+# branch re-derives everything from the file's actual imports/flags,
+# so membership only costs cycles, never correctness).
+_MAX_IMPORT_BOUND_SEGMENTS = 32
+
+
 def _build_function_called_index(
     inventory: dict[str, Any],
 ) -> _FunctionCalledIndex:
@@ -338,13 +352,22 @@ def _build_function_called_index(
         # Imports: target_module matches `bound == target_module`,
         # `bound == target_dot_func`, or `bound.startswith(
         # target_module + ".")`. Indexing every dotted prefix of
-        # ``bound`` covers all three.
+        # ``bound`` covers all three (fan-out capped — see
+        # _MAX_IMPORT_BOUND_SEGMENTS).
         for bound in (cg.get("imports") or {}).values():
             if not isinstance(bound, str) or not bound:
                 continue
             parts = bound.split(".")
-            for k in range(1, len(parts) + 1):
+            capped = len(parts) > _MAX_IMPORT_BOUND_SEGMENTS
+            n_prefixes = min(len(parts), _MAX_IMPORT_BOUND_SEGMENTS)
+            for k in range(1, n_prefixes + 1):
                 _add(".".join(parts[:k]), i)
+            if capped:
+                _add(bound, i)
+                # Deeper-prefix lookups would miss the token buckets —
+                # keep the file always-considered instead of ever
+                # letting narrowing read it as "no possible role".
+                non_wildcard.add(i)
             # Tail of the import name is what
             # ``file_mentions_tail`` checks against — index the
             # final segment too so target_func lookups hit it.
@@ -976,14 +999,20 @@ class _AdjacencyIndex:
 
     forward: dict[InternalFunction, set[FunctionId]] = field(default_factory=dict)
     reverse: dict[FunctionId, set[InternalFunction]] = field(default_factory=dict)
-    # Uncertain callers are stashed by *target tail name*, not target
-    # FunctionId, because the same file-level masking flag taints
-    # every internal function in that file as a possible caller for
-    # any target the file mentions by tail. callers_of() looks up by
-    # the target's tail when assembling its result.
-    uncertain_callers_by_tail: dict[str, set[tuple[InternalFunction, str]]] = (
-        field(default_factory=dict)
-    )
+    # Uncertain callers are a PER-FILE property: a file-level masking
+    # flag taints every internal function in that file as a possible
+    # caller for any target the file mentions by tail. Stored
+    # factored — tail → masked file paths, and per masked file its
+    # (flag_label, functions) record — and joined lazily in
+    # :meth:`uncertain_caller_pairs` (callers_of is the only
+    # consumer). The eager tails × functions tuple expansion this
+    # replaces was quadratic per masked file: ONE planted file with
+    # 2000 mentioned tails × 2000 defs materialised 4M tuples / 520MB
+    # / 65s at index build.
+    uncertain_tail_paths: dict[str, set[str]] = field(default_factory=dict)
+    masked_file_callers: dict[
+        str, tuple[str, tuple[InternalFunction, ...]],
+    ] = field(default_factory=dict)
     # ``method_match[tail]`` entries pair a candidate caller with an
     # optional receiver-class name. The receiver class is set when
     # the call site is a ``self.foo()`` / ``cls.foo()`` inside a
@@ -1053,6 +1082,21 @@ class _AdjacencyIndex:
     ] = field(default_factory=dict)
     # Set of file paths classified as test files (cached).
     test_paths: frozenset[str] = frozenset()
+
+    def uncertain_caller_pairs(
+        self, tail: str,
+    ) -> set[tuple[InternalFunction, str]]:
+        """(function, flag_label) pairs of possible uncertain callers
+        for ``tail`` — the lazy join over the factored per-file
+        records (see the field comments above)."""
+        out: set[tuple[InternalFunction, str]] = set()
+        for path in self.uncertain_tail_paths.get(tail, ()):
+            entry = self.masked_file_callers.get(path)
+            if entry is None:
+                continue
+            flag_label, fns = entry
+            out.update((fn, flag_label) for fn in fns)
+        return out
 
 
 # Memoisation: keyed on ``id(inventory)``. Cache entries hold a
@@ -1389,6 +1433,24 @@ def _get_or_build_index(
 
     qualified_to_internal = idx.qualified_to_internal
 
+    # Call-line staging: per-(caller, callee) line SETS during the
+    # build, frozen to sorted tuples once at the end. Recording
+    # straight into the tuple-valued ``idx.call_lines`` rebuilt and
+    # re-sorted the whole tuple per insert — O(n²) per edge pair, and
+    # a hostile file with one caller/callee pair and tens of
+    # thousands of call lines wedged the build (measured 8.6s at 40k
+    # inserts, 4x per doubling).
+    call_lines_acc: dict[
+        tuple[InternalFunction, FunctionId], set[int],
+    ] = {}
+
+    # Per-path function grouping (one pass over the completed
+    # ``definitions`` map) — the masking arm below reads it per file;
+    # scanning ALL definitions per masked file was O(files × defs).
+    fns_by_path: dict[str, list[InternalFunction]] = {}
+    for (def_path, _def_name), def_fns in idx.definitions.items():
+        fns_by_path.setdefault(def_path, []).extend(def_fns)
+
     # Pass 2: walk every call site, resolve to a callee FunctionId
     # (Internal or External), record forward + reverse edges.
     for file_record in inventory.get("files", []):
@@ -1407,7 +1469,7 @@ def _get_or_build_index(
         has_wildcard = INDIRECTION_WILDCARD_IMPORT in flags
 
         for call in cg.get("calls") or []:
-            chain: list[str] = list(call.get("chain") or [])
+            chain = list(call.get("chain") or [])  # type: ignore[no-redef]
             if not chain:
                 continue
             line = int(call.get("line", 0) or 0)
@@ -1430,10 +1492,10 @@ def _get_or_build_index(
                 # caller reaching it via cross-package import.
                 aliased = qualified_to_internal.get(callee.qualified_name)
                 if aliased is not None:
-                    callee = aliased
+                    callee = aliased  # type: ignore[assignment]
                 idx.forward.setdefault(caller_node, set()).add(callee)
                 idx.reverse.setdefault(callee, set()).add(caller_node)
-                _record_call_line(idx, caller_node, callee, line)
+                _record_call_line(call_lines_acc, caller_node, callee, line)
                 continue
 
             # Fully-qualified-call index path: when the chain itself
@@ -1453,7 +1515,7 @@ def _get_or_build_index(
                 if aliased is not None:
                     idx.forward.setdefault(caller_node, set()).add(aliased)
                     idx.reverse.setdefault(aliased, set()).add(caller_node)
-                    _record_call_line(idx, caller_node, aliased, line)
+                    _record_call_line(call_lines_acc, caller_node, aliased, line)
                     continue
 
             # Couldn't resolve via import map. Two sub-cases:
@@ -1472,7 +1534,7 @@ def _get_or_build_index(
                     for d in local_defs:
                         idx.forward.setdefault(caller_node, set()).add(d)
                         idx.reverse.setdefault(d, set()).add(caller_node)
-                        _record_call_line(idx, caller_node, d, line)
+                        _record_call_line(call_lines_acc, caller_node, d, line)
                     continue
                 # Local name not defined in this file — likely a
                 # builtin (open, len, ...) or a wildcard-imported
@@ -1504,15 +1566,16 @@ def _get_or_build_index(
 
         # Indirection flags on the file → every internal function
         # defined IN this file inherits "uncertain caller" status
-        # for any target the file mentions by tail. We record this
-        # at file level: the keys we care about are tail names that
-        # appear in (a) call chains tail-side, (b) getattr_targets,
-        # (c) imports' tail components.
+        # for any target the file mentions by tail. Recorded
+        # FACTORED at file level (tail → path, path → (flag, fns));
+        # the tails × functions pairs are joined lazily at lookup in
+        # ``uncertain_caller_pairs`` — the eager cross-product was
+        # quadratic per masked file (4M tuples / 520MB / 65s for one
+        # planted 2000×2000 file). The keys we care about are tail
+        # names that appear in (a) call chains tail-side, (b)
+        # getattr_targets, (c) imports' tail components.
         if non_wildcard_masking or has_wildcard:
-            file_internal_fns = [
-                fn for (p, _name), fns in idx.definitions.items()
-                if p == path for fn in fns
-            ]
+            file_internal_fns = fns_by_path.get(path, ())
             mentioned_tails: set[str] = set(getattr_targets)
             for call in cg.get("calls") or []:
                 chain = list(call.get("chain") or [])
@@ -1522,20 +1585,30 @@ def _get_or_build_index(
                 if not qualified:
                     continue
                 mentioned_tails.add(qualified.rsplit(".", 1)[-1])
-            for tail in mentioned_tails:
-                for fn in file_internal_fns:
-                    # We don't know the *target* yet — that's keyed
-                    # on the lookup. Stash the (caller, tail, flag)
-                    # tuple under tail so callers_of can pick it
-                    # up.
-                    flag_label = (
-                        sorted(non_wildcard_masking)[0]
-                        if non_wildcard_masking
-                        else INDIRECTION_WILDCARD_IMPORT
-                    )
-                    idx.uncertain_callers_by_tail.setdefault(
+            if file_internal_fns and mentioned_tails:
+                flag_label = (
+                    sorted(non_wildcard_masking)[0]
+                    if non_wildcard_masking
+                    else INDIRECTION_WILDCARD_IMPORT
+                )
+                idx.masked_file_callers[path] = (
+                    flag_label,
+                    tuple(sorted(
+                        file_internal_fns,
+                        key=lambda f: (f.name, f.line),
+                    )),
+                )
+                for tail in mentioned_tails:
+                    idx.uncertain_tail_paths.setdefault(
                         tail, set(),
-                    ).add((fn, flag_label))
+                    ).add(path)
+
+    # Freeze the staged call-line sets into the index's documented
+    # sorted-tuple form (one pass; consumers never see the sets).
+    idx.call_lines = {
+        key: tuple(sorted(lines))
+        for key, lines in call_lines_acc.items()
+    }
 
     with _INDEX_CACHE_LOCK:
         _INDEX_CACHE[inv_id] = (inventory, idx)
@@ -1862,23 +1935,20 @@ def _resolve_caller(
 
 
 def _record_call_line(
-    idx: _AdjacencyIndex,
+    call_lines_acc: dict[tuple[InternalFunction, FunctionId], set[int]],
     caller: InternalFunction,
     callee: FunctionId,
     line: int,
 ) -> None:
-    """Append ``line`` to ``idx.call_lines[(caller, callee)]``,
-    keeping the tuple sorted with no duplicates.
+    """Add ``line`` to the build-time staging set for ``(caller,
+    callee)``.
 
     Forward / reverse edges are deduplicated; this side-index keeps
     multiplicity for evidence rendering ("X calls Y at lines …").
-    """
-    key = (caller, callee)
-    existing = idx.call_lines.get(key, ())
-    if line in existing:
-        return
-    merged = existing + (line,)
-    idx.call_lines[key] = tuple(sorted(merged))
+    Staged as sets and frozen to sorted tuples ONCE at the end of the
+    index build — rebuilding a sorted tuple per insert was O(n²) per
+    edge pair on hostile many-calls-one-pair files."""
+    call_lines_acc.setdefault((caller, callee), set()).add(line)
 
 
 def _apply_reexport_aliases(idx: _AdjacencyIndex) -> int:
@@ -2135,15 +2205,17 @@ def _candidate_qualified_names(
     class_required = file_path.endswith(".java")
     if package_name and class_name:
         candidates.append(f"{package_name}.{class_name}.{fn_name}")
-    if package_name and not (class_required and class_name is None):
-        # In Java, a method with no class context shouldn't exist
-        # — skip the module-level form to avoid colliding with
-        # other files' class-qualified candidates that happen to
-        # share the dotted prefix (e.g. ``com.example.Util.helper``
-        # where one file's package is ``com.example.Util`` and
-        # another's class is ``Util``).
-        if not class_required:
-            candidates.append(f"{package_name}.{fn_name}")
+    # In Java, a method with no class context shouldn't exist — skip
+    # the module-level form to avoid colliding with other files'
+    # class-qualified candidates that happen to share the dotted
+    # prefix (e.g. ``com.example.Util.helper`` where one file's
+    # package is ``com.example.Util`` and another's class is
+    # ``Util``). (The previous outer guard ``not (class_required and
+    # class_name is None)`` was behaviour-equivalent to this given
+    # the inner ``not class_required`` — one of the two conditions
+    # was dead.)
+    if package_name and not class_required:
+        candidates.append(f"{package_name}.{fn_name}")
 
     # Python path-based heuristic.
     if file_path.endswith((".py", ".pyi")):
@@ -2268,7 +2340,7 @@ def callers_of(
         target.name if isinstance(target, InternalFunction)
         else target.qualified_name.rsplit(".", 1)[-1]
     )
-    uncertain_pairs = idx.uncertain_callers_by_tail.get(target_tail, set())
+    uncertain_pairs = idx.uncertain_caller_pairs(target_tail)
     # Drop callers that are already definitive — uncertain only
     # matters when there's NO definitive evidence in that file. But
     # uncertain is per-fn, not per-file, so we filter by fn.
@@ -2552,7 +2624,10 @@ def frida_runtime_trace_present(
     SOUND — runtime observation is mechanically sound evidence of
     reachability (stronger than static call-graph edges). But
     earns_suppression=False because this PROMOTES (proves reachable);
-    it doesn't suppress.
+    it doesn't suppress. Soundness holds only for unambiguous joins:
+    annotations the enrichment marked ``name_only_match`` (the name is
+    defined in more than one TU and no callsite resolved into this
+    file) may credit a same-named twin, so they do not witness.
     """
     if not file_path or not name:
         return False
@@ -2572,7 +2647,7 @@ def frida_runtime_trace_present(
         frida = meta.get("frida_runtime_trace")
         if not isinstance(frida, dict):
             continue
-        if frida.get("observed"):
+        if frida.get("observed") and not frida.get("name_only_match"):
             return True
     return False
 
@@ -2593,7 +2668,8 @@ def frida_call_edge_present(
     because the call executed.
 
     SOUND, earns_suppression=False (promotes reachable, never
-    suppresses).
+    suppresses). Soundness holds only for unambiguous joins: see
+    :func:`frida_runtime_trace_present` on ``name_only_match``.
     """
     if not file_path or not name:
         return False
@@ -2613,7 +2689,7 @@ def frida_call_edge_present(
         edge = meta.get("frida_call_edge")
         if not isinstance(edge, dict):
             continue
-        if edge.get("observed"):
+        if edge.get("observed") and not edge.get("name_only_match"):
             return True
     return False
 
@@ -2671,10 +2747,18 @@ def binary_oracle_absent(
     any_confirmed = False
     for item in candidates:
         meta = item.get("metadata")
-        if not isinstance(meta, dict):
-            continue
-        bo = meta.get("binary_oracle")
+        bo = meta.get("binary_oracle") if isinstance(meta, dict) else None
         if not isinstance(bo, dict):
+            # Unannotated FUNCTION candidate: block (return False) like
+            # is_lexically_dead's all() rule — the suppression invariant
+            # ("EVERY returned candidate is dead") must be structural,
+            # not dependent on enrichment completeness. Today
+            # enrich_inventory_with_binary_oracle annotates every native
+            # function item, so this only fires on a future partial
+            # join; non-function namesakes (globals/macros) never carry
+            # oracle verdicts and are skipped as before.
+            if item.get("kind", "function") == "function":
+                return False
             continue
         if bo.get("classification") != "absent":
             return False
@@ -3630,7 +3714,10 @@ def is_virtual_dispatch_candidate(
     if not class_name:
         return False
     idx = _get_or_build_index(inventory, exclude_test_files=exclude_test_files)
-    # getattr-guard a stale pickled index (pre-V7) that lacks the field.
+    # Defensive getattr: the persistent cache retired pickle at V10
+    # (data-only JSON always constructs a full index), so a field-less
+    # index can no longer be loaded — kept only as cheap belt-and-braces
+    # for hand-constructed test indexes.
     overrides = getattr(idx, "override_methods", None) or frozenset()
     return ((class_name, method_name) in overrides
             and method_name in idx.method_match)

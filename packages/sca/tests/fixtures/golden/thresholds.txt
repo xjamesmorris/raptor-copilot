@@ -1,0 +1,7 @@
+[critical] lodash@4.17.20: Command injection in template (CVE-2021-23337) [KEV] [EPSS 0.97]
+[hygiene low] express uses a caret range; patch releases land silently
+[supply-chain high] reqeusts is 1 edit from requests (top-1k package)
+[supply-chain medium] rebuilt image gained network capability
+[capability-drift] rebuilt image gained network capability
+[capability-drift +1 buckets > max 0] rebuilt image gained network capability
+[license high] left-pad is AGPL-3.0-only; policy denies AGPL

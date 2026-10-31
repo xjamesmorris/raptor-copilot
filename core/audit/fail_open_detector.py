@@ -38,6 +38,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from core.source.lines import split_lines
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -56,9 +57,9 @@ PATTERN_TYPES = frozenset({
 _C_EXTS = (
     ".c", ".h", ".cc", ".cpp", ".cxx",
     ".go", ".rs",
-    ".java", ".kt",
+    ".java", ".kt", ".kts",
     ".js", ".mjs", ".cjs", ".ts", ".tsx",
-    ".cs",
+    ".cs", ".swift",
 )
 
 
@@ -109,15 +110,20 @@ _IS_NOT_NONE_RE = re.compile(r"\bif\s+(\w+)\s+is\s+not\s+None\b")
 # LHS: simple var, len(var), var.length, var.size(), var.count()
 _LHS = r"(?:\w+(?:\(\w+\))?(?:\.(?:length|size|count)(?:\(\))?)?)"
 _RHS = r"(?:\w+|\d+)"
+# ``\s*\n?\s*`` is one whitespace run (\s already matches the
+# newline): the three-piece spelling stacked unbounded spans around
+# the redundant \n? — quadratic on an if-line followed by a long
+# whitespace run with no break/return. ``\s*`` alone is the same
+# language.
 _CAP_BREAK_RE = re.compile(
     # Python: if LHS >= RHS: break/return
-    rf"\bif\s+{_LHS}\s*(?:>=|>|==)\s*{_RHS}\s*:\s*\n?\s*(?:break|return)\b"
+    rf"\bif\s+{_LHS}\s*(?:>=|>|==)\s*{_RHS}\s*:\s*(?:break|return)\b"
     # C/Java/JS: if (LHS >= RHS) break;/return;
-    rf"|\bif\s*\(\s*{_LHS}\s*(?:>=|>|==)\s*{_RHS}\s*\)\s*\n?\s*(?:break|return)\s*;"
+    rf"|\bif\s*\(\s*{_LHS}\s*(?:>=|>|==)\s*{_RHS}\s*\)\s*(?:break|return)\s*;"
     # C/Java/JS: if (LHS >= RHS) { break; } (with braces)
-    rf"|\bif\s*\(\s*{_LHS}\s*(?:>=|>|==)\s*{_RHS}\s*\)\s*\{{\s*\n?\s*(?:break|return)\b"
+    rf"|\bif\s*\(\s*{_LHS}\s*(?:>=|>|==)\s*{_RHS}\s*\)\s*\{{\s*(?:break|return)\b"
     # Go: if LHS >= RHS { break/return
-    rf"|\bif\s+{_LHS}\s*(?:>=|>|==)\s*{_RHS}\s*\{{\s*\n?\s*(?:break|return)\b",
+    rf"|\bif\s+{_LHS}\s*(?:>=|>|==)\s*{_RHS}\s*\{{\s*(?:break|return)\b",
     re.MULTILINE,
 )
 
@@ -127,7 +133,8 @@ _TRUNCATION_SIGNAL_RE = re.compile(
     r'(?:truncat|capped|incomplete|"truncated"|"partial"'
     # Python: return results, True/False
     r"|return\s+\w+\s*,\s*(?:True|False|truncated|capped)"
-    r"|return\s+\(?\s*\w+\s*,\s*(?:True|False)\s*\)?"
+    # gated optional paren — the naive \(?\s* pair was quadratic
+    r"|return\s+(?:\(\s*)?\w+\s*,\s*(?:True|False)\s*\)?"
     # Go: return results, true/false
     r"|return\s+\w+\s*,\s*(?:true|false)\b"
     # JS: { results, truncated: true }
@@ -141,9 +148,18 @@ _TRUNCATION_SIGNAL_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Except clause header
+# Except clause header. One branch per header shape: with an
+# exception list (``\s+\w[\w.,\s]*`` — the class already admits the
+# ``as name`` tail and interior whitespace), a directly-adjoined
+# ``as`` clause (``exceptas e:`` — matched by the previous spelling,
+# kept for equivalence), or bare (``\s*``). The naive
+# ``(?:\s+\w[\w.,\s]*)?\s*(?:as\s+\w+)?\s*:`` chained THREE
+# unbounded whitespace-capable spans around optional atoms with the
+# same match set: an ``except a``-opening line ending in a long
+# whitespace run with no ``:`` made the engine try every split of
+# the run between the spans — cubic in the line length.
 _EXCEPT_HEADER_RE = re.compile(
-    r"^\s*except(?:\s+\w[\w.,\s]*)?\s*(?:as\s+\w+)?\s*:\s*$"
+    r"^\s*except(?:\s+\w[\w.,\s]*|as\s+\w+\s*|\s*):\s*$"
 )
 
 # Any return with a literal value
@@ -215,13 +231,27 @@ def _detect_optional_not_checked(
 # Sub-detector: truncation_not_signaled
 # ---------------------------------------------------------------------------
 
+# Bounded iteration/window counts on every newline-crossing span.
+# The qualifier/type loops and the params class cross newlines BY
+# DESIGN (multi-line declarations and parameter lists must keep
+# matching), but the unbounded spelling was quadratic two ways: the
+# keyword loop and the type loop overlap on every word (keywords ARE
+# \w+), so a run of qualifier words with no paren made the engine
+# try every split of the run between the loops; and every MULTILINE
+# ``^`` restart re-scanned the remaining text through the loops
+# (4x per input doubling measured at 14-56KB). Bound trade-off, both
+# directions: larger keeps pathological declarations matching but
+# raises the per-anchor re-scan ceiling; smaller is faster but a
+# real declaration beyond the bound stops matching. 16 words per
+# loop / 400-char receiver / 4096-char params sit far above real
+# code while capping per-anchor work at a constant.
 _C_FUNC_RE = re.compile(
     r"^[ \t]*(?:(?:static|inline|void|int|char|unsigned|const|auto|"
     r"public|private|protected|func|function|export|async|fn|"
-    r"override|virtual|abstract|final|synchronized)\s+)*"
-    r"(?:\([^)]*\)\s+)?"      # Go method receiver
-    r"(?:\w+[*&]*\s+)*"       # return type(s) with pointer/ref
-    r"(\w+)\s*\([^)]*\)\s*\{",
+    r"override|virtual|abstract|final|synchronized)\s+){0,16}"
+    r"(?:\([^)]{0,400}\)\s+)?"     # Go method receiver
+    r"(?:\w+[*&]*\s+){0,16}"       # return type(s) with pointer/ref
+    r"(\w+)\s*\([^)]{0,4096}\)\s*\{",
     re.MULTILINE,
 )
 
@@ -286,7 +316,7 @@ def _detect_truncation_via_ts(
             continue
         if not func_body:
             continue
-        if not re.search(r"^\s*return\b", func_body, re.MULTILINE):
+        if not re.search(r"^[^\S\n]*return\b", func_body, re.MULTILINE):
             continue
         if _TRUNCATION_SIGNAL_RE.search(func_body):
             continue
@@ -331,7 +361,7 @@ def _detect_truncation_not_signaled(
             continue
 
         # Must have a return statement (to be a function returning results)
-        if not re.search(r"^\s*return\b", body, re.MULTILINE):
+        if not re.search(r"^[^\S\n]*return\b", body, re.MULTILINE):
             continue
 
         # Check whether truncation is signaled anywhere in the body
@@ -382,7 +412,7 @@ def _detect_error_conflated_with_empty(
     results: list[FailOpenPattern] = []
 
     for name, start_line, body in _extract_functions(source):
-        lines = body.split("\n")
+        lines = body.split("\n")  # line-model: callers deliver \n-model text (universal-newline reads / split_lines span joins)
 
         # Pass 1: identify which line-indices are inside an except block.
         # An except block starts at an ``except ...:`` header and ends
@@ -449,9 +479,14 @@ def _detect_error_conflated_with_empty(
 # ---------------------------------------------------------------------------
 
 # Patterns indicating truncation awareness in a caller
+# The len() argument window is bounded: unbounded, source that
+# repeats ``len(`` makes every occurrence re-scan the rest of the
+# text for the missing ``)`` — quadratic on hostile source. A real
+# len() argument sits far inside 400 chars (trade-off: a longer
+# argument stops matching, versus an unbounded scan).
 _TRUNCATION_AWARE_RE = re.compile(
     r"truncat|\.is_complete|\.is_truncated|total\s*[><=!]+\s*len\("
-    r"|len\([^)]*\)\s*[<>=!]+\s*total"
+    r"|len\([^)]{0,400}\)\s*[<>=!]+\s*total"
     r"|partial|incomplete",
     re.IGNORECASE,
 )
@@ -554,7 +589,7 @@ def _detect_consumer_fail_open(
 
 def _function_start_line(source: str, func_name: str) -> int:
     """Return the 1-based line number of a function definition in source."""
-    for i, line in enumerate(source.splitlines(), 1):
+    for i, line in enumerate(split_lines(source), 1):
         if re.search(rf"\b{re.escape(func_name)}\s*\(", line):
             return i
     return 1

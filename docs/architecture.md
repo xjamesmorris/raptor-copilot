@@ -43,17 +43,18 @@ current contents):
 
 ```
 raptor/
-├── bin/               # User-facing launchers (raptor, raptor-sca, cve-diff)
+├── bin/               # User-facing launchers (raptor, raptor-sca, cve-diff, cve-env)
 ├── libexec/           # Internal helper scripts dispatched by commands and skills
 ├── core/              # Shared infrastructure: config, sandbox, inventory,
 │                      #   LLM substrate, audit orchestrator, git, reporting, ...
 ├── packages/          # Independent security capabilities: static-analysis,
 │                      #   codeql, sca, fuzzing, web, exploit_feasibility, frida, ...
-├── plugins/           # Hook-based extensions (coverage tracking)
+├── plugins/           # Frontend plugins (coverage hooks, Claude agents)
 ├── engine/            # Detection rules: Semgrep rules, Coccinelle patches,
 │                      #   CodeQL suites, negative controls, schemas
 ├── tiers/             # Expert personas and recovery protocols (loaded on demand)
-├── .claude/           # Slash commands, skills, and agents (the decision layer)
+├── .claude/           # Slash commands and skills (the decision layer)
+├── .github/agents/    # Generated Copilot custom-agent projection
 ├── test/              # Integration and end-to-end tests
 ├── docs/              # Documentation
 ├── out/               # All outputs (scans, logs, reports)
@@ -79,11 +80,16 @@ Structural notes:
 
 Two distinct entry points:
 
-- **`bin/raptor`** (bash) launches the interactive Claude Code session:
+- **`bin/raptor`** (bash) launches the interactive decision-layer session:
   startup banner, progressive persona loading from `tiers/`,
-  slash-command dispatch, permission wiring. It also routes a few
-  commands directly without Claude (`raptor project`, `raptor doctor`,
-  `raptor frida`, `raptor sage-setup`).
+  slash-command dispatch, permission wiring. `--frontend` accepts
+  `claude` (the default) or `copilot`. Copilot launch requires a native
+  Linux executable so the launcher can bind the session token and process
+  stamp to its exact uid and executable device/inode; unsupported wrappers
+  and platforms remain gated. Frontend admission does not admit a headless
+  LLM provider. The launcher also routes a few commands directly without
+  an interactive frontend (`raptor project`, `raptor doctor`, `raptor frida`,
+  `raptor sage-setup`).
 - **`raptor.py`** (python) is the non-interactive unified CLI:
   `python3 raptor.py <mode>` with modes scan, sca, binary, fuzz, web,
   agentic, codeql, analyze, describe, doctor, frida. Slash commands
@@ -94,16 +100,16 @@ Two distinct entry points:
 
 RAPTOR is split into a Python **execution layer** (scanning,
 subprocess management, SARIF parsing, LLM dispatch, cost tracking --
-no judgement calls) and a Claude Code **decision layer** (`.claude/`,
-`tiers/`, `CLAUDE.md`) that prioritises findings, interprets results,
-and decides what to do next. The split means the Python layer runs
+no judgement calls) and an interactive **decision layer** (`.claude/`,
+`plugins/agents/`, `tiers/`, `CLAUDE.md`) that prioritises findings,
+interprets results, and decides what to do next. The split means the Python layer runs
 standalone in CI pipelines while the decision layer drives it
 interactively. [Core concepts](concepts.md#two-layers) covers this in
 depth, including the cost model and the finding lifecycle.
 
 ## Dependencies
 
-Python 3.10+ and the tools listed in [dependencies](dependencies.md).
+Python 3.12+ and the tools listed in [dependencies](dependencies.md).
 Install Python packages with `pip install -r requirements.txt`; external
 tools (Semgrep, CodeQL, AFL++, ...) are installed separately and probed
 at runtime -- `python3 raptor.py doctor` reports what is missing.

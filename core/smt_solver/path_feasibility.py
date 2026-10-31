@@ -271,6 +271,18 @@ class PathSMTResult:
 # ---------------------------------------------------------------------------
 
 _HEX_RE = re.compile(r'^0x[0-9a-f]+$', re.IGNORECASE)
+
+
+def _hex_literal_forces_unsigned(tok: str, profile: "BVProfile") -> bool:
+    """True when *tok* is a bare hex literal whose value exceeds the
+    profile's signed max — in C such a literal has UNSIGNED type and
+    forces the enclosing comparison unsigned (usual arithmetic
+    conversions). Only exact-literal operands are recognised;
+    compound expressions keep the profile's signedness (conservative:
+    unchanged behaviour)."""
+    if not profile.signed or not _HEX_RE.fullmatch(tok):
+        return False
+    return int(tok, 16) >= (1 << (profile.width - 1))
 _INT_RE = re.compile(r'^\d+$')
 _IDENT_RE = re.compile(r'^[a-z_][a-z0-9_]*$', re.IGNORECASE)
 _NULL_RE = re.compile(r'^NULL$', re.IGNORECASE)
@@ -1041,17 +1053,19 @@ def _parse_condition(
 
     # Bitmask: lhs & mask (==|!=) val.
     #
-    # Pre-fix the LHS was `(.+?)` — a lazy unbounded quantifier
-    # over ANY character, including `&`. On a non-bitmask input
-    # the regex engine had to expand `.+?` greedily one character
-    # at a time, hunting for a `&` separator that never arrived;
-    # for an N-character input that's O(N) failed-match cost per
-    # invocation. Same ReDoS shape that `_parse_atom` was already
-    # hardened against by switching to `[^&]+?` (negated class so
-    # the lazy quantifier short-circuits at the first `&`).
-    # Apply the same fix here for parity.
+    # The lhs group is a negated class (no `&`) ending in
+    # non-whitespace, with a single-`\s` branch for the
+    # all-whitespace-lhs corner the previous spelling matched. The
+    # naive `([^&]+?)\s*&` overlapped the lazy lhs and the following
+    # whitespace span on whitespace: a condition whose lhs ends in a
+    # long whitespace run with no `&` made the engine try every
+    # split of the run between them — quadratic in the condition
+    # length. Match set and the stripped lhs capture are unchanged.
+    # (`[^&]` rather than `.` so a non-bitmask input still fails at
+    # the first `&`-less stretch instead of rescanning, the earlier
+    # hardening this pattern shares with `_parse_atom`.)
     m = re.fullmatch(
-        r'([^&]+?)\s*&\s*(0x[0-9a-f]+|\d+)\s*(==|!=)\s*(0x[0-9a-f]+|\d+)',
+        r'([^&]*?[^&\s]|\s)\s*&\s*(0x[0-9a-f]+|\d+)\s*(==|!=)\s*(0x[0-9a-f]+|\d+)',
         t, re.IGNORECASE,
     )
     if m:
@@ -1076,8 +1090,13 @@ def _parse_condition(
     # Relational: lhs OP rhs
     # The LHS pattern consumes '>>' and '<<' as atomic units so the regex
     # doesn't split inside a shift operator.
+    # The lhs ends in a non-whitespace atom (or is a single char):
+    # the naive lazy lhs overlapped the following whitespace span —
+    # quadratic on a condition whose lhs ends in a whitespace run
+    # with no operator. The stripped capture is unchanged.
     m = re.fullmatch(
-        r'((?:>>|<<|[^<>]|(?<![<>])[<>](?![<>]))+?)'
+        r'((?:>>|<<|[^<>]|(?<![<>])[<>](?![<>]))*?'
+        r'(?:>>|<<|[^<>\s]|(?<![<>])[<>](?![<>]))|\s)'
         r'\s*(<=|>=|!=|==|<(?!<)|>(?!>))\s*(.+)',
         t,
     )
@@ -1089,18 +1108,32 @@ def _parse_condition(
         if isinstance(rhs, Rejection):
             return _propagate(text, rhs)
         op = m.group(2)
+        signed_cmp = profile.signed
+        if signed_cmp and (
+            _hex_literal_forces_unsigned(m.group(1).strip(), profile)
+            or _hex_literal_forces_unsigned(m.group(3).strip(), profile)
+        ):
+            # C's usual arithmetic conversions: a hex literal that
+            # does not fit the signed type has UNSIGNED type, so the
+            # whole comparison is unsigned in the source semantics.
+            # Encoding ``x <= 0x80000000`` as signed at an int32
+            # profile read the literal as INT_MIN and made ``<=``
+            # equivalent to ``== INT_MIN`` — a false unsat that
+            # bypassed the dual safety net entirely for
+            # signed-pinned callers (they skip the dual check).
+            signed_cmp = False
         if op == '==':
             return lhs == rhs
         if op == '!=':
             return lhs != rhs
         if op == '<':
-            return lt(lhs, rhs, signed=profile.signed)
+            return lt(lhs, rhs, signed=signed_cmp)
         if op == '<=':
-            return le(lhs, rhs, signed=profile.signed)
+            return le(lhs, rhs, signed=signed_cmp)
         if op == '>':
-            return gt(lhs, rhs, signed=profile.signed)
+            return gt(lhs, rhs, signed=signed_cmp)
         if op == '>=':
-            return ge(lhs, rhs, signed=profile.signed)
+            return ge(lhs, rhs, signed=signed_cmp)
 
     return Rejection(
         text, RejectionKind.UNRECOGNIZED_FORM,
@@ -1172,6 +1205,7 @@ def _extract_wp(
     *,
     cap: int = WP_MAX_SOLVER_CALLS,
     axioms: list[tuple[str, Any]] | None = None,
+    timeout_ms: int | None = None,
 ) -> tuple[str | None, list[str], bool]:
     """Extract the weakest-precondition predicate for a *sat* path.
 
@@ -1226,7 +1260,15 @@ def _extract_wp(
     kept = [True] * n
     calls = 0
     complete = True
-    solver = _new_solver(WP_TIMEOUT_MS)
+    # The caller's per-call budget CAPS the per-redundancy-test
+    # timeout: WP is a best-effort refinement (up to 32 solver
+    # calls), so a caller who asked for a tight overall budget must
+    # not pay the fixed default per test. It never RAISES it — WP
+    # cost stays bounded even under a generous caller budget.
+    effective_ms = WP_TIMEOUT_MS
+    if timeout_ms is not None:
+        effective_ms = min(WP_TIMEOUT_MS, timeout_ms)
+    solver = _new_solver(effective_ms)
     for idx in order:
         if calls >= cap:
             complete = False
@@ -1274,6 +1316,7 @@ def _solve_pending(
     prefer_witness: tuple[str, str] | None = None,
     vars_: dict[str, Any] | None = None,
     axioms: list[tuple[str, Any]] | None = None,
+    wp_timeout_ms: int | None = None,
 ) -> PathSMTResult:
     """Run the solver over pending predicates and produce a verdict.
 
@@ -1357,7 +1400,7 @@ def _solve_pending(
         # symbolic variables (minimal sat-preserving conjunct subset). Its
         # own fresh solver — the verdict above is unaffected.
         wp_predicate, wp_conjuncts, wp_complete = _extract_wp(
-            pending, axioms=_axioms,
+            pending, axioms=_axioms, timeout_ms=wp_timeout_ms,
         )
         return PathSMTResult(
             feasible=True,
@@ -1537,9 +1580,16 @@ def check_path_feasibility(
                     rendering.  Defaults to BV_C_UINT64 (64-bit unsigned).
                     Use BV_C_UINT32 for CWE-190 32-bit wraparound paths;
                     BV_C_INT32 for signed-integer path conditions; etc.
-        timeout_ms: Per-call Z3 solver timeout in milliseconds.  When
-                    None (default) the solver uses the substrate's
-                    ``DEFAULT_TIMEOUT_MS`` (5000 ms).
+        timeout_ms: Z3 solver timeout in milliseconds, applied to
+                    every solver this call builds: the final joint
+                    solve, the per-condition tautology checks, and
+                    (as a cap, never a raise) the per-test timeout of
+                    the WP redundancy pass. When None (default) the
+                    solvers use the substrate's ``DEFAULT_TIMEOUT_MS``
+                    (5000 ms; WP tests use ``WP_TIMEOUT_MS``). Note
+                    the bound is per SOLVER CALL — a call with many
+                    conditions can still spend
+                    ``O(len(conditions)) x timeout_ms`` overall.
         prefer_witness: When set to ``(var_name, "max")`` or
                     ``(var_name, "min")``, drive the satisfying witness
                     toward an extreme value of ``var_name`` instead of
@@ -1617,7 +1667,16 @@ def check_path_feasibility(
     # the final solve.  Z3 4.15.4.0 has been observed to return
     # models that violate tracked assertions after repeated
     # push/pop cycles on the same solver instance.
-    tautology_solver = _new_solver()
+    # The caller's budget reaches EVERY solver this call builds —
+    # the final solve below, and this tautology solver, which runs
+    # one full check() per condition (up to the per-call cap) and
+    # previously kept the 5 s default regardless of timeout_ms,
+    # making the documented per-call budget a fiction for the
+    # per-condition lane.
+    tautology_solver = (
+        _new_solver(timeout_ms) if timeout_ms is not None
+        else _new_solver()
+    )
     # Per-call timeout override. Default to the substrate's
     # DEFAULT_TIMEOUT_MS (5s). Callers that know their CWE-class
     # solving-cost profile (CWE-190 wraparound is fast; CWE-787
@@ -1699,5 +1758,227 @@ def check_path_feasibility(
         pending, solver, satisfied, unknown, unknown_reasons,
         profile=profile, anon_map=anon_map,
         prefer_witness=prefer_witness, vars_=vars_,
-        axioms=axioms,
+        axioms=axioms, wp_timeout_ms=timeout_ms,
+    )
+
+
+def _exhibits_robust_contradiction(
+    candidate: frozenset[str],
+    conditions: list[PathCondition],
+    profiles: tuple[BVProfile, BVProfile],
+    timeout_ms: int | None,
+) -> bool:
+    """Does this unsat-core subset exhibit a contradiction that is
+    independent of the signedness guess?
+
+    ``candidate`` holds display texts from a leg's ``unsatisfied``
+    list; they are matched back to the original conditions by the same
+    rendering ``_classify_text_condition`` used (``NOT (text)`` for
+    negated conditions). Call-summary axiom labels have no matching
+    condition and simply drop out — the shrunken subset is weaker, so
+    the check can only fail toward refusal, never toward suppression.
+
+    True only when BOTH hold:
+
+    * the subset mentions at most ONE identifier. Each profile forces
+      every variable to one signedness, so for a single variable the
+      two profiles enumerate its whole interpretation space — unsat
+      under both is conclusive. A multi-identifier subset has mixed
+      per-variable interpretations neither profile encodes (the
+      ``[r == s, s > SSIZE_MAX, r <= SSIZE_MAX]`` shape is unsat under
+      both shared profiles yet satisfiable in C at r = -1,
+      s = UINT64_MAX), so it must never be honored as agreement —
+      per-variable profiles are the full fix for those. Call heads
+      count as identifiers, which errs toward refusal.
+    * the subset re-solves unsat under BOTH profiles on its own. A
+      subset satisfiable under either profile is that profile's
+      counterexample — the leg refuted through profile-specific
+      semantics, not a genuine contradiction.
+    """
+    subset = [
+        c for c in conditions
+        if (f"NOT ({c.text})" if c.negated else c.text) in candidate
+    ]
+    if not subset:
+        return False
+    idents = {
+        tok.lower()
+        for c in subset
+        for tok in _TOKEN_RE.findall(c.text)
+        if _IDENT_RE.match(tok) and not _NULL_RE.match(tok)
+    }
+    if len(idents) > 1:
+        return False
+    return all(
+        check_path_feasibility(
+            subset, profile=p, timeout_ms=timeout_ms,
+        ).feasible is False
+        for p in profiles
+    )
+
+
+def check_path_feasibility_dual(
+    conditions: list[PathCondition],
+    *,
+    profile: BVProfile = BV_C_UINT64,
+    timeout_ms: int | None = None,
+    prefer_witness: tuple[str, str] | None = None,
+) -> PathSMTResult:
+    """Signedness-agnostic feasibility check for callers whose profile
+    signedness is a GUESS rather than a known fact.
+
+    The two encodings disagree on exactly the guards that matter:
+    ``ret < 0`` — the ubiquitous C signed error check — is UNSAT as
+    ``ULT(ret, 0)`` under an unsigned profile, so a heuristic-unsigned
+    caller would refute (and thereby suppress) any path carrying one.
+    ``bounds_feasibility.check_bounds_infeasible`` already applies the
+    both-profiles-must-agree rule for its overflow receipts; this is
+    the same rule generalised for path-condition consumers.
+
+    Semantics:
+
+    * ``profile``'s verdict is authoritative whenever it is anything
+      but ``False`` — sat results (model, witness steering) are
+      byte-identical to :func:`check_path_feasibility` and the
+      signedness-flipped sibling is never solved (no extra cost on
+      the common path).
+    * A ``feasible=False`` verdict is honored only when the
+      signedness-flipped sibling profile ALSO reports ``False``
+      AND a core subset exhibits a single-identifier contradiction
+      that re-solves unsat under BOTH profiles on its own
+      (:func:`_exhibits_robust_contradiction`).
+      Both-legs-unsat alone is NOT agreement: each shared profile
+      forces EVERY variable to one signedness, so a mixed set like
+      ``[ret < 0, size > SSIZE_MAX]`` — a signed error-guard beside
+      an unsigned high-bound, the standard C overflow-path idiom —
+      is unsat under BOTH profiles for DIFFERENT conditions while
+      being jointly feasible in C, where each variable carries its
+      own signedness. Nor is a shared core CONDITION agreement:
+      ``[r == s, s > SSIZE_MAX, r <= SSIZE_MAX]`` puts the high
+      bound in both cores yet is satisfiable in C (r = -1,
+      s = UINT64_MAX) — condition-identity is not
+      contradiction-identity. When no candidate subset exhibits a
+      cross-profile contradiction the verdict is ``feasible=None``.
+      (Per-variable profiles are the full fix; the exhibited-subset
+      rule closes the known false refutations without them.)
+      Sibling sat → the sibling's (feasible) result is returned;
+      sibling inconclusive → ``feasible=None`` (a single-profile
+      refutation under guessed signedness carries no weight — the
+      fail direction must be "run the expensive analysis", never
+      "suppress the finding").
+
+    Callers that KNOW the signedness (explicit type info, a trusted
+    per-path hint) should call :func:`check_path_feasibility` directly
+    with the known profile.
+    """
+    primary = check_path_feasibility(
+        conditions, profile=profile,
+        timeout_ms=timeout_ms, prefer_witness=prefer_witness,
+    )
+    if primary.feasible is not False:
+        return primary
+    sibling_profile = BVProfile(width=profile.width, signed=not profile.signed)
+    sibling = check_path_feasibility(
+        conditions, profile=sibling_profile,
+        timeout_ms=timeout_ms, prefer_witness=prefer_witness,
+    )
+    if sibling.feasible is False:
+        # Both legs unsat is NOT signedness agreement by itself: each
+        # shared profile forces EVERY variable to one signedness, so a
+        # mixed set like [ret < 0, size > SSIZE_MAX] is unsat under
+        # BOTH profiles for DIFFERENT conditions while being jointly
+        # feasible in C. And a merely SHARED core condition is no
+        # better: [r == s, s > SSIZE_MAX, r <= SSIZE_MAX] puts the
+        # high bound in both cores yet is satisfiable in C (r = -1,
+        # s = UINT64_MAX) — condition-identity is not
+        # contradiction-identity. The refutation is honored only when
+        # some candidate core subset — the cores' intersection or
+        # either leg's core — EXHIBITS a single-identifier
+        # contradiction that re-solves unsat under BOTH profiles on
+        # its own (see _exhibits_robust_contradiction). Checking the
+        # legs' cores individually is load-bearing: Z3's minimal core
+        # under the unsigned default is the lone signed guard whenever
+        # one rides beside an independent contradiction ([ret < 0,
+        # x > 100, x < 50] presents disjoint cores), and guard shapes
+        # are ubiquitous on C paths — without it every guard-carrying
+        # infeasible path would refuse. Cost: a few bounded re-solves
+        # of tiny subsets on the already-rare both-legs-unsat path.
+        #
+        # Trade-off, both directions: a genuinely-infeasible set whose
+        # only contradiction spans MULTIPLE variables now refuses —
+        # that costs a refutation (recoverable: the path is analysed),
+        # while honoring multi-variable agreement cost live overflow
+        # paths (suppressed pre-LLM). When core extraction failed,
+        # ``unsatisfied`` is EVERY pending condition; the candidates
+        # then degenerate to the full set, which still refutes only
+        # via a single-identifier contradiction. Per-variable profiles
+        # remain the full fix.
+        primary_core = frozenset(primary.unsatisfied)
+        sibling_core = frozenset(sibling.unsatisfied)
+        candidates: list[frozenset[str]] = []
+        for candidate in (
+            primary_core & sibling_core, primary_core, sibling_core,
+        ):
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+        exhibited: frozenset[str] | None = None
+        for candidate in candidates:
+            if _exhibits_robust_contradiction(
+                candidate, conditions, (profile, sibling_profile),
+                timeout_ms,
+            ):
+                exhibited = candidate
+                break
+        if exhibited is not None:
+            primary.reasoning += (
+                f" [signedness-robust: also unsat at "
+                f"{sibling_profile.describe()}; exhibited cross-profile "
+                f"contradiction: {', '.join(sorted(exhibited)[:3])}]"
+            )
+            return primary
+        return PathSMTResult(
+            feasible=None,
+            satisfied=primary.satisfied,
+            unsatisfied=[],
+            unknown=primary.unknown,
+            model={},
+            smt_available=primary.smt_available,
+            reasoning=(
+                f"signedness-ambiguous: unsat at {profile.describe()} "
+                f"(core: {', '.join(primary.unsatisfied[:3])}) and at "
+                f"{sibling_profile.describe()} (core: "
+                f"{', '.join(sibling.unsatisfied[:3])}), but no core "
+                f"subset exhibits a single-identifier contradiction "
+                f"under BOTH profiles on its own — the mixed-signedness "
+                f"shape a per-variable encoding could satisfy — "
+                f"refusing the refutation"
+            ),
+            unknown_reasons=primary.unknown_reasons,
+            anon_var_map=primary.anon_var_map,
+            summary_axioms=primary.summary_axioms,
+        )
+    if sibling.feasible is True:
+        sibling.reasoning += (
+            f" [note: unsat at {profile.describe()} but satisfiable at "
+            f"{sibling_profile.describe()} — signedness unknown, so the "
+            f"path is treated as feasible]"
+        )
+        return sibling
+    return PathSMTResult(
+        feasible=None,
+        satisfied=primary.satisfied,
+        unsatisfied=primary.unsatisfied,
+        unknown=primary.unknown,
+        model={},
+        smt_available=primary.smt_available,
+        reasoning=(
+            f"signedness-ambiguous: unsat at {profile.describe()} but "
+            f"inconclusive at {sibling_profile.describe()} "
+            f"({sibling.reasoning}) — refusing the refutation because "
+            f"the profiles disagree and the signedness was not "
+            f"caller-asserted"
+        ),
+        unknown_reasons=primary.unknown_reasons,
+        anon_var_map=primary.anon_var_map,
+        summary_axioms=primary.summary_axioms,
     )

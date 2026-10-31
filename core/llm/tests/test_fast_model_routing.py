@@ -156,6 +156,28 @@ def test_unknown_provider_no_population() -> None:
     assert cfg.specialized_models == {}
 
 
+def test_provider_without_fast_mapping_needs_no_model_name() -> None:
+    """Session-fallback shims only promise a provider field. The
+    provider guard must return before touching ``model_name``."""
+    from types import SimpleNamespace
+
+    primary = SimpleNamespace(provider="claudecode")
+    cfg = LLMConfig(primary_model=primary, fallback_models=[])
+    assert cfg.specialized_models == {}
+
+
+def test_unlisted_model_on_known_provider_no_population() -> None:
+    """Provider affinity alone must not replace an explicit unlisted
+    model with a catalogued fast-tier sibling."""
+    primary = ModelConfig(
+        provider="anthropic",
+        model_name="rhyolite-preview-20261016",
+        api_key="sk-test",
+    )
+    cfg = LLMConfig(primary_model=primary, fallback_models=[])
+    assert cfg.specialized_models == {}
+
+
 # ---------------------------------------------------------------------------
 # Built ModelConfig sanity
 # ---------------------------------------------------------------------------

@@ -163,7 +163,12 @@ RESEARCH_THEMES: tuple[ResearchTheme, ...] = (
             "https://portswigger.net/research/top-10-web-hacking-techniques-of-2024",
             "https://portswigger.net/research/top-10-web-hacking-techniques-of-2021",
         ),
-        covered_by=("V5.1.15",),
+        # V5.3.1 is the registered id of the server-side
+        # prototype-pollution check; the theme previously cited a
+        # V5.1.15 id no check has ever registered, minting a permanent
+        # false "gap" with priority "high" for a capability the
+        # scanner has.
+        covered_by=("V5.3.1",),
         signals=("dompurify", "__proto__", "sanitize", "innerhtml", "prototype"),
         action=(
             "Use JS route and bundle discovery to flag sanitizer usage, prototype "
@@ -214,7 +219,12 @@ def assess_research_landscape(
 
     return {
         "source_archive": PORTSWIGGER_ARCHIVE_URL,
-        "archive_years_reviewed": list(range(2006, 2026)),
+        # Derived from the theme registry so the claim can never
+        # outrun the sources actually cited (a static 2006-2025 range
+        # asserted totality the curation does not have).
+        "archive_years_reviewed": sorted(
+            {year for theme in RESEARCH_THEMES for year in theme.years}
+        ),
         "curation_mode": "static_versioned_registry",
         "method": (
             "Themes distilled from the PortSwigger Top 10 Web Hacking Techniques "
@@ -234,6 +244,19 @@ def high_priority_theme_ids(research_landscape: dict) -> list[str]:
     ]
 
 
+# Signal collection stringifies discovery lists whole; bound how much
+# of each list feeds the token scan so a hostile crawl inflating
+# discovery state is not re-materialised here (theme keywords saturate
+# long before this many entries anyway).
+_MAX_SIGNAL_ITEMS = 500
+
+
+def _signal_text(value: object) -> str:
+    if isinstance(value, (list, tuple, set)):
+        return str(list(value)[:_MAX_SIGNAL_ITEMS])
+    return str(value)
+
+
 def _collect_signals(discovery: object, crawl_data: dict) -> set[str]:
     signal_text: list[str] = []
     if discovery:
@@ -241,11 +264,13 @@ def _collect_signals(discovery: object, crawl_data: dict) -> set[str]:
             "urls", "forms", "apis", "parameters", "fingerprint",
             "common_paths_found", "robots_disallow",
         ):
-            signal_text.append(str(getattr(discovery, attr, "")))
-    signal_text.append(str(crawl_data.get("discovered_urls", [])))
-    signal_text.append(str(crawl_data.get("visited_urls", [])))
-    signal_text.append(str(crawl_data.get("discovered_parameters", [])))
-    signal_text.append(str(crawl_data.get("discovered_forms", [])))
+            signal_text.append(_signal_text(getattr(discovery, attr, "")))
+    signal_text.append(_signal_text(crawl_data.get("discovered_urls", [])))
+    signal_text.append(_signal_text(crawl_data.get("visited_urls", [])))
+    signal_text.append(
+        _signal_text(crawl_data.get("discovered_parameters", [])),
+    )
+    signal_text.append(_signal_text(crawl_data.get("discovered_forms", [])))
     haystack = " ".join(signal_text).lower()
     tokens = set(re.findall(r"[a-z0-9_:-]+", haystack))
     tokens.update(token.replace("-", "_") for token in list(tokens))

@@ -14,13 +14,24 @@ Requires:
 
 import argparse
 import asyncio
+import os
 import sys
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+if not __package__:
+    # Script mode (python3 core/sage/scripts/register_agents.py): the
+    # repo root must come from RAPTOR_DIR — the path-safety rule
+    # forbids deriving it from __file__ (a namespace-shadowed checkout
+    # would import a foreign tree). Package imports need no path setup.
+    if "RAPTOR_DIR" not in os.environ:
+        sys.exit(
+            "RAPTOR_DIR is not set — run via libexec/raptor-sage-setup, "
+            "or export RAPTOR_DIR=<repo root> first"
+        )
+    sys.path.insert(0, os.environ["RAPTOR_DIR"])
 
 # Import errors are deferred to main() so the module stays import-safe
 # (test collection must never die on a missing optional dependency).
+_SAGE_SDK_IMPORT_ERROR: ImportError | None = None
 try:
     import httpx
     from sage_sdk.async_client import AsyncSageClient
@@ -29,9 +40,7 @@ try:
     from sage_sdk.models import MemoryType
 except ImportError as _exc:
     _SAGE_SDK_IMPORT_ERROR = _exc
-    httpx = AsyncSageClient = AgentIdentity = SageError = MemoryType = None
-else:
-    _SAGE_SDK_IMPORT_ERROR = None
+    httpx = AsyncSageClient = AgentIdentity = SageError = MemoryType = None  # type: ignore[assignment]
 
 from core.sage.scripts._common import async_memory_exists
 from core.security.log_sanitisation import escape_nonprintable as _escape_nonprintable
@@ -504,10 +513,6 @@ async def register_agents(sage_url: str, dry_run: bool = False, force: bool = Fa
 
 
 def main() -> None:
-    if _SAGE_SDK_IMPORT_ERROR is not None:
-        print("ERROR: sage-agent-sdk not installed.")
-        print("  pip install sage-agent-sdk")
-        sys.exit(1)
     parser = argparse.ArgumentParser(
         description="Register RAPTOR agents on the SAGE network"
     )
@@ -527,6 +532,14 @@ def main() -> None:
         help="Re-propose even if the agent's memories are already present in SAGE",
     )
     args = parser.parse_args()
+
+    # Checked after parse_args so `--help` works without the optional
+    # SDK; the deferred import error gates work, not usage. stderr so
+    # callers capturing streams see the failure where they look for it.
+    if _SAGE_SDK_IMPORT_ERROR is not None:
+        print("ERROR: sage-agent-sdk not installed.", file=sys.stderr)
+        print("  pip install sage-agent-sdk", file=sys.stderr)
+        sys.exit(1)
 
     asyncio.run(register_agents(args.sage_url, args.dry_run, args.force))
 

@@ -76,6 +76,14 @@ if [ -z "${CLAUDECODE:-}" ] && [ -z "${_RAPTOR_TRUSTED:-}" ]; then
 fi
 # ─── end trust-marker check ─────────────────────────────────
 
+if [[ -n "${RAPTOR_SESSION_SERVICE_POLICY:-}"
+        || "${RAPTOR_FRONTEND:-}" == "copilot"
+        || -n "${COPILOT_CLI:-}"
+        || -n "${COPILOT_AGENT_SESSION_ID:-}" ]]; then
+    echo "raptor-sage-setup: Copilot session service policy blocks SAGE/Docker access; setup flags are not service/account authorization." >&2
+    exit 3
+fi
+
 # Exit codes: 2 is reserved for the trust-marker refusal above
 # (cc-trust-check convention); usage errors exit 3, and an explicit
 # help request exits 0.
@@ -95,8 +103,12 @@ usage: raptor-sage-setup [install | --uninstall | --status | review] [--reauthor
                  note, and review/status stop flagging them as pending).
                  Exit 0 = nothing pending review, 4 = undecided variant(s).
   --approve      approve the reviewed variants without the interactive prompt
-                 (review only). Approves every live variant, including
-                 previously rejected ones — this is also the un-reject path.
+                 (review only). Approves the pending ("Not Authorized")
+                 variants; previously rejected variants stay rejected — an
+                 approve of a new variant never silently re-authorizes a
+                 denied one. To reverse a rejection, re-authorize the full
+                 payload: raptor-sage-setup install --reauthorize (replaces
+                 the stamp, denied records included).
                  Requires an interactive terminal (stdin must be a TTY):
                  approval cannot be scripted or agent-run.
   --reject       reject the unauthorized live variants non-interactively
@@ -203,12 +215,16 @@ while [ -L "$SCRIPT" ]; do
         echo "raptor-sage-setup: symlink hop limit exceeded resolving $0" >&2
         exit 3
     fi
-    DIR="$(cd "$(dirname "$SCRIPT")" && pwd)"
+    DIR="$(CDPATH= cd -- "$(dirname "$SCRIPT")" && pwd)"
     SCRIPT="$(readlink "$SCRIPT")"
     [[ "$SCRIPT" != /* ]] && SCRIPT="$DIR/$SCRIPT"
 done
 unset _symhops
-RAPTOR_DIR="$(cd "$(dirname "$SCRIPT")/.." && pwd)"
+RAPTOR_DIR="$(CDPATH= cd -- "$(dirname "$SCRIPT")/.." && pwd)"
+# Exported for the python children (seed_sage_knowledge.py /
+# register_agents.py): script-mode invocations resolve the repo root
+# from RAPTOR_DIR per the path-safety rule, never from __file__.
+export RAPTOR_DIR
 
 COMPOSE_FILE="$RAPTOR_DIR/core/sage/docker-compose.yml"
 MCP_WRAPPER="$RAPTOR_DIR/libexec/raptor-sage-mcp"
@@ -257,19 +273,18 @@ check_docker() {
     # (group membership rather than direct socket access), re-exec self.
     if ! docker info >/dev/null 2>&1; then
         if command -v sg >/dev/null 2>&1 && sg docker -c "docker info" >/dev/null 2>&1; then
-            # Re-exec under sg docker. Build a properly quoted argv
-            # since sg -c takes a single string.
-            local quoted_args=""
-            local a
+            # Re-exec under sg docker. sg -c takes a single shell
+            # string: printf %q quotes every element exec-safely (an
+            # install path or argument carrying a quote or $ breaks
+            # naive "\"$a\"" interpolation — the raptor-sage-mcp
+            # sibling documents this exact bug) and forwards the args
+            # verbatim so the re-exec matches the original invocation.
             # ${arr[@]+...} guard: on bash < 4.4 (macOS's bundled 3.2,
             # which this script otherwise supports) expanding an EMPTY
             # array under set -u is a fatal unbound-variable error —
             # hit exactly on a bare zero-arg install reaching this
             # re-exec. The + form expands to nothing when empty.
-            for a in ${_ORIG_ARGS[@]+"${_ORIG_ARGS[@]}"}; do
-                quoted_args="$quoted_args \"$a\""
-            done
-            exec sg docker -c "\"$0\"$quoted_args"
+            exec sg docker -c "$(printf '%q ' "$0" ${_ORIG_ARGS[@]+"${_ORIG_ARGS[@]}"})"
         fi
         echo "raptor-sage-setup: Docker daemon is not running or not accessible." >&2
         echo "  Start: sudo systemctl start docker" >&2
@@ -639,13 +654,15 @@ migrate_sage_home_if_needed() {
         echo "Post-migration check:"
         echo "  $validation_result"
 
+        # docker cp writes files as the host UID; cp -a preserves that.
+        # The container runs as root, so fix ownership before it starts.
         if ! docker run --rm \
             -v "$volume_name:/dest" \
             --entrypoint /bin/sh \
             "$sage_image" \
-            -c 'date -u > /dest/.migration-complete'; then
+            -c 'chown -R 0:0 /dest && date -u > /dest/.migration-complete'; then
             abort_sage_home_migration "$backup" "$volume_name" \
-                "could not write the migration completion marker."
+                "could not fix ownership / write the migration completion marker."
             return 1
         fi
     fi
@@ -832,13 +849,24 @@ run_boot_probe() {
     local nonce_file nonce rc=0
     nonce_file="$RAPTOR_DIR/.sage/boot-capture.nonce"
     mkdir -p "$RAPTOR_DIR/.sage"
-    nonce=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+    # python3 -I on every interpreter this consent lane spawns (here
+    # through the stamp write): an interpreter-startup hook (PYTHONPATH
+    # sitecustomize, user-site .pth/usercustomize — the latter with
+    # zero environment variables) could otherwise skew what the
+    # operator is shown versus what is stamped authorized. Isolated
+    # mode means the hook never loads (docs/security.md, the
+    # interpreter-startup-hook class); the ambient-env sites that
+    # legitimately need user-site packages (the sage_sdk probe,
+    # seeding, agent registration) are pinned as such in
+    # core/sage/tests/test_boot_payload_isolation.py.
+    nonce=$(python3 -I -c 'import secrets; print(secrets.token_hex(32))')
     _RAPTOR_TMP_FILES+=("$nonce_file")
     (umask 077; printf '%s' "$nonce" > "$nonce_file")
-    printf '%s\n%s\n%s\n' \
+    printf '%s\n%s\n%s\n%s\n' \
         '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"raptor-sage-setup","version":"1.0.0"}}}' \
         '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
         '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"sage_inception","arguments":{}}}' \
+        '{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}' \
         | CLAUDECODE=1 RAPTOR_SAGE_BOOT_CAPTURE="$nonce" $timeout_cmd "$MCP_WRAPPER" 2>/dev/null || rc=$?
     rm -f "$nonce_file"
     return "$rc"
@@ -857,6 +885,14 @@ capture_boot_payload() {
     #   ### sage_inception.content         every observed variant's
     #                                      ENTIRE result.content as
     #                                      one JSON line
+    #   ### tools.list                     every observed tools/list
+    #                                      tool object (name,
+    #                                      description, inputSchema,
+    #                                      siblings), one JSON line
+    #                                      per tool — tool definitions
+    #                                      land at definition tier, so
+    #                                      the guard enforces them
+    #                                      like initialize.instructions
     # The payload is state-dependent (first connection returns an
     # "Auto-Inception" variant with boot safeguards; later connections
     # a shorter "Auto-Connect" variant), so TWO probes run and both
@@ -883,12 +919,19 @@ capture_boot_payload() {
     if [ -z "$r1" ] && [ -z "$r2" ]; then
         return 1
     fi
-    local init1 init2 msg1 content1 content2
+    local init1 init2 msg1 content1 content2 tools1 tools2
     init1=$(printf '%s\n' "$r1" | jq -r 'select(.id == 1) | .result.instructions // ""' 2>/dev/null || true)
     init2=$(printf '%s\n' "$r2" | jq -r 'select(.id == 1) | .result.instructions // ""' 2>/dev/null || true)
     msg1=$(printf '%s\n' "$r1" | jq -r 'select(.id == 2) | ((try (.result.content[0].text | fromjson | .message) catch "") // "")' 2>/dev/null || true)
     content1=$(printf '%s\n' "$r1" | jq -c 'select(.id == 2) | .result.content // empty' 2>/dev/null || true)
     content2=$(printf '%s\n' "$r2" | jq -c 'select(.id == 2) | .result.content // empty' 2>/dev/null || true)
+    # One JSON line per WHOLE tool object (jq -c: single-line output,
+    # injection-proof like the content sections above). `objects`
+    # keeps only object-typed entries: the guard authorizes dict
+    # variants only, so recording a non-object entry would emit a
+    # section that LOOKS populated while authorizing nothing.
+    tools1=$(printf '%s\n' "$r1" | jq -c 'select(.id == 3) | .result.tools[]? | objects' 2>/dev/null || true)
+    tools2=$(printf '%s\n' "$r2" | jq -c 'select(.id == 3) | .result.tools[]? | objects' 2>/dev/null || true)
     if [ -z "$content1" ] && [ -z "$content2" ]; then
         echo "raptor-sage-setup: boot probes answered but no sage_inception content could be extracted; refusing to record an empty boot-payload stamp" >&2
         return 1
@@ -919,7 +962,7 @@ capture_boot_payload() {
     # Defined nested so test drivers that extract capture_boot_payload
     # alone stay self-contained.
     _flatten_splitlines_separators() {
-        python3 -c '
+        python3 -I -c '
 import sys
 text = sys.stdin.buffer.read().decode("utf-8", errors="replace")
 for sep in "\r\v\f\x1c\x1d\x1e\x85\u2028\u2029":
@@ -944,6 +987,22 @@ sys.stdout.buffer.write(text.encode("utf-8"))
     fi
     if [ -n "$content2" ] && [ "$content2" != "$content1" ]; then
         printf '%s\n' "$content2"
+    fi
+    # tools/list baseline. The section is emitted only when at least
+    # one tool was extracted: an ABSENT section is the honest "no
+    # tools baseline" state (guard forwards tools/list with a loud
+    # unverified notice), while an empty section could masquerade as a
+    # recorded baseline. Missing tools do not fail the capture — the
+    # boot surfaces above are still worth stamping — but the gap is
+    # reported so the operator knows enforcement has not started.
+    if [ -n "$tools1" ] || [ -n "$tools2" ]; then
+        printf '### tools.list\n'
+        {
+            [ -z "$tools1" ] || printf '%s\n' "$tools1"
+            [ -z "$tools2" ] || printf '%s\n' "$tools2"
+        } | awk '!seen[$0]++'
+    else
+        echo "raptor-sage-setup: warning: the boot probes returned no tools/list definitions — the tools surface stays unbaselined (the MCP guard forwards tools/list with an unverified notice). Re-run 'bin/raptor sage-setup review' once the server serves tools." >&2
     fi
 }
 
@@ -984,6 +1043,58 @@ authorize_boot_payload() {
     # payload from live sessions until the operator re-authorizes.
     # Non-fatal: without the recorded file, the wrapper withholds
     # server boot instructions from agent sessions.
+    #
+    # Display-lane sanitiser for payload text shown at the
+    # authorization TTY: non-printables escaped to \xHH, each line
+    # bounded with an explicit elision marker. The payload is
+    # server-derived — a hostile variant carrying ESC/CSI/OSC or bidi
+    # controls could re-render the diff (cursor moves forging a clean
+    # verdict) at the moment the operator decides. DISPLAY ONLY: the
+    # recorded stamp keeps the raw bytes (the guard's enforcement
+    # equality compares raw text). Fail direction: callers treat a
+    # non-zero exit as "could not render safely" and refuse the
+    # authorization step — never fall back to raw output. Defined
+    # nested so test drivers that extract authorize_boot_payload alone
+    # stay self-contained.
+    # Approval invariant: NOTHING the operator was not shown may be
+    # stamped authorized. Lines render UNBOUNDED (a length cap elided
+    # long-line tails from the display while the full raw payload was
+    # stamped — exactly the sight-unseen replace this surface
+    # refuses); a hostile server flooding the display is visible
+    # hostility, but a line-COUNT ceiling still refuses pathological
+    # payloads outright (fail closed, same lane as sanitiser failure)
+    # rather than burying one line in a hundred thousand. Every
+    # rendered payload line carries a "| " prefix so payload text can
+    # never impersonate the script's own frame/status lines.
+    _render_payload_display() {
+        RAPTOR_DIR="$RAPTOR_DIR" python3 -I -c '
+import os
+import sys
+
+sys.path.insert(0, os.environ["RAPTOR_DIR"])
+from core.security.log_sanitisation import escape_nonprintable
+
+data = sys.stdin.buffer.read().decode("utf-8", errors="replace")
+lines = data.split("\n")  # line-model: deliberate byte-decode display; escape_nonprintable renders \r visible
+if len(lines) > 4000:
+    sys.stderr.write(
+        f"payload has {len(lines)} lines — refusing to render an "
+        "approval display that large\n")
+    sys.exit(1)
+rendered = ["| " + escape_nonprintable(line) for line in lines]
+total = sum(len(r) + 1 for r in rendered)
+if total > 2_000_000:
+    # Escaping expands hostile bytes up to 4x; an unreviewably large
+    # render would scroll early payload lines out of the operator
+    # terminal. Refuse outright (never truncate-and-proceed) — same
+    # fail-closed lane as the line-count ceiling.
+    sys.stderr.write(
+        f"payload renders to {total} chars — refusing to render an "
+        "approval display that large\n")
+    sys.exit(1)
+sys.stdout.write("\n".join(rendered))
+'
+    }
     local payload
     if ! payload=$(capture_boot_payload) || [ -z "$payload" ]; then
         echo "Warning: could not capture the SAGE boot payload." >&2
@@ -1032,14 +1143,42 @@ authorize_boot_payload() {
                 echo "  bin/raptor sage-setup install --reauthorize" >&2
                 return 0
             fi
+            # An approval must render what is being approved: the old
+            # stamp is unreadable (no parseable hash → no diff), so
+            # show the FULL current payload the operator is stamping,
+            # exactly like the first-capture lane. Refusing on an
+            # unrenderable payload beats replacing the stamp sight
+            # unseen.
+            echo "Existing stamp has no parseable SHA256 header; the payload being"
+            echo "re-authorized follows (non-printables escaped for display):"
+            echo "-----------------------------------------------------------"
+            if ! printf '%s\n' "$payload" | _render_payload_display; then
+                echo "raptor-sage-setup: could not render the payload text safely (sanitiser failed)." >&2
+                echo "Refusing to replace a stamp with a payload that could not be reviewed." >&2
+                echo "The previous record is kept." >&2
+                return 0
+            fi
+            echo "-----------------------------------------------------------"
             echo "Existing stamp had no parseable SHA256 header — replaced (--reauthorize)."
         elif [ "$old_sha" = "$sha" ]; then
             echo "SAGE boot payload unchanged since last authorization (sha256 ${sha:0:12})."
         else
             echo "SAGE boot payload CHANGED since last authorization:"
-            sed '1,/^# ---$/d' "$AUTHORIZED_PAYLOAD" \
+            # diff exits 1 on difference (always, here) — compute the
+            # text first, then sanitise for the TTY. The diff below is
+            # what the operator's y/N answer authorizes: refusing to
+            # prompt over an unrenderable diff beats prompting over
+            # raw server bytes.
+            local payload_diff
+            payload_diff=$(sed '1,/^# ---$/d' "$AUTHORIZED_PAYLOAD" \
                 | diff -u --label previous --label current - <(printf '%s\n' "$payload") \
-                || true
+                || true)
+            if ! printf '%s\n' "$payload_diff" | _render_payload_display; then
+                echo "raptor-sage-setup: could not render the payload diff safely (sanitiser failed)." >&2
+                echo "The previous record is kept; nothing was re-authorized. The MCP wrapper" >&2
+                echo "will strip the changed payload from agent sessions." >&2
+                return 0
+            fi
             if [ "$REAUTHORIZE" = "1" ]; then
                 # Same TTY gate as the unparseable-header branch above:
                 # a changed payload is exactly what the flag launders
@@ -1108,12 +1247,91 @@ authorize_boot_payload() {
             return 1
         fi
         # First capture on this machine: show the operator exactly what
-        # they are authorizing.
-        echo "Recording the SAGE boot payload as operator-authorized."
-        echo "Payload text follows:"
+        # they are authorizing — non-printables escaped so the display
+        # is honest (the recorded stamp keeps the raw bytes). The boot
+        # surfaces render full-text (short, readable prose); the
+        # tools.list section renders as the reviewer's DIGEST instead
+        # (30+ full JSON definitions are an unreviewable wall — and can
+        # trip the renderer's fail-closed size ceilings outright), with
+        # full definitions one drill-down away. On a TTY the stamp
+        # waits for an explicit confirm; a NON-interactive first
+        # install records the boot surfaces as before (the operator's
+        # deliberate install invocation is that authorization) but
+        # leaves tools.list UNBASELINED — the guard forwards it with
+        # the unverified notice until `raptor-sage-setup review`
+        # baselines it at the operator's terminal, so a surface no one
+        # looked at is never stamped authorized.
+        local reviewer="$RAPTOR_DIR/core/sage/boot_payload_review.py"
+        local tmp_capture display_payload has_tools=0 tools_deferred=0
+        tmp_capture=$(mktemp); _RAPTOR_TMP_FILES+=("$tmp_capture")
+        printf '%s\n' "$payload" > "$tmp_capture"
+        display_payload="$payload"
+        # Probe the temp file, not a printf pipeline: grep -q exits on
+        # the first match and a large payload still mid-write would
+        # SIGPIPE printf — under pipefail that misreads "has tools" as
+        # "no tools" exactly on the payloads that most need the split.
+        if grep -qxF '### tools.list' "$tmp_capture"; then
+            has_tools=1
+            if ! display_payload=$(python3 -I "$reviewer" strip-tools --live "$tmp_capture"); then
+                echo "raptor-sage-setup: could not split the tools surface out of the payload display." >&2
+                echo "Refusing to record a boot-payload stamp that could not be reviewed." >&2
+                return 1
+            fi
+        fi
+        echo "First capture of the SAGE boot payload — review before it is recorded."
+        echo "Payload text follows (non-printables escaped for display):"
         echo "-----------------------------------------------------------"
-        printf '%s\n' "$payload"
+        if ! printf '%s\n' "$display_payload" | _render_payload_display; then
+            echo "raptor-sage-setup: could not render the payload text safely (sanitiser failed)." >&2
+            echo "Refusing to record a boot-payload stamp that could not be reviewed." >&2
+            return 1
+        fi
         echo "-----------------------------------------------------------"
+        if [ "$has_tools" = "1" ]; then
+            if ! python3 -I "$reviewer" tools-digest --live "$tmp_capture"; then
+                # Fail toward LESS authority, loudly: no digest means
+                # the tools surface was never reviewable, so it must
+                # not ride the stamp — defer it to the review lane.
+                echo "raptor-sage-setup: could not render the tools digest." >&2
+                echo "tools.list will NOT be baselined by this install; baseline it later" >&2
+                echo "at your own terminal: libexec/raptor-sage-setup review" >&2
+                tools_deferred=1
+            fi
+        fi
+        if [ -t 0 ]; then
+            local answer
+            while true; do
+                read -r -p "Baseline this surface? [y=record (trust-on-first-use) / d <tool>=show full definition / N=abort] " answer || answer=""
+                case "$answer" in
+                    y|Y|yes|YES) break ;;
+                    [dD]\ ?*)
+                        python3 -I "$reviewer" show-tool --live "$tmp_capture" \
+                            --name "${answer#[dD] }" || true
+                        ;;
+                    *)
+                        echo "NOT recorded. No boot payload is authorized; the MCP wrapper" >&2
+                        echo "withholds server boot instructions (and the guard notes the" >&2
+                        echo "tools surface as unverified) until one is. Re-run at your" >&2
+                        echo "terminal: bin/raptor sage-setup install" >&2
+                        return 0
+                        ;;
+                esac
+            done
+        elif [ "$has_tools" = "1" ]; then
+            tools_deferred=1
+            echo "tools.list left unbaselined (non-interactive first install): sessions"
+            echo "receive the server's tools/list with an unverified notice until you"
+            echo "baseline it at your own terminal: libexec/raptor-sage-setup review"
+        fi
+        if [ "$tools_deferred" = "1" ] && [ "$has_tools" = "1" ]; then
+            if ! payload=$(python3 -I "$reviewer" strip-tools --live "$tmp_capture"); then
+                echo "raptor-sage-setup: could not strip the deferred tools surface from the stamp." >&2
+                echo "Refusing to record definitions that were never reviewed." >&2
+                return 1
+            fi
+            # The stamp hash must cover exactly what is recorded.
+            sha=$(printf '%s\n' "$payload" | sha256sum | awk '{print $1}')
+        fi
     fi
     # Same-fs mktemp + atomic mv — see enable_sage_env for the rationale.
     mkdir -p "$(dirname "$AUTHORIZED_PAYLOAD")"
@@ -1134,12 +1352,19 @@ authorize_boot_payload() {
     } > "$tmp"
     mv "$tmp" "$AUTHORIZED_PAYLOAD"
     trap - RETURN
+    # Report tools.list only when the capture actually recorded it —
+    # a tools-less capture leaves the section out (see
+    # capture_boot_payload) and enforcement has not started for it.
+    local surfaces_line="initialize.instructions(+.json), sage_inception.message, sage_inception.content"
+    if printf '%s\n' "$payload" | grep -q '^### tools\.list$'; then
+        surfaces_line="$surfaces_line, tools.list"
+    fi
     echo "Recorded operator-authorized SAGE boot payload:"
     echo "  File:    $AUTHORIZED_PAYLOAD"
     echo "  Image:   $image"
     echo "  Running: $running_digest"
     echo "  SHA256:  $sha"
-    echo "  Surfaces: initialize.instructions(+.json), sage_inception.message, sage_inception.content"
+    echo "  Surfaces: $surfaces_line"
 }
 
 review_boot_payload() {
@@ -1161,9 +1386,12 @@ review_boot_payload() {
     # the flagless path's [ -t 0 ] prompt gate. Without this, a
     # mid-session prompt-injected `review --approve` (agents run this
     # script with a pipe/devnull stdin) could launder a hostile server
-    # variant into the operator-authorized record — including
-    # reversing a prior rejection. --reject stays non-interactive: it
-    # only narrows what sessions receive and is fully reversible.
+    # variant into the operator-authorized record. (Reversing a prior
+    # rejection is out of approve's reach entirely — merge keeps
+    # denied variants denied; un-rejecting requires the full
+    # `install --reauthorize` re-authorization.) --reject stays
+    # non-interactive: it only narrows what sessions receive and is
+    # reversible via that same explicit re-authorization.
     if [ "$APPROVE" = "1" ] && [ ! -t 0 ]; then
         echo "review --approve requires an interactive terminal (stdin is not a TTY)." >&2
         echo "Approval must come from the operator directly — an agent or script" >&2
@@ -1189,7 +1417,7 @@ review_boot_payload() {
     echo "Boot-payload review — live server vs $AUTHORIZED_PAYLOAD"
     echo
     local rc=0
-    python3 "$reviewer" compare \
+    python3 -I "$reviewer" compare \
         --authorized "$AUTHORIZED_PAYLOAD" --live "$tmp_live" || rc=$?
     echo
     if [ "$rc" = "0" ]; then
@@ -1201,6 +1429,19 @@ review_boot_payload() {
     fi
     echo "The variants marked \"Not Authorized\" above are undecided: the MCP"
     echo "guard strips them from live agent sessions until you decide."
+    # First-baseline honesty: with no tools baseline in the stamp, the
+    # tools digest above is a trust-on-first-use decision (the guard
+    # currently FORWARDS tools/list with an unverified notice — it has
+    # nothing to strip against), which the generic strip-wording does
+    # not cover. Wording only; enforcement reads the stamp, not this.
+    if ! grep -qxF '### tools.list' "$AUTHORIZED_PAYLOAD"; then
+        echo
+        echo "tools.list has no baseline yet: sessions currently receive the server's"
+        echo "tools/list with only an unverified notice. Approving baselines the"
+        echo "CURRENT live tool surface (trust-on-first-use — the digest above is the"
+        echo "evidence being approved) and the guard then enforces it; rejecting"
+        echo "records every captured definition as denied."
+    fi
     echo
     local decision=""
     if [ "$APPROVE" = "1" ]; then
@@ -1210,17 +1451,26 @@ review_boot_payload() {
         decision=deny
         echo "Rejecting (--reject)."
     elif [ -t 0 ]; then
+        # One decision for the whole reviewed capture, with a
+        # drill-down that renders a single full tool definition
+        # (escaped) and re-prompts — inspection is never a decision.
         local answer
-        read -r -p "Approve or reject these variants? [a=approve / r=reject / N=decide later] " answer
-        case "$answer" in
-            a|A) decision=merge ;;
-            r|R) decision=deny ;;
-            *)
-                echo "No decision recorded. The stamp is unchanged; review will" >&2
-                echo "flag these variants again." >&2
-                return 4
-                ;;
-        esac
+        while true; do
+            read -r -p "Approve or reject these variants? [a=approve / r=reject / d <tool>=show full definition / N=decide later] " answer || answer=""
+            case "$answer" in
+                a|A) decision=merge; break ;;
+                r|R) decision=deny; break ;;
+                [dD]\ ?*)
+                    python3 -I "$reviewer" show-tool --live "$tmp_live" \
+                        --name "${answer#[dD] }" || true
+                    ;;
+                *)
+                    echo "No decision recorded. The stamp is unchanged; review will" >&2
+                    echo "flag these variants again." >&2
+                    return 4
+                    ;;
+            esac
+        done
     else
         echo "Non-interactive and no decision flag: the stamp is unchanged." >&2
         echo "  approve: libexec/raptor-sage-setup review --approve" >&2
@@ -1228,7 +1478,7 @@ review_boot_payload() {
         return 4
     fi
     local merged
-    if ! merged=$(python3 "$reviewer" "$decision" \
+    if ! merged=$(python3 -I "$reviewer" "$decision" \
             --authorized "$AUTHORIZED_PAYLOAD" --live "$tmp_live"); then
         echo "Error: recording the decision failed; the stamp is unchanged." >&2
         return 3
@@ -1754,7 +2004,7 @@ status_sage() {
             printf '%s\n' "$live" > "$tmp_live"
             local drift_out
             drift_rc=0
-            drift_out=$(python3 "$RAPTOR_DIR/core/sage/boot_payload_review.py" \
+            drift_out=$(python3 -I "$RAPTOR_DIR/core/sage/boot_payload_review.py" \
                 summary --authorized "$AUTHORIZED_PAYLOAD" \
                 --live "$tmp_live" 2>/dev/null) || drift_rc=$?
             if [ "$drift_rc" = "0" ]; then

@@ -16,8 +16,8 @@ Behaviour:
   stale bump plan doesn't silently overwrite operator work.
 * No edits applied → file untouched.
 
-Atomic write via :func:`core.file.atomic_write` (or the
-package-local ``_atomic`` if core.file isn't available).
+Read / per-edit apply / atomic write is handled by the shared
+``rewrite_file_with`` driver in ``rewriters/__init__.py``.
 
 Adapted from https://github.com/gadievron/raptor/pull/467 by
 Natalie Somersall — her ``update_dockerfile()`` shipped the
@@ -32,9 +32,7 @@ from __future__ import annotations
 import logging
 import re
 
-from core.atomic_fs import write_text_atomically as _atomic_write
-
-from . import RewriteEdit, RewriteResult
+from . import RewriteEdit, RewriteResult, rewrite_file_with
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -43,19 +41,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _is_dockerfile(path: Path) -> bool:
-    """Predicate matching the inline-installs parser's predicate
-    so a rewriter is wired to every file the parser sees."""
-    name = path.name
-    if name in ("Dockerfile", "Containerfile"):
-        return True
-    if name.startswith("Dockerfile.") or name.endswith(".Dockerfile"):
-        return True
-    return path.suffix == ".dockerfile"
-
-
-# NOT @register'd: the Dockerfile predicate is owned by
-# ``dockerfile_from`` which dispatches ARG-shaped edits here
+# NOT @register'd: the Dockerfile predicate
+# (``packages.sca.file_shapes.is_dockerfile``) is registered by
+# ``dockerfile_from``, which dispatches ARG-shaped edits here
 # internally (locators containing ``/`` route to FROM, the rest
 # to ARG). One predicate registration prevents the
 # first-match-wins dispatcher from picking the wrong rewriter
@@ -70,30 +58,7 @@ def rewrite_dockerfile_arg(
     ``ARG <NAME>=<value>`` with optional whitespace; the value
     component is rewritten if it matches ``edit.old_value``.
     """
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as e:
-        return [RewriteResult(edit=e2, applied=False,
-                              reason=f"error: read failed: {e}")
-                for e2 in edits]
-
-    results: list[RewriteResult] = []
-    new_text = text
-    for edit in edits:
-        new_text, result = _apply_one(new_text, edit)
-        results.append(result)
-
-    if any(r.applied for r in results):
-        try:
-            _atomic_write(path, new_text)
-        except OSError as e:
-            # I/O failure on write — convert every applied edit
-            # to a failure (we couldn't actually persist).
-            return [RewriteResult(edit=r.edit, applied=False,
-                                  reason=f"error: write failed: {e}")
-                    if r.applied else r
-                    for r in results]
-    return results
+    return rewrite_file_with(path, edits, _apply_one)
 
 
 def _apply_one(
@@ -108,9 +73,12 @@ def _apply_one(
     # whitespace / comment / EOL. Multi-line mode so each line
     # is tested independently — Dockerfile ARGs are always
     # one-per-line.
+    # Leading indent is HORIZONTAL-only ([^\S\n]) — the MULTILINE
+    # ``^\s*`` idiom is quadratic on blank-line runs (see the helm
+    # rewriter's fixed anchor; same sibling idiom).
     name = re.escape(edit.locator)
     pattern = re.compile(
-        rf"^(\s*ARG\s+{name}\s*=\s*)(\S+)",
+        rf"^([^\S\n]*ARG\s+{name}\s*=\s*)(\S+)",
         re.MULTILINE,
     )
     # Multi-stage Dockerfiles redeclare the same ARG per stage, so the

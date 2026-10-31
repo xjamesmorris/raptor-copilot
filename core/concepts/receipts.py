@@ -32,6 +32,7 @@ from dataclasses import asdict, dataclass, field
 
 from core.paths import confine
 from typing import TYPE_CHECKING
+from core.source.lines import split_lines
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -129,7 +130,13 @@ def verify_receipt(
     anywhere in the file otherwise.  ``sha256`` records the
     normalised quote hash for downstream threading.
     """
-    receipt = Receipt(file=file_path, line=line, quote=quote[:2000])
+    # Hash what is STORED: the receipt keeps quote[:2000], so the
+    # sha256 must cover the same text or the pair is internally
+    # inconsistent (no consumer re-hashes today; the truncated quote
+    # still substring-verifies, but a future hash comparison would
+    # read every long quote as drift).
+    quote = quote[:2000]
+    receipt = Receipt(file=file_path, line=line, quote=quote)
     norm = _normalise(quote)
     if len(norm) < MIN_QUOTE_CHARS:
         receipt.note = "quote too short to verify"
@@ -147,7 +154,7 @@ def verify_receipt(
         return receipt
 
     if line is not None and line > 0:
-        lines = content.splitlines()
+        lines = split_lines(content)
         lo = max(0, line - 1 - LINE_WINDOW)
         hi = min(len(lines), line - 1 + LINE_WINDOW + 1)
         window = _normalise("\n".join(lines[lo:hi]))
@@ -176,13 +183,16 @@ def mechanical_receipt(
     """Receipt for a mechanically extracted snippet.
 
     The snippet came out of the extractor, so existence is true by
-    construction; the hash still pins the exact text.
+    construction; the hash still pins the exact text — the STORED
+    text (mirrors verify_receipt: hash and quote cover the same
+    2000-char prefix).
     """
+    snippet = snippet[:2000]
     norm = _normalise(snippet)
     return Receipt(
         file=file_path,
         line=line,
-        quote=snippet[:2000],
+        quote=snippet,
         verified=True,
         sha256=hashlib.sha256(norm.encode()).hexdigest()[:16] if norm else "",
         tier=TIER_MECHANICAL,
@@ -199,6 +209,16 @@ _PARAM_DOC_RE = re.compile(
 )
 _RETURNS_NULL_DOC_RE = re.compile(
     r"\breturns?\s+(?:``)?(NULL|None|nil|null)\b", re.IGNORECASE,
+)
+# Negated claims ("never returns NULL", "does not return None") are
+# the OPPOSITE contract — matching them as a NULL-return claim flagged
+# correct docs as stale. Presence anywhere in the doc disables check
+# (c): a mixed doc is not a decidable mismatch, and the check's own
+# contract is "only fire on decidable mismatches".
+_NEGATED_RETURNS_RE = re.compile(
+    r"\b(?:never|not|cannot|can't|won't|doesn't|don't|no)\s+"
+    r"(?:\w+\s+){0,2}returns?\b",
+    re.IGNORECASE,
 )
 _GO_LEADING_IDENT_RE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9]+)\b")
 
@@ -240,7 +260,7 @@ def detect_stale_doc(
 
     # (b) Go doc convention: comment should start with the item name
     if language == "go":
-        m = _GO_LEADING_IDENT_RE.match(doc_comment)
+        m = _GO_LEADING_IDENT_RE.match(doc_comment)  # type: ignore[assignment]
         if m and m.group(1) != name and len(m.group(1)) > 2:
             # Only flag when the leading identifier looks like a
             # code name that exists nowhere in the definition —
@@ -255,12 +275,22 @@ def detect_stale_doc(
                 )
 
     # (c) doc claims NULL/None/nil return the body never produces
-    m = _RETURNS_NULL_DOC_RE.search(doc_comment)
-    if m and "return" in definition:
+    m = _RETURNS_NULL_DOC_RE.search(doc_comment)  # type: ignore[assignment]
+    if m and "return" in definition \
+            and not _NEGATED_RETURNS_RE.search(doc_comment):
         token = m.group(1)
         variants = {"NULL", "None", "nil", "null"}
+        # The body scan spans line breaks with a bounded window:
+        # multi-line returns (``return (\n    NULL);``) are routine
+        # in kernel style, and per-line matching flagged a CORRECT doc
+        # as stale. The window errs toward NOT flagging (a distant
+        # token counting as a NULL return suppresses the flag), which
+        # is the conservative direction for this check.
         if not any(
-            re.search(rf"return\s+.*\b{re.escape(v)}\b", definition)
+            re.search(
+                rf"\breturn\b[\s\S]{{0,120}}?\b{re.escape(v)}\b",
+                definition,
+            )
             for v in variants
         ):
             return (

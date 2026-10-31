@@ -28,7 +28,8 @@ plural shape makes that concatenation trivial without a singular/plural
 schema awkwardness post-merge.
 
 What's INTENTIONALLY thin in a ProvenanceRef:
-  * run_id      = the run-dir basename (stable, file-system grep-able).
+  * run_id      = the RESOLVED run-dir basename (stable, file-system
+    grep-able; ``core.coverage.journal.resolved_run_id``).
   * ts          = the manifest's start-time ISO timestamp.
   * manifest_path = the path to ``.raptor-run.json``, always relative to
     the run dir (see ``_relative_manifest_path``). Consumers resolve it
@@ -51,7 +52,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any
 
-from core.json import loads, save_json
+from core.json import load_json, save_json
 from core.logging import get_logger
 
 from .metadata import RUN_METADATA_FILE, load_run_metadata
@@ -63,9 +64,17 @@ PROVENANCE_REFS_FIELD = "provenance_refs"
 
 # Files we stamp, relative to the run dir. Tested via load_findings_from_dir's
 # shape detection (top-level list OR {"findings": [...]} wrapper).
+# ``openant_findings.json``: standalone /openant runs write their
+# translated findings there with no top-level findings.json — without
+# the stamp there is no canonical provenance ref for the run, so a
+# forged local-looking ref in an imported archive would be the
+# record's only back-link. Import's ref-namespacing rewrite CONSUMES
+# THIS CONSTANT (core/project/export.py) — the two ends move together
+# by construction.
 _STAMP_PATHS: tuple = (
     "findings.json",
     "sca/findings.json",
+    "openant_findings.json",
 )
 
 
@@ -80,8 +89,15 @@ def build_provenance_ref(run_dir: Path) -> dict[str, Any] | None:
     manifest = load_run_metadata(run_dir)
     if not manifest:
         return None
+    from core.coverage.journal import resolved_run_id
+
     ref = {
-        "run_id": run_dir.name,
+        # Resolved basename, never the raw spelling: a relative
+        # run_dir ("." from inside the run dir) has name == "" — the
+        # ref would fail is_canonical_ref_shape's non-empty run_id
+        # check and the run's findings would carry no back-link (see
+        # resolved_run_id).
+        "run_id": resolved_run_id(run_dir),
         "manifest_path": str(_relative_manifest_path(run_dir)),
     }
     # Manifest top-level uses ``timestamp`` (per core/run/metadata.py
@@ -132,16 +148,24 @@ def stamp_findings_in_run(run_dir: Path) -> dict[str, int]:
 
 def _stamp_file(path: Path, ref: dict[str, Any]) -> int:
     """Stamp findings in one file. Returns count of findings newly stamped,
-    or -1 on parse failure (file skipped, not modified)."""
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except OSError as e:
-        logger.warning("stamp_findings: read failed %s: %s", path, e)
-        return -1
-    try:
-        data = loads(raw)
-    except ValueError as e:
-        logger.warning("stamp_findings: parse failed %s: %s", path, e)
+    or -1 on parse/budget failure (file skipped, not modified)."""
+    # Byte-budgeted load: this runs inside complete_run (the host-side
+    # lifecycle), and findings.json is written into the sandbox-
+    # writable run dir — the uncapped read_text + full rewrite of an
+    # oversize plant put the OOM inside the finaliser itself (and
+    # stamp_findings' caller swallows exceptions, so OOM-kill was the
+    # failure mode). load_json's gated read checks the budget on the
+    # open fd (no stat-then-read grow window); skip-with-warning is
+    # the same contract as the report/merge readers and export's
+    # import-side rewriter.
+    from core.project.findings_utils import MAX_FINDINGS_JSON_BYTES
+    data = load_json(path, max_bytes=MAX_FINDINGS_JSON_BYTES)
+    if data is None:
+        logger.warning(
+            "stamp_findings: skipping %s (unreadable, malformed, or "
+            "over the %d-byte findings gate)",
+            path, MAX_FINDINGS_JSON_BYTES,
+        )
         return -1
 
     findings_list, _container_kind = _resolve_findings_list(data)

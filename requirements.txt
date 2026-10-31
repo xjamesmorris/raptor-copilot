@@ -11,7 +11,7 @@ requests==2.34.2
 # and to avoid the no_proxy bypass that stdlib urllib.request.ProxyHandler
 # silently performs. Already a transitive dep of `requests` but pinned
 # here too because we depend on it directly.
-urllib3==2.7.0
+urllib3==2.8.0
 pydantic==2.13.4
 typer==0.25.1
 
@@ -143,7 +143,5 @@ pyelftools==0.33
 # sage-agent-sdk==11.17.11
 # httpx==0.28.1
 
-# SCA hard deps (defusedxml, packaging, pyyaml) are pinned above. The
-# only remaining optional one:
-#   - tomli      : TOML reader on Python <3.11 (stdlib `tomllib` from 3.11+)
-# tomli==2.4.1; python_version<"3.11"
+# SCA hard deps (defusedxml, packaging, pyyaml) are pinned above; TOML
+# parsing rides the stdlib `tomllib` (the Python floor is 3.12).

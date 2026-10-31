@@ -247,3 +247,20 @@ def test_virtual_and_local_sources_still_skipped(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     assert parse(p) == []
+
+
+def test_non_canonical_name_is_pep503_normalised(tmp_path):
+    """A non-canonical spelling in uv.lock must fold to the PEP 503
+    form every other PyPI parser emits, or the lockfile row never
+    joins with its manifest-side sibling."""
+    p = _write(tmp_path, """\
+version = 1
+
+[[package]]
+name = "Foo_Bar.baz"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+""")
+    [dep] = parse(p)
+    assert dep.name == "foo-bar-baz"
+    assert dep.purl == "pkg:pypi/foo-bar-baz@1.0.0"

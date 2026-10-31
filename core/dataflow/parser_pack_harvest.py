@@ -47,9 +47,11 @@ import argparse
 import re
 import subprocess
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from core.atomic_fs.fs_lock import artifact_lock
 from core.git.clone import (
     get_safe_git_env,
     safe_git_command,
@@ -79,7 +81,10 @@ _DIFF_FILE_RE = re.compile(r"^diff --git a/(\S+) b/(\S+)")
 # Unified hunk header; group(1) is git's enclosing-context line.
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@ ?(.*)$")
 # Last `name(` in the context line = the enclosing function.
-_CONTEXT_FUNC_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+# \b pin: unanchored, every position inside a long identifier run
+# starts a fresh scan of the hunk-context tail — quadratic; a
+# mid-word start is never a real function name.
+_CONTEXT_FUNC_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 
 _C_FAMILY_EXTS = (".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh")
@@ -385,6 +390,29 @@ def merge_results(pack: dict, results: list[HarvestResult]) -> dict:
     return merged
 
 
+
+@contextmanager
+def pack_write_lock(path: Path):
+    """Exclusive cross-process lock over the pack's read-merge-write
+    cycle.
+
+    write_pack's atomic rename protects against TORN files, not lost
+    updates: two harvests interleaving load -> merge -> write each
+    rename a complete pack, and the second rename silently discards
+    everything only the first one read and merged (the additive-only
+    merge protects only what the writer itself loaded). flock on a
+    sidecar keeps the whole cycle single-writer; the lock file stays
+    behind (unlinking a locked lock file races a third writer).
+    """
+    # The hoisted sidecar idiom (core.atomic_fs.fs_lock): hardened
+    # open, foreign-uid refusal, bounded announce-once wait. Every
+    # lock-unavailable shape degrades LOUDLY to the unlocked path —
+    # the harvest keeps writing (merge-in-place is additive-only), it
+    # just loses the single-writer guarantee for that one cycle.
+    with artifact_lock(Path(path), subject="parser pack"):
+        yield
+
+
 def dumps_pack(pack: dict) -> str:
     return dumps_artifact(pack, indent=1, sort_keys=True) + "\n"
 
@@ -492,25 +520,26 @@ def main(argv: list[str] | None = None) -> int:
         for err in result.errors[:5]:
             print(f"    ! {err}", file=sys.stderr)
 
-    pack = load_pack(args.pack)
-    before = {e["name"] for e in pack["entries"]}
-    merged = merge_results(pack, results)
-    after = {e["name"] for e in merged["entries"]}
-    corroborated = sum(
-        1 for e in merged["entries"]
-        if PROVENANCE_CVE_FIX in e["provenance"]
-        and e["name"] in before
-    )
-    print(
-        f"pack: {len(before)} -> {len(after)} entries "
-        f"(+{len(after - before)} new, {corroborated} with CVE provenance "
-        f"among pre-existing)", file=sys.stderr,
-    )
+    with pack_write_lock(args.pack):
+        pack = load_pack(args.pack)
+        before = {e["name"] for e in pack["entries"]}
+        merged = merge_results(pack, results)
+        after = {e["name"] for e in merged["entries"]}
+        corroborated = sum(
+            1 for e in merged["entries"]
+            if PROVENANCE_CVE_FIX in e["provenance"]
+            and e["name"] in before
+        )
+        print(
+            f"pack: {len(before)} -> {len(after)} entries "
+            f"(+{len(after - before)} new, {corroborated} with CVE provenance "
+            f"among pre-existing)", file=sys.stderr,
+        )
 
-    if args.dry_run:
-        print(dumps_pack(merged), end="")
-        return 0
-    write_pack(merged, args.pack)
+        if args.dry_run:
+            print(dumps_pack(merged), end="")
+            return 0
+        write_pack(merged, args.pack)
     print(f"wrote {args.pack}", file=sys.stderr)
     return 0
 

@@ -10,8 +10,12 @@ Instead, each build-system entry in
 `core/build/build_detector.BUILD_SYSTEMS` declares an
 `env_detect: List[str]` naming the vars it needs. At build time, this
 module resolves each name by filesystem probing — never by reading
-`os.environ` (which would re-admit the operator's shell quirks we're
-trying to keep out of the sandbox).
+the requested variable from `os.environ` (which would re-admit the
+operator's shell quirks we're trying to keep out of the sandbox).
+Two scoped `$HOME` consultations are the documented exceptions, both
+away from the hostile direction: JAVA_HOME REFUSES a resolution that
+is the user's home dir, and RUSTUP_HOME falls back to `$HOME/.rustup`
+only after the kernel-ratified `pwd` lookup fails.
 
 Detection strategy per var:
 
@@ -94,10 +98,12 @@ def detect_JAVA_HOME() -> str | None:
         macos_helper = "/usr/libexec/java_home"
         if os.path.isfile(macos_helper) and os.access(macos_helper, os.X_OK):
             try:
-                import subprocess
-                r = subprocess.run(
+                # Trusted-probe doctrine (see build_detector._PROBE_CWD):
+                # safe env + neutral cwd, never the caller's.
+                from core.sandbox import run_trusted
+                r = run_trusted(
                     [macos_helper], capture_output=True, text=True, timeout=5,
-                    check=False,
+                    cwd=os.sep,
                 )
                 if r.returncode == 0 and r.stdout.strip():
                     candidate = r.stdout.strip()
@@ -180,11 +186,12 @@ def detect_RUSTUP_HOME() -> str | None:
     rustup_bin = shutil.which("rustup")
     if rustup_bin:
         try:
-            import subprocess
-            r = subprocess.run(
+            # Trusted-probe doctrine: safe env + neutral cwd.
+            from core.sandbox import run_trusted
+            r = run_trusted(
                 [rustup_bin, "show", "home"],
                 capture_output=True, text=True, timeout=5,
-                check=False,
+                cwd=os.sep,
             )
             if r.returncode == 0 and r.stdout.strip():
                 candidate = r.stdout.strip()
@@ -286,7 +293,13 @@ def apply_toolchain_env(env: dict[str, str],
             value = None
         if value is None:
             logger.warning(
-                "build toolchain: %s not found on this host — the build step will likely fail with a missing-toolchain error. Install the toolchain or set %s explicitly via --build-env-file (future flag) / via your shell and the sandbox's env= kwarg.", name, name
+                "build toolchain: %s not found on this host — the "
+                "build step will likely fail with a "
+                "missing-toolchain error. Install the toolchain, or "
+                "supply your own build via `/project set "
+                "build-command` (callers with a trusted env can also "
+                "pass %s through the sandbox's env= kwarg).",
+                name, name,
             )
             continue
         env[name] = value
@@ -305,13 +318,18 @@ def has_libasan() -> bool:
     if shutil.which("gcc") is None:
         return False
     try:
-        result = subprocess.run(
+        # Trusted-probe doctrine: safe env + neutral cwd (a probe run
+        # with the caller's cwd inside a scanned repo picks up repo
+        # config; with its env, loader-injection vars).
+        from core.sandbox import run_trusted
+        result = run_trusted(
             ["gcc", "-fsanitize=address", "-x", "c", "-",
              "-o", "/dev/null"],
             input="int main(void){return 0;}",
             text=True,
             capture_output=True,
             timeout=10,
+            cwd=os.sep,
         )
         return result.returncode == 0
     except Exception:  # noqa: BLE001

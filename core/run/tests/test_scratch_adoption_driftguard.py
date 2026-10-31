@@ -9,8 +9,8 @@ Consumers converted by the substrate's own wave (git_oracle,
 dark_verify) are covered by their suites; this file pins the adoption
 sweep on top: coccinelle's two TMPDIR clones, the compiler_sweep /
 preprocessor_view / compiler_scan trio, iris' CodeQL runner,
-barrier_synth's --work-dir fallback, recon's clone scratch, and
-cc_adapter's process-lifetime neutral cwd.
+barrier_synth's --work-dir fallback, and cc_adapter's
+process-lifetime neutral cwd.
 """
 
 from __future__ import annotations
@@ -29,7 +29,6 @@ _SCRATCH_ADOPTERS = [
     "packages/static-analysis/compiler_scan.py",
     "core/iris/codeql_runner.py",
     "core/dataflow/barrier_synth.py",
-    "packages/recon/agent.py",
     "core/llm/cc_adapter.py",
     "core/inventory/perlasm.py",
     "packages/binary_analysis/radare2_understand.py",

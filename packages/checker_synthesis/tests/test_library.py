@@ -25,6 +25,7 @@ from packages.checker_synthesis.library import (  # noqa: E402  (import after sy
     RuleLibrary,
     _body_hash,
     _compute_rates,
+    rule_join_key,
 )
 from packages.checker_synthesis.models import (  # noqa: E402  (import after sys.path setup)
     CheckerSynthesisResult,
@@ -95,34 +96,52 @@ class TestComputeRates:
             MatchTriage(match=Match(file="a.py", line=1), status="variant", reasoning=""),
             MatchTriage(match=Match(file="b.py", line=2), status="variant", reasoning=""),
         ]
-        tp, fp, count = _compute_rates(triage)
+        tp, fp, count, classified = _compute_rates(triage)
         assert tp == 1.0
         assert fp == 0.0
         assert count == 2
+        assert classified == 2
 
     def test_mixed(self):
         triage = [
             MatchTriage(match=Match(file="a.py", line=1), status="variant", reasoning=""),
             MatchTriage(match=Match(file="b.py", line=2), status="false_positive", reasoning=""),
         ]
-        tp, fp, count = _compute_rates(triage)
+        tp, fp, count, classified = _compute_rates(triage)
         assert tp == 0.5
         assert fp == 0.5
         assert count == 1
+        assert classified == 2
 
     def test_uncertain_excluded(self):
         triage = [
             MatchTriage(match=Match(file="a.py", line=1), status="variant", reasoning=""),
             MatchTriage(match=Match(file="b.py", line=2), status="uncertain", reasoning=""),
         ]
-        tp, _fp, count = _compute_rates(triage)
+        tp, _fp, count, classified = _compute_rates(triage)
         assert tp == 1.0
         assert count == 1
+        assert classified == 1
 
     def test_empty(self):
-        tp, _fp, count = _compute_rates([])
+        tp, _fp, count, classified = _compute_rates([])
         assert tp == 0.0
         assert count == 0
+        assert classified == 0
+
+    def test_all_uncertain_classifies_nothing(self):
+        # LLM transport failure stamps every match uncertain: no rate
+        # exists — classified 0 is the signal callers gate on.
+        triage = [
+            MatchTriage(match=Match(file="a.py", line=1),
+                        status="uncertain", reasoning=""),
+            MatchTriage(match=Match(file="b.py", line=2),
+                        status="skipped", reasoning=""),
+        ]
+        tp, _fp, count, classified = _compute_rates(triage)
+        assert tp == 0.0
+        assert count == 0
+        assert classified == 0
 
 
 class TestRuleLibraryPromote:
@@ -253,16 +272,111 @@ class TestRuleLibraryFind:
 
         assert lib.find_replayable("CWE-89", "semgrep") == []
 
+    def test_find_replayable_requires_library_tier(self, tmp_path):
+        # dual passed but fix-mutant failed: an add_rule sweep_once
+        # entry that later accrues a rated target must stay
+        # replay-ineligible — replay treats the rule as proven, and it
+        # never proved it distinguishes fixed from unfixed code (same
+        # doctrine as graduate()).
+        lib = RuleLibrary(tmp_path / "lib")
+        lib.add_rule(
+            "r1", "semgrep", "rules:\n  - id: r1\n", cwe="CWE-89",
+            dual_control=True,
+        )
+        matches = [Match(file="a.py", line=1)]
+        triage = [MatchTriage(match=matches[0], status="variant",
+                              reasoning="")]
+        entry = lib.update("r1", "t1", matches, triage)
+        assert entry is not None
+        assert entry.tp_rate == 1.0
+        assert lib.find_replayable("CWE-89", "semgrep") == []
+
     def test_find_replayable_with_high_tp(self, tmp_path):
+        # Replay authority is earned across distinct targets, not on
+        # the minting target alone — accrue evidence on two more.
         lib = RuleLibrary(tmp_path / "lib")
         result = _result(triage_status="variant")
         rule_file = tmp_path / "r1.yml"
         rule_file.write_text(result.rule.body)
         result.rule_path = rule_file
         lib.promote(result, target_hash="t1")
+        for t in ("t2", "t3"):
+            matches = [Match(file=f"{t}.py", line=1)]
+            triage = [MatchTriage(match=matches[0], status="variant",
+                                  reasoning="")]
+            lib.update("r1", t, matches, triage)
 
         found = lib.find_replayable("CWE-89", "semgrep")
         assert len(found) == 1
+
+    def test_find_replayable_refuses_below_target_floor(self, tmp_path):
+        # Two targets is one short of the floor: a perfect TP rate
+        # demonstrated on too few targets must not replay — the
+        # counterpart of the 3-target grant above, so the floor
+        # cannot silently drift back down.
+        lib = RuleLibrary(tmp_path / "lib")
+        result = _result(triage_status="variant")
+        rule_file = tmp_path / "r1.yml"
+        rule_file.write_text(result.rule.body)
+        result.rule_path = rule_file
+        lib.promote(result, target_hash="t1")
+        matches = [Match(file="t2.py", line=1)]
+        triage = [MatchTriage(match=matches[0], status="variant",
+                              reasoning="")]
+        lib.update("r1", "t2", matches, triage)
+
+        assert lib.find_replayable("CWE-89", "semgrep") == []
+
+    @staticmethod
+    def _manifest_lib(tmp_path: Path, target_hashes: list[str]) -> RuleLibrary:
+        # promote()/update() dedup targets by hash on append, so the
+        # duplicate-hash vector is a hand-edited manifest.json — write
+        # it directly.
+        lib_dir = tmp_path / "lib"
+        (lib_dir / "semgrep").mkdir(parents=True)
+        (lib_dir / "semgrep" / "r1.yml").write_text(
+            "rules: []\n", encoding="utf-8",
+        )
+        entry = {
+            "rule_id": "r1",
+            "engine": "semgrep",
+            "cwe": "CWE-89",
+            "body_hash": "hash-r1",
+            "rule_path": "semgrep/r1.yml",
+            "dual_control": True,
+            "promoted_at": "2026-01-01T00:00:00Z",
+            "tp_rate": 0.9,
+            "fp_rate": 0.1,
+            "total_variants": 3,
+            "rule_tier": "library",
+            "targets": [
+                {
+                    "target_hash": h,
+                    "ts": "2026-01-01T00:00:00Z",
+                    "matches": 2,
+                    "variants": 1,
+                    "tp_rate": 0.9,
+                }
+                for h in target_hashes
+            ],
+        }
+        (lib_dir / "manifest.json").write_text(
+            json.dumps({"rules": [entry]}), encoding="utf-8",
+        )
+        return RuleLibrary(lib_dir)
+
+    def test_find_replayable_counts_distinct_target_hashes(self, tmp_path):
+        # Three records sharing one hash are one target's evidence —
+        # they must not clear the three-target floor.
+        lib = self._manifest_lib(tmp_path, ["t1", "t1", "t1"])
+        assert lib.find_replayable("CWE-89", "semgrep") == []
+
+    def test_find_replayable_admits_three_distinct_hashes(self, tmp_path):
+        # Control for the duplicate-hash refusal: the same manifest
+        # shape with three distinct hashes replays.
+        lib = self._manifest_lib(tmp_path, ["t1", "t2", "t3"])
+        found = lib.find_replayable("CWE-89", "semgrep")
+        assert [e.rule_id for e in found] == ["r1"]
 
 
 class TestRuleLibraryUpdate:
@@ -282,9 +396,105 @@ class TestRuleLibraryUpdate:
         assert len(entry.targets) == 2
         assert entry.targets[1].target_hash == "t2"
 
+    def test_all_uncertain_update_records_no_rate(self, tmp_path):
+        # An outage-shaped triage (all uncertain, matches present)
+        # must persist tp_rate=None on the target record — pre-fix the
+        # truthy triage LIST minted tp_rate=0.0, matches-weighted hard
+        # negative evidence feeding the replay gate and retirement.
+        lib = RuleLibrary(tmp_path / "lib")
+        result = _result()
+        rule_file = tmp_path / "r1.yml"
+        rule_file.write_text(result.rule.body)
+        result.rule_path = rule_file
+        lib.promote(result, target_hash="t1")
+        entry0 = lib.find(cwe="CWE-89", engine="semgrep")[0]
+        agg_before = entry0.tp_rate
+
+        matches = [Match(file="new.py", line=5),
+                   Match(file="new2.py", line=6)]
+        triage = [
+            MatchTriage(match=m, status="uncertain", reasoning="outage")
+            for m in matches
+        ]
+        entry = lib.update("r1", "t2", matches, triage, timestamp="ts2")
+        assert entry is not None
+        rec = [t for t in entry.targets if t.target_hash == "t2"][0]
+        assert rec.tp_rate is None
+        # No-evidence must not drag the aggregate.
+        assert entry.tp_rate == agg_before
+
     def test_update_unknown_rule_returns_none(self, tmp_path):
         lib = RuleLibrary(tmp_path / "lib")
         assert lib.update("nonexistent", "t1", [], []) is None
+
+
+def _promote(lib, tmp_path, result):
+    rule_file = tmp_path / "r1.yml"
+    rule_file.write_text(result.rule.body)
+    result.rule_path = rule_file
+    return lib.promote(result, target_hash="t1")
+
+
+class TestOutageIsNotEvidence:
+    """An outage-shaped triage (matches present, nothing classified)
+    is NO evidence — it must not feed retirement or auto-archive."""
+
+    def test_all_uncertain_promote_cannot_retire(self, tmp_path):
+        # Promote during an LLM outage: 6 matches, every triage row
+        # uncertain. Pre-fix the entry aggregate seeded 0.0 and the
+        # unrated target's matches met min_evidence, so the very next
+        # retire_low_precision() archived a rule whose mechanical
+        # controls all passed.
+        lib = RuleLibrary(tmp_path / "lib")
+        entry = _promote(
+            lib, tmp_path, _result(matches=6, triage_status="uncertain"),
+        )
+        assert entry is not None
+        assert lib.retire_low_precision() == []
+        assert lib.find(cwe="CWE-89", engine="semgrep")[0].archived is False
+
+    def test_rated_low_precision_still_retires(self, tmp_path):
+        # Two-direction: genuine verdict-backed 0% precision with
+        # enough rated matches still retires.
+        lib = RuleLibrary(tmp_path / "lib")
+        entry = _promote(
+            lib, tmp_path,
+            _result(matches=6, triage_status="false_positive"),
+        )
+        assert entry is not None
+        assert lib.retire_low_precision() == ["r1"]
+        assert lib.all_entries()[0].archived is True
+
+    def test_outage_targets_do_not_advance_auto_archive(self, tmp_path):
+        # A rule promoted during an outage plus two more outage-time
+        # replays: three targets, none carrying verdict evidence.
+        # Pre-fix they counted toward the archive floor and the rule
+        # was archived as "0 variants across 3 targets".
+        lib = RuleLibrary(tmp_path / "lib")
+        _promote(
+            lib, tmp_path, _result(matches=6, triage_status="uncertain"),
+        )
+        for th in ("t2", "t3"):
+            matches = [Match(file=f"{th}.py", line=1)]
+            triage = [MatchTriage(match=matches[0], status="uncertain",
+                                  reasoning="outage")]
+            entry = lib.update("r1", th, matches, triage)
+        assert entry is not None
+        assert entry.archived is False
+
+    def test_zero_match_targets_still_auto_archive(self, tmp_path):
+        # Two-direction: zero-match targets are deliberate negative
+        # evidence (the rule found nothing) and still advance the
+        # archive floor for a rule with no variants anywhere.
+        lib = RuleLibrary(tmp_path / "lib")
+        _promote(
+            lib, tmp_path,
+            _result(matches=3, triage_status="false_positive"),
+        )
+        for th in ("t2", "t3"):
+            entry = lib.update("r1", th, [], [])
+        assert entry is not None
+        assert entry.archived is True
 
     def test_update_does_not_duplicate_target(self, tmp_path):
         lib = RuleLibrary(tmp_path / "lib")
@@ -300,6 +510,111 @@ class TestRuleLibraryUpdate:
 
         entry = lib.get_by_body_hash(_body_hash(result.rule.body))
         assert len(entry.targets) == 1
+
+
+def _mixed_result(*, matches: int, classified_statuses: list[str]):
+    """A result whose first len(classified_statuses) matches carry
+    those verdicts and the rest are uncertain."""
+    result = _result(matches=matches)
+    result.triage = [
+        MatchTriage(
+            match=m,
+            status=(classified_statuses[i]
+                    if i < len(classified_statuses) else "uncertain"),
+            reasoning="test",
+        )
+        for i, m in enumerate(result.matches)
+    ]
+    return result
+
+
+class TestPartialOutageIsOneVerdict:
+    """A partially-classified triage carries exactly its verdict
+    count as evidence — one false_positive + five uncertain over six
+    matches is ONE sample, not six."""
+
+    def test_single_verdict_over_six_matches_cannot_retire(self, tmp_path):
+        # Pre-fix: tp_rate=0.0 (rated) let ALL 6 matches feed
+        # min_evidence and the rule retired off a single verdict.
+        lib = RuleLibrary(tmp_path / "lib")
+        entry = _promote(
+            lib, tmp_path,
+            _mixed_result(matches=6, classified_statuses=["false_positive"]),
+        )
+        assert entry is not None
+        assert lib.retire_low_precision() == []
+        assert lib.all_entries()[0].archived is False
+
+    def test_enough_real_verdicts_still_retire(self, tmp_path):
+        # Two-direction: verdict-backed 0% precision across targets
+        # whose CLASSIFIED counts reach the floor still retires,
+        # even when each triage also carried uncertain rows.
+        lib = RuleLibrary(tmp_path / "lib")
+        _promote(
+            lib, tmp_path,
+            _mixed_result(matches=4, classified_statuses=["false_positive"] * 3),
+        )
+        matches = [Match(file=f"m{i}.py", line=i) for i in range(4)]
+        triage = [
+            MatchTriage(match=m, status="false_positive", reasoning="t")
+            for m in matches[:3]
+        ] + [MatchTriage(match=matches[3], status="uncertain", reasoning="t")]
+        lib.update("r1", "t2", matches, triage)
+        assert lib.retire_low_precision() == ["r1"]
+
+    def test_aggregate_weighs_verdicts_not_matches(self, tmp_path):
+        # Target A: 5 matches, all classified variant (tp 100%).
+        # Target B: 20 matches, ONE false_positive verdict.
+        # Verdict-weighted aggregate is 5/6 — pre-fix the match-
+        # weighted blend read 5/25 and genuine precision drowned
+        # under one partial triage's match volume.
+        lib = RuleLibrary(tmp_path / "lib")
+        _promote(
+            lib, tmp_path,
+            _mixed_result(matches=5, classified_statuses=["variant"] * 5),
+        )
+        matches = [Match(file=f"m{i}.py", line=i) for i in range(20)]
+        triage = [
+            MatchTriage(match=matches[0], status="false_positive",
+                        reasoning="t"),
+        ] + [
+            MatchTriage(match=m, status="uncertain", reasoning="t")
+            for m in matches[1:]
+        ]
+        entry = lib.update("r1", "t2", matches, triage)
+        assert entry is not None
+        assert entry.tp_rate == pytest.approx(5 / 6)
+        assert lib.retire_low_precision() == []
+
+    def test_target_record_classified_persisted(self, tmp_path):
+        lib = RuleLibrary(tmp_path / "lib")
+        entry = _promote(
+            lib, tmp_path,
+            _mixed_result(matches=6, classified_statuses=["false_positive"]),
+        )
+        assert entry is not None
+        assert entry.targets[0].matches == 6
+        assert entry.targets[0].classified == 1
+        # Round-trips through the manifest.
+        reloaded = RuleLibrary(tmp_path / "lib").all_entries()[0]
+        assert reloaded.targets[0].classified == 1
+
+    def test_legacy_rated_record_defaults_classified_to_matches(self):
+        from packages.checker_synthesis.library import TargetRecord
+        t = TargetRecord.from_dict({
+            "target_hash": "t1", "ts": "", "matches": 6,
+            "variants": 2, "tp_rate": 0.33,
+        })
+        # Pre-field evidence weight preserved for legacy manifests.
+        assert t.classified == 6
+
+    def test_legacy_unrated_record_defaults_classified_to_zero(self):
+        from packages.checker_synthesis.library import TargetRecord
+        t = TargetRecord.from_dict({
+            "target_hash": "t1", "ts": "", "matches": 6,
+            "variants": 0, "tp_rate": None,
+        })
+        assert t.classified == 0
 
 
 class TestAutoArchive:
@@ -568,6 +883,13 @@ class TestCweFamilyLookup:
         rule_file.write_text(result.rule.body)
         result.rule_path = rule_file
         lib.promote(result, target_hash="t1")
+        # Clear the replay floor so the sibling-CWE lookup is what
+        # the assertion measures, not the target-diversity gate.
+        for t in ("t2", "t3"):
+            matches = [Match(file=f"{t}.py", line=1)]
+            triage = [MatchTriage(match=matches[0], status="variant",
+                                  reasoning="")]
+            lib.update("r1", t, matches, triage)
 
         found = lib.find_replayable("CWE-89", "semgrep")
         assert len(found) == 1
@@ -992,3 +1314,176 @@ class TestRecordMatchFeedback:
         lib.update("r1", "t3", replay_matches, replay_triage)
         entry = lib.all_entries()[0]
         assert entry.tp_rate == pytest.approx(4 / 5)
+
+
+class TestNonUniqueRuleIdJoin:
+    """Mutation APIs must never resolve a shared rule_id
+    first-entry-wins: replay verdicts, sweep coverage and precision
+    feedback recorded onto a DIFFERENT rule body drive that rule
+    toward retirement/graduation off evidence about another rule.
+    Entries are produced through the real producer (promote), which
+    documents that two bodies can legitimately share a rule id.
+    """
+
+    @staticmethod
+    def _colliding_library(tmp_path):
+        lib = RuleLibrary(tmp_path / "lib")
+        lib.promote(_result(matches=3), target_hash="t1")
+        res_b = _result(matches=3)
+        res_b.rule = SynthesisedRule(
+            engine="semgrep",
+            rule_id="r1",  # same id...
+            body="rules:\n  - id: r1\n    pattern: $DB.exec_two($Q)\n",
+            rationale="re-synthesised body for the same seed",
+        )
+        lib.promote(res_b, target_hash="t2")
+        entries = lib.all_entries()
+        assert [e.rule_id for e in entries] == ["r1", "r1"]
+        assert entries[0].body_hash != entries[1].body_hash
+        return lib
+
+    def test_update_by_join_key_hits_only_that_entry(self, tmp_path):
+        lib = self._colliding_library(tmp_path)
+        first, second = lib.all_entries()
+        first_targets = {t.target_hash for t in first.targets}
+
+        updated = lib.update(
+            rule_join_key(second), "t9",
+            [Match(file="v.py", line=1)],
+            [MatchTriage(match=Match(file="v.py", line=1),
+                         status="false_positive", reasoning="t")],
+        )
+        assert updated is not None
+        assert updated.body_hash == second.body_hash
+
+        reloaded_first, reloaded_second = RuleLibrary(
+            tmp_path / "lib").all_entries()
+        # The first entry's precision and targets are untouched.
+        assert {t.target_hash for t in reloaded_first.targets} == first_targets
+        assert reloaded_first.tp_rate == first.tp_rate
+        assert "t9" in {t.target_hash for t in reloaded_second.targets}
+
+    def test_update_by_shared_rule_id_refused(self, tmp_path):
+        lib = self._colliding_library(tmp_path)
+        before = [(e.body_hash, e.tp_rate, len(e.targets))
+                  for e in lib.all_entries()]
+        assert lib.update("r1", "t9", [Match(file="v.py", line=1)], []) is None
+        after = [(e.body_hash, e.tp_rate, len(e.targets))
+                 for e in RuleLibrary(tmp_path / "lib").all_entries()]
+        assert after == before
+
+    def test_record_match_shared_rule_id_refused(self, tmp_path):
+        lib = self._colliding_library(tmp_path)
+        before = [(e.tp_rate, e.feedback_classified)
+                  for e in lib.all_entries()]
+        lib.record_match("r1", is_tp=False)
+        after = [(e.tp_rate, e.feedback_classified)
+                 for e in RuleLibrary(tmp_path / "lib").all_entries()]
+        assert after == before
+
+    def test_record_match_joins_graduated_stem(self, tmp_path):
+        # Graduated findings carry the sanitised FILE STEM, not the
+        # raw rule id — feedback must still land on the entry.
+        from packages.checker_synthesis.library import graduated_stem
+
+        lib = RuleLibrary(tmp_path / "lib")
+        lib.add_rule("weird id/with sep", "semgrep", "rules: BODY-A\n")
+        stem = graduated_stem("weird id/with sep")
+        assert stem != "weird id/with sep"
+        lib.record_match(stem, is_tp=True)
+        entry = lib.all_entries()[0]
+        assert entry.feedback_classified == 1
+
+
+class TestTotalsFollowTargetDedup:
+    """total_matches / total_variants must follow the TargetRecord
+    dedup: a re-sweep of an already-recorded target must not inflate
+    the totals the per-target records refuse to double-count."""
+
+    def _lib_with_rule(self, tmp_path):
+        lib = RuleLibrary(tmp_path / "lib")
+        lib.add_rule(
+            "r1", "semgrep", "rules:\n  - id: r1\n", cwe="CWE-89",
+            dual_control=True,
+        )
+        return lib
+
+    def test_same_target_resweep_does_not_inflate_totals(self, tmp_path):
+        lib = self._lib_with_rule(tmp_path)
+        matches = [Match(file="a.py", line=1)]
+        triage = [MatchTriage(match=matches[0], status="variant",
+                              reasoning="")]
+        lib.update("r1", "t1", matches, triage)
+        entry = lib.update("r1", "t1", matches, triage)
+        assert entry is not None
+        assert len(entry.targets) == 1
+        assert entry.total_matches == 1
+        assert entry.total_variants == 1
+
+    def test_new_target_still_counts(self, tmp_path):
+        lib = self._lib_with_rule(tmp_path)
+        matches = [Match(file="a.py", line=1)]
+        triage = [MatchTriage(match=matches[0], status="variant",
+                              reasoning="")]
+        lib.update("r1", "t1", matches, triage)
+        entry = lib.update("r1", "t2", matches, triage)
+        assert entry.total_matches == 2
+        assert len(entry.targets) == 2
+
+
+class TestPrecisionDenominatorsAgree:
+    def test_summary_and_stats_share_the_rated_denominator(self, tmp_path):
+        lib = RuleLibrary(tmp_path / "lib")
+        # One rated rule at 100%, one unrated (never replayed).
+        lib.add_rule("rated", "semgrep", "rules:\n  - id: rated\n",
+                     cwe="CWE-89", dual_control=True)
+        lib.add_rule("unrated", "semgrep", "rules:\n  - id: unrated\n",
+                     cwe="CWE-79", dual_control=True)
+        m = [Match(file="a.py", line=1)]
+        lib.update("rated", "t1", m,
+                   [MatchTriage(match=m[0], status="variant",
+                                reasoning="")])
+        s = lib.stats()
+        assert s["rated_rules"] == 1
+        assert s["avg_tp_rate"] == 1.0          # rated-only average
+        assert "avg precision 100%" in lib.summary()
+
+
+class TestSummaryWithoutReplayData:
+    def test_unrated_library_reports_no_replay_data(self, tmp_path):
+        # No rule has been replayed yet — "avg precision 0%" would
+        # read as a precision collapse when there is simply no data.
+        lib = RuleLibrary(tmp_path / "lib")
+        lib.add_rule("unrated", "semgrep", "rules:\n  - id: unrated\n",
+                     cwe="CWE-79", dual_control=True)
+        s = lib.summary()
+        assert "1 active" in s
+        assert "no replay data yet" in s
+        assert "avg precision" not in s
+
+    def test_rated_library_keeps_the_precision_figure(self, tmp_path):
+        lib = RuleLibrary(tmp_path / "lib")
+        lib.add_rule("rated", "semgrep", "rules:\n  - id: rated\n",
+                     cwe="CWE-89", dual_control=True)
+        m = [Match(file="a.py", line=1)]
+        lib.update("rated", "t1", m,
+                   [MatchTriage(match=m[0], status="variant",
+                                reasoning="")])
+        s = lib.summary()
+        assert "avg precision 100%" in s
+        assert "no replay data yet" not in s
+
+
+class TestDefaultLibraryDirAnchor:
+    def test_default_dir_anchors_at_raptor_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("RAPTOR_DIR", str(tmp_path))
+        lib = RuleLibrary()
+        assert lib.library_dir == tmp_path / "out" / "rule-library"
+
+    def test_default_dir_falls_back_to_cwd_without_raptor_dir(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.delenv("RAPTOR_DIR", raising=False)
+        monkeypatch.chdir(tmp_path)
+        lib = RuleLibrary()
+        assert lib.library_dir == tmp_path / "out" / "rule-library"

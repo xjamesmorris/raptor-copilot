@@ -26,6 +26,7 @@ so the tests stay hermetic and don't race a developer's own build.
 
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 import subprocess
@@ -343,7 +344,23 @@ class TestCoordLauncherContract:
         interp = tmp_path / "shared-group-interpreter"
         interp.write_text("#!/bin/false\n")
         interp.chmod(0o664)
-        os.chown(interp, -1, shared)
+        try:
+            os.chown(interp, -1, shared)
+        except OSError as e:
+            # A single-mapping user namespace (unshare -Ur test
+            # containment) retains supplementary gids in getgroups()
+            # but leaves them unmapped, so chown to one is EINVAL
+            # (EPERM on kernels that map it to overflowgid): the
+            # shared-group posture cannot be CONSTRUCTED there. Skip
+            # rather than fail -- on hosts with a real mapping the
+            # chown succeeds and the refusal is still asserted below.
+            if e.errno in (errno.EINVAL, errno.EPERM):
+                pytest.skip(
+                    "supplementary group not mapped in this user "
+                    "namespace -- cannot construct the shared-group "
+                    "posture"
+                )
+            raise
         coord = built.parent / "netns_coordinator.py"
         r = _run([
             str(built / "raptor-coord-launcher"),
@@ -531,6 +548,16 @@ class TestGidmapAllowContract:
         # pid 1 lives in the init user namespace (owned by root): the
         # ownership check refuses it either at open() or at the owner
         # comparison, even with otherwise-valid mapping arguments.
+        from core.sandbox.tests.capability import (
+            pid1_userns_owner_is_invoker,
+        )
+        if pid1_userns_owner_is_invoker():
+            pytest.skip(
+                "pid 1's user namespace is owned by the invoker "
+                "(nested user namespace — pid 1 is our own init, not "
+                "the root-owned system init): the foreign-namespace "
+                "refusal posture cannot be constructed here"
+            )
         r = _run([
             str(built / "raptor-gidmap-allow"),
             "1", "0", str(os.getgid()), "1",

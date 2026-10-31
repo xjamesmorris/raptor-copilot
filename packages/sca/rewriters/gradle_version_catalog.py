@@ -65,13 +65,24 @@ def _version_key_pattern(key: str) -> re.Pattern:
     """
     k = re.escape(key)
     return re.compile(
+        # Leading indent in every anchored line (header, lookahead,
+        # key line) is HORIZONTAL-only ([^\S\n]): under MULTILINE
+        # the ``^\s*`` spelling re-scans a run of blank lines from
+        # every line start inside it — quadratic on a hostile
+        # catalog file. The header TAIL is horizontal too: a
+        # ``\s*$`` tail swallows a blank run placed directly after
+        # the header, and when the mandatory key line then fails
+        # (missing key), backtracking re-runs the lazy ``inter``
+        # scan from every ``$`` stop inside the run — the same
+        # quadratic through the back door. TOML headers never span
+        # lines. Same spellings in all five builders below.
         # ``[versions]`` header (anchor)
-        r"(?P<hdr>^\s*\[versions\]\s*$)"
+        r"(?P<hdr>^[^\S\n]*\[versions\][^\S\n]*$)"
         # everything up to the key line (non-greedy, no other
         # section headers in between)
-        r"(?P<inter>(?:(?!^\s*\[)[\s\S])*?)"
+        r"(?P<inter>(?:(?!^[^\S\n]*\[)[\s\S])*?)"
         # the key line itself
-        rf"(?P<lead>^\s*{k}\s*=\s*['\"])"
+        rf"(?P<lead>^[^\S\n]*{k}\s*=\s*['\"])"
         r"(?P<version>[^'\"]*)"
         r"(?P<tail>['\"])",
         re.MULTILINE,
@@ -96,9 +107,9 @@ def _inline_library_version_pattern(alias: str) -> re.Pattern:
     # as TWO ``}}`` chars — never matched a single-``}`` inline
     # table close.
     return re.compile(
-        r"(?P<hdr>^\s*\[libraries\]\s*$)"
-        r"(?P<inter>(?:(?!^\s*\[)[\s\S])*?)"
-        rf"(?P<lead>^\s*{a}\s*=\s*\{{[^}}\n]*?version\s*=\s*['\"])"
+        r"(?P<hdr>^[^\S\n]*\[libraries\][^\S\n]*$)"
+        r"(?P<inter>(?:(?!^[^\S\n]*\[)[\s\S])*?)"
+        rf"(?P<lead>^[^\S\n]*{a}\s*=\s*\{{[^}}\n]*?version\s*=\s*['\"])"
         r"(?P<version>[^'\"]*)"
         r"(?P<tail>['\"][^}\n]*\})",
         re.MULTILINE,
@@ -111,9 +122,9 @@ def _inline_library_string_pattern(alias: str) -> re.Pattern:
     version segment."""
     a = re.escape(alias)
     return re.compile(
-        r"(?P<hdr>^\s*\[libraries\]\s*$)"
-        r"(?P<inter>(?:(?!^\s*\[)[\s\S])*?)"
-        rf"(?P<lead>^\s*{a}\s*=\s*['\"][^'\":]+:[^'\":]+:)"
+        r"(?P<hdr>^[^\S\n]*\[libraries\][^\S\n]*$)"
+        r"(?P<inter>(?:(?!^[^\S\n]*\[)[\s\S])*?)"
+        rf"(?P<lead>^[^\S\n]*{a}\s*=\s*['\"][^'\":]+:[^'\":]+:)"
         r"(?P<version>[^'\"]+)"
         r"(?P<tail>['\"])",
         re.MULTILINE,
@@ -126,9 +137,9 @@ def _inline_plugin_version_pattern(alias: str) -> re.Pattern:
     ``_inline_library_version_pattern``."""
     a = re.escape(alias)
     return re.compile(
-        r"(?P<hdr>^\s*\[plugins\]\s*$)"
-        r"(?P<inter>(?:(?!^\s*\[)[\s\S])*?)"
-        rf"(?P<lead>^\s*{a}\s*=\s*\{{[^}}\n]*?version\s*=\s*['\"])"
+        r"(?P<hdr>^[^\S\n]*\[plugins\][^\S\n]*$)"
+        r"(?P<inter>(?:(?!^[^\S\n]*\[)[\s\S])*?)"
+        rf"(?P<lead>^[^\S\n]*{a}\s*=\s*\{{[^}}\n]*?version\s*=\s*['\"])"
         r"(?P<version>[^'\"]*)"
         r"(?P<tail>['\"][^}\n]*\})",
         re.MULTILINE,
@@ -141,9 +152,9 @@ def _inline_plugin_string_pattern(alias: str) -> re.Pattern:
     version segment."""
     a = re.escape(alias)
     return re.compile(
-        r"(?P<hdr>^\s*\[plugins\]\s*$)"
-        r"(?P<inter>(?:(?!^\s*\[)[\s\S])*?)"
-        rf"(?P<lead>^\s*{a}\s*=\s*['\"][^'\":]+:)"
+        r"(?P<hdr>^[^\S\n]*\[plugins\][^\S\n]*$)"
+        r"(?P<inter>(?:(?!^[^\S\n]*\[)[\s\S])*?)"
+        rf"(?P<lead>^[^\S\n]*{a}\s*=\s*['\"][^'\":]+:)"
         r"(?P<version>[^'\"]+)"
         r"(?P<tail>['\"])",
         re.MULTILINE,
@@ -164,6 +175,31 @@ def rewrite_libs_versions_toml(
     return rewrite_file_with(path, edits, _apply_one)
 
 
+_TOML_MULTILINE_STRING_RE = re.compile(
+    r'("""|\'\'\')(?s:.*?)\1'
+)
+
+
+def _blank_toml_multiline_strings(text: str) -> str:
+    """TOML multiline-string spans replaced with same-length spaces
+    (newlines kept), so matches on the view splice 1:1 into the
+    original text.
+
+    The section patterns anchor key lines with MULTILINE ``^``, which
+    also matches inside a multiline string's CONTENT — a
+    ``key = "…"``-shaped line in a doc string under ``[versions]``
+    (the pyproject mis-splice mechanism, one file over) was spliced
+    as if it were the live key. Unterminated strings are malformed
+    TOML and left unblanked.
+    """
+    return _TOML_MULTILINE_STRING_RE.sub(
+        lambda m: "".join(
+            c if c == "\n" else " " for c in m.group(0)
+        ),
+        text,
+    )
+
+
 def _apply_one(text: str, edit: RewriteEdit) -> tuple[str, RewriteResult]:
     section, _, key = edit.locator.partition(":")
     if not key:
@@ -179,23 +215,43 @@ def _apply_one(text: str, edit: RewriteEdit) -> tuple[str, RewriteResult]:
         candidates = [_version_key_pattern]
     elif section == "library":
         candidates = [
-            _inline_library_version_pattern,
-            _inline_library_string_pattern,
+            _inline_library_version_pattern,  # type: ignore[list-item]
+            _inline_library_string_pattern,  # type: ignore[list-item]
         ]
     elif section == "plugin":
-        candidates = [_inline_plugin_version_pattern, _inline_plugin_string_pattern]
+        candidates = [_inline_plugin_version_pattern, _inline_plugin_string_pattern]  # type: ignore[list-item]
     else:
         return text, RewriteResult(
             edit=edit, applied=False,
             reason=f"unknown locator section {section!r}",
         )
 
+    # Match on the string-blanked view; splice into the original
+    # (offsets map 1:1 — see _blank_toml_multiline_strings).
+    view = _blank_toml_multiline_strings(text)
     for build_pat in candidates:
         pat = build_pat(key)
-        match = pat.search(text)
+        # Single-occurrence ``search`` by DESIGN: valid TOML forbids
+        # duplicate keys and duplicate table headers, so the first
+        # match is the only live declaration a catalog can carry.
+        # Invalid-but-matchable input (a duplicated ``[versions]``
+        # table) gets its FIRST occurrence edited and the rest left —
+        # a deliberate trade against guessing semantics for a file
+        # Gradle itself would refuse; the regex rewriter never
+        # validates TOML, so this is the recorded rationale rather
+        # than an all-occurrence sweep.
+        match = pat.search(view)
         if match is None:
             continue
         current = match.group("version")
+        if current == edit.new_value:
+            # Idempotent re-run: aligned with the shared driver's
+            # verdict ladder — every sibling reports ``no_change``
+            # here, and a ``value_mismatch`` made a successful prior
+            # apply look like a stale plan.
+            return text, RewriteResult(
+                edit=edit, applied=False, reason="no_change",
+            )
         if current != edit.old_value:
             return text, RewriteResult(
                 edit=edit, applied=False,

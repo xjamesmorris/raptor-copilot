@@ -5,7 +5,7 @@ tests run it as a subprocess with a python probe target and no
 sandbox-exec — exactly the mechanics test_seatbelt_shim.py uses. No
 macOS, no seatbelt profile, no fds required.
 
-Contract under test (mirrors raptor-pid1-shim):
+Contract under test:
   * default: everything in core.config's TARGET_ENV_STRIP_SET is
     stripped before the target execs;
   * `--keep-trust-markers` (argv, first token — only the spawn side can

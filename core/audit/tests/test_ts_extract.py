@@ -28,6 +28,51 @@ from core.audit.ts_extract import (  # noqa: E402
 from core.testing.treesitter import requires_ts  # noqa: E402
 
 
+def _nested_switch_tower(depth: int) -> str:
+    out = ["void f(int a) {\n"]
+    for d in range(depth):
+        out.append('switch (a) { case %d: g("K%d"); ' % (d, d))
+    out.append("h();")
+    for d in range(depth):
+        out.append(' case %d: g("L%d"); break; }' % (d + 1, d))
+    out.append("\n}\n")
+    return "".join(out)
+
+
+class TestDispatchDepthGrowth:
+    @requires_ts("c")
+    def test_extraction_stays_near_linear_in_nesting_depth(self):
+        # Growth-ratio pin, twin of the enum extractor's: the
+        # per-case ancestor re-attribution here measured the same
+        # cubic wall-clock on a switch-per-level tower (an
+        # unbudgeted prep phase pays it). Single-pass nearest-switch
+        # attribution is ~linear; cubic fails by an order even with
+        # the parse-noise slack.
+        import time
+
+        from core.audit.ts_extract import _PARSE_CACHE
+
+        def cost(depth: int) -> float:
+            # Best-of-3: even process_time takes one-off spikes on a
+            # contended host (scheduler migration, lazy init landing
+            # in one sample); the minimum is the honest cost of the
+            # algorithm. A cubic regression is ~8x on minima too, so
+            # the pin below still fails it by an order.
+            src = _nested_switch_tower(depth)
+            samples = []
+            for _ in range(3):
+                _PARSE_CACHE.clear()
+                t0 = time.process_time()
+                extract_dispatch_tables(f"d{depth}.c", src)
+                samples.append(time.process_time() - t0)
+            return min(samples)
+
+        cost(50)  # warm-up
+        small = max(cost(300), 0.005)
+        large = cost(600)
+        assert large <= 4 * small + 0.05, (small, large)
+
+
 # ---------------------------------------------------------------
 # 1. Return semantics
 # ---------------------------------------------------------------
@@ -700,3 +745,72 @@ class TestDeepNesting:
         lits = extract_string_literals("deep.c", src)
         assert lits is not None
         assert any(lit.value == "deep" for lit in lits)
+
+
+class TestParseCache:
+    """Each extract_* API used to re-parse the same source; the keyed
+    cache must make repeated extracts parse once, transparently."""
+
+    @requires_ts("go")
+    def test_repeated_extracts_parse_once(self, monkeypatch):
+        import core.audit.ts_extract as tse
+        tse._PARSE_CACHE.clear()
+        calls = {"n": 0}
+        real_get_parser = tse._get_parser
+
+        class CountingParser:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def parse(self, src):
+                calls["n"] += 1
+                return self._inner.parse(src)
+
+        def counting_get_parser(lang):
+            p = real_get_parser(lang)
+            return CountingParser(p) if p is not None else None
+
+        monkeypatch.setattr(tse, "_get_parser", counting_get_parser)
+        src = (
+            "func handle(p string) string {\n"
+            "\tx := decode(p)\n"
+            "\tx = check(x)\n"
+            "\treturn x\n"
+            "}\n"
+        )
+        try:
+            assert tse.extract_call_chains("a.go", src) is not None
+            assert tse.extract_function_returns("a.go", src) is not None
+            assert tse.extract_string_literals("a.go", src) is not None
+            assert calls["n"] == 1
+        finally:
+            tse._PARSE_CACHE.clear()
+
+    @requires_ts("go")
+    def test_changed_source_reparses(self, monkeypatch):
+        import core.audit.ts_extract as tse
+        tse._PARSE_CACHE.clear()
+        calls = {"n": 0}
+        real_get_parser = tse._get_parser
+
+        class CountingParser:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def parse(self, src):
+                calls["n"] += 1
+                return self._inner.parse(src)
+
+        monkeypatch.setattr(
+            tse, "_get_parser",
+            lambda lang: (
+                CountingParser(real_get_parser(lang))
+                if real_get_parser(lang) is not None else None
+            ),
+        )
+        try:
+            tse.extract_call_chains("a.go", "func a() {\n}\n")
+            tse.extract_call_chains("a.go", "func b() {\n}\n")
+            assert calls["n"] == 2
+        finally:
+            tse._PARSE_CACHE.clear()

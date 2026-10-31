@@ -31,6 +31,8 @@ from typing import Any, TYPE_CHECKING
 
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from .models import Dependency, VulnFinding
 
 # ---------------------------------------------------------------------------
@@ -280,7 +282,8 @@ def compute_risk_estimate(
     else:
         components["ssvc_automatable_multiplier"] = 1.0
 
-    # 3. EPSS: 0..1 probability mapped onto a 0.30..1.00 multiplier.
+    # 3. EPSS: 0..1 probability mapped onto a floor..(floor+range)
+    #    multiplier (defaults ~0.44..0.90; both ends calibration-tunable).
     epss = finding.epss if finding.epss is not None else epss_missing
     epss_mult = epss_floor + epss_range * epss
     base *= epss_mult
@@ -549,26 +552,39 @@ def _calibration_status() -> str:
     return _CALIBRATION_STATUS_CACHE
 
 
-def _load_latest_validation_verdict() -> str:
+def _load_latest_validation_verdict(
+    validation_dir: Path | None = None,
+) -> str:
     """Pick the most-recent ``validation/<date>.json`` and return
     its ``verdict`` field. Defensive against every plausible
-    failure — never raises."""
+    failure — never raises.
+
+    ``validation_dir`` overrides the repo-bundled directory (test
+    seam)."""
+    import re
     from pathlib import Path
 
     from core.json import load_json
     try:
-        validation_dir = (
-            Path(__file__).resolve().parent
-            / "data" / "calibration" / "validation"
-        )
+        if validation_dir is None:
+            validation_dir = (
+                Path(__file__).resolve().parent
+                / "data" / "calibration" / "validation"
+            )
         if not validation_dir.is_dir():
             return "unverified"
         # ISO-formatted dates sort lexicographically, so sorting
-        # filenames descending picks the most recent. Skip non-
-        # JSON files defensively.
+        # filenames descending picks the most recent. Only strictly
+        # date-shaped names count — the writer / pruner apply the
+        # same shape (calibration._snapshots), and without it a
+        # stray late-sorting .json (operator scratch, tooling
+        # artifact) that parses as a dict with a verdict key would
+        # shadow every dated snapshot. Joint refit names carry
+        # .joint only under refit/, never here.
+        dated = re.compile(r"^\d{4}-\d{2}-\d{2}\.json$")
         candidates = sorted(
             (p for p in validation_dir.iterdir()
-             if p.is_file() and p.suffix == ".json"),
+             if p.is_file() and dated.match(p.name)),
             key=lambda p: p.name, reverse=True,
         )
         for path in candidates:

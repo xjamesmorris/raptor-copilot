@@ -173,7 +173,7 @@ def test_exploit_task_system_does_not_contain_prior_analysis():
     system_msg = ExploitTask().get_system_prompt()
     assert _INJECTION not in system_msg
     # System has the role definition + task instructions
-    assert "Mark Dowd" in system_msg
+    assert "expert exploit developer" in system_msg
     assert "16-character hex" in system_msg
 
 

@@ -16,11 +16,18 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+
+from core.source import open_regular
 from collections.abc import Callable, Iterable
 from typing import Any
 
 from core.artifacts.context_map_budget import CONTEXT_MAP_CONSUMER_MAX_BYTES
 from core.coverage.journal import make_function_key
+from core.inventory.languages import SCRIPT_PER_FILE_LANGUAGES
+from core.inventory.script_handler import (
+    interstitial_is_handler,
+    script_handler_stamp,
+)
 from core.json import load_json, save_json
 
 from ._util import extract_context_map_set, safe_join
@@ -38,6 +45,12 @@ PRIORITY_DEAD_CODE = 4
 _TRIVIAL_SLOC = 5
 _SMALL_ENTRY_SLOC = 20
 _LARGE_SLOC = 200
+
+# Sentinel for a checklist site whose raw line_end is unknown or not
+# comparable (site absent from the current checklist, or a
+# non-int/non-None value). Never equal to any recorded raw line_end,
+# so the recorded-site slice short-circuit stays off for it.
+_RAW_END_UNKNOWN: Any = object()
 _REVIEWABLE_KINDS = frozenset({"function", "method", ""})
 # Included by DEFAULT: import-time module code (module-level yaml.load,
 # eval on env, subprocess at import), C/C++ macros (an unsafe macro
@@ -53,6 +66,35 @@ _REVIEWABLE_KINDS = frozenset({"function", "method", ""})
 # them burned full LLM review + tool sweeps on items with nothing to
 # review. Operators can opt in via a positive --include-kinds list.
 _DEFAULT_EXTRA_KINDS = frozenset({"top_level", "macro", "global"})
+
+
+def _script_interstitials_enabled(include_kinds: set | None) -> bool:
+    """Whether script-per-file HANDLER interstitials are gap-eligible
+    (the per-item language + content gate in ``compute_gaps``).
+
+    Mirrors ``_resolve_reviewable_kinds``' override semantics: the
+    default is ON; ``{"none"}`` and any positive kind list turn it
+    off (the operator chose the exact extra kinds — naming
+    ``interstitial`` positively admits the whole kind, ungated, via
+    the reviewable set instead); a ``-interstitial`` entry opts out
+    explicitly.
+    """
+    if not include_kinds:
+        return True
+    if include_kinds == {"none"} or "-interstitial" in include_kinds:
+        return False
+    positive = {k for k in include_kinds
+                if k and not k.startswith("-") and k != "none"}
+    return not positive
+
+
+# The script-handler content classifier lives in
+# ``core.inventory.script_handler`` (the one shared home): the
+# inventory builder stamps the verdict on checklist items at build
+# time, and every consumer — including this module — reads that stamp.
+# ``interstitial_is_handler`` is imported above only for the
+# stamp-absent recompute fallbacks (``compute_gaps`` and
+# ``_site_script_handler``).
 
 
 def _resolve_reviewable_kinds(include_kinds: set | None) -> frozenset:
@@ -87,6 +129,16 @@ def _resolve_reviewable_kinds(include_kinds: set | None) -> frozenset:
 _MAX_HYDRATED_SLOC = 2000            # per function, lines
 _MAX_HYDRATED_FUNCTION_BYTES = 256 * 1024
 _MAX_HYDRATED_FILE_BYTES = 8 * 1024 * 1024
+# Total-bytes ceiling, both directions: RAISING it lets the mechanical
+# detectors see more of a big tree but holds every hydrated body
+# resident at once for the duration of the detector passes — 64 MiB is
+# already whole-tree for most targets and a deliberate memory bound on
+# kernel-scale ones (file contents are target-derived; a hostile tree
+# must not buy unbounded residency). LOWERING it starves negative-space
+# and sibling-asymmetry of baselines on ordinary targets. When the
+# ceiling binds, hydrate_live_gaps_for_detectors discloses the
+# selection ratio with a warning — the cap may bind, but never
+# silently.
 _MAX_HYDRATED_TOTAL_BYTES = 64 * 1024 * 1024
 
 # context-map.json is RAPTOR-written run output (measured multi-MiB
@@ -150,6 +202,7 @@ def compute_gaps(
     scope_floor: bool = True,
     own_run_reuse: bool = False,
     reuse_stats: dict | None = None,
+    seed_rereview_keys: set | None = None,
 ) -> list[dict[str, Any]]:
     """Compute the list of unreviewed functions.
 
@@ -210,19 +263,38 @@ def compute_gaps(
             instead of the default blanket suppression (which assumes
             source stability within one process lifetime, an
             assumption a resumed run cannot make).
-        reuse_stats: When a dict is passed, hash-verified entries the
-            reuse eligibility screen refused are accumulated into it
-            as ``function key → reason class`` (``context_reduced`` /
+        reuse_stats: When a dict is passed, entries the reuse
+            eligibility screens refused are accumulated into it
+            as ``function key → reason class`` (``provisional`` is
+            screened before hashing; ``context_reduced`` /
             ``model_changed`` / ``strategy_changed`` /
-            ``domain_model_context``) — unique per function — for the
-            run summary's per-reason split.
+            ``domain_model_context`` refuse hash-verified entries) —
+            unique per function — for the run summary's per-reason
+            split.
+        seed_rereview_keys: ``--seed-rereview`` resolution set
+            (``make_function_key`` keys from ``core.audit.
+            hypothesis_intake.rereview_candidate_keys``). A key the
+            coverage/journal folds would have suppressed is
+            UN-suppressed — its coverage credit and any pending
+            verdict-reuse import are dropped for this computation
+            (the journal history is untouched; the fresh verdict
+            appends) and the re-emitted gap carries
+            ``seed_rereview: True`` so the orchestrator can hoist it
+            and the journal row can record the seed-forced
+            provenance. Keys that were never covered pass through
+            unchanged (they are ordinary gaps); ``None``/empty is
+            byte-identical to today's behaviour.
 
     Returns:
         List of gap dicts sorted by priority, each containing:
         - file, name, line_start, line_end, priority, strategies,
           is_stale, old_annotation (if stale)
     """
-    covered_functions = _build_covered_set(coverage_records)
+    covered_functions = _build_covered_set(
+        coverage_records,
+        target_path=checklist.get("target_path", "") or "",
+        checklist=checklist,
+    )
     # Span-bound credits from the hash-verified journal fold: each
     # verified per-site entry credits ITS OWN line_start under the
     # file:function key, so suppression lands on the reviewed site
@@ -257,6 +329,15 @@ def compute_gaps(
             crypto_by_key.setdefault(
                 make_function_key(_sf, _sfn), []).append(_site)
     current_spans: dict[str, tuple] = {}
+    # Companion to current_spans, populated in lockstep (same
+    # first-occurrence-wins rule): the checklist item's RAW line_end —
+    # None when the checklist never measured one. current_spans
+    # normalises a missing line_end to line_start because its other
+    # consumers (source-hash verification, span comparison) need int
+    # spans, but the slice recompute must mirror the writer's stamp
+    # call, and the writer stamps with the raw value: a missing
+    # line_end means the fallback read window, not a single line.
+    current_raw_ends: dict[str, int | None] = {}
     binary_hashes: dict[str, str] = {}
     # key → {line_start: (item, fp)}: same-named items (function +
     # prototype pairs, macro redefinitions, C++ overloads) share one
@@ -265,6 +346,16 @@ def compute_gaps(
     # eligibility screen compare a journal entry against the item it
     # actually reviewed rather than the first same-named occurrence.
     items_by_key: dict[str, dict[int, tuple]] = {}
+    # (key, line_start) → the checklist item's RAW line_end AT THAT
+    # SITE (None = the fallback read window). Per-site companion to
+    # current_raw_ends for the recorded-site slice window rule: a
+    # journal entry that verified at its own recorded span must have
+    # its raw line_end compared against the item at THAT site — the
+    # first same-named occurrence's slot can belong to a different
+    # site with a different window. Non-int/non-None values map to
+    # the unknown sentinel: an incomparable window never certifies a
+    # stamp.
+    site_raw_ends: dict[str, dict[int, int | None | object]] = {}
     for file_info in checklist.get("files", []):
         fp = file_info.get("path", "")
         if not fp:
@@ -278,16 +369,35 @@ def compute_gaps(
                 and not isinstance(ls, bool)
                 and ls > 0
             ):
-                le = item.get("line_end")
+                raw_le = item.get("line_end")
+                le = raw_le
                 if not isinstance(le, int) or isinstance(le, bool):
                     le = ls
+                fn_key = make_function_key(fp, name)
                 # First occurrence wins for same-named items — matches
                 # _consume_covered_key's one-suppression-per-key rule.
-                current_spans.setdefault(
-                    make_function_key(fp, name), (ls, le))
-                items_by_key.setdefault(
-                    make_function_key(fp, name), {}).setdefault(
+                # The raw-end companion is written under the SAME
+                # claim so the two dicts never disagree about which
+                # occurrence owns the key.
+                if fn_key not in current_spans:
+                    current_spans[fn_key] = (ls, le)
+                    current_raw_ends[fn_key] = (
+                        raw_le
+                        if isinstance(raw_le, int)
+                        and not isinstance(raw_le, bool)
+                        else None)
+                items_by_key.setdefault(fn_key, {}).setdefault(
                     ls, (item, fp))
+                # Same first-wins claim as items_by_key, so the two
+                # per-site structures never disagree about which
+                # item owns a site.
+                site_raw_ends.setdefault(fn_key, {}).setdefault(
+                    ls,
+                    raw_le
+                    if raw_le is None
+                    or (isinstance(raw_le, int)
+                        and not isinstance(raw_le, bool))
+                    else _RAW_END_UNKNOWN)
             elif name and item.get("address") is not None:
                 # Binary items have no line spans; their staleness
                 # anchor is the binary's content hash + the function's
@@ -341,6 +451,47 @@ def compute_gaps(
             domain_ctx = domain_model_context(Path(out_dir))
         except Exception:
             logger.debug("domain-model context load failed", exc_info=True)
+    if domain_ctx is not None and target_path_str:
+        # Per-function slice recompute for the staleness gate's
+        # slice-stamp short-circuit: recomputes the entry's
+        # domain-model prompt slice through the SAME code path the
+        # prompt assembly and the journal writer use
+        # (core.audit.context.domain_slice_hash_for), at the span the
+        # fold hands over — the span where the entry's source hash
+        # actually VERIFIED. For a function that moved but is
+        # unchanged, that is the checklist's CURRENT span, never the
+        # recorded one: recomputing at the recorded span would read
+        # whatever code now occupies the OLD lines, and an
+        # empty-selection slice there reproduces an empty-selection
+        # stamp byte-for-byte — falsely certifying "provably
+        # unchanged" while the re-review prompt at the function's
+        # real location would carry new model content. A
+        # moved/edited function whose slice differs at the verified
+        # span (or errors) falls back to the relevance diff — the
+        # fail-toward-re-review direction.
+        _slice_out_dir = Path(out_dir)  # type: ignore[arg-type]
+        _slice_target = Path(target_path_str)
+
+        def _current_slice_hash(
+            entry: Any,
+            span: tuple[int, int | None] | None = None,
+        ) -> str | None:
+            from .context import domain_slice_hash_for
+            if span is not None:
+                line_start, line_end = span
+            else:
+                line_start = getattr(entry, "line_start", 0) or 0
+                line_end = getattr(entry, "line_end", None)
+            return domain_slice_hash_for(
+                _slice_out_dir,
+                _slice_target,
+                entry.file,
+                entry.function,
+                line_start or 0,
+                line_end,
+            )
+
+        domain_ctx["slice_hash_fn"] = _current_slice_hash
 
     _fold_journal_into_covered(
         covered_functions,
@@ -348,6 +499,8 @@ def compute_gaps(
         project_dir,
         target_path=Path(target_path_str) if target_path_str else None,
         current_spans=current_spans,
+        current_raw_ends=current_raw_ends,
+        site_raw_ends=site_raw_ends,
         binary_hashes=binary_hashes,
         reuse_sink=reuse_sink,
         credits=covered_credits,
@@ -357,6 +510,37 @@ def compute_gaps(
         domain_ctx=domain_ctx,
         reuse_stats=reuse_stats,
     )
+    # Seed-forced re-review (--seed-rereview): drop the suppression
+    # the folds just granted for every resolved seed key, AFTER all
+    # coverage/journal/reuse folds so nothing re-covers the key. Only
+    # keys that WERE suppressed get the marker — an uncovered seed
+    # key is an ordinary gap and must stay in the ordinary buckets.
+    # Same-named items share one key, so un-suppressing re-emits
+    # every sibling at that key (over-reviewing an overload beats
+    # never re-reviewing the seeded one). The reuse_sink pop is the
+    # fresh-review guarantee: a hash-verified prior verdict must not
+    # satisfy a seed-forced re-review as a $0 import — the prior
+    # verdict stays in the journal history and the new verdict
+    # appends.
+    seed_rereview_hits: set = set()
+    for _srk in seed_rereview_keys or ():
+        _was_covered = False
+        if _srk in covered_functions:
+            covered_functions.discard(_srk)
+            _was_covered = True
+        if covered_credits.pop(_srk, None) is not None:
+            _was_covered = True
+        if reuse_sink is not None and reuse_sink.pop(_srk, None) is not None:
+            _was_covered = True
+        if _was_covered:
+            seed_rereview_hits.add(_srk)
+    if seed_rereview_hits:
+        logger.info(
+            "seed re-review: %d covered function(s) un-suppressed for "
+            "a fresh seed-forced review (prior verdicts stay in the "
+            "journal history)",
+            len(seed_rereview_hits),
+        )
     file_tool_coverage = _build_file_tool_coverage(coverage_records)
     entry_point_set = extract_context_map_set(context_map, "entry_points")
     if not entry_point_set:
@@ -427,10 +611,18 @@ def compute_gaps(
 
     gaps: list[dict[str, Any]] = []
     reviewable_kinds = _resolve_reviewable_kinds(include_kinds)
+    script_interstitials = _script_interstitials_enabled(include_kinds)
     consumed_covered: dict[str, int] = {}
+    # One warning per run when the checklist predates the
+    # script_handler stamp (see the fallback below).
+    _stamp_fallback_logged = False
 
-    # Per-file source cache for the parser-shape classifier. Missing
-    # target or unreadable files degrade to signature-only signals.
+    # Single-slot source cache for the parser-shape classifier: gap
+    # iteration is grouped per checklist file, so one slot hits like
+    # an unbounded map without letting peak memory track the hostile
+    # target's TOTAL tree size (entries were never evicted). Missing
+    # target, unreadable, or oversized files degrade to
+    # signature-only signals.
     _source_lines_cache: dict[str, list[str] | None] = {}
     _target_root = Path(target_path_str) if target_path_str else None
 
@@ -440,21 +632,34 @@ def compute_gaps(
         if _target_root is None or not line_start:
             return None
         if file_path not in _source_lines_cache:
+            _source_lines_cache.clear()
             source_lines: list[str] | None = None
             # Containment-checked like _read_spans: checklist paths
             # derive from the scanned tree, so an absolute path or a
             # symlink escaping the target is rejected (treated as
             # unreadable) rather than read from outside the target.
             resolved = safe_join(_target_root, file_path)
-            if resolved is not None and resolved.is_file():
-                try:
-                    source_lines = (
-                        resolved
-                        .read_text(encoding="utf-8", errors="replace")
-                        .splitlines()
-                    )
-                except OSError:
-                    source_lines = None
+            if resolved is not None:
+                # Same oversized-file refusal as _read_spans: a
+                # planted multi-hundred-MB file must degrade to
+                # signature-only, not buffer wholesale (and a
+                # capped PREFIX would silently misclassify
+                # functions past the cap, so refuse outright) —
+                # enforced on the read itself, not a by-name stat
+                # that races a growing plant; FIFO plants refuse
+                # at the open.
+                from core.source import read_text_capped, split_lines
+
+                got = read_text_capped(
+                    resolved, _MAX_HYDRATED_FILE_BYTES,
+                )
+                if got is not None and not got[1]:
+                    # \n-model split: checklist line numbers count
+                    # \n only; str.splitlines() also breaks on
+                    # plantable bytes and would recompute the
+                    # stamp-absent classification from substitute
+                    # lines (see gap_for_site's fallback).
+                    source_lines = split_lines(got[0])
             _source_lines_cache[file_path] = source_lines
         lines = _source_lines_cache[file_path]
         if lines is None:
@@ -470,15 +675,70 @@ def compute_gaps(
         items = file_info.get("items", file_info.get("functions", []))
 
         file_coverage = file_tool_coverage.get(file_path, set())
+        file_language = (file_info.get("language") or "").lower()
 
         for item in items:
             name = item.get("name", "")
             item_kind = item.get("kind", "")
 
+            # Script-per-file targets: where file-scope code IS the
+            # program (classic PHP request handlers), an interstitial
+            # span carrying more than include/require boilerplate is
+            # the handler, not extraction residue — on script-heavy
+            # trees the interstitial share is half the attack surface,
+            # so writing it off wrote off the code the requests
+            # actually execute. Compiled/object languages keep the
+            # residue exclusion below: their interstitial spans are
+            # declarations-and-braces glue, and reviewing those burned
+            # full review slots on items with nothing to review.
+            # The builder-persisted stamp is the source of truth;
+            # recomputing from source is the STAMP-ABSENT fallback
+            # only (a checklist written before the stamp existed —
+            # resumable runs). The fallback is full-fidelity — the
+            # same classifier over the same raw bytes the builder
+            # stamps from — so a missing stamp never changes which
+            # gaps this selection emits; it is still logged loudly
+            # once per run so the operator knows the checklist
+            # predates the stamp (a rebuild persists it).
+            script_handler = False
+            if (
+                item_kind == "interstitial"
+                and file_language in SCRIPT_PER_FILE_LANGUAGES
+            ):
+                stamp = script_handler_stamp(item)
+                if stamp is not None:
+                    script_handler = stamp
+                else:
+                    if not _stamp_fallback_logged:
+                        _stamp_fallback_logged = True
+                        logger.info(
+                            "compute_gaps: checklist items lack the "
+                            "script_handler stamp (pre-stamp "
+                            "inventory) — recomputing the handler "
+                            "classification from source for this run",
+                        )
+                    _ls = item.get("line_start", 0)
+                    if (
+                        isinstance(_ls, int)
+                        and not isinstance(_ls, bool)
+                        and _ls > 0
+                    ):
+                        script_handler = interstitial_is_handler(
+                            file_language,
+                            _function_source(
+                                file_path, _ls, item.get("line_end"),
+                            ),
+                        )
+
             # Functions/methods plus top_level/macro/global by default
             # (see _resolve_reviewable_kinds); --include-kinds narrows
-            # or widens the set. Interstitial residue stays out.
-            if item_kind not in reviewable_kinds:
+            # or widens the set. Interstitial stays out EXCEPT the
+            # script-per-file handler spans gated above (default-on;
+            # opt out via --include-kinds -interstitial; a positive
+            # "interstitial" entry admits the kind wholesale instead).
+            if item_kind not in reviewable_kinds and not (
+                script_handler and script_interstitials
+            ):
                 continue
 
             # CI workflow jobs/steps carry kind "function" (the
@@ -580,6 +840,7 @@ def compute_gaps(
                 fuzz_iterations=fuzz_info[0],
                 fuzz_crashes=fuzz_info[1],
                 parser_shaped=bool(shape and shape.parser_shaped),
+                script_handler=script_handler,
             )
 
             gap = {
@@ -593,6 +854,12 @@ def compute_gaps(
                 "sloc": sloc,
                 "metadata": metadata,
             }
+            if func_key in seed_rereview_hits:
+                # Seed-forced re-review marker: consumed by the
+                # orchestrator's pin hoist, the intake's third
+                # accounting bucket, and the journal row's
+                # provenance field.
+                gap["seed_rereview"] = True
             # Receiver-qualified display/report name. Same-named
             # methods (seven ``Null*.Scan`` in one file) are otherwise
             # indistinguishable in progress lines, journal rows, and
@@ -706,6 +973,135 @@ def gap_keys(gap: dict[str, Any]) -> set:
     return keys
 
 
+def _fid_pin_gap(
+    pin: str,
+    keys_by_gap: list,
+    checklist: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Resolve a fid-shaped pin (``<anchor>:0x<rel>``) to a gap.
+
+    A fid's colon shears wrongly under the ``file:function``
+    ``rpartition`` parse, so identity-shaped pins resolve here
+    instead: the anchor joins the checklist's ``module_identity``
+    space (:func:`core.audit.hypothesis_intake.checklist_module_spaces`
+    — the ONE resolution table), the recorded image base places the
+    relative address, and the gap list is probed exact-first then
+    inside the exclusive fuzzy window. Ambiguity (two in-window
+    candidates) refuses — ``None``, classified truthfully by
+    :func:`_classify_unmatched_pin`. Fail-closed throughout: no
+    checklist, unknown anchor, or unrecorded base resolve nothing.
+    """
+    from core.binary.addrmap import (
+        FID_FUZZY_WINDOW_BYTES,
+        from_fid,
+        module_anchor,
+    )
+    parsed = from_fid(pin)
+    if parsed is None or not checklist:
+        return None
+    from core.audit.hypothesis_intake import checklist_module_spaces
+    modules, _file_sha = checklist_module_spaces(checklist)
+    anchor = module_anchor(build_id=parsed[0])
+    mod = modules.get(anchor) if anchor else None
+    if mod is None or mod["base"] is None:
+        return None
+    addr = mod["base"] + parsed[1]
+    by_addr: dict[int, dict[str, Any]] = {}
+    for g, _keys in keys_by_gap:
+        if (g.get("file") or "") != mod["file"]:
+            continue
+        meta_addr = (g.get("metadata") or {}).get("address")
+        if isinstance(meta_addr, int) and not isinstance(meta_addr, bool):
+            by_addr.setdefault(meta_addr, g)
+    exact = by_addr.get(addr)
+    if exact is not None:
+        return exact
+    hits: list[dict[str, Any]] = []
+    hit_ids: set[int] = set()
+    for delta in range(1, FID_FUZZY_WINDOW_BYTES):
+        for cand_addr in (addr - delta, addr + delta):
+            cand = by_addr.get(cand_addr)
+            if cand is not None and id(cand) not in hit_ids:
+                hit_ids.add(id(cand))
+                hits.append(cand)
+    if len(hits) == 1:
+        return hits[0]
+    return None
+
+
+def _classify_unmatched_fid_pin(
+    pin: str,
+    checklist: dict[str, Any],
+) -> str:
+    """Truthful cause for a fid-shaped pin that resolved no gap."""
+    from core.binary.addrmap import (
+        FID_FUZZY_WINDOW_BYTES,
+        from_fid,
+        module_anchor,
+    )
+    from core.audit.hypothesis_intake import checklist_module_spaces
+    parsed = from_fid(pin)
+    if parsed is None:  # pragma: no cover - caller pre-checks the shape
+        return "unclassified (not a fid)"
+    modules, _file_sha = checklist_module_spaces(checklist)
+    anchor = module_anchor(build_id=parsed[0])
+    mod = modules.get(anchor) if anchor else None
+    if mod is None:
+        return (
+            "fid anchor matches no checklist module_identity — the "
+            "pin was minted against a different build, or the "
+            "checklist predates identity blocks"
+        )
+    if mod["base"] is None:
+        return (
+            "module has no recorded image base — the fid's relative "
+            "address cannot be placed in this checklist's address "
+            "space (re-import with a base-recording producer)"
+        )
+    addr = mod["base"] + parsed[1]
+    in_window = 0
+    exact = False
+    for file_info in checklist.get("files", []) or []:
+        if file_info.get("path", "") != mod["file"]:
+            continue
+        for item in file_info.get("items", file_info.get("functions", [])):
+            if not isinstance(item, dict):
+                continue
+            meta_addr = (item.get("metadata") or {}).get("address")
+            if meta_addr is None:
+                meta_addr = item.get("address")
+            if not isinstance(meta_addr, int) or isinstance(
+                meta_addr, bool,
+            ):
+                continue
+            if meta_addr == addr:
+                exact = True
+            elif abs(meta_addr - addr) < FID_FUZZY_WINDOW_BYTES:
+                in_window += 1
+    if exact:
+        return (
+            "in the inventory but not in the gap list — already "
+            "reviewed this run, suppressed by coverage, or filtered "
+            "(re-review needs --force)"
+        )
+    if in_window > 1:
+        return (
+            "ambiguous — multiple inventory functions inside the "
+            "fuzzy window at the resolved address (refused rather "
+            "than hoisting an arbitrary neighbour)"
+        )
+    if in_window == 1:
+        return (
+            "nearest inventory function is inside the fuzzy window "
+            "but not in the gap list — already reviewed this run, "
+            "suppressed by coverage, or filtered"
+        )
+    return (
+        "no function at the resolved address in the checklist "
+        "inventory (entry-point drift or a wrong-module fid)"
+    )
+
+
 def _classify_unmatched_pin(
     pin: str,
     checklist: dict[str, Any] | None,
@@ -717,10 +1113,16 @@ def _classify_unmatched_pin(
     (already reviewed / filtered), the item is absent from the
     inventory entirely (label drift, preprocessor-dead code), or the
     receiver qualification matches nothing although the bare method
-    name exists in the file (name mismatch).
+    name exists in the file (name mismatch). fid-shaped pins get
+    their own causes (:func:`_classify_unmatched_fid_pin`) — the
+    ``file:function`` shear below would misread the anchor as a
+    file path and misclassify every one of them.
     """
     if not checklist:
         return "unclassified (no checklist available)"
+    from core.binary.addrmap import from_fid
+    if from_fid(pin) is not None:
+        return _classify_unmatched_fid_pin(pin, checklist)
     file_part, _, name_part = pin.rpartition(":")
     bare = name_part.rsplit(".", 1)[-1]
     exact = False
@@ -779,7 +1181,10 @@ def hoist_pins(
     whose qualification matches no gap falls back to the bare method
     name ONLY when exactly one gap in that file bears it — an
     ambiguous bare fallback (seven ``Null*.Scan`` methods in one file)
-    must not hoist an arbitrary sibling.
+    must not hoist an arbitrary sibling. A fid-shaped pin
+    (``<anchor>:0x<rel>``) resolves by content identity through the
+    checklist's ``module_identity`` space instead
+    (:func:`_fid_pin_gap`) — requires *checklist*.
 
     Motivating run: a scoped head-to-head where every per-file floor
     slot went to a finding-free sibling while the functions under
@@ -819,6 +1224,15 @@ def hoist_pins(
         if len(candidates) == 1:
             _take(candidates[0], pin)
 
+    # fid-shaped pins (``<anchor>:0x<rel>``) resolve through the
+    # checklist's module_identity space — content identity, not the
+    # file:function spelling, so a pin minted by one tool survives
+    # another tool's rendering of the same function.
+    for pin in sorted(pin_set - matched):
+        fid_gap = _fid_pin_gap(pin, keys_by_gap, checklist)
+        if fid_gap is not None:
+            _take(fid_gap, pin)
+
     unmatched = sorted(pin_set - matched)
     if unmatched:
         causes = [
@@ -833,10 +1247,25 @@ def hoist_pins(
         )
     if not pinned:
         return gaps
+    # Escaped AND bounded at emit: operator-typed pins are printable
+    # and short, but --seed-rereview routes CHECKLIST-derived keys
+    # (target-controlled function names) through this line — a hostile
+    # name must not flood the operator's terminal (escaping alone
+    # leaves printable length unbounded), and up to MAX_SEED_RECORDS
+    # keys can funnel into one banner, so the list is capped too.
+    from core.security.log_sanitisation import sanitise_for_terminal
+    _shown_pins = sorted(matched)
+    _PIN_LIST_CAP = 20
+    _pins_text = ", ".join(
+        sanitise_for_terminal(p, max_len=120)
+        for p in _shown_pins[:_PIN_LIST_CAP]
+    )
+    if len(_shown_pins) > _PIN_LIST_CAP:
+        _pins_text += f", … (+{len(_shown_pins) - _PIN_LIST_CAP} more)"
     logger.info(
         "--pin: %d pin(s) matched %d gap(s) hoisted to the front of "
         "the schedule: %s",
-        len(matched), len(pinned), ", ".join(sorted(matched)),
+        len(matched), len(pinned), _pins_text,
     )
     # An operator pin is an explicit review order: mark the gap so the
     # review loop's triage-skip gate cannot drop it (a pinned function
@@ -845,6 +1274,44 @@ def hoist_pins(
     for g in pinned:
         g["pinned"] = True
     return pinned + [g for g in gaps if id(g) not in pinned_ids]
+
+
+def merge_rereview_pins(
+    pins: list[str] | None,
+    gaps: list[dict[str, Any]],
+) -> list[str] | None:
+    """Operator pins plus the seed-forced re-review gaps' keys.
+
+    ``--seed-rereview`` scheduling rides :func:`hoist_pins` — the
+    SAME mechanism ``--pin`` uses (hoisted ahead of the ``--budget``
+    cut; excess beyond the budget is still cut and recorded in
+    not-attempted.json; ``pinned`` triage-skip override) — by
+    joining the marked gaps' keys to the operator's pin list. No
+    second scheduling path. On a bounded run the hoisted re-reviews
+    claim slots first, so never-reviewed gaps can be displaced —
+    consented, flag-gated spend (see the SEED_PRIORITY_BOOST
+    rationale). With no marked gaps the operator's list is returned
+    UNCHANGED (the same object), so the flag-off path is
+    byte-identical. Keys use the bare inventory spelling
+    (``file:name``), which :func:`gap_keys` always answers to.
+    """
+    extra = sorted({
+        f"{g.get('file', '')}:{g.get('name', '')}"
+        for g in gaps if g.get("seed_rereview")
+    })
+    if not extra:
+        return pins
+    merged = list(pins or [])
+    seen = set(merged)
+    merged.extend(k for k in extra if k not in seen)
+    logger.info(
+        "seed re-review: %d function(s) hoisted ahead of the "
+        "--budget cut via the pin mechanism (--pin semantics: excess "
+        "beyond the budget is still cut and recorded; fresh review, "
+        "reuse import refused)",
+        len(extra),
+    )
+    return merged
 
 
 def truncate_gaps_to_budget(
@@ -1045,6 +1512,36 @@ def load_checklist(out_dir: Path) -> dict[str, Any]:
     return read_checklist(out_dir)
 
 
+def find_checklist_item(
+    checklist: dict[str, Any] | None,
+    file_path: str,
+    function_name: str,
+) -> dict[str, Any] | None:
+    """Locate one function's checklist item by file path + name.
+
+    The single home for the lookup the CLI surfaces (context / record
+    / sweep line resolution, the G7 oracle read, annotate bounds
+    discovery) each used to hand-copy. Applies the legacy shape
+    fallback — older checklists keep per-file entries under
+    ``functions`` instead of ``items``. Only the first entry matching
+    ``file_path`` is consulted (checklist paths are unique by
+    construction). Returns None when the file or function is absent.
+    """
+    if not checklist:
+        return None
+    for file_entry in checklist.get("files", []):
+        if not isinstance(file_entry, dict):
+            continue
+        if file_entry.get("path") != file_path:
+            continue
+        items = file_entry.get("items", file_entry.get("functions", []))
+        for item in items or []:
+            if isinstance(item, dict) and item.get("name") == function_name:
+                return item
+        return None
+    return None
+
+
 def hydrate_live_gaps_for_detectors(
     gaps: list[dict[str, Any]],
     target_path: Path,
@@ -1103,21 +1600,27 @@ def hydrate_live_gaps_for_detectors(
 
     hydrated: list[dict[str, Any]] = []
     total_bytes = 0
+    budget_hit = False
 
     for file_path, file_gaps in by_file.items():
         remaining = _MAX_HYDRATED_TOTAL_BYTES - total_bytes
         if remaining <= 0:
-            logger.info(
-                "detector hydration stopped at %d gaps (%d MiB retained)",
-                len(hydrated), _MAX_HYDRATED_TOTAL_BYTES // (1024 * 1024),
-            )
+            budget_hit = True
             break
 
+        exhausted: list[bool] = []
         bodies = _read_spans(
             target_path, file_path,
             [(start, end) for _, start, end in file_gaps],
             budget_bytes=remaining,
+            budget_exhausted=exhausted,
         )
+        if exhausted:
+            # A span that fit the per-function cap was abandoned only
+            # because the remaining global allowance ran out — that is
+            # the ceiling binding, even though total_bytes never
+            # reaches it exactly (abandoned spans refund their bytes).
+            budget_hit = True
         if not bodies:
             continue
 
@@ -1136,6 +1639,7 @@ def hydrate_live_gaps_for_detectors(
             if (start, end) not in charged:
                 size = len(body.encode("utf-8", errors="ignore"))
                 if total_bytes + size > _MAX_HYDRATED_TOTAL_BYTES:
+                    budget_hit = True
                     continue
                 total_bytes += size
                 charged.add((start, end))
@@ -1145,6 +1649,18 @@ def hydrate_live_gaps_for_detectors(
 
         del bodies
 
+    if budget_hit:
+        # Coverage-carrying disclosure: the unhydrated remainder is
+        # invisible to the mechanical detectors, so the exhaustion must
+        # never pass at info/debug level.
+        eligible = sum(len(v) for v in by_file.values())
+        logger.warning(
+            "detector hydration budget (%d MiB) exhausted: hydrated "
+            "%d of %d span-valid live gaps — negative-space and "
+            "sibling-asymmetry detectors never see the remainder",
+            _MAX_HYDRATED_TOTAL_BYTES // (1024 * 1024),
+            len(hydrated), eligible,
+        )
     if hydrated:
         logger.debug(
             "hydrated source for %d/%d live gaps (%d KiB)",
@@ -1187,6 +1703,7 @@ def _read_spans(
     spans: list[tuple],
     *,
     budget_bytes: int = _MAX_HYDRATED_TOTAL_BYTES,
+    budget_exhausted: list[bool] | None = None,
 ) -> dict[tuple, str] | None:
     """Extract the requested 1-indexed inclusive line spans from a file.
 
@@ -1207,6 +1724,14 @@ def _read_spans(
     the global ceiling before the caller gets a chance to enforce it.
     The per-function cap is likewise applied while accumulating, so an
     oversized body is abandoned rather than built and then discarded.
+
+    ``budget_exhausted`` is an optional out-signal (mutable holder —
+    the return shape is shared with callers that must stay unchanged):
+    when a span that fits the per-function cap is abandoned purely
+    because ``budget_bytes`` ran out, ``True`` is appended. Callers
+    metering a global ceiling use it to disclose exhaustion instead of
+    silently hydrating less; spans abandoned by the per-function cap
+    do not signal (they would be dropped under any budget).
 
     Paths come from the checklist, which is derived from the scanned
     tree, so containment is enforced rather than assumed. Oversized files
@@ -1232,7 +1757,10 @@ def _read_spans(
         if resolved.stat().st_size > _MAX_HYDRATED_FILE_BYTES:
             logger.debug("skipping oversized file for hydration: %s", file_path)
             return None
-        with open(resolved, "rb") as probe:
+        probe = open_regular(resolved, "rb")
+        if probe is None:
+            return None
+        with probe:
             if b"\0" in probe.read(8192):
                 logger.debug("skipping binary-looking file: %s", file_path)
                 return None
@@ -1245,7 +1773,11 @@ def _read_spans(
         nxt = 0
         spent = 0
 
-        with open(resolved, encoding="utf-8", errors="replace") as fh:
+        fh = open_regular(resolved, "r", encoding="utf-8",
+                          errors="replace")
+        if fh is None:
+            return None
+        with fh:
             for lineno, text in enumerate(fh, start=1):
                 if lineno > last_line:
                     break
@@ -1268,6 +1800,9 @@ def _read_spans(
                     over_fn = sizes[span] + cost > _MAX_HYDRATED_FUNCTION_BYTES
                     over_total = spent + cost > budget_bytes
                     if over_fn or over_total:
+                        if (over_total and not over_fn
+                                and budget_exhausted is not None):
+                            budget_exhausted.append(True)
                         # Refund what this span buffered — an abandoned
                         # body retains nothing, so it must not go on
                         # charging the allowance and starving later
@@ -1304,6 +1839,67 @@ def _read_spans(
     return {s: b for s, b in done.items() if b and s not in abandoned}
   
   
+def _site_script_handler(
+    item: dict[str, Any],
+    file_info: dict[str, Any],
+    target_path: str,
+) -> bool:
+    """Whether an interstitial checklist item is a script-per-file
+    HANDLER span for site binding (``gap_for_site``).
+
+    Stamp-first: the builder-persisted ``script_handler`` bool is the
+    verdict. On a pre-stamp checklist the classification is recomputed
+    from source (loudly, once per process) — a mechanical tool HIT is
+    confirmed signal, and silently dropping it on old checklists while
+    stamped ones bind would make the same sweep's yield depend on
+    checklist vintage. When the source is unreachable too, the span
+    stays unbound (the landed conservative behavior; compiled-language
+    residue always stays unbound — the recompute classifies only
+    script-per-file languages).
+    """
+    stamp = script_handler_stamp(item)
+    if stamp is not None:
+        return stamp
+    language = (file_info.get("language") or "").lower()
+    if language not in SCRIPT_PER_FILE_LANGUAGES:
+        return False
+    line_start = item.get("line_start")
+    line_end = item.get("line_end")
+    if (not isinstance(line_start, int) or isinstance(line_start, bool)
+            or line_start <= 0):
+        return False
+    if not target_path:
+        return False
+    global _SITE_STAMP_FALLBACK_LOGGED
+    if not _SITE_STAMP_FALLBACK_LOGGED:
+        _SITE_STAMP_FALLBACK_LOGGED = True
+        logger.info(
+            "gap_for_site: checklist items lack the script_handler "
+            "stamp (pre-stamp inventory) — recomputing the handler "
+            "classification from source",
+        )
+    resolved = safe_join(Path(target_path), file_info.get("path") or "")
+    if resolved is None:
+        return False
+    from core.source import read_text_capped, split_lines
+    got = read_text_capped(resolved, _MAX_HYDRATED_FILE_BYTES)
+    if got is None or got[1]:
+        return False
+    # \n-model split: the checklist's line numbers count \n only, and
+    # str.splitlines() also breaks on plantable bytes (\f, \x85, ...)
+    # in this hostile file — one such byte would shift the recomputed
+    # span onto substitute lines.
+    lines = split_lines(got[0])
+    end = line_end if (isinstance(line_end, int)
+                       and not isinstance(line_end, bool)
+                       and line_end) else line_start
+    return interstitial_is_handler(
+        language, "\n".join(lines[line_start - 1:end]))
+
+
+_SITE_STAMP_FALLBACK_LOGGED = False
+
+
 def gap_for_site(
     checklist: dict[str, Any],
     file_path: str,
@@ -1346,15 +1942,28 @@ def gap_for_site(
         if not isinstance(raw_items, list):
             continue
 
+        target_path = ""
+        if isinstance(checklist.get("target_path"), str):
+            target_path = checklist["target_path"]
         items = [
             it for it in raw_items
             if isinstance(it, dict)
             # A mechanical sweep HIT landing in top-level code, a
             # macro body, or a global initializer is evidence in hand
             # — dropping the site because of its kind silently
-            # discarded confirmed signal.
-            and it.get("kind", "") in (
-                _REVIEWABLE_KINDS | {"top_level", "macro", "global"})
+            # discarded confirmed signal. Same rule for a hit inside
+            # a script-per-file HANDLER interstitial (stamp-gated):
+            # the span is schedulable cold, so a tool hit in it must
+            # be bindable too. Compiled-language interstitial residue
+            # stays refused.
+            and (
+                it.get("kind", "") in (
+                    _REVIEWABLE_KINDS | {"top_level", "macro", "global"})
+                or (
+                    it.get("kind", "") == "interstitial"
+                    and _site_script_handler(it, file_info, target_path)
+                )
+            )
             and it.get("name")
             and isinstance(it.get("line_start"), int)
             and not isinstance(it.get("line_start"), bool)
@@ -1393,7 +2002,7 @@ def gap_for_site(
                 (is_func and not best_is_func)
                 or best_span is None
                 or span < best_span
-                or (span == best_span and line_start > best["line_start"])
+                or (span == best_span and best is not None and line_start > best["line_start"])
             ):
                 best = dict(item)
                 best_span = span
@@ -1486,6 +2095,8 @@ def write_gaps(gaps: list[dict[str, Any]], out_dir: Path) -> Path:
 
 def _build_covered_set(
     records: list[dict[str, Any]],
+    target_path: str = "",
+    checklist: dict[str, Any] | None = None,
 ) -> set:
     """Build set of file:function keys that have coverage.
 
@@ -1495,7 +2106,39 @@ def _build_covered_set(
     disambiguated at CONSUMPTION time via _consume_covered_key, which
     suppresses only one same-named item per covered key instead of
     all of them.
+
+    Row authority is TIERED like the journal fold — coverage records
+    live in the same target-writable run/project directories, and a
+    dropped ``coverage-llm.json`` naming a function used to silence
+    its review with no stamp, no verdict and no source evidence:
+
+    * stamped + verified (``coverage_row_provenance`` under the
+      record's tool label — see ``core.coverage.journal_mac``) →
+      full credit.
+    * unstamped / tampered → credit ONLY when the row's ``hash``
+      exactly matches the function's CURRENT source hash, recomputed
+      from the checklist's spans against ``target_path`` (full-length
+      equality; a prefix is not evidence), AND the row is not
+      finding-class (``status`` finding/suspicious — those rows have
+      no re-import route, so hash credit would silently retire a
+      claimed finding; they re-review instead). The journal's
+      tolerant-reader compromise: the hash is UNKEYED (computable by
+      anything that can read the source), so this tier is a source-
+      currency check that keeps pre-MAC legacy rows credited — it is
+      NOT authentication, and a plant that copies the current hash is
+      indistinguishable from a legacy row by construction. It stops
+      hashless plants and stale-source credit; authorship assurance
+      comes only from the verified tier. Rows for functions absent
+      from the checklist get no credit — no gap exists for them, so
+      credit is moot.
+    * the legacy ``files{...functions{}}`` shape earns NO review
+      credit at all: it names functions with no verdict, no hash and
+      no stamp (and it credited under ANY non-runtime tool label,
+      even ``semgrep``). It keeps its store/report value for other
+      consumers; review suppression comes only from
+      ``functions_analysed`` rows.
     """
+    from core.coverage import journal_mac
     from core.coverage.registry import (
         CATEGORY_LLM,
         CATEGORY_RUNTIME,
@@ -1503,43 +2146,141 @@ def _build_covered_set(
         category_of,
         classify,
     )
+    from core.staleness import hash_spans
+
+    from .context import fallback_span_end
+
+    # (file, function) → current-source hash oracle for the
+    # unstamped tier, built lazily: spans come from the checklist,
+    # hashes are computed per-file on the first candidate row
+    # (hash_spans batches the file read) and only for files that
+    # actually have unstamped rows to verify.
+    spans_by_file: dict[str, list[tuple[str, tuple[int, int]]]] = {}
+    files_val = (checklist or {}).get("files")
+    for file_info in files_val if isinstance(files_val, list) else []:
+        if not isinstance(file_info, dict):
+            continue
+        fp = file_info.get("path", "")
+        if not fp or not isinstance(fp, str):
+            continue
+        items = file_info.get("items", file_info.get("functions", []))
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name", "")
+            ls = item.get("line_start", 0)
+            if (name and isinstance(name, str) and isinstance(ls, int)
+                    and not isinstance(ls, bool) and ls > 0):
+                le = item.get("line_end")
+                if le is None:
+                    # Missing line_end = the fallback read window —
+                    # the writer stamped the row's hash over that
+                    # window (core.audit.record._compute_hash), so
+                    # the oracle must hash the same lines or a
+                    # window-stamped row can never earn hash credit.
+                    le = fallback_span_end(ls, None)
+                elif not isinstance(le, int) or isinstance(le, bool):
+                    le = ls
+                spans_by_file.setdefault(fp, []).append((name, (ls, le)))
+    current_hashes: dict[str, dict[str, set]] = {}
+
+    def _row_hash_current(file_path: str, func_name: str,
+                          stored: str) -> bool:
+        if not target_path or not stored:
+            return False
+        entries = spans_by_file.get(file_path)
+        if not entries:
+            return False
+        if file_path not in current_hashes:
+            per_name: dict[str, set] = {}
+            resolved = safe_join(Path(target_path), file_path)
+            if resolved is not None and resolved.is_file():
+                try:
+                    hashes = hash_spans(
+                        resolved, [sp for _n, sp in entries])
+                except OSError:
+                    hashes = []
+                for (name, _sp), h in zip(entries, hashes):
+                    if h:
+                        per_name.setdefault(name, set()).add(h)
+            current_hashes[file_path] = per_name
+        # Exact, full-length equality with a freshly computed span
+        # hash — same discipline as the journal fold's compare (a
+        # short stored prefix simply never matches).
+        return stored in current_hashes[file_path].get(func_name, ())
 
     covered = set()
+    refused_rows = 0
+    legacy_shape_records = 0
     for record in records:
-        # Legacy coverage-record.json shape (files{...functions{}}).
-        # Runtime records (coverage-fuzz.json carries the same nested
-        # shape for its consumers) are excluded: a fuzzer REACHING a
-        # function is reachability evidence, not a review — folding it
-        # here would suppress exactly the functions fuzzing proved live.
+        # Runtime records (coverage-fuzz.json) never fold: a fuzzer
+        # REACHING a function is reachability evidence, not a review —
+        # folding it here would suppress exactly the functions fuzzing
+        # proved live.
         if category_of(record.get("tool", "")) == CATEGORY_RUNTIME:
             continue
-        # ``or {}`` guards (store.py's normalise pattern): coverage
-        # records are on-disk JSON, and one degenerate record with a
-        # null ``files``/``functions`` value must degrade to "no
-        # coverage from this record", not crash gap computation.
-        for file_path, file_data in (record.get("files") or {}).items():
-            for func_name in (file_data or {}).get("functions") or {}:
-                covered.add(make_function_key(file_path, func_name))
+        # Legacy coverage-record.json shape (files{...functions{}}):
+        # counted for the summary log, never credited (see docstring).
+        files = record.get("files")
+        if isinstance(files, dict) and files:
+            legacy_shape_records += 1
         # Modern per-tool records carry function-level review marks in
         # functions_analysed (operator --mark, coverage-llm.json,
-        # coverage-journal.json). Pre-fix only the legacy shape was
-        # parsed, so an operator's --mark never suppressed a gap. Only
-        # review-grade labels count: files_examined (whole-file, any
-        # depth) and scanned-depth marks (read / understand) must not
-        # suppress review gaps.
-        if classify(record.get("tool", "")) != (CATEGORY_LLM, DEPTH_ANALYSED):
+        # coverage-journal.json). Only review-grade labels count:
+        # files_examined (whole-file, any depth) and scanned-depth
+        # marks (read / understand) must not suppress review gaps.
+        tool = record.get("tool", "")
+        if classify(tool) != (CATEGORY_LLM, DEPTH_ANALYSED):
             continue
         for fa in record.get("functions_analysed") or []:
             if not isinstance(fa, dict):
                 continue
-            if fa.get("status") == "error":
+            if fa.get("status") in ("error", "dark"):
                 # A review that errored is not coverage — same discipline
-                # as import_journal's error-verdict skip.
+                # as import_journal's error/dark-verdict skip. Dark is
+                # the unresolved gate-resolution bucket: record-surface
+                # credit has NO re-adjudication route (nothing walks a
+                # coverage record back into the dark pass), so a dark
+                # functions_analysed row must not suppress the gap.
                 continue
             file_path = fa.get("file") or ""
             func_name = fa.get("function") or ""
-            if file_path and func_name:
-                covered.add(make_function_key(file_path, func_name))
+            if not (isinstance(file_path, str) and file_path
+                    and isinstance(func_name, str) and func_name):
+                continue
+            prov = journal_mac.coverage_row_provenance(fa, tool)
+            if prov != journal_mac.ROW_VERIFIED:
+                if fa.get("status") in ("finding", "suspicious"):
+                    # Same rule as the journal fold: a finding-class
+                    # row earns suppression only when its finding is
+                    # live, which only a verified row can prove —
+                    # hash-tier credit here would suppress review of
+                    # a function whose claimed finding no consumer
+                    # surfaces. Re-review, rediscover honestly.
+                    refused_rows += 1
+                    continue
+                stored = fa.get("hash")
+                if not (isinstance(stored, str) and _row_hash_current(
+                        file_path, func_name, stored)):
+                    refused_rows += 1
+                    logger.debug(
+                        "coverage record %s: refusing review credit for "
+                        "%s:%s (%s row, no matching source hash)",
+                        tool, file_path, func_name, prov,
+                    )
+                    continue
+            covered.add(make_function_key(file_path, func_name))
+    if refused_rows or legacy_shape_records:
+        logger.warning(
+            "coverage records: %d unverified functions_analysed row(s) "
+            "refused review credit (no stamp, no matching source hash, "
+            "or an unverified finding-class status); %d legacy files{} "
+            "record(s) carry no review credit — affected functions "
+            "resurface as gaps and will be re-reviewed (over-review, "
+            "the safe direction; on a large pre-migration run dir this "
+            "can be a substantial paid re-review)",
+            refused_rows, legacy_shape_records,
+        )
     return covered
 
 
@@ -1593,6 +2334,8 @@ def _fold_journal_into_covered(
     *,
     target_path: Path | None = None,
     current_spans: dict[str, tuple] | None = None,
+    current_raw_ends: dict[str, int | None] | None = None,
+    site_raw_ends: dict[str, dict[int, int | None | object]] | None = None,
     binary_hashes: dict[str, str] | None = None,
     reuse_sink: dict | None = None,
     credits: dict | None = None,
@@ -1655,19 +2398,22 @@ def _fold_journal_into_covered(
                 # them to one arbitrary site, dropping the coverage
                 # credit for its siblings and re-buying their reviews
                 # on every resume.
-                from .journal import load_entries
-                per_site: dict[tuple, Any] = {}
-                own_entries = load_entries(out_dir)
-                for _e in own_entries:
-                    _k = (_e.file, _e.function, _e.line_start)
-                    _prev = per_site.get(_k)
-                    if _prev is None or _e.ts > _prev.ts:
-                        per_site[_k] = _e
+                # SPEND-AUTHORIZING read: this fold decides which
+                # functions re-import at $0 versus re-review at full
+                # price, so a PARTIAL journal load must refuse (raise)
+                # rather than silently re-buy every missing verdict —
+                # require_complete_entries raises JournalIncomplete
+                # with the compaction remedy, and the except arm
+                # below re-raises it past the best-effort boundary.
+                from .journal import require_complete_entries
+                own_entries = require_complete_entries(out_dir)
                 _verify_entries_fold(
                     covered,
-                    list(per_site.values()),
+                    _latest_review_rows_per_site(own_entries),
                     target_path=target_path,
                     current_spans=current_spans or {},
+                    current_raw_ends=current_raw_ends or {},
+                    site_raw_ends=site_raw_ends or {},
                     binary_hashes=binary_hashes or {},
                     reuse_sink=reuse_sink,
                     credits=credits,
@@ -1677,14 +2423,68 @@ def _fold_journal_into_covered(
                     source_label="same-run",
                     reuse_stats=reuse_stats,
                     strategy_backfill=_strategy_backfill_from(own_entries),
+                    # Slim-tier stubs hydrate from THIS run's sidecar
+                    # for the context-staleness relevance diff.
+                    sidecar_dir=out_dir,
                 )
             else:
-                from .journal import is_function_grade, load_entries
-                covered.update(
-                    e.key for e in load_entries(out_dir)
-                    if e.verdict != "error" and is_function_grade(e)
+                from .journal import load_entries
+                # Reuse-DISABLED fold (cold-profile --no-verdict-reuse
+                # + interrupt + resume, and every mid-run recompute):
+                # same MAC-tier + exact-hash verification as the
+                # reuse-enabled fold, with reuse_sink=None so no
+                # import route exists. Plain set-fold credit here was
+                # the one journal suppression surface without a
+                # provenance gate: the journal is target-writable
+                # during runs, and one planted unstamped "clean" row
+                # silently retired the named function from the review
+                # queue — the forged-clean-row lever journal_mac
+                # exists to stop. Verified rows keep full credit
+                # (including hashless historical suppression —
+                # span-bound to the recorded site, so a row whose
+                # span matches no checklist item re-reviews);
+                # unstamped and unverifiable-token rows credit only
+                # behind the exact source-hash gate; dark /
+                # provisional / mechanical-echo / agent-mark rows
+                # resurface exactly as before (those screens live in
+                # _verify_entries_fold, shared with the verified
+                # folds).
+                # fresh=True: this fold suppresses re-review on a
+                # resume — resume decisions never read the
+                # process-local journal load cache. Best-effort load
+                # is correct here (unlike the spend-authorizing
+                # own-run reuse fold above): a partial load
+                # re-reviews, the safe direction.
+                _verify_entries_fold(
+                    covered,
+                    _latest_review_rows_per_site(
+                        load_entries(out_dir, fresh=True)),
+                    target_path=target_path,
+                    current_spans=current_spans or {},
+                    current_raw_ends=current_raw_ends or {},
+                    site_raw_ends=site_raw_ends or {},
+                    binary_hashes=binary_hashes or {},
+                    reuse_sink=None,
+                    credits=credits,
+                    current_strategies_fn=current_strategies_fn,
+                    current_model=current_model,
+                    domain_ctx=domain_ctx,
+                    source_label="reuse-disabled",
+                    reuse_stats=reuse_stats,
+                    # Slim-tier stubs hydrate from THIS run's sidecar
+                    # (import-eligibility only — inert with the sink
+                    # disabled, but keeps the call shape identical to
+                    # the own-run fold).
+                    sidecar_dir=out_dir,
                 )
-        except Exception:
+        except Exception as exc:
+            from core.coverage.journal import JournalIncomplete
+            if isinstance(exc, JournalIncomplete):
+                # The own-run reuse fold authorizes spend: degrading
+                # here converts every unloaded verdict into a fresh
+                # full-price review. Refuse loudly instead — the
+                # operator compacts and resumes.
+                raise
             logger.warning(
                 "journal-fold: failed to read per-run journal at %s — "
                 "gap computation will treat this run's reviews as absent",
@@ -1696,6 +2496,8 @@ def _fold_journal_into_covered(
                 covered, project_dir,
                 target_path=target_path,
                 current_spans=current_spans or {},
+                current_raw_ends=current_raw_ends or {},
+                site_raw_ends=site_raw_ends or {},
                 binary_hashes=binary_hashes or {},
                 reuse_sink=reuse_sink,
                 credits=credits,
@@ -1717,6 +2519,8 @@ def _context_staleness(
     key: str,
     domain_ctx: dict,
     current_strategies_fn,
+    hydrate_fn=None,
+    matched_span: tuple[int, int | None] | None = None,
 ) -> str | None:
     """AR-7 context-staleness: has the domain model gained knowledge
     this review lacked AND that is relevant to this function?
@@ -1731,6 +2535,31 @@ def _context_staleness(
       unchanged, not stale. A per-run (non-canonical) model's hash
       has no cross-run semantics (amendment §3), so hash equality
       against it never counts as fresh and the relevance diff runs.
+    * per-function slice stamp — the whole model changed, but when
+      the entry carries a ``domain_slice_hash`` stamp and recomputing
+      the SAME per-function prompt slice
+      (``domain_ctx["slice_hash_fn"]``, backed by
+      ``core.audit.context.domain_slice_hash_for`` — the code path
+      the prompt assembly and the journal writer share) reproduces
+      it byte-identically, a re-review would be briefed with exactly
+      the domain context the prior verdict already saw — not stale.
+      The recompute runs at *matched_span* — the span where the
+      fold's source-hash verification actually succeeded, which for
+      an unchanged function that merely moved is the checklist's
+      CURRENT span. Recomputing at the entry's recorded span after
+      a move fingerprints whatever code now sits on the OLD lines;
+      an empty selection there reproduces an empty-selection stamp
+      byte-for-byte and falsely certifies the slice unchanged while
+      the real re-review prompt would select new model content.
+      Callers that cannot name the verified span pass None and the
+      short-circuit is skipped entirely. Strictly reuse-ADDING and
+      fail-closed: no stamp, no matched span, a mismatching
+      recompute, or a recompute error all fall through to the
+      relevance diff below, the exact pre-stamp behaviour. A
+      mismatch never blocks reuse by itself — the relevance diff
+      still decides, so a model whose prose was merely reworded
+      (slice changed, nothing relevant gained) keeps reusing exactly
+      as it does today.
     * relevance diff — concepts absent from the entry's
       ``domain_concepts_available`` (and invariants absent from
       ``invariants_available``, via their parent concept) whose
@@ -1738,6 +2567,19 @@ def _context_staleness(
       strategies mark the entry stale. Unstamped concepts (empty
       ``related_strategies``) intersect nothing — storm-safe: the
       source-hash and strategy-set gates still catch real drift.
+
+    Slim-tier stubs (``journal compact --slim-clean`` offloads the
+    snapshot lists to the run sidecar): the relevance diff must see
+    the review's REAL snapshot, so an offloaded entry hydrates
+    through *hydrate_fn* first — bare empty lists would read as "the
+    review lacked every concept" and mass-mark stale (a re-review
+    storm). When the lists are needed but cannot be hydrated (no
+    sidecar route — project-index rows — or an unresolvable/tampered
+    record), the entry reads STALE with an explicit reason: refusing
+    the $0 reuse and re-reviewing is the journal's standing safe
+    direction, never trusting unverifiable context. Hydration is
+    lazy — a matching canonical hash still short-circuits fresh
+    without touching the sidecar.
     """
     entry_hash = getattr(entry, "domain_model_hash", None)
     if not entry_hash:
@@ -1746,6 +2588,26 @@ def _context_staleness(
     if domain_ctx["canonical"] and (
             cur_hash[:len(entry_hash)] == entry_hash[:len(cur_hash)]):
         return None
+    slice_stamp = getattr(entry, "domain_slice_hash", None)
+    slice_fn = domain_ctx.get("slice_hash_fn")
+    if slice_stamp and callable(slice_fn) and matched_span is not None:
+        current_slice: str | None = None
+        try:
+            current_slice = slice_fn(entry, matched_span)
+        except Exception:
+            # Fail toward re-review: an unresolvable source span, a
+            # renderer error, or a broken model all mean the slice
+            # cannot be PROVEN unchanged — fall through to the
+            # relevance diff, the pre-stamp behaviour.
+            logger.debug(
+                "domain slice recompute failed for %s", key,
+                exc_info=True,
+            )
+        # Full-string equality, deliberately not the prefix compare
+        # the whole-model hash uses: a truncated or foreign-length
+        # stamp must mismatch, never prefix-match its way to reuse.
+        if current_slice is not None and current_slice == slice_stamp:
+            return None
     current = (
         current_strategies_fn(key, getattr(entry, "line_start", 0) or 0)
         if current_strategies_fn is not None
@@ -1754,6 +2616,20 @@ def _context_staleness(
     if not current:
         return None                      # can't assess relevance
     cur_set = set(current)
+    try:
+        from core.coverage.journal_sidecar import entry_context_offloaded
+        context_offloaded = entry_context_offloaded(entry)
+    except ImportError:
+        context_offloaded = False
+    if context_offloaded:
+        hydrated = hydrate_fn(entry) if hydrate_fn is not None else None
+        if hydrated is None:
+            return (
+                "context offloaded (domain model changed and the "
+                "review's snapshot lists are in the run sidecar, "
+                "which is unavailable here)"
+            )
+        entry = hydrated
     concepts_available = set(
         getattr(entry, "domain_concepts_available", None) or [])
     relevant = [
@@ -1781,6 +2657,8 @@ def _reuse_ineligibility(
     current_model: str | None,
     domain_ctx: dict | None = None,
     recorded_strategies: list | None = None,
+    hydrate_fn=None,
+    matched_span: tuple[int, int | None] | None = None,
 ) -> str | None:
     """Why a hash-verified prior entry may NOT be imported as a
     reused verdict. ``None`` when it is eligible.
@@ -1793,6 +2671,9 @@ def _reuse_ineligibility(
     * ``context_reduced`` — the prior verdict came from the reduced-
       context timeout retry: lower-confidence by design, so it is
       re-reviewed rather than imported.
+    * ``provisional`` — a cadence-tick promotion the producing run
+      never finalized (interrupted before the confirming post-loop
+      pass): unsettled, so it is re-reviewed rather than imported.
     * model — when THIS run pins an explicit model and the entry
       records one, they must match; a verdict from a different model
       is not this run's verdict. Runs on the default/session model
@@ -1813,9 +2694,23 @@ def _reuse_ineligibility(
       review AND gained concepts/invariants relevant to this
       function's current strategies (:func:`_context_staleness`),
       the review lacked knowledge that could overturn its verdict.
+      Entries stamped with a ``domain_slice_hash`` whose recomputed
+      per-function prompt slice is byte-identical short-circuit
+      fresh — a whole-model change that never touched what THIS
+      function's review prompt contains does not re-buy its verdict.
+      The recompute runs at *matched_span* — the span where the
+      fold's source-hash verification succeeded — so a moved-but-
+      unchanged function is fingerprinted at its CURRENT location,
+      never at the stale recorded lines (see
+      :func:`_context_staleness`). ``None`` skips the short-circuit.
     """
     if getattr(entry, "context_reduced", None):
         return "context_reduced verdict"
+    if getattr(entry, "provisional", None):
+        # Cadence-tick promotion whose run was interrupted before the
+        # confirming post-loop pass — not a settled verdict; the
+        # function re-reviews and re-earns.
+        return "provisional verdict"
     entry_model = getattr(entry, "model", None)
     if current_model and entry_model:
         # Compare by bare identity: the journal records the resolved
@@ -1848,7 +2743,8 @@ def _reuse_ineligibility(
             return "strategy set changed"
     if domain_ctx is not None:
         stale = _context_staleness(
-            entry, key, domain_ctx, current_strategies_fn)
+            entry, key, domain_ctx, current_strategies_fn,
+            hydrate_fn=hydrate_fn, matched_span=matched_span)
         if stale is not None:
             return stale
     return None
@@ -1860,10 +2756,14 @@ def _reuse_ineligibility(
 def _reuse_block_class(reason: str) -> str:
     if reason.startswith("context_reduced"):
         return "context_reduced"
+    if reason.startswith("provisional"):
+        return "provisional"
     if reason.startswith("model changed"):
         return "model_changed"
     if reason.startswith("strategy set"):
         return "strategy_changed"
+    if reason.startswith("context offloaded"):
+        return "context_offloaded"
     return "domain_model_context"
 
 
@@ -1945,6 +2845,8 @@ def _fold_project_index(
     *,
     target_path: Path | None,
     current_spans: dict[str, tuple],
+    current_raw_ends: dict[str, int | None] | None = None,
+    site_raw_ends: dict[str, dict[int, int | None | object]] | None = None,
     binary_hashes: dict[str, str] | None = None,
     reuse_sink: dict | None = None,
     credits: dict | None = None,
@@ -2048,6 +2950,8 @@ def _fold_project_index(
         list(latest_function_grade_collapse(full_entries).values()),
         target_path=target_path,
         current_spans=current_spans,
+        current_raw_ends=current_raw_ends,
+        site_raw_ends=site_raw_ends,
         binary_hashes=binary_hashes,
         reuse_sink=reuse_sink,
         credits=credits,
@@ -2061,12 +2965,46 @@ def _fold_project_index(
     )
 
 
+def _latest_review_rows_per_site(entries) -> list:
+    """Per-SITE latest collapse over REVIEW-GRADE rows only.
+
+    Per SITE, not per key: same-named items (macro redefinitions,
+    C++ overloads) journal one entry per line span under a shared
+    file:function key, and a per-key collapse would drop the
+    coverage credit for siblings and re-buy their reviews on every
+    fold.
+
+    Non-review rows — mechanical echoes, agent-context marks,
+    finding-grade entries — never participate in the collapse: they
+    are screened again inside ``_verify_entries_fold`` (belt-and-
+    braces), but if they entered here a LATER echo at a reviewed
+    site would shadow the genuine review out of the fold entirely
+    and resurface a properly-reviewed function. Error/dark/
+    provisional rows stay in: they are genuine review rows whose
+    latest-wins semantics (and downstream screens) are the point.
+    """
+    from .journal import is_agent_mark, is_function_grade, is_mechanical_echo
+
+    per_site: dict[tuple, Any] = {}
+    for e in entries:
+        if (not is_function_grade(e) or is_mechanical_echo(e)
+                or is_agent_mark(e)):
+            continue
+        k = (e.file, e.function, e.line_start)
+        prev = per_site.get(k)
+        if prev is None or e.ts > prev.ts:
+            per_site[k] = e
+    return list(per_site.values())
+
+
 def _verify_entries_fold(
     covered: set,
     entries: list,
     *,
     target_path: Path | None,
     current_spans: dict[str, tuple],
+    current_raw_ends: dict[str, int | None] | None = None,
+    site_raw_ends: dict[str, dict[int, int | None | object]] | None = None,
     binary_hashes: dict[str, str] | None = None,
     reuse_sink: dict | None,
     credits: dict | None = None,
@@ -2077,6 +3015,7 @@ def _verify_entries_fold(
     reuse_stats: dict | None = None,
     strategy_backfill=None,
     known_run_ids: set[str] | None = None,
+    sidecar_dir: Path | None = None,
 ) -> None:
     """Hash-verify journal *entries* and fold them into ``covered``.
 
@@ -2092,10 +3031,21 @@ def _verify_entries_fold(
     ``source_label`` names the entry source in log lines
     (``same-run`` / ``prior-run``).
 
+    ``dark`` rows (the unresolved gate-resolution bucket) only earn
+    coverage credit on the route that also RE-ADJUDICATES them: the
+    $0 verdict-reuse import, whose imported outcomes the post-loop
+    dark-verification pass walks. Every route that credits without
+    importing — reuse disabled, binary rows, hashless rows, unstamped
+    rows — resurfaces them instead (``dark_unresolved`` in the
+    not-reusable split): plain credit would suppress the very
+    re-review that settles the row.
+
     ``reuse_stats`` (optional dict) accumulates ``function key →
-    reason class`` for hash-verified entries the eligibility screen
-    refused (``context_reduced`` / ``model_changed`` /
-    ``strategy_changed`` / ``domain_model_context``) so callers can
+    reason class`` for entries the eligibility screens refused
+    (``provisional`` is screened before hashing, ``dark_unresolved``
+    wherever the row has no import route; ``context_reduced`` /
+    ``model_changed`` / ``strategy_changed`` / ``domain_model_context``
+    refuse hash-verified entries) so callers can
     surface the split — an aggregate "N not reusable" hides which
     driver mass-fired (observed live: 1,461 re-reviews at one segment
     start with no way to tell strategy churn from legitimate
@@ -2113,10 +3063,36 @@ def _verify_entries_fold(
     field — from a verified sibling row, so the eligibility screen
     compares the review's REAL briefing instead of refusing every
     corrected function as ``strategy_changed`` forever.
+
+    ``sidecar_dir`` (optional): the run directory whose
+    ``review-journal-bodies.jsonl`` sidecar can hydrate slim-tier
+    stubs for the context-staleness relevance diff. The same-run fold
+    passes its own out dir; the project-index fold passes None —
+    index rows carry no route back to their producing run's sidecar,
+    so an offloaded index row whose domain hash drifted refuses reuse
+    (``context_offloaded``) and re-reviews, the safe direction.
     """
     from core.coverage import journal_mac
 
-    from .journal import is_function_grade
+    from .context import fallback_span_end
+    from .journal import is_agent_mark, is_function_grade, is_mechanical_echo
+
+    def _hydrate_from_sidecar(entry: Any) -> Any:
+        # None on any resolution failure — the staleness gate then
+        # refuses reuse (fail toward re-review, never toward
+        # trusting unverifiable context).
+        if sidecar_dir is None:
+            return None
+        try:
+            from core.coverage.journal_sidecar import hydrate_entry
+            return hydrate_entry(sidecar_dir, entry)
+        except Exception:  # noqa: BLE001 — sidecar is run-dir content; containment boundary
+            logger.debug(
+                "journal-fold: sidecar hydration failed", exc_info=True)
+            return None
+
+    hydrate_fn = (
+        _hydrate_from_sidecar if sidecar_dir is not None else None)
 
     def _credit(key: str, line_start: int) -> None:
         covered.add(key)
@@ -2132,11 +3108,101 @@ def _verify_entries_fold(
             credits.setdefault(key, []).append(int(line_start or 0))
 
     tampered = 0
+    # Demotions bucketed by entry_provenance_detail reason — the
+    # fold's drift telemetry. A mass hash_mismatch fire points at
+    # canonicalisation/schema drift or a reduced index copy; the
+    # verified-tier legacy buckets show drift being ABSORBED (rows
+    # retaining full authority via the generation ladder / raw form)
+    # rather than forfeited.
+    tampered_reasons: dict[str, int] = {}
+    legacy_verified: dict[str, int] = {}
     unstamped_credited = 0
     unstamped_unverifiable = 0
+    reuse_blocked: dict[str, int] = {}
+
+    def _log_blocked_split() -> None:
+        if not reuse_blocked:
+            return
+        # Per-reason split, not an aggregate: the drivers have very
+        # different operator meaning (context_reduced re-reviews are
+        # by design; a strategy_changed mass-fire signals unstable
+        # strategy inference inputs; provisional marks an interrupted
+        # producer run).
+        split = ", ".join(
+            f"{cls}={n}" for cls, n in sorted(reuse_blocked.items()))
+        logger.info(
+            "journal-fold: %d prior %s review(s) not "
+            "reusable (%s) — resurfacing for re-review",
+            sum(reuse_blocked.values()), source_label, split,
+        )
+
+    def _dark_resurface(key: str, why: str) -> None:
+        # ``dark`` is the unresolved gate-resolution bucket
+        # ("tool-blind, needs concrete verification"): coverage
+        # credit is only safe when the row ALSO rides the $0
+        # verdict-reuse import, because imported outcomes land in
+        # the run's outcome list and the post-loop dark-verification
+        # pass re-walks them. On every other route, credit would
+        # suppress the very re-review that settles the row — the
+        # function rests at "needs concrete verification" forever.
+        # Resurface instead (over-review direction, matching error's
+        # retry contract), counted into the not-reusable split so the
+        # run summary names the driver.
+        reuse_blocked["dark_unresolved"] = (
+            reuse_blocked.get("dark_unresolved", 0) + 1
+        )
+        if reuse_stats is not None:
+            reuse_stats.setdefault(key, "dark_unresolved")
+        logger.debug(
+            "journal-fold: %s row is dark with no re-adjudication "
+            "route (%s) — resurfacing for re-review", key, why,
+        )
+
     to_verify: dict[str, list] = {}
     for entry in entries:
         if entry.verdict == "error" or not is_function_grade(entry):
+            continue
+        if is_mechanical_echo(entry):
+            # Post-loop pattern-scan echo rows are cross-layer
+            # visibility, never reviews — no fold route may credit
+            # or import them. With verdict reuse enabled their
+            # ``post-loop-mechanical`` tag already refused reuse at
+            # the strategy screen, but the plain-credit routes
+            # (reuse disabled, unstamped tier, hashless verified)
+            # had no screen and marked never-reviewed functions
+            # covered.
+            continue
+        if is_agent_mark(entry):
+            # Review-grade marks are operator-tier (the /annotate
+            # authority rule): an agent context's --mark assertion
+            # carries no evidence gate, so no fold route may credit
+            # or import it. The operator's own mark rows
+            # (model="operator", MAC-covered when stamped) keep the
+            # full fold behaviour.
+            continue
+        if getattr(entry, "provisional", None):
+            # A cadence-tick promotion the producing run never
+            # finalized (interrupted before the confirming post-loop
+            # pass). Unsettled in EVERY fold mode: no coverage credit
+            # (with verdict reuse off, plain fold credit would
+            # silently suppress the very re-review that settles it,
+            # leaving the journal's latest row provisional on a
+            # COMPLETED resumed run) and no verdict reuse (the
+            # eligibility screen refuses it again for entries that
+            # reach the sink). The function resurfaces and re-earns.
+            # Counted into the not-reusable split (screened BEFORE
+            # hashing, unlike the other classes) so the run summary
+            # still names the driver.
+            _pkey = make_function_key(entry.file, entry.function)
+            reuse_blocked["provisional"] = (
+                reuse_blocked.get("provisional", 0) + 1
+            )
+            if reuse_stats is not None:
+                reuse_stats.setdefault(_pkey, "provisional")
+            logger.debug(
+                "journal-fold: %s row is a provisional (unfinalized) "
+                "promotion — resurfacing for re-review", _pkey,
+            )
             continue
         if getattr(entry, "edge_callee", None):
             # Tier-1 edge entries record an edge-contract review, not
@@ -2146,6 +3212,13 @@ def _verify_entries_fold(
             # edge_review.reviewed_edge_keys.
             continue
         key = make_function_key(entry.file, entry.function)
+        dark_row = entry.verdict == "dark"
+        if dark_row and reuse_sink is None:
+            # Reuse disabled: no import route exists at all, so no
+            # dark row in this fold can earn credit (the same screen
+            # the plain fold applies).
+            _dark_resurface(key, "verdict reuse disabled")
+            continue
         # Row provenance (core.coverage.journal_mac): the journal is
         # target-writable during runs and import-restorable, so a
         # row's authority is tiered on its MAC. Verified rows keep
@@ -2158,14 +3231,25 @@ def _verify_entries_fold(
         # Unverifiable-token rows are not dropped BELOW the unstamped
         # tier: the token is strippable, so that would punish only
         # honest newer-schema rows, not attackers.
-        provenance = journal_mac.entry_provenance(entry)
+        provenance, prov_reason = journal_mac.entry_provenance_detail(entry)
         if provenance == journal_mac.ROW_TAMPERED:
             tampered += 1
+            tampered_reasons[prov_reason] = (
+                tampered_reasons.get(prov_reason, 0) + 1)
             logger.debug(
                 "journal-fold: %s row has a provenance token that "
-                "does not verify — demoted to the unstamped tier "
-                "(hash-gated credit only, no verdict reuse)", key,
+                "does not verify (%s) — demoted to the unstamped "
+                "tier (hash-gated credit only, no verdict reuse)",
+                key, prov_reason,
             )
+        elif (provenance == journal_mac.ROW_VERIFIED
+                and prov_reason != journal_mac.REASON_CURRENT_FORM):
+            # Legacy-generation / raw-form verification: SAME
+            # authority as the current form — counted so the fold
+            # log shows how much of the corpus rides the legacy
+            # ladder (drift that is being absorbed, not forfeited).
+            legacy_verified[prov_reason] = (
+                legacy_verified.get(prov_reason, 0) + 1)
         verified_row = provenance == journal_mac.ROW_VERIFIED
         # Candidate spans, tried in order — a match on ANY verifies:
         # * the entry's OWN recorded span: same-named items (macro
@@ -2176,12 +3260,30 @@ def _verify_entries_fold(
         # * the checklist's CURRENT span: an unchanged function that
         #   merely moved down the file verifies there.
         spans = []
+        # Hash windows ride in LOCKSTEP with the candidate spans
+        # (same index = same candidate). The normalised span tuples
+        # feed the matched-span bookkeeping below; HASHING must cover
+        # the window the row's stamp was computed over — a missing
+        # line_end means the fallback read window (fallback_span_end),
+        # not a single line. Hashing the normalised single line here
+        # would make a window-stamped row read as permanent drift
+        # (every fold re-buys the same review); stamping the single
+        # line was the converse defect (body edits below the header
+        # never flipped the hash).
+        hash_windows: list[tuple[int, int]] = []
         if getattr(entry, "line_start", None):
             spans.append(
                 (entry.line_start, entry.line_end or entry.line_start))
+            hash_windows.append(
+                (entry.line_start,
+                 fallback_span_end(entry.line_start, entry.line_end)))
         cur = current_spans.get(key)
         if cur is not None and cur not in spans:
             spans.append(cur)
+            hash_windows.append(
+                (cur[0],
+                 fallback_span_end(
+                     cur[0], (current_raw_ends or {}).get(key, cur[1]))))
         if entry.source_hash and entry.source_hash.startswith("bin:"):
             # Binary items: the hash anchors the BINARY's content +
             # the function's address/size. A rebuilt binary (or a
@@ -2193,7 +3295,12 @@ def _verify_entries_fold(
             # unhashable binary) — crediting across that would keep a
             # verdict alive over arbitrary rebuilds.
             expected = (binary_hashes or {}).get(key)
-            if expected is not None and expected == entry.source_hash:
+            if dark_row:
+                # Binary rows never reach the reuse import below (the
+                # branch credits and continues), so a dark binary row
+                # has no re-adjudication route even with reuse on.
+                _dark_resurface(key, "binary rows never import")
+            elif expected is not None and expected == entry.source_hash:
                 _credit(key, 0)
             elif verified_row:
                 logger.debug(
@@ -2211,21 +3318,48 @@ def _verify_entries_fold(
             # there is no current source to compare). An UNSTAMPED
             # row with no checkable hash carries nothing — crediting
             # it was the forged-empty-hash suppression channel.
-            if verified_row:
+            if dark_row:
+                # Reuse requires positive hash evidence, so a
+                # hashless dark row can never be imported — and
+                # without the import there is no dark pass to settle
+                # it. Historical suppression is for SETTLED verdicts.
+                _dark_resurface(key, "no hash evidence, no import")
+            elif verified_row:
                 _credit(key, getattr(entry, "line_start", 0))
             else:
                 unstamped_unverifiable += 1
             continue
         to_verify.setdefault(entry.file, []).append(
-            (entry, key, spans, verified_row))
+            (entry, key, spans, hash_windows, verified_row))
 
+    if legacy_verified:
+        split = ", ".join(
+            f"{reason}={n}" for reason, n in sorted(legacy_verified.items()))
+        logger.info(
+            "journal-fold: %d row(s) verified under a legacy "
+            "canonical form (%s) — full verdict authority retained. "
+            "legacy_generation rows are re-stamped at the current "
+            "generation by the index merge; raw_form rows keep fold "
+            "authority but merge as reduced unstamped index copies "
+            "until a skew-free merge (or `raptor-audit journal "
+            "reindex <run-dir>`) re-projects them",
+            sum(legacy_verified.values()), split,
+        )
     if tampered:
+        split = ", ".join(
+            f"{reason}={n}" for reason, n in sorted(tampered_reasons.items()))
         logger.warning(
             "journal-fold: %d row(s) carried a provenance token that "
-            "does not verify (edited content, another install's key, "
-            "or a newer row schema) — demoted to the unstamped tier: "
-            "exact-hash fold credit only, no verdict reuse",
-            tampered,
+            "verifies under NO known canonicalisation generation "
+            "(%s: edited content, another install's key, a newer row "
+            "schema outside the shipped vocabulary, or an index copy "
+            "written by a version-skewed merge that dropped a stamped "
+            "field) — demoted to the unstamped tier: exact-hash fold "
+            "credit only, no verdict reuse. If these are "
+            "project-index rows whose run journal still verifies, "
+            "`raptor-audit journal reindex <run-dir>` re-projects the "
+            "verifying copies",
+            tampered, split,
         )
     if unstamped_unverifiable:
         logger.info(
@@ -2235,12 +3369,13 @@ def _verify_entries_fold(
         )
 
     if not to_verify:
+        _log_blocked_split()
         return
 
     from core.staleness import hash_spans
 
     stale = 0
-    reuse_blocked: dict[str, int] = {}
+    assert target_path is not None
     for file_path, items in to_verify.items():
         resolved = safe_join(Path(target_path), file_path)
         if resolved is None or not resolved.is_file():
@@ -2250,12 +3385,12 @@ def _verify_entries_fold(
             # and their verdicts stood as coverage; compute_drift
             # flags the identical case as drift. Resurface instead.
             stale += len(items)
-            # 4-tuples, matching the to_verify append above. A 3-name
-            # unpack here raised ValueError for ANY missing file, and
-            # the fold-level except then aborted the ENTIRE fold —
-            # every prior verdict re-bought because one reviewed file
-            # was deleted.
-            for _entry, key, _spans, _verified in items:
+            # 5-tuples, matching the to_verify append above. A
+            # shorter unpack here raised ValueError for ANY missing
+            # file, and the fold-level except then aborted the ENTIRE
+            # fold — every prior verdict re-bought because one
+            # reviewed file was deleted.
+            for _entry, key, _spans, _windows, _verified in items:
                 logger.debug(
                     "journal-fold: %s source missing since %s review "
                     "— resurfacing as gap",
@@ -2264,12 +3399,14 @@ def _verify_entries_fold(
             continue
         flat_spans: list[tuple] = []
         span_counts: list[int] = []
-        for _entry, _key, entry_spans, _verified in items:
+        for _entry, _key, entry_spans, windows, _verified in items:
+            # windows is index-aligned with entry_spans by
+            # construction: hash the WINDOW, report the span.
             span_counts.append(len(entry_spans))
-            flat_spans.extend(entry_spans)
+            flat_spans.extend(windows)
         all_hashes = hash_spans(resolved, flat_spans)
         hash_idx = 0
-        for (entry, key, entry_spans, verified_row), n_spans in zip(
+        for (entry, key, entry_spans, _windows, verified_row), n_spans in zip(
                 items, span_counts):
             candidates = all_hashes[hash_idx:hash_idx + n_spans]
             hash_idx += n_spans
@@ -2327,6 +3464,33 @@ def _verify_entries_fold(
                         key, getattr(entry, "run_id", None),
                     )
                     continue
+                if entry.verdict == "dark":
+                    # Unstamped rows are never imported as reused
+                    # verdicts, so an unstamped dark row has no
+                    # re-adjudication route — legacy tolerance is for
+                    # SETTLED verdicts, not the unresolved bucket.
+                    _dark_resurface(key, "unstamped rows never import")
+                    continue
+                if entry.verdict in ("finding", "suspicious"):
+                    # Finding-class rows need their finding to be
+                    # LIVE to earn suppression, and only a verified
+                    # row re-materialises into findings.json (the
+                    # re-import gate refuses unstamped/tampered
+                    # rows). Crediting here while the finding is
+                    # refused would be the worst joint outcome —
+                    # finding dropped AND review suppressed. Re-
+                    # review instead: the finding is honestly
+                    # rediscovered (cross-install resume / key
+                    # rotation pay re-review only for the tiny
+                    # finding-bearing fraction).
+                    stale += 1
+                    logger.debug(
+                        "journal-fold: unstamped %s row carries a "
+                        "finding-class verdict (%s) with no re-import "
+                        "route — resurfacing as gap",
+                        key, entry.verdict,
+                    )
+                    continue
                 unstamped_credited += 1
                 _credit(key, matched_span[0])
                 continue
@@ -2335,12 +3499,70 @@ def _verify_entries_fold(
                 if not (entry.strategies or []) and (
                         strategy_backfill is not None):
                     recorded_strategies = strategy_backfill(entry)
+                # The slice recompute must run at the span where the
+                # source hash actually VERIFIED: for an unchanged
+                # function that merely moved, that is the checklist's
+                # current span — recomputing at the recorded span
+                # would fingerprint whatever code now occupies the
+                # old lines and could reproduce the stamp
+                # byte-for-byte (an empty selection matches an
+                # empty-selection stamp), falsely certifying the
+                # slice unchanged. Whichever candidate verified, hand
+                # back the RAW line_end (possibly None) so the
+                # recompute mirrors the writer's stamp call — both
+                # candidate lists normalise a missing line_end to
+                # line_start, which would truncate the fallback read
+                # window the stamp was computed over. Recorded-site
+                # match: the entry's own raw line_end — but only when
+                # it equals the checklist's CURRENT raw line_end at
+                # THAT SITE (per site via site_raw_ends: the
+                # same-named occurrence owning the key's
+                # first-occurrence slot never speaks for the reviewed
+                # site). When the two differ — a row stamped over a
+                # measured line_end whose current item dropped it, or
+                # the reverse — the recompute would certify the stamp
+                # window while the re-review prompt reads a different
+                # one: a model gaining a concept that selects only in
+                # the widened region reproduces the stamp
+                # byte-for-byte and reuses a stale verdict. No window
+                # agreement (including a site absent from the current
+                # checklist or a non-int raw on either side) skips
+                # the short-circuit entirely — the relevance diff
+                # decides, the pre-stamp behaviour. Current-span
+                # match (the moved function): the CHECKLIST's raw
+                # line_end via current_raw_ends — recomputing over a
+                # single normalised line at the new location selects
+                # nothing and reproduces an empty-selection stamp,
+                # while the re-review prompt there reads the fallback
+                # window over the function's real body.
+                verified_span: tuple[int, int | None] | None = matched_span
+                if getattr(entry, "line_start", None) and (
+                        matched_span == (
+                            entry.line_start,
+                            entry.line_end or entry.line_start)):
+                    entry_raw_end = entry.line_end
+                    raw_comparable = entry_raw_end is None or (
+                        isinstance(entry_raw_end, int)
+                        and not isinstance(entry_raw_end, bool))
+                    site_raw_end = (site_raw_ends or {}).get(
+                        key, {}).get(entry.line_start, _RAW_END_UNKNOWN)
+                    if raw_comparable and site_raw_end == entry_raw_end:
+                        verified_span = (entry.line_start, entry.line_end)
+                    else:
+                        verified_span = None
+                elif matched_span == current_spans.get(key):
+                    verified_span = (
+                        matched_span[0],
+                        (current_raw_ends or {}).get(
+                            key, matched_span[1]))
                 reason = _reuse_ineligibility(
                     entry, key,
                     current_strategies_fn=current_strategies_fn,
                     current_model=current_model,
                     domain_ctx=domain_ctx,
                     recorded_strategies=recorded_strategies,
+                    hydrate_fn=hydrate_fn,
+                    matched_span=verified_span,
                 )
                 if reason is not None:
                     cls = _reuse_block_class(reason)
@@ -2377,18 +3599,7 @@ def _verify_entries_fold(
             "reuse; rows re-stamp on their next live review)",
             unstamped_credited, source_label,
         )
-    if reuse_blocked:
-        # Per-reason split, not an aggregate: the drivers have very
-        # different operator meaning (context_reduced re-reviews are
-        # by design; a strategy_changed mass-fire signals unstable
-        # strategy inference inputs).
-        split = ", ".join(
-            f"{cls}={n}" for cls, n in sorted(reuse_blocked.items()))
-        logger.info(
-            "journal-fold: %d hash-verified %s review(s) not "
-            "reusable (%s) — resurfacing for re-review",
-            sum(reuse_blocked.values()), source_label, split,
-        )
+    _log_blocked_split()
 
 
 def _build_file_tool_coverage(
@@ -2472,6 +3683,14 @@ def _derive_entry_points(checklist: dict[str, Any]) -> set:
             name = item.get("name", "")
             if not name:
                 continue
+            if item.get("kind", "") == "interstitial":
+                # The visibility fallback below reads "not static" as
+                # exported API, but an interstitial span has no
+                # linkage at all — deriving an entry point from it let
+                # file-scope residue bypass the dead-code demotion via
+                # the entry-point tier whenever the kind reached
+                # priority computation.
+                continue
             metadata = item.get("metadata") or {}
             visibility = metadata.get("visibility", "")
 
@@ -2517,6 +3736,7 @@ def _compute_priority(
     fuzz_iterations: int = 0,
     fuzz_crashes: int = 0,
     parser_shaped: bool = False,
+    script_handler: bool = False,
 ) -> int:
     """Assign priority (lower = higher priority).
 
@@ -2533,6 +3753,11 @@ def _compute_priority(
     header-API membership, so the ``static`` decode workhorse that
     actually walks the untrusted bytes used to compete on SLOC alone
     while its thin exported siblings claimed the file's review slots.
+
+    ``script_handler`` marks an interstitial item that compute_gaps'
+    language + content gate classified as script-per-file handler
+    code: it competes on the normal tiers instead of the dead-code
+    demotion.
     """
     if is_entry_point:
         # ``sloc`` 0 means UNMEASURED (no line_end in the checklist),
@@ -2548,7 +3773,16 @@ def _compute_priority(
     # large the body is or what sinks it lexically mentions — the
     # large-sloc arm used to hand oracle-absent functions the TOP
     # tier.
-    if binary_absent or item_kind == "interstitial":
+    #
+    # The interstitial arm is language-conditional in both directions:
+    # for compiled/object languages the file-scope residue really is
+    # declarations-and-braces glue — the demotion is earned, and
+    # lifting it would re-buy full review slots on items with nothing
+    # to review. For script-per-file languages the top-level span IS
+    # the request handler (``script_handler``, set by compute_gaps'
+    # content gate), and a blanket demotion wrote off the code the
+    # requests actually execute.
+    if binary_absent or (item_kind == "interstitial" and not script_handler):
         return PRIORITY_DEAD_CODE
 
     if sloc >= _LARGE_SLOC:

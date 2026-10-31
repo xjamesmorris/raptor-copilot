@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from packages.sca.platform_matrix import PlatformPair, ProjectPlatformMatrix
 from packages.sca.platform_matrix.glibc_db import LibcVersion
 from packages.sca.wheel_compat.compat import (
@@ -467,6 +469,73 @@ def test_recommendation_cache_does_not_cache_failure():
     assert find_compatible_version(pypi, "z3-solver", matrix) == "4.15.8.0"
 
 
+def test_stub_swap_poison_confined_by_per_test_isolation(
+    _fresh_recommendation_cache: Callable[[], None],
+) -> None:
+    """The cache key is ``(name, matrix-shape)`` and deliberately
+    ignores the client, so a test whose stub has NO compatible
+    version caches ``None`` and a later test's different stub for the
+    same (name, shape) reads that poisoned ``None`` instead of its own
+    releases. The autouse ``_fresh_recommendation_cache`` fixture is
+    what confines each stub's answers to its own test; this test
+    reproduces the poisoning pair around the fixture's boundary-clear
+    and fails if that isolation is removed."""
+    from packages.sca.wheel_compat.compat import find_compatible_version
+
+    matrix = ProjectPlatformMatrix()
+    matrix.add(_pair("aarch64", "glibc", (2, 36)))
+
+    # Poisoner half: a stub where every release needs glibc 2.38 →
+    # no compatible version → the negative result is cached under
+    # ("z3-solver", {aarch64/glibc-2.36 shape}).
+    poisoner = _StubPyPI({
+        "z3-solver": {
+            "releases": {
+                "4.16.0.0": [
+                    {"filename":
+                     "z3_solver-4.16.0.0-py3-none-manylinux_2_38_aarch64.whl"},
+                ],
+            },
+        },
+    })
+    assert find_compatible_version(poisoner, "z3-solver", matrix) is None
+
+    # The hazard, demonstrated: a DIFFERENT stub that DOES carry a
+    # compatible 4.15.8.0 still reads the poisoned entry — the key
+    # ignores which client answered.
+    victim = _StubPyPI({
+        "z3-solver": {
+            "releases": {
+                "4.16.0.0": [
+                    {"filename":
+                     "z3_solver-4.16.0.0-py3-none-manylinux_2_38_aarch64.whl"},
+                ],
+                "4.15.8.0": [
+                    {"filename":
+                     "z3_solver-4.15.8.0-py3-none-manylinux_2_34_aarch64.whl"},
+                ],
+            },
+        },
+    })
+    assert find_compatible_version(victim, "z3-solver", matrix) is None
+
+    # The protection: the autouse fixture clears the cache at every
+    # test boundary. Reproduce that boundary here via the clear the
+    # fixture yields — if the fixture stops providing isolation, this
+    # assertion (or the recommendation below) fails exactly like the
+    # cross-file CI bite.
+    boundary_clear = _fresh_recommendation_cache
+    assert callable(boundary_clear), (
+        "per-test cache isolation fixture no longer supplies its "
+        "boundary clear — stub-swapping tests are unprotected"
+    )
+    boundary_clear()
+
+    # Victim half, post-boundary: the walk-back sees the victim
+    # stub's own releases again.
+    assert find_compatible_version(victim, "z3-solver", matrix) == "4.15.8.0"
+
+
 # ---------------------------------------------------------------------------
 # macOS version gating
 # ---------------------------------------------------------------------------
@@ -625,3 +694,129 @@ def test_musl_project_glibc_only_dep_gets_actionable_alpine_hint():
     # alternative should appear so the operator has a clear fix.
     assert "apk add build-base" in v.reason
     assert "python:3.X-bookworm" in v.reason
+
+
+# ---------------------------------------------------------------------------
+# Explicit pair OS (bake / build-push / Dockerfile provenance)
+# ---------------------------------------------------------------------------
+
+def test_linux_pair_without_libc_accepts_manylinux_wheel() -> None:
+    """A Linux-provenance pair with undetermined libc (bake /
+    build-push mint these) accepts a standard manylinux wheel —
+    libc=None means "no libc constraint", not "non-Linux". The old
+    overload rejected every Linux wheel for such pairs, so a compiled
+    dep drew sdist_only / variant_mismatch / arch_gap findings per
+    pair and find_compatible_version could never answer "ok"."""
+    pypi = _StubPyPI({
+        "numpy": {
+            "releases": {
+                "2.0.0": [
+                    {"filename":
+                     "numpy-2.0.0-cp312-cp312-manylinux_2_17_x86_64.whl"},
+                ],
+            },
+        },
+    })
+    wm = wheel_matrix_for_version(pypi, "numpy", "2.0.0")
+    matrix = ProjectPlatformMatrix()
+    matrix.add(PlatformPair(
+        arch="x86_64", libc=None, os="linux",
+        source="docker-bake.hcl platforms in docker-bake.hcl",
+    ))
+    verdicts = check_compat(matrix, wm)
+    assert [v.verdict for v in verdicts] == ["ok"]
+
+
+def test_linux_pair_without_libc_rejects_windows_only_wheel() -> None:
+    """The other error direction of the libc=None overload: the same
+    Linux-provenance pair matched a win_amd64-only wheel and reported
+    "ok" for a deployment that cannot install the package."""
+    pypi = _StubPyPI({
+        "wonly": {
+            "releases": {
+                "1.0": [
+                    {"filename": "wonly-1.0-cp312-cp312-win_amd64.whl"},
+                ],
+            },
+        },
+    })
+    wm = wheel_matrix_for_version(pypi, "wonly", "1.0")
+    matrix = ProjectPlatformMatrix()
+    matrix.add(PlatformPair(
+        arch="x86_64", libc=None, os="linux",
+        source="docker-bake.hcl platforms in docker-bake.hcl",
+    ))
+    verdicts = check_compat(matrix, wm)
+    assert [v.verdict for v in verdicts] != ["ok"]
+
+
+def test_windows_pair_rejects_linux_wheel_and_accepts_win() -> None:
+    """Explicit Windows pairs match only Windows wheels."""
+    pypi = _StubPyPI({
+        "both": {
+            "releases": {
+                "1.0": [
+                    {"filename": "both-1.0-cp312-cp312-win_amd64.whl"},
+                    {"filename":
+                     "both-1.0-cp312-cp312-manylinux_2_17_x86_64.whl"},
+                ],
+            },
+        },
+    })
+    wm = wheel_matrix_for_version(pypi, "both", "1.0")
+    matrix = ProjectPlatformMatrix()
+    matrix.add(PlatformPair(
+        arch="x86_64", libc=None, os="windows",
+        source="GHA runs-on: windows-2022 in ci.yml",
+    ))
+    verdicts = check_compat(matrix, wm)
+    assert [v.verdict for v in verdicts] == ["ok"]
+    assert "win_amd64" in verdicts[0].matching_wheel
+
+
+class _CountingPyPI(_StubPyPI):
+    def __init__(self, packages: dict):
+        super().__init__(packages)
+        self.calls = 0
+
+    def get_metadata(self, name: str):
+        self.calls += 1
+        return super().get_metadata(name)
+
+
+def test_version_walk_fetches_metadata_once() -> None:
+    """find_compatible_version already holds the releases dict; the
+    per-version matrix must build from it instead of re-fetching the
+    same metadata once per walked version (up to 20 identical
+    fetches, masked only when the client happens to cache)."""
+    from packages.sca.wheel_compat.compat import (
+        clear_recommendation_cache, find_compatible_version,
+    )
+
+    clear_recommendation_cache()
+    releases = {
+        v: [{"filename": f"pkg-{v}-cp312-cp312-win_amd64.whl"}]
+        for v in ("1.0", "1.1", "1.2", "1.3")
+    }
+    pypi = _CountingPyPI({"pkg": {"releases": releases}})
+    matrix = ProjectPlatformMatrix()
+    matrix.add(PlatformPair(
+        arch="x86_64", libc=LibcVersion("glibc", (2, 36)), os="linux",
+        source="test",
+    ))
+    rec = find_compatible_version(pypi, "pkg", matrix)
+    assert rec is None            # Windows-only wheels never fit.
+    assert pypi.calls == 1
+    clear_recommendation_cache()
+
+
+def test_post_release_ranks_above_its_base_version() -> None:
+    """``1.2.3.post1`` supersedes ``1.2.3`` (PEP 440); a sort tie let
+    the walk recommend the superseded base build."""
+    from packages.sca.wheel_compat.compat import _version_key
+
+    assert _version_key("1.2.3.post1") > _version_key("1.2.3")
+    assert _version_key("1.2.3.4") > _version_key("1.2.3.post1")
+    assert sorted(
+        ["1.2.3", "1.2.3.post2", "1.2.3.post1"], key=_version_key,
+    ) == ["1.2.3", "1.2.3.post1", "1.2.3.post2"]

@@ -98,6 +98,18 @@ class TestBuildIndex:
         assert "abs_val" in idx
         assert "return -x" in idx["abs_val"][1]
 
+    def test_function_pointer_parameter(self, tmp_path):
+        """A fn-pointer parameter nests parentheses inside the list;
+        the flat [^)]* param pattern never reached the brace."""
+        (tmp_path / "cb.h").write_text(
+            "static inline void each(int n, void (*cb)(int)) {\n"
+            "    for (int i = 0; i < n; i++) cb(i);\n"
+            "}\n"
+        )
+        idx = build_header_function_index(tmp_path)
+        assert "each" in idx
+        assert "cb(i)" in idx["each"][1]
+
     def test_subdirectory_headers(self, tmp_path):
         sub = tmp_path / "include" / "mylib"
         sub.mkdir(parents=True)
@@ -114,6 +126,27 @@ class TestBuildIndex:
         )
         idx = build_header_function_index(tmp_path)
         assert "if" not in idx
+
+    def test_skips_reserved_words_but_keeps_prefix_names(self, tmp_path):
+        # _SKIP_NAMES shares the extractor's reserved-word blocklist:
+        # a captured name that is a C/C++ reserved word (`class` is a
+        # legal C identifier but reserved in C++) is refused, while
+        # identifiers that merely prefix a reserved word must index.
+        (tmp_path / "mix.h").write_text(
+            "static int class(int x) {\n"
+            "    return x;\n"
+            "}\n"
+            "static int classify(int x) {\n"
+            "    return x + 1;\n"
+            "}\n"
+            "static int interior(void) {\n"
+            "    return 2;\n"
+            "}\n"
+        )
+        idx = build_header_function_index(tmp_path)
+        assert "class" not in idx
+        assert "classify" in idx
+        assert "interior" in idx
 
     def test_braces_inside_string_literal(self, tmp_path):
         (tmp_path / "fmt.h").write_text(
@@ -171,3 +204,29 @@ class TestExtractFunctionBody:
     def test_unclosed(self):
         lines = ["int f(void) {", "    x++;"]
         assert _extract_function_body(lines, 0) is None
+
+
+class TestMultiLineSignature:
+    def test_two_line_signature_gets_full_body(self, tmp_path):
+        # The depth<=0 exit fired after the FIRST line even when that
+        # line carried no brace — a multi-line signature returned a
+        # one-line "body" (degraded callee-enrichment hints).
+        (tmp_path / "multi.h").write_text(
+            "static inline int add_pair(int a,\n"
+            "                           int b) {\n"
+            "    return a + b;\n"
+            "}\n"
+        )
+        result = lookup_header_function(tmp_path, "add_pair")
+        assert result is not None
+        _, body = result
+        assert "return a + b;" in body
+        assert body.count("\n") >= 2
+
+    def test_single_line_body_still_extracted(self, tmp_path):
+        (tmp_path / "one.h").write_text(
+            "static inline int one(void) { return 1; }\n"
+        )
+        result = lookup_header_function(tmp_path, "one")
+        assert result is not None
+        assert "return 1;" in result[1]

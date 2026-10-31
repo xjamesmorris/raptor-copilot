@@ -12,7 +12,9 @@ from typing import Any
 
 from core.security.prompt_defense_profiles import CONSERVATIVE
 from core.security.prompt_envelope import ModelDefenseProfile, system_with_priming
+from core.run.finding_status import read_verdict
 
+from .correlation import tally_verdict_votes
 from .dispatch import DispatchTask
 
 # Canonical SCA-dispatch predicates live in finding_kinds (shared with
@@ -172,7 +174,7 @@ class ExploitTask(DispatchTask):
     """Exploit PoC generation for exploitable findings."""
 
     name = "exploit"
-    model_role = "code"
+    model_role = "exploit"
     temperature = 0.8
     budget_cutoff = 0.85
 
@@ -189,7 +191,7 @@ class ExploitTask(DispatchTask):
             prior = prior_results.get(fid, {})
             if prior.get("exploit_code"):
                 continue
-            if prior.get("is_exploitable"):
+            if read_verdict(prior, "is_exploitable") is True:
                 selected.append(f)
                 continue
             # SCA findings: select if reachable or KEV-listed.
@@ -265,7 +267,7 @@ class PatchTask(DispatchTask):
     """Secure patch generation for exploitable findings."""
 
     name = "patch"
-    model_role = "code"
+    model_role = "exploit"
     temperature = 0.3
     budget_cutoff = 0.85
 
@@ -305,7 +307,7 @@ class PatchTask(DispatchTask):
             prior = prior_results.get(fid, {})
             if prior.get("patch_code"):
                 continue
-            if prior.get("is_exploitable"):
+            if read_verdict(prior, "is_exploitable") is True:
                 selected.append(f)
                 continue
             # SCA findings with a known fix version get a manifest patch.
@@ -420,6 +422,38 @@ class PatchTask(DispatchTask):
             return None
 
 
+# Override-stage snapshots of the primary analyst's own
+# ``is_exploitable`` conclusion, EARLIEST first. Two pipeline stages
+# mutate the field in place — the cross-family conservative override
+# (CrossFamilyCheckTask.finalize) and the consensus majority
+# (ConsensusTask.finalize) — and each snapshots the pre-override value
+# once, idempotently, before writing. Any consumer that renders or
+# tallies "the primary's vote" must read the earliest snapshot
+# present: reading the raw field one stage downstream re-creates the
+# structurally-impossible-critique defect (a judge shown an override
+# as the analyst's own conclusion, minting "agreed" corroboration for
+# a verdict no analyst produced) one hop later.
+_PRIMARY_SNAPSHOT_KEYS: tuple[str, ...] = (
+    "pre_crossfamily_is_exploitable",
+    "pre_consensus_is_exploitable",
+)
+
+
+def primary_verdict_snapshot(primary: dict) -> bool | None:
+    """The primary analyst's own tri-state ``is_exploitable`` verdict.
+
+    Earliest override-stage snapshot when one exists, else the
+    current field through ``read_verdict`` (tri-state: only a genuine
+    bool is a vote). Snapshot values are RAPTOR-written tri-states;
+    a non-bool snapshot reads as abstention, same as ``read_verdict``.
+    """
+    for key in _PRIMARY_SNAPSHOT_KEYS:
+        if key in primary:
+            value = primary[key]
+            return value if isinstance(value, bool) else None
+    return read_verdict(primary, "is_exploitable")
+
+
 class ConsensusTask(DispatchTask):
     """Independent second opinion from consensus models."""
 
@@ -508,11 +542,61 @@ class ConsensusTask(DispatchTask):
                 if not consensus_analyses:
                     continue
 
-                primary_exploitable = primary.get("is_exploitable", False)
-                verdicts = [primary_exploitable]
-                verdicts.extend(ca.get("is_exploitable", False) for ca in consensus_analyses)
+                # Tri-state read of the analyst's OWN verdict: the
+                # earliest override-stage snapshot when the
+                # cross-family conservative override already mutated
+                # the raw field (reading the raw field tallied the
+                # CHECKER's opinion as "the primary's vote" and froze
+                # it into the pre-consensus audit snapshot), else
+                # read_verdict — an abstained primary is recorded as
+                # None, not fabricated into an explicit False.
+                primary_exploitable = primary_verdict_snapshot(primary)
+                # Shared abstention-aware tally (see correlation.py):
+                # missing/null is_exploitable — an errored / refused /
+                # schema-failed model — is an abstention, never a
+                # "not exploitable" vote. Pre-fix `.get(..., False)`
+                # let two malformed consensus responses out-vote a
+                # clean primary "exploitable" verdict 2-1.
+                panel = tally_verdict_votes(
+                    ca.get("is_exploitable") for ca in consensus_analyses
+                )
+                # The primary's tally feed is the PARSED tri-state
+                # value, matching the stamp decision below: feeding
+                # the raw field let a junk shape ("true") cast a
+                # coerced, DECISIVE vote on rows the stamp then
+                # certified as the panel's own verdict — and made
+                # this surface diverge from JudgeTask, whose
+                # abstained-primary branch never lets the primary
+                # influence the outcome.
+                tally = tally_verdict_votes(
+                    [primary_exploitable]
+                    + [ca.get("is_exploitable") for ca in consensus_analyses]
+                )
 
-                disputed = not all(v == verdicts[0] for v in verdicts)
+                disputed = tally.disputed
+                # The primary cast NO vote (missing/null
+                # is_exploitable — errored / refused / schema-nulled,
+                # or a junk shape, which is a non-verdict either way).
+                # Snapshot BEFORE the verdict override below so the
+                # stamp decision reads the analyst's actual state.
+                primary_abstained = primary_exploitable is None
+
+                if panel.voted == 0:
+                    # The whole consensus panel abstained — no second
+                    # opinion exists. Mark the stage outcome
+                    # explicitly and leave the primary verdict
+                    # untouched: "agreed" here would let errored
+                    # consensus responses mint corroboration
+                    # (dataflow_validation reads consensus=="agreed"
+                    # as agreement evidence).
+                    primary["consensus"] = "no-verdict"
+                    primary["consensus_analyses"] = [
+                        {"model": ca.get("analysed_by", "?"),
+                         "is_exploitable": ca.get("is_exploitable"),
+                         "reasoning": ca.get("reasoning", "")}
+                        for ca in consensus_analyses
+                    ]
+                    continue
 
                 n_consensus = len(consensus_analyses)
                 if n_consensus == 1:
@@ -531,11 +615,38 @@ class ConsensusTask(DispatchTask):
                     # verdict and flags `cross_family_disputed`")
                     # so consensus and cross-family handle
                     # disputes the same way.
-                    final = any(verdicts)  # True if any voter says exploitable
+                    final = tally.any_exploitable()
                 else:
-                    final = sum(1 for v in verdicts if v) > len(verdicts) / 2
+                    majority = tally.majority()
+                    # Tied vote (possible once abstainers are
+                    # excluded, or with an even voter count): no
+                    # majority exists — apply the same conservative-
+                    # max rule as the 1-vote dispute above, so a
+                    # tie is surfaced as exploitable-for-review
+                    # rather than silently resolved against the
+                    # finding.
+                    final = (tally.any_exploitable() if majority is None
+                             else majority)
 
-                primary["consensus"] = "disputed" if disputed else "agreed"
+                if primary_abstained:
+                    # A one-sided pair: the primary never voted, so
+                    # there is nothing to "agree" with — that stamp
+                    # would mint corroboration downstream
+                    # (reconcile_dataflow_validation reads
+                    # consensus=="agreed" as "two strong signals
+                    # support the original verdict" and takes the
+                    # SOFT downgrade path; the operator summary
+                    # counts it as agreement). The panel's verdict
+                    # stands on its own authority instead — same
+                    # stamp semantics as JudgeTask.finalize's
+                    # primary_abstained branch below.
+                    primary["consensus"] = (
+                        "disputed" if panel.disputed else "panel-verdict"
+                    )
+                else:
+                    primary["consensus"] = (
+                        "disputed" if disputed else "agreed"
+                    )
                 # Capture pre-consensus verdict before overriding,
                 # so JudgeTask (which runs AFTER consensus) can show
                 # the judge what the primary analyst actually
@@ -594,7 +705,13 @@ class JudgeTask(DispatchTask):
             r = prior_results.get(fid, {"error": True})
             if "error" in r:
                 continue
-            if not r.get("is_true_positive", True):
+            # Only an EXPLICIT False skips the judge. Response
+            # validation nulls a missing/malformed is_true_positive
+            # (an abstention, not a verdict); a truthiness check read
+            # that None as "false positive" and silently dropped from
+            # the judge panel exactly the malformed-response findings
+            # that most need a second opinion.
+            if read_verdict(r, "is_true_positive") is False:
                 continue
             if r.get("cross_family_agreed"):
                 continue
@@ -610,16 +727,22 @@ class JudgeTask(DispatchTask):
         fid = finding.get("finding_id")
         primary = self.results_by_id.get(fid, {})
         primary_reasoning = (primary.get("reasoning") or "")[:2000]
-        # Use pre-consensus verdict if ConsensusTask ran first
-        # and stored it. Pre-fix `primary.get("is_exploitable")`
-        # showed the post-consensus value to the judge, making it
-        # structurally impossible for the judge to critique the
-        # primary analyst's ORIGINAL conclusion on any finding
-        # consensus had touched.
-        primary_verdict = primary.get(
-            "pre_consensus_is_exploitable",
-            primary.get("is_exploitable", "unknown"),
+        # The EARLIEST override-stage snapshot (cross-family, then
+        # consensus), else the raw field. Pre-fix
+        # `primary.get("is_exploitable")` showed the post-consensus
+        # value to the judge, making it structurally impossible for
+        # the judge to critique the primary analyst's ORIGINAL
+        # conclusion on any finding consensus had touched — and the
+        # pre-consensus-only read recreated the same defect one stage
+        # earlier for cross-family-overridden findings.
+        primary_verdict: bool | None | str = primary_verdict_snapshot(
+            primary,
         )
+        if primary_verdict is None:
+            # Abstained primary (schema-nulled verdict or a None
+            # pre-consensus snapshot): show the judge "unknown", not
+            # a Python None the model could misread as a verdict.
+            primary_verdict = "unknown"
         primary_ruling = primary.get("ruling", "unknown")
 
         extra_blocks: tuple[UntrustedBlock, ...] = (
@@ -659,7 +782,8 @@ class JudgeTask(DispatchTask):
         return _budget_for_task(self, model)
 
     def finalize(self, results, prior_results):
-        """Apply judge verdicts: preserve primary (single), majority (multi)."""
+        """Apply judge verdicts: preserve primary (single), majority
+        (multi); when the primary abstained, the panel verdict stands."""
         judge_by_finding: dict[str, list[dict]] = {}
         for r in results:
             fid = r.get("finding_id")
@@ -672,19 +796,82 @@ class JudgeTask(DispatchTask):
                 if not judge_analyses:
                     continue
 
-                primary_exploitable = primary.get("is_exploitable", False)
-                verdicts = [primary_exploitable]
-                verdicts.extend(ja.get("is_exploitable", False) for ja in judge_analyses)
+                # Tri-state read of the analyst's OWN verdict — same
+                # earliest-snapshot rule as the consensus stage above
+                # (the raw field here carries the consensus/cross-
+                # family override; feeding it as "the primary's vote"
+                # double-counts the earlier panel's opinion in this
+                # tally and mislabels agreed/disputed) — and the same
+                # no-fabrication rule (junk is not a vote).
+                primary_exploitable = primary_verdict_snapshot(primary)
+                # Shared abstention-aware tally (see correlation.py):
+                # missing/null is_exploitable is an abstention, never
+                # a "not exploitable" vote — pre-fix a schema-failed
+                # judge response counted as a negative majority vote
+                # and could flip a real exploitable verdict.
+                panel = tally_verdict_votes(
+                    ja.get("is_exploitable") for ja in judge_analyses
+                )
+                # Same parsed-primary tally feed as the consensus
+                # stage: the primary's vote is the tri-state value
+                # the abstention snapshot below reads, never the raw
+                # field (a junk shape is not a vote).
+                tally = tally_verdict_votes(
+                    [primary_exploitable]
+                    + [ja.get("is_exploitable") for ja in judge_analyses]
+                )
 
-                disputed = not all(v == verdicts[0] for v in verdicts)
+                disputed = tally.disputed
 
+                if panel.voted == 0:
+                    # Every judge abstained — no review verdict
+                    # exists. Record the stage outcome explicitly,
+                    # preserve the primary verdict, and skip the
+                    # contradiction tie-break below (it requires an
+                    # actual judge vote; "agreed" from zero votes
+                    # would mint corroboration).
+                    primary["judge"] = "no-verdict"
+                    primary["judge_analyses"] = [
+                        {"model": ja.get("analysed_by", "?"),
+                         "resolved_model": ja.get("resolved_model"),
+                         "is_exploitable": ja.get("is_exploitable"),
+                         "reasoning": ja.get("reasoning", "")}
+                        for ja in judge_analyses
+                    ]
+                    continue
+
+                primary_abstained = primary_exploitable is None
                 n_judges = len(judge_analyses)
-                if n_judges == 1:
+                if primary_abstained:
+                    # The primary cast NO vote (missing/null
+                    # is_exploitable — errored / refused / schema-
+                    # nulled). select_items admits these findings
+                    # precisely because they need a real review, so
+                    # the panel's verdict stands regardless of panel
+                    # size; "preserve primary" here would throw that
+                    # review away and keep the non-verdict. And
+                    # "agreed" would mint corroboration from a
+                    # one-sided pair — the primary never voted, so
+                    # there is nothing to agree with. A tied panel
+                    # yields None: the abstention survives honestly.
+                    final = panel.majority()
+                    primary["judge"] = (
+                        "disputed" if panel.disputed else "panel-verdict"
+                    )
+                elif n_judges == 1:
                     final = primary_exploitable
+                    primary["judge"] = "disputed" if disputed else "agreed"
                 else:
-                    final = sum(1 for v in verdicts if v) > len(verdicts) / 2
+                    majority = tally.majority()
+                    # No majority (a tie once abstainers are
+                    # excluded): preserve the primary verdict — the
+                    # judge stage overrides only on a strict
+                    # majority, mirroring its own 1-judge
+                    # preserve-primary rule.
+                    final = (primary_exploitable if majority is None
+                             else majority)
+                    primary["judge"] = "disputed" if disputed else "agreed"
 
-                primary["judge"] = "disputed" if disputed else "agreed"
                 primary["is_exploitable"] = final
                 primary["judge_analyses"] = [
                     {"model": ja.get("analysed_by", "?"),
@@ -705,8 +892,11 @@ class JudgeTask(DispatchTask):
                 # count drops; preserve the original ``contradictions``
                 # list + a new ``contradiction_resolved_by_judge``
                 # marker so the audit trail survives for operators
-                # who want to inspect HOW it was resolved.
-                if primary.get("self_contradictory"):
+                # who want to inspect HOW it was resolved. `final`
+                # is None only for an abstained primary over a tied
+                # panel — no verdict was produced, so nothing exists
+                # to tie-break with.
+                if final is not None and primary.get("self_contradictory"):
                     primary["contradiction_resolved_by_judge"] = True
                     primary["self_contradictory"] = False
 
@@ -934,7 +1124,8 @@ class GroupAnalysisTask(DispatchTask):
         si_blocks: tuple[UntrustedBlock, ...] = ()
         for fid in finding_ids:
             r = self.results_by_id.get(fid, {})
-            exploitable = r.get("is_exploitable", "unknown")
+            _v = read_verdict(r, "is_exploitable")
+            exploitable = "unknown" if _v is None else _v
             score = r.get("exploitability_score", "?")
             reasoning = (r.get("reasoning") or "")[:300]
             summaries.append(f"- {fid}: exploitable={exploitable}, score={score}\n  {reasoning}")
@@ -1234,7 +1425,7 @@ class CrossFamilyCheckTask(AnalysisTask):
         return selected
 
     def finalize(self, results, prior_results):
-        from core.security.llm_family import same_family
+        from core.security.llm_family import family_of, same_family
 
         for r in results:
             fid = r.get("finding_id")
@@ -1261,12 +1452,64 @@ class CrossFamilyCheckTask(AnalysisTask):
                 }
                 continue
 
-            primary_exploitable = primary.get("is_exploitable", False)
-            checker_exploitable = r.get("is_exploitable", False)
+            # The guard above is VOID when either family is unknown:
+            # same_family returns False for any comparison involving
+            # "unknown", so two rebadged same-lineage ids sail past it
+            # and adjudicate. Unprovable is not cross-family
+            # (llm_family doctrine) — the resolver already refuses
+            # unknown producers, this is the belt for direct task
+            # construction. Record the check, don't adjudicate.
+            if (family_of(primary_model) == "unknown"
+                    or family_of(actual_model) == "unknown"):
+                unproven = ("primary" if family_of(primary_model)
+                            == "unknown" else "checker")
+                prior_results[fid]["cross_family_check"] = {
+                    "checker_model": actual_model,
+                    "intended_model": self.checker_model.model_name,
+                    "trigger": trigger,
+                    "verdict": (
+                        "skipped — cross-family not provable "
+                        f"({unproven} model family unknown)"
+                    ),
+                }
+                continue
+
+            # Tri-state reads (shared counting rule — see
+            # correlation.py's tally contract): only a genuine bool is
+            # a vote. A nulled ``is_exploitable`` (errored / refused /
+            # schema-failed response) is NOT a vote, and neither is a
+            # junk shape ("yes", 1) that bypassed response validation.
+            # Pre-fix the raw `.get` comparison let identical junk on
+            # both sides mint ``cross_family_agreed`` (suppressing
+            # BOTH review panels — consensus and judge skip agreed
+            # findings), let junk-vs-bool manufacture a "dispute"
+            # (flipping a clean not-exploitable primary to exploitable
+            # via the conservative override), and read ``1 == True``
+            # as cross-shape agreement. Record the check but don't
+            # adjudicate — same shape as the same-family fallback
+            # skip above.
+            primary_exploitable = read_verdict(primary, "is_exploitable")
+            checker_exploitable = read_verdict(r, "is_exploitable")
+            if primary_exploitable is None or checker_exploitable is None:
+                absent = ("checker" if checker_exploitable is None
+                          else "primary")
+                prior_results[fid]["cross_family_check"] = {
+                    "checker_model": actual_model,
+                    "checker_exploitable": checker_exploitable,
+                    "checker_ruling": r.get("ruling"),
+                    "trigger": trigger,
+                    "verdict": f"skipped — {absent} returned no verdict",
+                }
+                continue
 
             check_record = {
                 "checker_model": actual_model,
                 "checker_exploitable": checker_exploitable,
+                # The analyst's own vote, on the record in BOTH arms:
+                # pre-fix the record stored only the checker's side,
+                # so after the conservative override the primary's
+                # original conclusion survived nowhere.
+                "primary_exploitable": primary_exploitable,
                 "checker_ruling": r.get("ruling"),
                 "trigger": trigger,
             }
@@ -1304,6 +1547,17 @@ class CrossFamilyCheckTask(AnalysisTask):
                 check_record["reasoning_distance"] = distance
 
             if primary_exploitable != checker_exploitable:
+                # Snapshot the analyst's own verdict BEFORE the
+                # conservative override, idempotently — same shape as
+                # the pre-consensus snapshot one stage downstream.
+                # Consumers (ConsensusTask tally + stamp, JudgeTask's
+                # critique prompt) prefer the earliest snapshot via
+                # primary_verdict_snapshot; without it they read the
+                # override as the analyst's own conclusion.
+                if "pre_crossfamily_is_exploitable" not in prior_results[fid]:
+                    prior_results[fid]["pre_crossfamily_is_exploitable"] = (
+                        primary_exploitable
+                    )
                 prior_results[fid]["is_exploitable"] = True
                 prior_results[fid]["cross_family_disputed"] = True
                 check_record["verdict"] = "disputed — conservative override"

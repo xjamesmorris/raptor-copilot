@@ -46,7 +46,7 @@ Static analysis scan using Semgrep (and optionally CodeQL and Coccinelle).
 | `--exclude-dir <glob>` | Exclude directories matching glob (repeatable) |
 | `--extra-config <path>` | Additional Semgrep config file (repeatable) |
 | `--show-suppressed` | Include suppressed findings in output |
-| `--sandbox` / `--no-sandbox` | Enable or disable [sandbox](sandbox.md) isolation |
+| `--sandbox` / `--no-sandbox` | Enable or disable [sandbox](sandbox.md) isolation (disable is [consent-gated](sandbox.md#disabling-the-sandbox)) |
 | `--audit` | Enable sandbox audit mode (log would-be-blocked syscalls) |
 | `--audit-verbose` | Verbose audit output (strace-style) |
 | `--audit-budget <n>` | Maximum audit event budget |
@@ -108,6 +108,15 @@ patches.
 | `--compiler-scan` / `--no-compiler-scan` | Enable/disable the compiler-analyzer scan channel (gcc `-fanalyzer` / clang `--analyze`) |
 | `--compiler-scan-max-tus <n>` | Cap on translation units for `--compiler-scan` (default 2000) |
 | `--expanded-semgrep` | Re-run rules over preprocessor-expanded views of macro-heavy C/C++ TUs |
+| `--openant` | Run the [OpenAnt](#openant) LLM semantic scan in addition to Semgrep/CodeQL |
+| `--openant-only` | Replace Semgrep/CodeQL entirely: only the OpenAnt semantic scan runs (combining with `--codeql`/`--codeql-only` is refused at parse time) |
+| `--openant-core <path>` | Path to the `openant-core` directory (default `$OPENANT_CORE`). The flag surface is consent-gated: a core that is not a clean checkout of the pinned commit (wrong commit, modified/untracked files at the pin, unverifiable provenance) refuses at startup |
+| `--openant-core-unpinned` | Consent to run a `--openant-core` checkout that is not a clean pinned checkout this run (the project `config` trust marker grants the same, standing) |
+| `--openant-model <name>` | OpenAnt LLM model: `sonnet` (default) or `opus` |
+| `--openant-level <depth>` | OpenAnt analysis depth: `all`, `reachable` (default), `codeql`, `exploitable` |
+| `--openant-gateway-budget <usd>` | Per-run raise of the OpenAnt dispatcher-gateway spend cap on gateway-minted runs (default $25; any positive finite USD, no uncapped spelling; the anti-runaway request cap scales with it). No effect on direct-credential runs (noted loudly) |
+| `--openant-timeout-seconds <n>` | Wall-clock deadline for the OpenAnt child in seconds (default 1800; positive integer, no ceiling). On gateway-minted runs the token TTL follows it (timeout + 600s slack) |
+| `--openant-expose-api-key-to-child` | Consent to inject the raw Anthropic API key into the network-enabled OpenAnt child's env (direct mode). Default posture routes the child through the credential-isolating dispatcher gateway whenever a dispatcher route exists; a direct-credential run with no dispatcher route refuses without this flag. Argv-only (no env twin); `/openant` spelling: `--expose-api-key-to-child` |
 
 **Output control**
 
@@ -189,7 +198,7 @@ patches.
 | Flag | Description |
 |------|-------------|
 | `--sandbox <mode>` | Sandbox mode: `debug`, `frida`, `full`, `network-only`, `none`, `strict`, `target_run` |
-| `--no-sandbox` | Disable sandbox entirely |
+| `--no-sandbox` | Disable sandbox entirely ([consent-gated](sandbox.md#disabling-the-sandbox)) |
 
 **Audit layer** (sandbox syscall audit)
 
@@ -232,8 +241,8 @@ Deep static analysis with CodeQL dataflow validation.
 | `--max-findings <n>` | Maximum findings to process |
 | `--no-visualizations` | Skip diagram generation |
 | `--trust-repo` | Trust the repository |
-| `--phase-timeout <secs>` | Per-phase timeout in seconds |
-| `--sandbox` / `--no-sandbox` | Enable or disable [sandbox](sandbox.md) |
+| `--phase-timeout <secs>` | Explicit per-phase timeout; `0` is unbounded for parent and child. If omitted, SCA keeps its own bounded 600s default. |
+| `--sandbox` / `--no-sandbox` | Enable or disable [sandbox](sandbox.md) (disable is [consent-gated](sandbox.md#disabling-the-sandbox)) |
 | `--audit` | Enable audit layer |
 | `--audit-verbose` | Verbose audit output |
 | `--audit-budget <n>` | Audit budget |
@@ -317,7 +326,7 @@ Coverage-guided fuzzing with automatic harness generation.
 
 | Flag | Description |
 |------|-------------|
-| `--sandbox` / `--no-sandbox` | Enable or disable [sandbox](sandbox.md) |
+| `--sandbox` / `--no-sandbox` | Enable or disable [sandbox](sandbox.md) (disable is [consent-gated](sandbox.md#disabling-the-sandbox)) |
 | `--audit` | Enable audit layer |
 | `--audit-verbose` | Verbose audit output |
 | `--audit-budget <n>` | Audit budget |
@@ -427,6 +436,67 @@ Analyse existing SARIF findings with LLM without re-scanning.
 | `--aggregate <model>` | Aggregation model |
 | `--deep-validate` / `--no-deep-validate` | Enable or disable deep validation |
 
+### /openant
+
+OpenAnt LLM-powered source-code vulnerability scan: AST analysis plus
+per-function LLM reasoning.  Unlike the pattern scanners, it reads each
+function in context, catching business-logic flaws and subtle injection
+patterns.  Requires the `openant-core` library: set `OPENANT_CORE` or
+pass `--openant-core` (auto-detection probes
+`<RAPTOR parent>/libs/openant-core`).  A missing checkout is a
+not-configured skip, not a failure: the command warns, writes an empty
+report, and the run completes; a scan that runs and hard-fails exits
+non-zero and the run is marked failed.
+
+```
+/openant --repo <path>
+```
+
+| Flag | Description |
+|------|-------------|
+| `--repo <path>` | Repository to scan (defaults to `$RAPTOR_CALLER_DIR`) |
+| `--model <name>` | OpenAnt LLM model: `sonnet` (default) or `opus` |
+| `--level <depth>` | Analysis depth: `all`, `reachable` (default), `codeql`, `exploitable` |
+| `--language <lang>` | Override language detection: `auto` (default), `python`, `javascript`, `go`, `c`, `ruby`, `php`; out-of-set values fall back to `auto` |
+| `--no-enhance` | Skip the OpenAnt enhance phase |
+| `--verify` | Enable the OpenAnt stage-2 verification pass |
+| `--workers <n>` | Parallel analysis workers (default 4) |
+| `--max-findings <n>` | Maximum findings to include in the report (default 50) |
+| `--gateway-budget <usd>` | Per-run raise of the dispatcher-gateway spend cap on gateway-minted runs (default $25; any positive finite USD, no uncapped spelling — dispatcher child tokens carry a finite budget by contract; the anti-runaway request cap scales with it, never below 10k). Argv-only; no effect on direct-credential runs (noted loudly) |
+| `--timeout-seconds <n>` | Wall-clock deadline for the OpenAnt child in seconds (default 1800; positive integer, no ceiling). The child is hard-killed at it in every credential posture; on gateway-minted runs the token TTL follows it (timeout + 600s slack) |
+| `--expose-api-key-to-child` | Consent to inject the raw Anthropic API key into the network-enabled OpenAnt child's env (direct mode). Default posture routes the child through the credential-isolating dispatcher gateway whenever a dispatcher route exists; a direct-credential run with no dispatcher route refuses without this flag. Argv-only (no env twin); `/agentic` spelling: `--openant-expose-api-key-to-child` |
+| `--openant-core <path>` | Path to the `openant-core` directory (default `$OPENANT_CORE`). The flag surface is consent-gated: a core that is not a clean checkout of the pinned commit refuses at startup unless `--openant-core-unpinned` or the project `config` trust marker consents |
+| `--resume <run-dir>` | Complete a truncated prior run: a new run directory is seeded from the prior run's scan state (the prior directory is never mutated), completed units restore from checkpoints at zero LLM cost, errored units retry, and the outputs rebuild over the union. The prior run dir is trusted as this installation's own output — its checkpoint contents shape verdicts (adopted without content authentication; the drift gates verify target/pin/core identity only), so resume only run dirs you trust; seeding refuses non-regular entries (symlinks/FIFOs) outright. The prior run's scan-shape config (model, level, enhance, verify, language) is adopted with a loud warning on conflicts; detected target/core drift refuses (exit 2, `outcome=resume_refused`) — for git targets the drift gate covers the HEAD commit only; uncommitted worktree changes are not detected and no dirtiness probe runs (git dirtiness queries can execute repo-configured filter commands): commit local edits and scan fresh, or an edited unit silently adopts its stale prior verdict; a complete prior run refuses with "nothing to resume"; a prior run still in flight (status `running`, recorded worker alive) refuses. An interrupted run (SIGINT/SIGTERM) records `outcome=interrupted` and resumes like any truncated run. The report records `resume.resumed_from` and prior/this-run/combined cost |
+| `--forecast` | Run only the free phases (parse + unit census), print a pre-spend cost forecast range, and exit with $0 LLM spend. The report carries `outcome=forecast_only` and no findings artifact is written — a forecast can never read as a scan. Combines with `--resume` to price completing a truncated run. Gateway-minted real runs print the same forecast line before minting (informational, never blocking) |
+| `--out <dir>` | Output directory override |
+
+Output files: `openant_findings.json` (findings in Raptor schema),
+`openant-report.md` (human-readable report), `raptor_openant_report.json`
+(machine-readable run summary), and `openant_scan/pipeline_output.json`
+(raw OpenAnt output).  OpenAnt also runs inside [/agentic](#agentic) via
+`--openant`, or as the sole scanner via `--openant-only`.
+
+The scanner's own report deduplicates caller/callee findings (a
+same-CWE callee with a single caller collapses into the caller's
+finding), dropping the callee's per-unit verdict from its output.
+RAPTOR recovers those verdicts from the scan artifacts and appends them
+to `openant_findings.json` as hint-tier candidates: each record carries
+`metadata.provenance_tier = "recovered_checkpoint_verdict"` and
+`level: note` (below a normal scanner finding), names the surviving
+finding it was collapsed into, and is counted separately in every
+report surface ("N findings + M recovered checkpoint verdicts") —
+never blended into the scanner's own findings count (in `/agentic`
+scan metrics, `total_findings` counts scanner findings only; recovered
+verdicts ride their own key, and `artifact_findings_total` carries the
+row count of `openant_findings.json` as written — the sum of the two —
+for consumers reconciling against the artifact file).  Recovery is
+best-effort and bounded:
+missing or drifted artifacts degrade to zero recovered records with a
+warning, never a failed run, and record volume is hard-capped per run
+(500) with the truncation stated loudly — the artifacts are written by
+the sandboxed scan child over an untrusted repository, so an unbounded
+candidate population is treated as hostile, not as signal.
+
 ---
 
 ## Systematic Review
@@ -454,6 +524,7 @@ code as vulnerable -- tool output is the verdict.
 | `--deepen-reserve <fraction>` | Slice of `--max-cost` held back for the deepen phase so announced re-reviews can execute (default 0.15; 0 disables) |
 | `--max-time <seconds>` | Wall-clock time limit |
 | `--review-passes <N>` | Independent review passes per function for self-consistency |
+| `--max-workers <N>` | Concurrent review workers (1-32; values above the cap are clamped). Overrides the transport-derived default — the operator owns the rate-limit consequences (the adaptive throttle still backs off on 429s). Also accepted by `resume` for a single segment |
 | `--subsystem-depth <N>` | Directory grouping depth for subsystem-ordered review (default: 0) |
 | `--max-propagation-depth <N>` | Override adaptive constraint propagation depth (default: auto-calibrated) |
 | `--include-kinds <list>` | Item kinds beyond functions/methods (default: `top_level`, `macro`, `global` — already on).  A positive list overrides the defaults, `-kind` opts one out, `none` restricts to functions/methods |
@@ -490,6 +561,7 @@ exploitable.  Stages run in order: 0 (inventory) through A--F (LLM stages) to
 |------|-------------|
 | `--vuln-type <type>` | Restrict to a specific vulnerability class |
 | `--findings <file>` | Findings file to validate |
+| `--include-dark` | Import audit dark-grade rows into stage-A candidacy (default: routed to the witness backlog `witness-backlog.json`, counted, not validated) |
 | `--binary <path>` | Debug binary for feasibility analysis |
 | `--skip-feasibility` | Skip binary feasibility stage |
 | `--rank` | Stage 0: LLM re-rank of the bridge's priority targets most-promising-first before persistence (ordering only; head- and budget-capped) |
@@ -564,8 +636,8 @@ Deep, adversarial code comprehension for security research.  Five modes.
 modes; the `libexec/raptor-understand` substrate (binary `--map`,
 multi-model `--hunt`/`--trace`) accepts exactly one of its three
 modes per invocation.  Study is multi-language: C/C++ resolve through
-the study-prep corpus; Python, Go, Java, JavaScript/TypeScript, and
-Rust identifiers resolve in-process.  Compiled artefacts route through
+the study-prep corpus; Python, Go, Java, JavaScript/TypeScript,
+Rust, PHP, Kotlin, C#, and Swift identifiers resolve in-process.  Compiled artefacts route through
 `libexec/raptor-binary-study`: the binary's RE database (from a prior
 `/ghidra import --decompile-all` or attach) is materialized as a
 decomp-tree — pseudo-source plus a `decomp-map.json` sidecar resolving
@@ -582,6 +654,7 @@ evidence).
 | `--out <dir>` | Output directory |
 | `--model <name>` | LLM model (repeatable) |
 | `--rank` | Multi-model `--hunt`: reorder the merged items most-promising-first before `hunt-result.json` is written (ordering only; head- and budget-capped) |
+| `--resume <run-dir>` | Re-enter an interrupted multi-model `--hunt`/`--trace` run as the same run: checkpointed models return their persisted results at no new cost, only the remainder dispatches. Configuration comes from the run's pinned `understand-run-config.json` (never fresh flags); `--allow-drift` carries checkpoints whose referenced files changed since (listed loudly, stamped into the payload); `--reopen` recovers a run wrongly stamped `completed` without a `*-result.json` |
 | `--target <path>` | Target path |
 | `--runtime-dir <dir>` | Runtime data directory |
 | `--fuzz-dir <dir>` | Fuzz data directory |
@@ -599,7 +672,10 @@ evidence).
 
 Pipeline integration: [/validate](#validate) Stage 0 automatically imports
 `/understand` output via the bridge.  See [architecture](architecture.md) for
-details.
+details.  `/understand` output also feeds the SQLite graph memory layer
+(project-scoped when a project is active, run-local otherwise); see
+[understand-graph](understand-graph.md) for what goes in and the
+`raptor-graph-query` operator CLI.
 
 ---
 
@@ -613,8 +689,8 @@ coverage data.
 /crash-analysis <bug-tracker-url> <git-repo-url>
 ```
 
-No flags.  The orchestrator spawns specialised agents (crash-analyser,
-function-trace-generator, coverage-analysis-generator) and a checker agent
+No flags.  The orchestrator spawns specialised agents (crash-analyzer,
+function-trace-generator, coverage-analyzer) and a checker agent
 for validation.
 
 Requirements: rr, gcc/clang (with ASAN), gdb, gcov.
@@ -667,7 +743,7 @@ Find vulnerable dependencies, gate CI, fix and pin.  Alias: `/raptor-sca`.
 /sca purl <ecosystem> <name> <version>
 /sca render <findings.json>
 /sca clean-cache --max-age <days>
-/sca dt-push <sbom> --url <url> --api-key <key>
+/sca dt-push <sbom> --url <url>    # reads $DT_API_KEY (export it in the shell profile / CI secret env, not inline on the command line)
 /sca suppress <list|check> <path>
 /sca bump <path> ...
 /sca fingerprint <path-or-image-ref> [--save|--check]
@@ -894,7 +970,7 @@ Named workspaces that corral analysis runs into a shared directory.
 | `sessions` | Show live sessions and their project bindings |
 | `none` | Clear this session's project (the default is untouched) |
 | `delete` | Delete a project (`--purge` removes output directory, `--yes` skips confirmation) |
-| `rename` | Rename a project |
+| `rename` | Rename a project (a name-derived default output dir moves with it; custom dirs never move; existing/claimed destination refused; `--force` past live runs keeps the old path, warning) |
 | `notes` | View or set project notes (inline text or `--file`) |
 | `add` | Add a run directory to the project |
 | `remove` | Remove a run, moving it to `--to <path>` |
@@ -918,7 +994,7 @@ Named workspaces that corral analysis runs into a shared directory.
 | `binary clear` | Clear all persisted binaries |
 | `trust` | List trust assertions (markers + persisted binaries count), or set a marker (`config`/`build`/`dynamic`) |
 | `untrust` | Remove a trust marker |
-| `set` | List settings, or set a registry key (`description`, `notes`, `threat-model`, `target-kind`, `build-command[.<lang>]`) |
+| `set` | List settings, or set a registry key (`description`, `notes`, `threat-model`, `target-kind`, `build-command[.<lang>]`, `sandbox-floor`) |
 | `unset` | Remove a setting |
 | `get` | Print one setting's bare value (exit 1 when unset — script-friendly) |
 
@@ -929,25 +1005,44 @@ directory conventions.
 **Trust markers.** `trust` / `untrust` persist operator trust
 assertions on the project (schema v4), stored as marker → timestamp in
 the project JSON under `~/.raptor/projects/` — never inside the
-scanned repo, and never set automatically. Each marker only loosens a
-gate its per-run flag already loosens:
+scanned repo, and never set automatically. Most marker consumers pair
+with a per-run flag the marker merely defaults on; the exceptions —
+consumers where the marker is the only control — are called out below:
 
 | Marker | Equivalent per-run flag | Effect |
 |--------|------------------------|--------|
-| `config` | `--trust-repo` | Lifts the Claude Code config check (`cc_trust`) and the CodeQL pack-config check (`codeql_trust`); also arms the audit pipeline's trust-gated refutation witnesses |
-| `build` | `--traced-build` | Traced-build C/C++ CodeQL extraction (executes the repo's build system) |
+| `config` | `--trust-repo` | Lifts the Claude Code config check (`cc_trust`) and the CodeQL pack-config check (`codeql_trust`); also arms the audit pipeline's trust-gated refutation witnesses and grants standing consent for a non-pinned `--openant-core` (the flag-surface gate) |
+| `build` | `--traced-build` | Traced-build C/C++ CodeQL extraction (executes the repo's build system); also makes build-flags evidence suppression-grade in source-intel's verdict policy (corpus Validator lane; no flag pair, one-target rule — see below) |
 | `dynamic` | `--dynamic` (audit) | Dynamic validation: Frida observation / target execution defaults on |
 
 Markers are consumed where `/agentic` and `/codeql` load the project's
-persisted binaries, and where the audit pipeline builds
+persisted binaries, where the audit pipeline builds
 `dynamic_validation` and `repo_trusted` (the `config` marker arms
 audit's trust-gated refutation witnesses; that consumption has no
 per-run flag pair — the marker is the only control, see
-[audit.md](audit.md)). Per-run flags always win, in both directions:
+[audit.md](audit.md)), and where source-intel's verdict policy decides
+build-flags suppression — the corpus-runner Validator lane
+(`core/dataflow/scripts/corpus-run --validator
+packages.source_intel.adapter:SourceIntelValidator`), the one place
+source-intel renders verdicts: fortify-source / stack-protector
+evidence parsed from the repo's declared build config (`.config` /
+Makefile / `compile_commands.json` text) can mark write-class findings
+Not Exploitable only under the `build` marker, and only when the
+analysed root matches the marker's project target (the one-target rule
+— a project's marker never relaxes vetting for a different tree;
+fail-closed on unknown roots). On `/agentic`/`/analyze` the same
+build-flags facts are injected as hint-tier evidence only — the marker
+changes no verdict there. Like the audit `config` consumption, this
+has no per-run flag pair — the marker is the only control; when the
+evidence matches without it on the verdict lane, suppression is
+withheld and a warning line names the remedy (`/project trust build`).
+Per-run flags always win, in both directions:
 explicit negative flag (`--no-trust-repo`, `--no-traced-build`,
 `--no-dynamic`) > explicit positive flag > project marker > default
 (off). Whenever a marker affects a run, one banner line prints at
-start: `[*] project trust: build, dynamic (per-run flags override)`.
+start: `[*] project trust: build, dynamic (per-run flags override)` —
+except the corpus-runner build-flags consumer, which is silent on
+grant and warns only when suppression is withheld.
 `build` deliberately does NOT imply `config` — a traced run that hits
 unsafe CodeQL pack config still refuses (see
 [docs/codeql.md](codeql.md)).
@@ -960,7 +1055,11 @@ to the existing project fields; `threat-model` points at an existing
 threat-model JSON (updates `threat_model_path`); `target-kind` is one
 of `library|hybrid|application|auto`; `build-command` stores per-
 language commands (`build-command.<lang>`; the bare key writes the
-`default` slot). `get <key>` prints the bare value and exits 1 when
+`default` slot); `sandbox-floor` is the standing untrusted
+containment-floor consent, one of
+`mount-ns`/`mountless-ns`/`ns-only`/`landlock` (`none` is refused —
+untrusted work never runs bare by consent; a per-run
+`--sandbox-floor` always overrides, see [sandbox](sandbox.md)). `get <key>` prints the bare value and exits 1 when
 unset, for scripting.
 
 ---
@@ -1070,9 +1169,14 @@ exploitable), `finding` (exploitable), `dormant` (unreachable / dead code),
 
 Annotations are human-only for new writes: no pipeline writes them, and
 operators add them via `/annotate add`.  Every add/edit stamps the
-invocation context (which std fds were TTYs); only `source=human` notes
-with an interactive-TTY stamp (or legacy pre-stamp notes) earn
-human-grade weight in readers.  LLM review outcomes are recorded in the
+invocation context (which std fds were TTYs, plus corroborating context:
+session-leader shape, environment markers, and a parent-chain summary —
+a pty wrapper makes `isatty` true by design, so the fd stamp alone is
+not sufficient); only `source=human` notes with a corroborated
+interactive-TTY stamp (or legacy pre-stamp notes) earn human-grade
+weight in readers.  Adds made under `script -c` or from inside an agent
+session record demoting corroboration; re-run from a plain interactive
+shell to earn human grade.  LLM review outcomes are recorded in the
 review journal instead.
 
 **Imported archives and human-grade notes.**  `/project import` demotes
@@ -1109,7 +1213,14 @@ natural-language questions about model competence.
 /scorecard pin <decision_class> --model <model> --as <mode>
 /scorecard unpin <decision_class> --model <model>
 /scorecard reset [<decision_class>] [--model <model>]
+/scorecard adopt [--file <json>]
 ```
+
+`adopt` re-blesses an unverified sidecar — genuine pre-MAC history or a
+quarantined `<sidecar>.<timestamp>.unverified` file — by stamping it with
+this install's integrity token. The machinery never re-stamps unverified
+content on its own; adoption is the operator asserting trust in the bytes,
+so inspect the JSON before running it.
 
 **List flags** (default subcommand)
 

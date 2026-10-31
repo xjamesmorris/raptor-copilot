@@ -34,7 +34,11 @@ import signal  # noqa: E402
 import subprocess  # noqa: E402
 import time  # noqa: E402
 from pathlib import Path  # noqa: E402
-from core.sandbox.tests.capability import requires_landlock, requires_userns
+from core.sandbox.tests.capability import (
+    requires_landlock,
+    requires_mount,
+    requires_userns,
+)
 
 
 def _mount_ns_usable() -> bool:
@@ -56,6 +60,8 @@ def _proc_alive(pid: int) -> bool:
 
 @requires_landlock
 @requires_userns
+# Exercises mount-delivered capability; hosts with userns but no mount capability degrade by design -> named SKIP, not a mid-flight mount failure.
+@requires_mount
 def test_setsid_target_killed_on_timeout(tmp_path):
     """A target that immediately re-execs under ``setsid`` (leaving the
     intermediate's process group AND session) and then stalls past the

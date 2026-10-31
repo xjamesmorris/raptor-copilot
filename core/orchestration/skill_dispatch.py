@@ -44,7 +44,7 @@ from core.llm.cc_proxy_hosts import (
 )
 from core.sandbox import run_untrusted_networked
 from core.sandbox.errors import SandboxSetupError as _SandboxSetupError
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -244,7 +244,225 @@ _BUILD_CHECKLIST = _RAPTOR_DIR / "libexec" / "raptor-build-checklist"
 MAX_VALIDATE_FINDINGS = 50
 
 _LIFECYCLE_TIMEOUT_S = 30   # lifecycle helpers are mechanical; should be instant
-_CHECKLIST_TIMEOUT_S = 300  # build_checklist parses every source file
+
+
+# Reason prefix stamped on SkillDispatchResult.skipped_reason when the
+# sandbox refused to set up (the child never launched). Callers use
+# is_sandbox_setup_skip to classify — never their own string matching.
+_SANDBOX_SETUP_REASON_PREFIX = "sandbox setup failed: "
+
+
+def is_sandbox_setup_skip(reason: str | None) -> bool:
+    """True when a dispatch skip records a sandbox SETUP failure.
+
+    Setup failures happen before any billed work (the child process
+    never launched), so a bounded caller-side retry is safe: it can
+    never double-run a skill pass, only re-attempt the launch.
+    """
+    return bool(reason) and str(reason).startswith(
+        _SANDBOX_SETUP_REASON_PREFIX)
+
+
+#: Bytes of each child stream kept in the on-disk failure artifact.
+_CHILD_TAIL_PERSIST_CHARS = 65536
+
+#: Writer-authored disclosure for a dispatch result whose streams were
+#: never captured (stdout/stderr both None — the runner was invoked
+#: without capture, so the child's narrative went to the parent's
+#: inherited stdio and is gone). Distinct from a captured-but-silent
+#: child: rendering the two identically made a plumbing regression
+#: look like a quiet child, and the empty tail was undiagnosable.
+_CAPTURE_MISSING_NOTE = (
+    "child streams were not captured (dispatch ran without "
+    "capture_output — the child's output went to the parent's "
+    "inherited stdio and was not persisted)"
+)
+
+
+def _streams_captured(proc: subprocess.CompletedProcess) -> bool:
+    """True when the dispatch result carries captured streams.
+
+    ``subprocess`` semantics: an uncaptured stream is ``None``; a
+    captured-but-silent stream is ``""``/``b""``. Both streams share
+    one ``capture_output`` switch, so either being non-None means
+    capture was on.
+    """
+    return proc.stdout is not None or proc.stderr is not None
+
+
+def _child_failure_tail(proc: subprocess.CompletedProcess) -> str:
+    """Bounded diagnostic line for a failed dispatch child.
+
+    The CC child multiplexes its own errors onto stdout — stderr is
+    routinely EMPTY on a nonzero exit, so a stderr-only excerpt goes
+    blank exactly when the operator needs it. Prefer stderr, fall back
+    to the stdout TAIL (a crash narrative ends the stream). Both
+    streams quote hostile-target bytes, so the excerpt is escaped and
+    bounded for the operator's terminal.
+    """
+    from core.security.log_sanitisation import sanitise_for_terminal
+
+    if not _streams_captured(proc):
+        return f"({_CAPTURE_MISSING_NOTE})"
+    err = (proc.stderr or "").strip()
+    if err:
+        return sanitise_for_terminal(err, max_len=500)
+    out = (proc.stdout or "").strip()
+    if out:
+        return ("(stderr empty; stdout tail) "
+                + sanitise_for_terminal(out[-500:], max_len=500))
+    return ("(capture active — the child produced no output on "
+            "stdout or stderr)")
+
+
+def _timeout_partial_capture(
+    exc: subprocess.TimeoutExpired,
+) -> subprocess.CompletedProcess:
+    """CompletedProcess-shaped view of a timeout kill's partial capture.
+
+    ``TimeoutExpired`` surfaces whatever the runner captured before
+    the kill — the only account of what the child was doing when the
+    clock ran out. Streams may arrive as bytes on this path (the kill
+    can precede decoding); decode with replacement so hostile bytes
+    cannot fail the forensics. ``returncode`` is a placeholder — the
+    caller labels the artifact's exit line ``timeout``.
+    """
+    def _decoded_stream(stream: object) -> str:
+        if isinstance(stream, bytes):
+            return stream.decode("utf-8", errors="replace")
+        return stream if isinstance(stream, str) else ""
+
+    return subprocess.CompletedProcess(
+        args=exc.cmd, returncode=-1,
+        stdout=_decoded_stream(exc.stdout),
+        stderr=_decoded_stream(exc.stderr))
+
+
+def _persist_child_tail(
+    run_dir: Path | None, proc: subprocess.CompletedProcess,
+    exit_label: str | None = None,
+    duration_s: float | None = None,
+) -> None:
+    """Write bounded child-stream tails beside the failed pass.
+
+    The artifact must never be SILENTLY empty: a child that produced
+    no bytes gets an explicit writer-authored ``streams=empty`` line
+    (with the exit label and ``duration=`` above it), and a result
+    whose streams were never captured gets ``capture=missing`` —
+    "the child said nothing" and "nobody listened" are different
+    failures and must read differently on disk.
+
+    The WARNING line carries 500 chars; the artifact keeps enough of
+    both streams to root-cause without re-running a multi-minute
+    child. Stream content quotes hostile-target bytes — escaped
+    (newlines kept: it is a multi-line narrative) before landing in an
+    operator-readable file, and every body line carries the ``| ``
+    quote prefix so writer-authored lines (the ``exit=`` authority
+    label, the section markers) are the only lines at column 0.
+    Escaping alone is not splice resistance here: with newlines
+    preserved, an entirely-printable child stdout could end with a
+    forged ``exit=0`` line plus duplicate section markers that read
+    exactly like parent-authored text (and a windowed excerpt of the
+    artifact then LED with the forgery once the genuine line 1 fell
+    out of the window). Best-effort — never let forensics fail the
+    failure path. ``exit_label`` replaces the numeric exit on paths
+    with no real exit status (the timeout kill).
+    """
+    if run_dir is None:
+        return
+    exit_text: str = (exit_label if exit_label is not None
+                      else str(proc.returncode))
+    # Writer-authored header lines (column 0, like the exit label —
+    # child body lines are always ``| ``-quoted so these cannot be
+    # forged). Empty tails must never render silently: an artifact
+    # that reads identically for "capture was off", "the child said
+    # nothing", and "the child crashed pre-logging" is undiagnosable
+    # exactly when it is needed.
+    notes: str = ""
+    if duration_s is not None:
+        notes += f"duration={duration_s:.1f}s\n"
+    captured = _streams_captured(proc)
+    if not captured:
+        notes += f"capture=missing ({_CAPTURE_MISSING_NOTE})\n"
+    elif not (proc.stderr or "").strip() and not (proc.stdout or "").strip():
+        notes += ("streams=empty (capture was active — the child "
+                  "produced no output on stdout or stderr; it likely "
+                  "died before logging anything)\n")
+    content = (
+        f"exit={exit_text}\n"
+        + notes
+        + "--- stderr tail ---\n"
+        + _quote_body((proc.stderr or "")[-_CHILD_TAIL_PERSIST_CHARS:])
+        + "\n--- stdout tail ---\n"
+        + _quote_body((proc.stdout or "")[-_CHILD_TAIL_PERSIST_CHARS:])
+        + "\n"
+    )
+    try:
+        from core.atomic_fs import write_text_atomically
+
+        # run_dir is child-writable by design (output=, cwd) and the
+        # child holds MAKE_SYM: a plain open("w") here follows a
+        # child-planted symlink at this name and hands the UNSANDBOXED
+        # parent an arbitrary-file write. The atomic primitive stages
+        # in an O_EXCL tempfile and renames over the name — a rename
+        # replaces a symlink, never follows it. 0600 for stream-at-
+        # rest parity with the prompt tempfile hygiene.
+        write_text_atomically(
+            Path(run_dir) / "dispatch-child-tail.log", content, mode=0o600,
+        )
+    except OSError:
+        logger.debug("child tail persist failed", exc_info=True)
+
+
+def _esc(s: str) -> str:
+    """Control-byte escape for the tail artifact.
+
+    Length is bounded by the caller's slice; newlines are kept — the
+    tail is a multi-line narrative, and flattening it would destroy
+    exactly the tracebacks it exists to preserve.
+    """
+    from core.security.log_sanitisation import escape_nonprintable
+
+    return escape_nonprintable(s, preserve_newlines=True)
+
+
+def _quote_body(s: str) -> str:
+    """Escape a child stream tail and quote every line with ``| ``.
+
+    The prefix makes the artifact's in-band markers forgery-evident:
+    untrusted body lines can never sit at column 0, so a column-0
+    ``exit=`` or ``--- … tail ---`` line is writer-authored by
+    construction (a child-emitted ``| exit=0`` renders as
+    ``| | exit=0`` — visibly quoted). See the label-preserving
+    excerpting contract in :mod:`core.security.log_sanitisation`.
+    """
+    return "\n".join("| " + line for line in _esc(s).split("\n"))  # line-model: escape_nonprintable above renders any \r inert
+
+
+def missing_validation_report(run_dir: Path) -> str | None:
+    """``validate_outputs`` probe for /validate skill passes.
+
+    The validation pipeline's terminal artifact is
+    ``validation-report.md`` — Stage 1 writes it only after the stage
+    verdicts are merged. A CC child can exit 0 while the pipeline
+    inside it crashed (a stage helper failing mid-run leaves the child
+    free to narrate the failure and exit cleanly), so the child's exit
+    status alone cannot stand for "verdicts were produced": a pass
+    recorded as completed on exit status alone leaves every selected
+    finding silently pending. Absent or empty report ⇒ the pass
+    failed, with the reason surfaced through the dispatch result.
+    """
+    report = Path(run_dir) / "validation-report.md"
+    try:
+        if report.is_file() and report.stat().st_size > 0:
+            return None
+    except OSError:
+        pass
+    return (
+        "validate pipeline produced no verdicts: validation-report.md "
+        "missing or empty in the run dir (in-child stage crash or "
+        "pipeline abort; the child process itself exited 0)"
+    )
 
 
 @dataclass
@@ -254,11 +472,20 @@ class SkillDispatchResult:
     ``run_dir`` is set as soon as the lifecycle started, including on
     failure paths, so callers can surface the partially-populated run
     directory to the operator.
+
+    ``child_exit`` is the parent-observed exit of the child process
+    (numeric exit status, or the timeout label) — ``None`` when no
+    child ever produced one (launch/sandbox-setup failures). It is
+    the OUT-OF-BAND copy of the tail artifact's line-1 authority
+    label: consumers that excerpt ``dispatch-child-tail.log`` must
+    re-emit exit authority from this field, never recover it from
+    artifact bytes (the artifact lives in a child-writable directory).
     """
     ran: bool
     skipped_reason: str | None = None
     run_dir: Path | None = None
     duration_s: float = 0.0
+    child_exit: str | None = None
 
 
 class StageError(Exception):
@@ -275,11 +502,139 @@ class StageError(Exception):
 # ---------------------------------------------------------------------------
 
 
-def start_lifecycle(command: str, target: Path) -> Path | None:
+class LifecycleStart(NamedTuple):
+    """Outcome of :func:`start_lifecycle`.
+
+    ``run_dir`` — the started run dir, or None when the helper failed.
+    ``error`` — on failure, a one-line sanitised detail for the
+    caller's skip record (helper stderr quotes project names and
+    target paths, so it is escaped and bounded before it travels);
+    None when there is nothing to say.
+    """
+
+    run_dir: Path | None
+    error: str | None = None
+
+
+def _vet_threaded_pin(pinned: str, target: Path, command: str) -> str:
+    """Return the project pin to thread for a CHILD run — a three-way
+    vet of *pinned* against the CHILD's target:
+
+    * **Match** — the child target lies inside the project's
+      registered target: thread *pinned* unchanged.
+    * **Mismatch** — the project loaded and the target-match
+      predicate answers False: thread ``ARGV_NONE`` (start the child
+      standalone), loudly. Threading the pin would deterministically
+      refuse the child's start — the lifecycle helper's target-match
+      gate errors with "target ... is outside project ...". That
+      poisoned-pin shape is real: a parent started with ``--out``
+      records its AMBIENT pin even when the ambient project does not
+      match the parent's own target (``get_output_dir``'s ``--out``
+      arm warns and proceeds), so the parent marker carries a project
+      the target was never inside, and threading it verbatim killed
+      every child pass (the /validate post-pass of an exhaustive
+      audit run skipped with "lifecycle start failed"). Mirror the
+      ``--out`` doctrine: outside the project's target, project
+      placement and trust markers do not apply.
+    * **Unknown** — the project cannot be loaded
+      (``ProjectManager.load`` funnels every file-level failure —
+      missing entry, unreadable file or dir, corrupt JSON — to
+      ``None``) or the vet itself raises: KEEP the pin and let the
+      helper's own gate adjudicate moments later. Its refusal rides
+      back as the recorded skip detail, so deferring loses nothing,
+      while demoting on a non-verdict would silently strip project
+      placement from a healthy pinned run on a transient registry
+      read error.
+
+    The demotion warning interpolates the child target and the
+    project's registered target — attacker-influenceable strings
+    (checkout directory names) — so both are escaped and bounded per
+    the log-sanitisation contract before they reach the log stream.
+    """
+    from core.security.log_sanitisation import sanitise_for_terminal
+    try:
+        from core.project.project import ProjectManager
+        project = ProjectManager().load(pinned)
+        if project is None:
+            logger.warning(
+                "lifecycle start %s: project '%s' could not be loaded "
+                "for vetting (missing, unreadable, or corrupt registry "
+                "entry); keeping the pin — the lifecycle helper will "
+                "adjudicate", command,
+                sanitise_for_terminal(pinned, max_len=120))
+            return pinned
+        from core.run.output import target_matches_project
+        if target_matches_project(str(target), pinned,
+                                  project.target, command=command):
+            return pinned
+        project_target: str = project.target
+    except Exception:  # noqa: BLE001 — vet unavailable: not a verdict
+        logger.warning(
+            "lifecycle start %s: project '%s' could not be vetted; "
+            "keeping the pin — the lifecycle helper will adjudicate",
+            command, sanitise_for_terminal(pinned, max_len=120))
+        logger.debug("lifecycle start %s: pin vet failed for %r",
+                     command, pinned, exc_info=True)
+        return pinned
+    from core.run.pin import ARGV_NONE
+    logger.warning(
+        "lifecycle start %s: not threading project pin %r — child "
+        "target %s is outside the project's target (%s); starting the "
+        "child standalone (projectless). Project placement and trust "
+        "markers do not apply to a target outside the project.",
+        command, pinned,
+        sanitise_for_terminal(str(target), max_len=300),
+        sanitise_for_terminal(project_target, max_len=300))
+    return ARGV_NONE
+
+
+def _start_failure_detail(proc: subprocess.CompletedProcess) -> str:
+    """One-line, sanitised failure detail from a nonzero helper exit.
+
+    The helper's contract is a single ``ERROR: ...`` stderr line;
+    prefer it, fall back to the last non-empty stderr line, then to
+    the bare exit code. Helper stderr interpolates target paths and
+    project names (attacker-influenceable on hostile checkouts), so
+    the line is escaped and bounded per the log-sanitisation contract
+    before it reaches a report field.
+    """
+    from core.security.log_sanitisation import sanitise_for_terminal
+
+    lines = [ln.strip() for ln in (proc.stderr or "").splitlines()
+             if ln.strip()]
+    detail = next((ln for ln in lines if ln.startswith("ERROR:")),
+                  lines[-1] if lines else "")
+    if not detail:
+        return f"helper exited {proc.returncode} with no stderr"
+    return sanitise_for_terminal(detail, max_len=300)
+
+
+def start_lifecycle(command: str, target: Path,
+                    parent_run_dir: Path | None = None) -> LifecycleStart:
     """Start a new lifecycle-managed run dir.
 
-    Returns the OUTPUT_DIR path on success, or None if the helper failed
-    or its output couldn't be parsed.
+    Returns a :class:`LifecycleStart`: ``run_dir`` holds the
+    OUTPUT_DIR path on success and None if the helper failed or its
+    output couldn't be parsed; on failure ``error`` carries the
+    sanitised one-line detail so callers can record WHY (the bare
+    "lifecycle start failed" constant hid a deterministic
+    target-match refusal from the operator and the run report).
+
+    ``parent_run_dir`` names the lifecycle run dir of the PARENT phase
+    (the /audit or /agentic run this dispatch is a child pass of). The
+    child run must land in the parent RUN's pinned project: the
+    process-scoped ``--project`` override threads as before, but
+    without one the parent run's own pin (freeze-cache first, session-
+    ledger witness checked) is threaded instead of letting the child
+    re-resolve ambiently — a mid-run project switch (another session
+    bumping the machine-wide last-activated default) otherwise
+    re-points the child at a DIFFERENT project, whose target-match
+    gate refuses the start ("target ... is outside project ...") or,
+    on a matching target, silently splits one command's artifacts
+    across two projects. Only AUTHORITATIVE parent pins thread (a real
+    ``project`` key, including the explicit-none pin); the legacy
+    containment fallback authorizes reads only and must not become an
+    argv pin.
 
     The helpers run with `RaptorConfig.get_safe_env()` (strict allowlist)
     rather than the inherited environment. When the pipeline runs against
@@ -293,6 +648,16 @@ def start_lifecycle(command: str, target: Path) -> Path | None:
     """
     from core.config import RaptorConfig
     safe_env = RaptorConfig.get_safe_env()
+    # The libexec trust guard requires _RAPTOR_TRUSTED or CLAUDECODE in the
+    # child env. get_safe_env() only COPIES those if already in os.environ —
+    # under bin/raptor (or a Claude Code session) they are, but on the direct
+    # `python3 raptor.py agentic` path they are not, so the /understand
+    # pre-pass's lifecycle call hit the guard and exited 2 ("Pre-pass
+    # skipped"). This is RAPTOR dispatching its OWN lifecycle helper, so
+    # asserting the trust marker is correct. setdefault so a real parent
+    # value (bin/raptor / CC) is never overwritten; _RAPTOR_TRUSTED (not a
+    # fabricated CLAUDECODE) is the honest marker for a non-CC transport.
+    safe_env.setdefault("_RAPTOR_TRUSTED", "1")
     argv = [str(_LIFECYCLE), "start", command, "--target", str(target)]
     # Thread the parent's project explicitly: a sibling lifecycle run
     # (the /understand pre-pass, the /validate post-pass, the gap-audit
@@ -302,10 +667,48 @@ def start_lifecycle(command: str, target: Path) -> Path | None:
     try:
         from core.run.pin import ARGV_NONE, get_process_project
         pinned = get_process_project()
+        if pinned is None and parent_run_dir is not None:
+            from core.run.pin import resolve_witnessed_run_pin
+            pin, witnessed = resolve_witnessed_run_pin(parent_run_dir)
+            if pin.authoritative:
+                if not witnessed:
+                    # The pin still threads — the sessionless/detached
+                    # orchestrator (no env credential, no claude-shaped
+                    # ancestor) has no ledger record by construction,
+                    # and a witnessed-only gate would strand exactly
+                    # that child back on the ambient layers. But the
+                    # unwitnessed marker is child-writable, so say so
+                    # loudly. pin.project is registry-vetted here
+                    # (resolution drops pins naming unregistered
+                    # projects, and registered names are
+                    # charset-validated at creation).
+                    logger.warning(
+                        "lifecycle start %s: threading parent run pin "
+                        "%r from %s with NO session-ledger witness "
+                        "(sessionless/detached parent) — the pin comes "
+                        "from the child-writable run marker only",
+                        command, pin.project, parent_run_dir)
+                pinned = pin.project if pin.project is not None \
+                    else ARGV_NONE
+        if pinned is not None and pinned != ARGV_NONE:
+            # Vet the pin against the CHILD's target before threading:
+            # a project whose registered target does not contain the
+            # child target deterministically refuses the start (the
+            # helper's target-match gate), which killed the post-pass
+            # outright. See _vet_threaded_pin for the doctrine.
+            pinned = _vet_threaded_pin(pinned, target, command)
         if pinned is not None:
             argv += ["--project", pinned if pinned else ARGV_NONE]
+            # The flag is harness-synthesized, not operator-typed: the
+            # marker makes the child record pin provenance "threaded"
+            # instead of "argv" (core.run.pin.PIN_SOURCES).
+            from core.run.pin import PIN_THREADED_ENV
+            safe_env[PIN_THREADED_ENV] = "1"
     except Exception:  # noqa: BLE001 — child falls back to its own layers
-        pass
+        logger.debug(
+            "lifecycle start %s: parent pin threading failed — the "
+            "child resolves its project from its own layers", command,
+            exc_info=True)
     try:
         proc = subprocess.run(
             argv,
@@ -313,18 +716,23 @@ def start_lifecycle(command: str, target: Path) -> Path | None:
             env=safe_env, check=False,
         )
     except (subprocess.TimeoutExpired, OSError) as e:
+        from core.security.log_sanitisation import sanitise_for_terminal
         logger.warning("lifecycle start %s failed: %s", command, e)
-        return None
+        return LifecycleStart(
+            None,
+            "helper spawn failed: "
+            + sanitise_for_terminal(str(e), max_len=300))
     if proc.returncode != 0:
+        detail = _start_failure_detail(proc)
         logger.warning("lifecycle start %s returned %d: %s",
-                       command, proc.returncode, (proc.stderr or "")[:300])
-        return None
+                       command, proc.returncode, detail)
+        return LifecycleStart(None, detail)
     for line in reversed(proc.stdout.splitlines()):
         line = line.strip()
         if line.startswith("OUTPUT_DIR="):
-            return Path(line[len("OUTPUT_DIR="):]).resolve()
+            return LifecycleStart(Path(line[len("OUTPUT_DIR="):]).resolve())
     logger.warning("lifecycle start %s did not emit OUTPUT_DIR=", command)
-    return None
+    return LifecycleStart(None, "helper did not emit OUTPUT_DIR=")
 
 
 def complete_lifecycle(output_dir: Path) -> None:
@@ -374,14 +782,33 @@ def fail_lifecycle(output_dir: Path | None, message: str) -> None:
 def build_checklist(target: Path, output_dir: Path) -> bool:
     """Run libexec/raptor-build-checklist. Returns True on success.
 
+    The child runs under the shared work-scaled bound
+    (``core.audit.checklist_timeout`` — the same sizing rule and
+    RAPTOR_CHECKLIST_BUILD_TIMEOUT_S override as the raptor-audit
+    call sites; a flat 300s here live-failed on large binary
+    targets on the audit surface). This surface degrades instead of
+    refusing on an invalid override — a pre-pass builder failure is
+    already a warn-and-continue path, so a malformed env value logs
+    a warning and the computed scaled bound applies.
+
     See `start_lifecycle` for the env=safe_env rationale.
     """
+    from core.audit.checklist_timeout import (
+        checklist_build_timeout_s,
+        scaled_checklist_build_timeout_s,
+    )
     from core.config import RaptorConfig
     safe_env = RaptorConfig.get_safe_env()
     try:
+        timeout_s = checklist_build_timeout_s(target, output_dir)
+    except ValueError as e:
+        logger.warning(
+            "build_checklist: %s — using the work-scaled bound", e)
+        timeout_s = scaled_checklist_build_timeout_s(target, output_dir)
+    try:
         proc = subprocess.run(
             [str(_BUILD_CHECKLIST), str(target), str(output_dir)],
-            capture_output=True, text=True, timeout=_CHECKLIST_TIMEOUT_S,
+            capture_output=True, text=True, timeout=timeout_s,
             env=safe_env, check=False,
         )
     except (subprocess.TimeoutExpired, OSError) as e:
@@ -422,7 +849,33 @@ def _signal_key(f: dict) -> tuple:
     return (
         0 if f.get("is_exploitable") is True else 1,  # exploitable first
         -_safe_score(f),                                # score descending
+        _tree_class_rank(f),                            # production first
+        _sarif_level_rank(f),                           # error > warning
     )
+
+
+# SARIF severity levels, strongest first. Raw SARIF results carry no
+# is_exploitable / exploitability_score / tree_class, so without this
+# component they all tie and truncation degrades to head order for
+# SARIF-shaped callers; unknown or absent levels rank as "warning"
+# (the SARIF default), so findings without the field are unaffected.
+_SARIF_LEVEL_RANK = {"error": 0, "warning": 1, "none": 2, "note": 3}
+
+
+def _sarif_level_rank(f: dict) -> int:
+    level = f.get("level")
+    return _SARIF_LEVEL_RANK.get(level, 1) if isinstance(level, str) else 1
+
+
+def _tree_class_rank(f: dict) -> int:
+    """Tie-break rank below the signal fields: findings tagged with a
+    non-production ``tree_class`` (core.audit.tree_class vocabulary —
+    audit emissions stamp it) yield to production findings ONLY when
+    the exploitability signals tie. Untagged findings (other emitters)
+    rank as production, so their ordering is unchanged."""
+    from core.audit.tree_class import NON_PRODUCTION_TREE_CLASSES
+
+    return 1 if f.get("tree_class") in NON_PRODUCTION_TREE_CLASSES else 0
 
 
 def truncate_findings_by_signal(
@@ -478,6 +931,7 @@ def run_skill_dispatch(
     preflight: Callable[[], str | None] | None = None,
     stage: Callable[[Path], None] | None = None,
     validate_outputs: Callable[[Path], str | None] | None = None,
+    parent_run_dir: Path | None = None,
 ) -> SkillDispatchResult:
     """Run one lifecycle-managed, sandboxed ``claude -p`` skill pass.
 
@@ -501,6 +955,11 @@ def run_skill_dispatch(
     read (e.g. the parent pipeline's out_dir): they are appended to the
     sandbox ``add_dirs`` and ``readable_paths``. ``target`` and the run
     dir are always included.
+
+    ``parent_run_dir`` is the parent phase's lifecycle run dir: its
+    project pin is threaded into this pass's lifecycle start so the
+    child run lands in the SAME project as the run that spawned it
+    (see :func:`start_lifecycle`).
 
     May raise: unexpected exceptions propagate AFTER the lifecycle is
     marked failed — callers keep their own never-raise wrapper so the
@@ -533,6 +992,16 @@ def run_skill_dispatch(
             skipped_reason="claude CLI transport disabled "
             "(RAPTOR_CC_TRANSPORT_DISABLED is set)")
 
+    # Operator-forced local-only posture: these skill passes are
+    # claude-bound (agentic tool-using investigations; there is no
+    # Ollama agent loop), so under RAPTOR_NO_CLAUDE skip them cleanly
+    # rather than spawning claude. Same skip shape as the other gates.
+    if os.environ.get("RAPTOR_NO_CLAUDE"):
+        return SkillDispatchResult(
+            ran=False,
+            skipped_reason="claude CLI skipped (RAPTOR_NO_CLAUDE is set); "
+            "this pass requires the Claude Code agent")
+
     # Realpath at the resolution seam: symlinked installs otherwise
     # fail the mount-ns visibility check and silently downgrade the
     # dispatch to Landlock-only (see resolve_claude_cli).
@@ -545,15 +1014,37 @@ def run_skill_dispatch(
         if reason is not None:
             return SkillDispatchResult(ran=False, skipped_reason=reason)
 
+    # Present-but-unusable claude (installed, NOT logged in) must skip
+    # like "not on PATH" — otherwise start_lifecycle creates a run dir,
+    # the dispatch spawns `claude -p` which exits with "Not logged in",
+    # and the run surfaces a noisy failure. The cc-probe (cache-first;
+    # a real call only on cold cache) returns None when the transport
+    # is not trustworthy, including the unauthenticated case.
+    from core.llm.cc_probe import probe_cc_session_model
+    if probe_cc_session_model(claude_bin) is None:
+        return SkillDispatchResult(
+            ran=False,
+            skipped_reason="claude CLI present but not usable "
+            "(not logged in, or transport probe failed) — "
+            "run `claude /login`")
+
     target = Path(target).resolve()
     context_dirs = [Path(d).resolve() for d in context_dirs]
 
     t0 = time.monotonic()
 
-    run_dir = start_lifecycle(command, target)
+    started = start_lifecycle(command, target,
+                              parent_run_dir=parent_run_dir)
+    run_dir = started.run_dir
     if run_dir is None:
+        # Carry the helper's one-line detail (already sanitised at the
+        # start_lifecycle seam): the bare constant left the operator
+        # with no lead on WHY the child pass never started.
+        reason = "lifecycle start failed"
+        if started.error:
+            reason = f"{reason}: {started.error}"
         return SkillDispatchResult(ran=False,
-                                   skipped_reason="lifecycle start failed",
+                                   skipped_reason=reason,
                                    duration_s=time.monotonic() - t0)
 
     # Track whether the run reached a definitive end-state. If we exit
@@ -679,6 +1170,27 @@ def run_skill_dispatch(
                         system_prompt_file=_sys_prompt_path,
                     ),
                     text=True,
+                    # The sandbox runner's capture defaults to FALSE:
+                    # without this kwarg the CompletedProcess carries
+                    # stdout=None/stderr=None and every failure-path
+                    # consumer below (_child_failure_tail,
+                    # _persist_child_tail, the timeout partial
+                    # capture) persisted EMPTY tails — a multi-minute
+                    # billed child exited nonzero and the run dir held
+                    # nothing diagnosable. The CC child in -p mode
+                    # emits its result/error narrative at exit (no
+                    # live progress stream is lost), and the fork
+                    # spawn backend drains the pipes under its own
+                    # per-stream byte cap, so capture is bounded.
+                    capture_output=True,
+                    # The captured streams can quote hostile-target
+                    # bytes; the subprocess-backed lanes otherwise
+                    # decode strict and a single bad byte raises
+                    # UnicodeDecodeError in the parent — losing the
+                    # very narrative capture exists to keep. (The
+                    # fork spawn backend already decodes with
+                    # replacement; this aligns the other lanes.)
+                    errors="replace",
                     **stdin_kwargs,
                     timeout=timeout_s,
                     target=str(target), output=str(run_dir),
@@ -731,14 +1243,30 @@ def run_skill_dispatch(
                         cc_proxy_creds.bridges if cc_proxy_creds else None
                     ),
                     caller_label=caller_label,
+                    # run_dir is a run-dir root by construction (the
+                    # lifecycle starts it above) and that is this
+                    # lane's contract: the skill pass writes the run's
+                    # own artifacts there.
+                    output_run_root_ok=True,
                 )
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as e:
             lifecycle_settled = True
             fail_lifecycle(run_dir, f"timeout after {timeout_s}s")
+            # The exception carries the kill's partial capture — the
+            # only account of what the multi-minute child was doing
+            # when the clock ran out. Persist it like the rc!=0 and
+            # validate-failure legs (previously discarded: the arm
+            # returned without writing, and the operator got a bare
+            # timeout line).
+            _persist_child_tail(
+                run_dir, _timeout_partial_capture(e),
+                exit_label=f"timeout after {timeout_s}s",
+                duration_s=time.monotonic() - t0)
             logger.warning("%s timed out after %ds", log_label, timeout_s)
             return SkillDispatchResult(
                 ran=False, skipped_reason=f"timeout after {timeout_s}s",
-                run_dir=run_dir, duration_s=time.monotonic() - t0)
+                run_dir=run_dir, duration_s=time.monotonic() - t0,
+                child_exit=f"timeout after {timeout_s}s")
         except OSError as e:
             lifecycle_settled = True
             fail_lifecycle(run_dir, f"launch failed: {e}")
@@ -753,10 +1281,11 @@ def run_skill_dispatch(
             # bridge that cannot engage must fail THIS pass, not crash
             # the whole pipeline.
             lifecycle_settled = True
-            fail_lifecycle(run_dir, f"sandbox setup failed: {e}")
+            reason = f"{_SANDBOX_SETUP_REASON_PREFIX}{e}"
+            fail_lifecycle(run_dir, reason)
             logger.warning("%s sandbox setup failed: %s", log_label, e)
             return SkillDispatchResult(
-                ran=False, skipped_reason=f"sandbox setup failed: {e}",
+                ran=False, skipped_reason=reason,
                 run_dir=run_dir, duration_s=time.monotonic() - t0)
         finally:
             if prompt_fh is not None:
@@ -764,29 +1293,54 @@ def run_skill_dispatch(
 
         if proc.returncode != 0:
             lifecycle_settled = True
+            # Safety net for the cc-probe gate above: auth can expire
+            # between the probe and the dispatch, so detect the CLI's
+            # own "Not logged in" on a non-zero exit and skip cleanly.
+            _child_out = ((proc.stdout or "") + (proc.stderr or "")).lower()
+            if ("not logged in" in _child_out
+                    or "please run /login" in _child_out
+                    or "please run `claude /login`" in _child_out):
+                reason = ("claude CLI present but not logged in — run "
+                          "`claude /login` (skill pass skipped)")
+                fail_lifecycle(run_dir, reason)
+                logger.warning("%s skipped: %s", log_label, reason)
+                return SkillDispatchResult(
+                    ran=False, skipped_reason=reason,
+                    run_dir=run_dir, duration_s=time.monotonic() - t0,
+                    child_exit=str(proc.returncode))
             fail_lifecycle(run_dir, f"subprocess returned {proc.returncode}")
+            _persist_child_tail(run_dir, proc,
+                                duration_s=time.monotonic() - t0)
             logger.warning("%s returned %d: %s", log_label, proc.returncode,
-                           (proc.stderr or "")[:500])
+                           _child_failure_tail(proc))
             return SkillDispatchResult(
                 ran=False,
                 skipped_reason=f"subprocess returned {proc.returncode}",
-                run_dir=run_dir, duration_s=time.monotonic() - t0)
+                run_dir=run_dir, duration_s=time.monotonic() - t0,
+                child_exit=str(proc.returncode))
 
         if validate_outputs is not None:
             error = validate_outputs(run_dir)
             if error is not None:
                 lifecycle_settled = True
                 fail_lifecycle(run_dir, error)
+                # The child exited 0 but the pass produced no terminal
+                # artifact — its narrative is the only account of what
+                # went wrong inside.
+                _persist_child_tail(run_dir, proc,
+                                    duration_s=time.monotonic() - t0)
                 logger.warning("%s: %s", log_label, error)
                 return SkillDispatchResult(
                     ran=False, skipped_reason=error, run_dir=run_dir,
-                    duration_s=time.monotonic() - t0)
+                    duration_s=time.monotonic() - t0,
+                    child_exit=str(proc.returncode))
 
         complete_lifecycle(run_dir)
         lifecycle_settled = True
 
         return SkillDispatchResult(ran=True, run_dir=run_dir,
-                                   duration_s=time.monotonic() - t0)
+                                   duration_s=time.monotonic() - t0,
+                                   child_exit=str(proc.returncode))
 
     except Exception:
         # Make sure the lifecycle is marked failed before propagating.
@@ -817,11 +1371,13 @@ def run_skill_dispatch(
 
 __all__ = [
     "MAX_VALIDATE_FINDINGS",
+    "LifecycleStart",
     "SkillDispatchResult",
     "StageError",
     "build_checklist",
     "complete_lifecycle",
     "fail_lifecycle",
+    "missing_validation_report",
     "run_skill_dispatch",
     "start_lifecycle",
     "truncate_findings_by_signal",

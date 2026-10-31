@@ -141,10 +141,16 @@ class WatchEvent(Event):
 
 
 class MemberEvent(Event):
-    """Collaborator changed."""
+    """Collaborator changed.
+
+    GitHub emits three MemberEvent actions: added, removed, edited
+    (permission change). All three must be representable — collect_events
+    deliberately raises on malformed rows, so a single unrepresentable
+    `edited` event used to abort a whole day's ingest.
+    """
 
     event_type: Literal["member"] = "member"
-    action: Literal["added", "removed"]
+    action: Literal["added", "removed", "edited"]
     member: GitHubActor
 
 

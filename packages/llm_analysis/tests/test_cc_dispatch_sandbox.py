@@ -525,8 +525,11 @@ def test_invoke_cc_simple_routes_system_prompt_via_flag(
     # argv hygiene: the prompt text itself never appears in argv.
     assert "--system-prompt" not in cmd
     assert "operator system instructions" not in " ".join(cmd)
-    # The tempfile is unlinked once the dispatch returns.
-    assert not Path(spf_path).exists()
+    # The tempfile is content-addressed and process-cached: it
+    # survives the dispatch for reuse by the next call with the same
+    # prompt content, and atexit removes the cache at process exit
+    # (see core.llm.cc_adapter._sysprompt_file).
+    assert Path(spf_path).exists()
     # The sandboxed child runs restrict_reads=True — the tempfile must
     # be on the read allowlist or the CLI can't load its system prompt.
     assert spf_path in entry["kwargs"]["readable_paths"]

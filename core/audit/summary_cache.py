@@ -1,9 +1,16 @@
-"""Library summary cache for cross-audit amortisation.
+"""Library summary cache for cross-audit amortisation (EXPERIMENTAL).
 
 Pre-computed summaries for widely-used libraries (OpenSSL, zlib,
-libc, Django, Flask, etc.) are cached and reused across audits.
+libc, Django, Flask, etc.) can be cached and reused across audits.
 When a project imports a known library, cached summaries skip the
 expensive LLM summary generation pass entirely.
+
+STATUS: the lane is currently inert — RAPTOR ships no summary data
+and no pipeline stage calls :meth:`SummaryCache.store`, so the
+default cache directory does not exist and every orchestrator lookup
+returns empty. The read side is kept wired so an operator can
+populate the cache by hand (or a future stage can start writing it)
+without plumbing changes.
 
 Cache structure:
     {cache_dir}/{library}/{version}/summaries.json
@@ -231,15 +238,22 @@ def detect_library_version(
                 # scanned target, so a hostile manifest must not be
                 # buffered unbounded. Over-cap files are skipped and
                 # the next candidate manifest is tried.
-                size = manifest.stat().st_size
-                if size > _MAX_MANIFEST_BYTES:
+                # Bounded read, not stat-then-read: the manifest
+                # lives in the scanned target and can grow between a
+                # stat and an unbounded read_text() (TOCTOU) — read
+                # at most cap+1 bytes and skip on overflow instead.
+                with manifest.open("rb") as fh:  # raw-open: RAPTOR-written summary-cache manifest
+                    data = fh.read(_MAX_MANIFEST_BYTES + 1)
+                if len(data) > _MAX_MANIFEST_BYTES:
                     logger.warning(
                         "detect_library_version: skipping %s "
-                        "(%d bytes exceeds the %d-byte cap)",
-                        manifest, size, _MAX_MANIFEST_BYTES,
+                        "(exceeds the %d-byte cap)",
+                        manifest, _MAX_MANIFEST_BYTES,
                     )
                     continue
-                version = parser(manifest.read_text(), library)
+                version = parser(
+                    data.decode("utf-8", errors="replace"), library,
+                )
                 if version:
                     return version
             except Exception:  # noqa: BLE001, S112 — per-manifest parse: try the next candidate

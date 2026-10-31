@@ -457,7 +457,8 @@ class TestVerdictMergeMultiModelAnalysesContract:
         merged = adapter.merge(per_model)
         # Only one DISTINCT model contributed — multi_model_analyses absent.
         assert "multi_model_analyses" not in merged[0]
-        # select_primary still picked among the dupes (prefer-positive)
+        # First-wins duplicate contract: the model's vote is its FIRST
+        # record (here positive); the later dupe is dropped.
         assert merged[0]["is_exploitable"] is True
 
     def test_genuine_multi_model_analyses_still_attached(self):
@@ -469,6 +470,58 @@ class TestVerdictMergeMultiModelAnalysesContract:
         merged = adapter.merge(per_model)
         assert "multi_model_analyses" in merged[0]
         assert len(merged[0]["multi_model_analyses"]) == 2
+
+
+class TestDuplicateVoteContract:
+    """One vote per (item, model), FIRST record wins — the contract the
+    panel consumers settled on. Pre-fix the adapter layer ran two
+    OTHER contracts at once: merge fed every duplicate to
+    select_primary (prefer-positive across one model's duplicates)
+    while the agreement matrix kept the LAST duplicate's verdict."""
+
+    def test_merge_first_record_wins_within_one_model(self):
+        adapter = FindingAdapter()
+        per_model = {
+            "model-a": [
+                {"finding_id": "f1", "is_exploitable": False},
+                {"finding_id": "f1", "is_exploitable": True},  # later dupe
+            ],
+        }
+        merged = adapter.merge(per_model)
+        # Prefer-positive across dupes would flip this to True.
+        assert merged[0]["is_exploitable"] is False
+
+    def test_matrix_vote_matches_merged_primary(self):
+        adapter = FindingAdapter()
+        per_model = {
+            "model-a": [
+                {"finding_id": "f1", "is_exploitable": False},
+                {"finding_id": "f1", "is_exploitable": True},
+            ],
+            "model-b": [{"finding_id": "f1", "is_exploitable": False}],
+        }
+        merged = adapter.merge(per_model)
+        c = adapter.correlate(merged, per_model)
+        # Pre-fix: matrix said negative (last-wins) while merge's
+        # primary said positive (prefer-positive over dupes) — the
+        # consensus producer then graded models against a majority
+        # computed from different votes than the output showed.
+        assert c["agreement_matrix"]["f1"]["model-a"] == "negative"
+        assert merged[0]["is_exploitable"] is False
+
+    def test_set_merge_first_wins_and_finds_deduped(self):
+        adapter = VariantAdapter()
+        per_model = {
+            "model-a": [
+                {"file": "x.c", "line": 5, "snippet": "first"},
+                {"file": "x.c", "line": 5, "snippet": "second"},
+            ],
+            "model-b": [{"file": "x.c", "line": 5, "snippet": "b"}],
+        }
+        merged = adapter.merge(per_model)
+        assert merged[0]["snippet"] == "first"
+        # One per-model record each — the intra-model dupe adds none.
+        assert len(merged[0]["multi_model_finds"]) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -633,3 +686,50 @@ class TestAbstractEnforcement:
     def test_cannot_instantiate_base_set_adapter(self):
         with pytest.raises(TypeError):
             BaseSetAdapter()  # type: ignore[abstract]
+
+
+class TestCorrelateToleratesSparseAnalysisRecords:
+    def test_subclass_records_without_model_or_reasoning_keys(self):
+        """extract_analysis_record is documented as overridable; a
+        subclass record lacking "model"/"reasoning" must degrade to a
+        skipped insight, not KeyError the whole correlation."""
+
+        class SparseAdapter(FindingAdapter):
+            def extract_analysis_record(self, result, model_name):
+                # Deliberately omits "model" and "reasoning".
+                return {"verdict": self.normalize_verdict(result)}
+
+        adapter = SparseAdapter()
+        per_model = {
+            "model-a": [{"finding_id": "f1", "is_exploitable": True}],
+            "model-b": [{"finding_id": "f1", "is_exploitable": False}],
+        }
+        merged = adapter.merge(per_model)
+        c = adapter.correlate(merged, per_model)
+        assert c["confidence_signals"]["f1"] == "disputed"
+        # No attributable minority reasoning → no insights, no crash.
+        assert c["unique_insights"] == []
+
+
+class TestMergeNeverMutatesRawInputs:
+    """types.py promises per_model_raw holds the RAW outputs. The
+    default select_primary returns a dict-copy, but the method is
+    consumer-overridable — an override returning the winning dict
+    itself let merge() write multi_model_analyses INTO the raw
+    per-model record. The copy belongs in merge(), not in every
+    override's contract."""
+
+    def test_override_returning_raw_dict_is_copied(self):
+        class FirstWinsRaw(FindingAdapter):
+            def select_primary(self, model_results):
+                return model_results[0]  # raw, not a copy
+
+        adapter = FirstWinsRaw()
+        raw_a = {"finding_id": "f1", "is_exploitable": True}
+        raw_b = {"finding_id": "f1", "is_exploitable": False}
+        per_model = {"model-a": [raw_a], "model-b": [raw_b]}
+        merged = adapter.merge(per_model)
+        assert "multi_model_analyses" in merged[0]
+        # The raw inputs stay raw.
+        assert "multi_model_analyses" not in raw_a
+        assert "multi_model_analyses" not in raw_b

@@ -39,7 +39,10 @@ MAX_PAIRS = 500
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _CALL_NAME_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 _LOCATION_RE = re.compile(r"^\s*(\S+?):(\d+)")
-_SOURCE_LOC_RE = re.compile(r"@\s*(\S+?):(\d+)\s*$")
+# Path span bounded: unbounded, every planted "@" re-scans the rest
+# of a hostile line — quadratic. Real source paths sit far below
+# 300 chars (beyond it the location is unparsed).
+_SOURCE_LOC_RE = re.compile(r"@\s*(\S{1,300}?):(\d+)\s*$")
 
 _SOURCE_KEYS = ("has_taint_flow", "taint_reaches_sinks")
 _SINK_KEYS = ("taint_reached_from",)
@@ -277,7 +280,13 @@ def enrich_attack_surface_with_taint(
     spans = _function_spans(checklist)
     calls = _call_index(checklist)
 
-    pairs: list[tuple[dict[str, Any], dict[str, Any], str, str]] = []
+    # Cap enforced DURING enumeration: both sections are LLM-authored,
+    # and source/sink resolution are independent of each other, so the
+    # cross product must never be materialised past the cap (an
+    # n-entries-per-section surface would otherwise cost O(n^2) tuples
+    # before a later slice could act). The overflow is counted from
+    # the resolved-section product instead of built.
+    source_rows: list[tuple[dict[str, Any], str]] = []
     for source in attack_surface.get("sources") or []:
         source_method = _source_method(source, spans)
         if not _is_identifier(source_method) and source.get(
@@ -287,19 +296,31 @@ def enrich_attack_surface_with_taint(
             source_method = source.get("function", "")
         if not _is_identifier(source_method):
             continue
+        source_rows.append((source, source_method))  # type: ignore[arg-type]
+
+    sink_rows: list[tuple[dict[str, Any], str]] = []
+    if source_rows:
         for sink in attack_surface.get("sinks") or []:
             sink_call = _sink_call_name(sink, calls)
             if not _is_identifier(sink_call):
                 continue
-            pairs.append((source, sink, source_method, sink_call))
+            sink_rows.append((sink, sink_call))  # type: ignore[arg-type]
 
-    dropped = max(0, len(pairs) - max_pairs)
+    total = len(source_rows) * len(sink_rows)
+    dropped = max(0, total - max_pairs)
     if dropped:
         logger.warning(
             "attack-surface taint enrichment: %d pairs exceed cap of %d — "
-            "dropping the excess", len(pairs), max_pairs,
+            "dropping the excess", total, max_pairs,
         )
-        pairs = pairs[:max_pairs]
+    pairs: list[tuple[dict[str, Any], dict[str, Any], str, str]] = []
+    for source, source_method in source_rows:
+        if len(pairs) >= max_pairs:
+            break
+        for sink, sink_call in sink_rows:
+            if len(pairs) >= max_pairs:
+                break
+            pairs.append((source, sink, source_method, sink_call))
 
     # Existence queries are per unique (source_method, sink_call);
     # multiple surface pairs can share one query.

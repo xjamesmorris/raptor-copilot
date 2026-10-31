@@ -100,10 +100,6 @@ from collections import defaultdict
 from pathlib import Path
 
 PY_ROOTS = ["core", "packages", "plugins", "engine", "libexec"]
-ROOT_PY_FILES = [
-    "raptor.py", "raptor_agentic.py", "raptor_codeql.py",
-    "raptor_fuzzing.py", "conftest.py",
-]
 BASH_ROOTS = ["bin", "libexec"]
 
 # Artifact/scratch directory names, pruned from the walk. A *tracked
@@ -257,6 +253,12 @@ OVERRIDES: dict[str, str] = {
     "SAGE_IDENTITY_PATH": "internal",
     "SAGE_PROJECT": "internal",
     "SAGE_PROVIDER": "internal",
+    # Test synchronization hook: only the forwarder's own tests set
+    # it (to hold the supervisor at the pre-spawn gate); the read in
+    # packages/joern/netns_forwarder.py is the hook's implementation,
+    # which trips the prod-read-only → operator heuristic. Operators
+    # never set it.
+    "RAPTOR_NETNS_FORWARDER_TEST_PRESPAWN_GATE": "test-only",
 }
 
 VAR_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -465,6 +467,40 @@ def _parse_config_tables(root: Path, inv: Inventory) -> None:
                                         errors="replace"))
     except (OSError, SyntaxError):
         return
+
+    # Build name→value map so *name splats in config tables can be
+    # resolved to their definitions (module-level and class-level).
+    _name_values: dict[str, ast.expr] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            tgt = node.targets[0]
+            if isinstance(tgt, ast.Name):
+                _name_values[tgt.id] = node.value
+            elif isinstance(tgt, ast.Attribute):
+                _name_values[tgt.attr] = node.value
+
+    def _collect(value_node: ast.expr, tname: str,
+                 _seen: set[str] | None = None) -> None:
+        if _seen is None:
+            _seen = set()
+        for sub in ast.walk(value_node):
+            if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                occ = Occurrence(CONFIG_FILE, sub.lineno,
+                                 f"declared:{tname}")
+                if tname.endswith("PREFIXES"):
+                    inv.add_prefix(sub.value, occ)
+                elif VAR_NAME.match(sub.value):
+                    inv.add(sub.value, occ)
+            elif (
+                isinstance(sub, ast.Starred)
+                and isinstance(sub.value, ast.Name)
+                and sub.value.id not in _seen
+            ):
+                ref = _name_values.get(sub.value.id)
+                if ref is not None:
+                    _seen.add(sub.value.id)
+                    _collect(ref, tname, _seen)
+
     for node in ast.walk(tree):
         if not isinstance(node, ast.Assign):
             continue
@@ -476,14 +512,7 @@ def _parse_config_tables(root: Path, inv: Inventory) -> None:
             tname = target.attr
         if tname not in CONFIG_TABLES:
             continue
-        for sub in ast.walk(node.value):
-            if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
-                occ = Occurrence(CONFIG_FILE, sub.lineno,
-                                 f"declared:{tname}")
-                if tname.endswith("PREFIXES"):
-                    inv.add_prefix(sub.value, occ)
-                elif VAR_NAME.match(sub.value):
-                    inv.add(sub.value, occ)
+        _collect(node.value, tname)
 
 
 # --- bash extraction --------------------------------------------------------
@@ -650,8 +679,12 @@ def _iter_files(root: Path):
                 continue
             seen.add(p)
             yield p
-    for name in ROOT_PY_FILES:
-        p = root / name
+    # Repo-root entry modules, derived from the tree — never a name
+    # list (codeql_scope.py's doctrine: a hand-maintained entry-module
+    # list silently dropped new entry points before; the previous
+    # 5-name hand list here was already stale, missing
+    # raptor_openant.py and its OPENANT_CORE read).
+    for p in sorted(root.glob("*.py")):
         if p.is_file():
             yield p
 

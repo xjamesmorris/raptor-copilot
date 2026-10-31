@@ -17,6 +17,7 @@ from core.llm.coerce import structured_result
 from core.security.prompt_framing import with_audit_framing
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -96,7 +97,7 @@ def _load_flow_trace_pairs(out_dir: Path) -> set[tuple[str, str]]:
             for i, a in enumerate(keys):
                 for b in keys[i + 1:]:
                     pair = tuple(sorted([a, b]))
-                    pairs.add(pair)
+                    pairs.add(pair)  # type: ignore[arg-type]
         except Exception:
             logger.debug("flow trace pair load failed", exc_info=True)
             continue
@@ -147,7 +148,7 @@ def find_chain_candidates(
             )
             if connected:
                 candidates.append((a, b))
-                seen.add(pair_key)
+                seen.add(pair_key)  # type: ignore[arg-type]
 
     return candidates
 
@@ -219,10 +220,15 @@ def evaluate_chains(
     llm_client: Any,
     *,
     model_name: str | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> list[dict[str, Any]]:
     """Evaluate candidate pairs for security chaining.
 
     Returns a list of confirmed chain records.
+
+    *should_stop* (the orchestrator's environment dispatch gate) is
+    consulted before each per-pair LLM call; True stops the loop —
+    confirmed chains found so far are still returned.
     """
     if not candidates:
         return []
@@ -236,7 +242,17 @@ def evaluate_chains(
             pass
 
     chains: list[dict[str, Any]] = []
+    evaluated = 0
     for a, b in candidates:
+        if should_stop is not None and should_stop():
+            logger.info(
+                "chain evaluation stopped — environment guard "
+                "concluded (%d/%d candidate pair(s) evaluated, "
+                "%d chain(s) confirmed)",
+                evaluated, len(candidates), len(chains),
+            )
+            break
+        evaluated += 1
         prompt, system_prompt = _build_chain_prompt(
             a, b,
             model_id=model_name or getattr(llm_client, "model_name", "") or "",

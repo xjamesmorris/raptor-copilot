@@ -1084,3 +1084,66 @@ def test_distro_ecosystems_join_the_primary_batch(tmp_path: Path) -> None:
         q["package"]["ecosystem"] for q in http.posts[0][1]["queries"]
     ]
     assert queried == ["Debian", "Ubuntu", "Alpine:v3.16", "Red Hat"]
+
+
+# ---------------------------------------------------------------------------
+# GitHub Actions — sub-action refs query the parent repo
+# ---------------------------------------------------------------------------
+
+def test_gha_subaction_queries_parent_repo(tmp_path: Path) -> None:
+    """OSV keys GHA advisories on ``owner/repo`` — a sub-action ref
+    (``github/codeql-action/init``) queried verbatim matched nothing,
+    so sub-action ``uses:`` deps silently missed every advisory. The
+    query must collapse to the parent (the registry client already
+    parents at fetch)."""
+    dep = _dep("github/codeql-action/init", version="3.0.0",
+               ecosystem="GitHub Actions")
+    http = FakeHttp(batch_results=[[]])
+    client = OsvClient(http, JsonCache(root=tmp_path))
+    client.query_batch([dep])
+    assert len(http.posts) == 1
+    _url, body = http.posts[0]
+    (query,) = body["queries"]
+    assert query["package"]["name"] == "github/codeql-action"
+    assert query["package"]["ecosystem"] == "GitHub Actions"
+
+
+def test_gha_subaction_matches_parent_keyed_advisory() -> None:
+    """The response filter must accept a parent-repo-keyed affected
+    block for a sub-action dep (both sides collapse to the parent)."""
+    from packages.sca.osv import _canonical_name
+    assert _canonical_name(
+        "GitHub Actions", "github/codeql-action/init",
+    ) == _canonical_name("GitHub Actions", "github/codeql-action")
+    # Plain owner/repo refs are untouched.
+    assert _canonical_name(
+        "GitHub Actions", "actions/checkout",
+    ) == _canonical_name("GitHub Actions", "actions/checkout")
+
+
+def test_lookup_failed_tracks_per_key_and_clears_on_retry(
+    tmp_path: Path,
+) -> None:
+    """``lookup_failed`` distinguishes "no advisories" from "answer
+    unknown" per dep key (uncapped, unlike the display sample), and a
+    later successful lookup for the same key clears it."""
+    deps = [_dep("lodash")]
+    cache = JsonCache(root=tmp_path)
+
+    failing = FakeHttp(post_error=HttpError("boom", status=503))
+    client = OsvClient(failing, cache)
+    client.query_batch(deps)
+    assert client.lookup_failed("npm:lodash@1.0.0") is True
+    assert client.lookup_failed("npm:other@1.0.0") is False
+
+    # Retry on the SAME client with a recovered transport: the key's
+    # failure record clears — "most recent answer wins".
+    client._inner = OsvClient(
+        FakeHttp(batch_results=[["GHSA-jfh8-c2jp-5v3q"]],
+                 vuln_records={"GHSA-jfh8-c2jp-5v3q": _LOG4J_RECORD}),
+        cache,
+    )._inner
+    client.query_batch(deps)
+    assert client.lookup_failed("npm:lodash@1.0.0") is False
+    # The run-level degradation telemetry keeps its history.
+    assert client.failed_lookups == 1

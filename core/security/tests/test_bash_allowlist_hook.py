@@ -1,4 +1,4 @@
-"""Subprocess tests for .claude/hooks/bash-command-allowlist.py.
+"""Subprocess tests for the plugin dispatcher's Bash policy helper.
 
 Contract (Claude Code PreToolUse hooks): stdin carries JSON with
 ``tool_input.command``; exit 0 allows, exit 2 blocks with guidance on

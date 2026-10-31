@@ -26,7 +26,11 @@ import unittest
 from pathlib import Path
 
 import pytest
-from core.sandbox.tests.capability import requires_landlock, requires_userns
+from core.sandbox.tests.capability import (
+    requires_landlock,
+    requires_mount,
+    requires_userns,
+)
 
 pytestmark = pytest.mark.skipif(
     sys.platform != "linux", reason="mount-ns backend is Linux-only",
@@ -55,6 +59,8 @@ class _Base(unittest.TestCase):
         self.out = os.path.realpath(self._out.name)
 
 
+# Exercises mount-delivered capability; hosts with userns but no mount capability degrade by design -> named SKIP, not a mid-flight mount failure.
+@requires_mount
 class TestStrictRefusesPerCallDemotion(_Base):
     @requires_landlock
     @requires_userns
@@ -229,31 +235,41 @@ class TestDemotedCallGetsPrivateScratch(_Base):
             "demoted restricted call must stamp private_scratch")
 
     @requires_landlock
-    def test_demoted_lane_masks_host_cgroup(self):
-        # The subprocess-lane bootstrap unshares a cgroup namespace
-        # (where util-linux supports --cgroup), so /proc/self/cgroup
-        # reads "0::/" instead of the orchestrator's session scope —
-        # mirroring CLONE_NEWCGROUP on the fork lane.
+    def test_spawn_lane_masks_host_cgroup(self):
+        # CLONE_NEWCGROUP on the fork lane: /proc/self/cgroup reads
+        # "0::/" instead of the orchestrator's session scope. (The
+        # pass_fds-demoted PLAIN lane no longer masks the cgroup path
+        # — the deleted unshare-CLI fallback's --cgroup was the only
+        # namespace mask a demoted call ever had; a demoted call now
+        # runs at the landlock tier, with the demotion warned and the
+        # tier stamped, and the mask rides the namespace lanes only.)
         from core.sandbox import sandbox
-        from core.sandbox.probes import unshare_supports_cgroup
-        if not unshare_supports_cgroup():
-            self.skipTest("unshare lacks --cgroup on this host")
-        _pr, _pw = os.pipe()
-        os.write(_pw, b"go")
-        os.close(_pw)
-        self.addCleanup(lambda: os.close(_pr))
         with sandbox(target=self.tgt, output=self.out) as run:
             r = run(["cat", "/proc/self/cgroup"],
-                    stdin=_pr, pass_fds=[_pr], pass_fds_declared=True,
                     capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr[-400:])
         self.assertIn("0::/", r.stdout, r.stdout)
         for tell in ("user.slice", "session-", ".scope"):
             self.assertNotIn(tell, r.stdout,
                              f"host cgroup path leaked: {r.stdout!r}")
+        # The demoted plain lane still RUNS the same shape (floor
+        # BARE for trusted work) — pin the routing, not the mask.
+        _pr, _pw = os.pipe()
+        os.write(_pw, b"go")
+        os.close(_pw)
+        self.addCleanup(lambda: os.close(_pr))
+        with sandbox(target=self.tgt, output=self.out) as run:
+            r2 = run(["cat", "/proc/self/cgroup"],
+                     stdin=_pr, pass_fds=[_pr], pass_fds_declared=True,
+                     capture_output=True, text=True, timeout=60)
+        self.assertEqual(r2.returncode, 0, r2.stderr[-400:])
+        self.assertEqual(r2.sandbox_info.get("containment_tier"),
+                         "landlock")
 
     @requires_landlock
     @requires_userns
+    # Exercises mount-delivered capability; hosts with userns but no mount capability degrade by design -> named SKIP, not a mid-flight mount failure.
+    @requires_mount
     def test_mounted_run_keeps_full_tmp_semantics(self):
         """No demotion → per-sandbox tmpfs /tmp stays writable."""
         from core.sandbox import sandbox

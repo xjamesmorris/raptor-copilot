@@ -52,6 +52,8 @@ from pathlib import Path
 from typing import Any
 
 from ..models import Confidence, Dependency, PinStyle
+from ..naming import pep503_name
+from ._base import PARSE_ESCAPE_ERRORS, build_purl
 from . import _safe_read, register
 
 try:
@@ -74,7 +76,7 @@ def parse(path: Path) -> list[Dependency]:
         return []
     try:
         data = tomllib.loads(text)
-    except tomllib.TOMLDecodeError as e:
+    except (tomllib.TOMLDecodeError, *PARSE_ESCAPE_ERRORS) as e:  # type: ignore[misc]  # hostile-input escape classes
         logger.warning(
             "sca.parsers.uv_lock: TOML parse failed for %s: %s",
             path, e,
@@ -106,7 +108,13 @@ def _build_dep(
         return None
     if not isinstance(version, str) or not version.strip():
         return None
-    name = name.strip()
+    # PEP 503 normalisation, same as every other PyPI parser. uv
+    # itself writes normalised names, but a non-canonical spelling
+    # (hand-edited lockfile, older tool output) would otherwise fail
+    # to join with the normalised manifest-side row from pyproject /
+    # requirements — the joined view would double-report instead of
+    # deferring to the manifest parser.
+    name = pep503_name(name.strip())
     version = version.strip()
 
     source = pkg.get("source") or {}
@@ -143,7 +151,7 @@ def _build_dep(
         # view defers to the manifest-side parser when both are
         # present.
         direct=False,
-        purl=f"pkg:{_PURL_TYPE}/{name}@{version}",
+        purl=build_purl(_PURL_TYPE, name, version),
         parser_confidence=Confidence(
             "high",
             reason="uv.lock pinned dependency",

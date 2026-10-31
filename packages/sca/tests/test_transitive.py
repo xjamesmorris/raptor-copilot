@@ -450,10 +450,12 @@ def test_common_ancestor_multiple_paths_finds_shared_prefix(tmp_path):
     assert common == (tmp_path / "a").resolve()
 
 
-def test_common_ancestor_disjoint_paths_returns_root():
+def test_common_ancestor_disjoint_paths_refused():
+    """Disjoint inputs share only the filesystem root — returning
+    ``/`` sized the batch sandbox cwd filesystem-wide; ``None`` makes
+    the batch resolvers fall back to sequential per-dir sessions."""
     from packages.sca.transitive import _common_ancestor
-    common = _common_ancestor([Path("/x/y"), Path("/p/q")])
-    assert common == Path("/")
+    assert _common_ancestor([Path("/x/y"), Path("/p/q")]) is None
 
 
 # ---------------------------------------------------------------------------
@@ -949,3 +951,193 @@ def test_dedup_across_multiple_project_dirs_unchanged(
     # survives (once per project_dir, as before).
     assert {d.name for d in deps} == {"c"}
     assert all(s.method == "cascade_resolver" for s in statuses)
+
+
+class TestCanonicalNameSharedRule:
+    """The detector must join on the SAME canonical form as the rest
+    of the pipeline (packages/sca/naming.py) — its hand-rolled fold
+    diverged both ways."""
+
+    def test_pypi_dotted_name_folds_per_pep503(self):
+        from packages.sca.transitive_drop.detector import _canonical_name
+        # Pre-fix: "foo.bar" stayed "foo.bar" while the pipeline
+        # folded it to "foo-bar" — a dotted transitive dep evaded
+        # drop detection.
+        assert _canonical_name("PyPI", "Foo.Bar") == "foo-bar"
+        assert _canonical_name("PyPI", "foo_bar") == "foo-bar"
+
+    def test_case_sensitive_ecosystems_pass_through(self):
+        from packages.sca.transitive_drop.detector import _canonical_name
+        # Pre-fix: Cargo/Go names were lowercased here and nowhere
+        # else, minting false matches at this boundary only.
+        assert _canonical_name("Go", "github.com/Foo/Bar") == "github.com/Foo/Bar"
+        assert _canonical_name("Maven", "com.Example:Artifact") == "com.Example:Artifact"
+
+    def test_npm_lowercases(self):
+        from packages.sca.transitive_drop.detector import _canonical_name
+        assert _canonical_name("npm", "@Scope/Pkg") == "@scope/pkg"
+
+
+class TestParentMapProducerClosure:
+    """Every cascade parent-map producer must emit child keys AND
+    parent values already folded by ``_parent_map_key`` — the
+    transitive-drop detector joins ``source_extra["via"]`` back
+    through that rule, so a producer outside it silently loses the
+    parent linkage. The producer set is enumerated mechanically so
+    a new extractor cannot ship outside the closure."""
+
+    # Mixed-case samples: the fixpoint assertion below is vacuous on
+    # all-lowercase input, so every sample carries case.
+    _SAMPLES = {
+        "_extract_cargo_lock_parents": ("Cargo", (
+            b'[[package]]\n'
+            b'name = "Inflector"\n'
+            b'version = "0.11.4"\n'
+            b'dependencies = ["Regex-Syntax 0.6.0"]\n'
+            b'\n'
+            b'[[package]]\n'
+            b'name = "Regex-Syntax"\n'
+            b'version = "0.6.0"\n'
+        )),
+        "_extract_composer_lock_parents": ("Packagist", (
+            b'{"packages": [{"name": "Vendor/Package",'
+            b' "require": {"Child/Lib": "^1.0"}}]}'
+        )),
+        "_extract_gemfile_lock_parents": ("RubyGems", (
+            b"GEM\n"
+            b"  remote: https://rubygems.org/\n"
+            b"  specs:\n"
+            b"    RedCloth (4.3.4)\n"
+            b"      Nokogiri (= 1.16.0)\n"
+            b"    Nokogiri (1.16.0)\n"
+        )),
+        "_extract_npm_lock_parents": ("npm", (
+            b'{"packages": {"": {},'
+            b' "node_modules/ParentPkg":'
+            b' {"dependencies": {"ChildPkg": "^1.0"}}}}'
+        )),
+        # Extras-carrying shape included deliberately: an unstripped
+        # ``celery[redis]`` is its own pep503 fixpoint, so only the
+        # no-brackets assertion below can see it.
+        "_extract_pip_compile_via": ("PyPI", (
+            b"Zope.Interface==5.0\n"
+            b"    # via My_Parent\n"
+            b"Redis==4.5.0\n"
+            b"    # via Celery[redis]\n"
+        )),
+    }
+
+    def _producers(self):
+        import packages.sca.transitive as t
+        return {
+            name: fn for name, fn in vars(t).items()
+            if callable(fn)
+            and name.startswith("_extract_")
+            and (name.endswith("_parents") or name.endswith("_via"))
+        }
+
+    def test_every_producer_has_a_sample(self):
+        assert set(self._producers()) == set(self._SAMPLES)
+
+    def test_producers_emit_join_key_fixpoints(self):
+        from packages.sca.transitive import _parent_map_key
+        for name, fn in self._producers().items():
+            eco, blob = self._SAMPLES[name]
+            mapping = fn(blob)
+            assert mapping, f"{name}: sample produced no edges"
+            for child, parents in mapping.items():
+                assert child == _parent_map_key(eco, child), (
+                    f"{name}: child key {child!r} not join-key folded"
+                )
+                assert parents, f"{name}: {child!r} has no parents"
+                for p in parents:
+                    assert p == _parent_map_key(eco, p), (
+                        f"{name}: parent {p!r} not join-key folded"
+                    )
+                    # Requirement syntax (PEP 508 extras) is never
+                    # part of a package name in any covered
+                    # ecosystem — and brackets survive the pep503
+                    # fold, so the fixpoint assertion above is
+                    # blind to them.
+                    assert "[" not in p, (
+                        f"{name}: parent {p!r} carries requirement "
+                        "syntax (extras) — can never join a direct "
+                        "dep's key"
+                    )
+
+    def test_pip_compile_extras_and_marker_lines_join(self):
+        """The real pip-compile shapes the fixpoint sweep cannot
+        pin by construction: an extras-carrying pinned line and a
+        marker-carrying pinned line must still produce edges (the
+        old pkg_re skipped both lines entirely), and an
+        extras-carrying via parent must fold to the bare name."""
+        from packages.sca.transitive import _extract_pip_compile_via
+        mapping = _extract_pip_compile_via(
+            b"Celery[redis]==5.3.6\n"
+            b"    # via My_App\n"
+            b'Redis==4.5.0 ; python_version >= "3.9"\n'
+            b"    # via\n"
+            b"    #   Celery[redis]\n"
+            b"    #   kombu\n"
+        )
+        assert mapping["celery"] == ["my-app"]
+        assert mapping["redis"] == ["celery", "kombu"]
+
+
+def test_requirements_include_scan_refuses_oversized_file(
+    tmp_path,
+) -> None:
+    """A planted multi-hundred-MB requirements file must be refused by
+    stat, not slurped — the include scan allocated ~2x the file size
+    before this read was bounded."""
+    import tracemalloc
+
+    from packages.sca.transitive import _requirements_include_targets
+
+    p = tmp_path / "requirements.txt"
+    with p.open("wb") as fh:
+        fh.truncate(60 * 1024 * 1024)       # sparse: cheap to create
+    tracemalloc.start()
+    try:
+        targets = _requirements_include_targets(p)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert targets == set()
+    assert peak < 10 * 1024 * 1024
+
+
+def test_cargo_workspace_probe_refuses_symlink(tmp_path) -> None:
+    """A committed ``Cargo.toml`` symlink must not be followed to a
+    host file."""
+    from packages.sca.transitive import _is_cargo_workspace_root
+
+    outside = tmp_path / "outside.toml"
+    outside.write_text("[workspace]\n", encoding="utf-8")
+    link = tmp_path / "Cargo.toml"
+    link.symlink_to(outside)
+    assert _is_cargo_workspace_root(link) is False
+
+
+def test_common_ancestor_refuses_rootless_batches() -> None:
+    """Manifests whose only shared prefix is the filesystem root must
+    NOT size the batch sandbox cwd to "/" (filesystem-wide reads for
+    the whole resolver session). ``None`` makes the batch resolvers
+    take their documented sequential per-dir fallback instead."""
+    from pathlib import Path as _P
+
+    from packages.sca.transitive import _common_ancestor
+
+    assert _common_ancestor([_P("/srv/app"), _P("/opt/other")]) is None
+    # A real shared prefix still batches.
+    assert _common_ancestor(
+        [_P("/srv/app/a"), _P("/srv/app/b")]) == _P("/srv/app")
+
+
+def test_common_ancestor_single_root_input_refused() -> None:
+    from pathlib import Path as _P
+
+    from packages.sca.transitive import _common_ancestor
+
+    assert _common_ancestor([_P("/")]) is None
+    assert _common_ancestor([_P("/srv/app")]) == _P("/srv/app")

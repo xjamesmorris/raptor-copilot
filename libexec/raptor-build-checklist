@@ -29,6 +29,7 @@ if not (os.environ.get("CLAUDECODE")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import core.startup.process_init  # noqa: E402,F401
+from core.json import load_json, save_json  # noqa: E402
 
 
 def main() -> None:
@@ -73,8 +74,35 @@ def main() -> None:
         )
         return
 
+    from core.inventory import ChecklistBudgetExceededError
     from packages.exploitability_validation import build_checklist
-    checklist = build_checklist(target, output_dir, scope=parsed.scope)
+    try:
+        checklist = build_checklist(target, output_dir, scope=parsed.scope)
+    except ChecklistBudgetExceededError as exc:
+        # The writer already composed the actionable message (size,
+        # budget, --scope remedy) — surface it without traceback spam.
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except ValueError as exc:
+        # Builder refusals (unrecognised single-file target, escaping
+        # --scope entry) pre-fix surfaced as a raw traceback. One
+        # actionable line instead — and for the archive case, the
+        # canonical route: this builder works on TREES, never inside
+        # archives.
+        msg = str(exc)
+        try:
+            from core.archive import is_archive
+            if Path(target).is_file() and is_archive(target):
+                msg = (
+                    f"target is an archive, not a source tree: {target}"
+                    f" — extract it (or run /scan on it, which unpacks"
+                    f" into the shared _sources cache) and build the"
+                    f" checklist on the extracted tree"
+                )
+        except Exception:  # noqa: BLE001 — hint is best-effort
+            pass
+        print(f"ERROR: {msg}", file=sys.stderr)
+        sys.exit(1)
 
     total = checklist.get("total_files", 0)
     items = checklist.get("total_items", 0)
@@ -111,8 +139,6 @@ def _build_binary_checklist(target: Path, output_dir: Path) -> dict:
     the sandboxed bridge, raw binaries through the r2/objdump
     fallback chain (reduced fidelity, no decompilation).
     """
-    import json
-
     from core.audit.binary_context import find_redb, load_redb
     from core.inventory.binary_builder import build_binary_checklist
 
@@ -153,8 +179,15 @@ def _build_binary_checklist(target: Path, output_dir: Path) -> dict:
                   file=sys.stderr)
             from packages.ghidra.objdump_import import import_binary_objdump
             db = import_binary_objdump(target)
-        with open(output_dir / "re-database.json", "w") as f:
-            json.dump(db.to_dict(), f, indent=1)
+        # Atomic write: a crash mid-write must not leave a torn
+        # database that the next run half-reads.
+        from core.audit.binary_context import stamp_binary_sha256
+        doc = db.to_dict()
+        # Content-hash stamp (the bridge writer's discipline): later
+        # cache hits on this file are validated against the binary
+        # they are being used for, not just its path.
+        stamp_binary_sha256(doc, target)
+        save_json(output_dir / "re-database.json", doc)
 
     # A prior /understand --map of the binary enriches priority
     # scoring with entry-point and sink addresses.
@@ -163,12 +196,14 @@ def _build_binary_checklist(target: Path, output_dir: Path) -> dict:
                  output_dir / "context-map.json",
                  output_dir.parent / "binary-context-map.json"):
         if cand.is_file():
-            try:
-                context_map = json.loads(cand.read_text())
+            # Bounded read: context maps are RAPTOR-written run
+            # output; the shared 64MB artifact ceiling keeps a
+            # corrupt/oversized file from becoming an OOM lever.
+            loaded = load_json(cand, max_bytes=64 * 1024 * 1024)
+            if loaded is not None:
+                context_map = loaded
                 print(f"using context map: {cand}")
                 break
-            except (OSError, ValueError):
-                continue
 
     checklist = build_binary_checklist(
         db,
@@ -176,8 +211,13 @@ def _build_binary_checklist(target: Path, output_dir: Path) -> dict:
         include_auto_named=True,
         context_map=context_map,
     )
-    with open(output_dir / "checklist.json", "w") as f:
-        json.dump(checklist, f, indent=2)
+    # Accessor write (atomic, flocked): every downstream stage
+    # (validate stage 0, the enrich family) reads through the
+    # accessors, and a direct save_json here would leave a stale
+    # sharded checklist/ dir winning the on-disk discriminator over
+    # the fresh binary inventory.
+    from core.inventory import save_checklist
+    save_checklist(output_dir, checklist)
     return checklist
 
 

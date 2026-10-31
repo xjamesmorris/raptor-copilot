@@ -10,7 +10,9 @@ constant-foldable index —
 Array elements can alias, so :mod:`core.analysis.const_fold_java`
 refuses every ``array_access``. This module supplies the missing
 aliasing analysis with a refusal-first whole-file scan: a table name
-qualifies only when its every appearance in the analysed span is one
+qualifies only when its every appearance in the WHOLE FILE (the
+occurrence pass deliberately scans beyond the analysed span — a store
+outside the span is still a store) is one
 of (a) its single initializing declarator with an array-literal
 value, or (b) an ``array_access`` READ base. Any other appearance —
 an element store (``values[i] = …``, compound or update forms), the
@@ -51,6 +53,41 @@ _IDENT = "identifier"
 def _parser():
     from core.analysis.cfg_builder_java import _get_parser
     return _get_parser()
+
+
+def _field_table_scope_ok(declarator: Node) -> bool:
+    """False for a FIELD table that another file could write.
+
+    The occurrence pass scans the WHOLE FILE but only the file: a
+    ``static String[] VALUES`` accessible from another compilation
+    unit can take a cross-file element store
+    (``Other.VALUES[0] = taint``) the scan can never see — and
+    ``final`` does not help, since it protects the REFERENCE, not
+    the elements. Only ``private`` fields confine every possible
+    store to this file (reflection is out of the model, as
+    everywhere in the folder). Local declarators pass: a local
+    array's stores are all in-file by construction, and the scan's
+    disqualifiers (aliasing, call-arg escape) already police them.
+    """
+    parent = declarator.parent
+    if parent is None:
+        return False
+    if parent.type == "constant_declaration":
+        # Interface fields are implicitly public static final
+        # regardless of written modifiers — always cross-file
+        # element-writable, so they can never confine their stores
+        # to this file.
+        return False
+    if parent.type != "field_declaration":
+        return True
+    mods = next(
+        (c for c in parent.children if c.type == "modifiers"), None)
+    if mods is None:
+        return False
+    return any(
+        c.text.decode("utf-8", "replace") == "private"  # type: ignore[union-attr]
+        for c in mods.children
+    )
 
 
 def _initializer_elements(value_node) -> list | None:
@@ -111,6 +148,11 @@ class ArrayTableIndex:
                         self._refused.add(name)
                     elif len(elements) > _MAX_ELEMENTS:
                         self._refused.add(name)
+                    elif not _field_table_scope_ok(n):
+                        # Non-private FIELD: a cross-file element
+                        # store is invisible to the file-scoped
+                        # occurrence pass — refuse.
+                        self._refused.add(name)
                     else:
                         self._elements[name] = elements
                         declarator_name_spans.add(
@@ -126,7 +168,7 @@ class ArrayTableIndex:
                 name = n.text.decode()
                 if name in self._elements and name not in self._refused:
                     if not self._appearance_allowed(
-                            n, parent, grandparent,
+                            n, parent, grandparent,  # type: ignore[arg-type]
                             declarator_name_spans):
                         self._refused.add(name)
             stack2.extend((c, n, parent) for c in n.children)
@@ -149,11 +191,11 @@ class ArrayTableIndex:
             return True
         # (b) the base of an array_access READ
         if parent.type == _ARRAY_ACCESS and self._spans_match(
-                parent.child_by_field_name("array"), ident):
+                parent.child_by_field_name("array"), ident):  # type: ignore[arg-type]
             if grandparent is not None \
                     and grandparent.type == _ASSIGNMENT \
                     and self._spans_match(
-                        grandparent.child_by_field_name("left"), parent):
+                        grandparent.child_by_field_name("left"), parent):  # type: ignore[arg-type]
                 return False  # element store (plain or compound)
             if grandparent is not None and grandparent.type == _UPDATE:
                 return False  # values[i]++
@@ -185,20 +227,20 @@ def make_array_resolver(table_index: ArrayTableIndex, fold):
     def resolve(node: Node, resolve_name, depth: int) -> Any:
         if table_index is None or not table_index.ok:
             return REFUSE
-        if resolve.active >= _MAX_NESTING:
+        if resolve.active >= _MAX_NESTING:  # type: ignore[attr-defined]
             return REFUSE
         base = node.child_by_field_name("array")
         idx = node.child_by_field_name("index")
         if base is None or idx is None or base.type != _IDENT:
             return REFUSE
-        elements = table_index.elements(base.text.decode())
+        elements = table_index.elements(base.text.decode())  # type: ignore[union-attr]
         if elements is None:
             return REFUSE
-        resolve.active += 1
+        resolve.active += 1  # type: ignore[attr-defined]
         try:
             index_val = fold(idx, resolve_name, depth)
         finally:
-            resolve.active -= 1
+            resolve.active -= 1  # type: ignore[attr-defined]
         if index_val is REFUSE or isinstance(index_val, bool) \
                 or not isinstance(index_val, int):
             return REFUSE
@@ -210,11 +252,11 @@ def make_array_resolver(table_index: ArrayTableIndex, fold):
         value = fold_expr(elements[index_val], lambda _n, _d: REFUSE)
         if value is REFUSE:
             return REFUSE
-        resolve.hits += 1
+        resolve.hits += 1  # type: ignore[attr-defined]
         return value
 
-    resolve.hits = 0
-    resolve.active = 0
+    resolve.hits = 0  # type: ignore[attr-defined]
+    resolve.active = 0  # type: ignore[attr-defined]
     return resolve
 
 

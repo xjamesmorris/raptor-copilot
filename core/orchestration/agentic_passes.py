@@ -28,25 +28,36 @@ Both passes degrade gracefully:
   - lifecycle start fails   -> skipped, no orphan dir
   - subprocess fails        -> lifecycle marked failed, base pipeline continues
 
-The return value carries a ``skipped`` reason so the main flow can log it.
-Functions never raise — a backstop catches unexpected exceptions and turns
-them into ran=False.
+The legacy dispatch return values carry a ``skipped`` reason so the main flow
+can log it. Those wrappers never raise — a backstop catches unexpected
+exceptions and turns them into ran=False.
+
+Copilot-native ``--validate`` reuses the same selection/conversion mechanics
+through :func:`prepare_native_validate_postpass`, but does not spawn a
+repository transport. It prepares and interrupts the sibling validate
+lifecycle for the active host session to execute.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
-import shutil
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from core.json import load_json, save_json
+from core.run.finding_status import read_verdict
 from core.orchestration.skill_dispatch import (
     MAX_VALIDATE_FINDINGS,
     StageError,
+    fail_lifecycle,
+    missing_validation_report,
     run_skill_dispatch,
+    start_lifecycle,
     truncate_findings_by_signal,
 )
 from core.orchestration.skill_dispatch import (
@@ -80,6 +91,18 @@ _POSTPASS_TIMEOUT_S = 1800  # 30 min — multi-stage validate over multiple find
 _LIFECYCLE_TIMEOUT_S = 30   # lifecycle helpers are mechanical; should be instant
 _CHECKLIST_TIMEOUT_S = 300  # build_checklist parses every source file
 
+NATIVE_VALIDATE_REQUEST_SCHEMA = (
+    "raptor.copilot-native-validation-request/v1"
+)
+_NATIVE_VALIDATE_POINTER_SCHEMA = (
+    "raptor.copilot-native-validation-handoff/v1"
+)
+NATIVE_CONTEXT_REQUEST_SCHEMA = (
+    "raptor.copilot-native-context-request/v1"
+)
+NATIVE_AUDIT_REQUEST_SCHEMA = "raptor.copilot-native-audit-request/v1"
+_NATIVE_AUDIT_POINTER_SCHEMA = "raptor.copilot-native-audit-handoff/v1"
+
 
 @dataclass
 class PrepassResult:
@@ -101,6 +124,102 @@ class PostpassResult:
     validate_dir: Path | None = None
     report_path: Path | None = None
     duration_s: float = 0.0
+
+
+@dataclass
+class NativeValidateHandoff:
+    """Prepared host-managed validation post-pass."""
+
+    requested: bool = True
+    prepared: bool = False
+    completed: bool = False
+    skipped_reason: str | None = None
+    selected_count: int = 0
+    validate_dir: Path | None = None
+    selection_file: Path | None = None
+    selection_sha256: str | None = None
+    request_path: Path | None = None
+    request_sha256: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "requested": self.requested,
+            "prepared": self.prepared,
+            "completed": self.completed,
+            "skipped_reason": self.skipped_reason,
+            "selected_count": self.selected_count,
+            "validate_dir": (
+                str(self.validate_dir) if self.validate_dir else None
+            ),
+            "selection_file": (
+                str(self.selection_file) if self.selection_file else None
+            ),
+            "selection_sha256": self.selection_sha256,
+            "request_path": (
+                str(self.request_path) if self.request_path else None
+            ),
+            "request_sha256": self.request_sha256,
+        }
+
+
+@dataclass
+class NativeContextHandoff:
+    """Prepared host-managed understand/threat-model context pass."""
+
+    prepared: bool = False
+    understand_dir: Path | None = None
+    context_map_path: Path | None = None
+    request_path: Path | None = None
+    request_sha256: str | None = None
+    receipt_path: Path | None = None
+    threat_model_requested: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "prepared": self.prepared,
+            "understand_dir": (
+                str(self.understand_dir) if self.understand_dir else None
+            ),
+            "context_map_path": (
+                str(self.context_map_path)
+                if self.context_map_path
+                else None
+            ),
+            "request_path": (
+                str(self.request_path) if self.request_path else None
+            ),
+            "request_sha256": self.request_sha256,
+            "receipt_path": (
+                str(self.receipt_path) if self.receipt_path else None
+            ),
+            "threat_model_requested": self.threat_model_requested,
+        }
+
+
+@dataclass
+class NativeAuditHandoff:
+    """Prepared host-managed gap-audit post-pass."""
+
+    prepared: bool = False
+    completed: bool = False
+    audit_dir: Path | None = None
+    request_path: Path | None = None
+    request_sha256: str | None = None
+    receipt_path: Path | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "prepared": self.prepared,
+            "completed": self.completed,
+            "audit_dir": str(self.audit_dir) if self.audit_dir else None,
+            "request_path": (
+                str(self.request_path) if self.request_path else None
+            ),
+            "request_sha256": self.request_sha256,
+            "receipt_path": (
+                str(self.receipt_path) if self.receipt_path else None
+            ),
+        }
 
 
 @dataclass
@@ -180,9 +299,10 @@ def _run_understand_prepass_unsafe(
     # The shared runner adds str(_RAPTOR_DIR) on top of the calibrated
     # readable_paths so the LLM-directed Bash tool can invoke
     # libexec/raptor-normalize-context-map (MAP-5) and
-    # libexec/raptor-coverage-summary --mark (MAP-6) — those scripts
-    # live under RAPTOR_DIR. target + understand_dir are auto-
-    # allowlisted via the target=/output= positional args.
+    # libexec/raptor-coverage-summary --mark ... --map-grade (MAP-6,
+    # map-grade: examination evidence only, never review credit) —
+    # those scripts live under RAPTOR_DIR. target + understand_dir are
+    # auto-allowlisted via the target=/output= positional args.
     dispatch = run_skill_dispatch(
         command="understand",
         target=target,
@@ -194,6 +314,9 @@ def _run_understand_prepass_unsafe(
         build_prompt=lambda run_dir: _build_understand_prompt(target, run_dir),
         block_cc_dispatch=block_cc_dispatch,
         claude_bin=claude_bin,
+        # Child phase of the agentic run: thread its project pin so
+        # the understand run lands in the same project.
+        parent_run_dir=agentic_out_dir,
         stage=_stage,
         validate_outputs=_check_outputs,
     )
@@ -203,6 +326,7 @@ def _run_understand_prepass_unsafe(
                              understand_dir=dispatch.run_dir,
                              duration_s=dispatch.duration_s)
 
+    assert dispatch.run_dir is not None
     context_map = dispatch.run_dir / "context-map.json"
 
     # Best-effort: enrich the agentic checklist with priority markers from
@@ -226,6 +350,355 @@ def _run_understand_prepass_unsafe(
         context_map_path=context_map,
         checklist_enriched=enriched,
         duration_s=dispatch.duration_s,
+    )
+
+
+def prepare_native_context_prepass(
+    *,
+    target: Path,
+    agentic_out_dir: Path,
+    threat_model_requested: bool = False,
+    threat_model_refresh: bool = False,
+    threat_model_use_stale: bool = False,
+) -> NativeContextHandoff:
+    """Prepare a sibling understand run for the active Copilot session."""
+    target = Path(target).resolve()
+    agentic_out_dir = Path(agentic_out_dir).resolve()
+    started = start_lifecycle(
+        "understand",
+        target,
+        parent_run_dir=agentic_out_dir,
+    )
+    understand_dir = started.run_dir
+    if understand_dir is None:
+        reason = "lifecycle start failed"
+        if started.error:
+            reason = f"{reason}: {started.error}"
+        raise RuntimeError(reason)
+
+    try:
+        if not _provision_understand_checklist(
+            target,
+            agentic_out_dir,
+            understand_dir,
+        ):
+            raise RuntimeError("checklist build failed")
+        from core.inventory import read_checklist
+        checklist = read_checklist(understand_dir)
+        if not isinstance(checklist, dict) or not checklist:
+            raise RuntimeError("understand checklist is missing or invalid")
+
+        context_map_path = understand_dir / "context-map.json"
+        receipt_path = (
+            agentic_out_dir / "copilot-native" / "context-receipt.json"
+        )
+        request_path = (
+            understand_dir / "copilot-native-context-request.json"
+        )
+        request = {
+            "schema": NATIVE_CONTEXT_REQUEST_SCHEMA,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "target": str(target),
+            "agentic_run_dir": str(agentic_out_dir),
+            "understand_dir": str(understand_dir),
+            "checklist_path": str(
+                (understand_dir / "checklist.json").resolve(),
+            ),
+            "checklist_sha256": _json_sha256(checklist),
+            "context_map_path": str(context_map_path),
+            "context_receipt_path": str(receipt_path),
+            "resume_argv": [
+                "libexec/raptor-run-lifecycle",
+                "start",
+                "understand",
+                "--target",
+                str(target),
+                "--out",
+                str(understand_dir),
+            ],
+            "mode": "map",
+            "threat_model_requested": bool(threat_model_requested),
+            "threat_model_refresh": bool(threat_model_refresh),
+            "threat_model_use_stale": bool(threat_model_use_stale),
+            "apply_target_patches": False,
+        }
+        save_json(request_path, request)
+
+        from core.run.metadata import interrupt_run
+        interrupt_run(
+            understand_dir,
+            reason="awaiting host-managed Copilot context mapping",
+            extra={
+                "copilot_native_context_request": str(request_path),
+                "parent_agentic_run": str(agentic_out_dir),
+                "context_map_path": str(context_map_path),
+                "threat_model_requested": bool(threat_model_requested),
+                "apply_target_patches": False,
+            },
+            expected_command="understand",
+        )
+    except Exception as exc:
+        fail_lifecycle(
+            understand_dir,
+            f"native context handoff preparation failed: {exc}",
+        )
+        raise
+
+    return NativeContextHandoff(
+        prepared=True,
+        understand_dir=understand_dir,
+        context_map_path=context_map_path,
+        request_path=request_path,
+        request_sha256=_sha256_file(request_path),
+        receipt_path=receipt_path,
+        threat_model_requested=bool(threat_model_requested),
+    )
+
+
+def prepare_native_audit_postpass(
+    *,
+    target: Path,
+    agentic_out_dir: Path,
+    context_receipt: dict[str, Any],
+    audit_policy: dict[str, Any],
+) -> NativeAuditHandoff:
+    """Prepare one sibling in-session audit over residual review coverage."""
+    target = Path(target).resolve()
+    agentic_out_dir = Path(agentic_out_dir).resolve()
+    context_map = Path(str(context_receipt.get("context_map"))).resolve()
+    if (
+        not context_map.is_file()
+        or context_map.is_symlink()
+        or context_receipt.get("context_map_sha256")
+        != _sha256_file(context_map)
+    ):
+        raise RuntimeError("attached context map is missing or changed")
+
+    pointer_path = agentic_out_dir / "copilot-native" / "audit-handoff.json"
+    reused = _reusable_native_audit_handoff(
+        pointer_path=pointer_path,
+        target=target,
+        agentic_out_dir=agentic_out_dir,
+        context_map_sha256=str(context_receipt["context_map_sha256"]),
+        audit_policy=audit_policy,
+    )
+    if reused is not None:
+        return reused
+    _supersede_stale_native_audit_handoff(
+        pointer_path,
+        agentic_out_dir=agentic_out_dir,
+    )
+
+    started = start_lifecycle(
+        "audit",
+        target,
+        parent_run_dir=agentic_out_dir,
+    )
+    audit_dir = started.run_dir
+    if audit_dir is None:
+        reason = "lifecycle start failed"
+        if started.error:
+            reason = f"{reason}: {started.error}"
+        raise RuntimeError(reason)
+
+    try:
+        from core.inventory import checklist_exists, read_checklist, save_checklist
+        if checklist_exists(agentic_out_dir):
+            checklist = read_checklist(agentic_out_dir)
+            if checklist:
+                save_checklist(audit_dir, checklist)
+        (audit_dir / "context-map.json").write_bytes(
+            context_map.read_bytes(),
+        )
+        validate_after = bool(audit_policy.get("validate_after"))
+        save_json(audit_dir / "pipeline-tail.json", {
+            "parent_run": str(agentic_out_dir),
+            "deferred": (
+                ["validate", "feedback"] if validate_after else []
+            ),
+            "reason": (
+                "validation unified in the parent native agentic run"
+                if validate_after
+                else "operator did not request chained validation"
+            ),
+        })
+
+        receipt_path = (
+            agentic_out_dir / "copilot-native" / "audit-receipt.json"
+        )
+        request_path = audit_dir / "copilot-native-audit-request.json"
+        request = {
+            "schema": NATIVE_AUDIT_REQUEST_SCHEMA,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "target": str(target),
+            "agentic_run_dir": str(agentic_out_dir),
+            "audit_dir": str(audit_dir),
+            "context_map": str(audit_dir / "context-map.json"),
+            "context_map_sha256": _sha256_file(
+                audit_dir / "context-map.json",
+            ),
+            "context_receipt": str(
+                agentic_out_dir
+                / "copilot-native"
+                / "context-receipt.json"
+            ),
+            "audit_receipt": str(receipt_path),
+            "resume_argv": [
+                "libexec/raptor-run-lifecycle",
+                "start",
+                "audit",
+                "--target",
+                str(target),
+                "--out",
+                str(audit_dir),
+            ],
+            "prior_journals": [
+                str(agentic_out_dir),
+                str(agentic_out_dir / "autonomous"),
+            ],
+            "policy": audit_policy,
+            "coverage_policy": "map_grade_is_not_review",
+            "validation_deferred_to_parent": validate_after,
+            "apply_target_patches": False,
+        }
+        save_json(request_path, request)
+        pointer_path.parent.mkdir(parents=True, exist_ok=True)
+        save_json(pointer_path, {
+            "schema": _NATIVE_AUDIT_POINTER_SCHEMA,
+            "target": str(target),
+            "agentic_run_dir": str(agentic_out_dir),
+            "context_map_sha256": context_receipt["context_map_sha256"],
+            "audit_policy_sha256": _json_sha256(audit_policy),
+            "audit_dir": str(audit_dir),
+            "request_path": str(request_path),
+            "request_sha256": _sha256_file(request_path),
+            "receipt_path": str(receipt_path),
+        })
+
+        from core.run.metadata import interrupt_run
+        interrupt_run(
+            audit_dir,
+            reason="awaiting host-managed Copilot gap audit",
+            extra={
+                "copilot_native_audit_request": str(request_path),
+                "parent_agentic_run": str(agentic_out_dir),
+                "context_map": str(audit_dir / "context-map.json"),
+                "validation_deferred_to_parent": validate_after,
+                "apply_target_patches": False,
+            },
+            expected_command="audit",
+        )
+    except Exception as exc:
+        fail_lifecycle(
+            audit_dir,
+            f"native audit handoff preparation failed: {exc}",
+        )
+        raise
+
+    return NativeAuditHandoff(
+        prepared=True,
+        audit_dir=audit_dir,
+        request_path=request_path,
+        request_sha256=_sha256_file(request_path),
+        receipt_path=receipt_path,
+    )
+
+
+def _supersede_stale_native_audit_handoff(
+    pointer_path: Path,
+    *,
+    agentic_out_dir: Path,
+) -> None:
+    if pointer_path.is_symlink():
+        return
+    pointer = load_json(pointer_path)
+    if not isinstance(pointer, dict):
+        return
+    try:
+        audit_dir = Path(str(pointer.get("audit_dir"))).resolve()
+    except (OSError, ValueError):
+        return
+    if audit_dir.parent != agentic_out_dir.parent:
+        return
+    try:
+        from core.run.metadata import (
+            load_run_metadata,
+            worker_liveness_for_meta,
+        )
+        metadata = load_run_metadata(audit_dir)
+    except (OSError, ValueError):
+        return
+    if not isinstance(metadata, dict):
+        return
+    status = metadata.get("status")
+    if status == "running":
+        live, detail = worker_liveness_for_meta(metadata)
+        if live:
+            raise RuntimeError(
+                "existing native audit run is still in flight: "
+                f"{detail}",
+            )
+    if status in {"running", "interrupted"}:
+        fail_lifecycle(
+            audit_dir,
+            "superseded by corrected Copilot-native audit policy/context",
+        )
+
+
+def _reusable_native_audit_handoff(
+    *,
+    pointer_path: Path,
+    target: Path,
+    agentic_out_dir: Path,
+    context_map_sha256: str,
+    audit_policy: dict[str, Any],
+) -> NativeAuditHandoff | None:
+    if pointer_path.is_symlink():
+        return None
+    pointer = load_json(pointer_path)
+    if (
+        not isinstance(pointer, dict)
+        or pointer.get("schema") != _NATIVE_AUDIT_POINTER_SCHEMA
+        or pointer.get("target") != str(target)
+        or pointer.get("agentic_run_dir") != str(agentic_out_dir)
+        or pointer.get("context_map_sha256") != context_map_sha256
+        or pointer.get("audit_policy_sha256")
+        != _json_sha256(audit_policy)
+    ):
+        return None
+    try:
+        audit_dir = Path(str(pointer["audit_dir"])).resolve()
+        request_path = Path(str(pointer["request_path"])).resolve()
+        receipt_path = Path(str(pointer["receipt_path"])).resolve()
+    except (KeyError, OSError, ValueError):
+        return None
+    if audit_dir.parent != agentic_out_dir.parent:
+        return None
+    if request_path != audit_dir / "copilot-native-audit-request.json":
+        return None
+    if (
+        not request_path.is_file()
+        or request_path.is_symlink()
+        or pointer.get("request_sha256") != _sha256_file(request_path)
+    ):
+        return None
+    try:
+        from core.run.metadata import load_run_metadata
+        metadata = load_run_metadata(audit_dir)
+    except (OSError, ValueError):
+        return None
+    status = metadata.get("status") if isinstance(metadata, dict) else None
+    if status not in {"running", "interrupted", "completed"}:
+        return None
+    if status == "completed" and not (audit_dir / "audit-report.json").is_file():
+        return None
+    return NativeAuditHandoff(
+        prepared=status != "completed",
+        completed=status == "completed",
+        audit_dir=audit_dir,
+        request_path=request_path,
+        request_sha256=str(pointer["request_sha256"]),
+        receipt_path=receipt_path,
     )
 
 
@@ -288,8 +761,13 @@ def _run_validate_postpass_unsafe(
     audit_selected: list = []
 
     def _preflight() -> str | None:
-        audit_selected.extend(
-            _load_audit_findings(audit_dir)[:_MAX_VALIDATE_FINDINGS])
+        # Signal-sorted, never a head slice: a >cap audit run must
+        # keep its highest-signal findings (and the truncator's
+        # tree-class tie-break keeps test/vendored-tree findings from
+        # evicting production ones).
+        audit_selected.extend(truncate_findings_by_signal(
+            _load_audit_findings(audit_dir), _MAX_VALIDATE_FINDINGS,
+            log_label="gap-audit selection"))
         found: list = []
         if analysis_report.exists():
             found = _select_findings_for_validate(analysis_report)
@@ -310,63 +788,14 @@ def _run_validate_postpass_unsafe(
         return None
 
     def _stage(validate_dir: Path) -> None:
-        # Persist the selected records to a file rather than splicing
-        # LLM-generated finding_id values into the prompt — defends against
-        # any injection attempt riding in on a finding identifier.
-        # Convert from /agentic shape to /validate shape so the validate
-        # skill can consume the file directly without prompt-driven
-        # field translation (was the stopgap; this is the real fix).
-        selection_file = validate_dir / "selected-findings.json"
-        payload = convert_agentic_to_validate(selected, str(target))
-        if audit_selected:
-            # Audit findings lead the container: they carry tool
-            # evidence (G2) where agentic findings carry LLM verdicts.
-            payload["findings"] = (
-                convert_audit_to_validate(audit_selected)
-                + payload["findings"]
-            )
-        save_json(selection_file, payload)
-
-        # Drop a pointer to the parent /agentic checklist so /validate's
-        # Stage 0 can reuse it instead of rebuilding the inventory from
-        # scratch. The reachability prepass already built one; pointing
-        # at it saves a full source-tree walk + AST parse (~30-60s on
-        # typical large repos). /validate's Stage 0 reads
-        # ``parent-checklist-pointer.json`` and falls through to a fresh
-        # build when the pointer is missing / stale / mistargeted /
-        # outside the expected root.
-        #
-        # ``expected_root_dir`` is the agentic_out_dir; /validate
-        # rejects pointers whose ``checklist_path`` resolves outside
-        # this root (defense against a buggy or malicious pointer
-        # pointing at arbitrary file paths). Same defensive principle
-        # as the /understand bridge's path validation. The mtime-based
-        # TTL on the validate side rejects checklists older than 1h
-        # (stale source drift).
-        agentic_checklist = agentic_out_dir / "checklist.json"
-        if agentic_checklist.is_file():
-            save_json(
-                validate_dir / "parent-checklist-pointer.json",
-                {
-                    "checklist_path": str(agentic_checklist.resolve()),
-                    "expected_target_path": str(target),
-                    "expected_root_dir": str(agentic_out_dir.resolve()),
-                },
-            )
-
-        # Operator-flag handoff to the validation orchestrator.
-        # Mirrors the parent-checklist-pointer.json pattern: the
-        # launcher writes overrides to a known filename in
-        # validate_dir; the orchestrator's Stage 0 reads it and
-        # merges into self.config. Substrate-enforced — bypasses
-        # the claude-code sub-agent's prompt-interpretation path
-        # entirely, so the flag works regardless of whether the
-        # SKILL.md teaches the agent about it.
-        if allow_unreachable:
-            save_json(
-                validate_dir / "pipeline-config-overrides.json",
-                {"allow_unreachable": True},
-            )
+        _write_validate_inputs(
+            target=target,
+            agentic_out_dir=agentic_out_dir,
+            validate_dir=validate_dir,
+            selected=selected,
+            audit_selected=audit_selected,
+            allow_unreachable=allow_unreachable,
+        )
 
     def _prompt(validate_dir: Path) -> str:
         return _build_validate_prompt(
@@ -393,8 +822,18 @@ def _run_validate_postpass_unsafe(
         block_cc_dispatch=block_cc_dispatch,
         claude_bin=claude_bin,
         context_dirs=(agentic_out_dir,),
+        # Child phase of the agentic run: thread its project pin so
+        # the validate run lands in the same project.
+        parent_run_dir=agentic_out_dir,
         preflight=_preflight,
         stage=_stage,
+        # Same outcome contract as the understand pre-pass's
+        # _check_outputs: the pass counts as ran only when the
+        # pipeline's terminal artifact exists — a CC child whose
+        # in-run pipeline crashed can still exit 0, which used to
+        # record the pass as completed with every selected finding
+        # silently pending.
+        validate_outputs=missing_validation_report,
     )
     if not dispatch.ran:
         return PostpassResult(ran=False,
@@ -403,12 +842,419 @@ def _run_validate_postpass_unsafe(
                               skipped_reason=dispatch.skipped_reason,
                               duration_s=dispatch.duration_s)
 
+    assert dispatch.run_dir is not None
     report_path = dispatch.run_dir / "validation-report.md"
     return PostpassResult(ran=True,
                           selected_count=len(selected) + len(audit_selected),
                           validate_dir=dispatch.run_dir,
                           report_path=report_path if report_path.exists() else None,
                           duration_s=dispatch.duration_s)
+
+
+def prepare_native_validate_postpass(
+    *,
+    target: Path,
+    agentic_out_dir: Path,
+    analysis_report: Path,
+    allow_unreachable: bool = False,
+    audit_dir: Path | None = None,
+) -> NativeValidateHandoff:
+    """Prepare a sibling validate run for the active Copilot session.
+
+    This is the mechanical half of ``run_validate_postpass``. It performs
+    the same selection and field conversion, creates the same sibling
+    lifecycle, writes the parent-checklist/config handoffs, and then leaves
+    the validate run Interrupted for the host session to execute the existing
+    Stage 0 → A–F → 1 pipeline. It never invokes another model transport.
+    """
+    target = Path(target).resolve()
+    agentic_out_dir = Path(agentic_out_dir).resolve()
+    analysis_report = Path(analysis_report).resolve()
+    if not analysis_report.is_file():
+        raise RuntimeError(
+            "native validate post-pass analysis report is missing",
+        )
+    audit_selected = truncate_findings_by_signal(
+        _load_audit_findings(audit_dir),
+        _MAX_VALIDATE_FINDINGS,
+        log_label="native gap-audit validation selection",
+    )
+    agentic_candidates = _select_findings_for_validate(analysis_report)
+    remaining = _MAX_VALIDATE_FINDINGS - len(audit_selected)
+    selected = (
+        truncate_findings_by_signal(
+            agentic_candidates,
+            remaining,
+            log_label="native validate post-pass",
+        )
+        if remaining > 0
+        else []
+    )
+    selected_count = len(selected) + len(audit_selected)
+    if not selected and not audit_selected:
+        return NativeValidateHandoff(
+            skipped_reason=(
+                "no findings matched is_exploitable=true or confidence=high"
+            ),
+        )
+    selection_payload = _build_validate_payload(
+        target=target,
+        selected=selected,
+        audit_selected=audit_selected,
+    )
+    selection_content_sha256 = _validate_selection_sha256(
+        selection_payload,
+    )
+
+    pointer_path = (
+        agentic_out_dir / "copilot-native" / "validation-handoff.json"
+    )
+    reused = _reusable_native_validate_handoff(
+        pointer_path=pointer_path,
+        selection_content_sha256=selection_content_sha256,
+        selected_count=selected_count,
+        target=target,
+        agentic_out_dir=agentic_out_dir,
+    )
+    if reused is not None:
+        return reused
+    _supersede_stale_native_validate_handoff(
+        pointer_path,
+        agentic_out_dir=agentic_out_dir,
+    )
+
+    started = start_lifecycle(
+        "validate",
+        target,
+        parent_run_dir=agentic_out_dir,
+    )
+    validate_dir = started.run_dir
+    if validate_dir is None:
+        reason = "lifecycle start failed"
+        if started.error:
+            reason = f"{reason}: {started.error}"
+        raise RuntimeError(reason)
+
+    try:
+        selection_file = _write_validate_inputs(
+            target=target,
+            agentic_out_dir=agentic_out_dir,
+            validate_dir=validate_dir,
+            selected=selected,
+            audit_selected=audit_selected,
+            allow_unreachable=allow_unreachable,
+            payload=selection_payload,
+        )
+        analysis_archive = validate_dir / "agentic-validation-source.json"
+        analysis_archive.write_bytes(analysis_report.read_bytes())
+        analysis_sha256 = _sha256_file(analysis_archive)
+        request_path = validate_dir / "copilot-native-validation-request.json"
+        request = {
+            "schema": NATIVE_VALIDATE_REQUEST_SCHEMA,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "target": str(target),
+            "agentic_run_dir": str(agentic_out_dir),
+            "analysis_report": str(analysis_archive),
+            "source_analysis_report": str(analysis_report),
+            "analysis_report_sha256": analysis_sha256,
+            "validate_dir": str(validate_dir),
+            "selection_file": str(selection_file),
+            "selection_sha256": _sha256_file(selection_file),
+            "selected_count": selected_count,
+            "audit_selected_count": len(audit_selected),
+            "audit_run_dir": (
+                str(Path(audit_dir).resolve())
+                if audit_dir is not None
+                else None
+            ),
+            "allow_unreachable": bool(allow_unreachable),
+            "apply_target_patches": False,
+            "pipeline_stages": ["0", "A", "B", "C", "D", "E", "F", "1"],
+            "stage0_argv": [
+                "libexec/raptor-validation-helper",
+                "0",
+                "--target",
+                str(target),
+                "--out",
+                str(validate_dir),
+                "--findings",
+                str(selection_file),
+            ],
+        }
+        save_json(request_path, request)
+        pointer_path.parent.mkdir(parents=True, exist_ok=True)
+        save_json(
+            pointer_path,
+            {
+                "schema": _NATIVE_VALIDATE_POINTER_SCHEMA,
+                "selection_content_sha256": selection_content_sha256,
+                "selected_count": selected_count,
+                "target": str(target),
+                "agentic_run_dir": str(agentic_out_dir),
+                "validate_dir": str(validate_dir),
+                "selection_file": str(selection_file),
+                "selection_sha256": _sha256_file(selection_file),
+                "request_path": str(request_path),
+                "request_sha256": _sha256_file(request_path),
+            },
+        )
+
+        from core.run.metadata import interrupt_run
+        interrupt_run(
+            validate_dir,
+            reason="awaiting host-managed Copilot validation",
+            extra={
+                "copilot_native_validation_request": str(request_path),
+                "parent_agentic_run": str(agentic_out_dir),
+                "selected_findings": selected_count,
+                "apply_target_patches": False,
+            },
+            expected_command="validate",
+        )
+    except Exception as exc:
+        fail_lifecycle(
+            validate_dir,
+            f"native validation handoff preparation failed: {exc}",
+        )
+        raise
+
+    return NativeValidateHandoff(
+        prepared=True,
+        selected_count=selected_count,
+        validate_dir=validate_dir,
+        selection_file=selection_file,
+        selection_sha256=_sha256_file(selection_file),
+        request_path=request_path,
+        request_sha256=_sha256_file(request_path),
+    )
+
+
+def _reusable_native_validate_handoff(
+    *,
+    pointer_path: Path,
+    selection_content_sha256: str,
+    selected_count: int,
+    target: Path,
+    agentic_out_dir: Path,
+) -> NativeValidateHandoff | None:
+    if pointer_path.is_symlink():
+        return None
+    pointer = load_json(pointer_path)
+    if (
+        not isinstance(pointer, dict)
+        or pointer.get("schema") != _NATIVE_VALIDATE_POINTER_SCHEMA
+        or pointer.get("selection_content_sha256")
+        != selection_content_sha256
+        or pointer.get("selected_count") != selected_count
+        or pointer.get("target") != str(target)
+        or pointer.get("agentic_run_dir") != str(agentic_out_dir)
+    ):
+        return None
+    try:
+        validate_dir = Path(str(pointer["validate_dir"])).resolve()
+        selection_file = Path(str(pointer["selection_file"])).resolve()
+        request_path = Path(str(pointer["request_path"])).resolve()
+    except (KeyError, OSError, ValueError):
+        return None
+    if validate_dir.parent != agentic_out_dir.parent:
+        return None
+    if not validate_dir.is_dir() or validate_dir.is_symlink():
+        return None
+    if selection_file != validate_dir / "selected-findings.json":
+        return None
+    if request_path != validate_dir / "copilot-native-validation-request.json":
+        return None
+    if (
+        not selection_file.is_file()
+        or selection_file.is_symlink()
+        or not request_path.is_file()
+        or request_path.is_symlink()
+    ):
+        return None
+    if pointer.get("selection_sha256") != _sha256_file(selection_file):
+        return None
+    selection_payload = load_json(selection_file)
+    if (
+        not isinstance(selection_payload, dict)
+        or _validate_selection_sha256(selection_payload)
+        != selection_content_sha256
+    ):
+        return None
+    if pointer.get("request_sha256") != _sha256_file(request_path):
+        return None
+    request = load_json(request_path)
+    if (
+        not isinstance(request, dict)
+        or request.get("schema") != NATIVE_VALIDATE_REQUEST_SCHEMA
+        or request.get("selected_count") != selected_count
+        or request.get("apply_target_patches") is not False
+        or request.get("target") != str(target)
+        or request.get("agentic_run_dir") != str(agentic_out_dir)
+        or request.get("validate_dir") != str(validate_dir)
+        or request.get("selection_file") != str(selection_file)
+    ):
+        return None
+    try:
+        analysis_archive = Path(str(request["analysis_report"])).resolve()
+    except (KeyError, OSError, ValueError):
+        return None
+    if analysis_archive != validate_dir / "agentic-validation-source.json":
+        return None
+    if (
+        not analysis_archive.is_file()
+        or analysis_archive.is_symlink()
+        or request.get("analysis_report_sha256")
+        != _sha256_file(analysis_archive)
+    ):
+        return None
+    try:
+        from core.run.metadata import load_run_metadata
+        metadata = load_run_metadata(validate_dir)
+    except (OSError, ValueError):
+        return None
+    status = metadata.get("status") if isinstance(metadata, dict) else None
+    if status not in {"running", "interrupted", "completed"}:
+        return None
+    if (
+        status == "completed"
+        and not (validate_dir / "validation-report.md").is_file()
+    ):
+        return None
+    return NativeValidateHandoff(
+        prepared=status != "completed",
+        completed=status == "completed",
+        skipped_reason=(
+            "validation already completed"
+            if status == "completed"
+            else None
+        ),
+        selected_count=selected_count,
+        validate_dir=validate_dir,
+        selection_file=selection_file,
+        selection_sha256=str(pointer["selection_sha256"]),
+        request_path=request_path,
+        request_sha256=str(pointer["request_sha256"]),
+    )
+
+
+def _supersede_stale_native_validate_handoff(
+    pointer_path: Path,
+    *,
+    agentic_out_dir: Path,
+) -> None:
+    if pointer_path.is_symlink():
+        return
+    pointer = load_json(pointer_path)
+    if not isinstance(pointer, dict):
+        return
+    try:
+        validate_dir = Path(str(pointer.get("validate_dir"))).resolve()
+    except (OSError, ValueError):
+        return
+    if validate_dir.parent != agentic_out_dir.parent:
+        return
+    try:
+        from core.run.metadata import load_run_metadata
+        metadata = load_run_metadata(validate_dir)
+    except (OSError, ValueError):
+        return
+    if not isinstance(metadata, dict):
+        return
+    status = metadata.get("status")
+    if status == "running":
+        from core.run.metadata import worker_liveness_for_meta
+        live, detail = worker_liveness_for_meta(metadata)
+        if live:
+            raise RuntimeError(
+                "existing native validation run is still in flight: "
+                f"{detail}",
+            )
+    if status in {"running", "interrupted"}:
+        fail_lifecycle(
+            validate_dir,
+            "superseded by corrected Copilot-native agentic results",
+        )
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _json_sha256(value: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_selection_sha256(payload: dict[str, Any]) -> str:
+    """Hash only stable validate selection semantics, not minted run fields."""
+    return _json_sha256({
+        "target_path": payload.get("target_path"),
+        "findings": payload.get("findings"),
+    })
+
+
+def _build_validate_payload(
+    *,
+    target: Path,
+    selected: list,
+    audit_selected: list,
+) -> dict[str, Any]:
+    payload = convert_agentic_to_validate(selected, str(target))
+    if audit_selected:
+        payload["findings"] = (
+            convert_audit_to_validate(audit_selected)
+            + payload["findings"]
+        )
+    return payload
+
+
+def _write_validate_inputs(
+    *,
+    target: Path,
+    agentic_out_dir: Path,
+    validate_dir: Path,
+    selected: list,
+    audit_selected: list,
+    allow_unreachable: bool,
+    payload: dict[str, Any] | None = None,
+) -> Path:
+    """Write validate selection and deterministic parent/config pointers."""
+    selection_file = validate_dir / "selected-findings.json"
+    if payload is None:
+        payload = _build_validate_payload(
+            target=target,
+            selected=selected,
+            audit_selected=audit_selected,
+        )
+    save_json(selection_file, payload)
+
+    from core.inventory import checklist_exists
+    agentic_checklist = agentic_out_dir / "checklist.json"
+    if checklist_exists(agentic_out_dir):
+        save_json(
+            validate_dir / "parent-checklist-pointer.json",
+            {
+                "checklist_path": str(agentic_checklist.resolve()),
+                "expected_target_path": str(target),
+                "expected_root_dir": str(agentic_out_dir.resolve()),
+            },
+        )
+
+    if allow_unreachable:
+        save_json(
+            validate_dir / "pipeline-config-overrides.json",
+            {"allow_unreachable": True},
+        )
+    return selection_file
 
 
 def _provision_understand_checklist(target: Path, agentic_out_dir: Path,
@@ -421,13 +1267,18 @@ def _provision_understand_checklist(target: Path, agentic_out_dir: Path,
     Falls back to running raptor-build-checklist when no agentic checklist
     is available (e.g. build_inventory failed earlier).
     """
-    agentic_checklist = agentic_out_dir / "checklist.json"
-    if agentic_checklist.exists():
+    from core.inventory import checklist_exists, read_checklist, save_checklist
+    if checklist_exists(agentic_out_dir):
         try:
-            shutil.copyfile(agentic_checklist, understand_dir / "checklist.json")
-            logger.info("reused agentic checklist for understand pre-pass (skipped reparse)")
-            return True
-        except OSError as e:
+            # Accessor round-trip instead of a byte copy: reads either
+            # on-disk form (single-file or sharded) and re-emits the
+            # right form in the understand dir.
+            data = read_checklist(agentic_out_dir)
+            if data:
+                save_checklist(understand_dir, data)
+                logger.info("reused agentic checklist for understand pre-pass (skipped reparse)")
+                return True
+        except (OSError, RuntimeError) as e:
             logger.warning("checklist copy failed (%s); falling back to fresh build", e)
     return _build_checklist_via_libexec(target, understand_dir)
 
@@ -558,13 +1409,23 @@ def _convert_one_finding(f: dict) -> dict:
             raw[key] = f[key]
     # is_exploitable: /agentic uses two key names depending on dispatch
     # mode (the schema says is_exploitable, sequential mode emits the
-    # legacy "exploitable"). Normalise to is_exploitable.
-    if f.get("is_exploitable") is not None:
-        raw["is_exploitable"] = f["is_exploitable"]
-    elif f.get("exploitable") is not None:
-        raw["is_exploitable"] = f["exploitable"]
-    if f.get("is_true_positive") is not None:
-        raw["is_true_positive"] = f["is_true_positive"]
+    # legacy "exploitable"). Normalise to is_exploitable; the
+    # tri-state read keeps a junk shape (a non-verdict) from being
+    # exported as a verdict.
+    _exploitable = read_verdict(f, "is_exploitable")
+    if _exploitable is None:
+        # Legacy alias, same genuine-bool rule: forwarding the raw
+        # field laundered a junk shape into the CANONICAL key on
+        # the export surface. (The alias is not a VERDICT_KEYS
+        # member, so the bool check is spelled locally.)
+        _legacy = f.get("exploitable")
+        if isinstance(_legacy, bool):
+            _exploitable = _legacy
+    if _exploitable is not None:
+        raw["is_exploitable"] = _exploitable
+    _tp = read_verdict(f, "is_true_positive")
+    if _tp is not None:
+        raw["is_true_positive"] = _tp
 
     out = Finding.from_dict(raw).to_dict()
     # ruling: /agentic emits a string verdict (e.g. "validated",
@@ -660,15 +1521,15 @@ def _enrich_agentic_checklist(agentic_out_dir: Path, context_map_path: Path) -> 
     mismatch (LLM produced absolute paths instead of relative-from-target,
     or some other drift) and would otherwise be a silent no-op.
     """
-    checklist_path = agentic_out_dir / "checklist.json"
-    if not checklist_path.exists():
-        logger.info("agentic checklist not found at %s; skipping enrichment", checklist_path)
+    from core.inventory import checklist_exists, read_checklist
+    if not checklist_exists(agentic_out_dir):
+        logger.info("agentic checklist not found in %s; skipping enrichment", agentic_out_dir)
         return False
     try:
         from core.orchestration.understand_bridge import enrich_checklist
-        checklist = load_json(checklist_path)
+        checklist = read_checklist(agentic_out_dir)
         context_map = load_json(context_map_path)
-        if not isinstance(checklist, dict) or not isinstance(context_map, dict):
+        if not checklist or not isinstance(context_map, dict):
             logger.warning("checklist or context_map not a JSON object; skipping enrichment")
             return False
 
@@ -746,8 +1607,8 @@ def _mark_unreachable_low_priority(
     Returns the count of functions marked low-priority. Best-
     effort; failures logged at debug.
     """
-    checklist_path = agentic_out_dir / "checklist.json"
-    if not checklist_path.exists():
+    from core.inventory import checklist_exists
+    if not checklist_exists(agentic_out_dir):
         return 0
     counted = {"marked": 0}
     try:
@@ -816,8 +1677,8 @@ def run_reachability_prepass(
     non-None ``skipped_reason``.
     """
     t0 = time.monotonic()
-    checklist_path = agentic_out_dir / "checklist.json"
-    if not checklist_path.exists():
+    from core.inventory import checklist_exists
+    if not checklist_exists(agentic_out_dir):
         return ReachabilityPrepassResult(
             ran=False,
             skipped_reason="agentic checklist not yet built",
@@ -842,8 +1703,10 @@ def run_reachability_prepass(
             )
 
     try:
-        from core.inventory import update_checklist
+        from core.inventory import read_checklist, update_checklist
         from core.orchestration.reachability_enrichment import (
+            collect_frida_call_edges,
+            compute_caller_context,
             enrich_with_caller_context,
             enrich_with_frida_call_edges,
             enrich_with_frida_traces,
@@ -853,10 +1716,39 @@ def run_reachability_prepass(
             from core.analysis.reach_audit import set_joern_server
             set_joern_server(joern_server)
 
-        # All three enrichment passes run inside the accessor's
-        # transform so the read-modify-write happens under the flock
-        # (concurrent writers can't drop each other's markers) and
-        # against the symlink-resolved project checklist.
+        # Heavy discovery runs BEFORE the flock: the events.jsonl
+        # parses + sandboxed addr2line behind the frida evidence maps
+        # and the per-function reverse-closure walk all scale with
+        # target size x run-dir count, and the checklist flock is the
+        # contention point for every writer in the run family — a
+        # concurrent save_checklist must never block behind them. The
+        # caller-context walk uses a snapshot read; functions that
+        # change between snapshot and lock are simply not enriched
+        # (same effect as any pre-existing writer race). The transform
+        # below then does only cheap field application under the
+        # flock, keeping the read-modify-write atomic (concurrent
+        # writers still can't drop each other's markers).
+        search_dirs = [agentic_out_dir, agentic_out_dir.parent]
+        evidence_map: dict = {}
+        try:
+            from core.orchestration.frida_validation_bridge import (
+                collect_runtime_evidence,
+            )
+            evidence_map = collect_runtime_evidence(
+                [Path(d) for d in search_dirs], target_path=str(target),
+            ) or {}
+        except Exception:  # noqa: BLE001 — enrichment is additive
+            logger.debug("frida evidence collection failed", exc_info=True)
+        edge_map: dict = {}
+        try:
+            edge_map = collect_frida_call_edges(
+                search_dirs, str(target)) or {}
+        except Exception:  # noqa: BLE001 — enrichment is additive
+            logger.debug("frida call-edge collection failed", exc_info=True)
+        caller_context = compute_caller_context(
+            read_checklist(agentic_out_dir), target, inventory=inventory,
+        )
+
         state = {"marked": 0, "malformed": False}
 
         def _transform(current: dict[str, Any]) -> dict[str, Any]:
@@ -869,16 +1761,17 @@ def run_reachability_prepass(
             )
             enriched_frida = enrich_with_frida_traces(
                 current, target,
-                search_dirs=[agentic_out_dir, agentic_out_dir.parent],
                 inventory=inventory,
+                evidence_map=evidence_map,
             )
             enriched_frida += enrich_with_frida_call_edges(
                 current, target,
-                search_dirs=[agentic_out_dir, agentic_out_dir.parent],
                 inventory=inventory,
+                edge_map=edge_map,
             )
             enriched_caller_ctx = enrich_with_caller_context(
                 current, target, inventory=inventory,
+                precomputed=caller_context,
             )
             if not (state["marked"] or enriched_caller_ctx or enriched_frida):
                 raise _ChecklistWriteSkipped

@@ -22,6 +22,9 @@ Exit codes:
     0  — clean: no advisories, no supply-chain hits.
     1  — review: advisories with available fixes, or distance-2 typosquat.
     2  — block: KEV-listed CVE, critical without fix, or distance-1 typosquat.
+         Also returned when OSV lookups degraded transiently — the
+         verdict is unavailable, never Clean (mirror of the whatif
+         degraded refusal).
     3  — invalid arguments / internal error.
 """
 
@@ -35,10 +38,11 @@ from pathlib import Path
 
 from core.cve import EpssClient, KevClient
 from core.json import JsonCache
-from core.security.log_sanitisation import escape_nonprintable
 from core.security.prompt_output_sanitise import sanitise_string
 
-from . import SCA_CACHE_ROOT, default_client
+from ._md import inline_code, neutralize_inline
+
+from . import sca_cache_root, default_client
 from .findings import build_vuln_findings, severity_rank
 from .models import (
     Confidence,
@@ -111,7 +115,7 @@ def _checked_main(
         return 3
 
     if cache is None:
-        cache = JsonCache(root=Path(args.cache_root) if args.cache_root else SCA_CACHE_ROOT)
+        cache = JsonCache(root=Path(args.cache_root) if args.cache_root else sca_cache_root())
     if http is None:
         http = default_client(offline=args.offline)
 
@@ -210,7 +214,29 @@ def _checked_main(
         transitive_walk_supported=transitive_walk_supported,
         seed_metadata_unverifiable=seed_metadata_unverifiable,
         slop_findings=slop_findings,
+        osv_degraded=osv.degraded,
     )
+
+    exit_code = {_VERDICT_CLEAN: 0, _VERDICT_REVIEW: 1, _VERDICT_BLOCK: 2}[verdict]
+    if osv.degraded:
+        # A transient OSV failure must never read as "no known
+        # advisories" with exit 0 — a network outage would wave a
+        # vulnerable package through any pre-install gate built on
+        # this command. Refuse to conclude instead (the whatif
+        # degraded-refusal shape).
+        sample = ", ".join(
+            neutralize_inline(k, limit=60)
+            for k in osv.failed_dep_keys[:5]
+        )
+        report += (
+            "\n## OSV lookups degraded — verdict unavailable\n\n"
+            f"{osv.failed_lookups} advisory lookup(s) failed "
+            "transiently"
+            + (f" (e.g. {sample})" if sample else "")
+            + "; the verdict above may be missing real advisories. "
+            "Re-run when the network/OSV recovers.\n"
+        )
+        exit_code = 2
 
     if args.out:
         out = Path(args.out).resolve()
@@ -219,7 +245,7 @@ def _checked_main(
     sys.stdout.write(report)
     sys.stdout.flush()
 
-    return {_VERDICT_CLEAN: 0, _VERDICT_REVIEW: 1, _VERDICT_BLOCK: 2}[verdict]
+    return exit_code
 
 
 # ---------------------------------------------------------------------------
@@ -419,12 +445,19 @@ def _render_review_markdown(
     transitive_walk_supported: bool = False,
     seed_metadata_unverifiable: bool = False,
     slop_findings: list[SlopsquatFinding] | None = None,
+    osv_degraded: bool = False,
 ) -> str:
     label = {_VERDICT_CLEAN: "Clean",
              _VERDICT_REVIEW: "Review",
              _VERDICT_BLOCK: "Block"}[verdict]
+    if osv_degraded and verdict != _VERDICT_BLOCK:
+        # The advisory picture is incomplete — a Clean/Review label
+        # would contradict the degraded refusal (exit 2) below it.
+        # Block survives: degradation never downgrades a verdict that
+        # tripped on the signals that DID arrive.
+        label = "Degraded"
     buf = StringIO()
-    buf.write(f"# raptor-sca check — {dep.purl}\n\n")
+    buf.write(f"# raptor-sca check — {neutralize_inline(dep.purl)}\n\n")
     buf.write(f"**Verdict:** {label}\n\n")
 
     if vuln_findings:
@@ -455,18 +488,27 @@ def _render_review_markdown(
             # terminal — same escaping treatment as report.py.
             buf.write(
                 f"- [{' / '.join(tags)}] "
-                f"**{escape_nonprintable(primary.osv_id)}**"
+                f"**{neutralize_inline(primary.osv_id)}**"
             )
             if primary.aliases:
                 aliases = ", ".join(
-                    escape_nonprintable(a) for a in primary.aliases[:2]
+                    neutralize_inline(a) for a in primary.aliases[:2]
                 )
                 buf.write(f" ({aliases})")
             buf.write("\n")
             if primary.summary:
                 buf.write(f"  - {sanitise_string(primary.summary)}\n")
             if f.fixed_version:
-                buf.write(f"  - Fix available: **{f.fixed_version}**\n")
+                # ``fixed_version`` comes from OSV ``ranges.events.
+                # fixed`` — untrusted registry content. Rendered as a
+                # code span (with backticks neutralised) so printable
+                # markdown metacharacters (``![x](url)`` image
+                # beacons, ``[x](url)`` links) stay inert —
+                # plain non-printable escaping passes them through.
+                buf.write(
+                    "  - Fix available: "
+                    f"**{inline_code(f.fixed_version)}**\n"
+                )
             else:
                 buf.write("  - No fix published.\n")
         buf.write("\n")
@@ -478,12 +520,12 @@ def _render_review_markdown(
         for t in typo_findings or []:
             buf.write(
                 f"- Typosquat candidate: distance-{t.distance} from "
-                f"popular **{t.nearest_popular}** "
+                f"popular **{neutralize_inline(t.nearest_popular)}** "
                 f"({t.severity})\n"
             )
         for s in slop_findings or []:
-            root = s.suspected_root or "(unknown)"
-            reasons = ", ".join(s.reasons)
+            root = neutralize_inline(s.suspected_root or "(unknown)")
+            reasons = neutralize_inline(", ".join(s.reasons))
             buf.write(
                 f"- Slopsquat candidate: heuristic score "
                 f"{s.score:.2f} ({s.severity}); suspected "
@@ -500,7 +542,8 @@ def _render_review_markdown(
         buf.write("## Existence\n\n")
         buf.write(
             f"⚠ Registry could not confirm that "
-            f"**{dep.ecosystem}:{dep.name}@{dep.version}** "
+            f"**{dep.ecosystem}:{neutralize_inline(dep.name)}"
+            f"@{neutralize_inline(dep.version)}** "
             f"exists (404 / network failure). This may be a "
             f"typo, a deleted package, or a private package "
             f"the registry won't disclose. Verify the name "
@@ -526,7 +569,8 @@ def _render_review_markdown(
             if seed_metadata_unverifiable:
                 buf.write(
                     f"⚠ Registry could not confirm that "
-                    f"**{dep.ecosystem}:{dep.name}@{dep.version}** "
+                    f"**{dep.ecosystem}:{neutralize_inline(dep.name)}"
+                    f"@{neutralize_inline(dep.version)}** "
                     f"exists (404 / network failure). This may be a "
                     f"typo, a deleted package, or a private package "
                     f"the registry won't disclose. Verify the name "
@@ -561,7 +605,7 @@ def _render_review_markdown(
                     ),
                 )
                 for f in ordered:
-                    primary = f.advisories[0] if f.advisories else None
+                    primary = f.advisories[0] if f.advisories else None  # type: ignore[assignment]
                     if primary is None:
                         continue
                     tags = [f.severity.title()]
@@ -571,12 +615,16 @@ def _render_review_markdown(
                         tags.append(f"CVSS {f.cvss_score:.1f}")
                     buf.write(
                         f"- [{' / '.join(tags)}] "
-                        f"**{escape_nonprintable(f.dependency.name)}"
-                        f"@{escape_nonprintable(f.dependency.version or '*')}"
-                        f"** — {escape_nonprintable(primary.osv_id)}"
+                        f"**{neutralize_inline(f.dependency.name)}"
+                        f"@{neutralize_inline(f.dependency.version or '*')}"
+                        f"** — {neutralize_inline(primary.osv_id)}"
                     )
                     if f.fixed_version:
-                        buf.write(f" (fix: {f.fixed_version})")
+                        # OSV-sourced — code span keeps link/image
+                        # markdown syntax inert (see the direct-dep
+                        # fix line above).
+                        buf.write(
+                            f" (fix: {inline_code(f.fixed_version)})")
                     buf.write("\n")
                 buf.write("\n")
             else:
@@ -587,7 +635,12 @@ def _render_review_markdown(
             # the full surface, not just the flagged subset.
             buf.write("<details>\n<summary>Full transitive list</summary>\n\n")
             for d in sorted(transitive_deps, key=lambda d: d.name):
-                buf.write(f"- `{d.name}@{d.version or '*'}`\n")
+                # Transitive names / versions come from live registry
+                # metadata: defang non-printables and neutralise
+                # backticks so a crafted name can't escape the code
+                # span (or close this <details> block early).
+                span = inline_code(f"{d.name}@{d.version or '*'}")
+                buf.write(f"- {span}\n")
             buf.write("</details>\n\n")
 
     if verdict == _VERDICT_BLOCK:
@@ -597,6 +650,13 @@ def _render_review_markdown(
             "(KEV-listed CVE, unfixable critical, high-EPSS critical, "
             "multiple criticals, near-typosquat, high-severity "
             "slopsquat, or compound supply-chain red flags).\n"
+        )
+    elif osv_degraded:
+        buf.write(
+            "## Recommendation\n\n"
+            "Verdict unavailable — advisory lookups degraded "
+            "transiently, so this version is unvetted. Re-run when "
+            "the network/OSV recovers before installing.\n"
         )
     elif verdict == _VERDICT_REVIEW:
         buf.write(

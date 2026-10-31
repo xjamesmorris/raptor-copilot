@@ -324,6 +324,31 @@ class TestSanitizerDeathShapeEnv:
             assert "handle_segv=0" in env[var], env[var]
 
 
+class TestSafeEnvFallbackCredentialStrip:
+    """The degraded fallback (core.config unimportable) hands the
+    harness a full-environ copy — the credential-env family must
+    still be dropped there via the stdlib-only vocabulary."""
+
+    def test_fallback_drops_credential_family(self, monkeypatch):
+        import sys as _sys
+
+        from core.security.credential_env import CREDENTIAL_ENV_FAMILY
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-LIVE")
+        monkeypatch.setenv("AWS_CONFIG_FILE", "/home/op/.aws/config")
+        monkeypatch.setenv("GIT_ASKPASS", "/usr/local/bin/askpass")
+        # Force the ImportError branch: a None sys.modules entry makes
+        # `from core.config import RaptorConfig` raise ImportError.
+        monkeypatch.setitem(_sys.modules, "core.config", None)
+        from core.audit.dynamic_sweep import _get_safe_env
+        env = _get_safe_env()
+        for name in CREDENTIAL_ENV_FAMILY:
+            assert name not in env, name
+        # The legacy fallback pops still apply.
+        monkeypatch.setenv("EDITOR", "vim")
+        env = _get_safe_env()
+        assert "EDITOR" not in env
+
+
 class TestSignalGradeHelper:
     def test_waitstatus_crash_true(self):
         r = _fake_result(-11, sandbox_info={
@@ -375,6 +400,7 @@ def _sandbox_delivers_signals() -> bool:
     import tempfile as _tf
 
     from core.sandbox import context as _ctx
+    from core.sandbox.errors import SandboxSetupError
     try:
         with _tf.TemporaryDirectory(prefix="sigprobe-") as out:
             # A KERNEL-generated fault via the system interpreter:
@@ -389,7 +415,13 @@ def _sandbox_delivers_signals() -> bool:
                 target="/tmp", output=out,
                 capture_output=True, timeout=60,
             )
-    except Exception:
+    except (SandboxSetupError, Exception):
+        # SandboxSetupError is a BaseException on purpose (runtime
+        # refusals must not be swallowed by broad handlers) — but this
+        # probe runs at COLLECTION time, and on a host that cannot
+        # create user namespaces the floor refusal must read as
+        # "signals not deliverable" (skip the class) rather than
+        # erroring the whole suite's collection.
         return False
     return isinstance(r, _sp.CompletedProcess) and r.returncode < 0
 

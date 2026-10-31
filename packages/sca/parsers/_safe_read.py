@@ -21,11 +21,11 @@ Mirrors ``core.inventory.builder.MAX_FILE_BYTES`` (8 MiB for
 source code) — same defensive shape, looser cap because SCA
 manifests legitimately run larger than source files.
 
-Other parsers in this package read target files via
-``path.read_text(encoding="utf-8")`` without a bound. They should
-migrate to this helper; until they do, the OS-level fail (sandbox
-memory limit) is the backstop. New parsers added to the package
-should use this from the start.
+Every parser and the shared rewriter driver read target-tree
+content through this helper — the migration away from bare
+``path.read_text`` is complete, and new target-tree read sites in
+the package must use it from the start (an unbounded read is a
+regression, not a pending migration).
 """
 
 from __future__ import annotations
@@ -37,6 +37,8 @@ import os
 import stat as _stat
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from core.security.capped_read import CappedReadRefused, read_capped
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -54,6 +56,23 @@ logger = logging.getLogger(__name__)
 _SCAN_ROOT: contextvars.ContextVar[Path | None] = contextvars.ContextVar(
     "sca_parser_scan_root", default=None,
 )
+
+
+@contextlib.contextmanager
+def sidecar_lock(path: Path) -> Iterator[None]:
+    """Exclusive advisory flock on ``<path>.lock`` — serialises a
+    read-modify-write cycle on ``path`` across processes (an atomic
+    replace protects against torn FILES, not lost UPDATES). The lock
+    rides a SIDECAR because ``os.replace`` swaps the data file's
+    inode out from under any lock taken on it, and the lock file is
+    deliberately never unlinked (unlink-after-unlock races split
+    lockers across two inodes — same doctrine as the core sidecar
+    locks). Hosts without ``fcntl`` fall back to unlocked."""
+    from core.atomic_fs.fs_lock import sidecar_flock
+
+    lock_path = path.with_name(path.name + ".lock")
+    with sidecar_flock(lock_path, subject="SCA parser"):
+        yield
 
 
 @contextlib.contextmanager
@@ -83,111 +102,180 @@ _MAX_PARSER_BYTES = 50 * 1024 * 1024
 
 def read_bounded(
     path: Path, *, max_bytes: int = _MAX_PARSER_BYTES,
-    follow_symlinks: bool = True,
+    follow_symlinks: bool = False,
 ) -> str | None:
     """Read ``path`` as UTF-8 text, capped at ``max_bytes``.
 
     Returns ``None`` and logs at warning level when:
 
-      * the file can't be stat'd (vanished, permission denied)
-      * the file exceeds ``max_bytes`` per its stat
-      * the file grew past ``max_bytes`` between stat and read
-        (racing writer; OS-level TOCTOU defence)
+      * the file can't be stat'd / opened (vanished, permission
+        denied)
+      * the file exceeds ``max_bytes``
+      * the file grew past ``max_bytes`` between the size gate and
+        the read (racing writer; OS-level TOCTOU defence)
       * any OSError fires during the read
 
-    Mirrors the ``core.inventory.builder._read_source_text``
-    pattern: stat first to reject before opening, then read with
-    ``+1`` and double-check so a file that grew between stat and
-    read still surfaces as unparseable rather than silently
-    truncating.
+    The hardened open/read dance (O_NOFOLLOW + O_NONBLOCK +
+    O_CLOEXEC at open, fstat regular-file and size gates on the
+    actually-opened inode, ``+1`` grew-past-cap re-check) is
+    delegated to ``core.security.capped_read``; this wrapper owns
+    the SCA-side POLICY — the symlink scan-root containment below
+    and the canonical refusal warnings the parse-failure collector
+    matches.
 
     Decodes with ``errors="replace"`` so adversarial byte sequences
     don't crash the parser — the caller's regex / JSON parse
     handles the resulting U+FFFD replacement chars as gracefully
     as it handles legitimate non-UTF-8 manifests.
 
-    When ``follow_symlinks=False`` is set, both the stat and the
-    open refuse to traverse a symlink at the final path component
-    (the open uses ``O_NOFOLLOW``; the stat uses ``lstat``). A
-    hostile target with ``Directory.Packages.props -> /etc/shadow``
-    is rejected here instead of leaking privileged file contents
-    into the parser's error logs. Defaults to ``True`` for
-    backward compatibility; new SCA parser sites that read attacker-
-    controlled manifest paths should pass ``follow_symlinks=False``.
+    Symlinks at the final component are REFUSED by default (the
+    chokepoint's stance): a hostile target with
+    ``Directory.Packages.props -> /etc/shadow`` is rejected here
+    instead of leaking privileged file contents into the parser's
+    error logs. With a declared scan root (see
+    :func:`scan_root_context`) a symlinked manifest whose resolved
+    target stays inside the root is still read — the legitimate
+    monorepo layout. ``follow_symlinks=True`` is for OPERATOR-NAMED
+    paths only (an explicit CLI argument), never for paths
+    discovered in the scanned tree.
     """
-    try:
-        st = (path.lstat() if not follow_symlinks else path.stat())
-    except OSError as e:
-        logger.warning("sca.parsers: cannot stat %s: %s", path, e)
-        return None
-    if not follow_symlinks and _stat.S_ISLNK(st.st_mode):
-        # Symlinked manifest. With a declared scan root, resolve and
-        # allow when the target stays inside it (monorepo shared-
-        # manifest layouts); otherwise fall through to the refusal
-        # below. The recursive call re-runs the full bound/regular-
-        # file checks on the resolved target, and its O_NOFOLLOW
-        # open closes the resolve->open TOCTOU window (a re-linked
-        # final component fails with ELOOP rather than following).
-        root = _SCAN_ROOT.get()
-        if root is not None:
-            try:
-                resolved = path.resolve(strict=True)
-            except OSError as e:
-                logger.warning(
-                    "sca.parsers: cannot resolve symlink %s: %s",
-                    path, e,
-                )
-                return None
-            if resolved.is_relative_to(root):
-                return read_bounded(
-                    resolved, max_bytes=max_bytes,
-                    follow_symlinks=False,
-                )
+    # Every refusal below uses the canonical ``refusing to read
+    # <path> (<reason>)`` shape the parse-failure collector matches —
+    # a skipped manifest must reach the run report's structured
+    # parse_failures, not just the log stream (this module's whole
+    # reason to warn instead of silently returning None).
+    if not follow_symlinks:
+        try:
+            st = path.lstat()
+        except OSError as e:
             logger.warning(
-                "sca.parsers: refusing symlinked manifest %s — "
-                "resolves outside the scan root (%s); treating as "
-                "unparseable", path, resolved,
+                "sca.parsers: refusing to read %s (cannot stat: %s)",
+                path, e,
             )
             return None
-    # Reject non-regular files up-front (symlinks, sockets, FIFOs,
-    # devices). With ``follow_symlinks=False`` ``lstat`` reports
-    # the symlink itself, so the S_ISLNK check is what blocks the
-    # symlink read (unless the scan-root containment branch above
-    # accepted it). With ``follow_symlinks=True`` ``stat`` follows
-    # transparently and this check rejects only non-regular final
-    # targets (FIFO, socket, etc.).
-    if not _stat.S_ISREG(st.st_mode):
-        logger.warning(
-            "sca.parsers: refusing to read %s (not a regular file: "
-            "mode=0o%o); treating as unparseable", path, st.st_mode,
-        )
-        return None
-    size = st.st_size
-    if size > max_bytes:
-        logger.warning(
-            "sca.parsers: refusing to read %s (size=%d > max=%d) "
-            "— hostile or unusually large manifest; treating as "
-            "unparseable", path, size, max_bytes,
-        )
-        return None
+        if _stat.S_ISLNK(st.st_mode):
+            # Symlinked manifest. With a declared scan root, resolve
+            # and allow when the target stays inside it (monorepo
+            # shared-manifest layouts); otherwise refuse. The
+            # recursive call re-runs the full bound/regular-file
+            # checks on the resolved target, and the chokepoint's
+            # O_NOFOLLOW open closes the resolve->open TOCTOU window
+            # (a re-linked final component fails with ELOOP rather
+            # than following).
+            root = _SCAN_ROOT.get()
+            if root is not None:
+                try:
+                    resolved = path.resolve(strict=True)
+                except OSError as e:
+                    logger.warning(
+                        "sca.parsers: refusing to read %s "
+                        "(cannot resolve symlink: %s)", path, e,
+                    )
+                    return None
+                if resolved.is_relative_to(root):
+                    return read_bounded(
+                        resolved, max_bytes=max_bytes,
+                        follow_symlinks=False,
+                    )
+                logger.warning(
+                    "sca.parsers: refusing to read %s (symlinked "
+                    "manifest resolves outside the scan root: %s); "
+                    "treating as unparseable", path, resolved,
+                )
+                return None
+            logger.warning(
+                "sca.parsers: refusing to read %s (not a regular "
+                "file: mode=0o%o); treating as unparseable",
+                path, st.st_mode,
+            )
+            return None
     try:
-        if not follow_symlinks:
-            # ``O_NOFOLLOW`` raises ELOOP if the final component
-            # is a symlink — defends against the TOCTOU window
-            # between the ``lstat`` above and this open.
-            fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
-            with os.fdopen(fd, "rb", closefd=True) as fh:
-                raw = fh.read(max_bytes + 1)
-        else:
-            with path.open("rb") as fh:
-                raw = fh.read(max_bytes + 1)
-    except OSError as e:
-        logger.warning("sca.parsers: cannot read %s: %s", path, e)
+        raw = read_capped(
+            path, max_bytes,
+            follow_symlinks=follow_symlinks, raise_on_refusal=True,
+        )
+    except CappedReadRefused as e:
+        if e.reason == "over_cap":
+            logger.warning(
+                "sca.parsers: refusing to read %s (size=%d > max=%d) "
+                "— hostile or unusually large manifest; treating as "
+                "unparseable", path, e.st_size, max_bytes,
+            )
+        elif e.reason == "grew_past_cap":
+            logger.warning(
+                "sca.parsers: refusing to read %s (grew past max=%d "
+                "during read); treating as unparseable",
+                path, max_bytes,
+            )
+        else:  # not_regular: FIFO, socket, device, directory
+            logger.warning(
+                "sca.parsers: refusing to read %s (not a regular "
+                "file: mode=0o%o); treating as unparseable",
+                path, e.st_mode,
+            )
         return None
-    if len(raw) > max_bytes:
+    except OSError as e:
         logger.warning(
-            "sca.parsers: %s grew past max during read (>%d); "
-            "treating as unparseable", path, max_bytes,
+            "sca.parsers: refusing to read %s (cannot read: %s)",
+            path, e,
         )
         return None
     return raw.decode("utf-8", errors="replace")
+
+
+def read_head_bytes(path: Path, *, max_bytes: int) -> bytes | None:
+    """Read at most ``max_bytes`` raw bytes from ``path``, refusing
+    symlinks and non-regular files.
+
+    The binary-sniffing detectors (magic-byte classification,
+    obfuscation entropy, URL extraction from source bytes) only ever
+    need a bounded prefix, so unlike :func:`read_bounded` an
+    oversized file is TRUNCATED rather than refused.  What this
+    helper exists to block is the same class the text reader blocks:
+
+      * a symlinked path leaking host-file bytes into operator-facing
+        finding details,
+      * a FIFO / device node hanging or flooding the scan
+        (``open()`` on a FIFO blocks until a writer appears; reads
+        from ``/dev/zero`` never end).
+
+    Returns ``None`` (after a debug log — these are per-file sniffs
+    on arbitrary tree walks, warning-level would flood) when the path
+    is a symlink, not a regular file, or unreadable.
+    """
+    try:
+        st = path.lstat()
+    except OSError as e:
+        logger.debug("sca.parsers: cannot lstat %s: %s", path, e)
+        return None
+    if not _stat.S_ISREG(st.st_mode):
+        logger.debug(
+            "sca.parsers: refusing byte read of %s (not a regular "
+            "file: mode=0o%o)", path, st.st_mode,
+        )
+        return None
+    try:
+        # ``O_NOFOLLOW`` closes the lstat→open TOCTOU window for the
+        # symlink case (re-linked final component fails with ELOOP);
+        # ``O_NONBLOCK`` closes it for the FIFO case (a FIFO swapped
+        # in after the lstat opens immediately instead of blocking
+        # until a writer appears — the fstat below then rejects it).
+        fd = os.open(
+            str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+        try:
+            if not _stat.S_ISREG(os.fstat(fd).st_mode):
+                logger.debug(
+                    "sca.parsers: refusing byte read of %s (became "
+                    "non-regular between lstat and open)", path,
+                )
+                return None
+            with os.fdopen(fd, "rb", closefd=True) as fh:
+                fd = -1
+                return fh.read(max_bytes)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+    except OSError as e:
+        logger.debug("sca.parsers: cannot read %s: %s", path, e)
+        return None

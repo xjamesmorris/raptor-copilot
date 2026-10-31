@@ -74,6 +74,7 @@ from xml.etree import ElementTree as _ET
 from core.security.log_sanitisation import escape_nonprintable
 
 from . import _safe_read
+from ._base import PARSE_ESCAPE_ERRORS, iter_walk_up
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +99,13 @@ except ImportError:                                 # pragma: no cover
 # (PropertyGroup blocks + Directory.Build.props inheritance + tool-
 # conditional properties). Skip those entries rather than emit a
 # wrong (or attacker-tainted) version string.
-_MSBUILD_PROPERTY_RE = re.compile(r"[\$@%]\([^)]+\)")
+# The opening marker alone decides: every use is a boolean search,
+# and requiring the closing ``)`` both cost quadratic scans on
+# hostile version strings (each planted ``$(`` re-scanned the rest)
+# and let an unterminated ``$(...`` slip through as if concrete.
+# Firing on the opener is strictly more conservative — at worst an
+# entry is skipped as unresolvable.
+_MSBUILD_PROPERTY_RE = re.compile(r"[\$@%]\(")
 
 # A single ``$(Name)`` property reference. We resolve these against properties
 # defined IN THE SAME FILE — the dominant pre-CPM pattern, where a
@@ -108,6 +115,17 @@ _MSBUILD_PROPERTY_RE = re.compile(r"[\$@%]\([^)]+\)")
 # left unresolved (skipped), as is a floating wildcard like ``3.1.0-*``.
 _PROP_REF_RE = re.compile(r"\$\(([A-Za-z_][\w.\-]*)\)")
 _MAX_PROP_DEPTH = 8
+
+# Total-size budget for a resolved Version value, mirroring
+# ``nuget.py``'s ``_MAX_VERSION_SPEC_LEN``: nothing longer is a
+# pinnable version, and without a SIZE bound the depth cap alone
+# bounds LEVELS, not growth — 8 chained properties with F references
+# each yield a 10·F^8-char string, so a ~550-byte hostile props file
+# allocated hundreds of MB before any read cap could matter. The
+# budget is enforced DURING substitution (accumulated output length,
+# checked before each replacement lands) so the oversized string is
+# never materialised.
+_MAX_RESOLVED_VERSION_LEN = 256
 
 
 def _extract_properties(root) -> dict[str, str]:
@@ -124,20 +142,63 @@ def _extract_properties(root) -> dict[str, str]:
     return props
 
 
+def _substitute_props_once(
+    version: str, props: dict[str, str],
+) -> str | None:
+    """One ``$(Prop)`` substitution pass with the total-size budget
+    enforced incrementally. Returns the substituted string, or
+    ``None`` the moment the accumulated output would exceed
+    ``_MAX_RESOLVED_VERSION_LEN`` — the over-budget expansion is
+    abandoned before it is built, not measured afterwards."""
+    parts: list[str] = []
+    total = 0
+    pos = 0
+    for m in _PROP_REF_RE.finditer(version):
+        repl = props.get(m.group(1).lower(), m.group(0))
+        total += (m.start() - pos) + len(repl)
+        if total > _MAX_RESOLVED_VERSION_LEN:
+            return None
+        parts.append(version[pos:m.start()])
+        parts.append(repl)
+        pos = m.end()
+    total += len(version) - pos
+    if total > _MAX_RESOLVED_VERSION_LEN:
+        return None
+    parts.append(version[pos:])
+    return "".join(parts)
+
+
 def _resolve_property_version(
     version: str, props: dict[str, str], _depth: int = 0,
+    *, declared_in: Path | None = None,
 ) -> str | None:
     """Substitute ``$(Prop)`` tokens in ``version`` from same-file ``props``
-    (recursive, capped). Returns a concrete version, or ``None`` if anything
-    MSBuild-expression-shaped survives (cross-file / item / metadata) or the
-    result is a floating wildcard (``*``) — neither is a pinnable version."""
+    (recursive, capped in DEPTH and total SIZE). Returns a concrete version,
+    or ``None`` if anything MSBuild-expression-shaped survives (cross-file /
+    item / metadata) or the result is a floating wildcard (``*``) — neither
+    is a pinnable version.
+
+    A size-budget breach is an analysis gap, not a quiet skip: it is
+    warned in the canonical ``<kind> parse failed for <path>: <reason>``
+    shape so :func:`packages.sca.parsers.capture_parse_failures` lifts it
+    into the run report's structured ``parse_failures``."""
     if _depth > _MAX_PROP_DEPTH:
         return None
-    resolved = _PROP_REF_RE.sub(
-        lambda m: props.get(m.group(1).lower(), m.group(0)), version,
-    )
+    resolved = _substitute_props_once(version, props)
+    if resolved is None:
+        logger.warning(
+            "sca.parsers.directory_packages_props: property expansion "
+            "parse failed for %s: $(...) expansion exceeded the "
+            "%d-char resolved-version budget (hostile or misconfigured "
+            "property graph); version left unresolved",
+            escape_nonprintable(str(declared_in)),
+            _MAX_RESOLVED_VERSION_LEN,
+        )
+        return None
     if resolved != version and "$(" in resolved:
-        deeper = _resolve_property_version(resolved, props, _depth + 1)
+        deeper = _resolve_property_version(
+            resolved, props, _depth + 1, declared_in=declared_in,
+        )
         resolved = deeper if deeper is not None else resolved
     if resolved is None or _MSBUILD_PROPERTY_RE.search(resolved) or "*" in resolved:
         return None
@@ -234,9 +295,10 @@ def parse_directory_packages_props(path: Path) -> CPMFile | None:
         return _PARSE_CACHE[resolved]
     try:
         root = _safe_fromstring(text)
-    except _ET.ParseError as e:
+    except (_ET.ParseError, *PARSE_ESCAPE_ERRORS) as e:  # type: ignore[misc]  # defused XML refusals are ValueError subclasses
         logger.warning(
-            "sca.parsers.directory_packages_props: invalid XML in %s: %s",
+            "sca.parsers.directory_packages_props: XML parse failed "
+            "for %s: %s",
             escape_nonprintable(str(resolved)),
             escape_nonprintable(str(e)),
         )
@@ -361,7 +423,9 @@ def _extract_package_versions(
                 )
                 continue
             if _MSBUILD_PROPERTY_RE.search(version):
-                resolved = _resolve_property_version(version, props)
+                resolved = _resolve_property_version(
+                    version, props, declared_in=declared_in,
+                )
                 if resolved is None:
                     logger.debug(
                         "sca.parsers.directory_packages_props: %s in "
@@ -446,53 +510,27 @@ def find_build_targets_chain(start_dir: Path) -> list[Path]:
     return _find_msbuild_chain(start_dir, "Directory.Build.targets")
 
 
-_MAX_WALK_UP_DEPTH = 12
-
-
 def _find_msbuild_chain(start_dir: Path, filename: str) -> list[Path]:
     """Shared walk-up implementation for ``find_cpm_chain``
     (Directory.Packages.props), ``find_build_props_chain``
     (Directory.Build.props) and ``find_build_targets_chain``
     (Directory.Build.targets). All three follow the same MSBuild
-    auto-import convention: walk parents, stop at the nearest
-    ``.git`` or filesystem root.
+    auto-import convention: walk parents, collecting every match.
 
-    Capped at ``_MAX_WALK_UP_DEPTH`` parents as a defence-in-depth
-    bound. The .git-boundary check is the primary stop signal, but
-    SCA may be invoked on an extracted-tarball target without any
-    .git directory (CI artefact, sandboxed snapshot) — without a
-    cap, the walk would proceed all the way to ``/`` and could
-    pick up an out-of-tree ``Directory.Packages.props`` from a
-    sibling checkout under the same parent. 12 levels matches the
-    deepest legitimate solution layouts seen in the wild
-    (microservice monorepos with category/subcategory/service
-    nesting); anything beyond that is overwhelmingly outside the
-    operator's intended scan scope.
+    Bounds come from the shared :func:`iter_walk_up` walker — the
+    active scan root (a Directory.* file above the scanned target is
+    outside the operator's declared scope, even when MSBuild itself
+    would inherit it), the nearest ``.git`` boundary, and the
+    defence-in-depth depth cap for boundary-less scans (CI artefact,
+    extracted tarball) where the walk would otherwise proceed to
+    ``/`` and could pick up an out-of-tree file from a sibling
+    checkout.
     """
     out: list[Path] = []
-    try:
-        current = start_dir.resolve()
-    except OSError:
-        return out
-    visited: set = set()
-    depth = 0
-    while True:
-        if current in visited:    # symlink loop defence
-            break
-        visited.add(current)
+    for current in iter_walk_up(start_dir):
         candidate = current / filename
         if candidate.is_file():
             out.append(candidate)
-        # Stop at repo boundary if present.
-        if (current / ".git").exists():
-            break
-        depth += 1
-        if depth >= _MAX_WALK_UP_DEPTH:
-            break
-        parent = current.parent
-        if parent == current:
-            break
-        current = parent
     return out
 
 
@@ -541,9 +579,10 @@ def parse_directory_build_props(path: Path) -> CPMFile | None:
         return _PARSE_CACHE[resolved]
     try:
         root = _safe_fromstring(text)
-    except _ET.ParseError as e:
+    except (_ET.ParseError, *PARSE_ESCAPE_ERRORS) as e:  # type: ignore[misc]  # defused XML refusals are ValueError subclasses
         logger.warning(
-            "sca.parsers.directory_packages_props: invalid XML in %s: %s",
+            "sca.parsers.directory_packages_props: XML parse failed "
+            "for %s: %s",
             escape_nonprintable(str(resolved)),
             escape_nonprintable(str(e)),
         )
@@ -570,7 +609,9 @@ def parse_directory_build_props(path: Path) -> CPMFile | None:
             if not version:
                 continue
             if _MSBUILD_PROPERTY_RE.search(version):
-                resolved_ver = _resolve_property_version(version, props)
+                resolved_ver = _resolve_property_version(
+                    version, props, declared_in=resolved,
+                )
                 if resolved_ver is None:
                     continue
                 version = resolved_ver

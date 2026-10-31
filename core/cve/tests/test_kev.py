@@ -87,6 +87,74 @@ class TestKevCaching:
         assert kev2.contains("CVE-2021-44228") is True
         assert http2.gets == []
 
+    @staticmethod
+    def _warp_cache_clock(monkeypatch, days: float) -> None:
+        """Advance the clock the cache's freshness check reads.
+
+        Patched through ``JsonCache``'s own function globals, not
+        ``sys.modules["core.json.cache"]``: the lazy-reexport suite
+        purges ``core.json.*`` from ``sys.modules``, so after it runs
+        in the same process a module-attr warp would land on a
+        freshly re-imported module while this suite's ``JsonCache``
+        binding still reads ``time`` from the detached original —
+        the warp misses and expired envelopes look fresh."""
+        import types
+
+        cache_globals = JsonCache.try_get.__globals__
+        real_time = cache_globals["time"].time
+        monkeypatch.setitem(
+            cache_globals, "time",
+            types.SimpleNamespace(time=lambda: real_time() + days * 86400),
+        )
+
+    def test_offline_stale_cache_still_serves_kev(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Docstring contract: stale cache + offline → load the cache
+        anyway (the KEV list rarely changes day-to-day). Silently
+        answering False for everything means --fail-on-kev can never
+        fire on an offline scan."""
+        cache = JsonCache(root=tmp_path)
+        KevClient(FakeHttp(payload=_PAYLOAD), cache).contains(
+            "CVE-2021-44228",
+        )  # seed the cache online
+        self._warp_cache_clock(monkeypatch, days=3)
+        http = FakeHttp(error=HttpError("must not be called"))
+        kev = KevClient(http, JsonCache(root=tmp_path), offline=True)
+        assert kev.contains("CVE-2021-44228") is True
+        assert kev.contains("CVE-9999-99999") is False
+        assert http.gets == []
+
+    def test_fetch_failure_serves_stale_cache(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Network down at refresh time is the same epistemic state as
+        offline: a stale catalog beats silently losing the KEV signal."""
+        cache = JsonCache(root=tmp_path)
+        KevClient(FakeHttp(payload=_PAYLOAD), cache).contains(
+            "CVE-2021-44228",
+        )
+        self._warp_cache_clock(monkeypatch, days=3)
+        kev = KevClient(
+            FakeHttp(error=HttpError("boom")), JsonCache(root=tmp_path),
+        )
+        assert kev.contains("CVE-2021-44228") is True
+        assert kev.is_loaded() is True
+
+    def test_fresh_cache_still_preferred_over_stale_arm(
+        self, tmp_path: Path,
+    ) -> None:
+        """Within the TTL the ordinary load path serves the cache
+        without any stale-arm warning or network call."""
+        cache = JsonCache(root=tmp_path)
+        KevClient(FakeHttp(payload=_PAYLOAD), cache).contains(
+            "CVE-2021-44228",
+        )
+        http = FakeHttp(error=HttpError("must not be called"))
+        kev = KevClient(http, JsonCache(root=tmp_path), offline=True)
+        assert kev.contains("CVE-2021-44228") is True
+        assert http.gets == []
+
     def test_offline_cold_cache_returns_false(
         self, tmp_path: Path,
     ) -> None:
@@ -155,6 +223,116 @@ class TestKevErrors:
             FakeHttp(payload=payload), JsonCache(root=tmp_path),
         )
         assert kev.contains("CVE-OK") is True
+
+
+# ---------------------------------------------------------------------------
+# Catalog-shape gate on the eternal cache envelope
+# ---------------------------------------------------------------------------
+
+
+class TestKevJunkCatalog:
+    """A 200 dict that is not catalog-shaped (JSON error page from a
+    CDN/proxy, hostile feed) must never be stored — the storage TTL is
+    TTL_FOREVER precisely so the stale-if-offline arm can re-read it,
+    which would make one junk fetch the eternal \"catalog\"."""
+
+    _JUNK = {"error": "backend timeout"}
+
+    def test_junk_200_is_not_cached(self, tmp_path: Path) -> None:
+        cache = JsonCache(root=tmp_path)
+        kev = KevClient(FakeHttp(payload=self._JUNK), cache)
+        assert kev.contains("CVE-2021-44228") is False
+
+        # A second client within the caller TTL must NOT be served
+        # the junk from the cache — the real catalog wins.
+        kev2 = KevClient(FakeHttp(payload=_PAYLOAD), cache)
+        assert kev2.contains("CVE-2021-44228") is True
+
+    def test_junk_200_falls_back_to_stale_catalog(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """A junk 200 at refresh time is the same epistemic state as a
+        failed fetch: the stale real catalog beats the junk."""
+        cache = JsonCache(root=tmp_path)
+        KevClient(FakeHttp(payload=_PAYLOAD), cache).contains(
+            "CVE-2021-44228",
+        )  # seed a real catalog
+        TestKevCaching._warp_cache_clock(monkeypatch, days=3)
+        kev = KevClient(FakeHttp(payload=self._JUNK), JsonCache(root=tmp_path))
+        assert kev.contains("CVE-2021-44228") is True
+        assert kev.is_loaded() is True
+
+    def test_stale_arm_rejects_preexisting_junk_entry(
+        self, tmp_path: Path, monkeypatch, caplog,
+    ) -> None:
+        """An already-poisoned eternal envelope (written before the
+        shape gate) is refused by the stale arm — degraded-unavailable
+        is honest; \"serving the stale cached catalog\" over junk is
+        not."""
+        from core.json import TTL_FOREVER
+
+        cache = JsonCache(root=tmp_path)
+        cache.put("kev", self._JUNK, ttl_seconds=TTL_FOREVER)
+        TestKevCaching._warp_cache_clock(monkeypatch, days=3)
+        kev = KevClient(FakeHttp(error=HttpError("boom")),
+                        JsonCache(root=tmp_path))
+        with caplog.at_level("WARNING", logger="core.cve.kev"):
+            assert kev.contains("CVE-2021-44228") is False
+        assert not any(
+            "serving the stale cached catalog" in r.getMessage()
+            for r in caplog.records
+        ), "stale arm must not present junk as a catalog"
+
+    def test_legacy_finite_ttl_envelope_not_served_stale(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Eligibility pin for the stale arm: only envelopes written
+        by this client (TTL_FOREVER) re-serve past the freshness
+        window. A legacy finite-TTL envelope stays expired until one
+        successful online refresh rewrites it."""
+        cache = JsonCache(root=tmp_path)
+        cache.put("kev", _PAYLOAD, ttl_seconds=24 * 3600)  # legacy shape
+        TestKevCaching._warp_cache_clock(monkeypatch, days=3)
+        kev = KevClient(FakeHttp(error=HttpError("boom")),
+                        JsonCache(root=tmp_path))
+        assert kev.contains("CVE-2021-44228") is False
+        assert kev.is_loaded() is True
+
+    def test_legacy_envelope_pin_survives_module_purge(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Order-dependence fence: sibling suites purge ``core.json.*``
+        from ``sys.modules`` (lazy-reexport and sentinel-stability
+        tests). Re-run the legacy-envelope pin under that condition —
+        the clock warp must land on the namespace THIS suite's
+        ``JsonCache`` binding reads, or the expired envelope looks
+        fresh and gets served."""
+        import sys
+
+        purged = {
+            name: sys.modules[name] for name in list(sys.modules)
+            if name == "core.json" or name.startswith("core.json.")
+        }
+        for name in purged:
+            del sys.modules[name]
+        try:
+            cache = JsonCache(root=tmp_path)
+            cache.put("kev", _PAYLOAD, ttl_seconds=24 * 3600)
+            TestKevCaching._warp_cache_clock(monkeypatch, days=3)
+            kev = KevClient(FakeHttp(error=HttpError("boom")),
+                            JsonCache(root=tmp_path))
+            assert kev.contains("CVE-2021-44228") is False
+            assert kev.is_loaded() is True
+        finally:
+            # Restore the ORIGINAL module objects (drop any fresh
+            # re-imports the body may have triggered): leaving the
+            # purge in place would split identities for later tests
+            # in the same process — the very ordering-bug class this
+            # fence pins.
+            for name in list(sys.modules):
+                if name == "core.json" or name.startswith("core.json."):
+                    del sys.modules[name]
+            sys.modules.update(purged)
 
 
 # ---------------------------------------------------------------------------

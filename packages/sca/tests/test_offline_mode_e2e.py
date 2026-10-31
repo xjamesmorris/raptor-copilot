@@ -33,6 +33,14 @@ _SITECUSTOMIZE = '''
 """Network-block sitecustomize for the offline E2E test."""
 import socket
 
+import pytest
+
+# Whole-module slow tier: every test spawns a full `python -m
+# packages.sca.cli` subprocess (interpreter startup + pipeline), which
+# is one load-spike away from the CI per-test budget cliff on a shared
+# runner — the same pattern test_bump_e2e already marks slow.
+pytestmark = pytest.mark.slow
+
 _real_connect = socket.socket.connect
 
 

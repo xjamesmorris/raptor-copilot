@@ -27,8 +27,16 @@ logger = logging.getLogger(__name__)
 
 _CVE_RE = re.compile(r"CVE-\d{4}-\d+", re.IGNORECASE)
 
+# Same character class as libexec/raptor-ghidra's _CTRL_CHARS and
+# decomp_tree's scrub: full C1 range (single-byte CSI/OSC/DCS), the
+# zero-width/joiner class, line/paragraph separators, bidi embedding
+# and isolate controls, and the BOM — the three ghidra-derived-text
+# scrubbers must cover the same set (class-parity test pins this).
 _CTRL_CHARS = re.compile(
-    r"[\x00-\x08\x0b-\x1f\x7f\x9b\u202a-\u202e\u2066-\u2069]"
+    r"[\x00-\x08\x0b-\x1f\x7f\x80-\x9f"
+    r"\u200b-\u200f\u2028\u2029"
+    r"\u202a-\u202e\u2066-\u2069"
+    r"\ufeff]"
 )
 
 
@@ -137,11 +145,13 @@ def write_attack_surface_from_bookmarks(
 
     surface_path = output_dir / "attack-surface.json"
     if surface_path.is_file():
-        try:
-            existing = json.loads(surface_path.read_text())
-            if not isinstance(existing, dict):
-                existing = {}
-        except (json.JSONDecodeError, OSError):
+        # Budgeted like the package's other cache readers —
+        # missing/corrupt/oversize all degrade to a fresh document.
+        from core.json import load_json
+
+        from .context_inject import _MAX_CACHE_BYTES
+        existing = load_json(surface_path, max_bytes=_MAX_CACHE_BYTES)
+        if not isinstance(existing, dict):
             existing = {}
     else:
         existing = {}
@@ -207,12 +217,13 @@ def write_checklist_from_bookmarks(
         return 0
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    checklist_path = output_dir / "checklist.json"
 
-    if checklist_path.is_file():
+    from core.inventory import checklist_exists, save_checklist
+    if checklist_exists(output_dir):
         try:
-            existing = json.loads(checklist_path.read_text())
-            if isinstance(existing, dict):
+            from core.inventory import read_checklist
+            existing = read_checklist(output_dir)
+            if existing:
                 existing_names = set()
                 for fe in existing.get("files", []):
                     for it in fe.get("items", []):
@@ -241,7 +252,9 @@ def write_checklist_from_bookmarks(
                 )
                 existing["total_functions"] = existing["total_items"]
                 existing["_bookmark_import"] = True
-                save_json(checklist_path, existing)
+                # Accessor write: retires a superseded sharded layout
+                # so the discriminator serves THIS write.
+                save_checklist(output_dir, existing)
                 return len(items)
         except (json.JSONDecodeError, OSError):
             pass
@@ -265,7 +278,7 @@ def write_checklist_from_bookmarks(
         "_bookmark_import": True,
     }
 
-    save_json(checklist_path, checklist)
+    save_checklist(output_dir, checklist)
 
     logger.info(
         "bookmarks bridge: %d function(s) → checklist.json",
@@ -282,9 +295,13 @@ def _resolve_function(addr, addr_to_func, db) -> str:
     if addr in addr_to_func:
         return addr_to_func[addr]
 
-    for f in db.functions:
-        if f.size > 0 and f.address <= addr < f.address + f.size:
-            return f.name
+    # Indexed containment lookup: the per-bookmark linear scan this
+    # replaces was O(bookmarks x functions) against a hostile-sized
+    # cache — the model grew the bisect index because this exact class
+    # bit twice before (xref resolution, decomp_tree).
+    f = db.function_containing_address(addr)
+    if f is not None:
+        return f.name
 
     return "sub_%x" % addr
 

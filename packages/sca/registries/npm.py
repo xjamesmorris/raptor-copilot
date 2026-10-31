@@ -221,7 +221,7 @@ class NpmClient:
         # ``_strip_npm_metadata`` for the rationale. Returns the
         # stripped envelope so subsequent in-process callers don't
         # see a different shape than the cache.
-        data = _strip_npm_metadata(data)
+        data = _strip_npm_metadata(data)  # type: ignore[assignment]
         if self._cache is not None:
             self._cache.put(cache_key, data, ttl_seconds=self._ttl)
         return data
@@ -239,8 +239,11 @@ class NpmClient:
             _CACHE_KEY_PREFIX, name, base_url=self._base_url,
         )
         if self._cache is not None:
-            cached = self._cache.get(cache_key, ttl_seconds=self._ttl)
-            if cached is not None:
+            # try_get + MISSING is the canonical read everywhere else in
+            # this package; the bare .get worked here only because the
+            # negative sentinel happens to be [] (truthiness-safe).
+            cached = self._cache.try_get(cache_key, ttl_seconds=self._ttl)
+            if cached is not MISSING and cached is not None:
                 return list(cached)
 
         if self._offline:
@@ -308,10 +311,14 @@ def _extract_versions(data: dict) -> list[str]:
 
     # Sort by publish time descending; versions without a publish
     # time fall back to lexical sort among themselves, after all
-    # timed versions.
+    # timed versions. The ``time`` map is untrusted registry JSON —
+    # a non-string entry (number, list, null-ish) must degrade to
+    # the untimed bucket, not raise a TypeError out of list.sort
+    # (which aborted the whole harden pass: no per-dep containment
+    # in its pool.map chain).
     def _sort_key(v: str):
         t = times.get(v)
-        return (1, t) if t else (0, v)
+        return (1, t) if isinstance(t, str) else (0, v)
     candidates.sort(key=_sort_key, reverse=True)
     return candidates
 
